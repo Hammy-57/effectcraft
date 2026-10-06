@@ -124,6 +124,12 @@ impl Gpu {
         GpuContext::new(adapter, device, queue).map(Gpu::from_context)
     }
 
+    /// A separate device on an existing adapter, so background compositing does not submit to
+    /// the window surface's queue while it reconfigures.
+    pub async fn request_on_adapter(adapter: &wgpu::Adapter) -> Result<Gpu, String> {
+        GpuContext::request_on_adapter(adapter).await.map(Gpu::from_context)
+    }
+
     pub fn from_context(ctx: GpuContext) -> Gpu {
         Gpu { ctx: Arc::new(ctx), auto: Default::default() }
     }
