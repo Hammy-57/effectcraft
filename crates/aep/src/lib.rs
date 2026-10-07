@@ -429,6 +429,7 @@ pub fn import_ir(
                     &format!("comp {ae_id} layer {ae_layer}"),
                 );
             }
+            place_unauthored_camera_eye(&mut layer, ir);
             if matches!(&layer.source, LayerSource::Model { .. }) {
                 models3d::import(&mut next, &mut layer, ir, comp.frame_rate.as_f64(), &mut result.losses, &format!("comp {ae_id} layer {ae_layer}"));
                 result.losses.push(format!("comp {ae_id} layer {ae_layer}: 3D model coordinate/render parity with AE is unverified"));
@@ -539,18 +540,7 @@ fn import_implicit_camera(
     // Older IR exposed the hidden default camera's unauthored Position as its POI. The eye
     // actually sits one zoom distance behind that plane; otherwise z=0 layers are clipped.
     let eye_z = position[2] - zoom;
-    let default_eye = position == poi
-        && eye_z.is_finite()
-        && array(ir, "properties")
-            .iter()
-            .find(|group| string(group, &["match_name"]) == Some("ADBE Transform Group"))
-            .and_then(|group| array(group, "children").iter().find(|prop| string(prop, &["match_name"]) == Some("ADBE Position")))
-            .is_some_and(|prop| {
-                !boolean(prop, &["authored"]).unwrap_or(false)
-                    && !boolean(prop, &["dimensions_separated"]).unwrap_or(false)
-                    && array(prop, "keyframes").is_empty()
-                    && string(prop, &["expression"]).unwrap_or("").is_empty()
-            });
+    let default_eye = position == poi && eye_z.is_finite() && unauthored_position(ir);
     for prop in array(ir, "properties") {
         if !check_property_budget(prop, property_budget, 0) {
             return Err(AepError::Invalid(format!("comp {ae_comp}: implicit camera property or keyframe limit exceeded")));
@@ -597,6 +587,46 @@ fn import_implicit_camera(
         position_prop.value = Value::Vec3([position[0], position[1], eye_z]);
     }
     Ok((ae_id, camera))
+}
+
+/// Whether a camera's Position stream was never set (not live, unkeyed, no expression). AE
+/// then places the eye one zoom distance in front of the Point of Interest; the IR reports the
+/// stream's placeholder, which equals the Point of Interest and would put the eye on the z = 0
+/// plane where every layer is clipped.
+fn unauthored_position(ir: &Json) -> bool {
+    array(ir, "properties")
+        .iter()
+        .find(|group| string(group, &["match_name"]) == Some("ADBE Transform Group"))
+        .and_then(|group| array(group, "children").iter().find(|prop| string(prop, &["match_name"]) == Some("ADBE Position")))
+        .is_some_and(|prop| {
+            !boolean(prop, &["authored"]).unwrap_or(false)
+                && !boolean(prop, &["dimensions_separated"]).unwrap_or(false)
+                && array(prop, "keyframes").is_empty()
+                && string(prop, &["expression"]).unwrap_or("").is_empty()
+        })
+}
+
+/// An explicit two-node camera with an unauthored Position sits one zoom distance in front of
+/// its Point of Interest, the same pose AE gives its hidden default camera.
+fn place_unauthored_camera_eye(layer: &mut Layer, ir: &Json) {
+    if !matches!(layer.source, LayerSource::Camera) || !unauthored_position(ir) {
+        return;
+    }
+    let zoom = layer
+        .props
+        .sub("cameraOptions")
+        .and_then(|options| options.get("zoom"))
+        .filter(|zoom| zoom.keys.is_empty() && zoom.expr.is_none())
+        .map(|zoom| zoom.value.as_f64())
+        .filter(|zoom| zoom.is_finite() && *zoom > 0.0);
+    let Some(zoom) = zoom else { return };
+    let Some(transform) = layer.transform_mut() else { return };
+    let Some(poi) = transform.get("poi").filter(|poi| poi.keys.is_empty()).map(|poi| poi.value.as_vec3()) else { return };
+    let Some(position) = transform.get_mut("position") else { return };
+    let eye_z = poi[2] - zoom;
+    if position.keys.is_empty() && position.value.as_vec3() == poi && eye_z.is_finite() {
+        position.value = Value::Vec3([poi[0], poi[1], eye_z]);
+    }
 }
 
 fn blend_from_ae(raw: i64) -> Option<BlendMode> {
@@ -1901,6 +1931,29 @@ mod tests {
         let result = import_ir(&mut project, ir.to_string().as_bytes(), "", &mut |_| None).unwrap();
         let camera = project.comp(result.primary_comp.unwrap()).unwrap().active_camera(Tick::ZERO).unwrap();
         assert_eq!(camera.transform().unwrap().get("position").unwrap().value.as_vec3(), [50.0, 50.0, 0.0]);
+    }
+
+    #[test]
+    fn unauthored_explicit_camera_eye_uses_zoom_depth() {
+        // 3D Items Slider / Dental Carousel: an explicit two-node camera whose Position was never
+        // set reports Position == Point of Interest; left there, every z = 0 layer is clipped.
+        let mut ir = serde_json::json!({"schema_version":1,"items":[{"id":1,"kind":"comp","name":"C","width":1920,"height":1080,"duration":1,
+            "layers":[{"id":2,"kind":"CameraLayer","name":"Camera","timing":{"in_point":0,"out_point":1},"switches":{"auto_orient":4214},"properties":[
+                {"kind":"group","match_name":"ADBE Transform Group","children":[
+                    {"kind":"property","match_name":"ADBE Anchor Point","authored":true,"value":[960,540,0],"keyframes":[]},
+                    {"kind":"property","match_name":"ADBE Position","authored":false,"value":[960,540,0],"keyframes":[]}]},
+                {"kind":"group","match_name":"ADBE Camera Options Group","children":[
+                    {"kind":"property","match_name":"ADBE Camera Zoom","authored":true,"value":1500,"keyframes":[]}]}]}]}]});
+        let eye = |ir: &Json| {
+            let mut project = Project::default();
+            let result = import_ir(&mut project, ir.to_string().as_bytes(), "", &mut |_| None).unwrap();
+            let camera = project.comp(result.primary_comp.unwrap()).unwrap().active_camera(Tick::ZERO).unwrap().clone();
+            camera.transform().unwrap().get("position").unwrap().value.as_vec3()
+        };
+        assert_eq!(eye(&ir), [960.0, 540.0, -1500.0]);
+        // An authored Position is kept exactly, even when it equals the Point of Interest.
+        ir["items"][0]["layers"][0]["properties"][0]["children"][1]["authored"] = Json::Bool(true);
+        assert_eq!(eye(&ir), [960.0, 540.0, 0.0]);
     }
 
     #[test]
