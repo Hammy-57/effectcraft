@@ -21,7 +21,7 @@ use rayon::prelude::*;
 
 pub use dof::depth_of_field;
 pub use raster::Target;
-pub use scene::{EnvInfo, Light, Material, Scene, ShadowMap, TexInfo, Vertex};
+pub use scene::{EnvInfo, Light, Material, Scene, ShadowMap, TexInfo, Vertex, ae_model_axes};
 
 use super::compose::camera_for;
 use crate::{EvalCtx, Image, Renderer};

@@ -441,6 +441,16 @@ fn ae_root_correction(m: &model::Model) -> Mat4 {
     if (0..4).all(|i| (0..4).all(|j| (matrix.0[i][j] - expected.0[i][j]).abs() < 1e-6)) { matrix.inverse().unwrap_or(Mat4::IDENTITY) } else { Mat4::IDENTITY }
 }
 
+/// A model layer imported from After Effects (Geometry Options ▸ AE Source Axes): its mesh
+/// keeps AE's raw source axes, and its Orientation composes like AE's model Orientation,
+/// Z applied first (Rx·Ry·Rz, the order of the separate Rotation controls). AE's model
+/// orientations are authored that way: an upright model turned about its own vertical axis
+/// reads as (≈270°, ≈0°, yaw), the yaw spinning the raw Z-up mesh before X stands it up.
+/// Other layers keep the Rz·Ry·Rx Orientation of [`Mat4::orientation`].
+pub fn ae_model_axes(ctx: &EvalCtx, layer: &Layer) -> bool {
+    matches!(layer.source, LayerSource::Model { .. }) && layer.props.sub("geometryOptions").is_some_and(|g| ctx.b(layer, g, "aeSourceSpace"))
+}
+
 fn model_layer(r: &Renderer, ctx: &EvalCtx, layer: &Layer, b: &mut Builder) {
     let lin = b.s.linear_io;
     let (opts, prim_mat) = model_options(ctx, layer, lin);
@@ -468,8 +478,7 @@ fn model_layer(r: &Renderer, ctx: &EvalCtx, layer: &Layer, b: &mut Builder) {
         }
         _ => return,
     };
-    let ae_source = geo.is_some_and(|g| ctx.b(layer, g, "aeSourceSpace"));
-    let correction = if ae_source { ae_root_correction(&mdl) } else { Mat4::IDENTITY };
+    let correction = if ae_model_axes(ctx, layer) { ae_root_correction(&mdl) } else { Mat4::IDENTITY };
     let world = b.outer * ctx.world_matrix(layer) * model_to_layer(unit) * correction;
     // Materials of the model (one default when it has none).
     let mut mats: Vec<u32> = vec![];

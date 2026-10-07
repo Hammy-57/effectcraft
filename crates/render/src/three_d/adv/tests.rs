@@ -535,3 +535,35 @@ fn stroke_regions_are_rings() {
     assert_eq!(outlines.len(), 1);
     assert_eq!(outlines[0].holes.len(), 1);
 }
+
+#[test]
+fn ae_model_orientation_turns_z_first() {
+    // AE-imported models compose Orientation as Rx·Ry·Rz: (270°, 0°, 30°) stands a Z-up mesh
+    // up and then yaws it about its own vertical axis (Rz·Ry·Rx would roll it on screen).
+    use effectcraft_geom::{Mat4, vec3};
+    let (mut p, cid) = project(160, 120);
+    let item = p.add_item(
+        "m.glb",
+        Default::default(),
+        None,
+        ItemKind::Footage(effectcraft_project::Footage { kind: effectcraft_project::FootageKind::Model, missing: true, ..Default::default() }),
+    );
+    for ae in [true, false] {
+        add(&mut p, cid, LayerSource::Model { item }, |l| {
+            set(l, "transform/orientation", Value::Vec3([270.0, 0.0, 30.0]));
+            set(l, "transform/anchor", Value::Vec3([0.0, 0.0, 0.0]));
+            set(l, "transform/position", Value::Vec3([0.0, 0.0, 0.0]));
+            set(l, "geometryOptions/aeSourceSpace", Value::Bool(ae));
+        });
+        let comp = p.comp(cid).unwrap();
+        let ctx = crate::EvalCtx::new(&p, cid, comp, Tick::ZERO);
+        let m = ctx.world_matrix(&comp.layers[0]);
+        let want = if ae { Mat4::rotate_x(270.0) * Mat4::rotate_y(0.0) * Mat4::rotate_z(30.0) } else { Mat4::orientation(vec3(270.0, 0.0, 30.0)) };
+        for i in 0..3 {
+            for j in 0..3 {
+                assert!((m.0[i][j] - want.0[i][j]).abs() < 1e-9, "ae={ae}: {m:?} vs {want:?}");
+            }
+        }
+        p.comp_mut(cid).unwrap().layers.remove(0);
+    }
+}
