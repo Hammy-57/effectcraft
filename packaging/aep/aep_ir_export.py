@@ -78,6 +78,8 @@ class Exporter:
             if any(i >= vertices for i in first):
                 continue
             edge = first[0] == first[2]
+            # Edge layout stores (a,b,a,c,b,c) for each face; the header's
+            # index count remains three per face, so the byte stream doubles it.
             stored = 2 * indices if edge else indices
             if offset + 4 * stored > len(data):
                 continue
