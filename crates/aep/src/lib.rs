@@ -503,6 +503,21 @@ fn import_implicit_camera(
         .and_then(vec3)
         .ok_or_else(|| AepError::Invalid(format!("comp {ae_comp}: implicit camera point of interest is invalid")))?;
     let zoom = number(pose, &["zoom"]).filter(|v| *v > 0.0).ok_or_else(|| AepError::Invalid(format!("comp {ae_comp}: implicit camera zoom is invalid")))?;
+    // Older IR exposed the hidden default camera's unauthored Position as its POI. The eye
+    // actually sits one zoom distance behind that plane; otherwise z=0 layers are clipped.
+    let eye_z = position[2] - zoom;
+    let default_eye = position == poi
+        && eye_z.is_finite()
+        && array(ir, "properties")
+            .iter()
+            .find(|group| string(group, &["match_name"]) == Some("ADBE Transform Group"))
+            .and_then(|group| array(group, "children").iter().find(|prop| string(prop, &["match_name"]) == Some("ADBE Position")))
+            .is_some_and(|prop| {
+                !boolean(prop, &["authored"]).unwrap_or(false)
+                    && !boolean(prop, &["dimensions_separated"]).unwrap_or(false)
+                    && array(prop, "keyframes").is_empty()
+                    && string(prop, &["expression"]).unwrap_or("").is_empty()
+            });
     for prop in array(ir, "properties") {
         if !check_property_budget(prop, property_budget, 0) {
             return Err(AepError::Invalid(format!("comp {ae_comp}: implicit camera property or keyframe limit exceeded")));
@@ -544,6 +559,9 @@ fn import_implicit_camera(
             losses,
             &format!("comp {ae_comp} implicit camera {ae_id}"),
         );
+    }
+    if default_eye && let Some(position_prop) = camera.transform_mut().and_then(|transform| transform.get_mut("position")) {
+        position_prop.value = Value::Vec3([position[0], position[1], eye_z]);
     }
     Ok((ae_id, camera))
 }
@@ -1811,6 +1829,26 @@ mod tests {
         assert_eq!(camera.props.sub("cameraOptions").unwrap().get("zoom").unwrap().value.as_f64(), 300.0);
         assert_eq!(structure(&project)[1], 1);
         assert_eq!(structure(&project)[7], 1);
+    }
+
+    #[test]
+    fn unauthored_implicit_camera_eye_uses_zoom_depth() {
+        let mut ir = serde_json::json!({"schema_version":1,"items":[{"id":1,"kind":"comp","name":"C","width":100,"height":100,"duration":1,
+            "default_camera":{"id":9,"kind":"CameraLayer","implicit":true,
+                "pose":{"position":[50,50,0],"point_of_interest":[50,50,0],"zoom":300},
+                "switches":{"enabled":true,"is_3d":true,"auto_orient":4214},
+                "properties":[{"kind":"group","match_name":"ADBE Transform Group","children":[
+                    {"kind":"property","match_name":"ADBE Position","authored":false,"value":[50,50,0],"keyframes":[]}]}]},
+            "layers":[]}]});
+        let mut project = Project::default();
+        let result = import_ir(&mut project, ir.to_string().as_bytes(), "", &mut |_| None).unwrap();
+        let camera = project.comp(result.primary_comp.unwrap()).unwrap().active_camera(Tick::ZERO).unwrap();
+        assert_eq!(camera.transform().unwrap().get("position").unwrap().value.as_vec3(), [50.0, 50.0, -300.0]);
+        ir["items"][0]["default_camera"]["properties"][0]["children"][0]["authored"] = Json::Bool(true);
+        let mut project = Project::default();
+        let result = import_ir(&mut project, ir.to_string().as_bytes(), "", &mut |_| None).unwrap();
+        let camera = project.comp(result.primary_comp.unwrap()).unwrap().active_camera(Tick::ZERO).unwrap();
+        assert_eq!(camera.transform().unwrap().get("position").unwrap().value.as_vec3(), [50.0, 50.0, 0.0]);
     }
 
     #[test]
