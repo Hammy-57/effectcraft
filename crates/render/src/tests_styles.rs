@@ -418,3 +418,22 @@ fn gradient_glow_uses_gradient() {
     let px = img.straight(121, 50);
     assert!(px[0] > px[2], "near the edge the glow takes the gradient's start colour {px:?}");
 }
+
+/// A track matte reads its layer before Layer Styles: SceneYard "Apple Maps Route" mattes its map
+/// through a rounded rectangle with Fill Opacity 0 and a Stroke style (the matte's own look is
+/// just the ring). After Effects shows the whole map inside it; we showed only the ring.
+#[test]
+fn track_matte_reads_the_layer_before_its_styles() {
+    let (mut p, cid, comp) = setup();
+    let mut matte = solid(&mut p, &comp, [1.0; 3], 40, 40);
+    add(&mut p, &comp, &mut matte, "stroke");
+    set(&mut matte, "stroke/size", Value::Scalar(4.0));
+    set(&mut matte, "blendingOptions/advancedBlending/fillOpacity", Value::Scalar(0.0));
+    let mut fill = solid(&mut p, &comp, [0.0, 0.0, 1.0], 200, 100);
+    fill.track_matte = Some(effectcraft_project::TrackMatte { layer: matte.id, kind: effectcraft_project::MatteKind::Alpha });
+    p.comp_mut(cid).unwrap().layers = vec![matte, fill];
+    let img = render(&p, cid);
+    // Inside the square (x 80..120): the blue layer, not just the ring.
+    assert!(img.get(100, 50)[2] > 0.98 && img.get(100, 50)[3] > 0.98, "{:?}", img.get(100, 50));
+    assert!(img.get(10, 10)[3] < 0.01);
+}

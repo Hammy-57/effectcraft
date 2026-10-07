@@ -75,7 +75,15 @@ fn coverage_at(ctx: &EvalCtx, layer: &Layer, g: &effectcraft_project::PropGroup,
     } else {
         effectcraft_path::fill_coverage(std::slice::from_ref(&path), &m, w, h, FillRule::NonZero)
     };
-    if exp.abs() > 0.01 && !variable {
+    // An expansion past about a quarter of the mask's own size: from the distance to the mask
+    // (a stroke that much wider than its curve folds its inner edge over and cancels itself).
+    let size = {
+        let b = kurbo::Shape::bounding_box(&path);
+        b.width().min(b.height()) * buf.scale
+    };
+    if exp.abs() > 0.01 && !variable && exp.abs() * buf.scale > 0.25 * size {
+        cov = expand_by_distance(&cov, exp * buf.scale);
+    } else if exp.abs() > 0.01 && !variable {
         let ring = effectcraft_path::stroke_coverage(
             std::slice::from_ref(&path),
             &StrokeStyle { width: exp.abs() * 2.0, join: effectcraft_path::Join::Round, ..Default::default() },
@@ -100,6 +108,29 @@ fn coverage_at(ctx: &EvalCtx, layer: &Layer, g: &effectcraft_project::PropGroup,
         cov = Mask::from_alpha(&b);
     }
     Some(cov)
+}
+
+/// Grow (`e` > 0) or shrink coverage by `e` buffer pixels from the Euclidean distance to the
+/// covered (or uncovered) pixels; edges stay anti-aliased within about a pixel.
+fn expand_by_distance(cov: &Mask, e: f64) -> Mask {
+    let (w, h) = (cov.width as usize, cov.height as usize);
+    let mut out = cov.clone();
+    if e > 0.0 {
+        let inside: Vec<bool> = cov.data.iter().map(|&c| c >= 0.5).collect();
+        let d = effectcraft_effects::util::distance_transform(&inside, w, h);
+        out.data.par_iter_mut().zip(d.par_iter()).for_each(|(c, &d)| {
+            // The grown edge lies `e` beyond the old one, itself half a pixel from the nearest
+            // covered pixel centre.
+            *c = c.max((e + 1.0 - d as f64).clamp(0.0, 1.0) as f32);
+        });
+    } else {
+        let outside: Vec<bool> = cov.data.iter().map(|&c| c < 0.5).collect();
+        let d = effectcraft_effects::util::distance_transform(&outside, w, h);
+        out.data.par_iter_mut().zip(d.par_iter()).for_each(|(c, &d)| {
+            *c = c.min((d as f64 + e).clamp(0.0, 1.0) as f32);
+        });
+    }
+    out
 }
 
 /// The layer's enabled masks at the context time, flattened to polylines in layer space (for

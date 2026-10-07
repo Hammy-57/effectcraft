@@ -392,7 +392,7 @@ fn matte_for(r: &Renderer, ctx: &EvalCtx, layer: &Layer, out: (u32, u32)) -> Opt
                 let lights = scene_lights(ctx);
                 composite(&mut img, &its, &lights, &[], m.id.0 as u32);
             }
-        } else if let Some(mb) = r.layer_buf(ctx, m) {
+        } else if let Some(mb) = r.matte_buf(ctx, m) {
             r.place(ctx, m, &mb, &mut img, BlendMode::Normal, ctx.opacity(m) as f32);
         }
     }

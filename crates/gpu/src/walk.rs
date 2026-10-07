@@ -307,7 +307,7 @@ fn composite_iso_with(
             None => {
                 let mut mimg = e.zeros(canvas.width, canvas.height);
                 if m.is_active_at(ctx.time)
-                    && let Some(mb) = r.layer_buf(ctx, m)
+                    && let Some(mb) = r.matte_buf(ctx, m)
                 {
                     let mo = ctx.opacity(m) as f32;
                     mimg = place(e, r, ctx, m, &mb, &mimg, BlendMode::Normal, mo, None)?;
