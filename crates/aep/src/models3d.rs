@@ -17,12 +17,20 @@ pub(super) fn layer_source(ir: &Json, project: &Project, item_ids: &BTreeMap<i64
 
 /// The common importer already handles 3D transforms, timing, keyframes, and AE-only
 /// properties. Normalize AE's model material flags onto the native render controls.
-pub(super) fn import(_project: &mut Project, layer: &mut Layer, ir: &Json, _fps: f64, losses: &mut Vec<String>, context: &str) {
+/// `model_scale` is the footage's object scale from AE's model settings (1 = as authored).
+pub(super) fn import(_project: &mut Project, layer: &mut Layer, ir: &Json, model_scale: Option<f64>, losses: &mut Vec<String>, context: &str) {
     let layer_time = LayerTime::of(layer);
     if let Some(scale) = layer.props.prop_mut("geometryOptions/unitScale") {
         scale.value = Value::Scalar(512.0);
     } else {
         losses.push(format!("{context}: native model scale missing"));
+    }
+    if let Some(k) = model_scale.filter(|k| k.is_finite() && *k > 0.0 && (*k - 1.0).abs() > 1e-12) {
+        if let Some(scale) = layer.props.prop_mut("geometryOptions/objectScale") {
+            scale.value = Value::Scalar(k * 100.0);
+        } else {
+            losses.push(format!("{context}: native model object scale missing"));
+        }
     }
     if let Some(axes) = layer.props.prop_mut("geometryOptions/aeSourceSpace") {
         axes.value = Value::Bool(true);
@@ -97,7 +105,7 @@ mod tests {
         assert_eq!(source, Some(LayerSource::Model { item }));
         let comp = Comp::new(1920, 1080, FrameRate::from_f64(30.0), tick(2.0));
         let mut layer = build::layer(&mut project, &comp, "Offline model", source.unwrap_or(LayerSource::Null), (1920, 1080), None);
-        import(&mut project, &mut layer, &ir, 30.0, &mut losses, "test");
+        import(&mut project, &mut layer, &ir, Some(0.125), &mut losses, "test");
         assert_eq!(layer.props.prop("materialOptions/castsShadows").map(|p| &p.value), Some(&Value::Enum(2)));
         assert_eq!(layer.props.prop("materialOptions/castsShadows").map(|p| p.keys.len()), Some(2));
         assert_eq!(layer.props.prop("materialOptions/acceptsShadows").map(|p| &p.value), Some(&Value::Enum(1)));
@@ -105,6 +113,7 @@ mod tests {
         assert_eq!(layer.props.prop("materialOptions/appearsInReflections").map(|p| &p.value), Some(&Value::Bool(false)));
         assert_eq!(layer.props.prop("geometryOptions/unitScale").map(|p| &p.value), Some(&Value::Scalar(512.0)));
         assert_eq!(layer.props.prop("geometryOptions/aeSourceSpace").map(|p| &p.value), Some(&Value::Bool(true)));
+        assert_eq!(layer.props.prop("geometryOptions/objectScale").map(|p| &p.value), Some(&Value::Scalar(12.5)));
         assert!(losses.is_empty(), "{losses:?}");
     }
 }

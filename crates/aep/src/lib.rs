@@ -431,7 +431,9 @@ pub fn import_ir(
             }
             place_unauthored_camera_eye(&mut layer, ir);
             if matches!(&layer.source, LayerSource::Model { .. }) {
-                models3d::import(&mut next, &mut layer, ir, comp.frame_rate.as_f64(), &mut result.losses, &format!("comp {ae_id} layer {ae_layer}"));
+                let model_scale =
+                    integer(ir, &["source_id"]).and_then(|id| items.iter().find(|i| integer(i, &["id"]) == Some(id))).and_then(|i| number(i, &["model_scale"]));
+                models3d::import(&mut next, &mut layer, ir, model_scale, &mut result.losses, &format!("comp {ae_id} layer {ae_layer}"));
                 result.losses.push(format!("comp {ae_id} layer {ae_layer}: 3D model coordinate/render parity with AE is unverified"));
             }
             local_ids.insert(ae_layer, layer.id);

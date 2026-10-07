@@ -486,6 +486,17 @@ class Exporter:
                 result[name] = self.value(self.read(item, name, scope), scope + "/" + name)
             source = self.read(item, "main_source", scope)
             result["source_type"] = type(source).__name__ if source else None
+            # 3D model footage: the object scale of AE's model settings ("mdls", big-endian
+            # f64 first), applied on top of the layer's Scale around its anchor.
+            mdls = next((c for c in getattr(getattr(item, "_item_list", None), "chunks", ())
+                         if c.chunk_type == "mdls"), None)
+            if mdls is not None:
+                data = getattr(mdls, "data", b"") or b""
+                scale = struct.unpack(">d", data[:8])[0] if len(data) >= 8 else None
+                if scale is not None and math.isfinite(scale) and 0 < scale <= 1e6:
+                    result["model_scale"] = scale
+                else:
+                    self.loss(scope + "/model_scale", "unsupported_value", data[:8].hex())
             if source and type(source).__name__ == "SolidSource":
                 result["color"] = self.value(self.read(source, "color", scope), scope + "/color")
             elif source and type(source).__name__ == "FileSource":

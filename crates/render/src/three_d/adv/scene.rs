@@ -481,7 +481,15 @@ fn model_layer(r: &Renderer, ctx: &EvalCtx, layer: &Layer, b: &mut Builder) {
         _ => return,
     };
     let correction = if ae_model_axes(ctx, layer) { ae_root_correction(&mdl) } else { Mat4::IDENTITY };
-    let world = b.outer * ctx.world_matrix(layer) * model_to_layer(unit) * correction;
+    // Object Scale (AE's model settings): scales the model about the layer's anchor point.
+    let object = geo.map_or(100.0, |g| ctx.f(layer, g, "objectScale", 100.0)) / 100.0;
+    let object = if object.is_finite() && (object - 1.0).abs() > 1e-12 {
+        let a = Vec3::from(layer.transform().map_or([0.0; 3], |tr| ctx.v3(layer, tr, "anchor", [0.0; 3])));
+        Mat4::translate(a) * Mat4::scale(vec3(object, object, object)) * Mat4::translate(-a)
+    } else {
+        Mat4::IDENTITY
+    };
+    let world = b.outer * ctx.world_matrix(layer) * object * model_to_layer(unit) * correction;
     // Materials of the model (one default when it has none).
     let mut mats: Vec<u32> = vec![];
     let defaults = [model::Material::plain([0.8, 0.8, 0.8, 1.0], 0.0, 0.5)];
