@@ -430,31 +430,46 @@ impl HslKey {
 /// Color Wheels, HSL Secondary (key, refine, correction), Vignette, in that order.
 fn lumetri(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let pr = ctx.params;
+    // AE stores an independent Active switch for each grading section and curve group.
+    // Missing switches in older native projects mean enabled.
+    let active = |id: &str| pr.get(id).map(Value::as_bool).unwrap_or(true);
+    let basic_active = active("basicCorrection/active");
+    let creative_active = active("creative/active");
+    let curves_active = active("curves/active");
+    let wheels_active = active("colorWheels/active");
+    let secondary_active = active("hslSecondary/active");
+    let vignette_active = active("vignette/active");
+    let basic_f = |id: &str, neutral: f64| if basic_active { pr.f(id) } else { neutral };
+    let creative_f = |id: &str, neutral: f64| if creative_active { pr.f(id) } else { neutral };
     let hdr = pr.b("highDynamicRange");
-    let hdr_white = if hdr { (pr.get("basicCorrection/tone/hdrWhite").map(Value::as_f64).unwrap_or(100.0) / 100.0).max(0.01) as f32 } else { 1.0 };
-    let hdr_spec = if hdr { (pr.f("basicCorrection/tone/hdrSpecular") / 100.0) as f32 } else { 0.0 };
-    let input_lut = if pr.e("basicCorrection/inputLut") == 1 { crate::utility::load_lut(pr.s("basicCorrection/inputLutFile")) } else { None };
-    let look = pr.e("creative/look");
+    let hdr_white =
+        if hdr && basic_active { (pr.get("basicCorrection/tone/hdrWhite").map(Value::as_f64).unwrap_or(100.0) / 100.0).max(0.01) as f32 } else { 1.0 };
+    let hdr_spec = if hdr && basic_active { (pr.f("basicCorrection/tone/hdrSpecular") / 100.0) as f32 } else { 0.0 };
+    let input_lut = if basic_active && pr.e("basicCorrection/inputLut") == 1 { crate::utility::load_lut(pr.s("basicCorrection/inputLutFile")) } else { None };
+    let look = if creative_active { pr.e("creative/look") } else { 0 };
     let look_lut = if look == 1 { crate::utility::load_lut(pr.s("creative/lookFile")) } else { None };
-    let temp = (pr.f("basicCorrection/whiteBalance/temperature") / 100.0) as f32;
-    let tint = (pr.f("basicCorrection/whiteBalance/tint") / 100.0) as f32;
-    let expo = 2f32.powf(pr.f("basicCorrection/tone/exposure") as f32);
-    let contrast = (pr.f("basicCorrection/tone/contrast") / 100.0) as f32;
+    let temp = (basic_f("basicCorrection/whiteBalance/temperature", 0.0) / 100.0) as f32;
+    let tint = (basic_f("basicCorrection/whiteBalance/tint", 0.0) / 100.0) as f32;
+    let expo = 2f32.powf(basic_f("basicCorrection/tone/exposure", 0.0) as f32);
+    let contrast = (basic_f("basicCorrection/tone/contrast", 0.0) / 100.0) as f32;
     let (hi, sh, wh, bl) = (
-        (pr.f("basicCorrection/tone/highlights") / 100.0) as f32,
-        (pr.f("basicCorrection/tone/shadows") / 100.0) as f32,
-        (pr.f("basicCorrection/tone/whites") / 100.0) as f32,
-        (pr.f("basicCorrection/tone/blacks") / 100.0) as f32,
+        (basic_f("basicCorrection/tone/highlights", 0.0) / 100.0) as f32,
+        (basic_f("basicCorrection/tone/shadows", 0.0) / 100.0) as f32,
+        (basic_f("basicCorrection/tone/whites", 0.0) / 100.0) as f32,
+        (basic_f("basicCorrection/tone/blacks", 0.0) / 100.0) as f32,
     );
-    let sat = (pr.f("basicCorrection/saturation") / 100.0) as f32;
-    let intensity = (pr.f("creative/lookIntensity") / 100.0) as f32;
-    let faded = (pr.f("creative/adjustments/fadedFilm") / 100.0) as f32;
-    let vib = (pr.f("creative/adjustments/vibrance") / 100.0) as f32;
-    let csat = (pr.f("creative/adjustments/creativeSaturation") / 100.0) as f32;
-    let st = tint_offset(pr.color("creative/adjustments/shadowTint"));
-    let ht = tint_offset(pr.color("creative/adjustments/highlightTint"));
-    let tbal = (pr.f("creative/adjustments/tintBalance") / 100.0) as f32;
+    let sat = (basic_f("basicCorrection/saturation", 100.0) / 100.0) as f32;
+    let intensity = (creative_f("creative/lookIntensity", 0.0) / 100.0) as f32;
+    let faded = (creative_f("creative/adjustments/fadedFilm", 0.0) / 100.0) as f32;
+    let vib = (creative_f("creative/adjustments/vibrance", 0.0) / 100.0) as f32;
+    let csat = (creative_f("creative/adjustments/creativeSaturation", 100.0) / 100.0) as f32;
+    let st = if creative_active { tint_offset(pr.color("creative/adjustments/shadowTint")) } else { [0.0; 3] };
+    let ht = if creative_active { tint_offset(pr.color("creative/adjustments/highlightTint")) } else { [0.0; 3] };
+    let tbal = (creative_f("creative/adjustments/tintBalance", 0.0) / 100.0) as f32;
     let curve = |k: &str| {
+        if !curves_active {
+            return [0.0; 3];
+        }
         [
             (pr.f(&format!("curves/{k}Shadows")) / 100.0) as f32,
             (pr.f(&format!("curves/{k}Midtones")) / 100.0) as f32,
@@ -462,20 +477,23 @@ fn lumetri(ctx: &EffectCtx, mut b: Buf) -> Buf {
         ]
     };
     let (cm, cr, cg, cb) = (curve("curveMaster"), curve("curveRed"), curve("curveGreen"), curve("curveBlue"));
-    let rgb_curves =
-        ["curves/rgbCurves/master", "curves/rgbCurves/red", "curves/rgbCurves/green", "curves/rgbCurves/blue"].map(|id| crate::color2::Curve::parse(pr.s(id)));
-    let hs = |id: &str, periodic: bool| OffsetCurve::parse(pr.s(&format!("curves/hueSaturationCurves/{id}")), periodic);
+    let rgb_curves = ["curves/rgbCurves/master", "curves/rgbCurves/red", "curves/rgbCurves/green", "curves/rgbCurves/blue"]
+        .map(|id| if curves_active && active("curves/rgbCurves/active") { crate::color2::Curve::parse(pr.s(id)) } else { None });
+    let hs = |id: &str, periodic: bool| {
+        let switch = format!("curves/hueSaturationCurves/{id}Active");
+        if curves_active && active(&switch) { OffsetCurve::parse(pr.s(&format!("curves/hueSaturationCurves/{id}")), periodic) } else { None }
+    };
     let (hue_sat, hue_hue, hue_luma, luma_sat, sat_sat) =
         (hs("hueVsSat", true), hs("hueVsHue", true), hs("hueVsLuma", true), hs("lumaVsSat", false), hs("satVsSat", false));
     let any_hs = hue_sat.is_some() || hue_hue.is_some() || hue_luma.is_some() || luma_sat.is_some() || sat_sat.is_some();
-    let ws = tint_offset(pr.color("colorWheels/shadowsWheel"));
-    let wm = tint_offset(pr.color("colorWheels/midtonesWheel"));
-    let wh_ = tint_offset(pr.color("colorWheels/highlightsWheel"));
-    let vig = pr.f("vignette/vignetteAmount") as f32;
+    let ws = if wheels_active { tint_offset(pr.color("colorWheels/shadowsWheel")) } else { [0.0; 3] };
+    let wm = if wheels_active { tint_offset(pr.color("colorWheels/midtonesWheel")) } else { [0.0; 3] };
+    let wh_ = if wheels_active { tint_offset(pr.color("colorWheels/highlightsWheel")) } else { [0.0; 3] };
+    let vig = if vignette_active { pr.f("vignette/vignetteAmount") as f32 } else { 0.0 };
     let vmid = (pr.f("vignette/vignetteMidpoint") / 100.0) as f32;
     let vround = (pr.f("vignette/vignetteRoundness") / 100.0) as f32;
     let vfeather = (pr.f("vignette/vignetteFeather") / 100.0) as f32;
-    let sharpen = (pr.f("creative/adjustments/sharpen") / 100.0) as f32;
+    let sharpen = (creative_f("creative/adjustments/sharpen", 0.0) / 100.0) as f32;
     // HSL Secondary.
     let sec = |id: &str, d: f64| pr.get(&format!("hslSecondary/{id}")).map(Value::as_f64).unwrap_or(d) as f32;
     let s_temp = sec("correction/temperature", 0.0) / 100.0;
@@ -484,8 +502,9 @@ fn lumetri(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let s_sharpen = sec("correction/sharpen", 0.0) / 100.0;
     let s_sat = sec("correction/saturation", 100.0) / 100.0;
     let s_wheel = pr.get("hslSecondary/correction/correctionWheel").map(|v| tint_offset(v.as_color())).unwrap_or([0.0; 3]);
-    let show_mask = pr.b("hslSecondary/key/showMask");
-    let sec_active = show_mask || s_temp != 0.0 || s_tint != 0.0 || s_contrast != 0.0 || s_sharpen != 0.0 || s_sat != 1.0 || s_wheel != [0.0; 3];
+    let show_mask = secondary_active && pr.b("hslSecondary/key/showMask");
+    let sec_active =
+        secondary_active && (show_mask || s_temp != 0.0 || s_tint != 0.0 || s_contrast != 0.0 || s_sharpen != 0.0 || s_sat != 1.0 || s_wheel != [0.0; 3]);
     let (lx, ly, lw, lh) = layer_rect(ctx, &b);
     let w = b.img.width as usize;
     let (cx, cy) = (lx + lw * 0.5, ly + lh * 0.5);
@@ -701,6 +720,7 @@ pub fn specs() -> Vec<EffectSpec> {
     let grey = || col(0.5, 0.5, 0.5);
     let mut lum = vec![
         p("highDynamicRange", "High Dynamic Range", Value::Bool(false), ParamUi::Checkbox),
+        p("basicCorrection/active", "Basic Correction Active", Value::Bool(true), ParamUi::Checkbox),
         p("basicCorrection/inputLut", "Input LUT", Value::Enum(0), popup(&["None", "Custom"])),
         // A .cube file path (or the file's text) for Input LUT = Custom.
         p("basicCorrection/inputLutFile", "Input LUT File", Value::Str(String::new()), ParamUi::Text),
@@ -715,6 +735,7 @@ pub fn specs() -> Vec<EffectSpec> {
         p("basicCorrection/tone/hdrWhite", "HDR White", num(100.0), slider(100.0, 10000.0, 100.0, 4000.0, 0)),
         p("basicCorrection/tone/hdrSpecular", "HDR Specular", num(0.0), bipolar()),
         p("basicCorrection/saturation", "Saturation", num(100.0), slider(0.0, 200.0, 0.0, 200.0, 1)),
+        p("creative/active", "Creative Active", Value::Bool(true), ParamUi::Checkbox),
         p("creative/look", "Look", Value::Enum(0), popup(&LUMETRI_LOOKS)),
         p("creative/lookFile", "Look File", Value::Str(String::new()), ParamUi::Text),
         p("creative/lookIntensity", "Intensity", num(100.0), slider(0.0, 200.0, 0.0, 200.0, 1)),
@@ -743,6 +764,15 @@ pub fn specs() -> Vec<EffectSpec> {
     for (id, name) in CURVES {
         lum.push(p(id, name, num(0.0), bipolar()));
     }
+    lum.extend([
+        p("curves/active", "Curves Active", Value::Bool(true), ParamUi::Checkbox),
+        p("curves/rgbCurves/active", "RGB Curves Active", Value::Bool(true), ParamUi::Checkbox),
+        p("curves/hueSaturationCurves/hueVsSatActive", "Hue vs Sat Active", Value::Bool(true), ParamUi::Checkbox),
+        p("curves/hueSaturationCurves/hueVsHueActive", "Hue vs Hue Active", Value::Bool(true), ParamUi::Checkbox),
+        p("curves/hueSaturationCurves/hueVsLumaActive", "Hue vs Luma Active", Value::Bool(true), ParamUi::Checkbox),
+        p("curves/hueSaturationCurves/lumaVsSatActive", "Luma vs Sat Active", Value::Bool(true), ParamUi::Checkbox),
+        p("curves/hueSaturationCurves/satVsSatActive", "Sat vs Sat Active", Value::Bool(true), ParamUi::Checkbox),
+    ]);
     // Curve graphs: control points "x,y x,y …" in 0..1 (like Curves). RGB curves default to
     // the identity diagonal; hue/saturation curves are flat at y = 0.5 (no change) and empty
     // means flat.
@@ -759,11 +789,13 @@ pub fn specs() -> Vec<EffectSpec> {
         pts("curves/hueSaturationCurves/satVsSat", "Sat vs Sat", ""),
     ]);
     lum.extend([
+        p("colorWheels/active", "Color Wheels Active", Value::Bool(true), ParamUi::Checkbox),
         p("colorWheels/shadowsWheel", "Shadows", grey(), ParamUi::Color),
         p("colorWheels/midtonesWheel", "Midtones", grey(), ParamUi::Color),
         p("colorWheels/highlightsWheel", "Highlights", grey(), ParamUi::Color),
         // HSL Secondary: key (hue centre / range / softness in degrees, saturation and
         // lightness bands in %), refine, correction.
+        p("hslSecondary/active", "HSL Secondary Active", Value::Bool(true), ParamUi::Checkbox),
         p("hslSecondary/key/hueEnabled", "H", Value::Bool(true), ParamUi::Checkbox),
         p("hslSecondary/key/hueCenter", "Hue Center", num(0.0), ParamUi::Angle),
         p("hslSecondary/key/hueRange", "Hue Range", num(180.0), slider(0.0, 180.0, 0.0, 180.0, 1)),
@@ -787,6 +819,7 @@ pub fn specs() -> Vec<EffectSpec> {
         p("hslSecondary/correction/contrast", "Contrast", num(0.0), bipolar()),
         p("hslSecondary/correction/sharpen", "Sharpen", num(0.0), bipolar()),
         p("hslSecondary/correction/saturation", "Saturation", num(100.0), slider(0.0, 200.0, 0.0, 200.0, 1)),
+        p("vignette/active", "Vignette Active", Value::Bool(true), ParamUi::Checkbox),
         p("vignette/vignetteAmount", "Amount", num(0.0), slider(-5.0, 5.0, -5.0, 5.0, 2)),
         p("vignette/vignetteMidpoint", "Midpoint", num(50.0), pct()),
         p("vignette/vignetteRoundness", "Roundness", num(0.0), bipolar()),
@@ -941,6 +974,28 @@ mod tests {
         let c = run("ec.color.lumetri", &[("curves/curveMasterMidtones", num(50.0))], g.clone());
         assert!(c.get(0, 0)[0] > 0.4);
         assert_eq!(c.data, run("ec.color.lumetri", &[("curves/curveMasterMidtones", num(50.0))], g).data);
+    }
+
+    #[test]
+    fn lumetri_section_switches_disable_only_their_section() {
+        let g = Image::filled(8, 8, [0.4, 0.4, 0.4, 1.0]);
+        let exposure = ("basicCorrection/tone/exposure", num(1.0));
+        let midtone = ("curves/curveMasterMidtones", num(50.0));
+        let both = run("ec.color.lumetri", &[exposure.clone(), midtone.clone()], g.clone());
+        let no_basic = run("ec.color.lumetri", &[exposure.clone(), midtone.clone(), ("basicCorrection/active", Value::Bool(false))], g.clone());
+        let curve_only = run("ec.color.lumetri", std::slice::from_ref(&midtone), g.clone());
+        assert!(close(&no_basic, &curve_only, 1e-5));
+        let no_curves = run("ec.color.lumetri", &[exposure.clone(), midtone, ("curves/active", Value::Bool(false))], g.clone());
+        let basic_only = run("ec.color.lumetri", &[exposure], g.clone());
+        assert!(close(&no_curves, &basic_only, 1e-5));
+        assert!(!close(&both, &g, 1e-3));
+
+        let rgb = ("curves/rgbCurves/master", s("0,0 0.5,0.75 1,1"));
+        let off = run("ec.color.lumetri", &[rgb, ("curves/rgbCurves/active", Value::Bool(false))], g.clone());
+        assert!(close(&off, &g, 1e-5));
+        let vignette = ("vignette/vignetteAmount", num(-3.0));
+        let off = run("ec.color.lumetri", &[vignette, ("vignette/active", Value::Bool(false))], g.clone());
+        assert!(close(&off, &g, 1e-5));
     }
 
     fn s(v: &str) -> Value {

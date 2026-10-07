@@ -93,6 +93,11 @@ pub type Result<T> = std::result::Result<T, EngineError>;
 pub trait Services: Send + Sync {
     fn read_file(&self, path: &str) -> std::io::Result<Vec<u8>>;
     fn write_file(&self, path: &str, data: &[u8]) -> std::io::Result<()>;
+    /// Convert an After Effects project to the versioned AEP import document.
+    /// Browser hosts and hosts without the optional importer can return Unsupported.
+    fn export_aep_ir(&self, _path: &str) -> std::io::Result<Vec<u8>> {
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "AEP importer is not configured on this host"))
+    }
     /// Whether a file exists (the background footage check after open).
     fn exists(&self, path: &str) -> bool {
         std::path::Path::new(path).exists()
@@ -116,6 +121,40 @@ impl Services for FsServices {
     }
     fn write_file(&self, path: &str, data: &[u8]) -> std::io::Result<()> {
         config::atomic_write(std::path::Path::new(path), data)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    fn export_aep_ir(&self, path: &str) -> std::io::Result<Vec<u8>> {
+        let script = std::env::var_os("EFFECTCRAFT_AEP_EXPORTER")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                let exe = std::env::current_exe().ok()?;
+                let mac_resource = exe.parent()?.join("../Resources/aep_ir_export.py");
+                if mac_resource.is_file() {
+                    return Some(mac_resource);
+                }
+                exe.ancestors().map(|dir| dir.join("packaging/aep/aep_ir_export.py")).find(|candidate| candidate.is_file())
+            })
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "AEP exporter script missing; set EFFECTCRAFT_AEP_EXPORTER"))?;
+        let python = std::env::var_os("EFFECTCRAFT_AEP_PYTHON").unwrap_or_else(|| "python3".into());
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+        let output = std::env::temp_dir().join(format!("effectcraft-aep-{}-{stamp}.json", std::process::id()));
+        let mut command = std::process::Command::new(python);
+        command.arg(script).arg(path).arg("-o").arg(&output);
+        if let Some(root) = std::env::var_os("EFFECTCRAFT_AEP_FONT_ROOT").filter(|root| !root.is_empty()) {
+            command.arg("--font-search-root").arg(root);
+        }
+        let run = command.output()?;
+        if !run.status.success() {
+            let _ = std::fs::remove_file(&output);
+            let error = String::from_utf8_lossy(&run.stderr);
+            return Err(std::io::Error::other(format!(
+                "AEP export failed (set EFFECTCRAFT_AEP_PYTHON to an interpreter with py-aep installed): {}",
+                error.trim()
+            )));
+        }
+        let bytes = std::fs::read(&output);
+        let _ = std::fs::remove_file(&output);
+        bytes
     }
 }
 
@@ -939,6 +978,8 @@ mod rq_tests;
 mod tests;
 #[cfg(test)]
 mod tests_3d;
+#[cfg(test)]
+mod tests_aep;
 #[cfg(test)]
 mod tests_anim_tools;
 #[cfg(test)]

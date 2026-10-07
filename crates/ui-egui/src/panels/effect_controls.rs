@@ -389,19 +389,7 @@ fn prop_row(
 
 /// Colour of a gradient at `f` (colour stops only).
 fn gradient_at(g: &effectcraft_engine::keyframe::Gradient, f: f64) -> Color32 {
-    let stops = &g.colors;
-    let c = if stops.is_empty() {
-        [0.0, 0.0, 0.0, 1.0]
-    } else if f <= stops[0].0 {
-        stops[0].1
-    } else if f >= stops[stops.len() - 1].0 {
-        stops[stops.len() - 1].1
-    } else {
-        let i = stops.iter().position(|s| s.0 > f).unwrap_or(stops.len() - 1).max(1);
-        let (a, b) = (stops[i - 1], stops[i]);
-        let k = ((f - a.0) / (b.0 - a.0).max(1e-9)) as f32;
-        [0, 1, 2, 3].map(|j| a.1[j] + (b.1[j] - a.1[j]) * k)
-    };
+    let c = g.sample(f);
     Color32::from_rgb((c[0].clamp(0.0, 1.0) * 255.0) as u8, (c[1].clamp(0.0, 1.0) * 255.0) as u8, (c[2].clamp(0.0, 1.0) * 255.0) as u8)
 }
 

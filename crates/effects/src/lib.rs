@@ -49,6 +49,8 @@ pub mod plugin;
 pub mod psim;
 pub mod puppet;
 pub mod roto;
+mod sapphire_compat;
+mod shadow_studio;
 mod sim;
 mod sim2;
 mod sim3;
@@ -420,6 +422,8 @@ pub fn registry() -> &'static [EffectSpec] {
     R.get_or_init(|| {
         let mut v = Vec::new();
         v.extend(misc::specs());
+        v.extend(sapphire_compat::specs());
+        v.extend(shadow_studio::specs());
         v.extend(color_fx::specs());
         v.extend(generate::specs());
         v.extend(distort::specs());
@@ -505,7 +509,12 @@ pub fn categories() -> Vec<&'static str> {
 }
 
 /// After Effects' third-party display names of effects we register under a generic name.
-const ALIASES: &[(&str, &[&str])] = &[("ec.keying.keylight", keylight::KEYLIGHT_ALIASES)];
+const ALIASES: &[(&str, &[&str])] = &[
+    ("ec.keying.keylight", keylight::KEYLIGHT_ALIASES),
+    ("ec.stylize.deepglow", &["PEDG", "Deep Glow"]),
+    ("ec.perspective.shadowstudio2", &["PESS2", "Shadow Studio 2"]),
+    ("ec.perspective.shadowstudio3", &["PESS3", "Shadow Studio 3"]),
+];
 
 /// Other names effect `id` answers to (in [`lookup`] and searches).
 pub fn aliases(id: &str) -> &'static [&'static str] {

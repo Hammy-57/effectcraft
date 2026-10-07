@@ -44,7 +44,9 @@ fn gradient_ramp(ctx: &EffectCtx, mut b: Buf) -> Buf {
             }
             let t = t.clamp(0.0, 1.0);
             let c = [c0[0] + (c1[0] - c0[0]) * t, c0[1] + (c1[1] - c0[1]) * t, c0[2] + (c1[2] - c0[2]) * t];
-            put(px, c, 1.0, blend);
+            // Gradient Ramp colours the already-masked layer; it must not fill transparent pixels.
+            let alpha = px[3];
+            put(px, c, alpha, blend);
         }
     });
     b
@@ -398,6 +400,23 @@ mod generator_tests {
 
     fn red() -> Image {
         Image::filled(32, 32, [1.0, 0.0, 0.0, 1.0])
+    }
+
+    #[test]
+    fn gradient_ramp_preserves_masked_alpha() {
+        let mut img = Image::new(3, 1);
+        img.data[1] = [0.5, 0.0, 0.0, 0.5];
+        img.data[2] = [1.0, 0.0, 0.0, 1.0];
+        let out = run_fx(
+            "ec.generate.gradientramp",
+            &[("startColor", Value::Color([0.0, 0.0, 1.0, 1.0])), ("endColor", Value::Color([0.0, 0.0, 1.0, 1.0]))],
+            img,
+            0.0,
+            EffectEnv::default(),
+        );
+        assert_eq!(out.img.data[0], [0.0; 4]);
+        assert_eq!(out.img.data[1], [0.0, 0.0, 0.5, 0.5]);
+        assert_eq!(out.img.data[2], [0.0, 0.0, 1.0, 1.0]);
     }
 
     #[test]

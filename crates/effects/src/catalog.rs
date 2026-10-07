@@ -7,7 +7,20 @@ use crate::{CATEGORIES, registry};
 /// Effects whose implementation is known to fall short of the reference behaviour:
 /// `(effect id, what is missing)`. Everything else in the registry is implemented in full as far
 /// as the public behaviour documentation describes it.
-pub const PARTIAL: &[(&str, &str)] = &[];
+pub const PARTIAL: &[(&str, &str)] = &[
+    ("ec.stylize.deepglow", "Approximate falloff, tint, chromatic aberration and downsampling; edge modes and masking are not fully matched"),
+    ("ec.perspective.shadowstudio2", "Approximate sampled directional shadow; easing, texture, inner and point modes are not implemented"),
+    ("ec.perspective.shadowstudio3", "Approximate sampled directional shadow; raytracing, gradients, texture, inner and point modes are not implemented"),
+    ("ec.perspective.cccylinder", "Orthographic 3D projection; AE camera and rotation-order settings are not yet matched"),
+    ("ec.noise.addgrain", "RGB color matching is calibrated for corpus defaults; other criteria, matte blur and external mask input are not implemented"),
+    ("S_CartoonPaint", "Approximate smoothing and edges; brush strokes, Mocha geometry, mask blur and mask combining are not implemented"),
+    ("S_DropShadow", "Basic alpha shadow; matte and background inputs are not implemented"),
+    ("S_Glow", "Bright-pass Gaussian; atmosphere and combine modes are not implemented"),
+    ("S_Gradient", "Linear ramp with limited combine modes"),
+    ("S_Grid", "2D grid only; latitude, swing and perspective are not implemented"),
+    ("S_HalfTone", "Basic monochrome dot screen"),
+    ("S_Monochrome", "Layer/path mask input is implemented; Mocha geometry, mask blur and mask combining are not implemented"),
+];
 
 /// Whether Effect Controls shows parameter (or twirl-down group) `param` (spec id path,
 /// `group/param`) of an instance of effect `effect`, given the instance's current values

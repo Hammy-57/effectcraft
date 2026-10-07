@@ -543,7 +543,11 @@ fn gradient_of(d: &Descriptor) -> Option<Gradient> {
             _ => None,
         })
         .collect();
-    (!colors.is_empty()).then(|| Gradient { colors, opacities: if opacities.is_empty() { vec![(0.0, 1.0), (1.0, 1.0)] } else { opacities } })
+    (!colors.is_empty()).then(|| Gradient {
+        colors,
+        opacities: if opacities.is_empty() { vec![(0.0, 1.0), (1.0, 1.0)] } else { opacities },
+        ..Default::default()
+    })
 }
 
 /// The effect descriptor for `key`, or the first enabled one of its `…Multi` list.

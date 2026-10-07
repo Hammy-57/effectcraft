@@ -3,7 +3,7 @@
 use effectcraft_color::luminance;
 use effectcraft_keyframe::Value;
 use effectcraft_project::ParamUi;
-use effectcraft_raster::{Image, gaussian_blur, hash_noise};
+use effectcraft_raster::{Image, gaussian_blur, hash_noise, resample};
 use rayon::prelude::*;
 
 use crate::{Buf, EffectCtx, EffectSpec, col, num, p, popup, slider};
@@ -222,6 +222,145 @@ fn glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
         }
         o[3] = o[3].clamp(0.0, 1.0);
     });
+    b
+}
+
+/// Editable, clean-room approximation of Plugin Everything Deep Glow v1. The public product
+/// description specifies a wide inverse-square-like falloff; three Gaussian scales approximate
+/// that profile without depending on the third-party plug-in.
+fn deep_glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
+    let radius = (ctx.params.f("PEDG-0001") * b.scale).clamp(0.0, 512.0);
+    if !radius.is_finite() || radius < 0.5 {
+        return b;
+    }
+    // Mode 2 is the expanded transparent-edge setting found in every SceneYard instance.
+    let edge = ctx.params.e("PEDG-0055");
+    let pad = if edge == 0 || ctx.adjustment { 0 } else { (radius * if ctx.params.e("PEDG-0084") == 1 { 1.5 } else { 1.0 }).ceil() as u32 };
+    // ponytail: bound full-image padding; tile the glow for larger frames or radii.
+    let expanded_w = b.img.width.saturating_add(pad.saturating_mul(2));
+    let expanded_h = b.img.height.saturating_add(pad.saturating_mul(2));
+    if u64::from(expanded_w) * u64::from(expanded_h) > 32_000_000 {
+        return b;
+    }
+    if pad > 0 {
+        b.pad(pad);
+    }
+    let threshold = (ctx.params.f("PEDG-0004") / 100.0).max(0.0) as f32;
+    let smooth = (ctx.params.f("PEDG-0005") / 100.0).max(0.0) as f32;
+    let mut source = b.img.clone();
+    source.data.par_iter_mut().for_each(|px| {
+        let a = px[3];
+        let l = if a > 0.0 { luminance(px[0] / a, px[1] / a, px[2] / a) } else { 0.0 };
+        let k = if smooth > 0.0 {
+            ((l - threshold) / smooth).clamp(0.0, 1.0)
+        } else if l >= threshold {
+            1.0
+        } else {
+            0.0
+        };
+        for v in px.iter_mut() {
+            *v *= k;
+        }
+    });
+    if let Some(layer) = ctx.layer_param("PEDG-0056", true) {
+        let mask = crate::util::fit_layer(ctx, &b, &layer, false);
+        let luma = ctx.params.e("PEDG-0057") == 1;
+        let invert = ctx.params.b("PEDG-0059");
+        source.data.par_iter_mut().zip(mask.data.par_iter()).for_each(|(px, m)| {
+            let mut amount = if luma && m[3] > 0.0 { luminance(m[0] / m[3], m[1] / m[3], m[2] / m[3]) * m[3] } else { m[3] };
+            if invert {
+                amount = 1.0 - amount;
+            }
+            for channel in px.iter_mut() {
+                *channel *= amount.clamp(0.0, 1.0);
+            }
+        });
+    }
+    // AE View 1 (native index 0) previews the glow input; View 2 renders the final composite.
+    if ctx.params.e("PEDG-0023") == 0 {
+        b.img = source;
+        return b;
+    }
+    let spread = (ctx.params.f("PEDG-0011") / 100.0).clamp(0.0, 1.0) as f32;
+    let near = (0.30 - 0.35 * spread).max(0.05);
+    let far = 0.30 + 0.44 * spread;
+    // A broad, unnormalised halo keeps thin bright strokes visible far from their source.
+    let weights = [near * 13.5, (1.0 - near - far) * 13.5, far * 13.5];
+    let aspect = ctx.params.f("PEDG-0010").clamp(0.0, 2.0);
+    let chroma = if ctx.params.b("PEDG-0013") { ctx.params.f("PEDG-0015").clamp(0.0, 2.0) as f32 } else { 0.0 };
+    let downsample = (ctx.params.f("PEDG-0019") / 100.0).clamp(0.1, 1.0);
+    let mut halo = Image::new(b.img.width, b.img.height);
+    for (step, (sigma, weight)) in [(0.035, weights[0]), (0.14, weights[1]), (0.42, weights[2])].into_iter().enumerate() {
+        let (sx, sy) = (radius * sigma * aspect, radius * sigma * (2.0 - aspect));
+        let blurred = if step == 2 && downsample < 0.999 {
+            let (w, h) = ((source.width as f64 * downsample).round().max(1.0) as u32, (source.height as f64 * downsample).round().max(1.0) as u32);
+            let small = resample(&source, w, h);
+            resample(&gaussian_blur(&small, sx * downsample, sy * downsample, false), source.width, source.height)
+        } else {
+            gaussian_blur(&source, sx, sy, false)
+        };
+        halo.data.par_iter_mut().zip(blurred.data.par_iter()).for_each(|(out, px)| {
+            for c in 0..4 {
+                let fringe = if c == 0 {
+                    [1.0, 1.0, 1.0 + chroma][step]
+                } else if c == 2 {
+                    [1.0 + chroma, 1.0, 1.0][step]
+                } else {
+                    1.0
+                };
+                out[c] += px[c] * weight * fringe;
+            }
+        });
+    }
+    let exposure = ctx.params.f("PEDG-0002").clamp(0.0, 64.0) as f32;
+    // Deep Glow's gamma correction applies exposure in approximate linear light.
+    let exposure = if ctx.params.b("PEDG-0043") || ctx.params.b("PEDG-0009") { exposure.powf(2.1) } else { exposure };
+    let source_opacity = (ctx.params.f("PEDG-0024") / 100.0).clamp(0.0, 1.0) as f32;
+    let screen = ctx.params.e("PEDG-0008") == 0;
+    let tint = ctx.params.b("PEDG-0037");
+    let tint_color = ctx.params.color("PEDG-0038");
+    let tint_mode = ctx.params.e("PEDG-0039");
+    let tint_mix = (ctx.params.f("PEDG-0041") / 100.0).clamp(0.0, 1.0) as f32;
+    b.img.data.par_iter_mut().zip(halo.data.par_iter()).for_each(|(out, glow)| {
+        let original = *out;
+        for c in 0..3 {
+            let mut g = glow[c] * exposure;
+            if tint {
+                let t = tint_color[c];
+                let tinted = match tint_mode {
+                    1 if g <= 0.5 => 2.0 * g * t,
+                    1 => 1.0 - 2.0 * (1.0 - g) * (1.0 - t),
+                    2 if t <= 0.5 => g - (1.0 - 2.0 * t) * g * (1.0 - g),
+                    2 => g + (2.0 * t - 1.0) * ((if g <= 0.25 { ((16.0 * g - 12.0) * g + 4.0) * g } else { g.sqrt() }) - g),
+                    _ => g * t,
+                };
+                g += (tinted - g) * tint_mix;
+            }
+            let s = original[c] * source_opacity;
+            out[c] = if screen { (s + g - s * g).clamp(0.0, 1.0) } else { s + g };
+        }
+        out[3] = (glow[3] * exposure + original[3] * source_opacity).clamp(0.0, 1.0);
+    });
+    if !ctx.params.b("PEDG-0025") {
+        b.img.data.par_iter_mut().for_each(|px| px[3] = 1.0);
+    }
+    if ctx.params.b("PEDG-0031") {
+        let amount = (ctx.params.f("PEDG-0033") / 100.0).clamp(0.0, 1.0) as f32 / 255.0;
+        let monochrome = ctx.params.b("PEDG-0032");
+        let width = b.img.width;
+        b.img.rows_mut().for_each(|(y, row)| {
+            for (x, px) in row.iter_mut().enumerate() {
+                if px[3] < 0.999 {
+                    continue;
+                }
+                let channel_noise =
+                    |c: u32| (hash_noise((x as u32).wrapping_add(if monochrome { 0 } else { c.wrapping_mul(width) }), y as u32, ctx.seed) - 0.5) * amount;
+                for c in 0..3 {
+                    px[c] = (px[c] + channel_noise(c as u32)).max(0.0);
+                }
+            }
+        });
+    }
     b
 }
 
@@ -628,6 +767,41 @@ pub fn specs() -> Vec<EffectSpec> {
             glow,
         ),
         spec(
+            "ec.stylize.deepglow",
+            "Deep Glow (Native)",
+            "Stylize",
+            vec![
+                p("PEDG-0001", "Radius", num(116.0), slider(0.0, 2000.0, 0.0, 500.0, 0)),
+                p("PEDG-0002", "Exposure", num(1.0), slider(0.0, 64.0, 0.0, 4.0, 2)),
+                p("PEDG-0004", "Threshold", num(0.0), slider(0.0, 1600.0, 0.0, 100.0, 0)),
+                p("PEDG-0005", "Threshold Smooth", num(0.0), slider(0.0, 100.0, 0.0, 100.0, 0)),
+                p("PEDG-0008", "Blend Mode", Value::Enum(0), popup(&["Screen", "Add"])),
+                p("PEDG-0009", "Gamma Correction", Value::Bool(false), ParamUi::Checkbox),
+                p("PEDG-0010", "Aspect Ratio", num(1.0), slider(0.0, 2.0, 0.0, 2.0, 2)),
+                p("PEDG-0011", "Spread", num(33.0), slider(0.0, 100.0, 0.0, 100.0, 0)),
+                p("PEDG-0019", "Downsample", num(80.0), slider(10.0, 100.0, 10.0, 100.0, 0)),
+                p("PEDG-0025", "Unmult (Generate Alpha)", Value::Bool(true), ParamUi::Checkbox),
+                p("PEDG-0031", "Dither", Value::Bool(true), ParamUi::Checkbox),
+                p("PEDG-0032", "Monochromatic Dither", Value::Bool(false), ParamUi::Checkbox),
+                p("PEDG-0033", "Dither Amount", num(50.0), slider(0.0, 100.0, 0.0, 100.0, 0)),
+                p("PEDG-0055", "Edge Behaviour", Value::Enum(1), slider(0.0, 2.0, 0.0, 2.0, 0)),
+                p("PEDG-0084", "Buffer Expansion", Value::Enum(0), popup(&["Auto", "Compatibility"])),
+                p("PEDG-0013", "Chromatic Aberration", Value::Bool(false), ParamUi::Checkbox),
+                p("PEDG-0015", "Chromatic Amount", num(0.25), slider(0.0, 2.0, 0.0, 2.0, 2)),
+                p("PEDG-0037", "Tint", Value::Bool(false), ParamUi::Checkbox),
+                p("PEDG-0038", "Tint Color", col(1.0, 0.0, 0.0), ParamUi::Color),
+                p("PEDG-0039", "Tint Mode", Value::Enum(0), popup(&["Standard", "Overlay", "Soft Light"])),
+                p("PEDG-0041", "Tint Mix", num(100.0), slider(0.0, 100.0, 0.0, 100.0, 0)),
+                p("PEDG-0043", "Auto Detect Gamma", Value::Bool(true), ParamUi::Checkbox),
+                p("PEDG-0056", "Mask Layer", Value::Layer(None), ParamUi::Layer),
+                p("PEDG-0057", "Mask Mode", Value::Enum(0), popup(&["Alpha", "Luminance"])),
+                p("PEDG-0059", "Invert Mask", Value::Bool(false), ParamUi::Checkbox),
+                p("PEDG-0023", "View", Value::Enum(1), popup(&["Glow Input", "Final"])),
+                p("PEDG-0024", "Source Opacity", num(100.0), slider(0.0, 100.0, 0.0, 100.0, 0)),
+            ],
+            deep_glow,
+        ),
+        spec(
             "ec.stylize.mosaic",
             "Mosaic",
             "Stylize",
@@ -779,5 +953,70 @@ mod tests {
         let red = run(&[("colors", Value::Enum(2)), ("arbitraryMap", Value::Str("0,1 1,1|0,0 1,0|0,0 1,0".into())), ("operation", Value::Enum(2))]);
         let p = red.get(6, 12);
         assert!(p[0] > 0.05 && p[1] < 1e-4 && p[2] < 1e-4, "{p:?}");
+    }
+
+    #[test]
+    fn deep_glow_renders_editable_halo() {
+        assert_eq!(crate::lookup("PEDG").map(|s| s.id), Some("ec.stylize.deepglow"));
+        let mut img = Image::new(17, 17);
+        img.set(8, 8, [1.0, 0.25, 0.1, 1.0]);
+        let run = |vals: &[(&str, Value)]| run_fx("ec.stylize.deepglow", vals, img.clone(), 0.0, EffectEnv::default());
+        let base = run(&[("PEDG-0001", num(8.0))]);
+        let pixel = |b: &Buf, x: i64, y: i64| b.img.get(x + b.offset[0] as i64, y + b.offset[1] as i64);
+        assert!(pixel(&base, 11, 8)[0] > 0.0, "radius must create a halo");
+        assert!(pixel(&base, 11, 8)[0] > pixel(&base, 11, 8)[1], "halo keeps source hue");
+        let brighter = run(&[("PEDG-0001", num(8.0)), ("PEDG-0002", num(2.0))]);
+        assert!(pixel(&brighter, 11, 8)[0] > pixel(&base, 11, 8)[0], "exposure must brighten halo");
+        let cut = run(&[("PEDG-0001", num(8.0)), ("PEDG-0004", num(200.0))]);
+        assert_eq!(pixel(&cut, 11, 8)[0], 0.0, "threshold must remove dim sources");
+        let source = run(&[("PEDG-0001", num(8.0)), ("PEDG-0023", Value::Enum(0))]);
+        assert_eq!(pixel(&source, 11, 8)[0], 0.0, "input view must omit halo");
+        let lower_quality = run(&[("PEDG-0001", num(8.0)), ("PEDG-0019", num(75.0))]);
+        assert_ne!(pixel(&lower_quality, 11, 8), pixel(&base, 11, 8), "Downsample must change the broad halo");
+        let clipped = run(&[("PEDG-0001", num(8.0)), ("PEDG-0055", Value::Enum(0))]);
+        assert_eq!(clipped.offset, [0.0, 0.0], "edge mode 0 keeps layer bounds");
+        let compatible = run(&[("PEDG-0001", num(8.0)), ("PEDG-0084", Value::Enum(1))]);
+        assert!(compatible.offset[0] > base.offset[0], "compatibility buffer expands farther");
+        // The AEP importer converts one-based AE enum values to zero-based native indices.
+        let native = |raw: u32| Value::Enum(raw - 1);
+        let corpus = run(&[("PEDG-0001", num(8.0)), ("PEDG-0008", native(1)), ("PEDG-0023", native(2)), ("PEDG-0055", native(2)), ("PEDG-0084", native(1))]);
+        assert_eq!(corpus.offset, base.offset);
+        assert!(pixel(&corpus, 11, 8)[0] > 0.0, "AE View 2 must render final glow");
+        let add = run(&[("PEDG-0001", num(8.0)), ("PEDG-0008", native(2))]);
+        assert!(pixel(&add, 8, 8)[0] > pixel(&corpus, 8, 8)[0], "AE Blend Mode 2 must use unclamped Add");
+        let low_auto = run(&[("PEDG-0001", num(8.0)), ("PEDG-0002", num(0.37))]);
+        let low_linear = run(&[("PEDG-0001", num(8.0)), ("PEDG-0002", num(0.37)), ("PEDG-0043", Value::Bool(false))]);
+        assert!(pixel(&low_auto, 11, 8)[0] < pixel(&low_linear, 11, 8)[0], "auto gamma must temper subunit exposure");
+        let low_manual = run(&[("PEDG-0001", num(8.0)), ("PEDG-0002", num(0.37)), ("PEDG-0043", Value::Bool(false)), ("PEDG-0009", Value::Bool(true))]);
+        assert_eq!(pixel(&low_auto, 11, 8), pixel(&low_manual, 11, 8), "manual gamma can replace auto detection");
+        let unit_linear = run(&[("PEDG-0001", num(8.0)), ("PEDG-0043", Value::Bool(false))]);
+        assert_eq!(pixel(&base, 11, 8), pixel(&unit_linear, 11, 8), "unit exposure stays calibrated");
+        let tint = [("PEDG-0001", num(8.0)), ("PEDG-0037", Value::Bool(true)), ("PEDG-0038", Value::Color([0.8, 0.2, 0.5, 1.0]))];
+        let standard = run(&[tint[0].clone(), tint[1].clone(), tint[2].clone(), ("PEDG-0039", native(1))]);
+        let overlay = run(&[tint[0].clone(), tint[1].clone(), tint[2].clone(), ("PEDG-0039", native(2))]);
+        assert_ne!(pixel(&standard, 11, 8), pixel(&overlay, 11, 8), "Tint Mode must alter the glow");
+        let host = crate::channel2::tests::FakeHost(Image::new(17, 17));
+        let masked = |invert| {
+            run_fx(
+                "ec.stylize.deepglow",
+                &[("PEDG-0001", num(8.0)), ("PEDG-0056", Value::Layer(Some(7))), ("PEDG-0059", Value::Bool(invert))],
+                img.clone(),
+                0.0,
+                EffectEnv { host: Some(&host), ..Default::default() },
+            )
+        };
+        assert_eq!(pixel(&masked(false), 11, 8)[0], 0.0, "transparent mask must suppress the glow");
+        assert!(pixel(&masked(true), 11, 8)[0] > 0.0, "inverted mask restores the glow");
+
+        let mut impulse = Image::new(9, 9);
+        impulse.set(4, 4, [1.0; 4]);
+        let wide = run_fx("ec.stylize.deepglow", &[("PEDG-0001", num(320.0))], impulse.clone(), 0.0, EffectEnv::default());
+        assert!(pixel(&wide, 284, 4)[0] > 0.0, "large SceneYard radii must extend beyond 256 px");
+        let opaque = run_fx("ec.stylize.deepglow", &[("PEDG-0001", num(8.0)), ("PEDG-0025", Value::Bool(false))], impulse, 0.0, EffectEnv::default());
+        assert_eq!(pixel(&opaque, 7, 7)[3], 1.0, "Unmult off keeps a black opaque backdrop");
+        let gray = Image::filled(9, 9, [0.3, 0.3, 0.3, 1.0]);
+        let dithered = run_fx("ec.stylize.deepglow", &[("PEDG-0001", num(8.0))], gray.clone(), 0.0, EffectEnv::default());
+        let clean = run_fx("ec.stylize.deepglow", &[("PEDG-0001", num(8.0)), ("PEDG-0031", Value::Bool(false))], gray, 0.0, EffectEnv::default());
+        assert!(dithered.img.data.iter().zip(&clean.img.data).any(|(a, b)| a != b), "Dither must affect opaque pixels");
     }
 }

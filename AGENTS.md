@@ -95,6 +95,12 @@ reproduce an image (for example, point lists traced from someone else's icon).
   reference or third-party decoders/encoders while implementing a format, even permissively licensed
   ones (libvpx, libopus, libaom, dav1d, openh264…); spec text and conformance vectors only. Record the
   spec edition used in the crate README.
+- **Owner-approved AEP exception (2026-10-06):** For `.aep` import only, contributors may study and
+  reuse the MIT-licensed `py-aep` parser to recover editable project data that After Effects scripting
+  does not expose, including through a Python process at import time. Converted projects and the
+  compositor remain native Rust. Keep its licence and attribution with any copied code. This exception
+  does not permit reading or copying Adobe application code, assets, presets or plug-ins, and does not change the rules
+  for any other format.
 - ffmpeg/ffprobe may be used only as external test oracles and fixture generators. They are never
   linked, bundled or shipped.
 - Dependencies must use permissive licences: MIT/Apache-2.0/BSD/ISC/Zlib/Unicode/CC0/BSL-1.0, or
