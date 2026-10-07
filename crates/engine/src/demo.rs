@@ -105,7 +105,11 @@ fn lower_third(p: &mut Project) -> Comp {
             false,
             [-280.0, 0.0],
             [280.0, 0.0],
-            Gradient { colors: vec![(0.0, [0.18, 0.55, 0.92, 1.0]), (1.0, [0.55, 0.32, 0.98, 1.0])], opacities: vec![(0.0, 1.0), (1.0, 1.0)], ..Default::default() },
+            Gradient {
+                colors: vec![(0.0, [0.18, 0.55, 0.92, 1.0]), (1.0, [0.55, 0.32, 0.98, 1.0])],
+                opacities: vec![(0.0, 1.0), (1.0, 1.0)],
+                ..Default::default()
+            },
         );
         let g = build::shape_group(&mut ids, "Bar", vec![rect, gfill]);
         contents(&mut bar, vec![g]);

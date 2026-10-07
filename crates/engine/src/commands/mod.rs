@@ -1,8 +1,8 @@
 //! The command registry. Ids follow After Effects' menu structure; every menu item, panel button,
 //! shortcut and viewer/timeline gesture maps to one of these.
 
-mod align;
 mod aep;
+mod align;
 mod align_data;
 mod anim;
 pub mod anim_tools;

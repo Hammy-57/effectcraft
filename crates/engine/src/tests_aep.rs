@@ -23,9 +23,14 @@ fn strict_import_rejects_declared_loss_without_mutating_project() {
     session.execute("comp.new", json!({"name": "Keep Me"})).unwrap();
     let before = session.project.to_file_json().unwrap();
     let path = std::env::temp_dir().join(format!("effectcraft-lossy-aep-ir-{}.json", std::process::id()));
-    std::fs::write(&path, json!({"schema_version":1,"items":[
+    std::fs::write(
+        &path,
+        json!({"schema_version":1,"items":[
         {"id":1,"kind":"comp","name":"Rejected","width":320,"height":180,"duration":1,"frame_rate":24,"layers":[]}
-    ],"losses":[{"reason":"opaque_value"}]}).to_string()).unwrap();
+    ],"losses":[{"reason":"opaque_value"}]})
+        .to_string(),
+    )
+    .unwrap();
 
     assert!(session.execute("file.importAeIr", json!({"path":path.to_string_lossy()})).is_err());
     assert_eq!(session.project.to_file_json().unwrap(), before);

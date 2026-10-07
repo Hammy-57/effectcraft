@@ -279,7 +279,14 @@ pub fn style(ids: &mut Ids, id: &str) -> Option<PropGroup> {
         "gradientOverlay" => vec![
             mode(ids, "blendMode", "Blend Mode", BlendMode::Normal),
             pct(ids, "opacity", "Opacity", 100.0),
-            gradient(ids, Gradient { colors: vec![(0.0, [0.0, 0.0, 0.0, 1.0]), (1.0, [1.0, 1.0, 1.0, 1.0])], opacities: vec![(0.0, 1.0), (1.0, 1.0)], ..Default::default() }),
+            gradient(
+                ids,
+                Gradient {
+                    colors: vec![(0.0, [0.0, 0.0, 0.0, 1.0]), (1.0, [1.0, 1.0, 1.0, 1.0])],
+                    opacities: vec![(0.0, 1.0), (1.0, 1.0)],
+                    ..Default::default()
+                },
+            ),
             pct(ids, "gradientSmoothness", "Gradient Smoothness", 100.0),
             angle(ids, "angle", "Angle", 90.0),
             pop(ids, "style", "Style", 0, GRADIENT_STYLE),

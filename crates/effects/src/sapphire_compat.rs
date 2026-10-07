@@ -4,11 +4,11 @@
 use effectcraft_color::luminance;
 use effectcraft_keyframe::Value;
 use effectcraft_project::ParamUi;
-use effectcraft_raster::{gaussian_blur, Image};
+use effectcraft_raster::{Image, gaussian_blur};
 use rayon::prelude::*;
 
-use crate::util::{fit_layer, gauss_plane, morph_frac, point_in_poly, premul, unpremul, Plane};
-use crate::{col, num, popup, slider, Buf, EffectCtx, EffectSpec, ParamSpec};
+use crate::util::{Plane, fit_layer, gauss_plane, morph_frac, point_in_poly, premul, unpremul};
+use crate::{Buf, EffectCtx, EffectSpec, ParamSpec, col, num, popup, slider};
 
 fn param(prefix: &'static str, n: u16, name: &'static str, default: Value, ui: ParamUi) -> ParamSpec {
     let id: &'static str = Box::leak(format!("{prefix}-{n:04}").into_boxed_str());

@@ -156,7 +156,12 @@ pub struct Gradient {
 
 impl Default for Gradient {
     fn default() -> Self {
-        Gradient { colors: vec![(0.0, [1.0, 1.0, 1.0, 1.0]), (1.0, [0.0, 0.0, 0.0, 1.0])], opacities: vec![(0.0, 1.0), (1.0, 1.0)], color_midpoints: vec![], opacity_midpoints: vec![] }
+        Gradient {
+            colors: vec![(0.0, [1.0, 1.0, 1.0, 1.0]), (1.0, [0.0, 0.0, 0.0, 1.0])],
+            opacities: vec![(0.0, 1.0), (1.0, 1.0)],
+            color_midpoints: vec![],
+            opacity_midpoints: vec![],
+        }
     }
 }
 
@@ -324,11 +329,20 @@ impl Value {
                     })
                     .collect();
                 let opacities = a.opacities.iter().zip(&b.opacities).map(|(x, y)| (x.0 + (y.0 - x.0) * t, x.1 + (y.1 - x.1) * t as f32)).collect();
-                let midpoint_lerp = |a: &[f64], b: &[f64], n: usize| (0..n).map(|i| {
-                    let x = a.get(i).copied().unwrap_or(0.5);
-                    x + (b.get(i).copied().unwrap_or(0.5) - x) * t
-                }).collect();
-                Value::Gradient(Gradient { colors, opacities, color_midpoints: midpoint_lerp(&a.color_midpoints, &b.color_midpoints, a.colors.len().saturating_sub(1)), opacity_midpoints: midpoint_lerp(&a.opacity_midpoints, &b.opacity_midpoints, a.opacities.len().saturating_sub(1)) })
+                let midpoint_lerp = |a: &[f64], b: &[f64], n: usize| {
+                    (0..n)
+                        .map(|i| {
+                            let x = a.get(i).copied().unwrap_or(0.5);
+                            x + (b.get(i).copied().unwrap_or(0.5) - x) * t
+                        })
+                        .collect()
+                };
+                Value::Gradient(Gradient {
+                    colors,
+                    opacities,
+                    color_midpoints: midpoint_lerp(&a.color_midpoints, &b.color_midpoints, a.colors.len().saturating_sub(1)),
+                    opacity_midpoints: midpoint_lerp(&a.opacity_midpoints, &b.opacity_midpoints, a.opacities.len().saturating_sub(1)),
+                })
             }
             _ if self.interpolates() && self.dims() > 0 && self.dims() == o.dims() => {
                 let a = self.components();
@@ -442,11 +456,11 @@ impl Value {
             }
             Value::Layer(_) => Some(Value::Layer(j.as_u64())),
             Value::Path(_) => serde_json::from_value::<ShapePath>(j.clone()).ok().map(Value::Path).or_else(|| serde_json::from_value::<Value>(j.clone()).ok()),
-            Value::Gradient(_) => {
-                serde_json::from_value::<Value>(j.clone()).ok().filter(|v| matches!(v, Value::Gradient(_)))
-                    .or_else(|| serde_json::from_value::<Gradient>(j.clone()).ok().map(Value::Gradient))
-                    .or_else(|| gradient_json(j).map(Value::Gradient))
-            }
+            Value::Gradient(_) => serde_json::from_value::<Value>(j.clone())
+                .ok()
+                .filter(|v| matches!(v, Value::Gradient(_)))
+                .or_else(|| serde_json::from_value::<Gradient>(j.clone()).ok().map(Value::Gradient))
+                .or_else(|| gradient_json(j).map(Value::Gradient)),
         }
     }
     /// JSON for display/automation (numbers/arrays for numeric kinds).

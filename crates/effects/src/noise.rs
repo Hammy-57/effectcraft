@@ -7,8 +7,8 @@ use effectcraft_raster::{Image, Px};
 use rayon::prelude::*;
 
 use crate::generate::value_noise;
-use crate::util::{gauss_plane, guided_filter, hash1, join, lerp, premul, smoothstep, split, unpremul, Plane};
-use crate::{num, p, popup, slider, Buf, EffectCtx, EffectSpec};
+use crate::util::{Plane, gauss_plane, guided_filter, hash1, join, lerp, premul, smoothstep, split, unpremul};
+use crate::{Buf, EffectCtx, EffectSpec, num, p, popup, slider};
 
 fn spec(id: &'static str, name: &'static str, params: Vec<crate::ParamSpec>, render: crate::RenderFn) -> EffectSpec {
     EffectSpec { id, name, category: "Noise & Grain", params, render, gpu: false, float: true }
@@ -537,11 +537,7 @@ fn grain_level(img: &Image, boxes: &[(usize, usize, usize)]) -> f32 {
     }
     let st = crate::noise2::grain_stats_masked(img, Some(&m));
     let s = (st.std[0] + st.std[1] + st.std[2]) / 3.0;
-    if boxes.is_empty() {
-        1.0
-    } else {
-        (s / 0.02).clamp(0.5, 2.0)
-    }
+    if boxes.is_empty() { 1.0 } else { (s / 0.02).clamp(0.5, 2.0) }
 }
 
 /// Remove Grain's measured grain level for buffer `b` without Temporal Filtering (the GPU
@@ -716,11 +712,7 @@ fn noise_alpha(ctx: &EffectCtx, mut b: Buf) -> Buf {
             let na = match ov {
                 1 => {
                     let t = na.rem_euclid(2.0);
-                    if t > 1.0 {
-                        2.0 - t
-                    } else {
-                        t
-                    }
+                    if t > 1.0 { 2.0 - t } else { t }
                 }
                 2 => {
                     if !(0.0..=1.0).contains(&na) {

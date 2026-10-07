@@ -2,7 +2,7 @@
 //!
 //! Regenerate with `UPDATE_DOCS=1 cargo test -p effectcraft-effects --lib effects_doc_is_current`.
 
-use crate::{registry, CATEGORIES};
+use crate::{CATEGORIES, registry};
 
 /// Effects whose implementation is known to fall short of the reference behaviour:
 /// `(effect id, what is missing)`. Everything else in the registry is implemented in full as far

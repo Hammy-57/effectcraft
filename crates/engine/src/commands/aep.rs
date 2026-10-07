@@ -45,10 +45,8 @@ fn import_document(s: &mut Session, path: &str, bytes: &[u8], dir: &str, allow_l
 fn import_ir(s: &mut Session, p: &Value) -> Result<Value> {
     let path = str_p(p, "path").ok_or_else(|| bad("file.importAeIr", "missing `path`"))?.to_string();
     let bytes = s.services.read_file(&path).map_err(|e| EngineError::Other(format!("cannot read {path}: {e}")))?;
-    let dir = str_p(p, "sourceDir")
-        .map(str::to_string)
-        .or_else(|| std::path::Path::new(&path).parent().map(|p| p.to_string_lossy().to_string()))
-        .unwrap_or_default();
+    let dir =
+        str_p(p, "sourceDir").map(str::to_string).or_else(|| std::path::Path::new(&path).parent().map(|p| p.to_string_lossy().to_string())).unwrap_or_default();
     import_document(s, &path, &bytes, &dir, b_p(p, "allowLosses").unwrap_or(false))
 }
 
@@ -64,7 +62,15 @@ fn import_aep(s: &mut Session, p: &Value) -> Result<Value> {
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
-        cmd!("file.importAep", "After Effects Project...", ["File", "Import"], None, "{path (.aep), allowLosses?: bool (inspect incomplete import)}", always, import_aep),
+        cmd!(
+            "file.importAep",
+            "After Effects Project...",
+            ["File", "Import"],
+            None,
+            "{path (.aep), allowLosses?: bool (inspect incomplete import)}",
+            always,
+            import_aep
+        ),
         cmd!(
             "file.importAeIr",
             "After Effects Project Data...",
