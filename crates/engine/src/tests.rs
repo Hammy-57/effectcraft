@@ -47,6 +47,76 @@ fn demo_layer_cache_is_transparent() {
     }
 }
 
+/// `layer.addItem` puts the layer at `index` (1-based) in the stack and starts it at `time`, as a
+/// drop in the Timeline does (#89).
+#[test]
+fn add_item_at_a_stack_index_and_time() {
+    let mut s = Session::default();
+    let clip = s.execute("comp.new", json!({"name": "Clip", "width": 16, "height": 16, "frameRate": 30, "duration": 1})).unwrap()["comp"].as_u64().unwrap();
+    s.execute("comp.new", json!({"name": "Main", "width": 32, "height": 32, "frameRate": 30, "duration": 4})).unwrap();
+    for name in ["C", "B", "A"] {
+        s.execute("layer.newSolid", json!({"name": name})).unwrap();
+    }
+    let names = |s: &Session| s.active_comp().unwrap().layers.iter().map(|l| l.name.clone()).collect::<Vec<_>>();
+    s.execute("layer.addItem", json!({"item": clip, "index": 2, "time": 1.01})).unwrap();
+    assert_eq!(names(&s), ["A", "Clip", "B", "C"]);
+    let l = &s.active_comp().unwrap().layers[1];
+    assert_eq!(l.in_point, effectcraft_time::Tick::from_seconds_f64(1.0), "on the nearest frame");
+    // Past the bottom: the bottom.
+    s.execute("layer.addItem", json!({"item": clip, "index": 99})).unwrap();
+    assert_eq!(names(&s).last().map(String::as_str), Some("Clip 2"));
+    assert!(s.execute("layer.addItem", json!({"item": clip, "index": 0})).is_err(), "1-based");
+}
+
+/// Files dropped on the Timeline or the Composition viewer (`file.import {addToComp}`) become
+/// layers of the comp that was active, one under the other, where they were dropped (#85, #89).
+#[test]
+fn imported_files_go_into_the_comp_where_they_were_dropped() {
+    use effectcraft_project::{Footage, FootageKind};
+    struct Probe;
+    impl crate::Importer for Probe {
+        fn probe(&self, path: &str) -> Result<Footage, String> {
+            Ok(Footage { path: path.into(), kind: FootageKind::Still, width: 64, height: 32, has_video: true, ..Default::default() })
+        }
+    }
+    let mut s = Session { importer: Some(std::sync::Arc::new(Probe)), ..Default::default() };
+    s.execute("comp.new", json!({"name": "Main", "width": 320, "height": 180, "frameRate": 30, "duration": 4})).unwrap();
+    s.execute("layer.newSolid", json!({"name": "Bg"})).unwrap();
+    let params = json!({"paths": ["/drop/a.png", "/drop/b.png"], "addToComp": true, "position": [40.0, 50.0], "index": 1, "time": 1.0});
+    s.execute("file.import", params).unwrap();
+    let comp = s.active_comp().unwrap();
+    assert_eq!(comp.layers.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["a.png", "b.png", "Bg"]);
+    for l in &comp.layers[..2] {
+        assert_eq!(l.props.prop("transform/position").map(|p| p.value.clone()), Some(effectcraft_keyframe::Value::Vec3([40.0, 50.0, 0.0])));
+        assert_eq!(l.in_point, effectcraft_time::Tick::from_seconds_f64(1.0));
+    }
+    // Without `addToComp` they only import.
+    s.execute("file.import", json!({"paths": ["/drop/c.png"]})).unwrap();
+    assert_eq!(s.active_comp().unwrap().layers.len(), 3);
+    assert!(s.execute("layer.addItem", json!({"item": "a.png", "position": [1.0]})).is_err(), "position needs x and y");
+}
+
+/// Audio, Lock and Shy don't change pixels: toggling them keeps the cached layers (#103).
+#[test]
+fn audio_lock_and_shy_keep_cached_layers() {
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "C", "width": 160, "height": 90, "frameRate": 30, "duration": 1})).unwrap();
+    s.execute("layer.newSolid", json!({"color": "#3080ff", "width": 80, "height": 40})).unwrap();
+    s.execute("effect.apply", json!({"layer": "#1", "effect": "Gaussian Blur"})).unwrap();
+    s.execute("prop.set", json!({"layer": "#1", "path": "effects/#1/blurriness", "value": 12})).unwrap();
+    let cid = s.active_comp_id().unwrap();
+    let t = s.time();
+    s.render(cid, t, Default::default());
+    let before = s.layer_cache.stats();
+    for sw in ["audio", "lock", "shy"] {
+        s.execute("layer.setSwitch", json!({"layers": ["#1"], "switch": sw, "value": sw != "audio"})).unwrap();
+    }
+    s.render(cid, t, Default::default());
+    let after = s.layer_cache.stats();
+    assert_eq!(after.misses, before.misses, "no layer rendered again");
+    assert!(after.hits > before.hits);
+}
+
 #[test]
 fn every_command_has_unique_id_and_runs_or_reports() {
     let mut ids = std::collections::HashSet::new();
@@ -299,6 +369,27 @@ fn comp_settings_anchor_start_timecode_renderer() {
     let c = s.active_comp().unwrap();
     assert_eq!(c.display_start, c.frame_rate.tick_of(30));
     assert_eq!(c.renderer, crate::project::Renderer::Advanced3D);
+}
+
+/// `advanced3D` is a value of `renderer`, not a key: comp.new / comp.settings don't advertise it
+/// in their schemas and reject it as unknown instead of ignoring it (#177).
+#[test]
+fn renderer_values_are_not_parameter_keys() {
+    let mut s = Session::default();
+    for (id, p) in [("comp.new", json!({"name": "A"})), ("comp.settings", json!({}))] {
+        let spec = crate::command_specs().iter().find(|c| c.id == id).unwrap();
+        let keys = crate::commands::accepted_params(spec.params).unwrap();
+        assert!(keys.contains(&"renderer".to_string()) && !keys.contains(&"advanced3D".to_string()), "{id}: {keys:?}");
+        let mut bad = p.clone();
+        bad["advanced3D"] = json!(true);
+        let e = s.execute_checked(id, bad).unwrap_err().to_string();
+        assert!(e.contains("unknown parameter(s) `advanced3D`"), "{id}: {e}");
+        let mut good = p;
+        good["renderer"] = json!("advanced3D");
+        s.execute_checked(id, good).unwrap();
+        assert_eq!(s.active_comp().unwrap().renderer, crate::project::Renderer::Advanced3D, "{id}");
+        s.execute("comp.renderer", json!({"renderer": "classic3d"})).unwrap();
+    }
 }
 
 #[test]

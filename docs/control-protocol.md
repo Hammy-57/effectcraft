@@ -14,6 +14,13 @@ effectcraft --control 9877        # or EFFECTCRAFT_CONTROL_PORT=9877
 - Requests run on the UI thread between frames. Input methods (`ui.click`, `ui.key` and similar)
   reply after the synthetic input has been processed. Methods that need an element that isn't drawn
   yet are retried for a few frames. A request times out after 60 s.
+- **Only requests are read:** every line must be a JSON object with a string `method` (blank lines are
+  skipped). Anything else (text that isn't JSON, a JSON array or number, an object without `method`,
+  invalid UTF-8, a line longer than 4 MiB) gets one error reply ending in "closing the connection", and
+  the server closes the connection, so nothing sent after it runs. An HTTP request (for example a web
+  page's cross-origin `fetch` to `127.0.0.1:<port>`) therefore can't smuggle a command in its body: its
+  request line is rejected first. At most 16 connections are served at once; further ones get an error
+  line and are closed. The port has no authentication, so only enable it while you use it.
 
 Quick test:
 
@@ -91,8 +98,9 @@ one), `panel.tab.Viewer(<n>)` and `viewers.<n>` (View ▸ New Viewer's other Com
 renames it), `viewer.comp`, `viewer.handle.<layer>.<i>`,
 `timeline.layer.<id>.bar`, `timeline.layer.<id>.nestedMarker.<i>` (a precomp's comp markers), `timeline.layer.<id>.twirl`, `timeline.layer.<id>.row` (click selects,
 Enter or a double-click renames, drag reorders), `timeline.prop.<uid>.stopwatch`,
-`timeline.key.<uid>.<frame>`, `timeline.cti`, `effectControls.prop.<uid>.value` and
-`effects.item.<name>`. The Composition viewer adds `viewer.magnification`, `viewer.resolution`,
+`timeline.key.<uid>.<frame>`, `timeline.cti`, `effectControls.prop.<uid>.value` (an angle's
+revolutions are `timeline.prop.<uid>.revolutions`, `effectControls.prop.<uid>.revolutions` and
+`properties.prop.<uid>.revolutions`) and `effects.item.<name>`. The Composition viewer adds `viewer.magnification`, `viewer.resolution`,
 `viewer.roi`, `viewer.grid`, `viewer.channel`, `viewer.exposure`, `viewer.snapshot`,
 `viewer.showSnapshot`, `viewer.fastPreviews` (their popup entries are `viewer.<menu>Item.<n>`),
 `viewer.ruler.top|left|origin`, `viewer.mask.<uid>.vertex.<i>`, `viewer.shapePath.<uid>.vertex.<i>`,

@@ -51,15 +51,36 @@ fn set_enabled(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn remove(s: &mut Session, p: &Value) -> Result<Value> {
-    let c = "prop.removeGroup";
-    let (cid, lid, uid) = group_ref(s, p, c, true)?;
+    let (cid, lid, uid) = group_ref(s, p, "prop.removeGroup", true)?;
+    remove_groups(s, cid, &[(lid, uid)])?;
+    Ok(Value::Null)
+}
+
+/// Remove groups of comp `cid` in one undo step.
+fn remove_groups(s: &mut Session, cid: ItemId, groups: &[(LayerId, Uid)]) -> Result<()> {
     s.edit("Delete", None, |proj, st| {
-        let l = layer_mut(proj, cid, lid)?;
-        let parent = l.props.parent_of_mut(uid).ok_or_else(|| bad(c, "group vanished"))?;
-        parent.children.retain(|n| n.uid() != uid);
-        st.selected_props.retain(|(_, u)| *u != uid);
-        Ok(Value::Null)
+        for (lid, uid) in groups {
+            // A group inside one removed before it went with it.
+            if let Some(parent) = layer_mut(proj, cid, *lid)?.props.parent_of_mut(*uid) {
+                parent.children.retain(|n| n.uid() != *uid);
+            }
+        }
+        st.selected_props.retain(|(_, u)| !groups.iter().any(|(_, g)| g == u));
+        Ok(())
     })
+}
+
+/// Edit ▸ Clear with masks, shape items, text animators or trackers selected in the active comp:
+/// removes those groups (not their layers) in one undo step. None when none are selected.
+pub(crate) fn remove_selected(s: &mut Session) -> Result<Option<Value>> {
+    let (Some(cid), Some(c)) = (s.active_comp_id(), s.active_comp()) else { return Ok(None) };
+    let groups: Vec<(LayerId, Uid)> =
+        s.state.selected_props.iter().filter(|(lid, uid)| c.layer(*lid).and_then(|l| l.props.find_group(*uid)).is_some_and(is_instance)).copied().collect();
+    if groups.is_empty() {
+        return Ok(None);
+    }
+    remove_groups(s, cid, &groups)?;
+    Ok(Some(json!(groups.len())))
 }
 
 fn duplicate(s: &mut Session, p: &Value) -> Result<Value> {

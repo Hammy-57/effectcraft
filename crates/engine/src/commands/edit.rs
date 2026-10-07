@@ -147,6 +147,12 @@ fn delete(s: &mut Session, p: &Value) -> Result<Value> {
     if p.get("layers").is_none() && !super::effect::selected_effects(s).is_empty() {
         return s.execute("effect.remove", json!({}));
     }
+    // Masks, shape items, text animators or trackers selected → remove them.
+    if p.get("layers").is_none()
+        && let Some(n) = super::prop_groups::remove_selected(s)?
+    {
+        return Ok(n);
+    }
     let (cid, ids) = layers_p(s, p)?;
     let ids = super::unlocked(s, cid, ids, "edit.clear")?;
     // Children of deleted layers are unparented where they are (like After Effects).

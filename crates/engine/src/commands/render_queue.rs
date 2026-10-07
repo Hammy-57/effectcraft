@@ -19,7 +19,7 @@ use crate::{EngineError, Result, Session, cmd, query};
 
 fn can_add(s: &Session) -> std::result::Result<(), String> {
     not_rendering(s)?;
-    if s.comp_for_queue(&Value::Null).is_some() { Ok(()) } else { Err("select or open a composition".into()) }
+    if s.comp_for_queue(&Value::Null).is_ok() { Ok(()) } else { Err("select or open a composition".into()) }
 }
 fn not_rendering(s: &Session) -> std::result::Result<(), String> {
     if s.is_rendering() { Err("the render queue is rendering".into()) } else { Ok(()) }
@@ -202,6 +202,9 @@ fn apply_om_template(om: &mut OutputModule, t: &OutputModule) {
     om.name = t.name.clone();
 }
 
+/// The `format` parameter's values.
+const FORMATS: &str = "format: h264|hevc|av1|prores|webm|png|jpeg|tiff|exr|gif|wav|aiff";
+
 /// Apply Output Module parameters (`template` first). `roi`: the viewer's region of interest
 /// (captured by `crop.useRoi`).
 fn apply_output(om: &mut OutputModule, templates: &RenderTemplates, roi: Option<[f64; 4]>, p: &Value, cmd: &str) -> Result<bool> {
@@ -213,9 +216,12 @@ fn apply_output(om: &mut OutputModule, templates: &RenderTemplates, roi: Option<
     }
     let before = om.clone();
     if let Some(f) = str_p(p, "format") {
-        let f = OutputFormat::from_name(f).ok_or_else(|| bad(cmd, "format: h264|hevc|av1|prores|webm|png|jpeg|tiff|exr|gif|wav|aiff"))?;
+        let f = OutputFormat::from_name(f).ok_or_else(|| bad(cmd, FORMATS))?;
         om.set_format(f);
     }
+    // Before Channels: the WebM codec decides whether alpha can be written, so an explicit
+    // `channels: rgba` with `webmCodec: av1` is refused rather than dropped (#166).
+    any |= apply_codec_options(om, p, cmd)?;
     if let Some(c) = str_p(p, "channels") {
         om.channels = match c.to_ascii_lowercase().replace([' ', '+'], "").as_str() {
             "rgb" => Channels::Rgb,
@@ -224,7 +230,11 @@ fn apply_output(om: &mut OutputModule, templates: &RenderTemplates, roi: Option<
             _ => return Err(bad(cmd, "channels: rgb|rgba|alpha")),
         };
         if om.channels == Channels::Rgba && !om.supports_alpha() {
-            return Err(bad(cmd, format!("{} has no alpha channel", om.format.label())));
+            let what = match om.format {
+                OutputFormat::WebM => format!("{} WebM has no alpha channel (VP9 WebM has)", om.webm_codec.label()),
+                f => format!("{} has no alpha channel", f.label()),
+            };
+            return Err(bad(cmd, what));
         }
     }
     if let Some(c) = str_p(p, "color").or(str_p(p, "alphaMode")) {
@@ -234,7 +244,6 @@ fn apply_output(om: &mut OutputModule, templates: &RenderTemplates, roi: Option<
             _ => return Err(bad(cmd, "color: straight|premultiplied")),
         };
     }
-    any |= apply_codec_options(om, p, cmd)?;
     if let Some(q) = f_p(p, "quality") {
         om.quality = q.clamp(1.0, 100.0) as u8;
     }
@@ -357,13 +366,18 @@ fn apply_output(om: &mut OutputModule, templates: &RenderTemplates, roi: Option<
     }
     if let Some(o) = str_p(p, "output").or(str_p(p, "path")) {
         om.output = o.to_string();
-        if p.get("format").is_none()
-            && let Some(f) = OutputFormat::from_path(o).filter(|f| *f != om.format && !o.contains("[fileExtension]"))
-        {
-            // `out.mov` with an H.264 module → ProRes, like picking a file type in Output To.
-            let keep = om.output.clone();
-            om.set_format(f);
-            om.output = keep;
+        // Only an extension the format doesn't write changes it: `.mp4` is H.264's, HEVC's and AV1's.
+        if let Some(f) = OutputFormat::from_path(o).filter(|f| f.extension() != om.format.extension() && !o.contains("[fileExtension]")) {
+            if p.get("format").is_some() {
+                // An explicit format wins and the extension follows it, as choosing a format in
+                // the Output Module renames Output To (#154: `--format hevc --out x.mp4`).
+                om.set_format(om.format);
+            } else {
+                // `out.mov` with an H.264 module → ProRes, like picking a file type in Output To.
+                let keep = om.output.clone();
+                om.set_format(f);
+                om.output = keep;
+            }
         }
     }
     if *om != before {
@@ -496,24 +510,20 @@ fn item_json(s: &Session, it: &RenderQueueItem, index: usize) -> Value {
 }
 
 fn add(s: &mut Session, p: &Value) -> Result<Value> {
-    let cid = s.comp_for_queue(p).ok_or(EngineError::NoComp)?;
+    let cid = s.comp_for_queue(p)?;
     let mut it = RenderQueueItem::new(0, cid);
     // New items start from the Movie Default templates (Edit ▸ Templates).
     let templates = s.project.render_templates.clone();
     it.settings = templates.default_render_settings(TemplateSlot::Movie);
     it.output = templates.default_output_module(TemplateSlot::Movie);
     if let Some(f) = str_p(p, "format") {
-        let f = OutputFormat::from_name(f).ok_or_else(|| bad("renderQueue.add", "format: h264|prores|webm|png|jpeg|tiff|exr|gif|wav|aiff"))?;
+        let f = OutputFormat::from_name(f).ok_or_else(|| bad("renderQueue.add", FORMATS))?;
         if f != it.output.format {
             it.output = OutputModule::for_format(f);
         }
     }
     apply_settings(&mut it.settings, &templates, p, "renderQueue.add")?;
-    let mut op = p.clone();
-    if let Some(o) = op.as_object_mut() {
-        o.remove("format");
-    }
-    apply_output(&mut it.output, &templates, s.state.region_of_interest, &op, "renderQueue.add")?;
+    apply_output(&mut it.output, &templates, s.state.region_of_interest, p, "renderQueue.add")?;
     if let Some(l) = enum_p(p, "log", "renderQueue.add", RenderLog::parse, "errorsOnly|plusSettings|plusPerFrameInfo")? {
         it.log = l;
     }
@@ -704,7 +714,7 @@ fn add_output_module(s: &mut Session, p: &Value) -> Result<Value> {
     let n = it.extra_outputs.len() + 2;
     let mut om = it.output.clone();
     if let Some(f) = str_p(p, "format") {
-        let f = OutputFormat::from_name(f).ok_or_else(|| bad("render.addOutputModule", "format: h264|prores|webm|png|jpeg|tiff|exr|gif|wav|aiff"))?;
+        let f = OutputFormat::from_name(f).ok_or_else(|| bad("render.addOutputModule", FORMATS))?;
         om = OutputModule::for_format(f);
     }
     if str_p(p, "output").is_none() && str_p(p, "path").is_none() {
@@ -714,11 +724,7 @@ fn add_output_module(s: &mut Session, p: &Value) -> Result<Value> {
             None => format!("{}_{n}", om.output),
         };
     }
-    let mut op = p.clone();
-    if let Some(o) = op.as_object_mut() {
-        o.remove("format");
-    }
-    apply_output(&mut om, &s.project.render_templates, s.state.region_of_interest, &op, "render.addOutputModule")?;
+    apply_output(&mut om, &s.project.render_templates, s.state.region_of_interest, p, "render.addOutputModule")?;
     s.edit("Add Output Module", None, |proj, _| {
         let it = &mut proj.render_queue[i];
         it.extra_outputs.push(om);
@@ -733,7 +739,7 @@ fn add_output_module(s: &mut Session, p: &Value) -> Result<Value> {
 /// Composition ▸ Pre-render…: queue the comp with a lossless-with-alpha module whose post-render
 /// action imports the result and replaces the comp's uses.
 fn pre_render(s: &mut Session, p: &Value) -> Result<Value> {
-    let cid = s.comp_for_queue(p).ok_or(EngineError::NoComp)?;
+    let cid = s.comp_for_queue(p)?;
     let mut it = RenderQueueItem::new(0, cid);
     let templates = s.project.render_templates.clone();
     it.settings = templates.default_render_settings(TemplateSlot::PreRender);

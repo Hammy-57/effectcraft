@@ -150,7 +150,12 @@ fn list_effects(b: &mut Backend, a: &Value) -> Result<Reply> {
     json_reply(b.exec("effect.list", obj(&[("filter", get(a, "filter"))]))?)
 }
 
-/// `effect.apply` on one layer, then set parameters on the new instance by param id.
+fn list_fonts(b: &mut Backend, a: &Value) -> Result<Reply> {
+    json_reply(b.exec("text.fonts", obj(&[("query", get(a, "query")), ("rescan", get(a, "rescan"))]))?)
+}
+
+/// `effect.apply` on one layer, then set parameters on the new instance by param id: one batch,
+/// so one undo step, and a failing value leaves nothing applied.
 fn add_effect(b: &mut Backend, a: &Value) -> Result<Reply> {
     let (layer, effect, comp) = (need(a, "layer")?, need(a, "effect")?, get(a, "comp"));
     let count = |t: &Value| effects_group(t).and_then(|g| g.get("children")).and_then(Value::as_array).map_or(0, Vec::len);
@@ -158,16 +163,22 @@ fn add_effect(b: &mut Backend, a: &Value) -> Result<Reply> {
     let index = count(&before) + 1;
     let mut p = obj(&[("effect", Some(effect)), ("comp", comp)]);
     p["layers"] = json!([layer]);
-    b.exec("effect.apply", p)?;
+    let mut steps = vec![json!({"command": "effect.apply", "params": p})];
     let prefix = format!("effects/#{index}");
     let mut set = vec![];
     if let Some(vals) = get(a, "values").and_then(Value::as_object) {
         for (k, v) in vals {
             let path = format!("{prefix}/{k}");
-            b.exec("prop.set", obj(&[("layer", Some(layer)), ("comp", comp), ("path", Some(&json!(path))), ("value", Some(v))]))?;
+            steps.push(
+                json!({"command": "prop.set", "params": obj(&[("layer", Some(layer)), ("comp", comp), ("path", Some(&json!(path))), ("value", Some(v))])}),
+            );
             set.push(path);
         }
     }
+    // The undo step is named like effect.apply's own ("Apply Gaussian Blur").
+    let name = effect.as_str().map(|e| effectcraft_engine::effects::lookup(e).map_or(e, |s| s.name));
+    let label = name.map(|n| json!(format!("Apply {n}")));
+    b.exec("engine.batch", obj(&[("steps", Some(&json!(steps))), ("label", label.as_ref())]))?;
     let tree = b.exec("layer.tree", obj(&[("layer", Some(layer)), ("comp", comp)]))?;
     let inst = effects_group(&tree).and_then(|g| g.get("children")).and_then(Value::as_array).and_then(|c| c.get(index - 1)).cloned();
     let mut params = vec![];
@@ -586,7 +597,7 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "add_effect",
-        description: "Apply an effect to a layer and optionally set its parameters in one undoable call. `effect` is an id (`ec.blur.gaussian`) or After Effects name (`Gaussian Blur`; see list_effects); `values` maps parameter ids to values, e.g. {\"blurriness\": 12}. Returns the instance `path` (`effects/#n`, for set_property / add_keyframe) and its parameters with their paths and current values.",
+        description: "Apply an effect to a layer and optionally set its parameters in one undoable call. `effect` is an id (`ec.blur.gaussian`) or After Effects name (`Gaussian Blur`; see list_effects); `values` maps parameter ids to values, e.g. {\"blurriness\": 12}. One undo step; if a value fails, nothing is applied. Returns the instance `path` (`effects/#n`, for set_property / add_keyframe) and its parameters with their paths and current values.",
         bridge_only: false,
         schema: || {
             schema(
@@ -606,6 +617,21 @@ static TOOLS: &[ToolDef] = &[
         bridge_only: false,
         schema: || schema(json!({"filter": {"type": "string", "description": "Only effects whose id, name or category contains this text."}}), &[]),
         run: list_effects,
+    },
+    ToolDef {
+        name: "list_fonts",
+        description: "The font families text layers can use, bundled and installed on this machine: family, styles, origin (bundled / system / user) and the name in the font's own language. Narrow with `query`; `rescan` picks up fonts installed since launch. Set one with execute_command `layer.setText {\"layer\", \"font\", \"style\"}`.",
+        bridge_only: false,
+        schema: || {
+            schema(
+                json!({
+                    "query": {"type": "string", "description": "Only families whose name (English or own-language) contains this text."},
+                    "rescan": {"type": "boolean", "description": "Look for fonts installed since launch first."}
+                }),
+                &[],
+            )
+        },
+        run: list_fonts,
     },
     ToolDef {
         name: "get_state",

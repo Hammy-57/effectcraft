@@ -173,7 +173,7 @@ pub enum SplitSize {
 pub struct StackEntry {
     pub panel: PanelKind,
     pub open: bool,
-    /// Content height when open; `None` = share the remaining height.
+    /// Content height when open (set by dragging the gaps); `None` = share the remaining height.
     pub height: Option<f32>,
 }
 
@@ -191,7 +191,8 @@ pub enum DockNode {
         active: usize,
     },
     /// After Effects' stacked panels (e.g. the Default workspace's right column): each panel has
-    /// a header row; clicking it expands or collapses the panel in place.
+    /// a header row; clicking it expands or collapses the panel in place, and dragging the gap
+    /// between two open panels resizes them.
     Stack {
         entries: Vec<StackEntry>,
     },
@@ -842,20 +843,33 @@ pub fn layout(ui: &mut egui::Ui, node: &mut DockNode, rect: Rect, t: &Tokens, pa
             out.push(Group { path: path.to_string(), rect, content, panels: panels.clone(), active: *active, stacked: None });
         }
         DockNode::Stack { entries } => {
-            // Headers for every entry; fixed-height panels next; flexible ones share the rest.
+            // A header for every entry; the open panels' bodies share the rest.
             let head = t.tab_h;
             let g = t.gap;
             let n = entries.len() as f32;
-            let fixed: f32 = entries.iter().filter(|e| e.open).filter_map(|e| e.height).sum();
-            let flex = entries.iter().filter(|e| e.open && e.height.is_none()).count().max(1) as f32;
-            let spare = (rect.height() - n * head - (n - 1.0).max(0.0) * g - fixed).max(0.0);
+            let avail = rect.height() - n * head - (n - 1.0).max(0.0) * g;
+            let bodies = stack_bodies(entries, avail);
             let mut y = rect.min.y;
+            let mut drag = None;
             for (i, e) in entries.iter().enumerate() {
-                let body = if !e.open { 0.0 } else { e.height.unwrap_or(spare / flex) };
+                let body = bodies.get(i).copied().unwrap_or(0.0);
                 let r = Rect::from_min_max(pos2(rect.min.x, y), pos2(rect.max.x, (y + head + body).min(rect.max.y)));
                 let content = Rect::from_min_max(pos2(r.min.x, r.min.y + head), r.max);
-                out.push(Group { path: format!("{path}s{i}"), rect: r, content, panels: vec![e.panel], active: 0, stacked: Some(e.open) });
+                let group = format!("{path}s{i}");
+                // The gap below a panel resizes the open panels on either side of it.
+                let above = entries.get(..=i).and_then(|s| s.iter().rposition(|x| x.open));
+                let below = entries.get(i + 1..).and_then(|s| s.iter().position(|x| x.open)).map(|k| i + 1 + k);
+                if let (Some(above), Some(below)) = (above, below) {
+                    let gap = Rect::from_min_max(pos2(rect.min.x, r.max.y), pos2(rect.max.x, r.max.y + g));
+                    if let Some(d) = gutter(ui, gap, true, &group, t, reg) {
+                        drag = Some((above, below, d));
+                    }
+                }
+                out.push(Group { path: group, rect: r, content, panels: vec![e.panel], active: 0, stacked: Some(e.open) });
                 y = r.max.y + g;
+            }
+            if let Some((above, below, d)) = drag {
+                resize_stacked(entries, &bodies, above, below, d);
             }
         }
         DockNode::Split { vertical, size, a, b } => {
@@ -868,7 +882,7 @@ pub fn layout(ui: &mut egui::Ui, node: &mut DockNode, rect: Rect, t: &Tokens, pa
                 SplitSize::FixedB(px) => avail - px.min(avail - 20.0),
             }
             .clamp(20.0_f32.min(avail), (avail - 20.0).max(0.0));
-            let (ra, gutter, rb) = if *vertical {
+            let (ra, gutter_rect, rb) = if *vertical {
                 (
                     Rect::from_min_max(rect.min, pos2(rect.max.x, rect.min.y + first)),
                     Rect::from_min_max(pos2(rect.min.x, rect.min.y + first), pos2(rect.max.x, rect.min.y + first + g)),
@@ -881,16 +895,7 @@ pub fn layout(ui: &mut egui::Ui, node: &mut DockNode, rect: Rect, t: &Tokens, pa
                     Rect::from_min_max(pos2(rect.min.x + first + g, rect.min.y), rect.max),
                 )
             };
-            // gutter drag (a slightly larger hit area than the visible gap)
-            let hit = gutter.expand2(if *vertical { vec2(0.0, 3.0) } else { vec2(3.0, 0.0) });
-            let id = egui::Id::new(("dock-gutter", path.to_string()));
-            let resp = ui.interact(hit, id, Sense::drag());
-            reg.add(&format!("dock.gutter.{path}"), hit, "gutter");
-            if resp.hovered() || resp.dragged() {
-                ui.ctx().set_cursor_icon(if *vertical { egui::CursorIcon::ResizeVertical } else { egui::CursorIcon::ResizeHorizontal });
-            }
-            if resp.dragged() {
-                let d = if *vertical { resp.drag_delta().y } else { resp.drag_delta().x };
+            if let Some(d) = gutter(ui, gutter_rect, *vertical, path, t, reg) {
                 let nf = (first + d).clamp(40.0, (avail - 40.0).max(40.0));
                 *size = match *size {
                     SplitSize::Ratio(_) => SplitSize::Ratio(nf / avail.max(1.0)),
@@ -898,11 +903,81 @@ pub fn layout(ui: &mut egui::Ui, node: &mut DockNode, rect: Rect, t: &Tokens, pa
                     SplitSize::FixedB(_) => SplitSize::FixedB(avail - nf),
                 };
             }
-            if resp.dragged() || resp.hovered() {
-                ui.painter().rect_filled(gutter, 0.0, t.focus.gamma_multiply(if resp.dragged() { 0.9 } else { 0.4 }));
-            }
             layout(ui, a, ra, t, &format!("{path}a"), out, reg);
             layout(ui, b, rb, t, &format!("{path}b"), out, reg);
+        }
+    }
+}
+
+/// A gap between dock areas that drags to resize them (`vertical`: up and down), with a slightly
+/// larger hit area than the gap. Returns the drag this frame.
+fn gutter(ui: &mut egui::Ui, gap: Rect, vertical: bool, path: &str, t: &Tokens, reg: &mut crate::automation::Registry) -> Option<f32> {
+    let hit = gap.expand2(if vertical { vec2(0.0, 3.0) } else { vec2(3.0, 0.0) });
+    let resp = ui.interact(hit, egui::Id::new(("dock-gutter", path.to_string())), Sense::drag());
+    reg.add(&format!("dock.gutter.{path}"), hit, "gutter");
+    if resp.hovered() || resp.dragged() {
+        ui.ctx().set_cursor_icon(if vertical { egui::CursorIcon::ResizeVertical } else { egui::CursorIcon::ResizeHorizontal });
+        ui.painter().rect_filled(gap, 0.0, t.focus.gamma_multiply(if resp.dragged() { 0.9 } else { 0.4 }));
+    }
+    resp.dragged().then(|| if vertical { resp.drag_delta().y } else { resp.drag_delta().x })
+}
+
+/// The least body height of an open stacked panel (when the stack has room for it).
+const STACK_MIN: f32 = 40.0;
+
+/// An open stacked panel without a height of its own: it shares the room the others leave.
+fn flexible(e: &StackEntry) -> bool {
+    e.open && !e.height.is_some_and(f32::is_finite)
+}
+
+/// The body heights of a stack's panels in `avail` points (headers and gaps taken out). Open
+/// panels with a height keep it and the others share the rest; when no panel takes the rest, or
+/// there is too little room, the heights grow or shrink in proportion (down to [`STACK_MIN`]) so
+/// the open panels fill the stack.
+fn stack_bodies(entries: &[StackEntry], avail: f32) -> Vec<f32> {
+    let avail = if avail.is_finite() { avail.max(0.0) } else { 0.0 };
+    let open = entries.iter().filter(|e| e.open).count();
+    let min = STACK_MIN.min(avail / open.max(1) as f32);
+    let fixed: Vec<f32> = entries.iter().filter(|e| e.open && !flexible(e)).filter_map(|e| e.height).map(|h| h.max(min)).collect();
+    let flex = open.saturating_sub(fixed.len());
+    let k = fixed.len() as f32;
+    // What the panels with a height may take, and how much of it lies above their minimum.
+    let room = avail - flex as f32 * min;
+    let sum: f32 = fixed.iter().sum();
+    let (excess, target) = (sum - k * min, (room - k * min).max(0.0));
+    let fit = flex == 0 || sum > room;
+    let size = |h: f32| match (fit, excess > 0.0) {
+        (false, _) => h,
+        (true, true) => min + (h - min) / excess * target,
+        (true, false) => min + target / k.max(1.0),
+    };
+    let used: f32 = fixed.iter().map(|&h| size(h)).sum();
+    let share = (avail - used).max(0.0) / flex.max(1) as f32;
+    entries
+        .iter()
+        .map(|e| match (e.open, flexible(e)) {
+            (false, _) => 0.0,
+            (true, true) => share,
+            (true, false) => size(e.height.unwrap_or(min).max(min)),
+        })
+        .collect()
+}
+
+/// Drag the gap between the open stacked panels `above` and `below` (laid out at `bodies`) by
+/// `d` points: one grows as much as the other shrinks, neither below [`STACK_MIN`]. The new sizes
+/// become the panels' heights, except that the last panel without one keeps sharing the rest
+/// (so the stack still fills its column when the window is resized).
+fn resize_stacked(entries: &mut [StackEntry], bodies: &[f32], above: usize, below: usize, d: f32) {
+    let (Some(&a), Some(&b)) = (bodies.get(above), bodies.get(below)) else { return };
+    let pair = a + b;
+    let lo = STACK_MIN.min(pair / 2.0);
+    let na = (a + d).max(lo).min(pair - lo);
+    for (i, h) in [(above, na), (below, pair - na)] {
+        let last_flexible = entries.iter().filter(|e| flexible(e)).count() == 1;
+        if let Some(e) = entries.get_mut(i)
+            && !(last_flexible && flexible(e))
+        {
+            e.height = Some(h);
         }
     }
 }
@@ -1125,6 +1200,67 @@ mod tests {
         d.close(Preview);
         assert!(!d.contains(Preview));
         assert!(!d.toggle_stacked(Timeline));
+    }
+
+    fn entry(panel: PanelKind, open: bool, height: Option<f32>) -> StackEntry {
+        StackEntry { panel, open, height }
+    }
+
+    fn close_to(a: &[f32], b: &[f32]) -> bool {
+        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-3)
+    }
+
+    #[test]
+    fn stacked_panels_fill_their_column() {
+        use PanelKind::*;
+        // A panel with a height keeps it; the open ones without share the rest.
+        let s = [entry(Preview, true, Some(100.0)), entry(Properties, true, None), entry(Align, false, None), entry(Audio, true, None)];
+        assert!(close_to(&stack_bodies(&s, 500.0), &[100.0, 200.0, 0.0, 200.0]));
+        // Too little room: the heights shrink so the others keep their minimum.
+        let s = [entry(Preview, true, Some(500.0)), entry(Properties, true, None)];
+        assert!(close_to(&stack_bodies(&s, 300.0), &[260.0, STACK_MIN]));
+        // Nothing to take the rest: the heights grow in proportion (above the minimum) to fill.
+        let s = [entry(Preview, true, Some(100.0)), entry(Properties, true, Some(300.0)), entry(Align, false, Some(80.0))];
+        assert!(close_to(&stack_bodies(&s, 600.0), &[137.5, 462.5, 0.0]));
+        let s = [entry(Preview, true, Some(46.0)), entry(Properties, false, None)];
+        assert!(close_to(&stack_bodies(&s, 600.0), &[600.0, 0.0]));
+        // Hostile sizes never make a body negative or non-finite.
+        for avail in [-50.0, 0.0, 10.0, f32::NAN, f32::INFINITY] {
+            for h in [None, Some(-5.0), Some(f32::NAN), Some(f32::INFINITY), Some(1e30), Some(f32::MAX)] {
+                let s = [entry(Preview, true, h), entry(Properties, true, Some(60.0)), entry(Align, false, h)];
+                let b = stack_bodies(&s, avail);
+                assert!(b.iter().all(|x| x.is_finite() && *x >= 0.0), "{avail} {h:?}: {b:?}");
+            }
+        }
+        assert!(stack_bodies(&[], 100.0).is_empty());
+    }
+
+    #[test]
+    fn dragging_a_stack_gap_trades_height_between_its_neighbours() {
+        use PanelKind::*;
+        let mut s = vec![entry(Preview, true, Some(46.0)), entry(Properties, true, None), entry(Align, false, None)];
+        let bodies = stack_bodies(&s, 800.0);
+        resize_stacked(&mut s, &bodies, 0, 1, 100.0);
+        // Preview keeps its new height; Properties, the only panel without one, takes the rest.
+        assert_eq!(s[0].height, Some(146.0));
+        assert_eq!(s[1].height, None);
+        assert!(close_to(&stack_bodies(&s, 800.0), &[146.0, 654.0, 0.0]));
+        // Neither side goes below the minimum.
+        for (d, want) in [(-1000.0, STACK_MIN), (1000.0, 800.0 - STACK_MIN)] {
+            let bodies = stack_bodies(&s, 800.0);
+            resize_stacked(&mut s, &bodies, 0, 1, d);
+            assert!(close_to(&stack_bodies(&s, 800.0)[..1], &[want]), "{d}");
+        }
+        // Two sharing panels: the upper one gets a height, the lower one keeps sharing.
+        let mut s = vec![entry(Preview, true, None), entry(Align, false, None), entry(Properties, true, None)];
+        let bodies = stack_bodies(&s, 400.0);
+        resize_stacked(&mut s, &bodies, 0, 2, 50.0);
+        assert_eq!((s[0].height, s[2].height), (Some(250.0), None));
+        assert!(close_to(&stack_bodies(&s, 400.0), &[250.0, 0.0, 150.0]));
+        // Out-of-range indices change nothing.
+        let before = s.clone();
+        resize_stacked(&mut s, &bodies, 0, 9, 50.0);
+        assert_eq!(s, before);
     }
 
     #[test]

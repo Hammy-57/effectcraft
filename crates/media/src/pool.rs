@@ -30,6 +30,16 @@ struct Entry {
     bytes: usize,
 }
 
+/// Conformed audio files written by builds before this version are ignored (and written again):
+/// version 1 files of sources longer than about 12:36 at 48 kHz were silent from there on (#172).
+const CONFORM_VERSION: u32 = 2;
+
+/// The source time of sample frame `at` at `rate` Hz. (`at` × ticks per second overflows `i64`
+/// past about 12:36 at 48 kHz.)
+fn sample_time(at: usize, rate: u32) -> Tick {
+    Tick::from_units(i64::try_from(at).unwrap_or(i64::MAX), i64::from(rate))
+}
+
 /// At most this many recycled pixel buffers are kept (outside the budget).
 const MAX_SPARE: usize = 4;
 
@@ -277,13 +287,13 @@ impl MediaPool {
     }
 
     /// The conformed-audio file of `path` at `rate` (named by a hash of the path, size and
-    /// modification time, so an edited file conforms again).
+    /// modification time, so an edited file conforms again, and of [`CONFORM_VERSION`]).
     pub fn conformed_path(&self, path: &str, rate: u32) -> Option<std::path::PathBuf> {
         use std::hash::{Hash, Hasher};
         let folder = lock(&self.inner.conform).clone()?;
         let meta = std::fs::metadata(path).ok()?;
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        (path, meta.len(), meta.modified().ok()).hash(&mut h);
+        (CONFORM_VERSION, path, meta.len(), meta.modified().ok()).hash(&mut h);
         Some(folder.join(format!("{:016x}_{rate}.ecaf", h.finish())))
     }
 
@@ -320,7 +330,7 @@ impl MediaPool {
             let mut at = 0usize;
             while at < frames {
                 let n = (frames - at).min(1 << 16);
-                let t = Tick(at as i64 * TICKS_PER_SECOND / rate as i64);
+                let t = sample_time(at, rate);
                 for v in pool.decode_audio(&f, t, n, rate) {
                     bytes.extend_from_slice(&v.to_le_bytes());
                 }
@@ -660,6 +670,24 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Conforming a long file's audio reads every chunk at its own time: the sample index times
+    /// ticks per second overflowed `i64` past 12:36 at 48 kHz, and later chunks came out silent
+    /// (#172).
+    #[test]
+    fn conform_chunks_keep_their_times_on_long_files() {
+        for rate in [24_000u32, 44_100, 48_000, 96_000] {
+            let mut last = Tick(-1);
+            // Every chunk start of a 2-hour file.
+            for at in (0..rate as usize * 7200).step_by(1 << 16) {
+                let t = sample_time(at, rate);
+                assert!(t > last, "{rate} Hz, frame {at}: {t:?} after {last:?}");
+                assert!((t.seconds() - at as f64 / rate as f64).abs() < 1e-6, "{rate} Hz, frame {at}");
+                last = t;
+            }
+        }
+        assert!((sample_time(36_372_480, 48_000).seconds() - 757.76).abs() < 1e-9);
+    }
 
     #[test]
     fn frame_index_loops_and_clamps() {

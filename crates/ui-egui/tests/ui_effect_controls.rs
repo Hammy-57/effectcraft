@@ -196,3 +196,76 @@ fn keyer_eyedropper_picks_the_screen_from_the_effect_input() {
     let img = s.render(s.active_comp_id().unwrap(), s.time(), Default::default());
     assert!(img.get(160, 90)[3] < 0.01, "{:?}", img.get(160, 90));
 }
+
+fn rect_of(h: &Harness<'_, EffectcraftApp>, id: &str) -> egui::Rect {
+    let e = h.state().auto.previous.iter().chain(h.state().auto.elements.iter()).find(|e| e.id == id).unwrap_or_else(|| panic!("no {id}")).clone();
+    egui::Rect::from_min_size(egui::pos2(e.rect[0], e.rect[1]), egui::vec2(e.rect[2], e.rect[3]))
+}
+
+/// Drag one pixel per frame, as a slow hand does.
+fn slow_drag(h: &mut Harness<'_, EffectcraftApp>, from: egui::Pos2, dx: f32) {
+    h.event(egui::Event::PointerMoved(from));
+    h.step();
+    h.event(egui::Event::PointerButton { pos: from, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+    h.step();
+    for k in 1..=dx as i32 {
+        h.event(egui::Event::PointerMoved(from + egui::vec2(k as f32, 0.0)));
+        h.step();
+    }
+    let to = from + egui::vec2(dx, 0.0);
+    h.event(egui::Event::PointerButton { pos: to, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+    h.run_steps(3);
+}
+
+/// Click a hot number and type a value over it.
+fn type_into(h: &mut Harness<'_, EffectcraftApp>, id: &str, text: &str) {
+    let p = rect_of(h, id).center();
+    click(h, p);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    h.event(egui::Event::Text(text.into()));
+    h.step();
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+}
+
+/// An angle's revolutions ("0x") scrub and take typing on their own, in Effect Controls and
+/// the Timeline, keeping the degrees (#93).
+#[test]
+fn angle_revolutions_scrub_and_take_typing() {
+    let (app, x) = app();
+    let mut h = Harness::builder().with_size(egui::vec2(1700.0, 1100.0)).build_eframe(|_| app);
+    settle(&mut h);
+    let angle = |h: &Harness<'_, EffectcraftApp>| layer(&h.state().session, x.small).effects().unwrap().find(x.angle).unwrap().value.as_f64();
+    h.state_mut().session.execute("prop.set", json!({"layer": x.small, "prop": x.angle, "value": 45.0})).unwrap();
+    h.run_steps(3);
+    let revs = format!("effectControls.prop.{}.revolutions", x.angle);
+    // Ten pixels a turn, however slowly the pointer moves; the degrees stay.
+    let from = rect_of(&h, &revs).center();
+    slow_drag(&mut h, from, 40.0);
+    let v = angle(&h);
+    assert!((v - 45.0).rem_euclid(360.0).abs() < 1e-9 && (2.0..=4.0).contains(&((v - 45.0) / 360.0)), "{v}");
+    type_into(&mut h, &revs, "3");
+    assert_eq!(angle(&h), 3.0 * 360.0 + 45.0);
+    let deg = format!("effectControls.prop.{}.value", x.angle);
+    assert_eq!(h.state().auto.find(&deg).map(|e| e.label.clone()), Some("3x+45.0°".into()));
+    // Negative angles keep their sign: -1x-30° → 2x-30°.
+    h.state_mut().session.execute("prop.set", json!({"layer": x.small, "prop": x.angle, "value": -390.0})).unwrap();
+    h.run_steps(3);
+    type_into(&mut h, &revs, "2");
+    assert_eq!(angle(&h), 2.0 * 360.0 - 30.0);
+
+    // The Timeline's Rotation.
+    let rot = layer(&h.state().session, x.small).props.prop("transform/rotation").unwrap().uid;
+    h.state_mut().show_panel(PanelKind::Timeline);
+    let ctx = h.ctx.clone();
+    effectcraft_ui_egui::menus::invoke(h.state_mut(), &ctx, "timeline.reveal.rotation", json!({})).unwrap();
+    h.run_steps(4);
+    type_into(&mut h, &format!("timeline.prop.{rot}.revolutions"), "-2");
+    let rotation = |h: &Harness<'_, EffectcraftApp>| layer(&h.state().session, x.small).props.prop("transform/rotation").unwrap().value.as_f64();
+    assert_eq!(rotation(&h), -720.0);
+    // The Properties panel's Rotation.
+    h.state_mut().show_panel(PanelKind::Properties);
+    h.run_steps(4);
+    type_into(&mut h, &format!("properties.prop.{rot}.revolutions"), "1");
+    assert_eq!(rotation(&h), 360.0);
+}

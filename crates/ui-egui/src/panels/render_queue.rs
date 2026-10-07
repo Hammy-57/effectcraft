@@ -398,6 +398,15 @@ fn output_to_menu(it: &RenderQueueItem) -> Vec<(String, Value)> {
     v
 }
 
+/// Output To's save dialog, as After Effects' Output Movie To: it opens at the current output
+/// (folder and name) and offers the output format's extension. `None` when the host has no
+/// save dialog for other file kinds; `Some(None)` when the dialog was cancelled.
+fn pick_output(app: &EffectcraftApp, it: &RenderQueueItem) -> Option<Option<String>> {
+    let pick = app.hooks.pick_save_file.as_ref()?;
+    let default = app.session.resolve_output(it).unwrap_or_default();
+    Some(pick(&default, it.output.format.extension()))
+}
+
 pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let t = app.tokens;
     let p = ui.painter().with_clip_rect(rect);
@@ -687,16 +696,16 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             let olabels: Vec<String> = omenu.iter().map(|(l, _)| l.clone()).collect();
             if let Some(i) = widgets::popup_menu(ui, oid, odd.left_bottom(), &olabels, None) {
                 if omenu[i].1.get("choose").is_some() {
-                    let default = app.session.resolve_output(it).unwrap_or_default();
-                    let picked = app
-                        .hooks
-                        .pick_save
-                        .as_ref()
-                        .and_then(|f| f(std::path::Path::new(&default).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default().as_str()));
+                    // The web has no folders to choose from: its save "dialog" only names the file.
+                    let picked = pick_output(app, it).or_else(|| {
+                        let default = app.session.resolve_output(it).unwrap_or_default();
+                        let name = std::path::Path::new(&default).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                        app.hooks.pick_save.as_ref().map(|f| f(&name))
+                    });
                     match picked {
-                        Some(path) => actions.push(("renderQueue.setOutput", json!({"item": it.id, "path": path}))),
-                        None if app.hooks.pick_save.is_none() => editing = Some((it.id, it.output.output.clone())),
-                        None => {}
+                        Some(Some(path)) => actions.push(("renderQueue.setOutput", json!({"item": it.id, "path": path}))),
+                        Some(None) => {}
+                        None => editing = Some((it.id, it.output.output.clone())),
                     }
                 } else {
                     let mut params = omenu[i].1.clone();
@@ -715,7 +724,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     }
                     editing = None;
                 } else {
-                    resp.request_focus();
+                    widgets::keep_focus(ui.ctx(), &resp, &buf);
                     editing = Some((it.id, buf));
                 }
             } else {
@@ -723,10 +732,19 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 let resp = ui.interact(path_rect, egui::Id::new(("rq-path", it.id)), Sense::click());
                 let col = if resp.hovered() { t.accent_hover } else { t.hot_text };
                 lp.with_clip_rect(path_rect.intersect(list)).text(pos2(path_rect.min.x, r.center().y), Align2::LEFT_CENTER, &shown, Tokens::ui(11.5), col);
+                // Clicking the file name opens the save dialog (Output Movie To); Alt-click, or a
+                // host without one, edits the name template in place.
+                let dialog = app.hooks.pick_save_file.is_some();
                 if resp.clicked() && !rendering {
-                    editing = Some((it.id, it.output.output.clone()));
+                    let picked = if ui.input(|i| i.modifiers.alt) { None } else { pick_output(app, it) };
+                    match picked {
+                        Some(Some(path)) => actions.push(("renderQueue.setOutput", json!({"item": it.id, "path": path}))),
+                        Some(None) => {}
+                        None => editing = Some((it.id, it.output.output.clone())),
+                    }
                 }
-                resp.on_hover_text(format!("Template: {}\nClick to edit", it.output.output));
+                let how = if dialog { "Click to choose where to save; Alt-click to edit the template" } else { "Click to edit" };
+                resp.on_hover_text(format!("Template: {}\n{how}", it.output.output));
                 app.auto.add(&aid("outputPath"), path_rect, &shown);
             }
         }

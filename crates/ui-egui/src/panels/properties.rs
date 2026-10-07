@@ -2,7 +2,7 @@
 //! like After Effects' Properties panel. Sections appear by layer type:
 //!
 //! - **Layer Transform** (all layers but cameras/lights): keyframe navigator (◀ ◆ ▶) or
-//!   stopwatch, scrubbable values, linked Scale, `Nx+N°` Rotation, Reset.
+//!   stopwatch, scrubbable values, linked Scale, `Nx+N°` Rotation (revolutions and degrees scrub on their own), Reset.
 //! - **Text** (text layers): font family/style, size, leading, tracking, stroke width, fill and
 //!   stroke with enable checkboxes; "More" opens the Character panel.
 //! - **Paragraph** (text layers): the seven alignment buttons; "More" opens the Paragraph panel.
@@ -48,12 +48,6 @@ const ALIGNS: [(Justify, &str); 7] = [
 /// Value text the way AE prints it: whole numbers without decimals, otherwise one decimal.
 fn decimals(v: f64) -> usize {
     if (v - v.round()).abs() < 1e-6 { 0 } else { 1 }
-}
-
-/// Rotation as AE shows it: revolutions and remaining degrees (`1x+30°`, `-0x-45°`).
-pub fn split_rotation(deg: f64) -> (i64, f64) {
-    let rev = (deg / 360.0).trunc();
-    (rev as i64, deg - rev * 360.0)
 }
 
 pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
@@ -259,15 +253,12 @@ fn transform_row(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter,
     let suffix = if pct { "%" } else { "" };
     match &value {
         Value::Scalar(v) if pr.name == "Rotation" || pr.name.ends_with(" Rotation") => {
-            let (rev, deg) = split_rotation(*v);
-            let g = p.layout_no_wrap(format!("{rev}x{}", if deg < 0.0 { "" } else { "+" }), Tokens::ui(12.0), t.hot_text);
-            let gw = g.size().x;
-            p.galley(pos2(vx + 2.0, cy - g.size().y / 2.0), g, t.hot_text);
-            let (vr, nv, _) =
-                widgets::hot_number_at(ui, pos2(vx + gw, cy - 9.0), egui::Id::new(("props-v", uid)), deg, 0.5, (-1e9, 1e9), decimals(deg), "°", &t);
-            app.auto.add(&format!("{base}.value"), vr, &pr.name);
+            let (_, deg) = super::fx_widgets::split_angle(*v);
+            let (rr, dr, nv) = super::fx_widgets::angle_field(ui, pos2(vx, cy - 9.0), egui::Id::new(("props-v", uid)), *v, decimals(deg), &t);
+            app.auto.add(&format!("{base}.value"), dr, &pr.name);
+            app.auto.add(&format!("{base}.revolutions"), rr, &pr.name);
             if let Some(nv) = nv {
-                set(actions, json!(rev as f64 * 360.0 + nv));
+                set(actions, json!(nv));
             }
         }
         Value::Scalar(v) => {
@@ -345,9 +336,10 @@ fn text_section(
         widgets::open_popup(ui, pop);
     }
     app.auto.add("properties.text.font", fr, "Font family");
-    let fams: Vec<String> = effectcraft_engine::text_families();
-    if let Some(i) = widgets::popup_menu(ui, pop, fr.left_bottom(), &fams, fams.iter().position(|f| *f == doc.font)) {
-        set(actions, json!({"font": fams[i]}));
+    // Every installed family (built only while the menu is open: it can be long).
+    let fams: Vec<String> = if widgets::popup_is_open(ui, pop) { effectcraft_engine::text_families() } else { vec![] };
+    if let Some(f) = widgets::popup_menu(ui, pop, fr.left_bottom(), &fams, fams.iter().position(|f| *f == doc.font)).and_then(|i| fams.get(i)) {
+        set(actions, json!({"font": f}));
     }
     y += 28.0;
     let sr = Rect::from_min_size(pos2(x0, y), vec2(w, 22.0));
@@ -356,9 +348,10 @@ fn text_section(
         widgets::open_popup(ui, spop);
     }
     app.auto.add("properties.text.style", sr, "Font style");
-    let styles: Vec<String> = ["Regular", "Medium", "SemiBold", "Bold", "Italic"].iter().map(|s| s.to_string()).collect();
-    if let Some(i) = widgets::popup_menu(ui, spop, sr.left_bottom(), &styles, styles.iter().position(|s| *s == doc.style)) {
-        set(actions, json!({"style": styles[i]}));
+    // The family's own styles.
+    let styles: Vec<String> = if widgets::popup_is_open(ui, spop) { effectcraft_engine::font_styles(&doc.font) } else { vec![] };
+    if let Some(st) = widgets::popup_menu(ui, spop, sr.left_bottom(), &styles, styles.iter().position(|s| *s == doc.style)).and_then(|i| styles.get(i)) {
+        set(actions, json!({"style": st}));
     }
     y += 32.0;
     // Size / leading, tracking / stroke width.
@@ -512,14 +505,6 @@ fn more_button(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, x
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn rotation_splits_like_ae() {
-        assert_eq!(split_rotation(0.0), (0, 0.0));
-        assert_eq!(split_rotation(390.0), (1, 30.0));
-        assert_eq!(split_rotation(-45.0), (0, -45.0));
-        assert_eq!(split_rotation(-725.0), (-2, -5.0));
-    }
 
     #[test]
     fn decimals_hide_whole_numbers() {

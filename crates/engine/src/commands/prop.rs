@@ -118,8 +118,14 @@ fn get(s: &mut Session, p: &Value) -> Result<Value> {
         "keys": keys, "expression": pr.expr.as_ref().map(|e| e.text.clone()),
     });
     // With an expression, `value` is the keyframed (pre-expression) value; also report what the
-    // expression makes of it (what renders), or why it fails.
-    if pr.has_expression()
+    // expression makes of it (what renders), or why it fails. A disabled one renders `value`; one
+    // disabled by its syntax error (prop.setExpression) reports that error.
+    if let Some(e) = pr.expr.as_ref().filter(|e| !e.enabled && !e.text.trim().is_empty()) {
+        out["evaluated"] = raw.to_json();
+        if let Some(err) = s.expr_check.and_then(|check| check(&e.text).err()) {
+            out["expressionError"] = json!(err);
+        }
+    } else if pr.has_expression()
         && let (Some(h), Some(comp)) = (s.expr.as_deref(), s.project.comp(cid))
     {
         let mut ctx = crate::render::EvalCtx::new(&s.project, cid, comp, t);

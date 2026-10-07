@@ -8,7 +8,7 @@ use effectcraft_project::{FootageKind, ItemId, ItemKind, Layer, LayerSource, Nod
 use effectcraft_time::Tick;
 use serde_json::{Value, json};
 
-use super::layer::{color_p, insert_layer};
+use super::layer::{color_p, index_p, insert_layer, insert_layer_at, place, position_p};
 use super::{CommandSpec, b_p, bad, comp_id, f_p, has_comp, has_layers, layer_mut, layer_p, layers_p, str_p};
 use crate::{EngineError, Result, Session, cmd};
 
@@ -119,6 +119,8 @@ pub(crate) fn new_model(s: &mut Session, p: &Value) -> Result<Value> {
     let name = str_p(p, "name").unwrap_or(&it.name).to_string();
     let fr = comp.frame_rate;
     let start = fr.snap_nearest(f_p(p, "time").map(Tick::from_seconds_f64).unwrap_or(Tick::ZERO));
+    let index = index_p(p, "layer.newModel")?;
+    let position = position_p(p, "layer.newModel")?;
     let id = s.edit("New 3D Model Layer", None, |proj, st| {
         let mut l = build::layer(proj, &comp, &name, LayerSource::Model { item }, (comp.width, comp.height), None);
         let g = build::model_geometry_options(&mut Ids(&mut proj.next_id), scale, &clips);
@@ -128,7 +130,8 @@ pub(crate) fn new_model(s: &mut Session, p: &Value) -> Result<Value> {
         l.start_time = start;
         l.in_point = start;
         l.out_point = comp.duration.max(start + fr.frame_duration());
-        insert_layer(proj, st, cid, l)
+        place(&mut l, position);
+        insert_layer_at(proj, st, cid, l, index)
     })?;
     Ok(json!({"layer": id.0, "item": item.0}))
 }
@@ -349,7 +352,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "3D Model Layer",
             [],
             None,
-            "{item?: id or name of a 3D model footage item, path?: a .gltf, .glb or .obj file to import, name?, time? (s)}",
+            "{item?: id or name of a 3D model footage item, path?: a .gltf, .glb or .obj file to import, name?, time? (s), index? (1-based stack position), position? ([x, y] comp px)}",
             has_comp,
             new_model
         ),

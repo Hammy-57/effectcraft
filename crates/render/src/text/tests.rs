@@ -207,6 +207,39 @@ fn tracking_line_anchor_and_character_offset() {
     assert_eq!(substitute('a', &CharXf { char_value: Some((66.0, 1.0)), ..Default::default() }), Some('B'));
 }
 
+/// Without a Line Anchor, tracking grows each line from where its paragraph's alignment pins it:
+/// left text grows right, centred text around its centre, right text to the left (#146).
+#[test]
+fn tracking_grows_from_each_paragraphs_alignment() {
+    use effectcraft_keyframe::{Justify, ParaStyle};
+    let tracked = |d: TextDoc, amount: f64| {
+        let (mut p, cid, comp) = setup(600, 300);
+        let mut l = text_layer(&mut p, &comp, d);
+        animator(&mut p, &mut l, &["tracking"], &["range"]);
+        set(&mut l, "text/animators/#1/properties/tracking", Value::Scalar(amount));
+        p.comp_mut(cid).unwrap().layers.push(l);
+        glyph_paths(&ctx(&p, cid, 0.0), &p.comp(cid).unwrap().layers[0])
+    };
+    // 4 chars × 500/1000 em × 40 px: 20 px of tracking each, half before and half after.
+    for (justify, x0, centre, x1) in [(Justify::Left, 10.0, 40.0, 70.0), (Justify::Center, -30.0, 0.0, 30.0), (Justify::Right, -70.0, -40.0, -10.0)] {
+        let d = TextDoc { justify, ..doc("ABCD", 40.0) };
+        let (w0, w1) = (bounds_of(&tracked(d.clone(), 0.0)), bounds_of(&tracked(d, 500.0)));
+        let got = [w1.x0 - w0.x0, w1.center().x - w0.center().x, w1.x1 - w0.x1];
+        assert!(got.iter().zip([x0, centre, x1]).all(|(g, w)| (g - w).abs() < 1.0), "{justify:?}: moved {got:?}, want {:?}", [x0, centre, x1]);
+    }
+    // Each paragraph by its own alignment: a left paragraph above a right-aligned one.
+    let mut d = doc("ABCD\nABCD", 40.0);
+    let left = d.base_para();
+    d.set_paras(vec![left.clone(), ParaStyle { justify: Justify::Right, ..left }]);
+    let lines = |paths: Vec<(BezPath, CharXf)>| -> [kurbo::Rect; 2] {
+        let (a, b): (Vec<_>, Vec<_>) = paths.into_iter().partition(|g| bounds_of(std::slice::from_ref(g)).center().y < 10.0);
+        [bounds_of(&a), bounds_of(&b)]
+    };
+    let ([a0, b0], [a1, b1]) = (lines(tracked(d.clone(), 0.0)), lines(tracked(d, 500.0)));
+    assert!((a1.x0 - a0.x0 - 10.0).abs() < 1.0, "the left paragraph grows right: {} {}", a0.x0, a1.x0);
+    assert!((b1.x1 - b0.x1 + 10.0).abs() < 1.0, "the right paragraph grows left: {} {}", b0.x1, b1.x1);
+}
+
 #[test]
 fn anchor_grouping_line_rotates_around_line_centre() {
     let (mut p, cid, comp) = setup(600, 300);

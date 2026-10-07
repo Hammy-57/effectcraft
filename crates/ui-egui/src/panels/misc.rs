@@ -285,8 +285,7 @@ fn dropdown_row(app: &mut EffectcraftApp, ui: &mut egui::Ui, r: Rect, key: &str,
             }
         });
     });
-    let outside =
-        ui.input(|i| i.pointer.any_pressed()) && !area.response.contains_pointer() && !r.contains(ui.input(|i| i.pointer.interact_pos()).unwrap_or_default());
+    let outside = widgets::pressed_outside(ui.ctx(), &area.response) && !r.contains(ui.input(|i| i.pointer.interact_pos()).unwrap_or_default());
     if chosen.is_some() || outside || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
         ui.data_mut(|d| d.insert_temp(pid.with("open"), false));
     }

@@ -558,7 +558,8 @@ fn key_any(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool, fo
     draft.hash(&mut h);
     layer.id.hash(&mut h);
     hash_debug(&mut h, &layer.source);
-    hash_debug(&mut h, &layer.switches);
+    // (Audio, Lock and Shy don't change pixels.)
+    hash_debug(&mut h, &layer.switches.pixels());
     // Mask motion blur and effects that read the shutter depend on whether the layer is motion
     // blurred in this render and on the comp's shutter.
     if layer.masks().is_some_and(|m| !m.children.is_empty()) || layer.effects().is_some_and(|fx| !fx.children.is_empty()) {

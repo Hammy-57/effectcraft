@@ -164,7 +164,11 @@ keys, with a nesting-depth guard.
 **Audio** is mixed by `render::audio::mix_comp` in blocks: Audio switch, solo, Audio Levels and
 the Effect > Audio effects (`effects::audio_fx`, applied per layer with a pre-roll so blocks are
 independent). Export and preview playback share it; the desktop app plays it through cpal and the
-audio clock drives preview playback (`ui-egui::audio`).
+audio clock drives preview playback (`ui-egui::audio`). The sound starts once the frames ahead
+are cached; until then, and whenever playback reaches a frame that isn't cached, every frame
+shows as it renders, silently, rather than being skipped. Layer and frame caches ignore the
+switches that don't change pixels (Audio, Lock, Shy, Hide Shy Layers: `Switches::pixels`,
+`Comp::same_pixels`), so toggling them keeps the cached frames.
 
 **Layer styles** (Layer ▸ Layer Styles; `crates/render/src/styles.rs`) render in layer space and
 may grow the layer's bounds. Drop Shadow and Outer Glow become separate passes composited below the
@@ -265,7 +269,25 @@ zero texture per size, readback staging buffers are reused, and the 8/16 bpc qua
 each layer is fused into the layer's composite kernel; under test, pooled scratch images start
 as NaNs (a kernel that skips pixels fails the oracle) and validation errors panic. The desktop viewer builds the
 `Gpu` on egui-wgpu's device and shows frames from GPU textures without reading them back
-(`ui-egui::frames`); headless renders, the CLI (unless `--gpu`) and CI use the CPU. On the web
+(`ui-egui::frames`); headless renders, the CLI (unless `--gpu`) and CI use the CPU. Outside
+tests, device errors are logged rather than fatal. A viewer frame that runs out of video memory
+(`Gpu::within_memory`) renders on the CPU, the uploaded layers and pooled textures are freed, and
+the RAM preview keeps half as many GPU frames from then on. A frame whose render panics is
+rendered again on the CPU or released, never left in progress. Native readbacks and timing waits
+share a finite deadline; failure retires pending readbacks exactly once, and late results are
+discarded. The desktop executable and browser page own their shared device's error/loss handlers and forward
+failures to the compositor through a weak notifier. Libraries borrowing a device preserve its
+host's handlers. A host fault disables shared-device preview acceleration without editing the project or its
+renderer preference; materialized CPU frames remain usable and late GPU textures cannot return
+to the preview cache. Scoped allocation failures retain the adaptive budget/CPU retry behavior.
+
+**Recovery boundary:** the host installs handlers through eframe's CreationContext, after egui's
+presentation pipelines but before EffectCraft's pipelines. This does not cover that earlier egui
+startup window. eframe 0.36.2 supports lost-surface recreation, not replacing its live device and
+all presentation resources. Device loss therefore requires restarting the presentation backend;
+CPU compositing alone cannot restore that display. No automatic restart or persistent safe-mode
+sentinel is implemented here. Browser scope futures are not synchronously awaited; the browser page
+forwards shared-device errors, while owned worker devices install their own handlers. On the web
 (WebGPU) the GPU composites viewer frames; steps that need a readback fall back to the CPU (the
 Info panel's pixel readout reads GPU frames back asynchronously). **GPU particles**
 (`effects::psim`, `gpu::particles`): CC Particle World, CC Particle Systems II and Particle
@@ -552,8 +574,9 @@ What keeps it fast:
 
 - **Lazy open.** A project file carries its footage metadata, so File ▸ Open is read + parse +
   swap. Nothing is decoded until a frame needs it, expressions compile on first evaluation
-  (cached by text), and system fonts are scanned only when a text layer asks for a family that
-  isn't bundled. The footage files are checked afterwards in the background (`footage.check`, a
+  (cached by text), and system fonts are scanned on first need (a text layer asking for a family
+  that isn't bundled, or a font menu or `text.fonts` listing the families); the desktop app starts
+  that scan on a background thread at launch, reading name tables only. The footage files are checked afterwards in the background (`footage.check`, a
   "Checking footage" job in the Progress panel): missing items are flagged, items saved without
   metadata are probed, and the project is not marked modified. The desktop app does this after
   every open (`Session::check_footage_on_open`); headless sessions run `footage.check {wait:true}`.

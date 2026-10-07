@@ -341,6 +341,12 @@ impl Vp9Encoder {
             }
             out.extend_from_slice(&t);
         }
+        // A frame mustn't end in a byte that reads as a superframe marker (0b110xxxxx, Annex B):
+        // decoders would take its last bytes for a superframe index and reject the frame. The
+        // last tile's bool-coded data may end in zero padding (9.2.3), so a zero byte fixes it.
+        if out.last().is_some_and(|b| b & 0xe0 == 0xc0) {
+            out.push(0);
+        }
         // State for the next frame.
         self.mvs = mi.iter().map(|m| if m.inter { m.mv } else { Mv::ZERO }).collect();
         self.reference = Some(planes);

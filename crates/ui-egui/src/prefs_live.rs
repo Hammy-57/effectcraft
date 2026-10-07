@@ -18,6 +18,8 @@ pub fn frame(app: &mut EffectcraftApp, ctx: &egui::Context) {
 }
 
 /// Files dropped on the window are imported (layered files as Default Drag Import As says).
+/// Dropped on the Composition viewer, they also become layers centred there, as in After
+/// Effects (#85), when the platform reports where the pointer is during file drags.
 fn dropped_files(app: &mut EffectcraftApp, ctx: &egui::Context) {
     let paths: Vec<String> =
         ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_string_lossy().to_string()).filter(|p| std::path::Path::new(p).is_absolute()).collect());
@@ -34,7 +36,10 @@ fn dropped_files(app: &mut EffectcraftApp, ctx: &egui::Context) {
         app.ui.status = e;
     }
     if !rest.is_empty() {
-        let params = json!({"paths": rest, "drag": true, "importAs": app.session.prefs.drag_import_as()});
+        let viewer = app.auto.find("viewer.area").map(|e| Rect::from_min_size(egui::pos2(e.rect[0], e.rect[1]), egui::vec2(e.rect[2], e.rect[3])));
+        let at =
+            ctx.input(|i| i.pointer.hover_pos()).filter(|p| viewer.is_some_and(|v| v.contains(*p))).and_then(|p| crate::panels::viewer::screen_to_comp(ctx, p));
+        let params = json!({"paths": rest, "drag": true, "importAs": app.session.prefs.drag_import_as(), "addToComp": at.is_some(), "position": at});
         if let Err(e) = crate::menus::invoke(app, ctx, "file.import", params) {
             app.ui.status = e;
         }

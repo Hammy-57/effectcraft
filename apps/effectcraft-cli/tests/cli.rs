@@ -130,6 +130,60 @@ fn errors_are_json() {
     assert_eq!(out.status.code(), Some(2));
 }
 
+/// An unknown option is a usage error (exit 2) naming it, before anything runs: the command
+/// doesn't run with defaults, and a misspelt option's value isn't opened as the project (#168).
+#[test]
+fn unknown_options_are_usage_errors() {
+    let png = tmp("bogus.png");
+    let o = png.to_str().unwrap();
+    for (args, named) in [
+        (&["exec", "comp.new", "--bogus", "--empty", "--json"][..], "`--bogus`"),
+        (&["render-frame", "--bogusflag", "--out", o, "--json"], "`--bogusflag`"),
+        (&["exec", "comp.new", "--empty", "--saveas", "z.ecproj", "--json"], "`--saveas`"),
+    ] {
+        let out = bin().args(args).output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {err}");
+        assert!(err.contains(&format!("unknown option {named}")), "{args:?}: {err}");
+        assert!(out.stdout.is_empty(), "{args:?}: nothing ran");
+    }
+    assert!(!png.exists(), "render-frame didn't render");
+    // `--transparent` (silently ignored before) keeps the frame's alpha.
+    let proj = tmp("transparent.ecproj");
+    let p = proj.to_str().unwrap();
+    ok_json(&["run", "comp.new", r#"{"name":"T","width":32,"height":32}"#, "layer.newSolid", r#"{"width":8,"height":8}"#, "--empty", "--save-as", p]);
+    for (flag, alpha) in [(None, 255), (Some("--transparent"), 0)] {
+        ok_json(&[&["render-frame", p, "--out", o][..], flag.as_slice()].concat());
+        assert_eq!(image::open(&png).unwrap().to_rgba8().get_pixel(0, 0)[3], alpha, "{flag:?}");
+    }
+}
+
+/// A reader that closes stdout before the CLI writes (`| head`) is not a crash: the command
+/// still does its work and exits 0, without a panic (#167).
+#[test]
+fn a_closed_stdout_is_not_a_crash() {
+    let proj = tmp("closed-stdout.ecproj");
+    let p = proj.to_str().unwrap();
+    for args in [&["info", "--json"][..], &["exec", "--list"], &["run", "comp.new", r#"{"name":"Piped"}"#, "project.summary", "--empty", "--save-as", p]] {
+        let mut child = bin().args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        drop(child.stdout.take());
+        let out = child.wait_with_output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(0), "{args:?}: {err}");
+        assert!(!err.contains("panicked"), "{args:?}: {err}");
+    }
+    assert!(std::fs::read_to_string(&proj).unwrap().contains("Piped"), "the sequence ran to the end and saved");
+    // The MCP server ends quietly when its client closes stdout.
+    let mut child = bin().arg("mcp").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    drop(child.stdout.take());
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        let _ = writeln!(stdin, "{}", json!({"jsonrpc": "2.0", "id": 1, "method": "ping"}));
+    }
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
 #[test]
 fn mcp_over_stdio() {
     let mut child = bin().args(["mcp", "--demo"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
@@ -185,4 +239,11 @@ fn script_file_and_eval() {
     let (code, v) = run_json(&["script", "--eval", "\nnope()"]);
     assert_eq!(code, 1);
     assert_eq!(v["error"]["line"], json!(2));
+    // A compiled .jsxbin script is reported as unsupported, not as a SyntaxError (#176).
+    let bin_script = tmp("compiled.jsxbin");
+    std::fs::write(&bin_script, "@JSXBIN@ES@2.0@MyBbyBn0ABJAnAEjzFjBjMjFjSjUBfRBFeFjIjFjMjMjPff0DzACByB\n").unwrap();
+    let out = bin().args(["script", bin_script.to_str().unwrap()]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains(".jsxbin scripts are not supported: run the .jsx source") && !err.contains("SyntaxError"), "{err}");
 }

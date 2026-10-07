@@ -465,8 +465,8 @@ fn run_script(s: &mut Session, p: &Value) -> Result<Value> {
         && p.get("steps").is_none()
         && is_js_script(path)
     {
-        if path.to_ascii_lowercase().ends_with(".jsxbin") {
-            return Err(bad("file.runScript", "binary .jsxbin scripts are not supported: run the .jsx source"));
+        if is_jsxbin(path) {
+            return Err(bad("file.runScript", JSXBIN));
         }
         let bytes = s.services.read_file(path).map_err(|e| EngineError::Other(format!("cannot read {path}: {e}")))?;
         let code = String::from_utf8_lossy(&bytes).to_string();
@@ -514,7 +514,14 @@ fn run_script(s: &mut Session, p: &Value) -> Result<Value> {
 /// command scripts.
 fn is_js_script(path: &str) -> bool {
     let l = path.to_ascii_lowercase();
-    l.ends_with(".jsx") || l.ends_with(".js") || l.ends_with(".jsxbin")
+    l.ends_with(".jsx") || l.ends_with(".js") || is_jsxbin(path)
+}
+
+/// Compiled `.jsxbin` scripts are an undocumented binary encoding, not JavaScript.
+const JSXBIN: &str = "binary .jsxbin scripts are not supported: run the .jsx source";
+
+fn is_jsxbin(name: &str) -> bool {
+    name.to_ascii_lowercase().ends_with(".jsxbin")
 }
 
 /// A script error becomes a toast and a command error.
@@ -546,6 +553,11 @@ fn run_js(s: &mut Session, code: &str, name: &str, console: bool) -> Result<Valu
 fn script_run(s: &mut Session, p: &Value) -> Result<Value> {
     let code = str_p(p, "code").ok_or_else(|| bad("script.run", "missing `code` (JavaScript)"))?.to_string();
     let name = str_p(p, "name").unwrap_or("script").to_string();
+    // A compiled script (named `.jsxbin`, or its text starts with the format's header) would only
+    // fail to parse at 1:1.
+    if is_jsxbin(&name) || code.trim_start_matches('\u{feff}').trim_start().starts_with("@JSXBIN@") {
+        return Err(bad("script.run", JSXBIN));
+    }
     run_js(s, &code, &name, super::b_p(p, "console").unwrap_or(false))
 }
 

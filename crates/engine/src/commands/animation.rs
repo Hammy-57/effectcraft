@@ -338,7 +338,8 @@ fn reveal(s: &mut Session, p: &Value) -> Result<Value> {
             out.extend(found.into_iter().map(|u| json!({"layer": lid.0, "prop": u})));
         }
     }
-    frontend(s, "timeline.revealProps", &json!({"props": out, "kind": kind}))?;
+    let layers: Vec<u64> = layers.iter().map(|l| l.0).collect();
+    frontend(s, "timeline.revealProps", &json!({"props": out, "kind": kind, "layers": layers}))?;
     Ok(json!({"props": out}))
 }
 

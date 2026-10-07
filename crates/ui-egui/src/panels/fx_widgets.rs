@@ -9,6 +9,7 @@ use effectcraft_engine::geom::{Mat3, vec2 as gv2};
 use egui::{Align2, Color32, Pos2, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
 
 use crate::theme::Tokens;
+use crate::widgets;
 
 // ---------------------------------------------------------------------------------------------
 // Angles
@@ -38,6 +39,23 @@ pub fn parse_angle(s: &str) -> Option<f64> {
         return Some(rev * 360.0 + deg);
     }
     s.parse().ok()
+}
+
+/// An angle value, `0x+45.0°`, at `at` (top left): the revolutions and the degrees
+/// are hot numbers of their own (drag to scrub, click to type) and changing one keeps the other.
+/// Returns the revolutions' rect, the degrees' rect and the new angle when either changed.
+pub fn angle_field(ui: &mut egui::Ui, at: Pos2, id: egui::Id, v: f64, decimals: usize, t: &Tokens) -> (Rect, Rect, Option<f64>) {
+    let (rev, deg) = split_angle(v);
+    let (rr, new_rev, _) = widgets::hot_int_at(ui, at, id.with("rev"), rev, 0.1, "x", t);
+    let sign = ui.painter().text(pos2(rr.max.x - 2.0, rr.center().y), Align2::LEFT_CENTER, if deg < 0.0 { "-" } else { "+" }, Tokens::ui(12.0), t.hot_text);
+    let (dr, new_deg, _) = widgets::hot_number_at(ui, pos2(sign.max.x - 2.0, at.y), id, deg.abs(), 0.5, (-1e9, 1e9), decimals, "°", t);
+    let out = match (new_rev, new_deg) {
+        (Some(r), _) => Some(r as f64 * 360.0 + deg),
+        // The degrees field shows the remainder's size; its sign stays.
+        (None, Some(d)) => Some(rev as f64 * 360.0 + if deg < 0.0 || (deg == 0.0 && v < 0.0) { -d } else { d }),
+        (None, None) => None,
+    };
+    (rr, dr, out)
 }
 
 /// Dial angle (degrees, 0 = up, clockwise) of `p` around `c` in screen space.

@@ -26,8 +26,8 @@ use effectcraft_engine::project::{ItemId, ItemKind, LayerSource, ParamUi, Proper
 use egui::{Rect, RichText};
 use serde_json::{Value, json};
 
-use crate::EffectcraftApp;
 use crate::panels::DragPayload;
+use crate::{EffectcraftApp, widgets};
 
 type Actions = Vec<(String, Value)>;
 
@@ -296,13 +296,13 @@ fn name_label(app: &mut EffectcraftApp, ui: &mut egui::Ui, cid: ItemId, c: &EgCo
         Some(mut buf) => {
             let r = ui.add(egui::TextEdit::singleline(&mut buf).desired_width(120.0));
             app.auto.add(&format!("essential.control.{}.rename", c.id), r.rect, &c.name);
-            r.request_focus();
-            if r.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                if !buf.trim().is_empty() && buf.trim() != c.name {
+            if r.lost_focus() {
+                if !ui.input(|i| i.key_pressed(egui::Key::Escape)) && !buf.trim().is_empty() && buf.trim() != c.name {
                     actions.push(("essential.rename".into(), json!({"comp": cid.0, "control": c.id, "name": buf.trim()})));
                 }
                 ui.ctx().data_mut(|d| d.remove::<String>(edit_id));
             } else {
+                widgets::keep_focus(ui.ctx(), &r, &buf);
                 ui.ctx().data_mut(|d| d.insert_temp(edit_id, buf));
             }
         }

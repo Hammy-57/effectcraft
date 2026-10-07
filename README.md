@@ -85,7 +85,9 @@ then to go further in a few places where it matters to us:
 
 The panels, menus and shortcuts follow After Effects, so your muscle memory carries over:
 Project, Composition, Timeline, Effect Controls, Properties, Effects & Presets, Character,
-Paragraph, Align, Info, Preview, Audio and the Render Queue, docked the way you expect.
+Paragraph, Align, Info, Preview, Audio and the Render Queue, docked the way you expect. Drag
+footage, comps and effects between them: onto the comp viewer, where they land under the pointer,
+or into the Timeline, between layers and at the time you point to.
 
 - **Layers of every kind:** solids, shapes, text, footage, nested compositions, nulls,
   adjustment layers, cameras and lights; parenting, track mattes, all 38 blend modes, motion blur.
@@ -97,8 +99,8 @@ Paragraph, Align, Info, Preview, Audio and the Render Queue, docked the way you 
 - **Shapes and masks:** shape layers with trim paths, repeaters, round corners, offset, zig zag,
   twist, wiggle, merge paths and gradient strokes; masks drawn with the pen tool, with modes,
   feather, expansion and vertex editing in the viewer.
-- **Text:** point and paragraph text with real shaping, the Character and Paragraph panels, and
-  text animators with range selectors.
+- **Text:** point and paragraph text with real shaping in any font installed on your machine, the
+  Character and Paragraph panels, and text animators with range selectors.
 - **Expressions:** JavaScript with the After Effects object model (`wiggle`, `loopOut`,
   `thisComp.layer("…")`, vector maths on arrays), an inline editor and the pick-whip.
 - **Timeline like you know it:** twirl layers open to Transform, masks, effects and the rest; drag
@@ -179,7 +181,14 @@ See [docs/agents.md](docs/agents.md) and [docs/control-protocol.md](docs/control
 
 ## Get started
 
-You need [Rust](https://rustup.rs/) 1.95 or newer.
+Installers for each version are on the [Releases](https://github.com/storytold/effectcraft/releases)
+page: a universal macOS app; Windows MSIs and portable zips for x64, x86 and ARM64; and Linux
+AppImage, deb, rpm and tar.gz for x86_64 and aarch64. The Windows ARM64 build runs natively on
+Windows on ARM, without x64 emulation. CI installs that MSI on Windows 11 ARM64 hardware, checks
+both programs are ARM64 and runs the command-line tool there, but it doesn't open the app's window
+or run the test suite natively on ARM64 yet, so please report anything that behaves differently.
+
+To build it yourself you need [Rust](https://rustup.rs/) 1.95 or newer.
 
 ```sh
 git clone https://github.com/storytold/effectcraft
@@ -285,3 +294,7 @@ Forks and modified versions must remove them.
   <a href="https://getartcraft.com/"><img alt="ArtCraft" src="docs/brand/artcraft-mark.svg" width="28"></a><br>
   <sub>Made by the <a href="https://getartcraft.com/">ArtCraft</a> team and community.</sub>
 </p>
+
+## Star history
+
+[![Star History Chart](https://api.star-history.com/svg?repos=storytold/effectcraft&type=Date&legend=top-left)](https://www.star-history.com/?repos=storytold%2Feffectcraft&type=date&legend=top-left)

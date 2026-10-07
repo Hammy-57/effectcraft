@@ -508,3 +508,16 @@ fn interface_language_is_validated_persisted_and_backward_compatible() {
     assert_eq!(Prefs::from_json(r#"{"general":{"undoLevels":17}}"#).general.language, "en");
     assert_eq!(Prefs::from_json(r#"{"general":{"language":"unknown"}}"#).general.language, "en");
 }
+
+#[test]
+fn unicode_label_colors_fall_back_without_panicking() {
+    use effectcraft_color::Label;
+    let mut s = Session::default();
+    let default = s.prefs.label_rgb(Label::Red);
+    for color in ["#€abc", "#a€bc", "#abc€"] {
+        s.execute("prefs.set", json!({"key": "labels.0.color", "value": color})).unwrap();
+        assert_eq!(s.prefs.label_rgb(Label::Red), default);
+    }
+    s.execute("prefs.set", json!({"key": "labels.0.color", "value": "#aBcD09"})).unwrap();
+    assert_eq!(s.prefs.label_rgb(Label::Red), [0xab, 0xcd, 9]);
+}

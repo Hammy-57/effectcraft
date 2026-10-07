@@ -81,6 +81,7 @@ mod fx_vr;
 mod fx_warp;
 mod ops;
 mod particles;
+mod readback;
 mod walk;
 
 use std::sync::Arc;
@@ -163,7 +164,7 @@ impl Gpu {
     /// Deliver finished readbacks without blocking (native; the browser delivers them itself).
     pub fn poll(&self) {
         #[cfg(not(target_arch = "wasm32"))]
-        let _ = self.ctx.device.poll(wgpu::PollType::Poll);
+        let _ = self.ctx.poll_readbacks(wgpu::PollType::Poll);
     }
 
     /// `{passes, readbacks, inFlight}` of deferred rendering (diagnostics).
@@ -183,10 +184,14 @@ impl Gpu {
     /// Render a top-level comp frame and leave it on the GPU as a display texture (no
     /// readback unless a CPU fallback step needs one). `None` = render on the CPU.
     pub fn render_display(&self, r: &Renderer, comp: ItemId, t: Tick) -> Option<DisplayFrame> {
+        self.ctx.check_health().map_err(|e| log::error!("gpu display: {e}")).ok()?;
         let mut e = Enc::new(&self.ctx);
         let img = walk::render(&mut e, r, comp, t)?;
         let texture = e.display(&img);
         e.submit();
+        // Reject failures observed during rendering/submission before publishing the frame.
+        // A later device fault still requires the presentation host's lifecycle handling.
+        self.ctx.check_health().map_err(|e| log::error!("gpu display: {e}")).ok()?;
         Some(DisplayFrame { texture, width: img.width, height: img.height })
     }
 
@@ -198,11 +203,17 @@ impl Gpu {
     /// [`Gpu::read_display`] without blocking (the browser's main thread): `done` gets the bytes
     /// once the GPU has them.
     pub fn read_display_async(&self, f: &DisplayFrame, done: impl FnOnce(Option<Vec<u8>>) + wgpu::WasmNotSend + 'static) {
+        if let Err(e) = self.ctx.check_health() {
+            log::error!("gpu display readback: {e}");
+            crate::readback::reject(done, e);
+            return;
+        }
         Enc::new(&self.ctx).read_texture_async(&f.texture, f.width, f.height, 4, done);
     }
 
     /// Render a frame on the GPU and read it back (`None` = not handled).
     pub fn render(&self, r: &Renderer, comp: ItemId, t: Tick) -> Option<Image> {
+        self.ctx.check_health().ok()?;
         if !self.ctx.can_readback() {
             return None;
         }
@@ -250,9 +261,34 @@ impl Gpu {
         }
     }
 
-    /// Wait for all submitted GPU work (benchmarks).
+    /// Run work in a native thread-local out-of-memory scope. A failed result is discarded
+    /// and cached allocations are released; callers can retry with a fresh CPU renderer.
+    /// Browser callers use the host/owned-device failure bridge and bounded readbacks instead
+    /// of blocking their event loop on an error-scope future.
+    pub fn within_memory<T>(&self, f: impl FnOnce() -> T) -> Result<T, String> {
+        self.ctx.check_health()?;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let scope = self.ctx.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+            let out = f();
+            match pollster::block_on(scope.pop()) {
+                Some(e) => {
+                    self.ctx.clear_uploads();
+                    Err(e.to_string())
+                }
+                None => self.ctx.check_health().map(|()| out),
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let out = f();
+            self.ctx.check_health().map(|()| out)
+        }
+    }
+
+    /// Wait for submitted GPU work with the readback deadline (benchmarks).
     pub fn wait(&self) {
-        let _ = self.ctx.device.poll(wgpu::PollType::wait_indefinitely());
+        let _ = self.ctx.poll_readbacks(wgpu::PollType::Wait { submission_index: None, timeout: Some(crate::readback::TIMEOUT) });
     }
 }
 
@@ -266,22 +302,26 @@ impl Accelerator for Gpu {
     }
 
     fn supports_effect(&self, id: &str) -> bool {
-        self.ctx.can_readback() && effects::supports(id)
+        self.ctx.check_health().is_ok() && self.ctx.can_readback() && effects::supports(id)
     }
 
     fn effects(&self, chain: &[FxStep], buf: &Buf, levels: Option<f32>) -> Option<Buf> {
+        self.ctx.check_health().ok()?;
         effects::run_chain(&mut Enc::new(&self.ctx), chain, buf, levels)
     }
 
     fn raster_3d(&self, scene: &effectcraft_render::three_d::adv::Scene) -> Option<effectcraft_render::three_d::adv::Target> {
+        self.ctx.check_health().ok()?;
         adv3d::render(&self.ctx, scene)
     }
 
     fn render_3d(&self, run: &effectcraft_render::three_d::adv::Prepared) -> Option<effectcraft_render::three_d::adv::Rendered> {
+        self.ctx.check_health().ok()?;
         adv3d::render_prepared(&self.ctx, run)
     }
 
     fn particles(&self) -> Option<&dyn effectcraft_effects::psim::ParticleSim> {
+        self.ctx.check_health().ok()?;
         self.ctx.can_readback().then_some(self as &dyn effectcraft_effects::psim::ParticleSim)
     }
 
@@ -314,7 +354,7 @@ impl Accelerator for Gpu {
         // Natively the device delivers the readbacks when polled: wait for them here.
         #[cfg(not(target_arch = "wasm32"))]
         if d.in_flight() > 0 {
-            let _ = self.ctx.device.poll(wgpu::PollType::wait_indefinitely());
+            let _ = self.ctx.poll_readbacks(wgpu::PollType::Wait { submission_index: None, timeout: Some(crate::readback::TIMEOUT) });
         }
         Some(Box::pin(async move { d.settled().await }))
     }
@@ -322,6 +362,7 @@ impl Accelerator for Gpu {
 
 impl effectcraft_effects::psim::ParticleSim for Gpu {
     fn simulate(&self, req: &effectcraft_effects::psim::SimRequest) -> Option<Vec<effectcraft_effects::psim::SimParticle>> {
+        self.ctx.check_health().ok()?;
         particles::simulate(&self.ctx, req)
     }
 }
@@ -378,5 +419,7 @@ mod tests_fx_transition;
 mod tests_fx_vr;
 #[cfg(test)]
 mod tests_fx_warp;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests_init;
 #[cfg(test)]
 mod tests_particles;

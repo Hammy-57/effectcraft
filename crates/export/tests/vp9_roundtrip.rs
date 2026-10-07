@@ -259,11 +259,22 @@ fn inter_frames_are_much_smaller_than_intra() {
     eprintln!("{report:#?}");
 }
 
-#[test]
-fn ffmpeg_decodes_inter_frames_like_the_encoder() {
-    let (w, h) = (96usize, 64usize);
-    let mut e = Vp9Encoder::new(EncoderConfig { width: w as u32, height: h as u32, quality: 75, keyframe_interval: 5, ..Default::default() });
-    let n = 7;
+/// Encode `n` frames of `moving(.., kind)`: (frames, the encoder's reconstruction of each).
+fn encode_moving(cfg: EncoderConfig, n: usize, kind: u32) -> (Vec<Vec<u8>>, Vec<[Vec<u8>; 3]>) {
+    let (w, h) = (cfg.width as usize, cfg.height as usize);
+    let mut e = Vp9Encoder::new(cfg);
+    (0..n)
+        .map(|t| {
+            let (y, u, v) = moving(w, h, t, kind);
+            let f = e.encode_frame(&y, &u, &v, false);
+            (f.data, e.reconstruction().expect("recon"))
+        })
+        .unzip()
+}
+
+/// Decode `frames` with ffmpeg (an IVF file) and check every frame against `recon`, with nothing
+/// on ffmpeg's error log. Skipped without ffmpeg.
+fn ffmpeg_matches(w: usize, h: usize, frames: &[Vec<u8>], recon: &[[Vec<u8>; 3]], name: &str) {
     let mut ivf = Vec::new();
     ivf.extend_from_slice(b"DKIF");
     ivf.extend_from_slice(&0u16.to_le_bytes());
@@ -273,18 +284,14 @@ fn ffmpeg_decodes_inter_frames_like_the_encoder() {
     ivf.extend_from_slice(&(h as u16).to_le_bytes());
     ivf.extend_from_slice(&30u32.to_le_bytes());
     ivf.extend_from_slice(&1u32.to_le_bytes());
-    ivf.extend_from_slice(&(n as u32).to_le_bytes());
+    ivf.extend_from_slice(&(frames.len() as u32).to_le_bytes());
     ivf.extend_from_slice(&0u32.to_le_bytes());
-    let mut recon = vec![];
-    for t in 0..n {
-        let (y, u, v) = moving(w, h, t, 0);
-        let f = e.encode_frame(&y, &u, &v, false);
-        ivf.extend_from_slice(&(f.data.len() as u32).to_le_bytes());
+    for (t, f) in frames.iter().enumerate() {
+        ivf.extend_from_slice(&(f.len() as u32).to_le_bytes());
         ivf.extend_from_slice(&(t as u64).to_le_bytes());
-        ivf.extend_from_slice(&f.data);
-        recon.push(e.reconstruction().expect("recon"));
+        ivf.extend_from_slice(f);
     }
-    let dir = std::env::temp_dir().join(format!("effectcraft-vp9-inter-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("effectcraft-vp9-{name}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("a.ivf");
     std::fs::write(&path, &ivf).unwrap();
@@ -297,14 +304,52 @@ fn ffmpeg_decodes_inter_frames_like_the_encoder() {
         eprintln!("ffmpeg not found: skipping oracle");
         return;
     };
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success() && out.stderr.is_empty(), "{}", String::from_utf8_lossy(&out.stderr));
     let fsz = w * h + 2 * w.div_ceil(2) * h.div_ceil(2);
-    assert_eq!(out.stdout.len(), fsz * n);
+    assert_eq!(out.stdout.len(), fsz * frames.len());
     for (t, r) in recon.iter().enumerate() {
         let frame = &out.stdout[t * fsz..(t + 1) * fsz];
         assert_eq!(&frame[..w * h], &r[0][..], "ffmpeg luma of frame {t}");
         assert_eq!(&frame[w * h..w * h + r[1].len()], &r[1][..], "ffmpeg U of frame {t}");
     }
+}
+
+#[test]
+fn ffmpeg_decodes_inter_frames_like_the_encoder() {
+    let (w, h) = (96usize, 64usize);
+    let cfg = EncoderConfig { width: w as u32, height: h as u32, quality: 75, keyframe_interval: 5, ..Default::default() };
+    let (frames, recon) = encode_moving(cfg, 7, 0);
+    ffmpeg_matches(w, h, &frames, &recon, "inter");
+}
+
+/// A frame whose data would end in a byte that reads as a superframe marker (0b110xxxxx) gets a
+/// zero byte after it; otherwise decoders take its tail for a superframe index and reject it
+/// (#161: 3 of 60 frames of a WebM failed to decode). Such frames still decode exactly.
+#[test]
+fn frames_never_end_in_a_superframe_marker() {
+    let marker = |b: u8| b & 0xe0 == 0xc0;
+    let mut padded = None;
+    for (w, h) in [(96usize, 64usize), (130, 66), (160, 96)] {
+        for q in [40u8, 60, 75, 90] {
+            let cfg = EncoderConfig { width: w as u32, height: h as u32, quality: q, keyframe_interval: 12, ..Default::default() };
+            let (frames, recon) = encode_moving(cfg, 24, 1);
+            for (t, f) in frames.iter().enumerate() {
+                assert!(!f.last().copied().is_some_and(marker), "{w}x{h} q{q} frame {t} ends in {:#x}", f[f.len() - 1]);
+            }
+            let needed = frames.iter().any(|f| f.len() >= 2 && f[f.len() - 1] == 0 && marker(f[f.len() - 2]));
+            if needed && padded.is_none() {
+                padded = Some((w, h, q, frames, recon));
+            }
+        }
+    }
+    let Some((w, h, q, frames, recon)) = padded else { panic!("no frame needed the padding: widen the search") };
+    // The padded frames decode exactly, with FilmCraft's decoder and with ffmpeg.
+    let mut d = Decoder::new();
+    for (t, (f, r)) in frames.iter().zip(&recon).enumerate() {
+        let mut pics = d.decode(f, t as i64).unwrap_or_else(|e| panic!("{w}x{h} q{q} frame {t}: {e:?}"));
+        assert_eq!(planes_of(&pics.remove(0), w, h), *r, "{w}x{h} q{q} frame {t}");
+    }
+    ffmpeg_matches(w, h, &frames, &recon, "marker");
 }
 
 /// Encoder speed on 720p (run with `--ignored --nocapture`).

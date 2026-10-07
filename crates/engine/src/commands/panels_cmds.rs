@@ -104,15 +104,14 @@ fn browser_import(s: &mut Session, p: &Value) -> Result<Value> {
     if !browser(s)?.fetch(&list, p) {
         return Ok(json!({"pending": true, "paths": list}));
     }
-    let r = s.execute("file.import", json!({"paths": paths}))?;
-    // Add to the active comp (drag into the timeline).
-    if b_p(p, "addToComp").unwrap_or(false)
-        && s.active_comp_id().is_some()
-        && let Some(items) = r.get("items").and_then(Value::as_array)
+    let target = s.active_comp_id();
+    let mut r = s.execute("file.import", json!({"paths": paths}))?;
+    // Dragged into the Timeline or the Composition viewer: into the comp, where they were dropped.
+    let errors = super::file::add_to_comp(s, &r, target, p);
+    if !errors.is_empty()
+        && let Some(e) = r.get_mut("errors").and_then(Value::as_array_mut)
     {
-        for it in items {
-            s.execute("layer.addItem", json!({"item": it}))?;
-        }
+        e.extend(errors.into_iter().map(Value::from));
     }
     Ok(r)
 }
@@ -233,7 +232,15 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("mediaBrowser.go", "Go to Folder", [], None, "{path?: folder | \"..\", importableOnly?}", browser_enabled, browser_go),
         cmd!("mediaBrowser.addFavorite", "Add to Favorites", [], None, "{path?}", browser_enabled, |s, p| browser_favorite(s, p, true)),
         cmd!("mediaBrowser.removeFavorite", "Remove from Favorites", [], None, "{path?}", browser_enabled, |s, p| browser_favorite(s, p, false)),
-        cmd!("mediaBrowser.import", "Import", [], None, "{paths, addToComp?}", browser_enabled, browser_import),
+        cmd!(
+            "mediaBrowser.import",
+            "Import",
+            [],
+            None,
+            "{paths, addToComp?, time?, index?, position? (where the layers go, as in layer.addItem)}",
+            browser_enabled,
+            browser_import
+        ),
         cmd!(
             "mediaBrowser.action",
             "Media Browser Action",

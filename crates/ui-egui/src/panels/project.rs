@@ -424,6 +424,10 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             // Flat rows like After Effects' Project panel (no stripes).
             if selected { t.row_selected } else { t.row },
         );
+        // The row's click / drag area goes first, so the twirl, proxy, label and comment widgets
+        // on top of it take their own clicks.
+        let mut resp = ui.interact(r.intersect(list), egui::Id::new(("pitem", id.0)), Sense::click_and_drag());
+        app.auto.add(&format!("project.item.{}", id.0), r, &it.name);
         let _ = i;
         let x0 = r.min.x + 8.0 + 14.0 * *depth as f32;
         if it.is_folder() {
@@ -476,7 +480,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     actions.push((cmd.into(), params));
                 }
             } else {
-                resp.request_focus();
+                widgets::keep_focus(&ctx, &resp, &buf);
                 ctx.data_mut(|d| d.insert_temp::<Editing>(edit_id(), (eid, ef, buf)));
             }
             true
@@ -533,6 +537,9 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     app.auto.add(&format!("project.item.{}.comment", id.0), cell, &it.comment);
                     if cresp.double_clicked() {
                         ctx.data_mut(|d| d.insert_temp::<Editing>(edit_id(), (id.0, "comment".into(), it.comment.clone())));
+                    } else {
+                        // Other clicks select the row and open its context menu.
+                        resp = resp.union(cresp);
                     }
                     it.comment.clone()
                 }
@@ -545,8 +552,6 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         if dragging.is_some_and(|d| d != id.0) && drop_row == Some(*id) && it.is_folder() {
             lp.rect_stroke(r.shrink(1.0), 2.0, Stroke::new(1.5, t.accent), egui::StrokeKind::Inside);
         }
-        let resp = ui.interact(r.intersect(list), egui::Id::new(("pitem", id.0)), Sense::click_and_drag());
-        app.auto.add(&format!("project.item.{}", id.0), r, &it.name);
         let nresp = ui.interact(name_clip, egui::Id::new(("pname", id.0)), Sense::click_and_drag());
         app.auto.add(&format!("project.item.{}.name", id.0), name_clip, &it.name);
         let resp = resp.union(nresp);

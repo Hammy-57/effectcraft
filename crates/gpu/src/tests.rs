@@ -55,6 +55,8 @@ pub(crate) fn gpu() -> Option<&'static Gpu> {
         let g = Gpu::headless();
         if g.is_none() {
             eprintln!("effectcraft-gpu tests: no GPU adapter, skipping GPU comparisons");
+        } else if let Some(g) = &g {
+            eprintln!("effectcraft-gpu tests: adapter {}", g.ctx.name);
         }
         g
     })
@@ -687,4 +689,12 @@ fn devices_with_webgl2_limits_are_declined() {
     let Ok((device, queue)) = pollster::block_on(adapter.request_device(&desc)) else { return };
     let err = crate::context::GpuContext::new(&adapter, device, queue).err().expect("declined");
     assert!(err.contains("max_storage_buffers_per_shader_stage"), "{err}");
+}
+
+/// GPU work inside the video memory guard returns its result when the device has room (#106).
+#[test]
+fn within_memory_returns_the_work_when_there_is_room() {
+    let Some(g) = gpu() else { return };
+    let img = g.within_memory(|| g.ctx.image(64, 32)).expect("room for a 64×32 texture");
+    assert_eq!((img.width, img.height), (64, 32));
 }

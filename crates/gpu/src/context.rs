@@ -267,6 +267,7 @@ pub struct GpuContext {
     pub(crate) particle_states: crate::particles::StatesCell,
     /// Deferred readbacks (a browser worker's WebGPU device), see [`crate::deferred`].
     pub(crate) deferred: Option<Arc<crate::deferred::Deferred>>,
+    readbacks: Arc<crate::readback::Readbacks>,
 }
 
 fn tex_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
@@ -291,10 +292,44 @@ fn storage_tex_entry(binding: u32, format: wgpu::TextureFormat) -> wgpu::BindGro
     }
 }
 
+/// Contain synchronous native initialization errors without replacing the device owner's
+/// handlers. Scopes are thread-local with wgpu's enabled `std` feature. The pinned native
+/// wgpu-core backend returns an immediately-ready future from pop_error_scope, so these
+/// drains do not poll or wait for unrelated submitted GPU work.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn init_resource<T>(device: &wgpu::Device, label: &str, create: impl FnOnce() -> T) -> Result<T, String> {
+    let oom = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    // Some native drivers/wgpu paths can still unwind instead of reporting a scoped error.
+    // Keep the last-resort guard inside the scopes, then drain every scope even on failure.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(create));
+    let validation_error = pollster::block_on(validation.pop());
+    let internal_error = pollster::block_on(internal.pop());
+    let oom_error = pollster::block_on(oom.pop());
+    if let Some(error) = validation_error.or(internal_error).or(oom_error) {
+        return Err(format!("GPU initialization ({label}): {error}"));
+    }
+    result.map_err(|payload| {
+        let reason =
+            payload.downcast_ref::<String>().map(String::as_str).or_else(|| payload.downcast_ref::<&str>().copied()).unwrap_or("native backend panicked");
+        format!("GPU initialization ({label}): {reason}")
+    })
+}
+
+/// Browser scope completion is asynchronous. Preserve the existing browser constructor;
+/// never block its event loop or introduce a guard across an asynchronous boundary here.
+#[cfg(target_arch = "wasm32")]
+fn init_resource<T>(_device: &wgpu::Device, _label: &str, create: impl FnOnce() -> T) -> Result<T, String> {
+    Ok(create())
+}
+
 impl GpuContext {
     /// Build on an existing device (the desktop app shares egui-wgpu's). `Err` when the
     /// adapter cannot run the compositor (no compute shaders, e.g. WebGL2; no float storage
     /// textures) or the device was created with limits below what its pipelines bind.
+    /// Preserves the host's device handlers. The host must forward failures using
+    /// [`Self::device_failure_notifier`] for immediate readback cancellation.
     pub fn new(adapter: &wgpu::Adapter, device: wgpu::Device, queue: wgpu::Queue) -> Result<GpuContext, String> {
         let info = adapter.get_info();
         if !adapter.get_downlevel_capabilities().flags.contains(wgpu::DownlevelFlags::COMPUTE_SHADERS) {
@@ -320,6 +355,7 @@ impl GpuContext {
                 return Err(format!("{} ({:?}): {f:?} storage textures unsupported", info.name, info.backend));
             }
         }
+        let readbacks = crate::readback::Readbacks::new()?;
         let name = format!("{} ({:?})", info.name, info.backend);
         let adv3d_unsupported = crate::adv3d::raster_unsupported(adapter);
         if let Some(why) = &adv3d_unsupported {
@@ -352,52 +388,61 @@ impl GpuContext {
             include_str!("shaders/sky.wgsl"),
         ]
         .concat();
-        let module =
-            device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("effectcraft kernels"), source: wgpu::ShaderSource::Wgsl(src.into()) });
-        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("effectcraft kernels"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
-                    count: None,
-                },
-                tex_entry(1),
-                tex_entry(2),
-                storage_tex_entry(3, FORMAT),
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+        let module = init_resource(&device, "kernels shader module", || {
+            device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("effectcraft kernels"), source: wgpu::ShaderSource::Wgsl(src.into()) })
+        })?;
+        let bgl = init_resource(&device, "kernels bind-group layout", || {
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("effectcraft kernels"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                        count: None,
                     },
-                    count: None,
-                },
-            ],
-        });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("effectcraft kernels"),
-            bind_group_layouts: &[Some(&bgl)],
-            immediate_size: 0,
-        });
+                    tex_entry(1),
+                    tex_entry(2),
+                    storage_tex_entry(3, FORMAT),
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            })
+        })?;
+        let layout = init_resource(&device, "kernels pipeline layout", || {
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("effectcraft kernels"),
+                bind_group_layouts: &[Some(&bgl)],
+                immediate_size: 0,
+            })
+        })?;
         let storage = |binding: u32| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::COMPUTE,
             ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
             count: None,
         };
-        let bgl_ext = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("effectcraft kernels (ext)"),
-            entries: &[storage(0), storage(1), storage(2), storage(3)],
-        });
-        let layout_ext = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("effectcraft kernels (ext)"),
-            bind_group_layouts: &[Some(&bgl), Some(&bgl_ext)],
-            immediate_size: 0,
-        });
+        let bgl_ext = init_resource(&device, "extended kernels bind-group layout", || {
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("effectcraft kernels (ext)"),
+                entries: &[storage(0), storage(1), storage(2), storage(3)],
+            })
+        })?;
+        let layout_ext = init_resource(&device, "extended kernels pipeline layout", || {
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("effectcraft kernels (ext)"),
+                bind_group_layouts: &[Some(&bgl), Some(&bgl_ext)],
+                immediate_size: 0,
+            })
+        })?;
         let pipelines = ENTRIES
             .iter()
             .chain(crate::fx_color::KERNELS)
@@ -424,50 +469,64 @@ impl GpuContext {
             .map(|e| (e, &layout))
             .chain(EXT_ENTRIES.iter().map(|e| (e, &layout_ext)))
             .map(|(e, layout)| {
-                let p = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some(e),
-                    layout: Some(layout),
-                    module: &module,
-                    entry_point: Some(e),
-                    compilation_options: Default::default(),
-                    cache: None,
-                });
-                (*e, p)
+                let p = init_resource(&device, e, || {
+                    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                        label: Some(e),
+                        layout: Some(layout),
+                        module: &module,
+                        entry_point: Some(e),
+                        compilation_options: Default::default(),
+                        cache: None,
+                    })
+                })?;
+                Ok((*e, p))
             })
-            .collect();
-        let dmodule = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("effectcraft display"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/display.wgsl").into()),
-        });
-        let display_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("effectcraft display"),
-            entries: &[tex_entry(1), storage_tex_entry(3, wgpu::TextureFormat::Rgba8Unorm)],
-        });
-        let dlayout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("effectcraft display"),
-            bind_group_layouts: &[Some(&display_bgl)],
-            immediate_size: 0,
-        });
-        let display = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("display"),
-            layout: Some(&dlayout),
-            module: &dmodule,
-            entry_point: Some("display"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-        let dummy = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("dummy"),
-            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: FORMAT,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let dummy_buf =
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("dummy"), contents: &[0u8; 16], usage: wgpu::BufferUsages::STORAGE });
+            .collect::<Result<HashMap<_, _>, String>>()?;
+        let dmodule = init_resource(&device, "display shader module", || {
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("effectcraft display"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("shaders/display.wgsl").into()),
+            })
+        })?;
+        let display_bgl = init_resource(&device, "display bind-group layout", || {
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("effectcraft display"),
+                entries: &[tex_entry(1), storage_tex_entry(3, wgpu::TextureFormat::Rgba8Unorm)],
+            })
+        })?;
+        let dlayout = init_resource(&device, "display pipeline layout", || {
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("effectcraft display"),
+                bind_group_layouts: &[Some(&display_bgl)],
+                immediate_size: 0,
+            })
+        })?;
+        let display = init_resource(&device, "display compute pipeline", || {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("display"),
+                layout: Some(&dlayout),
+                module: &dmodule,
+                entry_point: Some("display"),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        })?;
+        let dummy = init_resource(&device, "dummy texture", || {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("dummy"),
+                size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: FORMAT,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+        })?;
+        let dummy_buf = init_resource(&device, "dummy storage buffer", || {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("dummy"), contents: &[0u8; 16], usage: wgpu::BufferUsages::STORAGE })
+        })?;
+        let dummy_tex = init_resource(&device, "dummy texture view", || dummy.create_view(&Default::default()))?;
         let max_dim = device.limits().max_texture_dimension_2d;
         Ok(GpuContext {
             device,
@@ -479,7 +538,7 @@ impl GpuContext {
             pipelines,
             display_bgl,
             display,
-            dummy_tex: dummy.create_view(&Default::default()),
+            dummy_tex,
             dummy,
             dummy_buf,
             uploads: Mutex::new(Uploads::default()),
@@ -492,11 +551,112 @@ impl GpuContext {
             particles: Default::default(),
             particle_states: Default::default(),
             deferred: None,
+            readbacks,
         })
+    }
+
+    /// Whether this context has observed a readback timeout or device failure.
+    /// A successful check is not a guarantee against faults after it returns.
+    /// Shared-device hosts must forward their device failures through the notifier.
+    pub fn check_health(&self) -> Result<(), String> {
+        self.readbacks.check()
+    }
+
+    /// A notification hook for the owner of a shared device's error/loss handlers.
+    /// Invoke it with diagnostic context when the host observes a device failure.
+    /// It retires this context and settles pending readbacks without replacing any
+    /// host handler or keeping this context/device alive. It is harmless after drop.
+    ///
+    /// Shared-device construction does not automatically subscribe to device faults:
+    /// without host forwarding, readbacks rely on poll errors and their deadlines.
+    pub fn device_failure_notifier(&self) -> impl Fn(String) + Send + Sync + 'static {
+        crate::readback::failure_notifier(&self.readbacks)
+    }
+
+    /// All device polling routes through this failure bridge.
+    pub(crate) fn poll_readbacks(&self, kind: wgpu::PollType) -> Result<wgpu::PollStatus, String> {
+        self.readbacks.check()?;
+        self.device.poll(kind).map_err(|e| {
+            let error = format!("GPU readback poll: {e}");
+            self.readbacks.retire(error.clone());
+            log::error!("{error}");
+            error
+        })
+    }
+
+    /// Start a bounded buffer mapping. Retired contexts reject new requests immediately.
+    pub(crate) fn map_readback(
+        &self,
+        buffer: &wgpu::Buffer,
+        row: usize,
+        stride: usize,
+        height: usize,
+        done: impl FnOnce(Result<Vec<u8>, String>) + wgpu::WasmNotSend + 'static,
+    ) {
+        let ticket = match self.readbacks.start(done) {
+            Ok(t) => t,
+            Err(e) => {
+                log::error!("gpu: {e}");
+                return;
+            }
+        };
+        if !ticket.active() {
+            return;
+        }
+        let b = buffer.clone();
+        buffer.map_async(wgpu::MapMode::Read, .., move |r| {
+            if !ticket.active() {
+                b.unmap();
+                return;
+            }
+            let result = r.map_err(|e| format!("GPU buffer mapping: {e}")).and_then(|_| {
+                let view = b.get_mapped_range(..).map_err(|e| format!("GPU mapped range: {e}"))?;
+                crate::readback::packed(&view, row, stride, height)
+            });
+            b.unmap();
+            ticket.complete(result);
+        });
+    }
+
+    /// A bounded native readback: polling and receiving share one deadline.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn read_buffer(&self, buffer: &wgpu::Buffer, row: usize, stride: usize, height: usize) -> Result<Vec<u8>, String> {
+        let deadline = std::time::Instant::now() + crate::readback::TIMEOUT;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.map_readback(buffer, row, stride, height, move |r| {
+            let _ = tx.send(r);
+        });
+        loop {
+            self.readbacks.check()?;
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                let error = "GPU readback receive timed out; context retired".to_string();
+                self.readbacks.retire(error.clone());
+                return Err(error);
+            }
+            // Block until the GPU is done (bounded by the deadline: a timeout retires the
+            // context) rather than polling and sleeping, which adds latency to every readback.
+            self.poll_readbacks(wgpu::PollType::Wait { submission_index: None, timeout: Some(remaining) })?;
+            // The callback may be running on another thread that polled the same device.
+            match rx.recv_timeout(remaining.min(std::time::Duration::from_millis(1))) {
+                Ok(result) => return result,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(e) => return Err(format!("GPU readback completion channel: {e}")),
+            }
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn read_buffer(&self, _buffer: &wgpu::Buffer, _row: usize, _stride: usize, _height: usize) -> Result<Vec<u8>, String> {
+        Err("synchronous GPU readback is unavailable in the browser".into())
     }
 
     /// Switch to deferred readbacks (see [`crate::deferred`]): readbacks are never waited for.
     pub fn set_deferred(&mut self, on: bool) {
+        self.readbacks.cancel_pending("GPU readback mode changed".into());
+        if let Some(d) = self.deferred.take() {
+            d.cancel();
+        }
         self.deferred = on.then(Default::default);
     }
 
@@ -539,17 +699,10 @@ impl GpuContext {
             .request_device(&wgpu::DeviceDescriptor { label: Some("effectcraft gpu"), required_limits, ..Default::default() })
             .await
             .map_err(|e| format!("no device: {e}"))?;
-        device.on_uncaptured_error(Arc::new(|e| {
-            // Under test a validation error (a WGSL typo invalidates every kernel) fails loudly.
-            #[cfg(test)]
-            #[allow(clippy::panic)] // test builds only
-            {
-                panic!("wgpu: {e}")
-            }
-            #[cfg(not(test))]
-            log::error!("wgpu: {e}")
-        }));
-        GpuContext::new(adapter, device, queue)
+        let context = GpuContext::new(adapter, device, queue)?;
+        // This path owns the device; install handlers only after construction succeeds.
+        crate::readback::install(&context.device, &context.readbacks);
+        Ok(context)
     }
 
     /// A device of its own on the best adapter (CLI, tests, benchmarks). `None` when no
@@ -562,13 +715,13 @@ impl GpuContext {
     /// Readbacks (GPU → CPU) are possible: waited for natively, or deferred (a browser
     /// worker, [`crate::deferred`]). Impossible on the browser's main thread.
     pub fn can_readback(&self) -> bool {
-        self.can_wait() || self.deferred.is_some()
+        self.readbacks.check().is_ok() && (self.can_wait() || self.deferred.is_some())
     }
 
     /// Readbacks can be waited for (natively, unless deferred). Steps that read back without a
     /// key ([`crate::deferred`]) need this.
     pub fn can_wait(&self) -> bool {
-        cfg!(not(target_arch = "wasm32")) && self.deferred.is_none()
+        self.readbacks.check().is_ok() && cfg!(not(target_arch = "wasm32")) && self.deferred.is_none()
     }
 
     pub(crate) fn fits(&self, w: u32, h: u32) -> bool {
@@ -870,7 +1023,13 @@ impl<'g> Enc<'g> {
 
     /// Read an image back to the CPU (submits and waits). `None` where readback is impossible.
     pub fn download(&mut self, img: &GpuImage) -> Option<Image> {
-        let mut out = Image::new(img.width, img.height);
+        let layout = crate::readback::Layout::new(img.width, img.height, 16, self.g.device.limits().max_buffer_size)
+            .map_err(|e| log::error!("gpu image readback: {e}"))
+            .ok()?;
+        let mut data = Vec::new();
+        data.try_reserve_exact(layout.len / 16).map_err(|e| log::error!("gpu image allocation: {e}")).ok()?;
+        data.resize(layout.len / 16, [0.0; 4]);
+        let mut out = Image { width: img.width, height: img.height, data };
         let dst: &mut [u8] = bytemuck::cast_slice_mut(&mut out.data);
         self.read_texture_into(&img.texture, img.width, img.height, 16, dst)?;
         Some(out)
@@ -878,7 +1037,11 @@ impl<'g> Enc<'g> {
 
     /// Tightly packed texel bytes of a texture (`bpp` bytes per pixel).
     pub fn read_texture(&mut self, texture: &wgpu::Texture, w: u32, h: u32, bpp: u32) -> Option<Vec<u8>> {
-        let mut out = vec![0u8; (w * bpp) as usize * h as usize];
+        let layout =
+            crate::readback::Layout::new(w, h, bpp, self.g.device.limits().max_buffer_size).map_err(|e| log::error!("gpu texture readback: {e}")).ok()?;
+        let mut out = Vec::new();
+        out.try_reserve_exact(layout.len).map_err(|e| log::error!("gpu readback allocation: {e}")).ok()?;
+        out.resize(layout.len, 0);
         self.read_texture_into(texture, w, h, bpp, &mut out)?;
         Some(out)
     }
@@ -889,9 +1052,15 @@ impl<'g> Enc<'g> {
             return None;
         }
         self.g.transfers.count(false, out.len());
-        let row = (w * bpp) as usize;
-        let padded = (w * bpp).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-        let size = padded as u64 * h as u64;
+        let layout =
+            crate::readback::Layout::new(w, h, bpp, self.g.device.limits().max_buffer_size).map_err(|e| log::error!("gpu texture readback: {e}")).ok()?;
+        if out.len() != layout.len {
+            log::error!("gpu readback destination size mismatch");
+            return None;
+        }
+        let row = layout.row as usize;
+        let padded = layout.stride;
+        let size = layout.size;
         let buf = self.g.staging.lock().ok().and_then(|mut s| s.get_mut(&size).and_then(Vec::pop)).unwrap_or_else(|| {
             self.g.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("readback"),
@@ -906,27 +1075,12 @@ impl<'g> Enc<'g> {
             wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
         );
         self.submit();
-        let (tx, rx) = std::sync::mpsc::channel();
-        buf.map_async(wgpu::MapMode::Read, .., move |r| {
-            let _ = tx.send(r);
-        });
-        if let Err(e) = self.g.device.poll(wgpu::PollType::wait_indefinitely()) {
-            log::error!("gpu: poll: {e}");
+        let bytes = self.g.read_buffer(&buf, row, padded as usize, h as usize).map_err(|e| log::error!("gpu texture readback: {e}")).ok()?;
+        if bytes.len() != out.len() {
+            log::error!("gpu texture readback size mismatch");
             return None;
         }
-        rx.recv().ok()?.ok()?;
-        {
-            let view = buf.get_mapped_range(..).ok()?;
-            if row == padded as usize {
-                out.copy_from_slice(&view[..out.len()]);
-            } else {
-                for (y, dst) in out.chunks_exact_mut(row).enumerate() {
-                    let s = y * padded as usize;
-                    dst.copy_from_slice(&view[s..s + row]);
-                }
-            }
-        }
-        buf.unmap();
+        out.copy_from_slice(&bytes);
         // Keep a few staging buffers per size (frames read back at the same size every time).
         if let Ok(mut s) = self.g.staging.lock() {
             let v = s.entry(size).or_default();
@@ -941,11 +1095,24 @@ impl<'g> Enc<'g> {
     /// gets the bytes once the copy is mapped (from the browser's event loop on the web; from
     /// a later device poll natively).
     pub fn read_texture_async(&mut self, texture: &wgpu::Texture, w: u32, h: u32, bpp: u32, done: impl FnOnce(Option<Vec<u8>>) + wgpu::WasmNotSend + 'static) {
-        let row = w * bpp;
-        let padded = row.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        if let Err(e) = self.g.readbacks.check() {
+            log::error!("gpu readback: {e}");
+            crate::readback::reject(done, e);
+            return;
+        }
+        let layout = match crate::readback::Layout::new(w, h, bpp, self.g.device.limits().max_buffer_size) {
+            Ok(layout) => layout,
+            Err(e) => {
+                log::error!("gpu texture readback: {e}");
+                crate::readback::reject(done, e);
+                return;
+            }
+        };
+        let row = layout.row;
+        let padded = layout.stride;
         let buf = self.g.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback-async"),
-            size: padded as u64 * h as u64,
+            size: layout.size,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -955,21 +1122,11 @@ impl<'g> Enc<'g> {
             wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
         );
         self.submit();
-        let b = buf.clone();
-        buf.map_async(wgpu::MapMode::Read, .., move |r| {
-            let out = r.ok().and_then(|_| {
-                let view = b.get_mapped_range(..).ok()?;
-                let mut out = Vec::with_capacity((row * h) as usize);
-                for y in 0..h as usize {
-                    out.extend_from_slice(&view[y * padded as usize..y * padded as usize + row as usize]);
-                }
-                Some(out)
-            });
-            b.unmap();
-            done(out);
+        self.g.map_readback(&buf, row as usize, padded as usize, h as usize, move |r| {
+            done(r.map_err(|e| log::error!("gpu texture readback: {e}")).ok());
         });
         #[cfg(not(target_arch = "wasm32"))]
-        let _ = self.g.device.poll(wgpu::PollType::Poll);
+        let _ = self.g.poll_readbacks(wgpu::PollType::Poll);
     }
 
     /// A deferred readback of `img` (RGBA f32) under `key` (see [`crate::deferred`]): the bytes

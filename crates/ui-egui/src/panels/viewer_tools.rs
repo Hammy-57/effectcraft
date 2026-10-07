@@ -46,6 +46,20 @@ pub(crate) fn snap(
     sources: &[[f64; 2]],
     mods: egui::Modifiers,
 ) -> [f64; 2] {
+    snap_with(app, ctx, ectx, map, exclude, sources, mods, &[])
+}
+
+/// [`snap`] with `extra` layer targets (the Pan Behind layer's own box).
+pub(crate) fn snap_with(
+    app: &EffectcraftApp,
+    ctx: &egui::Context,
+    ectx: &EvalCtx,
+    map: &ViewerMap,
+    exclude: &[LayerId],
+    sources: &[[f64; 2]],
+    mods: egui::Modifiers,
+    extra: &[vw::SnapTarget],
+) -> [f64; 2] {
     let layers = snapping_on(app, mods);
     let v = &app.ui.viewer;
     let guides = v.snap_guides && v.guides;
@@ -55,6 +69,7 @@ pub(crate) fn snap(
     }
     let opts = vw::SnapOptions { guides, grid, grid_spacing: app.session.prefs.grids.grid_spacing };
     let mut targets = vw::targets(ectx, exclude, opts);
+    targets.extend_from_slice(extra);
     if !layers {
         targets.retain(|t| matches!(t.source, SnapSource::Guide | SnapSource::Grid));
     }
@@ -454,9 +469,7 @@ fn popup(app: &mut EffectcraftApp, ui: &mut egui::Ui, id: &str, anchor: Rect, it
             }
         });
     });
-    let outside = ui.input(|i| i.pointer.any_pressed())
-        && !area.response.contains_pointer()
-        && !anchor.contains(ui.input(|i| i.pointer.interact_pos()).unwrap_or_default());
+    let outside = widgets::pressed_outside(ui.ctx(), &area.response) && !anchor.contains(ui.input(|i| i.pointer.interact_pos()).unwrap_or_default());
     if chosen.is_some() || outside || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
         ui.data_mut(|d| d.insert_temp(pid.with("open"), false));
     }

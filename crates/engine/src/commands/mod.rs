@@ -444,9 +444,10 @@ pub(crate) fn merge_p(p: &Value) -> Option<&str> {
 
 /// `comp`: item id or name; default the active comp.
 pub(crate) fn comp_id(s: &Session, p: &Value) -> Result<ItemId> {
+    let missing = |v: &Value| EngineError::NoSuchComp(v.to_string());
     match p.get("comp") {
-        Some(Value::Number(n)) => n.as_u64().map(ItemId).filter(|id| s.project.comp(*id).is_some()).ok_or(EngineError::NoComp),
-        Some(Value::String(name)) => s.project.items.values().find(|i| &i.name == name && i.as_comp().is_some()).map(|i| i.id).ok_or(EngineError::NoComp),
+        Some(v @ Value::Number(n)) => n.as_u64().map(ItemId).filter(|id| s.project.comp(*id).is_some()).ok_or_else(|| missing(v)),
+        Some(v @ Value::String(name)) => s.project.items.values().find(|i| &i.name == name && i.as_comp().is_some()).map(|i| i.id).ok_or_else(|| missing(v)),
         _ => s.active_comp_id().ok_or(EngineError::NoComp),
     }
 }

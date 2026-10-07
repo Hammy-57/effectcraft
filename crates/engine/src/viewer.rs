@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use effectcraft_color::{ColorSpace, space};
-use effectcraft_geom::vec2;
+use effectcraft_geom::{Mat3, vec2};
 use effectcraft_project::{Layer, LayerId};
 use effectcraft_raster::Image;
 use effectcraft_render::EvalCtx;
@@ -131,21 +131,30 @@ pub fn snap(sources: &[[f64; 2]], targets: &[SnapTarget], tol: f64) -> Option<Sn
 /// Snap features of a layer in comp space: corners, edge midpoints, centre and anchor point
 /// (2D layers; `None` for layers without bounds).
 pub fn layer_features(ctx: &EvalCtx, layer: &Layer) -> Vec<[f64; 2]> {
-    let mut out = vec![];
     let (m, _) = ctx.layer_to_comp(layer);
-    if let Some(b) = effectcraft_render::content_bounds(ctx, layer) {
-        let (cx, cy) = ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0);
-        for p in [[b[0], b[1]], [b[2], b[1]], [b[2], b[3]], [b[0], b[3]], [cx, b[1]], [b[2], cy], [cx, b[3]], [b[0], cy], [cx, cy]] {
-            let q = m.apply(vec2(p[0], p[1]));
-            out.push([q.x, q.y]);
-        }
-    }
-    if let Some(tr) = layer.transform() {
-        let a = ctx.v3(layer, tr, "anchor", [0.0; 3]);
-        let q = m.apply(vec2(a[0], a[1]));
-        out.push([q.x, q.y]);
-    }
+    let mut out = box_features(ctx, layer, &m);
+    out.extend(anchor_feature(ctx, layer, &m));
     out
+}
+
+/// The corners, edge midpoints and centre of a layer's content box (`m`: layer → comp).
+fn box_features(ctx: &EvalCtx, layer: &Layer, m: &Mat3) -> Vec<[f64; 2]> {
+    let Some(b) = effectcraft_render::content_bounds(ctx, layer) else { return vec![] };
+    let (cx, cy) = ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0);
+    [[b[0], b[1]], [b[2], b[1]], [b[2], b[3]], [b[0], b[3]], [cx, b[1]], [b[2], cy], [cx, b[3]], [b[0], cy], [cx, cy]]
+        .into_iter()
+        .map(|p| {
+            let q = m.apply(vec2(p[0], p[1]));
+            [q.x, q.y]
+        })
+        .collect()
+}
+
+/// A layer's anchor point (`m`: layer → comp).
+fn anchor_feature(ctx: &EvalCtx, layer: &Layer, m: &Mat3) -> Option<[f64; 2]> {
+    let a = ctx.v3(layer, layer.transform()?, "anchor", [0.0; 3]);
+    let q = m.apply(vec2(a[0], a[1]));
+    Some([q.x, q.y])
 }
 
 /// Mask and shape-path vertices of a layer in comp space.
@@ -163,7 +172,7 @@ pub fn layer_vertices(ctx: &EvalCtx, layer: &Layer) -> Vec<[f64; 2]> {
         }
     }
     for (uid, sp) in shape_paths(ctx, layer) {
-        let pm = m * effectcraft_render::shapes::item_matrix(ctx, layer, uid).unwrap_or(effectcraft_geom::Mat3::IDENTITY);
+        let pm = m * effectcraft_render::shapes::item_matrix(ctx, layer, uid).unwrap_or(Mat3::IDENTITY);
         out.extend(sp.vertices.iter().map(|v| {
             let q = pm.apply(vec2(v[0], v[1]));
             [q.x, q.y]
@@ -214,19 +223,8 @@ pub fn targets(ctx: &EvalCtx, exclude: &[LayerId], opts: SnapOptions) -> Vec<Sna
         SnapTarget::hline(h / 2.0, PRI_COMP, SnapSource::Comp),
         SnapTarget::point([w / 2.0, h / 2.0], PRI_COMP, SnapSource::Comp),
     ];
-    for l in comp.layers.iter().filter(|l| l.is_active_at(ctx.time) && !exclude.contains(&l.id) && !l.is_camera() && !l.is_light() && !l.is_3d()) {
-        let f = layer_features(ctx, l);
-        // Edges of unrotated layers are lines too.
-        if f.len() >= 9 && (f[0][1] - f[1][1]).abs() < 1e-6 && (f[0][0] - f[3][0]).abs() < 1e-6 {
-            for x in [f[0][0], f[1][0]] {
-                out.push(SnapTarget { kind: SnapKind::VLine, pos: [x, f[0][1]], priority: PRI_LAYER, source: SnapSource::Layer(l.id) });
-            }
-            for y in [f[0][1], f[3][1]] {
-                out.push(SnapTarget { kind: SnapKind::HLine, pos: [f[0][0], y], priority: PRI_LAYER, source: SnapSource::Layer(l.id) });
-            }
-        }
-        out.extend(f.into_iter().map(|p| SnapTarget::point(p, PRI_LAYER, SnapSource::Layer(l.id))));
-        out.extend(layer_vertices(ctx, l).into_iter().map(|p| SnapTarget::point(p, PRI_VERTEX, SnapSource::Vertex(l.id))));
+    for l in comp.layers.iter().filter(|l| l.is_active_at(ctx.time) && !exclude.contains(&l.id)) {
+        out.extend(layer_targets(ctx, l, true));
     }
     if opts.guides {
         for g in &comp.guides {
@@ -250,6 +248,33 @@ pub fn targets(ctx: &EvalCtx, exclude: &[LayerId], opts: SnapOptions) -> Vec<Sna
             y += s;
         }
     }
+    out
+}
+
+/// A 2D layer's snap targets: its box points (edges as lines too while unrotated), its anchor
+/// point unless `anchor` is false (Pan Behind drags it, the box stays put) and its mask and shape
+/// path vertices. None for cameras, lights and 3D layers.
+pub fn layer_targets(ctx: &EvalCtx, l: &Layer, anchor: bool) -> Vec<SnapTarget> {
+    if l.is_camera() || l.is_light() || l.is_3d() {
+        return vec![];
+    }
+    let (m, _) = ctx.layer_to_comp(l);
+    let f = box_features(ctx, l, &m);
+    let mut out = vec![];
+    if let [nw, ne, _, sw, ..] = f.as_slice()
+        && (nw[1] - ne[1]).abs() < 1e-6
+        && (nw[0] - sw[0]).abs() < 1e-6
+    {
+        for x in [nw[0], ne[0]] {
+            out.push(SnapTarget { kind: SnapKind::VLine, pos: [x, nw[1]], priority: PRI_LAYER, source: SnapSource::Layer(l.id) });
+        }
+        for y in [nw[1], sw[1]] {
+            out.push(SnapTarget { kind: SnapKind::HLine, pos: [nw[0], y], priority: PRI_LAYER, source: SnapSource::Layer(l.id) });
+        }
+    }
+    let a = if anchor { anchor_feature(ctx, l, &m) } else { None };
+    out.extend(f.into_iter().chain(a).map(|p| SnapTarget::point(p, PRI_LAYER, SnapSource::Layer(l.id))));
+    out.extend(layer_vertices(ctx, l).into_iter().map(|p| SnapTarget::point(p, PRI_VERTEX, SnapSource::Vertex(l.id))));
     out
 }
 

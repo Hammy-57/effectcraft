@@ -17,13 +17,35 @@ fn invoke(h: &mut Harness<'_, EffectcraftApp>, id: &str, p: Value) {
     h.run_steps(3);
 }
 
-fn click(h: &mut Harness<'_, EffectcraftApp>, id: &str) {
+/// Hover element `id`; returns its centre.
+fn hover(h: &mut Harness<'_, EffectcraftApp>, id: &str) -> egui::Pos2 {
     let e = h.state().auto.find(id).unwrap_or_else(|| panic!("no {id}")).clone();
     let p = pos2(e.rect[0] + e.rect[2] / 2.0, e.rect[1] + e.rect[3] / 2.0);
     h.input_mut().events.push(Event::PointerMoved(p));
     h.step();
-    h.input_mut().events.push(Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
-    h.input_mut().events.push(Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+    p
+}
+
+fn button(h: &mut Harness<'_, EffectcraftApp>, pos: egui::Pos2, pressed: bool) {
+    h.input_mut().events.push(Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() });
+}
+
+/// Click element `id`, the release a frame after the press (as a hand does: a press in a tab
+/// strip focuses the shown panel first, the click then the tab).
+fn click(h: &mut Harness<'_, EffectcraftApp>, id: &str) {
+    let p = hover(h, id);
+    button(h, p, true);
+    h.step();
+    button(h, p, false);
+    h.run_steps(3);
+}
+
+/// Double-click element `id` (in one frame: the harness' frame time is longer than a double-click's).
+fn double_click(h: &mut Harness<'_, EffectcraftApp>, id: &str) {
+    let p = hover(h, id);
+    for pressed in [true, false, true, false] {
+        button(h, p, pressed);
+    }
     h.run_steps(3);
 }
 
@@ -31,14 +53,16 @@ fn shows(h: &Harness<'_, EffectcraftApp>, viewer: u32) -> Option<u64> {
     viewers::comp_of(h.state(), viewer).map(|c| c.0)
 }
 
+fn new_comp(s: &mut Session, name: &str) -> u64 {
+    s.execute("comp.new", json!({"name": name, "width": 64, "height": 36, "duration": 1})).unwrap()["comp"].as_u64().unwrap()
+}
+
 #[test]
 fn new_viewers_lock_route_comps_and_activate_on_click() {
     let mut s = Session::default();
-    let new =
-        |s: &mut Session, name: &str| s.execute("comp.new", json!({"name": name, "width": 64, "height": 36, "duration": 1})).unwrap()["comp"].as_u64().unwrap();
-    let c = new(&mut s, "C");
-    let b = new(&mut s, "B");
-    let a = new(&mut s, "A");
+    let c = new_comp(&mut s, "C");
+    let b = new_comp(&mut s, "B");
+    let a = new_comp(&mut s, "A");
     let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).build_eframe(|_| EffectcraftApp::new(s));
     h.run_steps(3);
     // View ▸ New Viewer: viewer 1 shows A too, viewer 0 (the Composition panel) is locked.
@@ -85,6 +109,29 @@ fn new_viewers_lock_route_comps_and_activate_on_click() {
         .map(|e| e.label.clone())
         .collect();
     assert!(titles.iter().any(|t| t == "Composition A") && titles.iter().any(|t| t == "Composition C"), "{titles:?}");
+}
+
+/// Issue #156: a locked viewer keeps its comp when the Project panel opens another one. The
+/// Project panel opens it mid-frame, before the viewers draw; the active (locked) viewer used to
+/// record the new comp as its own then, so the lock no longer applied.
+#[test]
+fn a_locked_viewer_keeps_its_comp_when_the_project_panel_opens_another() {
+    let mut s = Session::default();
+    let b = new_comp(&mut s, "B");
+    let a = new_comp(&mut s, "A");
+    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).build_eframe(|_| EffectcraftApp::new(s));
+    h.run_steps(3);
+    // Viewer 0 locked to A, and B in viewer 1 (a tab next to it).
+    invoke(&mut h, "view.newViewer", json!({}));
+    invoke(&mut h, "comp.open", json!({"comp": b}));
+    // Back to the locked viewer by its tab.
+    click(&mut h, "panel.tab.Composition");
+    assert!(viewers::locked(h.state(), 0));
+    assert_eq!((h.state().ui.active_viewer, shows(&h, 0), shows(&h, 1)), (0, Some(a), Some(b)));
+    // Double-click B in the Project panel: it shows in its viewer, the locked one keeps A.
+    double_click(&mut h, &format!("project.item.{b}.name"));
+    assert_eq!(h.state().session.active_comp_id(), Some(ItemId(b)));
+    assert_eq!((h.state().ui.active_viewer, shows(&h, 0), shows(&h, 1)), (1, Some(a), Some(b)));
 }
 
 /// `cargo test -p effectcraft-ui-egui --test ui_viewers -- --ignored`: two viewers side by side

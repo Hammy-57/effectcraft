@@ -716,15 +716,15 @@ pub fn audio(ids: &mut Ids) -> PropGroup {
 
 // ---------------------------------------------------------------- layers
 
-/// Default label colour for a layer source (Labels preferences defaults).
+/// Label colour for a new layer: its Project item's label when it has one (later changes to the
+/// item's label leave existing layers alone), else the Labels preferences default for its type.
 pub fn default_label(src: &LayerSource, project: &Project) -> Label {
+    if let Some(it) = src.item().and_then(|i| project.item(i)) {
+        return it.label;
+    }
     match src {
         LayerSource::Comp { .. } => Label::Sandstone,
-        LayerSource::Footage { item } => match project.item(*item).map(|i| i.type_name()) {
-            Some("Image") | Some("Image Sequence") => Label::Lavender,
-            Some("Audio") => Label::SeaFoam,
-            _ => Label::Aqua,
-        },
+        LayerSource::Footage { .. } => Label::Aqua,
         LayerSource::Solid { .. } => Label::Red,
         LayerSource::Text => Label::Red,
         LayerSource::Shape => Label::Blue,

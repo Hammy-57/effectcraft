@@ -344,6 +344,23 @@ impl Default for ViewerState {
     }
 }
 
+impl TimelineState {
+    /// Show `kinds` on `layers` (twirled open; empty: twirled closed) and remember it as the last
+    /// reveal. Other layers keep theirs.
+    pub fn apply_reveal(&mut self, layers: &[u64], kinds: Vec<String>) {
+        for id in layers {
+            if kinds.is_empty() {
+                self.open_layers.remove(id);
+                self.layer_reveal.remove(id);
+            } else {
+                self.open_layers.insert(*id);
+                self.layer_reveal.insert(*id, kinds.clone());
+            }
+        }
+        self.reveal = kinds;
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TimelineState {
     /// Visible span start (seconds) and pixels per second; None = fit comp.
@@ -361,8 +378,13 @@ pub struct TimelineState {
     /// Twirled-open layers and groups (by layer id / group uid).
     pub open_layers: BTreeSet<u64>,
     pub open_groups: BTreeSet<u64>,
-    /// "Reveal" filter: only show these property match ids (P/S/R/T/A…) — empty = normal.
+    /// The last reveal shortcut's filter (P/S/R/T/A…): what pressing it again toggles or adds to.
     pub reveal: Vec<String>,
+    /// Each revealed layer's filter: an open layer without one shows its whole property tree. A
+    /// reveal shortcut sets it on the selected layers (all layers with none selected) and leaves
+    /// the others as they are.
+    #[serde(default)]
+    pub layer_reveal: BTreeMap<u64, Vec<String>>,
     /// Properties / groups (uids) shown by the `props` reveal (Animation ▸ Reveal Properties…).
     #[serde(default)]
     pub reveal_props: BTreeSet<u64>,
@@ -426,6 +448,7 @@ impl Default for TimelineState {
             open_layers: BTreeSet::new(),
             open_groups: BTreeSet::new(),
             reveal: vec![],
+            layer_reveal: BTreeMap::new(),
             reveal_props: BTreeSet::new(),
             graph_mode: auto_graph(),
             graph_show_selected: true,

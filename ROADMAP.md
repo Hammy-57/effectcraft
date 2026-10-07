@@ -41,7 +41,10 @@ in [docs/gaps.md](docs/gaps.md).
   - **After Effects projects can't be opened.** EffectCraft can't read `.aep` / `.aepx` files,
     and third-party After Effects plug-ins can't run.
   - **Reliability is uneven across platforms.** Early Linux users hit basic problems: viewer
-    panning, panel docking, drag-and-drop import.
+    panning, panel docking, drag-and-drop import. A Windows user found the font menus offered only
+    the bundled fonts (fixed 6 October: they list every installed font). Reports of 6 October
+    covered drag and drop between panels, a Render Queue menu that ignored clicks, angle
+    revolutions, and preview with audio and with little video memory (all fixed 7 October).
   - **AI tools are new.** Roto Brush's trained model (MobileSAM, M13.35) and face tracking's
     (MediaPipe Face Landmarker, M13.36) are optional downloads, not yet compared with After
     Effects.

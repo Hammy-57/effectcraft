@@ -533,6 +533,15 @@ pub fn caret_maps(ctx: &EvalCtx, layer: &Layer, chars: usize) -> Vec<Mat3> {
     out
 }
 
+/// A paragraph's alignment: 0 left, 1 centre, 2 right (a justified paragraph by its last line).
+fn align_index(j: Justify) -> u8 {
+    match j {
+        Justify::Center | Justify::JustifyLastCenter => 1,
+        Justify::Right | Justify::JustifyLastRight => 2,
+        _ => 0,
+    }
+}
+
 /// Lay out and animate a text layer.
 pub fn text_geom(ctx: &EvalCtx, layer: &Layer) -> Option<TextGeom> {
     let doc = source_text(ctx, layer)?;
@@ -578,7 +587,9 @@ pub fn text_geom(ctx: &EvalCtx, layer: &Layer) -> Option<TextGeom> {
         })
         .collect();
     let advance = |gi: usize| lay.glyphs[gi].advance + vadv[gi];
-    // Tracking (before / after each character) and Line Anchor, per line.
+    // Tracking (before / after each character) and Line Anchor, per line. Without a Line Anchor
+    // a line grows from where its paragraph's alignment pins it (left, centre or right).
+    let paras = doc.paras();
     let mut shift = vec![0.0f64; n];
     let mut li_start = 0;
     while li_start < n {
@@ -588,7 +599,8 @@ pub fn text_geom(ctx: &EvalCtx, layer: &Layer) -> Option<TextGeom> {
             li_end += 1;
         }
         let mut pen = 0.0;
-        let (mut la, mut la_k) = (0.0, 0.0);
+        let justify = lay.layout.lines.get(line).and_then(|l| paras.get(l.para)).map_or(doc.justify, |p| p.justify);
+        let (mut la, mut la_k) = (50.0 * f64::from(align_index(justify)), 0.0);
         for gi in li_start..li_end {
             let x = &xfs[gi];
             let em = lay.styles.get(lay.glyphs[gi].run).map_or(doc.size, |s| s.size) / 1000.0;
@@ -639,11 +651,7 @@ pub fn text_geom(ctx: &EvalCtx, layer: &Layer) -> Option<TextGeom> {
 
     // Path Options.
     let on_path = text_path(ctx, layer, text);
-    let align = match doc.justify {
-        Justify::Center | Justify::JustifyLastCenter => 1,
-        Justify::Right | Justify::JustifyLastRight => 2,
-        _ => 0,
-    };
+    let align = align_index(doc.justify);
     let first_baseline = lay.line_boxes.first().map(|b| b[1]).unwrap_or(0.0);
     let mut arc = vec![0.0f64; n];
     if let Some((pm, _, force, fm, lm)) = &on_path {

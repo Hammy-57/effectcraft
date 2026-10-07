@@ -9,7 +9,7 @@
 //! effectcraft-cli props <comp> <layer> [--flat] [--time S]    a layer's property tree (with paths)
 //! effectcraft-cli get <comp> <layer> <path> [--time S]        read a property
 //! effectcraft-cli set <comp> <layer> <path> <value> [--time S] [--expression E]
-//! effectcraft-cli render-frame [--comp C] [--time S|--frame N] [--max-side PX|--scale K] [--out F.png]
+//! effectcraft-cli render-frame [--comp C] [--time S|--frame N] [--max-side PX|--scale K] [--out F.png] [--transparent]
 //! effectcraft-cli render [--comp C] --out FILE [--format h264|hevc|av1|prores|webm|png|jpeg|tiff|exr|gif|wav|aiff] [--start S] [--end S]
 //!     [--work-area] [--fps N] [--resolution full|half|third|quarter|K] [--quality best|draft] [--channels rgb|rgba]
 //!     [--jpeg-quality N] [--bitrate KBPS] [--prores proxy|lt|standard|hq|4444|4444xq] [--audio auto|on|off]
@@ -36,9 +36,53 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+use std::io::Write;
+
 use effectcraft_automation::tools::{self, Reply};
 use effectcraft_automation::{Backend, McpServer};
 use serde_json::{Value, json};
+
+/// `println!` that never panics: see [`write_line`].
+macro_rules! say {
+    ($($t:tt)*) => {
+        write_line(format_args!($($t)*))
+    };
+}
+
+/// `eprintln!` that never panics: a diagnostic that can't be written is dropped.
+macro_rules! note {
+    ($($t:tt)*) => {{
+        let _ = writeln!(std::io::stderr(), $($t)*);
+    }};
+}
+
+/// Why stdout stopped taking output, once it has.
+static STDOUT_FAILED: std::sync::OnceLock<std::io::ErrorKind> = std::sync::OnceLock::new();
+
+/// Write a line to stdout. Once that fails, later output is dropped but the command still
+/// finishes its work (a `run … --save` sequence isn't cut short). A reader that closes stdout
+/// early (`info --json | head`) has read what it wanted; any other failure is reported and makes
+/// the exit status 1 ([`stdout_broken`]).
+fn write_line(text: std::fmt::Arguments) {
+    if STDOUT_FAILED.get().is_some() {
+        return;
+    }
+    let r = {
+        let mut out = std::io::stdout().lock();
+        out.write_fmt(text).and_then(|()| out.write_all(b"\n"))
+    };
+    if let Err(e) = r {
+        let _ = STDOUT_FAILED.set(e.kind());
+        if e.kind() != std::io::ErrorKind::BrokenPipe {
+            note!("effectcraft-cli: cannot write to stdout: {e}");
+        }
+    }
+}
+
+/// Whether stdout failed for a reason other than its reader closing it early.
+fn stdout_broken() -> bool {
+    STDOUT_FAILED.get().is_some_and(|k| *k != std::io::ErrorKind::BrokenPipe)
+}
 
 const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|set|render-frame|render|script|mcp> [args] [--json]
   info                                     project + engine summary
@@ -48,7 +92,7 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
   props <comp> <layer> [--flat] [--time S] a layer's property tree with paths
   get <comp> <layer> <path> [--time S]     read a property
   set <comp> <layer> <path> <value> [--time S] [--expression E]
-  render-frame [--comp C] [--time S | --frame N] [--max-side PX | --scale K] [--out F.png]
+  render-frame [--comp C] [--time S | --frame N] [--max-side PX | --scale K] [--out F.png] [--transparent]
   render [--comp C] --out FILE [--format F] [--start S] [--end S] [--work-area] [--fps N]
          [--resolution full|half|third|quarter|K] [--quality best|draft] [--channels rgb|rgba]
          [--jpeg-quality N] [--bitrate KBPS] [--prores PROFILE] [--audio auto|on|off]
@@ -112,6 +156,25 @@ const VALUED: &[&str] = &[
     "--opus-app",
 ];
 
+/// Options without a value. Any other `--option` is a usage error.
+const FLAGS: &[&str] = &[
+    "--json",
+    "--save",
+    "--demo",
+    "--empty",
+    "--gpu",
+    "--list",
+    "--schemas",
+    "--enabled",
+    "--flat",
+    "--transparent",
+    "--work-area",
+    "--queue",
+    "--ops",
+    "--small",
+    "--adv3d",
+];
+
 struct Args {
     pos: Vec<String>,
     opts: Vec<(String, Option<String>)>,
@@ -121,7 +184,7 @@ struct Args {
 
 impl Args {
     fn parse(raw: Vec<String>) -> Result<Args, String> {
-        let (mut pos, mut opts) = (vec![], vec![]);
+        let (mut pos, mut opts, mut unknown) = (vec![], vec![], vec![]);
         let mut it = raw.into_iter();
         while let Some(a) = it.next() {
             if a.starts_with("--") && a.len() > 2 {
@@ -132,12 +195,22 @@ impl Args {
                 if VALUED.contains(&k.as_str()) {
                     let v = inline.or_else(|| it.next()).ok_or_else(|| format!("{k} needs a value"))?;
                     opts.push((k, Some(v)));
+                } else if !FLAGS.contains(&k.as_str()) {
+                    unknown.push(format!("`{k}`"));
+                } else if inline.is_some() {
+                    return Err(format!("{k} takes no value"));
                 } else {
                     opts.push((k, None));
                 }
             } else {
                 pos.push(a);
             }
+        }
+        // Before anything runs: a misspelt option must not run the command with defaults, or
+        // leave its value behind as a positional (`--saveas x.ecproj` opening x.ecproj).
+        if !unknown.is_empty() {
+            let s = if unknown.len() == 1 { "" } else { "s" };
+            return Err(format!("unknown option{s} {}", unknown.join(", ")));
         }
         let mut a = Args { pos, opts, project: None };
         a.project = match a.opt("--project") {
@@ -173,11 +246,11 @@ fn value_arg(s: &str) -> Value {
 fn main() {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     if matches!(raw.first().map(String::as_str), Some("--version" | "-V" | "version")) {
-        println!("effectcraft-cli {}", env!("CARGO_PKG_VERSION"));
+        say!("effectcraft-cli {}", env!("CARGO_PKG_VERSION"));
         return;
     }
     if raw.is_empty() || raw.iter().any(|a| a == "-h" || a == "--help") {
-        println!("{USAGE}");
+        say!("{USAGE}");
         std::process::exit(if raw.is_empty() { 2 } else { 0 });
     }
     let mut args = match Args::parse(raw) {
@@ -190,20 +263,21 @@ fn main() {
     }
     let cmd = args.pos.remove(0);
     match run(&cmd, &args, json_out) {
+        Ok(()) if stdout_broken() => std::process::exit(1),
         Ok(()) => {}
         Err(Failure::Usage(e)) => fail_usage(&e),
         Err(Failure::Error(e)) => {
             if json_out {
-                println!("{}", json!({"error": e}));
+                say!("{}", json!({"error": e}));
             }
-            eprintln!("effectcraft-cli {cmd}: {e}");
+            note!("effectcraft-cli {cmd}: {e}");
             std::process::exit(1);
         }
     }
 }
 
 fn fail_usage(e: &str) -> ! {
-    eprintln!("effectcraft-cli: {e}\n{USAGE}");
+    note!("effectcraft-cli: {e}\n{USAGE}");
     std::process::exit(2)
 }
 
@@ -292,13 +366,13 @@ fn script_cmd(args: &Args, json_out: bool) -> Result<(), Failure> {
         emit(&o, true);
     } else {
         if let Some(out) = r["output"].as_str().filter(|o| !o.is_empty()) {
-            println!("{out}");
+            say!("{out}");
         }
         if !r["result"].is_null() && r["error"].is_null() {
-            println!("{}", r["result"]);
+            say!("{}", r["result"]);
         }
         if let Some(p) = saved {
-            eprintln!("saved {p}");
+            note!("saved {p}");
         }
     }
     if let Some(e) = r.get("error").filter(|e| !e.is_null()) {
@@ -319,9 +393,9 @@ fn script_cmd(args: &Args, json_out: bool) -> Result<(), Failure> {
 /// Print a result: compact JSON with `--json`, else pretty JSON.
 fn emit(v: &Value, json_out: bool) {
     if json_out {
-        println!("{v}");
+        say!("{v}");
     } else {
-        println!("{}", serde_json::to_string_pretty(v).unwrap_or_default());
+        say!("{}", serde_json::to_string_pretty(v).unwrap_or_default());
     }
 }
 
@@ -344,19 +418,19 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
             if json_out {
                 emit(&info, true);
             } else {
-                println!(
+                say!(
                     "EffectCraft {} ({}), {} commands, {} effects",
                     info["version"].as_str().unwrap_or(""),
                     info["mode"].as_str().unwrap_or(""),
                     info["commands"],
                     info["effects"]
                 );
-                println!("project: {}", p["path"].as_str().unwrap_or("(unsaved)"));
+                say!("project: {}", p["path"].as_str().unwrap_or("(unsaved)"));
                 for i in p["items"].as_array().into_iter().flatten() {
-                    println!("  item {:>3}  {:<12} {}", i["id"], i["type"].as_str().unwrap_or(""), i["name"].as_str().unwrap_or(""));
+                    say!("  item {:>3}  {:<12} {}", i["id"], i["type"].as_str().unwrap_or(""), i["name"].as_str().unwrap_or(""));
                 }
                 if let Some(c) = comp {
-                    println!(
+                    say!(
                         "active comp {} \"{}\" {}x{} @ {} fps, {} s",
                         c["id"],
                         c["name"].as_str().unwrap_or(""),
@@ -366,7 +440,7 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
                         c["duration"]
                     );
                     for l in c["layers"].as_array().into_iter().flatten() {
-                        println!("  #{:<3} id {:<4} {:<10} {}", l["index"], l["id"], l["type"].as_str().unwrap_or(""), l["name"].as_str().unwrap_or(""));
+                        say!("  #{:<3} id {:<4} {:<10} {}", l["index"], l["id"], l["type"].as_str().unwrap_or(""), l["name"].as_str().unwrap_or(""));
                     }
                 }
             }
@@ -422,7 +496,7 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
             if json_out {
                 emit(&v, true);
             } else {
-                println!("layer {} \"{}\" ({}) at {} s", v["id"], v["name"].as_str().unwrap_or(""), v["type"].as_str().unwrap_or(""), v["time"]);
+                say!("layer {} \"{}\" ({}) at {} s", v["id"], v["name"].as_str().unwrap_or(""), v["type"].as_str().unwrap_or(""), v["time"]);
                 for p in v["properties"].as_array().into_iter().flatten() {
                     let mut extra = String::new();
                     if let Some(k) = p.get("keys") {
@@ -431,7 +505,7 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
                     if let Some(e) = p.get("expression").and_then(Value::as_str) {
                         extra += &format!("  expr: {e}");
                     }
-                    println!("  {:<44} {:<8} {}{extra}", p["path"].as_str().unwrap_or(""), p["type"].as_str().unwrap_or(""), p["value"]);
+                    say!("  {:<44} {:<8} {}{extra}", p["path"].as_str().unwrap_or(""), p["type"].as_str().unwrap_or(""), p["value"]);
                 }
             }
         }
@@ -474,19 +548,23 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
             }
             let out = args.opt("--out").unwrap_or("frame.png").to_string();
             let t0 = std::time::Instant::now();
-            let f = b.render(comp.as_ref(), time, max_side)?;
+            let f = b.render_with(comp.as_ref(), time, max_side, args.flag("--transparent"))?;
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
             std::fs::write(&out, &f.png).map_err(|e| format!("cannot write {out}: {e}"))?;
             let info = json!({"path": out, "comp": f.comp, "time": f.time, "width": f.width, "height": f.height, "ms": (ms * 10.0).round() / 10.0});
             if json_out {
                 emit(&info, true);
             } else {
-                eprintln!("rendered {}x{} at {:.3}s in {ms:.1} ms -> {out}", f.width, f.height, f.time);
+                note!("rendered {}x{} at {:.3}s in {ms:.1} ms -> {out}", f.width, f.height, f.time);
             }
         }
         "mcp" => {
             let b = backend(args, false)?;
-            McpServer::new(b).serve_stdio().map_err(|e| e.to_string())?;
+            // A client that closes its end of stdout has ended the session.
+            match McpServer::new(b).serve_stdio() {
+                Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => return Err(e.to_string().into()),
+                _ => {}
+            }
         }
         other => return usage_err(&format!("unknown subcommand `{other}`")),
     }
@@ -577,7 +655,7 @@ fn render(args: &Args, json_out: bool) -> Result<(), Failure> {
             let _ = s.execute("renderQueue.setRender", json!({"index": k + 1, "render": false}));
         }
         let r = s.execute("renderQueue.add", p).map_err(err)?;
-        eprintln!(
+        note!(
             "{} → {} ({}×{}, {} frames, {})",
             r["compName"].as_str().unwrap_or("?"),
             r["outputPath"].as_str().unwrap_or("?"),
@@ -593,7 +671,8 @@ fn render(args: &Args, json_out: bool) -> Result<(), Failure> {
         std::thread::sleep(std::time::Duration::from_millis(100));
         if tty && let Some(p) = s.render_progress() {
             let left = p.remaining.map(|r| format!(", ~{r:.1}s left")).unwrap_or_default();
-            eprint!(
+            let _ = write!(
+                std::io::stderr(),
                 "
   [{}/{}] frame {}/{}  {:.1}s{left}\x1b[K",
                 (p.items_done + 1).min(p.items_total),
@@ -607,7 +686,7 @@ fn render(args: &Args, json_out: bool) -> Result<(), Failure> {
     }
     s.poll_render();
     if tty {
-        eprintln!();
+        note!();
     }
     let mut results = vec![];
     let mut failed = vec![];
@@ -615,7 +694,7 @@ fn render(args: &Args, json_out: bool) -> Result<(), Failure> {
         let name = s.project.item(it.comp).map(|i| i.name.clone()).unwrap_or_else(|| "?".into());
         match &it.status {
             RenderStatus::Done => {
-                eprintln!("done: {name} → {} in {:.2}s", it.last_output.as_deref().unwrap_or("?"), it.render_time.unwrap_or(0.0));
+                note!("done: {name} → {} in {:.2}s", it.last_output.as_deref().unwrap_or("?"), it.render_time.unwrap_or(0.0));
                 results.push(json!({"comp": name, "output": it.last_output, "seconds": it.render_time}));
             }
             RenderStatus::Failed(e) => failed.push(format!("{name}: {e}")),
@@ -640,7 +719,7 @@ fn list_commands_cmd(args: &Args, json_out: bool) -> Result<(), Failure> {
         emit(&v, true);
     } else {
         for c in v.as_array().into_iter().flatten() {
-            println!(
+            say!(
                 "{:<36} {:<36} {:<16} {}",
                 c["id"].as_str().unwrap_or(""),
                 c["label"].as_str().unwrap_or(""),
@@ -708,7 +787,7 @@ fn bench_ops(args: &Args) -> Result<(), Failure> {
     m.extend(effectcraft_ui_egui::bench::ui_ops(|| {
         let mut s = effectcraft_host::session();
         if let Err(e) = s.execute("file.open", json!({"path": path})) {
-            eprintln!("bench --ops: {e}");
+            note!("bench --ops: {e}");
         }
         s
     }));
@@ -716,9 +795,9 @@ fn bench_ops(args: &Args) -> Result<(), Failure> {
     if args.flag("--json") {
         emit(&json!({"spec": format!("{spec:?}"), "measures": m.iter().map(perf::Measure::json).collect::<Vec<_>>()}), true);
     } else {
-        println!("bench --ops: {} comps, {} layers in Main, {} footage items", spec.comps, spec.main_layers, spec.footage);
+        say!("bench --ops: {} comps, {} layers in Main, {} footage items", spec.comps, spec.main_layers, spec.footage);
         for x in &m {
-            println!("  {:<22} {:>10.2} ms  {}", x.name, x.ms, x.note);
+            say!("  {:<22} {:>10.2} ms  {}", x.name, x.ms, x.note);
         }
     }
     Ok(())
@@ -788,7 +867,7 @@ fn bench(s: &Session, cid: ItemId, t: Tick, opts: RenderOpts, n: usize) {
             }
         }
     }
-    eprintln!(
+    note!(
         "bench (no cache): {n} runs at scale {}: wall min {:.2} ms, median {:.2} ms; CPU (all threads) min {:.2} ms",
         opts.scale,
         min(&totals),
@@ -796,9 +875,9 @@ fn bench(s: &Session, cid: ItemId, t: Tick, opts: RenderOpts, n: usize) {
         min(&cpus)
     );
     for (d, name, p, c, fx) in per_layer {
-        eprintln!("  {:indent$}{name:<28} process {:8.2} ms  composite {:8.2} ms  (min)", "", min(&p), min(&c), indent = d * 2);
+        note!("  {:indent$}{name:<28} process {:8.2} ms  composite {:8.2} ms  (min)", "", min(&p), min(&c), indent = d * 2);
         for (id, v) in fx {
-            eprintln!("  {:indent$}  fx {id:<30} {:8.2} ms", "", min(&v), indent = d * 2);
+            note!("  {:indent$}  fx {id:<30} {:8.2} ms", "", min(&v), indent = d * 2);
         }
     }
 }
@@ -819,7 +898,7 @@ fn bench_play(s: &Session, cid: ItemId, t: Tick, opts: RenderOpts, n: usize) {
         let mut v: Vec<f64> = runs.iter().map(|r| r.0).collect();
         let mean = v.iter().sum::<f64>() / n as f64;
         let cpu = runs.iter().map(|r| r.1).sum::<f64>() / n as f64;
-        eprintln!(
+        note!(
             "bench-play ({label}): {n} frames at scale {}: wall mean {mean:.2} ms, median {:.2} ms, min {:.2} ms; CPU mean {cpu:.2} ms",
             opts.scale,
             median(&mut v),
@@ -827,7 +906,7 @@ fn bench_play(s: &Session, cid: ItemId, t: Tick, opts: RenderOpts, n: usize) {
         );
     }
     let st = cache.stats();
-    eprintln!("  layer cache: {} hits, {} misses, {} entries, {:.1} MB", st.hits, st.misses, st.entries, st.bytes as f64 / 1e6);
+    note!("  layer cache: {} hits, {} misses, {} entries, {:.1} MB", st.hits, st.misses, st.entries, st.bytes as f64 / 1e6);
 }
 
 /// Median wall time (ms) of `n` runs of `f` after one warm-up run.
@@ -1008,10 +1087,21 @@ fn bench_gpu(s: &Session, args: &Args) -> Result<(), Failure> {
         }
     };
     let project = &project;
-    eprintln!("GPU: {} — median of {n} runs (ms/frame)", effectcraft_render::Accelerator::name(&gpu));
-    eprintln!(
+    note!("GPU: {} — median of {n} runs (ms/frame)", effectcraft_render::Accelerator::name(&gpu));
+    note!(
         "{:<28} {:>5} {:>10} {:>9} {:>9} {:>9} {:>9} {:>9} {:>8} {:>9} {:>9} {:>11}",
-        "comp", "res", "size", "cpu cold", "gpu cold", "cpu warm", "gpu warm", "gpu view", "speedup", "auto", "gpu≠cpu", "up/dn MB"
+        "comp",
+        "res",
+        "size",
+        "cpu cold",
+        "gpu cold",
+        "cpu warm",
+        "gpu warm",
+        "gpu view",
+        "speedup",
+        "auto",
+        "gpu≠cpu",
+        "up/dn MB"
     );
     for cid in comps {
         let Some(comp) = project.comp(cid) else { continue };
@@ -1077,10 +1167,46 @@ fn bench_gpu(s: &Session, args: &Args) -> Result<(), Failure> {
                 .count();
             let pct = 100.0 * off as f64 / a.data.len().max(1) as f64;
             let speedup = cpu_warm / gpu_warm.max(1e-9);
-            eprintln!(
+            note!(
                 "{name:<28} {label:>5} {size:>10} {cpu_cold:>9.2} {gpu_cold:>9.2} {cpu_warm:>9.2} {gpu_warm:>9.2} {view:>9.2} {speedup:>7.2}x {auto:>9.2} {pct:>8.3}% {traffic:>11}"
             );
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Args, String> {
+        Args::parse(args.iter().map(|a| a.to_string()).collect())
+    }
+
+    /// Unknown options are usage errors naming them, not ignored (#168).
+    #[test]
+    fn unknown_options_are_refused() {
+        let err = |args: &[&str]| parse(args).err().unwrap();
+        assert_eq!(err(&["exec", "comp.new", "--bogus", "--empty", "--saveas", "z.ecproj"]), "unknown options `--bogus`, `--saveas`");
+        assert_eq!(err(&["render", "--bogus=1"]), "unknown option `--bogus`");
+        assert_eq!(err(&["info", "--json=yes"]), "--json takes no value");
+        let a = parse(&["render", "t.ecproj", "--comp=Main", "--work-area", "--out", "x.mp4", "--json"]).unwrap();
+        assert_eq!((a.project.as_deref(), a.opt("--comp"), a.opt("--out")), (Some("t.ecproj"), Some("Main"), Some("x.mp4")));
+        assert!(a.flag("--work-area") && a.flag("--json"));
+    }
+
+    /// Every `--option` the CLI reads is declared in VALUED or FLAGS, so none is refused.
+    #[test]
+    fn every_option_read_is_declared() {
+        let code = include_str!("main.rs").split("#[cfg(test)]").next().unwrap();
+        for rest in code.split("\"--").skip(1) {
+            let name: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '-').collect();
+            let opt = format!("--{name}");
+            // `--help` and `--version` are handled before parsing.
+            if name.is_empty() || !rest[name.len()..].starts_with('"') || ["--help", "--version"].contains(&opt.as_str()) {
+                continue;
+            }
+            assert!(VALUED.contains(&opt.as_str()) || FLAGS.contains(&opt.as_str()), "{opt} is read but not declared");
+        }
+    }
 }

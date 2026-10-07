@@ -640,11 +640,11 @@ impl Session {
     }
 
     /// The comp to add: `comp` param, the active comp, or the first comp selected in the Project panel.
-    pub(crate) fn comp_for_queue(&self, p: &serde_json::Value) -> Option<ItemId> {
+    pub(crate) fn comp_for_queue(&self, p: &serde_json::Value) -> crate::Result<ItemId> {
         if p.get("comp").is_some() {
-            return crate::commands::comp_id(self, p).ok();
+            return crate::commands::comp_id(self, p);
         }
         let sel = self.state.project_selection.iter().copied().find(|i| self.project.comp(*i).is_some());
-        self.active_comp_id().or(sel)
+        self.active_comp_id().or(sel).ok_or(crate::EngineError::NoComp)
     }
 }

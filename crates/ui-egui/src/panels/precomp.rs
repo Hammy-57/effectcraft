@@ -304,7 +304,7 @@ pub fn mini_flowchart(app: &mut EffectcraftApp, ctx: &egui::Context) {
             }
         });
     });
-    let outside = ctx.input(|i| i.pointer.any_pressed()) && !area.response.contains_pointer();
+    let outside = crate::widgets::pressed_outside(ctx, &area.response);
     if let Some(id) = open {
         app.session.open_comp(id);
         close = true;

@@ -7,6 +7,7 @@ use effectcraft_ui_egui::EffectcraftApp;
 use effectcraft_ui_egui::dock::PanelKind;
 use egui::{Event, Pos2, pos2};
 use egui_kittest::Harness;
+use egui_kittest::kittest::Queryable;
 use serde_json::json;
 
 fn harness() -> Harness<'static, EffectcraftApp> {
@@ -101,6 +102,55 @@ fn progress_panel_cancels_a_job() {
     h.run_steps(2);
     assert!(h.state().session.jobs().is_empty());
     assert_eq!(h.state().session.job_log.last().unwrap().status, "cancelled");
+}
+
+fn click_at(h: &mut Harness<'_, EffectcraftApp>, p: Pos2) {
+    h.input_mut().events.push(Event::PointerMoved(p));
+    h.input_mut().events.push(Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+    h.step();
+    h.input_mut().events.push(Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+    h.run_steps(2);
+}
+
+fn hover(h: &mut Harness<'_, EffectcraftApp>, p: Pos2) {
+    h.input_mut().events.push(Event::PointerMoved(p));
+    h.run_steps(3);
+}
+
+/// Issue #191: a workspace saved with Save as New Workspace is listed in Window ▸ Workspace
+/// (below the built-ins, where the submenu used to be cut off) and choosing it there brings its
+/// layout back.
+#[test]
+fn saved_workspace_is_listed_in_the_workspace_menu() {
+    let mut h = harness();
+    let ctx = h.ctx.clone();
+    effectcraft_ui_egui::menus::invoke(h.state_mut(), &ctx, "window.workspace", json!({"name": "Minimal"})).unwrap();
+    effectcraft_ui_egui::menus::invoke(h.state_mut(), &ctx, "window.saveWorkspaceAs", json!({"name": "My Layout"})).unwrap();
+    h.run_steps(3);
+    let saved = h.state().ui.dock.clone();
+    assert_eq!(h.state().saved_workspace_names(), ["My Layout"]);
+    let cx = effectcraft_engine::menus::DynCtx { workspace: Some("My Layout"), saved_workspaces: &["My Layout".to_string()] };
+    let (entries, _) = effectcraft_engine::menus::dynamic(&h.state().session, "savedWorkspaces", &cx);
+    assert_eq!(entries.len(), 1);
+    assert_eq!((entries[0].label.as_str(), entries[0].command.as_str(), &entries[0].params), ("My Layout", "window.workspace", &json!({"name": "My Layout"})));
+    // Leave it, then pick it from the in-window menu bar.
+    effectcraft_ui_egui::menus::invoke(h.state_mut(), &ctx, "window.workspace", json!({"name": "Default"})).unwrap();
+    h.run_steps(3);
+    assert_ne!(h.state().ui.dock, saved);
+    click(&mut h, "menu.Window");
+    let ws = h.query_by_label(" Workspace ⏵").expect("Window ▸ Workspace").rect();
+    hover(&mut h, ws.center());
+    let entry = h.state().auto.find("menu.savedWorkspaces.0").expect("the saved workspace is listed").clone();
+    assert_eq!(entry.label, "My Layout");
+    let at = h.query_by_label(" My Layout").expect("the saved workspace entry").rect().center();
+    // Into the submenu, then down it (as a pointer moves).
+    hover(&mut h, pos2(at.x, ws.center().y));
+    for k in 1..=10 {
+        hover(&mut h, pos2(at.x, ws.center().y + (at.y - ws.center().y) * k as f32 / 10.0));
+    }
+    click_at(&mut h, at);
+    assert_eq!(h.state().ui.workspace, "My Layout");
+    assert_eq!(h.state().ui.dock, saved, "its layout came back");
 }
 
 /// Headless look at the panels (wgpu offscreen; needs a GPU adapter). Run with

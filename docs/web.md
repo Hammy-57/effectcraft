@@ -31,9 +31,11 @@ isolated like a production deployment should be. Any static server works
 (`python3 -m http.server -d target/web/dist 8765`); it must serve `.wasm` as `application/wasm`.
 Service workers need a secure context: `https://`, or `http://localhost` / `127.0.0.1`.
 
-The release `.wasm` is about 38 MB before `wasm-opt` (code: the effects, codecs, the expression
-engine and the UI; data, mostly the bundled fonts; function names for readable panics). Served
-compressed it is a fraction of that, and the service worker caches it after the first visit.
+The release `.wasm` is about 58 MB before `wasm-opt` (v0.3.1; code: the effects, codecs, the
+expression engine and the UI; data, mostly the bundled fonts; function names for readable
+panics). Served compressed it is about 17 MB with gzip or 10 MB with Brotli, and the service
+worker caches it after the first visit. Its name doesn't change between releases, so hosts
+revalidate it rather than caching it for long (`packaging/web/README.md`).
 
 On other targets the web crate holds only its portable storage model (`store.rs`, unit-tested by
 `cargo test --workspace`); `cargo xtask wasm` (part of `cargo xtask ci`) checks the whole crate,

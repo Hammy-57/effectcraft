@@ -204,6 +204,22 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
             eframe::WebOptions::default(),
             Box::new(move |cc| {
                 CTX.with(|c| *c.borrow_mut() = Some(cc.egui_ctx.clone()));
+                // The page owns this shared presentation device; worker devices retain their
+                // separate owned-device handlers. No browser error-scope future is blocked on.
+                let gpu_failures = effectcraft_ui_egui::gpu_failure::GpuFailureBridge::new(&cc.egui_ctx);
+                if let Some(rs) = &cc.wgpu_render_state {
+                    let errors = gpu_failures.clone();
+                    rs.device.on_uncaptured_error(Arc::new(move |error| {
+                        let message = format!("uncaptured GPU error: {error}");
+                        if errors.report(&message, false) {
+                            log::error!("{message}");
+                        }
+                    }));
+                    let lost = gpu_failures.clone();
+                    rs.device.set_device_lost_callback(move |reason, message| {
+                        lost.report(&format!("GPU device lost ({reason:?}): {message}"), true);
+                    });
+                }
                 let mut session = session();
                 session.load_settings();
                 let recovery = session.begin_recovery();
@@ -215,6 +231,7 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
                 }
                 api::set_info("restored", json!(restored));
                 let mut app = EffectcraftApp::new(session);
+                app.set_gpu_failure_bridge(gpu_failures);
                 app.ui.start_screen = home;
                 if let Some(r) = recovery.filter(|r| !restored && r.autosave.is_some()) {
                     app.offer_recovery(r);

@@ -7,10 +7,8 @@ AddType text/javascript .js
 </IfModule>
 
 <IfModule mod_headers.c>
-  <FilesMatch "\.(wasm|js)$">
-    Header set Cache-Control "public, max-age=31536000, immutable"
-  </FilesMatch>
-  <FilesMatch "^index\.html$">
+  # The file names don't change between releases: revalidate them (HOSTING.md).
+  <FilesMatch "(\.(wasm|js)|^index\.html)$">
     Header set Cache-Control "no-cache"
   </FilesMatch>
 </IfModule>

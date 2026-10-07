@@ -1,6 +1,6 @@
 //! Audio scrubbing: Ctrl/Cmd-dragging the current time plays one frame of the comp's mix at each
 //! new frame (each snippet replacing what is still queued); holding still repeats nothing; silent
-//! comps open no output; an idle scrub closes it.
+//! comps open no output; an idle scrub closes it. Previews with audio wait for frames.
 
 use std::sync::{Arc, Mutex};
 
@@ -106,4 +106,42 @@ fn cmd_dragging_the_current_time_scrubs_and_an_idle_scrub_closes() {
         }
     }
     assert!(h.state().scrub.is_none() && fake.0.lock().unwrap().1, "closed and stopped");
+}
+
+/// A preview with audio waits for frames like a silent one (#103): while the frames ahead aren't
+/// cached, every frame shows as it renders, silently; the sound starts once the rest of the
+/// preview is cached, and a frame that isn't cached stops it instead of being skipped.
+#[test]
+fn preview_with_audio_shows_every_frame_and_sounds_once_cached() {
+    let fake = Fake::default();
+    let (app, cid) = setup(true, &fake);
+    // A little under one frame of input time per step.
+    let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).with_step_dt(1.0 / 31.0).build_eframe(|_| app);
+    h.run_steps(2);
+    let frame = |h: &Harness<'_, EffectcraftApp>| {
+        let app = h.state();
+        app.session.project.comp(cid).unwrap().frame_rate.frame_at(app.session.time())
+    };
+    let now = h.ctx.input(|i| i.time);
+    h.state_mut().play(now);
+    assert!(h.state().playback.audio_held && h.state().audio.is_none(), "nothing is cached: no sound yet");
+    let mut last = frame(&h);
+    let mut shown = 0;
+    for _ in 0..2000 {
+        h.step();
+        if h.state().audio.is_some() {
+            break;
+        }
+        let f = frame(&h);
+        assert!(f == last || f == last + 1 || f < last, "{last} → {f}: a frame was skipped");
+        shown += usize::from(f != last);
+        last = f;
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(h.state().audio.is_some() && fake.0.lock().unwrap().0.is_some(), "the sound started once the frames ahead were cached");
+    assert!(shown > 0, "frames played silently first");
+    // A frame that isn't cached stops the sound rather than being skipped.
+    h.state().frames.clear();
+    h.step();
+    assert!(h.state().audio.is_none() && h.state().playback.audio_held && h.state().playback.playing);
 }

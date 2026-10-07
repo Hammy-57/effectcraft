@@ -62,6 +62,14 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         if resp.clicked() {
             app.ui.tool = cur;
         }
+        // Ctrl+double-click Pan Behind: Center Anchor Point in Layer Content.
+        if cur == Tool::PanBehind
+            && resp.double_clicked()
+            && ui.input(|i| i.modifiers.command)
+            && let Err(e) = crate::menus::invoke(app, ui.ctx(), "layer.centerAnchor", json!({}))
+        {
+            app.ui.status = e;
+        }
         if slot.len() > 1 {
             resp.context_menu(|ui| {
                 for tool in slot.iter() {
@@ -287,7 +295,7 @@ pub fn color_popup(ui: &mut egui::Ui, id: egui::Id, pos: egui::Pos2, c: &mut [f3
             }
         });
     });
-    if ui.input(|i| i.pointer.any_pressed()) && !area.response.contains_pointer() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+    if widgets::pressed_outside(ui.ctx(), &area.response) || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
         ui.data_mut(|d| d.insert_temp(open_id, false));
     }
     changed

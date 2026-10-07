@@ -1,7 +1,7 @@
 //! File menu.
 
 use effectcraft_color::Label;
-use effectcraft_project::{FootageKind, ItemKind, Project};
+use effectcraft_project::{FootageKind, ItemId, ItemKind, LayerSource, Project};
 use serde_json::{Value, json};
 
 use super::{CommandSpec, always, bad, str_p};
@@ -99,6 +99,54 @@ fn increment_save(s: &mut Session, _: &Value) -> Result<Value> {
 fn revert(s: &mut Session, _: &Value) -> Result<Value> {
     let path = s.path.clone().ok_or_else(|| bad("file.revert", "not saved"))?;
     open(s, &json!({"path": path}))
+}
+
+/// File ▸ Import; with `addToComp` (files dropped on the Timeline or the Composition viewer) they
+/// also become layers of the active comp ([`add_to_comp`]).
+fn import_cmd(s: &mut Session, p: &Value) -> Result<Value> {
+    let target = s.active_comp_id();
+    let mut r = import(s, p)?;
+    let errors = add_to_comp(s, &r, target, p);
+    if !errors.is_empty()
+        && let Some(e) = r.get_mut("errors").and_then(Value::as_array_mut)
+    {
+        e.extend(errors.into_iter().map(Value::from));
+    }
+    Ok(r)
+}
+
+/// With `addToComp`, put what an import (its result `r`) made into `target`, the comp that was
+/// active before it, one layer under the other, at the drop's `time`, `index` and `position`
+/// (as in `layer.addItem`): the comps of layered files (their layers' footage stays in the
+/// Project panel) and the other footage. `target` stays open. Returns what couldn't be added.
+pub(crate) fn add_to_comp(s: &mut Session, r: &Value, target: Option<ItemId>, p: &Value) -> Vec<String> {
+    let Some(cid) = target.filter(|_| p.get("addToComp").and_then(Value::as_bool).unwrap_or(false)) else { return vec![] };
+    let ids = |k: &str| r.get(k).and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_u64).collect::<Vec<u64>>();
+    let comps = ids("comps");
+    let in_comps: std::collections::HashSet<u64> = comps
+        .iter()
+        .filter_map(|c| s.project.comp(ItemId(*c)))
+        .flat_map(|c| c.layers.iter())
+        .filter_map(|l| match l.source {
+            LayerSource::Footage { item } | LayerSource::Comp { item } | LayerSource::Solid { item } => Some(item.0),
+            _ => None,
+        })
+        .collect();
+    let add: Vec<u64> = comps.iter().copied().chain(ids("items").into_iter().filter(|i| !in_comps.contains(i))).collect();
+    let mut errors = vec![];
+    for (k, item) in add.into_iter().enumerate() {
+        let mut params = json!({"comp": cid.0, "item": item, "time": p.get("time"), "position": p.get("position")});
+        if let Some(i) = p.get("index").and_then(Value::as_u64) {
+            params["index"] = json!(i.saturating_add(k as u64));
+        }
+        if let Err(e) = s.execute("layer.addItem", params) {
+            errors.push(e.to_string());
+        }
+    }
+    if s.active_comp_id() != Some(cid) {
+        s.open_comp(cid);
+    }
+    errors
 }
 
 pub(crate) fn import(s: &mut Session, p: &Value) -> Result<Value> {
@@ -528,9 +576,9 @@ pub fn specs() -> Vec<CommandSpec> {
             "File...",
             ["File", "Import"],
             Some("Cmd+I"),
-            "{paths: [string], importAs?: footage|composition|compositionLayerSizes (Photoshop, PDF, Illustrator and EPS files), layer?: name|index (footage of one Photoshop layer), page?: number from 1 (PDF / Illustrator page), drag?: bool (dropped files: Settings ▸ Import ▸ Default Drag Import As)}",
+            "{paths: [string], importAs?: footage|composition|compositionLayerSizes (Photoshop, PDF, Illustrator and EPS files), layer?: name|index (footage of one Photoshop layer), page?: number from 1 (PDF / Illustrator page), drag?: bool (dropped files: Settings ▸ Import ▸ Default Drag Import As), addToComp?: bool (also add them to the active comp, at time?, index?, position? as in layer.addItem)}",
             always,
-            import
+            import_cmd
         ),
         cmd!(
             "file.projectSettings",

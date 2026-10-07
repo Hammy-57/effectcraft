@@ -73,8 +73,14 @@ pub fn comp_of(app: &EffectcraftApp, id: u32) -> Option<ItemId> {
 /// becomes the active viewer when clicked.
 pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, id: u32, rect: Rect) {
     if id == app.ui.active_viewer {
-        let c = app.session.active_comp_id().map(|c| c.0);
-        app.ui.viewers.insert(id, c);
+        // A comp opened earlier this frame (the Project panel) is routed next frame by
+        // `on_open_comp`, which needs the comp this viewer showed (to keep it when locked).
+        if app.session.events.iter().any(|e| matches!(e, effectcraft_engine::Event::OpenComp(_))) {
+            ui.ctx().request_repaint();
+        } else {
+            let c = app.session.active_comp_id().map(|c| c.0);
+            app.ui.viewers.insert(id, c);
+        }
         super::viewer::show(app, ui, rect);
         return;
     }

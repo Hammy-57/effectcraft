@@ -54,6 +54,8 @@ fn main() -> eframe::Result {
             _ => files.push(a),
         }
     }
+    // The font menus list the installed fonts: read their names while the window opens.
+    effectcraft_engine::text::fonts::scan_system_in_background();
     // Wayland shows the window's icon from its desktop entry: an AppImage brings its own.
     #[cfg(target_os = "linux")]
     appimage::integrate_from_env(ICON_PNG);
@@ -75,6 +77,23 @@ fn main() -> eframe::Result {
         "EffectCraft",
         options,
         Box::new(move |cc| {
+            // This executable owns the shared device's handlers. Install them before
+            // EffectCraft's compositor pipelines are built, without changing handlers from
+            // inside Gpu::new. eframe has already constructed its presentation renderer here.
+            let gpu_failures = effectcraft_ui_egui::gpu_failure::GpuFailureBridge::new(&cc.egui_ctx);
+            if let Some(rs) = &cc.wgpu_render_state {
+                let errors = gpu_failures.clone();
+                rs.device.on_uncaptured_error(std::sync::Arc::new(move |error| {
+                    let message = format!("uncaptured GPU error: {error}");
+                    if errors.report(&message, false) {
+                        log::error!("{message}");
+                    }
+                }));
+                let lost = gpu_failures.clone();
+                rs.device.set_device_lost_callback(move |reason, message| {
+                    lost.report(&format!("GPU device lost ({reason:?}): {message}"), true);
+                });
+            }
             let mut session = effectcraft_host::session();
             // Lazy open and non-blocking auto-save: footage is checked and auto-saves are
             // written on background threads (M13.14).
@@ -108,6 +127,7 @@ fn main() -> eframe::Result {
             }
             let show_home = home.unwrap_or(session.prefs.startup.show_home_on_launch && files.is_empty() && control_port.is_none());
             let mut app = EffectcraftApp::new(session);
+            app.set_gpu_failure_bridge(gpu_failures);
             app.ui.start_screen = show_home;
             if let Some(r) = recovery {
                 app.offer_recovery(r);
@@ -125,7 +145,14 @@ fn main() -> eframe::Result {
             app.hooks.audio_devices = Some(Box::new(audio_out::devices));
             app.hooks.pick_folder = Some(Box::new(|| rfd::FileDialog::new().pick_folder().map(|p| p.to_string_lossy().to_string())));
             app.hooks.pick_save_file = Some(Box::new(|name: &str, ext: &str| {
-                rfd::FileDialog::new().add_filter(ext, &[ext]).set_file_name(name).save_file().map(|p| p.to_string_lossy().to_string())
+                // A default with a folder that exists opens the dialog there.
+                let path = std::path::Path::new(name);
+                let mut d = rfd::FileDialog::new().add_filter(ext, &[ext]);
+                if let Some(dir) = path.parent().filter(|d| d.is_dir()) {
+                    d = d.set_directory(dir);
+                }
+                let file = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                d.set_file_name(file).save_file().map(|p| p.to_string_lossy().to_string())
             }));
             #[cfg(target_os = "macos")]
             {

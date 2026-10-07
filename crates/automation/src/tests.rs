@@ -177,6 +177,28 @@ fn headless_workflow() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// An expression with a syntax error is kept but disabled; set_property and get_property report
+/// its error, and `evaluated` is the static value that renders (#163).
+#[test]
+fn expression_syntax_errors_reach_the_reply() {
+    let mut s = McpServer::new(Backend::headless(effectcraft_host::session()));
+    call_json(&mut s, "execute_command", json!({"command": "comp.new", "params": {"name": "A", "width": 64, "height": 64}}));
+    call_json(&mut s, "execute_command", json!({"command": "layer.newSolid", "params": {"name": "S", "color": "#ff0000", "width": 32, "height": 8}}));
+    let at = |expr: &str| json!({"layer": "S", "path": "transform/rotation", "expression": expr});
+    call_json(&mut s, "set_property", json!({"layer": "S", "path": "transform/rotation", "value": 30}));
+    let set = call_json(&mut s, "set_property", at("thisIsBroken("));
+    let got = call_json(&mut s, "get_property", json!({"layer": "S", "path": "transform/rotation"}));
+    for r in [&set, &got] {
+        assert_eq!((&r["expression"], &r["evaluated"]), (&json!("thisIsBroken("), &json!(30.0)), "{r}");
+        assert!(r["expressionError"].as_str().unwrap().contains("SyntaxError"), "{r}");
+    }
+    // A runtime error and a valid expression report as before.
+    let r = call_json(&mut s, "set_property", at("nope*2"));
+    assert!(r["expressionError"].as_str().unwrap().contains("nope is not defined"), "{r}");
+    let r = call_json(&mut s, "set_property", at("60"));
+    assert_eq!((&r["evaluated"], r.get("expressionError")), (&json!(60.0), None), "{r}");
+}
+
 #[test]
 fn stdio_loop() {
     let mut s = server();
@@ -394,6 +416,49 @@ fn high_level_tools_add_effect_and_report_state() {
     assert!(err && c[0]["text"].as_str().unwrap().contains("unknown effect"), "{c:?}");
 }
 
+/// add_effect is one undo step, and a call that fails leaves the layer and the history as they
+/// were (#175).
+#[test]
+fn add_effect_is_one_undo_step_and_all_or_nothing() {
+    let mut s = server();
+    call_json(&mut s, "execute_command", json!({"command": "comp.new", "params": {"name": "A", "width": 64, "height": 64}}));
+    call_json(&mut s, "execute_command", json!({"command": "layer.newSolid", "params": {"name": "S", "color": "#ff0000"}}));
+    let undo = |s: &mut McpServer| call_json(s, "get_project", json!({}))["undo"].as_array().unwrap().clone();
+    let effects = |s: &mut McpServer| {
+        let l = call_json(s, "get_layer", json!({"layer": "S", "flat": true}));
+        l["properties"].as_array().unwrap().iter().filter(|p| p["path"].as_str().unwrap().starts_with("effects/")).count()
+    };
+    let before = undo(&mut s);
+    let (c, err) = call(&mut s, "add_effect", json!({"layer": "S", "effect": "Gaussian Blur", "values": {"blurriness": 8, "repeatEdgePixels": true}}));
+    assert!(err && c[0]["text"].as_str().unwrap().contains("effects/#1/repeatEdgePixels"), "{c:?}");
+    assert_eq!((undo(&mut s), effects(&mut s)), (before.clone(), 0), "nothing applied");
+    // The corrected retry lands at #1, in one undo step named like effect.apply's.
+    let r = call_json(&mut s, "add_effect", json!({"layer": "S", "effect": "Gaussian Blur", "values": {"blurriness": 8, "repeatEdge": true}}));
+    assert_eq!((&r["path"], &r["set"]), (&json!("effects/#1"), &json!(["effects/#1/blurriness", "effects/#1/repeatEdge"])), "{r}");
+    let after = undo(&mut s);
+    assert_eq!(after.len(), before.len() + 1, "{after:?}");
+    assert_eq!(after.last(), Some(&json!("Apply Gaussian Blur")));
+    call_json(&mut s, "undo", json!({}));
+    assert_eq!((undo(&mut s), effects(&mut s)), (before, 0), "one undo removes the effect and its values");
+}
+
+#[test]
+fn list_fonts_lists_families_with_styles() {
+    let mut s = server();
+    let all = call_json(&mut s, "list_fonts", json!({}));
+    let fams = all["families"].as_array().unwrap();
+    assert!(fams.iter().any(|f| f["family"] == "Inter" && f["origin"] == "bundled"), "{all}");
+    // The query filters by substring: the bundled JetBrains Mono, and any installed family whose
+    // name contains it (JetBrainsMono Nerd Font…) (#149).
+    let one = call_json(&mut s, "list_fonts", json!({"query": "jetbrains"}));
+    let matched = one["families"].as_array().unwrap();
+    assert_eq!(one["count"].as_u64(), Some(matched.len() as u64), "{one}");
+    assert!(matched.iter().all(|f| f["family"].as_str().unwrap().to_lowercase().contains("jetbrains")), "{one}");
+    assert!(matched.len() < fams.len(), "the query filters: {one}");
+    let mono = matched.iter().find(|f| f["family"] == "JetBrains Mono").unwrap_or_else(|| panic!("{one}"));
+    assert!(mono["styles"].as_array().unwrap().contains(&json!("Regular")), "{one}");
+}
+
 /// Trained models over MCP (Roto Brush and face tracking): listed with their authors and
 /// licence, chosen, refused when unknown.
 #[test]
@@ -408,4 +473,37 @@ fn trained_models_over_mcp() {
         let (c, err) = call(&mut s, "execute_command", json!({"command": format!("{prefix}.model.select"), "params": {"id": "nope"}}));
         assert!(err && c[0]["text"].as_str().unwrap().contains("unknown model"), "{c:?}");
     }
+}
+
+/// docs/agents.md's Tools table lists every tool, and an entry that lists arguments lists every
+/// argument the tool's input schema accepts (#137).
+#[test]
+fn agents_doc_tools_table_is_current() {
+    // (Checkouts may have CRLF line endings.)
+    let doc = include_str!("../../../docs/agents.md").replace("\r\n", "\n");
+    let table: String = doc.split("### Tools").nth(1).and_then(|t| t.split("\n\n").nth(1)).unwrap_or_default().to_string();
+    assert!(table.starts_with("| Tool |"), "no Tools table");
+    let mut missing = vec![];
+    for t in crate::tools::catalogue() {
+        // `name` (no arguments) or `name {a, b?, …}`.
+        let Some(at) = table.find(&format!("`{}", t.name)).filter(|i| {
+            let rest = &table[i + 1 + t.name.len()..];
+            rest.starts_with('`') || rest.starts_with(" {")
+        }) else {
+            missing.push(format!("{}: no entry", t.name));
+            continue;
+        };
+        let rest = &table[at + 1 + t.name.len()..];
+        if !rest.starts_with(" {") {
+            continue;
+        }
+        let args = rest.split("}`").next().unwrap_or_default();
+        let schema = t.input_schema();
+        for prop in schema["properties"].as_object().into_iter().flat_map(|p| p.keys()) {
+            if !args.split(|c: char| !(c.is_alphanumeric() || c == '_')).any(|w| w == prop) {
+                missing.push(format!("{}: argument `{prop}`", t.name));
+            }
+        }
+    }
+    assert!(missing.is_empty(), "docs/agents.md's Tools table is missing: {missing:#?}");
 }

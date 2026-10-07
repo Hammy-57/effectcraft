@@ -21,7 +21,15 @@ pub(crate) fn deferred_gpu() -> Option<(&'static Gpu, std::sync::MutexGuard<'sta
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     // Also no other GPU test while it runs (see `hold_gpu_lock`).
     crate::tests::hold_gpu_lock();
-    let g = G.get_or_init(|| pollster::block_on(Gpu::request_deferred()).map_err(|e| eprintln!("deferred gpu tests skipped: {e}")).ok()).as_ref()?;
+    let g = G
+        .get_or_init(|| {
+            let g = pollster::block_on(Gpu::request_deferred()).map_err(|e| eprintln!("deferred gpu tests skipped: {e}")).ok();
+            if let Some(g) = &g {
+                eprintln!("deferred gpu tests: adapter {}", g.ctx.name);
+            }
+            g
+        })
+        .as_ref()?;
     Some((g, LOCK.lock().unwrap_or_else(|e| e.into_inner())))
 }
 

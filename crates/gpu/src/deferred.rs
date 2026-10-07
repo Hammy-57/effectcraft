@@ -14,7 +14,7 @@
 //! of its key, and a chain whose kernels read other data through the effect host (other layers,
 //! other times) is not started when that data missed while it ran (the miss counter moved).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::pin::Pin;
@@ -48,11 +48,9 @@ pub(crate) enum Lookup {
 
 #[derive(Default)]
 struct State {
-    /// Frame generation: results of an older frame's readbacks are dropped.
-    generation: u64,
     ready: HashMap<u128, Option<Readback>>,
-    waiting: HashSet<u128>,
-    in_flight: usize,
+    /// Each request owns a unique token, even when a key is reused after cancellation.
+    waiting: HashMap<u128, Arc<()>>,
     /// Misses so far in this frame (a counter, so a chain sees misses during its own work).
     misses: u64,
     wakers: Vec<Waker>,
@@ -71,11 +69,15 @@ pub struct Deferred {
 
 impl Deferred {
     pub fn frame_begin(&self) {
-        if let Ok(mut s) = self.st.lock() {
-            s.generation += 1;
+        let wakers = {
+            let mut s = self.st.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             s.ready.clear();
             s.waiting.clear();
             s.misses = 0;
+            std::mem::take(&mut s.wakers)
+        };
+        for w in wakers {
+            w.wake();
         }
         self.gate.store(false, Ordering::Relaxed);
     }
@@ -111,32 +113,25 @@ impl Deferred {
         if let Some(r) = s.ready.get(&key) {
             return Lookup::Ready(r.clone());
         }
-        if s.waiting.contains(&key) { Lookup::InFlight } else { Lookup::Absent }
+        if s.waiting.contains_key(&key) { Lookup::InFlight } else { Lookup::Absent }
     }
 
     /// A readback for `key` is being started; returns the callback that stores its bytes.
     pub(crate) fn start(self: &Arc<Self>, key: u128, width: u32, height: u32, offset: [f64; 2], scale: f64) -> impl FnOnce(Option<Vec<u8>>) + 'static {
-        let generation = match self.st.lock() {
-            Ok(mut s) => {
-                s.waiting.insert(key);
-                s.in_flight += 1;
-                s.generation
-            }
-            Err(_) => 0,
-        };
+        let token = Arc::new(());
+        self.st.lock().unwrap_or_else(std::sync::PoisonError::into_inner).waiting.insert(key, token.clone());
         self.readbacks.fetch_add(1, Ordering::Relaxed);
         let me = self.clone();
         move |bytes: Option<Vec<u8>>| {
-            let wakers = match me.st.lock() {
-                Ok(mut s) => {
-                    s.in_flight = s.in_flight.saturating_sub(1);
-                    if s.generation == generation {
-                        s.waiting.remove(&key);
-                        s.ready.insert(key, bytes.map(|bytes| Readback { bytes, width, height, offset, scale }));
-                    }
-                    if s.in_flight == 0 { std::mem::take(&mut s.wakers) } else { vec![] }
+            let wakers = {
+                let mut s = me.st.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                // Reject stale completion before touching either results or accounting.
+                if !s.waiting.get(&key).is_some_and(|current| Arc::ptr_eq(current, &token)) {
+                    return;
                 }
-                Err(_) => vec![],
+                s.waiting.remove(&key);
+                s.ready.insert(key, bytes.map(|bytes| Readback { bytes, width, height, offset, scale }));
+                if s.waiting.is_empty() { std::mem::take(&mut s.wakers) } else { vec![] }
             };
             for w in wakers {
                 w.wake();
@@ -144,9 +139,24 @@ impl Deferred {
         }
     }
 
+    /// Cancel pending requests without exposing placeholder pixels as successful results.
+    /// Existing waiters wake; late callbacks cannot change a newer request's accounting.
+    pub(crate) fn cancel(&self) {
+        let wakers = {
+            let mut s = self.st.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (key, _) in std::mem::take(&mut s.waiting) {
+                s.ready.insert(key, None);
+            }
+            std::mem::take(&mut s.wakers)
+        };
+        for w in wakers {
+            w.wake();
+        }
+    }
+
     /// Readbacks still in flight.
     pub fn in_flight(&self) -> usize {
-        self.st.lock().map(|s| s.in_flight).unwrap_or(0)
+        self.st.lock().unwrap_or_else(std::sync::PoisonError::into_inner).waiting.len()
     }
 
     /// Resolves once no readback is in flight (on the web the browser's event loop delivers
@@ -162,11 +172,13 @@ pub struct Settled(Arc<Deferred>);
 impl Future for Settled {
     type Output = ();
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let Ok(mut s) = self.0.st.lock() else { return Poll::Ready(()) };
-        if s.in_flight == 0 {
+        let mut s = self.0.st.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if s.waiting.is_empty() {
             return Poll::Ready(());
         }
-        s.wakers.push(cx.waker().clone());
+        if !s.wakers.iter().any(|w| w.will_wake(cx.waker())) {
+            s.wakers.push(cx.waker().clone());
+        }
         Poll::Pending
     }
 }
@@ -248,6 +260,56 @@ pub(crate) fn chain_key(chain: &[FxStep], buf: &Buf, levels: Option<f32>) -> u12
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct WakeCount(std::sync::atomic::AtomicUsize);
+    impl std::task::Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn cancellation_wakes_waiters_and_stale_same_key_does_not_drain_new_work() {
+        let d = Arc::new(Deferred::default());
+        let old = d.start(7, 1, 1, [0.0; 2], 1.0);
+        let wake = Arc::new(WakeCount(std::sync::atomic::AtomicUsize::new(0)));
+        let waker = Waker::from(wake.clone());
+        let mut settled = std::pin::pin!(d.settled());
+        for _ in 0..4 {
+            assert!(settled.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+        }
+        d.cancel();
+        assert_eq!(wake.0.load(Ordering::SeqCst), 1);
+        assert_eq!(d.in_flight(), 0);
+        assert!(settled.as_mut().poll(&mut Context::from_waker(&waker)).is_ready());
+        assert!(matches!(d.lookup(7), Lookup::Ready(None)));
+        d.frame_begin();
+        let new = d.start(7, 1, 1, [0.0; 2], 1.0);
+        old(Some(vec![99; 4]));
+        assert_eq!(d.in_flight(), 1);
+        assert!(matches!(d.lookup(7), Lookup::InFlight));
+        new(None);
+        assert_eq!(d.in_flight(), 0);
+        assert!(matches!(d.lookup(7), Lookup::Ready(None)));
+    }
+
+    #[test]
+    fn device_failure_without_map_callback_drains_and_wakes_deferred() {
+        let d = Arc::new(Deferred::default());
+        let registry = crate::readback::Readbacks::new().unwrap();
+        let done = d.start(11, 1, 1, [0.0; 2], 1.0);
+        let ticket = registry.start(move |r| done(r.ok())).unwrap();
+        let wake = Arc::new(WakeCount(std::sync::atomic::AtomicUsize::new(0)));
+        let waker = Waker::from(wake.clone());
+        let mut settled = std::pin::pin!(d.settled());
+        assert!(settled.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+        registry.retire("synthetic device loss".into());
+        assert_eq!(wake.0.load(Ordering::SeqCst), 1);
+        assert!(settled.as_mut().poll(&mut Context::from_waker(&waker)).is_ready());
+        assert_eq!(d.in_flight(), 0);
+        ticket.complete(Ok(vec![99; 4]));
+        assert!(matches!(d.lookup(11), Lookup::Ready(None)));
+    }
 
     #[test]
     fn keys_are_stable_and_distinct() {
