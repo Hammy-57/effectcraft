@@ -293,7 +293,13 @@ class Exporter:
         if type(layer).__name__ == "ThreeDModelLayer":
             transform = next((p for p in properties if p["match_name"] == "ADBE Transform Group"), None)
             anchor = next((p for p in transform["children"] if p["match_name"] == "ADBE Anchor Point"), None) if transform else None
-            if anchor and anchor["authored"]:
+            if anchor and not anchor["authored"]:
+                if anchor["keyframes"] or anchor["expression"]:
+                    self.loss(scope + "/model_anchor", "inconsistent_default", "un-authored model anchor has animation or expression")
+                else:
+                    anchor["value"] = [0.0, 0.0, 0.0]
+                    anchor["value_origin"] = "ae_model_anchor_default"
+            elif anchor and anchor["authored"]:
                 width = self.read(source, "width", scope) if source else None
                 height = self.read(source, "height", scope) if source else None
                 if all(isinstance(n, (int, float)) and math.isfinite(n) and 0 < n <= 32768
@@ -353,6 +359,16 @@ class Exporter:
                         "point_of_interest": camera_value("ADBE Transform Group", "ADBE Anchor Point"),
                         "zoom": camera_value("ADBE Camera Options Group", "ADBE Camera Zoom"),
                     }
+                    position, poi, zoom = (hidden["pose"][k] for k in ("position", "point_of_interest", "zoom"))
+                    transform = next((p for p in hidden["properties"] if p["match_name"] == "ADBE Transform Group"), None)
+                    position_prop = next((p for p in transform["children"] if p["match_name"] == "ADBE Position"), None) if transform else None
+                    if (position_prop and not position_prop["authored"] and not position_prop["keyframes"] and not position_prop["expression"]
+                            and isinstance(position, list) and isinstance(poi, list)
+                            and len(position) == len(poi) == 3 and position == poi
+                            and isinstance(zoom, (int, float)) and math.isfinite(zoom) and zoom > 0):
+                        position[2] = poi[2] - zoom
+                        position_prop["value"][2] = position[2]
+                        position_prop["value_origin"] = "ae_default_camera_eye"
                     result["default_camera"] = hidden
                 except Exception as exc:
                     self.loss(scope + "/default_camera", "parse_error", f"{type(exc).__name__}: {exc}")

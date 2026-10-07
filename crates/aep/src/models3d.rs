@@ -19,6 +19,16 @@ pub(super) fn layer_source(ir: &Json, project: &Project, item_ids: &BTreeMap<i64
 /// properties. Normalize AE's model material flags onto the native render controls.
 pub(super) fn import(_project: &mut Project, layer: &mut Layer, ir: &Json, _fps: f64, losses: &mut Vec<String>, context: &str) {
     let layer_time = LayerTime::of(layer);
+    if let Some(scale) = layer.props.prop_mut("geometryOptions/unitScale") {
+        scale.value = Value::Scalar(512.0);
+    } else {
+        losses.push(format!("{context}: native model scale missing"));
+    }
+    if let Some(axes) = layer.props.prop_mut("geometryOptions/aeSourceSpace") {
+        axes.value = Value::Bool(true);
+    } else {
+        losses.push(format!("{context}: native AE model axes control missing"));
+    }
     let Some(material) = array(ir, "properties").iter().find(|p| string(p, &["match_name"]) == Some("ADBE Material Options Group")) else {
         return;
     };
@@ -93,6 +103,8 @@ mod tests {
         assert_eq!(layer.props.prop("materialOptions/acceptsShadows").map(|p| &p.value), Some(&Value::Enum(1)));
         assert_eq!(layer.props.prop("materialOptions/acceptsLights").map(|p| &p.value), Some(&Value::Bool(false)));
         assert_eq!(layer.props.prop("materialOptions/appearsInReflections").map(|p| &p.value), Some(&Value::Bool(false)));
+        assert_eq!(layer.props.prop("geometryOptions/unitScale").map(|p| &p.value), Some(&Value::Scalar(512.0)));
+        assert_eq!(layer.props.prop("geometryOptions/aeSourceSpace").map(|p| &p.value), Some(&Value::Bool(true)));
         assert!(losses.is_empty(), "{losses:?}");
     }
 }

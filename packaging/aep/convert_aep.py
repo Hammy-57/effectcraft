@@ -12,7 +12,7 @@ import tempfile
 from pathlib import Path
 
 
-def convert(source, output, cli, allow_losses=False):
+def convert(source, output, cli, allow_losses=False, font_search_root=None):
     source = Path(source).resolve()
     output = Path(output).resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -20,7 +20,10 @@ def convert(source, output, cli, allow_losses=False):
     with tempfile.TemporaryDirectory(prefix='effectcraft-aep-', dir=output.parent) as folder:
         ir = Path(folder) / 'project.json'
         partial = Path(folder) / 'project.ecproj'
-        exported = subprocess.run([sys.executable, str(exporter), str(source), '-o', str(ir)],
+        export_args = [sys.executable, str(exporter), str(source), '-o', str(ir)]
+        if font_search_root is not None:
+            export_args.extend(['--font-search-root', str(Path(font_search_root).resolve())])
+        exported = subprocess.run(export_args,
                                   capture_output=True, text=True)
         if exported.returncode:
             raise RuntimeError(exported.stderr.strip() or exported.stdout.strip())
@@ -53,8 +56,9 @@ def main():
     parser.add_argument('--cli', default=os.environ.get('EFFECTCRAFT_CLI',
         str(sibling_cli) if sibling_cli.is_file() else 'effectcraft-cli'))
     parser.add_argument('--allow-losses', action='store_true', help='write an inspection project even with reported fidelity gaps')
+    parser.add_argument('--font-search-root', type=Path, help='also search this bounded directory for exact matching project fonts')
     args = parser.parse_args()
-    print(json.dumps(convert(args.source, args.output, args.cli, args.allow_losses), indent=2))
+    print(json.dumps(convert(args.source, args.output, args.cli, args.allow_losses, args.font_search_root), indent=2))
 
 
 if __name__ == '__main__':
