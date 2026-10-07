@@ -197,6 +197,26 @@ impl Pen16<'_> {
 
 /// Paint `icon` centred in `rect`.
 pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
+    let local = match icon {
+        Icon::Eye => Some("layer-eye"),
+        Icon::Speaker => Some("layer-audio"),
+        Icon::Solo => Some("layer-solo"),
+        Icon::Lock => Some("layer-lock"),
+        Icon::Collapse => Some("layer-collapse"),
+        Icon::Quality => Some("layer-quality"),
+        Icon::Fx => Some("layer-effects"),
+        Icon::Adjustment => Some("layer-adjustment"),
+        Icon::Cube => Some("layer-3d"),
+        Icon::Stopwatch => Some("layer-stopwatch"),
+        Icon::PickWhip => Some("layer-pickwhip"),
+        Icon::Shy if rect.width() <= 13.0 => Some("layer-shy"),
+        Icon::FrameBlend if rect.width() <= 13.0 => Some("layer-frameblend"),
+        Icon::MotionBlur if rect.width() <= 13.0 => Some("layer-motionblur"),
+        _ => None,
+    };
+    if local.is_some_and(|name| crate::local_assets::paint(painter, rect, name, color)) {
+        return;
+    }
     if paint_generated(painter, rect, icon, color) {
         return;
     }

@@ -623,7 +623,9 @@ pub fn align(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             let r = Rect::from_min_size(pos2(x0 + i as f32 * 34.0 + if i >= 3 { 12.0 } else { 0.0 }, y), vec2(30.0, 28.0));
             let resp = ui.interact(r, egui::Id::new((kind, *op)), Sense::click());
             p.rect_filled(r, 3.0, if resp.hovered() { t.hover } else { t.field_bg });
-            align_glyph(&p, r, op, row == 1, &t);
+            if !crate::local_assets::paint(&p, r.shrink(5.0), &format!("{kind}-{op}"), t.icon) {
+                align_glyph(&p, r, op, row == 1, &t);
+            }
             let tip = align_tip(kind, op);
             app.auto.add(&format!("{kind}.{op}"), r, &tip);
             if resp.on_hover_text(tip).clicked() {
