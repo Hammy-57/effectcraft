@@ -190,6 +190,17 @@ pub fn paragraph_style(p: &ParaStyle, width: Option<f32>) -> ParagraphStyle {
         Justify::JustifyLastRight => (Align::Justify, Align::Right),
         Justify::JustifyAll => (Align::Justify, Align::Justify),
     };
+    // Point text has no box: AE moves a line by the indent on the edge its alignment pins it to
+    // (start + first-line indent for left-aligned, end indent for right-aligned) and keeps
+    // centred lines centred on the layer origin.
+    let rtl = p.direction == Direction::Rtl;
+    let (indent_start, indent_end, indent_first) = match (width, justify_last) {
+        (Some(_), _) => (p.indent_left, p.indent_right, p.indent_first),
+        (None, Align::Left | Align::Justify) if !rtl => (p.indent_left, 0.0, p.indent_first),
+        (None, Align::Right) if rtl => (p.indent_left, 0.0, p.indent_first),
+        (None, Align::Left | Align::Justify | Align::Right) => (0.0, p.indent_right, 0.0),
+        (None, Align::Center) => (0.0, 0.0, 0.0),
+    };
     ParagraphStyle {
         align,
         justify_last,
@@ -197,12 +208,10 @@ pub fn paragraph_style(p: &ParaStyle, width: Option<f32>) -> ParagraphStyle {
         width,
         // The chosen direction is the paragraph's base direction (a left-to-right paragraph
         // starting with Arabic or Hebrew still runs left to right, as in After Effects).
-        rtl: Some(p.direction == Direction::Rtl),
-        // AE keeps these paragraph values on point text but places its single line at the
-        // alignment origin; applying them shifts centred card labels away from their anchor.
-        indent_start: if width.is_some() { p.indent_left as f32 } else { 0.0 },
-        indent_end: if width.is_some() { p.indent_right as f32 } else { 0.0 },
-        indent_first: if width.is_some() { p.indent_first as f32 } else { 0.0 },
+        rtl: Some(rtl),
+        indent_start: indent_start as f32,
+        indent_end: indent_end as f32,
+        indent_first: indent_first as f32,
         space_before: p.space_before as f32,
         space_after: p.space_after as f32,
         every_line: p.composer == Composer::EveryLine,
@@ -469,6 +478,23 @@ mod tests {
         doc.indent_right = 0.0;
         doc.indent_first = 0.0;
         assert_ne!(area.layout.lines[0].x, layout_doc(&doc).layout.lines[0].x, "box text still uses indents");
+    }
+
+    #[test]
+    fn ae_point_text_moves_by_the_indent_on_its_aligned_edge() {
+        // Left-aligned point text starts at Indent Before (+ first line); right-aligned ends at
+        // -Indent After (SceneYard "Effort": 607 px start indent, layer anchor on the shifted word).
+        let mut doc = TextDoc { text: "Effort".into(), justify: Justify::Left, size: 100.0, ..Default::default() };
+        let plain = layout_doc(&doc).layout.lines[0].x;
+        doc.indent_left = 607.0;
+        doc.indent_first = 3.0;
+        doc.indent_right = 159.0;
+        assert!((layout_doc(&doc).layout.lines[0].x - plain - 610.0).abs() < 1e-3);
+        doc.justify = Justify::Right;
+        let right = layout_doc(&doc).layout.lines[0].x;
+        doc.indent_right = 0.0;
+        let flush = layout_doc(&doc).layout.lines[0].x;
+        assert!((flush - right - 159.0).abs() < 1e-3);
     }
 
     #[test]
