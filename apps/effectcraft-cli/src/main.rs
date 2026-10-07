@@ -535,12 +535,16 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
             let comp = args.opt("--comp").and_then(reference);
             let mut time = args.num("--time")?;
             let mut max_side = args.num("--max-side")?.map(|m| m as u32).unwrap_or(0);
-            let needs_info = args.opt("--frame").is_some() || args.opt("--scale").is_some();
+            let needs_info = time.is_some() || args.opt("--frame").is_some() || args.opt("--scale").is_some();
             if needs_info {
                 let c = tool(&mut b, "get_comp", json!({"comp": comp}))?;
+                let fps = c["frameRate"].as_f64().filter(|r| r.is_finite() && *r > 0.0).unwrap_or(30.0);
                 if let Some(f) = args.num("--frame")? {
-                    time = Some(f / c["frameRate"].as_f64().unwrap_or(30.0));
+                    time = Some(f / fps);
                 }
+                // A time printed in rounded seconds ("1.483333" for frame 89 at 60 fps) means that
+                // frame, not the instant just before it where layers cut at the frame still show.
+                time = time.map(|t| snap_to_frame(t, fps));
                 if let Some(k) = args.num("--scale")? {
                     let long = c["width"].as_f64().unwrap_or(0.0).max(c["height"].as_f64().unwrap_or(0.0));
                     max_side = (long * k).round().max(1.0) as u32;
@@ -569,6 +573,13 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
         other => return usage_err(&format!("unknown subcommand `{other}`")),
     }
     Ok(())
+}
+
+/// `t` (seconds) moved onto the nearest frame of a `fps` grid when it is within 1/1000 frame of it.
+fn snap_to_frame(t: f64, fps: f64) -> f64 {
+    let f = t * fps;
+    let r = f.round();
+    if (f - r).abs() < 1e-3 { r / fps } else { t }
 }
 
 fn positional<const N: usize>(args: &Args, usage: &str) -> Result<[String; N], Failure> {
@@ -1193,6 +1204,15 @@ mod tests {
         let a = parse(&["render", "t.ecproj", "--comp=Main", "--work-area", "--out", "x.mp4", "--json"]).unwrap();
         assert_eq!((a.project.as_deref(), a.opt("--comp"), a.opt("--out")), (Some("t.ecproj"), Some("Main"), Some("x.mp4")));
         assert!(a.flag("--work-area") && a.flag("--json"));
+    }
+
+    /// Rounded seconds name the frame they print (SceneYard Typo: 1.483333 s = frame 89 at 60 fps,
+    /// where the first scene's layers end); other times are kept.
+    #[test]
+    fn rounded_render_times_snap_to_their_frame() {
+        assert_eq!(snap_to_frame(1.483333, 60.0), 89.0 / 60.0);
+        assert_eq!(snap_to_frame(0.813559, 29.5), 24.0 / 29.5);
+        assert_eq!(snap_to_frame(1.49, 60.0), 1.49);
     }
 
     /// Every `--option` the CLI reads is declared in VALUED or FLAGS, so none is refused.
