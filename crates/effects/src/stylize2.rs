@@ -503,9 +503,10 @@ fn vignette(ctx: &EffectCtx, mut b: Buf) -> Buf {
     }
     let c = b.to_px(ctx.params.v2("center"));
     let pin = ctx.params.f("pinHighlights") as f32 / 100.0;
-    let (lw, lh) = (ctx.layer_size[0] * b.scale, ctx.layer_size[1] * b.scale);
-    let half_diag = (lw * lw + lh * lh).sqrt() * 0.5;
-    let dist = half_diag.max(1.0) / (fov * 0.5).tan();
+    let lw = ctx.layer_size[0] * b.scale;
+    // Angle of View spans the layer's width (fitted to After Effects renders of portrait and
+    // landscape layers: SceneYard Photos Collage, UI Google search, 40f9d5a8, 3a8e8349).
+    let dist = (lw * 0.5).max(1.0) / (fov * 0.5).tan();
     b.img.rows_mut().for_each(|(y, row)| {
         for (x, px) in row.iter_mut().enumerate() {
             let (c3, a) = unpremul(*px);
@@ -857,6 +858,18 @@ mod tests {
         let out = run_at("ec.stylize.ccvignette", &[("amount", num(100.0)), ("center", Value::Vec2([20.0, 20.0]))], img, 0.0);
         assert!(out.img.get(0, 0)[0] < out.img.get(20, 20)[0] - 0.05);
         assert!((out.img.get(20, 20)[0] - 0.8).abs() < 0.01);
+    }
+
+    /// Angle of View spans the layer's width: a portrait layer darkens as strongly as AE does
+    /// (SceneYard UI Google search, 1080×1920 at Amount 100 / 45°: ~0.44 of the colour 860 px
+    /// above the centre).
+    #[test]
+    fn vignette_falloff_follows_the_layer_width() {
+        let img = Image::filled(108, 192, [0.5, 0.5, 0.5, 1.0]);
+        let set = [("amount", num(100.0)), ("angleOfView", num(45.0)), ("center", Value::Vec2([54.0, 96.0]))];
+        let out = run_at("ec.stylize.ccvignette", &set, img, 0.0);
+        let k = out.img.get(54, 10)[0] / 0.5;
+        assert!((k - 0.44).abs() < 0.06, "{k}");
     }
 
     #[test]

@@ -438,7 +438,8 @@ fn fg2_radio(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (!fg2_inside(p)) {
         return;
     }
-    var o = textureLoad(src, p, 0);
+    // The waves replace the layer's pixels (generate2::radio_waves).
+    var o = vec4<f32>(0.0);
     let aa = P.f[0].x;
     for (var w = 0u; w < P.u[0].x; w++) {
         let at = w * 13u;

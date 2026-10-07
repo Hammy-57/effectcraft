@@ -618,7 +618,11 @@ pub fn radio_plan(ctx: &EffectCtx, b: &Buf) -> Option<RadioPlan> {
 }
 
 fn radio_waves(ctx: &EffectCtx, mut b: Buf) -> Buf {
-    let Some(RadioPlan { waves, contour, aa, profile }) = radio_plan(ctx, &b) else { return b };
+    let plan = radio_plan(ctx, &b);
+    // Like After Effects, the waves replace the layer's own pixels (a grey solid carrying the
+    // effect shows only its rings); the layer is read only as an Image Contour source.
+    b.img.data.iter_mut().for_each(|p| *p = [0.0; 4]);
+    let Some(RadioPlan { waves, contour, aa, profile }) = plan else { return b };
     map_xy(&mut b.img, |x, y, px| {
         let mut out = px;
         // Older waves first, so newer ones sit on top.
@@ -1313,6 +1317,14 @@ mod tests {
         let base = [("waveMotion/expansion", num(100.0)), ("waveMotion/frequency", num(0.5))];
         let o = r(&base, 0.2);
         assert!(o.img.get(52, 32)[3] > 0.9, "{:?}", o.img.get(52, 32));
+        // The waves replace the layer: no original pixels around them (SceneYard UI Google
+        // search carries Radio Waves on a grey solid in Overlay mode).
+        let s = crate::find("ec.generate.radiowaves").unwrap();
+        let mut params = Params { values: s.params.iter().map(|p| (p.id.to_string(), p.default.clone())).collect() };
+        params.values.insert("producerPoint".into(), Value::Vec2([32.0, 32.0]));
+        let ctx = EffectCtx { params: &params, time: 0.2, layer_size: [64.0, 64.0], seed: 3, adjustment: false, env: Default::default() };
+        let grey = crate::apply(s, &ctx, Buf { img: Image::filled(64, 64, [0.5, 0.5, 0.5, 1.0]), offset: [0.0, 0.0], scale: 1.0 });
+        assert_eq!(grey.img.get(2, 2), [0.0; 4]);
         assert!(o.img.get(32, 32)[3] < 0.01);
         // Velocity moves the wave toward Direction (90° = right).
         let mut moving = base.to_vec();

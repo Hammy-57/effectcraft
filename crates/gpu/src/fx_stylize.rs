@@ -218,9 +218,8 @@ fn vignette(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
     }
     let c = b.to_px(ctx.params.v2("center"));
     let pin = ctx.params.f("pinHighlights") as f32 / 100.0;
-    let (lw, lh) = (ctx.layer_size[0] * b.scale, ctx.layer_size[1] * b.scale);
-    let half_diag = (lw * lw + lh * lh).sqrt() * 0.5;
-    let dist = half_diag.max(1.0) / (fov * 0.5).tan();
+    let lw = ctx.layer_size[0] * b.scale;
+    let dist = (lw * 0.5).max(1.0) / (fov * 0.5).tan(); // stylize2::vignette
     point(
         e,
         7,
