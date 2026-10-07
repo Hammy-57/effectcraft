@@ -44,6 +44,7 @@ class Exporter:
         self.root_font_index = None
         self.font_hashes = {}
         self.font_search_root = Path(font_search_root).resolve() if font_search_root else None
+        self.explicit_mattes = False
         if self.font_search_root and not self.font_search_root.is_dir():
             raise ValueError(f"No font search root: {self.font_search_root}")
 
@@ -381,11 +382,29 @@ class Exporter:
                 node["keyframes"].append(self.keyframe(key, f"{here}/keyframe/{i}"))
         return node
 
+    @staticmethod
+    def names_matte_layers(version):
+        """Whether a project saved by After Effects `version` ("25.5x4") names each track matte
+        layer (AE 23 and later); older projects use the layer above."""
+        try:
+            return int(str(version).split(".", 1)[0]) >= 23
+        except ValueError:
+            return False
+
+    @staticmethod
+    def track_matte(layer, matte, explicit):
+        """The track matte layer of a layer whose Track Matte type is set. py-aep falls back to
+        the layer above when no matte layer is named; AE 23+ applies no matte then (a type kept
+        with the layer set to None), so a project that names matte layers gets none."""
+        if matte is not None and explicit and getattr(layer, "_matte_layer_id", None) == 0:
+            return None
+        return matte
+
     def layer(self, layer, index, comp_id):
         scope = f"item/{comp_id}/layer/{layer.id}"
         source = self.read(layer, "source", scope) if hasattr(type(layer), "source") else None
         parent = self.read(layer, "parent", scope)
-        matte = (self.read(layer, "track_matte_layer", scope)
+        matte = (self.track_matte(layer, self.read(layer, "track_matte_layer", scope), self.explicit_mattes)
                  if hasattr(type(layer), "has_track_matte") and self.read(layer, "has_track_matte", scope) else None)
         timing = {name: self.read(layer, name, scope) for name in
                   ("start_time", "in_point", "out_point", "stretch")}
@@ -530,7 +549,9 @@ class Exporter:
     def export(self, source):
         source = Path(source).resolve()
         self.source_dir = source.parent
-        project = py_aep.parse(source).project
+        app = py_aep.parse(source)
+        self.explicit_mattes = self.names_matte_layers(self.read(app, "version", "application"))
+        project = app.project
         items = [self.item(item) for item in project]
         with source.open("rb") as handle:
             digest = hashlib.file_digest(handle, "sha256").hexdigest()
