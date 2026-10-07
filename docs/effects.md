@@ -3,11 +3,11 @@
 <!-- Generated from the effect registry (crates/effects/src/catalog.rs); do not edit by hand.
      Regenerate: UPDATE_DOCS=1 cargo test -p effectcraft-effects --lib effects_doc_is_current -->
 
-EffectCraft ships 306 effects with 3009 parameters in total, grouped into the same categories as the Effects & Presets panel. Every effect is our own implementation, written from public behaviour descriptions and standard image-processing literature. Parameter names, order, popup options, units, defaults and ranges follow the reference application so that projects, expressions and muscle memory carry over.
+EffectCraft ships 316 effects with 3169 parameters in total, grouped into the same categories as the Effects & Presets panel. Every effect is our own implementation, written from public behaviour descriptions and standard image-processing literature. Parameter names, order, popup options, units, defaults and ranges follow the reference application so that projects, expressions and muscle memory carry over.
 
 - **GPU**: 280 effects also run on the GPU compositor with identical results.
-- **32**: 306 effects process 32-bit float (HDR, overbright) pixels without clamping.
-- **Status**: 306 implemented in full, 0 partial (what is missing is listed).
+- **32**: 316 effects process 32-bit float (HDR, overbright) pixels without clamping.
+- **Status**: 304 implemented in full, 12 partial (what is missing is listed).
 
 Effects are addressed by id (`ec.<category>.<name>`) or display name in commands, scripts and the control channel, and every parameter by its id (`effects/#1/blurriness`).
 
@@ -119,6 +119,7 @@ Effects are addressed by id (`ec.<category>.<name>`) or display name in commands
 | OCIO Look Transform | `ec.color.ociolook` | 6 | GPU | 32 | Implemented |
 | PS Arbitrary Map | `ec.color.psarbitrarymap` | 2 | GPU | 32 | Implemented |
 | Photo Filter | `ec.color.photofilter` | 4 | GPU | 32 | Implemented |
+| S_Monochrome | `S_Monochrome` | 9 |  | 32 | Partial: Layer/path mask input is implemented; Mocha geometry, mask blur and mask combining are not implemented |
 | Selective Color | `ec.color.selectivecolor` | 38 | GPU | 32 | Implemented |
 | Shadow/Highlight | `ec.color.shadowhighlight` | 14 | GPU | 32 | Implemented |
 | Tint | `ec.color.tint` | 3 | GPU | 32 | Implemented |
@@ -138,7 +139,7 @@ Effects are addressed by id (`ec.<category>.<name>`) or display name in commands
 | CC Flo Motion | `ec.distort.ccflomotion` | 7 | GPU | 32 | Implemented |
 | CC Griddler | `ec.distort.ccgriddler` | 5 | GPU | 32 | Implemented |
 | CC Lens | `ec.distort.cclens` | 3 | GPU | 32 | Implemented |
-| CC Page Turn | `ec.distort.ccpageturn` | 7 | GPU | 32 | Implemented |
+| CC Page Turn | `ec.distort.ccpageturn` | 8 | GPU | 32 | Implemented |
 | CC Power Pin | `ec.distort.ccpowerpin` | 10 | GPU | 32 | Implemented |
 | CC Ripple Pulse | `ec.distort.ccripplepulse` | 5 | GPU | 32 | Implemented |
 | CC Slant | `ec.distort.ccslant` | 4 | GPU | 32 | Implemented |
@@ -210,6 +211,8 @@ Effects are addressed by id (`ec.<category>.<name>`) or display name in commands
 | Lens Flare | `ec.generate.lensflare` | 4 | GPU | 32 | Implemented |
 | Paint Bucket | `ec.generate.paintbucket` | 11 | GPU | 32 | Implemented |
 | Radio Waves | `ec.generate.radiowaves` | 31 | GPU | 32 | Implemented |
+| S_Gradient | `S_Gradient` | 11 |  | 32 | Partial: Linear ramp with limited combine modes |
+| S_Grid | `S_Grid` | 15 |  | 32 | Partial: 2D grid only; latitude, swing and perspective are not implemented |
 | Scribble | `ec.generate.scribble` | 25 | GPU | 32 | Implemented |
 | Stroke | `ec.generate.stroke` | 11 | GPU | 32 | Implemented |
 | Vegas | `ec.generate.vegas` | 26 | GPU | 32 | Implemented |
@@ -264,7 +267,7 @@ Effects are addressed by id (`ec.<category>.<name>`) or display name in commands
 
 | Effect | Id | Params | GPU | 32 | Status |
 |---|---|---:|:-:|:-:|---|
-| Add Grain | `ec.noise.addgrain` | 32 | GPU | 32 | Implemented |
+| Add Grain | `ec.noise.addgrain` | 46 | GPU | 32 | Partial: RGB color matching is calibrated for corpus defaults; other criteria, matte blur and external mask input are not implemented |
 | Curl Noise | `ec.noise.curlnoise` | 10 | GPU | 32 | Implemented |
 | Dust & Scratches | `ec.noise.dustscratches` | 3 | GPU | 32 | Implemented |
 | Fractal Noise | `ec.noise.fractal` | 26 | GPU | 32 | Implemented |
@@ -306,12 +309,15 @@ Effects are addressed by id (`ec.<category>.<name>`) or display name in commands
 | 3D Glasses | `ec.perspective.3dglasses` | 8 | GPU | 32 | Implemented |
 | Bevel Alpha | `ec.perspective.bevelalpha` | 4 | GPU | 32 | Implemented |
 | Bevel Edges | `ec.perspective.beveledges` | 4 | GPU | 32 | Implemented |
-| CC Cylinder | `ec.perspective.cccylinder` | 12 | GPU | 32 | Implemented |
+| CC Cylinder | `ec.perspective.cccylinder` | 18 | GPU | 32 | Partial: Orthographic 3D projection; AE camera and rotation-order settings are not yet matched |
 | CC Environment | `ec.perspective.ccenvironment` | 4 | GPU | 32 | Implemented |
 | CC Sphere | `ec.perspective.ccsphere` | 14 | GPU | 32 | Implemented |
 | CC Spotlight | `ec.perspective.ccspotlight` | 8 | GPU | 32 | Implemented |
 | Drop Shadow | `ec.perspective.dropshadow` | 6 | GPU | 32 | Implemented |
 | Radial Shadow | `ec.perspective.radialshadow` | 9 | GPU | 32 | Implemented |
+| S_DropShadow | `S_DropShadow` | 6 |  | 32 | Partial: Basic alpha shadow; matte and background inputs are not implemented |
+| Shadow Studio 2 (Native) | `ec.perspective.shadowstudio2` | 10 |  | 32 | Partial: Approximate sampled directional shadow; easing, texture, inner and point modes are not implemented |
+| Shadow Studio 3 (Native) | `ec.perspective.shadowstudio3` | 13 |  | 32 | Partial: Approximate sampled directional shadow; raytracing, gradients, texture, inner and point modes are not implemented |
 
 ## Simulation
 
@@ -354,6 +360,7 @@ Effects are addressed by id (`ec.<category>.<name>`) or display name in commands
 | CC Vignette | `ec.stylize.ccvignette` | 4 | GPU | 32 | Implemented |
 | Cartoon | `ec.stylize.cartoon` | 12 | GPU | 32 | Implemented |
 | Color Emboss | `ec.stylize.coloremboss` | 4 | GPU | 32 | Implemented |
+| Deep Glow (Native) | `ec.stylize.deepglow` | 27 |  | 32 | Partial: Approximate falloff, tint, chromatic aberration and downsampling; edge modes and masking are not fully matched |
 | Emboss | `ec.stylize.emboss` | 4 | GPU | 32 | Implemented |
 | Find Edges | `ec.stylize.findedges` | 2 | GPU | 32 | Implemented |
 | Glow | `ec.stylize.glow` | 14 | GPU | 32 | Implemented |
@@ -361,6 +368,9 @@ Effects are addressed by id (`ec.<category>.<name>`) or display name in commands
 | Motion Tile | `ec.stylize.motiontile` | 8 | GPU | 32 | Implemented |
 | Posterize | `ec.stylize.posterize` | 1 | GPU | 32 | Implemented |
 | Roughen Edges | `ec.stylize.roughenedges` | 13 | GPU | 32 | Implemented |
+| S_CartoonPaint | `S_CartoonPaint` | 24 |  | 32 | Partial: Approximate smoothing and edges; brush strokes, Mocha geometry, mask blur and mask combining are not implemented |
+| S_Glow | `S_Glow` | 13 |  | 32 | Partial: Bright-pass Gaussian; atmosphere and combine modes are not implemented |
+| S_HalfTone | `S_HalfTone` | 11 |  | 32 | Partial: Basic monochrome dot screen |
 | Scatter | `ec.stylize.scatter` | 3 | GPU | 32 | Implemented |
 | Strobe Light | `ec.stylize.strobe` | 7 | GPU | 32 | Implemented |
 | Texturize | `ec.stylize.texturize` | 4 | GPU | 32 | Implemented |

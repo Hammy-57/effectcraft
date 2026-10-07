@@ -627,15 +627,34 @@ fn cc_lens(ctx: &EffectCtx, mut b: Buf) -> Buf {
 // ---------------------------------------------------------------- CC Page Turn
 
 fn page_turn(ctx: &EffectCtx, mut b: Buf) -> Buf {
-    let f = b.to_px(ctx.params.v2("foldPosition"));
+    let pointer = b.to_px(ctx.params.v2("foldPosition"));
     let phi = ctx.params.f("foldDirection").to_radians();
+    let controls = ctx.params.e("controls");
+    // Corner controls drag the selected page corner; the fold is the perpendicular bisector
+    // between its original position and the dragged point. Classic UI uses Fold Direction.
+    let (f, n) = if (2..=5).contains(&controls) {
+        let (x, y, w, h) = layer_rect(ctx, &b);
+        let corner = match controls {
+            2 => (x, y),
+            3 => (x + w, y),
+            4 => (x, y + h),
+            _ => (x + w, y + h),
+        };
+        let (dx, dy) = (corner.0 - pointer.0, corner.1 - pointer.1);
+        let len = dx.hypot(dy);
+        if !len.is_finite() || len < 1e-6 {
+            return b;
+        }
+        (((corner.0 + pointer.0) * 0.5, (corner.1 + pointer.1) * 0.5), (dx / len, dy / len))
+    } else {
+        (pointer, (-phi.sin(), phi.cos()))
+    };
     let r = (ctx.params.f("foldRadius") * b.scale).max(0.5);
     let lam = ctx.params.f("lightDirection").to_radians();
     let render = ctx.params.e("render");
     let bo = (ctx.params.f("backPageOpacity") / 100.0) as f32;
     let paper = ctx.params.color("paperColor");
     // The fold travels along `fd`; the lifted part lies on the other side (toward `n`).
-    let n = (-phi.sin(), phi.cos());
     let ldot = (n.0 * lam.sin() - n.1 * lam.cos()) as f32;
     let (show_front, show_back) = (render != 1, render != 2);
     let src = b.img.clone();
@@ -846,6 +865,7 @@ pub fn specs() -> Vec<EffectSpec> {
             vec![
                 p("foldPosition", "Fold Position", pt(0.7, 0.7), ParamUi::Point),
                 p("foldDirection", "Fold Direction", num(315.0), ParamUi::Angle),
+                p("controls", "Controls", Value::Enum(0), slider(0.0, 5.0, 0.0, 5.0, 0)),
                 p("foldRadius", "Fold Radius", num(20.0), slider(0.0, 1000.0, 0.0, 200.0, 1)),
                 p("lightDirection", "Light Direction", num(-45.0), ParamUi::Angle),
                 p("render", "Render", Value::Enum(0), popup(&["Front & Back Page", "Back Page", "Front Page"])),
@@ -1015,6 +1035,18 @@ mod tests {
         // Bottom-right corner is lifted away; top-left untouched.
         assert!(o.img.get(63, 63)[3] < 1e-6);
         assert_eq!(o.img.get(2, 2), img.get(2, 2));
+    }
+
+    #[test]
+    fn page_turn_controls_use_imported_zero_based_corner_mode() {
+        let img = test_img(64, 64);
+        let raw = |n: u32| Value::Enum(n - 1);
+        let point = Value::Vec2([20.0, 20.0]);
+        let classic = run("ec.distort.ccpageturn", &[("controls", raw(1)), ("foldPosition", point.clone())], img.clone()).img;
+        let corner = run("ec.distort.ccpageturn", &[("controls", raw(6)), ("foldPosition", point.clone())], img.clone()).img;
+        assert!(max_diff(&classic, &corner) > 1e-3, "AE Controls 6 must use a dragged corner");
+        let other_direction = run("ec.distort.ccpageturn", &[("controls", raw(6)), ("foldPosition", point), ("foldDirection", num(90.0))], img).img;
+        assert_eq!(corner, other_direction, "corner controls ignore Fold Direction");
     }
 
     #[test]

@@ -424,6 +424,24 @@ function __child(c, l, group, key) {
   return info[1] ? __mkGroup(c, l, info) : __mkProp(c, l, info[0]);
 }
 
+function __parent(c, l, path) {
+  var i = path.lastIndexOf('/');
+  if (i < 0) return new Layer(c, l);
+  var parent = path.slice(0, i), j = parent.lastIndexOf('/');
+  return __child(c, l, j < 0 ? '' : parent.slice(0, j), parent.slice(j + 1));
+}
+
+function __propertyGroup(obj, countUp) {
+  countUp = countUp === undefined ? 1 : countUp;
+  if (countUp === 0) return obj;
+  if (!Number.isInteger(countUp) || countUp < 0) __err('Invalid propertyGroup count');
+  while (countUp-- > 0) {
+    if (obj === undefined || obj === null || obj.__isLayer) return null;
+    obj = __parent(obj.__c, obj.__l, obj.__p);
+  }
+  return obj;
+}
+
 // Comp ------------------------------------------------------------------------------------------
 
 function Comp(c) { this.__c = c; this.__i = null; }
@@ -620,6 +638,8 @@ Layer.prototype = {
 
 var __GroupProto = {
   __isGroup: true,
+  propertyGroup: function (countUp) { return __propertyGroup(this, countUp); },
+  get propertyIndex() { return this.__info[5]; },
   __get: function (k) {
     var r = __child(this.__c, this.__l, this.__p, k);
     if (r === undefined) __err('Property ' + (typeof k === 'string' ? '"' + k + '"' : k) + ' not found in "' + this.__info[2] + '"');
@@ -627,6 +647,8 @@ var __GroupProto = {
   },
   param: function (k) { return this.__get(k); },
   property: function (k) { return this.__get(k); },
+  animator: function (k) { return this.__get('animators').__get(k); },
+  selector: function (k) { return this.__get('selectors').__get(k); },
   content: function (k) {
     var inner = __child(this.__c, this.__l, this.__p, 'contents');
     return (inner !== undefined && inner.__isGroup ? inner : this).__get(k);
@@ -713,6 +735,7 @@ function __loop(p, out, type, n, dur) {
 
 Prop.prototype = {
   __isProp: true,
+  propertyGroup: function (countUp) { return __propertyGroup(this, countUp); },
   get __info() { return this.__i || (this.__i = __h(__PINFO, this.__c, this.__l, this.__p)); },
   get name() { return this.__info[0]; },
   get __uid() { return this.__info[1]; },

@@ -7,8 +7,8 @@ use effectcraft_raster::{Image, Px};
 use rayon::prelude::*;
 
 use crate::generate::value_noise;
-use crate::util::{Plane, gauss_plane, guided_filter, hash1, join, lerp, premul, smoothstep, split, unpremul};
-use crate::{Buf, EffectCtx, EffectSpec, num, p, popup, slider};
+use crate::util::{gauss_plane, guided_filter, hash1, join, lerp, premul, smoothstep, split, unpremul, Plane};
+use crate::{num, p, popup, slider, Buf, EffectCtx, EffectSpec};
 
 fn spec(id: &'static str, name: &'static str, params: Vec<crate::ParamSpec>, render: crate::RenderFn) -> EffectSpec {
     EffectSpec { id, name, category: "Noise & Grain", params, render, gpu: false, float: true }
@@ -133,13 +133,17 @@ impl GrainLook {
         planes
     }
 
-    /// Tonal weight of the grain at straight colour `c` (Shadows / Midtones / Highlights around
-    /// the Midpoint).
-    pub(crate) fn weight(&self, c: [f32; 3]) -> f32 {
+    /// Shadows / Midtones / Highlights contribution at straight colour `c`.
+    fn tone_weights(&self, c: [f32; 3]) -> [f32; 3] {
         let l = luminance(c[0], c[1], c[2]).clamp(0.0, 1.0);
         let s = 1.0 - smoothstep(0.0, self.midpoint, l);
         let hi = smoothstep(self.midpoint, 1.0, l);
-        self.tones[0] * s + self.tones[1] * (1.0 - s - hi) + self.tones[2] * hi
+        [s, 1.0 - s - hi, hi]
+    }
+
+    pub(crate) fn weight(&self, c: [f32; 3]) -> f32 {
+        let w = self.tone_weights(c);
+        self.tones[0] * w[0] + self.tones[1] * w[1] + self.tones[2] * w[2]
     }
 
     /// Per-channel grain from the raw plane values `g` (Saturation, Tint).
@@ -300,8 +304,40 @@ pub(crate) fn draw_boxes(img: &mut Image, boxes: &[(usize, usize, usize)], c: [f
 
 // ---- Add Grain ----
 
+const ADD_GRAIN_CHANNEL_TONES: [[(&str, &str); 3]; 3] = [
+    [
+        ("application/channelBalance/redShadows", "Red Shadows"),
+        ("application/channelBalance/redMidtones", "Red Midtones"),
+        ("application/channelBalance/redHighlights", "Red Highlights"),
+    ],
+    [
+        ("application/channelBalance/greenShadows", "Green Shadows"),
+        ("application/channelBalance/greenMidtones", "Green Midtones"),
+        ("application/channelBalance/greenHighlights", "Green Highlights"),
+    ],
+    [
+        ("application/channelBalance/blueShadows", "Blue Shadows"),
+        ("application/channelBalance/blueMidtones", "Blue Midtones"),
+        ("application/channelBalance/blueHighlights", "Blue Highlights"),
+    ],
+];
+
+const GRAIN_MATCH_AMOUNT: &str = "VISINF Grain Implant-0053";
+const GRAIN_MATCH_COLOR: &str = "VISINF Grain Implant-0054";
+const GRAIN_MATCH_TOLERANCE: &str = "VISINF Grain Implant-0055";
+const GRAIN_MATCH_SOFTNESS: &str = "VISINF Grain Implant-0056";
+const GRAIN_MATCH_MODE: &str = "VISINF Grain Implant-0057";
+const GRAIN_INVERT_MATCH: &str = "VISINF Grain Implant-0058";
+
 fn add_grain(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let look = GrainLook::from_params(ctx);
+    let channel_tones = ADD_GRAIN_CHANNEL_TONES.map(|ids| ids.map(|(id, _)| ctx.params.f(id) as f32));
+    let match_amount = (ctx.params.f(GRAIN_MATCH_AMOUNT) / 100.0).clamp(0.0, 1.0) as f32;
+    let match_color = ctx.params.color(GRAIN_MATCH_COLOR);
+    let match_tolerance = ctx.params.f(GRAIN_MATCH_TOLERANCE).max(0.0) as f32;
+    let match_softness = ctx.params.f(GRAIN_MATCH_SOFTNESS).max(0.0) as f32;
+    let match_mode = ctx.params.get(GRAIN_MATCH_MODE).map(Value::as_f64).unwrap_or(3.0) as u32;
+    let invert_match = ctx.params.b(GRAIN_INVERT_MATCH);
     // Viewing Mode (Final Output for projects saved before it existed).
     let view = ctx.params.get("viewingMode").map(|v| v.as_enum()).unwrap_or(2);
     if look.intensity <= 0.0 && view != 1 {
@@ -314,9 +350,16 @@ fn add_grain(ctx: &EffectCtx, mut b: Buf) -> Buf {
     b.img.data.par_iter_mut().enumerate().for_each(|(i, px)| {
         let (c, a) = unpremul(*px);
         let weight = look.weight(c);
+        let match_weight = if match_amount > 0.0 && match_mode != 1 {
+            let distance = ((0..3).map(|k| (c[k] - match_color[k]).powi(2)).sum::<f32>() / 3.0).sqrt();
+            let matched = 1.0 - smoothstep(match_tolerance, match_tolerance + match_softness.max(1e-6), distance);
+            1.0 - match_amount * if invert_match { 1.0 - matched } else { matched }
+        } else {
+            1.0
+        };
         if view == 1 {
             // Blending Matte: where (and how strongly) the grain applies.
-            let v = weight.clamp(0.0, 1.0);
+            let v = (weight * match_weight).clamp(0.0, 1.0);
             *px = [v, v, v, 1.0];
             return;
         }
@@ -325,7 +368,11 @@ fn add_grain(ctx: &EffectCtx, mut b: Buf) -> Buf {
         }
         let raw = if look.mono { [planes[0].data[i]; 3] } else { [planes[0].data[i], planes[1].data[i], planes[2].data[i]] };
         let g = look.color(raw);
-        let o = [0, 1, 2].map(|k| look.blend(c[k], g[k] * amp * look.channel_intensity[k] * weight));
+        let tone = look.tone_weights(c);
+        let o = [0, 1, 2].map(|k| {
+            let channel_weight = (0..3).map(|j| tone[j] * look.tones[j] * channel_tones[k][j]).sum::<f32>() * match_weight;
+            look.blend(c[k], g[k] * amp * look.channel_intensity[k] * channel_weight)
+        });
         *px = premul(o, a);
     });
     if view == 0 {
@@ -490,7 +537,11 @@ fn grain_level(img: &Image, boxes: &[(usize, usize, usize)]) -> f32 {
     }
     let st = crate::noise2::grain_stats_masked(img, Some(&m));
     let s = (st.std[0] + st.std[1] + st.std[2]) / 3.0;
-    if boxes.is_empty() { 1.0 } else { (s / 0.02).clamp(0.5, 2.0) }
+    if boxes.is_empty() {
+        1.0
+    } else {
+        (s / 0.02).clamp(0.5, 2.0)
+    }
 }
 
 /// Remove Grain's measured grain level for buffer `b` without Temporal Filtering (the GPU
@@ -665,7 +716,11 @@ fn noise_alpha(ctx: &EffectCtx, mut b: Buf) -> Buf {
             let na = match ov {
                 1 => {
                     let t = na.rem_euclid(2.0);
-                    if t > 1.0 { 2.0 - t } else { t }
+                    if t > 1.0 {
+                        2.0 - t
+                    } else {
+                        t
+                    }
                 }
                 2 => {
                     if !(0.0..=1.0).contains(&na) {
@@ -754,9 +809,23 @@ pub fn specs() -> Vec<EffectSpec> {
     vec![
         {
             let (tweaking, color, application, animation) = grain_params();
+            let channel_tones: Vec<_> =
+                ADD_GRAIN_CHANNEL_TONES.into_iter().flatten().map(|(id, name)| p(id, name, num(1.0), slider(0.0, 10.0, 0.0, 2.0, 2))).collect();
+            let color_match = vec![
+                p(GRAIN_MATCH_AMOUNT, "Blend with Original Amount", num(0.0), slider(0.0, 100.0, 0.0, 100.0, 1)),
+                p(GRAIN_MATCH_COLOR, "Matching Color", crate::col(0.5, 0.5, 0.5), ParamUi::Color),
+                p(GRAIN_MATCH_TOLERANCE, "Matching Tolerance", num(0.1), slider(0.0, 1.0, 0.0, 1.0, 3)),
+                p(GRAIN_MATCH_SOFTNESS, "Matching Softness", num(0.1), slider(0.0, 1.0, 0.0, 1.0, 3)),
+                p(GRAIN_INVERT_MATCH, "Invert Match", Value::Bool(false), ParamUi::Checkbox),
+            ];
             let head =
                 vec![p("viewingMode", "Viewing Mode", Value::Enum(2), popup(&ADD_GRAIN_VIEWS)), p("preset", "Preset", Value::Enum(0), popup(&GRAIN_PRESETS))];
-            spec("ec.noise.addgrain", "Add Grain", [head, preview_params(), tweaking, color, application, animation].into_iter().flatten().collect(), add_grain)
+            spec(
+                "ec.noise.addgrain",
+                "Add Grain",
+                [head, preview_params(), tweaking, color, application, channel_tones, color_match, animation].into_iter().flatten().collect(),
+                add_grain,
+            )
         },
         spec(
             "ec.noise.median",
@@ -1000,6 +1069,60 @@ mod tests {
         );
         assert!(tinted.img.data.iter().all(|p| (p[1] - 0.4).abs() < 1e-6));
         assert!(tinted.img.data.iter().any(|p| (p[0] - 0.4).abs() > 1e-3));
+    }
+
+    #[test]
+    fn add_grain_channel_balance_targets_tone_and_channel() {
+        for (level, control) in
+            [(0.1, "application/channelBalance/redShadows"), (0.5, "application/channelBalance/redMidtones"), (0.9, "application/channelBalance/redHighlights")]
+        {
+            let source = gray(32, 32, level);
+            let base = run("ec.noise.addgrain", &[("tweaking/intensity", num(3.0))], source.clone(), 0.0).img;
+            let reduced = run("ec.noise.addgrain", &[("tweaking/intensity", num(3.0)), (control, num(0.0))], source, 0.0).img;
+            let deviation = |img: &Image| img.data.iter().map(|p| (p[0] - level).abs()).sum::<f32>();
+            assert!(deviation(&reduced) < deviation(&base) * 0.25, "{control}");
+            assert!(base.data.iter().zip(&reduced.data).all(|(a, b)| (a[1] - b[1]).abs() < 1e-6), "{control} changed green");
+        }
+    }
+
+    #[test]
+    fn add_grain_rgb_match_restores_only_selected_color() {
+        let mut source = Image::new(60, 20);
+        for y in 0..20 {
+            for x in 0..60 {
+                let rgb = if x < 20 {
+                    [1.0, 0.0, 0.0]
+                } else if x < 40 {
+                    [0.0, 1.0, 0.0]
+                } else {
+                    [0.0, 0.0, 1.0]
+                };
+                source.set(x, y, [rgb[0], rgb[1], rgb[2], 1.0]);
+            }
+        }
+        let grain = [("tweaking/intensity", num(3.0))];
+        let base = run("ec.noise.addgrain", &grain, source.clone(), 0.0).img;
+        let matched = run(
+            "ec.noise.addgrain",
+            &[grain.as_slice(), &[(GRAIN_MATCH_AMOUNT, num(100.0)), (GRAIN_MATCH_COLOR, crate::col(1.0, 0.0, 0.0))]].concat(),
+            source.clone(),
+            0.0,
+        )
+        .img;
+        for y in 0..20 {
+            for x in 0..60 {
+                let i = (y * 60 + x) as usize;
+                assert_eq!(matched.data[i], if x < 20 { source.data[i] } else { base.data[i] });
+            }
+        }
+        let off = run(
+            "ec.noise.addgrain",
+            &[grain.as_slice(), &[(GRAIN_MATCH_AMOUNT, num(100.0)), (GRAIN_MATCH_COLOR, crate::col(1.0, 0.0, 0.0)), (GRAIN_MATCH_MODE, num(1.0))]].concat(),
+            source,
+            0.0,
+        )
+        .img;
+        assert_eq!(off, base);
     }
 
     #[test]

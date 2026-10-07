@@ -2,6 +2,7 @@
 //! shortcut and viewer/timeline gesture maps to one of these.
 
 mod align;
+mod aep;
 mod align_data;
 mod anim;
 pub mod anim_tools;
@@ -170,6 +171,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(key_transform::specs());
         v.extend(file_more::specs());
         v.extend(lottie::specs());
+        v.extend(aep::specs());
         v.extend(timeline::specs());
         v.extend(comp_more::specs());
         v.extend(frame_export::specs());

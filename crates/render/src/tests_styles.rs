@@ -407,7 +407,7 @@ fn gradient_glow_uses_gradient() {
         set(
             l,
             "outerGlow/colors",
-            Value::Gradient(Gradient { colors: vec![(0.0, [1.0, 0.0, 0.0, 1.0]), (1.0, [0.0, 0.0, 1.0, 1.0])], opacities: vec![(0.0, 1.0), (1.0, 0.0)] }),
+            Value::Gradient(Gradient { colors: vec![(0.0, [1.0, 0.0, 0.0, 1.0]), (1.0, [0.0, 0.0, 1.0, 1.0])], opacities: vec![(0.0, 1.0), (1.0, 0.0)], ..Default::default() }),
         );
     });
     let img = render(&p, cid);

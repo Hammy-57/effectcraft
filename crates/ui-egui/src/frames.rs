@@ -179,7 +179,7 @@ pub struct RenderSource {
     pub footage: Arc<dyn FootageSource>,
     pub expr: Option<Arc<dyn ExprHost>>,
     pub layer_cache: Arc<LayerCache>,
-    /// GPU compositor on the viewer's device (Mercury GPU Acceleration), if available.
+    /// GPU compositor (Mercury GPU Acceleration), if available.
     pub gpu: Option<Gpu>,
     /// Keep GPU frames on the GPU for the viewer (native egui-wgpu textures). Off on the
     /// desktop: Show Channel / exposure / region-of-interest drawing read the CPU frame texture,

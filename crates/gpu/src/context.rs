@@ -524,6 +524,11 @@ impl GpuContext {
             .request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, ..Default::default() })
             .await
             .map_err(|e| format!("no adapter: {e}"))?;
+        Self::request_on_adapter(&adapter).await
+    }
+
+    /// Request a separate device on an existing adapter (the desktop window's adapter).
+    pub async fn request_on_adapter(adapter: &wgpu::Adapter) -> Result<GpuContext, String> {
         let limits = adapter.limits();
         let required_limits = wgpu::Limits {
             max_texture_dimension_2d: limits.max_texture_dimension_2d.min(16384),
@@ -544,7 +549,7 @@ impl GpuContext {
             #[cfg(not(test))]
             log::error!("wgpu: {e}")
         }));
-        GpuContext::new(&adapter, device, queue)
+        GpuContext::new(adapter, device, queue)
     }
 
     /// A device of its own on the best adapter (CLI, tests, benchmarks). `None` when no

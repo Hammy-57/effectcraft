@@ -40,6 +40,28 @@ use state::UiState;
 use theme::Tokens;
 
 const SCREENSHOT_TIMEOUT_S: f64 = 4.0;
+
+fn compositor_gpu(adapter: &eframe::wgpu::Adapter, device: eframe::wgpu::Device, queue: eframe::wgpu::Queue) -> Result<effectcraft_gpu::Gpu, String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (device, queue);
+        pollster::block_on(effectcraft_gpu::Gpu::request_on_adapter(adapter))
+    }
+    #[cfg(target_arch = "wasm32")]
+    effectcraft_gpu::Gpu::new(adapter, device, queue)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[test]
+fn compositor_does_not_share_the_window_surface_device() {
+    // Surface::configure waits for its device to go idle. Frame workers submitting to that same
+    // device during a window move made wgpu panic with GpuWaitTimeout.
+    let instance = eframe::wgpu::Instance::default();
+    let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return };
+    let Ok((device, queue)) = pollster::block_on(adapter.request_device(&Default::default())) else { return };
+    let gpu = compositor_gpu(&adapter, device.clone(), queue).unwrap();
+    assert_ne!(gpu.device(), &device);
+}
 /// Seconds without a project change before paused prefetch resumes (see
 /// [`EffectcraftApp::editing`]).
 const EDIT_QUIET: f64 = 0.3;
@@ -451,8 +473,9 @@ impl EffectcraftApp {
             && self.ui.viewer.extended.is_none()
     }
 
-    /// Set up the GPU compositor on egui-wgpu's device (once). Without an adapter that runs
-    /// compute shaders (WebGL2, software GL) everything stays on the CPU.
+    /// Set up the GPU compositor (once). Desktop frame workers use their own device so their
+    /// submissions cannot race egui-wgpu's surface reconfiguration during window moves/resizes.
+    /// Without an adapter that runs compute shaders, everything stays on the CPU.
     pub(crate) fn init_gpu(&mut self, frame: &eframe::Frame) {
         if self.gpu_checked {
             return;
@@ -461,7 +484,7 @@ impl EffectcraftApp {
         let Some(rs) = frame.wgpu_render_state() else { return };
         // Backend validation can panic on shader compilation even when device creation
         // succeeded. Keep the document and the egui renderer, and use CPU compositing.
-        let gpu = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| effectcraft_gpu::Gpu::new(&rs.adapter, rs.device.clone(), rs.queue.clone())));
+        let gpu = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compositor_gpu(&rs.adapter, rs.device.clone(), rs.queue.clone())));
         match gpu {
             Ok(Ok(g)) => {
                 log::info!("GPU compositor: {}", effectcraft_engine::render::Accelerator::name(&g));

@@ -167,6 +167,7 @@ struct Shading {
     diffuse: f32,
     specular: f32,
     shininess: f32,
+    metal: f32,
 }
 
 impl Shading {
@@ -179,6 +180,7 @@ impl Shading {
             diffuse: ctx.params.f("diffuse") as f32 / 100.0,
             specular: ctx.params.f("specular") as f32 / 100.0,
             shininess: 1.0 / (ctx.params.f("roughness") as f32).max(0.001),
+            metal: (ctx.params.f("metal") as f32 / 100.0).clamp(0.0, 1.0),
         }
     }
     /// Shade a premultiplied texel with surface normal `n`.
@@ -193,7 +195,8 @@ impl Shading {
         let mut o = [0.0f32; 3];
         for i in 0..3 {
             let lc = self.color[i] * self.intensity;
-            o[i] = c[i] * (self.ambient + self.diffuse * nl * lc) + spec * lc;
+            let highlight = lc * (1.0 - self.metal) + c[i] * self.intensity * self.metal;
+            o[i] = c[i] * (self.ambient + self.diffuse * nl * lc) + spec * highlight;
         }
         premul(o, a)
     }
@@ -217,14 +220,76 @@ fn texel(src: &Image, rect: (f64, f64, f64, f64), u: f64, v: f64) -> Px {
 fn cylinder(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let rect = layer_rect(ctx, &b);
     let (_, _, w, h) = rect;
-    let r = (ctx.params.f("radius") / 100.0 * w / std::f64::consts::TAU).max(0.5);
-    let c = b.to_px(ctx.params.v2("position"));
+    if w <= 0.0 || h <= 0.0 {
+        return b;
+    }
+    let position = [ctx.params.f("positionX"), ctx.params.f("positionY"), ctx.params.f("positionZ")];
+    if !position.iter().all(|v| v.is_finite()) {
+        return b;
+    }
+    let position_z = position[2] * b.scale;
+    let camera_distance = w.max(h) * 2.0;
+    if !camera_distance.is_finite() || camera_distance <= 0.0 {
+        return b;
+    }
+    let perspective = (camera_distance / (camera_distance + position_z).max(camera_distance * 0.1)).clamp(0.1, 10.0);
+    let r = (ctx.params.f("radius") / 100.0 * w / std::f64::consts::TAU * perspective).max(0.5);
+    let ch = h * perspective;
+    let mut c = b.to_px(ctx.params.v2("position"));
+    c.0 += position[0] * b.scale;
+    c.1 += position[1] * b.scale;
     let spin = ctx.params.f("rotation").to_radians();
     let mode = ctx.params.e("render");
     let sh = Shading::from(ctx);
     let src = b.img.clone();
+    let angles = [ctx.params.f("rotationX"), ctx.params.f("rotationY"), ctx.params.f("rotationZ")];
+    if !angles.iter().all(|a| a.is_finite()) {
+        return b;
+    }
+    if angles.iter().any(|a| a.abs() > 1e-9) {
+        let m = rot_xyz(angles[0], angles[1], angles[2]);
+        b.img.rows_mut().for_each(|(y, row)| {
+            let py = y as f64 + 0.5 - c.1;
+            for (x, px) in row.iter_mut().enumerate() {
+                let px0 = x as f64 + 0.5 - c.0;
+                // Intersect a view ray (parallel to Z) with the rotated cylinder side.
+                let (ax, az) = (m[2][0], m[2][2]);
+                let (bx, bz) = (m[0][0] * px0 + m[1][0] * py, m[0][2] * px0 + m[1][2] * py);
+                let qa = ax * ax + az * az;
+                let qb = 2.0 * (ax * bx + az * bz);
+                let qc = bx * bx + bz * bz - r * r;
+                let disc = qb * qb - 4.0 * qa * qc;
+                if qa < 1e-10 || !disc.is_finite() || disc < 0.0 {
+                    *px = [0.0; 4];
+                    continue;
+                }
+                let d = disc.sqrt();
+                let hit = |z: f64, inside: bool| {
+                    let ly = m[0][1] * px0 + m[1][1] * py + m[2][1] * z;
+                    if ly.abs() > ch * 0.5 {
+                        return [0.0; 4];
+                    }
+                    let lx = bx + ax * z;
+                    let lz = bz + az * z;
+                    let u = lx.atan2(lz) / std::f64::consts::TAU + spin / std::f64::consts::TAU + 0.5;
+                    let v = ly / ch + 0.5;
+                    let sign = if inside { -1.0 } else { 1.0 };
+                    let n = [sign * (m[0][0] * lx + m[0][2] * lz) / r, sign * (m[1][0] * lx + m[1][2] * lz) / r, sign * (m[2][0] * lx + m[2][2] * lz) / r];
+                    sh.shade(texel(&src, rect, u, v), n)
+                };
+                let front = hit((-qb + d) / (2.0 * qa), false);
+                let back = hit((-qb - d) / (2.0 * qa), true);
+                *px = match mode {
+                    1 => front,
+                    2 => back,
+                    _ => over(front, back),
+                };
+            }
+        });
+        return b;
+    }
     b.img.rows_mut().for_each(|(y, row)| {
-        let v = (y as f64 + 0.5 - c.1) / h + 0.5;
+        let v = (y as f64 + 0.5 - c.1) / ch + 0.5;
         for (x, px) in row.iter_mut().enumerate() {
             let s = (x as f64 + 0.5 - c.0) / r;
             if s.abs() >= 1.0 {
@@ -361,7 +426,13 @@ pub fn specs() -> Vec<EffectSpec> {
     let mut cyl = vec![
         p("radius", "Radius", num(100.0), slider(0.0, 400.0, 0.0, 200.0, 1)),
         p("position", "Position", pt(0.5, 0.5), ParamUi::Point),
+        p("positionX", "Position X", num(0.0), slider(-10000.0, 10000.0, -2000.0, 2000.0, 1)),
+        p("positionY", "Position Y", num(0.0), slider(-10000.0, 10000.0, -2000.0, 2000.0, 1)),
+        p("positionZ", "Position Z", num(0.0), slider(-10000.0, 10000.0, -2000.0, 2000.0, 1)),
         p("rotation", "Rotation", num(0.0), ParamUi::Angle),
+        p("rotationX", "Rotation X", num(0.0), ParamUi::Angle),
+        p("rotationY", "Rotation Y", num(0.0), ParamUi::Angle),
+        p("rotationZ", "Rotation Z", num(0.0), ParamUi::Angle),
         p("render", "Render", Value::Enum(0), render()),
     ];
     cyl.extend(shading());
@@ -374,6 +445,7 @@ pub fn specs() -> Vec<EffectSpec> {
         p("render", "Render", Value::Enum(0), render()),
     ];
     sph.extend(shading());
+    sph.push(p("metal", "Metal", num(100.0), slider(0.0, 100.0, 0.0, 100.0, 1)));
     vec![
         spec(
             "ec.perspective.bevelalpha",
@@ -518,6 +590,16 @@ mod tests {
     }
 
     #[test]
+    fn sphere_metal_tints_specular_with_texture() {
+        let img = Image::filled(64, 64, [0.8, 0.1, 0.1, 1.0]);
+        let common = [("radius", num(20.0)), ("ambient", num(0.0)), ("diffuse", num(0.0)), ("specular", num(100.0)), ("lightHeight", num(90.0))];
+        let plastic = run("ec.perspective.ccsphere", &img, &[&common[..], &[("metal", num(0.0))]].concat()).img.get(32, 32);
+        let metal = run("ec.perspective.ccsphere", &img, &[&common[..], &[("metal", num(100.0))]].concat()).img.get(32, 32);
+        assert!((plastic[0] - plastic[1]).abs() < 0.01, "light-coloured plastic highlight {plastic:?}");
+        assert!(metal[0] > metal[1] * 5.0, "texture-coloured metal highlight {metal:?}");
+    }
+
+    #[test]
     fn cylinder_width_follows_radius() {
         let img = Image::filled(100, 20, [0.5, 0.5, 0.5, 1.0]);
         let out = run("ec.perspective.cccylinder", &img, &[]).img;
@@ -525,6 +607,27 @@ mod tests {
         assert!(out.get(50, 10)[3] > 0.99);
         assert!(out.get(50 + 14, 10)[3] > 0.99);
         assert_eq!(out.get(50 + 18, 10)[3], 0.0);
+    }
+
+    #[test]
+    fn cylinder_xyz_rotations_change_geometry_and_texture() {
+        let mut img = Image::new(80, 60);
+        for y in 0..60 {
+            for x in 0..80 {
+                img.set(x, y, [x as f32 / 80.0, y as f32 / 60.0, 0.5, 1.0]);
+            }
+        }
+        let base = run("ec.perspective.cccylinder", &img, &[]).img;
+        for id in ["rotationX", "rotationY", "rotationZ"] {
+            let rotated = run("ec.perspective.cccylinder", &img, &[(id, num(45.0))]).img;
+            assert!(rotated.data.iter().any(|p| p[3] > 0.0), "{id} should leave a visible cylinder");
+            assert!(base.data.iter().zip(&rotated.data).any(|(a, b)| (a[0] - b[0]).abs() + (a[3] - b[3]).abs() > 0.01), "{id} must affect rendering");
+        }
+        let moved = run("ec.perspective.cccylinder", &img, &[("positionX", num(20.0)), ("positionY", num(8.0))]).img;
+        assert!(base.data.iter().zip(&moved.data).any(|(a, b)| (a[3] - b[3]).abs() > 0.5), "position X/Y must move the cylinder");
+        let far = run("ec.perspective.cccylinder", &img, &[("positionZ", num(200.0))]).img;
+        let area = |image: &Image| image.data.iter().filter(|p| p[3] > 0.5).count();
+        assert!(area(&far) < area(&base), "positive Z must move the cylinder away");
     }
 
     #[test]
