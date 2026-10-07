@@ -8,6 +8,7 @@ import base64
 import hashlib
 import json
 import math
+import struct
 import sys
 import unicodedata
 from enum import Enum
@@ -55,6 +56,65 @@ class Exporter:
         except Exception as exc:
             self.loss(scope + "/" + name, "read_error", f"{type(exc).__name__}: {exc}")
             return default
+
+    @staticmethod
+    def puppet_mesh(data):
+        """Decode the two observed v2 PEdt topology layouts, rejecting ambiguous bytes."""
+        if len(data) < 29 or data[:9] != b"\x0a\xd0\xbe\xef\x00\x00\x00\x02\x01":
+            return None
+        vertices, indices, _, _ = struct.unpack_from(">4I", data, 13)
+        if not (3 <= vertices <= 20_000 and 3 <= indices <= 120_000 and indices % 3 == 0):
+            return None
+        vertex_end = 29 + 16 * vertices
+        if vertex_end > len(data) or len(data) > 8_000_000:
+            return None
+        points = [struct.unpack_from(">2d", data, 29 + 16 * i) for i in range(vertices)]
+        if any(not math.isfinite(x) or abs(x) > 1_000_000 for point in points for x in point):
+            return None
+        # PEdt embeds other data between the rest vertices and topology. Its
+        # topology begins on the same 4-byte phase as the vertex block.
+        for offset in range(vertex_end, len(data) - 4 * indices + 1, 4):
+            first = struct.unpack_from(">3I", data, offset)
+            if any(i >= vertices for i in first):
+                continue
+            edge = first[0] == first[2]
+            # Edge layout stores (a,b,a,c,b,c) for each face; the header's
+            # index count remains three per face, so the byte stream doubles it.
+            stored = 2 * indices if edge else indices
+            if offset + 4 * stored > len(data):
+                continue
+            preview = struct.unpack_from(f">{min(12, stored)}I", data, offset)
+            if any(i >= vertices for i in preview):
+                continue
+            if edge and any(preview[i] != preview[i + 2] or preview[i + 1] != preview[i + 4] or preview[i + 3] != preview[i + 5] for i in range(0, len(preview) - 5, 6)):
+                continue
+            if not edge and any(len(set(preview[i:i + 3])) != 3 for i in range(0, len(preview) - 2, 3)):
+                continue
+            values = struct.unpack_from(f">{stored}I", data, offset)
+            if any(i >= vertices for i in values):
+                continue
+            if edge:
+                groups = [values[i:i + 6] for i in range(0, stored, 6)]
+                if any(a != c or b != e or d != f for a, b, c, d, e, f in groups):
+                    continue
+                triangles = [(a, d, b) for a, b, _, d, _, _ in groups]
+            else:
+                triangles = [values[i:i + 3] for i in range(0, indices, 3)]
+            if not triangles or any(len({a, b, c}) != 3 or
+                    (points[b][0] - points[a][0]) * (points[c][1] - points[a][1]) -
+                    (points[b][1] - points[a][1]) * (points[c][0] - points[a][0]) <= 1e-7
+                    for a, b, c in triangles):
+                continue
+            return {"vertices": points, "triangles": triangles}
+        return None
+
+    def puppet_state(self, node, name, data, scope):
+        if data is None:
+            return
+        if len(data) > 8_000_000:
+            self.loss(scope, "puppet_state", f"oversized {name} state")
+            return
+        node[name] = base64.b64encode(data).decode("ascii")
 
     def scan_fonts(self, root):
         index = {}
@@ -246,6 +306,34 @@ class Exporter:
             children = self.read(prop, "properties", here, []) or []
             node["children"] = [self.property(child, path + [i], here)
                                 for i, child in enumerate(children, 1)]
+            tdgp = getattr(prop, "_tdgp", None)
+            if node["match_name"] == "ADBE FreePin3 ARAP Group" and tdgp is not None:
+                outline = next((c.data for c in tdgp.chunks if c.chunk_type == "fpol"), None)
+                self.puppet_state(node, "fpol_b64", outline, here)
+            if node["match_name"] == "ADBE FreePin3 Mesh Atom" and tdgp is not None:
+                state = next((c.data for c in tdgp.chunks if c.chunk_type == "fpms"), None)
+                self.puppet_state(node, "fpms_b64", state, here)
+            if node["match_name"] == "ADBE FreePin3 Mesh Group" and tdgp is not None:
+                for child, child_node in zip(children, node["children"]):
+                    if child_node["match_name"] != "ADBE FreePin3 Mesh Atom":
+                        continue
+                    position = next((i for i, chunk in enumerate(tdgp.chunks)
+                                     if chunk is getattr(child, "_tdgp", None)), None)
+                    if position is None:
+                        continue
+                    following = []
+                    for chunk in tdgp.chunks[position + 1:]:
+                        if isinstance(chunk, ListChunk) and chunk.list_type == "tdgp":
+                            break
+                        following.append(chunk)
+                    state = next((c.data for c in following if c.chunk_type == "PEdt"), None)
+                    if state is not None:
+                        self.puppet_state(child_node, "pedt_b64", state, here)
+                        geometry = self.puppet_mesh(state)
+                        if geometry is not None:
+                            child_node["mesh_geometry"] = geometry
+                        elif len(state) != 30:
+                            self.loss(here, "puppet_mesh", "unsupported or malformed PEdt topology")
         else:
             raw_value = self.read(prop, "value", here)
             default_gradient = False
