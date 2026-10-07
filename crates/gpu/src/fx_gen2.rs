@@ -362,7 +362,8 @@ fn text(e: &mut Enc, id: &str, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
 
 fn radio_waves(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
     let cpu = cpu_buf(e, &b, false)?;
-    let Some(plan) = effectcraft_effects::radio_plan(ctx, &cpu) else { return Some(b) };
+    // No waves: the CPU effect clears the layer.
+    let plan = effectcraft_effects::radio_plan(ctx, &cpu)?;
     let n = plan.waves.len();
     let mut data = Vec::with_capacity(n * 13);
     let mut outlines = Vec::new();
