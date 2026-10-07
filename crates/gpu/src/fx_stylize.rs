@@ -960,15 +960,7 @@ pub(crate) fn transform_blur(ctx: &EffectCtx) -> bool {
 
 /// distort::transform_matrix.
 fn transform_matrix(pr: &effectcraft_effects::Params, b: &GBuf) -> Mat3 {
-    let anchor = b.to_px(pr.v2("anchor"));
-    let pos = b.to_px(pr.v2("position"));
-    let sh = pr.f("scaleHeight");
-    let sw = if pr.b("uniform") { sh } else { pr.f("scaleWidth") };
-    Mat3::translate(vec2(pos.0, pos.1))
-        * Mat3::rotate_deg(pr.f("rotation"))
-        * Mat3::skew_deg(pr.f("skew"), pr.f("skewAxis"))
-        * Mat3::scale(vec2(sw / 100.0, sh / 100.0))
-        * Mat3::translate(vec2(-anchor.0, -anchor.1))
+    effectcraft_effects::transform_effect_matrix(pr, b.to_px(pr.v2("anchor")), b.to_px(pr.v2("position")))
 }
 
 /// distort::transform's motion blur: the transform at Samples instants across the shutter,
@@ -979,6 +971,14 @@ pub(crate) fn transform(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBu
     let sampling = if ctx.params.e("sampling") == 1 { Sampling::Bicubic } else { Sampling::Bilinear };
     let fd = 1.0 / ctx.fps();
     let (w, h) = (b.img.width, b.img.height);
+    // Content carried past the buffer edges grows the CPU buffer; render that case there.
+    let ms: Vec<Mat3> = (0..n)
+        .filter_map(|k| host.params_at(ctx.time + (phase + angle * k as f64 / (n - 1) as f64) / 360.0 * fd))
+        .map(|pr| transform_matrix(&pr, &b))
+        .collect();
+    if effectcraft_effects::transform_extent(ctx.adjustment, (w, h), &ms) != (0, 0, w, h) {
+        return None;
+    }
     let mut acc = e.image(w, h);
     let mut count = 0u32;
     for k in 0..n {

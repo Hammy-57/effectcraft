@@ -138,7 +138,16 @@ fn four_color(ctx: &EffectCtx, mut b: Buf) -> Buf {
                 let n = (effectcraft_raster::hash_noise(x as u32, y as u32, seed) - 0.5) * jitter * (8.0 / 255.0);
                 c = c.map(|v| v + n);
             }
-            *px = gen_blend(*px, [c[0] * op, c[1] * op, c[2] * op, op], mode);
+            *px = if gen_mode(mode).is_none() {
+                // None recolours the layer: the gradient takes the layer's own alpha (AE colours
+                // a stroked ring or text, not its whole canvas) and Opacity mixes it with the
+                // original.
+                let a = px[3];
+                let g = [c[0] * a, c[1] * a, c[2] * a, a];
+                std::array::from_fn(|i| px[i] + (g[i] - px[i]) * op)
+            } else {
+                gen_blend(*px, [c[0] * op, c[1] * op, c[2] * op, op], mode)
+            };
         }
     });
     b
@@ -485,9 +494,14 @@ mod generator_tests {
             .collect();
         let mut half = pts.clone();
         half.push(("opacity", num(50.0)));
-        // None: the gradient alone at half opacity.
-        let o = run_fx("ec.generate.fourcolor", &half, red(), 0.0, EffectEnv::default());
-        assert!((o.img.get(16, 16)[3] - 0.5).abs() < 1e-3);
+        // None recolours the layer within its own alpha: half opacity mixes with the original
+        // and an empty pixel stays empty (SceneYard UI 3 Stages: a stroked ring, not a square).
+        let mut ring = red();
+        ring.set(2, 2, [0.0; 4]);
+        let o = run_fx("ec.generate.fourcolor", &half, ring, 0.0, EffectEnv::default());
+        assert!((o.img.get(16, 16)[3] - 1.0).abs() < 1e-3);
+        assert!(o.img.get(16, 16)[0] < 0.9, "mixed with the gradient {:?}", o.img.get(16, 16));
+        assert_eq!(o.img.get(2, 2), [0.0; 4]);
         // Normal: over the opaque layer.
         half.push(("blendingMode", Value::Enum(1)));
         let o = run_fx("ec.generate.fourcolor", &half, red(), 0.0, EffectEnv::default());

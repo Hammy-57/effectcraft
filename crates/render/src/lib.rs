@@ -955,8 +955,15 @@ impl<'a> Renderer<'a> {
             let env = EffectEnv { effect_index: i, ..env };
             let ectx = EffectCtx { params: &params, time: lt.seconds(), layer_size, seed: g.uid as u32, adjustment, env };
             let t0 = web_time::Instant::now();
-            target.cpu(&mut |buf| {
+            let d = shape_fx_origin(ctx, layer).map(|d| [d[0] * self.opts.scale, d[1] * self.opts.scale]);
+            target.cpu(&mut |mut buf| {
+                if let Some(d) = d {
+                    buf.offset = [buf.offset[0] - d[0], buf.offset[1] - d[1]];
+                }
                 let mut buf = effectcraft_effects::apply(spec, &ectx, buf);
+                if let Some(d) = d {
+                    buf.offset = [buf.offset[0] + d[0], buf.offset[1] + d[1]];
+                }
                 // 8/16 bpc effects write integer pixels.
                 self.pipe.quantize(&mut buf.img);
                 buf
@@ -1728,7 +1735,17 @@ impl<'a> Renderer<'a> {
         let mut matte = Image::new(canvas.width, canvas.height);
         self.place(ctx, layer, &foot, &mut matte, BlendMode::Normal, 1.0);
         let o = self.roi_offset().map(|(x, y, _, _)| [-x, -y]).unwrap_or([0.0; 2]);
-        let mut below = Buf { img: canvas.clone(), offset: o, scale: self.opts.scale };
+        // The effects' points and sizes are in the adjustment layer's space: map a moved or
+        // uniformly scaled (unrotated 2D) layer onto the comp below; others keep comp space.
+        let (offset, scale) = match (layer.is_3d(), ctx.layer_to_comp(layer).0.0) {
+            (false, [[a, b, tx], [c, d, ty], [0.0, 0.0, 1.0]])
+                if b == 0.0 && c == 0.0 && a > 0.0 && (a - d).abs() < 1e-9 && tx.is_finite() && ty.is_finite() =>
+            {
+                ([o[0] + tx * self.opts.scale, o[1] + ty * self.opts.scale], self.opts.scale * a)
+            }
+            _ => (o, self.opts.scale),
+        };
+        let mut below = Buf { img: canvas.clone(), offset, scale };
         // Effects run in the working space, not the linear blending space.
         if let Some(c) = self.pipe.from_blend() {
             color::convert(&mut below.img, &c);
@@ -1747,6 +1764,18 @@ impl<'a> Renderer<'a> {
             }
         });
     }
+}
+
+/// Where a shape layer's effect coordinates start, in layer units. After Effects renders a
+/// shape layer's effects on a comp-sized canvas centred on its anchor point, so effect points
+/// (a Transform effect's anchor, a ramp's start, a light sweep's centre…) are measured from
+/// that canvas's top-left corner rather than from the shape coordinates' origin.
+fn shape_fx_origin(ctx: &EvalCtx, layer: &Layer) -> Option<[f64; 2]> {
+    if !matches!(layer.source, LayerSource::Shape) {
+        return None;
+    }
+    let a = layer.transform().map(|tr| ctx.v3(layer, tr, "anchor", [0.0; 3])).unwrap_or([0.0; 3]);
+    Some([ctx.comp.width as f64 / 2.0 - a[0], ctx.comp.height as f64 / 2.0 - a[1]])
 }
 
 /// A layer ready to composite (see [`Renderer::styled_layer`]).

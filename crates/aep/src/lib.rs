@@ -1277,6 +1277,9 @@ fn import_native_effect_params(
             losses.push(format!("{context}: unsupported {effect_id} value {raw}"));
             continue;
         };
+        if unauthored_raw_default_point(child, &value) {
+            continue; // Keep the native default (the same layer-relative point).
+        }
         // Match each effect's native opacity unit before importing static and keyed values.
         let scale = if effect_id == "ec.perspective.dropshadow" && path == "opacity" {
             100.0 / 255.0
@@ -1305,6 +1308,16 @@ fn import_native_effect_params(
             fill_property(prop, child, value, value_type, scale, layer_time, losses, context);
         }
     }
+}
+
+/// An unauthored effect point that py-aep reports in AE's raw fixed-point units (the layer
+/// centre 540, 960 as 54000, 96000; SceneYard Photos Collage's CC Vignette centre): no layer
+/// is that large, so the native default stands in for it.
+fn unauthored_raw_default_point(ir: &Json, value: &Value) -> bool {
+    boolean(ir, &["authored"]) == Some(false)
+        && array(ir, "keyframes").is_empty()
+        && string(ir, &["expression"]).unwrap_or("").is_empty()
+        && matches!(value, Value::Vec2(v) if v.iter().any(|c| c.abs() >= 10_000.0))
 }
 
 fn fill_property(prop: &mut Property, ir: &Json, value: Value, value_type: &str, scale: f64, layer_time: LayerTime, losses: &mut Vec<String>, context: &str) {
@@ -1719,6 +1732,22 @@ mod tests {
         let mut project = Project::default();
         let result = import_ir(&mut project, ir.to_string().as_bytes(), "", &mut |_| None).unwrap();
         assert_eq!(result.losses.iter().filter(|loss| loss.contains("CC Sphere metal specular approximation")).count(), 1);
+    }
+
+    #[test]
+    fn unauthored_raw_fixed_point_effect_points_keep_the_native_default() {
+        // SceneYard Photos Collage: CC Vignette's unauthored centre arrives as 54000, 96000.
+        let mut project = Project::default();
+        let spec = effectcraft_effects::find("ec.stylize.ccvignette").unwrap();
+        let mut effect = effectcraft_effects::instantiate(spec, &mut build::Ids(&mut project.next_id), "CC Vignette", [1080.0, 1920.0]);
+        let ir = serde_json::json!({"children":[
+            {"kind":"property","match_name":"CS Vignette-0001","authored":true,"value":39.0},
+            {"kind":"property","match_name":"CS Vignette-0003","authored":false,"value":[54000.0, 96000.0]}
+        ]});
+        let mut losses = Vec::new();
+        import_native_effect_params(&mut project, &mut effect, &ir, &ir, spec.id, LayerTime { start: Tick::ZERO, stretch: 100.0 }, &mut losses, "test", 0);
+        assert_eq!(effect.prop("center").unwrap().value, Value::Vec2([540.0, 960.0]));
+        assert_eq!(effect.prop("amount").unwrap().value, Value::Scalar(39.0));
     }
 
     #[test]

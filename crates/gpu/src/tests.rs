@@ -566,7 +566,8 @@ fn gpu_effects_match_cpu() {
     effect_case("ec.channel.invert", &[]);
     effect_case("ec.channel.invert", &[("channel", Value::Enum(effectcraft_effects::INVERT_ALPHA)), ("blend", n(30.0))]);
     effect_case("ec.channel.invert", &[("channel", Value::Enum(2))]);
-    effect_case("ec.distort.transform", &[("rotation", n(20.0)), ("scaleHeight", n(80.0)), ("skew", n(10.0)), ("opacity", n(70.0))]);
+    // Kept inside the buffer: content carried past its edges grows the buffer on the CPU.
+    effect_case("ec.distort.transform", &[("rotation", n(20.0)), ("scaleHeight", n(50.0)), ("skew", n(10.0)), ("opacity", n(70.0))]);
 }
 
 /// A chain of GPU effects (one upload, quantised between steps) and a non-GPU effect in the

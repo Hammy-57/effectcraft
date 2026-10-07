@@ -214,6 +214,12 @@ pub fn selected_layer_doc(doc: &Doc, index: usize, name: &str, bounds: Option<[f
         if [x0, y0, x1, y1].iter().any(|v| !v.is_finite() || v.abs() > 1_000_000.0) || x1 <= x0 || y1 <= y0 || x1 - x0 > 30000.0 || y1 - y0 > 30000.0 {
             return Err("invalid vector source layer crop bounds".into());
         }
+        // AE saves the layer's bounds in PDF user space (y up, as Illustrator measures them):
+        // map them through the page transform into the document's top-down pixels.
+        let [m0, m1, m2, m3, m4, m5] = doc.root.transform.as_coeffs();
+        let page = |x: f64, y: f64| (m0 * x + m2 * y + m4, m1 * x + m3 * y + m5);
+        let (a, b) = (page(x0, y0), page(x1, y1));
+        let (x0, y0, x1, y1) = (a.0.min(b.0), a.1.min(b.1), a.0.max(b.0), a.1.max(b.1));
         selected.width = (x1 - x0).ceil();
         selected.height = (y1 - y0).ceil();
         selected.root.transform = Affine::translate((-x0, -y0)) * selected.root.transform;

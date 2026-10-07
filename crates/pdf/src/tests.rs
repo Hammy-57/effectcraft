@@ -518,6 +518,12 @@ fn saved_layer_crop_selects_pixels_in_document_coordinates() {
     // PDF y-flip stays inside the new document-space translation.
     let pixel = px(&selected, 5, 5);
     assert!(pixel[0] > 0.99 && pixel[1] < 0.01 && pixel[3] > 0.99);
+    // The bounds are in PDF user space (y up, as AE saves them; SceneYard Retro Desktop's
+    // title bar sits at y 3333..3471 of a 4141-high page, i.e. near the top): the top of the
+    // clipped red art (y 85..90) is inside, the empty band above it (y 90..95) too.
+    let top = selected_layer_doc(&doc, 1, "Art", Some([0.0, 85.0, 50.0, 95.0])).unwrap();
+    assert!(px(&top, 15, 7)[0] > 0.99, "{:?}", px(&top, 15, 7));
+    assert!(px(&top, 15, 2)[3] < 0.01, "{:?}", px(&top, 15, 2));
     assert!(selected_layer_doc(&doc, usize::MAX, "", None).is_err());
     let shifted = selected_layer_doc(&doc, 99, "Art", None).unwrap();
     assert_eq!(layer_names(&shifted), ["Art"]);

@@ -98,7 +98,7 @@ fn bulge(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
     let rx = (ctx.params.f("hradius") * b.scale).max(1.0);
     let ry = (ctx.params.f("vradius") * b.scale).max(1.0);
     let c = b.to_px(ctx.params.v2("center"));
-    let h = ctx.params.f("height");
+    let h = ctx.params.f("height") * effectcraft_effects::BULGE_STRENGTH;
     let taper = 1.0 + ctx.params.f("taperRadius").max(0.0) / 100.0 * 3.0;
     let pin = ctx.params.b("pinAllEdges");
     let (lw, lh) = layer_wh(ctx);

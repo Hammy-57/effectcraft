@@ -190,6 +190,14 @@ pub fn paragraph_style(p: &ParaStyle, width: Option<f32>) -> ParagraphStyle {
         Justify::JustifyLastRight => (Align::Justify, Align::Right),
         Justify::JustifyAll => (Align::Justify, Align::Justify),
     };
+    // AE saves alignment relative to the reading direction: in a right-to-left paragraph
+    // "left" pins the line's start, its right edge.
+    let flip = |a: Align| match a {
+        Align::Left => Align::Right,
+        Align::Right => Align::Left,
+        other => other,
+    };
+    let (align, justify_last) = if p.direction == Direction::Rtl { (flip(align), flip(justify_last)) } else { (align, justify_last) };
     ParagraphStyle {
         align,
         justify_last,
@@ -198,11 +206,10 @@ pub fn paragraph_style(p: &ParaStyle, width: Option<f32>) -> ParagraphStyle {
         // The chosen direction is the paragraph's base direction (a left-to-right paragraph
         // starting with Arabic or Hebrew still runs left to right, as in After Effects).
         rtl: Some(p.direction == Direction::Rtl),
-        // AE keeps these paragraph values on point text but places its single line at the
-        // alignment origin; applying them shifts centred card labels away from their anchor.
-        indent_start: if width.is_some() { p.indent_left as f32 } else { 0.0 },
-        indent_end: if width.is_some() { p.indent_right as f32 } else { 0.0 },
-        indent_first: if width.is_some() { p.indent_first as f32 } else { 0.0 },
+        // Point text keeps them too; the layout applies AE's point-text rule.
+        indent_start: p.indent_left as f32,
+        indent_end: p.indent_right as f32,
+        indent_first: p.indent_first as f32,
         space_before: p.space_before as f32,
         space_after: p.space_after as f32,
         every_line: p.composer == Composer::EveryLine,
@@ -454,21 +461,53 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ae_point_text_alignment_ignores_saved_paragraph_indents() {
+    fn ae_point_text_centres_on_its_anchor_shifted_only_by_the_first_line_indent() {
         let mut doc = TextDoc { text: "MORE FREEDOM".into(), justify: Justify::Center, size: 66.0, ..Default::default() };
-        let plain = layout_doc(&doc);
+        let plain = layout_doc(&doc).layout.lines[0].x;
         doc.indent_left = 522.0;
         doc.indent_right = 94.0;
-        doc.indent_first = -12.0;
-        let indented = layout_doc(&doc);
-        assert_eq!(plain.bounds, indented.bounds, "AE point text stays centred at its layer anchor");
-        assert_eq!((doc.indent_left, doc.indent_right, doc.indent_first), (522.0, 94.0, -12.0));
+        let indented = layout_doc(&doc).layout.lines[0].x;
+        assert!((plain - indented).abs() < 1e-3, "AE point text stays centred at its layer anchor");
+        // SceneYard UI 3 Stages "Yard": first-line indent -102 moves the centred word 102 px left.
+        doc.indent_first = -102.0;
+        assert!((layout_doc(&doc).layout.lines[0].x - plain + 102.0).abs() < 1e-3);
         doc.box_size = Some([1088.0, 1072.0]);
         let area = layout_doc(&doc);
         doc.indent_left = 0.0;
         doc.indent_right = 0.0;
         doc.indent_first = 0.0;
         assert_ne!(area.layout.lines[0].x, layout_doc(&doc).layout.lines[0].x, "box text still uses indents");
+    }
+
+    #[test]
+    fn ae_rtl_left_justified_point_text_ends_at_its_start_indent() {
+        // SceneYard Photos Collage: a right-to-left paragraph saved "left" justified with
+        // Indent Before 552 / first line -12 ends 540 px left of the layer origin (its anchor
+        // sits on the word's middle), it does not start 106 px right of it.
+        let mut doc = TextDoc { text: "dieting".into(), justify: Justify::Left, size: 66.0, direction: Direction::Rtl, ..Default::default() };
+        doc.indent_left = 552.0;
+        doc.indent_first = -12.0;
+        doc.indent_right = 94.0;
+        let lay = layout_doc(&doc).layout;
+        let (x, w) = (lay.lines[0].x, lay.lines[0].width);
+        assert!((x + w + 540.0).abs() < 1e-3, "{x} {w}");
+    }
+
+    #[test]
+    fn ae_point_text_moves_by_the_indent_on_its_aligned_edge() {
+        // Left-aligned point text starts at Indent Before (+ first line); right-aligned ends at
+        // -Indent After (SceneYard "Effort": 607 px start indent, layer anchor on the shifted word).
+        let mut doc = TextDoc { text: "Effort".into(), justify: Justify::Left, size: 100.0, ..Default::default() };
+        let plain = layout_doc(&doc).layout.lines[0].x;
+        doc.indent_left = 607.0;
+        doc.indent_first = 3.0;
+        doc.indent_right = 159.0;
+        assert!((layout_doc(&doc).layout.lines[0].x - plain - 610.0).abs() < 1e-3);
+        doc.justify = Justify::Right;
+        let right = layout_doc(&doc).layout.lines[0].x;
+        doc.indent_right = 0.0;
+        let flush = layout_doc(&doc).layout.lines[0].x;
+        assert!((flush - right - 159.0).abs() < 1e-3);
     }
 
     #[test]

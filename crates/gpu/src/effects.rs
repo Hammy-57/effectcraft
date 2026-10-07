@@ -2,7 +2,6 @@
 //! radii, parameter conversions), with the pixel loops as compute kernels.
 
 use effectcraft_effects::{Buf, EffectCtx};
-use effectcraft_geom::{Mat3, vec2};
 use effectcraft_raster::Sampling;
 use effectcraft_render::FxStep;
 
@@ -345,16 +344,12 @@ fn transform(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     if ctx.env.host.is_some() && effectcraft_effects::transform_shutter(ctx).is_some() {
         return None;
     }
-    let anchor = b.to_px(ctx.params.v2("anchor"));
-    let pos = b.to_px(ctx.params.v2("position"));
-    let sh = ctx.params.f("scaleHeight");
-    let sw = if ctx.params.b("uniform") { sh } else { ctx.params.f("scaleWidth") };
+    let m = effectcraft_effects::transform_effect_matrix(ctx.params, b.to_px(ctx.params.v2("anchor")), b.to_px(ctx.params.v2("position")));
+    // Content carried past the buffer edges grows the CPU buffer; render that case there.
+    if effectcraft_effects::transform_extent(ctx.adjustment, (b.img.width, b.img.height), &[m]) != (0, 0, b.img.width, b.img.height) {
+        return None;
+    }
     let opacity = ctx.params.f("opacity") as f32 / 100.0;
-    let m = Mat3::translate(vec2(pos.0, pos.1))
-        * Mat3::rotate_deg(ctx.params.f("rotation"))
-        * Mat3::skew_deg(ctx.params.f("skew"), ctx.params.f("skewAxis"))
-        * Mat3::scale(vec2(sw / 100.0, sh / 100.0))
-        * Mat3::translate(vec2(-anchor.0, -anchor.1));
     let sampling = if ctx.params.e("sampling") == 1 { Sampling::Bicubic } else { Sampling::Bilinear };
     let empty = e.image(b.img.width, b.img.height);
     b.img = ops::warp(e, &empty, &b.img, &m, sampling, effectcraft_color::BlendMode::Normal, opacity, 0, None);

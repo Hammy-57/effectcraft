@@ -968,11 +968,18 @@ pub fn layout_rich_uncached(text: &str, runs: &[(Range<usize>, TextStyle)], para
             baseline += adv;
         }
         let shown = pl.content - pl.hang.0 - pl.hang.1;
-        let (ml, mr) = pl.margins;
+        let (ml, _) = pl.margins;
+        // Point text (no box, one line per paragraph): as in After Effects, the indent on the
+        // edge the alignment pins is applied (Indent Before for start-aligned lines, Indent
+        // After for end-aligned ones, neither for centred lines) and the first-line indent
+        // always moves the line along the reading direction.
+        let (rtl, fi) = (para.rtl == Some(true), para.indent_first);
         let shift = match (pl.avail, pl.align) {
-            (None, Align::Left | Align::Justify) => ml,
-            (None, Align::Center) => -shown / 2.0 + (ml - mr) / 2.0,
-            (None, Align::Right) => -shown - mr,
+            (None, Align::Left | Align::Justify) if rtl => para.indent_end - fi,
+            (None, Align::Left | Align::Justify) => para.indent_start + fi,
+            (None, Align::Center) => -shown / 2.0 + if rtl { -fi } else { fi },
+            (None, Align::Right) if rtl => -shown - para.indent_start - fi,
+            (None, Align::Right) => -shown - para.indent_end + fi,
             (Some(_), Align::Left | Align::Justify) => ml,
             (Some(a), Align::Center) => ml + (a - shown) / 2.0,
             (Some(a), Align::Right) => ml + a - shown,
