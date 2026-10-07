@@ -29,3 +29,13 @@ Imports reject any reported fidelity loss by default. Use `allowLosses: true`
 only to inspect an incomplete import while implementing a missing native feature.
 Missing footage remains an editable offline item with its original path so it
 can be relinked later.
+
+Layered Illustrator/PDF footage retains its saved source layer and fractional
+artwork bounds. Native rendering selects and crops the vector artwork; it does
+not bake the layer. These bindings survive saving, reopening, and replacement
+with another vector file. If empty layers shift the source index, a unique exact
+layer name resolves it; missing or ambiguous names and invalid crops are rejected.
+
+Opening and editing every corpus project is a structural check, not visual
+acceptance. Unsupported Puppet state, model lighting/cameras, effects and fonts
+still require separate validation against reference frames.

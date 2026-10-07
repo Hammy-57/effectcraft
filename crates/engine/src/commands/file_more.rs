@@ -802,7 +802,16 @@ fn replace_footage(s: &mut Session, p: &Value) -> Result<Value> {
     let path = str_p(p, "path").ok_or_else(|| bad("file.replaceFootage", "missing `path`"))?.to_string();
     let item = *items_p(s, p).first().ok_or_else(|| bad("file.replaceFootage", "select footage"))?;
     let importer = s.importer.clone().ok_or_else(|| EngineError::Other("media import is not available in this build".into()))?;
-    let f = importer.probe(&path).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    let mut f = importer.probe(&path).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    if matches!(f.codec.as_str(), "AI" | "PDF" | "EPS")
+        && let Some(ItemKind::Footage(previous)) = s.project.item(item).map(|it| &it.kind)
+        && previous.layer.as_ref().is_some_and(|layer| layer.crop_bounds.is_some())
+    {
+        f.layer = previous.layer.clone();
+        f.page = previous.page;
+        f.width = previous.width;
+        f.height = previous.height;
+    }
     let name = std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or(path.clone());
     s.edit("Replace Footage", None, |proj, _| {
         let it = proj.item_mut(item).ok_or_else(|| bad("file.replaceFootage", "no such item"))?;

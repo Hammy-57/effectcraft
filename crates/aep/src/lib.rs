@@ -232,8 +232,30 @@ pub fn import_ir(
                         .extension()
                         .and_then(|e| e.to_str())
                         .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "glb" | "gltf" | "obj"));
+                    let source_layer = item.get("source_layer").and_then(|raw| {
+                        let layer = serde_json::from_value::<effectcraft_project::SourceLayer>(raw.clone()).ok();
+                        match layer {
+                            Some(layer)
+                                if layer.index < 65535
+                                    && layer.crop_bounds.is_none_or(|b| {
+                                        b.iter().all(|v| v.is_finite() && v.abs() <= 1_000_000.0)
+                                            && b[2] > b[0]
+                                            && b[3] > b[1]
+                                            && b[2] - b[0] <= 30000.0
+                                            && b[3] - b[1] <= 30000.0
+                                    }) =>
+                            {
+                                Some(layer)
+                            }
+                            _ => {
+                                result.losses.push(format!("{name}: invalid footage source layer binding"));
+                                None
+                            }
+                        }
+                    });
                     ItemKind::Footage(Footage {
                         path: media_path,
+                        layer: source_layer,
                         kind: if model {
                             FootageKind::Model
                         } else if boolean(item, &["has_video"]) == Some(false) {
@@ -2029,6 +2051,49 @@ mod tests {
     }
 
     #[test]
+    fn shape_gradient_controls_render_saved_colors_and_keep_popup_keys() {
+        let gradient = serde_json::json!({"type":"Gradient","data":{
+            "color_stops":[
+                {"data":{"offset":0,"midpoint":0.5,"color":[0.02,0.05,0.1]}},
+                {"data":{"offset":1,"midpoint":0.5,"color":[0.12,0.15,0.2]}}
+            ],"alpha_stops":[{"data":{"offset":0,"midpoint":0.5,"alpha":1}},{"data":{"offset":1,"midpoint":0.5,"alpha":1}}]
+        }});
+        let ir = serde_json::json!({"schema_version":1,"items":[{"id":1,"kind":"comp","name":"Gradient","width":100,"height":100,"duration":2,"layers":[
+            {"id":2,"kind":"ShapeLayer","name":"Panel","timing":{"out_point":2},"properties":[
+                {"kind":"group","match_name":"ADBE Root Vectors Group","children":[
+                    {"kind":"group","match_name":"ADBE Vector Shape - Rect","children":[
+                        {"kind":"property","match_name":"ADBE Vector Rect Size","value":[100,100]}
+                    ]},
+                    {"kind":"group","match_name":"ADBE Vector Graphic - G-Fill","children":[
+                        {"kind":"property","match_name":"ADBE Vector Grad Colors","value":gradient},
+                        {"kind":"property","match_name":"ADBE Vector Grad Type","value":1,"keyframes":[{"time":0,"value":1},{"time":1,"value":2}]},
+                        {"kind":"property","match_name":"ADBE Vector Grad Start Pt","value":[-50,0]},
+                        {"kind":"property","match_name":"ADBE Vector Grad End Pt","value":[50,0]},
+                        {"kind":"property","match_name":"ADBE Vector Grad HiLite Length","value":20},
+                        {"kind":"property","match_name":"ADBE Vector Grad HiLite Angle","value":30},
+                        {"kind":"property","match_name":"ADBE Vector Fill Opacity","value":100}
+                    ]}
+                ]}
+            ]}
+        ]}]});
+        let mut project = Project::default();
+        let imported = import_ir(&mut project, ir.to_string().as_bytes(), "", &mut |_| None).unwrap();
+        assert!(imported.losses.is_empty(), "{:?}", imported.losses);
+        let comp = imported.primary_comp.unwrap();
+        let fill = project.comp(comp).unwrap().layers[0].props.sub("contents").unwrap().sub("gfill").unwrap();
+        assert!(matches!(fill.prop("colors").unwrap().value, Value::Gradient(_)));
+        assert_eq!(fill.prop("start").unwrap().value, Value::Vec2([-50.0, 0.0]));
+        assert_eq!(fill.prop("end").unwrap().value, Value::Vec2([50.0, 0.0]));
+        assert_eq!(fill.prop("highlightLength").unwrap().value.as_f64(), 20.0);
+        assert_eq!(fill.prop("highlightAngle").unwrap().value.as_f64(), 30.0);
+        assert_eq!(fill.prop("type").unwrap().keys.iter().map(|k| &k.value).collect::<Vec<_>>(), [&Value::Enum(0), &Value::Enum(1)]);
+        let frame = effectcraft_render::render_frame(&project, comp, Tick::ZERO, 1.0);
+        let visible: Vec<_> = frame.data.iter().filter(|p| p[3] > 0.9).collect();
+        assert!(!visible.is_empty());
+        assert!(visible.iter().all(|p| p[0] < 0.2 && p[2] > p[0]), "saved blue gradient must not fall back to white/black");
+    }
+
+    #[test]
     fn numeric_aep_track_matte_type_keeps_inversion() {
         let ir = serde_json::json!({"schema_version":1,"items":[{"id":1,"kind":"comp","name":"Main","width":100,"height":100,"duration":1,"layers":[
             {"id":2,"kind":"null","name":"Text","matte":{"layer_id":3,"type":5014}},
@@ -2038,6 +2103,37 @@ mod tests {
         let result = import_ir(&mut project, ir.to_string().as_bytes(), "", &mut |_| None).unwrap();
         let layer = &project.comp(result.primary_comp.unwrap()).unwrap().layers[0];
         assert!(matches!(layer.track_matte, Some(TrackMatte { kind: MatteKind::AlphaInverted, .. })));
+    }
+
+    #[test]
+    fn offline_vector_layer_binding_survives_native_reopen() {
+        let ir = serde_json::json!({"schema_version":1,"items":[
+            {"id":1,"kind":"footage","name":"Art/source.ai","file":"/missing/source.ai",
+             "width":21,"height":41,"has_video":true,
+             "source_layer":{"index":1,"name":"Art","layer_size":true,"crop_bounds":[20.25,20.5,40.5,60.75]}}
+        ]});
+        let mut project = Project::default();
+        let result = import_ir(&mut project, ir.to_string().as_bytes(), "", &mut |_| None).unwrap();
+        assert!(result.losses.is_empty(), "{:?}", result.losses);
+        assert_eq!(result.missing_media, ["/missing/source.ai"]);
+        let reopened = Project::from_json(&project.to_file_json().unwrap()).unwrap();
+        let footage = reopened
+            .items
+            .values()
+            .find_map(|item| match &item.kind {
+                ItemKind::Footage(f) => Some(f),
+                _ => None,
+            })
+            .unwrap();
+        assert!(footage.missing);
+        let binding = footage.layer.as_ref().unwrap();
+        assert_eq!(binding.index, 1);
+        assert_eq!(binding.name, "Art");
+        assert_eq!(binding.crop_bounds, Some([20.25, 20.5, 40.5, 60.75]));
+        let mut bad = ir;
+        bad["items"][0]["source_layer"]["crop_bounds"] = serde_json::json!([0, 0, -1, 40]);
+        let rejected = import_ir(&mut Project::default(), bad.to_string().as_bytes(), "", &mut |_| None).unwrap();
+        assert!(rejected.losses.iter().any(|s| s.contains("source layer binding")));
     }
 
     #[test]

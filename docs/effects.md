@@ -3,7 +3,7 @@
 <!-- Generated from the effect registry (crates/effects/src/catalog.rs); do not edit by hand.
      Regenerate: UPDATE_DOCS=1 cargo test -p effectcraft-effects --lib effects_doc_is_current -->
 
-EffectCraft ships 316 effects with 3169 parameters in total, grouped into the same categories as the Effects & Presets panel. Every effect is our own implementation, written from public behaviour descriptions and standard image-processing literature. Parameter names, order, popup options, units, defaults and ranges follow the reference application so that projects, expressions and muscle memory carry over.
+EffectCraft ships 316 effects with 3183 parameters in total, grouped into the same categories as the Effects & Presets panel. Every effect is our own implementation, written from public behaviour descriptions and standard image-processing literature. Parameter names, order, popup options, units, defaults and ranges follow the reference application so that projects, expressions and muscle memory carry over.
 
 - **GPU**: 280 effects also run on the GPU compositor with identical results.
 - **32**: 316 effects process 32-bit float (HDR, overbright) pixels without clamping.
@@ -111,7 +111,7 @@ Effects are addressed by id (`ec.<category>.<name>`) or display name in commands
 | Leave Color | `ec.color.leavecolor` | 5 | GPU | 32 | Implemented |
 | Levels | `ec.color.levels` | 36 | GPU | 32 | Implemented |
 | Levels (Individual Controls) | `ec.color.levelsic` | 27 | GPU | 32 | Implemented |
-| Lumetri Color | `ec.color.lumetri` | 66 | GPU | 32 | Implemented |
+| Lumetri Color | `ec.color.lumetri` | 78 | GPU | 32 | Implemented |
 | OCIO CDL Transform | `ec.color.ociocdl` | 12 | GPU | 32 | Implemented |
 | OCIO Color Space Transform | `ec.color.ociocolorspace` | 7 | GPU | 32 | Implemented |
 | OCIO Display Transform | `ec.color.ociodisplay` | 9 | GPU | 32 | Implemented |
@@ -311,7 +311,7 @@ Effects are addressed by id (`ec.<category>.<name>`) or display name in commands
 | Bevel Edges | `ec.perspective.beveledges` | 4 | GPU | 32 | Implemented |
 | CC Cylinder | `ec.perspective.cccylinder` | 18 | GPU | 32 | Partial: Orthographic 3D projection; AE camera and rotation-order settings are not yet matched |
 | CC Environment | `ec.perspective.ccenvironment` | 4 | GPU | 32 | Implemented |
-| CC Sphere | `ec.perspective.ccsphere` | 14 | GPU | 32 | Implemented |
+| CC Sphere | `ec.perspective.ccsphere` | 15 | GPU | 32 | Implemented |
 | CC Spotlight | `ec.perspective.ccspotlight` | 8 | GPU | 32 | Implemented |
 | Drop Shadow | `ec.perspective.dropshadow` | 6 | GPU | 32 | Implemented |
 | Radial Shadow | `ec.perspective.radialshadow` | 9 | GPU | 32 | Implemented |

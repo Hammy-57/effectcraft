@@ -805,7 +805,7 @@ pub fn specs() -> Vec<EffectSpec> {
                 p("PEDG-0031", "Dither", Value::Bool(true), ParamUi::Checkbox),
                 p("PEDG-0032", "Monochromatic Dither", Value::Bool(false), ParamUi::Checkbox),
                 p("PEDG-0033", "Dither Amount", num(50.0), slider(0.0, 100.0, 0.0, 100.0, 0)),
-                p("PEDG-0055", "Edge Behaviour", Value::Enum(1), slider(0.0, 2.0, 0.0, 2.0, 0)),
+                p("PEDG-0055", "Edge Behaviour", num(1.0), slider(0.0, 2.0, 0.0, 2.0, 0)),
                 p("PEDG-0084", "Buffer Expansion", Value::Enum(0), popup(&["Auto", "Compatibility"])),
                 p("PEDG-0013", "Chromatic Aberration", Value::Bool(false), ParamUi::Checkbox),
                 p("PEDG-0015", "Chromatic Amount", num(0.25), slider(0.0, 2.0, 0.0, 2.0, 2)),

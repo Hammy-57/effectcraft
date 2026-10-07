@@ -116,6 +116,26 @@ class Exporter:
             return
         node[name] = base64.b64encode(data).decode("ascii")
 
+    @staticmethod
+    def vector_source_layer(source):
+        """Read the saved AI/PDF layer binding without needing the external file."""
+        opti = getattr(source, "_opti", None)
+        name = getattr(opti, "text_layer_name", "")
+        if not name:
+            return None
+        index = getattr(getattr(source, "_sspc", None), "layer_index", None)
+        count = getattr(opti, "text_document_layers", 0)
+        if not isinstance(index, int) or not 0 <= index < count <= 65535:
+            raise ValueError("invalid vector source layer index/count")
+        data = opti.tobytes()
+        if len(data) < 32:
+            raise ValueError("truncated vector artwork bounds")
+        bounds = [v / 65536 for v in struct.unpack_from(">4i", data, 16)]
+        x0, y0, x1, y1 = bounds
+        if not (0 < x1 - x0 <= 30000 and 0 < y1 - y0 <= 30000):
+            raise ValueError("invalid vector artwork bounds")
+        return {"index": index, "name": name, "layer_size": True, "crop_bounds": bounds}
+
     def scan_fonts(self, root):
         index = {}
         for path in root.rglob("*"):
@@ -469,6 +489,12 @@ class Exporter:
             if source and type(source).__name__ == "SolidSource":
                 result["color"] = self.value(self.read(source, "color", scope), scope + "/color")
             elif source and type(source).__name__ == "FileSource":
+                try:
+                    binding = self.vector_source_layer(source)
+                    if binding is not None:
+                        result["source_layer"] = binding
+                except (ValueError, TypeError, struct.error) as exc:
+                    self.loss(scope + "/source_layer", "source_layer", str(exc))
                 raw = result["file"]
                 result["resolved_path"] = None
                 result["media_status"] = "missing"

@@ -423,6 +423,60 @@ fn depth_of_field_blurs_out_of_focus_layers() {
     assert!(b.get(66, 50)[3] > 0.01);
 }
 
+/// A 3D layer scaled to 0 % under an out-of-focus camera (SceneYard "Digital Wallets" and its
+/// finance scene folder): its blur radius in layer pixels was unbounded and the padding
+/// overflowed. The plane is invisible; the rest of the scene still renders, CPU and accelerated.
+#[test]
+fn zero_scale_plane_under_depth_of_field_renders() {
+    let (mut p, cid, comp) = setup();
+    let mut cam = camera(&mut p, &comp);
+    set(&mut cam, "cameraOptions/dof", Value::Bool(true));
+    set(&mut cam, "cameraOptions/aperture", Value::Scalar(100.0));
+    set(&mut cam, "cameraOptions/focusDistance", Value::Scalar(zoom() * 1.6));
+    let mut gone = solid3(&mut p, &comp, [1.0, 0.0, 0.0], 60, 20, [100.0, 50.0, -60.0]);
+    set(&mut gone, "transform/scale", Value::Vec3([0.0, 0.0, 100.0]));
+    let seen = solid3(&mut p, &comp, [1.0, 1.0, 1.0], 40, 40, [100.0, 50.0, 0.0]);
+    push(&mut p, cid, cam);
+    push(&mut p, cid, seen);
+    let without = render(&p, cid);
+    p.comp_mut(cid).unwrap().layers.insert(1, gone);
+    let img = render(&p, cid);
+    assert!(img.get(100, 50)[3] > 0.3, "visible layer drawn: {:?}", img.get(100, 50));
+    assert_eq!(img.data, without.data, "the degenerate plane adds nothing");
+    // The accelerator's plan: the degenerate plane gets no blur plan, the visible one does.
+    let c = p.comp(cid).unwrap();
+    let ctx = crate::EvalCtx::new(&p, cid, c, Tick::ZERO);
+    let r = Renderer::new(&p, &NoFootage, RenderOpts::default());
+    let run: Vec<&Layer> = c.layers.iter().filter(|l| l.is_3d()).collect();
+    let planned = r.prepare_3d_run(&ctx, &run, (W, H)).expect("accelerated run");
+    assert!(planned.planes.iter().all(|pl| pl.dof.as_ref().is_none_or(|d| d.pad <= compose::MAX_DOF_REACH as u32 + 2)));
+    assert!(planned.planes.iter().any(|pl| pl.dof.is_some()), "the visible plane still blurs");
+}
+
+/// A plane scaled almost to nothing magnifies its blur radius in layer pixels without limit;
+/// the radius (and so the padded buffer) is bounded for the CPU blur and the accelerator alike.
+#[test]
+fn near_zero_scale_depth_of_field_is_bounded() {
+    let (mut p, cid, comp) = setup();
+    let mut cam = camera(&mut p, &comp);
+    set(&mut cam, "cameraOptions/dof", Value::Bool(true));
+    set(&mut cam, "cameraOptions/aperture", Value::Scalar(100.0));
+    set(&mut cam, "cameraOptions/focusDistance", Value::Scalar(zoom() * 1.6));
+    push(&mut p, cid, cam);
+    let c = p.comp(cid).unwrap();
+    let ctx = crate::EvalCtx::new(&p, cid, c, Tick::ZERO);
+    let cs = super::camera::active_camera(&ctx);
+    let dof = cs.dof.expect("depth of field on");
+    for aspect in [1.0, 0.01, 100.0, f64::NAN] {
+        let dof = super::camera::Dof { iris: super::bokeh::Iris { aspect, ..dof.iris }, ..dof };
+        let world = effectcraft_geom::Mat4::scale(vec3(1e-6, 1e-6, 1.0));
+        let radii = compose::dof_radii_at(&cs, &dof, world, (8, 8), [4.0, 4.0], 1.0);
+        let rmax = radii.iter().copied().fold(0.0f32, f32::max) as f64;
+        assert!(rmax > 0.3 && rmax.is_finite(), "still blurs: {rmax}");
+        assert!(compose::dof_pad(&dof, rmax) <= compose::MAX_DOF_REACH as u32 + 2, "aspect {aspect}: rmax {rmax}");
+    }
+}
+
 /// Pixels in column `x` whose alpha is strictly between 0.05 and 0.95.
 fn soft_px(img: &effectcraft_raster::Image, x: i64) -> usize {
     (0..img.height as i64).filter(|&y| (0.05..0.95).contains(&img.get(x, y)[3])).count()

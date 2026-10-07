@@ -434,7 +434,12 @@ fn shading(ctx: &EffectCtx, b: &GBuf, p: &mut Params) {
     p.f[1] = f4([b.offset[0], b.offset[1], ctx.layer_size[0] * b.scale, ctx.layer_size[1] * b.scale]);
     p.f[3] = [l[0] as f32, l[1] as f32, l[2] as f32, pr.f("lightIntensity") as f32 / 100.0];
     p.f[4] = rgb(pr.color("lightColor"), pr.f("ambient") as f32 / 100.0);
-    p.f[5] = [pr.f("diffuse") as f32 / 100.0, pr.f("specular") as f32 / 100.0, 1.0 / (pr.f("roughness") as f32).max(0.001), 0.0];
+    p.f[5] = [
+        pr.f("diffuse") as f32 / 100.0,
+        pr.f("specular") as f32 / 100.0,
+        1.0 / (pr.f("roughness") as f32).max(0.001),
+        (pr.f("metal") as f32 / 100.0).clamp(0.0, 1.0),
+    ];
     p.f[6] = [hv[0] as f32, hv[1] as f32, hv[2] as f32, 0.0];
 }
 

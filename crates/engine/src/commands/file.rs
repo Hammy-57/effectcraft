@@ -284,7 +284,14 @@ pub(crate) fn import(s: &mut Session, p: &Value) -> Result<Value> {
                 {
                     match s.services.read_file(path).ok().and_then(|b| effectcraft_psd::Psd::parse(b).ok()).and_then(|d| find_psd_layer(&d, sel)) {
                         Some((index, name)) => {
-                            f.layer = Some(effectcraft_project::SourceLayer { index: index as u32, name, layer_size: false, embedded: None, placed: false })
+                            f.layer = Some(effectcraft_project::SourceLayer {
+                                index: index as u32,
+                                name,
+                                layer_size: false,
+                                embedded: None,
+                                placed: false,
+                                crop_bounds: None,
+                            })
                         }
                         None => {
                             errors.push(format!("{path}: no layer {sel}"));

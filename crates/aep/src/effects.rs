@@ -1210,11 +1210,11 @@ pub(crate) fn param_id(effect_id: &str, ae_param_match: &str) -> Option<&'static
         ("ec.noise.addgrain", "VISINF Grain Implant-0050") => "application/channelBalance/blueShadows",
         ("ec.noise.addgrain", "VISINF Grain Implant-0051") => "application/channelBalance/blueMidtones",
         ("ec.noise.addgrain", "VISINF Grain Implant-0052") => "application/channelBalance/blueHighlights",
-        ("ec.noise.addgrain", "VISINF Grain Implant-0053") => "VISINF Grain Implant-0053",
-        ("ec.noise.addgrain", "VISINF Grain Implant-0054") => "VISINF Grain Implant-0054",
-        ("ec.noise.addgrain", "VISINF Grain Implant-0055") => "VISINF Grain Implant-0055",
-        ("ec.noise.addgrain", "VISINF Grain Implant-0056") => "VISINF Grain Implant-0056",
-        ("ec.noise.addgrain", "VISINF Grain Implant-0058") => "VISINF Grain Implant-0058",
+        ("ec.noise.addgrain", "VISINF Grain Implant-0053") => "application/matchAmount",
+        ("ec.noise.addgrain", "VISINF Grain Implant-0054") => "application/matchingColor",
+        ("ec.noise.addgrain", "VISINF Grain Implant-0055") => "application/matchTolerance",
+        ("ec.noise.addgrain", "VISINF Grain Implant-0056") => "application/matchSoftness",
+        ("ec.noise.addgrain", "VISINF Grain Implant-0058") => "application/invertMatch",
         ("ec.noise.addgrain", "VISINF Grain Implant-0130") => "tweaking/softness",
         _ => return None,
     })
@@ -1342,11 +1342,11 @@ mod tests {
         assert_eq!(param_id("ec.keying.keylight", "Keylight 906-0031"), Some("outsideMask/outsideMask"));
         assert_eq!(param_id("ec.noise.addgrain", "VISINF Grain Implant-0044"), Some("application/channelBalance/redShadows"));
         assert_eq!(param_id("ec.noise.addgrain", "VISINF Grain Implant-0052"), Some("application/channelBalance/blueHighlights"));
-        assert_eq!(param_id("ec.noise.addgrain", "VISINF Grain Implant-0053"), Some("VISINF Grain Implant-0053"));
-        assert_eq!(param_id("ec.noise.addgrain", "VISINF Grain Implant-0054"), Some("VISINF Grain Implant-0054"));
-        assert_eq!(param_id("ec.noise.addgrain", "VISINF Grain Implant-0055"), Some("VISINF Grain Implant-0055"));
-        assert_eq!(param_id("ec.noise.addgrain", "VISINF Grain Implant-0056"), Some("VISINF Grain Implant-0056"));
-        assert_eq!(param_id("ec.noise.addgrain", "VISINF Grain Implant-0058"), Some("VISINF Grain Implant-0058"));
+        assert_eq!(param_id("ec.noise.addgrain", "VISINF Grain Implant-0053"), Some("application/matchAmount"));
+        assert_eq!(param_id("ec.noise.addgrain", "VISINF Grain Implant-0054"), Some("application/matchingColor"));
+        assert_eq!(param_id("ec.noise.addgrain", "VISINF Grain Implant-0055"), Some("application/matchTolerance"));
+        assert_eq!(param_id("ec.noise.addgrain", "VISINF Grain Implant-0056"), Some("application/matchSoftness"));
+        assert_eq!(param_id("ec.noise.addgrain", "VISINF Grain Implant-0058"), Some("application/invertMatch"));
         assert_eq!(param_id("ec.noise.addgrain", "VISINF Grain Implant-0057"), None);
         assert_eq!(param_id("ec.noise.addgrain", "VISINF Grain Implant-0059"), None);
         assert_eq!(param_id("ec.noise.addgrain", "VISINF Grain Implant-0060"), None);

@@ -508,3 +508,24 @@ fn multiple_pages_and_calculator_shadings() {
     assert!(img.get(5, 25)[0] < 0.1 && img.get(95, 25)[0] > 0.9, "{:?} {:?}", img.get(5, 25), img.get(95, 25));
     assert_eq!(parse_page(&bytes, 2), Err(Error::PageOutOfRange(2)));
 }
+
+#[test]
+fn saved_layer_crop_selects_pixels_in_document_coordinates() {
+    let doc = parse(&sample_pdf(false)).unwrap();
+    let selected = selected_layer_doc(&doc, 1, "Art", Some([20.25, 20.5, 40.5, 60.75])).unwrap();
+    assert_eq!(selected.pixel_size(), (21, 41));
+    assert_eq!(selected.root.children.len(), 1);
+    // PDF y-flip stays inside the new document-space translation.
+    let pixel = px(&selected, 5, 5);
+    assert!(pixel[0] > 0.99 && pixel[1] < 0.01 && pixel[3] > 0.99);
+    assert!(selected_layer_doc(&doc, usize::MAX, "", None).is_err());
+    let shifted = selected_layer_doc(&doc, 99, "Art", None).unwrap();
+    assert_eq!(layer_names(&shifted), ["Art"]);
+    assert!(selected_layer_doc(&doc, 0, "Missing", None).is_err());
+    let mut ambiguous = doc.clone();
+    ambiguous.root.children.push(doc.root.children[1].clone());
+    assert!(selected_layer_doc(&ambiguous, 99, "Art", None).is_err());
+    for bounds in [[0.0, 0.0, f64::NAN, 5.0], [10.0, 0.0, 5.0, 5.0], [0.0, 0.0, 30001.0, 5.0]] {
+        assert!(selected_layer_doc(&doc, 1, "Art", Some(bounds)).is_err());
+    }
+}
