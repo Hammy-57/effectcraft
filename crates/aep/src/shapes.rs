@@ -73,6 +73,21 @@ pub(crate) fn native_match(ae: &str) -> Option<&'static str> {
     })
 }
 
+/// AE shape popup values are one-based; native shape menus are zero-based.
+pub(crate) fn is_popup(parent: &str, property: &str) -> bool {
+    match parent {
+        "path" | "rect" | "ellipse" | "star" => matches!(property, "direction" | "type"),
+        "fill" | "stroke" | "gfill" | "gstroke" => {
+            matches!(property, "blend" | "composite" | "rule" | "cap" | "join" | "type")
+        }
+        "trim" | "merge" | "repeater" => matches!(property, "mode" | "composite"),
+        "offset" => property == "join",
+        "zigzag" => property == "points",
+        "taper" | "wave" => property == "units",
+        _ => false,
+    }
+}
+
 /// Convert exported AE Shape data to an editable path. Invalid geometry is rejected so the
 /// importer can report a loss instead of silently changing the outline.
 pub(crate) fn value(j: &Json) -> Option<Value> {

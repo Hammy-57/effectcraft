@@ -326,9 +326,9 @@ impl Mat4 {
     pub fn layer_3d(anchor: Vec3, position: Vec3, scale_pct: Vec3, orientation: Vec3, rotation: Vec3) -> Mat4 {
         Mat4::translate(position)
             * Mat4::orientation(orientation)
-            * Mat4::rotate_z(rotation.z)
-            * Mat4::rotate_y(rotation.y)
             * Mat4::rotate_x(rotation.x)
+            * Mat4::rotate_y(rotation.y)
+            * Mat4::rotate_z(rotation.z)
             * Mat4::scale(scale_pct / 100.0)
             * Mat4::translate(-anchor)
     }
