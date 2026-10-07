@@ -7,7 +7,7 @@
   "effect_instances": 4384,
   "mapped_effect_instances": 4110,
   "parameter_instances": 54836,
-  "mapped_parameter_instances": 33475,
+  "mapped_parameter_instances": 33535,
   "effects": {
     "ADBE 4ColorGradient": {
       "instances": 143,
@@ -6251,16 +6251,16 @@
             "Shift Edge": 5
           },
           "instances": 5,
-          "param_id": null,
-          "status": "unresolved_raw_property"
+          "param_id": "refineEdgeMatte/shiftEdge",
+          "status": "native_parameter"
         },
         "/HBspatialcontrast": {
           "names": {
             "Contrast": 5
           },
           "instances": 5,
-          "param_id": null,
-          "status": "unresolved_raw_property"
+          "param_id": "refineEdgeMatte/contrast",
+          "status": "native_parameter"
         },
         "/HBspatialsmoothing": {
           "names": {
@@ -6275,8 +6275,8 @@
             "Feather": 5
           },
           "instances": 5,
-          "param_id": null,
-          "status": "unresolved_raw_property"
+          "param_id": "refineEdgeMatte/feather",
+          "status": "native_parameter"
         },
         "/baserefineedgeradius": {
           "names": {
@@ -6387,16 +6387,16 @@
             "Reduce Chatter": 5
           },
           "instances": 5,
-          "param_id": null,
-          "status": "unresolved_raw_property"
+          "param_id": "refineEdgeMatte/reduceChatter",
+          "status": "native_parameter"
         },
         "/rmadditionalcleaningradius": {
           "names": {
             "Increase Radius": 5
           },
           "instances": 5,
-          "param_id": null,
-          "status": "unresolved_raw_property"
+          "param_id": "refineEdgeMatte/decontamination/increaseDecontaminationRadius",
+          "status": "native_parameter"
         },
         "/rmcleanedgecolors": {
           "names": {
@@ -6411,8 +6411,8 @@
             "Amount": 5
           },
           "instances": 5,
-          "param_id": null,
-          "status": "unresolved_raw_property"
+          "param_id": "refineEdgeMatte/decontamination/decontaminationAmount",
+          "status": "native_parameter"
         },
         "/rmextendedcleaning": {
           "names": {
@@ -6435,8 +6435,8 @@
             "Reduce Chatter": 5
           },
           "instances": 5,
-          "param_id": null,
-          "status": "unresolved_raw_property"
+          "param_id": "rotoBrushMatte/reduceChatter",
+          "status": "native_parameter"
         },
         "/rmrefinematte2enable": {
           "names": {
@@ -6459,16 +6459,16 @@
             "Samples Per Frame": 5
           },
           "instances": 5,
-          "param_id": null,
-          "status": "unresolved_raw_property"
+          "param_id": "refineEdgeMatte/motionBlur/motionBlurSamples",
+          "status": "native_parameter"
         },
         "/rmshiftedges": {
           "names": {
             "Shift Edge": 5
           },
           "instances": 5,
-          "param_id": null,
-          "status": "unresolved_raw_property"
+          "param_id": "rotoBrushMatte/shiftEdge",
+          "status": "native_parameter"
         },
         "/rmshutterangle": {
           "names": {
@@ -6491,8 +6491,8 @@
             "View Map": 5
           },
           "instances": 5,
-          "param_id": null,
-          "status": "unresolved_raw_property"
+          "param_id": "refineEdgeMatte/decontamination/viewDecontaminationMap",
+          "status": "native_parameter"
         },
         "/roto brush propagation": {
           "names": {
@@ -6507,16 +6507,16 @@
             "Feather": 5
           },
           "instances": 5,
-          "param_id": null,
-          "status": "unresolved_raw_property"
+          "param_id": "rotoBrushMatte/feather",
+          "status": "native_parameter"
         },
         "/spatialsoftness2": {
           "names": {
             "Contrast": 5
           },
           "instances": 5,
-          "param_id": null,
-          "status": "unresolved_raw_property"
+          "param_id": "rotoBrushMatte/contrast",
+          "status": "native_parameter"
         },
         "/staticdamping": {
           "names": {
@@ -18682,9 +18682,9 @@
     "dedicated_indexed_import": 1190,
     "diagnostic_ui_default": 820,
     "fixed_hidden_zero": 688,
-    "native_parameter": 33475,
+    "native_parameter": 33535,
     "requires_indexed_native_model": 1173,
-    "unresolved_raw_property": 4629,
+    "unresolved_raw_property": 4569,
     "varying_vendor_property": 43
   },
   "effect_role_instances": {
