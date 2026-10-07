@@ -80,6 +80,43 @@ fn mask_cuts_layer() {
     assert!(img.get(150, 50)[3] < 0.01);
 }
 
+/// A large Mask Expansion grows a small mask far past its own size (SceneYard "UI Map
+/// Location": a 115-pixel circle on a white solid expanded by 1068 px to fill the frame). The
+/// expansion was a stroke 2136 px wide around the circle, whose outline degenerates when it is
+/// that much wider than the curve: the white page stayed black.
+#[test]
+fn large_mask_expansion_covers_its_whole_reach() {
+    let mut p = Project::default();
+    p.settings.bit_depth = effectcraft_project::BitDepth::Bpc32;
+    let comp = Comp::new(1080, 1920, FrameRate::FPS_30, Tick::from_seconds_f64(1.0));
+    let cid = p.add_item("Comp", Label::Sandstone, None, ItemKind::Comp(comp.clone().into()));
+    let mut l = solid(&mut p, &comp, [1.0, 1.0, 1.0], 1080, 1920);
+    let mut next = p.next_id;
+    let m = build::mask(&mut Ids(&mut next), "Mask 1", ShapePath::ellipse([526.0, 973.0], 115.0, 115.0), MaskMode::Add, [255, 255, 0]);
+    p.next_id = next;
+    l.props.sub_mut("masks").unwrap().children.push(m.into());
+    l.props.prop_mut("masks/#1/expansion").unwrap().value = Value::Scalar(1068.0);
+    p.comp_mut(cid).unwrap().layers.push(l);
+    let img = render_frame(&p, cid, Tick::ZERO, 1.0);
+    // Everything within 57.5 + 1068 px of the centre is covered; the far corner is not.
+    for (x, y) in [(526, 973), (100, 300), (1000, 1600), (526, 1900), (300, 973)] {
+        assert!(img.get(x, y)[3] > 0.99, "({x},{y}) {:?}", img.get(x, y));
+    }
+    // The grown edge sits where it should, both ways: +300 px (radius 357.5) and −150 px of a
+    // 400-pixel square (a 100-pixel square left).
+    for (shape, exp, inside, outside) in [
+        (ShapePath::ellipse([526.0, 973.0], 115.0, 115.0), 300.0, (526 + 350, 973), (526 + 365, 973)),
+        (ShapePath::rect([526.0, 973.0], 400.0, 400.0), -150.0, (526 + 45, 973), (526 + 55, 973)),
+    ] {
+        let c = p.comp_mut(cid).unwrap();
+        c.layers[0].props.prop_mut("masks/#1/path").unwrap().value = Value::Path(shape);
+        c.layers[0].props.prop_mut("masks/#1/expansion").unwrap().value = Value::Scalar(exp);
+        let img = render_frame(&p, cid, Tick::ZERO, 1.0);
+        assert!(img.get(inside.0, inside.1)[3] > 0.99, "{exp}: inside {:?}", img.get(inside.0, inside.1));
+        assert!(img.get(outside.0, outside.1)[3] < 0.01, "{exp}: outside {:?}", img.get(outside.0, outside.1));
+    }
+}
+
 #[test]
 fn track_matte_alpha() {
     let (mut p, cid, comp) = setup();
