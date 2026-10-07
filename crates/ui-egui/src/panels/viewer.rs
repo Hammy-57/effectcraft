@@ -977,6 +977,25 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             }
         };
         ctx.set_cursor_icon(cursor);
+        if !app.ui.viewer.roi_draw {
+            let native = match app.ui.tool {
+                Tool::Hand => Some(("hand", [11, 11])),
+                Tool::Zoom => Some((if ctx.input(|i| i.modifiers.alt) { "zoom-out" } else { "zoom-in" }, [8, 8])),
+                Tool::Rotate => Some(("rotate", [1, 1])),
+                Tool::PanBehind => Some(("anchor", [1, 1])),
+                Tool::Orbit => Some(("orbit", [11, 9])),
+                Tool::PanCamera => Some(("camera-pan", [8, 10])),
+                Tool::Dolly => Some(("dolly", [9, 9])),
+                Tool::Pen => Some(("pen", [1, 1])),
+                Tool::PenAdd => Some(("pen-add", [1, 1])),
+                Tool::PenDelete => Some(("pen-delete", [1, 1])),
+                Tool::PenConvert => Some(("pen-convert", [1, 1])),
+                _ => None,
+            };
+            if let Some((name, hotspot)) = native {
+                crate::local_assets::cursor(&ctx, name, hotspot);
+            }
+        }
         // Scroll wheel zooms around the pointer.
         let scroll = ui.input(|i| i.smooth_scroll_delta.y + i.zoom_delta().ln() * 300.0);
         if scroll.abs() > 0.1 && area.contains(hp) {

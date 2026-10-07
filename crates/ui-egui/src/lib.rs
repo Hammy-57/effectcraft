@@ -18,6 +18,7 @@ pub mod gpu_failure;
 pub mod header;
 pub mod i18n;
 pub mod icons;
+mod local_assets;
 pub mod menus;
 pub mod native_menu;
 pub mod panels;
@@ -1539,6 +1540,7 @@ impl eframe::App for EffectcraftApp {
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.apply_gpu_failure(ctx);
+        ctx.set_cursor_image(None);
         if !self.styled {
             theme::install(ctx, &self.tokens);
             self.styled = true;

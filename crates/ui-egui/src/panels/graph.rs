@@ -164,7 +164,20 @@ fn curves<'a>(app: &EffectcraftApp, comp: &'a Comp, ectx: &EvalCtx, tm: TMap, pl
 
 fn text_button(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, x: &mut f32, y: f32, label: &str, on: bool, id: &str, tip: &str) -> bool {
     let t = app.tokens;
-    let w = p.layout_no_wrap(label.to_string(), Tokens::ui(11.0), t.text).size().x + 14.0;
+    let name = match label {
+        "Fit" => "graph-fit",
+        "Fit Selection" => "graph-fit-selection",
+        "Separate Dimensions" => "graph-separate",
+        "Hold" => "graph-hold",
+        "Linear" => "graph-linear",
+        "Auto Bezier" => "graph-auto-bezier",
+        "Easy Ease" => "graph-ease",
+        "Ease In" => "graph-ease-in",
+        "Ease Out" => "graph-ease-out",
+        _ => "",
+    };
+    let icon = if name.is_empty() { None } else { crate::local_assets::icon(ui.ctx(), name) };
+    let w = if icon.is_some() { 24.0 } else { p.layout_no_wrap(label.to_string(), Tokens::ui(11.0), t.text).size().x + 14.0 };
     let r = Rect::from_min_size(pos2(*x, y - 9.0), vec2(w, 18.0));
     let resp = ui.interact(r, egui::Id::new(("graph-btn", id)), Sense::click()).on_hover_text(tip);
     p.rect_filled(
@@ -178,7 +191,12 @@ fn text_button(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, x
             Color32::from_rgb(0x2c, 0x2c, 0x2c)
         },
     );
-    p.text(r.center(), Align2::CENTER_CENTER, label, Tokens::ui(11.0), if on { Color32::WHITE } else { t.text });
+    let color = if on { Color32::WHITE } else { t.text };
+    if let Some(icon) = icon {
+        p.image(icon.id(), Rect::from_center_size(r.center(), vec2(16.0, 16.0)), Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), color);
+    } else {
+        p.text(r.center(), Align2::CENTER_CENTER, label, Tokens::ui(11.0), color);
+    }
     app.auto.add(&format!("timeline.graph.{id}"), r, tip);
     *x += w + 4.0;
     resp.clicked()
