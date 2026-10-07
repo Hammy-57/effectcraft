@@ -1099,7 +1099,7 @@ fn import_curves_state(group: &mut PropGroup, ir: &Json, losses: &mut Vec<String
     if (1..5).any(|channel| {
         (0..256).any(|input| {
             let at = 8 + channel * 512 + input * 2;
-            u8::from_str_radix(&hex[at..at + 2], 16).unwrap() != input as u8
+            hex.get(at..at + 2).and_then(|s| u8::from_str_radix(s, 16).ok()).is_none_or(|value| value != input as u8)
         })
     }) {
         losses.push(format!("{context}: AE Curves individual-channel LUT visual parity unverified"));
@@ -1278,7 +1278,7 @@ fn adapt_value(value: Value, native: &Value) -> Value {
     match (value, native) {
         (Value::Scalar(v), Value::Bool(_)) => Value::Bool(v != 0.0),
         (Value::Scalar(v), Value::Enum(_)) => Value::Enum(v.round().max(1.0) as u32 - 1),
-        (Value::Scalar(v), Value::Layer(_)) if v == 0.0 => Value::Layer(None),
+        (Value::Scalar(0.0), Value::Layer(_)) => Value::Layer(None),
         (Value::Scalar(v), Value::Layer(_)) if v > 0.0 && v.fract() == 0.0 && v <= u32::MAX as f64 => Value::Layer(Some(v as u64)),
         (Value::Vec3(v), Value::Vec2(_)) => Value::Vec2([v[0], v[1]]),
         (Value::Vec2(v), Value::Vec3(_)) => Value::Vec3([v[0], v[1], 0.0]),
@@ -1975,16 +1975,15 @@ mod tests {
                         let editable =
                             reopened.comps().find_map(|(id, c)| c.layers.iter().find(|l| l.props.prop("transform/opacity").is_some()).map(|l| (*id, l.id)));
                         let mut edit_restore = false;
-                        if let Some((comp_id, layer_id)) = editable {
-                            if let Some(prop) =
+                        if let Some((comp_id, layer_id)) = editable
+                            && let Some(prop) =
                                 reopened.comp_mut(comp_id).and_then(|c| c.layer_mut(layer_id)).and_then(|l| l.props.prop_mut("transform/opacity"))
-                            {
-                                prop.value = Value::Scalar(prop.value.as_f64() + 1.0);
-                                assert!(!reopened.same_content(&snapshot));
-                                reopened = snapshot.clone(); // same snapshot restoration as command undo
-                                edit_restore = reopened.same_content(&snapshot);
-                                assert!(edit_restore);
-                            }
+                        {
+                            prop.value = Value::Scalar(prop.value.as_f64() + 1.0);
+                            assert!(!reopened.same_content(&snapshot));
+                            reopened = snapshot.clone(); // same snapshot restoration as command undo
+                            edit_restore = reopened.same_content(&snapshot);
+                            assert!(edit_restore);
                         }
                         assert!(edit_restore, "{name}: no editable opacity property was restored");
                         let source: Json = serde_json::from_slice(&bytes).unwrap();
@@ -2025,7 +2024,7 @@ mod tests {
         eprintln!("corpus: {ok}/{} imported, {} errors, {} panics, max {:?} ({})", files.len(), failures.len(), panics.len(), slowest.0, slowest.1);
         eprintln!("losses by reason: {losses:?}");
         let mut top: Vec<_> = loss_details.into_iter().collect();
-        top.sort_by(|a, b| b.1.cmp(&a.1));
+        top.sort_by_key(|item| std::cmp::Reverse(item.1));
         eprintln!("top loss details: {:?}", &top[..top.len().min(20)]);
         if let Some(dir) = &output_dir {
             let render_font_docs: u64 = evidence.iter().filter_map(|p| p.pointer("/counts/render_font_docs").and_then(Json::as_u64)).sum();

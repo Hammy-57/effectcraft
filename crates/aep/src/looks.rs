@@ -30,7 +30,7 @@ fn u32be(b: &[u8]) -> Result<u32, String> {
 }
 
 pub(super) fn parse_hex(encoded: &str) -> Result<LookState, String> {
-    if encoded.len() > MAX_STATE * 2 || encoded.len() % 2 != 0 {
+    if encoded.len() > MAX_STATE * 2 || !encoded.len().is_multiple_of(2) {
         return Err("invalid or oversized MBL2 hex state".into());
     }
     fn nibble(b: u8) -> Result<u8, String> {
@@ -197,7 +197,7 @@ mod tests {
     fn corpus_looks_state_when_supplied() {
         let Ok(path) = std::env::var("EFFECTCRAFT_LOOKS_IR") else { return };
         let doc: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-        fn look<'a>(node: &'a serde_json::Value) -> Option<&'a str> {
+        fn look(node: &serde_json::Value) -> Option<&str> {
             if node.get("match_name").and_then(serde_json::Value::as_str) == Some("MB LookSuite3") {
                 return node.get("mbl2_state_hex").and_then(serde_json::Value::as_str);
             }

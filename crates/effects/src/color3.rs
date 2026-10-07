@@ -983,7 +983,7 @@ mod tests {
         let midtone = ("curves/curveMasterMidtones", num(50.0));
         let both = run("ec.color.lumetri", &[exposure.clone(), midtone.clone()], g.clone());
         let no_basic = run("ec.color.lumetri", &[exposure.clone(), midtone.clone(), ("basicCorrection/active", Value::Bool(false))], g.clone());
-        let curve_only = run("ec.color.lumetri", &[midtone.clone()], g.clone());
+        let curve_only = run("ec.color.lumetri", std::slice::from_ref(&midtone), g.clone());
         assert!(close(&no_basic, &curve_only, 1e-5));
         let no_curves = run("ec.color.lumetri", &[exposure.clone(), midtone, ("curves/active", Value::Bool(false))], g.clone());
         let basic_only = run("ec.color.lumetri", &[exposure], g.clone());
