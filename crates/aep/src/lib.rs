@@ -15,6 +15,7 @@ use effectcraft_time::{FrameRate, Tick};
 use serde_json::Value as Json;
 
 mod color_ease;
+mod effect_defaults;
 mod effects;
 mod looks;
 mod markers_essential;
@@ -908,7 +909,10 @@ fn import_property(
                 if spec.id == "ec.color.curves" {
                     import_curves_state(&mut group, ir, losses, context);
                 }
-                import_native_effect_params(project, &mut group, ir, spec.id, layer_time, losses, context, depth + 1);
+                import_native_effect_params(project, &mut group, ir, ir, spec.id, layer_time, losses, context, depth + 1);
+                if spec.id == "S_CartoonPaint" {
+                    losses.push(format!("{context}: S_CartoonPaint brush-stroke rendering is approximate; visual parity unverified"));
+                }
             }
             if spec.id == "ec.perspective.ccsphere"
                 && group.prop("metal").is_some_and(|metal| {
@@ -1110,6 +1114,7 @@ fn import_native_effect_params(
     project: &mut Project,
     group: &mut PropGroup,
     ir: &Json,
+    effect_ir: &Json,
     effect_id: &str,
     layer_time: LayerTime,
     losses: &mut Vec<String>,
@@ -1122,7 +1127,7 @@ fn import_native_effect_params(
     }
     for child in array(ir, "children") {
         if string(child, &["kind"]) == Some("group") {
-            import_native_effect_params(project, group, child, effect_id, layer_time, losses, context, depth + 1);
+            import_native_effect_params(project, group, child, effect_ir, effect_id, layer_time, losses, context, depth + 1);
             continue;
         }
         let Some(raw) = string(child, &["match_name"]) else { continue };
@@ -1158,7 +1163,9 @@ fn import_native_effect_params(
             continue;
         }
         let Some(path) = effects::param_id(effect_id, raw) else {
-            losses.push(format!("{context}: unsupported {effect_id} parameter {raw}"));
+            if !effect_defaults::inert(effect_id, raw, child, effect_ir) {
+                losses.push(format!("{context}: unsupported {effect_id} parameter {raw}"));
+            }
             if let Some(value) = convert_value(value_json, string(child, &["value_type"]).unwrap_or("")) {
                 let mut prop = Property::new(project.alloc(), raw, string(child, &["name"]).unwrap_or(raw), value.clone());
                 fill_property(&mut prop, child, value, string(child, &["value_type"]).unwrap_or(""), 1.0, layer_time, losses, context);
@@ -1629,7 +1636,7 @@ mod tests {
              "keyframes":[{"time":0.0,"value":0.2},{"time":1.0,"value":1.0}]}
         ]});
         let mut losses = Vec::new();
-        import_native_effect_params(&mut project, &mut effect, &ir, spec.id, LayerTime { start: Tick::ZERO, stretch: 100.0 }, &mut losses, "test", 0);
+        import_native_effect_params(&mut project, &mut effect, &ir, &ir, spec.id, LayerTime { start: Tick::ZERO, stretch: 100.0 }, &mut losses, "test", 0);
         let opacity = effect.get("opacity").unwrap();
         assert_eq!(opacity.value, Value::Scalar(50.0));
         assert_eq!(opacity.keys.iter().map(|k| k.value.clone()).collect::<Vec<_>>(), vec![Value::Scalar(20.0), Value::Scalar(100.0)]);
@@ -1864,13 +1871,51 @@ mod tests {
         let mut effect = effectcraft_effects::instantiate(spec, &mut build::Ids(&mut project.next_id), "Drop Shadow", [100.0, 100.0]);
         let mut losses = Vec::new();
         let ir = serde_json::json!({"children":[{"kind":"property","match_name":"ADBE Drop Shadow-9999","value_type":6412,"value":0,"expression":"","keyframes":[]}]});
-        import_native_effect_params(&mut project, &mut effect, &ir, spec.id, LayerTime { start: Tick::ZERO, stretch: 100.0 }, &mut losses, "test", 0);
+        import_native_effect_params(&mut project, &mut effect, &ir, &ir, spec.id, LayerTime { start: Tick::ZERO, stretch: 100.0 }, &mut losses, "test", 0);
         assert!(losses.is_empty());
         assert!(effect.get("ADBE Drop Shadow-9999").is_none());
         let changed = serde_json::json!({"children":[{"kind":"property","match_name":"ADBE Drop Shadow-9999","value_type":6412,"value":1,"expression":"","keyframes":[]}]});
-        import_native_effect_params(&mut project, &mut effect, &changed, spec.id, LayerTime { start: Tick::ZERO, stretch: 100.0 }, &mut losses, "test", 0);
+        import_native_effect_params(
+            &mut project,
+            &mut effect,
+            &changed,
+            &changed,
+            spec.id,
+            LayerTime { start: Tick::ZERO, stretch: 100.0 },
+            &mut losses,
+            "test",
+            0,
+        );
         assert_eq!(losses.len(), 1);
         assert!(effect.get("ADBE Drop Shadow-9999").is_some());
+    }
+
+    #[test]
+    fn inert_effect_defaults_remain_editable_and_changed_values_report_loss() {
+        let mut project = Project::default();
+        let spec = effectcraft_effects::find("S_Monochrome").unwrap();
+        let mut effect = effectcraft_effects::instantiate(spec, &mut build::Ids(&mut project.next_id), "Monochrome", [100.0, 100.0]);
+        let prop = |raw: &str, value: i32| {
+            serde_json::json!({
+                "kind":"property","match_name":raw,"name":raw,"value_type":6417,"value":value,
+                "keyframes":[],"expression":"","expression_enabled":false
+            })
+        };
+        let mut ir = serde_json::json!({"sapphire_mocha_state_hex":"00","children":[
+            prop("S_Monochrome-0001",0),prop("S_Monochrome-0235",0),
+            {"kind":"property","match_name":"S_Monochrome-0520","value":null,"keyframes":[],"expression":"","expression_enabled":false},
+            prop("S_Monochrome-0541",12)
+        ]});
+        let mut losses = Vec::new();
+        import_native_effect_params(&mut project, &mut effect, &ir, &ir, spec.id, LayerTime { start: Tick::ZERO, stretch: 100.0 }, &mut losses, "test", 0);
+        assert!(losses.is_empty());
+        assert_eq!(effect.get("S_Monochrome-0541").unwrap().value.as_f64(), 12.0);
+        ir["children"][0]["value"] = serde_json::json!(1);
+        let mut changed = effectcraft_effects::instantiate(spec, &mut build::Ids(&mut project.next_id), "Monochrome", [100.0, 100.0]);
+        losses.clear();
+        import_native_effect_params(&mut project, &mut changed, &ir, &ir, spec.id, LayerTime { start: Tick::ZERO, stretch: 100.0 }, &mut losses, "test", 0);
+        assert!(losses.iter().any(|loss| loss.contains("S_Monochrome-0541")));
+        assert_eq!(changed.get("S_Monochrome-0541").unwrap().value.as_f64(), 12.0);
     }
 
     #[test]

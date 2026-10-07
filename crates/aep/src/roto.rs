@@ -141,7 +141,8 @@ pub(super) fn import(
         "children".into(),
         Json::Array(array(ir, "children").iter().filter(|c| string(c, &["match_name"]) != Some("ADBE Samurai Strokes Group")).cloned().collect()),
     );
-    import_native_effect_params(project, fx, &Json::Object(plain), roto::ID, layer_time, losses, context, 0);
+    let plain = Json::Object(plain);
+    import_native_effect_params(project, fx, &plain, &plain, roto::ID, layer_time, losses, context, 0);
     let Some(group) = child(ir, "ADBE Samurai Strokes Group") else { return };
     let mut strokes = Vec::new();
     let mut base = None;
