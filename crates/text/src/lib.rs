@@ -190,17 +190,6 @@ pub fn paragraph_style(p: &ParaStyle, width: Option<f32>) -> ParagraphStyle {
         Justify::JustifyLastRight => (Align::Justify, Align::Right),
         Justify::JustifyAll => (Align::Justify, Align::Justify),
     };
-    // Point text has no box: AE moves a line by the indent on the edge its alignment pins it to
-    // (start + first-line indent for left-aligned, end indent for right-aligned) and keeps
-    // centred lines centred on the layer origin.
-    let rtl = p.direction == Direction::Rtl;
-    let (indent_start, indent_end, indent_first) = match (width, justify_last) {
-        (Some(_), _) => (p.indent_left, p.indent_right, p.indent_first),
-        (None, Align::Left | Align::Justify) if !rtl => (p.indent_left, 0.0, p.indent_first),
-        (None, Align::Right) if rtl => (p.indent_left, 0.0, p.indent_first),
-        (None, Align::Left | Align::Justify | Align::Right) => (0.0, p.indent_right, 0.0),
-        (None, Align::Center) => (0.0, 0.0, 0.0),
-    };
     ParagraphStyle {
         align,
         justify_last,
@@ -208,10 +197,11 @@ pub fn paragraph_style(p: &ParaStyle, width: Option<f32>) -> ParagraphStyle {
         width,
         // The chosen direction is the paragraph's base direction (a left-to-right paragraph
         // starting with Arabic or Hebrew still runs left to right, as in After Effects).
-        rtl: Some(rtl),
-        indent_start: indent_start as f32,
-        indent_end: indent_end as f32,
-        indent_first: indent_first as f32,
+        rtl: Some(p.direction == Direction::Rtl),
+        // Point text keeps them too; the layout applies AE's point-text rule.
+        indent_start: p.indent_left as f32,
+        indent_end: p.indent_right as f32,
+        indent_first: p.indent_first as f32,
         space_before: p.space_before as f32,
         space_after: p.space_after as f32,
         every_line: p.composer == Composer::EveryLine,
@@ -463,15 +453,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ae_point_text_alignment_ignores_saved_paragraph_indents() {
+    fn ae_point_text_centres_on_its_anchor_shifted_only_by_the_first_line_indent() {
         let mut doc = TextDoc { text: "MORE FREEDOM".into(), justify: Justify::Center, size: 66.0, ..Default::default() };
-        let plain = layout_doc(&doc);
+        let plain = layout_doc(&doc).layout.lines[0].x;
         doc.indent_left = 522.0;
         doc.indent_right = 94.0;
-        doc.indent_first = -12.0;
-        let indented = layout_doc(&doc);
-        assert_eq!(plain.bounds, indented.bounds, "AE point text stays centred at its layer anchor");
-        assert_eq!((doc.indent_left, doc.indent_right, doc.indent_first), (522.0, 94.0, -12.0));
+        let indented = layout_doc(&doc).layout.lines[0].x;
+        assert!((plain - indented).abs() < 1e-3, "AE point text stays centred at its layer anchor");
+        // SceneYard UI 3 Stages "Yard": first-line indent -102 moves the centred word 102 px left.
+        doc.indent_first = -102.0;
+        assert!((layout_doc(&doc).layout.lines[0].x - plain + 102.0).abs() < 1e-3);
         doc.box_size = Some([1088.0, 1072.0]);
         let area = layout_doc(&doc);
         doc.indent_left = 0.0;
