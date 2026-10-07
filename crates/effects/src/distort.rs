@@ -59,6 +59,9 @@ fn spherize(ctx: &EffectCtx, mut b: Buf) -> Buf {
     b
 }
 
+/// Bulge displacement at the centre per unit of Bulge Height (fraction of the radius).
+pub const BULGE_STRENGTH: f64 = 0.35;
+
 fn bulge(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let rx = (ctx.params.f("hradius") * b.scale).max(1.0);
     let ry = (ctx.params.f("vradius") * b.scale).max(1.0);
@@ -76,7 +79,9 @@ fn bulge(ctx: &EffectCtx, mut b: Buf) -> Buf {
         if d2 >= 1.0 {
             return (x, y);
         }
-        let mut amt = h * (1.0 - d2).powf(taper) * 0.5;
+        // Strength per unit Bulge Height, matched to After Effects renders (SceneYard Assistive
+        // Touch, Paper Reveal, Liquid): 0.5 magnified the centre about a third too much.
+        let mut amt = h * (1.0 - d2).powf(taper) * BULGE_STRENGTH;
         if pin {
             let ex = ((x - lx - 0.5).min(lx + lw - 0.5 - x) / edge).clamp(0.0, 1.0);
             let ey = ((y - ly - 0.5).min(ly + lh - 0.5 - y) / edge).clamp(0.0, 1.0);
@@ -272,26 +277,57 @@ pub fn transform_shutter(ctx: &EffectCtx) -> Option<(f64, f64, u32)> {
 }
 
 fn transform_matrix(pr: &crate::Params, b: &Buf) -> Mat3 {
-    let anchor = b.to_px(pr.v2("anchor"));
-    let pos = b.to_px(pr.v2("position"));
+    transform_effect_matrix(pr, b.to_px(pr.v2("anchor")), b.to_px(pr.v2("position")))
+}
+
+/// The Transform effect's matrix in buffer pixels (`anchor` / `position` already in pixels).
+/// As in After Effects, the skew is applied after the rotation: Skew Axis 0 tilts horizontal
+/// lines (a vertical shear), so Rotation -20° with Skew 20° gives a pure horizontal shear.
+pub fn transform_effect_matrix(pr: &crate::Params, anchor: (f64, f64), pos: (f64, f64)) -> Mat3 {
     let sh = pr.f("scaleHeight");
     let sw = if pr.b("uniform") { sh } else { pr.f("scaleWidth") };
     Mat3::translate(vec2(pos.0, pos.1))
+        * Mat3::skew_deg(-pr.f("skew"), pr.f("skewAxis") + 90.0)
         * Mat3::rotate_deg(pr.f("rotation"))
-        * Mat3::skew_deg(pr.f("skew"), pr.f("skewAxis"))
         * Mat3::scale(vec2(sw / 100.0, sh / 100.0))
         * Mat3::translate(vec2(-anchor.0, -anchor.1))
+}
+
+pub fn transform_extent(adjustment: bool, size: (u32, u32), ms: &[Mat3]) -> (i64, i64, u32, u32) {
+    // An adjustment layer works on the comp below in place.
+    if adjustment {
+        return (0, 0, size.0, size.1);
+    }
+    let (w, h) = (size.0 as f64, size.1 as f64);
+    let (mut x0, mut y0, mut x1, mut y1) = (0.0f64, 0.0f64, w, h);
+    for m in ms {
+        for (x, y) in [(0.0, 0.0), (w, 0.0), (0.0, h), (w, h)] {
+            let q = m.apply(vec2(x, y));
+            if !(q.x.is_finite() && q.y.is_finite()) {
+                return (0, 0, size.0, size.1);
+            }
+            (x0, y0, x1, y1) = (x0.min(q.x), y0.min(q.y), x1.max(q.x), y1.max(q.y));
+        }
+    }
+    let (x0, y0) = (x0.floor(), y0.floor());
+    let (nw, nh) = ((x1.ceil() - x0).max(1.0), (y1.ceil() - y0).max(1.0));
+    // Cap the allocation (a huge scale would otherwise ask for an unbounded buffer).
+    if nw * nh > 64.0e6 || nw > 32768.0 || nh > 32768.0 {
+        return (0, 0, size.0, size.1);
+    }
+    (x0 as i64, y0 as i64, nw as u32, nh as u32)
+}
+
+/// Move `b` onto the grown canvas `ext` (pixel (0, 0) = old pixel (x0, y0)).
+fn regrid(b: &mut Buf, ext: (i64, i64, u32, u32), img: Image) {
+    b.img = img;
+    b.offset[0] -= ext.0 as f64;
+    b.offset[1] -= ext.1 as f64;
 }
 
 fn transform(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let anchor = b.to_px(ctx.params.v2("anchor"));
     let pos = b.to_px(ctx.params.v2("position"));
-    let uniform = ctx.params.b("uniform");
-    let sh = ctx.params.f("scaleHeight");
-    let sw = if uniform { sh } else { ctx.params.f("scaleWidth") };
-    let skew = ctx.params.f("skew");
-    let skew_axis = ctx.params.f("skewAxis");
-    let rot = ctx.params.f("rotation");
     let opacity = ctx.params.f("opacity") as f32 / 100.0;
     let sampling = if ctx.params.e("sampling") == 1 { effectcraft_raster::Sampling::Bicubic } else { effectcraft_raster::Sampling::Bilinear };
     // Motion blur: the transform at Samples instants across the shutter, averaged (the
@@ -300,36 +336,40 @@ fn transform(ctx: &EffectCtx, mut b: Buf) -> Buf {
         && let Some(host) = ctx.env.host
     {
         let fd = 1.0 / ctx.fps();
-        let mut acc = Image::new(b.img.width, b.img.height);
-        let mut count = 0.0f32;
-        for k in 0..n {
-            let t = ctx.time + (phase + angle * k as f64 / (n - 1) as f64) / 360.0 * fd;
-            let Some(pr) = host.params_at(t) else { continue };
-            let mut one = Image::new(b.img.width, b.img.height);
-            let op = pr.f("opacity") as f32 / 100.0;
-            effectcraft_raster::composite_warp(
-                &mut one,
-                &b.img,
-                &transform_matrix(&pr, &b),
-                &effectcraft_raster::WarpOpts { opacity: op, sampling, ..Default::default() },
-            );
-            acc.data.iter_mut().zip(&one.data).for_each(|(a, o)| (0..4).for_each(|c| a[c] += o[c]));
-            count += 1.0;
-        }
-        if count > 0.0 {
-            acc.data.iter_mut().for_each(|p| p.iter_mut().for_each(|v| *v /= count));
-            b.img = acc;
+        let samples: Vec<(Mat3, f32)> = (0..n)
+            .filter_map(|k| {
+                let t = ctx.time + (phase + angle * k as f64 / (n - 1) as f64) / 360.0 * fd;
+                let pr = host.params_at(t)?;
+                Some((transform_matrix(&pr, &b), pr.f("opacity") as f32 / 100.0))
+            })
+            .collect();
+        if !samples.is_empty() {
+            let ms: Vec<Mat3> = samples.iter().map(|s| s.0).collect();
+            let ext = transform_extent(ctx.adjustment, (b.img.width, b.img.height), &ms);
+            let shift = Mat3::translate(vec2(-ext.0 as f64, -ext.1 as f64));
+            let mut acc = Image::new(ext.2, ext.3);
+            for (m, op) in &samples {
+                let mut one = Image::new(ext.2, ext.3);
+                effectcraft_raster::composite_warp(
+                    &mut one,
+                    &b.img,
+                    &(shift * *m),
+                    &effectcraft_raster::WarpOpts { opacity: *op, sampling, ..Default::default() },
+                );
+                acc.data.iter_mut().zip(&one.data).for_each(|(a, o)| (0..4).for_each(|c| a[c] += o[c]));
+            }
+            let k = 1.0 / samples.len() as f32;
+            acc.data.iter_mut().for_each(|p| p.iter_mut().for_each(|v| *v *= k));
+            regrid(&mut b, ext, acc);
             return b;
         }
     }
-    let m = Mat3::translate(vec2(pos.0, pos.1))
-        * Mat3::rotate_deg(rot)
-        * Mat3::skew_deg(skew, skew_axis)
-        * Mat3::scale(vec2(sw / 100.0, sh / 100.0))
-        * Mat3::translate(vec2(-anchor.0, -anchor.1));
-    let mut out = Image::new(b.img.width, b.img.height);
-    effectcraft_raster::composite_warp(&mut out, &b.img, &m, &effectcraft_raster::WarpOpts { opacity, sampling, ..Default::default() });
-    b.img = out;
+    let m = transform_effect_matrix(ctx.params, anchor, pos);
+    let ext = transform_extent(ctx.adjustment, (b.img.width, b.img.height), &[m]);
+    let mut out = Image::new(ext.2, ext.3);
+    let shift = Mat3::translate(vec2(-ext.0 as f64, -ext.1 as f64));
+    effectcraft_raster::composite_warp(&mut out, &b.img, &(shift * m), &effectcraft_raster::WarpOpts { opacity, sampling, ..Default::default() });
+    regrid(&mut b, ext, out);
     b
 }
 
@@ -519,6 +559,32 @@ mod tests {
         assert!(asym.img.data.iter().zip(&sym.img.data).any(|(a, b)| differs(*a, *b)));
         // Corners lie beyond radius 100 % (half the layer) and stay put.
         assert_eq!(asym.img.get(0, 0), im.get(0, 0));
+    }
+
+    #[test]
+    fn transform_effect_skews_after_rotating_and_keeps_moved_pixels() {
+        // SceneYard Calendar Page Tear: Rotation -20 with Skew 20 leans a page into a pure
+        // horizontal shear (rows stay rows, about 1/cos 20° further from the anchor), as in AE.
+        let mut im = Image::new(60, 60);
+        for x in 10..50 {
+            im.set(x, 40, [1.0; 4]);
+        }
+        let set = [("anchor", Value::Vec2([30.0, 30.0])), ("position", Value::Vec2([30.0, 30.0])), ("skew", num(20.0)), ("rotation", num(-20.0))];
+        let out = run("ec.distort.transform", &set, im);
+        let row = |b: &Buf, y: i64| (0..b.img.width as i64).filter(|&x| b.img.get(x, y)[3] > 0.3).count();
+        let y = (40.0 - 30.0) / 20f64.to_radians().cos() + 30.0 + out.offset[1];
+        assert!(row(&out, y.floor() as i64) + row(&out, y.ceil() as i64) >= 30, "the bar stays one horizontal row");
+        // A rotation that carries content past the old edges grows the buffer instead of cutting it.
+        let mut sq = Image::new(40, 10);
+        for x in 0..40 {
+            for y in 0..10 {
+                sq.set(x, y, [1.0; 4]);
+            }
+        }
+        let rot = run("ec.distort.transform", &[("anchor", Value::Vec2([20.0, 5.0])), ("position", Value::Vec2([20.0, 5.0])), ("rotation", num(90.0))], sq);
+        assert!(rot.img.height >= 40, "{}x{}", rot.img.width, rot.img.height);
+        let covered: f32 = rot.img.data.iter().map(|p| p[3]).sum();
+        assert!((covered - 400.0).abs() < 10.0, "{covered}");
     }
 
     #[test]

@@ -40,7 +40,7 @@ fn dst_twirl(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 // ---------------------------------------------------------------- Bulge (distort::bulge)
-// f[0] = (cx, cy, rx, ry); f[1] = (height, taper, pin, edge); f[2] = layer rect (x, y, w, h)
+// f[0] = (cx, cy, rx, ry); f[1] = (height × strength, taper, pin, edge); f[2] = layer rect (x, y, w, h)
 @compute @workgroup_size(16, 16)
 fn dst_bulge(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = vec2<i32>(gid.xy);
@@ -56,7 +56,7 @@ fn dst_bulge(@builtin(global_invocation_id) gid: vec3<u32>) {
     let d2 = dx * dx + dy * dy;
     var s = q;
     if (d2 < 1.0) {
-        var amt = P.f[1].x * pow(1.0 - d2, P.f[1].y) * 0.5;
+        var amt = P.f[1].x * pow(1.0 - d2, P.f[1].y);
         if (P.f[1].z > 0.5) {
             let l = P.f[2];
             let edge = P.f[1].w;

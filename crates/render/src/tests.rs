@@ -425,3 +425,47 @@ fn auto_backend_sends_2d_and_3d_comps_to_the_gpu() {
     p.settings.gpu_acceleration = false;
     assert!(!asked(&p, crate::Backend::Auto));
 }
+
+/// An adjustment layer's effect points are in its own layer space: a 100×100 adjustment layer
+/// on the right half rotates the comp below about its own centre (comp 150, 50), not comp (50, 50)
+/// (SceneYard UI Assistive Touch: a moved Bulge adjustment layer bulged the wrong spot).
+#[test]
+fn adjustment_layer_effects_use_its_layer_space() {
+    let (mut p, cid, comp) = setup();
+    let mut red = solid(&mut p, &comp, [1.0, 0.0, 0.0], 10, 10);
+    red.props.prop_mut("transform/position").unwrap().value = Value::Vec3([135.0, 50.0, 0.0]);
+    let mut adj = solid(&mut p, &comp, [1.0, 1.0, 1.0], 100, 100);
+    adj.switches.adjustment = true;
+    adj.props.prop_mut("transform/position").unwrap().value = Value::Vec3([150.0, 50.0, 0.0]);
+    let at = [("anchor", Value::Vec2([50.0, 50.0])), ("position", Value::Vec2([50.0, 50.0])), ("rotation", Value::Scalar(180.0))];
+    add_effect(&mut p, &mut adj, "ec.distort.transform", [100.0, 100.0], &at);
+    let c = p.comp_mut(cid).unwrap();
+    c.layers.push(adj);
+    c.layers.push(red);
+    let img = render_frame(&p, cid, Tick::ZERO, 1.0);
+    assert!(img.get(165, 50)[0] > 0.9, "{:?}", img.get(165, 50));
+    assert!(img.get(135, 50)[3] < 0.1, "{:?}", img.get(135, 50));
+}
+
+/// A shape layer's effect points are measured on a comp-sized canvas centred on its anchor
+/// (SceneYard Calendar Page Tear: pages hinge on a Transform effect anchor at the comp-space top
+/// edge). Rotating a 40×10 bar 90° about effect point (100, 50) — the bar's centre — keeps it
+/// in place, upright.
+#[test]
+fn shape_layer_effect_points_use_the_comp_sized_canvas() {
+    let (mut p, cid, comp) = setup();
+    let mut l = build::layer(&mut p, &comp, "Shape", LayerSource::Shape, (200, 100), None);
+    let mut next = p.next_id;
+    let mut ids = Ids(&mut next);
+    let rect = build::shape_rect(&mut ids, [40.0, 10.0], [0.0, 0.0], 0.0);
+    let fill = build::shape_fill(&mut ids, [1.0, 0.0, 0.0, 1.0]);
+    let g = build::shape_group(&mut ids, "Bar", vec![rect, fill]);
+    p.next_id = next;
+    l.props.sub_mut("contents").unwrap().children.push(g.into());
+    let at = [("anchor", Value::Vec2([100.0, 50.0])), ("position", Value::Vec2([100.0, 50.0])), ("rotation", Value::Scalar(90.0))];
+    add_effect_200(&mut p, &mut l, "ec.distort.transform", &at);
+    p.comp_mut(cid).unwrap().layers.push(l);
+    let img = render_frame(&p, cid, Tick::ZERO, 1.0);
+    assert!(img.get(100, 65)[0] > 0.9, "{:?}", img.get(100, 65));
+    assert!(img.get(115, 50)[3] < 0.1, "{:?}", img.get(115, 50));
+}
