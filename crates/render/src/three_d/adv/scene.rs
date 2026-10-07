@@ -845,6 +845,19 @@ pub(crate) fn add_environment(b: &mut Builder, w: u32, h: u32, data: Vec<[f32; 4
 /// show reflections. Cards and extrusions (lit through their classic Material Options) stay
 /// unlit, as without lights.
 fn default_environment(b: &mut Builder) {
+    let (w, h, data) = studio_environment();
+    add_environment(b, w, h, data, [1.0; 3], 0.0);
+    let meshes: std::collections::HashSet<u32> = b.mesh_mats.iter().copied().collect();
+    for (i, m) in b.s.materials.iter_mut().enumerate() {
+        if !meshes.contains(&(i as u32)) {
+            m.accepts_lights = false;
+        }
+    }
+}
+
+/// The procedural studio environment of [`default_environment`] (linear radiance, 64×32
+/// equirectangular).
+fn studio_environment() -> (u32, u32, Vec<[f32; 4]>) {
     let (w, h) = (64u32, 32u32);
     // A dim surround, a soft key above the camera and two side lights (radiance; linear).
     let (base, key, key_el, rad, side, side_el, side_az) = (0.05f32, 6.0f32, 35.0f32, 30.0f32, 3.0f32, 20.0f32, 90.0f32);
@@ -867,13 +880,7 @@ fn default_environment(b: &mut Builder) {
             [v, v, v, 1.0]
         })
         .collect();
-    add_environment(b, w, h, data, [1.0; 3], 0.0);
-    let meshes: std::collections::HashSet<u32> = b.mesh_mats.iter().copied().collect();
-    for (i, m) in b.s.materials.iter_mut().enumerate() {
-        if !meshes.contains(&(i as u32)) {
-            m.accepts_lights = false;
-        }
-    }
+    (w, h, data)
 }
 
 /// The environment layer's pixels as linear straight RGBA.
@@ -989,9 +996,10 @@ pub(crate) fn build_at(r: &Renderer, ctx: &EvalCtx, sub: Option<&EvalCtx>, run: 
         let (ls, amb, env) = lights(ctx, lin);
         b.s.lights = ls;
         b.s.ambient = amb;
-        if let Some((src, k, rot)) = env
-            && let Some((w, h, d)) = env_pixels(r, ctx, src, lin)
-        {
+        if let Some((src, k, rot)) = env {
+            // No source layer (or none to be found): After Effects lights with its default
+            // environment, through the light's Intensity, Colour and Rotation.
+            let (w, h, d) = env_pixels(r, ctx, src, lin).unwrap_or_else(studio_environment);
             add_environment(&mut b, w, h, d, k, rot);
         }
         let any_light = ctx.comp.layers.iter().any(|l| l.is_light() && l.switches.video && l.is_active_at(ctx.time));
