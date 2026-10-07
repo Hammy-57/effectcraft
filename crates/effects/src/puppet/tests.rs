@@ -111,7 +111,7 @@ fn rect_mesh(w: f64, h: f64, tris: f64) -> Mesh {
 }
 
 fn pin(kind: PinKind, rest: [f64; 2], pos: [f64; 2]) -> Pin {
-    Pin { kind, uid: 0, rest, position: pos, scale: 1.0, rotation: 0.0, amount: 50.0, extent: 15.0, in_front: 50.0 }
+    Pin { kind, uid: 0, vertex_index: None, rest, position: pos, scale: 1.0, rotation: 0.0, amount: 50.0, extent: 15.0, in_front: 50.0 }
 }
 
 #[test]
@@ -305,4 +305,41 @@ fn groups_round_trip_serde() {
     assert_eq!(m[0].pins.len(), 2);
     assert_eq!(m[0].pins[1].kind, PinKind::Starch);
     assert_eq!(m[0].pins[0].position, [3.0, 4.0]);
+}
+
+#[test]
+fn imported_topology_and_vertex_index_override_alpha_and_nearest() {
+    let mut fx = puppet_fx(&[(PinKind::Position, [0.0, 0.0], [5.0, 0.0])]);
+    let mesh = fx
+        .children
+        .iter_mut()
+        .find_map(|n| match n {
+            effectcraft_project::Node::Group(g) if g.match_id == "mesh" => Some(g),
+            _ => None,
+        })
+        .unwrap();
+    let geometry = MeshGeometry { vertices: vec![[0.0, 0.0], [10.0, 0.0], [0.0, 10.0], [10.0, 10.0]], triangles: vec![[0, 1, 2], [1, 3, 2]] };
+    let mut next = 9000;
+    let mut ids = Ids(&mut next);
+    mesh.children.push(hidden(&mut ids, "imported_geometry", Value::Str(serde_json::to_string(&geometry).unwrap())).into());
+    let pin = mesh
+        .sub_mut("deform")
+        .unwrap()
+        .children
+        .iter_mut()
+        .find_map(|n| match n {
+            effectcraft_project::Node::Group(g) => Some(g),
+            _ => None,
+        })
+        .unwrap();
+    pin.children.push(hidden(&mut ids, "ae_vertex_index", Value::Scalar(3.0)).into());
+    let params = flatten_params(&fx, &mut |p| p.value.clone());
+    let parsed = parse(&params);
+    let buf = Buf { img: Image::new(1, 1), offset: [0.0; 2], scale: 1.0 };
+    let native = mesh_for(&buf, &parsed[0]);
+    assert_eq!(native.verts, geometry.vertices);
+    assert_eq!(native.tris, geometry.triangles);
+    assert_eq!(parsed[0].pins[0].vertex_index, Some(3));
+    let moved = solve(&native, &parsed[0].pins, 1);
+    assert_eq!(moved[3], [15.0, 10.0]);
 }

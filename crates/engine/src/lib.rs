@@ -138,7 +138,12 @@ impl Services for FsServices {
         let python = std::env::var_os("EFFECTCRAFT_AEP_PYTHON").unwrap_or_else(|| "python3".into());
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
         let output = std::env::temp_dir().join(format!("effectcraft-aep-{}-{stamp}.json", std::process::id()));
-        let run = std::process::Command::new(python).arg(script).arg(path).arg("-o").arg(&output).output()?;
+        let mut command = std::process::Command::new(python);
+        command.arg(script).arg(path).arg("-o").arg(&output);
+        if let Some(root) = std::env::var_os("EFFECTCRAFT_AEP_FONT_ROOT").filter(|root| !root.is_empty()) {
+            command.arg("--font-search-root").arg(root);
+        }
+        let run = command.output()?;
         if !run.status.success() {
             let _ = std::fs::remove_file(&output);
             let error = String::from_utf8_lossy(&run.stderr);

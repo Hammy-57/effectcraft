@@ -195,6 +195,22 @@ EXPLICIT_CHILDREN = {'PEDG': {f'PEDG-{number:04d}': f'PEDG-{number:04d}'
                          'Keylight 906-0065': 'edgeColourCorrection/edgeColourBalanceHue',
                          'Keylight 906-0066': 'edgeColourCorrection/edgeColourBalanceSaturation',
                      },
+                     # AE repeats labels (Feather, Contrast, Shift Edge, Reduce Chatter) in
+                     # separate matte groups; their raw IDs identify the intended native control.
+                     'ADBE Samurai': {
+                         '/spatialsmoothing2': 'rotoBrushMatte/feather',
+                         '/spatialsoftness2': 'rotoBrushMatte/contrast',
+                         '/rmshiftedges': 'rotoBrushMatte/shiftEdge',
+                         '/rmreducechatter': 'rotoBrushMatte/reduceChatter',
+                         '/HBspatialsoftness2': 'refineEdgeMatte/feather',
+                         '/HBspatialcontrast': 'refineEdgeMatte/contrast',
+                         '/HBspatialchoke': 'refineEdgeMatte/shiftEdge',
+                         '/rm2reducechatter': 'refineEdgeMatte/reduceChatter',
+                         '/rmsamplesperframe': 'refineEdgeMatte/motionBlur/motionBlurSamples',
+                         '/rmcleaningamount': 'refineEdgeMatte/decontamination/decontaminationAmount',
+                         '/rmadditionalcleaningradius': 'refineEdgeMatte/decontamination/increaseDecontaminationRadius',
+                         '/rmviewedgecleaningmap': 'refineEdgeMatte/decontamination/viewDecontaminationMap',
+                     },
                      'PESS2': {f'PESS2-{number:04d}': f'PESS2-{number:04d}'
                                for number in (2, 4, 5, 6, 8, 9, 22, 27, 28, 44)},
                      'PESS3': {f'PESS3-{number:04d}': f'PESS3-{number:04d}'

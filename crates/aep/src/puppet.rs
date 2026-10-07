@@ -1,7 +1,20 @@
 //! AE FreePin3's nested meshes and pins into EffectCraft's editable Puppet tree.
 
 use super::*;
-use effectcraft_effects::puppet::{self, MeshOpts, PinKind};
+use effectcraft_effects::puppet::{self, MeshGeometry, MeshOpts, PinKind};
+
+fn raw_state(project: &mut Project, group: &mut PropGroup, name: &str, ir: &Json, losses: &mut Vec<String>, context: &str) {
+    if let Some(state) = string(ir, &[name]) {
+        if state.len() > 12_000_000 {
+            losses.push(format!("{context}: oversized Puppet {name} state omitted"));
+            return;
+        }
+        let mut p = Property::new(project.alloc(), name, name, Value::Str(state.to_owned()));
+        p.ui = ParamUi::Hidden;
+        p.static_only = true;
+        group.children.push(p.into());
+    }
+}
 
 fn child<'a>(group: &'a Json, match_name: &str) -> Option<&'a Json> {
     array(group, "children").iter().find(|c| string(c, &["match_name"]) == Some(match_name))
@@ -131,6 +144,20 @@ fn import_mesh(project: &mut Project, fx: &mut PropGroup, ir: &Json, layer_time:
     }
     let mut mesh = puppet::mesh_group(&mut build::Ids(&mut project.next_id), string(ir, &["name"]).unwrap_or("Mesh"), seed, &opts);
     mesh.enabled = boolean(ir, &["enabled"]).unwrap_or(true);
+    raw_state(project, &mut mesh, "pedt_b64", ir, losses, context);
+    raw_state(project, &mut mesh, "fpms_b64", ir, losses, context);
+    let imported = ir.get("mesh_geometry").and_then(|v| serde_json::from_value::<MeshGeometry>(v.clone()).ok()).and_then(|g| g.clone().native().map(|_| g));
+    if let Some(geometry) = imported {
+        if let Ok(serialized) = serde_json::to_string(&geometry) {
+            let mut p = Property::new(project.alloc(), "imported_geometry", "Imported Geometry", Value::Str(serialized));
+            p.ui = ParamUi::Hidden;
+            p.static_only = true;
+            mesh.children.push(p.into());
+        }
+        losses.push(format!("{context}: Puppet imported mesh uses native solver; AE frame parity unverified"));
+    } else {
+        losses.push(format!("{context}: Puppet mesh geometry regenerated from layer alpha; AE frame parity unverified"));
+    }
     if let Some(deform) = mesh.sub_mut("deform") {
         for pin in pins {
             import_pin(project, deform, pin, layer_time, losses, context);
@@ -147,8 +174,6 @@ fn import_mesh(project: &mut Project, fx: &mut PropGroup, ir: &Json, layer_time:
             losses.push(format!("{context}: unsupported Puppet mesh field {m}"));
         }
     }
-    // AE's serialized mesh is opaque; the native renderer regenerates geometry from layer alpha.
-    losses.push(format!("{context}: Puppet mesh geometry regenerated from layer alpha"));
     fx.children.push(mesh.into());
 }
 
@@ -167,6 +192,7 @@ pub(super) fn import(project: &mut Project, fx: &mut PropGroup, ir: &Json, layer
         losses.push(format!("{context}: unsupported Puppet On Transparent setting"));
     }
     if let Some(arap) = child(ir, "ADBE FreePin3 ARAP Group") {
+        raw_state(project, fx, "fpol_b64", arap, losses, context);
         if let Some(meshes) = child(arap, "ADBE FreePin3 Mesh Group") {
             for mesh in array(meshes, "children") {
                 if string(mesh, &["match_name"]) == Some("ADBE FreePin3 Mesh Atom") {
@@ -279,5 +305,26 @@ mod tests {
             assert_eq!(prop.keys.len(), 2);
             assert_eq!(prop.ui, ParamUi::Hidden);
         }
+    }
+
+    #[test]
+    fn imports_rest_topology_and_preserves_opaque_states() {
+        let ir = serde_json::json!({"children":[{"match_name":"ADBE FreePin3 ARAP Group","fpol_b64":"outline","children":[
+            {"match_name":"ADBE FreePin3 Mesh Group","children":[{"match_name":"ADBE FreePin3 Mesh Atom",
+                "pedt_b64":"mesh","fpms_b64":"cache",
+                "mesh_geometry":{"vertices":[[0.0,0.0],[10.0,0.0],[0.0,10.0]],"triangles":[[0,1,2]]},
+                "children":[]}]}
+        ]}]});
+        let mut project = Project::default();
+        let mut fx =
+            effectcraft_effects::instantiate(effectcraft_effects::find(puppet::ID).unwrap(), &mut build::Ids(&mut project.next_id), "Puppet", [10.0, 10.0]);
+        let mut losses = vec![];
+        import(&mut project, &mut fx, &ir, LayerTime { start: tick(0.0), stretch: 100.0 }, &mut losses, "test");
+        let mesh = puppet::meshes(&fx).next().unwrap();
+        assert!(mesh.get("imported_geometry").is_some());
+        assert_eq!(mesh.get("pedt_b64").unwrap().value, Value::Str("mesh".into()));
+        assert_eq!(mesh.get("fpms_b64").unwrap().value, Value::Str("cache".into()));
+        assert_eq!(fx.get("fpol_b64").unwrap().value, Value::Str("outline".into()));
+        assert!(losses.iter().any(|loss| loss.contains("AE frame parity unverified")));
     }
 }

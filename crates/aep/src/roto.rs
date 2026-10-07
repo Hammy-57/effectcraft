@@ -141,7 +141,8 @@ pub(super) fn import(
         "children".into(),
         Json::Array(array(ir, "children").iter().filter(|c| string(c, &["match_name"]) != Some("ADBE Samurai Strokes Group")).cloned().collect()),
     );
-    import_native_effect_params(project, fx, &Json::Object(plain), roto::ID, layer_time, losses, context, 0);
+    let plain = Json::Object(plain);
+    import_native_effect_params(project, fx, &plain, &plain, roto::ID, layer_time, losses, context, 0);
     let Some(group) = child(ir, "ADBE Samurai Strokes Group") else { return };
     let mut strokes = Vec::new();
     let mut base = None;
@@ -213,5 +214,92 @@ mod tests {
         assert_eq!(data["strokes"][1]["frame"], 30);
         assert_eq!(data["strokes"][0]["radius"], 4.0);
         assert_eq!(fx.prop("rotoBrushPropagation/searchRadius").unwrap().value.as_f64(), 30.0);
+        assert!(losses.iter().any(|loss| loss.contains("AE frozen segmentation cannot be imported")));
+        assert_eq!(fx.prop(roto::FROZEN).unwrap().value, Value::Str(String::new()));
+    }
+
+    #[test]
+    fn imports_reviewed_matte_controls_as_editable_native_properties() {
+        let mut project = Project::default();
+        let mut fx =
+            effectcraft_effects::instantiate(effectcraft_effects::find(roto::ID).unwrap(), &mut build::Ids(&mut project.next_id), "Roto", [100.0, 100.0]);
+        let controls = [
+            ("/spatialsmoothing2", "rotoBrushMatte/feather", 5.0),
+            ("/spatialsoftness2", "rotoBrushMatte/contrast", 80.0),
+            ("/rmshiftedges", "rotoBrushMatte/shiftEdge", -12.0),
+            ("/rmreducechatter", "rotoBrushMatte/reduceChatter", 14.0),
+            ("/HBspatialsoftness2", "refineEdgeMatte/feather", 2.0),
+            ("/HBspatialcontrast", "refineEdgeMatte/contrast", 25.0),
+            ("/HBspatialchoke", "refineEdgeMatte/shiftEdge", -3.0),
+            ("/rm2reducechatter", "refineEdgeMatte/reduceChatter", 50.0),
+            ("/rmsamplesperframe", "refineEdgeMatte/motionBlur/motionBlurSamples", 8.0),
+            ("/rmcleaningamount", "refineEdgeMatte/decontamination/decontaminationAmount", 75.0),
+            ("/rmadditionalcleaningradius", "refineEdgeMatte/decontamination/increaseDecontaminationRadius", 4.0),
+        ];
+        let mut children: Vec<Json> = controls.iter().map(|(raw, _, value)| serde_json::json!({"match_name":raw,"value":value})).collect();
+        children.push(serde_json::json!({"match_name":"/rmviewedgecleaningmap","value":1}));
+        children[0]["keyframes"] = serde_json::json!([
+            {"time":0.0,"value":5.0}, {"time":1.0,"value":9.0}
+        ]);
+        let mut losses = Vec::new();
+        import(
+            &mut project,
+            &mut fx,
+            &serde_json::json!({"children":children}),
+            [100.0, 100.0],
+            25.0,
+            LayerTime { start: Tick::ZERO, stretch: 100.0 },
+            &mut losses,
+            "test",
+        );
+        assert!(losses.is_empty(), "{losses:?}");
+        for (_, path, value) in controls {
+            assert_eq!(fx.prop(path).unwrap().value.as_f64(), value, "{path}");
+        }
+        assert_eq!(fx.prop("rotoBrushMatte/feather").unwrap().keys.len(), 2);
+        assert_eq!(fx.prop("rotoBrushMatte/feather").unwrap().keys[1].value.as_f64(), 9.0);
+        assert_eq!(fx.prop("refineEdgeMatte/decontamination/viewDecontaminationMap").unwrap().value, Value::Bool(true));
+
+        let saved = serde_json::to_string(&fx).unwrap();
+        let mut reopened: PropGroup = serde_json::from_str(&saved).unwrap();
+        assert_eq!(reopened.prop("rotoBrushMatte/contrast").unwrap().value.as_f64(), 80.0);
+        reopened.prop_mut("rotoBrushMatte/contrast").unwrap().value = Value::Scalar(40.0);
+        assert_eq!(reopened.prop("rotoBrushMatte/contrast").unwrap().value.as_f64(), 40.0);
+        assert_eq!(fx.prop("rotoBrushMatte/contrast").unwrap().value.as_f64(), 80.0);
+    }
+
+    #[test]
+    fn unsupported_samurai_controls_remain_explicit_losses() {
+        let mut project = Project::default();
+        let mut fx =
+            effectcraft_effects::instantiate(effectcraft_effects::find(roto::ID).unwrap(), &mut build::Ids(&mut project.next_id), "Roto", [100.0, 100.0]);
+        let unsupported = [
+            "/use_adobecut_too",
+            "/edgedetection",
+            "/enfromulate",
+            "/invertforegroundbackground",
+            "/rmrefinematteenable",
+            "/renderHB",
+            "/baserefineedgeradius",
+            "/rmrefinematte2enable",
+            "/chatter_reduction2",
+        ];
+        let children: Vec<Json> = unsupported.iter().map(|raw| serde_json::json!({"match_name":raw,"value":1})).collect();
+        let mut losses = Vec::new();
+        import(
+            &mut project,
+            &mut fx,
+            &serde_json::json!({"children":children}),
+            [100.0, 100.0],
+            25.0,
+            LayerTime { start: Tick::ZERO, stretch: 100.0 },
+            &mut losses,
+            "test",
+        );
+        assert_eq!(losses.len(), unsupported.len(), "{losses:?}");
+        for raw in unsupported {
+            assert!(losses.iter().any(|loss| loss.contains(raw)), "{raw}");
+            assert!(fx.get(raw).is_some(), "opaque value remains available: {raw}");
+        }
     }
 }

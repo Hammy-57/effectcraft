@@ -15,6 +15,7 @@ use effectcraft_time::{FrameRate, Tick};
 use serde_json::Value as Json;
 
 mod color_ease;
+mod effect_defaults;
 mod effects;
 mod looks;
 mod markers_essential;
@@ -422,11 +423,21 @@ pub fn import_ir(
                 }
                 if let Some(m) = matte {
                     let mid = integer(&m, &["layer_id"]);
-                    let kind = match string(&m, &["type"]).unwrap_or("alpha").to_ascii_lowercase().as_str() {
-                        "alpha" => Some(MatteKind::Alpha),
-                        "alpha_inverted" | "alphainverted" => Some(MatteKind::AlphaInverted),
-                        "luma" => Some(MatteKind::Luma),
-                        "luma_inverted" | "lumainverted" => Some(MatteKind::LumaInverted),
+                    let kind = match m.get("type") {
+                        Some(Json::Number(n)) => match n.as_i64() {
+                            Some(5013) => Some(MatteKind::Alpha),
+                            Some(5014) => Some(MatteKind::AlphaInverted),
+                            Some(5015) => Some(MatteKind::Luma),
+                            Some(5016) => Some(MatteKind::LumaInverted),
+                            _ => None,
+                        },
+                        Some(Json::String(s)) => match s.to_ascii_lowercase().as_str() {
+                            "alpha" => Some(MatteKind::Alpha),
+                            "alpha_inverted" | "alphainverted" => Some(MatteKind::AlphaInverted),
+                            "luma" => Some(MatteKind::Luma),
+                            "luma_inverted" | "lumainverted" => Some(MatteKind::LumaInverted),
+                            _ => None,
+                        },
                         _ => None,
                     };
                     layer.track_matte = mid.and_then(|m| local_ids.get(&m).copied()).zip(kind).map(|(layer, kind)| TrackMatte { layer, kind });
@@ -503,6 +514,21 @@ fn import_implicit_camera(
         .and_then(vec3)
         .ok_or_else(|| AepError::Invalid(format!("comp {ae_comp}: implicit camera point of interest is invalid")))?;
     let zoom = number(pose, &["zoom"]).filter(|v| *v > 0.0).ok_or_else(|| AepError::Invalid(format!("comp {ae_comp}: implicit camera zoom is invalid")))?;
+    // Older IR exposed the hidden default camera's unauthored Position as its POI. The eye
+    // actually sits one zoom distance behind that plane; otherwise z=0 layers are clipped.
+    let eye_z = position[2] - zoom;
+    let default_eye = position == poi
+        && eye_z.is_finite()
+        && array(ir, "properties")
+            .iter()
+            .find(|group| string(group, &["match_name"]) == Some("ADBE Transform Group"))
+            .and_then(|group| array(group, "children").iter().find(|prop| string(prop, &["match_name"]) == Some("ADBE Position")))
+            .is_some_and(|prop| {
+                !boolean(prop, &["authored"]).unwrap_or(false)
+                    && !boolean(prop, &["dimensions_separated"]).unwrap_or(false)
+                    && array(prop, "keyframes").is_empty()
+                    && string(prop, &["expression"]).unwrap_or("").is_empty()
+            });
     for prop in array(ir, "properties") {
         if !check_property_budget(prop, property_budget, 0) {
             return Err(AepError::Invalid(format!("comp {ae_comp}: implicit camera property or keyframe limit exceeded")));
@@ -544,6 +570,9 @@ fn import_implicit_camera(
             losses,
             &format!("comp {ae_comp} implicit camera {ae_id}"),
         );
+    }
+    if default_eye && let Some(position_prop) = camera.transform_mut().and_then(|transform| transform.get_mut("position")) {
+        position_prop.value = Value::Vec3([position[0], position[1], eye_z]);
     }
     Ok((ae_id, camera))
 }
@@ -908,7 +937,10 @@ fn import_property(
                 if spec.id == "ec.color.curves" {
                     import_curves_state(&mut group, ir, losses, context);
                 }
-                import_native_effect_params(project, &mut group, ir, spec.id, layer_time, losses, context, depth + 1);
+                import_native_effect_params(project, &mut group, ir, ir, spec.id, layer_time, losses, context, depth + 1);
+                if spec.id == "S_CartoonPaint" {
+                    losses.push(format!("{context}: S_CartoonPaint brush-stroke rendering is approximate; visual parity unverified"));
+                }
             }
             if spec.id == "ec.perspective.ccsphere"
                 && group.prop("metal").is_some_and(|metal| {
@@ -1028,6 +1060,15 @@ fn import_property(
             }
         }
     } else if kind == "property" {
+        // py-aep exposes placeholder 10px Dash/Gap slots even for solid strokes. Only
+        // authored slots belong to the stroke; importing placeholders makes it dashed.
+        if parent.match_id == "dashes"
+            && boolean(ir, &["authored"]) == Some(false)
+            && array(ir, "keyframes").is_empty()
+            && string(ir, &["expression"]).unwrap_or("").is_empty()
+        {
+            return;
+        }
         let value_json = ir.get("value").unwrap_or(&Json::Null);
         let value_type = string(ir, &["value_type"]).unwrap_or("");
         if value_json.is_null() && array(ir, "keyframes").is_empty() {
@@ -1056,7 +1097,11 @@ fn import_property(
         let at = if let Some(at) = existing {
             at
         } else {
-            let template = text_anim::template(parent.match_id.as_str(), match_id).unwrap_or_else(|| value.clone());
+            let template = if shapes::is_popup(parent.match_id.as_str(), match_id) {
+                Value::Enum(0)
+            } else {
+                text_anim::template(parent.match_id.as_str(), match_id).unwrap_or_else(|| value.clone())
+            };
             parent.children.push(Node::Prop(Property::new(project.alloc(), match_id, name, template)));
             parent.children.len() - 1
         };
@@ -1110,6 +1155,7 @@ fn import_native_effect_params(
     project: &mut Project,
     group: &mut PropGroup,
     ir: &Json,
+    effect_ir: &Json,
     effect_id: &str,
     layer_time: LayerTime,
     losses: &mut Vec<String>,
@@ -1122,7 +1168,7 @@ fn import_native_effect_params(
     }
     for child in array(ir, "children") {
         if string(child, &["kind"]) == Some("group") {
-            import_native_effect_params(project, group, child, effect_id, layer_time, losses, context, depth + 1);
+            import_native_effect_params(project, group, child, effect_ir, effect_id, layer_time, losses, context, depth + 1);
             continue;
         }
         let Some(raw) = string(child, &["match_name"]) else { continue };
@@ -1158,7 +1204,9 @@ fn import_native_effect_params(
             continue;
         }
         let Some(path) = effects::param_id(effect_id, raw) else {
-            losses.push(format!("{context}: unsupported {effect_id} parameter {raw}"));
+            if !effect_defaults::inert(effect_id, raw, child, effect_ir) {
+                losses.push(format!("{context}: unsupported {effect_id} parameter {raw}"));
+            }
             if let Some(value) = convert_value(value_json, string(child, &["value_type"]).unwrap_or("")) {
                 let mut prop = Property::new(project.alloc(), raw, string(child, &["name"]).unwrap_or(raw), value.clone());
                 fill_property(&mut prop, child, value, string(child, &["value_type"]).unwrap_or(""), 1.0, layer_time, losses, context);
@@ -1629,7 +1677,7 @@ mod tests {
              "keyframes":[{"time":0.0,"value":0.2},{"time":1.0,"value":1.0}]}
         ]});
         let mut losses = Vec::new();
-        import_native_effect_params(&mut project, &mut effect, &ir, spec.id, LayerTime { start: Tick::ZERO, stretch: 100.0 }, &mut losses, "test", 0);
+        import_native_effect_params(&mut project, &mut effect, &ir, &ir, spec.id, LayerTime { start: Tick::ZERO, stretch: 100.0 }, &mut losses, "test", 0);
         let opacity = effect.get("opacity").unwrap();
         assert_eq!(opacity.value, Value::Scalar(50.0));
         assert_eq!(opacity.keys.iter().map(|k| k.value.clone()).collect::<Vec<_>>(), vec![Value::Scalar(20.0), Value::Scalar(100.0)]);
@@ -1814,6 +1862,26 @@ mod tests {
     }
 
     #[test]
+    fn unauthored_implicit_camera_eye_uses_zoom_depth() {
+        let mut ir = serde_json::json!({"schema_version":1,"items":[{"id":1,"kind":"comp","name":"C","width":100,"height":100,"duration":1,
+            "default_camera":{"id":9,"kind":"CameraLayer","implicit":true,
+                "pose":{"position":[50,50,0],"point_of_interest":[50,50,0],"zoom":300},
+                "switches":{"enabled":true,"is_3d":true,"auto_orient":4214},
+                "properties":[{"kind":"group","match_name":"ADBE Transform Group","children":[
+                    {"kind":"property","match_name":"ADBE Position","authored":false,"value":[50,50,0],"keyframes":[]}]}]},
+            "layers":[]}]});
+        let mut project = Project::default();
+        let result = import_ir(&mut project, ir.to_string().as_bytes(), "", &mut |_| None).unwrap();
+        let camera = project.comp(result.primary_comp.unwrap()).unwrap().active_camera(Tick::ZERO).unwrap();
+        assert_eq!(camera.transform().unwrap().get("position").unwrap().value.as_vec3(), [50.0, 50.0, -300.0]);
+        ir["items"][0]["default_camera"]["properties"][0]["children"][0]["authored"] = Json::Bool(true);
+        let mut project = Project::default();
+        let result = import_ir(&mut project, ir.to_string().as_bytes(), "", &mut |_| None).unwrap();
+        let camera = project.comp(result.primary_comp.unwrap()).unwrap().active_camera(Tick::ZERO).unwrap();
+        assert_eq!(camera.transform().unwrap().get("position").unwrap().value.as_vec3(), [50.0, 50.0, 0.0]);
+    }
+
+    #[test]
     fn camera_options_and_one_node_orientation_use_ae_ids() {
         let mut ir = serde_json::json!({"schema_version":1,"items":[{"id":1,"kind":"comp","name":"Camera Comp","width":2160,"height":3840,"duration":2,"layers":[{"id":2,"kind":"CameraLayer","name":"Camera","switches":{"auto_orient":4212},"properties":[
             {"kind":"group","match_name":"ADBE Transform Group","children":[{"kind":"property","match_name":"ADBE Position","value":[0,0,-1000]}]},
@@ -1864,13 +1932,51 @@ mod tests {
         let mut effect = effectcraft_effects::instantiate(spec, &mut build::Ids(&mut project.next_id), "Drop Shadow", [100.0, 100.0]);
         let mut losses = Vec::new();
         let ir = serde_json::json!({"children":[{"kind":"property","match_name":"ADBE Drop Shadow-9999","value_type":6412,"value":0,"expression":"","keyframes":[]}]});
-        import_native_effect_params(&mut project, &mut effect, &ir, spec.id, LayerTime { start: Tick::ZERO, stretch: 100.0 }, &mut losses, "test", 0);
+        import_native_effect_params(&mut project, &mut effect, &ir, &ir, spec.id, LayerTime { start: Tick::ZERO, stretch: 100.0 }, &mut losses, "test", 0);
         assert!(losses.is_empty());
         assert!(effect.get("ADBE Drop Shadow-9999").is_none());
         let changed = serde_json::json!({"children":[{"kind":"property","match_name":"ADBE Drop Shadow-9999","value_type":6412,"value":1,"expression":"","keyframes":[]}]});
-        import_native_effect_params(&mut project, &mut effect, &changed, spec.id, LayerTime { start: Tick::ZERO, stretch: 100.0 }, &mut losses, "test", 0);
+        import_native_effect_params(
+            &mut project,
+            &mut effect,
+            &changed,
+            &changed,
+            spec.id,
+            LayerTime { start: Tick::ZERO, stretch: 100.0 },
+            &mut losses,
+            "test",
+            0,
+        );
         assert_eq!(losses.len(), 1);
         assert!(effect.get("ADBE Drop Shadow-9999").is_some());
+    }
+
+    #[test]
+    fn inert_effect_defaults_remain_editable_and_changed_values_report_loss() {
+        let mut project = Project::default();
+        let spec = effectcraft_effects::find("S_Monochrome").unwrap();
+        let mut effect = effectcraft_effects::instantiate(spec, &mut build::Ids(&mut project.next_id), "Monochrome", [100.0, 100.0]);
+        let prop = |raw: &str, value: i32| {
+            serde_json::json!({
+                "kind":"property","match_name":raw,"name":raw,"value_type":6417,"value":value,
+                "keyframes":[],"expression":"","expression_enabled":false
+            })
+        };
+        let mut ir = serde_json::json!({"sapphire_mocha_state_hex":"00","children":[
+            prop("S_Monochrome-0001",0),prop("S_Monochrome-0235",0),
+            {"kind":"property","match_name":"S_Monochrome-0520","value":null,"keyframes":[],"expression":"","expression_enabled":false},
+            prop("S_Monochrome-0541",12)
+        ]});
+        let mut losses = Vec::new();
+        import_native_effect_params(&mut project, &mut effect, &ir, &ir, spec.id, LayerTime { start: Tick::ZERO, stretch: 100.0 }, &mut losses, "test", 0);
+        assert!(losses.is_empty());
+        assert_eq!(effect.get("S_Monochrome-0541").unwrap().value.as_f64(), 12.0);
+        ir["children"][0]["value"] = serde_json::json!(1);
+        let mut changed = effectcraft_effects::instantiate(spec, &mut build::Ids(&mut project.next_id), "Monochrome", [100.0, 100.0]);
+        losses.clear();
+        import_native_effect_params(&mut project, &mut changed, &ir, &ir, spec.id, LayerTime { start: Tick::ZERO, stretch: 100.0 }, &mut losses, "test", 0);
+        assert!(losses.iter().any(|loss| loss.contains("S_Monochrome-0541")));
+        assert_eq!(changed.get("S_Monochrome-0541").unwrap().value.as_f64(), 12.0);
     }
 
     #[test]
@@ -1891,6 +1997,47 @@ mod tests {
         assert!(matches!(layer.props.sub("masks").unwrap().sub("mask").unwrap().kind, GroupKind::Mask { .. }));
         let image = effectcraft_render::render_frame(&project, result.primary_comp.unwrap(), Tick::ZERO, 1.0);
         assert!(image.data.iter().any(|pixel| pixel[3] > 0.5));
+    }
+
+    #[test]
+    fn shape_stroke_popup_imports_butt_cap_and_keyed_round_cap() {
+        let path =
+            serde_json::json!({"type":"Shape","data":{"vertices":[[-20,0],[20,0]],"in_tangents":[[0,0],[0,0]],"out_tangents":[[0,0],[0,0]],"closed":false}});
+        let ir = serde_json::json!({"schema_version":1,"items":[{"id":1,"kind":"comp","name":"Main","width":100,"height":100,"duration":2,"layers":[
+        {"id":2,"kind":"ShapeLayer","name":"Line","properties":[{"kind":"group","match_name":"ADBE Root Vectors Group","children":[
+            {"kind":"group","match_name":"ADBE Vector Shape - Group","children":[{"kind":"property","match_name":"ADBE Vector Shape","value":path}]},
+            {"kind":"group","match_name":"ADBE Vector Graphic - Stroke","children":[
+                {"kind":"property","match_name":"ADBE Vector Stroke Color","value":[1,0,0,1]},
+                {"kind":"property","match_name":"ADBE Vector Stroke Width","value":10},
+                {"kind":"property","match_name":"ADBE Vector Stroke Line Cap","value":1,"keyframes":[{"time":0,"value":1},{"time":1,"value":2}]},
+                {"kind":"group","match_name":"ADBE Vector Stroke Dashes","authored":true,"children":[
+                    {"kind":"property","match_name":"ADBE Vector Stroke Dash 1","authored":false,"value":10},
+                    {"kind":"property","match_name":"ADBE Vector Stroke Gap 1","authored":false,"value":10}
+                ]}
+            ]}
+        ]}]}]}]});
+        let mut project = Project::default();
+        let result = import_ir(&mut project, ir.to_string().as_bytes(), "", &mut |_| None).unwrap();
+        let comp = result.primary_comp.unwrap();
+        let stroke = project.comp(comp).unwrap().layers[0].props.sub("contents").unwrap().sub("stroke").unwrap();
+        let cap = stroke.prop("cap").unwrap();
+        assert_eq!(cap.value, Value::Enum(0));
+        assert_eq!(cap.keys.iter().map(|k| &k.value).collect::<Vec<_>>(), [&Value::Enum(0), &Value::Enum(1)]);
+        assert!(stroke.sub("dashes").unwrap().children.is_empty());
+        let frame = effectcraft_render::render_frame(&project, comp, Tick::ZERO, 1.0);
+        assert!(frame.data.iter().any(|pixel| pixel[3] > 0.5));
+    }
+
+    #[test]
+    fn numeric_aep_track_matte_type_keeps_inversion() {
+        let ir = serde_json::json!({"schema_version":1,"items":[{"id":1,"kind":"comp","name":"Main","width":100,"height":100,"duration":1,"layers":[
+            {"id":2,"kind":"null","name":"Text","matte":{"layer_id":3,"type":5014}},
+            {"id":3,"kind":"null","name":"Matte"}
+        ]}]});
+        let mut project = Project::default();
+        let result = import_ir(&mut project, ir.to_string().as_bytes(), "", &mut |_| None).unwrap();
+        let layer = &project.comp(result.primary_comp.unwrap()).unwrap().layers[0];
+        assert!(matches!(layer.track_matte, Some(TrackMatte { kind: MatteKind::AlphaInverted, .. })));
     }
 
     #[test]

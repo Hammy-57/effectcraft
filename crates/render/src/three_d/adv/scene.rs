@@ -432,6 +432,15 @@ pub fn model_to_layer(unit_scale: f64) -> Mat4 {
     Mat4::scale(vec3(unit_scale, -unit_scale, -unit_scale))
 }
 
+/// AE's model source coordinates use the raw mesh axes. Its common glTF root
+/// −90° X conversion is already represented by the editable AE Orientation.
+fn ae_root_correction(m: &model::Model) -> Mat4 {
+    let [root] = m.roots.as_slice() else { return Mat4::IDENTITY };
+    let Some(matrix) = m.nodes.get(*root).and_then(|n| n.matrix) else { return Mat4::IDENTITY };
+    let expected = Mat4::rotate_x(-90.0);
+    if (0..4).all(|i| (0..4).all(|j| (matrix.0[i][j] - expected.0[i][j]).abs() < 1e-6)) { matrix.inverse().unwrap_or(Mat4::IDENTITY) } else { Mat4::IDENTITY }
+}
+
 fn model_layer(r: &Renderer, ctx: &EvalCtx, layer: &Layer, b: &mut Builder) {
     let lin = b.s.linear_io;
     let (opts, prim_mat) = model_options(ctx, layer, lin);
@@ -459,7 +468,9 @@ fn model_layer(r: &Renderer, ctx: &EvalCtx, layer: &Layer, b: &mut Builder) {
         }
         _ => return,
     };
-    let world = b.outer * ctx.world_matrix(layer) * model_to_layer(unit);
+    let ae_source = geo.is_some_and(|g| ctx.b(layer, g, "aeSourceSpace"));
+    let correction = if ae_source { ae_root_correction(&mdl) } else { Mat4::IDENTITY };
+    let world = b.outer * ctx.world_matrix(layer) * model_to_layer(unit) * correction;
     // Materials of the model (one default when it has none).
     let mut mats: Vec<u32> = vec![];
     let defaults = [model::Material::plain([0.8, 0.8, 0.8, 1.0], 0.0, 0.5)];
@@ -961,4 +972,21 @@ pub(crate) fn build_at(r: &Renderer, ctx: &EvalCtx, sub: Option<&EvalCtx>, run: 
     b.s.eye = [cam.eye.x as f32, cam.eye.y as f32, cam.eye.z as f32];
     b.s.ortho = cam.ortho;
     b.s
+}
+
+#[cfg(test)]
+mod ae_model_tests {
+    use super::*;
+
+    #[test]
+    fn ae_source_axes_cancel_only_the_common_gltf_root() {
+        let root = Mat4::rotate_x(-90.0);
+        let mut model = model::Model { nodes: vec![model::Node { matrix: Some(root), ..Default::default() }], roots: vec![0], ..Default::default() };
+        let point = vec3(1.0, 2.0, 3.0);
+        let actual = (model_to_layer(512.0) * ae_root_correction(&model) * root).apply(point);
+        let expected = model_to_layer(512.0).apply(point);
+        assert!((actual.x - expected.x).abs() < 1e-6 && (actual.y - expected.y).abs() < 1e-6 && (actual.z - expected.z).abs() < 1e-6);
+        model.nodes[0].matrix = Some(Mat4::rotate_y(20.0));
+        assert_eq!(ae_root_correction(&model), Mat4::IDENTITY);
+    }
 }
