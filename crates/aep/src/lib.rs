@@ -20,6 +20,7 @@ mod effects;
 mod looks;
 mod markers_essential;
 mod models3d;
+mod orient;
 mod puppet;
 mod roto;
 mod shadow_defaults;
@@ -498,6 +499,7 @@ pub fn import_ir(
         if comp.layers.iter().any(|l| matches!(&l.source, LayerSource::Model { .. })) {
             comp.renderer = effectcraft_project::Renderer::Advanced3D;
         }
+        orient::advanced_orientation(&mut comp, &mut result.losses, &format!("comp {ae_id}"));
         if let Some(i) = next.item_mut(id) {
             i.kind = ItemKind::Comp(Arc::new(comp));
         }

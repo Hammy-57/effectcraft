@@ -277,6 +277,35 @@ fn cards_and_environment_light() {
     assert_eq!(lit.data[80 * 120 + 110][3], 0.0);
 }
 
+/// An Environment light with no source layer lights with the default environment, scaled by
+/// its Intensity and Colour (SceneYard "Space Vision": Environment 180%, no source, the purple
+/// floor about 1.8× its solid colour in After Effects). It added no light at all and, being a
+/// light layer, also kept the no-light default away: the scene rendered black.
+#[test]
+fn environment_light_without_a_source_uses_the_default_environment() {
+    let (mut p, cid) = project(120, 90);
+    let sid = p.add_item(
+        "S",
+        Default::default(),
+        None,
+        ItemKind::Solid(effectcraft_project::Solid { color: [0.3, 0.2, 0.4], width: 60, height: 40, pixel_aspect: 1.0 }),
+    );
+    add(&mut p, cid, LayerSource::Solid { item: sid }, |l| l.switches.three_d = true);
+    let unlit = render(&p, cid).data[20 * 120 + 30];
+    add(&mut p, cid, LayerSource::Light { kind: LightKind::Environment }, |l| set(l, "lightOptions/intensity", Value::Scalar(180.0)));
+    let lit = render(&p, cid).data[20 * 120 + 30];
+    for c in 0..3 {
+        assert!(lit[c] > unlit[c] * 1.3 && lit[c] < unlit[c] * 2.5, "channel {c}: {lit:?} vs unlit {unlit:?}");
+    }
+    // Half the intensity: less light, still lit.
+    let l = p.comp_mut(cid).unwrap().layers.iter_mut().find(|l| l.is_light()).unwrap();
+    set(l, "lightOptions/intensity", Value::Scalar(90.0));
+    let half = render(&p, cid).data[20 * 120 + 30];
+    for c in 0..3 {
+        assert!(half[c] >= unlit[c] - 1e-6 && half[c] < lit[c], "channel {c}: {half:?} vs {lit:?}");
+    }
+}
+
 #[test]
 fn depth_of_field_blurs_out_of_focus_surfaces() {
     let mut img = Image::new(64, 64);
