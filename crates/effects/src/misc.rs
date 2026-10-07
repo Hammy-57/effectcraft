@@ -229,19 +229,27 @@ fn glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
 /// description specifies a wide inverse-square-like falloff; three Gaussian scales approximate
 /// that profile without depending on the third-party plug-in.
 fn deep_glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
-    let radius = (ctx.params.f("PEDG-0001") * b.scale).clamp(0.0, 512.0);
+    let radius = (ctx.params.f("PEDG-0001") * b.scale).clamp(0.0, 2000.0);
     if !radius.is_finite() || radius < 0.5 {
         return b;
     }
     // Mode 2 is the expanded transparent-edge setting found in every SceneYard instance.
     let edge = ctx.params.e("PEDG-0055");
-    let pad = if edge == 0 || ctx.adjustment { 0 } else { (radius * if ctx.params.e("PEDG-0084") == 1 { 1.5 } else { 1.0 }).ceil() as u32 };
-    // ponytail: bound full-image padding; tile the glow for larger frames or radii.
-    let expanded_w = b.img.width.saturating_add(pad.saturating_mul(2));
-    let expanded_h = b.img.height.saturating_add(pad.saturating_mul(2));
-    if u64::from(expanded_w) * u64::from(expanded_h) > 32_000_000 {
-        return b;
+    let wanted_pad = if edge == 0 || ctx.adjustment { 0 } else { (radius * if ctx.params.e("PEDG-0084") == 1 { 1.5 } else { 1.0 }).ceil() as u32 };
+    // Keep the output bounded, but still render a glow when its full expansion will not fit.
+    let mut low = 0;
+    let mut high = wanted_pad;
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        let width = u64::from(b.img.width) + 2 * u64::from(mid);
+        let height = u64::from(b.img.height) + 2 * u64::from(mid);
+        if width * height <= 16_000_000 {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
     }
+    let pad = low;
     if pad > 0 {
         b.pad(pad);
     }
@@ -289,15 +297,27 @@ fn deep_glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let aspect = ctx.params.f("PEDG-0010").clamp(0.0, 2.0);
     let chroma = if ctx.params.b("PEDG-0013") { ctx.params.f("PEDG-0015").clamp(0.0, 2.0) as f32 } else { 0.0 };
     let downsample = (ctx.params.f("PEDG-0019") / 100.0).clamp(0.1, 1.0);
-    let mut halo = Image::new(b.img.width, b.img.height);
+    // Very wide glows run at a reduced working resolution; the final halo is enlarged once.
+    // Radii at or below 512 retain the calibrated full-resolution path exactly.
+    let work_scale = (512.0 / radius).min(1.0);
+    let work_source = if work_scale < 1.0 {
+        let w = ((source.width as f64 * work_scale).round() as u32).max(1);
+        let h = ((source.height as f64 * work_scale).round() as u32).max(1);
+        let reduced = resample(&source, w, h);
+        drop(source);
+        reduced
+    } else {
+        source
+    };
+    let mut halo = Image::new(work_source.width, work_source.height);
     for (step, (sigma, weight)) in [(0.035, weights[0]), (0.14, weights[1]), (0.42, weights[2])].into_iter().enumerate() {
-        let (sx, sy) = (radius * sigma * aspect, radius * sigma * (2.0 - aspect));
+        let (sx, sy) = (radius * work_scale * sigma * aspect, radius * work_scale * sigma * (2.0 - aspect));
         let blurred = if step == 2 && downsample < 0.999 {
-            let (w, h) = ((source.width as f64 * downsample).round().max(1.0) as u32, (source.height as f64 * downsample).round().max(1.0) as u32);
-            let small = resample(&source, w, h);
-            resample(&gaussian_blur(&small, sx * downsample, sy * downsample, false), source.width, source.height)
+            let (w, h) = ((work_source.width as f64 * downsample).round().max(1.0) as u32, (work_source.height as f64 * downsample).round().max(1.0) as u32);
+            let small = resample(&work_source, w, h);
+            resample(&gaussian_blur(&small, sx * downsample, sy * downsample, false), work_source.width, work_source.height)
         } else {
-            gaussian_blur(&source, sx, sy, false)
+            gaussian_blur(&work_source, sx, sy, false)
         };
         halo.data.par_iter_mut().zip(blurred.data.par_iter()).for_each(|(out, px)| {
             for c in 0..4 {
@@ -312,6 +332,7 @@ fn deep_glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
             }
         });
     }
+    let halo = if work_scale < 1.0 { resample(&halo, b.img.width, b.img.height) } else { halo };
     let exposure = ctx.params.f("PEDG-0002").clamp(0.0, 64.0) as f32;
     // Deep Glow's gamma correction applies exposure in approximate linear light.
     let exposure = if ctx.params.b("PEDG-0043") || ctx.params.b("PEDG-0009") { exposure.powf(2.1) } else { exposure };
@@ -1018,5 +1039,15 @@ mod tests {
         let dithered = run_fx("ec.stylize.deepglow", &[("PEDG-0001", num(8.0))], gray.clone(), 0.0, EffectEnv::default());
         let clean = run_fx("ec.stylize.deepglow", &[("PEDG-0001", num(8.0)), ("PEDG-0031", Value::Bool(false))], gray, 0.0, EffectEnv::default());
         assert!(dithered.img.data.iter().zip(&clean.img.data).any(|(a, b)| a != b), "Dither must affect opaque pixels");
+    }
+
+    #[test]
+    fn deep_glow_renders_radius_above_512() {
+        let mut impulse = Image::new(9, 9);
+        impulse.set(4, 4, [1.0; 4]);
+        let wide = run_fx("ec.stylize.deepglow", &[("PEDG-0001", num(1603.0)), ("PEDG-0031", Value::Bool(false))], impulse, 0.0, EffectEnv::default());
+        assert_eq!(wide.offset, [1603.0; 2]);
+        assert_eq!(wide.img.width, 3215);
+        assert!(wide.img.get(2407, 1607)[0] > 0.0, "the 1603 px glow reaches 800 px from its source");
     }
 }
