@@ -864,7 +864,9 @@ fn depth_of_field(e: &mut Enc, acc: &wgpu::Buffer, depth: &wgpu::Buffer, (w, h):
         contents: &init,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
     });
-    let f0 = [dof.focus as f32, dof.aperture as f32, dof.blur_level as f32, scale as f32];
+    // The shader's circle of confusion is aperture · |z − focus| / z · blur level: hand it the
+    // aperture through the lens' magnification ([`Dof::coc`]).
+    let f0 = [dof.focus as f32, (dof.aperture * dof.magnification()) as f32, dof.blur_level as f32, scale as f32];
     let b = Binds { bufs: [None, Some(depth), None, None, Some(&radius), Some(&range), None], ..Default::default() };
     dispatch(e, "radius_of", [w, h, 0, 0], f0, b, pixel_groups(w, h));
     let rb = read_buffer(e, &range, 16)?;

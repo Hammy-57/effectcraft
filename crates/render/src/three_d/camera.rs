@@ -26,6 +26,10 @@ pub struct Dof {
     pub aperture: f64,
     /// Blur Level (1.0 = 100%).
     pub blur_level: f64,
+    /// Focal length (mm) of the lens: the camera's Zoom on the 36 mm film. 0 = unknown (the
+    /// circle of confusion is then the aperture's alone).
+    #[serde(default)]
+    pub focal_length: f64,
     /// Iris Shape, Rotation, Roundness, Aspect Ratio and Diffraction Fringe.
     #[serde(default)]
     pub iris: super::bokeh::Iris,
@@ -40,7 +44,18 @@ impl Dof {
         if z <= NEAR || self.focus <= 0.0 {
             return 0.0;
         }
-        self.aperture * (z - self.focus).abs() / z * self.blur_level
+        self.aperture * self.magnification() * (z - self.focus).abs() / z * self.blur_level
+    }
+    /// The lens' magnification at the focus distance, F / (focus − F): the thin-lens circle of
+    /// confusion is the aperture times it times |z − focus| / z. As in After Effects the focal
+    /// length is in millimetres (the 36 mm film) and distances in pixels, so a pixel of
+    /// distance counts as a millimetre. A focus at or inside the focal length is held a pixel
+    /// beyond it. No focal length (0): the aperture alone.
+    pub fn magnification(&self) -> f64 {
+        if self.focal_length.is_nan() || self.focal_length <= 0.0 {
+            return 1.0;
+        }
+        self.focal_length / (self.focus - self.focal_length).max(1.0)
     }
 }
 
@@ -300,6 +315,7 @@ pub fn layer_camera(ctx: &EvalCtx, cam: &Layer) -> CameraState {
         focus: ctx.f(cam, g, "focusDistance", zoom),
         aperture: ctx.f(cam, g, "aperture", default_aperture(w)).max(0.0),
         blur_level: ctx.f(cam, g, "blurLevel", 100.0).max(0.0) / 100.0,
+        focal_length: focal_for_zoom(w, zoom),
         iris: super::bokeh::Iris {
             sides: super::bokeh::Iris::sides_of_shape(ctx.e(cam, g, "irisShape")),
             rotation: ctx.f(cam, g, "irisRotation", 0.0),

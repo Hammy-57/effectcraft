@@ -63,7 +63,7 @@ mod tests {
         // coc = aperture · (z − focus) / z; radius = coc / 2.
         let (focus, z) = (500.0, 2000.0);
         let aperture = 2.0 * r * z / (z - focus);
-        (Dof { focus, aperture, blur_level: 1.0, iris, highlight: Highlight::default() }, vec![z as f32; 81 * 81])
+        (Dof { focus, aperture, blur_level: 1.0, focal_length: 0.0, iris, highlight: Highlight::default() }, vec![z as f32; 81 * 81])
     }
 
     fn lit(img: &Image) -> Vec<bool> {
