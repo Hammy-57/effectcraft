@@ -193,13 +193,20 @@ fn lit_cube_renders_with_depth_and_shading() {
     let centre = img.data[60 * 160 + 80];
     assert!(centre[3] > 0.99, "cube covers the centre: {centre:?}");
     assert_eq!(img.data[2 * 160 + 2][3], 0.0, "corner is empty");
-    // No lights: unlit (base colour) — add a light and faces get different shades.
+    let shades = |img: &crate::Image| {
+        let mut s: Vec<i32> = img.data.iter().filter(|q| q[3] > 0.99).map(|q| (q[0] * 20.0) as i32).collect();
+        s.sort();
+        s.dedup();
+        s
+    };
+    // No light layer: the default environment light shades the faces (not the flat base colour).
+    let default_lit = shades(&img);
+    assert!(default_lit.len() >= 3, "default light shades the faces: {default_lit:?}");
+    // A light layer replaces the default light.
     add(&mut p, cid, LayerSource::Light { kind: LightKind::Parallel }, |_| {});
     let lit = render(&p, cid);
-    let mut shades: Vec<i32> = lit.data.iter().filter(|q| q[3] > 0.99).map(|q| (q[0] * 20.0) as i32).collect();
-    shades.sort();
-    shades.dedup();
-    assert!(shades.len() >= 3, "faces are shaded differently: {shades:?}");
+    assert!(shades(&lit).len() >= 3, "faces are shaded differently: {:?}", shades(&lit));
+    assert!(lit.data.iter().zip(&img.data).any(|(a, b)| (a[0] - b[0]).abs() > 0.05), "the light layer turns the default light off");
     // Classic 3D draws no meshes.
     p.comp_mut(cid).unwrap().renderer = R3::Classic3D;
     assert!(render(&p, cid).data.iter().all(|q| q[3] == 0.0));

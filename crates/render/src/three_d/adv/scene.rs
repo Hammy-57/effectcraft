@@ -215,6 +215,8 @@ pub(crate) struct Builder {
     /// World of the collapsed precomp layers the current layers are drawn through (identity at
     /// the top level).
     outer: Mat4,
+    /// Materials of model and primitive meshes (lit by the default environment light).
+    mesh_mats: Vec<u32>,
 }
 
 impl Builder {
@@ -511,7 +513,9 @@ fn model_layer(r: &Renderer, ctx: &EvalCtx, layer: &Layer, b: &mut Builder) {
             unlit: mm.unlit,
             ..opts
         };
-        mats.push(b.material(m));
+        let id = b.material(m);
+        b.mesh_mats.push(id);
+        mats.push(id);
     }
     for inst in mdl.instances(clip, t) {
         for p in &inst.mesh.primitives {
@@ -825,6 +829,45 @@ pub(crate) fn add_environment(b: &mut Builder, w: u32, h: u32, data: Vec<[f32; 4
     b.s.env = Some(EnvInfo { radiance: first, mips: levels, irradiance: ii, intensity: k, rotation });
 }
 
+/// The default environment light of a comp without an active light layer: like After Effects'
+/// Advanced 3D, model and primitive meshes are lit by a neutral environment (no shadows)
+/// instead of drawing their raw base colour. It is our own procedural studio (no image
+/// asset): a dim surround, a soft key above the camera and two side lights, tuned against
+/// reference frames so dielectrics keep about their base colour facing the camera while metals
+/// show reflections. Cards and extrusions (lit through their classic Material Options) stay
+/// unlit, as without lights.
+fn default_environment(b: &mut Builder) {
+    let (w, h) = (64u32, 32u32);
+    // A dim surround, a soft key above the camera and two side lights (radiance; linear).
+    let (base, key, key_el, rad, side, side_el, side_az) = (0.05f32, 6.0f32, 35.0f32, 30.0f32, 3.0f32, 20.0f32, 90.0f32);
+    // AE world: +X right, +Y down, the default camera looks along +Z.
+    let dir = |az: f32, el: f32| {
+        let (az, el) = (az.to_radians(), el.to_radians());
+        [el.cos() * az.sin(), -el.sin(), -el.cos() * az.cos()]
+    };
+    let boxes = [(dir(0.0, key_el), key), (dir(side_az, side_el), side), (dir(-side_az, side_el), side)];
+    let (c0, c1) = ((rad * 1.25).to_radians().cos(), (rad * 0.75).to_radians().cos());
+    let data: Vec<[f32; 4]> = (0..h)
+        .flat_map(|y| (0..w).map(move |x| (x, y)))
+        .map(|(x, y)| {
+            let d = super::shade::equirect_dir((x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32, 0.0);
+            let mut v = base;
+            for (c, k) in boxes {
+                let t = ((super::shade::dot(d, c) - c0) / (c1 - c0)).clamp(0.0, 1.0);
+                v += k * t * t * (3.0 - 2.0 * t);
+            }
+            [v, v, v, 1.0]
+        })
+        .collect();
+    add_environment(b, w, h, data, [1.0; 3], 0.0);
+    let meshes: std::collections::HashSet<u32> = b.mesh_mats.iter().copied().collect();
+    for (i, m) in b.s.materials.iter_mut().enumerate() {
+        if !meshes.contains(&(i as u32)) {
+            m.accepts_lights = false;
+        }
+    }
+}
+
 /// The environment layer's pixels as linear straight RGBA.
 fn env_pixels(r: &Renderer, ctx: &EvalCtx, src: Option<u64>, lin: bool) -> Option<(u32, u32, Vec<[f32; 4]>)> {
     let layer = match src {
@@ -923,6 +966,7 @@ pub(crate) fn build_at(r: &Renderer, ctx: &EvalCtx, sub: Option<&EvalCtx>, run: 
         tri_depth: vec![],
         cam,
         outer: r.collapse3d.map_or(Mat4::IDENTITY, |c| c.world),
+        mesh_mats: vec![],
     };
     for layer in run {
         let ctx = if sub.is_some() && motion_blurred(r, base, layer) { at } else { base };
@@ -941,6 +985,10 @@ pub(crate) fn build_at(r: &Renderer, ctx: &EvalCtx, sub: Option<&EvalCtx>, run: 
             && let Some((w, h, d)) = env_pixels(r, ctx, src, lin)
         {
             add_environment(&mut b, w, h, d, k, rot);
+        }
+        let any_light = ctx.comp.layers.iter().any(|l| l.is_light() && l.switches.video && l.is_active_at(ctx.time));
+        if !any_light && !b.mesh_mats.is_empty() {
+            default_environment(&mut b);
         }
         if r.opts.shadows() {
             super::raster::shadow_maps(&mut b.s, r.opts.draft);
