@@ -190,6 +190,14 @@ pub fn paragraph_style(p: &ParaStyle, width: Option<f32>) -> ParagraphStyle {
         Justify::JustifyLastRight => (Align::Justify, Align::Right),
         Justify::JustifyAll => (Align::Justify, Align::Justify),
     };
+    // AE saves alignment relative to the reading direction: in a right-to-left paragraph
+    // "left" pins the line's start, its right edge.
+    let flip = |a: Align| match a {
+        Align::Left => Align::Right,
+        Align::Right => Align::Left,
+        other => other,
+    };
+    let (align, justify_last) = if p.direction == Direction::Rtl { (flip(align), flip(justify_last)) } else { (align, justify_last) };
     ParagraphStyle {
         align,
         justify_last,
@@ -469,6 +477,20 @@ mod tests {
         doc.indent_right = 0.0;
         doc.indent_first = 0.0;
         assert_ne!(area.layout.lines[0].x, layout_doc(&doc).layout.lines[0].x, "box text still uses indents");
+    }
+
+    #[test]
+    fn ae_rtl_left_justified_point_text_ends_at_its_start_indent() {
+        // SceneYard Photos Collage: a right-to-left paragraph saved "left" justified with
+        // Indent Before 552 / first line -12 ends 540 px left of the layer origin (its anchor
+        // sits on the word's middle), it does not start 106 px right of it.
+        let mut doc = TextDoc { text: "dieting".into(), justify: Justify::Left, size: 66.0, direction: Direction::Rtl, ..Default::default() };
+        doc.indent_left = 552.0;
+        doc.indent_first = -12.0;
+        doc.indent_right = 94.0;
+        let lay = layout_doc(&doc).layout;
+        let (x, w) = (lay.lines[0].x, lay.lines[0].width);
+        assert!((x + w + 540.0).abs() < 1e-3, "{x} {w}");
     }
 
     #[test]
