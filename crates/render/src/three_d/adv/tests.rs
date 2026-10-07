@@ -193,13 +193,20 @@ fn lit_cube_renders_with_depth_and_shading() {
     let centre = img.data[60 * 160 + 80];
     assert!(centre[3] > 0.99, "cube covers the centre: {centre:?}");
     assert_eq!(img.data[2 * 160 + 2][3], 0.0, "corner is empty");
-    // No lights: unlit (base colour) — add a light and faces get different shades.
+    let shades = |img: &crate::Image| {
+        let mut s: Vec<i32> = img.data.iter().filter(|q| q[3] > 0.99).map(|q| (q[0] * 20.0) as i32).collect();
+        s.sort();
+        s.dedup();
+        s
+    };
+    // No light layer: the default environment light shades the faces (not the flat base colour).
+    let default_lit = shades(&img);
+    assert!(default_lit.len() >= 3, "default light shades the faces: {default_lit:?}");
+    // A light layer replaces the default light.
     add(&mut p, cid, LayerSource::Light { kind: LightKind::Parallel }, |_| {});
     let lit = render(&p, cid);
-    let mut shades: Vec<i32> = lit.data.iter().filter(|q| q[3] > 0.99).map(|q| (q[0] * 20.0) as i32).collect();
-    shades.sort();
-    shades.dedup();
-    assert!(shades.len() >= 3, "faces are shaded differently: {shades:?}");
+    assert!(shades(&lit).len() >= 3, "faces are shaded differently: {:?}", shades(&lit));
+    assert!(lit.data.iter().zip(&img.data).any(|(a, b)| (a[0] - b[0]).abs() > 0.05), "the light layer turns the default light off");
     // Classic 3D draws no meshes.
     p.comp_mut(cid).unwrap().renderer = R3::Classic3D;
     assert!(render(&p, cid).data.iter().all(|q| q[3] == 0.0));
@@ -541,4 +548,36 @@ fn stroke_regions_are_rings() {
     let outlines = effectcraft_model::extrude::group_contours(scene::contours(&r, 0.25));
     assert_eq!(outlines.len(), 1);
     assert_eq!(outlines[0].holes.len(), 1);
+}
+
+#[test]
+fn ae_model_orientation_turns_z_first() {
+    // AE-imported models compose Orientation as Rx·Ry·Rz: (270°, 0°, 30°) stands a Z-up mesh
+    // up and then yaws it about its own vertical axis (Rz·Ry·Rx would roll it on screen).
+    use effectcraft_geom::{Mat4, vec3};
+    let (mut p, cid) = project(160, 120);
+    let item = p.add_item(
+        "m.glb",
+        Default::default(),
+        None,
+        ItemKind::Footage(effectcraft_project::Footage { kind: effectcraft_project::FootageKind::Model, missing: true, ..Default::default() }),
+    );
+    for ae in [true, false] {
+        add(&mut p, cid, LayerSource::Model { item }, |l| {
+            set(l, "transform/orientation", Value::Vec3([270.0, 0.0, 30.0]));
+            set(l, "transform/anchor", Value::Vec3([0.0, 0.0, 0.0]));
+            set(l, "transform/position", Value::Vec3([0.0, 0.0, 0.0]));
+            set(l, "geometryOptions/aeSourceSpace", Value::Bool(ae));
+        });
+        let comp = p.comp(cid).unwrap();
+        let ctx = crate::EvalCtx::new(&p, cid, comp, Tick::ZERO);
+        let m = ctx.world_matrix(&comp.layers[0]);
+        let want = if ae { Mat4::rotate_x(270.0) * Mat4::rotate_y(0.0) * Mat4::rotate_z(30.0) } else { Mat4::orientation(vec3(270.0, 0.0, 30.0)) };
+        for i in 0..3 {
+            for j in 0..3 {
+                assert!((m.0[i][j] - want.0[i][j]).abs() < 1e-9, "ae={ae}: {m:?} vs {want:?}");
+            }
+        }
+        p.comp_mut(cid).unwrap().layers.remove(0);
+    }
 }

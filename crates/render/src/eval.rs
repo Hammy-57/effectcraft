@@ -177,8 +177,10 @@ impl<'a> EvalCtx<'a> {
         let ry = self.f(layer, tr, "rotationY", 0.0);
         let p = Vec3::from(pos);
         // Auto-orient (along path / towards camera) replaces Orientation.
-        let orient = crate::three_d::camera::auto_orient_3d(self, layer, p)
-            .unwrap_or_else(|| Mat4::orientation(Vec3::from(self.v3(layer, tr, "orientation", [0.0; 3]))));
+        let orient = crate::three_d::camera::auto_orient_3d(self, layer, p).unwrap_or_else(|| {
+            let o = Vec3::from(self.v3(layer, tr, "orientation", [0.0; 3]));
+            if crate::three_d::adv::ae_model_axes(self, layer) { Mat4::rotate_x(o.x) * Mat4::rotate_y(o.y) * Mat4::rotate_z(o.z) } else { Mat4::orientation(o) }
+        });
         // AE composes the separate X/Y/Z Rotation controls as Rx·Ry·Rz.
         Mat4::translate(p)
             * orient
