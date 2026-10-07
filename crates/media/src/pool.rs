@@ -22,6 +22,7 @@ struct Key {
     frame: i64,
     alpha: u8,
     matte: [u32; 3],
+    crop: Option<[u64; 4]>,
 }
 
 struct Entry {
@@ -486,7 +487,8 @@ impl Inner {
             AlphaMode::Ignore => 2,
         };
         let matte = if footage.alpha == AlphaMode::Premultiplied { footage.premul_color.map(f32::to_bits) } else { [0; 3] };
-        let key = |path: &str, frame| Key { path: path.into(), frame, alpha, matte };
+        let crop = footage.layer.as_ref().and_then(|l| l.crop_bounds).map(|b| b.map(f64::to_bits));
+        let key = |path: &str, frame| Key { path: path.into(), frame, alpha, matte, crop };
         match footage.kind {
             FootageKind::Sequence if !footage.sequence.is_empty() => {
                 let i = Self::frame_index(footage.frame_rate, t, footage.sequence.len() as i64, footage.loop_count);
@@ -673,10 +675,23 @@ mod tests {
     }
 
     #[test]
+    fn saved_vector_crop_has_distinct_media_cache_key() {
+        let mut footage = Footage {
+            path: "art.ai".into(),
+            kind: FootageKind::Still,
+            layer: Some(effectcraft_project::SourceLayer { index: 1, name: "Art".into(), crop_bounds: Some([0.0, 0.0, 20.0, 40.0]), ..Default::default() }),
+            ..Default::default()
+        };
+        let before = Inner::locate(&footage, Tick::ZERO).key;
+        footage.layer.as_mut().unwrap().crop_bounds = Some([1.0, 0.0, 21.0, 40.0]);
+        assert!(before != Inner::locate(&footage, Tick::ZERO).key);
+    }
+
+    #[test]
     fn lru_respects_budget_and_recycles() {
         let mut c = Lru::default();
         let img = || Arc::new(Image::new(16, 16)); // 4 KiB + overhead
-        let k = |i| Key { path: "a".into(), frame: i, alpha: 0, matte: [0; 3] };
+        let k = |i| Key { path: "a".into(), frame: i, alpha: 0, matte: [0; 3], crop: None };
         let budget = 3 * (4096 + 64);
         for i in 0..10 {
             c.insert(k(i), img(), budget);

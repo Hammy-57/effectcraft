@@ -457,6 +457,11 @@ pub(crate) fn effect_direct(id: &str, vals: &[(&str, Value)], adjustment: bool) 
 pub(crate) fn effect_case(id: &str, vals: &[(&str, Value)]) {
     effect_direct(id, vals, false);
     effect_direct(id, vals, true);
+    effect_composite_case(id, vals);
+}
+
+/// Full compositor parity, including controls that deliberately fall back to the CPU.
+fn effect_composite_case(id: &str, vals: &[(&str, Value)]) {
     for depth in [BitDepth::Bpc8, BitDepth::Bpc32] {
         let mut s = Scene::new(depth);
         let bg = s.solid([0.15, 0.1, 0.2], 97, 61);
@@ -476,6 +481,13 @@ pub(crate) fn n(v: f64) -> Value {
 
 pub(crate) fn c(r: f64, g: f64, b: f64) -> Value {
     Value::Color([r, g, b, 1.0])
+}
+
+#[test]
+fn imported_cpu_only_effect_controls_match_on_gpu() {
+    effect_composite_case("ec.color.lumetri", &[("basicCorrection/active", Value::Bool(false)), ("basicCorrection/tone/exposure", n(2.0))]);
+    effect_composite_case("ec.noise.addgrain", &[("application/matchAmount", n(75.0)), ("application/matchingColor", c(0.2, 0.4, 0.6))]);
+    effect_composite_case("ec.perspective.cccylinder", &[("positionX", n(8.0)), ("rotationX", n(25.0))]);
 }
 
 #[test]

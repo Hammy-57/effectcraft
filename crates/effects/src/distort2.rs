@@ -865,7 +865,7 @@ pub fn specs() -> Vec<EffectSpec> {
             vec![
                 p("foldPosition", "Fold Position", pt(0.7, 0.7), ParamUi::Point),
                 p("foldDirection", "Fold Direction", num(315.0), ParamUi::Angle),
-                p("controls", "Controls", Value::Enum(0), slider(0.0, 5.0, 0.0, 5.0, 0)),
+                p("controls", "Controls", num(0.0), slider(0.0, 5.0, 0.0, 5.0, 0)),
                 p("foldRadius", "Fold Radius", num(20.0), slider(0.0, 1000.0, 0.0, 200.0, 1)),
                 p("lightDirection", "Light Direction", num(-45.0), ParamUi::Angle),
                 p("render", "Render", Value::Enum(0), popup(&["Front & Back Page", "Back Page", "Front Page"])),

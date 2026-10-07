@@ -76,7 +76,20 @@ pub fn param_shown(effect: &str, param: &str, value: &dyn Fn(&str) -> Option<eff
 /// Controls of GPU-accelerated effects that only the CPU implements: while any of them is away
 /// from its default the effect renders on the CPU. (Prefixes ending in `/` cover a whole group.)
 const CPU_ONLY_CONTROLS: &[(&str, &[&str])] = &[
-    ("ec.color.lumetri", &["highDynamicRange", "curves/rgbCurves/", "curves/hueSaturationCurves/", "hslSecondary/"]),
+    (
+        "ec.color.lumetri",
+        &[
+            "highDynamicRange",
+            "basicCorrection/active",
+            "creative/active",
+            "curves/active",
+            "colorWheels/active",
+            "vignette/active",
+            "curves/rgbCurves/",
+            "curves/hueSaturationCurves/",
+            "hslSecondary/",
+        ],
+    ),
     (
         "ec.color.colorama",
         &["inputPhase/addPhase", "outputCycle/usePresetPalette", "modify/", "pixelSelection/matchingMode", "masking/maskingMode", "masking/compositeOverLayer"],
@@ -95,7 +108,20 @@ const CPU_ONLY_CONTROLS: &[(&str, &[&str])] = &[
             "sourceCrops/edgeColourAlpha",
         ],
     ),
-    ("ec.noise.addgrain", &["viewingMode", "preset", "color/redBalance", "color/greenBalance", "color/blueBalance", "previewRegion/"]),
+    (
+        "ec.noise.addgrain",
+        &[
+            "viewingMode",
+            "preset",
+            "color/redBalance",
+            "color/greenBalance",
+            "color/blueBalance",
+            "previewRegion/",
+            "application/channelBalance/",
+            "application/matchAmount",
+        ],
+    ),
+    ("ec.perspective.cccylinder", &["positionX", "positionY", "positionZ", "rotationX", "rotationY", "rotationZ"]),
     ("ec.blur.cameralens", &["irisProperties/diffractionFringe", "blurMap/blurMapLayer"]),
     ("ec.noise.removegrain", &["temporalFiltering/enabled"]),
     ("ec.distort.liquify", &["viewFreezeAreaMask", "viewMesh"]),
@@ -211,6 +237,15 @@ mod tests {
         assert!(ok("ec.color.lumetri", &[]));
         assert!(!ok("ec.color.lumetri", &[("hslSecondary/correction/saturation", Value::Scalar(50.0))]));
         assert!(!ok("ec.noise.addgrain", &[("preset", Value::Enum(2))]));
+        for section in ["basicCorrection", "creative", "curves", "colorWheels", "vignette", "hslSecondary"] {
+            assert!(!ok("ec.color.lumetri", &[(&format!("{section}/active"), Value::Bool(false))]));
+        }
+        assert!(!ok("ec.noise.addgrain", &[("application/matchAmount", Value::Scalar(50.0))]));
+        assert!(!ok("ec.noise.addgrain", &[("application/channelBalance/redShadows", Value::Scalar(0.5))]));
+        assert!(ok("ec.perspective.cccylinder", &[]));
+        for control in ["positionX", "positionY", "positionZ", "rotationX", "rotationY", "rotationZ"] {
+            assert!(!ok("ec.perspective.cccylinder", &[(control, Value::Scalar(15.0))]));
+        }
         assert!(ok("ec.generate.cellpattern", &[("cellPattern", Value::Enum(3))]));
         assert!(!ok("ec.generate.cellpattern", &[("cellPattern", Value::Enum(9))]));
         assert!(!ok("ec.distort.turbulentdisplace", &[("pinning", Value::Enum(9))]));

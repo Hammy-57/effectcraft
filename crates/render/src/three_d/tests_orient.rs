@@ -79,6 +79,7 @@ fn camera_parent_xyz_rotations_match_ae_projection_order() {
     let (mut p, cid, comp) = setup();
     let mut parent = build::layer(&mut p, &comp, "Rig", LayerSource::Null, (200, 100), None);
     parent.switches.three_d = true;
+    parent.props.prop_mut("transform/anchor").unwrap().value = Value::Vec3([0.0, 0.0, 0.0]);
     for (name, value) in [
         ("position", Value::Vec3([90.0, 55.0, 0.0])),
         ("rotationX", Value::Scalar(41.0)),

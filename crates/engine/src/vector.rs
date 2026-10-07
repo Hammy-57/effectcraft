@@ -263,14 +263,10 @@ pub fn vector_doc(path: &str, bytes: &[u8], layer: Option<&effectcraft_project::
         return Some(effectcraft_svg::parse(bytes).map_err(|e| format!("{path}: {e}")));
     }
     effectcraft_pdf::sniff(bytes)?;
-    Some(
-        effectcraft_pdf::parse_page(bytes, page as usize)
-            .map(|d| match layer {
-                Some(l) => effectcraft_pdf::layer_doc(&d, l.index as usize),
-                None => d,
-            })
-            .map_err(|e| format!("{path}: {e}")),
-    )
+    Some(effectcraft_pdf::parse_page(bytes, page as usize).map_err(|e| format!("{path}: {e}")).and_then(|d| match layer {
+        Some(l) => effectcraft_pdf::selected_layer_doc(&d, l.index as usize, &l.name, l.crop_bounds).map_err(|e| format!("{path}: {e}")),
+        None => Ok(d),
+    }))
 }
 
 /// Import page `page` of a PDF / Illustrator / EPS document as a composition the size of the

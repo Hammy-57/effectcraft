@@ -8,7 +8,8 @@ layer per file layer (File ▸ Import ▸ Composition).
 
 Specifications used: **ISO 32000-1:2008** (PDF 1.7; the public Adobe edition) for the file
 structure, filters, content streams, graphics state, colour spaces, functions, shadings, text,
-fonts, images, patterns, transparency (blend modes, soft masks) and optional content; Adobe
+fonts, images, patterns, transparency (blend modes, soft masks), optional content and
+PDFDocEncoding text strings (Table D.2); Adobe
 **Technical Note #5176** (The Compact Font Format Specification) and **#5177** (The Type 2
 Charstring Format) for CFF font programs; **Adobe Type 1 Font Format** (version 1.1) for Type 1
 font programs; the **PostScript Language Reference, third edition** and the **Encapsulated

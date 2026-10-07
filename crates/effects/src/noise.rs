@@ -322,12 +322,12 @@ const ADD_GRAIN_CHANNEL_TONES: [[(&str, &str); 3]; 3] = [
     ],
 ];
 
-const GRAIN_MATCH_AMOUNT: &str = "VISINF Grain Implant-0053";
-const GRAIN_MATCH_COLOR: &str = "VISINF Grain Implant-0054";
-const GRAIN_MATCH_TOLERANCE: &str = "VISINF Grain Implant-0055";
-const GRAIN_MATCH_SOFTNESS: &str = "VISINF Grain Implant-0056";
+const GRAIN_MATCH_AMOUNT: &str = "application/matchAmount";
+const GRAIN_MATCH_COLOR: &str = "application/matchingColor";
+const GRAIN_MATCH_TOLERANCE: &str = "application/matchTolerance";
+const GRAIN_MATCH_SOFTNESS: &str = "application/matchSoftness";
 const GRAIN_MATCH_MODE: &str = "VISINF Grain Implant-0057";
-const GRAIN_INVERT_MATCH: &str = "VISINF Grain Implant-0058";
+const GRAIN_INVERT_MATCH: &str = "application/invertMatch";
 
 fn add_grain(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let look = GrainLook::from_params(ctx);
