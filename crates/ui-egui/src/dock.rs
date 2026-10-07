@@ -959,7 +959,7 @@ pub fn draw_group_chrome(ui: &mut egui::Ui, g: &Group, focused: PanelKind, t: &T
         let strip = Rect::from_min_size(g.rect.min, vec2(g.rect.width(), t.tab_h));
         if t.gradients {
             // Settings ▸ Appearance ▸ Use Gradients.
-            crate::theme::gradient_rect(&painter, strip.shrink2(vec2(t.radius, 0.0)), t.grad_top(t.panel_bg), t.panel_bg);
+            crate::theme::gradient_rect(&painter, strip, t.radius, t.grad_top(t.panel_bg), t.panel_bg);
         }
         let activate = |e: &Entry| match e.doc {
             Some(id) => DockAction::ActivateDoc(e.panel, id),

@@ -1,5 +1,5 @@
-//! Vector icons drawn in code on a 16×16 design grid (crisp at any DPI, recolourable). Original
-//! drawings following generic motion-graphics conventions; no third-party or Adobe artwork.
+//! Recolourable icons: generated toolbar artwork, with vector drawings for other controls.
+//! Original artwork following generic motion-graphics conventions; see assets/icons attribution.
 
 use egui::epaint::{PathShape, PathStroke};
 use egui::{Color32, Painter, Pos2, Rect, Stroke, pos2, vec2};
@@ -197,6 +197,9 @@ impl Pen16<'_> {
 
 /// Paint `icon` centred in `rect`.
 pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
+    if paint_generated(painter, rect, icon, color) {
+        return;
+    }
     let pen = Pen16 { painter, rect, color, width: 1.25 };
     use Icon::*;
     match icon {
@@ -630,6 +633,82 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             pen.line(&[(10.5, 4.0), (12.5, 6.5), (13.5, 10.0), (12.5, 13.5)]);
         }
     }
+}
+
+/// One embedded atlas, decoded once per UI context. Keep the vector fallback if decoding fails.
+fn paint_generated(painter: &Painter, rect: Rect, icon: Icon, color: Color32) -> bool {
+    use Icon::*;
+    let cell = match icon {
+        Home => 0,
+        Selection => 1,
+        Hand => 2,
+        Zoom => 3,
+        Orbit => 4,
+        PanCamera => 5,
+        Dolly => 6,
+        Rotate => 7,
+        PanBehind => 8,
+        Rectangle => 9,
+        Pen => 10,
+        Type => 11,
+        Brush => 12,
+        Clone => 13,
+        Eraser => 14,
+        RotoBrush => 15,
+        Puppet => 16,
+        RefineEdge => 17,
+        Flowchart => 18,
+        Draft3D => 19,
+        Shy => 20,
+        FrameBlend => 21,
+        MotionBlur => 22,
+        Graph => 23,
+        _ => return false,
+    };
+    let ctx = painter.ctx();
+    let id = egui::Id::new("effectcraft-tools-atlas");
+    let cached = ctx.data(|data| data.get_temp::<Option<(egui::TextureHandle, bool)>>(id));
+    let texture = cached.unwrap_or_else(|| {
+        // Optional owner-local reference glyphs. Reference artwork stays out of distributed assets.
+        let reference = std::env::var_os("EFFECTCRAFT_ICON_REFERENCE")
+            .and_then(|path| {
+                use std::io::Read;
+                let file = std::fs::File::open(path).ok()?;
+                let mut alpha = Vec::new();
+                file.take(24 * 64 * 64 + 1).read_to_end(&mut alpha).ok()?;
+                Some(alpha)
+            })
+            .filter(|alpha| alpha.len() == 24 * 64 * 64);
+        if let Some(alpha) = reference {
+            let pixels = alpha.into_iter().map(Color32::from_white_alpha).collect();
+            let texture = Some((ctx.load_texture("reference-tools", egui::ColorImage::new([64, 24 * 64], pixels), egui::TextureOptions::LINEAR), true));
+            ctx.data_mut(|data| data.insert_temp(id, texture.clone()));
+            return texture;
+        }
+        let texture = image::load_from_memory(include_bytes!("../../../assets/icons/tools-atlas.png")).ok().map(|image| {
+            let rgba = image.to_rgba8();
+            let size = [rgba.width() as usize, rgba.height() as usize];
+            // Use the generated alpha as a tintable mask for dark/light/selected/disabled states.
+            let pixels = rgba.pixels().map(|pixel| Color32::from_white_alpha(pixel.0[3])).collect();
+            (ctx.load_texture("tools-atlas", egui::ColorImage::new(size, pixels), egui::TextureOptions::LINEAR), false)
+        });
+        ctx.data_mut(|data| data.insert_temp(id, texture.clone()));
+        texture
+    });
+    let Some((texture, reference)) = texture else { return false };
+    if reference {
+        let uv = Rect::from_min_max(pos2(0.0, cell as f32 / 24.0), pos2(1.0, (cell + 1) as f32 / 24.0));
+        let side = rect.width().min(rect.height());
+        painter.image(texture.id(), Rect::from_center_size(rect.center(), vec2(side, side)), uv, color);
+        return true;
+    }
+    // 6 × 4 cells, each 256 px; omit the generated transparent margin.
+    let x = (cell % 6) as f32 * 256.0;
+    let y = (cell / 6) as f32 * 256.0;
+    let uv = Rect::from_min_max(pos2((x + 24.0) / 1536.0, (y + 24.0) / 1024.0), pos2((x + 232.0) / 1536.0, (y + 232.0) / 1024.0));
+    let side = rect.width().min(rect.height());
+    painter.image(texture.id(), Rect::from_center_size(rect.center(), vec2(side, side)), uv, color);
+    true
 }
 
 /// Keyframe glyph by interpolation (diamond = linear, hourglass = bezier/ease, circle = auto,

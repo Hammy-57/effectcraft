@@ -1,0 +1,8 @@
+asset:        tools-atlas.png
+title:        EffectCraft toolbar and timeline icon atlas (24 glyphs)
+author:       EffectCraft contributors, generated with OpenAI ImageGen at Elias's request
+source:       original work; generation prompt in tools-atlas-prompt.txt
+license:      MIT OR Apache-2.0
+license-file: LICENSE-MIT
+added:        2026-10-07 by Codex for Elias
+notes:        Generated transparent 1536x1024 atlas, 6 columns by 4 rows. Generic compositor symbols, no extracted Adobe assets. Runtime uses alpha as a theme-tinted mask. Original generator output preserved.

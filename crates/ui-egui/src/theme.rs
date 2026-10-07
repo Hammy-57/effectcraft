@@ -81,15 +81,23 @@ pub struct Tokens {
 }
 
 /// A vertical gradient fill (`top` → `bottom`) over `rect`.
-pub fn gradient_rect(painter: &egui::Painter, rect: egui::Rect, top: Color32, bottom: Color32) {
-    let mut m = egui::Mesh::default();
-    m.colored_vertex(rect.left_top(), top);
-    m.colored_vertex(rect.right_top(), top);
-    m.colored_vertex(rect.right_bottom(), bottom);
-    m.colored_vertex(rect.left_bottom(), bottom);
-    m.add_triangle(0, 1, 2);
-    m.add_triangle(0, 2, 3);
-    painter.add(egui::Shape::mesh(m));
+pub fn gradient_rect(painter: &egui::Painter, rect: egui::Rect, radius: f32, top: Color32, bottom: Color32) {
+    if !rect.is_positive() {
+        return;
+    }
+    // Tessellate the actual header outline so shading reaches the sides without
+    // painting over the panel's rounded top corners. Keep egui's antialiasing.
+    let corners = egui::CornerRadius { nw: radius as u8, ne: radius as u8, sw: 0, se: 0 };
+    let shape = egui::epaint::ClippedShape { clip_rect: painter.clip_rect(), shape: egui::Shape::rect_filled(rect, corners, Color32::WHITE) };
+    for primitive in painter.ctx().tessellate(vec![shape], painter.ctx().pixels_per_point()) {
+        if let egui::epaint::Primitive::Mesh(mut mesh) = primitive.primitive {
+            for vertex in &mut mesh.vertices {
+                let fraction = ((vertex.pos.y - rect.top()) / rect.height()).clamp(0.0, 1.0);
+                vertex.color = top.lerp_to_gamma(bottom, fraction).gamma_multiply(f32::from(vertex.color.a()) / 255.0);
+            }
+            painter.add(egui::Shape::mesh(mesh));
+        }
+    }
 }
 
 impl Tokens {
