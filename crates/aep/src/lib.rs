@@ -1290,21 +1290,27 @@ fn import_native_effect_params(
         } else {
             1.0
         };
-        if effect_id == "ec.keying.keylight" && matches!(path, "insideMask/insideMask" | "outsideMask/outsideMask") {
-            // Keylight's AE mask selector is already zero-based: 0=None, 1=Mask 1.
-            // The generic AE popup adapter subtracts one, so offset only this input.
+        // Keylight's AE mask selector is already zero-based (0=None, 1=Mask 1) and the generic
+        // AE popup adapter subtracts one; its Source Crops Right / Bottom are edge positions
+        // (100% = uncropped) where the native controls crop that much from the edge.
+        let remap: Option<fn(f64) -> f64> = match (effect_id, path) {
+            ("ec.keying.keylight", "insideMask/insideMask" | "outsideMask/outsideMask") => Some(|v| v + 1.0),
+            ("ec.keying.keylight", "sourceCrops/cropRight" | "sourceCrops/cropBottom") => Some(|v| 100.0 - v),
+            _ => None,
+        };
+        if let Some(f) = remap {
             let mut adjusted = child.clone();
             if let Some(v) = adjusted.get("value").and_then(Json::as_f64) {
-                adjusted["value"] = Json::from(v + 1.0);
+                adjusted["value"] = Json::from(f(v));
             }
             if let Some(keys) = adjusted.get_mut("keyframes").and_then(Json::as_array_mut) {
                 for key in keys {
                     if let Some(v) = key.get("value").and_then(Json::as_f64) {
-                        key["value"] = Json::from(v + 1.0);
+                        key["value"] = Json::from(f(v));
                     }
                 }
             }
-            let adjusted_value = if let Value::Scalar(v) = value { Value::Scalar(v + 1.0) } else { value };
+            let adjusted_value = if let Value::Scalar(v) = value { Value::Scalar(f(v)) } else { value };
             fill_property(prop, &adjusted, adjusted_value, value_type, scale, layer_time, losses, context);
         } else {
             fill_property(prop, child, value, value_type, scale, layer_time, losses, context);
@@ -1767,6 +1773,32 @@ mod tests {
         assert_eq!(opacity.value, Value::Scalar(50.0));
         assert_eq!(opacity.keys.iter().map(|k| k.value.clone()).collect::<Vec<_>>(), vec![Value::Scalar(20.0), Value::Scalar(100.0)]);
         assert!(losses.is_empty());
+    }
+
+    #[test]
+    fn keylight_source_crop_edges_become_crop_amounts() {
+        // AE's Right / Bottom are edge positions (100% = uncropped); the native controls crop that
+        // much from the edge. SceneYard Apple Apps' untouched crops (0, 100, 0, 100) cropped
+        // the whole background away.
+        let mut project = Project::default();
+        let spec = effectcraft_effects::find("ec.keying.keylight").unwrap();
+        let mut effect = effectcraft_effects::instantiate(spec, &mut build::Ids(&mut project.next_id), "Keylight", [100.0, 100.0]);
+        let ir = serde_json::json!({"children":[
+            {"kind":"property","match_name":"Keylight 906-0075","value":0.0},
+            {"kind":"property","match_name":"Keylight 906-0076","value":100.0},
+            {"kind":"property","match_name":"Keylight 906-0077","value":10.0},
+            {"kind":"property","match_name":"Keylight 906-0078","value":80.0,
+             "keyframes":[{"time":0.0,"value":100.0},{"time":1.0,"value":75.0}]}
+        ]});
+        let mut losses = Vec::new();
+        import_native_effect_params(&mut project, &mut effect, &ir, &ir, spec.id, LayerTime { start: Tick::ZERO, stretch: 100.0 }, &mut losses, "test", 0);
+        let v = |path: &str| effect.prop(path).unwrap().value.clone();
+        assert_eq!(v("sourceCrops/cropLeft"), Value::Scalar(0.0));
+        assert_eq!(v("sourceCrops/cropRight"), Value::Scalar(0.0));
+        assert_eq!(v("sourceCrops/cropTop"), Value::Scalar(10.0));
+        assert_eq!(v("sourceCrops/cropBottom"), Value::Scalar(20.0));
+        let keys: Vec<Value> = effect.prop("sourceCrops/cropBottom").unwrap().keys.iter().map(|k| k.value.clone()).collect();
+        assert_eq!(keys, vec![Value::Scalar(0.0), Value::Scalar(25.0)]);
     }
 
     #[test]
