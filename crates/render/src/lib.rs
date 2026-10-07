@@ -1168,6 +1168,13 @@ impl<'a> Renderer<'a> {
         self.layer_buf_keyed(ctx, layer).map(|(b, _)| b)
     }
 
+    /// The pixels a layer lends as a track matte: its content (source, masks, effects) before
+    /// Layer Styles and their blending options. After Effects mattes through a shape whose Fill
+    /// Opacity is 0 as through the shape (SceneYard "Apple Maps Route").
+    pub fn matte_buf(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Arc<Buf>> {
+        self.styled(ctx, layer, None).map(|st| st.content)
+    }
+
     /// [`Self::layer_buf`] in the blending space (linear with Blend Colors Using 1.0 Gamma).
     pub fn blend_layer_buf(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Arc<Buf>> {
         let (b, k) = self.layer_buf_keyed(ctx, layer)?;
@@ -1697,7 +1704,7 @@ impl<'a> Renderer<'a> {
                 _ => {
                     let mut mimg = Image::new(canvas.width, canvas.height);
                     if m.is_active_at(ctx.time)
-                        && let Some(mb) = self.layer_buf(ctx, m)
+                        && let Some(mb) = self.matte_buf(ctx, m)
                     {
                         let mo = ctx.opacity(m) as f32;
                         self.place(ctx, m, &mb, &mut mimg, BlendMode::Normal, mo);
