@@ -477,6 +477,39 @@ fn near_zero_scale_depth_of_field_is_bounded() {
     }
 }
 
+/// The circle of confusion is the thin lens': aperture · F / (focus − F) · |z − focus| / z,
+/// with the focal length F in millimetres (Zoom on the 36 mm film) and distances in pixels, as
+/// After Effects renders it. SceneYard "Digital Wallets" (1080-wide comp, Zoom 1866.67 = 62.2 mm,
+/// Focus Distance 2573.67, Aperture 100, layers at depth 1648.67): After Effects shows them
+/// sharp; the aperture alone made a 56-pixel circle and blurred everything.
+#[test]
+fn circle_of_confusion_is_the_thin_lens() {
+    let (mut p, cid, _) = setup();
+    let comp = Comp::new(1080, 1920, FrameRate::FPS_30, Tick::from_seconds_f64(1.0));
+    let mut cam = camera(&mut p, &comp);
+    set(&mut cam, "cameraOptions/zoom", Value::Scalar(1866.66666685));
+    set(&mut cam, "cameraOptions/dof", Value::Bool(true));
+    set(&mut cam, "cameraOptions/focusDistance", Value::Scalar(2573.66666685));
+    set(&mut cam, "cameraOptions/aperture", Value::Scalar(100.0));
+    let c = p.comp_mut(cid).unwrap();
+    *c = comp.clone();
+    c.layers.push(cam);
+    let c = p.comp(cid).unwrap();
+    let ctx = crate::EvalCtx::new(&p, cid, c, Tick::ZERO);
+    let dof = super::camera::active_camera(&ctx).dof.expect("depth of field on");
+    let f = 1866.66666685 * 36.0 / 1080.0;
+    assert!((dof.focal_length - f).abs() < 1e-9, "{}", dof.focal_length);
+    let z = 1648.66666685;
+    let want = 100.0 * f / (2573.66666685 - f) * (z - 2573.66666685f64).abs() / z;
+    assert!((dof.coc(z) - want).abs() < 1e-9 && dof.coc(z) < 1.5, "{} vs {want}", dof.coc(z));
+    // Focus at or inside the focal length: bounded, finite.
+    let near = super::camera::Dof { focus: f * 0.5, ..dof };
+    assert!(near.coc(z).is_finite() && near.coc(z) <= 100.0 * f * (z - f * 0.5).abs() / z);
+    // Unknown focal length: the aperture alone.
+    let bare = super::camera::Dof { focal_length: 0.0, ..dof };
+    assert!((bare.coc(z) - 100.0 * (z - 2573.66666685f64).abs() / z).abs() < 1e-9);
+}
+
 /// Pixels in column `x` whose alpha is strictly between 0.05 and 0.95.
 fn soft_px(img: &effectcraft_raster::Image, x: i64) -> usize {
     (0..img.height as i64).filter(|&y| (0.05..0.95).contains(&img.get(x, y)[3])).count()

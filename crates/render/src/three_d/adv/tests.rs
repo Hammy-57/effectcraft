@@ -283,7 +283,14 @@ fn depth_of_field_blurs_out_of_focus_surfaces() {
         let m: f32 = im.data.iter().map(|p| p[0]).sum::<f32>() / im.data.len() as f32;
         im.data.iter().map(|p| (p[0] - m).powi(2)).sum::<f32>() / im.data.len() as f32
     };
-    let dof = crate::three_d::camera::Dof { focus: 1000.0, aperture: 40.0, blur_level: 1.0, iris: Default::default(), highlight: Default::default() };
+    let dof = crate::three_d::camera::Dof {
+        focus: 1000.0,
+        aperture: 40.0,
+        blur_level: 1.0,
+        focal_length: 0.0,
+        iris: Default::default(),
+        highlight: Default::default(),
+    };
     let sharp = depth_of_field(&img, &vec![1000.0; 64 * 64], &dof, 1.0);
     assert!((var(&sharp) - var(&img)).abs() < 1e-6, "in focus: unchanged");
     let blurred = depth_of_field(&img, &vec![3000.0; 64 * 64], &dof, 1.0);
