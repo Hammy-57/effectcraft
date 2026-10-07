@@ -422,11 +422,21 @@ pub fn import_ir(
                 }
                 if let Some(m) = matte {
                     let mid = integer(&m, &["layer_id"]);
-                    let kind = match string(&m, &["type"]).unwrap_or("alpha").to_ascii_lowercase().as_str() {
-                        "alpha" => Some(MatteKind::Alpha),
-                        "alpha_inverted" | "alphainverted" => Some(MatteKind::AlphaInverted),
-                        "luma" => Some(MatteKind::Luma),
-                        "luma_inverted" | "lumainverted" => Some(MatteKind::LumaInverted),
+                    let kind = match m.get("type") {
+                        Some(Json::Number(n)) => match n.as_i64() {
+                            Some(5013) => Some(MatteKind::Alpha),
+                            Some(5014) => Some(MatteKind::AlphaInverted),
+                            Some(5015) => Some(MatteKind::Luma),
+                            Some(5016) => Some(MatteKind::LumaInverted),
+                            _ => None,
+                        },
+                        Some(Json::String(s)) => match s.to_ascii_lowercase().as_str() {
+                            "alpha" => Some(MatteKind::Alpha),
+                            "alpha_inverted" | "alphainverted" => Some(MatteKind::AlphaInverted),
+                            "luma" => Some(MatteKind::Luma),
+                            "luma_inverted" | "lumainverted" => Some(MatteKind::LumaInverted),
+                            _ => None,
+                        },
                         _ => None,
                     };
                     layer.track_matte = mid.and_then(|m| local_ids.get(&m).copied()).zip(kind).map(|(layer, kind)| TrackMatte { layer, kind });
@@ -1028,6 +1038,15 @@ fn import_property(
             }
         }
     } else if kind == "property" {
+        // py-aep exposes placeholder 10px Dash/Gap slots even for solid strokes. Only
+        // authored slots belong to the stroke; importing placeholders makes it dashed.
+        if parent.match_id == "dashes"
+            && boolean(ir, &["authored"]) == Some(false)
+            && array(ir, "keyframes").is_empty()
+            && string(ir, &["expression"]).unwrap_or("").is_empty()
+        {
+            return;
+        }
         let value_json = ir.get("value").unwrap_or(&Json::Null);
         let value_type = string(ir, &["value_type"]).unwrap_or("");
         if value_json.is_null() && array(ir, "keyframes").is_empty() {
@@ -1056,7 +1075,11 @@ fn import_property(
         let at = if let Some(at) = existing {
             at
         } else {
-            let template = text_anim::template(parent.match_id.as_str(), match_id).unwrap_or_else(|| value.clone());
+            let template = if shapes::is_popup(parent.match_id.as_str(), match_id) {
+                Value::Enum(0)
+            } else {
+                text_anim::template(parent.match_id.as_str(), match_id).unwrap_or_else(|| value.clone())
+            };
             parent.children.push(Node::Prop(Property::new(project.alloc(), match_id, name, template)));
             parent.children.len() - 1
         };
@@ -1891,6 +1914,47 @@ mod tests {
         assert!(matches!(layer.props.sub("masks").unwrap().sub("mask").unwrap().kind, GroupKind::Mask { .. }));
         let image = effectcraft_render::render_frame(&project, result.primary_comp.unwrap(), Tick::ZERO, 1.0);
         assert!(image.data.iter().any(|pixel| pixel[3] > 0.5));
+    }
+
+    #[test]
+    fn shape_stroke_popup_imports_butt_cap_and_keyed_round_cap() {
+        let path =
+            serde_json::json!({"type":"Shape","data":{"vertices":[[-20,0],[20,0]],"in_tangents":[[0,0],[0,0]],"out_tangents":[[0,0],[0,0]],"closed":false}});
+        let ir = serde_json::json!({"schema_version":1,"items":[{"id":1,"kind":"comp","name":"Main","width":100,"height":100,"duration":2,"layers":[
+        {"id":2,"kind":"ShapeLayer","name":"Line","properties":[{"kind":"group","match_name":"ADBE Root Vectors Group","children":[
+            {"kind":"group","match_name":"ADBE Vector Shape - Group","children":[{"kind":"property","match_name":"ADBE Vector Shape","value":path}]},
+            {"kind":"group","match_name":"ADBE Vector Graphic - Stroke","children":[
+                {"kind":"property","match_name":"ADBE Vector Stroke Color","value":[1,0,0,1]},
+                {"kind":"property","match_name":"ADBE Vector Stroke Width","value":10},
+                {"kind":"property","match_name":"ADBE Vector Stroke Line Cap","value":1,"keyframes":[{"time":0,"value":1},{"time":1,"value":2}]},
+                {"kind":"group","match_name":"ADBE Vector Stroke Dashes","authored":true,"children":[
+                    {"kind":"property","match_name":"ADBE Vector Stroke Dash 1","authored":false,"value":10},
+                    {"kind":"property","match_name":"ADBE Vector Stroke Gap 1","authored":false,"value":10}
+                ]}
+            ]}
+        ]}]}]}]});
+        let mut project = Project::default();
+        let result = import_ir(&mut project, ir.to_string().as_bytes(), "", &mut |_| None).unwrap();
+        let comp = result.primary_comp.unwrap();
+        let stroke = project.comp(comp).unwrap().layers[0].props.sub("contents").unwrap().sub("stroke").unwrap();
+        let cap = stroke.prop("cap").unwrap();
+        assert_eq!(cap.value, Value::Enum(0));
+        assert_eq!(cap.keys.iter().map(|k| &k.value).collect::<Vec<_>>(), [&Value::Enum(0), &Value::Enum(1)]);
+        assert!(stroke.sub("dashes").unwrap().children.is_empty());
+        let frame = effectcraft_render::render_frame(&project, comp, Tick::ZERO, 1.0);
+        assert!(frame.data.iter().any(|pixel| pixel[3] > 0.5));
+    }
+
+    #[test]
+    fn numeric_aep_track_matte_type_keeps_inversion() {
+        let ir = serde_json::json!({"schema_version":1,"items":[{"id":1,"kind":"comp","name":"Main","width":100,"height":100,"duration":1,"layers":[
+            {"id":2,"kind":"null","name":"Text","matte":{"layer_id":3,"type":5014}},
+            {"id":3,"kind":"null","name":"Matte"}
+        ]}]});
+        let mut project = Project::default();
+        let result = import_ir(&mut project, ir.to_string().as_bytes(), "", &mut |_| None).unwrap();
+        let layer = &project.comp(result.primary_comp.unwrap()).unwrap().layers[0];
+        assert!(matches!(layer.track_matte, Some(TrackMatte { kind: MatteKind::AlphaInverted, .. })));
     }
 
     #[test]
