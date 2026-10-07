@@ -176,7 +176,7 @@ pub fn layer_rotation(ctx: &EvalCtx, layer: &Layer) -> Mat4 {
     let rx = ctx.f(layer, tr, "rotationX", 0.0);
     let ry = ctx.f(layer, tr, "rotationY", 0.0);
     let rz = ctx.f(layer, tr, "rotation", 0.0);
-    Mat4::orientation(Vec3::from(o)) * Mat4::rotate_z(rz) * Mat4::rotate_y(ry) * Mat4::rotate_x(rx)
+    Mat4::orientation(Vec3::from(o)) * Mat4::rotate_x(rx) * Mat4::rotate_y(ry) * Mat4::rotate_z(rz)
 }
 
 /// World matrix of a layer's parent chain (identity when unparented).

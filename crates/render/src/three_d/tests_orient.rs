@@ -75,6 +75,35 @@ fn layers_parented_to_a_camera_follow_its_rotation() {
 }
 
 #[test]
+fn camera_parent_xyz_rotations_match_ae_projection_order() {
+    let (mut p, cid, comp) = setup();
+    let mut parent = build::layer(&mut p, &comp, "Rig", LayerSource::Null, (200, 100), None);
+    parent.switches.three_d = true;
+    for (name, value) in [
+        ("position", Value::Vec3([90.0, 55.0, 0.0])),
+        ("rotationX", Value::Scalar(41.0)),
+        ("rotationY", Value::Scalar(41.0)),
+        ("rotation", Value::Scalar(14.0)),
+    ] {
+        parent.props.prop_mut(&format!("transform/{name}")).unwrap().value = value;
+    }
+    let mut cam = build::layer(&mut p, &comp, "Camera", LayerSource::Camera, (200, 100), None);
+    cam.parent = Some(parent.id);
+    cam.auto_orient = AutoOrient::TowardsPointOfInterest;
+    cam.props.prop_mut("transform/poi").unwrap().value = Value::Vec3([0.0, 0.0, 0.0]);
+    cam.props.prop_mut("transform/position").unwrap().value = Value::Vec3([0.0, 0.0, -200.0]);
+    cam.props.prop_mut("cameraOptions/zoom").unwrap().value = Value::Scalar(200.0);
+    p.comp_mut(cid).unwrap().layers.extend([cam, parent]);
+    let c = p.comp(cid).unwrap();
+    let ctx = EvalCtx::new(&p, cid, c, Tick::ZERO);
+    let camera = active_camera(&ctx);
+    let top_left = camera.project(200.0, 100.0, vec3(0.0, 0.0, 0.0)).unwrap();
+    let top_right = camera.project(200.0, 100.0, vec3(200.0, 0.0, 0.0)).unwrap();
+    assert!((top_left.x + 17.6282).abs() < 0.01 && (top_left.y - 28.4564).abs() < 0.01, "{top_left:?}");
+    assert!((top_right.x - 131.7573).abs() < 0.01 && (top_right.y - 13.5049).abs() < 0.01, "{top_right:?}");
+}
+
+#[test]
 fn camera_parented_to_towards_camera_layer_does_not_recurse() {
     let (mut p, cid, comp) = setup();
     let mut l = solid(&mut p, &comp, true, [100.0, 50.0, 0.0]);
