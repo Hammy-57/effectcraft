@@ -1031,6 +1031,9 @@ fn import_property(
                     import_curves_state(&mut group, ir, losses, context);
                 }
                 import_native_effect_params(project, &mut group, ir, ir, spec.id, layer_time, losses, context, depth + 1);
+                if spec.id == "ec.color.colorama" {
+                    import_colorama_cycle(&mut group, ir, losses, context);
+                }
                 if spec.id == "S_CartoonPaint" {
                     losses.push(format!("{context}: S_CartoonPaint brush-stroke rendering is approximate; visual parity unverified"));
                 }
@@ -1221,6 +1224,49 @@ fn import_property(
         }
     } else {
         losses.push(format!("{context}: unknown property node {name}"));
+    }
+}
+
+/// Colorama's Output Cycle wheel as a palette string ("pos:r,g,b,a …"), from the effect's
+/// 520-byte state: 64 stops of (u32 BE position / 65536, A R G B bytes), then a u32 BE count
+/// of the stops in use. The wheel holds the palette AE draws with whether it came from a
+/// preset or was edited (SceneYard Puppet Control Documentary: black → blue, not the hue
+/// cycle that turned the sky green).
+fn colorama_cycle_palette(hex: &str) -> Option<String> {
+    let bytes: Vec<u8> = (0..hex.len()).step_by(2).map(|i| hex.get(i..i + 2).and_then(|b| u8::from_str_radix(b, 16).ok())).collect::<Option<_>>()?;
+    if bytes.len() != 520 {
+        return None;
+    }
+    let be = |at: usize| bytes.get(at..at + 4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+    let count = be(512)? as usize;
+    if count == 0 || count > 64 {
+        return None;
+    }
+    let stops: Vec<String> = (0..count)
+        .map(|i| {
+            let at = i * 8;
+            let pos = (be(at)? as f64 / 65536.0).clamp(0.0, 1.0);
+            let c = |k: usize| bytes.get(at + 4 + k).map(|v| *v as f64 / 255.0);
+            Some(format!("{pos:.5}:{:.4},{:.4},{:.4},{:.4}", c(1)?, c(2)?, c(3)?, c(0)?))
+        })
+        .collect::<Option<_>>()?;
+    Some(stops.join(" "))
+}
+
+fn import_colorama_cycle(group: &mut PropGroup, ir: &Json, losses: &mut Vec<String>, context: &str) {
+    let Some(hex) = string(ir, &["colorama_cycle_hex"]) else {
+        losses.push(format!("{context}: missing Colorama Output Cycle; the preset palette is used"));
+        return;
+    };
+    let Some(palette) = colorama_cycle_palette(hex) else {
+        losses.push(format!("{context}: invalid Colorama Output Cycle; the preset palette is used"));
+        return;
+    };
+    if let Some(prop) = group.prop_mut("outputCycle/palette") {
+        prop.value = Value::Str(palette);
+    }
+    if let Some(prop) = group.prop_mut("outputCycle/usePresetPalette") {
+        prop.value = Value::Enum(effectcraft_effects::COLORAMA_PRESETS.len().saturating_sub(1) as u32);
     }
 }
 
@@ -1663,6 +1709,20 @@ mod tests {
         let multi: String = raw.iter().map(|byte| format!("{byte:02x}")).collect();
         import_curves_state(&mut group, &serde_json::json!({"curves_state_hex":multi}), &mut losses, "test");
         assert_eq!(losses, ["test: AE Curves individual-channel LUT visual parity unverified"]);
+    }
+
+    /// Colorama's Output Cycle state becomes a custom palette (SceneYard Puppet Control
+    /// Documentary: two live stops, black → blue, after four stale hue-cycle stops).
+    #[test]
+    fn colorama_cycle_state_becomes_the_palette() {
+        let mut hex = String::from("00000000ff0000000000ffffff0000ff00005555ff00ff0000008000ff00ffff0000aaaaff0000ff0000d555ffff00ff");
+        hex.push_str(&"0".repeat(1024 - hex.len()));
+        hex.push_str("0000000200000000");
+        assert_eq!(colorama_cycle_palette(&hex).as_deref(), Some("0.00000:0.0000,0.0000,0.0000,1.0000 0.99998:0.0000,0.0000,1.0000,1.0000"));
+        assert_eq!(colorama_cycle_palette(&hex[..100]), None);
+        let palette = effectcraft_effects::ColoramaPalette::parse(&colorama_cycle_palette(&hex).unwrap()).unwrap();
+        let mid = palette.eval(0.5, true);
+        assert!(mid[0] == 0.0 && (mid[2] - 0.5).abs() < 1e-3, "{mid:?}");
     }
 
     #[test]
