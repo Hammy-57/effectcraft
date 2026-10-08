@@ -167,8 +167,9 @@ fn ripple(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
 fn cc_lens(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
     let c = b.to_px(ctx.params.v2("center"));
     let (lw, lh) = (ctx.layer_size[0] * b.scale, ctx.layer_size[1] * b.scale);
-    let r = (ctx.params.f("size") / 100.0 * lw.max(lh) * 0.5).max(0.5);
-    let k = 2f64.powf(ctx.params.f("convergence") / 50.0);
+    // distort2::cc_lens_radius.
+    let r = (ctx.params.f("size") / 100.0 * lw.hypot(lh) * 0.5).max(0.5);
+    let k = ctx.params.f("convergence") / 100.0;
     let mut p = Params::default();
     p.f[0] = [c.0 as f32, c.1 as f32, r as f32, k as f32];
     run(e, "dst_cclens", &p, b, None)

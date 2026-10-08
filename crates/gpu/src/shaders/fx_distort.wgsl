@@ -196,7 +196,7 @@ fn dst_ripple(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 // ---------------------------------------------------------------- CC Lens (distort2::cc_lens)
-// f[0] = (cx, cy, radius, convergence exponent)
+// f[0] = (cx, cy, radius, convergence / 100)
 @compute @workgroup_size(16, 16)
 fn dst_cclens(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = vec2<i32>(gid.xy);
@@ -213,12 +213,8 @@ fn dst_cclens(@builtin(global_invocation_id) gid: vec3<u32>) {
         textureStore(out, p, vec4<f32>(0.0));
         return;
     }
-    var s = q;
-    if (d >= 1e-9) {
-        let g = powz(asin_p(min(d / r, 1.0)) / DST_HALF_PI, P.f[0].w);
-        let k = r * g / d;
-        s = vec2<f32>(c.x + dx * k, c.y + dy * k);
-    }
+    let k = 1.0 - P.f[0].w * (d / r) * (d / r);
+    let s = vec2<f32>(c.x + dx * k, c.y + dy * k);
     textureStore(out, p, sample_bilinear(src, s.x, s.y));
 }
 
