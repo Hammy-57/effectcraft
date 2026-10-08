@@ -513,8 +513,10 @@ fn gen_fourcolor(@builtin(global_invocation_id) gid: vec3<u32>) {
     let op = P.f[8].z;
     let o = textureLoad(src, p, 0);
     if (P.u[0].x == 255u) {
-        // None recolours the layer within its own alpha (generate::four_color).
-        textureStore(out, p, o + (vec4<f32>(c * o.a, o.a) - o) * op);
+        // None replaces the layer's colour within its own alpha, faded by Opacity
+        // (generate::four_color).
+        let a = o.a * op;
+        textureStore(out, p, vec4<f32>(c * a, a));
         return;
     }
     textureStore(out, p, gen_blend(o, vec4<f32>(c * op, op), P.u[0].x));
