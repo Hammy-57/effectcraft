@@ -34,6 +34,12 @@ def media_name(name):
     return unicodedata.normalize("NFC", name).casefold()
 
 
+# Popup defaults where py-aep's shared last value is known to leak between instances. Measured
+# on the SceneYard corpus: CC Page Turn's untouched Controls reads 6 (Bottom Right Corner) in 12
+# of 13 instances, and aerender draws Paper News Highlight's untouched one flat as with 6.
+POPUP_DEFAULTS = {"CC Page Turn-0008": 6}
+
+
 class Exporter:
     def __init__(self, font_search_root=None):
         self.losses = []
@@ -45,6 +51,8 @@ class Exporter:
         self.font_hashes = {}
         self.font_search_root = Path(font_search_root).resolve() if font_search_root else None
         self.explicit_mattes = False
+        self.effect_definitions = {}
+        self.authored_values = None
         if self.font_search_root and not self.font_search_root.is_dir():
             raise ValueError(f"No font search root: {self.font_search_root}")
 
@@ -327,27 +335,95 @@ class Exporter:
         return {name: self.value(self.read(key, name, scope), f"{scope}/{name}") for name in fields}
 
     @staticmethod
-    def effect_default(prop):
+    def plugin_default(definition):
+        """An effect parameter's plugin default from py-aep's parameter definition (pard), in the
+        IR's units, or `None` where the definition carries none (points, layers, groups)."""
+        if not isinstance(definition, dict):
+            return None
+        kind = int(definition.get("property_control_type", -1))
+        # Popups: pard's default index is 0 for most built-in effects whatever their real default
+        # (Glow: Color Channels / Behind / Add), so it is not used; see POPUP_DEFAULTS.
+        if kind in (4, 5):  # checkbox, colour
+            return definition.get("default_value")
+        if kind in (1, 2, 3, 10):  # integer, scalar, angle, float slider
+            return definition.get("default")
+        return None
+
+    @staticmethod
+    def value_key(value):
+        """A comparable form of a static effect parameter value."""
+        if isinstance(value, (list, tuple)):
+            return tuple(round(float(v), 5) if isinstance(v, (int, float)) else v for v in value)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return round(float(value), 5)
+        return value
+
+    @staticmethod
+    def authored_effect_values(project):
+        """{(effect match name, parameter match name): {static values set somewhere}}: where an
+        untouched parameter can have picked up another instance's value."""
+        found = {}
+
+        def visit(effect_name, group, depth):
+            if depth > 8:
+                return
+            for prop in group:
+                if isinstance(prop, PropertyGroup):
+                    visit(effect_name, prop, depth + 1)
+                elif prop._is_live() and not getattr(prop, "keyframes", None) and not getattr(prop, "expression", ""):
+                    try:
+                        key = Exporter.value_key(prop.value)
+                        hash(key)
+                    except Exception:
+                        continue
+                    found.setdefault((effect_name, prop.match_name), set()).add(key)
+
+        for comp in getattr(project, "compositions", []) or []:
+            for layer in getattr(comp, "layers", []) or []:
+                for effect in getattr(layer, "effects", None) or []:
+                    try:
+                        visit(effect.match_name, effect, 0)
+                    except Exception:
+                        continue
+        return found
+
+    @staticmethod
+    def effect_default(prop, definitions=None, authored=None):
         """The plugin default of an effect parameter AE left out of the file (at its default).
 
         py-aep fills such a parameter from the project's shared parameter record, whose last value
         is whatever another instance of the effect was last set to (SceneYard Student Computer
         Workflow: an untouched Tint's Map White To read as another Tint's dark blue; aerender
-        draws it white). `None` keeps py-aep's value.
+        draws it white. Paper News Highlight: an untouched CC Page Turn's Controls read as another
+        instance's 3 and turned the page over). `definitions` are py-aep's per-effect parameter
+        definitions; without one, py-aep's own default is used. `None` keeps py-aep's value.
         """
         if prop._is_live() or not hasattr(prop, "last_value"):
             return None
-        parent = getattr(prop, "parent_property", None)
+        effect = getattr(prop, "parent_property", None)
+        parent = effect
         while parent is not None and getattr(parent, "match_name", None) != "ADBE Effect Parade":
             parent = getattr(parent, "parent_property", None)
         if parent is None:
             return None
-        default = getattr(prop, "default_value", None)
         value = getattr(prop, "value", None)
+        # Only a parameter another instance of the effect sets can have leaked (its last value is
+        # the shared record's, possibly 8-bit rounded); others (Levels, Hue/Saturation,
+        # third-party effects) keep state py-aep reads correctly.
+        if authored is not None and (getattr(effect, "match_name", None), prop.match_name) not in authored:
+            return None
+        definition = ((definitions or {}).get(getattr(effect, "match_name", None)) or {}).get(prop.match_name)
+        default = POPUP_DEFAULTS.get(prop.match_name, Exporter.plugin_default(definition))
+        if default is None:
+            default = getattr(prop, "default_value", None)
         if default is None or isinstance(default, (str, bytes)) or default == value:
             return None
-        if isinstance(value, (list, tuple)) and (not isinstance(default, (list, tuple)) or len(default) != len(value)):
+        if isinstance(value, (list, tuple)) != isinstance(default, (list, tuple)):
             return None
+        if isinstance(value, (list, tuple)) and len(default) != len(value):
+            return None
+        if isinstance(value, bool):
+            return bool(default)
         return list(default) if isinstance(default, tuple) else default
 
     def property(self, prop, path, scope):
@@ -419,7 +495,7 @@ class Exporter:
         else:
             raw_value = self.read(prop, "value", here)
             default_gradient = False
-            default = self.effect_default(prop)
+            default = self.effect_default(prop, self.effect_definitions, self.authored_values)
             if default is not None:
                 raw_value = default
             if raw_value is None and prop.match_name in ("gradientFill/gradient", "outerGlow/gradient", "innerGlow/gradient"):
@@ -628,6 +704,8 @@ class Exporter:
         app = py_aep.parse(source)
         self.explicit_mattes = self.names_matte_layers(self.read(app, "version", "application"))
         project = app.project
+        self.effect_definitions = getattr(project, "_effect_param_defs", None) or {}
+        self.authored_values = self.authored_effect_values(project)
         items = [self.item(item) for item in project]
         with source.open("rb") as handle:
             digest = hashlib.file_digest(handle, "sha256").hexdigest()
