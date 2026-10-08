@@ -136,8 +136,9 @@ fn flt_burst(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 // ---------------------------------------------------------------- CC Light Sweep (generate2::light_sweep)
-// aux = the (softened) alpha plane in x. u[0] = (shape, reception mode); f[0] = (cx, cy, nx, ny);
-// f[1] = (half width, sweep, edge intensity); f[2] = light colour.
+// aux = the alpha plane (x) padded by f[1].z px and box-blurred (when u[0].z). u[0] = (shape,
+// reception mode, edges); f[0] = (ax, ay, k, half): the band's distance is |ax x + ay y + k|;
+// f[1] = (sweep, 2 × edge intensity, pad); f[2] = light colour; f[3] = edge light offset.
 
 @compute @workgroup_size(16, 16)
 fn flt_sweep(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -146,38 +147,41 @@ fn flt_sweep(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let px = textureLoad(src, p, 0);
-    let rel = flt_rel(p, P.f[0].xy);
-    let d = abs(rel.x * P.f[0].z + rel.y * P.f[0].w);
-    let half = P.f[1].x;
+    let c = vec2<f32>(p) + vec2<f32>(0.5);
+    let d = abs(P.f[0].x * c.x + P.f[0].y * c.y + P.f[0].z);
     let mode = P.u[0].y;
+    // generate2::light_sweep_band.
+    let t = clamp(1.0 - d / max(P.f[0].w, 1e-6), 0.0, 1.0);
     var band: f32;
     switch P.u[0].x {
         case 0u: {
-            band = max(1.0 - d / half, 0.0);
+            band = t;
         }
         case 2u: {
-            band = clamp(half - d + 0.5, 0.0, 1.0);
+            band = t * t;
         }
         default: {
-            band = flt_smoothstep(half, 0.0, d);
+            band = t * t * (3.0 - 2.0 * t);
         }
     }
     if (band <= 0.0) {
         textureStore(out, p, select(px, vec4<f32>(0.0), mode == 2u));
         return;
     }
-    let gx = tex_get_clamped(aux, p.x + 1, p.y).x - tex_get_clamped(aux, p.x - 1, p.y).x;
-    let gy = tex_get_clamped(aux, p.x, p.y + 1).x - tex_get_clamped(aux, p.x, p.y - 1).x;
-    let edge = min(sqrt(gx * gx + gy * gy) * 2.0, 1.0);
-    let light = band * P.f[1].y + band * edge * P.f[1].z;
-    let lc = P.f[2].xyz;
     let a = px.w;
+    var edge = 0.0;
+    if (P.u[0].z != 0u) {
+        let q = c + vec2<f32>(P.f[1].z) + P.f[3].xy;
+        edge = max(a - sample_bilinear_clamped(aux, q.x, q.y).x, 0.0);
+    }
+    let light = band * (P.f[1].x + edge * P.f[1].y);
+    let lc = P.f[2].xyz;
     var o: vec4<f32>;
     if (mode == 1u) {
-        let la = min(band * P.f[1].y, 1.0);
-        o = vec4<f32>(px.xyz + lc * light, min(a + la * (1.0 - a), 1.0));
+        let l = clamp(light, 0.0, 1.0);
+        o = vec4<f32>(px.xyz * (1.0 - l) + lc * l * a, a);
     } else if (mode == 2u) {
-        let la = min(light * a, 1.0);
+        let la = clamp(light * a, 0.0, 1.0);
         o = vec4<f32>(lc * la, la);
     } else {
         o = vec4<f32>(px.xyz + lc * light * a, a);

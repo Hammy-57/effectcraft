@@ -2,12 +2,12 @@
 //! prefixed `flt_`): CC Light Rays, CC Light Burst 2.5, CC Light Sweep and CC Light Wipe, with
 //! the CPU effects' exact steps. Centres, radii, the wipe's corner distance and ramp are
 //! computed on the CPU in f64 as the CPU effect does; the kernels work relative to the centre.
-//! Light Sweep's softened alpha plane is the CPU's `gauss_plane` (box passes, edges repeated).
+//! Light Sweep's edge plane is the CPU's padded alpha box blur (`generate2::sweep_edge_plane`).
 
-use effectcraft_effects::EffectCtx;
+use effectcraft_effects::{EffectCtx, light_sweep_geometry};
 
 use crate::context::{Enc, GpuImage, Params};
-use crate::effects::{GBuf, gaussian_blur};
+use crate::effects::{GBuf, box_passes};
 
 /// Compute entry points in `fx_light.wgsl`.
 pub(crate) const KERNELS: &[&str] = &["flt_rays", "flt_burst", "flt_sweep", "flt_wipe"];
@@ -75,19 +75,28 @@ fn light_burst(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
 
 fn light_sweep(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
     let pr = ctx.params;
-    let c = b.to_px(pr.v2("center"));
-    let dir = pr.f("direction").to_radians();
-    let half = (pr.f("width") * b.scale * 0.5).max(0.5);
-    let edge_t = pr.f("edgeThickness") * b.scale;
-    // The alpha plane (x), softened by util::gauss_plane (edges repeated) when thick enough.
+    let g = light_sweep_geometry(ctx, b.offset, b.scale);
+    // generate2::sweep_edge_plane: the alpha plane (x) padded with transparency, box-blurred.
+    let pad = g.pad();
     let alpha = e.scratch(b.img.width, b.img.height);
     e.pixels("fxe_alpha", &Params::default(), &b.img, None, &alpha, None);
-    let soft = if edge_t > 0.05 { gaussian_blur(e, &alpha, edge_t * 0.5, edge_t * 0.5, true) } else { alpha };
+    let soft = if g.edges {
+        let (w, h) = (b.img.width.saturating_add(2 * pad as u32), b.img.height.saturating_add(2 * pad as u32));
+        if !e.g.fits(w, h) {
+            return None;
+        }
+        let padded = e.image(w, h);
+        e.copy_into(&alpha, &padded, pad as u32, pad as u32);
+        box_passes(e, &padded, &[g.rx], &[g.ry], false)
+    } else {
+        alpha
+    };
     let mut p = Params::default();
-    p.u[0] = [pr.e("shape"), pr.e("lightReceptionMode"), 0, 0];
-    p.f[0] = [c.0 as f32, c.1 as f32, dir.cos() as f32, dir.sin() as f32];
-    p.f[1] = [half as f32, (pr.f("sweepIntensity") / 100.0) as f32, (pr.f("edgeIntensity") / 100.0) as f32, 0.0];
+    p.u[0] = [pr.e("shape"), pr.e("lightReceptionMode"), g.edges as u32, 0];
+    p.f[0] = [g.ax as f32, g.ay as f32, g.k as f32, g.half as f32];
+    p.f[1] = [(pr.f("sweepIntensity") / 100.0) as f32, (pr.f("edgeIntensity") / 100.0 * 2.0) as f32, pad as f32, 0.0];
     p.f[2] = rgb(pr.color("lightColor"));
+    p.f[3] = [g.shift.0 as f32, g.shift.1 as f32, 0.0, 0.0];
     run(e, "flt_sweep", &p, b, Some(&soft))
 }
 

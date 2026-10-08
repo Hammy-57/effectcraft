@@ -94,7 +94,7 @@ pub use stylize2::strobe_on;
 pub use blur2::{camera_lens_plain, camera_lens_spans};
 pub use generate::gen_mode;
 pub use generate2::pattern_kind as cell_pattern_kind;
-pub use generate2::{BoltSeg, Contour, Ghost, RadioPlan, Wave, flare_ghosts, lightning_segments, radio_plan};
+pub use generate2::{BoltSeg, Contour, Ghost, RadioPlan, SweepGeometry, Wave, flare_ghosts, light_sweep_geometry, lightning_segments, radio_plan};
 pub use generate3::{
     Coverage, MarksPlan, PaintPlan, Seg, eyedropper_color, marks_plan, paint_bucket_region, paint_plan, plan_reads_pixels, poly_segs, scribble_style,
 };
@@ -350,6 +350,11 @@ pub struct EffectEnv<'a> {
     /// comp's and the layer's motion blur switches are on (Transform's Use Composition's
     /// Shutter Angle).
     pub shutter: Option<(f64, f64, u32)>,
+    /// A Continuously Rasterize (collapsed) shape or text layer: After Effects runs its effects
+    /// in comp space, their points, angles and sizes in comp pixels. The affine rows `[a, b, c]`,
+    /// `[d, e, f]` take the effect coordinates [`Buf::to_px`] places to comp coordinates
+    /// (`x' = a x + b y + c`). Effects that honour it say so.
+    pub comp_space: Option<[[f64; 3]; 2]>,
 }
 
 /// What an effect gets to render with.

@@ -955,6 +955,7 @@ impl<'a> Renderer<'a> {
             working_space: self.pipe.space,
             working_linear: self.pipe.linear,
             shutter: self.mb_on(ctx, layer).then_some((ctx.comp.shutter_angle, ctx.comp.shutter_phase, ctx.comp.motion_blur_samples)),
+            comp_space: fx_comp_space(ctx, layer).map(|m| [m.0[0], m.0[1]]),
         };
         // Video effects in stack order (index, group, spec); disabled and audio effects skipped.
         let stack: Vec<(usize, &effectcraft_project::PropGroup, &'static effectcraft_effects::EffectSpec)> = fx
@@ -1000,10 +1001,20 @@ impl<'a> Renderer<'a> {
             k += 1;
             let params = self.effect_params(ctx, layer, g);
             host.index.store(i, std::sync::atomic::Ordering::Relaxed);
-            let env = EffectEnv { effect_index: i, ..env };
+            let d = shape_fx_origin(ctx, layer).map(|d| [d[0] * self.opts.scale, d[1] * self.opts.scale]);
+            // The CPU shifts a shape layer's effect coordinates by `d` (buffer px): comp space
+            // follows them.
+            let comp_space = match (env.comp_space, d) {
+                (Some([r0, r1]), Some(d)) => {
+                    let rs = self.raster_scale(ctx, layer);
+                    let (dx, dy) = if rs > 1e-9 { (d[0] / rs, d[1] / rs) } else { (0.0, 0.0) };
+                    Some([[r0[0], r0[1], r0[2] - r0[0] * dx - r0[1] * dy], [r1[0], r1[1], r1[2] - r1[0] * dx - r1[1] * dy]])
+                }
+                (cs, _) => cs,
+            };
+            let env = EffectEnv { effect_index: i, comp_space, ..env };
             let ectx = EffectCtx { params: &params, time: lt.seconds(), layer_size, seed: g.uid as u32, adjustment, env };
             let t0 = web_time::Instant::now();
-            let d = shape_fx_origin(ctx, layer).map(|d| [d[0] * self.opts.scale, d[1] * self.opts.scale]);
             target.cpu(&mut |mut buf| {
                 if let Some(d) = d {
                     buf.offset = [buf.offset[0] - d[0], buf.offset[1] - d[1]];
@@ -1855,6 +1866,17 @@ fn shape_fx_origin(ctx: &EvalCtx, layer: &Layer) -> Option<[f64; 2]> {
     }
     let a = layer.transform().map(|tr| ctx.v3(layer, tr, "anchor", [0.0; 3])).unwrap_or([0.0; 3]);
     Some([ctx.comp.width as f64 / 2.0 - a[0], ctx.comp.height as f64 / 2.0 - a[1]])
+}
+
+/// After Effects runs a Continuously Rasterize shape or text layer's effects in comp space:
+/// measured with CC Light Sweep, its centre, angle and width stay put in the comp whatever the
+/// layer's position, scale and rotation. The layer → comp affine of such a 2D layer (see
+/// [`EffectEnv::comp_space`]).
+fn fx_comp_space(ctx: &EvalCtx, layer: &Layer) -> Option<Mat3> {
+    if !layer.switches.collapse || layer.is_3d() || !matches!(layer.source, LayerSource::Shape | LayerSource::Text) {
+        return None;
+    }
+    Some(ctx.layer_to_comp(layer).0)
 }
 
 /// Multiply `img` by a track matte's coverage (`mimg`, same size).
