@@ -326,6 +326,30 @@ class Exporter:
                   "spatial_auto_bezier", "spatial_continuous", "roving", "label")
         return {name: self.value(self.read(key, name, scope), f"{scope}/{name}") for name in fields}
 
+    @staticmethod
+    def effect_default(prop):
+        """The plugin default of an effect parameter AE left out of the file (at its default).
+
+        py-aep fills such a parameter from the project's shared parameter record, whose last value
+        is whatever another instance of the effect was last set to (SceneYard Student Computer
+        Workflow: an untouched Tint's Map White To read as another Tint's dark blue; aerender
+        draws it white). `None` keeps py-aep's value.
+        """
+        if prop._is_live() or not hasattr(prop, "last_value"):
+            return None
+        parent = getattr(prop, "parent_property", None)
+        while parent is not None and getattr(parent, "match_name", None) != "ADBE Effect Parade":
+            parent = getattr(parent, "parent_property", None)
+        if parent is None:
+            return None
+        default = getattr(prop, "default_value", None)
+        value = getattr(prop, "value", None)
+        if default is None or isinstance(default, (str, bytes)) or default == value:
+            return None
+        if isinstance(value, (list, tuple)) and (not isinstance(default, (list, tuple)) or len(default) != len(value)):
+            return None
+        return list(default) if isinstance(default, tuple) else default
+
     def property(self, prop, path, scope):
         here = scope + "/" + ".".join(map(str, path))
         is_group = isinstance(prop, PropertyGroup)
@@ -395,6 +419,9 @@ class Exporter:
         else:
             raw_value = self.read(prop, "value", here)
             default_gradient = False
+            default = self.effect_default(prop)
+            if default is not None:
+                raw_value = default
             if raw_value is None and prop.match_name in ("gradientFill/gradient", "outerGlow/gradient", "innerGlow/gradient"):
                 style = prop.parent_property
                 if style is not None and style.enabled:
