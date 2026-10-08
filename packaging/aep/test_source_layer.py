@@ -26,5 +26,32 @@ class SourceLayerTest(unittest.TestCase):
                 Exporter.vector_source_layer(source)
 
 
+class PhotoshopLayerTest(unittest.TestCase):
+    """SceneYard Patient ID: "Clipboard" and "stick" are layers 0 and 1 of one PSB; both drew
+    the merged document (the clip became a big white sheet)."""
+    def opti(self, **kw):
+        base = dict(asset_type="8BPS", psd_flattened=False, psd_layer_count=2, psd_layer_index=1,
+                    psd_group_name="Layer 1", psd_layer_left=449, psd_layer_top=139,
+                    psd_layer_right=1065, psd_layer_bottom=441, psd_canvas_width=1549,
+                    psd_canvas_height=2132)
+        base.update(kw)
+        return SimpleNamespace(_opti=SimpleNamespace(**base))
+
+    def test_document_size_layer(self):
+        self.assertEqual(Exporter.psd_source_layer(self.opti(), 1549, 2132),
+                         {"index": 1, "name": "Layer 1", "layer_size": False})
+
+    def test_layer_size_layer(self):
+        self.assertTrue(Exporter.psd_source_layer(self.opti(), 616, 302)["layer_size"])
+
+    def test_merged_import_is_not_a_layer(self):
+        self.assertIsNone(Exporter.psd_source_layer(self.opti(psd_flattened=True), 1549, 2132))
+        self.assertIsNone(Exporter.psd_source_layer(SimpleNamespace(), 1549, 2132))
+
+    def test_invalid_index_is_reported(self):
+        with self.assertRaises(ValueError):
+            Exporter.psd_source_layer(self.opti(psd_layer_index=2), 1549, 2132)
+
+
 if __name__ == "__main__":
     unittest.main()
