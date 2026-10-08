@@ -69,6 +69,11 @@ pub struct Material {
     pub diffuse_k: f32,
     pub specular_k: f32,
     pub ambient_k: f32,
+    /// Strength of a metal's coloured reflection (1 = physically based; cards: see
+    /// `card_material`).
+    pub metal_k: f32,
+    /// A card's classic Metal: applied to direct lights only (environment light unmeasured).
+    pub direct_metal_only: bool,
 }
 
 impl Default for Material {
@@ -97,6 +102,8 @@ impl Default for Material {
             diffuse_k: 1.0,
             specular_k: 1.0,
             ambient_k: 1.0,
+            metal_k: 1.0,
+            direct_metal_only: false,
         }
     }
 }
@@ -358,6 +365,10 @@ impl Builder {
 fn card_material(ctx: &EvalCtx, layer: &Layer) -> Material {
     let c = ClassicMaterial::of(ctx, layer);
     Material {
+        // Fitted with aerender on 50 % grey and coloured cards at Metal 0 / 50 / 80 / 100 ×
+        // Shininess 5 / 90 × Specular 50 / 100: Metal acts as metalness^1.5 (Specular no longer
+        // matters on a full metal), and a rough metal reflects about 4× a smooth one's colour.
+        metallic: c.metal.powf(1.5),
         roughness: (1.0 - c.shininess).clamp(0.05, 1.0),
         double_sided: true,
         accepts_lights: c.accepts_lights,
@@ -367,6 +378,10 @@ fn card_material(ctx: &EvalCtx, layer: &Layer) -> Material {
         diffuse_k: c.diffuse,
         specular_k: c.specular * 2.0,
         ambient_k: c.ambient,
+        metal_k: 1.0 + 3.0 * (1.0 - c.shininess),
+        // AE renders of environment-lit cards at the default Metal 100 (SceneYard 19355662,
+        // 67cf74c5, 812d9956) look like ours without Metal; not measured, so keep that.
+        direct_metal_only: true,
         ..Material::default()
     }
 }
@@ -684,6 +699,9 @@ fn card_layer(r: &Renderer, ctx: &EvalCtx, layer: &Layer, b: &mut Builder) {
     }
 }
 
+/// Exponent applying a light's Intensity in Advanced 3D (see [`lights`]).
+const LIGHT_INTENSITY_GAMMA: f32 = 2.3;
+
 /// Evaluated lights: (scene lights, ambient sum, environment light (layer, intensity × colour,
 /// rotation)).
 fn lights(ctx: &EvalCtx, lin: bool) -> (Vec<Light>, [f32; 3], Option<(Option<u64>, [f32; 3], f32)>) {
@@ -694,7 +712,11 @@ fn lights(ctx: &EvalCtx, lin: bool) -> (Vec<Light>, [f32; 3], Option<(Option<u64
     for layer in ctx.comp.layers.iter().filter(|l| l.is_light() && l.switches.video && l.is_active_at(ctx.time)) {
         let LayerSource::Light { kind } = layer.source else { continue };
         let Some(g) = layer.props.sub("lightOptions") else { continue };
-        let k = (ctx.f(layer, g, "intensity", 100.0) / 100.0) as f32;
+        let k = (ctx.f(layer, g, "intensity", 100.0) / 100.0).max(0.0) as f32;
+        // Advanced 3D reads Intensity like a display value: measured with aerender, an ambient
+        // light at 10 / 25 / 50 / 100 / 200 % lights a card by 0.006 / 0.045 / 0.20 / 1 / >1 of
+        // its colour, i.e. Intensity^2.3 in linear light (the environment light keeps its scale).
+        let k = if kind == LightKind::Environment { k } else { k.powf(LIGHT_INTENSITY_GAMMA) };
         let c = ctx.color(layer, g, "color");
         let color = [l(c[0]) * k, l(c[1]) * k, l(c[2]) * k];
         match kind {
