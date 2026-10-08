@@ -1010,6 +1010,19 @@ impl<'g> Enc<'g> {
         );
     }
 
+    /// Copy the `w`×`h` region of `src` at (`x`, `y`) into a new image (the caller checks
+    /// that it lies inside `src`).
+    pub fn crop(&mut self, src: &GpuImage, x: u32, y: u32, w: u32, h: u32) -> GpuImage {
+        let out = self.scratch(w, h);
+        let enc = self.encoder();
+        enc.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo { texture: &src.texture, mip_level: 0, origin: wgpu::Origin3d { x, y, z: 0 }, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyTextureInfo { texture: &out.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        out
+    }
+
     /// Submit recorded work.
     pub fn submit(&mut self) {
         if let Some((enc, id)) = self.enc.take() {

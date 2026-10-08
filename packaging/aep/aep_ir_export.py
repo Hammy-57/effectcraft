@@ -370,6 +370,17 @@ class Exporter:
                     node["curves_state_hex"] = blobs[0].hex()
                 else:
                     self.loss(here, "curves_state", "expected one 1644-byte Curves aRbp with header 00010001")
+            if node["match_name"] == "APC Colorama":
+                # The Output Cycle wheel (the palette actually used, preset or edited):
+                # 64 × (u32 BE position / 65536, A R G B) + u32 BE stop count.
+                tdgp = getattr(prop, "_tdgp", None)
+                blobs = [chunk.data for group in (tdgp.chunks if tdgp is not None else ())
+                         if getattr(group, "list_type", None) == "aRbs"
+                         for chunk in group.chunks if chunk.chunk_type == "aRbp"]
+                if len(blobs) == 1 and len(blobs[0]) == 520:
+                    node["colorama_cycle_hex"] = blobs[0].hex()
+                else:
+                    self.loss(here, "colorama_cycle", "expected one 520-byte Colorama Output Cycle aRbp")
             if node["match_name"] in ("MB LookSuite3", "S_Monochrome", "S_CartoonPaint"):
                 tdgp = getattr(prop, "_tdgp", None)
                 groups = [chunk for chunk in (tdgp.chunks if tdgp is not None else ())

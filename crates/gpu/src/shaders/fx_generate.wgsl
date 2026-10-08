@@ -551,8 +551,8 @@ fn gen_noise(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (P.u[0].z != 0u) {
         px = vec4<f32>(clamp(px.xyz + n * a, vec3<f32>(0.0), vec3<f32>(a)), a);
     } else {
-        // Unclipped: values past black / white wrap around.
-        px = vec4<f32>(fract_euclid(px.x / a + n.x) * a, fract_euclid(px.y / a + n.y) * a, fract_euclid(px.z / a + n.z) * a, a);
+        // Unclipped: over-range values stay (the bit depth clamps them), never wrap.
+        px = vec4<f32>(px.xyz + n * a, a);
     }
     textureStore(out, p, px);
 }

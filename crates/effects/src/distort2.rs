@@ -603,22 +603,29 @@ fn bend_it(ctx: &EffectCtx, mut b: Buf) -> Buf {
 
 // ---------------------------------------------------------------- CC Lens
 
+/// CC Lens radius in buffer pixels: Size 100 reaches the layer's corners.
+pub(crate) fn cc_lens_radius(size: f64, lw: f64, lh: f64) -> f64 {
+    (size / 100.0 * lw.hypot(lh) * 0.5).max(0.5)
+}
+
+/// CC Lens: a disc of radius Size around Center; outside it the layer is transparent. Inside,
+/// an output pixel at distance d reads the source at d·(1 − c·(d/r)²), c = Convergence/100:
+/// Convergence 0 is the plain disc (SceneYard Digital Wallets: a Size 100, Convergence 0
+/// lens leaves the card its size), positive pushes the content outward towards the rim and
+/// negative pulls it in. Fitted to SceneYard Puppet Control Documentary (Size 100,
+/// Convergence 31 on a 1920×1080 adjustment layer: about 4% at 400 px, 8% at 590 px).
 fn cc_lens(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let c = b.to_px(ctx.params.v2("center"));
     let (_, _, lw, lh) = layer_rect(ctx, &b);
-    let r = (ctx.params.f("size") / 100.0 * lw.max(lh) * 0.5).max(0.5);
-    let k = 2f64.powf(ctx.params.f("convergence") / 50.0);
+    let r = cc_lens_radius(ctx.params.f("size"), lw, lh);
+    let k = ctx.params.f("convergence") / 100.0;
     b.img = remap(&b.img, false, |x, y| {
         let (dx, dy) = (x - c.0, y - c.1);
-        let d = (dx * dx + dy * dy).sqrt();
-        if d >= r {
+        let d2 = dx * dx + dy * dy;
+        if d2 >= r * r {
             return None;
         }
-        if d < 1e-9 {
-            return Some((x, y));
-        }
-        let g = ((d / r).asin() / FRAC_PI_2).powf(k);
-        let s = r * g / d;
+        let s = 1.0 - k * d2 / (r * r);
         Some((c.0 + dx * s, c.1 + dy * s))
     });
     b
@@ -1060,6 +1067,27 @@ mod tests {
         let run_at = |p: [f64; 2]| run("ec.distort.ccpageturn", &[("controls", num(5.0)), ("foldPosition", Value::Vec2(p))], img.clone()).img;
         assert_eq!(run_at([70.0, 68.0]), img);
         assert!(max_diff(&run_at([40.0, 40.0]), &img) > 1e-3);
+    }
+
+    /// CC Lens at Convergence 0 is a plain disc, not a ×1.57 fish-eye (SceneYard Digital
+    /// Wallets: the lensed card came out half again too large); Size 100 reaches the corners and
+    /// a positive Convergence only pushes the rim outward (SceneYard Puppet Control
+    /// Documentary: Convergence 31 is a gentle bulge, not a bubble with black corners).
+    #[test]
+    fn cc_lens_zero_convergence_is_identity_and_size_100_reaches_corners() {
+        let img = test_img(40, 30);
+        let flat = run("ec.distort.cclens", &[("size", Value::Scalar(100.0)), ("convergence", Value::Scalar(0.0))], img.clone());
+        for (x, y) in [(20, 15), (5, 25), (35, 3), (0, 0), (39, 29)] {
+            let (a, b) = (flat.img.get(x, y), img.get(x, y));
+            assert!((0..4).all(|i| (a[i] - b[i]).abs() < 1e-4), "({x},{y}) {a:?} {b:?}");
+        }
+        let bulge = run("ec.distort.cclens", &[("size", Value::Scalar(100.0)), ("convergence", Value::Scalar(31.0))], img.clone());
+        // The centre stays put; a pixel 12 px out reads about 1 px closer in.
+        let (c, e) = (bulge.img.get(20, 15), img.get(20, 15));
+        assert!((c[0] - e[0]).abs() < 1e-3 && (c[1] - e[1]).abs() < 1e-3, "{c:?} {e:?}");
+        let x = bulge.img.get(32, 15)[0] * 40.0;
+        assert!((30.5..31.7).contains(&x), "reads x {x}");
+        assert!(bulge.img.get(1, 1)[3] > 0.99, "corners stay inside the lens");
     }
 
     #[test]

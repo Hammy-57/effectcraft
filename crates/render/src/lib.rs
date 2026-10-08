@@ -1759,6 +1759,13 @@ impl<'a> Renderer<'a> {
             color::convert(&mut below.img, &c);
         }
         let mut adjusted = self.apply_effects(ctx, layer, below, true);
+        if adjusted.img.width != canvas.width || adjusted.img.height != canvas.height {
+            // An effect grew the buffer (Motion Tile's Output Width): back to the comp.
+            let Some((x, y)) = adjustment_crop(adjusted.offset, offset, (adjusted.img.width, adjusted.img.height), (canvas.width, canvas.height)) else {
+                return;
+            };
+            adjusted.img = adjusted.img.crop(x, y, canvas.width, canvas.height);
+        }
         if let Some(c) = self.pipe.to_blend() {
             color::convert(&mut adjusted.img, &c);
         }
@@ -1777,6 +1784,19 @@ impl<'a> Renderer<'a> {
             }
         });
     }
+}
+
+/// Where the comp canvas sits inside an adjustment layer's effect output that grew around it:
+/// the whole-pixel shift between the output's and the input's layer origins (`offset` vs
+/// `input_offset`). `None` when the shift is fractional or the canvas would not fit inside.
+pub fn adjustment_crop(offset: [f64; 2], input_offset: [f64; 2], size: (u32, u32), canvas: (u32, u32)) -> Option<(i64, i64)> {
+    let (dx, dy) = (offset[0] - input_offset[0], offset[1] - input_offset[1]);
+    if !dx.is_finite() || !dy.is_finite() || (dx - dx.round()).abs() > 1e-6 || (dy - dy.round()).abs() > 1e-6 {
+        return None;
+    }
+    let (x, y) = (dx.round() as i64, dy.round() as i64);
+    let fits = x >= 0 && y >= 0 && x + canvas.0 as i64 <= size.0 as i64 && y + canvas.1 as i64 <= size.1 as i64;
+    fits.then_some((x, y))
 }
 
 /// Where a shape layer's effect coordinates start, in layer units. After Effects renders a
