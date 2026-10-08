@@ -431,6 +431,9 @@ pub fn import_ir(
                 );
             }
             place_unauthored_camera_eye(&mut layer, ir);
+            if matches!(&layer.source, LayerSource::Light { kind: effectcraft_project::LightKind::Environment }) {
+                keep_environment_light_defaults(&mut layer, &mut result.losses, &format!("comp {ae_id} layer {ae_layer}"));
+            }
             if matches!(&layer.source, LayerSource::Model { .. }) {
                 let model_scale =
                     integer(ir, &["source_id"]).and_then(|id| items.iter().find(|i| integer(i, &["id"]) == Some(id))).and_then(|i| number(i, &["model_scale"]));
@@ -849,6 +852,30 @@ fn apply_auto_orient(ir: &Json, layer: &mut Layer, losses: &mut Vec<String>, con
             layer.auto_orient
         }
     };
+}
+
+/// The environment light renders at its native Intensity and Colour, as before Light Options
+/// were imported: Advanced 3D's response to them differs per scene and is not modelled yet. AE's
+/// values stay on the layer under their original ids.
+fn keep_environment_light_defaults(layer: &mut Layer, losses: &mut Vec<String>, context: &str) {
+    let Some(g) = layer.props.sub_mut("lightOptions") else { return };
+    let mut changed = false;
+    for (id, default) in [("intensity", Value::Scalar(100.0)), ("color", Value::Color([1.0, 1.0, 1.0, 1.0]))] {
+        let Some(p) = g.prop_mut(id) else { continue };
+        if p.value == default && p.keys.is_empty() {
+            continue;
+        }
+        let mut raw = p.clone();
+        raw.match_id = format!("AE {}", raw.match_id);
+        p.value = default;
+        p.keys.clear();
+        p.expr = None;
+        g.children.push(Node::Prop(raw));
+        changed = true;
+    }
+    if changed {
+        losses.push(format!("{context}: Environment light Intensity / Colour kept at 100 % white (AE response not modelled)"));
+    }
 }
 
 fn native_match(ae: &str) -> &str {
@@ -2119,6 +2146,15 @@ mod tests {
         assert_eq!(opts.get("radius").unwrap().value.as_f64(), 250.0);
         assert_eq!(opts.get("falloffDistance").unwrap().value.as_f64(), 2000.0);
         assert!(opts.get("ADBE Light Intensity").is_none());
+        // Environment lights keep their native Intensity (AE's value stays on the layer).
+        let mut ir = ir;
+        ir["items"][0]["layers"][0]["light_type"] = serde_json::json!(4416);
+        let mut project = Project::default();
+        let result = import_ir(&mut project, ir.to_string().as_bytes(), "", &mut |_| None).unwrap();
+        let layer = &project.comp(result.primary_comp.unwrap()).unwrap().layers[0];
+        let opts = layer.props.sub("lightOptions").unwrap();
+        assert_eq!(opts.get("intensity").unwrap().value.as_f64(), 100.0);
+        assert_eq!(opts.get("AE intensity").unwrap().value.as_f64(), 600.0);
     }
 
     #[test]
