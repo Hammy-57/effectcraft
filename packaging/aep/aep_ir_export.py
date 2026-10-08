@@ -165,8 +165,14 @@ class Exporter:
         rect = (opti.psd_layer_right - opti.psd_layer_left, opti.psd_layer_bottom - opti.psd_layer_top)
         canvas = (opti.psd_canvas_width, opti.psd_canvas_height)
         size = (width, height)
-        return {"index": index, "name": getattr(opti, "psd_group_name", "") or "",
-                "layer_size": size != canvas and size == rect}
+        layer_size = size != canvas and size == rect
+        binding = {"index": index, "name": getattr(opti, "psd_group_name", "") or "", "layer_size": layer_size}
+        if layer_size:
+            # AE trims a Layer Size footage to the layer's visible pixels (SceneYard Student
+            # Computer Workflow: 894x929 out of a 1792x1024 layer record).
+            binding["crop_bounds"] = [float(opti.psd_layer_left), float(opti.psd_layer_top),
+                                      float(opti.psd_layer_right), float(opti.psd_layer_bottom)]
+        return binding
 
     def scan_fonts(self, root):
         index = {}
