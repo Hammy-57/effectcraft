@@ -503,29 +503,37 @@ fn fxv_gen(@builtin(global_invocation_id) gid: vec3<u32>) {
     let px = textureLoad(src, p, 0);
     var o = px;
     switch (P.u[0].x) {
-        // f[0] = (aberration R, G, B, falloff); f[1] = centre; u[0].y = invert.
+        // vr::ChromaticSetup: f[0] = (k R, G, B, falloff power); f[1] = (centre, whole sphere);
+        // f[2].xy = field of view (radians).
         case 0u: {
-            let d = fxv_equi_dir(fx, fy, w, h);
+            let fov = P.f[2].xy;
+            let lon0 = (fx / w - 0.5) * fov.x;
+            let lat0 = (0.5 - fy / h) * fov.y;
+            let d = vec3<f32>(cos(lat0) * sin(lon0), sin(lat0), cos(lat0) * cos(lon0));
             let center = P.f[1].xyz;
-            let ax = cross(center, d);
-            let al = length(ax);
-            let th = atan2(al, dot(center, d));
-            var weight = powz(th / FXV_PI, 1.0 + P.f[0].w * 3.0);
-            if (P.u[0].y != 0u) {
-                weight = 1.0 - weight;
-            }
+            let c = clamp(dot(center, d), -1.0, 1.0);
+            let th = atan2(length(cross(center, d)), dot(center, d));
+            let perp = d - center * c;
+            let pl = length(perp);
+            let weight = powz(max(cos(th * 0.5), 0.0), P.f[0].w);
             var res = vec4<f32>(0.0);
-            for (var c = 0; c < 3; c++) {
+            for (var ch = 0; ch < 3; ch++) {
                 var s = px;
-                if (al >= 1e-9) {
-                    let new_th = th * (1.0 - P.f[0][c] * weight);
-                    let perp = normalize(d - center * cos(th));
-                    let nd = center * cos(new_th) + perp * sin(new_th);
-                    let q = fxv_equi_px(nd, w, h);
-                    s = fxv_sample_equi(q.x, q.y);
+                if (pl >= 1e-6) {
+                    let nt = th * (1.0 - P.f[0][ch] * weight);
+                    let nd = center * cos(nt) + perp / pl * sin(nt);
+                    let lon = atan2(nd.x, nd.z);
+                    let lat = asin_p(clamp(nd.y, -1.0, 1.0));
+                    let sx = (lon / fov.x + 0.5) * w;
+                    let sy = (0.5 - lat / fov.y) * h;
+                    if (P.f[1].w > 0.5) {
+                        s = fxv_sample_equi(sx, sy);
+                    } else {
+                        s = sample_bilinear(src, sx, sy);
+                    }
                 }
-                res[c] = s[c];
-                res.w = max(res.w, s.w);
+                res[ch] = s[ch];
+                res.w += s.w / 3.0;
             }
             o = res;
         }

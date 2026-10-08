@@ -119,7 +119,7 @@ pub use sim2::{
     wave_world_plan,
 };
 pub use utility::{Lut, load_lut};
-pub use vr::{equi_dir as vr_equi_dir, rotation as vr_rotation};
+pub use vr::{ChromaticSetup as VrChromaticSetup, equi_dir as vr_equi_dir, rotation as vr_rotation};
 
 /// Effect categories in Effects & Presets order.
 pub const CATEGORIES: &[&str] = &[
