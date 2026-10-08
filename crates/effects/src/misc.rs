@@ -679,10 +679,13 @@ fn noise(ctx: &EffectCtx, mut b: Buf) -> Buf {
                 px[1] = (px[1] + g * a).clamp(0.0, a);
                 px[2] = (px[2] + bl * a).clamp(0.0, a);
             } else {
-                // Unclipped: values past black / white wrap around (integer overflow look).
-                for (c, n) in [r, g, bl].into_iter().enumerate() {
-                    px[c] = ((px[c] / a + n).rem_euclid(1.0)) * a;
-                }
+                // Unclipped: the noise may leave the 0..1 range (over-range in 32 bpc); an 8 or
+                // 16 bpc project clamps it after the effect like any other. It never wraps
+                // around (SceneYard Drone History: AE leaves cream paper with fine grain, not
+                // red that wrapped to cyan).
+                px[0] += r * a;
+                px[1] += g * a;
+                px[2] += bl * a;
             }
         }
     });
@@ -991,6 +994,18 @@ mod tests {
             }
         }
         img
+    }
+
+    /// Noise with Clip Result Values off never wraps a bright pixel to black (SceneYard Drone
+    /// History infographics: 10% mono noise on cream paper turned it cyan).
+    #[test]
+    fn unclipped_noise_does_not_wrap() {
+        let img = effectcraft_raster::Image::filled(32, 32, [0.98, 0.95, 0.92, 1.0]);
+        let vals = [("amount", Value::Scalar(10.0)), ("color", Value::Bool(false)), ("clip", Value::Bool(false))];
+        let out = run_fx("ec.noise.noise", &vals, img, 0.0, EffectEnv::default());
+        // Within ±5% of the input everywhere: no pixel jumped across the range.
+        assert!(out.img.data.iter().all(|p| (p[0] - 0.98).abs() <= 0.051 && (p[2] - 0.92).abs() <= 0.051), "wrapped noise");
+        assert!(out.img.data.iter().any(|p| p[0] > 1.0), "unclipped noise may go over range");
     }
 
     #[test]
