@@ -588,19 +588,49 @@ impl<'a> Renderer<'a> {
     /// Collapse Transformations switch is on and the layer has no masks, effects or layer
     /// styles (those force a flattened render of the precomp, as in After Effects).
     pub fn collapsed(&self, ctx: &EvalCtx, layer: &Layer) -> Option<ItemId> {
-        if layer.switches.effects && layer.effects().is_some_and(|fx| fx.groups().any(|g| g.enabled)) {
+        if self.collapses_isolated(ctx, layer) {
             return None;
         }
         self.collapse_target(ctx, layer)
     }
 
-    /// A collapsed precomp layer with effects: After Effects still collapses its nested layers
-    /// (3D ones seen through this comp's camera, unclipped by the precomp's frame), then runs
-    /// the effects on the result and composites it as one layer that does not intersect the
-    /// comp's other 3D layers (aerender, SceneYard Trump Photo Zoom In: the street behind the
-    /// collapsed scene fills the frame; flattened, it stopped at the precomp's edges).
+    /// A collapsed precomp drawn as one isolated layer ([`Self::collapsed_fx`]): it has effects,
+    /// or it is 3D and holds 2D layers (those are placed by the precomp layer's transform without
+    /// the camera's perspective, so they cannot join this comp's 3D space as planes).
+    fn collapses_isolated(&self, ctx: &EvalCtx, layer: &Layer) -> bool {
+        let effects = layer.switches.effects && layer.effects().is_some_and(|fx| fx.groups().any(|g| g.enabled));
+        effects || (layer.is_3d() && self.collapse_target(ctx, layer).is_some_and(|item| self.holds_2d(item)))
+    }
+
+    /// How a collapsed precomp layer places its nested comp's 2D layers: its transform, without
+    /// the camera even when it is 3D (aerender, SceneYard Trump Photo Zoom In: the paper card
+    /// keeps its size and place when the precomp moves in depth, and becomes as small as the 3D
+    /// layers once made 3D). A 3D precomp without 2D layers keeps the camera's projection, which
+    /// sizes its continuously rasterized layers.
+    fn collapse_matrix(&self, ctx: &EvalCtx, layer: &Layer) -> Mat3 {
+        let flat = layer.is_3d() && matches!(layer.source, LayerSource::Comp { item } if self.holds_2d(item));
+        if !flat {
+            return ctx.layer_to_comp(layer).0;
+        }
+        let m = &ctx.world_matrix(layer).0;
+        Mat3([[m[0][0], m[0][1], m[0][3]], [m[1][0], m[1][1], m[1][3]], [0.0, 0.0, 1.0]])
+    }
+
+    /// Whether a comp has 2D layers that draw (not cameras, lights, adjustment or guide layers).
+    fn holds_2d(&self, item: ItemId) -> bool {
+        self.project
+            .comp(item)
+            .is_some_and(|c| c.layers.iter().any(|l| !l.is_3d() && l.has_video() && !l.switches.adjustment && !l.switches.guide && l.source.is_av()))
+    }
+
+    /// A collapsed precomp layer with effects, or a collapsed 3D precomp holding 2D layers:
+    /// After Effects still collapses its nested layers (3D ones seen through this comp's camera,
+    /// unclipped by the precomp's frame), then runs the effects on the result and composites it
+    /// as one layer that does not intersect the comp's other 3D layers (aerender, SceneYard
+    /// Trump Photo Zoom In: the street behind the collapsed scene fills the frame; flattened, it
+    /// stopped at the precomp's edges).
     pub fn collapsed_fx(&self, ctx: &EvalCtx, layer: &Layer) -> Option<ItemId> {
-        if !layer.switches.effects || !layer.effects().is_some_and(|fx| fx.groups().any(|g| g.enabled)) {
+        if !self.collapses_isolated(ctx, layer) {
             return None;
         }
         self.collapse_target(ctx, layer)
@@ -639,9 +669,9 @@ impl<'a> Renderer<'a> {
             return None;
         }
         let nctx = EvalCtx { comp_id: item, comp: nc, time: t, ..*ctx };
-        let (l2c, _) = ctx.layer_to_comp(layer);
-        let outer = Some(self.outer.map_or(l2c, |o| o * l2c));
         let world = ctx.world_matrix(layer);
+        let l2c = self.collapse_matrix(ctx, layer);
+        let outer = Some(self.outer.map_or(l2c, |o| o * l2c));
         let c3 = Collapse3d {
             world: self.collapse3d.map_or(world, |c| c.world * world),
             cam: three_d::compose::camera_for(self, ctx),
@@ -1464,7 +1494,7 @@ impl<'a> Renderer<'a> {
         let mut t: Option<Tick> = None;
         for l in self.links() {
             let at = EvalCtx { comp_id: l.comp_id, comp: l.comp, time: t.unwrap_or(l.time + shift), ..*ctx };
-            let (m, _) = if l.blur { at.layer_to_comp(l.layer) } else { EvalCtx { time: l.time, ..at }.layer_to_comp(l.layer) };
+            let m = if l.blur { self.collapse_matrix(&at, l.layer) } else { self.collapse_matrix(&EvalCtx { time: l.time, ..at }, l.layer) };
             outer = Some(outer.map_or(m, |o| o * m));
             t = Some(at.nested_time(l.layer));
         }

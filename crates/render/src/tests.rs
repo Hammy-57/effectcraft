@@ -602,3 +602,30 @@ fn a_collapsed_precomp_with_effects_is_not_clipped_to_its_frame() {
     let c = img.get(150, 50);
     assert!(c[3] > 0.99 && c[1] > 0.99 && c[0] < 0.01, "outside the precomp's frame, tinted: {c:?}");
 }
+
+#[test]
+fn a_collapsed_3d_precomps_2d_layers_ignore_the_camera() {
+    // aerender (SceneYard Trump Photo Zoom In): in a collapsed 3D precomp the 2D layers are
+    // placed by the precomp layer's transform without perspective (the paper card kept its size
+    // when the precomp moved in depth), while its 3D layers recede with the camera.
+    let (mut p, cid, comp) = setup();
+    let inner = Comp::new(100, 100, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+    let iid = p.add_item("Inner", Label::Sandstone, None, ItemKind::Comp(inner.clone().into()));
+    let flat = solid(&mut p, &inner, [1.0, 1.0, 1.0], 20, 20);
+    let mut deep = solid(&mut p, &inner, [0.0, 0.0, 1.0], 20, 20);
+    deep.switches.three_d = true;
+    deep.props.prop_mut("transform/position").unwrap().value = Value::Vec3([20.0, 20.0, 0.0]);
+    p.comp_mut(iid).unwrap().layers.extend([flat, deep]);
+    let mut pre = build::layer(&mut p, &comp, "Inner", LayerSource::Comp { item: iid }, (100, 100), None);
+    pre.switches.three_d = true;
+    pre.switches.collapse = true;
+    // Far behind the default camera: a 3D plane there is drawn at about a fifth of its size.
+    pre.props.prop_mut("transform/position").unwrap().value = Value::Vec3([100.0, 50.0, 1000.0]);
+    p.comp_mut(cid).unwrap().layers.push(pre);
+    let img = render_frame(&p, cid, Tick::ZERO, 1.0);
+    for x in [92, 100, 108] {
+        let c = img.get(x, 50);
+        assert!(c[3] > 0.99 && c[0] > 0.99, "the 2D solid keeps its 20 px at x {x}: {c:?}");
+    }
+    assert!(img.get(100, 61)[3] < 0.01, "and no more: {:?}", img.get(100, 61));
+}
