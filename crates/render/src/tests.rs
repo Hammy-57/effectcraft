@@ -573,3 +573,32 @@ fn adjustment_motion_tile_feeds_a_later_warp() {
         }
     }
 }
+
+#[test]
+fn a_collapsed_precomp_with_effects_is_not_clipped_to_its_frame() {
+    // aerender (SceneYard Trump Photo Zoom In): a collapsed precomp with an effect still shows
+    // its layers beyond the precomp's frame, and the effect applies to them; flattened, they
+    // were cut at the precomp's edges.
+    let (mut p, cid, comp) = setup();
+    let inner = Comp::new(100, 100, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+    let iid = p.add_item("Inner", Label::Sandstone, None, ItemKind::Comp(inner.clone().into()));
+    let mut s = solid(&mut p, &inner, [1.0, 1.0, 1.0], 40, 40);
+    // Centred at x = 150: entirely outside the 100×100 precomp.
+    s.props.prop_mut("transform/position").unwrap().value = Value::Vec3([150.0, 50.0, 0.0]);
+    p.comp_mut(iid).unwrap().layers.push(s);
+    let mut pre = build::layer(&mut p, &comp, "Inner", LayerSource::Comp { item: iid }, (100, 100), None);
+    pre.props.prop_mut("transform/position").unwrap().value = Value::Vec3([50.0, 50.0, 0.0]);
+    pre.switches.collapse = true;
+    let spec = effectcraft_effects::find("ec.color.tint").unwrap();
+    let mut next = p.next_id;
+    let mut g = effectcraft_effects::instantiate(spec, &mut Ids(&mut next), "Tint", [100.0, 100.0]);
+    p.next_id = next;
+    if let Some(pr) = g.prop_mut("white") {
+        pr.value = Value::Color([0.0, 1.0, 0.0, 1.0]);
+    }
+    pre.props.sub_mut("effects").unwrap().children.push(g.into());
+    p.comp_mut(cid).unwrap().layers.push(pre);
+    let img = render_frame(&p, cid, Tick::ZERO, 1.0);
+    let c = img.get(150, 50);
+    assert!(c[3] > 0.99 && c[1] > 0.99 && c[0] < 0.01, "outside the precomp's frame, tinted: {c:?}");
+}
