@@ -898,6 +898,16 @@ fn native_match(ae: &str) -> &str {
         "ADBE Iris Highlight Threshold" => "highlightThreshold",
         "ADBE Iris Hightlight Saturation" => "highlightSaturation",
         "ADBE Light Options Group" => "lightOptions",
+        "ADBE Light Intensity" => "intensity",
+        "ADBE Light Color" => "color",
+        "ADBE Light Cone Angle" => "coneAngle",
+        "ADBE Light Cone Feather 2" => "coneFeather",
+        "ADBE Light Falloff Type" => "falloff",
+        "ADBE Light Falloff Start" => "radius",
+        "ADBE Light Falloff Distance" => "falloffDistance",
+        "ADBE Light Casts Shadows" => "castsShadows",
+        "ADBE Light Shadow Darkness" => "shadowDarkness",
+        "ADBE Light Shadow Diffusion" => "shadowDiffusion",
         "ADBE Extrsn Options Group" | "ADBE Plane Options Group" => "geometryOptions",
         "ADBE Casts Shadows" => "castsShadows",
         "ADBE Light Transmission" => "lightTransmission",
@@ -2081,6 +2091,34 @@ mod tests {
         // An authored Position is kept exactly, even when it equals the Point of Interest.
         ir["items"][0]["layers"][0]["properties"][0]["children"][1]["authored"] = Json::Bool(true);
         assert_eq!(eye(&ir), [960.0, 540.0, 0.0]);
+    }
+
+    /// Light Options were kept under their AE ids and never reached the renderer, so every
+    /// imported light rendered at 100 % without falloff (SceneYard Glass UI List: 600–1500 %
+    /// point lights with Smooth falloff).
+    #[test]
+    fn light_options_use_ae_ids() {
+        let ir = serde_json::json!({"schema_version":1,"items":[{"id":1,"kind":"comp","name":"Lit","width":100,"height":100,"duration":2,"layers":[
+            {"id":2,"kind":"LightLayer","light_type":4414,"name":"Point Light 1","properties":[
+                {"kind":"group","match_name":"ADBE Light Options Group","children":[
+                    {"kind":"property","match_name":"ADBE Light Intensity","value":600.0},
+                    {"kind":"property","match_name":"ADBE Light Color","value":[1.0,0.5,0.25,1.0]},
+                    {"kind":"property","match_name":"ADBE Light Falloff Type","value":2.0},
+                    {"kind":"property","match_name":"ADBE Light Falloff Start","value":250.0},
+                    {"kind":"property","match_name":"ADBE Light Falloff Distance","value":2000.0}
+                ]}
+            ]}
+        ]}]});
+        let mut project = Project::default();
+        let result = import_ir(&mut project, ir.to_string().as_bytes(), "", &mut |_| None).unwrap();
+        let layer = &project.comp(result.primary_comp.unwrap()).unwrap().layers[0];
+        let opts = layer.props.sub("lightOptions").unwrap();
+        assert_eq!(opts.get("intensity").unwrap().value.as_f64(), 600.0);
+        assert_eq!(opts.get("color").unwrap().value, Value::Color([1.0, 0.5, 0.25, 1.0]));
+        assert_eq!(opts.get("falloff").unwrap().value, Value::Enum(1));
+        assert_eq!(opts.get("radius").unwrap().value.as_f64(), 250.0);
+        assert_eq!(opts.get("falloffDistance").unwrap().value.as_f64(), 2000.0);
+        assert!(opts.get("ADBE Light Intensity").is_none());
     }
 
     #[test]
