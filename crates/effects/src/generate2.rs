@@ -369,6 +369,10 @@ const RW_PROFILES: [&str; 7] = ["Square", "Taper Front", "Taper Back", "Taper Bo
 /// Image Contour's Value Channel options.
 const RW_CHANNELS: [&str; 8] = ["Red", "Green", "Blue", "Alpha", "Luminance", "Hue", "Lightness", "Saturation"];
 
+/// When Radio Waves emits relative to its period: births at `k / Frequency + RW_BIRTH_PHASE`
+/// seconds (measured on After Effects renders at Frequency 0.5, 1 and 1.5).
+const RW_BIRTH_PHASE: f64 = -0.3;
+
 /// Stroke Profile weight across the stroke: `u` from −1 (inner edge) to 1 (outer edge).
 fn rw_profile(kind: u32, u: f64) -> f64 {
     let u = u.clamp(-1.0, 1.0);
@@ -549,12 +553,14 @@ pub fn radio_plan(ctx: &EffectCtx, b: &Buf) -> Option<RadioPlan> {
     if wave_type != 0 && contour.is_none() {
         return None;
     }
-    let k_hi = (t * freq).floor() as i64;
-    let k_lo = (((t - life_now) * freq).floor() as i64 - 1).max(0).max(k_hi - 256);
+    // As in After Effects, the waves have been running before the layer's time 0 (a steady
+    // ring pattern from the first frame), born every 1 / Frequency s at RW_BIRTH_PHASE.
+    let k_hi = ((t - RW_BIRTH_PHASE) * freq).floor() as i64;
+    let k_lo = (((t - RW_BIRTH_PHASE - life_now) * freq).floor() as i64 - 1).max(k_hi - 256);
     let mut cache: std::collections::HashMap<i64, crate::Params> = std::collections::HashMap::new();
     let waves: Vec<Wave> = (k_lo..=k_hi)
         .filter_map(|k| {
-            let born = k as f64 / freq;
+            let born = k as f64 / freq + RW_BIRTH_PHASE;
             let age = t - born;
             // Birth: the values the wave was born with (when the host can tell).
             let pr: &crate::Params = if birth {
@@ -575,6 +581,9 @@ pub fn radio_plan(ctx: &EffectCtx, b: &Buf) -> Option<RadioPlan> {
             let c = b.to_px(pr.v2("producerPoint"));
             let fin = pr.f("waveStroke/fadeInTime").max(0.0);
             let fout = pr.f("waveStroke/fadeOutTime").max(0.0);
+            // Fades longer than the lifespan span the whole life (AE: Fade-out 5 s on a 3 s wave
+            // dims it linearly from birth).
+            let (fin, fout) = (fin.min(life), fout.min(life));
             let fi = if fin > 0.0 { (age / fin).min(1.0) } else { 1.0 };
             let fo = if fout > 0.0 { ((life - age) / fout).min(1.0) } else { 1.0 };
             let dirn = pr.f("waveMotion/direction").to_radians();
@@ -585,7 +594,9 @@ pub fn radio_plan(ctx: &EffectCtx, b: &Buf) -> Option<RadioPlan> {
             }
             let sw = pr.f("waveStroke/startWidth") * b.scale;
             let ew = pr.f("waveStroke/endWidth") * b.scale;
-            let radius = pr.f("waveMotion/expansion") * b.scale * age;
+            let half_width = ((sw + (ew - sw) * age / life) * 0.5).max(0.25);
+            // Expansion moves the wave's outer edge; the stroke lies inside it.
+            let radius = (pr.f("waveMotion/expansion") * b.scale * age - half_width).max(0.0);
             let rotation = pr.f("waveMotion/orientation").to_radians() + pr.f("waveMotion/spin").to_radians() * age;
             let outline = (wave_type == 0).then(|| {
                 let sides = pr.f("polygon/sides").round().clamp(3.0, 64.0);
@@ -605,7 +616,7 @@ pub fn radio_plan(ctx: &EffectCtx, b: &Buf) -> Option<RadioPlan> {
             Some(Wave {
                 centre,
                 radius,
-                half_width: ((sw + (ew - sw) * age / life) * 0.5).max(0.25),
+                half_width,
                 rotation,
                 fade: (fi * fo) as f32,
                 color: pr.color("waveStroke/color"),
@@ -1301,9 +1312,17 @@ mod tests {
         }
     }
 
+    /// Test time for a wave of the given age: the second wave (born at 1 / Frequency +
+    /// RW_BIRTH_PHASE) whose stroke centre (half width `hw` inside the outer edge) is
+    /// Expansion × `age` from the producer.
+    fn rw_time(age: f64, freq: f64, expansion: f64, hw: f64) -> f64 {
+        1.0 / freq + RW_BIRTH_PHASE + age + hw / expansion
+    }
+
     #[test]
     fn radio_waves_expansion_velocity_and_star() {
-        let r = |set: &[(&str, Value)], t: f64| {
+        let r = |set: &[(&str, Value)], age: f64| {
+            let t = rw_time(age, 0.5, 100.0, 2.5);
             let s = crate::find("ec.generate.radiowaves").unwrap();
             let mut params = Params { values: s.params.iter().map(|p| (p.id.to_string(), p.default.clone())).collect() };
             params.values.insert("producerPoint".into(), Value::Vec2([32.0, 32.0]));
@@ -1313,7 +1332,19 @@ mod tests {
             let ctx = EffectCtx { params: &params, time: t, layer_size: [64.0, 64.0], seed: 3, adjustment: false, env: Default::default() };
             crate::apply(s, &ctx, Buf { img: Image::new(64, 64), offset: [0.0, 0.0], scale: 1.0 })
         };
-        // One wave born at t = 0, 0.2 s old: radius = Expansion × age = 20 px.
+        // Measured on AE: at time 0 a 1/s, 30 px/s wave train already runs; the newest wave,
+        // born at -0.3 s, has its outer edge 9 px out (stroke 5 px inside it).
+        let s0 = crate::find("ec.generate.radiowaves").unwrap();
+        let mut p0 = Params { values: s0.params.iter().map(|p| (p.id.to_string(), p.default.clone())).collect() };
+        p0.values.insert("producerPoint".into(), Value::Vec2([32.0, 32.0]));
+        p0.values.insert("waveMotion/expansion".into(), num(30.0));
+        p0.values.insert("waveMotion/lifespan".into(), num(20.0));
+        let c0 = EffectCtx { params: &p0, time: 0.0, layer_size: [64.0, 64.0], seed: 3, adjustment: false, env: Default::default() };
+        let o0 = crate::apply(s0, &c0, Buf { img: Image::new(64, 64), offset: [0.0, 0.0], scale: 1.0 });
+        let row: Vec<bool> = (32..64).map(|x| o0.img.get(x, 32)[3] > 0.5).collect();
+        assert_eq!(row.iter().position(|v| *v), Some(4), "{row:?}");
+        assert!(row[8] && !row[10], "5 px stroke inside the edge: {row:?}");
+        // One wave 0.2 s old: radius = Expansion × age = 20 px.
         let base = [("waveMotion/expansion", num(100.0)), ("waveMotion/frequency", num(0.5))];
         let o = r(&base, 0.2);
         assert!(o.img.get(52, 32)[3] > 0.9, "{:?}", o.img.get(52, 32));
@@ -1421,10 +1452,12 @@ mod tests {
         assert!(c > 0.5);
     }
 
-    fn rw(set: &[(&str, Value)], t: f64, env: crate::EffectEnv) -> Image {
+    fn rw(set: &[(&str, Value)], age: f64, env: crate::EffectEnv) -> Image {
         let mut v: Vec<(&str, Value)> =
             vec![("producerPoint", Value::Vec2([32.0, 32.0])), ("waveMotion/frequency", num(0.5)), ("waveMotion/expansion", num(100.0))];
         v.extend_from_slice(set);
+        let get = |k: &str, d: f64| v.iter().rev().find(|(id, _)| *id == k).map_or(d, |(_, x)| x.as_f64());
+        let t = rw_time(age, get("waveMotion/frequency", 0.5), get("waveMotion/expansion", 100.0), get("waveStroke/startWidth", 5.0) * 0.5);
         crate::run_fx("ec.generate.radiowaves", &v, Image::new(64, 64), t, env).img
     }
 
@@ -1473,7 +1506,7 @@ mod tests {
                 p.values.insert("producerPoint".into(), Value::Vec2([32.0, 32.0]));
                 p.values.insert("waveMotion/frequency".into(), num(1.0));
                 p.values.insert("waveMotion/expansion".into(), num(20.0));
-                p.values.insert("waveStroke/color".into(), if t < 0.5 { col(1.0, 0.0, 0.0) } else { col(0.0, 1.0, 0.0) });
+                p.values.insert("waveStroke/color".into(), if t < 1.0 { col(1.0, 0.0, 0.0) } else { col(0.0, 1.0, 0.0) });
                 Some(p)
             }
         }

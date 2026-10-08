@@ -704,6 +704,7 @@ pub(crate) fn param_id(effect_id: &str, ae_param_match: &str) -> Option<&'static
         ("ec.generate.radiowaves", "APC Radio Waves-0050") => "waveStroke/startWidth",
         ("ec.generate.radiowaves", "APC Radio Waves-0052") => "waveStroke/endWidth",
         ("ec.generate.radiowaves", "APC Radio Waves-0054") => "waveStroke/opacity",
+        ("ec.generate.radiowaves", "APC Radio Waves-0056") => "waveMotion/lifespan",
         ("ec.generate.radiowaves", "APC Radio Waves-0058") => "waveStroke/fadeInTime",
         ("ec.generate.radiowaves", "APC Radio Waves-0060") => "waveStroke/fadeOutTime",
         ("ec.generate.radiowaves", "APC Radio Waves-0062") => "waveMotion/reflection",

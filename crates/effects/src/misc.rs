@@ -289,11 +289,41 @@ fn deep_glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
         b.img = source;
         return b;
     }
+    // Gamma Correction (Auto Detect, on in every SceneYard instance): the glow is built and
+    // composited in linear light. Measured with aerender on a solid pill (Radius 100 / 439,
+    // Exposure 0.3 / 1 / 1.35): three Gaussians of 0.003, 0.03 and 0.12 × Radius weighted
+    // 6.6 / 2.54 / 1.30, scaled by Exposure^0.75. Without it, the older display-space profile.
+    let linear_model = ctx.params.b("PEDG-0043") || ctx.params.b("PEDG-0009");
+    let convert = linear_model && !ctx.env.working_linear;
+    // With Unmult the glow works on the layer as seen over black (premultiplied values), so a
+    // pixel the glow does not touch comes back unchanged.
+    let unmult = ctx.params.b("PEDG-0025");
+    let to_linear = |img: &mut Image| {
+        img.data.par_iter_mut().for_each(|px| {
+            let a = px[3];
+            if unmult {
+                for v in px.iter_mut().take(3) {
+                    *v = effectcraft_color::srgb_to_linear(v.clamp(0.0, 1.0));
+                }
+            } else if a > 0.0 {
+                for v in px.iter_mut().take(3) {
+                    *v = effectcraft_color::srgb_to_linear((*v / a).clamp(0.0, 1.0)) * a;
+                }
+            }
+        })
+    };
+    if convert {
+        to_linear(&mut source);
+    }
     let spread = (ctx.params.f("PEDG-0011") / 100.0).clamp(0.0, 1.0) as f32;
     let near = (0.30 - 0.35 * spread).max(0.05);
     let far = 0.30 + 0.44 * spread;
     // A broad, unnormalised halo keeps thin bright strokes visible far from their source.
-    let weights = [near * 13.5, (1.0 - near - far) * 13.5, far * 13.5];
+    // In Screen mode the near-core term is not added (AE's Screen render keeps the inside of a
+    // glowing shape near its own colour; its halo outside matches Add).
+    let core = if ctx.params.e("PEDG-0008") == 0 { 3.0 } else { 6.6 };
+    let weights = if linear_model { [core, 2.54, 1.30] } else { [near * 13.5, (1.0 - near - far) * 13.5, far * 13.5] };
+    let sigmas = if linear_model { [0.003, 0.03, 0.12] } else { [0.035, 0.14, 0.42] };
     let aspect = ctx.params.f("PEDG-0010").clamp(0.0, 2.0);
     let chroma = if ctx.params.b("PEDG-0013") { ctx.params.f("PEDG-0015").clamp(0.0, 2.0) as f32 } else { 0.0 };
     let downsample = (ctx.params.f("PEDG-0019") / 100.0).clamp(0.1, 1.0);
@@ -310,7 +340,7 @@ fn deep_glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
         source
     };
     let mut halo = Image::new(work_source.width, work_source.height);
-    for (step, (sigma, weight)) in [(0.035, weights[0]), (0.14, weights[1]), (0.42, weights[2])].into_iter().enumerate() {
+    for (step, (sigma, weight)) in sigmas.into_iter().zip(weights).enumerate() {
         let (sx, sy) = (radius * work_scale * sigma * aspect, radius * work_scale * sigma * (2.0 - aspect));
         let blurred = if step == 2 && downsample < 0.999 {
             let (w, h) = ((work_source.width as f64 * downsample).round().max(1.0) as u32, (work_source.height as f64 * downsample).round().max(1.0) as u32);
@@ -334,8 +364,10 @@ fn deep_glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
     }
     let halo = if work_scale < 1.0 { resample(&halo, b.img.width, b.img.height) } else { halo };
     let exposure = ctx.params.f("PEDG-0002").clamp(0.0, 64.0) as f32;
-    // Deep Glow's gamma correction applies exposure in approximate linear light.
-    let exposure = if ctx.params.b("PEDG-0043") || ctx.params.b("PEDG-0009") { exposure.powf(2.1) } else { exposure };
+    let exposure = if linear_model { exposure.powf(0.75) } else { exposure };
+    if convert {
+        to_linear(&mut b.img);
+    }
     let source_opacity = (ctx.params.f("PEDG-0024") / 100.0).clamp(0.0, 1.0) as f32;
     let screen = ctx.params.e("PEDG-0008") == 0;
     let tint = ctx.params.b("PEDG-0037");
@@ -362,6 +394,23 @@ fn deep_glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
         }
         out[3] = (glow[3] * exposure + original[3] * source_opacity).clamp(0.0, 1.0);
     });
+    if convert {
+        // Back to display values as seen over black (what AE shows); with Unmult the glow's
+        // alpha follows its brightness, so a faint halo is not darkened by premultiplication.
+        b.img.data.par_iter_mut().for_each(|px| {
+            let a = px[3];
+            if unmult {
+                for v in px.iter_mut().take(3) {
+                    *v = effectcraft_color::linear_to_srgb(v.clamp(0.0, 1.0));
+                }
+                px[3] = a.max(px[0].max(px[1]).max(px[2])).clamp(0.0, 1.0);
+            } else if a > 0.0 {
+                for v in px.iter_mut().take(3) {
+                    *v = effectcraft_color::linear_to_srgb((*v / a).max(0.0)).min(1.0) * a;
+                }
+            }
+        });
+    }
     if !ctx.params.b("PEDG-0025") {
         b.img.data.par_iter_mut().for_each(|px| px[3] = 1.0);
     }
@@ -976,6 +1025,29 @@ mod tests {
         assert!(p[0] > 0.05 && p[1] < 1e-4 && p[2] < 1e-4, "{p:?}");
     }
 
+    /// Measured with aerender (SceneYard Music app's pill, a 217 px wide dark red bar, Deep
+    /// Glow Radius 100, Exposure 1, Add, gamma correction on): the glow lifts the inside to
+    /// about (253, 162, 204) and reaches 116 / 63 / 28 (red) at 4 / 12 / 22 px outside.
+    #[test]
+    fn deep_glow_matches_ae_on_a_solid_bar() {
+        let mut img = Image::new(600, 300);
+        for y in 0..300 {
+            for x in 200..416 {
+                img.set(x, y, [0.553, 0.2, 0.25, 1.0]);
+            }
+        }
+        let set =
+            [("PEDG-0001", num(100.0)), ("PEDG-0002", num(1.0)), ("PEDG-0008", Value::Enum(1)), ("PEDG-0055", num(2.0)), ("PEDG-0031", Value::Bool(false))];
+        let o = run_fx("ec.stylize.deepglow", &set, img, 0.0, EffectEnv::default());
+        let px = |x: i64| o.img.get(x + o.offset[0] as i64, 150 + o.offset[1] as i64);
+        let inside = px(300);
+        assert!((inside[1] * 255.0 - 162.0).abs() < 12.0, "{inside:?}");
+        for (d, ae) in [(4, 116.0), (12, 63.0), (22, 28.0)] {
+            let v = px(415 + d)[0] * 255.0;
+            assert!((v - ae).abs() < 15.0, "{d} px out: {v} vs AE {ae}");
+        }
+    }
+
     #[test]
     fn deep_glow_renders_editable_halo() {
         assert_eq!(crate::lookup("PEDG").map(|s| s.id), Some("ec.stylize.deepglow"));
@@ -1003,15 +1075,16 @@ mod tests {
         let corpus = run(&[("PEDG-0001", num(8.0)), ("PEDG-0008", native(1)), ("PEDG-0023", native(2)), ("PEDG-0055", native(2)), ("PEDG-0084", native(1))]);
         assert_eq!(corpus.offset, base.offset);
         assert!(pixel(&corpus, 11, 8)[0] > 0.0, "AE View 2 must render final glow");
-        let add = run(&[("PEDG-0001", num(8.0)), ("PEDG-0008", native(2))]);
-        assert!(pixel(&add, 8, 8)[0] > pixel(&corpus, 8, 8)[0], "AE Blend Mode 2 must use unclamped Add");
+        let mut dim = Image::new(17, 17);
+        dim.set(8, 8, [0.2, 0.05, 0.02, 1.0]);
+        let dim_run = |mode| run_fx("ec.stylize.deepglow", &[("PEDG-0001", num(8.0)), ("PEDG-0008", native(mode))], dim.clone(), 0.0, EffectEnv::default());
+        let (dim_add, dim_screen) = (dim_run(2), dim_run(1));
+        assert!(pixel(&dim_add, 8, 8)[0] > pixel(&dim_screen, 8, 8)[0], "AE Blend Mode 2 (Add) lifts the source more than Screen");
         let low_auto = run(&[("PEDG-0001", num(8.0)), ("PEDG-0002", num(0.37))]);
         let low_linear = run(&[("PEDG-0001", num(8.0)), ("PEDG-0002", num(0.37)), ("PEDG-0043", Value::Bool(false))]);
-        assert!(pixel(&low_auto, 11, 8)[0] < pixel(&low_linear, 11, 8)[0], "auto gamma must temper subunit exposure");
+        assert_ne!(pixel(&low_auto, 11, 8), pixel(&low_linear, 11, 8), "gamma correction changes the glow model");
         let low_manual = run(&[("PEDG-0001", num(8.0)), ("PEDG-0002", num(0.37)), ("PEDG-0043", Value::Bool(false)), ("PEDG-0009", Value::Bool(true))]);
         assert_eq!(pixel(&low_auto, 11, 8), pixel(&low_manual, 11, 8), "manual gamma can replace auto detection");
-        let unit_linear = run(&[("PEDG-0001", num(8.0)), ("PEDG-0043", Value::Bool(false))]);
-        assert_eq!(pixel(&base, 11, 8), pixel(&unit_linear, 11, 8), "unit exposure stays calibrated");
         let tint = [("PEDG-0001", num(8.0)), ("PEDG-0037", Value::Bool(true)), ("PEDG-0038", Value::Color([0.8, 0.2, 0.5, 1.0]))];
         let standard = run(&[tint[0].clone(), tint[1].clone(), tint[2].clone(), ("PEDG-0039", native(1))]);
         let overlay = run(&[tint[0].clone(), tint[1].clone(), tint[2].clone(), ("PEDG-0039", native(2))]);
@@ -1032,7 +1105,8 @@ mod tests {
         let mut impulse = Image::new(9, 9);
         impulse.set(4, 4, [1.0; 4]);
         let wide = run_fx("ec.stylize.deepglow", &[("PEDG-0001", num(320.0))], impulse.clone(), 0.0, EffectEnv::default());
-        assert!(pixel(&wide, 284, 4)[0] > 0.0, "large SceneYard radii must extend beyond 256 px");
+        // The halo spans a fraction of the radius (AE: a 439 px glow fades out ~200 px past an edge).
+        assert!(pixel(&wide, 64, 4)[0] > 0.0, "a 320 px radius reaches 60 px");
         let opaque = run_fx("ec.stylize.deepglow", &[("PEDG-0001", num(8.0)), ("PEDG-0025", Value::Bool(false))], impulse, 0.0, EffectEnv::default());
         assert_eq!(pixel(&opaque, 7, 7)[3], 1.0, "Unmult off keeps a black opaque backdrop");
         let gray = Image::filled(9, 9, [0.3, 0.3, 0.3, 1.0]);

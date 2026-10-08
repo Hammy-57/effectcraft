@@ -1287,6 +1287,14 @@ fn import_native_effect_params(
             100.0 / 255.0
         } else if effect_id == "ec.generate.fill" && path == "opacity" {
             100.0
+        } else if effect_id == "ec.generate.radiowaves" {
+            match path {
+                // AE's 0..1 Opacity: 1 draws the waves at half strength (measured with aerender).
+                "waveStroke/opacity" => 50.0,
+                // AE's Expansion / Velocity unit is 30 px per second.
+                "waveMotion/expansion" | "waveMotion/velocity" => 30.0,
+                _ => 1.0,
+            }
         } else {
             1.0
         };

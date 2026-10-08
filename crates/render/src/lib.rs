@@ -1701,29 +1701,9 @@ impl<'a> Renderer<'a> {
         if let Some((m, kind)) = matte {
             let mimg = match matte_img {
                 Some(i) if i.width == canvas.width && i.height == canvas.height => i,
-                _ => {
-                    let mut mimg = Image::new(canvas.width, canvas.height);
-                    if m.is_active_at(ctx.time)
-                        && let Some(mb) = self.matte_buf(ctx, m)
-                    {
-                        let mo = ctx.opacity(m) as f32;
-                        self.place(ctx, m, &mb, &mut mimg, BlendMode::Normal, mo);
-                    }
-                    mimg
-                }
+                _ => self.matte_image(ctx, m, canvas.width, canvas.height),
             };
-            iso.data.par_iter_mut().zip(mimg.data.par_iter()).for_each(|(p, q)| {
-                let k = match kind {
-                    MatteKind::Alpha => q[3],
-                    MatteKind::AlphaInverted => 1.0 - q[3],
-                    MatteKind::Luma => effectcraft_color::luminance(q[0], q[1], q[2]),
-                    MatteKind::LumaInverted => 1.0 - effectcraft_color::luminance(q[0], q[1], q[2]),
-                }
-                .clamp(0.0, 1.0);
-                for c in p.iter_mut() {
-                    *c *= k;
-                }
-            });
+            apply_matte(&mut iso, &mimg, kind);
         }
         if preserve {
             iso.data.par_iter_mut().zip(canvas.data.par_iter()).for_each(|(p, q)| {
@@ -1735,12 +1715,31 @@ impl<'a> Renderer<'a> {
         canvas.blend_from(&iso, layer.blend_mode, opacity, layer.id.0 as u32);
     }
 
-    /// Adjustment layer: effects applied to the comp below, limited to the layer's footprint.
+    /// A track matte layer's pixels placed in the comp (`w`×`h`).
+    fn matte_image(&self, ctx: &EvalCtx, m: &Layer, w: u32, h: u32) -> Image {
+        let mut mimg = Image::new(w, h);
+        if m.is_active_at(ctx.time)
+            && let Some(mb) = self.matte_buf(ctx, m)
+        {
+            let mo = ctx.opacity(m) as f32;
+            self.place(ctx, m, &mb, &mut mimg, BlendMode::Normal, mo);
+        }
+        mimg
+    }
+
+    /// Adjustment layer: effects applied to the comp below, limited to the layer's footprint
+    /// (its source, masks and track matte).
     fn draw_adjustment(&self, ctx: &EvalCtx, layer: &Layer, canvas: &mut Image, opacity: f32) {
         let Some(mut foot) = self.source(ctx, layer) else { return };
         let _ = masks::apply(ctx, layer, &mut foot, self.mask_blur(ctx, layer));
         let mut matte = Image::new(canvas.width, canvas.height);
         self.place(ctx, layer, &foot, &mut matte, BlendMode::Normal, 1.0);
+        // A track matte limits where the adjustment applies (SceneYard UI Google search: a
+        // tint + blur only inside a rounded card).
+        if let Some((m, kind)) = self.track_matte(ctx, layer) {
+            let mimg = self.matte_image(ctx, m, canvas.width, canvas.height);
+            apply_matte(&mut matte, &mimg, kind);
+        }
         let o = self.roi_offset().map(|(x, y, _, _)| [-x, -y]).unwrap_or([0.0; 2]);
         // The effects' points and sizes are in the adjustment layer's space: map a moved or
         // uniformly scaled (unrotated 2D) layer onto the comp below; others keep comp space.
@@ -1783,6 +1782,22 @@ fn shape_fx_origin(ctx: &EvalCtx, layer: &Layer) -> Option<[f64; 2]> {
     }
     let a = layer.transform().map(|tr| ctx.v3(layer, tr, "anchor", [0.0; 3])).unwrap_or([0.0; 3]);
     Some([ctx.comp.width as f64 / 2.0 - a[0], ctx.comp.height as f64 / 2.0 - a[1]])
+}
+
+/// Multiply `img` by a track matte's coverage (`mimg`, same size).
+fn apply_matte(img: &mut Image, mimg: &Image, kind: MatteKind) {
+    img.data.par_iter_mut().zip(mimg.data.par_iter()).for_each(|(p, q)| {
+        let k = match kind {
+            MatteKind::Alpha => q[3],
+            MatteKind::AlphaInverted => 1.0 - q[3],
+            MatteKind::Luma => effectcraft_color::luminance(q[0], q[1], q[2]),
+            MatteKind::LumaInverted => 1.0 - effectcraft_color::luminance(q[0], q[1], q[2]),
+        }
+        .clamp(0.0, 1.0);
+        for c in p.iter_mut() {
+            *c *= k;
+        }
+    });
 }
 
 /// A layer ready to composite (see [`Renderer::styled_layer`]).
