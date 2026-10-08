@@ -551,6 +551,31 @@ class Exporter:
             return None
         return matte
 
+    @staticmethod
+    def av_anchor_depth(properties, height):
+        """py-aep reads an AV layer's Anchor Point z in units of the source's height, x and y in
+        pixels. Measured with aerender: a stored z of 0.5 on a 1024x1536 footage layer at 275.6%
+        moves it 2117 px (0.5 x 1536 x 2.756) along z; a precomp of height 1920 stores 0.0479166
+        for 92 px. Shape and text layers store pixels; cameras and lights (Point of Interest) too."""
+        if not (isinstance(height, (int, float)) and math.isfinite(height) and 0 < height <= 32768):
+            return
+        transform = next((p for p in properties if p["match_name"] == "ADBE Transform Group"), None)
+        anchor = next((p for p in transform["children"] if p["match_name"] == "ADBE Anchor Point"), None) if transform else None
+        if not anchor:
+            return
+        corrected = False
+        for value in [anchor.get("value"), *(key.get("value") for key in anchor.get("keyframes", []))]:
+            if isinstance(value, list) and len(value) == 3 and isinstance(value[2], (int, float)) and math.isfinite(value[2]) and value[2] != 0:
+                value[2] *= height
+                corrected = True
+        for key in anchor.get("keyframes", []):
+            for name in ("in_spatial_tangent", "out_spatial_tangent"):
+                tangent = key.get(name)
+                if isinstance(tangent, list) and len(tangent) == 3 and isinstance(tangent[2], (int, float)) and math.isfinite(tangent[2]):
+                    tangent[2] *= height
+        if corrected:
+            anchor["value_origin"] = "ae_av_anchor_z_height"
+
     def layer(self, layer, index, comp_id):
         scope = f"item/{comp_id}/layer/{layer.id}"
         source = self.read(layer, "source", scope) if hasattr(type(layer), "source") else None
@@ -596,6 +621,8 @@ class Exporter:
                         anchor["value_origin"] = "ae_model_anchor_xy"
                 else:
                     self.loss(scope + "/model_anchor", "missing_source_dimensions", source.id if source else None)
+        elif type(layer).__name__ == "AVLayer" and source is not None:
+            self.av_anchor_depth(properties, self.read(source, "height", scope))
         return {"id": layer.id, "index": index, "kind": type(layer).__name__,
                 "name": self.read(layer, "name", scope), "match_name": self.read(layer, "match_name", scope),
                 "light_type": self.value(self.read(layer, "light_type", scope), scope + "/light_type")
