@@ -588,6 +588,26 @@ impl<'a> Renderer<'a> {
     /// Collapse Transformations switch is on and the layer has no masks, effects or layer
     /// styles (those force a flattened render of the precomp, as in After Effects).
     pub fn collapsed(&self, ctx: &EvalCtx, layer: &Layer) -> Option<ItemId> {
+        if layer.switches.effects && layer.effects().is_some_and(|fx| fx.groups().any(|g| g.enabled)) {
+            return None;
+        }
+        self.collapse_target(ctx, layer)
+    }
+
+    /// A collapsed precomp layer with effects: After Effects still collapses its nested layers
+    /// (3D ones seen through this comp's camera, unclipped by the precomp's frame), then runs
+    /// the effects on the result and composites it as one layer that does not intersect the
+    /// comp's other 3D layers (aerender, SceneYard Trump Photo Zoom In: the street behind the
+    /// collapsed scene fills the frame; flattened, it stopped at the precomp's edges).
+    pub fn collapsed_fx(&self, ctx: &EvalCtx, layer: &Layer) -> Option<ItemId> {
+        if !layer.switches.effects || !layer.effects().is_some_and(|fx| fx.groups().any(|g| g.enabled)) {
+            return None;
+        }
+        self.collapse_target(ctx, layer)
+    }
+
+    /// [`Self::collapsed`] without the effects condition.
+    fn collapse_target(&self, ctx: &EvalCtx, layer: &Layer) -> Option<ItemId> {
         if !layer.switches.collapse || layer.switches.adjustment || self.depth > 12 {
             return None;
         }
@@ -596,9 +616,6 @@ impl<'a> Renderer<'a> {
             return None;
         }
         if layer.masks().is_some_and(|m| !m.children.is_empty()) {
-            return None;
-        }
-        if layer.switches.effects && layer.effects().is_some_and(|fx| fx.groups().any(|g| g.enabled)) {
             return None;
         }
         if styles::active(ctx, layer) {
@@ -666,6 +683,34 @@ impl<'a> Renderer<'a> {
         let mut iso = Image::new(canvas.width, canvas.height);
         sub.draw_comp(&nctx, &mut iso, true);
         self.composite_iso(ctx, layer, iso, canvas, opacity);
+        Region::Full
+    }
+
+    /// Draw a collapsed precomp layer with effects ([`Self::collapsed_fx`]): the nested layers
+    /// are drawn collapsed into an isolated frame, the precomp layer's effects run on it in comp
+    /// space (as for an adjustment layer) and it takes the layer's matte, mode and opacity.
+    pub fn draw_collapsed_fx(&self, ctx: &EvalCtx<'a>, layer: &'a Layer, item: ItemId, canvas: &mut Image) -> Region {
+        let opacity = ctx.opacity(layer) as f32 * self.opacity_mul;
+        if opacity <= 0.0 {
+            return Region::Empty;
+        }
+        let Some((sub, nctx)) = self.collapse_into(ctx, layer, item, 1.0) else { return Region::Empty };
+        let mut iso = Image::new(canvas.width, canvas.height);
+        sub.draw_comp(&nctx, &mut iso, true);
+        let offset = self.roi_offset().map(|(x, y, _, _)| [-x, -y]).unwrap_or([0.0; 2]);
+        let mut buf = Buf { img: iso, offset, scale: self.opts.scale };
+        // Effects run in the working space, not the linear blending space.
+        if let Some(c) = self.pipe.from_blend() {
+            color::convert(&mut buf.img, &c);
+        }
+        let mut done = self.apply_effects(ctx, layer, buf, true);
+        if let Some(c) = self.pipe.to_blend() {
+            color::convert(&mut done.img, &c);
+        }
+        if done.img.width != canvas.width || done.img.height != canvas.height {
+            return Region::Empty;
+        }
+        self.composite_iso(ctx, layer, done.img, canvas, opacity);
         Region::Full
     }
 
@@ -849,9 +894,10 @@ impl<'a> Renderer<'a> {
                 self.pipe.quantize(canvas);
                 blank = false;
             } else {
-                let changed = match self.collapsed(ctx, visible[i]) {
-                    Some(item) => self.draw_collapsed(ctx, visible[i], item, canvas, blank),
-                    None => self.draw_layer(ctx, visible[i], canvas, blank),
+                let changed = match (self.collapsed(ctx, visible[i]), self.collapsed_fx(ctx, visible[i])) {
+                    (Some(item), _) => self.draw_collapsed(ctx, visible[i], item, canvas, blank),
+                    (None, Some(item)) => self.draw_collapsed_fx(ctx, visible[i], item, canvas),
+                    (None, None) => self.draw_layer(ctx, visible[i], canvas, blank),
                 };
                 i += 1;
                 // 8/16 bpc: the comp is an integer buffer after every layer (only the pixels the

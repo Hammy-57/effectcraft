@@ -441,6 +441,13 @@ pub(crate) fn draw_run(r: &Renderer, ctx: &EvalCtx, run: &[&Layer], canvas: &mut
         draw_run(r, ctx, &run[k + 1..], canvas);
         return;
     }
+    // A collapsed precomp with effects is drawn as one layer that does not intersect the run.
+    if let Some((k, item)) = run.iter().enumerate().find_map(|(k, l)| r.collapsed_fx(ctx, l).map(|item| (k, item))) {
+        draw_run(r, ctx, &run[..k], canvas);
+        r.draw_collapsed_fx(ctx, run[k], item, canvas);
+        draw_run(r, ctx, &run[k + 1..], canvas);
+        return;
+    }
     if run.is_empty() {
         return;
     }

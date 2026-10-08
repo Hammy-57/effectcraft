@@ -81,9 +81,12 @@ fn draw_comp<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, canvas: &mut 
             draw_3d(e, r, ctx, &visible[i..j], canvas)?;
             i = j;
         } else {
-            match r.collapsed(ctx, visible[i]) {
-                Some(item) => draw_collapsed(e, r, ctx, visible[i], item, canvas)?,
-                None => draw_layer(e, r, ctx, visible[i], canvas)?,
+            match (r.collapsed(ctx, visible[i]), r.collapsed_fx(ctx, visible[i])) {
+                (Some(item), _) => draw_collapsed(e, r, ctx, visible[i], item, canvas)?,
+                (None, Some(item)) => on_cpu(e, canvas, |img| {
+                    r.draw_collapsed_fx(ctx, visible[i], item, img);
+                })?,
+                (None, None) => draw_layer(e, r, ctx, visible[i], canvas)?,
             }
             i += 1;
         }
@@ -113,6 +116,13 @@ fn draw_3d<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, run: &[&'a Laye
     if let Some(k) = run.iter().position(|l| l.switches.adjustment) {
         draw_3d(e, r, ctx, &run[..k], canvas)?;
         draw_layer(e, r, ctx, run[k], canvas)?;
+        return draw_3d(e, r, ctx, &run[k + 1..], canvas);
+    }
+    if let Some((k, item)) = run.iter().enumerate().find_map(|(k, l)| r.collapsed_fx(ctx, l).map(|item| (k, item))) {
+        draw_3d(e, r, ctx, &run[..k], canvas)?;
+        on_cpu(e, canvas, |img| {
+            r.draw_collapsed_fx(ctx, run[k], item, img);
+        })?;
         return draw_3d(e, r, ctx, &run[k + 1..], canvas);
     }
     if run.is_empty() {
