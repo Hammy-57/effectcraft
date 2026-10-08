@@ -316,31 +316,48 @@ fn cylinder(ctx: &EffectCtx, mut b: Buf) -> Buf {
     b
 }
 
-/// Rotation matrix R = Rz · Ry · Rx (degrees).
-fn rot_xyz(rx: f64, ry: f64, rz: f64) -> [[f64; 3]; 3] {
+type Mat3 = [[f64; 3]; 3];
+
+/// The X, Y and Z rotation matrices (degrees).
+fn rot_matrices(rx: f64, ry: f64, rz: f64) -> (Mat3, Mat3, Mat3) {
     let (sx, cx) = rx.to_radians().sin_cos();
     let (sy, cy) = ry.to_radians().sin_cos();
     let (sz, cz) = rz.to_radians().sin_cos();
     let mx = [[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]];
     let my = [[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]];
     let mz = [[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]];
-    let mul = |a: [[f64; 3]; 3], b: [[f64; 3]; 3]| {
-        let mut o = [[0.0; 3]; 3];
-        for i in 0..3 {
-            for j in 0..3 {
-                o[i][j] = (0..3).map(|k| a[i][k] * b[k][j]).sum();
-            }
+    (mx, my, mz)
+}
+
+fn mul3(a: Mat3, b: Mat3) -> Mat3 {
+    let mut o = [[0.0; 3]; 3];
+    for (i, row) in o.iter_mut().enumerate() {
+        for (j, v) in row.iter_mut().enumerate() {
+            *v = (0..3).map(|k| a[i][k] * b[k][j]).sum();
         }
-        o
-    };
-    mul(mz, mul(my, mx))
+    }
+    o
+}
+
+/// Rotation matrix R = Rz · Ry · Rx (degrees).
+fn rot_xyz(rx: f64, ry: f64, rz: f64) -> Mat3 {
+    let (mx, my, mz) = rot_matrices(rx, ry, rz);
+    mul3(mz, mul3(my, mx))
+}
+
+/// CC Sphere's rotation R = Rx · Ry · Rz (degrees): Rotation Z turns the ball about the view axis
+/// first, then Y, then X. Measured with aerender on a striped ball across eleven X/Y/Z
+/// combinations (e.g. 60/0/60, 40/70/30, -30/120/45); the Rz · Ry · Rx order misses the mixed ones.
+fn sphere_rotation(rx: f64, ry: f64, rz: f64) -> Mat3 {
+    let (mx, my, mz) = rot_matrices(rx, ry, rz);
+    mul3(mx, mul3(my, mz))
 }
 
 fn sphere(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let rect = layer_rect(ctx, &b);
     let r = (ctx.params.f("radius") * b.scale).max(0.5);
     let c = b.to_px(ctx.params.v2("offset"));
-    let m = rot_xyz(ctx.params.f("rotationX"), ctx.params.f("rotationY"), ctx.params.f("rotationZ"));
+    let m = sphere_rotation(ctx.params.f("rotationX"), ctx.params.f("rotationY"), ctx.params.f("rotationZ"));
     let mode = ctx.params.e("render");
     let sh = Shading::from(ctx);
     let src = b.img.clone();
@@ -576,6 +593,27 @@ mod tests {
         let s = out.get(30, 21);
         assert!(s[3] > 0.9 && s[0] < 0.05, "{s:?}");
         assert_eq!(out.get(30, 5)[3], 0.0);
+    }
+
+    #[test]
+    fn sphere_turns_about_z_before_x() {
+        // SceneYard Billiard Balls / aerender: CC Sphere applies Rotation Z, then Y, then X. A ball
+        // red above the equator and blue below, at X 90 and Z 90, shows the equator as a vertical
+        // line through the centre (Rz · Ry · Rx turned it edge-on and showed one colour).
+        let mut img = Image::new(64, 32);
+        for y in 0..32 {
+            for x in 0..64 {
+                img.set(x, y, if y < 16 { [1.0, 0.0, 0.0, 1.0] } else { [0.0, 0.0, 1.0, 1.0] });
+            }
+        }
+        let flat = [("lightIntensity", num(0.0)), ("ambient", num(100.0)), ("specular", num(0.0)), ("radius", num(14.0))];
+        let set = [&flat[..], &[("rotationX", num(90.0)), ("rotationZ", num(90.0))]].concat();
+        let out = run("ec.perspective.ccsphere", &img, &set).img;
+        let (left, right) = (out.get(24, 16), out.get(40, 16));
+        assert!((left[0] - right[0]).abs() > 0.9 && (left[2] - right[2]).abs() > 0.9, "{left:?} {right:?}");
+        // Rotation Z alone turns the equator vertical too.
+        let z_only = run("ec.perspective.ccsphere", &img, &[&flat[..], &[("rotationZ", num(90.0))]].concat()).img;
+        assert!((z_only.get(24, 16)[0] - z_only.get(40, 16)[0]).abs() > 0.9);
     }
 
     #[test]

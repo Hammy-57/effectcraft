@@ -360,8 +360,10 @@ class Exporter:
 
     @staticmethod
     def authored_effect_values(project):
-        """{(effect match name, parameter match name): {static values set somewhere}}: where an
-        untouched parameter can have picked up another instance's value."""
+        """{(effect match name, parameter match name): {values set somewhere}}: where an
+        untouched parameter can have picked up another instance's value. Keyframed values count:
+        SceneYard Billiard Balls' untouched CC Sphere Rotation X/Z read as the keyframed ball's
+        last keys (13, -56) and tilted the other balls; aerender draws them at 0."""
         found = {}
 
         def visit(effect_name, group, depth):
@@ -370,13 +372,16 @@ class Exporter:
             for prop in group:
                 if isinstance(prop, PropertyGroup):
                     visit(effect_name, prop, depth + 1)
-                elif prop._is_live() and not getattr(prop, "keyframes", None) and not getattr(prop, "expression", ""):
-                    try:
-                        key = Exporter.value_key(prop.value)
-                        hash(key)
-                    except Exception:
-                        continue
-                    found.setdefault((effect_name, prop.match_name), set()).add(key)
+                elif prop._is_live() and not getattr(prop, "expression", ""):
+                    keys = getattr(prop, "keyframes", None) or []
+                    values = [getattr(key, "value", None) for key in keys] if keys else [prop.value]
+                    for value in values:
+                        try:
+                            key = Exporter.value_key(value)
+                            hash(key)
+                        except Exception:
+                            continue
+                        found.setdefault((effect_name, prop.match_name), set()).add(key)
 
         for comp in getattr(project, "compositions", []) or []:
             for layer in getattr(comp, "layers", []) or []:
