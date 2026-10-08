@@ -81,7 +81,11 @@ class Exporter:
             edge = first[0] == first[2]
             # Edge layout stores (a,b,a,c,b,c) for each face; the header's
             # index count remains three per face, so the byte stream doubles it.
-            stored = 2 * indices if edge else indices
+            # Rotated layout (meshes with a Triangle Density, SceneYard "Hand
+            # balance collage") stores each face twice, (a,b,c) then (b,c,a).
+            pair = (not edge and offset + 24 <= len(data)
+                    and struct.unpack_from(">3I", data, offset + 12) == (first[1], first[2], first[0]))
+            stored = 2 * indices if edge or pair else indices
             if offset + 4 * stored > len(data):
                 continue
             preview = struct.unpack_from(f">{min(12, stored)}I", data, offset)
@@ -91,6 +95,8 @@ class Exporter:
                 continue
             if not edge and any(len(set(preview[i:i + 3])) != 3 for i in range(0, len(preview) - 2, 3)):
                 continue
+            if pair and any(preview[i + 3:i + 6] != (preview[i + 1], preview[i + 2], preview[i]) for i in range(0, len(preview) - 5, 6)):
+                continue
             values = struct.unpack_from(f">{stored}I", data, offset)
             if any(i >= vertices for i in values):
                 continue
@@ -99,6 +105,11 @@ class Exporter:
                 if any(a != c or b != e or d != f for a, b, c, d, e, f in groups):
                     continue
                 triangles = [(a, d, b) for a, b, _, d, _, _ in groups]
+            elif pair:
+                groups = [values[i:i + 6] for i in range(0, stored, 6)]
+                if any((d, e, f) != (b, c, a) for a, b, c, d, e, f in groups):
+                    continue
+                triangles = [(a, b, c) for a, b, c, _, _, _ in groups]
             else:
                 triangles = [values[i:i + 3] for i in range(0, indices, 3)]
             if not triangles or any(len({a, b, c}) != 3 or
@@ -154,8 +165,14 @@ class Exporter:
         rect = (opti.psd_layer_right - opti.psd_layer_left, opti.psd_layer_bottom - opti.psd_layer_top)
         canvas = (opti.psd_canvas_width, opti.psd_canvas_height)
         size = (width, height)
-        return {"index": index, "name": getattr(opti, "psd_group_name", "") or "",
-                "layer_size": size != canvas and size == rect}
+        layer_size = size != canvas and size == rect
+        binding = {"index": index, "name": getattr(opti, "psd_group_name", "") or "", "layer_size": layer_size}
+        if layer_size:
+            # AE trims a Layer Size footage to the layer's visible pixels (SceneYard Student
+            # Computer Workflow: 894x929 out of a 1792x1024 layer record).
+            binding["crop_bounds"] = [float(opti.psd_layer_left), float(opti.psd_layer_top),
+                                      float(opti.psd_layer_right), float(opti.psd_layer_bottom)]
+        return binding
 
     def scan_fonts(self, root):
         index = {}

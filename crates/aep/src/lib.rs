@@ -905,8 +905,8 @@ fn native_match(ae: &str) -> &str {
         "ADBE Accepts Lights" => "acceptsLights",
         "ADBE Ambient Coefficient" => "ambient",
         "ADBE Diffuse Coefficient" => "diffuse",
-        "ADBE Specular Intensity" => "specularIntensity",
-        "ADBE Specular Shininess" => "specularShininess",
+        "ADBE Specular Coefficient" | "ADBE Specular Intensity" => "specularIntensity",
+        "ADBE Shininess Coefficient" | "ADBE Specular Shininess" => "specularShininess",
         "ADBE Metal Coefficient" => "metal",
         "ADBE Bevel Styles" => "bevelStyle",
         "ADBE Bevel Depth" => "bevelDepth",
@@ -1166,7 +1166,15 @@ fn import_property(
             if matches!(prop.value, Value::Vec2(_) | Value::Vec3(_)) && matches!(match_id, "position" | "anchor") {
                 prop.spatial = true;
             }
-            fill_property(prop, ir, value, value_type, scale, layer_time, losses, context);
+            // Casts / Accepts Shadows are zero-based in AE (0 Off, 1 On, 2 Only) where the
+            // generic popup adapter subtracts one.
+            if parent.match_id == "materialOptions" && matches!(match_id, "castsShadows" | "acceptsShadows") {
+                let f = |v: f64| v + 1.0;
+                let value = if let Value::Scalar(v) = value { Value::Scalar(f(v)) } else { value };
+                fill_property(prop, &remapped(ir, f), value, value_type, scale, layer_time, losses, context);
+            } else {
+                fill_property(prop, ir, value, value_type, scale, layer_time, losses, context);
+            }
             if match_id == "sourceText" {
                 prop.ui = ParamUi::Text;
             }
@@ -1310,19 +1318,8 @@ fn import_native_effect_params(
             _ => None,
         };
         if let Some(f) = remap {
-            let mut adjusted = child.clone();
-            if let Some(v) = adjusted.get("value").and_then(Json::as_f64) {
-                adjusted["value"] = Json::from(f(v));
-            }
-            if let Some(keys) = adjusted.get_mut("keyframes").and_then(Json::as_array_mut) {
-                for key in keys {
-                    if let Some(v) = key.get("value").and_then(Json::as_f64) {
-                        key["value"] = Json::from(f(v));
-                    }
-                }
-            }
             let adjusted_value = if let Value::Scalar(v) = value { Value::Scalar(f(v)) } else { value };
-            fill_property(prop, &adjusted, adjusted_value, value_type, scale, layer_time, losses, context);
+            fill_property(prop, &remapped(child, f), adjusted_value, value_type, scale, layer_time, losses, context);
         } else {
             fill_property(prop, child, value, value_type, scale, layer_time, losses, context);
         }
@@ -1337,6 +1334,22 @@ fn unauthored_raw_default_point(ir: &Json, value: &Value) -> bool {
         && array(ir, "keyframes").is_empty()
         && string(ir, &["expression"]).unwrap_or("").is_empty()
         && matches!(value, Value::Vec2(v) if v.iter().any(|c| c.abs() >= 10_000.0))
+}
+
+/// A copy of a property's IR with its scalar value and keyframe values mapped by `f`.
+fn remapped(ir: &Json, f: impl Fn(f64) -> f64) -> Json {
+    let mut adjusted = ir.clone();
+    if let Some(v) = adjusted.get("value").and_then(Json::as_f64) {
+        adjusted["value"] = Json::from(f(v));
+    }
+    if let Some(keys) = adjusted.get_mut("keyframes").and_then(Json::as_array_mut) {
+        for key in keys {
+            if let Some(v) = key.get("value").and_then(Json::as_f64) {
+                key["value"] = Json::from(f(v));
+            }
+        }
+    }
+    adjusted
 }
 
 fn fill_property(prop: &mut Property, ir: &Json, value: Value, value_type: &str, scale: f64, layer_time: LayerTime, losses: &mut Vec<String>, context: &str) {
@@ -1823,6 +1836,31 @@ mod tests {
         let mut losses = Vec::new();
         import_native_effect_params(&mut project, &mut effect, &ir, &ir, spec.id, LayerTime { start: Tick::ZERO, stretch: 100.0 }, &mut losses, "test", 0);
         assert_eq!(effect.prop("controls").unwrap().value, Value::Scalar(3.0));
+    }
+
+    #[test]
+    fn material_options_keep_ae_shadow_modes_and_specular() {
+        // Glass UI List: AE's match names for Specular Intensity / Shininess are the
+        // "Coefficient" ones, and Casts / Accepts Shadows count from 0 (Off).
+        let ir = serde_json::json!({"schema_version":1,"items":[{"id":1,"kind":"comp","name":"Main","width":100,"height":100,"duration":2,"layers":[
+            {"id":2,"kind":"text","name":"Card","three_d_layer":true,"properties":[
+                {"kind":"group","match_name":"ADBE Material Options Group","children":[
+                    {"kind":"property","match_name":"ADBE Casts Shadows","value":1.0,"keyframes":[{"time":0.0,"value":0.0},{"time":1.0,"value":2.0}]},
+                    {"kind":"property","match_name":"ADBE Accepts Shadows","value":1.0},
+                    {"kind":"property","match_name":"ADBE Specular Coefficient","value":70.0},
+                    {"kind":"property","match_name":"ADBE Shininess Coefficient","value":90.0}
+                ]}
+            ]}
+        ]}]});
+        let mut project = Project::default();
+        let result = import_ir(&mut project, ir.to_string().as_bytes(), "", &mut |_| None).unwrap();
+        let layer = &project.comp(result.item_ids[&1]).unwrap().layers[0];
+        let p = |path: &str| layer.props.prop(&format!("materialOptions/{path}")).unwrap();
+        assert_eq!(p("castsShadows").value, Value::Enum(1));
+        assert_eq!(p("castsShadows").keys.iter().map(|k| &k.value).collect::<Vec<_>>(), [&Value::Enum(0), &Value::Enum(2)]);
+        assert_eq!(p("acceptsShadows").value, Value::Enum(1));
+        assert_eq!(p("specularIntensity").value, Value::Scalar(70.0));
+        assert_eq!(p("specularShininess").value, Value::Scalar(90.0));
     }
 
     #[test]

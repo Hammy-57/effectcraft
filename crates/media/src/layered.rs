@@ -94,7 +94,11 @@ pub(crate) fn decode(path: &str, bytes: &[u8], footage: &Footage, op: AlphaOp) -
             return Ok(Some(straight_to_image(px.width, px.height, &px.data, op)));
         }
         let px = match &footage.layer {
-            Some(l) => psd.layer_pixels(l.index as usize, !l.layer_size),
+            Some(l) => psd.layer_pixels(l.index as usize, !l.layer_size).map(|px| match (l.layer_size, l.crop_bounds, psd.layers.get(l.index as usize)) {
+                // After Effects trims a Layer Size footage to the layer's visible pixels.
+                (true, Some(b), Some(rec)) if rec.fill.is_none() => crop_layer(&px, (rec.rect.left, rec.rect.top), b).unwrap_or(px),
+                _ => px,
+            }),
             None => psd.composite(),
         }
         .map_err(|e| MediaError::Decode(format!("{path}: {e}")))?;
@@ -111,10 +115,53 @@ pub(crate) fn decode(path: &str, bytes: &[u8], footage: &Footage, op: AlphaOp) -
     Ok(None)
 }
 
+/// `px` (a layer's pixels with its top-left at document `origin`) cut to document `bounds`
+/// [left, top, right, bottom]; transparent outside the layer. `None` for empty or oversized bounds.
+fn crop_layer(px: &effectcraft_psd::Pixels, origin: (i32, i32), bounds: [f64; 4]) -> Option<effectcraft_psd::Pixels> {
+    let [l, t, r, b] = bounds.map(f64::round);
+    let (w, h) = (r - l, b - t);
+    if !(w >= 1.0 && h >= 1.0 && w <= 30_000.0 && h <= 30_000.0 && l.is_finite() && t.is_finite()) {
+        return None;
+    }
+    let (w, h) = (w as u32, h as u32);
+    let (dx, dy) = (l as i64 - origin.0 as i64, t as i64 - origin.1 as i64);
+    let mut data = vec![[0.0f32; 4]; (w as usize).checked_mul(h as usize)?];
+    for (i, o) in data.iter_mut().enumerate() {
+        let (x, y) = ((i % w as usize) as i64 + dx, (i / w as usize) as i64 + dy);
+        if x >= 0
+            && y >= 0
+            && x < px.width as i64
+            && y < px.height as i64
+            && let Some(p) = px.data.get(y as usize * px.width as usize + x as usize)
+        {
+            *o = *p;
+        }
+    }
+    Some(effectcraft_psd::Pixels { width: w, height: h, data })
+}
+
 /// A vector file rasterised at `scale` × its pixel size (Continuously Rasterize).
 pub(crate) fn rasterize_vector(path: &str, bytes: &[u8], layer: Option<&effectcraft_project::SourceLayer>, page: u32, scale: f64) -> Option<Image> {
     let doc = vector_doc(path, bytes, layer, page)?.ok()?;
     let (w, h) = doc.pixel_size();
     let (sw, sh) = (((w as f64 * scale).ceil() as u32).clamp(1, 16384), ((h as f64 * scale).ceil() as u32).clamp(1, 16384));
     Some(effectcraft_svg::rasterize(&doc, sw, sh, scale))
+}
+
+#[cfg(test)]
+mod crop_tests {
+    use super::*;
+
+    #[test]
+    fn layer_size_footage_is_cut_to_the_visible_bounds() {
+        // A 4×2 layer at document (10, 20); AE's trimmed bounds (11, 20)–(13, 23) take two
+        // columns and a transparent row below the layer.
+        let px = effectcraft_psd::Pixels { width: 4, height: 2, data: (0..8).map(|i| [i as f32, 0.0, 0.0, 1.0]).collect() };
+        let out = crop_layer(&px, (10, 20), [11.0, 20.0, 13.0, 23.0]).unwrap();
+        assert_eq!((out.width, out.height), (2, 3));
+        assert_eq!(out.data[0][0], 1.0);
+        assert_eq!(out.data[3][0], 6.0);
+        assert_eq!(out.data[4][3], 0.0);
+        assert!(crop_layer(&px, (0, 0), [5.0, 5.0, 5.0, 9.0]).is_none());
+    }
 }

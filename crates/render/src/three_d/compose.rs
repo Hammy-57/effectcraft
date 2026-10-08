@@ -263,7 +263,13 @@ fn prepare_with<'a>(
                 let f = phase + angle * i as f64 / (n - 1) as f64;
                 let sub = ctx.at(ctx.time + Tick::from_seconds_f64(f * fd));
                 let c = camera_for(r, &sub);
-                geo(&c, outer * sub.world_matrix(layer) * local, bounds, comp, s, out, r.out_offset())
+                let w = outer * sub.world_matrix(layer) * local;
+                // Depth from the frame's camera, as for unblurred layers: planes that stay
+                // coplanar keep their stack order while the camera moves.
+                geo(&c, w, bounds, comp, s, out, r.out_offset()).map(|g| {
+                    let cv = cam.view * w;
+                    Geo { depth: [cv.0[2][0], cv.0[2][1], cv.0[2][3]], ..g }
+                })
             })
             .collect()
     };

@@ -42,7 +42,10 @@ class PhotoshopLayerTest(unittest.TestCase):
                          {"index": 1, "name": "Layer 1", "layer_size": False})
 
     def test_layer_size_layer(self):
-        self.assertTrue(Exporter.psd_source_layer(self.opti(), 616, 302)["layer_size"])
+        binding = Exporter.psd_source_layer(self.opti(), 616, 302)
+        self.assertTrue(binding["layer_size"])
+        self.assertEqual(binding["crop_bounds"], [449.0, 139.0, 1065.0, 441.0])
+        self.assertNotIn("crop_bounds", Exporter.psd_source_layer(self.opti(), 1549, 2132))
 
     def test_merged_import_is_not_a_layer(self):
         self.assertIsNone(Exporter.psd_source_layer(self.opti(psd_flattened=True), 1549, 2132))
