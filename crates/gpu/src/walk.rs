@@ -263,9 +263,13 @@ fn draw_adjustment(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canv
     };
     let mut fx = crate::effects::GpuFx::new(e, below, [0.0; 2], r.opts.scale, pipe.levels);
     r.run_effects_on(ctx, layer, true, &mut fx);
-    let (mut adjusted, _, _) = fx.finish()?;
+    let (mut adjusted, offset, _) = fx.finish()?;
     if adjusted.width != w || adjusted.height != h {
-        return Some(());
+        // An effect grew the buffer (Motion Tile's Output Width): back to the comp.
+        let Some((x, y)) = effectcraft_render::adjustment_crop(offset, [0.0; 2], (adjusted.width, adjusted.height), (w, h)) else {
+            return Some(());
+        };
+        adjusted = e.crop(&adjusted, x as u32, y as u32, w, h);
     }
     if let Some(c) = pipe.to_blend() {
         adjusted = ops::convert(e, &adjusted, &c);

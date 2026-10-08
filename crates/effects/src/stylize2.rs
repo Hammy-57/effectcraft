@@ -421,6 +421,12 @@ fn repetile(ctx: &EffectCtx, b: Buf) -> Buf {
 
 // ---- Motion Tile ----
 
+/// Whole pixels an adjustment layer's Motion Tile grows its buffer by on each side, for an
+/// output `extra` layer units wider than the layer (none when narrower; capped).
+pub fn motion_tile_growth(extra: f64, scale: f64) -> u32 {
+    (extra * 0.5 * scale).round().clamp(0.0, 8192.0) as u32
+}
+
 fn motion_tile(ctx: &EffectCtx, b: Buf) -> Buf {
     let s = b.scale;
     let (lw, lh) = (ctx.layer_size[0], ctx.layer_size[1]);
@@ -433,11 +439,15 @@ fn motion_tile(ctx: &EffectCtx, b: Buf) -> Buf {
     let mirror = ctx.params.b("mirrorEdges");
     let phase = ctx.params.f("phase") / 360.0;
     let hshift = ctx.params.b("horizontalPhaseShift");
+    let ow = (lw * ctx.params.f("outputWidth") / 100.0).max(1.0 / s);
+    let oh = (lh * ctx.params.f("outputHeight") / 100.0).max(1.0 / s);
     let (nw, nh, noff) = if ctx.adjustment {
-        (b.img.width, b.img.height, b.offset)
+        // An adjustment layer's buffer is the comp below: grow it by whole pixels so later
+        // effects (a Wave Warp pulling from 500 px away) read tiles instead of transparency;
+        // the adjustment is cropped back to the comp afterwards.
+        let (ex, ey) = (motion_tile_growth(ow - lw, s), motion_tile_growth(oh - lh, s));
+        (b.img.width.saturating_add(2 * ex), b.img.height.saturating_add(2 * ey), [b.offset[0] + ex as f64, b.offset[1] + ey as f64])
     } else {
-        let ow = (lw * ctx.params.f("outputWidth") / 100.0).max(1.0 / s);
-        let oh = (lh * ctx.params.f("outputHeight") / 100.0).max(1.0 / s);
         ((ow * s).round().max(1.0) as u32, (oh * s).round().max(1.0) as u32, [(ow - lw) * 0.5 * s, (oh - lh) * 0.5 * s])
     };
     let mut out = Image::new(nw, nh);

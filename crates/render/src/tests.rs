@@ -530,3 +530,27 @@ fn adjustment_layer_track_matte_limits_its_effects() {
     assert!((right[0] - 0.2).abs() < 0.01, "outside the matte untouched: {right:?}");
     assert!((left[0] - 0.8).abs() < 0.01, "inverted inside the matte: {left:?}");
 }
+
+/// An adjustment layer's Motion Tile with Output Width/Height over 100% grows the buffer, so a
+/// later warp reads mirrored tiles past the comp edge instead of transparency (SceneYard Liquid
+/// Glass: Motion Tile 300% + Wave Warp 500 px tore black holes into the gradient background).
+#[test]
+fn adjustment_motion_tile_feeds_a_later_warp() {
+    let (mut p, cid, comp) = setup();
+    let red = solid(&mut p, &comp, [1.0, 0.0, 0.0], 200, 100);
+    let mut adj = solid(&mut p, &comp, [1.0, 1.0, 1.0], 200, 100);
+    adj.switches.adjustment = true;
+    let tile = [("outputWidth", Value::Scalar(300.0)), ("outputHeight", Value::Scalar(300.0)), ("mirrorEdges", Value::Bool(true))];
+    add_effect_200(&mut p, &mut adj, "ec.stylize.motiontile", &tile);
+    let warp = [("height", Value::Scalar(40.0)), ("width", Value::Scalar(60.0)), ("direction", Value::Scalar(0.0))];
+    add_effect_200(&mut p, &mut adj, "ec.distort.wavewarp", &warp);
+    let c = p.comp_mut(cid).unwrap();
+    c.layers.push(adj);
+    c.layers.push(red);
+    let img = render_frame(&p, cid, Tick::ZERO, 1.0);
+    for y in (0..100).step_by(3) {
+        for x in [0, 1, 2, 197, 198, 199] {
+            assert!(img.get(x, y)[3] > 0.99 && img.get(x, y)[0] > 0.99, "({x},{y}) {:?}", img.get(x, y));
+        }
+    }
+}
