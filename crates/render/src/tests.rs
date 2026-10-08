@@ -506,3 +506,27 @@ fn shape_layer_effect_points_use_the_comp_sized_canvas() {
     assert!(img.get(100, 65)[0] > 0.9, "{:?}", img.get(100, 65));
     assert!(img.get(115, 50)[3] < 0.1, "{:?}", img.get(115, 50));
 }
+
+/// An adjustment layer's track matte limits where its effects apply (SceneYard UI Google
+/// search: a tint + blur adjustment only inside a rounded card, the rings outside stay sharp).
+#[test]
+fn adjustment_layer_track_matte_limits_its_effects() {
+    let (mut p, cid, comp) = setup();
+    let grey = solid(&mut p, &comp, [0.2, 0.4, 0.6], 200, 100);
+    let mut adj = solid(&mut p, &comp, [1.0, 1.0, 1.0], 200, 100);
+    adj.switches.adjustment = true;
+    add_effect_200(&mut p, &mut adj, "ec.channel.invert", &[]);
+    // Matte: the left half only.
+    let mut matte = solid(&mut p, &comp, [1.0, 1.0, 1.0], 100, 100);
+    matte.props.prop_mut("transform/position").unwrap().value = Value::Vec3([50.0, 50.0, 0.0]);
+    matte.switches.video = false;
+    adj.track_matte = Some(TrackMatte { layer: matte.id, kind: MatteKind::Alpha });
+    let c = p.comp_mut(cid).unwrap();
+    c.layers.push(matte);
+    c.layers.push(adj);
+    c.layers.push(grey);
+    let img = render_frame(&p, cid, Tick::ZERO, 1.0);
+    let (left, right) = (img.get(40, 50), img.get(160, 50));
+    assert!((right[0] - 0.2).abs() < 0.01, "outside the matte untouched: {right:?}");
+    assert!((left[0] - 0.8).abs() < 0.01, "inverted inside the matte: {left:?}");
+}
