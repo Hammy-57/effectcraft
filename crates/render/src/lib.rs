@@ -382,9 +382,9 @@ pub struct RenderOpts {
     pub roi: Option<[f64; 4]>,
     /// Which proxies stand in for footage and compositions (Render Settings ▸ Proxy Use).
     pub proxy: effectcraft_project::render_queue::ProxyUse,
-    /// Switches Affect Nested Comps (Settings ▸ General): a precomp layer's Quality and Motion
-    /// Blur switches also limit the layers of the nested comp (Draft/Wireframe or motion blur off
-    /// propagate down; they never raise a nested layer's own setting).
+    /// Switches Affect Nested Comps (Settings ▸ General): a precomp layer's Quality switch also
+    /// limits the layers of the nested comp (Draft/Wireframe propagate down; they never raise a
+    /// nested layer's own setting). Its Motion Blur switch does not reach them in AE.
     pub nested_switches: bool,
     /// Realtime Shadows in Draft (Settings ▸ 3D): draft renders (`draft`) still cast shadows.
     pub draft_shadows: bool,
@@ -436,9 +436,9 @@ pub struct Renderer<'a> {
     opacity_mul: f32,
     /// Collapsed precomp: nested 3D layers join the parent's 3D space.
     pub(crate) collapse3d: Option<Collapse3d<'a>>,
-    /// Switches inherited from the precomp layers this comp is rendered through (see
-    /// [`RenderOpts::nested_switches`]): the worst quality and whether motion blur is allowed.
-    pub(crate) inherited: Option<(Quality, bool)>,
+    /// The worst Quality switch of the precomp layers this comp is rendered through (see
+    /// [`RenderOpts::nested_switches`]).
+    pub(crate) inherited: Option<Quality>,
     /// Classic 3D depth of field is left to an accelerator ([`three_d::Plane3d::dof`]).
     pub(crate) defer_dof: bool,
     /// This renderer draws into the top-level frame's canvas (the top comp, or a collapsed
@@ -547,14 +547,16 @@ impl<'a> Renderer<'a> {
             Quality::Wireframe => 2,
         };
         match self.inherited {
-            Some((q, _)) if rank(q) > rank(layer.switches.quality) => q,
+            Some(q) if rank(q) > rank(layer.switches.quality) => q,
             _ => layer.switches.quality,
         }
     }
 
-    /// A layer's Motion Blur switch, limited by the precomp layers above it.
+    /// A layer's Motion Blur switch. Unlike Quality, the precomp layers above do not limit it:
+    /// AE still motion blurs nested layers under a precomp layer whose Motion Blur is off
+    /// (aerender, SceneYard Student Computer Workflow: trimmed strokes two precomps down).
     pub(crate) fn layer_motion_blur(&self, layer: &Layer) -> bool {
-        layer.switches.motion_blur && self.inherited.is_none_or(|(_, mb)| mb)
+        layer.switches.motion_blur
     }
 
     /// The renderer for the nested comp of precomp layer `layer`: its switches pass down when
@@ -562,7 +564,7 @@ impl<'a> Renderer<'a> {
     fn nested_through(&self, layer: &Layer) -> Renderer<'a> {
         let mut sub = self.nested();
         if self.opts.nested_switches {
-            sub.inherited = Some((self.quality(layer), self.layer_motion_blur(layer)));
+            sub.inherited = Some(self.quality(layer));
         }
         sub
     }
@@ -1476,8 +1478,8 @@ impl<'a> Renderer<'a> {
     }
 
     /// Whether a layer is motion blurred: the render options, the comp's switch and the layer's
-    /// switch (limited by the precomp layers above when switches affect nested comps). Layer
-    /// motion, mask motion blur, effects that read the shutter and Advanced 3D all ask this.
+    /// switch. Layer motion, mask motion blur, effects that read the shutter and Advanced 3D all
+    /// ask this.
     pub(crate) fn mb_on(&self, ctx: &EvalCtx, layer: &Layer) -> bool {
         self.opts.motion_blur && ctx.comp.enable_motion_blur && self.layer_motion_blur(layer)
     }
@@ -1485,7 +1487,7 @@ impl<'a> Renderer<'a> {
     /// What a layer's mask motion blur may do in this render (see [`masks::MaskBlur`]).
     fn mask_blur(&self, ctx: &EvalCtx, layer: &Layer) -> masks::MaskBlur {
         masks::MaskBlur {
-            allowed: self.opts.motion_blur && ctx.comp.enable_motion_blur && self.inherited.is_none_or(|(_, mb)| mb),
+            allowed: self.opts.motion_blur && ctx.comp.enable_motion_blur,
             layer: self.layer_motion_blur(layer),
             samples: if self.opts.draft { 4 } else { ctx.comp.motion_blur_samples as usize },
         }
