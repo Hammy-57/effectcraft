@@ -158,3 +158,27 @@ fn layer_cache_is_independent_of_camera_lights_and_view() {
     assert_ne!(third, second);
     assert!(cache.stats().hits > 0, "the cache was actually used");
 }
+
+/// A camera parented to a null scaled across the view but not along it sees the picture
+/// magnified by the ratio (SceneYard "PayPal UI Animation": Null 1 at 49%, 49%, 100% zooms its
+/// camera in about 2×); a uniformly scaled parent only moves it.
+#[test]
+fn parent_scale_across_the_view_magnifies_the_camera() {
+    let zoom_with = |scale: [f64; 3]| {
+        let (mut p, cid, comp) = setup();
+        let mut null = solid(&mut p, &comp, true, [100.0, 50.0, 0.0]);
+        null.props.prop_mut("transform/scale").unwrap().value = Value::Vec3(scale);
+        let mut cam = build::layer(&mut p, &comp, "Camera", LayerSource::Camera, (200, 100), None);
+        cam.parent = Some(null.id);
+        let c = p.comp_mut(cid).unwrap();
+        c.layers.push(cam);
+        c.layers.push(null);
+        let c = p.comp(cid).unwrap();
+        let ctx = EvalCtx::new(&p, cid, c, Tick::ZERO);
+        let base = c.layers[0].props.prop("cameraOptions/zoom").unwrap().value.as_f64();
+        active_camera(&ctx).zoom / base
+    };
+    assert!((zoom_with([50.0, 50.0, 100.0]) - 2.0).abs() < 1e-9);
+    assert!((zoom_with([50.0, 50.0, 50.0]) - 1.0).abs() < 1e-9);
+    assert!((zoom_with([100.0, 100.0, 100.0]) - 1.0).abs() < 1e-9);
+}

@@ -305,6 +305,25 @@ pub fn layer_frame(ctx: &EvalCtx, layer: &Layer) -> (Vec3, Vec3, Vec3) {
     (eye, fwd, down)
 }
 
+/// How much a camera's parents magnify its picture. After Effects keeps the parents' scale in
+/// the camera's transform: a parent scaled across the view but not along it (a null at 49%,
+/// 49%, 100%) enlarges the picture by the ratio (SceneYard "PayPal UI Animation"). 1 for
+/// unparented cameras and uniformly scaled parents.
+fn parent_magnification(ctx: &EvalCtx, cam: &Layer) -> f64 {
+    if cam.parent.is_none() {
+        return 1.0;
+    }
+    let parent = parent_world(ctx, cam);
+    let local = rig_rotation(ctx, cam);
+    let len = |v: Vec3| parent.apply_vec(local.apply_vec(v)).length();
+    let across = (len(vec3(1.0, 0.0, 0.0)) + len(vec3(0.0, 1.0, 0.0))) * 0.5;
+    let along = len(vec3(0.0, 0.0, 1.0));
+    if !(across.is_finite() && along.is_finite() && across > 1e-9 && along > 1e-9) {
+        return 1.0;
+    }
+    (along / across).clamp(1e-3, 1e3)
+}
+
 /// Evaluate a camera layer.
 pub fn layer_camera(ctx: &EvalCtx, cam: &Layer) -> CameraState {
     let w = ctx.comp.width as f64;
@@ -329,6 +348,9 @@ pub fn layer_camera(ctx: &EvalCtx, cam: &Layer) -> CameraState {
             saturation: ctx.f(cam, g, "highlightSaturation", 0.0).clamp(0.0, 100.0) / 100.0,
         },
     });
+    // The lens (depth of field) keeps the camera's own Zoom; the picture also carries the
+    // parents' magnification.
+    let zoom = zoom * parent_magnification(ctx, cam);
     CameraState { view: basis_view(eye, fwd, down), eye, zoom, ortho: false, dof }
 }
 

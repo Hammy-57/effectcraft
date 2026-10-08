@@ -137,6 +137,26 @@ class Exporter:
             raise ValueError("invalid vector artwork bounds")
         return {"index": index, "name": name, "layer_size": True, "crop_bounds": bounds}
 
+    @staticmethod
+    def psd_source_layer(source, width, height):
+        """The saved binding of a single Photoshop layer imported as footage (Footage: Choose
+        Layer); None for a merged import. ``layer_size`` when the footage is the layer's own
+        bounds rather than the document size."""
+        opti = getattr(source, "_opti", None)
+        if getattr(opti, "asset_type", None) != "8BPS" or getattr(opti, "psd_flattened", True):
+            return None
+        count = getattr(opti, "psd_layer_count", 0)
+        index = getattr(opti, "psd_layer_index", None)
+        if not count:
+            return None
+        if not isinstance(index, int) or not 0 <= index < count <= 65535:
+            raise ValueError("invalid Photoshop source layer index/count")
+        rect = (opti.psd_layer_right - opti.psd_layer_left, opti.psd_layer_bottom - opti.psd_layer_top)
+        canvas = (opti.psd_canvas_width, opti.psd_canvas_height)
+        size = (width, height)
+        return {"index": index, "name": getattr(opti, "psd_group_name", "") or "",
+                "layer_size": size != canvas and size == rect}
+
     def scan_fonts(self, root):
         index = {}
         for path in root.rglob("*"):
@@ -520,7 +540,8 @@ class Exporter:
                 result["color"] = self.value(self.read(source, "color", scope), scope + "/color")
             elif source and type(source).__name__ == "FileSource":
                 try:
-                    binding = self.vector_source_layer(source)
+                    binding = (self.vector_source_layer(source)
+                               or self.psd_source_layer(source, result.get("width"), result.get("height")))
                     if binding is not None:
                         result["source_layer"] = binding
                 except (ValueError, TypeError, struct.error) as exc:

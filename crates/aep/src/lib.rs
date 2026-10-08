@@ -1296,6 +1296,9 @@ fn import_native_effect_params(
         let remap: Option<fn(f64) -> f64> = match (effect_id, path) {
             ("ec.keying.keylight", "insideMask/insideMask" | "outsideMask/outsideMask") => Some(|v| v + 1.0),
             ("ec.keying.keylight", "sourceCrops/cropRight" | "sourceCrops/cropBottom") => Some(|v| 100.0 - v),
+            // CC Page Turn's Controls is numeric natively but keeps AE's popup order less one
+            // (SceneYard Patient ID: AE 4 = drag the top-right corner).
+            ("ec.distort.ccpageturn", "controls") => Some(|v| v - 1.0),
             _ => None,
         };
         if let Some(f) = remap {
@@ -1799,6 +1802,19 @@ mod tests {
         assert_eq!(v("sourceCrops/cropBottom"), Value::Scalar(20.0));
         let keys: Vec<Value> = effect.prop("sourceCrops/cropBottom").unwrap().keys.iter().map(|k| k.value.clone()).collect();
         assert_eq!(keys, vec![Value::Scalar(0.0), Value::Scalar(25.0)]);
+    }
+
+    #[test]
+    fn cc_page_turn_controls_keep_the_zero_based_mode() {
+        // AE Controls 4 drags the top-right corner: native 3 (Patient ID's page lies flat once
+        // the corner is dragged back onto itself; read as 4 it curled from the bottom left).
+        let mut project = Project::default();
+        let spec = effectcraft_effects::find("ec.distort.ccpageturn").unwrap();
+        let mut effect = effectcraft_effects::instantiate(spec, &mut build::Ids(&mut project.next_id), "CC Page Turn", [100.0, 100.0]);
+        let ir = serde_json::json!({"children":[{"kind":"property","match_name":"CC Page Turn-0008","value":4.0}]});
+        let mut losses = Vec::new();
+        import_native_effect_params(&mut project, &mut effect, &ir, &ir, spec.id, LayerTime { start: Tick::ZERO, stretch: 100.0 }, &mut losses, "test", 0);
+        assert_eq!(effect.prop("controls").unwrap().value, Value::Scalar(3.0));
     }
 
     #[test]

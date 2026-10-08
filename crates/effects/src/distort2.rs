@@ -642,7 +642,11 @@ fn page_turn(ctx: &EffectCtx, mut b: Buf) -> Buf {
         };
         let (dx, dy) = (corner.0 - pointer.0, corner.1 - pointer.1);
         let len = dx.hypot(dy);
-        if !len.is_finite() || len < 1e-6 {
+        // A corner pulled away from the page (or not at all) leaves it flat: it only folds over
+        // when dragged in across the page (SceneYard "Famous Figure Article" ends its turn with
+        // the bottom-right corner just past itself and shows the page flat).
+        let inward = (pointer.0 - corner.0) * (x + w * 0.5 - corner.0) + (pointer.1 - corner.1) * (y + h * 0.5 - corner.1);
+        if !len.is_finite() || len < 1e-6 || inward <= 0.0 {
             return b;
         }
         (((corner.0 + pointer.0) * 0.5, (corner.1 + pointer.1) * 0.5), (dx / len, dy / len))
@@ -1047,6 +1051,15 @@ mod tests {
         assert!(max_diff(&classic, &corner) > 1e-3, "AE Controls 6 must use a dragged corner");
         let other_direction = run("ec.distort.ccpageturn", &[("controls", raw(6)), ("foldPosition", point), ("foldDirection", num(90.0))], img).img;
         assert_eq!(corner, other_direction, "corner controls ignore Fold Direction");
+    }
+
+    #[test]
+    fn page_turn_corner_pulled_away_leaves_the_page_flat() {
+        let img = test_img(64, 64);
+        // Bottom-right corner (native 5) dragged outward past itself: flat; dragged inward: turned.
+        let run_at = |p: [f64; 2]| run("ec.distort.ccpageturn", &[("controls", num(5.0)), ("foldPosition", Value::Vec2(p))], img.clone()).img;
+        assert_eq!(run_at([70.0, 68.0]), img);
+        assert!(max_diff(&run_at([40.0, 40.0]), &img) > 1e-3);
     }
 
     #[test]
