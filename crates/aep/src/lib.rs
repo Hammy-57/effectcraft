@@ -1295,6 +1295,14 @@ fn import_native_effect_params(
             100.0 / 255.0
         } else if effect_id == "ec.generate.fill" && path == "opacity" {
             100.0
+        } else if effect_id == "ec.stylize.glow" {
+            match path {
+                // AE stores Glow Threshold in 0..255 (shown as 60% = 153) and A & B Midpoint as
+                // 0..1; the native controls are percentages.
+                "threshold" => 100.0 / 255.0,
+                "abMidpoint" => 100.0,
+                _ => 1.0,
+            }
         } else if effect_id == "ec.generate.radiowaves" {
             match path {
                 // AE's 0..1 Opacity: 1 draws the waves at half strength (measured with aerender).
@@ -1836,6 +1844,23 @@ mod tests {
         let mut losses = Vec::new();
         import_native_effect_params(&mut project, &mut effect, &ir, &ir, spec.id, LayerTime { start: Tick::ZERO, stretch: 100.0 }, &mut losses, "test", 0);
         assert_eq!(effect.prop("controls").unwrap().value, Value::Scalar(3.0));
+    }
+
+    #[test]
+    fn glow_threshold_and_midpoint_become_percentages() {
+        // AE's default Glow Threshold 60% is stored as 153 (of 255); read as 153% nothing glowed.
+        let mut project = Project::default();
+        let spec = effectcraft_effects::find("ec.stylize.glow").unwrap();
+        let mut effect = effectcraft_effects::instantiate(spec, &mut build::Ids(&mut project.next_id), "Glow", [100.0, 100.0]);
+        let ir = serde_json::json!({"children":[
+            {"kind":"property","match_name":"ADBE Glo2-0002","value":153.0},
+            {"kind":"property","match_name":"ADBE Glo2-0011","value":0.5}
+        ]});
+        let mut losses = Vec::new();
+        import_native_effect_params(&mut project, &mut effect, &ir, &ir, spec.id, LayerTime { start: Tick::ZERO, stretch: 100.0 }, &mut losses, "test", 0);
+        let f = |path: &str| effect.prop(path).unwrap().value.as_f64();
+        assert!((f("threshold") - 60.0).abs() < 1e-9);
+        assert!((f("abMidpoint") - 50.0).abs() < 1e-9);
     }
 
     #[test]
