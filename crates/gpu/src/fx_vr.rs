@@ -305,17 +305,14 @@ fn blend(i: u32) -> (u32, u32) {
 }
 
 fn chromatic(e: &mut Enc, ctx: &EffectCtx, img: &GpuImage) -> Option<GpuImage> {
-    let pr = ctx.params;
-    let k = [pr.f("aberrationRed"), pr.f("aberrationGreen"), pr.f("aberrationBlue")].map(|v| (v / 100.0 * 0.1) as f32);
-    if k.iter().all(|v| *v == 0.0) {
+    let Some(cs) = effectcraft_effects::VrChromaticSetup::new(ctx) else {
         return Some(img.clone());
-    }
-    let r = effectcraft_effects::vr_rotation(pr.f("centerTilt"), pr.f("centerPan"), 0.0);
-    let c = [r[0][2], r[1][2], r[2][2]].map(|v| v as f32);
+    };
+    let c = cs.center().map(|v| v as f32);
     let mut p = op(0);
-    p.u[0][1] = pr.b("falloffInvert") as u32;
-    p.f[0] = [k[0], k[1], k[2], (pr.f("falloff") / 100.0).clamp(0.0, 1.0) as f32];
-    p.f[1] = [c[0], c[1], c[2], 0.0];
+    p.f[0] = [cs.k[0] as f32, cs.k[1] as f32, cs.k[2] as f32, cs.power as f32];
+    p.f[1] = [c[0], c[1], c[2], if cs.full_sphere() { 1.0 } else { 0.0 }];
+    p.f[2] = [cs.fov[0] as f32, cs.fov[1] as f32, 0.0, 0.0];
     per_eye(e, img, layout(ctx), |e, img, _| Some(gen_pass(e, &p, img, None)))
 }
 
