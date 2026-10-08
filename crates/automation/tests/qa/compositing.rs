@@ -154,7 +154,12 @@ fn compositing_matte_blend_adjustment_3d_and_alpha_renders() {
     assert_eq!(qa.exec("comp.renderer", json!({"renderer": "advanced3d"}))["renderer"], "advanced3d");
     let advanced = qa.frame(None, 0.0);
     assert!(mean_diff(&classic, &advanced) > 0.2, "Advanced 3D renders the stage its own way");
-    assert!(lum(&advanced, 50, 45) > 60.0, "Advanced 3D still lights the card");
+    // Advanced 3D lights fall off with distance as measured on AE renders, so compare the card
+    // lit from the front against the same light moved behind it rather than a fixed level.
+    qa.tool("set_property", json!({"layer": light, "path": "transform/position", "value": [50, 45, 400]}));
+    let advanced_back = qa.frame(None, 0.0);
+    let (lit, unlit) = (lum(&advanced, 50, 45), lum(&advanced_back, 50, 45));
+    assert!(lit > unlit + 10.0, "Advanced 3D still lights the card: {lit} vs {unlit}");
 
     // Renders with alpha: the stage has no background layer, so most of it is transparent.
     let mov = qa.path("stage.mov");
