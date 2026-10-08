@@ -139,12 +139,12 @@ fn four_color(ctx: &EffectCtx, mut b: Buf) -> Buf {
                 c = c.map(|v| v + n);
             }
             *px = if gen_mode(mode).is_none() {
-                // None recolours the layer: the gradient takes the layer's own alpha (AE colours
-                // a stroked ring or text, not its whole canvas) and Opacity mixes it with the
-                // original.
-                let a = px[3];
-                let g = [c[0] * a, c[1] * a, c[2] * a, a];
-                std::array::from_fn(|i| px[i] + (g[i] - px[i]) * op)
+                // None replaces the layer's colour: the gradient takes the layer's own alpha (AE
+                // colours a stroked ring or text, not its whole canvas) and Opacity fades that
+                // result; the original colour does not show through (SceneYard 4 Feature Card
+                // Slider: red cards under a 40% grey gradient render as translucent grey).
+                let a = px[3] * op;
+                [c[0] * a, c[1] * a, c[2] * a, a]
             } else {
                 gen_blend(*px, [c[0] * op, c[1] * op, c[2] * op, op], mode)
             };
@@ -494,13 +494,18 @@ mod generator_tests {
             .collect();
         let mut half = pts.clone();
         half.push(("opacity", num(50.0)));
-        // None recolours the layer within its own alpha: half opacity mixes with the original
-        // and an empty pixel stays empty (SceneYard UI 3 Stages: a stroked ring, not a square).
+        // None replaces the layer's colour within its own alpha: half opacity fades the
+        // gradient instead of mixing it with the original (SceneYard 4 Feature Card Slider:
+        // red cards under a 40% grey gradient are translucent grey, not pink), and an empty
+        // pixel stays empty (SceneYard UI 3 Stages: a stroked ring, not a square).
         let mut ring = red();
         ring.set(2, 2, [0.0; 4]);
         let o = run_fx("ec.generate.fourcolor", &half, ring, 0.0, EffectEnv::default());
-        assert!((o.img.get(16, 16)[3] - 1.0).abs() < 1e-3);
-        assert!(o.img.get(16, 16)[0] < 0.9, "mixed with the gradient {:?}", o.img.get(16, 16));
+        let px = o.img.get(16, 16);
+        assert!((px[3] - 0.5).abs() < 1e-3, "faded by Opacity {px:?}");
+        // The default gradient (yellow, green, magenta, blue) averages to a dull grey at the
+        // centre; the red layer colour does not leak through.
+        assert!(px[0] < 0.4 && (px[0] - px[1]).abs() < 0.2, "gradient only {px:?}");
         assert_eq!(o.img.get(2, 2), [0.0; 4]);
         // Normal: over the opaque layer.
         half.push(("blendingMode", Value::Enum(1)));

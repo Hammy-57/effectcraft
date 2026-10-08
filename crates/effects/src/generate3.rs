@@ -697,8 +697,10 @@ fn scribble_plan(ctx: &EffectCtx, b: &Buf) -> Option<PaintPlan> {
     let sc = b.scale;
     let fill = pr.e("fillType");
     let ew = pr.f("edgeOptions/edgeWidth").max(0.1) * sc;
+    // Angle is a compass direction (0 = up, clockwise): AE's 60° strokes rise to the right
+    // 30° above the horizontal (SceneYard Magnifying Glass), 45° runs along the "/" diagonal.
     let ang = pr.f("angle").to_radians();
-    let d = [ang.cos(), ang.sin()];
+    let d = [ang.sin(), -ang.cos()];
     let n = [-d[1], d[0]];
     let width = (pr.f("strokeWidth") * sc).max(0.1);
     let curv = pr.f("strokeOptions/curviness") / 100.0;
@@ -2067,6 +2069,27 @@ mod tests {
         assert_eq!(s.img.data, s2.img.data, "static wiggle is constant");
         let half = run_env("ec.generate.scribble", &[("end", num(50.0))], img, 0.5, env);
         assert!(alpha_sum(&half.img, 0, 0, 64, 64) < alpha_sum(&a.img, 0, 0, 64, 64));
+    }
+
+    #[test]
+    fn scribble_angle_is_a_compass_direction() {
+        // AE's Angle 0 points up and turns clockwise: 90 draws horizontal strokes (SceneYard
+        // Magnifying Glass: 60 rises to the right, it fell to the right at 60 from horizontal).
+        let masks = square_mask();
+        let env = EffectEnv { masks: &masks, ..Default::default() };
+        let set = [
+            ("angle", num(90.0)),
+            ("wiggleType", Value::Enum(0)),
+            ("strokeOptions/curviness", num(0.0)),
+            ("strokeOptions/curvinessVariation", num(0.0)),
+            ("strokeOptions/spacing", num(8.0)),
+            ("strokeOptions/spacingVariation", num(0.0)),
+            ("strokeOptions/pathOverlapVariation", num(0.0)),
+        ];
+        let o = run_env("ec.generate.scribble", &set, Image::new(64, 64), 0.5, env);
+        let empty_row = (22..42).any(|y| alpha_sum(&o.img, 26, y, 38, y + 1) < 0.5);
+        let empty_col = (22..42).any(|x| alpha_sum(&o.img, x, 26, x + 1, 38) < 0.5);
+        assert!(empty_row && !empty_col, "horizontal strokes: rows {empty_row} cols {empty_col}");
     }
 
     #[test]

@@ -1340,6 +1340,14 @@ fn import_native_effect_params(
                 "abMidpoint" => 100.0,
                 _ => 1.0,
             }
+        } else if effect_id == "ec.generate.scribble" {
+            match path {
+                // AE stores Scribble's Opacity, Curviness and Curviness Variation as 0..1
+                // fractions; the native controls are percentages (SceneYard Magnifying Glass:
+                // an untouched 100% Opacity read as 1% hid the scribble).
+                "opacity" | "strokeOptions/curviness" | "strokeOptions/curvinessVariation" => 100.0,
+                _ => 1.0,
+            }
         } else if effect_id == "ec.generate.radiowaves" {
             match path {
                 // AE's 0..1 Opacity: 1 draws the waves at half strength (measured with aerender).
@@ -1881,6 +1889,28 @@ mod tests {
         let mut losses = Vec::new();
         import_native_effect_params(&mut project, &mut effect, &ir, &ir, spec.id, LayerTime { start: Tick::ZERO, stretch: 100.0 }, &mut losses, "test", 0);
         assert_eq!(effect.prop("controls").unwrap().value, Value::Scalar(3.0));
+    }
+
+    #[test]
+    fn scribble_opacity_and_curviness_become_percentages() {
+        // AE's untouched Scribble Opacity is stored as 1.0 (100%); read as 1% the SceneYard
+        // Magnifying Glass scribble was invisible. Curviness 0.2 is 20%.
+        let mut project = Project::default();
+        let spec = effectcraft_effects::find("ec.generate.scribble").unwrap();
+        let mut effect = effectcraft_effects::instantiate(spec, &mut build::Ids(&mut project.next_id), "Scribble", [100.0, 100.0]);
+        let ir = serde_json::json!({"children":[
+            {"kind":"property","match_name":"ADBE Scribble Fill-0024","value":1.0},
+            {"kind":"property","match_name":"ADBE Scribble Fill-0012","value":0.2},
+            {"kind":"property","match_name":"ADBE Scribble Fill-0066","value":0.19},
+            {"kind":"property","match_name":"ADBE Scribble Fill-0060","value":3.4}
+        ]});
+        let mut losses = Vec::new();
+        import_native_effect_params(&mut project, &mut effect, &ir, &ir, spec.id, LayerTime { start: Tick::ZERO, stretch: 100.0 }, &mut losses, "test", 0);
+        let f = |path: &str| effect.prop(path).unwrap().value.as_f64();
+        assert!((f("opacity") - 100.0).abs() < 1e-9);
+        assert!((f("strokeOptions/curviness") - 20.0).abs() < 1e-9);
+        assert!((f("strokeOptions/curvinessVariation") - 19.0).abs() < 1e-9);
+        assert!((f("strokeOptions/spacing") - 3.4).abs() < 1e-9);
     }
 
     #[test]

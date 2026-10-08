@@ -1765,8 +1765,13 @@ impl<'a> Renderer<'a> {
         if adjusted.img.width != canvas.width || adjusted.img.height != canvas.height {
             return;
         }
+        // A blending mode composites the adjusted comp onto the layers below with that mode
+        // (SceneYard Billiard Balls: a white-to-black 4-Color Gradient adjustment in Overlay
+        // shades the felt; Normal washed it out to grey).
+        let mode = layer.blend_mode;
         canvas.data.par_iter_mut().zip(adjusted.img.data.par_iter()).zip(matte.data.par_iter()).for_each(|((c, a), m)| {
             let k = m[3] * opacity;
+            let a = if mode == BlendMode::Normal { *a } else { effectcraft_color::blend_pixel(mode, *c, *a, 0.5) };
             for i in 0..4 {
                 c[i] += (a[i] - c[i]) * k;
             }
