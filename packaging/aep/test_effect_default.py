@@ -53,6 +53,25 @@ class EffectDefaultTest(unittest.TestCase):
         self.assertEqual(Exporter.effect_default(untouched, definitions, leaked), WHITE)
         self.assertIsNone(Exporter.effect_default(untouched, definitions, {}))
 
+    def test_keyframed_parameters_count_as_set_by_another_instance(self):
+        # SceneYard Billiard Balls: the green ball keys CC Sphere Rotation X to 13; the other
+        # balls' untouched Rotation X reads 13 and must take the plugin default 0.
+        keyed = SimpleNamespace(match_name="CC Sphere-0002", value=-11.0, expression="",
+                                keyframes=[SimpleNamespace(value=-11.0), SimpleNamespace(value=13.0)],
+                                _is_live=lambda: True)
+        expressed = SimpleNamespace(match_name="CC Sphere-0003", value=0.0, expression="time",
+                                    keyframes=[], _is_live=lambda: True)
+
+        class Effect(list):
+            match_name = "CC Sphere"
+
+        project = SimpleNamespace(compositions=[SimpleNamespace(layers=[SimpleNamespace(effects=[Effect([keyed, expressed])])])])
+        authored = Exporter.authored_effect_values(project)
+        self.assertEqual(authored, {("CC Sphere", "CC Sphere-0002"): {-11.0, 13.0}})
+        definitions = {"CC Sphere": {"CC Sphere-0002": {"property_control_type": 3, "default": 0}}}
+        untouched = param(13.0, 13.0, effect_name="CC Sphere", match_name="CC Sphere-0002")
+        self.assertEqual(Exporter.effect_default(untouched, definitions, authored), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
