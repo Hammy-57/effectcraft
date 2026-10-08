@@ -84,7 +84,7 @@ pub fn f_schlick(f0: [f32; 3], v_h: f32) -> [f32; 3] {
 
 /// Cook–Torrance BRDF × N·L × π for one light: (diffuse colour factor, specular colour).
 /// Returned as the reflected fraction of the light's irradiance.
-pub fn brdf(base: [f32; 3], metallic: f32, rough: f32, spec_k: f32, diff_k: f32, n: [f32; 3], v: [f32; 3], l: [f32; 3]) -> [f32; 3] {
+pub fn brdf(base: [f32; 3], metallic: f32, rough: f32, spec_k: f32, diff_k: f32, metal_k: f32, n: [f32; 3], v: [f32; 3], l: [f32; 3]) -> [f32; 3] {
     let n_l = dot(n, l);
     if n_l <= 0.0 {
         return [0.0; 3];
@@ -94,7 +94,8 @@ pub fn brdf(base: [f32; 3], metallic: f32, rough: f32, spec_k: f32, diff_k: f32,
     let n_h = dot(n, h).max(0.0);
     let v_h = dot(v, h).max(0.0);
     let r = rough.clamp(0.03, 1.0);
-    let f0 = [mix(0.04 * spec_k, base[0], metallic), mix(0.04 * spec_k, base[1], metallic), mix(0.04 * spec_k, base[2], metallic)];
+    let mb = base.map(|b| b * metal_k);
+    let f0 = [mix(0.04 * spec_k, mb[0], metallic), mix(0.04 * spec_k, mb[1], metallic), mix(0.04 * spec_k, mb[2], metallic)];
     let f = f_schlick(f0, v_h);
     let d = d_ggx(n_h, r * r);
     let g = g_smith(n_v, n_l, r);
@@ -263,6 +264,10 @@ pub fn light_shadow(s: &Scene, l: &Light, p: [f32; 3], n_l: f32) -> f32 {
 }
 
 /// Distance attenuation × spot cone of a light at `p` (AE falloff modes).
+/// Advanced 3D point / spot light distance attenuation: `REACH / (d² + SOFTENING)`.
+const POINT_LIGHT_REACH: f32 = 9350.0;
+const POINT_LIGHT_SOFTENING: f32 = 62600.0;
+
 pub fn attenuation(l: &Light, p: [f32; 3], to_l: [f32; 3], dist: f32) -> f32 {
     let mut k = match l.falloff {
         1 if l.kind != 0 => {
@@ -284,6 +289,11 @@ pub fn attenuation(l: &Light, p: [f32; 3], to_l: [f32; 3], dist: f32) -> f32 {
         }
         _ => 1.0,
     };
+    // Point lights also dim physically with distance whatever their Falloff (measured on AE
+    // renders of a point light with Falloff None, distances 350..1030 px; spots unmeasured).
+    if l.kind == 2 && dist.is_finite() {
+        k *= POINT_LIGHT_REACH / (dist * dist + POINT_LIGHT_SOFTENING);
+    }
     let _ = p;
     if l.kind == 1 {
         let cos_a = dot(scale(to_l, -1.0), l.dir).clamp(-1.0, 1.0);
@@ -386,7 +396,7 @@ pub fn shade(s: &Scene, f: &Frag) -> Option<[f32; 4]> {
             continue;
         }
         let sh = if m.receives_shadows { light_shadow(s, l, f.pos, n_l) } else { 1.0 };
-        let b = brdf(rgb, metallic, rough, m.specular_k, m.diffuse_k, n, v, to_l);
+        let b = brdf(rgb, metallic, rough, m.specular_k, m.diffuse_k, m.metal_k, n, v, to_l);
         for c in 0..3 {
             out[c] += b[c] * l.color[c] * k * sh;
         }
@@ -398,6 +408,7 @@ pub fn shade(s: &Scene, f: &Frag) -> Option<[f32; 4]> {
         let n_v = dot(n, v).clamp(1e-4, 1.0);
         let r = sub(scale(n, 2.0 * dot(n, v)), v);
         let (irr, spec) = env_light(s, e, n, r, rough);
+        let metallic = if m.direct_metal_only { 0.0 } else { metallic };
         let f0 = [mix(0.04 * m.specular_k, rgb[0], metallic), mix(0.04 * m.specular_k, rgb[1], metallic), mix(0.04 * m.specular_k, rgb[2], metallic)];
         let (a, b) = env_brdf(n_v, rough);
         for c in 0..3 {

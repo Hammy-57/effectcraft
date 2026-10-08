@@ -16,7 +16,7 @@ fn brdf_matches_cook_torrance_formula() {
     let v = shade::norm([0.3, 0.1, 1.0]);
     let l = shade::norm([-0.4, 0.2, 1.0]);
     let (base, metal, rough) = ([0.8, 0.4, 0.2], 0.3f32, 0.45f32);
-    let got = shade::brdf(base, metal, rough, 1.0, 1.0, n, v, l);
+    let got = shade::brdf(base, metal, rough, 1.0, 1.0, 1.0, n, v, l);
     let h = shade::norm([v[0] + l[0], v[1] + l[1], v[2] + l[2]]);
     let (nv, nl, nh, vh) = (shade::dot(n, v), shade::dot(n, l), shade::dot(n, h), shade::dot(v, h));
     let a2 = (rough * rough).powi(2);
@@ -30,9 +30,9 @@ fn brdf_matches_cook_torrance_formula() {
         assert!((got[c] - expect).abs() < 1e-5, "channel {c}: {} vs {expect}", got[c]);
     }
     // No light from behind the surface.
-    assert_eq!(shade::brdf(base, metal, rough, 1.0, 1.0, n, v, [0.0, 0.0, -1.0]), [0.0; 3]);
+    assert_eq!(shade::brdf(base, metal, rough, 1.0, 1.0, 1.0, n, v, [0.0, 0.0, -1.0]), [0.0; 3]);
     // A white rough dielectric lit head-on reflects about its base colour (π folded in).
-    let w = shade::brdf([1.0; 3], 0.0, 1.0, 1.0, 1.0, n, n, n);
+    let w = shade::brdf([1.0; 3], 0.0, 1.0, 1.0, 1.0, 1.0, n, n, n);
     assert!(w[0] > 0.95 && w[0] < 1.05, "{w:?}");
 }
 
@@ -609,4 +609,41 @@ fn ae_model_orientation_turns_z_first() {
         }
         p.comp_mut(cid).unwrap().layers.remove(0);
     }
+}
+
+/// Advanced 3D Material Options and light Intensity as measured with aerender (SceneYard Glass
+/// UI List's Metal 80 cards): an ambient light at 50 % lights a 50 % grey card to about 0.20 of
+/// its linear colour (Intensity^2.3), and a smooth (Shininess 90) full metal lit by a point light
+/// is far darker than the same dielectric, while a rough (Shininess 5) metal is brighter.
+#[test]
+fn card_metal_and_light_intensity_follow_after_effects() {
+    let shade = |metal: f64, shininess: f64, ambient: bool| {
+        let (mut p, cid) = project(120, 90);
+        let sid = p.add_item(
+            "S",
+            Default::default(),
+            None,
+            ItemKind::Solid(effectcraft_project::Solid { color: [0.5, 0.5, 0.5], width: 120, height: 90, pixel_aspect: 1.0 }),
+        );
+        add(&mut p, cid, LayerSource::Solid { item: sid }, |l| {
+            l.switches.three_d = true;
+            set(l, "materialOptions/metal", Value::Scalar(metal));
+            set(l, "materialOptions/specularShininess", Value::Scalar(shininess));
+        });
+        if ambient {
+            add(&mut p, cid, LayerSource::Light { kind: LightKind::Ambient }, |l| set(l, "lightOptions/intensity", Value::Scalar(50.0)));
+        } else {
+            add(&mut p, cid, LayerSource::Light { kind: LightKind::Point }, |l| {
+                set(l, "transform/position", Value::Vec3([60.0, 45.0, -300.0]));
+                set(l, "lightOptions/intensity", Value::Scalar(600.0));
+            });
+        }
+        render(&p, cid).data[45 * 120 + 20]
+    };
+    let lin = |v: f32| effectcraft_color::srgb_to_linear(v);
+    let amb = shade(0.0, 5.0, true);
+    assert!((lin(amb[0]) / lin(0.5) - 0.2).abs() < 0.03, "{amb:?}");
+    let (dielectric, smooth_metal, rough_metal) = (shade(0.0, 90.0, false), shade(100.0, 90.0, false), shade(100.0, 5.0, false));
+    assert!(smooth_metal[0] < dielectric[0] * 0.6, "{smooth_metal:?} vs {dielectric:?}");
+    assert!(rough_metal[0] > shade(0.0, 5.0, false)[0], "{rough_metal:?}");
 }
