@@ -247,8 +247,8 @@ fn draw_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &
 /// resident on the GPU (non-GPU effects read back, run on the CPU and upload), and the result
 /// replaces the canvas inside the layer's footprint × opacity. `None` = draw it on the CPU.
 fn draw_adjustment(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut GpuImage) -> Option<()> {
-    // A track matte on the adjustment layer is applied by the CPU path.
-    if r.track_matte(ctx, layer).is_some() {
+    // A track matte or a blending mode on the adjustment layer is applied by the CPU path.
+    if r.track_matte(ctx, layer).is_some() || layer.blend_mode != BlendMode::Normal {
         return None;
     }
     let opacity = r.layer_opacity(ctx, layer);

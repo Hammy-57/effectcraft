@@ -507,6 +507,25 @@ fn shape_layer_effect_points_use_the_comp_sized_canvas() {
     assert!(img.get(115, 50)[3] < 0.1, "{:?}", img.get(115, 50));
 }
 
+/// An adjustment layer's blending mode composites its result onto the layers below
+/// (SceneYard Billiard Balls: a white-to-black 4-Color Gradient adjustment in Overlay shades
+/// the felt; drawn as Normal it washed the frame out to grey). Invert turns 0.2 into 0.8, and
+/// Overlay of 0.8 on 0.2 is 2 × 0.2 × 0.8 = 0.32, not 0.8.
+#[test]
+fn adjustment_layer_blending_mode_applies() {
+    let (mut p, cid, comp) = setup();
+    let grey = solid(&mut p, &comp, [0.2, 0.2, 0.2], 200, 100);
+    let mut adj = solid(&mut p, &comp, [1.0, 1.0, 1.0], 200, 100);
+    adj.switches.adjustment = true;
+    adj.blend_mode = BlendMode::Overlay;
+    add_effect_200(&mut p, &mut adj, "ec.channel.invert", &[]);
+    let c = p.comp_mut(cid).unwrap();
+    c.layers.push(adj);
+    c.layers.push(grey);
+    let px = render_frame(&p, cid, Tick::ZERO, 1.0).get(100, 50);
+    assert!((px[0] - 0.32).abs() < 0.01, "overlay, not normal: {px:?}");
+}
+
 /// An adjustment layer's track matte limits where its effects apply (SceneYard UI Google
 /// search: a tint + blur adjustment only inside a rounded card, the rings outside stay sharp).
 #[test]
