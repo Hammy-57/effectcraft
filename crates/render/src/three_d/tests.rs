@@ -628,3 +628,27 @@ fn rig_orbit_keeps_distance_and_pan_moves_both() {
     let off = r.eye - r.poi;
     assert!(off.y.abs() / off.length() < 0.9999);
 }
+
+#[test]
+fn coplanar_layers_keep_stack_order_under_a_moving_camera_with_motion_blur() {
+    // Hand balance collage: a motion-blurred background under unblurred layers in the same
+    // plane hid them while the camera dollied (its sub-sample depths sorted it in front).
+    let (mut p, cid, comp) = setup();
+    let mut cam = camera(&mut p, &comp);
+    let pr = cam.props.prop_mut("transform/position").unwrap();
+    pr.keys = vec![
+        effectcraft_keyframe::Keyframe::new(Tick::ZERO, Value::Vec3([100.0, 50.0, -zoom()])),
+        effectcraft_keyframe::Keyframe::new(Tick::from_seconds_f64(1.0), Value::Vec3([100.0, 50.0, -zoom() + 600.0])),
+    ];
+    let top = solid3(&mut p, &comp, [1.0, 0.0, 0.0], 40, 40, [100.0, 50.0, 0.0]);
+    let mut bottom = solid3(&mut p, &comp, [0.0, 0.0, 1.0], 400, 200, [100.0, 50.0, 0.0]);
+    bottom.switches.motion_blur = true;
+    push(&mut p, cid, cam);
+    push(&mut p, cid, top);
+    push(&mut p, cid, bottom);
+    for t in [0.2, 0.5] {
+        let img = render_frame(&p, cid, Tick::from_seconds_f64(t), 1.0);
+        let c = img.get(100, 50);
+        assert!(c[0] > 0.99 && c[2] < 0.01, "t={t}: {c:?}");
+    }
+}
