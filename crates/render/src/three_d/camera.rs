@@ -283,13 +283,44 @@ pub fn auto_orient_3d(ctx: &EvalCtx, layer: &Layer, pos: Vec3) -> Option<Mat4> {
             if ctx.comp.active_camera(ctx.time).is_some_and(|c| in_parent_chain(ctx, c, layer.id)) {
                 return None;
             }
+            // The layer faces the camera upright in world space, whatever its parents' rotation
+            // (SceneYard Lucky Smile: icons parented to a ring tilted X -78°, Y -18° and spinning
+            // still face the camera upright in AE). The parents' rotation is divided out of the
+            // world-space billboard; their scale still applies.
             let eye = active_camera(ctx).eye;
-            let e = parent_world(ctx, layer).inverse().unwrap_or(Mat4::IDENTITY).apply(eye);
-            let d = pos - e;
-            (d.length() > 1e-9).then(|| basis_rotation(d, vec3(0.0, 1.0, 0.0)))
+            let parent = parent_world(ctx, layer);
+            let d = parent.apply(pos) - eye;
+            if d.length() <= 1e-9 {
+                return None;
+            }
+            let world = basis_rotation(d, vec3(0.0, 1.0, 0.0));
+            Some(rotation_only(&parent).transpose() * world)
         }
         _ => None,
     }
+}
+
+/// The rotation in a matrix's linear part (columns orthonormalised, X kept, then Y), identity
+/// when degenerate.
+fn rotation_only(m: &Mat4) -> Mat4 {
+    let x = m.apply_vec(vec3(1.0, 0.0, 0.0));
+    let y = m.apply_vec(vec3(0.0, 1.0, 0.0));
+    if x.length() < 1e-12 || y.length() < 1e-12 {
+        return Mat4::IDENTITY;
+    }
+    let x = x.normalize();
+    let y = y - x * y.dot(x);
+    if y.length() < 1e-12 {
+        return Mat4::IDENTITY;
+    }
+    let y = y.normalize();
+    // Keep the handedness of the original Z (a mirrored parent stays mirrored).
+    let z0 = m.apply_vec(vec3(0.0, 0.0, 1.0));
+    let mut z = x.cross(y);
+    if z.dot(z0) < 0.0 {
+        z *= -1.0;
+    }
+    Mat4([[x.x, y.x, z.x, 0.0], [x.y, y.y, z.y, 0.0], [x.z, y.z, z.z, 0.0], [0.0, 0.0, 0.0, 1.0]])
 }
 
 /// (eye, forward, down) in world space of a camera or light layer.

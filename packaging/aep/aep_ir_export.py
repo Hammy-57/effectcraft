@@ -19,6 +19,7 @@ from fontTools.ttLib import TTFont
 from py_aep.binary.chunk import ListChunk
 from py_aep.cos import CosName, Stream, cos_get
 from py_aep.models.layers.shape_layer import ShapeLayer
+from py_aep.models.layers.text_layer import TextLayer
 from py_aep.models.properties.gradient import Gradient
 from py_aep.models.properties.property_group import PropertyGroup
 from py_aep.models.text.ranges import _char_run_spans, _kern_run_spans, _para_run_spans, u16_len
@@ -283,15 +284,15 @@ class Exporter:
                 data["font_version"] = self.read(font, "version", scope + "/font_object") if font else None
                 data["font_file"] = self.font_file(data.get("font"), data["font_version"])
                 self.text_runs(obj, data, scope)
-            if cls == "Shape" and getattr(obj, "_is_mask", False) and isinstance(getattr(obj, "_layer", None), ShapeLayer):
-                # AE stores masks on shape layers in pixel space; py-aep also
-                # multiplies them by layer size as it does for footage masks.
+            if cls == "Shape" and getattr(obj, "_is_mask", False) and isinstance(getattr(obj, "_layer", None), (ShapeLayer, TextLayer)):
+                # AE stores masks on shape and text layers in pixel space; py-aep
+                # also multiplies them by layer size as it does for footage masks.
                 width, height = obj._layer.width, obj._layer.height
                 if width and height:
                     for field in ("vertices", "in_tangents", "out_tangents"):
                         data[field] = [[x / width, y / height] for x, y in data[field]]
                 else:
-                    self.loss(scope, "mask_unit_error", "shape layer has zero width or height")
+                    self.loss(scope, "mask_unit_error", "shape or text layer has zero width or height")
             return {"type": cls, "data": data}
         self.loss(scope, "opaque_value", cls)
         return {"type": "opaque", "class": cls, "repr": repr(obj)[:500]}

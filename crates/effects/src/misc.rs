@@ -66,7 +66,9 @@ fn directional(ctx: &EffectCtx, mut b: Buf) -> Buf {
     if !ctx.adjustment {
         b.pad(len.ceil() as u32 + 1);
     }
-    b.img = effectcraft_raster::directional_blur(&b.img, ctx.params.f("direction"), len);
+    // On an adjustment layer the frame edge repeats, as After Effects keeps it opaque (measured:
+    // a full-frame black solid under a 108 px Directional Blur adjustment stays black to the edge).
+    b.img = effectcraft_raster::directional_blur(&b.img, ctx.params.f("direction"), len, ctx.adjustment);
     b
 }
 

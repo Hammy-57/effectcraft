@@ -69,7 +69,14 @@ fn on_cpu(e: &mut Enc, canvas: &mut GpuImage, f: impl FnOnce(&mut Image)) -> Opt
 }
 
 fn draw_comp<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, canvas: &mut GpuImage) -> Option<()> {
-    let visible = r.visible_layers(ctx);
+    // Passes as on the CPU (Posterize Time adjustment layers hold what is below them).
+    for (ctx, visible) in r.draw_passes(ctx) {
+        draw_layers(e, r, &ctx, &visible, canvas)?;
+    }
+    Some(())
+}
+
+fn draw_layers<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, visible: &[&'a Layer], canvas: &mut GpuImage) -> Option<()> {
     let levels = r.pipe().levels;
     let mut i = 0;
     while i < visible.len() {

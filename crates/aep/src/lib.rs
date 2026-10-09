@@ -518,7 +518,7 @@ pub fn import_ir(
         if comp.layers.iter().any(|l| matches!(&l.source, LayerSource::Model { .. })) {
             comp.renderer = effectcraft_project::Renderer::Advanced3D;
         }
-        orient::advanced_orientation(&mut comp, &mut result.losses, &format!("comp {ae_id}"));
+        orient::ae_orientation(&mut comp, &mut result.losses, &format!("comp {ae_id}"));
         if let Some(i) = next.item_mut(id) {
             i.kind = ItemKind::Comp(Arc::new(comp));
         }
@@ -1195,6 +1195,7 @@ fn import_property(
             parent.match_id.as_str(),
             "transform"
                 | "text"
+                | "pathOptions"
                 | "mask"
                 | "audio"
                 | "materialOptions"
@@ -1222,9 +1223,11 @@ fn import_property(
             if matches!(prop.value, Value::Vec2(_) | Value::Vec3(_)) && matches!(match_id, "position" | "anchor") {
                 prop.spatial = true;
             }
-            // Casts / Accepts Shadows are zero-based in AE (0 Off, 1 On, 2 Only) where the
-            // generic popup adapter subtracts one.
-            if parent.match_id == "materialOptions" && matches!(match_id, "castsShadows" | "acceptsShadows") {
+            // Casts / Accepts Shadows and the text Path (0 None, k = mask k) are zero-based in
+            // AE where the generic popup adapter subtracts one.
+            if (parent.match_id == "materialOptions" && matches!(match_id, "castsShadows" | "acceptsShadows"))
+                || (parent.match_id == "pathOptions" && match_id == "path")
+            {
                 let f = |v: f64| v + 1.0;
                 let value = if let Value::Scalar(v) = value { Value::Scalar(f(v)) } else { value };
                 fill_property(prop, &remapped(ir, f), value, value_type, scale, layer_time, losses, context);
@@ -2117,6 +2120,35 @@ mod tests {
     }
 
     #[test]
+    fn text_path_options_import_onto_the_native_group() {
+        // SceneYard Money trap collage: "Money trap" runs along Mask 1 (AE Path = 1); it was
+        // dropped into an unrecognised group and the text sat straight.
+        let ir = serde_json::json!({"schema_version":1,"items":[{"id":1,"kind":"comp","name":"Main","width":400,"height":200,"duration":2,"layers":[
+            {"id":2,"kind":"text","name":"Money trap","properties":[
+                {"kind":"group","match_name":"ADBE Text Properties","children":[
+                    {"kind":"property","match_name":"ADBE Text Document","value":{"type":"TextDocument","data":{"text":"Money trap","font_size":100}}},
+                    {"kind":"group","match_name":"ADBE Text Path Options","children":[
+                        {"kind":"property","match_name":"ADBE Text Path","authored":true,"value":1},
+                        {"kind":"property","match_name":"ADBE Text Reverse Path","authored":true,"value":1.0},
+                        {"kind":"property","match_name":"ADBE Text Perpendicular To Path","authored":true,"value":0.0},
+                        {"kind":"property","match_name":"ADBE Text First Margin","authored":true,"value":12.0}
+                    ]}
+                ]}
+            ]}
+        ]}]});
+        let mut project = Project::default();
+        let result = import_ir(&mut project, ir.to_string().as_bytes(), "", &mut |_| None).unwrap();
+        let layer = &project.comp(result.item_ids[&1]).unwrap().layers[0];
+        let po = |id: &str| layer.props.prop(&format!("text/pathOptions/{id}")).map(|p| p.value.clone());
+        assert_eq!(po("path"), Some(Value::Enum(1)));
+        assert_eq!(po("reversePath"), Some(Value::Bool(true)));
+        assert_eq!(po("perpendicular"), Some(Value::Bool(false)));
+        assert_eq!(po("firstMargin"), Some(Value::Scalar(12.0)));
+        let text = layer.props.sub("text").unwrap();
+        assert_eq!(text.groups().filter(|g| g.match_id.contains("Path")).count(), 0);
+    }
+
+    #[test]
     fn model_layer_keeps_reference_and_declares_unverified_render() {
         let ir = serde_json::json!({"schema_version":1,"items":[
             {"id":1,"kind":"footage","name":"offline.glb","file":"offline.glb"},
@@ -2306,6 +2338,22 @@ mod tests {
         let opts = layer.props.sub("lightOptions").unwrap();
         assert_eq!(opts.get("intensity").unwrap().value.as_f64(), 100.0);
         assert_eq!(opts.get("AE intensity").unwrap().value.as_f64(), 600.0);
+    }
+
+    #[test]
+    fn classic_3d_orientation_is_rewritten_z_first() {
+        // SceneYard Chess Strategy (Classic 3D): the king's Orientation 180°, 0°, 287° composes Z
+        // first in AE; in EffectCraft's X-first order that is 180°, 0°, 73° (Rz·Rx(180) = Rx(180)·Rz(-z)).
+        let ir = serde_json::json!({"schema_version":1,"items":[{"id":1,"kind":"comp","name":"Main","width":100,"height":100,"duration":1,"renderer":"ADBE Advanced 3d","layers":[
+            {"id":2,"kind":"null","name":"king","switches":{"is_3d":true},"properties":[
+                {"kind":"group","match_name":"ADBE Transform Group","children":[{"kind":"property","match_name":"ADBE Orientation","value":[180.0,0.0,287.0]}]}
+            ]}
+        ]}]});
+        let mut project = Project::default();
+        let result = import_ir(&mut project, ir.to_string().as_bytes(), "", &mut |_| None).unwrap();
+        let layer = &project.comp(result.item_ids[&1]).unwrap().layers[0];
+        let Value::Vec3(o) = layer.props.prop("transform/orientation").unwrap().value else { panic!("orientation") };
+        assert!((o[0] - 180.0).abs() < 1e-6 && o[1].abs() < 1e-6 && (o[2] - 73.0).rem_euclid(360.0) < 1e-6, "{o:?}");
     }
 
     #[test]
