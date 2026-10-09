@@ -9,7 +9,7 @@
 //! - `assets`: every asset file (image, icon, font, LUT, audio, video…) has a complete
 //!   `<file>.attribution` sidecar and an entry in `ATTRIBUTION.md` (AGENTS.md §1).
 //! - `ico <out.ico> <in.png>…`: pack PNGs into a Windows `.ico` (used by `packaging/icons.sh`).
-//! - `ci`: fmt check, clippy -D warnings, tests, layers, assets, wasm.
+//! - `ci`: fmt check, clippy -D warnings, tests (`--profile ci`), layers, assets, wasm.
 //! - `ci --affected [--base REV] [--dry-run]`: the same gates for only the crates the change since
 //!   REV (default: the merge-base with `main`) can affect; see `affected.rs` and docs/testing.md.
 
@@ -408,8 +408,8 @@ fn serve_dir(dir: &std::path::Path, port: u16) -> Result<(), String> {
 fn ci() -> Result<(), String> {
     let cargo = env!("CARGO");
     run(Command::new(cargo).args(["fmt", "--check"]))?;
-    run(Command::new(cargo).args(["clippy", "--workspace", "--all-targets", "--release", "--", "-D", "warnings"]))?;
-    run(Command::new(cargo).args(["test", "--workspace", "--release"]))?;
+    run(Command::new(cargo).args(["clippy", "--workspace", "--all-targets", "--profile", "ci", "--", "-D", "warnings"]))?;
+    run(Command::new(cargo).args(["test", "--workspace", "--profile", "ci"]))?;
     layers()?;
     assets()?;
     wasm()

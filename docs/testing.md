@@ -51,6 +51,9 @@ Limits: a crate that reads a repo file at run time through a path that is not a 
 sources is not detected, and building a subset of packages can unify features differently from the
 whole workspace. Run the full `cargo xtask ci` before a release.
 
+`xtask ci` builds clippy and tests with `--profile ci` (release optimisation without LTO, 16 codegen
+units, output in `target/ci/`): fast to build, still optimised enough for the pixel and perf tests.
+
 ## What the tests cover
 
 - **Engine commands** (`crates/engine/src/tests*.rs`): every command family, including undo and
