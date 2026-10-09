@@ -592,6 +592,9 @@ impl Inner {
                 if let Some(img) = crate::layered::decode(path, &bytes, footage, op)? {
                     return Ok(img);
                 }
+                if let Some(img) = crate::avif::decode(path, &bytes, op)? {
+                    return Ok(img);
+                }
                 let img = image::load_from_memory(&bytes).map_err(|e| MediaError::Decode(format!("{path}: {e}")))?;
                 Ok(dynamic_to_image(&img, op))
             }

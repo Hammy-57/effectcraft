@@ -40,7 +40,6 @@ impl AlphaOp {
 }
 
 /// Convert a FilmCraft frame to an [`Image`].
-#[cfg(test)]
 pub(crate) fn frame_to_image(f: &VideoFrame, op: AlphaOp) -> Image {
     frame_to_image_in(f, op, Vec::new())
 }

@@ -343,10 +343,12 @@ pub(crate) fn import(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 /// Whether a file format states how its alpha is stored (PNG, GIF, WebP and PSD are straight by
-/// definition, OpenEXR premultiplied); TGA, TIFF and movies with alpha don't.
+/// definition, OpenEXR premultiplied, AVIF flags premultiplied alpha); TGA, TIFF and movies with
+/// alpha don't.
 fn alpha_is_labeled(path: &str, codec: &str) -> bool {
     let ext = std::path::Path::new(path).extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
-    matches!(ext.as_str(), "png" | "gif" | "webp" | "psd" | "psb" | "exr" | "svg" | "jpg" | "jpeg" | "ai" | "pdf" | "eps") || codec.eq_ignore_ascii_case("PSD")
+    matches!(ext.as_str(), "png" | "gif" | "webp" | "avif" | "psd" | "psb" | "exr" | "svg" | "jpg" | "jpeg" | "ai" | "pdf" | "eps")
+        || codec.eq_ignore_ascii_case("PSD")
 }
 
 /// Gaps in an image sequence's frame numbers ("missing frames 4–6, 9"), from the digit run at the
