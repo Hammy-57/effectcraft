@@ -22,6 +22,7 @@ EffectCraft is a clean-room, open-source, pure-Rust motion graphics and visual e
 - **Community links** (Help menu, About, header Discord button): https://discord.gg/artcraft, https://getartcraft.com, https://getartcraft.com/apps/effectcraft, https://github.com/storytold/effectcraft.
 - **Quality gates** before every commit: `cargo xtask ci` (fmt, clippy -D warnings, tests, layers, assets, wasm).
 - **Commits:** one task id per commit (`M6.3: trim paths`). Only green states.
+- parity.md cells hold the current state; append history to docs/parity-log.md (union-merged).
 
 ## Running and looking at the app
 - `cargo run -p effectcraft -- --control 9877` opens the desktop app with the JSON-lines control server (`docs/control-protocol.md`).
