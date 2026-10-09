@@ -28,8 +28,11 @@ Code, add a `.mcp.json` at the project root:
 
 This repository ships a ready-made [`.mcp.json`](../.mcp.json): `effectcraft` (headless, demo
 project loaded) and `effectcraft-app` (bridged to a desktop app started with `--control 9877`). Both
-run through `cargo run --release`, so the first start compiles; run
-`cargo build --release -p effectcraft-cli` once beforehand to avoid an MCP startup timeout.
+start through [`scripts/mcp.sh`](../scripts/mcp.sh), which keeps a release binary in `target/mcp`
+(its own target dir, so it never waits on another build's lock). Only the first start compiles in the
+foreground; after that the server starts at once, and when the sources are newer than the binary it
+rebuilds in the background (log: `target/mcp/build.log`), so reconnect (`/mcp`) to pick up the new
+build. On Windows, run `cargo build --release -p effectcraft-cli` and point `command` at the binary.
 
 You can also register it from the command line:
 `claude mcp add effectcraft -- /path/to/target/release/effectcraft-cli mcp`. Other clients (Claude
