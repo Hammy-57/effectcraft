@@ -69,6 +69,25 @@ pub(crate) fn bar_color(label: Color32, selected: bool) -> Color32 {
     Color32::from_rgb(mix(label.r()), mix(label.g()), mix(label.b()))
 }
 
+/// How far a layer bar's trim zones reach past its ends and into it, in points. After Effects'
+/// zones straddle each end, so the pointer needn't land inside the bar.
+const TRIM_OUTSIDE: f32 = 4.0;
+const TRIM_INSIDE: f32 = 5.0;
+
+/// A layer bar's body (drag to move) and its In/Out trim zones. Short bars keep their middle
+/// third as body; a bar too short for that is all trim zones (the Out one on top).
+fn trim_zones(bar: Rect) -> (Rect, Rect, Rect) {
+    let inside = TRIM_INSIDE.min(bar.width() / 3.0).max(0.0);
+    let in_r = Rect::from_min_max(pos2(bar.min.x - TRIM_OUTSIDE, bar.min.y), pos2(bar.min.x + inside, bar.max.y));
+    let out_r = Rect::from_min_max(pos2(bar.max.x - inside, bar.min.y), pos2(bar.max.x + TRIM_OUTSIDE, bar.max.y));
+    (bar.shrink2(vec2(inside, 0.0)), in_r, out_r)
+}
+
+/// The trim cursor over a layer bar's ends: the horizontal resize arrow.
+fn trim_cursor(ctx: &egui::Context) {
+    ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+}
+
 /// Darken part `r` of a layer bar and stripe it diagonally in its label colour (where the layer
 /// runs past its source). Only the visible part is drawn.
 fn stripes(p: &egui::Painter, r: Rect, label: Color32) {
@@ -2093,16 +2112,14 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     }
                     app.auto.add(&format!("timeline.layer.{}.bar", layer.id.0), bar, &layer.name);
                     // Interactions: move body, trim edges.
-                    let edge_w = 6.0;
-                    let body = ui.interact(bar.shrink2(vec2(edge_w, 0.0)), egui::Id::new(("bar", layer.id.0)), Sense::click_and_drag());
-                    let (in_r, out_r) =
-                        (Rect::from_min_max(bar.min, pos2(bar.min.x + edge_w, bar.max.y)), Rect::from_min_max(pos2(bar.max.x - edge_w, bar.min.y), bar.max));
+                    let (body_r, in_r, out_r) = trim_zones(bar);
+                    let body = ui.interact(body_r, egui::Id::new(("bar", layer.id.0)), Sense::click_and_drag());
                     let lin = ui.interact(in_r, egui::Id::new(("bar-in", layer.id.0)), Sense::drag());
                     let lout = ui.interact(out_r, egui::Id::new(("bar-out", layer.id.0)), Sense::drag());
                     app.auto.add(&format!("timeline.layer.{}.bar.in", layer.id.0), in_r, "Trim In");
                     app.auto.add(&format!("timeline.layer.{}.bar.out", layer.id.0), out_r, "Trim Out");
                     if lin.hovered() || lout.hovered() || lin.dragged() || lout.dragged() {
-                        ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                        trim_cursor(&ctx);
                     }
                     let shift = ui.input(|i| i.modifiers.shift);
                     if let Some(layers) = (body.clicked() && shift).then(|| shift_range(&ctx, cid, &comp, &rows, &selected, layer.id)).flatten() {
