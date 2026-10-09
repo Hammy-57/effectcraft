@@ -899,18 +899,18 @@ fn dims_xy(dim: u32) -> (f64, f64) {
 
 /// misc::glow with any Glow Operation and the Arbitrary Map.
 pub(crate) fn glow(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
-    let thr = ctx.params.f("threshold") as f32 / 100.0;
     let radius = ctx.params.f("radius") * b.scale;
     let intensity = ctx.params.f("intensity") as f32;
     let colors = ctx.params.e("colors");
     let (kx, ky) = dims_xy(ctx.params.e("glowDimensions"));
+    let s = (radius * effectcraft_effects::GLOW_SIGMA_PER_RADIUS).max(0.5);
     if !ctx.adjustment {
-        b.pad(e, (radius * 1.5).ceil() as u32 + 2)?;
+        b.pad(e, (s * 3.0).ceil() as u32 + 2)?;
     }
-    let mut p = Params::default();
-    p.u[0] = [(colors == 1) as u32, (ctx.params.e("based") == 0) as u32, ctx.params.e("colorLooping"), 0];
-    p.f[0] = [thr, ctx.params.f("colorLoops") as f32, (ctx.params.f("colorPhase") / 360.0) as f32, ctx.params.f("abMidpoint") as f32 / 100.0];
+    let mut p = crate::effects::glow_params(ctx);
     let bright = e.image(b.img.width, b.img.height);
+    e.pixels("glow_bright", &p, &b.img, None, &bright, None);
+    let mut blurred = gaussian_blur(e, &bright, s * kx, s * ky, false);
     if colors == 2 {
         // Arbitrary Map: Curves tables per channel (see effects::curves).
         let mut parts = ctx.params.s("arbitraryMap").split('|');
@@ -929,15 +929,15 @@ pub(crate) fn glow(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
         }
         p.f[1] = [offs[0], offs[1], offs[2], 0.0];
         let buf = e.data(&data);
-        e.pixels("fxs_glow_map", &p, &b.img, None, &bright, Some(&buf));
-    } else {
-        p.f[1] = ctx.params.color("colorA");
-        p.f[2] = ctx.params.color("colorB");
-        e.pixels("glow_bright", &p, &b.img, None, &bright, None);
+        let coloured = e.image(b.img.width, b.img.height);
+        e.pixels("fxs_glow_map", &p, &blurred, None, &coloured, Some(&buf));
+        blurred = coloured;
+    } else if colors == 1 {
+        let coloured = e.image(b.img.width, b.img.height);
+        e.pixels("glow_ab", &p, &blurred, None, &coloured, None);
+        blurred = coloured;
     }
-    let s = (radius / 2.0).max(0.5);
-    let blurred = gaussian_blur(e, &bright, s * kx, s * ky, false);
-    let operation = ctx.params.e("operation");
+    let operation = effectcraft_effects::glow_composite(ctx.params.e("operation"));
     let glow_op = effectcraft_effects::glow_operation(ctx);
     let mut p = Params::default();
     p.f[0][0] = intensity;
@@ -946,7 +946,7 @@ pub(crate) fn glow(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
         p.u[0][0] = ops::mode_id(glow_op);
         e.pixels("fxs_glow_op", &p, &b.img, Some(&blurred), &out, None);
     } else {
-        p.u[0][0] = operation.min(2);
+        p.u[0][0] = operation;
         e.pixels("glow_combine", &p, &b.img, Some(&blurred), &out, None);
     }
     b.img = out;

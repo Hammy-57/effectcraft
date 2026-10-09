@@ -359,8 +359,14 @@ fn glow_ab_t(l: f32) -> f32 {
     return pow(max(t, 0.0), log(0.5) / log(m));
 }
 
-// Glow bright pass. u[0].x = A & B colours; u[0].y = based on alpha; f[0].x = threshold;
-// f[1] = colour A; f[2] = colour B.
+// misc::glow_bright: the soft step at the threshold (f[0].x), misc::GLOW_KNEE wide, fading
+// out towards black.
+fn glow_step(v: f32) -> f32 {
+    return clamp((v - P.f[0].x) / 0.12 + 0.5, 0.0, 1.0) * clamp(v / 0.12, 0.0, 1.0);
+}
+
+// Glow bright pass (misc::glow). u[0].x = one value per pixel (A & B Colors, Arbitrary Map),
+// coloured after the blur; u[0].y = based on alpha; f[0].x = threshold.
 @compute @workgroup_size(16, 16)
 fn glow_bright(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dims = out_dims();
@@ -374,25 +380,41 @@ fn glow_bright(@builtin(global_invocation_id) gid: vec3<u32>) {
         textureStore(out, p, vec4<f32>(0.0));
         return;
     }
-    let thr = P.f[0].x;
-    var l = luminance(px.xyz / a);
-    if (P.u[0].y != 0u) {
-        l = a;
-    }
-    let k = clamp((l - thr) / max(1.0 - thr, 1e-3), 0.0, 1.0);
     if (P.u[0].x != 0u) {
-        let t = glow_ab_t(l);
-        let ca = P.f[1].xyz;
-        let cb = P.f[2].xyz;
-        let c = ca + (cb - ca) * t;
-        textureStore(out, p, vec4<f32>(c * k * a, k * a));
+        // The luminance, or the alpha channel.
+        var l = luminance(px.xyz / a);
+        if (P.u[0].y != 0u) {
+            l = a;
+        }
+        textureStore(out, p, vec4<f32>(glow_step(l) * a));
+    } else if (P.u[0].y != 0u) {
+        textureStore(out, p, px * glow_step(a));
     } else {
-        textureStore(out, p, px * k);
+        // Color Channels: each channel steps on its own.
+        let c = vec3<f32>(glow_step(px.x / a), glow_step(px.y / a), glow_step(px.z / a));
+        textureStore(out, p, vec4<f32>(c * a, max(max(c.x, c.y), c.z) * a));
     }
 }
 
-// Glow composite: original `src` with the blurred glow `aux`. u[0].x = 0 on top, 1 behind,
-// 2 none (glow only); f[0].x = intensity.
+// A & B Colors after the blur (misc::glow): the gradient at misc::glow_ab_position of the
+// blurred strength (alpha), premultiplied by it. Same f / u layout as `glow_bright`;
+// f[1] = colour A; f[2] = colour B.
+@compute @workgroup_size(16, 16)
+fn glow_ab(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dims = out_dims();
+    let p = vec2<i32>(gid.xy);
+    if (p.x >= dims.x || p.y >= dims.y) {
+        return;
+    }
+    let v = clamp(textureLoad(src, p, 0).w, 0.0, 1.0);
+    let t = 1.0 - glow_ab_t(v);
+    let c = P.f[1].xyz + (P.f[2].xyz - P.f[1].xyz) * t;
+    textureStore(out, p, vec4<f32>(c * v, v));
+}
+
+// Glow composite: original `src` with the blurred glow `aux`. u[0].x = misc::glow_composite:
+// 0 the glow over the original (Behind / None), 1 the glow behind it (On Top);
+// f[0].x = intensity.
 @compute @workgroup_size(16, 16)
 fn glow_combine(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dims = out_dims();
@@ -402,9 +424,7 @@ fn glow_combine(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     var o = textureLoad(src, p, 0);
     let g = textureLoad(aux, p, 0) * P.f[0].x;
-    if (P.u[0].x == 2u) {
-        o = g;
-    } else if (P.u[0].x == 1u) {
+    if (P.u[0].x == 1u) {
         let k = 1.0 - o.w;
         o = o + g * k;
     } else {

@@ -120,6 +120,45 @@ pub fn glow_ab_t(l: f32, looping: u32, loops: f32, phase: f32, mid: f32) -> f32 
     t.max(0.0).powf(0.5f32.ln() / m.ln())
 }
 
+/// Glow's Composite Original (0 On Top, 1 Behind, 2 None) as the composite it draws: 0 the glow
+/// over the original with the Glow Operation, 1 the glow only behind it. The option names where
+/// the original goes; None draws like Behind (aerender, SceneYard UI Envelope: Behind brightens
+/// the card itself, On Top leaves it as it was with a halo around it, None matches Behind to
+/// the pixel).
+pub fn glow_composite(operation: u32) -> u32 {
+    match operation {
+        0 => 1,
+        _ => 0,
+    }
+}
+
+/// Glow's Gaussian sigma per pixel of Glow Radius (aerender, SceneYard UI Envelope card at
+/// Radius 10, 100 and 300: the halo is a normalised Gaussian of the bright pass with sigma =
+/// radius / 2.75, rms under 0.004).
+pub const GLOW_SIGMA_PER_RADIUS: f64 = 1.0 / 2.75;
+
+/// Width of Glow Threshold's soft knee: the bright pass is `(v - threshold) / GLOW_KNEE + 0.5`
+/// clamped, nearly a step (aerender, SceneYard UI Envelope card: a red channel of 178 glows
+/// fully at thresholds 0 to 153, 0.84 / 0.62 / 0.44 at 166 / 173 / 179; a blue channel of 28
+/// glows 0.82 / 0.58 / 0.33 at thresholds 20 / 28 / 36).
+pub const GLOW_KNEE: f32 = 0.12;
+
+/// Glow's bright pass for value `v` (a colour channel, the luminance or the alpha) at
+/// `threshold` (0..1), see [`GLOW_KNEE`]. Values near black fade out over the knee's width, so
+/// black never glows (aerender, SceneYard UI Chatbot: black shapes at a threshold of 2.7% and
+/// Intensity 5.4 leave no halo).
+pub fn glow_bright(v: f32, threshold: f32) -> f32 {
+    ((v - threshold) / GLOW_KNEE + 0.5).clamp(0.0, 1.0) * (v / GLOW_KNEE).clamp(0.0, 1.0)
+}
+
+/// Position (0 = Color A, 1 = Color B) of Glow's A & B gradient for the blurred bright pass
+/// `b`: Color A is the bright end (aerender, SceneYard UI Envelope with red A and blue B: Sawtooth
+/// A>B is red where the glow is strong and blue where it fades, Triangle A>B>A is red at half
+/// strength and blue at both ends).
+pub fn glow_ab_position(b: f32, looping: u32, loops: f32, phase: f32, mid: f32) -> f32 {
+    1.0 - glow_ab_t(b, looping, loops, phase, mid)
+}
+
 /// Glow Operation options (blend modes the glow is applied with).
 pub const GLOW_OPERATIONS: [&str; 17] = [
     "Normal",
@@ -169,10 +208,16 @@ fn glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let ca = ctx.params.color("colorA");
     let cb = ctx.params.color("colorB");
     let (kx, ky) = dims_xy(ctx.params.e("glowDimensions"));
+    let s = (radius * GLOW_SIGMA_PER_RADIUS).max(0.5);
     if !ctx.adjustment {
-        b.pad((radius * 1.5).ceil() as u32 + 2);
+        b.pad((s * 3.0).ceil() as u32 + 2);
     }
-    // Bright pass.
+    // Bright pass: a soft step at the threshold (see `GLOW_KNEE`). A & B Colors and the Arbitrary
+    // Map glow by one value per pixel, the luminance or the alpha, coloured after the blur;
+    // Original Colors with Color Channels steps each channel on its own (aerender, SceneYard UI
+    // Envelope: a red card glows pure red at 60%; at 41.6% with A & B Colors only its yellow and
+    // white parts glow, whose luminance is over the threshold).
+    let scalar = use_colors || arbitrary.is_some();
     let mut bright = b.img.clone();
     bright.data.par_iter_mut().for_each(|px| {
         let a = px[3];
@@ -180,39 +225,46 @@ fn glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
             *px = [0.0; 4];
             return;
         }
-        // Glow Based On: brightness from the colours, or from the alpha channel.
-        let l = if alpha_based { a } else { luminance(px[0] / a, px[1] / a, px[2] / a) };
-        let k = ((l - thr) / (1.0 - thr).max(1e-3)).clamp(0.0, 1.0);
-        if let Some(map) = &arbitrary {
-            let t = glow_ab_t(l, looping, loops, phase, mid);
-            let c = map.iter().map(|cv| cv.as_ref().map_or(t, |cv| cv.eval(t))).collect::<Vec<f32>>();
-            *px = [c[0] * k * a, c[1] * k * a, c[2] * k * a, k * a];
-        } else if use_colors {
-            let t = glow_ab_t(l, looping, loops, phase, mid);
-            let c = [ca[0] + (cb[0] - ca[0]) * t, ca[1] + (cb[1] - ca[1]) * t, ca[2] + (cb[2] - ca[2]) * t];
-            *px = [c[0] * k * a, c[1] * k * a, c[2] * k * a, k * a];
+        if scalar {
+            let l = if alpha_based { a } else { luminance(px[0] / a, px[1] / a, px[2] / a) };
+            *px = [glow_bright(l, thr) * a; 4];
+        } else if alpha_based {
+            *px = px.map(|v| v * glow_bright(a, thr));
         } else {
-            *px = px.map(|v| v * k);
+            let [r, g, bl] = [px[0], px[1], px[2]].map(|v| glow_bright(v / a, thr));
+            *px = [r * a, g * a, bl * a, r.max(g).max(bl) * a];
         }
     });
-    let s = (radius / 2.0).max(0.5);
-    let blurred = gaussian_blur(&bright, s * kx, s * ky, false);
-    let mode = ctx.params.e("operation");
+    let mut blurred = gaussian_blur(&bright, s * kx, s * ky, false);
+    if scalar {
+        // The colour follows the blurred glow's strength, so A & B Colors run across the falloff.
+        blurred.data.par_iter_mut().for_each(|px| {
+            let v = px[3].clamp(0.0, 1.0);
+            let c = if let Some(map) = &arbitrary {
+                let t = glow_ab_t(v, looping, loops, phase, mid);
+                let c = map.iter().map(|cv| cv.as_ref().map_or(t, |cv| cv.eval(t))).collect::<Vec<f32>>();
+                [c.first().copied().unwrap_or(t), c.get(1).copied().unwrap_or(t), c.get(2).copied().unwrap_or(t)]
+            } else {
+                let t = glow_ab_position(v, looping, loops, phase, mid);
+                [ca[0] + (cb[0] - ca[0]) * t, ca[1] + (cb[1] - ca[1]) * t, ca[2] + (cb[2] - ca[2]) * t]
+            };
+            *px = [c[0] * v, c[1] * v, c[2] * v, v];
+        });
+    }
+    let mode = glow_composite(ctx.params.e("operation"));
     b.img.data.par_iter_mut().zip(blurred.data.par_iter()).for_each(|(o, g)| {
         let g = g.map(|v| v * intensity);
         match mode {
-            // Behind: the glow shows only where the original is transparent.
+            // On Top: the original over the glow, which shows only where it is transparent.
             1 => {
                 let k = 1.0 - o[3];
                 for c in 0..4 {
                     o[c] += g[c] * k;
                 }
             }
-            // None: the glow alone.
-            2 => *o = [g[0], g[1], g[2], g[3]],
-            // On Top with another Glow Operation: that blend mode.
+            // Behind / None with another Glow Operation: that blend mode.
             _ if glow_op != effectcraft_color::BlendMode::Add => *o = effectcraft_color::blend_pixel(glow_op, *o, g, 0.0),
-            // On Top: add (screen-like add on premultiplied colour; alpha grows by the glow's alpha).
+            // Behind / None: add (screen-like add on premultiplied colour; alpha grows by the glow's alpha).
             _ => {
                 for c in 0..3 {
                     o[c] += g[c];
@@ -824,7 +876,8 @@ pub fn specs() -> Vec<EffectSpec> {
                 p("threshold", "Glow Threshold", num(60.0), slider(0.0, 100.0, 0.0, 100.0, 1)),
                 p("radius", "Glow Radius", num(10.0), slider(0.0, 1000.0, 0.0, 100.0, 1)),
                 p("intensity", "Glow Intensity", num(1.0), slider(0.0, 255.0, 0.0, 4.0, 1)),
-                p("operation", "Composite Original", Value::Enum(0), popup(&["On Top", "Behind", "None"])),
+                // AE's default, Behind: the original behind the glow (see `glow_composite`).
+                p("operation", "Composite Original", Value::Enum(1), popup(&["On Top", "Behind", "None"])),
                 p("glowOperation", "Glow Operation", Value::Enum(1), popup(&GLOW_OPERATIONS)),
                 p("colors", "Glow Colors", Value::Enum(0), popup(&["Original Colors", "A & B Colors", "Arbitrary Map"])),
                 // Arbitrary Map: "red points | green points | blue points" (Curves format).
@@ -1022,6 +1075,13 @@ mod tests {
         assert_eq!(GLOW_OPERATIONS[1], "Add");
         // Multiply darkens around the square where Add brightens.
         let mul = run(&[("glowOperation", Value::Enum(2))]);
+        // Composite Original names where the original goes: On Top keeps the square as it was
+        // and only shows the glow around it (aerender, SceneYard UI Envelope).
+        let on_top = run(&[("operation", Value::Enum(0)), ("threshold", Value::Scalar(0.0))]);
+        let behind = run(&[("threshold", Value::Scalar(0.0))]);
+        let inside = scene().get(4, 4);
+        assert!((on_top.get(4, 4)[0] - inside[0]).abs() < 1e-4, "{:?} {inside:?}", on_top.get(4, 4));
+        assert!(behind.get(4, 4)[0] > inside[0] + 0.01, "{:?} {inside:?}", behind.get(4, 4));
         assert!(add.get(6, 12)[0] > 0.31 && mul.get(6, 12)[0] <= 0.3 + 1e-4, "{:?} {:?}", add.get(6, 12), mul.get(6, 12));
         assert_eq!(
             glow_operation(&EffectCtx {
@@ -1035,9 +1095,72 @@ mod tests {
             effectcraft_color::BlendMode::Add
         );
         // Arbitrary Map: the glow takes the mapped colour (here pure red for every brightness).
-        let red = run(&[("colors", Value::Enum(2)), ("arbitraryMap", Value::Str("0,1 1,1|0,0 1,0|0,0 1,0".into())), ("operation", Value::Enum(2))]);
+        let red = run(&[("colors", Value::Enum(2)), ("arbitraryMap", Value::Str("0,1 1,1|0,0 1,0|0,0 1,0".into()))]);
         let p = red.get(6, 12);
-        assert!(p[0] > 0.05 && p[1] < 1e-4 && p[2] < 1e-4, "{p:?}");
+        assert!(p[0] > 0.35 && (p[1] - 0.3).abs() < 1e-4 && (p[2] - 0.3).abs() < 1e-4, "{p:?}");
+    }
+
+    /// Measured with aerender on SceneYard UI Envelope's card (Composite Original None, which
+    /// draws like Behind): an edge whose channels clear the threshold glows like a normalised
+    /// Gaussian of a full-strength step with sigma = radius / 2.75 (half strength at the edge,
+    /// 0.42 / 0.34 / 0.20 / 0.05 at 8 / 16 / 32 / 64 px for Radius 100), channels under the
+    /// threshold do not glow, and the A & B colours run across the falloff from Color A where the
+    /// glow is strong.
+    #[test]
+    fn glow_matches_ae_falloff_and_ab_colours() {
+        let (w, h) = (360, 40);
+        let mut img = Image::new(w, h);
+        for y in 0..h {
+            for x in 0..180 {
+                img.set(x, y, [0.878, 0.937, 0.11, 1.0]);
+            }
+        }
+        let run = |vals: &[(&str, Value)]| {
+            let mut v = vec![("threshold", Value::Scalar(60.0)), ("radius", Value::Scalar(100.0)), ("glowDimensions", Value::Enum(1))];
+            v.extend_from_slice(vals);
+            run_fx("ec.stylize.glow", &v, img.clone(), 0.0, EffectEnv::default())
+        };
+        let out = run(&[]);
+        let at = |b: &Buf, x: i64| b.img.get(x + b.offset[0] as i64, 20 + b.offset[1] as i64);
+        for (d, ae) in [(8, 0.418), (16, 0.341), (32, 0.204), (64, 0.047)] {
+            let p = at(&out, 179 + d);
+            assert!((p[0] - ae).abs() < 0.03 && (p[1] - ae).abs() < 0.03 && p[2] < 1e-4, "{d}: {p:?}");
+        }
+        // The soft threshold: a channel just under it still glows a little, well under it not at all.
+        assert!((glow_bright(0.698, 0.702) - 0.47).abs() < 0.03 && (glow_bright(0.698, 0.651) - 0.89).abs() < 0.03);
+        assert_eq!(glow_bright(0.11, 0.6), 0.0);
+        assert_eq!(glow_bright(0.0, 0.0), 0.0);
+        // A & B Colors, Sawtooth A>B with red A and blue B: half-way at the edge, blue far out.
+        let ab = run(&[
+            ("colors", Value::Enum(1)),
+            ("colorLooping", Value::Enum(0)),
+            ("colorA", Value::Color([1.0, 0.0, 0.0, 1.0])),
+            ("colorB", Value::Color([0.0, 0.0, 1.0, 1.0])),
+        ]);
+        let near = at(&ab, 181);
+        let far = at(&ab, 240);
+        assert!(near[0] > 0.9 * near[2] && far[2] > 10.0 * far[0], "{near:?} {far:?}");
+        // Triangle A>B>A from black A to white B on an opaque dark shape glowing by its alpha
+        // (SceneYard phone animation's main rectangle): the inside stays dark, the edge glows.
+        let dark = Image::filled(w, h, [0.0, 0.0, 0.0, 0.0]);
+        let mut dark = dark;
+        for y in 0..h {
+            for x in 0..180 {
+                dark.set(x, y, [0.1, 0.1, 0.1, 1.0]);
+            }
+        }
+        let v = [
+            ("based", Value::Enum(0)),
+            ("threshold", Value::Scalar(57.6)),
+            ("radius", Value::Scalar(10.0)),
+            ("colors", Value::Enum(1)),
+            ("colorLooping", Value::Enum(2)),
+            ("colorA", Value::Color([1.0, 1.0, 1.0, 1.0])),
+            ("colorB", Value::Color([0.0, 0.0, 0.0, 1.0])),
+        ];
+        let rect = run_fx("ec.stylize.glow", &v, dark, 0.0, EffectEnv::default());
+        assert!(at(&rect, 90)[0] < 0.11, "{:?}", at(&rect, 90));
+        assert!(at(&rect, 180)[0] > 0.3, "{:?}", at(&rect, 180));
     }
 
     /// Measured with aerender (SceneYard Music app's pill, a 217 px wide dark red bar, Deep

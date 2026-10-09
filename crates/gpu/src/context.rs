@@ -23,6 +23,7 @@ const ENTRIES: &[&str] = &[
     "directional",
     "glow_bright",
     "glow_combine",
+    "glow_ab",
     "shadow_make",
     "shadow_combine",
     "pointwise",
