@@ -362,6 +362,33 @@ pub struct EffectEnv<'a> {
     pub bounds_origin: [f64; 2],
 }
 
+impl EffectEnv<'_> {
+    /// Layer units per comp pixel along the effect's x and y axes: `[1, 1]` unless the layer
+    /// runs its effects in comp space ([`Self::comp_space`]). A size measured in comp pixels
+    /// (a blur radius) times these is the size in layer units. For a rotated non-uniform scale
+    /// this is the size's spread along each layer axis (the marginal of the comp-space
+    /// footprint), exact for uniform scale with any rotation and for axis-aligned scale.
+    pub fn comp_px(&self) -> [f64; 2] {
+        let Some([[a, b, _], [d, e, _]]) = self.comp_space else { return [1.0, 1.0] };
+        let det = a * e - b * d;
+        let det2 = det * det;
+        if !det2.is_finite() || det2 < 1e-12 {
+            return [1.0, 1.0];
+        }
+        // Layer-space covariance of a unit comp-space footprint: (MᵀM)⁻¹.
+        let kx = ((b * b + e * e) / det2).sqrt();
+        let ky = ((a * a + d * d) / det2).sqrt();
+        if kx.is_finite() && ky.is_finite() { [kx, ky] } else { [1.0, 1.0] }
+    }
+}
+
+/// Gaussian Blur's standard deviation (pixels) for a Blurriness: measured on After Effects 2026
+/// (the edge of a blurred solid fits a Gaussian with σ = 0.280 × Blurriness for Blurriness 10 to
+/// 160).
+pub fn gaussian_sigma(blurriness: f64) -> f64 {
+    blurriness.max(0.0) * 0.28
+}
+
 /// What an effect gets to render with.
 pub struct EffectCtx<'a> {
     pub params: &'a Params,
