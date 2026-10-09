@@ -587,7 +587,8 @@ fn straight(px: vec4<f32>) -> vec3<f32> {
 //  7 Fill            f[0] = colour; f[1] = (opacity); u[0].y = invert
 //  8 Curves          f[0] = data offsets (rgb, red, green, blue), f[1].x = alpha (−1 = none)
 //  9 Gradient Ramp   f[0] = (sx, sy, ex, ey); f[1] = start colour; f[2] = end colour;
-//                    f[3] = (len2, scatter, blend); u[0] = (_, radial, seed)
+//                    f[3] = (len2, scatter, blend); u[0] = (_, radial, seed);
+//                    f[4], f[5] = rows of the pixel → ramp-space affine (comp space)
 // 10 Fractal Noise   f[0] = (contrast, brightness, scale x, frac); f[1] = (ox, oy, sr, cr);
 //                    f[2] = (evo, blend, opacity, scale y); f[3] = (sub influence, 1 / sub scaling);
 //                    u[0] = (_, kind, n_oct, seed); u[1] = (invert, overflow, normal blend)
@@ -784,7 +785,8 @@ fn pointwise(@builtin(global_invocation_id) gid: vec3<u32>) {
             let s = P.f[0].xy;
             let e = P.f[0].zw;
             let d = e - s;
-            let v = vec2<f32>(f32(p.x) + 0.5, f32(p.y) + 0.5) - s;
+            let pc = vec3<f32>(f32(p.x) + 0.5, f32(p.y) + 0.5, 1.0);
+            let v = vec2<f32>(dot(P.f[4].xyz, pc), dot(P.f[5].xyz, pc)) - s;
             let len2 = P.f[3].x;
             var t: f32;
             if (P.u[0].y != 0u) {

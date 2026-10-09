@@ -94,6 +94,7 @@ pub use stylize2::strobe_on;
 // CPU helpers the GPU kernels share (effectcraft-gpu).
 pub use blur2::{camera_lens_plain, camera_lens_spans};
 pub use generate::gen_mode;
+pub use generate::gradient_ramp_space;
 pub use generate2::pattern_kind as cell_pattern_kind;
 pub use generate2::{BoltSeg, Contour, Ghost, RadioPlan, SweepGeometry, Wave, flare_ghosts, light_sweep_geometry, lightning_segments, radio_plan};
 pub use generate3::{

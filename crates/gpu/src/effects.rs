@@ -475,8 +475,7 @@ fn pointwise(e: &mut Enc, id: &str, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
             p.f[1][0] = f("opacity") as f32 / 100.0;
         }
         "ec.generate.gradientramp" => {
-            let s = b.to_px(ctx.params.v2("start"));
-            let en = b.to_px(ctx.params.v2("end"));
+            let (m, s, en) = effectcraft_effects::gradient_ramp_space(ctx, b.offset, b.scale);
             let (dx, dy) = (en.0 - s.0, en.1 - s.1);
             let len2 = (dx * dx + dy * dy).max(1e-9);
             p.u[0] = [9, (ctx.params.e("shape") == 1) as u32, ctx.seed, 0];
@@ -484,6 +483,8 @@ fn pointwise(e: &mut Enc, id: &str, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
             p.f[1] = rgb(ctx.params.color("startColor"));
             p.f[2] = rgb(ctx.params.color("endColor"));
             p.f[3] = [len2 as f32, f("scatter") as f32 / 512.0, f("blend") as f32 / 100.0, 0.0];
+            p.f[4] = [m[0][0] as f32, m[0][1] as f32, m[0][2] as f32, 0.0];
+            p.f[5] = [m[1][0] as f32, m[1][1] as f32, m[1][2] as f32, 0.0];
         }
         "ec.noise.fractal" => {
             // The shader covers Soft Linear noise, the Basic / Turbulent Smooth / Turbulent Basic
