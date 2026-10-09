@@ -1,9 +1,37 @@
 //! Optional owner-local artwork. Missing or malformed assets retain the built-in UI.
+//!
+//! The artwork never ships with EffectCraft: it is read from a per-user folder outside any
+//! checkout, so every build on the owner's machine (any branch or worktree) shows it by default.
+//! `EFFECTCRAFT_ICON_REFERENCE` (the toolbar `native-icons.alpha`, with `extra/` beside it)
+//! overrides the folder.
 use egui::{Color32, Context, Painter, Rect, TextureHandle};
 use std::io::Read;
+use std::path::PathBuf;
+
+/// The per-user owner-asset folder: `~/Library/Application Support/EffectCraft/owner-assets`
+/// on macOS, `%APPDATA%\EffectCraft\owner-assets` on Windows, `~/.local/share/effectcraft/owner-assets` elsewhere.
+fn owner_assets_dir() -> Option<PathBuf> {
+    if cfg!(target_os = "windows") {
+        return Some(PathBuf::from(std::env::var_os("APPDATA")?).join("EffectCraft").join("owner-assets"));
+    }
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    if cfg!(target_os = "macos") {
+        Some(home.join("Library/Application Support/EffectCraft/owner-assets"))
+    } else {
+        Some(home.join(".local/share/effectcraft/owner-assets"))
+    }
+}
+
+/// The toolbar glyph atlas (`native-icons.alpha`): the override when set, else the owner-asset folder's.
+pub(crate) fn reference_atlas() -> Option<PathBuf> {
+    match std::env::var_os("EFFECTCRAFT_ICON_REFERENCE") {
+        Some(path) => Some(PathBuf::from(path)),
+        None => Some(owner_assets_dir()?.join("native-icons.alpha")),
+    }
+}
 
 fn read_image(name: &str) -> Option<image::RgbaImage> {
-    let root = std::path::PathBuf::from(std::env::var_os("EFFECTCRAFT_ICON_REFERENCE")?);
+    let root = reference_atlas()?;
     let path = root.parent()?.join("extra").join(format!("{name}.png"));
     let mut bytes = Vec::new();
     std::fs::File::open(path).ok()?.take(262145).read_to_end(&mut bytes).ok()?;
