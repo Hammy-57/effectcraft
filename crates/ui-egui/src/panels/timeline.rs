@@ -400,6 +400,9 @@ const GUTTER_W: f32 = 18.0;
 /// The most a time ruler zooms in (pixels per second).
 const MAX_PPS: f64 = 4000.0;
 
+/// One `=` / `-` step (and one click on the footer's zoom buttons).
+pub(crate) const ZOOM_STEP: f64 = 1.5;
+
 /// Pixels per second that fit `comp` in a time graph `width` points wide.
 fn fit_pps(width: f32, comp: &Comp) -> f64 {
     (width - 10.0).max(1.0) as f64 / comp.duration.seconds().max(0.01)
@@ -2733,24 +2736,35 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     );
     // Zoom slider.
     let zs = Rect::from_min_max(pos2(graph_x0 + 30.0, footer.center().y - 2.0), pos2((graph_x0 + 230.0).min(rect.max.x - 30.0), footer.center().y + 2.0));
-    icons::paint(&p, Rect::from_center_size(pos2(zs.min.x - 14.0, footer.center().y), vec2(14.0, 14.0)), Icon::MountainSmall, t.text_dim);
-    icons::paint(&p, Rect::from_center_size(pos2(zs.max.x + 14.0, footer.center().y), vec2(16.0, 16.0)), Icon::MountainLarge, t.text_dim);
+    // Zoom out / zoom in buttons either side of the slider: the `-` / `=` steps. Everything here
+    // zooms around the CTI and sets the one time zoom the layer bars and the Graph Editor share.
+    let cti = time.seconds();
+    let cti_px = (cti - tm.start) * pps;
+    for (icon, size, cx, id, tip, k) in [
+        (Icon::MountainSmall, 14.0, zs.min.x - 14.0, "timeline.zoomOutButton", "Zoom Out (Time)", 1.0 / ZOOM_STEP),
+        (Icon::MountainLarge, 16.0, zs.max.x + 14.0, "timeline.zoomInButton", "Zoom In (Time)", ZOOM_STEP),
+    ] {
+        let r = Rect::from_center_size(pos2(cx, footer.center().y), vec2(20.0, 20.0));
+        let resp = ui.interact(r, egui::Id::new(id), Sense::click()).on_hover_text(crate::i18n::tr(tip));
+        icons::paint(&p, Rect::from_center_size(r.center(), vec2(size, size)), icon, if resp.hovered() { t.text } else { t.text_dim });
+        app.auto.add(id, r, tip);
+        if resp.clicked() {
+            set_zoom(&mut app.ui.timeline, &comp, pps * k, fit_pps, cti, cti_px);
+        }
+    }
     p.rect_filled(zs, 2.0, t.field_bg);
-    let maxpps = MAX_PPS;
+    let maxpps = MAX_PPS.max(fit_pps * 1.001);
     let frac = ((pps / fit_pps).ln() / (maxpps / fit_pps).ln()).clamp(0.0, 1.0) as f32;
     let knob = pos2(zs.min.x + zs.width() * frac, zs.center().y);
     p.circle_filled(knob, 6.0, t.text);
-    let zresp = ui.interact(zs.expand2(vec2(6.0, 8.0)), egui::Id::new("tl-zoom"), Sense::drag());
+    // Drag the knob, or click the track to jump there.
+    let zresp = ui.interact(zs.expand2(vec2(6.0, 8.0)), egui::Id::new("tl-zoom"), Sense::click_and_drag());
     app.auto.add("timeline.zoomSlider", zs, "Zoom");
-    if zresp.dragged()
+    if (zresp.dragged() || zresp.clicked())
         && let Some(pt) = zresp.interact_pointer_pos()
     {
-        let f = ((pt.x - zs.min.x) / zs.width()).clamp(0.0, 1.0) as f64;
-        let npps = fit_pps * (maxpps / fit_pps).powf(f);
-        let cti = time.seconds();
-        let rel = (cti - tm.start) * pps;
-        app.ui.timeline.start = (cti - rel / npps).max(0.0);
-        app.ui.timeline.pps = Some(npps);
+        let f = ((pt.x - zs.min.x) / zs.width().max(1.0)).clamp(0.0, 1.0) as f64;
+        set_zoom(&mut app.ui.timeline, &comp, fit_pps * (maxpps / fit_pps).powf(f), fit_pps, cti, cti_px);
     }
 
     // Composition markers in the ruler; protected regions shade the layer rows.
