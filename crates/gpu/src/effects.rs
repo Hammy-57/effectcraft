@@ -283,6 +283,7 @@ fn directional(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     let n = (len.ceil() as usize * 2 + 1).clamp(3, 257);
     let mut p = Params::default();
     p.f[0] = [a.sin() as f32, -a.cos() as f32, len as f32, n as f32];
+    p.u[0][0] = ctx.adjustment as u32;
     let out = e.scratch(b.img.width, b.img.height);
     e.pixels("directional", &p, &b.img, None, &out, None);
     b.img = out;

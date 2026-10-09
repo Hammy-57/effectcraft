@@ -316,7 +316,7 @@ fn box_v(@builtin(global_invocation_id) gid: vec3<u32>) {
     box_pass(gid, false);
 }
 
-// Directional blur (raster::directional_blur). f[0] = (dx, dy, length, samples).
+// Directional blur (raster::directional_blur). f[0] = (dx, dy, length, samples); u[0].x = repeat edges.
 @compute @workgroup_size(16, 16)
 fn directional(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dims = out_dims();
@@ -331,7 +331,13 @@ fn directional(@builtin(global_invocation_id) gid: vec3<u32>) {
     var acc = vec4<f32>(0.0);
     for (var i = 0; i < n; i++) {
         let t = (f32(i) / f32(n - 1) - 0.5) * len;
-        acc += sample_bilinear(src, f32(p.x) + 0.5 + dx * t, f32(p.y) + 0.5 + dy * t);
+        let sx = f32(p.x) + 0.5 + dx * t;
+        let sy = f32(p.y) + 0.5 + dy * t;
+        if (P.u[0].x != 0u) {
+            acc += sample_bilinear_clamped(src, sx, sy);
+        } else {
+            acc += sample_bilinear(src, sx, sy);
+        }
     }
     textureStore(out, p, acc / f32(n));
 }
