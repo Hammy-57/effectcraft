@@ -548,7 +548,7 @@ pub fn invoke(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: V
             app.ui.viewer.fast_preview = on;
         }
         "timeline.zoomIn" | "timeline.zoomOut" => {
-            let k = if id == "timeline.zoomIn" { 1.5 } else { 1.0 / 1.5 };
+            let k = if id == "timeline.zoomIn" { crate::panels::timeline::ZOOM_STEP } else { 1.0 / crate::panels::timeline::ZOOM_STEP };
             crate::panels::timeline::zoom(app, ctx, k);
             return Ok(Value::Null);
         }
