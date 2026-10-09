@@ -77,7 +77,7 @@ pub use color_fx::{
 };
 pub use color2::{Curve, auto_correct_settings, color_link_mode, color_link_sample, equalize_tables, luma_clip_points, shadow_highlight_amounts};
 pub use color3::OffsetCurve;
-pub use distort::{BULGE_STRENGTH, transform_effect_matrix, transform_extent, transform_shutter};
+pub use distort::{BULGE_STRENGTH, transform_effect_matrix, transform_extent, transform_shutter, twirl_radius, wave_warp_cycles};
 pub use distort2::{MAGNIFY_MODES, bezier_grid, parse_mesh};
 pub use distort3::{RESHAPE_POINTS, ReshapeSetup, SmearSetup, reshape_setup, smear_setup, warp_inverse_map};
 pub use distort4::liquify_mesh;
@@ -85,6 +85,7 @@ use effectcraft_keyframe::Value;
 use effectcraft_project::build::Ids;
 use effectcraft_project::{GroupKind, ParamUi, PropGroup, Property};
 pub use effectcraft_raster::{AuxChannels, Image};
+pub use generate::four_color_softening;
 pub use misc::{
     GLOW_KNEE, GLOW_OPERATIONS, GLOW_SIGMA_PER_RADIUS, INVERT_ALPHA, INVERT_CHANNELS, glow_ab_position, glow_ab_t, glow_bright, glow_composite, glow_operation,
 };
@@ -95,6 +96,7 @@ pub use stylize2::strobe_on;
 // CPU helpers the GPU kernels share (effectcraft-gpu).
 pub use blur2::{camera_lens_plain, camera_lens_spans};
 pub use generate::gen_mode;
+pub use generate::gradient_ramp_space;
 pub use generate2::pattern_kind as cell_pattern_kind;
 pub use generate2::{BoltSeg, Contour, Ghost, RadioPlan, SweepGeometry, Wave, flare_ghosts, light_sweep_geometry, lightning_segments, radio_plan};
 pub use generate3::{
@@ -362,6 +364,33 @@ pub struct EffectEnv<'a> {
     /// centred on their origin (−w/2, −h/2). Edge pinning measures from these bounds
     /// ([`util::pin_rect`]).
     pub bounds_origin: [f64; 2],
+}
+
+impl EffectEnv<'_> {
+    /// Layer units per comp pixel along the effect's x and y axes: `[1, 1]` unless the layer
+    /// runs its effects in comp space ([`Self::comp_space`]). A size measured in comp pixels
+    /// (a blur radius) times these is the size in layer units. For a rotated non-uniform scale
+    /// this is the size's spread along each layer axis (the marginal of the comp-space
+    /// footprint), exact for uniform scale with any rotation and for axis-aligned scale.
+    pub fn comp_px(&self) -> [f64; 2] {
+        let Some([[a, b, _], [d, e, _]]) = self.comp_space else { return [1.0, 1.0] };
+        let det = a * e - b * d;
+        let det2 = det * det;
+        if !det2.is_finite() || det2 < 1e-12 {
+            return [1.0, 1.0];
+        }
+        // Layer-space covariance of a unit comp-space footprint: (MᵀM)⁻¹.
+        let kx = ((b * b + e * e) / det2).sqrt();
+        let ky = ((a * a + d * d) / det2).sqrt();
+        if kx.is_finite() && ky.is_finite() { [kx, ky] } else { [1.0, 1.0] }
+    }
+}
+
+/// Gaussian Blur's standard deviation (pixels) for a Blurriness: measured on After Effects 2026
+/// (the edge of a blurred solid fits a Gaussian with σ = 0.280 × Blurriness for Blurriness 10 to
+/// 160).
+pub fn gaussian_sigma(blurriness: f64) -> f64 {
+    blurriness.max(0.0) * 0.28
 }
 
 /// What an effect gets to render with.

@@ -73,6 +73,22 @@ fn boolean(j: &Json, keys: &[&str]) -> Option<bool> {
 fn tick(s: f64) -> Tick {
     Tick::from_seconds_f64(s)
 }
+/// AE saves a rate as the float of the decimal it shows (23.976 is 23.9759979…) and its frame
+/// grid is that decimal (2997/125), not NTSC's 24000/1001: layer cuts at 3.003003 s (frame 72)
+/// would land 3 µs after an x/1001 frame start and show the previous shot.
+fn ae_frame_rate(fps: Option<f64>) -> FrameRate {
+    match fps.filter(|v| (0.001..=10_000.0).contains(v)) {
+        Some(v) => FrameRate::new((v * 1000.0).round() as i64, 1000),
+        None => FrameRate::FPS_30,
+    }
+}
+/// Seconds to ticks, on `rate`'s frame start when within 1 µs of one: rates like 2997/125 have
+/// no exact tick per frame, and a rounded cut a tick after the frame start would miss the frame.
+fn frame_tick(s: f64, rate: FrameRate) -> Tick {
+    let t = tick(s);
+    let frame = rate.snap_nearest(t);
+    if (t - frame).abs() <= Tick::from_units(1, 1_000_000) { frame } else { t }
+}
 /// AE property key times are composition times; native properties use layer time.
 #[derive(Clone, Copy)]
 struct LayerTime {
@@ -171,7 +187,7 @@ pub fn import_ir(
             continue;
         } // EffectCraft's root folder is implicit.
         let (w, h) = dimensions(item);
-        let rate = FrameRate::from_f64(number(item, &["frame_rate"]).filter(|v| *v > 0.0).unwrap_or(30.0));
+        let rate = ae_frame_rate(number(item, &["frame_rate"]));
         let duration = tick(number(item, &["duration"]).unwrap_or(0.0).max(0.0));
         let native = match kind {
             "folder" => ItemKind::Folder,
@@ -338,8 +354,8 @@ pub fn import_ir(
             layer.name = name.to_owned();
             let timing = ir.get("timing").unwrap_or(ir);
             layer.start_time = tick(number(timing, &["start_time"]).unwrap_or(0.0));
-            layer.in_point = tick(number(timing, &["in_point"]).unwrap_or(0.0));
-            layer.out_point = tick(number(timing, &["out_point"]).unwrap_or(comp.duration.seconds()));
+            layer.in_point = frame_tick(number(timing, &["in_point"]).unwrap_or(0.0), comp.frame_rate);
+            layer.out_point = frame_tick(number(timing, &["out_point"]).unwrap_or(comp.duration.seconds()), comp.frame_rate);
             layer.stretch = number(timing, &["stretch"]).filter(|v| v.abs() > f64::EPSILON).unwrap_or(100.0);
             if let Some(sw) = ir.get("switches") {
                 apply_switches(sw, &mut layer.switches);
@@ -2408,6 +2424,60 @@ mod tests {
         assert!(matches!(layer.props.sub("masks").unwrap().sub("mask").unwrap().kind, GroupKind::Mask { .. }));
         let image = effectcraft_render::render_frame(&project, result.primary_comp.unwrap(), Tick::ZERO, 1.0);
         assert!(image.data.iter().any(|pixel| pixel[3] > 0.5));
+    }
+
+    #[test]
+    fn shape_repeater_transform_imports_offset_scale_and_opacity() {
+        // SceneYard UI Calendar Task: the dots repeat 196 px apart, not at the native 100 px default.
+        let ir = serde_json::json!({"schema_version":1,"items":[{"id":1,"kind":"comp","name":"Main","width":400,"height":100,"duration":1,"layers":[
+            {"id":2,"kind":"ShapeLayer","name":"Dots","properties":[{"kind":"group","match_name":"ADBE Root Vectors Group","children":[
+                {"kind":"group","match_name":"ADBE Vector Shape - Ellipse","children":[{"kind":"property","match_name":"ADBE Vector Ellipse Size","value":[10,10]}]},
+                {"kind":"group","match_name":"ADBE Vector Graphic - Fill","children":[{"kind":"property","match_name":"ADBE Vector Fill Color","value":[1,1,1,1]}]},
+                {"kind":"group","match_name":"ADBE Vector Filter - Repeater","children":[
+                    {"kind":"property","match_name":"ADBE Vector Repeater Copies","value":2},
+                    {"kind":"group","match_name":"ADBE Vector Repeater Transform","children":[
+                        {"kind":"property","match_name":"ADBE Vector Repeater Anchor","value":[0,0]},
+                        {"kind":"property","match_name":"ADBE Vector Repeater Position","value":[196,0]},
+                        {"kind":"property","match_name":"ADBE Vector Repeater Scale","value":[50,50]},
+                        {"kind":"property","match_name":"ADBE Vector Repeater Rotation","value":15},
+                        {"kind":"property","match_name":"ADBE Vector Repeater Opacity 1","value":40},
+                        {"kind":"property","match_name":"ADBE Vector Repeater Opacity 2","value":80}
+                    ]}
+                ]}
+            ]}]}
+        ]}]});
+        let mut project = Project::default();
+        let result = import_ir(&mut project, ir.to_string().as_bytes(), "", &mut |_| None).unwrap();
+        let layer = &project.comp(result.primary_comp.unwrap()).unwrap().layers[0];
+        let transform = layer.props.sub("contents").unwrap().sub("repeater").unwrap().sub("transform").unwrap();
+        assert_eq!(transform.prop("position").unwrap().value, Value::Vec2([196.0, 0.0]));
+        assert_eq!(transform.prop("anchor").unwrap().value, Value::Vec2([0.0, 0.0]));
+        assert_eq!(transform.prop("scale").unwrap().value, Value::Vec2([50.0, 50.0]));
+        assert_eq!(transform.prop("rotation").unwrap().value.as_f64(), 15.0);
+        assert_eq!(transform.prop("startOpacity").unwrap().value.as_f64(), 40.0);
+        assert_eq!(transform.prop("endOpacity").unwrap().value.as_f64(), 80.0);
+    }
+
+    #[test]
+    fn ntsc_comp_rate_keeps_ae_decimal_grid() {
+        // SceneYard TV Channel Glitch cuts cameras at 3.003003 s = frame 72 of AE's 23.976 fps.
+        let ir = serde_json::json!({"schema_version":1,"items":[{"id":1,"kind":"comp","name":"Main","width":100,"height":100,"duration":5,"frame_rate":23.9759979248,"layers":[
+            {"id":2,"kind":"ShapeLayer","name":"Camera 2","timing":{"start_time":0,"in_point":1.5015015015015014,"out_point":3.003003003}},
+            {"id":3,"kind":"ShapeLayer","name":"Camera 3","timing":{"start_time":3.003003003,"in_point":3.003003003,"out_point":5}}
+        ]}]});
+        let mut project = Project::default();
+        let result = import_ir(&mut project, ir.to_string().as_bytes(), "", &mut |_| None).unwrap();
+        let comp = project.comp(result.primary_comp.unwrap()).unwrap();
+        assert_eq!(comp.frame_rate, FrameRate::new(2997, 125));
+        let (before, cut) = (comp.frame_rate.tick_of(71), comp.frame_rate.tick_of(72));
+        let layer = |name: &str| comp.layers.iter().find(|l| l.name == name).unwrap();
+        assert!(layer("Camera 2").is_active_at(before) && !layer("Camera 2").is_active_at(cut));
+        assert!(!layer("Camera 3").is_active_at(before) && layer("Camera 3").is_active_at(cut));
+        assert!(layer("Camera 3").is_active_at(Tick::from_seconds_f64(72.0 / comp.frame_rate.as_f64())));
+        assert_eq!(ae_frame_rate(Some(29.9699993134)), FrameRate::new(2997, 100));
+        assert_eq!(ae_frame_rate(Some(f64::INFINITY)), FrameRate::FPS_30);
+        assert_eq!(ae_frame_rate(Some(1e300)), FrameRate::FPS_30);
+        assert_eq!(ae_frame_rate(Some(0.0)), FrameRate::FPS_30);
     }
 
     #[test]

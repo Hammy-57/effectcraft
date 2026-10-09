@@ -25,10 +25,23 @@ fn remap(src: &Image, repeat: bool, f: impl Fn(f64, f64) -> (f64, f64) + Sync) -
     out
 }
 
+/// Twirl's radius in buffer pixels: Twirl Radius is a percentage of the larger dimension of
+/// the effect's input, so after a growing Motion Tile it spans the tiled canvas. The 1.035 is
+/// measured: After Effects renders of Liquid Glass (2560 and 7680 px inputs) put the rim there.
+pub fn twirl_radius(pct: f64, buf_w: u32, buf_h: u32) -> f64 {
+    (pct / 100.0 * f64::from(buf_w.max(buf_h)) * 1.035).max(1.0)
+}
+
+/// Twirl's share of Angle at normalised distance `t` = 1 - d / radius: a smoothstep, so the
+/// rotation eases out to nothing at the rim (fitted to After Effects at 90°, 360° and 720°).
+#[inline]
+pub(crate) fn twirl_falloff(t: f64) -> f64 {
+    t * t * (3.0 - 2.0 * t)
+}
+
 fn twirl(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let ang = ctx.params.f("angle").to_radians();
-    // Twirl Radius is a percentage of the layer's larger dimension: 50 reaches the edges.
-    let r = (ctx.params.f("radius") / 100.0 * b.layer_w(ctx).max(b.layer_h(ctx)) * b.scale).max(1.0);
+    let r = twirl_radius(ctx.params.f("radius"), b.img.width, b.img.height);
     let c = b.to_px(ctx.params.v2("center"));
     b.img = remap(&b.img, false, |x, y| {
         let (dx, dy) = (x - c.0, y - c.1);
@@ -36,8 +49,7 @@ fn twirl(ctx: &EffectCtx, mut b: Buf) -> Buf {
         if d >= r {
             return (x, y);
         }
-        let t = 1.0 - d / r;
-        let a = -ang * t * t;
+        let a = -ang * twirl_falloff(1.0 - d / r);
         let (s, co) = a.sin_cos();
         (c.0 + dx * co - dy * s, c.1 + dx * s + dy * co)
     });
@@ -160,25 +172,36 @@ fn wave_pin(pin: u32, x: f64, y: f64, rect: (f64, f64, f64, f64)) -> f64 {
     }
 }
 
+/// Wave Warp's wave phase in cycles at input-buffer pixel (x, y): one wave (crest and trough)
+/// spans twice Wave Width, measured from the input's top-left, and the waves move with time
+/// (`time * speed` cycles subtracted). Fitted to After Effects renders of SceneYard Liquid
+/// Glass (Sine, Square and Circle at three times): 1× Wave Width packed twice the waves and
+/// drifted the wrong way.
+pub fn wave_warp_cycles(x: f64, y: f64, dir: (f64, f64), width: f64, phase_deg: f64, time: f64, speed: f64) -> f64 {
+    (x * dir.0 + y * dir.1) / (2.0 * width) + phase_deg / 360.0 - time * speed
+}
+
 fn wave_warp(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let h = ctx.params.f("height") * b.scale;
     let w = (ctx.params.f("width") * b.scale).max(1.0);
     let dir = ctx.params.f("direction").to_radians();
-    let speed = ctx.params.f("speed");
-    let phase = ctx.params.f("phase").to_radians() + ctx.time * speed * std::f64::consts::TAU;
+    let (speed, phase) = (ctx.params.f("speed"), ctx.params.f("phase"));
     let kind = ctx.params.e("waveType");
     let pin = ctx.params.e("pinning");
     let seed = ctx.seed ^ 0x3a7e;
     let (dx, dy) = (dir.sin(), -dir.cos());
-    if !ctx.adjustment {
-        b.pad(h.abs().ceil() as u32 + 1);
+    // The waves are anchored to the input's top-left, before the room for the displacement.
+    let pad = if ctx.adjustment { 0.0 } else { h.abs().ceil() + 1.0 };
+    if pad > 0.0 {
+        b.pad(pad as u32);
     }
     let (x0, y0, lw, lh) = pin_rect(ctx, b.offset, b.scale);
     let rect = (x0, y0, lw.max(1.0), lh.max(1.0));
+    let time = ctx.time;
     b.img = remap(&b.img, false, |x, y| {
         // Waves travel along `dir`; displacement is perpendicular to it.
-        let along = x * dx + y * dy;
-        let disp = wave_shape(kind, along / w * std::f64::consts::TAU + phase, seed) * h * wave_pin(pin, x, y, rect);
+        let cyc = wave_warp_cycles(x - pad, y - pad, (dx, dy), w, phase, time, speed);
+        let disp = wave_shape(kind, cyc * std::f64::consts::TAU, seed) * h * wave_pin(pin, x, y, rect);
         (x + dy * disp, y - dx * disp)
     });
     b
@@ -541,12 +564,33 @@ mod tests {
 
     #[test]
     fn twirl_radius_is_a_percentage_of_the_larger_dimension() {
-        // 60×20 layer, radius 50 → 30 px: a pixel 20 px right of the centre is twirled (the old
-        // smaller-dimension rule gave 5 px), corners (> 30 px away) are not.
+        // 60×20 layer, radius 45 → 27.9 px: a pixel 20 px right of the centre is twirled (the old
+        // smaller-dimension rule gave 5 px), corners (31 px away) are not.
         let im = img(60, 20);
-        let o = run("ec.distort.twirl", &[("angle", num(90.0)), ("radius", num(50.0))], im.clone());
+        let o = run("ec.distort.twirl", &[("angle", num(90.0)), ("radius", num(45.0))], im.clone());
         assert!(differs(o.img.get(50, 10), im.get(50, 10)));
         assert_eq!(o.img.get(0, 0), im.get(0, 0));
+    }
+
+    #[test]
+    fn twirl_radius_follows_the_input_and_eases_out() {
+        // Liquid Glass: a 300% Motion Tile triples the input, and Twirl Radius with it.
+        assert!((twirl_radius(15.4, 7680, 4320) / twirl_radius(15.4, 2560, 1440) - 3.0).abs() < 1e-9);
+        assert!((twirl_radius(15.4, 2560, 1440) - 408.0).abs() < 1.0);
+        // Full Angle at the centre, half way at half the radius, nothing at the rim.
+        assert_eq!(twirl_falloff(1.0), 1.0);
+        assert_eq!(twirl_falloff(0.5), 0.5);
+        assert_eq!(twirl_falloff(0.0), 0.0);
+    }
+
+    #[test]
+    fn wave_warp_wave_spans_twice_the_width_and_moves_backwards_in_time() {
+        let dir = (1.0, 0.0);
+        // One full wave (crest and trough) per 2 × Wave Width.
+        assert!((wave_warp_cycles(200.0, 0.0, dir, 100.0, 0.0, 0.0, 0.0) - 1.0).abs() < 1e-12);
+        // Wave Speed 0.5 for 1 s: half a cycle back; Phase 90° a quarter forward.
+        assert!((wave_warp_cycles(0.0, 0.0, dir, 100.0, 0.0, 1.0, 0.5) + 0.5).abs() < 1e-12);
+        assert!((wave_warp_cycles(0.0, 0.0, dir, 100.0, 90.0, 0.0, 0.0) - 0.25).abs() < 1e-12);
     }
 
     #[test]

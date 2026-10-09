@@ -81,8 +81,7 @@ fn layer_wh(ctx: &EffectCtx) -> (f64, f64) {
 
 fn twirl(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
     let ang = ctx.params.f("angle").to_radians();
-    let (lw, lh) = layer_wh(ctx);
-    let r = (ctx.params.f("radius") / 100.0 * lw.max(lh) * b.scale).max(1.0);
+    let r = effectcraft_effects::twirl_radius(ctx.params.f("radius"), b.img.width, b.img.height);
     let c = b.to_px(ctx.params.v2("center"));
     let mut p = Params::default();
     p.f[0] = [c.0 as f32, c.1 as f32, r as f32, ang as f32];
@@ -109,27 +108,29 @@ fn wave_warp(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     let h = ctx.params.f("height") * b.scale;
     let w = (ctx.params.f("width") * b.scale).max(1.0);
     let dir = ctx.params.f("direction").to_radians();
-    let speed = ctx.params.f("speed");
-    let phase = ctx.params.f("phase").to_radians() + ctx.time * speed * TAU;
+    let (speed, phase) = (ctx.params.f("speed"), ctx.params.f("phase"));
     let (dx, dy) = (dir.sin(), -dir.cos());
-    if !ctx.adjustment {
-        b.pad(e, h.abs().ceil() as u32 + 1)?;
+    // distort::wave_warp: the waves are anchored to the input's top-left, before the padding.
+    let pad = if ctx.adjustment { 0.0 } else { h.abs().ceil() + 1.0 };
+    if pad > 0.0 {
+        b.pad(e, pad as u32)?;
     }
     let (x0, y0, lw, lh) = util::pin_rect(ctx, b.offset, b.scale);
     let rect = [x0 as f32, y0 as f32, lw.max(1.0) as f32, lh.max(1.0) as f32];
-    // The wave phase in cycles, (x·dx + y·dy) / width + phase / 2π, is separable: per column
-    // and per row (fraction, whole cycles) in f64, so the kernel's sum keeps the fraction exact
-    // to f32 (the circle shapes have vertical tangents where a phase error is amplified).
+    // The wave phase in cycles (effects::wave_warp_cycles) is separable: per column and per
+    // row (fraction, whole cycles) in f64, so the kernel's sum keeps the fraction exact to f32
+    // (the circle shapes have vertical tangents where a phase error is amplified).
     let (bw, bh) = (b.img.width as usize, b.img.height as usize);
     let mut data = vec![0.0f32; 2 * (bw + bh)];
     let split = |v: f64| (v - v.floor(), v.floor());
+    let cyc = |x: f64, y: f64, ph: f64, t: f64| effectcraft_effects::wave_warp_cycles(x, y, (dx, dy), w, ph, t, speed);
     for x in 0..bw {
-        let (f, i) = split((x as f64 + 0.5) * dx / w);
+        let (f, i) = split(cyc(x as f64 + 0.5 - pad, 0.0, 0.0, 0.0));
         data[x] = f as f32;
         data[bw + x] = i as f32;
     }
     for y in 0..bh {
-        let (f, i) = split((y as f64 + 0.5) * dy / w + phase / TAU);
+        let (f, i) = split(cyc(0.0, y as f64 + 0.5 - pad, phase, ctx.time));
         data[2 * bw + y] = f as f32;
         data[2 * bw + bh + y] = i as f32;
     }

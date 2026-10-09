@@ -12,11 +12,6 @@ fn spec(id: &'static str, name: &'static str, category: &'static str, params: Ve
     EffectSpec { id, name, category, params, render, gpu: false, float: true }
 }
 
-/// AE's Blurriness is roughly a radius; our Gaussian uses sigma = blurriness / 2.
-fn blur_sigma(blurriness: f64) -> f64 {
-    blurriness.max(0.0) * 0.5
-}
-
 fn dims_xy(dim: u32) -> (f64, f64) {
     match dim {
         1 => (1.0, 0.0),
@@ -25,32 +20,41 @@ fn dims_xy(dim: u32) -> (f64, f64) {
     }
 }
 
+/// Gaussian Blur: Blurriness in comp pixels for a layer whose effects run in comp space
+/// ([`crate::EffectEnv::comp_px`]), else in layer pixels.
 fn gaussian(ctx: &EffectCtx, mut b: Buf) -> Buf {
-    let s = blur_sigma(ctx.params.f("blurriness")) * b.scale;
+    let s = crate::gaussian_sigma(ctx.params.f("blurriness")) * b.scale;
     if s <= 0.0 {
         return b;
     }
     let (kx, ky) = dims_xy(ctx.params.e("dimensions"));
+    let [cx, cy] = ctx.env.comp_px();
+    let (sx, sy) = (s * cx * kx, s * cy * ky);
     let repeat = ctx.params.b("repeatEdge");
     if !repeat && !ctx.adjustment {
-        b.pad((s * 3.0).ceil() as u32);
+        b.pad((sx.max(sy) * 3.0).ceil().min(1.0e5) as u32);
     }
-    b.img = gaussian_blur(&b.img, s * kx, s * ky, repeat || ctx.adjustment);
+    b.img = gaussian_blur(&b.img, sx, sy, repeat || ctx.adjustment);
     b
 }
 
+/// Fast Box Blur: Blur Radius in comp pixels for a layer whose effects run in comp space
+/// ([`crate::EffectEnv::comp_px`]), else in layer pixels.
 fn box_blur(ctx: &EffectCtx, mut b: Buf) -> Buf {
-    let r = (ctx.params.f("radius") * b.scale).round().max(0.0) as usize;
-    if r == 0 {
+    let r = ctx.params.f("radius").max(0.0) * b.scale;
+    let (kx, ky) = dims_xy(ctx.params.e("dimensions"));
+    let [cx, cy] = ctx.env.comp_px();
+    let rx = (r * cx * kx).round().min(1.0e5) as usize;
+    let ry = (r * cy * ky).round().min(1.0e5) as usize;
+    if rx == 0 && ry == 0 {
         return b;
     }
     let it = ctx.params.f("iterations").round().clamp(1.0, 50.0) as usize;
-    let (kx, ky) = dims_xy(ctx.params.e("dimensions"));
     let repeat = ctx.params.b("repeatEdge");
     if !repeat && !ctx.adjustment {
-        b.pad((r * it) as u32 + 1);
+        b.pad((rx.max(ry) * it) as u32 + 1);
     }
-    b.img = effectcraft_raster::box_blur(&b.img, r * kx as usize, r * ky as usize, it, repeat || ctx.adjustment);
+    b.img = effectcraft_raster::box_blur(&b.img, rx, ry, it, repeat || ctx.adjustment);
     b
 }
 
@@ -444,7 +448,10 @@ fn deep_glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
             let s = original[c] * source_opacity;
             out[c] = if screen { (s + g - s * g).clamp(0.0, 1.0) } else { s + g };
         }
-        out[3] = (glow[3] * exposure + original[3] * source_opacity).clamp(0.0, 1.0);
+        // With Unmult the glow's alpha is its brightness (set below), not its summed coverage:
+        // the weighted passes add up to ~10× the source alpha, which would turn a faint halo
+        // into an opaque dark one.
+        out[3] = if unmult { original[3] * source_opacity } else { glow[3] * exposure + original[3] * source_opacity }.clamp(0.0, 1.0);
     });
     if convert {
         // Back to display values as seen over black (what AE shows); with Unmult the glow's
@@ -455,13 +462,18 @@ fn deep_glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
                 for v in px.iter_mut().take(3) {
                     *v = effectcraft_color::linear_to_srgb(v.clamp(0.0, 1.0));
                 }
-                px[3] = a.max(px[0].max(px[1]).max(px[2])).clamp(0.0, 1.0);
             } else if a > 0.0 {
                 for v in px.iter_mut().take(3) {
                     *v = effectcraft_color::linear_to_srgb((*v / a).max(0.0)).min(1.0) * a;
                 }
             }
         });
+    }
+    if unmult {
+        // Unmult: the result as seen over black, with alpha = its brightest channel (black is
+        // transparent), so a faint halo over a light background stays light. SceneYard's "Magic
+        // button item reveal" (Radius 500 over near-white): frame MAE vs AE 0.080 → 0.024.
+        b.img.data.par_iter_mut().for_each(|px| px[3] = px[3].max(px[0].max(px[1]).max(px[2])).clamp(0.0, 1.0));
     }
     if !ctx.params.b("PEDG-0025") {
         b.img.data.par_iter_mut().for_each(|px| px[3] = 1.0);
@@ -1049,6 +1061,64 @@ mod tests {
         img
     }
 
+    /// Spread (standard deviation, layer px) of a blurred 1-px-wide line along x and y.
+    fn blur_spread(id: &str, vals: &[(&str, Value)], env: EffectEnv) -> (f64, f64) {
+        let mut img = effectcraft_raster::Image::new(161, 161);
+        for i in 0..161 {
+            img.set(80, i, [1.0; 4]);
+            img.set(i, 80, [1.0; 4]);
+        }
+        let out = run_fx(id, vals, img, 0.0, env);
+        let sd = |along_x: bool| {
+            let (mut w, mut m, mut m2) = (0.0, 0.0, 0.0);
+            for i in 0..out.img.width.min(out.img.height) as i64 {
+                // Through the line's crossing-free part: 40 px from the other line.
+                let (x, y) = if along_x { (i, 40 + out.offset[1] as i64) } else { (40 + out.offset[0] as i64, i) };
+                let a = out.img.get(x, y)[3] as f64;
+                let c = i as f64;
+                w += a;
+                m += a * c;
+                m2 += a * c * c;
+            }
+            (m2 / w - (m / w).powi(2)).max(0.0).sqrt()
+        };
+        (sd(true), sd(false))
+    }
+
+    /// Gaussian Blur's σ is 0.28 × Blurriness (measured on After Effects 2026), and on a layer
+    /// whose effects run in comp space (Continuously Rasterize shape / text: Billiard Balls'
+    /// highlight, an ellipse scaled 305 % × 241 % with Blurriness 77.9) Blurriness is in comp
+    /// pixels: AE blurred that highlight by σ ≈ 21.5 comp px in both directions, where a layer
+    /// space blur spread it 118 × 93 px into a faint glow.
+    #[test]
+    fn gaussian_blur_sigma_and_comp_space() {
+        let vals = [("blurriness", Value::Scalar(20.0))];
+        let (sx, sy) = blur_spread("ec.blur.gaussian", &vals, EffectEnv::default());
+        assert!((sx - 5.6).abs() < 0.3 && (sy - 5.6).abs() < 0.3, "{sx} {sy}");
+        // Scaled 300 % × 100 % to comp: a third of the spread along x in layer pixels.
+        let env = EffectEnv { comp_space: Some([[3.0, 0.0, 7.0], [0.0, 1.0, -2.0]]), ..Default::default() };
+        let (sx, sy) = blur_spread("ec.blur.gaussian", &vals, env);
+        assert!((sx - 5.6 / 3.0).abs() < 0.3 && (sy - 5.6).abs() < 0.3, "{sx} {sy}");
+        // Fast Box Blur follows comp space too.
+        let vals = [("radius", Value::Scalar(12.0)), ("iterations", Value::Scalar(1.0))];
+        let (bx, by) = blur_spread("ec.blur.fastbox", &vals, env);
+        assert!(bx * 2.5 < by, "{bx} {by}");
+    }
+
+    /// Comp-pixel footprint: uniform scale with rotation is isotropic; a degenerate matrix
+    /// falls back to layer pixels.
+    #[test]
+    fn comp_px_of_rotated_and_degenerate_layers() {
+        let (c, s) = (30f64.to_radians().cos() * 2.0, 30f64.to_radians().sin() * 2.0);
+        let env = EffectEnv { comp_space: Some([[c, -s, 0.0], [s, c, 0.0]]), ..Default::default() };
+        let [kx, ky] = env.comp_px();
+        assert!((kx - 0.5).abs() < 1e-9 && (ky - 0.5).abs() < 1e-9, "{kx} {ky}");
+        let env = EffectEnv { comp_space: Some([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]), ..Default::default() };
+        assert_eq!(env.comp_px(), [1.0, 1.0]);
+        let env = EffectEnv { comp_space: Some([[f64::NAN, 0.0, 0.0], [0.0, 1.0, 0.0]]), ..Default::default() };
+        assert_eq!(env.comp_px(), [1.0, 1.0]);
+    }
+
     /// Noise with Clip Result Values off never wraps a bright pixel to black (SceneYard Drone
     /// History infographics: 10% mono noise on cream paper turned it cyan).
     #[test]
@@ -1251,6 +1321,37 @@ mod tests {
         let dithered = run_fx("ec.stylize.deepglow", &[("PEDG-0001", num(8.0))], gray.clone(), 0.0, EffectEnv::default());
         let clean = run_fx("ec.stylize.deepglow", &[("PEDG-0001", num(8.0)), ("PEDG-0031", Value::Bool(false))], gray, 0.0, EffectEnv::default());
         assert!(dithered.img.data.iter().zip(&clean.img.data).any(|(a, b)| a != b), "Dither must affect opaque pixels");
+    }
+
+    #[test]
+    fn deep_glow_unmult_alpha_is_glow_brightness() {
+        // SceneYard "Magic button item reveal": a faint violet halo over near-white must stay
+        // translucent; summing the passes' alpha made it an opaque dark-purple vignette.
+        let mut img = Image::new(41, 41);
+        for y in 15..26 {
+            for x in 15..26 {
+                img.set(x, y, [0.35, 0.15, 0.6, 1.0]);
+            }
+        }
+        let set = [
+            ("PEDG-0001", num(100.0)),
+            ("PEDG-0002", num(0.4)),
+            ("PEDG-0008", Value::Enum(0)),
+            ("PEDG-0025", Value::Bool(true)),
+            ("PEDG-0031", Value::Bool(false)),
+            ("PEDG-0055", num(2.0)),
+        ];
+        let o = run_fx("ec.stylize.deepglow", &set, img, 0.0, EffectEnv::default());
+        let px = |x: i64| o.img.get(x + o.offset[0] as i64, 20 + o.offset[1] as i64);
+        let inside = px(20);
+        assert!(inside[3] > 0.999, "the opaque source stays opaque: {inside:?}");
+        for x in [27, 32, 45] {
+            let h = px(x);
+            let bright = h[0].max(h[1]).max(h[2]);
+            assert!(bright > 0.01 && h[3] < 0.9, "{x}: a faint halo is translucent: {h:?}");
+            assert!((h[3] - bright).abs() < 1e-5, "{x}: alpha follows the halo's brightness: {h:?}");
+            assert!(h[2] > h[0] && h[0] > h[1], "{x}: unpremultiplied colour keeps the violet hue: {h:?}");
+        }
     }
 
     #[test]
