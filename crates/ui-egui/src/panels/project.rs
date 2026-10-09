@@ -472,11 +472,14 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 let cell = Rect::from_min_max(pos2(x0 + 27.0, r.min.y + 1.0), pos2((x0 + 33.0 + g.size().x).min(name_clip.max.x), r.max.y - 1.0));
                 lp.with_clip_rect(name_clip.expand2(vec2(3.0, 0.0))).rect_filled(cell, 0.0, Color32::from_rgb(0xa6, 0xa6, 0xa6));
             }
-            lp.with_clip_rect(name_clip).text(
+            // Long names end in "…" before the label column instead of being cut mid-glyph.
+            widgets::text_fit(
+                &lp.with_clip_rect(name_clip),
                 pos2(x0 + 30.0, r.center().y),
                 Align2::LEFT_CENTER,
                 &it.name,
                 Tokens::ui(12.0),
+                name_clip.max.x - (x0 + 30.0) - 2.0,
                 if selected { Color32::from_gray(0x16) } else { t.text },
             );
         }
