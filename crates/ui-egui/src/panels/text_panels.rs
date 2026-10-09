@@ -2,6 +2,7 @@
 //! Character and Paragraph panels show and change the selected text (creating style runs);
 //! otherwise they apply to the whole selected text layer.
 
+use crate::i18n::tr;
 use effectcraft_engine::keyframe::{BaselineOption, Composer, Direction, FigureStyle, FigureWidth, Justify, Kerning, TextDoc};
 use effectcraft_engine::render::EvalCtx;
 use egui::{Align2, Rect, Sense, pos2, vec2};
@@ -86,7 +87,9 @@ pub fn character(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let target = text_target(app);
     let enabled = target.is_some();
     let doc = target.as_ref().map(|t| t.doc.clone()).unwrap_or_default();
-    let mut y = rect.min.y + 10.0;
+    let scroll = widgets::PanelScroll::begin(ui, egui::Id::new("character-scroll"), rect);
+    let top = rect.min.y + 10.0 - scroll.offset;
+    let mut y = top;
     let x0 = rect.min.x + 10.0;
     let w = rect.width() - 20.0;
     let mut actions: Vec<serde_json::Value> = vec![];
@@ -107,9 +110,10 @@ pub fn character(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         widgets::open_popup(ui, spop);
     }
     app.auto.add("character.style", sr, "Font style");
-    let styles: Vec<String> = ["Regular", "Medium", "SemiBold", "Bold", "Italic"].iter().map(|s| s.to_string()).collect();
-    if let Some(i) = widgets::popup_menu(ui, spop, sr.left_bottom(), &styles, styles.iter().position(|s| *s == doc.style)) {
-        actions.push(json!({"style": styles[i]}));
+    // The family's own styles.
+    let styles: Vec<String> = if widgets::popup_is_open(ui, spop) { effectcraft_engine::font_styles(&doc.font) } else { vec![] };
+    if let Some(st) = widgets::popup_menu(ui, spop, sr.left_bottom(), &styles, styles.iter().position(|s| *s == doc.style)).and_then(|i| styles.get(i)) {
+        actions.push(json!({"style": st}));
     }
     y += 34.0;
     // Numeric fields in AE's two-column grid (Kerning is a popup, at row 1 right).
@@ -229,7 +233,7 @@ pub fn character(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         actions.push(json!({"ligatures": !doc.ligatures}));
     }
     app.auto.add("character.ligatures", lr, "Ligatures");
-    p.text(pos2(x0 + 20.0, y + 7.0), Align2::LEFT_CENTER, "Ligatures", Tokens::ui(11.5), t.text_dim);
+    p.text(pos2(x0 + 20.0, y + 7.0), Align2::LEFT_CENTER, tr("Ligatures"), Tokens::ui(11.5), t.text_dim);
     // OpenType: a popup with the font's layout features (like the Character panel's OpenType menu).
     let or = Rect::from_min_size(pos2(sr.max.x + 6.0, sr.min.y), vec2(78.0, 22.0));
     let opop = egui::Id::new("char-opentype-pop");
@@ -261,7 +265,7 @@ pub fn character(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let axes = effectcraft_engine::text::variable::font_axes(face);
     if !axes.is_empty() {
         y += 26.0;
-        p.text(pos2(x0, y + 7.0), Align2::LEFT_CENTER, "Variable Font Axes", Tokens::semibold(11.0), t.text_dim);
+        p.text(pos2(x0, y + 7.0), Align2::LEFT_CENTER, tr("Variable Font Axes"), Tokens::semibold(11.0), t.text_dim);
         for (i, a) in axes.iter().enumerate() {
             let (col, row) = (i % 2, i / 2);
             let fx = x0 + col as f32 * (w / 2.0);
@@ -278,10 +282,13 @@ pub fn character(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 actions.push(json!({"variations": {tag.clone(): nv}, "merge": format!("char-axis-{tag}")}));
             }
         }
+        y += 20.0 + axes.len().div_ceil(2) as f32 * 24.0;
     }
+    // (Room for the status line at the bottom.)
+    scroll.end(ui, &mut app.auto, "character.scroll", y + 44.0 - top, &t);
     match &target {
         None => {
-            p.text(pos2(rect.center().x, rect.max.y - 20.0), Align2::CENTER_CENTER, "Select a text layer", Tokens::ui(11.0), t.text_faint);
+            p.text(pos2(rect.center().x, rect.max.y - 20.0), Align2::CENTER_CENTER, tr("Select a text layer"), Tokens::ui(11.0), t.text_faint);
         }
         Some(tt) if tt.range.is_some() => {
             let [a, b] = tt.range.unwrap_or_default();
@@ -345,7 +352,7 @@ fn opentype_popup(app: &mut EffectcraftApp, ui: &mut egui::Ui, id: egui::Id, pos
                 }
             }
             ui.separator();
-            ui.label(egui::RichText::new("Figures").small().color(t.text_dim));
+            ui.label(egui::RichText::new(tr("Figures")).small().color(t.text_dim));
             let figs = [
                 ("default", "Default Figure Style", FigureStyle::Default, FigureWidth::Default),
                 ("tabularLining", "Tabular Lining", FigureStyle::Lining, FigureWidth::Tabular),
@@ -362,7 +369,7 @@ fn opentype_popup(app: &mut EffectcraftApp, ui: &mut egui::Ui, id: egui::Id, pos
                 }
             }
             ui.separator();
-            ui.label(egui::RichText::new("Stylistic Sets").small().color(t.text_dim));
+            ui.label(egui::RichText::new(tr("Stylistic Sets")).small().color(t.text_dim));
             egui::Grid::new(id.with("sets")).spacing(vec2(3.0, 3.0)).show(ui, |ui| {
                 for n in 1..=20u32 {
                     let key = format!("ss{n:02}");
@@ -386,7 +393,7 @@ fn opentype_popup(app: &mut EffectcraftApp, ui: &mut egui::Ui, id: egui::Id, pos
     for (aid, r, label) in rects {
         app.auto.add(&aid, r, &label);
     }
-    let outside = ui.input(|i| i.pointer.any_pressed()) && !area.response.contains_pointer() && !area.response.hovered();
+    let outside = widgets::pressed_outside(ui.ctx(), &area.response);
     if outside || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
         ui.data_mut(|d| d.insert_temp(open_id, false));
     }
@@ -440,7 +447,9 @@ pub fn paragraph(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let doc = target.as_ref().map(|t| t.doc.clone()).unwrap_or_default();
     let x0 = rect.min.x + 10.0;
     let w = rect.width() - 20.0;
-    let mut y = rect.min.y + 10.0;
+    let scroll = widgets::PanelScroll::begin(ui, egui::Id::new("paragraph-scroll"), rect);
+    let top = rect.min.y + 10.0 - scroll.offset;
+    let mut y = top;
     let mut actions: Vec<serde_json::Value> = vec![];
     let bw = ((w - 6.0 * 3.0) / 7.0).clamp(20.0, 28.0);
     for (i, (j, key)) in ALIGNS.into_iter().enumerate() {
@@ -528,9 +537,11 @@ pub fn paragraph(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         actions.push(json!({"hangingPunctuation": !doc.hanging_punctuation}));
     }
     app.auto.add("paragraph.hangingPunctuation", hr, "Roman Hanging Punctuation");
-    p.text(pos2(x0 + 20.0, y + 7.0), Align2::LEFT_CENTER, "Roman Hanging Punctuation", Tokens::ui(11.5), t.text_dim);
+    p.text(pos2(x0 + 20.0, y + 7.0), Align2::LEFT_CENTER, tr("Roman Hanging Punctuation"), Tokens::ui(11.5), t.text_dim);
+    // (Room for the status line at the bottom.)
+    scroll.end(ui, &mut app.auto, "paragraph.scroll", y + 44.0 - top, &t);
     if !enabled {
-        p.text(pos2(rect.center().x, rect.max.y - 20.0), Align2::CENTER_CENTER, "Select a text layer", Tokens::ui(11.0), t.text_faint);
+        p.text(pos2(rect.center().x, rect.max.y - 20.0), Align2::CENTER_CENTER, tr("Select a text layer"), Tokens::ui(11.0), t.text_faint);
     }
     let Some(tt) = target else { return };
     for a in actions {
@@ -543,51 +554,44 @@ pub fn paragraph(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
 /// The font menu: recent fonts first, names in English or the fonts' own language, and a
 /// "Sample" preview in each font (Settings ▸ Type).
 fn font_popup(app: &EffectcraftApp, ui: &mut egui::Ui, id: egui::Id, pos: egui::Pos2, current: &str) -> Option<String> {
-    if !ui.data(|d| d.get_temp::<bool>(id.with("open")).unwrap_or(false)) {
+    if !widgets::popup_is_open(ui, id) {
         return None;
     }
     let rows = effectcraft_engine::font_menu(&app.session.prefs);
     let preview = app.session.prefs.type_.font_preview;
     let t = app.tokens;
-    let mut chosen = None;
-    let area = egui::Area::new(id.with("area")).order(egui::Order::Foreground).fixed_pos(pos).show(ui.ctx(), |ui| {
-        egui::Frame::popup(ui.style()).show(ui, |ui| {
-            ui.set_min_width(if preview { 300.0 } else { 180.0 });
-            egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
-                for r in &rows {
-                    if r.family.is_empty() {
-                        ui.separator();
-                        continue;
+    let seps = rows.iter().filter(|r| r.family.is_empty()).count();
+    widgets::popup_list(ui, id, pos, Rect::NOTHING, rows.len().saturating_sub(seps), seps, |ui| {
+        ui.set_min_width(if preview { 300.0 } else { 180.0 });
+        let mut chosen = None;
+        for r in &rows {
+            if r.family.is_empty() {
+                ui.separator();
+                continue;
+            }
+            let resp = ui.selectable_label(r.family == current, &r.display);
+            if preview && ui.is_rect_visible(resp.rect) {
+                let key = egui::Id::new(("font-preview", &r.family));
+                let lines: std::sync::Arc<Vec<Vec<[f32; 2]>>> = match ui.data(|d| d.get_temp(key)) {
+                    Some(l) => l,
+                    None => {
+                        let l = std::sync::Arc::new(effectcraft_engine::font_preview(&r.family, 14.0));
+                        ui.data_mut(|d| d.insert_temp(key, l.clone()));
+                        l
                     }
-                    let resp = ui.selectable_label(r.family == current, &r.display);
-                    if preview && ui.is_rect_visible(resp.rect) {
-                        let key = egui::Id::new(("font-preview", &r.family));
-                        let lines: std::sync::Arc<Vec<Vec<[f32; 2]>>> = match ui.data(|d| d.get_temp(key)) {
-                            Some(l) => l,
-                            None => {
-                                let l = std::sync::Arc::new(effectcraft_engine::font_preview(&r.family, 14.0));
-                                ui.data_mut(|d| d.insert_temp(key, l.clone()));
-                                l
-                            }
-                        };
-                        let o = pos2(resp.rect.max.x - 120.0, resp.rect.center().y + 5.0);
-                        for poly in lines.iter() {
-                            let pts: Vec<egui::Pos2> = poly.iter().map(|p| o + vec2(p[0], p[1])).collect();
-                            ui.painter().add(egui::Shape::line(pts, egui::Stroke::new(1.0, t.text_dim)));
-                        }
-                    }
-                    if resp.clicked() {
-                        chosen = Some(r.family.clone());
-                    }
+                };
+                let o = pos2(resp.rect.max.x - 120.0, resp.rect.center().y + 5.0);
+                for poly in lines.iter() {
+                    let pts: Vec<egui::Pos2> = poly.iter().map(|p| o + vec2(p[0], p[1])).collect();
+                    ui.painter().add(egui::Shape::line(pts, egui::Stroke::new(1.0, t.text_dim)));
                 }
-            });
-        });
-    });
-    let outside = ui.input(|i| i.pointer.any_pressed()) && !area.response.contains_pointer() && !area.response.hovered();
-    if chosen.is_some() || outside || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-        ui.data_mut(|d| d.insert_temp(id.with("open"), false));
-    }
-    chosen
+            }
+            if resp.clicked() {
+                chosen = Some(r.family.clone());
+            }
+        }
+        chosen
+    })
 }
 
 /// Align panel: Align Layers to Selection / Composition, the six align buttons and the six
@@ -598,7 +602,7 @@ pub fn align(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let p = ui.painter().with_clip_rect(rect);
     let x0 = rect.min.x + 10.0;
     let mut y = rect.min.y + 10.0;
-    p.text(pos2(x0, y + 10.0), Align2::LEFT_CENTER, "Align Layers to:", Tokens::ui(11.5), t.text_dim);
+    p.text(pos2(x0, y + 10.0), Align2::LEFT_CENTER, tr("Align Layers to:"), Tokens::ui(11.5), t.text_dim);
     let dr = Rect::from_min_size(pos2(x0 + 100.0, y), vec2(110.0, 20.0));
     let to_sel = app.ui.align_to_selection;
     let pid = egui::Id::new("align-to-pop");
@@ -616,14 +620,16 @@ pub fn align(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let mut run: Option<(&str, &str)> = None;
     for (row, kind) in ["align", "distribute"].into_iter().enumerate() {
         if row == 1 {
-            p.text(pos2(x0, y + 8.0), Align2::LEFT_CENTER, "Distribute Layers:", Tokens::ui(11.5), t.text_dim);
+            p.text(pos2(x0, y + 8.0), Align2::LEFT_CENTER, tr("Distribute Layers:"), Tokens::ui(11.5), t.text_dim);
             y += 20.0;
         }
         for (i, op) in ops.iter().enumerate() {
             let r = Rect::from_min_size(pos2(x0 + i as f32 * 34.0 + if i >= 3 { 12.0 } else { 0.0 }, y), vec2(30.0, 28.0));
             let resp = ui.interact(r, egui::Id::new((kind, *op)), Sense::click());
             p.rect_filled(r, 3.0, if resp.hovered() { t.hover } else { t.field_bg });
-            align_glyph(&p, r, op, row == 1, &t);
+            if !crate::local_assets::paint(&p, r.shrink(5.0), &format!("{kind}-{op}"), t.icon) {
+                align_glyph(&p, r, op, row == 1, &t);
+            }
             let tip = align_tip(kind, op);
             app.auto.add(&format!("{kind}.{op}"), r, &tip);
             if resp.on_hover_text(tip).clicked() {

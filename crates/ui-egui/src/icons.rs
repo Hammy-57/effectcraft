@@ -1,5 +1,5 @@
-//! Vector icons drawn in code on a 16×16 design grid (crisp at any DPI, recolourable). Original
-//! drawings following generic motion-graphics conventions; no third-party or Adobe artwork.
+//! Recolourable icons: generated toolbar artwork, with vector drawings for other controls.
+//! Original artwork following generic motion-graphics conventions; see assets/icons attribution.
 
 use egui::epaint::{PathShape, PathStroke};
 use egui::{Color32, Painter, Pos2, Rect, Stroke, pos2, vec2};
@@ -59,6 +59,8 @@ pub enum Icon {
     Keyframe,
     PickWhip,
     Flowchart,
+    /// The Timeline's composition marker bin: a marker tab resting in an open tray.
+    MarkerBin,
     // project items
     Folder,
     Comp,
@@ -197,6 +199,29 @@ impl Pen16<'_> {
 
 /// Paint `icon` centred in `rect`.
 pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
+    let local = match icon {
+        Icon::Eye => Some("layer-eye"),
+        Icon::Speaker => Some("layer-audio"),
+        Icon::Solo => Some("layer-solo"),
+        Icon::Lock => Some("layer-lock"),
+        Icon::Collapse => Some("layer-collapse"),
+        Icon::Quality => Some("layer-quality"),
+        Icon::Fx => Some("layer-effects"),
+        Icon::Adjustment => Some("layer-adjustment"),
+        Icon::Cube => Some("layer-3d"),
+        Icon::Stopwatch => Some("layer-stopwatch"),
+        Icon::PickWhip => Some("layer-pickwhip"),
+        Icon::Shy if rect.width() <= 13.0 => Some("layer-shy"),
+        Icon::FrameBlend if rect.width() <= 13.0 => Some("layer-frameblend"),
+        Icon::MotionBlur if rect.width() <= 13.0 => Some("layer-motionblur"),
+        _ => None,
+    };
+    if local.is_some_and(|name| crate::local_assets::paint(painter, rect, name, color)) {
+        return;
+    }
+    if paint_generated(painter, rect, icon, color) {
+        return;
+    }
     let pen = Pen16 { painter, rect, color, width: 1.25 };
     use Icon::*;
     match icon {
@@ -411,6 +436,10 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             pen.rect(1.5, 2.5, 6.0, 6.5);
             pen.rect(10.0, 9.5, 14.5, 13.5);
             pen.line(&[(6.0, 4.5), (12.25, 4.5), (12.25, 9.5)]);
+        }
+        MarkerBin => {
+            pen.fill(&[(5.0, 2.0), (11.0, 2.0), (11.0, 7.5), (8.0, 10.5), (5.0, 7.5)]);
+            pen.line(&[(2.0, 9.0), (2.0, 14.0), (14.0, 14.0), (14.0, 9.0)]);
         }
         Folder => pen.closed(&[(1.5, 4.0), (6.0, 4.0), (7.5, 5.5), (14.5, 5.5), (14.5, 13.0), (1.5, 13.0)]),
         Comp => {
@@ -632,6 +661,82 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
     }
 }
 
+/// One embedded atlas, decoded once per UI context. Keep the vector fallback if decoding fails.
+fn paint_generated(painter: &Painter, rect: Rect, icon: Icon, color: Color32) -> bool {
+    use Icon::*;
+    let cell = match icon {
+        Home => 0,
+        Selection => 1,
+        Hand => 2,
+        Zoom => 3,
+        Orbit => 4,
+        PanCamera => 5,
+        Dolly => 6,
+        Rotate => 7,
+        PanBehind => 8,
+        Rectangle => 9,
+        Pen => 10,
+        Type => 11,
+        Brush => 12,
+        Clone => 13,
+        Eraser => 14,
+        RotoBrush => 15,
+        Puppet => 16,
+        RefineEdge => 17,
+        Flowchart => 18,
+        Draft3D => 19,
+        Shy => 20,
+        FrameBlend => 21,
+        MotionBlur => 22,
+        Graph => 23,
+        _ => return false,
+    };
+    let ctx = painter.ctx();
+    let id = egui::Id::new("effectcraft-tools-atlas");
+    let cached = ctx.data(|data| data.get_temp::<Option<(egui::TextureHandle, bool)>>(id));
+    let texture = cached.unwrap_or_else(|| {
+        // Optional owner-local reference glyphs. Reference artwork stays out of distributed assets.
+        let reference = crate::local_assets::reference_atlas()
+            .and_then(|path| {
+                use std::io::Read;
+                let file = std::fs::File::open(path).ok()?;
+                let mut alpha = Vec::new();
+                file.take(24 * 64 * 64 + 1).read_to_end(&mut alpha).ok()?;
+                Some(alpha)
+            })
+            .filter(|alpha| alpha.len() == 24 * 64 * 64);
+        if let Some(alpha) = reference {
+            let pixels = alpha.into_iter().map(Color32::from_white_alpha).collect();
+            let texture = Some((ctx.load_texture("reference-tools", egui::ColorImage::new([64, 24 * 64], pixels), egui::TextureOptions::LINEAR), true));
+            ctx.data_mut(|data| data.insert_temp(id, texture.clone()));
+            return texture;
+        }
+        let texture = image::load_from_memory(include_bytes!("../../../assets/icons/tools-atlas.png")).ok().map(|image| {
+            let rgba = image.to_rgba8();
+            let size = [rgba.width() as usize, rgba.height() as usize];
+            // Use the generated alpha as a tintable mask for dark/light/selected/disabled states.
+            let pixels = rgba.pixels().map(|pixel| Color32::from_white_alpha(pixel.0[3])).collect();
+            (ctx.load_texture("tools-atlas", egui::ColorImage::new(size, pixels), egui::TextureOptions::LINEAR), false)
+        });
+        ctx.data_mut(|data| data.insert_temp(id, texture.clone()));
+        texture
+    });
+    let Some((texture, reference)) = texture else { return false };
+    if reference {
+        let uv = Rect::from_min_max(pos2(0.0, cell as f32 / 24.0), pos2(1.0, (cell + 1) as f32 / 24.0));
+        let side = rect.width().min(rect.height());
+        painter.image(texture.id(), Rect::from_center_size(rect.center(), vec2(side, side)), uv, color);
+        return true;
+    }
+    // 6 × 4 cells, each 256 px; omit the generated transparent margin.
+    let x = (cell % 6) as f32 * 256.0;
+    let y = (cell / 6) as f32 * 256.0;
+    let uv = Rect::from_min_max(pos2((x + 24.0) / 1536.0, (y + 24.0) / 1024.0), pos2((x + 232.0) / 1536.0, (y + 232.0) / 1024.0));
+    let side = rect.width().min(rect.height());
+    painter.image(texture.id(), Rect::from_center_size(rect.center(), vec2(side, side)), uv, color);
+    true
+}
+
 /// Keyframe glyph by interpolation (diamond = linear, hourglass = bezier/ease, circle = auto,
 /// square = hold), split into in/out halves.
 pub fn keyframe(
@@ -641,13 +746,24 @@ pub fn keyframe(
     left: effectcraft_engine::keyframe::KeyHalf,
     right: effectcraft_engine::keyframe::KeyHalf,
     fill: Color32,
-    outline: Color32,
 ) {
+    painter.extend(keyframe_shapes(center, size, left, right, fill));
+}
+
+/// The halves of a [`keyframe`] glyph. Flat, without a dark outline (as in After Effects), so
+/// keys that overlap read as one shape instead of a tangle of borders (#284); the hairline in
+/// the fill colour closes the seam between the halves.
+fn keyframe_shapes(
+    center: Pos2,
+    size: f32,
+    left: effectcraft_engine::keyframe::KeyHalf,
+    right: effectcraft_engine::keyframe::KeyHalf,
+    fill: Color32,
+) -> Vec<egui::Shape> {
     use effectcraft_engine::keyframe::KeyHalf as H;
     let r = size / 2.0;
-    let half = |pts: Vec<Pos2>| {
-        painter.add(PathShape::convex_polygon(pts, fill, Stroke::new(1.0, outline)));
-    };
+    let mut out = Vec::with_capacity(2);
+    let mut half = |pts: Vec<Pos2>| out.push(PathShape::convex_polygon(pts, fill, Stroke::new(0.5, fill)).into());
     let c = center;
     for (side, h) in [(-1.0f32, left), (1.0, right)] {
         match h {
@@ -675,6 +791,28 @@ pub fn keyframe(
                     hp.push(c + vec2(side * r * 0.8 * t.sin(), r * 0.8 * t.cos()));
                 }
                 half(hp);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use effectcraft_engine::keyframe::KeyHalf as H;
+
+    /// #284: keyframes have no dark border (overlapping keys looked messy): each half is filled
+    /// and edged in the key's own colour.
+    #[test]
+    fn keyframes_are_drawn_without_a_dark_outline() {
+        let fill = egui::Color32::from_gray(0xc0);
+        for (l, r) in [(H::Linear, H::Linear), (H::Bezier, H::Hold), (H::Auto, H::Linear)] {
+            let shapes = super::keyframe_shapes(egui::pos2(10.0, 10.0), 11.0, l, r, fill);
+            assert_eq!(shapes.len(), 2);
+            for s in shapes {
+                let egui::Shape::Path(p) = s else { panic!("a path: {s:?}") };
+                assert_eq!(p.fill, fill);
+                assert!(p.stroke.width <= 0.5 && p.stroke.color == egui::epaint::ColorMode::Solid(fill), "{:?}", p.stroke);
             }
         }
     }

@@ -14,9 +14,9 @@ fn fxn_pixel(gid: vec3<u32>) -> vec2<i32> {
     return p;
 }
 
-// a / b rounded like the CPU's IEEE division (GPU division may be approximate): one
-// residual correction with fma, followed by a second refinement for half-step cases.
-// Used where a strict threshold follows the quotient.
+// Refine approximate GPU division with two fma residual corrections before restoring
+// the median's straight colour. Driver float optimisations can still affect rounding;
+// the fixed median levels instead come from a CPU-rounded lookup table.
 fn fxn_div4(a: vec4<f32>, b: vec4<f32>) -> vec4<f32> {
     let q = a / b;
     let r = fma(-q, b, a);
@@ -53,6 +53,7 @@ fn fxn_quant(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // Per-channel median of the quantised levels over a (2r+1)² window (edges repeated): the
 // smallest level m with more than half the window at or below m. u[0].x = r.
+// data = the 512 CPU-rounded level / 511 values.
 @compute @workgroup_size(16, 16)
 fn fxn_median(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = fxn_pixel(gid);
@@ -77,7 +78,8 @@ fn fxn_median(@builtin(global_invocation_id) gid: vec3<u32>) {
         hi = select(hi, mid, above);
         lo = select(mid + 1.0, lo, above);
     }
-    textureStore(out, p, fxn_div4(lo, vec4<f32>(511.0)));
+    let level = vec4<u32>(lo);
+    textureStore(out, p, vec4<f32>(data[level.x], data[level.y], data[level.z], data[level.w]));
 }
 
 // The same median for large radii, as the CPU computes it: a sliding 512-bin histogram per
@@ -85,6 +87,7 @@ fn fxn_median(@builtin(global_invocation_id) gid: vec3<u32>) {
 // the segment's first window, then slides right one column at a time (remove the column
 // leaving, add the one entering) and moves each channel's median by the counts below it.
 // u[0] = (r, segment length); dispatched over (rows, segments) with 64 × 1 workgroups.
+// data = the 512 CPU-rounded level / 511 values.
 @compute @workgroup_size(64, 1)
 fn fxn_median_huang(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dims = out_dims();
@@ -138,7 +141,7 @@ fn fxn_median_huang(@builtin(global_invocation_id) gid: vec3<u32>) {
                 med[c] += 1u;
             }
         }
-        textureStore(out, vec2<i32>(x, y), fxn_div4(vec4<f32>(med), vec4<f32>(511.0)));
+        textureStore(out, vec2<i32>(x, y), vec4<f32>(data[med.x], data[med.y], data[med.z], data[med.w]));
     }
 }
 
@@ -528,7 +531,7 @@ fn fxn_slice(ix: i32, iy: i32, iz: i32, tx: f32, ty: f32, seed: u32, nt: u32) ->
 // noise3::typed_noise.
 fn fxn_typed_noise(x: f32, y: f32, z: f32, seed: u32, nt: u32) -> f32 {
     if (nt == 2u) {
-        return value_noise(x, y, z, seed);
+        return soft_linear_noise(x, y, z, seed);
     }
     let x0 = floor(x);
     let y0 = floor(y);

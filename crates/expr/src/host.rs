@@ -37,7 +37,7 @@ pub enum Req {
     LayerLookup { comp: u64, key: Key },
     /// `[name, index, inPoint, outPoint, startTime, width, height, parentId|null, hasVideo, is3D, source, enabled]`.
     LayerInfo { comp: u64, layer: u64 },
-    /// `[path, isGroup, name, matchName, numChildren]` or null.
+    /// `[path, isGroup, name, matchName, numChildren, propertyIndex]` or null.
     Child { comp: u64, layer: u64, group: String, key: Key },
     /// `[name, uid, kind, dims, keyTimes, keyValues, hasExpression, propertyIndex, matchName]`.
     PropInfo { comp: u64, layer: u64, path: String },
@@ -256,6 +256,9 @@ fn find_child<'g>(g: &'g PropGroup, key: &Key) -> Option<&'g Node> {
     match key {
         Key::Index(i) => usize::try_from(*i).ok().filter(|i| *i >= 1).and_then(|i| g.children.get(i - 1)),
         Key::Name(name) => {
+            if let Some(uid) = name.strip_prefix('@').and_then(|s| s.parse::<u64>().ok()) {
+                return g.children.iter().find(|n| n.uid() == uid);
+            }
             let m = alias(name);
             let c = compact(name);
             g.children
@@ -351,12 +354,14 @@ impl<'a> Resolver<'a> {
                 let n = find_child(g, key)?;
                 let path = if group.is_empty() { format!("@{}", n.uid()) } else { format!("{group}/@{}", n.uid()) };
                 let count = n.as_group().map_or(0, |g| g.children.len());
+                let index = g.children.iter().position(|child| child.uid() == n.uid())? + 1;
                 Resp::List(vec![
                     Resp::Str(path),
                     Resp::Bool(n.as_group().is_some()),
                     Resp::Str(n.name().into()),
                     Resp::Str(n.match_id().into()),
                     Resp::Num(count as f64),
+                    Resp::Num(index as f64),
                 ])
             }
             Req::PropInfo { comp, layer, path } => {

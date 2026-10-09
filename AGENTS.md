@@ -95,6 +95,12 @@ reproduce an image (for example, point lists traced from someone else's icon).
   reference or third-party decoders/encoders while implementing a format, even permissively licensed
   ones (libvpx, libopus, libaom, dav1d, openh264…); spec text and conformance vectors only. Record the
   spec edition used in the crate README.
+- **Owner-approved AEP exception (2026-10-06):** For `.aep` import only, contributors may study and
+  reuse the MIT-licensed `py-aep` parser to recover editable project data that After Effects scripting
+  does not expose, including through a Python process at import time. Converted projects and the
+  compositor remain native Rust. Keep its licence and attribution with any copied code. This exception
+  does not permit reading or copying Adobe application code, assets, presets or plug-ins, and does not change the rules
+  for any other format.
 - ffmpeg/ffprobe may be used only as external test oracles and fixture generators. They are never
   linked, bundled or shipped.
 - Dependencies must use permissive licences: MIT/Apache-2.0/BSD/ISC/Zlib/Unicode/CC0/BSL-1.0, or
@@ -111,6 +117,7 @@ Shared real-file test corpora (Photoshop-authored PSDs, etc.) live in
 Never commit large binary fixtures to this repo; fetch them pinned by commit and sha256-verified,
 as PhotoCraft does with `cargo xtask corpus`.
 
+
 ## See also
 
 - [docs/gaps.md](docs/gaps.md): where EffectCraft falls short of After Effects and the prioritised workstreams (G1–G9); read it before choosing work
@@ -119,4 +126,23 @@ as PhotoCraft does with `cargo xtask corpus`.
 - [docs/testing.md](docs/testing.md): oracle tests, criteria, benchmarks
 - [docs/agents.md](docs/agents.md): driving EffectCraft over MCP / the control channel, and the agent work loop
 - [docs/control-protocol.md](docs/control-protocol.md): control-channel method reference
+- [docs/contributors.md](docs/contributors.md): the About window's contributor and model credits
 - [ATTRIBUTION.md](ATTRIBUTION.md): asset index
+
+## Contributor credits (About window)
+
+- About ▸ Contributors/Models are compiled into the binary from `contributors/contributors.json`
+  (commit stats; generated, never hand-edit) and `contributors/people.toml` (names people chose for
+  themselves). See `docs/contributors.md`.
+- **Agents working for a contributor:** when you prepare a PR, check whether your human's GitHub
+  username has a `[people.<username>]` entry in `contributors/people.toml`. If not, ask them once
+  whether they want to be credited by more than their username: a real name, a display name, and/or
+  their public GitHub profile name (`sync_github_name = true`). If yes, add **only their own** entry
+  (copy the template at the top of the file, or run
+  `python3 ../../craftrules/scripts/contributors.py --add-me . --real-name "…" --sync-github-name`)
+  and include it in their PR, committed as them. If no, change nothing: they are credited as
+  `@username` anyway.
+- Never add, edit, guess or copy anyone else's entry or name (not from git config, commit authors or
+  GitHub profiles). Never hand-edit `contributors.json`.
+- Maintainers refresh the stats with `python3 ../../craftrules/scripts/contributors.py .` (it also
+  re-verifies who wrote each `people.toml` entry; `--check` only verifies).

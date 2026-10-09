@@ -148,17 +148,33 @@ pub fn shape_value(shape: Shape, f: f64) -> f64 {
 }
 
 /// Ease High / Low remap of a selection value `v` (0..1): positive values slow the change near
-/// the fully selected (high) or unselected (low) end, negative values make it more abrupt. A cubic
-/// Bezier `y(t)` with control values `(1 - low)/3` and `1 - (1 - high)/3`; monotonic for -1..1.
+/// the fully selected (high) or unselected (low) end, negative values make it more abrupt. The
+/// remap is a cubic Bezier curve `y(x)` from (0, 0) to (1, 1), like a keyframe's speed graph: a
+/// positive ease is a flat handle reaching that fraction across (influence), a negative one a
+/// vertical handle of that length. 0 / 0 is the identity.
 pub fn ease(v: f64, high: f64, low: f64) -> f64 {
     if high == 0.0 && low == 0.0 {
         return v;
     }
-    let t = v.clamp(0.0, 1.0);
-    let p1 = (1.0 - low.clamp(-1.0, 1.0)) / 3.0;
-    let p2 = 1.0 - (1.0 - high.clamp(-1.0, 1.0)) / 3.0;
-    let u = 1.0 - t;
-    3.0 * u * u * t * p1 + 3.0 * u * t * t * p2 + t * t * t
+    let x = v.clamp(0.0, 1.0);
+    let (low, high) = (low.clamp(-1.0, 1.0), high.clamp(-1.0, 1.0));
+    let (x1, y1) = if low >= 0.0 { (low, 0.0) } else { (0.0, -low) };
+    let (x2, y2) = if high >= 0.0 { (1.0 - high, 1.0) } else { (1.0, 1.0 + high) };
+    let bez = |a: f64, b: f64, s: f64| {
+        let u = 1.0 - s;
+        3.0 * u * u * s * a + 3.0 * u * s * s * b + s * s * s
+    };
+    // x(s) is monotonic (control x values lie in 0..1): bisect for the curve parameter.
+    let (mut lo, mut hi) = (0.0, 1.0);
+    for _ in 0..48 {
+        let mid = 0.5 * (lo + hi);
+        if bez(x1, x2, mid) < x {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    bez(y1, y2, 0.5 * (lo + hi))
 }
 
 /// Selection of unit `i` of `n` (0-based, after any random reordering) by a range selector.
@@ -339,6 +355,10 @@ mod tests {
         // Monotonic.
         let v: Vec<f64> = (0..=20).map(|i| ease(i as f64 / 20.0, -1.0, 1.0)).collect();
         assert!(v.windows(2).all(|w| w[1] >= w[0]));
+        // Influence-style handles (SceneYard UI Wallet "WALLET" reveal, Ease High 30 / Low 100):
+        // the last letters are nearly unselected (E ~3%, T ~10%), as in AE, not 15% / 35%.
+        assert!(ease(0.283, 0.3, 1.0) < 0.05, "{}", ease(0.283, 0.3, 1.0));
+        assert!((ease(0.45, 0.3, 1.0) - 0.099).abs() < 0.01, "{}", ease(0.45, 0.3, 1.0));
     }
 
     #[test]

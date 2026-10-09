@@ -40,7 +40,9 @@ fn fxs_smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
 fn fxs_qdiv(x: vec3<f32>, a: f32) -> vec3<f32> {
     let q = x / a;
     let r = fma(-q, vec3<f32>(a), x);
-    return q + r / a;
+    // `q + r / a`, written as an fma so drivers (NVIDIA Vulkan) can't contract it another way
+    // and round differently from the CPU.
+    return fma(r / a, vec3<f32>(1.0), q);
 }
 
 fn fxs_rem2(i: i32) -> i32 {
@@ -898,32 +900,22 @@ fn fxs_texturize(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // ---------------------------------------------------------------- Glow (misc::glow) extras
 
-// Bright pass with the Arbitrary Map: as `glow_bright` (same f[0] / u[0] layout, see
-// kernels.wgsl) with the red, green and blue curves at data offsets f[1].xyz (−1 = identity).
+// The Arbitrary Map after the blur (misc::glow): the red, green and blue curves at data offsets
+// f[1].xyz (−1 = identity) of the blurred strength (alpha), premultiplied by it; f[0] / u[0] as
+// `glow_bright` (kernels.wgsl).
 @compute @workgroup_size(16, 16)
 fn fxs_glow_map(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = vec2<i32>(gid.xy);
     if (!fxs_inside(p)) {
         return;
     }
-    let px = textureLoad(src, p, 0);
-    let a = px.w;
-    if (a <= 0.0) {
-        textureStore(out, p, vec4<f32>(0.0));
-        return;
-    }
-    let thr = P.f[0].x;
-    var l = luminance(px.xyz / a);
-    if (P.u[0].y != 0u) {
-        l = a;
-    }
-    let k = clamp((l - thr) / max(1.0 - thr, 1e-3), 0.0, 1.0);
-    let t = glow_ab_t(l);
+    let v = clamp(textureLoad(src, p, 0).w, 0.0, 1.0);
+    let t = glow_ab_t(v);
     let c = vec3<f32>(curve_eval(P.f[1].x, t), curve_eval(P.f[1].y, t), curve_eval(P.f[1].z, t));
-    textureStore(out, p, vec4<f32>(c * k * a, k * a));
+    textureStore(out, p, vec4<f32>(c * v, v));
 }
 
-// On Top with another Glow Operation: blend_pixel(mode, original, glow · intensity, 0).
+// Behind / None with another Glow Operation: blend_pixel(mode, original, glow · intensity, 0).
 // aux = the blurred glow; u[0].x = blend mode id; f[0].x = intensity
 @compute @workgroup_size(16, 16)
 fn fxs_glow_op(@builtin(global_invocation_id) gid: vec3<u32>) {

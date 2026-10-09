@@ -159,7 +159,7 @@ pub fn gaussian_blur(img: &Image, sigma_x: f64, sigma_y: f64, repeat: bool) -> I
 
 /// Motion blur along `angle_deg` (0 = vertical in AE's Directional Blur, measured clockwise from
 /// up) over `length` pixels.
-pub fn directional_blur(img: &Image, angle_deg: f64, length: f64) -> Image {
+pub fn directional_blur(img: &Image, angle_deg: f64, length: f64, repeat: bool) -> Image {
     if length < 0.5 {
         return img.clone();
     }
@@ -172,7 +172,8 @@ pub fn directional_blur(img: &Image, angle_deg: f64, length: f64) -> Image {
             let mut acc = [0.0f32; 4];
             for i in 0..n {
                 let t = (i as f64 / (n - 1) as f64 - 0.5) * length;
-                let p = img.sample_bilinear(x as f64 + 0.5 + dx * t, y as f64 + 0.5 + dy * t);
+                let (sx, sy) = (x as f64 + 0.5 + dx * t, y as f64 + 0.5 + dy * t);
+                let p = if repeat { img.sample_bilinear_clamped(sx, sy) } else { img.sample_bilinear(sx, sy) };
                 for c in 0..4 {
                     acc[c] += p[c];
                 }
@@ -217,6 +218,18 @@ pub fn radial_blur(img: &Image, center: (f64, f64), amount: f64, zoom: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directional_blur_repeat_keeps_an_opaque_frame_opaque() {
+        // SceneYard Distorted Circle Typography: a Directional Blur adjustment layer over a
+        // full-frame black solid must not fade the frame edge to the comp background.
+        let mut img = Image::new(32, 16);
+        img.data.iter_mut().for_each(|p| *p = [0.0, 0.0, 0.0, 1.0]);
+        let fade = directional_blur(&img, 142.0, 20.0, false);
+        assert!(fade.get(0, 0)[3] < 0.9);
+        let kept = directional_blur(&img, 142.0, 20.0, true);
+        assert!(kept.data.iter().all(|p| (p[3] - 1.0).abs() < 1e-5));
+    }
 
     #[test]
     fn gaussian_preserves_mass() {

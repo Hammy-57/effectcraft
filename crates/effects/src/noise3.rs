@@ -4,7 +4,7 @@
 //!
 //! Each "noise layer" (octave) is 3D value noise (x, y, evolution) on an integer lattice. The
 //! Noise Type picks the interpolation between lattice values (Block = nearest, Linear,
-//! Soft Linear = quintic fade, Spline = Catmull-Rom). Successive layers are scaled by Sub
+//! Soft Linear = quadratic B-spline, Spline = Catmull-Rom). Successive layers are scaled by Sub
 //! Scaling, weighted by Sub Influence, rotated by Sub Rotation and shifted by Sub Offset, and the
 //! Fractal Type shapes each layer (turbulent types fold the signed noise; dynamic types warp the
 //! domain; Max keeps the strongest layer; Strings keeps thin lines). Contrast / Brightness /
@@ -17,7 +17,7 @@ use effectcraft_keyframe::Value;
 use effectcraft_project::ParamUi;
 use rayon::prelude::*;
 
-use crate::generate::value_noise;
+use crate::generate::{fade, lattice};
 use crate::{Buf, EffectCtx, EffectSpec, ParamSpec, num, p, popup, slider};
 
 /// Fractal Type options (shared by both effects).
@@ -120,36 +120,36 @@ pub fn specs() -> Vec<EffectSpec> {
 
 // ---------------------------------------------------------------- noise kernels
 
-fn lattice(ix: i32, iy: i32, iz: i32, seed: u32) -> f32 {
-    // The same hash as `generate::value_noise`, so Soft Linear matches it bit for bit.
-    let mut h =
-        (ix as u32).wrapping_mul(0x27d4_eb2d) ^ (iy as u32).wrapping_mul(0x1656_67b1) ^ (iz as u32).wrapping_mul(0x9e37_79b9) ^ seed.wrapping_mul(0x85eb_ca6b);
-    h ^= h >> 15;
-    h = h.wrapping_mul(0x2c1b_3c6d);
-    h ^= h >> 12;
-    h = h.wrapping_mul(0x297a_2d39);
-    h ^= h >> 15;
-    (h & 0xffff) as f32 / 65535.0
-}
-
-#[inline]
-fn fade(t: f32) -> f32 {
-    t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
-}
+/// Soft Linear's gain about mid-grey. Averaging 3 × 3 lattice values leaves the B-spline 0.55² of
+/// their variance, against 0.784² (181/231 per axis) for the quintic fade Soft Linear used before
+/// (#259); the gain keeps the noise's contrast.
+const SOFT_LINEAR_GAIN: f32 = (181.0 / 231.0) / 0.55;
 
 #[inline]
 fn catmull(p0: f32, p1: f32, p2: f32, p3: f32, t: f32) -> f32 {
     0.5 * (2.0 * p1 + (p2 - p0) * t + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t * t + (3.0 * p1 - p0 - 3.0 * p2 + p3) * t * t * t)
 }
 
+/// Uniform quadratic B-spline weights of the lattice values before, at and after the nearest one,
+/// for `t` = position − nearest + 0.5 in 0..1.
+#[inline]
+fn bspline(t: f32) -> [f32; 3] {
+    let s = 1.0 - t;
+    [0.5 * s * s, 0.5 + t * s, 0.5 * t * t]
+}
+
 /// 3D value noise in about 0..1 with the given [`NOISE_TYPES`] interpolation in x and y (the
 /// evolution axis z always fades smoothly).
+///
+/// Soft Linear is linear interpolation softened by a one-cell box filter, which is the quadratic
+/// B-spline: smooth like Spline from 9 lattice values instead of 16. A fade between two values
+/// has zero slope across every lattice line, which the turbulent types and high contrast turned
+/// into a visible grid (#259); the B-spline's slope there is half the neighbours' difference.
 pub fn typed_noise(x: f32, y: f32, z: f32, seed: u32, noise_type: u32) -> f32 {
-    if noise_type == NOISE_SOFT_LINEAR {
-        return value_noise(x, y, z, seed);
-    }
-    let (x0, y0, z0) = (x.floor(), y.floor(), z.floor());
-    let (tx, ty, fz) = (x - x0, y - y0, fade(z - z0));
+    // Soft Linear's taps are centred on the nearest lattice point, the others start at the cell's.
+    let h = if noise_type == NOISE_SOFT_LINEAR { 0.5 } else { 0.0 };
+    let (x0, y0, z0) = ((x + h).floor(), (y + h).floor(), z.floor());
+    let (tx, ty, fz) = (x + h - x0, y + h - y0, fade(z - z0));
     let (ix, iy, iz) = (x0 as i32, y0 as i32, z0 as i32);
     let l = |a: f32, b: f32, t: f32| a + (b - a) * t;
     let slice = |dz: i32| -> f32 {
@@ -157,13 +157,19 @@ pub fn typed_noise(x: f32, y: f32, z: f32, seed: u32, noise_type: u32) -> f32 {
         match noise_type {
             0 => c(0, 0),
             1 => l(l(c(0, 0), c(1, 0), tx), l(c(0, 1), c(1, 1), tx), ty),
+            NOISE_SOFT_LINEAR => {
+                let (wx, wy) = (bspline(tx), bspline(ty));
+                let row = |dy: i32| wx[0] * c(-1, dy) + wx[1] * c(0, dy) + wx[2] * c(1, dy);
+                wy[0] * row(-1) + wy[1] * row(0) + wy[2] * row(1)
+            }
             _ => {
                 let row = |dy: i32| catmull(c(-1, dy), c(0, dy), c(1, dy), c(2, dy), tx);
                 catmull(row(-1), row(0), row(1), row(2), ty)
             }
         }
     };
-    l(slice(0), slice(1), fz)
+    let n = l(slice(0), slice(1), fz);
+    if noise_type == NOISE_SOFT_LINEAR { 0.5 + (n - 0.5) * SOFT_LINEAR_GAIN } else { n }
 }
 
 /// Everything the per-pixel evaluation needs, resolved from the parameters.
@@ -586,5 +592,54 @@ mod tests {
         let t0 = run("ec.noise.turbulent", &[("evolution", num(200.0)), ("evolutionOptions/turbulenceFactor", num(0.0))]);
         let t1 = run("ec.noise.turbulent", &[("evolution", num(200.0)), ("evolutionOptions/turbulenceFactor", num(2.0))]);
         assert_ne!(t0, t1);
+    }
+
+    /// Turbulent Basic Fractal Noise drawn alone at `w` × `h`.
+    fn turbulent_basic(w: u32, h: u32, vals: &[(&str, Value)]) -> Image {
+        let mut all = vec![("fractalType", Value::Enum(2)), ("blendingMode", Value::Enum(BLEND_NONE))];
+        all.extend_from_slice(vals);
+        run_fx("ec.noise.fractal", &all, Image::filled(w, h, [0.0, 0.0, 0.0, 1.0]), 0.0, EffectEnv::default()).img
+    }
+
+    /// (x, y, ∂/∂x, ∂/∂y) of the grey value at every inner pixel (central differences).
+    fn gradients(img: &Image) -> Vec<(i64, i64, f64, f64)> {
+        let v = |x: i64, y: i64| img.get(x, y)[0] as f64;
+        let (w, h) = (img.width as i64, img.height as i64);
+        (1..h - 1).flat_map(|y| (1..w - 1).map(move |x| (x, y, (v(x + 1, y) - v(x - 1, y)) / 2.0, (v(x, y + 1) - v(x, y - 1)) / 2.0))).collect()
+    }
+
+    /// #259: Soft Linear faded between two lattice values with zero slope across every lattice
+    /// line, which Turbulent Basic and high contrast showed as a square grid.
+    #[test]
+    fn soft_linear_has_no_lattice_creases() {
+        // One 16 px layer whose lattice lines run through the pixel centres x, y = 16k: the slope
+        // across them is about the average slope (with the fade it was 2% of it).
+        let one = turbulent_basic(160, 96, &[("complexity", num(1.0)), ("transform/scale", num(16.0)), ("transform/offset", Value::Vec2([0.5, 0.5]))]);
+        let (mut on, mut n_on, mut all, mut n_all) = (0.0, 0.0, 0.0, 0.0);
+        for (x, y, gx, gy) in gradients(&one) {
+            for (k, g) in [(x, gx), (y, gy)] {
+                all += g.abs();
+                n_all += 1.0;
+                if k % 16 == 0 {
+                    on += g.abs();
+                    n_on += 1.0;
+                }
+            }
+        }
+        let across = (on / n_on) / (all / n_all);
+        assert!(across > 0.5, "slope across lattice lines / average slope: {across}");
+        // The issue's settings at a quarter size: gradients run along the lattice axes about as
+        // strongly as along the diagonals (with the fade, 1.2× as strongly).
+        let img = turbulent_basic(480, 270, &[("contrast", num(140.0)), ("brightness", num(-35.0)), ("transform/scale", num(105.0))]);
+        let (mut axis, mut diag) = (0.0, 0.0);
+        for (_, _, gx, gy) in gradients(&img) {
+            let a = gy.atan2(gx).to_degrees().rem_euclid(90.0);
+            if !(15.0..=75.0).contains(&a) {
+                axis += gx.hypot(gy);
+            } else if (30.0..=60.0).contains(&a) {
+                diag += gx.hypot(gy);
+            }
+        }
+        assert!(axis / diag < 1.15, "gradient along the axes / along the diagonals: {}", axis / diag);
     }
 }

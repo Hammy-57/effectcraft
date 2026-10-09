@@ -9,6 +9,7 @@ use effectcraft_engine::geom::{Mat3, vec2 as gv2};
 use egui::{Align2, Color32, Pos2, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
 
 use crate::theme::Tokens;
+use crate::widgets;
 
 // ---------------------------------------------------------------------------------------------
 // Angles
@@ -38,6 +39,23 @@ pub fn parse_angle(s: &str) -> Option<f64> {
         return Some(rev * 360.0 + deg);
     }
     s.parse().ok()
+}
+
+/// An angle value, `0x+45.0°`, at `at` (top left): the revolutions and the degrees
+/// are hot numbers of their own (drag to scrub, click to type) and changing one keeps the other.
+/// Returns the revolutions' rect, the degrees' rect and the new angle when either changed.
+pub fn angle_field(ui: &mut egui::Ui, at: Pos2, id: egui::Id, v: f64, decimals: usize, t: &Tokens) -> (Rect, Rect, Option<f64>) {
+    let (rev, deg) = split_angle(v);
+    let (rr, new_rev, _) = widgets::hot_int_at(ui, at, id.with("rev"), rev, 0.1, "x", t);
+    let sign = ui.painter().text(pos2(rr.max.x - 2.0, rr.center().y), Align2::LEFT_CENTER, if deg < 0.0 { "-" } else { "+" }, Tokens::ui(12.0), t.hot_text);
+    let (dr, new_deg, _) = widgets::hot_number_at(ui, pos2(sign.max.x - 2.0, at.y), id, deg.abs(), 0.5, (-1e9, 1e9), decimals, "°", t);
+    let out = match (new_rev, new_deg) {
+        (Some(r), _) => Some(r as f64 * 360.0 + deg),
+        // The degrees field shows the remainder's size; its sign stays.
+        (None, Some(d)) => Some(rev as f64 * 360.0 + if deg < 0.0 || (deg == 0.0 && v < 0.0) { -d } else { d }),
+        (None, None) => None,
+    };
+    (rr, dr, out)
 }
 
 /// Dial angle (degrees, 0 = up, clockwise) of `p` around `c` in screen space.
@@ -167,18 +185,23 @@ pub fn layer_to_comp(l2c: &Mat3, p: [f64; 2]) -> [f64; 2] {
     [v.x, v.y]
 }
 
-/// Straight RGBA (0..1) of the displayed frame at comp point `pt` (the frame may be rendered
-/// at a reduced resolution: `comp` is the comp size in pixels). `None` outside the frame.
-pub fn sample_frame(img: &egui::ColorImage, comp: [f32; 2], pt: [f64; 2]) -> Option<[f32; 4]> {
-    if comp[0] <= 0.0 || comp[1] <= 0.0 || pt[0] < 0.0 || pt[1] < 0.0 {
+/// The premultiplied pixel of the displayed frame at comp point `pt`. The frame covers
+/// `region` ([x, y, w, h] in comp pixels: the whole comp, or the region of interest or Extended
+/// Viewer area it was rendered for), maybe at a reduced resolution. `None` outside it.
+pub fn frame_pixel(img: &egui::ColorImage, region: [f64; 4], pt: [f64; 2]) -> Option<Color32> {
+    let [x, y, w, h] = region;
+    let (fx, fy) = ((pt[0] - x) / w, (pt[1] - y) / h);
+    if !(0.0..1.0).contains(&fx) || !(0.0..1.0).contains(&fy) {
         return None;
     }
-    let sx = (pt[0] / comp[0] as f64 * img.size[0] as f64).floor() as usize;
-    let sy = (pt[1] / comp[1] as f64 * img.size[1] as f64).floor() as usize;
-    if sx >= img.size[0] || sy >= img.size[1] {
-        return None;
-    }
-    let c = img.pixels[sy * img.size[0] + sx];
+    let sx = ((fx * img.size[0] as f64).floor() as usize).min(img.size[0].saturating_sub(1));
+    let sy = ((fy * img.size[1] as f64).floor() as usize).min(img.size[1].saturating_sub(1));
+    img.pixels.get(sy.checked_mul(img.size[0])?.checked_add(sx)?).copied()
+}
+
+/// Straight RGBA (0..1) of the displayed frame at comp point `pt` ([`frame_pixel`]).
+pub fn sample_frame(img: &egui::ColorImage, region: [f64; 4], pt: [f64; 2]) -> Option<[f32; 4]> {
+    let c = frame_pixel(img, region, pt)?;
     let a = c.a() as f32 / 255.0;
     if a <= 0.0 {
         return Some([0.0, 0.0, 0.0, 0.0]);
@@ -621,12 +644,20 @@ mod tests {
         img.pixels[4 + 3] = Color32::from_rgba_premultiplied(128, 64, 0, 128); // (3, 1), half alpha
         img.pixels[0] = Color32::from_rgb(255, 0, 0);
         // The frame is rendered at half resolution of an 8 × 4 comp.
-        let c = sample_frame(&img, [8.0, 4.0], [7.5, 3.0]).unwrap();
+        let comp = [0.0, 0.0, 8.0, 4.0];
+        let c = sample_frame(&img, comp, [7.5, 3.0]).unwrap();
         assert!((c[0] - 1.0).abs() < 0.01 && (c[1] - 0.5).abs() < 0.01 && c[2] == 0.0, "{c:?}");
         assert!((c[3] - 128.0 / 255.0).abs() < 1e-6);
-        assert_eq!(sample_frame(&img, [8.0, 4.0], [0.5, 0.5]), Some([1.0, 0.0, 0.0, 1.0]));
-        assert_eq!(sample_frame(&img, [8.0, 4.0], [8.0, 1.0]), None, "outside");
-        assert_eq!(sample_frame(&img, [8.0, 4.0], [-1.0, 1.0]), None);
+        assert_eq!(sample_frame(&img, comp, [0.5, 0.5]), Some([1.0, 0.0, 0.0, 1.0]));
+        assert_eq!(sample_frame(&img, comp, [8.0, 1.0]), None, "outside");
+        assert_eq!(sample_frame(&img, comp, [-1.0, 1.0]), None);
+        assert_eq!(sample_frame(&img, [0.0, 0.0, 0.0, 4.0], [0.0, 1.0]), None, "an empty region");
+        // A frame of the region of interest (16, 8) to (24, 12) of a bigger comp (#284: it was
+        // read as if it covered the whole comp).
+        let roi = [16.0, 8.0, 8.0, 4.0];
+        assert_eq!(sample_frame(&img, roi, [16.5, 8.5]), Some([1.0, 0.0, 0.0, 1.0]));
+        assert!(sample_frame(&img, roi, [23.5, 11.0]).is_some_and(|c| c[3] > 0.4 && c[3] < 0.6));
+        assert_eq!(sample_frame(&img, roi, [0.5, 0.5]), None, "outside the region");
     }
 
     #[test]

@@ -139,7 +139,7 @@ fn g1(x: f32, k: f32) -> f32 {
     return x / (x * (1.0 - k) + k);
 }
 
-fn brdf(base: vec3<f32>, metallic: f32, rough_in: f32, spec_k: f32, diff_k: f32, n: vec3<f32>, v: vec3<f32>, l: vec3<f32>) -> vec3<f32> {
+fn brdf(base: vec3<f32>, metallic: f32, rough_in: f32, spec_k: f32, diff_k: f32, metal_k: f32, n: vec3<f32>, v: vec3<f32>, l: vec3<f32>) -> vec3<f32> {
     let n_l = dot(n, l);
     if (n_l <= 0.0) {
         return vec3<f32>(0.0);
@@ -149,7 +149,7 @@ fn brdf(base: vec3<f32>, metallic: f32, rough_in: f32, spec_k: f32, diff_k: f32,
     let n_h = max(dot(n, h), 0.0);
     let v_h = max(dot(v, h), 0.0);
     let r = clamp(rough_in, 0.03, 1.0);
-    let f0 = mix(vec3<f32>(0.04 * spec_k), base, metallic);
+    let f0 = mix(vec3<f32>(0.04 * spec_k), base * metal_k, metallic);
     let fk = pow(clamp(1.0 - v_h, 0.0, 1.0), 5.0);
     let f = f0 + (vec3<f32>(1.0) - f0) * fk;
     let d = d_ggx(n_h, r * r);
@@ -265,6 +265,10 @@ fn attenuation(kind: u32, falloff: u32, radius: f32, falloff_distance: f32, cos_
             k = q * q;
         }
     }
+    // Physical distance dimming of point lights (shade::attenuation).
+    if (kind == 2u) {
+        k = k * 9350.0 / (dist * dist + 62600.0);
+    }
     if (kind == 1u) {
         let cos_a = clamp(dot(-to_l, dir), -1.0, 1.0);
         if (cos_a >= cos_inner) {
@@ -302,6 +306,7 @@ fn fs(i: VOut, @builtin(front_facing) front: bool) -> FOut {
     let unlit = (flags & 2u) != 0u;
     let accepts_lights = (flags & 4u) != 0u;
     let receives_shadows = (flags & 8u) != 0u;
+    let direct_metal_only = (flags & 16u) != 0u;
     let alpha_mode = (flags >> 8u) & 3u;
     if (!front && !double_sided) {
         discard;
@@ -371,6 +376,7 @@ fn fs(i: VOut, @builtin(front_facing) front: bool) -> FOut {
     let diff_k = m4.z;
     let spec_k = m4.w;
     let amb_k = m5.x;
+    let metal_k = m5.z;
     var acc = vec3<f32>(0.0);
     let nl_count = u32(g.fwd.w);
     for (var li = 0u; li < nl_count; li = li + 1u) {
@@ -409,7 +415,7 @@ fn fs(i: VOut, @builtin(front_facing) front: bool) -> FOut {
         if (receives_shadows) {
             sh = light_shadow(li, kind, l0.xyz, i32(l3.w), l4.x, i.pos, n_l);
         }
-        let b = brdf(rgb, metallic, rough, spec_k, diff_k, n, v, to_l);
+        let b = brdf(rgb, metallic, rough, spec_k, diff_k, metal_k, n, v, to_l);
         acc = acc + b * l2.xyz * k * sh;
     }
     acc = acc + g.ambient.xyz * rgb * amb_k * ao;
@@ -427,10 +433,11 @@ fn fs(i: VOut, @builtin(front_facing) front: bool) -> FOut {
         let sa = sample_tex(i32(g.env.x) + i32(lo), ruv).rgb;
         let sb = sample_tex(i32(g.env.x) + i32(hi), ruv).rgb;
         let spec = (sa + (sb - sa) * f) * g.env.w;
-        let f0 = mix(vec3<f32>(0.04 * spec_k), rgb, metallic);
+        let em = select(metallic, 0.0, direct_metal_only);
+        let f0 = mix(vec3<f32>(0.04 * spec_k), rgb, em);
         let ab = env_brdf(n_v, rough);
         let fs = f0 * ab.x + vec3<f32>(ab.y);
-        acc = acc + (irr * rgb * (vec3<f32>(1.0) - fs) * (1.0 - metallic) * diff_k + spec * fs) * ao;
+        acc = acc + (irr * rgb * (vec3<f32>(1.0) - fs) * (1.0 - em) * diff_k + spec * fs) * ao;
     }
     let c = acc + emissive;
     out.color = vec4<f32>(c * alpha, alpha);

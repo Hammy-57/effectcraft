@@ -1,6 +1,6 @@
 //! End-to-end tests of the agent CLI: JSON output, project round-trips, rendering and MCP over stdio.
 
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -130,6 +130,60 @@ fn errors_are_json() {
     assert_eq!(out.status.code(), Some(2));
 }
 
+/// An unknown option is a usage error (exit 2) naming it, before anything runs: the command
+/// doesn't run with defaults, and a misspelt option's value isn't opened as the project (#168).
+#[test]
+fn unknown_options_are_usage_errors() {
+    let png = tmp("bogus.png");
+    let o = png.to_str().unwrap();
+    for (args, named) in [
+        (&["exec", "comp.new", "--bogus", "--empty", "--json"][..], "`--bogus`"),
+        (&["render-frame", "--bogusflag", "--out", o, "--json"], "`--bogusflag`"),
+        (&["exec", "comp.new", "--empty", "--saveas", "z.ecproj", "--json"], "`--saveas`"),
+    ] {
+        let out = bin().args(args).output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {err}");
+        assert!(err.contains(&format!("unknown option {named}")), "{args:?}: {err}");
+        assert!(out.stdout.is_empty(), "{args:?}: nothing ran");
+    }
+    assert!(!png.exists(), "render-frame didn't render");
+    // `--transparent` (silently ignored before) keeps the frame's alpha.
+    let proj = tmp("transparent.ecproj");
+    let p = proj.to_str().unwrap();
+    ok_json(&["run", "comp.new", r#"{"name":"T","width":32,"height":32}"#, "layer.newSolid", r#"{"width":8,"height":8}"#, "--empty", "--save-as", p]);
+    for (flag, alpha) in [(None, 255), (Some("--transparent"), 0)] {
+        ok_json(&[&["render-frame", p, "--out", o][..], flag.as_slice()].concat());
+        assert_eq!(image::open(&png).unwrap().to_rgba8().get_pixel(0, 0)[3], alpha, "{flag:?}");
+    }
+}
+
+/// A reader that closes stdout before the CLI writes (`| head`) is not a crash: the command
+/// still does its work and exits 0, without a panic (#167).
+#[test]
+fn a_closed_stdout_is_not_a_crash() {
+    let proj = tmp("closed-stdout.ecproj");
+    let p = proj.to_str().unwrap();
+    for args in [&["info", "--json"][..], &["exec", "--list"], &["run", "comp.new", r#"{"name":"Piped"}"#, "project.summary", "--empty", "--save-as", p]] {
+        let mut child = bin().args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        drop(child.stdout.take());
+        let out = child.wait_with_output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(0), "{args:?}: {err}");
+        assert!(!err.contains("panicked"), "{args:?}: {err}");
+    }
+    assert!(std::fs::read_to_string(&proj).unwrap().contains("Piped"), "the sequence ran to the end and saved");
+    // The MCP server ends quietly when its client closes stdout.
+    let mut child = bin().arg("mcp").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    drop(child.stdout.take());
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        let _ = writeln!(stdin, "{}", json!({"jsonrpc": "2.0", "id": 1, "method": "ping"}));
+    }
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
 #[test]
 fn mcp_over_stdio() {
     let mut child = bin().args(["mcp", "--demo"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
@@ -185,4 +239,218 @@ fn script_file_and_eval() {
     let (code, v) = run_json(&["script", "--eval", "\nnope()"]);
     assert_eq!(code, 1);
     assert_eq!(v["error"]["line"], json!(2));
+    // A compiled .jsxbin script is reported as unsupported, not as a SyntaxError (#176).
+    let bin_script = tmp("compiled.jsxbin");
+    std::fs::write(&bin_script, "@JSXBIN@ES@2.0@MyBbyBn0ABJAnAEjzFjBjMjFjSjUBfRBFeFjIjFjMjMjPff0DzACByB\n").unwrap();
+    let out = bin().args(["script", bin_script.to_str().unwrap()]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains(".jsxbin scripts are not supported: run the .jsx source") && !err.contains("SyntaxError"), "{err}");
+}
+
+/// `render --out` (#300): a relative path is relative to the working directory like `--project`,
+/// not to the project's folder (which doubled a path that already named it).
+#[test]
+fn render_out_is_relative_to_the_working_directory() {
+    let root = tmp("render-out");
+    let _ = std::fs::remove_dir_all(&root);
+    let (proj, elsewhere) = (root.join("proj"), root.join("elsewhere"));
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let project = proj.join("x.ecproj");
+    let p = project.to_str().unwrap();
+    ok_json(&[
+        "run",
+        "comp.new",
+        r#"{"name":"T","width":64,"height":36,"duration":1}"#,
+        "layer.newSolid",
+        r#"{"width":64,"height":36}"#,
+        "--empty",
+        "--save-as",
+        p,
+    ]);
+    assert!(project.exists());
+    let render = |cwd: &std::path::Path, project: &str, out: &str| {
+        let o = bin()
+            .current_dir(cwd)
+            .args(["render", "--project", project, "--format", "gif", "--start", "0", "--end", "0.1", "--resolution", "quarter", "--out", out, "--json"])
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{out}: {}", String::from_utf8_lossy(&o.stderr));
+        let v: Value = serde_json::from_slice(&o.stdout).unwrap();
+        PathBuf::from(v["rendered"][0]["output"].as_str().unwrap())
+    };
+    // A path that already names the project folder is not doubled.
+    let done = render(&root, "proj/x.ecproj", "proj/out/d.gif");
+    assert_eq!(done, root.join("proj/out/d.gif"));
+    assert!(done.exists() && !proj.join("proj").exists());
+    // Another working directory: the file lands there, not beside the project.
+    let done = render(&elsewhere, project.to_str().unwrap(), "out/card.gif");
+    assert_eq!(done, elsewhere.join("out/card.gif"));
+    assert!(done.exists() && !proj.join("out/card.gif").exists());
+    // `./f.gif` too.
+    assert_eq!(render(&elsewhere, project.to_str().unwrap(), "./f.gif"), elsewhere.join("./f.gif"));
+    // An absolute path is unchanged.
+    let abs = root.join("abs.gif");
+    assert_eq!(render(&elsewhere, project.to_str().unwrap(), abs.to_str().unwrap()), abs);
+    assert!(abs.exists());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A real stdio client: each edit's reply is read before disconnecting or killing the server.
+struct McpChild {
+    child: std::process::Child,
+    output: BufReader<std::process::ChildStdout>,
+}
+
+impl McpChild {
+    fn start(config: &std::path::Path, autosave: bool) -> Self {
+        let mut command = bin();
+        command.arg("mcp").env("EFFECTCRAFT_CONFIG_DIR", config).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        if autosave {
+            command.arg("--autosave");
+        }
+        let mut child = command.spawn().unwrap();
+        let output = BufReader::new(child.stdout.take().unwrap());
+        Self { child, output }
+    }
+    fn rpc(&mut self, method: &str, params: Value) -> Value {
+        writeln!(self.child.stdin.as_mut().unwrap(), "{}", json!({"jsonrpc":"2.0", "id":1, "method":method, "params":params})).unwrap();
+        let mut line = String::new();
+        assert!(self.output.read_line(&mut line).unwrap() > 0, "server exited without replying");
+        let reply: Value = serde_json::from_str(&line).unwrap();
+        assert!(reply.get("error").is_none(), "{reply}");
+        reply["result"].clone()
+    }
+    fn tool(&mut self, name: &str, arguments: Value) -> Value {
+        let result = self.rpc("tools/call", json!({"name":name,"arguments":arguments}));
+        assert_eq!(result["isError"], false, "{result}");
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap()
+    }
+    fn kill(&mut self) {
+        self.child.kill().unwrap();
+        self.child.wait().unwrap();
+    }
+    fn eof(&mut self) {
+        drop(self.child.stdin.take());
+        assert!(self.child.wait().unwrap().success());
+    }
+}
+
+impl Drop for McpChild {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn mcp_config(name: &str) -> PathBuf {
+    let dir = tmp(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[test]
+fn mcp_autosave_survives_kill_and_restart_without_touching_desktop_settings() {
+    let config = mcp_config("mcp-kill");
+    let prefs = r#"{"autoSave":{"enabled":false,"maxVersions":2,"intervalMinutes":20}}"#;
+    std::fs::write(config.join("prefs.json"), prefs).unwrap();
+    std::fs::write(config.join("shortcuts.json"), "{}").unwrap();
+    std::fs::write(config.join("session.lock"), "desktop sentinel").unwrap();
+    let mut first = McpChild::start(&config, true);
+    first.rpc("initialize", json!({}));
+    first.tool("execute_command", json!({"command":"comp.new","params":{"name":"Survives restart","width":320,"height":180}}));
+    first.tool("execute_command", json!({"command":"layer.newText","params":{"text":"Unsaved title"}}));
+    assert_eq!(first.tool("execute_command", json!({"command":"prefs.get","params":{"key":"autoSave.enabled"}})), false);
+    let status = first.tool("get_project", json!({}))["autosave"].clone();
+    let path = status["latestPath"].as_str().unwrap();
+    first.kill(); // SIGKILL: there is no opportunity to save at EOF.
+    let folder = std::path::Path::new(status["folder"].as_str().unwrap());
+    assert_eq!(effectcraft_engine::autosave::existing(folder, "Untitled Project").len(), 2, "loaded maxVersions is respected");
+    let manifest: Value = serde_json::from_str(&std::fs::read_to_string(folder.join("session.json")).unwrap()).unwrap();
+    assert_eq!(manifest["dirty"], true);
+    assert_eq!(manifest["ended"], false);
+    let mut restarted = McpChild::start(&config, true);
+    let init = restarted.rpc("initialize", json!({}));
+    assert!(init["instructions"].as_str().unwrap().contains(path));
+    assert_eq!(init["_meta"]["effectcraftAutoSave"]["previousSessions"][0]["autosave"], path);
+    restarted.tool("open_project", json!({"path":path}));
+    let comp = restarted.tool("get_comp", json!({"comp":"Survives restart"}));
+    assert_eq!(comp["layers"].as_array().unwrap().len(), 1);
+    let layer = restarted.tool("get_layer", json!({"layer":"#1"}));
+    assert!(layer.to_string().contains("Unsaved title"), "{layer}");
+    restarted.tool("save_project", json!({"path":config.join("Recovered.ecproj")}));
+    restarted.eof();
+    assert_eq!(std::fs::read_to_string(config.join("prefs.json")).unwrap(), prefs);
+    assert_eq!(std::fs::read_to_string(config.join("shortcuts.json")).unwrap(), "{}");
+    assert_eq!(std::fs::read_to_string(config.join("session.lock")).unwrap(), "desktop sentinel");
+    std::fs::remove_dir_all(config).unwrap();
+}
+
+#[test]
+fn mcp_autosave_eof_preserves_titled_edits_without_overwriting_project() {
+    let config = mcp_config("mcp-eof");
+    let original = config.join("Original.ecproj");
+    let mut first = McpChild::start(&config, true);
+    first.tool("execute_command", json!({"command":"comp.new","params":{"name":"Original"}}));
+    first.tool("save_project", json!({"path":original}));
+    let original_bytes = std::fs::read(&original).unwrap();
+    first.tool("execute_command", json!({"command":"layer.newText","params":{"text":"Not manually saved"}}));
+    let status = first.tool("get_project", json!({}))["autosave"].clone();
+    first.eof();
+    assert_eq!(std::fs::read(original).unwrap(), original_bytes);
+    assert!(std::fs::read_to_string(status["latestPath"].as_str().unwrap()).unwrap().contains("Not manually saved"));
+    let folder = std::path::Path::new(status["folder"].as_str().unwrap());
+    let manifest: Value = serde_json::from_str(&std::fs::read_to_string(folder.join("session.json")).unwrap()).unwrap();
+    assert_eq!(manifest["ended"], true);
+    assert_eq!(manifest["dirty"], true);
+    std::fs::remove_dir_all(config).unwrap();
+}
+
+#[test]
+fn mcp_autosave_preserves_work_when_stdout_is_closed() {
+    let config = mcp_config("mcp-broken-pipe");
+    let mut child = bin()
+        .args(["mcp", "--autosave"])
+        .env("EFFECTCRAFT_CONFIG_DIR", &config)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    {
+        let mut input = child.stdin.take().unwrap();
+        writeln!(input, "{}", json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"execute_command","arguments":{"command":"comp.new","params":{"name":"Closed stdout"}}}})).unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let base = config.join(effectcraft_engine::autosave::AUTOSAVE_FOLDER).join("MCP");
+    let folder = std::fs::read_dir(base).unwrap().next().unwrap().unwrap().path();
+    let manifest: Value = serde_json::from_str(&std::fs::read_to_string(folder.join("session.json")).unwrap()).unwrap();
+    assert!(std::fs::read_to_string(manifest["autosave"].as_str().unwrap()).unwrap().contains("Closed stdout"));
+    assert_eq!(manifest["ended"], true);
+    std::fs::remove_dir_all(config).unwrap();
+}
+
+#[test]
+fn mcp_autosave_is_opt_in_and_rejects_invalid_combinations() {
+    let config = mcp_config("mcp-opt-in");
+    let mut client = McpChild::start(&config, false);
+    client.tool("execute_command", json!({"command":"comp.new","params":{"name":"Ephemeral"}}));
+    client.eof();
+    assert!(std::fs::read_dir(&config).unwrap().next().is_none());
+    for args in [["mcp", "--autosave", "--bridge", "1"].as_slice(), ["info", "--autosave"].as_slice()] {
+        let out = bin().args(args).env("EFFECTCRAFT_CONFIG_DIR", &config).output().unwrap();
+        assert_eq!(out.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("--autosave"));
+    }
+    let blocked = config.join("file-not-directory");
+    std::fs::write(&blocked, "file").unwrap();
+    let out = bin().args(["mcp", "--autosave"]).env("EFFECTCRAFT_CONFIG_DIR", blocked).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("MCP auto-save"));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("panicked"));
+    std::fs::remove_dir_all(config).unwrap();
 }

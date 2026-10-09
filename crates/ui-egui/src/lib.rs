@@ -11,12 +11,16 @@ pub mod audio;
 pub mod automation;
 pub mod bench;
 pub mod control;
+pub mod credits;
 pub mod dock;
 pub mod dock_ui;
 pub mod frames;
+pub mod gpu_failure;
 pub mod header;
 pub mod i18n;
 pub mod icons;
+mod local_assets;
+pub mod menu_keys;
 pub mod menus;
 pub mod native_menu;
 pub mod panels;
@@ -40,6 +44,28 @@ use state::UiState;
 use theme::Tokens;
 
 const SCREENSHOT_TIMEOUT_S: f64 = 4.0;
+
+fn compositor_gpu(adapter: &eframe::wgpu::Adapter, device: eframe::wgpu::Device, queue: eframe::wgpu::Queue) -> Result<effectcraft_gpu::Gpu, String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (device, queue);
+        pollster::block_on(effectcraft_gpu::Gpu::request_on_adapter(adapter))
+    }
+    #[cfg(target_arch = "wasm32")]
+    effectcraft_gpu::Gpu::new(adapter, device, queue)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[test]
+fn compositor_does_not_share_the_window_surface_device() {
+    // Surface::configure waits for its device to go idle. Frame workers submitting to that same
+    // device during a window move made wgpu panic with GpuWaitTimeout.
+    let instance = eframe::wgpu::Instance::default();
+    let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return };
+    let Ok((device, queue)) = pollster::block_on(adapter.request_device(&Default::default())) else { return };
+    let gpu = compositor_gpu(&adapter, device.clone(), queue).unwrap();
+    assert_ne!(gpu.device(), &device);
+}
 /// Seconds without a project change before paused prefetch resumes (see
 /// [`EffectcraftApp::editing`]).
 const EDIT_QUIET: f64 = 0.3;
@@ -101,13 +127,32 @@ pub struct Hooks {
     pub audio_devices: Option<Box<dyn Fn() -> Vec<String>>>,
     /// Picks a folder (Settings paths).
     pub pick_folder: Option<Box<dyn Fn() -> Option<String>>>,
-    /// Save dialog for other file kinds: (default name, extension).
+    /// Save dialog for other file kinds: (default name or path, extension; empty: no filter). A
+    /// default path opens the dialog in its folder.
     pub pick_save_file: Option<Box<dyn Fn(&str, &str) -> Option<String>>>,
     /// The system clipboard's text (native menu Edit ▸ Paste into a text field).
     pub clipboard_text: Option<Box<dyn Fn() -> Option<String>>>,
     /// Application actions the OS performs (`app.hide`, `app.hideOthers`, `app.showAll` on
     /// macOS). Returns false when the host doesn't handle the id.
     pub app_action: Option<Box<dyn Fn(&str) -> bool>>,
+}
+
+impl Hooks {
+    /// The host's save dialog for `default` (a file name or path), offering its extension: the
+    /// project dialog for project files, else [`Hooks::pick_save_file`]. The project dialog is
+    /// the fallback for hosts without that (the web, whose dialog only names the file): on macOS
+    /// a dialog filtered to projects appends `.ecproj` to any other name (#293). `None` when the
+    /// host has no save dialog; `Some(None)` when it was cancelled.
+    pub fn save_dialog(&self, default: &str) -> Option<Option<String>> {
+        let path = std::path::Path::new(default);
+        let ext = path.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_default();
+        match (&self.pick_save_file, &self.pick_save) {
+            (Some(pick), _) if !ext.eq_ignore_ascii_case("ecproj") => Some(pick(default, &ext)),
+            (_, Some(pick)) => Some(pick(&path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default())),
+            (Some(pick), None) => Some(pick(default, &ext)),
+            (None, None) => None,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -135,6 +180,11 @@ pub struct Playback {
     pub restore_max: Option<Option<PanelKind>>,
     /// Audio-only previews: the frame under the audible sample (the current time stays put).
     pub audio_frame: Option<i64>,
+    /// The preview's sound waits for frames: while the frames ahead aren't cached, every frame
+    /// shows as it renders, silently; the sound starts once the rest of the preview (or what
+    /// fits in the RAM preview) is cached, so it never plays over skipped frames (#103), or
+    /// sooner once the silent preview keeps real time with the frames ahead cached (#208).
+    pub audio_held: bool,
     /// When the last frames were shown (seconds, the last second's worth): the achieved rate.
     pub shown_at: std::collections::VecDeque<f64>,
 }
@@ -162,6 +212,15 @@ impl Playback {
         let step = self.plan.map_or(1, |p| p.step).max(1) as f64;
         self.achieved_fps().map(|f| f * step >= self.fps * 0.95)
     }
+
+    /// The preview has kept real time for the last quarter second (at least two frames) up to
+    /// `now`: rendering keeps up, so sound can start without waiting for the whole preview.
+    pub fn keeps_up(&self, now: f64) -> bool {
+        let step = self.plan.map_or(1, |p| p.step).max(1) as f64;
+        let frame = step / self.fps.max(1.0);
+        let (Some(a), Some(b)) = (self.shown_at.front(), self.shown_at.back()) else { return false };
+        self.shown_at.len() >= 3 && b - a >= (2.0 * frame).max(0.25) && now - b <= 2.0 * frame && self.real_time() == Some(true)
+    }
 }
 
 pub struct EffectcraftApp {
@@ -177,6 +236,8 @@ pub struct EffectcraftApp {
     last_time: f64,
     styled: bool,
     fonts_ready: bool,
+    /// The interface language the fonts were installed for; `""` until the first frame.
+    styled_language: &'static str,
     pub(crate) control_rx: Option<Receiver<ControlRequest>>,
     pub(crate) deferred: Vec<(ControlRequest, f64)>,
     pub(crate) synthetic: Vec<egui::Event>,
@@ -211,6 +272,8 @@ pub struct EffectcraftApp {
     /// The GPU compositor on that device (None: no usable adapter → CPU only).
     pub(crate) gpu: Option<effectcraft_gpu::Gpu>,
     gpu_checked: bool,
+    gpu_failures: Option<gpu_failure::GpuFailureBridge>,
+    gpu_failure_applied: Option<bool>,
     /// Commands from the native menu bar.
     pub command_inbox: Option<Receiver<String>>,
     /// Pointer position in comp pixels (Info panel).
@@ -261,6 +324,7 @@ impl EffectcraftApp {
             last_time: 0.0,
             styled: false,
             fonts_ready: false,
+            styled_language: "",
             control_rx: None,
             deferred: vec![],
             synthetic: vec![],
@@ -282,6 +346,8 @@ impl EffectcraftApp {
             wgpu: None,
             gpu: None,
             gpu_checked: false,
+            gpu_failures: None,
+            gpu_failure_applied: None,
             command_inbox: None,
             pointer_comp: None,
             dialog_state: Default::default(),
@@ -333,6 +399,10 @@ impl EffectcraftApp {
         theme::apply_visuals(ctx, &self.tokens);
         let tips = p.general.show_tool_tips;
         ctx.all_styles_mut(|s| s.interaction.tooltip_delay = if tips { 0.5 } else { f32::INFINITY });
+        // Settings ▸ Appearance ▸ UI Scale (#284). egui's own Ctrl+= / Ctrl+- / Ctrl+0 zoom stays
+        // off: Ctrl+0 is Window ▸ Project, and the scale is a setting.
+        ctx.options_mut(|o| o.zoom_with_keyboard = false);
+        ctx.set_zoom_factor(p.appearance.ui_scale as f32 / 100.0);
         self.ui.cache_when_idle = p.previews.cache_frames_when_idle;
         self.ui.viewer.fast_preview = p.previews.fast_previews;
         self.frames.set_budget(p.cache_budgets(self.session.sys_memory).preview);
@@ -362,23 +432,34 @@ impl EffectcraftApp {
     }
 
     pub fn set_workspace(&mut self, name: &str) {
-        self.ui.workspace = name.to_string();
-        self.ui.dock = self.ui.saved_workspaces.get(name).cloned().unwrap_or_else(|| dock::workspace(name));
-        self.ui.floating = self.ui.saved_floating.get(name).cloned().unwrap_or_else(|| dock::workspace_floating(name));
-        self.ui.maximized = None;
-        // Learn: the Home screen's Learn tab (tutorials) in the Composition panel.
+        // Learn: the Home screen's Learn tab (tutorials) in the Composition panel. Leaving it for
+        // another workspace closes the Home screen again: it stayed over every workspace until a
+        // project was created (#272).
         if name == "Learn" {
             self.ui.start_screen = true;
             self.ui.home_learn = true;
             self.ui.home_templates = false;
+        } else if self.ui.workspace == "Learn" {
+            self.ui.start_screen = false;
+            self.ui.home_learn = false;
         }
+        self.ui.workspace = name.to_string();
+        self.ui.dock = self.ui.saved_workspaces.get(name).cloned().unwrap_or_else(|| dock::workspace(name));
+        self.ui.floating = self.ui.saved_floating.get(name).cloned().unwrap_or_else(|| dock::workspace_floating(name));
+        self.ui.maximized = None;
     }
 
     /// Built-in workspaces followed by the saved ones (Window ▸ Workspace ▸ Save as New Workspace).
     pub fn workspace_names(&self) -> Vec<String> {
         let mut v: Vec<String> = dock::WORKSPACES.iter().map(|s| s.to_string()).collect();
-        v.extend(self.ui.saved_workspaces.keys().filter(|k| !dock::WORKSPACES.contains(&k.as_str())).cloned());
+        v.extend(self.saved_workspace_names());
         v
+    }
+
+    /// The workspaces the user saved under a new name (built-ins whose changes were saved are
+    /// not repeated), in name order.
+    pub fn saved_workspace_names(&self) -> Vec<String> {
+        self.ui.saved_workspaces.keys().filter(|k| !dock::WORKSPACES.contains(&k.as_str())).cloned().collect()
     }
 
     /// Show panel `p` (opening it in its usual place if it is closed), bring it to the front and
@@ -451,28 +532,97 @@ impl EffectcraftApp {
             && self.ui.viewer.extended.is_none()
     }
 
-    /// Set up the GPU compositor on egui-wgpu's device (once). Without an adapter that runs
-    /// compute shaders (WebGL2, software GL) everything stays on the CPU.
+    /// Provide the executable/embedding host's device notifications. The host installs the
+    /// handlers once; this frontend never replaces handlers on a borrowed device.
+    pub fn set_gpu_failure_bridge(&mut self, bridge: gpu_failure::GpuFailureBridge) {
+        if let Some(gpu) = &self.gpu {
+            bridge.forward_to(gpu.context().device_failure_notifier());
+        }
+        self.gpu_failures = Some(bridge);
+    }
+
+    fn apply_gpu_failure(&mut self, ctx: &egui::Context) {
+        let Some(bridge) = &self.gpu_failures else { return };
+        // Readback deadlines can retire the compositor without a host device notification.
+        if let Some(gpu) = &self.gpu
+            && let Err(reason) = gpu.context().check_health()
+        {
+            bridge.report(&reason, false);
+        }
+        let Some(failure) = bridge.failure() else { return };
+        if self.gpu_failure_applied == Some(failure.presentation_lost) {
+            return;
+        }
+        self.gpu_failure_applied = Some(failure.presentation_lost);
+        self.gpu_checked = true;
+        self.frames.retire_gpu();
+        self.session.accel = None;
+        self.session.accel_note = Some(format!("GPU preview retired: {}", failure.reason));
+        self.session.layer_cache.clear();
+        self.gpu = None;
+        if let Some(rs) = &self.wgpu {
+            let mut renderer = rs.renderer.write();
+            if let Some((id, _, _)) = &self.viewer_native {
+                renderer.free_texture(id);
+            }
+            for (_, texture) in self.passive_tex.values() {
+                if let panels::viewers::PassiveTexture::Gpu(id, _) = texture {
+                    renderer.free_texture(id);
+                }
+            }
+        }
+        self.viewer_native = None;
+        self.passive_tex.retain(|_, (_, texture)| matches!(texture, panels::viewers::PassiveTexture::Cpu(_)));
+        self.viewer_shown = self.viewer_tex.as_ref().map(|(texture, key)| (texture.id(), *key));
+        self.viewer_image = None;
+        // Old completion closures retain only their detached slot, not the replacement.
+        self.viewer_readback = Default::default();
+        self.wgpu = None;
+        self.ui.status = if failure.presentation_lost {
+            "Graphics device lost. The project is still open; presentation requires restarting the application.".into()
+        } else {
+            "Shared GPU preview disabled; CPU compositing remains available.".into()
+        };
+        log::warn!("GPU preview retired: {}", failure.reason);
+        ctx.request_repaint();
+    }
+
+    /// Set up the GPU compositor (once). Desktop frame workers use their own device so their
+    /// submissions cannot race egui-wgpu's surface reconfiguration during window moves/resizes.
+    /// Without an adapter that runs compute shaders, everything stays on the CPU.
     pub(crate) fn init_gpu(&mut self, frame: &eframe::Frame) {
         if self.gpu_checked {
             return;
         }
         self.gpu_checked = true;
+        if self.gpu_failures.as_ref().is_some_and(|bridge| bridge.failure().is_some()) {
+            return;
+        }
         let Some(rs) = frame.wgpu_render_state() else { return };
         // Backend validation can panic on shader compilation even when device creation
         // succeeded. Keep the document and the egui renderer, and use CPU compositing.
-        let gpu = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| effectcraft_gpu::Gpu::new(&rs.adapter, rs.device.clone(), rs.queue.clone())));
+        let gpu = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compositor_gpu(&rs.adapter, rs.device.clone(), rs.queue.clone())));
         match gpu {
             Ok(Ok(g)) => {
+                if let Some(bridge) = &self.gpu_failures {
+                    bridge.forward_to(g.context().device_failure_notifier());
+                    if bridge.failure().is_some() {
+                        return;
+                    }
+                }
                 log::info!("GPU compositor: {}", effectcraft_engine::render::Accelerator::name(&g));
                 self.session.accel = Some(Arc::new(g.clone()));
                 self.gpu = Some(g);
                 self.wgpu = Some(rs.clone());
             }
-            Ok(Err(e)) => log::info!("GPU compositor unavailable: {e}"),
+            Ok(Err(e)) => {
+                log::info!("GPU compositor unavailable: {e}");
+                self.session.accel_note = Some(format!("GPU compositor unavailable: {e}"));
+            }
             Err(e) => {
                 let reason = e.downcast_ref::<String>().map(String::as_str).or_else(|| e.downcast_ref::<&str>().copied()).unwrap_or("backend panicked");
                 log::warn!("GPU compositor setup failed; using CPU compositing: {reason}");
+                self.session.accel_note = Some(format!("GPU compositor setup failed: {reason}"));
             }
         }
     }
@@ -485,6 +635,11 @@ impl EffectcraftApp {
     /// The GPU compositor's adapter, when the viewer has one.
     pub fn gpu_adapter(&self) -> Option<String> {
         self.gpu.as_ref().map(effectcraft_engine::render::Accelerator::name)
+    }
+
+    /// The size of the viewer frame's texture (CPU frames; fitted to the GPU's texture limit).
+    pub fn viewer_texture_size(&self) -> Option<[usize; 2]> {
+        self.viewer_tex.as_ref().map(|(t, _)| t.size())
     }
 
     /// The viewer's current pixels as 8-bit premultiplied RGBA, reading a GPU frame back the
@@ -684,31 +839,33 @@ impl EffectcraftApp {
             layer_controls: preset.include_layer_controls,
             restore_max,
             audio_frame: (!plan.video).then_some(plan.first),
+            audio_held: false,
             shown_at: Default::default(),
         };
         if !self.playback.caching {
-            self.start_audio(fr.tick_of(plan.first));
+            if plan.video {
+                self.playback.audio_held = self.audio_plays();
+            } else {
+                self.start_audio(fr.tick_of(plan.first));
+            }
         }
     }
 
-    /// Start audio preview from comp time `t` when the preview includes audio at the comp's
-    /// frame rate, the comp has something audible and an output device opens.
+    /// The preview includes audio at the comp's frame rate and the comp has something audible.
+    fn audio_plays(&self) -> bool {
+        let (Some(pl), Some(cid)) = (self.playback.plan, self.session.active_comp_id()) else { return false };
+        let Some(c) = self.session.project.comp(cid) else { return false };
+        // A preview at another frame rate plays slower or faster than real time: silent.
+        pl.audio && (pl.fps - c.frame_rate.as_f64()).abs() <= 0.01 && effectcraft_engine::render::audio::comp_has_audio(&self.session.project, cid)
+    }
+
+    /// Start audio preview from comp time `t` when [`Self::audio_plays`] and an output device
+    /// opens.
     fn start_audio(&mut self, t: Tick) {
         self.audio = None;
         self.meter.clipped = [false; 2];
-        let Some(pl) = self.playback.plan else { return };
-        if !pl.audio {
-            return;
-        }
-        let Some(cid) = self.session.active_comp_id() else { return };
-        let Some(c) = self.session.project.comp_arc(cid) else { return };
-        // A preview at another frame rate plays slower or faster than real time: silent.
-        if (pl.fps - c.frame_rate.as_f64()).abs() > 0.01 {
-            return;
-        }
-        if !effectcraft_engine::render::audio::comp_has_audio(&self.session.project, cid) {
-            return;
-        }
+        let (Some(pl), Some(cid)) = (self.playback.plan, self.session.active_comp_id()) else { return };
+        let Some(c) = self.session.project.comp_arc(cid).filter(|_| self.audio_plays()) else { return };
         let out = audio::AudioOutput::from_prefs(&self.session.prefs);
         let Some(dev) = self.hooks.audio_device.as_ref().and_then(|f| f(&out)) else { return };
         let mix = self.session.prefs.audio.preview_sample_rate;
@@ -935,8 +1092,19 @@ impl EffectcraftApp {
             return;
         }
         let snap = |f: i64| wa + (f - wa).div_euclid(step) * step;
-        // Audio clock drives playback: show the frame under the audible sample (frames that
-        // are not rendered yet are dropped, never delayed).
+        // Held sound starts once the frames ahead are cached (see `Playback::audio_held`): the
+        // prefetch window when the silent preview keeps real time, else the rest of the preview.
+        let fit = self.frames_that_fit(&c, scale);
+        if self.playback.audio_held
+            && let Some(p) = plan
+            && ((self.playback.keeps_up(now) && self.cached_ahead(&p, &series, cur, ahead.min(fit))) || self.cached_ahead(&p, &series, cur, fit))
+        {
+            self.playback.audio_held = false;
+            self.playback.start_wall = now;
+            self.playback.start_frame = cur;
+            self.start_audio(fr.tick_of(cur));
+        }
+        // Audio clock drives playback: show the frame under the audible sample.
         if let Some(a) = &self.audio {
             if a.finished() {
                 if video {
@@ -950,12 +1118,22 @@ impl EffectcraftApp {
             let target = snap(audio::frame_of_sample(a.clock(), a.rate, fr).clamp(wa, wb));
             if !video {
                 self.playback.audio_frame = Some(target);
-            } else {
-                self.playback.waiting = !self.frames.is_cached(&FrameKey { frame: target, ..series });
+            } else if self.frames.is_cached(&FrameKey { frame: target, ..series }) {
+                self.playback.waiting = false;
                 if target != cur {
                     self.session.set_time(fr.tick_of(target));
                     self.playback.frame_shown(now);
                 }
+            } else {
+                // Rendering can't keep up: rather than skip frames, the sound stops and every
+                // frame shows as it renders until the frames ahead are cached again.
+                self.audio = None;
+                self.playback.audio_held = true;
+                self.playback.waiting = true;
+                // The rate measured before the stall no longer says it keeps up.
+                self.playback.shown_at.clear();
+                self.playback.start_wall = now;
+                self.playback.start_frame = cur;
             }
             ctx.request_repaint();
             return;
@@ -1065,6 +1243,13 @@ impl EffectcraftApp {
 
     /// How many viewer frames of `comp` at `scale` the RAM preview budget holds (90 % of it,
     /// at least one).
+    /// The frames of `plan` from `cur` to its end, or as many as fit in the RAM preview, are
+    /// cached: sound can play from `cur` in real time.
+    fn cached_ahead(&self, plan: &effectcraft_engine::preview::PreviewPlan, series: &FrameKey, cur: i64, fit: i64) -> bool {
+        let cached = self.frames.cached_frames(series);
+        (0..fit).map_while(|k| plan.frame_after(cur, k)).take_while(|f| *f >= cur).all(|f| cached.binary_search(&f).is_ok())
+    }
+
     fn frames_that_fit(&self, comp: &effectcraft_engine::project::Comp, scale: f64) -> i64 {
         let side = |n: u32| (n as f64 * scale).ceil().max(1.0);
         let frame = side(comp.width) * side(comp.height) * 4.0;
@@ -1233,6 +1418,7 @@ impl EffectcraftApp {
 
     fn frame(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        self.apply_gpu_failure(&ctx);
         self.auto.begin_frame();
         self.frames.set_context(&ctx);
         if self.session.render_job.is_some() {
@@ -1247,7 +1433,7 @@ impl EffectcraftApp {
             self.session.poll_mask_track();
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
-        // Background tasks (Content-Aware Fill, Scene Edit Detection).
+        // Background tasks (Content-Aware Fill, Scene Edit Detection, imports).
         if !self.session.tasks.is_empty() {
             self.session.poll_jobs();
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
@@ -1312,13 +1498,17 @@ impl EffectcraftApp {
         panels::precomp::mini_flowchart(self, &ctx);
         panels::home::capture_thumbnail(self);
         panels::dialogs::show(self, &ctx);
+        panels::fx_console::show(self, &ctx);
         panels::scriptui_view::sync_panels(self);
         panels::scriptui_view::show_windows(self, &ctx);
         panels::learn::coach(self, &ctx);
-        self.draw_toast(ui, full);
+        let lift = panels::media_panels::import_card(self, ui, full);
+        self.draw_toast(ui, full, lift);
     }
 
-    fn draw_toast(&mut self, ui: &mut egui::Ui, full: egui::Rect) {
+    /// The status message or the latest toast, bottom left (`lift` points higher while the
+    /// Importing card is there).
+    fn draw_toast(&mut self, ui: &mut egui::Ui, full: egui::Rect, lift: f32) {
         let now = ui.input(|i| i.time);
         let msg = if !self.ui.status.is_empty() {
             Some(self.ui.status.clone())
@@ -1327,11 +1517,12 @@ impl EffectcraftApp {
         };
         if let Some(m) = msg {
             let t = &self.tokens;
-            let galley = ui.painter().layout_no_wrap(m, Tokens::ui(12.0), t.text);
-            let r = egui::Rect::from_min_size(egui::pos2(full.min.x + 16.0, full.max.y - 44.0), galley.size() + egui::vec2(24.0, 14.0));
+            let galley = ui.painter().layout_no_wrap(m.clone(), Tokens::ui(12.0), t.text);
+            let r = egui::Rect::from_min_size(egui::pos2(full.min.x + 16.0, full.max.y - 44.0 - lift), galley.size() + egui::vec2(24.0, 14.0));
             ui.painter().rect_filled(r, 6.0, t.panel_bg);
             ui.painter().rect_stroke(r, 6.0, egui::Stroke::new(1.0, t.field_border), egui::StrokeKind::Inside);
             ui.painter().galley(r.min + egui::vec2(12.0, 7.0), galley, t.text);
+            self.auto.add("toast", r, &m);
             let resp = ui.interact(r, egui::Id::new("toast"), egui::Sense::click());
             if resp.clicked() {
                 self.ui.status.clear();
@@ -1409,9 +1600,19 @@ impl eframe::App for EffectcraftApp {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if !self.styled {
-            theme::install(ctx, &self.tokens);
-            self.styled = true;
+        self.apply_gpu_failure(ctx);
+        ctx.set_cursor_image(None);
+        // The CJK fallback fonts depend on the interface language, so they follow a change of
+        // Settings ▸ General ▸ Language instead of only the first frame.
+        let language = crate::i18n::language(self);
+        crate::i18n::set_current(language);
+        if !self.styled || self.styled_language != language {
+            theme::install(ctx, &self.tokens, language);
+            self.styled_language = language;
+            if !self.styled {
+                fit_window(ctx);
+                self.styled = true;
+            }
             ctx.request_repaint();
         } else {
             self.fonts_ready = true;
@@ -1464,4 +1665,76 @@ impl eframe::App for EffectcraftApp {
 /// Advance playback with the viewer's scale (called by the viewer panel each frame).
 pub(crate) fn tick_playback(app: &mut EffectcraftApp, ctx: &egui::Context, scale: f64) {
     app.advance_playback(ctx, scale);
+}
+
+/// Maximize a first window that doesn't fit the screen, which fits it to the space beside the
+/// taskbar or dock. The 1680 × 1020 window on a smaller screen is only shrunk to the monitor's
+/// size, so with its title bar it ran under the taskbar and cut menus off at the bottom of the
+/// screen (#269).
+fn fit_window(ctx: &egui::Context) {
+    let (monitor, window) = ctx.input(|i| (i.viewport().monitor_size, i.viewport().outer_rect.or(i.viewport().inner_rect)));
+    if let (Some(monitor), Some(window)) = (monitor, window)
+        && overflows_screen(window.size(), monitor)
+    {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+    }
+}
+
+/// Whether a window `size` leaves no room on a `monitor` for a taskbar or dock (points).
+fn overflows_screen(size: egui::Vec2, monitor: egui::Vec2) -> bool {
+    const TASKBAR: f32 = 64.0;
+    size.x > monitor.x || size.y > monitor.y - TASKBAR
+}
+
+#[cfg(test)]
+mod fit_window_tests {
+    use super::overflows_screen;
+    use egui::vec2;
+
+    #[test]
+    fn a_window_taller_than_the_screen_beside_its_taskbar_overflows() {
+        // The default window on a 1366 × 768 laptop (shrunk to the monitor) and on 1080p.
+        assert!(overflows_screen(vec2(1366.0, 799.0), vec2(1366.0, 768.0)));
+        assert!(overflows_screen(vec2(1680.0, 1051.0), vec2(1920.0, 1080.0)));
+        assert!(!overflows_screen(vec2(1680.0, 1051.0), vec2(2560.0, 1440.0)));
+    }
+}
+
+#[cfg(test)]
+mod gpu_failure_tests {
+    use super::*;
+
+    #[test]
+    fn host_failure_preserves_document_undo_and_cpu_pixels_and_detaches_late_readbacks() {
+        let mut session = Session::default();
+        let comp = ItemId(session.execute("comp.new", json!({"name": "Recovery", "width": 4, "height": 4, "duration": 1})).unwrap()["comp"].as_u64().unwrap());
+        session.execute("layer.newSolid", json!({"comp": comp.0, "color": "#ff0000"})).unwrap();
+        let before = session.render(comp, Tick::ZERO, RenderOpts::default());
+        let project = session.project.clone();
+        let revision = session.revision;
+        let prefs = serde_json::to_value(&session.prefs).unwrap();
+        let mut app = EffectcraftApp::new(session);
+        let ctx = egui::Context::default();
+        let bridge = gpu_failure::GpuFailureBridge::new(&ctx);
+        app.set_gpu_failure_bridge(bridge.clone());
+        let late_slot = app.viewer_readback.1.clone();
+        let key = FrameKey { revision, content: 1, comp: comp.0, frame: 0, scale: 1000, view: 0, opts: 0 };
+        app.viewer_readback.0 = Some(key);
+        bridge.report("synthetic host device failure", true);
+        app.apply_gpu_failure(&ctx);
+        assert!(Arc::ptr_eq(&project, &app.session.project));
+        assert_eq!(app.session.revision, revision);
+        assert_eq!(serde_json::to_value(&app.session.prefs).unwrap(), prefs);
+        assert!(app.gpu_checked, "failed device cannot be initialized again next frame");
+        assert!(app.session.accel.is_none());
+        assert!(app.ui.status.contains("presentation requires restarting"));
+        assert_eq!(app.session.render(comp, Tick::ZERO, RenderOpts::default()).data, before.data);
+        *late_slot.lock().unwrap() = Some((key, Arc::new(egui::ColorImage::new([1, 1], vec![egui::Color32::RED]))));
+        assert!(app.viewer_readback.0.is_none());
+        assert!(app.viewer_readback.1.lock().unwrap().is_none(), "a late completion cannot refill the replacement slot");
+        app.session.execute("edit.undo", json!({})).unwrap();
+        assert!(app.session.project.comp(comp).unwrap().layers.is_empty());
+        app.session.execute("edit.redo", json!({})).unwrap();
+        assert_eq!(app.session.render(comp, Tick::ZERO, RenderOpts::default()).data, before.data);
+    }
 }

@@ -71,6 +71,8 @@ fn kinetic_typography() {
     // A precomp of everything, time-remapped to play backwards.
     let pre = qa.exec("layer.precompose", json!({"layers": ["Title", "Sub"], "name": "Type Pre", "mode": "move"}));
     assert!(pre["comp"].is_u64() && pre["layer"].is_u64(), "{pre}");
+    // Nested switches pass the precomp layer's blur flag down to the animated title.
+    qa.exec("layer.setSwitch", json!({"layers": [pre["layer"].clone()], "switch": "motionBlur", "value": true}));
     qa.exec("layer.enableTimeRemap", json!({"layers": [pre["layer"].clone()], "value": true}));
     qa.tool("add_keyframe", json!({"layer": pre["layer"].clone(), "path": "timeRemap", "keys": [{"time": 0, "value": 1.9}, {"time": 1.9, "value": 0}]}));
     let fwd = qa.frame(Some(pre["comp"].clone()), 1.6);

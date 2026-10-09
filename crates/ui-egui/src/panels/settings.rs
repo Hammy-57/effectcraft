@@ -7,6 +7,7 @@
 //! `settings.labels.<n>.name` / `.color`, `settings.button.<label>`, `settings.ok`,
 //! `settings.cancel`, `settings.previous`, `settings.next`.
 
+use crate::i18n::{tr, tr_args};
 use effectcraft_engine::prefs::{Item, Kind, Page, pages};
 use effectcraft_engine::segment::Task;
 use egui::{Color32, RichText, vec2};
@@ -69,10 +70,10 @@ fn page_ui(app: &mut EffectcraftApp, ui: &mut egui::Ui, page: &Page, cur: &Value
                 let devices: Vec<String> = app.hooks.audio_devices.as_ref().map(|f| f()).unwrap_or_default();
                 let sel = get(key).as_str().unwrap_or("").to_string();
                 ui.horizontal(|ui| {
-                    ui.add_sized(vec2(label_w, 18.0), egui::Label::new("Default Output:"));
+                    ui.add_sized(vec2(label_w, 18.0), egui::Label::new(tr("Default Output:")));
                     let shown = if sel.is_empty() { "System Default".to_string() } else { sel.clone() };
                     let r = egui::ComboBox::from_id_salt(("settings", key)).selected_text(shown).width(260.0).show_ui(ui, |ui| {
-                        if ui.selectable_label(sel.is_empty(), "System Default").clicked() {
+                        if ui.selectable_label(sel.is_empty(), tr("System Default")).clicked() {
                             acts.push(Act::Set(key.into(), json!("")));
                         }
                         for d in &devices {
@@ -84,7 +85,7 @@ fn page_ui(app: &mut EffectcraftApp, ui: &mut egui::Ui, page: &Page, cur: &Value
                     reg(app, &format!("settings.{key}"), &r.response, "Default Output");
                 });
                 if devices.is_empty() {
-                    ui.label(RichText::new("No device list from this host; the system default output is used.").color(t.text_dim));
+                    ui.label(RichText::new(tr("No device list from this host; the system default output is used.")).color(t.text_dim));
                 }
             }
             Item::Setting { key, label, kind, live } => {
@@ -129,9 +130,9 @@ fn page_ui(app: &mut EffectcraftApp, ui: &mut egui::Ui, page: &Page, cur: &Value
                                 }
                                 Kind::Slider(lo, hi) => {
                                     let mut x = v.as_f64().unwrap_or(0.0);
-                                    ui.label(RichText::new("Darker").color(t.text_dim));
+                                    ui.label(RichText::new(tr("Darker")).color(t.text_dim));
                                     let r = ui.add(egui::Slider::new(&mut x, lo..=hi).show_value(false));
-                                    ui.label(RichText::new("Lighter").color(t.text_dim));
+                                    ui.label(RichText::new(tr("Lighter")).color(t.text_dim));
                                     if ui.small_button("Default").clicked() {
                                         acts.push(Act::Set(key.into(), json!(0.0)));
                                     }
@@ -141,7 +142,8 @@ fn page_ui(app: &mut EffectcraftApp, ui: &mut egui::Ui, page: &Page, cur: &Value
                                     r
                                 }
                                 Kind::Choice(opts) => {
-                                    let curv = v.as_str().unwrap_or("").to_string();
+                                    // (A number with choices, UI Scale, shows as its text.)
+                                    let curv = v.as_str().map_or_else(|| v.to_string(), str::to_string);
                                     let shown = opts.iter().find(|o| o.1 == curv).map(|o| o.0).unwrap_or(curv.as_str()).to_string();
                                     egui::ComboBox::from_id_salt(("settings", key))
                                         .selected_text(shown)
@@ -162,7 +164,7 @@ fn page_ui(app: &mut EffectcraftApp, ui: &mut egui::Ui, page: &Page, cur: &Value
                                         acts.push(Act::Set(key.into(), json!(s)));
                                     }
                                     if kind == Kind::Path {
-                                        let b = ui.button("Choose...");
+                                        let b = ui.button(tr("Choose..."));
                                         reg(app, &format!("{id}.choose"), &b, "Choose...");
                                         if b.clicked() {
                                             acts.push(if key.ends_with("Path") { Act::PickProject(key.into()) } else { Act::PickFolder(key.into()) });
@@ -252,7 +254,7 @@ fn models_ui(app: &mut EffectcraftApp, ui: &mut egui::Ui, t: &Tokens, acts: &mut
                 ui.label(RichText::new(format!("By {by}")).color(t.text_dim));
             }
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(format!("Licence: {}", m["licence"].as_str().unwrap_or_default())).color(t.text_dim));
+                ui.label(RichText::new(tr_args("Licence: {}", &[&(m["licence"].as_str().unwrap_or_default())])).color(t.text_dim));
                 if let Some(size) = m["size"].as_u64() {
                     ui.label(RichText::new(format!("·  {}", human_bytes(size))).color(t.text_dim));
                 }
@@ -270,21 +272,21 @@ fn models_ui(app: &mut EffectcraftApp, ui: &mut egui::Ui, t: &Tokens, acts: &mut
             }
             ui.horizontal(|ui| {
                 if !installed && !web {
-                    let r = ui.add_enabled(busy.is_none(), egui::Button::new("Download"));
+                    let r = ui.add_enabled(busy.is_none(), egui::Button::new(tr("Download")));
                     reg(app, &format!("settings.{prefix}.download.{id}"), &r, "Download");
                     if r.clicked() {
                         acts.push(Act::Run(format!("{prefix}.model.download"), json!({"id": id})));
                     }
                 }
                 if !web {
-                    let r = ui.add_enabled(busy.is_none(), egui::Button::new("Install from File…"));
+                    let r = ui.add_enabled(busy.is_none(), egui::Button::new(tr("Install from File…")));
                     reg(app, &format!("settings.{prefix}.install.{id}"), &r, "Install from File");
                     if r.clicked() {
                         acts.push(Act::PickModel(task));
                     }
                 }
                 if installed {
-                    let r = ui.add_enabled(busy.is_none(), egui::Button::new("Remove"));
+                    let r = ui.add_enabled(busy.is_none(), egui::Button::new(tr("Remove")));
                     reg(app, &format!("settings.{prefix}.remove.{id}"), &r, "Remove");
                     if r.clicked() {
                         acts.push(Act::Run(format!("{prefix}.model.remove"), json!({"id": id})));
@@ -304,9 +306,9 @@ fn models_ui(app: &mut EffectcraftApp, ui: &mut egui::Ui, t: &Tokens, acts: &mut
         ui.label(RichText::new(e).color(t.danger));
     }
     if web {
-        ui.label(RichText::new("Trained models are available in the desktop app; the browser uses the classic engine.").color(t.text_dim));
+        ui.label(RichText::new(tr("Trained models are available in the desktop app; the browser uses the classic engine.")).color(t.text_dim));
     } else if let Some(f) = info["folder"].as_str() {
-        ui.label(RichText::new(format!("Models folder: {f}")).color(t.text_faint));
+        ui.label(RichText::new(tr_args("Models folder: {}", &[&f])).color(t.text_faint));
     }
 }
 
@@ -317,7 +319,7 @@ fn browser_storage_ui(app: &mut EffectcraftApp, ui: &mut egui::Ui, t: &Tokens, a
     let info = host.info();
     let u = |v: &Value| v.as_u64().unwrap_or(0);
     ui.add_space(6.0);
-    ui.label(RichText::new("Browser Storage").font(Tokens::semibold(12.5)).color(t.tab_text_active));
+    ui.label(RichText::new(tr("Browser Storage")).font(Tokens::semibold(12.5)).color(t.tab_text_active));
     ui.separator();
     let backend = match info["backend"].as_str().unwrap_or("") {
         "opfs" => "Origin Private File System",
@@ -326,7 +328,7 @@ fn browser_storage_ui(app: &mut EffectcraftApp, ui: &mut egui::Ui, t: &Tokens, a
         "" => "Unknown",
         other => other,
     };
-    let r = ui.label(format!("Stored in: {backend}"));
+    let r = ui.label(tr_args("Stored in: {}", &[&backend]));
     reg(app, "settings.storage.backend", &r, backend);
     let (usage, quota) = (u(&info["usage"]), u(&info["quota"]));
     let frac = if quota > 0 { usage as f32 / quota as f32 } else { 0.0 };
@@ -341,7 +343,8 @@ fn browser_storage_ui(app: &mut EffectcraftApp, ui: &mut egui::Ui, t: &Tokens, a
     let f = &info["files"];
     let row = |what: &str, k: &str| format!("{what}: {} ({})", u(&f[k]["count"]), human_bytes(u(&f[k]["bytes"])));
     ui.label(
-        RichText::new(format!("{} · {} · {}", row("Projects", "projects"), row("Imported media", "media"), row("Auto-saves", "autoSaves"))).color(t.text_dim),
+        RichText::new(format!("{} · {} · {}", row(tr("Projects"), "projects"), row(tr("Imported media"), "media"), row(tr("Auto-saves"), "autoSaves")))
+            .color(t.text_dim),
     );
     let d = &info["diskCache"];
     let dc = if d["enabled"].as_bool().unwrap_or(false) {
@@ -363,7 +366,7 @@ fn browser_storage_ui(app: &mut EffectcraftApp, ui: &mut egui::Ui, t: &Tokens, a
         let state = if persisted { "Persistent storage: granted" } else { "Persistent storage: not granted (the browser may clear it when space runs low)" };
         ui.label(state);
         if !persisted {
-            let r = ui.button("Request Persistent Storage");
+            let r = ui.button(tr("Request Persistent Storage"));
             reg(app, "settings.storage.persist", &r, "Request Persistent Storage");
             if r.clicked() {
                 acts.push(Act::Run("storage.persist".into(), json!({})));
@@ -386,7 +389,7 @@ fn browser_storage_ui(app: &mut EffectcraftApp, ui: &mut egui::Ui, t: &Tokens, a
 }
 
 fn labels_ui(app: &mut EffectcraftApp, ui: &mut egui::Ui, cur: &Value, acts: &mut Vec<Act>) {
-    ui.label("Label Colors and Names:");
+    ui.label(tr("Label Colors and Names:"));
     ui.add_space(4.0);
     let labels = cur.get("labels").and_then(Value::as_array).cloned().unwrap_or_default();
     egui::Grid::new("settings-labels").num_columns(4).spacing([10.0, 4.0]).show(ui, |ui| {
@@ -410,7 +413,7 @@ fn labels_ui(app: &mut EffectcraftApp, ui: &mut egui::Ui, cur: &Value, acts: &mu
         }
     });
     ui.add_space(8.0);
-    let r = ui.button("Reset Labels");
+    let r = ui.button(tr("Reset Labels"));
     app.auto.add("settings.button.Reset Labels", r.rect, "Reset Labels");
     if r.clicked() {
         acts.push(Act::Run("prefs.reset".into(), json!({"page": "labels"})));
@@ -459,7 +462,9 @@ pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
             });
             ui.separator();
             ui.vertical(|ui| {
-                ui.set_width(590.0);
+                // The rest of the dialog's width: a fixed width ran past it, so the whole
+                // dialog scrolled sideways a little (#284).
+                ui.set_width(ui.available_width());
                 let p = &all[idx];
                 ui.label(RichText::new(p.title).font(Tokens::semibold(14.0)).color(t.tab_text_active));
                 ui.add_space(6.0);
@@ -471,21 +476,21 @@ pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
         ui.add_space(8.0);
         ui.separator();
         ui.horizontal(|ui| {
-            let r = ui.add_enabled(idx > 0, egui::Button::new("Previous"));
+            let r = ui.add_enabled(idx > 0, egui::Button::new(tr("Previous")));
             app.auto.add("settings.previous", r.rect, "Previous");
             if r.clicked() {
                 page = all[idx - 1].id.to_string();
             }
-            let r = ui.add_enabled(idx + 1 < all.len(), egui::Button::new("Next"));
+            let r = ui.add_enabled(idx + 1 < all.len(), egui::Button::new(tr("Next")));
             app.auto.add("settings.next", r.rect, "Next");
             if r.clicked() {
                 page = all[idx + 1].id.to_string();
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let r = ui.add(egui::Button::new(RichText::new("   OK   ").color(Color32::WHITE)).fill(t.accent));
+                let r = ui.add(egui::Button::new(RichText::new(tr("   OK   ")).color(Color32::WHITE)).fill(t.accent));
                 app.auto.add("settings.ok", r.rect, "OK");
                 ok |= r.clicked();
-                let r = ui.button("Cancel");
+                let r = ui.button(tr("Cancel"));
                 app.auto.add("settings.cancel", r.rect, "Cancel");
                 cancel |= r.clicked();
             });
@@ -559,10 +564,10 @@ pub fn recovery(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
     };
     let mut choice: Option<&str> = None;
     super::dialogs::modal(ctx, "Recover Project", vec2(560.0, 230.0), t, |ui| {
-        ui.label("EffectCraft didn't quit normally last time.");
+        ui.label(tr("EffectCraft didn't quit normally last time."));
         ui.add_space(6.0);
         if let Some(p) = &r.project {
-            ui.label(format!("Project: {p}"));
+            ui.label(tr_args("Project: {}", &[&p]));
         }
         if let Some(a) = &r.autosave {
             let when = std::fs::metadata(a).and_then(|m| m.modified()).ok().and_then(|m| m.elapsed().ok()).map(|d| {
@@ -575,26 +580,26 @@ pub fn recovery(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
                     format!("{} hours ago", m / 60)
                 }
             });
-            ui.label(format!("Latest auto-save: {a}"));
+            ui.label(tr_args("Latest auto-save: {}", &[&a]));
             if let Some(w) = when {
-                ui.label(RichText::new(format!("Saved {w}")).color(t.text_dim));
+                ui.label(RichText::new(tr_args("Saved {}", &[&w])).color(t.text_dim));
             }
         }
         ui.add_space(14.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let b = ui.add(egui::Button::new(RichText::new(" Open Auto-Save ").color(Color32::WHITE)).fill(t.accent));
+            let b = ui.add(egui::Button::new(RichText::new(tr(" Open Auto-Save ")).color(Color32::WHITE)).fill(t.accent));
             app.auto.add("recovery.openAutoSave", b.rect, "Open Auto-Save");
             if b.clicked() {
                 choice = Some("autosave");
             }
             if r.project.is_some() {
-                let b = ui.button("Open Last Saved Project");
+                let b = ui.button(tr("Open Last Saved Project"));
                 app.auto.add("recovery.openProject", b.rect, "Open Last Saved Project");
                 if b.clicked() {
                     choice = Some("project");
                 }
             }
-            let b = ui.button("Don't Recover");
+            let b = ui.button(tr("Don't Recover"));
             app.auto.add("recovery.dismiss", b.rect, "Don't Recover");
             if b.clicked() {
                 choice = Some("none");

@@ -423,6 +423,93 @@ fn depth_of_field_blurs_out_of_focus_layers() {
     assert!(b.get(66, 50)[3] > 0.01);
 }
 
+/// A 3D layer scaled to 0 % under an out-of-focus camera (SceneYard "Digital Wallets" and its
+/// finance scene folder): its blur radius in layer pixels was unbounded and the padding
+/// overflowed. The plane is invisible; the rest of the scene still renders, CPU and accelerated.
+#[test]
+fn zero_scale_plane_under_depth_of_field_renders() {
+    let (mut p, cid, comp) = setup();
+    let mut cam = camera(&mut p, &comp);
+    set(&mut cam, "cameraOptions/dof", Value::Bool(true));
+    set(&mut cam, "cameraOptions/aperture", Value::Scalar(100.0));
+    set(&mut cam, "cameraOptions/focusDistance", Value::Scalar(zoom() * 1.6));
+    let mut gone = solid3(&mut p, &comp, [1.0, 0.0, 0.0], 60, 20, [100.0, 50.0, -60.0]);
+    set(&mut gone, "transform/scale", Value::Vec3([0.0, 0.0, 100.0]));
+    let seen = solid3(&mut p, &comp, [1.0, 1.0, 1.0], 40, 40, [100.0, 50.0, 0.0]);
+    push(&mut p, cid, cam);
+    push(&mut p, cid, seen);
+    let without = render(&p, cid);
+    p.comp_mut(cid).unwrap().layers.insert(1, gone);
+    let img = render(&p, cid);
+    assert!(img.get(100, 50)[3] > 0.3, "visible layer drawn: {:?}", img.get(100, 50));
+    assert_eq!(img.data, without.data, "the degenerate plane adds nothing");
+    // The accelerator's plan: the degenerate plane gets no blur plan, the visible one does.
+    let c = p.comp(cid).unwrap();
+    let ctx = crate::EvalCtx::new(&p, cid, c, Tick::ZERO);
+    let r = Renderer::new(&p, &NoFootage, RenderOpts::default());
+    let run: Vec<&Layer> = c.layers.iter().filter(|l| l.is_3d()).collect();
+    let planned = r.prepare_3d_run(&ctx, &run, (W, H)).expect("accelerated run");
+    assert!(planned.planes.iter().all(|pl| pl.dof.as_ref().is_none_or(|d| d.pad <= compose::MAX_DOF_REACH as u32 + 2)));
+    assert!(planned.planes.iter().any(|pl| pl.dof.is_some()), "the visible plane still blurs");
+}
+
+/// A plane scaled almost to nothing magnifies its blur radius in layer pixels without limit;
+/// the radius (and so the padded buffer) is bounded for the CPU blur and the accelerator alike.
+#[test]
+fn near_zero_scale_depth_of_field_is_bounded() {
+    let (mut p, cid, comp) = setup();
+    let mut cam = camera(&mut p, &comp);
+    set(&mut cam, "cameraOptions/dof", Value::Bool(true));
+    set(&mut cam, "cameraOptions/aperture", Value::Scalar(100.0));
+    set(&mut cam, "cameraOptions/focusDistance", Value::Scalar(zoom() * 1.6));
+    push(&mut p, cid, cam);
+    let c = p.comp(cid).unwrap();
+    let ctx = crate::EvalCtx::new(&p, cid, c, Tick::ZERO);
+    let cs = super::camera::active_camera(&ctx);
+    let dof = cs.dof.expect("depth of field on");
+    for aspect in [1.0, 0.01, 100.0, f64::NAN] {
+        let dof = super::camera::Dof { iris: super::bokeh::Iris { aspect, ..dof.iris }, ..dof };
+        let world = effectcraft_geom::Mat4::scale(vec3(1e-6, 1e-6, 1.0));
+        let radii = compose::dof_radii_at(&cs, &dof, world, (8, 8), [4.0, 4.0], 1.0);
+        let rmax = radii.iter().copied().fold(0.0f32, f32::max) as f64;
+        assert!(rmax > 0.3 && rmax.is_finite(), "still blurs: {rmax}");
+        assert!(compose::dof_pad(&dof, rmax) <= compose::MAX_DOF_REACH as u32 + 2, "aspect {aspect}: rmax {rmax}");
+    }
+}
+
+/// The circle of confusion is the thin lens': aperture · F / (focus − F) · |z − focus| / z,
+/// with the focal length F in millimetres (Zoom on the 36 mm film) and distances in pixels, as
+/// After Effects renders it. SceneYard "Digital Wallets" (1080-wide comp, Zoom 1866.67 = 62.2 mm,
+/// Focus Distance 2573.67, Aperture 100, layers at depth 1648.67): After Effects shows them
+/// sharp; the aperture alone made a 56-pixel circle and blurred everything.
+#[test]
+fn circle_of_confusion_is_the_thin_lens() {
+    let (mut p, cid, _) = setup();
+    let comp = Comp::new(1080, 1920, FrameRate::FPS_30, Tick::from_seconds_f64(1.0));
+    let mut cam = camera(&mut p, &comp);
+    set(&mut cam, "cameraOptions/zoom", Value::Scalar(1866.66666685));
+    set(&mut cam, "cameraOptions/dof", Value::Bool(true));
+    set(&mut cam, "cameraOptions/focusDistance", Value::Scalar(2573.66666685));
+    set(&mut cam, "cameraOptions/aperture", Value::Scalar(100.0));
+    let c = p.comp_mut(cid).unwrap();
+    *c = comp.clone();
+    c.layers.push(cam);
+    let c = p.comp(cid).unwrap();
+    let ctx = crate::EvalCtx::new(&p, cid, c, Tick::ZERO);
+    let dof = super::camera::active_camera(&ctx).dof.expect("depth of field on");
+    let f = 1866.66666685 * 36.0 / 1080.0;
+    assert!((dof.focal_length - f).abs() < 1e-9, "{}", dof.focal_length);
+    let z = 1648.66666685;
+    let want = 100.0 * f / (2573.66666685 - f) * (z - 2573.66666685f64).abs() / z;
+    assert!((dof.coc(z) - want).abs() < 1e-9 && dof.coc(z) < 1.5, "{} vs {want}", dof.coc(z));
+    // Focus at or inside the focal length: bounded, finite.
+    let near = super::camera::Dof { focus: f * 0.5, ..dof };
+    assert!(near.coc(z).is_finite() && near.coc(z) <= 100.0 * f * (z - f * 0.5).abs() / z);
+    // Unknown focal length: the aperture alone.
+    let bare = super::camera::Dof { focal_length: 0.0, ..dof };
+    assert!((bare.coc(z) - 100.0 * (z - 2573.66666685f64).abs() / z).abs() < 1e-9);
+}
+
 /// Pixels in column `x` whose alpha is strictly between 0.05 and 0.95.
 fn soft_px(img: &effectcraft_raster::Image, x: i64) -> usize {
     (0..img.height as i64).filter(|&y| (0.05..0.95).contains(&img.get(x, y)[3])).count()
@@ -540,4 +627,28 @@ fn rig_orbit_keeps_distance_and_pan_moves_both() {
     r.orbit(0.0, 500.0);
     let off = r.eye - r.poi;
     assert!(off.y.abs() / off.length() < 0.9999);
+}
+
+#[test]
+fn coplanar_layers_keep_stack_order_under_a_moving_camera_with_motion_blur() {
+    // Hand balance collage: a motion-blurred background under unblurred layers in the same
+    // plane hid them while the camera dollied (its sub-sample depths sorted it in front).
+    let (mut p, cid, comp) = setup();
+    let mut cam = camera(&mut p, &comp);
+    let pr = cam.props.prop_mut("transform/position").unwrap();
+    pr.keys = vec![
+        effectcraft_keyframe::Keyframe::new(Tick::ZERO, Value::Vec3([100.0, 50.0, -zoom()])),
+        effectcraft_keyframe::Keyframe::new(Tick::from_seconds_f64(1.0), Value::Vec3([100.0, 50.0, -zoom() + 600.0])),
+    ];
+    let top = solid3(&mut p, &comp, [1.0, 0.0, 0.0], 40, 40, [100.0, 50.0, 0.0]);
+    let mut bottom = solid3(&mut p, &comp, [0.0, 0.0, 1.0], 400, 200, [100.0, 50.0, 0.0]);
+    bottom.switches.motion_blur = true;
+    push(&mut p, cid, cam);
+    push(&mut p, cid, top);
+    push(&mut p, cid, bottom);
+    for t in [0.2, 0.5] {
+        let img = render_frame(&p, cid, Tick::from_seconds_f64(t), 1.0);
+        let c = img.get(100, 50);
+        assert!(c[0] > 0.99 && c[2] < 0.01, "t={t}: {c:?}");
+    }
 }

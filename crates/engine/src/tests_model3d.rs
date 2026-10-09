@@ -193,3 +193,50 @@ fn material_commands_and_serde() {
     let back = Project::from_json(&json).unwrap();
     assert_eq!(&back, &*s.project);
 }
+
+/// #264: only Advanced 3D draws models and primitives, and new comps are Classic 3D, so an
+/// imported model was invisible. Adding one switches the comp to Advanced 3D (in the same undo
+/// step, with a toast), as After Effects does.
+#[test]
+fn adding_models_switches_classic_comps_to_advanced_3d() {
+    let toasts = |s: &mut Session| -> Vec<String> {
+        s.drain_events().into_iter().filter_map(|e| if let crate::Event::Toast { message, .. } = e { Some(message) } else { None }).collect()
+    };
+    let mut s = session();
+    let text = s.execute("layer.newText", json!({"text": "Hi"})).unwrap()["layer"].as_u64().unwrap();
+    let item = s.execute("file.import", json!({"paths": [fixture("quad.glb")]})).unwrap()["items"][0].as_u64().unwrap();
+    assert_eq!(s.active_comp().unwrap().renderer, Renderer::Classic3D);
+    toasts(&mut s);
+    let r = s.execute("layer.addItem", json!({"item": item})).unwrap();
+    assert_eq!(r["advanced3d"], true);
+    assert_eq!(s.active_comp().unwrap().renderer, Renderer::Advanced3D);
+    // As with Composition Settings: the text layer gets Geometry Options.
+    assert!(layer(&s, text).props.sub("geometryOptions").is_some());
+    assert!(toasts(&mut s).iter().any(|m| m.contains("Advanced 3D")));
+    // A second model leaves the comp (and the user) alone.
+    s.execute("layer.addItem", json!({"item": item})).unwrap();
+    assert!(toasts(&mut s).is_empty());
+    s.undo();
+    s.undo();
+    assert_eq!(s.active_comp().unwrap().layers.len(), 1);
+    assert_eq!(s.active_comp().unwrap().renderer, Renderer::Classic3D);
+    assert!(layer(&s, text).props.sub("geometryOptions").is_none());
+    // Primitives too.
+    s.execute("layer.newPrimitive", json!({"kind": "cube"})).unwrap();
+    assert_eq!(s.active_comp().unwrap().renderer, Renderer::Advanced3D);
+    // Switching back to Classic 3D says why the model layers disappear.
+    toasts(&mut s);
+    s.execute("comp.renderer", json!({"renderer": "classic3d"})).unwrap();
+    assert!(toasts(&mut s).iter().any(|m| m.contains("Classic 3D doesn't draw")));
+}
+
+/// Importing a 3D model doesn't ask how to interpret its alpha (Interpret Footage): a model
+/// renders its own.
+#[test]
+fn importing_a_model_does_not_ask_about_alpha() {
+    let mut s = session();
+    assert_eq!(s.prefs.unlabeled_alpha(false), None, "Ask User");
+    let r = s.execute("file.import", json!({"paths": [fixture("quad.glb")]})).unwrap();
+    assert_eq!(r["unlabeledAlpha"], json!([]));
+    assert!(!s.drain_events().iter().any(|e| matches!(e, crate::Event::Frontend { command, .. } if command == "file.interpretFootage")));
+}

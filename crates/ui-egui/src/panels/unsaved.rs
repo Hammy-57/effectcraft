@@ -7,6 +7,7 @@
 //! Automation ids: `dialog.unsaved.save`, `dialog.unsaved.dontSave` (Revert: `dialog.unsaved.revert`),
 //! `dialog.unsaved.cancel`.
 
+use crate::i18n::tr;
 use egui::{Color32, vec2};
 use serde_json::{Value, json};
 
@@ -49,6 +50,8 @@ pub fn on_close_requested(app: &mut EffectcraftApp, ctx: &egui::Context) {
     if !ctx.input(|i| i.viewport().close_requested()) || app.dialog_state.unsaved.quitting {
         return;
     }
+    // Logged, so a window that closes on its own shows it (#234).
+    log::info!("the window was asked to close");
     if ask(app, "app.quit", &json!({})) {
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
     }
@@ -94,7 +97,7 @@ pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
         ui.label(egui::RichText::new(text).color(t.tab_text_active));
         if !revert {
             ui.add_space(4.0);
-            ui.label(egui::RichText::new("Your changes will be lost if you don't save them.").color(t.text_dim).size(11.0));
+            ui.label(egui::RichText::new(tr("Your changes will be lost if you don't save them.")).color(t.text_dim).size(11.0));
         }
         ui.add_space(18.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -104,7 +107,7 @@ pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
             if r.clicked() {
                 answer = Some(if revert { Answer::Discard } else { Answer::Save });
             }
-            let r = ui.button("Cancel");
+            let r = ui.button(tr("Cancel"));
             app.auto.add("dialog.unsaved.cancel", r.rect, "Cancel");
             if r.clicked() {
                 answer = Some(Answer::Cancel);
@@ -112,7 +115,7 @@ pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
             if !revert {
                 // Set apart from Save, as is customary.
                 ui.add_space(ui.available_width() - 90.0);
-                let r = ui.button("Don't Save");
+                let r = ui.button(tr("Don't Save"));
                 app.auto.add("dialog.unsaved.dontSave", r.rect, "Don't Save");
                 if r.clicked() {
                     answer = Some(Answer::Discard);
@@ -168,7 +171,7 @@ mod tests {
     fn app() -> (EffectcraftApp, egui::Context) {
         let ctx = egui::Context::default();
         let app = EffectcraftApp::new(effectcraft_engine::Session::default());
-        crate::theme::install(&ctx, &app.tokens);
+        crate::theme::install(&ctx, &app.tokens, crate::i18n::language(&app));
         (app, ctx)
     }
 

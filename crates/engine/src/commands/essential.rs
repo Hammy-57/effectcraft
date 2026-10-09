@@ -886,7 +886,8 @@ pub fn read_template(bytes: &[u8]) -> std::result::Result<(Value, Project, Vec<(
         return Err("the template was made by a newer EffectCraft".into());
     }
     let text = String::from_utf8(get("project.ecproj").ok_or("template has no project.ecproj")?).map_err(|e| e.to_string())?;
-    let project = Project::from_json(&text).map_err(|e| e.to_string())?;
+    let mut project = Project::from_json(&text).map_err(|e| e.to_string())?;
+    crate::upgrade_effects(&mut project);
     Ok((manifest, project, entries))
 }
 

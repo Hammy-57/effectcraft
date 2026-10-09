@@ -1,5 +1,5 @@
 //! Headless checks for Timeline keyframes as a person uses them: dragging keys over many frames
-//! in one gesture (the drag used to end after the first frame), Shift-snapping, and Ctrl+C /
+//! in one gesture (the drag used to end after the first frame), Shift-snapping, Ctrl+C /
 //! Ctrl+V, which the windowing layer delivers as clipboard events rather than key presses.
 
 use effectcraft_engine::Session;
@@ -148,6 +148,23 @@ fn shift_click_toggles_and_ctrl_click_switches_interpolation() {
     assert_eq!(key(&h).out_interp, effectcraft_engine::keyframe::Interp::Hold);
 }
 
+/// Clicking a key in the Timeline selects its property and layer too, as in After Effects, so
+/// the Graph Editor shows the key's curve (#252).
+#[test]
+fn a_key_clicked_in_the_timeline_shows_in_the_graph_editor() {
+    let (mut h, id, uid) = harness();
+    h.state_mut().session.execute("edit.deselectAll", json!({})).unwrap();
+    h.run_steps(2);
+    let ks = keys(&h, uid);
+    click_with(&mut h, ks[1], Default::default());
+    let st = &h.state().session.state;
+    assert_eq!(st.selected_keys.len(), 1);
+    assert_eq!((st.selected_props.clone(), st.selected_layers.clone()), (vec![(id, uid)], vec![id]), "the key's property and layer");
+    h.state_mut().ui.timeline.graph_editor = true;
+    h.run_steps(4);
+    assert!(h.state().auto.find(&format!("timeline.graph.key.{uid}.0.1")).is_some(), "the Graph Editor shows the key");
+}
+
 #[test]
 fn graph_editor_drags_move_every_selected_key_and_shift_keeps_an_axis() {
     let (mut h, id, uid) = harness();
@@ -237,4 +254,44 @@ fn k_follows_the_revealed_properties_and_auto_select_picks_the_speed_graph_for_p
     h.state_mut().ui.timeline.graph_mode = "value".into();
     h.run_steps(3);
     assert!(h.state().auto.find(&format!("timeline.graph.key.{pos}.1.0")).is_some(), "value graph: X and Y");
+}
+
+/// #284: in the Graph Editor, dragging the handle of one selected key moves the same handle of
+/// every selected key with it (After Effects), in one undo step.
+#[test]
+fn a_graph_handle_drag_moves_the_handles_of_every_selected_key() {
+    let (mut h, id, uid) = harness();
+    let s = &mut h.state_mut().session;
+    s.execute("prop.addKey", json!({"layer": id.0, "path": "transform/opacity", "time": 2.0, "value": 0.0})).unwrap();
+    s.execute("prop.select", json!({"layer": id.0, "prop": uid})).unwrap();
+    s.execute("keys.selectAll", json!({})).unwrap();
+    s.execute("keys.easyEase", json!({})).unwrap();
+    h.state_mut().ui.timeline.graph_editor = true;
+    h.run_steps(4);
+    // (in, out) influence of each key.
+    let influences = |h: &Harness<'_, EffectcraftApp>| -> Vec<(f64, f64)> {
+        let l = h.state().session.active_comp().unwrap().layer(id).unwrap().clone();
+        let keys = l.props.prop("transform/opacity").unwrap().keys.clone();
+        keys.iter().map(|k| (k.in_ease.first().map_or(0.0, |e| e.influence), k.out_ease.first().map_or(0.0, |e| e.influence))).collect()
+    };
+    let before = influences(&h);
+    let handle = |h: &Harness<'_, EffectcraftApp>, key: usize| {
+        let e = h.state().auto.find(&format!("timeline.graph.handle.{uid}.0.{key}.out")).unwrap_or_else(|| panic!("no handle {key}")).clone();
+        pos2(e.rect[0] + e.rect[2] / 2.0, e.rect[1] + e.rect[3] / 2.0)
+    };
+    let px_per_s = {
+        let at = |i: usize| h.state().auto.find(&format!("timeline.graph.key.{uid}.0.{i}")).unwrap().rect[0];
+        at(1) - at(0)
+    };
+    let (k0, k1) = (handle(&h, 0), handle(&h, 1));
+    let undo = h.state().session.history.undo.len();
+    // Key 1's out handle 0.2 s further out (the keys are 1 s apart): key 0's goes along.
+    drag(&mut h, k1, k1 + egui::vec2(px_per_s * 0.2, 0.0), Default::default());
+    let after = influences(&h);
+    for i in [0, 1] {
+        assert!((after[i].1 - before[i].1 - 0.2).abs() < 0.01, "key {i}: {:?} → {:?}", before[i], after[i]);
+    }
+    assert_eq!((after[1].0, after[2].0), (before[1].0, before[2].0), "the in handles stay");
+    assert_eq!(h.state().session.history.undo.len(), undo + 1, "one undo step");
+    assert!((handle(&h, 0).x - k0.x - px_per_s * 0.2).abs() < 2.0, "key 0's handle moved on screen");
 }

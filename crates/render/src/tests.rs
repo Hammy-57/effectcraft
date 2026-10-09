@@ -80,6 +80,43 @@ fn mask_cuts_layer() {
     assert!(img.get(150, 50)[3] < 0.01);
 }
 
+/// A large Mask Expansion grows a small mask far past its own size (SceneYard "UI Map
+/// Location": a 115-pixel circle on a white solid expanded by 1068 px to fill the frame). The
+/// expansion was a stroke 2136 px wide around the circle, whose outline degenerates when it is
+/// that much wider than the curve: the white page stayed black.
+#[test]
+fn large_mask_expansion_covers_its_whole_reach() {
+    let mut p = Project::default();
+    p.settings.bit_depth = effectcraft_project::BitDepth::Bpc32;
+    let comp = Comp::new(1080, 1920, FrameRate::FPS_30, Tick::from_seconds_f64(1.0));
+    let cid = p.add_item("Comp", Label::Sandstone, None, ItemKind::Comp(comp.clone().into()));
+    let mut l = solid(&mut p, &comp, [1.0, 1.0, 1.0], 1080, 1920);
+    let mut next = p.next_id;
+    let m = build::mask(&mut Ids(&mut next), "Mask 1", ShapePath::ellipse([526.0, 973.0], 115.0, 115.0), MaskMode::Add, [255, 255, 0]);
+    p.next_id = next;
+    l.props.sub_mut("masks").unwrap().children.push(m.into());
+    l.props.prop_mut("masks/#1/expansion").unwrap().value = Value::Scalar(1068.0);
+    p.comp_mut(cid).unwrap().layers.push(l);
+    let img = render_frame(&p, cid, Tick::ZERO, 1.0);
+    // Everything within 57.5 + 1068 px of the centre is covered; the far corner is not.
+    for (x, y) in [(526, 973), (100, 300), (1000, 1600), (526, 1900), (300, 973)] {
+        assert!(img.get(x, y)[3] > 0.99, "({x},{y}) {:?}", img.get(x, y));
+    }
+    // The grown edge sits where it should, both ways: +300 px (radius 357.5) and −150 px of a
+    // 400-pixel square (a 100-pixel square left).
+    for (shape, exp, inside, outside) in [
+        (ShapePath::ellipse([526.0, 973.0], 115.0, 115.0), 300.0, (526 + 350, 973), (526 + 365, 973)),
+        (ShapePath::rect([526.0, 973.0], 400.0, 400.0), -150.0, (526 + 45, 973), (526 + 55, 973)),
+    ] {
+        let c = p.comp_mut(cid).unwrap();
+        c.layers[0].props.prop_mut("masks/#1/path").unwrap().value = Value::Path(shape);
+        c.layers[0].props.prop_mut("masks/#1/expansion").unwrap().value = Value::Scalar(exp);
+        let img = render_frame(&p, cid, Tick::ZERO, 1.0);
+        assert!(img.get(inside.0, inside.1)[3] > 0.99, "{exp}: inside {:?}", img.get(inside.0, inside.1));
+        assert!(img.get(outside.0, outside.1)[3] < 0.01, "{exp}: outside {:?}", img.get(outside.0, outside.1));
+    }
+}
+
 #[test]
 fn track_matte_alpha() {
     let (mut p, cid, comp) = setup();
@@ -368,6 +405,26 @@ fn effects_see_layer_masks() {
     assert!(img.get(150, 50)[3] > 0.99, "mode None mask does not cut the layer");
 }
 
+/// An open mask (the Pen still drawing it) leaves the layer whole; closed, it masks (#290).
+#[test]
+fn open_masks_make_no_transparency() {
+    let render = |closed: bool| {
+        let (mut p, cid, comp) = setup();
+        let mut l = solid(&mut p, &comp, [1.0, 0.0, 0.0], 200, 100);
+        let path = ShapePath { closed, ..ShapePath::rect([50.0, 50.0], 40.0, 40.0) };
+        let mut next = p.next_id;
+        let m = build::mask(&mut Ids(&mut next), "Mask 1", path, MaskMode::Add, [255, 255, 0]);
+        p.next_id = next;
+        l.props.sub_mut("masks").unwrap().children.push(m.into());
+        p.comp_mut(cid).unwrap().layers.push(l);
+        render_frame(&p, cid, Tick::ZERO, 1.0)
+    };
+    let open = render(false);
+    assert!(open.get(50, 50)[3] > 0.99 && open.get(150, 50)[3] > 0.99, "the open mask cut the layer");
+    let closed = render(true);
+    assert!(closed.get(50, 50)[3] > 0.99 && closed.get(150, 50)[3] < 0.01, "the closed mask masks");
+}
+
 #[test]
 fn effects_read_layer_params() {
     let (mut p, cid, comp) = setup();
@@ -424,4 +481,267 @@ fn auto_backend_sends_2d_and_3d_comps_to_the_gpu() {
     // Software Only: never.
     p.settings.gpu_acceleration = false;
     assert!(!asked(&p, crate::Backend::Auto));
+}
+
+/// An adjustment layer's effect points are in its own layer space: a 100×100 adjustment layer
+/// on the right half rotates the comp below about its own centre (comp 150, 50), not comp (50, 50)
+/// (SceneYard UI Assistive Touch: a moved Bulge adjustment layer bulged the wrong spot).
+#[test]
+fn adjustment_layer_effects_use_its_layer_space() {
+    let (mut p, cid, comp) = setup();
+    let mut red = solid(&mut p, &comp, [1.0, 0.0, 0.0], 10, 10);
+    red.props.prop_mut("transform/position").unwrap().value = Value::Vec3([135.0, 50.0, 0.0]);
+    let mut adj = solid(&mut p, &comp, [1.0, 1.0, 1.0], 100, 100);
+    adj.switches.adjustment = true;
+    adj.props.prop_mut("transform/position").unwrap().value = Value::Vec3([150.0, 50.0, 0.0]);
+    let at = [("anchor", Value::Vec2([50.0, 50.0])), ("position", Value::Vec2([50.0, 50.0])), ("rotation", Value::Scalar(180.0))];
+    add_effect(&mut p, &mut adj, "ec.distort.transform", [100.0, 100.0], &at);
+    let c = p.comp_mut(cid).unwrap();
+    c.layers.push(adj);
+    c.layers.push(red);
+    let img = render_frame(&p, cid, Tick::ZERO, 1.0);
+    assert!(img.get(165, 50)[0] > 0.9, "{:?}", img.get(165, 50));
+    assert!(img.get(135, 50)[3] < 0.1, "{:?}", img.get(135, 50));
+}
+
+/// A shape layer's effect points are measured on a comp-sized canvas centred on its anchor
+/// (SceneYard Calendar Page Tear: pages hinge on a Transform effect anchor at the comp-space top
+/// edge). Rotating a 40×10 bar 90° about effect point (100, 50) — the bar's centre — keeps it
+/// in place, upright.
+#[test]
+fn shape_layer_effect_points_use_the_comp_sized_canvas() {
+    let (mut p, cid, comp) = setup();
+    let mut l = build::layer(&mut p, &comp, "Shape", LayerSource::Shape, (200, 100), None);
+    let mut next = p.next_id;
+    let mut ids = Ids(&mut next);
+    let rect = build::shape_rect(&mut ids, [40.0, 10.0], [0.0, 0.0], 0.0);
+    let fill = build::shape_fill(&mut ids, [1.0, 0.0, 0.0, 1.0]);
+    let g = build::shape_group(&mut ids, "Bar", vec![rect, fill]);
+    p.next_id = next;
+    l.props.sub_mut("contents").unwrap().children.push(g.into());
+    let at = [("anchor", Value::Vec2([100.0, 50.0])), ("position", Value::Vec2([100.0, 50.0])), ("rotation", Value::Scalar(90.0))];
+    add_effect_200(&mut p, &mut l, "ec.distort.transform", &at);
+    p.comp_mut(cid).unwrap().layers.push(l);
+    let img = render_frame(&p, cid, Tick::ZERO, 1.0);
+    assert!(img.get(100, 65)[0] > 0.9, "{:?}", img.get(100, 65));
+    assert!(img.get(115, 50)[3] < 0.1, "{:?}", img.get(115, 50));
+}
+
+/// An adjustment layer's blending mode composites its result onto the layers below
+/// (SceneYard Billiard Balls: a white-to-black 4-Color Gradient adjustment in Overlay shades
+/// the felt; drawn as Normal it washed the frame out to grey). Invert turns 0.2 into 0.8, and
+/// Overlay of 0.8 on 0.2 is 2 × 0.2 × 0.8 = 0.32, not 0.8.
+#[test]
+fn adjustment_layer_blending_mode_applies() {
+    let (mut p, cid, comp) = setup();
+    let grey = solid(&mut p, &comp, [0.2, 0.2, 0.2], 200, 100);
+    let mut adj = solid(&mut p, &comp, [1.0, 1.0, 1.0], 200, 100);
+    adj.switches.adjustment = true;
+    adj.blend_mode = BlendMode::Overlay;
+    add_effect_200(&mut p, &mut adj, "ec.channel.invert", &[]);
+    let c = p.comp_mut(cid).unwrap();
+    c.layers.push(adj);
+    c.layers.push(grey);
+    let px = render_frame(&p, cid, Tick::ZERO, 1.0).get(100, 50);
+    assert!((px[0] - 0.32).abs() < 0.01, "overlay, not normal: {px:?}");
+}
+
+/// An adjustment layer's track matte limits where its effects apply (SceneYard UI Google
+/// search: a tint + blur adjustment only inside a rounded card, the rings outside stay sharp).
+#[test]
+fn adjustment_layer_track_matte_limits_its_effects() {
+    let (mut p, cid, comp) = setup();
+    let grey = solid(&mut p, &comp, [0.2, 0.4, 0.6], 200, 100);
+    let mut adj = solid(&mut p, &comp, [1.0, 1.0, 1.0], 200, 100);
+    adj.switches.adjustment = true;
+    add_effect_200(&mut p, &mut adj, "ec.channel.invert", &[]);
+    // Matte: the left half only.
+    let mut matte = solid(&mut p, &comp, [1.0, 1.0, 1.0], 100, 100);
+    matte.props.prop_mut("transform/position").unwrap().value = Value::Vec3([50.0, 50.0, 0.0]);
+    matte.switches.video = false;
+    adj.track_matte = Some(TrackMatte { layer: matte.id, kind: MatteKind::Alpha });
+    let c = p.comp_mut(cid).unwrap();
+    c.layers.push(matte);
+    c.layers.push(adj);
+    c.layers.push(grey);
+    let img = render_frame(&p, cid, Tick::ZERO, 1.0);
+    let (left, right) = (img.get(40, 50), img.get(160, 50));
+    assert!((right[0] - 0.2).abs() < 0.01, "outside the matte untouched: {right:?}");
+    assert!((left[0] - 0.8).abs() < 0.01, "inverted inside the matte: {left:?}");
+}
+
+/// An adjustment layer's Motion Tile with Output Width/Height over 100% grows the buffer, so a
+/// later warp reads mirrored tiles past the comp edge instead of transparency (SceneYard Liquid
+/// Glass: Motion Tile 300% + Wave Warp 500 px tore black holes into the gradient background).
+#[test]
+fn adjustment_motion_tile_feeds_a_later_warp() {
+    let (mut p, cid, comp) = setup();
+    let red = solid(&mut p, &comp, [1.0, 0.0, 0.0], 200, 100);
+    let mut adj = solid(&mut p, &comp, [1.0, 1.0, 1.0], 200, 100);
+    adj.switches.adjustment = true;
+    let tile = [("outputWidth", Value::Scalar(300.0)), ("outputHeight", Value::Scalar(300.0)), ("mirrorEdges", Value::Bool(true))];
+    add_effect_200(&mut p, &mut adj, "ec.stylize.motiontile", &tile);
+    let warp = [("height", Value::Scalar(40.0)), ("width", Value::Scalar(60.0)), ("direction", Value::Scalar(0.0))];
+    add_effect_200(&mut p, &mut adj, "ec.distort.wavewarp", &warp);
+    let c = p.comp_mut(cid).unwrap();
+    c.layers.push(adj);
+    c.layers.push(red);
+    let img = render_frame(&p, cid, Tick::ZERO, 1.0);
+    for y in (0..100).step_by(3) {
+        for x in [0, 1, 2, 197, 198, 199] {
+            assert!(img.get(x, y)[3] > 0.99 && img.get(x, y)[0] > 0.99, "({x},{y}) {:?}", img.get(x, y));
+        }
+    }
+}
+
+#[test]
+fn a_collapsed_precomp_with_effects_is_not_clipped_to_its_frame() {
+    // aerender (SceneYard Trump Photo Zoom In): a collapsed precomp with an effect still shows
+    // its layers beyond the precomp's frame, and the effect applies to them; flattened, they
+    // were cut at the precomp's edges.
+    let (mut p, cid, comp) = setup();
+    let inner = Comp::new(100, 100, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+    let iid = p.add_item("Inner", Label::Sandstone, None, ItemKind::Comp(inner.clone().into()));
+    let mut s = solid(&mut p, &inner, [1.0, 1.0, 1.0], 40, 40);
+    // Centred at x = 150: entirely outside the 100×100 precomp.
+    s.props.prop_mut("transform/position").unwrap().value = Value::Vec3([150.0, 50.0, 0.0]);
+    p.comp_mut(iid).unwrap().layers.push(s);
+    let mut pre = build::layer(&mut p, &comp, "Inner", LayerSource::Comp { item: iid }, (100, 100), None);
+    pre.props.prop_mut("transform/position").unwrap().value = Value::Vec3([50.0, 50.0, 0.0]);
+    pre.switches.collapse = true;
+    let spec = effectcraft_effects::find("ec.color.tint").unwrap();
+    let mut next = p.next_id;
+    let mut g = effectcraft_effects::instantiate(spec, &mut Ids(&mut next), "Tint", [100.0, 100.0]);
+    p.next_id = next;
+    if let Some(pr) = g.prop_mut("white") {
+        pr.value = Value::Color([0.0, 1.0, 0.0, 1.0]);
+    }
+    pre.props.sub_mut("effects").unwrap().children.push(g.into());
+    p.comp_mut(cid).unwrap().layers.push(pre);
+    let img = render_frame(&p, cid, Tick::ZERO, 1.0);
+    let c = img.get(150, 50);
+    assert!(c[3] > 0.99 && c[1] > 0.99 && c[0] < 0.01, "outside the precomp's frame, tinted: {c:?}");
+}
+
+#[test]
+fn a_collapsed_3d_precomps_2d_layers_ignore_the_camera() {
+    // aerender (SceneYard Trump Photo Zoom In): in a collapsed 3D precomp the 2D layers are
+    // placed by the precomp layer's transform without perspective (the paper card kept its size
+    // when the precomp moved in depth), while its 3D layers recede with the camera.
+    let (mut p, cid, comp) = setup();
+    let inner = Comp::new(100, 100, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+    let iid = p.add_item("Inner", Label::Sandstone, None, ItemKind::Comp(inner.clone().into()));
+    let flat = solid(&mut p, &inner, [1.0, 1.0, 1.0], 20, 20);
+    let mut deep = solid(&mut p, &inner, [0.0, 0.0, 1.0], 20, 20);
+    deep.switches.three_d = true;
+    deep.props.prop_mut("transform/position").unwrap().value = Value::Vec3([20.0, 20.0, 0.0]);
+    p.comp_mut(iid).unwrap().layers.extend([flat, deep]);
+    let mut pre = build::layer(&mut p, &comp, "Inner", LayerSource::Comp { item: iid }, (100, 100), None);
+    pre.switches.three_d = true;
+    pre.switches.collapse = true;
+    // Far behind the default camera: a 3D plane there is drawn at about a fifth of its size.
+    pre.props.prop_mut("transform/position").unwrap().value = Value::Vec3([100.0, 50.0, 1000.0]);
+    p.comp_mut(cid).unwrap().layers.push(pre);
+    let img = render_frame(&p, cid, Tick::ZERO, 1.0);
+    for x in [92, 100, 108] {
+        let c = img.get(x, 50);
+        assert!(c[3] > 0.99 && c[0] > 0.99, "the 2D solid keeps its 20 px at x {x}: {c:?}");
+    }
+    assert!(img.get(100, 61)[3] < 0.01, "and no more: {:?}", img.get(100, 61));
+}
+
+/// #227: a shape layer's content surrounds its origin, so edge pinning (Turbulent Displace's
+/// default Pin All, Wave Warp's All Edges) must measure from comp-sized bounds centred on it;
+/// bounds starting at the origin pinned all but the bottom-right quadrant.
+#[test]
+fn edge_pinning_displaces_all_of_a_centred_shape_layer() {
+    for (id, vals) in [("ec.distort.turbulentdisplace", vec![]), ("ec.distort.wavewarp", vec![("pinning", Value::Enum(1))])] {
+        let (mut p, cid, comp) = setup();
+        let mut l = build::layer(&mut p, &comp, "Shape Layer 1", LayerSource::Shape, (200, 100), None);
+        let mut next = p.next_id;
+        let mut ids = Ids(&mut next);
+        let rect = build::shape_rect(&mut ids, [180.0, 80.0], [0.0, 0.0], 0.0);
+        let fill = build::shape_fill(&mut ids, [1.0, 0.0, 0.0, 1.0]);
+        let g = build::shape_group(&mut ids, "Rectangle 1", vec![rect, fill]);
+        p.next_id = next;
+        l.props.sub_mut("contents").unwrap().children.push(g.into());
+        p.comp_mut(cid).unwrap().layers.push(l.clone());
+        let plain = render_frame(&p, cid, Tick::ZERO, 1.0);
+        add_effect_200(&mut p, &mut l, id, &vals);
+        p.comp_mut(cid).unwrap().layers = vec![l];
+        let warped = render_frame(&p, cid, Tick::ZERO, 1.0);
+        // Alpha change per comp quadrant (TL, TR, BL, BR): the rectangle's edges move in each.
+        let mut q = [0.0f32; 4];
+        for y in 0..100 {
+            for x in 0..200 {
+                q[(x >= 100) as usize + 2 * (y >= 50) as usize] += (plain.get(x, y)[3] - warped.get(x, y)[3]).abs();
+            }
+        }
+        assert!(q.iter().all(|&d| d > 20.0), "{id}: per-quadrant change {q:?}");
+    }
+}
+
+/// Effect points on a shape layer are measured from the top-left of its comp-sized bounds
+/// (#227), so the default "layer centre" is where the content's origin is. Measured from the
+/// origin they sat at the comp's bottom-right corner: Twirl changed nothing and Bulge only
+/// the bottom-right quadrant.
+#[test]
+fn default_effect_points_sit_at_the_centre_of_a_shape_layer() {
+    let cases: [(&str, Vec<(&str, Value)>); 2] =
+        [("ec.distort.twirl", vec![("angle", Value::Scalar(90.0))]), ("ec.distort.bulge", vec![("height", Value::Scalar(2.0))])];
+    for (id, vals) in cases {
+        let (mut p, cid, comp) = setup();
+        let mut l = build::layer(&mut p, &comp, "Shape Layer 1", LayerSource::Shape, (200, 100), None);
+        let mut next = p.next_id;
+        let mut ids = Ids(&mut next);
+        let rect = build::shape_rect(&mut ids, [180.0, 80.0], [0.0, 0.0], 0.0);
+        let fill = build::shape_fill(&mut ids, [1.0, 0.0, 0.0, 1.0]);
+        let g = build::shape_group(&mut ids, "Rectangle 1", vec![rect, fill]);
+        p.next_id = next;
+        l.props.sub_mut("contents").unwrap().children.push(g.into());
+        p.comp_mut(cid).unwrap().layers.push(l.clone());
+        let plain = render_frame(&p, cid, Tick::ZERO, 1.0);
+        add_effect_200(&mut p, &mut l, id, &vals);
+        p.comp_mut(cid).unwrap().layers = vec![l];
+        let warped = render_frame(&p, cid, Tick::ZERO, 1.0);
+        // Alpha change per comp quadrant (TL, TR, BL, BR): the top and bottom edges move in each.
+        let mut q = [0.0f32; 4];
+        for y in 0..100 {
+            for x in 0..200 {
+                q[(x >= 100) as usize + 2 * (y >= 50) as usize] += (plain.get(x, y)[3] - warped.get(x, y)[3]).abs();
+            }
+        }
+        assert!(q.iter().all(|&d| d > 5.0), "{id}: per-quadrant change {q:?}");
+        // Symmetric about the centre: opposite quadrants change alike.
+        assert!((q[0] - q[3]).abs() < 0.05 * q[0].max(q[3]) && (q[1] - q[2]).abs() < 0.05 * q[1].max(q[2]), "{id}: {q:?}");
+    }
+}
+
+/// A layer parameter pointing at a shape layer sees all of it (in its effect space), and the
+/// effect's own masks are in effect space too: Set Matte with a centred shape layer as the
+/// matte keeps the centre of a full-comp solid (#227).
+#[test]
+fn layer_parameters_see_a_whole_shape_layer() {
+    let (mut p, cid, comp) = setup();
+    let mut shape = build::layer(&mut p, &comp, "Matte", LayerSource::Shape, (200, 100), None);
+    let mut next = p.next_id;
+    let mut ids = Ids(&mut next);
+    let rect = build::shape_rect(&mut ids, [100.0, 50.0], [0.0, 0.0], 0.0);
+    let fill = build::shape_fill(&mut ids, [1.0, 1.0, 1.0, 1.0]);
+    let g = build::shape_group(&mut ids, "Rectangle 1", vec![rect, fill]);
+    p.next_id = next;
+    shape.props.sub_mut("contents").unwrap().children.push(g.into());
+    shape.switches.video = false;
+    let matte_id = shape.id;
+    let mut s = solid(&mut p, &comp, [0.0, 0.0, 1.0], 200, 100);
+    add_effect_200(&mut p, &mut s, "ec.channel.setmatte", &[("takeMatteFromLayer", Value::Layer(Some(matte_id.0)))]);
+    p.comp_mut(cid).unwrap().layers = vec![s, shape];
+    let f = render_frame(&p, cid, Tick::ZERO, 1.0);
+    // The matte covers x 50..150, y 25..75: kept inside (all four quadrants), gone outside.
+    for (x, y) in [(60, 30), (140, 30), (60, 70), (140, 70)] {
+        assert!(f.get(x, y)[3] > 0.99, "inside at ({x}, {y}): {:?}", f.get(x, y));
+    }
+    for (x, y) in [(20, 10), (180, 90), (190, 50)] {
+        assert!(f.get(x, y)[3] < 0.01, "outside at ({x}, {y}): {:?}", f.get(x, y));
+    }
 }

@@ -35,6 +35,12 @@ pub fn get(path: &str) -> Option<Arc<[u8]>> {
     STORE.file(path)
 }
 
+/// A file's bytes and version (new with every write: workers resend a file whose version they
+/// haven't seen).
+pub fn get_versioned(path: &str) -> Option<(Arc<[u8]>, u64)> {
+    STORE.file_versioned(path)
+}
+
 /// `(path, size)` of every file in the table.
 pub fn list() -> Vec<(String, usize)> {
     STORE.files().into_iter().map(|(p, n, _, _)| (p, n)).collect()
@@ -132,6 +138,15 @@ impl Services for WebServices {
         }
         Ok(())
     }
+    /// The table's files in `dir` (picked and dropped files sit in `/`): picking or dropping a
+    /// numbered file finds the other frames of its image sequence loaded before.
+    fn list_dir(&self, dir: &str) -> Vec<String> {
+        let dir = dir.trim_end_matches('/');
+        list().into_iter().map(|(p, _)| p).filter(|p| p.rsplit_once('/').is_some_and(|(d, _)| d == dir)).collect()
+    }
+    fn is_dir(&self, _path: &str) -> bool {
+        false
+    }
 }
 
 /// Media import from the table (the bytes are also handed to the media pool, which decodes them).
@@ -147,6 +162,13 @@ impl effectcraft_engine::Importer for WebImporter {
     }
     fn register(&self, path: &str, data: &[u8]) {
         self.pool.add_bytes(path, get(path).unwrap_or_else(|| data.into()));
+    }
+    fn add_frames(&self, paths: &[String]) {
+        for p in paths {
+            if let Some(bytes) = get(p) {
+                self.pool.add_bytes(p, bytes);
+            }
+        }
     }
 }
 

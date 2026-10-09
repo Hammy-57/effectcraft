@@ -500,7 +500,8 @@ fn gen_fourcolor(@builtin(global_invocation_id) gid: vec3<u32>) {
         let dx = f32(p.x) + 0.5 - q.x;
         let dy = f32(p.y) + 0.5 - q.y;
         let d2 = dx * dx + dy * dy;
-        let w = 1.0 / pow(d2 / bl + 1e-6, 1.5);
+        // generate::four_color: w = 1 / (d² + Blend²).
+        let w = 1.0 / (d2 + bl);
         acc += P.f[4 + i].xyz * w;
         wsum += w;
     }
@@ -511,7 +512,15 @@ fn gen_fourcolor(@builtin(global_invocation_id) gid: vec3<u32>) {
         c += vec3<f32>(n);
     }
     let op = P.f[8].z;
-    textureStore(out, p, gen_blend(textureLoad(src, p, 0), vec4<f32>(c * op, op), P.u[0].x));
+    let o = textureLoad(src, p, 0);
+    if (P.u[0].x == 255u) {
+        // None replaces the layer's colour within its own alpha, faded by Opacity
+        // (generate::four_color).
+        let a = o.a * op;
+        textureStore(out, p, vec4<f32>(c * a, a));
+        return;
+    }
+    textureStore(out, p, gen_blend(o, vec4<f32>(c * op, op), P.u[0].x));
 }
 
 // ---------------------------------------------------------------- Noise / Add Grain
@@ -543,8 +552,8 @@ fn gen_noise(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (P.u[0].z != 0u) {
         px = vec4<f32>(clamp(px.xyz + n * a, vec3<f32>(0.0), vec3<f32>(a)), a);
     } else {
-        // Unclipped: values past black / white wrap around.
-        px = vec4<f32>(fract_euclid(px.x / a + n.x) * a, fract_euclid(px.y / a + n.y) * a, fract_euclid(px.z / a + n.z) * a, a);
+        // Unclipped: over-range values stay (the bit depth clamps them), never wrap.
+        px = vec4<f32>(px.xyz + n * a, a);
     }
     textureStore(out, p, px);
 }

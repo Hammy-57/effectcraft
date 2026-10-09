@@ -128,7 +128,12 @@ fn converter() {
 #[test]
 fn generated() {
     layouts("ec.vr.chromaticaberrations", &[("aberrationRed", n(40.0)), ("aberrationBlue", n(-30.0))]);
-    case("ec.vr.chromaticaberrations", &[("centerTilt", n(30.0)), ("centerPan", n(-60.0)), ("falloff", n(10.0)), ("falloffInvert", on())]);
+    case("ec.vr.chromaticaberrations", &[("pointOfInterest", Value::Vec2([20.0, 10.0])), ("falloff", n(10.0)), ("falloffInvert", on())]);
+    // A partial sphere (the patch's outside is transparent) with the point off-centre.
+    case(
+        "ec.vr.chromaticaberrations",
+        &[("horizontalFov", n(300.0)), ("verticalFov", n(110.0)), ("pointOfInterest", Value::Vec2([70.0, 30.0])), ("aberrationRed", n(-20.0))],
+    );
     layouts("ec.vr.colorgradients", &[]);
     case("ec.vr.colorgradients", &[("blend", n(5.0)), ("opacity", n(60.0)), ("blendingMode", e(5)), ("enablePoint5", on())]);
     for mode in 1..5 {

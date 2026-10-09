@@ -11,6 +11,12 @@ use effectcraft_ui_egui::EffectcraftApp;
 use serde_json::json;
 use wasm_bindgen::prelude::*;
 
+#[wasm_bindgen(module = "/js/host.js")]
+extern "C" {
+    #[wasm_bindgen(js_name = showDeviceLost)]
+    fn show_device_lost(message: &str, kept: bool);
+}
+
 /// Work for the UI thread with access to the app (posted by async tasks: picked files…).
 type Action = Box<dyn FnOnce(&mut EffectcraftApp)>;
 
@@ -204,6 +210,27 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
             eframe::WebOptions::default(),
             Box::new(move |cc| {
                 CTX.with(|c| *c.borrow_mut() = Some(cc.egui_ctx.clone()));
+                // The page owns this shared presentation device; worker devices retain their
+                // separate owned-device handlers. No browser error-scope future is blocked on.
+                let gpu_failures = effectcraft_ui_egui::gpu_failure::GpuFailureBridge::new(&cc.egui_ctx);
+                if let Some(rs) = &cc.wgpu_render_state {
+                    let errors = gpu_failures.clone();
+                    rs.device.on_uncaptured_error(Arc::new(move |error| {
+                        let message = format!("uncaptured GPU error: {error}");
+                        if errors.report(&message, false) {
+                            log::error!("{message}");
+                        }
+                    }));
+                    // The canvas can't present any more (#225): the page says so over it and
+                    // offers a reload, which brings the session back when browser storage keeps it.
+                    let lost = gpu_failures.clone();
+                    let kept = !empty && persist::backend() != "memory";
+                    rs.device.set_device_lost_callback(move |reason, message| {
+                        let message = format!("GPU device lost ({reason:?}): {message}");
+                        lost.report(&message, true);
+                        show_device_lost(&message, kept);
+                    });
+                }
                 let mut session = session();
                 session.load_settings();
                 let recovery = session.begin_recovery();
@@ -214,7 +241,10 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
                     let _ = session.execute("file.openDemoProject", json!({}));
                 }
                 api::set_info("restored", json!(restored));
+                // The ScriptUI panels open on the last visit open again.
+                let _ = session.execute("window.restoreScriptPanels", json!({}));
                 let mut app = EffectcraftApp::new(session);
+                app.set_gpu_failure_bridge(gpu_failures);
                 app.ui.start_screen = home;
                 if let Some(r) = recovery.filter(|r| !restored && r.autosave.is_some()) {
                     app.offer_recovery(r);

@@ -161,6 +161,13 @@ pub fn hook(
     ui.interact(Rect::from_min_size(resp.rect.min, vec2(1.0, 1.0)), focus_id(), egui::Sense::focusable_noninteractive());
     let tool = app.ui.tool;
     let type_tool = matches!(tool, Tool::Type | Tool::TypeVertical);
+    let last_tool_id = egui::Id::new("viewer-text-last-tool");
+    let last_tool = ui.data(|d| d.get_temp::<Tool>(last_tool_id));
+    ui.data_mut(|d| d.insert_temp(last_tool_id, tool));
+    if last_tool.is_some_and(|previous| matches!(previous, Tool::Type | Tool::TypeVertical) && !type_tool) {
+        exec(app, "text.endEdit", json!({}));
+        ui.data_mut(|d| d.remove::<Drag>(drag_id()));
+    }
     // The session ends when its layer leaves the active comp.
     if let Some(e) = app.session.state.text_edit.clone()
         && ectx.comp.layer(e.layer).is_none()

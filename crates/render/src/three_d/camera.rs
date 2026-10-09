@@ -26,6 +26,10 @@ pub struct Dof {
     pub aperture: f64,
     /// Blur Level (1.0 = 100%).
     pub blur_level: f64,
+    /// Focal length (mm) of the lens: the camera's Zoom on the 36 mm film. 0 = unknown (the
+    /// circle of confusion is then the aperture's alone).
+    #[serde(default)]
+    pub focal_length: f64,
     /// Iris Shape, Rotation, Roundness, Aspect Ratio and Diffraction Fringe.
     #[serde(default)]
     pub iris: super::bokeh::Iris,
@@ -40,7 +44,18 @@ impl Dof {
         if z <= NEAR || self.focus <= 0.0 {
             return 0.0;
         }
-        self.aperture * (z - self.focus).abs() / z * self.blur_level
+        self.aperture * self.magnification() * (z - self.focus).abs() / z * self.blur_level
+    }
+    /// The lens' magnification at the focus distance, F / (focus − F): the thin-lens circle of
+    /// confusion is the aperture times it times |z − focus| / z. As in After Effects the focal
+    /// length is in millimetres (the 36 mm film) and distances in pixels, so a pixel of
+    /// distance counts as a millimetre. A focus at or inside the focal length is held a pixel
+    /// beyond it. No focal length (0): the aperture alone.
+    pub fn magnification(&self) -> f64 {
+        if self.focal_length.is_nan() || self.focal_length <= 0.0 {
+            return 1.0;
+        }
+        self.focal_length / (self.focus - self.focal_length).max(1.0)
     }
 }
 
@@ -176,7 +191,7 @@ pub fn layer_rotation(ctx: &EvalCtx, layer: &Layer) -> Mat4 {
     let rx = ctx.f(layer, tr, "rotationX", 0.0);
     let ry = ctx.f(layer, tr, "rotationY", 0.0);
     let rz = ctx.f(layer, tr, "rotation", 0.0);
-    Mat4::orientation(Vec3::from(o)) * Mat4::rotate_z(rz) * Mat4::rotate_y(ry) * Mat4::rotate_x(rx)
+    Mat4::orientation(Vec3::from(o)) * Mat4::rotate_x(rx) * Mat4::rotate_y(ry) * Mat4::rotate_z(rz)
 }
 
 /// World matrix of a layer's parent chain (identity when unparented).
@@ -268,13 +283,44 @@ pub fn auto_orient_3d(ctx: &EvalCtx, layer: &Layer, pos: Vec3) -> Option<Mat4> {
             if ctx.comp.active_camera(ctx.time).is_some_and(|c| in_parent_chain(ctx, c, layer.id)) {
                 return None;
             }
+            // The layer faces the camera upright in world space, whatever its parents' rotation
+            // (SceneYard Lucky Smile: icons parented to a ring tilted X -78°, Y -18° and spinning
+            // still face the camera upright in AE). The parents' rotation is divided out of the
+            // world-space billboard; their scale still applies.
             let eye = active_camera(ctx).eye;
-            let e = parent_world(ctx, layer).inverse().unwrap_or(Mat4::IDENTITY).apply(eye);
-            let d = pos - e;
-            (d.length() > 1e-9).then(|| basis_rotation(d, vec3(0.0, 1.0, 0.0)))
+            let parent = parent_world(ctx, layer);
+            let d = parent.apply(pos) - eye;
+            if d.length() <= 1e-9 {
+                return None;
+            }
+            let world = basis_rotation(d, vec3(0.0, 1.0, 0.0));
+            Some(rotation_only(&parent).transpose() * world)
         }
         _ => None,
     }
+}
+
+/// The rotation in a matrix's linear part (columns orthonormalised, X kept, then Y), identity
+/// when degenerate.
+fn rotation_only(m: &Mat4) -> Mat4 {
+    let x = m.apply_vec(vec3(1.0, 0.0, 0.0));
+    let y = m.apply_vec(vec3(0.0, 1.0, 0.0));
+    if x.length() < 1e-12 || y.length() < 1e-12 {
+        return Mat4::IDENTITY;
+    }
+    let x = x.normalize();
+    let y = y - x * y.dot(x);
+    if y.length() < 1e-12 {
+        return Mat4::IDENTITY;
+    }
+    let y = y.normalize();
+    // Keep the handedness of the original Z (a mirrored parent stays mirrored).
+    let z0 = m.apply_vec(vec3(0.0, 0.0, 1.0));
+    let mut z = x.cross(y);
+    if z.dot(z0) < 0.0 {
+        z *= -1.0;
+    }
+    Mat4([[x.x, y.x, z.x, 0.0], [x.y, y.y, z.y, 0.0], [x.z, y.z, z.z, 0.0], [0.0, 0.0, 0.0, 1.0]])
 }
 
 /// (eye, forward, down) in world space of a camera or light layer.
@@ -290,6 +336,25 @@ pub fn layer_frame(ctx: &EvalCtx, layer: &Layer) -> (Vec3, Vec3, Vec3) {
     (eye, fwd, down)
 }
 
+/// How much a camera's parents magnify its picture. After Effects keeps the parents' scale in
+/// the camera's transform: a parent scaled across the view but not along it (a null at 49%,
+/// 49%, 100%) enlarges the picture by the ratio (SceneYard "PayPal UI Animation"). 1 for
+/// unparented cameras and uniformly scaled parents.
+fn parent_magnification(ctx: &EvalCtx, cam: &Layer) -> f64 {
+    if cam.parent.is_none() {
+        return 1.0;
+    }
+    let parent = parent_world(ctx, cam);
+    let local = rig_rotation(ctx, cam);
+    let len = |v: Vec3| parent.apply_vec(local.apply_vec(v)).length();
+    let across = (len(vec3(1.0, 0.0, 0.0)) + len(vec3(0.0, 1.0, 0.0))) * 0.5;
+    let along = len(vec3(0.0, 0.0, 1.0));
+    if !(across.is_finite() && along.is_finite() && across > 1e-9 && along > 1e-9) {
+        return 1.0;
+    }
+    (along / across).clamp(1e-3, 1e3)
+}
+
 /// Evaluate a camera layer.
 pub fn layer_camera(ctx: &EvalCtx, cam: &Layer) -> CameraState {
     let w = ctx.comp.width as f64;
@@ -300,6 +365,7 @@ pub fn layer_camera(ctx: &EvalCtx, cam: &Layer) -> CameraState {
         focus: ctx.f(cam, g, "focusDistance", zoom),
         aperture: ctx.f(cam, g, "aperture", default_aperture(w)).max(0.0),
         blur_level: ctx.f(cam, g, "blurLevel", 100.0).max(0.0) / 100.0,
+        focal_length: focal_for_zoom(w, zoom),
         iris: super::bokeh::Iris {
             sides: super::bokeh::Iris::sides_of_shape(ctx.e(cam, g, "irisShape")),
             rotation: ctx.f(cam, g, "irisRotation", 0.0),
@@ -313,6 +379,9 @@ pub fn layer_camera(ctx: &EvalCtx, cam: &Layer) -> CameraState {
             saturation: ctx.f(cam, g, "highlightSaturation", 0.0).clamp(0.0, 100.0) / 100.0,
         },
     });
+    // The lens (depth of field) keeps the camera's own Zoom; the picture also carries the
+    // parents' magnification.
+    let zoom = zoom * parent_magnification(ctx, cam);
     CameraState { view: basis_view(eye, fwd, down), eye, zoom, ortho: false, dof }
 }
 

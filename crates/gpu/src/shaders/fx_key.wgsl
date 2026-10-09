@@ -220,7 +220,8 @@ fn fxk_point(@builtin(global_invocation_id) gid: vec3<u32>) {
             o = vec4<f32>(m);
         }
         case 3u: {
-            let v = fxk_range_components(u0.y, c);
+            // 8-bit levels, as keying::color_range.
+            let v = floor(fxk_range_components(u0.y, c) + vec3<f32>(0.5));
             var out_d = 0.0;
             for (var i = 0u; i < 3u; i++) {
                 out_d = max(max(out_d, P.f[0][i] - v[i]), v[i] - P.f[1][i]);

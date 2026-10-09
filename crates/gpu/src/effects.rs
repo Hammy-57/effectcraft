@@ -2,7 +2,6 @@
 //! radii, parameter conversions), with the pixel loops as compute kernels.
 
 use effectcraft_effects::{Buf, EffectCtx};
-use effectcraft_geom::{Mat3, vec2};
 use effectcraft_raster::Sampling;
 use effectcraft_render::FxStep;
 
@@ -136,6 +135,11 @@ impl effectcraft_render::FxTarget for GpuFx<'_, '_> {
         let out = f(Buf { img, offset: b.offset, scale: b.scale });
         self.b = self.e.g.upload_image(&out.img).map(|img| GBuf { img, offset: out.offset, scale: out.scale });
     }
+    fn shift(&mut self, d: [f64; 2]) {
+        if let Some(b) = &mut self.b {
+            b.offset = [b.offset[0] - d[0], b.offset[1] - d[1]];
+        }
+    }
 }
 
 fn apply(e: &mut Enc, id: &str, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
@@ -231,32 +235,39 @@ fn dims_xy(dim: u32) -> (f64, f64) {
     }
 }
 
+/// Gaussian Blur (as `effectcraft_effects`' CPU one: σ from [`effectcraft_effects::gaussian_sigma`],
+/// comp pixels on a layer whose effects run in comp space).
 fn gaussian(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
-    let s = ctx.params.f("blurriness").max(0.0) * 0.5 * b.scale;
+    let s = effectcraft_effects::gaussian_sigma(ctx.params.f("blurriness")) * b.scale;
     if s <= 0.0 {
         return Some(b);
     }
     let (kx, ky) = dims_xy(ctx.params.e("dimensions"));
+    let [cx, cy] = ctx.env.comp_px();
+    let (sx, sy) = (s * cx * kx, s * cy * ky);
     let repeat = ctx.params.b("repeatEdge");
     if !repeat && !ctx.adjustment {
-        b.pad(e, (s * 3.0).ceil() as u32)?;
+        b.pad(e, (sx.max(sy) * 3.0).ceil().min(1.0e5) as u32)?;
     }
-    b.img = gaussian_blur(e, &b.img, s * kx, s * ky, repeat || ctx.adjustment);
+    b.img = gaussian_blur(e, &b.img, sx, sy, repeat || ctx.adjustment);
     Some(b)
 }
 
 fn box_blur(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
-    let r = (ctx.params.f("radius") * b.scale).round().max(0.0) as usize;
-    if r == 0 {
+    let r = ctx.params.f("radius").max(0.0) * b.scale;
+    let (kx, ky) = dims_xy(ctx.params.e("dimensions"));
+    let [cx, cy] = ctx.env.comp_px();
+    let rx = (r * cx * kx).round().min(1.0e5) as usize;
+    let ry = (r * cy * ky).round().min(1.0e5) as usize;
+    if rx == 0 && ry == 0 {
         return Some(b);
     }
     let it = ctx.params.f("iterations").round().clamp(1.0, 50.0) as usize;
-    let (kx, ky) = dims_xy(ctx.params.e("dimensions"));
     let repeat = ctx.params.b("repeatEdge");
     if !repeat && !ctx.adjustment {
-        b.pad(e, (r * it) as u32 + 1)?;
+        b.pad(e, (rx.max(ry) * it) as u32 + 1)?;
     }
-    b.img = box_passes(e, &b.img, &vec![r * kx as usize; it], &vec![r * ky as usize; it], repeat || ctx.adjustment);
+    b.img = box_passes(e, &b.img, &vec![rx; it], &vec![ry; it], repeat || ctx.adjustment);
     Some(b)
 }
 
@@ -272,6 +283,7 @@ fn directional(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     let n = (len.ceil() as usize * 2 + 1).clamp(3, 257);
     let mut p = Params::default();
     p.f[0] = [a.sin() as f32, -a.cos() as f32, len as f32, n as f32];
+    p.u[0][0] = ctx.adjustment as u32;
     let out = e.scratch(b.img.width, b.img.height);
     e.pixels("directional", &p, &b.img, None, &out, None);
     b.img = out;
@@ -283,32 +295,45 @@ fn glow(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     if ctx.params.e("colors") == 2 || effectcraft_effects::glow_operation(ctx) != effectcraft_color::BlendMode::Add {
         return None;
     }
-    let thr = ctx.params.f("threshold") as f32 / 100.0;
     let radius = ctx.params.f("radius") * b.scale;
     let intensity = ctx.params.f("intensity") as f32;
     let use_colors = ctx.params.e("colors") == 1;
-    let ca = ctx.params.color("colorA");
-    let cb = ctx.params.color("colorB");
     let (kx, ky) = dims_xy(ctx.params.e("glowDimensions"));
+    let s = (radius * effectcraft_effects::GLOW_SIGMA_PER_RADIUS).max(0.5);
     if !ctx.adjustment {
-        b.pad(e, (radius * 1.5).ceil() as u32 + 2)?;
+        b.pad(e, (s * 3.0).ceil() as u32 + 2)?;
     }
-    let mut p = Params::default();
-    p.u[0] = [use_colors as u32, (ctx.params.e("based") == 0) as u32, ctx.params.e("colorLooping"), 0];
-    p.f[0] = [thr, ctx.params.f("colorLoops") as f32, (ctx.params.f("colorPhase") / 360.0) as f32, ctx.params.f("abMidpoint") as f32 / 100.0];
-    p.f[1] = ca;
-    p.f[2] = cb;
+    let p = glow_params(ctx);
     let bright = e.image(b.img.width, b.img.height);
     e.pixels("glow_bright", &p, &b.img, None, &bright, None);
-    let s = (radius / 2.0).max(0.5);
-    let blurred = gaussian_blur(e, &bright, s * kx, s * ky, false);
+    let mut blurred = gaussian_blur(e, &bright, s * kx, s * ky, false);
+    if use_colors {
+        let coloured = e.image(b.img.width, b.img.height);
+        e.pixels("glow_ab", &p, &blurred, None, &coloured, None);
+        blurred = coloured;
+    }
     let mut p = Params::default();
-    p.u[0][0] = ctx.params.e("operation").min(2);
+    p.u[0][0] = effectcraft_effects::glow_composite(ctx.params.e("operation"));
     p.f[0][0] = intensity;
     let out = e.scratch(b.img.width, b.img.height);
     e.pixels("glow_combine", &p, &b.img, Some(&blurred), &out, None);
     b.img = out;
     Some(b)
+}
+
+/// Parameters shared by Glow's `glow_bright`, `glow_ab` and `fxs_glow_map` kernels.
+pub(crate) fn glow_params(ctx: &EffectCtx) -> Params {
+    let mut p = Params::default();
+    p.u[0] = [(ctx.params.e("colors") != 0) as u32, (ctx.params.e("based") == 0) as u32, ctx.params.e("colorLooping"), 0];
+    p.f[0] = [
+        ctx.params.f("threshold") as f32 / 100.0,
+        ctx.params.f("colorLoops") as f32,
+        (ctx.params.f("colorPhase") / 360.0) as f32,
+        ctx.params.f("abMidpoint") as f32 / 100.0,
+    ];
+    p.f[1] = ctx.params.color("colorA");
+    p.f[2] = ctx.params.color("colorB");
+    p
 }
 
 fn drop_shadow(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
@@ -345,16 +370,12 @@ fn transform(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     if ctx.env.host.is_some() && effectcraft_effects::transform_shutter(ctx).is_some() {
         return None;
     }
-    let anchor = b.to_px(ctx.params.v2("anchor"));
-    let pos = b.to_px(ctx.params.v2("position"));
-    let sh = ctx.params.f("scaleHeight");
-    let sw = if ctx.params.b("uniform") { sh } else { ctx.params.f("scaleWidth") };
+    let m = effectcraft_effects::transform_effect_matrix(ctx.params, b.to_px(ctx.params.v2("anchor")), b.to_px(ctx.params.v2("position")));
+    // Content carried past the buffer edges grows the CPU buffer; render that case there.
+    if effectcraft_effects::transform_extent(ctx.adjustment, (b.img.width, b.img.height), &[m]) != (0, 0, b.img.width, b.img.height) {
+        return None;
+    }
     let opacity = ctx.params.f("opacity") as f32 / 100.0;
-    let m = Mat3::translate(vec2(pos.0, pos.1))
-        * Mat3::rotate_deg(ctx.params.f("rotation"))
-        * Mat3::skew_deg(ctx.params.f("skew"), ctx.params.f("skewAxis"))
-        * Mat3::scale(vec2(sw / 100.0, sh / 100.0))
-        * Mat3::translate(vec2(-anchor.0, -anchor.1));
     let sampling = if ctx.params.e("sampling") == 1 { Sampling::Bicubic } else { Sampling::Bilinear };
     let empty = e.image(b.img.width, b.img.height);
     b.img = ops::warp(e, &empty, &b.img, &m, sampling, effectcraft_color::BlendMode::Normal, opacity, 0, None);
@@ -468,8 +489,7 @@ fn pointwise(e: &mut Enc, id: &str, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
             p.f[1][0] = f("opacity") as f32 / 100.0;
         }
         "ec.generate.gradientramp" => {
-            let s = b.to_px(ctx.params.v2("start"));
-            let en = b.to_px(ctx.params.v2("end"));
+            let (m, s, en) = effectcraft_effects::gradient_ramp_space(ctx, b.offset, b.scale);
             let (dx, dy) = (en.0 - s.0, en.1 - s.1);
             let len2 = (dx * dx + dy * dy).max(1e-9);
             p.u[0] = [9, (ctx.params.e("shape") == 1) as u32, ctx.seed, 0];
@@ -477,6 +497,8 @@ fn pointwise(e: &mut Enc, id: &str, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
             p.f[1] = rgb(ctx.params.color("startColor"));
             p.f[2] = rgb(ctx.params.color("endColor"));
             p.f[3] = [len2 as f32, f("scatter") as f32 / 512.0, f("blend") as f32 / 100.0, 0.0];
+            p.f[4] = [m[0][0] as f32, m[0][1] as f32, m[0][2] as f32, 0.0];
+            p.f[5] = [m[1][0] as f32, m[1][1] as f32, m[1][2] as f32, 0.0];
         }
         "ec.noise.fractal" => {
             // The shader covers Soft Linear noise, the Basic / Turbulent Smooth / Turbulent Basic

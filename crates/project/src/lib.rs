@@ -11,6 +11,7 @@ pub mod essential;
 pub mod props;
 pub mod render_queue;
 pub mod render_templates;
+pub mod sequence;
 pub mod styles;
 pub mod tracking;
 
@@ -26,7 +27,13 @@ use serde::{Deserialize, Serialize};
 pub use effectcraft_keyframe as keyframe;
 pub use effectcraft_keyframe::{Keyframe, Value};
 
-pub const SCHEMA_VERSION: u32 = 1;
+/// The project file schema. 2: effects on layers without a source rectangle (shape, text)
+/// measure positions from the top-left of their comp-sized bounds (effect space), not from
+/// the layer's origin; projects from schema 1 are converted when opened (#227).
+pub const SCHEMA_VERSION: u32 = 2;
+
+/// The first schema in which effect positions are in effect space (see [`SCHEMA_VERSION`]).
+pub const SCHEMA_EFFECT_SPACE: u32 = 2;
 
 /// The EffectCraft version, written into project files as `savedBy`.
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -613,6 +620,139 @@ impl Default for Switches {
     }
 }
 
+// What a frame's pixels depend on. Caches key on it: the Audio, Lock and Shy switches and Hide
+// Shy Layers don't change pixels, so toggling them keeps cached frames (#103).
+
+impl Switches {
+    /// These switches with Audio, Lock and Shy at their defaults.
+    pub fn pixels(&self) -> Switches {
+        Switches { audio: true, locked: false, shy: false, ..self.clone() }
+    }
+}
+
+impl Layer {
+    /// Draws the same pixels as `o`: equal but for the Audio, Lock and Shy switches.
+    pub fn same_pixels(&self, o: &Layer) -> bool {
+        // Every field (no `..`: a new field must be considered here); the property tree last.
+        let Layer {
+            id,
+            name,
+            source,
+            label,
+            comment,
+            start_time,
+            in_point,
+            out_point,
+            stretch,
+            switches,
+            blend_mode,
+            preserve_transparency,
+            track_matte,
+            parent,
+            markers,
+            markers_locked,
+            auto_orient,
+            environment,
+            environment_background,
+            props,
+        } = self;
+        *id == o.id
+            && *name == o.name
+            && *source == o.source
+            && *label == o.label
+            && *comment == o.comment
+            && *start_time == o.start_time
+            && *in_point == o.in_point
+            && *out_point == o.out_point
+            && *stretch == o.stretch
+            && switches.pixels() == o.switches.pixels()
+            && *blend_mode == o.blend_mode
+            && *preserve_transparency == o.preserve_transparency
+            && *track_matte == o.track_matte
+            && *parent == o.parent
+            && *markers == o.markers
+            && *markers_locked == o.markers_locked
+            && *auto_orient == o.auto_orient
+            && *environment == o.environment
+            && *environment_background == o.environment_background
+            && *props == o.props
+    }
+}
+
+impl Comp {
+    /// Draws the same pixels as `o`: equal but for its layers' Audio, Lock and Shy switches and
+    /// Hide Shy Layers.
+    pub fn same_pixels(&self, o: &Comp) -> bool {
+        // Every field (no `..`: a new field must be considered here); the layers last.
+        let Comp {
+            width,
+            height,
+            pixel_aspect,
+            frame_rate,
+            duration,
+            display_start,
+            background,
+            work_area,
+            layers,
+            markers,
+            shutter_angle,
+            shutter_phase,
+            motion_blur_samples,
+            motion_blur_adaptive_limit,
+            renderer,
+            hide_shy: _,
+            enable_motion_blur,
+            enable_frame_blending,
+            draft_3d,
+            preserve_frame_rate,
+            preserve_resolution,
+            poster_time,
+            global_light,
+            guides,
+            essential,
+        } = self;
+        *width == o.width
+            && *height == o.height
+            && *pixel_aspect == o.pixel_aspect
+            && *frame_rate == o.frame_rate
+            && *duration == o.duration
+            && *display_start == o.display_start
+            && *background == o.background
+            && *work_area == o.work_area
+            && *markers == o.markers
+            && *shutter_angle == o.shutter_angle
+            && *shutter_phase == o.shutter_phase
+            && *motion_blur_samples == o.motion_blur_samples
+            && *motion_blur_adaptive_limit == o.motion_blur_adaptive_limit
+            && *renderer == o.renderer
+            && *enable_motion_blur == o.enable_motion_blur
+            && *enable_frame_blending == o.enable_frame_blending
+            && *draft_3d == o.draft_3d
+            && *preserve_frame_rate == o.preserve_frame_rate
+            && *preserve_resolution == o.preserve_resolution
+            && *poster_time == o.poster_time
+            && *global_light == o.global_light
+            && *guides == o.guides
+            && *essential == o.essential
+            && layers.len() == o.layers.len()
+            && layers.iter().zip(&o.layers).all(|(a, b)| a.same_pixels(b))
+    }
+
+    /// The comp with those switches at their defaults (borrowed when they already are), for
+    /// keys that hash the whole comp.
+    pub fn pixel_form(&self) -> std::borrow::Cow<'_, Comp> {
+        if !self.hide_shy && self.layers.iter().all(|l| l.switches == l.switches.pixels()) {
+            return std::borrow::Cow::Borrowed(self);
+        }
+        let mut c = self.clone();
+        c.hide_shy = false;
+        for l in &mut c.layers {
+            l.switches = l.switches.pixels();
+        }
+        std::borrow::Cow::Owned(c)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MatteKind {
     #[default]
@@ -830,6 +970,16 @@ pub struct Footage {
     /// PDF / Illustrator footage: the page shown (0-based; File ▸ Import ▸ Page).
     #[serde(default, skip_serializing_if = "is_default")]
     pub page: u32,
+    /// Image sequences imported with Force Alphabetical Order: the files play one after another
+    /// and their numbering doesn't count (otherwise a gap in it shows a placeholder, as in After
+    /// Effects; [`sequence`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub alphabetical: bool,
+    /// Interpret Footage ▸ Start Timecode ▸ Override Start: the frame (at the footage's frame
+    /// rate) its timecode shows at its first frame. `None` = Use Source File Timecode (0: file
+    /// timecode isn't read). It only relabels source time, as in After Effects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_timecode: Option<i64>,
 }
 
 fn is_default<T: Default + PartialEq>(v: &T) -> bool {
@@ -862,11 +1012,19 @@ impl Default for Footage {
             data: None,
             layer: None,
             page: 0,
+            alphabetical: false,
+            start_timecode: None,
         }
     }
 }
 
 impl Footage {
+    /// Source time as the footage's timecode: its frame `frame` from Start Timecode
+    /// (`0:00:41:20`), as the Footage panel shows it.
+    pub fn timecode(&self, frame: i64) -> String {
+        effectcraft_time::format_timecode_ae(frame.saturating_add(self.start_timecode.unwrap_or(0)), self.frame_rate, false)
+    }
+
     /// The data format of data footage: `json`, `csv` or `tsv` (from the file extension).
     pub fn data_format(&self) -> Option<&'static str> {
         if self.kind != FootageKind::Data {
@@ -894,8 +1052,11 @@ pub struct Proxy {
 
 /// A layer of a layered still (a Photoshop document, or a PDF / Illustrator / EPS file) used as
 /// footage (File ▸ Import ▸ Composition / Composition – Retain Layer Sizes, or Choose Layer).
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SourceLayer {
+    /// Authored vector artwork bounds in document pixels, retained even while offline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crop_bounds: Option<[f64; 4]>,
     /// Layer record index in the file (bottom of the stack = 0).
     pub index: u32,
     pub name: String,

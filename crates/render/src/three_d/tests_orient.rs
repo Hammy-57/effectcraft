@@ -41,6 +41,32 @@ fn orient_towards_camera_faces_the_eye() {
 }
 
 #[test]
+fn orient_towards_camera_faces_the_eye_upright_under_a_rotated_parent() {
+    // SceneYard Lucky Smile: icons parented to a ring tilted X -78°, Y -18° still face the
+    // camera upright (layer +y stays world down), keeping the parent's scale.
+    let (mut p, cid, comp) = setup();
+    let mut ring = solid(&mut p, &comp, true, [100.0, 50.0, 0.0]);
+    ring.props.prop_mut("transform/rotationX").unwrap().value = Value::Scalar(-78.0);
+    ring.props.prop_mut("transform/rotationY").unwrap().value = Value::Scalar(-18.0);
+    ring.props.prop_mut("transform/rotation").unwrap().value = Value::Scalar(40.0);
+    ring.props.prop_mut("transform/scale").unwrap().value = Value::Vec3([200.0, 200.0, 200.0]);
+    let mut l = solid(&mut p, &comp, true, [30.0, -20.0, 10.0]);
+    l.auto_orient = AutoOrient::TowardsCamera;
+    l.parent = Some(ring.id);
+    p.comp_mut(cid).unwrap().layers.extend([l, ring]);
+    let c = p.comp(cid).unwrap();
+    let ctx = EvalCtx::new(&p, cid, c, Tick::ZERO);
+    let w = ctx.world_matrix(&c.layers[0]);
+    let n = w.apply_vec(vec3(0.0, 0.0, 1.0));
+    let eye = active_camera(&ctx).eye;
+    let to_layer = (w.apply(vec3(5.0, 5.0, 0.0)) - eye).normalize();
+    assert!((n.normalize() - to_layer).length() < 1e-6, "{n:?} vs {to_layer:?}");
+    assert!((n.length() - 2.0).abs() < 1e-6, "parent scale kept: {n:?}");
+    let x = w.apply_vec(vec3(1.0, 0.0, 0.0));
+    assert!(x.y.abs() < 1e-6, "upright: layer x stays horizontal, {x:?}");
+}
+
+#[test]
 fn orient_along_path_2d_follows_motion() {
     let (mut p, cid, comp) = setup();
     let mut l = solid(&mut p, &comp, false, [50.0, 10.0, 0.0]);
@@ -72,6 +98,36 @@ fn layers_parented_to_a_camera_follow_its_rotation() {
     // 100 px in front of a camera turned to +x is at x = 100 (anchor at the solid's centre).
     let at = ctx.world_matrix(&c.layers[1]).apply(vec3(5.0, 5.0, 0.0));
     assert!((at - vec3(100.0, 0.0, 0.0)).length() < 1e-6, "{at:?}");
+}
+
+#[test]
+fn camera_parent_xyz_rotations_match_ae_projection_order() {
+    let (mut p, cid, comp) = setup();
+    let mut parent = build::layer(&mut p, &comp, "Rig", LayerSource::Null, (200, 100), None);
+    parent.switches.three_d = true;
+    parent.props.prop_mut("transform/anchor").unwrap().value = Value::Vec3([0.0, 0.0, 0.0]);
+    for (name, value) in [
+        ("position", Value::Vec3([90.0, 55.0, 0.0])),
+        ("rotationX", Value::Scalar(41.0)),
+        ("rotationY", Value::Scalar(41.0)),
+        ("rotation", Value::Scalar(14.0)),
+    ] {
+        parent.props.prop_mut(&format!("transform/{name}")).unwrap().value = value;
+    }
+    let mut cam = build::layer(&mut p, &comp, "Camera", LayerSource::Camera, (200, 100), None);
+    cam.parent = Some(parent.id);
+    cam.auto_orient = AutoOrient::TowardsPointOfInterest;
+    cam.props.prop_mut("transform/poi").unwrap().value = Value::Vec3([0.0, 0.0, 0.0]);
+    cam.props.prop_mut("transform/position").unwrap().value = Value::Vec3([0.0, 0.0, -200.0]);
+    cam.props.prop_mut("cameraOptions/zoom").unwrap().value = Value::Scalar(200.0);
+    p.comp_mut(cid).unwrap().layers.extend([cam, parent]);
+    let c = p.comp(cid).unwrap();
+    let ctx = EvalCtx::new(&p, cid, c, Tick::ZERO);
+    let camera = active_camera(&ctx);
+    let top_left = camera.project(200.0, 100.0, vec3(0.0, 0.0, 0.0)).unwrap();
+    let top_right = camera.project(200.0, 100.0, vec3(200.0, 0.0, 0.0)).unwrap();
+    assert!((top_left.x + 17.6282).abs() < 0.01 && (top_left.y - 28.4564).abs() < 0.01, "{top_left:?}");
+    assert!((top_right.x - 131.7573).abs() < 0.01 && (top_right.y - 13.5049).abs() < 0.01, "{top_right:?}");
 }
 
 #[test]
@@ -127,4 +183,28 @@ fn layer_cache_is_independent_of_camera_lights_and_view() {
     let third = check(&p, Some(top));
     assert_ne!(third, second);
     assert!(cache.stats().hits > 0, "the cache was actually used");
+}
+
+/// A camera parented to a null scaled across the view but not along it sees the picture
+/// magnified by the ratio (SceneYard "PayPal UI Animation": Null 1 at 49%, 49%, 100% zooms its
+/// camera in about 2×); a uniformly scaled parent only moves it.
+#[test]
+fn parent_scale_across_the_view_magnifies_the_camera() {
+    let zoom_with = |scale: [f64; 3]| {
+        let (mut p, cid, comp) = setup();
+        let mut null = solid(&mut p, &comp, true, [100.0, 50.0, 0.0]);
+        null.props.prop_mut("transform/scale").unwrap().value = Value::Vec3(scale);
+        let mut cam = build::layer(&mut p, &comp, "Camera", LayerSource::Camera, (200, 100), None);
+        cam.parent = Some(null.id);
+        let c = p.comp_mut(cid).unwrap();
+        c.layers.push(cam);
+        c.layers.push(null);
+        let c = p.comp(cid).unwrap();
+        let ctx = EvalCtx::new(&p, cid, c, Tick::ZERO);
+        let base = c.layers[0].props.prop("cameraOptions/zoom").unwrap().value.as_f64();
+        active_camera(&ctx).zoom / base
+    };
+    assert!((zoom_with([50.0, 50.0, 100.0]) - 2.0).abs() < 1e-9);
+    assert!((zoom_with([50.0, 50.0, 50.0]) - 1.0).abs() < 1e-9);
+    assert!((zoom_with([100.0, 100.0, 100.0]) - 1.0).abs() < 1e-9);
 }

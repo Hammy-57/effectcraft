@@ -2006,7 +2006,7 @@ pub fn specs() -> Vec<EffectSpec> {
                 p("twistAngle", "Twist Angle", num(0.0), ParamUi::Angle),
                 p("gridSpacing", "Grid Spacing", num(4.0), slider(1.0, 200.0, 1.0, 50.0, 0)),
                 p("ballSize", "Ball Size", num(40.0), slider(0.0, 400.0, 0.0, 200.0, 1)),
-                p("instabilityState", "Instability State", num(0.0), ParamUi::Angle),
+                p("instabilityState", "Scatter Motion", num(0.0), ParamUi::Angle),
             ],
             ball_action,
         ),
@@ -2253,6 +2253,10 @@ mod tests {
         assert!(none.data.iter().all(|p| p[3] == 0.0));
         let sc = run("ec.sim.ccballaction", &[("ballSize", num(80.0)), ("scatter", num(20.0))], ramp(32, 32), 0.0);
         assert!(sum_diff(&a, &sc) > 1.0);
+        let motion = run("ec.sim.ccballaction", &[("ballSize", num(80.0)), ("scatter", num(20.0)), ("instabilityState", num(24.0))], ramp(32, 32), 0.0);
+        assert!(sum_diff(&sc, &motion) > 0.1, "Scatter Motion rotates scatter offsets");
+        let still = run("ec.sim.ccballaction", &[("ballSize", num(80.0)), ("instabilityState", num(24.0))], ramp(32, 32), 0.0);
+        assert_eq!(a, still, "Scatter Motion has no effect without Scatter");
     }
 
     #[test]

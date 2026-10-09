@@ -1,6 +1,7 @@
-//! Modal dialogs: About (with community links), New Composition / Composition Settings, Solid
-//! Settings and the command palette (Camera/Light Settings live in `dialogs_3d`).
+//! Modal dialogs: About (community links, Contributors and Models credits), New Composition /
+//! Composition Settings, Solid Settings and the command palette (Camera/Light Settings live in `dialogs_3d`).
 
+use crate::i18n::{tr, tr_args};
 use effectcraft_engine::project::{ItemId, ItemKind, LayerId, LayerSource};
 use egui::{Align2, Color32, Rect, Sense, pos2, vec2};
 use serde_json::{Value, json};
@@ -31,6 +32,8 @@ pub struct DialogState {
     pub solid_affect_all: bool,
     pub palette_query: String,
     pub palette_sel: usize,
+    /// The Effect Console (Ctrl+Space), when open. It isn't a modal dialog: the app stays live.
+    pub fx_console: Option<super::fx_console::Console>,
     /// Settings dialog page id (`general`, `appearance`…).
     pub settings_page: String,
     /// Settings when the dialog opened (Cancel restores them).
@@ -194,67 +197,49 @@ pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context) {
     }
 }
 
+/// About tabs: About · Contributors · Models.
+const ABOUT_TABS: [(&str, &str); 3] = [("About", "about"), ("Contributors", "contributors"), ("Models", "models")];
+/// Height of the Contributors / Models tab bodies (they scroll inside it).
+const CREDITS_HEIGHT: f32 = 380.0;
+
 fn about(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
     let mut close = false;
     let mut cmd: Option<&str> = None;
-    modal(ctx, "About EffectCraft", vec2(520.0, 400.0), t, |ui| {
-        let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 96.0), Sense::hover());
-        let p = ui.painter();
-        p.rect_filled(r, 10.0, Color32::from_rgb(0x1b, 0x22, 0x3c));
-        crate::header::paint_logo(p, Rect::from_min_size(r.min + vec2(18.0, 20.0), vec2(56.0, 56.0)));
-        p.text(r.min + vec2(90.0, 34.0), Align2::LEFT_CENTER, "EffectCraft", Tokens::semibold(24.0), Color32::WHITE);
-        p.text(
-            r.min + vec2(90.0, 62.0),
-            Align2::LEFT_CENTER,
-            format!("Version {}  •  Motion graphics & VFX in pure Rust", env!("CARGO_PKG_VERSION")),
-            Tokens::ui(12.0),
-            t.text_dim,
-        );
-        ui.add_space(12.0);
-        ui.label("A clean-room, open-source compositor for motion graphics and visual effects: native on macOS, Windows and Linux, and in the browser. Part of the ArtCraft family of creative apps.");
-        ui.add_space(14.0);
-        let links: [(Icon, &str, &str, &str); 4] = [
-            (Icon::Chat, "Join the ArtCraft Discord", effectcraft_engine::links::DISCORD, "help.discord"),
-            (Icon::Globe, "ArtCraft website", effectcraft_engine::links::WEBSITE, "help.website"),
-            (Icon::Sparkle, "EffectCraft home page", effectcraft_engine::links::APP_PAGE, "help.appPage"),
-            (Icon::Code, "Source code on GitHub", effectcraft_engine::links::GITHUB, "help.github"),
-        ];
-        for (icon, label, url, c) in links {
-            let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
-            let p = ui.painter();
-            let discord = c == "help.discord";
-            p.rect_filled(
-                r,
-                6.0,
-                if discord {
-                    Color32::from_rgb(0x58, 0x65, 0xf2)
-                } else if resp.hovered() {
-                    t.hover
-                } else {
-                    t.field_bg
-                },
-            );
-            let foreground = if discord { Color32::WHITE } else { t.text };
-            icons::paint(p, Rect::from_center_size(pos2(r.min.x + 18.0, r.center().y), vec2(15.0, 15.0)), icon, foreground);
-            p.text(pos2(r.min.x + 36.0, r.center().y), Align2::LEFT_CENTER, label, Tokens::medium(12.5), foreground);
-            p.text(
-                pos2(r.max.x - 12.0, r.center().y),
-                Align2::RIGHT_CENTER,
-                url,
-                Tokens::ui(11.0),
-                if discord { Color32::from_white_alpha(200) } else { t.text_dim },
-            );
-            app.auto.add(&format!("about.{c}"), r, label);
-            if resp.clicked() {
-                cmd = Some(c);
+    let tab_id = egui::Id::new("about_tab");
+    modal(ctx, "About EffectCraft", vec2(680.0, 520.0), t, |ui| {
+        let mut tab = ui.data_mut(|d| d.get_temp::<usize>(tab_id)).unwrap_or(0);
+        ui.horizontal(|ui| {
+            for (i, (label, id)) in ABOUT_TABS.iter().enumerate() {
+                let r = ui.selectable_label(tab == i, *label);
+                app.auto.add(&format!("about.tab.{id}"), r.rect, label);
+                if r.clicked() {
+                    tab = i;
+                }
             }
-            ui.add_space(4.0);
+        });
+        ui.data_mut(|d| d.insert_temp(tab_id, tab));
+        ui.separator();
+        match tab {
+            1 | 2 => {
+                let h = CREDITS_HEIGHT.min(ui.available_height().max(120.0));
+                ui.allocate_ui(vec2(ui.available_width(), h), |ui| {
+                    ui.set_max_height(h);
+                    if tab == 1 {
+                        crate::credits::contributors_ui(ui, &mut app.auto);
+                    } else {
+                        crate::credits::models_ui(ui);
+                    }
+                });
+            }
+            _ => about_main(app, ui, t, &mut cmd),
         }
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("MIT OR Apache-2.0 • Fonts: Inter, JetBrains Mono (OFL)").small().color(t.text_faint));
+            ui.label(egui::RichText::new(tr("MIT OR Apache-2.0 • Fonts: Inter, JetBrains Mono (OFL)")).small().color(t.text_faint));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Close").clicked() {
+                let r = ui.button(tr("Close"));
+                app.auto.add("about.close", r.rect, "Close");
+                if r.clicked() {
                     close = true;
                 }
             });
@@ -265,6 +250,62 @@ fn about(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
     }
     if close {
         app.dialog = None;
+    }
+}
+
+/// The About tab: logo, version, blurb and community links.
+fn about_main(app: &mut EffectcraftApp, ui: &mut egui::Ui, t: &Tokens, cmd: &mut Option<&'static str>) {
+    let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 96.0), Sense::hover());
+    let p = ui.painter();
+    p.rect_filled(r, 10.0, Color32::from_rgb(0x1b, 0x22, 0x3c));
+    crate::header::paint_logo(p, Rect::from_min_size(r.min + vec2(18.0, 20.0), vec2(56.0, 56.0)));
+    p.text(r.min + vec2(90.0, 34.0), Align2::LEFT_CENTER, "EffectCraft", Tokens::semibold(24.0), Color32::WHITE);
+    p.text(
+        r.min + vec2(90.0, 62.0),
+        Align2::LEFT_CENTER,
+        format!("Version {}  •  Motion graphics & VFX in pure Rust", env!("CARGO_PKG_VERSION")),
+        Tokens::ui(12.0),
+        t.text_dim,
+    );
+    ui.add_space(12.0);
+    ui.label(tr("A clean-room, open-source compositor for motion graphics and visual effects: native on macOS, Windows and Linux, and in the browser. Part of the ArtCraft family of creative apps."));
+    ui.add_space(14.0);
+    let links: [(Icon, &str, &str, &'static str); 4] = [
+        (Icon::Chat, "Join the ArtCraft Discord", effectcraft_engine::links::DISCORD, "help.discord"),
+        (Icon::Globe, "ArtCraft website", effectcraft_engine::links::WEBSITE, "help.website"),
+        (Icon::Sparkle, "EffectCraft home page", effectcraft_engine::links::APP_PAGE, "help.appPage"),
+        (Icon::Code, "Source code on GitHub", effectcraft_engine::links::GITHUB, "help.github"),
+    ];
+    for (icon, label, url, c) in links {
+        let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
+        let p = ui.painter();
+        let discord = c == "help.discord";
+        p.rect_filled(
+            r,
+            6.0,
+            if discord {
+                Color32::from_rgb(0x58, 0x65, 0xf2)
+            } else if resp.hovered() {
+                t.hover
+            } else {
+                t.field_bg
+            },
+        );
+        let foreground = if discord { Color32::WHITE } else { t.text };
+        icons::paint(p, Rect::from_center_size(pos2(r.min.x + 18.0, r.center().y), vec2(15.0, 15.0)), icon, foreground);
+        p.text(pos2(r.min.x + 36.0, r.center().y), Align2::LEFT_CENTER, label, Tokens::medium(12.5), foreground);
+        p.text(
+            pos2(r.max.x - 12.0, r.center().y),
+            Align2::RIGHT_CENTER,
+            url,
+            Tokens::ui(11.0),
+            if discord { Color32::from_white_alpha(200) } else { t.text_dim },
+        );
+        app.auto.add(&format!("about.{c}"), r, label);
+        if resp.clicked() {
+            *cmd = Some(c);
+        }
+        ui.add_space(4.0);
     }
 }
 
@@ -311,23 +352,23 @@ fn solid(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
     let auto = &mut app.auto;
     modal(ctx, "Solid Settings", vec2(480.0, if editing.is_some() { 430.0 } else { 390.0 }), t, |ui| {
         ui.horizontal(|ui| {
-            ui.label("Name:");
+            ui.label(tr("Name:"));
             let r = ui.add(egui::TextEdit::singleline(&mut name).desired_width(320.0));
             auto.add("dialog.solid.name", r.rect, "Name");
         });
         ui.add_space(8.0);
-        ui.label(egui::RichText::new("Size").strong());
+        ui.label(egui::RichText::new(tr("Size")).strong());
         egui::Grid::new("solid-grid").num_columns(2).spacing([14.0, 8.0]).show(ui, |ui| {
             let (ow, oh) = (size[0], size[1]);
-            ui.label("Width:");
+            ui.label(tr("Width:"));
             ui.horizontal(|ui| {
                 let r = ui.add(egui::DragValue::new(&mut size[0]).range(1..=30000).suffix(" px"));
                 auto.add("dialog.solid.width", r.rect, "Width");
-                let r = ui.checkbox(&mut lock, format!("Lock Aspect Ratio to {}", super::comp_settings::aspect_label(ow as f64, oh as f64)));
+                let r = ui.checkbox(&mut lock, tr_args("Lock Aspect Ratio to {}", &[&(super::comp_settings::aspect_label(ow as f64, oh as f64))]));
                 auto.add("dialog.solid.lockAspect", r.rect, "Lock Aspect Ratio");
             });
             ui.end_row();
-            ui.label("Height:");
+            ui.label(tr("Height:"));
             let r = ui.add(egui::DragValue::new(&mut size[1]).range(1..=30000).suffix(" px"));
             auto.add("dialog.solid.height", r.rect, "Height");
             ui.end_row();
@@ -338,7 +379,7 @@ fn solid(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
                     size[0] = ((size[1] as f64) * ow as f64 / oh as f64).round().max(1.0) as u32;
                 }
             }
-            ui.label("Pixel Aspect Ratio:");
+            ui.label(tr("Pixel Aspect Ratio:"));
             let cur = super::comp_settings::PIXEL_ASPECTS
                 .iter()
                 .find(|(_, v)| (v - par).abs() < 1e-3)
@@ -365,14 +406,14 @@ fn solid(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
             .color(Color32::GRAY),
         );
         ui.add_space(4.0);
-        let r = ui.button("Make Comp Size");
+        let r = ui.button(tr("Make Comp Size"));
         auto.add("dialog.solid.makeCompSize", r.rect, "Make Comp Size");
         if r.clicked() {
             size = [comp_size.0, comp_size.1];
         }
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            ui.label("Color:");
+            ui.label(tr("Color:"));
             let r = crate::widgets::srgb_color_button(ui, &mut color);
             auto.add("dialog.solid.color", r.rect, "Color");
         });
@@ -383,15 +424,15 @@ fn solid(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
                 .on_disabled_hover_text("Only this layer uses this solid.");
             auto.add("dialog.solid.affectAll", r.rect, "Affect all layers that use this solid");
             if shared && !affect_all {
-                ui.label(egui::RichText::new("This change will create a new solid for this layer.").color(t.text_dim).size(11.0));
+                ui.label(egui::RichText::new(tr("This change will create a new solid for this layer.")).color(t.text_dim).size(11.0));
             }
         }
         ui.add_space(14.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let r = ui.add(egui::Button::new(egui::RichText::new("   OK   ").color(Color32::WHITE)).fill(t.accent));
+            let r = ui.add(egui::Button::new(egui::RichText::new(tr("   OK   ")).color(Color32::WHITE)).fill(t.accent));
             auto.add("dialog.solid.ok", r.rect, "OK");
             ok = r.clicked();
-            let r = ui.button("Cancel");
+            let r = ui.button(tr("Cancel"));
             auto.add("dialog.solid.cancel", r.rect, "Cancel");
             close = r.clicked();
         });
@@ -455,7 +496,7 @@ fn palette(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
         .take(14)
         .collect();
     modal(ctx, "Command Palette", vec2(560.0, 470.0), t, |ui| {
-        let r = ui.add(egui::TextEdit::singleline(&mut q).hint_text("Type a command or effect…").desired_width(f32::INFINITY).font(Tokens::ui(14.0)));
+        let r = ui.add(egui::TextEdit::singleline(&mut q).hint_text(tr("Type a command or effect…")).desired_width(f32::INFINITY).font(Tokens::ui(14.0)));
         r.request_focus();
         ui.add_space(8.0);
         let sel = app.dialog_state.palette_sel.min(matches.len().saturating_sub(1));
@@ -510,7 +551,7 @@ mod tests {
     fn app() -> (EffectcraftApp, egui::Context) {
         let ctx = egui::Context::default();
         let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
-        crate::theme::install(&ctx, &app.tokens);
+        crate::theme::install(&ctx, &app.tokens, crate::i18n::language(&app));
         app.session.execute("comp.new", json!({"name": "Main", "width": 640, "height": 360})).unwrap();
         (app, ctx)
     }

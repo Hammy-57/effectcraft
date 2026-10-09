@@ -106,6 +106,31 @@ fn new_light_and_change_type() {
     assert!(s.execute("layer.newLight", json!({"kind": "Laser"})).is_err());
 }
 
+/// The Environment light is listed in `layer.newLight`'s help and in the kind errors, and takes
+/// its equirectangular source as a layer id (#261).
+#[test]
+fn environment_light_is_listed_and_takes_a_source_layer() {
+    let mut s = session();
+    let spec = crate::command_specs().iter().find(|c| c.id == "layer.newLight").unwrap();
+    assert!(spec.params.contains("lightOptions/source"), "{}", spec.params);
+    let e = s.execute("layer.newLight", json!({"kind": "Laser"})).unwrap_err().to_string();
+    let point = s.execute("layer.newLight", json!({"kind": "Point"})).unwrap()["layer"].as_u64().unwrap();
+    let e2 = s.execute("layer.lightSettings", json!({"layer": point, "kind": "Laser"})).unwrap_err().to_string();
+    for k in LightKind::ALL {
+        assert!(spec.params.contains(k.label()), "help lists {}: {}", k.label(), spec.params);
+        assert!(e.contains(k.label()) && e2.contains(k.label()), "{e} / {e2}");
+    }
+    let sky = s.execute("layer.newSolid", json!({"width": 256, "height": 128, "name": "Sky"})).unwrap()["layer"].as_u64().unwrap();
+    let env = s.execute("layer.newLight", json!({"kind": "Environment", "name": "Env"})).unwrap()["layer"].as_u64().unwrap();
+    let source = s.active_comp().unwrap().layer(effectcraft_project::LayerId(env)).unwrap().source.clone();
+    assert_eq!(source, LayerSource::Light { kind: LightKind::Environment });
+    assert_eq!(prop(&s, env, "lightOptions/source").as_layer(), None, "empty: the comp's Environment Layer");
+    s.execute("prop.set", json!({"layer": env, "path": "lightOptions/source", "value": sky})).unwrap();
+    assert_eq!(prop(&s, env, "lightOptions/source").as_layer(), Some(sky));
+    s.undo();
+    assert_eq!(prop(&s, env, "lightOptions/source").as_layer(), None);
+}
+
 #[test]
 fn three_d_switch_undo_redo() {
     let mut s = session();

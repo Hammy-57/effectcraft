@@ -10,12 +10,16 @@
 //! `f32` bits) and compared with the pinned hashes below: any change to the CPU output of these
 //! effects, however small, fails the test.
 //!
-//! The hashes are exact `f32` bit patterns, so they depend on the platform's libm; they are
-//! pinned for aarch64 macOS (where the gates run). Elsewhere the test only checks that every
-//! case renders deterministically.
+//! The hashes are exact `f32` bit patterns, so they depend on the platform's libm (`sin`, `cos`,
+//! `powf`…); they are pinned for aarch64 macOS (where the gates run). Elsewhere the test only
+//! checks that every case renders deterministically. A case whose frame differs between macOS
+//! releases only through libm also accepts that release's hash ([`LIBM_VARIANTS`]).
 //!
 //! `SIM_GOLDEN_PRINT=1` prints the table (to re-pin after an intended change);
 //! `SIM_GOLDEN_OUT=<dir>` also writes every frame's raw pixels (`f32` little-endian RGBA) there.
+//! To tell a libm difference from a change in the code, render the cases with `SIM_GOLDEN_OUT`
+//! here and at the commit that pinned the hash, and compare the frames: identical frames mean
+//! the code didn't change, and the new hash goes into [`LIBM_VARIANTS`].
 
 use effectcraft_effects::{Buf, EffectCtx, EffectEnv, EffectHost, LayerPixels, Params, apply, default_value, find};
 use effectcraft_keyframe::Value;
@@ -316,16 +320,40 @@ fn sim_effects_golden_hashes() {
     // Deterministic: a second pass (warm simulation caches) renders the same frames.
     assert_eq!(got, hashes(), "simulation effects render deterministically");
     if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        let bad: Vec<String> = got
-            .iter()
-            .zip(GOLDEN)
-            .filter(|((n, h), (gn, gh))| n != gn || h != gh)
-            .map(|((n, h), (_, gh))| format!("{n}: 0x{h:016x} (pinned 0x{gh:016x})"))
-            .collect();
         assert_eq!(got.len(), GOLDEN.len(), "case count");
-        assert!(bad.is_empty(), "CPU output changed:\n{}", bad.join("\n"));
+        let bad = mismatches(&got, GOLDEN, LIBM_VARIANTS);
+        assert!(bad.is_empty(), "CPU output changed (if it may be libm, see the module docs):\n{}", bad.join("\n"));
     }
 }
+
+/// The cases whose hash is neither the pinned one nor one of the case's [`LIBM_VARIANTS`].
+fn mismatches(got: &[(String, u64)], golden: &[(&str, u64)], variants: &[(&str, u64, &str)]) -> Vec<String> {
+    got.iter()
+        .zip(golden)
+        .filter(|((n, h), (gn, gh))| n != gn || (h != gh && !variants.iter().any(|(vn, vh, _)| vn == n && vh == h)))
+        .map(|((n, h), (_, gh))| format!("{n}: 0x{h:016x} (pinned 0x{gh:016x})"))
+        .collect()
+}
+
+/// A libm variant passes for its own case only (#232).
+#[test]
+fn libm_variants_are_accepted_for_their_case_only() {
+    let golden = [("a", 1), ("b", 2)];
+    let variants = [("a", 9, "another libm")];
+    let got = |a: u64, b: u64| vec![("a".to_string(), a), ("b".to_string(), b)];
+    assert!(mismatches(&got(1, 2), &golden, &variants).is_empty());
+    assert!(mismatches(&got(9, 2), &golden, &variants).is_empty(), "the variant");
+    assert_eq!(mismatches(&got(9, 9), &golden, &variants), ["b: 0x0000000000000009 (pinned 0x0000000000000002)"], "not another case's");
+    assert_eq!(mismatches(&got(3, 2), &golden, &variants).len(), 1);
+    assert!(LIBM_VARIANTS.iter().all(|(n, ..)| GOLDEN.iter().any(|(g, _)| g == n)), "every variant names a pinned case");
+}
+
+/// Hashes also accepted for a case: the same frame rendered by the same code with another macOS
+/// release's libm (case, hash, where it was seen).
+const LIBM_VARIANTS: &[(&str, u64, &str)] = &[
+    // #232: the pinning commit (ce6ece4) renders byte-identical frames there.
+    ("ec.sim.ccmrmercury/1/32bpc/t2.2", 0x3823bd73a3cdab0d, "macOS 27.2 (26B5091g), rustc 1.98.0"),
+];
 
 /// Pinned hashes (aarch64 macOS).
 const GOLDEN: &[(&str, u64)] = &[

@@ -42,6 +42,9 @@ pub struct Entry {
     pub modified: f64,
     /// Written to the browser's storage (render outputs are not).
     pub persist: bool,
+    /// Which write this is: new with every write of the key, so a file replaced by another of
+    /// the same size still reads as changed (workers are sent it again, #218).
+    pub version: u64,
 }
 
 /// A queued write for the browser storage: `data` = `None` deletes the key.
@@ -58,17 +61,21 @@ pub struct Mirror {
     entries: BTreeMap<String, Entry>,
     /// Keys changed since the last [`Mirror::take_pending`], in first-change order.
     dirty: Vec<String>,
+    /// The last [`Entry::version`] given.
+    version: u64,
 }
 
 impl Mirror {
     /// An entry read from the browser's storage at startup (nothing to flush).
     pub fn load(&mut self, key: &str, data: Arc<[u8]>, modified: f64) {
-        self.entries.insert(key.to_string(), Entry { data, modified, persist: true });
+        let version = self.next_version();
+        self.entries.insert(key.to_string(), Entry { data, modified, persist: true, version });
     }
 
     pub fn put(&mut self, key: &str, data: Arc<[u8]>, modified: f64, persist: bool) {
         let was_persisted = self.entries.get(key).is_some_and(|e| e.persist);
-        self.entries.insert(key.to_string(), Entry { data, modified, persist });
+        let version = self.next_version();
+        self.entries.insert(key.to_string(), Entry { data, modified, persist, version });
         if persist || was_persisted {
             self.touch(key);
         }
@@ -84,6 +91,16 @@ impl Mirror {
             }
             None => false,
         }
+    }
+
+    fn next_version(&mut self) -> u64 {
+        self.version = self.version.wrapping_add(1);
+        self.version
+    }
+
+    /// A write of `key` that failed: the next flush writes the key's latest state again (#215).
+    pub fn retry(&mut self, key: &str) {
+        self.touch(key);
     }
 
     fn touch(&mut self, key: &str) {
@@ -170,6 +187,11 @@ impl Store {
 
     pub fn file(&self, path: &str) -> Option<Arc<[u8]>> {
         self.lock().get(&file_key(path)).map(|e| e.data.clone())
+    }
+
+    /// The file under `path` with its [`Entry::version`].
+    pub fn file_versioned(&self, path: &str) -> Option<(Arc<[u8]>, u64)> {
+        self.lock().get(&file_key(path)).map(|e| (e.data.clone(), e.version))
     }
 
     pub fn remove_file(&self, path: &str) -> bool {
@@ -410,6 +432,38 @@ mod tests {
         m.put("files/old.mov", Arc::from(&b"n"[..]), 7.0, false);
         assert_eq!(m.take_pending()[0].data, None);
         assert_eq!(m.list("files").len(), 1);
+    }
+
+    /// A file replaced by different bytes of the same size gets a new version, so workers are
+    /// sent it again (#218).
+    #[test]
+    fn versions_change_with_every_write() {
+        let s = store();
+        s.put_file("/collision.png", Arc::from(&b"red!"[..]), true);
+        let (_, a) = s.file_versioned("/collision.png").unwrap();
+        s.put_file("/collision.png", Arc::from(&b"blue"[..]), true);
+        let (data, b) = s.file_versioned("/collision.png").unwrap();
+        assert_ne!(a, b);
+        assert_eq!(&data[..], b"blue");
+        assert_eq!(s.file_versioned("/collision.png").map(|f| f.1), Some(b), "reading doesn't change it");
+    }
+
+    /// A write that failed is flushed again with the key's latest state (#215).
+    #[test]
+    fn failed_writes_retry() {
+        let s = store();
+        s.put_file("/collision.png", Arc::from(&b"blue"[..]), true);
+        let mut m = s.lock();
+        let p = m.take_pending();
+        assert_eq!(p.len(), 1);
+        assert!(!m.has_pending());
+        m.retry(&p[0].key);
+        assert_eq!(m.take_pending(), p, "the same write again");
+        // A newer change wins over the failed one.
+        m.retry("files/collision.png");
+        m.put("files/collision.png", Arc::from(&b"gold"[..]), 2.0, true);
+        let again = m.take_pending();
+        assert_eq!((again.len(), again[0].data.as_deref()), (1, Some(&b"gold"[..])));
     }
 
     #[test]

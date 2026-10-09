@@ -316,7 +316,7 @@ fn box_v(@builtin(global_invocation_id) gid: vec3<u32>) {
     box_pass(gid, false);
 }
 
-// Directional blur (raster::directional_blur). f[0] = (dx, dy, length, samples).
+// Directional blur (raster::directional_blur). f[0] = (dx, dy, length, samples); u[0].x = repeat edges.
 @compute @workgroup_size(16, 16)
 fn directional(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dims = out_dims();
@@ -331,7 +331,13 @@ fn directional(@builtin(global_invocation_id) gid: vec3<u32>) {
     var acc = vec4<f32>(0.0);
     for (var i = 0; i < n; i++) {
         let t = (f32(i) / f32(n - 1) - 0.5) * len;
-        acc += sample_bilinear(src, f32(p.x) + 0.5 + dx * t, f32(p.y) + 0.5 + dy * t);
+        let sx = f32(p.x) + 0.5 + dx * t;
+        let sy = f32(p.y) + 0.5 + dy * t;
+        if (P.u[0].x != 0u) {
+            acc += sample_bilinear_clamped(src, sx, sy);
+        } else {
+            acc += sample_bilinear(src, sx, sy);
+        }
     }
     textureStore(out, p, acc / f32(n));
 }
@@ -359,8 +365,14 @@ fn glow_ab_t(l: f32) -> f32 {
     return pow(max(t, 0.0), log(0.5) / log(m));
 }
 
-// Glow bright pass. u[0].x = A & B colours; u[0].y = based on alpha; f[0].x = threshold;
-// f[1] = colour A; f[2] = colour B.
+// misc::glow_bright: the soft step at the threshold (f[0].x), misc::GLOW_KNEE wide, fading
+// out towards black.
+fn glow_step(v: f32) -> f32 {
+    return clamp((v - P.f[0].x) / 0.12 + 0.5, 0.0, 1.0) * clamp(v / 0.12, 0.0, 1.0);
+}
+
+// Glow bright pass (misc::glow). u[0].x = one value per pixel (A & B Colors, Arbitrary Map),
+// coloured after the blur; u[0].y = based on alpha; f[0].x = threshold.
 @compute @workgroup_size(16, 16)
 fn glow_bright(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dims = out_dims();
@@ -374,25 +386,41 @@ fn glow_bright(@builtin(global_invocation_id) gid: vec3<u32>) {
         textureStore(out, p, vec4<f32>(0.0));
         return;
     }
-    let thr = P.f[0].x;
-    var l = luminance(px.xyz / a);
-    if (P.u[0].y != 0u) {
-        l = a;
-    }
-    let k = clamp((l - thr) / max(1.0 - thr, 1e-3), 0.0, 1.0);
     if (P.u[0].x != 0u) {
-        let t = glow_ab_t(l);
-        let ca = P.f[1].xyz;
-        let cb = P.f[2].xyz;
-        let c = ca + (cb - ca) * t;
-        textureStore(out, p, vec4<f32>(c * k * a, k * a));
+        // The luminance, or the alpha channel.
+        var l = luminance(px.xyz / a);
+        if (P.u[0].y != 0u) {
+            l = a;
+        }
+        textureStore(out, p, vec4<f32>(glow_step(l) * a));
+    } else if (P.u[0].y != 0u) {
+        textureStore(out, p, px * glow_step(a));
     } else {
-        textureStore(out, p, px * k);
+        // Color Channels: each channel steps on its own.
+        let c = vec3<f32>(glow_step(px.x / a), glow_step(px.y / a), glow_step(px.z / a));
+        textureStore(out, p, vec4<f32>(c * a, max(max(c.x, c.y), c.z) * a));
     }
 }
 
-// Glow composite: original `src` with the blurred glow `aux`. u[0].x = 0 on top, 1 behind,
-// 2 none (glow only); f[0].x = intensity.
+// A & B Colors after the blur (misc::glow): the gradient at misc::glow_ab_position of the
+// blurred strength (alpha), premultiplied by it. Same f / u layout as `glow_bright`;
+// f[1] = colour A; f[2] = colour B.
+@compute @workgroup_size(16, 16)
+fn glow_ab(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dims = out_dims();
+    let p = vec2<i32>(gid.xy);
+    if (p.x >= dims.x || p.y >= dims.y) {
+        return;
+    }
+    let v = clamp(textureLoad(src, p, 0).w, 0.0, 1.0);
+    let t = 1.0 - glow_ab_t(v);
+    let c = P.f[1].xyz + (P.f[2].xyz - P.f[1].xyz) * t;
+    textureStore(out, p, vec4<f32>(c * v, v));
+}
+
+// Glow composite: original `src` with the blurred glow `aux`. u[0].x = misc::glow_composite:
+// 0 the glow over the original (Behind / None), 1 the glow behind it (On Top);
+// f[0].x = intensity.
 @compute @workgroup_size(16, 16)
 fn glow_combine(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dims = out_dims();
@@ -402,9 +430,7 @@ fn glow_combine(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     var o = textureLoad(src, p, 0);
     let g = textureLoad(aux, p, 0) * P.f[0].x;
-    if (P.u[0].x == 2u) {
-        o = g;
-    } else if (P.u[0].x == 1u) {
+    if (P.u[0].x == 1u) {
         let k = 1.0 - o.w;
         o = o + g * k;
     } else {
@@ -535,6 +561,36 @@ fn value_noise(x: f32, y: f32, z: f32, seed: u32) -> f32 {
     return a + (b - a) * fz;
 }
 
+// Fractal Noise's Soft Linear (effects::noise3::typed_noise): the quadratic B-spline over the
+// 3 × 3 lattice values around the nearest one, faded along evolution, and SOFT_LINEAR_GAIN.
+const SOFT_LINEAR_GAIN: f32 = (181.0 / 231.0) / 0.55;
+
+fn bspline(t: f32) -> vec3<f32> {
+    let s = 1.0 - t;
+    return vec3<f32>(0.5 * s * s, 0.5 + t * s, 0.5 * t * t);
+}
+
+fn soft_linear_slice(ix: i32, iy: i32, iz: i32, wx: vec3<f32>, wy: vec3<f32>, seed: u32) -> f32 {
+    var sum = 0.0;
+    for (var j = 0; j < 3; j++) {
+        let y = iy + j - 1;
+        sum += wy[j] * (wx.x * lattice(ix - 1, y, iz, seed) + wx.y * lattice(ix, y, iz, seed) + wx.z * lattice(ix + 1, y, iz, seed));
+    }
+    return sum;
+}
+
+fn soft_linear_noise(x: f32, y: f32, z: f32, seed: u32) -> f32 {
+    let x0 = floor(x + 0.5);
+    let y0 = floor(y + 0.5);
+    let z0 = floor(z);
+    let wx = bspline(x + 0.5 - x0);
+    let wy = bspline(y + 0.5 - y0);
+    let a = soft_linear_slice(i32(x0), i32(y0), i32(z0), wx, wy, seed);
+    let b = soft_linear_slice(i32(x0), i32(y0), i32(z0) + 1, wx, wy, seed);
+    let n = a + (b - a) * fade(z - z0);
+    return 0.5 + (n - 0.5) * SOFT_LINEAR_GAIN;
+}
+
 // generate::put: blend a generated straight colour (alpha ga) over the pixel.
 fn put(px: vec4<f32>, g: vec3<f32>, ga: f32, blend_orig: f32) -> vec4<f32> {
     let g2 = vec4<f32>(g * ga, ga);
@@ -557,7 +613,8 @@ fn straight(px: vec4<f32>) -> vec3<f32> {
 //  7 Fill            f[0] = colour; f[1] = (opacity); u[0].y = invert
 //  8 Curves          f[0] = data offsets (rgb, red, green, blue), f[1].x = alpha (−1 = none)
 //  9 Gradient Ramp   f[0] = (sx, sy, ex, ey); f[1] = start colour; f[2] = end colour;
-//                    f[3] = (len2, scatter, blend); u[0] = (_, radial, seed)
+//                    f[3] = (len2, scatter, blend); u[0] = (_, radial, seed);
+//                    f[4], f[5] = rows of the pixel → ramp-space affine (comp space)
 // 10 Fractal Noise   f[0] = (contrast, brightness, scale x, frac); f[1] = (ox, oy, sr, cr);
 //                    f[2] = (evo, blend, opacity, scale y); f[3] = (sub influence, 1 / sub scaling);
 //                    u[0] = (_, kind, n_oct, seed); u[1] = (invert, overflow, normal blend)
@@ -754,7 +811,8 @@ fn pointwise(@builtin(global_invocation_id) gid: vec3<u32>) {
             let s = P.f[0].xy;
             let e = P.f[0].zw;
             let d = e - s;
-            let v = vec2<f32>(f32(p.x) + 0.5, f32(p.y) + 0.5) - s;
+            let pc = vec3<f32>(f32(p.x) + 0.5, f32(p.y) + 0.5, 1.0);
+            let v = vec2<f32>(dot(P.f[4].xyz, pc), dot(P.f[5].xyz, pc)) - s;
             let len2 = P.f[3].x;
             var t: f32;
             if (P.u[0].y != 0u) {
@@ -769,7 +827,7 @@ fn pointwise(@builtin(global_invocation_id) gid: vec3<u32>) {
             t = clamp(t, 0.0, 1.0);
             let c0 = P.f[1].xyz;
             let c1 = P.f[2].xyz;
-            px = put(px, c0 + (c1 - c0) * t, 1.0, P.f[3].z);
+            px = put(px, c0 + (c1 - c0) * t, px.w, P.f[3].z);
         }
         case 10u: {
             let contrast = P.f[0].x;
@@ -800,7 +858,7 @@ fn pointwise(@builtin(global_invocation_id) gid: vec3<u32>) {
                 if (o + 1u == n_oct && frac > 0.0) {
                     w = frac;
                 }
-                var n = value_noise(u * f, v * f, evo + f32(o) * 7.31, seed + o);
+                var n = soft_linear_noise(u * f, v * f, evo + f32(o) * 7.31, seed + o);
                 let s = n * 2.0 - 1.0;
                 if (kind == 1u) {
                     n = 1.0 - s * s;

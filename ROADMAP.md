@@ -1,5 +1,9 @@
 # Roadmap
 
+- 2026-10-09: Settings ▸ General ▸ Language now translates the interface below the menu bar as well: panels, dialogs, buttons and tooltips read their text through `crates/ui-egui/src/i18n/ui.rs`, keyed by the English source string. Simplified and Traditional Chinese are complete (384 strings); Japanese rows can follow in the same file. A test fails when a converted panel gains a hard-coded string, and another keeps the catalog free of unused rows.
+- 2026-10-08: `effectcraft-cli render --out` resolves a relative path against the working directory, like `--project` (it used the project's folder, which doubled a path that already named it). Render Queue outputs set in a project are unchanged.
+- 2026-10-08: Long-press a grouped toolbar button to choose its tools, including Horizontal/Vertical Type; releasing the hold keeps the menu open. Existing point/paragraph text creation is unchanged.
+
 - 2026-10-06: Settings ▸ General ▸ Language persists English/Japanese menu labels (`general.language`); native UI reuses installed Japanese font fallback, with no bundled CJK font. Dialog and panel contents remain English.
 
 EffectCraft aims to do what After Effects does, with the same panels, menus and behaviour, written
@@ -41,7 +45,10 @@ in [docs/gaps.md](docs/gaps.md).
   - **After Effects projects can't be opened.** EffectCraft can't read `.aep` / `.aepx` files,
     and third-party After Effects plug-ins can't run.
   - **Reliability is uneven across platforms.** Early Linux users hit basic problems: viewer
-    panning, panel docking, drag-and-drop import.
+    panning, panel docking, drag-and-drop import. A Windows user found the font menus offered only
+    the bundled fonts (fixed 6 October: they list every installed font). Reports of 6 October
+    covered drag and drop between panels, a Render Queue menu that ignored clicks, angle
+    revolutions, and preview with audio and with little video memory (all fixed 7 October).
   - **AI tools are new.** Roto Brush's trained model (MobileSAM, M13.35) and face tracking's
     (MediaPipe Face Landmarker, M13.36) are optional downloads, not yet compared with After
     Effects.

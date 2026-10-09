@@ -3,7 +3,8 @@
 //!
 //! - [`load`] (before the app starts) opens the storage and reads every entry into the mirror.
 //! - Changes flush in the background ([`schedule_flush`], wired as the store's change hook):
-//!   one write per changed key, in order, with nothing written twice concurrently.
+//!   one write per changed key, in order, with nothing written twice concurrently. A write that
+//!   fails (quota exceeded…) is kept and tried again, after 2 s, then longer, up to a minute.
 //! - The session snapshot ([`snapshot`]) records the open project and editor state every second
 //!   or so while it changes, so a reload (or a crash) comes back to where the user was
 //!   ([`restore`]).
@@ -37,10 +38,17 @@ thread_local! {
     static FLUSHING: Cell<bool> = const { Cell::new(false) };
     static BACKEND: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
     static LAST_ERROR: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
-    static FLUSH_WAITERS: std::cell::RefCell<Vec<js_sys::Function>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// [`flushed`] promises waiting for the running flush: (resolve, reject).
+    static FLUSH_WAITERS: std::cell::RefCell<Vec<(js_sys::Function, js_sys::Function)>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Delay before retrying failed writes (ms; doubles while they keep failing).
+    static RETRY_MS: Cell<i32> = const { Cell::new(RETRY_FIRST_MS) };
+    static RETRY_PENDING: Cell<bool> = const { Cell::new(false) };
     static SNAP: Cell<(u64, f64)> = const { Cell::new((u64::MAX, 0.0)) };
     static LAST_META: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
 }
+
+const RETRY_FIRST_MS: i32 = 2_000;
+const RETRY_MAX_MS: i32 = 60_000;
 
 /// The storage in use: `opfs`, `indexeddb` or `memory`.
 pub fn backend() -> String {
@@ -52,7 +60,8 @@ pub fn last_error() -> Option<String> {
     LAST_ERROR.with(|e| e.borrow().clone())
 }
 
-fn js_err(e: JsValue) -> String {
+/// A JavaScript error (a rejected promise's reason) as text.
+pub(crate) fn js_err(e: JsValue) -> String {
     e.as_string().or_else(|| js_sys::Reflect::get(&e, &"message".into()).ok().and_then(|m| m.as_string())).unwrap_or_else(|| format!("{e:?}"))
 }
 
@@ -86,8 +95,11 @@ pub fn schedule_flush() {
         return; // the running flush picks the new changes up
     }
     wasm_bindgen_futures::spawn_local(async {
+        // Keys whose write failed in this flush, and the last failure.
+        let mut failed: Vec<String> = vec![];
+        let mut error = None;
         loop {
-            let pending = STORE.lock().take_pending();
+            let pending: Vec<_> = STORE.lock().take_pending().into_iter().filter(|p| !failed.contains(&p.key)).collect();
             if pending.is_empty() {
                 break;
             }
@@ -99,24 +111,68 @@ pub fn schedule_flush() {
                 if let Err(e) = r {
                     let msg = format!("saving {} to browser storage failed: {}", p.key, js_err(e));
                     log::warn!("{msg}");
-                    LAST_ERROR.with(|l| *l.borrow_mut() = Some(msg));
+                    LAST_ERROR.with(|l| *l.borrow_mut() = Some(msg.clone()));
+                    error = Some(msg);
+                    failed.push(p.key);
                 }
             }
         }
+        // Failed writes stay pending (#215): flushed later, and the waiters hear of the failure
+        // instead of being told the changes are stored.
+        {
+            let mut m = STORE.lock();
+            for k in &failed {
+                m.retry(k);
+            }
+        }
         FLUSHING.with(|f| f.set(false));
-        for w in FLUSH_WAITERS.with(|w| std::mem::take(&mut *w.borrow_mut())) {
-            let _ = w.call0(&JsValue::NULL);
+        let waiters = FLUSH_WAITERS.with(|w| std::mem::take(&mut *w.borrow_mut()));
+        match &error {
+            None => {
+                RETRY_MS.with(|r| r.set(RETRY_FIRST_MS));
+                for (resolve, _) in waiters {
+                    let _ = resolve.call0(&JsValue::NULL);
+                }
+            }
+            Some(msg) => {
+                let e: JsValue = js_sys::Error::new(msg).into();
+                for (_, reject) in waiters {
+                    let _ = reject.call1(&JsValue::NULL, &e);
+                }
+                retry_later();
+            }
         }
     });
 }
 
-/// A promise that resolves once every change so far is in the browser storage.
+/// Flush again after the retry delay (once; the delay doubles up to a minute while writes keep
+/// failing).
+fn retry_later() {
+    if RETRY_PENDING.with(|r| r.replace(true)) {
+        return;
+    }
+    let ms = RETRY_MS.with(|r| {
+        let ms = r.get();
+        r.set(ms.saturating_mul(2).min(RETRY_MAX_MS));
+        ms
+    });
+    let again = Closure::once_into_js(|| {
+        RETRY_PENDING.with(|r| r.set(false));
+        schedule_flush();
+    });
+    if let Some(w) = web_sys::window() {
+        let _ = w.set_timeout_with_callback_and_timeout_and_arguments_0(again.unchecked_ref(), ms);
+    }
+}
+
+/// A promise that resolves once every change so far is in the browser storage, and rejects
+/// when a write failed (the change stays pending and is tried again).
 pub fn flushed() -> js_sys::Promise {
-    js_sys::Promise::new(&mut |resolve, _| {
+    js_sys::Promise::new(&mut |resolve, reject| {
         if !FLUSHING.with(|f| f.get()) && !STORE.lock().has_pending() {
             let _ = resolve.call0(&JsValue::NULL);
         } else {
-            FLUSH_WAITERS.with(|w| w.borrow_mut().push(resolve));
+            FLUSH_WAITERS.with(|w| w.borrow_mut().push((resolve, reject)));
             schedule_flush();
         }
     })

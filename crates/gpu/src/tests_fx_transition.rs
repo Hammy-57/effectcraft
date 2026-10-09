@@ -91,6 +91,9 @@ fn perspective() {
     effect_case("ec.perspective.cccylinder", &[("render", e(2)), ("lightHeight", n(20.0)), ("specular", n(60.0))]);
     effect_case("ec.perspective.ccsphere", &[("offset", pt(35.0, 22.0)), ("radius", n(18.0)), ("rotationX", n(20.0)), ("rotationY", n(35.0))]);
     effect_case("ec.perspective.ccsphere", &[("radius", n(20.0)), ("rotationZ", n(50.0)), ("render", e(2))]);
+    for metal in [0.0, 50.0, 100.0] {
+        effect_case("ec.perspective.ccsphere", &[("radius", n(20.0)), ("metal", n(metal)), ("lightColor", c(0.3, 0.7, 1.0))]);
+    }
     effect_case("ec.perspective.ccspotlight", &[("from", pt(15.0, 8.0)), ("to", pt(35.0, 22.0))]);
     effect_case(
         "ec.perspective.ccspotlight",

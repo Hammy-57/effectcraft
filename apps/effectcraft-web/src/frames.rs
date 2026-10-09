@@ -19,7 +19,7 @@
 //! frame times. Without WebGPU, frames render on the worker's CPU.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use effectcraft_engine::offload::footage_files;
@@ -45,7 +45,8 @@ extern "C" {
 struct Fw {
     index: u32,
     mirror: Mirror,
-    files: HashSet<String>,
+    /// The footage files it was sent, with their versions (a replaced file goes again).
+    files: HashMap<String, u64>,
     busy: Option<(u64, RemoteDone)>,
     alive: bool,
     /// Its GPU adapter (after it reported), or why it has none.
@@ -99,7 +100,7 @@ impl WebFrames {
             let mut s = s.borrow_mut();
             for _ in 0..n {
                 let index = frame_worker_start(&crate::page_url(""), on.as_ref().unchecked_ref(), gpu);
-                s.workers.push(Fw { index, mirror: Mirror::default(), files: HashSet::new(), busy: None, alive: true, gpu: None });
+                s.workers.push(Fw { index, mirror: Mirror::default(), files: HashMap::new(), busy: None, alive: true, gpu: None });
             }
         });
         HANDLER.with(|h| *h.borrow_mut() = Some(on));
@@ -116,14 +117,13 @@ impl WebFrames {
             // Footage the worker hasn't got yet.
             let w = &mut s.workers[k];
             for p in footage_files(&job.project) {
-                if w.files.contains(&p) {
+                let Some((d, version)) = crate::files::get_versioned(&p) else { continue };
+                if w.files.get(&p) == Some(&version) {
                     continue;
                 }
-                if let Some(d) = crate::files::get(&p) {
-                    let bytes = js_sys::Uint8Array::from(&d[..]);
-                    frame_worker_post(w.index, &obj(&[("type", "file".into()), ("path", p.as_str().into()), ("bytes", bytes.into())]), &js_sys::Array::new());
-                    w.files.insert(p);
-                }
+                let bytes = js_sys::Uint8Array::from(&d[..]);
+                frame_worker_post(w.index, &obj(&[("type", "file".into()), ("path", p.as_str().into()), ("bytes", bytes.into())]), &js_sys::Array::new());
+                w.files.insert(p, version);
             }
             let sync = w.mirror.sync(job.revision, &job.project);
             let index = w.index;

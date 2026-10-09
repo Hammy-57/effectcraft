@@ -30,6 +30,9 @@ self.onmessage = (e) => {
       else await ec.workerJobInit(!!m.gpu);
       self.postMessage({ type: "ready" });
     })();
+    // A failed start is re-raised outside the promise so the page's `onerror` sees it: its job
+    // fails instead of waiting for "ready" forever (#216).
+    ready.catch((err) => setTimeout(() => { throw err; }));
     return;
   }
   // A failure (a panic) is re-raised outside the queue so the page's `onerror` sees it, as

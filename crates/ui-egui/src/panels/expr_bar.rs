@@ -3,6 +3,7 @@
 //! Clicking the message selects the layer and reveals the property in the timeline.
 //! Automation ids: `viewer.exprErrors`, `viewer.exprErrors.prev`, `viewer.exprErrors.next`.
 
+use crate::i18n::tr;
 use effectcraft_engine::commands::expr_tools::{self, ExprError};
 use effectcraft_engine::project::ItemId;
 use egui::{Align2, Color32, Rect, Sense, pos2, vec2};
@@ -77,7 +78,7 @@ pub fn draw(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect, cid: ItemId
     let comp_name = app.session.project.item(cid).map(|it| it.name.clone()).unwrap_or_default();
     let e = c.errors[i].clone();
     let msg_rect = Rect::from_min_max(pos2(rect.min.x + 26.0, rect.min.y), pos2(prev.min.x - 6.0, rect.max.y));
-    let resp = ui.interact(msg_rect, egui::Id::new("expr-bar-msg"), Sense::click()).on_hover_text("Click to reveal the expression in the timeline");
+    let resp = ui.interact(msg_rect, egui::Id::new("expr-bar-msg"), Sense::click()).on_hover_text(tr("Click to reveal the expression in the timeline"));
     p.with_clip_rect(msg_rect).text(
         pos2(msg_rect.min.x, rect.center().y),
         Align2::LEFT_CENTER,

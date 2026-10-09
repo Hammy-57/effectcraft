@@ -437,6 +437,29 @@ fn group_names_and_counts() {
 }
 
 #[test]
+fn property_group_climbs_by_index() {
+    let f = fx();
+    assert_eq!(f.text("thisComp.layer('A').transform.rotation.propertyGroup().name", 0.0), "Transform");
+    assert_close!(f.num("thisProperty.propertyGroup().propertyIndex == thisLayer.transform.propertyIndex ? 1 : 0", 0.0), 1.0);
+    assert_eq!(f.text("thisComp.layer('A').effect(1)(1).propertyGroup(1).name", 0.0), "Slider Control");
+    assert_close!(f.num("thisComp.layer('A').effect(1)(1).propertyGroup(1).propertyIndex", 0.0), 1.0);
+    assert_close!(f.num("thisComp.layer('A').effect(1)(1).propertyGroup(3).effect(1)(1)", 0.0), 42.0);
+    let shape = f.ev(f.shape, "contents/group/contents/rect/roundness", "thisProperty.propertyGroup(4)(1)(2)(1)(4).value + 7", 0.0).unwrap();
+    assert_close!(shape.as_f64(), 7.0);
+}
+
+#[test]
+fn text_animator_selector_lookup() {
+    let mut f = fx();
+    let animator = group_push(&mut f.p, |ids| build::text_animator(ids, "Animator", vec![]));
+    f.layer_mut(f.title).props.group_mut("text/animators").unwrap().children.push(animator.into());
+    let amount = f.ev(f.title, ROT, "text.animator('Animator').selector('Range Selector 1').advanced.amount", 0.0).unwrap();
+    assert_close!(amount.as_f64(), 100.0);
+    let mode = f.ev(f.title, ROT, "text.animator('Animator').selector('Range Selector 1').advanced.mode", 0.0).unwrap();
+    assert_close!(mode.as_f64(), 1.0);
+}
+
+#[test]
 fn mask_properties() {
     let f = fx();
     assert_close!(f.num("mask('Mask 1').maskOpacity", 0.0), 100.0);

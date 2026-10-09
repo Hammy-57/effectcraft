@@ -55,6 +55,8 @@ pub(crate) fn gpu() -> Option<&'static Gpu> {
         let g = Gpu::headless();
         if g.is_none() {
             eprintln!("effectcraft-gpu tests: no GPU adapter, skipping GPU comparisons");
+        } else if let Some(g) = &g {
+            eprintln!("effectcraft-gpu tests: adapter {}", g.ctx.name);
         }
         g
     })
@@ -158,8 +160,8 @@ impl Scene {
     pub(crate) fn effect(&mut self, l: &mut Layer, id: &str, vals: &[(&str, Value)]) {
         let spec = effectcraft_effects::find(id).unwrap();
         let mut next = self.p.next_id;
-        let size = effectcraft_render::source_size(&self.p, l);
-        let mut g = effectcraft_effects::instantiate(spec, &mut Ids(&mut next), spec.name, [size.0 as f64, size.1 as f64]);
+        let size = effectcraft_render::effect_bounds(&self.p, &self.comp, l).0;
+        let mut g = effectcraft_effects::instantiate(spec, &mut Ids(&mut next), spec.name, size);
         self.p.next_id = next;
         for (k, v) in vals {
             g.prop_mut(k).unwrap_or_else(|| panic!("{id}: no {k}")).value = v.clone();
@@ -425,6 +427,11 @@ fn layer_styles_collapsed_precomps_and_cpu_fallbacks() {
 /// The effect alone on a buffer: GPU kernels vs the CPU effect (32-bit float), including the
 /// buffer geometry (padding, offset).
 pub(crate) fn effect_direct(id: &str, vals: &[(&str, Value)], adjustment: bool) {
+    effect_direct_env(id, vals, adjustment, Default::default());
+}
+
+/// [`effect_direct`] with renderer context (e.g. a Continuously Rasterize layer's comp space).
+pub(crate) fn effect_direct_env(id: &str, vals: &[(&str, Value)], adjustment: bool, env: effectcraft_effects::EffectEnv) {
     let Some(g) = gpu() else { return };
     let spec = effectcraft_effects::find(id).unwrap();
     let size = [70.0, 44.0];
@@ -436,7 +443,7 @@ pub(crate) fn effect_direct(id: &str, vals: &[(&str, Value)], adjustment: bool) 
     for scale in [1.0, 0.5] {
         let img = pattern(7, (size[0] * scale) as u32, (size[1] * scale) as u32);
         let buf = effectcraft_effects::Buf { img, offset: [0.0, 0.0], scale };
-        let ctx = || effectcraft_effects::EffectCtx { params: &params, time: 0.25, layer_size: size, seed: 11, adjustment, env: Default::default() };
+        let ctx = || effectcraft_effects::EffectCtx { params: &params, time: 0.25, layer_size: size, seed: 11, adjustment, env };
         let cpu = (spec.render)(&ctx(), buf.clone());
         let out = effectcraft_render::Accelerator::effects(g, &[effectcraft_render::FxStep { spec, ctx: ctx() }], &buf, None).expect("the GPU runs the effect");
         assert_eq!((out.offset, out.scale), (cpu.offset, cpu.scale), "{id}: geometry");
@@ -457,6 +464,11 @@ pub(crate) fn effect_direct(id: &str, vals: &[(&str, Value)], adjustment: bool) 
 pub(crate) fn effect_case(id: &str, vals: &[(&str, Value)]) {
     effect_direct(id, vals, false);
     effect_direct(id, vals, true);
+    effect_composite_case(id, vals);
+}
+
+/// Full compositor parity, including controls that deliberately fall back to the CPU.
+fn effect_composite_case(id: &str, vals: &[(&str, Value)]) {
     for depth in [BitDepth::Bpc8, BitDepth::Bpc32] {
         let mut s = Scene::new(depth);
         let bg = s.solid([0.15, 0.1, 0.2], 97, 61);
@@ -476,6 +488,13 @@ pub(crate) fn n(v: f64) -> Value {
 
 pub(crate) fn c(r: f64, g: f64, b: f64) -> Value {
     Value::Color([r, g, b, 1.0])
+}
+
+#[test]
+fn imported_cpu_only_effect_controls_match_on_gpu() {
+    effect_composite_case("ec.color.lumetri", &[("basicCorrection/active", Value::Bool(false)), ("basicCorrection/tone/exposure", n(2.0))]);
+    effect_composite_case("ec.noise.addgrain", &[("application/matchAmount", n(75.0)), ("application/matchingColor", c(0.2, 0.4, 0.6))]);
+    effect_composite_case("ec.perspective.cccylinder", &[("positionX", n(8.0)), ("rotationX", n(25.0))]);
 }
 
 #[test]
@@ -514,6 +533,12 @@ fn gpu_effects_match_cpu() {
     effect_case("ec.generate.fill", &[("invert", Value::Bool(true))]);
     effect_case("ec.generate.gradientramp", &[("start", Value::Vec2([5.0, 3.0])), ("end", Value::Vec2([60.0, 40.0])), ("blend", n(25.0))]);
     effect_case("ec.generate.gradientramp", &[("shape", Value::Enum(1)), ("scatter", n(40.0))]);
+    // A Continuously Rasterize layer: the points are comp pixels (rotated, non-uniform scale).
+    let env = effectcraft_effects::EffectEnv { comp_space: Some([[2.5, -0.8, 300.0], [0.6, 4.0, -50.0]]), ..Default::default() };
+    for shape in [0, 1] {
+        let vals = [("start", Value::Vec2([310.0, -40.0])), ("end", Value::Vec2([420.0, 120.0])), ("shape", Value::Enum(shape))];
+        effect_direct_env("ec.generate.gradientramp", &vals, false, env);
+    }
     effect_case("ec.noise.fractal", &[]);
     effect_case(
         "ec.noise.fractal",
@@ -552,7 +577,8 @@ fn gpu_effects_match_cpu() {
     effect_case("ec.channel.invert", &[]);
     effect_case("ec.channel.invert", &[("channel", Value::Enum(effectcraft_effects::INVERT_ALPHA)), ("blend", n(30.0))]);
     effect_case("ec.channel.invert", &[("channel", Value::Enum(2))]);
-    effect_case("ec.distort.transform", &[("rotation", n(20.0)), ("scaleHeight", n(80.0)), ("skew", n(10.0)), ("opacity", n(70.0))]);
+    // Kept inside the buffer: content carried past its edges grows the buffer on the CPU.
+    effect_case("ec.distort.transform", &[("rotation", n(20.0)), ("scaleHeight", n(50.0)), ("skew", n(10.0)), ("opacity", n(70.0))]);
 }
 
 /// A chain of GPU effects (one upload, quantised between steps) and a non-GPU effect in the
@@ -686,5 +712,14 @@ fn devices_with_webgl2_limits_are_declined() {
     let desc = wgpu::DeviceDescriptor { required_limits: wgpu::Limits::downlevel_webgl2_defaults(), ..Default::default() };
     let Ok((device, queue)) = pollster::block_on(adapter.request_device(&desc)) else { return };
     let err = crate::context::GpuContext::new(&adapter, device, queue).err().expect("declined");
-    assert!(err.contains("max_storage_buffers_per_shader_stage"), "{err}");
+    // A GL adapter (FreeBSD's llvmpipe) is declined for its backend before its limits are checked.
+    assert!(err.contains("max_storage_buffers_per_shader_stage") || err.contains("(Gl)"), "{err}");
+}
+
+/// GPU work inside the video memory guard returns its result when the device has room (#106).
+#[test]
+fn within_memory_returns_the_work_when_there_is_room() {
+    let Some(g) = gpu() else { return };
+    let img = g.within_memory(|| g.ctx.image(64, 32)).expect("room for a 64×32 texture");
+    assert_eq!((img.width, img.height), (64, 32));
 }

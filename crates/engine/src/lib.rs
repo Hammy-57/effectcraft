@@ -36,6 +36,7 @@ pub mod remote;
 pub mod render_queue;
 pub mod roto;
 pub mod scriptui;
+pub mod sequence;
 mod session_settings;
 pub mod shortcuts;
 pub mod storage;
@@ -81,6 +82,9 @@ pub enum EngineError {
     BadParams { cmd: String, msg: String },
     #[error("no active composition")]
     NoComp,
+    /// A `comp` reference (name or id) that names no composition.
+    #[error("no composition {0}")]
+    NoSuchComp(String),
     #[error("{0}")]
     Project(#[from] effectcraft_project::ProjectError),
     #[error("{0}")]
@@ -93,6 +97,11 @@ pub type Result<T> = std::result::Result<T, EngineError>;
 pub trait Services: Send + Sync {
     fn read_file(&self, path: &str) -> std::io::Result<Vec<u8>>;
     fn write_file(&self, path: &str, data: &[u8]) -> std::io::Result<()>;
+    /// Convert an After Effects project to the versioned AEP import document.
+    /// Browser hosts and hosts without the optional importer can return Unsupported.
+    fn export_aep_ir(&self, _path: &str) -> std::io::Result<Vec<u8>> {
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "AEP importer is not configured on this host"))
+    }
     /// Whether a file exists (the background footage check after open).
     fn exists(&self, path: &str) -> bool {
         std::path::Path::new(path).exists()
@@ -106,6 +115,19 @@ pub trait Services: Send + Sync {
         }
         self.write_file(path, data)
     }
+    /// The files in folder `dir` (full paths; no folders, no hidden files), for image-sequence
+    /// detection on import. Empty when it can't be read.
+    fn list_dir(&self, dir: &str) -> Vec<String> {
+        let Ok(rd) = std::fs::read_dir(if dir.is_empty() { "." } else { dir }) else { return vec![] };
+        rd.filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()) && !e.file_name().to_string_lossy().starts_with('.'))
+            .map(|e| e.path().to_string_lossy().to_string())
+            .collect()
+    }
+    /// Whether `path` is a folder (dropped or picked folders import their files).
+    fn is_dir(&self, path: &str) -> bool {
+        std::path::Path::new(path).is_dir()
+    }
 }
 
 /// Native filesystem.
@@ -117,15 +139,53 @@ impl Services for FsServices {
     fn write_file(&self, path: &str, data: &[u8]) -> std::io::Result<()> {
         config::atomic_write(std::path::Path::new(path), data)
     }
+    #[cfg(not(target_arch = "wasm32"))]
+    fn export_aep_ir(&self, path: &str) -> std::io::Result<Vec<u8>> {
+        let script = std::env::var_os("EFFECTCRAFT_AEP_EXPORTER")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                let exe = std::env::current_exe().ok()?;
+                let mac_resource = exe.parent()?.join("../Resources/aep_ir_export.py");
+                if mac_resource.is_file() {
+                    return Some(mac_resource);
+                }
+                exe.ancestors().map(|dir| dir.join("packaging/aep/aep_ir_export.py")).find(|candidate| candidate.is_file())
+            })
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "AEP exporter script missing; set EFFECTCRAFT_AEP_EXPORTER"))?;
+        let python = std::env::var_os("EFFECTCRAFT_AEP_PYTHON").unwrap_or_else(|| "python3".into());
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+        let output = std::env::temp_dir().join(format!("effectcraft-aep-{}-{stamp}.json", std::process::id()));
+        let mut command = std::process::Command::new(python);
+        command.arg(script).arg(path).arg("-o").arg(&output);
+        if let Some(root) = std::env::var_os("EFFECTCRAFT_AEP_FONT_ROOT").filter(|root| !root.is_empty()) {
+            command.arg("--font-search-root").arg(root);
+        }
+        let run = command.output()?;
+        if !run.status.success() {
+            let _ = std::fs::remove_file(&output);
+            let error = String::from_utf8_lossy(&run.stderr);
+            return Err(std::io::Error::other(format!(
+                "AEP export failed (set EFFECTCRAFT_AEP_PYTHON to an interpreter with py-aep installed): {}",
+                error.trim()
+            )));
+        }
+        let bytes = std::fs::read(&output);
+        let _ = std::fs::remove_file(&output);
+        bytes
+    }
 }
 
 /// Imports media files into the project (implemented by the media layer).
 pub trait Importer: Send + Sync {
-    /// Probe a file and return footage metadata.
+    /// Probe one file and return footage metadata. Image sequences are the engine's
+    /// ([`sequence`]): it groups numbered stills and probes their first file here.
     fn probe(&self, path: &str) -> std::result::Result<effectcraft_project::Footage, String>;
     /// A footage file's bytes are now at `path` (extracted from a template): hosts whose media
     /// layer reads from memory (the browser) register them; file-based ones need nothing.
     fn register(&self, _path: &str, _data: &[u8]) {}
+    /// An image sequence's other frames (its first was probed) are footage now: hosts whose
+    /// media layer reads from memory (the browser) register them; file-based ones need nothing.
+    fn add_frames(&self, _paths: &[String]) {}
 }
 
 /// A keyframe reference: layer, property uid, key time (layer time).
@@ -191,10 +251,17 @@ pub struct EditorState {
     /// selected layers.
     #[serde(skip)]
     pub effect_clipboard: Vec<effectcraft_project::PropGroup>,
+    /// Copied shape items (Edit ▸ Copy with groups, paths, paints or path operations selected in
+    /// a shape layer's Contents); Paste adds them to the selected shape layers.
+    #[serde(skip)]
+    pub contents_clipboard: Vec<effectcraft_project::PropGroup>,
     /// Selected mask vertices (viewer Selection tool / pen).
     #[serde(default)]
     pub selected_vertices: Vec<VertexRef>,
     pub snapping: bool,
+    /// Tools bar ▸ Snapping options (which features snap, Snap Edges Extended).
+    #[serde(default)]
+    pub snap_features: viewer::SnapFeatures,
     /// Last applied effect id (Effect ▸ last effect).
     pub last_effect: Option<String>,
     /// Viewer region of interest `[x, y, w, h]` in comp pixels (Composition ▸ Crop Comp to Region
@@ -231,6 +298,9 @@ pub struct EditorState {
     /// Puppet tool options for new meshes.
     #[serde(default)]
     pub puppet: commands::puppet::PuppetOptions,
+    /// The shape tools' and the Pen's options (Tool Creates Shape / Mask, Fill and Stroke).
+    #[serde(default)]
+    pub shape_tool: commands::shape_tool::ShapeTool,
     /// View ▸ Switch View Layout: 1, 2 or 4 views side by side in the Composition viewer.
     #[serde(default = "one_view")]
     pub view_layout: u8,
@@ -326,6 +396,9 @@ pub struct Session {
     /// that ask for [`effectcraft_render::Backend::Gpu`]/`Auto`, and by Render Queue exports
     /// when the project's renderer is the GPU.
     pub accel: Option<Arc<dyn effectcraft_render::Accelerator>>,
+    /// Why there is no [`Session::accel`] (`render.backend`'s `why`): the host's reason, e.g. a
+    /// headless start without `--gpu` or the compositor's setup error.
+    pub accel_note: Option<String>,
     /// Expression syntax checker (set by the host that links the expression engine).
     pub expr_check: Option<fn(&str) -> std::result::Result<(), String>>,
     pub importer: Option<Arc<dyn Importer>>,
@@ -371,12 +444,18 @@ pub struct Session {
     pub config: Option<Arc<dyn config::ConfigStore>>,
     /// Keyboard shortcut presets.
     pub keymaps: shortcuts::Keymaps,
+    /// Scripts' `app.settings`, kept in the settings store (see
+    /// [`commands::scripts::SCRIPT_SETTINGS_FILE`]).
+    pub script_settings: commands::scripts::ScriptSettings,
     /// Frontend-only commands offered for binding.
     pub ui_commands: Vec<shortcuts::UiCommand>,
     /// Cache of the resolved active preset (read it with [`Session::shortcuts`]).
     pub shortcut_table: std::sync::OnceLock<shortcuts::ShortcutTable>,
     /// Auto-save bookkeeping.
     pub autosave: autosave::AutoSaveState,
+    /// Host-owned isolation for all auto-saves (e.g. one MCP session). Independent of settings
+    /// and project bookkeeping, so opening/saving a project or changing preferences keeps it.
+    pub autosave_folder_override: Option<std::path::PathBuf>,
     /// The viewer snapshot (Take Snapshot / Show Snapshot).
     pub snapshot: Option<viewer::Snapshot>,
     /// The JavaScript scripting engine (set by the host that links `effectcraft-script`):
@@ -457,6 +536,7 @@ impl Default for Session {
             footage: Arc::new(NoFootage),
             expr: None,
             accel: None,
+            accel_note: None,
             expr_check: None,
             importer: None,
             exporter: None,
@@ -480,9 +560,11 @@ impl Default for Session {
             prefs_revision: 0,
             config: None,
             keymaps: shortcuts::Keymaps::default(),
+            script_settings: Default::default(),
             ui_commands: vec![],
             shortcut_table: std::sync::OnceLock::new(),
             autosave: autosave::AutoSaveState::default(),
+            autosave_folder_override: None,
             snapshot: None,
             script: None,
             plugin_loader: None,
@@ -906,31 +988,49 @@ impl Session {
 
 /// Bring effect instances saved by earlier versions up to date with the effect registry
 /// (renamed / regrouped / added parameters, reordered popups; see
-/// [`effectcraft_effects::migrate`]).
+/// [`effectcraft_effects::migrate`]), and a project from before
+/// [`effectcraft_project::SCHEMA_EFFECT_SPACE`] into effect space
+/// ([`effectcraft_effects::migrate::to_effect_space`]). Stamps the current schema.
 pub fn upgrade_effects(p: &mut Project) {
-    let mut sizes = std::collections::HashMap::new();
+    let to_effect_space = p.schema < effectcraft_project::SCHEMA_EFFECT_SPACE;
+    // Effect bounds per layer: (size, top-left in layer coordinates).
+    let mut bounds = std::collections::HashMap::new();
     for (cid, c) in p.comps() {
         for l in &c.layers {
-            let (w, h) = effectcraft_render::source_size(p, l);
-            sizes.insert((*cid, l.id), if w == 0 { [c.width as f64, c.height as f64] } else { [w as f64, h as f64] });
+            let (size, origin) = effectcraft_render::effect_bounds(p, c, l);
+            bounds.insert((*cid, l.id), (size, origin, matches!(l.source, effectcraft_project::LayerSource::Shape)));
         }
     }
     let mut next = p.next_id;
     for (cid, it) in p.items.iter_mut() {
         let effectcraft_project::ItemKind::Comp(c) = &mut it.kind else { continue };
         for l in &mut std::sync::Arc::make_mut(c).layers {
-            let size = sizes.get(&(*cid, l.id)).copied().unwrap_or([100.0, 100.0]);
+            let (size, origin, _) = bounds.get(&(*cid, l.id)).copied().unwrap_or(([100.0, 100.0], [0.0; 2], false));
+            // Effect space starts at the bounds' top-left: positions move by minus that corner.
+            // Adjustment layers run their effects on the comp below as it is: nothing moves.
+            // Shape layers already measured effect points from their anchor-centred comp-sized
+            // canvas before schema 2 (as After Effects does): nothing moves either.
+            let shift = |o: [f64; 2]| [-o[0], -o[1]];
+            let d = if l.switches.adjustment || matches!(l.source, effectcraft_project::LayerSource::Shape) { [0.0; 2] } else { shift(origin) };
+            let clone_d = |src: Option<u64>| match src {
+                Some(id) => bounds.get(&(*cid, effectcraft_project::LayerId(id))).map_or([0.0; 2], |b| if b.2 { [0.0; 2] } else { shift(b.1) }),
+                None => d,
+            };
             let Some(fx) = l.props.sub_mut("effects") else { continue };
             for n in &mut fx.children {
                 let effectcraft_project::Node::Group(g) = n else { continue };
                 let effectcraft_project::GroupKind::Effect { effect } = &g.kind else { continue };
                 if let Some(spec) = effectcraft_effects::find(effect) {
                     effectcraft_effects::migrate::upgrade_instance(spec, g, &mut effectcraft_project::build::Ids(&mut next), size);
+                    if to_effect_space {
+                        effectcraft_effects::migrate::to_effect_space(spec, g, size, d, &clone_d);
+                    }
                 }
             }
         }
     }
     p.next_id = next;
+    p.schema = effectcraft_project::SCHEMA_VERSION;
 }
 
 #[cfg(test)]
@@ -939,6 +1039,8 @@ mod rq_tests;
 mod tests;
 #[cfg(test)]
 mod tests_3d;
+#[cfg(test)]
+mod tests_aep;
 #[cfg(test)]
 mod tests_anim_tools;
 #[cfg(test)]
@@ -986,6 +1088,8 @@ mod tests_proxy;
 #[cfg(test)]
 mod tests_rig3d;
 #[cfg(test)]
+mod tests_sequence;
+#[cfg(test)]
 mod tests_settings;
 #[cfg(test)]
 mod tests_stubs;
@@ -1016,6 +1120,17 @@ pub fn text_presets() -> Vec<(String, String)> {
 
 pub fn text_families() -> Vec<String> {
     effectcraft_text::families().into_iter().map(|(f, _)| f).collect()
+}
+
+/// The styles a family offers (its own faces, in weight order), for the style menus. A family
+/// that isn't installed offers the usual styles, which resolve to Inter's.
+pub fn font_styles(family: &str) -> Vec<String> {
+    effectcraft_text::families()
+        .into_iter()
+        .find(|(f, _)| f.eq_ignore_ascii_case(family))
+        .map(|(_, st)| st)
+        .filter(|st| !st.is_empty())
+        .unwrap_or_else(|| ["Regular", "Medium", "SemiBold", "Bold", "Italic"].iter().map(|s| s.to_string()).collect())
 }
 
 /// The OpenType feature tags (GSUB / GPOS) of the face a family + style resolves to.

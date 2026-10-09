@@ -29,6 +29,18 @@ fn click(h: &mut Harness<'_, EffectcraftApp>, p: Pos2, modifiers: Modifiers) {
     h.run_steps(2);
 }
 
+fn drag(h: &mut Harness<'_, EffectcraftApp>, from: Pos2, to: Pos2) {
+    h.input_mut().events.push(Event::PointerMoved(from));
+    h.input_mut().events.push(Event::PointerButton { pos: from, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE });
+    h.run_steps(1);
+    for i in 1..=8 {
+        h.input_mut().events.push(Event::PointerMoved(from + (to - from) * (i as f32 / 8.0)));
+        h.run_steps(1);
+    }
+    h.input_mut().events.push(Event::PointerButton { pos: to, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE });
+    h.run_steps(2);
+}
+
 fn key(h: &mut Harness<'_, EffectcraftApp>, key: Key, modifiers: Modifiers) {
     h.input_mut().events.push(Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers });
     h.input_mut().events.push(Event::Key { key, physical_key: None, pressed: false, repeat: false, modifiers });
@@ -146,6 +158,36 @@ fn type_tool_click_type_edit_and_commit() {
     h.run_steps(2);
     key(&mut h, Key::Escape, Modifiers::NONE);
     assert!(h.state().session.state.text_edit.is_none());
+}
+
+#[test]
+fn switching_from_type_to_selection_commits_and_moves_text_layer() {
+    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).with_step_dt(1.0 / 60.0).build_eframe(|_| app());
+    h.state_mut().show_panel(PanelKind::Composition);
+    h.run_steps(3);
+    h.state_mut().ui.tool = effectcraft_ui_egui::state::Tool::Type;
+    h.run_steps(1);
+    let comp = rect(&h, "viewer.comp");
+    let k = comp.width() / 640.0;
+    click(&mut h, comp.min + egui::vec2(320.0 * k, 180.0 * k), Modifiers::NONE);
+    type_text(&mut h, "Move me");
+    let layer_id = h.state().session.state.text_edit.as_ref().unwrap().layer;
+    let layer_position = |h: &Harness<'_, EffectcraftApp>| {
+        h.state().session.active_comp().unwrap().layer(layer_id).unwrap().props.prop("transform/position").unwrap().value.as_vec3()
+    };
+    let original_text = layer_doc(&h.state().session, layer_id).unwrap().text;
+    let before = layer_position(&h);
+
+    h.state_mut().ui.tool = effectcraft_ui_egui::state::Tool::Selection;
+    h.run_steps(2);
+    assert!(h.state().session.state.text_edit.is_none(), "leaving the Type tool commits text editing");
+    type_text(&mut h, " ignored");
+    assert_eq!(layer_doc(&h.state().session, layer_id).unwrap().text, original_text, "Selection does not type into the layer");
+    let from = comp.min + egui::vec2(340.0 * k, 150.0 * k);
+    let to = from + egui::vec2(60.0 * k, 50.0 * k);
+    drag(&mut h, from, to);
+    let after = layer_position(&h);
+    assert!(after[0] > before[0] && after[1] > before[1], "Selection dragging moves the text layer: {before:?} -> {after:?}");
 }
 
 #[test]

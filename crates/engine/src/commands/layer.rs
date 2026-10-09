@@ -1,7 +1,7 @@
 //! Layer menu.
 
 use effectcraft_color::{BlendMode, Label};
-use effectcraft_keyframe::{Justify, ShapePath, TextDoc, Value as KV};
+use effectcraft_keyframe::{Justify, TextDoc, Value as KV};
 use effectcraft_project::build::{self, Ids};
 use effectcraft_project::{
     Comp, FrameBlend, GroupKind, ItemId, ItemKind, Layer, LayerId, LayerSource, MaskMode, MatteKind, Project, PropGroup, Quality, Solid, TrackMatte,
@@ -24,13 +24,58 @@ pub(crate) fn color_p(p: &Value, k: &str) -> Option<[f32; 3]> {
 }
 
 /// Insert a new layer above the selection (or at the top) and select it.
-pub(crate) fn insert_layer(proj: &mut Project, st: &mut crate::EditorState, cid: ItemId, mut layer: Layer) -> Result<LayerId> {
+pub(crate) fn insert_layer(proj: &mut Project, st: &mut crate::EditorState, cid: ItemId, layer: Layer) -> Result<LayerId> {
+    insert_layer_at(proj, st, cid, layer, None)
+}
+
+/// `index`: an `index` parameter, the layer's 1-based place in the stack (1 = top; past the
+/// bottom = the bottom), as 0-based.
+pub(crate) fn index_p(p: &Value, cmd: &str) -> Result<Option<usize>> {
+    match p.get("index") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => {
+            v.as_u64().filter(|i| *i >= 1).map(|i| Some(usize::try_from(i - 1).unwrap_or(usize::MAX))).ok_or_else(|| bad(cmd, "index: 1-based stack position"))
+        }
+    }
+}
+
+/// A `position` parameter: `[x, y]` in comp pixels (finite).
+pub(crate) fn position_p(p: &Value, cmd: &str) -> Result<Option<[f64; 2]>> {
+    match p.get("position") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_array()
+            .and_then(|a| Some([a.first()?.as_f64()?, a.get(1)?.as_f64()?]))
+            .filter(|c| c.iter().all(|x| x.is_finite()))
+            .map(Some)
+            .ok_or_else(|| bad(cmd, "position: [x, y] in comp pixels")),
+    }
+}
+
+/// Put a new layer's Position at `pos` (comp pixels).
+pub(crate) fn place(l: &mut Layer, pos: Option<[f64; 2]>) {
+    if let Some([x, y]) = pos
+        && let Some(pr) = l.props.prop_mut("transform/position")
+    {
+        let z = match pr.value {
+            KV::Vec3(v) => v[2],
+            _ => 0.0,
+        };
+        pr.value = KV::Vec3([x, y, z]);
+    }
+}
+
+/// [`insert_layer`] at stack position `at` (0 = top) instead of above the selected layer.
+pub(crate) fn insert_layer_at(proj: &mut Project, st: &mut crate::EditorState, cid: ItemId, mut layer: Layer, at: Option<usize>) -> Result<LayerId> {
     // Text and shape layers in Advanced 3D comps get Geometry Options (extrusion, bevels).
     if proj.comp(cid).is_some_and(|c| c.renderer == effectcraft_project::Renderer::Advanced3D) {
         super::model3d::add_geometry_options(&mut proj.next_id, &mut layer);
     }
     let comp = proj.comp_mut(cid).ok_or(EngineError::NoComp)?;
-    let at = st.selected_layers.first().and_then(|id| comp.layers.iter().position(|l| l.id == *id)).unwrap_or(0);
+    let at = match at {
+        Some(i) => i.min(comp.layers.len()),
+        None => st.selected_layers.first().and_then(|id| comp.layers.iter().position(|l| l.id == *id)).unwrap_or(0),
+    };
     let id = layer.id;
     comp.layers.insert(at, layer);
     st.selected_layers = vec![id];
@@ -160,30 +205,6 @@ fn new_text(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"layer": id.0}))
 }
 
-/// Contents for a new shape (one group with path + fill + stroke).
-fn shape_contents(ids: &mut Ids, kind: &str, size: [f64; 2], fill: Option<[f64; 4]>, stroke: Option<([f64; 4], f64)>) -> Option<PropGroup> {
-    let (path, gname) = match kind {
-        "rect" | "rectangle" => (build::shape_rect(ids, size, [0.0, 0.0], 0.0), "Rectangle 1"),
-        "rounded" | "roundedRect" => (build::shape_rect(ids, size, [0.0, 0.0], size[0].min(size[1]) * 0.15), "Rectangle 1"),
-        "ellipse" => (build::shape_ellipse(ids, size, [0.0, 0.0]), "Ellipse 1"),
-        "star" => (build::shape_star(ids, true, 5.0, [0.0, 0.0], size[0] / 2.0, size[0] / 4.0), "Polystar 1"),
-        "polygon" => (build::shape_star(ids, false, 6.0, [0.0, 0.0], size[0] / 2.0, 0.0), "Polystar 1"),
-        _ => return None,
-    };
-    let mut items = vec![path];
-    if let Some((c, w)) = stroke {
-        items.push(build::shape_stroke(ids, c, w));
-    }
-    if let Some(c) = fill {
-        items.push(build::shape_fill(ids, c));
-    }
-    Some(build::shape_group(ids, gname, items))
-}
-
-fn c4(c: Option<[f32; 3]>, d: [f64; 4]) -> [f64; 4] {
-    c.map(|c| [c[0] as f64, c[1] as f64, c[2] as f64, 1.0]).unwrap_or(d)
-}
-
 fn new_shape(s: &mut Session, p: &Value) -> Result<Value> {
     let cid = comp_id(s, p)?;
     let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?.clone();
@@ -191,27 +212,24 @@ fn new_shape(s: &mut Session, p: &Value) -> Result<Value> {
     let size = p
         .get("size")
         .and_then(Value::as_array)
-        .map(|a| [a[0].as_f64().unwrap_or(200.0), a.get(1).and_then(Value::as_f64).unwrap_or(200.0)])
+        .map(|a| [a.first().and_then(Value::as_f64).unwrap_or(200.0), a.get(1).and_then(Value::as_f64).unwrap_or(200.0)])
         .unwrap_or([300.0, 300.0]);
-    let fill = Some(c4(color_p(p, "fill"), [0.25, 0.55, 1.0, 1.0]));
-    let stroke = (f_p(p, "strokeWidth").unwrap_or(0.0) > 0.0).then(|| (c4(color_p(p, "stroke"), [1.0, 1.0, 1.0, 1.0]), f_p(p, "strokeWidth").unwrap_or(2.0)));
-    let pos = p.get("position").and_then(|v| v.as_array()).map(|a| [a[0].as_f64().unwrap_or(0.0), a.get(1).and_then(Value::as_f64).unwrap_or(0.0)]);
+    // A fill, and a stroke only with a width (not the Tools bar's paint).
+    let paint = super::shape_tool::paint_p(p, &Default::default(), "layer.newShape")?;
+    let pos = p
+        .get("position")
+        .and_then(|v| v.as_array())
+        .map(|a| [a.first().and_then(Value::as_f64).unwrap_or(0.0), a.get(1).and_then(Value::as_f64).unwrap_or(0.0)]);
     let name = str_p(p, "name").unwrap_or("Shape Layer 1").to_string();
     let id = s.edit("New Shape Layer", None, |proj, st| {
-        let mut l = build::layer(proj, &comp, &name, LayerSource::Shape, (comp.width, comp.height), None);
+        let lid = super::shape_tool::new_shape_layer(proj, st, &comp, cid, Some(&name), pos)?;
         let mut next = proj.next_id;
-        if let Some(g) = shape_contents(&mut Ids(&mut next), &kind, size, fill, stroke)
-            && let Some(c) = l.props.sub_mut("contents")
-        {
-            c.children.push(g.into());
-        }
+        let g = super::shape_tool::shape_group(&mut Ids(&mut next), &kind, size, &paint);
         proj.next_id = next;
-        if let Some(pos) = pos
-            && let Some(pr) = l.props.prop_mut("transform/position")
-        {
-            pr.value = KV::Vec3([pos[0], pos[1], 0.0]);
+        if let Some(g) = g {
+            super::shape_tool::add_to_contents(proj, cid, lid, g, [0.0, 0.0], "layer.newShape")?;
         }
-        insert_layer(proj, st, cid, l)
+        Ok(lid)
     })?;
     Ok(json!({"layer": id.0}))
 }
@@ -258,12 +276,17 @@ fn add_item(s: &mut Session, p: &Value) -> Result<Value> {
             return Err(bad("layer.addItem", "data files can't be layers; read them in expressions with footage(\"name\").sourceData"));
         }
         ItemKind::Footage(f) if f.kind == effectcraft_project::FootageKind::Model => {
-            return super::model3d::new_model(s, &serde_json::json!({"comp": cid.0, "item": item.0, "time": f_p(p, "time")}));
+            return super::model3d::new_model(
+                s,
+                &serde_json::json!({"comp": cid.0, "item": item.0, "time": f_p(p, "time"), "index": p.get("index"), "position": p.get("position")}),
+            );
         }
         ItemKind::Footage(f) => (LayerSource::Footage { item }, (f.width, f.height), Some(f.duration)),
         ItemKind::Solid(so) => (LayerSource::Solid { item }, (so.width, so.height), None),
         ItemKind::Folder => return Err(bad("layer.addItem", "folders can't be layers")),
     };
+    let index = index_p(p, "layer.addItem")?;
+    let position = position_p(p, "layer.addItem")?;
     let fr = comp.frame_rate;
     // Settings ▸ General ▸ Create Layers at Composition Start Time (off: at the current time).
     let default_start = if s.prefs.general.create_layers_at_comp_start || s.active_comp_id() != Some(cid) { Tick::ZERO } else { s.time() };
@@ -273,7 +296,8 @@ fn add_item(s: &mut Session, p: &Value) -> Result<Value> {
         l.start_time = start;
         l.in_point = start;
         l.out_point = fr.snap_nearest((start + dur.unwrap_or(comp.duration)).min(comp.duration)).max(start + fr.frame_duration());
-        insert_layer(proj, st, cid, l)
+        place(&mut l, position);
+        insert_layer_at(proj, st, cid, l, index)
     })?;
     Ok(json!({"layer": id.0}))
 }
@@ -353,7 +377,8 @@ fn set_switch(s: &mut Session, p: &Value) -> Result<Value> {
     let name = str_p(p, "switch").ok_or_else(|| bad("layer.setSwitch", "missing `switch`"))?.to_string();
     let v = b_p(p, "value");
     let label = format!("Layer Switch ({name})");
-    let r = s.edit(&label, None, |proj, _| {
+    // `merge`: a switch dragged over several layers in the Timeline is one undo step.
+    let r = s.edit(&label, merge_p(p), |proj, _| {
         let comp = proj.comp_mut(cid).ok_or(EngineError::NoComp)?;
         let mut last = false;
         // Toggle relative to the first layer so a multi-selection ends up consistent.
@@ -612,6 +637,45 @@ pub(crate) fn parent_fixes(s: &Session, cid: ItemId, ids: &[LayerId], parent: Op
         .collect()
 }
 
+/// Validate the proposed ancestor chain before any authored edit, including when compensation
+/// is disabled. Bound both unique ancestors and linear lookup/selection work on loaded graphs.
+fn check_parent_chain(comp: &Comp, ids: &[LayerId], parent: Option<LayerId>, max_visits: usize, max_work: usize) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    let mut work = 0usize;
+    let mut cur = parent;
+    while let Some(id) = cur {
+        if seen.len() >= max_visits {
+            return Err(bad("layer.setParent", "parent chain exceeds the safety visit limit"));
+        }
+        if !seen.insert(id) {
+            return Err(bad("layer.setParent", "parent chain contains an existing cycle"));
+        }
+        for selected in ids {
+            if work >= max_work {
+                return Err(bad("layer.setParent", "parent chain exceeds the safety work limit"));
+            }
+            work += 1;
+            if *selected == id {
+                return Err(bad("layer.setParent", "parenting would create a cycle"));
+            }
+        }
+        let mut ancestor = None;
+        for layer in &comp.layers {
+            if work >= max_work {
+                return Err(bad("layer.setParent", "parent chain exceeds the safety work limit"));
+            }
+            work += 1;
+            if layer.id == id {
+                ancestor = Some(layer);
+                break;
+            }
+        }
+        let layer = ancestor.ok_or_else(|| bad("layer.setParent", "parent chain refers to a missing layer"))?;
+        cur = layer.parent;
+    }
+    Ok(())
+}
+
 fn set_parent(s: &mut Session, p: &Value) -> Result<Value> {
     let (cid, ids) = layers_p(s, p)?;
     let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
@@ -619,16 +683,9 @@ fn set_parent(s: &mut Session, p: &Value) -> Result<Value> {
         None | Some(Value::Null) => None,
         Some(v) => Some(resolve_layer(comp, v).ok_or_else(|| bad("layer.setParent", "no such parent layer"))?),
     };
-    // Cycle check.
-    if let Some(par) = parent {
-        let mut cur = Some(par);
-        while let Some(c) = cur {
-            if ids.contains(&c) {
-                return Err(bad("layer.setParent", "parenting would create a cycle"));
-            }
-            cur = comp.layer(c).and_then(|l| l.parent);
-        }
-    }
+    // A loaded cycle need not include a selected child. Validate before compensation or edit;
+    // do not impose the renderer's 64-ancestor truncation as a new ordinary hierarchy limit.
+    check_parent_chain(comp, &ids, parent, 4096, 1_048_576)?;
     // Like AE's pick-whip, parenting keeps the layer where it is: its transform is re-expressed
     // in the new parent's space (Position, Rotation, Scale), unless `compensate: false`.
     let compensate = b_p(p, "compensate").unwrap_or(true);
@@ -912,10 +969,9 @@ fn add_mask(s: &mut Session, p: &Value) -> Result<Value> {
         Some([x, y, rw, rh]) => (x + rw / 2.0, y + rh / 2.0, rw, rh),
         None => (if w > 0.0 { w / 2.0 } else { 0.0 }, h / 2.0, w * 0.6, h * 0.6),
     };
-    let path = match shape {
-        "ellipse" => ShapePath::ellipse([cx, cy], rw, rh),
-        _ => ShapePath::rect([cx, cy], rw, rh),
-    };
+    // The shape tools' masks: rectangle, ellipse, rounded rectangle, polygon or star.
+    let path = super::shape_tool::mask_path(shape, [cx, cy], [rw, rh])
+        .ok_or_else(|| bad("layer.addMask", format!("unknown shape `{shape}`; one of rect, ellipse, rounded, polygon, star")))?;
     let mode = str_p(p, "mode").and_then(MaskMode::from_name).unwrap_or(MaskMode::Add);
     let cycle = s.prefs.appearance.cycle_mask_colors;
     let uid = s.edit("New Mask", None, |proj, _| {
@@ -992,7 +1048,9 @@ fn add_shape_item(s: &mut Session, p: &Value) -> Result<Value> {
             "polygon" => build::shape_star(&mut ids, false, 5.0, [0.0, 0.0], 100.0, 0.0),
             "fill" => build::shape_fill(&mut ids, [1.0, 0.0, 0.0, 1.0]),
             "stroke" => build::shape_stroke(&mut ids, [1.0, 1.0, 1.0, 1.0], 2.0),
+            "path" => build::shape_path(&mut ids, Default::default()),
             "gfill" | "gradientFill" => build::shape_gradient_fill(&mut ids, false, [-100.0, 0.0], [100.0, 0.0], Default::default()),
+            "gstroke" | "gradientStroke" => build::shape_gradient_stroke(&mut ids, false, [-100.0, 0.0], [100.0, 0.0], Default::default(), 2.0),
             "trim" | "trimPaths" => build::shape_trim(&mut ids, 0.0, 100.0, 0.0),
             "repeater" => build::shape_repeater(&mut ids, 3.0, [100.0, 0.0]),
             k => build::shape_simple_op(&mut ids, k).ok_or_else(|| bad("layer.addShapeItem", format!("unknown kind `{k}`")))?,
@@ -1228,7 +1286,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Shape Layer",
             ["Layer", "New"],
             None,
-            "{kind?: rect|rounded|ellipse|star|polygon|none, name?, size?, fill?, stroke?, strokeWidth?, position?}",
+            "{kind?: rect|rounded|ellipse|star|polygon|none, name?, size?, fill?, fillType?, fillBlend?, fillOpacity?, stroke?, strokeType?, strokeBlend?, strokeOpacity?, strokeWidth?, position?}",
             has_comp,
             new_shape
         ),
@@ -1242,7 +1300,15 @@ pub fn specs() -> Vec<CommandSpec> {
             has_layer_settings,
             layer_settings
         ),
-        cmd!("layer.addItem", "Add Footage to Comp", ["File"], Some("Cmd+/"), "{item: id|name, time?, duration? (s, for a still)}", has_comp, add_item),
+        cmd!(
+            "layer.addItem",
+            "Add Footage to Comp",
+            ["File"],
+            Some("Cmd+/"),
+            "{item: id|name, time? (s, the In point), index? (1-based stack position; default above the selected layer), position? ([x, y] comp px; default the centre), duration? (s, for a still)}",
+            has_comp,
+            add_item
+        ),
         cmd!("layer.select", "Select Layers", [], None, "{layers: [id|name|#n], add?, toggle?}", has_comp, select),
         cmd!("layer.selectNext", "Select Next Layer", [], Some("Cmd+ArrowDown"), "{add?}", has_comp, select_next),
         cmd!("layer.selectPrevious", "Select Previous Layer", [], Some("Cmd+ArrowUp"), "{add?}", has_comp, select_prev),
@@ -1251,7 +1317,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Layer Switch",
             [],
             None,
-            "{layers?, switch: video|audio|solo|lock|shy|collapse|quality|fx|frameBlend|motionBlur|adjustment|threeD|guide|preserveTransparency, value?}",
+            "{layers?, switch: video|audio|solo|lock|shy|collapse|quality|fx|frameBlend|motionBlur|adjustment|threeD|guide|preserveTransparency, value?, merge?}",
             has_layers,
             set_switch
         ),
@@ -1303,7 +1369,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "New Mask",
             ["Layer", "Mask"],
             Some("Cmd+Shift+N"),
-            "{layer?, shape?: rect|ellipse, rect? [x,y,w,h], mode?}",
+            "{layer?, shape?: rect|ellipse|rounded|polygon|star, rect? [x,y,w,h] (layer space; a polygon or star fits its width), mode?}",
             has_layers,
             add_mask
         ),
@@ -1313,7 +1379,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Add (Shape)",
             [],
             None,
-            "{layer?, kind: group|rect|ellipse|star|polygon|fill|stroke|gfill|trim|repeater|round|offset|pucker|twist|zigzag|wiggle|merge, group?: uid|path} → {uid, path}",
+            "{layer?, kind: group|rect|ellipse|star|polygon|path|fill|stroke|gfill|gstroke|trim|repeater|round|offset|pucker|twist|zigzag|wiggle|merge, group?: uid|path} → {uid, path}",
             has_layers,
             add_shape_item
         ),
@@ -1340,3 +1406,120 @@ pub fn specs() -> Vec<CommandSpec> {
 
 #[allow(dead_code)]
 fn unused(_: &Comp) {}
+
+#[cfg(test)]
+mod parent_chain_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn fixture() -> (Session, u64, u64, u64) {
+        let mut s = Session::default();
+        s.execute("comp.new", json!({"name":"Parent safety","width":16,"height":16,"duration":1})).unwrap();
+        let a = s.execute("layer.newSolid", json!({"name":"A"})).unwrap()["layer"].as_u64().unwrap();
+        let b = s.execute("layer.newSolid", json!({"name":"B"})).unwrap()["layer"].as_u64().unwrap();
+        let c = s.execute("layer.newSolid", json!({"name":"C"})).unwrap()["layer"].as_u64().unwrap();
+        for id in [a, b, c] {
+            s.execute("prop.set", json!({"layer":id,"path":"transform/anchor","value":[0,0,0]})).unwrap();
+        }
+        s.execute("prop.set", json!({"layer":a,"path":"transform/position","value":[100,200,0]})).unwrap();
+        s.execute("prop.set", json!({"layer":c,"path":"transform/position","value":[10,20,0]})).unwrap();
+        s.history.undo.clear();
+        (s, a, b, c)
+    }
+    fn malformed_parent(s: &mut Session, child: u64, parent: u64) {
+        let cid = s.active_comp_id().unwrap();
+        Arc::make_mut(&mut s.project).comp_mut(cid).unwrap().layer_mut(LayerId(child)).unwrap().parent = Some(LayerId(parent));
+    }
+    fn assert_atomic_error(s: &mut Session, child: u64, parent: u64, compensate: bool, message: &str) {
+        let before = s.project.clone();
+        let revision = s.revision;
+        let undo = s.history.undo.len();
+        let err = s.execute("layer.setParent", json!({"layers":[child],"parent":parent,"compensate":compensate})).unwrap_err();
+        assert!(err.to_string().contains(message), "{err}");
+        assert!(Arc::ptr_eq(&before, &s.project));
+        assert_eq!(s.revision, revision);
+        assert_eq!(s.history.undo.len(), undo);
+    }
+    #[test]
+    fn loaded_cycle_excluding_selected_child_is_rejected_atomically() {
+        for compensate in [true, false] {
+            let (mut s, a, b, c) = fixture();
+            // Simulate a malformed loaded project. Never execute this on the unguarded baseline.
+            malformed_parent(&mut s, a, b);
+            malformed_parent(&mut s, b, a);
+            assert_atomic_error(&mut s, c, a, compensate, "existing cycle");
+        }
+    }
+    #[test]
+    fn dangling_loaded_parent_is_rejected_atomically() {
+        for compensate in [true, false] {
+            let (mut s, a, _, c) = fixture();
+            malformed_parent(&mut s, a, u64::MAX);
+            assert_atomic_error(&mut s, c, a, compensate, "missing layer");
+        }
+    }
+    #[test]
+    fn selected_descendant_and_direct_self_are_rejected() {
+        let (mut s, a, _, c) = fixture();
+        assert_atomic_error(&mut s, c, c, false, "create a cycle");
+        s.execute("layer.setParent", json!({"layers":[a],"parent":c,"compensate":false})).unwrap();
+        assert_atomic_error(&mut s, c, a, true, "create a cycle");
+    }
+    #[test]
+    fn ordinary_parent_and_unparent_keep_explicit_false_and_undo_semantics() {
+        for compensate in [true, false] {
+            let (mut s, a, _, c) = fixture();
+            let old = s.project.clone();
+            let world = |s: &Session| {
+                let cid = s.active_comp_id().unwrap();
+                let comp = s.active_comp().unwrap();
+                let ctx = effectcraft_render::EvalCtx::new(&s.project, cid, comp, s.time());
+                ctx.world_matrix(comp.layer(LayerId(c)).unwrap()).apply(effectcraft_geom::Vec3::ZERO)
+            };
+            let before = world(&s);
+            s.execute("layer.setParent", json!({"layers":[c],"parent":a,"compensate":compensate})).unwrap();
+            let expected = if compensate { before } else { before + effectcraft_geom::vec3(100.0, 200.0, 0.0) };
+            assert!((world(&s) - expected).length() < 1e-9);
+            assert_eq!(s.active_comp().unwrap().layer(LayerId(c)).unwrap().parent, Some(LayerId(a)));
+            assert_eq!(s.history.undo.len(), 1);
+            let parented = s.project.clone();
+            assert!(s.undo());
+            assert!(Arc::ptr_eq(&s.project, &old));
+            assert!(s.redo());
+            assert!(Arc::ptr_eq(&s.project, &parented));
+            s.execute("layer.setParent", json!({"layers":[c],"parent":null,"compensate":compensate})).unwrap();
+            assert_eq!(s.active_comp().unwrap().layer(LayerId(c)).unwrap().parent, None);
+            assert!(s.undo());
+            assert!(Arc::ptr_eq(&s.project, &parented));
+        }
+    }
+    #[test]
+    fn ancestor_and_lookup_work_budgets_fail_closed() {
+        let (mut s, a, b, c) = fixture();
+        malformed_parent(&mut s, a, b);
+        let comp = s.active_comp().unwrap();
+        // New solids are inserted above the selection: C,B,A. Walking A->B scans
+        // three then two layers, and compares the one selected child twice: seven work units.
+        assert_eq!(comp.layers.iter().map(|l| l.id).collect::<Vec<_>>(), vec![LayerId(c), LayerId(b), LayerId(a)]);
+        assert!(check_parent_chain(comp, &[LayerId(c)], Some(LayerId(a)), 2, 7).is_ok());
+        assert!(check_parent_chain(comp, &[LayerId(c)], Some(LayerId(a)), 2, 6).unwrap_err().to_string().contains("work limit"));
+        assert!(check_parent_chain(comp, &[LayerId(c)], Some(LayerId(a)), 2, 256).is_ok());
+        assert!(check_parent_chain(comp, &[LayerId(c)], Some(LayerId(a)), 1, 256).unwrap_err().to_string().contains("visit limit"));
+        assert!(check_parent_chain(comp, &[LayerId(c)], Some(LayerId(a)), 2, 1).unwrap_err().to_string().contains("work limit"));
+        assert!(check_parent_chain(comp, &[LayerId(c)], None, 0, 0).is_ok(), "unparenting does not traverse ancestors");
+    }
+
+    #[test]
+    fn well_formed_chain_beyond_renderer_depth_is_not_unnecessarily_rejected() {
+        let (s, _, _, c) = fixture();
+        let mut comp = s.active_comp().unwrap().clone();
+        let template = comp.layers.first().unwrap().clone();
+        for n in 0..80 {
+            let mut layer = template.clone();
+            layer.id = LayerId(10_000 + n);
+            layer.parent = (n < 79).then_some(LayerId(10_001 + n));
+            comp.layers.push(layer);
+        }
+        assert!(check_parent_chain(&comp, &[LayerId(c)], Some(LayerId(10_000)), 4096, 1_048_576).is_ok());
+    }
+}

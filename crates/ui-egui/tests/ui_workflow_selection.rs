@@ -58,6 +58,26 @@ fn timeline_shift_click_selects_range_and_ctrl_toggles() {
     click(&mut h, p, Modifiers::COMMAND);
     assert_eq!(h.state().session.state.selected_layers, vec![ids[0], ids[2]]);
 }
+/// #284: Shift-clicking layer bars in the time graph selects the range from the last layer
+/// clicked, as Shift-clicking their names does.
+#[test]
+fn timeline_shift_click_on_layer_bars_selects_the_range() {
+    let mut h = harness();
+    let ids: Vec<LayerId> = h.state().session.active_comp().unwrap().layers.iter().map(|l| l.id).collect();
+    let bar = |h: &Harness<'_, EffectcraftApp>, id: LayerId| rect(h, &format!("timeline.layer.{}.bar", id.0)).center();
+    let p = bar(&h, ids[3]);
+    click(&mut h, p, Modifiers::NONE);
+    assert_eq!(h.state().session.state.selected_layers, vec![ids[3]]);
+    let p = bar(&h, ids[1]);
+    click(&mut h, p, Modifiers::SHIFT);
+    assert_eq!(h.state().session.state.selected_layers, ids[1..]);
+    // From a name to a bar too.
+    let r = rect(&h, &format!("timeline.layer.{}.row", ids[0].0));
+    click(&mut h, pos2(r.min.x + 210.0, r.center().y), Modifiers::NONE);
+    let p = bar(&h, ids[2]);
+    click(&mut h, p, Modifiers::SHIFT);
+    assert_eq!(h.state().session.state.selected_layers, ids[..3]);
+}
 #[test]
 fn timeline_empty_outline_marquee_selects_layers() {
     let mut h = harness();

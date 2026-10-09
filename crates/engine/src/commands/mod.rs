@@ -1,6 +1,7 @@
 //! The command registry. Ids follow After Effects' menu structure; every menu item, panel button,
 //! shortcut and viewer/timeline gesture maps to one of these.
 
+mod aep;
 mod align;
 mod align_data;
 mod anim;
@@ -54,7 +55,8 @@ pub mod roto_cmds;
 mod scene_detect;
 pub mod scripts;
 mod settings;
-mod shape_stroke;
+pub mod shape_stroke;
+pub mod shape_tool;
 mod stubs;
 mod styles;
 mod text_anim;
@@ -72,8 +74,6 @@ pub(crate) mod watch_folder;
 #[cfg(test)]
 pub(crate) use app_more::report_text as report_text_for_tests;
 pub(crate) use app_more::view_command;
-#[cfg(test)]
-pub(crate) use file::missing_frames as missing_frames_for_tests;
 #[cfg(test)]
 pub(crate) use keys_more::amplitudes as amplitudes_for_tests;
 #[cfg(test)]
@@ -165,11 +165,13 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(view::specs());
         v.extend(viewer_cmds::specs());
         v.extend(shape_stroke::specs());
+        v.extend(shape_tool::specs());
         v.extend(focus::specs());
         v.extend(key_labels::specs());
         v.extend(key_transform::specs());
         v.extend(file_more::specs());
         v.extend(lottie::specs());
+        v.extend(aep::specs());
         v.extend(timeline::specs());
         v.extend(comp_more::specs());
         v.extend(frame_export::specs());
@@ -442,9 +444,10 @@ pub(crate) fn merge_p(p: &Value) -> Option<&str> {
 
 /// `comp`: item id or name; default the active comp.
 pub(crate) fn comp_id(s: &Session, p: &Value) -> Result<ItemId> {
+    let missing = |v: &Value| EngineError::NoSuchComp(v.to_string());
     match p.get("comp") {
-        Some(Value::Number(n)) => n.as_u64().map(ItemId).filter(|id| s.project.comp(*id).is_some()).ok_or(EngineError::NoComp),
-        Some(Value::String(name)) => s.project.items.values().find(|i| &i.name == name && i.as_comp().is_some()).map(|i| i.id).ok_or(EngineError::NoComp),
+        Some(v @ Value::Number(n)) => n.as_u64().map(ItemId).filter(|id| s.project.comp(*id).is_some()).ok_or_else(|| missing(v)),
+        Some(v @ Value::String(name)) => s.project.items.values().find(|i| &i.name == name && i.as_comp().is_some()).map(|i| i.id).ok_or_else(|| missing(v)),
         _ => s.active_comp_id().ok_or(EngineError::NoComp),
     }
 }

@@ -1,14 +1,16 @@
 //! Shape Stroke options: the Dashes "+" / "−" buttons (Dash 2 / Gap 2, Dash 3 / Gap 3), Taper and
 //! Wave. Taper and Wave are ordinary properties of the stroke (`…/stroke/taper/startLength`); the
 //! commands here set several of them in one undo step and add the groups to strokes saved before
-//! they existed.
+//! they existed. Also the toolbar's Fill / Stroke options on selected shape layers.
 
 use effectcraft_keyframe::Value as KV;
 use effectcraft_project::build::{self, EXTRA_DASHES, Ids};
-use effectcraft_project::{ItemId, LayerId, PropGroup, Uid};
+use effectcraft_project::{ItemId, Layer, LayerId, LayerSource, Node, PropGroup, Uid};
+use effectcraft_time::Tick;
 use serde_json::{Value, json};
 
-use super::{CommandSpec, bad, has_layers, layer_mut, layer_p, merge_p};
+use super::layer::color_p;
+use super::{CommandSpec, bad, f_p, has_layers, layer_mut, layer_p, layers_p, merge_p};
 use crate::{EngineError, Result, Session, cmd};
 
 fn is_stroke(g: &PropGroup) -> bool {
@@ -195,8 +197,116 @@ fn wave(s: &mut Session, p: &Value) -> Result<Value> {
     )
 }
 
+/// Path items a Fill or Stroke paints in their group.
+const PATHS: [&str; 4] = ["rect", "ellipse", "star", "path"];
+
+/// Shape groups nest; deeper contents are left alone (never-crash recursion bound).
+pub(crate) const MAX_DEPTH: usize = 64;
+
+/// The first Fill colour, Stroke colour and Stroke Width in `layer`'s contents at layer time
+/// `lt` (what the toolbar shows for a selected shape layer).
+pub fn first_paint(layer: &Layer, lt: Tick) -> (Option<[f64; 4]>, Option<[f64; 4]>, Option<f64>) {
+    let (mut fill, mut stroke, mut width) = (None, None, None);
+    if let Some(c) = layer.props.sub("contents") {
+        walk_groups(c, &mut |g| {
+            let at = |id: &str| g.get(id).map(|p| p.value_at(lt));
+            let rgba = |v: KV| v.as_color().map(f64::from);
+            match g.match_id.as_str() {
+                "fill" if fill.is_none() => fill = at("color").map(rgba),
+                "stroke" if stroke.is_none() => {
+                    stroke = at("color").map(rgba);
+                    width = at("width").map(|v| v.as_f64());
+                }
+                _ => {}
+            }
+        });
+    }
+    (fill, stroke, width)
+}
+
+/// Paint one contents group and its sub-groups: Fills take `fill`, Strokes `stroke`, Strokes and
+/// Gradient Strokes `width`. With `add_stroke`, a group with a path and no stroke gets one (before
+/// its fills, as new shapes have it).
+#[allow(clippy::too_many_arguments)]
+fn paint(c: &mut PropGroup, ids: &mut Ids, lt: Tick, fill: Option<[f64; 4]>, stroke: Option<[f64; 4]>, width: Option<f64>, add_stroke: bool, depth: usize) {
+    if depth > MAX_DEPTH {
+        return;
+    }
+    if add_stroke && c.groups().any(|g| PATHS.contains(&g.match_id.as_str())) && !c.groups().any(is_stroke) {
+        let at = c.children.iter().position(|n| matches!(n, Node::Group(g) if matches!(g.match_id.as_str(), "fill" | "gfill"))).unwrap_or(c.children.len());
+        c.children.insert(at, build::shape_stroke(ids, stroke.unwrap_or([1.0; 4]), width.unwrap_or(2.0)).into());
+    }
+    for n in &mut c.children {
+        let Node::Group(g) = n else { continue };
+        let set = |g: &mut PropGroup, id: &str, v: Option<KV>| {
+            if let (Some(v), Some(p)) = (v, g.get_mut(id)) {
+                p.set_value_at(lt, v);
+            }
+        };
+        match g.match_id.as_str() {
+            "fill" => set(g, "color", fill.map(KV::Color)),
+            "stroke" => {
+                set(g, "color", stroke.map(KV::Color));
+                set(g, "width", width.map(KV::Scalar));
+            }
+            "gstroke" => set(g, "width", width.map(KV::Scalar)),
+            "group" => {
+                if let Some(sub) = g.sub_mut("contents") {
+                    paint(sub, ids, lt, fill, stroke, width, add_stroke, depth + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The toolbar's Fill and Stroke options with shape layers selected (as in After Effects, they
+/// change the layers' fills and strokes): `fill` sets every Fill's colour, `stroke` every Stroke's,
+/// `strokeWidth` every stroke's width. A stroke colour or a width above 0 gives the paths that
+/// have no stroke one. Without values, reports the first layer's paint.
+fn fill_stroke(s: &mut Session, p: &Value) -> Result<Value> {
+    let c = "shape.fillStroke";
+    let (cid, lids) = layers_p(s, p)?;
+    let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
+    let shapes: Vec<LayerId> = lids.into_iter().filter(|l| comp.layer(*l).is_some_and(|l| matches!(l.source, LayerSource::Shape))).collect();
+    if shapes.is_empty() {
+        return Err(bad(c, "select a shape layer"));
+    }
+    let rgba = |k: &str| color_p(p, k).map(|c| [c[0] as f64, c[1] as f64, c[2] as f64, 1.0]);
+    let (fill, stroke) = (rgba("fill"), rgba("stroke"));
+    let width = f_p(p, "strokeWidth").filter(|w| w.is_finite()).map(|w| w.max(0.0));
+    if fill.is_some() || stroke.is_some() || width.is_some() {
+        let add_stroke = width.map_or(stroke.is_some(), |w| w > 0.0);
+        let t = s.time();
+        s.edit("Fill and Stroke", merge_p(p), |proj, _| {
+            let mut next = proj.next_id;
+            for lid in &shapes {
+                let l = layer_mut(proj, cid, *lid)?;
+                let lt = l.layer_time(t);
+                if let Some(contents) = l.props.sub_mut("contents") {
+                    paint(contents, &mut Ids(&mut next), lt, fill, stroke, width, add_stroke, 0);
+                }
+            }
+            proj.next_id = next;
+            Ok(())
+        })?;
+    }
+    let l = shapes.first().and_then(|id| s.project.comp(cid)?.layer(*id)).ok_or(EngineError::NoComp)?;
+    let (fill, stroke, width) = first_paint(l, l.layer_time(s.time()));
+    Ok(json!({"fill": fill, "stroke": stroke, "strokeWidth": width}))
+}
+
 pub fn specs() -> Vec<CommandSpec> {
     vec![
+        cmd!(
+            "shape.fillStroke",
+            "Fill and Stroke",
+            [],
+            None,
+            "{layers?, fill?: color, stroke?: color, strokeWidth?, merge?} → {fill, stroke, strokeWidth} (first layer)",
+            has_layers,
+            fill_stroke
+        ),
         cmd!("shape.dashes.add", "Add Dash or Gap", [], None, "{layer?, prop?: stroke uid}", has_layers, dashes_add),
         cmd!("shape.dashes.remove", "Remove Dash or Gap", [], None, "{layer?, prop?: stroke uid}", has_layers, dashes_remove),
         cmd!(

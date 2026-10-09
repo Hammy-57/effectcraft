@@ -8,7 +8,7 @@ use effectcraft_project::{FootageKind, ItemId, ItemKind, Layer, LayerSource, Nod
 use effectcraft_time::Tick;
 use serde_json::{Value, json};
 
-use super::layer::{color_p, insert_layer};
+use super::layer::{color_p, index_p, insert_layer, insert_layer_at, place, position_p};
 use super::{CommandSpec, b_p, bad, comp_id, f_p, has_comp, has_layers, layer_mut, layer_p, layers_p, str_p};
 use crate::{EngineError, Result, Session, cmd};
 
@@ -61,6 +61,9 @@ fn comp_renderer(s: &mut Session, p: &Value) -> Result<Value> {
         sync_geometry_options(proj, cid);
         Ok(())
     })?;
+    if r == Renderer::Classic3D && s.project.comp(cid).is_some_and(|c| c.layers.iter().any(|l| l.source.is_model())) {
+        s.toast("Classic 3D doesn't draw 3D model layers: they show with the Advanced 3D renderer");
+    }
     Ok(json!({"renderer": renderer_id(r)}))
 }
 
@@ -68,6 +71,25 @@ fn renderer_id(r: Renderer) -> &'static str {
     match r {
         Renderer::Advanced3D => "advanced3d",
         Renderer::Classic3D => "classic3d",
+    }
+}
+
+/// Only the Advanced 3D renderer draws model and primitive layers, so adding one switches a
+/// Classic 3D comp to it, like After Effects (inside the adding edit: one undo step). Whether
+/// the renderer changed.
+fn use_advanced_3d(proj: &mut effectcraft_project::Project, cid: ItemId) -> Result<bool> {
+    let c = proj.comp_mut(cid).ok_or(EngineError::NoComp)?;
+    let switched = c.renderer != Renderer::Advanced3D;
+    c.renderer = Renderer::Advanced3D;
+    sync_geometry_options(proj, cid);
+    Ok(switched)
+}
+
+/// Tell the user when [`use_advanced_3d`] changed the comp's renderer.
+fn report_switch(s: &mut Session, cid: ItemId, switched: bool) {
+    if switched {
+        let name = s.project.item(cid).map_or("the composition", |i| i.name.as_str()).to_string();
+        s.toast(format!("\"{name}\" now uses the Advanced 3D renderer, which draws 3D models"));
     }
 }
 
@@ -119,7 +141,9 @@ pub(crate) fn new_model(s: &mut Session, p: &Value) -> Result<Value> {
     let name = str_p(p, "name").unwrap_or(&it.name).to_string();
     let fr = comp.frame_rate;
     let start = fr.snap_nearest(f_p(p, "time").map(Tick::from_seconds_f64).unwrap_or(Tick::ZERO));
-    let id = s.edit("New 3D Model Layer", None, |proj, st| {
+    let index = index_p(p, "layer.newModel")?;
+    let position = position_p(p, "layer.newModel")?;
+    let (id, switched) = s.edit("New 3D Model Layer", None, |proj, st| {
         let mut l = build::layer(proj, &comp, &name, LayerSource::Model { item }, (comp.width, comp.height), None);
         let g = build::model_geometry_options(&mut Ids(&mut proj.next_id), scale, &clips);
         if let Some(slot) = l.props.children.iter_mut().find(|c| c.match_id() == "geometryOptions") {
@@ -128,9 +152,12 @@ pub(crate) fn new_model(s: &mut Session, p: &Value) -> Result<Value> {
         l.start_time = start;
         l.in_point = start;
         l.out_point = comp.duration.max(start + fr.frame_duration());
-        insert_layer(proj, st, cid, l)
+        place(&mut l, position);
+        let id = insert_layer_at(proj, st, cid, l, index)?;
+        Ok((id, use_advanced_3d(proj, cid)?))
     })?;
-    Ok(json!({"layer": id.0, "item": item.0}))
+    report_switch(s, cid, switched);
+    Ok(json!({"layer": id.0, "item": item.0, "advanced3d": true}))
 }
 
 fn kind_p(p: &Value, cmd: &str) -> Result<PrimitiveKind> {
@@ -184,7 +211,7 @@ fn new_primitive(s: &mut Session, p: &Value) -> Result<Value> {
     let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?.clone();
     let name = str_p(p, "name").map(str::to_string).unwrap_or_else(|| kind.label().to_string());
     let t = super::time_p(s, p, Some(&comp));
-    let id = s.edit(&format!("New {}", kind.label()), None, |proj, st| {
+    let (id, switched) = s.edit(&format!("New {}", kind.label()), None, |proj, st| {
         let mut l = build::layer(proj, &comp, &name, LayerSource::Primitive { kind }, (comp.width, comp.height), None);
         for k in ["width", "height", "depth", "radius", "tubeRadius", "segments", "rings"] {
             if let Some(v) = f_p(p, k) {
@@ -196,11 +223,11 @@ fn new_primitive(s: &mut Session, p: &Value) -> Result<Value> {
             set_at(&mut l, "transform/position", t, KV::Vec3([g(0), g(1), g(2)]));
         }
         apply_material(&mut l, p, t, "layer.newPrimitive")?;
-        insert_layer(proj, st, cid, l)
+        let id = insert_layer(proj, st, cid, l)?;
+        Ok((id, use_advanced_3d(proj, cid)?))
     })?;
-    // Primitives are drawn by the Advanced 3D renderer.
-    let advanced = s.project.comp(cid).is_some_and(|c| c.renderer == Renderer::Advanced3D);
-    Ok(json!({"layer": id.0, "kind": kind.label(), "advanced3d": advanced}))
+    report_switch(s, cid, switched);
+    Ok(json!({"layer": id.0, "kind": kind.label(), "advanced3d": true}))
 }
 
 // ---------------------------------------------------------------- environment layer
@@ -349,7 +376,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "3D Model Layer",
             [],
             None,
-            "{item?: id or name of a 3D model footage item, path?: a .gltf, .glb or .obj file to import, name?, time? (s)}",
+            "{item?: id or name of a 3D model footage item, path?: a .gltf, .glb or .obj file to import, name?, time? (s), index? (1-based stack position), position? ([x, y] comp px)}; switches a Classic 3D comp to Advanced 3D",
             has_comp,
             new_model
         ),
@@ -358,7 +385,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "3D Primitive",
             [],
             None,
-            "{kind: cube|sphere|plane|torus|cone|cylinder, name?, width?, height?, depth?, radius?, tubeRadius?, segments?, rings?, position? [x,y,z], baseColor?, metallic?, roughness?, emissive?, castsShadows?, acceptsShadows?, acceptsLights?}",
+            "{kind: cube|sphere|plane|torus|cone|cylinder, name?, width?, height?, depth?, radius?, tubeRadius?, segments?, rings?, position? [x,y,z], baseColor?, metallic?, roughness?, emissive?, castsShadows?, acceptsShadows?, acceptsLights?}; switches a Classic 3D comp to Advanced 3D",
             has_comp,
             new_primitive
         ),
@@ -367,7 +394,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "New 3D Primitive",
             [],
             None,
-            "{kind: cube|sphere|plane|torus|cone|cylinder, name?, width?, height?, depth?, radius?, tubeRadius?, segments?, rings?, position? [x,y,z], baseColor?, metallic?, roughness?, emissive?, castsShadows?, acceptsShadows?, acceptsLights?}",
+            "{kind: cube|sphere|plane|torus|cone|cylinder, name?, width?, height?, depth?, radius?, tubeRadius?, segments?, rings?, position? [x,y,z], baseColor?, metallic?, roughness?, emissive?, castsShadows?, acceptsShadows?, acceptsLights?}; switches a Classic 3D comp to Advanced 3D",
             has_comp,
             new_primitive
         ),

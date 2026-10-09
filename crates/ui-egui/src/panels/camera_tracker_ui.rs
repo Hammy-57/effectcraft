@@ -13,6 +13,7 @@
 //!
 //! Everything is dispatched to the `camera.*` commands.
 
+use crate::i18n::{tr, tr_args};
 use std::sync::Arc;
 
 use effectcraft_engine::Session;
@@ -297,7 +298,7 @@ pub fn viewer_hook(
         let some = !pts.is_empty();
         let many = pts.len() > 1;
         let mut pick: Option<(&str, serde_json::Value)> = None;
-        if ui.add_enabled(some, egui::Button::new("Set Ground Plane and Origin")).clicked() {
+        if ui.add_enabled(some, egui::Button::new(tr("Set Ground Plane and Origin"))).clicked() {
             pick = Some(("camera.setGroundPlane", with(None, false)));
         }
         ui.separator();
@@ -320,7 +321,7 @@ pub fn viewer_hook(
             }
         }
         ui.separator();
-        if ui.add_enabled(some, egui::Button::new("Delete Selected Points")).clicked() {
+        if ui.add_enabled(some, egui::Button::new(tr("Delete Selected Points"))).clicked() {
             pick = Some(("camera.deletePoints", with(None, false)));
         }
         if let Some((cmd, q)) = pick {
@@ -419,7 +420,7 @@ pub fn editor(
     let status = match app.session.camera_progress() {
         Some(pr) if running => pr.banner(),
         _ => match &solve {
-            Some(sv) => format!("Method Used: {}    Average Error: {:.2} pixels", sv.method_used.label(), sv.average_error),
+            Some(sv) => tr_args("Method Used: {}    Average Error: {} pixels", &[&(sv.method_used.label()), &format!("{:.2}", sv.average_error)]),
             None if ct::tracks(&params).is_some() && app.session.camera_pending.iter().any(|(_, l, u)| *l == layer.id && *u == g.uid) => {
                 "Waiting to solve".into()
             }

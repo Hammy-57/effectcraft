@@ -1,5 +1,5 @@
 //! Mask motion blur follows the renderer's motion blur gate: the render options (Render
-//! Settings ▸ Motion Blur, previews), the comp's switch and the precomp layers above.
+//! Settings ▸ Motion Blur, previews) and the comp's switch, not the precomp layers above.
 
 use effectcraft_color::Label;
 use effectcraft_keyframe::{Keyframe, ShapePath, Value};
@@ -49,4 +49,19 @@ fn mask_motion_blur_follows_the_render_and_the_comp() {
     assert!(alpha_at_25(&p, cid, false) < 0.01, "Render Settings ▸ Motion Blur off");
     let (p, cid) = project(false);
     assert!(alpha_at_25(&p, cid, true) < 0.01, "the comp's switch off");
+}
+
+#[test]
+fn a_precomp_layer_with_motion_blur_off_keeps_the_nested_blur() {
+    // aerender (SceneYard Student Computer Workflow): nested layers stay motion blurred under
+    // precomp layers whose Motion Blur switch is off.
+    let (mut p, inner) = project(true);
+    let mut outer = Comp::new(100, 100, FrameRate::FPS_30, Tick::from_seconds_f64(1.0));
+    outer.enable_motion_blur = true;
+    let mut pre = build::layer(&mut p, &outer, "Inner", LayerSource::Comp { item: inner }, (100, 100), None);
+    pre.switches.motion_blur = false;
+    let oid = p.add_item("Outer", Label::Sandstone, None, ItemKind::Comp(outer.into()));
+    p.comp_mut(oid).unwrap().layers.push(pre);
+    let a = alpha_at_25(&p, oid, true);
+    assert!(a > 0.05 && a < 0.95, "blurred through the precomp: {a}");
 }

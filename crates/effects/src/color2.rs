@@ -52,9 +52,35 @@ pub struct Curve {
 const LUT_N: usize = 1024;
 
 impl Curve {
-    /// Parse "x,y x,y …" (separators: whitespace or ';'). Returns None for an identity curve or
-    /// fewer than two valid points.
+    /// Parse editable points or an exact AE `lut8:` table. Identity curves return None.
     pub fn parse(s: &str) -> Option<Curve> {
+        if let Some(hex) = s.strip_prefix("lut8:") {
+            if hex.len() != 512 {
+                return None;
+            }
+            let bytes: Vec<u8> = hex
+                .as_bytes()
+                .chunks_exact(2)
+                .map(|pair| {
+                    let hi = (pair[0] as char).to_digit(16)?;
+                    let lo = (pair[1] as char).to_digit(16)?;
+                    Some(((hi << 4) | lo) as u8)
+                })
+                .collect::<Option<_>>()?;
+            if bytes.iter().enumerate().all(|(i, &v)| v == i as u8) {
+                return None;
+            }
+            let xs: Vec<f32> = (0..=255).map(|i| i as f32 / 255.0).collect();
+            let ys: Vec<f32> = bytes.iter().map(|&v| v as f32 / 255.0).collect();
+            let lut: Vec<f32> = (0..=LUT_N)
+                .map(|i| {
+                    let x = i as f32 * 255.0 / LUT_N as f32;
+                    let j = (x as usize).min(254);
+                    ys[j] + (ys[j + 1] - ys[j]) * (x - j as f32)
+                })
+                .collect();
+            return Some(Curve { xs, ys, ms: vec![0.0; 256], lut });
+        }
         let mut pts: Vec<(f32, f32)> = s
             .split(|c: char| c.is_whitespace() || c == ';')
             .filter(|t| !t.is_empty())
@@ -971,6 +997,7 @@ pub fn specs() -> Vec<EffectSpec> {
                 curve("green", "Green"),
                 curve("blue", "Blue"),
                 curve("alpha", "Alpha"),
+                p("aeStateHex", "Original AE Curve State", Value::Str(String::new()), ParamUi::Hidden),
             ],
             curves,
         ),
@@ -1137,6 +1164,16 @@ mod tests {
         assert!((out.data[0][0] - 0.75).abs() < 1e-3);
         let red = run("ec.color.curves", &img, &[("red", Value::Str("0,1 1,1".into()))]);
         assert!((red.data[0][0] - 1.0).abs() < 1e-4 && (red.data[0][1] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn curves_ae_lut8_samples_are_editable_and_exact() {
+        let hex: String = (0..=255).map(|i| format!("{:02x}", i / 2)).collect();
+        let curve = Curve::parse(&format!("lut8:{hex}")).unwrap();
+        assert!((curve.eval(128.0 / 255.0) - 64.0 / 255.0).abs() < 1e-3);
+        assert!((curve.eval(1.0) - 127.0 / 255.0).abs() < 1e-6);
+        let identity: String = (0..=255).map(|i| format!("{i:02x}")).collect();
+        assert!(Curve::parse(&format!("lut8:{identity}")).is_none());
     }
 
     #[test]

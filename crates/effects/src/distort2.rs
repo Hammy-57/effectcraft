@@ -603,22 +603,29 @@ fn bend_it(ctx: &EffectCtx, mut b: Buf) -> Buf {
 
 // ---------------------------------------------------------------- CC Lens
 
+/// CC Lens radius in buffer pixels: Size 100 reaches the layer's corners.
+pub(crate) fn cc_lens_radius(size: f64, lw: f64, lh: f64) -> f64 {
+    (size / 100.0 * lw.hypot(lh) * 0.5).max(0.5)
+}
+
+/// CC Lens: a disc of radius Size around Center; outside it the layer is transparent. Inside,
+/// an output pixel at distance d reads the source at d·(1 − c·(d/r)²), c = Convergence/100:
+/// Convergence 0 is the plain disc (SceneYard Digital Wallets: a Size 100, Convergence 0
+/// lens leaves the card its size), positive pushes the content outward towards the rim and
+/// negative pulls it in. Fitted to SceneYard Puppet Control Documentary (Size 100,
+/// Convergence 31 on a 1920×1080 adjustment layer: about 4% at 400 px, 8% at 590 px).
 fn cc_lens(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let c = b.to_px(ctx.params.v2("center"));
     let (_, _, lw, lh) = layer_rect(ctx, &b);
-    let r = (ctx.params.f("size") / 100.0 * lw.max(lh) * 0.5).max(0.5);
-    let k = 2f64.powf(ctx.params.f("convergence") / 50.0);
+    let r = cc_lens_radius(ctx.params.f("size"), lw, lh);
+    let k = ctx.params.f("convergence") / 100.0;
     b.img = remap(&b.img, false, |x, y| {
         let (dx, dy) = (x - c.0, y - c.1);
-        let d = (dx * dx + dy * dy).sqrt();
-        if d >= r {
+        let d2 = dx * dx + dy * dy;
+        if d2 >= r * r {
             return None;
         }
-        if d < 1e-9 {
-            return Some((x, y));
-        }
-        let g = ((d / r).asin() / FRAC_PI_2).powf(k);
-        let s = r * g / d;
+        let s = 1.0 - k * d2 / (r * r);
         Some((c.0 + dx * s, c.1 + dy * s))
     });
     b
@@ -627,15 +634,38 @@ fn cc_lens(ctx: &EffectCtx, mut b: Buf) -> Buf {
 // ---------------------------------------------------------------- CC Page Turn
 
 fn page_turn(ctx: &EffectCtx, mut b: Buf) -> Buf {
-    let f = b.to_px(ctx.params.v2("foldPosition"));
+    let pointer = b.to_px(ctx.params.v2("foldPosition"));
     let phi = ctx.params.f("foldDirection").to_radians();
+    let controls = ctx.params.e("controls");
+    // Corner controls drag the selected page corner; the fold is the perpendicular bisector
+    // between its original position and the dragged point. Classic UI uses Fold Direction.
+    let (f, n) = if (2..=5).contains(&controls) {
+        let (x, y, w, h) = layer_rect(ctx, &b);
+        let corner = match controls {
+            2 => (x, y),
+            3 => (x + w, y),
+            4 => (x, y + h),
+            _ => (x + w, y + h),
+        };
+        let (dx, dy) = (corner.0 - pointer.0, corner.1 - pointer.1);
+        let len = dx.hypot(dy);
+        // A corner pulled away from the page (or not at all) leaves it flat: it only folds over
+        // when dragged in across the page (SceneYard "Famous Figure Article" ends its turn with
+        // the bottom-right corner just past itself and shows the page flat).
+        let inward = (pointer.0 - corner.0) * (x + w * 0.5 - corner.0) + (pointer.1 - corner.1) * (y + h * 0.5 - corner.1);
+        if !len.is_finite() || len < 1e-6 || inward <= 0.0 {
+            return b;
+        }
+        (((corner.0 + pointer.0) * 0.5, (corner.1 + pointer.1) * 0.5), (dx / len, dy / len))
+    } else {
+        (pointer, (-phi.sin(), phi.cos()))
+    };
     let r = (ctx.params.f("foldRadius") * b.scale).max(0.5);
     let lam = ctx.params.f("lightDirection").to_radians();
     let render = ctx.params.e("render");
     let bo = (ctx.params.f("backPageOpacity") / 100.0) as f32;
     let paper = ctx.params.color("paperColor");
     // The fold travels along `fd`; the lifted part lies on the other side (toward `n`).
-    let n = (-phi.sin(), phi.cos());
     let ldot = (n.0 * lam.sin() - n.1 * lam.cos()) as f32;
     let (show_front, show_back) = (render != 1, render != 2);
     let src = b.img.clone();
@@ -846,6 +876,7 @@ pub fn specs() -> Vec<EffectSpec> {
             vec![
                 p("foldPosition", "Fold Position", pt(0.7, 0.7), ParamUi::Point),
                 p("foldDirection", "Fold Direction", num(315.0), ParamUi::Angle),
+                p("controls", "Controls", num(0.0), slider(0.0, 5.0, 0.0, 5.0, 0)),
                 p("foldRadius", "Fold Radius", num(20.0), slider(0.0, 1000.0, 0.0, 200.0, 1)),
                 p("lightDirection", "Light Direction", num(-45.0), ParamUi::Angle),
                 p("render", "Render", Value::Enum(0), popup(&["Front & Back Page", "Back Page", "Front Page"])),
@@ -1015,6 +1046,48 @@ mod tests {
         // Bottom-right corner is lifted away; top-left untouched.
         assert!(o.img.get(63, 63)[3] < 1e-6);
         assert_eq!(o.img.get(2, 2), img.get(2, 2));
+    }
+
+    #[test]
+    fn page_turn_controls_use_imported_zero_based_corner_mode() {
+        let img = test_img(64, 64);
+        let raw = |n: u32| Value::Enum(n - 1);
+        let point = Value::Vec2([20.0, 20.0]);
+        let classic = run("ec.distort.ccpageturn", &[("controls", raw(1)), ("foldPosition", point.clone())], img.clone()).img;
+        let corner = run("ec.distort.ccpageturn", &[("controls", raw(6)), ("foldPosition", point.clone())], img.clone()).img;
+        assert!(max_diff(&classic, &corner) > 1e-3, "AE Controls 6 must use a dragged corner");
+        let other_direction = run("ec.distort.ccpageturn", &[("controls", raw(6)), ("foldPosition", point), ("foldDirection", num(90.0))], img).img;
+        assert_eq!(corner, other_direction, "corner controls ignore Fold Direction");
+    }
+
+    #[test]
+    fn page_turn_corner_pulled_away_leaves_the_page_flat() {
+        let img = test_img(64, 64);
+        // Bottom-right corner (native 5) dragged outward past itself: flat; dragged inward: turned.
+        let run_at = |p: [f64; 2]| run("ec.distort.ccpageturn", &[("controls", num(5.0)), ("foldPosition", Value::Vec2(p))], img.clone()).img;
+        assert_eq!(run_at([70.0, 68.0]), img);
+        assert!(max_diff(&run_at([40.0, 40.0]), &img) > 1e-3);
+    }
+
+    /// CC Lens at Convergence 0 is a plain disc, not a ×1.57 fish-eye (SceneYard Digital
+    /// Wallets: the lensed card came out half again too large); Size 100 reaches the corners and
+    /// a positive Convergence only pushes the rim outward (SceneYard Puppet Control
+    /// Documentary: Convergence 31 is a gentle bulge, not a bubble with black corners).
+    #[test]
+    fn cc_lens_zero_convergence_is_identity_and_size_100_reaches_corners() {
+        let img = test_img(40, 30);
+        let flat = run("ec.distort.cclens", &[("size", Value::Scalar(100.0)), ("convergence", Value::Scalar(0.0))], img.clone());
+        for (x, y) in [(20, 15), (5, 25), (35, 3), (0, 0), (39, 29)] {
+            let (a, b) = (flat.img.get(x, y), img.get(x, y));
+            assert!((0..4).all(|i| (a[i] - b[i]).abs() < 1e-4), "({x},{y}) {a:?} {b:?}");
+        }
+        let bulge = run("ec.distort.cclens", &[("size", Value::Scalar(100.0)), ("convergence", Value::Scalar(31.0))], img.clone());
+        // The centre stays put; a pixel 12 px out reads about 1 px closer in.
+        let (c, e) = (bulge.img.get(20, 15), img.get(20, 15));
+        assert!((c[0] - e[0]).abs() < 1e-3 && (c[1] - e[1]).abs() < 1e-3, "{c:?} {e:?}");
+        let x = bulge.img.get(32, 15)[0] * 40.0;
+        assert!((30.5..31.7).contains(&x), "reads x {x}");
+        assert!(bulge.img.get(1, 1)[3] > 0.99, "corners stay inside the lens");
     }
 
     #[test]

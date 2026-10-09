@@ -421,6 +421,12 @@ fn repetile(ctx: &EffectCtx, b: Buf) -> Buf {
 
 // ---- Motion Tile ----
 
+/// Whole pixels an adjustment layer's Motion Tile grows its buffer by on each side, for an
+/// output `extra` layer units wider than the layer (none when narrower; capped).
+pub fn motion_tile_growth(extra: f64, scale: f64) -> u32 {
+    (extra * 0.5 * scale).round().clamp(0.0, 8192.0) as u32
+}
+
 fn motion_tile(ctx: &EffectCtx, b: Buf) -> Buf {
     let s = b.scale;
     let (lw, lh) = (ctx.layer_size[0], ctx.layer_size[1]);
@@ -433,11 +439,15 @@ fn motion_tile(ctx: &EffectCtx, b: Buf) -> Buf {
     let mirror = ctx.params.b("mirrorEdges");
     let phase = ctx.params.f("phase") / 360.0;
     let hshift = ctx.params.b("horizontalPhaseShift");
+    let ow = (lw * ctx.params.f("outputWidth") / 100.0).max(1.0 / s);
+    let oh = (lh * ctx.params.f("outputHeight") / 100.0).max(1.0 / s);
     let (nw, nh, noff) = if ctx.adjustment {
-        (b.img.width, b.img.height, b.offset)
+        // An adjustment layer's buffer is the comp below: grow it by whole pixels so later
+        // effects (a Wave Warp pulling from 500 px away) read tiles instead of transparency;
+        // the adjustment is cropped back to the comp afterwards.
+        let (ex, ey) = (motion_tile_growth(ow - lw, s), motion_tile_growth(oh - lh, s));
+        (b.img.width.saturating_add(2 * ex), b.img.height.saturating_add(2 * ey), [b.offset[0] + ex as f64, b.offset[1] + ey as f64])
     } else {
-        let ow = (lw * ctx.params.f("outputWidth") / 100.0).max(1.0 / s);
-        let oh = (lh * ctx.params.f("outputHeight") / 100.0).max(1.0 / s);
         ((ow * s).round().max(1.0) as u32, (oh * s).round().max(1.0) as u32, [(ow - lw) * 0.5 * s, (oh - lh) * 0.5 * s])
     };
     let mut out = Image::new(nw, nh);
@@ -503,9 +513,10 @@ fn vignette(ctx: &EffectCtx, mut b: Buf) -> Buf {
     }
     let c = b.to_px(ctx.params.v2("center"));
     let pin = ctx.params.f("pinHighlights") as f32 / 100.0;
-    let (lw, lh) = (ctx.layer_size[0] * b.scale, ctx.layer_size[1] * b.scale);
-    let half_diag = (lw * lw + lh * lh).sqrt() * 0.5;
-    let dist = half_diag.max(1.0) / (fov * 0.5).tan();
+    let lw = ctx.layer_size[0] * b.scale;
+    // Angle of View spans the layer's width (fitted to After Effects renders of portrait and
+    // landscape layers: SceneYard Photos Collage, UI Google search, 40f9d5a8, 3a8e8349).
+    let dist = (lw * 0.5).max(1.0) / (fov * 0.5).tan();
     b.img.rows_mut().for_each(|(y, row)| {
         for (x, px) in row.iter_mut().enumerate() {
             let (c3, a) = unpremul(*px);
@@ -859,6 +870,18 @@ mod tests {
         assert!((out.img.get(20, 20)[0] - 0.8).abs() < 0.01);
     }
 
+    /// Angle of View spans the layer's width: a portrait layer darkens as strongly as AE does
+    /// (SceneYard UI Google search, 1080×1920 at Amount 100 / 45°: ~0.44 of the colour 860 px
+    /// above the centre).
+    #[test]
+    fn vignette_falloff_follows_the_layer_width() {
+        let img = Image::filled(108, 192, [0.5, 0.5, 0.5, 1.0]);
+        let set = [("amount", num(100.0)), ("angleOfView", num(45.0)), ("center", Value::Vec2([54.0, 96.0]))];
+        let out = run_at("ec.stylize.ccvignette", &set, img, 0.0);
+        let k = out.img.get(54, 10)[0] / 0.5;
+        assert!((k - 0.44).abs() < 0.06, "{k}");
+    }
+
     #[test]
     fn kaleida_is_symmetric() {
         let out = run_at("ec.stylize.cckaleida", &[("mirroring", Value::Enum(2)), ("center", Value::Vec2([16.0, 16.0]))], ramp(32, 32), 0.0);
@@ -980,11 +1003,11 @@ mod tests {
             v.extend_from_slice(extra);
             v
         };
-        // None: the glow alone (the core is the glow's own brightness, not the original's 1.0 + glow).
+        // None draws exactly like Behind (aerender, SceneYard UI Envelope).
         let on_top = run_at("ec.stylize.glow", &vals(&[]), img.clone(), 0.0);
         let none = run_at("ec.stylize.glow", &vals(&[("operation", Value::Enum(2))]), img.clone(), 0.0);
         let (ox, oy) = (on_top.offset[0] as i64, on_top.offset[1] as i64);
-        assert!(none.img.get(ox + 15, oy + 15)[0] < on_top.img.get(ox + 15, oy + 15)[0]);
+        assert_eq!(none.img.data, on_top.img.data);
         // Horizontal only: glow spreads sideways but not up.
         let h = run_at("ec.stylize.glow", &vals(&[("glowDimensions", Value::Enum(1))]), img.clone(), 0.0);
         assert!(h.img.get(ox + 21, oy + 15)[3] > 0.05);

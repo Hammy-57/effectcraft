@@ -4,7 +4,7 @@ members = ["crates/*", "apps/*", "xtask"]
 default-members = ["crates/*", "apps/*"]
 
 [workspace.package]
-version = "0.3.1"
+version = "0.6.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.95"
@@ -30,6 +30,7 @@ effectcraft-media = { path = "crates/media" }
 effectcraft-export = { path = "crates/export" }
 effectcraft-expr = { path = "crates/expr" }
 effectcraft-lottie = { path = "crates/lottie" }
+effectcraft-aep = { path = "crates/aep" }
 effectcraft-interchange = { path = "crates/interchange" }
 effectcraft-pdf = { path = "crates/pdf" }
 effectcraft-psd = { path = "crates/psd" }
@@ -103,6 +104,8 @@ eframe = { version = "0.36", default-features = false }
 egui_kittest = "0.36"
 rfd = "0.17"
 cpal = "0.16"
+# The operating system's interface language (MIT/Apache-2.0, no dependencies on desktop).
+sys-locale = "0.3"
 
 # Local co-development against a FilmCraft checkout next to this repo: uncomment.
 # [patch."https://github.com/storytold/filmcraft"]

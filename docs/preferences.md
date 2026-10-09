@@ -29,7 +29,7 @@ Commands (CLI, MCP, control channel):
 
 ### Settings that change behaviour
 
-- `general.language`: interface language (`en` / `ja`), Settings ▸ General ▸ Language; menu labels change immediately. Native Japanese UI uses installed system fonts; the web host must supply a Japanese font.
+- `general.language`: interface language (`system` / `en` / `ja` / `zh-hans` / `zh-hant` / `uk`), Settings ▸ General ▸ Language; menu labels change immediately. `system` (Match System, the default) follows the operating system's interface language where EffectCraft has a translation and is English otherwise: a Simplified Chinese locale (`zh`, `zh-CN`, `zh_CN.UTF-8`, `zh-Hans-CN`, `zh-SG`) selects `zh-hans`, a Traditional one (`zh-TW`, `zh-HK`, `zh-Hant`, `zh_MO`) selects `zh-hant`, a Ukrainian one (`uk`, `uk-UA`, `uk_UA.UTF-8`) selects `uk`; the browser build stays in English with it. Choose **Українська** for Ukrainian menus; Ukrainian dialog and panel contents stay in English for now, and Ukrainian uses the bundled UI fonts. Native Japanese, Simplified and Traditional Chinese UI uses installed system fonts; the web host must supply a Japanese font. The same setting picks the CJK fallback for the interface *and* the Han preference of the text engine, so the composition's own text is drawn with the same language's glyph forms (the text engine's preference is process-global); swapping the language reinstalls the fonts, so it applies without a restart. Two catalogs back the text: the menus are keyed by `(command, English label)` (`crates/ui-egui/src/i18n.rs`), and the rest of the interface - panels, dialogs, buttons, tooltips - is keyed by its English source string (`crates/ui-egui/src/i18n/ui.rs`), where a panel writes `tr("Rename")`, or `tr_args("Proxy Use: {}", &[&quality])` when the row carries a value. A row that is missing falls back to English, so a new string shows up untranslated rather than empty; the tests in that module fail on an unused row and on a hard-coded string in a converted panel.
 - `general.undoLevels`: Levels of Undo
 - `general.pathPointSize`: Path Point and Handle Size
 - `general.recentItems`: Recent Projects Shown
@@ -38,6 +38,7 @@ Commands (CLI, MCP, control channel):
 - `general.defaultSpatialLinear`: Default Spatial Interpolation to Linear
 - `startup.showHomeOnLaunch`: Show Home Screen When Launching
 - `startup.offerCrashRecovery`: Offer to Open the Latest Auto-Save After a Crash
+- `startup.windowGraphics`: Window Graphics (`auto` / `gl`), what the desktop window draws with from the next launch. `auto` lets the platform pick (DirectX 12, Vulkan or Metal); `gl` uses OpenGL, with CPU compositing, for graphics drivers that crash with the others. A launch whose window never drew leaves a `launch-pending` marker in the settings folder, and the next launch switches to `gl` and says so (not on macOS, which has no OpenGL backend). `WGPU_BACKEND` overrides both.
 - `project.useTemplate`: New Project Loads Template
 - `project.templatePath`: Template Project
 - `autoSave.enabled`: Automatically Save Projects
@@ -55,6 +56,9 @@ Commands (CLI, MCP, control channel):
 - `previews.fastPreviews`: Fast Previews (Draft 3D, Faster Effects)
 - `appearance.theme`: Theme
 - `appearance.brightness`: Brightness
+- `appearance.uiScale`: UI Scale, the size of the whole interface (75–200 %, on top of the
+  display's own scaling), applied as soon as it is chosen
+- `appearance.parameterRowSeparators`: thin dark boundaries between parameter/group rows in Effect Controls and the timeline (default on). Expanded sliders and dials are kept within their parameter block. Effect Controls indents each group level beneath its effect, aligns sibling names and values, and preserves the gap before the next effect.
 - `appearance.useLabelColorForHandles`: Use Label Color for Layer Handles and Paths
 - `grids.gridColor`: Color
 - `grids.gridSpacing`: Gridline Every
@@ -105,6 +109,7 @@ Commands (CLI, MCP, control channel):
 - `type.recentFonts`: how many recently used fonts head the font menu
 - `type.fontNamesInEnglish`: off, fonts with a native-language family name show it
 - `import.reportMissingFrames`: gaps in an image sequence's numbering are reported on import
+  (they show as colour-bar placeholders, as in After Effects; see [footage.md](footage.md))
 - `import.unlabeledAlpha`: alpha of TGA / TIFF / movie footage (Ask opens Interpret Footage;
   Guess takes premultiplied for movies, straight for stills)
 - `import.dragImportAs`: layered files dropped on the window import as footage or a comp
@@ -140,6 +145,10 @@ Commands (CLI, MCP, control channel):
   the Timeline's expression editor
 - `scripting.errorBanner`: a banner along the bottom of the Composition panel names the first
   failing expression (click: reveal it)
+- `scripting.agentControl`, `scripting.agentControlPort`: the desktop app starts the control
+  channel ([control-protocol.md](control-protocol.md)) on this port at every launch, so agents and
+  `effectcraft-cli mcp --bridge <port>` can drive it; unlike `--control`, the window still takes
+  focus and the Home screen and crash recovery behave as usual. Takes effect at the next launch
 - `roto.model` (Settings ▸ Roto Brush): the segmentation model Roto Brush 2.0 / 3.0 use,
   `classical` (built in) or `mobilesam` (once installed). The page lists every registered model
   with its authors, licence, size, source and status, with Download, Install from File… and
@@ -160,6 +169,8 @@ step with the schema.
   drawn by the GPU (egui on wgpu).
 - `scripting.enableJsDebugger`: the JavaScript engine has no step debugger; script errors report
   their file and line in the Script Console.
+
+Effect Controls uses compact, fixed 20 pt parameter rows; the timeline keeps its fixed 19 pt rows. These logical sizes follow the existing whole-interface UI Scale. The separator preference previews immediately; Cancel restores it and OK saves it. Painting and mouse hit tests use the same row geometry. These UI changes do not alter project values or render output.
 
 ## Keyboard shortcuts
 
@@ -188,7 +199,7 @@ from?, newName?}`, `shortcuts.export {preset?, path?}`, `shortcuts.import {path?
 - Every *n* minutes (Settings ▸ Project ▸ Auto-Save) a project with unsaved changes is written
   to an `EffectCraft Auto-Save` folder next to it (or the custom folder) as
   `<name> auto-save N.ecproj`. Slots rotate through 1…maximum versions, overwriting the oldest.
-  Untitled projects go to the custom folder, or to `Auto-Save` in the config directory.
+  Untitled projects go to the custom folder, or to `EffectCraft Auto-Save` in the config directory.
 - Every project and auto-save write is atomic: a temporary file is written and flushed, then
   renamed over the target, so a crash mid-write leaves the previous file intact.
 - While the app runs, `session.lock` in the config directory records the open project and its
@@ -196,6 +207,13 @@ from?, newName?}`, `shortcuts.export {preset?, path?}`, `shortcuts.import {path?
   offers to open the latest auto-save (Settings ▸ Startup & Repair can turn this off).
 - File ▸ Open Recent lists recent projects (stored in the settings), File ▸ Revert reloads the
   saved project, File ▸ Increment and Save saves `Intro.ecproj` as `Intro 2.ecproj`.
+
+Headless MCP clients can opt in with `effectcraft-cli mcp --autosave`. Unlike the desktop's
+interval, this writes changed dirty projects before sending each tool reply, with separate
+version slots per server under `EffectCraft Auto-Save/MCP/` (or the custom folder's `MCP/`).
+It reads settings without sharing the desktop's writable settings store or `session.lock`.
+See [headless recovery](agents.md#keeping-headless-work-across-restarts) for how to reopen a
+checkpoint after a client restart.
 
 Commands: `file.autoSave` (now), `file.recoveryInfo`, `file.openRecent {index? | path?}`,
 `file.clearRecent`, `file.revert`, `file.incrementAndSave`.

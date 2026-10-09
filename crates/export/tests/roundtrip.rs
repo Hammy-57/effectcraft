@@ -53,6 +53,11 @@ fn settings() -> RenderSettings {
 }
 
 fn run(p: &Project, cid: ItemId, footage: &dyn FootageSource, om: &OutputModule, path: &Path) -> effectcraft_export::Report {
+    run_frames(p, cid, footage, om, path, FRAMES)
+}
+
+/// [`run`] for a comp of `frames` frames.
+fn run_frames(p: &Project, cid: ItemId, footage: &dyn FootageSource, om: &OutputModule, path: &Path, frames: u64) -> effectcraft_export::Report {
     let s = settings();
     let path = path.to_string_lossy().to_string();
     let job = Job {
@@ -77,10 +82,10 @@ fn run(p: &Project, cid: ItemId, footage: &dyn FootageSource, om: &OutputModule,
         true
     })
     .expect("export");
-    assert_eq!(last.done, FRAMES);
-    assert_eq!(last.total, FRAMES);
+    assert_eq!(last.done, frames);
+    assert_eq!(last.total, frames);
     assert!(calls >= 2);
-    assert_eq!(r.frames, FRAMES);
+    assert_eq!(r.frames, frames);
     r
 }
 
@@ -277,6 +282,71 @@ fn exr_sequence_is_linear() {
     assert!((c[2] - 0.1329).abs() < 0.01 && (c[3] - 1.0).abs() < 1e-6, "{c:?}");
 }
 
+/// A 32 bpc project whose only layer is a full-frame opaque solid of the given colour.
+fn bright_project(color: [f32; 3]) -> (Project, ItemId) {
+    let mut p = Project::default();
+    p.settings.bit_depth = effectcraft_project::BitDepth::Bpc32;
+    let comp = Comp::new(W, H, FrameRate::new(10, 1), Tick::from_seconds_f64(0.1));
+    let sid = p.add_item("Bright", Label::Red, None, ItemKind::Solid(Solid { color, width: W, height: H, pixel_aspect: 1.0 }));
+    let mut comp = comp;
+    let l = build::layer(&mut p, &comp, "Bright", LayerSource::Solid { item: sid }, (W, H), None);
+    comp.layers.push(l);
+    let cid = p.add_item("Comp 1", Label::Sandstone, None, ItemKind::Comp(comp.into()));
+    (p, cid)
+}
+
+/// Export one frame of a 32 bpc solid to an EXR sequence and read its centre pixel.
+fn exr_centre(color: [f32; 3], channels: Channels, name: &str) -> [f32; 4] {
+    let (p, cid) = bright_project(color);
+    let d = out_dir(name);
+    let mut om = OutputModule::for_format(OutputFormat::ExrSequence);
+    om.channels = channels;
+    let s = RenderSettings { time_span: TimeSpan::LengthOfComp, ..Default::default() };
+    let path = d.join("f_[#####].exr").to_string_lossy().to_string();
+    let job = Job {
+        project: &p,
+        footage: &NoFootage,
+        expr: None,
+        accel: None,
+        comp: cid,
+        settings: &s,
+        output: &om,
+        path: &path,
+        sink: None,
+        options: Default::default(),
+        nested_switches: true,
+    };
+    export(&job, &mut |_| true).expect("export");
+    let img = image::open(d.join("f_00000.exr")).expect("exr").to_rgba32f();
+    img.get_pixel(W / 2, H / 2).0
+}
+
+/// The sRGB decode of the frame the writer is handed (the solid is sRGB-encoded in the frame).
+fn lin(v: f32) -> f32 {
+    effectcraft_color::srgb_to_linear(v)
+}
+
+#[test]
+fn exr_sequence_keeps_values_above_one() {
+    // Issue #339: a 32 bpc project's over-range colour must reach the EXR, in scene-linear light.
+    let src = [1.5, 1.25, 0.75];
+    for channels in [Channels::Rgba, Channels::Rgb] {
+        let c = exr_centre(src, channels, "seq-exr-over");
+        for i in 0..3 {
+            assert!((c[i] - lin(src[i])).abs() < 1e-3 * lin(src[i]).max(1.0), "{channels:?} channel {i}: {c:?}");
+        }
+        assert!(c[0] > 1.5 && c[1] > 1.25, "{channels:?} not clamped: {c:?}");
+        assert!((c[3] - 1.0).abs() < 1e-6, "{c:?}");
+    }
+}
+
+#[test]
+fn exr_sequence_values_at_or_below_one_are_unchanged() {
+    for channels in [Channels::Rgba, Channels::Rgb] {
+        let c = exr_centre([1.0, 0.4, 0.0], channels, "seq-exr-in-range");
+        assert!((c[0] - 1.0).abs() < 1e-4 && (c[1] - lin(0.4)).abs() < 1e-4 && c[2].abs() < 1e-6, "{channels:?}: {c:?}");
+    }
+}
 #[test]
 fn gif_roundtrip() {
     let (p, cid) = project(None);
@@ -397,6 +467,58 @@ fn movies_carry_audio() {
         let path = d.join(format!("silent-{name}"));
         assert!(!run(&p, cid, &pool, &om, &path).audio);
         assert!(!effectcraft_media::probe(&path).expect("probe").has_audio);
+    }
+}
+
+/// `src`'s audio decoded by ffmpeg as interleaved stereo `f32` at 48 kHz (external oracle).
+fn ffmpeg_audio(src: &Path) -> Vec<f32> {
+    let out = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-i"])
+        .arg(src)
+        .args(["-f", "f32le", "-ac", "2", "-ar", "48000", "-"])
+        .output()
+        .expect("ffmpeg");
+    assert!(out.status.success(), "ffmpeg failed to decode {}", src.display());
+    out.stdout.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect()
+}
+
+/// Movies of a 29.97 fps comp whose footage has AAC audio at 44.1 kHz sound like the footage
+/// (both decoded by ffmpeg): reading footage audio at another rate ramped from a wrong position
+/// at the start of every batch of frames, so exports stuttered (#274).
+#[test]
+fn movies_carry_resampled_footage_audio() {
+    let d = out_dir("audio-44k");
+    let clip = d.join("clip.mp4");
+    let made = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=64x48:rate=30000/1001:duration=3", "-f", "lavfi", "-i"])
+        .args(["aevalsrc=0.5*sin(2*PI*440*t)|0.5*sin(2*PI*(200+400*t/3)*t):s=44100:d=3", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest"])
+        .arg(&clip)
+        .status()
+        .is_ok_and(|s| s.success());
+    if !made {
+        eprintln!("ffmpeg not found: skipping");
+        return;
+    }
+    let fps = FrameRate::new(30000, 1001);
+    let mut p = Project::default();
+    let mut comp = Comp::new(W, H, fps, fps.tick_of(60));
+    let fid = p.add_item("clip.mp4", Label::SeaFoam, None, ItemKind::Footage(effectcraft_media::probe(&clip).expect("probe clip")));
+    let l = build::layer(&mut p, &comp, "clip", LayerSource::Footage { item: fid }, (64, 48), None);
+    comp.layers.push(l);
+    let cid = p.add_item("Comp 1", Label::Sandstone, None, ItemKind::Comp(comp.into()));
+    let want = ffmpeg_audio(&clip);
+    let pool = MediaPool::new();
+    // AAC is lossy; PCM differs from ffmpeg's resampler by little more than 16-bit rounding.
+    for (fmt, name, tol) in [(OutputFormat::H264, "a.mp4", 0.06), (OutputFormat::ProRes, "a.mov", 0.01)] {
+        let path = d.join(name);
+        assert!(run_frames(&p, cid, &pool, &OutputModule::for_format(fmt), &path, 60).audio);
+        let got = ffmpeg_audio(&path);
+        // 60 frames at 29.97 fps: 96 096 samples at 48 kHz.
+        assert!((got.len() as i64 / 2 - 96_096).abs() < 1024, "{name}: {} samples", got.len() / 2);
+        // (Up to the last AAC frames, where the cut to silence smears back into the sound.)
+        let worst = got.iter().zip(&want).take(94_000 * 2).map(|(g, w)| (g - w).abs()).fold(0.0f32, f32::max);
+        eprintln!("{name}: max error {worst:.4}");
+        assert!(worst < tol, "{name}: max error {worst} against the footage");
     }
 }
 

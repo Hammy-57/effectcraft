@@ -12,7 +12,7 @@ use effectcraft_project::ParamUi;
 use effectcraft_raster::Px;
 use rayon::prelude::*;
 
-use crate::util::{Plane, Rng, gauss_plane, hash1, layer_rect, lerp3, map_xy, smoothstep, unpremul};
+use crate::util::{Plane, Rng, box_plane, gauss_plane, hash1, layer_rect, lerp3, map_xy, smoothstep, unpremul};
 use crate::{Buf, EffectCtx, EffectSpec, col, num, p, popup, slider};
 
 fn spec(id: &'static str, name: &'static str, params: Vec<crate::ParamSpec>, render: crate::RenderFn) -> EffectSpec {
@@ -369,6 +369,10 @@ const RW_PROFILES: [&str; 7] = ["Square", "Taper Front", "Taper Back", "Taper Bo
 /// Image Contour's Value Channel options.
 const RW_CHANNELS: [&str; 8] = ["Red", "Green", "Blue", "Alpha", "Luminance", "Hue", "Lightness", "Saturation"];
 
+/// When Radio Waves emits relative to its period: births at `k / Frequency + RW_BIRTH_PHASE`
+/// seconds (measured on After Effects renders at Frequency 0.5, 1 and 1.5).
+const RW_BIRTH_PHASE: f64 = -0.3;
+
 /// Stroke Profile weight across the stroke: `u` from −1 (inner edge) to 1 (outer edge).
 fn rw_profile(kind: u32, u: f64) -> f64 {
     let u = u.clamp(-1.0, 1.0);
@@ -549,12 +553,14 @@ pub fn radio_plan(ctx: &EffectCtx, b: &Buf) -> Option<RadioPlan> {
     if wave_type != 0 && contour.is_none() {
         return None;
     }
-    let k_hi = (t * freq).floor() as i64;
-    let k_lo = (((t - life_now) * freq).floor() as i64 - 1).max(0).max(k_hi - 256);
+    // As in After Effects, the waves have been running before the layer's time 0 (a steady
+    // ring pattern from the first frame), born every 1 / Frequency s at RW_BIRTH_PHASE.
+    let k_hi = ((t - RW_BIRTH_PHASE) * freq).floor() as i64;
+    let k_lo = (((t - RW_BIRTH_PHASE - life_now) * freq).floor() as i64 - 1).max(k_hi - 256);
     let mut cache: std::collections::HashMap<i64, crate::Params> = std::collections::HashMap::new();
     let waves: Vec<Wave> = (k_lo..=k_hi)
         .filter_map(|k| {
-            let born = k as f64 / freq;
+            let born = k as f64 / freq + RW_BIRTH_PHASE;
             let age = t - born;
             // Birth: the values the wave was born with (when the host can tell).
             let pr: &crate::Params = if birth {
@@ -575,6 +581,9 @@ pub fn radio_plan(ctx: &EffectCtx, b: &Buf) -> Option<RadioPlan> {
             let c = b.to_px(pr.v2("producerPoint"));
             let fin = pr.f("waveStroke/fadeInTime").max(0.0);
             let fout = pr.f("waveStroke/fadeOutTime").max(0.0);
+            // Fades longer than the lifespan span the whole life (AE: Fade-out 5 s on a 3 s wave
+            // dims it linearly from birth).
+            let (fin, fout) = (fin.min(life), fout.min(life));
             let fi = if fin > 0.0 { (age / fin).min(1.0) } else { 1.0 };
             let fo = if fout > 0.0 { ((life - age) / fout).min(1.0) } else { 1.0 };
             let dirn = pr.f("waveMotion/direction").to_radians();
@@ -585,7 +594,9 @@ pub fn radio_plan(ctx: &EffectCtx, b: &Buf) -> Option<RadioPlan> {
             }
             let sw = pr.f("waveStroke/startWidth") * b.scale;
             let ew = pr.f("waveStroke/endWidth") * b.scale;
-            let radius = pr.f("waveMotion/expansion") * b.scale * age;
+            let half_width = ((sw + (ew - sw) * age / life) * 0.5).max(0.25);
+            // Expansion moves the wave's outer edge; the stroke lies inside it.
+            let radius = (pr.f("waveMotion/expansion") * b.scale * age - half_width).max(0.0);
             let rotation = pr.f("waveMotion/orientation").to_radians() + pr.f("waveMotion/spin").to_radians() * age;
             let outline = (wave_type == 0).then(|| {
                 let sides = pr.f("polygon/sides").round().clamp(3.0, 64.0);
@@ -605,7 +616,7 @@ pub fn radio_plan(ctx: &EffectCtx, b: &Buf) -> Option<RadioPlan> {
             Some(Wave {
                 centre,
                 radius,
-                half_width: ((sw + (ew - sw) * age / life) * 0.5).max(0.25),
+                half_width,
                 rotation,
                 fade: (fi * fo) as f32,
                 color: pr.color("waveStroke/color"),
@@ -618,7 +629,11 @@ pub fn radio_plan(ctx: &EffectCtx, b: &Buf) -> Option<RadioPlan> {
 }
 
 fn radio_waves(ctx: &EffectCtx, mut b: Buf) -> Buf {
-    let Some(RadioPlan { waves, contour, aa, profile }) = radio_plan(ctx, &b) else { return b };
+    let plan = radio_plan(ctx, &b);
+    // Like After Effects, the waves replace the layer's own pixels (a grey solid carrying the
+    // effect shows only its rings); the layer is read only as an Image Contour source.
+    b.img.data.iter_mut().for_each(|p| *p = [0.0; 4]);
+    let Some(RadioPlan { waves, contour, aa, profile }) = plan else { return b };
     map_xy(&mut b.img, |x, y, px| {
         let mut out = px;
         // Older waves first, so newer ones sit on top.
@@ -993,43 +1008,139 @@ fn light_burst(ctx: &EffectCtx, mut b: Buf) -> Buf {
 }
 
 // ---------------------------------------------------------------- CC Light Sweep
+//
+// Measured against After Effects 2026 (aerender, 8 bpc TIFF): the sweep is a band of light
+// across the layer, its line at `direction` from vertical (clockwise), through `center`. At a
+// perpendicular distance d, with t = max(0, 1 - d / (2 · width)), the band is t (Linear),
+// smoothstep(t) (Smooth) or t² (Sharp); `width` 100 lights a 400 px wide triangle. The sweep
+// adds band · Sweep Intensity of the light colour. Edges are lit as a bevel facing along the
+// band's line (`light`, up the line): with S the alpha box-blurred over ±Edge Thickness
+// (outside the layer transparent), the edge light is 2 · Edge Intensity · max(0, α − S(p +
+// thickness · light)) times the band, so an edge facing the light glows over 2 × thickness px
+// inside the shape, one along it over thickness px and one facing away stays dark. Light
+// Reception: Add adds the light inside the layer's alpha, Composite lays it over the layer
+// (p · (1 − L) + light · L), Cutout keeps only the light.
+
+/// The CC Light Sweep band at perpendicular distance `d` (`half` = 2 · width, in pixels).
+fn light_sweep_band(shape: u32, d: f64, half: f64) -> f32 {
+    let t = (1.0 - d / half.max(1e-6)).clamp(0.0, 1.0) as f32;
+    match shape {
+        0 => t,
+        2 => t * t,
+        _ => t * t * (3.0 - 2.0 * t),
+    }
+}
+
+/// Where CC Light Sweep's band and edge light fall in a buffer (`offset`, `scale` as in
+/// [`Buf`]): the band's distance at buffer pixel centre (x, y) is |ax · x + ay · y + k|, in the
+/// units of `half`; the edge plane blurs ±(`rx`, `ry`) px and is sampled `shift` px away. On a
+/// Continuously Rasterize layer ([`crate::EffectEnv::comp_space`]) these are measured in comp
+/// space, as After Effects renders it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SweepGeometry {
+    pub ax: f64,
+    pub ay: f64,
+    pub k: f64,
+    pub half: f64,
+    pub shift: (f64, f64),
+    pub rx: usize,
+    pub ry: usize,
+    /// Edge light is drawn (thickness and intensity non-zero).
+    pub edges: bool,
+}
+
+impl SweepGeometry {
+    /// Padding (px) that keeps the shifted edge-plane samples inside the padded plane.
+    pub fn pad(&self) -> usize {
+        if !self.edges {
+            return 0;
+        }
+        self.rx.max(self.ry) + self.shift.0.abs().max(self.shift.1.abs()).ceil().min(4096.0) as usize + 2
+    }
+}
+
+pub fn light_sweep_geometry(ctx: &EffectCtx, offset: [f64; 2], scale: f64) -> SweepGeometry {
+    let pr = ctx.params;
+    let dir = pr.f("direction").to_radians();
+    let (nx, ny) = (dir.cos(), dir.sin());
+    // The edge light's direction: up the band's line.
+    let (lx, ly) = (dir.sin(), -dir.cos());
+    let width = pr.f("width");
+    let thick = pr.f("edgeThickness").clamp(0.0, 1000.0);
+    let edges = thick * scale > 0.05 && pr.f("edgeIntensity") != 0.0;
+    let c = pr.v2("center");
+    let scale = if scale.is_finite() && scale > 1e-9 { scale } else { 1.0 };
+    let radius = |r: f64| if r.is_finite() { r.round().clamp(0.0, 4096.0) as usize } else { 0 };
+    let m = ctx.env.comp_space.filter(|m| {
+        let det = m[0][0] * m[1][1] - m[0][1] * m[1][0];
+        det.is_finite() && det.abs() > 1e-12 && m.iter().flatten().all(|v| v.is_finite())
+    });
+    if let Some(m) = m {
+        // Buffer px → effect coordinates p = (px − offset) / scale → comp = M p + t.
+        let (ax, ay) = ((nx * m[0][0] + ny * m[1][0]) / scale, (nx * m[0][1] + ny * m[1][1]) / scale);
+        let k = nx * (m[0][2] - c[0]) + ny * (m[1][2] - c[1]) - ax * offset[0] - ay * offset[1];
+        let det = m[0][0] * m[1][1] - m[0][1] * m[1][0];
+        let inv = [[m[1][1] / det, -m[0][1] / det], [-m[1][0] / det, m[0][0] / det]];
+        let shift = ((inv[0][0] * lx + inv[0][1] * ly) * thick * scale, (inv[1][0] * lx + inv[1][1] * ly) * thick * scale);
+        let rx = radius(thick * scale * inv[0][0].hypot(inv[0][1]));
+        let ry = radius(thick * scale * inv[1][0].hypot(inv[1][1]));
+        return SweepGeometry { ax, ay, k, half: (width * 2.0).max(0.5), shift, rx, ry, edges };
+    }
+    let (cx, cy) = (c[0] * scale + offset[0], c[1] * scale + offset[1]);
+    let t = thick * scale;
+    SweepGeometry {
+        ax: nx,
+        ay: ny,
+        k: -(nx * cx + ny * cy),
+        half: (width * scale * 2.0).max(0.5),
+        shift: (lx * t, ly * t),
+        rx: radius(t),
+        ry: radius(t),
+        edges,
+    }
+}
+
+/// The CC Light Sweep edge plane: alpha box-blurred over ±(`rx`, `ry`) px, padded by `pad` px
+/// of transparency on every side (sampled at pixel + `pad`).
+fn sweep_edge_plane(alpha: &Plane, rx: usize, ry: usize, pad: usize) -> Plane {
+    let (w, h) = (alpha.w + 2 * pad, alpha.h + 2 * pad);
+    let mut p = Plane::new(w, h);
+    for y in 0..alpha.h {
+        let (Some(src), Some(dst)) = (alpha.data.get(y * alpha.w..(y + 1) * alpha.w), p.data.get_mut((y + pad) * w + pad..(y + pad) * w + pad + alpha.w))
+        else {
+            continue;
+        };
+        dst.copy_from_slice(src);
+    }
+    box_plane(&p, rx, ry)
+}
 
 fn light_sweep(ctx: &EffectCtx, mut b: Buf) -> Buf {
-    let c = b.to_px(ctx.params.v2("center"));
-    let dir = ctx.params.f("direction").to_radians();
+    let g = light_sweep_geometry(ctx, b.offset, b.scale);
     let shape = ctx.params.e("shape");
-    let half = (ctx.params.f("width") * b.scale * 0.5).max(0.5);
     let sweep = (ctx.params.f("sweepIntensity") / 100.0) as f32;
-    let edge_i = (ctx.params.f("edgeIntensity") / 100.0) as f32;
-    let edge_t = ctx.params.f("edgeThickness") * b.scale;
+    let edge_i = (ctx.params.f("edgeIntensity") / 100.0 * 2.0) as f32;
     let lc = ctx.params.color("lightColor");
     let mode = ctx.params.e("lightReceptionMode");
-    let (nx, ny) = (dir.cos(), dir.sin());
-    let alpha = Plane::alpha(&b.img);
-    let soft_a = if edge_t > 0.05 { gauss_plane(&alpha, edge_t * 0.5, edge_t * 0.5) } else { alpha };
+    let pad = g.pad();
+    let soft = if g.edges { sweep_edge_plane(&Plane::alpha(&b.img), g.rx, g.ry, pad) } else { Plane::default() };
     map_xy(&mut b.img, |x, y, px| {
-        let d = ((x as f64 + 0.5 - c.0) * nx + (y as f64 + 0.5 - c.1) * ny).abs();
-        let band = match shape {
-            0 => (1.0 - d / half).max(0.0) as f32,
-            2 => (half - d + 0.5).clamp(0.0, 1.0) as f32,
-            _ => smoothstep(half as f32, 0.0, d as f32),
-        };
+        let (fx, fy) = (x as f64 + 0.5, y as f64 + 0.5);
+        let band = light_sweep_band(shape, (g.ax * fx + g.ay * fy + g.k).abs(), g.half);
         if band <= 0.0 {
             return if mode == 2 { [0.0; 4] } else { px };
         }
-        let (xi, yi) = (x as i64, y as i64);
-        let gx = soft_a.get_clamped(xi + 1, yi) - soft_a.get_clamped(xi - 1, yi);
-        let gy = soft_a.get_clamped(xi, yi + 1) - soft_a.get_clamped(xi, yi - 1);
-        let edge = ((gx * gx + gy * gy).sqrt() * 2.0).min(1.0);
-        let light = band * sweep + band * edge * edge_i;
         let a = px[3];
+        let edge = if g.edges { (a - soft.sample(fx + pad as f64 + g.shift.0, fy + pad as f64 + g.shift.1)).max(0.0) } else { 0.0 };
+        let light = band * (sweep + edge * edge_i);
         match mode {
             1 => {
-                let la = (band * sweep).min(1.0);
-                [px[0] + lc[0] * light, px[1] + lc[1] * light, px[2] + lc[2] * light, (a + la * (1.0 - a)).min(1.0)]
+                let l = light.clamp(0.0, 1.0);
+                let k = 1.0 - l;
+                [px[0] * k + lc[0] * l * a, px[1] * k + lc[1] * l * a, px[2] * k + lc[2] * l * a, a]
             }
             2 => {
-                let la = (light * a).min(1.0);
+                let la = (light * a).clamp(0.0, 1.0);
                 [lc[0] * la, lc[1] * la, lc[2] * la, la]
             }
             _ => [px[0] + lc[0] * light * a, px[1] + lc[1] * light * a, px[2] + lc[2] * light * a, a],
@@ -1244,6 +1355,111 @@ mod tests {
         crate::apply(s, &ctx, Buf { img, offset: [0.0, 0.0], scale: 1.0 })
     }
 
+    /// A black opaque card (x 20..180, y 20..80) on a transparent 200 × 100 layer.
+    fn card() -> Image {
+        let mut img = Image::new(200, 100);
+        for y in 20..80 {
+            for x in 20..180 {
+                img.set(x, y, [0.0, 0.0, 0.0, 1.0]);
+            }
+        }
+        img
+    }
+
+    #[test]
+    fn light_sweep_band_matches_after_effects() {
+        // Measured: Width 100 lights a triangle 200 px either side of the line (Linear); Sharp
+        // squares it, Smooth smoothsteps it.
+        let set = |shape: u32| {
+            vec![
+                ("center", Value::Vec2([100.5, 50.0])),
+                ("direction", num(0.0)),
+                ("shape", Value::Enum(shape)),
+                ("width", num(10.0)),
+                ("sweepIntensity", num(100.0)),
+                ("edgeIntensity", num(0.0)),
+            ]
+        };
+        let lin = run("ec.generate.cclightsweep", &set(0), card());
+        assert!((lin.img.get(100, 50)[0] - 1.0).abs() < 0.03);
+        assert!((lin.img.get(110, 50)[0] - 0.5).abs() < 0.03, "{:?}", lin.img.get(110, 50));
+        assert!(lin.img.get(121, 50)[0] < 1e-3);
+        let sharp = run("ec.generate.cclightsweep", &set(2), card());
+        assert!((sharp.img.get(110, 50)[0] - 0.25).abs() < 0.03);
+        let smooth = run("ec.generate.cclightsweep", &set(1), card());
+        assert!((smooth.img.get(110, 50)[0] - 0.5).abs() < 0.03);
+        assert!(smooth.img.get(105, 50)[0] > 0.8);
+        // Add: nothing outside the layer's alpha.
+        assert_eq!(lin.img.get(100, 10), [0.0; 4]);
+    }
+
+    #[test]
+    fn light_sweep_lights_edges_facing_up_the_line() {
+        // Direction 0 (a vertical line): the top edge faces the light, the sides run along it,
+        // the bottom faces away (After Effects: 2 × thickness, thickness and 0 px of light).
+        let o = run(
+            "ec.generate.cclightsweep",
+            &[
+                ("center", Value::Vec2([100.0, 50.0])),
+                ("direction", num(0.0)),
+                ("shape", Value::Enum(0)),
+                ("width", num(1000.0)),
+                ("sweepIntensity", num(0.0)),
+                ("edgeIntensity", num(100.0)),
+                ("edgeThickness", num(4.0)),
+            ],
+            card(),
+        );
+        let v = |x: i64, y: i64| o.img.get(x, y)[0];
+        assert!(v(100, 20) > 0.9 && v(100, 25) > 0.3 && v(100, 29) < 0.05, "top {} {} {}", v(100, 20), v(100, 25), v(100, 29));
+        assert!(v(20, 50) > 0.6 && v(22, 50) > 0.2 && v(25, 50) < 0.05, "side {} {} {}", v(20, 50), v(22, 50), v(25, 50));
+        assert!(v(179, 50) > 0.6 && v(175, 50) < 0.05);
+        assert!(v(100, 79) < 1e-3 && v(100, 50) < 1e-3);
+        assert!(v(100, 15) < 1e-6, "no light outside the shape");
+        // Direction 90: the right edge faces the light, the left one away.
+        let o = run(
+            "ec.generate.cclightsweep",
+            &[
+                ("center", Value::Vec2([100.0, 50.0])),
+                ("direction", num(90.0)),
+                ("shape", Value::Enum(0)),
+                ("width", num(1000.0)),
+                ("sweepIntensity", num(0.0)),
+                ("edgeIntensity", num(100.0)),
+                ("edgeThickness", num(4.0)),
+            ],
+            card(),
+        );
+        assert!(o.img.get(179, 50)[0] > 0.9 && o.img.get(20, 50)[0] < 1e-3);
+    }
+
+    #[test]
+    fn light_sweep_reception_modes() {
+        let mut img = card();
+        for y in 20..80 {
+            for x in 20..180 {
+                img.set(x, y, [0.5, 0.5, 0.5, 1.0]);
+            }
+        }
+        let set = |mode: u32| {
+            vec![
+                ("center", Value::Vec2([100.0, 50.0])),
+                ("direction", num(0.0)),
+                ("shape", Value::Enum(0)),
+                ("width", num(10.0)),
+                ("sweepIntensity", num(50.0)),
+                ("edgeIntensity", num(0.0)),
+                ("lightReceptionMode", Value::Enum(mode)),
+            ]
+        };
+        let add = run("ec.generate.cclightsweep", &set(0), img.clone());
+        assert!((add.img.get(100, 50)[0] - 1.0).abs() < 0.03);
+        let comp = run("ec.generate.cclightsweep", &set(1), img.clone());
+        assert!((comp.img.get(100, 50)[0] - 0.75).abs() < 0.03, "{:?}", comp.img.get(100, 50));
+        let cut = run("ec.generate.cclightsweep", &set(2), img);
+        assert!((cut.img.get(100, 50)[0] - 0.5).abs() < 0.03 && cut.img.get(60, 50)[3] < 1e-6);
+    }
+
     #[test]
     fn cell_pattern_is_deterministic_and_seeded() {
         let a = run("ec.generate.cellpattern", &[("size", num(10.0))], Image::new(40, 30));
@@ -1297,9 +1513,17 @@ mod tests {
         }
     }
 
+    /// Test time for a wave of the given age: the second wave (born at 1 / Frequency +
+    /// RW_BIRTH_PHASE) whose stroke centre (half width `hw` inside the outer edge) is
+    /// Expansion × `age` from the producer.
+    fn rw_time(age: f64, freq: f64, expansion: f64, hw: f64) -> f64 {
+        1.0 / freq + RW_BIRTH_PHASE + age + hw / expansion
+    }
+
     #[test]
     fn radio_waves_expansion_velocity_and_star() {
-        let r = |set: &[(&str, Value)], t: f64| {
+        let r = |set: &[(&str, Value)], age: f64| {
+            let t = rw_time(age, 0.5, 100.0, 2.5);
             let s = crate::find("ec.generate.radiowaves").unwrap();
             let mut params = Params { values: s.params.iter().map(|p| (p.id.to_string(), p.default.clone())).collect() };
             params.values.insert("producerPoint".into(), Value::Vec2([32.0, 32.0]));
@@ -1309,10 +1533,30 @@ mod tests {
             let ctx = EffectCtx { params: &params, time: t, layer_size: [64.0, 64.0], seed: 3, adjustment: false, env: Default::default() };
             crate::apply(s, &ctx, Buf { img: Image::new(64, 64), offset: [0.0, 0.0], scale: 1.0 })
         };
-        // One wave born at t = 0, 0.2 s old: radius = Expansion × age = 20 px.
+        // Measured on AE: at time 0 a 1/s, 30 px/s wave train already runs; the newest wave,
+        // born at -0.3 s, has its outer edge 9 px out (stroke 5 px inside it).
+        let s0 = crate::find("ec.generate.radiowaves").unwrap();
+        let mut p0 = Params { values: s0.params.iter().map(|p| (p.id.to_string(), p.default.clone())).collect() };
+        p0.values.insert("producerPoint".into(), Value::Vec2([32.0, 32.0]));
+        p0.values.insert("waveMotion/expansion".into(), num(30.0));
+        p0.values.insert("waveMotion/lifespan".into(), num(20.0));
+        let c0 = EffectCtx { params: &p0, time: 0.0, layer_size: [64.0, 64.0], seed: 3, adjustment: false, env: Default::default() };
+        let o0 = crate::apply(s0, &c0, Buf { img: Image::new(64, 64), offset: [0.0, 0.0], scale: 1.0 });
+        let row: Vec<bool> = (32..64).map(|x| o0.img.get(x, 32)[3] > 0.5).collect();
+        assert_eq!(row.iter().position(|v| *v), Some(4), "{row:?}");
+        assert!(row[8] && !row[10], "5 px stroke inside the edge: {row:?}");
+        // One wave 0.2 s old: radius = Expansion × age = 20 px.
         let base = [("waveMotion/expansion", num(100.0)), ("waveMotion/frequency", num(0.5))];
         let o = r(&base, 0.2);
         assert!(o.img.get(52, 32)[3] > 0.9, "{:?}", o.img.get(52, 32));
+        // The waves replace the layer: no original pixels around them (SceneYard UI Google
+        // search carries Radio Waves on a grey solid in Overlay mode).
+        let s = crate::find("ec.generate.radiowaves").unwrap();
+        let mut params = Params { values: s.params.iter().map(|p| (p.id.to_string(), p.default.clone())).collect() };
+        params.values.insert("producerPoint".into(), Value::Vec2([32.0, 32.0]));
+        let ctx = EffectCtx { params: &params, time: 0.2, layer_size: [64.0, 64.0], seed: 3, adjustment: false, env: Default::default() };
+        let grey = crate::apply(s, &ctx, Buf { img: Image::filled(64, 64, [0.5, 0.5, 0.5, 1.0]), offset: [0.0, 0.0], scale: 1.0 });
+        assert_eq!(grey.img.get(2, 2), [0.0; 4]);
         assert!(o.img.get(32, 32)[3] < 0.01);
         // Velocity moves the wave toward Direction (90° = right).
         let mut moving = base.to_vec();
@@ -1409,10 +1653,12 @@ mod tests {
         assert!(c > 0.5);
     }
 
-    fn rw(set: &[(&str, Value)], t: f64, env: crate::EffectEnv) -> Image {
+    fn rw(set: &[(&str, Value)], age: f64, env: crate::EffectEnv) -> Image {
         let mut v: Vec<(&str, Value)> =
             vec![("producerPoint", Value::Vec2([32.0, 32.0])), ("waveMotion/frequency", num(0.5)), ("waveMotion/expansion", num(100.0))];
         v.extend_from_slice(set);
+        let get = |k: &str, d: f64| v.iter().rev().find(|(id, _)| *id == k).map_or(d, |(_, x)| x.as_f64());
+        let t = rw_time(age, get("waveMotion/frequency", 0.5), get("waveMotion/expansion", 100.0), get("waveStroke/startWidth", 5.0) * 0.5);
         crate::run_fx("ec.generate.radiowaves", &v, Image::new(64, 64), t, env).img
     }
 
@@ -1461,7 +1707,7 @@ mod tests {
                 p.values.insert("producerPoint".into(), Value::Vec2([32.0, 32.0]));
                 p.values.insert("waveMotion/frequency".into(), num(1.0));
                 p.values.insert("waveMotion/expansion".into(), num(20.0));
-                p.values.insert("waveStroke/color".into(), if t < 0.5 { col(1.0, 0.0, 0.0) } else { col(0.0, 1.0, 0.0) });
+                p.values.insert("waveStroke/color".into(), if t < 1.0 { col(1.0, 0.0, 0.0) } else { col(0.0, 1.0, 0.0) });
                 Some(p)
             }
         }

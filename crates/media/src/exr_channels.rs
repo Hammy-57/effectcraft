@@ -94,6 +94,46 @@ pub fn read_exr_channels(bytes: &[u8]) -> Option<AuxChannels> {
     Some(aux)
 }
 
+/// The picture of a multi-layer OpenEXR file without an unnamed RGB layer (Blender's
+/// `ViewLayer.Combined.R`, Nuke's `beauty.R`, …), which the image decoder rejects: its colour
+/// layer (preferring one named combined, beauty or rgba), else its first channel as grey.
+/// Linear, straight RGBA as the file stores it. `None` when it is not a readable EXR.
+pub fn layered_image(bytes: &[u8]) -> Option<image::DynamicImage> {
+    let aux = read_exr_channels(bytes)?;
+    let layers = aux.layers();
+    // Colour layers: three different channels (not one channel, such as depth, shown in all).
+    let rgb: Vec<&str> = layers
+        .iter()
+        .copied()
+        .filter(|l| {
+            let [r, g, b, _] = aux.layer_rgba(l);
+            !r.is_empty() && !g.is_empty() && !b.is_empty() && r != g
+        })
+        .collect();
+    let colour = rgb
+        .iter()
+        .find(|l| ["combined", "beauty", "rgba"].iter().any(|k| l.to_ascii_lowercase().contains(k)))
+        .or_else(|| rgb.first())
+        .or_else(|| layers.first())?;
+    let names = aux.layer_rgba(colour);
+    let first = aux.channels.first().map(|(n, _)| n.as_str()).unwrap_or_default();
+    let plane = |k: usize| -> Option<&[f32]> { aux.get(names.get(k).map(String::as_str).filter(|n| !n.is_empty()).unwrap_or(first)) };
+    let (r, g, b) = (plane(0)?, plane(1)?, plane(2)?);
+    let a = names.get(3).filter(|n| !n.is_empty()).and_then(|n| aux.get(n));
+    let n = (aux.width as usize).checked_mul(aux.height as usize)?;
+    let mut data = Vec::with_capacity(n.checked_mul(4)?);
+    for i in 0..n {
+        data.extend([r.get(i)?, g.get(i)?, b.get(i)?].map(|v| *v));
+        if let Some(a) = a {
+            data.push(*a.get(i)?);
+        }
+    }
+    match a {
+        Some(_) => image::Rgba32FImage::from_raw(aux.width, aux.height, data).map(image::DynamicImage::ImageRgba32F),
+        None => image::Rgb32FImage::from_raw(aux.width, aux.height, data).map(image::DynamicImage::ImageRgb32F),
+    }
+}
+
 type Cache = Mutex<Vec<(String, Option<Arc<AuxChannels>>)>>;
 
 /// Read (and cache, a few files) the channels of the EXR at `path` via `read`.
@@ -148,5 +188,29 @@ mod tests {
         assert_eq!(aux.object_id().unwrap(), id.as_slice());
         assert_eq!(aux.manifests, vec![("CryptoObject".to_string(), vec![("bunny".to_string(), 0x1385_1a76), ("floor".to_string(), 0x0a1b_2c3d)])]);
         assert!(read_exr_channels(b"not an exr").is_none());
+    }
+
+    /// #295: a multi-layer EXR whose colour is only in named layers (`diffuse.R`, as Blender and
+    /// Nuke write them) failed to import ("does not contain non-deep rgb channels"); it now
+    /// shows its colour layer and keeps every channel for EXtractoR.
+    #[test]
+    fn layered_exr_without_an_unnamed_rgb_layer_imports() {
+        use exr::prelude::*;
+        let (w, h) = (4usize, 2usize);
+        let ch = |n: &str, v: f32| AnyChannel::new(n, FlatSamples::F32(vec![v; w * h]));
+        let channels = AnyChannels::sort(vec![ch("diffuse.R", 1.0), ch("diffuse.G", 0.2), ch("diffuse.B", 0.0), ch("depth.Z", 7.0)].into());
+        let image = Image::from_layer(Layer::new((w, h), LayerAttributes::default(), Encoding::FAST_LOSSLESS, channels));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image.write().to_buffered(&mut bytes).unwrap();
+        let b: Arc<[u8]> = bytes.into_inner().into();
+        let f = crate::probe_bytes("/layers.exr", b.clone()).unwrap();
+        assert_eq!((f.width, f.height, f.alpha), (4, 2, effectcraft_project::AlphaMode::Ignore));
+        let pool = crate::MediaPool::new();
+        pool.add_bytes("/layers.exr", b.clone());
+        let px = pool.frame_at(&f, effectcraft_time::Tick::ZERO).unwrap().get(1, 1);
+        assert!((px[0] - 1.0).abs() < 1e-4 && px[1] > 0.3 && px[1] < 0.6 && px[2] < 1e-4 && px[3] == 1.0, "diffuse, sRGB-encoded: {px:?}");
+        let aux = read_exr_channels(&b).unwrap();
+        assert_eq!(aux.layers(), ["depth", "diffuse"]);
+        assert_eq!(aux.layer_rgba("diffuse"), ["diffuse.R", "diffuse.G", "diffuse.B", ""].map(String::from));
     }
 }
