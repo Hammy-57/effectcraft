@@ -280,6 +280,97 @@ fn toolbar_fill_and_stroke_paint_selected_shape_layers() {
     let _ = s.render(cid, s.time(), Default::default());
 }
 
+/// The toolbar's Fill / Stroke kinds (Option-click on the swatch, Fill Options) change the
+/// selected shape layers, as in After Effects: None switches the fill off (it stays, its eye
+/// off, and the shape renders without it), Solid Color switches it back on, a gradient converts it
+/// to a Gradient Fill (and back), each in one undo step; blend mode and opacity apply too.
+#[test]
+fn toolbar_fill_stroke_kinds_apply_to_selected_shape_layers() {
+    use effectcraft_keyframe::Value as KV;
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"width": 400, "height": 300, "duration": 2})).unwrap();
+    let sh = s.execute("layer.newShape", json!({"kind": "rect", "fill": "#ff0000"})).unwrap()["layer"].as_u64().unwrap();
+    let cid = s.active_comp_id().unwrap();
+    let items = |s: &Session| {
+        let l = s.active_comp().unwrap().layer(effectcraft_project::LayerId(sh)).unwrap();
+        l.props.group("contents/group").unwrap().sub("contents").unwrap().groups().cloned().collect::<Vec<_>>()
+    };
+    let item = |s: &Session, m: &str| items(s).into_iter().find(|g| g.match_id == m);
+    let centre = |s: &Session| s.render(cid, s.time(), Default::default()).get(200, 150);
+    let fs = |s: &mut Session, v: serde_json::Value| s.execute("shape.fillStroke", v).unwrap();
+    let red = |p: [f32; 4]| p[3] > 0.99 && p[0] > 0.9 && p[1] < 0.1 && p[2] < 0.1;
+    assert!(red(centre(&s)), "{:?}", centre(&s));
+    let opacity_uid = item(&s, "fill").unwrap().get("opacity").unwrap().uid;
+
+    // None: the Fill is kept, switched off, and no longer paints.
+    let r = fs(&mut s, json!({"fillType": "none"}));
+    assert_eq!(r["fillType"], "none", "{r}");
+    let f = item(&s, "fill").expect("the fill is kept");
+    assert!(!f.enabled);
+    assert!(centre(&s)[3] < 0.01, "{:?}", centre(&s));
+    // One undo step brings it back; redo hides it again.
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(item(&s, "fill").unwrap().enabled && red(centre(&s)));
+    s.execute("edit.redo", json!({})).unwrap();
+    assert!(!item(&s, "fill").unwrap().enabled && centre(&s)[3] < 0.01);
+    // Solid Color switches it back on, colour unchanged.
+    let r = fs(&mut s, json!({"fillType": "solid"}));
+    assert_eq!(r["fillType"], "solid", "{r}");
+    assert!(item(&s, "fill").unwrap().enabled && red(centre(&s)), "{:?}", centre(&s));
+    // `fill: false` is None too.
+    fs(&mut s, json!({"fill": false}));
+    assert!(!item(&s, "fill").unwrap().enabled);
+    fs(&mut s, json!({"fillType": "solid"}));
+
+    // Linear Gradient converts the Fill into a Gradient Fill in its place, keeping its shared
+    // properties; Radial changes its type; Solid Color converts it back.
+    let r = fs(&mut s, json!({"fillType": "linear"}));
+    assert_eq!(r["fillType"], "linear", "{r}");
+    let order: Vec<String> = items(&s).iter().map(|g| g.match_id.clone()).filter(|m| m != "transform").collect();
+    assert_eq!(order, ["rect", "gfill"]);
+    assert!(item(&s, "fill").is_none());
+    let g = item(&s, "gfill").unwrap();
+    assert_eq!(g.name, "Gradient Fill 1");
+    assert_eq!(g.get("opacity").unwrap().uid, opacity_uid);
+    assert_eq!(g.get("type").unwrap().value, KV::Enum(0));
+    let px = centre(&s);
+    assert!(px[3] > 0.99 && (px[0] - px[1]).abs() < 0.05 && (px[1] - px[2]).abs() < 0.05 && px[0] > 0.05 && px[0] < 0.95, "grey mid-gradient: {px:?}");
+    assert_eq!(fs(&mut s, json!({"fillType": "radial"}))["fillType"], "radial");
+    assert_eq!(item(&s, "gfill").unwrap().get("type").unwrap().value, KV::Enum(1));
+    let r = fs(&mut s, json!({"fillType": "solid", "fill": "#ff0000"}));
+    assert_eq!(r["fillType"], "solid", "{r}");
+    assert!(item(&s, "gfill").is_none() && item(&s, "fill").is_some_and(|f| f.name == "Fill 1"));
+    assert!(red(centre(&s)), "{:?}", centre(&s));
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(item(&s, "gfill").is_some() && item(&s, "fill").is_none(), "one undo step");
+    s.execute("edit.redo", json!({})).unwrap();
+
+    // Fill Options' blend mode and opacity.
+    fs(&mut s, json!({"fillBlend": "multiply", "fillOpacity": 40}));
+    let f = item(&s, "fill").unwrap();
+    let multiply = effectcraft_color::BlendMode::ALL.iter().position(|m| *m == effectcraft_color::BlendMode::Multiply).unwrap() as u32;
+    assert_eq!((f.get("blend").unwrap().value.clone(), f.get("opacity").unwrap().value.as_f64()), (KV::Enum(multiply), 40.0));
+
+    // Stroke kinds: a gradient gives the stroke-less path a Gradient Stroke (before the fill);
+    // None switches it off.
+    let r = fs(&mut s, json!({"strokeType": "radial"}));
+    assert_eq!(r["strokeType"], "radial", "{r}");
+    let order: Vec<String> = items(&s).iter().map(|g| g.match_id.clone()).filter(|m| m != "transform").collect();
+    assert_eq!(order, ["rect", "gstroke", "fill"]);
+    assert_eq!(fs(&mut s, json!({"strokeType": "none"}))["strokeType"], "none");
+    assert!(!item(&s, "gstroke").unwrap().enabled);
+    assert_eq!(fs(&mut s, json!({"strokeType": "solid"}))["strokeType"], "solid");
+    assert!(item(&s, "stroke").is_some_and(|g| g.enabled && g.name == "Stroke 1") && item(&s, "gstroke").is_none());
+
+    // A shape drawn with no fill gets one from a fill kind.
+    let none = s.execute("layer.newShape", json!({"kind": "ellipse", "fill": false})).unwrap()["layer"].as_u64().unwrap();
+    let r = s.execute("shape.fillStroke", json!({"layers": [none], "fillType": "solid", "fill": "#00ff00"})).unwrap();
+    assert_eq!((r["fillType"].as_str(), r["fill"][1].as_f64()), (Some("solid"), Some(1.0)), "{r}");
+    // The query still only reports.
+    assert_eq!(s.execute("shape.fillStroke", json!({"layers": [none]})).unwrap()["fillType"], "solid");
+    assert!(s.execute("shape.fillStroke", json!({"fillType": "plaid"})).is_err());
+}
+
 /// Selecting a mask in the Timeline (its row or its Mask Path) selects all of its points, so the
 /// viewer drags the whole mask (#203); a shape's Path item works the same way.
 #[test]
