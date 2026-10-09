@@ -77,7 +77,7 @@ pub use color_fx::{
 };
 pub use color2::{Curve, auto_correct_settings, color_link_mode, color_link_sample, equalize_tables, luma_clip_points, shadow_highlight_amounts};
 pub use color3::OffsetCurve;
-pub use distort::{BULGE_STRENGTH, transform_effect_matrix, transform_extent, transform_shutter};
+pub use distort::{BULGE_STRENGTH, transform_effect_matrix, transform_extent, transform_shutter, twirl_radius, wave_warp_cycles};
 pub use distort2::{MAGNIFY_MODES, bezier_grid, parse_mesh};
 pub use distort3::{RESHAPE_POINTS, ReshapeSetup, SmearSetup, reshape_setup, smear_setup, warp_inverse_map};
 pub use distort4::liquify_mesh;
@@ -85,6 +85,7 @@ use effectcraft_keyframe::Value;
 use effectcraft_project::build::Ids;
 use effectcraft_project::{GroupKind, ParamUi, PropGroup, Property};
 pub use effectcraft_raster::{AuxChannels, Image};
+pub use generate::four_color_softening;
 pub use misc::{INVERT_ALPHA, INVERT_CHANNELS, glow_ab_t, glow_operation};
 pub use sim::particle_state;
 pub use sim3::{PgBlit, PgPlan, playground_plan, playground_state};
