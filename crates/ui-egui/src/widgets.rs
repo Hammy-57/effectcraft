@@ -2,6 +2,7 @@
 
 use egui::{Align2, Color32, Rect, Response, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
 
+use crate::automation::Registry;
 use crate::icons::{self, Icon};
 use crate::theme::Tokens;
 
@@ -148,15 +149,15 @@ pub fn twirl(ui: &mut Ui, rect: Rect, open: bool, id: egui::Id, t: &Tokens) -> R
     resp
 }
 
-/// A flat icon toggle inside a rect.
-pub fn icon_toggle(ui: &mut Ui, rect: Rect, icon: Icon, on: bool, t: &Tokens, id: egui::Id, on_color: Option<Color32>) -> Response {
-    let resp = ui.interact(rect, id, Sense::click());
+/// A flat icon toggle inside a rect (`sense`: click, or click and drag for a switch dragged
+/// over several rows).
+pub fn icon_toggle(ui: &mut Ui, rect: Rect, icon: Icon, on: bool, t: &Tokens, id: egui::Id, sense: Sense) -> Response {
+    let resp = ui.interact(rect, id, sense);
     if resp.hovered() {
         ui.painter().rect_filled(rect, 2.0, t.hover);
     }
-    let col = if on { on_color.unwrap_or(t.icon) } else { t.text_faint.gamma_multiply(0.7) };
     if on || resp.hovered() {
-        icons::paint(ui.painter(), rect.shrink(rect.width() * 0.18), icon, if !on { t.text_faint } else { col });
+        icons::paint(ui.painter(), rect.shrink(rect.width() * 0.18), icon, if on { t.icon } else { t.text_faint });
     }
     resp
 }
@@ -193,11 +194,22 @@ pub fn text_fit(p: &egui::Painter, pos: egui::Pos2, align: Align2, text: &str, f
 
 /// Rounded search field with a magnifier icon.
 pub fn search_field(ui: &mut Ui, rect: Rect, text: &mut String, hint: &str, t: &Tokens) -> Response {
+    field(ui, rect, text, hint, t, true)
+}
+
+/// Rounded text field.
+pub fn text_field(ui: &mut Ui, rect: Rect, text: &mut String, hint: &str, t: &Tokens) -> Response {
+    field(ui, rect, text, hint, t, false)
+}
+
+fn field(ui: &mut Ui, rect: Rect, text: &mut String, hint: &str, t: &Tokens, search: bool) -> Response {
     let h = rect.height();
     ui.painter().rect_filled(rect, h / 2.0, t.field_bg);
     ui.painter().rect_stroke(rect, h / 2.0, Stroke::new(1.0, t.field_border), StrokeKind::Inside);
-    icons::paint(ui.painter(), Rect::from_center_size(pos2(rect.min.x + 12.0, rect.center().y), vec2(12.0, 12.0)), Icon::Search, t.text_dim);
-    let inner = Rect::from_min_max(pos2(rect.min.x + 22.0, rect.min.y + 1.0), pos2(rect.max.x - 8.0, rect.max.y - 1.0));
+    if search {
+        icons::paint(ui.painter(), Rect::from_center_size(pos2(rect.min.x + 12.0, rect.center().y), vec2(12.0, 12.0)), Icon::Search, t.text_dim);
+    }
+    let inner = Rect::from_min_max(pos2(rect.min.x + if search { 22.0 } else { 9.0 }, rect.min.y + 1.0), pos2(rect.max.x - 8.0, rect.max.y - 1.0));
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(inner));
     child.add(
         egui::TextEdit::singleline(text)
@@ -266,6 +278,79 @@ pub fn checkbox(ui: &mut Ui, rect: Rect, on: bool, t: &Tokens, id: egui::Id) -> 
     resp
 }
 
+/// A scroll bar along `track` (vertical when it is taller than wide) for content scrolled
+/// `scroll` of `max`, registered for automation as `key` ("scroll/max"): drag the thumb, or
+/// press the track beside it to centre the thumb there. The thumb's length is the share in view
+/// (the view is about as long as its track), at least 16 points but never longer than the track
+/// (a panel only a few points tall still draws, #231). Returns the new scroll.
+pub fn scroll_bar(ui: &mut Ui, auto: &mut Registry, key: &str, track: Rect, scroll: f32, max: f32, t: &Tokens) -> f32 {
+    if !track.is_positive() {
+        // (A panel too short for its bar.)
+        return scroll.clamp(0.0, max.max(0.0));
+    }
+    let vertical = track.height() >= track.width();
+    let a = usize::from(vertical);
+    let len = track.size()[a];
+    let thumb_len = (len * len / (len + max.max(0.0)).max(1.0)).max(16.0).min(len).max(0.0);
+    let travel = (len - thumb_len).max(1.0);
+    let thumb_at = |s: f32| track.min[a] + (len - thumb_len) * if max > 0.0 { (s / max).clamp(0.0, 1.0) } else { 0.0 };
+    let resp = ui.interact(track.expand2(if vertical { vec2(3.0, 0.0) } else { vec2(0.0, 3.0) }), egui::Id::new(key), Sense::drag());
+    let pressed = resp.is_pointer_button_down_on() && ui.input(|i| i.pointer.any_pressed());
+    let mut s = scroll;
+    if let Some(p) = resp.interact_pointer_pos().filter(|p| pressed && !(thumb_at(scroll)..=thumb_at(scroll) + thumb_len).contains(&p[a])) {
+        s = (p[a] - thumb_len / 2.0 - track.min[a]) * max / travel;
+    } else if resp.dragged() {
+        s += resp.drag_delta()[a] * max / travel;
+    }
+    let s = s.clamp(0.0, max.max(0.0));
+    let thumb = if vertical {
+        Rect::from_min_size(pos2(track.min.x, thumb_at(s)), vec2(track.width(), thumb_len))
+    } else {
+        Rect::from_min_size(pos2(thumb_at(s), track.min.y), vec2(thumb_len, track.height()))
+    };
+    ui.painter().rect_filled(track, 2.0, t.field_bg);
+    ui.painter().rect_filled(thumb, 2.0, if resp.hovered() || resp.dragged() { t.text_dim } else { t.text_faint });
+    auto.add(key, track, &format!("{s}/{max}"));
+    if s != scroll {
+        ui.ctx().request_repaint();
+    }
+    s
+}
+
+/// Vertical scrolling for a panel that lays out its own rows: [`PanelScroll::begin`] gives the
+/// offset to draw them at (moved by the mouse wheel over `area`), [`PanelScroll::end`] takes the
+/// rows' height and draws a [`scroll_bar`] on the right edge while they overflow, so every
+/// panel can be scrolled without a wheel or touchpad (#271).
+pub struct PanelScroll {
+    id: egui::Id,
+    area: Rect,
+    /// How far the rows are scrolled up.
+    pub offset: f32,
+}
+
+impl PanelScroll {
+    pub fn begin(ui: &Ui, id: egui::Id, area: Rect) -> Self {
+        // (Clamped to last frame's overflow: the rows' height is known once they are drawn.)
+        let (mut offset, max): (f32, f32) = ui.data(|d| d.get_temp(id)).unwrap_or_default();
+        if ui.rect_contains_pointer(area) {
+            offset -= ui.input(|i| i.smooth_scroll_delta.y);
+        }
+        Self { id, area, offset: offset.clamp(0.0, max.max(0.0)) }
+    }
+
+    /// The rows were `content` points tall: keep the offset, with the scroll bar registered for
+    /// automation as `key`.
+    pub fn end(self, ui: &mut Ui, auto: &mut Registry, key: &str, content: f32, t: &Tokens) {
+        let max = (content - self.area.height()).max(0.0);
+        let mut offset = self.offset.min(max);
+        if max > 0.0 {
+            let track = Rect::from_min_max(pos2(self.area.max.x - 6.0, self.area.min.y + 1.0), pos2(self.area.max.x - 2.0, self.area.max.y - 1.0));
+            offset = scroll_bar(ui, auto, key, track, offset, max, t);
+        }
+        ui.data_mut(|d| d.insert_temp(self.id, (offset, max)));
+    }
+}
+
 /// A pointer press this frame landed outside a popup `Area` (its `show` response). egui
 /// hit-tests a fixed-position area where it was asked to go, not where it was moved to fit the
 /// window, so `contains_pointer` / `hovered` are false over a menu shifted up from the bottom of
@@ -275,36 +360,65 @@ pub fn pressed_outside(ctx: &egui::Context, area: &Response) -> bool {
     ctx.input(|i| i.pointer.any_pressed() && !i.pointer.interact_pos().is_some_and(|p| area.rect.contains(p)))
 }
 
+/// A [`popup_menu`] option with a check mark when `on` (the labels line up either way).
+pub fn check_label(on: bool, label: &str) -> String {
+    if on { format!("✓ {label}") } else { format!("   {label}") }
+}
+
 /// Show a popup menu anchored at `pos` with string options; returns the chosen index.
 pub fn popup_menu(ui: &mut Ui, id: egui::Id, pos: egui::Pos2, options: &[String], current: Option<usize>) -> Option<usize> {
-    let mut chosen = None;
-    let open_id = id.with("open");
-    let open: bool = ui.data(|d| d.get_temp(open_id).unwrap_or(false));
-    if !open {
+    if !popup_is_open(ui, id) {
         return None;
     }
+    let seps = options.iter().filter(|o| *o == "-").count();
+    popup_list(ui, id, pos, Rect::NOTHING, options.len().saturating_sub(seps), seps, |ui| {
+        ui.set_min_width(160.0);
+        let mut chosen = None;
+        for (i, o) in options.iter().enumerate() {
+            if o == "-" {
+                ui.separator();
+            } else if ui.selectable_label(current == Some(i), o).clicked() {
+                chosen = Some(i);
+            }
+        }
+        chosen
+    })
+}
+
+/// The open popup list `id` at `pos`, drawn by `body` (`rows` entries and `seps` separators,
+/// for its height): as tall as the window allows, scrolling beyond with a scroll bar (a shape
+/// layer's Add menu has 20 entries, the blend modes 40, the fonts hundreds), and moved up when
+/// it would run past the bottom of the window (the Timeline's menus, #269). Closes when `body`
+/// returns a choice, on Escape, or on a press outside it and outside `anchor` (a control that
+/// toggles the list itself). Returns the choice.
+pub fn popup_list<R>(ui: &mut Ui, id: egui::Id, pos: egui::Pos2, anchor: Rect, rows: usize, seps: usize, body: impl FnOnce(&mut Ui) -> Option<R>) -> Option<R> {
+    let screen = ui.ctx().content_rect();
+    let max_h = (screen.height() - 24.0).max(120.0);
+    let sp = ui.spacing();
+    let est = (rows as f32 * (sp.interact_size.y + sp.item_spacing.y + 4.0) + seps as f32 * (2.0 * sp.item_spacing.y + 2.0) + 16.0).min(max_h + 12.0);
+    let pos = egui::pos2(pos.x, pos.y.min(screen.bottom() - est).max(screen.top()));
+    let mut chosen = None;
     let area = egui::Area::new(id.with("area")).order(egui::Order::Foreground).fixed_pos(pos).show(ui.ctx(), |ui| {
         egui::Frame::popup(ui.style()).show(ui, |ui| {
-            ui.set_min_width(160.0);
-            egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
-                for (i, o) in options.iter().enumerate() {
-                    if o == "-" {
-                        ui.separator();
-                        continue;
-                    }
-                    let sel = current == Some(i);
-                    if ui.selectable_label(sel, o).clicked() {
-                        chosen = Some(i);
-                    }
-                }
-            });
+            // (An area's content is laid out in last frame's size: ask for the estimate.)
+            egui::ScrollArea::vertical().max_height(max_h).min_scrolled_height((est - 16.0).min(max_h)).show(ui, |ui| chosen = body(ui));
         });
     });
-    let clicked_outside = pressed_outside(ui.ctx(), &area.response);
-    if chosen.is_some() || clicked_outside || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-        ui.data_mut(|d| d.insert_temp(open_id, false));
+    let outside = pressed_outside(ui.ctx(), &area.response) && !ui.input(|i| i.pointer.interact_pos()).is_some_and(|p| anchor.contains(p));
+    if chosen.is_some() || outside || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        ui.data_mut(|d| d.insert_temp(id.with("open"), false));
     }
     chosen
+}
+
+/// A menu's (or submenu's) entries, scrolling with a scroll bar when they are taller than the
+/// window instead of running off it (Edit on a short screen, #269; Blending Mode). Others show
+/// whole: egui sizes a new menu from a default 400 pt area, so without a minimum a longer one
+/// (Window ▸ Workspace) got stuck at that height with its last entries scrolled out of view
+/// (#191).
+pub fn menu_scroll<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let max_h = ui.ctx().content_rect().height() - 40.0;
+    egui::ScrollArea::vertical().max_height(max_h).min_scrolled_height(max_h).show(ui, add).inner
 }
 
 /// Whether a [`popup_menu`] is open (build its options only then: they can be long).

@@ -34,9 +34,10 @@ pub(crate) fn snapping_on(app: &EffectcraftApp, mods: egui::Modifiers) -> bool {
 }
 
 /// Snap dragged feature points (`sources`, comp pixels) to the comp's targets: other layers'
-/// edges, centres, anchor points and mask/shape vertices and the comp edges and centre (when
-/// snapping is on), guides (View ▸ Snap to Guides) and the grid (View ▸ Snap to Grid). Returns
-/// the comp-space correction (zero when nothing is near) and records the feedback for this frame.
+/// edges, corners, centres, anchor points and mask/shape vertices and the comp edges and centre
+/// (when snapping is on, as the Snapping options allow), guides (View ▸ Snap to Guides) and the
+/// grid (View ▸ Snap to Grid). Returns the comp-space correction (zero when nothing is near) and
+/// records the feedback for this frame.
 pub(crate) fn snap(
     app: &EffectcraftApp,
     ctx: &egui::Context,
@@ -67,11 +68,10 @@ pub(crate) fn snap_with(
     if sources.is_empty() || !(layers || guides || grid) {
         return [0.0; 2];
     }
-    let opts = vw::SnapOptions { guides, grid, grid_spacing: app.session.prefs.grids.grid_spacing };
+    let opts = vw::SnapOptions { layers, features: app.session.state.snap_features, guides, grid, grid_spacing: app.session.prefs.grids.grid_spacing };
     let mut targets = vw::targets(ectx, exclude, opts);
-    targets.extend_from_slice(extra);
-    if !layers {
-        targets.retain(|t| matches!(t.source, SnapSource::Guide | SnapSource::Grid));
+    if layers {
+        targets.extend_from_slice(extra);
     }
     match vw::snap(sources, &targets, SNAP_PX / map.zoom.max(1e-3) as f64) {
         Some(s) => {
@@ -81,6 +81,12 @@ pub(crate) fn snap_with(
         }
         None => [0.0; 2],
     }
+}
+
+/// The snap handle: the dragged layer's feature that snaps (the one nearest where it was
+/// grabbed), boxed while snapping is on.
+pub(crate) fn draw_handle(painter: &egui::Painter, at: Pos2) {
+    painter.rect_stroke(Rect::from_center_size(at, vec2(6.0, 6.0)), 0.0, Stroke::new(1.0, SNAP_COLOR), StrokeKind::Middle);
 }
 
 /// Draw (and clear) this frame's snap feedback: the target layer's box highlighted, the guide or
@@ -110,13 +116,16 @@ pub(crate) fn draw_snap(ctx: &egui::Context, painter: &egui::Painter, map: &View
                 let c = map.to_screen(h.pos);
                 painter.rect_stroke(Rect::from_center_size(c, vec2(9.0, 9.0)), 0.0, stroke, StrokeKind::Middle);
             }
+            // A line across the viewer, or along its span (to where the feature landed).
             SnapKind::VLine => {
                 let x = map.to_screen(h.pos).x;
-                painter.line_segment([pos2(x, area.min.y), pos2(x, area.max.y)], Stroke::new(1.0, SNAP_COLOR));
+                let (a, b) = h.span.map_or((area.min.y, area.max.y), |[a, b]| (map.to_screen([0.0, a.min(s.at[1])]).y, map.to_screen([0.0, b.max(s.at[1])]).y));
+                painter.line_segment([pos2(x, a), pos2(x, b)], Stroke::new(1.0, SNAP_COLOR));
             }
             SnapKind::HLine => {
                 let y = map.to_screen(h.pos).y;
-                painter.line_segment([pos2(area.min.x, y), pos2(area.max.x, y)], Stroke::new(1.0, SNAP_COLOR));
+                let (a, b) = h.span.map_or((area.min.x, area.max.x), |[a, b]| (map.to_screen([a.min(s.at[0]), 0.0]).x, map.to_screen([b.max(s.at[0]), 0.0]).x));
+                painter.line_segment([pos2(a, y), pos2(b, y)], Stroke::new(1.0, SNAP_COLOR));
             }
         }
     }
@@ -382,7 +391,7 @@ pub(crate) fn draw_frame(app: &mut EffectcraftApp, ctx: &egui::Context, painter:
             _ => {
                 let img = crate::frames::to_color_image(&s.image);
                 let img = if plain { img } else { transformed(&img, opts.channel, opts.colorized, opts.exposure, dc) };
-                let tex = ctx.load_texture("viewer-snapshot", img, egui::TextureOptions::LINEAR);
+                let tex = crate::frames::load_fitted(ctx, "viewer-snapshot", img, egui::TextureOptions::LINEAR);
                 ctx.data_mut(|d| d.insert_temp(id, (key, tex.clone())));
                 tex
             }
@@ -432,7 +441,7 @@ pub(crate) fn draw_frame(app: &mut EffectcraftApp, ctx: &egui::Context, painter:
     let tex = match ctx.data(|d| d.get_temp::<(u64, egui::TextureHandle)>(id)) {
         Some((k, tex)) if k == key => tex,
         _ => {
-            let tex = ctx.load_texture("viewer-display", transformed(&src, opts.channel, opts.colorized, opts.exposure, dc), zoom_opts);
+            let tex = crate::frames::load_fitted(ctx, "viewer-display", transformed(&src, opts.channel, opts.colorized, opts.exposure, dc), zoom_opts);
             ctx.data_mut(|d| d.insert_temp(id, (key, tex.clone())));
             tex
         }
@@ -446,34 +455,27 @@ pub(crate) fn draw_frame(app: &mut EffectcraftApp, ctx: &egui::Context, painter:
 /// `viewer.<auto>.<n>` automation ids.
 fn popup(app: &mut EffectcraftApp, ui: &mut egui::Ui, id: &str, anchor: Rect, items: &[(String, bool)], auto: &str) -> Option<usize> {
     let pid = egui::Id::new(id);
-    let open: bool = ui.data(|d| d.get_temp(pid.with("open")).unwrap_or(false));
-    if !open {
+    if !widgets::popup_is_open(ui, pid) {
         return None;
     }
     let h: f32 = items.iter().map(|(l, _)| if l == "-" { 9.0 } else { 21.0 }).sum::<f32>() + 14.0;
-    let pos = anchor.left_top() - vec2(0.0, h + 4.0);
-    let mut chosen = None;
-    let area = egui::Area::new(pid.with("area")).order(egui::Order::Foreground).fixed_pos(pos).show(ui.ctx(), |ui| {
-        egui::Frame::popup(ui.style()).show(ui, |ui| {
-            ui.set_min_width(170.0);
-            for (i, (label, on)) in items.iter().enumerate() {
-                if label == "-" {
-                    ui.separator();
-                    continue;
-                }
-                let r = ui.selectable_label(*on, label.as_str());
-                app.auto.add(&format!("viewer.{auto}.{i}"), r.rect, label);
-                if r.clicked() {
-                    chosen = Some(i);
-                }
+    let seps = items.iter().filter(|(l, _)| l == "-").count();
+    widgets::popup_list(ui, pid, anchor.left_top() - vec2(0.0, h + 4.0), anchor, items.len().saturating_sub(seps), seps, |ui| {
+        ui.set_min_width(170.0);
+        let mut chosen = None;
+        for (i, (label, on)) in items.iter().enumerate() {
+            if label == "-" {
+                ui.separator();
+                continue;
             }
-        });
-    });
-    let outside = widgets::pressed_outside(ui.ctx(), &area.response) && !anchor.contains(ui.input(|i| i.pointer.interact_pos()).unwrap_or_default());
-    if chosen.is_some() || outside || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-        ui.data_mut(|d| d.insert_temp(pid.with("open"), false));
-    }
-    chosen
+            let r = ui.selectable_label(*on, label.as_str());
+            app.auto.add(&format!("viewer.{auto}.{i}"), r.rect, label);
+            if r.clicked() {
+                chosen = Some(i);
+            }
+        }
+        chosen
+    })
 }
 
 fn toggle_popup(ui: &egui::Ui, id: &str) {

@@ -335,6 +335,11 @@ impl GpuContext {
         if !adapter.get_downlevel_capabilities().flags.contains(wgpu::DownlevelFlags::COMPUTE_SHADERS) {
             return Err(format!("{} ({:?}): no compute shaders", info.name, info.backend));
         }
+        // OpenGL (Window Graphics ▸ OpenGL for drivers that crash otherwise, #243) translates the
+        // kernels for tens of seconds before one fails validation: CPU compositing at once.
+        if info.backend == wgpu::Backend::Gl {
+            return Err(format!("{} (Gl): the GPU compositor needs DirectX 12, Vulkan, Metal or WebGPU", info.name));
+        }
         // egui-wgpu asks for WebGL2's limits on GL (no storage buffers at all): building the
         // pipelines there would be a validation error, which release builds only log.
         let l = device.limits();

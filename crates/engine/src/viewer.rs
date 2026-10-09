@@ -45,17 +45,75 @@ pub struct SnapTarget {
     /// guides, guides before the grid).
     pub priority: u8,
     pub source: SnapSource,
+    /// A line's extent along itself (y of a vertical line, x of a horizontal one): a layer's
+    /// edge without Snap Edges Extended. `None` runs across the whole comp.
+    #[serde(default)]
+    pub span: Option<[f64; 2]>,
 }
 
 impl SnapTarget {
     pub fn point(pos: [f64; 2], priority: u8, source: SnapSource) -> SnapTarget {
-        SnapTarget { kind: SnapKind::Point, pos, priority, source }
+        SnapTarget { kind: SnapKind::Point, pos, priority, source, span: None }
     }
     pub fn vline(x: f64, priority: u8, source: SnapSource) -> SnapTarget {
-        SnapTarget { kind: SnapKind::VLine, pos: [x, 0.0], priority, source }
+        SnapTarget { kind: SnapKind::VLine, pos: [x, 0.0], priority, source, span: None }
     }
     pub fn hline(y: f64, priority: u8, source: SnapSource) -> SnapTarget {
-        SnapTarget { kind: SnapKind::HLine, pos: [0.0, y], priority, source }
+        SnapTarget { kind: SnapKind::HLine, pos: [0.0, y], priority, source, span: None }
+    }
+    /// The line limited to `span` (`None`: across the comp).
+    pub fn within(self, span: Option<[f64; 2]>) -> SnapTarget {
+        SnapTarget { span: span.map(|[a, b]| [a.min(b), a.max(b)]), ..self }
+    }
+}
+
+/// Tools bar ▸ Snapping options: which layer features snap (the dragged layer's and the
+/// targets), and Snap Edges Extended (layer edges snap along their whole line, beyond the
+/// layer's bounds). Everything is on by default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct SnapFeatures {
+    pub edges_extended: bool,
+    /// Edges and edge midpoints of layers, and the comp's edges.
+    pub edges: bool,
+    pub corners: bool,
+    /// Layer centres and the comp's centre.
+    pub centers: bool,
+    pub anchor_points: bool,
+    /// Mask and shape path points.
+    pub paths: bool,
+}
+
+impl Default for SnapFeatures {
+    fn default() -> Self {
+        SnapFeatures { edges_extended: true, edges: true, corners: true, centers: true, anchor_points: true, paths: true }
+    }
+}
+
+impl SnapFeatures {
+    /// The options in the Tools bar's Snapping menu order: (parameter key, label).
+    pub const OPTIONS: [(&'static str, &'static str); 6] = [
+        ("edgesExtended", "Snap Edges Extended"),
+        ("edges", "Edges"),
+        ("corners", "Corners"),
+        ("centers", "Centers"),
+        ("anchorPoints", "Anchor Points"),
+        ("paths", "Mask and Shape Path Points"),
+    ];
+    /// The option called `key` (an [`OPTIONS`](Self::OPTIONS) key).
+    pub fn option_mut(&mut self, key: &str) -> Option<&mut bool> {
+        Some(match key {
+            "edgesExtended" => &mut self.edges_extended,
+            "edges" => &mut self.edges,
+            "corners" => &mut self.corners,
+            "centers" => &mut self.centers,
+            "anchorPoints" => &mut self.anchor_points,
+            "paths" => &mut self.paths,
+            _ => return None,
+        })
+    }
+    pub fn option(mut self, key: &str) -> bool {
+        self.option_mut(key).is_some_and(|v| *v)
     }
 }
 
@@ -89,12 +147,13 @@ pub fn snap(sources: &[[f64; 2]], targets: &[SnapTarget], tol: f64) -> Option<Sn
     let mut best_y: Option<((f64, u8), [f64; 2], SnapTarget)> = None;
     for s in sources {
         for t in targets {
-            let (d, slot) = match t.kind {
-                SnapKind::Point => (((t.pos[0] - s[0]).powi(2) + (t.pos[1] - s[1]).powi(2)).sqrt(), &mut best_pt),
-                SnapKind::VLine => ((t.pos[0] - s[0]).abs(), &mut best_x),
-                SnapKind::HLine => ((t.pos[1] - s[1]).abs(), &mut best_y),
+            // (`along`: where the source is along a line, for its span.)
+            let (d, slot, along) = match t.kind {
+                SnapKind::Point => (((t.pos[0] - s[0]).powi(2) + (t.pos[1] - s[1]).powi(2)).sqrt(), &mut best_pt, 0.0),
+                SnapKind::VLine => ((t.pos[0] - s[0]).abs(), &mut best_x, s[1]),
+                SnapKind::HLine => ((t.pos[1] - s[1]).abs(), &mut best_y, s[0]),
             };
-            if d > tol {
+            if d > tol || t.span.is_some_and(|[a, b]| along < a || along > b) {
                 continue;
             }
             let key = (d, t.priority);
@@ -128,26 +187,56 @@ pub fn snap(sources: &[[f64; 2]], targets: &[SnapTarget], tol: f64) -> Option<Sn
     Some(Snap { delta, hits, at })
 }
 
-/// Snap features of a layer in comp space: corners, edge midpoints, centre and anchor point
-/// (2D layers; `None` for layers without bounds).
-pub fn layer_features(ctx: &EvalCtx, layer: &Layer) -> Vec<[f64; 2]> {
+/// Snap features of a layer in comp space that `f` turns on: corners, edge midpoints, centre,
+/// anchor point and mask / shape path vertices (no box for layers without bounds).
+pub fn layer_features(ctx: &EvalCtx, layer: &Layer, f: SnapFeatures) -> Vec<[f64; 2]> {
     let (m, _) = ctx.layer_to_comp(layer);
-    let mut out = box_features(ctx, layer, &m);
-    out.extend(anchor_feature(ctx, layer, &m));
+    let mut out = layer_box(ctx, layer, &m).map(|b| b.features(f)).unwrap_or_default();
+    out.extend(anchor_feature(ctx, layer, &m).filter(|_| f.anchor_points));
+    if f.paths {
+        out.extend(layer_vertices(ctx, layer));
+    }
     out
 }
 
-/// The corners, edge midpoints and centre of a layer's content box (`m`: layer → comp).
-fn box_features(ctx: &EvalCtx, layer: &Layer, m: &Mat3) -> Vec<[f64; 2]> {
-    let Some(b) = effectcraft_render::content_bounds(ctx, layer) else { return vec![] };
+/// A layer's content box in comp space: corners (top left, top right, bottom right, bottom
+/// left), edge midpoints (top, right, bottom, left) and centre.
+struct BoxPoints {
+    corners: [[f64; 2]; 4],
+    mids: [[f64; 2]; 4],
+    center: [f64; 2],
+}
+
+impl BoxPoints {
+    /// The points `f` turns on.
+    fn features(&self, f: SnapFeatures) -> Vec<[f64; 2]> {
+        let mut out = vec![];
+        if f.corners {
+            out.extend(self.corners);
+        }
+        if f.edges {
+            out.extend(self.mids);
+        }
+        if f.centers {
+            out.push(self.center);
+        }
+        out
+    }
+}
+
+/// A layer's content box (`m`: layer → comp).
+fn layer_box(ctx: &EvalCtx, layer: &Layer, m: &Mat3) -> Option<BoxPoints> {
+    let b = effectcraft_render::content_bounds(ctx, layer)?;
     let (cx, cy) = ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0);
-    [[b[0], b[1]], [b[2], b[1]], [b[2], b[3]], [b[0], b[3]], [cx, b[1]], [b[2], cy], [cx, b[3]], [b[0], cy], [cx, cy]]
-        .into_iter()
-        .map(|p| {
-            let q = m.apply(vec2(p[0], p[1]));
-            [q.x, q.y]
-        })
-        .collect()
+    let c = |x: f64, y: f64| {
+        let q = m.apply(vec2(x, y));
+        [q.x, q.y]
+    };
+    Some(BoxPoints {
+        corners: [c(b[0], b[1]), c(b[2], b[1]), c(b[2], b[3]), c(b[0], b[3])],
+        mids: [c(cx, b[1]), c(b[2], cy), c(cx, b[3]), c(b[0], cy)],
+        center: c(cx, cy),
+    })
 }
 
 /// A layer's anchor point (`m`: layer → comp).
@@ -203,28 +292,42 @@ pub fn shape_paths(ctx: &EvalCtx, layer: &Layer) -> Vec<(u64, effectcraft_keyfra
 /// Which target families are on.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SnapOptions {
+    /// Layer and comp targets (the Snapping checkbox, inverted while Cmd/Ctrl is held).
+    pub layers: bool,
+    pub features: SnapFeatures,
     pub guides: bool,
     pub grid: bool,
     pub grid_spacing: f64,
 }
 
-/// Snap targets of a comp at the context time: other layers' features and vertices, comp edges
-/// and centre, and (when on) guides and grid lines. Layers in `exclude` (the dragged ones) are
-/// skipped.
+/// Snap targets of a comp at the context time: other visible layers' features and vertices and
+/// the comp's edges and centre (with `layers`, as `features` allows), and guides and grid lines
+/// (when on). Layers in `exclude` (the dragged ones) are skipped.
 pub fn targets(ctx: &EvalCtx, exclude: &[LayerId], opts: SnapOptions) -> Vec<SnapTarget> {
     let comp = ctx.comp;
     let (w, h) = (comp.width as f64, comp.height as f64);
-    let mut out = vec![
-        SnapTarget::vline(0.0, PRI_COMP, SnapSource::Comp),
-        SnapTarget::vline(w, PRI_COMP, SnapSource::Comp),
-        SnapTarget::vline(w / 2.0, PRI_COMP, SnapSource::Comp),
-        SnapTarget::hline(0.0, PRI_COMP, SnapSource::Comp),
-        SnapTarget::hline(h, PRI_COMP, SnapSource::Comp),
-        SnapTarget::hline(h / 2.0, PRI_COMP, SnapSource::Comp),
-        SnapTarget::point([w / 2.0, h / 2.0], PRI_COMP, SnapSource::Comp),
-    ];
-    for l in comp.layers.iter().filter(|l| l.is_active_at(ctx.time) && !exclude.contains(&l.id)) {
-        out.extend(layer_targets(ctx, l, true));
+    let f = opts.features;
+    let mut out = vec![];
+    if opts.layers {
+        // The comp's edge and centre lines, along the comp without Snap Edges Extended.
+        let (xs, ys) = if f.edges_extended { (None, None) } else { (Some([0.0, w]), Some([0.0, h])) };
+        let mut lines = |x: &[f64], y: &[f64]| {
+            out.extend(x.iter().map(|x| SnapTarget::vline(*x, PRI_COMP, SnapSource::Comp).within(ys)));
+            out.extend(y.iter().map(|y| SnapTarget::hline(*y, PRI_COMP, SnapSource::Comp).within(xs)));
+        };
+        if f.edges {
+            lines(&[0.0, w], &[0.0, h]);
+        }
+        if f.centers {
+            lines(&[w / 2.0], &[h / 2.0]);
+            out.push(SnapTarget::point([w / 2.0, h / 2.0], PRI_COMP, SnapSource::Comp));
+        }
+        // Visible layers: eye on, and soloed while any layer is.
+        let any_solo = comp.layers.iter().any(|l| l.switches.solo && l.source.is_av() && l.is_active_at(ctx.time));
+        let visible = |l: &&Layer| l.is_active_at(ctx.time) && l.switches.video && (!any_solo || l.switches.solo) && !exclude.contains(&l.id);
+        for l in comp.layers.iter().filter(visible) {
+            out.extend(layer_targets(ctx, l, true, f));
+        }
     }
     if opts.guides {
         for g in &comp.guides {
@@ -251,30 +354,34 @@ pub fn targets(ctx: &EvalCtx, exclude: &[LayerId], opts: SnapOptions) -> Vec<Sna
     out
 }
 
-/// A 2D layer's snap targets: its box points (edges as lines too while unrotated), its anchor
-/// point unless `anchor` is false (Pan Behind drags it, the box stays put) and its mask and shape
-/// path vertices. None for cameras, lights and 3D layers.
-pub fn layer_targets(ctx: &EvalCtx, l: &Layer, anchor: bool) -> Vec<SnapTarget> {
+/// A 2D layer's snap targets as `f` allows: its box points, its edges as lines while unrotated
+/// (across the comp with Snap Edges Extended, along the layer otherwise), its anchor point
+/// unless `anchor` is false (Pan Behind drags it, the box stays put) and its mask and shape path
+/// vertices. None for cameras, lights and 3D layers.
+pub fn layer_targets(ctx: &EvalCtx, l: &Layer, anchor: bool, f: SnapFeatures) -> Vec<SnapTarget> {
     if l.is_camera() || l.is_light() || l.is_3d() {
         return vec![];
     }
     let (m, _) = ctx.layer_to_comp(l);
-    let f = box_features(ctx, l, &m);
+    let src = SnapSource::Layer(l.id);
     let mut out = vec![];
-    if let [nw, ne, _, sw, ..] = f.as_slice()
-        && (nw[1] - ne[1]).abs() < 1e-6
-        && (nw[0] - sw[0]).abs() < 1e-6
-    {
-        for x in [nw[0], ne[0]] {
-            out.push(SnapTarget { kind: SnapKind::VLine, pos: [x, nw[1]], priority: PRI_LAYER, source: SnapSource::Layer(l.id) });
+    if let Some(b) = layer_box(ctx, l, &m) {
+        let [nw, ne, _, sw] = b.corners;
+        if f.edges && (nw[1] - ne[1]).abs() < 1e-6 && (nw[0] - sw[0]).abs() < 1e-6 {
+            let (xs, ys) = if f.edges_extended { (None, None) } else { (Some([nw[0], ne[0]]), Some([nw[1], sw[1]])) };
+            for x in [nw[0], ne[0]] {
+                out.push(SnapTarget::vline(x, PRI_LAYER, src).within(ys));
+            }
+            for y in [nw[1], sw[1]] {
+                out.push(SnapTarget::hline(y, PRI_LAYER, src).within(xs));
+            }
         }
-        for y in [nw[1], sw[1]] {
-            out.push(SnapTarget { kind: SnapKind::HLine, pos: [nw[0], y], priority: PRI_LAYER, source: SnapSource::Layer(l.id) });
-        }
+        out.extend(b.features(f).into_iter().map(|p| SnapTarget::point(p, PRI_LAYER, src)));
     }
-    let a = if anchor { anchor_feature(ctx, l, &m) } else { None };
-    out.extend(f.into_iter().chain(a).map(|p| SnapTarget::point(p, PRI_LAYER, SnapSource::Layer(l.id))));
-    out.extend(layer_vertices(ctx, l).into_iter().map(|p| SnapTarget::point(p, PRI_VERTEX, SnapSource::Vertex(l.id))));
+    out.extend(anchor_feature(ctx, l, &m).filter(|_| anchor && f.anchor_points).map(|p| SnapTarget::point(p, PRI_LAYER, src)));
+    if f.paths {
+        out.extend(layer_vertices(ctx, l).into_iter().map(|p| SnapTarget::point(p, PRI_VERTEX, SnapSource::Vertex(l.id))));
+    }
     out
 }
 

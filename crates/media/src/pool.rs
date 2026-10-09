@@ -379,31 +379,35 @@ impl MediaPool {
         self.decode_audio(footage, start, frames, rate)
     }
 
-    /// [`MediaPool::audio_samples`] straight from the decoder.
+    /// [`MediaPool::audio_samples`] straight from the decoder. The source is read at its own
+    /// rate and resampled here (linear, by absolute sample position, so a range comes out the
+    /// same however it is split into reads). FilmCraft's MP4 reader, asked for another rate,
+    /// applied the edit list's priming offset twice and ramped the start of every read: AAC
+    /// footage not at the mix rate stuttered in previews and exports (#274).
     fn decode_audio(&self, footage: &Footage, start: Tick, frames: usize, rate: u32) -> Vec<f32> {
-        let mut out = vec![0.0; frames * 2];
         let path: Arc<str> = footage.path.as_str().into();
-        let Some(src) = self.inner.source(&path) else { return out };
+        let Some(src) = self.inner.source(&path) else { return vec![0.0; frames * 2] };
         let s0 = start.to_units_floor(rate as i64);
-        let skip = (-s0).max(0) as usize;
-        if skip >= frames {
-            return out;
+        let native = src.info().audio.as_ref().map_or(rate, |a| a.sample_rate);
+        if native == 0 || native == rate {
+            return read_stereo(&src, &path, s0, frames, rate);
         }
-        let buf = match src.audio(s0.max(0), frames - skip, rate) {
-            Ok(b) => b,
-            Err(e) => {
-                log::warn!("media: audio of {path}: {e}");
-                return out;
+        // Output sample `n` sits at source position n × native / rate.
+        let (native_i, rate_i) = (i128::from(native), i128::from(rate));
+        let first = (i128::from(s0) * native_i).div_euclid(rate_i);
+        let last = ((i128::from(s0) + frames as i128) * native_i).div_euclid(rate_i) + 1;
+        let (Ok(first64), Ok(count)) = (i64::try_from(first), usize::try_from(last - first + 1)) else { return vec![0.0; frames * 2] };
+        let buf = read_stereo(&src, &path, first64, count, native);
+        let mut out = Vec::with_capacity(frames * 2);
+        for k in 0..frames as i128 {
+            let pos = (i128::from(s0) + k) * native_i;
+            let i = usize::try_from(pos.div_euclid(rate_i) - first).unwrap_or(0) * 2;
+            let f = (pos.rem_euclid(rate_i) as f64 / rate as f64) as f32;
+            for c in 0..2 {
+                let a = buf.get(i + c).copied().unwrap_or(0.0);
+                let b = buf.get(i + 2 + c).copied().unwrap_or(a);
+                out.push(a + (b - a) * f);
             }
-        };
-        let chans = buf.channels.len();
-        if chans == 0 {
-            return out;
-        }
-        let (l, r) = (&buf.channels[0], &buf.channels[if chans > 1 { 1 } else { 0 }]);
-        for i in 0..(frames - skip).min(l.len()).min(r.len()) {
-            out[(skip + i) * 2] = l[i];
-            out[(skip + i) * 2 + 1] = r[i];
         }
         out
     }
@@ -663,6 +667,31 @@ impl FootageSource for MediaPool {
         }
         Some(self.audio_samples(footage, t, frames, rate))
     }
+}
+
+/// `frames` stereo sample frames (interleaved) of `src` from sample `s0` at `rate` Hz, which
+/// FilmCraft serves as decoded when it is the source's own rate. Mono is duplicated to both
+/// channels; silence before the start and where decoding fails.
+fn read_stereo(src: &SharedSource, path: &str, s0: i64, frames: usize, rate: u32) -> Vec<f32> {
+    let mut out = vec![0.0; frames * 2];
+    let skip = usize::try_from(s0.saturating_neg()).unwrap_or(0);
+    if skip >= frames {
+        return out;
+    }
+    let buf = match src.audio(s0.max(0), frames - skip, rate) {
+        Ok(b) => b,
+        Err(e) => {
+            log::warn!("media: audio of {path}: {e}");
+            return out;
+        }
+    };
+    let (Some(l), Some(r)) = (buf.channels.first(), buf.channels.get(1).or(buf.channels.first())) else { return out };
+    let Some(dst) = skip.checked_mul(2).and_then(|i| out.get_mut(i..)) else { return out };
+    for ([o0, o1], (a, b)) in dst.as_chunks_mut::<2>().0.iter_mut().zip(l.iter().zip(r)) {
+        *o0 = *a;
+        *o1 = *b;
+    }
+    out
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {

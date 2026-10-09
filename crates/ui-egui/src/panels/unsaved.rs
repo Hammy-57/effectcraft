@@ -49,6 +49,8 @@ pub fn on_close_requested(app: &mut EffectcraftApp, ctx: &egui::Context) {
     if !ctx.input(|i| i.viewport().close_requested()) || app.dialog_state.unsaved.quitting {
         return;
     }
+    // Logged, so a window that closes on its own shows it (#234).
+    log::info!("the window was asked to close");
     if ask(app, "app.quit", &json!({})) {
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
     }

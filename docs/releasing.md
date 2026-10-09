@@ -1,7 +1,8 @@
 # Releasing EffectCraft
 
 Every push to the `release` branch runs [`.github/workflows/release.yml`](../.github/workflows/release.yml).
-It builds signed installers for macOS, Windows, Linux and the web, then creates or updates a
+It builds signed installers for macOS and Windows, packages for Linux and FreeBSD, and the web
+build, then creates or updates a
 **draft** GitHub Release named `EffectCraft v<version>`. Nobody sees a draft until a maintainer
 publishes it.
 
@@ -41,9 +42,11 @@ pushing to release.`), so bump it first.
 
 **Test runs:** *Actions › Release › Run workflow* runs the whole pipeline by hand. The optional
 `version` input (such as `0.4.0-rc.1`) overrides `Cargo.toml` for that run only: the jobs apply it
-with `cargo xtask version set` before building, so the binaries report it too. The run still
-needs the `release` environment, which only the `release` branch can use, so pick that branch in
-the dialog.
+with `cargo xtask version set` before building, so the binaries report it too. Signing and the
+draft release need the `release` environment, which only the `release` branch can use. Run on
+any other branch (`gh workflow run release.yml --ref <branch>`), it is a dry run: the jobs that
+sign nothing (Linux, Flatpak, FreeBSD, web) build and check everything, the macOS and Windows
+jobs are refused by the environment's branch rule, and no draft release is made.
 
 ## What gets built
 
@@ -55,6 +58,9 @@ the dialog.
 | Windows 11 ARM64 | `effectcraft-<v>-windows-arm64.msi`, `effectcraft-<v>-windows-arm64-portable.zip` | cross-compiled on `windows-latest` |
 | Linux x86_64 | `effectcraft-<v>-linux-x86_64.{AppImage,deb,rpm,tar.gz}` | `ubuntu-22.04` |
 | Linux aarch64 | `effectcraft-<v>-linux-aarch64.{AppImage,deb,rpm,tar.gz}` | `ubuntu-22.04-arm` |
+| Linux AppImage updates | `effectcraft-<v>-linux-{x86_64,aarch64}.AppImage.zsync` | with the AppImages |
+| Flatpak x86_64, aarch64 | `effectcraft-<v>-linux-{x86_64,aarch64}.flatpak` (the Linux tarball, repackaged) | `ubuntu-24.04`, `ubuntu-24.04-arm` |
+| FreeBSD 14+ x86_64 | `effectcraft-<v>-freebsd-x86_64.tar.gz` | a FreeBSD 14.3 VM on `ubuntu-latest` |
 | Web | `effectcraft-web-<v>.zip` (a static site; see [web.md](web.md)) | `ubuntu-latest` |
 
 The ARM64 MSI is installed and run on ARM64 hardware by
@@ -72,10 +78,33 @@ RHEL 10. Building on a newer image would silently raise that floor. `packaging/l
 builds the AppImage, `.deb`, `.rpm` and tarball; the workflow then runs the AppImage's
 `--version` as a smoke test.
 
+### Linux: AppImage updates and Flatpak
+
+Each AppImage embeds update information
+(`gh-releases-zsync|storytold|effectcraft|latest|effectcraft-*-linux-<arch>.AppImage.zsync`), and
+the `.zsync` file published beside it lets [AppImageUpdate](https://github.com/AppImageCommunity/AppImageUpdate)
+and AppImageLauncher fetch only the changed blocks from the newest published (non-pre-release)
+version. `package.sh` writes the `.zsync` when `zsyncmake` (the `zsync` package) is installed; the
+workflow checks both.
+
+The `.flatpak` bundles repackage the Linux job's tarball with
+`packaging/linux/flatpak-bundle.sh` and `packaging/linux/flatpak/ai.storyteller.effectcraft.bundle.yml`
+(no Rust build inside flatpak-builder), then install the bundle and run `effectcraft-cli --version`
+in the sandbox. `ai.storyteller.effectcraft.yml` is the from-source manifest for Flathub; packaging
+lint keeps the runtime and sandbox permissions of the two identical.
+
+### FreeBSD
+
+GitHub has no FreeBSD runners, so the job builds in a FreeBSD 14.3 VM
+(`vmactions/freebsd-vm`, pinned by commit) with the packages
+[`freebsd.yml`](../.github/workflows/freebsd.yml) uses, and `packaging/freebsd/package.sh` makes a
+`/usr/local`-style tarball: `tar -xzf effectcraft-<v>-freebsd-x86_64.tar.gz --strip-components 1 -C /usr/local`.
+
 ## Signing
 
-Every job runs in the `release` environment, which only the `release` branch can use and which
-holds the signing secrets. Every secret is optional: a missing one produces an unsigned artifact
+The macOS and Windows jobs and the draft-release job run in the `release` environment, which only
+the `release` branch can use and which holds the signing secrets. The jobs that sign nothing run
+without it and get no secrets. Every secret is optional: a missing one produces an unsigned artifact
 and a warning in the job summary, never a failed build.
 
 | Platform | Secrets |

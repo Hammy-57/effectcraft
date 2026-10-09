@@ -36,12 +36,42 @@ You can also register it from the command line:
 Desktop, Cursor and the like) take the same `command` and `args`.
 
 - **Headless** (`["mcp"]`): an in-process session with no window. Add `"--demo"` or
-  `"--project", "file.ecproj"` to start with content. Startup is instant.
+  `"--project", "file.ecproj"` to start with content. Startup is instant. It renders on the CPU
+  unless you add `"--gpu"` (`["mcp", "--gpu"]`), which attaches the GPU compositor on a device of
+  its own; if no adapter is usable the server says why and exits. `get_project`'s `renderer`
+  (`render.backend`) reports `active` (`gpu` / `cpu`) and, on the CPU, `why`.
 - **Bridge** (`["mcp", "--bridge", "9877"]`): drives a running `effectcraft --control 9877`, so you
   see every change live. Bridge mode adds `screenshot` and the `ui_*` tools.
 
 The server speaks JSON-RPC 2.0 over stdio, one message per line, and supports MCP protocol versions
 2025-06-18, 2025-03-26 and 2024-11-05 (`initialize`, `ping`, `tools/list`, `tools/call`).
+
+### Keeping headless work across restarts
+
+Start `effectcraft-cli mcp --autosave` (MCP args `["mcp", "--autosave"]`) to preserve
+unsaved headless work. Each tool call that changes a dirty project writes a checkpoint before
+its reply is sent, so even killing the server after that reply leaves the work on disk. EOF
+and transport errors also flush outstanding changes. Queries do not rotate the saved versions.
+A failed checkpoint adds a warning to the tool reply; the edit remains in memory and the next
+call retries. Use `save_project {path}` to a writable location before disconnecting if warned.
+
+Each server has its own folder under `<config directory>/EffectCraft Auto-Save/MCP/` (or
+`<custom Auto-Save folder>/MCP/`). The maximum-version setting applies within that folder.
+`--autosave` enables these checkpoints regardless of the desktop's Auto-Save toggle and interval;
+it reads settings without writing desktop preferences, shortcuts or crash-recovery state.
+`EFFECTCRAFT_CONFIG_DIR` overrides the platform config directory. Session folders are retained
+for recovery; remove old folders once their work is saved elsewhere.
+
+`initialize` instructions and `_meta.effectcraftAutoSave` list the current folder and up to five
+previous dirty sessions; `get_project.autosave` also reports the latest checkpoint and errors.
+Recover explicitly with `open_project {"path":"<checkpoint .ecproj>"}`, then
+`save_project {"path":"Recovered.ecproj"}`. Prior sessions may still be running and are never
+opened automatically. Replacing a dirty project with `open_project` or `file.newProject` discards
+it intentionally; save it first. The metadata describes the current project in each session.
+
+Without `--autosave`, headless work is in memory until explicitly saved. The flag is headless
+only; a bridged desktop app owns its auto-saves. An edit interrupted before its reply is received
+may be absent from the last checkpoint.
 
 ### Tools
 
@@ -107,6 +137,31 @@ Short recipes; every step is one tool call.
 
 The desktop app checks footage in the background after every open (a "Checking footage" job in
 the Progress panel, `jobs.list`); headless sessions run `footage.check` when they want it.
+
+### Pitfalls
+
+Things that tripped up a long agent-driven session (a multi-scene 3D piece built entirely over MCP).
+
+- **Layer time vs comp time.** `add_keyframe`, `set_property` with `time`, `prop.addKey`,
+  `keys.select` and `keys.set` take layer time; `get_property` and `render_frame` take comp time;
+  `run_script`'s `setValueAtTime` and `keyTime` use comp time, as in After Effects. On a layer that
+  doesn't start at 0, such as a nested comp placed later, subtract the layer's start time from the
+  comp time before keying (unstretched layers), or set the keys from `run_script`
+  ([#257](https://github.com/storytold/effectcraft/issues/257)).
+- **Moving a layer in time.** `execute_command layer.timing {"layers":["Scene 2"],"start":5.1}` sets
+  the start time in comp seconds and moves the in and out points with it.
+- **Loops in scripts.** `run_script` can call any engine command with `app.run(id, params)`, for
+  example `app.run("layer.new3dPrimitive", {kind: "cube", position: [x, y, z]})` inside a loop. A
+  script that throws keeps the edits it already made: wrap it in `app.beginUndoGroup()` /
+  `app.endUndoGroup()` so one `undo {}` removes them all. (`batch` rolls back on its own.)
+- **Save early in headless mode.** Without `--autosave` the headless server keeps the project in
+  memory only, so a server restart loses unsaved work: start it with `mcp --autosave` (see above)
+  or call `save_project {"path": …}` after each milestone.
+- **Environment light.** `layer.newLight` also accepts `"kind":"Environment"`: an equirectangular
+  image that metallic surfaces reflect. Set its `lightOptions/source` to a footage, comp or solid
+  layer by layer id; with no source it uses the comp's Environment Layer (`layer.environment`)
+  ([#261](https://github.com/storytold/effectcraft/issues/261)).
+
 ### Cookbook (from end-to-end QA)
 
 The scenarios in `crates/automation/tests/qa/` and `apps/effectcraft-cli/tests/qa_template.rs`
@@ -491,7 +546,8 @@ not read or written.
 
 ## Seeing the UI
 
-To work on the UI, start the app with `cargo run -p effectcraft -- --control 9877` and use MCP bridge
+To work on the UI, start the app with `cargo run -p effectcraft -- --control 9877` (add `--demo` to
+open the demo project; without it the app starts with an empty project) and use MCP bridge
 mode or the raw control channel. A good loop is: `ui_elements` to find an id, `ui_click` or `ui_drag`
 to act, then `screenshot {"panel":"Timeline"}` to check the result. `render_frame` shows the
 composition itself at any zoom.

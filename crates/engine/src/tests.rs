@@ -96,6 +96,69 @@ fn imported_files_go_into_the_comp_where_they_were_dropped() {
     assert!(s.execute("layer.addItem", json!({"item": "a.png", "position": [1.0]})).is_err(), "position needs x and y");
 }
 
+/// #270: files dropped or picked in the Import dialog (`file.import {background}`) are probed in
+/// a background job that says which file it is reading and how many are left; then they arrive
+/// in one undo step, all selected, with a count. The same file imported again arrives again.
+#[test]
+fn background_imports_report_progress_and_select_what_arrived() {
+    use effectcraft_project::{Footage, FootageKind, ItemId};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    /// Probes file k once `allow` > k (a slow video; 5 s at most, so an import that waits for it
+    /// fails the test instead of hanging it); `.xyz` files fail.
+    struct Gated {
+        started: AtomicUsize,
+        allow: Arc<AtomicUsize>,
+    }
+    impl crate::Importer for Gated {
+        fn probe(&self, path: &str) -> Result<Footage, String> {
+            let k = self.started.fetch_add(1, Ordering::SeqCst);
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while self.allow.load(Ordering::SeqCst) <= k && std::time::Instant::now() < until {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            if path.ends_with(".xyz") {
+                return Err("unsupported file".into());
+            }
+            Ok(Footage { path: path.into(), kind: FootageKind::Still, width: 64, height: 32, has_video: true, ..Default::default() })
+        }
+    }
+    let allow = Arc::new(AtomicUsize::new(1));
+    let mut s = Session { importer: Some(Arc::new(Gated { started: AtomicUsize::new(0), allow: allow.clone() })), ..Default::default() };
+    s.execute("comp.new", json!({"name": "Main", "width": 320, "height": 180, "frameRate": 30, "duration": 4})).unwrap();
+    let undo = s.history.undo.len();
+    let r = s.execute("file.import", json!({"paths": ["/drop/a.png", "/drop/b.png", "/drop/a.png"], "background": true})).unwrap();
+    let job = r["job"].as_str().unwrap().to_string();
+    // The first file is through; the second is being read.
+    let running = |s: &mut Session| s.execute("jobs.list", json!({})).unwrap()["running"].as_array().unwrap().clone();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while running(&mut s)[0]["done"] != json!(1) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let row = running(&mut s)[0].clone();
+    assert_eq!(row["id"], json!(job));
+    assert_eq!(row["label"], json!("Importing 3 files"));
+    assert_eq!(row["message"], json!("b.png (2 of 3)"));
+    assert_eq!((row["done"].as_u64(), row["total"].as_u64()), (Some(1), Some(3)));
+    assert!(s.project.items.values().all(|i| i.name != "a.png"), "nothing is added before the import finishes");
+    allow.store(usize::MAX, Ordering::SeqCst);
+    s.execute("jobs.wait", json!({})).unwrap();
+    let names = |s: &Session, ids: &[ItemId]| ids.iter().map(|i| s.project.item(*i).unwrap().name.clone()).collect::<Vec<_>>();
+    assert_eq!(names(&s, &s.state.project_selection), ["a.png", "b.png", "a.png"], "everything imported is selected, the same file twice too");
+    assert_eq!(s.history.undo.len(), undo + 1, "one undo step");
+    let rec = s.job_log.last().unwrap();
+    assert_eq!((rec.status.as_str(), rec.message.as_str()), ("done", "Imported 3 items"));
+    assert!(s.drain_events().iter().any(|e| matches!(e, crate::Event::Toast { message, .. } if message == "Imported 3 items")));
+    // Dropped on the viewer: they become layers too; a file that can't be read is reported.
+    s.execute("file.import", json!({"paths": ["/drop/c.png", "/drop/d.xyz"], "background": true, "addToComp": true, "position": [10.0, 20.0]})).unwrap();
+    s.execute("jobs.wait", json!({})).unwrap();
+    assert_eq!(s.active_comp().unwrap().layers.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["c.png"]);
+    assert_eq!(s.job_log.last().unwrap().message, "Imported 1 item. /drop/d.xyz: unsupported file");
+    // Agents and scripts import at once by default.
+    let r = s.execute("file.import", json!({"paths": ["/drop/e.png"]})).unwrap();
+    assert_eq!(r["items"].as_array().map(Vec::len), Some(1));
+}
+
 /// Audio, Lock and Shy don't change pixels: toggling them keeps the cached layers (#103).
 #[test]
 fn audio_lock_and_shy_keep_cached_layers() {
@@ -181,6 +244,71 @@ fn text_shape_mask_matte_parent() {
     let _ = s.render(cid, s.time(), Default::default());
     let info = s.execute("comp.info", json!({})).unwrap();
     assert_eq!(info["layers"].as_array().unwrap().len(), 2);
+}
+
+/// The toolbar's Fill / Stroke change a selected shape layer's paint (#205): a shape drawn
+/// without a stroke gets one, later edits change it, and the Contents "Add:" items (#206) include
+/// an empty Path and a Gradient Stroke that render.
+#[test]
+fn toolbar_fill_and_stroke_paint_selected_shape_layers() {
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"width": 400, "height": 300, "duration": 2})).unwrap();
+    let sh = s.execute("layer.newShape", json!({"kind": "rect", "fill": "#ff0000"})).unwrap()["layer"].as_u64().unwrap();
+    let paint = |s: &mut Session| s.execute("shape.fillStroke", json!({})).unwrap();
+    assert_eq!(paint(&mut s)["stroke"], serde_json::Value::Null, "drawn without a stroke");
+    s.execute("shape.fillStroke", json!({"stroke": "#00ff00", "strokeWidth": 6})).unwrap();
+    let p = paint(&mut s);
+    assert_eq!((p["stroke"][1].as_f64(), p["strokeWidth"].as_f64()), (Some(1.0), Some(6.0)), "{p}");
+    s.execute("shape.fillStroke", json!({"fill": "#0000ff", "strokeWidth": 3})).unwrap();
+    let p = paint(&mut s);
+    assert_eq!((p["fill"][2].as_f64(), p["strokeWidth"].as_f64()), (Some(1.0), Some(3.0)), "{p}");
+    // One stroke, before the fill (paths, stroke, fill), and each change is one undo step.
+    let l = s.active_comp().unwrap().layer(effectcraft_project::LayerId(sh)).unwrap().clone();
+    let group = l.props.group("contents/group").unwrap();
+    let order: Vec<&str> = group.sub("contents").unwrap().groups().map(|g| g.match_id.as_str()).collect();
+    assert_eq!(order, ["rect", "stroke", "fill"]);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(paint(&mut s)["strokeWidth"].as_f64(), Some(6.0));
+    // Only shape layers.
+    s.execute("layer.newSolid", json!({"color": "#808080"})).unwrap();
+    assert!(s.execute("shape.fillStroke", json!({"fill": "#ffffff"})).is_err());
+    for kind in ["path", "gstroke"] {
+        let r = s.execute("layer.addShapeItem", json!({"layer": sh, "kind": kind})).unwrap();
+        assert!(r["path"].as_str().is_some_and(|p| p.starts_with("contents/")), "{r}");
+    }
+    let cid = s.active_comp_id().unwrap();
+    let _ = s.render(cid, s.time(), Default::default());
+}
+
+/// Selecting a mask in the Timeline (its row or its Mask Path) selects all of its points, so the
+/// viewer drags the whole mask (#203); a shape's Path item works the same way.
+#[test]
+fn selecting_a_mask_selects_its_points() {
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"width": 400, "height": 300, "duration": 2})).unwrap();
+    let l = s.execute("layer.newSolid", json!({"color": "#808080"})).unwrap()["layer"].as_u64().unwrap();
+    let m1 = s.execute("layer.addMask", json!({"layer": l, "shape": "rect"})).unwrap()["mask"].as_u64().unwrap();
+    let m2 = s.execute("layer.addMask", json!({"layer": l, "shape": "ellipse"})).unwrap()["mask"].as_u64().unwrap();
+    let points = |s: &Session, m: u64| s.state.selected_vertices.iter().filter(|v| v.mask == m).count();
+    s.execute("prop.select", json!({"layer": l, "prop": m1, "selectKeys": false})).unwrap();
+    assert_eq!((points(&s, m1), s.state.selected_vertices.len()), (4, 4));
+    // Mask Path selects them too; Shift-adding another mask keeps the first.
+    let path = s.active_comp().unwrap().layer(effectcraft_project::LayerId(l)).unwrap().props.find_group(m2).unwrap().get("path").unwrap().uid;
+    s.execute("prop.select", json!({"layer": l, "prop": path, "add": true})).unwrap();
+    assert_eq!((points(&s, m1), points(&s, m2)), (4, 4));
+    // Another mask replaces them; another property deselects them.
+    s.execute("prop.select", json!({"layer": l, "prop": m2})).unwrap();
+    assert_eq!((points(&s, m1), points(&s, m2)), (0, 4));
+    // Delete removes the selected mask (not only its points).
+    s.execute("edit.clear", json!({})).unwrap();
+    let masks = |s: &Session| s.active_comp().unwrap().layer(effectcraft_project::LayerId(l)).unwrap().masks().unwrap().children.len();
+    assert_eq!(masks(&s), 1);
+    s.execute("prop.select", json!({"layer": l, "path": "transform/opacity"})).unwrap();
+    assert!(s.state.selected_vertices.is_empty());
+    let sh = s.execute("layer.newShape", json!({"kind": "star"})).unwrap()["layer"].as_u64().unwrap();
+    let star = s.execute("layer.addShapeItem", json!({"layer": sh, "kind": "path"})).unwrap()["uid"].as_u64().unwrap();
+    s.execute("prop.select", json!({"layer": sh, "prop": star})).unwrap();
+    assert_eq!(s.state.selected_vertices.len(), 0, "an empty Path has no points");
 }
 
 #[test]

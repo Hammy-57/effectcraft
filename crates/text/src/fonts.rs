@@ -209,9 +209,29 @@ impl Face {
     pub fn glyph(&self, c: char) -> Option<u32> {
         self.font()?.charmap().map(c).map(|g| g.to_u32()).filter(|g| *g != 0)
     }
+    /// Whether the face can draw `c`: it maps `c` to a glyph that has an outline, a colour glyph
+    /// or a bitmap. Some fonts map whole scripts to empty glyphs (#285); those don't count, so
+    /// fallback moves on to a face that draws the character. Characters that are blank by nature
+    /// (spaces, format characters) count as covered by any mapping.
     pub fn has_char(&self, c: char) -> bool {
-        self.glyph(c).is_some()
+        self.font().is_some_and(|f| covers(&f, c))
     }
+    /// Horizontal advance and vertical origin above the baseline, in pixels.
+    pub(crate) fn vertical_origin(&self, gid: u32, px: f32) -> Option<(f64, f64)> {
+        use skrifa::raw::TableProvider;
+        let font = self.font()?;
+        let glyph = skrifa::GlyphId::new(gid);
+        let metrics = font.glyph_metrics(Size::unscaled(), LocationRef::default());
+        let origin = match font.vorg() {
+            Ok(table) => f32::from(table.vertical_origin_y(glyph)),
+            Err(_) => metrics.bounds(glyph)?.y_max + f32::from(font.vmtx().ok()?.side_bearing(glyph)?),
+        };
+        let scale = f64::from(px / self.units_per_em());
+        let width = f64::from(metrics.advance_width(glyph)?) * scale;
+        let top = f64::from(origin) * scale;
+        (width.is_finite() && top.is_finite() && top.abs() < f64::from(px) * 4.0).then_some((width, top))
+    }
+
     pub fn metrics(&self, px: f32) -> VMetrics {
         let Some(f) = self.font() else {
             return VMetrics {
@@ -675,7 +695,54 @@ fn file_covers(f: &Face, c: char) -> bool {
     }
     let FaceData::File(p) = &f.info.data else { return f.has_char(c) };
     let Ok(data) = std::fs::read(p) else { return false };
-    FontRef::from_index(&data, f.info.index).ok().and_then(|font| font.charmap().map(c)).is_some_and(|g| g.to_u32() != 0)
+    FontRef::from_index(&data, f.info.index).ok().is_some_and(|font| covers(&font, c))
+}
+
+/// Characters that legitimately draw nothing: whitespace and the default-ignorable code points
+/// (soft hyphen, joiners, bidi controls, variation selectors…).
+fn blank_by_nature(c: char) -> bool {
+    c.is_whitespace()
+        || matches!(c as u32,
+            0x00AD | 0x034F | 0x061C | 0x115F | 0x1160 | 0x17B4 | 0x17B5 | 0x180B..=0x180F | 0x200B..=0x200F
+            | 0x202A..=0x202E | 0x2060..=0x206F | 0x3164 | 0xFE00..=0xFE0F | 0xFEFF | 0xFFA0 | 0x1BCA0..=0x1BCA3
+            | 0x1D173..=0x1D17A | 0xE0000..=0xE0FFF)
+}
+
+/// Whether `font` maps `c` to a glyph it can draw (see [`Face::has_char`]).
+fn covers(font: &FontRef, c: char) -> bool {
+    let Some(gid) = font.charmap().map(c).filter(|g| g.to_u32() != 0) else { return false };
+    blank_by_nature(c) || glyph_draws(font, gid)
+}
+
+/// Whether a glyph has an outline, a colour glyph or a bitmap in any strike.
+fn glyph_draws(font: &FontRef, gid: skrifa::GlyphId) -> bool {
+    use skrifa::outline::{DrawSettings, OutlinePen};
+    /// Counts the drawing segments of an outline.
+    struct Segments(usize);
+    impl OutlinePen for Segments {
+        fn move_to(&mut self, _: f32, _: f32) {}
+        fn line_to(&mut self, _: f32, _: f32) {
+            self.0 += 1;
+        }
+        fn quad_to(&mut self, _: f32, _: f32, _: f32, _: f32) {
+            self.0 += 1;
+        }
+        fn curve_to(&mut self, _: f32, _: f32, _: f32, _: f32, _: f32, _: f32) {
+            self.0 += 1;
+        }
+        fn close(&mut self) {}
+    }
+    if let Some(outline) = font.outline_glyphs().get(gid) {
+        let mut pen = Segments(0);
+        if outline.draw(DrawSettings::unhinted(Size::unscaled(), LocationRef::default()), &mut pen).is_ok() && pen.0 > 0 {
+            return true;
+        }
+    }
+    if font.color_glyphs().get(gid).is_some() {
+        return true;
+    }
+    let strikes = font.bitmap_strikes();
+    (0..strikes.len()).any(|i| strikes.get(i).is_some_and(|s| s.get(gid).is_some()))
 }
 
 /// Results of the expensive part of [`fallback_for`], per 256-character block and preferred face
@@ -905,6 +972,80 @@ mod tests {
         assert!(!has_bold || w >= 600, "{} {}", f.info.family, f.info.style);
         // Cached: the second call is a lookup.
         assert_eq!(fallback_for('水', inter), f.id);
+    }
+
+    /// A minimal TrueType font built in code (no font file in the repo): U+0020 and U+E000 map to
+    /// an empty glyph, U+E001 to a triangle.
+    fn blank_glyph_font() -> Vec<u8> {
+        fn u16s(v: &[u16]) -> Vec<u8> {
+            v.iter().flat_map(|x| x.to_be_bytes()).collect()
+        }
+        let delta_space = 1u16.wrapping_sub(0x20);
+        let cmap4 = {
+            let mut t = u16s(&[4, 0, 0, 6, 4, 1, 2]);
+            t.extend(u16s(&[0x20, 0xE001, 0xFFFF, 0, 0x20, 0xE000, 0xFFFF, delta_space, 0x2001, 1, 0, 0, 0]));
+            let len = t.len() as u16;
+            t[2..4].copy_from_slice(&len.to_be_bytes());
+            t
+        };
+        let mut cmap = u16s(&[0, 1, 3, 1, 0, 12]);
+        cmap.extend(cmap4);
+        // glyph 2: one contour of three on-curve points (100,0) (500,0) (300,600)
+        let mut glyf = u16s(&[1, 100, 0, 500, 600, 2, 0]);
+        glyf.extend([1u8, 1, 1]);
+        glyf.extend(u16s(&[100, 400, (-200i16) as u16, 0, 0, 600]));
+        glyf.push(0);
+        let loca = u16s(&[0, 0, 0, (glyf.len() / 2) as u16]);
+        let mut head = u16s(&[1, 0, 1, 0, 0, 0, 0x5F0F, 0x3CF5, 0, 1000]);
+        head.extend([0u8; 16]);
+        head.extend(u16s(&[100, 0, 500, 600, 0, 8, 2, 0, 0]));
+        let mut hhea = u16s(&[1, 0, 800, (-200i16) as u16, 0, 600, 0, 0, 500, 1, 0, 0]);
+        hhea.extend([0u8; 8]);
+        hhea.extend(u16s(&[0, 3]));
+        let hmtx = u16s(&[600, 0, 600, 0, 600, 0]);
+        let maxp = u16s(&[1, 0, 3, 3, 1, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let strings: Vec<Vec<u8>> = ["Blank Glyph Test", "Regular"].iter().map(|s| s.encode_utf16().flat_map(|u| u.to_be_bytes()).collect()).collect();
+        let mut name = u16s(&[0, 2, 30]);
+        let mut off = 0;
+        for (id, st) in strings.iter().enumerate() {
+            name.extend(u16s(&[3, 1, 0x409, id as u16 + 1, st.len() as u16, off]));
+            off += st.len() as u16;
+        }
+        strings.iter().for_each(|st| name.extend(st));
+        let tables: [(&[u8; 4], Vec<u8>); 8] =
+            [(b"cmap", cmap), (b"glyf", glyf), (b"head", head), (b"hhea", hhea), (b"hmtx", hmtx), (b"loca", loca), (b"maxp", maxp), (b"name", name)];
+        let mut out = u16s(&[1, 0, tables.len() as u16, 128, 3, 0]);
+        let mut offset = 12 + 16 * tables.len();
+        let mut body = vec![];
+        for (tag, data) in &tables {
+            out.extend(*tag);
+            out.extend([0u8; 4]);
+            out.extend((offset as u32).to_be_bytes());
+            out.extend((data.len() as u32).to_be_bytes());
+            let padded = data.len().div_ceil(4) * 4;
+            body.extend(data);
+            body.resize(body.len() + padded - data.len(), 0);
+            offset += padded;
+        }
+        out.extend(body);
+        out
+    }
+
+    /// A face that maps a character to an empty glyph doesn't cover it, so fallback skips it
+    /// (#285); a blank space still counts, and a drawn glyph is found as before.
+    #[test]
+    fn an_empty_glyph_does_not_cover_its_character() {
+        let ids = add_font_data(blank_glyph_font());
+        let &[id] = ids.as_slice() else { panic!("one face expected: {ids:?}") };
+        let f = face(id);
+        assert_eq!(f.info.family, "Blank Glyph Test");
+        assert!(f.glyph('\u{e000}').is_some(), "the cmap maps it");
+        assert!(!f.has_char('\u{e000}'), "but its glyph is empty");
+        assert!(f.has_char('\u{e001}'), "a drawn glyph covers its character");
+        assert!(f.has_char(' '), "a space is blank by nature");
+        let inter = resolve("Inter", "Regular").face;
+        assert_ne!(fallback_for('\u{e000}', inter), id, "fallback never picks the empty glyph");
+        assert_eq!(fallback_for('\u{e001}', inter), id, "fallback finds the drawn one");
     }
 
     #[test]

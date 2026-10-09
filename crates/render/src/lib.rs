@@ -336,6 +336,8 @@ pub trait FxTarget {
     fn gpu(&mut self, steps: &[FxStep]) -> bool;
     /// Run one CPU effect: `f` maps the buffer.
     fn cpu(&mut self, f: &mut dyn FnMut(Buf) -> Buf);
+    /// Move the buffer's effect coordinates: subtract `d` (buffer px) from its offset.
+    fn shift(&mut self, d: [f64; 2]);
 }
 
 /// The CPU effect target (GPU chains go through [`Accelerator::effects`]: upload, readback).
@@ -359,6 +361,11 @@ impl FxTarget for CpuFx<'_> {
     fn cpu(&mut self, f: &mut dyn FnMut(Buf) -> Buf) {
         if let Some(b) = self.buf.take() {
             self.buf = Some(f(b));
+        }
+    }
+    fn shift(&mut self, d: [f64; 2]) {
+        if let Some(b) = &mut self.buf {
+            b.offset = [b.offset[0] - d[0], b.offset[1] - d[1]];
         }
     }
 }
@@ -744,18 +751,21 @@ impl<'a> Renderer<'a> {
         Region::Full
     }
 
-    /// Rasterisation scale of a layer's source: the output scale, or — for Continuously
-    /// Rasterize text and shape layers — the output scale times the layer's on-screen scale
-    /// (quarter-octave steps, rounded up, so vector content is drawn at its final size and
-    /// stays sharp when scaled up).
+    /// Rasterisation scale of a layer's source: the output scale, or — for text layers, which are
+    /// always continuously rasterised, and Continuously Rasterize shape layers and vector footage —
+    /// the output scale times the layer's on-screen scale (quarter-octave steps, rounded up, so
+    /// vector content is drawn at its final size and stays sharp when scaled up).
     pub fn raster_scale(&self, ctx: &EvalCtx, layer: &Layer) -> f64 {
         let s = self.opts.scale;
-        let vector = match layer.source {
-            LayerSource::Text | LayerSource::Shape => true,
-            LayerSource::Footage { item } => matches!(self.project.item(item).map(|i| &i.kind), Some(ItemKind::Footage(f)) if is_vector_footage(f)),
+        let continuous = match layer.source {
+            LayerSource::Text => true,
+            LayerSource::Shape => layer.switches.collapse,
+            LayerSource::Footage { item } => {
+                layer.switches.collapse && matches!(self.project.item(item).map(|i| &i.kind), Some(ItemKind::Footage(f)) if is_vector_footage(f))
+            }
             _ => false,
         };
-        if !layer.switches.collapse || !vector {
+        if !continuous {
             return s;
         }
         let (l2c, _) = ctx.layer_to_comp(layer);
@@ -973,7 +983,14 @@ impl<'a> Renderer<'a> {
         let Some(fx) = layer.effects() else { return };
         let lt = layer.layer_time(ctx.time);
         let size = source_size(self.project, layer);
-        let layer_size = if size.0 == 0 { [ctx.comp.width as f64, ctx.comp.height as f64] } else { [size.0 as f64, size.1 as f64] };
+        // Layers without a source rectangle (shape, text) have comp-sized bounds centred on
+        // their origin, which their content surrounds.
+        let (layer_size, bounds_origin) = if size.0 == 0 {
+            let (w, h) = (ctx.comp.width as f64, ctx.comp.height as f64);
+            ([w, h], [-w / 2.0, -h / 2.0])
+        } else {
+            ([size.0 as f64, size.1 as f64], [0.0; 2])
+        };
         let mask_shapes = masks::shapes(ctx, layer);
         let host = FxHost { r: self, ctx, layer, index: Default::default() };
         let env = EffectEnv {
@@ -986,6 +1003,7 @@ impl<'a> Renderer<'a> {
             working_linear: self.pipe.linear,
             shutter: self.mb_on(ctx, layer).then_some((ctx.comp.shutter_angle, ctx.comp.shutter_phase, ctx.comp.motion_blur_samples)),
             comp_space: fx_comp_space(ctx, layer).map(|m| [m.0[0], m.0[1]]),
+            bounds_origin,
         };
         // Video effects in stack order (index, group, spec); disabled and audio effects skipped.
         let stack: Vec<(usize, &effectcraft_project::PropGroup, &'static effectcraft_effects::EffectSpec)> = fx
@@ -999,6 +1017,25 @@ impl<'a> Renderer<'a> {
             })
             .filter(|(_, _, s)| !effectcraft_effects::audio_fx::is_audio_effect(s.id))
             .collect();
+        // A shape layer's effect coordinates are shifted by `d` (buffer px) onto the comp-sized
+        // canvas centred on its anchor ([`shape_fx_origin`]), on the CPU and the GPU alike;
+        // comp space follows them.
+        let d = shape_fx_origin(ctx, layer).map(|d| [d[0] * self.opts.scale, d[1] * self.opts.scale]);
+        let env = match d {
+            Some(d) => {
+                let comp_space = env.comp_space.map(|[r0, r1]| {
+                    let rs = self.raster_scale(ctx, layer);
+                    let (dx, dy) = if rs > 1e-9 { (d[0] / rs, d[1] / rs) } else { (0.0, 0.0) };
+                    [[r0[0], r0[1], r0[2] - r0[0] * dx - r0[1] * dy], [r1[0], r1[1], r1[2] - r1[0] * dx - r1[1] * dy]]
+                });
+                // The shifted coordinates start at the canvas's corner, so the layer bounds edge
+                // pinning holds start there too.
+                EffectEnv { comp_space, bounds_origin: [0.0; 2], ..env }
+            }
+            None => env,
+        };
+        let d = d.unwrap_or([0.0; 2]);
+        let neg = [-d[0], -d[1]];
         let accel = self.active_accel();
         let mut k = 0;
         while k < stack.len() {
@@ -1019,7 +1056,10 @@ impl<'a> Renderer<'a> {
                     })
                     .collect();
                 let t0 = web_time::Instant::now();
-                if target.gpu(&steps) {
+                target.shift(d);
+                let done = target.gpu(&steps);
+                target.shift(neg);
+                if done {
                     if let Some(v) = timing.as_deref_mut() {
                         let ms = t0.elapsed().as_secs_f64() * 1e3 / run.len() as f64;
                         v.extend(run.iter().map(|(_, _, s)| (format!("{} (gpu)", s.id), ms)));
@@ -1031,32 +1071,17 @@ impl<'a> Renderer<'a> {
             k += 1;
             let params = self.effect_params(ctx, layer, g);
             host.index.store(i, std::sync::atomic::Ordering::Relaxed);
-            let d = shape_fx_origin(ctx, layer).map(|d| [d[0] * self.opts.scale, d[1] * self.opts.scale]);
-            // The CPU shifts a shape layer's effect coordinates by `d` (buffer px): comp space
-            // follows them.
-            let comp_space = match (env.comp_space, d) {
-                (Some([r0, r1]), Some(d)) => {
-                    let rs = self.raster_scale(ctx, layer);
-                    let (dx, dy) = if rs > 1e-9 { (d[0] / rs, d[1] / rs) } else { (0.0, 0.0) };
-                    Some([[r0[0], r0[1], r0[2] - r0[0] * dx - r0[1] * dy], [r1[0], r1[1], r1[2] - r1[0] * dx - r1[1] * dy]])
-                }
-                (cs, _) => cs,
-            };
-            let env = EffectEnv { effect_index: i, comp_space, ..env };
+            let env = EffectEnv { effect_index: i, ..env };
             let ectx = EffectCtx { params: &params, time: lt.seconds(), layer_size, seed: g.uid as u32, adjustment, env };
             let t0 = web_time::Instant::now();
-            target.cpu(&mut |mut buf| {
-                if let Some(d) = d {
-                    buf.offset = [buf.offset[0] - d[0], buf.offset[1] - d[1]];
-                }
+            target.shift(d);
+            target.cpu(&mut |buf| {
                 let mut buf = effectcraft_effects::apply(spec, &ectx, buf);
-                if let Some(d) = d {
-                    buf.offset = [buf.offset[0] + d[0], buf.offset[1] + d[1]];
-                }
                 // 8/16 bpc effects write integer pixels.
                 self.pipe.quantize(&mut buf.img);
                 buf
             });
+            target.shift(neg);
             if let Some(v) = timing.as_deref_mut() {
                 v.push((spec.id.to_string(), t0.elapsed().as_secs_f64() * 1e3));
             }

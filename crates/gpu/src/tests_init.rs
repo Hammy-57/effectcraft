@@ -136,6 +136,19 @@ fn initialization_unwind_drains_all_scopes_before_the_next_operation() {
 
 /// Acceptance for the captured RTX 5090 / FXC failure. Future compiler/shader fixes can
 /// legitimately make FXC succeed; this diagnostic is deliberately outside portable CI.
+/// On OpenGL the compositor declines at once instead of translating its kernels for tens of
+/// seconds and then failing (#243). Skips where there is no OpenGL adapter.
+#[test]
+fn opengl_adapters_get_cpu_compositing_at_once() {
+    let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+    desc.backends = wgpu::Backends::GL;
+    let Some((adapter, device, queue)) = native_device(desc, false) else { return };
+    let t = std::time::Instant::now();
+    let error = crate::Gpu::new(&adapter, device, queue).err().expect("no GPU compositor on OpenGL");
+    assert!(error.contains("(Gl)"), "{error}");
+    assert!(t.elapsed() < std::time::Duration::from_secs(1), "{:?}", t.elapsed());
+}
+
 #[test]
 #[cfg(target_os = "windows")]
 #[ignore = "requires the reproduced Windows DX12/FXC pointwise compiler failure; no adapter skips"]

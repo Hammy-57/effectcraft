@@ -15,6 +15,7 @@ pub mod camera_track;
 pub mod commands;
 pub mod config;
 pub mod demo;
+pub mod ease_presets;
 pub mod footage_check;
 pub mod guard;
 pub mod history;
@@ -233,10 +234,17 @@ pub struct EditorState {
     /// selected layers.
     #[serde(skip)]
     pub effect_clipboard: Vec<effectcraft_project::PropGroup>,
+    /// Copied shape items (Edit ▸ Copy with groups, paths, paints or path operations selected in
+    /// a shape layer's Contents); Paste adds them to the selected shape layers.
+    #[serde(skip)]
+    pub contents_clipboard: Vec<effectcraft_project::PropGroup>,
     /// Selected mask vertices (viewer Selection tool / pen).
     #[serde(default)]
     pub selected_vertices: Vec<VertexRef>,
     pub snapping: bool,
+    /// Tools bar ▸ Snapping options (which features snap, Snap Edges Extended).
+    #[serde(default)]
+    pub snap_features: viewer::SnapFeatures,
     /// Last applied effect id (Effect ▸ last effect).
     pub last_effect: Option<String>,
     /// Viewer region of interest `[x, y, w, h]` in comp pixels (Composition ▸ Crop Comp to Region
@@ -273,6 +281,9 @@ pub struct EditorState {
     /// Puppet tool options for new meshes.
     #[serde(default)]
     pub puppet: commands::puppet::PuppetOptions,
+    /// The shape tools' and the Pen's options (Tool Creates Shape / Mask, Fill and Stroke).
+    #[serde(default)]
+    pub shape_tool: commands::shape_tool::ShapeTool,
     /// View ▸ Switch View Layout: 1, 2 or 4 views side by side in the Composition viewer.
     #[serde(default = "one_view")]
     pub view_layout: u8,
@@ -368,6 +379,9 @@ pub struct Session {
     /// that ask for [`effectcraft_render::Backend::Gpu`]/`Auto`, and by Render Queue exports
     /// when the project's renderer is the GPU.
     pub accel: Option<Arc<dyn effectcraft_render::Accelerator>>,
+    /// Why there is no [`Session::accel`] (`render.backend`'s `why`): the host's reason, e.g. a
+    /// headless start without `--gpu` or the compositor's setup error.
+    pub accel_note: Option<String>,
     /// Expression syntax checker (set by the host that links the expression engine).
     pub expr_check: Option<fn(&str) -> std::result::Result<(), String>>,
     pub importer: Option<Arc<dyn Importer>>,
@@ -413,12 +427,17 @@ pub struct Session {
     pub config: Option<Arc<dyn config::ConfigStore>>,
     /// Keyboard shortcut presets.
     pub keymaps: shortcuts::Keymaps,
+    /// User ease presets (Window ▸ Ease Presets; the built-in ones are in [`ease_presets`]).
+    pub ease_presets: Vec<ease_presets::EasePreset>,
     /// Frontend-only commands offered for binding.
     pub ui_commands: Vec<shortcuts::UiCommand>,
     /// Cache of the resolved active preset (read it with [`Session::shortcuts`]).
     pub shortcut_table: std::sync::OnceLock<shortcuts::ShortcutTable>,
     /// Auto-save bookkeeping.
     pub autosave: autosave::AutoSaveState,
+    /// Host-owned isolation for all auto-saves (e.g. one MCP session). Independent of settings
+    /// and project bookkeeping, so opening/saving a project or changing preferences keeps it.
+    pub autosave_folder_override: Option<std::path::PathBuf>,
     /// The viewer snapshot (Take Snapshot / Show Snapshot).
     pub snapshot: Option<viewer::Snapshot>,
     /// The JavaScript scripting engine (set by the host that links `effectcraft-script`):
@@ -499,6 +518,7 @@ impl Default for Session {
             footage: Arc::new(NoFootage),
             expr: None,
             accel: None,
+            accel_note: None,
             expr_check: None,
             importer: None,
             exporter: None,
@@ -522,9 +542,11 @@ impl Default for Session {
             prefs_revision: 0,
             config: None,
             keymaps: shortcuts::Keymaps::default(),
+            ease_presets: vec![],
             ui_commands: vec![],
             shortcut_table: std::sync::OnceLock::new(),
             autosave: autosave::AutoSaveState::default(),
+            autosave_folder_override: None,
             snapshot: None,
             script: None,
             plugin_loader: None,
@@ -993,6 +1015,8 @@ mod tests_codec_options;
 mod tests_color_view;
 #[cfg(test)]
 mod tests_disk_cache;
+#[cfg(test)]
+mod tests_ease_presets;
 #[cfg(test)]
 mod tests_effects;
 #[cfg(test)]

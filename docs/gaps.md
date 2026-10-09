@@ -5,7 +5,7 @@ and the work that closes the gap. This document is meant for contributors and ag
 what to work on. The [ROADMAP](../ROADMAP.md) summarises it; [parity.md](parity.md) is the
 feature-by-feature checklist it builds on.
 
-*Assessed 5 October 2026, user issues updated 7 October. Estimates marked "≈" are judgements from the evidence listed, not
+*Assessed 5 October 2026, user issues updated 8 October. Estimates marked "≈" are judgements from the evidence listed, not
 measurements. Update this file when the evidence changes.*
 
 ## Two different questions
@@ -34,7 +34,7 @@ of them have been reconciled.
 | Behaves like After Effects | largely unmeasured, ≈ 60–80% | One outside contributor found four bugs in features marked done within a day (PRs #6–#10): Hold keyframes eased the motion into them, `keyInSpatialTangent` / `keyOutSpatialTangent` had the wrong names, a zero frame rate crashed, Find and Enter Full Screen shared Ctrl+F off macOS. There are about 10 After Effects reference captures in total. The first live G1 comparison now checks eight scalar Rotation/ease cases (168 samples) against AE 26.3x87 via AEsync 2.0.4: all pass after fixing overlapping temporal influences, with maximum error below 3e-11 degrees ([scores and reproduction](fidelity/README.md)). Other animation behavior and rendered frames remain unmeasured. User reports of 6 October found five more in features marked done (the Render Queue's template menu, angle revolutions, switches wiping the RAM preview, audio playback skipping frames, preview crashing when video memory ran out; all fixed 7 October) |
 | Opening existing After Effects work | ≈ 0% | `.aep` / `.aepx` projects cannot be opened. Third-party After Effects plug-ins cannot run. Expressions and the scripting object model are strong, so scripts and expressions carry over |
 | Stability | improving | 23 never-crash PRs landed on 4 October; community PRs on 7 October fixed a hang on projects whose parent chains loop (#142), a panic on non-ASCII label colours (#135), and contained GPU initialization and device failures (#139); [AGENTS.md](../AGENTS.md) "Never crash" now binds every crate. On 5 October `cargo xtask ci` failed on main under Rust 1.99's clippy (a fix is in progress) |
-| Real-user experience | ≈ 70%, uneven by platform | Issues #41–#47 (all from the Linux AppImage 0.1.1, 5 October): panning the viewer snaps back, panels can't be resized or rearranged, drag-and-drop and double-click import don't work, layer rename gets stuck, the Layer Settings arrow does nothing, the Project panel clips, the Wayland window icon is generic. Issues #63–#68 (macOS, 5 October): scaling a layer by its handles goes wrong and can stick at 0, two 3D compasses, the viewer lags while a layer is dragged (a frame renders in 20 ms but showed after ≈ 100 ms, behind RAM preview prefetch), the Discord and other links do nothing, Delete doesn't delete in the Project panel, hidden layers can be selected in the viewer. All but the last two were fixed or confirmed fixed with a test on 5–6 October (those two have community PRs); file drops still can't work on Wayland (winit has no support). The panning, rename and arrow bugs had been fixed in v0.2.0 already; nobody had told the reporter. A Windows user (6 October, on Discord) found the font menus listed only the three bundled fonts: installed fonts were read only when a project asked for one, on every platform. Fixed with a regression test on 6 October; the menus now list every installed family and its own styles, and agents get `text.fonts` / `list_fonts`. Seven reports of 6 October (Linux .deb and Windows): Project items and files couldn't be dropped on the viewer (#85), nor effects on a layer there (#88); drops in the Timeline ignored where they landed (#89); an angle's revolutions couldn't be edited (#93); toggling Audio, Lock or Shy threw away the RAM preview and playback with audio skipped frames (#103); running out of video memory panicked every frame thread and left frames stuck (#106); choosing a Render Settings template in the Render Queue did nothing (#117: any popup menu moved up to fit the window closed on the press). All seven were fixed with regression tests on 7 October. Most checking happens on macOS. No localisation, no accessibility work |
+| Real-user experience | ≈ 70%, uneven by platform | Issues #41–#47 (all from the Linux AppImage 0.1.1, 5 October): panning the viewer snaps back, panels can't be resized or rearranged, drag-and-drop and double-click import don't work, layer rename gets stuck, the Layer Settings arrow does nothing, the Project panel clips, the Wayland window icon is generic. Issues #63–#68 (macOS, 5 October): scaling a layer by its handles goes wrong and can stick at 0, two 3D compasses, the viewer lags while a layer is dragged (a frame renders in 20 ms but showed after ≈ 100 ms, behind RAM preview prefetch), the Discord and other links do nothing, Delete doesn't delete in the Project panel, hidden layers can be selected in the viewer. All but the last two were fixed or confirmed fixed with a test on 5–6 October (those two have community PRs); file drops still can't work on Wayland (winit has no support). The panning, rename and arrow bugs had been fixed in v0.2.0 already; nobody had told the reporter. A Windows user (6 October, on Discord) found the font menus listed only the three bundled fonts: installed fonts were read only when a project asked for one, on every platform. Fixed with a regression test on 6 October; the menus now list every installed family and its own styles, and agents get `text.fonts` / `list_fonts`. Seven reports of 6 October (Linux .deb and Windows): Project items and files couldn't be dropped on the viewer (#85), nor effects on a layer there (#88); drops in the Timeline ignored where they landed (#89); an angle's revolutions couldn't be edited (#93); toggling Audio, Lock or Shy threw away the RAM preview and playback with audio skipped frames (#103); running out of video memory panicked every frame thread and left frames stuck (#106); choosing a Render Settings template in the Render Queue did nothing (#117: any popup menu moved up to fit the window closed on the press). All seven were fixed with regression tests on 7 October. Reports of 7 October (Linux, macOS, Windows): the app opened the demo project on every launch, so a new comp landed in it (#204); a comp wider than the GPU's texture limit (11000 × 2200) at Full resolution stopped the window drawing (#201); an Intel HD Graphics 5500 couldn't start the app (#198: most likely the window's device asked for limits that GPU doesn't have, and the failure was silent); Audio Spectrum / Waveform stood still in the viewer (#209) and preview sound waited for the whole work area to cache (#208); a layer couldn't be deselected from the time graph, a shape layer's Fill and Stroke showed only with a shape tool and a drawn shape had no stroke to change, Alt+Shift+P didn't reveal Position (#205); a mask selected in the Timeline wasn't selected in the viewer, Mask Feather had no link and took negative values, the Project panel had no selection box (#203); shape layers had no Add menu for Trim Paths and the other operations, and Classic 3D comps hid Geometry Options (#206); dragging Puppet pins re-rendered the layer under the Puppet at every move (#212). All were fixed with regression tests the same day (#219–#222); the #198 fix couldn't be checked on that GPU. Reports of 8 October (browser, Windows, macOS): an empty project at 1280 × 800 with device pixel ratio 2 crashed on its first frame, because the Project panel's scroll bar clamped its thumb to a track shorter than the thumb (#231, any short panel on every platform); Media Browser ▸ Add Files… dropped a file it couldn't read without a word (#226); after the page's WebGPU device was lost, the browser editor froze on its last frame while edits went on (#225); a press in the viewer always took the topmost layer, so a selected layer behind others couldn't be dragged (#230); the language didn't follow the system's (#229); and a list of missing After Effects behaviour (#227): drawing into, copying, pasting and duplicating shape contents, Tool Creates Shape / Mask and Fill / Stroke Options, Turbulent Displace, Wave Warp and Bulge pinning all but a shape layer's bottom-right quadrant, a Spacebar hold that previewed instead of being the Hand tool, the Effect menu in Effect Controls, dropping items on New Composition and dragging over layer switches. All were fixed with regression tests the same day (#235, #237–#241); multi-monitor support and the Project panel's empty-area menu (community PR #210) remain from #227, and effect points on shape and text layers still sit half a comp off. Most checking happens on macOS. Localisation covers Japanese menus only; no accessibility work |
 | Performance | unknown against After Effects | Internal numbers only (e.g. Advanced 3D 290 ms/frame at 1080p on the GPU, an M4 Pro under load). Nothing benchmarked against After Effects; no large real projects (4K footage, hundreds of layers) tested |
 | Media formats | ≈ 80% | H.264, ProRes, HEVC, AV1, image sequences and audio exist. The new HEVC / AV1 encoders have no B-frames, multi-reference or SAO / CDEF, so files are larger than from mature encoders. Camera formats (BRAW, R3D, ProRes RAW, variable-frame-rate phone video) are unverified |
 | AI-assisted tools | ≈ 50% | Both tools can use trained models (pure-Rust inference, optional downloads), but nothing compares them with After Effects yet. Roto Brush 2.0 / 3.0 with MobileSAM (M13.35) scores IoU 0.989 on the base frame of our synthetic moving-disc test and ≥ 0.980 over 20 propagated frames (classic: 0.973). Face tracking with MediaPipe Face Landmarker (M13.36) matches Google's own pipeline to 0.85 px on average on a test portrait; on our synthetic clip the eyes and chin stay within 4% of the face height |
@@ -65,8 +65,9 @@ The most important missing piece: it turns every other estimate here into a meas
 
 - Fix user issues as they come in, each with a regression test, and answer the reporter (#41–#47
   and #63–#68 are handled, as are the Windows report that the font menus missed installed fonts
-  and the reports of 6 October, #85, #88, #89, #93, #103, #106 and #117; Wayland file drops wait
-  on winit).
+  and the reports of 6 October, #85, #88, #89, #93, #103, #106 and #117, and of 7 October, #198,
+  #201, #203–#206, #208, #209 and #212, and of 8 October, #225, #226 and #229–#231; #227 is
+  handled except multi-monitor support; Wayland file drops wait on winit).
 - Run the headless snapshot and control-channel checks on Linux (X11 and Wayland) and Windows, not
   only macOS. Interactions that only fail with real input (docking drags, viewer pan, drag-and-drop
   import, inline rename) need scripted input tests.
@@ -90,6 +91,40 @@ The most important missing piece: it turns every other estimate here into a meas
   Windows, verify that Escape cancels edits and non-finite entries leave the value and undo
   history unchanged in Effect Controls, Timeline and Properties. Valid entries still commit on
   Enter or click-away.
+- Regression evidence for the reports of 7 October, checked headlessly on Linux: `ui_viewer`
+  `full_resolution_frames_wider_than_the_texture_limit_fit` (#201), the desktop app's
+  `no_arguments_start_an_empty_project` (#204) and `device_limits_fit_the_adapter` (#198),
+  `audio_spectrum_follows_time_through_the_layer_cache` (#209),
+  `preview_with_audio_sounds_once_rendering_keeps_up` (#208), `ui_timeline_shapes` (the Add menu
+  and Change Renderer, #206; deselecting below the layers, Alt+Shift+P and the toolbar's stroke,
+  #205; linked Mask Feather, #203), `dragging_in_the_empty_area_box_selects_items` and
+  `selecting_a_mask_selects_its_points` (#203), and `input_keys_ignore_later_effects` (#212).
+- Regression evidence for the reports of 8 October, checked headlessly on Windows:
+  `a_short_project_panel_draws` (#231), `viewer_press_prefers_a_selected_layer_under_the_pointer`
+  (#230), `match_system_uses_the_system_language_where_there_is_a_catalog` (#229) and
+  `apps/effectcraft-web/tests/page.mjs` (#226, #225); the #225, #226 and #231 reproductions also
+  pass in the dev web build in headless Chrome 154 (device pixel ratio 2, a rejected file read,
+  `GPUDevice.destroy()`).
+- Regression evidence for the Turbulent Displace, Wave Warp and Bulge pinning of #227:
+  `edge_pinning_displaces_all_of_a_centred_shape_layer` (render) and
+  `edge_pinning_on_a_shape_layer` (GPU against CPU).
+- Regression evidence for the interface items of [#227](https://github.com/storytold/effectcraft/issues/227),
+  checked headlessly on Windows: `spacebar_taps_preview_and_held_spacebar_pans_the_viewer` and
+  `spacebar_drag_scrolls_the_time_graph` (Spacebar previews on its release, held it is the Hand
+  tool), `right_click_in_effect_controls_shows_the_effect_menu`,
+  `project_items_dropped_on_new_comp_make_a_composition` and
+  `dragging_over_layer_switches_sets_them_all`.
+- Regression evidence for the shape layer items of
+  [#227](https://github.com/storytold/effectcraft/issues/227), checked headlessly on Windows:
+  `shape_tools_draw_into_the_selected_shape_layer` and `ui_viewer`
+  `shape_tool_draws_into_the_selected_shape_layer` (a shape tool adds a group to the selected
+  shape layer), `shape_contents_copy_cut_and_paste_between_shape_layers` and
+  `ctrl_c_and_ctrl_v_copy_a_shape_group_into_another_shape_layer` (Copy, Cut and Paste of shape
+  items), `duplicate_with_shape_items_selected_duplicates_them_in_place` and
+  `ctrl_d_duplicates_the_selected_shape_group_in_its_layer` (Duplicate), and
+  `shape_tool_options_paint_new_shapes`, `masks_of_every_shape_tool_kind`,
+  `tool_creates_mask_draws_a_mask_on_the_selected_shape_layer` and
+  `fill_options_paint_the_next_shape` (Tool Creates Shape / Mask, Fill and Stroke Options).
 - Done when: no open bug blocks a basic workflow (import, arrange, animate, preview, render) on
   any of the three desktop platforms, and every bug users report gets triaged within a day.
 
@@ -107,6 +142,12 @@ The most important missing piece: it turns every other estimate here into a meas
 - `.aep` / `.aepx` import is the largest single barrier to switching. It needs an **owner
   decision** on clean-room scope (whether and how the format may be studied), like the open
   `.prproj` question in `plan/STATUS.md`.
+- A candidate for that decision (#248): [py-aep](https://github.com/forticheprod/py-aep), an MIT
+  licensed Python library that reads and writes `.aep` files, reported by a user as working well.
+  It can't be linked into the pure-Rust app. It could run as an external converter (`.aep` to
+  `.ecproj`, the way ffmpeg is used only from outside), or its format knowledge could be ported.
+  The second means reading another implementation of the format, which AGENTS.md rules out
+  unless the clean-room scope allows it.
 - Also in this area: relative footage paths and relinking when a project moves (parity.md, Project).
 - Done when: the decision is recorded and, if approved, a corpus of real-world-shaped projects
   opens with its comps, layers, keyframes, effects and expressions intact.
@@ -144,6 +185,9 @@ The most important missing piece: it turns every other estimate here into a meas
 - After Effects SDK plug-ins cannot run in EffectCraft. Our own WebAssembly plug-in API exists
   ([plugins.md](plugins.md)). Grow it: documentation, examples, and original effects that cover
   what the most common third-party plug-ins are used for (particles, glows, 3D objects, sabers).
+- Done so far: ease presets (Window ▸ Ease Presets, `keys.easePreset.*`, #254) cover what
+  ease-curve plug-ins are used for: easing curves kept by name, drawn and edited in a value graph,
+  and applied to pairs of keyframes ([parity.md](parity.md#update-ease-presets-254)).
 
 ### G9. Reach
 

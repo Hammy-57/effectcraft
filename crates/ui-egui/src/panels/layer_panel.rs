@@ -147,7 +147,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 let x0 = -buf.offset[0] / buf.scale;
                 let y0 = -buf.offset[1] / buf.scale;
                 let rect = [x0, y0, x0 + buf.img.width as f64 / buf.scale, y0 + buf.img.height as f64 / buf.scale];
-                let tex = ctx.load_texture("layer-panel", img, egui::TextureOptions::LINEAR);
+                let tex = crate::frames::load_fitted(&ctx, "layer-panel", img, egui::TextureOptions::LINEAR);
                 let c = Tex { key, tex, rect };
                 ctx.data_mut(|d| d.insert_temp(tex_id(), c.clone()));
                 c

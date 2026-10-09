@@ -629,3 +629,34 @@ fn a_collapsed_3d_precomps_2d_layers_ignore_the_camera() {
     }
     assert!(img.get(100, 61)[3] < 0.01, "and no more: {:?}", img.get(100, 61));
 }
+
+/// #227: a shape layer's content surrounds its origin, so edge pinning (Turbulent Displace's
+/// default Pin All, Wave Warp's All Edges) must measure from comp-sized bounds centred on it;
+/// bounds starting at the origin pinned all but the bottom-right quadrant.
+#[test]
+fn edge_pinning_displaces_all_of_a_centred_shape_layer() {
+    for (id, vals) in [("ec.distort.turbulentdisplace", vec![]), ("ec.distort.wavewarp", vec![("pinning", Value::Enum(1))])] {
+        let (mut p, cid, comp) = setup();
+        let mut l = build::layer(&mut p, &comp, "Shape Layer 1", LayerSource::Shape, (200, 100), None);
+        let mut next = p.next_id;
+        let mut ids = Ids(&mut next);
+        let rect = build::shape_rect(&mut ids, [180.0, 80.0], [0.0, 0.0], 0.0);
+        let fill = build::shape_fill(&mut ids, [1.0, 0.0, 0.0, 1.0]);
+        let g = build::shape_group(&mut ids, "Rectangle 1", vec![rect, fill]);
+        p.next_id = next;
+        l.props.sub_mut("contents").unwrap().children.push(g.into());
+        p.comp_mut(cid).unwrap().layers.push(l.clone());
+        let plain = render_frame(&p, cid, Tick::ZERO, 1.0);
+        add_effect_200(&mut p, &mut l, id, &vals);
+        p.comp_mut(cid).unwrap().layers = vec![l];
+        let warped = render_frame(&p, cid, Tick::ZERO, 1.0);
+        // Alpha change per comp quadrant (TL, TR, BL, BR): the rectangle's edges move in each.
+        let mut q = [0.0f32; 4];
+        for y in 0..100 {
+            for x in 0..200 {
+                q[(x >= 100) as usize + 2 * (y >= 50) as usize] += (plain.get(x, y)[3] - warped.get(x, y)[3]).abs();
+            }
+        }
+        assert!(q.iter().all(|&d| d > 20.0), "{id}: per-quadrant change {q:?}");
+    }
+}

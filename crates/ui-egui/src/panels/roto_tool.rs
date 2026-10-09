@@ -122,7 +122,7 @@ pub fn draw_overlay(
             let x0 = -inp.offset[0] / inp.scale;
             let y0 = -inp.offset[1] / inp.scale;
             let rect = [x0, y0, x0 + w as f64 / inp.scale, y0 + h as f64 / inp.scale];
-            let tex = ctx.load_texture("roto-overlay", img, egui::TextureOptions::NEAREST);
+            let tex = crate::frames::load_fitted(ctx, "roto-overlay", img, egui::TextureOptions::NEAREST);
             let c = Overlay { key, tex, rect };
             ctx.data_mut(|d| d.insert_temp(id, c.clone()));
             Some(c)

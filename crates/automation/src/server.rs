@@ -2,9 +2,11 @@
 //! `initialize`, `ping`, `tools/list` and `tools/call`; notifications are accepted and ignored.
 
 use std::io::{BufRead, Write};
+use std::path::Path;
 
 use serde_json::{Value, json};
 
+use crate::autosave::AutoSave;
 use crate::tools::{self, Reply};
 use crate::{Backend, Error, base64};
 
@@ -21,11 +23,34 @@ const INVALID_PARAMS: i64 = -32602;
 
 pub struct McpServer {
     backend: Backend,
+    autosave: Option<AutoSave>,
 }
 
 impl McpServer {
     pub fn new(backend: Backend) -> Self {
-        Self { backend }
+        Self { backend, autosave: None }
+    }
+
+    /// Opt in to durable headless checkpoints in a separate folder per server.
+    /// `root` is the platform config directory; settings are read by the caller.
+    pub fn with_autosave(mut self, root: &Path) -> crate::Result<Self> {
+        let s = self.backend.session().ok_or_else(|| crate::Error::BadArgs("--autosave is for headless MCP; the bridged app owns its auto-saves".into()))?;
+        s.autosave.background = false;
+        let autosave = AutoSave::new(root, &s.prefs).map_err(|e| crate::Error::Other(format!("MCP auto-save: {e}")))?;
+        s.autosave_folder_override = Some(autosave.folder().to_path_buf());
+        self.autosave = Some(autosave);
+        Ok(self)
+    }
+
+    fn autosave_info(&self) -> Value {
+        self.autosave.as_ref().map(AutoSave::info).unwrap_or_else(|| json!({"enabled": false}))
+    }
+
+    fn checkpoint(&mut self, finish: bool) -> std::io::Result<()> {
+        match (&mut self.autosave, self.backend.session()) {
+            (Some(a), Some(s)) => a.checkpoint(s, finish),
+            _ => Ok(()),
+        }
     }
 
     pub fn backend(&mut self) -> &mut Backend {
@@ -73,14 +98,21 @@ impl McpServer {
 
     /// Serve until EOF on `input`.
     pub fn serve(&mut self, input: impl BufRead, mut output: impl Write) -> std::io::Result<()> {
-        for line in input.lines() {
-            if let Some(reply) = self.handle_line(&line?) {
-                output.write_all(reply.as_bytes())?;
-                output.write_all(b"\n")?;
-                output.flush()?;
+        let served = (|| {
+            for line in input.lines() {
+                if let Some(reply) = self.handle_line(&line?) {
+                    output.write_all(reply.as_bytes())?;
+                    output.write_all(b"\n")?;
+                    output.flush()?;
+                }
             }
+            Ok(())
+        })();
+        match (served, self.checkpoint(true)) {
+            (r, Ok(())) => r,
+            (Ok(()), Err(e)) => Err(e),
+            (Err(transport), Err(save)) => Err(std::io::Error::other(format!("{transport}; {save}"))),
         }
-        Ok(())
     }
 
     /// Serve on stdin/stdout (the MCP stdio transport).
@@ -94,11 +126,17 @@ impl McpServer {
                 let asked = params.get("protocolVersion").and_then(Value::as_str).unwrap_or("");
                 let version = PROTOCOL_VERSIONS.iter().find(|v| **v == asked).copied().unwrap_or(PROTOCOL_VERSIONS[0]);
                 let mode = if self.backend.is_bridge() { "bridge" } else { "headless" };
+                let instructions = if self.autosave.is_some() {
+                    format!("{INSTRUCTIONS} Headless auto-save and recovery: {}", self.autosave_info())
+                } else {
+                    INSTRUCTIONS.to_string()
+                };
                 Ok(json!({
                     "protocolVersion": version,
                     "capabilities": {"tools": {"listChanged": false}},
                     "serverInfo": {"name": "effectcraft", "title": format!("EffectCraft ({mode})"), "version": env!("CARGO_PKG_VERSION")},
-                    "instructions": INSTRUCTIONS,
+                    "instructions": instructions,
+                    "_meta": {"effectcraftAutoSave": self.autosave_info()},
                 }))
             }
             "ping" => Ok(json!({})),
@@ -113,7 +151,35 @@ impl McpServer {
                     return Err((INVALID_PARAMS, format!("unknown tool `{name}`{hint}")));
                 }
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
-                Ok(call_result(tools::run(&mut self.backend, name, &args)))
+                let mut result = call_result(tools::run(&mut self.backend, name, &args));
+                // Also checkpoint a partially successful tool that returned an error. The
+                // project is durable before the client receives its reply (even if it kills
+                // the process immediately afterwards).
+                if let Err(e) = self.checkpoint(false) {
+                    let _ = writeln!(std::io::stderr(), "{e}");
+                    if let Some(content) = result.get_mut("content").and_then(Value::as_array_mut) {
+                        content.push(json!({"type": "text", "text": format!("Warning: {e}. Use save_project with a writable path before disconnecting.")}));
+                    }
+                }
+                if self.autosave.is_some()
+                    && let Some(obj) = result.as_object_mut()
+                {
+                    let meta = obj.entry("_meta").or_insert_with(|| json!({}));
+                    if let Some(meta) = meta.as_object_mut() {
+                        meta.insert("effectcraftAutoSave".into(), self.autosave_info());
+                    }
+                }
+                if self.autosave.is_some()
+                    && name == "get_project"
+                    && result["isError"] == false
+                    && let Some(text) = result.get_mut("content").and_then(Value::as_array_mut).and_then(|c| c.first_mut()).and_then(|c| c.get_mut("text"))
+                    && let Some(summary) = text.as_str().and_then(|t| serde_json::from_str::<Value>(t).ok())
+                {
+                    let mut summary = summary;
+                    summary["autosave"] = self.autosave_info();
+                    *text = Value::String(summary.to_string());
+                }
+                Ok(result)
             }
             // Advertised as absent, but answer politely for clients that probe anyway.
             "resources/list" => Ok(json!({"resources": []})),

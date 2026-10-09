@@ -131,13 +131,15 @@ fn set_texture(app: &mut EffectcraftApp, ctx: &egui::Context, id: u32, key: Fram
     }
     let opts = super::viewer::zoom_texture_options(app.session.prefs.viewer_zoom_smooth());
     let tex = match (img, app.passive_tex.remove(&id)) {
-        (FrameImage::Cpu(img), Some((_, PassiveTexture::Cpu(mut h)))) if h.size() == img.size => {
-            h.set((*img).clone(), opts);
+        (FrameImage::Cpu(img), Some((_, PassiveTexture::Cpu(mut h))))
+            if h.size() == crate::frames::fitted_size(img.size, crate::frames::max_texture_side(ctx)) =>
+        {
+            h.set(crate::frames::fit_texture((*img).clone(), crate::frames::max_texture_side(ctx)), opts);
             PassiveTexture::Cpu(h)
         }
         (FrameImage::Cpu(img), old) => {
             free(app, old.map(|(_, t)| t));
-            PassiveTexture::Cpu(ctx.load_texture(format!("viewer-{id}"), (*img).clone(), opts))
+            PassiveTexture::Cpu(crate::frames::load_fitted(ctx, format!("viewer-{id}"), (*img).clone(), opts))
         }
         (FrameImage::Gpu(f), old) => {
             let Some(rs) = &app.wgpu else { return };

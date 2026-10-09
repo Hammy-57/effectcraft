@@ -353,6 +353,9 @@ pub fn apply_visuals(ctx: &egui::Context, t: &Tokens) {
         s.spacing.button_padding = egui::vec2(8.0, 3.0);
         s.spacing.interact_size.y = 22.0;
         s.spacing.menu_margin = egui::Margin::same(5);
+        // Scroll bars always show (egui's float in only over the list), so long menus and lists
+        // can be dragged without a mouse wheel or touchpad (#269).
+        s.spacing.scroll = egui::style::ScrollStyle::solid();
         s.text_styles.insert(TextStyle::Body, FontId::new(12.0, FontFamily::Proportional));
         s.text_styles.insert(TextStyle::Button, FontId::new(12.0, FontFamily::Proportional));
         s.text_styles.insert(TextStyle::Small, FontId::new(11.0, FontFamily::Proportional));

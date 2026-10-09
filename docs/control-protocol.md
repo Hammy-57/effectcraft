@@ -109,10 +109,14 @@ revolutions are `timeline.prop.<uid>.revolutions`, `effectControls.prop.<uid>.re
 `viewer.regionOfInterest`; the Graph Editor adds `timeline.graph.transformBox[.<i>]`,
 `timeline.graph.snap` and `timeline.graph.reference`. Use `ui.elements` to see what is on screen.
 
-Viewer state that agents drive headless too: `view.snapping`, `view.channel {channel, colorized?}`,
+Viewer state that agents drive headless too: `view.snapping`, `view.snappingOptions
+{edgesExtended?, edges?, corners?, centers?, anchorPoints?, paths?, toggle?}` (the Tools bar's
+Snapping options, `header.snappingOptions`), `view.channel {channel, colorized?}`,
 `view.exposure {stops | delta}`, `view.resetExposure`, `view.takeSnapshot`, `view.showSnapshot`,
 `view.fastPreviewMode {mode}`, `view.setRegionOfInterest {rect}`, `view.addGuide`,
 `view.moveGuide`, `view.removeGuide`; editing: `shape.newPath` (Pen on shape layers),
+`shape.newShape` (the shape tools: a new group in the selected shape layer, else a new shape layer),
+`shape.toolOptions` (the Tools bar's Tool Creates Shape / Mask and Fill and Stroke Options),
 `mask.insertVertex`, `mask.convertVertex`, `mask.deleteVertices`, `path.freeTransform` (masks and
 shape paths by uid), `keys.setSpatialTangents` (motion-path handles) and `keys.transform` (Graph
 Editor transform box, timeline Alt-drag scaling).

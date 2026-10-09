@@ -220,7 +220,9 @@ fn new_light(s: &mut Session, p: &Value) -> Result<Value> {
     let cid = comp_id(s, p)?;
     let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?.clone();
     let kind = match p.get("kind").or_else(|| p.get("type")) {
-        Some(_) => light_kind_p(p, "kind").or_else(|| light_kind_p(p, "type")).ok_or_else(|| bad("layer.newLight", "kind: Parallel|Spot|Point|Ambient"))?,
+        Some(_) => {
+            light_kind_p(p, "kind").or_else(|| light_kind_p(p, "type")).ok_or_else(|| bad("layer.newLight", "kind: Parallel|Spot|Point|Ambient|Environment"))?
+        }
         None => LightKind::Spot,
     };
     let name = str_p(p, "name").unwrap_or("Light 1").to_string();
@@ -239,9 +241,11 @@ fn light_settings(s: &mut Session, p: &Value) -> Result<Value> {
     let t = time_p(s, p, Some(&comp));
     let name = str_p(p, "name").map(str::to_string);
     let kind = match p.get("kind").or_else(|| p.get("type")) {
-        Some(_) => {
-            Some(light_kind_p(p, "kind").or_else(|| light_kind_p(p, "type")).ok_or_else(|| bad("layer.lightSettings", "kind: Parallel|Spot|Point|Ambient"))?)
-        }
+        Some(_) => Some(
+            light_kind_p(p, "kind")
+                .or_else(|| light_kind_p(p, "type"))
+                .ok_or_else(|| bad("layer.lightSettings", "kind: Parallel|Spot|Point|Ambient|Environment"))?,
+        ),
         None => None,
     };
     s.edit("Light Settings", None, |proj, _| {
@@ -662,7 +666,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Light...",
             ["Layer", "New"],
             Some("Cmd+Alt+Shift+L"),
-            "{kind?: Parallel|Spot|Point|Ambient (default Spot), name?, color?, intensity?, coneAngle?, coneFeather?, falloff?: None|Smooth|Inverse Square Clamped, radius?, falloffDistance?, castsShadows?, shadowDarkness?, shadowDiffusion?, position? [x,y,z], poi? [x,y,z]}",
+            "{kind?: Parallel|Spot|Point|Ambient|Environment (default Spot; Environment lights and reflects from an equirectangular image layer: prop.set its lightOptions/source to that layer's id, or leave it empty for the comp's Environment Layer, see layer.environment), name?, color?, intensity?, coneAngle?, coneFeather?, falloff?: None|Smooth|Inverse Square Clamped, radius?, falloffDistance?, castsShadows?, shadowDarkness?, shadowDiffusion?, position? [x,y,z], poi? [x,y,z]}",
             has_comp,
             new_light
         ),
@@ -689,7 +693,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Light Settings...",
             [],
             None,
-            "{layer?, name?, kind?, color?, intensity?, coneAngle?, coneFeather?, falloff?, radius?, falloffDistance?, castsShadows?, shadowDarkness?, shadowDiffusion?, position?, poi?}",
+            "{layer?, name?, kind?: Parallel|Spot|Point|Ambient|Environment, color?, intensity?, coneAngle?, coneFeather?, falloff?, radius?, falloffDistance?, castsShadows?, shadowDarkness?, shadowDiffusion?, position?, poi?}",
             has_comp,
             light_settings
         ),

@@ -4,7 +4,7 @@ use effectcraft_color::Label;
 use effectcraft_project::{FootageKind, ItemId, ItemKind, LayerSource, Project};
 use serde_json::{Value, json};
 
-use super::{CommandSpec, always, bad, str_p};
+use super::{CommandSpec, always, b_p, bad, str_p};
 use crate::{EngineError, Result, Session, cmd};
 
 fn has_path(s: &Session) -> std::result::Result<(), String> {
@@ -103,16 +103,70 @@ fn revert(s: &mut Session, _: &Value) -> Result<Value> {
 
 /// File ▸ Import; with `addToComp` (files dropped on the Timeline or the Composition viewer) they
 /// also become layers of the active comp ([`add_to_comp`]).
+///
+/// With `background` (files dropped on the window or picked in the Import dialog) the files are
+/// probed on a background thread, so decoding a slow video doesn't freeze the app: the job shows
+/// the file being read and how many are left (Window ▸ Progress, `jobs.list`), then adds them in
+/// one undo step, selects them and reports how many arrived ("Imported 3 items").
 fn import_cmd(s: &mut Session, p: &Value) -> Result<Value> {
     let target = s.active_comp_id();
-    let mut r = import(s, p)?;
-    let errors = add_to_comp(s, &r, target, p);
+    let mut pending = prepare_import(s, p)?;
+    if b_p(p, "background").unwrap_or(false) && !pending.paths.is_empty() {
+        let paths = std::mem::take(&mut pending.paths);
+        let total = paths.len();
+        let label = match paths.first() {
+            Some(one) if total == 1 => format!("Importing {}", file_name(one)),
+            _ => format!("Importing {total} files"),
+        };
+        let p = p.clone();
+        return s.spawn_task("import", label, false, move |ctl| {
+            let mut probed = Vec::with_capacity(total);
+            for (k, path) in paths.into_iter().enumerate() {
+                ctl.message(format!("{} ({} of {total})", file_name(&path), k + 1));
+                if !ctl.progress(k as u64, total as u64) {
+                    return Err(crate::render_queue::CANCELLED.into());
+                }
+                let r = pending.prober.probe(&path);
+                probed.push(r);
+            }
+            ctl.progress(total as u64, total as u64);
+            let apply: crate::jobs::Apply = Box::new(move |s: &mut Session| {
+                let made = pending.comps.len() + probed.iter().filter(|r| r.is_ok()).count();
+                let mut r = add_footage(s, pending, probed)?;
+                finish_import(s, &mut r, target, &p);
+                let mut toast = format!("Imported {made} item{}", if made == 1 { "" } else { "s" });
+                let errors: Vec<&str> = r["errors"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+                match errors.as_slice() {
+                    [] => {}
+                    [one] => toast = format!("{toast}. {one}"),
+                    [first, rest @ ..] => toast = format!("{toast}. {first} (and {} more)", rest.len()),
+                }
+                r["toast"] = json!(toast);
+                Ok(r)
+            });
+            Ok(apply)
+        });
+    }
+    let probed = pending.paths.iter().map(|path| pending.prober.probe(path)).collect();
+    let mut r = add_footage(s, pending, probed)?;
+    finish_import(s, &mut r, target, p);
+    Ok(r)
+}
+
+/// The file name of a path, for labels.
+fn file_name(path: &str) -> String {
+    std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.to_string())
+}
+
+/// After an import (its result `r`): with `addToComp`, the new items become layers of `target`;
+/// what couldn't be added joins the result's errors.
+fn finish_import(s: &mut Session, r: &mut Value, target: Option<ItemId>, p: &Value) {
+    let errors = add_to_comp(s, r, target, p);
     if !errors.is_empty()
         && let Some(e) = r.get_mut("errors").and_then(Value::as_array_mut)
     {
         e.extend(errors.into_iter().map(Value::from));
     }
-    Ok(r)
 }
 
 /// With `addToComp`, put what an import (its result `r`) made into `target`, the comp that was
@@ -149,7 +203,119 @@ pub(crate) fn add_to_comp(s: &mut Session, r: &Value, target: Option<ItemId>, p:
     errors
 }
 
+/// File ▸ Import, all in one go (scripts and commands built on it); see [`import_cmd`].
 pub(crate) fn import(s: &mut Session, p: &Value) -> Result<Value> {
+    let pending = prepare_import(s, p)?;
+    let probed = pending.paths.iter().map(|path| pending.prober.probe(path)).collect();
+    add_footage(s, pending, probed)
+}
+
+/// An import whose layered files are already compositions: the files left to probe as footage,
+/// how, and what the import made so far.
+struct PendingImport {
+    paths: Vec<String>,
+    prober: Prober,
+    comps: Vec<u64>,
+    items: Vec<u64>,
+    errors: Vec<String>,
+}
+
+/// Everything probing a file needs, apart from the session (it can run on a background thread).
+struct Prober {
+    importer: Option<std::sync::Arc<dyn crate::Importer>>,
+    services: std::sync::Arc<dyn crate::Services>,
+    /// Settings ▸ Import ▸ Report Missing Frames.
+    report_missing_frames: bool,
+    /// Settings ▸ Import ▸ Interpret Unlabeled Alpha As, for stills and for movies.
+    still_alpha: Option<effectcraft_project::AlphaMode>,
+    movie_alpha: Option<effectcraft_project::AlphaMode>,
+    /// Settings ▸ Import ▸ Sequence Footage frames per second.
+    sequence_rate: effectcraft_time::FrameRate,
+    /// PDF / Illustrator page (0-based).
+    page: u32,
+    /// Choose Layer: one layer of a Photoshop document.
+    psd_layer: Option<Value>,
+}
+
+/// A file probed as footage.
+struct Probed {
+    path: String,
+    footage: effectcraft_project::Footage,
+    /// Its alpha is unlabeled and Settings say Ask User: open Interpret Footage.
+    ask_alpha: bool,
+    warning: Option<String>,
+}
+
+impl Prober {
+    /// Probe `path` as footage; the error names the file.
+    fn probe(&self, path: &str) -> std::result::Result<Probed, String> {
+        let fail = |e: String| format!("{path}: {e}");
+        // Data files (JSON, CSV, TSV) for data-driven animation: kept as text in the project.
+        if let Some(f) = data_footage(self.services.as_ref(), path) {
+            return f.map(|footage| Probed { path: path.to_string(), footage, ask_alpha: false, warning: None }).map_err(fail);
+        }
+        let importer = self.importer.as_ref().ok_or_else(|| fail("media import is not available in this build".into()))?;
+        let mut f = importer.probe(path).map_err(fail)?;
+        let mut warning = None;
+        // Settings ▸ Import ▸ Report Missing Frames.
+        if f.kind == FootageKind::Sequence
+            && self.report_missing_frames
+            && let Some(gaps) = missing_frames(&f.sequence)
+        {
+            warning = Some(format!("{path}: {gaps}"));
+        }
+        // Settings ▸ Import ▸ Interpret Unlabeled Alpha As: images only (a 3D model renders its
+        // own alpha, and audio and data have none).
+        let mut ask_alpha = false;
+        if matches!(f.kind, FootageKind::Still | FootageKind::Sequence | FootageKind::Video)
+            && f.alpha != effectcraft_project::AlphaMode::Ignore
+            && !alpha_is_labeled(path, &f.codec)
+        {
+            let setting = if f.kind == FootageKind::Video { self.movie_alpha } else { self.still_alpha };
+            match setting {
+                Some(a) => f.alpha = a,
+                None => ask_alpha = true,
+            }
+        }
+        // Settings ▸ Import ▸ Sequence Footage frames per second.
+        if f.kind == FootageKind::Sequence {
+            let r = self.sequence_rate;
+            let frames = f.frame_rate.frame_at(f.duration);
+            f.frame_rate = r;
+            f.duration = r.tick_of(frames.max(1));
+        }
+        // Page: another page of a PDF / Illustrator file.
+        if self.page > 0 && matches!(f.codec.as_str(), "PDF" | "AI") {
+            let doc = self
+                .services
+                .read_file(path)
+                .map_err(|e| e.to_string())
+                .and_then(|b| effectcraft_pdf::parse_page(&b, self.page as usize).map_err(|e| e.to_string()))
+                .map_err(fail)?;
+            (f.width, f.height) = doc.pixel_size();
+            f.page = self.page;
+        }
+        // Choose Layer: one layer of a Photoshop document (document-sized).
+        if let Some(sel) = &self.psd_layer
+            && f.codec == "PSD"
+        {
+            let (index, name) = self
+                .services
+                .read_file(path)
+                .ok()
+                .and_then(|b| effectcraft_psd::Psd::parse(b).ok())
+                .and_then(|d| find_psd_layer(&d, sel))
+                .ok_or_else(|| fail(format!("no layer {sel}")))?;
+            f.layer = Some(effectcraft_project::SourceLayer { index: index as u32, name, layer_size: false, embedded: None, placed: false, crop_bounds: None });
+        }
+        Ok(Probed { path: path.to_string(), footage: f, ask_alpha, warning })
+    }
+}
+
+/// The first part of an import: read the parameters, note the files as recent footage, and
+/// import layered files (Photoshop, PDF, Illustrator, EPS) as compositions when `importAs` (or,
+/// for dropped files, Default Drag Import As) asks for that. The other files are left to probe.
+fn prepare_import(s: &mut Session, p: &Value) -> Result<PendingImport> {
     let paths: Vec<String> = match p.get("paths").or(p.get("path")) {
         Some(Value::Array(a)) => a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
         Some(Value::String(x)) => vec![x.clone()],
@@ -178,8 +344,8 @@ pub(crate) fn import(s: &mut Session, p: &Value) -> Result<Value> {
         },
     };
     let mut paths = paths;
-    let mut out_comps = vec![];
-    let mut ids = vec![];
+    let mut comps = vec![];
+    let mut items = vec![];
     let mut errors = vec![];
     if let Some(retain) = retain {
         let mut rest = vec![];
@@ -189,9 +355,9 @@ pub(crate) fn import(s: &mut Session, p: &Value) -> Result<Value> {
                 Ok(b) if effectcraft_pdf::sniff(&b).is_some() && !path.to_ascii_lowercase().ends_with(".svg") => {
                     // PDF / Illustrator / EPS: one layer per file layer.
                     match import_vector_comp(s, &path, &b, page) {
-                        Ok((comp, items)) => {
-                            out_comps.push(comp);
-                            ids.extend(items);
+                        Ok((comp, made)) => {
+                            comps.push(comp);
+                            items.extend(made);
                         }
                         Err(e) => errors.push(e.to_string()),
                     }
@@ -203,134 +369,76 @@ pub(crate) fn import(s: &mut Session, p: &Value) -> Result<Value> {
                 }
             };
             match import_psd_comp(s, &path, bytes, retain) {
-                Ok((comp, items, warnings)) => {
-                    out_comps.push(comp);
-                    ids.extend(items);
+                Ok((comp, made, warnings)) => {
+                    comps.push(comp);
+                    items.extend(made);
                     errors.extend(warnings);
                 }
                 Err(e) => errors.push(format!("{path}: {e}")),
             }
         }
         paths = rest;
-        if paths.is_empty() {
-            if let Some(c) = out_comps.first() {
-                s.open_comp(effectcraft_project::ItemId(*c));
-            }
-            return Ok(json!({"items": ids, "comps": out_comps, "errors": errors}));
-        }
     }
-    let mut probed = vec![];
-    let psd_layer = p.get("layer").cloned();
-    let seq_rate = effectcraft_time::FrameRate::from_f64(s.prefs.import.sequence_fps);
-    let mut ask_alpha = vec![];
+    let prober = Prober {
+        importer: s.importer.clone(),
+        services: s.services.clone(),
+        report_missing_frames: s.prefs.import.report_missing_frames,
+        still_alpha: s.prefs.unlabeled_alpha(false),
+        movie_alpha: s.prefs.unlabeled_alpha(true),
+        sequence_rate: effectcraft_time::FrameRate::from_f64(s.prefs.import.sequence_fps),
+        page,
+        psd_layer: p.get("layer").cloned(),
+    };
+    Ok(PendingImport { paths, prober, comps, items, errors })
+}
+
+/// The last part of an import: add the probed files to the project (one undo step) and select
+/// everything the import made, so the Project panel shows it.
+fn add_footage(s: &mut Session, pending: PendingImport, probed: Vec<std::result::Result<Probed, String>>) -> Result<Value> {
+    let PendingImport { comps, mut items, mut errors, .. } = pending;
+    let mut found = vec![];
     let mut warnings = vec![];
-    for path in &paths {
-        // Data files (JSON, CSV, TSV) for data-driven animation: kept as text in the project.
-        if let Some(f) = data_footage(s, path) {
-            match f {
-                Ok(f) => probed.push((path.clone(), f)),
-                Err(e) => errors.push(format!("{path}: {e}")),
+    for r in probed {
+        match r {
+            Ok(f) => {
+                warnings.extend(f.warning.clone());
+                found.push(f);
             }
-            continue;
-        }
-        let Some(importer) = s.importer.clone() else {
-            errors.push(format!("{path}: media import is not available in this build"));
-            continue;
-        };
-        match importer.probe(path) {
-            Ok(mut f) => {
-                // Settings ▸ Import ▸ Report Missing Frames.
-                if f.kind == FootageKind::Sequence
-                    && s.prefs.import.report_missing_frames
-                    && let Some(gaps) = missing_frames(&f.sequence)
-                {
-                    warnings.push(format!("{path}: {gaps}"));
-                }
-                // Settings ▸ Import ▸ Interpret Unlabeled Alpha As.
-                if f.alpha != effectcraft_project::AlphaMode::Ignore && !alpha_is_labeled(path, &f.codec) {
-                    match s.prefs.unlabeled_alpha(f.kind == FootageKind::Video) {
-                        Some(a) => f.alpha = a,
-                        None => ask_alpha.push(paths.iter().position(|x| x == path).unwrap_or(0)),
-                    }
-                }
-                // Settings ▸ Import ▸ Sequence Footage frames per second.
-                if f.kind == FootageKind::Sequence {
-                    let r = seq_rate;
-                    let frames = f.frame_rate.frame_at(f.duration);
-                    f.frame_rate = r;
-                    f.duration = r.tick_of(frames.max(1));
-                }
-                // Page: another page of a PDF / Illustrator file.
-                if page > 0 && matches!(f.codec.as_str(), "PDF" | "AI") {
-                    match s
-                        .services
-                        .read_file(path)
-                        .map_err(|e| e.to_string())
-                        .and_then(|b| effectcraft_pdf::parse_page(&b, page as usize).map_err(|e| e.to_string()))
-                    {
-                        Ok(doc) => {
-                            (f.width, f.height) = doc.pixel_size();
-                            f.page = page;
-                        }
-                        Err(e) => {
-                            errors.push(format!("{path}: {e}"));
-                            continue;
-                        }
-                    }
-                }
-                // Choose Layer: one layer of a Photoshop document (document-sized).
-                if let Some(sel) = &psd_layer
-                    && f.codec == "PSD"
-                {
-                    match s.services.read_file(path).ok().and_then(|b| effectcraft_psd::Psd::parse(b).ok()).and_then(|d| find_psd_layer(&d, sel)) {
-                        Some((index, name)) => {
-                            f.layer = Some(effectcraft_project::SourceLayer {
-                                index: index as u32,
-                                name,
-                                layer_size: false,
-                                embedded: None,
-                                placed: false,
-                                crop_bounds: None,
-                            })
-                        }
-                        None => {
-                            errors.push(format!("{path}: no layer {sel}"));
-                            continue;
-                        }
-                    }
-                }
-                probed.push((path.clone(), f))
-            }
-            Err(e) => errors.push(format!("{path}: {e}")),
+            Err(e) => errors.push(e),
         }
     }
     let mut asked: Vec<u64> = vec![];
-    s.edit("Import", None, |proj, st| {
-        for (path, f) in probed {
-            let name = std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or(path.clone());
-            let name = match &f.layer {
-                Some(l) => format!("{}/{name}", l.name),
-                None if f.page > 0 => format!("{name} (Page {})", f.page + 1),
-                None => name,
-            };
-            let label = match f.kind {
-                FootageKind::Still | FootageKind::Sequence => Label::Lavender,
-                FootageKind::Audio => Label::SeaFoam,
-                FootageKind::Video | FootageKind::Model => Label::Aqua,
-                FootageKind::Data => Label::Sandstone,
-            };
-            let ask = ask_alpha.contains(&paths.iter().position(|x| *x == path).unwrap_or(usize::MAX));
-            let id = proj.add_item(&name, label, None, ItemKind::Footage(f));
-            ids.push(id.0);
-            if ask {
-                asked.push(id.0);
+    let made: Vec<ItemId> = comps.iter().map(|c| ItemId(*c)).collect();
+    if !found.is_empty() {
+        s.edit("Import", None, |proj, st| {
+            let mut selection = made;
+            for f in found {
+                let name = file_name(&f.path);
+                let footage = f.footage;
+                let name = match &footage.layer {
+                    Some(l) => format!("{}/{name}", l.name),
+                    None if footage.page > 0 => format!("{name} (Page {})", footage.page + 1),
+                    None => name,
+                };
+                let label = match footage.kind {
+                    FootageKind::Still | FootageKind::Sequence => Label::Lavender,
+                    FootageKind::Audio => Label::SeaFoam,
+                    FootageKind::Video | FootageKind::Model => Label::Aqua,
+                    FootageKind::Data => Label::Sandstone,
+                };
+                let id = proj.add_item(&name, label, None, ItemKind::Footage(footage));
+                items.push(id.0);
+                if f.ask_alpha {
+                    asked.push(id.0);
+                }
+                selection.push(id);
             }
-            st.project_selection = vec![id];
-        }
-        Ok(())
-    })?;
-    if let Some(c) = out_comps.first() {
-        s.open_comp(effectcraft_project::ItemId(*c));
+            st.project_selection = selection;
+            Ok(())
+        })?;
+    }
+    if let Some(c) = comps.first() {
+        s.open_comp(ItemId(*c));
     }
     for w in &warnings {
         s.events.push(crate::Event::Toast { message: w.clone(), error: true });
@@ -339,7 +447,7 @@ pub(crate) fn import(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(first) = asked.first() {
         s.events.push(crate::Event::Frontend { command: "file.interpretFootage".into(), params: json!({"item": first, "reason": "unlabeledAlpha"}) });
     }
-    Ok(json!({"items": ids, "comps": out_comps, "errors": errors, "warnings": warnings, "unlabeledAlpha": asked}))
+    Ok(json!({"items": items, "comps": comps, "errors": errors, "warnings": warnings, "unlabeledAlpha": asked}))
 }
 
 /// Whether a file format states how its alpha is stored (PNG, GIF, WebP and PSD are straight by
@@ -423,13 +531,13 @@ fn import_vector_comp(s: &mut Session, path: &str, bytes: &[u8], page: u32) -> R
 pub const DATA_EXTENSIONS: &[&str] = &["json", "csv", "tsv"];
 
 /// A data footage item for `path` (JSON / CSV / TSV), `None` for other files.
-pub(crate) fn data_footage(s: &Session, path: &str) -> Option<std::result::Result<effectcraft_project::Footage, String>> {
+pub(crate) fn data_footage(services: &dyn crate::Services, path: &str) -> Option<std::result::Result<effectcraft_project::Footage, String>> {
     let ext = std::path::Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     if !DATA_EXTENSIONS.contains(&ext.as_str()) {
         return None;
     }
     Some((|| {
-        let bytes = s.services.read_file(path).map_err(|e| e.to_string())?;
+        let bytes = services.read_file(path).map_err(|e| e.to_string())?;
         let text = String::from_utf8(bytes).map_err(|_| "data files must be UTF-8 text".to_string())?;
         if ext == "json" {
             serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')).map_err(|e| format!("invalid JSON: {e}"))?;
@@ -553,11 +661,20 @@ fn render_backend(s: &mut Session, p: &Value) -> Result<Value> {
 pub fn backend_status(s: &Session) -> Value {
     let adapter = s.accel.as_ref().map(|a| a.name());
     let gpu = s.project.settings.gpu_acceleration;
+    // Why it renders on the CPU (#262).
+    let why = if !gpu {
+        Some("the project's renderer is Mercury Software Only".to_string())
+    } else if adapter.is_none() {
+        Some(s.accel_note.clone().unwrap_or_else(|| "no GPU compositor is attached".into()))
+    } else {
+        None
+    };
     json!({
         "renderer": if gpu { "Mercury GPU Acceleration" } else { "Mercury Software Only" },
         "gpuAcceleration": gpu,
         "adapter": adapter,
         "active": if gpu && adapter.is_some() { "gpu" } else { "cpu" },
+        "why": why,
     })
 }
 
@@ -583,7 +700,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "File...",
             ["File", "Import"],
             Some("Cmd+I"),
-            "{paths: [string], importAs?: footage|composition|compositionLayerSizes (Photoshop, PDF, Illustrator and EPS files), layer?: name|index (footage of one Photoshop layer), page?: number from 1 (PDF / Illustrator page), drag?: bool (dropped files: Settings ▸ Import ▸ Default Drag Import As), addToComp?: bool (also add them to the active comp, at time?, index?, position? as in layer.addItem)}",
+            "{paths: [string], importAs?: footage|composition|compositionLayerSizes (Photoshop, PDF, Illustrator and EPS files), layer?: name|index (footage of one Photoshop layer), page?: number from 1 (PDF / Illustrator page), drag?: bool (dropped files: Settings ▸ Import ▸ Default Drag Import As), addToComp?: bool (also add them to the active comp, at time?, index?, position? as in layer.addItem), background?: bool (probe the files in a background job, jobs.list / jobs.wait; returns {job})}",
             always,
             import_cmd
         ),

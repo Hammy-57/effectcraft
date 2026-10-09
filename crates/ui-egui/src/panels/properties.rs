@@ -66,14 +66,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let ectx = EvalCtx { project: &project, comp_id: cid, comp: &comp, time: now, expr: expr.as_deref(), footage: None };
     let x0 = rect.min.x + PAD;
     let w = rect.width() - 2.0 * PAD;
-    // Vertical scrolling: content height is known after drawing, so clamp with last frame's.
-    let scroll_id = egui::Id::new("props-scroll");
-    let (mut scroll, content_h): (f32, f32) = ui.data(|d| d.get_temp(scroll_id)).unwrap_or((0.0, 0.0));
-    if ui.rect_contains_pointer(rect) {
-        scroll -= ui.input(|i| i.smooth_scroll_delta.y);
-    }
-    scroll = scroll.clamp(0.0, (content_h - rect.height()).max(0.0));
-    let top = rect.min.y + 8.0 - scroll;
+    let scroll = widgets::PanelScroll::begin(ui, egui::Id::new("props-scroll"), rect);
+    let top = rect.min.y + 8.0 - scroll.offset;
     let mut y = top;
     let mut actions: Actions = vec![];
 
@@ -153,15 +147,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     }
 
     y += 40.0;
-    let content_h = y - top;
-    ui.data_mut(|d| d.insert_temp(scroll_id, (scroll, content_h)));
-    if content_h > rect.height() {
-        // Thin scroll indicator.
-        let frac = rect.height() / content_h;
-        let bar_h = (rect.height() * frac).max(24.0);
-        let by = rect.min.y + (rect.height() - bar_h) * (scroll / (content_h - rect.height()).max(1.0));
-        p.rect_filled(Rect::from_min_size(pos2(rect.max.x - 5.0, by), vec2(3.0, bar_h)), 1.5, t.text_faint.gamma_multiply(0.6));
-    }
+    scroll.end(ui, &mut app.auto, "properties.scroll", y - top, &t);
     for (id, params) in actions {
         let params = match &text_target {
             Some(tt) if id == "layer.setText" => tt.params(params),

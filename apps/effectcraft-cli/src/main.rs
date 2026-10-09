@@ -15,13 +15,14 @@
 //!     [--jpeg-quality N] [--bitrate KBPS] [--prores proxy|lt|standard|hq|4444|4444xq] [--audio auto|on|off]
 //!     [--profile main|main10] [--level auto|4.1] [--rate-control bitrate|quality] [--video-quality 1-100]
 //!     [--keyint FRAMES] [--webm-codec vp9|av1] [--audio-bitrate KBPS] [--opus-app audio|voice]
+//!     (a relative --out is relative to the working directory; --queue outputs follow the project's own settings)
 //! effectcraft-cli render F.ecproj --queue                    render the project's Render Queue
 //! effectcraft-cli bench [--comp C] [--time S] [--scale K] [--n N] [--play N] [--gpu [--adv3d]]   render timings
 //!     (--gpu: CPU vs GPU ms/frame for every comp at Full and Half)
 //! effectcraft-cli bench --ops [--small] [--layers N] [--comps N] [--footage N]   everyday-operation timings
 //!     on a large generated project (open, save, auto-save, undo/redo, timeline, Project panel)
 //! effectcraft-cli script FILE.jsx [F.ecproj] | --eval CODE    run an After Effects-style script
-//! effectcraft-cli mcp [--bridge PORT]                         MCP server on stdio
+//! effectcraft-cli mcp [--autosave | --bridge PORT]            MCP server on stdio
 //!
 //! Project:  --project F.ecproj (or a positional *.ecproj) | --demo | --empty   (default: demo; mcp: empty)
 //! Saving:   --save (back to --project) | --save-as F.ecproj
@@ -100,6 +101,7 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
          [--keyint FRAMES] [--webm-codec vp9|av1] [--audio-bitrate KBPS] [--opus-app audio|voice] | --queue
                                            (formats h264|hevc|av1|prores|webm|png|jpeg|tiff|exr|gif|wav|aiff;
                                            --profile..--keyint: HEVC / AV1, --audio-bitrate/--opus-app: WebM Opus)
+                                           a relative --out is relative to the working directory
   bench [--comp C] [--time S] [--scale K] [--n N] [--play N] [--gpu [--adv3d]]   per-layer/effect render timings;
                                            --play N renders N consecutive frames with/without the layer cache;
                                            --gpu compares CPU and GPU ms/frame for every comp at Full and Half
@@ -109,7 +111,7 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
   script FILE.jsx [F.ecproj] | --eval CODE run JavaScript with the After Effects-style object model
                                            (app.project, comps, layers, properties…); prints writeLn
                                            output and the result; errors exit 1 with file:line:col
-  mcp [--bridge PORT]                      MCP server (JSON-RPC over stdio)
+  mcp [--autosave | --bridge PORT]         MCP server (JSON-RPC over stdio); --autosave preserves unsaved headless work
 options: --project F.ecproj | --demo | --empty   --save | --save-as F   --bridge PORT   --json   --gpu
 <comp>: id or name, '-' = active comp; <layer>: id, '#n' or name; <value>: JSON or bare string";
 
@@ -173,6 +175,7 @@ const FLAGS: &[&str] = &[
     "--ops",
     "--small",
     "--adv3d",
+    "--autosave",
 ];
 
 struct Args {
@@ -321,9 +324,22 @@ fn backend(args: &Args, default_demo: bool) -> Result<Backend, Failure> {
 /// renderer setting, Mercury GPU Acceleration by default).
 fn session(args: &Args) -> Result<effectcraft_engine::Session, Failure> {
     let mut s = effectcraft_host::session();
+    if args.flag("--autosave") {
+        let dir = effectcraft_host::config_dir().ok_or_else(|| Failure::Error("--autosave: no config directory; set EFFECTCRAFT_CONFIG_DIR".into()))?;
+        // Read only auto-save settings. Opting in must not change headless rendering or load
+        // the desktop's models, shortcuts, disk cache or recovery sentinel.
+        use effectcraft_engine::config::ConfigStore;
+        let config = effectcraft_engine::config::DirConfig::new(dir);
+        if let Some(text) = config.read(effectcraft_engine::prefs::PREFS_FILE) {
+            s.prefs.auto_save = effectcraft_engine::prefs::Prefs::from_json(&text).auto_save;
+        }
+        s.prefs.normalize();
+    }
     if args.flag("--gpu") {
-        let g = effectcraft_gpu::Gpu::headless().ok_or_else(|| Failure::Error("--gpu: no usable GPU adapter".into()))?;
+        let g = effectcraft_gpu::Gpu::try_headless().map_err(|e| Failure::Error(format!("--gpu: no usable GPU adapter ({e})")))?;
         s.accel = Some(std::sync::Arc::new(g));
+    } else {
+        s.accel_note = Some("headless: renders on the CPU unless started with --gpu".into());
     }
     Ok(s)
 }
@@ -400,6 +416,9 @@ fn emit(v: &Value, json_out: bool) {
 }
 
 fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
+    if args.flag("--autosave") && cmd != "mcp" {
+        return usage_err("--autosave is only supported by mcp");
+    }
     match cmd {
         "render" => render(args, json_out)?,
         "bench" => bench_cmd(args)?,
@@ -563,9 +582,20 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
             }
         }
         "mcp" => {
+            if args.flag("--autosave") && args.opt("--bridge").is_some() {
+                return usage_err("--autosave is for headless MCP; the bridged app owns its auto-saves");
+            }
             let b = backend(args, false)?;
+            let server = McpServer::new(b);
+            let mut server = if args.flag("--autosave") {
+                let root =
+                    effectcraft_host::config_dir().ok_or_else(|| Failure::Error("--autosave: no config directory; set EFFECTCRAFT_CONFIG_DIR".into()))?;
+                server.with_autosave(&root)?
+            } else {
+                server
+            };
             // A client that closes its end of stdout has ended the session.
-            match McpServer::new(b).serve_stdio() {
+            match server.serve_stdio() {
                 Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => return Err(e.to_string().into()),
                 _ => {}
             }
@@ -596,6 +626,12 @@ fn with_saved(v: Value, saved: Option<String>) -> Value {
     }
 }
 
+/// A relative `--out` is relative to the working directory, like `--project` and every other CLI
+/// path. The Render Queue alone would resolve it against the project's folder.
+fn from_cwd(path: &str) -> Result<String, Failure> {
+    std::path::absolute(path).map(|p| p.to_string_lossy().into_owned()).map_err(|e| Failure::Error(format!("render: cannot resolve --out {path}: {e}")))
+}
+
 /// `render`: queue `--comp` (or the active comp) with the given settings unless `--queue`, then
 /// render the queue with a progress line on stderr. Fails if any item fails.
 fn render(args: &Args, json_out: bool) -> Result<(), Failure> {
@@ -611,6 +647,7 @@ fn render(args: &Args, json_out: bool) -> Result<(), Failure> {
     let err = |e: effectcraft_engine::EngineError| Failure::Error(e.to_string());
     if !args.flag("--queue") {
         let Some(out) = args.opt("--out") else { return usage_err("render: --out FILE is required (or --queue)") };
+        let out = &from_cwd(out)?;
         let mut p = json!({"output": out});
         if let Some(c) = args.opt("--comp") {
             p["comp"] = json!(c);
@@ -1080,7 +1117,7 @@ fn adv3d_bench_comp(p: &mut effectcraft_engine::project::Project) -> Option<Item
 /// warm; "up/dn MB" are the GPU's uploads / readbacks per warm GPU frame.
 fn bench_gpu(s: &Session, args: &Args) -> Result<(), Failure> {
     use effectcraft_render::Backend;
-    let gpu = effectcraft_gpu::Gpu::headless().ok_or_else(|| Failure::Error("--gpu: no usable GPU adapter".into()))?;
+    let gpu = effectcraft_gpu::Gpu::try_headless().map_err(|e| Failure::Error(format!("--gpu: no usable GPU adapter ({e})")))?;
     let n = args.num("--n")?.unwrap_or(10.0).max(1.0) as usize;
     // Every comp, plus an adjustment-layer comp built for the benchmark (the main comp under a
     // full-frame adjustment layer with a GPU effect stack) and an Advanced 3D comp (`--adv3d`:

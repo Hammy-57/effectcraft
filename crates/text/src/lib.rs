@@ -176,6 +176,7 @@ pub fn text_style(s: &CharStyle) -> TextStyle {
         leading: s.leading.map(|l| l as f32),
         opentype: s.opentype,
         variations: s.variations.clone(),
+        vertical: false,
     }
 }
 
@@ -252,7 +253,9 @@ pub fn layout_doc(doc: &TextDoc) -> TextLayout {
         let a = byte_of_char[ci.min(nchars)];
         ci += r.len;
         let b = byte_of_char[ci.min(nchars)];
-        runs.push((a..b, text_style(&r.style)));
+        let mut runtime_style = text_style(&r.style);
+        runtime_style.vertical = doc.vertical && !r.style.tate_chu_yoko;
+        runs.push((a..b, runtime_style));
         styles.push(r.style);
     }
     let width = doc.box_size.map(|b| if doc.vertical { b[1] } else { b[0] } as f32);
@@ -333,10 +336,17 @@ pub fn layout_doc(doc: &TextDoc) -> TextLayout {
             } else if doc.vertical {
                 let upright = is_cjk(src) || st.is_some_and(|s| s.vertical_roman_upright);
                 if upright {
-                    // Keep the character upright around its centre.
-                    let c = Point::new(advance / 2.0, -0.35 * g.size as f64);
-                    let rc = ROT90 * c;
-                    let t = Affine::translate((rc.x - c.x, rc.y - c.y));
+                    // Anchor vertical forms using their own vertical origin and horizontal
+                    // advance, not the next glyph's pen (which includes tracking/justification).
+                    let font = fonts::face(g.face);
+                    let metrics = is_cjk(src).then(|| font.vertical_origin(g.id, g.size)).flatten();
+                    let t = if let Some((width, top)) = metrics {
+                        Affine::translate((0.35 * g.size as f64 - width * g.h_scale as f64 / 2.0, top * g.v_scale as f64))
+                    } else {
+                        let c = Point::new(advance / 2.0, -0.35 * g.size as f64);
+                        let rc = ROT90 * c;
+                        Affine::translate((rc.x - c.x, rc.y - c.y))
+                    };
                     path = t * path;
                     outline_xf = t * outline_xf;
                 } else {

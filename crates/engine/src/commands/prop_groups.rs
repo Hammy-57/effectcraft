@@ -2,10 +2,10 @@
 //! effect, mask, shape item or text animator (what scripting's `PropertyGroup.name`, `enabled`,
 //! `remove()`, `duplicate()` and `moveTo()` do, and what agents need without a UI selection).
 
-use effectcraft_project::{GroupKind, ItemId, LayerId, Node, PropGroup, Uid};
+use effectcraft_project::{GroupKind, ItemId, LayerId, LayerSource, Node, PropGroup, Uid};
 use serde_json::{Value, json};
 
-use super::{CommandSpec, b_p, bad, has_layers, layer_mut, layer_p, str_p};
+use super::{CommandSpec, b_p, bad, has_layers, layer_mut, layer_p, layers_p, str_p};
 use crate::{EngineError, Result, Session, cmd};
 
 /// Groups that can be renamed, removed, duplicated and reordered: instances in indexed lists.
@@ -52,13 +52,13 @@ fn set_enabled(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn remove(s: &mut Session, p: &Value) -> Result<Value> {
     let (cid, lid, uid) = group_ref(s, p, "prop.removeGroup", true)?;
-    remove_groups(s, cid, &[(lid, uid)])?;
+    remove_groups(s, cid, &[(lid, uid)], "Delete")?;
     Ok(Value::Null)
 }
 
 /// Remove groups of comp `cid` in one undo step.
-fn remove_groups(s: &mut Session, cid: ItemId, groups: &[(LayerId, Uid)]) -> Result<()> {
-    s.edit("Delete", None, |proj, st| {
+fn remove_groups(s: &mut Session, cid: ItemId, groups: &[(LayerId, Uid)], label: &str) -> Result<()> {
+    s.edit(label, None, |proj, st| {
         for (lid, uid) in groups {
             // A group inside one removed before it went with it.
             if let Some(parent) = layer_mut(proj, cid, *lid)?.props.parent_of_mut(*uid) {
@@ -79,8 +79,123 @@ pub(crate) fn remove_selected(s: &mut Session) -> Result<Option<Value>> {
     if groups.is_empty() {
         return Ok(None);
     }
-    remove_groups(s, cid, &groups)?;
+    remove_groups(s, cid, &groups, "Delete")?;
     Ok(Some(json!(groups.len())))
+}
+
+/// Shape items (groups, paths, paints and path operations) selected in the Contents of the
+/// active comp's shape layers, top to bottom. An item inside another selected one goes with it,
+/// so it isn't listed.
+pub(crate) fn selected_contents(s: &Session) -> Vec<(LayerId, Uid)> {
+    let mut out = vec![];
+    let Some(c) = s.active_comp().filter(|_| !s.state.selected_props.is_empty()) else { return out };
+    for l in c.layers.iter().filter(|l| matches!(l.source, LayerSource::Shape)) {
+        if let Some(contents) = l.props.sub("contents") {
+            let selected = |u: Uid| s.state.selected_props.contains(&(l.id, u));
+            let mut uids = vec![];
+            collect_selected(contents, &selected, &mut uids, 0);
+            out.extend(uids.into_iter().map(|u| (l.id, u)));
+        }
+    }
+    out
+}
+
+fn collect_selected(g: &PropGroup, selected: &dyn Fn(Uid) -> bool, out: &mut Vec<Uid>, depth: usize) {
+    if depth > super::shape_stroke::MAX_DEPTH {
+        return;
+    }
+    for c in g.groups() {
+        if is_instance(c) && selected(c.uid) {
+            out.push(c.uid);
+        } else {
+            collect_selected(c, selected, out, depth + 1);
+        }
+    }
+}
+
+/// Copies of the selected shape items (Edit ▸ Copy), top to bottom.
+pub(crate) fn copy_contents(s: &Session) -> Vec<PropGroup> {
+    let Some(c) = s.active_comp() else { return vec![] };
+    selected_contents(s).into_iter().filter_map(|(lid, uid)| c.layer(lid)?.props.find_group(uid).cloned()).collect()
+}
+
+/// Edit ▸ Cut's removal of the selected shape items (once copied).
+pub(crate) fn cut_contents(s: &mut Session, items: &[(LayerId, Uid)]) -> Result<Value> {
+    let cid = s.active_comp_id().ok_or(EngineError::NoComp)?;
+    remove_groups(s, cid, items, "Cut")?;
+    Ok(json!({"contents": items.len()}))
+}
+
+/// Edit ▸ Paste with shape items on the clipboard: copies go into each selected shape layer's
+/// Contents, above its topmost selected item (in that item's group), else on top. Names stay
+/// unique in their group ("Rectangle 2"…), and the copies are selected.
+pub(crate) fn paste_contents(s: &mut Session, p: &Value) -> Result<Value> {
+    let c = "edit.paste";
+    let clip = s.state.contents_clipboard.clone();
+    let (cid, ids) = layers_p(s, p)?;
+    let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
+    let targets: Vec<LayerId> =
+        ids.into_iter().filter(|l| comp.layer(*l).is_some_and(|l| matches!(l.source, LayerSource::Shape) && !l.switches.locked)).collect();
+    if targets.is_empty() {
+        return Err(bad(c, "select a shape layer to paste shape items into"));
+    }
+    let sel = selected_contents(s);
+    let label = match clip.as_slice() {
+        [g] => format!("Paste {}", g.name),
+        _ => "Paste".to_string(),
+    };
+    let pasted = s.edit(&label, None, |proj, st| {
+        let mut next = proj.next_id;
+        let mut out = vec![];
+        for lid in &targets {
+            let l = layer_mut(proj, cid, *lid)?;
+            // Above the layer's topmost selected item, in its group.
+            let spot = sel.iter().find(|(sl, _)| sl == lid).and_then(|(_, u)| {
+                let parent = l.props.parent_of(*u)?;
+                Some((parent.uid, parent.children.iter().position(|n| n.uid() == *u)?))
+            });
+            let (parent, at) = match spot {
+                Some((pu, i)) => (l.props.find_group_mut(pu), i),
+                None => (l.props.sub_mut("contents"), 0),
+            };
+            let parent = parent.ok_or_else(|| bad(c, "the layer has no contents"))?;
+            for (k, g) in clip.iter().enumerate() {
+                let mut g = g.clone();
+                g.reassign_uids(&mut next);
+                g.name = super::effect::unique_name(parent, &g.name);
+                out.push((*lid, g.uid));
+                parent.children.insert((at + k).min(parent.children.len()), g.into());
+            }
+        }
+        proj.next_id = next + 1;
+        st.selected_props = out.clone();
+        Ok(out)
+    })?;
+    Ok(json!({"contents": pasted.iter().map(|(_, u)| *u).collect::<Vec<_>>()}))
+}
+
+/// Edit ▸ Duplicate with shape items selected: each is copied in place, above the original and
+/// named as After Effects does ("Rectangle 1" → "Rectangle 2"), and the copies are selected.
+pub(crate) fn duplicate_contents(s: &mut Session, items: &[(LayerId, Uid)]) -> Result<Value> {
+    let c = "edit.duplicate";
+    let cid = s.active_comp_id().ok_or(EngineError::NoComp)?;
+    let copies = s.edit("Duplicate", None, |proj, st| {
+        let mut next = proj.next_id;
+        let mut out = vec![];
+        for (lid, uid) in items {
+            let parent = layer_mut(proj, cid, *lid)?.props.parent_of_mut(*uid).ok_or_else(|| bad(c, "the shape item is gone"))?;
+            let Some((i, Node::Group(g))) = parent.children.iter().enumerate().find(|(_, n)| n.uid() == *uid) else { continue };
+            let mut g = g.clone();
+            g.reassign_uids(&mut next);
+            g.name = super::effect::unique_name(parent, &g.name);
+            out.push((*lid, g.uid));
+            parent.children.insert(i, Node::Group(g));
+        }
+        proj.next_id = next + 1;
+        st.selected_props = out.clone();
+        Ok(out)
+    })?;
+    Ok(json!({"contents": copies.iter().map(|(_, u)| *u).collect::<Vec<_>>()}))
 }
 
 fn duplicate(s: &mut Session, p: &Value) -> Result<Value> {

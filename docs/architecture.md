@@ -101,7 +101,8 @@ time), primitive layers (Layer ▸ New ▸ Cube/Sphere/Plane/Torus/Cone/Cylinder
 Geometry Options), text and shape layers with Geometry Options ▸ Extrusion Depth (glyph and
 fill outlines flattened, triangulated with holes and extruded with Angular/Concave/Convex
 bevels, per character so per-character 3D carries over), and a textured card for every other
-3D layer. Shading is physically based in linear light (glTF metallic-roughness; Cook–Torrance
+3D layer. Classic 3D doesn't draw model or primitive layers, so adding one switches a Classic 3D
+comp to Advanced 3D in the same undo step, as in After Effects. Shading is physically based in linear light (glTF metallic-roughness; Cook–Torrance
 GGX specular, Smith–Schlick geometry, Schlick Fresnel, Lambert diffuse, after Karis 2013):
 parallel, spot and point lights with After Effects' falloffs, ambient lights, image-based
 light from an Environment light whose Source (or the comp's Environment Layer, Layer ▸
@@ -318,8 +319,9 @@ hierarchical block-matching optical flow and a bidirectional warp (Pixel Motion,
 its nested layers straight into the parent with concatenated transforms (one resample), so
 nested blend modes and adjustment layers act on the parent's layers; nested 3D layers use the
 parent's camera and lights and, when the precomp layer is 3D, are depth-sorted with the parent's
-3D run. Masks, effects or styles force a flattened render. On text and shape layers the switch is
-Continuously Rasterize: the source is rasterised at its on-screen scale. Quality: Draft samples
+3D run. Masks, effects or styles force a flattened render. Text layers are always rasterised at
+their on-screen scale; on shape layers and vector footage the switch is Continuously Rasterize and
+does the same. Quality: Draft samples
 nearest-neighbour, Wireframe draws the layer bounds. Slip edit (`layer.slip`, Alt+PageUp/Down,
 dragging the source bar in the timeline) moves the source under fixed in/out points.
 

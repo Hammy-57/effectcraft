@@ -95,3 +95,39 @@ fn label_swatch_opens_the_label_menu() {
     assert_eq!(h.state().session.history.undo.len(), undo + 1);
     assert!(h.query_by_label(&green).is_none(), "the menu closed after the choice");
 }
+
+/// Dragging from the Project panel's empty area draws a selection box that selects the rows it
+/// touches; a click there deselects (#203).
+#[test]
+fn dragging_in_the_empty_area_box_selects_items() {
+    let (mut h, folder, _, solid) = harness();
+    let list = h.state().auto.find("project.empty").unwrap().rect;
+    let from = pos2(list[0] + 40.0, list[1] + list[3] - 6.0);
+    let to = center(&h, &format!("project.item.{}.name", folder.0));
+    h.input_mut().events.push(Event::PointerMoved(from));
+    h.step();
+    button(&mut h, from, true);
+    h.step();
+    for k in 1..=6 {
+        h.input_mut().events.push(Event::PointerMoved(from + (to - from) * (k as f32 / 6.0)));
+        h.step();
+    }
+    button(&mut h, to, false);
+    h.run_steps(2);
+    let sel = h.state().session.state.project_selection.clone();
+    assert!(sel.contains(&folder) && sel.contains(&solid), "{sel:?}");
+    click_at(&mut h, from);
+    assert!(h.state().session.state.project_selection.is_empty());
+}
+
+/// A Project panel shorter than its scroll bar's thumb draws instead of panicking: an empty
+/// project in a 1280 × 800 browser window at device pixel ratio 2 (640 × 400 points) left the
+/// list too short for the thumb's 16-point minimum (#231).
+#[test]
+fn a_short_project_panel_draws() {
+    for height in [400.0, 300.0] {
+        let mut h = Harness::builder().with_size(egui::vec2(640.0, height)).build_eframe(|_| EffectcraftApp::new(Session::default()));
+        h.run_steps(3);
+        assert!(h.state().auto.find("project.empty").is_some(), "the Project panel drew at {height} points");
+    }
+}

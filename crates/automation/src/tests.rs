@@ -218,6 +218,167 @@ fn stdio_loop() {
     assert_eq!(lines[1]["result"]["isError"], false);
 }
 
+/// Regression for #258: a dirty headless project must survive an MCP disconnect.
+#[test]
+fn headless_autosave_on_eof_preserves_unsaved_project() {
+    let dir = std::env::temp_dir().join(format!("ec-mcp-autosave-eof-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut s = server().with_autosave(&dir).unwrap();
+    let input = [
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "execute_command", "arguments": {"command": "comp.new", "params": {"name": "Keep my work", "width": 320, "height": 180}}}}),
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "execute_command", "arguments": {"command": "layer.newText", "params": {"text": "Unsaved title"}}}}),
+    ].iter().map(|v| v.to_string() + "\n").collect::<String>();
+    let mut output = Vec::new();
+    s.serve(input.as_bytes(), &mut output).unwrap();
+    let path = s.backend().session().unwrap().autosave.last_path.clone();
+    assert!(path.is_some(), "disconnect discarded the dirty project without an auto-save");
+    let path = path.unwrap();
+    let mut fresh = server();
+    call_json(&mut fresh, "open_project", json!({"path": path}));
+    let comp = call_json(&mut fresh, "get_comp", json!({"comp": "Keep my work"}));
+    assert_eq!(comp["layers"].as_array().unwrap().len(), 1);
+    assert!(s.backend().session().unwrap().is_dirty(), "an auto-save must not mark the original project saved");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+fn autosave_test_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("ec-mcp-autosave-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn autosave_status(s: &mut McpServer) -> Value {
+    rpc(s, 1, "initialize", json!({}))["_meta"]["effectcraftAutoSave"].clone()
+}
+
+#[test]
+fn autosave_is_durable_before_reply_and_queries_do_not_rotate() {
+    let dir = autosave_test_dir("durable");
+    let mut s = server().with_autosave(&dir).unwrap();
+    call_json(&mut s, "execute_command", json!({"command": "comp.new", "params": {"name": "Durable"}}));
+    let first = autosave_status(&mut s);
+    let path = first["latestPath"].as_str().unwrap();
+    assert!(std::fs::read_to_string(path).unwrap().contains("Durable"));
+    let summary = call_json(&mut s, "get_project", json!({}));
+    assert_eq!(summary["autosave"]["latestPath"], path);
+    assert_eq!(summary["path"], Value::Null);
+    assert_eq!(summary["dirty"], true);
+    assert_eq!(autosave_status(&mut s)["latestPath"], path);
+    assert!(s.backend().session().unwrap().config.is_none());
+    drop(s); // Abrupt process loss has no EOF cleanup; the checkpoint already exists.
+    let mut restarted = server().with_autosave(&dir).unwrap();
+    let init = rpc(&mut restarted, 1, "initialize", json!({}));
+    assert!(init["instructions"].as_str().unwrap().contains(path));
+    assert_eq!(init["_meta"]["effectcraftAutoSave"]["previousSessions"][0]["autosave"], path);
+    call_json(&mut restarted, "open_project", json!({"path": path}));
+    assert_eq!(call_json(&mut restarted, "get_project", json!({}))["items"][0]["name"], "Durable");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn autosave_errors_preserve_tool_success_retry_and_fail_shutdown() {
+    let dir = autosave_test_dir("write-error");
+    let mut s = server().with_autosave(&dir).unwrap();
+    let folder = std::path::PathBuf::from(autosave_status(&mut s)["folder"].as_str().unwrap());
+    std::fs::remove_dir(&folder).unwrap();
+    std::fs::write(&folder, "blocked by file").unwrap();
+    let (content, failed) = call(&mut s, "execute_command", json!({"command": "comp.new", "params": {"name": "Still in memory"}}));
+    assert!(!failed, "the edit succeeded even though its checkpoint failed");
+    assert!(content.iter().any(|c| c["text"].as_str().unwrap_or("").contains("Warning:")));
+    assert!(s.backend().session().unwrap().is_dirty());
+    assert!(autosave_status(&mut s)["error"].as_str().unwrap().contains("failed"));
+    let error = s.serve(&b""[..], Vec::new()).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::Other);
+    assert!(error.to_string().contains("MCP auto-save"));
+    std::fs::remove_file(&folder).unwrap();
+    // Even a query retries the outstanding dirty revision.
+    let summary = call_json(&mut s, "get_project", json!({}));
+    assert_eq!(summary["autosave"]["error"], Value::Null);
+    let path = summary["autosave"]["latestPath"].as_str().unwrap();
+    assert!(std::fs::read_to_string(path).unwrap().contains("Still in memory"));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn autosave_keeps_sessions_and_desktop_recovery_separate() {
+    let dir = autosave_test_dir("isolated");
+    let desktop_save = dir.join(effectcraft_engine::autosave::AUTOSAVE_FOLDER).join("Untitled Project auto-save 1.ecproj");
+    std::fs::create_dir_all(desktop_save.parent().unwrap()).unwrap();
+    std::fs::write(&desktop_save, "desktop backup").unwrap();
+    std::fs::write(dir.join("session.lock"), "desktop sentinel").unwrap();
+    let mut a = server().with_autosave(&dir).unwrap();
+    let mut b = server().with_autosave(&dir).unwrap();
+    assert_ne!(autosave_status(&mut a)["folder"], autosave_status(&mut b)["folder"]);
+    for index in 0..7 {
+        for (s, name) in [(&mut a, "A"), (&mut b, "B")] {
+            call_json(s, "execute_command", json!({"command": "comp.new", "params": {"name": format!("{name}{index}")}}));
+        }
+    }
+    for (s, mine, other) in [(&mut a, "A6", "B6"), (&mut b, "B6", "A6")] {
+        let status = autosave_status(s);
+        let json = std::fs::read_to_string(status["latestPath"].as_str().unwrap()).unwrap();
+        assert!(json.contains(mine));
+        assert!(!json.contains(other));
+        let folder = std::path::Path::new(status["folder"].as_str().unwrap());
+        assert_eq!(effectcraft_engine::autosave::existing(folder, "Untitled Project").len(), 5);
+    }
+    assert_eq!(std::fs::read_to_string(desktop_save).unwrap(), "desktop backup");
+    assert_eq!(std::fs::read_to_string(dir.join("session.lock")).unwrap(), "desktop sentinel");
+    assert!(!dir.join("prefs.json").exists());
+    assert!(!dir.join("shortcuts.json").exists());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn autosave_marks_saved_or_undone_work_clean_without_losing_its_path() {
+    let dir = autosave_test_dir("clean");
+    let mut s = server().with_autosave(&dir).unwrap();
+    call_json(&mut s, "execute_command", json!({"command": "comp.new", "params": {"name": "Undo me"}}));
+    let status = autosave_status(&mut s);
+    let folder = std::path::Path::new(status["folder"].as_str().unwrap());
+    call_json(&mut s, "undo", json!({}));
+    let manifest: Value = serde_json::from_str(&std::fs::read_to_string(folder.join("session.json")).unwrap()).unwrap();
+    assert_eq!(manifest["dirty"], false);
+    call_json(&mut s, "redo", json!({}));
+    let path = autosave_status(&mut s)["latestPath"].clone();
+    call_json(&mut s, "save_project", json!({"path": dir.join("Saved.ecproj")}));
+    assert_eq!(autosave_status(&mut s)["latestPath"], path, "save resets the engine bookkeeping but the server remembers the recovery file");
+    let manifest: Value = serde_json::from_str(&std::fs::read_to_string(folder.join("session.json")).unwrap()).unwrap();
+    assert_eq!(manifest["dirty"], false);
+    let mut next = server().with_autosave(&dir).unwrap();
+    assert!(autosave_status(&mut next)["previousSessions"].as_array().unwrap().is_empty());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn autosave_flushes_on_read_errors_and_broken_output() {
+    struct Broken;
+    impl Write for Broken {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let dir = autosave_test_dir("transports");
+    for invalid_input in [true, false] {
+        let mut s = server().with_autosave(&dir).unwrap();
+        // Simulate an edit whose client went away before it received a tool response.
+        s.backend().exec("comp.new", json!({"name": "Transport failure"})).unwrap();
+        let error = if invalid_input {
+            s.serve(&b"\xff\n"[..], Vec::new()).unwrap_err()
+        } else {
+            s.serve(&b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n"[..], Broken).unwrap_err()
+        };
+        assert_eq!(error.kind(), if invalid_input { std::io::ErrorKind::InvalidData } else { std::io::ErrorKind::BrokenPipe });
+        let status = autosave_status(&mut s);
+        assert!(std::fs::read_to_string(status["latestPath"].as_str().unwrap()).unwrap().contains("Transport failure"));
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// A fake desktop control channel: answers `engine.execute` from a real session, and canned
 /// `render.frame` / `ui.screenshot` replies.
 fn fake_app() -> u16 {
@@ -506,4 +667,70 @@ fn agents_doc_tools_table_is_current() {
         }
     }
     assert!(missing.is_empty(), "docs/agents.md's Tools table is missing: {missing:#?}");
+}
+
+#[test]
+fn autosave_checkpoints_batch_and_partially_failed_tools() {
+    let dir = autosave_test_dir("partial");
+    let mut s = server().with_autosave(&dir).unwrap();
+    let msgs = json!([
+        {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"execute_command","arguments":{"command":"comp.new","params":{"name":"Batch"}}}},
+        {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"execute_command","arguments":{"command":"layer.newText","params":{"text":"Batch title"}}}}
+    ]);
+    let reply = s.handle(&msgs).unwrap();
+    assert_eq!(reply.as_array().unwrap().len(), 2);
+    let (_, failed) = call(&mut s, "add_keyframe", json!({"layer":"#1","path":"transform/opacity","keys":[{"time":0,"value":37}],"interpolation":"invalid"}));
+    assert!(failed, "the key was added, then the interpolation failed");
+    let status = autosave_status(&mut s);
+    let mut recovered = server();
+    call_json(&mut recovered, "open_project", json!({"path":status["latestPath"]}));
+    let prop = call_json(&mut recovered, "get_property", json!({"layer":"#1","path":"transform/opacity"}));
+    assert_eq!(prop["keys"].as_array().unwrap().len(), 1);
+    assert_eq!(prop["keys"][0]["value"], 37.0);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn autosave_isolation_also_applies_to_engine_autosaves_and_preference_changes() {
+    let dir = autosave_test_dir("engine-save");
+    let desktop = dir.join("DesktopCustom");
+    std::fs::create_dir_all(&desktop).unwrap();
+    std::fs::write(desktop.join("Untitled Project auto-save 1.ecproj"), "desktop backup").unwrap();
+    let mut session = Session::default();
+    session.prefs.auto_save.location = "custom".into();
+    session.prefs.auto_save.folder = desktop.to_string_lossy().into_owned();
+    let mut s = McpServer::new(Backend::headless(session)).with_autosave(&dir).unwrap();
+    call_json(&mut s, "execute_command", json!({"command":"comp.new","params":{"name":"Isolated"}}));
+    let status = autosave_status(&mut s);
+    let explicit = call_json(&mut s, "execute_command", json!({"command":"file.autoSave"}));
+    assert!(std::path::Path::new(explicit["path"].as_str().unwrap()).starts_with(status["folder"].as_str().unwrap()));
+    assert_eq!(autosave_status(&mut s)["latestPath"], explicit["path"]);
+    // The host override survives preference edits even within a single batch tool call.
+    call_json(
+        &mut s,
+        "batch",
+        json!({"steps":[
+            {"command":"prefs.set","params":{"values":{"autoSave.location":"custom","autoSave.folder":desktop.to_string_lossy()}}},
+            {"command":"file.autoSave","params":{}}
+        ]}),
+    );
+    call_json(&mut s, "save_project", json!({"path":dir.join("Named.ecproj")}));
+    call_json(&mut s, "execute_command", json!({"command":"layer.newText","params":{"text":"Latest isolated edit"}}));
+    let current = autosave_status(&mut s);
+    assert!(std::path::Path::new(current["latestPath"].as_str().unwrap()).starts_with(status["folder"].as_str().unwrap()));
+    assert!(std::fs::read_to_string(current["latestPath"].as_str().unwrap()).unwrap().contains("Latest isolated edit"));
+    let recovery = call_json(&mut s, "execute_command", json!({"command":"file.recoveryInfo"}));
+    assert_eq!(recovery["folder"], status["folder"]);
+    assert_eq!(std::fs::read_to_string(desktop.join("Untitled Project auto-save 1.ecproj")).unwrap(), "desktop backup");
+    assert_eq!(std::fs::read_dir(&desktop).unwrap().count(), 2, "only the original desktop file and the MCP subfolder");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn autosave_non_utf8_path_returns_an_error_instead_of_panicking() {
+    use std::os::unix::ffi::OsStringExt;
+    let root = std::path::PathBuf::from(std::ffi::OsString::from_vec(b"/tmp/ec-mcp-\xff".to_vec()));
+    let result = server().with_autosave(&root);
+    assert!(matches!(result, Err(crate::Error::Other(message)) if message.contains("UTF-8")));
 }

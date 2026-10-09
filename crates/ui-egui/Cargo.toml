@@ -32,7 +32,12 @@ image = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 pollster = { workspace = true }
+sys-locale = { workspace = true }
 
 [dev-dependencies]
 egui_kittest = { workspace = true, features = ["eframe", "wgpu"] }
 effectcraft-host = { workspace = true }
+
+[build-dependencies]
+serde_json = { workspace = true }
+toml = "1"

@@ -701,7 +701,8 @@ fn devices_with_webgl2_limits_are_declined() {
     let desc = wgpu::DeviceDescriptor { required_limits: wgpu::Limits::downlevel_webgl2_defaults(), ..Default::default() };
     let Ok((device, queue)) = pollster::block_on(adapter.request_device(&desc)) else { return };
     let err = crate::context::GpuContext::new(&adapter, device, queue).err().expect("declined");
-    assert!(err.contains("max_storage_buffers_per_shader_stage"), "{err}");
+    // A GL adapter (FreeBSD's llvmpipe) is declined for its backend before its limits are checked.
+    assert!(err.contains("max_storage_buffers_per_shader_stage") || err.contains("(Gl)"), "{err}");
 }
 
 /// GPU work inside the video memory guard returns its result when the device has room (#106).

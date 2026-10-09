@@ -8,7 +8,7 @@ work apply to everyone, people and AI agents alike, and they are not negotiable.
 You need [Rust](https://rustup.rs/) 1.95 or newer.
 
 ```sh
-cargo run -p effectcraft                 # the desktop app, with the demo project
+cargo run -p effectcraft -- --demo       # the desktop app, with the demo project
 cargo test --workspace
 cargo xtask ci                           # what every commit must pass
 ```

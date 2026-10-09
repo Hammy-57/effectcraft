@@ -8,7 +8,7 @@
 use std::f64::consts::TAU;
 
 use effectcraft_effects::EffectCtx;
-use effectcraft_effects::util::{Src, src_at};
+use effectcraft_effects::util::{self, Src, src_at};
 
 use crate::context::{Enc, Params};
 use crate::effects::GBuf;
@@ -77,11 +77,6 @@ fn layer_wh(ctx: &EffectCtx) -> (f64, f64) {
     (ctx.layer_size[0].max(1.0), ctx.layer_size[1].max(1.0))
 }
 
-/// util::layer_rect.
-fn layer_rect(ctx: &EffectCtx, b: &GBuf) -> [f32; 4] {
-    [b.offset[0] as f32, b.offset[1] as f32, (ctx.layer_size[0] * b.scale) as f32, (ctx.layer_size[1] * b.scale) as f32]
-}
-
 // ---------------------------------------------------------------- distort.rs
 
 fn twirl(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
@@ -101,13 +96,12 @@ fn bulge(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
     let h = ctx.params.f("height") * effectcraft_effects::BULGE_STRENGTH;
     let taper = 1.0 + ctx.params.f("taperRadius").max(0.0) / 100.0 * 3.0;
     let pin = ctx.params.b("pinAllEdges");
-    let (lw, lh) = layer_wh(ctx);
-    let (lw, lh) = (lw * b.scale, lh * b.scale);
+    let (x0, y0, lw, lh) = util::pin_rect(ctx, b.offset, b.scale);
     let edge = (lw.min(lh) * 0.1).max(1.0);
     let mut p = Params::default();
     p.f[0] = [c.0 as f32, c.1 as f32, rx as f32, ry as f32];
     p.f[1] = [h as f32, taper as f32, if pin { 1.0 } else { 0.0 }, edge as f32];
-    p.f[2] = [b.offset[0] as f32, b.offset[1] as f32, lw as f32, lh as f32];
+    p.f[2] = [x0 as f32, y0 as f32, lw as f32, lh as f32];
     run(e, "dst_bulge", &p, b, None)
 }
 
@@ -121,8 +115,8 @@ fn wave_warp(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     if !ctx.adjustment {
         b.pad(e, h.abs().ceil() as u32 + 1)?;
     }
-    let (lw, lh) = layer_wh(ctx);
-    let rect = [b.offset[0] as f32, b.offset[1] as f32, (lw * b.scale).max(1.0) as f32, (lh * b.scale).max(1.0) as f32];
+    let (x0, y0, lw, lh) = util::pin_rect(ctx, b.offset, b.scale);
+    let rect = [x0 as f32, y0 as f32, lw.max(1.0) as f32, lh.max(1.0) as f32];
     // The wave phase in cycles, (x·dx + y·dy) / width + phase / 2π, is separable: per column
     // and per row (fraction, whole cycles) in f64, so the kernel's sum keeps the fraction exact
     // to f32 (the circle shapes have vertical tangents where a phase error is amplified).
@@ -190,8 +184,8 @@ fn turbulent(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     let evo = ctx.params.f("evolution") / 360.0;
     let cycle = ctx.params.b("evolutionOptions/cycleEvolution").then(|| ctx.params.f("evolutionOptions/cycle").round().max(1.0));
     let falloff = if (3..=5).contains(&kind) { 0.3 } else { 0.5 };
-    let rect = layer_rect(ctx, &b);
-    let edge = ((ctx.layer_size[0] * b.scale).min(ctx.layer_size[1] * b.scale) * 0.1).max(1.0);
+    let (x0, y0, lw, lh) = util::pin_rect(ctx, b.offset, b.scale);
+    let edge = (lw.min(lh) * 0.1).max(1.0);
     let seed = (ctx.seed ^ 0x7d15).wrapping_add((ctx.params.f("evolutionOptions/randomSeed") as i64 as u32).wrapping_mul(0x9e37_79b9));
     let (z0, z1, t) = match cycle {
         Some(c) => {
@@ -205,7 +199,7 @@ fn turbulent(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     p.u[1][0] = cycle.is_some() as u32;
     p.f[0] = [off.0 as f32, off.1 as f32, size as f32, amount as f32];
     p.f[1] = [z0, z1, t, (oct - oct.floor()) as f32];
-    p.f[2] = rect;
+    p.f[2] = [x0 as f32, y0 as f32, lw as f32, lh as f32];
     p.f[3] = [edge as f32, falloff, 0.0, 0.0];
     run(e, "dst_turbulent", &p, b, None)
 }

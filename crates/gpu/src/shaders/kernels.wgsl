@@ -535,6 +535,36 @@ fn value_noise(x: f32, y: f32, z: f32, seed: u32) -> f32 {
     return a + (b - a) * fz;
 }
 
+// Fractal Noise's Soft Linear (effects::noise3::typed_noise): the quadratic B-spline over the
+// 3 × 3 lattice values around the nearest one, faded along evolution, and SOFT_LINEAR_GAIN.
+const SOFT_LINEAR_GAIN: f32 = (181.0 / 231.0) / 0.55;
+
+fn bspline(t: f32) -> vec3<f32> {
+    let s = 1.0 - t;
+    return vec3<f32>(0.5 * s * s, 0.5 + t * s, 0.5 * t * t);
+}
+
+fn soft_linear_slice(ix: i32, iy: i32, iz: i32, wx: vec3<f32>, wy: vec3<f32>, seed: u32) -> f32 {
+    var sum = 0.0;
+    for (var j = 0; j < 3; j++) {
+        let y = iy + j - 1;
+        sum += wy[j] * (wx.x * lattice(ix - 1, y, iz, seed) + wx.y * lattice(ix, y, iz, seed) + wx.z * lattice(ix + 1, y, iz, seed));
+    }
+    return sum;
+}
+
+fn soft_linear_noise(x: f32, y: f32, z: f32, seed: u32) -> f32 {
+    let x0 = floor(x + 0.5);
+    let y0 = floor(y + 0.5);
+    let z0 = floor(z);
+    let wx = bspline(x + 0.5 - x0);
+    let wy = bspline(y + 0.5 - y0);
+    let a = soft_linear_slice(i32(x0), i32(y0), i32(z0), wx, wy, seed);
+    let b = soft_linear_slice(i32(x0), i32(y0), i32(z0) + 1, wx, wy, seed);
+    let n = a + (b - a) * fade(z - z0);
+    return 0.5 + (n - 0.5) * SOFT_LINEAR_GAIN;
+}
+
 // generate::put: blend a generated straight colour (alpha ga) over the pixel.
 fn put(px: vec4<f32>, g: vec3<f32>, ga: f32, blend_orig: f32) -> vec4<f32> {
     let g2 = vec4<f32>(g * ga, ga);
@@ -800,7 +830,7 @@ fn pointwise(@builtin(global_invocation_id) gid: vec3<u32>) {
                 if (o + 1u == n_oct && frac > 0.0) {
                     w = frac;
                 }
-                var n = value_noise(u * f, v * f, evo + f32(o) * 7.31, seed + o);
+                var n = soft_linear_noise(u * f, v * f, evo + f32(o) * 7.31, seed + o);
                 let s = n * 2.0 - 1.0;
                 if (kind == 1u) {
                     n = 1.0 - s * s;

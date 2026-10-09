@@ -23,14 +23,10 @@ pub fn preview(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let p = ui.painter().with_clip_rect(rect);
     // The panel scrolls when it is shorter than its controls (the default workspace shows just
     // the transport row, as in After Effects).
-    let scroll_id = egui::Id::new("preview-scroll");
-    let mut scroll: f32 = ctx.data(|d| d.get_temp(scroll_id).unwrap_or(0.0));
-    if ui.rect_contains_pointer(rect) {
-        scroll = (scroll - ui.input(|i| i.smooth_scroll_delta.y)).max(0.0);
-    }
+    let scroll = widgets::PanelScroll::begin(ui, egui::Id::new("preview-scroll"), rect);
     let panel_clip = ui.clip_rect();
     ui.set_clip_rect(rect.intersect(panel_clip));
-    let y = rect.min.y + 12.0 - scroll;
+    let y = rect.min.y + 12.0 - scroll.offset;
     let bw = 30.0;
     let total = bw * 5.0 + 16.0;
     let mut x = rect.center().x - total / 2.0;
@@ -231,17 +227,8 @@ pub fn preview(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         p.text(pos2(bar.min.x, bar.max.y + 12.0), Align2::LEFT_CENTER, format!("{cached} / {total} frames cached{status}"), Tokens::ui(11.0), t.text_faint);
     }
     ui.set_clip_rect(panel_clip);
-    let content = yy + 30.0 - (rect.min.y - scroll);
-    let max = (content - rect.height()).max(0.0);
-    scroll = scroll.min(max);
-    ctx.data_mut(|d| d.insert_temp(scroll_id, scroll));
-    if max > 0.0 {
-        // A thin scroll indicator on the right edge.
-        let h = (rect.height() * rect.height() / content).max(12.0);
-        let top = rect.min.y + (rect.height() - h) * (scroll / max);
-        p.rect_filled(Rect::from_min_size(pos2(rect.max.x - 5.0, top), vec2(3.0, h)), 1.5, t.text_faint.gamma_multiply(0.6));
-        app.auto.add("preview.scroll", Rect::from_min_size(pos2(rect.max.x - 6.0, rect.min.y), vec2(6.0, rect.height())), "Preview scroll");
-    }
+    let content = yy + 30.0 - (rect.min.y - scroll.offset);
+    scroll.end(ui, &mut app.auto, "preview.scroll", content, &t);
 }
 
 fn fmt_rate(r: f64) -> String {
@@ -268,28 +255,21 @@ fn dropdown_row(app: &mut EffectcraftApp, ui: &mut egui::Ui, r: Rect, key: &str,
         ui.data_mut(|d| d.insert_temp(pid.with("open"), !open));
     }
     app.auto.add(&format!("preview.{key}"), r, text);
-    let open: bool = ui.data(|d| d.get_temp(pid.with("open")).unwrap_or(false));
-    if !open {
+    if !widgets::popup_is_open(ui, pid) {
         return None;
     }
-    let mut chosen = None;
-    let area = egui::Area::new(pid.with("area")).order(egui::Order::Foreground).fixed_pos(r.left_bottom() + vec2(0.0, 2.0)).show(ui.ctx(), |ui| {
-        egui::Frame::popup(ui.style()).show(ui, |ui| {
-            ui.set_min_width(r.width().max(140.0));
-            for (i, label) in items.iter().enumerate() {
-                let resp = ui.selectable_label(current == Some(i), label.as_str());
-                app.auto.add(&format!("preview.{key}.{i}"), resp.rect, label);
-                if resp.clicked() {
-                    chosen = Some(i);
-                }
+    widgets::popup_list(ui, pid, r.left_bottom() + vec2(0.0, 2.0), r, items.len(), 0, |ui| {
+        ui.set_min_width(r.width().max(140.0));
+        let mut chosen = None;
+        for (i, label) in items.iter().enumerate() {
+            let resp = ui.selectable_label(current == Some(i), label.as_str());
+            app.auto.add(&format!("preview.{key}.{i}"), resp.rect, label);
+            if resp.clicked() {
+                chosen = Some(i);
             }
-        });
-    });
-    let outside = widgets::pressed_outside(ui.ctx(), &area.response) && !r.contains(ui.input(|i| i.pointer.interact_pos()).unwrap_or_default());
-    if chosen.is_some() || outside || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-        ui.data_mut(|d| d.insert_temp(pid.with("open"), false));
-    }
-    chosen
+        }
+        chosen
+    })
 }
 
 /// Audio panel: L/R VU meters (dBFS, 0 to -48) with peak hold and clip indicators, fed by the
@@ -389,12 +369,24 @@ pub fn history(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let nodes = app.session.history_tree();
     let row_h = 22.0;
     let cur = nodes.iter().position(|n| n.current).unwrap_or(0);
-    // Keep the current state in view.
-    let visible = ((rect.height() - 12.0) / row_h).max(1.0) as usize;
-    let first = (cur + 2).saturating_sub(visible).min(nodes.len().saturating_sub(visible));
-    let mut y = rect.min.y + 6.0;
+    let scroll_id = egui::Id::new("history-scroll");
+    let mut scroll = widgets::PanelScroll::begin(ui, scroll_id, rect);
+    // The current state scrolls into view when it changes (undo, redo, a new step).
+    if ui.data(|d| d.get_temp::<usize>(scroll_id.with("current"))) != Some(cur) {
+        ui.data_mut(|d| d.insert_temp(scroll_id.with("current"), cur));
+        let top = cur as f32 * row_h;
+        if top < scroll.offset {
+            scroll.offset = top;
+        } else if top + row_h + 12.0 > scroll.offset + rect.height() {
+            scroll.offset = top + row_h + 12.0 - rect.height();
+        }
+    }
+    // Only the rows in view are drawn.
+    let first = ((scroll.offset / row_h) as usize).min(nodes.len());
+    let mut y = rect.min.y + 6.0 - (scroll.offset - first as f32 * row_h);
+    let visible = (rect.height() / row_h) as usize + 2;
     let mut jump: Option<usize> = None;
-    for n in nodes.iter().skip(first).take(visible + 1) {
+    for n in nodes.iter().skip(first).take(visible) {
         let r = Rect::from_min_size(pos2(rect.min.x, y), vec2(rect.width(), row_h));
         y += row_h;
         let resp = ui.interact(r, egui::Id::new(("hist", n.id.as_str())), Sense::click());
@@ -417,6 +409,7 @@ pub fn history(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             jump = Some(n.index);
         }
     }
+    scroll.end(ui, &mut app.auto, "history.scroll", nodes.len() as f32 * row_h + 12.0, &t);
     if let Some(i) = jump {
         let ctx = ui.ctx().clone();
         if let Err(e) = crate::menus::invoke(app, &ctx, "edit.history.goto", serde_json::json!({"index": i})) {
@@ -429,13 +422,17 @@ pub fn markers(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let t = app.tokens;
     let p = ui.painter().with_clip_rect(rect);
     let Some(c) = app.session.active_comp_arc() else { return };
-    let mut y = rect.min.y + 8.0;
+    let scroll = widgets::PanelScroll::begin(ui, egui::Id::new("markers-scroll"), rect);
+    let mut y = rect.min.y + 8.0 - scroll.offset;
     if c.markers.is_empty() {
         p.text(rect.center(), Align2::CENTER_CENTER, "No composition markers", Tokens::ui(12.0), t.text_faint);
     }
     for m in &c.markers {
         let r = Rect::from_min_size(pos2(rect.min.x, y), vec2(rect.width(), 22.0));
         y += 22.0;
+        if !r.intersects(rect) {
+            continue;
+        }
         let tc = crate::panels::timecode(&app.session, &c, m.time);
         p.text(pos2(r.min.x + 12.0, r.center().y), Align2::LEFT_CENTER, tc, Tokens::mono(11.5), t.timecode);
         p.text(pos2(r.min.x + 120.0, r.center().y), Align2::LEFT_CENTER, &m.comment, Tokens::ui(12.0), t.text);
@@ -443,4 +440,6 @@ pub fn markers(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             app.session.set_time(m.time);
         }
     }
+    let content = y + 8.0 - (rect.min.y - scroll.offset);
+    scroll.end(ui, &mut app.auto, "markers.scroll", content, &t);
 }

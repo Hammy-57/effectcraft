@@ -1,6 +1,7 @@
 //! Headless checks for Timeline keyframes as a person uses them: dragging keys over many frames
-//! in one gesture (the drag used to end after the first frame), Shift-snapping, and Ctrl+C /
-//! Ctrl+V, which the windowing layer delivers as clipboard events rather than key presses.
+//! in one gesture (the drag used to end after the first frame), Shift-snapping, Ctrl+C /
+//! Ctrl+V, which the windowing layer delivers as clipboard events rather than key presses, and
+//! easing selected keys from the Ease Presets panel.
 
 use effectcraft_engine::Session;
 use effectcraft_engine::project::LayerId;
@@ -148,6 +149,23 @@ fn shift_click_toggles_and_ctrl_click_switches_interpolation() {
     assert_eq!(key(&h).out_interp, effectcraft_engine::keyframe::Interp::Hold);
 }
 
+/// Clicking a key in the Timeline selects its property and layer too, as in After Effects, so
+/// the Graph Editor shows the key's curve (#252).
+#[test]
+fn a_key_clicked_in_the_timeline_shows_in_the_graph_editor() {
+    let (mut h, id, uid) = harness();
+    h.state_mut().session.execute("edit.deselectAll", json!({})).unwrap();
+    h.run_steps(2);
+    let ks = keys(&h, uid);
+    click_with(&mut h, ks[1], Default::default());
+    let st = &h.state().session.state;
+    assert_eq!(st.selected_keys.len(), 1);
+    assert_eq!((st.selected_props.clone(), st.selected_layers.clone()), (vec![(id, uid)], vec![id]), "the key's property and layer");
+    h.state_mut().ui.timeline.graph_editor = true;
+    h.run_steps(4);
+    assert!(h.state().auto.find(&format!("timeline.graph.key.{uid}.0.1")).is_some(), "the Graph Editor shows the key");
+}
+
 #[test]
 fn graph_editor_drags_move_every_selected_key_and_shift_keeps_an_axis() {
     let (mut h, id, uid) = harness();
@@ -235,4 +253,43 @@ fn k_follows_the_revealed_properties_and_auto_select_picks_the_speed_graph_for_p
     h.state_mut().ui.timeline.graph_mode = "value".into();
     h.run_steps(3);
     assert!(h.state().auto.find(&format!("timeline.graph.key.{pos}.1.0")).is_some(), "value graph: X and Y");
+}
+
+fn center(h: &Harness<'_, EffectcraftApp>, id: &str) -> Pos2 {
+    let e = h.state().auto.find(id).unwrap_or_else(|| panic!("no {id}"));
+    pos2(e.rect[0] + e.rect[2] / 2.0, e.rect[1] + e.rect[3] / 2.0)
+}
+
+#[test]
+fn clicking_an_ease_preset_eases_the_selected_keys_and_handles_edit_the_curve() {
+    use effectcraft_engine::keyframe::{Ease, Interp};
+    use effectcraft_ui_egui::dock::PanelKind;
+    let (mut h, id, _) = harness();
+    h.state_mut().session.execute("prop.select", json!({"layer": id.0, "path": "transform/opacity"})).unwrap();
+    h.state_mut().show_panel(PanelKind::EasePresets);
+    h.state_mut().ui.maximized = Some(PanelKind::EasePresets);
+    h.run_steps(4);
+    let opacity =
+        |h: &Harness<'_, EffectcraftApp>| h.state().session.active_comp().unwrap().layer(id).unwrap().props.prop("transform/opacity").unwrap().clone();
+    let tile = h.state().auto.query("easePresets.preset.").into_iter().find(|e| e.label == "Ease In-Out").expect("the Ease In-Out thumbnail").id.clone();
+    let steps = h.state().session.history.undo.len();
+    let at = center(&h, &tile);
+    click_with(&mut h, at, Default::default());
+    let op = opacity(&h);
+    let eased = Ease { speed: 0.0, influence: 0.5 };
+    assert_eq!((op.keys[0].out_interp, op.keys[0].out_ease.clone()), (Interp::Bezier, vec![eased]));
+    assert_eq!((op.keys[1].in_interp, op.keys[1].in_ease.clone()), (Interp::Bezier, vec![eased]));
+    assert_eq!(h.state().session.history.undo.len(), steps + 1);
+    assert_eq!(h.state().ui.ease_presets.selected.as_deref(), Some("Ease In-Out"));
+    // Dragging the out handle to the right lengthens its influence; Apply uses the edited curve.
+    let graph = h.state().auto.find("easePresets.graph").unwrap().rect;
+    let from = center(&h, "easePresets.handle.out");
+    drag(&mut h, from, from + egui::vec2(graph[2] * 0.2, 0.0), Default::default());
+    let out = h.state().ui.ease_presets.curve.out_influence;
+    assert!(out > 60.0 && out < 75.0, "{out}");
+    let apply = center(&h, "easePresets.apply");
+    click_with(&mut h, apply, Default::default());
+    let applied = opacity(&h).keys[0].out_ease[0].influence;
+    assert!((applied * 100.0 - out).abs() < 1e-9, "{applied} vs {out}");
+    assert_eq!(h.state().session.history.undo.len(), steps + 2);
 }

@@ -425,6 +425,55 @@ pub fn to_color_image(img: &effectcraft_engine::render::Image) -> egui::ColorIma
     egui::ColorImage::new([img.width as usize, img.height as usize], px)
 }
 
+/// The size `size` is shown at in a texture whose sides can't exceed `max_side`: divided by the
+/// smallest whole factor that fits (frames of comps wider than the GPU's texture limit, #201).
+pub fn fitted_size(size: [usize; 2], max_side: usize) -> [usize; 2] {
+    let k = size[0].max(size[1]).div_ceil(max_side.max(1)).max(1);
+    [size[0].div_ceil(k), size[1].div_ceil(k)]
+}
+
+/// `img` as a texture the renderer accepts: unchanged when it fits in `max_side`, else averaged
+/// down by a whole factor (premultiplied pixels average correctly). The viewer draws it over the
+/// same area, so only detail beyond the GPU's texture limit is lost, instead of the upload
+/// failing (#201).
+pub fn fit_texture(img: egui::ColorImage, max_side: usize) -> egui::ColorImage {
+    let [w, h] = img.size;
+    let [fw, fh] = fitted_size(img.size, max_side);
+    if [fw, fh] == [w, h] {
+        return img;
+    }
+    let k = w.max(h).div_ceil(max_side.max(1)).max(1);
+    let px: Vec<egui::Color32> = (0..fw * fh)
+        .into_par_iter()
+        .map(|i| {
+            let (x0, y0) = ((i % fw) * k, (i / fw) * k);
+            let (mut sum, mut n) = ([0u32; 4], 0u32);
+            for y in y0..(y0 + k).min(h) {
+                for c in img.pixels.get(y * w + x0..y * w + (x0 + k).min(w)).unwrap_or_default() {
+                    for (s, v) in sum.iter_mut().zip(c.to_array()) {
+                        *s += v as u32;
+                    }
+                    n += 1;
+                }
+            }
+            let n = n.max(1);
+            let [r, g, b, a] = sum.map(|s| ((s + n / 2) / n) as u8);
+            egui::Color32::from_rgba_premultiplied(r, g, b, a)
+        })
+        .collect();
+    egui::ColorImage::new([fw, fh], px)
+}
+
+/// The largest texture side the renderer accepts.
+pub fn max_texture_side(ctx: &egui::Context) -> usize {
+    ctx.input(|i| i.max_texture_side)
+}
+
+/// `ctx.load_texture` for frame-sized images: fitted to the renderer's texture limit first.
+pub fn load_fitted(ctx: &egui::Context, name: impl Into<String>, img: egui::ColorImage, opts: egui::TextureOptions) -> egui::TextureHandle {
+    ctx.load_texture(name, fit_texture(img, max_texture_side(ctx)), opts)
+}
+
 impl Frames {
     /// Retire only GPU preview state; documents, CPU frames and running job leases survive.
     /// Publication checks the same latch while holding the cache lock, so a late GPU frame
@@ -1014,6 +1063,26 @@ impl Queue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Frames larger than the texture limit are averaged down by a whole factor (#201: an
+    /// 11000×2200 comp at Full resolution against an 8192 limit).
+    #[test]
+    fn frames_over_the_texture_limit_are_averaged_down() {
+        assert_eq!(fitted_size([11000, 2200], 8192), [5500, 1100]);
+        assert_eq!(fitted_size([8192, 100], 8192), [8192, 100]);
+        assert_eq!(fitted_size([30000, 30000], 16384), [15000, 15000]);
+        assert_eq!(fitted_size([0, 0], 0), [0, 0]);
+        // 5×2 (three columns of white, then black) into 2 px: 3×2 blocks (the last one 2×2).
+        let w = egui::Color32::WHITE;
+        let b = egui::Color32::from_rgba_premultiplied(0, 0, 0, 255);
+        let img = egui::ColorImage::new([5, 2], vec![w, w, w, b, b, w, w, w, b, b]);
+        let out = fit_texture(img.clone(), 2);
+        assert_eq!(out.size, [2, 1]);
+        assert_eq!(out.pixels, vec![w, b]);
+        assert_eq!(fit_texture(img.clone(), 5).pixels, img.pixels);
+        let mixed = fit_texture(egui::ColorImage::new([2, 1], vec![w, b]), 1);
+        assert_eq!(mixed.pixels, vec![egui::Color32::from_rgba_premultiplied(128, 128, 128, 255)]);
+    }
 
     #[test]
     fn retirement_reaches_existing_workers_and_keeps_cpu_frames_and_completion_live() {

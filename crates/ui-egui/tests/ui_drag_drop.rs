@@ -1,7 +1,11 @@
 //! Drag and drop between panels (egui_kittest, real pointer drags): Project
 //! items land in the Timeline where they are dropped, between layers and, over the time graph,
 //! starting there (#89); dropped on the Composition viewer they are centred where they land
-//! (#85); an effect dropped on the viewer goes on the layer under the pointer (#88).
+//! (#85); an effect dropped on the viewer goes on the layer under the pointer (#88). Files
+//! dropped on the window import with visible progress (#270).
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use effectcraft_engine::Session;
 use effectcraft_engine::keyframe::Value as KV;
@@ -135,4 +139,121 @@ fn effects_dropped_on_the_viewer_go_on_the_layer_under_the_pointer() {
     let comp = h.state().session.active_comp().unwrap();
     let effects = |id: u64| comp.layer(effectcraft_engine::project::LayerId(id)).unwrap().effects().map_or(0, |fx| fx.groups().count());
     assert_eq!((effects(top), effects(middle)), (1, 0), "on Top, which is under the pointer");
+}
+
+/// #227: Project items dropped on Create a new Composition (the Project panel's footer) make a
+/// composition from them, as File ▸ New Comp from Selection does; several items ask how in its
+/// dialog.
+#[test]
+fn project_items_dropped_on_new_comp_make_a_composition() {
+    let (mut h, clip) = harness();
+    let comps = |h: &Harness<'_, EffectcraftApp>| h.state().session.project.comps().count();
+    let before = comps(&h);
+    let item = rect(&h, &format!("project.item.{clip}.name")).center();
+    let button = rect(&h, "project.newComp").center();
+    drag(&mut h, item, button, Modifiers::NONE);
+    assert_eq!(comps(&h), before + 1);
+    let comp = h.state().session.active_comp().unwrap();
+    assert_eq!((comp.width, comp.height, comp.duration.seconds()), (160, 90, 1.0), "the item's settings");
+    assert_eq!(stack(&h), ["Clip"], "holding the item");
+    assert_ne!(h.state().session.active_comp_id().map(|c| c.0), Some(clip), "a new comp, open");
+    assert!(h.state().dialog.is_none());
+
+    // Two selected items, one dragged: New Composition from Selection asks how.
+    let main = h.state().session.project.items.values().find(|i| i.name == "Main").unwrap().id;
+    h.state_mut().session.state.project_selection = vec![effectcraft_engine::project::ItemId(clip), main];
+    h.run_steps(2);
+    let item = rect(&h, &format!("project.item.{clip}.name")).center();
+    drag(&mut h, item, button, Modifiers::NONE);
+    assert_eq!(h.state().dialog, Some(effectcraft_ui_egui::Dialog::Form));
+    assert!(h.state().auto.find("form.field.single").is_some(), "the New Composition from Selection dialog");
+    assert_eq!(comps(&h), before + 1, "nothing made yet");
+}
+
+/// A file dropped on the window (egui hands it over as a dropped file).
+#[derive(Debug)]
+struct Dropped(std::path::PathBuf);
+
+impl egui::DroppedFile for Dropped {
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+    fn bytes(&self) -> Result<Vec<u8>, String> {
+        Err("not read".into())
+    }
+}
+
+/// Footage probes that hold file k until `allow` > k (slow video decoding), 5 s at most (an
+/// import that blocks the app then fails the test instead of hanging it).
+struct Gated {
+    started: AtomicUsize,
+    allow: Arc<AtomicUsize>,
+}
+
+impl effectcraft_engine::Importer for Gated {
+    fn probe(&self, path: &str) -> Result<effectcraft_engine::project::Footage, String> {
+        let k = self.started.fetch_add(1, Ordering::SeqCst);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while self.allow.load(Ordering::SeqCst) <= k && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        Ok(effectcraft_engine::project::Footage { path: path.into(), width: 64, height: 32, has_video: true, ..Default::default() })
+    }
+}
+
+/// Step the app until `done` holds (the import runs on another thread).
+fn step_until(h: &mut Harness<'_, EffectcraftApp>, done: impl Fn(&Harness<'_, EffectcraftApp>) -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !done(h) {
+        assert!(std::time::Instant::now() < deadline, "timed out");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        h.step();
+    }
+}
+
+/// #270: files dropped on the window import in the background with an Importing card that names
+/// the file being read and how many are left (the app keeps drawing meanwhile); then they are
+/// selected and shown in the Project panel, with the count in a toast. The same file dropped
+/// again arrives again, selected.
+#[test]
+fn dropped_files_show_import_progress_then_the_items_they_made() {
+    let (mut h, _) = harness();
+    let allow = Arc::new(AtomicUsize::new(1));
+    h.state_mut().session.importer = Some(Arc::new(Gated { started: AtomicUsize::new(0), allow: allow.clone() }));
+    let file = |n: &str| std::env::temp_dir().join(n);
+    for n in ["a.png", "b.png", "c.png"] {
+        h.input_mut().dropped_files.push(Arc::new(Dropped(file(n))));
+    }
+    h.run_steps(2);
+    let card = |h: &Harness<'_, EffectcraftApp>| h.state().auto.query("import.job.").first().map(|e| e.label.clone());
+    step_until(&mut h, |h| card(h).as_deref() == Some("b.png (2 of 3)"));
+    let r = rect(&h, &card_id(&h));
+    assert!(r.min.x < 40.0 && r.max.y > 960.0, "bottom left, over the panels (where toasts show): {r:?}");
+    assert!(h.state().auto.find(&card_id(&h).replace("import.job.", "import.cancel.")).is_some(), "with Cancel");
+    let items = |h: &Harness<'_, EffectcraftApp>| h.state().session.project.items.values().filter(|i| i.name.ends_with(".png")).count();
+    assert_eq!(items(&h), 0, "nothing added until the import finishes");
+    allow.store(usize::MAX, Ordering::SeqCst);
+    step_until(&mut h, |h| card(h).is_none() && items(h) == 3);
+    h.run_steps(2);
+    let st = &h.state().session.state;
+    let names: Vec<String> = st.project_selection.iter().map(|i| h.state().session.project.item(*i).unwrap().name.clone()).collect();
+    assert_eq!(names, ["a.png", "b.png", "c.png"], "what arrived is selected");
+    let last = st.project_selection[2].0;
+    assert!(h.state().auto.find(&format!("project.item.{last}")).is_some(), "and in view in the Project panel");
+    assert_eq!(h.state().auto.find("toast").map(|e| e.label.as_str()), Some("Imported 3 items"));
+
+    // The same file again: imported again, and that one is selected.
+    h.input_mut().dropped_files.push(Arc::new(Dropped(file("a.png"))));
+    h.run_steps(2);
+    step_until(&mut h, |h| items(h) == 4);
+    h.run_steps(2);
+    let sel = &h.state().session.state.project_selection;
+    assert_eq!(sel.len(), 1);
+    assert_eq!(h.state().session.project.item(sel[0]).unwrap().name, "a.png");
+    assert_eq!(h.state().auto.find("toast").map(|e| e.label.as_str()), Some("Imported 1 item"));
+}
+
+/// The automation id of the Importing card on screen.
+fn card_id(h: &Harness<'_, EffectcraftApp>) -> String {
+    h.state().auto.query("import.job.").first().map(|e| e.id.clone()).unwrap_or_default()
 }

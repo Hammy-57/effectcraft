@@ -1,7 +1,8 @@
 //! Distort / stylize GPU effects vs the CPU effects (the oracle): see `fx_distort.rs`.
 
 use effectcraft_keyframe::Value;
-use effectcraft_project::BitDepth;
+use effectcraft_project::build::{self, Ids};
+use effectcraft_project::{BitDepth, LayerSource};
 use effectcraft_render::RenderOpts;
 use effectcraft_time::Tick;
 
@@ -52,6 +53,30 @@ fn turbulent_displace_and_cc_lens() {
     effect_case("ec.distort.cclens", &[("size", n(70.0))]);
     effect_case("ec.distort.cclens", &[("size", n(45.0)), ("convergence", n(60.0)), ("center", Value::Vec2([30.0, 20.0]))]);
     effect_case("ec.distort.cclens", &[("convergence", n(-70.0))]);
+}
+
+/// Edge pinning on a shape layer, whose comp-sized bounds are centred on its origin (#227).
+#[test]
+fn edge_pinning_on_a_shape_layer() {
+    let cases: [(&str, &[(&str, Value)]); 3] = [
+        ("ec.distort.turbulentdisplace", &[("size", n(30.0)), ("amount", n(20.0))]),
+        ("ec.distort.wavewarp", &[("pinning", e(1)), ("height", n(6.0)), ("width", n(25.0))]),
+        ("ec.distort.bulge", &[("pinAllEdges", on()), ("height", n(2.0)), ("hradius", n(40.0)), ("vradius", n(30.0)), ("center", Value::Vec2([-20.0, -10.0]))]),
+    ];
+    for (id, vals) in cases {
+        let mut s = Scene::new(BitDepth::Bpc32);
+        let mut l = build::layer(&mut s.p, &s.comp, "Shape", LayerSource::Shape, (97, 61), None);
+        let mut next = s.p.next_id;
+        let mut ids = Ids(&mut next);
+        let rect = build::shape_rect(&mut ids, [90.0, 54.0], [0.0, 0.0], 0.0);
+        let fill = build::shape_fill(&mut ids, [0.9, 0.3, 0.1, 1.0]);
+        let g = build::shape_group(&mut ids, "Rectangle 1", vec![rect, fill]);
+        s.p.next_id = next;
+        l.props.sub_mut("contents").unwrap().children.push(g.into());
+        s.effect(&mut l, id, vals);
+        s.push(l);
+        check(&format!("{id} on a shape layer"), compare_at(&s, opts(), Tick::ZERO), 0.0);
+    }
 }
 
 #[test]

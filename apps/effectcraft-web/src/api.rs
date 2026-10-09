@@ -148,7 +148,8 @@ pub fn remove_stored(path: String) -> bool {
     crate::files::STORE.remove_file(&path)
 }
 
-/// Resolves once every change is written to browser storage.
+/// Resolves once every change is written to browser storage; rejects when a write failed (it is
+/// tried again).
 #[wasm_bindgen]
 pub fn flush() -> js_sys::Promise {
     crate::persist::flushed()

@@ -87,6 +87,7 @@ impl FxTarget for Probe {
     fn cpu(&mut self, _f: &mut dyn FnMut(effectcraft_effects::Buf) -> effectcraft_effects::Buf) {
         self.cpu += 1;
     }
+    fn shift(&mut self, _d: [f64; 2]) {}
 }
 
 #[test]

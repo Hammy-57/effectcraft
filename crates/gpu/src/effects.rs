@@ -135,6 +135,11 @@ impl effectcraft_render::FxTarget for GpuFx<'_, '_> {
         let out = f(Buf { img, offset: b.offset, scale: b.scale });
         self.b = self.e.g.upload_image(&out.img).map(|img| GBuf { img, offset: out.offset, scale: out.scale });
     }
+    fn shift(&mut self, d: [f64; 2]) {
+        if let Some(b) = &mut self.b {
+            b.offset = [b.offset[0] - d[0], b.offset[1] - d[1]];
+        }
+    }
 }
 
 fn apply(e: &mut Enc, id: &str, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {

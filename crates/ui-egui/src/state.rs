@@ -413,6 +413,10 @@ pub struct TimelineState {
     /// Properties whose inline expression editor is collapsed.
     #[serde(default)]
     pub expr_closed: BTreeSet<u64>,
+    /// Scale and Mask Feather properties whose chain link (Constrain Proportions, on by default)
+    /// was turned off.
+    #[serde(default)]
+    pub unlinked: BTreeSet<u64>,
     /// Visible optional columns (column header right-click ▸ Columns): `av`, `keys`, `label`,
     /// `num`, `comment`, `switches`, `parent`, `in`, `out`, `duration`, `stretch`. The name
     /// column is always shown; Modes follows `show_modes` (F4).
@@ -458,6 +462,7 @@ impl Default for TimelineState {
             graph_reference: false,
             graph_transform_box: true,
             expr_closed: BTreeSet::new(),
+            unlinked: BTreeSet::new(),
             columns: default_tl_columns(),
             source_name: false,
         }
@@ -628,13 +633,7 @@ pub struct UiState {
     /// Effects & Presets contents-menu view options.
     #[serde(default)]
     pub effects_view: EffectsView,
-    /// Shape tool options.
-    pub fill_color: [f32; 3],
-    pub stroke_color: [f32; 3],
-    pub stroke_width: f32,
     pub snapping: bool,
-    /// Tool creates shape (true) or mask (false) when a layer is selected.
-    pub tool_creates_shape: bool,
     pub start_screen: bool,
     /// The Home screen shows its Learn tab (tutorials) instead of the recent projects.
     #[serde(default)]
@@ -668,6 +667,9 @@ pub struct UiState {
     /// Lumetri Scopes panel options.
     #[serde(default)]
     pub scopes: crate::panels::scopes_panel::ScopesState,
+    /// Ease Presets panel: working curve, selected preset, name field.
+    #[serde(default)]
+    pub ease_presets: crate::panels::ease_presets::EasePanelState,
 }
 
 impl Default for UiState {
@@ -709,11 +711,7 @@ impl Default for UiState {
             effects_favorites: BTreeSet::new(),
             effects_recent: Vec::new(),
             effects_view: EffectsView::default(),
-            fill_color: [0.24, 0.55, 0.96],
-            stroke_color: [1.0, 1.0, 1.0],
-            stroke_width: 0.0,
             snapping: true,
-            tool_creates_shape: true,
             start_screen: false,
             home_learn: false,
             home_templates: false,
@@ -726,6 +724,7 @@ impl Default for UiState {
             mini_flowchart: None,
             flowchart: Default::default(),
             scopes: Default::default(),
+            ease_presets: Default::default(),
         }
     }
 }

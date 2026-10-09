@@ -182,10 +182,27 @@ fn prop_row(
     if prop.is_animated() {
         key_navigator(app, ui, p, layer, prop, ectx, r, actions);
     }
-    let name_clip = Rect::from_min_max(pos2(swr.max.x + 6.0, r.min.y), pos2((r.min.x + r.width() * 0.48).max(swr.max.x + 124.0) - 4.0, r.max.y));
-    p.with_clip_rect(name_clip.intersect(p.clip_rect())).text(pos2(swr.max.x + 6.0, cy), Align2::LEFT_CENTER, &prop.name, Tokens::ui(12.0), t.text);
-    let vx = (r.min.x + r.width() * 0.48).max(swr.max.x + 130.0);
     let value = ectx.value(layer, prop);
+    let vx = (r.min.x + r.width() * 0.48).max(swr.max.x + 130.0);
+    // A vector's values end before the keyframe navigator: in a narrow panel they move left over
+    // the name (cut short) instead of running under the navigator (#271).
+    let vx = match &value {
+        Value::Vec2(_) | Value::Vec3(_) => {
+            let point = if matches!(prop.ui, ParamUi::Point | ParamUi::Point3) { 22.0 } else { 0.0 };
+            let fields: f32 = value
+                .components()
+                .iter()
+                .take(shown_dims(layer, prop, &value))
+                .map(|v| p.layout_no_wrap(format!("{v:.1}"), Tokens::ui(12.0), t.hot_text).size().x + 12.0)
+                .sum();
+            let right = r.max.x - if prop.is_animated() { 52.0 } else { 8.0 };
+            vx.min(right - point - fields + 8.0).max(swr.max.x + 60.0)
+        }
+        _ => vx,
+    };
+    let name_clip =
+        Rect::from_min_max(pos2(swr.max.x + 6.0, r.min.y), pos2(((r.min.x + r.width() * 0.48).max(swr.max.x + 124.0) - 4.0).min(vx - 6.0), r.max.y));
+    p.with_clip_rect(name_clip.intersect(p.clip_rect())).text(pos2(swr.max.x + 6.0, cy), Align2::LEFT_CENTER, &prop.name, Tokens::ui(12.0), t.text);
     let merge = format!("ec-{uid}");
     let set =
         |actions: &mut Actions, v: serde_json::Value| actions.push(("prop.set".into(), json!({"layer": layer.id.0, "prop": uid, "value": v, "merge": merge})));
@@ -264,7 +281,7 @@ fn prop_row(
         }
         Value::Vec2(_) | Value::Vec3(_) => {
             let c = value.components();
-            let n = if prop.shown_dims > 0 && !(layer.is_3d() && c.len() == 3) { prop.shown_dims as usize } else { c.len() };
+            let n = shown_dims(layer, prop, &value);
             let mut x = vx;
             if matches!(prop.ui, ParamUi::Point | ParamUi::Point3) {
                 let cr = Rect::from_center_size(pos2(x + 8.0, cy), vec2(18.0, 18.0));
@@ -378,6 +395,12 @@ fn prop_row(
         }
         _ => {}
     }
+}
+
+/// How many of a vector parameter's values show (a 3D point's Z only on a 3D layer).
+fn shown_dims(layer: &Layer, prop: &Property, value: &Value) -> usize {
+    let n = value.components().len();
+    if prop.shown_dims > 0 && !(layer.is_3d() && n == 3) { prop.shown_dims as usize } else { n }
 }
 
 /// Colour of a gradient at `f` (colour stops only).
@@ -894,12 +917,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     p.text(pos2(hdr.min.x + 10.0, hdr.center().y), Align2::LEFT_CENTER, format!("{} • {}", comp_name, layer.name), Tokens::ui(11.5), t.text_dim);
     p.line_segment([hdr.left_bottom(), hdr.right_bottom()], Stroke::new(1.0, t.separator));
     let body = Rect::from_min_max(pos2(rect.min.x, hdr.max.y), rect.max);
-    let scroll_id = egui::Id::new("ec-scroll");
-    let mut scroll: f32 = ctx.data(|d| d.get_temp(scroll_id).unwrap_or(0.0));
-    if ui.rect_contains_pointer(body) {
-        scroll = (scroll - ui.input(|i| i.smooth_scroll_delta.y)).max(0.0);
-    }
-    let mut y = body.min.y + 4.0 - scroll;
+    let scroll = widgets::PanelScroll::begin(ui, egui::Id::new("ec-scroll"), body);
+    let mut y = body.min.y + 4.0 - scroll.offset;
     let mut actions: Actions = vec![];
     let bp = p.with_clip_rect(body);
     // Rows scroll under the header: clip their widgets (and hit tests) to the body.
@@ -934,7 +953,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         let selected = app.session.state.selected_props.iter().any(|(l, u)| *l == layer.id && *u == g.uid);
         bp.rect_filled(r, 0.0, if selected { Color32::from_rgb(0x2f, 0x3a, 0x52) } else { Color32::from_rgb(0x2a, 0x2a, 0x2a) });
         let fxr = Rect::from_center_size(pos2(r.min.x + 14.0, r.center().y), vec2(16.0, 16.0));
-        if widgets::icon_toggle(ui, fxr, Icon::Fx, g.enabled, &t, egui::Id::new(("ec-fx", g.uid)), None).clicked() {
+        if widgets::icon_toggle(ui, fxr, Icon::Fx, g.enabled, &t, egui::Id::new(("ec-fx", g.uid)), Sense::click()).clicked() {
             actions.push(("effect.toggle".into(), json!({"layer": layer.id.0, "effect": g.uid})));
         }
         app.auto.add(&format!("effectControls.effect.{}.fx", g.uid), fxr, &g.name);
@@ -1051,10 +1070,19 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             ctx.data_mut(|d| d.remove::<u64>(drag_id));
         }
     }
+    // Right-click anywhere a control has no menu of its own: the Effect menu, which applies to
+    // the selected layers (After Effects). Drawn after the rows, whose menus open first.
+    let menu_id = bg.id.with("effect-menu");
+    let open = ui.input(|i| i.pointer.secondary_clicked())
+        && ui.rect_contains_pointer(body)
+        && (!egui::Popup::is_any_open(&ctx) || egui::Popup::is_id_open(&ctx, menu_id));
+    egui::Popup::context_menu(&bg).id(menu_id).open_memory(open.then_some(egui::SetOpenCommand::Bool(true))).show(|ui| {
+        ui.set_min_width(200.0);
+        actions.extend(crate::menus::menu_contents(app, ui, "Effect"));
+    });
     ui.set_clip_rect(panel_clip);
-    let content_h = y + scroll - body.min.y;
-    scroll = scroll.min((content_h - body.height()).max(0.0));
-    ctx.data_mut(|d| d.insert_temp(scroll_id, scroll));
+    let content_h = y + scroll.offset - body.min.y;
+    scroll.end(ui, &mut app.auto, "effectControls.scroll", content_h, &t);
     // Drop effects here.
     if let Some(payload) = egui::DragAndDrop::payload::<crate::panels::DragPayload>(&ctx)
         && ui.rect_contains_pointer(rect)

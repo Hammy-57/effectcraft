@@ -304,7 +304,7 @@ fn variable_font_axes_animator() {
         eprintln!("the variable face isn't reachable by family/style: skipped");
         return;
     }
-    let tag = listed["axes"][0]["tag"].as_str().unwrap().to_string();
+    let tag = axis.tag.clone();
     let r = s.execute("text.animatorFontAxes", json!({"axis": tag})).unwrap();
     let anim = r["animator"].as_u64().unwrap();
     let area = |s: &Session| {
@@ -327,7 +327,8 @@ fn variable_font_axes_animator() {
     let gap_before = gap(&s);
     let l = s.active_comp().unwrap().layer(LayerId(t)).unwrap().clone();
     let pg = l.props.find_group(anim).unwrap().sub("properties").unwrap().props().next().unwrap().uid;
-    let range = (axis.max - axis.min) as f64;
+    let target = if axis.max - axis.default >= axis.default - axis.min { axis.max } else { axis.min };
+    let range = (target - axis.default) as f64;
     s.execute("prop.set", json!({"layer": t, "prop": pg, "value": range})).unwrap();
     let after = area(&s);
     assert!((after - before).abs() > 1.0, "{} axis moved the outline: {before} → {after}", axis.tag);
@@ -337,7 +338,7 @@ fn variable_font_axes_animator() {
     let gid = f.glyph('H').unwrap();
     let upem = f.units_per_em() as f64;
     let units = |v: f32| effectcraft_text::variable::advance_units_at(face, gid, &[(a.tag.clone(), v)]).unwrap() as f64;
-    let want = (units((a.default + range as f32).min(a.max)) - units(a.default)) * 60.0 / upem;
+    let want = (units((a.default + range as f32).clamp(a.min, a.max)) - units(a.default)) * 60.0 / upem;
     let moved = gap(&s) - gap_before;
     assert!((moved - want).abs() < 0.5, "{} axis: advance change {moved}, expected {want}", a.tag);
     s.execute("edit.undo", json!({})).unwrap();

@@ -7,6 +7,7 @@ pub mod content_fill_panel;
 pub mod delete_items;
 pub mod dialogs;
 pub mod dialogs_3d;
+pub mod ease_presets;
 pub mod effect_controls;
 pub mod effects_presets;
 pub mod essential;
@@ -83,6 +84,12 @@ pub fn timecode(session: &Session, comp: &Comp, t: Tick) -> String {
     effectcraft_engine::commands::time::display_time(session, comp, t)
 }
 
+/// Spacebar held outside a text field: the Hand tool (drags pan the viewer and scroll the
+/// Timeline).
+pub(crate) fn space_hand(ctx: &egui::Context) -> bool {
+    ctx.input(|i| i.key_down(egui::Key::Space)) && !ctx.egui_wants_keyboard_input()
+}
+
 pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: PanelKind, rect: Rect) {
     match p {
         PanelKind::Composition => viewers::show(app, ui, 0, rect),
@@ -121,6 +128,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: PanelKind, rect: Rec
         PanelKind::ContentAwareFill => content_fill_panel::show(app, ui, rect),
         PanelKind::CreateNullsFromPaths => path_vr_panels::create_nulls(app, ui, rect),
         PanelKind::VrCompEditor => path_vr_panels::vr_editor(app, ui, rect),
+        PanelKind::EasePresets => ease_presets::show(app, ui, rect),
     }
 }
 

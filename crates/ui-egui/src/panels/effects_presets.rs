@@ -313,14 +313,10 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let view = app.ui.effects_view.clone();
     let list = Rect::from_min_max(pos2(rect.min.x, sr.max.y + 6.0), rect.max);
     let lp = p.with_clip_rect(list);
-    let scroll_id = egui::Id::new("fx-scroll");
-    let mut scroll: f32 = ctx.data(|d| d.get_temp(scroll_id).unwrap_or(0.0));
-    if ui.rect_contains_pointer(list) {
-        scroll = (scroll - ui.input(|i| i.smooth_scroll_delta.y)).max(0.0);
-    }
+    let scroll = widgets::PanelScroll::begin(ui, egui::Id::new("fx-scroll"), list);
     let query = q.trim().to_lowercase();
     let searching = !query.is_empty();
-    let mut y = list.min.y - scroll;
+    let mut y = list.min.y - scroll.offset;
     let mut apply: Option<Apply> = None;
     let reg = effectcraft_engine::effects::all();
     let keep =
@@ -397,12 +393,11 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             }
         }
     }
-    if y == list.min.y - scroll && searching {
+    if y == list.min.y - scroll.offset && searching {
         lp.text(pos2(list.center().x, list.min.y + 24.0), Align2::CENTER_CENTER, "No matching effects or presets", Tokens::ui(12.0), t.text_faint);
     }
-    let content = y + scroll - list.min.y;
-    scroll = scroll.min((content - list.height()).max(0.0));
-    ctx.data_mut(|d| d.insert_temp(scroll_id, scroll));
+    let content = y + scroll.offset - list.min.y;
+    scroll.end(ui, &mut app.auto, "effects.scroll", content, &t);
     if let Some(DragPayload::Effect(id)) = egui::DragAndDrop::payload::<DragPayload>(&ctx).as_deref()
         && let Some(pos) = ctx.pointer_hover_pos()
     {

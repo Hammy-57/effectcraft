@@ -119,3 +119,31 @@ fn cache_correct_while_scrubbing() {
         assert_eq!(render(&p, cid, t, Some(&cache)).data, render(&p, cid, t, None).data, "edited t={t}");
     }
 }
+
+/// A layer's input up to an effect keys only the effects before it: editing a later effect (a
+/// Puppet pin being dragged, #212) keeps the input cached; editing an earlier one doesn't.
+#[test]
+fn input_keys_ignore_later_effects() {
+    let (mut p, cid) = scene(Some(("ec.blur.gaussian", &[("blurriness", Value::Scalar(4.0))])));
+    {
+        let spec = effectcraft_effects::find("ec.stylize.mosaic").unwrap();
+        let mut next = p.next_id;
+        let g = effectcraft_effects::instantiate(spec, &mut Ids(&mut next), spec.name, [200.0, 100.0]);
+        p.next_id = next;
+        p.comp_mut(cid).unwrap().layers[0].props.sub_mut("effects").unwrap().children.push(g.into());
+    }
+    let key = |p: &Project| {
+        let comp = p.comp(cid).unwrap();
+        let ctx = crate::EvalCtx { project: p, comp_id: cid, comp, time: Tick::from_seconds_f64(0.5), expr: None, footage: None };
+        let l = &comp.layers[0];
+        (crate::cache::input_key(&ctx, l, 1.0, false, false, 1), crate::cache::input_key(&ctx, l, 1.0, false, false, 2))
+    };
+    let (one, two) = key(&p);
+    assert!(one.is_some() && one != two);
+    let set = |p: &mut Project, path: &str, v: f64| p.comp_mut(cid).unwrap().layers[0].props.prop_mut(path).unwrap().value = Value::Scalar(v);
+    set(&mut p, "effects/#2/horizontal", 30.0);
+    assert_eq!(key(&p).0, one, "the second effect doesn't change the input to it");
+    assert_ne!(key(&p).1, two);
+    set(&mut p, "effects/#1/blurriness", 8.0);
+    assert_ne!(key(&p).0, one);
+}

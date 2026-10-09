@@ -173,7 +173,8 @@ pub fn reveal(app: &mut EffectcraftApp, kind: &str, now: f64, add: bool) {
     } else {
         kinds = vec![kind.to_string()];
     }
-    tl.apply_reveal(&targets, kinds);
+    tl.apply_reveal(&targets, kinds.clone());
+    crate::panels::timeline::open_revealed(app, &targets, &kinds);
 }
 
 /// Show Time Remap on the layers of a `layer.enableTimeRemap` (`layers` by id, else the
@@ -187,6 +188,35 @@ fn reveal_time_remap(app: &mut EffectcraftApp, params: &Value) {
     let layers: Vec<u64> = comp.layers.iter().filter(|l| asked.contains(&l.id.0) && l.props.get("timeRemap").is_some()).map(|l| l.id.0).collect();
     if !layers.is_empty() {
         app.ui.timeline.apply_reveal(&layers, vec!["timeRemap".into()]);
+    }
+}
+
+/// After Alt+Shift+P (A, S, R, T) the Timeline shows the property on each layer it keyed, as in
+/// After Effects: added to what a reveal shortcut shows, else with the layer's Transform twirled
+/// open, else alone like P.
+fn reveal_keyed(app: &mut EffectcraftApp, keyed: &Value, kind: &str) {
+    let layers: std::collections::BTreeSet<u64> = keyed.as_array().into_iter().flatten().filter_map(|k| k.get("layer").and_then(Value::as_u64)).collect();
+    let Some(comp) = app.session.active_comp() else { return };
+    let tl = &mut app.ui.timeline;
+    for id in layers {
+        let shown = tl.layer_reveal.get(&id).filter(|k| !k.is_empty()).cloned();
+        match shown {
+            Some(mut kinds) => {
+                if !kinds.iter().any(|k| k == kind) {
+                    kinds.push(kind.to_string());
+                    tl.layer_reveal.insert(id, kinds);
+                }
+            }
+            None if tl.open_layers.contains(&id) => {
+                if let Some(tr) = comp.layer(effectcraft_engine::project::LayerId(id)).and_then(|l| l.transform()) {
+                    tl.open_groups.insert(tr.uid);
+                }
+            }
+            None => {
+                tl.open_layers.insert(id);
+                tl.layer_reveal.insert(id, vec![kind.to_string()]);
+            }
+        }
     }
 }
 
@@ -314,7 +344,9 @@ pub fn invoke(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: V
         return Ok(Value::Null);
     }
     if let Some(k) = id.strip_prefix("timeline.keyAt.") {
-        return run_engine(app, ctx, "keys.toggleTransform", json!({"prop": k}));
+        let r = run_engine(app, ctx, "keys.toggleTransform", json!({"prop": k}))?;
+        reveal_keyed(app, &r, k);
+        return Ok(r);
     }
     if let Some(k) = id.strip_prefix("timeline.revealAdd.") {
         reveal(app, k, now, true);
@@ -589,6 +621,8 @@ fn clipboard_note(s: &effectcraft_engine::Session) -> String {
         n(st.key_clipboard.iter().map(|c| c.keys.len()).sum(), "keyframe", "keyframes")
     } else if !st.effect_clipboard.is_empty() {
         n(st.effect_clipboard.len(), "effect", "effects")
+    } else if !st.contents_clipboard.is_empty() {
+        n(st.contents_clipboard.len(), "shape item", "shape items")
     } else if st.link_clipboard.is_some() {
         "EffectCraft: property links".into()
     } else {
@@ -1040,6 +1074,10 @@ pub fn frontend(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, p: Valu
             if !shown.is_empty() {
                 tl.apply_reveal(&shown, vec!["props".into()]);
             }
+            // Properties inside effects (puppet pins…) show under their effect, twirled open.
+            for (layer, prop) in props.iter().filter_map(|x| Some((x.get("layer")?.as_u64()?, x.get("prop")?.as_u64()?))) {
+                crate::panels::timeline::open_effect_paths(app, layer, &[prop]);
+            }
             json!({"revealed": found.len()})
         }
         _ => return Err(format!("`{id}` is not a frontend command")),
@@ -1121,6 +1159,10 @@ fn file_dialog(app: &mut EffectcraftApp, id: &str, params: &Value) -> Option<Res
     };
     let Some(v) = picked else { return Some(Ok(Value::Null)) };
     p.insert(key.to_string(), v);
+    // Picked files import in the background, with the Importing card showing progress (#270).
+    if matches!(id, "file.import" | "file.importMultiple") {
+        p.insert("background".into(), Value::Bool(true));
+    }
     // Photoshop files ask how to import them first.
     if id == "file.import" && crate::panels::dialogs::open_form(app, id, &Value::Object(p.clone())) {
         return Some(Ok(json!({"dialog": id})));
@@ -1366,6 +1408,12 @@ fn mods_match(want: egui::Modifiers, got: egui::Modifiers) -> bool {
     want.command == got.command && want.shift == got.shift && want.alt == got.alt && (want.ctrl == got.ctrl || got.command && cfg!(not(target_os = "macos")))
 }
 
+/// Set (egui temp data) from a plain Spacebar press until its release while a tap would still
+/// run the Spacebar shortcut.
+fn space_tap_id() -> egui::Id {
+    egui::Id::new("spacebar-tap")
+}
+
 /// Dispatch keyboard shortcuts (skipped while typing in a text field).
 pub fn handle_shortcuts(app: &mut EffectcraftApp, ctx: &egui::Context) {
     // Dialog cancellation owns Escape even when a text field has keyboard focus.
@@ -1390,12 +1438,17 @@ pub fn handle_shortcuts(app: &mut EffectcraftApp, ctx: &egui::Context) {
         }
         return;
     }
+    // A mouse button down while Spacebar is held belongs to the Hand tool: its release won't
+    // preview.
+    if ctx.input(|i| i.pointer.any_down()) || ctx.egui_wants_keyboard_input() {
+        ctx.data_mut(|d| d.remove::<bool>(space_tap_id()));
+    }
     if ctx.egui_wants_keyboard_input() {
         return;
     }
     // Text editing in the viewer takes the clipboard events itself.
     let clipboard = app.session.state.text_edit.is_none();
-    let events: Vec<(egui::Key, egui::Modifiers)> = ctx.input(|i| {
+    let events: Vec<(egui::Key, egui::Modifiers, bool)> = ctx.input(|i| {
         // The windowing layer turns Ctrl+C / Ctrl+X / Ctrl+V into clipboard events instead of
         // key presses: map them back to the keys (with the modifiers held) so Edit ▸ Copy, Cut,
         // Paste and their variants (Ctrl+Alt+C…) run.
@@ -1406,11 +1459,12 @@ pub fn handle_shortcuts(app: &mut EffectcraftApp, ctx: &egui::Context) {
                 egui::Event::Key { key, pressed: true, modifiers, repeat, .. }
                     if !*repeat || matches!(key, egui::Key::PageUp | egui::Key::PageDown | egui::Key::ArrowLeft | egui::Key::ArrowRight) =>
                 {
-                    Some((*key, *modifiers))
+                    Some((*key, *modifiers, true))
                 }
-                egui::Event::Copy if clipboard => Some((egui::Key::C, held)),
-                egui::Event::Cut if clipboard => Some((egui::Key::X, held)),
-                egui::Event::Paste(_) if clipboard => Some((egui::Key::V, held)),
+                egui::Event::Key { key: egui::Key::Space, pressed: false, .. } => Some((egui::Key::Space, egui::Modifiers::NONE, false)),
+                egui::Event::Copy if clipboard => Some((egui::Key::C, held, true)),
+                egui::Event::Cut if clipboard => Some((egui::Key::X, held, true)),
+                egui::Event::Paste(_) if clipboard => Some((egui::Key::V, held, true)),
                 _ => None,
             })
             .collect()
@@ -1419,7 +1473,20 @@ pub fn handle_shortcuts(app: &mut EffectcraftApp, ctx: &egui::Context) {
         return;
     }
     let binds = bindings(&app.session);
-    for (key, mods) in events {
+    for (key, mods, pressed) in events {
+        // Plain Spacebar runs its shortcut (Play Current Preview) on the release: held, it is
+        // the Hand tool (After Effects), and a drag with it must not start or stop playback.
+        if key == egui::Key::Space && (!pressed || !mods.any()) {
+            if pressed {
+                if app.dialog.is_none() {
+                    ctx.data_mut(|d| d.insert_temp(space_tap_id(), true));
+                }
+                continue;
+            }
+            if !ctx.data_mut(|d| d.remove_temp::<bool>(space_tap_id())).unwrap_or(false) {
+                continue;
+            }
+        }
         // Escape closes dialogs.
         if key == egui::Key::Escape && app.dialog.is_some() {
             // Escape while recording a shortcut cancels the recording, not the editor.
@@ -1480,7 +1547,7 @@ pub fn menu_bar(app: &mut EffectcraftApp, ui: &mut egui::Ui) {
                 if let MenuNode::Submenu { label, children } = node {
                     let r = ui.menu_button(crate::i18n::label(app, "", label), |ui| {
                         ui.set_min_width(if label == "Effect" { 200.0 } else { 280.0 });
-                        menu_nodes(app, ui, children, &mut clicked);
+                        crate::widgets::menu_scroll(ui, |ui| menu_nodes(app, ui, children, &mut clicked));
                     });
                     app.auto.add(&format!("menu.{label}"), r.response.rect, label);
                 }
@@ -1492,6 +1559,18 @@ pub fn menu_bar(app: &mut EffectcraftApp, ui: &mut egui::Ui) {
     {
         app.ui.status = e;
     }
+}
+
+/// The entries of top-level menu `name` (the Effect menu is the Effect Controls panel's context
+/// menu); returns the chosen command and its params.
+pub(crate) fn menu_contents(app: &mut EffectcraftApp, ui: &mut egui::Ui, name: &str) -> Option<(String, Value)> {
+    let mut clicked = None;
+    if let Some(MenuNode::Submenu { children, .. }) =
+        effectcraft_engine::menus::menu_bar().iter().find(|n| matches!(n, MenuNode::Submenu { label, .. } if label == name))
+    {
+        menu_nodes(app, ui, children, &mut clicked);
+    }
+    clicked.map(|(id, params)| (id, if params.is_null() { json!({}) } else { params }))
 }
 
 fn menu_nodes(app: &mut EffectcraftApp, ui: &mut egui::Ui, nodes: &[MenuNode], clicked: &mut Option<(String, Value)>) {
@@ -1535,12 +1614,7 @@ fn menu_nodes(app: &mut EffectcraftApp, ui: &mut egui::Ui, nodes: &[MenuNode], c
                 let shown = crate::i18n::submenu(app, label, effectcraft_engine::menus::submenu_label(&app.session, label, &dyn_ctx(&ws, &[])));
                 ui.menu_button((gutter(false), shown.as_str()), |ui| {
                     ui.set_min_width(if children.len() > 30 { 200.0 } else { 240.0 });
-                    // Long submenus (Blending Mode, effect categories) scroll instead of running
-                    // off the screen. Others show whole: egui sizes a new submenu from a default
-                    // 400 pt area, so without a minimum a longer one (Window ▸ Workspace) got
-                    // stuck at that height with its last entries scrolled out of view (#191).
-                    let max_h = ui.ctx().content_rect().height() - 40.0;
-                    egui::ScrollArea::vertical().max_height(max_h).min_scrolled_height(max_h).show(ui, |ui| menu_nodes(app, ui, children, clicked));
+                    crate::widgets::menu_scroll(ui, |ui| menu_nodes(app, ui, children, clicked));
                 });
             }
             MenuNode::Item(e) => {

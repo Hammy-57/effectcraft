@@ -11,6 +11,12 @@ use effectcraft_ui_egui::EffectcraftApp;
 use serde_json::json;
 use wasm_bindgen::prelude::*;
 
+#[wasm_bindgen(module = "/js/host.js")]
+extern "C" {
+    #[wasm_bindgen(js_name = showDeviceLost)]
+    fn show_device_lost(message: &str, kept: bool);
+}
+
 /// Work for the UI thread with access to the app (posted by async tasks: picked files…).
 type Action = Box<dyn FnOnce(&mut EffectcraftApp)>;
 
@@ -215,9 +221,14 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
                             log::error!("{message}");
                         }
                     }));
+                    // The canvas can't present any more (#225): the page says so over it and
+                    // offers a reload, which brings the session back when browser storage keeps it.
                     let lost = gpu_failures.clone();
+                    let kept = !empty && persist::backend() != "memory";
                     rs.device.set_device_lost_callback(move |reason, message| {
-                        lost.report(&format!("GPU device lost ({reason:?}): {message}"), true);
+                        let message = format!("GPU device lost ({reason:?}): {message}");
+                        lost.report(&message, true);
+                        show_device_lost(&message, kept);
                     });
                 }
                 let mut session = session();

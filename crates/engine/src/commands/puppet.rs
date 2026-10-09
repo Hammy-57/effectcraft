@@ -26,8 +26,9 @@ fn pt(v: Option<&Value>) -> Option<[f64; 2]> {
     Some([a.first()?.as_f64()?, a.get(1)?.as_f64()?])
 }
 
-/// The Puppet effect's input pixels and evaluated parameters at comp time `t`.
-pub fn puppet_eval(s: &Session, cid: ItemId, lid: LayerId, fx_uid: Uid, t: Tick) -> Option<(Buf, Params)> {
+/// The Puppet effect's input pixels and evaluated parameters at comp time `t`. The input comes
+/// from the layer cache, shared: moving pins doesn't change it (#212).
+pub fn puppet_eval(s: &Session, cid: ItemId, lid: LayerId, fx_uid: Uid, t: Tick) -> Option<(std::sync::Arc<Buf>, Params)> {
     let comp = s.project.comp(cid)?;
     let layer = comp.layer(lid)?;
     let fx = layer.effects()?;
@@ -37,7 +38,7 @@ pub fn puppet_eval(s: &Session, cid: ItemId, lid: LayerId, fx_uid: Uid, t: Tick)
     let mut r = Renderer::new(&s.project, &*s.footage, RenderOpts::default());
     r.expr = s.expr.as_deref();
     r.cache = Some(&s.layer_cache);
-    let buf = (*r.layer_input(&ctx, layer, index)?).clone();
+    let buf = r.layer_input(&ctx, layer, index)?;
     let params = effectcraft_effects::flatten_params(g, &mut |p| ctx.value(layer, p));
     Some((buf, params))
 }

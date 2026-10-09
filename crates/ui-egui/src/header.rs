@@ -1,7 +1,7 @@
 //! The Tools bar: home, the tool slots, tool options, snapping, workspaces and the community
 //! buttons (Discord is always one click away).
 
-use egui::{Align2, Color32, Rect, Sense, Stroke, pos2, vec2};
+use egui::{Align2, Color32, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
 use serde_json::json;
 
 use crate::icons::{self, Icon};
@@ -9,6 +9,10 @@ use crate::state::Tool;
 use crate::theme::Tokens;
 use crate::widgets;
 use crate::{Dialog, EffectcraftApp};
+use effectcraft_color::BlendMode;
+use effectcraft_engine::commands::shape_tool::{PaintKind, ToolPaint};
+use effectcraft_engine::project::{LayerId, LayerSource};
+use effectcraft_engine::viewer as vw;
 
 pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let t = app.tokens;
@@ -39,6 +43,10 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     x += 6.0;
 
     // Tool slots (with group separators after camera tools and pan-behind).
+    let held_id = egui::Id::new("tool-slot-held");
+    if ui.input(|i| i.pointer.any_pressed()) {
+        ui.data_mut(|d| d.remove::<egui::Id>(held_id));
+    }
     for (si, slot) in Tool::SLOTS.iter().enumerate() {
         let cur = app.ui.slot_tools.get(si).copied().unwrap_or(slot[0]);
         let r = Rect::from_min_size(pos2(x, cy - 13.0), vec2(26.0, 26.0));
@@ -59,7 +67,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             None => cur.label().to_string(),
         };
         let resp = resp.on_hover_text(tip);
-        if resp.clicked() {
+        let held = ui.data(|d| d.get_temp::<egui::Id>(held_id)) == Some(id);
+        if resp.clicked() && !held {
             app.ui.tool = cur;
         }
         // Ctrl+double-click Pan Behind: Center Anchor Point in Layer Content.
@@ -71,11 +80,33 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             app.ui.status = e;
         }
         if slot.len() > 1 {
-            resp.context_menu(|ui| {
+            let held_for = resp.is_pointer_button_down_on().then(|| ui.input(|i| i.pointer.press_start_time().map(|s| i.time - s))).flatten();
+            if let Some(seconds) = held_for
+                && seconds < 0.35
+            {
+                ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(0.35 - seconds));
+            }
+            let long_press = held_for.is_some_and(|seconds| seconds >= 0.35) && !held;
+            let command = if resp.secondary_clicked() || long_press {
+                if long_press {
+                    ui.data_mut(|d| d.insert_temp(held_id, id));
+                }
+                Some(egui::SetOpenCommand::Bool(true))
+            } else if resp.clicked() && !held {
+                Some(egui::SetOpenCommand::Bool(false))
+            } else {
+                None
+            };
+            let close_behavior = if held && resp.clicked() { egui::PopupCloseBehavior::IgnoreClicks } else { egui::PopupCloseBehavior::CloseOnClickOutside };
+            egui::Popup::menu(&resp).open_memory(command).close_behavior(close_behavior).show(|ui| {
                 for tool in slot.iter() {
-                    if ui.selectable_label(app.ui.tool == *tool, tool.label()).clicked() {
+                    let row = ui.selectable_label(app.ui.tool == *tool, tool.label());
+                    app.auto.add(&format!("tools.select.{tool:?}"), row.rect, tool.label());
+                    if row.clicked() {
                         app.ui.tool = *tool;
-                        app.ui.slot_tools[si] = *tool;
+                        if let Some(saved) = app.ui.slot_tools.get_mut(si) {
+                            *saved = *tool;
+                        }
                         ui.close();
                     }
                 }
@@ -91,31 +122,43 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
 
     // Tool options.
     x += 10.0;
-    if app.ui.tool.is_shape() || app.ui.tool == Tool::Pen {
-        p.text(pos2(x, cy), Align2::LEFT_CENTER, "Fill:", Tokens::ui(12.0), t.text_dim);
-        x += 28.0;
-        let fr = Rect::from_center_size(pos2(x + 10.0, cy), vec2(20.0, 16.0));
-        let c = app.ui.fill_color;
-        if widgets::swatch(ui, fr, [c[0], c[1], c[2], 1.0], egui::Id::new("tool-fill"), &t).clicked() {
-            widgets::open_popup(ui, egui::Id::new("tool-fill-pop"));
+    // Selected shape layers: the options show their paint and edit it (as in After Effects).
+    let shape_layers: Vec<u64> = app
+        .session
+        .active_comp()
+        .map(|c| {
+            app.session.state.selected_layers.iter().filter(|id| c.layer(**id).is_some_and(|l| matches!(l.source, LayerSource::Shape))).map(|id| id.0).collect()
+        })
+        .unwrap_or_default();
+    let layer_paint = shape_layers
+        .first()
+        .and_then(|id| app.session.active_comp()?.layer(LayerId(*id)))
+        .map(|l| effectcraft_engine::commands::shape_stroke::first_paint(l, l.layer_time(app.session.time())));
+    if let Some((fill, stroke, width)) = layer_paint {
+        let rgb = |c: [f64; 4]| [c[0] as f32, c[1] as f32, c[2] as f32];
+        let tool = &mut app.session.state.shape_tool;
+        if let Some(c) = fill {
+            tool.fill.color = rgb(c);
         }
-        color_popup(ui, egui::Id::new("tool-fill-pop"), fr.left_bottom(), &mut app.ui.fill_color);
-        x += 32.0;
-        p.text(pos2(x, cy), Align2::LEFT_CENTER, "Stroke:", Tokens::ui(12.0), t.text_dim);
-        x += 44.0;
-        let sr = Rect::from_center_size(pos2(x + 10.0, cy), vec2(20.0, 16.0));
-        let c = app.ui.stroke_color;
-        if widgets::swatch(ui, sr, [c[0], c[1], c[2], 1.0], egui::Id::new("tool-stroke"), &t).clicked() {
-            widgets::open_popup(ui, egui::Id::new("tool-stroke-pop"));
+        if let Some(c) = stroke {
+            tool.stroke.color = rgb(c);
         }
-        color_popup(ui, egui::Id::new("tool-stroke-pop"), sr.left_bottom(), &mut app.ui.stroke_color);
-        x += 26.0;
-        let (r, v, _) =
-            widgets::hot_number_at(ui, pos2(x, cy - 9.0), egui::Id::new("tool-stroke-w"), app.ui.stroke_width as f64, 0.2, (0.0, 1000.0), 0, " px", &t);
-        if let Some(v) = v {
-            app.ui.stroke_width = v as f32;
-        }
-        x = r.max.x + 14.0;
+        tool.stroke_width = width.unwrap_or(0.0);
+    }
+    // One undo step per picker session or width drag: end the merge once both are done.
+    let picking = ["fill", "stroke"].iter().any(|k| widgets::popup_is_open(ui, picker_id(k)));
+    if !picking && !ui.input(|i| i.pointer.any_down()) && app.session.history.merge_key.as_deref().is_some_and(|k| k.starts_with("tool-")) {
+        app.session.history.merge_key = None;
+    }
+    let drawing = app.ui.tool.is_shape() || app.ui.tool == Tool::Pen;
+    // Tool Creates Shape / Tool Creates Mask, with a shape layer selected (as in After Effects).
+    if drawing && !shape_layers.is_empty() {
+        x = creates_buttons(app, ui, x, cy);
+    }
+    // Fill and Stroke, hidden while the tools draw masks.
+    let masking = drawing && !shape_layers.is_empty() && app.session.state.shape_tool.creates_mask;
+    if (drawing || !shape_layers.is_empty()) && !masking {
+        x = fill_stroke_options(app, ui, &p, &shape_layers, x, cy);
     }
     if app.ui.tool.puppet_kind().is_some() {
         x = puppet_options(app, ui, &p, x, cy);
@@ -128,7 +171,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         app.ui.snapping = app.session.state.snapping;
     }
     app.auto.add("header.snapping", snap, "Snapping");
-    p.text(pos2(snap.max.x + 4.0, cy), Align2::LEFT_CENTER, "Snapping", Tokens::ui(12.0), t.text_dim);
+    let label = p.text(pos2(snap.max.x + 4.0, cy), Align2::LEFT_CENTER, "Snapping", Tokens::ui(12.0), t.text_dim);
+    snapping_options(app, ui, Rect::from_min_size(pos2(label.max.x + 2.0, cy - 9.0), vec2(18.0, 18.0)));
 
     // Right side: community buttons, workspaces.
     let mut rx = rect.max.x - 10.0;
@@ -205,6 +249,235 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         }
         rx = r.min.x - 2.0;
     }
+}
+
+/// The Snapping options menu beside the checkbox: Snap Edges Extended and which layer features
+/// snap (`view.snappingOptions`).
+fn snapping_options(app: &mut EffectcraftApp, ui: &mut egui::Ui, r: Rect) {
+    let t = app.tokens;
+    let pop = egui::Id::new("snap-options");
+    if widgets::icon_button(ui, r, Icon::ChevronDown, false, &t, egui::Id::new("snap-options-button")).on_hover_text("Snapping options").clicked() {
+        widgets::open_popup(ui, pop);
+    }
+    app.auto.add("header.snappingOptions", r, "Snapping options");
+    if !widgets::popup_is_open(ui, pop) {
+        return;
+    }
+    // Snap Edges Extended, then the features ("" keys the separator).
+    let f = app.session.state.snap_features;
+    let mut keys = vec![];
+    let mut items = vec![];
+    for (i, (k, label)) in vw::SnapFeatures::OPTIONS.into_iter().enumerate() {
+        if i == 1 {
+            keys.push("");
+            items.push("-".to_string());
+        }
+        keys.push(k);
+        items.push(widgets::check_label(f.option(k), label));
+    }
+    if let Some(k) = widgets::popup_menu(ui, pop, r.left_bottom(), &items, None).and_then(|i| keys.get(i))
+        && let Err(e) = app.session.execute("view.snappingOptions", json!({"toggle": k}))
+    {
+        app.ui.status = e.to_string();
+    }
+}
+
+/// Set the shape tools' options (`shape.toolOptions`).
+fn tool_options(app: &mut EffectcraftApp, v: serde_json::Value) {
+    if let Err(e) = app.session.execute("shape.toolOptions", v) {
+        app.ui.status = e.to_string();
+    }
+}
+
+/// The colour picker of the Fill or Stroke swatch.
+fn picker_id(key: &str) -> egui::Id {
+    egui::Id::new(("tool-pick", key))
+}
+
+/// Tool Creates Shape / Tool Creates Mask: with a shape layer selected, whether the shape tools
+/// and the Pen draw shapes into it or masks on it. Returns the next x.
+fn creates_buttons(app: &mut EffectcraftApp, ui: &mut egui::Ui, mut x: f32, cy: f32) -> f32 {
+    let t = app.tokens;
+    for (mask, icon, tip, key) in [(false, Icon::ShapeLayer, "Tool Creates Shape", "createsShape"), (true, Icon::MaskVis, "Tool Creates Mask", "createsMask")] {
+        let r = Rect::from_min_size(pos2(x, cy - 13.0), vec2(26.0, 26.0));
+        let on = app.session.state.shape_tool.creates_mask == mask;
+        if widgets::icon_button(ui, r, icon, on, &t, egui::Id::new(("tool-creates", key))).on_hover_text(tip).clicked() {
+            tool_options(app, json!({"createsMask": mask}));
+        }
+        app.auto.add(&format!("header.{key}"), r, tip);
+        x += 28.0;
+    }
+    x + 10.0
+}
+
+/// Fill and Stroke (the words open Fill Options / Stroke Options), their swatches and the
+/// Stroke Width: for new shapes, and for the selected shape layers. Returns the next x.
+fn fill_stroke_options(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, shape_layers: &[u64], mut x: f32, cy: f32) -> f32 {
+    let t = app.tokens;
+    // The selected shape layers take the colours and the width too, one undo step per picker
+    // session or drag.
+    let paint = |app: &mut EffectcraftApp, key: &str, v: serde_json::Value| {
+        if shape_layers.is_empty() {
+            return;
+        }
+        let merge = format!("tool-{key}");
+        if let Err(e) = app.session.execute("shape.fillStroke", json!({"layers": shape_layers, key: v, "merge": merge})) {
+            app.ui.status = e.to_string();
+        }
+    };
+    for (key, title) in [("fill", "Fill"), ("stroke", "Stroke")] {
+        let tp = if key == "fill" { &app.session.state.shape_tool.fill } else { &app.session.state.shape_tool.stroke }.clone();
+        let options = format!("{title} Options");
+        let g = p.layout_no_wrap(format!("{title}:"), Tokens::ui(12.0), t.text_dim);
+        let wr = Rect::from_min_size(pos2(x, cy - g.size().y / 2.0), g.size());
+        let wresp = ui.interact(wr, egui::Id::new(("tool-paint-word", key)), Sense::click()).on_hover_text(&options);
+        let col = if wresp.hovered() { t.text } else { t.text_dim };
+        if wresp.hovered() {
+            p.line_segment([pos2(wr.min.x, wr.max.y), pos2(wr.max.x - 3.0, wr.max.y)], Stroke::new(1.0, col));
+        }
+        p.galley_with_override_text_color(wr.min, g, col);
+        app.auto.add(&format!("header.{key}Options"), wr, &options);
+        let opts = egui::Id::new(("tool-paint-options", key));
+        if wresp.clicked() {
+            widgets::open_popup(ui, opts);
+        }
+        // The swatch picks a Solid Color's colour and opens the options for the other kinds;
+        // Alt-click steps through the kinds (as in After Effects).
+        let sr = Rect::from_min_size(pos2(wr.max.x + 6.0, cy - 8.0), vec2(20.0, 16.0));
+        let sresp = ui.interact(sr, egui::Id::new(("tool-paint-swatch", key)), Sense::click()).on_hover_text(format!("{title}: {}", tp.kind.label()));
+        paint_swatch(p, sr, &tp, sresp.hovered(), &t);
+        app.auto.add(&format!("header.{key}"), sr, &format!("{title} Color"));
+        if sresp.clicked() {
+            if ui.input(|i| i.modifiers.alt) {
+                let at = PaintKind::ALL.iter().position(|k| *k == tp.kind).unwrap_or(0);
+                let next = PaintKind::ALL.get((at + 1) % PaintKind::ALL.len()).copied().unwrap_or_default();
+                let k = format!("{key}Type");
+                tool_options(app, json!({k: next.id()}));
+            } else if tp.kind == PaintKind::Solid {
+                widgets::open_popup(ui, picker_id(key));
+            } else {
+                widgets::open_popup(ui, opts);
+            }
+        }
+        let mut c = tp.color;
+        if color_popup(ui, picker_id(key), sr.left_bottom(), &mut c) {
+            tool_options(app, json!({key: c}));
+            paint(app, key, json!(c));
+        }
+        paint_options_popup(app, ui, key, &options, wr.left_bottom());
+        x = sr.max.x + 12.0;
+    }
+    let width = app.session.state.shape_tool.stroke_width;
+    let (r, v, _) = widgets::hot_number_at(ui, pos2(x - 6.0, cy - 9.0), egui::Id::new("tool-stroke-w"), width, 0.2, (0.0, 1000.0), 0, " px", &t);
+    if let Some(v) = v {
+        tool_options(app, json!({"strokeWidth": v}));
+        paint(app, "strokeWidth", json!(v));
+    }
+    app.auto.add("header.strokeWidth", r, "Stroke Width");
+    r.max.x + 14.0
+}
+
+/// Fill Options / Stroke Options: None, Solid Color, Linear Gradient or Radial Gradient, and the
+/// blend mode and opacity new shapes get (After Effects' dialogs, applied as they change).
+fn paint_options_popup(app: &mut EffectcraftApp, ui: &mut egui::Ui, key: &str, title: &str, pos: egui::Pos2) {
+    let id = egui::Id::new(("tool-paint-options", key));
+    if !widgets::popup_is_open(ui, id) {
+        return;
+    }
+    let t = app.tokens;
+    let tp = if key == "fill" { &app.session.state.shape_tool.fill } else { &app.session.state.shape_tool.stroke }.clone();
+    let blend_pop = id.with("blend");
+    let mut set = None;
+    let mut blend_rect = Rect::NOTHING;
+    let area = egui::Area::new(id.with("area")).order(egui::Order::Foreground).fixed_pos(pos + vec2(0.0, 4.0)).show(ui.ctx(), |ui| {
+        egui::Frame::popup(ui.style()).show(ui, |ui| {
+            let (rect, _) = ui.allocate_exact_size(vec2(236.0, 112.0), Sense::hover());
+            let p = ui.painter().clone();
+            let row = |y: f32| rect.min + vec2(0.0, y);
+            p.text(row(8.0), Align2::LEFT_CENTER, title, Tokens::semibold(12.0), t.text);
+            for (i, k) in PaintKind::ALL.into_iter().enumerate() {
+                let r = Rect::from_min_size(row(22.0) + vec2(i as f32 * 32.0, 0.0), vec2(28.0, 22.0));
+                let resp = ui.interact(r, id.with(k.id()), Sense::click()).on_hover_text(k.label());
+                if k == tp.kind {
+                    p.rect_stroke(r, 3.0, Stroke::new(1.5, t.accent), StrokeKind::Outside);
+                }
+                paint_swatch(&p, r.shrink(3.0), &ToolPaint { kind: k, ..tp.clone() }, resp.hovered(), &t);
+                app.auto.add(&format!("header.{key}Options.{}", k.id()), r, k.label());
+                if resp.clicked() {
+                    let k_type = format!("{key}Type");
+                    set = Some(json!({k_type: k.id()}));
+                }
+            }
+            p.text(row(33.0) + vec2(134.0, 0.0), Align2::LEFT_CENTER, tp.kind.label(), Tokens::ui(11.5), t.text_dim);
+            p.text(row(66.0), Align2::LEFT_CENTER, "Blend Mode:", Tokens::ui(12.0), t.text_dim);
+            blend_rect = Rect::from_min_size(row(56.0) + vec2(84.0, 0.0), vec2(150.0, 20.0));
+            if widgets::dropdown(ui, blend_rect, tp.blend.label(), &t, id.with("blend-dd")).clicked() {
+                widgets::open_popup(ui, blend_pop);
+            }
+            app.auto.add(&format!("header.{key}Options.blend"), blend_rect, "Blend Mode");
+            p.text(row(98.0), Align2::LEFT_CENTER, "Opacity:", Tokens::ui(12.0), t.text_dim);
+            let (or, v, _) = widgets::hot_number_at(ui, row(89.0) + vec2(84.0, 0.0), id.with("opacity"), tp.opacity, 0.5, (0.0, 100.0), 0, "%", &t);
+            app.auto.add(&format!("header.{key}Options.opacity"), or, "Opacity");
+            if let Some(v) = v {
+                let k_opacity = format!("{key}Opacity");
+                set = Some(json!({k_opacity: v}));
+            }
+        });
+    });
+    // The blend modes in the Layer ▸ Blending Mode menu's groups, over the options.
+    let modes: Vec<String> =
+        BlendMode::ALL.iter().flat_map(|m| std::iter::once(m.label().to_string()).chain(m.ends_group().then(|| "-".to_string()))).collect();
+    let current = modes.iter().position(|m| m == tp.blend.label());
+    if let Some(m) = widgets::popup_menu(ui, blend_pop, blend_rect.left_bottom(), &modes, current).and_then(|i| modes.get(i)) {
+        let k_blend = format!("{key}Blend");
+        set = Some(json!({k_blend: m}));
+    }
+    // Closes on a press outside or Escape, but stays open while its blend mode menu is.
+    if !widgets::popup_is_open(ui, blend_pop) && (widgets::pressed_outside(ui.ctx(), &area.response) || ui.input(|i| i.key_pressed(egui::Key::Escape))) {
+        ui.data_mut(|d| d.insert_temp(id.with("open"), false));
+    }
+    if let Some(v) = set {
+        tool_options(app, v);
+    }
+}
+
+/// sRGB components (0–1) as a colour.
+fn srgb32(c: [f32; 3]) -> Color32 {
+    let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    Color32::from_rgb(b(c[0]), b(c[1]), b(c[2]))
+}
+
+/// A Fill or Stroke swatch: its colour, a gradient (white to black), or None's red slash.
+fn paint_swatch(p: &egui::Painter, r: Rect, paint: &ToolPaint, hovered: bool, t: &Tokens) {
+    let clip = p.with_clip_rect(r);
+    match paint.kind {
+        PaintKind::None => {
+            clip.rect_filled(r, 2.0, Color32::WHITE);
+            clip.line_segment([r.left_bottom(), r.right_top()], Stroke::new(1.5, Color32::from_rgb(0xe0, 0x30, 0x30)));
+        }
+        PaintKind::Solid => {
+            clip.rect_filled(r, 2.0, srgb32(paint.color));
+        }
+        PaintKind::Linear => {
+            let mut m = egui::Mesh::default();
+            for (q, c) in
+                [(r.left_top(), Color32::WHITE), (r.right_top(), Color32::BLACK), (r.right_bottom(), Color32::BLACK), (r.left_bottom(), Color32::WHITE)]
+            {
+                m.colored_vertex(q, c);
+            }
+            m.add_triangle(0, 1, 2);
+            m.add_triangle(0, 2, 3);
+            clip.add(m);
+        }
+        PaintKind::Radial => {
+            let rad = r.size().length() / 2.0;
+            for i in 0..8 {
+                let f = 1.0 - i as f32 / 8.0;
+                clip.circle_filled(r.center(), rad * f, Color32::from_gray((255.0 * (1.0 - f)) as u8));
+            }
+        }
+    }
+    p.rect_stroke(r, 2.0, Stroke::new(1.0, if hovered { t.text } else { t.field_border }), StrokeKind::Inside);
 }
 
 /// Puppet tool options: Mesh: Show, Expansion, Density (for new meshes and the selected
@@ -287,8 +560,7 @@ pub fn color_popup(ui: &mut egui::Ui, id: egui::Id, pos: egui::Pos2, c: &mut [f3
     let mut changed = false;
     let area = egui::Area::new(id.with("area")).order(egui::Order::Foreground).fixed_pos(pos + vec2(0.0, 4.0)).show(ui.ctx(), |ui| {
         egui::Frame::popup(ui.style()).show(ui, |ui| {
-            let mut col =
-                egui::Color32::from_rgb((c[0].clamp(0.0, 1.0) * 255.0) as u8, (c[1].clamp(0.0, 1.0) * 255.0) as u8, (c[2].clamp(0.0, 1.0) * 255.0) as u8);
+            let mut col = srgb32(*c);
             if egui::color_picker::color_picker_color32(ui, &mut col, egui::color_picker::Alpha::Opaque) {
                 *c = [col.r() as f32 / 255.0, col.g() as f32 / 255.0, col.b() as f32 / 255.0];
                 changed = true;
@@ -321,5 +593,48 @@ pub fn paint_logo(p: &egui::Painter, r: Rect) {
     });
     if let Some(t) = tex {
         p.image(t.id(), r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(app: &mut EffectcraftApp, ctx: &egui::Context, time: f64, events: Vec<egui::Event>) {
+        app.auto.begin_frame();
+        let mut out = ctx.run_ui(
+            egui::RawInput { time: Some(time), events, screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(1400.0, 500.0))), ..Default::default() },
+            |ui| {
+                show(app, ui, Rect::from_min_size(egui::Pos2::ZERO, vec2(1400.0, 40.0)));
+            },
+        );
+        out.textures_delta.clear();
+    }
+
+    #[test]
+    fn long_press_type_keeps_the_tool_until_vertical_is_selected() {
+        let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx, &app.tokens);
+        frame(&mut app, &ctx, 0.0, vec![]);
+        frame(&mut app, &ctx, 0.1, vec![]);
+        let center = |element: &crate::automation::Element| {
+            let [x, y, w, h] = element.rect;
+            egui::pos2(x + w / 2.0, y + h / 2.0)
+        };
+        let at = center(app.auto.elements.iter().find(|w| w.id == "tools.Type").unwrap());
+        let pointer = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        frame(&mut app, &ctx, 1.0, vec![egui::Event::PointerMoved(at), pointer(at, true)]);
+        frame(&mut app, &ctx, 1.36, vec![]);
+        frame(&mut app, &ctx, 1.4, vec![pointer(at, false)]);
+        frame(&mut app, &ctx, 1.45, vec![]);
+        assert_eq!(app.ui.tool, Tool::Selection);
+        let row = center(app.auto.elements.iter().find(|w| w.id == "tools.select.TypeVertical").unwrap());
+        frame(&mut app, &ctx, 2.0, vec![egui::Event::PointerMoved(row), pointer(row, true)]);
+        frame(&mut app, &ctx, 2.05, vec![pointer(row, false)]);
+        assert_eq!(app.ui.tool, Tool::TypeVertical);
+        assert_eq!(app.ui.slot_tools[10], Tool::TypeVertical);
+        frame(&mut app, &ctx, 2.1, vec![]);
+        assert!(!app.auto.elements.iter().any(|w| w.id == "tools.select.TypeVertical"));
     }
 }

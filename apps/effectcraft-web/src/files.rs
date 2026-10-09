@@ -35,6 +35,12 @@ pub fn get(path: &str) -> Option<Arc<[u8]>> {
     STORE.file(path)
 }
 
+/// A file's bytes and version (new with every write: workers resend a file whose version they
+/// haven't seen).
+pub fn get_versioned(path: &str) -> Option<(Arc<[u8]>, u64)> {
+    STORE.file_versioned(path)
+}
+
 /// `(path, size)` of every file in the table.
 pub fn list() -> Vec<(String, usize)> {
     STORE.files().into_iter().map(|(p, n, _, _)| (p, n)).collect()

@@ -30,10 +30,15 @@ impl AudioDevice for Fake {
     }
 }
 
-/// A 30 fps comp whose solid sounds a tone (Audio switch on).
+/// A 2 s, 30 fps comp whose solid sounds a tone (Audio switch on).
 fn setup(audible: bool, fake: &Fake) -> (EffectcraftApp, ItemId) {
+    setup_long(audible, fake, 2.0)
+}
+
+/// A `duration`-second, 30 fps comp whose solid sounds a tone (Audio switch on).
+fn setup_long(audible: bool, fake: &Fake, duration: f64) -> (EffectcraftApp, ItemId) {
     let mut s = Session::default();
-    s.execute("comp.new", json!({"name": "A", "width": 64, "height": 36, "frameRate": 30, "duration": 2})).unwrap();
+    s.execute("comp.new", json!({"name": "A", "width": 64, "height": 36, "frameRate": 30, "duration": duration})).unwrap();
     let cid = s.active_comp_id().unwrap();
     let l = s.execute("layer.newSolid", json!({"color": "#808080"})).unwrap()["layer"].as_u64().unwrap();
     if audible {
@@ -127,7 +132,10 @@ fn preview_with_audio_shows_every_frame_and_sounds_once_cached() {
     assert!(h.state().playback.audio_held && h.state().audio.is_none(), "nothing is cached: no sound yet");
     let mut last = frame(&h);
     let mut shown = 0;
-    for _ in 0..2000 {
+    // Wait on the clock, not a step count: under a loaded machine (parallel test binaries) the
+    // background cache can take far longer than 2000 short steps to get ahead.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while std::time::Instant::now() < deadline {
         h.step();
         if h.state().audio.is_some() {
             break;
@@ -140,8 +148,41 @@ fn preview_with_audio_shows_every_frame_and_sounds_once_cached() {
     }
     assert!(h.state().audio.is_some() && fake.0.lock().unwrap().0.is_some(), "the sound started once the frames ahead were cached");
     assert!(shown > 0, "frames played silently first");
-    // A frame that isn't cached stops the sound rather than being skipped.
+    // A frame that isn't cached stops the sound rather than being skipped. (Frames render fast
+    // enough here to be cached again before the check: keep them out of the cache.)
+    h.state().frames.set_budget(0);
     h.state().frames.clear();
     h.step();
     assert!(h.state().audio.is_none() && h.state().playback.audio_held && h.state().playback.playing);
+}
+
+/// A preview whose frames render in real time sounds without waiting for the whole work area to
+/// be cached (#208): once the silent preview has kept up for a moment with the frames ahead
+/// cached, the sound starts, still without skipping a frame before it.
+#[test]
+fn preview_with_audio_sounds_once_rendering_keeps_up() {
+    let fake = Fake::default();
+    let (app, cid) = setup_long(true, &fake, 30.0);
+    let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).with_step_dt(1.0 / 30.0).build_eframe(|_| app);
+    h.run_steps(2);
+    let frame = |h: &Harness<'_, EffectcraftApp>| {
+        let app = h.state();
+        app.session.project.comp(cid).unwrap().frame_rate.frame_at(app.session.time())
+    };
+    let now = h.ctx.input(|i| i.time);
+    h.state_mut().play(now);
+    assert!(h.state().playback.audio_held && h.state().audio.is_none(), "nothing is cached: no sound yet");
+    let mut last = frame(&h);
+    // Two seconds of playback, each step giving the frame workers time to keep up.
+    for _ in 0..60 {
+        h.step();
+        if h.state().audio.is_some() {
+            break;
+        }
+        let f = frame(&h);
+        assert!(f == last || f == last + 1, "{last} → {f}: a frame was skipped");
+        last = f;
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(h.state().audio.is_some() && fake.0.lock().unwrap().0.is_some(), "the sound started within 2 s, at frame {last} of 900");
 }

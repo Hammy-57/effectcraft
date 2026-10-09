@@ -301,6 +301,7 @@ fn copy(s: &mut Session, p: &Value) -> Result<Value> {
         fx.iter().filter_map(|(l, u)| comp.layer(*l).and_then(|l| l.effects()).and_then(|e| e.groups().find(|g| g.uid == *u)).cloned()).collect();
     s.state.clipboard.clear();
     s.state.key_clipboard.clear();
+    s.state.contents_clipboard.clear();
     s.state.link_clipboard = None;
     s.state.clip_is_keys = false;
     let n = groups.len();

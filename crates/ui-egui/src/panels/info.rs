@@ -2,14 +2,15 @@
 
 use egui::{Align2, Color32, Rect, pos2, vec2};
 
-use crate::EffectcraftApp;
 use crate::theme::Tokens;
+use crate::{EffectcraftApp, widgets};
 
 pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let t = app.tokens;
     let p = ui.painter().with_clip_rect(rect);
     let x0 = rect.min.x + 12.0;
-    let mut y = rect.min.y + 14.0;
+    let scroll = widgets::PanelScroll::begin(ui, egui::Id::new("info-scroll"), rect);
+    let mut y = rect.min.y + 14.0 - scroll.offset;
     if app.pointer_comp.is_some() {
         // GPU frames: read the shown frame back for sampling.
         app.viewer_pixels();
@@ -60,6 +61,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     y += 82.0;
     p.line_segment([pos2(rect.min.x + 8.0, y), pos2(rect.max.x - 8.0, y)], egui::Stroke::new(1.0, t.separator));
     y += 14.0;
+    let mut bottom = y;
     let comp = app.session.active_comp_arc();
     if let Some(c) = comp {
         let sel: Vec<String> = app.session.state.selected_layers.iter().filter_map(|id| c.layer(*id)).map(|l| l.name.clone()).collect();
@@ -121,5 +123,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             let line = one.unwrap_or_else(|| format!("{} keyframes selected", sel.len()));
             p.text(pos2(x0, ly + 18.0), Align2::LEFT_CENTER, line, Tokens::ui(11.5), t.text_dim);
         }
+        bottom = ly + 30.0;
     }
+    let content = bottom - (rect.min.y - scroll.offset);
+    scroll.end(ui, &mut app.auto, "info.scroll", content, &t);
 }

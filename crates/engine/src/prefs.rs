@@ -22,6 +22,25 @@ pub const PREFS_VERSION: u32 = 2;
 /// Settings file name in the config store.
 pub const PREFS_FILE: &str = "prefs.json";
 
+/// Settings ▸ General ▸ Language: (label, `general.language` value).
+pub const LANGUAGES: &[(&str, &str)] = &[("Match System", "system"), ("English", "en"), ("日本語", "ja"), ("简体中文", "zh-hans"), ("繁體中文", "zh-hant")];
+
+/// Settings ▸ Startup & Repair ▸ Window Graphics: (label, `startup.windowGraphics` value).
+pub const WINDOW_GRAPHICS: &[(&str, &str)] = &[("Automatic", "auto"), ("OpenGL (compatibility)", "gl")];
+
+/// The settings whose value must be one of their choices.
+fn choices(key: &str) -> Option<&'static [(&'static str, &'static str)]> {
+    match key {
+        "general.language" => Some(LANGUAGES),
+        "startup.windowGraphics" => Some(WINDOW_GRAPHICS),
+        _ => None,
+    }
+}
+
+fn is_choice(choices: &[(&str, &str)], v: &str) -> bool {
+    choices.iter().any(|(_, c)| *c == v)
+}
+
 /// Unknown keys inside a page, kept so a newer version's settings survive a round trip.
 type Extra = BTreeMap<String, Value>;
 
@@ -44,8 +63,9 @@ macro_rules! page {
 }
 
 page!(General {
-    /// Interface language (`en` or `ja`).
-    language: String = "en".into(),
+    /// Interface language: `system` (the operating system's, where EffectCraft has it, else
+    /// English), `en` or `ja`.
+    language: String = "system".into(),
     /// Levels of Undo (1–99).
     undo_levels: u32 = 32,
     /// Path Point and Handle Size (px).
@@ -71,6 +91,10 @@ page!(Startup {
     show_home_on_open_project: bool = false,
     /// After a crash, offer to open the most recent auto-save.
     offer_crash_recovery: bool = true,
+    /// What the desktop window draws with, from the next launch: `auto` (the platform's best
+    /// graphics API) or `gl` (OpenGL, for drivers that crash with the others). A launch whose
+    /// window never drew switches it to `gl` (#243).
+    window_graphics: String = "auto".into(),
 });
 
 page!(ProjectPrefs {
@@ -416,9 +440,12 @@ impl Prefs {
     /// Clamp values into their valid ranges and fill missing labels.
     pub fn normalize(&mut self) {
         self.version = PREFS_VERSION;
+        if !is_choice(WINDOW_GRAPHICS, &self.startup.window_graphics) {
+            self.startup.window_graphics = Startup::default().window_graphics;
+        }
         let g = &mut self.general;
-        if !matches!(g.language.as_str(), "en" | "ja") {
-            g.language = "en".into();
+        if !is_choice(LANGUAGES, &g.language) {
+            g.language = General::default().language;
         }
         g.undo_levels = g.undo_levels.clamp(1, 99);
         g.path_point_size = g.path_point_size.clamp(3, 20);
@@ -458,8 +485,11 @@ impl Prefs {
 
     /// Set the value at a dotted key. The key must exist and the value must have its type.
     pub fn set(&mut self, key: &str, value: Value) -> Result<(), String> {
-        if key == "general.language" && !matches!(value.as_str(), Some("en" | "ja")) {
-            return Err("`general.language` expects `en` or `ja`".into());
+        if let Some(c) = choices(key)
+            && !value.as_str().is_some_and(|v| is_choice(c, v))
+        {
+            let all: Vec<&str> = c.iter().map(|(_, v)| *v).collect();
+            return Err(format!("`{key}` expects one of {}", all.join(", ")));
         }
         let mut v = serde_json::to_value(&*self).map_err(|e| e.to_string())?;
         let ptr = format!("/{}", key.replace('.', "/"));
@@ -885,7 +915,7 @@ pub fn pages() -> Vec<Page> {
             id: "general",
             title: "General",
             items: vec![
-                s("general.language", "Language", Kind::Choice(&[("English", "en"), ("日本語", "ja")]), true),
+                s("general.language", "Language", Kind::Choice(LANGUAGES), true),
                 s("general.undoLevels", "Levels of Undo", Kind::Int(1, 99, ""), true),
                 s("general.pathPointSize", "Path Point and Handle Size", Kind::Int(3, 20, "px"), true),
                 s("general.recentItems", "Recent Projects Shown", Kind::Int(1, 30, ""), true),
@@ -909,6 +939,10 @@ pub fn pages() -> Vec<Page> {
                 s("startup.showHomeOnLaunch", "Show Home Screen When Launching", B, true),
                 s("startup.showHomeOnOpenProject", "Show Home Screen When Opening a Project", B, true),
                 s("startup.offerCrashRecovery", "Offer to Open the Latest Auto-Save After a Crash", B, true),
+                s("startup.windowGraphics", "Window Graphics", Kind::Choice(WINDOW_GRAPHICS), true),
+                Note(
+                    "Window Graphics applies from the next launch. When the graphics driver stops EffectCraft before its window draws, the next launch switches to OpenGL.",
+                ),
                 Section("Repair"),
                 Button { label: "Reset Settings", command: "prefs.reset", params: "{}" },
                 Button { label: "Reset Keyboard Shortcuts", command: "shortcuts.reset", params: "{}" },

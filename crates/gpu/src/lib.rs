@@ -117,7 +117,13 @@ impl Gpu {
     /// On a device of its own (CLI, tests, benchmarks); `None` without a usable adapter.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn headless() -> Option<Gpu> {
-        GpuContext::headless().map(Gpu::from_context)
+        Gpu::try_headless().map_err(|e| log::info!("gpu: {e}")).ok()
+    }
+
+    /// [`Gpu::headless`], with why there is none.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn try_headless() -> Result<Gpu, String> {
+        pollster::block_on(GpuContext::request()).map(Gpu::from_context)
     }
 
     /// On an existing device (the desktop app shares egui-wgpu's).

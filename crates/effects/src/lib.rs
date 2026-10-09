@@ -355,6 +355,11 @@ pub struct EffectEnv<'a> {
     /// `[d, e, f]` take the effect coordinates [`Buf::to_px`] places to comp coordinates
     /// (`x' = a x + b y + c`). Effects that honour it say so.
     pub comp_space: Option<[[f64; 3]; 2]>,
+    /// Top-left corner of the layer bounds ([`EffectCtx::layer_size`]) in layer coordinates:
+    /// (0, 0) for layers with a source rectangle; shape and text layers have comp-sized bounds
+    /// centred on their origin (−w/2, −h/2). Edge pinning measures from these bounds
+    /// ([`util::pin_rect`]).
+    pub bounds_origin: [f64; 2],
 }
 
 /// What an effect gets to render with.
@@ -1122,6 +1127,9 @@ pub const TIME_DEPENDENT: &[&str] = &[
     "ec.obsolete.lightning",
     "ec.text.timecode",
     "ec.text.numbers",
+    // The audio visualisers read the Audio Layer's samples around the frame time.
+    "ec.generate.audiospectrum",
+    "ec.generate.audiowaveform",
     // Path Text's jitter changes every frame.
     "ec.obsolete.pathtext",
     // Time effects read neighbouring frames of the layer.

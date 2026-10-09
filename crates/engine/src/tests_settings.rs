@@ -487,11 +487,25 @@ fn memory_tick_never_waits_for_the_system() {
     }
 }
 
+/// Settings ▸ Startup & Repair ▸ Window Graphics takes `auto` or `gl` (#243).
+#[test]
+fn window_graphics_is_validated() {
+    let mut s = Session::default();
+    assert_eq!(s.prefs.startup.window_graphics, "auto");
+    s.execute("prefs.set", json!({"key": "startup.windowGraphics", "value": "gl"})).unwrap();
+    for bad in [json!("vulkan"), json!(true)] {
+        assert!(s.execute("prefs.set", json!({"key": "startup.windowGraphics", "value": bad})).is_err());
+    }
+    assert_eq!(s.prefs.startup.window_graphics, "gl");
+    assert_eq!(Prefs::from_json(r#"{"startup":{"windowGraphics":"dx9"}}"#).startup.window_graphics, "auto");
+}
+
 #[test]
 fn interface_language_is_validated_persisted_and_backward_compatible() {
     let store = Arc::new(MemoryConfig::default());
     let mut s = Session { config: Some(store.clone()), ..Default::default() };
-    assert_eq!(s.prefs.general.language, "en");
+    assert_eq!(s.prefs.general.language, "system", "Match System by default (#229)");
+    s.execute("prefs.set", json!({"key": "general.language", "value": "en"})).unwrap();
     s.execute("prefs.set", json!({"key": "general.language", "value": "ja"})).unwrap();
     assert_eq!(s.execute("prefs.get", json!({"key": "general.language"})).unwrap(), json!("ja"));
     let saved = store.read(PREFS_FILE).unwrap();
@@ -500,13 +514,25 @@ fn interface_language_is_validated_persisted_and_backward_compatible() {
         assert_eq!(s.prefs.general.language, "ja");
         assert_eq!(store.read(PREFS_FILE).unwrap(), saved);
     }
+    // zh-hans is registered alongside en and ja: it is accepted, persisted and read back.
+    s.execute("prefs.set", json!({"key": "general.language", "value": "zh-hans"})).unwrap();
+    let mut zh = Session { config: Some(store.clone()), ..Default::default() };
+    zh.load_settings();
+    assert_eq!(zh.prefs.general.language, "zh-hans");
+    // zh-hant is the same: another language of the registered set, not an error.
+    s.execute("prefs.set", json!({"key": "general.language", "value": "zh-hant"})).unwrap();
+    let mut zh_hant = Session { config: Some(store.clone()), ..Default::default() };
+    zh_hant.load_settings();
+    assert_eq!(zh_hant.prefs.general.language, "zh-hant");
+    s.execute("prefs.set", json!({"key": "general.language", "value": "ja"})).unwrap();
     let mut reloaded = Session { config: Some(store), ..Default::default() };
     reloaded.load_settings();
     assert_eq!(reloaded.prefs.general.language, "ja");
     reloaded.execute("prefs.reset", json!({"page": "general"})).unwrap();
-    assert_eq!(reloaded.prefs.general.language, "en");
-    assert_eq!(Prefs::from_json(r#"{"general":{"undoLevels":17}}"#).general.language, "en");
-    assert_eq!(Prefs::from_json(r#"{"general":{"language":"unknown"}}"#).general.language, "en");
+    assert_eq!(reloaded.prefs.general.language, "system");
+    assert_eq!(Prefs::from_json(r#"{"general":{"undoLevels":17}}"#).general.language, "system");
+    assert_eq!(Prefs::from_json(r#"{"general":{"language":"unknown"}}"#).general.language, "system");
+    assert_eq!(Prefs::from_json(r#"{"general":{"language":"en"}}"#).general.language, "en", "a chosen language stays");
 }
 
 #[test]
@@ -520,4 +546,16 @@ fn unicode_label_colors_fall_back_without_panicking() {
     }
     s.execute("prefs.set", json!({"key": "labels.0.color", "value": "#aBcD09"})).unwrap();
     assert_eq!(s.prefs.label_rgb(Label::Red), [0xab, 0xcd, 9]);
+}
+
+/// `render.backend` says why it renders on the CPU (#262): the Software Only renderer, or the
+/// host's reason there is no GPU compositor.
+#[test]
+fn render_backend_says_why_it_renders_on_the_cpu() {
+    let mut s = Session::default();
+    let why = |s: &mut Session| s.execute("render.backend", json!({})).unwrap()["why"].clone();
+    assert_eq!(why(&mut s), json!("no GPU compositor is attached"));
+    s.accel_note = Some("headless: renders on the CPU unless started with --gpu".into());
+    assert_eq!(why(&mut s), json!("headless: renders on the CPU unless started with --gpu"));
+    assert_eq!(s.execute("render.backend", json!({"backend": "cpu"})).unwrap()["why"], json!("the project's renderer is Mercury Software Only"));
 }

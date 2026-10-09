@@ -9,6 +9,7 @@ use effectcraft_ui_egui::EffectcraftApp;
 use effectcraft_ui_egui::dock::PanelKind;
 use effectcraft_ui_egui::state::FxPick;
 use egui_kittest::Harness;
+use egui_kittest::kittest::Queryable;
 use serde_json::json;
 
 struct Ids {
@@ -268,4 +269,69 @@ fn angle_revolutions_scrub_and_take_typing() {
     h.run_steps(4);
     type_into(&mut h, &format!("properties.prop.{rot}.revolutions"), "1");
     assert_eq!(rotation(&h), 360.0);
+}
+
+fn right_click(h: &mut Harness<'_, EffectcraftApp>, pos: egui::Pos2) {
+    h.event(egui::Event::PointerMoved(pos));
+    h.step();
+    h.event(egui::Event::PointerButton { pos, button: egui::PointerButton::Secondary, pressed: true, modifiers: Default::default() });
+    h.step();
+    h.event(egui::Event::PointerButton { pos, button: egui::PointerButton::Secondary, pressed: false, modifiers: Default::default() });
+    h.run_steps(2);
+}
+
+fn hover(h: &mut Harness<'_, EffectcraftApp>, pos: egui::Pos2) {
+    h.event(egui::Event::PointerMoved(pos));
+    h.run_steps(3);
+}
+
+/// #227: right-clicking Effect Controls where no control has a menu of its own shows the
+/// Effect menu (After Effects), which applies an effect to the selected layers; an effect's
+/// header keeps its own menu.
+#[test]
+fn right_click_in_effect_controls_shows_the_effect_menu() {
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "Main", "width": 320, "height": 180, "frameRate": 30, "duration": 4})).unwrap();
+    let a = s.execute("layer.newSolid", json!({"name": "A", "color": "#406080"})).unwrap()["layer"].as_u64().unwrap();
+    let b = s.execute("layer.newSolid", json!({"name": "B", "color": "#804060"})).unwrap()["layer"].as_u64().unwrap();
+    let fill = s.execute("effect.apply", json!({"layers": [b], "effect": "Fill"})).unwrap()["effects"][0].as_u64().unwrap();
+    s.state.selected_layers = vec![LayerId(b), LayerId(a)];
+    let mut app = EffectcraftApp::new(s);
+    app.show_panel(PanelKind::EffectControls);
+    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).build_eframe(|_| app);
+    h.run_steps(3);
+    let category = " Blur & Sharpen ⏵";
+    // An effect's header: its own menu.
+    let header = rect_of(&h, &format!("effectControls.effect.{fill}")).center();
+    right_click(&mut h, header);
+    assert!(h.query_by_label("Duplicate").is_some(), "the effect's own menu");
+    assert!(h.query_by_label(category).is_none());
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    // A control without a menu (the header's Reset): the Effect menu.
+    let reset = rect_of(&h, &format!("effectControls.effect.{fill}.reset")).center();
+    right_click(&mut h, reset);
+    assert!(h.query_by_label(category).is_some());
+    assert_eq!(layer(&h.state().session, b).effects().map(|f| f.groups().count()), Some(1), "Reset didn't run");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(h.query_by_label(category).is_none());
+    // The empty area below it: the Effect menu.
+    let panel = rect_of(&h, "panel.EffectControls");
+    right_click(&mut h, egui::pos2(panel.center().x, panel.max.y - 30.0));
+    let cat = h.query_by_label(category).expect("the Effect menu's categories").rect();
+    assert!(h.query_by_label_contains("Remove All").is_some(), "the whole Effect menu");
+    hover(&mut h, cat.center());
+    let at = h.query_by_label(" Gaussian Blur").expect("Blur & Sharpen ▸ Gaussian Blur").rect().center();
+    hover(&mut h, egui::pos2(at.x, cat.center().y));
+    for k in 1..=10 {
+        hover(&mut h, egui::pos2(at.x, cat.center().y + (at.y - cat.center().y) * k as f32 / 10.0));
+    }
+    click(&mut h, at);
+    let names = |h: &Harness<'_, EffectcraftApp>, l: u64| -> Vec<String> {
+        layer(&h.state().session, l).effects().map(|f| f.groups().map(|g| g.name.clone()).collect()).unwrap_or_default()
+    };
+    assert_eq!(names(&h, b), ["Fill", "Gaussian Blur"]);
+    assert_eq!(names(&h, a), ["Gaussian Blur"], "every selected layer gets it");
+    assert!(h.query_by_label(category).is_none(), "the menu closed");
 }

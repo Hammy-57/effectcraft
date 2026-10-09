@@ -251,6 +251,68 @@ fn h264_audio_samples() {
     assert!(pre.iter().all(|v| *v == 0.0));
 }
 
+/// H.264 + AAC at 44.1 kHz in MP4 (ffmpeg writes an edit list that skips the AAC priming):
+/// 440 Hz left, a 200 → 1000 Hz sweep right, 29.97 fps.
+fn aac_44k_mp4() -> Option<PathBuf> {
+    ffmpeg_fixture(
+        "aac_44k.mp4",
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=64x48:rate=30000/1001:duration=3",
+            "-f",
+            "lavfi",
+            "-i",
+            "aevalsrc=0.5*sin(2*PI*440*t)|0.5*sin(2*PI*(200+400*t/3)*t):s=44100:d=3",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-shortest",
+        ],
+    )
+}
+
+/// `src`'s audio decoded by ffmpeg as interleaved stereo `f32` at `rate` Hz (external oracle).
+fn ffmpeg_audio(src: &Path, rate: u32) -> Vec<f32> {
+    let out = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-i"])
+        .arg(src)
+        .args(["-f", "f32le", "-ac", "2", "-ar", &rate.to_string(), "-"])
+        .output()
+        .expect("ffmpeg");
+    assert!(out.status.success(), "ffmpeg failed to decode {}", src.display());
+    out.stdout.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect()
+}
+
+/// Footage audio at a rate other than the file's, read in one-frame pieces as export and the
+/// preview mix do, matches ffmpeg's decode: a resampled MP4 read ramped from a wrong position
+/// at the start of every piece (peaks near 100 against a 0.5 tone), so AAC footage stuttered in
+/// previews and exports (#274).
+#[test]
+fn resampled_audio_read_in_frame_pieces_matches_ffmpeg() {
+    let (Some(a), Some(b)) = (aac_44k_mp4(), h264_mp4()) else { return };
+    // 44.1 kHz read at 48 kHz, 48 kHz read at 44.1 kHz; NTSC frames are fractional in samples.
+    for (p, rate) in [(a, 48_000u32), (b, 44_100)] {
+        let f = probe(&p).expect("probe");
+        let want = ffmpeg_audio(&p, rate);
+        let fps = FrameRate::new(30000, 1001);
+        let pool = MediaPool::new();
+        let (mut got, mut cursor) = (Vec::new(), 0i64);
+        for k in 1..=55 {
+            let end = fps.tick_of(k).to_units_floor(rate as i64);
+            got.extend(pool.audio_samples(&f, Tick::from_units(cursor, rate as i64), (end - cursor) as usize, rate));
+            cursor = end;
+        }
+        let worst = got.iter().zip(&want).map(|(g, w)| (g - w).abs()).fold(0.0f32, f32::max);
+        eprintln!("{} at {rate} Hz: max error {worst:.4}", p.display());
+        assert!(want.len() >= got.len() && worst < 0.01, "{} at {rate} Hz: max error {worst}", p.display());
+    }
+}
+
 #[test]
 fn prores_4444_with_alpha() {
     let Some(p) = prores_mov() else { return };

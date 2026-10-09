@@ -1,7 +1,7 @@
 //! Layer menu.
 
 use effectcraft_color::{BlendMode, Label};
-use effectcraft_keyframe::{Justify, ShapePath, TextDoc, Value as KV};
+use effectcraft_keyframe::{Justify, TextDoc, Value as KV};
 use effectcraft_project::build::{self, Ids};
 use effectcraft_project::{
     Comp, FrameBlend, GroupKind, ItemId, ItemKind, Layer, LayerId, LayerSource, MaskMode, MatteKind, Project, PropGroup, Quality, Solid, TrackMatte,
@@ -205,30 +205,6 @@ fn new_text(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"layer": id.0}))
 }
 
-/// Contents for a new shape (one group with path + fill + stroke).
-fn shape_contents(ids: &mut Ids, kind: &str, size: [f64; 2], fill: Option<[f64; 4]>, stroke: Option<([f64; 4], f64)>) -> Option<PropGroup> {
-    let (path, gname) = match kind {
-        "rect" | "rectangle" => (build::shape_rect(ids, size, [0.0, 0.0], 0.0), "Rectangle 1"),
-        "rounded" | "roundedRect" => (build::shape_rect(ids, size, [0.0, 0.0], size[0].min(size[1]) * 0.15), "Rectangle 1"),
-        "ellipse" => (build::shape_ellipse(ids, size, [0.0, 0.0]), "Ellipse 1"),
-        "star" => (build::shape_star(ids, true, 5.0, [0.0, 0.0], size[0] / 2.0, size[0] / 4.0), "Polystar 1"),
-        "polygon" => (build::shape_star(ids, false, 6.0, [0.0, 0.0], size[0] / 2.0, 0.0), "Polystar 1"),
-        _ => return None,
-    };
-    let mut items = vec![path];
-    if let Some((c, w)) = stroke {
-        items.push(build::shape_stroke(ids, c, w));
-    }
-    if let Some(c) = fill {
-        items.push(build::shape_fill(ids, c));
-    }
-    Some(build::shape_group(ids, gname, items))
-}
-
-fn c4(c: Option<[f32; 3]>, d: [f64; 4]) -> [f64; 4] {
-    c.map(|c| [c[0] as f64, c[1] as f64, c[2] as f64, 1.0]).unwrap_or(d)
-}
-
 fn new_shape(s: &mut Session, p: &Value) -> Result<Value> {
     let cid = comp_id(s, p)?;
     let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?.clone();
@@ -236,27 +212,24 @@ fn new_shape(s: &mut Session, p: &Value) -> Result<Value> {
     let size = p
         .get("size")
         .and_then(Value::as_array)
-        .map(|a| [a[0].as_f64().unwrap_or(200.0), a.get(1).and_then(Value::as_f64).unwrap_or(200.0)])
+        .map(|a| [a.first().and_then(Value::as_f64).unwrap_or(200.0), a.get(1).and_then(Value::as_f64).unwrap_or(200.0)])
         .unwrap_or([300.0, 300.0]);
-    let fill = Some(c4(color_p(p, "fill"), [0.25, 0.55, 1.0, 1.0]));
-    let stroke = (f_p(p, "strokeWidth").unwrap_or(0.0) > 0.0).then(|| (c4(color_p(p, "stroke"), [1.0, 1.0, 1.0, 1.0]), f_p(p, "strokeWidth").unwrap_or(2.0)));
-    let pos = p.get("position").and_then(|v| v.as_array()).map(|a| [a[0].as_f64().unwrap_or(0.0), a.get(1).and_then(Value::as_f64).unwrap_or(0.0)]);
+    // A fill, and a stroke only with a width (not the Tools bar's paint).
+    let paint = super::shape_tool::paint_p(p, &Default::default(), "layer.newShape")?;
+    let pos = p
+        .get("position")
+        .and_then(|v| v.as_array())
+        .map(|a| [a.first().and_then(Value::as_f64).unwrap_or(0.0), a.get(1).and_then(Value::as_f64).unwrap_or(0.0)]);
     let name = str_p(p, "name").unwrap_or("Shape Layer 1").to_string();
     let id = s.edit("New Shape Layer", None, |proj, st| {
-        let mut l = build::layer(proj, &comp, &name, LayerSource::Shape, (comp.width, comp.height), None);
+        let lid = super::shape_tool::new_shape_layer(proj, st, &comp, cid, Some(&name), pos)?;
         let mut next = proj.next_id;
-        if let Some(g) = shape_contents(&mut Ids(&mut next), &kind, size, fill, stroke)
-            && let Some(c) = l.props.sub_mut("contents")
-        {
-            c.children.push(g.into());
-        }
+        let g = super::shape_tool::shape_group(&mut Ids(&mut next), &kind, size, &paint);
         proj.next_id = next;
-        if let Some(pos) = pos
-            && let Some(pr) = l.props.prop_mut("transform/position")
-        {
-            pr.value = KV::Vec3([pos[0], pos[1], 0.0]);
+        if let Some(g) = g {
+            super::shape_tool::add_to_contents(proj, cid, lid, g, [0.0, 0.0], "layer.newShape")?;
         }
-        insert_layer(proj, st, cid, l)
+        Ok(lid)
     })?;
     Ok(json!({"layer": id.0}))
 }
@@ -404,7 +377,8 @@ fn set_switch(s: &mut Session, p: &Value) -> Result<Value> {
     let name = str_p(p, "switch").ok_or_else(|| bad("layer.setSwitch", "missing `switch`"))?.to_string();
     let v = b_p(p, "value");
     let label = format!("Layer Switch ({name})");
-    let r = s.edit(&label, None, |proj, _| {
+    // `merge`: a switch dragged over several layers in the Timeline is one undo step.
+    let r = s.edit(&label, merge_p(p), |proj, _| {
         let comp = proj.comp_mut(cid).ok_or(EngineError::NoComp)?;
         let mut last = false;
         // Toggle relative to the first layer so a multi-selection ends up consistent.
@@ -995,10 +969,9 @@ fn add_mask(s: &mut Session, p: &Value) -> Result<Value> {
         Some([x, y, rw, rh]) => (x + rw / 2.0, y + rh / 2.0, rw, rh),
         None => (if w > 0.0 { w / 2.0 } else { 0.0 }, h / 2.0, w * 0.6, h * 0.6),
     };
-    let path = match shape {
-        "ellipse" => ShapePath::ellipse([cx, cy], rw, rh),
-        _ => ShapePath::rect([cx, cy], rw, rh),
-    };
+    // The shape tools' masks: rectangle, ellipse, rounded rectangle, polygon or star.
+    let path = super::shape_tool::mask_path(shape, [cx, cy], [rw, rh])
+        .ok_or_else(|| bad("layer.addMask", format!("unknown shape `{shape}`; one of rect, ellipse, rounded, polygon, star")))?;
     let mode = str_p(p, "mode").and_then(MaskMode::from_name).unwrap_or(MaskMode::Add);
     let cycle = s.prefs.appearance.cycle_mask_colors;
     let uid = s.edit("New Mask", None, |proj, _| {
@@ -1075,7 +1048,9 @@ fn add_shape_item(s: &mut Session, p: &Value) -> Result<Value> {
             "polygon" => build::shape_star(&mut ids, false, 5.0, [0.0, 0.0], 100.0, 0.0),
             "fill" => build::shape_fill(&mut ids, [1.0, 0.0, 0.0, 1.0]),
             "stroke" => build::shape_stroke(&mut ids, [1.0, 1.0, 1.0, 1.0], 2.0),
+            "path" => build::shape_path(&mut ids, Default::default()),
             "gfill" | "gradientFill" => build::shape_gradient_fill(&mut ids, false, [-100.0, 0.0], [100.0, 0.0], Default::default()),
+            "gstroke" | "gradientStroke" => build::shape_gradient_stroke(&mut ids, false, [-100.0, 0.0], [100.0, 0.0], Default::default(), 2.0),
             "trim" | "trimPaths" => build::shape_trim(&mut ids, 0.0, 100.0, 0.0),
             "repeater" => build::shape_repeater(&mut ids, 3.0, [100.0, 0.0]),
             k => build::shape_simple_op(&mut ids, k).ok_or_else(|| bad("layer.addShapeItem", format!("unknown kind `{k}`")))?,
@@ -1311,7 +1286,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Shape Layer",
             ["Layer", "New"],
             None,
-            "{kind?: rect|rounded|ellipse|star|polygon|none, name?, size?, fill?, stroke?, strokeWidth?, position?}",
+            "{kind?: rect|rounded|ellipse|star|polygon|none, name?, size?, fill?, fillType?, fillBlend?, fillOpacity?, stroke?, strokeType?, strokeBlend?, strokeOpacity?, strokeWidth?, position?}",
             has_comp,
             new_shape
         ),
@@ -1342,7 +1317,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Layer Switch",
             [],
             None,
-            "{layers?, switch: video|audio|solo|lock|shy|collapse|quality|fx|frameBlend|motionBlur|adjustment|threeD|guide|preserveTransparency, value?}",
+            "{layers?, switch: video|audio|solo|lock|shy|collapse|quality|fx|frameBlend|motionBlur|adjustment|threeD|guide|preserveTransparency, value?, merge?}",
             has_layers,
             set_switch
         ),
@@ -1394,7 +1369,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "New Mask",
             ["Layer", "Mask"],
             Some("Cmd+Shift+N"),
-            "{layer?, shape?: rect|ellipse, rect? [x,y,w,h], mode?}",
+            "{layer?, shape?: rect|ellipse|rounded|polygon|star, rect? [x,y,w,h] (layer space; a polygon or star fits its width), mode?}",
             has_layers,
             add_mask
         ),
@@ -1404,7 +1379,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Add (Shape)",
             [],
             None,
-            "{layer?, kind: group|rect|ellipse|star|polygon|fill|stroke|gfill|trim|repeater|round|offset|pucker|twist|zigzag|wiggle|merge, group?: uid|path} → {uid, path}",
+            "{layer?, kind: group|rect|ellipse|star|polygon|path|fill|stroke|gfill|gstroke|trim|repeater|round|offset|pucker|twist|zigzag|wiggle|merge, group?: uid|path} → {uid, path}",
             has_layers,
             add_shape_item
         ),

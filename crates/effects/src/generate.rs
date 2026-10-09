@@ -273,7 +273,7 @@ fn circle(ctx: &EffectCtx, mut b: Buf) -> Buf {
 // ---- value noise / fBm (our own lattice noise with quintic fade) ----
 
 #[inline]
-fn lattice(ix: i32, iy: i32, iz: i32, seed: u32) -> f32 {
+pub(crate) fn lattice(ix: i32, iy: i32, iz: i32, seed: u32) -> f32 {
     let mut h =
         (ix as u32).wrapping_mul(0x27d4_eb2d) ^ (iy as u32).wrapping_mul(0x1656_67b1) ^ (iz as u32).wrapping_mul(0x9e37_79b9) ^ seed.wrapping_mul(0x85eb_ca6b);
     h ^= h >> 15;
@@ -285,7 +285,7 @@ fn lattice(ix: i32, iy: i32, iz: i32, seed: u32) -> f32 {
 }
 
 #[inline]
-fn fade(t: f32) -> f32 {
+pub(crate) fn fade(t: f32) -> f32 {
     t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
 }
 

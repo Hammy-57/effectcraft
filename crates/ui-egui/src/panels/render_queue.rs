@@ -20,6 +20,7 @@ use egui::{Align2, Color32, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
 use serde_json::{Value, json};
 
 use crate::theme::Tokens;
+use crate::widgets::check_label as mark;
 use crate::{EffectcraftApp, widgets};
 
 const TOP_H: f32 = 74.0;
@@ -59,10 +60,6 @@ fn status_color(t: &Tokens, s: &RenderStatus) -> Color32 {
         RenderStatus::Unqueued => t.text_faint,
         RenderStatus::Queued => t.text,
     }
-}
-
-fn mark(on: bool, l: &str) -> String {
-    if on { format!("✓ {l}") } else { format!("   {l}") }
 }
 
 /// Render Settings menu: (label, params). `{"form": …}` entries open a form.
@@ -530,7 +527,11 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     // ---------------------------------------------------------- items
     let list = Rect::from_min_max(pos2(rect.min.x, head.max.y), pos2(rect.max.x, rect.max.y - FOOT_H));
     let lp = p.with_clip_rect(list);
-    let mut y = list.min.y;
+    let scroll = widgets::PanelScroll::begin(ui, egui::Id::new("rq-scroll"), list);
+    // Items scroll under the header and footer: clip their widgets (and hit tests) to the list.
+    let panel_clip = ui.clip_rect();
+    ui.set_clip_rect(list.intersect(panel_clip));
+    let mut y = list.min.y - scroll.offset;
     if queue.is_empty() {
         lp.text(pos2(list.center().x, list.min.y + 30.0), Align2::CENTER_CENTER, "The render queue is empty.", Tokens::ui(12.0), t.text_faint);
     }
@@ -749,6 +750,9 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             }
         }
     }
+    ui.set_clip_rect(panel_clip);
+    let content = y + scroll.offset - list.min.y;
+    scroll.end(ui, &mut app.auto, "renderQueue.scroll", content, &t);
     ui.data_mut(|d| match &editing {
         Some(e) => {
             d.insert_temp(editing_id, e.clone());

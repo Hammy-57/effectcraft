@@ -153,6 +153,20 @@ fn saved_workspace_is_listed_in_the_workspace_menu() {
     assert_eq!(h.state().ui.dock, saved, "its layout came back");
 }
 
+/// Learn opens the Home screen's tutorials; clicking another workspace tab closes them again,
+/// however quickly the tabs are clicked (they stayed over every workspace, #272).
+#[test]
+fn leaving_the_learn_workspace_closes_its_tutorials() {
+    let mut h = harness();
+    for name in ["Learn", "Default", "Learn", "Review", "Learn", "Learn", "Small Screen", "Standard", "Learn", "Default"] {
+        click(&mut h, &format!("header.workspace.{name}"));
+        assert_eq!(h.state().ui.workspace, name);
+        let learn = name == "Learn";
+        assert_eq!(h.state().ui.start_screen, learn, "{name}: the Home screen shows only for Learn");
+        assert_eq!(!h.state().auto.query("home.learn.").is_empty(), learn, "{name}: the tutorials show only for Learn");
+    }
+}
+
 /// Headless look at the panels (wgpu offscreen; needs a GPU adapter). Run with
 /// `PANELS_SNAPSHOT=/abs/dir cargo test -p effectcraft-ui-egui --test ui_panels -- --ignored`.
 #[test]

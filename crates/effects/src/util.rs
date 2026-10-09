@@ -427,6 +427,15 @@ pub fn layer_rect(ctx: &crate::EffectCtx, b: &crate::Buf) -> (f64, f64, f64, f64
     (b.offset[0], b.offset[1], ctx.layer_size[0] * b.scale, ctx.layer_size[1] * b.scale)
 }
 
+/// The layer bounds edge pinning holds in place, in the pixels of a buffer with `offset` and
+/// `scale` (see [`crate::Buf`]): (x0, y0, width, height). Unlike [`layer_rect`] it starts at
+/// [`crate::EffectEnv::bounds_origin`], so a shape layer's content around its origin lies
+/// inside it.
+pub fn pin_rect(ctx: &crate::EffectCtx, offset: [f64; 2], scale: f64) -> (f64, f64, f64, f64) {
+    let o = ctx.env.bounds_origin;
+    (offset[0] + o[0] * scale, offset[1] + o[1] * scale, ctx.layer_size[0] * scale, ctx.layer_size[1] * scale)
+}
+
 /// Resample another layer (a layer parameter) into `b`'s pixel grid. With `stretch` the other
 /// layer is scaled to this layer's size ("Stretch to Fit"); otherwise it is centred.
 pub fn fit_layer(ctx: &crate::EffectCtx, b: &crate::Buf, other: &crate::LayerPixels, stretch: bool) -> Image {

@@ -20,7 +20,12 @@ fn has_clip(s: &Session) -> std::result::Result<(), String> {
         // Text editing pastes the system clipboard's text (passed as `text`) or copied text.
         return Ok(());
     }
-    if s.state.clipboard.is_empty() && s.state.key_clipboard.is_empty() && s.state.effect_clipboard.is_empty() && s.state.link_clipboard.is_none() {
+    if s.state.clipboard.is_empty()
+        && s.state.key_clipboard.is_empty()
+        && s.state.effect_clipboard.is_empty()
+        && s.state.contents_clipboard.is_empty()
+        && s.state.link_clipboard.is_none()
+    {
         Err("the clipboard is empty".into())
     } else {
         Ok(())
@@ -104,6 +109,11 @@ fn duplicate(s: &mut Session, p: &Value) -> Result<Value> {
             }
             return Ok(json!({"effects": out}));
         }
+        // Shape items selected → duplicate them inside their layers.
+        let items = super::prop_groups::selected_contents(s);
+        if !items.is_empty() {
+            return super::prop_groups::duplicate_contents(s, &items);
+        }
     }
     let (cid, ids) = layers_p(s, p)?;
     let new = s.edit("Duplicate", None, |proj, st| {
@@ -136,7 +146,12 @@ fn delete(s: &mut Session, p: &Value) -> Result<Value> {
     if !s.state.selected_keys.is_empty() && p.get("layers").is_none() {
         return s.execute("keys.delete", json!({}));
     }
-    if !s.state.selected_vertices.is_empty() && p.get("layers").is_none() {
+    // (Points selected with their mask, which selecting a mask does: the mask goes, below.)
+    let comp = s.active_comp();
+    let loose = s.state.selected_vertices.iter().any(|v| {
+        !s.state.selected_props.contains(&(v.layer, v.mask)) && comp.and_then(|c| c.layer(v.layer)).is_some_and(|l| l.props.find_group(v.mask).is_some())
+    });
+    if loose && p.get("layers").is_none() {
         return s.execute("mask.deleteVertices", json!({}));
     }
     // Puppet pins selected → delete the pins (not their layer).
@@ -185,6 +200,7 @@ fn clear_clipboards(s: &mut Session) {
     s.state.clipboard.clear();
     s.state.key_clipboard.clear();
     s.state.effect_clipboard.clear();
+    s.state.contents_clipboard.clear();
     s.state.link_clipboard = None;
     s.state.clip_is_keys = false;
 }
@@ -198,11 +214,21 @@ fn copy(s: &mut Session, p: &Value) -> Result<Value> {
     if !s.state.selected_keys.is_empty() && p.get("layers").is_none() {
         s.state.link_clipboard = None;
         s.state.effect_clipboard.clear();
+        s.state.contents_clipboard.clear();
         return s.execute("keys.copy", json!({}));
     }
     // Effects selected (Effect Controls / timeline) → copy the effects.
     if p.get("layers").is_none() && !super::effect::selected_effects(s).is_empty() {
         return s.execute("effect.copy", json!({}));
+    }
+    // Shape items selected in a shape layer's Contents → copy them (not their layer).
+    if p.get("layers").is_none() {
+        let items = super::prop_groups::copy_contents(s);
+        if !items.is_empty() {
+            clear_clipboards(s);
+            s.state.contents_clipboard = items;
+            return Ok(json!({"contents": s.state.contents_clipboard.len()}));
+        }
     }
     let (cid, ids) = layers_p(s, p)?;
     s.state.clip_is_keys = false;
@@ -339,6 +365,14 @@ fn cut(s: &mut Session, p: &Value) -> Result<Value> {
         s.execute("keys.copy", json!({}))?;
         return s.execute("keys.delete", json!({}));
     }
+    // Shape items selected → copied, then removed from their layers (Paste moves them).
+    if p.get("layers").is_none() && super::effect::selected_effects(s).is_empty() {
+        let items = super::prop_groups::selected_contents(s);
+        if !items.is_empty() {
+            copy(s, p)?;
+            return super::prop_groups::cut_contents(s, &items);
+        }
+    }
     copy(s, p)?;
     delete(s, p)
 }
@@ -355,6 +389,9 @@ fn paste(s: &mut Session, p: &Value) -> Result<Value> {
     }
     if !s.state.effect_clipboard.is_empty() {
         return s.execute("effect.paste", p.clone());
+    }
+    if !s.state.contents_clipboard.is_empty() {
+        return super::prop_groups::paste_contents(s, p);
     }
     let cid = super::comp_id(s, p)?;
     let clip = s.state.clipboard.clone();
@@ -637,8 +674,8 @@ pub fn specs() -> Vec<CommandSpec> {
     vec![
         cmd!("edit.undo", "Undo", ["Edit"], Some("Cmd+Z"), "{}", can_undo, undo),
         cmd!("edit.redo", "Redo", ["Edit"], Some("Cmd+Shift+Z"), "{}", can_redo, redo),
-        cmd!("edit.cut", "Cut", ["Edit"], Some("Cmd+X"), "{layers?} (keyframes when keys are selected)", layers_or_keys, cut),
-        cmd!("edit.copy", "Copy", ["Edit"], Some("Cmd+C"), "{layers?} (keyframes when keys are selected)", layers_or_keys, copy),
+        cmd!("edit.cut", "Cut", ["Edit"], Some("Cmd+X"), "{layers?} (keyframes, effects or shape items when they are selected)", layers_or_keys, cut),
+        cmd!("edit.copy", "Copy", ["Edit"], Some("Cmd+C"), "{layers?} (keyframes, effects or shape items when they are selected)", layers_or_keys, copy),
         cmd!(
             "edit.copyWithPropertyLinks",
             "Copy with Property Links",
@@ -658,10 +695,18 @@ pub fn specs() -> Vec<CommandSpec> {
             |s, p| copy_links(s, p, true)
         ),
         cmd!("edit.copyExpressionOnly", "Copy Expression Only", ["Edit"], None, "{}", has_props_or_layers, copy_expression_only),
-        cmd!("edit.paste", "Paste", ["Edit"], Some("Cmd+V"), "{} (layers, keyframes at the CTI, or property links / expressions)", has_clip, paste),
+        cmd!(
+            "edit.paste",
+            "Paste",
+            ["Edit"],
+            Some("Cmd+V"),
+            "{} (layers, keyframes at the CTI, effects, shape items into the selected shape layers, or property links / expressions)",
+            has_clip,
+            paste
+        ),
         cmd!("edit.pasteReversedKeyframes", "Paste Reversed Keyframes", ["Edit"], None, "{layers?, prop?|path?, time?}", has_key_clip, paste_reversed),
         cmd!("edit.clear", "Clear", ["Edit"], Some("Delete"), "{layers?}", layers_or_keys, delete),
-        cmd!("edit.duplicate", "Duplicate", ["Edit"], Some("Cmd+D"), "{layers?}", has_layers, duplicate),
+        cmd!("edit.duplicate", "Duplicate", ["Edit"], Some("Cmd+D"), "{layers?} (effects or shape items when they are selected)", has_layers, duplicate),
         cmd!("edit.splitLayer", "Split Layer", ["Edit"], Some("Cmd+Shift+D"), "{layers?}", has_layers, split),
         cmd!("edit.liftWorkArea", "Lift Work Area", ["Edit"], None, "{layers?}", has_comp, lift),
         cmd!("edit.extractWorkArea", "Extract Work Area", ["Edit"], None, "{layers?}", has_comp, extract),

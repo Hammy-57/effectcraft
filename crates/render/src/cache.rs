@@ -492,7 +492,10 @@ pub fn layer_key(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bo
 /// effects (see `Renderer::layer_input`). Unlike [`layer_key`], footage layers are cached here
 /// (keyed by item and source time), since Time effects read many neighbouring frames.
 pub fn input_key(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool, effects: usize) -> Option<u64> {
-    let base = key_with(ctx, layer, scale, draft, blur, true)?;
+    if layer.switches.adjustment {
+        return None;
+    }
+    let base = key_any(ctx, layer, scale, draft, blur, true, Some(effects))?;
     let mut h = KeyHasher(base ^ 0x5bd1_e995_7a3c_11d3);
     effects.hash(&mut h);
     Some(h.finish())
@@ -516,18 +519,20 @@ fn has_expression(g: &PropGroup) -> bool {
 /// Cache key for an adjustment layer's footprint (its source through its masks, see
 /// `Renderer::adjustment_footprint`): the GPU compositor then uploads it once, not every frame.
 pub fn footprint_key(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool) -> Option<u64> {
-    Some(derive(key_any(ctx, layer, scale, draft, blur, false)?, 0xf007_9417))
+    Some(derive(key_any(ctx, layer, scale, draft, blur, false, None)?, 0xf007_9417))
 }
 
 fn key_with(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool, footage: bool) -> Option<u64> {
     if layer.switches.adjustment {
         return None;
     }
-    key_any(ctx, layer, scale, draft, blur, footage)
+    key_any(ctx, layer, scale, draft, blur, footage, None)
 }
 
-/// `blur`: the layer is motion blurred in this render (`Renderer::mb_on`).
-fn key_any(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool, footage: bool) -> Option<u64> {
+/// `blur`: the layer is motion blurred in this render (`Renderer::mb_on`). `effects`: key only
+/// the first that many effects (a layer's input, see [`input_key`]).
+#[allow(clippy::too_many_arguments)]
+fn key_any(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool, footage: bool, effects: Option<usize>) -> Option<u64> {
     let mut h = KeyHasher(0xcbf2_9ce4_8422_2325);
     match &layer.source {
         LayerSource::Solid { item } => {
@@ -574,6 +579,24 @@ fn key_any(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool, fo
         if let Node::Group(g) = c
             && (g.match_id == "transform" || g.match_id == effectcraft_project::styles::GROUP)
         {
+            continue;
+        }
+        // A layer's input runs only its first effects: the later ones (a Puppet whose pins are
+        // dragged, #212) don't change it, so it stays cached.
+        if let (Some(n), Node::Group(g)) = (effects, c)
+            && g.match_id == "effects"
+        {
+            let mut first = g.clone();
+            let mut seen = 0;
+            first.children.retain(|e| match e {
+                Node::Prop(_) => true,
+                Node::Group(_) => {
+                    seen += 1;
+                    seen <= n
+                }
+            });
+            hash_debug(&mut h, &first);
+            hash_values(&mut h, ctx, layer, &first);
             continue;
         }
         // Static structure: values, keyframes, expressions, enabled flags, effect ids, modes.

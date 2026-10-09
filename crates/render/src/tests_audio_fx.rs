@@ -214,3 +214,42 @@ fn peak_summary_bins() {
     assert_eq!(peaks.len(), 200);
     assert!((peaks[150][1] - 1.51).abs() < 0.01, "{:?}", peaks[150]);
 }
+
+/// Audio Spectrum reads its Audio Layer's samples at the frame time, so the layer cache keys it
+/// by time: a cached frame after the sound starts matches an uncached render (#209).
+#[test]
+fn audio_spectrum_follows_time_through_the_layer_cache() {
+    fn late_tone(t: f64) -> (f32, f32) {
+        let v = if t < 0.5 { 0.0 } else { (2.0 * std::f64::consts::PI * 1000.0 * t).sin() as f32 };
+        (v, v)
+    }
+    let mut p = Project::default();
+    let comp = Comp::new(64, 64, FrameRate::new(25, 1), Tick::from_seconds_f64(2.0));
+    let audio = p.add_item("x.wav", effectcraft_color::Label::SeaFoam, None, ItemKind::Footage(audio_footage()));
+    let a = build::layer(&mut p, &comp, "a", LayerSource::Footage { item: audio }, (64, 64), None);
+    let sid = p.add_item("S", effectcraft_color::Label::Red, None, ItemKind::Solid(Solid { color: [0.0; 3], width: 64, height: 64, pixel_aspect: 1.0 }));
+    let mut s = build::layer(&mut p, &comp, "s", LayerSource::Solid { item: sid }, (64, 64), None);
+    let spec = effectcraft_effects::find("ec.generate.audiospectrum").unwrap();
+    let mut next = p.next_id;
+    let mut g = effectcraft_effects::instantiate(spec, &mut Ids(&mut next), spec.name, [64.0, 64.0]);
+    p.next_id = next;
+    g.prop_mut("audioLayer").unwrap().value = Value::Layer(Some(a.id.0));
+    s.props.sub_mut("effects").unwrap().children.push(g.into());
+    let mut comp = comp;
+    comp.layers = vec![s, a];
+    let cid = p.add_item("C", effectcraft_color::Label::Sandstone, None, ItemKind::Comp(comp.into()));
+
+    let src = Signal(late_tone);
+    let render = |t: f64, cache: Option<&crate::LayerCache>| {
+        let mut r = crate::Renderer::new(&p, &src, crate::RenderOpts::default());
+        r.cache = cache;
+        r.comp_frame(cid, Tick::from_seconds_f64(t))
+    };
+    let lit = |img: &Image| img.data.iter().filter(|px| px[0] + px[1] + px[2] > 0.1).count();
+    let cache = crate::LayerCache::default();
+    let silent = render(0.0, Some(&cache));
+    let cached = render(0.8, Some(&cache));
+    let fresh = render(0.8, None);
+    assert!(lit(&fresh) > lit(&silent), "the tone draws more than the baseline: {} vs {}", lit(&fresh), lit(&silent));
+    assert_eq!(cached.data, fresh.data, "cached {} px, uncached {} px", lit(&cached), lit(&fresh));
+}

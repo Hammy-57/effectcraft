@@ -82,6 +82,16 @@ pub fn overlay(app: &EffectcraftApp, ctx: &egui::Context, cid: ItemId, layer: &L
     Some(overlay)
 }
 
+/// Keep a pin's keyframed Position in view in the Timeline after placing, moving or recording the
+/// pin in the viewer (#273).
+pub fn reveal_pin(app: &mut EffectcraftApp, layer: LayerId, pin: u64) {
+    let comp = app.session.active_comp();
+    let pos = comp.and_then(|c| c.layer(layer)?.props.find_group(pin)?.get("position")).filter(|p| p.is_animated()).map(|p| p.uid);
+    if let Some(pos) = pos {
+        super::timeline::keep_in_view(app, layer, pos);
+    }
+}
+
 /// Where a pin sits now (layer space): its Position, or (Bend / Starch / Overlap pins) its rest
 /// point carried along by the deformation.
 pub fn pin_position(mesh: &Mesh, def: &[[f64; 2]], p: &Pin) -> [f64; 2] {
