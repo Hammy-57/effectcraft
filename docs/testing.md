@@ -5,6 +5,9 @@ cargo test --workspace     # everything
 cargo xtask ci             # fmt, clippy -D warnings, tests, layers, assets, wasm
 ```
 
+`xtask ci` builds clippy and tests with `--profile ci` (release optimisation without LTO, 16 codegen
+units, output in `target/ci/`): fast to build, still optimised enough for the pixel and perf tests.
+
 ## What the tests cover
 
 - **Engine commands** (`crates/engine/src/tests*.rs`): every command family, including undo and
