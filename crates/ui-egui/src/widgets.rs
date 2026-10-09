@@ -301,6 +301,9 @@ fn field(ui: &mut Ui, rect: Rect, text: &mut String, hint: &str, t: &Tokens, sea
             // As tall as the field, so the text and the hint sit on its middle (they sat high, #581).
             .min_size(inner.size())
             .font(Tokens::ui(12.0))
+            // Fill the field's height so the text and hint centre on the magnifier instead of
+            // hugging the top edge (`vertical_align` only acts within `min_size`).
+            .min_size(inner.size())
             .vertical_align(egui::Align::Center),
     )
 }
