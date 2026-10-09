@@ -73,6 +73,9 @@ pub fn probe_bytes(path: &str, bytes: Arc<[u8]>) -> Result<Footage> {
     if let Some(f) = crate::layered::probe(path, &bytes)? {
         return Ok(f);
     }
+    if let Some(f) = crate::avif::probe(path, &bytes)? {
+        return Ok(f);
+    }
     if crate::MODEL_EXTENSIONS.contains(&ext_of(Path::new(path)).as_str()) {
         return probe_model(path, &bytes, &|_| None);
     }

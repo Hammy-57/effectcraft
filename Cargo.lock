@@ -1420,6 +1420,7 @@ dependencies = [
 name = "effectcraft-media"
 version = "0.6.0"
 dependencies = [
+ "effectcraft-av1enc",
  "effectcraft-model",
  "effectcraft-pdf",
  "effectcraft-project",
@@ -1429,6 +1430,7 @@ dependencies = [
  "effectcraft-svg",
  "effectcraft-time",
  "exr",
+ "filmcraft-av1",
  "filmcraft-codecs",
  "filmcraft-color",
  "filmcraft-frame",
