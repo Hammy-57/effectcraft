@@ -215,9 +215,19 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
         Icon::FrameBlend if rect.width() <= 13.0 => Some("layer-frameblend"),
         Icon::MotionBlur if rect.width() <= 13.0 => Some("layer-motionblur"),
         Icon::Comp => Some("layer-comp"),
+        Icon::Folder => Some("item-folder"),
+        Icon::Image => Some("item-still"),
+        Icon::Footage => Some("item-video"),
+        Icon::Audio => Some("item-audio"),
         _ => None,
     };
-    if local.is_some_and(|name| crate::local_assets::paint(painter, rect, name, color)) {
+    // AE draws video and audio items in their own colour (violet film, green waveform):
+    // those images keep their colours and take only the caller's opacity.
+    let tint = match icon {
+        Icon::Footage | Icon::Audio => Color32::from_white_alpha(color.a()),
+        _ => color,
+    };
+    if local.is_some_and(|name| crate::local_assets::paint(painter, rect, name, tint)) {
         return;
     }
     if paint_generated(painter, rect, icon, color) {

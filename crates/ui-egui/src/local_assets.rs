@@ -52,7 +52,8 @@ pub(crate) fn icon(ctx: &Context, name: &str) -> Option<TextureHandle> {
         return cached;
     }
     let texture = read_image(name).map(|image| {
-        let pixels = image.pixels().map(|p| Color32::from_white_alpha(p.0[3])).collect();
+        // White-on-alpha masks take the caller's tint; coloured artwork keeps its colours.
+        let pixels = image.pixels().map(|p| Color32::from_rgba_unmultiplied(p.0[0], p.0[1], p.0[2], p.0[3])).collect();
         ctx.load_texture(name, egui::ColorImage::new([image.width() as usize, image.height() as usize], pixels), egui::TextureOptions::LINEAR)
     });
     ctx.data_mut(|d| d.insert_temp(id, texture.clone()));
