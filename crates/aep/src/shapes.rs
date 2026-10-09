@@ -29,12 +29,16 @@ pub(crate) fn native_match(ae: &str) -> Option<&'static str> {
         "ADBE Vector Shape Direction" => "direction",
         "ADBE Vector Blend Mode" => "blend",
         "ADBE Vector Composite Order" | "ADBE Vector Repeater Order" => "composite",
-        "ADBE Vector Anchor" => "anchor",
-        "ADBE Vector Position" | "ADBE Vector Rect Position" | "ADBE Vector Ellipse Position" | "ADBE Vector Star Position" => "position",
-        "ADBE Vector Scale" => "scale",
+        "ADBE Vector Anchor" | "ADBE Vector Repeater Anchor" => "anchor",
+        "ADBE Vector Position"
+        | "ADBE Vector Rect Position"
+        | "ADBE Vector Ellipse Position"
+        | "ADBE Vector Star Position"
+        | "ADBE Vector Repeater Position" => "position",
+        "ADBE Vector Scale" | "ADBE Vector Repeater Scale" => "scale",
         "ADBE Vector Skew" => "skew",
         "ADBE Vector Skew Axis" => "skewAxis",
-        "ADBE Vector Rotation" | "ADBE Vector Star Rotation" => "rotation",
+        "ADBE Vector Rotation" | "ADBE Vector Star Rotation" | "ADBE Vector Repeater Rotation" => "rotation",
         "ADBE Vector Group Opacity" | "ADBE Vector Fill Opacity" | "ADBE Vector Stroke Opacity" => "opacity",
         "ADBE Vector Rect Size" | "ADBE Vector Ellipse Size" => "size",
         "ADBE Vector Rect Roundness" => "roundness",
@@ -71,6 +75,8 @@ pub(crate) fn native_match(ae: &str) -> Option<&'static str> {
         "ADBE Vector Trim Offset" | "ADBE Vector Repeater Offset" => "offset",
         "ADBE Vector Trim Type" | "ADBE Vector Merge Type" => "mode",
         "ADBE Vector Repeater Copies" => "copies",
+        "ADBE Vector Repeater Opacity 1" => "startOpacity",
+        "ADBE Vector Repeater Opacity 2" => "endOpacity",
         "ADBE Vector RoundCorner Radius" => "radius",
         "ADBE Vector PuckerBloat Amount" => "amount",
         "ADBE Vector Twist Angle" => "angle",
