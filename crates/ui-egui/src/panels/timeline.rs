@@ -1518,7 +1518,11 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         } else {
             format!("{:02}:{:02}f", fno / fps_i, fno % fps_i)
         };
-        pr.text(pos2(x + 3.0, ruler.max.y - 16.0), Align2::LEFT_CENTER, label, Tokens::ui(10.0), t.tl_ruler_text);
+        // A label that would run under the marker bin is left out rather than cut to a stray digit.
+        let g = pr.layout_no_wrap(label, Tokens::ui(10.0), t.tl_ruler_text);
+        if x + 3.0 + g.size().x <= bin.min.x {
+            pr.galley(pos2(x + 3.0, ruler.max.y - 16.0 - g.size().y / 2.0), g, t.tl_ruler_text);
+        }
         for k in 1..5 {
             let xx = tm.x(s + secs_per_label * k as f64 / 5.0);
             pr.line_segment([pos2(xx, ruler.max.y - 4.0), pos2(xx, ruler.max.y)], Stroke::new(1.0, t.tl_ruler_tick.gamma_multiply(0.6)));
