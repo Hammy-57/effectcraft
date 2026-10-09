@@ -1231,6 +1231,12 @@ fn import_property(
                 let f = |v: f64| v + 1.0;
                 let value = if let Value::Scalar(v) = value { Value::Scalar(f(v)) } else { value };
                 fill_property(prop, &remapped(ir, f), value, value_type, scale, layer_time, losses, context);
+            } else if match_id == "direction" && matches!(parent.match_id.as_str(), "path" | "rect" | "ellipse" | "star") {
+                // Path Direction is 1 Default / 3 Reversed in AE (2 is normal too); ours is 0 / 1
+                // after the popup adapter's minus one.
+                let f = |v: f64| if v >= 2.5 { 2.0 } else { 1.0 };
+                let value = if let Value::Scalar(v) = value { Value::Scalar(f(v)) } else { value };
+                fill_property(prop, &remapped(ir, f), value, value_type, scale, layer_time, losses, context);
             } else {
                 fill_property(prop, ir, value, value_type, scale, layer_time, losses, context);
             }
@@ -2555,6 +2561,24 @@ mod tests {
         assert!(stroke.sub("dashes").unwrap().children.is_empty());
         let frame = effectcraft_render::render_frame(&project, comp, Tick::ZERO, 1.0);
         assert!(frame.data.iter().any(|pixel| pixel[3] > 0.5));
+    }
+
+    #[test]
+    fn shape_path_direction_reversed_imports_as_reversed() {
+        let ellipse = |d: u32| {
+            serde_json::json!({"kind":"group","match_name":"ADBE Vector Shape - Ellipse","children":[
+                {"kind":"property","match_name":"ADBE Vector Shape Direction","value":d},
+                {"kind":"property","match_name":"ADBE Vector Ellipse Size","value":[40,40]}
+            ]})
+        };
+        let ir = serde_json::json!({"schema_version":1,"items":[{"id":1,"kind":"comp","name":"Main","width":100,"height":100,"duration":2,"layers":[
+        {"id":2,"kind":"ShapeLayer","name":"Dirs","properties":[{"kind":"group","match_name":"ADBE Root Vectors Group","children":[ellipse(1), ellipse(3), ellipse(2)]}]}]}]});
+        let mut project = Project::default();
+        let result = import_ir(&mut project, ir.to_string().as_bytes(), "", &mut |_| None).unwrap();
+        let comp = result.primary_comp.unwrap();
+        let contents = project.comp(comp).unwrap().layers[0].props.sub("contents").unwrap();
+        let dirs: Vec<Value> = contents.groups().filter_map(|g| g.get("direction")).map(|p| p.value.clone()).collect();
+        assert_eq!(dirs, [Value::Enum(0), Value::Enum(1), Value::Enum(0)], "AE 1 Default, 3 Reversed, 2 normal");
     }
 
     #[test]
