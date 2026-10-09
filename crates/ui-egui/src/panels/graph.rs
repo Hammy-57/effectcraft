@@ -617,9 +617,12 @@ fn fit_selection(app: &mut EffectcraftApp, cs: &[Curve], tm: TMap, plot: Rect) {
         }
     }
     let span = (t1 - t0).max(0.2);
-    let pps = (plot.width() as f64 * 0.8 / span).clamp(5.0, 4000.0);
-    app.ui.timeline.pps = Some(pps);
-    app.ui.timeline.start = (t0 - span * 0.1).max(0.0);
+    let pps = plot.width() as f64 * 0.8 / span;
+    // Through the timeline's zoom, so the fit never zooms out past the whole comp.
+    if let Some(comp) = app.session.active_comp_arc() {
+        let fit = super::timeline::fit_pps(plot.width(), &comp);
+        super::timeline::set_zoom(&mut app.ui.timeline, &comp, pps, fit, (t0 - span * 0.1).max(0.0), 0.0);
+    }
     let pad = ((v1 - v0) * 0.15).max(1.0);
     app.ui.timeline.graph_auto_zoom = false;
     app.ui.timeline.graph_range = Some((v0 - pad, v1 + pad));

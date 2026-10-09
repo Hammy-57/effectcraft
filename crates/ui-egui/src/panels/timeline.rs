@@ -404,14 +404,14 @@ const MAX_PPS: f64 = 4000.0;
 pub(crate) const ZOOM_STEP: f64 = 1.5;
 
 /// Pixels per second that fit `comp` in a time graph `width` points wide.
-fn fit_pps(width: f32, comp: &Comp) -> f64 {
+pub(crate) fn fit_pps(width: f32, comp: &Comp) -> f64 {
     (width - 10.0).max(1.0) as f64 / comp.duration.seconds().max(0.01)
 }
 
 /// Zoom the time ruler to `pps` pixels per second, keeping comp time `at_t` at `at_px` pixels
 /// from the ruler's start. Zooming out stops at `fit`, where the whole comp shows (and the
 /// ruler keeps fitting it).
-fn set_zoom(tl: &mut crate::state::TimelineState, comp: &Comp, pps: f64, fit: f64, at_t: f64, at_px: f64) {
+pub(crate) fn set_zoom(tl: &mut crate::state::TimelineState, comp: &Comp, pps: f64, fit: f64, at_t: f64, at_px: f64) {
     let npps = pps.min(MAX_PPS.max(fit)).max(fit);
     if npps <= fit {
         tl.pps = None;
