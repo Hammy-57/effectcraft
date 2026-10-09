@@ -3,7 +3,9 @@
 use effectcraft_color::luminance;
 use effectcraft_keyframe::Value;
 use effectcraft_project::ParamUi;
-use effectcraft_raster::{Image, gaussian_blur, hash_noise, resample};
+#[cfg(test)]
+use effectcraft_raster::resample;
+use effectcraft_raster::{Image, Px, Sparse, gaussian_blur, gaussian_blur_sparse, hash_noise, resample_sparse};
 use rayon::prelude::*;
 
 use crate::{Buf, EffectCtx, EffectSpec, col, num, p, popup, slider};
@@ -283,10 +285,362 @@ fn glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
     b
 }
 
+/// Deep Glow's threshold pass on one premultiplied pixel (Threshold / Threshold Smooth).
+#[inline]
+fn deep_glow_key(px: Px, threshold: f32, smooth: f32) -> Px {
+    let a = px[3];
+    let l = if a > 0.0 { luminance(px[0] / a, px[1] / a, px[2] / a) } else { 0.0 };
+    let k = if smooth > 0.0 {
+        ((l - threshold) / smooth).clamp(0.0, 1.0)
+    } else if l >= threshold {
+        1.0
+    } else {
+        0.0
+    };
+    px.map(|v| v * k)
+}
+
+/// How much of the glow input Deep Glow's Mask Layer keeps at mask pixel `m`.
+#[inline]
+fn deep_glow_mask(m: Px, luma: bool, invert: bool) -> f32 {
+    let mut amount = if luma && m[3] > 0.0 { luminance(m[0] / m[3], m[1] / m[3], m[2] / m[3]) * m[3] } else { m[3] };
+    if invert {
+        amount = 1.0 - amount;
+    }
+    amount.clamp(0.0, 1.0)
+}
+
+/// Deep Glow's display → linear conversion of one pixel (Unmult: of the values as seen over
+/// black, else of the unpremultiplied colour).
+#[inline]
+fn deep_glow_to_linear(px: &mut Px, unmult: bool) {
+    let a = px[3];
+    if unmult {
+        for v in px.iter_mut().take(3) {
+            *v = effectcraft_color::srgb_to_linear(v.clamp(0.0, 1.0));
+        }
+    } else if a > 0.0 {
+        for v in px.iter_mut().take(3) {
+            *v = effectcraft_color::srgb_to_linear((*v / a).clamp(0.0, 1.0)) * a;
+        }
+    }
+}
+
+/// Whether every channel of every pixel of `px` is ±0 (a branch-free scan that vectorises).
+#[inline]
+fn all_zero(px: &[Px]) -> bool {
+    px.iter().fold(0u32, |acc, p| acc | p[0].to_bits() | p[1].to_bits() | p[2].to_bits() | p[3].to_bits()) & 0x7fff_ffff == 0
+}
+
+/// Pixels per block when skipping transparent runs.
+const ZERO_RUN: usize = 32;
+
+/// Bounding box `[x0, x1) × [y0, y1)` of the pixels of `img` for which `nonzero` holds (which
+/// must be false for transparent pixels), and for each row whether it is entirely ±0.
+fn bounding_box(img: &Image, nonzero: impl Fn(&Px) -> bool + Sync) -> (Option<(u32, u32, u32, u32)>, Vec<bool>) {
+    let w = img.width.max(1) as usize;
+    let rows: Vec<(bool, Option<(usize, usize)>)> = img
+        .data
+        .par_chunks(w)
+        .map(|row| {
+            if all_zero(row) {
+                return (true, None);
+            }
+            let find = |(i, chunk): (usize, &[Px]), last: bool| -> Option<usize> {
+                if all_zero(chunk) {
+                    return None;
+                }
+                let at = if last { chunk.iter().rposition(&nonzero) } else { chunk.iter().position(&nonzero) };
+                at.map(|x| i * ZERO_RUN + x)
+            };
+            let x0 = row.chunks(ZERO_RUN).enumerate().find_map(|c| find(c, false));
+            let x1 = row.chunks(ZERO_RUN).enumerate().rev().find_map(|c| find(c, true));
+            (false, x0.zip(x1).map(|(a, b)| (a, b + 1)))
+        })
+        .collect();
+    let bbox = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(y, r)| r.1.map(|(x0, x1)| (x0 as u32, y as u32, x1 as u32, y as u32 + 1)))
+        .reduce(|a, b| (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3)));
+    (bbox, rows.into_iter().map(|r| r.0).collect())
+}
+
 /// Editable, clean-room approximation of Plugin Everything Deep Glow v1. The public product
 /// description specifies a wide inverse-square-like falloff; three Gaussian scales approximate
 /// that profile without depending on the third-party plug-in.
+///
+/// The glow input is non-zero only around the layer's bright content, so the blurs and
+/// resamples run on that rectangle ([`Sparse`]) instead of the whole padded frame, and the
+/// conversions, composite, Unmult and Dither run in one pass over the frame.
 fn deep_glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
+    let radius = (ctx.params.f("PEDG-0001") * b.scale).clamp(0.0, 2000.0);
+    if !radius.is_finite() || radius < 0.5 {
+        return b;
+    }
+    // Mode 2 is the expanded transparent-edge setting found in every SceneYard instance.
+    let edge = ctx.params.e("PEDG-0055");
+    let wanted_pad = if edge == 0 || ctx.adjustment { 0 } else { (radius * if ctx.params.e("PEDG-0084") == 1 { 1.5 } else { 1.0 }).ceil() as u32 };
+    // Keep the output bounded, but still render a glow when its full expansion will not fit.
+    let mut low = 0;
+    let mut high = wanted_pad;
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        let width = u64::from(b.img.width) + 2 * u64::from(mid);
+        let height = u64::from(b.img.height) + 2 * u64::from(mid);
+        if width * height <= 16_000_000 {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    let pad = low;
+    if pad > 0 {
+        b.pad(pad);
+    }
+    let threshold = (ctx.params.f("PEDG-0004") / 100.0).max(0.0) as f32;
+    let smooth = (ctx.params.f("PEDG-0005") / 100.0).max(0.0) as f32;
+    let mask = ctx.layer_param("PEDG-0056", true).map(|layer| crate::util::fit_layer(ctx, &b, &layer, false));
+    let luma = ctx.params.e("PEDG-0057") == 1;
+    let invert = ctx.params.b("PEDG-0059");
+    let masked = |px: Px, x: usize, y: usize| -> Px {
+        let px = deep_glow_key(px, threshold, smooth);
+        match &mask {
+            Some(m) => {
+                let amount = deep_glow_mask(m.get(x as i64, y as i64), luma, invert);
+                px.map(|v| v * amount)
+            }
+            None => px,
+        }
+    };
+    // AE View 1 (native index 0) previews the glow input; View 2 renders the final composite.
+    if ctx.params.e("PEDG-0023") == 0 {
+        b.img.rows_mut().for_each(|(y, row)| {
+            for (x, px) in row.iter_mut().enumerate() {
+                *px = masked(*px, x, y);
+            }
+        });
+        return b;
+    }
+    // Gamma Correction (Auto Detect, on in every SceneYard instance): the glow is built and
+    // composited in linear light. Measured with aerender on a solid pill (Radius 100 / 439,
+    // Exposure 0.3 / 1 / 1.35): three Gaussians of 0.003, 0.03 and 0.12 × Radius weighted
+    // 6.6 / 2.54 / 1.30, scaled by Exposure^0.75. Without it, the older display-space profile.
+    let linear_model = ctx.params.b("PEDG-0043") || ctx.params.b("PEDG-0009");
+    let convert = linear_model && !ctx.env.working_linear;
+    // With Unmult the glow works on the layer as seen over black (premultiplied values), so a
+    // pixel the glow does not touch comes back unchanged.
+    let unmult = ctx.params.b("PEDG-0025");
+    // The glow input, kept to the rectangle around its non-zero pixels (a mask only removes).
+    let (fw, fh) = (b.img.width, b.img.height);
+    let (bbox, zero_rows) = bounding_box(&b.img, |px| *px != [0.0; 4] && deep_glow_key(*px, threshold, smooth) != [0.0; 4]);
+    let source = match bbox {
+        Some((x0, y0, x1, y1)) => {
+            let mut img = Image::new(x1 - x0, y1 - y0);
+            let src = &b.img;
+            img.rows_mut().for_each(|(ry, row)| {
+                let y = y0 as usize + ry;
+                let srow = &src.data[y * fw as usize + x0 as usize..y * fw as usize + x1 as usize];
+                for (rx, (px, s)) in row.iter_mut().zip(srow).enumerate() {
+                    *px = masked(*s, x0 as usize + rx, y);
+                    if convert {
+                        deep_glow_to_linear(px, unmult);
+                    }
+                }
+            });
+            Sparse { img, x: x0, y: y0, width: fw, height: fh }
+        }
+        None => Sparse::empty(fw, fh),
+    };
+    drop(mask);
+    let spread = (ctx.params.f("PEDG-0011") / 100.0).clamp(0.0, 1.0) as f32;
+    let near = (0.30 - 0.35 * spread).max(0.05);
+    let far = 0.30 + 0.44 * spread;
+    // A broad, unnormalised halo keeps thin bright strokes visible far from their source.
+    // In Screen mode the near-core term is not added (AE's Screen render keeps the inside of a
+    // glowing shape near its own colour; its halo outside matches Add).
+    let core = if ctx.params.e("PEDG-0008") == 0 { 3.0 } else { 6.6 };
+    let weights = if linear_model { [core, 2.54, 1.30] } else { [near * 13.5, (1.0 - near - far) * 13.5, far * 13.5] };
+    let sigmas = if linear_model { [0.003, 0.03, 0.12] } else { [0.035, 0.14, 0.42] };
+    let aspect = ctx.params.f("PEDG-0010").clamp(0.0, 2.0);
+    let chroma = if ctx.params.b("PEDG-0013") { ctx.params.f("PEDG-0015").clamp(0.0, 2.0) as f32 } else { 0.0 };
+    let downsample = (ctx.params.f("PEDG-0019") / 100.0).clamp(0.1, 1.0);
+    // Very wide glows run at a reduced working resolution; the final halo is enlarged once.
+    // Radii at or below 512 retain the calibrated full-resolution path exactly.
+    let work_scale = (512.0 / radius).min(1.0);
+    let work_source = if work_scale < 1.0 {
+        let w = ((fw as f64 * work_scale).round() as u32).max(1);
+        let h = ((fh as f64 * work_scale).round() as u32).max(1);
+        resample_sparse(&source, w, h)
+    } else {
+        source
+    };
+    let (ww, wh) = (work_source.width, work_source.height);
+    let blurred: Vec<Sparse> = sigmas
+        .into_iter()
+        .enumerate()
+        .map(|(step, sigma)| {
+            let (sx, sy) = (radius * work_scale * sigma * aspect, radius * work_scale * sigma * (2.0 - aspect));
+            if step == 2 && downsample < 0.999 {
+                let (w, h) = ((ww as f64 * downsample).round().max(1.0) as u32, (wh as f64 * downsample).round().max(1.0) as u32);
+                let small = resample_sparse(&work_source, w, h);
+                resample_sparse(&gaussian_blur_sparse(&small, sx * downsample, sy * downsample), ww, wh)
+            } else {
+                gaussian_blur_sparse(&work_source, sx, sy)
+            }
+        })
+        .collect();
+    drop(work_source);
+    // The weighted passes summed on the union of their rectangles.
+    let union = blurred
+        .iter()
+        .filter(|s| !s.img.is_empty())
+        .map(|s| {
+            let (ex, ey) = s.end();
+            (s.x, s.y, ex, ey)
+        })
+        .reduce(|a, c| (a.0.min(c.0), a.1.min(c.1), a.2.max(c.2), a.3.max(c.3)));
+    let halo = match union {
+        Some((x0, y0, x1, y1)) => {
+            let mut img = Image::new(x1 - x0, y1 - y0);
+            img.rows_mut().for_each(|(ry, row)| {
+                let y = y0 + ry as u32;
+                for (step, (part, weight)) in blurred.iter().zip(weights).enumerate() {
+                    let (ex, ey) = part.end();
+                    if part.img.is_empty() || y < part.y || y >= ey {
+                        continue;
+                    }
+                    let fringe = [[1.0, 1.0, 1.0 + chroma][step], 1.0, [1.0 + chroma, 1.0, 1.0][step], 1.0];
+                    let pw = part.img.width as usize;
+                    let start = (y - part.y) as usize * pw;
+                    let prow = &part.img.data[start..start + pw];
+                    let off = (part.x - x0) as usize;
+                    for (out, px) in row[off..off + (ex - part.x) as usize].iter_mut().zip(prow) {
+                        for c in 0..4 {
+                            out[c] += px[c] * weight * fringe[c];
+                        }
+                    }
+                }
+            });
+            Sparse { img, x: x0, y: y0, width: ww, height: wh }
+        }
+        None => Sparse::empty(ww, wh),
+    };
+    drop(blurred);
+    let halo = if work_scale < 1.0 { resample_sparse(&halo, fw, fh) } else { halo };
+    let exposure = ctx.params.f("PEDG-0002").clamp(0.0, 64.0) as f32;
+    let exposure = if linear_model { exposure.powf(0.75) } else { exposure };
+    let source_opacity = (ctx.params.f("PEDG-0024") / 100.0).clamp(0.0, 1.0) as f32;
+    let screen = ctx.params.e("PEDG-0008") == 0;
+    let tint = ctx.params.b("PEDG-0037");
+    let tint_color = ctx.params.color("PEDG-0038");
+    let tint_mode = ctx.params.e("PEDG-0039");
+    let tint_mix = (ctx.params.f("PEDG-0041") / 100.0).clamp(0.0, 1.0) as f32;
+    let dither = ctx.params.b("PEDG-0031");
+    let dither_amount = (ctx.params.f("PEDG-0033") / 100.0).clamp(0.0, 1.0) as f32 / 255.0;
+    let monochrome = ctx.params.b("PEDG-0032");
+    let seed = ctx.seed;
+    // One pixel of the final composite: the original (to linear), plus the exposed, tinted
+    // glow, back to display values, Unmult's alpha, then Dither.
+    let finish = |px: Px, glow: Px, x: u32, y: u32| -> Px {
+        let mut original = px;
+        if convert {
+            deep_glow_to_linear(&mut original, unmult);
+        }
+        let mut out = original;
+        for c in 0..3 {
+            let mut g = glow[c] * exposure;
+            if tint {
+                let t = tint_color[c];
+                let tinted = match tint_mode {
+                    1 if g <= 0.5 => 2.0 * g * t,
+                    1 => 1.0 - 2.0 * (1.0 - g) * (1.0 - t),
+                    2 if t <= 0.5 => g - (1.0 - 2.0 * t) * g * (1.0 - g),
+                    2 => g + (2.0 * t - 1.0) * ((if g <= 0.25 { ((16.0 * g - 12.0) * g + 4.0) * g } else { g.sqrt() }) - g),
+                    _ => g * t,
+                };
+                g += (tinted - g) * tint_mix;
+            }
+            let s = original[c] * source_opacity;
+            out[c] = if screen { (s + g - s * g).clamp(0.0, 1.0) } else { s + g };
+        }
+        // With Unmult the glow's alpha is its brightness (set below), not its summed coverage:
+        // the weighted passes add up to ~10× the source alpha, which would turn a faint halo
+        // into an opaque dark one.
+        out[3] = if unmult { original[3] * source_opacity } else { glow[3] * exposure + original[3] * source_opacity }.clamp(0.0, 1.0);
+        if convert {
+            // Back to display values as seen over black (what AE shows); with Unmult the glow's
+            // alpha follows its brightness, so a faint halo is not darkened by premultiplication.
+            let a = out[3];
+            if unmult {
+                for v in out.iter_mut().take(3) {
+                    *v = effectcraft_color::linear_to_srgb(v.clamp(0.0, 1.0));
+                }
+            } else if a > 0.0 {
+                for v in out.iter_mut().take(3) {
+                    *v = effectcraft_color::linear_to_srgb((*v / a).max(0.0)).min(1.0) * a;
+                }
+            }
+        }
+        if unmult {
+            // Unmult: the result as seen over black, with alpha = its brightest channel (black is
+            // transparent), so a faint halo over a light background stays light. SceneYard's "Magic
+            // button item reveal" (Radius 500 over near-white): frame MAE vs AE 0.080 → 0.024.
+            out[3] = out[3].max(out[0].max(out[1]).max(out[2])).clamp(0.0, 1.0);
+        } else {
+            out[3] = 1.0;
+        }
+        if dither && out[3] >= 0.999 {
+            for c in 0..3u32 {
+                let n = (hash_noise(x.wrapping_add(if monochrome { 0 } else { c.wrapping_mul(fw) }), y, seed) - 0.5) * dither_amount;
+                out[c as usize] = (out[c as usize] + n).max(0.0);
+            }
+        }
+        out
+    };
+    // Pixels with neither content nor glow are left as they are when that is the result, so
+    // transparent rows and runs outside the halo are skipped without per-pixel work.
+    let keep_empty = finish([0.0; 4], [0.0; 4], 0, 0) == [0.0; 4];
+    let (hx1, hy1) = halo.end();
+    let (hx0, hy0) = (halo.x.min(hx1) as usize, halo.y);
+    let hw = halo.img.width as usize;
+    b.img.rows_mut().for_each(|(y, row)| {
+        let in_halo = !halo.img.is_empty() && (hy0..hy1).contains(&(y as u32));
+        if keep_empty && !in_halo && zero_rows.get(y).copied().unwrap_or(false) {
+            return;
+        }
+        let (gx0, gx1) = if in_halo { (hx0, hx1 as usize) } else { (0, 0) };
+        let glow_row = if in_halo { &halo.img.data[(y - hy0 as usize) * hw..(y - hy0 as usize + 1) * hw] } else { &[] };
+        let y = y as u32;
+        // Outside the halo: the original alone.
+        let plain = |px: &mut [Px], x0: usize| {
+            for (i, chunk) in px.chunks_mut(ZERO_RUN).enumerate() {
+                if keep_empty && all_zero(chunk) {
+                    continue;
+                }
+                for (j, p) in chunk.iter_mut().enumerate() {
+                    if !(keep_empty && *p == [0.0; 4]) {
+                        *p = finish(*p, [0.0; 4], (x0 + i * ZERO_RUN + j) as u32, y);
+                    }
+                }
+            }
+        };
+        let (left, rest) = row.split_at_mut(gx0.min(row.len()));
+        let (mid, right) = rest.split_at_mut((gx1 - gx0).min(rest.len()));
+        plain(left, 0);
+        for (i, (p, glow)) in mid.iter_mut().zip(glow_row).enumerate() {
+            if !(keep_empty && *p == [0.0; 4] && *glow == [0.0; 4]) {
+                *p = finish(*p, *glow, (gx0 + i) as u32, y);
+            }
+        }
+        plain(right, gx1);
+    });
+    b
+}
+
+/// The full-frame implementation [`deep_glow`] replaced (reference for its tests).
+#[cfg(test)]
+fn deep_glow_reference(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let radius = (ctx.params.f("PEDG-0001") * b.scale).clamp(0.0, 2000.0);
     if !radius.is_finite() || radius < 0.5 {
         return b;
@@ -1356,6 +1710,130 @@ mod tests {
         }
     }
 
+    /// A comp-sized frame (1920 × 1080 at `scale`) holding one anti-aliased ~200 px ring, like
+    /// a shape layer's layer image.
+    fn ring_frame(scale: f64) -> Image {
+        let (w, h) = ((1920.0 * scale).round() as u32, (1080.0 * scale).round() as u32);
+        let mut img = Image::new(w, h);
+        let (cx, cy) = (w as f64 * 0.45, h as f64 * 0.55);
+        let (outer, inner) = (100.0 * scale, 80.0 * scale);
+        for y in 0..h {
+            for x in 0..w {
+                let d = ((x as f64 + 0.5 - cx).powi(2) + (y as f64 + 0.5 - cy).powi(2)).sqrt();
+                let a = ((outer - d + 0.5).clamp(0.0, 1.0) * (d - inner + 0.5).clamp(0.0, 1.0)) as f32;
+                if a > 0.0 {
+                    img.set(x, y, [0.95 * a, 0.45 * a, 0.12 * a, a]);
+                }
+            }
+        }
+        img
+    }
+
+    /// Deep Glow's defaults overridden by `vals` (Elias's case: Radius 150, Exposure 0.01).
+    fn deep_glow_params(vals: &[(&str, Value)], size: [f64; 2]) -> crate::Params {
+        let spec = crate::find("ec.stylize.deepglow");
+        let mut params =
+            crate::Params { values: spec.map(|s| s.params.iter().map(|p| (p.id.to_string(), crate::default_value(p, size))).collect()).unwrap_or_default() };
+        for (k, v) in [("PEDG-0001", num(150.0)), ("PEDG-0002", num(0.01))].iter().chain(vals) {
+            assert!(params.values.contains_key(*k), "unknown param {k}");
+            params.values.insert(k.to_string(), v.clone());
+        }
+        params
+    }
+
+    fn run_deep_glow(f: fn(&EffectCtx, Buf) -> Buf, params: &crate::Params, img: &Image, scale: f64, env: EffectEnv) -> Buf {
+        let layer_size = [img.width as f64 / scale, img.height as f64 / scale];
+        let ctx = EffectCtx { params, time: 0.0, layer_size, seed: 7, adjustment: false, env };
+        f(&ctx, Buf { img: img.clone(), offset: [0.0, 0.0], scale })
+    }
+
+    /// Largest per-channel difference between the new and the reference Deep Glow.
+    fn deep_glow_diff(vals: &[(&str, Value)], img: &Image, scale: f64, env: EffectEnv) -> f32 {
+        let params = deep_glow_params(vals, [img.width as f64 / scale, img.height as f64 / scale]);
+        let new = run_deep_glow(deep_glow, &params, img, scale, env);
+        let old = run_deep_glow(deep_glow_reference, &params, img, scale, env);
+        assert_eq!((new.img.width, new.img.height, new.offset), (old.img.width, old.img.height, old.offset));
+        new.img.data.iter().zip(&old.img.data).flat_map(|(p, q)| (0..4).map(move |c| (p[c] - q[c]).abs())).fold(0.0, f32::max)
+    }
+
+    /// The content-rectangle Deep Glow renders what the full-frame one did: on Elias's case
+    /// (Radius 150, Exposure 0.01, defaults: Unmult, Dither, Auto Detect Gamma, Downsample 80,
+    /// Edge Behaviour 1) at Full and Quarter resolution, and with the other options.
+    #[test]
+    fn deep_glow_matches_full_frame_reference() {
+        // Float rounding only (box sums restart per crop), far under one 8-bit level.
+        const TOLERANCE: f32 = 1e-4;
+        for scale in [1.0, 0.25] {
+            let d = deep_glow_diff(&[], &ring_frame(scale), scale, EffectEnv::default());
+            println!("scale {scale}: max abs diff {d:e}");
+            assert!(d < TOLERANCE, "scale {scale}: {d}");
+        }
+        let small = ring_frame(0.3);
+        let options: [&[(&str, Value)]; 11] = [
+            &[("PEDG-0025", Value::Bool(false))],
+            &[("PEDG-0031", Value::Bool(false)), ("PEDG-0008", Value::Enum(1)), ("PEDG-0002", num(1.5))],
+            &[("PEDG-0043", Value::Bool(false))],
+            &[("PEDG-0019", num(30.0)), ("PEDG-0010", num(0.4))],
+            &[("PEDG-0019", num(100.0)), ("PEDG-0013", Value::Bool(true))],
+            &[("PEDG-0001", num(1500.0)), ("PEDG-0002", num(1.0))],
+            &[("PEDG-0004", num(60.0)), ("PEDG-0005", num(20.0))],
+            &[("PEDG-0037", Value::Bool(true)), ("PEDG-0039", Value::Enum(2)), ("PEDG-0024", num(40.0))],
+            &[("PEDG-0055", num(0.0))],
+            &[("PEDG-0023", Value::Enum(0))],
+            &[("PEDG-0004", num(1600.0))],
+        ];
+        for vals in options {
+            let d = deep_glow_diff(vals, &small, 1.0, EffectEnv::default());
+            assert!(d < TOLERANCE, "{vals:?}: {d}");
+        }
+        let d = deep_glow_diff(&[], &small, 1.0, EffectEnv { working_linear: true, ..Default::default() });
+        assert!(d < TOLERANCE, "linear working space: {d}");
+        // A Mask Layer (here an opaque one, inverted and not).
+        let host = crate::channel2::tests::FakeHost(Image::filled(small.width, small.height, [1.0; 4]));
+        for invert in [false, true] {
+            let env = EffectEnv { host: Some(&host), ..Default::default() };
+            let d = deep_glow_diff(&[("PEDG-0056", Value::Layer(Some(7))), ("PEDG-0059", Value::Bool(invert))], &small, 1.0, env);
+            assert!(d < TOLERANCE, "mask invert {invert}: {d}");
+        }
+        // Content at the frame edge, and an empty layer.
+        let mut edge = Image::new(300, 200);
+        for y in 0..200 {
+            for x in 0..12 {
+                edge.set(x, y, [0.8, 0.8, 0.8, 1.0]);
+            }
+        }
+        for vals in [&[("PEDG-0055", num(0.0))][..], &[]] {
+            assert!(deep_glow_diff(vals, &edge, 1.0, EffectEnv::default()) < TOLERANCE);
+        }
+        assert_eq!(deep_glow_diff(&[], &Image::new(64, 48), 1.0, EffectEnv::default()), 0.0);
+    }
+
+    /// Timing of the new and the full-frame Deep Glow on Elias's case (run in release:
+    /// `cargo test --release -p effectcraft-effects -- --ignored --nocapture deep_glow_bench`).
+    #[test]
+    #[ignore]
+    fn deep_glow_bench() {
+        let time = |f: fn(&EffectCtx, Buf) -> Buf, params: &crate::Params, img: &Image, scale: f64| {
+            let mut ms: Vec<f64> = (0..7)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    std::hint::black_box(run_deep_glow(f, params, img, scale, EffectEnv::default()));
+                    t.elapsed().as_secs_f64() * 1000.0
+                })
+                .collect();
+            ms.sort_by(f64::total_cmp);
+            ms[ms.len() / 2]
+        };
+        for scale in [1.0, 0.5, 0.25] {
+            // The layer image is comp-sized at every resolution (1920 × 1080 at Full).
+            let img = ring_frame(scale);
+            let params = deep_glow_params(&[], [1920.0, 1080.0]);
+            let old = time(deep_glow_reference, &params, &img, scale);
+            let new = time(deep_glow, &params, &img, scale);
+            println!("deep_glow {}x{} scale {scale}: old {old:.2} ms, new {new:.2} ms ({:.1}x)", img.width, img.height, old / new);
+        }
+    }
+
     #[test]
     fn deep_glow_renders_radius_above_512() {
         let mut impulse = Image::new(9, 9);
@@ -1363,6 +1841,8 @@ mod tests {
         let wide = run_fx("ec.stylize.deepglow", &[("PEDG-0001", num(1603.0)), ("PEDG-0031", Value::Bool(false))], impulse, 0.0, EffectEnv::default());
         assert_eq!(wide.offset, [1603.0; 2]);
         assert_eq!(wide.img.width, 3215);
-        assert!(wide.img.get(2407, 1607)[0] > 0.0, "the 1603 px glow reaches 800 px from its source");
+        // The widest Gaussian's three boxes reach ~3.6 sigma (~580 px here); past that the
+        // full-frame blur only left a 1e-10 running-sum residue.
+        assert!(wide.img.get(2107, 1607)[0] > 1e-6, "the 1603 px glow reaches 500 px from its source");
     }
 }
