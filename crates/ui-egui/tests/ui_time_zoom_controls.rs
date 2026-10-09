@@ -142,17 +142,30 @@ fn graph_curves_follow_the_time_zoom_and_the_navigator() {
 }
 
 #[test]
-fn switching_between_layer_bars_and_graph_keeps_the_time_zoom() {
+fn leaving_the_graph_keeps_its_time_zoom() {
     let mut h = harness(false);
-    send(&mut h, "ui.key", json!({"key": "="}));
-    send(&mut h, "ui.key", json!({"key": "="}));
-    let before = view(&h);
+    // Opening the Graph Editor fits the graphs (ui_graph_fit); the zoom set there stays.
     send(&mut h, "ui.click", json!({"id": "timeline.switch.graph"}));
     assert!(h.state().ui.timeline.graph_editor);
-    assert_eq!(view(&h), before);
-    send(&mut h, "ui.key", json!({"key": "-"}));
+    send(&mut h, "ui.key", json!({"key": "="}));
     let graph = view(&h);
     send(&mut h, "ui.click", json!({"id": "timeline.switch.graph"}));
     assert!(!h.state().ui.timeline.graph_editor);
     assert_eq!(view(&h), graph);
+}
+
+#[test]
+fn azerty_physical_zoom_keys_zoom_the_graph() {
+    let mut h = harness(true);
+    // The "Elias AE"-style bindings: AZERTY's - (US 6 position) zooms in, ) (US minus) out.
+    for (command, keys) in [("timeline.zoomIn", "Physical+6"), ("timeline.zoomOut", "Physical+Minus")] {
+        h.state_mut().session.execute("shortcuts.set", json!({"command": command, "keys": keys})).unwrap();
+    }
+    let (_, span0) = view(&h);
+    send(&mut h, "ui.key", json!({"key": "Physical+6"}));
+    let (_, span1) = view(&h);
+    assert!(span1 < span0 * 0.8, "Physical+6 zooms the graph in: {span0} -> {span1}");
+    send(&mut h, "ui.key", json!({"key": "Physical+Minus"}));
+    let (_, span2) = view(&h);
+    assert!(span2 > span1 * 1.2, "Physical+Minus zooms the graph out: {span1} -> {span2}");
 }
