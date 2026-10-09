@@ -14,7 +14,7 @@ use effectcraft_engine::time::Tick;
 use egui::{Align2, Color32, Pos2, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
 use serde_json::json;
 
-use crate::icons::{self, Icon};
+use crate::icons::{self, Icon, SourceIcon};
 use crate::theme::Tokens;
 use crate::{EffectcraftApp, widgets};
 
@@ -972,28 +972,32 @@ fn push_group(rows: &mut Vec<Row>, l: &Layer, g: &PropGroup, depth: usize, open:
     }
 }
 
-fn layer_icon(l: &Layer, project: &effectcraft_engine::project::Project) -> Icon {
-    match &l.source {
+/// The icon After Effects shows before a layer's name: the layer-type glyph (text, shape,
+/// camera, light), the source item's icon (comp, footage, still, audio, 3D model), or for solids,
+/// adjustment layers and nulls a swatch of the source solid's colour (nulls: white).
+pub fn layer_icon(l: &Layer, project: &effectcraft_engine::project::Project) -> SourceIcon {
+    let glyph = match &l.source {
         LayerSource::Text => Icon::TextLayer,
         LayerSource::Shape => Icon::ShapeLayer,
-        LayerSource::Null => Icon::Null,
+        LayerSource::Null => return SourceIcon::Swatch(Color32::WHITE),
         LayerSource::Camera => Icon::Camera,
         LayerSource::Light { .. } => Icon::Light,
-        LayerSource::Model { .. } | LayerSource::Primitive { .. } => Icon::Cube,
+        LayerSource::Model { .. } => Icon::Model,
+        LayerSource::Primitive { .. } => Icon::Primitive,
         LayerSource::Comp { .. } => Icon::Comp,
-        LayerSource::Solid { .. } => {
-            if l.switches.adjustment {
-                Icon::Adjustment
-            } else {
-                Icon::Solid
-            }
+        LayerSource::Solid { item } => {
+            return match project.item(*item).map(|i| &i.kind) {
+                Some(effectcraft_engine::project::ItemKind::Solid(s)) => SourceIcon::swatch(s.color),
+                _ => SourceIcon::Swatch(Color32::WHITE),
+            };
         }
         LayerSource::Footage { item } => match project.item(*item).map(|i| i.type_name()) {
             Some("Image") | Some("Image Sequence") => Icon::Image,
             Some("Audio") => Icon::Audio,
             _ => Icon::Footage,
         },
-    }
+    };
+    SourceIcon::Glyph(glyph)
 }
 
 /// Layers being dragged to a new place in the stack (timeline rows).
@@ -1645,7 +1649,12 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     ui_actions.push(UiAct::ToggleLayer(layer.id.0, ui.input(|i| i.modifiers.alt || i.modifiers.command)));
                 }
                 app.auto.add(&format!("timeline.layer.{}.twirl", layer.id.0), tw, "twirl");
-                icons::paint(&lp, Rect::from_center_size(pos2(cw.name + 24.0, cy), vec2(13.0, 13.0)), layer_icon(layer, &app.session.project), t.text_dim);
+                icons::paint_source(
+                    &lp,
+                    Rect::from_center_size(pos2(cw.name + 24.0, cy), vec2(13.0, 13.0)),
+                    layer_icon(layer, &app.session.project),
+                    t.text_dim,
+                );
                 let name_rect = Rect::from_min_max(pos2(cw.name + 34.0, r.min.y), pos2(cw.name_end - 4.0, r.max.y));
                 let rename_id = egui::Id::new("tl-rename");
                 let renaming: Option<(u64, String)> = ctx.data(|d| d.get_temp(rename_id));

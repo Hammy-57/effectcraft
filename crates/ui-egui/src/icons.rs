@@ -73,6 +73,10 @@ pub enum Icon {
     Null,
     Camera,
     Light,
+    /// A 3D model item / layer (AE's cube outline).
+    Model,
+    /// A parametric 3D primitive layer (Advanced 3D).
+    Primitive,
     // ui
     Search,
     Trash,
@@ -197,6 +201,36 @@ impl Pen16<'_> {
     }
 }
 
+/// The icon After Effects shows for a layer source or project item: a glyph, or (solids, nulls
+/// and adjustment layers) a square swatch filled with the solid's colour.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceIcon {
+    Glyph(Icon),
+    Swatch(Color32),
+}
+
+impl SourceIcon {
+    /// A swatch from a solid's 0..1 RGB colour.
+    pub fn swatch(rgb: [f32; 3]) -> Self {
+        let c = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+        SourceIcon::Swatch(Color32::from_rgb(c(rgb[0]), c(rgb[1]), c(rgb[2])))
+    }
+}
+
+/// Paint a [`SourceIcon`] centred in `rect`; glyphs take `color`, swatches their own fill.
+pub fn paint_source(painter: &Painter, rect: Rect, icon: SourceIcon, color: Color32) {
+    match icon {
+        SourceIcon::Glyph(icon) => paint(painter, rect, icon, color),
+        SourceIcon::Swatch(fill) => {
+            // AE: a flat square of the solid's colour with a thin dark edge (reads on white and black).
+            let side = (rect.width().min(rect.height()) * 0.72).round().max(4.0);
+            let sq = Rect::from_center_size(rect.center(), vec2(side, side));
+            painter.rect_filled(sq, 0.0, fill);
+            painter.rect_stroke(sq, 0.0, Stroke::new(1.0, Color32::from_black_alpha(140)), egui::StrokeKind::Inside);
+        }
+    }
+}
+
 /// Paint `icon` centred in `rect`.
 pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
     let local = match icon {
@@ -219,6 +253,12 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
         Icon::Image => Some("item-still"),
         Icon::Footage => Some("item-video"),
         Icon::Audio => Some("item-audio"),
+        Icon::Model => Some("item-model"),
+        Icon::TextLayer => Some("source-text"),
+        Icon::ShapeLayer => Some("source-shape"),
+        Icon::Camera => Some("source-camera"),
+        Icon::Light => Some("source-light"),
+        Icon::Primitive => Some("source-primitive"),
         _ => None,
     };
     // AE draws video and audio items in their own colour (violet film, green waveform):
@@ -418,7 +458,7 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             pen.circle(8.0, 8.0, 5.5);
             pen.fill(&[(8.0, 2.5), (8.0, 13.5), (5.2, 12.7), (3.2, 10.6), (2.5, 8.0), (3.2, 5.4), (5.2, 3.3)]);
         }
-        Cube => {
+        Cube | Model => {
             pen.closed(&[(8.0, 2.0), (13.5, 5.0), (13.5, 11.0), (8.0, 14.0), (2.5, 11.0), (2.5, 5.0)]);
             pen.line(&[(2.5, 5.0), (8.0, 8.0), (13.5, 5.0)]);
             pen.line(&[(8.0, 8.0), (8.0, 14.0)]);
@@ -487,6 +527,11 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             pen.closed(&pts);
         }
         Null => pen.rect(3.0, 3.0, 13.0, 13.0),
+        Primitive => {
+            pen.circle(8.0, 6.5, 4.5);
+            pen.line(&[(2.5, 13.5), (13.5, 13.5)]);
+            pen.dot(8.0, 13.5, 1.6);
+        }
         Camera => {
             pen.rect(1.5, 5.0, 10.5, 12.0);
             pen.closed(&[(10.5, 7.5), (14.5, 5.5), (14.5, 11.5), (10.5, 9.5)]);
