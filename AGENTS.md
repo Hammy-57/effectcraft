@@ -104,6 +104,7 @@ reproduce an image (for example, point lists traced from someone else's icon).
 
 See `CLAUDE.md`: pure Rust, dependency layering (`cargo xtask layers`), exact `Tick` time, everything is
 a command, everything is agent-drivable, and the quality gates (`cargo xtask ci`) before every commit.
+Agents: `cargo xtask ci --affected` per change; full `cargo xtask ci` before release ([`docs/testing.md`](docs/testing.md)).
 
 Shared real-file test corpora (Photoshop-authored PSDs, etc.) live in
 [`storytold/photocraft-corpus`](https://github.com/storytold/photocraft-corpus), explained in
