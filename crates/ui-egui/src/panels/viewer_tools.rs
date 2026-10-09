@@ -225,8 +225,9 @@ pub(crate) fn rulers(app: &mut EffectcraftApp, ui: &mut egui::Ui, map: &ViewerMa
     // Zero point: drag the corner, double-click to reset.
     p.line_segment([corner.center() - vec2(4.0, 0.0), corner.center() + vec2(4.0, 0.0)], tick);
     p.line_segment([corner.center() - vec2(0.0, 4.0), corner.center() + vec2(0.0, 4.0)], tick);
-    let cr =
-        ui.interact(corner, egui::Id::new("vw-ruler-origin"), Sense::click_and_drag()).on_hover_text("Ruler zero point (drag to move, double-click to reset)");
+    let cr = ui
+        .interact(corner, egui::Id::new("vw-ruler-origin"), Sense::click_and_drag())
+        .on_hover_text(crate::i18n::tr("Ruler zero point (drag to move, double-click to reset)"));
     app.auto.add("viewer.ruler.origin", corner, "Ruler zero point");
     let fg = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("vw-ruler-fg")));
     if cr.dragged()
@@ -247,7 +248,7 @@ pub(crate) fn rulers(app: &mut EffectcraftApp, ui: &mut egui::Ui, map: &ViewerMa
     // Guides dragged out of the rulers: the top ruler makes horizontal guides, the left one
     // vertical guides.
     for (r, vertical, id) in [(top, false, "top"), (left, true, "left")] {
-        let resp = ui.interact(r, egui::Id::new(("vw-ruler", id)), Sense::drag()).on_hover_text("Drag to create a guide");
+        let resp = ui.interact(r, egui::Id::new(("vw-ruler", id)), Sense::drag()).on_hover_text(crate::i18n::tr("Drag to create a guide"));
         app.auto.add(&format!("viewer.ruler.{id}"), r, if vertical { "Vertical ruler" } else { "Horizontal ruler" });
         if resp.hovered() {
             ui.ctx().set_cursor_icon(if vertical { egui::CursorIcon::ResizeHorizontal } else { egui::CursorIcon::ResizeVertical });
@@ -325,6 +326,12 @@ fn texture_roi(ctx: &egui::Context) -> Option<[f64; 4]> {
     ctx.data(|d| d.get_temp::<Option<[f64; 4]>>(egui::Id::new("viewer-tex-roi"))).flatten()
 }
 
+/// The comp area ([x, y, w, h], comp pixels) the shown frame covers: its region of interest or
+/// Extended Viewer area, else the whole `comp` (width, height).
+pub(crate) fn shown_region(ctx: &egui::Context, comp: [f32; 2]) -> [f64; 4] {
+    texture_roi(ctx).unwrap_or([0.0, 0.0, comp[0] as f64, comp[1] as f64])
+}
+
 /// Show Snapshot: the stored snapshot is on screen (button or F5 held).
 pub(crate) fn showing_snapshot(app: &EffectcraftApp, ctx: &egui::Context) -> bool {
     let f5 = ctx.input(|i| i.key_down(egui::Key::F5)) && !ctx.egui_wants_keyboard_input();
@@ -350,7 +357,7 @@ pub(crate) fn draw_frame(app: &mut EffectcraftApp, ctx: &egui::Context, painter:
     let snap = showing_snapshot(app, ctx);
     // Settings ▸ Video ▸ Mirror on Computer Monitor off: playback goes to Video Preview only.
     if crate::prefs_live::main_viewer_hidden(app) && !snap {
-        painter.text(comp_rect.center(), Align2::CENTER_CENTER, "Playing on Video Preview", Tokens::ui(13.0), Color32::from_gray(150));
+        painter.text(comp_rect.center(), Align2::CENTER_CENTER, crate::i18n::tr("Playing on Video Preview"), Tokens::ui(13.0), Color32::from_gray(150));
         return;
     }
     if opts.fast_previews == FastPreviews::Wireframe && !snap {
@@ -397,7 +404,7 @@ pub(crate) fn draw_frame(app: &mut EffectcraftApp, ctx: &egui::Context, painter:
             }
         };
         painter.image(tex.id(), comp_rect, uv, Color32::WHITE);
-        painter.text(comp_rect.left_top() + vec2(6.0, 6.0), Align2::LEFT_TOP, "Snapshot", Tokens::ui(11.0), SNAP_COLOR);
+        painter.text(comp_rect.left_top() + vec2(6.0, 6.0), Align2::LEFT_TOP, crate::i18n::tr("Snapshot"), Tokens::ui(11.0), SNAP_COLOR);
         return;
     }
     // A GPU frame (the web viewer): drawn straight from its texture; Show Channel / exposure
@@ -524,7 +531,10 @@ pub(crate) fn bottom_bar(app: &mut EffectcraftApp, ui: &mut egui::Ui, bar: Rect,
 
     // Magnification.
     let r = Rect::from_min_size(pos2(x, cy - 10.0), vec2(80.0, 20.0));
-    if widgets::dropdown(ui, r, &magnification_label(zoom * ppp * 100.0), &t, egui::Id::new("vw-mag")).on_hover_text("Magnification ratio popup").clicked() {
+    if widgets::dropdown(ui, r, &magnification_label(zoom * ppp * 100.0), &t, egui::Id::new("vw-mag"))
+        .on_hover_text(crate::i18n::tr("Magnification ratio popup"))
+        .clicked()
+    {
         toggle_popup(ui, "vw-mag-pop");
     }
     app.auto.add("viewer.magnification", r, "Magnification");
@@ -554,7 +564,7 @@ pub(crate) fn bottom_bar(app: &mut EffectcraftApp, ui: &mut egui::Ui, bar: Rect,
     let r = Rect::from_min_size(pos2(x, cy - 10.0), vec2(84.0, 20.0));
     let scale = app.viewer_scale(zoom, ppp);
     if widgets::dropdown(ui, r, &resolution_label(app.ui.viewer.res, scale), &t, egui::Id::new("vw-res"))
-        .on_hover_text("Resolution/Down Sample Factor Popup")
+        .on_hover_text(crate::i18n::tr("Resolution/Down Sample Factor Popup"))
         .clicked()
     {
         toggle_popup(ui, "vw-res-pop");
@@ -660,7 +670,7 @@ pub(crate) fn bottom_bar(app: &mut EffectcraftApp, ui: &mut egui::Ui, bar: Rect,
             .fixed_decimals(1)
             .custom_formatter(|v, _| if v == 0.0 { "0.0".into() } else { format!("{v:+.1}") }),
     );
-    let resp = resp.on_hover_text("Adjust Exposure (stops)");
+    let resp = resp.on_hover_text(crate::i18n::tr("Adjust Exposure (stops)"));
     app.auto.add("viewer.exposure", er, "Adjust Exposure");
     if resp.changed() {
         let _ = app.session.execute("view.exposure", json!({"stops": ev}));

@@ -3,7 +3,7 @@
 //! Keyframe times are stored in **layer time** (they move with the layer), so evaluating a
 //! property at comp time `t` first maps `t` through the layer's start time and stretch.
 
-use effectcraft_geom::{Mat3, Mat4, Vec3, vec3};
+use effectcraft_geom::{Mat3, Mat4, Vec3, vec2, vec3};
 use effectcraft_keyframe::Value;
 use effectcraft_project::{Comp, ItemId, Layer, LayerId, LayerSource, Project, PropGroup, Property};
 use effectcraft_time::Tick;
@@ -234,6 +234,24 @@ impl<'a> EvalCtx<'a> {
             (Mat3([[m[0][0], m[0][1], m[0][3]], [m[1][0], m[1][1], m[1][3]], [0.0, 0.0, 1.0]]), 0.0)
         }
     }
+    /// [`effect_bounds`] of a layer of this comp at this time. A shape layer's comp-sized bounds
+    /// are centred on its anchor point rather than its origin: After Effects renders a shape
+    /// layer's effects on a comp-sized canvas centred on the anchor, so effect points (Transform
+    /// anchors, ramp / 4-colour points, light-sweep centres) are measured from that canvas's
+    /// corner (SceneYard Calendar Page Tear: the pages hinged ~1000 px away otherwise).
+    pub fn effect_bounds(&self, layer: &Layer) -> ([f64; 2], [f64; 2]) {
+        let (size, origin) = effect_bounds(self.project, self.comp, layer);
+        if !matches!(layer.source, LayerSource::Shape) {
+            return (size, origin);
+        }
+        let a = layer.transform().map(|tr| self.v3(layer, tr, "anchor", [0.0; 3])).unwrap_or([0.0; 3]);
+        (size, [origin[0] + a[0], origin[1] + a[1]])
+    }
+    /// Effect space (see [`effect_bounds`]) → comp matrix.
+    pub fn effect_to_comp(&self, layer: &Layer) -> Mat3 {
+        let o = self.effect_bounds(layer).1;
+        self.layer_to_comp(layer).0 * Mat3::translate(vec2(o[0], o[1]))
+    }
 }
 
 /// The protected regions of a comp (Responsive Design — Time markers), merged, sorted and
@@ -301,6 +319,21 @@ pub fn responsive_source_time(comp: &Comp, stretch: f64, elapsed: f64) -> Option
         pos += len;
     }
     Some(Tick::from_seconds_f64(d + (elapsed - pos) / k))
+}
+
+/// A layer's effect bounds ([`effectcraft_effects::EffectCtx::layer_size`]) and their top-left
+/// corner in layer coordinates: the source rectangle at (0, 0), or for layers without one
+/// (shape, text) a comp-sized rectangle centred on the layer's origin, which their content
+/// surrounds. Effects work in **effect space**, measured from that corner (After Effects' layer
+/// space for effect points: a shape layer's default effect point is its bounds' centre).
+pub fn effect_bounds(project: &Project, comp: &Comp, layer: &Layer) -> ([f64; 2], [f64; 2]) {
+    match source_size(project, layer) {
+        (0, _) => {
+            let (w, h) = (comp.width as f64, comp.height as f64);
+            ([w, h], [-w / 2.0, -h / 2.0])
+        }
+        (w, h) => ([w as f64, h as f64], [0.0; 2]),
+    }
 }
 
 /// Size of a layer's source in layer pixels.

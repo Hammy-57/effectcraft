@@ -8,6 +8,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use effectcraft_engine::color::Label;
 use effectcraft_engine::project::{Item, ItemId, ItemKind};
 use egui::{Align2, Color32, Rect, Sense, Stroke, pos2, vec2};
 use serde_json::json;
@@ -485,14 +486,11 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         let sresp = ui.interact(sw.expand(3.0).intersect(list), egui::Id::new(("plabel", id.0)), Sense::click());
         app.auto.add(&format!("project.item.{}.label", id.0), sw, it.label.name());
         let pop = egui::Id::new(("plabel-pop", id.0));
-        if sresp.clicked() {
+        if sresp.clicked() || sresp.secondary_clicked() {
             widgets::open_popup(ui, pop);
         }
-        let names: Vec<String> = effectcraft_engine::color::Label::ALL.iter().map(|l| app.session.prefs.label_name(*l)).collect();
-        let cur = effectcraft_engine::color::Label::ALL.iter().position(|l| *l == it.label);
-        if let Some(li) = widgets::popup_menu(ui, pop, sw.left_bottom(), &names, cur) {
-            let items: Vec<u64> = if selected { app.session.state.project_selection.iter().map(|i| i.0).collect() } else { vec![id.0] };
-            actions.push(("project.setLabel".into(), json!({"items": items, "label": li})));
+        if let Some(l) = widgets::label_popup(ui, pop, sw.left_bottom(), it.label, |l| app.session.prefs.label_name(l), &t) {
+            actions.push(("project.setLabel".into(), json!({"items": targets(app, *id, selected), "label": label_index(l)})));
         }
         // Optional columns.
         for (key, _, cx, w) in cols.iter().skip(2) {
@@ -574,35 +572,58 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         if resp.drag_started() {
             egui::DragAndDrop::set_payload(&ctx, DragPayload::Item(id.0));
         }
+        // Right-clicking an item selects it (After Effects): the menu's File commands act on the
+        // selection.
+        if resp.secondary_clicked() && !selected {
+            app.session.state.project_selection = vec![*id];
+        }
+        let footage = matches!(it.kind, ItemKind::Footage(_));
         resp.context_menu(|ui| {
-            if ui.button("Delete").clicked() {
-                let items: Vec<u64> = if selected { app.session.state.project_selection.iter().map(|i| i.0).collect() } else { vec![id.0] };
-                actions.push(("project.delete".into(), json!({"items": items})));
+            if ui.button(crate::i18n::tr("Delete")).clicked() {
+                actions.push(("project.delete".into(), json!({"items": targets(app, *id, selected)})));
                 ui.close();
             }
-            if matches!(it.kind, ItemKind::Comp(_)) && ui.button("Open Composition").clicked() {
+            if matches!(it.kind, ItemKind::Comp(_)) && ui.button(crate::i18n::tr("Open Composition")).clicked() {
                 actions.push(("comp.open".into(), json!({"comp": id.0})));
                 ui.close();
             }
-            if ui.button("Rename").clicked() {
+            if ui.button(crate::i18n::tr("Rename")).clicked() {
                 ctx.data_mut(|d| d.insert_temp::<Editing>(edit_id(), (id.0, "name".into(), it.name.clone())));
                 ui.close();
             }
-            if it.parent.is_some() && ui.button("Move to Project Root").clicked() {
+            if it.parent.is_some() && ui.button(crate::i18n::tr("Move to Project Root")).clicked() {
                 actions.push(("project.move".into(), json!({"items": [id.0], "folder": null})));
                 ui.close();
             }
-            if !it.is_folder() && ui.button("Add to Composition").clicked() {
+            if !it.is_folder() && ui.button(crate::i18n::tr("Add to Composition")).clicked() {
                 actions.push(("layer.addItem".into(), json!({"item": id.0})));
                 ui.close();
             }
-            if ui.button("New Comp from Selection").clicked() {
+            if ui.button(crate::i18n::tr("New Comp from Selection")).clicked() {
                 if let Some((w, h)) = it.dimensions() {
                     let d = it.duration().map(|d| d.seconds()).unwrap_or(10.0);
                     actions.push(("comp.new".into(), json!({"name": format!("{} Comp", it.name), "width": w, "height": h, "duration": d})));
                     actions.push(("layer.addItem".into(), json!({"item": id.0})));
                 }
                 ui.close();
+            }
+            ui.separator();
+            ui.menu_button(crate::i18n::tr("Label"), |ui| {
+                for l in Label::ALL {
+                    if widgets::label_entry(ui, l, &app.session.prefs.label_name(l), l == it.label, &t).clicked() {
+                        actions.push(("project.setLabel".into(), json!({"items": targets(app, *id, selected), "label": label_index(l)})));
+                        ui.close();
+                    }
+                }
+            });
+            // Footage: the File menu's footage commands (Interpret Footage, Replace Footage…).
+            if footage {
+                let mut chosen = None;
+                crate::menus::submenu_at(app, ui, &["File", "Interpret Footage"], &mut chosen);
+                crate::menus::submenu_at(app, ui, &["File", "Replace Footage"], &mut chosen);
+                crate::menus::entry_for(app, ui, "file.reloadFootage", &mut chosen);
+                crate::menus::entry_for(app, ui, "file.revealInFinder", &mut chosen);
+                actions.extend(chosen);
             }
         });
     }
@@ -674,9 +695,12 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         let resp = widgets::icon_button(ui, r, icon, false, &t, egui::Id::new(("pfoot", id))).on_hover_text(tip);
         app.auto.add(&format!("project.{id}"), r, tip);
         if resp.clicked() {
+            let footage =
+                app.session.state.project_selection.first().and_then(|i| app.session.project.item(*i)).is_some_and(|i| matches!(i.kind, ItemKind::Footage(_)));
             match id {
                 "newComp" => crate::panels::dialogs::open_new_comp(app),
                 "newFolder" => actions.push(("project.newFolder".into(), json!({}))),
+                _ if footage => actions.push(("file.interpretFootage".into(), json!({}))),
                 _ => app.ui.status = "Interpret Footage: select a footage item".into(),
             }
         }
@@ -710,9 +734,9 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             actions.push(("file.cycleBitDepth".into(), json!({})));
         }
     }
-    dresp.on_hover_text("Project color depth: click to cycle 8/16/32 bpc, Alt-click for Project Settings");
+    dresp.on_hover_text(crate::i18n::tr("Project color depth: click to cycle 8/16/32 bpc, Alt-click for Project Settings"));
     let tr = Rect::from_min_size(pos2(foot.max.x - 30.0, foot.min.y + 3.0), vec2(22.0, 22.0));
-    if widgets::icon_button(ui, tr, Icon::Trash, false, &t, egui::Id::new("ptrash")).on_hover_text("Delete selected project items").clicked()
+    if widgets::icon_button(ui, tr, Icon::Trash, false, &t, egui::Id::new("ptrash")).on_hover_text(crate::i18n::tr("Delete selected project items")).clicked()
         && !app.session.state.project_selection.is_empty()
     {
         actions.push(("project.delete".into(), json!({})));
@@ -775,10 +799,20 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     }
 }
 
+/// Items a row's menu acts on: the selection when the row is selected, else the row's item.
+fn targets(app: &EffectcraftApp, id: ItemId, selected: bool) -> Vec<u64> {
+    if selected { app.session.state.project_selection.iter().map(|i| i.0).collect() } else { vec![id.0] }
+}
+
+/// `project.setLabel`'s index of a label.
+fn label_index(l: Label) -> usize {
+    Label::ALL.iter().position(|x| *x == l).unwrap_or(0)
+}
+
 /// The column header's context menu: show or hide the optional columns.
 fn column_menu(app: &mut EffectcraftApp, resp: &egui::Response) {
     resp.context_menu(|ui| {
-        ui.label(egui::RichText::new("Columns").weak());
+        ui.label(egui::RichText::new(crate::i18n::tr("Columns")).weak());
         for (key, label, _) in COLUMNS {
             let mut on = app.ui.project_columns.iter().any(|c| c == key);
             if ui.checkbox(&mut on, label).changed() {

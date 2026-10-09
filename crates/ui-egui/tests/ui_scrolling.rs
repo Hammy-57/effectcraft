@@ -143,3 +143,23 @@ fn effect_values_stay_clear_of_the_keyframe_navigator() {
     assert!(value.max.x <= nav.min.x, "the value ({value:?}) ends before the navigator ({nav:?})");
     assert!(value.min.x > rect(&h, &format!("effectControls.prop.{uid}.stopwatch")).max.x, "and after the stopwatch");
 }
+
+/// The Settings dialog fits its width: its page column was wider than the dialog, so the whole
+/// dialog scrolled sideways a little (#284).
+#[test]
+fn settings_dialog_does_not_scroll_sideways() {
+    let mut h = harness(1400.0, 900.0);
+    let ctx = h.ctx.clone();
+    effectcraft_ui_egui::menus::invoke(h.state_mut(), &ctx, "app.settings", json!({"page": "general"})).unwrap();
+    h.run_steps(3);
+    let (ok, page) = (rect(&h, "settings.ok"), rect(&h, "settings.page.general"));
+    h.input_mut().events.push(Event::PointerMoved(page.center()));
+    h.input_mut().events.push(Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta: vec2(-400.0, 0.0),
+        modifiers: Default::default(),
+        phase: egui::TouchPhase::Move,
+    });
+    h.run_steps(20);
+    assert_eq!((rect(&h, "settings.ok"), rect(&h, "settings.page.general")), (ok, page), "nothing moved sideways");
+}

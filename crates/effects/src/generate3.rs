@@ -1604,26 +1604,55 @@ fn audio_waveform(ctx: &EffectCtx, mut b: Buf) -> Buf {
     b
 }
 
+fn compute_fft_mags(samples: &[f64]) -> (usize, f64, Vec<f64>) {
+    let m = samples.len();
+    let n = m.next_power_of_two().max(64);
+    let mut re = vec![0.0; n];
+    let mut im = vec![0.0; n];
+    let denom = (m.max(2) - 1) as f64;
+    for (i, s) in samples.iter().enumerate() {
+        let w = 0.5 - 0.5 * (2.0 * PI * i as f64 / denom).cos();
+        if let Some(r) = re.get_mut(i) {
+            *r = s * w;
+        }
+    }
+    fft(&mut re, &mut im);
+    let hz_per_bin = AUDIO_RATE as f64 / n as f64;
+    let scale = 4.0 / m.max(1) as f64;
+    let num_bins = n / 2 + 1;
+    let mut mags = Vec::with_capacity(num_bins);
+    for k in 0..num_bins {
+        let r = re.get(k).copied().unwrap_or(0.0);
+        let im_val = im.get(k).copied().unwrap_or(0.0);
+        let mag = (r * r + im_val * im_val).sqrt() * scale;
+        mags.push(mag);
+    }
+    (n, hz_per_bin, mags)
+}
+
 fn spectrum_plan(ctx: &EffectCtx, b: &Buf) -> Option<MarksPlan> {
     let pr = ctx.params;
     let samples = audio_window(ctx, pr.f("audioDuration"), pr.f("audioOffset"), 0)?;
-    let n = samples.len().next_power_of_two().max(64);
-    let mut re = vec![0.0; n];
-    let mut im = vec![0.0; n];
-    let m = samples.len();
-    for (i, s) in samples.iter().enumerate() {
-        // Hann window.
-        re[i] = s * (0.5 - 0.5 * (2.0 * PI * i as f64 / (m.max(2) - 1) as f64).cos());
-    }
-    fft(&mut re, &mut im);
+    let (_n, hz_per_bin, mags) = compute_fft_mags(&samples);
+
     let bands = pr.f("frequencyBands").round().clamp(1.0, 4096.0) as usize;
-    let f0 = pr.f("startFrequency").max(1.0);
+    let f0 = pr.f("startFrequency").max(0.0);
     let f1 = pr.f("endFrequency").max(f0 + 1.0);
-    let hz_per_bin = AUDIO_RATE as f64 / n as f64;
-    let mag = |f: f64| {
-        let k = ((f / hz_per_bin).round() as usize).min(n / 2);
-        (re[k] * re[k] + im[k] * im[k]).sqrt() * 4.0 / m as f64
+    let max_bin = mags.len().saturating_sub(1);
+
+    let get_band_mag = |fc: f64| -> f64 {
+        if mags.is_empty() || hz_per_bin <= 0.0 {
+            return 0.0;
+        }
+        let k_float = (fc / hz_per_bin).clamp(0.0, max_bin as f64);
+        let k0 = (k_float.floor() as usize).min(max_bin.saturating_sub(1));
+        let k1 = (k0 + 1).min(max_bin);
+        let frac = (k_float - k0 as f64).clamp(0.0, 1.0);
+        let m0 = mags.get(k0).copied().unwrap_or(0.0);
+        let m1 = mags.get(k1).copied().unwrap_or(0.0);
+        m0 * (1.0 - frac) + m1 * frac
     };
+
     let max_h = pr.f("maximumHeight") * b.scale;
     let thick = (pr.f("thickness") * b.scale).max(0.1);
     let soft = pr.f("softness") / 100.0;
@@ -1634,15 +1663,9 @@ fn spectrum_plan(ctx: &EffectCtx, b: &Buf) -> Option<MarksPlan> {
     let mut segs = Vec::new();
     for i in 0..bands {
         let u = if bands > 1 { i as f64 / (bands - 1) as f64 } else { 0.5 };
-        let fa = f0 * (f1 / f0).powf(i as f64 / bands as f64);
-        let fb = f0 * (f1 / f0).powf((i + 1) as f64 / bands as f64);
-        let mut v = 0.0f64;
-        let k = 4;
-        for j in 0..k {
-            v = v.max(mag(fa + (fb - fa) * j as f64 / k as f64));
-        }
-        let db = (20.0 * v.max(1e-9).log10() + 60.0) / 60.0;
-        let hgt = db.clamp(0.0, 1.0) * max_h;
+        let fc = f0 + (f1 - f0) * u;
+        let v = get_band_mag(fc);
+        let hgt = if (v * max_h).is_finite() { (v * max_h).clamp(0.0, max_h.max(0.0)) } else { 0.0 };
         let (q, nrm) = base.at(u);
         let (ua, ub) = match side {
             0 => (0.0, hgt),
@@ -2015,6 +2038,37 @@ mod tests {
             }
         }
         s
+    }
+
+    #[test]
+    fn audio_spectrum_linear_frequency_and_linear_amplitude() {
+        let host = Tone; // Tone produces 440 Hz
+        let env = EffectEnv { host: Some(&host), comp_time: 1.0, ..Default::default() };
+        let img = Image::new(200, 100);
+        let out = run_env(
+            "ec.generate.audiospectrum",
+            &[
+                ("audioLayer", Value::Layer(Some(1))),
+                ("startPoint", Value::Vec2([0.0, 50.0])),
+                ("endPoint", Value::Vec2([200.0, 50.0])),
+                ("startFrequency", num(20.0)),
+                ("endFrequency", num(2000.0)),
+                ("frequencyBands", num(100.0)),
+                ("maximumHeight", num(40.0)),
+                ("thickness", num(2.0)),
+                ("softness", num(0.0)),
+            ],
+            img,
+            1.0,
+            env,
+        );
+        // Verify 440 Hz tone produces a peak above baseline, while high frequencies have zero bar height
+        let peak_zone = alpha_sum(&out.img, 36, 10, 48, 48);
+        let high_zone = alpha_sum(&out.img, 120, 10, 150, 48);
+        let silent_zone = alpha_sum(&out.img, 170, 10, 195, 48);
+        assert!(peak_zone > 5.0, "peak zone has energy: {peak_zone}");
+        assert!(peak_zone > high_zone * 2.0, "linear peak is distinctly taller than far frequencies: {peak_zone} vs {high_zone}");
+        assert_eq!(silent_zone, 0.0, "silent end has zero height, not boosted by dB scale");
     }
 
     #[test]

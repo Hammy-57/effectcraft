@@ -6,6 +6,7 @@
 //! the active viewer is locked shows it in an unlocked viewer, or in a new one if every viewer is
 //! locked.
 
+use crate::i18n::tr;
 use std::sync::Arc;
 
 use effectcraft_engine::project::ItemId;
@@ -88,7 +89,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, id: u32, rect: Rect) {
     let ctx = ui.ctx().clone();
     let p = ui.painter().with_clip_rect(rect);
     p.rect_filled(rect, 0.0, t.pasteboard);
-    let resp = ui.interact(rect, egui::Id::new(("passive-viewer", id)), Sense::click()).on_hover_text("Click to make this viewer active");
+    let resp = ui.interact(rect, egui::Id::new(("passive-viewer", id)), Sense::click()).on_hover_text(tr("Click to make this viewer active"));
     app.auto.add(&format!("viewers.{id}"), rect, "Composition viewer (click to make it active)");
     match comp_of(app, id).and_then(|cid| Some((cid, app.session.project.comp(cid)?.clone()))) {
         Some((cid, c)) => {
@@ -116,7 +117,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, id: u32, rect: Rect) {
             p.rect_stroke(r, 0.0, egui::Stroke::new(1.0, t.separator), egui::StrokeKind::Outside);
         }
         None => {
-            p.text(rect.center(), Align2::CENTER_CENTER, "Click to show the active composition here", Tokens::ui(12.0), t.text_faint);
+            p.text(rect.center(), Align2::CENTER_CENTER, tr("Click to show the active composition here"), Tokens::ui(12.0), t.text_faint);
         }
     }
     if resp.clicked() {

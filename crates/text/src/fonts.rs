@@ -658,17 +658,46 @@ const CHINESE_FAMILIES: &[&str] = &[
 ];
 const KOREAN_FAMILIES: &[&str] = &["Malgun Gothic", "Gulim", "Apple SD Gothic Neo", "Noto Sans CJK KR", "Noto Sans KR", "Source Han Sans KR", "NanumGothic"];
 
-/// The CJK language to try first for Han ideographs, from the locale environment (`LANG`,
-/// `LC_ALL`, `LC_CTYPE`; `EFFECTCRAFT_CJK_LOCALE` overrides them). Japanese when nothing says
-/// otherwise: the ambiguity only matters for ideographs, and kana / hangul in the same text pick
-/// their language regardless.
-fn han_order() -> [FallbackScript; 3] {
-    let tag = ["EFFECTCRAFT_CJK_LOCALE", "LC_ALL", "LC_CTYPE", "LANG"]
-        .iter()
-        .filter_map(|k| std::env::var(k).ok())
-        .map(|v| v.trim().to_ascii_lowercase())
-        .find(|v| !v.is_empty() && v != "c" && v != "posix")
-        .unwrap_or_default();
+/// The CJK locale the host asked fallbacks to prefer, when it has one (see [`set_cjk_locale`]).
+static REQUESTED_CJK_LOCALE: RwLock<Option<String>> = RwLock::new(None);
+
+/// Ask CJK font fallbacks to prefer `tag`'s language for Han ideographs instead of the locale
+/// environment, so a Chinese interface is drawn with a Chinese face on a machine whose locale is
+/// Japanese (and the other way round). The interface sets this from its language setting; an empty
+/// tag, `c` or `posix` clears the request and returns to the environment. Process-global, like the
+/// environment it replaces: every layout in the process follows it, so composition text is drawn
+/// with the same language's Han forms as the interface, not only the interface chrome.
+pub fn set_cjk_locale(tag: &str) {
+    let tag = tag.trim().to_ascii_lowercase();
+    let requested = if tag.is_empty() || tag == "c" || tag == "posix" { None } else { Some(tag) };
+    *REQUESTED_CJK_LOCALE.write().unwrap_or_else(|e| e.into_inner()) = requested;
+    // The fallback cache answers per character block and preferred face, so a change of language
+    // must drop it.
+    fallback_cache().write().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+fn requested_cjk_locale() -> Option<String> {
+    REQUESTED_CJK_LOCALE.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// The CJK locale to use: [`set_cjk_locale`] when the host asked for one, otherwise the locale
+/// environment (`LANG`, `LC_ALL`, `LC_CTYPE`; `EFFECTCRAFT_CJK_LOCALE` overrides them).
+fn active_cjk_locale() -> String {
+    requested_cjk_locale().unwrap_or_else(|| {
+        ["EFFECTCRAFT_CJK_LOCALE", "LC_ALL", "LC_CTYPE", "LANG"]
+            .iter()
+            .filter_map(|k| std::env::var(k).ok())
+            .map(|v| v.trim().to_ascii_lowercase())
+            .find(|v| !v.is_empty() && v != "c" && v != "posix")
+            .unwrap_or_default()
+    })
+}
+
+/// The CJK language to try first for Han ideographs. Japanese when nothing says otherwise: the
+/// ambiguity only matters for ideographs, and kana / hangul in the same text pick their language
+/// regardless.
+fn han_order_for(tag: &str) -> [FallbackScript; 3] {
+    let tag = tag.trim().to_ascii_lowercase();
     if tag.starts_with("zh") {
         [FallbackScript::Han, FallbackScript::Japanese, FallbackScript::Korean]
     } else if tag.starts_with("ko") {
@@ -676,6 +705,11 @@ fn han_order() -> [FallbackScript; 3] {
     } else {
         [FallbackScript::Japanese, FallbackScript::Han, FallbackScript::Korean]
     }
+}
+
+/// The order for the locale in force ([`active_cjk_locale`]).
+fn han_order() -> [FallbackScript; 3] {
+    han_order_for(&active_cjk_locale())
 }
 
 fn families_for(s: FallbackScript) -> &'static [&'static str] {
@@ -1046,6 +1080,36 @@ mod tests {
         let inter = resolve("Inter", "Regular").face;
         assert_ne!(fallback_for('\u{e000}', inter), id, "fallback never picks the empty glyph");
         assert_eq!(fallback_for('\u{e001}', inter), id, "fallback finds the drawn one");
+    }
+
+    #[test]
+    fn the_han_order_follows_the_cjk_locale() {
+        // Chinese first for any Chinese tag, whether or not it names a script.
+        for tag in ["zh", "zh-CN", "zh_Hans", "ZH-Hant-TW.UTF-8", "zh_MO"] {
+            assert_eq!(han_order_for(tag)[0], FallbackScript::Han, "{tag}");
+        }
+        assert_eq!(han_order_for("ko-KR"), [FallbackScript::Korean, FallbackScript::Japanese, FallbackScript::Han]);
+        // Japanese, and anything else, keeps the Japanese face first for Han text.
+        for tag in ["ja_JP.UTF-8", "en-US", "de", ""] {
+            assert_eq!(han_order_for(tag), [FallbackScript::Japanese, FallbackScript::Han, FallbackScript::Korean], "{tag}");
+        }
+        // The host's request is what `han_order` reads (the ui test covers the effect on the
+        // registered fallbacks; this only checks that clearing it returns to the environment).
+        assert_eq!(requested_cjk_locale(), None, "tests run without a request");
+        assert_eq!(han_order(), han_order_for(&active_cjk_locale()));
+    }
+
+    #[test]
+    fn bundled_ui_fonts_cover_the_ukrainian_alphabet() {
+        const ALPHABET: &str = "АБВГҐДЕЄЖЗИІЇЙКЛМНОПРСТУФХЦЧШЩЬЮЯабвгґдеєжзиіїйклмнопрстуфхцчшщьюя’«»";
+        for (name, bytes) in
+            [("Inter Regular", INTER_REGULAR), ("Inter Medium", INTER_MEDIUM), ("Inter SemiBold", INTER_SEMIBOLD), ("JetBrains Mono", JETBRAINS_MONO_REGULAR)]
+        {
+            let font = FontRef::new(bytes).unwrap();
+            for c in ALPHABET.chars() {
+                assert!(covers(&font, c), "{name} cannot draw {c}");
+            }
+        }
     }
 
     #[test]

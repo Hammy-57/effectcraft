@@ -87,6 +87,28 @@ fn prefs_set_validates_keys_types_and_ranges() {
     assert!(p.reset(Some("bogus")).is_err());
 }
 
+/// Settings ▸ Appearance ▸ UI Scale (#284): a percentage, 100 by default, kept within 75–200;
+/// the dialog's choices set it as a number.
+#[test]
+fn ui_scale_is_a_percentage_from_75_to_200() {
+    let mut p = Prefs::default();
+    assert_eq!(p.appearance.ui_scale, 100);
+    p.set("appearance.uiScale", json!("150")).unwrap();
+    assert_eq!(p.appearance.ui_scale, 150);
+    assert_eq!(p.get("appearance.uiScale"), Some(json!(150)));
+    p.set("appearance.uiScale", json!(500)).unwrap();
+    assert_eq!(p.appearance.ui_scale, 200);
+    p.set("appearance.uiScale", json!(10)).unwrap();
+    assert_eq!(p.appearance.ui_scale, 75);
+    let page = crate::prefs::pages().into_iter().find(|pg| pg.id == "appearance").unwrap();
+    let listed = page.items.iter().any(|i| {
+        matches!(i, crate::prefs::Item::Setting { key: "appearance.uiScale", kind: crate::prefs::Kind::Choice(c), live: true, .. } if c.contains(&("200%", "200")))
+    });
+    assert!(listed, "Settings ▸ Appearance offers it");
+    // Older settings files without it get the default.
+    assert_eq!(Prefs::from_json(r#"{"version": 2, "appearance": {"theme": "light"}}"#).appearance.ui_scale, 100);
+}
+
 #[test]
 fn every_schema_key_exists_and_docs_list_the_todo_settings() {
     let p = Prefs::default();
@@ -524,6 +546,12 @@ fn interface_language_is_validated_persisted_and_backward_compatible() {
     let mut zh_hant = Session { config: Some(store.clone()), ..Default::default() };
     zh_hant.load_settings();
     assert_eq!(zh_hant.prefs.general.language, "zh-hant");
+    s.execute("prefs.set", json!({"key": "general.language", "value": "uk"})).unwrap();
+    assert_eq!(s.execute("prefs.get", json!({"key": "general.language"})).unwrap(), json!("uk"));
+    let mut uk = Session { config: Some(store.clone()), ..Default::default() };
+    uk.load_settings();
+    assert_eq!(uk.prefs.general.language, "uk");
+    assert_eq!(Prefs::from_json(r#"{"general":{"language":"uk"}}"#).general.language, "uk");
     s.execute("prefs.set", json!({"key": "general.language", "value": "ja"})).unwrap();
     let mut reloaded = Session { config: Some(store), ..Default::default() };
     reloaded.load_settings();

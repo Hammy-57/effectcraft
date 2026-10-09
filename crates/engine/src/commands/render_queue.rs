@@ -8,7 +8,7 @@
 use effectcraft_project::render_queue::{
     AlphaMode, AudioFormat, AudioOutput, Channels, ColorDepth, CurrentOrOff, DEFAULT_SEQUENCE_TEMPLATE, DEFAULT_TEMPLATE, EffectsMode, FieldRender,
     OutputFormat, OutputModule, PostRenderAction, ProResProfile, Pulldown, RESIZE_PRESETS, RenderLog, RenderQuality, RenderQueueItem, RenderSettings,
-    RenderStatus, ResizeQuality, SwitchOverride, TimeSpan, post_render_parse,
+    RenderStatus, ResizeQuality, SwitchOverride, TimeSpan, post_render_parse, without_project_extension,
 };
 use effectcraft_project::render_templates::{RenderTemplates, TemplateKind, TemplateSlot};
 use effectcraft_time::{FrameRate, Tick};
@@ -364,7 +364,8 @@ fn apply_output(om: &mut OutputModule, templates: &RenderTemplates, roi: Option<
     if let Some(l) = b_p(p, "includeProjectLink") {
         om.include_project_link = l;
     }
-    if let Some(o) = str_p(p, "output").or(str_p(p, "path")) {
+    // (Without the `.ecproj` a save dialog filtered to projects appended, #293.)
+    if let Some(o) = str_p(p, "output").or(str_p(p, "path")).map(without_project_extension) {
         om.output = o.to_string();
         // Only an extension the format doesn't write changes it: `.mp4` is H.264's, HEVC's and AV1's.
         if let Some(f) = OutputFormat::from_path(o).filter(|f| f.extension() != om.format.extension() && !o.contains("[fileExtension]")) {
@@ -379,6 +380,8 @@ fn apply_output(om: &mut OutputModule, templates: &RenderTemplates, roi: Option<
                 om.output = keep;
             }
         }
+        // The format's extension exactly once (`Comp 2.mov.mov` → `Comp 2.mov`).
+        om.output = om.format.with_extension(&om.output);
     }
     if *om != before {
         // Output To alone doesn't make the module custom.

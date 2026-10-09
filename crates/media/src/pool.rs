@@ -16,6 +16,23 @@ use crate::{MediaError, Result};
 /// Default frame-cache budget: 1 GiB of decoded frames.
 pub const DEFAULT_BUDGET: usize = 1 << 30;
 
+/// The cache path of a missing image-sequence frame (no file can have this name).
+const PLACEHOLDER: &str = "\0missing frame";
+
+/// What a missing image-sequence frame shows: 75 % colour bars (white, yellow, cyan, green,
+/// magenta, red, blue), the usual "no picture here" frame.
+fn colour_bars(w: u32, h: u32) -> Image {
+    const BARS: [[f32; 3]; 7] = [[1.0, 1.0, 1.0], [1.0, 1.0, 0.0], [0.0, 1.0, 1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
+    let (w, h) = (w.clamp(1, 16_384), h.clamp(1, 16_384));
+    let row: Vec<Px> = (0..w)
+        .map(|x| {
+            let c = BARS.get((x as usize * BARS.len()) / w as usize).copied().unwrap_or([0.0; 3]);
+            [c[0] * 0.75, c[1] * 0.75, c[2] * 0.75, 1.0]
+        })
+        .collect();
+    Image { width: w, height: h, data: row.repeat(h as usize) }
+}
+
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct Key {
     path: Arc<str>,
@@ -389,7 +406,7 @@ impl MediaPool {
         let Some(src) = self.inner.source(&path) else { return vec![0.0; frames * 2] };
         let s0 = start.to_units_floor(rate as i64);
         let native = src.info().audio.as_ref().map_or(rate, |a| a.sample_rate);
-        if native == 0 || native == rate {
+        if native == 0 || rate == 0 || native == rate {
             return read_stereo(&src, &path, s0, frames, rate);
         }
         // Output sample `n` sits at source position n × native / rate.
@@ -505,8 +522,12 @@ impl Inner {
         let key = |path: &str, frame| Key { path: path.into(), frame, alpha, matte, crop };
         match footage.kind {
             FootageKind::Sequence if !footage.sequence.is_empty() => {
-                let i = Self::frame_index(footage.frame_rate, t, footage.sequence.len() as i64, footage.loop_count);
-                Loc { key: key(&footage.sequence[i as usize], 0), media_t: None }
+                let i = Self::frame_index(footage.frame_rate, t, footage.sequence_frames(), footage.loop_count);
+                match footage.sequence_file(i) {
+                    Some(path) => Loc { key: key(path, 0), media_t: None },
+                    // A gap in the numbering: colour bars, as in After Effects.
+                    None => Loc { key: key(PLACEHOLDER, ((footage.width as i64) << 32) | footage.height as i64), media_t: None },
+                }
             }
             // A layer of a layered still is keyed by its layer index and size mode (smart objects
             // by their embedded file; PDF pages by their number).
@@ -591,6 +612,7 @@ impl Inner {
         let op = AlphaOp::new(footage.alpha, footage.premul_color);
         let path = &loc.key.path;
         match loc.media_t {
+            None if &**path == PLACEHOLDER => Ok(colour_bars(footage.width, footage.height)),
             None => {
                 let bytes = self.read(path)?;
                 if let Some(img) = crate::layered::decode(path, &bytes, footage, op)? {
@@ -599,7 +621,11 @@ impl Inner {
                 if let Some(img) = crate::avif::decode(path, &bytes, op)? {
                     return Ok(img);
                 }
-                let img = image::load_from_memory(&bytes).map_err(|e| MediaError::Decode(format!("{path}: {e}")))?;
+                let img = match image::load_from_memory(&bytes) {
+                    Ok(img) => img,
+                    // A multi-layer OpenEXR file without an unnamed RGB layer: its colour layer.
+                    Err(e) => crate::exr_channels::layered_image(&bytes).ok_or_else(|| MediaError::Decode(format!("{path}: {e}")))?,
+                };
                 Ok(dynamic_to_image(&img, op))
             }
             Some(mt) => {

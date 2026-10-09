@@ -424,16 +424,13 @@ pub fn remap(src: &Image, clamp: bool, f: impl Fn(f64, f64) -> Option<(f64, f64)
 
 /// Layer rectangle in buffer pixels: (x0, y0, width, height).
 pub fn layer_rect(ctx: &crate::EffectCtx, b: &crate::Buf) -> (f64, f64, f64, f64) {
-    (b.offset[0], b.offset[1], ctx.layer_size[0] * b.scale, ctx.layer_size[1] * b.scale)
+    layer_rect_at(ctx, b.offset, b.scale)
 }
 
-/// The layer bounds edge pinning holds in place, in the pixels of a buffer with `offset` and
-/// `scale` (see [`crate::Buf`]): (x0, y0, width, height). Unlike [`layer_rect`] it starts at
-/// [`crate::EffectEnv::bounds_origin`], so a shape layer's content around its origin lies
-/// inside it.
-pub fn pin_rect(ctx: &crate::EffectCtx, offset: [f64; 2], scale: f64) -> (f64, f64, f64, f64) {
-    let o = ctx.env.bounds_origin;
-    (offset[0] + o[0] * scale, offset[1] + o[1] * scale, ctx.layer_size[0] * scale, ctx.layer_size[1] * scale)
+/// [`layer_rect`] in the pixels of a buffer with `offset` and `scale` (see [`crate::Buf`];
+/// GPU buffers): the layer bounds start at effect-space (0, 0).
+pub fn layer_rect_at(ctx: &crate::EffectCtx, offset: [f64; 2], scale: f64) -> (f64, f64, f64, f64) {
+    (offset[0], offset[1], ctx.layer_size[0] * scale, ctx.layer_size[1] * scale)
 }
 
 /// Resample another layer (a layer parameter) into `b`'s pixel grid. With `stretch` the other

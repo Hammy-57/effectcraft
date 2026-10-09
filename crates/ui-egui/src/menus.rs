@@ -35,6 +35,14 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     uic!("view.fit", "Fit", [], Some("Shift+/")),
     uic!("view.actualSize", "100%", [], Some("/")),
     uic!("view.res.auto", "Resolution: Auto", [], None),
+    uic!("viewer.nudge.up", "Move Selected Layers Up 1 Pixel at Current Magnification", [], Some("ArrowUp")),
+    uic!("viewer.nudge.down", "Move Selected Layers Down 1 Pixel at Current Magnification", [], Some("ArrowDown")),
+    uic!("viewer.nudge.left", "Move Selected Layers Left 1 Pixel at Current Magnification", [], Some("ArrowLeft")),
+    uic!("viewer.nudge.right", "Move Selected Layers Right 1 Pixel at Current Magnification", [], Some("ArrowRight")),
+    uic!("viewer.nudge.up10", "Move Selected Layers Up 10 Pixels at Current Magnification", [], Some("Shift+ArrowUp")),
+    uic!("viewer.nudge.down10", "Move Selected Layers Down 10 Pixels at Current Magnification", [], Some("Shift+ArrowDown")),
+    uic!("viewer.nudge.left10", "Move Selected Layers Left 10 Pixels at Current Magnification", [], Some("Shift+ArrowLeft")),
+    uic!("viewer.nudge.right10", "Move Selected Layers Right 10 Pixels at Current Magnification", [], Some("Shift+ArrowRight")),
     uic!("view.safeMargins", "Title/Action Safe", [], None),
     uic!("view.transparencyGrid", "Transparency Grid", [], None),
     uic!("view.fastPreviews", "Fast Previews", [], None),
@@ -229,6 +237,33 @@ fn reveal_targets(app: &EffectcraftApp) -> Vec<u64> {
     }
 }
 
+/// The arrow keys over the Composition panel or the Timeline: move the selected layers 1 pixel
+/// at the viewer's magnification (`up`, `down`, `left`, `right`), 10 with Shift (`up10`…), as
+/// After Effects does, so zoomed in they move by fractions of a comp pixel. Not while typing,
+/// or with mask points selected.
+fn nudge(app: &mut EffectcraftApp, ctx: &egui::Context, dir: &str) -> Result<Value, String> {
+    let (side, n) = match dir.strip_suffix("10") {
+        Some(side) => (side, 10.0),
+        None => (dir, 1.0),
+    };
+    let (x, y) = match side {
+        "up" => (0.0, -n),
+        "down" => (0.0, n),
+        "left" => (-n, 0.0),
+        "right" => (n, 0.0),
+        _ => return Err(format!("unknown nudge `{dir}`")),
+    };
+    let st = &app.session.state;
+    let over = matches!(app.ui.focused, PanelKind::Composition | PanelKind::Viewer(_) | PanelKind::Timeline);
+    if !over || st.selected_layers.is_empty() || st.text_edit.is_some() || !st.selected_vertices.is_empty() {
+        return Ok(Value::Null);
+    }
+    // Screen pixels per comp pixel.
+    let zoom = (app.ui.viewer.zoom.unwrap_or_else(|| crate::panels::viewer::last_fit(ctx)) * ctx.pixels_per_point()) as f64;
+    let k = if zoom.is_finite() && zoom > 1e-6 { 1.0 / zoom } else { 1.0 };
+    run_engine(app, ctx, "layer.nudge", json!({"x": x * k, "y": y * k}))
+}
+
 fn no_params(p: &Value) -> bool {
     p.as_object().is_none_or(|m| m.is_empty())
 }
@@ -335,6 +370,9 @@ pub fn invoke(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: V
         let tool = Tool::from_name(t).ok_or_else(|| format!("unknown tool `{t}`"))?;
         app.ui.tool = tool;
         return Ok(json!({"tool": tool}));
+    }
+    if let Some(dir) = id.strip_prefix("viewer.nudge.") {
+        return nudge(app, ctx, dir);
     }
     if let Some(k) = id.strip_prefix("timeline.reveal.") {
         if k == "animated" {
@@ -1153,8 +1191,8 @@ fn file_dialog(app: &mut EffectcraftApp, id: &str, params: &Value) -> Option<Res
             f(exts).first().map(|s| json!(s))
         }
         Ask::Save(default) => {
-            let Some(f) = app.hooks.pick_save.as_ref() else { return Some(Err("no file dialog available (pass `path`)".into())) };
-            f(default).map(|s| json!(s))
+            let Some(picked) = app.hooks.save_dialog(default) else { return Some(Err("no file dialog available (pass `path`)".into())) };
+            picked.map(|s| json!(s))
         }
     };
     let Some(v) = picked else { return Some(Ok(Value::Null)) };
@@ -1163,8 +1201,12 @@ fn file_dialog(app: &mut EffectcraftApp, id: &str, params: &Value) -> Option<Res
     if matches!(id, "file.import" | "file.importMultiple") {
         p.insert("background".into(), Value::Bool(true));
     }
-    // Photoshop files ask how to import them first.
-    if id == "file.import" && crate::panels::dialogs::open_form(app, id, &Value::Object(p.clone())) {
+    // Photoshop files ask how to import them first; numbered stills whether to import them as an
+    // image sequence.
+    let picked = Value::Object(p.clone());
+    if id == "file.import" && crate::panels::dialogs::open_form(app, id, &picked)
+        || matches!(id, "file.import" | "file.importMultiple") && crate::panels::forms::open_import_sequence(app, &picked)
+    {
         return Some(Ok(json!({"dialog": id})));
     }
     // Save (untitled) becomes Save As.
@@ -1443,7 +1485,9 @@ pub fn handle_shortcuts(app: &mut EffectcraftApp, ctx: &egui::Context) {
     if ctx.input(|i| i.pointer.any_down()) || ctx.egui_wants_keyboard_input() {
         ctx.data_mut(|d| d.remove::<bool>(space_tap_id()));
     }
-    if ctx.egui_wants_keyboard_input() {
+    // While a menu or popup list is open, keys go to it, not to the app (Space must not start a
+    // preview behind the menu, #279).
+    if ctx.egui_wants_keyboard_input() || crate::widgets::any_menu_open(ctx) {
         return;
     }
     // Text editing in the viewer takes the clipboard events itself.
@@ -1457,7 +1501,11 @@ pub fn handle_shortcuts(app: &mut EffectcraftApp, ctx: &egui::Context) {
             .iter()
             .filter_map(|e| match e {
                 egui::Event::Key { key, pressed: true, modifiers, repeat, .. }
-                    if !*repeat || matches!(key, egui::Key::PageUp | egui::Key::PageDown | egui::Key::ArrowLeft | egui::Key::ArrowRight) =>
+                    if !*repeat
+                        || matches!(
+                            key,
+                            egui::Key::PageUp | egui::Key::PageDown | egui::Key::ArrowLeft | egui::Key::ArrowRight | egui::Key::ArrowUp | egui::Key::ArrowDown
+                        ) =>
                 {
                     Some((*key, *modifiers, true))
                 }
@@ -1469,6 +1517,16 @@ pub fn handle_shortcuts(app: &mut EffectcraftApp, ctx: &egui::Context) {
             })
             .collect()
     });
+    // Numpad * (or `*` typed with Shift+8): Add Marker (#275). egui has no key for it, so it
+    // comes as text.
+    if clipboard && app.dialog.is_none() && ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Text(t) if t == "*"))) {
+        let bound = app.session.shortcuts().bindings().into_iter().find(|(k, _)| *k == "Num*").map(|(_, b)| (b.command.clone(), b.params.clone()));
+        if let Some((id, params)) = bound
+            && let Err(e) = invoke(app, ctx, &id, if params.is_null() { json!({}) } else { params })
+        {
+            app.ui.status = e;
+        }
+    }
     if events.is_empty() {
         return;
     }
@@ -1540,6 +1598,7 @@ pub fn handle_shortcuts(app: &mut EffectcraftApp, ctx: &egui::Context) {
 pub fn menu_bar(app: &mut EffectcraftApp, ui: &mut egui::Ui) {
     let ctx = ui.ctx().clone();
     let mut clicked: Option<(String, Value)> = None;
+    let mut nav = crate::menu_keys::Nav::default();
     ui.horizontal_centered(|ui| {
         ui.add_space(6.0);
         egui::MenuBar::new().ui(ui, |ui| {
@@ -1547,13 +1606,15 @@ pub fn menu_bar(app: &mut EffectcraftApp, ui: &mut egui::Ui) {
                 if let MenuNode::Submenu { label, children } = node {
                     let r = ui.menu_button(crate::i18n::label(app, "", label), |ui| {
                         ui.set_min_width(if label == "Effect" { 200.0 } else { 280.0 });
-                        crate::widgets::menu_scroll(ui, |ui| menu_nodes(app, ui, children, &mut clicked));
+                        crate::widgets::menu_scroll(ui, |ui| menu_nodes(app, ui, children, &mut clicked, &mut nav, 0));
                     });
+                    nav.top(&r.response);
                     app.auto.add(&format!("menu.{label}"), r.response.rect, label);
                 }
             }
         });
     });
+    crate::menu_keys::handle(&ctx, &nav);
     if let Some((id, params)) = clicked
         && let Err(e) = invoke(app, &ctx, &id, if params.is_null() { json!({}) } else { params })
     {
@@ -1568,12 +1629,20 @@ pub(crate) fn menu_contents(app: &mut EffectcraftApp, ui: &mut egui::Ui, name: &
     if let Some(MenuNode::Submenu { children, .. }) =
         effectcraft_engine::menus::menu_bar().iter().find(|n| matches!(n, MenuNode::Submenu { label, .. } if label == name))
     {
-        menu_nodes(app, ui, children, &mut clicked);
+        menu_nodes(app, ui, children, &mut clicked, &mut crate::menu_keys::Nav::default(), 0);
     }
     clicked.map(|(id, params)| (id, if params.is_null() { json!({}) } else { params }))
 }
 
-fn menu_nodes(app: &mut EffectcraftApp, ui: &mut egui::Ui, nodes: &[MenuNode], clicked: &mut Option<(String, Value)>) {
+/// The entries `nodes` of a menu `depth` submenus deep, registered with `nav` for the keyboard.
+fn menu_nodes(
+    app: &mut EffectcraftApp,
+    ui: &mut egui::Ui,
+    nodes: &[MenuNode],
+    clicked: &mut Option<(String, Value)>,
+    nav: &mut crate::menu_keys::Nav,
+    depth: usize,
+) {
     for n in nodes {
         match n {
             MenuNode::Separator => {
@@ -1603,6 +1672,7 @@ fn menu_nodes(app: &mut EffectcraftApp, ui: &mut egui::Ui, nodes: &[MenuNode], c
                         None => r,
                     };
                     app.auto.add(&format!("menu.{name}.{i}"), r.rect, &e.label);
+                    nav.entry(ui, depth, &r, false);
                     if r.clicked() {
                         *clicked = Some((e.command.clone(), e.params.clone()));
                         ui.close();
@@ -1612,18 +1682,56 @@ fn menu_nodes(app: &mut EffectcraftApp, ui: &mut egui::Ui, nodes: &[MenuNode], c
             MenuNode::Submenu { label, children } => {
                 let ws = app.ui.workspace.clone();
                 let shown = crate::i18n::submenu(app, label, effectcraft_engine::menus::submenu_label(&app.session, label, &dyn_ctx(&ws, &[])));
-                ui.menu_button((gutter(false), shown.as_str()), |ui| {
+                let r = ui.menu_button((gutter(false), shown.as_str()), |ui| {
                     ui.set_min_width(if children.len() > 30 { 200.0 } else { 240.0 });
-                    crate::widgets::menu_scroll(ui, |ui| menu_nodes(app, ui, children, clicked));
+                    crate::widgets::menu_scroll(ui, |ui| menu_nodes(app, ui, children, clicked, nav, depth + 1));
                 });
+                nav.entry(ui, depth, &r.response, true);
+                if r.inner.is_some() {
+                    nav.opened(depth, &r.response);
+                }
             }
             MenuNode::Item(e) => {
-                if menu_entry(app, ui, e) {
+                let r = menu_entry(app, ui, e);
+                nav.entry(ui, depth, &r, false);
+                if r.clicked() {
                     *clicked = Some((e.command.clone(), e.params.clone()));
                     ui.close();
                 }
             }
         }
+    }
+}
+
+/// The menu bar's submenu at `path` (`["File", "Interpret Footage"]`) in a panel's context menu,
+/// with the menu bar's labels, shortcuts and enabled state; a chosen entry goes to `clicked`.
+pub(crate) fn submenu_at(app: &mut EffectcraftApp, ui: &mut egui::Ui, path: &[&str], clicked: &mut Option<(String, Value)>) {
+    let mut nodes = effectcraft_engine::menus::menu_bar();
+    let mut found = None;
+    for label in path {
+        let Some(n) = nodes.iter().find(|n| matches!(n, MenuNode::Submenu { label: l, .. } if l == label)) else { return };
+        if let MenuNode::Submenu { children, .. } = n {
+            nodes = children;
+        }
+        found = Some(n);
+    }
+    if let Some(n) = found {
+        menu_nodes(app, ui, std::slice::from_ref(n), clicked, &mut crate::menu_keys::Nav::default(), 0);
+    }
+    if let Some((_, p)) = clicked.as_mut()
+        && p.is_null()
+    {
+        *p = json!({});
+    }
+}
+
+/// The menu bar's entry for `command` in a panel's context menu (see [`submenu_at`]).
+pub(crate) fn entry_for(app: &EffectcraftApp, ui: &mut egui::Ui, command: &str, clicked: &mut Option<(String, Value)>) {
+    if let Some((_, e)) = effectcraft_engine::menus::entries().into_iter().find(|(_, e)| e.command == command)
+        && menu_entry(app, ui, e).clicked()
+    {
+        *clicked = Some((e.command.clone(), e.params_or_empty()));
+        ui.close();
     }
 }
 
@@ -1638,13 +1746,21 @@ fn gutter(checked: bool) -> egui::Atom<'static> {
     (if checked { "✔" } else { "" }).atom_size(egui::vec2(14.0, 14.0))
 }
 
-fn menu_entry(app: &EffectcraftApp, ui: &mut egui::Ui, e: &MenuEntry) -> bool {
-    let label = entry_label(app, e);
-    let mut b = egui::Button::new((gutter(entry_checked(app, e) == Some(true)), label));
+fn menu_entry(app: &EffectcraftApp, ui: &mut egui::Ui, e: &MenuEntry) -> egui::Response {
+    let (label, check, enabled) = (entry_label(app, e), gutter(entry_checked(app, e) == Some(true)), entry_enabled(app, e));
+    // Edit ▸ Label's entries show the label's colour before its name.
+    if e.command == "edit.label"
+        && let Some(l) = e.params.get("label").and_then(Value::as_str).and_then(effectcraft_engine::color::Label::from_name)
+    {
+        let out = ui.add_enabled_ui(enabled, |ui| egui::Button::new((check, crate::widgets::label_swatch(), label)).atom_ui(ui)).inner;
+        crate::widgets::paint_label_swatch(ui, &out, l, &app.tokens);
+        return out.response;
+    }
+    let mut b = egui::Button::new((check, label));
     if let Some(s) = entry_shortcut(app, e) {
         b = b.shortcut_text(shortcut_text(&s));
     }
-    ui.add_enabled(entry_enabled(app, e), b).clicked()
+    ui.add_enabled(enabled, b)
 }
 
 #[cfg(test)]
@@ -1708,6 +1824,47 @@ mod tests {
         let labels: Vec<String> = menu_items(&app).into_iter().filter(|i| i.id == "edit.label").map(|i| i.label).collect();
         assert!(labels.contains(&"Sunflower".to_string()), "{labels:?}");
         assert!(!labels.contains(&"Yellow".to_string()));
+    }
+
+    /// Saving anything but a project asks the save dialog for that file's extension (#293): the
+    /// project dialog, filtered to `.ecproj`, made macOS append `.ecproj` (`Frame.png.ecproj`).
+    /// Hosts with only the project dialog (the web) still get it, given the file name.
+    #[test]
+    fn save_dialogs_offer_the_file_extension() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+        app.session.execute("comp.new", json!({"name": "A", "width": 64, "height": 36, "frameRate": 30, "duration": 1})).unwrap();
+        let ctx = egui::Context::default();
+        let asked: Rc<RefCell<Vec<String>>> = Rc::default();
+        let (a, b) = (asked.clone(), asked.clone());
+        app.hooks.pick_save = Some(Box::new(move |name: &str| {
+            a.borrow_mut().push(format!("project {name}"));
+            None
+        }));
+        app.hooks.pick_save_file = Some(Box::new(move |name: &str, ext: &str| {
+            b.borrow_mut().push(format!("file {name} [{ext}]"));
+            None
+        }));
+        for id in ["comp.saveFrameAs", "render.saveCurrentPreview", "file.exportLottie", "file.saveCopyAsXml", "file.collectFiles", "file.saveAs"] {
+            invoke(&mut app, &ctx, id, json!({})).unwrap();
+        }
+        assert_eq!(
+            *asked.borrow(),
+            [
+                "file Frame.png [png]",
+                "file Preview.mp4 [mp4]",
+                "file Animation.json [json]",
+                "file Untitled Project.ecprojx [ecprojx]",
+                "file Collected Files []",
+                "project Untitled Project.ecproj",
+            ]
+        );
+        // Without the other dialog, the project one names any file.
+        app.hooks.pick_save_file = None;
+        asked.borrow_mut().clear();
+        invoke(&mut app, &ctx, "comp.saveFrameAs", json!({})).unwrap();
+        assert_eq!(*asked.borrow(), ["project Frame.png"]);
     }
 
     #[test]

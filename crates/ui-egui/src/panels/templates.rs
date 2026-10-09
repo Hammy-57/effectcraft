@@ -55,7 +55,7 @@ pub fn home_tab(app: &mut EffectcraftApp, ui: &mut egui::Ui, area: Rect) {
     let ctx = ui.ctx().clone();
     let p = ui.painter().with_clip_rect(area);
     let (x, y, w) = (area.min.x, area.min.y, area.width());
-    p.text(pos2(x, y + 6.0), Align2::LEFT_CENTER, "New from Template", Tokens::semibold(16.0), Color32::WHITE);
+    p.text(pos2(x, y + 6.0), Align2::LEFT_CENTER, crate::i18n::tr("New from Template"), Tokens::semibold(16.0), Color32::WHITE);
     p.text(
         pos2(x, y + 26.0),
         Align2::LEFT_CENTER,
@@ -134,7 +134,7 @@ pub fn home_tab(app: &mut EffectcraftApp, ui: &mut egui::Ui, area: Rect) {
             let mut del_hit = false;
             if !tpl.builtin {
                 let dr = Rect::from_min_size(pos2(tr.max.x - 30.0, tr.min.y + 6.0), vec2(24.0, 24.0));
-                let dresp = ui.interact(dr, egui::Id::new(("template-del", &tpl.id)), Sense::click()).on_hover_text("Delete this template");
+                let dresp = ui.interact(dr, egui::Id::new(("template-del", &tpl.id)), Sense::click()).on_hover_text(crate::i18n::tr("Delete this template"));
                 if resp.hovered() || dresp.hovered() {
                     p.circle_filled(dr.center(), 12.0, if dresp.hovered() { Color32::from_rgb(0xc0, 0x3a, 0x3a) } else { Color32::from_black_alpha(170) });
                     icons::paint(&p, dr.shrink(6.0), Icon::Close, Color32::WHITE);
@@ -194,7 +194,7 @@ mod tests {
     fn gallery_lists_renders_and_opens_templates() {
         let mut app = app_with_store();
         let ctx = egui::Context::default();
-        crate::theme::install(&ctx, &app.tokens);
+        crate::theme::install(&ctx, &app.tokens, crate::i18n::language(&app));
         // File ▸ New ▸ New Project from Template… opens the Templates tab.
         let ev = app.session.execute("file.newFromTemplate", json!({})).unwrap();
         assert_eq!(ev["frontend"], "file.newFromTemplate");
@@ -250,7 +250,7 @@ mod tests {
     fn my_custom_rgb_dialog() {
         let mut app = app_with_store();
         let ctx = egui::Context::default();
-        crate::theme::install(&ctx, &app.tokens);
+        crate::theme::install(&ctx, &app.tokens, crate::i18n::language(&app));
         // Menu check marks follow the active comp's viewer.
         app.session.execute("comp.new", json!({"name": "C", "width": 64, "height": 48})).unwrap();
         let item = crate::menus::menu_items(&app).into_iter().find(|m| m.id == "view.customRgb").expect("menu item");

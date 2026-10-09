@@ -59,6 +59,8 @@ pub enum Icon {
     Keyframe,
     PickWhip,
     Flowchart,
+    /// The Timeline's composition marker bin: a marker tab resting in an open tray.
+    MarkerBin,
     // project items
     Folder,
     Comp,
@@ -435,6 +437,10 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             pen.rect(10.0, 9.5, 14.5, 13.5);
             pen.line(&[(6.0, 4.5), (12.25, 4.5), (12.25, 9.5)]);
         }
+        MarkerBin => {
+            pen.fill(&[(5.0, 2.0), (11.0, 2.0), (11.0, 7.5), (8.0, 10.5), (5.0, 7.5)]);
+            pen.line(&[(2.0, 9.0), (2.0, 14.0), (14.0, 14.0), (14.0, 9.0)]);
+        }
         Folder => pen.closed(&[(1.5, 4.0), (6.0, 4.0), (7.5, 5.5), (14.5, 5.5), (14.5, 13.0), (1.5, 13.0)]),
         Comp => {
             pen.rect(2.0, 3.0, 14.0, 13.0);
@@ -740,13 +746,24 @@ pub fn keyframe(
     left: effectcraft_engine::keyframe::KeyHalf,
     right: effectcraft_engine::keyframe::KeyHalf,
     fill: Color32,
-    outline: Color32,
 ) {
+    painter.extend(keyframe_shapes(center, size, left, right, fill));
+}
+
+/// The halves of a [`keyframe`] glyph. Flat, without a dark outline (as in After Effects), so
+/// keys that overlap read as one shape instead of a tangle of borders (#284); the hairline in
+/// the fill colour closes the seam between the halves.
+fn keyframe_shapes(
+    center: Pos2,
+    size: f32,
+    left: effectcraft_engine::keyframe::KeyHalf,
+    right: effectcraft_engine::keyframe::KeyHalf,
+    fill: Color32,
+) -> Vec<egui::Shape> {
     use effectcraft_engine::keyframe::KeyHalf as H;
     let r = size / 2.0;
-    let half = |pts: Vec<Pos2>| {
-        painter.add(PathShape::convex_polygon(pts, fill, Stroke::new(1.0, outline)));
-    };
+    let mut out = Vec::with_capacity(2);
+    let mut half = |pts: Vec<Pos2>| out.push(PathShape::convex_polygon(pts, fill, Stroke::new(0.5, fill)).into());
     let c = center;
     for (side, h) in [(-1.0f32, left), (1.0, right)] {
         match h {
@@ -774,6 +791,28 @@ pub fn keyframe(
                     hp.push(c + vec2(side * r * 0.8 * t.sin(), r * 0.8 * t.cos()));
                 }
                 half(hp);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use effectcraft_engine::keyframe::KeyHalf as H;
+
+    /// #284: keyframes have no dark border (overlapping keys looked messy): each half is filled
+    /// and edged in the key's own colour.
+    #[test]
+    fn keyframes_are_drawn_without_a_dark_outline() {
+        let fill = egui::Color32::from_gray(0xc0);
+        for (l, r) in [(H::Linear, H::Linear), (H::Bezier, H::Hold), (H::Auto, H::Linear)] {
+            let shapes = super::keyframe_shapes(egui::pos2(10.0, 10.0), 11.0, l, r, fill);
+            assert_eq!(shapes.len(), 2);
+            for s in shapes {
+                let egui::Shape::Path(p) = s else { panic!("a path: {s:?}") };
+                assert_eq!(p.fill, fill);
+                assert!(p.stroke.width <= 0.5 && p.stroke.color == egui::epaint::ColorMode::Solid(fill), "{:?}", p.stroke);
             }
         }
     }

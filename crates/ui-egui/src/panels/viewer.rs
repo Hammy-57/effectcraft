@@ -159,7 +159,7 @@ enum Gesture {
         start: Pos2,
     },
     /// Puppet tool Record mode (⌘/Ctrl-drag a pin): the drag is sampled in real time (seconds
-    /// since it began, layer space) and becomes keyframes on release (`puppet.recordPin`); the
+    /// since it began, effect space) and becomes keyframes on release (`puppet.recordPin`); the
     /// current time runs along while recording.
     PuppetRecord {
         layer: LayerId,
@@ -243,6 +243,18 @@ pub(crate) fn l2c(ctx: &EvalCtx, layer: &Layer) -> (Mat3, f64) {
         Some(cam) if layer.is_3d() => (three_d::layer_to_view(ctx, layer, &cam), 0.0),
         _ => ctx.layer_to_comp(layer),
     }
+}
+
+/// `l2c` (layer → comp) applied from effect space instead: effect points and Puppet pins,
+/// measured from the top-left of the layer's effect bounds (see `effect_bounds`).
+pub(crate) fn from_effect_space(ctx: &EvalCtx, layer: &Layer, l2c: Mat3) -> Mat3 {
+    let o = ctx.effect_bounds(layer).1;
+    l2c * Mat3::translate(gv2(o[0], o[1]))
+}
+
+/// Effect space → comp (viewer) matrix through the current 3D view.
+pub(crate) fn fx2c(ctx: &EvalCtx, layer: &Layer) -> Mat3 {
+    from_effect_space(ctx, layer, l2c(ctx, layer).0)
 }
 
 /// Layer → comp matrix and its bounds quad (in comp pixels).
@@ -454,7 +466,7 @@ fn aux_views(
                 p.rect_stroke(Rect::from_center_size(cr.center(), cr.size() * k), 0.0, Stroke::new(1.0, Color32::from_white_alpha(120)), StrokeKind::Middle);
             }
         }
-        let label = if comp.has_3d() { v.label() } else { "Active Camera" };
+        let label = if comp.has_3d() { v.label() } else { crate::i18n::tr("Active Camera") };
         p.text(r.left_bottom() + vec2(8.0, -8.0), Align2::LEFT_BOTTOM, label, Tokens::ui(11.0), Color32::from_white_alpha(200));
         app.auto.add(&format!("viewer.view.{}", v.id()), r, label);
     }
@@ -511,7 +523,7 @@ fn locked_pane(app: &mut EffectcraftApp, ui: &mut egui::Ui, full: Rect, bg: Colo
     p.rect_filled(cr, 0.0, Color32::from_rgb((b[0] * 255.0) as u8, (b[1] * 255.0) as u8, (b[2] * 255.0) as u8));
     p.image(tex.id(), cr, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
     p.rect_stroke(cr, 0.0, Stroke::new(1.0, Color32::from_black_alpha(160)), StrokeKind::Outside);
-    let label = format!("Locked: {name} \u{2014} {}", if comp.has_3d() { lv.view.label() } else { "Active Camera" });
+    let label = crate::i18n::tr_args("Locked: {} — {}", &[&name, &(if comp.has_3d() { lv.view.label() } else { crate::i18n::tr("Active Camera") })]);
     p.text(r.left_top() + vec2(8.0, 8.0), Align2::LEFT_TOP, &label, Tokens::ui(11.0), Color32::from_white_alpha(210));
     app.auto.add("viewer.locked", r, &label);
     // Close the locked viewer.
@@ -919,6 +931,9 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
 
     // Puppet pins and meshes of the selected layers (Puppet tools).
     let mut pin_hits: Vec<super::puppet_tool::PinHit> = vec![];
+    // The selected layers with a Puppet effect, top of the stack first (the layers the Puppet
+    // tools work on).
+    let mut puppet_layers: Vec<(&Layer, super::puppet_tool::Overlay)> = vec![];
     if app.ui.tool.puppet_kind().is_some() {
         let sel_props: Vec<u64> = app.session.state.selected_props.iter().map(|(_, u)| *u).collect();
         for lid in &selected {
@@ -927,8 +942,10 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             {
                 let hover = ui.input(|i| i.pointer.hover_pos());
                 pin_hits.extend(super::puppet_tool::draw(&painter, &map, &ectx, l, &ov, app.session.state.puppet.show_mesh, &sel_props, hover));
+                puppet_layers.push((l, ov));
             }
         }
+        puppet_layers.sort_by_key(|(l, _)| comp.index_of(l.id));
         for h in &pin_hits {
             app.auto.add(&format!("viewer.puppetPin.{}", h.pin), Rect::from_center_size(h.pos, vec2(10.0, 10.0)), "Puppet pin");
             if let Some(hp) = h.handle {
@@ -938,6 +955,14 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             }
         }
     }
+    // The layer a Puppet tool press works on: while selected layers are rigged, only those
+    // ([`super::puppet_tool::target`]); otherwise the layer under the pointer, selected.
+    let puppet_layer = |app: &mut EffectcraftApp, cpt: [f64; 2]| -> Option<LayerId> {
+        if puppet_layers.is_empty() {
+            return pick(app, &ectx, cpt, false);
+        }
+        super::puppet_tool::target(&ectx, &puppet_layers, cpt, |l| layers_at(&ectx, cpt).any(|h| h.id == l.id))
+    };
 
     // Project items, files and effects dropped on the viewer.
     super::viewer_drop::show(app, ui, &painter, &map, &ectx);
@@ -961,7 +986,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     resp.context_menu(|ui| {
         let hits = ui.data(|d| d.get_temp::<Vec<(u64, String)>>(menu_hits_id)).unwrap_or_default();
         if !hits.is_empty() {
-            ui.menu_button("Select", |ui| {
+            ui.menu_button(crate::i18n::tr("Select"), |ui| {
                 crate::widgets::menu_scroll(ui, |ui| {
                     for (id, name) in &hits {
                         if ui.button(name).clicked() {
@@ -974,7 +999,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             ui.separator();
         }
         if context_layers.is_empty() {
-            ui.label("No unlocked layer selected");
+            ui.label(crate::i18n::tr("No unlocked layer selected"));
         } else {
             super::timeline::layer_menu(ui, &context_layers, &mut context_actions);
         }
@@ -1140,7 +1165,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             t if t.is_shape() => Some(Gesture::Create { tool: t, start: cpt }),
             t if t.puppet_kind().is_some() && super::puppet_tool::hit(&pin_hits, press).is_none() => {
                 // Off the pins: Alt or a press outside the art drags a marquee that selects pins.
-                (mods.alt || pick(app, &ectx, cpt, false).is_none()).then_some(Gesture::PinMarquee { start: press })
+                (mods.alt || puppet_layer(app, cpt).is_none()).then_some(Gesture::PinMarquee { start: press })
             }
             t if t.puppet_kind().is_some() => super::puppet_tool::hit(&pin_hits, press).and_then(|(h, part)| {
                 use super::puppet_tool::PinPart;
@@ -1156,7 +1181,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     PinPart::Center => {}
                 }
                 let l = comp.layer(h.layer)?;
-                let inv = l2c(&ectx, l).0.inverse()?;
+                let inv = fx2c(&ectx, l).inverse()?;
                 if mods.command {
                     let lp = inv.apply(gv2(cpt[0], cpt[1]));
                     let began = ui.input(|i| i.time);
@@ -1242,8 +1267,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                         })
                         .collect();
                     // Snap the grabbed layer's feature nearest the pointer (AE's snap handle).
-                    let features = app.session.state.snap_features;
-                    let snap_src = comp.layer(l).map(|layer| effectcraft_engine::viewer::layer_features(&ectx, layer, features)).and_then(|f| {
+                    let snap_src = comp.layer(l).map(|layer| effectcraft_engine::viewer::layer_features(&ectx, layer)).and_then(|f| {
                         let c = map.to_comp(press);
                         f.into_iter().min_by(|a, b| {
                             let da = (a[0] - c[0]).powi(2) + (a[1] - c[1]).powi(2);
@@ -1398,7 +1422,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 let speed = app.session.state.puppet.record_speed.max(1.0) / 100.0;
                 app.session.set_time(cti + Tick::from_seconds_f64(now / speed));
                 painter.circle_filled(pos, 6.0, Color32::from_rgb(0xe0, 0x30, 0x30));
-                painter.text(pos + vec2(10.0, -10.0), Align2::LEFT_BOTTOM, "Recording", Tokens::ui(11.0), Color32::from_rgb(0xff, 0x60, 0x60));
+                painter.text(pos + vec2(10.0, -10.0), Align2::LEFT_BOTTOM, crate::i18n::tr("Recording"), Tokens::ui(11.0), Color32::from_rgb(0xff, 0x60, 0x60));
                 ui.data_mut(|dd| dd.insert_temp(gid, Gesture::PuppetRecord { layer, pin, others, inv, began, cti, samples }));
                 ui.ctx().request_repaint();
             }
@@ -1576,8 +1600,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 if let Some((h, _)) = super::puppet_tool::hit(&pin_hits, pos) {
                     // Click selects the pin; Shift-click adds or removes it.
                     let _ = app.session.execute("puppet.selectPins", json!({"layer": h.layer.0, "pins": [h.pin], "toggle": mods.shift}));
-                } else if let Some(l) = pick(app, &ectx, cpt, false).and_then(|l| comp.layer(l))
-                    && let Some(inv) = l2c(&ectx, l).0.inverse()
+                } else if let Some(l) = puppet_layer(app, cpt).and_then(|l| comp.layer(l))
+                    && let Some(inv) = fx2c(&ectx, l).inverse()
                 {
                     let lp = inv.apply(gv2(cpt[0], cpt[1]));
                     match app.session.execute("puppet.addPin", json!({"layer": l.id.0, "kind": t.puppet_kind(), "position": [lp.x, lp.y]})) {
@@ -1609,8 +1633,13 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         && let Some(pos) = resp.interact_pointer_pos()
         && let Some((l, m)) = vertex_at(pos, false).map(|h| (h.layer, h.mask)).or_else(|| ov::segment_at(&paths, &map, pos, 6.0).map(|s| (s.0, s.1)))
     {
-        // Double-click a path: free transform its points (Layer ▸ Mask and Shape Path ▸ Free
-        // Transform Points).
+        // Double-click a path: all its points selected in a free-transform box (Layer ▸ Mask and
+        // Shape Path ▸ Free Transform Points), so dragging any of them, or inside the box, moves
+        // the whole path (After Effects).
+        if let Some(p) = paths.iter().find(|p| p.layer == l && p.uid == m) {
+            let all: Vec<serde_json::Value> = (0..p.sp.vertices.len()).map(|index| json!({"layer": l.0, "mask": m, "index": index})).collect();
+            let _ = app.session.execute("mask.selectVertices", json!({"vertices": all}));
+        }
         ov::begin_free_transform(&ctx, l, m);
     } else if resp.double_clicked()
         && !text_owns
@@ -1634,7 +1663,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     if app.playback.playing && app.playback.waiting {
         let r = Rect::from_min_size(area.min + vec2(10.0, 10.0), vec2(150.0, 22.0));
         painter.rect_filled(r, 11.0, Color32::from_black_alpha(170));
-        painter.text(r.center(), Align2::CENTER_CENTER, "Caching frames…", Tokens::ui(11.5), t.cache_green);
+        painter.text(r.center(), Align2::CENTER_CENTER, crate::i18n::tr("Caching frames…"), Tokens::ui(11.5), t.cache_green);
     }
 
     vt::draw_snap(&ctx, &painter, &map, &ectx);
@@ -1918,7 +1947,7 @@ fn empty_state(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let p = ui.painter();
     p.rect_filled(rect, 0.0, t.pasteboard);
     let c = rect.center();
-    p.text(c - vec2(0.0, 40.0), Align2::CENTER_CENTER, "Composition", Tokens::semibold(16.0), t.text);
+    p.text(c - vec2(0.0, 40.0), Align2::CENTER_CENTER, crate::i18n::tr("Composition"), Tokens::semibold(16.0), t.text);
     let b1 = Rect::from_center_size(c + vec2(0.0, 0.0), vec2(220.0, 30.0));
     if widgets::text_button(ui, b1, "New Composition", true, &t, egui::Id::new("empty-newcomp")).clicked() {
         crate::panels::dialogs::open_new_comp(app);

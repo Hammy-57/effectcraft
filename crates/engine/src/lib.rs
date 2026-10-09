@@ -15,7 +15,6 @@ pub mod camera_track;
 pub mod commands;
 pub mod config;
 pub mod demo;
-pub mod ease_presets;
 pub mod footage_check;
 pub mod guard;
 pub mod history;
@@ -37,6 +36,7 @@ pub mod remote;
 pub mod render_queue;
 pub mod roto;
 pub mod scriptui;
+pub mod sequence;
 mod session_settings;
 pub mod shortcuts;
 pub mod storage;
@@ -115,6 +115,19 @@ pub trait Services: Send + Sync {
         }
         self.write_file(path, data)
     }
+    /// The files in folder `dir` (full paths; no folders, no hidden files), for image-sequence
+    /// detection on import. Empty when it can't be read.
+    fn list_dir(&self, dir: &str) -> Vec<String> {
+        let Ok(rd) = std::fs::read_dir(if dir.is_empty() { "." } else { dir }) else { return vec![] };
+        rd.filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()) && !e.file_name().to_string_lossy().starts_with('.'))
+            .map(|e| e.path().to_string_lossy().to_string())
+            .collect()
+    }
+    /// Whether `path` is a folder (dropped or picked folders import their files).
+    fn is_dir(&self, path: &str) -> bool {
+        std::path::Path::new(path).is_dir()
+    }
 }
 
 /// Native filesystem.
@@ -164,11 +177,15 @@ impl Services for FsServices {
 
 /// Imports media files into the project (implemented by the media layer).
 pub trait Importer: Send + Sync {
-    /// Probe a file and return footage metadata.
+    /// Probe one file and return footage metadata. Image sequences are the engine's
+    /// ([`sequence`]): it groups numbered stills and probes their first file here.
     fn probe(&self, path: &str) -> std::result::Result<effectcraft_project::Footage, String>;
     /// A footage file's bytes are now at `path` (extracted from a template): hosts whose media
     /// layer reads from memory (the browser) register them; file-based ones need nothing.
     fn register(&self, _path: &str, _data: &[u8]) {}
+    /// An image sequence's other frames (its first was probed) are footage now: hosts whose
+    /// media layer reads from memory (the browser) register them; file-based ones need nothing.
+    fn add_frames(&self, _paths: &[String]) {}
 }
 
 /// A keyframe reference: layer, property uid, key time (layer time).
@@ -427,8 +444,9 @@ pub struct Session {
     pub config: Option<Arc<dyn config::ConfigStore>>,
     /// Keyboard shortcut presets.
     pub keymaps: shortcuts::Keymaps,
-    /// User ease presets (Window ▸ Ease Presets; the built-in ones are in [`ease_presets`]).
-    pub ease_presets: Vec<ease_presets::EasePreset>,
+    /// Scripts' `app.settings`, kept in the settings store (see
+    /// [`commands::scripts::SCRIPT_SETTINGS_FILE`]).
+    pub script_settings: commands::scripts::ScriptSettings,
     /// Frontend-only commands offered for binding.
     pub ui_commands: Vec<shortcuts::UiCommand>,
     /// Cache of the resolved active preset (read it with [`Session::shortcuts`]).
@@ -542,7 +560,7 @@ impl Default for Session {
             prefs_revision: 0,
             config: None,
             keymaps: shortcuts::Keymaps::default(),
-            ease_presets: vec![],
+            script_settings: Default::default(),
             ui_commands: vec![],
             shortcut_table: std::sync::OnceLock::new(),
             autosave: autosave::AutoSaveState::default(),
@@ -970,31 +988,49 @@ impl Session {
 
 /// Bring effect instances saved by earlier versions up to date with the effect registry
 /// (renamed / regrouped / added parameters, reordered popups; see
-/// [`effectcraft_effects::migrate`]).
+/// [`effectcraft_effects::migrate`]), and a project from before
+/// [`effectcraft_project::SCHEMA_EFFECT_SPACE`] into effect space
+/// ([`effectcraft_effects::migrate::to_effect_space`]). Stamps the current schema.
 pub fn upgrade_effects(p: &mut Project) {
-    let mut sizes = std::collections::HashMap::new();
+    let to_effect_space = p.schema < effectcraft_project::SCHEMA_EFFECT_SPACE;
+    // Effect bounds per layer: (size, top-left in layer coordinates).
+    let mut bounds = std::collections::HashMap::new();
     for (cid, c) in p.comps() {
         for l in &c.layers {
-            let (w, h) = effectcraft_render::source_size(p, l);
-            sizes.insert((*cid, l.id), if w == 0 { [c.width as f64, c.height as f64] } else { [w as f64, h as f64] });
+            let (size, origin) = effectcraft_render::effect_bounds(p, c, l);
+            bounds.insert((*cid, l.id), (size, origin, matches!(l.source, effectcraft_project::LayerSource::Shape)));
         }
     }
     let mut next = p.next_id;
     for (cid, it) in p.items.iter_mut() {
         let effectcraft_project::ItemKind::Comp(c) = &mut it.kind else { continue };
         for l in &mut std::sync::Arc::make_mut(c).layers {
-            let size = sizes.get(&(*cid, l.id)).copied().unwrap_or([100.0, 100.0]);
+            let (size, origin, _) = bounds.get(&(*cid, l.id)).copied().unwrap_or(([100.0, 100.0], [0.0; 2], false));
+            // Effect space starts at the bounds' top-left: positions move by minus that corner.
+            // Adjustment layers run their effects on the comp below as it is: nothing moves.
+            // Shape layers already measured effect points from their anchor-centred comp-sized
+            // canvas before schema 2 (as After Effects does): nothing moves either.
+            let shift = |o: [f64; 2]| [-o[0], -o[1]];
+            let d = if l.switches.adjustment || matches!(l.source, effectcraft_project::LayerSource::Shape) { [0.0; 2] } else { shift(origin) };
+            let clone_d = |src: Option<u64>| match src {
+                Some(id) => bounds.get(&(*cid, effectcraft_project::LayerId(id))).map_or([0.0; 2], |b| if b.2 { [0.0; 2] } else { shift(b.1) }),
+                None => d,
+            };
             let Some(fx) = l.props.sub_mut("effects") else { continue };
             for n in &mut fx.children {
                 let effectcraft_project::Node::Group(g) = n else { continue };
                 let effectcraft_project::GroupKind::Effect { effect } = &g.kind else { continue };
                 if let Some(spec) = effectcraft_effects::find(effect) {
                     effectcraft_effects::migrate::upgrade_instance(spec, g, &mut effectcraft_project::build::Ids(&mut next), size);
+                    if to_effect_space {
+                        effectcraft_effects::migrate::to_effect_space(spec, g, size, d, &clone_d);
+                    }
                 }
             }
         }
     }
     p.next_id = next;
+    p.schema = effectcraft_project::SCHEMA_VERSION;
 }
 
 #[cfg(test)]
@@ -1015,8 +1051,6 @@ mod tests_codec_options;
 mod tests_color_view;
 #[cfg(test)]
 mod tests_disk_cache;
-#[cfg(test)]
-mod tests_ease_presets;
 #[cfg(test)]
 mod tests_effects;
 #[cfg(test)]
@@ -1053,6 +1087,8 @@ mod tests_project_items;
 mod tests_proxy;
 #[cfg(test)]
 mod tests_rig3d;
+#[cfg(test)]
+mod tests_sequence;
 #[cfg(test)]
 mod tests_settings;
 #[cfg(test)]

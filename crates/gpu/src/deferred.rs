@@ -253,8 +253,6 @@ pub(crate) fn chain_key(chain: &[FxStep], buf: &Buf, levels: Option<f32>) -> u12
         k.debug(&e.working_space);
         k.u64(e.working_linear as u64);
         k.debug(&e.shutter);
-        k.f64(e.bounds_origin[0]);
-        k.f64(e.bounds_origin[1]);
         k.debug(&e.comp_space);
     }
     k.finish()

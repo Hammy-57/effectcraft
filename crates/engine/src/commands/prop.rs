@@ -144,7 +144,7 @@ fn get(s: &mut Session, p: &Value) -> Result<Value> {
 fn toggle_anim(s: &mut Session, p: &Value) -> Result<Value> {
     let (cid, lid, uid) = prop_ref(s, p, "prop.toggleAnimation")?;
     let on = b_p(p, "value");
-    with_prop(s, "Toggle Animation", None, cid, lid, uid, |pr, lt| {
+    with_prop(s, "Toggle Animation", merge_p(p), cid, lid, uid, |pr, lt| {
         if pr.static_only {
             return Err(bad("prop.toggleAnimation", "this property can't be animated"));
         }
@@ -589,7 +589,8 @@ fn interpolation(s: &mut Session, p: &Value) -> Result<Value> {
     let roving = b_p(p, "roving");
     edit_keys(s, "Keyframe Interpolation", None, move |keys, i, _| {
         if let Some(sp) = spatial.as_deref() {
-            let (tin, tout) = effectcraft_keyframe::spatial_tangents(keys, i);
+            // (Bezier keeps the current handles, with handles where the path left straight.)
+            let (tin, tout) = effectcraft_keyframe::spatial_handles(keys, i);
             let k = &mut keys[i];
             match sp {
                 "linear" => {
@@ -769,7 +770,7 @@ pub fn specs() -> Vec<CommandSpec> {
     vec![
         query!("prop.get", "Get Property", "{layer?, path|prop, time? (comp s)}", get),
         cmd!("prop.set", "Set Property Value", [], None, "{layer?, path|prop, value, time?, merge?}", has_layers, set),
-        cmd!("prop.toggleAnimation", "Toggle Stopwatch", [], None, "{layer?, path|prop, value?}", has_layers, toggle_anim),
+        cmd!("prop.toggleAnimation", "Toggle Stopwatch", [], None, "{layer?, path|prop, value?, merge?}", has_layers, toggle_anim),
         cmd!("prop.addKey", "Add Keyframe", [], None, "{layer?, path|prop, time?, value?}", has_layers, add_key),
         cmd!("prop.toggleKey", "Add or Remove Keyframe at Current Time", [], None, "{layer?, path|prop}", has_layers, toggle_key),
         cmd!(

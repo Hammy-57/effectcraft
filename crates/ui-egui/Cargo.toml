@@ -37,6 +37,7 @@ sys-locale = { workspace = true }
 [dev-dependencies]
 egui_kittest = { workspace = true, features = ["eframe", "wgpu"] }
 effectcraft-host = { workspace = true }
+exr = { workspace = true }
 
 [build-dependencies]
 serde_json = { workspace = true }

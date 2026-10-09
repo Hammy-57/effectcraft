@@ -20,7 +20,7 @@ use effectcraft_raster::{Image, Px};
 use rayon::prelude::*;
 
 use crate::generate::value_noise;
-use crate::util::{SRC_NAMES, Src, fit_layer, layer_rect, lerp4, map_xy, pick, pin_rect, premul, remap, smoothstep, src_at, unpremul};
+use crate::util::{SRC_NAMES, Src, fit_layer, layer_rect, lerp4, map_xy, pick, premul, remap, smoothstep, src_at, unpremul};
 use crate::{Buf, EffectCtx, EffectSpec, col, num, p, popup, slider};
 
 fn spec(id: &'static str, name: &'static str, params: Vec<crate::ParamSpec>, render: crate::RenderFn) -> EffectSpec {
@@ -103,7 +103,7 @@ fn turbulent_displace(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let locked = pin_raw >= 8;
     let pin = if locked { pin_raw - 7 } else { pin_raw };
     let falloff = if (3..=5).contains(&kind) { 0.3 } else { 0.5 };
-    let (lx, ly, lw, lh) = pin_rect(ctx, b.offset, b.scale);
+    let (lx, ly, lw, lh) = layer_rect(ctx, &b);
     let edge = (lw.min(lh) * if locked { 0.25 } else { 0.1 }).max(1.0);
     let seed = (ctx.seed ^ 0x7d15).wrapping_add((ctx.params.f("evolutionOptions/randomSeed") as i64 as u32).wrapping_mul(0x9e37_79b9));
     let n = |u: f64, v: f64, s: u32| {

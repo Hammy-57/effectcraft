@@ -165,7 +165,10 @@ pub fn shapes(ctx: &EvalCtx, layer: &Layer) -> Vec<effectcraft_effects::MaskShap
 /// Returns whether any mask was applied.
 pub fn apply(ctx: &EvalCtx, layer: &Layer, buf: &mut Buf, blur: MaskBlur) -> bool {
     let Some(masks) = layer.masks() else { return false };
-    let list: Vec<_> = masks.groups().filter(|g| g.enabled && matches!(g.kind, GroupKind::Mask { mode, .. } if mode != MaskMode::None)).collect();
+    // An open mask (a path the Pen is still drawing) makes no transparency: the layer shows
+    // whole until the path is closed (After Effects; effects still use it as a path).
+    let closed = |g: &effectcraft_project::PropGroup| matches!(ctx.group_value(layer, g, "path"), Some(Value::Path(sp)) if sp.closed);
+    let list: Vec<_> = masks.groups().filter(|g| g.enabled && matches!(g.kind, GroupKind::Mask { mode, .. } if mode != MaskMode::None) && closed(g)).collect();
     if list.is_empty() {
         return false;
     }

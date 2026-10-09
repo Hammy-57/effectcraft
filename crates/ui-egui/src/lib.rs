@@ -20,6 +20,7 @@ pub mod header;
 pub mod i18n;
 pub mod icons;
 mod local_assets;
+pub mod menu_keys;
 pub mod menus;
 pub mod native_menu;
 pub mod panels;
@@ -126,14 +127,32 @@ pub struct Hooks {
     pub audio_devices: Option<Box<dyn Fn() -> Vec<String>>>,
     /// Picks a folder (Settings paths).
     pub pick_folder: Option<Box<dyn Fn() -> Option<String>>>,
-    /// Save dialog for other file kinds: (default name or path, extension). A default path opens
-    /// the dialog in its folder.
+    /// Save dialog for other file kinds: (default name or path, extension; empty: no filter). A
+    /// default path opens the dialog in its folder.
     pub pick_save_file: Option<Box<dyn Fn(&str, &str) -> Option<String>>>,
     /// The system clipboard's text (native menu Edit ▸ Paste into a text field).
     pub clipboard_text: Option<Box<dyn Fn() -> Option<String>>>,
     /// Application actions the OS performs (`app.hide`, `app.hideOthers`, `app.showAll` on
     /// macOS). Returns false when the host doesn't handle the id.
     pub app_action: Option<Box<dyn Fn(&str) -> bool>>,
+}
+
+impl Hooks {
+    /// The host's save dialog for `default` (a file name or path), offering its extension: the
+    /// project dialog for project files, else [`Hooks::pick_save_file`]. The project dialog is
+    /// the fallback for hosts without that (the web, whose dialog only names the file): on macOS
+    /// a dialog filtered to projects appends `.ecproj` to any other name (#293). `None` when the
+    /// host has no save dialog; `Some(None)` when it was cancelled.
+    pub fn save_dialog(&self, default: &str) -> Option<Option<String>> {
+        let path = std::path::Path::new(default);
+        let ext = path.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_default();
+        match (&self.pick_save_file, &self.pick_save) {
+            (Some(pick), _) if !ext.eq_ignore_ascii_case("ecproj") => Some(pick(default, &ext)),
+            (_, Some(pick)) => Some(pick(&path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default())),
+            (Some(pick), None) => Some(pick(default, &ext)),
+            (None, None) => None,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -217,6 +236,8 @@ pub struct EffectcraftApp {
     last_time: f64,
     styled: bool,
     fonts_ready: bool,
+    /// The interface language the fonts were installed for; `""` until the first frame.
+    styled_language: &'static str,
     pub(crate) control_rx: Option<Receiver<ControlRequest>>,
     pub(crate) deferred: Vec<(ControlRequest, f64)>,
     pub(crate) synthetic: Vec<egui::Event>,
@@ -303,6 +324,7 @@ impl EffectcraftApp {
             last_time: 0.0,
             styled: false,
             fonts_ready: false,
+            styled_language: "",
             control_rx: None,
             deferred: vec![],
             synthetic: vec![],
@@ -377,6 +399,10 @@ impl EffectcraftApp {
         theme::apply_visuals(ctx, &self.tokens);
         let tips = p.general.show_tool_tips;
         ctx.all_styles_mut(|s| s.interaction.tooltip_delay = if tips { 0.5 } else { f32::INFINITY });
+        // Settings ▸ Appearance ▸ UI Scale (#284). egui's own Ctrl+= / Ctrl+- / Ctrl+0 zoom stays
+        // off: Ctrl+0 is Window ▸ Project, and the scale is a setting.
+        ctx.options_mut(|o| o.zoom_with_keyboard = false);
+        ctx.set_zoom_factor(p.appearance.ui_scale as f32 / 100.0);
         self.ui.cache_when_idle = p.previews.cache_frames_when_idle;
         self.ui.viewer.fast_preview = p.previews.fast_previews;
         self.frames.set_budget(p.cache_budgets(self.session.sys_memory).preview);
@@ -1575,10 +1601,17 @@ impl eframe::App for EffectcraftApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.apply_gpu_failure(ctx);
         ctx.set_cursor_image(None);
-        if !self.styled {
-            theme::install(ctx, &self.tokens);
-            fit_window(ctx);
-            self.styled = true;
+        // The CJK fallback fonts depend on the interface language, so they follow a change of
+        // Settings ▸ General ▸ Language instead of only the first frame.
+        let language = crate::i18n::language(self);
+        crate::i18n::set_current(language);
+        if !self.styled || self.styled_language != language {
+            theme::install(ctx, &self.tokens, language);
+            self.styled_language = language;
+            if !self.styled {
+                fit_window(ctx);
+                self.styled = true;
+            }
             ctx.request_repaint();
         } else {
             self.fonts_ready = true;

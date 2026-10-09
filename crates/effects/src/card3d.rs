@@ -298,11 +298,34 @@ pub struct CompLight {
 /// The comp's camera and lights relative to the effect's layer.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct CompScene {
-    /// Layer pixels (x, y, z) → layer pixels, homogeneous rows X, Y, W: the comp camera's view
-    /// of the layer brought back into the layer's own pixel grid (identity on the layer plane
-    /// for the default camera).
+    /// Effect-space pixels (x, y, z) → effect-space pixels, homogeneous rows X, Y, W: the comp
+    /// camera's view of the layer brought back into the layer's own pixel grid (identity on the
+    /// layer plane for the default camera).
     pub camera: Option<[[f64; 4]; 3]>,
     pub light: Option<CompLight>,
+}
+
+impl CompScene {
+    /// The scene measured from `origin` (in its current coordinates, as [`crate::Buf::rebase`]):
+    /// a point `p` becomes `p − origin`.
+    pub fn rebased(mut self, origin: [f64; 2]) -> CompScene {
+        if let Some(c) = &mut self.camera {
+            for row in c.iter_mut() {
+                row[3] += row[0] * origin[0] + row[1] * origin[1];
+            }
+            let w = c[2];
+            for (row, o) in c.iter_mut().zip(origin) {
+                for (v, wv) in row.iter_mut().zip(w) {
+                    *v -= o * wv;
+                }
+            }
+        }
+        if let Some(l) = &mut self.light {
+            l.pos[0] -= origin[0];
+            l.pos[1] -= origin[1];
+        }
+        self
+    }
 }
 
 fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {

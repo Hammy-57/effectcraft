@@ -282,6 +282,71 @@ fn exr_sequence_is_linear() {
     assert!((c[2] - 0.1329).abs() < 0.01 && (c[3] - 1.0).abs() < 1e-6, "{c:?}");
 }
 
+/// A 32 bpc project whose only layer is a full-frame opaque solid of the given colour.
+fn bright_project(color: [f32; 3]) -> (Project, ItemId) {
+    let mut p = Project::default();
+    p.settings.bit_depth = effectcraft_project::BitDepth::Bpc32;
+    let comp = Comp::new(W, H, FrameRate::new(10, 1), Tick::from_seconds_f64(0.1));
+    let sid = p.add_item("Bright", Label::Red, None, ItemKind::Solid(Solid { color, width: W, height: H, pixel_aspect: 1.0 }));
+    let mut comp = comp;
+    let l = build::layer(&mut p, &comp, "Bright", LayerSource::Solid { item: sid }, (W, H), None);
+    comp.layers.push(l);
+    let cid = p.add_item("Comp 1", Label::Sandstone, None, ItemKind::Comp(comp.into()));
+    (p, cid)
+}
+
+/// Export one frame of a 32 bpc solid to an EXR sequence and read its centre pixel.
+fn exr_centre(color: [f32; 3], channels: Channels, name: &str) -> [f32; 4] {
+    let (p, cid) = bright_project(color);
+    let d = out_dir(name);
+    let mut om = OutputModule::for_format(OutputFormat::ExrSequence);
+    om.channels = channels;
+    let s = RenderSettings { time_span: TimeSpan::LengthOfComp, ..Default::default() };
+    let path = d.join("f_[#####].exr").to_string_lossy().to_string();
+    let job = Job {
+        project: &p,
+        footage: &NoFootage,
+        expr: None,
+        accel: None,
+        comp: cid,
+        settings: &s,
+        output: &om,
+        path: &path,
+        sink: None,
+        options: Default::default(),
+        nested_switches: true,
+    };
+    export(&job, &mut |_| true).expect("export");
+    let img = image::open(d.join("f_00000.exr")).expect("exr").to_rgba32f();
+    img.get_pixel(W / 2, H / 2).0
+}
+
+/// The sRGB decode of the frame the writer is handed (the solid is sRGB-encoded in the frame).
+fn lin(v: f32) -> f32 {
+    effectcraft_color::srgb_to_linear(v)
+}
+
+#[test]
+fn exr_sequence_keeps_values_above_one() {
+    // Issue #339: a 32 bpc project's over-range colour must reach the EXR, in scene-linear light.
+    let src = [1.5, 1.25, 0.75];
+    for channels in [Channels::Rgba, Channels::Rgb] {
+        let c = exr_centre(src, channels, "seq-exr-over");
+        for i in 0..3 {
+            assert!((c[i] - lin(src[i])).abs() < 1e-3 * lin(src[i]).max(1.0), "{channels:?} channel {i}: {c:?}");
+        }
+        assert!(c[0] > 1.5 && c[1] > 1.25, "{channels:?} not clamped: {c:?}");
+        assert!((c[3] - 1.0).abs() < 1e-6, "{c:?}");
+    }
+}
+
+#[test]
+fn exr_sequence_values_at_or_below_one_are_unchanged() {
+    for channels in [Channels::Rgba, Channels::Rgb] {
+        let c = exr_centre([1.0, 0.4, 0.0], channels, "seq-exr-in-range");
+        assert!((c[0] - 1.0).abs() < 1e-4 && (c[1] - lin(0.4)).abs() < 1e-4 && c[2].abs() < 1e-6, "{channels:?}: {c:?}");
+    }
+}
 #[test]
 fn gif_roundtrip() {
     let (p, cid) = project(None);

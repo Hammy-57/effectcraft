@@ -95,7 +95,7 @@ fn bulge(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
     let h = ctx.params.f("height") * effectcraft_effects::BULGE_STRENGTH;
     let taper = 1.0 + ctx.params.f("taperRadius").max(0.0) / 100.0 * 3.0;
     let pin = ctx.params.b("pinAllEdges");
-    let (x0, y0, lw, lh) = util::pin_rect(ctx, b.offset, b.scale);
+    let (x0, y0, lw, lh) = util::layer_rect_at(ctx, b.offset, b.scale);
     let edge = (lw.min(lh) * 0.1).max(1.0);
     let mut p = Params::default();
     p.f[0] = [c.0 as f32, c.1 as f32, rx as f32, ry as f32];
@@ -115,7 +115,7 @@ fn wave_warp(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     if pad > 0.0 {
         b.pad(e, pad as u32)?;
     }
-    let (x0, y0, lw, lh) = util::pin_rect(ctx, b.offset, b.scale);
+    let (x0, y0, lw, lh) = util::layer_rect_at(ctx, b.offset, b.scale);
     let rect = [x0 as f32, y0 as f32, lw.max(1.0) as f32, lh.max(1.0) as f32];
     // The wave phase in cycles (effects::wave_warp_cycles) is separable: per column and per
     // row (fraction, whole cycles) in f64, so the kernel's sum keeps the fraction exact to f32
@@ -185,7 +185,7 @@ fn turbulent(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     let evo = ctx.params.f("evolution") / 360.0;
     let cycle = ctx.params.b("evolutionOptions/cycleEvolution").then(|| ctx.params.f("evolutionOptions/cycle").round().max(1.0));
     let falloff = if (3..=5).contains(&kind) { 0.3 } else { 0.5 };
-    let (x0, y0, lw, lh) = util::pin_rect(ctx, b.offset, b.scale);
+    let (x0, y0, lw, lh) = util::layer_rect_at(ctx, b.offset, b.scale);
     let edge = (lw.min(lh) * 0.1).max(1.0);
     let seed = (ctx.seed ^ 0x7d15).wrapping_add((ctx.params.f("evolutionOptions/randomSeed") as i64 as u32).wrapping_mul(0x9e37_79b9));
     let (z0, z1, t) = match cycle {

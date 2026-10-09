@@ -125,7 +125,7 @@ fn run(e: &mut Enc, entry: &str, p: &Params, mut b: GBuf, data: Option<&wgpu::Bu
 
 /// util::layer_rect.
 fn layer_rect(ctx: &EffectCtx, b: &GBuf) -> (f64, f64, f64, f64) {
-    (b.offset[0], b.offset[1], ctx.layer_size[0] * b.scale, ctx.layer_size[1] * b.scale)
+    effectcraft_effects::util::layer_rect_at(ctx, b.offset, b.scale)
 }
 
 // ---------------------------------------------------------------- per-pixel (fxs_point)

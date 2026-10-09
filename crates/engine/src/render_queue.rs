@@ -58,7 +58,8 @@ pub trait Exporter: Send + Sync {
     /// Formats this build can write.
     fn formats(&self) -> Vec<OutputFormat>;
     /// Render and write one item (blocking). `progress(done, total)` returns `false` to cancel;
-    /// a cancelled export returns `Err("cancelled")`.
+    /// a cancelled export removes the files it opened for that output and returns `Err("cancelled")`.
+    /// Completed earlier queue items and unrelated files must be preserved.
     fn export(&self, job: &ExportJob, progress: &mut dyn FnMut(u64, u64) -> bool) -> Result<ExportResult, String>;
     /// [`Exporter::export`] as a future: renders whose GPU readbacks are deferred (a browser
     /// job worker's WebGPU device) await the device between a frame's passes. The default runs
@@ -321,7 +322,8 @@ impl Session {
             .unwrap_or_else(|| "Untitled Project".into())
     }
 
-    /// The output path of a queue item: template tokens expanded, relative paths resolved against
+    /// The output path of a queue item: template tokens expanded, ending in the format's
+    /// extension exactly once ([`OutputFormat::with_extension`]), relative paths resolved against
     /// the project's folder (or the working directory). `None` when the comp is gone or the
     /// output is empty ("Needs Output").
     pub fn resolve_output(&self, item: &RenderQueueItem) -> Option<String> {
@@ -338,7 +340,8 @@ impl Session {
         let pname = self.project_name();
         let vars =
             TemplateVars { comp_name: &name, project_name: &pname, width: w, height: h, frame_rate: rate.as_f64(), start_frame: f0, end_frame: f0 + n - 1 };
-        let p = expand_template(tpl, item.output.format, &vars);
+        // The format's extension exactly once, whatever the name or a save dialog added (#293).
+        let p = item.output.format.with_extension(&expand_template(tpl, item.output.format, &vars));
         let path = std::path::Path::new(&p);
         if path.is_absolute() {
             return Some(p);
@@ -494,7 +497,22 @@ impl Session {
             let sh = shared.clone();
             let thread = std::thread::Builder::new()
                 .name("render-queue".into())
-                .spawn(move || effectcraft_render::passes::block_on(run_work(work, &sh, &mut |_| {})))
+                .spawn(move || {
+                    let pending: Vec<u64> = work.items.iter().filter_map(|modules| modules.first().map(|(item, _)| item.id)).collect();
+                    if let Err(error) = crate::guard::guarded("render worker", || {
+                        effectcraft_render::passes::block_on(run_work(work, &sh, &mut |_| {}));
+                        Ok(())
+                    }) {
+                        let completed = lock(&sh.state).items_done;
+                        let mut updates = lock(&sh.updates);
+                        for id in pending.into_iter().skip(completed) {
+                            if !updates.iter().any(|u| matches!(u, ItemUpdate::Finished { id: done, .. } if *done == id)) {
+                                updates.push(ItemUpdate::Finished { id, status: RenderStatus::Failed(error.to_string()), seconds: 0.0, output: None });
+                            }
+                        }
+                        lock(&sh.state).finished = true;
+                    }
+                })
                 .map_err(|e| e.to_string())?;
             self.render_job = Some(RenderJob { shared, thread: Some(thread), remote: None });
         }
@@ -606,8 +624,8 @@ impl Session {
         if item.post_render.is_none() {
             return Ok(None);
         }
-        let importer = self.importer.clone().ok_or("media import is not available in this build")?;
-        let footage = importer.probe(path)?;
+        // A rendered image sequence's first file brings the sequence.
+        let footage = self.probe_footage(path)?;
         if item.post_render == PostRenderAction::SetProxy {
             crate::commands::proxy_set(self, item.comp, footage).map_err(|e| e.to_string())?;
             self.toast(format!("Proxy set from {path}"));

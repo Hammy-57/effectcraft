@@ -5,6 +5,7 @@
 //! selected layers; dragging an effect onto a layer (timeline, viewer, Effect Controls) applies
 //! it there.
 
+use crate::i18n::tr;
 use egui::{Align2, Color32, Rect, Sense, Stroke, pos2, vec2};
 use serde_json::json;
 
@@ -276,7 +277,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     // Contents menu.
     let mr = Rect::from_center_size(pos2(rect.max.x - 18.0, sr.center().y), vec2(22.0, 22.0));
     let mpop = egui::Id::new("fx-contents-menu");
-    if widgets::icon_button(ui, mr, Icon::Hamburger, false, &t, egui::Id::new("fx-menu")).on_hover_text("Effects & Presets options").clicked() {
+    if widgets::icon_button(ui, mr, Icon::Hamburger, false, &t, egui::Id::new("fx-menu")).on_hover_text(tr("Effects & Presets options")).clicked() {
         widgets::open_popup(ui, mpop);
     }
     app.auto.add("effects.menu", mr, "Effects & Presets options");
@@ -394,7 +395,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         }
     }
     if y == list.min.y - scroll.offset && searching {
-        lp.text(pos2(list.center().x, list.min.y + 24.0), Align2::CENTER_CENTER, "No matching effects or presets", Tokens::ui(12.0), t.text_faint);
+        lp.text(pos2(list.center().x, list.min.y + 24.0), Align2::CENTER_CENTER, tr("No matching effects or presets"), Tokens::ui(12.0), t.text_faint);
     }
     let content = y + scroll.offset - list.min.y;
     scroll.end(ui, &mut app.auto, "effects.scroll", content, &t);

@@ -131,10 +131,20 @@ STAGE="$WORK/dmg"
 mkdir -p "$STAGE"
 ditto "$APP" "$STAGE/EffectCraft.app"
 ln -s /Applications "$STAGE/Applications"
+# Finder window layout: background, icon size and positions (packaging/macos/dmg/README.md).
+# The background is rendered from its SVG (1x + 2x in one HiDPI TIFF), so no bitmap is committed.
+command -v resvg >/dev/null || { echo "resvg not found (cargo install resvg --locked --version 0.48.1)" >&2; exit 1; }
+mkdir -p "$STAGE/.background"
+resvg --skip-system-fonts -w 660 "$HERE/dmg/background.svg" "$WORK/background.png"
+resvg --skip-system-fonts -w 1320 "$HERE/dmg/background.svg" "$WORK/background@2x.png"
+sips -s dpiWidth 144 -s dpiHeight 144 "$WORK/background@2x.png" >/dev/null
+tiffutil -cathidpicheck "$WORK/background.png" "$WORK/background@2x.png" -out "$STAGE/.background/background.tiff"
+cp "$HERE/dmg/dmg-layout.DS_Store" "$STAGE/.DS_Store"
 rm -f "$DMG" "$WORK/raw.dmg"
 # makehybrid + convert builds the image without attaching a device, unlike `create -srcfolder`,
 # which is flaky on CI runners ("Resource busy") and hangs in sandboxed sessions.
-hdiutil makehybrid -hfs -hfs-volume-name "EffectCraft $VERSION" -hfs-openfolder "$STAGE" -o "$WORK/raw.dmg" "$STAGE"
+# The volume name has no version: .DS_Store finds the background through an alias that includes it.
+hdiutil makehybrid -hfs -hfs-volume-name "EffectCraft" -hfs-openfolder "$STAGE" -o "$WORK/raw.dmg" "$STAGE"
 hdiutil convert "$WORK/raw.dmg" -format UDZO -imagekey zlib-level=9 -o "$DMG"
 rm -f "$WORK/raw.dmg"
 sign "$DMG"

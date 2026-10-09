@@ -281,7 +281,7 @@ fn rail_ui(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, rail:
     let foot_h = 22.0 + links.len() as f32 * 30.0 + 22.0 + sib_rows * 26.0;
     let mut cy = (rail.max.y - 16.0 - foot_h).max(y + 16.0);
     p.line_segment([pos2(x0, cy - 10.0), pos2(x0 + w, cy - 10.0)], Stroke::new(1.0, t.separator));
-    p.text(pos2(x0, cy + 6.0), Align2::LEFT_CENTER, "Community", Tokens::semibold(12.0), t.text_dim);
+    p.text(pos2(x0, cy + 6.0), Align2::LEFT_CENTER, crate::i18n::tr("Community"), Tokens::semibold(12.0), t.text_dim);
     cy += 22.0;
     for (icon, label, cmd) in links {
         let r = Rect::from_min_size(pos2(x0, cy), vec2(w, 26.0));
@@ -301,7 +301,7 @@ fn rail_ui(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, rail:
         }
         cy += 30.0;
     }
-    p.text(pos2(x0, cy + 8.0), Align2::LEFT_CENTER, "More ArtCraft apps", Tokens::ui(11.0), t.text_faint);
+    p.text(pos2(x0, cy + 8.0), Align2::LEFT_CENTER, crate::i18n::tr("More ArtCraft apps"), Tokens::ui(11.0), t.text_faint);
     cy += 20.0;
     let sw = (w - 6.0) / 2.0;
     for (i, (name, slug)) in sib.iter().enumerate() {
@@ -328,7 +328,7 @@ fn home_page(
     let t = app.tokens;
     let (x0, w) = (area.min.x, area.width());
     let mut y = area.min.y;
-    p.text(pos2(x0, y + 14.0), Align2::LEFT_CENTER, "Welcome to EffectCraft", Tokens::semibold(26.0), t.tab_text_active);
+    p.text(pos2(x0, y + 14.0), Align2::LEFT_CENTER, crate::i18n::tr("Welcome to EffectCraft"), Tokens::semibold(26.0), t.tab_text_active);
     y += 40.0;
     p.text(
         pos2(x0, y + 8.0),
@@ -369,7 +369,7 @@ fn home_page(
     y += 64.0 + 36.0;
 
     // Recent: heading, filter, clear.
-    p.text(pos2(x0, y + 12.0), Align2::LEFT_CENTER, "Recent", Tokens::semibold(17.0), t.tab_text_active);
+    p.text(pos2(x0, y + 12.0), Align2::LEFT_CENTER, crate::i18n::tr("Recent"), Tokens::semibold(17.0), t.tab_text_active);
     let entries = recent_entries(&app.session.prefs);
     let fid = egui::Id::new("home-filter");
     let mut filter: String = ctx.data(|d| d.get_temp(fid)).unwrap_or_default();
@@ -380,7 +380,7 @@ fn home_page(
     if !entries.is_empty() {
         let cr = Rect::from_min_size(pos2(fr.min.x - 96.0, y + 3.0), vec2(84.0, 20.0));
         let resp = ui.interact(cr, egui::Id::new("home-clear-recent"), Sense::click());
-        p.text(cr.right_center(), Align2::RIGHT_CENTER, "Clear list", Tokens::ui(11.5), if resp.hovered() { t.text } else { t.text_faint });
+        p.text(cr.right_center(), Align2::RIGHT_CENTER, crate::i18n::tr("Clear list"), Tokens::ui(11.5), if resp.hovered() { t.text } else { t.text_faint });
         app.auto.add("home.clearRecent", cr, "Clear Recent Projects");
         if resp.clicked() {
             actions.push(("file.clearRecent", json!({})));
@@ -540,7 +540,7 @@ mod tests {
         s.prefs.push_recent("/projects/Alpha.ecproj");
         let mut app = EffectcraftApp::new(s);
         let ctx = egui::Context::default();
-        crate::theme::install(&ctx, &app.tokens);
+        crate::theme::install(&ctx, &app.tokens, crate::i18n::language(&app));
         ctx.run_ui(Default::default(), |_| {}).textures_delta.clear();
         ctx.run_ui(Default::default(), |ui| {
             app.auto.begin_frame();
@@ -573,7 +573,7 @@ mod tests {
         app.ui.start_screen = true;
         app.ui.home_learn = true;
         let ctx = egui::Context::default();
-        crate::theme::install(&ctx, &app.tokens);
+        crate::theme::install(&ctx, &app.tokens, crate::i18n::language(&app));
         let frame = |app: &mut EffectcraftApp| {
             ctx.run_ui(Default::default(), |ui| {
                 app.auto.begin_frame();

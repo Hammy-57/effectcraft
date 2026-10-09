@@ -6,12 +6,12 @@
 
 use effectcraft_keyframe::{Keyframe, Value as KV};
 use effectcraft_project::build::Ids;
-use effectcraft_project::{Layer, LayerSource, Node, ParamUi, Property};
+use effectcraft_project::{Layer, LayerId, LayerSource, Node, ParamUi, Property};
 use effectcraft_time::Tick;
 use serde_json::{Value, json};
 
 use super::{CommandSpec, b_p, bad, f_p, has_layers, layers_p, str_p};
-use crate::{EngineError, Result, Session, cmd};
+use crate::{EngineError, KeyRef, Result, Session, cmd};
 
 /// Layers whose source has its own time (precomps and footage) can be remapped.
 fn remappable(l: &Layer) -> bool {
@@ -86,6 +86,10 @@ fn enable_time_remap(s: &mut Session, p: &Value) -> Result<Value> {
     if !comp.layers.iter().filter(|l| ids.contains(&l.id)).any(remappable) {
         return Err(bad("layer.enableTimeRemap", "time remapping needs a footage or composition layer"));
     }
+    // Each layer's source duration (stills have none): a layer extended past it ends its remap
+    // at the source's end, where its last frame starts to hold (After Effects).
+    let src_end: Vec<(LayerId, Tick)> =
+        comp.layers.iter().filter(|l| ids.contains(&l.id)).filter_map(|l| Some((l.id, l.source.item().and_then(|i| s.project.item(i))?.duration()?))).collect();
     let on = s.edit("Enable Time Remapping", None, |proj, _| {
         let mut next = proj.next_id;
         let comp = proj.comp_mut(cid).ok_or(EngineError::NoComp)?;
@@ -97,7 +101,13 @@ fn enable_time_remap(s: &mut Session, p: &Value) -> Result<Value> {
             if target && !has {
                 let mut pr = remap_prop(&mut Ids(&mut next));
                 let (lin, lout) = (l.layer_time(l.in_point), l.layer_time(l.out_point));
-                let (a, b) = (lin.min(lout), lin.max(lout));
+                let (a, mut b) = (lin.min(lout), lin.max(lout));
+                if let Some((_, end)) = src_end.iter().find(|(id, _)| *id == l.id)
+                    && lin <= lout
+                    && *end > a
+                {
+                    b = b.min(*end);
+                }
                 pr.value = KV::Scalar(source_secs(l, l.in_point));
                 pr.keys = vec![Keyframe::new(a, KV::Scalar(a.seconds())), Keyframe::new(b, KV::Scalar(b.seconds()))];
                 if lin > lout {
@@ -114,6 +124,40 @@ fn enable_time_remap(s: &mut Session, p: &Value) -> Result<Value> {
         Ok(on)
     })?;
     Ok(json!(on))
+}
+
+/// Layers of the active comp whose Time Remap property is selected with all of its keys (clicking
+/// its name selects them all, and a key selects its property): Edit ▸ Clear turns their time
+/// remapping off instead of deleting the keys or the layer.
+pub(crate) fn selected_time_remap(s: &Session) -> Vec<LayerId> {
+    let Some(comp) = s.active_comp() else { return vec![] };
+    let st = &s.state;
+    st.selected_props
+        .iter()
+        .filter(|(lid, uid)| {
+            comp.layer(*lid)
+                .and_then(|l| l.props.get("timeRemap"))
+                .filter(|pr| pr.uid == *uid)
+                .is_some_and(|pr| pr.keys.iter().all(|k| st.selected_keys.contains(&KeyRef { layer: *lid, prop: *uid, time: k.time })))
+        })
+        .map(|(lid, _)| *lid)
+        .collect()
+}
+
+/// Turn time remapping off on `layers` (one undo step) and drop the removed property and its
+/// keys from the selection.
+pub(crate) fn disable_time_remap(s: &mut Session, layers: &[LayerId]) -> Result<Value> {
+    let ids: Vec<u64> = layers.iter().map(|l| l.0).collect();
+    let r = s.execute("layer.enableTimeRemap", json!({"layers": ids, "value": false}))?;
+    let comp = s.active_comp();
+    let gone = |lid: LayerId, uid: u64| layers.contains(&lid) && comp.and_then(|c| c.layer(lid)).is_none_or(|l| l.props.find(uid).is_none());
+    let (props, keys): (Vec<_>, Vec<_>) = (
+        s.state.selected_props.iter().copied().filter(|(l, u)| !gone(*l, *u)).collect(),
+        s.state.selected_keys.iter().copied().filter(|k| !gone(k.layer, k.prop)).collect(),
+    );
+    s.state.selected_props = props;
+    s.state.selected_keys = keys;
+    Ok(r)
 }
 
 /// Freeze Frame: time remapping holding the current source frame for the whole layer.

@@ -57,7 +57,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let comp = app.session.active_comp_arc();
     let layer = comp.as_ref().and_then(|c| app.session.state.selected_layers.first().and_then(|id| c.layer(*id)).cloned());
     let (Some(comp), Some(cid), Some(layer)) = (comp, app.session.active_comp_id(), layer) else {
-        p.text(rect.center(), Align2::CENTER_CENTER, "Select a layer to see its properties", Tokens::ui(12.0), t.text_faint);
+        p.text(rect.center(), Align2::CENTER_CENTER, crate::i18n::tr("Select a layer to see its properties"), Tokens::ui(12.0), t.text_faint);
         return;
     };
     let project = app.session.project.clone();
@@ -76,7 +76,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         section_header(app, ui, &p, x0, w, y, "Layer Transform", "properties.transform");
         let rr = Rect::from_min_size(pos2(x0 + w - 40.0, y), vec2(40.0, ROW_H));
         let resp = ui.interact(rr, egui::Id::new("props-reset"), Sense::click());
-        p.text(rr.right_center(), Align2::RIGHT_CENTER, "Reset", Tokens::ui(12.0), if resp.hovered() { t.accent_hover } else { t.accent });
+        p.text(rr.right_center(), Align2::RIGHT_CENTER, crate::i18n::tr("Reset"), Tokens::ui(12.0), if resp.hovered() { t.accent_hover } else { t.accent });
         app.auto.add("properties.transform.reset", rr, "Reset Transform");
         if resp.clicked() {
             for pr in tr.props() {
@@ -112,7 +112,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         let resp = ui.interact(br, egui::Id::new("props-add-animator"), Sense::click());
         p.rect_stroke(br, 4.0, Stroke::new(1.0, if resp.hovered() { t.text_dim } else { t.field_border }), egui::StrokeKind::Inside);
         icons::paint(&p, Rect::from_center_size(pos2(br.min.x + 14.0, br.center().y), vec2(10.0, 10.0)), Icon::Plus, t.text);
-        p.text(pos2(br.min.x + 26.0, br.center().y), Align2::LEFT_CENTER, "Add Animator", Tokens::ui(12.0), t.text);
+        p.text(pos2(br.min.x + 26.0, br.center().y), Align2::LEFT_CENTER, crate::i18n::tr("Add Animator"), Tokens::ui(12.0), t.text);
         app.auto.add("properties.addAnimator", br, "Add Animator");
         let pop = egui::Id::new("props-add-animator-pop");
         if resp.clicked() {
@@ -132,7 +132,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         let pr = Rect::from_min_size(pos2(br.max.x + 8.0, y), vec2(84.0, 24.0));
         let presp = ui.interact(pr, egui::Id::new("props-text-presets"), Sense::click());
         p.rect_stroke(pr, 4.0, Stroke::new(1.0, if presp.hovered() { t.text_dim } else { t.field_border }), egui::StrokeKind::Inside);
-        p.text(pr.center(), Align2::CENTER_CENTER, "Presets", Tokens::ui(12.0), t.text);
+        p.text(pr.center(), Align2::CENTER_CENTER, crate::i18n::tr("Presets"), Tokens::ui(12.0), t.text);
         app.auto.add("properties.textPresets", pr, "Text Animation Presets");
         let ppop = egui::Id::new("props-text-presets-pop");
         if presp.clicked() {
@@ -362,7 +362,13 @@ fn text_section(
             p.text(pos2(col2, y + 9.0), Align2::LEFT_CENTER, "A", Tokens::semibold(11.0), t.text_dim);
             let r = Rect::from_min_size(pos2(col2 + 26.0, y), vec2(40.0, 18.0));
             let resp = ui.interact(r, egui::Id::new("props-leading-auto"), Sense::click());
-            p.text(pos2(r.min.x + 2.0, r.center().y), Align2::LEFT_CENTER, "Auto", Tokens::ui(12.0), if resp.hovered() { t.accent_hover } else { t.hot_text });
+            p.text(
+                pos2(r.min.x + 2.0, r.center().y),
+                Align2::LEFT_CENTER,
+                crate::i18n::tr("Auto"),
+                Tokens::ui(12.0),
+                if resp.hovered() { t.accent_hover } else { t.hot_text },
+            );
             app.auto.add("properties.text.leading", r, "leading");
             if resp.clicked() {
                 set(actions, json!({"leading": (doc.size * 1.2).round()}));
@@ -480,7 +486,7 @@ fn more_button(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, x
     let resp = ui.interact(r, egui::Id::new(id), Sense::click());
     p.rect_filled(r, 4.0, if resp.hovered() { t.hover } else { t.field_bg });
     p.text(pos2(r.min.x + 8.0, r.center().y), Align2::LEFT_CENTER, "···", Tokens::semibold(12.0), t.text);
-    p.text(pos2(r.min.x + 26.0, r.center().y), Align2::LEFT_CENTER, "More", Tokens::ui(12.0), t.text);
+    p.text(pos2(r.min.x + 26.0, r.center().y), Align2::LEFT_CENTER, crate::i18n::tr("More"), Tokens::ui(12.0), t.text);
     app.auto.add(auto, r, "More");
     if resp.clicked() {
         app.show_panel(panel);

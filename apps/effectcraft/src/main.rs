@@ -158,6 +158,9 @@ fn main() -> eframe::Result {
                 eprintln!("effectcraft: {e}");
             }
             let show_home = home.unwrap_or(session.prefs.startup.show_home_on_launch && files.is_empty() && control_port.is_none());
+            // The ScriptUI panels open when the app last quit open again (a failing one is
+            // reported in a toast and forgotten).
+            let _ = session.execute("window.restoreScriptPanels", json!({}));
             let mut app = EffectcraftApp::new(session);
             app.set_gpu_failure_bridge(gpu_failures);
             app.ui.start_screen = show_home;
@@ -182,7 +185,8 @@ fn main() -> eframe::Result {
             app.hooks.pick_save_file = Some(Box::new(|name: &str, ext: &str| {
                 // A default with a folder that exists opens the dialog there.
                 let path = std::path::Path::new(name);
-                let mut d = rfd::FileDialog::new().add_filter(ext, &[ext]);
+                // (No filter for a name without an extension, such as a folder to create.)
+                let mut d = if ext.is_empty() { rfd::FileDialog::new() } else { rfd::FileDialog::new().add_filter(ext, &[ext]) };
                 if let Some(dir) = path.parent().filter(|d| d.is_dir()) {
                     d = d.set_directory(dir);
                 }

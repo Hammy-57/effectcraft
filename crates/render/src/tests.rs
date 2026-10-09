@@ -405,6 +405,26 @@ fn effects_see_layer_masks() {
     assert!(img.get(150, 50)[3] > 0.99, "mode None mask does not cut the layer");
 }
 
+/// An open mask (the Pen still drawing it) leaves the layer whole; closed, it masks (#290).
+#[test]
+fn open_masks_make_no_transparency() {
+    let render = |closed: bool| {
+        let (mut p, cid, comp) = setup();
+        let mut l = solid(&mut p, &comp, [1.0, 0.0, 0.0], 200, 100);
+        let path = ShapePath { closed, ..ShapePath::rect([50.0, 50.0], 40.0, 40.0) };
+        let mut next = p.next_id;
+        let m = build::mask(&mut Ids(&mut next), "Mask 1", path, MaskMode::Add, [255, 255, 0]);
+        p.next_id = next;
+        l.props.sub_mut("masks").unwrap().children.push(m.into());
+        p.comp_mut(cid).unwrap().layers.push(l);
+        render_frame(&p, cid, Tick::ZERO, 1.0)
+    };
+    let open = render(false);
+    assert!(open.get(50, 50)[3] > 0.99 && open.get(150, 50)[3] > 0.99, "the open mask cut the layer");
+    let closed = render(true);
+    assert!(closed.get(50, 50)[3] > 0.99 && closed.get(150, 50)[3] < 0.01, "the closed mask masks");
+}
+
 #[test]
 fn effects_read_layer_params() {
     let (mut p, cid, comp) = setup();
@@ -658,5 +678,70 @@ fn edge_pinning_displaces_all_of_a_centred_shape_layer() {
             }
         }
         assert!(q.iter().all(|&d| d > 20.0), "{id}: per-quadrant change {q:?}");
+    }
+}
+
+/// Effect points on a shape layer are measured from the top-left of its comp-sized bounds
+/// (#227), so the default "layer centre" is where the content's origin is. Measured from the
+/// origin they sat at the comp's bottom-right corner: Twirl changed nothing and Bulge only
+/// the bottom-right quadrant.
+#[test]
+fn default_effect_points_sit_at_the_centre_of_a_shape_layer() {
+    let cases: [(&str, Vec<(&str, Value)>); 2] =
+        [("ec.distort.twirl", vec![("angle", Value::Scalar(90.0))]), ("ec.distort.bulge", vec![("height", Value::Scalar(2.0))])];
+    for (id, vals) in cases {
+        let (mut p, cid, comp) = setup();
+        let mut l = build::layer(&mut p, &comp, "Shape Layer 1", LayerSource::Shape, (200, 100), None);
+        let mut next = p.next_id;
+        let mut ids = Ids(&mut next);
+        let rect = build::shape_rect(&mut ids, [180.0, 80.0], [0.0, 0.0], 0.0);
+        let fill = build::shape_fill(&mut ids, [1.0, 0.0, 0.0, 1.0]);
+        let g = build::shape_group(&mut ids, "Rectangle 1", vec![rect, fill]);
+        p.next_id = next;
+        l.props.sub_mut("contents").unwrap().children.push(g.into());
+        p.comp_mut(cid).unwrap().layers.push(l.clone());
+        let plain = render_frame(&p, cid, Tick::ZERO, 1.0);
+        add_effect_200(&mut p, &mut l, id, &vals);
+        p.comp_mut(cid).unwrap().layers = vec![l];
+        let warped = render_frame(&p, cid, Tick::ZERO, 1.0);
+        // Alpha change per comp quadrant (TL, TR, BL, BR): the top and bottom edges move in each.
+        let mut q = [0.0f32; 4];
+        for y in 0..100 {
+            for x in 0..200 {
+                q[(x >= 100) as usize + 2 * (y >= 50) as usize] += (plain.get(x, y)[3] - warped.get(x, y)[3]).abs();
+            }
+        }
+        assert!(q.iter().all(|&d| d > 5.0), "{id}: per-quadrant change {q:?}");
+        // Symmetric about the centre: opposite quadrants change alike.
+        assert!((q[0] - q[3]).abs() < 0.05 * q[0].max(q[3]) && (q[1] - q[2]).abs() < 0.05 * q[1].max(q[2]), "{id}: {q:?}");
+    }
+}
+
+/// A layer parameter pointing at a shape layer sees all of it (in its effect space), and the
+/// effect's own masks are in effect space too: Set Matte with a centred shape layer as the
+/// matte keeps the centre of a full-comp solid (#227).
+#[test]
+fn layer_parameters_see_a_whole_shape_layer() {
+    let (mut p, cid, comp) = setup();
+    let mut shape = build::layer(&mut p, &comp, "Matte", LayerSource::Shape, (200, 100), None);
+    let mut next = p.next_id;
+    let mut ids = Ids(&mut next);
+    let rect = build::shape_rect(&mut ids, [100.0, 50.0], [0.0, 0.0], 0.0);
+    let fill = build::shape_fill(&mut ids, [1.0, 1.0, 1.0, 1.0]);
+    let g = build::shape_group(&mut ids, "Rectangle 1", vec![rect, fill]);
+    p.next_id = next;
+    shape.props.sub_mut("contents").unwrap().children.push(g.into());
+    shape.switches.video = false;
+    let matte_id = shape.id;
+    let mut s = solid(&mut p, &comp, [0.0, 0.0, 1.0], 200, 100);
+    add_effect_200(&mut p, &mut s, "ec.channel.setmatte", &[("takeMatteFromLayer", Value::Layer(Some(matte_id.0)))]);
+    p.comp_mut(cid).unwrap().layers = vec![s, shape];
+    let f = render_frame(&p, cid, Tick::ZERO, 1.0);
+    // The matte covers x 50..150, y 25..75: kept inside (all four quadrants), gone outside.
+    for (x, y) in [(60, 30), (140, 30), (60, 70), (140, 70)] {
+        assert!(f.get(x, y)[3] > 0.99, "inside at ({x}, {y}): {:?}", f.get(x, y));
+    }
+    for (x, y) in [(20, 10), (180, 90), (190, 50)] {
+        assert!(f.get(x, y)[3] < 0.01, "outside at ({x}, {y}): {:?}", f.get(x, y));
     }
 }

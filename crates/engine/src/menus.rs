@@ -1201,7 +1201,6 @@ Window
   @dynamic:openViewers
   ---
   Create Nulls From Paths | window.panel {"panel":"createNullsFromPaths"}
-  Ease Presets | window.panel {"panel":"easePresets"}
   VR Comp Editor | window.panel {"panel":"vrCompEditor"}
   @dynamic:scriptPanels
 Help

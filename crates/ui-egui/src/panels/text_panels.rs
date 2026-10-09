@@ -2,6 +2,7 @@
 //! Character and Paragraph panels show and change the selected text (creating style runs);
 //! otherwise they apply to the whole selected text layer.
 
+use crate::i18n::tr;
 use effectcraft_engine::keyframe::{BaselineOption, Composer, Direction, FigureStyle, FigureWidth, Justify, Kerning, TextDoc};
 use effectcraft_engine::render::EvalCtx;
 use egui::{Align2, Rect, Sense, pos2, vec2};
@@ -232,7 +233,7 @@ pub fn character(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         actions.push(json!({"ligatures": !doc.ligatures}));
     }
     app.auto.add("character.ligatures", lr, "Ligatures");
-    p.text(pos2(x0 + 20.0, y + 7.0), Align2::LEFT_CENTER, "Ligatures", Tokens::ui(11.5), t.text_dim);
+    p.text(pos2(x0 + 20.0, y + 7.0), Align2::LEFT_CENTER, tr("Ligatures"), Tokens::ui(11.5), t.text_dim);
     // OpenType: a popup with the font's layout features (like the Character panel's OpenType menu).
     let or = Rect::from_min_size(pos2(sr.max.x + 6.0, sr.min.y), vec2(78.0, 22.0));
     let opop = egui::Id::new("char-opentype-pop");
@@ -264,7 +265,7 @@ pub fn character(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let axes = effectcraft_engine::text::variable::font_axes(face);
     if !axes.is_empty() {
         y += 26.0;
-        p.text(pos2(x0, y + 7.0), Align2::LEFT_CENTER, "Variable Font Axes", Tokens::semibold(11.0), t.text_dim);
+        p.text(pos2(x0, y + 7.0), Align2::LEFT_CENTER, tr("Variable Font Axes"), Tokens::semibold(11.0), t.text_dim);
         for (i, a) in axes.iter().enumerate() {
             let (col, row) = (i % 2, i / 2);
             let fx = x0 + col as f32 * (w / 2.0);
@@ -287,7 +288,7 @@ pub fn character(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     scroll.end(ui, &mut app.auto, "character.scroll", y + 44.0 - top, &t);
     match &target {
         None => {
-            p.text(pos2(rect.center().x, rect.max.y - 20.0), Align2::CENTER_CENTER, "Select a text layer", Tokens::ui(11.0), t.text_faint);
+            p.text(pos2(rect.center().x, rect.max.y - 20.0), Align2::CENTER_CENTER, tr("Select a text layer"), Tokens::ui(11.0), t.text_faint);
         }
         Some(tt) if tt.range.is_some() => {
             let [a, b] = tt.range.unwrap_or_default();
@@ -351,7 +352,7 @@ fn opentype_popup(app: &mut EffectcraftApp, ui: &mut egui::Ui, id: egui::Id, pos
                 }
             }
             ui.separator();
-            ui.label(egui::RichText::new("Figures").small().color(t.text_dim));
+            ui.label(egui::RichText::new(tr("Figures")).small().color(t.text_dim));
             let figs = [
                 ("default", "Default Figure Style", FigureStyle::Default, FigureWidth::Default),
                 ("tabularLining", "Tabular Lining", FigureStyle::Lining, FigureWidth::Tabular),
@@ -368,7 +369,7 @@ fn opentype_popup(app: &mut EffectcraftApp, ui: &mut egui::Ui, id: egui::Id, pos
                 }
             }
             ui.separator();
-            ui.label(egui::RichText::new("Stylistic Sets").small().color(t.text_dim));
+            ui.label(egui::RichText::new(tr("Stylistic Sets")).small().color(t.text_dim));
             egui::Grid::new(id.with("sets")).spacing(vec2(3.0, 3.0)).show(ui, |ui| {
                 for n in 1..=20u32 {
                     let key = format!("ss{n:02}");
@@ -536,11 +537,11 @@ pub fn paragraph(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         actions.push(json!({"hangingPunctuation": !doc.hanging_punctuation}));
     }
     app.auto.add("paragraph.hangingPunctuation", hr, "Roman Hanging Punctuation");
-    p.text(pos2(x0 + 20.0, y + 7.0), Align2::LEFT_CENTER, "Roman Hanging Punctuation", Tokens::ui(11.5), t.text_dim);
+    p.text(pos2(x0 + 20.0, y + 7.0), Align2::LEFT_CENTER, tr("Roman Hanging Punctuation"), Tokens::ui(11.5), t.text_dim);
     // (Room for the status line at the bottom.)
     scroll.end(ui, &mut app.auto, "paragraph.scroll", y + 44.0 - top, &t);
     if !enabled {
-        p.text(pos2(rect.center().x, rect.max.y - 20.0), Align2::CENTER_CENTER, "Select a text layer", Tokens::ui(11.0), t.text_faint);
+        p.text(pos2(rect.center().x, rect.max.y - 20.0), Align2::CENTER_CENTER, tr("Select a text layer"), Tokens::ui(11.0), t.text_faint);
     }
     let Some(tt) = target else { return };
     for a in actions {
@@ -601,7 +602,7 @@ pub fn align(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let p = ui.painter().with_clip_rect(rect);
     let x0 = rect.min.x + 10.0;
     let mut y = rect.min.y + 10.0;
-    p.text(pos2(x0, y + 10.0), Align2::LEFT_CENTER, "Align Layers to:", Tokens::ui(11.5), t.text_dim);
+    p.text(pos2(x0, y + 10.0), Align2::LEFT_CENTER, tr("Align Layers to:"), Tokens::ui(11.5), t.text_dim);
     let dr = Rect::from_min_size(pos2(x0 + 100.0, y), vec2(110.0, 20.0));
     let to_sel = app.ui.align_to_selection;
     let pid = egui::Id::new("align-to-pop");
@@ -619,7 +620,7 @@ pub fn align(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let mut run: Option<(&str, &str)> = None;
     for (row, kind) in ["align", "distribute"].into_iter().enumerate() {
         if row == 1 {
-            p.text(pos2(x0, y + 8.0), Align2::LEFT_CENTER, "Distribute Layers:", Tokens::ui(11.5), t.text_dim);
+            p.text(pos2(x0, y + 8.0), Align2::LEFT_CENTER, tr("Distribute Layers:"), Tokens::ui(11.5), t.text_dim);
             y += 20.0;
         }
         for (i, op) in ops.iter().enumerate() {

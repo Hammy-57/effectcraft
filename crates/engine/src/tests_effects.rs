@@ -257,3 +257,68 @@ fn opening_an_old_project_upgrades_effect_instances() {
     // The upgraded project renders.
     let _ = s2.render(cid, s2.time(), Default::default());
 }
+
+/// A project saved before schema 2 (#227): effect points on a shape layer were measured from
+/// its origin. Opening converts them to effect space so points that were set keep their place
+/// in the comp; points at their default become the layer centre; layers with a source
+/// rectangle, adjustment layers (their effects see the comp below as it is) and expression
+/// controls keep their values. Saving writes schema 2, and opening that again changes nothing.
+#[test]
+fn opening_a_schema_1_project_moves_text_layer_effect_points_into_effect_space() {
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "Main", "width": 200, "height": 100, "frameRate": 30, "duration": 2})).unwrap();
+    let shape = s.execute("layer.newText", json!({"text": "Hello"})).unwrap()["layer"].as_u64().unwrap();
+    // Shape layers measured effect points from their anchor-centred canvas before schema 2.
+    let real_shape = s.execute("layer.newShape", json!({"kind": "rect", "size": [180, 80]})).unwrap()["layer"].as_u64().unwrap();
+    let solid = s.execute("layer.newSolid", json!({"color": "#0000ff", "width": 200, "height": 100})).unwrap()["layer"].as_u64().unwrap();
+    let point = |s: &Session, lid: u64, fx: u64, id: &str| -> KV {
+        let l = layer(s, lid);
+        let g = l.effects().unwrap().groups().find(|g| g.uid == fx).unwrap();
+        g.props().find(|p| p.match_id == id || (id.is_empty() && p.ui == effectcraft_project::ParamUi::Point)).unwrap().value.clone()
+    };
+    let set = |s: &mut Session, lid: u64, fx: u64, id: &str, v: [f64; 2]| {
+        let l = layer(s, lid);
+        let g = l.effects().unwrap().groups().find(|g| g.uid == fx).unwrap();
+        let uid = g.props().find(|p| p.match_id == id || (id.is_empty() && p.ui == effectcraft_project::ParamUi::Point)).unwrap().uid;
+        s.execute("prop.set", json!({"layer": lid, "prop": uid, "value": v})).unwrap();
+    };
+    let twirl = apply(&mut s, shape, "Twirl");
+    set(&mut s, shape, twirl, "center", [-30.0, -10.0]);
+    let bulge = apply(&mut s, shape, "Bulge");
+    let on_shape = apply(&mut s, real_shape, "Twirl");
+    set(&mut s, real_shape, on_shape, "center", [-30.0, -10.0]);
+    let control = apply(&mut s, shape, "Point Control");
+    set(&mut s, shape, control, "", [5.0, 5.0]);
+    let on_solid = apply(&mut s, solid, "Twirl");
+    set(&mut s, solid, on_solid, "center", [30.0, 20.0]);
+    let adjust = s.execute("layer.newShape", json!({"kind": "rect", "size": [50, 50]})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("layer.setSwitch", json!({"layers": [adjust], "switch": "adjustment", "value": true})).unwrap();
+    let on_adjust = apply(&mut s, adjust, "Twirl");
+    set(&mut s, adjust, on_adjust, "center", [40.0, 30.0]);
+    assert_eq!(point(&s, shape, bulge, "center"), KV::Vec2([100.0, 50.0]), "Bulge's default centre");
+
+    let old = s.project.to_file_json().unwrap().replacen("\"schema\": 2", "\"schema\": 1", 1);
+    assert!(old.contains("\"schema\": 1"));
+    let dir = std::env::temp_dir().join(format!("ec-effect-space-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("old.ecproj").to_string_lossy().to_string();
+    std::fs::write(&path, old).unwrap();
+    let mut s2 = Session::default();
+    s2.execute("file.open", json!({"path": path})).unwrap();
+    assert_eq!(s2.project.schema, effectcraft_project::SCHEMA_VERSION);
+    let check = |s2: &Session| {
+        assert_eq!(point(s2, shape, twirl, "center"), KV::Vec2([70.0, 40.0]), "a set point keeps its place in the comp");
+        assert_eq!(point(s2, shape, bulge, "center"), KV::Vec2([100.0, 50.0]), "a default point becomes the layer centre");
+        assert_eq!(point(s2, shape, control, ""), KV::Vec2([5.0, 5.0]), "expression controls keep their values");
+        assert_eq!(point(s2, real_shape, on_shape, "center"), KV::Vec2([-30.0, -10.0]), "a shape layer's points were in effect space already");
+        assert_eq!(point(s2, solid, on_solid, "center"), KV::Vec2([30.0, 20.0]), "a solid's effect space is its layer space");
+        assert_eq!(point(s2, adjust, on_adjust, "center"), KV::Vec2([40.0, 30.0]), "an adjustment layer's effects see the comp");
+    };
+    check(&s2);
+    // Saved as schema 2 and opened again: nothing moves twice.
+    s2.execute("file.save", json!({"path": path})).unwrap();
+    let mut s3 = Session::default();
+    s3.execute("file.open", json!({"path": path})).unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+    check(&s3);
+}

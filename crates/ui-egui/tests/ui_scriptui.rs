@@ -90,6 +90,64 @@ fn script_windows_are_drawn_and_clickable() {
     h.state_mut().session.execute("scriptui.close", json!({})).unwrap();
 }
 
+/// A ScriptUI panel open when the app quit opens again, docked, at the next launch (the
+/// frontends call `window.restoreScriptPanels` before building the app).
+#[test]
+fn panels_open_at_quit_dock_again_at_launch() {
+    use effectcraft_engine::config::{ConfigStore, MemoryConfig};
+    let store = std::sync::Arc::new(MemoryConfig::default());
+    store.write("Scripts/ScriptUI Panels/Hello Panel.jsx", "this.add('button', undefined, 'Hi', { name: 'hi' });").unwrap();
+    store.write(effectcraft_engine::commands::scripts::OPEN_PANELS_FILE, r#"{"open": ["Hello Panel.jsx"]}"#).unwrap();
+    let mut s = effectcraft_host::session();
+    s.config = Some(store.clone());
+    s.execute("window.restoreScriptPanels", json!({})).unwrap();
+    let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(|_| EffectcraftApp::new(s));
+    h.run_steps(3);
+    let panel = h.state().session.script_ui.windows.iter().find(|w| w.script == "Hello Panel.jsx").expect("the panel's window").id;
+    assert!(h.state().ui.dock.contains(PanelKind::ScriptPanel(panel)), "the panel docks");
+    assert!(h.state().auto.find(&format!("scriptui.{panel}.hi")).is_some(), "its controls are drawn");
+    // Closing its tab forgets it for the next launch.
+    h.state_mut().close_panel(PanelKind::ScriptPanel(panel));
+    h.run_steps(2);
+    assert_eq!(store.read(effectcraft_engine::commands::scripts::OPEN_PANELS_FILE).as_deref(), Some(r#"{"open":[]}"#));
+}
+
+/// The bundled Ease Presets ScriptUI panel (Window ▸ Ease Presets.jsx) docks, and clicking a
+/// preset in its list eases the selected keyframes in one undo step.
+#[test]
+fn ease_presets_panel_eases_the_selected_keys_from_its_list() {
+    use effectcraft_engine::keyframe::{Ease, Interp};
+    use egui_kittest::kittest::Queryable;
+    let mut h = harness();
+    let s = &mut h.state_mut().session;
+    let l = s.execute("layer.newSolid", json!({"name": "Box", "color": "#e04020", "width": 80, "height": 80})).unwrap()["layer"].as_u64().unwrap();
+    for (t, v) in [(0.0, 0.0), (1.0, 100.0)] {
+        s.execute("prop.addKey", json!({"layer": l, "path": "transform/opacity", "time": t, "value": v})).unwrap();
+    }
+    s.execute("prop.select", json!({"layer": l, "path": "transform/opacity"})).unwrap();
+    let cx = effectcraft_engine::menus::DynCtx::default();
+    let (panels, _) = effectcraft_engine::menus::dynamic(s, "scriptPanels", &cx);
+    assert!(panels.iter().any(|e| e.label == "Ease Presets.jsx"), "listed in the Window menu");
+    s.execute("window.scriptPanel", json!({"name": "Ease Presets.jsx"})).unwrap();
+    h.run_steps(3);
+    let panel = h.state().session.script_ui.windows.iter().find(|w| w.script == "Ease Presets.jsx").unwrap().id;
+    assert!(h.state().ui.dock.contains(PanelKind::ScriptPanel(panel)), "the panel docks");
+    h.state_mut().ui.maximized = Some(PanelKind::ScriptPanel(panel));
+    h.run_steps(3);
+    let steps = h.state().session.history.undo.len();
+    let item = h.query_by_label("Ease In-Out").expect("the Ease In-Out preset").rect().center();
+    h.input_mut().events.push(Event::PointerMoved(item));
+    for pressed in [true, false] {
+        h.input_mut().events.push(Event::PointerButton { pos: item, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() });
+    }
+    h.run_steps(3);
+    let op = h.state().session.active_comp().unwrap().layer(effectcraft_engine::project::LayerId(l)).unwrap().props.prop("transform/opacity").unwrap().clone();
+    let eased = Ease { speed: 0.0, influence: 0.5 };
+    assert_eq!((op.keys[0].out_interp, op.keys[0].out_ease[0]), (Interp::Bezier, eased));
+    assert_eq!((op.keys[1].in_interp, op.keys[1].in_ease[0]), (Interp::Bezier, eased));
+    assert_eq!(h.state().session.history.undo.len(), steps + 1);
+}
+
 #[test]
 fn history_panel_jumps_between_branches() {
     let mut h = harness();

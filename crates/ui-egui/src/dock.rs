@@ -2,7 +2,7 @@
 //! thin gutters; each group has a tab strip (active tab bright, with a panel menu "≡"); the focused
 //! panel gets a blue outline. Gutters drag to resize; workspaces are serialized trees.
 
-use egui::{Align2, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
+use egui::{Align2, Rect, Sense, Stroke, pos2, vec2};
 use serde::{Deserialize, Serialize};
 
 use crate::icons::{self, Icon};
@@ -50,12 +50,10 @@ pub enum PanelKind {
     CreateNullsFromPaths,
     /// Window ▸ VR Comp Editor (our own panel).
     VrCompEditor,
-    /// Window ▸ Ease Presets (our own panel).
-    EasePresets,
 }
 
 impl PanelKind {
-    pub const ALL: [PanelKind; 35] = [
+    pub const ALL: [PanelKind; 34] = [
         PanelKind::Project,
         PanelKind::EffectControls,
         PanelKind::Composition,
@@ -90,7 +88,6 @@ impl PanelKind {
         PanelKind::ContentAwareFill,
         PanelKind::CreateNullsFromPaths,
         PanelKind::VrCompEditor,
-        PanelKind::EasePresets,
     ];
     pub fn title(self) -> &'static str {
         match self {
@@ -130,7 +127,6 @@ impl PanelKind {
             PanelKind::ContentAwareFill => "Content-Aware Fill",
             PanelKind::CreateNullsFromPaths => "Create Nulls From Paths",
             PanelKind::VrCompEditor => "VR Comp Editor",
-            PanelKind::EasePresets => "Ease Presets",
         }
     }
     pub fn id(self) -> String {
@@ -371,7 +367,6 @@ pub fn workspace(name: &str) -> DockNode {
                             ContentAwareFill,
                             CreateNullsFromPaths,
                             VrCompEditor,
-                            EasePresets,
                         ],
                     ),
                 ),
@@ -990,7 +985,7 @@ fn resize_stacked(entries: &mut [StackEntry], bodies: &[f32], above: usize, belo
 /// Draw a group's frame + tab strip: one tab per panel, or per document for panels that show
 /// several (the Timeline's comps). Tab labels may name the comp or layer they show (After
 /// Effects style).
-pub fn draw_group_chrome(ui: &mut egui::Ui, g: &Group, focused: PanelKind, t: &Tokens, reg: &mut crate::automation::Registry, info: &TabInfo) -> Chrome {
+pub fn draw_group_chrome(ui: &mut egui::Ui, g: &Group, t: &Tokens, reg: &mut crate::automation::Registry, info: &TabInfo) -> Chrome {
     struct Entry {
         panel: PanelKind,
         doc: Option<u64>,
@@ -1164,10 +1159,6 @@ pub fn draw_group_chrome(ui: &mut egui::Ui, g: &Group, focused: PanelKind, t: &T
             }
             x += w + 8.0;
         }
-    }
-    // focus outline
-    if active_panel == Some(focused) {
-        painter.rect_stroke(g.rect, 0.0, Stroke::new(1.0, t.focus), StrokeKind::Inside);
     }
     // clicking anywhere in the panel focuses it
     if let Some(p) = active_panel

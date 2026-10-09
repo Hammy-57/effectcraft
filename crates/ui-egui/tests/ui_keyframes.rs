@@ -1,7 +1,6 @@
 //! Headless checks for Timeline keyframes as a person uses them: dragging keys over many frames
 //! in one gesture (the drag used to end after the first frame), Shift-snapping, Ctrl+C /
-//! Ctrl+V, which the windowing layer delivers as clipboard events rather than key presses, and
-//! easing selected keys from the Ease Presets panel.
+//! Ctrl+V, which the windowing layer delivers as clipboard events rather than key presses.
 
 use effectcraft_engine::Session;
 use effectcraft_engine::project::LayerId;
@@ -255,41 +254,42 @@ fn k_follows_the_revealed_properties_and_auto_select_picks_the_speed_graph_for_p
     assert!(h.state().auto.find(&format!("timeline.graph.key.{pos}.1.0")).is_some(), "value graph: X and Y");
 }
 
-fn center(h: &Harness<'_, EffectcraftApp>, id: &str) -> Pos2 {
-    let e = h.state().auto.find(id).unwrap_or_else(|| panic!("no {id}"));
-    pos2(e.rect[0] + e.rect[2] / 2.0, e.rect[1] + e.rect[3] / 2.0)
-}
-
+/// #284: in the Graph Editor, dragging the handle of one selected key moves the same handle of
+/// every selected key with it (After Effects), in one undo step.
 #[test]
-fn clicking_an_ease_preset_eases_the_selected_keys_and_handles_edit_the_curve() {
-    use effectcraft_engine::keyframe::{Ease, Interp};
-    use effectcraft_ui_egui::dock::PanelKind;
-    let (mut h, id, _) = harness();
-    h.state_mut().session.execute("prop.select", json!({"layer": id.0, "path": "transform/opacity"})).unwrap();
-    h.state_mut().show_panel(PanelKind::EasePresets);
-    h.state_mut().ui.maximized = Some(PanelKind::EasePresets);
+fn a_graph_handle_drag_moves_the_handles_of_every_selected_key() {
+    let (mut h, id, uid) = harness();
+    let s = &mut h.state_mut().session;
+    s.execute("prop.addKey", json!({"layer": id.0, "path": "transform/opacity", "time": 2.0, "value": 0.0})).unwrap();
+    s.execute("prop.select", json!({"layer": id.0, "prop": uid})).unwrap();
+    s.execute("keys.selectAll", json!({})).unwrap();
+    s.execute("keys.easyEase", json!({})).unwrap();
+    h.state_mut().ui.timeline.graph_editor = true;
     h.run_steps(4);
-    let opacity =
-        |h: &Harness<'_, EffectcraftApp>| h.state().session.active_comp().unwrap().layer(id).unwrap().props.prop("transform/opacity").unwrap().clone();
-    let tile = h.state().auto.query("easePresets.preset.").into_iter().find(|e| e.label == "Ease In-Out").expect("the Ease In-Out thumbnail").id.clone();
-    let steps = h.state().session.history.undo.len();
-    let at = center(&h, &tile);
-    click_with(&mut h, at, Default::default());
-    let op = opacity(&h);
-    let eased = Ease { speed: 0.0, influence: 0.5 };
-    assert_eq!((op.keys[0].out_interp, op.keys[0].out_ease.clone()), (Interp::Bezier, vec![eased]));
-    assert_eq!((op.keys[1].in_interp, op.keys[1].in_ease.clone()), (Interp::Bezier, vec![eased]));
-    assert_eq!(h.state().session.history.undo.len(), steps + 1);
-    assert_eq!(h.state().ui.ease_presets.selected.as_deref(), Some("Ease In-Out"));
-    // Dragging the out handle to the right lengthens its influence; Apply uses the edited curve.
-    let graph = h.state().auto.find("easePresets.graph").unwrap().rect;
-    let from = center(&h, "easePresets.handle.out");
-    drag(&mut h, from, from + egui::vec2(graph[2] * 0.2, 0.0), Default::default());
-    let out = h.state().ui.ease_presets.curve.out_influence;
-    assert!(out > 60.0 && out < 75.0, "{out}");
-    let apply = center(&h, "easePresets.apply");
-    click_with(&mut h, apply, Default::default());
-    let applied = opacity(&h).keys[0].out_ease[0].influence;
-    assert!((applied * 100.0 - out).abs() < 1e-9, "{applied} vs {out}");
-    assert_eq!(h.state().session.history.undo.len(), steps + 2);
+    // (in, out) influence of each key.
+    let influences = |h: &Harness<'_, EffectcraftApp>| -> Vec<(f64, f64)> {
+        let l = h.state().session.active_comp().unwrap().layer(id).unwrap().clone();
+        let keys = l.props.prop("transform/opacity").unwrap().keys.clone();
+        keys.iter().map(|k| (k.in_ease.first().map_or(0.0, |e| e.influence), k.out_ease.first().map_or(0.0, |e| e.influence))).collect()
+    };
+    let before = influences(&h);
+    let handle = |h: &Harness<'_, EffectcraftApp>, key: usize| {
+        let e = h.state().auto.find(&format!("timeline.graph.handle.{uid}.0.{key}.out")).unwrap_or_else(|| panic!("no handle {key}")).clone();
+        pos2(e.rect[0] + e.rect[2] / 2.0, e.rect[1] + e.rect[3] / 2.0)
+    };
+    let px_per_s = {
+        let at = |i: usize| h.state().auto.find(&format!("timeline.graph.key.{uid}.0.{i}")).unwrap().rect[0];
+        at(1) - at(0)
+    };
+    let (k0, k1) = (handle(&h, 0), handle(&h, 1));
+    let undo = h.state().session.history.undo.len();
+    // Key 1's out handle 0.2 s further out (the keys are 1 s apart): key 0's goes along.
+    drag(&mut h, k1, k1 + egui::vec2(px_per_s * 0.2, 0.0), Default::default());
+    let after = influences(&h);
+    for i in [0, 1] {
+        assert!((after[i].1 - before[i].1 - 0.2).abs() < 0.01, "key {i}: {:?} → {:?}", before[i], after[i]);
+    }
+    assert_eq!((after[1].0, after[2].0), (before[1].0, before[2].0), "the in handles stay");
+    assert_eq!(h.state().session.history.undo.len(), undo + 1, "one undo step");
+    assert!((handle(&h, 0).x - k0.x - px_per_s * 0.2).abs() < 2.0, "key 0's handle moved on screen");
 }

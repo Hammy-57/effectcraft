@@ -52,6 +52,36 @@ fn an_edit_in_another_comp_keeps_the_cached_frames_and_undo_finds_them_again() {
     assert!(h.state().frames.is_cached(&effectcraft_ui_egui::frames::FrameKey { frame: 0, ..b_frame }));
 }
 
+/// #284: the Timeline shows the cached frames as a green line under the work area bar, from
+/// the first frame rendered on.
+#[test]
+fn the_timeline_shows_the_cached_frames_in_green() {
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "Cache", "width": 64, "height": 36, "duration": 2})).unwrap();
+    s.execute("layer.newSolid", json!({"color": "#3080ff"})).unwrap();
+    let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(|_| EffectcraftApp::new(s));
+    settle(&mut h);
+    h.run_steps(2);
+    let green = h.state().tokens.cache_green;
+    let bar = h.state().auto.find("timeline.workArea.bar").unwrap().rect;
+    fn rects(s: &egui::Shape, out: &mut Vec<egui::epaint::RectShape>) {
+        match s {
+            egui::Shape::Rect(r) => out.push(r.clone()),
+            egui::Shape::Vec(v) => v.iter().for_each(|s| rects(s, out)),
+            _ => {}
+        }
+    }
+    let mut all = vec![];
+    for c in &h.output().shapes {
+        rects(&c.shape, &mut all);
+    }
+    let line: Vec<egui::Rect> = all.iter().filter(|r| r.fill == green).map(|r| r.rect).collect();
+    assert!(!line.is_empty(), "a green cache line is drawn");
+    // Under the work area bar, at its start (frame 0 is cached), a visible width.
+    let under = |r: &egui::Rect| r.min.y >= bar[1] + bar[3] - 1.0 && r.max.y <= bar[1] + bar[3] + 8.0;
+    assert!(line.iter().any(|r| under(r) && (r.min.x - bar[0]).abs() < 2.0 && r.width() >= 1.0), "{line:?} bar {bar:?}");
+}
+
 /// Issue #65: while edits keep coming (a layer dragged in the viewer), only the viewer's frame
 /// renders; prefetching the frames around it waits until the edits pause (they would be stale at
 /// the next step, and would hold the CPU and GPU the next viewer frame needs), then resumes.

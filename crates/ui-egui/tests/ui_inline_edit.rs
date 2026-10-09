@@ -73,3 +73,57 @@ fn timecode_field_replaces_commits_and_cancels() {
     assert_eq!(frame(&h), 24, "Escape cancels");
     assert!(!h.ctx.egui_wants_keyboard_input(), "Escape releases the keyboard");
 }
+
+/// #284: dragging the expression pick whip while the expression is being edited puts the
+/// reference at the cursor (After Effects), and the editing goes on after it; without an edit
+/// in progress it replaces the expression.
+#[test]
+fn the_expression_pick_whip_inserts_at_the_cursor_while_editing() {
+    let (mut h, _) = harness();
+    let (layer, opacity, rotation, transform) = {
+        let s = &mut h.state_mut().session;
+        let l = s.execute("layer.newSolid", json!({"name": "Plate", "color": "#406080"})).unwrap()["layer"].as_u64().unwrap();
+        s.execute("prop.setExpression", json!({"layer": l, "path": "transform/opacity", "expression": "50 + 0"})).unwrap();
+        let tr = s.active_comp().unwrap().layer(effectcraft_engine::project::LayerId(l)).unwrap().props.sub("transform").unwrap().clone();
+        (l, tr.get("opacity").unwrap().uid, tr.get("rotation").unwrap().uid, tr.uid)
+    };
+    h.state_mut().ui.timeline.open_layers.insert(layer);
+    h.state_mut().ui.timeline.open_groups.insert(transform);
+    h.run_steps(3);
+    let expr = |h: &Harness<'_, EffectcraftApp>| {
+        let comp = h.state().session.active_comp().unwrap();
+        comp.layer(effectcraft_engine::project::LayerId(layer)).unwrap().props.find(opacity).unwrap().expr.as_ref().unwrap().text.clone()
+    };
+    let whip = |h: &mut Harness<'_, EffectcraftApp>| {
+        let (from, to) = (center(h, &format!("timeline.prop.{opacity}.pickWhip")), center(h, &format!("timeline.prop.{rotation}.name")));
+        h.input_mut().events.push(Event::PointerMoved(from));
+        h.step();
+        h.input_mut().events.push(Event::PointerButton { pos: from, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE });
+        h.step();
+        for k in 1..=8 {
+            h.input_mut().events.push(Event::PointerMoved(from + (to - from) * (k as f32 / 8.0)));
+            h.step();
+        }
+        h.input_mut().events.push(Event::PointerButton { pos: to, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE });
+        h.run_steps(3);
+    };
+    // Editing: the cursor at the end after typing " * ".
+    let p = center(&h, &format!("timeline.prop.{opacity}.expression"));
+    click(&mut h, p, 1);
+    key(&mut h, Key::End);
+    type_text(&mut h, " * ");
+    whip(&mut h);
+    assert_eq!(expr(&h), "50 + 0 * transform.rotation");
+    // The editor has the keyboard again, its cursor after the reference.
+    type_text(&mut h, " + 1");
+    // Ctrl/Cmd+Enter commits.
+    h.input_mut().events.push(Event::ModifiersChanged(Modifiers::COMMAND));
+    h.input_mut().events.push(Event::Key { key: Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::COMMAND });
+    h.step();
+    h.input_mut().events.push(Event::ModifiersChanged(Modifiers::NONE));
+    h.run_steps(3);
+    assert_eq!(expr(&h), "50 + 0 * transform.rotation + 1");
+    // Not editing: the reference replaces the expression.
+    whip(&mut h);
+    assert_eq!(expr(&h), "transform.rotation");
+}

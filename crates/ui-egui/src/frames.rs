@@ -667,30 +667,37 @@ impl Frames {
             return;
         }
         let Ok(mut q) = self.queue.lock() else { return };
+        let Ok(mut inf) = self.inflight.lock() else { return };
         // Jobs for an older project revision can never be shown: drop them.
         let before = q.jobs.len();
         q.jobs.retain(|j| j.key.revision >= key.revision);
-        let dropped = before - q.jobs.len();
-        if dropped > 0
-            && let Ok(mut inf) = self.inflight.lock()
-        {
+        if q.jobs.len() < before {
             inf.retain(|k| k.revision >= key.revision || q.running.contains(k));
         }
         if urgent {
-            // Only the newest viewer frame is urgent; earlier ones become prefetch.
+            // Only the newest viewer frame is urgent. The comp's earlier viewer frames that
+            // haven't started are dropped (scrubbing: rendering every frame the pointer passed
+            // would hold the workers the frame under it needs); frames already rendering finish
+            // into the cache, and the viewer shows its last frame until the new one is in
+            // (#284). Other comps' viewer frames become prefetch.
+            q.jobs.retain(|j| {
+                let superseded = j.urgent && j.key != key && j.key.comp == key.comp;
+                if superseded {
+                    inf.remove(&j.key);
+                }
+                !superseded
+            });
             for j in q.jobs.iter_mut() {
                 j.urgent = j.key == key;
             }
         }
-        {
-            let Ok(mut inf) = self.inflight.lock() else { return };
-            if !inf.insert(key) {
-                return;
-            }
+        if !inf.insert(key) {
+            return;
         }
         q.seq += 1;
         let seq = q.seq;
         q.jobs.push(Job { key, src: src.clone(), comp, t, opts, urgent, seq });
+        drop(inf);
         drop(q);
         #[cfg(not(target_arch = "wasm32"))]
         if self.remote.is_none() {
@@ -1159,6 +1166,43 @@ mod tests {
         assert!(footage.0.load(Ordering::SeqCst) > 0, "the render reached the footage");
         assert_eq!(f.inflight(), 0, "released");
         assert!(!f.is_cached(&key));
+    }
+
+    /// #284: scrubbing asks for a viewer frame at every step; a newer one drops the comp's viewer
+    /// frames still waiting (they would all render first), but not prefetch frames or another
+    /// comp's viewer frame.
+    #[test]
+    fn a_newer_viewer_frame_drops_the_ones_still_waiting() {
+        /// Starts nothing, so every request stays queued.
+        struct Idle;
+        impl RemoteFrames for Idle {
+            fn slots(&self) -> usize {
+                0
+            }
+            fn start(&self, _: RemoteJob, _: RemoteDone) {}
+        }
+        let mut f = Frames::default();
+        f.set_remote(Some(Arc::new(Idle)));
+        let src = RenderSource {
+            project: Arc::default(),
+            footage: Arc::new(effectcraft_engine::render::NoFootage),
+            expr: None,
+            layer_cache: Arc::default(),
+            gpu: None,
+            gpu_display: false,
+            disk: None,
+        };
+        let request = |k: FrameKey, urgent: bool| f.request_with(&src, k, ItemId(k.comp), Tick::ZERO, RenderOpts::default(), urgent);
+        let other = FrameKey { comp: 2, ..key(1, 0, 0) };
+        request(other, true);
+        request(key(1, 20, 0), false);
+        for frame in 0..10 {
+            request(key(1, frame, 0), true);
+        }
+        let mut queued: Vec<(u64, i64, bool)> = f.queue.lock().unwrap().jobs.iter().map(|j| (j.key.comp, j.key.frame, j.urgent)).collect();
+        queued.sort();
+        assert_eq!(queued, [(1, 9, true), (1, 20, false), (2, 0, false)]);
+        assert_eq!(f.inflight(), 3, "dropped frames aren't in flight: the viewer can ask again");
     }
 
     /// Each time the GPU runs out of memory, half as many GPU frames are kept, down to a floor.

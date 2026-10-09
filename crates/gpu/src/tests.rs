@@ -160,8 +160,8 @@ impl Scene {
     pub(crate) fn effect(&mut self, l: &mut Layer, id: &str, vals: &[(&str, Value)]) {
         let spec = effectcraft_effects::find(id).unwrap();
         let mut next = self.p.next_id;
-        let size = effectcraft_render::source_size(&self.p, l);
-        let mut g = effectcraft_effects::instantiate(spec, &mut Ids(&mut next), spec.name, [size.0 as f64, size.1 as f64]);
+        let size = effectcraft_render::effect_bounds(&self.p, &self.comp, l).0;
+        let mut g = effectcraft_effects::instantiate(spec, &mut Ids(&mut next), spec.name, size);
         self.p.next_id = next;
         for (k, v) in vals {
             g.prop_mut(k).unwrap_or_else(|| panic!("{id}: no {k}")).value = v.clone();

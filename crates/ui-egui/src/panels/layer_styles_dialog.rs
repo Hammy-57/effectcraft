@@ -4,6 +4,7 @@
 //! `layerStyles/<style>/<property>` property, so the viewer previews live; Cancel rolls the
 //! edits made in the dialog back, OK keeps them (one undo step per control drag).
 
+use crate::i18n::tr;
 use effectcraft_engine::keyframe::Value as KV;
 use effectcraft_engine::project::styles::{BLENDING, STYLES};
 use effectcraft_engine::project::{Layer, LayerId, ParamUi, Property};
@@ -115,7 +116,7 @@ fn control(ui: &mut egui::Ui, p: &Property, v: &KV) -> Option<Value> {
             changed.then(|| json!([rgba.r(), rgba.g(), rgba.b()]))
         }
         (KV::Gradient(_), _) => {
-            ui.label(egui::RichText::new("Edit in the Timeline").weak());
+            ui.label(egui::RichText::new(tr("Edit in the Timeline")).weak());
             None
         }
         _ => {
@@ -176,7 +177,7 @@ pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
                 app.auto.add("dialog.layerStyle.page", head.rect, &sel);
                 ui.add_space(6.0);
                 let Some(g) = styles.as_ref().and_then(|s| s.sub(&sel)) else {
-                    ui.label(egui::RichText::new("Not applied: tick it in the list to add it.").weak());
+                    ui.label(egui::RichText::new(tr("Not applied: tick it in the list to add it.")).weak());
                     return;
                 };
                 egui::ScrollArea::vertical().max_height(400.0).show(ui, |ui| {
@@ -203,12 +204,12 @@ pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
         });
         ui.add_space(8.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let ok = ui.button("OK");
+            let ok = ui.button(tr("OK"));
             app.auto.add("dialog.layerStyle.ok", ok.rect, "OK");
             if ok.clicked() {
                 close = Some(true);
             }
-            let cancel = ui.button("Cancel");
+            let cancel = ui.button(tr("Cancel"));
             app.auto.add("dialog.layerStyle.cancel", cancel.rect, "Cancel");
             if cancel.clicked() {
                 close = Some(false);

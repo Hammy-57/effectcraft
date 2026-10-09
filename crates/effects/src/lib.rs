@@ -245,7 +245,8 @@ pub fn flatten_params(g: &PropGroup, eval: &mut dyn FnMut(&Property) -> Value) -
     Params { values }
 }
 
-/// A layer image in flight: layer-space point `p` sits at pixel `p * scale + offset`.
+/// A layer image in flight: point `p` sits at pixel `p * scale + offset`. Points are in layer
+/// space, or in effect space while the layer's effects run (see [`Buf::rebase`]).
 #[derive(Clone, Debug, Default)]
 pub struct Buf {
     pub img: Image,
@@ -256,6 +257,12 @@ pub struct Buf {
 impl Buf {
     pub fn to_px(&self, p: [f64; 2]) -> (f64, f64) {
         (p[0] * self.scale + self.offset[0], p[1] * self.scale + self.offset[1])
+    }
+    /// Measure from `origin` (in the current coordinates): a point `p` becomes `p − origin`.
+    /// Moves between layer space and effect space (the renderer's `effect_bounds`).
+    pub fn rebase(&mut self, origin: [f64; 2]) {
+        self.offset[0] += origin[0] * self.scale;
+        self.offset[1] += origin[1] * self.scale;
     }
     /// Grow by `pad` transparent pixels on every side.
     pub fn pad(&mut self, pad: u32) {
@@ -359,11 +366,6 @@ pub struct EffectEnv<'a> {
     /// `[d, e, f]` take the effect coordinates [`Buf::to_px`] places to comp coordinates
     /// (`x' = a x + b y + c`). Effects that honour it say so.
     pub comp_space: Option<[[f64; 3]; 2]>,
-    /// Top-left corner of the layer bounds ([`EffectCtx::layer_size`]) in layer coordinates:
-    /// (0, 0) for layers with a source rectangle; shape and text layers have comp-sized bounds
-    /// centred on their origin (−w/2, −h/2). Edge pinning measures from these bounds
-    /// ([`util::pin_rect`]).
-    pub bounds_origin: [f64; 2],
 }
 
 impl EffectEnv<'_> {

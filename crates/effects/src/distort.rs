@@ -6,7 +6,7 @@ use effectcraft_project::ParamUi;
 use effectcraft_raster::Image;
 use rayon::prelude::*;
 
-use crate::util::pin_rect;
+use crate::util::layer_rect;
 use crate::{Buf, EffectCtx, EffectSpec, num, p, popup, slider};
 
 fn spec(id: &'static str, name: &'static str, params: Vec<crate::ParamSpec>, render: crate::RenderFn) -> EffectSpec {
@@ -83,7 +83,7 @@ fn bulge(ctx: &EffectCtx, mut b: Buf) -> Buf {
     // Taper Radius: higher values make the sides of the bulge shallower (a more peaked profile).
     let taper = 1.0 + ctx.params.f("taperRadius").max(0.0) / 100.0 * 3.0;
     let pin = ctx.params.b("pinAllEdges");
-    let (lx, ly, lw, lh) = pin_rect(ctx, b.offset, b.scale);
+    let (lx, ly, lw, lh) = layer_rect(ctx, &b);
     let edge = (lw.min(lh) * 0.1).max(1.0);
     b.img = remap(&b.img, false, |x, y| {
         let (dx, dy) = ((x - c.0) / rx, (y - c.1) / ry);
@@ -195,7 +195,7 @@ fn wave_warp(ctx: &EffectCtx, mut b: Buf) -> Buf {
     if pad > 0.0 {
         b.pad(pad as u32);
     }
-    let (x0, y0, lw, lh) = pin_rect(ctx, b.offset, b.scale);
+    let (x0, y0, lw, lh) = layer_rect(ctx, &b);
     let rect = (x0, y0, lw.max(1.0), lh.max(1.0));
     let time = ctx.time;
     b.img = remap(&b.img, false, |x, y| {

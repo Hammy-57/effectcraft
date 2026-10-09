@@ -75,6 +75,7 @@ pub struct Tokens {
     pub gap: f32,
     pub tab_h: f32,
     pub row_h: f32,
+    pub parameter_separators: bool,
     /// Settings ▸ Appearance ▸ Use Gradients: panel tab strips and buttons get a soft vertical
     /// gradient (off: flat fills).
     pub gradients: bool,
@@ -154,6 +155,7 @@ impl Tokens {
             gap: 4.0,
             tab_h: 30.0,
             row_h: 19.0,
+            parameter_separators: true,
             gradients: true,
         };
         match kind {
@@ -195,6 +197,8 @@ impl Tokens {
                 tl_ruler_bg: Color32::from_rgb(0xe2, 0xe2, 0xe2),
                 tl_ruler_text: Color32::from_rgb(0x50, 0x50, 0x50),
                 pasteboard: Color32::from_rgb(0xa8, 0xa8, 0xa8),
+                // Keyframes have no outline: dark enough to stand out on the light time graph.
+                keyframe: Color32::from_rgb(0x6c, 0x6c, 0x6c),
                 ..dark
             },
         }
@@ -222,6 +226,7 @@ impl Tokens {
     pub fn from_prefs(p: &effectcraft_engine::prefs::Prefs) -> Tokens {
         let kind = ThemeKind::from_name(&p.appearance.theme).unwrap_or_default();
         let mut t = Tokens::for_kind(kind).with_brightness(p.appearance.brightness as f32);
+        t.parameter_separators = p.appearance.parameter_row_separators;
         for (i, l) in effectcraft_color::Label::ALL.iter().enumerate() {
             let [r, g, b] = p.label_rgb(*l);
             t.labels[i] = Color32::from_rgb(r, g, b);
@@ -279,8 +284,14 @@ static INTER_MEDIUM: &[u8] = include_bytes!("../../../assets/fonts/Inter-Medium.
 static INTER_SEMIBOLD: &[u8] = include_bytes!("../../../assets/fonts/Inter-SemiBold.ttf");
 static JETBRAINS_MONO: &[u8] = include_bytes!("../../../assets/fonts/JetBrainsMono-Regular.ttf");
 
-/// Install fonts (Inter, Inter Medium/SemiBold, JetBrains Mono) and egui visuals.
-pub fn install(ctx: &egui::Context, t: &Tokens) {
+/// Install fonts (Inter, Inter Medium/SemiBold, JetBrains Mono) and egui visuals. `language` is the
+/// resolved interface language from [`crate::i18n::language`] (`en`, `ja`, `zh-hans` or `zh-hant`),
+/// not the stored `general.language` preference: `system` is already resolved there, so a Chinese
+/// system draws Chinese with the default setting. The CJK fallback that draws the interface's own
+/// script is registered first, so a Chinese interface is drawn by a Chinese face and a Japanese one
+/// by a Japanese face. `install` is called again when the language changes (see the `EffectcraftApp`
+/// frame loop), so the fonts do not need a restart.
+pub fn install(ctx: &egui::Context, t: &Tokens, language: &str) {
     let mut fonts = FontDefinitions::default();
     fonts.font_data.insert("inter".into(), Arc::new(FontData::from_static(INTER_REGULAR)));
     fonts.font_data.insert("inter-medium".into(), Arc::new(FontData::from_static(INTER_MEDIUM)));
@@ -290,26 +301,78 @@ pub fn install(ctx: &egui::Context, t: &Tokens) {
     fonts.families.entry(FontFamily::Monospace).or_default().insert(0, "jbmono".into());
     fonts.families.insert(FontFamily::Name("semibold".into()), vec!["inter-semibold".into(), "inter".into()]);
     fonts.families.insert(FontFamily::Name("medium".into()), vec!["inter-medium".into(), "inter".into()]);
-    // Reuse the text engine's script-aware system fallback (#84), without embedding a CJK font.
+    install_cjk_fallbacks(&mut fonts, language);
+    ctx.set_fonts(fonts);
+    apply_visuals(ctx, t);
+}
+
+/// Register the CJK system fallbacks for `language` in every font family, and return their names in
+/// registration order (empty when nothing installed covers a probe, so a machine without CJK fonts
+/// simply keeps the bundled ones).
+///
+/// The text engine has its own script-aware fallback (#84), but which face it picks for Han
+/// ideographs depends on the locale environment: a Chinese interface on a Japanese-locale machine
+/// would be drawn with the Japanese face. The interface language is the better signal, so the probe
+/// for its script comes first — kana for Japanese, a Han character for the Chinese catalogs. Both
+/// scripts are registered, so file, layer and template names in the other one still render. The web
+/// build has no system fonts and installs nothing.
+fn install_cjk_fallbacks(family_fonts: &mut FontDefinitions, language: &str) -> Vec<String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (family_fonts, language);
+        Vec::new()
+    }
     #[cfg(not(target_arch = "wasm32"))]
     {
         use effectcraft_text::fonts;
+        // Kana is unambiguously Japanese; Han ideographs are shared, so the order decides which
+        // language's face draws them.
+        const KANA: (char, &str) = ('あ', "japanese-system");
+        const HAN: (char, &str) = ('文', "chinese-system");
+        // Han text follows the interface language, not the operating system's locale.
+        fonts::set_cjk_locale(cjk_locale(language));
         let base = fonts::resolve("Inter", "Regular").face;
-        let face = fonts::face(fonts::fallback_for('あ', base));
-        if face.has_char('あ')
-            && let Some(font) = face.font()
-        {
+        let probes = if is_chinese(language) { [HAN, KANA] } else { [KANA, HAN] };
+        let mut names = Vec::new();
+        let mut seen = Vec::new();
+        for (probe, name) in probes {
+            let id = fonts::fallback_for(probe, base);
+            if seen.contains(&id) {
+                continue;
+            }
+            let face = fonts::face(id);
+            if !face.has_char(probe) {
+                continue; // nothing installed covers this script
+            }
+            let Some(font) = face.font() else { continue };
+            seen.push(id);
             // Use the already-read, parsed bytes rather than reading a font file twice.
             let mut data = FontData::from_owned(font.data().as_bytes().to_vec());
             data.index = face.info.index;
-            fonts.font_data.insert("japanese-system".into(), Arc::new(data));
-            for family in fonts.families.values_mut() {
-                family.push("japanese-system".into());
+            family_fonts.font_data.insert(name.to_string(), Arc::new(data));
+            for family in family_fonts.families.values_mut() {
+                family.push(name.to_string());
             }
+            names.push(name.to_string());
         }
+        names
     }
-    ctx.set_fonts(fonts);
-    apply_visuals(ctx, t);
+}
+
+/// The CJK locale the text engine should prefer for Han text: the interface language when it names
+/// one, otherwise the empty string, which leaves the operating system's locale in charge.
+#[cfg(not(target_arch = "wasm32"))]
+fn cjk_locale(language: &str) -> &str {
+    match language {
+        "ja" | "zh-hans" | "zh-hant" => language,
+        _ => "",
+    }
+}
+
+/// Whether `language` is one of the Chinese catalogs.
+#[cfg(not(target_arch = "wasm32"))]
+fn is_chinese(language: &str) -> bool {
+    matches!(language, "zh-hans" | "zh-hant")
 }
 
 pub fn apply_visuals(ctx: &egui::Context, t: &Tokens) {
@@ -376,7 +439,7 @@ mod japanese_font_tests {
             return;
         }
         let ctx = egui::Context::default();
-        super::install(&ctx, &super::Tokens::for_kind(super::ThemeKind::Dark));
+        super::install(&ctx, &super::Tokens::for_kind(super::ThemeKind::Dark), "ja");
         let mut out = ctx.run_ui(egui::RawInput::default(), |_| {});
         // No renderer here: drop the frame's texture uploads (egui asserts on unhandled ones in debug).
         out.textures_delta.clear();
@@ -401,5 +464,62 @@ mod japanese_font_tests {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The last `n` font names of `family`, in order.
+    fn tail(family: &[String], n: usize) -> Vec<&str> {
+        family.iter().rev().take(n).rev().map(String::as_str).collect()
+    }
+
+    #[test]
+    fn cjk_fallbacks_follow_the_interface_language() {
+        // A Chinese interface asks for the Han probe first, so Han text is drawn by a Chinese face
+        // even when the operating system's locale is not Chinese.
+        assert_eq!(cjk_locale("zh-hans"), "zh-hans");
+        assert_eq!(cjk_locale("zh-hant"), "zh-hant");
+        assert_eq!(cjk_locale("ja"), "ja");
+        assert_eq!(cjk_locale("en"), "");
+        assert_eq!(cjk_locale("system"), "");
+        let mut chinese = FontDefinitions::default();
+        let installed = install_cjk_fallbacks(&mut chinese, "zh-hans");
+        if installed.is_empty() {
+            eprintln!("no CJK font is installed: only the language plumbing can be checked here");
+        } else {
+            assert_eq!(installed.first().map(String::as_str), Some("chinese-system"), "the Han probe comes first");
+            assert!(chinese.font_data.contains_key("chinese-system"));
+            let expected: Vec<&str> = installed.iter().map(String::as_str).collect();
+            for (family, stack) in &chinese.families {
+                assert_eq!(tail(stack, installed.len()), expected, "{family:?}");
+            }
+        }
+        // A Japanese interface keeps the kana probe first, as it was before the language existed.
+        let mut japanese = FontDefinitions::default();
+        let installed = install_cjk_fallbacks(&mut japanese, "ja");
+        if let Some(first) = installed.first() {
+            assert_eq!(first, "japanese-system", "the kana probe comes first");
+        }
+        // And an English interface leaves the operating system's locale in charge.
+        let mut english = FontDefinitions::default();
+        install_cjk_fallbacks(&mut english, "en");
+    }
+
+    #[test]
+    fn a_cjk_face_is_registered_at_most_once() {
+        let mut fonts = FontDefinitions::default();
+        let installed = install_cjk_fallbacks(&mut fonts, "zh-hant");
+        let mut unique = installed.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique, installed, "no face may be registered twice");
+        for name in &installed {
+            assert!(fonts.font_data.contains_key(name), "{name} is missing its font data");
+        }
+        // Leave the operating system's locale behind for whatever runs next.
+        install_cjk_fallbacks(&mut fonts, "system");
     }
 }

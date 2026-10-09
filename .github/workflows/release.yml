@@ -88,6 +88,9 @@ jobs:
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
         run: packaging/macos/import-cert.sh
+      # Renders the DMG background from packaging/macos/dmg/background.svg (package.sh).
+      - name: Install resvg
+        run: cargo install resvg --locked --version 0.48.1
       - name: Build, sign, notarize
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}

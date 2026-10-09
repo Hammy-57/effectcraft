@@ -142,6 +142,14 @@ fn delete(s: &mut Session, p: &Value) -> Result<Value> {
     if s.state.text_edit.is_some() && p.get("layers").is_none() {
         return s.execute("text.delete", json!({}));
     }
+    // Time Remap selected (its name, which selects all its keys) → time remapping off, not the
+    // layer (After Effects).
+    if p.get("layers").is_none() {
+        let remapped = super::layer_time::selected_time_remap(s);
+        if !remapped.is_empty() {
+            return super::layer_time::disable_time_remap(s, &remapped);
+        }
+    }
     // Keyframes selected → delete keys; mask vertices → delete them; else layers.
     if !s.state.selected_keys.is_empty() && p.get("layers").is_none() {
         return s.execute("keys.delete", json!({}));

@@ -11,6 +11,7 @@
 //! overlay, the segmentation span bar and the view / Freeze buttons; the Roto Brush and Refine
 //! Edge tools paint their strokes here (see [`super::roto_tool`]).
 
+use crate::i18n::{tr, tr_args};
 use effectcraft_engine::effects::paint;
 use effectcraft_engine::project::{Layer, LayerId};
 use effectcraft_engine::render::{EvalCtx, RenderOpts, Renderer};
@@ -67,7 +68,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let p = ui.painter().with_clip_rect(rect);
     let (Some(cid), Some(layer)) = (app.session.active_comp_id(), current_layer(app)) else {
         p.rect_filled(rect, 0.0, t.pasteboard);
-        p.text(rect.center(), Align2::CENTER_CENTER, "Double-click a layer to open it in the Layer panel", Tokens::ui(12.0), t.text_faint);
+        p.text(rect.center(), Align2::CENTER_CENTER, tr("Double-click a layer to open it in the Layer panel"), Tokens::ui(12.0), t.text_faint);
         app.auto.add("layerPanel.empty", rect, "Layer panel (empty)");
         return;
     };
@@ -80,12 +81,12 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     // Title strip.
     let top = Rect::from_min_size(rect.min, vec2(rect.width(), 24.0));
     p.rect_filled(top, 0.0, t.panel_bg);
-    p.text(pos2(top.min.x + 10.0, top.center().y), Align2::LEFT_CENTER, format!("Layer: {}", layer.name), Tokens::semibold(12.0), t.text);
+    p.text(pos2(top.min.x + 10.0, top.center().y), Align2::LEFT_CENTER, tr_args("Layer: {}", &[&layer.name]), Tokens::semibold(12.0), t.text);
     app.auto.add("layerPanel.title", top, &layer.name);
     // Bottom bar: View menu.
     let bar = Rect::from_min_max(pos2(rect.min.x, rect.max.y - 30.0), rect.max);
     p.rect_filled(bar, 0.0, t.panel_bg);
-    p.text(pos2(bar.min.x + 10.0, bar.center().y), Align2::LEFT_CENTER, "View:", Tokens::ui(12.0), t.text_dim);
+    p.text(pos2(bar.min.x + 10.0, bar.center().y), Align2::LEFT_CENTER, tr("View:"), Tokens::ui(12.0), t.text_dim);
     let mut names = vec!["Masks".to_string()];
     if let Some(fx) = layer.effects() {
         names.extend(fx.groups().map(|g| g.name.clone()));
@@ -113,8 +114,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     // Canvas.
     let area = Rect::from_min_max(pos2(rect.min.x, top.max.y), pos2(rect.max.x, canvas_bottom));
     p.rect_filled(area, 0.0, t.pasteboard);
-    let (w, h) = effectcraft_engine::render::source_size(&app.session.project, &layer);
-    let (lw, lh) = if w == 0 { (comp.width as f64, comp.height as f64) } else { (w as f64, h as f64) };
+    // The layer's effect bounds, in effect space (where paint and Roto Brush strokes are).
+    let [lw, lh] = effectcraft_engine::render::effect_bounds(&app.session.project, &comp, &layer).0;
     let zoom = ((area.width() - 40.0) as f64 / lw).min((area.height() - 40.0) as f64 / lh).max(0.01);
     let origin = area.center() - vec2((lw * zoom / 2.0) as f32, (lh * zoom / 2.0) as f32);
     let to_screen = |q: [f64; 2]| pos2(origin.x + (q[0] * zoom) as f32, origin.y + (q[1] * zoom) as f32);

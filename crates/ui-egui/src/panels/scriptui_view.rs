@@ -6,6 +6,7 @@
 //! named it). Controls with an `onDraw` handler are painted from their draw list; edit texts and
 //! sliders send live `changing` updates (onChanging) while typing / dragging.
 
+use crate::i18n::tr;
 use effectcraft_engine::Services;
 use effectcraft_engine::scriptui::{DrawOp, ImageRef, PathSeg, ScriptWindow, Widget, WidgetKind, WindowKind, layout};
 use egui::{Align2, Color32, Rect, Sense, Stroke, StrokeKind, UiBuilder, pos2, vec2};
@@ -410,7 +411,7 @@ pub fn show_windows(app: &mut EffectcraftApp, ctx: &egui::Context) {
 pub fn panel(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect, id: u32) {
     let t = app.tokens;
     let Some(mut w) = app.session.script_ui.window(id).cloned() else {
-        ui.painter().text(rect.center(), Align2::CENTER_CENTER, "This ScriptUI panel has closed", Tokens::ui(12.0), t.text_faint);
+        ui.painter().text(rect.center(), Align2::CENTER_CENTER, tr("This ScriptUI panel has closed"), Tokens::ui(12.0), t.text_faint);
         return;
     };
     // Docked panels fill their frame (ScriptUI lays them out at the panel's size).

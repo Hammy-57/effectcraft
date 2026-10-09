@@ -1,6 +1,7 @@
 //! Modal dialogs: About (community links, Contributors and Models credits), New Composition /
 //! Composition Settings, Solid Settings and the command palette (Camera/Light Settings live in `dialogs_3d`).
 
+use crate::i18n::{tr, tr_args};
 use effectcraft_engine::project::{ItemId, ItemKind, LayerId, LayerSource};
 use egui::{Align2, Color32, Rect, Sense, pos2, vec2};
 use serde_json::{Value, json};
@@ -232,9 +233,9 @@ fn about(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
         }
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("MIT OR Apache-2.0 • Fonts: Inter, JetBrains Mono (OFL)").small().color(t.text_faint));
+            ui.label(egui::RichText::new(tr("MIT OR Apache-2.0 • Fonts: Inter, JetBrains Mono (OFL)")).small().color(t.text_faint));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let r = ui.button("Close");
+                let r = ui.button(tr("Close"));
                 app.auto.add("about.close", r.rect, "Close");
                 if r.clicked() {
                     close = true;
@@ -265,7 +266,7 @@ fn about_main(app: &mut EffectcraftApp, ui: &mut egui::Ui, t: &Tokens, cmd: &mut
         t.text_dim,
     );
     ui.add_space(12.0);
-    ui.label("A clean-room, open-source compositor for motion graphics and visual effects: native on macOS, Windows and Linux, and in the browser. Part of the ArtCraft family of creative apps.");
+    ui.label(tr("A clean-room, open-source compositor for motion graphics and visual effects: native on macOS, Windows and Linux, and in the browser. Part of the ArtCraft family of creative apps."));
     ui.add_space(14.0);
     let links: [(Icon, &str, &str, &'static str); 4] = [
         (Icon::Chat, "Join the ArtCraft Discord", effectcraft_engine::links::DISCORD, "help.discord"),
@@ -349,23 +350,23 @@ fn solid(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
     let auto = &mut app.auto;
     modal(ctx, "Solid Settings", vec2(480.0, if editing.is_some() { 430.0 } else { 390.0 }), t, |ui| {
         ui.horizontal(|ui| {
-            ui.label("Name:");
+            ui.label(tr("Name:"));
             let r = ui.add(egui::TextEdit::singleline(&mut name).desired_width(320.0));
             auto.add("dialog.solid.name", r.rect, "Name");
         });
         ui.add_space(8.0);
-        ui.label(egui::RichText::new("Size").strong());
+        ui.label(egui::RichText::new(tr("Size")).strong());
         egui::Grid::new("solid-grid").num_columns(2).spacing([14.0, 8.0]).show(ui, |ui| {
             let (ow, oh) = (size[0], size[1]);
-            ui.label("Width:");
+            ui.label(tr("Width:"));
             ui.horizontal(|ui| {
                 let r = ui.add(egui::DragValue::new(&mut size[0]).range(1..=30000).suffix(" px"));
                 auto.add("dialog.solid.width", r.rect, "Width");
-                let r = ui.checkbox(&mut lock, format!("Lock Aspect Ratio to {}", super::comp_settings::aspect_label(ow as f64, oh as f64)));
+                let r = ui.checkbox(&mut lock, tr_args("Lock Aspect Ratio to {}", &[&(super::comp_settings::aspect_label(ow as f64, oh as f64))]));
                 auto.add("dialog.solid.lockAspect", r.rect, "Lock Aspect Ratio");
             });
             ui.end_row();
-            ui.label("Height:");
+            ui.label(tr("Height:"));
             let r = ui.add(egui::DragValue::new(&mut size[1]).range(1..=30000).suffix(" px"));
             auto.add("dialog.solid.height", r.rect, "Height");
             ui.end_row();
@@ -376,7 +377,7 @@ fn solid(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
                     size[0] = ((size[1] as f64) * ow as f64 / oh as f64).round().max(1.0) as u32;
                 }
             }
-            ui.label("Pixel Aspect Ratio:");
+            ui.label(tr("Pixel Aspect Ratio:"));
             let cur = super::comp_settings::PIXEL_ASPECTS
                 .iter()
                 .find(|(_, v)| (v - par).abs() < 1e-3)
@@ -403,14 +404,14 @@ fn solid(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
             .color(Color32::GRAY),
         );
         ui.add_space(4.0);
-        let r = ui.button("Make Comp Size");
+        let r = ui.button(tr("Make Comp Size"));
         auto.add("dialog.solid.makeCompSize", r.rect, "Make Comp Size");
         if r.clicked() {
             size = [comp_size.0, comp_size.1];
         }
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            ui.label("Color:");
+            ui.label(tr("Color:"));
             let r = crate::widgets::srgb_color_button(ui, &mut color);
             auto.add("dialog.solid.color", r.rect, "Color");
         });
@@ -421,15 +422,15 @@ fn solid(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
                 .on_disabled_hover_text("Only this layer uses this solid.");
             auto.add("dialog.solid.affectAll", r.rect, "Affect all layers that use this solid");
             if shared && !affect_all {
-                ui.label(egui::RichText::new("This change will create a new solid for this layer.").color(t.text_dim).size(11.0));
+                ui.label(egui::RichText::new(tr("This change will create a new solid for this layer.")).color(t.text_dim).size(11.0));
             }
         }
         ui.add_space(14.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let r = ui.add(egui::Button::new(egui::RichText::new("   OK   ").color(Color32::WHITE)).fill(t.accent));
+            let r = ui.add(egui::Button::new(egui::RichText::new(tr("   OK   ")).color(Color32::WHITE)).fill(t.accent));
             auto.add("dialog.solid.ok", r.rect, "OK");
             ok = r.clicked();
-            let r = ui.button("Cancel");
+            let r = ui.button(tr("Cancel"));
             auto.add("dialog.solid.cancel", r.rect, "Cancel");
             close = r.clicked();
         });
@@ -493,7 +494,7 @@ fn palette(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
         .take(14)
         .collect();
     modal(ctx, "Command Palette", vec2(560.0, 470.0), t, |ui| {
-        let r = ui.add(egui::TextEdit::singleline(&mut q).hint_text("Type a command or effect…").desired_width(f32::INFINITY).font(Tokens::ui(14.0)));
+        let r = ui.add(egui::TextEdit::singleline(&mut q).hint_text(tr("Type a command or effect…")).desired_width(f32::INFINITY).font(Tokens::ui(14.0)));
         r.request_focus();
         ui.add_space(8.0);
         let sel = app.dialog_state.palette_sel.min(matches.len().saturating_sub(1));
@@ -548,7 +549,7 @@ mod tests {
     fn app() -> (EffectcraftApp, egui::Context) {
         let ctx = egui::Context::default();
         let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
-        crate::theme::install(&ctx, &app.tokens);
+        crate::theme::install(&ctx, &app.tokens, crate::i18n::language(&app));
         app.session.execute("comp.new", json!({"name": "Main", "width": 640, "height": 360})).unwrap();
         (app, ctx)
     }

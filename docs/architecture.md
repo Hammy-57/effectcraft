@@ -83,13 +83,48 @@ a file that a newer EffectCraft saved shows a warning: fields this version doesn
 dropped if it saves the project. Save, Save As, Save a Copy and Increment and Save keep the
 file's format (`.ecprojx` stays XML).
 
+`schema` changes when a saved value changes meaning; a project from an older schema is converted
+when it is opened (`effectcraft_engine::upgrade_effects`, which also refreshes effect instances
+from the registry) and saved with the current one, which older versions refuse to open rather than
+render wrongly. Schema 2 put effect positions on shape and text layers in effect space (§4,
+#227). Opening a schema 1 project moves what an effect on a text layer (not an adjustment layer,
+whose effects see the comp below as before, nor a shape layer, whose effects already measured from
+its anchor-centred canvas in this tree) holds as a position by half the comp size,
+so points that were set keep their place in the comp: point parameters with their keyframes, Paint
+stroke paths and clone positions, Puppet mesh seeds, pin rest points and positions, and Liquify
+and Roto Brush strokes. A point parameter still at its default and not animated is left alone:
+the old default sat at the comp's bottom-right corner, where most effects did nothing, and the
+same value is now the layer centre, as in After Effects. Expression controls (Point Control…)
+keep their values, because their meaning is up to the expressions that read them, and expressions
+are not rewritten, so an expression that computes an effect point on a shape or text layer from
+other values may need `+ [thisComp.width / 2, thisComp.height / 2]`. Effects that use the layer
+bounds (edge pinning, wipes, Offset, generators) now cover the whole comp-sized bounds instead of
+their bottom-right quarter. Tracking data of effects that analyse footage (Warp Stabilizer, 3D
+Camera Tracker, Mocha shape) is left as it is: footage has a source rectangle, whose effect space
+did not change.
+
 ## 4. Rendering
 
 `Renderer::comp_frame(comp, t)` walks the layers bottom to top. For each visible layer it renders
 the **source** (solid, footage frame, text, shape contents, or a nested comp), applies **masks**,
 then **effects** in order, then **layer styles**, then the **transform** into comp space (with motion blur sub-samples
 when enabled), the **track matte**, and finally **blends** into the accumulator. Adjustment layers
-apply their effects to the accumulator. Runs of 3D layers are composited per pixel through the
+apply their effects to the accumulator.
+
+Effects run in **effect space** (`effectcraft_render::effect_bounds`): layer pixels measured from
+the top-left of the layer's effect bounds, which are the source rectangle, or for layers without
+one (shape, text) a comp-sized rectangle centred on the layer's origin that their content
+surrounds; `EvalCtx::effect_bounds` centres a shape layer's on its anchor point, as After Effects
+renders a shape layer's effects on a comp-sized canvas centred on the anchor. A shape layer's
+default effect point (the bounds' centre) is therefore its anchor, as in After Effects. The renderer moves the layer buffer into effect space for the whole
+stack (`Buf::rebase`, on the CPU and the GPU alike) and hands effects everything else in it too:
+masks, other layers' pixels for layer parameters (each in its own effect space), the layer's own
+frames at other times (`Renderer::layer_input`, also what Puppet, Roto Brush and the Layer panel
+read) and the comp camera. Effect point handles, Puppet pins and the Layer panel map effect space
+to the comp with `EvalCtx::effect_to_comp`. Adjustment layers run their effects on the comp below
+in their own layer space (a shape adjustment layer still from its anchor-centred canvas).
+
+Runs of 3D layers are composited per pixel through the
 active camera, with lights, shadows and depth of field (Classic 3D), or rasterised as meshes by
 the Advanced 3D renderer (below).
 
@@ -319,9 +354,8 @@ hierarchical block-matching optical flow and a bidirectional warp (Pixel Motion,
 its nested layers straight into the parent with concatenated transforms (one resample), so
 nested blend modes and adjustment layers act on the parent's layers; nested 3D layers use the
 parent's camera and lights and, when the precomp layer is 3D, are depth-sorted with the parent's
-3D run. Masks, effects or styles force a flattened render. Text layers are always rasterised at
-their on-screen scale; on shape layers and vector footage the switch is Continuously Rasterize and
-does the same. Quality: Draft samples
+3D run. Masks, effects or styles force a flattened render. On text and shape layers the switch is
+Continuously Rasterize: the source is rasterised at its on-screen scale. Quality: Draft samples
 nearest-neighbour, Wireframe draws the layer bounds. Slip edit (`layer.slip`, Alt+PageUp/Down,
 dragging the source bar in the timeline) moves the source under fixed in/out points.
 

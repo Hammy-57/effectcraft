@@ -163,6 +163,22 @@ fn velocity_dialog_values_per_dimension_and_continuous() {
     undo_redo_roundtrip(&mut s, after, |s| assert_eq!(prop(s, l, "transform/scale").keys[1].in_interp, Interp::Linear));
 }
 
+/// Spatial Bezier on a straight two-key path gives both keys handles a third of the way along it
+/// (they had none), so the path can be pulled into a curve; the motion stays the same (#290).
+#[test]
+fn spatial_bezier_gives_a_straight_path_handles() {
+    let (mut s, l) = setup();
+    animate(&mut s, l, "transform/position", &[(0.0, json!([0, 0])), (2.0, json!([300, 0]))]);
+    let mid = prop(&s, l, "transform/position").value_at(effectcraft_time::Tick::from_seconds_f64(0.7)).as_vec3();
+    select_prop_keys(&mut s, l, "transform/position");
+    s.execute("keys.interpolation", json!({"spatial": "bezier"})).unwrap();
+    let p = prop(&s, l, "transform/position");
+    assert!(p.keys.iter().all(|k| !k.spatial_auto));
+    assert_eq!((p.keys[0].spatial_out, p.keys[1].spatial_in), ([100.0, 0.0, 0.0], [-100.0, 0.0, 0.0]));
+    let now = p.value_at(effectcraft_time::Tick::from_seconds_f64(0.7)).as_vec3();
+    assert!((now[0] - mid[0]).abs() < 0.01 && now[1].abs() < 1e-9, "{mid:?} → {now:?}");
+}
+
 #[test]
 fn interpolation_dialog_temporal_spatial_and_roving() {
     let (mut s, l) = setup();
@@ -428,6 +444,19 @@ fn parenting_keeps_the_layer_in_place() {
     assert!(s.active_comp().unwrap().layer(effectcraft_project::LayerId(child)).unwrap().parent.is_some());
 }
 
+/// #284: toggling stopwatches with one `merge` key (dragging over them) is one undo step.
+#[test]
+fn stopwatch_toggles_with_a_merge_key_are_one_undo_step() {
+    let (mut s, l) = setup();
+    let steps = s.history.undo.len();
+    for path in ["transform/position", "transform/scale", "transform/opacity"] {
+        s.execute("prop.toggleAnimation", json!({"layer": l, "path": path, "value": true, "merge": "drag"})).unwrap();
+    }
+    assert_eq!(s.history.undo.len(), steps + 1);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(["transform/position", "transform/scale", "transform/opacity"].iter().all(|p| !prop(&s, l, p).is_animated()));
+}
+
 #[test]
 fn pick_whip_generates_ae_reference_expressions() {
     let (mut s, l) = setup();
@@ -451,6 +480,33 @@ fn pick_whip_generates_ae_reference_expressions() {
     s.execute("edit.undo", json!({})).unwrap();
     assert_ne!(prop(&s, l, "transform/position").expr.map(|e| e.text), Some("thisComp.layer(\"Other\").transform.position".into()));
     assert!(s.execute("prop.pickWhip", json!({"layer": l, "path": "transform/opacity", "target": {"layer": l, "path": "transform/opacity"}})).is_err());
+}
+
+/// #284: with the expression being edited, the pick whip puts the reference at the cursor,
+/// replacing the selected characters (After Effects), in one undo step.
+#[test]
+fn pick_whip_inserts_into_the_expression_being_edited() {
+    let (mut s, l) = setup();
+    let o = s.execute("layer.newSolid", json!({"name": "Ö", "color": "#00ff00"})).unwrap()["layer"].as_u64().unwrap();
+    let whip = |s: &mut Session, base: &str, range: Value| {
+        let mut p = json!({"layer": l, "path": "transform/opacity", "target": {"layer": o, "path": "transform/rotation"}, "expression": base});
+        if !range.is_null() {
+            p["range"] = range;
+        }
+        s.execute("prop.pickWhip", p)
+    };
+    let r = "thisComp.layer(\"Ö\").transform.rotation";
+    // Characters, not bytes: "é" before the cursor.
+    assert_eq!(whip(&mut s, "é + 5", json!([1, 1])).unwrap(), json!(format!("é{r} + 5")));
+    assert_eq!(prop(&s, l, "transform/opacity").expr.unwrap().text, format!("é{r} + 5"));
+    // A selection (either way round) is replaced; no range: at the end.
+    assert_eq!(whip(&mut s, "a*2+b", json!([4, 2])).unwrap(), json!(format!("a*{r}b")));
+    assert_eq!(whip(&mut s, "x + ", Value::Null).unwrap(), json!(format!("x + {r}")));
+    // Past the end clamps; a malformed range is an error.
+    assert_eq!(whip(&mut s, "7", json!([9, 99])).unwrap(), json!(format!("7{r}")));
+    assert!(whip(&mut s, "7", json!([1])).is_err());
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(prop(&s, l, "transform/opacity").expr.unwrap().text, format!("x + {r}"));
 }
 
 /// Outer comp (4 s) containing a precomp whose 10×10 white solid moves x = 10 + 20·t (t in s).
@@ -509,6 +565,44 @@ fn time_remap_enable_freeze_and_disable() {
     // Solids can't be remapped.
     let r = s.execute("layer.newSolid", json!({"color": "#ff0000"})).unwrap();
     assert!(s.execute("layer.enableTimeRemap", json!({"layers": [r["layer"]]})).is_err());
+}
+
+/// Edit ▸ Clear with Time Remap selected (clicking its name selects all its keys) turns time
+/// remapping off instead of deleting the layer (#290); one selected key is still just a key.
+#[test]
+fn deleting_time_remap_turns_time_remapping_off() {
+    let (mut s, l) = precomp_setup();
+    s.execute("layer.enableTimeRemap", json!({})).unwrap();
+    let uid = prop(&s, l, "timeRemap").uid;
+    s.execute("keys.select", json!({"keys": [{"layer": l, "prop": uid, "time": 0.0}], "selectProperties": true})).unwrap();
+    s.execute("edit.clear", json!({})).unwrap();
+    assert_eq!(prop(&s, l, "timeRemap").keys.len(), 1, "only the selected key went");
+    s.execute("prop.select", json!({"layer": l, "prop": uid})).unwrap();
+    s.execute("edit.clear", json!({})).unwrap();
+    let comp = s.active_comp().unwrap();
+    assert_eq!(comp.layers.len(), 1, "the layer stays");
+    assert!(comp.layers[0].props.get("timeRemap").is_none(), "time remapping is off");
+    assert!(s.state.selected_keys.is_empty() && !s.state.selected_props.iter().any(|(_, u)| *u == uid));
+    assert!((square_x(&s, 1.0) - 30.0).abs() < 1.5);
+    // One undo step brings it back.
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(prop(&s, l, "timeRemap").keys.len(), 1);
+}
+
+/// Enable Time Remapping on a layer extended past its source's end (its last frame frozen) puts
+/// the end key at the source's end, not at the extended out point (#290).
+#[test]
+fn time_remap_on_an_extended_layer_ends_at_the_source_end() {
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "Inner", "width": 100, "height": 100, "frameRate": 30, "duration": 2})).unwrap();
+    s.execute("comp.new", json!({"name": "Outer", "width": 100, "height": 100, "frameRate": 30, "duration": 4})).unwrap();
+    let l = s.execute("layer.addItem", json!({"item": "Inner"})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("layer.timing", json!({"layers": [l], "out": 4.0})).unwrap();
+    s.execute("layer.enableTimeRemap", json!({"layers": [l]})).unwrap();
+    let p = prop(&s, l, "timeRemap");
+    let keys: Vec<(f64, KV)> = p.keys.iter().map(|k| (k.time.seconds(), k.value.clone())).collect();
+    assert_eq!(keys, vec![(0.0, KV::Scalar(0.0)), (2.0, KV::Scalar(2.0))]);
+    assert_eq!(s.active_comp().unwrap().layers[0].out_point.seconds(), 4.0, "the layer stays extended");
 }
 
 #[test]

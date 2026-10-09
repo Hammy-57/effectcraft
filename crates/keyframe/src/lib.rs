@@ -10,11 +10,9 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
-pub mod ease_curve;
 pub mod text_doc;
 pub mod value;
 
-pub use ease_curve::EaseCurve;
 use effectcraft_time::{TICKS_PER_SECOND, Tick};
 use serde::{Deserialize, Serialize};
 pub use text_doc::{BaselineOption, CharStyle, Composer, Direction, FigureStyle, FigureWidth, Kerning, OpenType, ParaStyle, StyleRun};
@@ -297,6 +295,37 @@ fn auto_spatial(keys: &[Keyframe], i: usize) -> ([f64; 3], [f64; 3]) {
 pub fn spatial_tangents(keys: &[Keyframe], i: usize) -> ([f64; 3], [f64; 3]) {
     let Some(key) = keys.get(i) else { return ([0.0; 3], [0.0; 3]) };
     if key.spatial_auto { auto_spatial(keys, i) } else { (key.spatial_in, key.spatial_out) }
+}
+
+/// Spatial tangents of key `i` as motion-path handles: [`spatial_tangents`], with a side that
+/// has none but a neighbour (the ends of an auto-Bezier path, a straight two-key path) pointing
+/// where the path leaves the key, toward the segment's next control point, a third of the way to
+/// the neighbouring key. After Effects shows Bezier handles there to drag the path into a curve.
+pub fn spatial_handles(keys: &[Keyframe], i: usize) -> ([f64; 3], [f64; 3]) {
+    let (mut tin, mut tout) = spatial_tangents(keys, i);
+    let Some(p) = keys.get(i).map(|k| v3(&k.value)) else { return (tin, tout) };
+    // Toward key `j`'s control point on this segment (its in side when `j` follows `i`).
+    let toward = |j: usize, after: bool| -> Option<[f64; 3]> {
+        let q = v3(&keys.get(j)?.value);
+        let (jin, jout) = spatial_tangents(keys, j);
+        let t = if after { jin } else { jout };
+        let d = [q[0] + t[0] - p[0], q[1] + t[1] - p[1], q[2] + t[2] - p[2]];
+        let dl = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        let len = ((q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2) + (q[2] - p[2]).powi(2)).sqrt() / 3.0;
+        (dl > 1e-9).then(|| d.map(|v| v * len / dl))
+    };
+    let none = |t: [f64; 3]| t == [0.0; 3];
+    if none(tout)
+        && let Some(v) = toward(i + 1, true)
+    {
+        tout = v;
+    }
+    if none(tin)
+        && let Some(v) = i.checked_sub(1).and_then(|j| toward(j, false))
+    {
+        tin = v;
+    }
+    (tin, tout)
 }
 
 /// Effective temporal ease of key `i` for dimension `d` (auto-Bezier keys get the neighbour slope).

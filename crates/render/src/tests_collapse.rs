@@ -1,7 +1,7 @@
 //! Collapse Transformations, Continuously Rasterize and the Quality switch.
 
 use effectcraft_color::{BlendMode, Label};
-use effectcraft_keyframe::{TextDoc, Value};
+use effectcraft_keyframe::Value;
 use effectcraft_project::build::{self, Ids};
 use effectcraft_project::{BitDepth, Comp, ItemId, ItemKind, Layer, LayerSource, Project, Quality, Solid};
 use effectcraft_time::{FrameRate, Tick};
@@ -233,33 +233,4 @@ fn collapsed_precomp_of_another_size_renders_through_the_parent_camera() {
         assert!(c[2] > 0.99 && c[3] > 0.99, "3D precomp {three_d}, camera {camera}: centre {c:?}");
         assert!(img.get(100, 100)[3] < 0.01, "only the 40 px solid is drawn");
     }
-}
-
-/// Text layers are always continuously rasterised (#194): text scaled up with the layer's Scale is drawn
-/// at its on-screen size, as sharp as text set at that font size, without the switch.
-#[test]
-fn text_scaled_up_stays_sharp_without_the_switch() {
-    let run = |size: f64, scale: f64| {
-        let mut p = project();
-        let comp = Comp::new(240, 160, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
-        let mut l = build::layer(&mut p, &comp, "Text", LayerSource::Text, (240, 160), None);
-        l.props.prop_mut("text/sourceText").unwrap().value = Value::Text(Box::new(TextDoc { text: "HE".into(), size, ..Default::default() }));
-        set(&mut l, "transform/anchor", Value::Vec3([0.0, 0.0, 0.0]));
-        set(&mut l, "transform/position", Value::Vec3([40.0, 120.0, 0.0]));
-        set(&mut l, "transform/scale", Value::Vec3([scale, scale, 100.0]));
-        assert!(!l.switches.collapse);
-        let mut c = comp;
-        c.layers = vec![l];
-        let cid = p.add_item("Comp", Label::Sandstone, None, ItemKind::Comp(c.into()));
-        render_frame(&p, cid, Tick::ZERO, 1.0)
-    };
-    let partial = |img: &Image| img.data.iter().filter(|px| (0.02..0.98).contains(&px[3])).count();
-    let scaled = run(10.0, 800.0);
-    let native = run(80.0, 100.0);
-    let (ps, pn) = (partial(&scaled), partial(&native));
-    let d = max_diff(&scaled, &native);
-    eprintln!("partially covered pixels: scaled {ps}, native {pn}; max difference {d}");
-    assert!(native.data.iter().filter(|px| px[3] > 0.98).count() > 1000, "the text renders");
-    assert!(ps <= pn + pn / 2, "scaled text is blurred: {ps} soft pixels against {pn}");
-    assert!(d < 0.05, "scaled text differs from text set at that size by {d}");
 }

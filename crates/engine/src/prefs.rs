@@ -23,7 +23,11 @@ pub const PREFS_VERSION: u32 = 2;
 pub const PREFS_FILE: &str = "prefs.json";
 
 /// Settings ▸ General ▸ Language: (label, `general.language` value).
-pub const LANGUAGES: &[(&str, &str)] = &[("Match System", "system"), ("English", "en"), ("日本語", "ja"), ("简体中文", "zh-hans"), ("繁體中文", "zh-hant")];
+pub const LANGUAGES: &[(&str, &str)] =
+    &[("Match System", "system"), ("English", "en"), ("日本語", "ja"), ("简体中文", "zh-hans"), ("繁體中文", "zh-hant"), ("Українська", "uk")];
+
+/// Settings ▸ Appearance ▸ UI Scale: (label, `appearance.uiScale` percent).
+pub const UI_SCALES: &[(&str, &str)] = &[("75%", "75"), ("100%", "100"), ("125%", "125"), ("150%", "150"), ("175%", "175"), ("200%", "200")];
 
 /// Settings ▸ Startup & Repair ▸ Window Graphics: (label, `startup.windowGraphics` value).
 pub const WINDOW_GRAPHICS: &[(&str, &str)] = &[("Automatic", "auto"), ("OpenGL (compatibility)", "gl")];
@@ -64,7 +68,7 @@ macro_rules! page {
 
 page!(General {
     /// Interface language: `system` (the operating system's, where EffectCraft has it, else
-    /// English), `en` or `ja`.
+    /// English), or a language code from `LANGUAGES`.
     language: String = "system".into(),
     /// Levels of Undo (1–99).
     undo_levels: u32 = 32,
@@ -140,6 +144,9 @@ page!(Appearance {
     theme: String = "dark".into(),
     /// User interface brightness, -1 (darker) … 1 (lighter).
     brightness: f64 = 0.0,
+    /// The size of the whole interface in percent (75–200), on top of the display's own scale.
+    ui_scale: u32 = 100,
+    parameter_row_separators: bool = true,
     use_label_color_for_handles: bool = true,
     use_label_color_for_tabs: bool = true,
     cycle_mask_colors: bool = true,
@@ -454,6 +461,7 @@ impl Prefs {
         a.interval_minutes = a.interval_minutes.clamp(1, 240);
         a.max_versions = a.max_versions.clamp(1, 99);
         self.appearance.brightness = self.appearance.brightness.clamp(-1.0, 1.0);
+        self.appearance.ui_scale = self.appearance.ui_scale.clamp(75, 200);
         let defaults = default_labels();
         self.labels.truncate(defaults.len());
         for d in defaults.iter().skip(self.labels.len()) {
@@ -1009,11 +1017,13 @@ pub fn pages() -> Vec<Page> {
             items: vec![
                 s("appearance.theme", "Theme", Kind::Choice(&[("Dark", "dark"), ("Darker", "darker"), ("Light", "light")]), true),
                 s("appearance.brightness", "Brightness", Kind::Slider(-1.0, 1.0), true),
+                s("appearance.uiScale", "UI Scale", Kind::Choice(UI_SCALES), true),
                 Section("Labels and Colors"),
                 s("appearance.useLabelColorForHandles", "Use Label Color for Layer Handles and Paths", B, true),
                 s("appearance.useLabelColorForTabs", "Use Label Color for Related Tabs", B, true),
                 s("appearance.cycleMaskColors", "Cycle Mask Colors", B, true),
                 s("appearance.useGradients", "Use Gradients", B, true),
+                s("appearance.parameterRowSeparators", "Show Parameter Row Separators", B, true),
                 Section("Menu Bar"),
                 s("appearance.inWindowMenuBarMac", "Use In-Window Menu Bar on macOS", B, true),
             ],

@@ -2,6 +2,7 @@
 //! Basic / Advanced / 3D Renderer tabs, Cancel / OK. Every control registers an automation id
 //! (`dialog.comp.<field>`).
 
+use crate::i18n::{tr, tr_args};
 use effectcraft_engine::time::{FrameRate, format_timecode_frames, parse_timecode};
 use egui::{Color32, vec2};
 use serde_json::json;
@@ -174,7 +175,7 @@ fn timecode_field(ui: &mut egui::Ui, buf: &mut Option<String>, secs: &mut f64, r
 pub fn show(ui: &mut egui::Ui, d: &mut CompDraft, t: &Tokens, auto: &mut Registry) -> Option<serde_json::Value> {
     let mut out = None;
     ui.horizontal(|ui| {
-        ui.label("Composition Name:");
+        ui.label(tr("Composition Name:"));
         let r = ui.add(egui::TextEdit::singleline(&mut d.name).desired_width(300.0));
         auto.add("dialog.comp.name", r.rect, "Composition Name");
     });
@@ -193,7 +194,7 @@ pub fn show(ui: &mut egui::Ui, d: &mut CompDraft, t: &Tokens, auto: &mut Registr
     match d.tab {
         Tab::Basic => {
             egui::Grid::new("comp-basic").num_columns(2).spacing([12.0, 9.0]).show(ui, |ui| {
-                ui.label("Preset:");
+                ui.label(tr("Preset:"));
                 let current = PRESETS
                     .iter()
                     .find(|(_, w, h, par, f)| *w == d.width && *h == d.height && (par - d.pixel_aspect).abs() < 1e-3 && (f - d.fps).abs() < 1e-3)
@@ -208,7 +209,7 @@ pub fn show(ui: &mut egui::Ui, d: &mut CompDraft, t: &Tokens, auto: &mut Registr
                 });
                 auto.add("dialog.comp.preset", r.response.rect, "Preset");
                 ui.end_row();
-                ui.label("Width:");
+                ui.label(tr("Width:"));
                 ui.horizontal(|ui| {
                     let (ow, oh) = (d.width, d.height);
                     let r = ui.add(egui::DragValue::new(&mut d.width).range(4..=30000).suffix(" px"));
@@ -221,7 +222,7 @@ pub fn show(ui: &mut egui::Ui, d: &mut CompDraft, t: &Tokens, auto: &mut Registr
                     }
                 });
                 ui.end_row();
-                ui.label("Height:");
+                ui.label(tr("Height:"));
                 let (ow, oh) = (d.width, d.height);
                 let r = ui.add(egui::DragValue::new(&mut d.height).range(4..=30000).suffix(" px"));
                 auto.add("dialog.comp.height", r.rect, "Height");
@@ -229,7 +230,7 @@ pub fn show(ui: &mut egui::Ui, d: &mut CompDraft, t: &Tokens, auto: &mut Registr
                     d.width = ((d.height as f64) * ow as f64 / oh as f64).round().max(4.0) as u32;
                 }
                 ui.end_row();
-                ui.label("Pixel Aspect Ratio:");
+                ui.label(tr("Pixel Aspect Ratio:"));
                 ui.horizontal(|ui| {
                     let cur = PIXEL_ASPECTS
                         .iter()
@@ -245,12 +246,12 @@ pub fn show(ui: &mut egui::Ui, d: &mut CompDraft, t: &Tokens, auto: &mut Registr
                     });
                     auto.add("dialog.comp.pixelAspect", r.response.rect, "Pixel Aspect Ratio");
                     ui.label(
-                        egui::RichText::new(format!("Frame Aspect Ratio: {}", aspect_label(d.width as f64 * d.pixel_aspect, d.height as f64)))
+                        egui::RichText::new(tr_args("Frame Aspect Ratio: {}", &[&(aspect_label(d.width as f64 * d.pixel_aspect, d.height as f64))]))
                             .color(Color32::GRAY),
                     );
                 });
                 ui.end_row();
-                ui.label("Frame Rate:");
+                ui.label(tr("Frame Rate:"));
                 ui.horizontal(|ui| {
                     // Any rate can be typed; the list holds the common ones.
                     let r = ui.add(egui::DragValue::new(&mut d.fps).range(1.0..=999.0).speed(0.01).max_decimals(3));
@@ -263,25 +264,25 @@ pub fn show(ui: &mut egui::Ui, d: &mut CompDraft, t: &Tokens, auto: &mut Registr
                         }
                     });
                     auto.add("dialog.comp.frameRates", r.response.rect, "Frame Rate presets");
-                    ui.label("frames per second");
+                    ui.label(tr("frames per second"));
                     if rate.supports_drop_frame() {
-                        ui.label(egui::RichText::new("Drop Frame").color(Color32::GRAY));
+                        ui.label(egui::RichText::new(tr("Drop Frame")).color(Color32::GRAY));
                     }
                 });
                 ui.end_row();
                 ui.label("");
                 let mb = d.width as f64 * d.height as f64 * 4.0 / (1024.0 * 1024.0);
-                ui.label(egui::RichText::new(format!("{} x {}, {mb:.1}MB per 8bpc frame", d.width, d.height)).color(Color32::GRAY));
+                ui.label(egui::RichText::new(tr_args("{} x {}, {}MB per 8bpc frame", &[&d.width, &d.height, &format!("{mb:.1}")])).color(Color32::GRAY));
                 ui.end_row();
-                ui.label("Start Timecode:");
+                ui.label(tr("Start Timecode:"));
                 let r = ui.horizontal(|ui| timecode_field(ui, &mut d.start_tc, &mut d.start, rate, i64::MIN / 4)).inner;
                 auto.add("dialog.comp.startTimecode", r.rect, "Start Timecode");
                 ui.end_row();
-                ui.label("Duration:");
+                ui.label(tr("Duration:"));
                 let r = ui.horizontal(|ui| timecode_field(ui, &mut d.dur_tc, &mut d.duration, rate, 1)).inner;
                 auto.add("dialog.comp.duration", r.rect, "Duration");
                 ui.end_row();
-                ui.label("Background Color:");
+                ui.label(tr("Background Color:"));
                 ui.horizontal(|ui| {
                     let r = crate::widgets::srgb_color_button(ui, &mut d.bg);
                     auto.add("dialog.comp.background", r.rect, "Background Color");
@@ -292,7 +293,7 @@ pub fn show(ui: &mut egui::Ui, d: &mut CompDraft, t: &Tokens, auto: &mut Registr
         }
         Tab::Advanced => {
             egui::Grid::new("comp-adv").num_columns(2).spacing([12.0, 9.0]).show(ui, |ui| {
-                ui.label("Anchor:");
+                ui.label(tr("Anchor:"));
                 egui::Grid::new("comp-anchor").spacing([2.0, 2.0]).show(ui, |ui| {
                     for i in 0..9u8 {
                         let on = d.anchor == i;
@@ -309,28 +310,28 @@ pub fn show(ui: &mut egui::Ui, d: &mut CompDraft, t: &Tokens, auto: &mut Registr
                 });
                 ui.end_row();
                 ui.label("");
-                let r = ui.checkbox(&mut d.preserve_frame_rate, "Preserve frame rate when nested or in render queue");
+                let r = ui.checkbox(&mut d.preserve_frame_rate, tr("Preserve frame rate when nested or in render queue"));
                 auto.add("dialog.comp.preserveFrameRate", r.rect, "Preserve frame rate when nested or in render queue");
                 ui.end_row();
                 ui.label("");
-                let r = ui.checkbox(&mut d.preserve_resolution, "Preserve resolution when nested");
+                let r = ui.checkbox(&mut d.preserve_resolution, tr("Preserve resolution when nested"));
                 auto.add("dialog.comp.preserveResolution", r.rect, "Preserve resolution when nested");
                 ui.end_row();
-                ui.label(egui::RichText::new("Motion Blur").strong());
+                ui.label(egui::RichText::new(tr("Motion Blur")).strong());
                 ui.end_row();
-                ui.label("Shutter Angle:");
+                ui.label(tr("Shutter Angle:"));
                 let r = ui.add(egui::DragValue::new(&mut d.shutter_angle).range(0.0..=720.0).suffix("°"));
                 auto.add("dialog.comp.shutterAngle", r.rect, "Shutter Angle");
                 ui.end_row();
-                ui.label("Shutter Phase:");
+                ui.label(tr("Shutter Phase:"));
                 let r = ui.add(egui::DragValue::new(&mut d.shutter_phase).range(-360.0..=360.0).suffix("°"));
                 auto.add("dialog.comp.shutterPhase", r.rect, "Shutter Phase");
                 ui.end_row();
-                ui.label("Samples Per Frame:");
+                ui.label(tr("Samples Per Frame:"));
                 let r = ui.add(egui::DragValue::new(&mut d.samples).range(2..=64));
                 auto.add("dialog.comp.samples", r.rect, "Samples Per Frame");
                 ui.end_row();
-                ui.label("Adaptive Sample Limit:");
+                ui.label(tr("Adaptive Sample Limit:"));
                 let r = ui.add(egui::DragValue::new(&mut d.adaptive_limit).range(16..=256));
                 auto.add("dialog.comp.adaptiveLimit", r.rect, "Adaptive Sample Limit");
                 ui.end_row();
@@ -338,11 +339,11 @@ pub fn show(ui: &mut egui::Ui, d: &mut CompDraft, t: &Tokens, auto: &mut Registr
         }
         Tab::Renderer => {
             ui.horizontal(|ui| {
-                ui.label("Renderer:");
+                ui.label(tr("Renderer:"));
                 let r =
                     egui::ComboBox::from_id_salt("comp-renderer").selected_text(if d.advanced_3d { "Advanced 3D" } else { "Classic 3D" }).show_ui(ui, |ui| {
-                        ui.selectable_value(&mut d.advanced_3d, false, "Classic 3D");
-                        ui.selectable_value(&mut d.advanced_3d, true, "Advanced 3D");
+                        ui.selectable_value(&mut d.advanced_3d, false, tr("Classic 3D"));
+                        ui.selectable_value(&mut d.advanced_3d, true, tr("Advanced 3D"));
                     });
                 auto.add("dialog.comp.renderer", r.response.rect, "Renderer");
             });
@@ -351,12 +352,12 @@ pub fn show(ui: &mut egui::Ui, d: &mut CompDraft, t: &Tokens, auto: &mut Registr
     ui.add_space(14.0);
     ui.horizontal(|ui| {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let r = ui.add(egui::Button::new(egui::RichText::new("   OK   ").color(Color32::WHITE)).fill(t.accent));
+            let r = ui.add(egui::Button::new(egui::RichText::new(tr("   OK   ")).color(Color32::WHITE)).fill(t.accent));
             auto.add("dialog.comp.ok", r.rect, "OK");
             if r.clicked() {
                 out = Some(params(d));
             }
-            let r = ui.button("Cancel");
+            let r = ui.button(tr("Cancel"));
             auto.add("dialog.comp.cancel", r.rect, "Cancel");
             if r.clicked() {
                 out = Some(serde_json::Value::Null);

@@ -19,6 +19,7 @@ mod autosave;
 pub mod backend;
 pub mod base64;
 pub mod bridge;
+mod long_job;
 pub mod server;
 pub mod tools;
 

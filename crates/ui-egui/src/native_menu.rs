@@ -190,6 +190,8 @@ pub fn build(app: &EffectcraftApp) -> NativeMenu {
                                     "服务"
                                 } else if crate::i18n::traditional(app) {
                                     "服務"
+                                } else if crate::i18n::ukrainian(app) {
+                                    "Служби"
                                 } else {
                                     "Services"
                                 }
@@ -416,6 +418,27 @@ mod tests {
         assert_eq!((it.command.as_str(), &it.params, it.checked), ("window.workspace", &json!({"name": "My Layout"}), Some(true)));
         crate::menus::invoke(&mut app, &ctx, "window.workspace", json!({"name": "Default"})).unwrap();
         assert_eq!(entry(&app).and_then(|i| i.checked), Some(false));
+    }
+
+    #[test]
+    fn ukrainian_translates_macos_predefined_items() {
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+        app.session.execute("prefs.set", json!({"key": "general.language", "value": "uk"})).unwrap();
+        fn labels(nodes: &[NativeNode], out: &mut Vec<String>) {
+            for node in nodes {
+                match node {
+                    NativeNode::Predefined { label, .. } => out.push(label.clone()),
+                    NativeNode::Submenu { children, .. } => labels(children, out),
+                    _ => {}
+                }
+            }
+        }
+        let mut translated = vec![];
+        labels(&build(&app).menus, &mut translated);
+        assert_eq!(translated, ["Служби", "Приховати EffectCraft", "Приховати решту", "Показати все"]);
     }
 
     #[test]

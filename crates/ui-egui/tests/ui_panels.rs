@@ -153,6 +153,29 @@ fn saved_workspace_is_listed_in_the_workspace_menu() {
     assert_eq!(h.state().ui.dock, saved, "its layout came back");
 }
 
+/// Edit ▸ Label shows each label's colour before its name (#290), and choosing one labels the
+/// selected layer.
+#[test]
+fn edit_label_menu_shows_the_label_colours() {
+    let mut h = harness();
+    click(&mut h, "menu.Edit");
+    let label = h.query_by_label(" Label ⏵").expect("Edit ▸ Label").rect();
+    hover(&mut h, label.center());
+    // (Not Dark Green; the entry's label starts with its check-mark column.)
+    let green = h.query_by_label(" Green").expect("the Label submenu is open").rect();
+    let col = h.state().tokens.label(effectcraft_engine::color::Label::Green);
+    let swatch = |s: &egui::Shape| matches!(s, egui::Shape::Rect(r) if r.fill == col && r.rect.width() < 16.0 && green.contains(r.rect.center()));
+    let shapes: Vec<egui::Shape> = h.output().shapes.iter().map(|c| c.shape.clone()).collect();
+    assert!(shapes.iter().any(|s| swatch(s) || matches!(s, egui::Shape::Vec(v) if v.iter().any(swatch))), "no Green swatch");
+    // Into the submenu, then down to Green.
+    hover(&mut h, pos2(green.center().x, label.center().y));
+    for k in 1..=10 {
+        hover(&mut h, pos2(green.center().x, label.center().y + (green.center().y - label.center().y) * k as f32 / 10.0));
+    }
+    click_at(&mut h, green.center());
+    assert_eq!(h.state().session.active_comp().unwrap().layers[0].label, effectcraft_engine::color::Label::Green);
+}
+
 /// Learn opens the Home screen's tutorials; clicking another workspace tab closes them again,
 /// however quickly the tabs are clicked (they stayed over every workspace, #272).
 #[test]
@@ -165,6 +188,48 @@ fn leaving_the_learn_workspace_closes_its_tutorials() {
         assert_eq!(h.state().ui.start_screen, learn, "{name}: the Home screen shows only for Learn");
         assert_eq!(!h.state().auto.query("home.learn.").is_empty(), learn, "{name}: the tutorials show only for Learn");
     }
+}
+
+/// #284: Settings ▸ Appearance ▸ UI Scale sizes the whole interface as soon as it is chosen,
+/// Cancel puts it back, OK keeps it; Ctrl+0 (Window ▸ Project) doesn't reset it.
+#[test]
+fn ui_scale_setting_sizes_the_interface() {
+    let mut h = harness();
+    let ctx = h.ctx.clone();
+    let choose = |h: &mut Harness<'_, EffectcraftApp>, label: &str| {
+        let ctx = h.ctx.clone();
+        effectcraft_ui_egui::menus::invoke(h.state_mut(), &ctx, "app.settings", json!({"page": "appearance"})).unwrap();
+        h.run_steps(3);
+        click(h, "settings.appearance.uiScale");
+        let option = h.query_by_label(label).unwrap_or_else(|| panic!("the {label} choice")).rect().center();
+        click_at(h, option);
+        h.run_steps(2);
+    };
+    assert_eq!(ctx.zoom_factor(), 1.0);
+    choose(&mut h, "150%");
+    assert_eq!(h.state().session.prefs.appearance.ui_scale, 150);
+    assert_eq!(ctx.zoom_factor(), 1.5, "live");
+    click(&mut h, "settings.cancel");
+    h.run_steps(2);
+    assert_eq!((h.state().session.prefs.appearance.ui_scale, ctx.zoom_factor()), (100, 1.0), "Cancel put it back");
+    choose(&mut h, "125%");
+    click(&mut h, "settings.ok");
+    h.run_steps(2);
+    assert_eq!(h.state().dialog, None);
+    assert_eq!((h.state().session.prefs.appearance.ui_scale, ctx.zoom_factor()), (125, 1.25), "OK kept it");
+    // Ctrl+0 opens the Project panel; egui's own Ctrl+0 zoom reset stays out of it.
+    for pressed in [true, false] {
+        h.input_mut().events.push(Event::Key { key: egui::Key::Num0, physical_key: None, pressed, repeat: false, modifiers: egui::Modifiers::COMMAND });
+        h.step();
+    }
+    h.run_steps(2);
+    assert_eq!(ctx.zoom_factor(), 1.25);
+    // A saved scale applies from the first frame.
+    let mut s = Session::default();
+    s.prefs.set("appearance.uiScale", json!(175)).unwrap();
+    let mut h2 = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).build_eframe(|_| EffectcraftApp::new(s));
+    h2.run_steps(3);
+    assert_eq!(h2.ctx.zoom_factor(), 1.75);
 }
 
 /// Headless look at the panels (wgpu offscreen; needs a GPU adapter). Run with

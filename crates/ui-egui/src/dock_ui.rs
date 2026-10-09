@@ -149,7 +149,7 @@ impl EffectcraftApp {
 
     fn panel_body(&mut self, ui: &mut egui::Ui, p: PanelKind, rect: Rect) {
         self.auto.add(&format!("panel.{}", p.id()), rect, p.title());
-        let mut content = rect;
+        let mut content = rect.shrink(1.0);
         let viewer = p == panels::viewers::active_panel(self);
         if viewer && !self.ui.start_screen && panels::precomp::has_flow(self) {
             // Composition Navigator: the flow of nested comps above the viewer.
@@ -194,7 +194,7 @@ impl EffectcraftApp {
         // Where each group's tabs are (tab drags show where a tab will land between them).
         let mut tab_rects: Vec<(String, Vec<(PanelKind, Rect)>)> = vec![];
         for g in &groups {
-            let c = dock::draw_group_chrome(ui, g, self.ui.focused, &t, &mut self.auto, &info);
+            let c = dock::draw_group_chrome(ui, g, &t, &mut self.auto, &info);
             actions.extend(c.actions);
             tab_rects.push((g.path.clone(), c.tabs));
         }
@@ -209,6 +209,11 @@ impl EffectcraftApp {
                 continue; // a collapsed stacked panel: header only
             }
             self.panel_body(ui, p, g.content);
+        }
+        for g in &groups {
+            if g.panels.get(g.active) == Some(&self.ui.focused) {
+                ui.painter().rect_stroke(g.rect, 0.0, Stroke::new(1.0, t.focus), StrokeKind::Inside);
+            }
         }
         // Floating groups over the dock.
         let mut float_groups: Vec<Group> = vec![];
@@ -308,11 +313,14 @@ impl EffectcraftApp {
                 active: f.active.min(f.panels.len().saturating_sub(1)),
                 stacked: None,
             };
-            let c = dock::draw_group_chrome(ui, &g, self.ui.focused, &t, &mut self.auto, info);
+            let c = dock::draw_group_chrome(ui, &g, &t, &mut self.auto, info);
             actions.extend(c.actions);
-            ui.painter().rect_stroke(r, t.radius, Stroke::new(1.0, t.field_border), StrokeKind::Outside);
             if let Some(p) = g.panels.get(g.active).copied() {
                 self.panel_body(ui, p, g.content);
+            }
+            ui.painter().rect_stroke(r, t.radius, Stroke::new(1.0, t.field_border), StrokeKind::Outside);
+            if g.panels.get(g.active) == Some(&self.ui.focused) {
+                ui.painter().rect_stroke(r, t.radius, Stroke::new(1.0, t.focus), StrokeKind::Inside);
             }
             // Resize from the corner.
             let grip = Rect::from_min_max(r.max - vec2(14.0, 14.0), r.max);
