@@ -920,8 +920,15 @@ impl<'a> Renderer<'a> {
     /// Draw a comp's layers (bottom to top) into `canvas` (blending space).
     /// `blank`: the canvas is fully transparent (lets the first layer skip re-quantising).
     fn draw_comp(&self, ctx: &EvalCtx<'a>, canvas: &mut Image, mut blank: bool) {
+        for (ctx, visible) in self.draw_passes(ctx) {
+            self.draw_layers(&ctx, &visible, canvas, blank);
+            blank = blank && visible.is_empty();
+        }
+    }
+
+    /// Draw `visible` (bottom to top) into `canvas`.
+    fn draw_layers(&self, ctx: &EvalCtx<'a>, visible: &[&'a Layer], canvas: &mut Image, mut blank: bool) {
         // Bottom-to-top, with runs of consecutive 3D layers depth-sorted (farthest first).
-        let visible = self.visible_layers(ctx);
         let mut i = 0;
         while i < visible.len() {
             if visible[i].is_3d() {
@@ -2010,6 +2017,60 @@ impl<'a> Renderer<'a> {
             .rev()
             .filter(|l| l.is_active_at(t) && l.has_video() && !l.environment && (!any_solo || l.switches.solo) && (self.opts.guides || !l.switches.guide))
             .collect()
+    }
+
+    /// The comp's visible layers (bottom to top) in drawing passes, each with the time it is
+    /// drawn at. A 2D adjustment layer with Posterize Time holds everything below it (and itself)
+    /// on its frame grid, as After Effects does: SceneYard UI Google search's "Glow / Posterize
+    /// Time" adjustment steps the Gaussian Blur adjustment and the layers under it to 15 fps.
+    /// Above that layer the comp runs at the real time. Effects of other layers see their own
+    /// pass's time.
+    pub fn draw_passes(&self, ctx: &EvalCtx<'a>) -> Vec<(EvalCtx<'a>, Vec<&'a Layer>)> {
+        let mut out = Vec::new();
+        self.collect_passes(ctx, None, 0, &mut out);
+        out
+    }
+
+    fn collect_passes(&self, ctx: &EvalCtx<'a>, below: Option<usize>, depth: usize, out: &mut Vec<(EvalCtx<'a>, Vec<&'a Layer>)>) {
+        let comp = ctx.comp;
+        let index = |l: &Layer| comp.layers.iter().position(|x| std::ptr::eq(x, l)).unwrap_or(0);
+        let visible: Vec<&'a Layer> = self.visible_layers(ctx).into_iter().filter(|l| below.is_none_or(|b| index(l) >= b)).collect();
+        let split = if depth < 16 {
+            visible.iter().enumerate().rev().find_map(|(k, l)| {
+                let t = self.posterized_comp_time(ctx, l)?;
+                ((t.0 - ctx.time.0).abs() > 0).then_some((k, t))
+            })
+        } else {
+            None
+        };
+        match split {
+            Some((k, t)) => {
+                self.collect_passes(&ctx.at(t), Some(index(visible[k])), depth + 1, out);
+                out.push((*ctx, visible.get(k + 1..).unwrap_or_default().to_vec()));
+            }
+            None => out.push((*ctx, visible)),
+        }
+    }
+
+    /// The comp time a 2D adjustment layer's first enabled Posterize Time holds at `ctx`.
+    fn posterized_comp_time(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Tick> {
+        if !layer.switches.adjustment || layer.is_3d() || !layer.switches.effects {
+            return None;
+        }
+        let g = layer.effects()?.groups().find(|g| g.enabled && matches!(&g.kind, GroupKind::Effect { effect } if effect == "ec.time.posterizetime"))?;
+        let rate = self.effect_params(ctx, layer, g).f("frameRate");
+        let lt = layer.layer_time(ctx.time).seconds();
+        let held = effectcraft_effects::posterized_time(lt, rate);
+        if !held.is_finite() {
+            return None;
+        }
+        // The held time lands on the comp's next frame (SceneYard Twisting text gradient: 20 fps
+        // in a 30 fps comp holds frame 44 at frame 44, not at 43.5, so its footage keeps frame
+        // 44's picture).
+        let t = layer.comp_time(Tick::from_seconds_f64(held)).seconds();
+        let fps = ctx.comp.frame_rate.as_f64();
+        let t = if fps > 0.0 { (t * fps - 1e-6).ceil() / fps } else { t };
+        t.is_finite().then(|| Tick::from_seconds_f64(t))
     }
 
     /// Draw a run of consecutive 3D layers into `canvas` (CPU).

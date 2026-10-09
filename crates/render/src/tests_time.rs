@@ -55,6 +55,46 @@ fn posterize_time_holds_frames() {
     assert!((alpha(&render(&plain, cid, 0.3, None)) - 0.3).abs() < 0.01);
 }
 
+/// Posterize Time on an adjustment layer holds the layers below it on its frame grid, snapped to
+/// the comp's next frame (SceneYard UI Google search; Twisting text gradient); layers above it
+/// run at the real time.
+#[test]
+fn posterize_time_adjustment_holds_the_layers_below() {
+    let (mut p, cid) = scene(None);
+    let comp = p.comp(cid).unwrap().clone();
+    let sid = p.add_item("Adj", Label::Red, None, ItemKind::Solid(Solid { color: [1.0, 1.0, 1.0], width: 200, height: 100, pixel_aspect: 1.0 }));
+    let mut adj = build::layer(&mut p, &comp, "Adj", LayerSource::Solid { item: sid }, (200, 100), None);
+    adj.switches.adjustment = true;
+    let mut next = p.next_id;
+    let spec = effectcraft_effects::find("ec.time.posterizetime").unwrap();
+    let mut g = effectcraft_effects::instantiate(spec, &mut Ids(&mut next), spec.name, [200.0, 100.0]);
+    g.prop_mut("frameRate").unwrap().value = Value::Scalar(5.0);
+    adj.props.sub_mut("effects").unwrap().children.push(g.into());
+    p.next_id = next;
+    p.comp_mut(cid).unwrap().layers.insert(0, adj);
+    // 5 fps: 0.3 s holds 0.2 s (a 30 fps frame); 0.25 s holds 0.2 s too.
+    for (t, want) in [(0.3, 0.2), (0.25, 0.2), (0.4, 0.4)] {
+        let a = alpha(&render(&p, cid, t, None));
+        assert!((a - want).abs() < 0.01, "t={t}: {a}");
+    }
+    // 20 fps lands between 30 fps frames: frame 14 holds 0.45 s (frame 13.5), snapped to frame 14.
+    let fx = p.comp_mut(cid).unwrap().layers[0].props.sub_mut("effects").unwrap();
+    if let Some(effectcraft_project::Node::Group(g)) = fx.children.first_mut() {
+        g.prop_mut("frameRate").unwrap().value = Value::Scalar(20.0);
+    }
+    let a = alpha(&render(&p, cid, 14.0 / 30.0, None));
+    assert!((a - 14.0 / 30.0).abs() < 0.004, "{a}");
+    let a = alpha(&render(&p, cid, 0.5 + 1.0 / 30.0, None));
+    assert!((a - 0.5).abs() < 0.004, "{a}");
+    // Above the adjustment layer the comp runs at the real time.
+    let (top, _) = scene(None);
+    let solid = top.comp(cid).unwrap().layers[0].clone();
+    p.comp_mut(cid).unwrap().layers.insert(0, solid);
+    let a = alpha(&render(&p, cid, 0.3, None));
+    let over = 0.3 + (1.0 - 0.3) * 0.3;
+    assert!((a - over).abs() < 0.01, "{a} vs {over}");
+}
+
 #[test]
 fn echo_blends_neighbouring_frames() {
     let vals = [("echoTime", Value::Scalar(-0.1)), ("numberOfEchoes", Value::Scalar(2.0)), ("decay", Value::Scalar(0.5))];
