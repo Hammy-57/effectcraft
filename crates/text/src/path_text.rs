@@ -117,7 +117,7 @@ pub fn arc_positions(xs: &[f64], line: [f64; 2], align: u8, length: f64, first_m
     }
     match align {
         1 => {
-            let mid = (first_margin + length - last_margin) * 0.5;
+            let mid = length * 0.5 + first_margin - last_margin;
             let c = (line[0] + line[1]) * 0.5;
             xs.iter().map(|x| mid + x - c).collect()
         }
@@ -176,6 +176,9 @@ mod tests {
         assert_eq!(arc_positions(&xs, [0.0, 20.0], 0, 100.0, 5.0, 0.0, false), vec![5.0, 15.0, 25.0]);
         assert_eq!(arc_positions(&xs, [0.0, 20.0], 2, 100.0, 0.0, 10.0, false), vec![70.0, 80.0, 90.0]);
         assert_eq!(arc_positions(&xs, [0.0, 20.0], 1, 100.0, 0.0, 0.0, false), vec![40.0, 50.0, 60.0]);
+        // Centred text moves by the full First Margin (SceneYard Dynamic Counter Grid: two
+        // copies 554 px apart in First Margin sit on opposite sides of a 1062 px circle).
+        assert_eq!(arc_positions(&xs, [0.0, 20.0], 1, 100.0, 20.0, 0.0, false), vec![60.0, 70.0, 80.0]);
         assert_eq!(arc_positions(&xs, [0.0, 20.0], 0, 100.0, 10.0, 10.0, true), vec![10.0, 50.0, 90.0]);
     }
 }
