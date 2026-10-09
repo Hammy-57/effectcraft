@@ -396,7 +396,10 @@ fn deep_glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
             let s = original[c] * source_opacity;
             out[c] = if screen { (s + g - s * g).clamp(0.0, 1.0) } else { s + g };
         }
-        out[3] = (glow[3] * exposure + original[3] * source_opacity).clamp(0.0, 1.0);
+        // With Unmult the glow's alpha is its brightness (set below), not its summed coverage:
+        // the weighted passes add up to ~10× the source alpha, which would turn a faint halo
+        // into an opaque dark one.
+        out[3] = if unmult { original[3] * source_opacity } else { glow[3] * exposure + original[3] * source_opacity }.clamp(0.0, 1.0);
     });
     if convert {
         // Back to display values as seen over black (what AE shows); with Unmult the glow's
@@ -407,13 +410,18 @@ fn deep_glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
                 for v in px.iter_mut().take(3) {
                     *v = effectcraft_color::linear_to_srgb(v.clamp(0.0, 1.0));
                 }
-                px[3] = a.max(px[0].max(px[1]).max(px[2])).clamp(0.0, 1.0);
             } else if a > 0.0 {
                 for v in px.iter_mut().take(3) {
                     *v = effectcraft_color::linear_to_srgb((*v / a).max(0.0)).min(1.0) * a;
                 }
             }
         });
+    }
+    if unmult {
+        // Unmult: the result as seen over black, with alpha = its brightest channel (black is
+        // transparent), so a faint halo over a light background stays light. SceneYard's "Magic
+        // button item reveal" (Radius 500 over near-white): frame MAE vs AE 0.080 → 0.024.
+        b.img.data.par_iter_mut().for_each(|px| px[3] = px[3].max(px[0].max(px[1]).max(px[2])).clamp(0.0, 1.0));
     }
     if !ctx.params.b("PEDG-0025") {
         b.img.data.par_iter_mut().for_each(|px| px[3] = 1.0);
@@ -1190,6 +1198,37 @@ mod tests {
         let dithered = run_fx("ec.stylize.deepglow", &[("PEDG-0001", num(8.0))], gray.clone(), 0.0, EffectEnv::default());
         let clean = run_fx("ec.stylize.deepglow", &[("PEDG-0001", num(8.0)), ("PEDG-0031", Value::Bool(false))], gray, 0.0, EffectEnv::default());
         assert!(dithered.img.data.iter().zip(&clean.img.data).any(|(a, b)| a != b), "Dither must affect opaque pixels");
+    }
+
+    #[test]
+    fn deep_glow_unmult_alpha_is_glow_brightness() {
+        // SceneYard "Magic button item reveal": a faint violet halo over near-white must stay
+        // translucent; summing the passes' alpha made it an opaque dark-purple vignette.
+        let mut img = Image::new(41, 41);
+        for y in 15..26 {
+            for x in 15..26 {
+                img.set(x, y, [0.35, 0.15, 0.6, 1.0]);
+            }
+        }
+        let set = [
+            ("PEDG-0001", num(100.0)),
+            ("PEDG-0002", num(0.4)),
+            ("PEDG-0008", Value::Enum(0)),
+            ("PEDG-0025", Value::Bool(true)),
+            ("PEDG-0031", Value::Bool(false)),
+            ("PEDG-0055", num(2.0)),
+        ];
+        let o = run_fx("ec.stylize.deepglow", &set, img, 0.0, EffectEnv::default());
+        let px = |x: i64| o.img.get(x + o.offset[0] as i64, 20 + o.offset[1] as i64);
+        let inside = px(20);
+        assert!(inside[3] > 0.999, "the opaque source stays opaque: {inside:?}");
+        for x in [27, 32, 45] {
+            let h = px(x);
+            let bright = h[0].max(h[1]).max(h[2]);
+            assert!(bright > 0.01 && h[3] < 0.9, "{x}: a faint halo is translucent: {h:?}");
+            assert!((h[3] - bright).abs() < 1e-5, "{x}: alpha follows the halo's brightness: {h:?}");
+            assert!(h[2] > h[0] && h[0] > h[1], "{x}: unpremultiplied colour keeps the violet hue: {h:?}");
+        }
     }
 
     #[test]
