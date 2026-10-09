@@ -19,7 +19,7 @@ mod edit;
 mod effect;
 pub mod essential;
 pub mod expr_tools;
-mod file;
+pub(crate) mod file;
 pub(crate) mod file_more;
 mod focus;
 pub mod footage_panel;
@@ -159,6 +159,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(help::specs());
         v.extend(query::specs());
         v.extend(batch::specs());
+        v.extend(crate::figma::specs());
         v.extend(layer_menu::specs());
         v.extend(create::specs());
         v.extend(animation::specs());
