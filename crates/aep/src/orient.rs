@@ -1,11 +1,14 @@
-//! Advanced 3D Orientation order.
+//! After Effects Orientation order.
 //!
-//! After Effects' Advanced 3D renderer composes a layer's Orientation Z first (Rx·Ry·Rz); the
-//! EffectCraft layer transform uses Rz·Ry·Rx (as Classic 3D). The tilted solids of SceneYard
-//! "Space Vision"'s floor only meet as steps the Advanced 3D way. Import rewrites each
-//! Orientation of an Advanced 3D comp's layers into the angles that give the same rotation in
-//! EffectCraft's order, so native projects keep their meaning. Models carry their own AE axes
-//! flag ([`super::models3d`]); cameras and lights are left as they are.
+//! After Effects composes a layer's Orientation Z first (Rx·Ry·Rz), in Classic 3D as in Advanced
+//! 3D; the EffectCraft layer transform uses Rz·Ry·Rx. The tilted solids of SceneYard "Space
+//! Vision"'s floor only meet as steps the Z-first way (Advanced 3D), and in Classic 3D SceneYard
+//! Chess Strategy's king (Orientation 180°, 0°, 287° under a parent turned Y 180°, Z 107°) only
+//! stands upright that way. Import rewrites each Orientation into the angles that give the same
+//! rotation in EffectCraft's order, so native projects keep their meaning. Models carry their
+//! own AE axes flag ([`super::models3d`]); Advanced 3D cameras and lights are left as they are,
+//! Classic 3D ones are rewritten too (the lights of SceneYard Drone Collage and the camera of
+//! Calendar Illustration then light and frame as in AE).
 
 use effectcraft_keyframe::Value;
 use effectcraft_project::{Comp, LayerSource};
@@ -55,14 +58,13 @@ pub(crate) fn z_first_to_x_first(o: [f64; 3], near: [f64; 3]) -> Option<[f64; 3]
     Some(std::array::from_fn(|i| nearest(a[i], near[i])))
 }
 
-/// Rewrite the Orientation of every 3D layer of an Advanced 3D comp (static value and each
-/// keyframe; keyframes stay continuous) into EffectCraft's order.
-pub(crate) fn advanced_orientation(comp: &mut Comp, losses: &mut Vec<String>, context: &str) {
-    if comp.renderer != effectcraft_project::Renderer::Advanced3D {
-        return;
-    }
+/// Rewrite the Orientation of every 3D layer of a comp (static value and each keyframe;
+/// keyframes stay continuous) into EffectCraft's order.
+pub(crate) fn ae_orientation(comp: &mut Comp, losses: &mut Vec<String>, context: &str) {
+    let advanced = comp.renderer == effectcraft_project::Renderer::Advanced3D;
     for layer in &mut comp.layers {
-        if !layer.switches.three_d || matches!(layer.source, LayerSource::Model { .. } | LayerSource::Camera | LayerSource::Light { .. }) {
+        let camera_or_light = matches!(layer.source, LayerSource::Camera | LayerSource::Light { .. });
+        if matches!(layer.source, LayerSource::Model { .. }) || (advanced && camera_or_light) || !(layer.switches.three_d || camera_or_light) {
             continue;
         }
         let name = layer.name.clone();
