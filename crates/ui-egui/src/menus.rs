@@ -762,6 +762,10 @@ pub fn frontend(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, p: Valu
             app.dialog = Some(crate::Dialog::CommandPalette);
             Value::Null
         }
+        "app.fxConsole" => {
+            crate::panels::fx_console::open(app, ctx, p.get("query").and_then(Value::as_str).unwrap_or_default());
+            Value::Null
+        }
         "app.keyboardShortcuts" => {
             crate::panels::shortcut_editor::open(app);
             Value::Null
@@ -1384,7 +1388,14 @@ pub fn parse_shortcut(s: &str) -> Option<(egui::Modifiers, egui::Key)> {
             "Physical" => {}
             "Shift" => m.shift = true,
             "Alt" => m.alt = true,
-            "Ctrl" => m.ctrl = true,
+            // Off macOS Ctrl is the command key: egui reports both, so a Ctrl shortcut (the
+            // Effect Console's Ctrl+Space) must expect both to match.
+            "Ctrl" => {
+                m.ctrl = true;
+                if !cfg!(target_os = "macos") {
+                    m.command = true;
+                }
+            }
             k => {
                 key = match k {
                     ";" => Some(egui::Key::Semicolon),
