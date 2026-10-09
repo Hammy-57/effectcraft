@@ -225,6 +225,9 @@ fn field(ui: &mut Ui, rect: Rect, text: &mut String, hint: &str, t: &Tokens, sea
             .frame(egui::Frame::NONE)
             .desired_width(inner.width())
             .font(Tokens::ui(12.0))
+            // Fill the field's height so the text and hint centre on the magnifier instead of
+            // hugging the top edge (`vertical_align` only acts within `min_size`).
+            .min_size(inner.size())
             .vertical_align(egui::Align::Center),
     )
 }
