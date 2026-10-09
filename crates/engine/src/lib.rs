@@ -15,6 +15,7 @@ pub mod camera_track;
 pub mod commands;
 pub mod config;
 pub mod demo;
+pub mod figma;
 pub mod footage_check;
 pub mod footage_reload;
 pub mod guard;
