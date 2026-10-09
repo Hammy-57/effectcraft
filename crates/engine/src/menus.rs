@@ -592,6 +592,7 @@ Edit
     @dynamic:history
   ---
   Quick Apply... | app.commandPalette
+  Effect Console... | app.fxConsole
   ---
   Cut | edit.cut
   Copy | edit.copy
