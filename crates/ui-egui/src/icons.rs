@@ -696,7 +696,7 @@ fn paint_generated(painter: &Painter, rect: Rect, icon: Icon, color: Color32) ->
     let cached = ctx.data(|data| data.get_temp::<Option<(egui::TextureHandle, bool)>>(id));
     let texture = cached.unwrap_or_else(|| {
         // Optional owner-local reference glyphs. Reference artwork stays out of distributed assets.
-        let reference = std::env::var_os("EFFECTCRAFT_ICON_REFERENCE")
+        let reference = crate::local_assets::reference_atlas()
             .and_then(|path| {
                 use std::io::Read;
                 let file = std::fs::File::open(path).ok()?;
