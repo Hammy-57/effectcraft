@@ -2391,6 +2391,38 @@ mod tests {
     }
 
     #[test]
+    fn shape_repeater_transform_imports_offset_scale_and_opacity() {
+        // SceneYard UI Calendar Task: the dots repeat 196 px apart, not at the native 100 px default.
+        let ir = serde_json::json!({"schema_version":1,"items":[{"id":1,"kind":"comp","name":"Main","width":400,"height":100,"duration":1,"layers":[
+            {"id":2,"kind":"ShapeLayer","name":"Dots","properties":[{"kind":"group","match_name":"ADBE Root Vectors Group","children":[
+                {"kind":"group","match_name":"ADBE Vector Shape - Ellipse","children":[{"kind":"property","match_name":"ADBE Vector Ellipse Size","value":[10,10]}]},
+                {"kind":"group","match_name":"ADBE Vector Graphic - Fill","children":[{"kind":"property","match_name":"ADBE Vector Fill Color","value":[1,1,1,1]}]},
+                {"kind":"group","match_name":"ADBE Vector Filter - Repeater","children":[
+                    {"kind":"property","match_name":"ADBE Vector Repeater Copies","value":2},
+                    {"kind":"group","match_name":"ADBE Vector Repeater Transform","children":[
+                        {"kind":"property","match_name":"ADBE Vector Repeater Anchor","value":[0,0]},
+                        {"kind":"property","match_name":"ADBE Vector Repeater Position","value":[196,0]},
+                        {"kind":"property","match_name":"ADBE Vector Repeater Scale","value":[50,50]},
+                        {"kind":"property","match_name":"ADBE Vector Repeater Rotation","value":15},
+                        {"kind":"property","match_name":"ADBE Vector Repeater Opacity 1","value":40},
+                        {"kind":"property","match_name":"ADBE Vector Repeater Opacity 2","value":80}
+                    ]}
+                ]}
+            ]}]}
+        ]}]});
+        let mut project = Project::default();
+        let result = import_ir(&mut project, ir.to_string().as_bytes(), "", &mut |_| None).unwrap();
+        let layer = &project.comp(result.primary_comp.unwrap()).unwrap().layers[0];
+        let transform = layer.props.sub("contents").unwrap().sub("repeater").unwrap().sub("transform").unwrap();
+        assert_eq!(transform.prop("position").unwrap().value, Value::Vec2([196.0, 0.0]));
+        assert_eq!(transform.prop("anchor").unwrap().value, Value::Vec2([0.0, 0.0]));
+        assert_eq!(transform.prop("scale").unwrap().value, Value::Vec2([50.0, 50.0]));
+        assert_eq!(transform.prop("rotation").unwrap().value.as_f64(), 15.0);
+        assert_eq!(transform.prop("startOpacity").unwrap().value.as_f64(), 40.0);
+        assert_eq!(transform.prop("endOpacity").unwrap().value.as_f64(), 80.0);
+    }
+
+    #[test]
     fn shape_stroke_popup_imports_butt_cap_and_keyed_round_cap() {
         let path =
             serde_json::json!({"type":"Shape","data":{"vertices":[[-20,0],[20,0]],"in_tangents":[[0,0],[0,0]],"out_tangents":[[0,0],[0,0]],"closed":false}});
