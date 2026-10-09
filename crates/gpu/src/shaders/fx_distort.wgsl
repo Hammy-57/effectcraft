@@ -31,7 +31,8 @@ fn dst_twirl(@builtin(global_invocation_id) gid: vec3<u32>) {
     var s = q;
     if (d < r) {
         let t = 1.0 - d / r;
-        let a = -P.f[0].w * t * t;
+        // distort::twirl_falloff: a smoothstep.
+        let a = -P.f[0].w * t * t * (3.0 - 2.0 * t);
         let sn = sin(a);
         let co = cos(a);
         s = vec2<f32>(c.x + dx * co - dy * sn, c.y + dx * sn + dy * co);

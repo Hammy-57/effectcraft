@@ -112,10 +112,19 @@ pub(crate) fn gen_blend(o: Px, g: Px, mode: u32) -> Px {
     }
 }
 
+/// 4-Color Gradient's weight softening (Blend², in buffer pixels²): each point weighs
+/// `1 / (d² + softening)`.
+pub fn four_color_softening(blend: f64, scale: f64) -> f64 {
+    (blend.max(1.0) * scale).powi(2).max(1e-6)
+}
+
 fn four_color(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let pts: Vec<((f64, f64), [f32; 4])> =
         (1..=4).map(|i| (b.to_px(ctx.params.v2(&format!("positionsColors/point{i}"))), ctx.params.color(&format!("positionsColors/color{i}")))).collect();
-    let blend = ctx.params.f("blend").max(1.0);
+    // Inverse-square weights softened by Blend (in pixels): w = 1 / (d² + Blend²). Fitted to
+    // After Effects renders at Blend 20..500 (SceneYard Liquid Glass: ~0.004 mean error, where
+    // the former 1 / d³ falloff gave sharp blobs around each point at 0.03).
+    let blend = four_color_softening(ctx.params.f("blend"), b.scale);
     let jitter = (ctx.params.f("jitter") / 100.0).clamp(0.0, 1.0) as f32;
     let op = ctx.params.f("opacity") as f32 / 100.0;
     let mode = ctx.params.e("blendingMode");
@@ -126,7 +135,7 @@ fn four_color(ctx: &EffectCtx, mut b: Buf) -> Buf {
             let mut wsum = 0.0;
             for ((qx, qy), c) in &pts {
                 let d2 = (x as f64 + 0.5 - qx).powi(2) + (y as f64 + 0.5 - qy).powi(2);
-                let w = 1.0 / (d2 / (blend * 100.0) + 1e-6).powf(1.5);
+                let w = 1.0 / (d2 + blend);
                 for i in 0..3 {
                     acc[i] += c[i] as f64 * w;
                 }
@@ -511,5 +520,34 @@ mod generator_tests {
         half.push(("blendingMode", Value::Enum(1)));
         let o = run_fx("ec.generate.fourcolor", &half, red(), 0.0, EffectEnv::default());
         assert!((o.img.get(16, 16)[3] - 1.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn four_color_weights_are_inverse_square_softened_by_blend() {
+        // Two points, black at x = 0 and white at x = 64 (the others far away on the same
+        // colours' sides are symmetric): at x = 16 the weights are 1/(16² + B²) and
+        // 1/(48² + B²), so Blend 1 gives 0.1 white and a huge Blend tends to an even mix.
+        let set = |blend: f64| -> Vec<(&'static str, Value)> {
+            vec![
+                ("positionsColors/point1", Value::Vec2([0.0, 0.0])),
+                ("positionsColors/color1", Value::Color([0.0, 0.0, 0.0, 1.0])),
+                ("positionsColors/point2", Value::Vec2([64.0, 0.0])),
+                ("positionsColors/color2", Value::Color([1.0, 1.0, 1.0, 1.0])),
+                ("positionsColors/point3", Value::Vec2([0.0, 0.0])),
+                ("positionsColors/color3", Value::Color([0.0, 0.0, 0.0, 1.0])),
+                ("positionsColors/point4", Value::Vec2([64.0, 0.0])),
+                ("positionsColors/color4", Value::Color([1.0, 1.0, 1.0, 1.0])),
+                ("blend", num(blend)),
+            ]
+        };
+        let expect = |b: f64| {
+            let (w0, w1) = (1.0 / (15.5f64.powi(2) + 0.25 + b * b), 1.0 / (48.5f64.powi(2) + 0.25 + b * b));
+            w1 / (w0 + w1)
+        };
+        for b in [1.0, 100.0] {
+            let o = run_fx("ec.generate.fourcolor", &set(b), red(), 0.0, EffectEnv::default());
+            let v = o.img.get(15, 0)[0] as f64;
+            assert!((v - expect(b)).abs() < 1e-3, "blend {b}: {v} vs {}", expect(b));
+        }
     }
 }
