@@ -170,6 +170,10 @@ fn main() -> eframe::Result {
                 session.config = Some(std::sync::Arc::new(effectcraft_engine::config::DirConfig::new(dir)));
             }
             session.load_settings();
+            // Settings ▸ Scripting & Expressions ▸ Let Agents Control EffectCraft: the control
+            // channel on every launch, without `--control`'s agent-launch behaviour.
+            let agent = &session.prefs.scripting;
+            let listen_port = control_port.or_else(|| agent.agent_control.then(|| u16::try_from(agent.agent_control_port).ok()).flatten());
             let recovery = if control_port.is_none() { session.begin_recovery() } else { None };
             let project = files.iter().find(|f| is_project_file(f)).cloned();
             if let Some(p) = project {
@@ -252,7 +256,7 @@ fn main() -> eframe::Result {
                 app.hooks.app_action = Some(Box::new(native_menu::app_action));
                 app.hooks.clipboard_text = Some(Box::new(native_menu::clipboard_text));
             }
-            if let Some(port) = control_port {
+            if let Some(port) = listen_port {
                 disable_app_nap();
                 let rx = control_server::start(port, cc.egui_ctx.clone());
                 app = app.with_control(rx);
