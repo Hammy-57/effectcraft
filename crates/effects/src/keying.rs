@@ -301,7 +301,9 @@ fn color_range(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let hi = ["maxL", "maxA", "maxB"].map(|i| ctx.params.f(i) as f32);
     let fuzz = ctx.params.f("fuzziness") as f32;
     let m = matte_of(&b.img, |c, _| {
-        let v = range_components(space, c);
+        // AE's ranges are 8-bit levels: a colour is in range when its level is, so pure white
+        // (Lab a = b = 128, computed as 128.005 in float) sits inside a 127..128 range.
+        let v = range_components(space, c).map(|x| (x + 0.5).floor());
         let mut out = 0.0f32;
         for i in 0..3 {
             out = out.max(lo[i] - v[i]).max(v[i] - hi[i]);
@@ -790,6 +792,26 @@ mod tests {
         let out = run("ec.key.colorrange", &[], green_screen());
         assert!(out.get(2, 2)[3] < 0.01);
         assert!(out.get(12, 2)[3] > 0.99);
+    }
+
+    #[test]
+    fn color_range_keys_pure_white_with_neutral_ab_range() {
+        // SceneYard UI Google search: a phone mockup's white screen keyed with L 174..255,
+        // a 127..128, b 127..128 must vanish; the dark bezel stays.
+        let mut img = Image::new(2, 1);
+        img.set(0, 0, [1.0, 1.0, 1.0, 1.0]);
+        img.set(1, 0, [0.14, 0.14, 0.14, 1.0]);
+        let over = [
+            ("minL", Value::Scalar(174.2)),
+            ("maxL", Value::Scalar(255.0)),
+            ("minA", Value::Scalar(127.0)),
+            ("maxA", Value::Scalar(128.0)),
+            ("minB", Value::Scalar(127.0)),
+            ("maxB", Value::Scalar(128.0)),
+        ];
+        let out = run("ec.key.colorrange", &over, img);
+        assert!(out.get(0, 0)[3] < 0.01, "{:?}", out.get(0, 0));
+        assert!(out.get(1, 0)[3] > 0.99);
     }
 
     #[test]
