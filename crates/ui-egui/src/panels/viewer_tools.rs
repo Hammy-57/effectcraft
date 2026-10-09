@@ -591,7 +591,20 @@ pub(crate) fn bottom_bar(app: &mut EffectcraftApp, ui: &mut egui::Ui, bar: Rect,
 
     let tog = |ui: &mut egui::Ui, auto: &mut crate::automation::Registry, x: &mut f32, icon: Icon, on: bool, id: &str, tip: &str| -> (bool, Rect) {
         let r = Rect::from_min_size(pos2(*x, cy - 11.0), vec2(22.0, 22.0));
-        let resp = widgets::icon_button(ui, r, icon, on, &t, egui::Id::new(("vw-btn", id))).on_hover_text(tip);
+        // The owner-local AE reference icon when present (`viewer-<button>`), else the drawn one.
+        let local = match id {
+            "transparency" => Some("viewer-transparency"),
+            "masks" => Some("viewer-masks"),
+            "roi" => Some("viewer-roi"),
+            "grid" => Some("viewer-grid"),
+            "channel" => Some("viewer-channel"),
+            "resetExposure" => Some("viewer-exposure"),
+            "snapshot" => Some("viewer-snapshot"),
+            "showSnapshot" => Some("viewer-show-snapshot"),
+            "fastPreviews" => Some("viewer-fast-previews"),
+            _ => None,
+        };
+        let resp = widgets::icon_button_local(ui, r, icon, local, on, &t, egui::Id::new(("vw-btn", id))).on_hover_text(tip);
         auto.add(&format!("viewer.{id}"), r, tip);
         *x += 24.0;
         (resp.clicked(), r)
