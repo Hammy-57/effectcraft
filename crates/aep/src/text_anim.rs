@@ -9,6 +9,13 @@ use serde_json::Value as Json;
 pub(crate) fn native_match(parent: &str, ae: &str, authored: Option<bool>) -> Option<&'static str> {
     Some(match (parent, ae) {
         ("text", "ADBE Text Animators") => "animators",
+        ("text", "ADBE Text Path Options") => "pathOptions",
+        ("pathOptions", "ADBE Text Path") => "path",
+        ("pathOptions", "ADBE Text Reverse Path") => "reversePath",
+        ("pathOptions", "ADBE Text Perpendicular To Path") => "perpendicular",
+        ("pathOptions", "ADBE Text Force Align Path") => "forceAlignment",
+        ("pathOptions", "ADBE Text First Margin") => "firstMargin",
+        ("pathOptions", "ADBE Text Last Margin") => "lastMargin",
         ("animators", "ADBE Text Animator") => "animator",
         ("animator", "ADBE Text Selectors") => "selectors",
         ("animator", "ADBE Text Animator Properties") => "properties",
