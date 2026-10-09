@@ -41,6 +41,32 @@ fn orient_towards_camera_faces_the_eye() {
 }
 
 #[test]
+fn orient_towards_camera_faces_the_eye_upright_under_a_rotated_parent() {
+    // SceneYard Lucky Smile: icons parented to a ring tilted X -78°, Y -18° still face the
+    // camera upright (layer +y stays world down), keeping the parent's scale.
+    let (mut p, cid, comp) = setup();
+    let mut ring = solid(&mut p, &comp, true, [100.0, 50.0, 0.0]);
+    ring.props.prop_mut("transform/rotationX").unwrap().value = Value::Scalar(-78.0);
+    ring.props.prop_mut("transform/rotationY").unwrap().value = Value::Scalar(-18.0);
+    ring.props.prop_mut("transform/rotation").unwrap().value = Value::Scalar(40.0);
+    ring.props.prop_mut("transform/scale").unwrap().value = Value::Vec3([200.0, 200.0, 200.0]);
+    let mut l = solid(&mut p, &comp, true, [30.0, -20.0, 10.0]);
+    l.auto_orient = AutoOrient::TowardsCamera;
+    l.parent = Some(ring.id);
+    p.comp_mut(cid).unwrap().layers.extend([l, ring]);
+    let c = p.comp(cid).unwrap();
+    let ctx = EvalCtx::new(&p, cid, c, Tick::ZERO);
+    let w = ctx.world_matrix(&c.layers[0]);
+    let n = w.apply_vec(vec3(0.0, 0.0, 1.0));
+    let eye = active_camera(&ctx).eye;
+    let to_layer = (w.apply(vec3(5.0, 5.0, 0.0)) - eye).normalize();
+    assert!((n.normalize() - to_layer).length() < 1e-6, "{n:?} vs {to_layer:?}");
+    assert!((n.length() - 2.0).abs() < 1e-6, "parent scale kept: {n:?}");
+    let x = w.apply_vec(vec3(1.0, 0.0, 0.0));
+    assert!(x.y.abs() < 1e-6, "upright: layer x stays horizontal, {x:?}");
+}
+
+#[test]
 fn orient_along_path_2d_follows_motion() {
     let (mut p, cid, comp) = setup();
     let mut l = solid(&mut p, &comp, false, [50.0, 10.0, 0.0]);
