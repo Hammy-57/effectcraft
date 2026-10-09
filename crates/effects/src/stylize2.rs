@@ -1003,11 +1003,11 @@ mod tests {
             v.extend_from_slice(extra);
             v
         };
-        // None: the glow alone (the core is the glow's own brightness, not the original's 1.0 + glow).
+        // None draws exactly like Behind (aerender, SceneYard UI Envelope).
         let on_top = run_at("ec.stylize.glow", &vals(&[]), img.clone(), 0.0);
         let none = run_at("ec.stylize.glow", &vals(&[("operation", Value::Enum(2))]), img.clone(), 0.0);
         let (ox, oy) = (on_top.offset[0] as i64, on_top.offset[1] as i64);
-        assert!(none.img.get(ox + 15, oy + 15)[0] < on_top.img.get(ox + 15, oy + 15)[0]);
+        assert_eq!(none.img.data, on_top.img.data);
         // Horizontal only: glow spreads sideways but not up.
         let h = run_at("ec.stylize.glow", &vals(&[("glowDimensions", Value::Enum(1))]), img.clone(), 0.0);
         assert!(h.img.get(ox + 21, oy + 15)[3] > 0.05);

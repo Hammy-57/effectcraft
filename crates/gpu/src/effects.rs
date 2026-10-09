@@ -294,32 +294,45 @@ fn glow(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     if ctx.params.e("colors") == 2 || effectcraft_effects::glow_operation(ctx) != effectcraft_color::BlendMode::Add {
         return None;
     }
-    let thr = ctx.params.f("threshold") as f32 / 100.0;
     let radius = ctx.params.f("radius") * b.scale;
     let intensity = ctx.params.f("intensity") as f32;
     let use_colors = ctx.params.e("colors") == 1;
-    let ca = ctx.params.color("colorA");
-    let cb = ctx.params.color("colorB");
     let (kx, ky) = dims_xy(ctx.params.e("glowDimensions"));
+    let s = (radius * effectcraft_effects::GLOW_SIGMA_PER_RADIUS).max(0.5);
     if !ctx.adjustment {
-        b.pad(e, (radius * 1.5).ceil() as u32 + 2)?;
+        b.pad(e, (s * 3.0).ceil() as u32 + 2)?;
     }
-    let mut p = Params::default();
-    p.u[0] = [use_colors as u32, (ctx.params.e("based") == 0) as u32, ctx.params.e("colorLooping"), 0];
-    p.f[0] = [thr, ctx.params.f("colorLoops") as f32, (ctx.params.f("colorPhase") / 360.0) as f32, ctx.params.f("abMidpoint") as f32 / 100.0];
-    p.f[1] = ca;
-    p.f[2] = cb;
+    let p = glow_params(ctx);
     let bright = e.image(b.img.width, b.img.height);
     e.pixels("glow_bright", &p, &b.img, None, &bright, None);
-    let s = (radius / 2.0).max(0.5);
-    let blurred = gaussian_blur(e, &bright, s * kx, s * ky, false);
+    let mut blurred = gaussian_blur(e, &bright, s * kx, s * ky, false);
+    if use_colors {
+        let coloured = e.image(b.img.width, b.img.height);
+        e.pixels("glow_ab", &p, &blurred, None, &coloured, None);
+        blurred = coloured;
+    }
     let mut p = Params::default();
-    p.u[0][0] = ctx.params.e("operation").min(2);
+    p.u[0][0] = effectcraft_effects::glow_composite(ctx.params.e("operation"));
     p.f[0][0] = intensity;
     let out = e.scratch(b.img.width, b.img.height);
     e.pixels("glow_combine", &p, &b.img, Some(&blurred), &out, None);
     b.img = out;
     Some(b)
+}
+
+/// Parameters shared by Glow's `glow_bright`, `glow_ab` and `fxs_glow_map` kernels.
+pub(crate) fn glow_params(ctx: &EffectCtx) -> Params {
+    let mut p = Params::default();
+    p.u[0] = [(ctx.params.e("colors") != 0) as u32, (ctx.params.e("based") == 0) as u32, ctx.params.e("colorLooping"), 0];
+    p.f[0] = [
+        ctx.params.f("threshold") as f32 / 100.0,
+        ctx.params.f("colorLoops") as f32,
+        (ctx.params.f("colorPhase") / 360.0) as f32,
+        ctx.params.f("abMidpoint") as f32 / 100.0,
+    ];
+    p.f[1] = ctx.params.color("colorA");
+    p.f[2] = ctx.params.color("colorB");
+    p
 }
 
 fn drop_shadow(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {

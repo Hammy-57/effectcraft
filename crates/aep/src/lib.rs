@@ -1430,6 +1430,9 @@ fn import_native_effect_params(
             // CC Page Turn's Controls is numeric natively but keeps AE's popup order less one
             // (SceneYard Patient ID: AE 4 = drag the top-right corner).
             ("ec.distort.ccpageturn", "controls") => Some(|v| v - 1.0),
+            // Glow Operation: AE lists an option between Normal (1) and Add (3, its default) that
+            // the native list lacks (aerender, SceneYard UI Envelope: 3 adds, 4 multiplies).
+            ("ec.stylize.glow", "glowOperation") => Some(|v| if v >= 3.0 { v - 1.0 } else { 1.0 }),
             _ => None,
         };
         if let Some(f) = remap {
@@ -2004,6 +2007,23 @@ mod tests {
         let f = |path: &str| effect.prop(path).unwrap().value.as_f64();
         assert!((f("threshold") - 60.0).abs() < 1e-9);
         assert!((f("abMidpoint") - 50.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn glow_operation_keeps_ae_add_and_multiply() {
+        // AE Glow Operation 3 (its default) is Add and 4 Multiply.
+        let mut project = Project::default();
+        let spec = effectcraft_effects::find("ec.stylize.glow").unwrap();
+        let op = |project: &mut Project, v: f64| {
+            let mut effect = effectcraft_effects::instantiate(spec, &mut build::Ids(&mut project.next_id), "Glow", [100.0, 100.0]);
+            let ir = serde_json::json!({"children":[{"kind":"property","match_name":"ADBE Glo2-0006","value":v}]});
+            import_native_effect_params(project, &mut effect, &ir, &ir, spec.id, LayerTime { start: Tick::ZERO, stretch: 100.0 }, &mut Vec::new(), "test", 0);
+            effect.prop("glowOperation").unwrap().value.clone()
+        };
+        let names = effectcraft_effects::GLOW_OPERATIONS;
+        assert_eq!(op(&mut project, 3.0), Value::Enum(names.iter().position(|n| *n == "Add").unwrap() as u32));
+        assert_eq!(op(&mut project, 4.0), Value::Enum(names.iter().position(|n| *n == "Multiply").unwrap() as u32));
+        assert_eq!(op(&mut project, 1.0), Value::Enum(0));
     }
 
     #[test]
