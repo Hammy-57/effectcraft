@@ -214,6 +214,7 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
         Icon::Shy if rect.width() <= 13.0 => Some("layer-shy"),
         Icon::FrameBlend if rect.width() <= 13.0 => Some("layer-frameblend"),
         Icon::MotionBlur if rect.width() <= 13.0 => Some("layer-motionblur"),
+        Icon::Comp => Some("layer-comp"),
         _ => None,
     };
     if local.is_some_and(|name| crate::local_assets::paint(painter, rect, name, color)) {

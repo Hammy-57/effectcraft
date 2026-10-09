@@ -82,10 +82,19 @@ reproduce an image (for example, point lists traced from someone else's icon).
    need a sidecar and an `ATTRIBUTION.md` row (licence `LicenseRef-ArtCraft-Trademark`). No other
    non-open asset is allowed, and this exception never covers third-party marks (Adobe, Discord, GitHub
    and other logos stay out; draw a generic icon instead).
+9. **Owner-local exception (owner-approved 2026-10-09): Adobe icons on the owner's own machine.** For the
+   owner's personal use, icons and cursors may be extracted from the owner's licensed After Effects install
+   into the per-user owner-assets folder (`~/Library/Application Support/EffectCraft/owner-assets`, outside
+   every checkout; scripts in its `source-scripts/`) and loaded at runtime by
+   `crates/ui-egui/src/local_assets.rs`. That artwork must never be committed, embedded, bundled, shipped,
+   uploaded or attached to issues/PRs (the repository is public), and every icon it replaces keeps an
+   original code-drawn fallback in `icons.rs`, so builds without the folder still work. Code may reference
+   an owner-asset by name (e.g. `"layer-comp"`); it never contains the artwork's bytes or traced geometry.
 
 ## 2. Clean-room code
 
 - Never read, disassemble or copy anything inside Adobe application bundles; file names and listings only.
+  (Sole exception: icon/cursor image files extracted to the owner-local folder under §1.9.)
   Observe behaviour by using the app; never capture its Home screen, recent projects, account info or
   file browsers.
 - Never copy GPL/LGPL/AGPL code (FFmpeg, Natron, Blender, Glaxnimate, Synfig, Friction, Olive, MLT, frei0r, G'MIC…).
