@@ -97,6 +97,13 @@ Points are logical window coordinates. A target is `{id}` (the element's centre;
 | `ui.key` | `{key}`, for example `Space`, `F9`, `Cmd+Z`, `Cmd+Shift+Z`, `PageDown`, `Escape` |
 | `ui.type` | `{text}`: text input into the focused field |
 
+Shortcut presets also accept `Physical+<shortcut>` for a keyboard position, using egui's
+US-position names (for example `Physical+6` and `Physical+Minus` distinguish AZERTY's
+`-` and `)` keys). Physical bindings take precedence over logical bindings for that key
+press. `ui.key` accepts the same notation to test them. Ordinary shortcuts remain layout-aware.
+`time.workAreaStart` and `time.workAreaEnd` navigate to the first and last included work-area
+frames and can be assigned through `shortcuts.set`.
+
 ## Locating things
 
 | Method | Params | Result |

@@ -1490,6 +1490,7 @@ pub fn parse_shortcut(s: &str) -> Option<(egui::Modifiers, egui::Key)> {
                     m.ctrl = true;
                 }
             }
+            "Physical" => {}
             "Shift" => m.shift = true,
             "Alt" => m.alt = true,
             "Ctrl" => m.ctrl = true,
@@ -1537,6 +1538,9 @@ pub type Binding = (egui::Modifiers, egui::Key, String, Value);
 pub fn bindings(session: &effectcraft_engine::Session) -> Vec<Binding> {
     let mut v: Vec<Binding> = Vec::new();
     for (sc, b) in session.shortcuts().bindings() {
+        if sc.starts_with("Physical+") {
+            continue;
+        }
         // Off macOS `Cmd` is Ctrl, so a Ctrl+Cmd shortcut (Enter Full Screen's Ctrl+Cmd+F) would
         // steal the plain Cmd one (Find's Cmd+F): such macOS-only shortcuts aren't bound there.
         if !cfg!(target_os = "macos") && sc.split('+').any(|p| p == "Ctrl") && sc.split('+').any(|p| p == "Cmd") {
@@ -1641,7 +1645,7 @@ fn handle_shortcuts_impl(app: &mut EffectcraftApp, ctx: &egui::Context, tab_only
     // Text editing in the viewer takes the clipboard events itself.
     let clipboard = app.session.state.text_edit.is_none();
     let project = app.ui.focused == PanelKind::Project;
-    let mut events: Vec<(egui::Key, egui::Modifiers, bool)> = ctx.input(|i| {
+    let mut events: Vec<(egui::Key, egui::Modifiers, bool, Option<egui::Key>)> = ctx.input(|i| {
         // The windowing layer turns Ctrl+C / Ctrl+X / Ctrl+V into clipboard events instead of
         // key presses: map them back to the keys (with the modifiers held) so Edit ▸ Copy, Cut,
         // Paste and their variants (Ctrl+Alt+C…) run. Clipboard events carry no modifiers and
@@ -1657,31 +1661,31 @@ fn handle_shortcuts_impl(app: &mut EffectcraftApp, ctx: &egui::Context, tab_only
                 egui::Event::ModifiersChanged(m) => at = Some(*m),
                 // egui forgets the modifiers held when the window loses focus.
                 egui::Event::WindowFocused(false) => at = Some(egui::Modifiers::NONE),
-                egui::Event::Key { key, pressed: true, modifiers, repeat, .. }
+                egui::Event::Key { key, physical_key, pressed: true, modifiers, repeat, .. }
                     if !*repeat
                         || matches!(
                             key,
                             egui::Key::PageUp | egui::Key::PageDown | egui::Key::ArrowLeft | egui::Key::ArrowRight | egui::Key::ArrowUp | egui::Key::ArrowDown
                         ) =>
                 {
-                    out.push((*key, *modifiers, true));
+                    out.push((*key, *modifiers, true, *physical_key));
                 }
-                egui::Event::Key { key: egui::Key::Space, pressed: false, .. } => out.push((egui::Key::Space, egui::Modifiers::NONE, false)),
-                egui::Event::Copy if clipboard => out.push((egui::Key::C, held(at), true)),
+                egui::Event::Key { key: egui::Key::Space, pressed: false, .. } => out.push((egui::Key::Space, egui::Modifiers::NONE, false, None)),
+                egui::Event::Copy if clipboard => out.push((egui::Key::C, held(at), true, None)),
                 // On Windows, Shift+Delete is the old Cut key and arrives as Cut too. The Project
                 // panel has no clipboard: there a Cut with only Shift held is Shift+Delete (Delete
                 // Project Items Without Confirmation). Never when the modifiers aren't known.
                 egui::Event::Cut if clipboard && project && at.is_some_and(only_shift) => {
-                    out.push((egui::Key::Delete, egui::Modifiers::SHIFT, true));
+                    out.push((egui::Key::Delete, egui::Modifiers::SHIFT, true, None));
                 }
-                egui::Event::Cut if clipboard => out.push((egui::Key::X, held(at), true)),
-                egui::Event::Paste(_) if clipboard => out.push((egui::Key::V, held(at), true)),
+                egui::Event::Cut if clipboard => out.push((egui::Key::X, held(at), true, None)),
+                egui::Event::Paste(_) if clipboard => out.push((egui::Key::V, held(at), true, None)),
                 _ => {}
             }
         }
         out
     });
-    events.retain(|(key, _, _)| (*key == egui::Key::Tab) == tab_only);
+    events.retain(|(key, _, _, _)| (*key == egui::Key::Tab) == tab_only);
     // Numpad * (or `*` typed with Shift+8): Add Marker (#275). egui has no key for it, so it
     // comes as text.
     if !tab_only && clipboard && app.dialog.is_none() && ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Text(t) if t == "*"))) {
@@ -1696,7 +1700,7 @@ fn handle_shortcuts_impl(app: &mut EffectcraftApp, ctx: &egui::Context, tab_only
         return;
     }
     let binds = bindings(&app.session);
-    for (key, mods, pressed) in events {
+    for (key, mods, pressed, physical_key) in events {
         // Plain Spacebar runs its shortcut (Play Current Preview) on the release: held, it is
         // the Hand tool (After Effects), and a drag with it must not start or stop playback.
         if key == egui::Key::Space && (!pressed || !mods.any()) {
@@ -1754,7 +1758,25 @@ fn handle_shortcuts_impl(app: &mut EffectcraftApp, ctx: &egui::Context, tab_only
             let _ = invoke(app, ctx, "edit.clear", json!({}));
             continue;
         }
-        if let Some((_, _, id, params)) = binds.iter().find(|(m, k, ..)| *k == key && mods_match(*m, mods)) {
+        // Explicit physical bindings distinguish keys that a layout reports with the same
+        // logical name (for example AZERTY's minus and right parenthesis).
+        let physical = physical_key.and_then(|key| {
+            app.session.shortcuts().bindings().into_iter().find_map(|(sc, b)| {
+                let (m, k) = parse_shortcut(sc.strip_prefix("Physical+")?)?;
+                (k == key && mods_match(m, mods)).then(|| (b.command.clone(), b.params.clone()))
+            })
+        });
+        if let Some((id, params)) = physical {
+            if let Err(e) = invoke(app, ctx, &id, if params.is_null() { json!({}) } else { params }) {
+                app.ui.status = e;
+            }
+            continue;
+        }
+        if let Some((_, _, id, params)) = binds.iter().filter(|(m, k, ..)| *k == key && mods_match(*m, mods)).min_by_key(|(_, _, id, params)| {
+            // The focused panel wins over an application command sharing its chord.
+            let key = effectcraft_engine::shortcuts::binding_key(id, params);
+            app.session.shortcuts().find(&key).is_none_or(|b| b.scope != app.ui.focused.id())
+        }) {
             let (id, params) = (id.clone(), if params.is_null() { json!({}) } else { params.clone() });
             if let Err(e) = invoke(app, ctx, &id, params) {
                 app.ui.status = e;
