@@ -427,6 +427,11 @@ fn layer_styles_collapsed_precomps_and_cpu_fallbacks() {
 /// The effect alone on a buffer: GPU kernels vs the CPU effect (32-bit float), including the
 /// buffer geometry (padding, offset).
 pub(crate) fn effect_direct(id: &str, vals: &[(&str, Value)], adjustment: bool) {
+    effect_direct_env(id, vals, adjustment, Default::default());
+}
+
+/// [`effect_direct`] with renderer context (e.g. a Continuously Rasterize layer's comp space).
+pub(crate) fn effect_direct_env(id: &str, vals: &[(&str, Value)], adjustment: bool, env: effectcraft_effects::EffectEnv) {
     let Some(g) = gpu() else { return };
     let spec = effectcraft_effects::find(id).unwrap();
     let size = [70.0, 44.0];
@@ -438,7 +443,7 @@ pub(crate) fn effect_direct(id: &str, vals: &[(&str, Value)], adjustment: bool) 
     for scale in [1.0, 0.5] {
         let img = pattern(7, (size[0] * scale) as u32, (size[1] * scale) as u32);
         let buf = effectcraft_effects::Buf { img, offset: [0.0, 0.0], scale };
-        let ctx = || effectcraft_effects::EffectCtx { params: &params, time: 0.25, layer_size: size, seed: 11, adjustment, env: Default::default() };
+        let ctx = || effectcraft_effects::EffectCtx { params: &params, time: 0.25, layer_size: size, seed: 11, adjustment, env };
         let cpu = (spec.render)(&ctx(), buf.clone());
         let out = effectcraft_render::Accelerator::effects(g, &[effectcraft_render::FxStep { spec, ctx: ctx() }], &buf, None).expect("the GPU runs the effect");
         assert_eq!((out.offset, out.scale), (cpu.offset, cpu.scale), "{id}: geometry");
@@ -528,6 +533,12 @@ fn gpu_effects_match_cpu() {
     effect_case("ec.generate.fill", &[("invert", Value::Bool(true))]);
     effect_case("ec.generate.gradientramp", &[("start", Value::Vec2([5.0, 3.0])), ("end", Value::Vec2([60.0, 40.0])), ("blend", n(25.0))]);
     effect_case("ec.generate.gradientramp", &[("shape", Value::Enum(1)), ("scatter", n(40.0))]);
+    // A Continuously Rasterize layer: the points are comp pixels (rotated, non-uniform scale).
+    let env = effectcraft_effects::EffectEnv { comp_space: Some([[2.5, -0.8, 300.0], [0.6, 4.0, -50.0]]), ..Default::default() };
+    for shape in [0, 1] {
+        let vals = [("start", Value::Vec2([310.0, -40.0])), ("end", Value::Vec2([420.0, 120.0])), ("shape", Value::Enum(shape))];
+        effect_direct_env("ec.generate.gradientramp", &vals, false, env);
+    }
     effect_case("ec.noise.fractal", &[]);
     effect_case(
         "ec.noise.fractal",

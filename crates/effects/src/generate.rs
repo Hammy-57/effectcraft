@@ -24,9 +24,30 @@ fn put(px: &mut Px, g: [f32; 3], ga: f32, blend_orig: f32) {
     }
 }
 
+/// Where Gradient Ramp's points lie for a buffer (`offset`, `scale` as in [`Buf`]): the ramp is
+/// evaluated at `m · (x + 0.5, y + 0.5, 1)` for buffer pixel (x, y), between `start` and `end`
+/// in that space. Normally layer pixels (`m` the identity, points through [`Buf::to_px`]); on a
+/// Continuously Rasterize layer ([`crate::EffectEnv::comp_space`]) the points are comp pixels and
+/// `m` takes buffer pixels to comp, as After Effects renders it (SceneYard "Spotify Music Player
+/// UI": a ramp from (960, −64) to (960, 900) on text scaled 468 %).
+pub fn gradient_ramp_space(ctx: &EffectCtx, offset: [f64; 2], scale: f64) -> ([[f64; 3]; 2], (f64, f64), (f64, f64)) {
+    let (s, e) = (ctx.params.v2("start"), ctx.params.v2("end"));
+    let scale = if scale.is_finite() && scale > 1e-9 { scale } else { 1.0 };
+    let m = ctx.env.comp_space.filter(|m| {
+        let det = m[0][0] * m[1][1] - m[0][1] * m[1][0];
+        det.is_finite() && det.abs() > 1e-12 && m.iter().flatten().all(|v| v.is_finite())
+    });
+    if let Some(m) = m {
+        // Buffer px → effect coordinates p = (px − offset) / scale → comp = M p + t.
+        let row = |r: [f64; 3]| [r[0] / scale, r[1] / scale, r[2] - (r[0] * offset[0] + r[1] * offset[1]) / scale];
+        return ([row(m[0]), row(m[1])], (s[0], s[1]), (e[0], e[1]));
+    }
+    let px = |p: [f64; 2]| (p[0] * scale + offset[0], p[1] * scale + offset[1]);
+    ([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], px(s), px(e))
+}
+
 fn gradient_ramp(ctx: &EffectCtx, mut b: Buf) -> Buf {
-    let s = b.to_px(ctx.params.v2("start"));
-    let e = b.to_px(ctx.params.v2("end"));
+    let (m, s, e) = gradient_ramp_space(ctx, b.offset, b.scale);
     let c0 = ctx.params.color("startColor");
     let c1 = ctx.params.color("endColor");
     let radial = ctx.params.e("shape") == 1;
@@ -37,7 +58,9 @@ fn gradient_ramp(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let seed = ctx.seed;
     b.img.rows_mut().for_each(|(y, row)| {
         for (x, px) in row.iter_mut().enumerate() {
-            let (vx, vy) = (x as f64 + 0.5 - s.0, y as f64 + 0.5 - s.1);
+            let (cx, cy) = (x as f64 + 0.5, y as f64 + 0.5);
+            let (qx, qy) = (m[0][0] * cx + m[0][1] * cy + m[0][2], m[1][0] * cx + m[1][1] * cy + m[1][2]);
+            let (vx, vy) = (qx - s.0, qy - s.1);
             let mut t = if radial { ((vx * vx + vy * vy) / len2).sqrt() } else { (vx * dx + vy * dy) / len2 } as f32;
             if scatter > 0.0 {
                 t += (effectcraft_raster::hash_noise(x as u32, y as u32, seed) - 0.5) * scatter;
@@ -435,6 +458,22 @@ mod generator_tests {
         assert_eq!(out.img.data[0], [0.0; 4]);
         assert_eq!(out.img.data[1], [0.0, 0.0, 0.5, 0.5]);
         assert_eq!(out.img.data[2], [0.0, 0.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn gradient_ramp_points_are_comp_pixels_on_continuously_rasterized_layers() {
+        // SceneYard "Spotify Music Player UI": text scaled 468 % with a ramp given in comp pixels;
+        // read in layer space the points fell off the layer and it rendered all black.
+        let set = [("start", Value::Vec2([600.0, 100.0])), ("end", Value::Vec2([600.0, 100.0 + 4.68 * 40.0]))];
+        let env = EffectEnv { comp_space: Some([[4.68, 0.0, 500.0], [0.0, 4.68, 100.0]]), ..Default::default() };
+        let out = run_fx("ec.generate.gradientramp", &set, Image::filled(40, 40, [1.0; 4]), 0.0, env);
+        for y in [2, 20, 30] {
+            let v = out.img.get(10, y)[0];
+            assert!((v - (y as f32 + 0.5) / 40.0).abs() < 1e-3, "row {y}: {v}");
+        }
+        // Without comp space the same points are layer pixels (all past the start: black).
+        let out = run_fx("ec.generate.gradientramp", &set, Image::filled(40, 40, [1.0; 4]), 0.0, EffectEnv::default());
+        assert_eq!(out.img.get(10, 30)[0], 0.0);
     }
 
     #[test]
