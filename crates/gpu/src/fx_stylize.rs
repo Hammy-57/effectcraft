@@ -301,11 +301,11 @@ fn cc_slant(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
 fn cc_smear(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
     let from = b.to_px(ctx.params.v2("from"));
     let to = b.to_px(ctx.params.v2("to"));
-    let reach = ctx.params.f("reach") / 100.0;
-    let radius = (ctx.params.f("radius") * b.scale).max(0.5);
-    let (dx, dy) = (to.0 - from.0, to.1 - from.1);
-    let l2 = dx * dx + dy * dy;
-    if l2 < 1e-12 || reach == 0.0 {
+    let reach = ctx.params.f("reach").clamp(-1000.0, 1000.0) / 100.0;
+    let radius = (ctx.params.f("radius").clamp(0.0, 4000.0) * b.scale).max(0.5);
+    let (dx, dy) = ((to.0 - from.0) * reach, (to.1 - from.1) * reach);
+    let len = dx.hypot(dy);
+    if [from.0, from.1, to.0, to.1, len, radius].iter().any(|v| !v.is_finite() || v.abs() > 1e9) || len < 1e-6 {
         return Some(b);
     }
     warp(
@@ -313,7 +313,7 @@ fn cc_smear(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
         5,
         |p| {
             p.f[0] = [from.0 as f32, from.1 as f32, dx as f32, dy as f32];
-            p.f[1] = [l2 as f32, reach as f32, radius as f32, 0.0];
+            p.f[1] = [len as f32, 0.0, radius as f32, 0.0];
         },
         b,
         None,

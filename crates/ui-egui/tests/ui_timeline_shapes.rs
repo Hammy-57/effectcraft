@@ -235,3 +235,53 @@ fn reverse_path_direction_button_toggles_the_path_direction() {
     h.state_mut().session.execute("edit.undo", json!({})).unwrap();
     assert_eq!(dir(&h), effectcraft_engine::keyframe::Value::Enum(1), "each click is one undo step");
 }
+
+/// #612: the real shape Gradient Fill property, driven through the complete app and its
+/// timeline, commits one undoable document change. Optional local screenshots show the editor.
+#[test]
+fn gradient_fill_editor_applies_undoes_and_escape_discards() {
+    use effectcraft_engine::keyframe::Value;
+    let mut s = session();
+    let layer = s.execute("layer.newShape", json!({"name": "Gradient rectangle"})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("layer.addShapeItem", json!({"layer": layer, "kind": "rect"})).unwrap();
+    s.execute("layer.addShapeItem", json!({"layer": layer, "kind": "gradientFill"})).unwrap();
+    let prop = s.active_comp().unwrap().layer(LayerId(layer)).unwrap().props.prop("contents/gfill/colors").unwrap();
+    let uid = prop.uid;
+    let original = prop.value.clone();
+    let mut h = harness(s);
+    h.state_mut().ui.timeline.search = "Colors".into();
+    h.run_steps(3);
+    let entry = format!("timeline.prop.{uid}.value");
+    click(&mut h, &entry);
+    click(&mut h, "gradient.color.add");
+    let undo_before = h.state().session.history.undo.len();
+    let value =
+        |h: &Harness<'_, EffectcraftApp>| h.state().session.active_comp().unwrap().layer(LayerId(layer)).unwrap().props.find(uid).unwrap().value.clone();
+    assert_eq!(value(&h), original, "editing the draft does not alter the project");
+    if let Ok(dir) = std::env::var("EC_SNAPSHOT_DIR") {
+        std::fs::create_dir_all(&dir).unwrap();
+        h.render().expect("gradient editor screenshot").save(format!("{dir}/gradient_fill_editor.png")).unwrap();
+    }
+    click(&mut h, "gradient.apply");
+    let Value::Gradient(edited) = value(&h) else { panic!("gradient fill lost its gradient value") };
+    let Value::Gradient(before) = &original else { panic!("fixture must be a gradient") };
+    assert_eq!(edited.colors.len(), before.colors.len() + 1);
+    assert_ne!(edited.sample(0.5), before.sample(0.5), "the committed gradient changes the renderer's sampled color");
+    assert_eq!(h.state().session.history.undo.len(), undo_before + 1);
+    h.state_mut().session.execute("edit.undo", json!({})).unwrap();
+    h.run_steps(3);
+    assert_eq!(value(&h), original);
+    click(&mut h, &entry);
+    click(&mut h, "gradient.opacity.add");
+    let project_before_escape = serde_json::to_value(&h.state().session.project).unwrap();
+    let history_before_escape = h.state().session.history.undo.len();
+    for pressed in [true, false] {
+        h.input_mut().events.push(Event::Key { key: Key::Escape, physical_key: None, pressed, repeat: false, modifiers: Modifiers::NONE });
+        h.step();
+    }
+    h.run_steps(3);
+    assert!(h.state().auto.find("gradient.apply").is_none(), "Escape closes the draft editor");
+    assert_eq!(serde_json::to_value(&h.state().session.project).unwrap(), project_before_escape, "Escape never deletes a layer or changes the project");
+    assert_eq!(h.state().session.history.undo.len(), history_before_escape);
+    assert_eq!(value(&h), original);
+}

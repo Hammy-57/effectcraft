@@ -1047,8 +1047,18 @@ impl EffectcraftApp {
             // background renders cannot be preempted by the priority queue.
             self.frames_parallelism().saturating_sub(1).min(2) as i64
         };
+        let ahead = ahead.min(self.frames_that_fit(&c, scale));
         let mut queued = self.frames.inflight();
         let series = self.frame_series(cid, scale);
+        // In-flight renders far ahead may finish after the near frames. Keep their completion
+        // from evicting the very frames playback needs next (#595).
+        self.frames.protect_frames(
+            series,
+            (0..ahead.max(2)).filter_map(|k| match plan {
+                Some(p) => p.frame_after(cur, k),
+                None => Some(wa + (cur.saturating_sub(wa).saturating_add(k)).rem_euclid(wb.saturating_sub(wa).saturating_add(1).max(1))),
+            }),
+        );
         if self.playback.caching
             && let Some(p) = plan
         {
@@ -1513,7 +1523,12 @@ impl EffectcraftApp {
                         self.ui.status = e;
                     }
                 }
-                effectcraft_engine::Event::PurgeCaches => self.frames.clear(),
+                effectcraft_engine::Event::PurgeCaches => {
+                    self.frames.clear();
+                    if let Some(gpu) = &self.gpu {
+                        gpu.context().clear_uploads();
+                    }
+                }
             }
         }
     }
@@ -1844,6 +1859,34 @@ mod fit_window_tests {
 #[cfg(test)]
 mod gpu_failure_tests {
     use super::*;
+
+    #[test]
+    fn purge_and_project_replacement_release_gpu_uploads() {
+        let Some(gpu) = effectcraft_gpu::Gpu::headless() else {
+            assert!(std::env::var_os("EFFECTCRAFT_REQUIRE_GPU").is_none(), "GPU required for upload purge test");
+            eprintln!("no GPU adapter: skipping upload purge test");
+            return;
+        };
+        let mut app = EffectcraftApp::new(Session::default());
+        app.gpu = Some(gpu.clone());
+        let ctx = egui::Context::default();
+        for replace in [false, true] {
+            app.session.execute("comp.new", json!({"width": 64, "height": 64, "duration": 1})).unwrap();
+            app.session.execute("layer.newText", json!({"text": "A", "size": 24, "position": [8, 32]})).unwrap();
+            app.handle_events(&ctx);
+            let mut renderer = effectcraft_engine::render::Renderer::new(&app.session.project, app.session.footage.as_ref(), Default::default());
+            renderer.cache = Some(&app.session.layer_cache);
+            assert!(gpu.render_display(&renderer, app.session.active_comp_id().unwrap(), Tick::ZERO).is_some());
+            assert!(gpu.context().upload_stats().0 > 0);
+            if replace {
+                app.session.replace_project(Default::default(), None);
+            } else {
+                app.session.execute("edit.purge", json!({"what": "memory"})).unwrap();
+            }
+            app.handle_events(&ctx);
+            assert_eq!(gpu.context().upload_stats(), (0, 0));
+        }
+    }
 
     #[test]
     fn host_failure_preserves_document_undo_and_cpu_pixels_and_detaches_late_readbacks() {

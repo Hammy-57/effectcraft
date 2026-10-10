@@ -1240,7 +1240,21 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let t = app.tokens;
     let ctx = ui.ctx().clone();
     let Some(cid) = app.session.active_comp_id() else {
-        ui.painter().text(rect.center(), Align2::CENTER_CENTER, "(no composition)", Tokens::ui(12.0), t.text_faint);
+        ui.painter().text(rect.center(), Align2::CENTER_CENTER, "Drop footage here to create a composition", Tokens::ui(12.0), t.text_faint);
+        app.auto.add("timeline.empty", rect, "Drop footage to create a composition");
+        if let Some(crate::panels::DragPayload::Item(item)) = egui::DragAndDrop::payload::<crate::panels::DragPayload>(&ctx).as_deref()
+            && ui.rect_contains_pointer(rect)
+            && app.session.project.item(ItemId(*item)).is_some_and(|item| !item.is_folder())
+        {
+            ui.painter().rect_stroke(rect, 0.0, Stroke::new(2.0, t.accent), StrokeKind::Inside);
+            if ctx.input(|i| i.pointer.any_released()) {
+                app.session.state.project_selection = vec![ItemId(*item)];
+                if let Err(error) = crate::menus::invoke(app, &ctx, "file.newCompFromSelection", json!({})) {
+                    app.ui.status = error;
+                }
+                egui::DragAndDrop::clear_payload(&ctx);
+            }
+        }
         return;
     };
     let Some(comp) = app.session.project.comp_arc(cid) else { return };
@@ -3730,8 +3744,13 @@ fn value_editor(
                 t.hot_text,
             );
         }
-        Value::Gradient(_) => {
+        Value::Gradient(g) => {
             p.text(pos2(x, at.y), Align2::LEFT_CENTER, crate::i18n::tr("Edit Gradient…"), Tokens::ui(12.0), t.hot_text);
+            let r = Rect::from_min_size(pos2(x, at.y - 9.0), vec2(110.0, 18.0));
+            app.auto.add(&format!("timeline.prop.{uid}.value"), r, &prop.name);
+            if let Some(value) = super::gradient_editor::show(app, ui, egui::Id::new(("timeline-gradient", uid)), r, g) {
+                actions.push(("prop.set".into(), json!({"layer": layer.id.0, "prop": uid, "value": value})));
+            }
         }
         Value::Str(s) => {
             p.text(pos2(x, at.y), Align2::LEFT_CENTER, s.chars().take(30).collect::<String>(), Tokens::ui(12.0), t.text_dim);

@@ -62,3 +62,56 @@ fn viewer_draws_gpu_frames_that_match_the_cpu() {
         cpu_shot.save(format!("{d}/ui_cpu_viewer.png")).unwrap();
     }
 }
+
+/// #591: losing the compositor device must not take egui's presentation device or the
+/// document with it. Exercise real device destruction, not just a synthetic error string.
+#[test]
+fn compositor_device_loss_keeps_the_window_rendering_and_the_document_editable() {
+    let _gpu = crate::gpu_lock();
+    let Some(probe) = effectcraft_gpu::Gpu::headless() else {
+        assert!(std::env::var_os("EFFECTCRAFT_REQUIRE_GPU").is_none(), "GPU required for device-loss test");
+        eprintln!("no GPU adapter: skipping device-loss test");
+        return;
+    };
+    drop(probe);
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "Device recovery", "width": 64, "height": 64, "duration": 2})).unwrap();
+    s.execute("layer.newSolid", json!({"name": "Preserved", "color": "#ff0000"})).unwrap();
+    let project = s.project.clone();
+    let mut presentation = None;
+    let mut h = Harness::builder().with_size(egui::vec2(1200.0, 800.0)).wgpu().build_eframe(|cc| {
+        presentation = cc.wgpu_render_state.as_ref().map(|rs| rs.device.clone());
+        let mut app = EffectcraftApp::new(s);
+        app.set_gpu_failure_bridge(effectcraft_ui_egui::gpu_failure::GpuFailureBridge::new(&cc.egui_ctx));
+        app
+    });
+    settle(&mut h);
+    let Some(compositor) = h.state().render_source().gpu else {
+        assert!(std::env::var_os("EFFECTCRAFT_REQUIRE_GPU").is_none(), "compositor required for device-loss test");
+        eprintln!("adapter cannot run the compositor: skipping device-loss test");
+        return;
+    };
+    assert_ne!(compositor.device(), presentation.as_ref().unwrap(), "worker and window must have separate devices");
+    h.render().expect("window renders before device loss");
+    compositor.device().destroy();
+    for _ in 0..100 {
+        let _ = compositor.device().poll(eframe::wgpu::PollType::Poll);
+        h.step();
+        if h.state().session.accel.is_none() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(h.state().session.accel.is_none(), "lost compositor is retired");
+    assert!(std::sync::Arc::ptr_eq(&project, &h.state().session.project), "device loss preserves the document");
+    h.state_mut().session.execute("time.set", json!({"time": 1.0})).unwrap();
+    settle(&mut h);
+    let pixels = h.state_mut().viewer_pixels().expect("CPU preview after device loss");
+    assert!(pixels.pixels.iter().any(|p| p.r() > 200 && p.g() < 10), "the original red layer still renders");
+    h.render().expect("egui still presents after compositor device loss");
+    h.state_mut().session.execute("edit.undo", json!({})).unwrap();
+    assert!(h.state().session.active_comp().unwrap().layers.is_empty());
+    h.state_mut().session.execute("edit.redo", json!({})).unwrap();
+    assert_eq!(h.state().session.active_comp().unwrap().layers.len(), 1);
+    h.render().expect("egui still presents after undo and redo");
+}

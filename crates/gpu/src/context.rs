@@ -48,6 +48,9 @@ const UPLOAD_BUDGET: usize = 1536 << 20;
 /// Working textures kept for reuse once their last image is dropped (bytes), at most.
 const POOL_BUDGET: usize = 768 << 20;
 
+/// Small auxiliary caches must be bounded across sizes, not independently per size.
+const AUX_CACHE_BUDGET: u64 = 64 << 20;
+
 /// A GPU image: premultiplied RGBA f32 in a texture (cheap to clone; immutable once written).
 /// Working images come from the context's texture pool and go back to it when the last clone
 /// is dropped.
@@ -106,6 +109,7 @@ pub(crate) struct Pool {
     free: HashMap<(u32, u32), Vec<wgpu::Texture>>,
     /// (texture, newest encoder open at its release).
     released: Vec<(wgpu::Texture, u64)>,
+    released_bytes: usize,
     /// Encoders with recorded, unsubmitted work.
     open: BTreeSet<u64>,
     next: u64,
@@ -115,6 +119,15 @@ pub(crate) struct Pool {
     /// Working textures reused / newly allocated (diagnostics, tests).
     hits: u64,
     misses: u64,
+}
+
+/// Shared-memory adapters retain fewer duplicate pixels: CPU caches already hold the sources.
+fn cache_budgets(layer_cache: usize, integrated: bool) -> (usize, usize, u64) {
+    let upload_cap = if integrated { 256 << 20 } else { UPLOAD_BUDGET };
+    let pool_cap = if integrated { 128 << 20 } else { POOL_BUDGET };
+    // Keep room for one 1080p RGBA-f32 buffer even on shared memory.
+    let auxiliary_cap = if integrated { 32 << 20 } else { AUX_CACHE_BUDGET };
+    (layer_cache.min(upload_cap), (layer_cache / 2).min(pool_cap), ((layer_cache / 16) as u64).min(auxiliary_cap))
 }
 
 /// Counts of uploads (CPU → GPU) and readbacks (GPU → CPU).
@@ -151,14 +164,21 @@ fn tex_bytes(t: &wgpu::Texture) -> usize {
 impl Pool {
     fn release(&mut self, t: wgpu::Texture) {
         match self.open.last() {
-            Some(&newest) => self.released.push((t, newest)),
+            Some(&newest) => {
+                let bytes = tex_bytes(&t);
+                if self.bytes.saturating_add(self.released_bytes).saturating_add(bytes) <= self.budget.unwrap_or(POOL_BUDGET) {
+                    self.released.push((t, newest));
+                    self.released_bytes += bytes;
+                }
+                // Dropping our handle is safe: the encoder retains resources it still uses.
+            }
             None => self.make_free(t),
         }
     }
 
     fn make_free(&mut self, t: wgpu::Texture) {
         let b = tex_bytes(&t);
-        if self.bytes + b > self.budget.unwrap_or(POOL_BUDGET) {
+        if self.bytes.saturating_add(self.released_bytes).saturating_add(b) > self.budget.unwrap_or(POOL_BUDGET) {
             return;
         }
         self.bytes += b;
@@ -180,6 +200,7 @@ impl Pool {
         }
         let (ready, wait): (Vec<_>, Vec<_>) = std::mem::take(&mut self.released).into_iter().partition(|(_, w)| *w < oldest);
         self.released = wait;
+        self.released_bytes = self.released.iter().map(|(t, _)| tex_bytes(t)).sum();
         for (t, _) in ready {
             self.make_free(t);
         }
@@ -187,6 +208,9 @@ impl Pool {
 
     fn take(&mut self, w: u32, h: u32) -> Option<wgpu::Texture> {
         let t = self.free.get_mut(&(w, h)).and_then(Vec::pop);
+        if self.free.get(&(w, h)).is_some_and(Vec::is_empty) {
+            self.free.remove(&(w, h));
+        }
         match &t {
             Some(t) => {
                 self.bytes -= tex_bytes(t);
@@ -199,12 +223,18 @@ impl Pool {
 
     fn clear(&mut self) {
         self.free.clear();
+        self.released.clear();
+        self.released_bytes = 0;
         self.bytes = 0;
     }
 
-    /// Keep at most `budget` bytes of free textures from now on (drops the excess now).
+    /// Bound free and pending-reuse textures together (drop excess handles now).
     fn set_budget(&mut self, budget: usize) {
         self.budget = Some(budget);
+        while self.bytes.saturating_add(self.released_bytes) > budget {
+            let Some((texture, _)) = self.released.pop() else { break };
+            self.released_bytes = self.released_bytes.saturating_sub(tex_bytes(&texture));
+        }
         for list in self.free.values_mut() {
             while self.bytes > budget {
                 let Some(t) = list.pop() else { break };
@@ -289,6 +319,8 @@ pub struct GpuContext {
     pub queue: wgpu::Queue,
     pub(crate) name: String,
     pub(crate) max_dim: u32,
+    integrated: bool,
+    auxiliary_budget: std::sync::atomic::AtomicU64,
     bgl: wgpu::BindGroupLayout,
     bgl_ext: wgpu::BindGroupLayout,
     pipelines: HashMap<&'static str, wgpu::ComputePipeline>,
@@ -594,6 +626,8 @@ impl GpuContext {
         let align = u64::from(device.limits().min_uniform_buffer_offset_alignment.max(1));
         let uniform_stride = PARAMS_SIZE.div_ceil(align).saturating_mul(align);
         let max_dim = device.limits().max_texture_dimension_2d;
+        let integrated = info.device_type == wgpu::DeviceType::IntegratedGpu;
+        let (upload_budget, pool_budget, auxiliary_budget) = cache_budgets(UPLOAD_BUDGET, integrated);
         Ok(GpuContext {
             device,
             queue,
@@ -609,8 +643,10 @@ impl GpuContext {
             dummy_buf,
             uniform_stride,
             uniforms: Default::default(),
-            uploads: Mutex::new(Uploads::default()),
-            pool: Default::default(),
+            uploads: Mutex::new(Uploads { budget: Some(upload_budget), ..Default::default() }),
+            pool: Arc::new(Mutex::new(Pool { budget: Some(pool_budget), ..Default::default() })),
+            integrated,
+            auxiliary_budget: std::sync::atomic::AtomicU64::new(auxiliary_budget),
             staging: Default::default(),
             transfers: Default::default(),
             zeros: Default::default(),
@@ -930,14 +966,30 @@ impl GpuContext {
     /// after RAM Reserved for Other Applications): uploaded layer textures mirror cached layer
     /// buffers, so they get at most the same budget (capped at [`UPLOAD_BUDGET`]), and free
     /// working textures half of it (capped at [`POOL_BUDGET`]). On unified memory (Apple
-    /// silicon) both come out of system RAM.
+    /// silicon, Adreno) CPU/GPU caches share RAM, so retained uploads and working textures
+    /// are further capped at 256/128 MiB. Auxiliary staging and zero-image caches each get
+    /// 1/16 of the layer budget, capped at 32 MiB integrated or 64 MiB discrete.
     pub fn set_cache_budget(&self, layer_cache: usize) {
+        let (upload, pool, auxiliary) = cache_budgets(layer_cache, self.integrated);
+        self.auxiliary_budget.store(auxiliary, std::sync::atomic::Ordering::Relaxed);
         if let Ok(mut u) = self.uploads.lock() {
-            u.budget = Some(layer_cache.min(UPLOAD_BUDGET));
+            u.budget = Some(upload);
             u.trim();
         }
         if let Ok(mut p) = self.pool.lock() {
-            p.set_budget((layer_cache / 2).min(POOL_BUDGET));
+            p.set_budget(pool);
+        }
+        if let Ok(mut s) = self.staging.lock() {
+            let retained = s.iter().map(|(size, buffers)| size.saturating_mul(buffers.len() as u64)).sum::<u64>();
+            if retained > auxiliary {
+                s.clear();
+            }
+        }
+        if let Ok(mut z) = self.zeros.lock() {
+            let retained = z.values().map(|img| u64::from(img.width).saturating_mul(u64::from(img.height)).saturating_mul(16)).sum::<u64>();
+            if retained > auxiliary {
+                z.clear();
+            }
         }
     }
 
@@ -957,6 +1009,9 @@ impl GpuContext {
         }
         if let Ok(mut s) = self.staging.lock() {
             s.clear();
+        }
+        if let Ok(mut z) = self.zeros.lock() {
+            z.clear();
         }
     }
 }
@@ -1029,10 +1084,22 @@ impl<'g> Enc<'g> {
     pub fn zeros(&self, w: u32, h: u32) -> GpuImage {
         let (w, h) = (w.max(1), h.max(1));
         let Ok(mut z) = self.g.zeros.lock() else { return self.g.image(w, h) };
-        if z.len() > 8 && !z.contains_key(&(w, h)) {
+        if let Some(img) = z.get(&(w, h)) {
+            return img.clone();
+        }
+        let bytes = u64::from(w).saturating_mul(u64::from(h)).saturating_mul(16);
+        let budget = self.g.auxiliary_budget.load(std::sync::atomic::Ordering::Relaxed);
+        // Oversized images are valid working resources, but must not be retained forever.
+        if bytes > budget {
+            return self.g.image(w, h);
+        }
+        let retained = z.values().map(|img| u64::from(img.width).saturating_mul(u64::from(img.height)).saturating_mul(16)).sum::<u64>();
+        if retained.saturating_add(bytes) > budget {
             z.clear();
         }
-        z.entry((w, h)).or_insert_with(|| self.g.image(w, h)).clone()
+        let img = self.g.image(w, h);
+        z.insert((w, h), img.clone());
+        img
     }
 
     /// Set every pixel of `img` to `v`.
@@ -1221,14 +1288,24 @@ impl<'g> Enc<'g> {
         self.g.transfers.count(false, layout.len);
         let padded = layout.stride;
         let size = layout.size;
-        let buf = self.g.staging.lock().ok().and_then(|mut s| s.get_mut(&size).and_then(Vec::pop)).unwrap_or_else(|| {
-            self.g.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("readback"),
-                size,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
+        let buf = self
+            .g
+            .staging
+            .lock()
+            .ok()
+            .and_then(|mut s| {
+                let buf = s.get_mut(&size).and_then(Vec::pop);
+                s.retain(|_, buffers| !buffers.is_empty());
+                buf
             })
-        });
+            .unwrap_or_else(|| {
+                self.g.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("readback"),
+                    size,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            });
         self.encoder().copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo { texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
             wgpu::TexelCopyBufferInfo { buffer: &buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(padded), rows_per_image: Some(h) } },
@@ -1236,10 +1313,18 @@ impl<'g> Enc<'g> {
         );
         self.submit();
         self.read_staging(&buf, layout.row as usize, padded as usize, h as usize, row).map_err(|e| log::error!("gpu texture readback: {e}")).ok()?;
-        // Keep a few staging buffers per size (frames read back at the same size every time).
+        // Resized layers used to retain two buffers for every size ever read back (#591).
         if let Ok(mut s) = self.g.staging.lock() {
+            let budget = self.g.auxiliary_budget.load(std::sync::atomic::Ordering::Relaxed);
+            if size > budget {
+                return Some(());
+            }
+            let retained = s.iter().map(|(size, buffers)| size.saturating_mul(buffers.len() as u64)).sum::<u64>();
+            if retained.saturating_add(size) > budget {
+                s.clear();
+            }
             let v = s.entry(size).or_default();
-            if v.len() < 2 && size <= 256 << 20 {
+            if v.len() < 2 {
                 v.push(buf);
             }
         }
@@ -1400,6 +1485,68 @@ pub(crate) fn mip_levels(w: u32, h: u32) -> u32 {
 #[cfg(test)]
 mod upload_budget_tests {
     use super::*;
+
+    #[test]
+    fn pool_pending_reuse_is_bounded_and_purge_cannot_repopulate_it() {
+        crate::tests::hold_gpu_lock();
+        let context = GpuContext::headless();
+        assert!(context.is_some() || !std::env::var("EFFECTCRAFT_REQUIRE_GPU").is_ok_and(|v| v == "1"), "required GPU unavailable");
+        let Some(g) = context else { return };
+        let mut pool = Pool::default();
+        pool.set_budget(2 * 8 * 8 * 16);
+        let encoder = pool.open();
+        for _ in 0..8 {
+            pool.release(g.texture(8, 8));
+        }
+        assert_eq!(pool.released.len(), 2);
+        assert_eq!(pool.released_bytes, 2 * 8 * 8 * 16);
+        pool.set_budget(8 * 8 * 16);
+        assert_eq!(pool.released.len(), 1);
+        pool.clear();
+        pool.close(encoder);
+        assert_eq!(pool.bytes, 0);
+        assert_eq!(pool.released_bytes, 0);
+        assert!(pool.free.is_empty());
+    }
+
+    #[test]
+    fn shared_memory_cache_budgets_follow_preferences_and_have_lower_caps() {
+        assert_eq!(cache_budgets(0, true), (0, 0, 0));
+        assert_eq!(cache_budgets(64 << 20, true), (64 << 20, 32 << 20, 4 << 20));
+        assert_eq!(cache_budgets(usize::MAX, true), (256 << 20, 128 << 20, 32 << 20));
+        assert_eq!(cache_budgets(usize::MAX, false), (UPLOAD_BUDGET, POOL_BUDGET, AUX_CACHE_BUDGET));
+    }
+
+    #[test]
+    fn auxiliary_caches_are_bounded_across_sizes_and_purged() {
+        crate::tests::hold_gpu_lock();
+        let context = GpuContext::headless();
+        assert!(context.is_some() || !std::env::var("EFFECTCRAFT_REQUIRE_GPU").is_ok_and(|v| v == "1"), "required GPU unavailable");
+        let Some(g) = context else { return };
+        // A tiny budget makes changing layer extents exercise eviction with kilobytes.
+        g.set_cache_budget(16 * 4096);
+        for width in 8..40 {
+            let mut enc = Enc::new(&g);
+            let zero = enc.zeros(width, 8);
+            let pixels = enc.download(&zero).unwrap();
+            assert!(pixels.data.iter().all(|p| *p == [0.0; 4]));
+            let retained = g.zeros.lock().unwrap().values().map(|img| tex_bytes(&img.texture)).sum::<usize>();
+            assert!(retained <= 4096, "zero cache retained {retained} bytes");
+            let staging = g.staging.lock().unwrap();
+            let retained = staging.iter().map(|(size, buffers)| size * buffers.len() as u64).sum::<u64>();
+            assert!(retained <= 4096, "staging cache retained {retained} bytes");
+            assert!(staging.values().all(|buffers| !buffers.is_empty()));
+        }
+        g.clear_uploads();
+        assert!(g.zeros.lock().unwrap().is_empty());
+        assert!(g.staging.lock().unwrap().is_empty());
+        g.set_cache_budget(0);
+        let mut enc = Enc::new(&g);
+        let zero = enc.zeros(8, 8);
+        assert!(enc.download(&zero).is_some());
+        assert!(g.zeros.lock().unwrap().is_empty());
+        assert!(g.staging.lock().unwrap().is_empty());
+    }
 
     /// Readback copies rows straight out of the padded staging buffer: an odd width (row
     /// padding) round-trips bit-exactly through `download` and `read_texture`.

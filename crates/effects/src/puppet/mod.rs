@@ -316,7 +316,6 @@ pub fn mesh_for(buf: &Buf, m: &MeshParams) -> Arc<Mesh> {
         return mesh.clone();
     }
     let (w, h) = (buf.img.width as usize, buf.img.height as usize);
-    let alpha: Vec<f32> = buf.img.data.iter().map(|p| p[3]).collect();
     let mut key = 0xcbf2_9ce4_8422_2325u64;
     fnv(&mut key, &(w as u64).to_le_bytes());
     fnv(&mut key, &(h as u64).to_le_bytes());
@@ -324,8 +323,8 @@ pub fn mesh_for(buf: &Buf, m: &MeshParams) -> Arc<Mesh> {
         fnv(&mut key, &v.to_bits().to_le_bytes());
     }
     let mut bits = 0u8;
-    for (i, a) in alpha.iter().enumerate() {
-        bits = (bits << 1) | (*a >= 0.5) as u8;
+    for (i, pixel) in buf.img.data.iter().enumerate() {
+        bits = (bits << 1) | (pixel[3] >= 0.5) as u8;
         if i % 8 == 7 {
             fnv(&mut key, &[bits]);
         }
@@ -336,6 +335,7 @@ pub fn mesh_for(buf: &Buf, m: &MeshParams) -> Arc<Mesh> {
     {
         return mesh.clone();
     }
+    let alpha: Vec<f32> = buf.img.data.iter().map(|p| p[3]).collect();
     let outline = mesh::outline(&alpha, w, h, buf.scale.max(1e-9), buf.offset, m.seed, m.opts.expansion);
     let mesh = Arc::new(mesh::triangulate(&outline, &m.opts));
     if let Ok(mut c) = CACHE.lock() {
@@ -378,8 +378,47 @@ fn centroid(mesh: &Mesh, t: &[usize; 3]) -> [f64; 2] {
     [(v[t[0]][0] + v[t[1]][0] + v[t[2]][0]) / 3.0, (v[t[0]][1] + v[t[1]][1] + v[t[2]][1]) / 3.0]
 }
 
+struct Deformation {
+    mesh: Mesh,
+    pins: Vec<Pin>,
+    refine: usize,
+    vertices: Vec<[f64; 2]>,
+}
+
+// Viewer overlays and the compositor ask for the same solve. Keep a bounded recent set without
+// holding the mutex through the expensive solver or retaining any input image buffers (#586).
+static DEFORMATIONS: Mutex<Vec<Deformation>> = Mutex::new(Vec::new());
+
+impl Deformation {
+    fn matches(&self, mesh: &Mesh, pins: &[Pin], refine: usize) -> bool {
+        self.refine == refine && self.pins == pins && self.mesh == *mesh
+    }
+}
+
 /// Solve the deformation of `mesh` for `pins` (layer space). Returns deformed vertices.
 pub fn solve(mesh: &Mesh, pins: &[Pin], refine: usize) -> Vec<[f64; 2]> {
+    if let Ok(cache) = DEFORMATIONS.lock()
+        && let Some(entry) = cache.iter().rev().find(|entry| entry.matches(mesh, pins, refine))
+    {
+        return entry.vertices.clone();
+    }
+    let vertices = solve_uncached(mesh, pins, refine);
+    // Large imported meshes still render, but cannot multiply the cache's memory use.
+    if mesh.verts.len() <= 16_384
+        && mesh.tris.len() <= 32_768
+        && mesh.outline.len() <= 16_384
+        && pins.len() <= 1024
+        && let Ok(mut cache) = DEFORMATIONS.lock()
+    {
+        if cache.len() >= 8 {
+            cache.remove(0);
+        }
+        cache.push(Deformation { mesh: mesh.clone(), pins: pins.to_vec(), refine, vertices: vertices.clone() });
+    }
+    vertices
+}
+
+fn solve_uncached(mesh: &Mesh, pins: &[Pin], refine: usize) -> Vec<[f64; 2]> {
     let mut h = arap::Handles::default();
     let mut adj: Vec<Vec<usize>> = vec![vec![]; mesh.verts.len()];
     for t in &mesh.tris {

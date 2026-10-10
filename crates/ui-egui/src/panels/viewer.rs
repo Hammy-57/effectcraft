@@ -881,6 +881,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let mut handle_hits: Vec<(LayerId, usize, Pos2, egui::CursorIcon)> = Vec::new();
     let mut vertex_hits: Vec<VertexHit> = Vec::new();
     let mut key_hits: Vec<ov::KeyHit> = Vec::new();
+    let mut motion_segments = Vec::new();
     let mut paths: Vec<ov::PathInfo> = Vec::new();
     let sel_vertices = app.session.state.selected_vertices.clone();
     // Pen path in progress ends when the tool changes or its mask is gone; Esc / Enter also end
@@ -900,7 +901,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         for l in comp.layers.iter().filter(|l| selected.contains(&l.id) && l.is_active_at(time)) {
             let col = if label_handles { t.label(l.label) } else { t.accent };
             // Motion path of animated position (keyframes and spatial tangents are draggable).
-            ov::motion_path(app, &painter, &map, &ectx, l, col, &mut key_hits);
+            ov::motion_path(app, &painter, &map, &ectx, l, col, &mut key_hits, &mut motion_segments);
             // Masks and shape paths.
             if app.ui.viewer.show_masks {
                 let pen = ui.data(|d| d.get_temp::<(LayerId, u64)>(pen_id()));
@@ -1139,19 +1140,42 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             app.ui.status = e;
         }
     }
+    // An unfinished shape/mask owns Pen presses, even where it crosses a motion path.
+    if app.ui.tool == Tool::Pen && ui.data(|d| d.get_temp::<(LayerId, u64)>(pen_id())).is_some() {
+        key_hits.clear();
+        motion_segments.clear();
+    }
     let gid = egui::Id::new("viewer-gesture");
     if let Some(hp) = resp.hover_pos() {
         app.pointer_comp = Some({
             let c = map.to_comp(hp);
             [c[0] as f32, c[1] as f32]
         });
-        let cursor = match app.ui.tool {
+        let motion_key = ov::motion_key_at(&key_hits, hp);
+        let motion_segment = ov::motion_segment_at(&motion_segments, hp);
+        let cursor_tool = if app.ui.tool == Tool::Pen {
+            if motion_key.is_some() && ctx.input(|i| i.modifiers.alt) {
+                Tool::PenConvert
+            } else if motion_key.is_some() {
+                Tool::PenDelete
+            } else if motion_segment.is_some() {
+                Tool::PenAdd
+            } else {
+                Tool::Pen
+            }
+        } else {
+            app.ui.tool
+        };
+        let cursor = match cursor_tool {
             Tool::Hand => egui::CursorIcon::Grab,
             Tool::Zoom => egui::CursorIcon::ZoomIn,
             Tool::Type | Tool::TypeVertical => egui::CursorIcon::Text,
             Tool::Orbit => egui::CursorIcon::Alias,
             Tool::PanCamera => egui::CursorIcon::Move,
             Tool::Dolly => egui::CursorIcon::ResizeVertical,
+            Tool::PenAdd => egui::CursorIcon::Copy,
+            Tool::PenDelete => egui::CursorIcon::NotAllowed,
+            Tool::PenConvert => egui::CursorIcon::Alias,
             t if t.is_shape() || t.is_pen() => egui::CursorIcon::Crosshair,
             _ if app.ui.viewer.roi_draw => egui::CursorIcon::Crosshair,
             t if t.puppet_kind().is_some() => match super::puppet_tool::hit(&pin_hits, hp) {
@@ -1175,7 +1199,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         };
         ctx.set_cursor_icon(cursor);
         if !app.ui.viewer.roi_draw {
-            let native = match app.ui.tool {
+            let native = match cursor_tool {
                 Tool::Hand => Some(("hand", [11, 11])),
                 Tool::Zoom => Some((if ctx.input(|i| i.modifiers.alt) { "zoom-out" } else { "zoom-in" }, [8, 8])),
                 Tool::Rotate => Some(("rotate", [1, 1])),
@@ -1218,6 +1242,9 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         && resp.hovered()
         && ui.input(|i| i.pointer.primary_pressed())
         && let Some(pos) = ui.input(|i| i.pointer.press_origin())
+        && ov::motion_key_at(&key_hits, pos).is_none()
+        && ov::motion_segment_at(&motion_segments, pos).is_none()
+        && !key_hits.iter().any(|h| h.tangent.is_some() && h.pos.distance(pos) < 6.0)
     {
         pen_press(app, ui, &ectx, &map, &paths, pos, mods);
     }
@@ -1249,7 +1276,14 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             Tool::Selection if ft.as_ref().and_then(|f| ov::begin_ft_drag(f, press, &map)).is_some() => {
                 ft.as_ref().and_then(|f| ov::begin_ft_drag(f, press, &map)).map(Gesture::Overlay)
             }
-            Tool::Selection if key_hits.iter().any(|h| h.pos.distance(press) < 6.0) => {
+            Tool::PenConvert | Tool::Pen | Tool::Selection if (tool == Tool::PenConvert || mods.alt) && ov::motion_key_at(&key_hits, press).is_some() => {
+                ov::motion_key_at(&key_hits, press).and_then(|h| {
+                    h.p2c
+                        .inverse()
+                        .map(|inv| Gesture::Overlay(ov::Drag::KeyTangent { layer: h.layer, prop: h.prop, time: h.time, out: true, key: h.value, inv }))
+                })
+            }
+            Tool::Selection | Tool::Pen | Tool::PenAdd | Tool::PenConvert if key_hits.iter().any(|h| h.pos.distance(press) < 6.0) => {
                 ov::begin_key_drag(app, &key_hits, press, map.to_comp(press), mods.shift).map(Gesture::Overlay)
             }
             Tool::Selection if vt::guide_at(app, &comp, &map, press).is_some() => {
@@ -1700,6 +1734,27 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 app.ui.viewer.pan = [pan.x, pan.y];
             }
             Tool::Type | Tool::TypeVertical => {}
+            Tool::Pen if ov::motion_key_at(&key_hits, pos).is_some() => {
+                if let Some(h) = ov::motion_key_at(&key_hits, pos) {
+                    ov::edit_motion_key(app, h, !mods.alt);
+                }
+            }
+            Tool::Pen | Tool::PenAdd if ov::motion_segment_at(&motion_segments, pos).is_some() && ov::motion_key_at(&key_hits, pos).is_none() => {
+                if let Some(hit) = ov::motion_segment_at(&motion_segments, pos) {
+                    ov::insert_motion_key(app, hit);
+                }
+            }
+            Tool::PenDelete | Tool::PenConvert if ov::motion_key_at(&key_hits, pos).is_some() => {
+                let delete = app.ui.tool == Tool::PenDelete;
+                if let Some(h) = ov::motion_key_at(&key_hits, pos) {
+                    ov::edit_motion_key(app, h, delete);
+                }
+            }
+            Tool::Selection if mods.alt && ov::motion_key_at(&key_hits, pos).is_some() => {
+                if let Some(h) = ov::motion_key_at(&key_hits, pos) {
+                    ov::edit_motion_key(app, h, false);
+                }
+            }
             Tool::Pen | Tool::MaskFeather => {}
             Tool::PenAdd => {
                 if let Some((l, m, seg, tt)) = ov::segment_at(&paths, &map, pos, 6.0) {
