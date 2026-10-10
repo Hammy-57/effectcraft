@@ -63,6 +63,17 @@ impl<'a> Renderer<'a> {
         s * k
     }
 
+    /// The renderer drawing precomp layer `layer`'s nested comp `item`, and the scale of the
+    /// buffer it draws. Preserve resolution when nested: drawn at full size even when this comp
+    /// renders smaller (the buffer's scale places it).
+    pub(crate) fn precomp_renderer(&self, layer: &Layer, item: effectcraft_project::ItemId) -> (Renderer<'a>, f64) {
+        let s = self.opts.scale;
+        let full = s < 1.0 && self.project.comp(item).is_some_and(|nc| nc.preserve_resolution);
+        let bs = if full { 1.0 } else { s };
+        let base = self.nested_through(layer);
+        (Renderer { opts: RenderOpts { scale: bs, ..base.opts }, ..base }, bs)
+    }
+
     /// Source pixels of a layer in layer space (before masks/effects).
     pub(crate) fn source(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Buf> {
         let s = self.opts.scale;
@@ -101,12 +112,7 @@ impl<'a> Renderer<'a> {
                 // values.
                 let ov = essential_overrides(ctx, layer);
                 let tmp = if ov.is_empty() { None } else { effectcraft_project::essential::with_overrides(self.project, *item, &ov) };
-                // Preserve resolution when nested: drawn at full size even when this comp renders
-                // smaller (the buffer's scale places it).
-                let full = s < 1.0 && self.project.comp(*item).is_some_and(|nc| nc.preserve_resolution);
-                let bs = if full { 1.0 } else { s };
-                let base = self.nested_through(layer);
-                let base = Renderer { opts: RenderOpts { scale: bs, ..base.opts }, ..base };
+                let (base, bs) = self.precomp_renderer(layer, *item);
                 let sub = match &tmp {
                     Some(p) => Renderer { project: p, ..base },
                     None => base,
