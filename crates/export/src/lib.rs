@@ -178,7 +178,9 @@ pub fn export(job: &Job, progress: &mut dyn FnMut(&Progress) -> bool) -> Result<
 /// batches as in [`export`].
 pub async fn export_async(job: &Job<'_>, progress: &mut dyn FnMut(&Progress) -> bool) -> Result<Report> {
     let t0 = Instant::now();
-    let cx = Cx::new(job);
+    // Another output module of the same Render Queue item renders the same frames: continue
+    // from its layer cache (see `pipeline::Warm`).
+    let cx = Cx::resume(job);
     let mut r = export_with(&cx, progress, t0).await;
     if matches!(r, Err(ExportError::Cancelled)) {
         cx.remove_cancelled_outputs()?;
@@ -188,6 +190,11 @@ pub async fn export_async(job: &Job<'_>, progress: &mut dyn FnMut(&Progress) -> 
     if let Ok(rep) = &mut r {
         rep.log = log;
         rep.overflow = cx.overflowed.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    }
+    // A finished job leaves its layer cache for the next module; a failed or cancelled one
+    // (the item stops there) drops it.
+    if r.is_ok() {
+        cx.keep_warm();
     }
     r
 }
