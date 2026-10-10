@@ -196,9 +196,9 @@ pub fn glow_operation(ctx: &EffectCtx) -> effectcraft_color::BlendMode {
 
 /// Glow's Arbitrary Map: red, green and blue curves of the glow brightness, as Curves point
 /// lists `x,y …` separated by `|` (an empty or missing curve is the identity).
-fn glow_map(s: &str) -> Vec<Option<crate::Curve>> {
+fn glow_map(s: &str) -> [Option<crate::Curve>; 3] {
     let mut parts = s.split('|');
-    (0..3).map(|_| parts.next().and_then(crate::Curve::parse)).collect()
+    [(); 3].map(|_| parts.next().and_then(crate::Curve::parse))
 }
 
 fn glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
@@ -250,8 +250,7 @@ fn glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
             let v = px[3].clamp(0.0, 1.0);
             let c = if let Some(map) = &arbitrary {
                 let t = glow_ab_t(v, looping, loops, phase, mid);
-                let c = map.iter().map(|cv| cv.as_ref().map_or(t, |cv| cv.eval(t))).collect::<Vec<f32>>();
-                [c.first().copied().unwrap_or(t), c.get(1).copied().unwrap_or(t), c.get(2).copied().unwrap_or(t)]
+                map.each_ref().map(|cv| cv.as_ref().map_or(t, |cv| cv.eval(t)))
             } else {
                 let t = glow_ab_position(v, looping, loops, phase, mid);
                 [ca[0] + (cb[0] - ca[0]) * t, ca[1] + (cb[1] - ca[1]) * t, ca[2] + (cb[2] - ca[2]) * t]
@@ -1844,5 +1843,20 @@ mod tests {
         // The widest Gaussian's three boxes reach ~3.6 sigma (~580 px here); past that the
         // full-frame blur only left a 1e-10 running-sum residue.
         assert!(wide.img.get(2107, 1607)[0] > 1e-6, "the 1603 px glow reaches 500 px from its source");
+    }
+
+    #[test]
+    fn glow_map_array_matches_collected_vec() {
+        for spec in ["", "0,1 1,1|0,0 1,0|0,0 1,0", "0,0 0.5,0.8 1,1|0,1 1,0|", "|0,0 0.3,0.9 1,0.2", "a|b|c|d"] {
+            let map = glow_map(spec);
+            for k in 0..=1000 {
+                let t = k as f32 / 1000.0;
+                // The per-pixel Vec this replaced.
+                let c = map.iter().map(|cv| cv.as_ref().map_or(t, |cv| cv.eval(t))).collect::<Vec<f32>>();
+                let old = [c.first().copied().unwrap_or(t), c.get(1).copied().unwrap_or(t), c.get(2).copied().unwrap_or(t)];
+                let new = map.each_ref().map(|cv| cv.as_ref().map_or(t, |cv| cv.eval(t)));
+                assert_eq!(old.map(f32::to_bits), new.map(f32::to_bits), "{spec} {t}");
+            }
+        }
     }
 }
