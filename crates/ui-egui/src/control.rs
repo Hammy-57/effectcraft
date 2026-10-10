@@ -159,7 +159,7 @@ fn task_ids(app: &EffectcraftApp) -> Vec<String> {
 /// Commands that block with `wait` (and its default).
 fn waits(command: &str, params: &Value) -> bool {
     // Frame renders and contact sheets too, so one agent's render never holds up the others.
-    let default = matches!(command, "renderQueue.render" | "render.frame" | "render.contactSheet");
+    let default = matches!(command, "renderQueue.render" | "render.frame" | "render.contactSheet" | "file.importProject");
     params.get("wait").and_then(Value::as_bool).unwrap_or(default)
 }
 

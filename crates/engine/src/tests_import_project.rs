@@ -158,3 +158,32 @@ fn import_project_rejects_bad_files_and_leaves_the_project() {
     assert!(e.to_string().contains("out of range"), "{e}");
     assert_eq!(t.project.items.len(), before);
 }
+
+/// Multi-agent fairness: `wait: false` reads a (big) project on a background thread and merges it
+/// on the session's thread when done, with the blocking import's result and one undo step.
+#[test]
+fn import_project_in_the_background_matches_the_blocking_import() {
+    let dir = out_dir("import-project-background");
+    let path = source_project(&dir);
+    let mut blocking = Session::default();
+    blocking.execute("comp.new", json!({"name": "Host"})).unwrap();
+    let expected = blocking.execute("file.importProject", json!({"path": path})).unwrap();
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "Host"})).unwrap();
+    let started = s.execute("file.importProject", json!({"path": path, "wait": false})).unwrap();
+    let job = started["job"].as_str().unwrap().to_string();
+    s.wait_jobs();
+    let rec = s.job_log.iter().find(|r| r.id == job).unwrap();
+    assert_eq!(rec.status, "done", "{}", rec.message);
+    assert_eq!(rec.result, expected);
+    assert_eq!(s.project.items.len(), blocking.project.items.len());
+    // A file that isn't a project fails the task, leaving the project as it was.
+    let bad = dir.join("bad.ecproj");
+    std::fs::write(&bad, "not json").unwrap();
+    let before = s.project.items.len();
+    let started = s.execute("file.importProject", json!({"path": bad.to_string_lossy(), "wait": false})).unwrap();
+    let job = started["job"].as_str().unwrap().to_string();
+    s.wait_jobs();
+    assert_eq!(s.job_log.iter().find(|r| r.id == job).unwrap().status, "failed");
+    assert_eq!(s.project.items.len(), before);
+}

@@ -24,7 +24,8 @@ window's status bar and on stderr: give each app its own port, and point its MCP
   reply after the synthetic input has been processed. Methods that need an element that isn't drawn
   yet are retried for a few frames. A command that waits for a background job (`wait: true` on
   `renderQueue.render`, the analyses, `footage.check`, Content-Aware Fill, Scene Edit Detection;
-  `jobs.wait`, and `render.frame` / `render.contactSheet`, which render on a copy of the project)
+  `jobs.wait`, `render.frame` / `render.contactSheet`, which render on a copy of the project, and
+  `file.importProject`, which reads the file in the background)
   starts the job and replies when it ends, with the same result as the blocking
   command: the UI keeps drawing and other connections' requests run meanwhile. A request times
   out after 60 s. If the app hadn't started it
