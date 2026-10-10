@@ -35,8 +35,16 @@
 //! the in-flight render) admits it to the cache proper. A key rendered again after its probation
 //! entry left the window (a busy frame flushed it, a RAM-preview loop came round) is remembered
 //! by a bounded doorkeeper of recently rendered keys and admitted straight away.
+//!
+//! The window follows the frame: two frames' worth of pixels once the renderer has said how big
+//! its frames are ([`LayerCache::begin_frame`]), so a Half-resolution render keeps a quarter of
+//! what a Full one does. A buffer whose key changes every frame (an animated precomp,
+//! [`LayerCache::insert_once`]) could only be reused within its frame (a precomp nested in one
+//! used several times), which saves less than holding it costs: it isn't kept, unless it is
+//! rendered again after the frame that first rendered it finished (scrubbing back, playing
+//! again), when the doorkeeper admits it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, PoisonError, RwLock, Weak};
 
@@ -99,31 +107,38 @@ struct Inner {
     probation_bytes: usize,
     /// Keys rendered recently (admission, see the module docs).
     seen: Doorkeeper,
+    /// Bytes of the frames being rendered (`f32` RGBA; 0 until [`LayerCache::begin_frame`]).
+    frame_bytes: usize,
+    /// Frames begun so far ([`LayerCache::begin_frame`]).
+    frames: u64,
+    /// The frames being rendered (their numbers, see [`FrameMark`]).
+    active: std::collections::BTreeSet<u64>,
 }
 
 /// Keys per doorkeeper generation: two generations are kept, so the last 16–32k rendered keys
-/// are remembered (a few hundred KB).
+/// are remembered (about a megabyte).
 const DOOR_GEN: usize = 16 * 1024;
 
-/// A bounded set of recently rendered keys: two generations, the older dropped when the newer
-/// fills (a cheap approximation of least recently seen).
+/// A bounded map of recently rendered keys to the frame that last rendered them (see
+/// [`LayerCache::begin_frame`]): two generations, the older dropped when the newer fills (a cheap
+/// approximation of least recently seen).
 #[derive(Default)]
 struct Doorkeeper {
-    cur: HashSet<u64>,
-    old: HashSet<u64>,
+    cur: HashMap<u64, u64>,
+    old: HashMap<u64, u64>,
 }
 
 impl Doorkeeper {
-    /// Note a render of `key`; whether it was rendered before.
-    fn saw(&mut self, key: u64) -> bool {
-        if self.cur.contains(&key) {
-            return true;
+    /// Note a render of `key` in `frame`; the frame that rendered it before, if one did.
+    fn saw(&mut self, key: u64, frame: u64) -> Option<u64> {
+        if let Some(f) = self.cur.get_mut(&key) {
+            return Some(std::mem::replace(f, frame));
         }
-        let before = self.old.contains(&key);
+        let before = self.old.get(&key).copied();
         if self.cur.len() >= DOOR_GEN {
             self.old = std::mem::take(&mut self.cur);
         }
-        self.cur.insert(key);
+        self.cur.insert(key, frame);
         before
     }
 
@@ -163,6 +178,9 @@ impl LayerCache {
                 missed_at: HashMap::new(),
                 probation_bytes: 0,
                 seen: Doorkeeper::default(),
+                frame_bytes: 0,
+                frames: 0,
+                active: std::collections::BTreeSet::new(),
             }),
             disk: Mutex::new(None),
             store: Mutex::new(None),
@@ -281,11 +299,29 @@ impl LayerCache {
     }
 
     pub fn insert(&self, key: u64, buf: Arc<Buf>) {
+        self.insert_with(key, buf, false);
+    }
+
+    /// [`Self::insert`] for a buffer whose key changes every frame (an animated precomp): kept
+    /// only when it is rendered again after the frame that first rendered it (see the module
+    /// docs).
+    pub(crate) fn insert_once(&self, key: u64, buf: Arc<Buf>) {
+        self.insert_with(key, buf, true);
+    }
+
+    fn insert_with(&self, key: u64, buf: Arc<Buf>, once: bool) {
         if self.gated() {
             return;
         }
         let (started, again) = match self.inner.lock() {
-            Ok(mut g) => (g.missed_at.remove(&key), g.seen.saw(key)),
+            Ok(mut g) => {
+                let g = &mut *g;
+                let seen = g.seen.saw(key, g.frames);
+                // (A buffer of one frame is seen again later when every frame rendering then
+                // has finished.)
+                let again = if once { seen.is_some_and(|f| g.active.first().is_none_or(|oldest| *oldest > f)) } else { seen.is_some() };
+                (g.missed_at.remove(&key), again)
+            }
             Err(_) => return,
         };
         if let Some((dc, dk)) = self.disk_key(key) {
@@ -294,7 +330,9 @@ impl LayerCache {
                 dc.put_layer(dk, &buf);
             }
         }
-        self.insert_mem(key, buf, again);
+        if again || !once {
+            self.insert_mem(key, buf, again);
+        }
     }
 
     /// Keep `buf` under `key`: in the cache proper when `admit`, else on probation (see the
@@ -320,16 +358,33 @@ impl LayerCache {
             g.bytes += bytes;
             if probation {
                 g.probation_bytes += bytes;
-                trim_probation(&mut g, key);
+                trim_probation(&mut g, Some(key));
             }
         }
         self.relieve();
     }
 
     /// Bytes of first renders kept on probation, at most (the newest is kept whatever its size,
-    /// so a big precomp used twice in a row still hits): 1/16 of the budget, at most 128 MB.
+    /// so a big precomp used twice in a row still hits): two frames' worth (see
+    /// [`Self::begin_frame`]) but at least 16 MB, and at most 1/16 of the budget and 128 MB.
     pub fn window(&self) -> usize {
-        self.inner.lock().map(|g| window_of(g.budget)).unwrap_or(0)
+        self.inner.lock().map(|g| window_of(g.budget, g.frame_bytes)).unwrap_or(0)
+    }
+
+    /// The renderer starts a `width × height` top-level frame, which lasts while the returned
+    /// mark lives. The probation window follows the latest frame's size (a smaller one trims
+    /// what is on probation now), and [`Self::insert_once`] tells a later frame from this one.
+    pub(crate) fn begin_frame(&self, width: u32, height: u32) -> FrameMark<'_> {
+        let bytes = (width as usize).saturating_mul(height as usize).saturating_mul(std::mem::size_of::<effectcraft_raster::Px>());
+        let Ok(mut g) = self.inner.lock() else { return FrameMark { cache: self, frame: None } };
+        g.frames = g.frames.wrapping_add(1);
+        let frame = g.frames;
+        g.active.insert(frame);
+        if g.frame_bytes != bytes {
+            g.frame_bytes = bytes;
+            trim_probation(&mut g, None);
+        }
+        FrameMark { cache: self, frame: Some(frame) }
     }
 
     /// A packed entry's pixels as `f32`: unpacked (outside the lock) and kept unpacked, as it is
@@ -508,6 +563,21 @@ impl LayerCache {
     }
 }
 
+/// A top-level frame being rendered ([`LayerCache::begin_frame`]): ends when dropped.
+pub(crate) struct FrameMark<'c> {
+    cache: &'c LayerCache,
+    frame: Option<u64>,
+}
+
+impl Drop for FrameMark<'_> {
+    fn drop(&mut self) {
+        if let Some(f) = self.frame {
+            let mut g = self.cache.inner.lock().unwrap_or_else(PoisonError::into_inner);
+            g.active.remove(&f);
+        }
+    }
+}
+
 /// How long a waiter on a rayon worker waits for another thread's render (see
 /// [`LayerCache::claim`]).
 const WAIT_POOL: std::time::Duration = std::time::Duration::from_secs(2);
@@ -594,18 +664,24 @@ fn remove(g: &mut Inner, key: u64) {
     }
 }
 
+/// Frames' worth of pixels the probation window holds (see [`LayerCache::window`]).
+const WINDOW_FRAMES: usize = 2;
+/// The probation window is at least this big (small frames whose layers reach past them).
+const WINDOW_MIN: usize = 16 << 20;
+
 /// See [`LayerCache::window`].
-fn window_of(budget: usize) -> usize {
-    (budget / 16).min(128 << 20)
+fn window_of(budget: usize, frame_bytes: usize) -> usize {
+    let most = (budget / 16).min(128 << 20);
+    if frame_bytes == 0 { most } else { most.min(frame_bytes.saturating_mul(WINDOW_FRAMES).max(WINDOW_MIN)) }
 }
 
-/// Drop the oldest entries on probation (never `newest`) until they fit the window.
-fn trim_probation(g: &mut Inner, newest: u64) {
-    let window = window_of(g.budget);
+/// Drop the least recently used entries on probation (never `newest`) until they fit the window.
+fn trim_probation(g: &mut Inner, newest: Option<u64>) {
+    let window = window_of(g.budget, g.frame_bytes);
     if g.probation_bytes <= window {
         return;
     }
-    let mut by_age: Vec<(u64, u64)> = g.map.iter().filter(|(k, e)| e.probation && **k != newest).map(|(k, e)| (e.last_use, *k)).collect();
+    let mut by_age: Vec<(u64, u64)> = g.map.iter().filter(|(k, e)| e.probation && Some(**k) != newest).map(|(k, e)| (e.last_use, *k)).collect();
     by_age.sort_unstable();
     for (_, k) in by_age {
         if g.probation_bytes <= window {
@@ -1062,6 +1138,13 @@ pub(crate) fn layer_info(comp: &Comp, layer: &Layer) -> LayerInfo {
         Some(arc) => layer_info_arc(arc),
         None => LayerInfo::of(layer),
     }
+}
+
+/// Whether `layer`'s content (masks, effects, source settings) has keyframes or expressions or
+/// reads the clock: its key changes over time.
+pub(crate) fn content_animated(comp: &Comp, layer: &Layer) -> bool {
+    let i = layer_info(comp, layer);
+    i.content_animated || i.content_expressions || i.time_dependent || i.reads_other_times
 }
 
 /// [`layer_info`] of a shared layer.
