@@ -68,7 +68,6 @@ const READ_ONLY: &[&str] = &[
     "list_commands",
     "describe_command",
     "doc_inspect",
-    "render_preview",
     "get_project",
     "get_comp",
     "get_layer",
@@ -81,7 +80,18 @@ const READ_ONLY: &[&str] = &[
     "get_layout",
 ];
 /// Tools that write files without changing the project.
-const WRITES_FILES: &[&str] = &["save_project", "render_frame", "screenshot", "analyze_audio"];
+const WRITES_FILES: &[&str] = &["save_project", "render_frame", "render_preview", "screenshot", "analyze_audio"];
+
+/// Older tool names kept callable but left out of `tools/list` (`mcp --all-tools` lists them):
+/// (alias, canonical tool). The canonical one takes every argument the alias does, except
+/// `execute_command`'s `command` key (`command_run` takes `id`).
+pub const HIDDEN_ALIASES: &[(&str, &str)] =
+    &[("list_commands", "command_list"), ("execute_command", "command_run"), ("get_project", "doc_inspect"), ("render_frame", "render_preview")];
+
+/// The canonical tool a hidden alias stands for.
+pub fn alias_of(name: &str) -> Option<&'static str> {
+    HIDDEN_ALIASES.iter().find(|(alias, _)| *alias == name).map(|(_, canonical)| *canonical)
+}
 
 /// Whether a tool can change the project (anything but queries and file writers).
 pub fn may_edit(name: &str) -> bool {
@@ -649,7 +659,7 @@ fn control(b: &mut Backend, a: &Value) -> Result<Reply> {
 static TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "list_commands",
-        description: "List engine commands: id, label, menu path, shortcut, `params` doc (e.g. `{name?, width?, height?, frameRate?, duration? (s)}`) and whether it can run now (`why` if not). Every menu item, shortcut and panel gesture maps to one of these ids; run them with execute_command. Narrow with `filter` (e.g. `layer.new`, `keys`, `effect`).",
+        description: "List engine commands: id, label, menu path, shortcut, `params` doc (e.g. `{name?, width?, height?, frameRate?, duration? (s)}`) and whether it can run now (`why` if not). Every menu item, shortcut and panel gesture maps to one of these ids; run them with command_run. Narrow with `filter` (e.g. `layer.new`, `keys`, `effect`).",
         bridge_only: false,
         schema: || {
             schema(
@@ -665,7 +675,7 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "describe_command",
-        description: "One command in full: id, label, menu path, shortcut, the `params` doc, a JSON Schema of its parameters (`schema`: properties, required, additionalProperties) and whether it can run now (`why` if not). Use before execute_command when unsure of the parameters; execute_command rejects unknown keys.",
+        description: "One command in full: id, label, menu path, shortcut, the `params` doc, a JSON Schema of its parameters (`schema`: properties, required, additionalProperties) and whether it can run now (`why` if not). Use before command_run when unsure of the parameters; command_run rejects unknown keys.",
         bridge_only: false,
         schema: || {
             schema(
@@ -682,9 +692,9 @@ static TOOLS: &[ToolDef] = &[
         schema: || {
             schema(
                 json!({
-                    "command": {"type": "string", "description": "Command id, e.g. `comp.new`, `layer.newText`, `effect.apply` (see list_commands)."},
+                    "command": {"type": "string", "description": "Command id, e.g. `comp.new`, `layer.newText`, `effect.apply` (see command_list)."},
                     "id": {"type": "string", "description": "Alias of `command`."},
-                    "params": {"type": "object", "description": "Command parameters as documented by list_commands.", "additionalProperties": true}
+                    "params": {"type": "object", "description": "Command parameters as documented by command_list.", "additionalProperties": true}
                 }),
                 &[],
             )
@@ -1061,7 +1071,7 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "command_list",
-        description: "List engine commands: id, label, menu path, shortcut, `params` doc (e.g. `{name?, width?, height?, frameRate?, duration? (s)}`) and whether it can run now (`why` if not). Every menu item, shortcut and panel gesture maps to one of these ids; run them with execute_command. Narrow with `filter` (e.g. `layer.new`, `keys`, `effect`).",
+        description: "List engine commands: id, label, menu path, shortcut, `params` doc (e.g. `{name?, width?, height?, frameRate?, duration? (s)}`) and whether it can run now (`why` if not). Every menu item, shortcut and panel gesture maps to one of these ids; run them with command_run. Narrow with `filter` (e.g. `layer.new`, `keys`, `effect`).",
         bridge_only: false,
         schema: || {
             schema(
@@ -1082,8 +1092,8 @@ static TOOLS: &[ToolDef] = &[
         schema: || {
             schema(
                 json!({
-                    "id": {"type": "string", "description": "Command id, e.g. `comp.new`, `layer.newText`, `effect.apply` (see list_commands)."},
-                    "params": {"type": "object", "description": "Command parameters as documented by list_commands.", "additionalProperties": true}
+                    "id": {"type": "string", "description": "Command id, e.g. `comp.new`, `layer.newText`, `effect.apply` (see command_list)."},
+                    "params": {"type": "object", "description": "Command parameters as documented by command_list.", "additionalProperties": true}
                 }),
                 &["id"],
             )
@@ -1092,7 +1102,7 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "render_preview",
-        description: "Render a composition frame (default: the active comp at the current time) and return it as a PNG image, longest side `max_side` (default 960, 0 = full size). Use it to check your work.",
+        description: "Render a composition frame (default: the active comp at the current time, in comp seconds) and return it as a PNG image, longest side `max_side` (default 960, 0 = full size). `path` also writes the PNG to disk; `inline: false` returns only the metadata. Use it to check your work.",
         bridge_only: false,
         schema: || {
             schema(
@@ -1100,6 +1110,8 @@ static TOOLS: &[ToolDef] = &[
                     "comp": comp_s(),
                     "time": {"type": "number", "description": "Comp time in seconds (default: current time)."},
                     "max_side": {"type": "integer", "description": "Longest side in pixels (default 960; 0 = full comp size)."},
+                    "path": {"type": "string", "description": "Also write the PNG here."},
+                    "inline": {"type": "boolean", "description": "Include the image in the reply (default true)."},
                     "transparent": {"type": "boolean", "description": "Keep the frame's alpha (RGBA PNG, as an RGB + Alpha render writes it) instead of compositing over the comp's background colour."}
                 }),
                 &[],

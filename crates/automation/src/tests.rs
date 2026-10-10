@@ -74,16 +74,16 @@ fn initialize_and_list_tools() {
     let tools = rpc(&mut s, 4, "tools/list", json!({}))["tools"].as_array().unwrap().clone();
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     for want in [
-        "list_commands",
-        "execute_command",
+        "command_list",
+        "command_run",
         "run_script",
-        "get_project",
+        "doc_inspect",
         "get_comp",
         "get_layer",
         "get_property",
         "set_property",
         "add_keyframe",
-        "render_frame",
+        "render_preview",
         "open_project",
         "save_project",
         "undo",
@@ -586,19 +586,18 @@ fn puppet_rigging_over_mcp() {
 }
 
 /// The agent-interface audit (MCP side): every registered engine command is listed by
-/// `list_commands` with a label, params doc and JSON Schema, described by `describe_command`,
-/// and routed by `execute_command` (an unknown parameter is rejected by that very command
+/// `command_list` with a label, params doc and JSON Schema, described by `describe_command`,
+/// and routed by `command_run` (an unknown parameter is rejected by that very command
 /// without running it).
 #[test]
 fn every_engine_command_is_reachable_over_mcp() {
     let mut s = server();
     let tools = rpc(&mut s, 1, "tools/list", json!({}))["tools"].as_array().unwrap().clone();
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-    for want in ["list_commands", "describe_command", "execute_command", "add_effect", "list_effects", "get_state", "render_frame", "get_layer", "set_property"]
-    {
+    for want in ["command_list", "describe_command", "command_run", "add_effect", "list_effects", "get_state", "render_preview", "get_layer", "set_property"] {
         assert!(names.contains(&want), "{want}");
     }
-    let listed = call_json(&mut s, "list_commands", json!({"schemas": true}));
+    let listed = call_json(&mut s, "command_list", json!({"schemas": true}));
     let listed: std::collections::HashMap<&str, &Value> = listed.as_array().unwrap().iter().map(|c| (c["id"].as_str().unwrap(), c)).collect();
     let specs = effectcraft_engine::command_specs();
     assert_eq!(listed.len(), specs.len());
@@ -610,7 +609,7 @@ fn every_engine_command_is_reachable_over_mcp() {
         assert!(c["schema"]["properties"].is_object(), "{}", spec.id);
         let d = call_json(&mut s, "describe_command", json!({"command": spec.id}));
         assert_eq!(d["schema"], c["schema"], "{}", spec.id);
-        let (content, err) = call(&mut s, "execute_command", json!({"command": spec.id, "params": {"__audit": 1}}));
+        let (content, err) = call(&mut s, "command_run", json!({"id": spec.id, "params": {"__audit": 1}}));
         let text = content[0]["text"].as_str().unwrap_or_default();
         assert!(err && text.contains("unknown parameter") && text.contains(spec.id), "{}: {text}", spec.id);
     }
@@ -1381,6 +1380,51 @@ fn prompts_list_and_get() {
     assert!(rpc(&mut s, 2, "prompts/list", json!({}))["prompts"][0].get("title").is_none());
 }
 
+/// The older duplicate tool names are left out of tools/list (unless `with_all_tools`), stay
+/// callable with their own arguments, and the canonical tools take everything they did.
+#[test]
+fn hidden_aliases_are_callable_but_not_listed() {
+    let names = |s: &mut McpServer| -> Vec<String> {
+        rpc(s, 1, "tools/list", json!({}))["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect()
+    };
+    let mut s = server();
+    let listed = names(&mut s);
+    for (alias, canonical) in crate::tools::HIDDEN_ALIASES {
+        assert!(!listed.iter().any(|n| n == alias), "{alias} is listed");
+        assert!(listed.iter().any(|n| n == canonical), "{canonical} is missing");
+        // The canonical tool accepts every argument of the alias (except execute_command's `command`).
+        let schema = |n: &str| crate::tools::find(n).unwrap().input_schema();
+        let (a, c) = (schema(alias), schema(canonical));
+        for k in a["properties"].as_object().unwrap().keys().filter(|k| *k != "command") {
+            assert!(c["properties"].get(k).is_some(), "{canonical} lacks `{k}` of {alias}");
+        }
+    }
+    call_json(&mut s, "execute_command", json!({"command": "comp.new", "params": {"name": "Alias", "width": 32, "height": 16}}));
+    assert!(call_json(&mut s, "list_commands", json!({"filter": "comp.new"})).as_array().unwrap().iter().any(|c| c["id"] == "comp.new"));
+    assert_eq!(call_json(&mut s, "get_project", json!({}))["items"], call_json(&mut s, "doc_inspect", json!({}))["project"]["items"]);
+    let (c, err) = call(&mut s, "render_frame", json!({"max_side": 16}));
+    assert!(!err && c[0]["type"] == "image", "{c:?}");
+    // render_preview took over render_frame's `path` and `inline`.
+    let png = std::env::temp_dir().join(format!("ec-alias-{}.png", std::process::id()));
+    let info = call_json(&mut s, "render_preview", json!({"max_side": 16, "inline": false, "path": png.to_string_lossy()}));
+    assert_eq!((info["width"].as_u64(), info["height"].as_u64()), (Some(16), Some(8)));
+    assert_eq!(png_size(&std::fs::read(&png).unwrap()), Some((16, 8)));
+    let _ = std::fs::remove_file(png);
+
+    let mut s = server().with_all_tools(true);
+    let tools = rpc(&mut s, 1, "tools/list", json!({}))["tools"].as_array().unwrap().clone();
+    for (alias, canonical) in crate::tools::HIDDEN_ALIASES {
+        let t = tools.iter().find(|t| t["name"] == *alias).unwrap_or_else(|| panic!("{alias} not listed with --all-tools"));
+        assert!(t["description"].as_str().unwrap().starts_with(&format!("Alias of {canonical}")), "{t}");
+    }
+    // The server's instructions name only canonical tools.
+    let init = rpc(&mut s, 2, "initialize", json!({"protocolVersion": "2025-06-18"}));
+    let text = init["instructions"].as_str().unwrap();
+    for (alias, _) in crate::tools::HIDDEN_ALIASES {
+        assert!(!text.contains(alias), "instructions mention {alias}");
+    }
+}
+
 /// The `uri`s of queued `notifications/resources/updated`.
 fn updated(s: &mut McpServer) -> Vec<String> {
     s.take_notifications()
@@ -1582,7 +1626,7 @@ fn structured_content_is_version_gated_and_matches_output_schemas() {
         ("get_state", json!({})),
         ("doc_inspect", json!({})),
         ("render_preview", json!({"max_side": 16})),
-        ("render_frame", json!({"max_side": 16, "inline": false, "path": png})),
+        ("render_preview", json!({"max_side": 16, "inline": false, "path": png})),
         ("undo", json!({})),
         ("redo", json!({})),
         ("history", json!({})),

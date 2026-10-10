@@ -140,8 +140,8 @@ const MAX_TOASTS: usize = 100;
 
 fn no_comp(comp: Option<&Value>) -> Error {
     match comp.filter(|c| !c.is_null()) {
-        Some(c) => Error::BadArgs(format!("no composition {c} (see get_project)")),
-        None => Error::BadArgs("no active composition: create one (execute_command comp.new) or open a project".into()),
+        Some(c) => Error::BadArgs(format!("no composition {c} (see doc_inspect)")),
+        None => Error::BadArgs("no active composition: create one (command_run comp.new) or open a project".into()),
     }
 }
 
