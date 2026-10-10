@@ -574,3 +574,30 @@ fn graph_transform_box_scales_key_times_and_values() {
     assert_eq!(p.keys[1].value.as_f64(), 50.0);
     assert!(s.execute("keys.transform", json!({"timeScale": 0})).is_err());
 }
+
+#[test]
+fn insert_spatial_uses_exact_layer_time_preserves_motion_and_undoes() {
+    let mut s = comp();
+    let lid = animated_position(&mut s);
+    let cid = s.active_comp_id().unwrap();
+    let l = std::sync::Arc::make_mut(&mut s.project).comp_mut(cid).unwrap().layer_mut(LayerId(lid)).unwrap();
+    l.start_time = Tick::from_seconds_f64(3.0);
+    l.stretch = 200.0;
+    let before = layer(&s, lid).props.prop("transform/position").unwrap().clone();
+    let exact = Tick::from_seconds_f64(0.4371);
+    s.execute("keys.insertSpatial", json!({"layer":lid,"path":"transform/position","time":exact.seconds()})).unwrap();
+    let after = layer(&s, lid).props.prop("transform/position").unwrap().clone();
+    assert_eq!(after.keys.len(), 4);
+    assert_eq!(after.keys[1].time, exact);
+    assert_eq!(s.state.selected_keys[0].time, exact);
+    for n in 0..=200 {
+        let t = Tick::from_seconds_f64(n as f64 / 100.0);
+        let a = before.value_at(t).as_vec3();
+        let b = after.value_at(t).as_vec3();
+        assert!(a.iter().zip(b).all(|(a, b)| (a - b).abs() < 0.05));
+    }
+    assert!(s.execute("keys.insertSpatial", json!({"layer":lid,"path":"transform/position","time":exact.seconds()})).is_err());
+    assert_eq!(layer(&s, lid).props.prop("transform/position").unwrap().keys, after.keys);
+    s.undo();
+    assert_eq!(layer(&s, lid).props.prop("transform/position").unwrap().keys, before.keys);
+}

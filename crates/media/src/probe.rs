@@ -161,6 +161,9 @@ pub fn probe_bytes(path: &str, bytes: Arc<[u8]>) -> Result<Footage> {
         return probe_model(path, &bytes, &|_| None);
     }
     if let Ok(fmt) = image::guess_format(&bytes) {
+        if fmt == image::ImageFormat::Gif {
+            return crate::gif::probe(path, &bytes);
+        }
         return probe_still_bytes(path, &bytes, fmt);
     }
     let name = Path::new(path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.to_string());

@@ -1,0 +1,12 @@
+// #647: native preview workers nested unlimited urgent renders while dragging this layer.
+// Replay these edits with the Composition viewer open; command-only replay does not run the
+// frame workers. frames::tests::dragging_keeps_only_one_running_viewer_render checks admission.
+{"start":"new","note":"Native viewer drag memory reproducer; no external asset required"}
+{"command":"comp.new","params":{"name":"Drag preview memory","width":3840,"height":2160,"frameRate":30,"duration":10}}
+{"command":"layer.newSolid","params":{"name":"Image substitute","width":3840,"height":2160,"color":"#4080ff"}}
+{"command":"prop.set","params":{"path":"transform/position","value":[1800,1000],"merge":"drag"}}
+{"command":"prop.set","params":{"path":"transform/position","value":[2100,1200],"merge":"drag"}}
+{"command":"prop.set","params":{"path":"transform/position","value":[1600,900],"merge":"drag"}}
+{"command":"prop.set","params":{"path":"transform/position","value":[2300,1300],"merge":"drag"}}
+{"command":"prop.set","params":{"path":"transform/position","value":[1920,1080],"merge":"drag"}}
+{"expect_no_error":true}

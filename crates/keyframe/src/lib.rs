@@ -10,6 +10,9 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+mod spatial_insert;
+pub use spatial_insert::insert_spatial;
+
 pub mod text_doc;
 pub mod value;
 
@@ -454,11 +457,14 @@ impl SpatialSeg {
         if len <= 0.0 {
             return self.p[0];
         }
-        let s = s.clamp(0.0, len);
+        Self::point(&self.p, self.parameter_at_length(s))
+    }
+    fn parameter_at_length(&self, s: f64) -> f64 {
+        let s = s.clamp(0.0, self.length());
         let i = self.table.partition_point(|&v| v < s).clamp(1, ARC_N);
         let (a, b) = (self.table.get(i - 1).copied().unwrap_or(0.0), self.table.get(i).copied().unwrap_or(0.0));
         let f = if b > a { (s - a) / (b - a) } else { 0.0 };
-        Self::point(&self.p, (i as f64 - 1.0 + f) / ARC_N as f64)
+        (i as f64 - 1.0 + f) / ARC_N as f64
     }
 }
 

@@ -200,3 +200,23 @@ fn zoomed_in_the_ruler_stops_at_the_comp_end_and_a_scrub_past_the_edge_scrolls()
     assert!(t2 < start, "the CTI moved left of the old view: {t2} vs {start}");
     assert!(t2 >= start2 - 1e-6 && t2 <= start2 + span2, "the CTI stays in view: {t2} in {start2}+{span2}");
 }
+
+#[test]
+fn command_plus_minus_zoom_the_focused_composition() {
+    use effectcraft_ui_egui::dock::PanelKind;
+    use egui::{Event, Key, Modifiers};
+    let mut h = harness(false);
+    h.state_mut().ui.focused = PanelKind::Composition;
+    h.state_mut().ui.viewer.zoom = Some(1.0);
+    for (key, want) in [(Key::Plus, 1.5), (Key::Minus, 1.0), (Key::Equals, 1.5)] {
+        h.input_mut().events.push(Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::COMMAND });
+        h.step();
+        h.input_mut().events.push(Event::Key { key, physical_key: None, pressed: false, repeat: false, modifiers: Modifiers::COMMAND });
+        h.step();
+        assert_eq!(h.state().ui.viewer.zoom, Some(want));
+    }
+    h.state_mut().ui.focused = PanelKind::Timeline;
+    h.input_mut().events.push(Event::Key { key: Key::Minus, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::COMMAND });
+    h.step();
+    assert_eq!(h.state().ui.viewer.zoom, Some(1.5), "viewer aliases are local to the composition panel");
+}

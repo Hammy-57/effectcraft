@@ -48,7 +48,9 @@ pub(crate) fn open(s: &mut Session, p: &Value) -> Result<Value> {
     let text = String::from_utf8(bytes).map_err(|_| EngineError::Other("not a text project file".into()))?;
     // XML copies (File ▸ Save a Copy As XML…) open like the JSON project.
     let text = if crate::xml_project::is_xml(&text) { crate::xml_project::from_xml(&text).map_err(EngineError::Other)? } else { text };
-    let proj = Project::from_json(&text).map_err(|e| EngineError::Other(format!("{path} is not a project EffectCraft can open: {e}")))?;
+    let mut proj = Project::from_json(&text).map_err(|e| EngineError::Other(format!("{path} is not a project EffectCraft can open: {e}")))?;
+    let dir = std::path::Path::new(path).parent().unwrap_or_else(|| std::path::Path::new("."));
+    super::import_project::resolve_footage(s, &mut proj, dir, false);
     // The comps open when it was saved reopen, in their tabs, at their times (as in After
     // Effects).
     let meta = effectcraft_project::file_meta(&text);

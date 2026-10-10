@@ -173,3 +173,26 @@ fn reproduced_fxc_pointwise_failure_returns_error_without_escaping_or_notifying_
     let _invalid = invalid_module(&device);
     assert_eq!(host.load(Ordering::SeqCst), 1);
 }
+
+/// The shipped Windows x64 configuration must compile the complete compositor on DX12.
+#[test]
+#[cfg(all(target_os = "windows", target_env = "msvc", target_arch = "x86_64"))]
+fn dx12_auto_compiler_builds_compositor_with_linked_dxc() {
+    let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+    desc.backends = wgpu::Backends::DX12;
+    // Do not force StaticDxc: exercise the same Auto selection as the desktop and CLI.
+    let Some((adapter, device, queue)) = native_device(desc, false) else { return };
+    let host = count_host_errors(&device);
+    let context = GpuContext::new(&adapter, device, queue).expect("DX12 with linked DXC compiles pointwise");
+    let image = effectcraft_raster::Image::filled(3, 2, [0.25, 0.5, 0.75, 1.0]);
+    let uploaded = context.upload_image(&image).unwrap();
+    let mut encoder = crate::context::Enc::new(&context);
+    let output = encoder.scratch(3, 2);
+    let mut params = crate::context::Params::default();
+    params.u[0][0] = 6; // Invert RGB, the kernel that FXC could not compile.
+    params.f[0][0] = 1.0;
+    encoder.pixels("pointwise", &params, &uploaded, None, &output, None);
+    let actual = encoder.download(&output).unwrap();
+    assert!(actual.data.iter().all(|pixel| *pixel == [0.75, 0.5, 0.25, 1.0]));
+    assert_eq!(host.load(Ordering::SeqCst), 0);
+}
