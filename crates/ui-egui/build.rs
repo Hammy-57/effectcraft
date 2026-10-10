@@ -1,5 +1,6 @@
 //! Self-registering modules (see `effectcraft-buildgen`): every `src/*.rs` and
-//! `src/panels/*.rs` file is a public module, so adding a panel module is adding a file.
+//! `src/panels/*.rs` file is a public module, so adding a panel module is adding a file; every
+//! `src/menus/*.rs` file is a UI command area module, registered when it defines `fn handlers()`.
 //!
 //! Also bakes the contributor credits into the binary as static Rust tables (craftrules
 //! standards/contributors.md). Nothing is read at run time.
@@ -18,7 +19,9 @@ use serde_json::Value;
 fn main() -> Result<(), String> {
     credits();
     effectcraft_buildgen::Modules::new("src", "src/lib.rs", "modules.rs").visibility("pub").generate()?;
-    effectcraft_buildgen::Modules::new("src/panels", "src/panels/mod.rs", "panels.rs").visibility("pub").generate()
+    effectcraft_buildgen::Modules::new("src/panels", "src/panels/mod.rs", "panels.rs").visibility("pub").generate()?;
+    // UI command area files: each defining `fn handlers()` is listed in `menus::AREAS`.
+    effectcraft_buildgen::Modules::new("src/menus", "src/menus.rs", "menus.rs").registry("AREAS", "handlers", "fn() -> &'static [dispatch::Handler]").generate()
 }
 
 fn credits() {
