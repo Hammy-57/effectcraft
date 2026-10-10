@@ -540,7 +540,14 @@ fn bridge_forwards_to_control_channel() {
     call_json(&mut s, "execute_command", json!({"command": "comp.new", "params": {"name": "B", "width": 64, "height": 64}}));
     assert_eq!(call_json(&mut s, "get_comp", json!({}))["name"], "B");
 
+    // Bridged agents run under their own name from `initialize` on (AN4), and a named agent
+    // renders through the engine command on its own cursor (the app's session: comp B).
+    assert!(s.backend().client().is_some());
     let (c, err) = call(&mut s, "render_frame", json!({}));
+    assert!(!err, "{c:?}");
+    assert_eq!(png_size(&base64::decode(c[0]["data"].as_str().unwrap()).unwrap()), Some((64, 64)));
+    // As the user (`"client": ""`), the render goes to the app's own `render.frame` method.
+    let (c, err) = call(&mut s, "render_frame", json!({"client": ""}));
     assert!(!err, "{c:?}");
     assert_eq!(png_size(&base64::decode(c[0]["data"].as_str().unwrap()).unwrap()), Some((4, 2)));
 
