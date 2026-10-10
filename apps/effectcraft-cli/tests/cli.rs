@@ -288,6 +288,9 @@ fn script_file_and_eval() {
 fn render_out_is_relative_to_the_working_directory() {
     let root = tmp("render-out");
     let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    // The CLI resolves against the canonical working directory (macOS: /var is /private/var).
+    let root = root.canonicalize().unwrap();
     let (proj, elsewhere) = (root.join("proj"), root.join("elsewhere"));
     std::fs::create_dir_all(&proj).unwrap();
     std::fs::create_dir_all(&elsewhere).unwrap();
