@@ -295,7 +295,7 @@ impl<'a> Renderer<'a> {
         // Text rasterisation is tight to the glyphs. Distortions and tilers need transparent
         // output pixels beyond that rectangle, on CPU and GPU alike (#659).
         if matches!(layer.source, LayerSource::Text) && !adjustment && stack.iter().any(|(_, _, spec)| text_needs_canvas(spec)) {
-            target.expand_canvas(layer_size);
+            target.cpu(&mut |buf| text_effect_canvas(buf, layer_size));
         }
         let accel = self.active_accel();
         let mut k = 0;
@@ -378,8 +378,8 @@ fn text_needs_canvas(spec: &effectcraft_effects::EffectSpec) -> bool {
 }
 
 /// Bounded extent and integer copy offset for extending a buffer to its effect canvas.
-/// Shared by CPU buffers and resident GPU textures; `None` means unchanged or over budget.
-pub fn effect_canvas_extent(dimensions: [u32; 2], offset: [f64; 2], scale: f64, size: [f64; 2]) -> Option<([u32; 2], [u32; 2])> {
+/// `None` means unchanged or over budget.
+fn effect_canvas_extent(dimensions: [u32; 2], offset: [f64; 2], scale: f64, size: [f64; 2]) -> Option<([u32; 2], [u32; 2])> {
     let lo = [offset[0].floor().min(0.0), offset[1].floor().min(0.0)];
     let hi = [
         (offset[0] + size[0] * scale).ceil().max(dimensions[0] as f64),
@@ -397,7 +397,7 @@ pub fn effect_canvas_extent(dimensions: [u32; 2], offset: [f64; 2], scale: f64, 
 }
 
 /// Extend without moving or resampling the original glyph pixels.
-pub(crate) fn text_effect_canvas(mut buf: Buf, size: [f64; 2]) -> Buf {
+fn text_effect_canvas(mut buf: Buf, size: [f64; 2]) -> Buf {
     let Some(([width, height], pad)) = effect_canvas_extent([buf.img.width, buf.img.height], buf.offset, buf.scale, size) else { return buf };
     let Some(count) = (width as usize).checked_mul(height as usize) else { return buf };
     let mut data = Vec::new();
