@@ -141,7 +141,7 @@ fn linear_blend_hits_skip_the_working_space_copy() {
     };
     let a = frame();
     let entries = cache.stats().entries;
-    assert_eq!(entries, 4, "two layers, each in the working and the blending space");
+    assert_eq!(entries, 2, "two layers, each in the blending space alone (nothing reads the working space)");
     let hits = cache.stats().hits;
     let b = frame();
     assert_eq!(cache.stats().hits, hits + 2, "one hit per layer");
