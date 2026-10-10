@@ -88,6 +88,50 @@ fn timeline_empty_outline_marquee_selects_layers() {
     drag(&mut h, pos2(area.min.x + 210.0, last.max.y + 25.0), pos2(area.min.x + 215.0, top.min.y + 2.0), Modifiers::NONE);
     assert_eq!(h.state().session.state.selected_layers, ids);
 }
+/// A plain click on empty track area (beside a layer's bar or below the last layer) deselects
+/// the layers, as in After Effects; Shift / Cmd keep the selection, a click on a bar selects
+/// its layer and a key marquee that catches nothing leaves nothing selected.
+#[test]
+fn timeline_click_on_empty_track_area_deselects_layers() {
+    let mut h = harness();
+    let ids: Vec<LayerId> = h.state().session.active_comp().unwrap().layers.iter().map(|l| l.id).collect();
+    let select = |h: &mut Harness<'_, EffectcraftApp>, layers: &[LayerId]| {
+        let layers: Vec<u64> = layers.iter().map(|l| l.0).collect();
+        h.state_mut().session.execute("layer.select", json!({"layers": layers})).unwrap();
+        h.run_steps(2);
+    };
+    h.state_mut().session.execute("layer.timing", json!({"layers": [ids[1].0], "in": 1.5, "out": 2.5})).unwrap();
+    select(&mut h, &ids[..2]);
+    let bar = rect(&h, &format!("timeline.layer.{}.bar", ids[1].0));
+    let before = pos2(bar.min.x - 30.0, bar.center().y);
+    let after = pos2(bar.max.x + 30.0, bar.center().y);
+    click(&mut h, before, Modifiers::NONE);
+    assert!(h.state().session.state.selected_layers.is_empty(), "a click beside the bar deselects");
+    click(&mut h, bar.center(), Modifiers::NONE);
+    assert_eq!(h.state().session.state.selected_layers, vec![ids[1]], "a click on the bar selects its layer");
+    click(&mut h, after, Modifiers::SHIFT);
+    assert_eq!(h.state().session.state.selected_layers, vec![ids[1]], "Shift-click on empty keeps the selection");
+    click(&mut h, after, Modifiers::COMMAND);
+    assert_eq!(h.state().session.state.selected_layers, vec![ids[1]], "Cmd-click on empty keeps the selection");
+    click(&mut h, after, Modifiers::NONE);
+    assert!(h.state().session.state.selected_layers.is_empty());
+    // Below the last layer, in the track area and in the outline.
+    let last = rect(&h, &format!("timeline.layer.{}.bar", ids[3].0));
+    select(&mut h, &ids);
+    click(&mut h, pos2(last.center().x, last.max.y + 30.0), Modifiers::NONE);
+    assert!(h.state().session.state.selected_layers.is_empty(), "a click below the last layer deselects");
+    let outline = rect(&h, "timeline.layerMarquee");
+    select(&mut h, &ids);
+    click(&mut h, pos2(outline.min.x + 210.0, last.max.y + 30.0), Modifiers::NONE);
+    assert!(h.state().session.state.selected_layers.is_empty(), "so does one below the layers in the outline");
+    // A key marquee over empty track area that catches nothing.
+    select(&mut h, &ids[1..2]);
+    drag(&mut h, after, pos2(after.x + 60.0, after.y + 4.0), Modifiers::NONE);
+    assert!(h.state().session.state.selected_layers.is_empty(), "an empty marquee leaves nothing selected");
+    select(&mut h, &ids[1..2]);
+    drag(&mut h, after, pos2(after.x + 60.0, after.y + 4.0), Modifiers::SHIFT);
+    assert_eq!(h.state().session.state.selected_layers, vec![ids[1]], "a Shift marquee keeps the selection");
+}
 #[test]
 fn project_clear_deletes_items_and_undo_restores_them() {
     let mut h = harness();
