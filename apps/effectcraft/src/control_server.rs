@@ -11,8 +11,11 @@
 //! `requestId` is answered from a small cache when the same id comes again (on any connection),
 //! so a retry never runs a command twice. `events.subscribe` makes the connection also receive
 //! `{"event": …}` lines when the project or selection changes.
+//!
+//! Composition claims (`comp.claim`) are released when the last connection that used their
+//! `client` closes, so an agent that goes away doesn't keep comps locked until the claims expire.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -38,6 +41,10 @@ const REPLY_CACHE: usize = 128;
 /// Larger replies (rendered frames, inspections) aren't kept: a retry runs again, which is
 /// harmless for the reads that return them.
 const MAX_CACHED_REPLY: usize = 256 * 1024;
+/// Distinct `client` names one connection is tracked for (their claims are released when it
+/// closes); longer names than the engine accepts aren't tracked.
+const MAX_CLIENTS_PER_CONNECTION: usize = 64;
+const MAX_CLIENT_LEN: usize = 128;
 /// Change events a connection can receive (`events.subscribe`).
 const EVENTS: [&str; 2] = ["project.changed", "selection.changed"];
 
@@ -53,7 +60,7 @@ pub fn start(port: u16, ctx: egui::Context, tx: Sender<ControlRequest>) -> Resul
     let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|e| bind_error(port, &e))?;
     let port = listener.local_addr().map(|a| a.port()).unwrap_or(port);
     let events = ControlEvents::default();
-    let shared = Shared { tx, ctx, events: events.clone(), replies: Arc::default(), timeout: REQUEST_TIMEOUT };
+    let shared = Shared { tx, ctx, events: events.clone(), replies: Arc::default(), clients: Arc::default(), timeout: REQUEST_TIMEOUT };
     std::thread::spawn(move || accept_loop(listener, shared));
     Ok(Started { events, port })
 }
@@ -74,6 +81,8 @@ struct Shared {
     ctx: egui::Context,
     events: ControlEvents,
     replies: Arc<Mutex<ReplyCache>>,
+    /// Open connections that sent each `client` name.
+    clients: Arc<Mutex<BTreeMap<String, usize>>>,
     timeout: Duration,
 }
 
@@ -100,9 +109,11 @@ fn serve(stream: TcpStream, shared: &Shared) {
     let out = SharedOut(Arc::new(Mutex::new(stream)));
     let closed = Arc::new(AtomicBool::new(false));
     let mut subscribed = false;
+    let mut used = BTreeSet::new();
     let events_out = out.clone();
     let events_closed = Arc::clone(&closed);
     serve_lines(read, out, |method, params, request_id| {
+        note_client(shared, &mut used, &method, &params);
         if method == "events.subscribe" {
             let (rx, revision) = shared.events.subscribe();
             if !subscribed {
@@ -115,6 +126,56 @@ fn serve(stream: TcpStream, shared: &Shared) {
     });
     closed.store(true, Ordering::SeqCst);
     let _ = closer.shutdown(std::net::Shutdown::Both);
+    release_clients(shared, used);
+}
+
+/// The `client` an engine request runs as (`engine.execute {command, params: {client}}`).
+fn request_client<'a>(method: &str, params: &'a Value) -> Option<&'a str> {
+    if !matches!(method, "engine.execute" | "ui.menu.invoke") {
+        return None;
+    }
+    params.get("params")?.get("client")?.as_str().filter(|c| !c.is_empty() && c.len() <= MAX_CLIENT_LEN)
+}
+
+/// Remember that this connection runs as the request's `client`.
+fn note_client(shared: &Shared, used: &mut BTreeSet<String>, method: &str, params: &Value) {
+    let Some(c) = request_client(method, params) else { return };
+    if used.contains(c) || used.len() >= MAX_CLIENTS_PER_CONNECTION {
+        return;
+    }
+    used.insert(c.to_string());
+    let mut clients = lock(&shared.clients);
+    let n = clients.entry(c.to_string()).or_insert(0);
+    *n = n.saturating_add(1);
+}
+
+/// A connection closed: release the claims of the clients no other open connection uses.
+fn release_clients(shared: &Shared, used: BTreeSet<String>) {
+    let gone: Vec<String> = {
+        let mut clients = lock(&shared.clients);
+        used.into_iter()
+            .filter(|c| match clients.get_mut(c) {
+                Some(n) if *n > 1 => {
+                    *n -= 1;
+                    false
+                }
+                Some(_) => {
+                    clients.remove(c);
+                    true
+                }
+                None => false,
+            })
+            .collect()
+    };
+    for c in &gone {
+        let (req, _reply) = ControlRequest::new("engine.execute", json!({"command": "comp.release", "params": {"client": c}}));
+        if shared.tx.send(req).is_err() {
+            return;
+        }
+    }
+    if !gone.is_empty() {
+        shared.ctx.request_repaint();
+    }
 }
 
 /// Write change events to a subscribed connection until it closes.
@@ -463,7 +524,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = channel::<ControlRequest>();
         let events = ControlEvents::default();
-        let shared = Shared { tx, ctx: egui::Context::default(), events: events.clone(), replies: Arc::default(), timeout };
+        let shared = Shared { tx, ctx: egui::Context::default(), events: events.clone(), replies: Arc::default(), clients: Arc::default(), timeout };
         std::thread::spawn(move || accept_loop(listener, shared));
         (addr, rx, events)
     }
@@ -603,6 +664,40 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert_eq!(events.subscribers(), 0);
+    }
+
+    /// An agent's claims go when its last connection closes (not while another one is open).
+    #[test]
+    fn closing_the_last_connection_of_a_client_releases_its_claims() {
+        let (addr, rx, _events) = server(REQUEST_TIMEOUT);
+        let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let log = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for req in rx {
+                lock(&log).push(json!({"method": req.method, "params": req.params}));
+                let _ = req.reply.send(json!({"ok": true, "result": null}));
+            }
+        });
+        let claim = r#"{"id":1,"method":"engine.execute","params":{"command":"comp.claim","params":{"comp":1,"client":"agentA"}}}"#;
+        let mut first = connect(addr);
+        let mut second = connect(addr);
+        call(&mut first, claim);
+        call(&mut second, claim);
+        let releases = |seen: &Arc<Mutex<Vec<Value>>>| lock(seen).iter().filter(|r| r["params"]["command"] == "comp.release").cloned().collect::<Vec<_>>();
+        drop(first);
+        // Still in use by the second connection: nothing is released (give the server a moment).
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(releases(&seen).is_empty());
+        drop(second);
+        for _ in 0..100 {
+            if !releases(&seen).is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let r = releases(&seen);
+        assert_eq!(r.len(), 1, "{r:?}");
+        assert_eq!(r[0]["params"]["params"], json!({"client": "agentA"}));
     }
 
     #[test]

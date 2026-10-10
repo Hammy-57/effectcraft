@@ -77,6 +77,31 @@ A number always names an id (layer, effect, mask…), never a position; use `"#n
 Every engine command is reachable through `engine.execute`, and every interactive widget of every
 panel registers an element id; both are enforced by `crates/ui-egui/tests/ui_agent_audit.rs`.
 
+### Clients: cursors and claims
+
+A request whose params carry `client` runs on that client's own cursor: active comp, current times,
+selected layers / properties / keys / mask vertices / Project items, the current track and on-canvas
+text editing (`Session::execute` swaps it in for the command and the user's back afterwards; batch and
+script steps inherit it). A new client starts from a copy of the user's cursor; at most 64 are kept
+(least recently used dropped). Open comp tabs, clipboards and tool and viewer options stay shared; a
+client opening a comp adds its tab but sends no `OpenComp` to the UI. `editor.state` returns the
+caller's view and adds `client` (when given), `clients` (`[{client, active_comp, time, selected_layers}]`,
+most recent first) and `claims`.
+
+| Command | Params | Result |
+|---|---|---|
+| `comp.claim` | `{comp?, ttl?}` + `client` (required) | `{comp, name, client, ttl, renewed, warnings?}`; `ttl` seconds, default 300, capped at 86400; the owner re-claiming renews; another client's live claim is an error naming it |
+| `comp.release` | `{comp?, force?}` | `{released: [{comp, name, client}]}`; with `client`: that comp (only if you own it) or all your claims; without `client` only with `force: true` (anyone's, one comp or all) |
+| `comp.claims` | `{}` | `{claims: [{comp, name, client, expiresIn, ttl}]}` |
+
+While a claim is live, a command from another client that changes the claimed comp (layers, properties,
+name) or deletes it fails with `composition "<name>" is claimed by <owner> (expires in 4m 12s); …` and
+changes nothing; edits are checked in `Session::edit`, and anything else (undo, redo, history jumps)
+by comparing the comp before and after the command. Requests without `client` are never refused.
+Expired claims are dropped when next checked; opening another project drops all claims and cursors.
+The TCP control server counts the open connections per `client` and runs `comp.release {client}` when
+the last one closes.
+
 ## Change events
 
 `{"method": "events.subscribe"}` → `{subscribed: true, revision, events}`. From then on the
