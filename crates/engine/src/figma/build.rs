@@ -425,7 +425,7 @@ pub(super) fn run(s: &mut Session, plan: Plan, src: &Source, scale: f64, cfg: &S
                     target.layers.insert(k, l);
                 }
             } else {
-                target.layers = layers;
+                target.layers = layers.into();
             }
             if Some(i) == plan.into_active || plan.roots.first() == Some(&i) {
                 top_layers = ids;

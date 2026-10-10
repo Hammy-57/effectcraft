@@ -385,7 +385,7 @@ fn set_switch(s: &mut Session, p: &Value) -> Result<Value> {
         let first = comp.layers.iter().find(|l| ids.contains(&l.id)).map(|l| switch_value(l, &name)).unwrap_or(Some(false));
         let Some(first) = first else { return Err(bad("layer.setSwitch", format!("unknown switch `{name}`"))) };
         let target = v.unwrap_or(!first);
-        for l in comp.layers.iter_mut().filter(|l| ids.contains(&l.id)) {
+        for l in comp.layers.iter_mut_where(|l| ids.contains(&l.id)) {
             set_switch_value(l, &name, target);
             last = target;
         }
@@ -482,7 +482,7 @@ fn set_comment(s: &mut Session, p: &Value) -> Result<Value> {
     let text = str_p(p, "comment").ok_or_else(|| bad("layer.setComment", "missing `comment`"))?.to_string();
     s.edit("Layer Comment", None, |proj, _| {
         let comp = proj.comp_mut(cid).ok_or(EngineError::NoComp)?;
-        for l in comp.layers.iter_mut().filter(|l| ids.contains(&l.id)) {
+        for l in comp.layers.iter_mut_where(|l| ids.contains(&l.id)) {
             l.comment = text.clone();
         }
         Ok(())
@@ -499,7 +499,7 @@ fn blend(s: &mut Session, p: &Value) -> Result<Value> {
     }
     s.edit("Blending Mode", None, |proj, _| {
         let comp = proj.comp_mut(cid).ok_or(EngineError::NoComp)?;
-        for l in comp.layers.iter_mut().filter(|l| ids.contains(&l.id)) {
+        for l in comp.layers.iter_mut_where(|l| ids.contains(&l.id)) {
             l.blend_mode = match mode {
                 Some(m) => m,
                 None if step > 0 => l.blend_mode.next(),
@@ -692,7 +692,7 @@ fn set_parent(s: &mut Session, p: &Value) -> Result<Value> {
     let fixes = if compensate { parent_fixes(s, cid, &ids, parent) } else { vec![] };
     s.edit("Parent", None, |proj, _| {
         let comp = proj.comp_mut(cid).ok_or(EngineError::NoComp)?;
-        for l in comp.layers.iter_mut().filter(|l| ids.contains(&l.id)) {
+        for l in comp.layers.iter_mut_where(|l| ids.contains(&l.id)) {
             l.parent = parent;
             if let Some(f) = fixes.iter().find(|f| f.layer == l.id) {
                 f.apply(l);
@@ -719,7 +719,7 @@ fn timing(s: &mut Session, p: &Value) -> Result<Value> {
         let comp = proj.comp_mut(cid).ok_or(EngineError::NoComp)?;
         let fd = comp.frame_duration();
         let dur = comp.duration;
-        for l in comp.layers.iter_mut().filter(|l| ids.contains(&l.id)) {
+        for l in comp.layers.iter_mut_where(|l| ids.contains(&l.id)) {
             if let Some(d) = in_delta {
                 l.in_point = (l.in_point + d).max(Tick::ZERO.min(l.in_point)).min(l.out_point - fd);
             }
@@ -843,14 +843,14 @@ fn arrange(s: &mut Session, p: &Value) -> Result<Value> {
                 for i in 1..n {
                     if picked(&comp.layers[i]) && !picked(&comp.layers[i - 1]) {
                         let run_end = (i..n).find(|j| !picked(&comp.layers[*j])).unwrap_or(n);
-                        comp.layers[i - 1..run_end].rotate_left(1);
+                        comp.layers.arcs_mut()[i - 1..run_end].rotate_left(1);
                     }
                 }
             } else {
                 for i in (0..n.saturating_sub(1)).rev() {
                     if picked(&comp.layers[i]) && !picked(&comp.layers[i + 1]) {
                         let run_start = (0..=i).rev().find(|j| !picked(&comp.layers[*j])).map_or(0, |j| j + 1);
-                        comp.layers[run_start..=i + 1].rotate_right(1);
+                        comp.layers.arcs_mut()[run_start..=i + 1].rotate_right(1);
                     }
                 }
             }
