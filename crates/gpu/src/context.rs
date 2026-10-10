@@ -125,7 +125,8 @@ pub(crate) struct Pool {
 fn cache_budgets(layer_cache: usize, integrated: bool) -> (usize, usize, u64) {
     let upload_cap = if integrated { 256 << 20 } else { UPLOAD_BUDGET };
     let pool_cap = if integrated { 128 << 20 } else { POOL_BUDGET };
-    let auxiliary_cap = if integrated { 16 << 20 } else { AUX_CACHE_BUDGET };
+    // Keep room for one 1080p RGBA-f32 buffer even on shared memory.
+    let auxiliary_cap = if integrated { 32 << 20 } else { AUX_CACHE_BUDGET };
     (layer_cache.min(upload_cap), (layer_cache / 2).min(pool_cap), ((layer_cache / 16) as u64).min(auxiliary_cap))
 }
 
@@ -967,7 +968,7 @@ impl GpuContext {
     /// working textures half of it (capped at [`POOL_BUDGET`]). On unified memory (Apple
     /// silicon, Adreno) CPU/GPU caches share RAM, so retained uploads and working textures
     /// are further capped at 256/128 MiB. Auxiliary staging and zero-image caches each get
-    /// 1/16 of the layer budget, capped at 16 MiB integrated or 64 MiB discrete.
+    /// 1/16 of the layer budget, capped at 32 MiB integrated or 64 MiB discrete.
     pub fn set_cache_budget(&self, layer_cache: usize) {
         let (upload, pool, auxiliary) = cache_budgets(layer_cache, self.integrated);
         self.auxiliary_budget.store(auxiliary, std::sync::atomic::Ordering::Relaxed);
@@ -1488,7 +1489,9 @@ mod upload_budget_tests {
     #[test]
     fn pool_pending_reuse_is_bounded_and_purge_cannot_repopulate_it() {
         crate::tests::hold_gpu_lock();
-        let Some(g) = GpuContext::headless() else { return };
+        let context = GpuContext::headless();
+        assert!(context.is_some() || !std::env::var("EFFECTCRAFT_REQUIRE_GPU").is_ok_and(|v| v == "1"), "required GPU unavailable");
+        let Some(g) = context else { return };
         let mut pool = Pool::default();
         pool.set_budget(2 * 8 * 8 * 16);
         let encoder = pool.open();
@@ -1510,14 +1513,16 @@ mod upload_budget_tests {
     fn shared_memory_cache_budgets_follow_preferences_and_have_lower_caps() {
         assert_eq!(cache_budgets(0, true), (0, 0, 0));
         assert_eq!(cache_budgets(64 << 20, true), (64 << 20, 32 << 20, 4 << 20));
-        assert_eq!(cache_budgets(usize::MAX, true), (256 << 20, 128 << 20, 16 << 20));
+        assert_eq!(cache_budgets(usize::MAX, true), (256 << 20, 128 << 20, 32 << 20));
         assert_eq!(cache_budgets(usize::MAX, false), (UPLOAD_BUDGET, POOL_BUDGET, AUX_CACHE_BUDGET));
     }
 
     #[test]
     fn auxiliary_caches_are_bounded_across_sizes_and_purged() {
         crate::tests::hold_gpu_lock();
-        let Some(g) = GpuContext::headless() else { return };
+        let context = GpuContext::headless();
+        assert!(context.is_some() || !std::env::var("EFFECTCRAFT_REQUIRE_GPU").is_ok_and(|v| v == "1"), "required GPU unavailable");
+        let Some(g) = context else { return };
         // A tiny budget makes changing layer extents exercise eviction with kilobytes.
         g.set_cache_budget(16 * 4096);
         for width in 8..40 {

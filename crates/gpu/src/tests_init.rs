@@ -186,7 +186,13 @@ fn dx12_auto_compiler_builds_compositor_with_linked_dxc() {
     let context = GpuContext::new(&adapter, device, queue).expect("DX12 with linked DXC compiles pointwise");
     let image = effectcraft_raster::Image::filled(3, 2, [0.25, 0.5, 0.75, 1.0]);
     let uploaded = context.upload_image(&image).unwrap();
-    let actual = crate::context::Enc::new(&context).download(&uploaded).unwrap();
-    assert_eq!(actual.data, image.data);
+    let mut encoder = crate::context::Enc::new(&context);
+    let output = encoder.scratch(3, 2);
+    let mut params = crate::context::Params::default();
+    params.u[0][0] = 6; // Invert RGB, the kernel that FXC could not compile.
+    params.f[0][0] = 1.0;
+    encoder.pixels("pointwise", &params, &uploaded, None, &output, None);
+    let actual = encoder.download(&output).unwrap();
+    assert!(actual.data.iter().all(|pixel| *pixel == [0.75, 0.5, 0.25, 1.0]));
     assert_eq!(host.load(Ordering::SeqCst), 0);
 }
