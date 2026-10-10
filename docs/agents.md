@@ -237,6 +237,16 @@ Two things follow:
   last connection that used that `client` closes (keep one connection open, as the MCP bridge does).
   Without `client`, `comp.release` needs `force: true` (the user overriding a claim).
 
+### Undo with several people in one project
+
+`edit.undo` undoes the caller's own latest step: the user's (no `client`) or the agent's. When
+someone else made the last step, only what the caller's step changed is reverted, as a new step
+(`{undone, selective: true}`), so the user's ⌘Z never removes an agent's work and an agent's undo
+never removes the user's. It's refused, changing nothing, when someone changed the same item (a
+comp, footage item, folder) or the project settings since; the error names who. The user's
+`edit.undo {any: true}` undoes the last step whoever made it, and the History panel still jumps to
+any state.
+
 ### Which project is open where (hosts) and the save guard
 
 One process holds one project. Every EffectCraft that holds one (the desktop app, a headless or
