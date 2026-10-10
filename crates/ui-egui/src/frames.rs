@@ -118,10 +118,13 @@ struct Cache {
     budget: usize,
     /// Bytes of GPU frames to keep at most ([`GPU_BUDGET`]).
     gpu_budget: usize,
+    /// Changes whenever a frame comes or goes (see [`Frames::disk_frames`]).
+    generation: u64,
 }
 
 impl Cache {
     fn insert(&mut self, k: FrameKey, img: FrameImage) {
+        self.generation = self.generation.wrapping_add(1);
         let (sz, gpu) = (img.bytes(), img.is_gpu());
         if let Some(old) = self.map.insert(k, img) {
             self.forget(&old);
@@ -160,6 +163,7 @@ impl Cache {
     }
     fn remove(&mut self, k: &FrameKey) {
         if let Some(i) = self.map.remove(k) {
+            self.generation = self.generation.wrapping_add(1);
             self.forget(&i);
         }
     }
@@ -405,6 +409,27 @@ pub struct Frames {
     /// Where frames render instead of the UI thread (wasm32), and how many it is rendering.
     remote: Option<Arc<dyn RemoteFrames>>,
     remote_busy: Arc<Mutex<usize>>,
+    /// The cache bar's frames, remembered while nothing they depend on changes (the bar is drawn
+    /// every UI frame).
+    bar: Mutex<CacheBar>,
+}
+
+/// See [`Frames::cached_frames`] and [`Frames::disk_frames`]: (series with frame 0, what else
+/// the answer depends on, the answer), most recent last.
+#[derive(Default)]
+struct CacheBar {
+    ram: Vec<(FrameKey, u64, Vec<i64>)>,
+    disk: Vec<(FrameKey, [u64; 5], Vec<i64>)>,
+}
+
+/// Series remembered by [`CacheBar`] (the Timeline, Preview panel and playback ask for one or two).
+const BAR_SERIES: usize = 4;
+
+fn remember<K: Copy>(v: &mut Vec<(FrameKey, K, Vec<i64>)>, series: FrameKey, k: K, frames: &[i64]) {
+    if v.len() >= BAR_SERIES {
+        v.remove(0);
+    }
+    v.push((series, k, frames.to_vec()));
 }
 
 impl Default for Frames {
@@ -412,7 +437,7 @@ impl Default for Frames {
         #[cfg(not(target_arch = "wasm32"))]
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 16);
         Frames {
-            cache: Arc::new(Mutex::new(Cache { map: HashMap::new(), order: VecDeque::new(), bytes: 0, gpu_bytes: 0, budget: 3 << 30, gpu_budget: GPU_BUDGET })),
+            cache: Arc::new(Mutex::new(Cache { map: HashMap::new(), order: VecDeque::new(), bytes: 0, gpu_bytes: 0, budget: 3 << 30, gpu_budget: GPU_BUDGET, generation: 0 })),
             inflight: Arc::new(Mutex::new(HashSet::new())),
             failed: Failed::default(),
             queue: Arc::new(Mutex::new(Queue::default())),
@@ -435,6 +460,7 @@ impl Default for Frames {
             keepers: Mutex::default(),
             remote: None,
             remote_busy: Arc::default(),
+            bar: Mutex::default(),
         }
     }
 }
@@ -671,9 +697,16 @@ impl Frames {
     /// Cached frame numbers of the series of `base` (its comp content, scale, view and render
     /// options) — for the cache bar.
     pub fn cached_frames(&self, base: &FrameKey) -> Vec<i64> {
+        let series = FrameKey { frame: 0, ..*base };
         let Ok(c) = self.cache.lock() else { return vec![] };
+        let mut bar = self.bar.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, _, v)) = bar.ram.iter().find(|(s, g, _)| *s == series && *g == c.generation) {
+            return v.clone();
+        }
         let mut v: Vec<i64> = c.map.keys().filter(|k| k.same_series(base)).map(|k| k.frame).collect();
         v.sort_unstable();
+        bar.ram.retain(|(s, ..)| *s != series);
+        remember(&mut bar.ram, series, c.generation, &v);
         v
     }
 
@@ -689,12 +722,27 @@ impl Frames {
         if src.disk.is_none() && remote.is_none() {
             return vec![];
         }
-        let ram: HashSet<i64> = self.cached_frames(base).into_iter().collect();
         let oh = opts_hash(opts);
-        (0..frames.clamp(0, 100_000))
+        // Remembered until the frames in RAM or on disk, the project or the series change (the
+        // remote disk cache gets its frames with the RAM cache's).
+        let series = FrameKey { frame: 0, ..*base };
+        let ram_generation = self.cache.lock().map(|c| c.generation).unwrap_or(0);
+        let k = [base.revision, frames as u64, oh, ram_generation, src.disk.as_ref().map_or(0, |dc| dc.generation())];
+        if let Ok(bar) = self.bar.lock()
+            && let Some((_, _, v)) = bar.disk.iter().find(|(s, g, _)| *s == series && *g == k)
+        {
+            return v.clone();
+        }
+        let ram: HashSet<i64> = self.cached_frames(base).into_iter().collect();
+        let v: Vec<i64> = (0..frames.clamp(0, 100_000))
             .filter(|f| !ram.contains(f))
             .filter(|f| contains(frame_disk_key(&self.content_keys, &src.project, &FrameKey { frame: *f, ..*base }, oh)))
-            .collect()
+            .collect();
+        if let Ok(mut bar) = self.bar.lock() {
+            bar.disk.retain(|(s, ..)| *s != series);
+            remember(&mut bar.disk, series, k, &v);
+        }
+        v
     }
 
     /// Change the RAM preview cache budget (Settings ▸ Memory & CPU), evicting the oldest
@@ -716,6 +764,7 @@ impl Frames {
         }
         if let Ok(mut c) = self.cache.lock() {
             c.map.clear();
+            c.generation = c.generation.wrapping_add(1);
             c.order.clear();
             c.bytes = 0;
             c.gpu_bytes = 0;
@@ -1411,6 +1460,42 @@ mod tests {
         insert(&f, key(1, 3, 0));
         assert!(f.is_cached(&key(1, 0, 0)) && !f.is_cached(&key(1, 1, 0)));
         assert!(f.is_cached(&key(1, 2, 0)) && f.is_cached(&key(1, 3, 0)));
+    }
+
+    /// The cache bar's frame lists are remembered, and follow frames coming and going.
+    #[test]
+    fn cache_bar_follows_the_cache() {
+        let f = Frames::default();
+        insert(&f, key(1, 3, 0));
+        assert_eq!(f.cached_frames(&key(1, 0, 0)), vec![3]);
+        assert_eq!(f.cached_frames(&key(1, 9, 0)), vec![3], "any frame of the series");
+        insert(&f, key(1, 1, 0));
+        assert_eq!(f.cached_frames(&key(1, 0, 0)), vec![1, 3]);
+        f.cache.lock().unwrap().remove(&key(1, 3, 0));
+        assert_eq!(f.cached_frames(&key(1, 0, 0)), vec![1]);
+        f.clear();
+        assert!(f.cached_frames(&key(1, 0, 0)).is_empty());
+        // Disk: a frame written to the disk cache shows; one read back into RAM doesn't.
+        let dir = std::env::temp_dir().join(format!("effectcraft-cache-bar-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dc = DiskCache::open(&dir, 1 << 30).unwrap();
+        let src = RenderSource {
+            project: Arc::default(),
+            footage: Arc::new(effectcraft_engine::render::NoFootage),
+            expr: None,
+            layer_cache: Arc::default(),
+            gpu: None,
+            gpu_display: false,
+            disk: Some(dc.clone()),
+        };
+        let opts = RenderOpts::default();
+        assert!(f.disk_frames(&src, &key(1, 0, 0), 5, &opts).is_empty());
+        let k = frame_disk_key(&f.content_keys, &src.project, &key(1, 2, 0), opts_hash(&opts));
+        dc.put_frame_now(k, 1, 1, &[0, 0, 0, 255]);
+        assert_eq!(f.disk_frames(&src, &key(1, 0, 0), 5, &opts), vec![2]);
+        insert(&f, key(1, 2, 0));
+        assert!(f.disk_frames(&src, &key(1, 0, 0), 5, &opts).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

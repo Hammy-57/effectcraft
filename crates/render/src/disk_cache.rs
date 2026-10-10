@@ -243,6 +243,8 @@ pub struct DiskCache {
     queue: Arc<(Mutex<Queue>, Condvar)>,
     /// Layer buffers that took less than this to render are not written (ms).
     min_layer_ms: AtomicU64,
+    /// See [`Self::generation`].
+    generation: AtomicU64,
 }
 
 /// FNV-1a 128-bit (content keys).
@@ -315,6 +317,7 @@ impl DiskCache {
             tmp_counter: AtomicU64::new(0),
             queue: Arc::new((Mutex::new(Queue { jobs: Default::default(), bytes: 0, busy: false }), Condvar::new())),
             min_layer_ms: AtomicU64::new(30),
+            generation: AtomicU64::new(0),
         });
         dc.rescan();
         dc.evict();
@@ -363,6 +366,7 @@ impl DiskCache {
         if let Ok(mut g) = self.index.lock() {
             *g = idx;
         }
+        self.changed();
     }
 
     fn path(&self, kind: Kind, key: u128) -> PathBuf {
@@ -393,6 +397,16 @@ impl DiskCache {
         self.index.lock().is_ok_and(|g| g.contains(kind, key))
     }
 
+    /// Changes whenever an entry is added or removed (so callers can cache what they derive
+    /// from [`Self::contains`], like the Timeline's cache bar).
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
+    }
+
+    fn changed(&self) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Keys of one kind (unordered).
     pub fn keys(&self, kind: Kind) -> Vec<u128> {
         self.index.lock().map(|g| g.keys(kind)).unwrap_or_default()
@@ -418,6 +432,7 @@ impl DiskCache {
         if let Ok(mut g) = self.index.lock() {
             g.clear();
         }
+        self.changed();
         for kind in [Kind::Frame, Kind::Layer] {
             let _ = std::fs::remove_dir_all(self.dir.join(kind.dir()));
         }
@@ -477,6 +492,7 @@ impl DiskCache {
         if let Ok(mut g) = self.index.lock() {
             g.remove(kind, key);
         }
+        self.changed();
     }
 
     fn enqueue(&self, kind: Kind, key: u128, payload: Vec<u8>) {
@@ -523,6 +539,7 @@ impl DiskCache {
         if let Ok(mut g) = self.index.lock() {
             g.insert(kind, key, data.len() as u64);
         }
+        self.changed();
         self.evict();
     }
 
@@ -533,6 +550,9 @@ impl DiskCache {
             Ok(mut g) => g.evict(max),
             Err(_) => return,
         };
+        if !victims.is_empty() {
+            self.changed();
+        }
         for (kind, key) in victims {
             let _ = std::fs::remove_file(self.path(kind, key));
             self.evictions.fetch_add(1, Ordering::Relaxed);
