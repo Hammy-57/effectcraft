@@ -23,12 +23,14 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         app.auto.add("footage.empty", rect, "Footage panel (empty)");
         return;
     };
-    let Some(item) = app.session.project.item(view.item).cloned() else {
+    // Borrowed from a project snapshot, not copied (an image sequence lists every frame's file).
+    let project = app.session.project.clone();
+    let Some(item) = project.item(view.item) else {
         app.session.state.footage_panel = None;
         return;
     };
     let footage = match &item.kind {
-        ItemKind::Footage(f) => Some(f.clone()),
+        ItemKind::Footage(f) => Some(f),
         _ => None,
     };
     let (dur, fr) = match &footage {
@@ -49,10 +51,12 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     p.rect_filled(Rect::from_min_max(pos2(rect.min.x, ruler.min.y - 4.0), rect.max), 0.0, t.panel_bg);
     // Canvas.
     let area = Rect::from_min_max(pos2(rect.min.x, top.max.y), pos2(rect.max.x, ruler.min.y - 4.0));
-    if let Some(f) = &footage
+    if let Some(f) = footage
         && f.has_video
     {
-        let key = (view.item.0, view.time.0, app.session.revision);
+        // Decoded once per footage frame (playback here advances the time every UI frame).
+        let frame = if f.kind == FootageKind::Still { 0 } else { f.frame_rate.frame_at(view.time) };
+        let key = (view.item.0, frame, app.session.revision);
         let tid = egui::Id::new("footage-panel-tex");
         let cached: Option<((u64, i64, u64), egui::TextureHandle, [u32; 2])> = ctx.data(|d| d.get_temp(tid));
         let tex = match cached {
