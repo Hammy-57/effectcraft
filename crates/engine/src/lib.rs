@@ -25,6 +25,7 @@ pub mod jobs;
 pub mod layout;
 pub mod learn;
 pub mod links;
+pub mod lint;
 pub mod logging;
 pub mod mask_track;
 pub mod media_browser;
@@ -1328,3 +1329,5 @@ mod tests_exam;
 mod tests_import_project;
 #[cfg(test)]
 mod tests_key_time;
+#[cfg(test)]
+mod tests_lint;

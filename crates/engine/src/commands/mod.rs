@@ -38,6 +38,7 @@ mod layer_time;
 mod layout_cmds;
 mod library;
 pub(crate) mod link;
+mod lint_cmds;
 mod liquify;
 mod lottie;
 pub mod markers;
@@ -223,6 +224,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(import_project::specs());
         v.extend(library::specs());
         v.extend(exam_cmds::specs());
+        v.extend(lint_cmds::specs());
         v
     })
 }

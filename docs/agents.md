@@ -129,13 +129,14 @@ See [MCP conventions](mcp.md) for core tools, resources, strict arguments, and p
 | `render_compare {a, b, threshold?, min_psnr?, max_side?, region?, amplify?, diff_path?, inline?}` | Compare two frames. `a` and `b` are each a snapshot name (or `{snapshot}`), `{path}` (a PNG/JPEG golden or After Effects reference) or `{comp?, time?, transparent?}` (render now; `{}` = active comp at the CTI). Returns `{width, height, max_abs, mean_abs, alpha_max_abs, psnr_db, ssim, changed_pixels, changed_pct, pass, diffBounds}` and, when something changed, the diff heatmap as an image. `region: [x, y, w, h]` compares one rectangle. See [Verify your change](#verify-your-change-snapshot--edit--compare). |
 | `get_layout {comp?, time?, layers?, pixels?, overlaps?}` | Where layers are on screen at a time, without rendering (`layer.bounds`): `visible` (and `why` not), comp-space `bounds` [x,y,w,h], `corners`, `center`, `anchorInComp`, `onScreen` (0-1) and the layer-space `source` rect, after parenting and (3D) the active camera. `pixels` adds the drawn pixels' bounds (effects included); `overlaps` lists overlapping visible layers. |
 | `analyze_audio {comp?, start?, end?, layer?, silence_db?, min_silence?, true_peak?, waveform?, width?, height?, path?}` | Measure the audio mix (`audio.analyze`): peak / true peak dBFS, RMS, integrated LUFS (BS.1770), clipped samples, silent ranges, per-channel stats; `waveform` returns a waveform image. No audio gives `hasAudio: false`. |
+| `lint_frame {comp?, time?, start?, end?, step?, rules?, min_text_px?, min_contrast?}` | Design lint (`render.lint`): plain-language design problems at one time or over a range, each with a fix hint: text too small or low-contrast, outside title / action safe, cut off, overlapping text, layers switched on but not seen, keyframes just off the music's beat. Returns `{clean, counts, problems: [{rule, severity, layer, layerName, time, until, message, other?}]}`. See [Design lint](#design-lint). |
 | `open_project {path \| demo \| new}` / `save_project {path?}` | Open and save files. |
 | `undo {steps?}` / `redo {steps?}` | History. |
 | `history {goto?}` | The branching undo history (History panel): every state with its index, id, label, branch depth and whether it's current; `goto` (an index or id) jumps to any state, on any branch, without losing the others. |
 | `script_ui {action?, window?, widget?, value?, result?}` | Drive ScriptUI windows that scripts opened: `list` (default) the open windows, `get` a window's control tree, `click` a button / checkbox / radio button, `set` text, a slider or a list item, `close` a window (`result`: what a dialog's `show()` returns, default 2 = Cancel). |
 | `batch {steps: [{command, params}], label?, atomic?}` | Several commands in one call and one undo step (`engine.batch`); `"$N.key"` in a param is step N's result (`"$1.layer"`). A failing step rolls the batch back and names the step. |
 | *(UI: `--ui` or `--bridge`)* `screenshot {panel?, id?, max_side?, path?}`, `ui_inspect`, `ui_elements {prefix?}`, `ui_click`, `ui_drag`, `ui_key`, `ui_type`, `ui_set`, `control {method, params}` | Look at and operate the app window (offscreen with `--ui`, the live one with `--bridge`). |
-| *(hidden aliases)* `list_commands {filter?, enabled_only?, schemas?}`, `execute_command {command \| id, params?}`, `get_project`, `render_frame {comp? \| item?, layer?, time?, max_side?, region?, overlays?, path?, inline?, transparent?}` | Older names of `command_list`, `command_run`, `doc_inspect` (its `project`) and `render_preview`. Callable, but not in `tools/list` unless the server runs with `mcp --all-tools`. |
+| *(hidden aliases)* `list_commands {filter?, enabled_only?, schemas?, brief?}`, `execute_command {command \| id, params?}`, `get_project`, `render_frame {comp? \| item?, layer?, time?, max_side?, region?, overlays?, path?, inline?, transparent?}` | Older names of `command_list`, `command_run`, `doc_inspect` (its `project`) and `render_preview`. Callable, but not in `tools/list` unless the server runs with `mcp --all-tools`. |
 
 Layers are referenced by id (from `get_comp`), `"#n"` (1-based index from the top) or name. Comps are
 referenced by id or name, and default to the active comp. Property paths come from `get_layer`, for
@@ -240,6 +241,52 @@ refactor that should change nothing gives `pass: true` with `psnr_db: "inf"`.
   them. Over the control channel the same commands are `engine.execute render.snapshot` /
   `render.compare` (`diff_inline: true` returns the heatmap as base64 `diff_png`).
 - For goldens and fidelity checks from the shell: `effectcraft-cli compare a.png b.png` (see [CLI](#cli)).
+
+### Design lint
+
+`lint_frame` (engine command `render.lint`) checks a comp the way a designer would glance at it
+and lists what is wrong, in words an agent can act on. Run it before calling a design done:
+`lint_frame {}` checks the current frame, `lint_frame {"start":0,"end":5}` samples every 0.5 s
+(`step`) plus each layer's in point and keyframe time (at most 120 samples, else `truncated: true`).
+
+```json
+{"comp": 1, "compName": "Main", "times": [0.0, 0.5, 1.0], "truncated": false, "clean": false,
+ "counts": {"error": 1, "warning": 1, "info": 0}, "rules": ["text-too-small", "…"],
+ "problems": [{"rule": "low-contrast", "severity": "error", "layer": 3, "layerName": "Title",
+               "time": 0.0, "until": 1.0, "message": "“Title”'s text colour #8a8a8a on its background (about #808080 under the text) has a contrast ratio of 1.14:1, below 3.0:1: make the text lighter or darker, change what is behind it, or add a stroke or shadow."}],
+ "notes": ["off-beat skipped: the comp has no audible layers"]}
+```
+
+- **Reading it.** `clean` is true when there are no errors or warnings (info doesn't count).
+  The same problem at several sample times is one entry from `time` to `until` (comp seconds; the
+  worst occurrence's severity and message). `layer` is the stable layer id; pair rules add
+  `other` / `otherName`. Problems come errors first, then by time. `rules: [...]` runs only some.
+- `text-too-small`: the smallest drawn character's font size on screen (its em size through the
+  layer's scale, parents, text animators and the camera; cap height is about 70 % of it) is under
+  `min_text_px` (default comp height / 30: 36 px at 1080p) → warning; under half → error.
+- `low-contrast`: the WCAG contrast ratio of the text colour (blended by the layer's opacity)
+  against the mean colour under the text's box, measured on a small render of the comp without
+  its text layers, is under `min_contrast` (default 3:1) → warning; under two thirds of it (2:1)
+  → error. The message gives both colours and the ratio.
+- `outside-title-safe` (text, warning) / `outside-action-safe` (other layers, info): part of the
+  layer is outside the title-safe / action-safe box (Settings ▸ Grids & Guides: 10 % / 5 % per
+  side by default). The message says by how many pixels on which side.
+- `cut-off`: part (not all) of the layer is outside the frame: warning for text, info otherwise.
+  Layers covering the whole frame (backgrounds) are never cut off or outside a safe area.
+- `text-overlap`: two visible text layers' boxes overlap by more than 2 % of the smaller one
+  (warning; `layer` is the upper one).
+- `hidden-visible` (info): switched on and inside its in/out range, yet nothing shows: opacity 0,
+  entirely outside the frame, or entirely covered by an opaque layer above (`other`; a solid, or
+  footage whose alpha is ignored, at 100 % in Normal mode without masks or effects).
+- `off-beat` (warning, only when the comp has audio): a key moment (a Transform or Opacity
+  keyframe, or an in point after 0) within half a beat of a beat that misses it by more than one
+  frame; the message names the beat to move it to. Beats come from the comp's audio mix (onset
+  envelope, tempo by autocorrelation, beats by dynamic programming); with a single `time` only the
+  key moments on that frame are checked. Without audio, or without a clear beat, a `notes` entry
+  says it was skipped.
+
+Geometry is the `get_layout` geometry (track-matte sources and adjustment layers are skipped);
+only `low-contrast` renders, at most 480 px on the long side, once per sample time that shows text.
 
 ### Cookbook
 
