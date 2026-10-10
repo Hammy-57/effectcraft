@@ -18,6 +18,7 @@ pub mod panels_cmds;
 pub mod puppet;
 pub mod render_compare;
 pub mod roto_cmds;
+pub mod round_corners;
 pub mod scripts;
 pub mod shape_stroke;
 pub mod shape_tool;
