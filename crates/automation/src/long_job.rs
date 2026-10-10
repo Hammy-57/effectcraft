@@ -331,7 +331,8 @@ impl McpServer {
         if call.modern {
             result["resultType"] = json!("complete");
         }
-        send(out, &json!({"jsonrpc": "2.0", "id": call.id, "result": result}))
+        send(out, &json!({"jsonrpc": "2.0", "id": call.id, "result": result}))?;
+        self.flush_notifications(out)
     }
 
     /// Run a long call to its end or cancellation, handling the other input meanwhile.
@@ -404,6 +405,7 @@ impl McpServer {
                         out.write_all(b"\n")?;
                         out.flush()?;
                     }
+                    self.flush_notifications(out)?;
                 }
             }
         }

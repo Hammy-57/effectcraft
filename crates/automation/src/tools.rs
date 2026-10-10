@@ -83,6 +83,11 @@ const READ_ONLY: &[&str] = &[
 /// Tools that write files without changing the project.
 const WRITES_FILES: &[&str] = &["save_project", "render_frame", "screenshot", "analyze_audio"];
 
+/// Whether a tool can change the project (anything but queries and file writers).
+pub fn may_edit(name: &str) -> bool {
+    !READ_ONLY.contains(&name) && !WRITES_FILES.contains(&name)
+}
+
 /// `get_project` → "Get project".
 fn title_of(name: &str) -> String {
     let s = name.replace('_', " ");
