@@ -17,7 +17,7 @@ use crate::{Backend, Error, base64};
 /// Protocol revisions we speak, newest first. We answer with the client's if we know it.
 pub const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 
-const INSTRUCTIONS: &str = "EffectCraft is an After Effects-class motion graphics compositor. Everything is an engine command: command_list discovers ids and params (describe_command shows one in full), command_run {id, params} runs them (undoable; command_batch runs several in order, batch as one undo step). Typical flow: command_run comp.new -> command_run layer.newText / layer.newSolid (returns the layer id) -> set_property / add_keyframe / add_effect -> render_preview to look at the result. Inspect with doc_inspect, get_comp and get_layer (every property node carries its `path`, e.g. `transform/position`, `effects/#1/blurriness`). Times are seconds: keyframe times (add_keyframe, set_property with `time`) are layer time, render_preview and get_property use comp time. Resources and resource templates (effectcraft://document, comp/{comp}, layer/{comp}/{layer}, frame/{comp}/{time}, command/{id}) and workflow prompts are available too. In bridge mode (app started with `--control <port>`) screenshot and the ui_* tools show and operate the live window.";
+const INSTRUCTIONS: &str = "EffectCraft is an After Effects-class motion graphics compositor. Everything is an engine command: command_list discovers ids and params (describe_command shows one in full), command_run {id, params} runs them (undoable; command_batch runs several in order, batch as one undo step). Typical flow: command_run comp.new -> command_run layer.newText / layer.newSolid (returns the layer id) -> set_property / add_keyframe / add_effect -> render_preview to look at the result. Inspect with doc_inspect, get_comp and get_layer (every property node carries its `path`, e.g. `transform/position`, `effects/#1/blurriness`). Times are seconds: keyframe times (add_keyframe, set_property with `time`) are layer time, render_preview and get_property use comp time. Resources and resource templates (effectcraft://document, comp/{comp}, layer/{comp}/{layer}, frame/{comp}/{time}, command/{id}) and workflow prompts are available too. With a UI (bridge mode `--bridge <port>` to a running app, or `--ui` for the app offscreen) screenshot and the ui_* tools show and operate it.";
 
 // JSON-RPC error codes.
 const PARSE_ERROR: i64 = -32700;
@@ -213,7 +213,7 @@ impl McpServer {
                 let version =
                     PROTOCOL_VERSIONS.iter().find(|v| **v == asked).copied().unwrap_or(PROTOCOL_VERSIONS.first().copied().unwrap_or(STRUCTURED_SINCE));
                 self.version = Some(version);
-                let mode = if self.backend.is_bridge() { "bridge" } else { "headless" };
+                let mode = self.backend.mode();
                 let instructions = if self.autosave.is_some() {
                     format!("{INSTRUCTIONS} Headless auto-save and recovery: {}", self.autosave_info())
                 } else {

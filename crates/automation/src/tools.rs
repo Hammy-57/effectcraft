@@ -20,7 +20,7 @@ pub enum Reply {
 pub struct ToolDef {
     pub name: &'static str,
     pub description: &'static str,
-    /// Only listed (and usable) when bridged to the running app.
+    /// Only listed (and usable) with a UI: bridged to the running app, or `mcp --ui` (offscreen).
     pub bridge_only: bool,
     schema: fn() -> Value,
     run: fn(&mut Backend, &Value) -> Result<Reply>,
@@ -113,7 +113,7 @@ pub fn find(name: &str) -> Option<&'static ToolDef> {
     TOOLS.iter().find(|t| t.name == name)
 }
 
-/// The tools available on a backend (bridge-only tools are hidden in headless mode).
+/// The tools available on a backend (UI tools are hidden in headless mode without a UI).
 pub fn available(bridge: bool) -> impl Iterator<Item = &'static ToolDef> {
     TOOLS.iter().filter(move |t| bridge || !t.bridge_only)
 }
@@ -532,7 +532,7 @@ fn batch_tool(b: &mut Backend, a: &Value) -> Result<Reply> {
     json_reply(b.exec("engine.batch", obj(&[("steps", Some(&steps)), ("label", get(a, "label")), ("atomic", get(a, "atomic"))]))?)
 }
 
-// ------------------------------------------------------------------ bridge-only tools
+// ------------------------------------------------------------------ UI tools (bridge or offscreen UI)
 
 fn screenshot(b: &mut Backend, a: &Value) -> Result<Reply> {
     let max_side = get(a, "max_side").and_then(Value::as_u64).unwrap_or(1600) as u32;
@@ -840,7 +840,7 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "screenshot",
-        description: "Screenshot of the live app window, or one panel (`Composition`, `Timeline`, `EffectControls`, `Project`, ...) or element id, as PNG (longest side `max_side`, default 1600). Use it to check what the UI looks like after an action.",
+        description: "Screenshot of the app window (the live one when bridged, the offscreen one with `mcp --ui`), or one panel (`Composition`, `Timeline`, `EffectControls`, `Project`, ...) or element id, as PNG (longest side `max_side`, default 1600). Use it to check what the UI looks like after an action.",
         bridge_only: true,
         schema: || {
             schema(

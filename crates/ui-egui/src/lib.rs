@@ -23,6 +23,8 @@ mod local_assets;
 pub mod menu_keys;
 pub mod menus;
 pub mod native_menu;
+#[cfg(all(feature = "offscreen", not(target_arch = "wasm32")))]
+pub mod offscreen;
 pub mod panels;
 pub mod prefs_live;
 pub mod state;

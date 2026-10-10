@@ -427,9 +427,10 @@ fn camera_focus_commands_undo_and_serde() {
 #[test]
 fn reverse_path_direction_runs_trim_paths_the_other_way() {
     let mut s = comp(200, 200);
-    let lid = s.execute("layer.newShape", json!({"kind": "ellipse", "size": [120, 120], "fill": false, "stroke": [1, 1, 1], "strokeWidth": 8})).unwrap()["layer"]
-        .as_u64()
-        .unwrap();
+    let lid =
+        s.execute("layer.newShape", json!({"kind": "ellipse", "size": [120, 120], "fill": false, "stroke": [1, 1, 1], "strokeWidth": 8})).unwrap()["layer"]
+            .as_u64()
+            .unwrap();
     s.execute("layer.addShapeItem", json!({"layer": lid, "kind": "trim", "group": "contents/group"})).unwrap();
     let (trim_end, ellipse) = {
         let l = s.active_comp().unwrap().layer(LayerId(lid)).unwrap();
@@ -449,7 +450,18 @@ fn reverse_path_direction_runs_trim_paths_the_other_way() {
     let dir = |s: &Session| s.active_comp().unwrap().layer(LayerId(lid)).unwrap().props.find_group(ellipse).unwrap().get("direction").unwrap().value.clone();
     assert_eq!(dir(&s), effectcraft_keyframe::Value::Enum(1));
     let saved = roundtrip(&s);
-    let saved = saved.comp(s.active_comp_id().unwrap()).unwrap().layer(LayerId(lid)).unwrap().props.find_group(ellipse).unwrap().get("direction").unwrap().value.clone();
+    let saved = saved
+        .comp(s.active_comp_id().unwrap())
+        .unwrap()
+        .layer(LayerId(lid))
+        .unwrap()
+        .props
+        .find_group(ellipse)
+        .unwrap()
+        .get("direction")
+        .unwrap()
+        .value
+        .clone();
     assert_eq!(saved, dir(&s), "saved with the project");
 
     s.execute("edit.undo", json!({})).unwrap();
