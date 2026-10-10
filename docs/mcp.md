@@ -26,6 +26,13 @@ The server provides the same core conventions as FilmCraft #28:
 | `doc_inspect` | none | Project overview and active composition |
 | `render_preview` | `comp?`, `time?`, `max_side?`, `path?`, `inline?`, `transparent?` | PNG and frame information |
 
+To check visual work, `render_snapshot {name, comp?, time?}` keeps a frame and
+`render_compare {a, b, threshold?, min_psnr?, max_side?, diff_path?, inline?}` compares snapshots,
+image files or frames rendered now, returning the metrics as JSON and, when something changed, the
+diff heatmap as image content (longest side 768; `diff_path` writes it full size). Both are
+annotated like file writers (not read-only, not destructive, idempotent): they never change the
+project. See [agents.md](agents.md#verify-your-change-snapshot--edit--compare).
+
 `command_batch` stops at the first error by default; false continues. Each edit has its
 own undo step. The existing `batch` tool retains its atomic undo grouping and result references.
 See [agents.md](agents.md) for the full catalog. Each tool has a title and read-only, destructive,

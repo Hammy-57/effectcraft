@@ -19,6 +19,8 @@
 //! effectcraft-cli render --template T.ectemplate [--values V.json] --out FILE
 //! effectcraft-cli render-frame --template T.ectemplate [--values V.json] [--time S] [--out F.png]
 //! effectcraft-cli render F.ecproj --queue                    render the project's Render Queue
+//! effectcraft-cli compare A.png B.png [--threshold L] [--min-psnr DB] [--max-side PX] [--diff D.png]
+//!     compare two images (goldens, After Effects references): metrics; exit 1 when they differ
 //! effectcraft-cli bench [--comp C] [--time S] [--scale K] [--n N] [--play N] [--gpu [--adv3d]]   render timings
 //!     (--gpu: CPU vs GPU ms/frame for every comp at Full and Half)
 //! effectcraft-cli bench --ops [--small] [--layers N] [--comps N] [--footage N]   everyday-operation timings
@@ -89,7 +91,7 @@ fn stdout_broken() -> bool {
     STDOUT_FAILED.get().is_some_and(|k| *k != std::io::ErrorKind::BrokenPipe)
 }
 
-const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|set|render-frame|render|script|mcp> [args] [--json]
+const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|set|render-frame|render|compare|script|mcp> [args] [--json]
   info                                     project + engine summary
   commands [--filter TEXT] [--enabled]     list engine commands
   exec <command-id> [--params JSON]        run one engine command (exec --list: list them, as `commands`)
@@ -107,6 +109,10 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
                                            --profile..--keyint: HEVC / AV1, --audio-bitrate/--opus-app: WebM Opus)
                                            a relative --out is relative to the working directory
   render/render-frame --template T.ectemplate [--values V.json]   render one template instance
+
+  compare A.png B.png [--threshold L] [--min-psnr DB] [--max-side PX] [--amplify K] [--diff D.png]
+                                           compare two PNG/JPEG images (max/mean abs diff, PSNR, SSIM, changed
+                                           pixels; --diff writes a heatmap); exit 1 when they don't pass
   bench [--comp C] [--time S] [--scale K] [--n N] [--play N] [--gpu [--adv3d]]   per-layer/effect render timings;
                                            --play N renders N consecutive frames with/without the layer cache;
                                            --gpu compares CPU and GPU ms/frame for every comp at Full and Half
@@ -146,6 +152,11 @@ const VALUED: &[&str] = &[
     "--expression",
     "--depth",
     "--eval",
+    // compare
+    "--threshold",
+    "--min-psnr",
+    "--diff",
+    "--amplify",
     // render
     "--template",
     "--values",
@@ -446,6 +457,7 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
     match cmd {
         "render" => render(args, json_out)?,
         "bench" => bench_cmd(args)?,
+        "compare" => compare_cmd(args, json_out)?,
         "info" => {
             let mut b = backend(args, true)?;
             let p = tool(&mut b, "get_project", json!({}))?;
@@ -632,6 +644,48 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
             }
         }
         other => return usage_err(&format!("unknown subcommand `{other}`")),
+    }
+    Ok(())
+}
+
+/// `compare A B`: `render.compare` on two image files in an empty headless session. Prints the
+/// metrics; exits 1 when the images don't pass (golden tests and AE fidelity checks).
+fn compare_cmd(args: &Args, json_out: bool) -> Result<(), Failure> {
+    let [a, b] = positional::<2>(args, "compare <a.png> <b.png> [--threshold L] [--min-psnr DB] [--max-side PX] [--diff D.png]")?;
+    let mut p = json!({"a": {"path": a}, "b": {"path": b}});
+    for (opt, key) in [("--threshold", "threshold"), ("--min-psnr", "min_psnr"), ("--amplify", "amplify")] {
+        if let Some(v) = args.num(opt)? {
+            p[key] = json!(v);
+        }
+    }
+    if let Some(m) = args.num("--max-side")? {
+        p["max_side"] = json!(m.max(0.0) as u64);
+    }
+    if let Some(d) = args.opt("--diff") {
+        p["diff_path"] = json!(d);
+    }
+    let mut bk = Backend::headless(session(args)?);
+    let r = bk.exec("render.compare", p)?;
+    let pass = r["pass"].as_bool().unwrap_or(false);
+    if json_out {
+        emit(&r, true);
+    } else {
+        say!(
+            "{} {}x{}  max {} mean {} psnr {} dB ssim {} changed {}% ({} px){}",
+            if pass { "PASS" } else { "FAIL" },
+            r["width"],
+            r["height"],
+            r["max_abs"],
+            r["mean_abs"],
+            r["psnr_db"].as_str().map(str::to_string).unwrap_or_else(|| r["psnr_db"].to_string()),
+            r["ssim"],
+            r["changed_pct"],
+            r["changed_pixels"],
+            r["diff_path"].as_str().map(|d| format!("  diff -> {d}")).unwrap_or_default()
+        );
+    }
+    if !pass {
+        std::process::exit(1);
     }
     Ok(())
 }

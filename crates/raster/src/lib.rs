@@ -7,6 +7,7 @@
 
 pub mod blur;
 pub mod channels3d;
+pub mod compare;
 pub mod cuts;
 pub mod flow;
 pub mod inpaint;

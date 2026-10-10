@@ -79,8 +79,8 @@ const READ_ONLY: &[&str] = &[
     "ui_elements",
     "get_layout",
 ];
-/// Tools that write files without changing the project.
-const WRITES_FILES: &[&str] = &["save_project", "render_frame", "render_preview", "screenshot", "analyze_audio"];
+/// Tools that write files (or keep session-side frames) without changing the project.
+const WRITES_FILES: &[&str] = &["save_project", "render_frame", "render_preview", "screenshot", "render_snapshot", "render_compare", "analyze_audio"];
 
 /// Older tool names kept callable but left out of `tools/list` (`mcp --all-tools` lists them):
 /// (alias, canonical tool). The canonical one takes every argument the alias does, except
@@ -474,6 +474,63 @@ fn render_frame(b: &mut Backend, a: &Value) -> Result<Reply> {
     Ok(Reply::Image { png: f.png, info })
 }
 
+fn render_snapshot(b: &mut Backend, a: &Value) -> Result<Reply> {
+    let p = obj(&[
+        ("name", get(a, "name")),
+        ("comp", get(a, "comp")),
+        ("time", get(a, "time")),
+        ("max_side", get(a, "max_side")),
+        ("transparent", get(a, "transparent")),
+    ]);
+    json_reply(b.exec("render.snapshot", p)?)
+}
+
+/// Longest side of the diff heatmap returned inline.
+const DIFF_INLINE_SIDE: u32 = 768;
+
+fn render_compare(b: &mut Backend, a: &Value) -> Result<Reply> {
+    need(a, "a")?;
+    need(a, "b")?;
+    let inline = get(a, "inline").and_then(Value::as_bool) != Some(false);
+    let mut p = obj(&[
+        ("a", get(a, "a")),
+        ("b", get(a, "b")),
+        ("threshold", get(a, "threshold")),
+        ("min_psnr", get(a, "min_psnr")),
+        ("max_side", get(a, "max_side")),
+        ("amplify", get(a, "amplify")),
+        ("diff_path", get(a, "diff_path")),
+    ]);
+    if inline {
+        p["diff_inline"] = json!(true);
+    }
+    let mut r = b.exec("render.compare", p)?;
+    let diff = r.as_object_mut().and_then(|o| o.remove("diff_png"));
+    // The heatmap is worth looking at only when something changed.
+    let changed = r["changed_pixels"].as_u64().unwrap_or(0) > 0;
+    match diff.as_ref().and_then(Value::as_str).filter(|_| changed) {
+        Some(b64) => {
+            let raw = crate::base64::decode(b64).ok_or_else(|| Error::App("render.compare: bad base64".into()))?;
+            let (png, w, h) = recompress_png(&raw, DIFF_INLINE_SIDE)?;
+            r["diff_image"] = json!([w, h]);
+            Ok(Reply::Image { png, info: r })
+        }
+        None => json_reply(r),
+    }
+}
+
+fn frame_source_s() -> Value {
+    json!({
+        "description": "A snapshot name (string), {\"snapshot\": name}, {\"path\": \"file.png\"} (PNG/JPEG, e.g. a golden or an After Effects reference render) or {\"comp\"?, \"time\"?, \"transparent\"?} to render now ({} = active comp at the current time).",
+        "oneOf": [
+            {"type": "string"},
+            {"type": "object", "properties": {"snapshot": {"type": "string"}}, "required": ["snapshot"], "additionalProperties": false},
+            {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"], "additionalProperties": false},
+            {"type": "object", "properties": {"comp": comp_s(), "time": {"type": "number"}, "transparent": {"type": "boolean"}}, "additionalProperties": false}
+        ]
+    })
+}
+
 fn open_project(b: &mut Backend, a: &Value) -> Result<Reply> {
     if let Some(p) = get(a, "path") {
         b.exec("file.open", json!({"path": p}))?;
@@ -860,6 +917,45 @@ static TOOLS: &[ToolDef] = &[
             )
         },
         run: render_frame,
+    },
+    ToolDef {
+        name: "render_snapshot",
+        description: "Render a frame (default: the active comp at the current time) and keep it in the session under `name`, for render_compare. Verify an edit by looking: render_snapshot {\"name\":\"before\"} -> edit -> render_compare {\"a\":\"before\",\"b\":{}}. Up to 16 are kept (oldest dropped); taking a name again replaces it.",
+        bridge_only: false,
+        schema: || {
+            schema(
+                json!({
+                    "name": {"type": "string", "description": "Snapshot name."},
+                    "comp": comp_s(),
+                    "time": {"type": "number", "description": "Comp time in seconds (default: current time)."},
+                    "max_side": {"type": "integer", "minimum": 0, "description": "Longest side in pixels (default 0 = full comp size)."},
+                    "transparent": {"type": "boolean", "description": "Keep the frame's alpha instead of compositing over the comp background."}
+                }),
+                &["name"],
+            )
+        },
+        run: render_snapshot,
+    },
+    ToolDef {
+        name: "render_compare",
+        description: "Compare two frames: snapshots (render_snapshot), image files (goldens, After Effects reference renders) or frames rendered now. Returns {width, height, max_abs, mean_abs (8-bit levels), alpha_max_abs, psnr_db (\"inf\" when identical), ssim, changed_pixels, changed_pct, pass} and, when something changed, the diff heatmap as an image (red -> yellow -> white by size of difference, over frame a dimmed to grey). `pass` = no channel differs by more than `threshold` levels (default 1), or with `min_psnr` PSNR >= min_psnr. Sizes: `max_side` scales both down first; the same aspect ratio at different sizes compares at the smaller size; different aspect ratios are an error.",
+        bridge_only: false,
+        schema: || {
+            schema(
+                json!({
+                    "a": frame_source_s(),
+                    "b": frame_source_s(),
+                    "threshold": {"type": "number", "minimum": 0, "maximum": 255, "description": "Per-channel tolerance in 8-bit levels for `changed_pixels` and `pass` (default 1)."},
+                    "min_psnr": {"type": "number", "minimum": 0, "description": "Pass when PSNR (dB) is at least this, instead of the exact threshold test (e.g. 35 for another app's render)."},
+                    "max_side": {"type": "integer", "minimum": 0, "description": "Scale both down to this longest side before comparing (0 = full size, the default)."},
+                    "amplify": {"type": "number", "minimum": 1, "maximum": 255, "description": "Heatmap gain (default 8: a 32-level difference is white)."},
+                    "diff_path": {"type": "string", "description": "Also write the heatmap PNG here (full size)."},
+                    "inline": {"type": "boolean", "description": "Include the heatmap image in the reply when something changed (default true)."}
+                }),
+                &["a", "b"],
+            )
+        },
+        run: render_compare,
     },
     ToolDef {
         name: "get_layout",
