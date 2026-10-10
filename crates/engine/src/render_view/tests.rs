@@ -166,3 +166,80 @@ fn render_frame_rejects_bad_numbers_and_writes_files() {
     assert_eq!(image::open(&path).unwrap().width(), 320);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn contact_sheet_spreads_frames_and_labels_them() {
+    let mut s = session();
+    s.execute("prop.addKey", json!({"layer": "Red", "path": "transform/position", "time": 0, "value": [60, 90]})).unwrap();
+    s.execute("prop.addKey", json!({"layer": "Red", "path": "transform/position", "time": 3, "value": [260, 90]})).unwrap();
+    let v = s.execute("render.contactSheet", json!({"count": 4, "base64": true, "max_side": 800})).unwrap();
+    assert_eq!(v["count"], 4);
+    assert_eq!(v["frames"], json!([0, 40, 79, 119]));
+    let img = decode(&v);
+    assert_eq!((img.width() as u64, img.height() as u64), (v["width"].as_u64().unwrap(), v["height"].as_u64().unwrap()));
+    assert!(img.width() <= 800 && img.height() <= 800);
+    let cell = v["cell"].as_array().unwrap();
+    assert!(cell[0].as_u64().unwrap() <= 320 && cell[1].as_u64().unwrap() <= 180);
+    // Labels draw light text on the dark strip below each cell.
+    let (cw, ch) = (cell[0].as_u64().unwrap() as u32, cell[1].as_u64().unwrap() as u32);
+    let strip = (4..4 + cw).flat_map(|x| (4 + ch..4 + ch + 18).map(move |y| (x, y)));
+    assert!(strip.into_iter().any(|(x, y)| img.get_pixel(x, y).0[0] > 150), "label text in the strip");
+    // Without labels: no strip.
+    let v2 = s.execute("render.contactSheet", json!({"count": 4, "base64": true, "max_side": 800, "labels": false, "cols": 4})).unwrap();
+    assert_eq!(v2["rows"], 1);
+    assert_eq!(v2["cols"], 4);
+    // Explicit times, a range, overlays and a solo layer.
+    let v = s.execute("render.contactSheet", json!({"times": [0, 1.5, 3], "layer": "Red", "overlays": ["motionPath"], "base64": true})).unwrap();
+    assert_eq!(v["times"], json!([0.0, 1.5, 3.0]));
+    assert_eq!(v["overlays"], json!(["motionPath"]));
+    let v = s.execute("render.contactSheet", json!({"start": 1, "end": 2, "count": 3, "base64": true})).unwrap();
+    assert_eq!(v["frames"], json!([30, 45, 59]));
+    // More frames than the range has: one per frame.
+    let v = s.execute("render.contactSheet", json!({"start": 0, "end": 0.1, "count": 10, "base64": true})).unwrap();
+    assert_eq!(v["frames"], json!([0, 1, 2]));
+}
+
+#[test]
+fn contact_sheet_caps_and_rejects_hostile_input() {
+    let mut s = session();
+    let v = s.execute("render.contactSheet", json!({"count": u64::MAX, "max_side": 256, "base64": true})).unwrap();
+    assert_eq!(v["count"], super::MAX_CELLS);
+    assert!(v["note"].as_str().unwrap().contains("capped"));
+    let many: Vec<f64> = (0..500).map(|i| i as f64 / 100.0).collect();
+    let v = s.execute("render.contactSheet", json!({"times": many, "max_side": 256, "base64": true})).unwrap();
+    assert_eq!(v["count"], super::MAX_CELLS);
+    assert_eq!(v["requested"], 500);
+    let v = s.execute("render.contactSheet", json!({"count": 2, "cols": 1000, "base64": true, "max_side": 1})).unwrap();
+    assert_eq!(v["cols"], 2);
+    for (p, want) in [
+        (json!({"count": 0}), "at least 1"),
+        (json!({"cols": 0}), "at least 1"),
+        (json!({"times": []}), "empty"),
+        (json!({"times": [0, "x"]}), "not a number"),
+        (json!({"times": 3}), "list"),
+        (json!({"start": 2, "end": 1}), "before"),
+        (json!({"region": [0, 0, 0, 0]}), "positive"),
+        (json!({"layer": "Nope"}), "no layer"),
+        (json!({"time": 1}), "unknown parameter"),
+    ] {
+        let e = err(&mut s, "render.contactSheet", p.clone());
+        assert!(e.contains(want), "{p}: {e}");
+    }
+}
+
+#[test]
+fn contact_sheet_writes_png_and_gif() {
+    let mut s = session();
+    let dir = std::env::temp_dir().join(format!("ec-contact-sheet-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (png, gif) = (dir.join("s.png"), dir.join("s.gif"));
+    let v = s
+        .execute("render.contactSheet", json!({"count": 3, "path": png.to_string_lossy(), "gif": gif.to_string_lossy(), "max_side": 400, "transparent": true}))
+        .unwrap();
+    assert_eq!(v["path"], json!(png.to_string_lossy()));
+    assert!(v.get("png").is_none());
+    assert_eq!(image::open(&png).unwrap().width() as u64, v["width"].as_u64().unwrap());
+    let g = std::fs::read(&gif).unwrap();
+    assert!(g.starts_with(b"GIF89a"));
+    let _ = std::fs::remove_dir_all(dir);
+}
