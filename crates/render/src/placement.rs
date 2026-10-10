@@ -2,6 +2,7 @@
 //! region of interest, motion-blur sub-samples, sampling, and the changed region.
 
 use crate::color::Region;
+use crate::motion_blur::MotionMemo;
 use crate::{EvalCtx, Image, Renderer, color};
 use effectcraft_color::BlendMode;
 use effectcraft_effects::Buf;
@@ -47,10 +48,15 @@ impl<'a> Renderer<'a> {
         }
     }
 
-    /// Buffer pixel → output pixel matrix for the layer at the context time.
-    pub(crate) fn buf_matrix(&self, ctx: &EvalCtx, layer: &Layer, buf: &Buf) -> Mat3 {
+    /// Layer → (top-level) comp matrix at the context time: through the collapsed precomps.
+    pub(crate) fn comp_matrix(&self, ctx: &EvalCtx, layer: &Layer) -> Mat3 {
         let (l2c, _) = ctx.layer_to_comp(layer);
-        self.place_matrix(self.outer.map_or(l2c, |o| o * l2c), buf)
+        self.outer.map_or(l2c, |o| o * l2c)
+    }
+
+    /// Buffer pixel → output pixel matrix for the layer at the context time.
+    pub(crate) fn buf_matrix(&self, ctx: &EvalCtx, layer: &Layer, buf: &Buf, mo: &MotionMemo) -> Mat3 {
+        self.place_matrix(mo.still(|| self.comp_matrix(ctx, layer)), buf)
     }
 
     /// Buffer pixel → output pixel matrix for a layer → (top-level) comp matrix.
@@ -69,11 +75,11 @@ impl<'a> Renderer<'a> {
     ///
     /// A quantised buffer placed pixel-exactly (integer translation, Normal, 100%) over a blank
     /// canvas leaves exactly its own (quantised) pixels: nothing to re-quantise.
-    pub(crate) fn footprint(&self, ctx: &EvalCtx, layer: &Layer, buf: &Buf, opacity: f32, blank: bool) -> Region {
-        if layer.blend_mode.is_stencil() || self.mb_samples(ctx, layer, buf) > 1 {
+    pub(crate) fn footprint(&self, ctx: &EvalCtx, layer: &Layer, buf: &Buf, opacity: f32, blank: bool, mo: &MotionMemo) -> Region {
+        if layer.blend_mode.is_stencil() || self.mb_samples(ctx, layer, buf, mo) > 1 {
             return Region::Full;
         }
-        let m = self.buf_matrix(ctx, layer, buf);
+        let m = self.buf_matrix(ctx, layer, buf, mo);
         if !m.is_affine() {
             return Region::Full;
         }
@@ -105,19 +111,30 @@ impl<'a> Renderer<'a> {
     /// How a processed layer buffer lands in the output: one buffer → output matrix, or one per
     /// motion-blur sub-sample (averaged), with the layer's sampling filter and dissolve seed.
     pub fn placement(&self, ctx: &EvalCtx, layer: &Layer, buf: &Buf) -> Placement {
-        let samples = self.mb_samples(ctx, layer, buf);
+        self.placement_memo(ctx, layer, buf, &MotionMemo::default())
+    }
+
+    /// [`Self::placement`] sharing the layer's matrices with the draw's other buffers and steps.
+    pub(crate) fn placement_memo(&self, ctx: &EvalCtx, layer: &Layer, buf: &Buf, mo: &MotionMemo) -> Placement {
+        let samples = self.mb_samples(ctx, layer, buf, mo);
         let (sampling, seed) = (self.sampling(layer), layer.id.0 as u32);
         if samples <= 1 {
-            return Placement { matrices: vec![self.buf_matrix(ctx, layer, buf)], sampling, seed };
+            return Placement { matrices: vec![self.buf_matrix(ctx, layer, buf, mo)], sampling, seed };
         }
         let sh = self.shutter(ctx);
-        let matrices = (0..samples).map(|i| self.buf_matrix_at(ctx, layer, buf, sh.offset(i, samples))).collect();
+        let matrices = (0..samples).map(|i| self.buf_matrix_at(ctx, layer, buf, sh.offset(i, samples), mo)).collect();
         Placement { matrices, sampling, seed }
     }
 
     /// Draw a processed layer into `target` (transform, motion blur) with `mode`/`opacity`.
     pub(crate) fn place(&self, ctx: &EvalCtx, layer: &Layer, buf: &Buf, target: &mut Image, mode: BlendMode, opacity: f32) {
-        let pl = self.placement(ctx, layer, buf);
+        self.place_memo(ctx, layer, buf, target, mode, opacity, &MotionMemo::default());
+    }
+
+    /// [`Self::place`] sharing the layer's matrices through `mo` (see [`MotionMemo`]).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn place_memo(&self, ctx: &EvalCtx, layer: &Layer, buf: &Buf, target: &mut Image, mode: BlendMode, opacity: f32, mo: &MotionMemo) {
+        let pl = self.placement_memo(ctx, layer, buf, mo);
         let opts = WarpOpts { sampling: pl.sampling, opacity, mode, seed: pl.seed, clip: None };
         // One minification chain for every sub-sample (built only when the layer is shrunk).
         let mips = MipChain::new(&buf.img);

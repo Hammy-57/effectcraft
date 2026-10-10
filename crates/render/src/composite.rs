@@ -2,6 +2,7 @@
 //! Transparency, blended into the comp with the layer's mode and opacity.
 
 use crate::color::Region;
+use crate::motion_blur::MotionMemo;
 use crate::{EvalCtx, Image, LayerTiming, Renderer, StyledLayer, styles};
 use effectcraft_color::BlendMode;
 use effectcraft_effects::Buf;
@@ -35,11 +36,13 @@ impl<'a> Renderer<'a> {
         let t0 = web_time::Instant::now();
         let Some(st) = self.styled_blend(ctx, layer, timing.as_mut()) else { return Region::Empty };
         let t1 = web_time::Instant::now();
+        // The layer's transforms are evaluated once for all of its buffers and steps.
+        let mo = MotionMemo::default();
         let changed = if st.plain {
-            self.composite_layer(ctx, layer, &st.body, canvas, opacity);
-            self.footprint(ctx, layer, &st.body, opacity, blank)
+            self.composite_layer(ctx, layer, &st.body, canvas, opacity, &mo);
+            self.footprint(ctx, layer, &st.body, opacity, blank, &mo)
         } else {
-            self.composite_styled(ctx, layer, &st, canvas, opacity);
+            self.composite_styled(ctx, layer, &st, canvas, opacity, &mo);
             Region::Full
         };
         if let (Some(prof), Some(mut timing)) = (self.profile, timing) {
@@ -55,22 +58,22 @@ impl<'a> Renderer<'a> {
     /// Composite a styled layer: exterior passes with their own modes, then the body with the
     /// layer's mode; the layer's opacity fades the whole stack. Knockout clears what is below the
     /// layer's content; switched-off R/G/B channels keep the values below.
-    fn composite_styled(&self, ctx: &EvalCtx, layer: &Layer, st: &StyledLayer, canvas: &mut Image, opacity: f32) {
+    fn composite_styled(&self, ctx: &EvalCtx, layer: &Layer, st: &StyledLayer, canvas: &mut Image, opacity: f32, mo: &MotionMemo) {
         let bl = styles::blending(ctx, layer);
         let matte = layer.track_matte.is_some_and(|tm| tm.layer != layer.id && ctx.comp.layer(tm.layer).is_some());
         if matte || layer.preserve_transparency {
             let mut iso = pool::zeroed(canvas.width, canvas.height);
             for (b, m) in &st.passes {
-                self.place(ctx, layer, b, &mut iso, *m, 1.0);
+                self.place_memo(ctx, layer, b, &mut iso, *m, 1.0, mo);
             }
-            self.place(ctx, layer, &st.body, &mut iso, BlendMode::Normal, 1.0);
+            self.place_memo(ctx, layer, &st.body, &mut iso, BlendMode::Normal, 1.0, mo);
             self.composite_iso(ctx, layer, iso, canvas, opacity);
             return;
         }
         let mut tmp = pool::copy_of(canvas);
         if bl.knockout > 0 {
             let mut k = pool::zeroed(canvas.width, canvas.height);
-            self.place(ctx, layer, &st.content, &mut k, BlendMode::Normal, 1.0);
+            self.place_memo(ctx, layer, &st.content, &mut k, BlendMode::Normal, 1.0, mo);
             tmp.data.par_iter_mut().zip(k.data.par_iter()).for_each(|(p, q)| {
                 let keep = 1.0 - q[3].clamp(0.0, 1.0);
                 for c in p.iter_mut() {
@@ -80,9 +83,9 @@ impl<'a> Renderer<'a> {
             pool::recycle(k);
         }
         for (b, m) in &st.passes {
-            self.place(ctx, layer, b, &mut tmp, *m, 1.0);
+            self.place_memo(ctx, layer, b, &mut tmp, *m, 1.0, mo);
         }
-        self.place(ctx, layer, &st.body, &mut tmp, layer.blend_mode, 1.0);
+        self.place_memo(ctx, layer, &st.body, &mut tmp, layer.blend_mode, 1.0, mo);
         let ch = bl.channels;
         canvas.data.par_iter_mut().zip(tmp.data.par_iter()).for_each(|(c, t)| {
             for i in 0..4 {
@@ -93,15 +96,15 @@ impl<'a> Renderer<'a> {
         pool::recycle(tmp);
     }
 
-    fn composite_layer(&self, ctx: &EvalCtx, layer: &Layer, buf: &Buf, canvas: &mut Image, opacity: f32) {
+    fn composite_layer(&self, ctx: &EvalCtx, layer: &Layer, buf: &Buf, canvas: &mut Image, opacity: f32, mo: &MotionMemo) {
         let matte = layer.track_matte.is_some_and(|tm| tm.layer != layer.id && ctx.comp.layer(tm.layer).is_some());
         if !matte && !layer.preserve_transparency {
-            self.place(ctx, layer, buf, canvas, layer.blend_mode, opacity);
+            self.place_memo(ctx, layer, buf, canvas, layer.blend_mode, opacity, mo);
             return;
         }
         // Render in isolation, then matte / preserve transparency, then blend.
         let mut iso = pool::zeroed(canvas.width, canvas.height);
-        self.place(ctx, layer, buf, &mut iso, BlendMode::Normal, 1.0);
+        self.place_memo(ctx, layer, buf, &mut iso, BlendMode::Normal, 1.0, mo);
         self.composite_iso(ctx, layer, iso, canvas, opacity);
     }
 
