@@ -308,3 +308,37 @@ fn duplicated_text_boxes_both_remain_editable() {
         assert_eq!(layer_doc(&h.state().session, LayerId(layer)).unwrap().text, text);
     }
 }
+
+#[test]
+fn overlapping_duplicate_text_remains_editable_by_double_click_and_selected_type_tool() {
+    let mut a = app();
+    let original = a.session.execute("layer.newText", json!({"text": "alpha beta", "size": 40, "box": [40, 60, 250, 100]})).unwrap()["layer"].as_u64().unwrap();
+    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).with_step_dt(1.0 / 60.0).build_eframe(move |_| a);
+    h.run_steps(3);
+    h.state_mut().ui.focused = PanelKind::Composition;
+    key(&mut h, Key::D, Modifiers::COMMAND);
+    let duplicate = h.state().session.state.selected_layers[0].0;
+    assert_ne!(original, duplicate);
+    let comp = rect(&h, "viewer.comp");
+    let p = comp.min + egui::vec2(80.0, 85.0) * (comp.width() / 640.0);
+    click(&mut h, p, Modifiers::NONE);
+    click(&mut h, p, Modifiers::NONE);
+    assert_eq!(edited(&h).0, duplicate, "double-click edits the topmost overlapping copy");
+    type_text(&mut h, "copy edited");
+    assert_eq!(edited(&h).1, "copy edited");
+    key(&mut h, Key::Z, Modifiers::COMMAND);
+    assert_eq!(edited(&h).1, "alpha beta", "undo restores the duplicate's text");
+    key(&mut h, Key::Escape, Modifiers::NONE);
+    h.state_mut().session.execute("layer.select", json!({"layers": [original]})).unwrap();
+    h.state_mut().ui.focused = PanelKind::Composition;
+    key(&mut h, Key::T, Modifiers::COMMAND);
+    h.run_steps(40);
+    click(&mut h, p, Modifiers::NONE);
+    assert_eq!(edited(&h).0, original, "the Type tool must honor the explicitly selected overlapping text layer");
+    key(&mut h, Key::A, Modifiers::COMMAND);
+    type_text(&mut h, "original edited");
+    assert_eq!(edited(&h).1, "original edited");
+    assert_eq!(layer_doc(&h.state().session, LayerId(duplicate)).unwrap().text, "alpha beta", "editing the original leaves the duplicate unchanged");
+    key(&mut h, Key::Z, Modifiers::COMMAND);
+    assert_eq!(edited(&h).1, "alpha beta");
+}
