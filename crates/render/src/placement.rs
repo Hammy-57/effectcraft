@@ -475,7 +475,10 @@ mod tests {
         for (n, &x) in spots.iter().enumerate() {
             for &y in &[-90.0, -30.0, -8.0, 50.0, 108.0, 140.0, 200.0] {
                 let mut layers: Vec<Layer> = vec![];
-                for (j, mut l) in [text(&mut p, &comp, 4.0), blurred_text(&mut p, &comp), shape(&mut p, &comp, [55.0, 0.0]), shape(&mut p, &comp, [0.0, -45.0])].into_iter().enumerate() {
+                for (j, mut l) in [text(&mut p, &comp, 4.0), blurred_text(&mut p, &comp), shape(&mut p, &comp, [55.0, 0.0]), shape(&mut p, &comp, [0.0, -45.0])]
+                    .into_iter()
+                    .enumerate()
+                {
                     place(&mut l, [x, y], 23.0 * (n + j) as f64, 60.0 + 35.0 * j as f64);
                     l.switches.collapse = j % 2 == 0;
                     l.name = format!("{j}");
