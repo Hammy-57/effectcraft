@@ -10,6 +10,10 @@ pub struct Element {
     pub id: String,
     pub label: String,
     pub rect: [f32; 4],
+    /// The undocked panel group's OS window the element is in ([`crate::dock::Floating::id`]);
+    /// `rect` is then in that window's coordinates. Absent for the main window.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window: Option<u64>,
 }
 
 #[derive(Default)]
@@ -17,11 +21,18 @@ pub struct Registry {
     pub elements: Vec<Element>,
     /// Last frame's elements (for lookups from control handlers between frames).
     pub previous: Vec<Element>,
+    /// The OS window being drawn (elements added now are in it), `None` for the main window.
+    pub window: Option<u64>,
 }
 
 impl Registry {
     pub fn add(&mut self, id: &str, rect: Rect, label: &str) {
-        self.elements.push(Element { id: id.to_string(), label: label.to_string(), rect: [rect.min.x, rect.min.y, rect.width(), rect.height()] });
+        self.elements.push(Element {
+            id: id.to_string(),
+            label: label.to_string(),
+            rect: [rect.min.x, rect.min.y, rect.width(), rect.height()],
+            window: self.window,
+        });
     }
     pub fn begin_frame(&mut self) {
         self.previous = std::mem::take(&mut self.elements);

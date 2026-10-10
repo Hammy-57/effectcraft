@@ -231,6 +231,8 @@ pub struct EffectcraftApp {
     pub(crate) control_rx: Option<Receiver<ControlRequest>>,
     pub(crate) deferred: Vec<(ControlRequest, f64)>,
     pub(crate) synthetic: Vec<egui::Event>,
+    /// Undocked panel groups shown as OS windows (desktop multi-viewport).
+    pub(crate) os_windows: float_windows::OsWindows,
     pub(crate) input_waiters: Vec<Sender<serde_json::Value>>,
     /// Control requests waiting for an offloaded job (`wait: true` in the browser).
     pub(crate) job_waiters: Vec<(control::JobWaiter, Sender<serde_json::Value>)>,
@@ -326,6 +328,7 @@ impl EffectcraftApp {
             control_rx: None,
             deferred: vec![],
             synthetic: vec![],
+            os_windows: Default::default(),
             input_waiters: vec![],
             job_waiters: vec![],
             queued_screenshots: vec![],
@@ -476,6 +479,10 @@ impl EffectcraftApp {
     pub fn show_panel(&mut self, p: PanelKind) {
         if !self.ui.floating.iter().any(|f| f.panels.contains(&p)) && self.ui.maximized.is_some_and(|m| m != p) {
             self.ui.maximized = None;
+        }
+        if let Some(f) = self.ui.floating.iter().find(|f| f.panels.contains(&p)) {
+            // Its OS window comes to the front too.
+            self.os_windows.raise = Some(f.id);
         }
         self.raise_panel(p);
         self.ui.focused = p;
@@ -1631,16 +1638,7 @@ impl eframe::App for EffectcraftApp {
 
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         if !self.synthetic.is_empty() {
-            // Pointer events go one per frame so egui sees press → moves → release as a real drag.
-            let pointer = |e: &egui::Event| matches!(e, egui::Event::PointerMoved(_) | egui::Event::PointerButton { .. } | egui::Event::MouseWheel { .. });
-            let n = if pointer(&self.synthetic[0]) {
-                1
-            } else {
-                self.synthetic
-                    .iter()
-                    .position(|e| pointer(e) || matches!(e, egui::Event::Key { pressed: false, .. }))
-                    .map_or(self.synthetic.len(), |i| if pointer(&self.synthetic[i]) { i.max(1) } else { i + 1 })
-            };
+            let n = synthetic_batch(&self.synthetic);
             raw_input.events.extend(self.synthetic.drain(..n));
         }
     }
@@ -1671,7 +1669,7 @@ impl eframe::App for EffectcraftApp {
         self.last_time = now;
         self.drain_control(ctx);
         self.publish_control_events(ctx);
-        if !self.synthetic.is_empty() {
+        if !self.synthetic.is_empty() || float_windows::input_pending(ctx) {
             ctx.request_repaint();
         } else if !self.input_waiters.is_empty() {
             for w in self.input_waiters.drain(..) {
@@ -1695,7 +1693,7 @@ impl eframe::App for EffectcraftApp {
             ctx.request_repaint();
         }
         self.last_ui_time = ctx.input(|i| i.time);
-        if !self.synthetic.is_empty() {
+        if !self.synthetic.is_empty() || float_windows::input_pending(&ctx) {
             ctx.request_repaint();
         } else if !self.input_waiters.is_empty() {
             ctx.request_repaint();
@@ -1708,6 +1706,21 @@ impl eframe::App for EffectcraftApp {
         }
         // Edits made by this frame's input.
         self.publish_control_events(&ctx);
+    }
+}
+
+/// How many of the queued synthetic events (`ui.click`, `ui.key` …) go into the next frame:
+/// pointer events one per frame, so egui sees press → moves → release as a real drag; keys up to
+/// and including the next release.
+pub(crate) fn synthetic_batch(queue: &[egui::Event]) -> usize {
+    let pointer = |e: &egui::Event| matches!(e, egui::Event::PointerMoved(_) | egui::Event::PointerButton { .. } | egui::Event::MouseWheel { .. });
+    match queue.first() {
+        None => 0,
+        Some(e) if pointer(e) => 1,
+        Some(_) => queue
+            .iter()
+            .position(|e| pointer(e) || matches!(e, egui::Event::Key { pressed: false, .. }))
+            .map_or(queue.len(), |i| if queue.get(i).is_some_and(pointer) { i.max(1) } else { i + 1 }),
     }
 }
 

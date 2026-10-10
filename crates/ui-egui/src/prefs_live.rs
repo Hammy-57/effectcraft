@@ -37,7 +37,11 @@ fn dropped_files(app: &mut EffectcraftApp, ctx: &egui::Context) {
         app.ui.status = e;
     }
     if !rest.is_empty() {
-        let viewer = app.auto.find("viewer.area").map(|e| Rect::from_min_size(egui::pos2(e.rect[0], e.rect[1]), egui::vec2(e.rect[2], e.rect[3])));
+        let viewer = app
+            .auto
+            .find("viewer.area")
+            .filter(|e| e.window.is_none())
+            .map(|e| Rect::from_min_size(egui::pos2(e.rect[0], e.rect[1]), egui::vec2(e.rect[2], e.rect[3])));
         let at =
             ctx.input(|i| i.pointer.hover_pos()).filter(|p| viewer.is_some_and(|v| v.contains(*p))).and_then(|p| crate::panels::viewer::screen_to_comp(ctx, p));
         let params =
