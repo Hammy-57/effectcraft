@@ -21,7 +21,8 @@
 //! render log (Errors Only / Plus Settings / Plus Per Frame Info) is written next to the output.
 //!
 //! Frames are rendered in parallel batches (rayon; one batch ≈ one frame per core) and handed to
-//! the encoder in order. Progress is reported after each batch through a callback that can cancel
+//! the encoder in order. They share the job's layer cache, as viewer frames share the viewer's:
+//! static and transform-only layers render once per job. Progress is reported after each batch through a callback that can cancel
 //! the job by returning `false`. Codecs and the MP4/MOV muxer are FilmCraft's pure-Rust crates
 //! (plan ADR 0001); nothing outside this crate touches them.
 //!
@@ -74,7 +75,8 @@ pub struct Job<'a> {
     pub project: &'a Project,
     pub footage: &'a dyn FootageSource,
     pub expr: Option<&'a dyn ExprHost>,
-    /// GPU compositor: used when the project's renderer is Mercury GPU Acceleration.
+    /// GPU compositor: used for every frame of the job when the project's renderer is Mercury
+    /// GPU Acceleration (frames it declines render on the CPU).
     pub accel: Option<&'a dyn effectcraft_render::Accelerator>,
     pub comp: ItemId,
     pub settings: &'a RenderSettings,

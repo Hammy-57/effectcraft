@@ -659,6 +659,52 @@ fn backend_selection_and_display_frames() {
     }
 }
 
+/// The display texture carries a full mip chain, each level the 2 × 2 mean of the one above, so the
+/// viewer minifies a frame without aliasing (#417).
+#[test]
+fn display_frames_are_mipmapped() {
+    let Some(g) = gpu() else { return };
+    let s = blend_scene(BitDepth::Bpc8, BlendMode::Screen);
+    let mut r = Renderer::new(&s.p, &Pattern, opts());
+    r.accel = Some(g);
+    let f = g.render_display(&r, s.cid, Tick::ZERO).expect("display frame");
+    assert_eq!(f.texture.mip_level_count(), crate::context::mip_levels(f.width, f.height));
+    assert_eq!(f.texture.mip_level_count(), u32::BITS - f.width.max(f.height).leading_zeros());
+    let base = g.read_display(&f).expect("readback");
+    // Level 1, copied out to read it back.
+    let (w1, h1) = (f.width / 2, f.height / 2);
+    let tex = g.device().create_texture(&wgpu::TextureDescriptor {
+        label: None,
+        size: wgpu::Extent3d { width: w1, height: h1, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let mut e = crate::context::Enc::new(&g.ctx);
+    e.encoder().copy_texture_to_texture(
+        wgpu::TexelCopyTextureInfo { texture: &f.texture, mip_level: 1, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+        wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+        wgpu::Extent3d { width: w1, height: h1, depth_or_array_layers: 1 },
+    );
+    let level1 = e.read_texture(&tex, w1, h1, 4).expect("level 1");
+    let at = |x: u32, y: u32, c: usize| base[((y * f.width + x) * 4) as usize + c] as f32;
+    let mut varied = false;
+    for y in 0..h1 {
+        for x in 0..w1 {
+            for c in 0..4 {
+                let want = (at(2 * x, 2 * y, c) + at(2 * x + 1, 2 * y, c) + at(2 * x, 2 * y + 1, c) + at(2 * x + 1, 2 * y + 1, c)) / 4.0;
+                let got = level1[((y * w1 + x) * 4) as usize + c] as f32;
+                assert!((want - got).abs() <= 1.0, "({x}, {y}) channel {c}: {got} against the mean {want}");
+                varied |= want != at(2 * x, 2 * y, c);
+            }
+        }
+    }
+    assert!(varied, "the scene has edges to average");
+}
+
 /// Browsers' WGSL compilers reject an f32 literal whose exact decimal value lies outside the f32
 /// range (`3.40282347e38` rounds to f32::MAX in Rust but exceeds it), which invalidates the whole
 /// module (every kernel); naga accepts it, so native runs can't catch it. Every float literal

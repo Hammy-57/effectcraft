@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use effectcraft_project::{AlphaMode, Footage, FootageKind, ItemId};
 use effectcraft_raster::{Image, Px};
@@ -37,7 +37,9 @@ fn colour_bars(w: u32, h: u32) -> Image {
 struct Key {
     path: Arc<str>,
     frame: i64,
-    alpha: u8,
+    /// The alpha interpretation (bits 0–1) and Preserve RGB (bit 2): they change the decoded
+    /// pixels.
+    interp: u8,
     matte: [u32; 3],
     crop: Option<[u64; 4]>,
 }
@@ -52,8 +54,25 @@ struct Entry {
 /// version 1 files of sources longer than about 12:36 at 48 kHz were silent from there on (#172).
 const CONFORM_VERSION: u32 = 2;
 
+/// Footage longer than this (24 hours) is read from its decoder rather than conformed: its
+/// duration comes from the file's header, and a damaged one claiming days of audio had the
+/// conform thread allocate all of it at once (#408).
+const MAX_CONFORM_SECONDS: i64 = 24 * 3600;
+
+/// The sample frames of `footage`'s audio at `rate` Hz that a conformed file holds, `None` past
+/// [`MAX_CONFORM_SECONDS`].
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+fn conform_frames(footage: &Footage, rate: u32) -> Option<usize> {
+    let frames = footage.duration.to_units_floor(i64::from(rate)).max(0);
+    if frames > MAX_CONFORM_SECONDS.saturating_mul(i64::from(rate)) {
+        return None;
+    }
+    usize::try_from(frames).ok()
+}
+
 /// The source time of sample frame `at` at `rate` Hz. (`at` × ticks per second overflows `i64`
 /// past about 12:36 at 48 kHz.)
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 fn sample_time(at: usize, rate: u32) -> Tick {
     Tick::from_units(i64::try_from(at).unwrap_or(i64::MAX), i64::from(rate))
 }
@@ -134,6 +153,8 @@ pub struct PoolStats {
     /// Frames currently cached and their total size in bytes.
     pub frames: usize,
     pub bytes: usize,
+    /// Movie and audio files opened (each path once, however many callers ask for it at once).
+    pub opened: u64,
 }
 
 #[derive(Default)]
@@ -145,9 +166,15 @@ struct CacheState {
     last: HashMap<Arc<str>, i64>,
 }
 
+/// A movie/audio source by path, opened by the first caller while the others wait for it
+/// (`None`: failed to open; not retried until `forget`).
+type SourceSlot = Arc<OnceLock<Option<SharedSource>>>;
+
 struct Inner {
-    /// Opened movie/audio sources by path (`None`: failed to open; not retried until `forget`).
-    sources: Mutex<HashMap<Arc<str>, Option<SharedSource>>>,
+    /// Opened movie/audio sources by path.
+    sources: Mutex<HashMap<Arc<str>, SourceSlot>>,
+    /// Files opened into `sources` (see [`PoolStats::opened`]).
+    opened: AtomicU64,
     /// In-memory files registered with `add_bytes` (web builds, tests).
     files: Mutex<HashMap<String, Arc<[u8]>>>,
     /// Parsed 3D models by path (`None`: failed to load; not retried until `forget`).
@@ -227,6 +254,7 @@ impl MediaPool {
                 hits: AtomicU64::new(0),
                 misses: AtomicU64::new(0),
                 prefetched: AtomicU64::new(0),
+                opened: AtomicU64::new(0),
                 conform: Mutex::default(),
                 conforming: Mutex::default(),
             }),
@@ -258,6 +286,7 @@ impl MediaPool {
             prefetched: i.prefetched.load(Ordering::Relaxed),
             frames: c.lru.map.len(),
             bytes: c.lru.bytes,
+            opened: i.opened.load(Ordering::Relaxed),
         }
     }
 
@@ -335,30 +364,21 @@ impl MediaPool {
         Some(out)
     }
 
-    /// Conform `footage`'s audio at `rate` into `file` on a worker thread (once).
+    /// Conform `frames` sample frames of `footage`'s audio at `rate` into `file` on a worker
+    /// thread (once).
     #[cfg(not(target_arch = "wasm32"))]
-    fn conform(&self, footage: &Footage, file: std::path::PathBuf, rate: u32) {
+    fn conform(&self, footage: &Footage, file: std::path::PathBuf, frames: usize, rate: u32) {
         if !lock(&self.inner.conforming).insert(file.clone()) {
             return;
         }
         let (pool, f) = (self.clone(), footage.clone());
         let spawned = std::thread::Builder::new().name("ec-conform-audio".into()).spawn(move || {
-            let frames = f.duration.to_units_floor(rate as i64).max(0) as usize;
-            let mut bytes = Vec::with_capacity(frames * 8);
-            let mut at = 0usize;
-            while at < frames {
-                let n = (frames - at).min(1 << 16);
-                let t = sample_time(at, rate);
-                for v in pool.decode_audio(&f, t, n, rate) {
-                    bytes.extend_from_slice(&v.to_le_bytes());
-                }
-                at += n;
-            }
-            let ok = file.parent().is_some_and(|d| std::fs::create_dir_all(d).is_ok()) && {
-                let tmp = file.with_extension("tmp");
-                std::fs::write(&tmp, &bytes).is_ok() && std::fs::rename(&tmp, &file).is_ok()
-            };
+            let tmp = file.with_extension("tmp");
+            let ok = file.parent().is_some_and(|d| std::fs::create_dir_all(d).is_ok())
+                && pool.write_conformed(&f, &tmp, frames, rate).is_ok()
+                && std::fs::rename(&tmp, &file).is_ok();
             if !ok {
+                let _ = std::fs::remove_file(&tmp);
                 log::warn!("media: could not write conformed audio {}", file.display());
             }
             lock(&pool.inner.conforming).remove(&file);
@@ -366,6 +386,23 @@ impl MediaPool {
         if spawned.is_err() {
             lock(&self.inner.conforming).clear();
         }
+    }
+
+    /// Write `frames` sample frames of `footage`'s audio at `rate` to `path` (raw interleaved
+    /// stereo `f32`) a chunk at a time: the whole track was held in memory before it was written.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn write_conformed(&self, footage: &Footage, path: &std::path::Path, frames: usize, rate: u32) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
+        let mut at = 0usize;
+        while at < frames {
+            let n = (frames - at).min(1 << 16);
+            for v in self.decode_audio(footage, sample_time(at, rate), n, rate) {
+                out.write_all(&v.to_le_bytes())?;
+            }
+            at += n;
+        }
+        out.flush()
     }
 
     /// `frames` stereo sample frames of `footage`'s audio starting at source time `start`, at
@@ -377,7 +414,9 @@ impl MediaPool {
             return vec![0.0; frames * 2];
         }
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(file) = self.conformed_path(&footage.path, rate) {
+        if let Some(conform) = conform_frames(footage, rate)
+            && let Some(file) = self.conformed_path(&footage.path, rate)
+        {
             let s0 = start.to_units_floor(rate as i64);
             if file.exists() && !lock(&self.inner.conforming).contains(&file) {
                 let skip = (-s0).max(0) as usize;
@@ -390,7 +429,7 @@ impl MediaPool {
                     return out;
                 }
             } else {
-                self.conform(footage, file, rate);
+                self.conform(footage, file, conform, rate);
             }
         }
         self.decode_audio(footage, start, frames, rate)
@@ -477,24 +516,28 @@ impl Inner {
         std::fs::read(path).map(Into::into).map_err(|e| MediaError::Io(format!("{path}: {e}")))
     }
 
-    /// The opened movie/audio source for `path`.
+    /// The opened movie/audio source for `path`. The first caller opens it, outside the map's
+    /// lock (reading and parsing a large file takes a moment; FLAC, MP3, Ogg and AIFF files are
+    /// decoded whole); callers asking for the same file meanwhile wait for that instead of opening
+    /// it again: a preview's frame workers, audio feeder, conform and waveform threads each
+    /// decoded a long FLAC in full at once (#408).
     fn source(&self, path: &Arc<str>) -> Option<SharedSource> {
-        if let Some(s) = lock(&self.sources).get(path) {
-            return s.clone();
-        }
-        // open outside the lock (reading and parsing a large file takes a moment)
-        let opened = self.read(path).and_then(|bytes| {
-            let name = std::path::Path::new(&**path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-            filmcraft_codecs::open_bytes(&name, bytes).map_err(MediaError::from)
-        });
-        let opened = match opened {
-            Ok(s) => Some(s),
-            Err(e) => {
-                log::warn!("media: cannot open {path}: {e}");
-                None
+        let slot = lock(&self.sources).entry(path.clone()).or_default().clone();
+        slot.get_or_init(|| {
+            self.opened.fetch_add(1, Ordering::Relaxed);
+            let opened = self.read(path).and_then(|bytes| {
+                let name = std::path::Path::new(&**path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                filmcraft_codecs::open_bytes(&name, bytes).map_err(MediaError::from)
+            });
+            match opened {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    log::warn!("media: cannot open {path}: {e}");
+                    None
+                }
             }
-        };
-        lock(&self.sources).entry(path.clone()).or_insert(opened).clone()
+        })
+        .clone()
     }
 
     /// The frame index (in the footage's interpreted rate) shown at source time `t`, after
@@ -517,9 +560,10 @@ impl Inner {
             AlphaMode::Premultiplied => 1,
             AlphaMode::Ignore => 2,
         };
+        let interp = alpha | (u8::from(footage.preserve_rgb) << 2);
         let matte = if footage.alpha == AlphaMode::Premultiplied { footage.premul_color.map(f32::to_bits) } else { [0; 3] };
         let crop = footage.layer.as_ref().and_then(|l| l.crop_bounds).map(|b| b.map(f64::to_bits));
-        let key = |path: &str, frame| Key { path: path.into(), frame, alpha, matte, crop };
+        let key = |path: &str, frame| Key { path: path.into(), frame, interp, matte, crop };
         match footage.kind {
             FootageKind::Sequence if !footage.sequence.is_empty() => {
                 let i = Self::frame_index(footage.frame_rate, t, footage.sequence_frames(), footage.loop_count);
@@ -609,7 +653,7 @@ impl Inner {
     fn prefetch(self: &Arc<Self>, _footage: &Footage, _t: Tick) {}
 
     fn decode(&self, loc: &Loc, footage: &Footage) -> Result<Image> {
-        let op = AlphaOp::new(footage.alpha, footage.premul_color);
+        let op = AlphaOp::of(footage);
         let path = &loc.key.path;
         match loc.media_t {
             None if &**path == PLACEHOLDER => Ok(colour_bars(footage.width, footage.height)),
@@ -749,6 +793,37 @@ mod tests {
         assert!((sample_time(36_372_480, 48_000).seconds() - 757.76).abs() < 1e-9);
     }
 
+    /// #408: footage whose header claims a month of audio isn't conformed: the conform thread
+    /// allocated the whole conformed track up front (a terabyte here), and the failed allocation
+    /// aborted the app. Its audio is read from the decoder instead (silence: this file doesn't
+    /// decode).
+    #[test]
+    fn a_header_claiming_a_month_of_audio_is_not_conformed() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-conform-month");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("month.flac");
+        std::fs::write(&path, b"fLaC, not really").unwrap();
+        let footage = Footage {
+            path: path.to_string_lossy().into(),
+            kind: FootageKind::Audio,
+            duration: Tick::from_seconds_f64(30.0 * 86_400.0),
+            has_audio: true,
+            ..Default::default()
+        };
+        assert_eq!(conform_frames(&footage, 48_000), None);
+        assert_eq!(conform_frames(&Footage { duration: Tick::from_seconds_f64(60.0), ..footage.clone() }, 48_000), Some(2_880_000));
+        let pool = MediaPool::new();
+        let conformed = dir.join("conformed");
+        pool.set_conform_folder(Some(conformed.clone()));
+        let s = pool.audio_samples(&footage, Tick::from_seconds_f64(3600.0), 1024, 48_000);
+        assert_eq!(s.len(), 2048);
+        assert!(s.iter().all(|v| *v == 0.0));
+        assert!(lock(&pool.inner.conforming).is_empty(), "no conform thread started");
+        assert!(!conformed.exists(), "nothing was written");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn frame_index_loops_and_clamps() {
         let r = FrameRate::FPS_30;
@@ -777,7 +852,7 @@ mod tests {
     fn lru_respects_budget_and_recycles() {
         let mut c = Lru::default();
         let img = || Arc::new(Image::new(16, 16)); // 4 KiB + overhead
-        let k = |i| Key { path: "a".into(), frame: i, alpha: 0, matte: [0; 3], crop: None };
+        let k = |i| Key { path: "a".into(), frame: i, interp: 0, matte: [0; 3], crop: None };
         let budget = 3 * (4096 + 64);
         for i in 0..10 {
             c.insert(k(i), img(), budget);
@@ -791,5 +866,28 @@ mod tests {
         assert_eq!(c.spare.len(), MAX_SPARE);
         assert_eq!(c.take_spare(256).len(), 256);
         assert!(c.take_spare(17).is_empty());
+    }
+
+    /// #411: Interpret Footage ▸ Preserve RGB reads a float OpenEXR's values as the file stores
+    /// them (no automatic linear → sRGB encode), so an OCIO effect is the only conversion; the
+    /// default interpretation still encodes. Both interpretations of one file decode separately.
+    #[test]
+    fn preserve_rgb_reads_float_exr_values_unconverted() {
+        use exr::prelude::*;
+        let (w, h) = (2usize, 2usize);
+        let ch = |n: &str, v: f32| AnyChannel::new(n, FlatSamples::F32(vec![v; w * h]));
+        let channels = AnyChannels::sort(vec![ch("R", 0.18), ch("G", 0.5), ch("B", 2.0), ch("A", 1.0)].into());
+        let image = exr::image::Image::from_layer(Layer::new((w, h), LayerAttributes::default(), Encoding::FAST_LOSSLESS, channels));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image.write().to_buffered(&mut bytes).unwrap();
+        let b: Arc<[u8]> = bytes.into_inner().into();
+        let pool = MediaPool::new();
+        pool.add_bytes("/render.exr", b.clone());
+        let f = crate::probe_bytes("/render.exr", b).unwrap();
+        let encoded = pool.frame_at(&f, Tick::ZERO).unwrap().get(0, 0);
+        assert!((encoded[0] - 0.4613).abs() < 1e-3 && (encoded[1] - 0.7354).abs() < 1e-3 && encoded[2] > 1.3, "sRGB-encoded: {encoded:?}");
+        let raw = pool.frame_at(&Footage { preserve_rgb: true, ..f.clone() }, Tick::ZERO).unwrap().get(0, 0);
+        assert_eq!(raw, [0.18, 0.5, 2.0, 1.0]);
+        assert_eq!(pool.frame_at(&f, Tick::ZERO).unwrap().get(0, 0), encoded, "the default interpretation is cached apart");
     }
 }

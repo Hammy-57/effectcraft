@@ -213,6 +213,51 @@ fn card_dance_comp_camera_matches_the_default_view() {
     assert!(img.get(10, 50)[3] < 0.01);
 }
 
+/// A black 2D solid with CC Particle World, under a camera layer panned right by `pan` px.
+fn particle_world_scene(pan: f64) -> (Project, ItemId) {
+    let (mut p, cid, comp) = setup();
+    let mut l = solid(&mut p, &comp, [0.0, 0.0, 0.0], 200, 100);
+    let vals = [("birthRate", Value::Scalar(2.0)), ("particle/particleType", Value::Enum(2)), ("particle/birthSize", Value::Scalar(0.1))];
+    add_effect(&mut p, &mut l, "ec.sim.ccparticleworld", [200.0, 100.0], &vals);
+    let mut cam = build::layer(&mut p, &comp, "Camera", LayerSource::Camera, (200, 100), None);
+    for path in ["transform/position", "transform/poi"] {
+        let pr = cam.props.prop_mut(path).unwrap();
+        let Value::Vec3(v) = pr.value else { panic!("{path}: {:?}", pr.value) };
+        pr.value = Value::Vec3([v[0] + pan, v[1], v[2]]);
+    }
+    p.comp_mut(cid).unwrap().layers = vec![cam, l];
+    (p, cid)
+}
+
+/// The red-weighted centre of the particles (x).
+fn particles_x(img: &crate::Image) -> f32 {
+    let (mut m, mut sx) = (0.0, 0.0);
+    for y in 0..img.height {
+        for x in 0..img.width {
+            let r = img.get(x as i64, y as i64)[0];
+            m += r;
+            sx += r * x as f32;
+        }
+    }
+    assert!(m > 1.0, "particles drawn");
+    sx / m
+}
+
+/// #397: CC Particle World on a 2D layer is seen through the comp's camera layer, and the layer
+/// cache notices the camera moving.
+#[test]
+fn particle_world_follows_the_comp_camera() {
+    let t = Tick::from_seconds_f64(1.0);
+    let (p, cid) = particle_world_scene(0.0);
+    let (q, _) = particle_world_scene(40.0);
+    let cache = crate::LayerCache::default();
+    let here = render_cached(&p, cid, t, Some(&cache));
+    let panned = render_cached(&q, cid, t, Some(&cache));
+    assert_same(&panned, &render_cached(&q, cid, t, None), "cached render after the camera moved");
+    let (a, b) = (particles_x(&here), particles_x(&panned));
+    assert!(b < a - 20.0, "panning the camera right moves the particles left: {a} -> {b}");
+}
+
 // ------------------------------------------------------------------------------ layer cache
 
 fn render_cached(p: &Project, cid: ItemId, t: Tick, cache: Option<&crate::LayerCache>) -> crate::Image {

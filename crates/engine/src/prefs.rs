@@ -146,7 +146,6 @@ page!(Appearance {
     brightness: f64 = 0.0,
     /// The size of the whole interface in percent (75–200), on top of the display's own scale.
     ui_scale: u32 = 100,
-    parameter_row_separators: bool = true,
     use_label_color_for_handles: bool = true,
     use_label_color_for_tabs: bool = true,
     cycle_mask_colors: bool = true,
@@ -1036,7 +1035,6 @@ pub fn pages() -> Vec<Page> {
                 s("appearance.useLabelColorForTabs", "Use Label Color for Related Tabs", B, true),
                 s("appearance.cycleMaskColors", "Cycle Mask Colors", B, true),
                 s("appearance.useGradients", "Use Gradients", B, true),
-                s("appearance.parameterRowSeparators", "Show Parameter Row Separators", B, true),
                 Section("Menu Bar"),
                 s("appearance.inWindowMenuBarMac", "Use In-Window Menu Bar on macOS", B, true),
             ],

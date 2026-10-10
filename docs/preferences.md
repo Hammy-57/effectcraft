@@ -58,7 +58,6 @@ Commands (CLI, MCP, control channel):
 - `appearance.brightness`: Brightness
 - `appearance.uiScale`: UI Scale, the size of the whole interface (75–200 %, on top of the
   display's own scaling), applied as soon as it is chosen
-- `appearance.parameterRowSeparators`: thin dark boundaries between parameter/group rows in Effect Controls and the timeline (default on). Expanded sliders and dials are kept within their parameter block. Effect Controls indents each group level beneath its effect, aligns sibling names and values, and preserves the gap before the next effect.
 - `appearance.useLabelColorForHandles`: Use Label Color for Layer Handles and Paths
 - `grids.gridColor`: Color
 - `grids.gridSpacing`: Gridline Every
@@ -177,7 +176,7 @@ step with the schema.
 - `scripting.enableJsDebugger`: the JavaScript engine has no step debugger; script errors report
   their file and line in the Script Console.
 
-Effect Controls uses compact, fixed 20 pt parameter rows; the timeline keeps its fixed 19 pt rows. These logical sizes follow the existing whole-interface UI Scale. The separator preference previews immediately; Cancel restores it and OK saves it. Painting and mouse hit tests use the same row geometry. These UI changes do not alter project values or render output.
+Effect Controls uses compact, fixed 20 pt parameter rows, as After Effects does: each group level is indented beneath its effect, sibling names and values align, and a gap separates effects. The timeline keeps its fixed 19 pt rows. Both follow the whole-interface UI Scale.
 
 ## Keyboard shortcuts
 

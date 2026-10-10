@@ -589,6 +589,8 @@ pub(crate) struct Interpretation {
     fields: Option<effectcraft_project::FieldOrder>,
     profile: Option<Option<effectcraft_project::ColorSpace>>,
     linear: Option<bool>,
+    /// Color ▸ Preserve RGB.
+    preserve_rgb: Option<bool>,
     /// Start Timecode.
     start: Option<StartTimecode>,
 }
@@ -667,6 +669,7 @@ impl Interpretation {
             None => None,
         };
         it.linear = super::b_p(p, "linearLight");
+        it.preserve_rgb = super::b_p(p, "preserveRgb");
         // Start Timecode: Use Source File Timecode (`overrideStart: false`), or Override Start
         // (timecode or a frame number).
         let start_err = || bad(cmd, "startTimecode: timecode (0:00:41:20) or a frame number, 0 to 1e9");
@@ -740,6 +743,9 @@ impl Interpretation {
         }
         if let Some(v) = self.linear {
             f.linear_light = v;
+        }
+        if let Some(v) = self.preserve_rgb {
+            f.preserve_rgb = v;
         }
         // After the frame rate: timecode is read at the footage's rate.
         if let Some(start) = self.start.as_ref().and_then(|t| t.frame(f.frame_rate)) {
@@ -821,7 +827,7 @@ fn interpret(s: &mut Session, p: &Value) -> Result<Value> {
             Some(ItemKind::Footage(f)) => Some(json!({
                 "item": i.0, "alpha": format!("{:?}", f.alpha), "matteColor": f.premul_color, "invertAlpha": f.invert_alpha,
                 "fields": f.fields.label(), "pixelAspect": f.pixel_aspect, "loop": f.loop_count, "frameRate": f.frame_rate.as_f64(),
-                "linearLight": f.linear_light, "startTimecode": f.timecode(0), "overrideStart": f.start_timecode.is_some(),
+                "linearLight": f.linear_light, "preserveRgb": f.preserve_rgb, "startTimecode": f.timecode(0), "overrideStart": f.start_timecode.is_some(),
                 "frames": f.sequence_frames(),
             })),
             _ => None,
@@ -851,6 +857,7 @@ fn apply_interpretation(s: &mut Session, p: &Value) -> Result<Value> {
                 f.fields = src.fields;
                 f.invert_alpha = src.invert_alpha;
                 f.linear_light = src.linear_light;
+                f.preserve_rgb = src.preserve_rgb;
                 f.color_profile = src.color_profile;
                 if src.native_rate.is_some() {
                     if f.native_rate.is_none() {
@@ -1071,7 +1078,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Main...",
             ["File", "Interpret Footage"],
             Some("Cmd+Alt+G"),
-            "{items?, frameRate?: fps|\"file\", alpha?: straight|premultiplied|ignore|guess, guessAlpha?, matteColor?, invertAlpha?, loop?, pixelAspect?, fields?: off|upper|lower, colorProfile?: srgb|rec709|rec2020|p3|auto, linearLight?, overrideStart?: bool (false: Use Source File Timecode), startTimecode?: timecode|frame (Override Start)}",
+            "{items?, frameRate?: fps|\"file\", alpha?: straight|premultiplied|ignore|guess, guessAlpha?, matteColor?, invertAlpha?, loop?, pixelAspect?, fields?: off|upper|lower, colorProfile?: srgb|rec709|rec2020|p3|auto, linearLight?, preserveRgb? (the file's values unconverted), overrideStart?: bool (false: Use Source File Timecode), startTimecode?: timecode|frame (Override Start)}",
             has_footage_selection,
             interpret
         ),

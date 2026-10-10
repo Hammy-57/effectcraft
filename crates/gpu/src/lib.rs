@@ -104,8 +104,9 @@ pub struct Gpu {
     auto: Arc<effectcraft_render::AutoPick>,
 }
 
-/// A viewer frame left on the GPU: premultiplied RGBA8 (`wgpu::TextureFormat::Rgba8Unorm`),
-/// ready for `egui_wgpu::Renderer::register_native_texture`.
+/// A viewer frame left on the GPU: premultiplied RGBA8 (`wgpu::TextureFormat::Rgba8Unorm`) with
+/// a full mip chain (for minified views), ready for
+/// `egui_wgpu::Renderer::register_native_texture_with_sampler_options`.
 #[derive(Clone, Debug)]
 pub struct DisplayFrame {
     pub texture: wgpu::Texture,

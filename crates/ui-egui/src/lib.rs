@@ -247,8 +247,9 @@ pub struct EffectcraftApp {
     /// When the project last changed, and its revision then (see [`Self::editing`]).
     last_edit: (f64, u64),
     pub(crate) toast: Option<(String, f64)>,
-    /// Texture of the last CPU frame shown in the viewer and the key it came from.
-    pub(crate) viewer_tex: Option<(egui::TextureHandle, FrameKey)>,
+    /// Texture of the last CPU frame shown in the viewer, the key it came from and the factor it
+    /// was averaged down by for the magnification (`panels::viewer::minify_factor`).
+    pub(crate) viewer_tex: Option<(egui::TextureHandle, FrameKey, usize)>,
     /// The frames the other (passive) Composition viewers show, by viewer id.
     pub(crate) passive_tex: std::collections::HashMap<u32, (FrameKey, panels::viewers::PassiveTexture)>,
     /// The last GPU frame shown: its egui texture id (registered with egui-wgpu), key and texture.
@@ -579,7 +580,7 @@ impl EffectcraftApp {
         }
         self.viewer_native = None;
         self.passive_tex.retain(|_, (_, texture)| matches!(texture, panels::viewers::PassiveTexture::Cpu(_)));
-        self.viewer_shown = self.viewer_tex.as_ref().map(|(texture, key)| (texture.id(), *key));
+        self.viewer_shown = self.viewer_tex.as_ref().map(|(texture, key, _)| (texture.id(), *key));
         self.viewer_image = None;
         // Old completion closures retain only their detached slot, not the replacement.
         self.viewer_readback = Default::default();
@@ -645,7 +646,7 @@ impl EffectcraftApp {
 
     /// The size of the viewer frame's texture (CPU frames; fitted to the GPU's texture limit).
     pub fn viewer_texture_size(&self) -> Option<[usize; 2]> {
-        self.viewer_tex.as_ref().map(|(t, _)| t.size())
+        self.viewer_tex.as_ref().map(|(t, _, _)| t.size())
     }
 
     /// The viewer's current pixels as 8-bit premultiplied RGBA, reading a GPU frame back the

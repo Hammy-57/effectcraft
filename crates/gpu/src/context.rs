@@ -247,6 +247,8 @@ pub struct GpuContext {
     pipelines: HashMap<&'static str, wgpu::ComputePipeline>,
     display_bgl: wgpu::BindGroupLayout,
     display: wgpu::ComputePipeline,
+    /// The display texture's next mip level from the one above (`display.wgsl` `mip`).
+    display_mip: wgpu::ComputePipeline,
     dummy: wgpu::Texture,
     dummy_tex: wgpu::TextureView,
     dummy_buf: wgpu::Buffer,
@@ -507,16 +509,20 @@ impl GpuContext {
                 immediate_size: 0,
             })
         })?;
-        let display = init_resource(&device, "display compute pipeline", || {
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("display"),
-                layout: Some(&dlayout),
-                module: &dmodule,
-                entry_point: Some("display"),
-                compilation_options: Default::default(),
-                cache: None,
+        let display_pipeline = |entry: &'static str| {
+            init_resource(&device, "display compute pipeline", || {
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(entry),
+                    layout: Some(&dlayout),
+                    module: &dmodule,
+                    entry_point: Some(entry),
+                    compilation_options: Default::default(),
+                    cache: None,
+                })
             })
-        })?;
+        };
+        let display = display_pipeline("display")?;
+        let display_mip = display_pipeline("mip")?;
         let dummy = init_resource(&device, "dummy texture", || {
             device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("dummy"),
@@ -544,6 +550,7 @@ impl GpuContext {
             pipelines,
             display_bgl,
             display,
+            display_mip,
             dummy_tex,
             dummy,
             dummy_buf,
@@ -1205,36 +1212,47 @@ impl<'g> Enc<'g> {
         self.g.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("data"), contents: &bytes, usage: wgpu::BufferUsages::STORAGE })
     }
 
-    /// Convert to the viewer's premultiplied RGBA8 texture (egui-wgpu's native texture format).
+    /// Convert to the viewer's premultiplied RGBA8 texture (egui-wgpu's native texture format),
+    /// with a full mip chain so the viewer minifies it without aliasing (#417).
     pub fn display(&mut self, img: &GpuImage) -> wgpu::Texture {
         let g = self.g;
+        let levels = mip_levels(img.width, img.height);
         let tex = g.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("viewer frame"),
             size: wgpu::Extent3d { width: img.width, height: img.height, depth_or_array_layers: 1 },
-            mip_level_count: 1,
+            mip_level_count: levels,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
-        let sv = img.texture.create_view(&Default::default());
-        let ov = tex.create_view(&Default::default());
-        let bg = g.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &g.display_bgl,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&sv) },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&ov) },
-            ],
-        });
+        let level = |l: u32| tex.create_view(&wgpu::TextureViewDescriptor { base_mip_level: l, mip_level_count: Some(1), ..Default::default() });
+        // Level 0 from the frame, then each level the 2 × 2 mean of the one above.
+        let mut steps = vec![(&g.display, img.texture.create_view(&Default::default()), level(0), img.width, img.height)];
+        for l in 1..levels {
+            steps.push((&g.display_mip, level(l - 1), level(l), (img.width >> l).max(1), (img.height >> l).max(1)));
+        }
         let enc = self.encoder();
-        {
+        for (pipeline, src, dst, w, h) in &steps {
+            let bg = g.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &g.display_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(src) },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(dst) },
+                ],
+            });
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("display"), timestamp_writes: None });
-            pass.set_pipeline(&g.display);
+            pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &bg, &[]);
-            pass.dispatch_workgroups(img.width.div_ceil(16), img.height.div_ceil(16), 1);
+            pass.dispatch_workgroups(w.div_ceil(16), h.div_ceil(16), 1);
         }
         tex
     }
+}
+
+/// Mip levels of a full chain for a `w × h` texture (down to 1 × 1).
+pub(crate) fn mip_levels(w: u32, h: u32) -> u32 {
+    u32::BITS - w.max(h).max(1).leading_zeros()
 }

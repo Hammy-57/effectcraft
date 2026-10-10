@@ -21,7 +21,9 @@ on:
 
 concurrency:
   group: windows-arm64-${{ github.ref }}
-  cancel-in-progress: true
+  # A push to main doesn't cancel the run in progress (the newest waiting run replaces older ones),
+  # so main gets complete runs however often it moves; PR pushes do cancel.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read

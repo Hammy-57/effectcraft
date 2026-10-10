@@ -425,11 +425,26 @@ pub fn to_color_image(img: &effectcraft_engine::render::Image) -> egui::ColorIma
     egui::ColorImage::new([img.width as usize, img.height as usize], px)
 }
 
-/// The size `size` is shown at in a texture whose sides can't exceed `max_side`: divided by the
-/// smallest whole factor that fits (frames of comps wider than the GPU's texture limit, #201).
+/// The whole factor an image of `size` is averaged down by for a texture: at least `min_k`, and
+/// the smallest that fits its sides in `max_side` (frames of comps wider than the GPU's texture
+/// limit, #201).
+pub fn fit_factor(size: [usize; 2], max_side: usize, min_k: usize) -> usize {
+    size[0].max(size[1]).div_ceil(max_side.max(1)).max(min_k).max(1)
+}
+
+/// The size `size` is shown at in a texture whose sides can't exceed `max_side`.
 pub fn fitted_size(size: [usize; 2], max_side: usize) -> [usize; 2] {
-    let k = size[0].max(size[1]).div_ceil(max_side.max(1)).max(1);
+    let k = fit_factor(size, max_side, 1);
     [size[0].div_ceil(k), size[1].div_ceil(k)]
+}
+
+/// The texture coordinates of the image within a texture averaged down by `k`: its last texels
+/// cover fewer pixels than the factor, so drawn over the image's area with these the texels sit
+/// exactly where their pixels are.
+pub fn fitted_uv(size: [usize; 2], k: usize) -> egui::Rect {
+    let k = k.max(1);
+    let f = |n: usize| (n as f64 / (n.div_ceil(k).max(1) * k) as f64) as f32;
+    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(f(size[0]), f(size[1])))
 }
 
 /// `img` as a texture the renderer accepts: unchanged when it fits in `max_side`, else averaged
@@ -437,21 +452,26 @@ pub fn fitted_size(size: [usize; 2], max_side: usize) -> [usize; 2] {
 /// same area, so only detail beyond the GPU's texture limit is lost, instead of the upload
 /// failing (#201).
 pub fn fit_texture(img: egui::ColorImage, max_side: usize) -> egui::ColorImage {
+    fit_texture_by(img, max_side, 1)
+}
+
+/// [`fit_texture`] averaging down by at least `min_k` (see [`fit_factor`]).
+pub fn fit_texture_by(img: egui::ColorImage, max_side: usize, min_k: usize) -> egui::ColorImage {
     let [w, h] = img.size;
-    let [fw, fh] = fitted_size(img.size, max_side);
-    if [fw, fh] == [w, h] {
+    let k = fit_factor(img.size, max_side, min_k);
+    if k == 1 {
         return img;
     }
-    let k = w.max(h).div_ceil(max_side.max(1)).max(1);
+    let (fw, fh) = (w.div_ceil(k), h.div_ceil(k));
     let px: Vec<egui::Color32> = (0..fw * fh)
         .into_par_iter()
         .map(|i| {
             let (x0, y0) = ((i % fw) * k, (i / fw) * k);
-            let (mut sum, mut n) = ([0u32; 4], 0u32);
+            let (mut sum, mut n) = ([0u64; 4], 0u64);
             for y in y0..(y0 + k).min(h) {
                 for c in img.pixels.get(y * w + x0..y * w + (x0 + k).min(w)).unwrap_or_default() {
                     for (s, v) in sum.iter_mut().zip(c.to_array()) {
-                        *s += v as u32;
+                        *s += v as u64;
                     }
                     n += 1;
                 }

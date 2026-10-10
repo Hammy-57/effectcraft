@@ -145,14 +145,14 @@ fn set_texture(app: &mut EffectcraftApp, ctx: &egui::Context, id: u32, key: Fram
         (FrameImage::Gpu(f), old) => {
             let Some(rs) = &app.wgpu else { return };
             let view = f.texture.create_view(&Default::default());
-            let filter = if app.session.prefs.viewer_zoom_smooth() { eframe::wgpu::FilterMode::Linear } else { eframe::wgpu::FilterMode::Nearest };
+            let sampler = || super::viewer::zoom_sampler(app.session.prefs.viewer_zoom_smooth());
             let mut ren = rs.renderer.write();
             let tid = match old {
                 Some((_, PassiveTexture::Gpu(tid, _))) => {
-                    ren.update_egui_texture_from_wgpu_texture(&rs.device, &view, filter, tid);
+                    ren.update_egui_texture_from_wgpu_texture_with_sampler_options(&rs.device, &view, sampler(), tid);
                     tid
                 }
-                _ => ren.register_native_texture(&rs.device, &view, filter),
+                _ => ren.register_native_texture_with_sampler_options(&rs.device, &view, sampler()),
             };
             PassiveTexture::Gpu(tid, f)
         }

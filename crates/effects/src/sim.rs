@@ -15,7 +15,7 @@ use effectcraft_raster::{Image, Px};
 use rayon::prelude::*;
 
 use crate::generate::value_noise;
-use crate::util::{SimCache, hash1, params_key, unpremul};
+use crate::util::{SimCache, hash1, params_key, params_key_except, unpremul};
 use crate::{Buf, EffectCtx, EffectSpec, col, num, p, popup, slider};
 
 pub(crate) fn spec(id: &'static str, name: &'static str, params: Vec<crate::ParamSpec>, render: crate::RenderFn) -> EffectSpec {
@@ -989,9 +989,16 @@ pub fn particle_state(id: &str, ctx: &EffectCtx) -> Option<Vec<crate::psim::SimP
         "ec.sim.ccparticlesystems2" => (ps2_phys(ctx), &PS2_CACHE, 2),
         _ => return None,
     };
-    let key = params_key(ctx, &Buf { img: Image::new(0, 0), offset: [0.0; 2], scale: 1.0 }, salt);
+    let key = sim_key(ctx, salt);
     let st = accelerated(ctx, key, &phys).unwrap_or_else(|| simulate(cache, key, ctx.time, &phys));
     Some(st.parts.iter().map(|q| crate::psim::SimParticle { p: q.p, v: q.v, age: q.age, life: q.life, rnd: q.rnd, id: q.id }).collect())
+}
+
+/// The simulation cache key of a stepped particle effect: every parameter but CC Particle World's
+/// Effect Camera, which only changes how the particles are seen (animating it doesn't restart
+/// the simulation).
+fn sim_key(ctx: &EffectCtx, salt: u64) -> u64 {
+    params_key_except(ctx, &Buf { img: Image::new(0, 0), offset: [0.0; 2], scale: 1.0 }, salt, &[PW_EFFECT_CAMERA])
 }
 
 /// Run a particle system to layer time `t` through `cache`.
@@ -1068,6 +1075,90 @@ fn particle_world(ctx: &EffectCtx, b: Buf) -> Buf {
     }
 }
 
+/// CC Particle World's Extras ▸ Effect Camera parameters (id prefix).
+const PW_EFFECT_CAMERA: &str = "extras/effectCamera/";
+/// Effect Camera ▸ FOV's default (degrees).
+const PW_FOV: f64 = 50.0;
+
+/// What CC Particle World sees its particles through.
+enum PwCamera {
+    /// Extras ▸ Effect Camera, in world units (layer widths): `dist` from the world origin (the
+    /// layer centre) along −z, the world turned by `rot` (`None` = not turned) about the origin,
+    /// `focal` the scale at unit depth; particles nearer than `near` aren't drawn.
+    Effect { rot: Option<[[f32; 3]; 3]>, dist: f32, focal: f32, near: f32 },
+    /// The comp's active camera layer, on buffer-world points (After Effects then ignores the
+    /// Effect Camera).
+    Comp(crate::card3d::Proj),
+}
+
+/// A particle as the camera sees it: depth (larger is farther), buffer pixel, size scale `k`
+/// (buffer pixels per world unit = `k · layer width · buffer scale`) and velocity in world units
+/// on screen (× the same factor for buffer pixels).
+struct PwSeen {
+    depth: f32,
+    x: f32,
+    y: f32,
+    k: f32,
+    v: [f32; 2],
+}
+
+impl PwCamera {
+    fn new(ctx: &EffectCtx, b: &Buf) -> PwCamera {
+        let [lw, lh] = ctx.layer_size;
+        if let Some(cam) = ctx.env.host.and_then(|h| h.comp_scene()).filter(|sc| sc.camera_layer).and_then(|sc| sc.camera) {
+            let c = [b.offset[0] + lw * 0.5 * b.scale, b.offset[1] + lh * 0.5 * b.scale];
+            return PwCamera::Comp(crate::card3d::comp_proj(&cam, c, b));
+        }
+        let f = |id: &str, d: f64| ctx.params.get(&format!("{PW_EFFECT_CAMERA}{id}")).map(Value::as_f64).filter(|v| v.is_finite()).unwrap_or(d);
+        // The camera keeps the origin's plane at the scale Distance gives it as FOV changes
+        // (moving in for a wider view), so FOV sets how strong the perspective is. Distance 2
+        // shows the origin's plane at the layer's own scale.
+        let half = |fov: f64| (fov.clamp(1.0, 179.0).to_radians() * 0.5).tan();
+        let zoom = half(PW_FOV) / half(f("fov", PW_FOV));
+        let dist = f("distance", 2.0).max(0.01) * zoom;
+        let a = [f("rotationX", 0.0), f("rotationY", 0.0), f("rotationZ", 0.0)];
+        let rot = (a != [0.0; 3]).then(|| {
+            let r = crate::card3d::rot_ordered(a[0].to_radians(), a[1].to_radians(), a[2].to_radians(), 0);
+            r.map(|row| row.map(|v| v as f32))
+        });
+        PwCamera::Effect { rot, dist: dist as f32, focal: (2.0 * zoom) as f32, near: (0.025 * dist) as f32 }
+    }
+
+    /// How the camera sees world point `p` moving at `v`; `None` behind or too close to it.
+    fn see(&self, p: [f32; 3], v: [f32; 3], lw: f32, lh: f32, b: &Buf) -> Option<PwSeen> {
+        match self {
+            PwCamera::Effect { rot, dist, focal, near } => {
+                let turn = |r: &[[f32; 3]; 3], q: [f32; 3]| r.map(|row| row[0] * q[0] + row[1] * q[1] + row[2] * q[2]);
+                let (p, v) = match rot {
+                    Some(r) => (turn(r, p), turn(r, v)),
+                    None => (p, v),
+                };
+                let zc = dist + p[2];
+                if zc.is_nan() || zc <= *near {
+                    return None;
+                }
+                let k = focal / zc;
+                let (x, y) = b.to_px([(lw * 0.5 + p[0] * lw * k) as f64, (lh * 0.5 + p[1] * lw * k) as f64]);
+                Some(PwSeen { depth: zc, x: x as f32, y: y as f32, k, v: [v[0], v[1]] })
+            }
+            PwCamera::Comp(proj) => {
+                let (s, lw, lh) = (b.scale, lw as f64, lh as f64);
+                let u = lw * s;
+                let at = [b.offset[0] + lw * 0.5 * s + p[0] as f64 * u, b.offset[1] + lh * 0.5 * s + p[1] as f64 * u, p[2] as f64 * u];
+                let seen = proj.view(at, [v[0] as f64, v[1] as f64, v[2] as f64])?;
+                let k = seen.scale;
+                Some(PwSeen {
+                    depth: seen.depth as f32,
+                    x: seen.at[0] as f32,
+                    y: seen.at[1] as f32,
+                    k: k as f32,
+                    v: [(seen.vel[0] / k) as f32, (seen.vel[1] / k) as f32],
+                })
+            }
+        }
+    }
+}
+
 /// CC Particle World's sprites (far to near), `None` before anything is born.
 fn particle_world_plan(ctx: &EffectCtx, b: &Buf) -> Option<SpritePlan> {
     let pr = ctx.params;
@@ -1076,7 +1167,7 @@ fn particle_world_plan(ctx: &EffectCtx, b: &Buf) -> Option<SpritePlan> {
     if phys.rate <= 0.0 && ctx.time <= 0.0 {
         return None;
     }
-    let key = params_key(ctx, &Buf { img: Image::new(0, 0), offset: [0.0; 2], scale: 1.0 }, 1);
+    let key = sim_key(ctx, 1);
     let st = accelerated(ctx, key, &phys).unwrap_or_else(|| simulate(&PW_CACHE, key, ctx.time, &phys));
     let kind = pr.e("particle/particleType");
     let birth = pr.color("particle/birthColor");
@@ -1085,24 +1176,16 @@ fn particle_world_plan(ctx: &EffectCtx, b: &Buf) -> Option<SpritePlan> {
     let svar = pr.f("particle/sizeVariation") as f32 / 100.0;
     let max_op = pr.f("particle/maxOpacity") as f32 / 100.0;
     let s = b.scale as f32;
-    // Camera at distance 2 (world units = layer width) looking at the origin (layer centre).
-    let cam = 2.0f32;
+    let cam = PwCamera::new(ctx, b);
     let mut list: Vec<(f32, Sprite)> = st
         .parts
         .par_iter()
         .filter_map(|q| {
-            let zc = cam + q.p[2];
-            if zc <= 0.05 {
-                return None;
-            }
-            let k = cam / zc;
-            let x = lw * 0.5 + q.p[0] * lw * k;
-            let y = lh * 0.5 + q.p[1] * lw * k;
-            let (bx, by) = b.to_px([x as f64, y as f64]);
+            let PwSeen { depth, x, y, k, v } = cam.see(q.p, q.v, lw, lh, b)?;
             let (c, size) = particle_look(q, birth, death, bs, ds, svar, max_op);
             let r = size * 0.5 * lw * k * s * 0.25;
-            let sp = type_sprite(kind, bx as f32, by as f32, r, c, q.v[0] * lw * k * s, q.v[1] * lw * k * s, (q.id % 628) as f32 * 0.01 + q.age * 2.0);
-            Some((zc, sp))
+            let sp = type_sprite(kind, x, y, r, c, v[0] * lw * k * s, v[1] * lw * k * s, (q.id % 628) as f32 * 0.01 + q.age * 2.0);
+            Some((depth, sp))
         })
         .collect();
     list.sort_by(|a, b| b.0.total_cmp(&a.0));
@@ -1158,7 +1241,7 @@ fn particle_systems2_plan(ctx: &EffectCtx, b: &Buf) -> SpritePlan {
     let lh = ctx.layer_size[1] as f32;
     let unit = lh.max(1.0);
     let phys = ps2_phys(ctx);
-    let key = params_key(ctx, &Buf { img: Image::new(0, 0), offset: [0.0; 2], scale: 1.0 }, 2);
+    let key = sim_key(ctx, 2);
     let st = accelerated(ctx, key, &phys).unwrap_or_else(|| simulate(&PS2_CACHE, key, ctx.time, &phys));
     let kind = pr.e("particle/particleType");
     let birth = pr.color("particle/birthColor");
@@ -1431,6 +1514,11 @@ pub fn specs() -> Vec<EffectSpec> {
                 p("particle/birthColor", "Birth Color", col(1.0, 1.0, 0.0), ParamUi::Color),
                 p("particle/deathColor", "Death Color", col(0.6, 0.0, 0.0), ParamUi::Color),
                 p("particle/transferMode", "Transfer Mode", Value::Enum(0), popup(&["Composite", "Screen", "Add", "Black Matte"])),
+                p("extras/effectCamera/distance", "Distance", num(2.0), slider(0.0, 100.0, 0.0, 10.0, 2)),
+                p("extras/effectCamera/rotationX", "Rotation X", num(0.0), ParamUi::Angle),
+                p("extras/effectCamera/rotationY", "Rotation Y", num(0.0), ParamUi::Angle),
+                p("extras/effectCamera/rotationZ", "Rotation Z", num(0.0), ParamUi::Angle),
+                p("extras/effectCamera/fov", "FOV", num(PW_FOV), slider(1.0, 179.0, 10.0, 120.0, 1)),
                 p("extras/randomSeed", "Random Seed", num(0.0), slider(0.0, 10_000.0, 0.0, 1000.0, 0)),
             ],
             particle_world,
@@ -1523,18 +1611,24 @@ mod tests {
         a.data.iter().zip(&b.data).map(|(p, q)| (0..4).map(|k| (p[k] - q[k]).abs()).sum::<f32>()).sum()
     }
 
-    /// Centre of mass (luminance-weighted difference from `base`) in y.
-    fn mass_y(img: &Image, base: &Image) -> f32 {
-        let (mut m, mut sy) = (0.0, 0.0);
+    /// Centre of mass (luminance-weighted difference from `base`), `[-1, -1]` when equal.
+    fn mass(img: &Image, base: &Image) -> [f32; 2] {
+        let (mut m, mut sx, mut sy) = (0.0, 0.0, 0.0);
         for y in 0..img.height {
             for x in 0..img.width {
                 let i = img.idx(x, y);
                 let d: f32 = (0..3).map(|k| (img.data[i][k] - base.data[i][k]).abs()).sum();
                 m += d;
+                sx += d * x as f32;
                 sy += d * y as f32;
             }
         }
-        if m > 0.0 { sy / m } else { -1.0 }
+        if m > 0.0 { [sx / m, sy / m] } else { [-1.0; 2] }
+    }
+
+    /// [`mass`] in y.
+    fn mass_y(img: &Image, base: &Image) -> f32 {
+        mass(img, base)[1]
     }
 
     #[test]
@@ -1684,6 +1778,119 @@ mod tests {
         let up = mass_y(&run("ec.sim.ccparticleworld", &base(0.0), blank.clone(), 1.0), &blank);
         let down = mass_y(&run("ec.sim.ccparticleworld", &base(2.0), blank.clone(), 1.0), &blank);
         assert!(down > up + 2.0, "{up} {down}");
+    }
+
+    /// A comp whose camera is `camera` ([`crate::CompScene::camera`]); `layer`: a camera layer
+    /// (else the comp's default view).
+    struct Comp {
+        camera: [[f64; 4]; 3],
+        layer: bool,
+    }
+    impl crate::EffectHost for Comp {
+        fn layer(&self, _: u64, _: bool) -> Option<crate::LayerPixels> {
+            None
+        }
+        fn audio(&self, _: u64, _: f64, _: usize, _: u32) -> Option<Vec<f32>> {
+            None
+        }
+        fn comp_scene(&self) -> Option<crate::CompScene> {
+            Some(crate::CompScene { camera: Some(self.camera), camera_layer: self.layer, light: None })
+        }
+    }
+
+    /// A camera `d` px in front of layer point `c` looking at it, moved right by `dx` px and
+    /// zoomed by `zoom` (1 = identity on the layer plane): `c + zoom·d·(p − c − dx) / (z + d)`.
+    fn cam(c: [f64; 2], d: f64, dx: f64, zoom: f64) -> [[f64; 4]; 3] {
+        let k = zoom * d;
+        [[k, 0.0, c[0], d * c[0] - k * (c[0] + dx)], [0.0, k, c[1], d * c[1] - k * c[1]], [0.0, 0.0, 1.0, d]]
+    }
+
+    fn pw_in(comp: &Comp, vals: &[(&str, Value)]) -> Image {
+        run_fx("ec.sim.ccparticleworld", vals, Image::new(48, 48), 1.0, EffectEnv { host: Some(comp), ..Default::default() }).img
+    }
+
+    fn finite(img: &Image) -> bool {
+        img.data.iter().all(|p| p.iter().all(|c| c.is_finite()))
+    }
+
+    /// #397: with a camera layer in the comp, the particles are seen through it.
+    #[test]
+    fn particle_world_follows_the_comp_camera() {
+        let v = pw_vals(3.0);
+        let blank = Image::new(48, 48);
+        let here = Comp { camera: cam([24.0, 24.0], 96.0, 0.0, 1.0), layer: true };
+        let base = pw_in(&here, &v);
+        assert!(base.data.iter().any(|p| p[3] > 0.0), "particles alive");
+        // Moving the camera right moves the particles left.
+        let moved = pw_in(&Comp { camera: cam([24.0, 24.0], 96.0, 8.0, 1.0), ..here }, &v);
+        let (a, b) = (mass(&base, &blank), mass(&moved, &blank));
+        assert!(b[0] < a[0] - 4.0 && (b[1] - a[1]).abs() < 2.0, "{a:?} -> {b:?}");
+        // Zooming in spreads them out.
+        let zoomed = pw_in(&Comp { camera: cam([24.0, 24.0], 96.0, 0.0, 2.0), ..here }, &v);
+        let cover = |i: &Image| i.data.iter().filter(|p| p[3] > 0.01).count();
+        assert!(cover(&zoomed) > cover(&base), "{} {}", cover(&zoomed), cover(&base));
+        // The Effect Camera is ignored then.
+        let mut turned = v.clone();
+        turned.push(("extras/effectCamera/rotationY", num(60.0)));
+        assert_eq!(pw_in(&here, &turned), base);
+        // The comp's default view (no camera layer) leaves it to the Effect Camera.
+        let default_view = Comp { layer: false, ..here };
+        assert_eq!(pw_in(&default_view, &v), run("ec.sim.ccparticleworld", &v, blank.clone(), 1.0));
+        // A camera facing away, or a degenerate one, draws nothing and never NaN.
+        for camera in [[[96.0, 0.0, 24.0, 0.0], [0.0, 96.0, 24.0, 0.0], [0.0, 0.0, -1.0, -96.0]], [[0.0; 4]; 3], [[f64::NAN; 4]; 3]] {
+            assert_eq!(pw_in(&Comp { camera, layer: true }, &v), blank);
+        }
+        // A camera among the particles draws the ones in front of it.
+        let inside = pw_in(&Comp { camera: cam([24.0, 24.0], 1.0, 0.0, 1.0), ..here }, &v);
+        assert!(finite(&inside));
+    }
+
+    /// Extras ▸ Effect Camera: the defaults are the fixed camera Particle World always had.
+    #[test]
+    fn particle_world_effect_camera() {
+        let v = pw_vals(5.0);
+        let base = run("ec.sim.ccparticleworld", &v, Image::new(48, 48), 1.0);
+        let with = |extra: &[(&'static str, Value)]| {
+            let mut w = v.clone();
+            w.extend_from_slice(extra);
+            run("ec.sim.ccparticleworld", &w, Image::new(48, 48), 1.0)
+        };
+        // Missing parameters (projects saved before) read as the defaults.
+        let spec = crate::find("ec.sim.ccparticleworld").unwrap();
+        let mut params = crate::Params { values: spec.params.iter().map(|p| (p.id.to_string(), p.default.clone())).collect() };
+        params.values.retain(|k, _| !k.starts_with(PW_EFFECT_CAMERA));
+        for (k, val) in &v {
+            params.values.insert(k.to_string(), val.clone());
+        }
+        let ctx = EffectCtx { params: &params, time: 1.0, layer_size: [48.0, 48.0], seed: 1, adjustment: false, env: EffectEnv::default() };
+        assert_eq!(crate::apply(spec, &ctx, Buf { img: Image::new(48, 48), offset: [0.0; 2], scale: 1.0 }).img, base);
+        assert_eq!(with(&[("extras/effectCamera/fov", num(f64::NAN))]), base);
+        // Turning or pulling back the camera changes the view.
+        let turned = with(&[("extras/effectCamera/rotationY", num(60.0))]);
+        assert!(diff(&turned, &base) > 1.0);
+        let cover = |i: &Image| i.data.iter().filter(|p| p[3] > 0.01).count();
+        let far = with(&[("extras/effectCamera/distance", num(4.0))]);
+        assert!(cover(&far) < cover(&base), "{} {}", cover(&far), cover(&base));
+        assert!(diff(&with(&[("extras/effectCamera/fov", num(120.0))]), &base) > 0.1);
+        // Extremes never panic or produce NaN.
+        for extra in [
+            ("extras/effectCamera/distance", num(0.0)),
+            ("extras/effectCamera/distance", num(-5.0)),
+            ("extras/effectCamera/fov", num(0.0)),
+            ("extras/effectCamera/fov", num(180.0)),
+            ("extras/effectCamera/rotationX", num(1e12)),
+        ] {
+            assert!(finite(&with(std::slice::from_ref(&extra))), "{extra:?}");
+        }
+        // Moving the camera doesn't restart the simulation.
+        let key = |pr: &crate::Params| {
+            sim_key(&EffectCtx { params: pr, time: 1.0, layer_size: [48.0, 48.0], seed: 1, adjustment: false, env: EffectEnv::default() }, 1)
+        };
+        let mut moved = params.clone();
+        moved.values.insert("extras/effectCamera/rotationZ".into(), num(30.0));
+        assert_eq!(key(&params), key(&moved));
+        moved.values.insert("extras/randomSeed".into(), num(9.0));
+        assert_ne!(key(&params), key(&moved));
     }
 
     #[test]

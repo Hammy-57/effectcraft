@@ -114,27 +114,31 @@ pub fn active(ctx: &Context) -> bool {
     ctx.data(|d| d.get_temp(active_id())).unwrap_or(false)
 }
 
-/// Alt pressed and released with nothing else in between (no key, click or wheel), off macOS.
+/// Alt pressed and released with nothing else in between (no other modifier, key, click or wheel),
+/// off macOS. Alt only counts when it went down with no other modifier held: Windows switches the
+/// keyboard layout with Alt+Shift, and releasing Shift first leaves Alt held alone, which must not
+/// take the keyboard from the field being typed in (#394).
 fn alt_tapped(ctx: &Context) -> bool {
     if cfg!(target_os = "macos") {
         return false;
     }
-    let mut armed: bool = ctx.data(|d| d.get_temp(alt_id())).unwrap_or(false);
+    // (armed, the modifiers held after the last change)
+    let (mut armed, mut held): (bool, Modifiers) = ctx.data(|d| d.get_temp(alt_id())).unwrap_or_default();
     let mut tapped = false;
     ctx.input(|i| {
         for e in &i.events {
             match e {
-                Event::ModifiersChanged(m) if *m == Modifiers::ALT => armed = true,
                 Event::ModifiersChanged(m) => {
                     tapped |= armed && *m == Modifiers::NONE;
-                    armed = false;
+                    armed = *m == Modifiers::ALT && held == Modifiers::NONE;
+                    held = *m;
                 }
                 Event::PointerMoved(_) | Event::MouseMoved(_) | Event::Zoom(_) => {}
                 _ => armed = false,
             }
         }
     });
-    ctx.data_mut(|d| d.insert_temp(alt_id(), armed));
+    ctx.data_mut(|d| d.insert_temp(alt_id(), (armed, held)));
     tapped
 }
 
