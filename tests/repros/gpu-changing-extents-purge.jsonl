@@ -1,0 +1,13 @@
+// #591 navigation/purge smoke. Hardware allocation failure is exercised by the GPU unit
+// regression; this command replay does not simulate Adreno device loss.
+{"start":"new"}
+{"command":"comp.new","params":{"name":"GPU extents","width":96,"height":48,"duration":2,"frameRate":30}}
+{"command":"layer.newSolid","params":{"name":"Original solid","color":"#3366ff"}}
+{"command":"render.frame","params":{"base64":true,"wait":true}}
+{"command":"comp.settings","params":{"width":97,"height":49}}
+{"command":"time.set","params":{"time":0.5}}
+{"command":"render.frame","params":{"base64":true,"wait":true}}
+{"command":"edit.purge","params":{"what":"all"}}
+{"command":"render.frame","params":{"base64":true,"wait":true}}
+{"expect_no_error":true}
+{"expect":{"query":"comp.info","pointer":"/width","equals":97}}
