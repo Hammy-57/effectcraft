@@ -106,6 +106,12 @@ impl McpServer {
         Ok(self)
     }
 
+    /// Throttle checkpoints of at least `bytes` to one per `interval` (see [`AutoSave`]).
+    #[cfg(test)]
+    pub(crate) fn throttle_autosave(&mut self, bytes: u64, interval: std::time::Duration) {
+        self.autosave = self.autosave.take().map(|a| a.with_throttle(bytes, interval));
+    }
+
     fn autosave_info(&self) -> Value {
         self.autosave.as_ref().map(AutoSave::info).unwrap_or_else(|| json!({"enabled": false}))
     }
@@ -251,10 +257,21 @@ impl McpServer {
                     PROTOCOL_VERSIONS.iter().find(|v| **v == asked).copied().unwrap_or(PROTOCOL_VERSIONS.first().copied().unwrap_or(STRUCTURED_SINCE));
                 self.version = Some(version);
                 let mode = self.backend.mode();
+                // Bridged to an app others use too: run as a named agent unless the server was
+                // given a name, so this agent never moves the user's selection, comp or time.
+                if mode == "bridge" && self.backend.client().is_none() {
+                    self.backend.set_client(Some(default_client(params)));
+                }
                 let instructions = if self.autosave.is_some() {
                     format!("{INSTRUCTIONS} Headless auto-save and recovery: {}", self.autosave_info())
                 } else {
                     INSTRUCTIONS.to_string()
+                };
+                let instructions = match self.backend.client() {
+                    Some(c) if mode == "bridge" => format!(
+                        "{instructions} You are the agent `{c}`: every tool call runs as `{c}`; pass `client` to use another name, or `\"client\": \"\"` for a call that should change what the user sees (as the user)."
+                    ),
+                    _ => instructions,
                 };
                 Ok(json!({
                     "protocolVersion": version,
@@ -460,15 +477,21 @@ impl McpServer {
 pub(crate) fn guarded_run(backend: &mut Backend, name: &str, args: &Value) -> Result<Reply, Error> {
     use effectcraft_engine::agents::MAX_CLIENT_LEN;
     let mut args = std::borrow::Cow::Borrowed(args);
+    // `Some(None)`: `"client": ""`, this call runs as the user.
     let client = match args.get("client") {
         None | Some(Value::Null) => None,
-        Some(Value::String(c)) if !c.is_empty() && c.len() <= MAX_CLIENT_LEN => Some(c.clone()),
-        Some(c) => return Err(Error::BadArgs(format!("`client` must be your name, a non-empty string of at most {MAX_CLIENT_LEN} bytes, got {c}"))),
+        Some(Value::String(c)) if c.is_empty() => Some(None),
+        Some(Value::String(c)) if c.len() <= MAX_CLIENT_LEN => Some(Some(c.clone())),
+        Some(c) => {
+            return Err(Error::BadArgs(format!(
+                "`client` must be your name (a string of at most {MAX_CLIENT_LEN} bytes; \"\" runs the call as the user), got {c}"
+            )));
+        }
     };
     if let Some(o) = args.to_mut().as_object_mut() {
         o.remove("client");
     }
-    let outer = client.map(|c| backend.set_client(Some(c)));
+    let outer = client.map(|c| backend.set_client(c));
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tools::run(backend, name, &args))).unwrap_or_else(|p| {
         let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_else(|| "panic".into());
         Err(Error::Other(format!("internal error: {msg}")))
@@ -477,6 +500,19 @@ pub(crate) fn guarded_run(backend: &mut Backend, name: &str, args: &Value) -> Re
         backend.set_client(outer);
     }
     r
+}
+
+/// The name a bridged agent runs under when none was given: the MCP client's name and this
+/// server's process id (`claude-code-4821`), so two agents never share a cursor or claims.
+pub(crate) fn default_client(initialize: &Value) -> String {
+    let info = initialize.get("clientInfo").and_then(|i| i.get("name")).and_then(Value::as_str).unwrap_or("");
+    let mut name: String =
+        info.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c.to_ascii_lowercase() } else { '-' }).take(40).collect();
+    name = name.trim_matches('-').to_string();
+    if name.is_empty() {
+        name = "agent".into();
+    }
+    format!("{name}-{}", std::process::id())
 }
 
 /// A resource URI that can't be read, as a JSON-RPC error.
