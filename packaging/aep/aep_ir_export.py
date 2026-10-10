@@ -31,6 +31,15 @@ CHAR_STYLE_FIELDS = "font font_size fill_color stroke_color apply_fill apply_str
 PARA_STYLE_FIELDS = "justification first_line_indent start_indent end_indent space_before space_after leading_type auto_hyphenate hanging_roman every_line_composer direction composer_engine"
 
 
+def is_file(path):
+    """Whether `path` is a file; a path this system can't even ask about (a Windows path saved
+    in the project, longer than a file name may be here) is not one."""
+    try:
+        return path.is_file()
+    except OSError:
+        return False
+
+
 def media_name(name):
     return unicodedata.normalize("NFC", name).casefold()
 
@@ -186,7 +195,7 @@ class Exporter:
     def scan_fonts(self, root):
         index = {}
         for path in root.rglob("*"):
-            if not path.is_file() or path.suffix.lower() not in (".ttf", ".otf"):
+            if not is_file(path) or path.suffix.lower() not in (".ttf", ".otf"):
                 continue
             try:
                 font = TTFont(path, lazy=True)
@@ -715,14 +724,14 @@ class Exporter:
                 result["media_status"] = "missing"
                 if raw:
                     exact = Path(raw)
-                    if exact.is_file():
+                    if is_file(exact):
                         matches = [exact.resolve()]
                         result["media_status"] = "exact"
                     else:
                         if self.media_index is None:
                             self.media_index = {}
                             for path in self.source_dir.rglob("*"):
-                                if path.is_file():
+                                if is_file(path):
                                     self.media_index.setdefault(media_name(path.name), []).append(path)
                         basename = PureWindowsPath(raw).name
                         matches = self.media_index.get(media_name(basename), [])
