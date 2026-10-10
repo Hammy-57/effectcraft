@@ -6,14 +6,25 @@ The desktop app exposes a control channel for agents, tests and the MCP bridge:
 effectcraft --control 9877        # or EFFECTCRAFT_CONTROL_PORT=9877
 ```
 
+The port is `--control`, else `EFFECTCRAFT_CONTROL_PORT`, else Settings ▸ Scripting & Expressions ▸
+Control Channel Port (9877) when Let Agents Control EffectCraft is on. The app prints the port it
+listens on. A port that is already taken (usually by a second EffectCraft) is reported in the
+window's status bar and on stderr: give each app its own port, and point its MCP bridge at it
+(`effectcraft-cli mcp --bridge` without a port uses `EFFECTCRAFT_CONTROL_PORT`, else 9877).
+
 - **Transport:** TCP on `127.0.0.1` only, one JSON object per line in each direction. Connections are
   persistent; requests on one connection are answered in order.
 - **Request:** `{"id": 1, "method": "engine.execute", "params": {...}}` (`id` is echoed back, `params`
-  defaults to `{}`).
+  defaults to `{}`). An optional top-level `"requestId": "<unique string>"` makes retries safe: a
+  request whose `requestId` was already seen (on any connection, last 128 ids) gets the first reply
+  again and doesn't run twice; while the first is still running the retry gets an error saying so.
+  Replies larger than 256 KiB (frames, inspections) aren't kept, so such a retry runs again.
 - **Reply:** `{"id": 1, "ok": true, "result": ...}` or `{"id": 1, "ok": false, "error": "message"}`.
 - Requests run on the UI thread between frames. Input methods (`ui.click`, `ui.key` and similar)
   reply after the synthetic input has been processed. Methods that need an element that isn't drawn
-  yet are retried for a few frames. A request times out after 60 s.
+  yet are retried for a few frames. A request times out after 60 s. If the app hadn't started it
+  by then, it is cancelled and never runs: the reply has `"notRun": true` and says it is safe to
+  retry. If it had started, the reply says it may still complete.
 - **Only requests are read:** every line must be a JSON object with a string `method` (blank lines are
   skipped). Anything else (text that isn't JSON, a JSON array or number, an object without `method`,
   invalid UTF-8, a line longer than 4 MiB) gets one error reply ending in "closing the connection", and
@@ -46,17 +57,39 @@ Useful query commands for `engine.execute` (they aren't journaled or undoable): 
 export formats, parity summary), `jobs.list` (Progress panel jobs, e.g. the background
 `footage.check` after File ▸ Open), `render.snapshot {name, comp?, time?, max_side?, transparent?}`
 (keep a rendered frame in the session, 16 at most), `render.snapshots {clear?}` and
-`render.compare {a, b, threshold?, min_psnr?, max_side?, amplify?, diff_path?, diff_inline?}`
+`render.compare {a, b, threshold?, min_psnr?, max_side?, region?, amplify?, diff_path?, diff_inline?}`
 (`a`/`b`: a snapshot name, `{snapshot}`, `{path}` of a PNG/JPEG, or `{comp?, time?, transparent?}`
 rendered now) → `{width, height, max_abs, mean_abs, alpha_max_abs, psnr_db, ssim, changed_pixels,
-changed_pct, pass, diff_path?, diff_png?}` (metrics and size rules in
+changed_pct, pass, diffBounds, region?, diff_path?, diff_png?}` (`region: [x, y, w, h]` compares
+one rectangle; `diffBounds` boxes the changed pixels or is null; metrics and size rules in
 [agents.md](agents.md#verify-your-change-snapshot--edit--compare)). Analysis queries (see
 [mcp.md](mcp.md#analysis-tools)): `layer.bounds {comp?, time?, layers?, pixels?, overlaps?}`
 (layer geometry in comp space) and `audio.analyze {comp?, start?, end?, layer?, waveform?, path?}`
 (peak, RMS, LUFS, clipping and silences of the mix).
 
+`project.summary` and `editor.state` include the document `revision` (bumped on every change, undo and
+redo included). Every command's `params` also accepts `expectRevision` (the command doesn't run and
+errors with `document changed (revision X, expected Y)` when the document moved on) and `client` (a
+driver name: its undo steps are tagged, and `edit.undo {"client": …}` refuses unless that client made
+the last step). Both are handled by `Session::execute` and stripped before the command sees its params.
+A number always names an id (layer, effect, mask…), never a position; use `"#n"` for the n-th.
+
 Every engine command is reachable through `engine.execute`, and every interactive widget of every
 panel registers an element id; both are enforced by `crates/ui-egui/tests/ui_agent_audit.rs`.
+
+## Change events
+
+`{"method": "events.subscribe"}` → `{subscribed: true, revision, events}`. From then on the
+connection also receives event lines (no `id`), at most ten bursts a second, coalesced:
+
+```json
+{"event": "project.changed", "revision": 42}
+{"event": "selection.changed", "revision": 42, "layers": [3, 5]}
+```
+
+`revision` is the session's project revision (`app.revision` → `{revision}` reads it cheaply).
+Replies and events share the connection: tell them apart by `event`. Closing the connection
+unsubscribes.
 
 ## UI state
 
@@ -82,7 +115,7 @@ Points are logical window coordinates. A target is `{id}` (the element's centre;
 | Method | Params |
 |---|---|
 | `ui.click` | `{id \| x,y, button?: left\|right\|middle, count?, modifiers?}` |
-| `ui.move` | `{id \| x,y}` |
+| `ui.move` | `{id \| x,y, down?, up?, button?, modifiers?}`: `down` presses and holds the button there, later moves drag, `up` releases |
 | `ui.drag` | `{from: target, to: target, steps? (12), modifiers?}`: press, move, release |
 | `ui.scroll` | `{id \| x,y, dx, dy}` |
 | `ui.key` | `{key}`, for example `Space`, `F9`, `Cmd+Z`, `Cmd+Shift+Z`, `PageDown`, `Escape` |
@@ -107,7 +140,7 @@ frames and can be assigned through `shortcuts.set`.
 
 | Method | Params | Result |
 |---|---|---|
-| `ui.screenshot` | `{path?, panel?, id?}` | `{path, width, height}`: a PNG of the window, or cropped to one panel or element. |
+| `ui.screenshot` | `{path?, panel?, id?, max_side?}` | `{path, width, height}`: a PNG of the window, or cropped to one panel or element, downscaled so the longest side is at most `max_side` pixels (default 1600, 0 = full size). |
 
 Element ids are stable, for example `tools.Selection`, `panel.Timeline`, `panel.tab.EffectControls`,
 `panel.tab.Timeline.<comp>` (one Timeline tab per open comp; `panel.tab.Timeline` is the shown

@@ -9,6 +9,11 @@
 //! side fits. Two images of different sizes but the same aspect ratio (a half-resolution
 //! reference, say) are compared at the smaller size, the larger one scaled down to it; different
 //! aspect ratios are an error naming both sizes.
+//!
+//! `region: [x, y, w, h]` is in pixels of the compared frames (comp pixels unless `max_side` or
+//! the size rule scaled them): the metrics, `diffBounds` and the heatmap cover only that rectangle,
+//! clipped to the frame. `diffBounds` is the box of the pixels over the threshold, in the same
+//! frame coordinates (null when nothing changed).
 
 use std::collections::VecDeque;
 
@@ -96,6 +101,11 @@ impl Frame {
         }
         let rgba = cmp::resample(&self.view().map_err(|e| bad(cmd, e.to_string()))?, w, h).map_err(|e| bad(cmd, e.to_string()))?;
         Ok(Frame { width: w, height: h, rgba, source: self.source })
+    }
+    /// Just the `[x, y, w, h]` rectangle (inside the frame).
+    fn cropped(self, r: [u32; 4], cmd: &str) -> Result<Frame> {
+        let rgba = cmp::crop(&self.view().map_err(|e| err(cmd, e))?, r).map_err(|e| err(cmd, e))?;
+        Ok(Frame { width: r[2], height: r[3], rgba, source: self.source })
     }
 }
 
@@ -210,7 +220,7 @@ fn round(v: f64, digits: i32) -> Value {
     json!((v * k).round() / k)
 }
 
-/// `render.compare {a, b, threshold?, min_psnr?, max_side?, amplify?, diff_path?, diff_inline?}`
+/// `render.compare {a, b, threshold?, min_psnr?, max_side?, region?, amplify?, diff_path?, diff_inline?}`
 fn compare(s: &mut Session, p: &Value) -> Result<Value> {
     const CMD: &str = "render.compare";
     let max_side = max_side_p(p, CMD)?;
@@ -252,12 +262,24 @@ fn compare(s: &mut Session, p: &Value) -> Result<Value> {
             format!("size mismatch: a is {aw}x{ah}, b is {bw}x{bh} (different aspect ratios; render or export both at the same size, or crop one)"),
         ));
     };
+    let (width, height) = (a.width, a.height);
+    let region = match p.get("region") {
+        None | Some(Value::Null) => None,
+        // Whole pixels clipped to the frame, so the casts are exact.
+        Some(v) => Some(crate::render_view::region_p(v, width, height, CMD)?.map(|n| n as u32)),
+    };
+    let (a, b) = match region {
+        Some(r) => (a.cropped(r, CMD)?, b.cropped(r, CMD)?),
+        None => (a, b),
+    };
+    let (ox, oy) = region.map_or((0, 0), |r| (r[0], r[1]));
     let (va, vb) = (a.view().map_err(|e| err(CMD, e))?, b.view().map_err(|e| err(CMD, e))?);
     let st = cmp::compare(&va, &vb, &opts).map_err(|e| err(CMD, e))?;
     let pass = st.pass(min_psnr);
+    let diff_bounds = st.diff_bounds.map(|[x, y, w, h]| [x.saturating_add(ox), y.saturating_add(oy), w, h]);
     let mut out = json!({
-        "width": st.width,
-        "height": st.height,
+        "width": width,
+        "height": height,
         "max_abs": round(st.max_abs, 3),
         "mean_abs": round(st.mean_abs, 4),
         "alpha_max_abs": round(st.alpha_max_abs, 3),
@@ -267,11 +289,15 @@ fn compare(s: &mut Session, p: &Value) -> Result<Value> {
         "changed_pct": round(st.changed_pct, 4),
         "threshold": threshold,
         "pass": pass,
+        "diffBounds": diff_bounds,
         "a": a.source,
         "b": b.source,
     });
     if let Some(db) = min_psnr {
         out["min_psnr"] = json!(db);
+    }
+    if let Some(r) = region {
+        out["region"] = json!(r);
     }
     if !resampled.is_null() {
         out["resampled"] = resampled;
@@ -305,7 +331,7 @@ pub(super) fn specs() -> Vec<CommandSpec> {
         crate::query!(
             "render.compare",
             "Render Compare",
-            "{a: name|{snapshot}|{path}|{comp?, time?, transparent?}, b: (same), threshold? (levels, default 1), min_psnr? (dB), max_side?, amplify? (heatmap gain, default 8), diff_path?, diff_inline?} → {width, height, max_abs, mean_abs, alpha_max_abs, psnr_db, ssim, changed_pixels, changed_pct, pass, diff_path?, diff_png? (base64)}",
+            "{a: name|{snapshot}|{path}|{comp?, time?, transparent?}, b: (same), threshold? (levels, default 1), min_psnr? (dB), max_side?, region? ([x, y, w, h] frame px: compare only that), amplify? (heatmap gain, default 8), diff_path?, diff_inline?} → {width, height, max_abs, mean_abs, alpha_max_abs, psnr_db, ssim, changed_pixels, changed_pct, pass, diffBounds ([x, y, w, h] of changed px | null), region?, diff_path?, diff_png? (base64)}",
             compare
         ),
     ]
@@ -364,6 +390,50 @@ mod tests {
         s.execute("edit.undo", json!({})).unwrap();
         let r = s.execute("render.compare", json!({"a": "before", "b": {}})).unwrap();
         assert_eq!(r["pass"], true, "{r}");
+    }
+
+    #[test]
+    fn diff_bounds_and_region() {
+        let mut s = session();
+        s.execute("render.snapshot", json!({"name": "before"})).unwrap();
+        let r = s.execute("render.compare", json!({"a": "before", "b": {}})).unwrap();
+        assert_eq!(r["diffBounds"], json!(null), "identical frames: {r}");
+        // The 16×16 box (x 24..40, y 10..26) moves 10 px right: the box spans x 24..50.
+        s.execute("prop.set", json!({"layer": 1, "path": "transform/position", "value": [42, 18]})).unwrap();
+        let r = s.execute("render.compare", json!({"a": "before", "b": {}})).unwrap();
+        assert_eq!((r["diffBounds"].clone(), r["changed_pixels"].as_u64()), (json!([24, 10, 26, 16]), Some(320)), "{r}");
+        assert!(r.get("region").is_none());
+        // A region restricts the metrics, the box and the heatmap; coordinates stay frame pixels.
+        let diff = tmp("region-diff.png");
+        let r = s.execute("render.compare", json!({"a": "before", "b": {}, "region": [0, 0, 30, 36], "diff_path": diff})).unwrap();
+        assert_eq!((r["width"].as_u64(), r["height"].as_u64(), r["region"].clone()), (Some(64), Some(36), json!([0, 0, 30, 36])), "{r}");
+        assert_eq!((r["diffBounds"].clone(), r["changed_pixels"].as_u64()), (json!([24, 10, 6, 16]), Some(96)), "{r}");
+        assert_eq!(super::decode_image(&std::fs::read(&diff).unwrap()).unwrap().0, 30);
+        let _ = std::fs::remove_file(&diff);
+        // Clipped to the frame; a region away from the change passes with no box.
+        let r = s.execute("render.compare", json!({"a": "before", "b": {}, "region": [40.5, -10, 100, 100]})).unwrap();
+        assert_eq!(r["region"], json!([40, 0, 24, 36]), "{r}");
+        assert_eq!(r["diffBounds"], json!([40, 10, 10, 16]), "{r}");
+        let r = s.execute("render.compare", json!({"a": "before", "b": {}, "region": [0, 28, 64, 8]})).unwrap();
+        assert_eq!((r["pass"].as_bool(), r["diffBounds"].clone()), (Some(true), json!(null)), "{r}");
+        // Bad regions are errors.
+        for (region, want) in [
+            (json!([100, 0, 10, 10]), "outside"),
+            (json!([0, 0, 0, 10]), "positive"),
+            (json!([0, 0, 10]), "[x, y, width, height]"),
+            (json!([0, 0, "a", 10]), "[x, y, width, height]"),
+            (json!("0,0,8,8"), "[x, y, width, height]"),
+            (json!([1e308, 1e308, 1e308, 1e308]), "outside"),
+        ] {
+            let e = s.execute("render.compare", json!({"a": "before", "b": {}, "region": region})).unwrap_err().to_string();
+            assert!(e.contains(want), "{region}: {e}");
+        }
+        // Hostile but valid: a huge region is the whole frame.
+        let r = s.execute("render.compare", json!({"a": "before", "b": {}, "region": [-1e300, -1e300, 1e308, 1e308]})).unwrap();
+        assert_eq!(r["region"], json!([0, 0, 64, 36]), "{r}");
+        // With max_side the region is in the scaled frame's pixels.
+        let r = s.execute_checked("render.compare", json!({"a": "before", "b": {}, "max_side": 32, "region": [0, 0, 16, 18]})).unwrap();
+        assert_eq!((r["width"].as_u64(), r["region"].clone()), (Some(32), json!([0, 0, 16, 18])), "{r}");
     }
 
     #[test]

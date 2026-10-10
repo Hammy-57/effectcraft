@@ -25,7 +25,7 @@
 //!     on a large generated project (open, save, auto-save, undo/redo, timeline, Project panel)
 //! effectcraft-cli script FILE.jsx [F.ecproj] | --eval CODE    run an After Effects-style script
 //! effectcraft-cli replay SCRIPT.jsonl [--keep-going]        replay a repro script (docs/agents.md)
-//! effectcraft-cli mcp [--autosave | --bridge PORT | --ui] [--all-tools]  MCP server on stdio
+//! effectcraft-cli mcp [--autosave] [--bridge [PORT] | --ui] [--all-tools]  MCP server on stdio
 //! effectcraft-cli figma-bridge [--port 7789] [--control 9877] local endpoint for the Figma plug-in
 //!
 //! Project:  --project F.ecproj (or a positional *.ecproj) | --demo | --empty   (default: demo; mcp: empty)
@@ -34,7 +34,8 @@
 //!           the default is the CPU (Mercury Software Only)
 //! Bridge:   --bridge PORT drives a running `effectcraft --control PORT` instead of a headless session
 //! UI:       mcp --ui [--ui-size WxH] [--ui-scale K] runs the full app offscreen (no window) for
-//!           screenshot and the ui_* tools (feature `ui`, on by default)
+//!           screenshot and the ui_* tools (feature `ui`, on by default); with --autosave its
+//!           project is checkpointed like headless work
 //! Output:   --json for one compact JSON document on stdout (errors: {"error": …}, exit 1)
 //! ```
 //!
@@ -127,7 +128,9 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
   replay SCRIPT.jsonl [--keep-going]       replay a repro script headless (journal.export, crash repros):
                                            per-step ok/error and the first failure; exits 1 when a step
                                            fails, an expectation is not met or a command panics
-  mcp [--autosave | --bridge PORT | --ui]  MCP server (JSON-RPC over stdio); --autosave preserves unsaved headless work;
+  mcp [--autosave] [--bridge [PORT] | --ui] MCP server (JSON-RPC over stdio); --autosave preserves unsaved work
+                                           (headless or --ui; a bridged app owns its auto-saves);
+                                           --bridge without a port uses EFFECTCRAFT_CONTROL_PORT, else 9877;
                                            --ui [--ui-size 1680x1020] [--ui-scale 2] runs the app offscreen
                                            (no window) so screenshot and the ui_* tools work;
                                            --all-tools also lists the older tool aliases
@@ -223,7 +226,7 @@ struct Args {
 impl Args {
     fn parse(raw: Vec<String>) -> Result<Args, String> {
         let (mut pos, mut opts, mut unknown) = (vec![], vec![], vec![]);
-        let mut it = raw.into_iter();
+        let mut it = raw.into_iter().peekable();
         while let Some(a) = it.next() {
             if a.starts_with("--") && a.len() > 2 {
                 let (k, inline) = match a.split_once('=') {
@@ -231,7 +234,10 @@ impl Args {
                     None => (a, None),
                 };
                 if VALUED.contains(&k.as_str()) {
-                    let v = inline.or_else(|| it.next()).ok_or_else(|| format!("{k} needs a value"))?;
+                    // `--bridge` / `--control` without a port: the app's default control port.
+                    let port_default = matches!(k.as_str(), "--bridge" | "--control") && inline.is_none() && it.peek().is_none_or(|n| n.starts_with("--"));
+                    let v = if port_default { Some(default_control_port()) } else { inline.or_else(|| it.next()) };
+                    let v = v.ok_or_else(|| format!("{k} needs a value"))?;
                     opts.push((k, Some(v)));
                 } else if !FLAGS.contains(&k.as_str()) {
                     unknown.push(format!("`{k}`"));
@@ -266,6 +272,15 @@ impl Args {
     fn num(&self, k: &str) -> Result<Option<f64>, String> {
         self.opt(k).map(|v| v.parse::<f64>().map_err(|_| format!("{k}: not a number: {v}"))).transpose()
     }
+}
+
+/// The desktop app's control port: `EFFECTCRAFT_CONTROL_PORT` when set, else 9877.
+fn default_control_port() -> String {
+    control_port_or_default(std::env::var("EFFECTCRAFT_CONTROL_PORT").ok())
+}
+
+fn control_port_or_default(env: Option<String>) -> String {
+    env.map(|p| p.trim().to_string()).filter(|p| p.parse::<u16>().is_ok()).unwrap_or_else(|| "9877".to_string())
 }
 
 /// A comp/layer reference: number → id, `-` → none (active), else a name / `#n`.
@@ -382,8 +397,13 @@ fn offscreen_backend(args: &Args, default_demo: bool) -> Result<Backend, Failure
         None if args.flag("--demo") || (default_demo && !args.flag("--empty")) => Some(("file.openDemoProject", json!({}))),
         None => None,
     };
+    let auto_save = autosave_prefs(args)?;
     let ui = offscreen_ui::Offscreen::start(opts, move || {
         let mut s = effectcraft_host::session();
+        if let Some(a) = auto_save {
+            s.prefs.auto_save = a;
+            s.prefs.normalize();
+        }
         if let Some((id, params)) = open {
             s.execute_checked(id, params).map_err(|e| e.to_string())?;
         }
@@ -398,19 +418,28 @@ fn offscreen_backend(_args: &Args, _default_demo: bool) -> Result<Backend, Failu
     Err(Failure::Error("--ui: this effectcraft-cli was built without the `ui` feature (cargo build -p effectcraft-cli --features ui)".into()))
 }
 
+/// `--autosave`: the Auto-Save settings from the config directory (defaults without a settings
+/// file). Only those are read: opting in must not change rendering or load the desktop's models,
+/// shortcuts, disk cache or recovery sentinel.
+fn autosave_prefs(args: &Args) -> Result<Option<effectcraft_engine::prefs::AutoSave>, Failure> {
+    if !args.flag("--autosave") {
+        return Ok(None);
+    }
+    let dir = effectcraft_host::config_dir().ok_or_else(|| Failure::Error("--autosave: no config directory; set EFFECTCRAFT_CONFIG_DIR".into()))?;
+    use effectcraft_engine::config::ConfigStore;
+    let config = effectcraft_engine::config::DirConfig::new(dir);
+    Ok(Some(match config.read(effectcraft_engine::prefs::PREFS_FILE) {
+        Some(text) => effectcraft_engine::prefs::Prefs::from_json(&text).auto_save,
+        None => effectcraft_engine::prefs::Prefs::default().auto_save,
+    }))
+}
+
 /// A wired session; `--gpu` attaches the GPU compositor (renders then follow the project's
 /// renderer setting, Mercury GPU Acceleration by default).
 fn session(args: &Args) -> Result<effectcraft_engine::Session, Failure> {
     let mut s = effectcraft_host::session();
-    if args.flag("--autosave") {
-        let dir = effectcraft_host::config_dir().ok_or_else(|| Failure::Error("--autosave: no config directory; set EFFECTCRAFT_CONFIG_DIR".into()))?;
-        // Read only auto-save settings. Opting in must not change headless rendering or load
-        // the desktop's models, shortcuts, disk cache or recovery sentinel.
-        use effectcraft_engine::config::ConfigStore;
-        let config = effectcraft_engine::config::DirConfig::new(dir);
-        if let Some(text) = config.read(effectcraft_engine::prefs::PREFS_FILE) {
-            s.prefs.auto_save = effectcraft_engine::prefs::Prefs::from_json(&text).auto_save;
-        }
+    if let Some(a) = autosave_prefs(args)? {
+        s.prefs.auto_save = a;
         s.prefs.normalize();
     }
     if args.flag("--gpu") {
@@ -557,7 +586,6 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
     } else if args.flag("--ui") {
         for (o, why) in [
             ("--bridge", "--ui runs its own app offscreen; --bridge drives a running one"),
-            ("--autosave", "--autosave is for headless MCP; the offscreen app keeps the project in memory (save_project)"),
             ("--gpu", "the offscreen UI renders on the GPU compositor of its own device when one is usable"),
         ] {
             if args.opts.iter().any(|(k, _)| k == o) {
@@ -574,7 +602,7 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
                 Some(p) => p.parse::<u16>().map_err(|_| Failure::Usage(format!("--port: not a port: {p}")))?,
                 None => 7789,
             };
-            let control = args.opt("--control").or(args.opt("--bridge")).unwrap_or("9877").to_string();
+            let control = args.opt("--control").or(args.opt("--bridge")).map_or_else(default_control_port, str::to_string);
             figma_bridge::serve(figma_bridge::Config { port, control, code: args.opt("--code").map(str::to_string) })?;
         }
         "bench" => bench_cmd(args)?,
@@ -741,7 +769,7 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
         }
         "mcp" => {
             if args.flag("--autosave") && args.opt("--bridge").is_some() {
-                return usage_err("--autosave is for headless MCP; the bridged app owns its auto-saves");
+                return usage_err("--autosave is for MCP with the project in this process (headless or --ui); the bridged app owns its auto-saves");
             }
             let b = backend(args, false)?;
             let server = McpServer::new(b).with_all_tools(args.flag("--all-tools"));
@@ -1441,6 +1469,20 @@ mod tests {
         let a = parse(&["render", "t.ecproj", "--comp=Main", "--work-area", "--out", "x.mp4", "--json"]).unwrap();
         assert_eq!((a.project.as_deref(), a.opt("--comp"), a.opt("--out")), (Some("t.ecproj"), Some("Main"), Some("x.mp4")));
         assert!(a.flag("--work-area") && a.flag("--json"));
+    }
+
+    /// `--bridge` without a port uses the app's control port (`EFFECTCRAFT_CONTROL_PORT`, else 9877).
+    #[test]
+    fn bridge_without_a_port_uses_the_default_control_port() {
+        let a = parse(&["mcp", "--bridge", "9000"]).unwrap();
+        assert_eq!(a.opt("--bridge"), Some("9000"));
+        let a = parse(&["mcp", "--bridge"]).unwrap();
+        assert_eq!(a.opt("--bridge"), Some(default_control_port().as_str()));
+        let a = parse(&["info", "--bridge", "--json"]).unwrap();
+        assert!(a.opt("--bridge").is_some() && a.flag("--json"));
+        assert_eq!(control_port_or_default(Some("9901".into())), "9901");
+        assert_eq!(control_port_or_default(Some("nope".into())), "9877");
+        assert_eq!(control_port_or_default(None), "9877");
     }
 
     /// Rounded seconds name the frame they print (SceneYard Typo: 1.483333 s = frame 89 at 60 fps,

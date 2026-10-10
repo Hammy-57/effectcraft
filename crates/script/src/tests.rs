@@ -563,3 +563,71 @@ fn path_direction_uses_after_effects_values() {
     );
     assert!(o.error.as_ref().is_some_and(|e| format!("{e:?}").contains("can not be set")), "{:?}", o.error);
 }
+
+/// After Effects compatibility the Reel builds tripped over: legacy string builtins, the
+/// Repeater's and gradient items' own match names, and adding dashes by match name.
+#[test]
+fn ae_compat_substr_repeater_gradient_and_dash_match_names() {
+    let mut s = session();
+    let o = ok(
+        &mut s,
+        r#"
+        var c = app.project.items.addComp("C", 400, 300, 1, 2, 30);
+        var sh = c.layers.addShape();
+        var cont = sh.property("ADBE Root Vectors Group").addProperty("ADBE Vector Group").property("ADBE Vectors Group");
+        cont.addProperty("ADBE Vector Shape - Rect");
+        var rep = cont.addProperty("ADBE Vector Filter - Repeater");
+        var rt = rep.property("ADBE Vector Repeater Transform");
+        rt.property("ADBE Vector Repeater Position").setValue([40, 0]);
+        rt.property("ADBE Vector Repeater Opacity 2").setValue(25);
+        var gf = cont.addProperty("ADBE Vector Graphic - G-Fill");
+        gf.property("ADBE Vector Grad Type").setValue(2);
+        gf.property("ADBE Vector Grad Start Pt").setValue([-50, 0]);
+        gf.property("ADBE Vector Grad End Pt").setValue([50, 0]);
+        var st = cont.addProperty("ADBE Vector Graphic - Stroke");
+        var d = st.property("ADBE Vector Stroke Dashes");
+        var can = d.canAddProperty("ADBE Vector Stroke Dash 1");
+        d.addProperty("ADBE Vector Stroke Dash 1").setValue(12);
+        d.addProperty("ADBE Vector Stroke Gap 1").setValue(6);
+        d.addProperty("ADBE Vector Stroke Dash 2").setValue(3);
+        d.addProperty("ADBE Vector Stroke Offset").setValue(5);
+        var again = d.addProperty("ADBE Vector Stroke Dash 1").value;
+        var gs = cont.addProperty("ADBE Vector Graphic - G-Stroke");
+        [
+          "abcdef".substr(1, 3), unescape(escape("a b")),
+          rt.property("ADBE Vector Repeater Position").value, rt.property(2).matchName, rt.property("Position").matchName,
+          gf.property("ADBE Vector Grad Type").value, gf.property(4).matchName, gf.property("ADBE Vector Grad Colors").name,
+          gs.property("ADBE Vector Grad End Pt").name, gs.property("ADBE Vector Stroke Dashes").matchName,
+          can, again, d.property("ADBE Vector Stroke Gap 2").matchName, d.canAddProperty("Nope")
+        ]
+        "#,
+    );
+    assert_eq!(
+        o.result,
+        json!([
+            "bcd",
+            "a b",
+            [40, 0],
+            "ADBE Vector Repeater Position",
+            "ADBE Vector Repeater Position",
+            2,
+            "ADBE Vector Grad Start Pt",
+            "Colors",
+            "End Point",
+            "ADBE Vector Stroke Dashes",
+            true,
+            12,
+            "ADBE Vector Stroke Gap 2",
+            false
+        ])
+    );
+    let (_, c) = comp_named(&s, "C");
+    let sh = c.layers.iter().find(|l| l.props.sub("contents").is_some()).unwrap();
+    let items = sh.props.group("contents/#1/contents").unwrap();
+    assert_eq!(items.prop("repeater/transform/endOpacity").unwrap().value, KV::Scalar(25.0));
+    assert_eq!(items.prop("gfill/type").unwrap().value, KV::Enum(1), "AE's 2 is our radial (1)");
+    let dashes = items.group("stroke/dashes").unwrap();
+    let v = |m: &str| dashes.get(m).map(|p| p.value.clone());
+    assert_eq!((v("dash"), v("gap"), v("dash2"), v("offset")), (Some(KV::Scalar(12.0)), Some(KV::Scalar(6.0)), Some(KV::Scalar(3.0)), Some(KV::Scalar(5.0))));
+    assert!(dashes.get("dash3").is_none(), "only the pairs asked for");
+}

@@ -12,7 +12,7 @@
 //! history holds them ([`HistoryNode::id`]), so ids stay valid across undo, redo and jumps.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use effectcraft_project::Project;
 use serde::Serialize;
@@ -33,6 +33,9 @@ pub struct History {
     pub merge_key: Option<String>,
     /// Alternative futures kept when a new step was made after undoing.
     pub branches: Vec<Branch>,
+    /// Who made each state (the `client` of the step that led to it), by state address; states
+    /// the user made aren't listed. The weak reference keeps the address from being reused.
+    authors: HashMap<usize, (Weak<Project>, String)>,
 }
 
 /// A line of states that grows from another state of the history.
@@ -58,6 +61,9 @@ pub struct HistoryNode {
     pub parent: Option<usize>,
     /// Branch nesting (0 = the working line).
     pub depth: usize,
+    /// The client (agent, script) whose step made this state; absent when the user made it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client: Option<String>,
     /// The current state.
     pub current: bool,
     /// On the working line (Undo / Redo walk it).
@@ -172,6 +178,7 @@ impl Arena {
                 label: self.label[n].clone(),
                 parent: self.parent[n].and_then(|p| order.get(&p).copied()),
                 depth,
+                client: None,
                 current: n == self.current,
                 line,
                 future: line && pos_in_line[&n] > cur_pos,
@@ -254,7 +261,31 @@ impl History {
 
     /// The history as a tree, given the current state.
     pub fn tree(&self, current: &Arc<Project>) -> Vec<HistoryNode> {
-        Arena::build(self, current).listing()
+        let a = Arena::build(self, current);
+        let mut nodes = a.listing();
+        let by_id: HashMap<String, &str> = a.state.iter().filter_map(|st| Some((state_id(st), self.author(st)?))).collect();
+        for n in &mut nodes {
+            n.client = by_id.get(&n.id).map(|c| c.to_string());
+        }
+        nodes
+    }
+
+    /// The client whose step made `state` (`None`: the user, or unknown).
+    pub fn author(&self, state: &Arc<Project>) -> Option<&str> {
+        self.authors.get(&key(state)).filter(|(w, _)| w.strong_count() > 0).map(|(_, c)| c.as_str())
+    }
+
+    /// Remember who made `state` (`None`: the user). Forgets states nothing holds any more.
+    pub fn set_author(&mut self, state: &Arc<Project>, client: Option<String>) {
+        self.authors.retain(|_, (w, _)| w.strong_count() > 0);
+        match client {
+            Some(c) => {
+                self.authors.insert(key(state), (Arc::downgrade(state), c));
+            }
+            None => {
+                self.authors.remove(&key(state));
+            }
+        }
     }
 
     /// Number of states on branches (not on the working line).

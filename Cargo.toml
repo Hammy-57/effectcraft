@@ -59,7 +59,9 @@ gif = "0.14"
 proptest = "1"
 
 # scripting (expressions)
-boa_engine = { version = "0.22", default-features = false }
+# annex-b: the legacy builtins ExtendScript and AE expressions rely on (String.prototype.substr,
+# escape/unescape…).
+boa_engine = { version = "0.22", default-features = false, features = ["annex-b"] }
 # WebAssembly effect plug-ins (sandboxed interpreter; MIT/Apache-2.0, pure Rust)
 wasmi = { version = "2", default-features = false, features = ["std", "validate", "wat", "deterministic", "portable-dispatch"] }
 
@@ -210,3 +212,18 @@ opt-level = 3
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# Optimised builds for the owner's own use (scripts/fork/app.sh): release speed without the slow
+# link-time optimisation, parallel codegen and incremental rebuilds. Published builds use `release`.
+[profile.local]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
+
+# `cargo xtask ci` builds clippy and tests with this profile. Tests don't need shipping-grade LTO:
+# thin LTO + one codegen unit across ~69 test binaries made the gate ~1.5 h while the tests run in ~75 s.
+[profile.ci]
+inherits = "release"
+lto = false
+codegen-units = 16

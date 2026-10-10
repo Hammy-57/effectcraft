@@ -1,7 +1,11 @@
 //! MCP server: JSON-RPC 2.0, one message per line (the MCP stdio transport). Implements
 //! tools, resources (with templates and subscriptions), prompts and logging. The stdio loop
 //! handles progress and cancellation for long renders and writes queued notifications.
+//!
+//! A `tools/call` carrying `_meta.requestId` (or a `request_id` argument) is answered from a small
+//! cache when the same id comes again, so a retried call never runs twice.
 
+use std::collections::VecDeque;
 use std::io::{BufRead, Write};
 use std::path::Path;
 
@@ -29,6 +33,8 @@ const RESOURCE_NOT_FOUND: i64 = -32002;
 
 /// The first revision with `structuredContent`, `outputSchema` and `title`.
 const STRUCTURED_SINCE: &str = "2025-06-18";
+/// Tool-call `requestId`s remembered (with their results) for retries.
+const REPLY_CACHE: usize = 128;
 
 pub struct McpServer {
     backend: Backend,
@@ -38,12 +44,14 @@ pub struct McpServer {
     notify: Notifier,
     /// List the hidden aliases too (`mcp --all-tools`).
     all_tools: bool,
+    /// Recent `tools/call` results by request id.
+    replies: VecDeque<(String, Value)>,
 }
 
 impl McpServer {
     pub fn new(mut backend: Backend) -> Self {
         let notify = Notifier::new(&mut backend);
-        Self { backend, autosave: None, version: None, notify, all_tools: false }
+        Self { backend, autosave: None, version: None, notify, all_tools: false, replies: VecDeque::new() }
     }
 
     /// Also list the older tool names (`list_commands`, `execute_command`, `get_project`,
@@ -78,13 +86,22 @@ impl McpServer {
         is_modern(params) || self.version.is_some_and(|v| v >= STRUCTURED_SINCE)
     }
 
-    /// Opt in to durable headless checkpoints in a separate folder per server.
+    /// Opt in to durable checkpoints in a separate folder per server, for a session in this
+    /// process: headless, or the offscreen app of `mcp --ui` (checkpointed on its UI thread).
     /// `root` is the platform config directory; settings are read by the caller.
     pub fn with_autosave(mut self, root: &Path) -> crate::Result<Self> {
-        let s = self.backend.session().ok_or_else(|| crate::Error::BadArgs("--autosave is for headless MCP; the bridged app owns its auto-saves".into()))?;
-        s.autosave.background = false;
-        let autosave = AutoSave::new(root, &s.prefs).map_err(|e| crate::Error::Other(format!("MCP auto-save: {e}")))?;
-        s.autosave_folder_override = Some(autosave.folder().to_path_buf());
+        let in_process =
+            || crate::Error::BadArgs("--autosave is for MCP with the project in this process (headless or --ui); the bridged app owns its auto-saves".into());
+        let prefs = self.backend.session_prefs().ok_or_else(in_process)?;
+        let autosave = AutoSave::new(root, &prefs).map_err(|e| crate::Error::Other(format!("MCP auto-save: {e}")))?;
+        let folder = autosave.folder().to_path_buf();
+        // Queued for an app in this process: it runs once the app started, before any request.
+        self.backend
+            .queue_on_session(Box::new(move |s| {
+                s.autosave.background = false;
+                s.autosave_folder_override = Some(folder);
+            }))
+            .ok_or_else(in_process)??;
         self.autosave = Some(autosave);
         Ok(self)
     }
@@ -94,9 +111,22 @@ impl McpServer {
     }
 
     fn checkpoint(&mut self, finish: bool) -> std::io::Result<()> {
-        match (&mut self.autosave, self.backend.session()) {
-            (Some(a), Some(s)) => a.checkpoint(s, finish),
-            _ => Ok(()),
+        let Some(a) = &mut self.autosave else { return Ok(()) };
+        if let Some(s) = self.backend.session() {
+            return a.checkpoint(s, finish);
+        }
+        // An app in this process (`mcp --ui`): checkpoint on its UI thread, between frames.
+        let mut job = a.clone();
+        match self.backend.with_session(move |s| {
+            let r = job.checkpoint(s, finish);
+            (job, r)
+        }) {
+            Some(Ok((done, r))) => {
+                *a = done;
+                r
+            }
+            Some(Err(e)) => Err(a.failed(e)),
+            None => Ok(()),
         }
     }
 
@@ -251,7 +281,12 @@ impl McpServer {
             }
             "tools/call" => {
                 let name = params.get("name").and_then(Value::as_str).ok_or((INVALID_PARAMS, "missing tool `name`".to_string()))?;
-                let args = params.get("arguments").cloned().unwrap_or(json!({}));
+                let mut args = params.get("arguments").cloned().unwrap_or(json!({}));
+                // Idempotency key: `_meta.requestId` or a `request_id` argument (never passed on).
+                let request_id = take_request_id(params, &mut args);
+                if let Some(cached) = request_id.as_ref().and_then(|rid| self.replies.iter().find(|(k, _)| k == rid)) {
+                    return Ok(cached.1.clone());
+                }
                 if tools::available(self.backend.is_bridge()).all(|t| t.name != name) {
                     let hint = if tools::find(name).is_some() { format!(" ({})", crate::backend::NEED_BRIDGE) } else { String::new() };
                     return Err((INVALID_PARAMS, format!("unknown tool `{name}`{hint}")));
@@ -261,7 +296,14 @@ impl McpServer {
                 }
                 let r = self.guarded(name, &args);
                 let structured = self.structured(params);
-                Ok(self.finish_call(name, r, structured))
+                let result = self.finish_call(name, r, structured);
+                if let Some(rid) = request_id {
+                    while self.replies.len() >= REPLY_CACHE {
+                        self.replies.pop_front();
+                    }
+                    self.replies.push_back((rid, result.clone()));
+                }
+                Ok(result)
             }
             "resources/subscribe" => {
                 let uri = params.get("uri").and_then(Value::as_str).ok_or((INVALID_PARAMS, "missing `uri`".to_string()))?;
@@ -301,6 +343,22 @@ impl McpServer {
             m => Err((METHOD_NOT_FOUND, format!("method not found: {m}"))),
         }
     }
+}
+
+/// Remove and return a `tools/call`'s idempotency key: `params._meta.requestId`, or a
+/// `request_id` / `requestId` argument (strings or numbers).
+fn take_request_id(params: &Value, args: &mut Value) -> Option<String> {
+    let key = |v: Option<Value>| match v? {
+        Value::String(s) => Some(s),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    };
+    let from_args = args.as_object_mut().and_then(|a| {
+        let rid = a.remove("request_id");
+        let camel = a.remove("requestId");
+        key(rid).or(key(camel))
+    });
+    key(params.pointer("/_meta/requestId").cloned()).or(from_args)
 }
 
 /// A `tools/call` result: tool failures are reported in-band (`isError`) so the model can react.

@@ -2,12 +2,13 @@
 //! Style dialog with the style list on the left (a check box per style, Blending Options first)
 //! and the selected style's controls on the right. Every control edits the ordinary
 //! `layerStyles/<style>/<property>` property, so the viewer previews live; Cancel rolls the
-//! edits made in the dialog back, OK keeps them (one undo step per control drag).
+//! layer's styles back to how they were when the dialog opened (edits other drivers made
+//! meanwhile are kept), OK keeps them (one undo step per control drag).
 
 use crate::i18n::tr;
 use effectcraft_engine::keyframe::Value as KV;
-use effectcraft_engine::project::styles::{BLENDING, STYLES};
-use effectcraft_engine::project::{Layer, LayerId, ParamUi, Property};
+use effectcraft_engine::project::styles::{BLENDING, GROUP, STYLES};
+use effectcraft_engine::project::{ItemId, Layer, LayerId, Node, ParamUi, Project, Property};
 use egui::{Align2, vec2};
 use serde_json::{Value, json};
 
@@ -27,6 +28,9 @@ pub struct LayerStyleState {
 struct Checkpoint {
     project: std::sync::Arc<effectcraft_engine::project::Project>,
     history: effectcraft_engine::history::History,
+    /// The layer whose styles the dialog edits, in its composition.
+    comp: Option<ItemId>,
+    layer: Option<LayerId>,
 }
 
 impl std::fmt::Debug for Checkpoint {
@@ -35,9 +39,37 @@ impl std::fmt::Debug for Checkpoint {
     }
 }
 
-fn checkpoint(app: &mut EffectcraftApp) -> Checkpoint {
+fn checkpoint(app: &mut EffectcraftApp, layer: Option<LayerId>) -> Checkpoint {
     app.session.history.merge_key = None;
-    Checkpoint { project: app.session.project.clone(), history: app.session.history.clone() }
+    Checkpoint { project: app.session.project.clone(), history: app.session.history.clone(), comp: app.session.active_comp_id(), layer }
+}
+
+/// The Layer Styles group of `layer` and its place among the layer's top-level groups.
+fn styles_of(p: &Project, comp: ItemId, layer: LayerId) -> Option<(usize, Node)> {
+    let l = p.comp(comp)?.layer(layer)?;
+    let i = l.props.children.iter().position(|c| c.match_id() == GROUP)?;
+    Some((i, l.props.children.get(i)?.clone()))
+}
+
+/// Give `layer` the Layer Styles group `saved` (none: remove it).
+fn put_styles(p: &mut Project, comp: ItemId, layer: LayerId, saved: Option<&(usize, Node)>) {
+    let Some(l) = p.comp_mut(comp).and_then(|c| c.layer_mut(layer)) else { return };
+    let cur = l.props.children.iter().position(|c| c.match_id() == GROUP);
+    match (cur, saved) {
+        (Some(i), Some((_, g))) => {
+            if let Some(slot) = l.props.children.get_mut(i) {
+                *slot = g.clone();
+            }
+        }
+        (Some(i), None) => {
+            l.props.children.remove(i);
+        }
+        (None, Some((at, g))) => {
+            let at = (*at).min(l.props.children.len());
+            l.props.children.insert(at, g.clone());
+        }
+        (None, None) => {}
+    }
 }
 
 /// Open the dialog on the first selected (or given) layer, showing `style` (a style id;
@@ -54,7 +86,7 @@ pub fn open(app: &mut EffectcraftApp, params: &Value) -> Result<(), String> {
     if style != BLENDING && !STYLES.iter().any(|s| s.0 == style) {
         return Err(format!("unknown layer style `{style}`"));
     }
-    let checkpoint = checkpoint(app);
+    let checkpoint = checkpoint(app, Some(LayerId(layer)));
     app.dialog_state.layer_style = LayerStyleState { layer, selected: style, undo_mark: app.session.history.undo.len(), checkpoint: Some(checkpoint) };
     app.dialog = Some(Dialog::LayerStyles);
     Ok(())
@@ -68,7 +100,8 @@ pub fn route(app: &mut EffectcraftApp, id: &str, params: &Value) -> Result<bool,
         return Ok(false);
     }
     let mark = app.session.history.undo.len();
-    let checkpoint = checkpoint(app);
+    let target = app.session.state.selected_layers.first().copied();
+    let checkpoint = checkpoint(app, target);
     app.session.execute(id, json!({})).map_err(|e| e.to_string())?;
     open(app, &json!({"style": style}))?;
     // Cancel also removes the style just added.
@@ -234,19 +267,43 @@ pub fn select(app: &mut EffectcraftApp, style: &str) {
     app.dialog_state.layer_style.selected = style.to_string();
 }
 
-/// Close the dialog: OK keeps the edits, Cancel undoes everything done since it opened.
+/// Close the dialog: OK keeps the edits, Cancel puts the layer's styles back as they were when
+/// it opened. When nothing else changed meanwhile, the dialog's steps leave the history too;
+/// when another driver (an agent, a script) edited the project meanwhile, only the layer's
+/// styles are restored, as one undoable step, and the other edits stay.
 pub fn finish(app: &mut EffectcraftApp, ok: bool) {
     if let Some(checkpoint) = app.dialog_state.layer_style.checkpoint.take()
         && !ok
     {
-        let changed = !std::sync::Arc::ptr_eq(&app.session.project, &checkpoint.project);
-        app.session.project = checkpoint.project;
-        app.session.history = checkpoint.history;
-        app.session.sanitize_state();
-        if changed {
-            app.session.bump();
-        }
+        cancel(app, checkpoint);
     }
     app.session.history.merge_key = None;
     app.dialog = None;
+}
+
+fn cancel(app: &mut EffectcraftApp, checkpoint: Checkpoint) {
+    if std::sync::Arc::ptr_eq(&app.session.project, &checkpoint.project) {
+        app.session.history = checkpoint.history;
+        return;
+    }
+    let (Some(comp), Some(layer)) = (checkpoint.comp, checkpoint.layer) else { return };
+    let saved = styles_of(&checkpoint.project, comp, layer);
+    // Only the dialog's layer styles changed: back to the checkpoint, history included.
+    let mut only_styles = (*app.session.project).clone();
+    put_styles(&mut only_styles, comp, layer, saved.as_ref());
+    only_styles.next_id = checkpoint.project.next_id;
+    if only_styles.same_content(&checkpoint.project) {
+        app.session.project = checkpoint.project;
+        app.session.history = checkpoint.history;
+        app.session.sanitize_state();
+        app.session.bump();
+        return;
+    }
+    let r = app.session.edit("Cancel Layer Style", None, |p, _| {
+        put_styles(p, comp, layer, saved.as_ref());
+        Ok(())
+    });
+    if let Err(e) = r {
+        app.ui.status = e.to_string();
+    }
 }

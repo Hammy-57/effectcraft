@@ -6,6 +6,7 @@ use effectcraft_engine::config::{FileOps, StdFiles};
 use effectcraft_engine::{Session, autosave, prefs::Prefs};
 use serde_json::{Value, json};
 
+#[derive(Clone)]
 pub(crate) struct AutoSave {
     folder: PathBuf,
     latest: Option<String>,
@@ -43,11 +44,14 @@ impl AutoSave {
     }
 
     pub fn checkpoint(&mut self, s: &mut Session, ended: bool) -> std::io::Result<()> {
-        let result = self.write(s, ended);
-        if let Err(e) = &result {
-            self.error = Some(format!("MCP auto-save in {} failed: {e}", self.folder.display()));
-        }
-        result.map_err(|e| std::io::Error::other(format!("MCP auto-save in {} failed: {e}", self.folder.display())))
+        self.write(s, ended).map_err(|e| self.failed(e))
+    }
+
+    /// Record a failed checkpoint (reported by [`AutoSave::info`] until one succeeds).
+    pub fn failed(&mut self, e: impl std::fmt::Display) -> std::io::Error {
+        let message = format!("MCP auto-save in {} failed: {e}", self.folder.display());
+        self.error = Some(message.clone());
+        std::io::Error::other(message)
     }
 
     fn write(&mut self, s: &mut Session, ended: bool) -> std::io::Result<()> {

@@ -54,11 +54,7 @@ fn warp_p(s: &Session, p: &Value, cmd: &str) -> Result<(ItemId, LayerId, Uid)> {
     for lid in candidates {
         let Some(fx) = comp.layer(lid).and_then(Layer::effects) else { continue };
         let g = match p.get("effect") {
-            Some(Value::Number(n)) => {
-                let n = n.as_u64().unwrap_or(0);
-                fx.groups().find(|g| g.uid == n).or_else(|| fx.groups().nth((n as usize).saturating_sub(1)))
-            }
-            Some(Value::String(name)) => fx.groups().find(|g| &g.name == name),
+            Some(v @ (Value::Number(_) | Value::String(_))) => super::pick_group(fx.groups(), v),
             _ => s
                 .state
                 .selected_props

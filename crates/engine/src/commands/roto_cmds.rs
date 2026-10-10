@@ -64,7 +64,7 @@ fn is_running(s: &Session) -> std::result::Result<(), String> {
     if s.is_roto_running() { Ok(()) } else { Err("no Roto Brush job is running".into()) }
 }
 
-/// The Roto Brush instance targeted by `p`: `layer` / `effect` (uid, name or 1-based index),
+/// The Roto Brush instance targeted by `p`: `layer` / `effect` (uid, name or `"#n"`, 1-based index),
 /// else a selected one, else the first on the selected (or any) layer.
 pub(crate) fn roto_p(s: &Session, p: &Value, cmd: &str) -> Result<(ItemId, LayerId, Uid)> {
     let cid = super::comp_id(s, p)?;
@@ -81,11 +81,7 @@ pub(crate) fn roto_p(s: &Session, p: &Value, cmd: &str) -> Result<(ItemId, Layer
     for lid in candidates {
         let Some(fxg) = comp.layer(lid).and_then(Layer::effects) else { continue };
         let g = match p.get("effect") {
-            Some(Value::Number(n)) => {
-                let n = n.as_u64().unwrap_or(0);
-                fxg.groups().find(|g| g.uid == n).or_else(|| fxg.groups().nth((n as usize).saturating_sub(1)))
-            }
-            Some(Value::String(name)) => fxg.groups().find(|g| &g.name == name),
+            Some(v @ (Value::Number(_) | Value::String(_))) => super::pick_group(fxg.groups(), v),
             _ => s
                 .state
                 .selected_props

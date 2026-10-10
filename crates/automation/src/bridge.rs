@@ -9,9 +9,14 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
+use effectcraft_engine::Session;
+use effectcraft_engine::prefs::Prefs;
 use serde_json::{Value, json};
 
 use crate::{Error, Result};
+
+/// Code run on the session of an app in this process ([`ControlTransport::on_session`]).
+pub type SessionJob = Box<dyn FnOnce(&mut Session) + Send>;
 
 /// Slightly longer than the app's own 60 s per-request timeout, so its error reply wins.
 const READ_TIMEOUT: Duration = Duration::from_secs(65);
@@ -23,6 +28,17 @@ pub trait ControlTransport: Send {
     /// The MCP mode name this transport gives (`initialize`'s server title, `effectcraft-cli info`).
     fn mode(&self) -> &'static str {
         "bridge"
+    }
+    /// The session's preferences when the app runs in this process (`None` for an app in another
+    /// process, whose session is out of reach).
+    fn session_prefs(&self) -> Option<Prefs> {
+        None
+    }
+    /// Queue `job` on the app's session when the app runs in this process: it runs on the app's
+    /// UI thread, between frames, before any later request, and this doesn't wait for it. `None`
+    /// when the app is in another process; `Err` when the app stopped.
+    fn on_session(&mut self, _job: SessionJob) -> Option<Result<()>> {
+        None
     }
 }
 
@@ -79,6 +95,9 @@ impl BridgeClient {
     /// Call a control method; returns the reply's `result`, or the app's `error` as [`Error::App`].
     pub fn call(&mut self, method: &str, params: Value) -> Result<Value> {
         let mut last = Error::Bridge("not attempted".into());
+        // The same `requestId` on the resend: if the app ran the first attempt before the
+        // connection died, it answers from its reply cache instead of running it again.
+        let request_id = format!("mcp-{}-{}", std::process::id(), self.next_id);
         for attempt in 0..2 {
             if self.conn.is_none() {
                 self.conn = Some(self.connect()?);
@@ -86,7 +105,7 @@ impl BridgeClient {
             let id = self.next_id;
             self.next_id += 1;
             let Some((r, w)) = self.conn.as_mut() else { continue };
-            let line = format!("{}\n", json!({"id": id, "method": method, "params": params}));
+            let line = format!("{}\n", json!({"id": id, "requestId": request_id, "method": method, "params": params}));
             // `Ok(Err(_))`: the connection is dead before a reply (safe to resend once);
             // `Err(_)`: a timeout or bad reply (never resent: the app may have run the request).
             let res = (|| -> Result<std::result::Result<Value, Error>> {
