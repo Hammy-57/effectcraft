@@ -80,7 +80,7 @@ fn key_light_removes_a_green_screen() {
     let steps = s.history.undo.len();
     // The default screen colour (pure green) already keys the screen, so the shown frame is
     // transparent there; the eyedropper samples the effect's input instead.
-    let picked = s.execute_checked("effect.pickColor", json!({"effect": 1, "param": "screenColour", "x": 6, "y": 6, "average": true})).unwrap();
+    let picked = s.execute_checked("effect.pickColor", json!({"effect": "#1", "param": "screenColour", "x": 6, "y": 6, "average": true})).unwrap();
     let col: Vec<f64> = picked["color"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
     let want = plate(6, 6);
     assert!((0..3).all(|i| (col[i] - want[i] as f64).abs() < 0.02), "{col:?} vs {want:?}");
@@ -117,11 +117,11 @@ fn key_light_removes_a_green_screen() {
 fn pick_color_rejects_bad_targets_and_screen_matte_view_shows_the_key() {
     let (mut s, c) = keyed();
     // Not a colour parameter / outside the layer.
-    assert!(s.execute_checked("effect.pickColor", json!({"effect": 1, "param": "screenGain", "x": 6, "y": 6})).is_err());
-    assert!(s.execute_checked("effect.pickColor", json!({"effect": 1, "param": "screenColour", "x": -50, "y": 6})).is_err());
-    assert!(s.execute_checked("effect.pickColor", json!({"effect": 1, "param": "screenColour", "x": 1e300, "y": -1e300, "average": true})).is_err());
-    assert!(s.execute_checked("effect.pickColor", json!({"effect": 1, "param": "screenColour"})).is_err());
-    s.execute_checked("effect.pickColor", json!({"effect": 1, "param": "screenColour", "x": 90, "y": 60})).unwrap();
+    assert!(s.execute_checked("effect.pickColor", json!({"effect": "#1", "param": "screenGain", "x": 6, "y": 6})).is_err());
+    assert!(s.execute_checked("effect.pickColor", json!({"effect": "#1", "param": "screenColour", "x": -50, "y": 6})).is_err());
+    assert!(s.execute_checked("effect.pickColor", json!({"effect": "#1", "param": "screenColour", "x": 1e300, "y": -1e300, "average": true})).is_err());
+    assert!(s.execute_checked("effect.pickColor", json!({"effect": "#1", "param": "screenColour"})).is_err());
+    s.execute_checked("effect.pickColor", json!({"effect": "#1", "param": "screenColour", "x": 90, "y": 60})).unwrap();
     // View ▸ Screen Matte: black screen (once Clip Black takes the uneven screen), white subject.
     for (path, v) in [("effects/#1/view", 4), ("effects/#1/screenMatte/clipBlack", 25)] {
         s.execute_checked("prop.set", json!({"path": path, "value": v})).unwrap();

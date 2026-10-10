@@ -141,7 +141,7 @@ fn roto_brush_propagates_and_content_aware_fill_removes_the_object() {
     }
 
     // Content-Aware Fill: a mask around the object's path, Object fill, then the square is gone.
-    let roto_fx = qa.exec("effect.remove", json!({"layer": plate.clone(), "effect": 1}));
+    let roto_fx = qa.exec("effect.remove", json!({"layer": plate.clone(), "effect": "#1"}));
     let _ = roto_fx;
     qa.exec("layer.addMask", json!({"layer": plate.clone(), "shape": "rect", "rect": [20, 25, 120, 40], "mode": "Subtract"}));
     let caf =

@@ -289,7 +289,7 @@ fn center_anchor(s: &mut Session, p: &Value) -> Result<Value> {
 
 // ---------------------------------------------------------------- masks
 
-/// Masks the command applies to: `mask` (index / uid / name) on `layer`, else selected masks,
+/// Masks the command applies to: `mask` (uid, `"#n"` (1-based) or name) on `layer`, else selected masks,
 /// else every mask of the selected layers.
 pub(crate) fn target_masks(s: &Session, p: &Value) -> Result<(ItemId, Vec<(LayerId, Uid)>)> {
     let (cid, ids) = layers_p(s, p)?;
@@ -298,16 +298,8 @@ pub(crate) fn target_masks(s: &Session, p: &Value) -> Result<(ItemId, Vec<(Layer
     if let Some(m) = p.get("mask") {
         for lid in &ids {
             let Some(masks) = comp.layer(*lid).and_then(|l| l.masks()) else { continue };
-            let g = match m {
-                Value::Number(n) => {
-                    let n = n.as_u64().unwrap_or(1);
-                    masks.children.iter().find(|c| c.uid() == n).or_else(|| masks.children.get(n.saturating_sub(1) as usize))
-                }
-                Value::String(name) => masks.children.iter().find(|c| c.name() == name),
-                _ => None,
-            };
-            if let Some(g) = g {
-                out.push((*lid, g.uid()));
+            if let Some(g) = super::pick_group(masks.groups(), m) {
+                out.push((*lid, g.uid));
             }
         }
         return Ok((cid, out));

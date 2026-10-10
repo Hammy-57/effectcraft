@@ -58,6 +58,7 @@ fn summary(s: &mut Session, _: &Value) -> Result<Value> {
         .collect();
     Ok(json!({
         "path": s.path,
+        "revision": s.revision,
         "dirty": s.is_dirty(),
         // Changes with every project edit (also undo/redo), never for queries: a cheap "has
         // anything changed" check for agents (MCP resource subscriptions).
@@ -205,7 +206,11 @@ fn capabilities(s: &mut Session, _: &Value) -> Result<Value> {
 const PARITY: &str = "≈91% feature breadth and ≈45% ready for real work (estimated parity with After Effects 2026 26.5, stage alpha); all After Effects effects present (306 registered)";
 
 fn state(s: &mut Session, _: &Value) -> Result<Value> {
-    Ok(serde_json::to_value(&s.state).unwrap_or_default())
+    let mut v = serde_json::to_value(&s.state).unwrap_or_default();
+    if let Some(o) = v.as_object_mut() {
+        o.insert("revision".into(), json!(s.revision));
+    }
+    Ok(v)
 }
 
 pub fn specs() -> Vec<CommandSpec> {
