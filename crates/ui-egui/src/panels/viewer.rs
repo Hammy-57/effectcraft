@@ -1242,13 +1242,11 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         && resp.hovered()
         && ui.input(|i| i.pointer.primary_pressed())
         && let Some(pos) = ui.input(|i| i.pointer.press_origin())
+        && ov::motion_key_at(&key_hits, pos).is_none()
+        && ov::motion_segment_at(&motion_segments, pos).is_none()
+        && !key_hits.iter().any(|h| h.tangent.is_some() && h.pos.distance(pos) < 6.0)
     {
-        if ov::motion_key_at(&key_hits, pos).is_none()
-            && ov::motion_segment_at(&motion_segments, pos).is_none()
-            && !key_hits.iter().any(|h| h.tangent.is_some() && h.pos.distance(pos) < 6.0)
-        {
-            pen_press(app, ui, &ectx, &map, &paths, pos, mods);
-        }
+        pen_press(app, ui, &ectx, &map, &paths, pos, mods);
     }
     // A pen click (press + release without a drag) ends its tangent gesture on release.
     if ui.input(|i| i.pointer.primary_released())
