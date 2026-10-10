@@ -26,11 +26,14 @@
 //! * **Cost**: a run that meets unanswered requests keeps going on stand-in answers to collect
 //!   them all, so an evaluation takes a handful of runs instead of one per request; and each
 //!   evaluation first answers what the same expression read last time (see [`prefetch`]), so
-//!   from the second frame on most expressions run exactly once.
+//!   from the second frame on most expressions run exactly once. Results are shared between
+//!   evaluations with the same inputs while everything they read answers the same (see [`memo`]),
+//!   so a controller read by many layers runs once per frame.
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod host;
+mod memo;
 mod noise;
 mod prefetch;
 pub mod rewrite;
@@ -150,15 +153,39 @@ fn evaluate_out(
     }
     FRAMES.with(|f| f.borrow_mut().push(frame));
     let _guard = FrameGuard;
-    // Answer what this expression read last time (pushed first: answers that evaluate other
-    // expressions nest exactly as they do when a run asks for them).
     let key = prefetch::Key::new(text, comp, layer.id.0, prop.uid);
     let now = secs(ctx.time.seconds());
+    // The same inputs evaluated before (by another layer reading this property, or another
+    // frame): when everything that run read answers the same now, so does the result.
+    let memo_key = memo::Key::new(text, &begin);
+    if let Some(reqs) = memo::recorded(&memo_key, text, &begin) {
+        answer(&resolver, depth, reqs.clone());
+        let hit = FRAMES.with(|f| {
+            let f = f.borrow();
+            let fr = f.get(depth)?;
+            memo::check(&memo_key, |q, r| fr.answer(q).is_some_and(|a| memo::same(a, r)))
+        });
+        if let Some(out) = hit {
+            prefetch::store(key, now, reqs);
+            return Ok(out);
+        }
+    }
+    // Answer what this expression read last time (pushed first: answers that evaluate other
+    // expressions nest exactly as they do when a run asks for them).
     answer(&resolver, depth, prefetch::predicted(&key, now));
     for _ in 0..MAX_PASSES {
         match runtime::run(text, &begin) {
             Run::Done(r) => {
-                let used = FRAMES.with(|f| f.borrow_mut().get_mut(depth).map(|fr| std::mem::take(&mut fr.used)).unwrap_or_default());
+                let (used, resps) = FRAMES.with(|f| {
+                    let mut f = f.borrow_mut();
+                    let Some(fr) = f.get_mut(depth) else { return (vec![], None) };
+                    let used = std::mem::take(&mut fr.used);
+                    let resps = if r.is_ok() && memo::cacheable(text) { fr.take_answers(&used) } else { None };
+                    (used, resps)
+                });
+                if let (Ok(out), Some(resps)) = (&r, resps) {
+                    memo::store(memo_key, text, &begin, used.clone(), resps, out.clone());
+                }
                 prefetch::store(key, now, used);
                 return r;
             }
@@ -217,5 +244,7 @@ pub fn check_syntax(text: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_memo;
 #[cfg(test)]
 mod tests_perf;
