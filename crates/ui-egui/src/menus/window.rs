@@ -72,7 +72,7 @@ fn panel_op(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: Val
         }
         "floatPanelGroup" => {
             let p = need(op)?;
-            let r = rect.unwrap_or_else(|| crate::dock_ui::default_float_rect(ctx.content_rect()));
+            let r = rect.unwrap_or_else(|| crate::dock_ui::default_float_rect(crate::float_windows::main_content_rect(ctx)));
             if !app.edit_layout(|l| l.float_group(p, r)) {
                 return Err(format!("can't undock the panel group of {}", p.title()));
             }
@@ -107,7 +107,9 @@ fn panel_op(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: Val
                 _ => tab.unwrap_or_else(|| ctx.content_rect().center()),
             };
             let doc = comp.or_else(|| app.shown_doc(p));
-            crate::panels::panel_menu::open(ctx, p, doc, pos);
+            // A panel in an undocked OS window: its menu opens in that window.
+            let viewport = crate::float_windows::panel_viewport(app, p).unwrap_or_else(|| ctx.viewport_id());
+            crate::panels::panel_menu::open_in(ctx, viewport, p, doc, pos);
             Ok(Value::Null)
         }
         "maximizePanel" => {
@@ -125,7 +127,7 @@ fn panel_op(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: Val
         }
         "floatPanel" => {
             let p = need(op)?;
-            let r = rect.unwrap_or_else(|| crate::dock_ui::default_float_rect(ctx.content_rect()));
+            let r = rect.unwrap_or_else(|| crate::dock_ui::default_float_rect(crate::float_windows::main_content_rect(ctx)));
             if !app.edit_layout(|l| l.float(p, r)) {
                 return Err(format!("can't undock {}", p.title()));
             }

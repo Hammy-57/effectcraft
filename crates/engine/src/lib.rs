@@ -21,7 +21,7 @@ mod session_settings;
 
 use std::sync::Arc;
 
-use effectcraft_project::{Comp, ItemId, Layer, LayerId, Project, Uid};
+use effectcraft_project::{Comp, ItemId, LayerId, Project, Uid};
 use effectcraft_raster::Image;
 use effectcraft_render::{ExprHost, FootageSource, LayerCache, NoFootage, RenderOpts, Renderer};
 use effectcraft_time::Tick;
@@ -209,9 +209,10 @@ pub struct EditorState {
     pub selected_props: Vec<(LayerId, Uid)>,
     pub selected_keys: Vec<KeyRef>,
     pub project_selection: Vec<ItemId>,
-    /// Layer clipboard (serialized layers) and keyframe clipboard.
+    /// Layer clipboard (serialized layers) and keyframe clipboard. Shared layers: cloning the
+    /// state for an edit doesn't copy them.
     #[serde(skip)]
-    pub clipboard: Vec<Layer>,
+    pub clipboard: effectcraft_project::Layers,
     /// Copied keyframes (times relative to the earliest copied key).
     #[serde(skip)]
     pub key_clipboard: Vec<KeyClip>,
@@ -403,6 +404,9 @@ pub struct Session {
     pub warp_job: Option<warp::WarpJob>,
     /// Warp Stabilizers waiting for (re-)analysis: (comp, layer, effect uid).
     pub warp_pending: Vec<(ItemId, LayerId, Uid)>,
+    /// The last state whose analyses (Warp Stabilizer, 3D Camera Tracker, Roto Brush) were all
+    /// checked after an edit: the next edit from it checks only the layers it changed.
+    pub analyses_checked: std::sync::Weak<Project>,
     /// The running (or finished, not yet polled) 3D Camera Tracker analysis.
     pub camera_job: Option<camera_track::CameraJob>,
     /// 3D Camera Trackers waiting for (re-)analysis: (comp, layer, effect uid).
@@ -574,6 +578,7 @@ impl Default for Session {
             mask_job: None,
             warp_job: None,
             warp_pending: vec![],
+            analyses_checked: std::sync::Weak::new(),
             camera_job: None,
             camera_pending: vec![],
             roto_job: None,
@@ -716,32 +721,35 @@ impl Session {
         if let Some(e) = self.claim_conflict(&before, &p) {
             return Err(e);
         }
-        // Warp Stabilizer analyses made from other frames are cleared (and queued again).
-        for w in warp::invalidate(&before, &mut p) {
+        // Warp Stabilizer analyses made from other frames are cleared (and queued again). From a
+        // checked state only the layers the edit changed are looked at (the rest are shared).
+        let full = !std::ptr::eq(self.analyses_checked.as_ptr(), Arc::as_ptr(&before));
+        for w in warp::invalidate(&before, &mut p, full) {
             if !self.warp_pending.contains(&w) {
                 self.warp_pending.push(w);
             }
         }
         // So are 3D Camera Tracker tracks (and solves made with other settings).
-        for w in camera_track::invalidate(&before, &mut p) {
+        for w in camera_track::invalidate(&before, &mut p, full) {
             if !self.camera_pending.contains(&w) {
                 self.camera_pending.push(w);
             }
         }
         // Roto Brush Input Keys follow the frames; edited instances propagate again.
-        for r in roto::sync(&before, &mut p) {
+        for r in roto::sync(&before, &mut p, full) {
             if !self.roto_pending.contains(&r) {
                 self.roto_pending.push(r);
             }
         }
         // Nothing changed (a value set to what it already was): no undo step, not modified.
         if p.same_content(&before) {
+            self.analyses_checked = Arc::downgrade(&before);
             self.state = st;
             return Ok(r);
         }
-        // A continuous gesture folds into one step, unless another client made the last step.
         // Footage removed: its files are closed (below).
         let removed = p.items.len() < before.items.len();
+        // A continuous gesture folds into one step, unless another client made the last step.
         let same = merge.is_some() && merge.map(str::to_string) == self.history.merge_key && self.history.author(&before) == self.client.as_deref();
         if !same {
             // Undone steps aren't lost: they stay in the History panel as a branch.
@@ -755,6 +763,7 @@ impl Session {
         if removed {
             self.release_unused_footage();
         }
+        self.analyses_checked = Arc::downgrade(&self.project);
         self.history.set_author(&self.project, self.client.clone());
         self.state = st;
         self.bump();
@@ -1049,7 +1058,13 @@ impl Session {
     }
 
     /// Replace the whole project (open/new), resetting history and state.
-    pub fn replace_project(&mut self, mut p: Project, path: Option<String>) {
+    pub fn replace_project(&mut self, p: Project, path: Option<String>) {
+        self.replace_project_with(p, path, None);
+    }
+
+    /// [`Session::replace_project`], reopening the comps that were open when it was saved
+    /// ([`Session::restore_open_comps`]); without any (or none left), the first comp opens.
+    pub fn replace_project_with(&mut self, mut p: Project, path: Option<String>, open: Option<&effectcraft_project::OpenComps>) {
         if self.stop_render()
             && let Some(mut job) = self.render_job.take()
         {
@@ -1085,10 +1100,59 @@ impl Session {
         self.path = path;
         self.bump();
         self.mark_saved();
+        if open.is_some_and(|o| self.restore_open_comps(o)) {
+            return;
+        }
         let first = self.project.comps().next().map(|(id, _)| *id);
         if let Some(c) = first {
             self.open_comp(c);
         }
+    }
+
+    /// The comps open in the user's Timeline/Composition tabs, the front one and their current
+    /// times, for the project file (`openComps`, see [`effectcraft_project::OpenComps`]). Always
+    /// the user's view: while an agent's command runs (a `client`, see [`agents`]) its own
+    /// cursor is in [`Session::state`] and the user's waits in [`Session::cursors`]. `None`
+    /// when no comp is open.
+    pub fn open_comps_to_save(&self) -> Option<effectcraft_project::OpenComps> {
+        let (active, times) = match self.cursors.user() {
+            Some(u) => (u.active_comp, &u.times),
+            None => (self.state.active_comp, &self.state.times),
+        };
+        let comps: Vec<effectcraft_project::OpenComp> = self
+            .state
+            .open_comps
+            .iter()
+            .filter(|c| self.project.comp(**c).is_some())
+            .map(|c| effectcraft_project::OpenComp { comp: *c, time: times.get(c).copied().unwrap_or(Tick::ZERO) })
+            .collect();
+        if comps.is_empty() {
+            return None;
+        }
+        let active = active.filter(|a| comps.iter().any(|c| c.comp == *a));
+        Some(effectcraft_project::OpenComps { comps, active })
+    }
+
+    /// Reopen the comps a project file says were open (After Effects reopens a project's
+    /// Timeline tabs): in their tab order, each at its saved current time (clamped to the comp
+    /// and snapped to a frame), the saved front one active. Ids of comps that no longer exist
+    /// (or repeat) are skipped. Returns whether any comp opened. Not an edit: no undo step and
+    /// the project stays unmodified.
+    pub fn restore_open_comps(&mut self, open: &effectcraft_project::OpenComps) -> bool {
+        let mut comps: Vec<ItemId> = Vec::new();
+        for oc in &open.comps {
+            let Some(c) = self.project.comp(oc.comp) else { continue };
+            if comps.contains(&oc.comp) {
+                continue;
+            }
+            let last = (c.duration - c.frame_duration()).max(Tick::ZERO);
+            self.state.times.insert(oc.comp, c.frame_rate.snap_nearest(oc.time.clamp(Tick::ZERO, last)));
+            comps.push(oc.comp);
+        }
+        let Some(active) = open.active.filter(|a| comps.contains(a)).or_else(|| comps.first().copied()) else { return false };
+        self.state.open_comps = comps;
+        self.open_comp(active);
+        true
     }
 }
 

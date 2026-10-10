@@ -537,7 +537,7 @@ fn now() -> u64 {
 }
 
 /// `YYYY-MM-DD HH:MM UTC` (civil-from-days, proleptic Gregorian).
-fn utc(t: u64) -> String {
+pub(crate) fn utc(t: u64) -> String {
     let (days, secs) = ((t / 86_400) as i64, t % 86_400);
     let z = days + 719_468;
     let era = z.div_euclid(146_097);

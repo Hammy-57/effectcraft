@@ -10,12 +10,16 @@ use crate::EffectcraftApp;
 use crate::dock::PanelKind;
 use crate::i18n::tr;
 
-/// The open menu: its panel, the document tab it was opened on (a Timeline comp) and where.
+/// The open menu: its panel, the document tab it was opened on (a Timeline comp) and where:
+/// `pos` in the window `viewport` (the main window, or an undocked panel group's OS window,
+/// which opens it when it next draws while `pending`).
 #[derive(Clone, Copy, Debug)]
 struct Target {
     panel: PanelKind,
     doc: Option<u64>,
     pos: egui::Pos2,
+    viewport: egui::ViewportId,
+    pending: bool,
 }
 
 fn popup_id() -> egui::Id {
@@ -28,8 +32,16 @@ fn target_id() -> egui::Id {
 
 /// Open the panel menu of `panel` (its document tab `doc`) at `pos`.
 pub fn open(ctx: &egui::Context, panel: PanelKind, doc: Option<u64>, pos: egui::Pos2) {
-    ctx.data_mut(|d| d.insert_temp(target_id(), Target { panel, doc, pos }));
-    egui::Popup::open_id(ctx, popup_id());
+    open_in(ctx, ctx.viewport_id(), panel, doc, pos);
+}
+
+/// [`open`] in the window `viewport` (`pos` in its coordinates): the panel's undocked OS window.
+pub fn open_in(ctx: &egui::Context, viewport: egui::ViewportId, panel: PanelKind, doc: Option<u64>, pos: egui::Pos2) {
+    let here = viewport == ctx.viewport_id();
+    ctx.data_mut(|d| d.insert_temp(target_id(), Target { panel, doc, pos, viewport, pending: !here }));
+    if here {
+        egui::Popup::open_id(ctx, popup_id());
+    }
 }
 
 /// The panel whose menu is open, if any.
@@ -193,7 +205,16 @@ fn rows(auto: &mut crate::automation::Registry, ui: &mut egui::Ui, entries: &[En
 /// Show the open panel menu (drawn by the dock area every frame) and run what is chosen.
 pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui) {
     let ctx = ui.ctx().clone();
-    let Some(t) = ctx.data(|d| d.get_temp::<Target>(target_id())) else { return };
+    let Some(mut t) = ctx.data(|d| d.get_temp::<Target>(target_id())) else { return };
+    // (Menus open in one window: another window's menu is drawn there.)
+    if t.viewport != ctx.viewport_id() {
+        return;
+    }
+    if t.pending {
+        t.pending = false;
+        ctx.data_mut(|d| d.insert_temp(target_id(), t));
+        egui::Popup::open_id(&ctx, popup_id());
+    }
     if !egui::Popup::is_id_open(&ctx, popup_id()) {
         ctx.data_mut(|d| d.remove::<Target>(target_id()));
         return;

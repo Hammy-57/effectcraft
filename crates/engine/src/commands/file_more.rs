@@ -296,7 +296,7 @@ fn consolidate(s: &mut Session, _: &Value) -> Result<Value> {
         let ids: Vec<ItemId> = proj.comps().map(|(id, _)| *id).collect();
         for cid in ids {
             if let Some(c) = proj.comp_mut(cid) {
-                for l in &mut c.layers {
+                for l in c.layers.iter_mut_where(|l| matches!(&l.source, LayerSource::Footage { item } if remap.contains_key(item))) {
                     if let LayerSource::Footage { item } = &mut l.source
                         && let Some(k) = remap.get(item)
                     {
@@ -812,10 +812,8 @@ fn interpret(s: &mut Session, p: &Value) -> Result<Value> {
             // Layers that ran to the footage's end still do (After Effects re-times them too).
             let ids: Vec<ItemId> = proj.comps().map(|(id, _)| *id).collect();
             for cid in ids {
-                for l in proj.comp_mut(cid).into_iter().flat_map(|c| c.layers.iter_mut()) {
-                    if l.source.item() == Some(*i) && (l.stretch - 100.0).abs() < 1e-9 && l.out_point == l.start_time + old {
-                        l.out_point = l.start_time + new;
-                    }
+                for l in proj.comp_mut(cid).into_iter().flat_map(|c| c.layers.iter_mut_where(|l| l.source.item() == Some(*i) && (l.stretch - 100.0).abs() < 1e-9 && l.out_point == l.start_time + old)) {
+                    l.out_point = l.start_time + new;
                 }
             }
         }
@@ -906,10 +904,8 @@ fn retarget_layers(proj: &mut Project, item: ItemId, src: impl Fn(&LayerSource) 
     let ids: Vec<ItemId> = proj.comps().map(|(id, _)| *id).collect();
     for cid in ids {
         if let Some(c) = proj.comp_mut(cid) {
-            for l in &mut c.layers {
-                if l.source.item() == Some(item) {
-                    l.source = src(&l.source);
-                }
+            for l in c.layers.iter_mut_where(|l| l.source.item() == Some(item)) {
+                l.source = src(&l.source);
             }
         }
     }

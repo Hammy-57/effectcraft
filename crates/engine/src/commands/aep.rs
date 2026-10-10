@@ -18,8 +18,9 @@ fn import_document(s: &mut Session, path: &str, bytes: &[u8], dir: &str, allow_l
             None
         }
     };
+    // The edit works on a copy of the project and drops it on an error: no second copy needed.
     let imported = s.edit("Import After Effects Project", None, |project, state| {
-        let result = effectcraft_aep::import_ir(project, bytes, dir, &mut resolve_media).map_err(|e| EngineError::Other(e.to_string()))?;
+        let result = effectcraft_aep::import_ir_into(project, bytes, dir, &mut resolve_media).map_err(|e| EngineError::Other(e.to_string()))?;
         if !allow_losses && !result.losses.is_empty() {
             return Err(EngineError::Other(format!("AEP import has {} fidelity gaps; project left unchanged", result.losses.len())));
         }
