@@ -210,6 +210,10 @@ The most important missing piece: it turns every other estimate here into a meas
 - Localisation of the interface, accessibility (keyboard navigation, screen readers, contrast),
   user documentation and tutorials.
 
+### Agent-native editing
+
+- Design lint (10 October): `render.lint` / MCP `lint_frame` reports small or low-contrast text, safe-area, cut-off, overlap, hidden-layer and off-beat problems in plain language; the beat tracker is a simple onset/tempo one, not yet checked against real music.
+
 ## For agents choosing work
 
 1. Run `cargo xtask agents status` (running work and claims; regenerates `plan/STATUS.md`) and claim
