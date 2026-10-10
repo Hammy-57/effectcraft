@@ -56,6 +56,7 @@ impl Exporter for FileExporter {
                     label: job.label.clone(),
                     storage: job.storage,
                     overflow: job.project.render_prefs.overflow_folders.clone(),
+                    memory_budget: job.memory_budget,
                 },
                 nested_switches: job.nested_switches,
             };

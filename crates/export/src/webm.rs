@@ -252,7 +252,7 @@ pub(crate) async fn webm(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut Sta
         }
     };
 
-    let batch = batch_size();
+    let batch = batch_size(job, comp);
     let mut i = 0;
     while i < total {
         let end = (i + batch).min(total);
