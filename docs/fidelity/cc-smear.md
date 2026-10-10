@@ -42,6 +42,6 @@ Types, exact edge antialiasing and arbitrary orientations against AE are unmeasu
 The canvas grows only for effects that may need it. Expression controls and
 colour-only corrections retain the glyph raster; colour effects that can create
 alpha (Levels, Levels IC, Curves, Color Link, Colorama and PS Arbitrary Map) retain
-canvas expansion. GPU expansion copies into a larger resident texture and does
-not read pixels back to the CPU. A small title with Color Control and Tint has a
+canvas expansion. Normal text expands its CPU raster before accelerator upload;
+this does not introduce a GPU readback. A small title with Color Control and Tint has a
 regression asserting its buffer remains below 1,000 pixels.
