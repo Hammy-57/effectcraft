@@ -26,7 +26,7 @@ fn kinetic_typography() {
     assert_eq!(off["keys"][0]["out"], "Bezier", "easy ease makes Bezier keys");
     // A second, wiggly selector (Mode: Intersect) jitters the amounts; pinned to 100 % here so
     // frames stay predictable, then checked to really wiggle once released.
-    let wig = qa.exec("layer.addTextSelector", json!({"layer": "Title", "animator": 1, "kind": "wiggly"}));
+    let wig = qa.exec("layer.addTextSelector", json!({"layer": "Title", "animator": "#1", "kind": "wiggly"}));
     assert!(wig["selector"].is_u64());
     qa.tool("set_property", json!({"layer": "Title", "path": "text/animators/#1/selectors/wigglySelector/minAmount", "value": 100}));
     qa.tool("add_keyframe", json!({"layer": "Title", "path": "transform/position", "keys": [{"time": 0, "value": [40, 50]}, {"time": 2, "value": [120, 50]}]}));
