@@ -114,7 +114,9 @@ See [MCP conventions](mcp.md) for core tools, resources, strict arguments, and p
 | `render_preview {comp? \| item?, layer?, time?, max_side?, region?, overlays?, path?, inline?, transparent?}` | Returns a PNG image of a frame; `transparent: true` keeps the alpha (as an RGB + Alpha render writes it) instead of compositing over the comp background. `region: [x, y, w, h]` (comp pixels) renders just that rectangle at full resolution (then `max_side` applies to it); `layer` renders one layer solo in its place; `item` renders a footage or solid item on its own (source time). `overlays: true` (bounds + anchor) or a list of `bounds`, `anchor`, `motionPath`, `safeMargins`, `grid`, `all` draws the viewer's overlays (boxes tagged `#n name` in label colours) and returns each drawn layer's comp-space `bounds` [x, y, w, h] (the `get_layout` geometry), `anchor` and `keyPositions`. |
 | `render_frames {comp? \| item?, layer?, times? \| count?, start?, end?, cols?, max_side?, labels?, region?, overlays?, transparent?, path?, gif?, inline?}` | One contact-sheet PNG of several frames, each cell labelled with its time and frame number: `times` (s), or `count` frames (default 6, capped at 64) spread evenly over `start`..`end` (default the work area). `max_side` is the sheet's longest side (default 1600); `gif` also writes an animated GIF. Returns `{times, frames, cols, rows, cell, width, height}`. |
 | `get_layout {comp?, time?, layers?, pixels?, overlaps?}` | Where layers are on screen at a time, without rendering (`layer.bounds`): `visible` (and `why` not), comp-space `bounds` [x,y,w,h], `corners`, `center`, `anchorInComp`, `onScreen` (0-1) and the layer-space `source` rect, after parenting and (3D) the active camera. `pixels` adds the drawn pixels' bounds (effects included); `overlaps` lists overlapping visible layers. |
+| `get_motion {comp?, layer? \| layers?, start?, end?, step?}` | How layers move over a time range, without rendering (`comp.motion` / `layer.motion`): per layer `segments` (enter, exit, move, hold, scale, rotate, fade-in, fade-out with times, from / to, direction, edge), `offscreen` intervals and a one-sentence `summary`, plus `overlaps` between drawn layers. See [Motion summary](#motion-summary). |
 | `analyze_audio {comp?, start?, end?, layer?, silence_db?, min_silence?, true_peak?, waveform?, width?, height?, path?}` | Measure the audio mix (`audio.analyze`): peak / true peak dBFS, RMS, integrated LUFS (BS.1770), clipped samples, silent ranges, per-channel stats; `waveform` returns a waveform image. No audio gives `hasAudio: false`. |
+| `lint_frame {comp?, time?, start?, end?, step?, rules?, min_text_px?, min_contrast?}` | Design lint (`render.lint`): plain-language design problems at one time or over a range, each with a fix hint: text too small or low-contrast, outside title / action safe, cut off, overlapping text, layers switched on but not seen, keyframes just off the music's beat. Returns `{clean, counts, problems: [{rule, severity, layer, layerName, time, until, message, other?}]}`. See [Design lint](#design-lint). |
 | `render_snapshot {name, comp?, time?, max_side?, transparent?}` | Render a frame and keep it in the session under `name` (16 kept, oldest dropped; the same name replaces). |
 | `render_compare {a, b, threshold?, min_psnr?, max_side?, region?, amplify?, diff_path?, inline?}` | Compare two frames. `a` and `b` are each a snapshot name (or `{snapshot}`), `{path}` (a PNG/JPEG golden or After Effects reference) or `{comp?, time?, transparent?}` (render now; `{}` = active comp at the CTI). Returns `{width, height, max_abs, mean_abs, alpha_max_abs, psnr_db, ssim, changed_pixels, changed_pct, pass, diffBounds}` and, when something changed, the diff heatmap as an image. `region: [x, y, w, h]` compares one rectangle. See [Verify your change](#verify-your-change-snapshot--edit--compare). |
 | `open_project {path \| demo \| new}` / `save_project {path?}` | Open and save files. |
@@ -167,6 +169,30 @@ warnings}` (`prop.addKey`: `{keys, warnings}`), `set_property`, `add_keyframe` a
 `warnings` array, and `batch` gathers them as `step N (id): …`. Read them: a clamped Levels value
 renders very differently from what you meant.
 
+### Several agents at once
+
+Pass `client` on every request (`"client": "agentA"`) when you share the app with the user or other
+agents. Two things follow:
+
+- **Your own cursor.** Selection (layers, properties, keys, mask vertices, Project items), active comp
+  and current time are yours: `layer.select`, `time.set`, `comp.new` / `comp.open` and every command
+  that acts on "the selected layers" or "the active comp" use your copy, never the user's or another
+  agent's. Your first request starts from a copy of the user's cursor. A comp you create or open gets a
+  tab, but the user's viewer stays on what they are looking at. `editor.state` with your `client` is
+  your view; without one it is the user's, plus `clients` (each agent's active comp, time and selected
+  layers) and `claims`. At most 64 cursors are kept (the least recently used goes); requests without
+  `client` behave exactly as before.
+- **Claims.** `comp.claim {comp, ttl?}` reserves a comp for you (`ttl` seconds, default 300, at most
+  24 h; claim again to renew). While it holds, another client's command that would change the comp (its
+  layers, properties or name) or delete it is refused, changing nothing: `composition "Main" is claimed
+  by agentA (expires in 4m 12s); claim it after they release it, or work on another comp`. That includes
+  an `edit.undo` that would reach into it. The owner and the user (no `client`) edit as always; the
+  user never needs a claim. `comp.release {comp?}` releases one claim or, without `comp`, all of yours;
+  `comp.claims` lists them (`{comp, name, client, expiresIn, ttl}`). Claims expire on their own, are
+  dropped when another project is opened, and the control channel releases a client's claims when the
+  last connection that used that `client` closes (keep one connection open, as the MCP bridge does).
+  Without `client`, `comp.release` needs `force: true` (the user overriding a claim).
+
 ### A typical session
 
 1. `command_run {"id":"comp.new","params":{"name":"Intro","width":1920,"height":1080,"frameRate":30,"duration":4}}`
@@ -212,6 +238,52 @@ refactor that should change nothing gives `pass: true` with `psnr_db: "inf"`.
   `render.compare` (`diff_inline: true` returns the heatmap as base64 `diff_png`).
 - For goldens and fidelity checks from the shell: `effectcraft-cli compare a.png b.png` (see [CLI](#cli)).
 
+### Design lint
+
+`lint_frame` (engine command `render.lint`) checks a comp the way a designer would glance at it
+and lists what is wrong, in words an agent can act on. Run it before calling a design done:
+`lint_frame {}` checks the current frame, `lint_frame {"start":0,"end":5}` samples every 0.5 s
+(`step`) plus each layer's in point and keyframe time (at most 120 samples, else `truncated: true`).
+
+```json
+{"comp": 1, "compName": "Main", "times": [0.0, 0.5, 1.0], "truncated": false, "clean": false,
+ "counts": {"error": 1, "warning": 1, "info": 0}, "rules": ["text-too-small", "…"],
+ "problems": [{"rule": "low-contrast", "severity": "error", "layer": 3, "layerName": "Title",
+               "time": 0.0, "until": 1.0, "message": "“Title”'s text colour #8a8a8a on its background (about #808080 under the text) has a contrast ratio of 1.14:1, below 3.0:1: make the text lighter or darker, change what is behind it, or add a stroke or shadow."}],
+ "notes": ["off-beat skipped: the comp has no audible layers"]}
+```
+
+- **Reading it.** `clean` is true when there are no errors or warnings (info doesn't count).
+  The same problem at several sample times is one entry from `time` to `until` (comp seconds; the
+  worst occurrence's severity and message). `layer` is the stable layer id; pair rules add
+  `other` / `otherName`. Problems come errors first, then by time. `rules: [...]` runs only some.
+- `text-too-small`: the smallest drawn character's font size on screen (its em size through the
+  layer's scale, parents, text animators and the camera; cap height is about 70 % of it) is under
+  `min_text_px` (default comp height / 30: 36 px at 1080p) → warning; under half → error.
+- `low-contrast`: the WCAG contrast ratio of the text colour (blended by the layer's opacity)
+  against the mean colour under the text's box, measured on a small render of the comp without
+  its text layers, is under `min_contrast` (default 3:1) → warning; under two thirds of it (2:1)
+  → error. The message gives both colours and the ratio.
+- `outside-title-safe` (text, warning) / `outside-action-safe` (other layers, info): part of the
+  layer is outside the title-safe / action-safe box (Settings ▸ Grids & Guides: 10 % / 5 % per
+  side by default). The message says by how many pixels on which side.
+- `cut-off`: part (not all) of the layer is outside the frame: warning for text, info otherwise.
+  Layers covering the whole frame (backgrounds) are never cut off or outside a safe area.
+- `text-overlap`: two visible text layers' boxes overlap by more than 2 % of the smaller one
+  (warning; `layer` is the upper one).
+- `hidden-visible` (info): switched on and inside its in/out range, yet nothing shows: opacity 0,
+  entirely outside the frame, or entirely covered by an opaque layer above (`other`; a solid, or
+  footage whose alpha is ignored, at 100 % in Normal mode without masks or effects).
+- `off-beat` (warning, only when the comp has audio): a key moment (a Transform or Opacity
+  keyframe, or an in point after 0) within half a beat of a beat that misses it by more than one
+  frame; the message names the beat to move it to. Beats come from the comp's audio mix (onset
+  envelope, tempo by autocorrelation, beats by dynamic programming); with a single `time` only the
+  key moments on that frame are checked. Without audio, or without a clear beat, a `notes` entry
+  says it was skipped.
+
+Geometry is the `get_layout` geometry (track-matte sources and adjustment layers are skipped);
+only `low-contrast` renders, at most 480 px on the long side, once per sample time that shows text.
+
 ### Cookbook
 
 Short recipes; every step is one tool call.
@@ -227,6 +299,7 @@ Short recipes; every step is one tool call.
 | Drive with an expression | `set_property {"layer":2,"path":"transform/rotation","expression":"time*90"}` |
 | Inspect a layer | `get_layer {"layer":2,"flat":true}` (every property with its `path`, value, key count) |
 | Is the title centred and on screen? | `get_layout {"layers":["Title"],"time":2}` → compare `center` with half the comp size, `onScreen` should be 1; `get_layout {"overlaps":true}` for collisions |
+| Does the animation read right? | `get_motion {}` → each layer's `summary` ("Logo flies in from the left 0–1s, holds 1–4s, fades out 4–5s."), `segments` for exact times, `overlaps` for collisions over time |
 | Check the soundtrack | `analyze_audio {}` → `integratedLufs` (streaming targets about -14), `truePeakDbtp` under -1, `clippedSamples` 0, `silences`; `analyze_audio {"waveform":true}` to see it |
 | Check the result | `render_preview {"time":1.5,"max_side":640}`; with a UI (`--ui` / `--bridge`) `screenshot {"panel":"Timeline"}` |
 | Prove what an edit changed | `render_snapshot {"name":"before"}` → edit → `render_compare {"a":"before","b":{}}` (metrics + diff heatmap) |
@@ -243,6 +316,47 @@ Short recipes; every step is one tool call.
 
 The desktop app checks footage in the background after every open (a "Checking footage" job in
 the Progress panel, `jobs.list`); headless sessions run `footage.check` when they want it.
+
+### Motion summary
+
+Agents can't watch a video. `get_motion` (engine `comp.motion {comp?, layers?, start?, end?,
+step?}`, or `layer.motion {comp?, layer, start?, end?, step?}` for one layer) describes how layers
+move in text, from the same comp-space content boxes as `get_layout` plus each layer's opacity,
+scale and rotation; nothing is rendered, so it is cheap.
+
+```json
+{"comp": 1, "compName": "Intro", "start": 0, "end": 5, "step": 0.0417, "truncated": false,
+ "layers": [{"layer": 2, "name": "Logo", "inPoint": 0, "outPoint": 5,
+   "segments": [{"kind": "enter", "start": 0, "end": 1, "from": [-60, 90], "to": [160, 90], "direction": "right", "edge": "left"},
+                {"kind": "hold", "start": 1, "end": 4, "from": [160, 90], "to": [160, 90]},
+                {"kind": "fade-out", "start": 4, "end": 5, "from": 100, "to": 0}],
+   "offscreen": [{"start": 0, "end": 0.125}],
+   "summary": "Logo flies in from the left 0–1s, holds 1–4s, fades out 4–5s."}],
+ "overlaps": [{"a": 3, "b": 4, "aName": "A", "bName": "B", "start": 0.75, "end": 1.29, "maxFraction": 1}]}
+```
+
+- **Range and sampling.** Default the whole comp (0 to its duration, not the work area), one
+  sample per frame, or coarser for long comps so a layer gets at most 600 samples. Each layer is
+  also sampled at its in and out points and at every Transform keyframe of it and its parents
+  inside the range, so segment boundaries land on keys. Layers × samples is capped at 20 000:
+  past that the range is cut short, `end` says where it stopped and `truncated` is true (with
+  `notes`). Times are comp seconds.
+- **Segments.** `move`: the content centre travels at least 0.5% of the comp diagonal; `from` /
+  `to` are centres in comp pixels and `direction` the 8-way direction (`left`, `up-right`…); a
+  turn of more than 50° starts a new segment. `enter` / `exit`: a move during which the share of
+  the layer inside the frame rises / falls by at least 25%, with the frame `edge` it comes from /
+  leaves by; a move that does both (flies across) is split into enter, move and exit where it is
+  most on screen. A layer that just appears on screen at its in point is not an enter.
+  `scale` (average X/Y scale %), `rotate` (degrees, positive is clockwise), `fade-in` /
+  `fade-out` (opacity 0–100) are the layer's own Transform values changing by at least 1. `hold`:
+  nothing of the above for at least 0.25 s (and three samples); smaller jitter counts as holding.
+  Kinds overlap in time when a layer moves and fades at once.
+- **`offscreen`**: while the layer is on (in to out point), intervals where none of its box is
+  inside the frame. **`overlaps`**: pairs of drawn layers whose on-screen boxes overlap by more
+  than 5% of the smaller one, sampled on the grid, merged into intervals with the largest
+  fraction; layers covering the whole frame (backgrounds) are left out.
+- Cameras, lights, nulls, hidden (Video off) and content-less layers are listed with no segments
+  and a `summary` saying why.
 
 ### Pitfalls
 
@@ -766,6 +880,24 @@ not read or written.
 
 `<comp>` is an id or name, or `-` for the active comp. `<value>` is JSON (`50`, `[960,540]`,
 `"#ff0000"`) or a bare string.
+
+## Agent exam
+
+`evals/agent/` holds about twenty motion-design tasks (lower third, title card in the safe areas,
+logo fly-in, easing, parenting, precomp, shape layer, blur and glow, masks, track matte, fixing
+layout problems, retiming and renaming, a 9:16 reframe, a contrast fix) that an agent performs
+through the MCP server, each scored by deterministic checks. `cargo xtask agent-exam --run` builds
+each starting project, runs Claude Code headless against `effectcraft-cli mcp`, and writes
+`report.json` / `report.md` (pass rate, minutes, tool calls, failures with reasons); it is meant
+for a nightly cloud job. `--check P.ecproj --task ID` scores one saved project, `--list` and
+`--validate` are cheap.
+
+The checker is the engine query `exam.check {task | checks, base?}` → `{passed, score, total,
+passedCount, results: [{id, desc, pass, reason, actual}]}`. A check runs one read-only query
+(`comp.info`, `prop.get`, `layer.bounds`, `render.lint`, `comp.motion`…; commands that edit or
+write files are refused) and tests its JSON result with JSON Pointers and ops (`eq`, `approx`,
+`contains`, `any`, …), or uses a shorthand (`prop`, `layerCount`, `comp`, `lint`, `motion`,
+`compare`). Agents can run it on their own work too. Format: [evals/agent/README.md](../evals/agent/README.md).
 
 ## Repro scripts
 

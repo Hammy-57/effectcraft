@@ -1,0 +1,155 @@
+{
+  "id": "scale-pop",
+  "title": "Pop a headline in with overshoot",
+  "prompt": "In the comp \"Main\" (1920×1080, 30 fps, 5 s), animate the text layer \"Headline\" popping in: Scale 0% at 0 s, overshooting to 115% at 0.4 s, settling at 100% at 0.6 s and staying there.",
+  "setup": [
+    {
+      "command": "comp.new",
+      "params": {
+        "name": "Main",
+        "width": 1920,
+        "height": 1080,
+        "frameRate": 30,
+        "duration": 5
+      }
+    },
+    {
+      "command": "layer.newText",
+      "params": {
+        "text": "LAUNCH DAY",
+        "size": 150,
+        "position": [
+          960,
+          590
+        ],
+        "fill": "#FFFFFF",
+        "name": "Headline"
+      }
+    }
+  ],
+  "limits": {
+    "minutes": 5,
+    "toolCalls": 25
+  },
+  "checks": [
+    {
+      "id": "start",
+      "desc": "scale 0% at 0 s",
+      "prop": {
+        "comp": "Main",
+        "layer": "Headline",
+        "path": "transform/scale",
+        "time": 0
+      },
+      "op": "approx",
+      "value": [
+        0,
+        0
+      ],
+      "tol": 1
+    },
+    {
+      "id": "overshoot",
+      "desc": "scale 115% at 0.4 s",
+      "prop": {
+        "comp": "Main",
+        "layer": "Headline",
+        "path": "transform/scale",
+        "time": 0.4
+      },
+      "op": "approx",
+      "value": [
+        115,
+        115
+      ],
+      "tol": 2
+    },
+    {
+      "id": "settle",
+      "desc": "scale 100% at 0.6 s",
+      "prop": {
+        "comp": "Main",
+        "layer": "Headline",
+        "path": "transform/scale",
+        "time": 0.6
+      },
+      "op": "approx",
+      "value": [
+        100,
+        100
+      ],
+      "tol": 1
+    },
+    {
+      "id": "stays",
+      "desc": "scale 100% at 3 s",
+      "prop": {
+        "comp": "Main",
+        "layer": "Headline",
+        "path": "transform/scale",
+        "time": 3
+      },
+      "op": "approx",
+      "value": [
+        100,
+        100
+      ],
+      "tol": 0.5
+    },
+    {
+      "id": "motion",
+      "desc": "a scale segment from 0 to 0.6 s",
+      "motion": {
+        "comp": "Main"
+      },
+      "layer": "Headline",
+      "segment": {
+        "kind": "scale",
+        "startApprox": 0,
+        "endApprox": 0.6,
+        "tol": 0.2
+      }
+    }
+  ],
+  "solution": [
+    {
+      "command": "prop.addKey",
+      "params": {
+        "layer": "Headline",
+        "path": "transform/scale",
+        "time": 0,
+        "value": [
+          0,
+          0,
+          100
+        ]
+      }
+    },
+    {
+      "command": "prop.addKey",
+      "params": {
+        "layer": "Headline",
+        "path": "transform/scale",
+        "time": 0.4,
+        "value": [
+          115,
+          115,
+          100
+        ]
+      }
+    },
+    {
+      "command": "prop.addKey",
+      "params": {
+        "layer": "Headline",
+        "path": "transform/scale",
+        "time": 0.6,
+        "value": [
+          100,
+          100,
+          100
+        ]
+      }
+    }
+  ]
+}

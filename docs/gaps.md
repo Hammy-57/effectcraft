@@ -39,6 +39,8 @@ of them have been reconciled.
 | Performance | unknown against After Effects | Internal numbers only (e.g. Advanced 3D 290 ms/frame at 1080p on the GPU, an M4 Pro under load). Nothing benchmarked against After Effects; no large real projects (4K footage, hundreds of layers) tested |
 | Media formats | ≈ 80% | H.264, ProRes, HEVC, AV1, image sequences and audio exist. The new HEVC / AV1 encoders have no B-frames, multi-reference or SAO / CDEF, so files are larger than from mature encoders. Camera formats (BRAW, R3D, ProRes RAW, variable-frame-rate phone video) are unverified |
 | AI-assisted tools | ≈ 50% | Both tools can use trained models (pure-Rust inference, optional downloads), but nothing compares them with After Effects yet. Roto Brush 2.0 / 3.0 with MobileSAM (M13.35) scores IoU 0.989 on the base frame of our synthetic moving-disc test and ≥ 0.980 over 20 propagated frames (classic: 0.973). Face tracking with MediaPipe Face Landmarker (M13.36) matches Google's own pipeline to 0.85 px on average on a test portrait; on our synthetic clip the eyes and chin stay within 4% of the face height |
+| Several agents at once | working (10 October) | Each `client` has its own selection, active comp and current time, and `comp.claim` reserves a comp against other clients' edits (expiring, released when the agent disconnects). Not yet covered: background analyses (tracking, Roto Brush) writing into a claimed comp, a UI showing claims, MCP `--client` |
+| Agent tooling | headless checks | Agents can't eyeball a render or watch a video, so they get numbers and words: `layer.bounds` (`get_layout`) for where layers are, `audio.analyze` for the mix, and since 10 October `comp.motion` / `layer.motion` (`get_motion`) for how layers move (enter / exit edges, holds, fades, overlaps, a sentence per layer; content boxes only, so masks and effects that move pixels are not seen) |
 | Maturity | early | First commit 1 October 2026. ≈ 344,000 lines of almost entirely agent-written Rust (10 October), ≈ 2,360 tests, about 30 external issue reports so far. After Effects has around 30 years of edge cases behind it |
 
 ## Where we're going: workstreams in priority order
@@ -212,6 +214,10 @@ The most important missing piece: it turns every other estimate here into a meas
 - Localisation of the interface, accessibility (keyboard navigation, screen readers, contrast),
   user documentation and tutorials.
 
+### Agent-native editing
+
+- Design lint (10 October): `render.lint` / MCP `lint_frame` reports small or low-contrast text, safe-area, cut-off, overlap, hidden-layer and off-beat problems in plain language; the beat tracker is a simple onset/tempo one, not yet checked against real music.
+
 ## For agents choosing work
 
 1. Run `cargo xtask agents status` (running work and claims; regenerates `plan/STATUS.md`) and claim
@@ -222,3 +228,6 @@ The most important missing piece: it turns every other estimate here into a meas
    above. That is how this assessment stays honest.
 4. Don't raise parity.md's numbers without evidence: a G1 score, a user-facing check on more than
    one platform, or both.
+5. How well agents drive EffectCraft is measured by the agent exam (`evals/agent/`, `cargo xtask
+   agent-exam --run`, nightly): a task that agents keep failing points at a missing command, a
+   confusing parameter or an unclear reply.

@@ -84,6 +84,8 @@ const READ_ONLY: &[&str] = &[
     "ui_inspect",
     "ui_elements",
     "get_layout",
+    "lint_frame",
+    "get_motion",
 ];
 /// Tools that write files (or keep session-side frames) without changing the project.
 const WRITES_FILES: &[&str] =
@@ -223,6 +225,49 @@ pub fn output_schema(name: &str) -> Option<Value> {
             }),
             &["comp", "time", "width", "height", "layers"],
         ),
+        "lint_frame" => {
+            let problem = object(
+                json!({
+                    "rule": {"type": "string", "enum": effectcraft_engine::lint::RULES},
+                    "severity": {"type": "string", "enum": ["error", "warning", "info"]},
+                    "layer": int, "layerName": {"type": "string"},
+                    "time": {"type": "number", "description": "First sample time it occurs at (comp seconds)."},
+                    "until": {"type": "number", "description": "Last sample time it occurs at (comp seconds)."},
+                    "message": {"type": "string"},
+                    "other": {"type": "integer", "description": "The second layer of a pair (text-overlap, the cover of hidden-visible)."},
+                    "otherName": {"type": "string"}
+                }),
+                &["rule", "severity", "layer", "layerName", "time", "until", "message"],
+            );
+            object(
+                json!({
+                    "comp": int, "compName": {"type": "string"},
+                    "times": {"type": "array", "items": {"type": "number"}}, "truncated": {"type": "boolean"},
+                    "clean": {"type": "boolean", "description": "No errors or warnings (info doesn't count)."},
+                    "counts": object(json!({"error": int, "warning": int, "info": int}), &["error", "warning", "info"]),
+                    "rules": {"type": "array", "items": {"type": "string"}},
+                    "problems": {"type": "array", "items": problem},
+                    "notes": {"type": "array", "items": {"type": "string"}}
+                }),
+                &["comp", "compName", "times", "truncated", "clean", "counts", "problems"],
+            )
+        }
+        "get_motion" => {
+            let num = json!({"type": "number"});
+            let seg = object(
+                json!({"kind": {"type": "string", "enum": ["enter", "exit", "move", "hold", "scale", "rotate", "fade-in", "fade-out"]}, "start": num, "end": num, "from": {}, "to": {}, "direction": {"type": "string"}, "edge": {"type": "string"}}),
+                &["kind", "start", "end"],
+            );
+            let span = object(json!({"start": num, "end": num}), &["start", "end"]);
+            object(
+                json!({
+                    "comp": int, "compName": {"type": "string"}, "start": num, "end": num, "step": num, "truncated": {"type": "boolean"},
+                    "layers": {"type": "array", "items": object(json!({"layer": int, "name": {"type": "string"}, "inPoint": num, "outPoint": num, "segments": {"type": "array", "items": seg}, "offscreen": {"type": "array", "items": span}, "summary": {"type": "string"}}), &["layer", "name", "segments", "offscreen", "summary"])},
+                    "overlaps": {"type": "array", "items": object(json!({"a": int, "b": int, "aName": {"type": "string"}, "bName": {"type": "string"}, "start": num, "end": num, "maxFraction": num}), &["a", "b", "start", "end", "maxFraction"])}
+                }),
+                &["comp", "start", "end", "step", "truncated", "layers", "overlaps"],
+            )
+        }
         "analyze_audio" => {
             let db = json!({"type": ["number", "null"]});
             object(
@@ -770,6 +815,43 @@ fn get_layout(b: &mut Backend, a: &Value) -> Result<Reply> {
     json_reply(b.exec("layer.bounds", p)?)
 }
 
+fn lint_frame(b: &mut Backend, a: &Value) -> Result<Reply> {
+    let rules = match get(a, "rules") {
+        Some(Value::String(r)) => Some(json!([r])),
+        other => other.cloned(),
+    };
+    let p = obj(&[
+        ("comp", get(a, "comp")),
+        ("time", get(a, "time")),
+        ("start", get(a, "start")),
+        ("end", get(a, "end")),
+        ("step", get(a, "step")),
+        ("rules", rules.as_ref()),
+        ("minTextPx", get(a, "min_text_px")),
+        ("minContrast", get(a, "min_contrast")),
+    ]);
+    json_reply(b.exec("render.lint", p)?)
+}
+
+fn get_motion(b: &mut Backend, a: &Value) -> Result<Reply> {
+    let range = [("comp", get(a, "comp")), ("start", get(a, "start")), ("end", get(a, "end")), ("step", get(a, "step"))];
+    if let Some(l) = get(a, "layer") {
+        let mut p = obj(&range);
+        p["layer"] = l.clone();
+        return json_reply(b.exec("layer.motion", p)?);
+    }
+    let layers = match get(a, "layers") {
+        Some(Value::Array(v)) => Some(json!(v)),
+        Some(v) => Some(json!([v])),
+        None => None,
+    };
+    let mut p = obj(&range);
+    if let Some(l) = layers {
+        p["layers"] = l;
+    }
+    json_reply(b.exec("comp.motion", p)?)
+}
+
 fn analyze_audio(b: &mut Backend, a: &Value) -> Result<Reply> {
     let waveform = get(a, "waveform").and_then(Value::as_bool).unwrap_or(false);
     let on = json!(true);
@@ -1119,6 +1201,46 @@ static TOOLS: &[ToolDef] = &[
             )
         },
         run: get_layout,
+    },
+    ToolDef {
+        name: "lint_frame",
+        description: "Design lint (render.lint): plain-language design problems in a comp at one time (`time`, default the current time) or over `start`..`end` (sampled every `step` s plus in points and keyframes, at most 120 samples). Rules: text-too-small (on-screen font size under min_text_px, default comp height / 30), low-contrast (WCAG ratio of text against what is under it under min_contrast, default 3:1), outside-title-safe (text), outside-action-safe, cut-off (partly outside the frame), text-overlap, hidden-visible (switched on but off-screen, transparent or covered), off-beat (keyframes and in points just missing the audio's beat). Returns {clean, counts, problems: [{rule, severity, layer, layerName, time, until, message, other?}]}; each message says what to fix. Run it before calling a design done.",
+        bridge_only: false,
+        schema: || {
+            schema(
+                json!({
+                    "comp": comp_s(),
+                    "time": {"type": "number", "description": "One comp time in seconds (default: current time). Use start/end for a range instead."},
+                    "start": {"type": "number", "description": "Range start, comp seconds (default 0 when end is given)."},
+                    "end": {"type": "number", "description": "Range end, comp seconds (default the comp's duration when start is given)."},
+                    "step": {"type": "number", "description": "Seconds between range samples (default 0.5)."},
+                    "rules": {"type": "array", "items": {"type": "string", "enum": effectcraft_engine::lint::RULES}, "description": "Only these rules (default all)."},
+                    "min_text_px": {"type": "number", "description": "Smallest legible font size on screen, comp pixels (default comp height / 30)."},
+                    "min_contrast": {"type": "number", "description": "Smallest acceptable WCAG contrast ratio (default 3)."}
+                }),
+                &[],
+            )
+        },
+        run: lint_frame,
+    },
+    ToolDef {
+        name: "get_motion",
+        description: "How layers move over a time range, in words and numbers, without rendering (comp.motion / layer.motion): samples each layer's comp-space content box, opacity, scale and rotation (default the whole comp, every frame or coarser so a layer gets at most 600 samples; keyframe times are always sampled) and returns per layer `segments` {kind: enter|exit|move|hold|scale|rotate|fade-in|fade-out, start, end, from, to, direction (move/enter/exit: left, up-right...), edge (enter/exit: the frame edge)}, `offscreen` intervals and a one-sentence `summary` (\"Logo flies in from the left 0–1s, holds 1–4s, fades out 4–5s.\"), plus `overlaps` {a, b, start, end, maxFraction} between drawn layers (full-frame backgrounds left out). Times are comp seconds. Use it to check an animation's timing and choreography; render_frames shows the frames.",
+        bridge_only: false,
+        schema: || {
+            schema(
+                json!({
+                    "comp": comp_s(),
+                    "layer": layer_s(),
+                    "layers": {"type": "array", "items": layer_s(), "description": "Layers to describe (default every layer of the comp); `layer` describes one."},
+                    "start": {"type": "number", "description": "Start, comp seconds (default 0)."},
+                    "end": {"type": "number", "description": "End, comp seconds (default the comp's duration)."},
+                    "step": {"type": "number", "description": "Sampling step in seconds (default one frame, coarser for comps over ~10 s so a layer gets at most 600 samples)."}
+                }),
+                &[],
+            )
+        },
+        run: get_motion,
     },
     ToolDef {
         name: "analyze_audio",

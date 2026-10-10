@@ -1,0 +1,179 @@
+{
+  "id": "precompose",
+  "title": "Pre-compose two layers",
+  "prompt": "In the comp \"Main\", pre-compose the shape layers \"Star\" and \"Ring\" into a new composition named \"Icon\" (moving all their attributes into it). Main should then hold exactly two layers: the precomp layer \"Icon\" and the text layer \"Label\".",
+  "setup": [
+    {
+      "command": "comp.new",
+      "params": {
+        "name": "Main",
+        "width": 1920,
+        "height": 1080,
+        "frameRate": 30,
+        "duration": 5
+      }
+    },
+    {
+      "command": "layer.newShape",
+      "params": {
+        "name": "Star",
+        "kind": "star",
+        "size": [
+          200,
+          200
+        ],
+        "fill": "#FFD23F",
+        "position": [
+          860,
+          540
+        ]
+      }
+    },
+    {
+      "command": "layer.newShape",
+      "params": {
+        "name": "Ring",
+        "kind": "ellipse",
+        "size": [
+          300,
+          300
+        ],
+        "fill": "#3BCEAC",
+        "position": [
+          1060,
+          540
+        ]
+      }
+    },
+    {
+      "command": "layer.newText",
+      "params": {
+        "text": "ICON",
+        "size": 60,
+        "position": [
+          960,
+          800
+        ],
+        "fill": "#FFFFFF",
+        "name": "Label"
+      }
+    }
+  ],
+  "limits": {
+    "minutes": 5,
+    "toolCalls": 20
+  },
+  "checks": [
+    {
+      "id": "icon-comp",
+      "desc": "a comp named Icon exists",
+      "comp": {
+        "name": "Icon"
+      }
+    },
+    {
+      "id": "icon-count",
+      "desc": "Icon has two layers",
+      "layerCount": {
+        "comp": "Icon"
+      },
+      "op": "eq",
+      "value": 2
+    },
+    {
+      "id": "icon-star",
+      "desc": "Star is in Icon",
+      "query": "comp.info",
+      "params": {
+        "comp": "Icon"
+      },
+      "expect": [
+        {
+          "path": "/layers",
+          "op": "contains",
+          "value": {
+            "name": "Star",
+            "type": "Shape"
+          }
+        }
+      ]
+    },
+    {
+      "id": "icon-ring",
+      "desc": "Ring is in Icon",
+      "query": "comp.info",
+      "params": {
+        "comp": "Icon"
+      },
+      "expect": [
+        {
+          "path": "/layers",
+          "op": "contains",
+          "value": {
+            "name": "Ring",
+            "type": "Shape"
+          }
+        }
+      ]
+    },
+    {
+      "id": "main-count",
+      "desc": "Main has two layers",
+      "layerCount": {
+        "comp": "Main"
+      },
+      "op": "eq",
+      "value": 2
+    },
+    {
+      "id": "main-icon",
+      "desc": "Main has the precomp layer Icon",
+      "query": "comp.info",
+      "params": {
+        "comp": "Main"
+      },
+      "expect": [
+        {
+          "path": "/layers",
+          "op": "contains",
+          "value": {
+            "name": "Icon",
+            "type": "Composition"
+          }
+        }
+      ]
+    },
+    {
+      "id": "main-label",
+      "desc": "Main still has Label",
+      "query": "comp.info",
+      "params": {
+        "comp": "Main"
+      },
+      "expect": [
+        {
+          "path": "/layers",
+          "op": "contains",
+          "value": {
+            "name": "Label",
+            "type": "Text"
+          }
+        }
+      ]
+    }
+  ],
+  "solution": [
+    {
+      "command": "layer.precompose",
+      "params": {
+        "comp": "Main",
+        "layers": [
+          "Star",
+          "Ring"
+        ],
+        "name": "Icon",
+        "mode": "move"
+      }
+    }
+  ]
+}

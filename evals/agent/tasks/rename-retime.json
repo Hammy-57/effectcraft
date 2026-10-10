@@ -1,0 +1,196 @@
+{
+  "id": "rename-retime",
+  "title": "Rename and retime an existing edit",
+  "prompt": "Edit the existing project: rename the comp \"Comp 1\" to \"Promo\"; in it, rename the layer \"Layer 1\" to \"Background\" and \"Layer 2\" to \"CTA\"; change CTA's text to \"Shop now\"; and make CTA appear at 2 s (its in point at 2 s) while it still lasts until the end of the comp (6 s).",
+  "setup": [
+    {
+      "command": "comp.new",
+      "params": {
+        "name": "Comp 1",
+        "width": 1920,
+        "height": 1080,
+        "frameRate": 30,
+        "duration": 6
+      }
+    },
+    {
+      "command": "layer.newSolid",
+      "params": {
+        "name": "Layer 1",
+        "color": "#102030"
+      }
+    },
+    {
+      "command": "layer.newText",
+      "params": {
+        "text": "Buy now",
+        "size": 100,
+        "position": [
+          960,
+          560
+        ],
+        "fill": "#FFFFFF",
+        "name": "Layer 2"
+      }
+    }
+  ],
+  "limits": {
+    "minutes": 8,
+    "toolCalls": 30
+  },
+  "checks": [
+    {
+      "id": "comp",
+      "desc": "the comp is called Promo",
+      "comp": {
+        "name": "Promo"
+      },
+      "duration": 6
+    },
+    {
+      "id": "background",
+      "desc": "a layer named Background",
+      "query": "comp.info",
+      "params": {
+        "comp": "Promo"
+      },
+      "expect": [
+        {
+          "path": "/layers",
+          "op": "contains",
+          "value": {
+            "name": "Background",
+            "type": "Solid"
+          }
+        }
+      ]
+    },
+    {
+      "id": "cta",
+      "desc": "a layer named CTA",
+      "query": "comp.info",
+      "params": {
+        "comp": "Promo"
+      },
+      "expect": [
+        {
+          "path": "/layers",
+          "op": "contains",
+          "value": {
+            "name": "CTA",
+            "type": "Text"
+          }
+        }
+      ]
+    },
+    {
+      "id": "old-names",
+      "desc": "no layer is still called Layer 1 or Layer 2",
+      "query": "comp.info",
+      "params": {
+        "comp": "Promo"
+      },
+      "expect": [
+        {
+          "path": "/layers",
+          "op": "none",
+          "value": {
+            "path": "/name",
+            "op": "in",
+            "value": [
+              "Layer 1",
+              "Layer 2"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "cta-text",
+      "desc": "CTA reads Shop now",
+      "prop": {
+        "comp": "Promo",
+        "layer": "CTA",
+        "path": "text/sourceText"
+      },
+      "op": "eq",
+      "value": "Shop now"
+    },
+    {
+      "id": "cta-time",
+      "desc": "CTA runs from 2 s to 6 s",
+      "query": "comp.info",
+      "params": {
+        "comp": "Promo"
+      },
+      "select": {
+        "array": "/layers",
+        "where": {
+          "name": "CTA"
+        }
+      },
+      "expect": [
+        {
+          "path": "/in",
+          "op": "approx",
+          "value": 2,
+          "tol": 0.02
+        },
+        {
+          "path": "/out",
+          "op": "approx",
+          "value": 6,
+          "tol": 0.02
+        }
+      ]
+    },
+    {
+      "layerCount": {
+        "comp": "Promo"
+      },
+      "id": "count",
+      "desc": "still two layers",
+      "op": "eq",
+      "value": 2
+    }
+  ],
+  "solution": [
+    {
+      "command": "project.rename",
+      "params": {
+        "item": "Comp 1",
+        "name": "Promo"
+      }
+    },
+    {
+      "command": "layer.rename",
+      "params": {
+        "layer": "Layer 1",
+        "name": "Background"
+      }
+    },
+    {
+      "command": "layer.rename",
+      "params": {
+        "layer": "Layer 2",
+        "name": "CTA"
+      }
+    },
+    {
+      "command": "layer.setText",
+      "params": {
+        "layer": "CTA",
+        "text": "Shop now"
+      }
+    },
+    {
+      "command": "layer.timing",
+      "params": {
+        "layers": [
+          "CTA"
+        ],
+        "in": 2
+      }
+    }
+  ]
+}

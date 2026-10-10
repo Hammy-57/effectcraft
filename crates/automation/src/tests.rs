@@ -1247,6 +1247,56 @@ fn get_layout_reports_layer_geometry() {
     }
 }
 
+/// `lint_frame`: design problems as structured JSON, headless and bridged.
+#[test]
+fn lint_frame_reports_design_problems() {
+    for bridge in [false, true] {
+        let mut s = if bridge { McpServer::new(Backend::bridge(&fake_app().to_string()).unwrap()) } else { server() };
+        call_json(&mut s, "command_run", json!({"id": "comp.new", "params": {"width": 320, "height": 180, "frameRate": 25, "duration": 2}}));
+        let l = call_json(&mut s, "command_run", json!({"id": "layer.newSolid", "params": {"width": 40, "height": 40}}))["layer"].clone();
+        call_json(&mut s, "set_property", json!({"layer": l, "path": "transform/position", "value": [0, 90]}));
+        let r = call_json(&mut s, "lint_frame", json!({"time": 0, "rules": ["cut-off"]}));
+        assert_eq!(r["problems"].as_array().unwrap().len(), 1, "{r}");
+        let p = &r["problems"][0];
+        assert_eq!((p["rule"].as_str(), p["severity"].as_str(), &p["layer"]), (Some("cut-off"), Some("info"), &l), "{r}");
+        assert_eq!(r["clean"], true);
+        assert_eq!(r["counts"], json!({"error": 0, "warning": 0, "info": 1}));
+        // A range and snake_case thresholds; bad rules are tool errors.
+        let r = call_json(&mut s, "lint_frame", json!({"start": 0, "end": 1, "step": 0.5, "min_text_px": 10, "rules": "cut-off"}));
+        assert_eq!(r["times"], json!([0.0, 0.5, 1.0]), "{r}");
+        assert_eq!((r["problems"][0]["time"].as_f64(), r["problems"][0]["until"].as_f64()), (Some(0.0), Some(1.0)), "{r}");
+        let (c, err) = call(&mut s, "lint_frame", json!({"rules": ["nope"]}));
+        assert!(err && c[0]["text"].as_str().unwrap().contains("unknown rule"), "{c:?}");
+    }
+}
+
+/// `get_motion`: a motion summary of keyframed layers, headless and bridged.
+#[test]
+fn get_motion_describes_layer_motion() {
+    for bridge in [false, true] {
+        let mut s = if bridge { McpServer::new(Backend::bridge(&fake_app().to_string()).unwrap()) } else { server() };
+        call_json(&mut s, "command_run", json!({"id": "comp.new", "params": {"width": 320, "height": 180, "frameRate": 24, "duration": 2}}));
+        let l = call_json(&mut s, "command_run", json!({"id": "layer.newSolid", "params": {"name": "Logo", "width": 80, "height": 44}}))["layer"].clone();
+        call_json(
+            &mut s,
+            "add_keyframe",
+            json!({"layer": l, "path": "transform/position", "keys": [{"time": 0, "value": [-60, 90]}, {"time": 1, "value": [160, 90]}]}),
+        );
+        let r = call_json(&mut s, "get_motion", json!({}));
+        assert_eq!(r["truncated"], false, "{r}");
+        let m = &r["layers"][0];
+        assert_eq!(m["segments"][0]["kind"], "enter", "{r}");
+        assert_eq!(m["segments"][0]["edge"], "left");
+        assert!(m["summary"].as_str().unwrap().contains("from the left"), "{r}");
+        // `layer` routes to layer.motion; bad references are tool errors.
+        let r = call_json(&mut s, "get_motion", json!({"layer": "Logo", "start": 0.5}));
+        assert_eq!((r["layers"].as_array().unwrap().len(), r["start"].clone()), (1, json!(0.5)));
+        let (c, err) = call(&mut s, "get_motion", json!({"layers": ["Nope"]}));
+        assert!(err && c[0]["text"].as_str().unwrap().contains("no layer"), "{c:?}");
+    }
+    assert!(crate::tools::output_schema("get_motion").is_some());
+}
+
 /// `analyze_audio`: levels of a Tone, a waveform image, no-audio comps.
 #[test]
 fn analyze_audio_levels_and_waveform() {

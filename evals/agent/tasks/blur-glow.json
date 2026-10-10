@@ -1,0 +1,109 @@
+{
+  "id": "blur-glow",
+  "title": "Blur and glow on a title",
+  "prompt": "In the comp \"Main\", add a Gaussian Blur effect with Blurriness 12 to the text layer \"Title\", and then a Glow effect below it (Gaussian Blur first, Glow second).",
+  "setup": [
+    {
+      "command": "comp.new",
+      "params": {
+        "name": "Main",
+        "width": 1920,
+        "height": 1080,
+        "frameRate": 30,
+        "duration": 5
+      }
+    },
+    {
+      "command": "layer.newText",
+      "params": {
+        "text": "NEON",
+        "size": 200,
+        "position": [
+          960,
+          600
+        ],
+        "fill": "#44DDFF",
+        "name": "Title"
+      }
+    }
+  ],
+  "limits": {
+    "minutes": 5,
+    "toolCalls": 20
+  },
+  "checks": [
+    {
+      "id": "blurriness",
+      "desc": "Gaussian Blur's Blurriness is 12",
+      "prop": {
+        "comp": "Main",
+        "layer": "Title",
+        "path": "effects/Gaussian Blur/blurriness"
+      },
+      "op": "approx",
+      "value": 12,
+      "tol": 0.01
+    },
+    {
+      "id": "effects",
+      "desc": "the effects are Gaussian Blur then Glow",
+      "query": "layer.tree",
+      "params": {
+        "comp": "Main",
+        "layer": "Title",
+        "depth": 2
+      },
+      "select": {
+        "array": "/properties/children",
+        "where": {
+          "match": "effects"
+        }
+      },
+      "expect": [
+        {
+          "path": "/children",
+          "op": "len",
+          "value": 2
+        },
+        {
+          "path": "/children/0/effect",
+          "op": "eq",
+          "value": "ec.blur.gaussian"
+        },
+        {
+          "path": "/children/1/effect",
+          "op": "eq",
+          "value": "ec.stylize.glow"
+        }
+      ]
+    }
+  ],
+  "solution": [
+    {
+      "command": "effect.apply",
+      "params": {
+        "layers": [
+          "Title"
+        ],
+        "effect": "Gaussian Blur"
+      }
+    },
+    {
+      "command": "effect.apply",
+      "params": {
+        "layers": [
+          "Title"
+        ],
+        "effect": "Glow"
+      }
+    },
+    {
+      "command": "prop.set",
+      "params": {
+        "layer": "Title",
+        "path": "effects/Gaussian Blur/blurriness",
+        "value": 12
+      }
+    }
+  ]
+}

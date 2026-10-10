@@ -1,0 +1,138 @@
+{
+  "id": "spin",
+  "title": "One linear turn",
+  "prompt": "In the comp \"Main\" (30 fps, 3 s), make the shape layer \"Gear\" rotate one full turn clockwise (0° to 360°) from 0 s to 2 s at a constant speed, then stop.",
+  "setup": [
+    {
+      "command": "comp.new",
+      "params": {
+        "name": "Main",
+        "width": 1920,
+        "height": 1080,
+        "frameRate": 30,
+        "duration": 3
+      }
+    },
+    {
+      "command": "layer.newShape",
+      "params": {
+        "name": "Gear",
+        "kind": "star",
+        "size": [
+          300,
+          300
+        ],
+        "fill": "#CCCCCC",
+        "position": [
+          960,
+          540
+        ]
+      }
+    }
+  ],
+  "limits": {
+    "minutes": 5,
+    "toolCalls": 20
+  },
+  "checks": [
+    {
+      "id": "start",
+      "desc": "0° at 0 s",
+      "prop": {
+        "comp": "Main",
+        "layer": "Gear",
+        "path": "transform/rotation",
+        "time": 0
+      },
+      "op": "approx",
+      "value": 0,
+      "tol": 0.5
+    },
+    {
+      "id": "quarter",
+      "desc": "90° at 0.5 s (constant speed)",
+      "prop": {
+        "comp": "Main",
+        "layer": "Gear",
+        "path": "transform/rotation",
+        "time": 0.5
+      },
+      "op": "approx",
+      "value": 90,
+      "tol": 1
+    },
+    {
+      "id": "half",
+      "desc": "180° at 1 s",
+      "prop": {
+        "comp": "Main",
+        "layer": "Gear",
+        "path": "transform/rotation",
+        "time": 1
+      },
+      "op": "approx",
+      "value": 180,
+      "tol": 1
+    },
+    {
+      "id": "full",
+      "desc": "360° at 2 s",
+      "prop": {
+        "comp": "Main",
+        "layer": "Gear",
+        "path": "transform/rotation",
+        "time": 2
+      },
+      "op": "approx",
+      "value": 360,
+      "tol": 0.5
+    },
+    {
+      "id": "stops",
+      "desc": "still 360° at 2.5 s",
+      "prop": {
+        "comp": "Main",
+        "layer": "Gear",
+        "path": "transform/rotation",
+        "time": 2.5
+      },
+      "op": "approx",
+      "value": 360,
+      "tol": 0.5
+    },
+    {
+      "id": "motion",
+      "desc": "a rotation from 0 to 2 s",
+      "motion": {
+        "comp": "Main"
+      },
+      "layer": "Gear",
+      "segment": {
+        "kind": "rotate",
+        "startApprox": 0,
+        "endApprox": 2,
+        "tol": 0.2
+      }
+    }
+  ],
+  "solution": [
+    {
+      "command": "prop.addKey",
+      "params": {
+        "layer": "Gear",
+        "path": "transform/rotation",
+        "time": 0,
+        "value": 0
+      }
+    },
+    {
+      "command": "prop.addKey",
+      "params": {
+        "layer": "Gear",
+        "path": "transform/rotation",
+        "time": 2,
+        "value": 360
+      }
+    }
+  ]
+}
