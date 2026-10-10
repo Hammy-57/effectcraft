@@ -277,3 +277,34 @@ fn type_tool_drag_makes_paragraph_text_with_box_handles() {
     assert!(doc2.box_size.unwrap()[0] > bs[0] + 20.0, "{:?}", doc2.box_size);
     assert!(h.state().session.state.text_edit.is_some(), "still editing after resizing");
 }
+
+#[test]
+fn duplicated_text_boxes_both_remain_editable() {
+    let mut a = app();
+    let original = a
+        .session
+        .execute("layer.newText", json!({"text": "alpha beta", "size": 40, "position": [40, 100], "justify": "left", "box": [40, 60, 250, 100]}))
+        .unwrap()["layer"]
+        .as_u64()
+        .unwrap();
+    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).with_step_dt(1.0 / 60.0).build_eframe(move |_| a);
+    h.run_steps(3);
+    h.state_mut().ui.focused = PanelKind::Composition;
+    key(&mut h, Key::D, Modifiers::COMMAND);
+    let duplicate = h.state().session.state.selected_layers[0].0;
+    assert_ne!(original, duplicate);
+    h.state_mut().session.execute("prop.set", json!({"layer": duplicate, "path": "transform/position", "value": [465, 110]})).unwrap();
+    h.run_steps(3);
+    for (layer, x, text) in [(original, 80.0, "original edited"), (duplicate, 380.0, "duplicate edited")] {
+        h.run_steps(40);
+        let comp = rect(&h, "viewer.comp");
+        let k = comp.width() / 640.0;
+        let p = comp.min + egui::vec2(x * k, 85.0 * k);
+        click(&mut h, p, Modifiers::NONE);
+        click(&mut h, p, Modifiers::NONE);
+        assert_eq!(edited(&h).0, layer);
+        type_text(&mut h, text);
+        key(&mut h, Key::Escape, Modifiers::NONE);
+        assert_eq!(layer_doc(&h.state().session, LayerId(layer)).unwrap().text, text);
+    }
+}
