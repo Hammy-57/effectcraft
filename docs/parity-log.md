@@ -852,3 +852,38 @@ Fixes from measured reports:
   factor) instead of minified bilinearly (#417). Not yet: the viewer resolution and magnification
   are not remembered between launches.
 
+
+## Update: interface, import and agent additions (7–10 October)
+
+Recorded in one place on 10 October; each landed with tests.
+
+- **Effect Console** (Edit ▸ Effect Console..., Ctrl+Space, `app.fxConsole {query?}`): a search
+  bar at the pointer ranks effects and presets by name, word starts, initials (`gb` = Gaussian
+  Blur) and letters in order, recent and favourite effects first. Enter applies to the selected
+  layers and closes, Shift+Enter applies and stays open; with no text it lists recent effects.
+- **Shortcuts:** `Physical+<key>` bindings for layouts such as AZERTY that report one logical key
+  for two physical keys; Go to Work Area Start / End (`time.workAreaStart` / `time.workAreaEnd`,
+  Shift+Home / Shift+End).
+- **Shape layers:** Reverse Path Direction (⇄) on Path, Rectangle, Ellipse and Polystar rows
+  (`shape.reversePathDirection`; Trim Paths then runs the other way). The toolbar's Fill / Stroke
+  kind, blend mode and opacity apply to the selected shape layers (`shape.fillStroke`), not only
+  to the next shape drawn.
+- **Timeline and Graph Editor:** trim zones reach just past a layer bar's ends and win over slip;
+  the view stops at the comp end; the zoom buttons and a click on the zoom slider work, and the
+  Graph Editor shares the layer bars' time zoom and fits the selection when it opens; key
+  marquees show the selection live while dragging.
+- **Panels:** right-clicking a tab (or the ≡ menu) opens the panel menu: Close Panel, Undock
+  Panel, Close Other Panels in Group, Panel Group Settings ▸ (`window.*` commands,
+  `panelMenu.<key>` ids). Solids, adjustment layers and nulls show a swatch of their colour as
+  their source icon; long Project panel names end in an ellipsis.
+- **Settings ▸ Scripting & Expressions:** Let Agents Control EffectCraft starts the control
+  channel on every launch (`scripting.agentControl`, port 9877); Let Figma Send Layers runs the
+  Figma plug-in's bridge on localhost:7789 (`scripting.figmaBridge`).
+- **Import:** After Effects projects (`file.importAep` through py-aep,
+  [packaging/aep/README.md](../packaging/aep/README.md)), Figma frames as native layers
+  (`file.importFigma`, [integrations/figma/README.md](../integrations/figma/README.md)), and AVIF
+  stills.
+- **Agents:** the offscreen app (`mcp --ui`), frame, contact-sheet, comparison, layout and audio
+  analysis tools, progress and cancellation, resource templates, subscriptions, logging and
+  prompts, stable ids, per-client undo and `expectRevision`, repro scripts, `cargo xtask agents`
+  ([agents.md](agents.md), [mcp.md](mcp.md), [control-protocol.md](control-protocol.md)).

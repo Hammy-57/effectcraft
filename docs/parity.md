@@ -7,7 +7,8 @@ How close EffectCraft is to After Effects 2026, feature by feature, and how much
 > **Read this as a measure of breadth, not of real-world readiness.** It checks whether each
 > feature exists, using our own catalogue, graded by the agents that built it. It does not measure
 > whether the feature behaves like After Effects (nothing compares the two yet), whether After
-> Effects projects open (they don't), or how the app holds up for real users on every platform.
+> Effects projects open (only through the py-aep converter), or how the app holds up for real
+> users on every platform.
 > Those gaps, and the work that closes them, are in [gaps.md](gaps.md). Don't raise the numbers
 > here without the evidence gaps.md asks for. The per-area table further down has stale rows that
 > have not been reconciled with the headline.
