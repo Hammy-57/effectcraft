@@ -124,6 +124,12 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     uic!("window.dockPanel", "Dock Panel", [], None),
     uic!("window.floatPanel", "Undock Panel", [], None),
     uic!("window.closePanel", "Close Panel", [], None),
+    uic!("window.closeOtherPanels", "Close Other Panels in Group", [], None),
+    uic!("window.closePanelGroup", "Close Panel Group", [], None),
+    uic!("window.floatPanelGroup", "Undock Panel Group", [], None),
+    uic!("window.stackPanelGroup", "Stacked Panel Group", [], None),
+    uic!("window.panelMenu", "Panel Menu", [], None),
+    uic!("project.column", "Show/Hide Project Column", [], None),
 ];
 
 pub fn panel_command_id(p: PanelKind) -> String {
@@ -407,10 +413,73 @@ pub fn invoke(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: V
             _ => {}
         }
     }
-    // Docking: {panel, anchor, zone: center|left|right|top|bottom}, {panel, rect?}, {panel?}.
-    if let Some(op) = id.strip_prefix("window.").filter(|o| matches!(*o, "maximizePanel" | "dockPanel" | "floatPanel" | "closePanel")) {
+    // File ▸ Close (Cmd+W) closes the focused panel, as in After Effects; on a Composition or
+    // Timeline panel (or with a `comp`), its comp.
+    if id == "file.close" && no_params(&params) {
+        let p = app.ui.focused;
+        if !matches!(p, PanelKind::Composition | PanelKind::Viewer(_) | PanelKind::Timeline) && app.panel_group(p).is_some() {
+            app.close_panel(p);
+            return Ok(json!({"closed": p.id()}));
+        }
+    }
+    // Docking and the panel menu: {panel, anchor?, zone: center|left|right|top|bottom},
+    // {panel, rect?}, {panel?}, {panel, comp?}, {panel, stacked?}.
+    if let Some(op) = id.strip_prefix("window.").filter(|o| {
+        matches!(
+            *o,
+            "maximizePanel"
+                | "dockPanel"
+                | "floatPanel"
+                | "closePanel"
+                | "closeOtherPanels"
+                | "closePanelGroup"
+                | "floatPanelGroup"
+                | "stackPanelGroup"
+                | "panelMenu"
+        )
+    }) {
         let panel_of = |k: &str| params.get(k).and_then(Value::as_str).map(|s| PanelKind::from_name(s).ok_or(format!("unknown panel `{s}`")));
+        let need = |op: &str| -> Result<PanelKind, String> { panel_of("panel").ok_or(format!("{op}: need `panel`"))? };
+        // A Timeline comp tab: `comp` (its id).
+        let comp = params.get("comp").and_then(Value::as_u64);
+        let rect = params.get("rect").and_then(Value::as_array).map(|a| {
+            let g = |i: usize| a.get(i).and_then(Value::as_f64).unwrap_or(0.0) as f32;
+            [g(0), g(1), g(2), g(3)]
+        });
         match op {
+            "closeOtherPanels" => {
+                let n = app.close_other_panels(ctx, need(op)?, comp)?;
+                return Ok(json!({"closed": n}));
+            }
+            "closePanelGroup" => {
+                let n = app.close_panel_group(need(op)?)?;
+                return Ok(json!({"closed": n}));
+            }
+            "floatPanelGroup" => {
+                let p = need(op)?;
+                let r = rect.unwrap_or_else(|| crate::dock_ui::default_float_rect(ctx.content_rect()));
+                if !app.edit_layout(|l| l.float_group(p, r)) {
+                    return Err(format!("can't undock the panel group of {}", p.title()));
+                }
+                return Ok(Value::Null);
+            }
+            "stackPanelGroup" => {
+                let on = app.stack_panel_group(need(op)?, params.get("stacked").and_then(Value::as_bool))?;
+                return Ok(json!({"stacked": on}));
+            }
+            "panelMenu" => {
+                let p = need(op)?;
+                app.panel_group(p).ok_or_else(|| format!("{} is not open", p.title()))?;
+                let at = |k: &str| params.get(k).and_then(Value::as_f64).map(|v| v as f32);
+                let tab = app.auto.find(&format!("panel.tab.{}", p.id())).map(|e| egui::pos2(e.rect[0], e.rect[1] + e.rect[3]));
+                let pos = match (at("x"), at("y")) {
+                    (Some(x), Some(y)) => egui::pos2(x, y),
+                    _ => tab.unwrap_or_else(|| ctx.content_rect().center()),
+                };
+                let doc = comp.or_else(|| app.shown_doc(p));
+                crate::panels::panel_menu::open(ctx, p, doc, pos);
+                return Ok(Value::Null);
+            }
             "maximizePanel" => {
                 let p = match panel_of("panel") {
                     Some(p) => p?,
@@ -420,25 +489,26 @@ pub fn invoke(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: V
                 return Ok(json!({"maximized": app.ui.maximized}));
             }
             "closePanel" => {
-                let p = panel_of("panel").ok_or("closePanel: need `panel`")??;
-                app.close_panel(p);
+                let p = need(op)?;
+                app.close_panel_tab(ctx, p, comp)?;
                 return Ok(Value::Null);
             }
             "floatPanel" => {
-                let p = panel_of("panel").ok_or("floatPanel: need `panel`")??;
-                let r = params.get("rect").and_then(Value::as_array).map(|a| {
-                    let g = |i: usize| a.get(i).and_then(Value::as_f64).unwrap_or(0.0) as f32;
-                    [g(0), g(1), g(2), g(3)]
-                });
-                let r = r.unwrap_or_else(|| crate::dock_ui::default_float_rect(ctx.content_rect()));
+                let p = need(op)?;
+                let r = rect.unwrap_or_else(|| crate::dock_ui::default_float_rect(ctx.content_rect()));
                 if !app.edit_layout(|l| l.float(p, r)) {
                     return Err(format!("can't undock {}", p.title()));
                 }
                 return Ok(Value::Null);
             }
             _ => {
-                let p = panel_of("panel").ok_or("dockPanel: need `panel`")??;
-                let anchor = panel_of("anchor").ok_or("dockPanel: need `anchor` (a docked panel)")??;
+                let p = need(op)?;
+                // Without an anchor: back to its usual docked place.
+                let Some(anchor) = panel_of("anchor") else {
+                    app.redock_panel(p);
+                    return Ok(Value::Null);
+                };
+                let anchor = anchor?;
                 let zone = params
                     .get("zone")
                     .and_then(Value::as_str)
@@ -519,6 +589,16 @@ pub fn invoke(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: V
             let shown: Vec<&str> =
                 crate::panels::timeline::COLUMNS.iter().map(|c| c.0).filter(|c| crate::panels::timeline::column_visible(&app.ui.timeline, c)).collect();
             return Ok(json!({"columns": shown}));
+        }
+        "project.column" => {
+            use crate::panels::project::{COLUMNS, set_column};
+            let col = params.get("column").and_then(Value::as_str).ok_or("project.column: need `column`")?;
+            if !COLUMNS.iter().any(|c| c.0 == col) {
+                return Err(format!("unknown column `{col}` (one of: {})", COLUMNS.map(|c| c.0).join(", ")));
+            }
+            let on = params.get("visible").and_then(Value::as_bool).unwrap_or(!app.ui.project_columns.iter().any(|c| c == col));
+            set_column(&mut app.ui.project_columns, col, on);
+            return Ok(json!({"columns": app.ui.project_columns}));
         }
         "timeline.sourceName" => {
             let tl = &mut app.ui.timeline;
@@ -1774,7 +1854,7 @@ pub(crate) fn dyn_ctx<'a>(workspace: &'a str, saved_workspaces: &'a [String]) ->
 }
 
 /// The check-mark column every menu row reserves (like macOS / After Effects menus).
-fn gutter(checked: bool) -> egui::Atom<'static> {
+pub(crate) fn gutter(checked: bool) -> egui::Atom<'static> {
     use egui::AtomExt;
     (if checked { "✔" } else { "" }).atom_size(egui::vec2(14.0, 14.0))
 }

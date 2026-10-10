@@ -297,7 +297,7 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
             if req.method == "ui.panel.show" {
                 app.show_panel(panel);
             } else {
-                app.ui.dock.close(panel);
+                app.close_panel(panel);
             }
             ok(Value::Null)
         }
