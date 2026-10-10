@@ -10,7 +10,7 @@ use effectcraft_render::FootageSource;
 use effectcraft_time::{FrameRate, TICKS_PER_SECOND, Tick};
 use filmcraft_media::{FrameRequest, SharedSource};
 
-use crate::convert::{AlphaOp, dynamic_to_image, frame_to_image_in};
+use crate::convert::{AlphaOp, Packed, pack_dynamic};
 use crate::{MediaError, Result};
 
 /// Default frame-cache budget: 1 GiB of decoded frames.
@@ -44,8 +44,33 @@ struct Key {
     crop: Option<[u64; 4]>,
 }
 
+/// A cached frame: float pixels, or the decoder's samples converted on use (8-bit 4:2:0 video
+/// takes 1.5 bytes a pixel instead of 16; see [`Packed`]).
+#[derive(Clone)]
+pub(crate) enum Pixels {
+    Float(Arc<Image>),
+    Packed(Arc<Packed>),
+}
+
+impl Pixels {
+    /// Bytes held (what the cache budget counts).
+    fn bytes(&self) -> usize {
+        64 + match self {
+            Pixels::Float(img) => img.data.len() * std::mem::size_of::<Px>(),
+            Pixels::Packed(p) => p.bytes(),
+        }
+    }
+    /// The frame as compositor pixels (a packed frame is converted now).
+    pub(crate) fn image(&self) -> Arc<Image> {
+        match self {
+            Pixels::Float(img) => img.clone(),
+            Pixels::Packed(p) => Arc::new(p.to_image()),
+        }
+    }
+}
+
 struct Entry {
-    img: Arc<Image>,
+    px: Pixels,
     stamp: u64,
     bytes: usize,
 }
@@ -77,9 +102,6 @@ fn sample_time(at: usize, rate: u32) -> Tick {
     Tick::from_units(i64::try_from(at).unwrap_or(i64::MAX), i64::from(rate))
 }
 
-/// At most this many recycled pixel buffers are kept (outside the budget).
-const MAX_SPARE: usize = 4;
-
 /// Least-recently-used frames, bounded by bytes.
 #[derive(Default)]
 struct Lru {
@@ -87,24 +109,21 @@ struct Lru {
     order: BTreeMap<u64, Key>,
     clock: u64,
     bytes: usize,
-    /// Pixel buffers of evicted frames nobody else holds, reused for new frames: playback then
-    /// writes into memory that is already mapped instead of faulting in fresh pages every frame.
-    spare: Vec<Vec<Px>>,
 }
 
 impl Lru {
-    fn get(&mut self, k: &Key) -> Option<Arc<Image>> {
+    fn get(&mut self, k: &Key) -> Option<Pixels> {
         let e = self.map.get_mut(k)?;
         self.order.remove(&e.stamp);
         self.clock += 1;
         e.stamp = self.clock;
         self.order.insert(e.stamp, k.clone());
-        Some(e.img.clone())
+        Some(e.px.clone())
     }
-    fn insert(&mut self, k: Key, img: Arc<Image>, budget: usize) {
-        let bytes = img.data.len() * std::mem::size_of::<Px>() + 64;
+    fn insert(&mut self, k: Key, px: Pixels, budget: usize) {
+        let bytes = px.bytes();
         self.clock += 1;
-        if let Some(old) = self.map.insert(k.clone(), Entry { img, stamp: self.clock, bytes }) {
+        if let Some(old) = self.map.insert(k.clone(), Entry { px, stamp: self.clock, bytes }) {
             self.order.remove(&old.stamp);
             self.bytes -= old.bytes;
         }
@@ -124,19 +143,7 @@ impl Lru {
             let Some((_, k)) = self.order.pop_first() else { break };
             if let Some(e) = self.map.remove(&k) {
                 self.bytes -= e.bytes;
-                if self.spare.len() < MAX_SPARE
-                    && let Ok(img) = Arc::try_unwrap(e.img)
-                {
-                    self.spare.push(img.data);
-                }
             }
-        }
-    }
-    /// A recycled buffer of exactly `len` pixels, or an empty Vec.
-    fn take_spare(&mut self, len: usize) -> Vec<Px> {
-        match self.spare.iter().position(|b| b.len() == len) {
-            Some(i) => self.spare.swap_remove(i),
-            None => Vec::new(),
         }
     }
 }
@@ -691,6 +698,11 @@ impl Inner {
     }
 
     fn frame_at(self: &Arc<Self>, footage: &Footage, t: Tick, playback: bool) -> Result<Arc<Image>> {
+        Ok(self.pixels_at(footage, t, playback)?.image())
+    }
+
+    /// The cached (or newly decoded) pixels of `footage` at source time `t`.
+    fn pixels_at(self: &Arc<Self>, footage: &Footage, t: Tick, playback: bool) -> Result<Pixels> {
         if !footage.has_video {
             return Err(MediaError::Unsupported(format!("{}: no video", footage.path)));
         }
@@ -709,9 +721,9 @@ impl Inner {
             }
         }
         loop {
-            if let Some(img) = c.lru.get(&loc.key) {
+            if let Some(px) = c.lru.get(&loc.key) {
                 self.hits.fetch_add(1, Ordering::Relaxed);
-                return Ok(img);
+                return Ok(px);
             }
             if !c.inflight.contains(&loc.key) {
                 break;
@@ -723,7 +735,7 @@ impl Inner {
             if rayon::current_thread_index().is_some() {
                 self.misses.fetch_add(1, Ordering::Relaxed);
                 drop(c);
-                return Ok(Arc::new(self.decode(&loc, footage)?));
+                return self.decode(&loc, footage);
             }
             c = self.done.wait(c).unwrap_or_else(|e| e.into_inner());
         }
@@ -731,9 +743,9 @@ impl Inner {
         c.inflight.insert(loc.key.clone());
         drop(c);
         let _guard = Inflight { inner: self, key: loc.key.clone() };
-        let img = Arc::new(self.decode(&loc, footage)?);
-        lock(&self.cache).lru.insert(loc.key, img.clone(), self.budget());
-        Ok(img)
+        let px = self.decode(&loc, footage)?;
+        lock(&self.cache).lru.insert(loc.key, px.clone(), self.budget());
+        Ok(px)
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -742,38 +754,44 @@ impl Inner {
         self.prefetched.fetch_add(1, Ordering::Relaxed);
         // A plain thread, not a rayon job: the decode below parallelises with rayon itself.
         std::thread::spawn(move || {
-            let _ = me.frame_at(&f, t, false);
+            let _ = me.pixels_at(&f, t, false);
         });
     }
 
     #[cfg(target_arch = "wasm32")]
     fn prefetch(self: &Arc<Self>, _footage: &Footage, _t: Tick) {}
 
-    fn decode(&self, loc: &Loc, footage: &Footage) -> Result<Image> {
+    /// Decode the frame at `loc`: movies and 8 / 16-bit stills are kept as their samples
+    /// ([`Packed`]), float stills, layered and vector documents as float pixels.
+    fn decode(&self, loc: &Loc, footage: &Footage) -> Result<Pixels> {
         let op = AlphaOp::of(footage);
         let path = &loc.key.path;
+        let float = |img: Image| Pixels::Float(Arc::new(img));
         match loc.media_t {
-            None if &**path == PLACEHOLDER => Ok(colour_bars(footage.width, footage.height)),
+            None if &**path == PLACEHOLDER => Ok(float(colour_bars(footage.width, footage.height))),
             None => {
                 let bytes = self.read(path)?;
                 if let Some(img) = crate::layered::decode(path, &bytes, footage, op)? {
-                    return Ok(img);
+                    return Ok(float(img));
                 }
                 if let Some(img) = crate::avif::decode(path, &bytes, op)? {
-                    return Ok(img);
+                    return Ok(float(img));
                 }
                 let img = match image::load_from_memory(&bytes) {
                     Ok(img) => img,
                     // A multi-layer OpenEXR file without an unnamed RGB layer: its colour layer.
                     Err(e) => crate::exr_channels::layered_image(&bytes).ok_or_else(|| MediaError::Decode(format!("{path}: {e}")))?,
                 };
-                Ok(dynamic_to_image(&img, op))
+                drop(bytes);
+                Ok(match pack_dynamic(img, op) {
+                    Ok(img) => float(img),
+                    Err(packed) => Pixels::Packed(Arc::new(packed)),
+                })
             }
             Some(mt) => {
                 let src = self.source(path).ok_or_else(|| MediaError::Io(format!("{path}: cannot open")))?;
-                let vf = src.video_frame(FrameRequest::full(filmcraft_time::Tick(mt.0))).map_err(MediaError::from)?;
-                let buf = lock(&self.cache).lru.take_spare(vf.width as usize * vf.height as usize);
-                Ok(frame_to_image_in(&vf, op, buf))
+                let frame = src.video_frame(FrameRequest::full(filmcraft_time::Tick(mt.0))).map_err(MediaError::from)?;
+                Ok(Pixels::Packed(Arc::new(Packed::Video { frame, op })))
             }
         }
     }
@@ -925,30 +943,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn frame_index_loops_and_clamps() {
-        let r = FrameRate::FPS_30;
-        assert_eq!(Inner::frame_index(r, r.tick_of(-3), 10, 1), 0);
-        assert_eq!(Inner::frame_index(r, r.tick_of(4), 10, 1), 4);
-        assert_eq!(Inner::frame_index(r, r.tick_of(25), 10, 1), 9);
-        assert_eq!(Inner::frame_index(r, r.tick_of(25), 10, 3), 5);
-        assert_eq!(Inner::frame_index(r, r.tick_of(45), 10, 3), 9);
-        assert_eq!(Inner::frame_count(r, Tick(2 * TICKS_PER_SECOND)), 60);
-    }
-
-    #[test]
-    fn saved_vector_crop_has_distinct_media_cache_key() {
-        let mut footage = Footage {
-            path: "art.ai".into(),
-            kind: FootageKind::Still,
-            layer: Some(effectcraft_project::SourceLayer { index: 1, name: "Art".into(), crop_bounds: Some([0.0, 0.0, 20.0, 40.0]), ..Default::default() }),
-            ..Default::default()
-        };
-        let before = Inner::locate(&footage, Tick::ZERO).key;
-        footage.layer.as_mut().unwrap().crop_bounds = Some([1.0, 0.0, 21.0, 40.0]);
-        assert!(before != Inner::locate(&footage, Tick::ZERO).key);
-    }
-
     /// Open files are bounded (least recently used closed first), purging closes the idle ones,
     /// and files the project no longer names are closed.
     #[test]
@@ -981,9 +975,33 @@ mod tests {
     }
 
     #[test]
-    fn lru_respects_budget_and_recycles() {
+    fn frame_index_loops_and_clamps() {
+        let r = FrameRate::FPS_30;
+        assert_eq!(Inner::frame_index(r, r.tick_of(-3), 10, 1), 0);
+        assert_eq!(Inner::frame_index(r, r.tick_of(4), 10, 1), 4);
+        assert_eq!(Inner::frame_index(r, r.tick_of(25), 10, 1), 9);
+        assert_eq!(Inner::frame_index(r, r.tick_of(25), 10, 3), 5);
+        assert_eq!(Inner::frame_index(r, r.tick_of(45), 10, 3), 9);
+        assert_eq!(Inner::frame_count(r, Tick(2 * TICKS_PER_SECOND)), 60);
+    }
+
+    #[test]
+    fn saved_vector_crop_has_distinct_media_cache_key() {
+        let mut footage = Footage {
+            path: "art.ai".into(),
+            kind: FootageKind::Still,
+            layer: Some(effectcraft_project::SourceLayer { index: 1, name: "Art".into(), crop_bounds: Some([0.0, 0.0, 20.0, 40.0]), ..Default::default() }),
+            ..Default::default()
+        };
+        let before = Inner::locate(&footage, Tick::ZERO).key;
+        footage.layer.as_mut().unwrap().crop_bounds = Some([1.0, 0.0, 21.0, 40.0]);
+        assert!(before != Inner::locate(&footage, Tick::ZERO).key);
+    }
+
+    #[test]
+    fn lru_respects_budget() {
         let mut c = Lru::default();
-        let img = || Arc::new(Image::new(16, 16)); // 4 KiB + overhead
+        let img = || Pixels::Float(Arc::new(Image::new(16, 16))); // 4 KiB + overhead
         let k = |i| Key { path: "a".into(), frame: i, interp: 0, matte: [0; 3], crop: None };
         let budget = 3 * (4096 + 64);
         for i in 0..10 {
@@ -995,9 +1013,6 @@ mod tests {
         c.get(&k(7));
         c.insert(k(10), img(), budget);
         assert!(c.get(&k(7)).is_some() && c.get(&k(8)).is_none());
-        assert_eq!(c.spare.len(), MAX_SPARE);
-        assert_eq!(c.take_spare(256).len(), 256);
-        assert!(c.take_spare(17).is_empty());
     }
 
     /// #411: Interpret Footage ▸ Preserve RGB reads a float OpenEXR's values as the file stores

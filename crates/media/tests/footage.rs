@@ -230,10 +230,13 @@ fn h264_mp4_probe_and_frames() {
     let last = pool.frame_at(&f, Tick(10 * TICKS_PER_SECOND)).expect("frame");
     let db = psnr(&last, &reference_frame(&p, 59));
     assert!(db > 35.0, "clamp: {db:.2} dB");
-    // cached
+    // cached (kept as the decoder's 4:2:0 samples, converted on use: the same pixels)
     let a = pool.frame_at(&f, t_of(f.frame_rate, 45)).expect("frame");
+    let hits = pool.stats().hits;
     let b = pool.frame_at(&f, t_of(f.frame_rate, 45)).expect("frame");
-    assert!(Arc::ptr_eq(&a, &b));
+    assert_eq!(pool.stats().hits, hits + 1);
+    assert!(a.data == b.data);
+    assert!(pool.stats().bytes <= pool.stats().frames * (1920 * 1080 * 3 / 2 + 64), "{:?}", pool.stats());
 }
 
 #[test]
@@ -424,7 +427,9 @@ fn png_with_alpha() {
     let pool = MediaPool::new();
     let a = pool.frame_at(&f, Tick::ZERO).expect("frame");
     let b = pool.frame_at(&f, Tick(5 * TICKS_PER_SECOND)).expect("frame");
-    assert!(Arc::ptr_eq(&a, &b), "stills are timeless");
+    let st = pool.stats();
+    assert!(st.frames == 1 && st.hits == 1 && a.data == b.data, "stills are timeless: {st:?}");
+    assert_eq!(st.bytes, 256 * 128 * 4 + 64, "kept as 8-bit RGBA");
     assert_eq!(*a, load_png(&p));
     assert!(a.data[0][3] == 0.0 && a.data[a.data.len() - 1][3] > 0.98);
     let th = pool.thumbnail(&f, 64).expect("thumb");
@@ -453,7 +458,8 @@ fn wav_audio() {
 fn cache_budget_evicts() {
     let Some(p) = vp9_webm() else { return };
     let f = probe(&p).expect("probe");
-    let frame_bytes = 640 * 360 * 16;
+    // 8-bit 4:2:0 frames are cached as their samples: 1.5 bytes a pixel.
+    let frame_bytes = 640 * 360 * 3 / 2 + 64;
     let pool = MediaPool::with_budget(3 * frame_bytes + 1024);
     for n in 0..10 {
         pool.frame_at(&f, t_of(f.frame_rate, n)).expect("frame");
