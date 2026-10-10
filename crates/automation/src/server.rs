@@ -7,6 +7,7 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use crate::autosave::AutoSave;
+use crate::prompts;
 use crate::resources::{self, Target, UriError};
 use crate::tools::{self, Reply};
 use crate::{Backend, Error, base64};
@@ -184,7 +185,7 @@ impl McpServer {
                 };
                 Ok(json!({
                     "protocolVersion": version,
-                    "capabilities": {"tools": {"listChanged": false}, "resources": {"listChanged": false, "subscribe": false}},
+                    "capabilities": {"tools": {"listChanged": false}, "resources": {"listChanged": false, "subscribe": false}, "prompts": {"listChanged": false}},
                     "serverInfo": {"name": "effectcraft", "title": format!("EffectCraft ({mode})"), "version": env!("CARGO_PKG_VERSION")},
                     "instructions": instructions,
                     "_meta": {"effectcraftAutoSave": self.autosave_info()},
@@ -234,7 +235,11 @@ impl McpServer {
                     Err(e) => Err((INTERNAL_ERROR, e.to_string())),
                 }
             }
-            "prompts/list" => Ok(json!({"prompts": []})),
+            "prompts/list" => Ok(prompts::list(self.structured(params))),
+            "prompts/get" => {
+                let name = params.get("name").and_then(Value::as_str).ok_or((INVALID_PARAMS, "missing prompt `name`".to_string()))?;
+                prompts::get(name, params.get("arguments")).map_err(|m| (INVALID_PARAMS, m))
+            }
             m => Err((METHOD_NOT_FOUND, format!("method not found: {m}"))),
         }
     }

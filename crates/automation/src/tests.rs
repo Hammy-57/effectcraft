@@ -1335,6 +1335,52 @@ fn resource_templates_read_and_reject_bad_uris() {
     assert_eq!(rpc(&mut s, 4, "ping", json!({})), json!({}));
 }
 
+/// Workflow prompts: listed with their arguments, rendered with the tool flow, and argument
+/// mistakes are invalid params.
+#[test]
+fn prompts_list_and_get() {
+    let mut s = server();
+    let init = rpc(&mut s, 1, "initialize", json!({"protocolVersion": "2025-06-18"}));
+    assert!(init["capabilities"]["prompts"].is_object());
+    let list = rpc(&mut s, 2, "prompts/list", json!({}));
+    let prompts = list["prompts"].as_array().unwrap();
+    let names: Vec<&str> = prompts.iter().map(|p| p["name"].as_str().unwrap()).collect();
+    for want in ["title_card", "lower_third", "port_ae_script", "check_against_reference", "animate_layer"] {
+        assert!(names.contains(&want), "missing {want}");
+    }
+    for p in prompts {
+        assert!(p["title"].is_string() && p["description"].is_string(), "{p}");
+        assert!(p["arguments"].as_array().unwrap().iter().any(|a| a["required"] == true), "{p}");
+    }
+    let r = rpc(&mut s, 3, "prompts/get", json!({"name": "title_card", "arguments": {"text": "Hello World"}}));
+    assert_eq!(r["messages"][0]["role"], "user");
+    let text = r["messages"][0]["content"]["text"].as_str().unwrap();
+    for needle in ["Hello World", "command_run comp.new", "layer.newText", "add_keyframe", "render_preview", "layer time"] {
+        assert!(text.contains(needle), "{needle}: {text}");
+    }
+    let r = rpc(&mut s, 4, "prompts/get", json!({"name": "check_against_reference", "arguments": {"reference_path": "/tmp/ref.png", "time": "1.5"}}));
+    let text = r["messages"][0]["content"]["text"].as_str().unwrap();
+    assert!(text.contains("render_compare") && text.contains("/tmp/ref.png") && text.contains("1.5 s"), "{text}");
+    let r = rpc(&mut s, 5, "prompts/get", json!({"name": "port_ae_script", "arguments": {"script": "app.project.items.addComp('X', 10, 10, 1, 1, 24);"}}));
+    assert!(r["messages"][0]["content"]["text"].as_str().unwrap().contains("run_script"));
+    for params in [
+        json!({"name": "lower_third", "arguments": {"name": "Ada"}}),
+        json!({"name": "lower_third", "arguments": {"name": "Ada", "title": "   "}}),
+        json!({"name": "title_card"}),
+        json!({"name": "title_card", "arguments": {"text": "x", "colour": "red"}}),
+        json!({"name": "title_card", "arguments": {"text": 5}}),
+        json!({"name": "title_card", "arguments": "text"}),
+        json!({"name": "no_such_prompt"}),
+        json!({}),
+    ] {
+        assert_eq!(rpc_err(&mut s, "prompts/get", params.clone()), -32602, "{params}");
+    }
+    // Older revisions don't get `title`.
+    let mut s = server();
+    rpc(&mut s, 1, "initialize", json!({"protocolVersion": "2025-03-26"}));
+    assert!(rpc(&mut s, 2, "prompts/list", json!({}))["prompts"][0].get("title").is_none());
+}
+
 /// A minimal JSON Schema check (type, required, properties, items): enough for outputSchema.
 fn validate(schema: &Value, v: &Value, at: &str) -> Result<(), String> {
     if let Some(t) = schema.get("type") {
