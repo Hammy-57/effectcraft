@@ -53,6 +53,7 @@ mod relink;
 mod render_queue;
 pub(crate) mod rig3d;
 pub mod roto_cmds;
+pub mod round_corners;
 mod scene_detect;
 pub mod scripts;
 mod settings;
@@ -187,6 +188,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(viewer_cmds::specs());
         v.extend(shape_stroke::specs());
         v.extend(shape_tool::specs());
+        v.extend(round_corners::specs());
         v.extend(focus::specs());
         v.extend(key_labels::specs());
         v.extend(key_transform::specs());
