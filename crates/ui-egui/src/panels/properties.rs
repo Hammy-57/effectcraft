@@ -292,8 +292,9 @@ fn transform_row(
             actions.push(("prop.toggleAnimation".into(), json!({"layer": lid, "prop": uid})));
         }
     }
-    p.text(pos2(r.min.x + 42.0, cy), Align2::LEFT_CENTER, &row.label, Tokens::ui(12.0), t.text);
-    let vx = r.min.x + (r.width() * 0.5).max(130.0);
+    let lr = p.text(pos2(r.min.x + 42.0, cy), Align2::LEFT_CENTER, &row.label, Tokens::ui(12.0), t.text);
+    // Long labels ("Outer Roundness") push their values right rather than under them.
+    let vx = (r.min.x + (r.width() * 0.5).max(130.0)).max(lr.max.x + 10.0);
     let merge = row.merge.as_str();
     let set = |actions: &mut Actions, v: serde_json::Value| actions.push(("prop.set".into(), json!({"layer": lid, "prop": uid, "value": v, "merge": merge})));
     let value = ectx.value(layer, pr);
