@@ -189,7 +189,8 @@ fn delete(s: &mut Session, p: &Value) -> Result<Value> {
                 let gone: Vec<effectcraft_project::LayerId> =
                     comp.layers.iter().filter(|l| l.source.item().is_some_and(|i| doomed.contains(&i))).map(|l| l.id).collect();
                 comp.layers.retain(|l| !gone.contains(&l.id));
-                for l in &mut comp.layers {
+                let refers = |l: &effectcraft_project::Layer| l.parent.is_some_and(|x| gone.contains(&x)) || l.track_matte.is_some_and(|m| gone.contains(&m.layer));
+                for l in comp.layers.iter_mut_where(refers) {
                     if l.parent.is_some_and(|x| gone.contains(&x)) {
                         l.parent = None;
                     }
