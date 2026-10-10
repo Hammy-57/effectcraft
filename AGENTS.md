@@ -31,6 +31,8 @@ building on top of it. Full standard: [craftrules `standards/never-crash.md`](ht
   `catch_unwind` boundary that turns an escaped panic into an error and keeps the document. It is a
   safety net, not a substitute for the rules above; keep `panic = "unwind"`.
 - **Prove it:** every crash fix comes with a small synthetic regression test that panicked before the fix.
+  Crash fix regression test = drop a `.jsonl` in `tests/repros` (the crash repro, trimmed; see
+  [docs/agents.md](docs/agents.md), "Repro scripts").
 
 Tests, benches, fuzz targets and `xtask` may `unwrap()`; `clippy.toml` allows it in tests. Crates that are
 clean carry `#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented,
