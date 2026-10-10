@@ -929,3 +929,6 @@ before.
 - `effectcraft-cli serve`: a windowless host holding one project that several agents join over the
   control channel (own cursors, comp claims, waiting jobs that don't block the others, throttled
   checkpoints, in the host list); `host.release` saves and stops it.
+- Handover: opening a project that a windowless host (`effectcraft-cli serve`) has open asks the
+  host to save and stop, then opens the saved file, instead of making a second copy; agents whose
+  host went away are pointed to the MCP `hosts` tool to rejoin.

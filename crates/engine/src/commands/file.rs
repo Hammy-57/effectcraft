@@ -39,6 +39,11 @@ fn demo(s: &mut Session, _: &Value) -> Result<Value> {
 
 pub(crate) fn open(s: &mut Session, p: &Value) -> Result<Value> {
     let path = str_p(p, "path").ok_or_else(|| bad("file.open", "missing `path`"))?;
+    // A windowless host holding it saves it and stops first (a handover, not a second copy).
+    let handover = crate::hosts::take_over(path);
+    if let Some(h) = &handover {
+        s.toast(h.clone());
+    }
     let bytes = s.services.read_file(path).map_err(|e| EngineError::Other(format!("cannot read {path}: {e}")))?;
     let text = String::from_utf8(bytes).map_err(|_| EngineError::Other("not a text project file".into()))?;
     // XML copies (File ▸ Save a Copy As XML…) open like the JSON project.
@@ -70,6 +75,9 @@ pub(crate) fn open(s: &mut Session, p: &Value) -> Result<Value> {
         crate::footage_check::start(s, None, false)?;
     }
     let mut out = json!({"path": path, "savedBy": saved_by});
+    if let Some(h) = handover {
+        out["handover"] = json!(h);
+    }
     if !elsewhere.is_empty() {
         out["openElsewhere"] = json!(elsewhere);
     }
