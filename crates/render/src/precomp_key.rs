@@ -107,7 +107,33 @@ fn tree_has(project: &Project, id: ItemId, expressions: bool, depth: usize) -> b
     here || info.nested.iter().any(|n| tree_has(project, *n, expressions, depth + 1))
 }
 
+/// Does comp `id` change from frame to frame: a layer animates or reads the clock in it or a
+/// comp nested in it, or it shows moving footage?
+fn tree_varies(project: &Project, id: ItemId, depth: usize) -> bool {
+    if depth > MAX_DEPTH {
+        return true;
+    }
+    let Some(arc) = comp_arc(project, id) else { return false };
+    let info = comp_info(arc);
+    if !info.animated.is_empty() || info.other_times {
+        return true;
+    }
+    let moving = |l: &Layer| match l.source {
+        LayerSource::Footage { item } => !matches!(project.item(item).map(|i| &i.kind), Some(ItemKind::Footage(f)) if f.kind == FootageKind::Still),
+        _ => false,
+    };
+    info.sources.iter().any(|&i| arc.layers.get(i).is_some_and(moving)) || info.nested.iter().any(|n| tree_varies(project, *n, depth + 1))
+}
+
 impl<'a> Renderer<'a> {
+    /// Whether precomp layer `layer`'s pixels change from frame to frame (its nested comps
+    /// animate, or its own masks or effects do): its buffer is only reused within a frame (see
+    /// [`crate::cache::LayerCache::insert_once`]).
+    pub(crate) fn precomp_varies(&self, ctx: &EvalCtx, layer: &Layer) -> bool {
+        let LayerSource::Comp { item } = layer.source else { return false };
+        crate::cache::content_animated(ctx.comp, layer) || tree_varies(self.project, item, 0)
+    }
+
     /// The key of what precomp layer `layer` shows at the context time (its nested comp as
     /// [`Self::source`] draws it), or `None` when it can't be keyed (see the module docs).
     pub(crate) fn precomp_key(&self, ctx: &EvalCtx, layer: &Layer) -> Option<u64> {

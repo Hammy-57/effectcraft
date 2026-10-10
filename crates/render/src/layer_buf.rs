@@ -118,9 +118,13 @@ impl<'a> Renderer<'a> {
 
     fn content_buf_timed(&self, ctx: &EvalCtx, layer: &Layer, mut timing: Option<&mut LayerTiming>) -> Option<(Arc<Buf>, Option<u64>)> {
         let (key, noted) = self.content_cache_key_noted(ctx, layer);
+        // An animated precomp's buffer isn't kept for other uses in its frame (see
+        // [`cache::LayerCache::insert_once`]): no use waiting for another thread's render of it.
+        let once = key.is_some() && noted.is_some() && self.precomp_varies(ctx, layer);
         let mut _flight = None;
         if let Some(c) = self.cache {
             let hit = match key {
+                Some(k) if once => c.get(k),
                 Some(k) => c.get(k).or_else(|| match c.claim(k) {
                     cache::Claim::Ready(b) => Some(b),
                     cache::Claim::Owner(g) => {
@@ -152,7 +156,11 @@ impl<'a> Renderer<'a> {
             k.adopt(&buf);
         }
         if let (Some(c), Some(k)) = (self.cache, key) {
-            c.insert(k, buf.clone());
+            if once {
+                c.insert_once(k, buf.clone());
+            } else {
+                c.insert(k, buf.clone());
+            }
         }
         // (`_flight`, dropped here, wakes the threads waiting for this buffer.)
         Some((buf, key))
