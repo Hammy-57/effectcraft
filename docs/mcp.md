@@ -62,6 +62,22 @@ return `-32602`.
 {"jsonrpc":"2.0","id":3,"method":"resources/read","params":{"uri":"effectcraft://frame/1/0.5?max_side=320"}}
 ```
 
+## Prompts
+
+`prompts/list` and `prompts/get` serve workflow recipes. Each one is a single user message that spells
+out the tool flow (canonical tool names, the layer-time versus comp-time pitfall, rendering to check):
+
+| Prompt | Arguments |
+| --- | --- |
+| `title_card` | `text`, `style?` |
+| `lower_third` | `name`, `title` |
+| `port_ae_script` | `script` (After Effects ExtendScript, run through `run_script`) |
+| `check_against_reference` | `reference_path`, `comp?`, `time?` (`render_compare` against the reference) |
+| `animate_layer` | `layer`, `motion` |
+
+Argument values are strings. A missing required argument, an unknown argument or prompt, or a
+non-string value returns `-32602`.
+
 ## Progress and cancellation
 
 Headless `command_run` / `execute_command` calls to `renderQueue.render` (unless `wait: false`)

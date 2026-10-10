@@ -20,6 +20,7 @@ pub mod backend;
 pub mod base64;
 pub mod bridge;
 mod long_job;
+mod prompts;
 pub mod resources;
 pub mod server;
 pub mod tools;
