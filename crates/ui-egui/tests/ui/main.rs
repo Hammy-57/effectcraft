@@ -43,6 +43,8 @@ mod ui_azerty_shortcuts;
 mod ui_blank_context_menus;
 #[path = "../ui_camera_tracker.rs"]
 mod ui_camera_tracker;
+#[path = "../ui_control_channel.rs"]
+mod ui_control_channel;
 #[path = "../ui_drag_drop.rs"]
 mod ui_drag_drop;
 #[path = "../ui_effect_controls.rs"]

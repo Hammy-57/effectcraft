@@ -61,11 +61,14 @@ happened in between:
 
 ## Cheaper builds
 
-In progress (AG2.16); this section is updated when it lands.
+Landed in AG2.16 (details: docs/testing.md, "One test binary per crate").
 
 - UI tests (`crates/ui-egui/tests/*.rs`) compile into **one** test binary instead of one binary per
   file (each of which linked the whole app). Run one file's tests with
-  `cargo test -p effectcraft-ui-egui --test ui <file_name>::` (for example `ui_viewer::`).
+  `cargo test -p effectcraft-ui-egui --test ui <file_name>::` (for example `ui_viewer::`). The same
+  goes for `effectcraft-host`, `-export` and `-effects` (`--test host`, `--test export`,
+  `--test effects`). A new test file needs its `#[path = "../x.rs"] mod x;` line in
+  `tests/<binary>/main.rs`; a test fails until it has it.
 - Dev and test builds carry line tables only (`debug = "line-tables-only"`; dependencies none):
   panics still show file and line, and linking is faster.
 - Later: splitting `crates/engine` (about 68,000 lines in one crate; any edit recompiles it and
