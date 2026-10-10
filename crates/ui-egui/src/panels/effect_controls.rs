@@ -408,6 +408,9 @@ fn prop_row(
             }
             p.rect_stroke(gr, 2.0, Stroke::new(1.0, t.field_border), egui::StrokeKind::Inside);
             app.auto.add(&format!("effectControls.prop.{uid}.value"), gr, &prop.name);
+            if let Some(value) = super::gradient_editor::show(app, ui, egui::Id::new(("ec-gradient", uid)), gr, g) {
+                actions.push(("prop.set".into(), json!({"layer": layer.id.0, "prop": uid, "value": value})));
+            }
         }
         _ => {}
     }
