@@ -34,8 +34,9 @@ and your focused tests. Report exactly what you ran.
 2. Merge the latest `main` into your branch **once**, at the end (merge, don't rebase: a rebase
    replays every commit and, when `main` moves again, means another rebuild). Then `cargo check`
    the crates you touched: no full build, no test suite.
-3. Merge into `main`, **push `main`** (the nightly cloud run only sees what's on GitHub), then delete
-   your worktree, branch and `target/agent-<name>`.
+3. Merge into `main`, **push `main`** (the nightly cloud run only sees what's on GitHub), then
+   `cargo xtask agents release <slug>` (a lane goes back to `main` with its build folder kept warm).
+   Outside a lane: delete your worktree, branch and `target/agent-<name>`.
 4. Stop there. **Don't build the app or the release CLI after merging**, and don't ask another
    session to: see "Building the app" below.
 
@@ -57,6 +58,30 @@ morning summary.
 A failure shows as the red ❌ on the commit (`gh run list --workflow watchdog.yml`) and in GitHub's email;
 with issues turned on it also opens one `watchdog` issue that the next green run closes. If main is
 red, fixing it comes before new work.
+
+## Lanes: warm build folders
+
+A new worktree with an empty build folder compiles all ~600 crates (11 minutes on a 4-core cloud
+machine, 15–25 under load here), even for a one-line change. Measured on 10 October 2026: a build
+folder is reusable from another checkout (third-party crates stay fresh), and the workspace crates
+only rebuild because a fresh checkout gives every file a new date.
+
+So agents work in **lanes**: a few permanent worktrees (`../effectcraft-lane-<n>`, 4 by default,
+`EFFECTCRAFT_LANES` overrides), each with its own build folder (`target/lane-<n>`).
+`cargo xtask agents lane <slug> --task "…"` takes a free lane and switches it to a new branch
+`agents/<slug>` from `main` (`--branch` picks another): git only rewrites the files that differ, so
+cargo rebuilds only what changed. It prints the `cd` and environment to use. `release` refuses a
+lane with uncommitted changes, puts it back on `main` and deletes the branch if it is merged.
+`gc` never removes a lane. All lanes busy: wait for one; at most 4 agents build at once, which also
+keeps the cores from drowning. The first agent in a new lane builds everything once.
+
+## The MCP servers
+
+`.mcp.json` starts three MCP servers per Claude session through `scripts/mcp.sh`. When the sources
+are newer than the CLI it rebuilds it once in the background, with the `local` profile in
+`target/local` (shared with the app), not `--release` (thin LTO, one codegen unit, no incremental
+reuse: 10–20 minutes of every core, on almost every session start). A linked worktree serves the
+main checkout's CLI and never builds its own; Claude cloud sessions don't build it at all.
 
 ## Building the app
 
