@@ -165,14 +165,18 @@ pub fn nodes(base: &str, key: &str, ids: &[String], token: &str) -> Result<serde
     serde_json::from_slice(&body).map_err(|e| format!("Figma sent invalid JSON: {e}"))
 }
 
-/// Render `ids` as PNG at `scale` (`GET /v1/images/:key?format=png&use_absolute_bounds=true`)
-/// and download each: (id, PNG bytes or the reason it failed).
-pub fn images(base: &str, key: &str, ids: &[String], scale: f64, token: &str) -> Result<Vec<(String, Result<Vec<u8>, String>)>, String> {
+/// Render `ids` as `format` (`pdf` or `png` at `scale`; `GET
+/// /v1/images/:key?format=…&use_absolute_bounds=true`) and download each: (id, the file's bytes
+/// or the reason it failed).
+pub fn images(base: &str, key: &str, ids: &[String], scale: f64, token: &str, format: &str) -> Result<Vec<(String, Result<Vec<u8>, String>)>, String> {
+    let format = if format == "pdf" { "pdf" } else { "png" };
     let mut out = vec![];
     for chunk in ids.chunks(50) {
         let q: Vec<String> = chunk.iter().filter_map(|i| normalize_id(i)).collect();
-        let url =
-            format!("{base}/v1/images/{key}?ids={}&format=png&scale={scale}&use_absolute_bounds=true", q.join(",").replace(':', "%3A").replace(';', "%3B"));
+        let url = format!(
+            "{base}/v1/images/{key}?ids={}&format={format}&scale={scale}&use_absolute_bounds=true",
+            q.join(",").replace(':', "%3A").replace(';', "%3B")
+        );
         let body = curl(&url, Some(token), 16 << 20)?;
         let v: serde_json::Value = serde_json::from_slice(&body).map_err(|e| format!("Figma sent invalid JSON: {e}"))?;
         if let Some(e) = v.get("err").and_then(|e| e.as_str()) {

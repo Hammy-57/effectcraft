@@ -17,6 +17,7 @@
 //! - `ui.playback {action: play|stop|toggle}`
 //! - `ui.screenshot {path?, panel?, id?}`: PNG of the window (or one panel / element)
 //! - `render.frame {comp?, time?, max_side?, path?, base64?}`: PNG of a comp frame rendered by the session
+//! - `ui.figmaPair {client}`: the one-time Figma pairing prompt; replies `{allowed}` once answered
 //! - `ui.resize {width, height}` / `ui.focus` / `app.quit {force?}` (a modified project asks to save first unless `force`)
 //!
 //! The full reference with examples is `docs/control-protocol.md`.
@@ -57,6 +58,8 @@ pub enum Outcome {
     },
     /// Reply once background jobs end (a `wait: true` command whose job runs in a worker).
     AwaitJobs(JobWaiter),
+    /// The handler kept the request's reply and sends it later.
+    Held,
 }
 
 /// A `wait: true` engine command whose job was sent to the session's offload (the browser's
@@ -435,6 +438,16 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
             // Explicit request: activate the app and take keyboard focus.
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             ok(Value::Null)
+        }
+        "ui.figmaPair" => {
+            // The Figma bridge asks once whether the plug-in may send layers; the reply goes out
+            // when the person clicks Allow or Deny (`{allowed}`).
+            let client = s("client").unwrap_or("Figma plug-in").to_string();
+            if crate::panels::figma_pair::ask(app, ctx, &client, req.reply.clone()) {
+                Outcome::Held
+            } else {
+                err("EffectCraft is already asking to connect Figma")
+            }
         }
         "app.quit" => {
             // A modified project asks to save first unless `force: true`.
