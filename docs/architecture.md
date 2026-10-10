@@ -635,7 +635,15 @@ docked group's setting). Shortcuts and the panel menu work in the window, and a 
 of it lands where it is dropped, in the main window's dock or another undocked group (the window that has the pointer
 feeds it to the dock's drop logic). While a tab is dragged, the window under the pointer draws
 the drop highlight and the dragged tab: an undocked window draws them in its next pass, as the
-dock's drop logic placed them, translated into its coordinates. Where egui embeds viewports (`ctx.embed_viewports()`: the web,
+dock's drop logic placed them, translated into its coordinates. While EffectCraft is the active app (any of its windows has
+the focus) undocked windows float above the main window, as After Effects' floating panels do;
+when another app becomes active they drop back to the normal window level, so they don't float
+above its windows. egui has no parent-window API, so this is the windows' level
+(`WindowLevel::AlwaysOnTop` / `Normal` in their viewport builders, which send it only when it
+changes; `float_windows::OnTop`): gaining the focus raises them at once, losing it lowers them once
+it has stayed lost for 0.2 s (focus moving between our own windows passes through a frame or two
+in which none has it). Setting a level doesn't take the focus. Limit: unlike a real child window,
+they don't minimise or hide with the main window. Where egui embeds viewports (`ctx.embed_viewports()`: the web,
 the headless test harness, the snapshot example and the offscreen `mcp --ui` app) undocked groups
 float inside the main window instead, unchanged. Automation elements drawn in an undocked window
 carry `window` (the group id), their rects are in its coordinates, and synthetic `ui.click` /

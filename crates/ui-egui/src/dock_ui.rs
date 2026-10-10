@@ -262,7 +262,7 @@ impl EffectcraftApp {
             panels::home::show(self, &mut child, body);
             // (Undocked OS windows wait behind it too.)
             self.os_windows.drag_overlay = None;
-            self.os_windows.begin_frame();
+            self.os_windows.begin_frame(&ctx);
             self.os_windows.end_frame(&ctx);
             return;
         }
@@ -311,7 +311,7 @@ impl EffectcraftApp {
         dock::assign_floating_ids(&mut self.ui.floating);
         let origin = crate::float_windows::main_origin(&ctx).filter(|_| crate::float_windows::enabled(&ctx));
         let mut closed = vec![];
-        self.os_windows.begin_frame();
+        self.os_windows.begin_frame(&ctx);
         for i in 0..self.ui.floating.len() {
             let shown = match origin {
                 Some(o) => self.floating_os_window(&ctx, i, o, &info, &mut actions, &mut closed),

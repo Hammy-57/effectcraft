@@ -11,6 +11,8 @@
 //!   menu's Dock Panel and Window ▸ <panel> work as for a group floating in the main window.
 //! - Shortcuts, the panel menu (≡) and tab drags work in it: a tab dragged out of it lands where
 //!   it is dropped, in the main window's dock or another undocked group.
+//! - While EffectCraft is the active app the windows float above the main window (After
+//!   Effects' floating panels); when another app is, they are ordinary windows ([`OnTop`]).
 //! - Agents: automation elements drawn in it carry `window` (the group's [`Floating::id`]) and
 //!   their rect is in its coordinates; `ui.click`, `ui.drag`, `ui.scroll` on them (or with
 //!   `window`) are delivered to that window, and `ui.key`/`ui.type` follow the last pointer
@@ -76,6 +78,56 @@ pub struct OsWindows {
     pub(crate) drag_feed: Option<DragFeed>,
     /// A tab drag's feedback for the window under the pointer, drawn in its next pass.
     pub(crate) drag_overlay: Option<DragOverlay>,
+    /// Whether the windows float above the main window.
+    pub(crate) on_top: OnTop,
+}
+
+/// How long no EffectCraft window may have the focus before the undocked windows stop floating
+/// above the main window (seconds): focus moving from one of our windows to another passes
+/// through a frame or two in which none has it.
+const LEVEL_DEBOUNCE: f64 = 0.2;
+
+/// Whether the undocked windows float above the main window, as After Effects' floating panels
+/// do: while EffectCraft is the active app (one of its windows has the focus), and not when
+/// another app is, so they don't float above its windows. egui has no parent-window API, so
+/// this is their window level (`AlwaysOnTop` / `Normal`, set through their viewport builders,
+/// which send it only when it changes). Gaining the focus raises them at once; losing it lowers
+/// them once it has stayed lost for [`LEVEL_DEBOUNCE`].
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct OnTop {
+    pub on: bool,
+    /// Since when (seconds) no window has had the focus while `on`.
+    lost_at: Option<f64>,
+}
+
+impl OnTop {
+    /// A frame at `now` (seconds) in which `focused`: any EffectCraft window has the focus.
+    /// Returns the new state when it changes, and while a change waits, how long until it may
+    /// happen (repaint then).
+    pub(crate) fn update(&mut self, focused: bool, now: f64) -> (Option<bool>, Option<f64>) {
+        if focused {
+            self.lost_at = None;
+            let raised = !self.on;
+            self.on = true;
+            return (raised.then_some(true), None);
+        }
+        if !self.on {
+            return (None, None);
+        }
+        let since = *self.lost_at.get_or_insert(now);
+        let left = LEVEL_DEBOUNCE - (now - since);
+        if left > 0.0 && left <= LEVEL_DEBOUNCE {
+            return (None, Some(left));
+        }
+        // (Also when the clock is odd: never stay above other apps.)
+        *self = OnTop::default();
+        (Some(false), None)
+    }
+
+    /// The undocked windows' window level.
+    pub(crate) fn level(&self) -> egui::WindowLevel {
+        if self.on { egui::WindowLevel::AlwaysOnTop } else { egui::WindowLevel::Normal }
+    }
 }
 
 /// What an undocked window draws while a tab is dragged over it (in its own coordinates): the
@@ -100,9 +152,17 @@ pub(crate) struct DragFeed {
 }
 
 impl OsWindows {
-    /// Start a frame's windows.
-    pub(crate) fn begin_frame(&mut self) {
+    /// Start a frame's windows: they float above the main window while EffectCraft is the
+    /// active app.
+    pub(crate) fn begin_frame(&mut self, ctx: &egui::Context) {
         self.building.clear();
+        if !enabled(ctx) {
+            return;
+        }
+        let (focused, now) = ctx.input(|i| (i.raw.viewports.values().any(|v| v.focused == Some(true)), i.time));
+        if let (_, Some(wait)) = self.on_top.update(focused, now) {
+            ctx.request_repaint_after(std::time::Duration::try_from_secs_f64(wait).unwrap_or_default());
+        }
     }
 
     /// After the floating groups are drawn: forget the windows that are gone (they close).
@@ -219,6 +279,7 @@ impl EffectcraftApp {
             .with_position(pos2(at[0], at[1]))
             .with_inner_size(size)
             .with_min_inner_size(MIN_SIZE)
+            .with_window_level(self.os_windows.on_top.level())
             .with_taskbar(false);
         if self.os_windows.raise == Some(f.id) {
             self.os_windows.raise = None;
@@ -381,6 +442,33 @@ mod tests {
         let old: Layout = serde_json::from_value(old).unwrap();
         let f = &old.floating[0];
         assert_eq!((f.id, f.screen, f.rect, &f.panels), (0, None, [200.0, 150.0, 320.0, 240.0], &vec![Info]));
+    }
+
+    #[test]
+    fn undocked_windows_float_above_the_main_window_only_while_effectcraft_is_active() {
+        let mut t = OnTop::default();
+        assert_eq!(t.level(), egui::WindowLevel::Normal);
+        // EffectCraft becomes the active app: at once.
+        assert_eq!(t.update(true, 1.0), (Some(true), None));
+        assert_eq!(t.level(), egui::WindowLevel::AlwaysOnTop);
+        assert_eq!(t.update(true, 1.1), (None, None), "no change, nothing sent");
+        // The focus moves from one of our windows to another (a frame with none focused).
+        let (change, wait) = t.update(false, 1.2);
+        assert_eq!(change, None);
+        assert!(wait.is_some_and(|w| (w - LEVEL_DEBOUNCE).abs() < 1e-9));
+        assert_eq!(t.update(false, 1.25).0, None);
+        assert_eq!(t.update(true, 1.3), (None, None));
+        assert!(t.on);
+        // Another app becomes active: once the focus has stayed away, they are ordinary windows.
+        assert_eq!(t.update(false, 2.0).0, None);
+        assert_eq!(t.update(false, 2.1).0, None);
+        assert_eq!(t.update(false, 2.0 + LEVEL_DEBOUNCE).0, Some(false));
+        assert_eq!(t.level(), egui::WindowLevel::Normal);
+        assert_eq!(t.update(false, 3.0), (None, None));
+        // A clock that jumps back never keeps them above other apps.
+        t.update(true, 5.0);
+        t.update(false, 5.1);
+        assert_eq!(t.update(false, 1.0).0, Some(false));
     }
 
     #[test]

@@ -913,3 +913,5 @@ before.
   Group keeps a docked group's Small Tabs, and the setting is saved with the layout.
 - Dragging a tab over an undocked window shows where it will land (the tab strip highlight and
   insertion mark) and the dragged tab in that window, whichever window the drag started in.
+- Undocked windows stay above the main window while EffectCraft is the active app, as After
+  Effects' floating panels do, and become ordinary windows when another app is active.
