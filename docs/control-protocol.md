@@ -68,6 +68,10 @@ one rectangle; `diffBounds` boxes the changed pixels or is null; metrics and siz
 (peak, RMS, LUFS, clipping and silences of the mix). Design lint: `render.lint {comp?, time? | start?, end?, step?, rules?, minTextPx?, minContrast?}`
 → `{comp, compName, times, truncated, clean, counts {error, warning, info}, problems: [{rule, severity,
 layer, layerName, time, until, message, other?}], notes}` (rules and how to read it: [agents.md](agents.md#design-lint)).
+Motion summaries: `comp.motion {comp?, layers?, start?, end?, step?}` /
+`layer.motion {comp?, layer, start?, end?, step?}` → per layer `segments` (enter, exit, move,
+hold, scale, rotate, fade-in, fade-out), `offscreen` intervals and a `summary` sentence, plus
+`overlaps` ([agents.md](agents.md#motion-summary)).
 Agent exam: `exam.check {task? | checks?, base?}` scores the
 project against an exam task's checks (each runs one read-only query and tests its result) →
 `{passed, score, total, passedCount, results: [{id, desc, pass, reason, actual}]}`
