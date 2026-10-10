@@ -27,6 +27,7 @@ pub mod footage_panel;
 pub(crate) mod frame_export;
 mod frontend;
 mod help;
+pub(crate) mod hosts;
 mod import_project;
 mod journal;
 mod key_labels;
@@ -229,6 +230,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(motion_cmds::specs());
 
         v.extend(crate::agents::specs());
+        v.extend(hosts::specs());
         v
     })
 }

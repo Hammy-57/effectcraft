@@ -22,6 +22,7 @@ pub mod footage_check;
 pub mod footage_reload;
 pub mod guard;
 pub mod history;
+pub mod hosts;
 pub mod jobs;
 pub mod layout;
 pub mod learn;
@@ -1360,3 +1361,7 @@ mod tests_agent_cursor;
 mod tests_claims;
 #[cfg(test)]
 mod tests_motion;
+
+
+#[cfg(test)]
+mod tests_hosts;

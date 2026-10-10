@@ -236,6 +236,20 @@ Two things follow:
   last connection that used that `client` closes (keep one connection open, as the MCP bridge does).
   Without `client`, `comp.release` needs `force: true` (the user overriding a claim).
 
+### Which project is open where (hosts) and the save guard
+
+One process holds one project. Every EffectCraft that holds one (the desktop app, a headless or
+`--ui` MCP server) is listed in `<config directory>/Hosts/` with its kind, control port and open
+project; `command_run hosts.list` returns the live ones (`{hosts: [{pid, kind, port, project, me}]}`).
+To work on a project that is already open, join that host (`--bridge <port>`, with your own
+`client`) instead of opening a copy: `file.open` of a project another host has open succeeds but
+warns, and its reply lists them in `openElsewhere`.
+
+Two copies of one file overwrite each other when saved, so saving is guarded: `file.save` /
+`file.saveAs` over a file that changed on disk since this process opened or saved it (another
+app, an agent's CLI, a script) is refused, naming the ways out: save under a new name
+(`file.saveAs`), reload theirs (`file.revert`), or `force: true` to overwrite.
+
 ### A typical session
 
 1. `command_run {"id":"comp.new","params":{"name":"Intro","width":1920,"height":1080,"frameRate":30,"duration":4}}`

@@ -97,6 +97,10 @@ fn main() -> eframe::Result {
     };
     // The font menus list the installed fonts: read their names while the window opens.
     effectcraft_engine::text::fonts::scan_system_in_background();
+    // In the host list (which project is open where; the control port is added once it listens).
+    if let Some(dir) = effectcraft_host::config_dir() {
+        effectcraft_engine::hosts::announce(&dir, "app", None);
+    }
     // Wayland shows the window's icon from its desktop entry: an AppImage brings its own.
     #[cfg(target_os = "linux")]
     appimage::integrate_from_env(ICON_PNG);
@@ -257,6 +261,10 @@ fn main() -> eframe::Result {
                 match control_server::start(port, cc.egui_ctx.clone()) {
                     Ok(started) => {
                         eprintln!("effectcraft: control server listening on 127.0.0.1:{}", started.port);
+                        // In the host list, joinable on this port (`hosts.list`).
+                        if let Some(dir) = effectcraft_host::config_dir() {
+                            effectcraft_engine::hosts::announce(&dir, "app", Some(started.port));
+                        }
                         app = app.with_control(started.requests).with_control_events(started.events);
                     }
                     // Another app (often a second EffectCraft) holds the port: say so in the
@@ -289,6 +297,7 @@ fn main() -> eframe::Result {
             startup_failed(e, !on_gl && cfg!(not(target_os = "macos")));
         }
     }
+    effectcraft_engine::hosts::withdraw();
     result
 }
 
