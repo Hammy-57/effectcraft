@@ -50,7 +50,10 @@ export formats, parity summary), `jobs.list` (Progress panel jobs, e.g. the back
 (`a`/`b`: a snapshot name, `{snapshot}`, `{path}` of a PNG/JPEG, or `{comp?, time?, transparent?}`
 rendered now) → `{width, height, max_abs, mean_abs, alpha_max_abs, psnr_db, ssim, changed_pixels,
 changed_pct, pass, diff_path?, diff_png?}` (metrics and size rules in
-[agents.md](agents.md#verify-your-change-snapshot--edit--compare)).
+[agents.md](agents.md#verify-your-change-snapshot--edit--compare)). Analysis queries (see
+[mcp.md](mcp.md#analysis-tools)): `layer.bounds {comp?, time?, layers?, pixels?, overlaps?}`
+(layer geometry in comp space) and `audio.analyze {comp?, start?, end?, layer?, waveform?, path?}`
+(peak, RMS, LUFS, clipping and silences of the mix).
 
 Every engine command is reachable through `engine.execute`, and every interactive widget of every
 panel registers an element id; both are enforced by `crates/ui-egui/tests/ui_agent_audit.rs`.

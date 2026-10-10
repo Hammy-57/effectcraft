@@ -88,6 +88,29 @@ return `-32602`.
 {"jsonrpc":"2.0","id":3,"method":"resources/read","params":{"uri":"effectcraft://frame/1/0.5?max_side=320"}}
 ```
 
+## Analysis tools
+
+Headless agents can't eyeball a layout or hear the mix, so these tools return numbers; neither
+changes the project (`render_compare` above covers pixels). Each wraps an engine command, so the
+CLI, scripts (`app.run`) and the control channel get the same.
+
+| Tool | Command | Result |
+| --- | --- | --- |
+| `get_layout` | `layer.bounds` | Per layer: `visible` + `why`, comp-space `bounds`, `corners`, `center`, `anchorInComp`, `onScreen`, `source`; optional `pixelBounds` and `overlaps` |
+| `analyze_audio` | `audio.analyze` | Peak, true peak, RMS, integrated LUFS, clipped samples, silences, channels; optional waveform |
+
+- **Geometry** is `sourceRectAtTime` through the transform, parents and, for 3D layers, the
+  active camera. A 3D layer partly behind the camera reports `projected: false` and no bounds.
+  The engine function is `effectcraft_engine::layout::layer_geometry`.
+- **Audio** is the 48 kHz stereo mix preview and export play. Integrated loudness follows ITU-R
+  BS.1770-4 (K-weighting, 400 ms blocks, absolute and relative gates). Levels are null for
+  silence, and the true peak is a 4× oversampled estimate. A comp without audio returns
+  `hasAudio: false`. One call covers at most an hour.
+
+`analyze_audio {waveform: true}` returns the waveform as PNG content next to the JSON; the server
+draws it from the command's min/max columns, so it works the same headless and bridged.
+
+
 ## Notifications
 
 The server writes notifications on stdout after the reply to the request that caused them.

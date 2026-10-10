@@ -1111,6 +1111,49 @@ fn command_tools_accept_id_as_an_alias() {
     assert!(err, "neither key is an error");
 }
 
+/// `get_layout`: comp-space geometry of layers, headless and bridged.
+#[test]
+fn get_layout_reports_layer_geometry() {
+    for bridge in [false, true] {
+        let mut s = if bridge { McpServer::new(Backend::bridge(&fake_app().to_string()).unwrap()) } else { server() };
+        call_json(&mut s, "command_run", json!({"id": "comp.new", "params": {"width": 400, "height": 300}}));
+        let l = call_json(&mut s, "command_run", json!({"id": "layer.newSolid", "params": {"width": 100, "height": 50}}))["layer"].clone();
+        call_json(&mut s, "set_property", json!({"layer": l, "path": "transform/position", "value": [0, 150]}));
+        let r = call_json(&mut s, "get_layout", json!({"layers": [l], "overlaps": true}));
+        let g = &r["layers"][0];
+        assert_eq!(g["bounds"], json!([-50.0, 125.0, 100.0, 50.0]), "{r}");
+        assert_eq!(g["onScreen"], 0.5);
+        assert_eq!(g["visible"], true);
+        assert_eq!(r["overlaps"], json!([]));
+        // A single layer reference works too; bad references are tool errors.
+        assert_eq!(call_json(&mut s, "get_layout", json!({"layers": "#1"}))["layers"].as_array().unwrap().len(), 1);
+        let (c, err) = call(&mut s, "get_layout", json!({"layers": ["Nope"]}));
+        assert!(err && c[0]["text"].as_str().unwrap().contains("no layer"), "{c:?}");
+    }
+}
+
+/// `analyze_audio`: levels of a Tone, a waveform image, no-audio comps.
+#[test]
+fn analyze_audio_levels_and_waveform() {
+    let mut s = server();
+    call_json(&mut s, "command_run", json!({"id": "comp.new", "params": {"width": 64, "height": 36, "duration": 1}}));
+    let r = call_json(&mut s, "analyze_audio", json!({}));
+    assert_eq!(r["hasAudio"], false, "{r}");
+    let l = call_json(&mut s, "command_run", json!({"id": "layer.newSolid", "params": {}}))["layer"].clone();
+    let values = json!({"frequency1": 1000, "frequency2": 0, "frequency3": 0, "frequency4": 0, "frequency5": 0, "level": 25});
+    call_json(&mut s, "add_effect", json!({"layer": l, "effect": "Tone", "values": values}));
+    let r = call_json(&mut s, "analyze_audio", json!({}));
+    assert!((r["peakDbfs"].as_f64().unwrap() + 12.04).abs() < 0.05, "{r}");
+    assert!((r["integratedLufs"].as_f64().unwrap() + 12.04).abs() < 0.2, "{r}");
+    let (c, err) = call(&mut s, "analyze_audio", json!({"waveform": true, "width": 120, "height": 50}));
+    assert!(!err, "{c:?}");
+    assert_eq!(png_size(&base64::decode(c[0]["data"].as_str().unwrap()).unwrap()), Some((120, 50)));
+    let info: Value = serde_json::from_str(c[1]["text"].as_str().unwrap()).unwrap();
+    assert!(info["waveform"].get("columns").is_none(), "columns become the image");
+    let (_, err) = call(&mut s, "analyze_audio", json!({"start": 0.5, "end": 0.5}));
+    assert!(err);
+}
+
 /// Send a request that must fail; returns the JSON-RPC error code.
 fn rpc_err(s: &mut McpServer, method: &str, params: Value) -> i64 {
     let line = json!({"jsonrpc": "2.0", "id": 7, "method": method, "params": params}).to_string();
