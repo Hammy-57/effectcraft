@@ -73,6 +73,12 @@ whole workspace. Run the full `cargo xtask ci` before a release.
 - **Automation** (`crates/automation`, `apps/effectcraft-cli/tests`): MCP protocol round trips and
   the command-line tool's JSON output.
 - **Interface** (`crates/ui-egui`): headless egui_kittest tests for panels and dialogs.
+  `tests/ui_fingerprints.rs` renders every panel (wgpu, skipped without a GPU adapter), reduces it
+  to a 32×20 grey grid and compares it with `tests/ui_fingerprints.txt` with a tolerance: icon and
+  font tweaks pass, a blank, clipped or rearranged panel fails and its render is written to
+  `target/tmp/ui-fingerprints/`. Re-pinning after an intended UI change is expected:
+  `UI_FINGERPRINT_PRINT=1 cargo test -p effectcraft-ui-egui --test ui_fingerprints` (pinned for
+  aarch64 macOS; elsewhere it only checks no panel renders flat).
 
 ## Looking at the interface without a window
 
