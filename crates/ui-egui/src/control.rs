@@ -158,7 +158,8 @@ fn task_ids(app: &EffectcraftApp) -> Vec<String> {
 
 /// Commands that block with `wait` (and its default).
 fn waits(command: &str, params: &Value) -> bool {
-    let default = command == "renderQueue.render";
+    // Frame renders and contact sheets too, so one agent's render never holds up the others.
+    let default = matches!(command, "renderQueue.render" | "render.frame" | "render.contactSheet");
     params.get("wait").and_then(Value::as_bool).unwrap_or(default)
 }
 
@@ -208,12 +209,13 @@ impl JobWaiter {
         }
         // A generic task (desktop): the blocking command returned its result, or failed with its
         // message.
-        let tasks: Vec<&effectcraft_engine::jobs::JobRecord> = s.job_log.iter().filter(|r| self.jobs.contains(&r.id)).collect();
+        let mut tasks: Vec<&mut effectcraft_engine::jobs::JobRecord> = s.job_log.iter_mut().filter(|r| self.jobs.contains(&r.id)).collect();
         if let Some(r) = tasks.iter().find(|r| r.status != "done") {
             return json!({"ok": false, "error": if r.message.is_empty() { r.status.clone() } else { r.message.clone() }});
         }
-        if let [task] = tasks.as_slice() {
-            return json!({"ok": true, "result": task.result});
+        if let [task] = tasks.as_mut_slice() {
+            // Taken, not copied: a render's PNG shouldn't stay in the job log.
+            return json!({"ok": true, "result": std::mem::take(&mut task.result)});
         }
         let mut r = self.result;
         if r.get("running").is_some() {
@@ -536,6 +538,11 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
             Outcome::Screenshot { path: s("path").map(str::to_string), crop, max_side }
         }
         "app.revision" => ok(json!({"revision": app.session.revision})),
+        // Desktop: rendered off the UI thread like the engine command (the reply waits for it).
+        "render.frame" if !cfg!(target_arch = "wasm32") => match execute_engine(app, "render.frame", p.clone()) {
+            Ok(o) => o,
+            Err(e) => err(e),
+        },
         "render.frame" => render_frame(app, p),
         "ui.resize" => {
             let w = p.get("width").and_then(Value::as_f64).unwrap_or(1600.0) as f32;
