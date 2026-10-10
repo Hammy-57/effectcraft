@@ -198,7 +198,11 @@ renames it), `viewer.comp`, `viewer.handle.<layer>.<i>`,
 Enter or a double-click renames, drag reorders), `timeline.prop.<uid>.stopwatch`,
 `timeline.key.<uid>.<frame>`, `timeline.cti`, `effectControls.prop.<uid>.value` (an angle's
 revolutions are `timeline.prop.<uid>.revolutions`, `effectControls.prop.<uid>.revolutions` and
-`properties.prop.<uid>.revolutions`) and `effects.item.<name>`. The Composition viewer adds `viewer.magnification`, `viewer.resolution`,
+`properties.prop.<uid>.revolutions`), the Properties panel's shape rows
+`properties.shape.<key>[.value[.0|.1]|.stopwatch|.prevKey|.keyKey|.nextKey]` for the first shape group and
+`properties.shape.<n>.<key>` for the n-th (`size`, `roundness`, `ellipseSize`, `points`,
+`outerRadius`, `innerRadius`, `outerRoundness`, `innerRoundness`, `fillColor`, `fillOpacity`,
+`strokeColor`, `strokeWidth`), a solid's `properties.solid.roundness`, and `effects.item.<name>`. The Composition viewer adds `viewer.magnification`, `viewer.resolution`,
 `viewer.roi`, `viewer.grid`, `viewer.channel`, `viewer.exposure`, `viewer.snapshot`,
 `viewer.showSnapshot`, `viewer.fastPreviews` (their popup entries are `viewer.<menu>Item.<n>`),
 `viewer.ruler.top|left|origin`, `viewer.mask.<uid>.vertex.<i>`, `viewer.shapePath.<uid>.vertex.<i>`,
@@ -214,7 +218,13 @@ Compositions and Text Layers), `view.channel {channel, colorized?}`,
 `view.exposure {stops | delta}`, `view.resetExposure`, `view.takeSnapshot`, `view.showSnapshot`,
 `view.fastPreviewMode {mode}`, `view.setRegionOfInterest {rect}`, `view.addGuide`,
 `view.moveGuide`, `view.removeGuide`; editing: `shape.newPath` (Pen on shape layers),
-`shape.newShape` (the shape tools: a new group in the selected shape layer, else a new shape layer),
+`shape.newShape` (the shape tools: a new group in the selected shape layer, else a new shape layer;
+`roundness` px rounds a rect's corners), `layer.roundCorners {layer?|layers?, roundness?}` (Layer ›
+Create › Round Corners and the Properties panel's Roundness: sets the Roundness of a shape layer's
+Rectangle Paths; a solid becomes, in one undo step, a shape layer drawing a rectangle of its size
+and colour that keeps its id, name, timing, transform, switches, masks, styles and markers, and
+renders the same at roundness 0; solids with effects, adjustment layers and other solids that
+could not render the same are refused with the reason),
 `shape.toolOptions` (the Tools bar's Tool Creates Shape / Mask and Fill and Stroke Options),
 `mask.insertVertex`, `mask.convertVertex`, `mask.deleteVertices`, `path.freeTransform` (masks and
 shape paths by uid), `keys.setSpatialTangents` (motion-path handles) and `keys.transform` (Graph
