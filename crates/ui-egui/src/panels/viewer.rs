@@ -2389,7 +2389,7 @@ fn show_frame(app: &mut EffectcraftApp, ctx: &egui::Context, key: crate::frames:
         FrameImage::Cpu(img) => {
             // Frames wider or taller than the GPU's texture limit go up averaged down too (#201).
             let max = crate::frames::max_texture_side(ctx);
-            let fitted = crate::frames::fit_texture_by((*img).clone(), max, minify);
+            let fitted = crate::frames::fit_texture_shared(&img, max, minify);
             match &mut app.viewer_tex {
                 Some((tex, k, m)) if tex.size() == fitted.size => {
                     tex.set(fitted, opts);
