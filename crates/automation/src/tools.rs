@@ -84,6 +84,7 @@ const READ_ONLY: &[&str] = &[
     "ui_inspect",
     "ui_elements",
     "get_layout",
+    "get_motion",
 ];
 /// Tools that write files (or keep session-side frames) without changing the project.
 const WRITES_FILES: &[&str] =
@@ -223,6 +224,22 @@ pub fn output_schema(name: &str) -> Option<Value> {
             }),
             &["comp", "time", "width", "height", "layers"],
         ),
+        "get_motion" => {
+            let num = json!({"type": "number"});
+            let seg = object(
+                json!({"kind": {"type": "string", "enum": ["enter", "exit", "move", "hold", "scale", "rotate", "fade-in", "fade-out"]}, "start": num, "end": num, "from": {}, "to": {}, "direction": {"type": "string"}, "edge": {"type": "string"}}),
+                &["kind", "start", "end"],
+            );
+            let span = object(json!({"start": num, "end": num}), &["start", "end"]);
+            object(
+                json!({
+                    "comp": int, "compName": {"type": "string"}, "start": num, "end": num, "step": num, "truncated": {"type": "boolean"},
+                    "layers": {"type": "array", "items": object(json!({"layer": int, "name": {"type": "string"}, "inPoint": num, "outPoint": num, "segments": {"type": "array", "items": seg}, "offscreen": {"type": "array", "items": span}, "summary": {"type": "string"}}), &["layer", "name", "segments", "offscreen", "summary"])},
+                    "overlaps": {"type": "array", "items": object(json!({"a": int, "b": int, "aName": {"type": "string"}, "bName": {"type": "string"}, "start": num, "end": num, "maxFraction": num}), &["a", "b", "start", "end", "maxFraction"])}
+                }),
+                &["comp", "start", "end", "step", "truncated", "layers", "overlaps"],
+            )
+        }
         "analyze_audio" => {
             let db = json!({"type": ["number", "null"]});
             object(
@@ -770,6 +787,25 @@ fn get_layout(b: &mut Backend, a: &Value) -> Result<Reply> {
     json_reply(b.exec("layer.bounds", p)?)
 }
 
+fn get_motion(b: &mut Backend, a: &Value) -> Result<Reply> {
+    let range = [("comp", get(a, "comp")), ("start", get(a, "start")), ("end", get(a, "end")), ("step", get(a, "step"))];
+    if let Some(l) = get(a, "layer") {
+        let mut p = obj(&range);
+        p["layer"] = l.clone();
+        return json_reply(b.exec("layer.motion", p)?);
+    }
+    let layers = match get(a, "layers") {
+        Some(Value::Array(v)) => Some(json!(v)),
+        Some(v) => Some(json!([v])),
+        None => None,
+    };
+    let mut p = obj(&range);
+    if let Some(l) = layers {
+        p["layers"] = l;
+    }
+    json_reply(b.exec("comp.motion", p)?)
+}
+
 fn analyze_audio(b: &mut Backend, a: &Value) -> Result<Reply> {
     let waveform = get(a, "waveform").and_then(Value::as_bool).unwrap_or(false);
     let on = json!(true);
@@ -1119,6 +1155,25 @@ static TOOLS: &[ToolDef] = &[
             )
         },
         run: get_layout,
+    },
+    ToolDef {
+        name: "get_motion",
+        description: "How layers move over a time range, in words and numbers, without rendering (comp.motion / layer.motion): samples each layer's comp-space content box, opacity, scale and rotation (default the whole comp, every frame or coarser so a layer gets at most 600 samples; keyframe times are always sampled) and returns per layer `segments` {kind: enter|exit|move|hold|scale|rotate|fade-in|fade-out, start, end, from, to, direction (move/enter/exit: left, up-right...), edge (enter/exit: the frame edge)}, `offscreen` intervals and a one-sentence `summary` (\"Logo flies in from the left 0–1s, holds 1–4s, fades out 4–5s.\"), plus `overlaps` {a, b, start, end, maxFraction} between drawn layers (full-frame backgrounds left out). Times are comp seconds. Use it to check an animation's timing and choreography; render_frames shows the frames.",
+        bridge_only: false,
+        schema: || {
+            schema(
+                json!({
+                    "comp": comp_s(),
+                    "layer": layer_s(),
+                    "layers": {"type": "array", "items": layer_s(), "description": "Layers to describe (default every layer of the comp); `layer` describes one."},
+                    "start": {"type": "number", "description": "Start, comp seconds (default 0)."},
+                    "end": {"type": "number", "description": "End, comp seconds (default the comp's duration)."},
+                    "step": {"type": "number", "description": "Sampling step in seconds (default one frame, coarser for comps over ~10 s so a layer gets at most 600 samples)."}
+                }),
+                &[],
+            )
+        },
+        run: get_motion,
     },
     ToolDef {
         name: "analyze_audio",

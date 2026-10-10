@@ -65,7 +65,10 @@ one rectangle; `diffBounds` boxes the changed pixels or is null; metrics and siz
 [agents.md](agents.md#verify-your-change-snapshot--edit--compare)). Analysis queries (see
 [mcp.md](mcp.md#analysis-tools)): `layer.bounds {comp?, time?, layers?, pixels?, overlaps?}`
 (layer geometry in comp space) and `audio.analyze {comp?, start?, end?, layer?, waveform?, path?}`
-(peak, RMS, LUFS, clipping and silences of the mix).
+(peak, RMS, LUFS, clipping and silences of the mix). Motion summaries: `comp.motion {comp?, layers?, start?, end?, step?}` /
+`layer.motion {comp?, layer, start?, end?, step?}` → per layer `segments` (enter, exit, move,
+hold, scale, rotate, fade-in, fade-out), `offscreen` intervals and a `summary` sentence, plus
+`overlaps` ([agents.md](agents.md#motion-summary)).
 
 `project.summary` and `editor.state` include the document `revision` (bumped on every change, undo and
 redo included). Every command's `params` also accepts `expectRevision` (the command doesn't run and
