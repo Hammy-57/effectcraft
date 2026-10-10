@@ -26,6 +26,18 @@ preserved. Tool failures (including escaped panics) return `isError: true`. Malf
 returns `-32700` with a null id and the session keeps serving. The MCP backend owns its session
 without a mutex; the engine's render-job mutexes already recover poisoned locks.
 
+## Structured results
+
+Sessions that negotiated MCP 2025-06-18 (and modern per-request clients) get each JSON tool
+result as `structuredContent` as well as the JSON text block older clients read. It is always an
+object: an array result is `{"items": [...]}`, a scalar `{"value": v}`, and an image reply carries
+its metadata (`comp`, `time`, `width`, `height`, `path?`). Tools with a stable shape declare it as
+`outputSchema` in `tools/list`: `get_state`, `doc_inspect`, `render_preview`, `undo`, `redo`,
+`history`, `command_batch`, `batch` and `save_project`. Earlier revisions see neither field.
+Long renders (below) reply with text only.
+
+## Resources
+
 Resources `effectcraft://document` and `effectcraft://commands` return JSON matching
 `doc_inspect` and `command_list`. Clients declaring MCP 2026-07-28 in per-request `_meta`
 receive `resultType: complete` and list/read cache hints; document reads are never cached.

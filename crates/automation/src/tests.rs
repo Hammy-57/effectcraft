@@ -1063,3 +1063,107 @@ fn command_tools_accept_id_as_an_alias() {
     let (_, err) = call(&mut s, "execute_command", json!({}));
     assert!(err, "neither key is an error");
 }
+
+/// A minimal JSON Schema check (type, required, properties, items): enough for outputSchema.
+fn validate(schema: &Value, v: &Value, at: &str) -> Result<(), String> {
+    if let Some(t) = schema.get("type") {
+        let types: Vec<&str> = match t {
+            Value::String(s) => vec![s.as_str()],
+            Value::Array(a) => a.iter().filter_map(Value::as_str).collect(),
+            _ => vec![],
+        };
+        let ok = types.iter().any(|t| match *t {
+            "object" => v.is_object(),
+            "array" => v.is_array(),
+            "string" => v.is_string(),
+            "integer" => v.is_i64() || v.is_u64(),
+            "number" => v.is_number(),
+            "boolean" => v.is_boolean(),
+            "null" => v.is_null(),
+            _ => false,
+        });
+        if !ok {
+            return Err(format!("{at}: {v} is not {t}"));
+        }
+    }
+    for r in schema.get("required").and_then(Value::as_array).into_iter().flatten() {
+        if v.get(r.as_str().unwrap()).is_none() {
+            return Err(format!("{at}: missing `{r}` in {v}"));
+        }
+    }
+    if let (Some(props), Some(o)) = (schema.get("properties").and_then(Value::as_object), v.as_object()) {
+        for (k, s) in props {
+            if let Some(x) = o.get(k) {
+                validate(s, x, &format!("{at}.{k}"))?;
+            }
+        }
+    }
+    if let (Some(items), Some(a)) = (schema.get("items"), v.as_array()) {
+        for (i, x) in a.iter().enumerate() {
+            validate(items, x, &format!("{at}[{i}]"))?;
+        }
+    }
+    Ok(())
+}
+
+/// MCP 2025-06-18: JSON results also come as `structuredContent` (always an object) and the
+/// stable ones declare an `outputSchema` it validates against; older revisions get neither, and
+/// keep the text content either way.
+#[test]
+fn structured_content_is_version_gated_and_matches_output_schemas() {
+    for (version, structured) in [("2025-06-18", true), ("2025-03-26", false), ("2024-11-05", false)] {
+        let mut s = server();
+        rpc(&mut s, 1, "initialize", json!({"protocolVersion": version}));
+        let tools = rpc(&mut s, 2, "tools/list", json!({}))["tools"].as_array().unwrap().clone();
+        let declared = tools.iter().filter(|t| t.get("outputSchema").is_some()).count();
+        assert_eq!(declared > 0, structured, "{version}");
+        let r = rpc(&mut s, 3, "tools/call", json!({"name": "command_run", "arguments": {"id": "comp.new", "params": {"width": 32, "height": 32}}}));
+        assert_eq!(r.get("structuredContent").is_some(), structured, "{version}: {r}");
+        assert_eq!(r["content"][0]["type"], "text", "{version}: text content stays");
+    }
+    // A modern request (revision in `_meta`, no initialize) gets them too.
+    let mut s = server();
+    let meta = json!({"io.modelcontextprotocol/protocolVersion": "2026-07-28"});
+    let r = rpc(&mut s, 1, "tools/call", json!({"_meta": meta, "name": "get_state", "arguments": {}}));
+    assert!(r["structuredContent"]["state"].is_object(), "{r}");
+
+    let mut s = server();
+    rpc(&mut s, 1, "initialize", json!({"protocolVersion": "2025-06-18"}));
+    let tools = rpc(&mut s, 2, "tools/list", json!({}))["tools"].as_array().unwrap().clone();
+    let schema = |n: &str| tools.iter().find(|t| t["name"] == n).and_then(|t| t.get("outputSchema")).cloned().unwrap_or_else(|| panic!("{n}: no outputSchema"));
+    for t in &tools {
+        if let Some(o) = t.get("outputSchema") {
+            assert_eq!(o["type"], "object", "{t}");
+        }
+    }
+    let path = std::env::temp_dir().join(format!("ec-structured-{}.ecproj", std::process::id())).to_string_lossy().into_owned();
+    let png = std::env::temp_dir().join(format!("ec-structured-{}.png", std::process::id())).to_string_lossy().into_owned();
+    let calls = [
+        ("command_run", json!({"id": "comp.new", "params": {"name": "S", "width": 64, "height": 36}})),
+        ("command_batch", json!({"steps": [{"id": "layer.newNull"}, {"id": "no.such"}], "stop_on_error": false})),
+        ("batch", json!({"steps": [{"command": "layer.newSolid", "params": {"color": "#ff0000"}}]})),
+        ("get_state", json!({})),
+        ("doc_inspect", json!({})),
+        ("render_preview", json!({"max_side": 16})),
+        ("render_frame", json!({"max_side": 16, "inline": false, "path": png})),
+        ("undo", json!({})),
+        ("redo", json!({})),
+        ("history", json!({})),
+        ("save_project", json!({"path": path})),
+        ("command_list", json!({"filter": "comp.new"})),
+    ];
+    for (name, args) in calls {
+        let r = rpc(&mut s, 3, "tools/call", json!({"name": name, "arguments": args}));
+        let sc = &r["structuredContent"];
+        assert!(sc.is_object(), "{name}: {r}");
+        if r["content"][0]["type"] == "text" {
+            let text: Value = serde_json::from_str(r["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert!(sc == &text || sc["items"] == text, "{name}: structuredContent mirrors the text");
+        }
+        if name != "command_list" && name != "command_run" {
+            validate(&schema(name), sc, name).unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
+    }
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(png);
+}

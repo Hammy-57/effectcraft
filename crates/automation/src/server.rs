@@ -23,14 +23,25 @@ const INVALID_PARAMS: i64 = -32602;
 const INTERNAL_ERROR: i64 = -32603;
 const RESOURCE_NOT_FOUND: i64 = -32002;
 
+/// The first revision with `structuredContent`, `outputSchema` and `title`.
+const STRUCTURED_SINCE: &str = "2025-06-18";
+
 pub struct McpServer {
     backend: Backend,
     autosave: Option<AutoSave>,
+    /// The protocol revision `initialize` negotiated (`None` before it).
+    version: Option<&'static str>,
 }
 
 impl McpServer {
     pub fn new(backend: Backend) -> Self {
-        Self { backend, autosave: None }
+        Self { backend, autosave: None, version: None }
+    }
+
+    /// Whether replies to this request may use 2025-06-18 fields (`structuredContent`,
+    /// `outputSchema`, `title`): the session negotiated it, or the request declares a modern revision.
+    fn structured(&self, params: &Value) -> bool {
+        is_modern(params) || self.version.is_some_and(|v| v >= STRUCTURED_SINCE)
     }
 
     /// Opt in to durable headless checkpoints in a separate folder per server.
@@ -159,7 +170,9 @@ impl McpServer {
         match method {
             "initialize" => {
                 let asked = params.get("protocolVersion").and_then(Value::as_str).unwrap_or("");
-                let version = PROTOCOL_VERSIONS.iter().find(|v| **v == asked).copied().unwrap_or(PROTOCOL_VERSIONS.first().copied().unwrap_or("2025-06-18"));
+                let version =
+                    PROTOCOL_VERSIONS.iter().find(|v| **v == asked).copied().unwrap_or(PROTOCOL_VERSIONS.first().copied().unwrap_or(STRUCTURED_SINCE));
+                self.version = Some(version);
                 let mode = if self.backend.is_bridge() { "bridge" } else { "headless" };
                 let instructions = if self.autosave.is_some() {
                     format!("{INSTRUCTIONS} Headless auto-save and recovery: {}", self.autosave_info())
@@ -176,7 +189,18 @@ impl McpServer {
             }
             "ping" => Ok(json!({})),
             "tools/list" => {
-                let tools: Vec<Value> = tools::available(self.backend.is_bridge()).map(|t| t.descriptor()).collect();
+                let structured = self.structured(params);
+                let tools: Vec<Value> = tools::available(self.backend.is_bridge())
+                    .map(|t| {
+                        let mut d = t.descriptor();
+                        if let Some(schema) = tools::output_schema(t.name).filter(|_| structured)
+                            && let Some(o) = d.as_object_mut()
+                        {
+                            o.insert("outputSchema".into(), schema);
+                        }
+                        d
+                    })
+                    .collect();
                 Ok(json!({"tools": tools}))
             }
             "tools/call" => {
@@ -189,11 +213,26 @@ impl McpServer {
                 if let Some(m) = tools::find(name).and_then(|t| t.unknown_arg(&args)) {
                     return Err((INVALID_PARAMS, m));
                 }
-                let mut result = call_result(self.guarded(name, &args));
+                let mut reply = self.guarded(name, &args);
                 // Also checkpoint a partially successful tool that returned an error. The
                 // project is durable before the client receives its reply (even if it kills
                 // the process immediately afterwards).
-                if let Err(e) = self.checkpoint(false) {
+                let saved = self.checkpoint(false);
+                if self.autosave.is_some()
+                    && let Ok(Reply::Json(v)) = &mut reply
+                {
+                    let info = self.autosave_info();
+                    let target = match name {
+                        "get_project" => v.as_object_mut(),
+                        "doc_inspect" => v.get_mut("project").and_then(Value::as_object_mut),
+                        _ => None,
+                    };
+                    if let Some(o) = target {
+                        o.insert("autosave".into(), info);
+                    }
+                }
+                let mut result = call_result_with(reply, self.structured(params));
+                if let Err(e) = saved {
                     let _ = writeln!(std::io::stderr(), "{e}");
                     if let Some(content) = result.get_mut("content").and_then(Value::as_array_mut) {
                         content.push(json!({"type": "text", "text": format!("Warning: {e}. Use save_project with a writable path before disconnecting.")}));
@@ -206,16 +245,6 @@ impl McpServer {
                     if let Some(meta) = meta.as_object_mut() {
                         meta.insert("effectcraftAutoSave".into(), self.autosave_info());
                     }
-                }
-                if self.autosave.is_some()
-                    && name == "get_project"
-                    && result["isError"] == false
-                    && let Some(text) = result.get_mut("content").and_then(Value::as_array_mut).and_then(|c| c.first_mut()).and_then(|c| c.get_mut("text"))
-                    && let Some(summary) = text.as_str().and_then(|t| serde_json::from_str::<Value>(t).ok())
-                {
-                    let mut summary = summary;
-                    summary["autosave"] = self.autosave_info();
-                    *text = Value::String(summary.to_string());
                 }
                 Ok(result)
             }
@@ -245,19 +274,35 @@ impl McpServer {
 
 /// A `tools/call` result: tool failures are reported in-band (`isError`) so the model can react.
 pub fn call_result(r: Result<Reply, Error>) -> Value {
-    match r {
+    call_result_with(r, false)
+}
+
+/// [`call_result`]; `structured` (MCP 2025-06-18+) also returns the JSON as `structuredContent`
+/// (an image's metadata for image replies), keeping the text content for older clients.
+pub fn call_result_with(r: Result<Reply, Error>, structured: bool) -> Value {
+    let (mut result, data) = match r {
         Ok(Reply::Json(v)) => {
-            json!({"content": [{"type": "text", "text": v.to_string()}], "isError": v.get("failed").and_then(Value::as_u64).is_some_and(|n| n > 0)})
+            let failed = v.get("failed").and_then(Value::as_u64).is_some_and(|n| n > 0);
+            (json!({"content": [{"type": "text", "text": v.to_string()}], "isError": failed}), Some(v))
         }
-        Ok(Reply::Image { png, info }) => json!({
-            "content": [
-                {"type": "image", "data": base64::encode(&png), "mimeType": "image/png"},
-                {"type": "text", "text": info.to_string()},
-            ],
-            "isError": false,
-        }),
-        Err(e) => json!({"content": [{"type": "text", "text": e.to_string()}], "isError": true}),
+        Ok(Reply::Image { png, info }) => (
+            json!({
+                "content": [
+                    {"type": "image", "data": base64::encode(&png), "mimeType": "image/png"},
+                    {"type": "text", "text": info.to_string()},
+                ],
+                "isError": false,
+            }),
+            Some(info),
+        ),
+        Err(e) => (json!({"content": [{"type": "text", "text": e.to_string()}], "isError": true}), None),
+    };
+    if let Some(v) = data.filter(|_| structured)
+        && let Some(o) = result.as_object_mut()
+    {
+        o.insert("structuredContent".into(), tools::structured(v));
     }
+    result
 }
 
 impl McpServer {
