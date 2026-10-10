@@ -246,7 +246,7 @@ fn comp_content_with(project: &Project, comp: ItemId, addr: impl Fn(ItemId, &Arc
         })
     }
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    format!("{:?}", project.settings).hash(&mut h);
+    hash_debug(&mut h, &project.settings);
     let mut seen = BTreeSet::new();
     let mut stack = vec![comp];
     let mut expressions = false;
@@ -272,12 +272,27 @@ fn comp_content_with(project: &Project, comp: ItemId, addr: impl Fn(ItemId, &Arc
         }
         match &it.kind {
             ItemKind::Comp(c) => (addr(id, c) as usize).hash(&mut h),
-            k => format!("{k:?}").hash(&mut h),
+            k => hash_debug(&mut h, k),
         }
-        format!("{:?}", it.proxy).hash(&mut h);
+        hash_debug(&mut h, &it.proxy);
     }
     comp.0.hash(&mut h);
     h.finish()
+}
+
+/// Hash `v`'s `Debug` text and a terminator, streamed (no intermediate `String`: footage of a
+/// long image sequence formats every frame's path).
+fn hash_debug(h: &mut impl std::hash::Hasher, v: &impl std::fmt::Debug) {
+    struct W<'a, H: std::hash::Hasher>(&'a mut H);
+    impl<H: std::hash::Hasher> std::fmt::Write for W<'_, H> {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            self.0.write(s.as_bytes());
+            Ok(())
+        }
+    }
+    use std::fmt::Write;
+    let _ = write!(W(h), "{v:?}");
+    h.write_u8(0xff);
 }
 
 /// Hash of render options (part of [`FrameKey`] and of the disk key).

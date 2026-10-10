@@ -1701,6 +1701,14 @@ impl eframe::App for EffectcraftApp {
             self.fps = self.fps * 0.9 + (1.0 / dt).min(480.0) * 0.1;
         }
         self.last_time = now;
+        // Back in the app (footage may have been edited elsewhere): the disk cache's keys stat
+        // footage files again.
+        let focused = ctx.input(|i| i.focused);
+        let focus_id = egui::Id::new("app-was-focused");
+        if focused && !ctx.data(|d| d.get_temp::<bool>(focus_id)).unwrap_or(true) {
+            effectcraft_engine::render::disk_cache::refresh_file_stamps();
+        }
+        ctx.data_mut(|d| d.insert_temp(focus_id, focused));
         self.drain_control(ctx);
         self.publish_control_events(ctx);
         if !self.synthetic.is_empty() || float_windows::input_pending(ctx) {

@@ -110,6 +110,8 @@ fn footage_changes_change_the_salt() {
     .unwrap();
     let a = effectcraft_render::disk_cache::footage_salt(&s.project);
     std::fs::write(&foot, b"two, longer").unwrap();
+    // File stamps are cached until a refresh (focus, Reload Footage) or a short timeout.
+    effectcraft_render::disk_cache::refresh_file_stamps();
     let b = effectcraft_render::disk_cache::footage_salt(&s.project);
     assert_ne!(a, b);
     let cid = project(&mut s);
