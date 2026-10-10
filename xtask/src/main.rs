@@ -16,8 +16,11 @@
 //!   REV (default: the merge-base with `main`) can affect; see `affected.rs` and docs/testing.md.
 //! - `agents <status|claim|release|gc>`: worktrees, target dirs and claims of parallel agents
 //!   (`agents.rs`).
+//! - `agent-exam <--list|--validate|--check P --task T|--run …>`: the agent exam (`evals/agent/`,
+//!   `agent_exam.rs`): motion-design tasks an AI agent performs over MCP, scored by `exam.check`.
 
 mod affected;
+mod agent_exam;
 mod agents;
 mod fmt;
 mod ico;
@@ -435,6 +438,7 @@ fn main() -> ExitCode {
         }
         "fmt" => fmt::run(&std::env::args().skip(2).collect::<Vec<_>>()),
         "agents" => agents::run(&std::env::args().skip(2).collect::<Vec<_>>()),
+        "agent-exam" => agent_exam::run(&root(), &std::env::args().skip(2).collect::<Vec<_>>()),
         "web" => web(&std::env::args().skip(2).collect::<Vec<_>>()),
         "ico" => {
             let rest: Vec<String> = std::env::args().skip(2).collect();
@@ -444,7 +448,7 @@ fn main() -> ExitCode {
             let rest: Vec<String> = std::env::args().skip(2).collect();
             version::run(&root(), &rest.iter().map(String::as_str).collect::<Vec<_>>())
         }
-        _ => Err("usage: cargo xtask <layers|assets|wasm|web [--dev] [--serve PORT]|ico OUT.ico IN.png…|version [set X.Y.Z]|fmt [--check]|ci [--affected [--base REV] [--dry-run]]|agents <status|claim|release|gc>>".into()),
+        _ => Err("usage: cargo xtask <layers|assets|wasm|web [--dev] [--serve PORT]|ico OUT.ico IN.png…|version [set X.Y.Z]|fmt [--check]|ci [--affected [--base REV] [--dry-run]]|agents <status|claim|release|gc>|agent-exam <--list|--validate|--check P.ecproj --task T|--run [--tasks a,b] [--out DIR] [--minutes N] [--max-tool-calls N] [--model M]>>".into()),
     };
     match r {
         Ok(()) => ExitCode::SUCCESS,

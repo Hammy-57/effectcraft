@@ -1,0 +1,66 @@
+{
+  "id": "wiggle-expression",
+  "title": "Wiggle with an expression",
+  "prompt": "In the comp \"Main\", add an expression to the Position of the solid \"Logo\" that wiggles it 2 times per second with an amplitude of 30 px (use the wiggle expression).",
+  "setup": [
+    {
+      "command": "comp.new",
+      "params": {
+        "name": "Main",
+        "width": 1920,
+        "height": 1080,
+        "frameRate": 30,
+        "duration": 5
+      }
+    },
+    {
+      "command": "layer.newSolid",
+      "params": {
+        "name": "Logo",
+        "color": "#FFFFFF",
+        "width": 200,
+        "height": 200
+      }
+    }
+  ],
+  "limits": {
+    "minutes": 5,
+    "toolCalls": 15
+  },
+  "checks": [
+    {
+      "id": "expr",
+      "desc": "Position has a wiggle(2, 30) expression",
+      "prop": {
+        "comp": "Main",
+        "layer": "Logo",
+        "path": "transform/position",
+        "field": "expression"
+      },
+      "op": "matches",
+      "value": "*wiggle(*2*,*30*)*"
+    },
+    {
+      "id": "no-error",
+      "desc": "the expression has no error",
+      "prop": {
+        "comp": "Main",
+        "layer": "Logo",
+        "path": "transform/position",
+        "field": "expressionError"
+      },
+      "op": "absent",
+      "value": null
+    }
+  ],
+  "solution": [
+    {
+      "command": "prop.setExpression",
+      "params": {
+        "layer": "Logo",
+        "path": "transform/position",
+        "expression": "wiggle(2, 30)"
+      }
+    }
+  ]
+}

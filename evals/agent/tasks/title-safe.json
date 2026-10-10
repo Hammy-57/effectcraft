@@ -1,0 +1,151 @@
+{
+  "id": "title-safe",
+  "title": "Bring a title into the safe area",
+  "prompt": "In the comp \"Main\" (1920×1080), the text layer \"Title\" sticks out of the frame. Move it (you may also scale it) so the whole title is inside the title-safe area and centred horizontally (its centre within 10 px of x = 960). The title-safe area is the frame inset by 10% on each side (x 192–1728, y 108–972 in a 1920×1080 comp). Don't change the text.",
+  "setup": [
+    {
+      "command": "comp.new",
+      "params": {
+        "name": "Main",
+        "width": 1920,
+        "height": 1080,
+        "frameRate": 30,
+        "duration": 5
+      }
+    },
+    {
+      "command": "layer.newText",
+      "params": {
+        "text": "SUMMER SALE",
+        "size": 140,
+        "position": [
+          1500,
+          110
+        ],
+        "fill": "#FFFFFF",
+        "name": "Title"
+      }
+    }
+  ],
+  "limits": {
+    "minutes": 5,
+    "toolCalls": 20
+  },
+  "checks": [
+    {
+      "id": "text",
+      "desc": "the text is unchanged",
+      "prop": {
+        "comp": "Main",
+        "layer": "Title",
+        "path": "text/sourceText"
+      },
+      "op": "eq",
+      "value": "SUMMER SALE"
+    },
+    {
+      "id": "safe",
+      "desc": "Title inside title-safe",
+      "query": "layer.bounds",
+      "params": {
+        "comp": "Main",
+        "layers": [
+          "Title"
+        ]
+      },
+      "expect": [
+        {
+          "path": "/layers",
+          "op": "len",
+          "value": 1
+        },
+        {
+          "path": "/layers",
+          "op": "all",
+          "value": [
+            {
+              "path": "/visible",
+              "op": "eq",
+              "value": true
+            },
+            {
+              "path": "/corners",
+              "op": "all",
+              "value": [
+                {
+                  "path": "/0",
+                  "op": "gte",
+                  "value": 192
+                },
+                {
+                  "path": "/0",
+                  "op": "lte",
+                  "value": 1728
+                },
+                {
+                  "path": "/1",
+                  "op": "gte",
+                  "value": 108
+                },
+                {
+                  "path": "/1",
+                  "op": "lte",
+                  "value": 972
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "centred",
+      "desc": "Title centred horizontally",
+      "query": "layer.bounds",
+      "params": {
+        "comp": "Main",
+        "layers": [
+          "Title"
+        ]
+      },
+      "select": {
+        "array": "/layers",
+        "index": 0
+      },
+      "expect": [
+        {
+          "path": "/center/0",
+          "op": "approx",
+          "value": 960,
+          "tol": 10
+        }
+      ]
+    },
+    {
+      "id": "clean",
+      "desc": "no safe-area or cut-off problems",
+      "lint": {
+        "comp": "Main",
+        "rules": [
+          "outside-title-safe",
+          "outside-action-safe",
+          "cut-off"
+        ]
+      }
+    }
+  ],
+  "solution": [
+    {
+      "command": "prop.set",
+      "params": {
+        "layer": "Title",
+        "path": "transform/position",
+        "value": [
+          960,
+          540,
+          0
+        ]
+      }
+    }
+  ]
+}

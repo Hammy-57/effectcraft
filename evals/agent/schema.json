@@ -1,0 +1,142 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/storytold/effectcraft/evals/agent/schema.json",
+  "title": "EffectCraft agent exam task",
+  "description": "One task of the agent exam (evals/agent/README.md). Checks are run by the engine command exam.check.",
+  "type": "object",
+  "required": ["id", "title", "prompt", "limits", "checks"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {"type": "string"},
+    "id": {"type": "string", "pattern": "^[a-z0-9-]+$", "description": "Also the file name (<id>.json)."},
+    "title": {"type": "string", "minLength": 1},
+    "prompt": {"type": "string", "minLength": 1, "description": "What the agent is told: plain English, self-contained, naming every comp and layer the checks read."},
+    "setup": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/steps"}], "description": "Engine commands run in a fresh empty session to build the starting project."},
+    "project": {"type": "string", "description": "Instead of setup: a .ecproj path relative to the task file."},
+    "reference": {"type": "string", "description": "Optional media for compare checks; generated or own media only, with how it is produced."},
+    "limits": {
+      "type": "object",
+      "required": ["minutes", "toolCalls"],
+      "additionalProperties": false,
+      "properties": {
+        "minutes": {"type": "number", "exclusiveMinimum": 0},
+        "toolCalls": {"type": "integer", "minimum": 1}
+      }
+    },
+    "checks": {"type": "array", "minItems": 1, "maxItems": 200, "items": {"$ref": "#/$defs/check"}},
+    "solution": {"$ref": "#/$defs/steps", "description": "Reference solution (never shown to the agent); the engine tests prove it passes every check."}
+  },
+  "not": {"required": ["setup", "project"]},
+  "$defs": {
+    "steps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["command"],
+        "additionalProperties": false,
+        "properties": {"command": {"type": "string", "minLength": 1}, "params": {"type": "object"}}
+      }
+    },
+    "op": {"enum": ["eq", "ne", "approx", "gt", "gte", "lt", "lte", "contains", "matches", "exists", "absent", "len", "lenGte", "lenLte", "in", "notIn", "any", "all", "none"]},
+    "pointer": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}, "minItems": 1}]},
+    "select": {
+      "oneOf": [
+        {"$ref": "#/$defs/selectStep"},
+        {"type": "array", "maxItems": 8, "items": {"$ref": "#/$defs/selectStep"}}
+      ]
+    },
+    "selectStep": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {"array": {"type": "string"}, "where": {"type": "object"}, "index": {"type": "integer", "minimum": 0}}
+    },
+    "expectation": {
+      "type": "object",
+      "required": ["op"],
+      "additionalProperties": false,
+      "properties": {
+        "path": {"$ref": "#/$defs/pointer"},
+        "op": {"$ref": "#/$defs/op"},
+        "value": {},
+        "tol": {"type": "number", "minimum": 0},
+        "length": {"type": "boolean"},
+        "select": {"$ref": "#/$defs/select"}
+      }
+    },
+    "check": {
+      "type": "object",
+      "required": ["id"],
+      "properties": {
+        "id": {"type": "string"},
+        "desc": {"type": "string"}
+      },
+      "oneOf": [
+        {
+          "required": ["query", "expect"],
+          "properties": {
+            "query": {"type": "string"},
+            "params": {"type": "object"},
+            "select": {"$ref": "#/$defs/select"},
+            "expect": {"type": "array", "minItems": 1, "maxItems": 64, "items": {"$ref": "#/$defs/expectation"}},
+            "show": {"type": "string"}
+          }
+        },
+        {
+          "required": ["prop", "op"],
+          "properties": {
+            "prop": {
+              "type": "object",
+              "required": ["layer", "path"],
+              "properties": {"comp": {}, "layer": {}, "path": {"type": "string"}, "time": {"type": "number"}, "field": {"type": "string"}}
+            },
+            "op": {"$ref": "#/$defs/op"}, "value": {}, "tol": {"type": "number"}
+          }
+        },
+        {"required": ["layerCount", "op", "value"], "properties": {"layerCount": {"type": "object"}, "op": {"$ref": "#/$defs/op"}}},
+        {
+          "required": ["comp"],
+          "properties": {
+            "comp": {"type": "object", "required": ["name"]},
+            "width": {"type": "integer"}, "height": {"type": "integer"}, "fps": {"type": "number"}, "duration": {"type": "number"}, "tol": {"type": "number"}
+          }
+        },
+        {
+          "required": ["lint"],
+          "properties": {"lint": {"type": "object"}, "maxSeverity": {"enum": ["info", "warning", "none"]}, "allow": {"type": "array", "items": {"type": "string"}}}
+        },
+        {
+          "required": ["motion", "layer", "segment"],
+          "properties": {
+            "motion": {"type": "object"},
+            "layer": {},
+            "segment": {"oneOf": [{"$ref": "#/$defs/segment"}, {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/segment"}}]}
+          }
+        },
+        {
+          "required": ["compare"],
+          "properties": {
+            "compare": {
+              "type": "object",
+              "required": ["reference"],
+              "additionalProperties": false,
+              "properties": {"reference": {"type": "string"}, "comp": {}, "time": {"type": "number"}, "threshold": {"type": "number"}, "minPsnr": {"type": "number"}, "maxSide": {"type": "integer"}, "maxChangedPct": {"type": "number"}}
+            }
+          }
+        }
+      ]
+    },
+    "segment": {
+      "type": "object",
+      "required": ["kind"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {"enum": ["enter", "exit", "move", "hold", "scale", "rotate", "fade-in", "fade-out"]},
+        "edge": {"type": "string"},
+        "direction": {"type": "string"},
+        "startApprox": {"type": "number"},
+        "endApprox": {"type": "number"},
+        "tol": {"type": "number", "minimum": 0}
+      }
+    }
+  }
+}

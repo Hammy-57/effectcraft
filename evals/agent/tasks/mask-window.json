@@ -1,0 +1,95 @@
+{
+  "id": "mask-window",
+  "title": "Mask a window",
+  "prompt": "In the comp \"Main\" (1920×1080), add a mask to the full-frame solid \"Photo\" so that only a centred 800×600 rectangle of it stays visible (x 560–1360, y 240–840). Don't add layers.",
+  "setup": [
+    {
+      "command": "comp.new",
+      "params": {
+        "name": "Main",
+        "width": 1920,
+        "height": 1080,
+        "frameRate": 30,
+        "duration": 5
+      }
+    },
+    {
+      "command": "layer.newSolid",
+      "params": {
+        "name": "Photo",
+        "color": "#3366CC"
+      }
+    }
+  ],
+  "limits": {
+    "minutes": 5,
+    "toolCalls": 20
+  },
+  "checks": [
+    {
+      "id": "window",
+      "desc": "Photo's visible pixels are the 800 × 600 window",
+      "query": "layer.bounds",
+      "params": {
+        "comp": "Main",
+        "layers": [
+          "Photo"
+        ],
+        "pixels": true
+      },
+      "select": {
+        "array": "/layers",
+        "index": 0
+      },
+      "expect": [
+        {
+          "path": "/pixelBounds",
+          "op": "approx",
+          "value": [
+            560,
+            240,
+            800,
+            600
+          ],
+          "tol": 3
+        }
+      ]
+    },
+    {
+      "layerCount": {
+        "comp": "Main"
+      },
+      "id": "count",
+      "desc": "one layer",
+      "op": "eq",
+      "value": 1
+    }
+  ],
+  "solution": [
+    {
+      "command": "mask.new",
+      "params": {
+        "layer": "Photo",
+        "vertices": [
+          [
+            560,
+            240
+          ],
+          [
+            1360,
+            240
+          ],
+          [
+            1360,
+            840
+          ],
+          [
+            560,
+            840
+          ]
+        ],
+        "closed": true
+      }
+    }
+  ]
+}

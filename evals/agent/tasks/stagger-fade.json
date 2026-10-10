@@ -1,0 +1,209 @@
+{
+  "id": "stagger-fade",
+  "title": "Staggered fade-in",
+  "prompt": "In the comp \"Main\" (30 fps, 3 s), fade in the text layers \"Item 1\", \"Item 2\" and \"Item 3\" one after another: each goes from 0% to 100% opacity over 0.5 s, Item 1 from 0 to 0.5 s, Item 2 from 0.2 to 0.7 s and Item 3 from 0.4 to 0.9 s. They stay fully visible afterwards.",
+  "setup": [
+    {
+      "command": "comp.new",
+      "params": {
+        "name": "Main",
+        "width": 1920,
+        "height": 1080,
+        "frameRate": 30,
+        "duration": 3
+      }
+    },
+    {
+      "command": "layer.newText",
+      "params": {
+        "text": "One",
+        "size": 90,
+        "position": [
+          960,
+          400
+        ],
+        "fill": "#FFFFFF",
+        "name": "Item 1"
+      }
+    },
+    {
+      "command": "layer.newText",
+      "params": {
+        "text": "Two",
+        "size": 90,
+        "position": [
+          960,
+          540
+        ],
+        "fill": "#FFFFFF",
+        "name": "Item 2"
+      }
+    },
+    {
+      "command": "layer.newText",
+      "params": {
+        "text": "Three",
+        "size": 90,
+        "position": [
+          960,
+          680
+        ],
+        "fill": "#FFFFFF",
+        "name": "Item 3"
+      }
+    }
+  ],
+  "limits": {
+    "minutes": 8,
+    "toolCalls": 30
+  },
+  "checks": [
+    {
+      "id": "item1-start",
+      "desc": "Item 1 invisible at 0.0 s",
+      "prop": {
+        "comp": "Main",
+        "layer": "Item 1",
+        "path": "transform/opacity",
+        "time": 0.0
+      },
+      "op": "approx",
+      "value": 0,
+      "tol": 1
+    },
+    {
+      "id": "item1-end",
+      "desc": "Item 1 opaque at 0.5 s",
+      "prop": {
+        "comp": "Main",
+        "layer": "Item 1",
+        "path": "transform/opacity",
+        "time": 0.5
+      },
+      "op": "approx",
+      "value": 100,
+      "tol": 1
+    },
+    {
+      "id": "item2-start",
+      "desc": "Item 2 invisible at 0.2 s",
+      "prop": {
+        "comp": "Main",
+        "layer": "Item 2",
+        "path": "transform/opacity",
+        "time": 0.2
+      },
+      "op": "approx",
+      "value": 0,
+      "tol": 1
+    },
+    {
+      "id": "item2-end",
+      "desc": "Item 2 opaque at 0.7 s",
+      "prop": {
+        "comp": "Main",
+        "layer": "Item 2",
+        "path": "transform/opacity",
+        "time": 0.7
+      },
+      "op": "approx",
+      "value": 100,
+      "tol": 1
+    },
+    {
+      "id": "item3-start",
+      "desc": "Item 3 invisible at 0.4 s",
+      "prop": {
+        "comp": "Main",
+        "layer": "Item 3",
+        "path": "transform/opacity",
+        "time": 0.4
+      },
+      "op": "approx",
+      "value": 0,
+      "tol": 1
+    },
+    {
+      "id": "item3-end",
+      "desc": "Item 3 opaque at 0.9 s",
+      "prop": {
+        "comp": "Main",
+        "layer": "Item 3",
+        "path": "transform/opacity",
+        "time": 0.9
+      },
+      "op": "approx",
+      "value": 100,
+      "tol": 1
+    },
+    {
+      "id": "item3-waits",
+      "desc": "Item 3 still invisible at 0.3 s",
+      "prop": {
+        "comp": "Main",
+        "layer": "Item 3",
+        "path": "transform/opacity",
+        "time": 0.3
+      },
+      "op": "approx",
+      "value": 0,
+      "tol": 1
+    }
+  ],
+  "solution": [
+    {
+      "command": "prop.addKey",
+      "params": {
+        "layer": "Item 1",
+        "path": "transform/opacity",
+        "time": 0.0,
+        "value": 0
+      }
+    },
+    {
+      "command": "prop.addKey",
+      "params": {
+        "layer": "Item 1",
+        "path": "transform/opacity",
+        "time": 0.5,
+        "value": 100
+      }
+    },
+    {
+      "command": "prop.addKey",
+      "params": {
+        "layer": "Item 2",
+        "path": "transform/opacity",
+        "time": 0.2,
+        "value": 0
+      }
+    },
+    {
+      "command": "prop.addKey",
+      "params": {
+        "layer": "Item 2",
+        "path": "transform/opacity",
+        "time": 0.7,
+        "value": 100
+      }
+    },
+    {
+      "command": "prop.addKey",
+      "params": {
+        "layer": "Item 3",
+        "path": "transform/opacity",
+        "time": 0.4,
+        "value": 0
+      }
+    },
+    {
+      "command": "prop.addKey",
+      "params": {
+        "layer": "Item 3",
+        "path": "transform/opacity",
+        "time": 0.9,
+        "value": 100
+      }
+    }
+  ]
+}
