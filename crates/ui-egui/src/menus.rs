@@ -140,6 +140,8 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     uic!("window.closePanelGroup", "Close Panel Group", [], None),
     uic!("window.floatPanelGroup", "Undock Panel Group", [], None),
     uic!("window.stackPanelGroup", "Stacked Panel Group", [], None),
+    uic!("window.soloPanels", "Solo Panels in Stack", [], None),
+    uic!("window.smallTabs", "Small Tabs", [], None),
     uic!("window.panelMenu", "Panel Menu", [], None),
     uic!("project.column", "Show/Hide Project Column", [], None),
 ];

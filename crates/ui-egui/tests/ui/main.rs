@@ -93,6 +93,8 @@ mod ui_script_console;
 mod ui_scriptui;
 #[path = "../ui_scrolling.rs"]
 mod ui_scrolling;
+#[path = "../ui_solo_small_tabs.rs"]
+mod ui_solo_small_tabs;
 #[path = "../ui_source_icons.rs"]
 mod ui_source_icons;
 #[path = "../ui_tabs.rs"]
