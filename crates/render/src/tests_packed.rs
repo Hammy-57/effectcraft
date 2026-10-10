@@ -32,6 +32,13 @@ fn buf(img: Image) -> Buf {
     Buf { img, offset: [-3.5, 12.25], scale: 0.5 }
 }
 
+/// Insert `b` as a buffer rendered a second time (admitted to the cache proper, not on
+/// probation: see `cache.rs`).
+fn keep(cache: &LayerCache, key: u64, b: Arc<Buf>) {
+    cache.insert(key, b.clone());
+    cache.insert(key, b);
+}
+
 fn bits(b: &Buf) -> Vec<[u32; 4]> {
     b.img.data.iter().map(|p| p.map(f32::to_bits)).collect()
 }
@@ -74,7 +81,7 @@ fn cache_packs_under_pressure_and_counts_packed_bytes() {
         crate::color::quantize(&mut img, 255.0);
         let b = Arc::new(buf(img));
         kept.push(bits(&b));
-        cache.insert(i, b);
+        keep(&cache, i, b);
     }
     let st = cache.stats();
     assert_eq!(st.entries, 6, "nothing evicted");
@@ -94,7 +101,7 @@ fn cache_packs_under_pressure_and_counts_packed_bytes() {
     let cache = LayerCache::new(4 * f32_bytes);
     let bufs: Vec<_> = (0..6u64).map(|i| Arc::new(buf(noise(64, 64, 100 + i as u32)))).collect();
     for (i, b) in bufs.iter().enumerate() {
-        cache.insert(i as u64, b.clone());
+        keep(&cache, i as u64, b.clone());
     }
     let st = cache.stats();
     assert_eq!(st.bytes, st.entries * f32_bytes);

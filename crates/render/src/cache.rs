@@ -26,8 +26,17 @@
 //!
 //! Concurrent misses on one key (parallel frames reaching the same static layer) render it once:
 //! the first claims the key ([`LayerCache::claim`]) and the others wait for its buffer.
+//!
+//! **Admission.** Most of what an animated comp renders is used once (a layer whose effect
+//! animates has a new key every frame), and keeping it would fill the budget with buffers that
+//! never hit. So a buffer whose key was never rendered before goes on probation: a small window
+//! ([`LayerCache::window`], first in first out) that holds the most recent first renders. A hit
+//! there (the next frame of a static layer, a precomp used again in the same frame, a waiter of
+//! the in-flight render) admits it to the cache proper. A key rendered again after its probation
+//! entry left the window (a busy frame flushed it, a RAM-preview loop came round) is remembered
+//! by a bounded doorkeeper of recently rendered keys and admitted straight away.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, PoisonError, RwLock, Weak};
 
@@ -61,6 +70,9 @@ struct Entry {
     last_use: u64,
     /// [`PackedBuf::pack`] declined this buffer (not on an integer grid): don't try again.
     unpackable: bool,
+    /// A first render on probation (see the module docs): admitted on its first hit, dropped
+    /// first in first out when the probation window is full.
+    probation: bool,
 }
 
 /// How an entry keeps its pixels. Entries go in as `f32` buffers (a hit shares the `Arc`, and
@@ -83,6 +95,42 @@ struct Inner {
     inserts: u64,
     /// When each recent miss happened (to time the render that follows it).
     missed_at: HashMap<u64, web_time::Instant>,
+    /// Bytes of the entries on probation (part of `bytes`).
+    probation_bytes: usize,
+    /// Keys rendered recently (admission, see the module docs).
+    seen: Doorkeeper,
+}
+
+/// Keys per doorkeeper generation: two generations are kept, so the last 16–32k rendered keys
+/// are remembered (a few hundred KB).
+const DOOR_GEN: usize = 16 * 1024;
+
+/// A bounded set of recently rendered keys: two generations, the older dropped when the newer
+/// fills (a cheap approximation of least recently seen).
+#[derive(Default)]
+struct Doorkeeper {
+    cur: HashSet<u64>,
+    old: HashSet<u64>,
+}
+
+impl Doorkeeper {
+    /// Note a render of `key`; whether it was rendered before.
+    fn saw(&mut self, key: u64) -> bool {
+        if self.cur.contains(&key) {
+            return true;
+        }
+        let before = self.old.contains(&key);
+        if self.cur.len() >= DOOR_GEN {
+            self.old = std::mem::take(&mut self.cur);
+        }
+        self.cur.insert(key);
+        before
+    }
+
+    fn clear(&mut self) {
+        self.cur.clear();
+        self.old.clear();
+    }
 }
 
 /// Hit/miss counters and memory use (for perf readouts and tests).
@@ -104,7 +152,18 @@ impl LayerCache {
     /// A cache holding at most `budget` bytes of pixels.
     pub fn new(budget: usize) -> LayerCache {
         LayerCache {
-            inner: Mutex::new(Inner { map: HashMap::new(), bytes: 0, budget, clock: 0, hits: 0, misses: 0, inserts: 0, missed_at: HashMap::new() }),
+            inner: Mutex::new(Inner {
+                map: HashMap::new(),
+                bytes: 0,
+                budget,
+                clock: 0,
+                hits: 0,
+                misses: 0,
+                inserts: 0,
+                missed_at: HashMap::new(),
+                probation_bytes: 0,
+                seen: Doorkeeper::default(),
+            }),
             disk: Mutex::new(None),
             store: Mutex::new(None),
             gate: Mutex::new(None),
@@ -191,7 +250,8 @@ impl LayerCache {
         // Disk cache: a hit comes back into memory.
         let (dc, dk) = self.disk_key(key)?;
         let buf = dc.get_layer(dk)?;
-        self.insert_mem(key, buf.clone());
+        // (Stored on disk: it was worth keeping.)
+        self.insert_mem(key, buf.clone(), true);
         Some(buf)
     }
 
@@ -207,6 +267,11 @@ impl LayerCache {
             Stored::Full(b) => Ok(b.clone()),
             Stored::Packed(p) => Err(p.clone()),
         };
+        // Used again: admitted.
+        let admitted = std::mem::take(&mut e.probation).then_some(e.bytes);
+        if let Some(b) = admitted {
+            g.probation_bytes = g.probation_bytes.saturating_sub(b);
+        }
         g.hits += 1;
         drop(g);
         Some(match stored {
@@ -219,17 +284,22 @@ impl LayerCache {
         if self.gated() {
             return;
         }
-        let started = self.inner.lock().ok().and_then(|mut g| g.missed_at.remove(&key));
+        let (started, again) = match self.inner.lock() {
+            Ok(mut g) => (g.missed_at.remove(&key), g.seen.saw(key)),
+            Err(_) => return,
+        };
         if let Some((dc, dk)) = self.disk_key(key) {
             let slow = started.is_some_and(|t| t.elapsed().as_secs_f64() * 1e3 >= dc.min_layer_ms() as f64);
             if slow {
                 dc.put_layer(dk, &buf);
             }
         }
-        self.insert_mem(key, buf);
+        self.insert_mem(key, buf, again);
     }
 
-    fn insert_mem(&self, key: u64, buf: Arc<Buf>) {
+    /// Keep `buf` under `key`: in the cache proper when `admit`, else on probation (see the
+    /// module docs).
+    fn insert_mem(&self, key: u64, buf: Arc<Buf>, admit: bool) {
         let bytes = buf.img.data.len() * std::mem::size_of::<effectcraft_raster::Px>();
         {
             let Ok(mut g) = self.inner.lock() else { return };
@@ -239,12 +309,27 @@ impl LayerCache {
             g.clock += 1;
             g.inserts += 1;
             let now = g.clock;
-            if let Some(old) = g.map.insert(key, Entry { buf: Stored::Full(buf), bytes, last_use: now, unpackable: false }) {
+            // An entry already admitted stays admitted.
+            let probation = !admit && g.map.get(&key).is_none_or(|e| e.probation);
+            if let Some(old) = g.map.insert(key, Entry { buf: Stored::Full(buf), bytes, last_use: now, unpackable: false, probation }) {
                 g.bytes -= old.bytes;
+                if old.probation {
+                    g.probation_bytes = g.probation_bytes.saturating_sub(old.bytes);
+                }
             }
             g.bytes += bytes;
+            if probation {
+                g.probation_bytes += bytes;
+                trim_probation(&mut g, key);
+            }
         }
         self.relieve();
+    }
+
+    /// Bytes of first renders kept on probation, at most (the newest is kept whatever its size,
+    /// so a big precomp used twice in a row still hits): 1/16 of the budget, at most 128 MB.
+    pub fn window(&self) -> usize {
+        self.inner.lock().map(|g| window_of(g.budget)).unwrap_or(0)
     }
 
     /// A packed entry's pixels as `f32`: unpacked (outside the lock) and kept unpacked, as it is
@@ -279,7 +364,7 @@ impl LayerCache {
             }
             let excess = g.bytes - g.budget / 4 * 3;
             let mut by_age: Vec<(u64, u64)> =
-                g.map.iter().filter(|(_, e)| matches!(e.buf, Stored::Full(_)) && !e.unpackable).map(|(k, e)| (e.last_use, *k)).collect();
+                g.map.iter().filter(|(_, e)| matches!(e.buf, Stored::Full(_)) && !e.unpackable && !e.probation).map(|(k, e)| (e.last_use, *k)).collect();
             by_age.sort_unstable();
             // Packing saves at least half (16 bpc).
             let mut saved = 0;
@@ -337,6 +422,8 @@ impl LayerCache {
         if let Ok(mut g) = self.inner.lock() {
             g.map.clear();
             g.bytes = 0;
+            g.probation_bytes = 0;
+            g.seen.clear();
         }
     }
 
@@ -348,6 +435,18 @@ impl LayerCache {
     #[cfg(test)]
     pub(crate) fn inserts(&self) -> u64 {
         self.inner.lock().map(|g| g.inserts).unwrap_or(0)
+    }
+
+    /// (Entries admitted, entries on probation, bytes on probation): tests check admission.
+    #[cfg(test)]
+    pub(crate) fn admission(&self) -> (usize, usize, usize) {
+        self.inner
+            .lock()
+            .map(|g| {
+                let probation = g.map.values().filter(|e| e.probation).count();
+                (g.map.len() - probation, probation, g.probation_bytes)
+            })
+            .unwrap_or_default()
     }
 
     /// After a miss on `key`: render it ([`Claim::Owner`], whose drop wakes the waiters), take
@@ -482,9 +581,37 @@ fn evict_lru(g: &mut Inner, target: usize) {
         if g.bytes <= target {
             break;
         }
-        if let Some(e) = g.map.remove(&k) {
-            g.bytes -= e.bytes;
+        remove(g, k);
+    }
+}
+
+fn remove(g: &mut Inner, key: u64) {
+    if let Some(e) = g.map.remove(&key) {
+        g.bytes -= e.bytes;
+        if e.probation {
+            g.probation_bytes = g.probation_bytes.saturating_sub(e.bytes);
         }
+    }
+}
+
+/// See [`LayerCache::window`].
+fn window_of(budget: usize) -> usize {
+    (budget / 16).min(128 << 20)
+}
+
+/// Drop the oldest entries on probation (never `newest`) until they fit the window.
+fn trim_probation(g: &mut Inner, newest: u64) {
+    let window = window_of(g.budget);
+    if g.probation_bytes <= window {
+        return;
+    }
+    let mut by_age: Vec<(u64, u64)> = g.map.iter().filter(|(k, e)| e.probation && **k != newest).map(|(k, e)| (e.last_use, *k)).collect();
+    by_age.sort_unstable();
+    for (_, k) in by_age {
+        if g.probation_bytes <= window {
+            break;
+        }
+        remove(g, k);
     }
 }
 
