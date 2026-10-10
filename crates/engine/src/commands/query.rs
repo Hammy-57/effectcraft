@@ -10,6 +10,7 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
     let filter = str_p(p, "filter").map(str::to_ascii_lowercase);
     let only = b_p(p, "enabledOnly").unwrap_or(false);
     let schemas = b_p(p, "schemas").unwrap_or(false);
+    let brief = b_p(p, "brief").unwrap_or(false);
     let v: Vec<Value> = super::command_specs()
         .iter()
         .filter(|c| filter.as_ref().is_none_or(|f| c.id.to_ascii_lowercase().contains(f) || c.label.to_ascii_lowercase().contains(f)))
@@ -17,6 +18,10 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
             let en = (c.enabled)(s);
             if only && en.is_err() {
                 return None;
+            }
+            if brief {
+                // The cheap index: ids and labels only (command.describe has the rest).
+                return Some(json!({"id": c.id, "label": c.label}));
             }
             let mut o =
                 json!({"id": c.id, "label": c.label, "menu": c.menu, "shortcut": c.shortcut, "params": c.params, "enabled": en.is_ok(), "why": en.err()});
@@ -91,7 +96,7 @@ fn comp_info(s: &mut Session, p: &Value) -> Result<Value> {
 /// The path segment that addresses child `i` of `g` (see `effectcraft_project::parse_path`): the match
 /// id (with `#n` when it is not the first sibling matching it), or `#index` when the match id is not
 /// path-safe (effects and other ids containing `.`).
-fn segment(g: &PropGroup, i: usize) -> String {
+pub(crate) fn segment(g: &PropGroup, i: usize) -> String {
     let c = &g.children[i];
     let m = c.match_id();
     if m.is_empty() || m.contains(['/', '.', '#', '@']) || m.parse::<u64>().is_ok() {
@@ -207,7 +212,12 @@ fn state(s: &mut Session, _: &Value) -> Result<Value> {
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
-        query!("command.list", "List Commands", "{filter?, enabledOnly?, schemas? (add each command's params JSON Schema)}", list),
+        query!(
+            "command.list",
+            "List Commands",
+            "{filter?, enabledOnly?, schemas? (add each command's params JSON Schema), brief?: bool (only id + label; command.describe has the rest)}",
+            list
+        ),
         query!("command.describe", "Describe Command", "{command} → id, label, menu, shortcut, params doc, JSON `schema`, enabled", describe),
         query!("app.capabilities", "App Capabilities", "{} → version, command/effect counts, export formats, parity summary", capabilities),
         query!("project.summary", "Project Summary", "{}", summary),

@@ -71,7 +71,7 @@ fn plugins_load(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn apply(s: &mut Session, p: &Value) -> Result<Value> {
     let name = str_p(p, "effect").ok_or_else(|| bad("effect.apply", "missing `effect` (id or name)"))?;
-    let spec = effectcraft_effects::lookup(name).ok_or_else(|| bad("effect.apply", format!("unknown effect `{name}`")))?;
+    let spec = effectcraft_effects::lookup(name).ok_or_else(|| bad("effect.apply", unknown_effect(name)))?;
     let (cid, ids) = layers_p(s, p)?;
     if ids.is_empty() {
         return Err(bad("effect.apply", "no layer"));
@@ -110,6 +110,13 @@ fn apply(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"effects": uids, "paths": paths, "effect": spec.id}))
 }
 
+/// "unknown effect `X`; did you mean …?" with the closest effect names (and ids).
+pub(crate) fn unknown_effect(name: &str) -> String {
+    let all = effectcraft_effects::all();
+    let hint = crate::suggest::did_you_mean(name, all.iter().map(|e| e.name).chain(all.iter().map(|e| e.id)));
+    format!("unknown effect `{name}`{hint} (effect.list {{filter}} lists them)")
+}
+
 fn find_fx(s: &Session, p: &Value, cmd: &str) -> Result<(effectcraft_project::ItemId, effectcraft_project::LayerId, Uid)> {
     let (cid, lid) = super::layer_p(s, p, cmd)?;
     let layer = s.project.comp(cid).and_then(|c| c.layer(lid)).ok_or(EngineError::NoComp)?;
@@ -118,7 +125,12 @@ fn find_fx(s: &Session, p: &Value, cmd: &str) -> Result<(effectcraft_project::It
         Some(v @ (Value::Number(_) | Value::String(_))) => super::pick_group(fx.groups(), v),
         _ => s.state.selected_props.iter().find_map(|(l, u)| (*l == lid).then(|| fx.groups().find(|g| g.uid == *u)).flatten()),
     }
-    .ok_or_else(|| bad(cmd, "no such effect"))?;
+    .ok_or_else(|| {
+        // Name what the layer has, so the next call can pick one.
+        let have: Vec<String> = fx.groups().enumerate().map(|(i, g)| format!("{} = {} (uid {})", i + 1, g.name, g.uid)).collect();
+        let have = if have.is_empty() { "none".to_string() } else { crate::suggest::capped_list(have.iter().map(String::as_str), 30) };
+        bad(cmd, format!("no such effect; `effect` is a 1-based index, uid or name; the layer's effects: {have}"))
+    })?;
     Ok((cid, lid, g.uid))
 }
 
@@ -221,7 +233,11 @@ fn reorder(s: &mut Session, p: &Value) -> Result<Value> {
         fx.children.insert(to, g);
         Ok(())
     })?;
-    Ok(Value::Null)
+    // The new stack order (1-based, as `effects/#n` paths address it).
+    let fx = s.project.comp(cid).and_then(|c| c.layer(lid)).and_then(|l| l.effects());
+    let effects: Vec<Value> =
+        fx.map(|fx| fx.groups().enumerate().map(|(i, g)| json!({"index": i + 1, "name": g.name, "uid": g.uid})).collect()).unwrap_or_default();
+    Ok(json!({"layer": lid.0, "effects": effects}))
 }
 
 fn duplicate(s: &mut Session, p: &Value) -> Result<Value> {
@@ -392,16 +408,32 @@ fn last(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn list(_: &mut Session, p: &Value) -> Result<Value> {
     let filter = str_p(p, "filter").map(str::to_lowercase);
+    let brief = b_p(p, "brief").unwrap_or(false);
     let v: Vec<Value> = effectcraft_effects::all()
         .into_iter()
         .filter(|e| {
             filter.as_ref().is_none_or(|f| effectcraft_effects::name_matches(e, f) || e.id.contains(f.as_str()) || e.category.to_ascii_lowercase().contains(f))
         })
         .map(|e| {
-            json!({"id": e.id, "name": e.name, "category": e.category, "gpu": e.gpu, "float": e.float, "params": e.params.iter().map(|p| json!({"id": p.id, "name": p.name, "default": p.default.to_json()})).collect::<Vec<_>>()})
+            if brief {
+                return json!({"id": e.id, "name": e.name});
+            }
+            json!({"id": e.id, "name": e.name, "category": e.category, "gpu": e.gpu, "float": e.float, "params": e.params.iter().map(param_json).collect::<Vec<_>>()})
         })
         .collect();
     Ok(json!(v))
+}
+
+/// An effect parameter for `effect.list`: id, name, default, plus the valid `range` of a slider
+/// (values outside are clamped) and the `options` of a popup (set by 0-based index or name).
+fn param_json(p: &effectcraft_effects::ParamSpec) -> Value {
+    let mut o = json!({"id": p.id, "name": p.name, "default": p.default.to_json()});
+    match &p.ui {
+        effectcraft_project::ParamUi::Slider { min, max, .. } => o["range"] = json!([min, max]),
+        effectcraft_project::ParamUi::Popup { options } => o["options"] = json!(options),
+        _ => {}
+    }
+    o
 }
 
 impl Session {
@@ -447,12 +479,25 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("effect.removeAll", "Remove All", ["Effect"], Some("Cmd+Shift+E"), "{layers?}", has_layers, remove_all),
         cmd!("effect.remove", "Remove Effect", [], None, "{layer?, effect: index|uid|name}", has_layers, remove),
         cmd!("effect.toggle", "Toggle Effect", [], None, "{layer?, effect, value?}", has_layers, toggle),
-        cmd!("effect.reorder", "Reorder Effect", [], None, "{layer?, effect, index}", has_layers, reorder),
+        cmd!(
+            "effect.reorder",
+            "Reorder Effect",
+            [],
+            None,
+            "{layer?, effect: index (1-based)|uid|name, index (1-based new stack position)} → {layer, effects: [{index, name, uid}]}",
+            has_layers,
+            reorder
+        ),
         cmd!("effect.duplicate", "Duplicate Effect", [], None, "{layer?, effect}", has_layers, duplicate),
         cmd!("effect.copy", "Copy Effects", [], None, "{layer?, effect? | effects?: [uid|name|index]} (default: the selected effects)", has_layers, copy),
         cmd!("effect.paste", "Paste Effects", [], None, "{layers?} — adds the copied effects to the layers", has_layers, paste),
         cmd!("effect.reset", "Reset Effect", [], None, "{layer?, effect}", has_layers, reset),
-        crate::query!("effect.list", "List Effects", "{filter?}", list),
+        crate::query!(
+            "effect.list",
+            "List Effects",
+            "{filter?, brief?: bool (only id + name)} → [{id, name, category, gpu, float, params: [{id, name, default, range?: [min, max], options?: [popup names]}]}]",
+            list
+        ),
         crate::query!(
             "effect.plugins.list",
             "List Effect Plug-ins",
