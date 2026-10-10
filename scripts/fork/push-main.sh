@@ -1,5 +1,5 @@
 #!/bin/bash
-# Nightly safety net (fork only): push local main to origin before the 23:00 cloud routine, which
+# Nightly safety net (fork only): push local main to origin before the 02:00 cloud routine, which
 # only sees what is on GitHub. Fast-forward only: never forces, never pushes other branches
 # (unfinished work stays local). Run by ~/Library/LaunchAgents/com.eliasx45.effectcraft.pushmain.plist.
 set -u

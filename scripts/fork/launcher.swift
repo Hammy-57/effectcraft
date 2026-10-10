@@ -116,7 +116,8 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/sh")
-        p.arguments = [script]
+        // Build only: launchApp() starts EffectCraft itself once the build ends.
+        p.arguments = [script, "--build-only"]
         p.standardOutput = FileHandle.nullDevice
         p.standardError = FileHandle.nullDevice
         p.terminationHandler = { [weak self] _ in DispatchQueue.main.async { self?.buildEnded() } }
