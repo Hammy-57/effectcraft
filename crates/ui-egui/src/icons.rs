@@ -770,9 +770,11 @@ fn paint_generated(painter: &Painter, rect: Rect, icon: Icon, color: Color32) ->
         }
         let texture = image::load_from_memory(include_bytes!("../../../assets/icons/tools-atlas.png")).ok().map(|image| {
             let rgba = image.to_rgba8();
-            let size = [rgba.width() as usize, rgba.height() as usize];
-            // Use the generated alpha as a tintable mask for dark/light/selected/disabled states.
-            let pixels = rgba.pixels().map(|pixel| Color32::from_white_alpha(pixel.0[3])).collect();
+            // Use the generated alpha as a tintable mask for dark/light/selected/disabled states,
+            // averaged down 2× (cells of 128 px still cover 20 pt icons at 5× scale; a quarter
+            // of the texture memory).
+            let (size, alpha) = half_alpha(rgba.width() as usize, rgba.height() as usize, &rgba.pixels().map(|p| p.0[3]).collect::<Vec<u8>>());
+            let pixels = alpha.into_iter().map(Color32::from_white_alpha).collect();
             (ctx.load_texture("tools-atlas", egui::ColorImage::new(size, pixels), egui::TextureOptions::LINEAR), false)
         });
         ctx.data_mut(|data| data.insert_temp(id, texture.clone()));
@@ -792,6 +794,28 @@ fn paint_generated(painter: &Painter, rect: Rect, icon: Icon, color: Color32) ->
     let side = rect.width().min(rect.height());
     painter.image(texture.id(), Rect::from_center_size(rect.center(), vec2(side, side)), uv, color);
     true
+}
+
+/// An alpha mask `w`×`h` averaged down 2× (2×2 boxes, rounded; odd edges average what they
+/// cover).
+fn half_alpha(w: usize, h: usize, alpha: &[u8]) -> ([usize; 2], Vec<u8>) {
+    let (ow, oh) = (w.div_ceil(2), h.div_ceil(2));
+    let mut out = Vec::with_capacity(ow * oh);
+    for y in 0..oh {
+        for x in 0..ow {
+            let (mut sum, mut n) = (0u32, 0u32);
+            for (sx, sy) in [(2 * x, 2 * y), (2 * x + 1, 2 * y), (2 * x, 2 * y + 1), (2 * x + 1, 2 * y + 1)] {
+                if sx < w
+                    && let Some(a) = alpha.get(sy * w + sx)
+                {
+                    sum += *a as u32;
+                    n += 1;
+                }
+            }
+            out.push(if n == 0 { 0 } else { ((sum + n / 2) / n) as u8 });
+        }
+    }
+    ([ow, oh], out)
 }
 
 /// Keyframe glyph by interpolation (diamond = linear, hourglass = bezier/ease, circle = auto,
@@ -857,6 +881,14 @@ fn keyframe_shapes(
 #[cfg(test)]
 mod tests {
     use effectcraft_engine::keyframe::KeyHalf as H;
+
+    /// The tools atlas is kept at half size: 2×2 averages, odd edges included.
+    #[test]
+    fn alpha_masks_halve() {
+        let (size, a) = super::half_alpha(3, 2, &[0, 255, 100, 255, 255, 50]);
+        assert_eq!(size, [2, 1]);
+        assert_eq!(a, vec![191, 75]);
+    }
 
     /// #284: keyframes have no dark border (overlapping keys looked messy): each half is filled
     /// and edged in the key's own colour.
