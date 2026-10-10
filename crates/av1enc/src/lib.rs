@@ -453,17 +453,11 @@ impl Encoder {
         let (w, h) = (self.geom.width, self.geom.height);
         let sb_row_step = if self.geom.sb_rows >= 9 { 3 } else { 1 };
         let sse = |pl: &Plane| -> u64 {
-            let mut s = 0u64;
-            for y in 0..h {
-                if !(y >> 6).is_multiple_of(sb_row_step) {
-                    continue;
-                }
-                for (a, b) in pl.row(y)[..w].iter().zip(&src[0].row(y)[..w]) {
-                    let d = *a as i64 - *b as i64;
-                    s += (d * d) as u64;
-                }
-            }
-            s
+            (0..h)
+                .into_par_iter()
+                .filter(|y| (y >> 6).is_multiple_of(sb_row_step))
+                .map(|y| pl.row(y)[..w].iter().zip(&src[0].row(y)[..w]).map(|(a, b)| (*a as i64 - *b as i64).pow(2) as u64).sum::<u64>())
+                .sum()
         };
         let bd = self.cfg.bit_depth as u32;
         let mut cache: Vec<(u32, u64)> = vec![(0, sse(&rec[0]))];
