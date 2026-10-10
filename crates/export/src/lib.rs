@@ -181,7 +181,18 @@ pub async fn export_async(job: &Job<'_>, progress: &mut dyn FnMut(&Progress) -> 
     // Another output module of the same Render Queue item renders the same frames: continue
     // from its layer cache (see `pipeline::Warm`).
     let cx = Cx::resume(job);
-    let mut r = export_with(&cx, progress, t0).await;
+    let r = run(&cx, progress, t0).await;
+    // A finished job leaves its layer cache for the next module; a failed or cancelled one
+    // (the item stops there) drops it.
+    if r.is_ok() {
+        cx.keep_warm();
+    }
+    r
+}
+
+/// Export `cx`'s job: a cancelled job removes the files it opened; any other writes its render log.
+pub(crate) async fn run(cx: &Cx<'_>, progress: &mut dyn FnMut(&Progress) -> bool, t0: Instant) -> Result<Report> {
+    let mut r = export_with(cx, progress, t0).await;
     if matches!(r, Err(ExportError::Cancelled)) {
         cx.remove_cancelled_outputs()?;
         return r;
@@ -191,12 +202,77 @@ pub async fn export_async(job: &Job<'_>, progress: &mut dyn FnMut(&Progress) -> 
         rep.log = log;
         rep.overflow = cx.overflowed.lock().unwrap_or_else(|e| e.into_inner()).clone();
     }
-    // A finished job leaves its layer cache for the next module; a failed or cancelled one
-    // (the item stops there) drops it.
-    if r.is_ok() {
-        cx.keep_warm();
-    }
     r
+}
+
+/// Export the output modules of one Render Queue item (blocking): see [`export_modules_async`].
+pub fn export_modules(jobs: &[Job], progress: &mut dyn FnMut(usize, &Progress) -> bool) -> Vec<Result<Report>> {
+    effectcraft_render::passes::block_on(export_modules_async(jobs, progress))
+}
+
+/// Export the output modules of one Render Queue item, with the result of [`export`] for each
+/// module run one after another: the files are those of each module exported alone, and the
+/// results stop at the first module that fails or is cancelled (the modules after it are not
+/// run). `progress` hears each module's progress with its index; returning `false` cancels that
+/// module.
+///
+/// Modules that render the same frames ([`pipeline::shares_frames`]) export at once from one
+/// render of each frame ([`pipeline::fan_out`]), each with its own encoder and muxer; the others
+/// export alone, continuing from the previous module's layer cache. A module of such a group
+/// that fails cancels the modules after it (their files are removed; with a sink, a module that
+/// finished first has already handed its files over), and a stop cancels every module of the
+/// group being written. Frames render in passes (deferred readbacks), on the web and on a rayon
+/// worker one module at a time.
+pub async fn export_modules_async(jobs: &[Job<'_>], progress: &mut dyn FnMut(usize, &Progress) -> bool) -> Vec<Result<Report>> {
+    let n = jobs.len();
+    let together = !cfg!(target_arch = "wasm32") && rayon::current_thread_index().is_none();
+    let mut done: Vec<Option<pipeline::Outcome>> = (0..n).map(|_| None).collect();
+    // The first module (by index) that failed or was cancelled: the item stops there.
+    let failed = std::sync::atomic::AtomicUsize::new(n);
+    let stop_at = |failed: &std::sync::atomic::AtomicUsize| failed.load(std::sync::atomic::Ordering::SeqCst);
+    for i in 0..n {
+        let Some(job) = jobs.get(i) else { break };
+        if i >= stop_at(&failed) || done.get(i).is_some_and(Option::is_some) {
+            continue;
+        }
+        let shares = |j: &&Job| together && !effectcraft_render::passes::is_deferred(j.accel) && pipeline::shares_frames(job, j);
+        let group: Vec<(usize, &Job)> = std::iter::once((i, job))
+            .chain(jobs.iter().enumerate().skip(i + 1).filter(|(j, o)| *j < stop_at(&failed) && done.get(*j).is_some_and(Option::is_none) && shares(o)))
+            .collect();
+        let outcomes = if group.len() > 1 {
+            pipeline::fan_out(&group, &failed, progress)
+        } else {
+            let t0 = Instant::now();
+            let cx = Cx::resume(job);
+            let r = run(&cx, &mut |p| progress(i, p), t0).await;
+            let written = cx.written();
+            if r.is_ok() {
+                cx.keep_warm();
+            }
+            vec![(r, written)]
+        };
+        for ((index, _), outcome) in group.iter().zip(outcomes) {
+            if outcome.0.is_err() {
+                failed.fetch_min(*index, std::sync::atomic::Ordering::SeqCst);
+            }
+            if let Some(slot) = done.get_mut(*index) {
+                *slot = Some(outcome);
+            }
+        }
+    }
+    // Modules after the first failure that finished in a group before it leave no files, as if
+    // they never ran.
+    let stop = stop_at(&failed);
+    for (_, written) in done.iter().skip(stop.saturating_add(1)).flatten() {
+        for path in written {
+            if let Err(e) = std::fs::remove_file(path)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                log::warn!("export: cannot remove {path}: {e}");
+            }
+        }
+    }
+    done.into_iter().take(stop.saturating_add(1)).map_while(|o| o.map(|(r, _)| r)).collect()
 }
 
 async fn export_with(cx: &Cx<'_>, progress: &mut dyn FnMut(&Progress) -> bool, t0: Instant) -> Result<Report> {
