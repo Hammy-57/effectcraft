@@ -67,6 +67,11 @@ impl NativeBar {
         if in_window {
             return;
         }
+        // While a button is held (a drag edits on every frame, each a new revision) the menu,
+        // which can't be opened meanwhile, catches up on release.
+        if self.menu.is_some() && self.state.is_some() && ctx.input(|i| i.pointer.any_down()) {
+            return;
+        }
         let key = native_menu::state_key(app);
         if self.state == Some(key) && self.menu.is_some() {
             return;
