@@ -1502,6 +1502,37 @@ fn structured_content_is_version_gated_and_matches_output_schemas() {
     let _ = std::fs::remove_file(png);
 }
 
+/// AG5: render_snapshot → edit → render_compare, with the heatmap inline only when it shows something.
+#[test]
+fn render_snapshot_and_compare_tools() {
+    let mut s = server();
+    call_json(&mut s, "execute_command", json!({"command": "comp.new", "params": {"name": "C", "width": 320, "height": 180}}));
+    call_json(&mut s, "execute_command", json!({"command": "layer.newSolid", "params": {"name": "Box", "color": "#ffffff", "width": 40, "height": 40}}));
+    let snap = call_json(&mut s, "render_snapshot", json!({"name": "before"}));
+    assert_eq!((snap["width"].as_u64(), snap["snapshots"].clone()), (Some(320), json!(["before"])));
+    // Nothing changed: JSON only, a pass with infinite PSNR.
+    let same = call_json(&mut s, "render_compare", json!({"a": "before", "b": {}}));
+    assert_eq!((same["pass"].as_bool(), same["psnr_db"].as_str()), (Some(true), Some("inf")), "{same}");
+    assert!(same.get("diff_png").is_none());
+    // Move the box 10 px right: metrics plus the heatmap image.
+    call_json(&mut s, "set_property", json!({"layer": 1, "path": "transform/position", "value": [170, 90]}));
+    let (c, err) = call(&mut s, "render_compare", json!({"a": {"snapshot": "before"}, "b": {"time": 0}}));
+    assert!(!err, "{c:?}");
+    assert_eq!(c[0]["type"], "image");
+    let png = base64::decode(c[0]["data"].as_str().unwrap()).unwrap();
+    assert_eq!(png_size(&png), Some((320, 180)));
+    let info: Value = serde_json::from_str(c[1]["text"].as_str().unwrap()).unwrap();
+    assert_eq!((info["pass"].as_bool(), info["changed_pixels"].as_u64()), (Some(false), Some(800)), "{info}");
+    assert!(info.get("diff_png").is_none(), "base64 moved into the image content");
+    // inline: false keeps the reply to JSON; bad references are in-band errors.
+    let r = call_json(&mut s, "render_compare", json!({"a": "before", "b": {}, "inline": false}));
+    assert_eq!(r["pass"], false);
+    let (c, err) = call(&mut s, "render_compare", json!({"a": "missing", "b": {}}));
+    assert!(err && c[0]["text"].as_str().unwrap().contains("no snapshot `missing`"));
+    let (_, err) = call(&mut s, "render_compare", json!({"a": "before"}));
+    assert!(err);
+}
+
 /// Every command in the long-call table exists and takes `wait` (a typo would silently make it
 /// synchronous again).
 #[test]

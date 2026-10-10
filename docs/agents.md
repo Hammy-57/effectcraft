@@ -109,6 +109,8 @@ See [MCP conventions](mcp.md) for core tools, resources, strict arguments, and p
 | `list_fonts {query?, rescan?}` | Font families text layers can use, bundled and installed, with their styles, origin and own-language name; `rescan` picks up fonts installed since launch. |
 | `add_effect {layer, effect, values?, comp?}` | Apply an effect and set its parameters in one call and one undo step (a failing value leaves nothing applied); returns the instance path (`effects/#n`) and its parameter paths. |
 | `render_preview {comp?, time?, max_side?, path?, inline?, transparent?}` | Returns a PNG image of a frame; `transparent: true` keeps the alpha (as an RGB + Alpha render writes it) instead of compositing over the comp background. |
+| `render_snapshot {name, comp?, time?, max_side?, transparent?}` | Render a frame and keep it in the session under `name` (16 kept, oldest dropped; the same name replaces). |
+| `render_compare {a, b, threshold?, min_psnr?, max_side?, amplify?, diff_path?, inline?}` | Compare two frames. `a` and `b` are each a snapshot name (or `{snapshot}`), `{path}` (a PNG/JPEG golden or After Effects reference) or `{comp?, time?, transparent?}` (render now; `{}` = active comp at the CTI). Returns `{width, height, max_abs, mean_abs, alpha_max_abs, psnr_db, ssim, changed_pixels, changed_pct, pass}` and, when something changed, the diff heatmap as an image. See [Verify your change](#verify-your-change-snapshot--edit--compare). |
 | `open_project {path \| demo \| new}` / `save_project {path?}` | Open and save files. |
 | `undo {steps?}` / `redo {steps?}` | History. |
 | `history {goto?}` | The branching undo history (History panel): every state with its index, id, label, branch depth and whether it's current; `goto` (an index or id) jumps to any state, on any branch, without losing the others. |
@@ -135,6 +137,38 @@ instead of being ignored.
 4. `command_run {"id":"effect.apply","params":{"layer":2,"effect":"Gaussian Blur"}}`, then `set_property {"layer":2,"path":"effects/#1/blurriness","value":8}`
 5. `render_preview {"time":1.0}` lets you look at the result, and `save_project {"path":"intro.ecproj"}` saves it.
 
+### Verify your change: snapshot → edit → compare
+
+Don't just assume an edit did what you meant; look. Snapshot the frame, make the change, and compare:
+
+1. `render_snapshot {"name":"before","time":1.0}` → `{name, comp, time, width, height, snapshots}`
+2. `set_property {"layer":"EFFECTCRAFT","path":"transform/opacity","value":50}`
+3. `render_compare {"a":"before","b":{"time":1.0}}` (demo project) →
+   `{"width":1920,"height":1080,"max_abs":118.0,"mean_abs":1.8705,"alpha_max_abs":0.0,"psnr_db":27.091,"ssim":0.99214,"changed_pixels":135386,"changed_pct":6.529,"pass":false,…}`
+   plus the heatmap image (768 px wide inline): unchanged pixels are frame `a` dimmed to grey, differences within the
+   threshold dark blue, changed pixels red → yellow → white by size (`amplify`, default 8: a
+   32-level difference is white).
+
+So a change that should touch only the title shows a heatmap lit only around the title, and a
+refactor that should change nothing gives `pass: true` with `psnr_db: "inf"`.
+
+- **Metrics.** Colour is compared premultiplied (each image over black, so colour under fully
+  transparent pixels never counts) in 8-bit levels: `max_abs` and `mean_abs` over R, G and B,
+  `alpha_max_abs` for alpha, `psnr_db` from the colour MSE (the string `"inf"` when identical),
+  `ssim` the mean luma SSIM over 8×8 windows (1 = identical). A pixel is *changed* when any channel
+  differs by more than `threshold` levels (default 1).
+- **Pass.** `pass` is true when no pixel changed. With `min_psnr` (dB) the PSNR decides instead,
+  for references that are close but never bit-exact, such as an After Effects render
+  (`render_compare {"a":{"path":"plan/aftereffects/ref/title.png"},"b":{},"min_psnr":35}`).
+- **Sizes.** `max_side` scales both images down (area average) first. Images with the same aspect
+  ratio but different sizes (a half-resolution reference) are compared at the smaller size and the
+  reply says which side was `resampled`; different aspect ratios are an error naming both sizes.
+- `diff_path` also writes the full-size heatmap PNG. Snapshots live in the session (the app's in
+  bridge mode), not in the project; `execute_command render.snapshots {"clear":true}` lists or drops
+  them. Over the control channel the same commands are `engine.execute render.snapshot` /
+  `render.compare` (`diff_inline: true` returns the heatmap as base64 `diff_png`).
+- For goldens and fidelity checks from the shell: `effectcraft-cli compare a.png b.png` (see [CLI](#cli)).
+
 ### Cookbook
 
 Short recipes; every step is one tool call.
@@ -150,6 +184,7 @@ Short recipes; every step is one tool call.
 | Drive with an expression | `set_property {"layer":2,"path":"transform/rotation","expression":"time*90"}` |
 | Inspect a layer | `get_layer {"layer":2,"flat":true}` (every property with its `path`, value, key count) |
 | Check the result | `render_preview {"time":1.5,"max_side":640}`; with a UI (`--ui` / `--bridge`) `screenshot {"panel":"Timeline"}` |
+| Prove what an edit changed | `render_snapshot {"name":"before"}` → edit → `render_compare {"a":"before","b":{}}` (metrics + diff heatmap) |
 | Undo a mistake | `undo {}`, or `history {}` then `history {"goto": n}` |
 | Missing media after opening | `command_run footage.check {"wait":true}` → `{checked, missing, probed}`; then `file.findMissing {"what":"footage"}` |
 | Bring in a Figma design | No token: serialize with the Figma MCP's `use_figma` + `integrations/figma/serialize.js`, then `command_run file.importFigma {"payloadPaths": [<parts>]}` (see "Figma designs"). With a token: `{"url": "<figma link>"}` |
@@ -611,6 +646,8 @@ effectcraft-cli set Main '#1' transform/position '[100,360]' --time 0 main.ecpro
 effectcraft-cli get Main '#1' transform/position --time 0.5 main.ecproj --json
 effectcraft-cli run main.ecproj comp.open '{"comp":"Main"}' time.set '{"time":1}' --json
 effectcraft-cli render-frame main.ecproj --time 1 --max-side 640 --out f.png --json
+effectcraft-cli compare golden.png f.png --diff diff.png        # PASS/FAIL + metrics; exit 1 when they differ
+effectcraft-cli compare ae-ref.png f.png --min-psnr 35 --max-side 960 --json
 effectcraft-cli exec layer.newNull --bridge 9877                 # same commands, against the live app
 effectcraft-cli exec file.exportLottie '{"comp":"Main","path":"main.json","includeExpressions":true}' main.ecproj --json
 effectcraft-cli exec file.importLottie '{"path":"anim.json"}' main.ecproj --save

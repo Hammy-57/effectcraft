@@ -44,7 +44,13 @@ Useful query commands for `engine.execute` (they aren't journaled or undoable): 
 `prop.get {layer, path, comp?, time?}`, `editor.state`, `command.list {filter?, enabledOnly?, schemas?}`,
 `command.describe {command}` (params doc and JSON Schema), `app.capabilities` (version, counts,
 export formats, parity summary), `jobs.list` (Progress panel jobs, e.g. the background
-`footage.check` after File ▸ Open).
+`footage.check` after File ▸ Open), `render.snapshot {name, comp?, time?, max_side?, transparent?}`
+(keep a rendered frame in the session, 16 at most), `render.snapshots {clear?}` and
+`render.compare {a, b, threshold?, min_psnr?, max_side?, amplify?, diff_path?, diff_inline?}`
+(`a`/`b`: a snapshot name, `{snapshot}`, `{path}` of a PNG/JPEG, or `{comp?, time?, transparent?}`
+rendered now) → `{width, height, max_abs, mean_abs, alpha_max_abs, psnr_db, ssim, changed_pixels,
+changed_pct, pass, diff_path?, diff_png?}` (metrics and size rules in
+[agents.md](agents.md#verify-your-change-snapshot--edit--compare)).
 
 Every engine command is reachable through `engine.execute`, and every interactive widget of every
 panel registers an element id; both are enforced by `crates/ui-egui/tests/ui_agent_audit.rs`.
