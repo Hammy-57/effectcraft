@@ -2,6 +2,8 @@
 
 use effectcraft_color::{BlendMode, blend_pixel};
 use effectcraft_geom::{Mat3, Rect, vec2};
+use std::sync::OnceLock;
+
 use rayon::prelude::*;
 
 use crate::{Image, Px, hash_noise};
@@ -51,25 +53,85 @@ pub(crate) fn half(src: &Image) -> Image {
     out
 }
 
+/// A source image with its minification levels (box halvings), built on first use and kept:
+/// drawing one buffer several times (motion-blur sub-samples, a layer and its styles) builds
+/// each level once instead of once per draw.
+pub struct MipChain<'s> {
+    base: &'s Image,
+    /// Level `k + 1` (`k` halvings after the first); bounded by the halvings a warp can ask for.
+    levels: Vec<OnceLock<Image>>,
+}
+
+impl<'s> MipChain<'s> {
+    pub fn new(base: &'s Image) -> MipChain<'s> {
+        // A warp halves once, then again while both sides exceed one pixel.
+        let mut n = 1;
+        let (mut w, mut h) = (base.width.div_ceil(2).max(1), base.height.div_ceil(2).max(1));
+        while w > 1 && h > 1 {
+            n += 1;
+            (w, h) = (w.div_ceil(2).max(1), h.div_ceil(2).max(1));
+        }
+        MipChain { base, levels: (0..n).map(|_| OnceLock::new()).collect() }
+    }
+
+    pub fn base(&self) -> &'s Image {
+        self.base
+    }
+
+    /// Size of level `k` (0 = the base) without building it.
+    fn level_size(&self, k: usize) -> (u32, u32) {
+        let (mut w, mut h) = (self.base.width, self.base.height);
+        for _ in 0..k {
+            (w, h) = (w.div_ceil(2).max(1), h.div_ceil(2).max(1));
+        }
+        (w, h)
+    }
+
+    /// Level `k` (0 = the base): `k` successive [`half`]s, each built once.
+    fn level(&self, k: usize) -> &Image {
+        let mut img = self.base;
+        for slot in self.levels.iter().take(k) {
+            let prev = img;
+            img = slot.get_or_init(|| half(prev));
+        }
+        img
+    }
+
+    /// Levels built so far (tests).
+    pub fn built(&self) -> usize {
+        self.levels.iter().filter(|l| l.get().is_some()).count()
+    }
+}
+
 /// Draw `src` transformed by `m` (src pixel space → dst pixel space) onto `dst` with blending.
 ///
 /// Affine transforms with non-stencil modes take a fast path (per-row span clipping, interior
 /// bilinear without bounds checks, integer-translation copies, inlined Normal blending); it
 /// matches [`composite_warp_reference`] to float rounding.
 pub fn composite_warp(dst: &mut Image, src: &Image, m: &Mat3, opts: &WarpOpts) {
+    composite_warp_impl(dst, &MipChain::new(src), m, opts, true, None);
+}
+
+/// [`composite_warp`] from a [`MipChain`], whose minification levels are reused across draws.
+pub fn composite_warp_mips(dst: &mut Image, src: &MipChain, m: &Mat3, opts: &WarpOpts) {
     composite_warp_impl(dst, src, m, opts, true, None);
 }
 
 /// `dst += warp(src) · weight` (plain sum, no blending): motion-blur sub-samples accumulate
 /// straight into one buffer instead of one full-size image per sample.
 pub fn accumulate_warp(dst: &mut Image, src: &Image, m: &Mat3, sampling: Sampling, weight: f32) {
+    accumulate_warp_mips(dst, &MipChain::new(src), m, sampling, weight);
+}
+
+/// [`accumulate_warp`] from a [`MipChain`] (one chain for all of a layer's sub-samples).
+pub fn accumulate_warp_mips(dst: &mut Image, src: &MipChain, m: &Mat3, sampling: Sampling, weight: f32) {
     let opts = WarpOpts { sampling, ..Default::default() };
     if m.is_affine() && m.inverse().is_some_and(|i| i.is_affine()) {
         composite_warp_impl(dst, src, m, &opts, true, Some(weight));
         return;
     }
     let mut tmp = Image::new(dst.width, dst.height);
-    composite_warp(&mut tmp, src, m, &opts);
+    composite_warp_impl(&mut tmp, src, m, &opts, true, None);
     dst.data.par_iter_mut().zip(tmp.data.par_iter()).for_each(|(d, s)| {
         for c in 0..4 {
             d[c] += s[c] * weight;
@@ -79,7 +141,7 @@ pub fn accumulate_warp(dst: &mut Image, src: &Image, m: &Mat3, sampling: Samplin
 
 /// The straightforward per-pixel implementation (reference for the fast path's tests).
 pub fn composite_warp_reference(dst: &mut Image, src: &Image, m: &Mat3, opts: &WarpOpts) {
-    composite_warp_impl(dst, src, m, opts, false, None);
+    composite_warp_impl(dst, &MipChain::new(src), m, opts, false, None);
 }
 
 /// Bilinear blend of four taps (same operation order as [`Image::sample_bilinear`]).
@@ -208,28 +270,26 @@ fn affine_rows(
     });
 }
 
-fn composite_warp_impl(dst: &mut Image, src: &Image, m: &Mat3, opts: &WarpOpts, allow_fast: bool, accumulate: Option<f32>) {
+fn composite_warp_impl(dst: &mut Image, mips: &MipChain, m: &Mat3, opts: &WarpOpts, allow_fast: bool, accumulate: Option<f32>) {
+    let src = mips.base;
     if src.is_empty() || dst.is_empty() || opts.opacity <= 0.0 {
         return;
     }
     let Some(inv) = m.inverse() else { return };
     // Minification: pick a pre-filtered level so sampling doesn't alias.
     let scale = m.mean_scale();
-    let mut level_img;
     let mut img = src;
     let mut inv = inv;
     if scale < 0.5 && m.is_affine() {
-        let mut s = scale;
-        let mut f = 1.0;
-        level_img = half(src);
-        f *= 0.5;
-        s *= 2.0;
-        while s < 0.5 && level_img.width > 1 && level_img.height > 1 {
-            level_img = half(&level_img);
+        let mut s = scale * 2.0;
+        let mut f = 0.5;
+        let mut k = 1;
+        while s < 0.5 && k < mips.levels.len() && mips.level_size(k).0 > 1 && mips.level_size(k).1 > 1 {
+            k += 1;
             f *= 0.5;
             s *= 2.0;
         }
-        img = &level_img;
+        img = mips.level(k);
         inv = Mat3::scale(vec2(f, f)) * inv;
     }
     let bounds = m.map_rect(&Rect::from_size(src.width as f64, src.height as f64)).inflate(1.0).round_out();
@@ -418,6 +478,46 @@ mod tests {
                 assert!((p[c] - q[c]).abs() < 1e-4, "{p:?} vs {q:?}");
             }
         }
+    }
+
+    /// One mip chain shared by several minified draws (motion-blur sub-samples) gives exactly
+    /// what a fresh chain per draw gave, and builds each level once.
+    #[test]
+    fn shared_mip_chain_matches_per_draw() {
+        let src = test_image(97, 61, 3);
+        let mats = [
+            Mat3::translate(vec2(4.0, 3.0)) * Mat3::scale(vec2(0.3, 0.3)),
+            Mat3::translate(vec2(4.5, 3.25)) * Mat3::scale(vec2(0.3, 0.3)),
+            Mat3::translate(vec2(6.0, 2.0)) * Mat3::rotate_deg(10.0) * Mat3::scale(vec2(0.1, 0.12)),
+            Mat3::translate(vec2(1.0, 1.0)) * Mat3::scale(vec2(0.02, 0.02)),
+            Mat3::translate(vec2(2.0, 2.0)),
+        ];
+        let mips = MipChain::new(&src);
+        assert_eq!(mips.built(), 0, "levels are built lazily");
+        let (mut shared, mut fresh) = (test_image(40, 30, 8), test_image(40, 30, 8));
+        let (mut acc_shared, mut acc_fresh) = (Image::new(40, 30), Image::new(40, 30));
+        for (i, m) in mats.iter().enumerate() {
+            let opts = WarpOpts {
+                sampling: [Sampling::Bilinear, Sampling::Bicubic, Sampling::Nearest][i % 3],
+                opacity: 0.8,
+                mode: BlendMode::Screen,
+                seed: 1,
+                clip: None,
+            };
+            composite_warp_mips(&mut shared, &mips, m, &opts);
+            composite_warp(&mut fresh, &src, m, &opts);
+            accumulate_warp_mips(&mut acc_shared, &mips, m, opts.sampling, 0.2);
+            accumulate_warp(&mut acc_fresh, &src, m, opts.sampling, 0.2);
+        }
+        assert_eq!(shared, fresh);
+        assert_eq!(acc_shared, acc_fresh);
+        let mut n = 1;
+        let (mut w, mut h) = (49u32, 31u32);
+        while w > 1 && h > 1 {
+            (w, h) = (w.div_ceil(2), h.div_ceil(2));
+            n += 1;
+        }
+        assert!(mips.built() <= n && mips.built() >= 5, "{} levels", mips.built());
     }
 
     #[test]

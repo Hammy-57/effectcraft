@@ -7,7 +7,7 @@ use effectcraft_color::BlendMode;
 use effectcraft_effects::Buf;
 use effectcraft_geom::{Mat3, vec2};
 use effectcraft_project::{Layer, Quality, Sampling};
-use effectcraft_raster::{WarpOpts, composite_warp};
+use effectcraft_raster::{MipChain, WarpOpts, accumulate_warp_mips, composite_warp_mips};
 
 impl<'a> Renderer<'a> {
     pub(crate) fn sampling(&self, layer: &Layer) -> effectcraft_raster::Sampling {
@@ -119,15 +119,17 @@ impl<'a> Renderer<'a> {
     pub(crate) fn place(&self, ctx: &EvalCtx, layer: &Layer, buf: &Buf, target: &mut Image, mode: BlendMode, opacity: f32) {
         let pl = self.placement(ctx, layer, buf);
         let opts = WarpOpts { sampling: pl.sampling, opacity, mode, seed: pl.seed, clip: None };
+        // One minification chain for every sub-sample (built only when the layer is shrunk).
+        let mips = MipChain::new(&buf.img);
         if let [m] = pl.matrices.as_slice() {
-            composite_warp(target, &buf.img, m, &opts);
+            composite_warp_mips(target, &mips, m, &opts);
             return;
         }
         // Sub-samples sum straight into one buffer (each warp is row-parallel).
         let mut acc = Image::new(target.width, target.height);
         let k = 1.0 / pl.matrices.len() as f32;
         for m in &pl.matrices {
-            effectcraft_raster::accumulate_warp(&mut acc, &buf.img, m, opts.sampling, k);
+            accumulate_warp_mips(&mut acc, &mips, m, opts.sampling, k);
         }
         target.blend_from(&acc, mode, opacity, pl.seed);
     }
