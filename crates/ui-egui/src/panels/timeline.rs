@@ -90,6 +90,31 @@ fn stripes(p: &egui::Painter, r: Rect, label: Color32) {
     }
 }
 
+/// The keys of unlocked layers whose marks fall inside `br` (a key marquee), for `rows`
+/// stacked from `top` (`rh` high each, see [`row_height`]).
+fn keys_in_box(comp: &Comp, rows: &[Row], top: f32, rh: f32, tm: TMap, br: Rect) -> Vec<effectcraft_engine::KeyRef> {
+    let mut keys = vec![];
+    let mut y = top;
+    for row in rows {
+        let cy = y + rh / 2.0;
+        y += row_height(row, rh);
+        if let RowKind::Prop { uid } = row.kind
+            && cy >= br.min.y
+            && cy <= br.max.y
+            && let Some(l) = comp.layer(row.layer).filter(|l| !l.switches.locked)
+            && let Some(pr) = l.props.find(uid)
+        {
+            for k in &pr.keys {
+                let x = tm.x(l.comp_time(k.time).seconds());
+                if x >= br.min.x && x <= br.max.x {
+                    keys.push(effectcraft_engine::KeyRef { layer: l.id, prop: uid, time: k.time });
+                }
+            }
+        }
+    }
+    keys
+}
+
 /// Row height (expression editors grow with their text).
 fn row_height(row: &Row, rh: f32) -> f32 {
     match row.kind {
@@ -1570,6 +1595,15 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let outline_rect = Rect::from_min_max(rows_rect.min, pos2(graph_x0 - 1.0, rows_rect.max.y));
     let outline_empty = ui.interact(outline_rect, egui::Id::new("tl-layer-bg"), Sense::click_and_drag());
     app.auto.add("timeline.layerMarquee", outline_rect, "Drag empty outline to select layers");
+    // Key marquee (dragging the empty time graph): the box now (the last one on release), the
+    // keys inside it, and the selection the keys show while it is dragged, as in After Effects.
+    let key_box = match (empty.dragged(), ctx.input(|i| i.pointer.press_origin()), empty.interact_pointer_pos()) {
+        (true, Some(origin), Some(cur)) => Some(Rect::from_two_pos(origin, cur)),
+        _ if empty.drag_stopped() => ctx.data(|d| d.get_temp::<Rect>(egui::Id::new("tl-box"))),
+        _ => None,
+    };
+    let box_keys = key_box.map(|br| keys_in_box(&comp, &rows, rows_rect.min.y - app.ui.timeline.scroll_y, rh, tm, br));
+    let key_preview = box_keys.as_ref().map(|in_box| super::graph_tools::marquee_selection(&sel_keys, in_box, ui.input(|i| i.modifiers)));
     let mut hit_rows: Vec<(Rect, Row)> = vec![];
     for (ri, row) in rows.iter().enumerate() {
         // Outline widgets never spill into the time graph (narrow timelines).
@@ -2330,15 +2364,17 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                         }
                         let kref = effectcraft_engine::KeyRef { layer: layer.id, prop: *uid, time: k.time };
                         let ks = sel_keys.contains(&kref);
+                        // Drawn selected: what a marquee being dragged would select, else the selection.
+                        let shown = key_preview.as_ref().map_or(ks, |p| p.contains(&kref));
                         let icon = k.icon();
                         let c = pos2(x, cy);
                         // Labelled keys take their label colour (brighter when selected).
                         let kcol = match effectcraft_engine::color::Label::ALL.get(k.label as usize).filter(|_| k.label > 0) {
                             Some(l) => {
                                 let c = t.label(*l);
-                                if ks { c } else { c.gamma_multiply(0.75) }
+                                if shown { c } else { c.gamma_multiply(0.75) }
                             }
-                            None if ks => t.keyframe_selected,
+                            None if shown => t.keyframe_selected,
                             None => t.keyframe,
                         };
                         if k.roving {
@@ -2349,7 +2385,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                         }
                         let kr = Rect::from_center_size(c, vec2(12.0, 14.0));
                         let kresp = ui.interact(kr, egui::Id::new(("key", uid, k.time.0)), Sense::click_and_drag());
-                        app.auto.add(&format!("timeline.key.{uid}.{}", fr.frame_at(ct)), kr, &format!("{} key", prop.name));
+                        let label = if shown { format!("{} key (selected)", prop.name) } else { format!("{} key", prop.name) };
+                        app.auto.add(&format!("timeline.key.{uid}.{}", fr.frame_at(ct)), kr, &label);
                         let mods = ui.input(|i| i.modifiers);
                         let this_key = json!({"keys": [{"layer": layer.id.0, "prop": uid, "time": k.time.seconds()}], "selectProperties": true});
                         if kresp.clicked() && mods.command {
@@ -2361,14 +2398,9 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                                 let linear = k.in_interp == Interp::Linear && k.out_interp == Interp::Linear;
                                 actions.push(("keys.interpolation".into(), json!({"interpolation": if linear { "autoBezier" } else { "linear" }})));
                             }
-                        } else if kresp.clicked() && mods.shift {
-                            // Shift+click: in or out of the selection.
-                            let mut p = this_key.clone();
-                            p["toggle"] = json!(true);
-                            actions.push(("keys.select".into(), p));
-                        } else if (kresp.clicked() || kresp.drag_started()) && !ks {
-                            let mut p = this_key.clone();
-                            p["add"] = json!(mods.shift);
+                        } else if let Some(p) = super::graph_tools::key_select_gesture(ui, &kresp, &this_key, ks, sel_keys.len()) {
+                            // Selected on the press (Shift adds); a click on a selected key
+                            // reduces the selection to it (Shift: takes it out).
                             actions.push(("keys.select".into(), p));
                         }
                         if kresp.double_clicked() {
@@ -2574,10 +2606,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             actions.push(("layer.select".into(), json!({"layers": []})));
         }
     }
-    if let (true, Some(origin), Some(cur)) =
-        (empty.dragged(), empty.interact_pointer_pos().and_then(|_| ctx.input(|i| i.pointer.press_origin())), empty.interact_pointer_pos())
-    {
-        let br = Rect::from_two_pos(origin, cur);
+    if let Some(br) = key_box.filter(|_| empty.dragged()) {
         gp.rect_filled(br, 0.0, t.accent.gamma_multiply(0.12));
         gp.rect_stroke(br, 0.0, Stroke::new(1.0, t.accent), StrokeKind::Middle);
         ctx.data_mut(|d| d.insert_temp(egui::Id::new("tl-box"), br));
@@ -2655,30 +2684,12 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             }
         }
     }
+    // Releasing the key marquee commits the selection its keys showed.
     if empty.drag_stopped()
-        && let Some(br) = ctx.data(|d| d.get_temp::<Rect>(egui::Id::new("tl-box")))
+        && let Some(in_box) = &box_keys
     {
         ctx.data_mut(|d| d.remove::<Rect>(egui::Id::new("tl-box")));
-        let mut keys = vec![];
-        let mut yy = rows_rect.min.y - app.ui.timeline.scroll_y;
-        for row in &rows {
-            let cy = yy + rh / 2.0;
-            yy += row_height(row, rh);
-            if let RowKind::Prop { uid } = row.kind
-                && cy >= br.min.y
-                && cy <= br.max.y
-                && let Some(l) = comp.layer(row.layer)
-                && let Some(pr) = l.props.find(uid)
-            {
-                for k in &pr.keys {
-                    let x = tm.x(l.comp_time(k.time).seconds());
-                    if x >= br.min.x && x <= br.max.x {
-                        keys.push(json!({"layer": l.id.0, "prop": uid, "time": k.time.seconds()}));
-                    }
-                }
-            }
-        }
-        actions.push(("keys.select".into(), json!({"keys": keys, "add": ui.input(|i| i.modifiers.shift), "selectProperties": true})));
+        actions.push(("keys.select".into(), super::graph_tools::marquee_params(in_box, ui.input(|i| i.modifiers), true)));
     }
 
     // CTI.
