@@ -158,18 +158,27 @@ fn generated() {
     );
 }
 
-/// #580 names chromatic aberration and Pan/Tilt. Those angles belong to Rotate Sphere;
-/// exercise both effects together, including seams and poles in every stereo layout.
+/// #580's v0.7.0 Center Pan/Tilt were replaced by Point of Interest in 77c769d8.
+/// Check corresponding spherical directions on the current CPU/GPU implementation.
 #[test]
-fn chromatic_aberration_then_pan_tilt_crosses_seams_and_poles() {
+fn chromatic_direction_control_crosses_seams_and_poles() {
     for layout in 0..3 {
-        for (pan, tilt) in [(0.0, 0.0), (180.0, 90.0), (-180.0, -90.0), (359.0, 89.5)] {
+        let (cols, rows) = match layout {
+            1 => (1.0, 2.0),
+            2 => (2.0, 1.0),
+            _ => (1.0, 1.0),
+        };
+        for (pan, tilt) in [(0.0, 0.0), (180.0, 90.0), (-180.0, -90.0), (179.0, 89.5)] {
             let mut s = Scene::new(BitDepth::Bpc32);
             let mut layer = s.footage(97, 49);
-            s.effect(&mut layer, "ec.vr.chromaticaberrations", &[("frameLayout", e(layout)), ("aberrationRed", n(40.0)), ("aberrationBlue", n(-30.0))]);
-            s.effect(&mut layer, "ec.vr.rotatesphere", &[("frameLayout", e(layout)), ("pan", n(pan)), ("tilt", n(tilt))]);
+            let point = [(pan / 360.0 + 0.5) * 97.0 / cols, (tilt / 180.0 + 0.5) * 49.0 / rows];
+            s.effect(
+                &mut layer,
+                "ec.vr.chromaticaberrations",
+                &[("frameLayout", e(layout)), ("aberrationRed", n(40.0)), ("aberrationBlue", n(-30.0)), ("pointOfInterest", Value::Vec2(point))],
+            );
             s.push(layer);
-            check(&format!("chromatic + pan {pan} tilt {tilt} layout {layout}"), compare_at(&s, opts(), Tick::ZERO), 0.005);
+            check(&format!("chromatic direction {pan}/{tilt} layout {layout}"), compare_at(&s, opts(), Tick::ZERO), 0.005);
         }
     }
 }
