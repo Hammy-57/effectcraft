@@ -184,7 +184,8 @@ as you; a call's own `client` wins. Two things follow:
   tab, but the user's viewer stays on what they are looking at. `editor.state` with your `client` is
   your view; without one it is the user's, plus `clients` (each agent's active comp, time and selected
   layers) and `claims`. At most 64 cursors are kept (the least recently used goes); requests without
-  `client` behave exactly as before.
+  `client` behave exactly as before. A project you save remembers the user's open comps, front comp
+  and current times (`openComps`), never yours.
 - **Claims.** `comp.claim {comp, ttl?}` reserves a comp for you (`ttl` seconds, default 300, at most
   24 h; claim again to renew). While it holds, another client's command that would change the comp (its
   layers, properties or name) or delete it is refused, changing nothing: `composition "Main" is claimed

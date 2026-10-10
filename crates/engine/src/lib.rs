@@ -1029,7 +1029,13 @@ impl Session {
     }
 
     /// Replace the whole project (open/new), resetting history and state.
-    pub fn replace_project(&mut self, mut p: Project, path: Option<String>) {
+    pub fn replace_project(&mut self, p: Project, path: Option<String>) {
+        self.replace_project_with(p, path, None);
+    }
+
+    /// [`Session::replace_project`], reopening the comps that were open when it was saved
+    /// ([`Session::restore_open_comps`]); without any (or none left), the first comp opens.
+    pub fn replace_project_with(&mut self, mut p: Project, path: Option<String>, open: Option<&effectcraft_project::OpenComps>) {
         if self.stop_render()
             && let Some(mut job) = self.render_job.take()
         {
@@ -1064,10 +1070,59 @@ impl Session {
         self.path = path;
         self.bump();
         self.mark_saved();
+        if open.is_some_and(|o| self.restore_open_comps(o)) {
+            return;
+        }
         let first = self.project.comps().next().map(|(id, _)| *id);
         if let Some(c) = first {
             self.open_comp(c);
         }
+    }
+
+    /// The comps open in the user's Timeline/Composition tabs, the front one and their current
+    /// times, for the project file (`openComps`, see [`effectcraft_project::OpenComps`]). Always
+    /// the user's view: while an agent's command runs (a `client`, see [`agents`]) its own
+    /// cursor is in [`Session::state`] and the user's waits in [`Session::cursors`]. `None`
+    /// when no comp is open.
+    pub fn open_comps_to_save(&self) -> Option<effectcraft_project::OpenComps> {
+        let (active, times) = match self.cursors.user() {
+            Some(u) => (u.active_comp, &u.times),
+            None => (self.state.active_comp, &self.state.times),
+        };
+        let comps: Vec<effectcraft_project::OpenComp> = self
+            .state
+            .open_comps
+            .iter()
+            .filter(|c| self.project.comp(**c).is_some())
+            .map(|c| effectcraft_project::OpenComp { comp: *c, time: times.get(c).copied().unwrap_or(Tick::ZERO) })
+            .collect();
+        if comps.is_empty() {
+            return None;
+        }
+        let active = active.filter(|a| comps.iter().any(|c| c.comp == *a));
+        Some(effectcraft_project::OpenComps { comps, active })
+    }
+
+    /// Reopen the comps a project file says were open (After Effects reopens a project's
+    /// Timeline tabs): in their tab order, each at its saved current time (clamped to the comp
+    /// and snapped to a frame), the saved front one active. Ids of comps that no longer exist
+    /// (or repeat) are skipped. Returns whether any comp opened. Not an edit: no undo step and
+    /// the project stays unmodified.
+    pub fn restore_open_comps(&mut self, open: &effectcraft_project::OpenComps) -> bool {
+        let mut comps: Vec<ItemId> = Vec::new();
+        for oc in &open.comps {
+            let Some(c) = self.project.comp(oc.comp) else { continue };
+            if comps.contains(&oc.comp) {
+                continue;
+            }
+            let last = (c.duration - c.frame_duration()).max(Tick::ZERO);
+            self.state.times.insert(oc.comp, c.frame_rate.snap_nearest(oc.time.clamp(Tick::ZERO, last)));
+            comps.push(oc.comp);
+        }
+        let Some(active) = open.active.filter(|a| comps.contains(a)).or_else(|| comps.first().copied()) else { return false };
+        self.state.open_comps = comps;
+        self.open_comp(active);
+        true
     }
 }
 

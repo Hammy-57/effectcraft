@@ -83,6 +83,16 @@ a file that a newer EffectCraft saved shows a warning: fields this version doesn
 dropped if it saves the project. Save, Save As, Save a Copy and Increment and Save keep the
 file's format (`.ecprojx` stays XML).
 
+As in After Effects, a project file also remembers the compositions that were open: `openComps`
+(after the project) lists the Timeline/Composition tabs in tab order with each one's current
+time, and the one in front (`{"comps": [{"comp": 3, "time": <ticks>}], "active": 3}`). It is
+editor state, not part of `Project`: the save path fills it in from the user's `EditorState` at
+the moment of saving (`Session::open_comps_to_save`; while an agent's command runs, the user's
+cursor, never the agent's), so it has no undo step and switching tabs or moving the current time
+never marks the project modified. Opening a file (File ▸ Open, Open Recent, Revert, a recovered
+auto-save, which carries it too) reopens those comps (`Session::replace_project_with`), skipping
+comps that no longer exist; a file without it, or with none left, opens the first comp as before.
+
 `schema` changes when a saved value changes meaning; a project from an older schema is converted
 when it is opened (`effectcraft_engine::upgrade_effects`, which also refreshes effect instances
 from the registry) and saved with the current one, which older versions refuse to open rather than

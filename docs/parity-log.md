@@ -891,6 +891,13 @@ Recorded in one place on 10 October; each landed with tests.
 ## Update: 10 October 2026, undocked panels as OS windows
 
 - Interface: an undocked (floating) panel group is now an OS window of its own on the desktop, as in After Effects (egui multi-viewport): it can go to a second monitor, keeps its screen position and size in the workspace and across relaunches, closes its panels from its close button, and docks back with the panel menu's Dock Panel or by dragging a tab into the main window. The web and headless contexts keep the in-window floating groups.
+## Update: projects reopen their open comps
+
+Saving a project remembers the comps open in the Timeline/Composition tabs (in tab order), the
+one in front and each one's current time, and opening it (Open, Open Recent, Revert, a
+recovered auto-save) brings them back, as After Effects does with an `.aep`. Changing tabs or
+the time doesn't mark the project modified; comps deleted since are skipped; older files open as
+before.
 ## Update: Panel Group Settings ▸ Solo Panels in Stack and Small Tabs (10 October)
 
 - The panel menu's last two Panel Group Settings items work: Solo Panels in Stack
