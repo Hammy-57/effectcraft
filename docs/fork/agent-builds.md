@@ -42,6 +42,13 @@ and your focused tests. Report exactly what you ran.
 not even the coordinating session after merging. Elias starts CI himself, often on another
 computer.
 
+**Day and night.** During the day, agents write the regression test but don't run it: `cargo
+check` and clippy on the touched crates, then merge, saying in the merge message which tests
+weren't run. Every night at 22:00 UTC a cloud routine ("EffectCraft nightly: CI, tests, fixes,
+community PRs") does the heavy part: it merges upstream, runs those tests and the full CI, fixes
+main until green, opens or updates focused PRs to storytold for finished work, and leaves a
+morning summary.
+
 **The watchdog** (`.github/workflows/watchdog.yml`, set up at Elias's request) runs `cargo xtask ci
 --affected` on a free GitHub-hosted Linux runner after every push to `main`. It never blocks a push.
 A failure shows as the red ❌ on the commit (`gh run list --workflow watchdog.yml`) and in GitHub's email;
