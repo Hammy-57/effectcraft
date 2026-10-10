@@ -7,6 +7,7 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use crate::autosave::AutoSave;
+use crate::resources::{self, Target, UriError};
 use crate::tools::{self, Reply};
 use crate::{Backend, Error, base64};
 
@@ -248,21 +249,18 @@ impl McpServer {
                 }
                 Ok(result)
             }
-            "resources/list" => Ok(json!({"resources": [
-                {"uri": DOCUMENT_URI, "name": "document", "title": "Project", "description": "The project overview and the active composition (same as doc_inspect).", "mimeType": "application/json"},
-                {"uri": COMMANDS_URI, "name": "commands", "title": "Command catalog", "description": "Every engine command with id, label, menu, shortcut and params (same as command_list).", "mimeType": "application/json"},
-            ]})),
-            "resources/templates/list" => Ok(json!({"resourceTemplates": []})),
+            "resources/list" => Ok(json!({"resources": resources::list()})),
+            "resources/templates/list" => Ok(json!({"resourceTemplates": resources::templates(self.structured(params))})),
             "resources/read" => {
                 let uri = params.get("uri").and_then(Value::as_str).ok_or((INVALID_PARAMS, "missing `uri`".to_string()))?;
-                let tool = match uri {
-                    DOCUMENT_URI => "doc_inspect",
-                    COMMANDS_URI => "command_list",
-                    _ => return Err((RESOURCE_NOT_FOUND, format!("resource not found: {uri}"))),
-                };
-                match self.guarded(tool, &json!({})) {
+                let target = resources::parse(uri).map_err(uri_error)?;
+                let (tool, args) = target.tool();
+                match self.guarded(tool, &args) {
                     Ok(Reply::Json(v)) => Ok(json!({"contents": [{"uri": uri, "mimeType": "application/json", "text": v.to_string()}]})),
-                    Ok(Reply::Image { .. }) => Err((INTERNAL_ERROR, "unexpected image".into())),
+                    Ok(Reply::Image { png, .. }) => Ok(json!({"contents": [{"uri": uri, "mimeType": "image/png", "blob": base64::encode(&png)}]})),
+                    // A templated comp, layer or command that doesn't exist is "not found".
+                    Err(Error::BadArgs(e) | Error::App(e)) if !matches!(target, Target::Document | Target::Commands) => Err((RESOURCE_NOT_FOUND, e)),
+                    Err(Error::Engine(e)) if !matches!(target, Target::Document | Target::Commands) => Err((RESOURCE_NOT_FOUND, e.to_string())),
                     Err(e) => Err((INTERNAL_ERROR, e.to_string())),
                 }
             }
@@ -317,9 +315,13 @@ impl McpServer {
     }
 }
 
-/// The craft catalog resources (docs/mcp.md).
-const DOCUMENT_URI: &str = "effectcraft://document";
-const COMMANDS_URI: &str = "effectcraft://commands";
+/// A resource URI that can't be read, as a JSON-RPC error.
+fn uri_error(e: UriError) -> (i64, String) {
+    match e {
+        UriError::NotFound(m) => (RESOURCE_NOT_FOUND, m),
+        UriError::Invalid(m) => (INVALID_PARAMS, m),
+    }
+}
 
 /// Whether a request declares MCP 2026-07-28 or later in its `_meta` (a "modern" client, which
 /// negotiates per request instead of through `initialize`).

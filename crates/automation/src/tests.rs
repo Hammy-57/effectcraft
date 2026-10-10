@@ -1064,6 +1064,82 @@ fn command_tools_accept_id_as_an_alias() {
     assert!(err, "neither key is an error");
 }
 
+/// Send a request that must fail; returns the JSON-RPC error code.
+fn rpc_err(s: &mut McpServer, method: &str, params: Value) -> i64 {
+    let line = json!({"jsonrpc": "2.0", "id": 7, "method": method, "params": params}).to_string();
+    let reply: Value = serde_json::from_str(&s.handle_line(&line).expect("reply")).unwrap();
+    assert!(reply.get("result").is_none(), "{method} {params}: {reply}");
+    reply["error"]["code"].as_i64().unwrap()
+}
+
+/// Resource templates: comp, layer, frame (a PNG blob) and command; names are percent-decoded,
+/// and unknown or malformed URIs are errors, never panics.
+#[test]
+fn resource_templates_read_and_reject_bad_uris() {
+    use crate::resources::encode;
+    let mut s = server();
+    rpc(&mut s, 1, "initialize", json!({"protocolVersion": "2025-06-18"}));
+    let t = rpc(&mut s, 2, "resources/templates/list", json!({}));
+    let uris: Vec<&str> = t["resourceTemplates"].as_array().unwrap().iter().map(|t| t["uriTemplate"].as_str().unwrap()).collect();
+    assert_eq!(uris, ["effectcraft://comp/{comp}", "effectcraft://layer/{comp}/{layer}", "effectcraft://frame/{comp}/{time}", "effectcraft://command/{id}"]);
+    assert!(t["resourceTemplates"][0]["title"].is_string());
+
+    call_json(&mut s, "command_run", json!({"id": "comp.new", "params": {"name": "Main / Ünïcode", "width": 64, "height": 32, "duration": 2}}));
+    call_json(&mut s, "command_run", json!({"id": "layer.newSolid", "params": {"name": "Red bar", "color": "#ff0000"}}));
+    let comp = format!("effectcraft://comp/{}", encode("Main / Ünïcode"));
+    assert!(comp.contains("%2F"), "{comp}");
+    let read = |s: &mut McpServer, uri: &str| -> Value {
+        let r = rpc(s, 3, "resources/read", json!({"uri": uri}));
+        assert_eq!(r["contents"][0]["uri"], uri);
+        r["contents"][0].clone()
+    };
+    let json_of = |c: &Value| -> Value { serde_json::from_str(c["text"].as_str().unwrap()).unwrap() };
+    let c = read(&mut s, &comp);
+    assert_eq!(c["mimeType"], "application/json");
+    assert_eq!(json_of(&c), call_json(&mut s, "get_comp", json!({"comp": "Main / Ünïcode"})));
+    let id = json_of(&c)["id"].as_u64().unwrap();
+    assert_eq!(json_of(&read(&mut s, &format!("effectcraft://comp/{id}")))["id"], id, "numeric segment = item id");
+
+    let tree = json_of(&read(&mut s, &format!("{}/{}", comp.replace("/comp/", "/layer/"), encode("Red bar"))));
+    assert_eq!(tree["name"], "Red bar");
+    assert!(tree["properties"].is_object());
+    let flat = json_of(&read(&mut s, &format!("effectcraft://layer/{id}/%231?flat=true")));
+    assert!(flat["properties"].as_array().unwrap().iter().any(|p| p["path"] == "transform/opacity"), "{flat}");
+
+    let frame = read(&mut s, &format!("effectcraft://frame/{id}/0.5"));
+    assert_eq!(frame["mimeType"], "image/png");
+    assert!(frame.get("text").is_none());
+    assert_eq!(png_size(&base64::decode(frame["blob"].as_str().unwrap()).unwrap()), Some((64, 32)));
+    let small = read(&mut s, &format!("effectcraft://frame/{id}/0?max_side=16"));
+    assert_eq!(png_size(&base64::decode(small["blob"].as_str().unwrap()).unwrap()), Some((16, 8)));
+
+    let cmd = json_of(&read(&mut s, "effectcraft://command/layer.newText"));
+    assert_eq!(cmd["id"], "layer.newText");
+
+    for (uri, code) in [
+        ("effectcraft://nope/1", -32002),
+        ("https://example.com/", -32002),
+        ("effectcraft://comp/No%20such%20comp", -32002),
+        ("effectcraft://command/no.such", -32002),
+        (&format!("effectcraft://layer/{id}/Nobody") as &str, -32002),
+        ("effectcraft://comp/", -32602),
+        ("effectcraft://comp/a/b", -32602),
+        ("effectcraft://comp/%zz", -32602),
+        ("effectcraft://comp/%E2%28", -32602),
+        ("effectcraft://comp/%", -32602),
+        ("effectcraft://layer/1", -32602),
+        (&format!("effectcraft://frame/{id}/soon") as &str, -32602),
+        (&format!("effectcraft://frame/{id}/NaN") as &str, -32602),
+        (&format!("effectcraft://frame/{id}/1?max_side=-3") as &str, -32602),
+        (&format!("effectcraft://frame/{id}/1?bogus=1") as &str, -32602),
+        (&format!("effectcraft://layer/{id}/%231?flat=maybe") as &str, -32602),
+    ] {
+        assert_eq!(rpc_err(&mut s, "resources/read", json!({"uri": uri})), code, "{uri}");
+    }
+    assert_eq!(rpc_err(&mut s, "resources/read", json!({})), -32602);
+    assert_eq!(rpc(&mut s, 4, "ping", json!({})), json!({}));
+}
+
 /// A minimal JSON Schema check (type, required, properties, items): enough for outputSchema.
 fn validate(schema: &Value, v: &Value, at: &str) -> Result<(), String> {
     if let Some(t) = schema.get("type") {

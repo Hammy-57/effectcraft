@@ -42,9 +42,24 @@ Resources `effectcraft://document` and `effectcraft://commands` return JSON matc
 `doc_inspect` and `command_list`. Clients declaring MCP 2026-07-28 in per-request `_meta`
 receive `resultType: complete` and list/read cache hints; document reads are never cached.
 
+`resources/templates/list` offers four templates, read with `resources/read`:
+
+| Template | Content |
+| --- | --- |
+| `effectcraft://comp/{comp}` | `get_comp` JSON |
+| `effectcraft://layer/{comp}/{layer}` | `get_layer` tree JSON; `?flat=true` for the flat list |
+| `effectcraft://frame/{comp}/{time}` | PNG (`blob`, `image/png`) at comp time `time` seconds, longest side 960; `?max_side=N` (0 = full size, at most 8192) |
+| `effectcraft://command/{id}` | `describe_command` JSON |
+
+`{comp}` and `{layer}` take an id (a number), a name, or `#n` for a layer. Each segment is
+percent-encoded (`Main%20%2F%20Intro`, `%231`). An unknown scheme, kind, comp, layer or command
+returns `-32002`; malformed URIs (wrong segment count, bad escape or time, unknown query key)
+return `-32602`.
+
 ```json
 {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"command_run","arguments":{"id":"comp.new","params":{"width":640,"height":360}}}}
 {"jsonrpc":"2.0","id":2,"method":"resources/read","params":{"uri":"effectcraft://document"}}
+{"jsonrpc":"2.0","id":3,"method":"resources/read","params":{"uri":"effectcraft://frame/1/0.5?max_side=320"}}
 ```
 
 ## Progress and cancellation
