@@ -250,8 +250,7 @@ pub fn viewer_hook(
     if let (Some(start), Some(p)) = (marquee, resp.interact_pointer_pos()) {
         let r = Rect::from_two_pos(start, p);
         let t = app.tokens;
-        painter.rect_filled(r, 0.0, t.accent.gamma_multiply(0.12));
-        painter.rect_stroke(r, 0.0, Stroke::new(1.0, t.accent), egui::StrokeKind::Middle);
+        crate::widgets::marquee(painter, r, &t);
         if resp.drag_stopped() {
             let ids: Vec<u32> = hits.iter().filter(|h| r.contains(h.1)).map(|h| h.0).collect();
             ui.data_mut(|d| d.remove::<Pos2>(mid));
