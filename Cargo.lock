@@ -1156,7 +1156,7 @@ dependencies = [
 
 [[package]]
 name = "effectcraft-aep"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "effectcraft-color",
  "effectcraft-effects",
@@ -1191,7 +1191,7 @@ dependencies = [
 
 [[package]]
 name = "effectcraft-buildgen"
-version = "0.6.0"
+version = "0.7.0"
 
 [[package]]
 name = "effectcraft-cli"

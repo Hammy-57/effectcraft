@@ -7,7 +7,7 @@ use effectcraft_project::styles::{self as st, GROUP};
 use effectcraft_project::{Comp, ItemId, ItemKind, Layer, LayerSource, MaskMode, Project, Solid};
 use effectcraft_time::{FrameRate, Tick};
 
-use crate::{Image, NoFootage, RenderOpts, Renderer, render_frame};
+use crate::{render_frame, Image, NoFootage, RenderOpts, Renderer};
 
 const NORMAL: u32 = 0;
 const MULTIPLY: u32 = 3;
@@ -206,8 +206,11 @@ fn overlays_leave_antialiased_edges_clean() {
     let plain = edge(blue, &|_, _, _| {});
     assert!(near(plain[0][0], 0.5 * (blue[0] + bg[0]), 0.01), "half covered: {:?}", plain[0]);
     let color = Value::Color([blue[0] as f64, blue[1] as f64, blue[2] as f64, 1.0]);
-    let flat =
-        Gradient { colors: vec![(0.0, [blue[0], blue[1], blue[2], 1.0]), (1.0, [blue[0], blue[1], blue[2], 1.0])], opacities: vec![(0.0, 1.0), (1.0, 1.0)] };
+    let flat = Gradient {
+        colors: vec![(0.0, [blue[0], blue[1], blue[2], 1.0]), (1.0, [blue[0], blue[1], blue[2], 1.0])],
+        opacities: vec![(0.0, 1.0), (1.0, 1.0)],
+        ..Default::default()
+    };
     let styled: [(&str, Box<dyn Fn(&mut Project, &Comp, &mut Layer)>); 3] = [
         (
             "Color Overlay",
