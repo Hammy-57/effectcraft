@@ -1135,10 +1135,44 @@ fn render_frame_region_solo_item_and_overlays() {
 }
 
 #[test]
-fn bridge_render_params() {
+fn render_frames_contact_sheet() {
+    let mut s = render_server();
+    let (size, info) = call_image(&mut s, "render_frames", json!({"count": 4, "max_side": 800}));
+    assert_eq!(info["frames"], json!([0, 40, 79, 119]));
+    assert_eq!(size, (info["width"].as_u64().unwrap() as u32, info["height"].as_u64().unwrap() as u32));
+    assert!(size.0 <= 800 && size.1 <= 800);
+    assert!(info.get("png").is_none(), "the PNG travels as the image, not in the JSON");
+    let (_, info) = call_image(&mut s, "render_frames", json!({"times": [0, 1, 2], "layer": "Red", "overlays": ["motionPath"], "cols": 3, "labels": false}));
+    assert_eq!((info["cols"].as_u64(), info["rows"].as_u64()), (Some(3), Some(1)));
+    // Huge counts are capped, not trusted.
+    let (_, info) = call_image(&mut s, "render_frames", json!({"count": 1_000_000_000u64, "max_side": 256}));
+    assert_eq!(info["count"], 64);
+    assert_eq!(info["requested"], 1_000_000_000u64);
+    assert!(tool_error(&mut s, "render_frames", json!({"count": 0})).contains("at least 1"));
+    assert!(tool_error(&mut s, "render_frames", json!({"times": []})).contains("empty"));
+    assert!(tool_error(&mut s, "render_frames", json!({"start": 3, "end": 1})).contains("before"));
+    assert!(tool_error(&mut s, "render_frames", json!({"region": [400, 0, 10, 10]})).contains("outside"));
+    // Files: the sheet and an animated GIF.
+    let dir = std::env::temp_dir().join(format!("ec-mcp-frames-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (png, gif) = (dir.join("sheet.png"), dir.join("anim.gif"));
+    let info =
+        call_json(&mut s, "render_frames", json!({"count": 3, "max_side": 300, "path": png.to_string_lossy(), "gif": gif.to_string_lossy(), "inline": false}));
+    assert_eq!(info["gif"], json!(gif.to_string_lossy()));
+    assert!(std::fs::read(&png).unwrap().starts_with(b"\x89PNG"));
+    assert!(std::fs::read(&gif).unwrap().starts_with(b"GIF89a"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn bridge_render_frames_and_render_params() {
     let port = fake_app();
     let mut s = McpServer::new(Backend::bridge(&port.to_string()).unwrap());
     call_json(&mut s, "execute_command", json!({"command": "comp.new", "params": {"name": "B", "width": 64, "height": 32}}));
+    // The contact sheet runs the engine command in the app.
+    let (size, info) = call_image(&mut s, "render_frames", json!({"count": 2, "max_side": 200}));
+    assert_eq!(info["count"], 2);
+    assert_eq!(size.0 as u64, info["width"].as_u64().unwrap());
     // render_frame forwards the new arguments to the app's render.frame (the fake answers a 4×2 PNG).
     let (size, _) = call_image(&mut s, "render_frame", json!({"region": [0, 0, 8, 8], "overlays": true}));
     assert_eq!(size, (4, 2));

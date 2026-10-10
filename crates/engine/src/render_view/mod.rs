@@ -1,4 +1,5 @@
-//! Renders for agents and scripts: `render.frame`.
+//! Renders for agents and scripts: `render.frame` (one frame) and `render.contactSheet` (several
+//! frames on one labelled sheet, optionally also an animated GIF).
 //!
 //! A render can show a comp frame, a footage or solid item on its own (`item`), or one layer solo
 //! (`layer`, in its place in the comp); `region` renders just that rectangle of the comp at full
@@ -6,10 +7,11 @@
 //! `overlays` draws what the Composition viewer draws on top (layer bounds, anchor points, motion
 //! paths, safe margins, grid), so a headless agent can see where layers are.
 //!
-//! The MCP tools (`render_frame`, `render_preview`), the control channel's
+//! The MCP tools (`render_frame`, `render_preview`, `render_frames`), the control channel's
 //! `render.frame` and the CLI all go through [`request`] and [`Session::render_view`].
 
 mod overlay;
+mod sheet;
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -20,6 +22,7 @@ use effectcraft_time::{FrameRate, Tick};
 use serde_json::{Value, json};
 
 pub use overlay::{LayerGeom, Overlays, layer_geometry};
+pub use sheet::MAX_CELLS;
 
 use crate::commands::{CommandSpec, b_p, bad, comp_id, resolve_layer, str_p};
 use crate::{EngineError, Result, Session, query};
@@ -345,13 +348,25 @@ fn render_frame_cmd(s: &mut Session, p: &Value) -> Result<Value> {
     render_frame_reply(s, p, false)
 }
 
+fn contact_sheet_cmd(s: &mut Session, p: &Value) -> Result<Value> {
+    sheet::contact_sheet_reply(s, p)
+}
+
 pub fn specs() -> Vec<CommandSpec> {
-    vec![query!(
-        "render.frame",
-        "Render Frame",
-        "{comp?, item?, layer?, time? (s), frame?, max_side?, transparent?, region?: [x, y, w, h], overlays?: true|[bounds, anchor, motionPath, safeMargins, grid], path?, base64?}",
-        render_frame_cmd
-    )]
+    vec![
+        query!(
+            "render.frame",
+            "Render Frame",
+            "{comp?, item?, layer?, time? (s), frame?, max_side?, transparent?, region?: [x, y, w, h], overlays?: true|[bounds, anchor, motionPath, safeMargins, grid], path?, base64?}",
+            render_frame_cmd
+        ),
+        query!(
+            "render.contactSheet",
+            "Render Contact Sheet",
+            "{comp?, item?, layer?, times?: [s], count?, start? (s), end? (s), cols?, max_side?, labels?, transparent?, region?: [x, y, w, h], overlays?: true|[bounds, anchor, motionPath, safeMargins, grid], path?, gif?, base64?}",
+            contact_sheet_cmd
+        ),
+    ]
 }
 
 #[cfg(test)]

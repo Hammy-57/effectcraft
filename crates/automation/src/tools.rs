@@ -80,7 +80,7 @@ const READ_ONLY: &[&str] = &[
     "ui_elements",
 ];
 /// Tools that write files without changing the project.
-const WRITES_FILES: &[&str] = &["save_project", "render_frame", "screenshot"];
+const WRITES_FILES: &[&str] = &["save_project", "render_frame", "render_frames", "screenshot"];
 
 /// `get_project` → "Get project".
 fn title_of(name: &str) -> String {
@@ -385,7 +385,7 @@ fn add_keyframe(b: &mut Backend, a: &Value) -> Result<Reply> {
     json_reply(info)
 }
 
-/// The render arguments shared by render_frame / render_preview.
+/// The render arguments shared by render_frame / render_preview / render_frames.
 fn render_params(a: &Value, keys: &[&str]) -> Value {
     let entries: Vec<(&str, Option<&Value>)> = keys.iter().map(|k| (*k, get(a, k))).collect();
     obj(&entries)
@@ -405,6 +405,20 @@ fn render_frame(b: &mut Backend, a: &Value) -> Result<Reply> {
         return json_reply(info);
     }
     Ok(Reply::Image { png, info })
+}
+
+fn render_frames(b: &mut Backend, a: &Value) -> Result<Reply> {
+    let mut p = render_params(
+        a,
+        &["comp", "item", "layer", "times", "count", "start", "end", "cols", "max_side", "labels", "transparent", "region", "overlays", "path", "gif"],
+    );
+    p["base64"] = json!(true);
+    let mut r = b.exec("render.contactSheet", p)?;
+    let png = take_png(&mut r, "render.contactSheet")?;
+    if get(a, "inline").and_then(Value::as_bool) == Some(false) {
+        return json_reply(r);
+    }
+    Ok(Reply::Image { png, info: r })
 }
 
 /// Remove and decode the base64 `png` of a render reply.
@@ -725,7 +739,7 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "render_frame",
-        description: "Render a composition frame (default: the active comp at the current time) and return it as a PNG image, longest side `max_side` (default 960, 0 = full size). `region` renders one rectangle at full resolution (detail checks); `layer` renders one layer solo; `item` renders a footage or solid item on its own; `overlays` draws layer bounds, anchor points, motion paths, safe margins or the grid on top and lists each layer's comp-space bounds. `path` also writes the PNG to disk; `inline: false` returns only the metadata. Use it to check your work.",
+        description: "Render a composition frame (default: the active comp at the current time) and return it as a PNG image, longest side `max_side` (default 960, 0 = full size). `region` renders one rectangle at full resolution (detail checks); `layer` renders one layer solo; `item` renders a footage or solid item on its own; `overlays` draws layer bounds, anchor points, motion paths, safe margins or the grid on top and lists each layer's comp-space bounds. `path` also writes the PNG to disk; `inline: false` returns only the metadata. Use it to check your work; render_frames shows several times at once.",
         bridge_only: false,
         schema: || {
             schema(
@@ -745,6 +759,35 @@ static TOOLS: &[ToolDef] = &[
             )
         },
         run: render_frame,
+    },
+    ToolDef {
+        name: "render_frames",
+        description: "Several frames on ONE contact-sheet PNG, each cell labelled with its time and frame number: check an animation in one call. `times` (seconds) or `count` frames (default 6, at most 64) spread evenly over `start`..`end` (default the work area). `max_side` is the sheet's longest side (default 1600); `cols` overrides the grid. Takes render_frame's `layer`, `item`, `region`, `overlays` and `transparent`. `path` also writes the sheet, `gif` also writes an animated GIF of the frames. Returns the image plus {times, frames, cols, rows, cell, width, height}.",
+        bridge_only: false,
+        schema: || {
+            schema(
+                json!({
+                    "comp": comp_s(),
+                    "item": item_s(),
+                    "layer": solo_s(),
+                    "times": {"type": "array", "items": {"type": "number"}, "description": "Comp times in seconds (at most 64)."},
+                    "count": {"type": "integer", "minimum": 1, "description": "Frames spread evenly from `start` to `end` when `times` is not given (default 6, capped at 64)."},
+                    "start": {"type": "number", "description": "First time in seconds (default: work area start)."},
+                    "end": {"type": "number", "description": "End time in seconds, exclusive (default: work area end)."},
+                    "cols": {"type": "integer", "minimum": 1, "description": "Columns (default: a grid close to 16:10)."},
+                    "max_side": {"type": "integer", "description": "Longest side of the whole sheet in pixels (default 1600, 64-8192; 0 = 8192). Cells never exceed the frame's own size."},
+                    "labels": {"type": "boolean", "description": "Label each cell with its time and frame number (default true)."},
+                    "region": region_s(),
+                    "overlays": overlays_s(),
+                    "transparent": {"type": "boolean", "description": "Keep alpha (transparent gutters) instead of compositing over the comp background."},
+                    "path": {"type": "string", "description": "Also write the sheet PNG here."},
+                    "gif": {"type": "string", "description": "Also write an animated GIF of the frames here (delays follow the times)."},
+                    "inline": {"type": "boolean", "description": "Include the image in the reply (default true)."}
+                }),
+                &[],
+            )
+        },
+        run: render_frames,
     },
     ToolDef {
         name: "open_project",

@@ -96,6 +96,7 @@ See [MCP conventions](mcp.md) for core tools, resources, strict arguments, and r
 | `list_fonts {query?, rescan?}` | Font families text layers can use, bundled and installed, with their styles, origin and own-language name; `rescan` picks up fonts installed since launch. |
 | `add_effect {layer, effect, values?, comp?}` | Apply an effect and set its parameters in one call and one undo step (a failing value leaves nothing applied); returns the instance path (`effects/#n`) and its parameter paths. |
 | `render_frame {comp? \| item?, layer?, time?, max_side?, region?, overlays?, path?, inline?, transparent?}` | Returns a PNG image of a frame; `transparent: true` keeps the alpha (as an RGB + Alpha render writes it) instead of compositing over the comp background. `region: [x, y, w, h]` (comp pixels) renders just that rectangle at full resolution (then `max_side` applies to it); `layer` renders one layer solo in its place; `item` renders a footage or solid item on its own (source time). `overlays: true` (bounds + anchor) or a list of `bounds`, `anchor`, `motionPath`, `safeMargins`, `grid`, `all` draws the viewer's overlays (boxes tagged `#n name` in label colours) and returns each drawn layer's comp-space `bounds`, `anchor` and `keyPositions`. |
+| `render_frames {comp? \| item?, layer?, times? \| count?, start?, end?, cols?, max_side?, labels?, region?, overlays?, transparent?, path?, gif?, inline?}` | One contact-sheet PNG of several frames, each cell labelled with its time and frame number: `times` (s), or `count` frames (default 6, capped at 64) spread evenly over `start`..`end` (default the work area). `max_side` is the sheet's longest side (default 1600); `gif` also writes an animated GIF. Returns `{times, frames, cols, rows, cell, width, height}`. |
 | `open_project {path \| demo \| new}` / `save_project {path?}` | Open and save files. |
 | `undo {steps?}` / `redo {steps?}` | History. |
 | `history {goto?}` | The branching undo history (History panel): every state with its index, id, label, branch depth and whether it's current; `goto` (an index or id) jumps to any state, on any branch, without losing the others. |
@@ -141,6 +142,7 @@ Short recipes; every step is one tool call.
 | Drive with an expression | `set_property {"layer":2,"path":"transform/rotation","expression":"time*90"}` |
 | Inspect a layer | `get_layer {"layer":2,"flat":true}` (every property with its `path`, value, key count) |
 | Check the result | `render_frame {"time":1.5,"max_side":640}`; in bridge mode `screenshot {"panel":"Timeline"}` |
+| Check an animation | `render_frames {"count":8}` (one labelled sheet), `render_frames {"times":[0,0.5,1],"layer":2,"overlays":["motionPath"],"gif":"anim.gif"}` |
 | Where are the layers? | `render_frame {"overlays":true}` (boxes tagged `#n name`, anchors; reply `layers[].bounds`) |
 | Check a detail | `render_frame {"region":[800,400,320,180],"max_side":0}` (full resolution crop of a big comp) |
 | Undo a mistake | `undo {}`, or `history {}` then `history {"goto": n}` |
