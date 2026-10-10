@@ -1,0 +1,5 @@
+# Append-only files: git's built-in union driver keeps the lines both branches added, so
+# parallel agents appending to them never conflict. Only add lines; don't rewrite existing ones.
+docs/parity-log.md merge=union
+ATTRIBUTION.md merge=union
+contributors/people.toml merge=union

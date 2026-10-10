@@ -330,8 +330,31 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
         .collect();
     let all_key_times: Vec<(u64, usize, f64)> = cs.iter().flat_map(|c| c.keys.iter().map(move |k| (c.prop.uid, k.idx, k.t))).collect();
     super::graph_tools::transform_box(app, ui, &pc, &sel_keys, tm, &ymap, &vmap, speed, false, actions);
+    // Key marquee (dragging the background): the box now (the last one on release), the keys
+    // inside it, and the selection the keys show while it is dragged, as in After Effects.
+    let key_box = match (bg.dragged(), ctx.input(|i| i.pointer.press_origin()), bg.interact_pointer_pos()) {
+        (true, Some(o), Some(cur)) => Some(Rect::from_two_pos(o, cur)),
+        _ if bg.drag_stopped() => ctx.data(|d| d.get_temp::<Rect>(egui::Id::new("graph-box"))),
+        _ => None,
+    };
+    let box_keys: Option<Vec<KeyRef>> = key_box.map(|br| {
+        cs.iter()
+            .filter(|c| !c.layer.switches.locked)
+            .flat_map(|c| {
+                c.keys
+                    .iter()
+                    .filter(move |k| {
+                        let kp = pos2(tm.x(k.t), ymap(k.v));
+                        plot.expand(6.0).contains(kp) && br.contains(kp)
+                    })
+                    .map(move |k| KeyRef { layer: c.layer.id, prop: c.prop.uid, time: k.time })
+            })
+            .collect()
+    });
+    let current = app.session.state.selected_keys.clone();
+    let key_preview = box_keys.as_ref().map(|in_box| super::graph_tools::marquee_selection(&current, in_box, ui.input(|i| i.modifiers)));
+    let n_selected = current.len();
     // Keys and handles.
-    let mut key_screens: Vec<(serde_json::Value, Pos2)> = vec![];
     for c in &cs {
         let (lid, uid, d) = (c.layer.id, c.prop.uid, c.dim);
         for k in &c.keys {
@@ -340,7 +363,6 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
                 continue;
             }
             let kjson = json!({"layer": lid.0, "prop": uid, "time": k.time.seconds()});
-            key_screens.push((kjson.clone(), kp));
             // Handles (selected keys).
             for h in &k.handles {
                 let hp = pos2(tm.x(h.t), ymap(h.v));
@@ -394,12 +416,15 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
                 }
             }
             // The key itself.
-            let col = if k.sel { t.keyframe_selected } else { Color32::from_gray(0xe0) };
+            // Drawn selected: what a marquee being dragged would select, else the selection.
+            let shown = key_preview.as_ref().map_or(k.sel, |p| p.contains(&KeyRef { layer: lid, prop: uid, time: k.time }));
+            let col = if shown { t.keyframe_selected } else { Color32::from_gray(0xe0) };
             pc.rect_filled(Rect::from_center_size(kp, vec2(7.0, 7.0)), 0.0, col);
             pc.rect_stroke(Rect::from_center_size(kp, vec2(7.0, 7.0)), 0.0, Stroke::new(1.0, c.color), StrokeKind::Outside);
             let kr = Rect::from_center_size(kp, vec2(11.0, 11.0));
             let kresp = ui.interact(kr, egui::Id::new(("gkey", uid, d, k.idx)), Sense::click_and_drag());
-            app.auto.add(&format!("timeline.graph.key.{uid}.{d}.{}", k.idx), kr, &c.prop.name);
+            let label = if shown { format!("{} (selected)", c.prop.name) } else { c.prop.name.clone() };
+            app.auto.add(&format!("timeline.graph.key.{uid}.{d}.{}", k.idx), kr, &label);
             let mods = ui.input(|i| i.modifiers);
             let key = &c.prop.keys[k.idx];
             if kresp.clicked() && mods.command {
@@ -411,10 +436,10 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
                     let linear = key.in_interp == Interp::Linear && key.out_interp == Interp::Linear;
                     actions.push(("keys.interpolation".into(), json!({"interpolation": if linear { "autoBezier" } else { "linear" }})));
                 }
-            } else if kresp.clicked() && mods.shift {
-                actions.push(("keys.select".into(), json!({"keys": [kjson.clone()], "toggle": true})));
-            } else if (kresp.clicked() || kresp.drag_started()) && !k.sel {
-                actions.push(("keys.select".into(), json!({"keys": [kjson.clone()], "add": mods.shift})));
+            } else if let Some(p) = super::graph_tools::key_select_gesture(ui, &kresp, &json!({"keys": [kjson.clone()]}), k.sel, n_selected) {
+                // Selected on the press (Shift adds); a click on a selected key reduces the
+                // selection to it (Shift: takes it out).
+                actions.push(("keys.select".into(), p));
             }
             // A drag moves every selected key, by how far the pointer went from where the button
             // went down (the key doesn't jump under the pointer); Shift keeps it to the time or
@@ -454,20 +479,17 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
     if bg.clicked() {
         actions.push(("keys.select".into(), json!({"keys": []})));
     }
-    if bg.dragged()
-        && let (Some(o), Some(cur)) = (ctx.input(|i| i.pointer.press_origin()), bg.interact_pointer_pos())
-    {
-        let br = Rect::from_two_pos(o, cur);
+    if let Some(br) = key_box.filter(|_| bg.dragged()) {
         pc.rect_filled(br, 0.0, t.accent.gamma_multiply(0.12));
         pc.rect_stroke(br, 0.0, Stroke::new(1.0, t.accent), StrokeKind::Middle);
         ctx.data_mut(|d| d.insert_temp(egui::Id::new("graph-box"), br));
     }
+    // Releasing the marquee commits the selection its keys showed.
     if bg.drag_stopped()
-        && let Some(br) = ctx.data(|d| d.get_temp::<Rect>(egui::Id::new("graph-box")))
+        && let Some(in_box) = &box_keys
     {
         ctx.data_mut(|d| d.remove::<Rect>(egui::Id::new("graph-box")));
-        let keys: Vec<serde_json::Value> = key_screens.iter().filter(|(_, sp)| br.contains(*sp)).map(|(k, _)| k.clone()).collect();
-        actions.push(("keys.select".into(), json!({"keys": keys, "add": ui.input(|i| i.modifiers.shift)})));
+        actions.push(("keys.select".into(), super::graph_tools::marquee_params(in_box, ui.input(|i| i.modifiers), false)));
     }
     // Wheel over the graph with Alt/Ctrl zooms the value axis (turns auto-zoom off).
     if ui.rect_contains_pointer(plot) {

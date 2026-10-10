@@ -662,6 +662,69 @@ impl DockNode {
         self.panels(&mut v);
         v.len()
     }
+
+    /// The panel group holding `p` (a tab group, or a whole stacked panel group): its panels in
+    /// order and the index of the shown (first expanded) one.
+    pub fn group_of(&self, p: PanelKind) -> Option<(Vec<PanelKind>, usize)> {
+        match self {
+            DockNode::Split { a, b, .. } => a.group_of(p).or_else(|| b.group_of(p)),
+            DockNode::Tabs { panels, active } => panels.contains(&p).then(|| (panels.clone(), (*active).min(panels.len().saturating_sub(1)))),
+            DockNode::Stack { entries } => {
+                entries.iter().any(|e| e.panel == p).then(|| (entries.iter().map(|e| e.panel).collect(), entries.iter().position(|e| e.open).unwrap_or(0)))
+            }
+        }
+    }
+
+    /// Whether `p` is in a stacked panel group.
+    pub fn is_stacked(&self, p: PanelKind) -> bool {
+        match self {
+            DockNode::Split { a, b, .. } => a.is_stacked(p) || b.is_stacked(p),
+            DockNode::Tabs { .. } => false,
+            DockNode::Stack { entries } => entries.iter().any(|e| e.panel == p),
+        }
+    }
+
+    /// Panel Group Settings ▸ Stacked Panel Group: turn the tab group holding `p` into a stack
+    /// (its shown panel expanded, the others collapsed) or the stack holding `p` back into tabs
+    /// (`p` shown). False if `p` isn't docked; true (unchanged) if it already is as asked.
+    pub fn set_stacked(&mut self, p: PanelKind, stacked: bool) -> bool {
+        let new = match self {
+            DockNode::Split { a, b, .. } => return a.set_stacked(p, stacked) || b.set_stacked(p, stacked),
+            DockNode::Tabs { panels, active } if panels.contains(&p) => stacked.then(|| DockNode::Stack {
+                entries: panels.iter().enumerate().map(|(i, q)| StackEntry { panel: *q, open: i == *active, height: None }).collect(),
+            }),
+            DockNode::Stack { entries } if entries.iter().any(|e| e.panel == p) => (!stacked)
+                .then(|| DockNode::Tabs { panels: entries.iter().map(|e| e.panel).collect(), active: entries.iter().position(|e| e.panel == p).unwrap_or(0) }),
+            _ => return false,
+        };
+        if let Some(n) = new {
+            *self = n;
+        }
+        true
+    }
+
+    /// Add `p` as a tab of the first tab group (or stack), or as the only panel of an empty tree:
+    /// the last resort for re-docking a panel whose usual neighbours are all closed.
+    pub fn add_anywhere(&mut self, p: PanelKind) {
+        if self.contains(p) {
+            return;
+        }
+        fn rec(n: &mut DockNode, p: PanelKind) -> bool {
+            match n {
+                DockNode::Split { a, b, .. } => rec(a, p) || rec(b, p),
+                DockNode::Tabs { panels, active } => {
+                    panels.push(p);
+                    *active = panels.len() - 1;
+                    true
+                }
+                DockNode::Stack { entries } => {
+                    entries.push(StackEntry { panel: p, open: true, height: None });
+                    true
+                }
+            }
+        }
+        rec(self, p);
+    }
 }
 
 /// A full layout: the docked tree plus floating panels (what a workspace saves).
@@ -765,6 +828,33 @@ impl Layout {
     pub fn contains(&self, p: PanelKind) -> bool {
         self.root.contains(p) || self.floating.iter().any(|f| f.panels.contains(&p))
     }
+
+    /// The panel group holding `p`, docked or floating: its panels, the shown one's index and
+    /// whether it floats.
+    pub fn group_of(&self, p: PanelKind) -> Option<(Vec<PanelKind>, usize, bool)> {
+        if let Some(f) = self.floating.iter().find(|f| f.panels.contains(&p)) {
+            return Some((f.panels.clone(), f.active.min(f.panels.len().saturating_sub(1)), true));
+        }
+        self.root.group_of(p).map(|(panels, active)| (panels, active, false))
+    }
+
+    /// Panel Group Settings ▸ Undock Panel Group: float the whole docked group holding `p` at
+    /// `rect`, its tabs and shown panel kept. False if `p` already floats or its group is all
+    /// that is docked.
+    pub fn float_group(&mut self, p: PanelKind, rect: [f32; 4]) -> bool {
+        if self.floating.iter().any(|f| f.panels.contains(&p)) {
+            return false;
+        }
+        let Some((panels, active)) = self.root.group_of(p) else { return false };
+        if panels.len() >= self.root.panel_count() {
+            return false;
+        }
+        for q in &panels {
+            self.root.close(*q);
+        }
+        self.floating.push(Floating { panels, active, rect });
+        true
+    }
 }
 
 /// One laid-out tab group.
@@ -787,6 +877,9 @@ pub enum DockAction {
     Focus(PanelKind),
     Close(PanelKind),
     PanelMenu(PanelKind, egui::Pos2),
+    /// A right-click on a tab (of document `doc`, a Timeline comp tab) or on the empty part of a
+    /// group's tab strip: the panel menu at the pointer, as in After Effects.
+    TabMenu(PanelKind, Option<u64>, egui::Pos2),
     /// A tab started being dragged (re-dock or undock).
     BeginDrag(PanelKind),
     /// The tab's lock was toggled (Composition / Timeline viewer lock).
@@ -1044,6 +1137,11 @@ pub fn draw_group_chrome(ui: &mut egui::Ui, g: &Group, t: &Tokens, reg: &mut cra
             Some(id) => DockAction::CloseDoc(e.panel, id),
             None => DockAction::Close(e.panel),
         };
+        // The strip behind the tabs (they are on top of it) answers to a right-click.
+        let strip_resp = ui.interact(strip, egui::Id::new(("tab-strip", g.path.clone())), Sense::click());
+        if let Some(e) = entries.get(ai) {
+            reg.add(&format!("panel.strip.{}", e.panel.id()), strip, "panel group header");
+        }
         let mut x = strip.min.x + 12.0;
         let text_y = strip.min.y + 16.0;
         for (k, e) in entries.iter().enumerate() {
@@ -1157,7 +1255,22 @@ pub fn draw_group_chrome(ui: &mut egui::Ui, g: &Group, t: &Tokens, reg: &mut cra
             if resp.middle_clicked() {
                 out.actions.push(close(e));
             }
+            // Right-click (also on its ×, lock or ≡): bring the tab forward and open its panel
+            // menu.
+            if resp.secondary_clicked() || (ui.input(|i| i.pointer.secondary_clicked()) && ui.rect_contains_pointer(tab)) {
+                if g.stacked.is_none() {
+                    out.actions.push(activate(e));
+                }
+                out.actions.push(DockAction::Focus(*p));
+                out.actions.push(DockAction::TabMenu(*p, e.doc, ui.input(|i| i.pointer.interact_pos()).unwrap_or(tab.left_bottom())));
+            }
             x += w + 8.0;
+        }
+        // Right-clicking the empty part of the strip: the shown panel's menu.
+        if strip_resp.secondary_clicked()
+            && let Some(e) = entries.get(ai)
+        {
+            out.actions.push(DockAction::TabMenu(e.panel, e.doc, strip_resp.interact_pointer_pos().unwrap_or(strip.left_bottom())));
         }
     }
     // clicking anywhere in the panel focuses it
@@ -1415,5 +1528,29 @@ mod tests {
         let back: DockNode = serde_json::from_str(&s).unwrap();
         assert_eq!(back, d);
         assert_eq!(PanelKind::from_name("effects & presets"), Some(PanelKind::EffectsPresets));
+    }
+
+    #[test]
+    fn panel_groups_stack_and_float_whole() {
+        use PanelKind::*;
+        let mut d = workspace("Default");
+        assert_eq!(d.group_of(Layer), Some((vec![Composition, Layer], 0)));
+        assert_eq!(d.group_of(Audio).map(|g| g.0.len()), Some(5));
+        // Tabs -> stack (the shown panel expanded) -> tabs (the asked panel shown).
+        assert!(d.set_stacked(Layer, true) && d.is_stacked(Composition));
+        assert!(d.is_visible(Composition) && !d.is_visible(Layer));
+        assert!(d.set_stacked(Layer, false) && !d.is_stacked(Layer));
+        assert_eq!(d.group_of(Layer), Some((vec![Composition, Layer], 1)));
+        assert!(!d.set_stacked(Tracker, true), "not docked");
+        // A whole group floats; the last docked group can't.
+        let mut l = Layout { root: d, floating: vec![] };
+        assert!(l.float_group(Timeline, [0.0, 0.0, 400.0, 300.0]));
+        assert_eq!(l.group_of(RenderQueue), Some((vec![Timeline, RenderQueue], 0, true)));
+        assert!(!l.root.contains(Timeline) && !l.float_group(Timeline, [0.0; 4]));
+        let mut one = Layout { root: tabs(&[Project, Info], 0), floating: vec![] };
+        assert!(!one.float_group(Info, [0.0; 4]));
+        // Re-docking anywhere when nothing near is left.
+        one.root.add_anywhere(Tracker);
+        assert_eq!(one.root.group_of(Tracker), Some((vec![Project, Info, Tracker], 2)));
     }
 }

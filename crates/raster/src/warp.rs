@@ -31,7 +31,7 @@ impl Default for WarpOpts {
 }
 
 /// Box-filter halving (for minification).
-fn half(src: &Image) -> Image {
+pub(crate) fn half(src: &Image) -> Image {
     let w = src.width.div_ceil(2).max(1);
     let h = src.height.div_ceil(2).max(1);
     let mut out = Image::new(w, h);

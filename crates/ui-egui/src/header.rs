@@ -135,9 +135,14 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         .first()
         .and_then(|id| app.session.active_comp()?.layer(LayerId(*id)))
         .map(|l| effectcraft_engine::commands::shape_stroke::first_paint(l, l.layer_time(app.session.time())));
-    if let Some((fill, stroke, width)) = layer_paint {
+    let layer_kinds =
+        shape_layers.first().and_then(|id| app.session.active_comp()?.layer(LayerId(*id))).map(effectcraft_engine::commands::shape_stroke::first_kinds);
+    if let (Some((fill, stroke, width)), Some((fill_kind, stroke_kind))) = (layer_paint, layer_kinds) {
         let rgb = |c: [f64; 4]| [c[0] as f32, c[1] as f32, c[2] as f32];
         let tool = &mut app.session.state.shape_tool;
+        // The swatches show the layer's kinds too (None for a switched-off fill or stroke).
+        tool.fill.kind = fill_kind;
+        tool.stroke.kind = stroke_kind;
         if let Some(c) = fill {
             tool.fill.color = rgb(c);
         }
@@ -305,17 +310,7 @@ fn creates_buttons(app: &mut EffectcraftApp, ui: &mut egui::Ui, mut x: f32, cy: 
 /// Stroke Width: for new shapes, and for the selected shape layers. Returns the next x.
 fn fill_stroke_options(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, shape_layers: &[u64], mut x: f32, cy: f32) -> f32 {
     let t = app.tokens;
-    // The selected shape layers take the colours and the width too, one undo step per picker
-    // session or drag.
-    let paint = |app: &mut EffectcraftApp, key: &str, v: serde_json::Value| {
-        if shape_layers.is_empty() {
-            return;
-        }
-        let merge = format!("tool-{key}");
-        if let Err(e) = app.session.execute("shape.fillStroke", json!({"layers": shape_layers, key: v, "merge": merge})) {
-            app.ui.status = e.to_string();
-        }
-    };
+    let paint = |app: &mut EffectcraftApp, key: &str, v: serde_json::Value| paint_layers(app, shape_layers, json!({key: v}));
     for (key, title) in [("fill", "Fill"), ("stroke", "Stroke")] {
         let tp = if key == "fill" { &app.session.state.shape_tool.fill } else { &app.session.state.shape_tool.stroke }.clone();
         let options = format!("{title} Options");
@@ -343,7 +338,8 @@ fn fill_stroke_options(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Pa
                 let at = PaintKind::ALL.iter().position(|k| *k == tp.kind).unwrap_or(0);
                 let next = PaintKind::ALL.get((at + 1) % PaintKind::ALL.len()).copied().unwrap_or_default();
                 let k = format!("{key}Type");
-                tool_options(app, json!({k: next.id()}));
+                tool_options(app, json!({&k: next.id()}));
+                paint(app, &k, json!(next.id()));
             } else if tp.kind == PaintKind::Solid {
                 widgets::open_popup(ui, picker_id(key));
             } else {
@@ -355,7 +351,7 @@ fn fill_stroke_options(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Pa
             tool_options(app, json!({key: c}));
             paint(app, key, json!(c));
         }
-        paint_options_popup(app, ui, key, &options, wr.left_bottom());
+        paint_options_popup(app, ui, shape_layers, key, &options, wr.left_bottom());
         x = sr.max.x + 12.0;
     }
     let width = app.session.state.shape_tool.stroke_width;
@@ -368,9 +364,23 @@ fn fill_stroke_options(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Pa
     r.max.x + 14.0
 }
 
+/// The toolbar's Fill / Stroke changes (`shape.fillStroke` keys) on the selected shape layers, as
+/// in After Effects; one undo step per picker session or drag (the `tool-` merge key ends when
+/// the pointer is released).
+fn paint_layers(app: &mut EffectcraftApp, shape_layers: &[u64], mut v: serde_json::Value) {
+    let Some(obj) = v.as_object_mut().filter(|_| !shape_layers.is_empty()) else { return };
+    let merge = format!("tool-{}", obj.keys().next().map_or("paint", String::as_str));
+    obj.insert("layers".into(), json!(shape_layers));
+    obj.insert("merge".into(), json!(merge));
+    if let Err(e) = app.session.execute("shape.fillStroke", v) {
+        app.ui.status = e.to_string();
+    }
+}
+
 /// Fill Options / Stroke Options: None, Solid Color, Linear Gradient or Radial Gradient, and the
-/// blend mode and opacity new shapes get (After Effects' dialogs, applied as they change).
-fn paint_options_popup(app: &mut EffectcraftApp, ui: &mut egui::Ui, key: &str, title: &str, pos: egui::Pos2) {
+/// blend mode and opacity, for new shapes and the selected shape layers (After Effects' dialogs,
+/// applied as they change).
+fn paint_options_popup(app: &mut EffectcraftApp, ui: &mut egui::Ui, shape_layers: &[u64], key: &str, title: &str, pos: egui::Pos2) {
     let id = egui::Id::new(("tool-paint-options", key));
     if !widgets::popup_is_open(ui, id) {
         return;
@@ -428,7 +438,8 @@ fn paint_options_popup(app: &mut EffectcraftApp, ui: &mut egui::Ui, key: &str, t
         ui.data_mut(|d| d.insert_temp(id.with("open"), false));
     }
     if let Some(v) = set {
-        tool_options(app, v);
+        tool_options(app, v.clone());
+        paint_layers(app, shape_layers, v);
     }
 }
 
