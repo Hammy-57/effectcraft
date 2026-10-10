@@ -109,8 +109,9 @@ pub(crate) fn open_with_reader(name: &str, head: &[u8], reader: &SharedReader) -
 }
 
 /// Open the movie or audio file `path`: from `mem` when its contents are in memory, otherwise
-/// from disk through a file reader (containers keep only their index in memory), else read whole.
-pub(crate) fn open_source(path: &str, mem: Option<Arc<[u8]>>) -> Result<SharedSource> {
+/// from disk through a file reader (containers keep only their index in memory), else read whole
+/// (then `true`).
+pub(crate) fn open_source(path: &str, mem: Option<Arc<[u8]>>) -> Result<(SharedSource, bool)> {
     let name = file_name(path);
     let io = |e: std::io::Error| MediaError::Io(format!("{path}: {e}"));
     let reader: SharedReader = match &mem {
@@ -122,14 +123,14 @@ pub(crate) fn open_source(path: &str, mem: Option<Arc<[u8]>>) -> Result<SharedSo
     };
     let head = head(&*reader).map_err(io)?;
     if let Some(r) = open_with_reader(&name, &head, &reader) {
-        return r;
+        return r.map(|s| (s, false));
     }
     let bytes = match mem {
         Some(b) => b,
         None => read_whole(&*reader).map_err(io)?,
     };
     drop(reader);
-    filmcraft_codecs::open_bytes(&name, bytes).map_err(MediaError::from)
+    filmcraft_codecs::open_bytes(&name, bytes).map(|s| (s, true)).map_err(MediaError::from)
 }
 
 #[cfg(test)]

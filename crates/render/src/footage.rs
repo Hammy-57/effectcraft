@@ -29,9 +29,13 @@ pub trait FootageSource: Send + Sync {
     /// Set the decoded-frame cache budget in bytes (Settings ▸ Memory & CPU); sources without
     /// a cache ignore it.
     fn set_cache_budget(&self, _bytes: usize) {}
-    /// Drop the decoded frames it keeps (Edit ▸ Purge ▸ All Memory / Image Cache Memory): the
-    /// next reads decode again. Sources without a cache ignore it.
+    /// Drop the decoded frames it keeps (Edit ▸ Purge ▸ All Memory / Image Cache Memory) and close
+    /// the files nobody is reading: the next reads decode again. Sources without a cache ignore it.
     fn purge(&self) {}
+    /// Close the files (decoders, parsed models, cached frames) of footage `keep` doesn't name:
+    /// called when footage leaves the project or another project is opened. Sources that keep
+    /// nothing open ignore it.
+    fn retain_files(&self, _keep: &dyn Fn(&str) -> bool) {}
     /// Settings ▸ Disk ▸ Conformed Audio Folder: where decoded audio is kept between reads
     /// (`None` = off); sources that don't decode audio ignore it.
     fn set_conform_folder(&self, _folder: Option<std::path::PathBuf>) {}

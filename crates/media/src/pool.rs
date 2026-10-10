@@ -170,9 +170,77 @@ struct CacheState {
 /// (`None`: failed to open; not retried until `forget`).
 type SourceSlot = Arc<OnceLock<Option<SharedSource>>>;
 
+/// At most this many movie/audio files stay open (least recently used closed first).
+const MAX_SOURCES: usize = 24;
+
+/// Open files whose decoders hold their whole contents (WAV bytes, decoded MP3 / FLAC samples)
+/// are closed beyond this many bytes of such data (least recently used first).
+const SOURCE_BUDGET: usize = 1 << 30;
+
+struct SourceEntry {
+    slot: SourceSlot,
+    stamp: u64,
+    /// Bytes the source keeps in memory (estimated once it is open).
+    held: usize,
+}
+
+/// Open movie/audio files by path, least recently used closed first beyond [`MAX_SOURCES`] or
+/// [`SOURCE_BUDGET`].
+#[derive(Default)]
+struct Sources {
+    map: HashMap<Arc<str>, SourceEntry>,
+    clock: u64,
+}
+
+impl Sources {
+    /// The slot of `path` (created empty), marked as just used.
+    fn slot(&mut self, path: &Arc<str>) -> SourceSlot {
+        self.clock += 1;
+        let clock = self.clock;
+        let e = self.map.entry(path.clone()).or_insert_with(|| SourceEntry { slot: SourceSlot::default(), stamp: clock, held: 0 });
+        e.stamp = clock;
+        e.slot.clone()
+    }
+    /// Whether nothing but this map uses the source of `e` (no decode in progress, nobody waiting
+    /// for it to open).
+    fn idle(e: &SourceEntry) -> bool {
+        Arc::strong_count(&e.slot) == 1 && e.slot.get().is_none_or(|s| s.as_ref().is_none_or(|s| Arc::strong_count(s) == 1))
+    }
+    /// Close idle sources, least recently used first, until within the count and byte bounds
+    /// (`keep` stays open).
+    fn trim(&mut self, keep: &str) {
+        loop {
+            let held: usize = self.map.values().map(|e| e.held).fold(0, usize::saturating_add);
+            if self.map.len() <= MAX_SOURCES && held <= SOURCE_BUDGET {
+                return;
+            }
+            let oldest = self.map.iter().filter(|(p, e)| &***p != keep && Self::idle(e)).min_by_key(|(_, e)| e.stamp).map(|(p, _)| p.clone());
+            let Some(p) = oldest else { return };
+            self.map.remove(&p);
+        }
+    }
+    /// Close every idle source.
+    fn close_idle(&mut self) {
+        self.map.retain(|_, e| !Self::idle(e));
+    }
+}
+
+/// Bytes a source keeps in memory: decoders that read the file whole keep its bytes (WAV) or its
+/// decoded samples (MP3, FLAC); containers read through the file keep their index.
+fn held_bytes(src: &SharedSource, whole: bool) -> usize {
+    if !whole {
+        return 1 << 20;
+    }
+    let info = src.info();
+    let file = info.file_size.unwrap_or(0);
+    let decoded =
+        info.audio.as_ref().map_or(0.0, |a| info.duration.0 as f64 / TICKS_PER_SECOND as f64 * f64::from(a.sample_rate) * f64::from(a.channels) * 4.0);
+    usize::try_from(file).unwrap_or(usize::MAX).max(decoded.clamp(0.0, usize::MAX as f64) as usize)
+}
+
 struct Inner {
     /// Opened movie/audio sources by path.
-    sources: Mutex<HashMap<Arc<str>, SourceSlot>>,
+    sources: Mutex<Sources>,
     /// Files opened into `sources` (see [`PoolStats::opened`]).
     opened: AtomicU64,
     /// In-memory files registered with `add_bytes` (web builds, tests).
@@ -300,12 +368,27 @@ impl MediaPool {
     /// Drop every cached frame and decoder.
     pub fn clear(&self) {
         self.clear_frames();
-        lock(&self.inner.sources).clear();
+        lock(&self.inner.sources).map.clear();
+    }
+
+    /// Movie and audio files open now.
+    pub fn open_files(&self) -> usize {
+        lock(&self.inner.sources).map.len()
+    }
+
+    /// Forget every file `keep` doesn't name: close its decoder, drop its parsed model and its
+    /// cached frames (after footage is removed from the project, or another project is opened).
+    pub fn retain_files(&self, keep: &dyn Fn(&str) -> bool) {
+        let gone: Vec<Arc<str>> = lock(&self.inner.sources).map.keys().filter(|p| !keep(p)).cloned().collect();
+        for p in &gone {
+            self.forget(p);
+        }
+        lock(&self.inner.models).retain(|p, _| keep(p));
     }
 
     /// Forget a file (after it changed on disk, or to retry a file that failed to open).
     pub fn forget(&self, path: &str) {
-        lock(&self.inner.sources).remove(path);
+        lock(&self.inner.sources).map.remove(path);
         lock(&self.inner.models).remove(path);
         let mut c = lock(&self.inner.cache);
         let keys: Vec<Key> = c.lru.map.keys().filter(|k| &*k.path == path).cloned().collect();
@@ -523,20 +606,35 @@ impl Inner {
     /// FLAC in full at once (#408). Containers are read through the file (index now, samples on
     /// demand), not held in memory.
     fn source(&self, path: &Arc<str>) -> Option<SharedSource> {
-        let slot = lock(&self.sources).entry(path.clone()).or_default().clone();
-        slot.get_or_init(|| {
-            self.opened.fetch_add(1, Ordering::Relaxed);
-            let mem = lock(&self.files).get(&**path).cloned();
-            let opened = crate::open::open_source(path, mem);
-            match opened {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    log::warn!("media: cannot open {path}: {e}");
-                    None
+        let slot = lock(&self.sources).slot(path);
+        let mut held = None;
+        let src = slot
+            .get_or_init(|| {
+                self.opened.fetch_add(1, Ordering::Relaxed);
+                let mem = lock(&self.files).get(&**path).cloned();
+                match crate::open::open_source(path, mem) {
+                    Ok((s, whole)) => {
+                        held = Some(held_bytes(&s, whole));
+                        Some(s)
+                    }
+                    Err(e) => {
+                        log::warn!("media: cannot open {path}: {e}");
+                        None
+                    }
                 }
+            })
+            .clone();
+        if let Some(h) = held {
+            let mut sources = lock(&self.sources);
+            if let Some(e) = sources.map.get_mut(path)
+                && Arc::ptr_eq(&e.slot, &slot)
+            {
+                e.held = h;
             }
-        })
-        .clone()
+            drop(slot);
+            sources.trim(path);
+        }
+        src
     }
 
     /// The frame index (in the footage's interpreted rate) shown at source time `t`, after
@@ -696,6 +794,10 @@ impl FootageSource for MediaPool {
     }
     fn purge(&self) {
         self.clear_frames();
+        lock(&self.inner.sources).close_idle();
+    }
+    fn retain_files(&self, keep: &dyn Fn(&str) -> bool) {
+        MediaPool::retain_files(self, keep);
     }
     fn cache_budget(&self) -> Option<usize> {
         Some(self.budget())
@@ -845,6 +947,37 @@ mod tests {
         let before = Inner::locate(&footage, Tick::ZERO).key;
         footage.layer.as_mut().unwrap().crop_bounds = Some([1.0, 0.0, 21.0, 40.0]);
         assert!(before != Inner::locate(&footage, Tick::ZERO).key);
+    }
+
+    /// Open files are bounded (least recently used closed first), purging closes the idle ones,
+    /// and files the project no longer names are closed.
+    #[test]
+    fn open_files_are_bounded_and_released() {
+        let pool = MediaPool::new();
+        let wav: Arc<[u8]> = filmcraft_media::wav::write_wav16(&[0.25; 9600], 2, 48_000).into();
+        let footage = |i: usize| {
+            let path = format!("/mem/tone{i}.wav");
+            pool.add_bytes(&path, wav.clone());
+            Footage { path, kind: FootageKind::Audio, duration: Tick::from_seconds_f64(0.1), has_audio: true, ..Default::default() }
+        };
+        let files: Vec<Footage> = (0..MAX_SOURCES + 6).map(footage).collect();
+        for f in &files {
+            assert!(pool.audio_samples(f, Tick::ZERO, 16, 48_000).iter().all(|v| (*v - 0.25).abs() < 1e-3));
+        }
+        assert_eq!(pool.open_files(), MAX_SOURCES);
+        assert!(lock(&pool.inner.sources).map.contains_key(files[MAX_SOURCES + 5].path.as_str()), "the newest stays open");
+        assert!(!lock(&pool.inner.sources).map.contains_key(files[0].path.as_str()), "the oldest was closed");
+        // Reopened on demand.
+        assert!(pool.audio_samples(&files[0], Tick::ZERO, 16, 48_000).iter().all(|v| (*v - 0.25).abs() < 1e-3));
+        pool.retain_files(&|p| p == files[1].path || p == files[2].path || p == files[0].path);
+        assert!(pool.open_files() <= 3);
+        // A source in use isn't closed by a purge.
+        let busy = pool.inner.source(&Arc::from(files[0].path.as_str()));
+        FootageSource::purge(&pool);
+        assert_eq!(pool.open_files(), 1);
+        drop(busy);
+        FootageSource::purge(&pool);
+        assert_eq!(pool.open_files(), 0);
     }
 
     #[test]
