@@ -829,6 +829,22 @@ pub fn handle_shortcuts(app: &mut EffectcraftApp, ctx: &egui::Context) {
         if app.dialog.is_some() {
             continue;
         }
+        // The Composition panel also accepts the familiar Cmd/Ctrl +/- magnification keys.
+        // Preserve explicit user bindings and leave text editing to its own input handler.
+        if mods.command
+            && !mods.alt
+            && clipboard
+            && matches!(app.ui.focused, PanelKind::Composition | PanelKind::Viewer(_))
+            && matches!(key, egui::Key::Plus | egui::Key::Equals | egui::Key::Minus)
+            && !binds.iter().any(|(m, k, ..)| *k == key && mods_match(*m, mods))
+        {
+            let id = if key == egui::Key::Minus { "view.zoomOut" } else { "view.zoomIn" };
+            if let Err(error) = invoke(app, ctx, id, json!({})) {
+                app.ui.status = error;
+            }
+            ctx.input_mut(|i| i.consume_key(mods, key));
+            continue;
+        }
         // Enter in the Project panel renames the selected item (handled by the panel).
         if key == egui::Key::Enter && !mods.any() && app.ui.focused == PanelKind::Project {
             continue;

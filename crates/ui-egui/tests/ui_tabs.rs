@@ -321,3 +321,15 @@ fn render_queue_close_button_hides_panel_and_preserves_queue() {
     assert!(h.state().auto.find("panel.tab.RenderQueue.close").is_some());
     assert_eq!(h.state().session.project.render_queue, queue);
 }
+
+#[test]
+fn precomp_layer_double_click_opens_its_timeline_tab() {
+    let (mut h, pre, main) = harness();
+    let layer = h.state().session.active_comp().unwrap().layers[0].id.0;
+    let twirl = rect(&h, &format!("timeline.layer.{layer}.twirl"));
+    // The name area, away from the switches and twirl.
+    click_n(&mut h, twirl.center() + egui::vec2(70.0, 0.0), 2);
+    assert_eq!(open_comps(&h), vec![main, pre]);
+    assert_eq!(h.state().session.active_comp_id(), Some(ItemId(pre)));
+    assert!(h.state().auto.find(&format!("panel.tab.Timeline.{pre}")).is_some());
+}

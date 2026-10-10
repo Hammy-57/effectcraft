@@ -1240,7 +1240,21 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let t = app.tokens;
     let ctx = ui.ctx().clone();
     let Some(cid) = app.session.active_comp_id() else {
-        ui.painter().text(rect.center(), Align2::CENTER_CENTER, "(no composition)", Tokens::ui(12.0), t.text_faint);
+        ui.painter().text(rect.center(), Align2::CENTER_CENTER, "Drop footage here to create a composition", Tokens::ui(12.0), t.text_faint);
+        app.auto.add("timeline.empty", rect, "Drop footage to create a composition");
+        if let Some(crate::panels::DragPayload::Item(item)) = egui::DragAndDrop::payload::<crate::panels::DragPayload>(&ctx).as_deref()
+            && ui.rect_contains_pointer(rect)
+            && app.session.project.item(ItemId(*item)).is_some_and(|item| !item.is_folder())
+        {
+            ui.painter().rect_stroke(rect, 0.0, Stroke::new(2.0, t.accent), StrokeKind::Inside);
+            if ctx.input(|i| i.pointer.any_released()) {
+                app.session.state.project_selection = vec![ItemId(*item)];
+                if let Err(error) = crate::menus::invoke(app, &ctx, "file.newCompFromSelection", json!({})) {
+                    app.ui.status = error;
+                }
+                egui::DragAndDrop::clear_payload(&ctx);
+            }
+        }
         return;
     };
     let Some(comp) = app.session.project.comp_arc(cid) else { return };

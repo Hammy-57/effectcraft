@@ -183,3 +183,42 @@ fn a_short_project_panel_draws() {
         assert!(h.state().auto.find("project.empty").is_some(), "the Project panel drew at {height} points");
     }
 }
+
+#[test]
+fn dropping_footage_into_empty_timeline_creates_a_matching_comp() {
+    use effectcraft_engine::time::{FrameRate, Tick};
+    use effectcraft_ui_egui::dock::PanelKind;
+    let mut s = Session::default();
+    let footage = Footage {
+        kind: FootageKind::Video,
+        path: "clip.mp4".into(),
+        width: 720,
+        height: 480,
+        has_video: true,
+        frame_rate: FrameRate::FPS_24,
+        duration: Tick::from_seconds_f64(3.0),
+        pixel_aspect: 1.2,
+        ..Default::default()
+    };
+    let item = std::sync::Arc::make_mut(&mut s.project).add_item("Clip", Default::default(), None, ItemKind::Footage(footage));
+    let mut a = EffectcraftApp::new(s);
+    a.show_panel(PanelKind::Timeline);
+    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).build_eframe(move |_| a);
+    h.run_steps(3);
+    let from = center(&h, &format!("project.item.{}.name", item.0));
+    let to = center(&h, "timeline.empty");
+    h.input_mut().events.push(Event::PointerMoved(from));
+    h.step();
+    button(&mut h, from, true);
+    h.step();
+    for k in 1..=8 {
+        h.input_mut().events.push(Event::PointerMoved(from + (to - from) * (k as f32 / 8.0)));
+        h.step();
+    }
+    button(&mut h, to, false);
+    h.run_steps(3);
+    let comp = h.state().session.active_comp().expect("drop opens the created composition");
+    assert_eq!((comp.width, comp.height, comp.frame_rate, comp.duration, comp.pixel_aspect), (720, 480, FrameRate::FPS_24, Tick::from_seconds_f64(3.0), 1.2));
+    assert_eq!(comp.layers.len(), 1);
+    assert!(matches!(comp.layers[0].source, effectcraft_engine::project::LayerSource::Footage { item: source } if source == item));
+}
