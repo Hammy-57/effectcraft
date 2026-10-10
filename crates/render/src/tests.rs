@@ -832,3 +832,38 @@ fn text_effects_extend_beyond_glyph_bounds() {
         }
     }
 }
+
+#[test]
+fn text_colour_and_control_effects_keep_a_tight_raster() {
+    let (mut p, cid, comp) = setup();
+    let mut l = build::layer(&mut p, &comp, "Small title", LayerSource::Text, (200, 100), None);
+    l.props.prop_mut("text/sourceText").unwrap().value = Value::Text(Box::new(TextDoc { text: "H".into(), size: 18.0, ..Default::default() }));
+    add_effect_200(&mut p, &mut l, "ec.control.color", &[]);
+    add_effect_200(&mut p, &mut l, "ec.color.tint", &[("amount", Value::Scalar(70.0))]);
+    p.comp_mut(cid).unwrap().layers.push(l);
+    let c = p.comp(cid).unwrap();
+    let l = &c.layers[0];
+    let ctx = crate::EvalCtx::new(&p, cid, c, Tick::ZERO);
+    let r = crate::Renderer::new(&p, &crate::NoFootage, crate::RenderOpts::default());
+    let raw = r.layer_source(&ctx, l).unwrap();
+    let out = r.content_buf(&ctx, l).unwrap();
+    assert_eq!((out.img.width, out.img.height), (raw.img.width, raw.img.height));
+    assert!(out.offset.iter().zip(raw.offset).all(|(a, b)| (a - b).abs() < 1e-9));
+    assert!(out.img.data.len() < 1000, "a small title must not allocate a comp-sized effect buffer");
+}
+
+#[test]
+fn text_colour_alpha_creation_uses_the_canvas() {
+    let (mut p, cid, comp) = setup();
+    let mut l = build::layer(&mut p, &comp, "Text", LayerSource::Text, (200, 100), None);
+    l.props.prop_mut("text/sourceText").unwrap().value = Value::Text(Box::new(TextDoc { text: "H".into(), size: 18.0, ..Default::default() }));
+    add_effect_200(&mut p, &mut l, "ec.color.levels", &[("alphaOutBlack", Value::Scalar(1.0))]);
+    p.comp_mut(cid).unwrap().layers.push(l);
+    let c = p.comp(cid).unwrap();
+    let l = &c.layers[0];
+    let ctx = crate::EvalCtx::new(&p, cid, c, Tick::ZERO);
+    let r = crate::Renderer::new(&p, &crate::NoFootage, crate::RenderOpts::default());
+    let out = r.content_buf(&ctx, l).unwrap();
+    assert!(out.img.width >= 200 && out.img.height >= 100);
+    assert!(out.img.get(0, 0)[3] > 0.99);
+}
