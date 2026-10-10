@@ -206,3 +206,11 @@ opt-level = 3
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# Optimised builds for the owner's own use (scripts/fork/app.sh): release speed without the slow
+# link-time optimisation, parallel codegen and incremental rebuilds. Published builds use `release`.
+[profile.local]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
