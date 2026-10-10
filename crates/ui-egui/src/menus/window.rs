@@ -92,9 +92,10 @@ fn panel_op(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: Val
         }
         "smallTabs" => {
             let p = need(op)?;
-            let cur = app.ui.dock.small_tabs(p).ok_or_else(|| format!("{} is not docked", p.title()))?;
+            // Docked or undocked groups alike.
+            let cur = crate::dock::small_tabs(&app.ui.dock, &app.ui.floating, p).ok_or_else(|| format!("{} is not open", p.title()))?;
             let on = params.get("small").and_then(Value::as_bool).unwrap_or(!cur);
-            app.ui.dock.set_small_tabs(p, on);
+            crate::dock::set_small_tabs(&mut app.ui.dock, &mut app.ui.floating, p, on);
             Ok(json!({"small": on}))
         }
         "panelMenu" => {

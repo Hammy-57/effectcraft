@@ -400,7 +400,9 @@ impl EffectcraftApp {
         egui::Area::new(id).order(egui::Order::Middle).fixed_pos(rect.min).interactable(true).show(ctx, |ui| {
             let (r, _) = ui.allocate_exact_size(rect.size(), Sense::hover());
             ui.painter().rect_filled(r.expand(1.0), t.radius, Color32::from_black_alpha(90));
-            let strip = Rect::from_min_size(r.min, vec2(r.width(), t.tab_h));
+            // (Shorter with Small Tabs.)
+            let strip_h = f.strip_h(&t);
+            let strip = Rect::from_min_size(r.min, vec2(r.width(), strip_h));
             // Move by the strip (tabs, registered later, take precedence over it).
             let mv = ui.interact(strip, id.with("move"), Sense::drag());
             self.auto.add(&format!("panel.float.{i}.move"), strip, "Move floating panel");
@@ -411,7 +413,7 @@ impl EffectcraftApp {
             let g = Group {
                 path: format!("f{i}"),
                 rect: r,
-                content: Rect::from_min_max(pos2(r.min.x, r.min.y + t.tab_h), r.max),
+                content: Rect::from_min_max(pos2(r.min.x, r.min.y + strip_h), r.max),
                 panels: f.panels.clone(),
                 active: f.active.min(f.panels.len().saturating_sub(1)),
                 stacked: None,

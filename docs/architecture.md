@@ -630,8 +630,9 @@ workspace saves and relaunches; `Floating::rect` keeps the place relative to the
 for a new window and by the fallback. Older layouts without these fields load (`#[serde(default)]`).
 Closing the window closes its panels (as After Effects does); the panel menu's Dock Panel, the
 `window.*` commands and Window ▸ <panel> (which brings the window to the front) work as for any
-group. Shortcuts and the panel menu work in the window, and a tab dragged out of it lands where it
-is dropped, in the main window's dock or another undocked group (the window that has the pointer
+group, Panel Group Settings ▸ Small Tabs included (`Floating::small`; Undock Panel Group keeps a
+docked group's setting). Shortcuts and the panel menu work in the window, and a tab dragged out
+of it lands where it is dropped, in the main window's dock or another undocked group (the window that has the pointer
 feeds it to the dock's drop logic). Where egui embeds viewports (`ctx.embed_viewports()`: the web,
 the headless test harness, the snapshot example and the offscreen `mcp --ui` app) undocked groups
 float inside the main window instead, unchanged. Automation elements drawn in an undocked window

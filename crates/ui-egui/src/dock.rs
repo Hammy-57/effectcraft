@@ -610,12 +610,20 @@ pub struct Floating {
     /// until it has had an OS window (it then opens at `rect` relative to the main window).
     #[serde(default)]
     pub screen: Option<[f32; 4]>,
+    /// Panel Group Settings ▸ Small Tabs: a shorter tab strip with smaller labels.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub small: bool,
 }
 
 impl Floating {
     /// A new group (no OS window yet).
     pub fn new(panels: Vec<PanelKind>, active: usize, rect: [f32; 4]) -> Self {
-        Floating { panels, active, rect, id: 0, screen: None }
+        Floating { panels, active, rect, id: 0, screen: None, small: false }
+    }
+
+    /// The height of its tab strip ([`tab_strip_h`]).
+    pub fn strip_h(&self, t: &Tokens) -> f32 {
+        tab_strip_h(t, self.small)
     }
 }
 
@@ -985,11 +993,44 @@ impl Layout {
         if panels.len() >= self.root.panel_count() {
             return false;
         }
+        // The group keeps its Small Tabs (as a tab group turned into a stack does).
+        let small = self.root.small_tabs(p).unwrap_or(false);
         for q in &panels {
             self.root.close(*q);
         }
-        self.floating.push(Floating::new(panels, active, rect));
+        self.floating.push(Floating { small, ..Floating::new(panels, active, rect) });
         true
+    }
+
+    /// Panel Group Settings ▸ Small Tabs of the group holding `p`, docked or floating (`None`:
+    /// `p` isn't open).
+    pub fn small_tabs(&self, p: PanelKind) -> Option<bool> {
+        small_tabs(&self.root, &self.floating, p)
+    }
+
+    /// Turn Small Tabs on or off for the group holding `p`, docked or floating. False if `p`
+    /// isn't open.
+    pub fn set_small_tabs(&mut self, p: PanelKind, on: bool) -> bool {
+        set_small_tabs(&mut self.root, &mut self.floating, p, on)
+    }
+}
+
+/// [`Layout::small_tabs`] on the parts of a layout (the app keeps them apart).
+pub fn small_tabs(root: &DockNode, floating: &[Floating], p: PanelKind) -> Option<bool> {
+    match floating.iter().find(|f| f.panels.contains(&p)) {
+        Some(f) => Some(f.small),
+        None => root.small_tabs(p),
+    }
+}
+
+/// [`Layout::set_small_tabs`] on the parts of a layout.
+pub fn set_small_tabs(root: &mut DockNode, floating: &mut [Floating], p: PanelKind, on: bool) -> bool {
+    match floating.iter_mut().find(|f| f.panels.contains(&p)) {
+        Some(f) => {
+            f.small = on;
+            true
+        }
+        None => root.set_small_tabs(p, on),
     }
 }
 

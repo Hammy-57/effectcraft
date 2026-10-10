@@ -255,7 +255,8 @@ impl EffectcraftApp {
         let r = ui.max_rect();
         ui.painter().rect_filled(r, 0.0, t.app_bg);
         // Drag the empty part of the tab strip to move the window (tabs take precedence).
-        let strip = Rect::from_min_size(r.min, vec2(r.width(), t.tab_h));
+        let strip_h = f.strip_h(&t);
+        let strip = Rect::from_min_size(r.min, vec2(r.width(), strip_h));
         let mv = ui.interact(strip, egui::Id::new(("floating-os-panel", f.id, "move")), Sense::drag());
         self.auto.add(&format!("panel.float.{i}.move"), strip, "Move floating panel");
         if mv.drag_started() {
@@ -264,7 +265,7 @@ impl EffectcraftApp {
         let g = Group {
             path: format!("f{i}"),
             rect: r,
-            content: Rect::from_min_max(pos2(r.min.x, r.min.y + t.tab_h), r.max),
+            content: Rect::from_min_max(pos2(r.min.x, r.min.y + strip_h), r.max),
             panels: f.panels.clone(),
             active,
             stacked: None,
