@@ -19,6 +19,7 @@ mod convert;
 pub mod exr_channels;
 mod gif_anim;
 mod layered;
+mod open;
 pub use layered::vector_doc;
 mod pool;
 mod probe;

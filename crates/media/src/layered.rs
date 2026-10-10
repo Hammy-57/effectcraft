@@ -40,6 +40,11 @@ fn is_pdf_like(path: &str, bytes: &[u8]) -> bool {
     effectcraft_pdf::sniff(bytes).is_some() && (effectcraft_pdf::EXTENSIONS.contains(&ext.as_str()) || bytes.starts_with(b"%PDF"))
 }
 
+/// Whether [`probe`] takes a file starting with `head` (Photoshop, SVG, PDF / Illustrator / EPS).
+pub(crate) fn claims(path: &str, head: &[u8]) -> bool {
+    effectcraft_psd::is_psd(head) || is_svg(path, head) || effectcraft_pdf::sniff(head).is_some()
+}
+
 /// Footage for a Photoshop or vector file (`None` for other formats).
 pub(crate) fn probe(path: &str, bytes: &[u8]) -> Result<Option<Footage>> {
     if effectcraft_psd::is_psd(bytes) {

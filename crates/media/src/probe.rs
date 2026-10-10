@@ -13,14 +13,107 @@ pub const DEFAULT_SEQUENCE_RATE: FrameRate = FrameRate::FPS_30;
 
 /// Probe one file. Image sequences are made by the engine, which groups numbered stills
 /// (`effectcraft_engine::sequence`) and probes their first frame here.
+///
+/// Movies are probed from their index (read through the file, not loaded whole) and standalone
+/// compressed audio from its packet headers (not decoded); stills are read whole.
 pub fn probe(path: impl AsRef<Path>) -> Result<Footage> {
     let path = path.as_ref();
-    let bytes = std::fs::read(path).map_err(|e| MediaError::Io(format!("{}: {e}", path.display())))?;
+    let p = path.to_string_lossy();
     if crate::MODEL_EXTENSIONS.contains(&ext_of(path).as_str()) {
+        let bytes = crate::open::read_file(&p)?;
         let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
-        return probe_model(&path.to_string_lossy(), &bytes, &|uri| std::fs::read(dir.join(uri)).ok());
+        return probe_model(&p, &bytes, &|uri| std::fs::read(dir.join(uri)).ok());
     }
-    probe_bytes(&path.to_string_lossy(), bytes.into())
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use filmcraft_media::reader::SharedReader;
+        let io = |e: std::io::Error| MediaError::Io(format!("{}: {e}", path.display()));
+        let file = crate::open::FileReader::open(&p).map_err(io)?;
+        let head = crate::open::head(&file).map_err(io)?;
+        if !is_still(&p, &head) {
+            let name = crate::open::file_name(&p);
+            let reader: SharedReader = Arc::new(file);
+            if let Some(src) = crate::open::open_with_reader(&name, &head, &reader) {
+                return Ok(footage_from_info(&p, src?.info()));
+            }
+            if let Some(f) = probe_audio_headers(path, &name) {
+                return Ok(f);
+            }
+            let bytes = crate::open::read_whole(&*reader).map_err(io)?;
+            return probe_bytes(&p, bytes);
+        }
+        let bytes = crate::open::read_whole(&file).map_err(io)?;
+        probe_bytes(&p, bytes)
+    }
+    #[cfg(target_arch = "wasm32")]
+    probe_bytes(&p, crate::open::read_file(&p)?)
+}
+
+/// Whether [`probe_bytes`] takes a file starting with `head` as a still (or a layered / vector
+/// document) rather than handing it to FilmCraft.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+fn is_still(path: &str, head: &[u8]) -> bool {
+    let ext = ext_of(Path::new(path));
+    crate::STILL_EXTENSIONS.contains(&ext.as_str()) || crate::layered::claims(path, head) || crate::avif::sniff(head) || image::guess_format(head).is_ok()
+}
+
+/// A standalone MP3 / FLAC / Ogg / AIFF file described from its headers and packet framing,
+/// without decoding it (FilmCraft decodes these whole when they are opened): `None` when the file
+/// isn't one, or doesn't read cleanly (then it is probed by opening it, as before).
+///
+/// The duration is the sum of the packets' durations, which is what decoding them yields: FLAC's
+/// header gives it directly.
+#[cfg(not(target_arch = "wasm32"))]
+fn probe_audio_headers(path: &Path, name: &str) -> Option<Footage> {
+    use symphonia::core::codecs::CODEC_TYPE_FLAC;
+    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::meta::MetadataOptions;
+    use symphonia::core::probe::Hint;
+    let ext = ext_of(path);
+    if !matches!(ext.as_str(), "mp3" | "mp2" | "flac" | "ogg" | "oga" | "aif" | "aiff" | "aifc") {
+        return None;
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let size = file.metadata().ok()?.len();
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    hint.with_extension(&ext);
+    let mut format = symphonia::default::get_probe().format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default()).ok()?.format;
+    let track = format.default_track()?.clone();
+    let rate = track.codec_params.sample_rate?;
+    let frames = match track.codec_params.n_frames {
+        Some(n) if n > 0 && track.codec_params.codec == CODEC_TYPE_FLAC => n,
+        _ => {
+            let mut n = 0u64;
+            loop {
+                match format.next_packet() {
+                    Ok(pkt) if pkt.track_id() == track.id => n = n.saturating_add(pkt.dur),
+                    Ok(_) => {}
+                    Err(symphonia::core::errors::Error::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    // A damaged stream: open it the usual way (decoding skips what it can't read).
+                    Err(_) => return None,
+                }
+            }
+            n
+        }
+    };
+    let channels = track.codec_params.channels.map(|c| c.count() as u32)?;
+    if frames == 0 || rate == 0 || channels == 0 {
+        return None;
+    }
+    let codec = symphonia::default::get_codecs().get_codec(track.codec_params.codec).map(|d| d.short_name.to_uppercase()).unwrap_or_else(|| ext.to_uppercase());
+    let info = filmcraft_media::MediaInfo {
+        name: name.to_string(),
+        kind: filmcraft_media::MediaKind::AudioOnly,
+        duration: filmcraft_time::Tick::from_units(i64::try_from(frames).ok()?, i64::from(rate)),
+        video: None,
+        audio: Some(filmcraft_media::AudioStreamInfo { sample_rate: rate, channels, codec, bits_per_sample: track.codec_params.bits_per_sample }),
+        container: ext.to_uppercase(),
+        start_timecode: None,
+        file_size: Some(size),
+    };
+    Some(footage_from_info(&path.to_string_lossy(), &info))
 }
 
 /// Probe a 3D model (glTF 2.0 / OBJ): a [`FootageKind::Model`] item whose duration is its
