@@ -1140,6 +1140,11 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             app.ui.status = e;
         }
     }
+    // An unfinished shape/mask owns Pen presses, even where it crosses a motion path.
+    if app.ui.tool == Tool::Pen && ui.data(|d| d.get_temp::<(LayerId, u64)>(pen_id())).is_some() {
+        key_hits.clear();
+        motion_segments.clear();
+    }
     let gid = egui::Id::new("viewer-gesture");
     if let Some(hp) = resp.hover_pos() {
         app.pointer_comp = Some({
