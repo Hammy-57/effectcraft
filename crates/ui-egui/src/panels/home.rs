@@ -397,7 +397,7 @@ fn home_page(
 
     // Recent: heading, filter, clear.
     p.text(pos2(x0, y + 12.0), Align2::LEFT_CENTER, crate::i18n::tr("Recent"), Tokens::semibold(17.0), t.tab_text_active);
-    let entries = cached_recent_entries(&ctx, &app.session.prefs);
+    let entries = cached_recent_entries(ctx, &app.session.prefs);
     let fid = egui::Id::new("home-filter");
     let mut filter: String = ctx.data(|d| d.get_temp(fid)).unwrap_or_default();
     let fr = Rect::from_min_size(pos2(x0 + w - 240.0, y), vec2(240.0, 26.0));

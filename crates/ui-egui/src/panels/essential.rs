@@ -458,11 +458,11 @@ fn instance(app: &mut EffectcraftApp, ui: &mut egui::Ui, actions: &mut Actions) 
     let Some(layer) = app.session.state.selected_layers.iter().filter_map(|l| comp.layer(*l)).find(|l| essential::group(l).is_some()) else { return };
     let LayerSource::Comp { item: src } = layer.source else { return };
     let Some(eg) = app.session.project.comp(src).and_then(|c| c.essential.clone()) else { return };
-    let over = essential::overridden(&layer);
+    let over = essential::overridden(layer);
     let lt = layer.layer_time(app.session.time());
     ui.separator();
     ui.label(RichText::new(tr_args("Essential Properties — {}", &[&layer.name])).strong());
-    let group = essential::group(&layer).cloned().unwrap_or_else(|| effectcraft_engine::project::PropGroup::new(0, "", ""));
+    let group = essential::group(layer).cloned().unwrap_or_else(|| effectcraft_engine::project::PropGroup::new(0, "", ""));
     for c in eg.flat() {
         let m = essential::match_id(c.id);
         let mut pr = None;

@@ -812,7 +812,7 @@ fn half_alpha(w: usize, h: usize, alpha: &[u8]) -> ([usize; 2], Vec<u8>) {
                     n += 1;
                 }
             }
-            out.push(if n == 0 { 0 } else { ((sum + n / 2) / n) as u8 });
+            out.push((sum + n / 2).checked_div(n).map_or(0, |v| v as u8));
         }
     }
     ([ow, oh], out)
