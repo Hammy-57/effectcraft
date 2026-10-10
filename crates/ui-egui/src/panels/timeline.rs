@@ -2847,21 +2847,28 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 let tl = &mut app.ui.timeline;
                 // Twirled by hand, the layer shows its whole tree again.
                 tl.reveal.clear();
-                tl.layer_reveal.remove(&id);
                 let open = !tl.open_layers.contains(&id);
-                if open {
-                    tl.open_layers.insert(id);
+                let targets = if app.session.state.selected_layers.contains(&LayerId(id)) {
+                    app.session.state.selected_layers.iter().map(|l| l.0).collect::<Vec<_>>()
                 } else {
-                    tl.open_layers.remove(&id);
-                }
-                if all && let Some(l) = comp.layer(LayerId(id)) {
-                    let mut uids = vec![];
-                    walk_groups(&l.props, &mut uids);
-                    for u in uids {
-                        if open {
-                            tl.open_groups.insert(u);
-                        } else {
-                            tl.open_groups.remove(&u);
+                    vec![id]
+                };
+                for id in targets {
+                    tl.layer_reveal.remove(&id);
+                    if open {
+                        tl.open_layers.insert(id);
+                    } else {
+                        tl.open_layers.remove(&id);
+                    }
+                    if all && let Some(l) = comp.layer(LayerId(id)) {
+                        let mut uids = vec![];
+                        walk_groups(&l.props, &mut uids);
+                        for u in uids {
+                            if open {
+                                tl.open_groups.insert(u);
+                            } else {
+                                tl.open_groups.remove(&u);
+                            }
                         }
                     }
                 }

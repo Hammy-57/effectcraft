@@ -1590,3 +1590,36 @@ fn full_resolution_frames_wider_than_the_texture_limit_fit() {
     assert!(full(&mut h), "the full-size frame is shown (and stays readable): {:?}", h.state().ui.viewer.res);
     assert_eq!(h.state().viewer_texture_size(), Some([800, 134]), "2400×400 averaged by 3");
 }
+
+#[test]
+fn timeline_twirl_applies_clicked_state_to_selected_layers() {
+    let mut h = harness();
+    let a = layer_id(&h, "Box");
+    let b = layer_id(&h, "Plate");
+    let c = h.state_mut().session.execute("layer.newNull", json!({"name": "Other"})).unwrap()["layer"].as_u64().unwrap();
+    h.state_mut().session.execute("layer.select", json!({"layers": [a, b]})).unwrap();
+    h.state_mut().ui.timeline.open_layers.insert(b);
+    h.state_mut().ui.timeline.layer_reveal.insert(b, vec!["scale".into()]);
+    h.run_steps(3);
+    let selection = h.state().session.state.selected_layers.clone();
+    let at = rect(&h, &format!("timeline.layer.{a}.twirl")).center();
+    click(&mut h, at);
+    assert!(h.state().ui.timeline.open_layers.contains(&a));
+    assert!(h.state().ui.timeline.open_layers.contains(&b));
+    assert!(!h.state().ui.timeline.open_layers.contains(&c));
+    assert!(!h.state().ui.timeline.layer_reveal.contains_key(&b));
+    assert_eq!(h.state().session.state.selected_layers, selection);
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/test-out");
+    std::fs::create_dir_all(dir).unwrap();
+    h.render().unwrap().save(format!("{dir}/selected-layer-chevrons.png")).unwrap();
+    let at = rect(&h, &format!("timeline.layer.{a}.twirl")).center();
+    click(&mut h, at);
+    assert!(!h.state().ui.timeline.open_layers.contains(&a));
+    assert!(!h.state().ui.timeline.open_layers.contains(&b));
+    // Clicking an unselected layer leaves the selected layers alone.
+    let at = rect(&h, &format!("timeline.layer.{c}.twirl")).center();
+    click(&mut h, at);
+    assert!(h.state().ui.timeline.open_layers.contains(&c));
+    assert!(!h.state().ui.timeline.open_layers.contains(&a));
+    assert!(!h.state().ui.timeline.open_layers.contains(&b));
+}

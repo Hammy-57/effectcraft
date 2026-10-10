@@ -298,3 +298,25 @@ fn project_empty_area_double_click_and_dropped_files_import() {
     h.run_steps(2);
     assert_eq!(imports(&h), 2, "the dropped file was imported");
 }
+
+#[test]
+fn render_queue_close_button_hides_panel_and_preserves_queue() {
+    let (mut h, _, main) = harness();
+    h.state_mut().session.execute("renderQueue.add", json!({"comp": main})).unwrap();
+    let queue = h.state().session.project.render_queue.clone();
+    let rq = rect(&h, "panel.tab.RenderQueue");
+    click_n(&mut h, rq.center(), 1);
+    let close = rect(&h, "panel.tab.RenderQueue.close");
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/test-out");
+    std::fs::create_dir_all(dir).unwrap();
+    h.render().unwrap().save(format!("{dir}/render-queue-close.png")).unwrap();
+    click_n(&mut h, close.center(), 1);
+    assert!(!h.state().ui.dock.contains(PanelKind::RenderQueue));
+    assert!(h.state().ui.dock.contains(PanelKind::Timeline));
+    assert_eq!(h.state().session.active_comp_id(), Some(ItemId(main)));
+    assert_eq!(h.state().session.project.render_queue, queue);
+    h.state_mut().show_panel(PanelKind::RenderQueue);
+    h.run_steps(3);
+    assert!(h.state().auto.find("panel.tab.RenderQueue.close").is_some());
+    assert_eq!(h.state().session.project.render_queue, queue);
+}
