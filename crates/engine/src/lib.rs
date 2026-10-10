@@ -406,7 +406,7 @@ pub struct Session {
     pub warp_pending: Vec<(ItemId, LayerId, Uid)>,
     /// The last state whose analyses (Warp Stabilizer, 3D Camera Tracker, Roto Brush) were all
     /// checked after an edit: the next edit from it checks only the layers it changed.
-    analyses_checked: std::sync::Weak<Project>,
+    pub analyses_checked: std::sync::Weak<Project>,
     /// The running (or finished, not yet polled) 3D Camera Tracker analysis.
     pub camera_job: Option<camera_track::CameraJob>,
     /// 3D Camera Trackers waiting for (re-)analysis: (comp, layer, effect uid).
