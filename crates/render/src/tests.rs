@@ -790,3 +790,45 @@ fn layer_parameters_see_a_whole_shape_layer() {
         assert!(f.get(x, y)[3] < 0.01, "outside at ({x}, {y}): {:?}", f.get(x, y));
     }
 }
+
+/// #659: tiling and smearing text may paint beyond the glyph raster's original rectangle.
+#[test]
+fn text_effects_extend_beyond_glyph_bounds() {
+    for scale in [1.0, 0.5] {
+        for effect in ["ec.distort.cctiler", "ec.distort.ccsmear"] {
+            let (mut p, cid, comp) = setup();
+            let mut l = build::layer(&mut p, &comp, "Text", LayerSource::Text, (200, 100), None);
+            l.props.prop_mut("text/sourceText").unwrap().value = Value::Text(Box::new(TextDoc { text: "H".into(), size: 24.0, ..Default::default() }));
+            l.props.prop_mut("transform/position").unwrap().value = Value::Vec3([100.0, 70.0, 0.0]);
+            let vals = if effect.ends_with("cctiler") {
+                vec![("scale", Value::Scalar(50.0))]
+            } else {
+                vec![("from", Value::Vec2([108.0, 40.0])), ("to", Value::Vec2([165.0, 40.0])), ("radius", Value::Scalar(30.0)), ("reach", Value::Scalar(150.0))]
+            };
+            add_effect_200(&mut p, &mut l, effect, &vals);
+            p.comp_mut(cid).unwrap().layers.push(l);
+            let c = p.comp(cid).unwrap();
+            let l = &c.layers[0];
+            let ctx = crate::EvalCtx::new(&p, cid, c, Tick::ZERO);
+            let r = crate::Renderer::new(&p, &crate::NoFootage, crate::RenderOpts { scale, ..Default::default() });
+            let raw = r.layer_source(&ctx, l).unwrap();
+            let out = r.content_buf(&ctx, l).unwrap();
+            let mut outside = 0;
+            for y in 0..out.img.height {
+                for x in 0..out.img.width {
+                    let px = x as f64 + 0.5 - out.offset[0] + raw.offset[0];
+                    let py = y as f64 + 0.5 - out.offset[1] + raw.offset[1];
+                    if (px < 0.0 || py < 0.0 || px >= raw.img.width as f64 || py >= raw.img.height as f64) && out.img.get(x as i64, y as i64)[3] > 0.1 {
+                        outside += 1;
+                    }
+                }
+            }
+            assert!(outside > 5, "{effect} at {scale}: {outside} pixels outside original glyph raster");
+            // The source and zero-effect temporal input retain their original tight raster.
+            let input = r.layer_input(&ctx, l, 0).unwrap();
+            assert_eq!(input.img, raw.img);
+            let temporal = r.layer_input(&ctx, l, 1).unwrap();
+            assert_eq!(temporal.img, out.img);
+        }
+    }
+}

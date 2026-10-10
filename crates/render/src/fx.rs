@@ -292,6 +292,11 @@ impl<'a> Renderer<'a> {
             })
             .filter(|(_, _, s)| !effectcraft_effects::audio_fx::is_audio_effect(s.id))
             .collect();
+        // Text rasterisation is tight to the glyphs. Distortions and tilers need transparent
+        // output pixels beyond that rectangle, on CPU and GPU alike (#659).
+        if matches!(layer.source, LayerSource::Text) && !adjustment && !stack.is_empty() {
+            target.cpu(&mut |buf| text_effect_canvas(buf, layer_size));
+        }
         let accel = self.active_accel();
         let mut k = 0;
         while k < stack.len() {
@@ -357,4 +362,70 @@ fn fx_comp_space(ctx: &EvalCtx, layer: &Layer) -> Option<Mat3> {
         return None;
     }
     Some(ctx.layer_to_comp(layer).0)
+}
+
+/// Extend to the effect canvas without moving or resampling the original glyph pixels.
+fn text_effect_canvas(mut buf: Buf, size: [f64; 2]) -> Buf {
+    let lo = [buf.offset[0].floor().min(0.0), buf.offset[1].floor().min(0.0)];
+    let hi = [
+        (buf.offset[0] + size[0] * buf.scale).ceil().max(buf.img.width as f64),
+        (buf.offset[1] + size[1] * buf.scale).ceil().max(buf.img.height as f64),
+    ];
+    let (w, h) = (hi[0] - lo[0], hi[1] - lo[1]);
+    if !w.is_finite() || !h.is_finite() || w > 16384.0 || h > 16384.0 || w * h > 64_000_000.0 {
+        log::warn!("Text effect canvas exceeds the render limit; reduce the composition size or preview resolution");
+        return buf;
+    }
+    if lo == [0.0; 2] && w == buf.img.width as f64 && h == buf.img.height as f64 {
+        return buf;
+    }
+    let (width, height) = (w as u32, h as u32);
+    let Some(count) = (width as usize).checked_mul(height as usize) else { return buf };
+    let mut data = Vec::new();
+    if data.try_reserve_exact(count).is_err() {
+        log::warn!("Not enough memory to extend text effects; reduce the preview resolution");
+        return buf;
+    }
+    data.resize(count, [0.0; 4]);
+    let mut img = Image { width, height, data };
+    use rayon::prelude::*;
+    img.rows_mut().for_each(|(y, row)| {
+        for (x, px) in row.iter_mut().enumerate() {
+            *px = buf.img.get(lo[0] as i64 + x as i64, lo[1] as i64 + y as i64);
+        }
+    });
+    buf.img = img;
+    buf.offset[0] -= lo[0];
+    buf.offset[1] -= lo[1];
+    buf
+}
+
+#[cfg(test)]
+mod text_canvas_tests {
+    use super::*;
+
+    #[test]
+    fn expansion_keeps_the_pixel_grid_and_existing_extent() {
+        let source = Buf { img: Image::filled(3, 2, [0.2, 0.3, 0.4, 1.0]), offset: [-2.25, 1.5], scale: 0.5 };
+        let out = text_effect_canvas(source.clone(), [20.0, 10.0]);
+        assert_eq!((out.img.width, out.img.height), (11, 7));
+        assert_eq!(out.offset, [0.75, 1.5]);
+        for y in 0..2 {
+            for x in 0..3 {
+                assert_eq!(out.img.get(x + 3, y), source.img.get(x, y));
+            }
+        }
+        assert_eq!(out.img.get(0, 0), [0.0; 4]);
+        assert_eq!(out.img.get(10, 6), [0.0; 4]);
+    }
+
+    #[test]
+    fn oversized_canvas_keeps_existing_pixels() {
+        let source = Buf { img: Image::filled(3, 2, [0.2, 0.3, 0.4, 1.0]), offset: [0.0; 2], scale: 1.0 };
+        for size in [[f64::MAX, 10.0], [10.0, f64::INFINITY], [16000.0; 2]] {
+            let out = text_effect_canvas(source.clone(), size);
+            assert_eq!(out.img, source.img);
+            assert_eq!(out.offset, source.offset);
+        }
+    }
 }
