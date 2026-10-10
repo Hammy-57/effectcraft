@@ -29,10 +29,35 @@ tree from scratch. The fix is to build less per agent, and to make each build ch
 **Before you hand back:** `cargo fmt`, `cargo clippy -p <crates you touched> --all-targets -- -D warnings`,
 and your focused tests. Report exactly what you ran.
 
-**Once, after merging (the coordinating session):** one `cargo xtask ci --affected` on the merged
-`main` (or on the integration branch before it lands). That's the "combine, then build once"
-step: failures that only show up together surface here, and get fixed before anyone builds on them.
-The full `cargo xtask ci` stays for releases.
+**Landing your work:**
+1. Commit on your branch.
+2. Merge the latest `main` into your branch **once**, at the end (merge, don't rebase: a rebase
+   replays every commit and, when `main` moves again, means another rebuild). Then `cargo check`
+   the crates you touched: no full build, no test suite.
+3. Merge into `main`, then delete your worktree, branch and `target/agent-<name>`.
+4. Stop there. **Don't build the app or the release CLI after merging**, and don't ask another
+   session to: see "Building the app" below.
+
+**CI only when Elias says so.** No agent runs `cargo xtask ci` or `ci --affected` on its own,
+not even the coordinating session after merging. Elias starts CI himself, often on another
+computer.
+
+## Building the app
+
+Nobody builds the app after a merge. It's built when it's opened, once, however many merges
+happened in between:
+
+- **Dock:** `~/Applications/EffectCraft.app` (pinned to the Dock). A click opens the app at once
+  when nothing changed. When the code changed it shows "Building EffectCraft…" with a Stop button
+  and opens the app when the build is done. Stop, closing that window, Cmd-Q or Quit from the Dock
+  stop the build (the next click carries on where it stopped). A running app is never quit or
+  replaced: the click brings it to the front.
+- **Command line:** `scripts/fork/app.sh` (same thing; `--status` prints `running` / `stale` /
+  `ready`, `--build-only` builds without opening).
+- It builds with the `local` profile (release speed without link-time optimisation, parallel and
+  incremental codegen) in `target/local`, one build at a time (a lock), so a rebuild only recompiles
+  what changed. Published releases still use `release`.
+- After changing `scripts/fork/launcher.swift`, reinstall with `scripts/fork/install-dock-app.sh`.
 
 ## Cheaper builds
 

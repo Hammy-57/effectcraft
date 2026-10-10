@@ -8,7 +8,7 @@ EffectCraft is a clean-room, open-source, pure-Rust motion graphics and visual e
 2. Read the task in `plan/execution-plan.md` §3, the relevant section of `plan/architecture.md`, and the crate README/docs you touch. Feature ids: `plan/aftereffects/feature-catalog.md`; effects: `plan/aftereffects/effects-list.md`; UI reference: `plan/aftereffects/README.md`.
 3. Read [`docs/gaps.md`](docs/gaps.md): the honest assessment of where we fall short and the prioritised workstreams. Fidelity, reliability and stability (G1–G3) come before new features.
 4. Follow the autonomous operation protocol (`plan/execution-plan.md` §7). Don't stop to ask.
-5. **On the eliasx45 fork:** read [`docs/fork/agent-builds.md`](docs/fork/agent-builds.md) before building anything. While iterating, use `cargo check` and focused tests with `CARGO_BUILD_JOBS=4`; the coordinating session runs `cargo xtask ci --affected` once after merging. These rules override the per-change gates below.
+5. **On the eliasx45 fork:** read [`docs/fork/agent-builds.md`](docs/fork/agent-builds.md) before building anything. While iterating, use `cargo check` and focused tests with `CARGO_BUILD_JOBS=4`. To land: merge `main` into your branch once (no rebase), `cargo check`, merge, clean up. Never build the app or release CLI after merging (it builds itself on launch: `scripts/fork/app.sh`), and never run CI (`cargo xtask ci` / `--affected`) unless Elias asks. These rules override the per-change gates below.
 
 ## Non-negotiables
 **Read [`AGENTS.md`](AGENTS.md) first; its rules override everything here.** No Adobe assets, every asset licensed + attributed (`cargo xtask assets`).
