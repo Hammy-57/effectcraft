@@ -1,0 +1,78 @@
+# Fork-only (eliasx45/effectcraft): keep this file out of upstream pull requests.
+#
+# The watchdog: work lands on main without a CI run first (docs/fork/agent-builds.md). After each
+# push to main this runs `cargo xtask ci --affected` for what the push changed, on a free
+# GitHub-hosted Linux runner. A failure opens (or comments on) one issue labelled `watchdog`; the
+# next green run closes it. Nothing blocks a push.
+name: Watchdog
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# A newer push replaces a run that is still going.
+concurrency:
+  group: watchdog
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  affected:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Free disk space (a full test build needs more than the runner's default)
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev libasound2-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: watchdog
+      - name: cargo xtask ci --affected
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          base="$BEFORE"
+          if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then base="HEAD~1"; fi
+          echo "base: $base"
+          cargo xtask ci --affected --base "$base"
+
+      - name: Report a broken main
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh label create watchdog --color B60205 --description "main is broken (watchdog)" --force
+          body="🔴 \`cargo xtask ci --affected\` failed on main at ${GITHUB_SHA::9}: $(git log -1 --format=%s).
+          Log: $RUN"
+          open=$(gh issue list --label watchdog --state open --json number --jq '.[0].number')
+          if [ -n "$open" ]; then
+            gh issue comment "$open" --body "$body"
+          else
+            gh issue create --label watchdog --title "🔴 main is broken (watchdog)" --body "$body"
+          fi
+      - name: Close the issue once main is green again
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for n in $(gh issue list --label watchdog --state open --json number --jq '.[].number'); do
+            gh issue close "$n" --comment "🟢 green again at ${GITHUB_SHA::9}: $(git log -1 --format=%s)"
+          done
