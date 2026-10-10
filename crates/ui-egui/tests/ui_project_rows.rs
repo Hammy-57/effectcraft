@@ -221,4 +221,7 @@ fn dropping_footage_into_empty_timeline_creates_a_matching_comp() {
     assert_eq!((comp.width, comp.height, comp.frame_rate, comp.duration, comp.pixel_aspect), (720, 480, FrameRate::FPS_24, Tick::from_seconds_f64(3.0), 1.2));
     assert_eq!(comp.layers.len(), 1);
     assert!(matches!(comp.layers[0].source, effectcraft_engine::project::LayerSource::Footage { item: source } if source == item));
+    h.state_mut().session.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(h.state().session.project.comps().count(), 0, "one undo removes the new composition");
+    assert!(h.state().session.project.item(item).is_some(), "the original footage stays in the project");
 }
