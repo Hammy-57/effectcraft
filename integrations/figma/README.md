@@ -4,12 +4,29 @@ Bring Figma layers into the open EffectCraft composition as **native, editable l
 shape layers with real paths and fills, text layers you can retype, precomps for frames, nulls for
 groups, track mattes for masks, layer styles for shadows.
 
-There are two ways in, and both use the same importer (the engine command `file.importFigma`):
+There are two ways in, both without a Figma token, and both use the same importer (the engine
+command `file.importFigma`) and the same serializer ([`serialize.js`](serialize.js)):
 
-- **Agents and scripts** pass a Figma link (or node JSON) to `file.importFigma`. No clicking in Figma.
+- **Agents** get a Figma link and import it through the Figma MCP. Say "import <figma link>".
 - **People** select layers in Figma and click **Send** in the EffectCraft Transfer plug-in.
 
-## Agents: one command
+## Agents: "import <figma link>"
+
+Claude sessions with the Figma MCP signed in use the skill in [`skill/SKILL.md`](skill/SKILL.md)
+(install it at `~/.claude/skills/figma-to-effectcraft/SKILL.md`). It:
+
+1. parses the link (`figma.com/design/<fileKey>/…?node-id=12-345`);
+2. runs `serialize.js` inside the file with the MCP's `use_figma` tool (Figma Plugin API, headless,
+   no token). Its replies are capped at 20 KB, so `effectcraftSerialize({ids, fileKey, images:
+   'none', budget: 18000})` sends what fits and lists the rest in `pending`; calls with
+   `{subtree: [pending ids]}` return those subtrees as `fragments` until nothing is pending;
+3. fetches every node listed in `rasterize` as a PDF with the MCP's `download_assets` (PNG only if
+   the PDF fails), saving the URLs with `curl`;
+4. writes each reply to a part file and runs
+   `effectcraft-cli exec file.importFigma --bridge 9877 --params '{"payloadPaths": ["part-1.json", …]}'`;
+5. reports what came over natively and what came in as images (and in which format).
+
+**Optional: a token.** With a Figma personal access token, `file.importFigma` can fetch by itself:
 
 ```sh
 export FIGMA_TOKEN=figd_…   # Figma ▸ Settings ▸ Security ▸ Personal access tokens (File content: read)
@@ -23,9 +40,12 @@ effectcraft-cli exec file.importFigma --bridge 9877 \
   `fileKey` + `nodeIds: ["12:345", …]` does the same.
 - `target`: `newComp` (frame size → comp size), `activeComp` (centred in the open comp), or `auto`
   (the default: frames get new comps, anything else goes into the active comp).
-- `payload` takes Figma node JSON directly: the REST `GET /v1/files/:key/nodes?geometry=paths` reply, a
-  node or an array of nodes. Use `payloadPath` for a JSON file. Images can be included as
-  `"images": {"<node id>": {"png": "<base64>"} | {"path": "/file.png"}}`.
+- `payload` takes Figma node JSON directly: the REST `GET /v1/files/:key/nodes?geometry=paths` reply, the
+  serializer's output, a node or an array of nodes. Use `payloadPath` for a JSON file, or
+  `payloadPaths` for a payload in parts (the first file has `nodes`; later ones add `fragments`
+  for `{"$ref": id}` stubs, and `images`). Images can be included as
+  `"images": {"<node id>": {"pdf" | "png": "<base64>"} | {"pdfPath" | "path": "<file>", "bounds"?: "render"}}`;
+  an entry may list a PDF and a PNG, and the PNG is used only if the PDF can't be imported.
 - `dryRun: true` returns the plan (comps, layers, what would be rasterised) and changes nothing.
 - The token comes from `token`, `FIGMA_TOKEN`, or one stored with
   `effectcraft-cli exec figma.setToken --params '{"token":"figd_…"}'` (kept beside the settings,
@@ -40,26 +60,29 @@ why, and notes about anything approximated.
 
 1. **Install once.** In the Figma desktop app: **Plugins ▸ Development ▸ Import plugin from
    manifest…** and pick `integrations/figma/plugin/manifest.json` from this repository.
-2. **Start the bridge** (with EffectCraft open; its control channel is on 9877 when
-   **Settings ▸ Let Agents Control EffectCraft** is on, or `effectcraft --control 9877`):
+2. **Open EffectCraft.** It runs the Figma bridge itself on `127.0.0.1:7789` (Settings ▸
+   Scripting & Expressions ▸ **Let Figma Send Layers**, on by default). No terminal.
+3. **Connect once.** Run **Plugins ▸ Development ▸ EffectCraft Transfer** and click **Connect to
+   EffectCraft**. EffectCraft comes forward and asks **Connect Figma?**: click **Allow**. The
+   plug-in keeps the pairing code (in Figma's client storage), so this happens only once.
+4. **Send.** Select layers, choose **New comp** or **Into active comp**, then click **Send**. Each
+   transfer is one undo step in EffectCraft.
 
-   ```sh
-   effectcraft-cli figma-bridge
-   ```
+The bridge listens on 127.0.0.1 only, accepts browser requests only from the plug-in (origin
+`null`) or figma.com on the loopback host name, and imports only with the pairing code, which it
+hands out only after you click Allow (one prompt at a time; after Deny it waits a few seconds).
+The code is stored in the EffectCraft settings folder (`figma-bridge-code`).
 
-   It listens on `http://127.0.0.1:7789` and prints a **pairing code**. Options:
-   `--port 7789`, `--control 9877` (the app's control port), `--code CODE`. The code is stored in the
-   EffectCraft settings folder, so it stays the same next time.
-3. **Send.** In Figma, run **Plugins ▸ Development ▸ EffectCraft Transfer**. Paste the pairing
-   code once. The dot turns green when EffectCraft is reachable. Select layers, choose **New comp**
-   or **Into active comp**, then click **Send**. Each transfer is one undo step in EffectCraft.
+**Without the app's bridge** (the setting off, or a headless setup), run
+`effectcraft-cli figma-bridge` (`--port 7789`, `--control 9877`, `--code CODE`): it forwards to the
+app's control channel and prints the pairing code, which you paste into the plug-in once (it shows
+a code field instead of Connect).
 
 To use another port, change it in `manifest.json` (`devAllowedDomains`) and in `ui.html`
-(`BRIDGE`), then start the bridge with `--port`.
+(`BRIDGE`); `EFFECTCRAFT_FIGMA_BRIDGE_PORT` moves the app's bridge.
 
-The bridge accepts requests only from the plug-in (origin `null`), figma.com or non-browser clients,
-and only with the pairing code. It writes the payload to a temporary file and runs
-`file.importFigma {payloadPath}` in the app.
+**Editing the plug-in:** `plugin/code.js` is generated. Edit `serialize.js` or `plugin/src/main.js`
+and run `./build-plugin.sh` (a test fails when `code.js` is out of date).
 
 ## What transfers natively
 
@@ -85,14 +108,22 @@ they do in Figma. Each layer's comment holds its Figma node id.
 
 ## What comes in as an image
 
-These come in as PNG renders at 2× (the `scale` parameter), placed exactly over the node:
+These come in as **PDF** footage, placed exactly over the node. EffectCraft turns on Continuously
+Rasterize for them, so they stay sharp at any scale, and the page has no background (transparent
+where the node is). When a PDF can't be exported or imported, a PNG render at 2× (the `scale`
+parameter) is used instead; the reply's `rasterized` entries say which `format` each node used.
 
 - Layers with image, video, pattern or emoji fills (the whole layer, with its stroke and corners).
   A frame with an image fill comes in as one image, children included.
 - Node types without an EffectCraft counterpart: widgets, embeds, stickies, connectors, tables, and
   so on.
 
-Renders come from Figma's image export (`GET /v1/images` or the plug-in's `exportAsync`). They are
+Why PDF and not SVG: both stay sharp when scaled, but Figma's SVG export (tested through the Figma
+MCP's `download_assets`) adds an opaque canvas-coloured rectangle behind the node, and EffectCraft's
+SVG import drops what the SVG carries as filters and embedded images (drop shadows, image fills).
+The PDF export imports with all of it and with a transparent background.
+
+Renders come from Figma's image export (`exportAsync` in the plug-in and `use_figma`, `GET /v1/images` with a token, or the Figma MCP's `download_assets`). They are
 saved next to a saved project (`<project> Figma Assets/`) or in the settings folder, and imported as
 footage in a `<name> (Figma)` folder.
 
