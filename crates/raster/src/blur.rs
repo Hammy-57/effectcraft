@@ -436,20 +436,20 @@ pub fn radial_blur(img: &Image, center: (f64, f64), amount: f64, zoom: bool) -> 
         return img.clone();
     }
     let n = 32usize;
+    // Per-sample scale (zoom) or rotation (spin): the same for every pixel.
+    let steps: Vec<(f64, f64)> = (0..n)
+        .map(|i| {
+            let t = i as f64 / (n - 1) as f64 - 0.5;
+            if zoom { (1.0 + t * amount, 0.0) } else { (t * amount).to_radians().sin_cos() }
+        })
+        .collect();
     let mut out = Image::new(img.width, img.height);
     out.rows_mut().for_each(|(y, row)| {
         for (x, px) in row.iter_mut().enumerate() {
             let (vx, vy) = (x as f64 + 0.5 - center.0, y as f64 + 0.5 - center.1);
             let mut acc = [0.0f32; 4];
-            for i in 0..n {
-                let t = i as f64 / (n - 1) as f64 - 0.5;
-                let (sx, sy) = if zoom {
-                    let k = 1.0 + t * amount;
-                    (center.0 + vx * k, center.1 + vy * k)
-                } else {
-                    let (s, c) = (t * amount).to_radians().sin_cos();
-                    (center.0 + vx * c - vy * s, center.1 + vx * s + vy * c)
-                };
+            for &(s, c) in &steps {
+                let (sx, sy) = if zoom { (center.0 + vx * s, center.1 + vy * s) } else { (center.0 + vx * c - vy * s, center.1 + vx * s + vy * c) };
                 let p = img.sample_bilinear(sx, sy);
                 for ch in 0..4 {
                     acc[ch] += p[ch];
@@ -558,6 +558,44 @@ mod tests {
         assert_close(&directional_blur(&one, 0.0, 6.0, true), &slow, "1x1");
     }
 
+    /// Radial Blur before hoisting the per-sample angle out of the pixel loop.
+    fn radial_blur_ref(img: &Image, center: (f64, f64), amount: f64, zoom: bool) -> Image {
+        let n = 32usize;
+        let mut out = Image::new(img.width, img.height);
+        out.rows_mut().for_each(|(y, row)| {
+            for (x, px) in row.iter_mut().enumerate() {
+                let (vx, vy) = (x as f64 + 0.5 - center.0, y as f64 + 0.5 - center.1);
+                let mut acc = [0.0f32; 4];
+                for i in 0..n {
+                    let t = i as f64 / (n - 1) as f64 - 0.5;
+                    let (sx, sy) = if zoom {
+                        let k = 1.0 + t * amount;
+                        (center.0 + vx * k, center.1 + vy * k)
+                    } else {
+                        let (s, c) = (t * amount).to_radians().sin_cos();
+                        (center.0 + vx * c - vy * s, center.1 + vx * s + vy * c)
+                    };
+                    let p = img.sample_bilinear(sx, sy);
+                    for ch in 0..4 {
+                        acc[ch] += p[ch];
+                    }
+                }
+                *px = acc.map(|v| v / n as f32);
+            }
+        });
+        out
+    }
+
+    #[test]
+    fn radial_blur_is_bit_identical_to_reference() {
+        let img = noisy(41, 23);
+        for (amount, zoom) in [(30.0, false), (-7.5, false), (0.4, true), (-0.2, true)] {
+            let a = radial_blur(&img, (17.3, 9.1), amount, zoom);
+            let b = radial_blur_ref(&img, (17.3, 9.1), amount, zoom);
+            assert!(a.data.iter().zip(&b.data).all(|(p, q)| p.map(f32::to_bits) == q.map(f32::to_bits)), "{amount} {zoom}");
+        }
+    }
+
     /// Rough timing: `cargo test -p effectcraft-raster --release --lib blur_timing -- --ignored --nocapture`.
     #[test]
     #[ignore]
@@ -572,6 +610,12 @@ mod tests {
             let _ = directional_blur(&img, angle, length, false);
             eprintln!("directional {angle} deg len {length}: {slow:?} -> {:?}", t.elapsed());
         }
+        let t = std::time::Instant::now();
+        let _ = radial_blur_ref(&img, (960.0, 540.0), 20.0, false);
+        let slow = t.elapsed();
+        let t = std::time::Instant::now();
+        let _ = radial_blur(&img, (960.0, 540.0), 20.0, false);
+        eprintln!("radial spin: {slow:?} -> {:?}", t.elapsed());
     }
 
     #[test]
