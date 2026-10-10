@@ -35,6 +35,7 @@ mod layer;
 mod layer_menu;
 mod layer_time;
 mod layout_cmds;
+mod library;
 pub(crate) mod link;
 mod liquify;
 mod lottie;
@@ -219,6 +220,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(render_compare::specs());
         v.extend(crate::render_view::specs());
         v.extend(import_project::specs());
+        v.extend(library::specs());
         v
     })
 }

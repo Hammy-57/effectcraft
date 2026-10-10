@@ -104,16 +104,18 @@ fn import_project_merges_with_fresh_ids_and_one_undo() {
     assert_eq!(r["rootComps"], json!([main.0]));
     let comp = t.project.comp(main).unwrap();
     let nest = comp.layers.iter().find(|l| matches!(l.source, LayerSource::Comp { .. })).unwrap();
-    let LayerSource::Comp { item } = nest.source else { unreachable!() };
+    let item = nest.source.item().unwrap();
     assert_eq!(t.project.item(item).unwrap().name, "Inner");
     assert!(imported.contains(&item));
     let parent = nest.parent.unwrap();
     assert_eq!(comp.layer(parent).unwrap().name, "Rig");
 
     // A relative footage path resolves next to the imported project; a missing one is reported.
-    let data = t.project.items.values().find(|i| i.name == "data.json").unwrap();
-    let ItemKind::Footage(f) = &data.kind else { unreachable!() };
-    assert_eq!(std::path::Path::new(&f.path), dir.join("data.json"));
+    let data = t.project.items.values().find_map(|i| match &i.kind {
+        ItemKind::Footage(f) if i.name == "data.json" => Some(f.path.clone()),
+        _ => None,
+    });
+    assert_eq!(data.map(std::path::PathBuf::from), Some(dir.join("data.json")));
     assert_eq!(r["missingMedia"], json!(["/offline/gone.mov"]));
 
     // One undo step removes all of it; redo brings it back.
