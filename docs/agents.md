@@ -198,6 +198,30 @@ warnings}` (`prop.addKey`: `{keys, warnings}`), `set_property`, `add_keyframe` a
 `warnings` array, and `batch` gathers them as `step N (id): …`. Read them: a clamped Levels value
 renders very differently from what you meant.
 
+### Several agents at once
+
+Pass `client` on every request (`"client": "agentA"`) when you share the app with the user or other
+agents. Two things follow:
+
+- **Your own cursor.** Selection (layers, properties, keys, mask vertices, Project items), active comp
+  and current time are yours: `layer.select`, `time.set`, `comp.new` / `comp.open` and every command
+  that acts on "the selected layers" or "the active comp" use your copy, never the user's or another
+  agent's. Your first request starts from a copy of the user's cursor. A comp you create or open gets a
+  tab, but the user's viewer stays on what they are looking at. `editor.state` with your `client` is
+  your view; without one it is the user's, plus `clients` (each agent's active comp, time and selected
+  layers) and `claims`. At most 64 cursors are kept (the least recently used goes); requests without
+  `client` behave exactly as before.
+- **Claims.** `comp.claim {comp, ttl?}` reserves a comp for you (`ttl` seconds, default 300, at most
+  24 h; claim again to renew). While it holds, another client's command that would change the comp (its
+  layers, properties or name) or delete it is refused, changing nothing: `composition "Main" is claimed
+  by agentA (expires in 4m 12s); claim it after they release it, or work on another comp`. That includes
+  an `edit.undo` that would reach into it. The owner and the user (no `client`) edit as always; the
+  user never needs a claim. `comp.release {comp?}` releases one claim or, without `comp`, all of yours;
+  `comp.claims` lists them (`{comp, name, client, expiresIn, ttl}`). Claims expire on their own, are
+  dropped when another project is opened, and the control channel releases a client's claims when the
+  last connection that used that `client` closes (keep one connection open, as the MCP bridge does).
+  Without `client`, `comp.release` needs `force: true` (the user overriding a claim).
+
 ### A typical session
 
 1. `command_run {"id":"comp.new","params":{"name":"Intro","width":1920,"height":1080,"frameRate":30,"duration":4}}`

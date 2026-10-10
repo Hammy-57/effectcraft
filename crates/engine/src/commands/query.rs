@@ -206,6 +206,7 @@ fn state(s: &mut Session, _: &Value) -> Result<Value> {
     let mut v = serde_json::to_value(&s.state).unwrap_or_default();
     if let Some(o) = v.as_object_mut() {
         o.insert("revision".into(), json!(s.revision));
+        crate::agents::state_extras(s, o);
     }
     Ok(v)
 }
@@ -223,6 +224,11 @@ pub fn specs() -> Vec<CommandSpec> {
         query!("project.summary", "Project Summary", "{}", summary),
         query!("comp.info", "Composition Info", "{comp?}", comp_info),
         query!("layer.tree", "Layer Property Tree", "{layer?, comp?, depth?, time? (comp s)} → nodes with `path`", layer_tree),
-        query!("editor.state", "Editor State", "{}", state),
+        query!(
+            "editor.state",
+            "Editor State",
+            "{} → the editor state (yours when you pass `client`: your active comp, times, selection), revision, clients (other agents' cursors), claims",
+            state
+        ),
     ]
 }
