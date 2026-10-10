@@ -46,13 +46,133 @@ pub(crate) struct FrameGeom {
     pub mi_rows: usize,
     pub sb_cols: usize,
     pub sb_rows: usize,
+    pub tiles: TileLayout,
+}
+
+/// Uniformly spaced tiles (tile_info( ) with uniform_tile_spacing_flag = 1), chosen from the
+/// frame size alone so that the bitstream never depends on the machine or the thread count.
+pub(crate) struct TileLayout {
+    /// TileColsLog2 / TileRowsLog2.
+    pub cols_log2: usize,
+    pub rows_log2: usize,
+    /// minLog2TileCols, maxLog2TileCols, minLog2TileRows (for this cols_log2), maxLog2TileRows.
+    pub min_cols_log2: usize,
+    pub max_cols_log2: usize,
+    pub min_rows_log2: usize,
+    pub max_rows_log2: usize,
+    /// Tile width and height in superblocks (the last column / row may be smaller).
+    pub w_sb: usize,
+    pub h_sb: usize,
+    /// TileCols, TileRows.
+    pub cols: usize,
+    pub rows: usize,
+}
+
+/// Tiles are split into columns while each column keeps at least this many superblocks
+/// (1024 samples: 1080p stays one tile, 3840x2160 gets two columns, 7680x4320 four). Each tile restarts
+/// its CDF adaptation and loses the neighbours across its borders; two columns at 1080p cost
+/// about 0.6 % in size for little speed, since decisions are already parallel.
+const MIN_TILE_WIDTH_SB: usize = 16;
+/// MAX_TILE_WIDTH and MAX_TILE_AREA in 64x64 superblocks, MAX_TILE_COLS / MAX_TILE_ROWS.
+const MAX_TILE_WIDTH_SB: usize = 4096 >> 6;
+const MAX_TILE_AREA_SB: usize = (4096 * 2304) >> 12;
+const MAX_TILE_COLS: usize = 64;
+const MAX_TILE_ROWS: usize = 64;
+
+/// Superblocks per tile along a side of `n` superblocks split into `1 << log2` tiles.
+fn span(n: usize, log2: usize) -> usize {
+    n.div_ceil(1 << log2).max(1)
+}
+
+/// tile_log2( blkSize, target ): the smallest k with blkSize << k >= target.
+pub(crate) fn tile_log2(blk: usize, target: usize) -> usize {
+    let mut k = 0;
+    while blk.checked_shl(k as u32).is_some_and(|v| v < target) {
+        k += 1;
+    }
+    k
+}
+
+impl TileLayout {
+    fn new(sb_cols: usize, sb_rows: usize) -> TileLayout {
+        let min_cols_log2 = tile_log2(MAX_TILE_WIDTH_SB, sb_cols);
+        let max_cols_log2 = tile_log2(1, sb_cols.min(MAX_TILE_COLS));
+        let mut cols_log2 = min_cols_log2;
+        while cols_log2 < max_cols_log2 && span(sb_cols, cols_log2 + 1) >= MIN_TILE_WIDTH_SB {
+            cols_log2 += 1;
+        }
+        TileLayout::with_log2(sb_cols, sb_rows, cols_log2, 0)
+    }
+
+    /// A layout with at least `cols_log2` / `rows_log2` (raised to the minimum the frame size
+    /// requires and capped at the maximum it allows).
+    pub fn with_log2(sb_cols: usize, sb_rows: usize, cols_log2: usize, rows_log2: usize) -> TileLayout {
+        let min_cols_log2 = tile_log2(MAX_TILE_WIDTH_SB, sb_cols);
+        let max_cols_log2 = tile_log2(1, sb_cols.min(MAX_TILE_COLS));
+        let max_rows_log2 = tile_log2(1, sb_rows.min(MAX_TILE_ROWS));
+        let min_tiles_log2 = min_cols_log2.max(tile_log2(MAX_TILE_AREA_SB, sb_rows * sb_cols));
+        let cols_log2 = cols_log2.clamp(min_cols_log2, max_cols_log2.max(min_cols_log2));
+        let min_rows_log2 = min_tiles_log2.saturating_sub(cols_log2);
+        let mut rows_log2 = rows_log2.clamp(min_rows_log2, max_rows_log2.max(min_rows_log2));
+        // the rounded-up tile size may still exceed MAX_TILE_AREA
+        while rows_log2 < max_rows_log2 && span(sb_cols, cols_log2) * span(sb_rows, rows_log2) > MAX_TILE_AREA_SB {
+            rows_log2 += 1;
+        }
+        let (w_sb, h_sb) = (span(sb_cols, cols_log2), span(sb_rows, rows_log2));
+        TileLayout {
+            cols_log2,
+            rows_log2,
+            min_cols_log2,
+            max_cols_log2,
+            min_rows_log2,
+            max_rows_log2,
+            w_sb,
+            h_sb,
+            cols: sb_cols.div_ceil(w_sb).max(1),
+            rows: sb_rows.div_ceil(h_sb).max(1),
+        }
+    }
+
+    pub fn count(&self) -> usize {
+        self.cols * self.rows
+    }
+}
+
+/// The 4x4 rows r0..r1 and columns c0..c1 of a tile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TileRect {
+    pub r0: usize,
+    pub r1: usize,
+    pub c0: usize,
+    pub c1: usize,
 }
 
 impl FrameGeom {
     pub fn new(width: usize, height: usize) -> FrameGeom {
         let mi_cols = 2 * width.div_ceil(8);
         let mi_rows = 2 * height.div_ceil(8);
-        FrameGeom { width, height, mi_cols, mi_rows, sb_cols: mi_cols.div_ceil(16), sb_rows: mi_rows.div_ceil(16) }
+        let (sb_cols, sb_rows) = (mi_cols.div_ceil(16), mi_rows.div_ceil(16));
+        FrameGeom { width, height, mi_cols, mi_rows, sb_cols, sb_rows, tiles: TileLayout::new(sb_cols, sb_rows) }
+    }
+    /// The geometry with a given tile split (see `TileLayout::with_log2`).
+    pub fn with_tiles(width: usize, height: usize, cols_log2: usize, rows_log2: usize) -> FrameGeom {
+        let mut g = FrameGeom::new(width, height);
+        g.tiles = TileLayout::with_log2(g.sb_cols, g.sb_rows, cols_log2, rows_log2);
+        g
+    }
+    /// Tile `n` (raster order).
+    pub fn tile(&self, n: usize) -> TileRect {
+        let t = &self.tiles;
+        let (row, col) = (n / t.cols.max(1), n % t.cols.max(1));
+        let (r0, c0) = (row * t.h_sb * 16, col * t.w_sb * 16);
+        TileRect { r0, r1: (r0 + t.h_sb * 16).min(self.mi_rows), c0, c1: (c0 + t.w_sb * 16).min(self.mi_cols) }
+    }
+    /// The tile holding the 4x4 unit (r, c).
+    pub fn tile_at(&self, r: usize, c: usize) -> TileRect {
+        let t = &self.tiles;
+        let row = (r / 16 / t.h_sb).min(t.rows.saturating_sub(1));
+        let col = (c / 16 / t.w_sb).min(t.cols.saturating_sub(1));
+        self.tile(row * t.cols + col)
     }
     /// Padded plane size (whole superblocks).
     pub fn padded(&self, plane: usize) -> (usize, usize) {
@@ -179,6 +299,8 @@ pub(crate) struct Decider<'a> {
     intra_only: bool,
     src: &'a [Plane; 3],
     sb_row: usize,
+    /// The tile of the superblock being decided (intra edges stop at its borders).
+    tile: TileRect,
     /// Reconstruction strip per plane ((64 >> ss) + 1 rows).
     rec: [Plane; 3],
     refr: Option<&'a RefFrame>,
@@ -288,6 +410,7 @@ impl<'a> Decider<'a> {
             intra_only,
             src,
             sb_row,
+            tile: g.tile_at(sb_row * 16, 0),
             rec,
             refr,
             decoded: Box::new([[[false; 35]; 35]; 3]),
@@ -365,11 +488,12 @@ impl<'a> Decider<'a> {
     /// Decides superblock `sbc` of the row (reconstruction is written to `rec`).
     fn superblock(&mut self, sbc: usize) -> Node {
         let (r, c) = (self.sb_row * 16, sbc * 16);
+        self.tile = self.g.tile_at(r, c);
         // clear_block_decoded_flags( r, c, sbSize4 )
         for plane in 0..3 {
             let s = (plane > 0) as usize;
-            let sb_w4 = (self.g.mi_cols as isize - c as isize) >> s;
-            let sb_h4 = (self.g.mi_rows as isize - r as isize) >> s;
+            let sb_w4 = (self.tile.c1 as isize - c as isize) >> s;
+            let sb_h4 = (self.tile.r1 as isize - r as isize) >> s;
             let bd = &mut self.decoded[plane];
             for y in -1..=((16 >> s) as isize) {
                 for x in -1..=((16 >> s) as isize) {
@@ -545,8 +669,8 @@ impl<'a> Decider<'a> {
         let e = IntraEdge {
             x: c * 4,
             y: self.ry(0, r * 4),
-            have_left: c > 0,
-            have_above: r > 0,
+            have_left: c > self.tile.c0,
+            have_above: r > self.tile.r0,
             have_above_right: self.decoded_at(0, sbr - 1, sbc + n4 as isize),
             have_below_left: self.decoded_at(0, sbr + n4 as isize, sbc - 1),
             log2,
@@ -617,8 +741,8 @@ impl<'a> Decider<'a> {
         let ce: [IntraEdge; 2] = std::array::from_fn(|i| IntraEdge {
             x: c * 2,
             y: self.ry(1, r * 2),
-            have_left: c > 0,
-            have_above: r > 0,
+            have_left: c > self.tile.c0,
+            have_above: r > self.tile.r0,
             have_above_right: self.decoded_at(1 + i, csbr - 1, csbc + (n4 >> 1) as isize),
             have_below_left: self.decoded_at(1 + i, csbr + (n4 >> 1) as isize, csbc - 1),
             log2: clog2,
@@ -1138,5 +1262,45 @@ pub(crate) fn scan_for(tx_sz: usize) -> &'static [u16] {
         TX_8X8 => &DEFAULT_SCAN_8X8,
         TX_16X16 => &DEFAULT_SCAN_16X16,
         _ => &DEFAULT_SCAN_32X32,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn layout(w: usize, h: usize) -> (usize, usize, usize, usize) {
+        let t = FrameGeom::new(w, h).tiles;
+        (t.cols, t.rows, t.w_sb, t.h_sb)
+    }
+
+    #[test]
+    fn tile_layout_from_frame_size() {
+        assert_eq!(layout(1, 1), (1, 1, 1, 1));
+        assert_eq!(layout(1920, 1080), (1, 1, 30, 17), "1080p is one tile");
+        assert_eq!(layout(2048, 1080), (2, 1, 16, 17));
+        assert_eq!(layout(3840, 2160), (2, 1, 30, 34));
+        assert_eq!(layout(4096, 2304), (4, 1, 16, 36));
+        assert_eq!(layout(7680, 4320), (4, 1, 30, 68));
+        // over MAX_TILE_WIDTH, a partial last column
+        assert_eq!(layout(4200, 72), (4, 1, 17, 2));
+        // over MAX_TILE_AREA in one column: two tile rows
+        assert_eq!(layout(1920, 4928), (1, 2, 30, 39));
+        assert_eq!(layout(16384, 2176), (16, 1, 16, 34));
+        for (w, h) in [(16384, 2176), (7680, 4320), (1920, 4928), (4200, 72), (64, 16384), (16384, 64)] {
+            let t = FrameGeom::new(w, h).tiles;
+            assert!(t.w_sb <= MAX_TILE_WIDTH_SB && t.w_sb * t.h_sb <= MAX_TILE_AREA_SB, "{w}x{h}");
+            assert!(t.cols <= MAX_TILE_COLS && t.rows <= MAX_TILE_ROWS, "{w}x{h}");
+        }
+    }
+
+    #[test]
+    fn tiles_cover_the_frame() {
+        let g = FrameGeom::with_tiles(320, 200, 2, 1);
+        assert_eq!((g.tiles.cols, g.tiles.rows), (3, 2));
+        assert_eq!(g.tile(2), TileRect { r0: 0, r1: 32, c0: 64, c1: 80 });
+        assert_eq!(g.tile(5), TileRect { r0: 32, r1: 50, c0: 64, c1: 80 });
+        assert_eq!(g.tile_at(49, 79), g.tile(5));
+        assert_eq!(g.tile_at(31, 63), g.tile(1));
     }
 }
