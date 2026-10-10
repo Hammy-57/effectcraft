@@ -1,10 +1,24 @@
 //! Durable MCP checkpoints, isolated from the desktop and other headless sessions.
+//!
+//! Bounded on disk: a checkpoint of a big project (at least [`THROTTLE_BYTES`]) is written at most
+//! every [`THROTTLE_INTERVAL`] (and always when the session ends), each session keeps the
+//! Auto-Save setting's maximum number of versions, its folder is emptied once the project is saved
+//! normally, and folders of finished, saved sessions (or untouched for [`ABANDONED_AFTER`]) are
+//! removed when the next session starts.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime};
 
 use effectcraft_engine::config::{FileOps, StdFiles};
 use effectcraft_engine::{Session, autosave, prefs::Prefs};
 use serde_json::{Value, json};
+
+/// Checkpoints of at least this size are throttled (smaller ones are written after every change).
+pub(crate) const THROTTLE_BYTES: u64 = 8 * 1024 * 1024;
+/// The shortest time between two throttled checkpoints.
+pub(crate) const THROTTLE_INTERVAL: Duration = Duration::from_secs(30);
+/// A session folder untouched this long is removed when another session starts.
+pub(crate) const ABANDONED_AFTER: Duration = Duration::from_secs(30 * 24 * 3600);
 
 #[derive(Clone)]
 pub(crate) struct AutoSave {
@@ -13,6 +27,11 @@ pub(crate) struct AutoSave {
     error: Option<String>,
     previous: Vec<Value>,
     manifest: Option<Value>,
+    /// When the last checkpoint was written and how big it was (for throttling).
+    last_write: Option<(Instant, u64)>,
+    throttle: (u64, Duration),
+    /// A change is waiting for the next (throttled) checkpoint.
+    pending: bool,
 }
 
 impl AutoSave {
@@ -26,9 +45,26 @@ impl AutoSave {
             return Err(std::io::Error::other("the MCP auto-save folder must be valid UTF-8; set EFFECTCRAFT_CONFIG_DIR to a UTF-8 path"));
         }
         std::fs::create_dir_all(&base)?;
+        prune(&base, SystemTime::now());
         let previous = previous_sessions(&base);
         let folder = unique_folder(&base)?;
-        Ok(Self { folder, latest: None, error: None, previous, manifest: None })
+        Ok(Self {
+            folder,
+            latest: None,
+            error: None,
+            previous,
+            manifest: None,
+            last_write: None,
+            throttle: (THROTTLE_BYTES, THROTTLE_INTERVAL),
+            pending: false,
+        })
+    }
+
+    /// Throttle checkpoints of at least `bytes` to one per `interval` (tests use small values).
+    #[cfg(test)]
+    pub fn with_throttle(mut self, bytes: u64, interval: Duration) -> Self {
+        self.throttle = (bytes, interval);
+        self
     }
 
     pub fn folder(&self) -> &Path {
@@ -38,7 +74,7 @@ impl AutoSave {
     pub fn info(&self) -> Value {
         json!({
             "enabled": true, "folder": self.folder.to_string_lossy(), "latestPath": self.latest,
-            "error": self.error, "previousSessions": self.previous,
+            "error": self.error, "previousSessions": self.previous, "pending": self.pending,
             "recovery": "Recover with open_project {path: latestPath}, then save_project {path: a normal project file}. Previous sessions may still be running; they are never opened automatically.",
         })
     }
@@ -54,10 +90,42 @@ impl AutoSave {
         std::io::Error::other(message)
     }
 
+    /// Whether the last checkpoint was big and recent enough to skip this one.
+    fn throttled(&self) -> bool {
+        let (bytes, interval) = self.throttle;
+        self.last_write.is_some_and(|(at, size)| size >= bytes && at.elapsed() < interval)
+    }
+
     fn write(&mut self, s: &mut Session, ended: bool) -> std::io::Result<()> {
-        if s.is_dirty() && s.autosave.saved_revision != Some(s.revision) {
+        if !s.is_dirty() {
+            // Saved normally (or nothing done): the recovery copies are no longer needed.
+            self.pending = false;
+            if self.latest.take().is_some() {
+                self.manifest = None;
+                s.autosave.last_path = None;
+                match std::fs::remove_dir_all(&self.folder) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            if ended {
+                let _ = std::fs::remove_dir_all(&self.folder);
+            }
+            self.error = None;
+            return Ok(());
+        }
+        if s.autosave.saved_revision != Some(s.revision) {
+            if !ended && self.throttled() {
+                self.pending = true;
+                return Ok(());
+            }
+            std::fs::create_dir_all(&self.folder)?;
             s.autosave.background = false;
-            s.autosave_now().map_err(std::io::Error::other)?;
+            let path = s.autosave_now().map_err(std::io::Error::other)?;
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            self.last_write = Some((Instant::now(), size));
+            self.pending = false;
         }
         s.autosave_wait().map_err(std::io::Error::other)?;
         // Explicit file.autoSave and save-on-render-start use the same override. Keep their
@@ -79,6 +147,34 @@ impl AutoSave {
             let _ = std::fs::remove_dir(&self.folder);
         }
         Ok(())
+    }
+}
+
+/// Whether `name` is a session folder this module made (`<pid>-<nanos>-<n>`).
+fn is_session_folder(name: &str) -> bool {
+    let parts: Vec<&str> = name.split('-').collect();
+    parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Remove session folders that are no longer needed: a finished session whose project was saved
+/// (or that never checkpointed), and any folder untouched for [`ABANDONED_AFTER`]. A running
+/// session is never finished, and recreates its folder if a later change needs it.
+pub(crate) fn prune(base: &Path, now: SystemTime) {
+    let Ok(entries) = std::fs::read_dir(base) else { return };
+    for entry in entries.flatten().take(10_000) {
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+        if !meta.is_dir() || !entry.file_name().to_str().is_some_and(is_session_folder) {
+            continue;
+        }
+        let manifest = path.join("session.json");
+        let touched = std::fs::metadata(&manifest).or(Ok::<_, std::io::Error>(meta)).ok().and_then(|m| m.modified().ok());
+        let abandoned = touched.and_then(|t| now.duration_since(t).ok()).is_some_and(|age| age >= ABANDONED_AFTER);
+        let record: Option<Value> = std::fs::read(&manifest).ok().filter(|b| b.len() <= 64 * 1024).and_then(|b| serde_json::from_slice(&b).ok());
+        let finished_clean = record.as_ref().is_some_and(|r| r.get("ended") == Some(&Value::Bool(true)) && r.get("dirty") == Some(&Value::Bool(false)));
+        if abandoned || finished_clean {
+            let _ = std::fs::remove_dir_all(&path);
+        }
     }
 }
 
