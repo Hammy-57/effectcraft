@@ -1611,6 +1611,7 @@ fn timeline_twirl_applies_clicked_state_to_selected_layers() {
     assert_eq!(h.state().session.state.selected_layers, selection);
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/test-out");
     std::fs::create_dir_all(dir).unwrap();
+    let _gpu = crate::gpu_lock();
     h.render().unwrap().save(format!("{dir}/selected-layer-chevrons.png")).unwrap();
     let at = rect(&h, &format!("timeline.layer.{a}.twirl")).center();
     click(&mut h, at);

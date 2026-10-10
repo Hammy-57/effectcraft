@@ -21,6 +21,7 @@ fn settle(h: &mut Harness<'_, EffectcraftApp>) {
 
 #[test]
 fn viewer_draws_gpu_frames_that_match_the_cpu() {
+    let _gpu = crate::gpu_lock();
     let Some(probe) = effectcraft_gpu::Gpu::headless() else {
         eprintln!("no GPU adapter: skipping");
         return;

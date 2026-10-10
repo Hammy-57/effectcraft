@@ -123,7 +123,7 @@ fn dragged_tabs_land_where_the_insertion_mark_is() {
     assert_eq!(group_of(&dock(&h), PanelKind::Timeline), Some(vec![PanelKind::RenderQueue, PanelKind::Timeline, PanelKind::EffectControls]));
 }
 
-/// `cargo test -p effectcraft-ui-egui --test ui_tabs -- --ignored`: the insertion mark mid-drag
+/// `cargo test -p effectcraft-ui-egui --test ui ui_tabs:: -- --ignored`: the insertion mark mid-drag
 /// (`target/test-out/tab-drag.png`).
 #[test]
 #[ignore]
@@ -309,6 +309,7 @@ fn render_queue_close_button_hides_panel_and_preserves_queue() {
     let close = rect(&h, "panel.tab.RenderQueue.close");
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/test-out");
     std::fs::create_dir_all(dir).unwrap();
+    let _gpu = crate::gpu_lock();
     h.render().unwrap().save(format!("{dir}/render-queue-close.png")).unwrap();
     click_n(&mut h, close.center(), 1);
     assert!(!h.state().ui.dock.contains(PanelKind::RenderQueue));
