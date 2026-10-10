@@ -6,9 +6,9 @@ use crate::motion_blur::MotionMemo;
 use crate::{EvalCtx, Image, Renderer, color};
 use effectcraft_color::BlendMode;
 use effectcraft_effects::Buf;
-use effectcraft_geom::{Mat3, vec2};
+use effectcraft_geom::{Mat3, Rect, vec2};
 use effectcraft_project::{Layer, Quality, Sampling};
-use effectcraft_raster::{MipChain, WarpOpts, accumulate_warp_mips, composite_warp_mips};
+use effectcraft_raster::{MipChain, WarpOpts, accumulate_warp_at, composite_warp_at, pool, warp_bounds};
 
 impl<'a> Renderer<'a> {
     pub(crate) fn sampling(&self, layer: &Layer) -> effectcraft_raster::Sampling {
@@ -134,21 +134,107 @@ impl<'a> Renderer<'a> {
     /// [`Self::place`] sharing the layer's matrices through `mo` (see [`MotionMemo`]).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn place_memo(&self, ctx: &EvalCtx, layer: &Layer, buf: &Buf, target: &mut Image, mode: BlendMode, opacity: f32, mo: &MotionMemo) {
+        self.place_at(ctx, layer, buf, target, [0, 0], mode, opacity, mo);
+    }
+
+    /// [`Self::place_memo`] into `target`, the window of the canvas at `origin` (see
+    /// [`Self::reach`]): exactly the canvas's pixels there.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn place_at(&self, ctx: &EvalCtx, layer: &Layer, buf: &Buf, target: &mut Image, origin: [u32; 2], mode: BlendMode, opacity: f32, mo: &MotionMemo) {
         let pl = self.placement_memo(ctx, layer, buf, mo);
         let opts = WarpOpts { sampling: pl.sampling, opacity, mode, seed: pl.seed, clip: None };
         // One minification chain for every sub-sample (built only when the layer is shrunk).
         let mips = MipChain::new(&buf.img);
         if let [m] = pl.matrices.as_slice() {
-            composite_warp_mips(target, &mips, m, &opts);
+            composite_warp_at(target, origin, &mips, m, &opts);
             return;
         }
-        // Sub-samples sum straight into one buffer (each warp is row-parallel).
-        let mut acc = Image::new(target.width, target.height);
+        // Sub-samples sum straight into one buffer (each warp is row-parallel), as large as they
+        // reach (stencil modes also change what they don't cover: the whole target).
+        let whole = Window { x: origin[0], y: origin[1], w: target.width, h: target.height };
+        let win = if mode.is_stencil() { whole } else { whole.clip(reach_of(&[(&pl, buf)])) };
+        if win.is_empty() {
+            return;
+        }
+        let mut acc = pool::zeroed(win.w, win.h);
         let k = 1.0 / pl.matrices.len() as f32;
         for m in &pl.matrices {
-            accumulate_warp_mips(&mut acc, &mips, m, opts.sampling, k);
+            accumulate_warp_at(&mut acc, win.origin(), &mips, m, opts.sampling, k);
         }
-        target.blend_from(&acc, mode, opacity, pl.seed);
+        target.blend_from_at(origin, &acc, win.origin(), mode, opacity, pl.seed);
+        pool::recycle(acc);
+    }
+
+    /// The window of a `w`×`h` canvas that drawing `bufs` for `layer` can change: their
+    /// transformed bounds over every motion-blur sub-sample. Callers that clear or tint outside
+    /// the layer (stencil modes) need the whole canvas instead.
+    pub(crate) fn reach(&self, ctx: &EvalCtx, layer: &Layer, bufs: &[&Buf], mo: &MotionMemo, (w, h): (u32, u32)) -> Window {
+        let whole = Window { x: 0, y: 0, w, h };
+        #[cfg(test)]
+        if crate::tests_footprint::full_windows() {
+            return whole;
+        }
+        let pls: Vec<Placement> = bufs.iter().map(|b| self.placement_memo(ctx, layer, b, mo)).collect();
+        let items: Vec<(&Placement, &Buf)> = pls.iter().zip(bufs.iter().copied()).collect();
+        whole.clip(reach_of(&items))
+    }
+}
+
+/// The union of the warps' bounds of these placed buffers (output pixels).
+fn reach_of(items: &[(&Placement, &Buf)]) -> Rect {
+    let mut r = Rect::EMPTY;
+    for (pl, buf) in items {
+        for m in &pl.matrices {
+            r = r.union(&warp_bounds(m, buf.img.width, buf.img.height));
+        }
+    }
+    r
+}
+
+/// A window of the canvas: `w`×`h` pixels from (`x`, `y`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Window {
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+}
+
+impl Window {
+    pub(crate) fn origin(&self) -> [u32; 2] {
+        [self.x, self.y]
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.w == 0 || self.h == 0
+    }
+
+    /// Whether this is the whole `w`×`h` canvas.
+    pub(crate) fn is_whole(&self, (w, h): (u32, u32)) -> bool {
+        self.x == 0 && self.y == 0 && self.w == w && self.h == h
+    }
+
+    /// The canvas region this window covers (the whole canvas as [`Region::Full`]).
+    pub(crate) fn region(&self, size: (u32, u32)) -> Region {
+        if self.is_empty() {
+            Region::Empty
+        } else if self.is_whole(size) {
+            Region::Full
+        } else {
+            Region::Rect(color::PxRect { x0: self.x, y0: self.y, x1: self.x + self.w, y1: self.y + self.h })
+        }
+    }
+
+    /// The part of this window inside `r` (whole pixels, `r` rounded out).
+    pub(crate) fn clip(&self, r: Rect) -> Window {
+        let (x1, y1) = (self.x as f64 + self.w as f64, self.y as f64 + self.h as f64);
+        let c = |v: f64, lo: f64, hi: f64| if v.is_nan() { lo } else { v.clamp(lo, hi) };
+        let (a0, a1) = (c(r.x0.floor(), self.x as f64, x1), c(r.x1.ceil(), self.x as f64, x1));
+        let (b0, b1) = (c(r.y0.floor(), self.y as f64, y1), c(r.y1.ceil(), self.y as f64, y1));
+        if a1 <= a0 || b1 <= b0 {
+            return Window { x: self.x, y: self.y, w: 0, h: 0 };
+        }
+        Window { x: a0 as u32, y: b0 as u32, w: (a1 - a0) as u32, h: (b1 - b0) as u32 }
     }
 }
 

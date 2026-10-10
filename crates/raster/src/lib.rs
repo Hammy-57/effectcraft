@@ -22,7 +22,10 @@ use rayon::prelude::*;
 pub use blur::{box_blur, directional_blur, gaussian_blur, gaussian_support, radial_blur};
 pub use channels3d::AuxChannels;
 pub use sparse::{Sparse, gaussian_blur_sparse, resample_sparse};
-pub use warp::{MipChain, Sampling, WarpOpts, accumulate_warp, accumulate_warp_mips, composite_warp, composite_warp_mips, composite_warp_reference, resample};
+pub use warp::{
+    MipChain, Sampling, WarpOpts, accumulate_warp, accumulate_warp_at, accumulate_warp_mips, composite_warp, composite_warp_at, composite_warp_mips,
+    composite_warp_reference, resample, warp_bounds,
+};
 
 pub type Px = [f32; 4];
 
@@ -253,18 +256,35 @@ impl Image {
     }
     /// Blend `src` (same size) onto self with a mode and opacity.
     pub fn blend_from(&mut self, src: &Image, mode: BlendMode, opacity: f32, seed: u32) {
-        let w = self.width as usize;
-        self.data.par_chunks_mut(w.max(1)).zip(src.data.par_chunks(w.max(1))).enumerate().for_each(|(y, (d, s))| {
-            for x in 0..d.len() {
-                let mut sp = s[x];
+        self.blend_from_at([0, 0], src, [0, 0], mode, opacity, seed);
+    }
+    /// [`Self::blend_from`] between windows of one canvas: self covers the canvas from `origin`,
+    /// `src` from `at` (canvas pixels; the overlap is blended). Pixels `src` doesn't cover are
+    /// left as a transparent source leaves them (non-stencil modes), and Dissolve's noise is the
+    /// canvas's.
+    pub fn blend_from_at(&mut self, origin: [u32; 2], src: &Image, at: [u32; 2], mode: BlendMode, opacity: f32, seed: u32) {
+        let (w, sw) = (self.width as usize, src.width as usize);
+        // src (sx, sy) lands on self (sx + dx, sy + dy).
+        let (dx, dy) = (at[0] as i64 - origin[0] as i64, at[1] as i64 - origin[1] as i64);
+        let (skip_x, skip_y) = ((-dx).max(0) as usize, (-dy).max(0) as usize);
+        let (ax, ay) = (dx.max(0) as usize, dy.max(0) as usize);
+        let rows = self.data.par_chunks_mut(w.max(1)).enumerate().skip(ay).zip(src.data.par_chunks(sw.max(1)).skip(skip_y));
+        rows.for_each(|((y, d), s)| {
+            let (Some(d), Some(s)) = (d.get_mut(ax..), s.get(skip_x..)) else { return };
+            for (x, (d, &sp)) in d.iter_mut().zip(s).enumerate() {
+                let mut sp = sp;
                 if sp[3] <= 0.0 && !mode.is_stencil() {
                     continue;
                 }
                 for c in sp.iter_mut() {
                     *c *= opacity;
                 }
-                let n = if matches!(mode, BlendMode::Dissolve | BlendMode::DancingDissolve) { hash_noise(x as u32, y as u32, seed) } else { 0.5 };
-                d[x] = blend_pixel(mode, d[x], sp, n);
+                let n = if matches!(mode, BlendMode::Dissolve | BlendMode::DancingDissolve) {
+                    hash_noise((origin[0] as usize + ax + x) as u32, (origin[1] as usize + y) as u32, seed)
+                } else {
+                    0.5
+                };
+                *d = blend_pixel(mode, *d, sp, n);
             }
         });
     }
