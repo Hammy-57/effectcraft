@@ -1704,7 +1704,7 @@ fn render_snapshot_and_compare_tools() {
     assert_eq!((same["pass"].as_bool(), same["psnr_db"].as_str()), (Some(true), Some("inf")), "{same}");
     assert!(same.get("diff_png").is_none());
     // Move the box 10 px right: metrics plus the heatmap image.
-    call_json(&mut s, "set_property", json!({"layer": 1, "path": "transform/position", "value": [170, 90]}));
+    call_json(&mut s, "set_property", json!({"layer": "#1", "path": "transform/position", "value": [170, 90]}));
     let (c, err) = call(&mut s, "render_compare", json!({"a": {"snapshot": "before"}, "b": {"time": 0}}));
     assert!(!err, "{c:?}");
     assert_eq!(c[0]["type"], "image");
