@@ -319,21 +319,27 @@ fn cc_slant(ctx: &EffectCtx, mut b: Buf) -> Buf {
 fn cc_smear(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let from = b.to_px(ctx.params.v2("from"));
     let to = b.to_px(ctx.params.v2("to"));
-    let reach = ctx.params.f("reach") / 100.0;
-    let radius = (ctx.params.f("radius") * b.scale).max(0.5);
-    let (dx, dy) = (to.0 - from.0, to.1 - from.1);
-    let l2 = dx * dx + dy * dy;
-    if l2 < 1e-12 || reach == 0.0 {
+    let reach = ctx.params.f("reach").clamp(-1000.0, 1000.0) / 100.0;
+    let radius = (ctx.params.f("radius").clamp(0.0, 4000.0) * b.scale).max(0.5);
+    let (dx, dy) = ((to.0 - from.0) * reach, (to.1 - from.1) * reach);
+    let len = dx.hypot(dy);
+    if [from.0, from.1, to.0, to.1, len, radius].iter().any(|v| !v.is_finite() || v.abs() > 1e9) || len < 1e-6 {
         return b;
     }
+    let (ux, uy) = (dx / len, dy / len);
+    let tip = (from.0 + dx, from.1 + dy);
+    // Default-tip behaviour measured in AE: the back of the brush stretches with reach,
+    // while its front and perpendicular profile keep the brush radius (#658).
     b.img = remap(&b.img, false, |x, y| {
-        let t = (((x - from.0) * dx + (y - from.1) * dy) / l2).clamp(0.0, 1.0);
-        let (px, py) = (from.0 + dx * t, from.1 + dy * t);
-        let d = ((x - px).powi(2) + (y - py).powi(2)).sqrt();
-        let w = (1.0 - d / radius).max(0.0);
-        let w = w * w * (3.0 - 2.0 * w);
-        let k = reach * w * t;
-        Some((x - dx * k, y - dy * k))
+        let (rx, ry) = (x - tip.0, y - tip.1);
+        let along = rx * ux + ry * uy;
+        let across = -rx * uy + ry * ux;
+        let falloff = |t: f64| {
+            let w = (1.0 - t.abs()).max(0.0);
+            w * w * (3.0 - 2.0 * w)
+        };
+        let w = falloff(along / if along < 0.0 { radius + len } else { radius }) * falloff(across / radius);
+        Some((x - dx * w, y - dy * w))
     });
     b
 }
@@ -912,7 +918,7 @@ pub fn specs() -> Vec<EffectSpec> {
             vec![
                 p("from", "From", pt(0.35, 0.5), ParamUi::Point),
                 p("to", "To", pt(0.65, 0.5), ParamUi::Point),
-                p("reach", "Reach", num(50.0), slider(-100.0, 100.0, -100.0, 100.0, 1)),
+                p("reach", "Reach", num(100.0), slider(-1000.0, 1000.0, -100.0, 100.0, 1)),
                 p("radius", "Radius", num(50.0), slider(0.0, 4000.0, 0.0, 400.0, 1)),
             ],
             cc_smear,
@@ -1066,6 +1072,76 @@ mod tests {
         // Power pin with perspective 0 at default corners is also identity.
         let o = run("ec.distort.ccpowerpin", &[("perspective", num(0.0))], im.clone(), &[]);
         assert!(maxd(&o.img, &im) < 1e-4);
+    }
+
+    /// Source x coordinates recovered from our 320×160 RG ramp rendered in AE 2026,
+    /// default Tip Type, From=(100,80), To=(200,80), Radius=80. Quantisation is ~1.25 px.
+    #[test]
+    fn cc_smear_reach_matches_measured_default_tip() {
+        let im = crate::util::gen_image(320, 160, |x, y| [x as f32 / 319.0, y as f32 / 159.0, 0.0, 1.0]);
+        let samples: &[(f64, &[(i64, i64, f64)])] = &[
+            (50.0, &[(100, 80, 66.3), (200, 40, 191.4), (220, 60, 217.7)]),
+            (100.0, &[(100, 80, 57.5), (200, 80, 100.1), (140, 40, 102.6), (240, 20, 231.4)]),
+            (150.0, &[(100, 80, 57.5), (200, 80, 67.6), (140, 40, 100.1), (280, 120, 228.9)]),
+            (200.0, &[(100, 80, 60.0), (200, 80, 57.5), (140, 40, 101.3), (280, 120, 181.4)]),
+            (-100.0, &[(100, 80, 142.6), (140, 40, 146.4), (180, 80, 180.1)]),
+        ];
+        for (reach, points) in samples {
+            let out = run("ec.distort.ccsmear", &[("from", pt(100.0, 80.0)), ("to", pt(200.0, 80.0)), ("radius", num(80.0)), ("reach", num(*reach))], im.clone(), &[]);
+            for &(x, y, measured) in *points {
+                let actual = out.img.get(x, y)[0] as f64 * 319.0;
+                assert!((actual - measured).abs() < 2.0, "reach {reach}, ({x},{y}): source x {actual} vs AE {measured}");
+            }
+        }
+        let spec = crate::find("ec.distort.ccsmear").unwrap();
+        let reach = spec.params.iter().find(|p| p.id == "reach").unwrap();
+        assert_eq!(reach.default, num(100.0));
+        assert!(matches!(reach.ui, ParamUi::Slider { min: -1000.0, max: 1000.0, .. }));
+    }
+
+    #[test]
+    fn cc_smear_legacy_range_upgrades_without_changing_animation() {
+        let spec = crate::find("ec.distort.ccsmear").unwrap();
+        let mut next = 1;
+        let mut ids = effectcraft_project::build::Ids(&mut next);
+        let mut g = crate::instantiate(spec, &mut ids, "CC Smear", [320.0, 160.0]);
+        let p = g.prop_mut("reach").unwrap();
+        p.value = num(50.0);
+        p.keys = vec![effectcraft_keyframe::Keyframe::new(Default::default(), num(150.0))];
+        p.ui = slider(-100.0, 100.0, -100.0, 100.0, 1);
+        let keys = p.keys.clone();
+        crate::migrate::upgrade_instance(spec, &mut g, &mut ids, [320.0, 160.0]);
+        let p = g.prop("reach").unwrap();
+        assert_eq!(p.value, num(50.0));
+        assert_eq!(p.keys, keys);
+        assert!(matches!(p.ui, ParamUi::Slider { min: -1000.0, max: 1000.0, .. }));
+    }
+
+    #[test]
+    fn cc_smear_above_100_extends_the_measured_circle_trail() {
+        let im = crate::util::gen_image(480, 240, |x, y| {
+            if (x as f64 - 160.0).powi(2) + (y as f64 - 120.0).powi(2) <= 900.0 { [0.1, 0.6, 1.0, 1.0] } else { [0.0; 4] }
+        });
+        // Alpha > 0.5 bounds from AE's own render of our generated circle, same default tip.
+        for (reach, expected) in [(100.0, [161, 91, 257, 150]), (150.0, [160, 91, 294, 150]), (200.0, [153, 91, 333, 150])] {
+            let out = run("ec.distort.ccsmear", &[("from", pt(160.0, 120.0)), ("to", pt(240.0, 120.0)), ("radius", num(60.0)), ("reach", num(reach))], im.clone(), &[]);
+            let mut bounds = [480i64, 240, 0, 0];
+            for y in 0..240 {
+                for x in 0..480 {
+                    if out.img.get(x, y)[3] > 0.5 {
+                        bounds = [bounds[0].min(x), bounds[1].min(y), bounds[2].max(x + 1), bounds[3].max(y + 1)];
+                    }
+                }
+            }
+            assert!(bounds.iter().zip(expected).all(|(a, b)| (a - b).abs() <= 2), "reach {reach}: {bounds:?} vs {expected:?}");
+            // At 200 the long brush folds back: the tip remains opaque and the trailing
+            // centre thins out. Merely translating/stretching the circle cannot pass this.
+            if reach == 200.0 {
+                assert!(out.img.get(320, 120)[3] > 0.95);
+                assert!(out.img.get(240, 120)[3] < 0.05);
+                assert!(out.img.get(240, 100)[3] > 0.95);
+            }
+        }
     }
 
     #[test]
