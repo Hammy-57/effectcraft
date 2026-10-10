@@ -208,6 +208,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(crate::learn::specs());
         v.extend(crate::templates::specs());
         v.extend(crate::preview::specs());
+        v.extend(crate::render_view::specs());
         v
     })
 }

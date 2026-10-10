@@ -95,7 +95,7 @@ See [MCP conventions](mcp.md) for core tools, resources, strict arguments, and r
 | `list_effects {filter?}` | Effect ids, names, categories, GPU / 32-bpc support and parameters. |
 | `list_fonts {query?, rescan?}` | Font families text layers can use, bundled and installed, with their styles, origin and own-language name; `rescan` picks up fonts installed since launch. |
 | `add_effect {layer, effect, values?, comp?}` | Apply an effect and set its parameters in one call and one undo step (a failing value leaves nothing applied); returns the instance path (`effects/#n`) and its parameter paths. |
-| `render_frame {comp?, time?, max_side?, path?, inline?, transparent?}` | Returns a PNG image of a frame; `transparent: true` keeps the alpha (as an RGB + Alpha render writes it) instead of compositing over the comp background. |
+| `render_frame {comp? \| item?, layer?, time?, max_side?, region?, overlays?, path?, inline?, transparent?}` | Returns a PNG image of a frame; `transparent: true` keeps the alpha (as an RGB + Alpha render writes it) instead of compositing over the comp background. `region: [x, y, w, h]` (comp pixels) renders just that rectangle at full resolution (then `max_side` applies to it); `layer` renders one layer solo in its place; `item` renders a footage or solid item on its own (source time). `overlays: true` (bounds + anchor) or a list of `bounds`, `anchor`, `motionPath`, `safeMargins`, `grid`, `all` draws the viewer's overlays (boxes tagged `#n name` in label colours) and returns each drawn layer's comp-space `bounds`, `anchor` and `keyPositions`. |
 | `open_project {path \| demo \| new}` / `save_project {path?}` | Open and save files. |
 | `undo {steps?}` / `redo {steps?}` | History. |
 | `history {goto?}` | The branching undo history (History panel): every state with its index, id, label, branch depth and whether it's current; `goto` (an index or id) jumps to any state, on any branch, without losing the others. |
@@ -106,7 +106,7 @@ See [MCP conventions](mcp.md) for core tools, resources, strict arguments, and r
 | `command_run {id, params?}` | Run a command. |
 | `command_batch {steps, stop_on_error?}` | Run commands in order with per-step results; each edit has its own undo step. |
 | `doc_inspect` | Project overview and active composition. |
-| `render_preview` | Render a PNG without writing a file (`comp`, `time`, `max_side`, `transparent`). |
+| `render_preview` | Render a PNG without writing a file (`comp`, `item`, `layer`, `time`, `max_side`, `region`, `overlays`, `transparent`). |
 
 Layers are referenced by id (from `get_comp`), `"#n"` (1-based index from the top) or name. Comps are
 referenced by id or name, and default to the active comp. Property paths come from `get_layer`, for
@@ -141,6 +141,8 @@ Short recipes; every step is one tool call.
 | Drive with an expression | `set_property {"layer":2,"path":"transform/rotation","expression":"time*90"}` |
 | Inspect a layer | `get_layer {"layer":2,"flat":true}` (every property with its `path`, value, key count) |
 | Check the result | `render_frame {"time":1.5,"max_side":640}`; in bridge mode `screenshot {"panel":"Timeline"}` |
+| Where are the layers? | `render_frame {"overlays":true}` (boxes tagged `#n name`, anchors; reply `layers[].bounds`) |
+| Check a detail | `render_frame {"region":[800,400,320,180],"max_side":0}` (full resolution crop of a big comp) |
 | Undo a mistake | `undo {}`, or `history {}` then `history {"goto": n}` |
 | Missing media after opening | `execute_command footage.check {"wait":true}` → `{checked, missing, probed}`; then `file.findMissing {"what":"footage"}` |
 | Bring in a Figma design | `execute_command file.importFigma {"url":"https://www.figma.com/design/KEY/Name?node-id=12-345"}` (token from `FIGMA_TOKEN`); `{"payload": <Figma node JSON>}` when you already have the nodes |
