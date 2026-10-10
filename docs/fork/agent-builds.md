@@ -34,7 +34,8 @@ and your focused tests. Report exactly what you ran.
 2. Merge the latest `main` into your branch **once**, at the end (merge, don't rebase: a rebase
    replays every commit and, when `main` moves again, means another rebuild). Then `cargo check`
    the crates you touched: no full build, no test suite.
-3. Merge into `main`, then delete your worktree, branch and `target/agent-<name>`.
+3. Merge into `main`, **push `main`** (the nightly cloud run only sees what's on GitHub), then delete
+   your worktree, branch and `target/agent-<name>`.
 4. Stop there. **Don't build the app or the release CLI after merging**, and don't ask another
    session to: see "Building the app" below.
 
@@ -45,7 +46,9 @@ computer.
 **Day and night.** During the day, agents write the regression test but don't run it: `cargo
 check` and clippy on the touched crates, then merge, saying in the merge message which tests
 weren't run. Every night at 22:00 UTC a cloud routine ("EffectCraft nightly: CI, tests, fixes,
-community PRs") does the heavy part: it merges upstream, runs those tests and the full CI, fixes
+community PRs") does the heavy part. At 22:40 Mac time a LaunchAgent
+(`scripts/fork/push-main.sh`, log `~/Library/Logs/EffectCraft push-main.log`) pushes `main` first
+in case a merge wasn't pushed: fast-forward only, never other branches. The routine then it merges upstream, runs those tests and the full CI, fixes
 main until green, opens or updates focused PRs to storytold for finished work, and leaves a
 morning summary.
 
