@@ -14,6 +14,8 @@
 //! - `ci`: fmt check, clippy -D warnings, tests (`--profile ci`), layers, assets, wasm.
 //! - `ci --affected [--base REV] [--dry-run]`: the same gates for only the crates the change since
 //!   REV (default: the merge-base with `main`) can affect; see `affected.rs` and docs/testing.md.
+//! - `bench [--bin CLI] [--quick] [--compare OLD.jsonl] …`: render benchmark of generated scenarios
+//!   (memory, CPU, wall time) into `target/bench/results.jsonl` (`bench.rs`, docs/testing.md).
 //! - `agents <status|claim|release|gc>`: worktrees, target dirs and claims of parallel agents
 //!   (`agents.rs`).
 //! - `agent-exam <--list|--validate|--check P --task T|--run …>`: the agent exam (`evals/agent/`,
@@ -22,6 +24,7 @@
 mod affected;
 mod agent_exam;
 mod agents;
+mod bench;
 mod fmt;
 mod ico;
 mod version;
@@ -440,6 +443,7 @@ fn main() -> ExitCode {
         "agents" => agents::run(&std::env::args().skip(2).collect::<Vec<_>>()),
         "agent-exam" => agent_exam::run(&root(), &std::env::args().skip(2).collect::<Vec<_>>()),
         "web" => web(&std::env::args().skip(2).collect::<Vec<_>>()),
+        "bench" => bench::run(&root(), &std::env::args().skip(2).collect::<Vec<_>>()),
         "ico" => {
             let rest: Vec<String> = std::env::args().skip(2).collect();
             ico::run(&rest.iter().map(String::as_str).collect::<Vec<_>>())
@@ -448,7 +452,7 @@ fn main() -> ExitCode {
             let rest: Vec<String> = std::env::args().skip(2).collect();
             version::run(&root(), &rest.iter().map(String::as_str).collect::<Vec<_>>())
         }
-        _ => Err("usage: cargo xtask <layers|assets|wasm|web [--dev] [--serve PORT]|ico OUT.ico IN.png…|version [set X.Y.Z]|fmt [--check]|ci [--affected [--base REV] [--dry-run]]|agents <status|claim|release|gc>|agent-exam <--list|--validate|--check P.ecproj --task T|--run [--tasks a,b] [--out DIR] [--minutes N] [--max-tool-calls N] [--model M]>>".into()),
+        _ => Err("usage: cargo xtask <layers|assets|wasm|web [--dev] [--serve PORT]|ico OUT.ico IN.png…|version [set X.Y.Z]|fmt [--check]|ci [--affected [--base REV] [--dry-run]]|bench [--bin CLI] [--quick] [--project F --comp C] [--compare OLD.jsonl] (--help)|agents <status|claim|release|gc>|agent-exam <--list|--validate|--check P.ecproj --task T|--run [--tasks a,b] [--out DIR] [--minutes N] [--max-tool-calls N] [--model M]>>".into()),
     };
     match r {
         Ok(()) => ExitCode::SUCCESS,
