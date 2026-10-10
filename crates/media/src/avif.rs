@@ -34,7 +34,7 @@ pub(crate) fn sniff(bytes: &[u8]) -> bool {
     // major brand, minor version, compatible brands
     let major = body.get(0..4);
     let compat = body.get(8..).unwrap_or(&[]);
-    major.into_iter().chain(compat.chunks_exact(4)).any(|b| b == b"avif" || b == b"avis")
+    major.into_iter().chain(compat.as_chunks::<4>().0.iter().map(|c| c.as_slice())).any(|b| b == b"avif" || b == b"avis")
 }
 
 /// Footage for an AVIF still (`None` for other formats).
