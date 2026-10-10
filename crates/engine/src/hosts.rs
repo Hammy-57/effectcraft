@@ -82,6 +82,14 @@ pub fn announce(config_dir: &Path, kind: &str, port: Option<u16>) {
     if let Some(m) = me.as_ref() {
         write_entry(m);
     }
+    drop(me);
+    // Files of hosts that are gone are removed when listed; opening a project checks only the
+    // hosts that have it. A long-running host prunes the folder once, in the background (not
+    // in this crate's tests, which check what open and list remove).
+    #[cfg(not(any(target_arch = "wasm32", test)))]
+    let _ = std::thread::Builder::new().name("hosts-prune".into()).spawn(|| {
+        list();
+    });
 }
 
 /// Remove this process's entry (on exit).
@@ -138,6 +146,12 @@ fn alive(pid: u32) -> Option<bool> {
 /// Every live host (this process too), `[{pid, kind, port, project, me}]`. Entries of processes
 /// that are gone are removed.
 pub fn list() -> Vec<Value> {
+    live_hosts(|_| true)
+}
+
+/// The live hosts whose entry passes `keep`. Liveness is checked only for those (it starts a
+/// process per entry): opening a project checks none when no other host has it open.
+fn live_hosts(keep: impl Fn(&Value) -> bool) -> Vec<Value> {
     let dir = match lock(&ME).as_ref() {
         Some(m) => m.dir.clone(),
         None => return vec![],
@@ -151,6 +165,9 @@ pub fn list() -> Vec<Value> {
         }
         let Some(v) = std::fs::read(&path).ok().filter(|b| b.len() <= 64 * 1024).and_then(|b| serde_json::from_slice::<Value>(&b).ok()) else { continue };
         let Some(pid) = v.get("pid").and_then(Value::as_u64).and_then(|p| u32::try_from(p).ok()) else { continue };
+        if !keep(&v) {
+            continue;
+        }
         let old = entry.metadata().ok().and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok()).is_some_and(|age| age > STALE_AFTER);
         let live = match alive(pid) {
             Some(live) => live,
@@ -171,7 +188,8 @@ pub fn list() -> Vec<Value> {
 /// Other live hosts that have `path` open.
 pub(crate) fn others_with(path: &str) -> Vec<Value> {
     let k = key(path);
-    list().into_iter().filter(|h| h["me"] != json!(true) && h.get("project").and_then(Value::as_str) == Some(k.as_str())).collect()
+    let me = u64::from(std::process::id());
+    live_hosts(|h| h.get("pid").and_then(Value::as_u64) != Some(me) && h.get("project").and_then(Value::as_str) == Some(k.as_str()))
 }
 
 /// A warning for opening `path` while other hosts have it open (`None`: nobody else does).

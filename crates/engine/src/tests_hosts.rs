@@ -56,13 +56,18 @@ fn hosts_list_names_where_a_project_is_open() {
     let parent = std::os::unix::process::parent_id();
     std::fs::write(hosts.join(format!("{parent}.json")), json!({"pid": parent, "kind": "app", "port": 9, "project": canonical}).to_string()).unwrap();
     std::fs::write(hosts.join("999999.json"), json!({"pid": 999_999, "kind": "app", "port": 10, "project": canonical}).to_string()).unwrap();
+    // A gone host with another project: opening doesn't check it (each check starts a process,
+    // which made opening a tiny project take a quarter of a second with a dozen host files).
+    std::fs::write(hosts.join("999998.json"), json!({"pid": 999_998, "kind": "app", "port": 11, "project": "/elsewhere/Other.ecproj"}).to_string()).unwrap();
     let r = s.execute("file.open", json!({"path": project.to_string_lossy()})).unwrap();
+    assert!(hosts.join("999998.json").exists(), "a host with another project isn't checked on open");
     assert_eq!(r["openElsewhere"][0]["port"], 9, "{r}");
     assert!(s.events.iter().any(|e| matches!(e, crate::Event::Toast { message, .. } if message.contains("--bridge 9"))));
     let list = s.execute("hosts.list", json!({})).unwrap()["hosts"].clone();
     let pids: Vec<u64> = list.as_array().unwrap().iter().filter_map(|h| h["pid"].as_u64()).collect();
     assert!(pids.contains(&u64::from(parent)) && pids.contains(&u64::from(std::process::id())), "{list}");
     assert!(!hosts.join("999999.json").exists(), "a gone process's file is removed");
+    assert!(!hosts.join("999998.json").exists(), "listed, it is checked and removed");
     let me = list.as_array().unwrap().iter().find(|h| h["me"] == true).unwrap();
     assert_eq!((me["kind"].clone(), me["project"].clone()), (json!("mcp"), json!(canonical)));
     crate::hosts::withdraw();
