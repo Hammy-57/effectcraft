@@ -784,8 +784,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         && empty.dragged()
     {
         let b = Rect::from_two_pos(start, end).intersect(list);
-        lp.rect_filled(b, 0.0, t.accent.gamma_multiply(0.12));
-        lp.rect_stroke(b, 0.0, Stroke::new(1.0, t.accent), egui::StrokeKind::Inside);
+        crate::widgets::marquee(&lp, b, &t);
         ctx.data_mut(|d| d.insert_temp(box_id, b));
     }
     if empty.drag_stopped()

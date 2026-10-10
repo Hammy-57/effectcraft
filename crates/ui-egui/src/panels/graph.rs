@@ -115,6 +115,21 @@ type Samples = (u64, std::sync::Arc<Vec<Vec<(f64, f64)>>>);
 /// Build the curves for the visible time span. Their samples evaluate every shown property
 /// (expressions too) across the plot, so they are remembered until the project, the shown
 /// properties or the view change.
+/// The graph's value of dimension `d` of `pr` at comp time `ct` (s): its value, or in the speed
+/// graph its speed (spatial properties) or velocity.
+fn sample(ectx: &EvalCtx, l: &Layer, pr: &Property, d: usize, speed: bool, ct: f64) -> f64 {
+    let tt = Tick::from_seconds_f64(ct);
+    if !speed {
+        return ectx.at(tt).value(l, pr).components().get(d).copied().unwrap_or(0.0);
+    }
+    let lt = l.layer_time(tt);
+    if pr.spatial && matches!(pr.value, Value::Vec2(_) | Value::Vec3(_)) {
+        effectcraft_engine::keyframe::speed(&pr.keys, lt, true)
+    } else {
+        effectcraft_engine::keyframe::velocity(&pr.keys, lt, false).get(d).copied().unwrap_or(0.0).abs()
+    }
+}
+
 fn curves<'a>(app: &EffectcraftApp, ctx: &egui::Context, comp: &'a Comp, ectx: &EvalCtx, tm: TMap, plot: Rect, speed: bool) -> Vec<Curve<'a>> {
     let sel = &app.session.state.selected_keys;
     let n = ((plot.width() / 2.0) as usize).max(2);
@@ -149,18 +164,7 @@ fn curves<'a>(app: &EffectcraftApp, ctx: &egui::Context, comp: &'a Comp, ectx: &
             for i in 0..todo {
                 let x = plot.min.x + plot.width() * i as f32 / (n - 1) as f32;
                 let ct = tm.t(x);
-                let tt = Tick::from_seconds_f64(ct);
-                let v = if speed {
-                    let lt = l.layer_time(tt);
-                    if spatial {
-                        effectcraft_engine::keyframe::speed(&pr.keys, lt, true)
-                    } else {
-                        effectcraft_engine::keyframe::velocity(&pr.keys, lt, false).get(d).copied().unwrap_or(0.0).abs()
-                    }
-                } else {
-                    ectx.at(tt).value(l, pr).components().get(d).copied().unwrap_or(0.0)
-                };
-                pts.push((ct, v));
+                pts.push((ct, sample(ectx, l, pr, d, speed, ct)));
             }
             sampled.push(pts.clone());
             let mut keys = vec![];
@@ -258,7 +262,7 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
     ctx.data_mut(|d| d.insert_temp(was_speed_id, speed));
     if ctx.data_mut(|d| d.remove_temp::<bool>(fit_pending_id())).unwrap_or(false) || type_changed {
         if cs.iter().any(|c| c.keys.iter().any(|k| k.sel)) {
-            fit_selection(app, &cs, tm, plot);
+            fit_selection(app, &cs, ectx, speed, plot);
         } else {
             fit_all(app);
         }
@@ -508,8 +512,7 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
         actions.push(("keys.select".into(), json!({"keys": []})));
     }
     if let Some(br) = key_box.filter(|_| bg.dragged()) {
-        pc.rect_filled(br, 0.0, t.accent.gamma_multiply(0.12));
-        pc.rect_stroke(br, 0.0, Stroke::new(1.0, t.accent), StrokeKind::Middle);
+        crate::widgets::marquee(&pc, br, &t);
         ctx.data_mut(|d| d.insert_temp(egui::Id::new("graph-box"), br));
     }
     // Releasing the marquee commits the selection its keys showed.
@@ -548,14 +551,14 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
         "autoSelectGraphType",
         "Auto-Select Graph Type (speed graph for spatial properties, else value graph)",
     ) {
-        app.ui.timeline.graph_mode = if auto_type { if speed { "speed" } else { "value" } } else { "auto" }.into();
+        set_graph_type(app, if auto_type { if speed { "speed" } else { "value" } } else { "auto" });
     }
     // Choosing a graph type turns Auto-Select off, as in After Effects.
     if text_button(app, ui, p, &mut x, y, "Value", !speed, "valueGraph", "Edit Value Graph") {
-        app.ui.timeline.graph_mode = "value".into();
+        set_graph_type(app, "value");
     }
     if text_button(app, ui, p, &mut x, y, "Speed", speed, "speedGraph", "Edit Speed Graph") {
-        app.ui.timeline.graph_mode = "speed".into();
+        set_graph_type(app, "speed");
     }
     x += 6.0;
     if text_button(app, ui, p, &mut x, y, "Selected", show_sel, "showSelected", "Show Selected Properties (else all animated properties)") {
@@ -568,7 +571,7 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
         fit_all(app);
     }
     if text_button(app, ui, p, &mut x, y, "Fit Selection", false, "fitSelection", "Fit selection to view") {
-        fit_selection(app, &cs, tm, plot);
+        fit_selection(app, &cs, ectx, speed, plot);
     }
     x += 6.0;
     let (snap, reference, tbox) = (app.ui.timeline.graph_snap, app.ui.timeline.graph_reference, app.ui.timeline.graph_transform_box);
@@ -604,6 +607,16 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
     }
 }
 
+/// Show graph type `mode` and remember it (Preferences `graphType`): the Graph Editor opens on
+/// it until another type is chosen, across launches.
+fn set_graph_type(app: &mut EffectcraftApp, mode: &str) {
+    app.ui.timeline.graph_mode = mode.into();
+    if app.session.prefs.graph_type != mode {
+        app.session.prefs.graph_type = mode.into();
+        app.session.save_prefs();
+    }
+}
+
 /// Fit All Graphs to View: the whole comp in time, auto-zoomed values.
 fn fit_all(app: &mut EffectcraftApp) {
     app.ui.timeline.graph_auto_zoom = true;
@@ -614,22 +627,32 @@ fn fit_pending_id() -> egui::Id {
     egui::Id::new("graph-fit-pending")
 }
 
-/// Called every Timeline frame with whether the Graph Editor is on: switching it on (header
-/// button, menu, Shift+F3 or the control channel) frames the graphs on its first frame, when the
-/// plot rect is known, as After Effects does.
-pub(crate) fn track_open(ctx: &egui::Context, on: bool) {
+/// Called every Timeline frame: switching the Graph Editor on (header button, menu, Shift+F3 or
+/// the control channel) frames the graphs on its first frame, when the plot rect is known, as
+/// After Effects does; switching it off puts back the time zoom from before it opened, so the
+/// fit doesn't leave the layer bars zoomed in.
+pub(crate) fn track_open(ctx: &egui::Context, tl: &mut crate::state::TimelineState) {
+    let on = tl.graph_editor;
     let was_id = egui::Id::new("graph-editor-was-on");
+    let zoom_id = egui::Id::new("graph-editor-zoom-before");
     let was = ctx.data(|d| d.get_temp::<bool>(was_id)).unwrap_or(false);
-    ctx.data_mut(|d| {
-        d.insert_temp(was_id, on);
-        if on && !was {
+    if on && !was {
+        ctx.data_mut(|d| {
             d.insert_temp(fit_pending_id(), true);
-        }
-    });
+            d.insert_temp(zoom_id, (tl.start, tl.pps));
+        });
+    } else if was
+        && !on
+        && let Some((start, pps)) = ctx.data_mut(|d| d.remove_temp::<(f64, Option<f64>)>(zoom_id))
+    {
+        tl.start = start;
+        tl.pps = pps;
+    }
+    ctx.data_mut(|d| d.insert_temp(was_id, on));
 }
 
 /// Zoom time and value to the selected keys (and their handles).
-fn fit_selection(app: &mut EffectcraftApp, cs: &[Curve], tm: TMap, plot: Rect) {
+fn fit_selection(app: &mut EffectcraftApp, cs: &[Curve], ectx: &EvalCtx, speed: bool, plot: Rect) {
     let mut t0 = f64::INFINITY;
     let mut t1 = f64::NEG_INFINITY;
     let mut v0 = f64::INFINITY;
@@ -661,6 +684,17 @@ fn fit_selection(app: &mut EffectcraftApp, cs: &[Curve], tm: TMap, plot: Rect) {
             }
         }
     }
+    // And the curves between them: an eased speed graph is 0 at both keys and peaks in between
+    // (sampled here: the drawn samples only cover the view before the fit).
+    for c in cs.iter().filter(|c| c.keys.iter().any(|k| k.sel)) {
+        for i in 0..=FIT_SAMPLES {
+            let v = sample(ectx, c.layer, c.prop, c.dim, speed, t0 + (t1 - t0) * i as f64 / FIT_SAMPLES as f64);
+            if v.is_finite() {
+                v0 = v0.min(v);
+                v1 = v1.max(v);
+            }
+        }
+    }
     let span = (t1 - t0).max(0.2);
     let pps = plot.width() as f64 * 0.8 / span;
     // Through the timeline's zoom, so the fit never zooms out past the whole comp.
@@ -671,8 +705,10 @@ fn fit_selection(app: &mut EffectcraftApp, cs: &[Curve], tm: TMap, plot: Rect) {
     let pad = ((v1 - v0) * 0.15).max(1.0);
     app.ui.timeline.graph_auto_zoom = false;
     app.ui.timeline.graph_range = Some((v0 - pad, v1 + pad));
-    let _ = tm;
 }
+
+/// Curve samples Fit Selection to View takes between the selected keys.
+const FIT_SAMPLES: usize = 200;
 
 fn nice_step(raw: f64) -> f64 {
     let raw = raw.abs().max(1e-9);

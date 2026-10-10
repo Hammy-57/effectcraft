@@ -25,7 +25,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 
 use effectcraft_engine::project::{Comp, ItemId, ItemKind, LayerSource, Node, Project, PropGroup};
 use effectcraft_engine::render::disk_cache::{self, DiskCache};
@@ -388,11 +388,9 @@ pub struct Frames {
     failed: Failed,
     /// Pending jobs, picked by priority when a pool thread frees up (the viewer's frame first).
     queue: Arc<Mutex<Queue>>,
-    /// Signalled when a job stops running (workers waiting for memory, see [`max_running`]).
-    freed: Arc<Condvar>,
     #[cfg(not(target_arch = "wasm32"))]
     /// None if the OS refused the threads: jobs then go to rayon's global pool.
-    pool: Option<rayon::ThreadPool>,
+    pool: Option<Arc<rayon::ThreadPool>>,
     ctx: Option<egui::Context>,
     /// Render time of the last viewer (urgent) frame in ms, for the Info panel / perf readout.
     pub last_ms: Arc<Mutex<f64>>,
@@ -441,7 +439,6 @@ impl Default for Frames {
             inflight: Arc::new(Mutex::new(HashSet::new())),
             failed: Failed::default(),
             queue: Arc::new(Mutex::new(Queue::default())),
-            freed: Arc::default(),
             #[cfg(not(target_arch = "wasm32"))]
             // A panicking job would abort the whole process (rayon's default for `spawn`): log it
             // and lose only that frame (the panic hook has logged the message).
@@ -450,7 +447,8 @@ impl Default for Frames {
                 .thread_name(|i| format!("ec-frame-{i}"))
                 .panic_handler(|_| log::error!("a frame render panicked; that frame was skipped"))
                 .build()
-                .ok(),
+                .ok()
+                .map(Arc::new),
             ctx: None,
             last_ms: Arc::new(Mutex::new(0.0)),
             content_keys: Arc::default(),
@@ -597,7 +595,7 @@ impl Frames {
     /// Actual native frame-worker capacity, including the OS fallback pool.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn parallelism(&self) -> usize {
-        self.pool.as_ref().map_or_else(rayon::current_num_threads, rayon::ThreadPool::current_num_threads)
+        self.pool.as_ref().map_or_else(rayon::current_num_threads, |p| p.current_num_threads())
     }
     #[cfg(target_arch = "wasm32")]
     pub fn parallelism(&self) -> usize {
@@ -831,21 +829,10 @@ impl Frames {
         q.jobs.push(Job { key, src: src.clone(), comp, t, opts, urgent, seq });
         drop(inf);
         drop(q);
-        // A worker waiting for memory takes the viewer's frame at once.
-        if urgent {
-            self.freed.notify_all();
-        }
         #[cfg(not(target_arch = "wasm32"))]
         if self.remote.is_none() {
-            let w = self.worker();
             // One spawn per job; each spawn renders whichever queued job matters most right now.
-            let job = move || {
-                w.run_next();
-            };
-            match &self.pool {
-                Some(pool) => pool.spawn(job),
-                None => rayon::spawn(job),
-            }
+            self.worker().spawn_next();
         }
         #[cfg(target_arch = "wasm32")]
         if let Some(ctx) = &self.ctx {
@@ -857,7 +844,6 @@ impl Frames {
     fn worker(&self) -> Worker {
         Worker {
             queue: self.queue.clone(),
-            freed: self.freed.clone(),
             cache: self.cache.clone(),
             inflight: self.inflight.clone(),
             failed: self.failed.clone(),
@@ -865,6 +851,8 @@ impl Frames {
             last: self.last_ms.clone(),
             content_keys: self.content_keys.clone(),
             gpu_retired: self.gpu_retired.clone(),
+            #[cfg(not(target_arch = "wasm32"))]
+            pool: self.pool.clone(),
         }
     }
 
@@ -999,9 +987,9 @@ fn keep_on_disk(render: std::time::Duration, urgent: bool, prefetch_queued: usiz
 }
 
 /// Renders queued jobs (on a pool thread, or the UI thread on wasm32).
+#[derive(Clone)]
 struct Worker {
     queue: Arc<Mutex<Queue>>,
-    freed: Arc<Condvar>,
     cache: Arc<Mutex<Cache>>,
     inflight: Arc<Mutex<HashSet<FrameKey>>>,
     failed: Failed,
@@ -1009,26 +997,43 @@ struct Worker {
     last: Arc<Mutex<f64>>,
     content_keys: ContentKeys,
     gpu_retired: Arc<AtomicBool>,
+    /// The pool frames render on (`None`: rayon's global pool).
+    #[cfg(not(target_arch = "wasm32"))]
+    pool: Option<Arc<rayon::ThreadPool>>,
 }
 
 impl Worker {
-    /// Render the queued job that matters most right now. `false` when the queue was empty.
+    /// Run [`Worker::run_next`] on the frame pool.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn spawn_next(&self) {
+        let w = self.clone();
+        let job = move || {
+            w.run_next();
+        };
+        match &self.pool {
+            Some(pool) => pool.spawn(job),
+            None => rayon::spawn(job),
+        }
+    }
+
+    /// Render the queued job that matters most right now. `false` when the queue was empty, or
+    /// the job has to wait for memory (a finishing frame starts it, see [`Worker::release`]).
     fn run_next(&self) -> bool {
         let Worker { queue, content_keys, .. } = self;
         let job = {
             let Ok(mut q) = queue.lock() else { return false };
-            let i = loop {
-                let Some(i) = Queue::best(&q.jobs) else { return false };
-                let j = &q.jobs[i];
-                // Prefetch waits while the frames already rendering would take more memory than
-                // the budget allows; the viewer's frame never waits. (wasm32 renders one frame
-                // at a time on the UI thread, which must not block.)
-                if cfg!(target_arch = "wasm32") || j.urgent || q.running.len() < max_running(j) {
-                    break i;
-                }
-                let Ok((g, _)) = self.freed.wait_timeout(q, std::time::Duration::from_millis(50)) else { return false };
-                q = g;
-            };
+            let Some(i) = Queue::best(&q.jobs) else { return false };
+            let j = &q.jobs[i];
+            // Prefetch waits while the frames already rendering would take more memory than the
+            // budget allows; the viewer's frame never waits. (wasm32 renders one frame at a time
+            // on the UI thread.) It waits in the queue, not on this thread: rayon runs queued
+            // spawns nested inside renders on the same pool, so a spawn blocked here could sit on
+            // top of the very render it waits for, and with every worker doing that nothing
+            // finished: playback held at the end of the cached frames forever.
+            if !(cfg!(target_arch = "wasm32") || j.urgent || q.running.len() < max_running(j)) {
+                q.parked += 1;
+                return false;
+            }
             let job = q.jobs.swap_remove(i);
             q.running.insert(job.key);
             if job.urgent {
@@ -1102,13 +1107,26 @@ impl Worker {
         if let Ok(mut inf) = self.inflight.lock() {
             inf.remove(&key);
         }
+        let mut restart = false;
         if let Ok(mut q) = self.queue.lock() {
             q.running.remove(&key);
             if urgent {
                 q.urgent_running = q.urgent_running.saturating_sub(1);
             }
+            // A job that waited for memory starts now (one per finished frame).
+            if q.parked > 0 && !q.jobs.is_empty() {
+                q.parked -= 1;
+                restart = true;
+            } else if q.jobs.is_empty() {
+                q.parked = 0;
+            }
         }
-        self.freed.notify_all();
+        #[cfg(not(target_arch = "wasm32"))]
+        if restart {
+            self.spawn_next();
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = restart;
         if let Some(ctx) = &self.ctx {
             ctx.request_repaint();
         }
@@ -1239,6 +1257,9 @@ struct Queue {
     running: HashSet<FrameKey>,
     urgent_running: usize,
     seq: u64,
+    /// Spawns that returned because their job had to wait for memory: each finishing frame
+    /// starts one again.
+    parked: usize,
 }
 
 impl Queue {
@@ -1378,6 +1399,44 @@ mod tests {
         // Purge Caches forgets failures too.
         f.clear();
         assert!(!f.failed(&later));
+    }
+
+    /// Regression: prefetch frames over the memory budget waited on their pool thread, and rayon
+    /// runs queued spawns nested inside renders on the same pool, so every worker could end up
+    /// waiting under the render it waited for: nothing finished and playback held at the end of
+    /// the cached frames forever. Now they wait in the queue and each finished frame starts the
+    /// next, so a long run of frames, one at a time (budget for one), all render.
+    #[test]
+    fn frames_over_the_memory_budget_wait_in_the_queue_and_all_render() {
+        use effectcraft_engine::Session;
+        use serde_json::json;
+        let mut s = Session::default();
+        let cid = ItemId(s.execute("comp.new", json!({"name": "A", "width": 64, "height": 64, "duration": 2})).unwrap()["comp"].as_u64().unwrap());
+        s.execute("layer.newSolid", json!({"color": "#ff0000", "width": 32, "height": 32})).unwrap();
+        let src = RenderSource {
+            project: s.project.clone(),
+            footage: Arc::new(effectcraft_engine::render::NoFootage),
+            expr: None,
+            // Room for one frame at a time.
+            layer_cache: Arc::new(LayerCache::new(1)),
+            gpu: None,
+            gpu_display: false,
+            disk: None,
+        };
+        let f = Frames::default();
+        let content = f.content_of(&s.project, s.revision, cid);
+        let keys: Vec<FrameKey> = (0..40).map(|i| FrameKey { revision: s.revision, content, comp: cid.0, ..key(0, i, 0) }).collect();
+        for (i, k) in keys.iter().enumerate() {
+            f.request(&src, *k, cid, Tick::from_seconds_f64(i as f64 / 30.0), RenderOpts::default());
+        }
+        for _ in 0..3000 {
+            if f.inflight() == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(f.inflight(), 0, "every frame finished");
+        assert!(keys.iter().all(|k| f.is_cached(k)), "every frame is cached");
     }
 
     /// Frames rendering at once are bounded by their size against the layer cache budget: 4K

@@ -61,8 +61,10 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     uic!("view.theme.dark", "Theme: Dark", [], None),
     uic!("view.theme.darker", "Theme: Darker", [], None),
     uic!("view.theme.light", "Theme: Light", [], None),
-    uic!("timeline.zoomIn", "Zoom In Time", [], Some("=")),
-    uic!("timeline.zoomOut", "Zoom Out Time", [], Some("-")),
+    // By key position, as in After Effects: on a Mac AZERTY keyboard (ABC-AZERTY, French) the key
+    // right of `)` types `-` and zooms in, `)` zooms out; US keyboards are unchanged.
+    uic!("timeline.zoomIn", "Zoom In Time", [], Some("Physical+=")),
+    uic!("timeline.zoomOut", "Zoom Out Time", [], Some("Physical+-")),
     uic!("timeline.zoomFit", "Zoom to Fit Comp", [], None),
     uic!("timeline.zoomFrameToggle", "Zoom In to Frame Level / Out to the Whole Comp", [], Some(";")),
     uic!("timeline.graphEditor", "Graph Editor", [], Some("Shift+F3")),
@@ -603,6 +605,7 @@ pub fn shortcut_text(s: &str) -> String {
                 "Alt" => "⌥",
                 "Shift" => "⇧",
                 "Cmd" => "⌘",
+                "Physical" => "",
                 x => x,
             });
         }
@@ -614,7 +617,7 @@ pub fn shortcut_text(s: &str) -> String {
         });
         out
     } else {
-        s.replace("Cmd", "Ctrl")
+        s.replace("Physical+", "").replace("Cmd", "Ctrl")
     }
 }
 
