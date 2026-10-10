@@ -243,7 +243,7 @@ sort comparator) that never calls the object model is only stopped by the loop-i
 Bridged scripts honour `timeout` (in the app) but can't be cancelled.
 
 Batch tools (`batch`, `command_batch`), single-frame tools, other synchronous commands
-(`render.saveCurrentPreview`, `file.importAep`, `layer.autoTrace`, imports without `background`)
+(`render.saveCurrentPreview`, `layer.autoTrace`, imports without `background`)
 and every call with `wait: false` stay synchronous: no progress, no cancellation.
 
 ### Requests during a render

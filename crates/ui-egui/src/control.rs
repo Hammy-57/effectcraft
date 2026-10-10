@@ -138,23 +138,8 @@ pub enum Outcome {
 }
 
 /// A `wait: true` engine command (or `jobs.wait`) whose job runs in the background instead of
-/// blocking the UI thread: on desktop a worker thread, in the browser the session's offload (Web
-/// Workers). The reply goes out when the job ends, and other clients' requests run meanwhile.
-pub struct JobWaiter {
-    pub command: String,
-    pub params: Value,
-    /// The command's own result (with `wait: false`).
-    pub result: Value,
-    /// Ids of the jobs it started (`jobs.list` ids: `render`, `track`, `roto`…).
-    pub jobs: Vec<String>,
-    /// Length of [`effectcraft_engine::Session::offload_log`] when it started.
-    pub log_len: usize,
-}
-
-/// Ids of the background jobs `jobs.wait` waits for (the generic tasks).
-fn task_ids(app: &EffectcraftApp) -> Vec<String> {
-    app.session.jobs().into_iter().map(|j| j.id).filter(|j| j.starts_with("task:")).collect()
-}
+/// blocking the UI thread (shared with the windowless host).
+pub use effectcraft_engine::job_waiter::JobWaiter;
 
 /// The most time one frame spends running control requests (the rest wait for the next frame).
 pub const CONTROL_FRAME_BUDGET: std::time::Duration = std::time::Duration::from_millis(50);
@@ -182,91 +167,14 @@ pub fn fair_order<T>(reqs: Vec<(ControlRequest, T)>) -> Vec<(ControlRequest, T)>
     out
 }
 
-/// Commands that block with `wait` (and its default).
-fn waits(command: &str, params: &Value) -> bool {
-    // Frame renders and contact sheets too, so one agent's render never holds up the others.
-    let default = matches!(command, "renderQueue.render" | "render.frame" | "render.contactSheet" | "file.importProject");
-    params.get("wait").and_then(Value::as_bool).unwrap_or(default)
-}
-
 /// Run an engine command. A waiting command (`wait: true`) runs with `wait: false` instead, and
 /// the reply waits for the job it started ([`Outcome::AwaitJobs`]), so the UI keeps drawing and
 /// other clients' requests run while it works. `jobs.wait` likewise waits for the running tasks.
 fn execute_engine(app: &mut EffectcraftApp, id: &str, params: Value) -> Result<Outcome, String> {
-    if id == "jobs.wait" && !app.session.offloads() {
-        let jobs = task_ids(app);
-        if !jobs.is_empty() {
-            let log_len = app.session.offload_log.len();
-            return Ok(Outcome::AwaitJobs(JobWaiter { command: id.to_string(), params, result: json!({}), jobs, log_len }));
-        }
-    }
-    if !waits(id, &params) {
-        return app.session.execute_checked(id, params).map(ok).map_err(|e| e.to_string());
-    }
-    let before: Vec<String> = app.session.jobs().into_iter().map(|j| j.id).collect();
-    let log_len = app.session.offload_log.len();
-    let mut p = params.clone();
-    p["wait"] = json!(false);
-    let result = app.session.execute_checked(id, p).map_err(|e| e.to_string())?;
-    let jobs: Vec<String> = app.session.jobs().into_iter().map(|j| j.id).filter(|j| !before.contains(j)).collect();
-    if jobs.is_empty() {
-        return Ok(ok(result));
-    }
-    Ok(Outcome::AwaitJobs(JobWaiter { command: id.to_string(), params, result, jobs, log_len }))
-}
-
-impl JobWaiter {
-    /// Whether its jobs are still running.
-    pub fn pending(&self, app: &EffectcraftApp) -> bool {
-        app.session.jobs().iter().any(|j| self.jobs.contains(&j.id))
-    }
-
-    /// The reply: what the blocking command would have returned (`running: false`, the final
-    /// progress, render items and analysis status), or the job's error.
-    pub fn finish(self, app: &mut EffectcraftApp) -> Value {
-        let s = &mut app.session;
-        s.poll_render();
-        if self.command == "jobs.wait" {
-            return json!({"ok": true, "result": {"finished": s.job_log}});
-        }
-        let errors: Vec<String> = s.offload_log.iter().skip(self.log_len).filter_map(|(_, e)| e.clone()).collect();
-        if let Some(e) = errors.first() {
-            return json!({"ok": false, "error": e});
-        }
-        // A generic task (desktop): the blocking command returned its result, or failed with its
-        // message.
-        let mut tasks: Vec<&mut effectcraft_engine::jobs::JobRecord> = s.job_log.iter_mut().filter(|r| self.jobs.contains(&r.id)).collect();
-        if let Some(r) = tasks.iter().find(|r| r.status != "done") {
-            return json!({"ok": false, "error": if r.message.is_empty() { r.status.clone() } else { r.message.clone() }});
-        }
-        if let [task] = tasks.as_mut_slice() {
-            // Taken, not copied: a render's PNG shouldn't stay in the job log.
-            return json!({"ok": true, "result": std::mem::take(&mut task.result)});
-        }
-        let mut r = self.result;
-        if r.get("running").is_some() {
-            r["running"] = json!(false);
-        }
-        if self.command == "renderQueue.render" {
-            let ids: Vec<Value> = r["items"].as_array().map(|a| a.iter().map(|i| i["id"].clone()).collect()).unwrap_or_default();
-            if let Ok(list) = s.execute("renderQueue.list", json!({})) {
-                r["items"] =
-                    json!(list["items"].as_array().map(|a| a.iter().filter(|i| ids.contains(&i["id"])).cloned().collect::<Vec<_>>()).unwrap_or_default());
-            }
-            r["rendering"] = json!(s.is_rendering());
-        }
-        let prefix = self.command.split('.').next().unwrap_or("");
-        if matches!(prefix, "warp" | "camera" | "roto")
-            && r.get("layer").is_some()
-            && let Ok(st) = s.execute(&format!("{prefix}.status"), json!({"layer": r["layer"], "effect": r["effect"]}))
-        {
-            r["status"] = st;
-        }
-        if r.get("progress").is_some() {
-            r["progress"] = Value::Null;
-        }
-        json!({"ok": true, "result": r})
-    }
+    Ok(match effectcraft_engine::job_waiter::start(&mut app.session, id, params)? {
+        effectcraft_engine::job_waiter::Started::Done(v) => ok(v),
+        effectcraft_engine::job_waiter::Started::Waiting(w) => Outcome::AwaitJobs(w),
+    })
 }
 
 fn ok(v: Value) -> Outcome {

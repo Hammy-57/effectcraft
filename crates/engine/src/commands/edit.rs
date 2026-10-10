@@ -53,7 +53,8 @@ fn undo(s: &mut Session, p: &Value) -> Result<Value> {
     let author = s.history.author(&s.project).map(str::to_string);
     // The caller made the last step (or the user asks for whoever's last step): a plain undo.
     let any = me.is_none() && b_p(p, "any").unwrap_or(false);
-    if label.is_none() || any || author == me {
+    // (Not when the last step was itself an own-step undo: ⌘Z goes on to the step before it.)
+    if label.is_none() || any || (author == me && !s.history.settled(&s.project)) {
         s.undo();
         return Ok(json!({"undone": label}));
     }
@@ -61,6 +62,11 @@ fn undo(s: &mut Session, p: &Value) -> Result<Value> {
     // (crate::selective_undo), never their work.
     match crate::selective_undo::undo_own(s, me.as_deref())? {
         Some(own) => Ok(json!({"undone": own, "selective": true})),
+        // Only own-step undos of the caller's left: undo the last one plainly.
+        None if author == me => {
+            s.undo();
+            Ok(json!({"undone": label}))
+        }
         None => {
             let mine = me.as_deref().map_or_else(|| "you".to_string(), |m| format!("`{m}`"));
             let who = author.map_or_else(|| "the user".to_string(), |a| format!("client `{a}`"));
