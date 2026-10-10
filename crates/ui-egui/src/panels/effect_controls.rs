@@ -37,10 +37,10 @@ const DIAL_ROW: f32 = 64.0;
 const PARAM_NAME_X: f32 = 58.0;
 const TREE_INDENT: f32 = 14.0;
 
-fn selected_layer(app: &EffectcraftApp) -> Option<Layer> {
+fn selected_layer(app: &EffectcraftApp) -> Option<std::sync::Arc<Layer>> {
     let comp = app.session.active_comp()?;
     let id = app.session.state.selected_layers.first()?;
-    comp.layer(*id).cloned()
+    super::layer_arc(comp, *id)
 }
 
 /// An effect was just applied (`effect.apply` / `effect.applyLast` with `params`): Effect
@@ -947,7 +947,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     // Rows scroll under the header: clip their widgets (and hit tests) to the body.
     let panel_clip = ui.clip_rect();
     ui.set_clip_rect(body.intersect(panel_clip));
-    let fx: Vec<PropGroup> = layer.effects().map(|f| f.groups().cloned().collect()).unwrap_or_default();
+    let fx: Vec<&PropGroup> = layer.effects().map(|f| f.groups().collect()).unwrap_or_default();
     if fx.is_empty() {
         bp.text(
             pos2(body.center().x, body.min.y + 40.0),
@@ -1161,7 +1161,7 @@ pub fn viewer_hook(
     let ctx = ui.ctx().clone();
     let mut actions: Actions = vec![];
     if let Some(pick) = app.ui.fx_pick.clone() {
-        let Some(layer) = ectx.comp.layer(effectcraft_engine::project::LayerId(pick.layer)).cloned() else {
+        let Some(layer) = super::layer_arc(ectx.comp, effectcraft_engine::project::LayerId(pick.layer)) else {
             app.ui.fx_pick = None;
             return;
         };

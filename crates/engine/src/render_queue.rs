@@ -259,7 +259,11 @@ async fn run_work(w: Work, shared: &JobShared, notify: &mut dyn FnMut(&JobShared
         }
         notify(shared);
         // Every output module encodes the same frames (Composition ▸ Add Output Module); the
-        // first module's file is the item's output.
+        // first module's file is the item's output. Modules export one after another with the
+        // same project and session objects, so the exporter can continue each from the previous
+        // module's render (`effectcraft-export` keeps its layer cache). Each module reports its
+        // own progress (0..total again), a stop cancels the module being written (earlier
+        // modules' files stay), and the first failing module fails the item and skips the rest.
         let mut r: Result<ExportResult, String> = Err("no output module".into());
         for (mi, (mitem, path)) in modules.iter().enumerate() {
             let name = w.project.item(mitem.comp).map(|i| i.name.clone()).unwrap_or_default();

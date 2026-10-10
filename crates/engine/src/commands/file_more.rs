@@ -958,6 +958,8 @@ fn reload(s: &mut Session, p: &Value) -> Result<Value> {
     if s.importer.is_none() {
         return Err(EngineError::Other("media import is not available in this build".into()));
     }
+    // Footage files are stat-ed again for the disk cache's keys.
+    effectcraft_render::disk_cache::refresh_file_stamps();
     let mut updates = vec![];
     for i in &items {
         if let Some(ItemKind::Footage(f)) = s.project.item(*i).map(|x| &x.kind) {

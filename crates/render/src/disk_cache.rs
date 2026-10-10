@@ -243,6 +243,8 @@ pub struct DiskCache {
     queue: Arc<(Mutex<Queue>, Condvar)>,
     /// Layer buffers that took less than this to render are not written (ms).
     min_layer_ms: AtomicU64,
+    /// See [`Self::generation`].
+    generation: AtomicU64,
 }
 
 /// FNV-1a 128-bit (content keys).
@@ -315,6 +317,7 @@ impl DiskCache {
             tmp_counter: AtomicU64::new(0),
             queue: Arc::new((Mutex::new(Queue { jobs: Default::default(), bytes: 0, busy: false }), Condvar::new())),
             min_layer_ms: AtomicU64::new(30),
+            generation: AtomicU64::new(0),
         });
         dc.rescan();
         dc.evict();
@@ -363,6 +366,7 @@ impl DiskCache {
         if let Ok(mut g) = self.index.lock() {
             *g = idx;
         }
+        self.changed();
     }
 
     fn path(&self, kind: Kind, key: u128) -> PathBuf {
@@ -393,6 +397,16 @@ impl DiskCache {
         self.index.lock().is_ok_and(|g| g.contains(kind, key))
     }
 
+    /// Changes whenever an entry is added or removed (so callers can cache what they derive
+    /// from [`Self::contains`], like the Timeline's cache bar).
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
+    }
+
+    fn changed(&self) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Keys of one kind (unordered).
     pub fn keys(&self, kind: Kind) -> Vec<u128> {
         self.index.lock().map(|g| g.keys(kind)).unwrap_or_default()
@@ -418,6 +432,7 @@ impl DiskCache {
         if let Ok(mut g) = self.index.lock() {
             g.clear();
         }
+        self.changed();
         for kind in [Kind::Frame, Kind::Layer] {
             let _ = std::fs::remove_dir_all(self.dir.join(kind.dir()));
         }
@@ -477,6 +492,7 @@ impl DiskCache {
         if let Ok(mut g) = self.index.lock() {
             g.remove(kind, key);
         }
+        self.changed();
     }
 
     fn enqueue(&self, kind: Kind, key: u128, payload: Vec<u8>) {
@@ -523,6 +539,7 @@ impl DiskCache {
         if let Ok(mut g) = self.index.lock() {
             g.insert(kind, key, data.len() as u64);
         }
+        self.changed();
         self.evict();
     }
 
@@ -533,6 +550,9 @@ impl DiskCache {
             Ok(mut g) => g.evict(max),
             Err(_) => return,
         };
+        if !victims.is_empty() {
+            self.changed();
+        }
         for (kind, key) in victims {
             let _ = std::fs::remove_file(self.path(kind, key));
             self.evictions.fetch_add(1, Ordering::Relaxed);
@@ -768,31 +788,104 @@ fn decode_layer(p: &[u8]) -> Option<Buf> {
 /// Bump when rendering changes in a way that makes old disk entries wrong.
 const RENDER_VERSION: &str = "effectcraft-render-2";
 
+/// Feeds formatted text straight into a hash (no intermediate `String`).
+struct HashWriter<'a>(&'a mut Hash128);
+
+impl std::fmt::Write for HashWriter<'_> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.0.write(s.as_bytes());
+        Ok(())
+    }
+}
+
+/// The `Debug` text of `v` and a terminator (the hash is byte-wise, so streaming it gives the
+/// same hash as formatting it into a string first).
 fn hash_debug(h: &mut Hash128, v: &impl std::fmt::Debug) {
-    h.write(format!("{v:?}").as_bytes());
+    use std::fmt::Write;
+    let _ = write!(HashWriter(h), "{v:?}");
     h.write(&[0xff]);
 }
 
-/// A file's size and modification time (so edited footage gets new keys).
-fn file_stamp(h: &mut Hash128, path: &str) {
-    if path.is_empty() {
-        return;
+/// A file's size and modification time, when it can be read.
+type Stamp = Option<(u64, Option<u64>)>;
+
+/// File stamps are read again after this long (headless sessions, which get no focus events).
+const STAMP_TTL: web_time::Duration = web_time::Duration::from_secs(2);
+
+/// Cached file stamps (see [`refresh_file_stamps`]): the stamp, the refresh generation and the
+/// time it was read.
+static STAMPS: std::sync::LazyLock<Mutex<HashMap<String, (Stamp, u64, web_time::Instant)>>> = std::sync::LazyLock::new(Mutex::default);
+static STAMP_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// Stamps cached at most (a long image sequence has one per frame); past it the cache restarts.
+const MAX_STAMPS: usize = 1 << 20;
+
+/// Forget the cached file stamps: footage files are stat-ed again the next time a key is taken
+/// (the app regaining focus, Reload Footage). Between refreshes a stamp is reused for
+/// [`STAMP_TTL`], so an edit doesn't stat every footage file and every sequence frame again.
+pub fn refresh_file_stamps() {
+    STAMP_GENERATION.fetch_add(1, Ordering::Relaxed);
+}
+
+fn read_stamp(path: &str) -> Stamp {
+    let md = std::fs::metadata(path).ok()?;
+    let t = md.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_nanos() as u64);
+    Some((md.len(), t))
+}
+
+/// File stamps through the cache, locked once for many files.
+struct Stamps<'a> {
+    map: Option<std::sync::MutexGuard<'a, HashMap<String, (Stamp, u64, web_time::Instant)>>>,
+    generation: u64,
+    now: web_time::Instant,
+}
+
+impl Stamps<'_> {
+    fn new() -> Self {
+        let map = STAMPS.lock().unwrap_or_else(|e| e.into_inner());
+        Stamps { map: Some(map), generation: STAMP_GENERATION.load(Ordering::Relaxed), now: web_time::Instant::now() }
     }
-    if let Ok(md) = std::fs::metadata(path) {
-        h.write_u64(md.len());
-        if let Ok(t) = md.modified()
-            && let Ok(d) = t.duration_since(std::time::UNIX_EPOCH)
+
+    fn get(&mut self, path: &str) -> Stamp {
+        let Some(map) = self.map.as_mut() else { return read_stamp(path) };
+        if let Some((s, g, at)) = map.get(path)
+            && *g == self.generation
+            && self.now.saturating_duration_since(*at) < STAMP_TTL
         {
-            h.write_u64(d.as_nanos() as u64);
+            return *s;
+        }
+        let s = read_stamp(path);
+        if map.len() >= MAX_STAMPS {
+            map.clear();
+        }
+        map.insert(path.to_string(), (s, self.generation, self.now));
+        s
+    }
+
+    /// A file's size and modification time (so edited footage gets new keys).
+    fn file(&mut self, h: &mut Hash128, path: &str) {
+        if path.is_empty() {
+            return;
+        }
+        if let Some((len, t)) = self.get(path) {
+            h.write_u64(len);
+            if let Some(t) = t {
+                h.write_u64(t);
+            }
+        }
+    }
+
+    fn footage(&mut self, h: &mut Hash128, f: &effectcraft_project::Footage) {
+        self.file(h, &f.path);
+        for p in &f.sequence {
+            self.file(h, p);
         }
     }
 }
 
-fn footage_stamp(h: &mut Hash128, f: &effectcraft_project::Footage) {
-    file_stamp(h, &f.path);
-    for p in &f.sequence {
-        file_stamp(h, p);
-    }
+/// A file's size through the stamp cache (see [`refresh_file_stamps`]): for panels that show
+/// footage sizes every frame.
+pub fn file_len(path: &str) -> Option<u64> {
+    Stamps::new().get(path).map(|(len, _)| len)
 }
 
 /// Salt for layer cache keys on disk: the renderer version and every footage file's identity
@@ -800,15 +893,79 @@ fn footage_stamp(h: &mut Hash128, f: &effectcraft_project::Footage) {
 pub fn footage_salt(project: &effectcraft_project::Project) -> u64 {
     let mut h = Hash128::default();
     h.write(RENDER_VERSION.as_bytes());
+    let mut stamps = Stamps::new();
     for (id, it) in &project.items {
         if let effectcraft_project::ItemKind::Footage(f) = &it.kind {
             h.write_u64(id.0);
             hash_debug(&mut h, f);
-            footage_stamp(&mut h, f);
+            stamps.footage(&mut h, f);
         }
     }
     let v = h.finish();
     (v as u64) ^ ((v >> 64) as u64)
+}
+
+/// What [`comp_content_key`] needs of one layer: the hash of its pixel form (the Audio, Lock and
+/// Shy switches at their defaults) and whether it has an expression.
+#[derive(Clone, Copy)]
+struct LayerKey {
+    hash: u128,
+    expressions: bool,
+}
+
+/// [`LayerKey`]s by layer allocation. An entry holds a `Weak` to its layer, so the address can't
+/// be reused while the entry exists, and it is current while that layer lives: layers are
+/// immutable behind their `Arc` (an edit copies a shared layer, and `Arc::make_mut` moves a
+/// layer only `Weak`s point at to a new allocation), so a live entry describes the layer at
+/// that address.
+struct LayerKeys {
+    map: HashMap<usize, (std::sync::Weak<effectcraft_project::Layer>, LayerKey)>,
+    /// Entries before dead ones are swept.
+    sweep_at: usize,
+}
+
+static LAYER_KEYS: std::sync::LazyLock<Mutex<LayerKeys>> = std::sync::LazyLock::new(|| Mutex::new(LayerKeys { map: HashMap::new(), sweep_at: 1024 }));
+
+fn layer_key(l: &Arc<effectcraft_project::Layer>) -> LayerKey {
+    let addr = Arc::as_ptr(l) as usize;
+    if let Ok(m) = LAYER_KEYS.lock()
+        && let Some((w, k)) = m.map.get(&addr)
+        && w.strong_count() > 0
+        && std::ptr::eq(w.as_ptr(), Arc::as_ptr(l))
+    {
+        return *k;
+    }
+    let mut h = Hash128::default();
+    if l.switches == l.switches.pixels() {
+        hash_debug(&mut h, &**l);
+    } else {
+        let mut px = (**l).clone();
+        px.switches = px.switches.pixels();
+        hash_debug(&mut h, &px);
+    }
+    let mut expressions = false;
+    l.props.walk("", &mut |_, p| expressions |= p.expr.is_some());
+    let k = LayerKey { hash: h.finish(), expressions };
+    if let Ok(mut m) = LAYER_KEYS.lock() {
+        if m.map.len() >= m.sweep_at {
+            m.map.retain(|_, (w, _)| w.strong_count() > 0);
+            m.sweep_at = (m.map.len() * 2).max(1024);
+        }
+        m.map.insert(addr, (Arc::downgrade(l), k));
+    }
+    k
+}
+
+/// Hash of a comp's pixel form ([`effectcraft_project::Comp::pixel_form`]): its settings with
+/// Hide Shy Layers off, then each layer's [`LayerKey`] (memoised, so an edit formats only the
+/// layers it changed).
+fn hash_comp(h: &mut Hash128, c: &effectcraft_project::Comp, layers: &[LayerKey]) {
+    let shell = effectcraft_project::Comp { layers: effectcraft_project::Layers::new(), hide_shy: false, ..c.clone() };
+    hash_debug(h, &shell);
+    h.write_u64(layers.len() as u64);
+    for k in layers {
+        h.write(&k.hash.to_le_bytes());
+    }
 }
 
 /// Content key of a composition's pixels: project render settings, the comp and everything it
@@ -823,37 +980,43 @@ pub fn comp_content_key(project: &effectcraft_project::Project, comp: effectcraf
     let mut seen = std::collections::BTreeSet::new();
     let mut stack = vec![comp];
     let mut expressions = false;
+    let mut comp_layers: HashMap<effectcraft_project::ItemId, Vec<LayerKey>> = HashMap::new();
+    let keys_of = |c: &effectcraft_project::Comp| -> Vec<LayerKey> { c.layers.arcs().iter().map(layer_key).collect() };
     while let Some(id) = stack.pop() {
         if !seen.insert(id) {
             continue;
         }
         let Some(it) = project.item(id) else { continue };
         if let ItemKind::Comp(c) = &it.kind {
-            for l in &c.layers {
+            let keys = keys_of(c);
+            for (l, k) in c.layers.iter().zip(&keys) {
                 if let LayerSource::Comp { item } | LayerSource::Footage { item } | LayerSource::Solid { item } = l.source {
                     stack.push(item);
                 }
-                if !expressions {
-                    l.props.walk("", &mut |_, p| expressions |= p.expr.is_some());
-                }
+                expressions |= k.expressions;
             }
+            comp_layers.insert(id, keys);
         }
     }
     let ids: Vec<effectcraft_project::ItemId> = if expressions { project.items.keys().copied().collect() } else { seen.into_iter().collect() };
+    let mut stamps = Stamps::new();
     for id in ids {
         let Some(it) = project.item(id) else { continue };
         h.write_u64(id.0);
         h.write(it.name.as_bytes());
         match &it.kind {
-            ItemKind::Comp(c) => hash_debug(&mut h, &c.pixel_form()),
+            ItemKind::Comp(c) => match comp_layers.get(&id) {
+                Some(keys) => hash_comp(&mut h, c, keys),
+                None => hash_comp(&mut h, c, &keys_of(c)),
+            },
             k => hash_debug(&mut h, k),
         }
         if let ItemKind::Footage(f) = &it.kind {
-            footage_stamp(&mut h, f);
+            stamps.footage(&mut h, f);
         }
         hash_debug(&mut h, &it.proxy);
         if let Some(px) = &it.proxy {
-            footage_stamp(&mut h, &px.footage);
+            stamps.footage(&mut h, &px.footage);
         }
     }
     h.write_u64(comp.0);
@@ -905,6 +1068,68 @@ mod tests {
             q.jobs.push_back(Job::Write(Kind::Layer, k as u128, vec![]));
         }
         assert!(q.full(0), "count limit");
+    }
+
+    /// A comp with two solid layers.
+    fn keyed_project() -> (effectcraft_project::Project, effectcraft_project::ItemId) {
+        use effectcraft_project::*;
+        let mut p = Project::default();
+        let mut c = Comp::new(64, 64, effectcraft_time::FrameRate::FPS_30, effectcraft_time::Tick::from_seconds_f64(1.0));
+        for (i, color) in [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]].into_iter().enumerate() {
+            let sid = p.add_item(&format!("S{i}"), effectcraft_color::Label::Red, None, ItemKind::Solid(Solid { color, width: 8, height: 8, pixel_aspect: 1.0 }));
+            let l = build::layer(&mut p, &c, "S", LayerSource::Solid { item: sid }, (8, 8), None);
+            c.layers.push(l);
+        }
+        let cid = p.add_item("C", effectcraft_color::Label::Red, None, ItemKind::Comp(Arc::new(c)));
+        (p, cid)
+    }
+
+    /// Memoised layer keys (#G5): a layer edited in place (its `Arc` unique, so `make_mut` reuses
+    /// it unless a memo entry points at it) gets a new key, and memoised keys equal fresh ones.
+    #[test]
+    fn content_keys_follow_layer_edits() {
+        let (mut p, cid) = keyed_project();
+        let k1 = comp_content_key(&p, cid);
+        assert_eq!(comp_content_key(&p, cid), k1, "memoised");
+        // A deep copy (new layer allocations) has the same key.
+        let deep: effectcraft_project::Project = effectcraft_project::Project::from_json(&p.to_json()).unwrap();
+        assert_eq!(comp_content_key(&deep, cid), k1);
+        // Edit a layer in place: nothing else shares the project, its comp or the layer.
+        let l = p.comp_mut(cid).unwrap().layers.get_mut(1).unwrap();
+        l.props.prop_mut("transform/opacity").unwrap().value = effectcraft_project::Value::Scalar(50.0);
+        let k2 = comp_content_key(&p, cid);
+        assert_ne!(k2, k1);
+        let deep: effectcraft_project::Project = effectcraft_project::Project::from_json(&p.to_json()).unwrap();
+        assert_eq!(comp_content_key(&deep, cid), k2);
+        // Shy doesn't change pixels.
+        p.comp_mut(cid).unwrap().layers.get_mut(0).unwrap().switches.shy = true;
+        assert_eq!(comp_content_key(&p, cid), k2);
+        // An expression makes every item count: renaming an unrelated item changes the key.
+        p.comp_mut(cid).unwrap().layers.get_mut(0).unwrap().props.prop_mut("transform/opacity").unwrap().expr =
+            Some(effectcraft_project::Expression { text: "value".into(), enabled: true });
+        let k3 = comp_content_key(&p, cid);
+        assert_ne!(k3, k2);
+        let other = p.add_item("Other", effectcraft_color::Label::Red, None, effectcraft_project::ItemKind::Folder);
+        assert_ne!(comp_content_key(&p, cid), k3);
+        p.items.remove(&other);
+        assert_eq!(comp_content_key(&p, cid), k3);
+    }
+
+    /// File stamps are reused until a refresh.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn file_stamps_refresh() {
+        let d = tmpdir("stamps");
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("a.bin");
+        std::fs::write(&f, b"1").unwrap();
+        let path = f.to_string_lossy().to_string();
+        let one = Stamps::new().get(&path);
+        assert_eq!(one.map(|s| s.0), Some(1));
+        std::fs::write(&f, b"22").unwrap();
+        refresh_file_stamps();
+        assert_eq!(Stamps::new().get(&path).map(|s| s.0), Some(2));
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

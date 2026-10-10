@@ -110,8 +110,8 @@ pub fn route(app: &mut EffectcraftApp, id: &str, params: &Value) -> Result<bool,
     Ok(true)
 }
 
-fn layer(app: &EffectcraftApp) -> Option<Layer> {
-    app.session.active_comp()?.layer(LayerId(app.dialog_state.layer_style.layer)).cloned()
+fn layer(app: &EffectcraftApp) -> Option<std::sync::Arc<Layer>> {
+    super::layer_arc(app.session.active_comp()?, LayerId(app.dialog_state.layer_style.layer))
 }
 
 /// One control row for a property. Returns the new value when it changed.

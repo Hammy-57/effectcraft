@@ -241,31 +241,61 @@ pub fn ease_progress(out_speed_n: f64, out_inf: f64, in_speed_n: f64, in_inf: f6
 /// Spatial cubic segment with an arc-length table.
 struct SpatialSeg {
     p: [[f64; 3]; 4],
-    /// Cumulative length at u = i / N.
-    table: Vec<f64>,
+    /// Cumulative length at u = i / N (on the stack: evaluation allocates nothing).
+    table: [f64; ARC_N + 1],
 }
 
 const ARC_N: usize = 96;
 
+/// Slots of the per-thread arc-length table cache (direct-mapped by control points).
+const ARC_CACHE_SLOTS: usize = 32;
+
+type ArcCacheSlot = Option<([u64; 12], [f64; ARC_N + 1])>;
+
+thread_local! {
+    /// Recently built tables: motion blur samples and parented layers evaluate the same
+    /// segment many times per frame. Keyed by the control points' exact bits.
+    static ARC_CACHE: std::cell::RefCell<[ArcCacheSlot; ARC_CACHE_SLOTS]> = const { std::cell::RefCell::new([None; ARC_CACHE_SLOTS]) };
+}
+
 impl SpatialSeg {
     fn new(p: [[f64; 3]; 4]) -> SpatialSeg {
-        let mut table = Vec::with_capacity(ARC_N + 1);
-        table.push(0.0);
-        let mut prev = Self::point(&p, 0.0);
+        let mut bits = [0u64; 12];
+        for (b, v) in bits.iter_mut().zip(p.iter().flatten()) {
+            *b = v.to_bits();
+        }
+        let slot = bits.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b).wrapping_mul(0x0100_0000_01b3)) as usize % ARC_CACHE_SLOTS;
+        let hit = ARC_CACHE.with(|c| c.try_borrow().ok().and_then(|c| c.get(slot).copied().flatten()).filter(|(k, _)| *k == bits).map(|(_, t)| t));
+        if let Some(table) = hit {
+            return SpatialSeg { p, table };
+        }
+        let table = Self::build(&p);
+        ARC_CACHE.with(|c| {
+            if let Ok(mut c) = c.try_borrow_mut()
+                && let Some(s) = c.get_mut(slot)
+            {
+                *s = Some((bits, table));
+            }
+        });
+        SpatialSeg { p, table }
+    }
+    fn build(p: &[[f64; 3]; 4]) -> [f64; ARC_N + 1] {
+        let mut table = [0.0; ARC_N + 1];
+        let mut prev = Self::point(p, 0.0);
         let mut acc = 0.0;
-        for i in 1..=ARC_N {
-            let q = Self::point(&p, i as f64 / ARC_N as f64);
+        for (i, slot) in table.iter_mut().enumerate().skip(1) {
+            let q = Self::point(p, i as f64 / ARC_N as f64);
             acc += ((q[0] - prev[0]).powi(2) + (q[1] - prev[1]).powi(2) + (q[2] - prev[2]).powi(2)).sqrt();
-            table.push(acc);
+            *slot = acc;
             prev = q;
         }
-        SpatialSeg { p, table }
+        table
     }
     fn point(p: &[[f64; 3]; 4], u: f64) -> [f64; 3] {
         [bez(p[0][0], p[1][0], p[2][0], p[3][0], u), bez(p[0][1], p[1][1], p[2][1], p[3][1], u), bez(p[0][2], p[1][2], p[2][2], p[3][2], u)]
     }
     fn length(&self) -> f64 {
-        *self.table.last().unwrap_or(&0.0)
+        self.table[ARC_N]
     }
     fn at_length(&self, s: f64) -> [f64; 3] {
         let len = self.length();
@@ -274,7 +304,7 @@ impl SpatialSeg {
         }
         let s = s.clamp(0.0, len);
         let i = self.table.partition_point(|&v| v < s).clamp(1, ARC_N);
-        let (a, b) = (self.table[i - 1], self.table[i]);
+        let (a, b) = (self.table.get(i - 1).copied().unwrap_or(0.0), self.table.get(i).copied().unwrap_or(0.0));
         let f = if b > a { (s - a) / (b - a) } else { 0.0 };
         Self::point(&self.p, (i as f64 - 1.0 + f) / ARC_N as f64)
     }
@@ -607,6 +637,105 @@ pub fn easy_ease(k: &mut Keyframe, ease_in: bool, ease_out: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The arc-length table before it moved to the stack and gained a cache: the oracle.
+    struct SpatialSegRef {
+        p: [[f64; 3]; 4],
+        table: Vec<f64>,
+    }
+
+    impl SpatialSegRef {
+        fn new(p: [[f64; 3]; 4]) -> SpatialSegRef {
+            let mut table = Vec::with_capacity(ARC_N + 1);
+            table.push(0.0);
+            let mut prev = SpatialSeg::point(&p, 0.0);
+            let mut acc = 0.0;
+            for i in 1..=ARC_N {
+                let q = SpatialSeg::point(&p, i as f64 / ARC_N as f64);
+                acc += ((q[0] - prev[0]).powi(2) + (q[1] - prev[1]).powi(2) + (q[2] - prev[2]).powi(2)).sqrt();
+                table.push(acc);
+                prev = q;
+            }
+            SpatialSegRef { p, table }
+        }
+        fn length(&self) -> f64 {
+            *self.table.last().unwrap_or(&0.0)
+        }
+        fn at_length(&self, s: f64) -> [f64; 3] {
+            let len = self.length();
+            if len <= 0.0 {
+                return self.p[0];
+            }
+            let s = s.clamp(0.0, len);
+            let i = self.table.partition_point(|&v| v < s).clamp(1, ARC_N);
+            let (a, b) = (self.table[i - 1], self.table[i]);
+            let f = if b > a { (s - a) / (b - a) } else { 0.0 };
+            SpatialSeg::point(&self.p, (i as f64 - 1.0 + f) / ARC_N as f64)
+        }
+    }
+
+    fn test_segs() -> Vec<[[f64; 3]; 4]> {
+        // Deterministic pseudo-random segments, plus degenerate ones (a point, a straight line,
+        // coincident handles), more than the cache holds so slots get replaced.
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut r = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 11) as f64 / (1u64 << 53) as f64 * 2000.0 - 1000.0
+        };
+        let mut v: Vec<[[f64; 3]; 4]> = (0..100).map(|_| [[r(), r(), r()], [r(), r(), 0.0], [r(), r(), r()], [r(), r(), 0.0]]).collect();
+        v.push([[5.0, 5.0, 0.0]; 4]);
+        v.push([[0.0; 3], [0.0; 3], [100.0, 0.0, 0.0], [100.0, 0.0, 0.0]]);
+        v.push([[0.0; 3], [50.0, 80.0, 0.0], [50.0, 80.0, 0.0], [100.0, 0.0, 0.0]]);
+        v
+    }
+
+    #[test]
+    fn spatial_arc_table_matches_the_heap_reference_bit_for_bit() {
+        let segs = test_segs();
+        // Twice over: the second pass reads cached tables.
+        for _ in 0..2 {
+            for p in &segs {
+                let (new, old) = (SpatialSeg::new(*p), SpatialSegRef::new(*p));
+                assert!(new.table.iter().zip(&old.table).all(|(a, b)| a.to_bits() == b.to_bits()), "{p:?}");
+                assert_eq!(new.length().to_bits(), old.length().to_bits());
+                for k in 0..=40 {
+                    let s = old.length() * (k as f64 / 37.0 - 0.05);
+                    assert_eq!(new.at_length(s).map(f64::to_bits), old.at_length(s).map(f64::to_bits), "{p:?} at {s}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "timing, run by hand: cargo test -p effectcraft-keyframe --release --lib -- --ignored --nocapture timing"]
+    fn spatial_arc_table_timing() {
+        let segs = test_segs();
+        let n = 2000;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            for p in segs.iter().take(8) {
+                std::hint::black_box(SpatialSegRef::new(std::hint::black_box(*p)).at_length(10.0));
+            }
+        }
+        let old = t.elapsed();
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            for p in segs.iter().take(8) {
+                std::hint::black_box(SpatialSeg::new(std::hint::black_box(*p)).at_length(10.0));
+            }
+        }
+        let cached = t.elapsed();
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            for p in segs.iter().take(8) {
+                std::hint::black_box(SpatialSeg::build(std::hint::black_box(p)));
+            }
+        }
+        let stack = t.elapsed();
+        eprintln!("arc table x{}: heap {old:?}, stack build {stack:?}, cached {cached:?}", n * 8);
+    }
 
     fn s(x: f64) -> Tick {
         Tick::from_seconds_f64(x)

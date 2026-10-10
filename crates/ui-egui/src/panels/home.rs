@@ -66,6 +66,26 @@ pub fn recent_entries(prefs: &effectcraft_engine::prefs::Prefs) -> Vec<RecentEnt
         .collect()
 }
 
+/// Seconds the Home screen reuses [`recent_entries`] for (it is drawn every frame; each entry
+/// stats its file).
+const RECENT_REFRESH: f64 = 2.0;
+
+/// [`recent_entries`], read again when the list changes or after [`RECENT_REFRESH`].
+fn cached_recent_entries(ctx: &egui::Context, prefs: &effectcraft_engine::prefs::Prefs) -> std::sync::Arc<Vec<RecentEntry>> {
+    type Cached = (f64, Vec<String>, std::sync::Arc<Vec<RecentEntry>>);
+    let id = egui::Id::new("home-recent-entries");
+    let now = ctx.input(|i| i.time);
+    if let Some((at, list, entries)) = ctx.data(|d| d.get_temp::<Cached>(id))
+        && list == prefs.recent_projects
+        && (0.0..RECENT_REFRESH).contains(&(now - at))
+    {
+        return entries;
+    }
+    let entries = std::sync::Arc::new(recent_entries(prefs));
+    ctx.data_mut(|d| d.insert_temp::<Cached>(id, (now, prefs.recent_projects.clone(), entries.clone())));
+    entries
+}
+
 /// `YYYY-MM-DD HH:MM` (UTC) from Unix seconds.
 pub fn format_utc(secs: i64) -> String {
     let days = secs.div_euclid(86_400);
@@ -377,7 +397,7 @@ fn home_page(
 
     // Recent: heading, filter, clear.
     p.text(pos2(x0, y + 12.0), Align2::LEFT_CENTER, crate::i18n::tr("Recent"), Tokens::semibold(17.0), t.tab_text_active);
-    let entries = recent_entries(&app.session.prefs);
+    let entries = cached_recent_entries(ctx, &app.session.prefs);
     let fid = egui::Id::new("home-filter");
     let mut filter: String = ctx.data(|d| d.get_temp(fid)).unwrap_or_default();
     let fr = Rect::from_min_size(pos2(x0 + w - 240.0, y), vec2(240.0, 26.0));
