@@ -439,7 +439,9 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
             let Some((mut m, key)) = crate::menus::parse_shortcut(name) else { return err(format!("unknown key `{name}`")) };
             let extra = modifiers(p);
             m |= extra;
-            let physical_key = name.starts_with("Physical+").then_some(key);
+            // As a US keyboard sends it: the key is also the physical key, so by-position
+            // shortcuts (`Physical+=`, Zoom In Time) answer `=` too.
+            let physical_key = Some(key);
             let events = vec![
                 egui::Event::Key { key, physical_key, pressed: true, repeat: false, modifiers: m },
                 egui::Event::Key { key, physical_key, pressed: false, repeat: false, modifiers: m },

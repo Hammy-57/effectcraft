@@ -326,9 +326,12 @@ pub struct EffectcraftApp {
 
 impl EffectcraftApp {
     pub fn new(session: Session) -> Self {
+        let mut ui = UiState::default();
+        // The Graph Editor opens on the graph type last chosen (Preferences `graphType`).
+        ui.timeline.graph_mode = session.prefs.graph_type.clone();
         EffectcraftApp {
             session,
-            ui: UiState::default(),
+            ui,
             tokens: Tokens::for_kind(Default::default()),
             auto: Default::default(),
             frames: Frames::default(),

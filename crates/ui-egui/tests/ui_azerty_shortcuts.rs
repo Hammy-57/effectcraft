@@ -30,6 +30,27 @@ fn physical_shortcuts_distinguish_azerty_zoom_keys() {
     }
 }
 
+/// The default Zoom In / Out Time keys go by position, as in After Effects. On a Mac AZERTY
+/// keyboard (ABC-AZERTY) the key right of `)` (US `=`) types `-` and zooms in, `)` (US `-`)
+/// zooms out; a logical `-` used to zoom out whichever key typed it.
+#[test]
+fn default_zoom_keys_go_by_position_on_mac_azerty() {
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"width": 320, "height": 180, "duration": 60})).unwrap();
+    let mut h = Harness::builder().with_size(vec2(1200.0, 800.0)).build_eframe(|_| EffectcraftApp::new(s));
+    h.run_steps(3);
+    h.state_mut().ui.timeline.pps = Some(100.0);
+    // `-` on the US `=` key, then `)` (no egui key: it arrives as its physical key, Minus).
+    for (key, physical, expected) in [(Key::Minus, Key::Equals, 150.0), (Key::Minus, Key::Minus, 100.0)] {
+        for pressed in [true, false] {
+            h.event(Event::Key { key, physical_key: Some(physical), pressed, repeat: false, modifiers: Modifiers::NONE });
+            h.step();
+        }
+        let pps = h.state().ui.timeline.pps;
+        assert!(pps.is_some_and(|p| (p - expected).abs() < 0.01), "physical={physical:?} expected={expected} actual={pps:?}");
+    }
+}
+
 #[test]
 fn work_area_navigation_uses_last_included_frame() {
     let mut s = Session::default();
