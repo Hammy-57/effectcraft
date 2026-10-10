@@ -223,6 +223,20 @@ lto = false
 codegen-units = 16
 incremental = true
 
+# The hot pixel loops live in these crates: one codegen unit lets them inline across the whole crate.
+# Incremental stays on, so only edits to these crates pay the slower single-unit codegen.
+[profile.local.package.effectcraft-render]
+codegen-units = 1
+
+[profile.local.package.effectcraft-raster]
+codegen-units = 1
+
+[profile.local.package.effectcraft-effects]
+codegen-units = 1
+
+[profile.local.package.effectcraft-color]
+codegen-units = 1
+
 # `cargo xtask ci` builds clippy and tests with this profile. Tests don't need shipping-grade LTO:
 # thin LTO + one codegen unit across ~69 test binaries made the gate ~1.5 h while the tests run in ~75 s.
 [profile.ci]
