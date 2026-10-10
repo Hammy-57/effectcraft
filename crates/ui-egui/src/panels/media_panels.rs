@@ -57,11 +57,15 @@ fn make_thumbnail(imp: &dyn effectcraft_engine::Importer, footage: &dyn effectcr
     Some(([img.width, img.height], img.to_rgba8()))
 }
 
+/// File thumbnails kept (128 px, ~64 KB each); the least recently shown go first.
+const MAX_THUMBS: usize = 256;
+
 /// Thumbnail of a file (cached per path; `None` while not decoded or not decodable). Files are
 /// probed and decoded on a worker thread, never on the UI thread.
 fn thumbnail(app: &EffectcraftApp, ctx: &egui::Context, path: &str, budget: &mut u32) -> Thumb {
     let id = egui::Id::new(("mb-thumb", path));
     if let Some(t) = ctx.data(|d| d.get_temp::<Thumb>(id)) {
+        crate::thumb_lru::touch::<Thumb>(ctx, "mb-thumb", id, MAX_THUMBS);
         return t;
     }
     let jid = egui::Id::new(("mb-thumb-job", path));
@@ -75,6 +79,7 @@ fn thumbnail(app: &EffectcraftApp, ctx: &egui::Context, path: &str, budget: &mut
             d.insert_temp(id, thumb.clone());
             d.remove::<ThumbJob>(jid);
         });
+        crate::thumb_lru::touch::<Thumb>(ctx, "mb-thumb", id, MAX_THUMBS);
         return thumb;
     }
     if *budget == 0 || THUMB_JOBS.load(Ordering::Relaxed) >= MAX_THUMB_JOBS {

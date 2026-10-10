@@ -103,9 +103,15 @@ impl ControlEvents {
     /// A new subscriber's event stream, and the current revision.
     pub fn subscribe(&self) -> (Receiver<Value>, u64) {
         let (tx, rx) = std::sync::mpsc::channel();
+        (rx, self.attach(tx))
+    }
+
+    /// Subscribe `tx` (whose owner may keep a clone, e.g. to wake its reader when the connection
+    /// closes); returns the current revision.
+    pub fn attach(&self, tx: Sender<Value>) -> u64 {
         let mut g = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         g.subscribers.push(tx);
-        (rx, g.revision)
+        g.revision
     }
 
     pub fn subscribers(&self) -> usize {
