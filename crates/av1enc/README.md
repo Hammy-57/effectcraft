@@ -23,12 +23,22 @@ reconstruction, so prediction never drifts.
 - **Frames**: a `KEY_FRAME` every `keyint` frames, `INTER_FRAME`s otherwise. Inter frames use
   slot 0 (the previous reconstruction) for all seven references and refresh slot 0 only, so
   `LAST_FRAME` is always the previous frame. CDFs adapt per symbol and are saved at the end of
-  every frame; inter frames load them from `LAST_FRAME` (`primary_ref_frame` = 0). One tile,
+  every frame; inter frames load them from `LAST_FRAME` (`primary_ref_frame` = 0).
   `TX_MODE_LARGEST`, `reduced_tx_set`, no segmentation, no delta q / lf.
+- **Tile layout**: uniform tile spacing chosen from the frame size alone (never from the machine
+  or thread count): tile columns are added while each stays at least 16 superblocks (1024
+  samples) wide, and at least as many as MAX_TILE_WIDTH (4096) requires; tile rows only when a
+  tile would exceed MAX_TILE_AREA (4096x2304). 1920x1080 is one tile, 3840x2160 two columns,
+  7680x4320 four. Each tile starts from the frame's CDFs with a cleared above context, and
+  AvailU / AvailL, intra edges (BlockDecoded) and motion vector candidates stop at its borders;
+  the CDFs saved for the next frame are tile 0's (`context_update_tile_id` = 0). Every tile but
+  the last is preceded by its size in the fewest bytes that fit (`tile_size_bytes_minus_1`).
+  Tiles cost compression (about 0.6 % in size for two columns at 1080p, hence the 1024-sample
+  minimum; nothing measurable at 2160p).
 - **Deblocking**: the normative loop filter (7.14) runs on the reconstruction; the frame level
   (the same for both luma directions and both chroma planes, no deltas, sharpness 0) is searched
   per frame for the lowest luma error.
-- **Tiles**: the multi-symbol arithmetic encoder is the exact inverse of the spec's symbol
+- **Symbol coding**: the multi-symbol arithmetic encoder is the exact inverse of the spec's symbol
   decoder (8.2), including the exit process padding; CDF adaptation as in 8.2.6.
 - **Partitions**: 64x64 superblocks, `PARTITION_NONE` / `PARTITION_SPLIT` down to 8x8 chosen by
   a rate-distortion cost (SSE + λ·estimated bits); blocks crossing the frame edge are split as
@@ -54,12 +64,14 @@ reconstruction, so prediction never drifts.
   superblocks behind the row above, since a decision reads only the last reconstructed row and
   motion vectors of the row above up to the superblock above-right. The output is bit-identical
   to the serial order whatever the thread count (`tests/roundtrip.rs` pins the bitstream bytes).
-  Syntax writing, loop-filter search and filtering (under 1 % of the time) stay serial;
-  transform trials and block decisions reuse scratch buffers.
+  Tiles are written in parallel. The loop filter runs its vertical-edge pass on superblock
+  rows and its horizontal-edge pass on superblock columns in parallel (an edge only changes
+  samples in its own row or column of 4x4 units, so the result equals the raster order), for
+  the level search too. Transform trials and block decisions reuse scratch buffers.
 
 ## Limits
 
-- One tile: width and height up to 4096 and at most 2304 superblocks (4096x2304 samples).
+- Frames up to the level 6 limits: 16384 samples per side and 35 651 584 in all.
 - No CDEF or loop restoration, no compound prediction, no rectangular or 4xN blocks, no
   directional intra modes other than V / H, no CfL or palette, no transform-size splits, so
   compression is below mature encoders.
