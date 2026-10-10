@@ -529,6 +529,82 @@ fn perf_sequential_1080p_h264() {
     );
 }
 
+/// Rayon workers asking for a frame another worker is decoding wait for it instead of each
+/// decoding a private copy: one decode, the same pixels for everyone.
+#[test]
+fn rayon_workers_wait_for_an_in_flight_frame() {
+    use rayon::prelude::*;
+    let Some(p) = h264_mp4() else { return };
+    let f = probe(&p).expect("probe");
+    let pool = MediaPool::new();
+    let workers = rayon::ThreadPoolBuilder::new().num_threads(10).build().expect("pool");
+    let t = t_of(f.frame_rate, 40);
+    let frames: Vec<Arc<Image>> = workers.install(|| (0..10).into_par_iter().with_max_len(1).map(|_| pool.frame_at(&f, t).expect("frame")).collect());
+    let st = pool.stats();
+    assert_eq!((st.misses, st.hits), (1, 9), "{st:?}");
+    assert!(frames.iter().all(|img| img.data == frames[0].data));
+    let db = psnr(&frames[0], &reference_frame(&p, 40));
+    assert!(db > 35.0, "frame 40: {db:.2} dB");
+}
+
+/// Parallel export reads footage frames from many rayon workers at once, in roughly sequential
+/// order: the pool decodes each frame once (in-flight frames are waited for, not decoded again;
+/// the decode-ahead runs ahead of the workers) and every frame comes out exactly as a plain
+/// sequential read decodes it.
+#[test]
+fn parallel_sequential_reads_match_sequential_decoding() {
+    use rayon::prelude::*;
+    let Some(p) = h264_mp4() else { return };
+    let f = probe(&p).expect("probe");
+    let n = 60;
+    let plain = MediaPool::new();
+    plain.set_read_ahead(false);
+    let reference: Vec<Arc<Image>> = (0..n).map(|i| plain.frame_at(&f, t_of(f.frame_rate, i)).expect("frame")).collect();
+    let workers = rayon::ThreadPoolBuilder::new().num_threads(10).build().expect("pool");
+    let mut fps = [Vec::new(), Vec::new()];
+    for _ in 0..3 {
+        for (k, read_ahead) in [false, true].into_iter().enumerate() {
+            let pool = MediaPool::new();
+            pool.set_read_ahead(read_ahead);
+            let (g0, t0) = (filmcraft_codecs::gop_stats(), Instant::now());
+            let frames: Vec<Arc<Image>> = workers.install(|| {
+                (0..n as i32).into_par_iter().with_max_len(1).map(|i| pool.frame_at(&f, t_of(f.frame_rate, i64::from(i))).expect("frame")).collect()
+            });
+            fps[k].push(n as f64 / t0.elapsed().as_secs_f64());
+            let g = filmcraft_codecs::gop_stats() - g0;
+            for (i, (a, b)) in frames.iter().zip(&reference).enumerate() {
+                assert!(a.data == b.data, "frame {i} (read-ahead {read_ahead}) differs from a sequential decode");
+            }
+            eprintln!("parallel read (read-ahead {read_ahead}): {:?}; samples decoded {}, seeks {}", pool.stats(), g.decoded, g.seeks);
+        }
+    }
+    let median = |v: &mut Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    };
+    let (off, on) = (median(&mut fps[0]), median(&mut fps[1]));
+    eprintln!("1080p H.264, 60 frames on 10 rayon workers (median of 3): {off:.1} fps without decode-ahead, {on:.1} fps with");
+    // Export-like: each worker renders for a while (a sleep: no CPU taken from the decoder) with
+    // the frame's samples, as the compositor does.
+    let mut fps = [Vec::new(), Vec::new()];
+    for _ in 0..3 {
+        for (k, read_ahead) in [false, true].into_iter().enumerate() {
+            let pool = MediaPool::new();
+            pool.set_read_ahead(read_ahead);
+            let t0 = Instant::now();
+            workers.install(|| {
+                (0..n as i32).into_par_iter().with_max_len(1).for_each(|i| {
+                    pool.frame_pixels(ItemId(1), &f, t_of(f.frame_rate, i64::from(i))).expect("frame");
+                    std::thread::sleep(std::time::Duration::from_millis(40));
+                })
+            });
+            fps[k].push(n as f64 / t0.elapsed().as_secs_f64());
+        }
+    }
+    let (off, on) = (median(&mut fps[0]), median(&mut fps[1]));
+    eprintln!("… with 40 ms of render per frame (median of 3): {off:.1} fps without decode-ahead, {on:.1} fps with");
+}
+
 #[test]
 fn exr_still_is_linear_float() {
     // written with the image crate's OpenEXR encoder (no ffmpeg needed)

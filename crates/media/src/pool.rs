@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::thread::ThreadId;
 
 use effectcraft_project::{AlphaMode, Footage, FootageKind, ItemId};
 use effectcraft_raster::{Image, Px};
@@ -174,7 +175,7 @@ pub struct PoolStats {
     pub hits: u64,
     /// Requests that had to decode (or wait for a read-ahead decode).
     pub misses: u64,
-    /// Frames decoded ahead of sequential playback.
+    /// Frames decoded ahead of sequential reads (playback, export).
     pub prefetched: u64,
     /// Frames currently cached and their total size in bytes.
     pub frames: usize,
@@ -186,10 +187,52 @@ pub struct PoolStats {
 #[derive(Default)]
 struct CacheState {
     lru: Lru,
-    /// Frames being decoded right now (requests for them wait instead of decoding again).
-    inflight: HashSet<Key>,
-    /// Last frame index requested per movie (sequential-playback detection).
+    /// Frames being decoded right now and the thread decoding each (requests for them wait
+    /// instead of decoding again).
+    inflight: HashMap<Key, ThreadId>,
+    /// Last frame index requested per movie (sequential-read detection).
     last: HashMap<Arc<str>, i64>,
+    /// Sequential decode-ahead per movie.
+    ahead: HashMap<Arc<str>, Ahead>,
+    /// Decode-ahead runners started (each runner's id).
+    runners: u64,
+    /// Counts finished decodes: a waiter that sees no progress for [`STALL`] stops waiting.
+    progress: u64,
+}
+
+/// A movie's sequential decode-ahead: a runner thread decodes the frames `next..until` (frame
+/// indices at the footage's rate, before looping) in order, so readers going through the movie
+/// (export workers, playback) find them cached instead of each decoding on its own.
+struct Ahead {
+    footage: Footage,
+    preview: Option<Preview>,
+    /// The frames it decodes are keyed like this (frame 0): other interpretations or preview
+    /// sizes of the file don't wait for it.
+    stream: Key,
+    next: i64,
+    until: i64,
+    /// Bytes of one decoded frame (sizes the window).
+    frame_bytes: usize,
+    /// The runner working on it (`None`: stopped).
+    runner: Option<u64>,
+}
+
+/// Requests within this many frames of the previous request of the same movie read it in order
+/// (parallel export workers ask for neighbouring frames out of order).
+const SEQ_SLACK: i64 = 32;
+/// At most this many frames are decoded ahead of a reader …
+const MAX_AHEAD: i64 = 32;
+/// … and at most this share (1 / n) of the frame-cache budget.
+const AHEAD_SHARE: usize = 4;
+/// At most this many movies are decoded ahead at once.
+const MAX_RUNNERS: usize = 4;
+/// A rayon worker waits for a frame being decoded elsewhere while decoding progresses, and decodes
+/// it itself after this long without progress (see [`Inner::pixels_at`]).
+const STALL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Whether `a` and `b` key frames of the same stream (all but the frame index match).
+fn same_stream(a: &Key, b: &Key) -> bool {
+    a.path == b.path && a.interp == b.interp && a.matte == b.matte && a.crop == b.crop && a.preview == b.preview
 }
 
 /// A movie/audio source by path, opened by the first caller while the others wait for it
@@ -317,9 +360,10 @@ struct Inner {
     /// Settings ▸ Disk ▸ Conformed Audio Folder: decoded audio tracks written once per file and
     /// rate, read back instead of decoding again (`None` = off).
     conform: Mutex<Option<std::path::PathBuf>>,
-    /// The read-ahead workers' queue (started on the first read-ahead).
+    /// The thread pool decode-ahead runners decode in (started with the first runner; `None`:
+    /// could not be started).
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-    prefetcher: OnceLock<Option<std::sync::mpsc::SyncSender<Prefetch>>>,
+    ahead_pool: OnceLock<Option<rayon::ThreadPool>>,
     /// Conformed files being written right now.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     conforming: Mutex<HashSet<std::path::PathBuf>>,
@@ -331,9 +375,11 @@ struct Inner {
 /// - One decoder per movie: FilmCraft's GOP cache keeps it positioned, so sequential frames
 ///   decode without re-seeking, and a seek decodes forward from the preceding sync sample.
 /// - Converted frames live in an LRU cache bounded by a byte budget ([`DEFAULT_BUDGET`]).
-/// - Sequential playback reads one frame ahead on a worker thread (native builds), so decoding
-///   and conversion of the next frame overlap with the caller's use of the current one.
-/// - Concurrent requests for the same frame decode it once.
+/// - Reading a movie in order (playback, parallel export) starts a decode-ahead on a runner
+///   thread (native builds): it decodes the next frames in order, up to a share of the cache
+///   budget, so decoding overlaps with the callers' use of the current frames and they find the
+///   next ones cached.
+/// - Concurrent requests for the same frame decode it once: the others wait for it.
 #[derive(Clone)]
 pub struct MediaPool {
     inner: Arc<Inner>,
@@ -362,7 +408,10 @@ struct Inflight<'a> {
 
 impl Drop for Inflight<'_> {
     fn drop(&mut self) {
-        lock(&self.inner.cache).inflight.remove(&self.key);
+        let mut c = lock(&self.inner.cache);
+        c.inflight.remove(&self.key);
+        c.progress = c.progress.wrapping_add(1);
+        drop(c);
         self.inner.done.notify_all();
     }
 }
@@ -390,7 +439,7 @@ impl MediaPool {
                 prefetched: AtomicU64::new(0),
                 opened: AtomicU64::new(0),
                 conform: Mutex::default(),
-                prefetcher: OnceLock::new(),
+                ahead_pool: OnceLock::new(),
                 conforming: Mutex::default(),
             }),
         }
@@ -406,8 +455,8 @@ impl MediaPool {
         lock(&self.inner.cache).lru.evict(bytes);
     }
 
-    /// Enable or disable reading one frame ahead during sequential playback (on by default on
-    /// native builds; ignored on wasm32).
+    /// Enable or disable decoding ahead of sequential reads (on by default on native builds;
+    /// ignored on wasm32).
     pub fn set_read_ahead(&self, on: bool) {
         self.inner.read_ahead.store(on && cfg!(not(target_arch = "wasm32")), Ordering::Relaxed);
     }
@@ -430,6 +479,8 @@ impl MediaPool {
         let mut c = lock(&self.inner.cache);
         c.lru = Lru::default();
         c.last.clear();
+        // Running decode-aheads stop.
+        c.ahead.clear();
     }
 
     /// Drop every cached frame and decoder.
@@ -465,6 +516,7 @@ impl MediaPool {
             c.lru.remove(&k);
         }
         c.last.remove(path);
+        c.ahead.remove(path);
     }
 
     /// Provide the contents of `path` from memory (used instead of the file system; web builds).
@@ -800,40 +852,60 @@ impl Inner {
             return Err(MediaError::Unsupported(format!("{}: no video", footage.path)));
         }
         let loc = Self::locate_for(footage, t, preview);
-        let movie = loc.media_t.is_some();
+        let raw = footage.frame_rate.frame_at(t);
         let mut c = lock(&self.cache);
-        // sequential playback of a movie: read the next frame ahead
-        if playback && movie {
-            let prev = c.last.insert(loc.key.path.clone(), loc.key.frame);
-            if prev == Some(loc.key.frame - 1) && self.read_ahead.load(Ordering::Relaxed) {
-                let next_t = t + footage.frame_rate.frame_duration();
-                let next = Self::locate_for(footage, next_t, preview);
-                if next.key != loc.key && !c.lru.map.contains_key(&next.key) && !c.inflight.contains(&next.key) {
-                    self.prefetch(footage, next_t, preview);
-                }
-            }
+        // a movie read in order: decode the next frames ahead
+        if playback && loc.media_t.is_some() && self.read_ahead.load(Ordering::Relaxed) {
+            self.schedule(&mut c, footage, preview, &loc.key, raw);
         }
+        let me = std::thread::current().id();
+        // (last progress seen, when it was seen): rayon workers stop waiting without progress
+        let mut seen: Option<(u64, std::time::Instant)> = None;
         loop {
             if let Some(px) = c.lru.get(&loc.key) {
                 self.hits.fetch_add(1, Ordering::Relaxed);
                 return Ok(px);
             }
-            if !c.inflight.contains(&loc.key) {
+            let owner = c.inflight.get(&loc.key).copied();
+            let scheduled = owner.is_none()
+                && c.ahead.get(&loc.key.path).is_some_and(|a| a.runner.is_some() && same_stream(&a.stream, &loc.key) && (a.next..a.until).contains(&raw));
+            if owner.is_none() && !scheduled {
                 break;
             }
-            // Another thread (or the read-ahead) is decoding this frame. Never block a rayon
-            // worker on that: while the decoder waits on its own parallel join, the worker can
-            // steal this very job, and waiting here would then wait on a decode further down
-            // its own stack (deadlock). Decode a private copy instead.
-            if rayon::current_thread_index().is_some() {
+            // This thread is decoding the frame further down its stack (a rayon worker that took
+            // this job while its decoder waited on a parallel join): waiting would wait on itself.
+            if owner == Some(me) {
                 self.misses.fetch_add(1, Ordering::Relaxed);
                 drop(c);
                 return self.decode(&loc, footage, false);
             }
-            c = self.done.wait(c).unwrap_or_else(|e| e.into_inner());
+            // Another thread or the decode-ahead is decoding the frame: wait for it. A rayon
+            // worker waits only while decoding progresses: the decoding thread may wait on a
+            // parallel job queued behind this worker's own stack, which it can't run while it
+            // waits here. Without progress for a while it decodes a private copy instead.
+            if rayon::current_thread_index().is_some() {
+                let now = std::time::Instant::now();
+                let since = match seen {
+                    Some((p, at)) if p == c.progress => at,
+                    _ => now,
+                };
+                seen = Some((c.progress, since));
+                let left = STALL.saturating_sub(now.saturating_duration_since(since));
+                if left.is_zero() {
+                    self.misses.fetch_add(1, Ordering::Relaxed);
+                    drop(c);
+                    return self.decode(&loc, footage, false);
+                }
+                c = match self.done.wait_timeout(c, left) {
+                    Ok((g, _)) => g,
+                    Err(e) => e.into_inner().0,
+                };
+            } else {
+                c = self.done.wait(c).unwrap_or_else(|e| e.into_inner());
+            }
         }
         self.misses.fetch_add(1, Ordering::Relaxed);
-        c.inflight.insert(loc.key.clone());
+        c.inflight.insert(loc.key.clone(), me);
         drop(c);
         let _guard = Inflight { inner: self, key: loc.key.clone() };
         let px = self.decode(&loc, footage, false)?;
@@ -841,18 +913,134 @@ impl Inner {
         Ok(px)
     }
 
-    /// Decode a frame ahead of playback on a read-ahead worker. A full queue drops the request
-    /// (playback is ahead of decoding anyway): a thread was spawned per frame before.
-    #[cfg(not(target_arch = "wasm32"))]
-    fn prefetch(self: &Arc<Self>, footage: &Footage, t: Tick, preview: Option<Preview>) {
-        let Some(tx) = self.prefetcher.get_or_init(start_prefetchers) else { return };
-        if tx.try_send((Arc::downgrade(self), footage.clone(), t, preview)).is_ok() {
-            self.prefetched.fetch_add(1, Ordering::Relaxed);
+    /// A read of frame `raw` (key `key`) of a movie: when it follows the previous read closely,
+    /// extend the movie's decode-ahead past it (starting a runner when none is running).
+    fn schedule(self: &Arc<Self>, c: &mut CacheState, footage: &Footage, preview: Option<Preview>, key: &Key, raw: i64) {
+        let prev = c.last.insert(key.path.clone(), raw);
+        if !prev.is_some_and(|p| p != raw && p.abs_diff(raw) <= SEQ_SLACK.unsigned_abs()) {
+            return;
+        }
+        let estimate = (footage.width as usize).saturating_mul(footage.height as usize).saturating_mul(3) / 2 + 64;
+        let frame_bytes = c.ahead.get(&key.path).filter(|a| same_stream(&a.stream, key)).map_or(estimate, |a| a.frame_bytes).max(1);
+        let window = i64::try_from(self.budget() / AHEAD_SHARE / frame_bytes).unwrap_or(MAX_AHEAD).min(MAX_AHEAD);
+        if window < 1 {
+            return;
+        }
+        let total = Self::frame_count(footage.frame_rate, footage.duration).max(1).saturating_mul(i64::from(footage.loop_count.max(1)));
+        let until = raw.saturating_add(1).saturating_add(window).min(total);
+        let running = c.ahead.values().filter(|a| a.runner.is_some()).count();
+        let a = c.ahead.entry(key.path.clone()).or_insert_with(|| Ahead {
+            footage: footage.clone(),
+            preview,
+            stream: Key { frame: 0, ..key.clone() },
+            next: raw.saturating_add(1),
+            until,
+            frame_bytes,
+            runner: None,
+        });
+        let jump = raw < a.next.saturating_sub(SEQ_SLACK) || raw >= a.until;
+        if !same_stream(&a.stream, key) || a.footage != *footage || a.preview != preview || a.runner.is_none() || jump {
+            // another stream of the file, a stopped runner or a jump: start over after this frame
+            if !same_stream(&a.stream, key) {
+                a.frame_bytes = estimate;
+            }
+            a.footage = footage.clone();
+            a.preview = preview;
+            a.stream = Key { frame: 0, ..key.clone() };
+            a.next = raw.saturating_add(1);
+        }
+        a.until = a.until.max(until).min(total);
+        if a.runner.is_some() || a.next >= a.until || running >= MAX_RUNNERS {
+            return;
+        }
+        c.runners = c.runners.wrapping_add(1);
+        let id = c.runners;
+        if self.start_runner(key.path.clone(), id)
+            && let Some(a) = c.ahead.get_mut(&key.path)
+        {
+            a.runner = Some(id);
         }
     }
 
+    /// Start the decode-ahead runner `id` of `path`: a plain thread, not a rayon job (rayon
+    /// workers wait for the frames it decodes). It decodes in its own thread pool, so codecs that
+    /// parallelise with rayon don't queue their work behind the global pool's waiting workers.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn start_runner(self: &Arc<Self>, path: Arc<str>, id: u64) -> bool {
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let pool =
+            self.ahead_pool.get_or_init(|| rayon::ThreadPoolBuilder::new().num_threads(threads).thread_name(|i| format!("ec-media-ahead-{i}")).build().ok());
+        if pool.is_none() {
+            return false;
+        }
+        let weak = Arc::downgrade(self);
+        std::thread::Builder::new()
+            .name("ec-media-decode-ahead".into())
+            .spawn(move || {
+                let _stop = RunnerStop { inner: weak.clone(), path: path.clone(), id };
+                while let Some(inner) = weak.upgrade() {
+                    if !inner.run_ahead(&path, id) {
+                        return;
+                    }
+                }
+            })
+            .is_ok()
+    }
+
     #[cfg(target_arch = "wasm32")]
-    fn prefetch(self: &Arc<Self>, _footage: &Footage, _t: Tick, _preview: Option<Preview>) {}
+    fn start_runner(self: &Arc<Self>, _path: Arc<str>, _id: u64) -> bool {
+        false
+    }
+
+    /// One step of runner `id` of `path`: decode its next frame (skipping frames cached or being
+    /// decoded already). `false` when the runner is done (window decoded, stopped or replaced).
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    fn run_ahead(&self, path: &Arc<str>, id: u64) -> bool {
+        let mut c = lock(&self.cache);
+        let Some(a) = c.ahead.get_mut(path).filter(|a| a.runner == Some(id)) else { return false };
+        if a.next >= a.until {
+            a.runner = None;
+            drop(c);
+            self.done.notify_all();
+            return false;
+        }
+        let raw = a.next;
+        a.next = a.next.saturating_add(1);
+        let (footage, preview) = (a.footage.clone(), a.preview);
+        let rate = footage.frame_rate;
+        let t = rate.tick_of(raw) + Tick(rate.frame_duration().0 / 2);
+        let loc = Self::locate_for(&footage, t, preview);
+        if c.lru.map.contains_key(&loc.key) || c.inflight.contains_key(&loc.key) {
+            return true;
+        }
+        c.inflight.insert(loc.key.clone(), std::thread::current().id());
+        drop(c);
+        let guard = Inflight { inner: self, key: loc.key.clone() };
+        let decoded = match self.ahead_pool.get().and_then(Option::as_ref) {
+            Some(pool) => pool.install(|| self.decode(&loc, &footage, false)),
+            None => self.decode(&loc, &footage, false),
+        };
+        let mut c = lock(&self.cache);
+        match decoded {
+            Ok(px) => {
+                let bytes = px.bytes();
+                c.lru.insert(loc.key, px, self.budget());
+                if let Some(a) = c.ahead.get_mut(path).filter(|a| a.runner == Some(id)) {
+                    a.frame_bytes = bytes;
+                }
+                self.prefetched.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => {
+                log::debug!("media: decode-ahead of {path} at frame {raw}: {e}");
+                if let Some(a) = c.ahead.get_mut(path).filter(|a| a.runner == Some(id)) {
+                    a.until = a.next;
+                }
+            }
+        }
+        drop(c);
+        drop(guard);
+        true
+    }
 
     /// Decode the frame at `loc`: movies and 8 / 16-bit stills are kept as their samples
     /// ([`Packed`]), float stills, layered and vector documents as float pixels.
@@ -993,36 +1181,23 @@ impl FootageSource for MediaPool {
     }
 }
 
-/// A read-ahead request: the pool (not kept alive by the queue), the footage and its time.
-type Prefetch = (std::sync::Weak<Inner>, Footage, Tick, Option<Preview>);
+/// Marks a decode-ahead runner stopped when its thread ends (also when a decode panics), and
+/// wakes the readers waiting for its frames.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+struct RunnerStop {
+    inner: std::sync::Weak<Inner>,
+    path: Arc<str>,
+    id: u64,
+}
 
-/// Read-ahead workers per pool, and requests queued for them.
-#[cfg(not(target_arch = "wasm32"))]
-const PREFETCH_WORKERS: usize = 2;
-#[cfg(not(target_arch = "wasm32"))]
-const PREFETCH_QUEUE: usize = 4;
-
-/// Start the read-ahead workers: plain threads, not rayon jobs (the decodes parallelise with
-/// rayon themselves). They end when the pool (holding the queue's sender) is dropped.
-#[cfg(not(target_arch = "wasm32"))]
-fn start_prefetchers() -> Option<std::sync::mpsc::SyncSender<Prefetch>> {
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Prefetch>(PREFETCH_QUEUE);
-    let rx = Arc::new(Mutex::new(rx));
-    let mut started = 0;
-    for i in 0..PREFETCH_WORKERS {
-        let rx = rx.clone();
-        let spawned = std::thread::Builder::new().name(format!("ec-media-readahead-{i}")).spawn(move || {
-            loop {
-                let job = lock(&rx).recv();
-                let Ok((pool, f, t, preview)) = job else { return };
-                if let Some(me) = pool.upgrade() {
-                    let _ = me.pixels_at(&f, t, false, preview);
-                }
-            }
-        });
-        started += usize::from(spawned.is_ok());
+impl Drop for RunnerStop {
+    fn drop(&mut self) {
+        let Some(inner) = self.inner.upgrade() else { return };
+        if let Some(a) = lock(&inner.cache).ahead.get_mut(&self.path).filter(|a| a.runner == Some(self.id)) {
+            a.runner = None;
+        }
+        inner.done.notify_all();
     }
-    (started > 0).then_some(tx)
 }
 
 impl MediaPool {
