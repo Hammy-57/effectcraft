@@ -76,7 +76,7 @@ Without `--autosave`, headless work is in memory until explicitly saved. The fla
 only; a bridged desktop app owns its auto-saves. An edit interrupted before its reply is received
 may be absent from the last checkpoint.
 
-See [MCP conventions](mcp.md) for core tools, resources, strict arguments, and render progress/cancellation.
+See [MCP conventions](mcp.md) for core tools, resources, strict arguments, and progress/cancellation of long calls (renders, analyses with `wait: true`, `jobs.wait`, scripts).
 
 ### Tools
 
@@ -86,7 +86,7 @@ See [MCP conventions](mcp.md) for core tools, resources, strict arguments, and r
 | `describe_command {command \| id}` | One command in full: label, menu, shortcut, params doc, JSON `schema`, enabled / `why`. |
 | `execute_command {command \| id, params?}` | Run any command (undoable). Unknown parameter keys are rejected with the accepted list. |
 | `get_state` | Editor state (active comp, time, selections, tool) plus `app`: version, command and effect counts, export formats, parity summary. |
-| `run_script {code, name?}` | Run JavaScript with the After Effects-style scripting object model (`app.project`, `comp.layers.addText(…)`, `layer.property("ADBE Transform Group").property("ADBE Position").setValueAtTime(…)`…). Returns `{ok, result, output, error: {message, line, column}}`; edits are undoable. |
+| `run_script {code, name?, timeout?}` | Run JavaScript with the After Effects-style scripting object model (`app.project`, `comp.layers.addText(…)`, `layer.property("ADBE Transform Group").property("ADBE Position").setValueAtTime(…)`…). Returns `{ok, result, output, error: {message, line, column}}`; edits are undoable. Stops after `timeout` seconds (default 300, `0` = none) or on `notifications/cancelled`. |
 | `get_project` / `get_comp {comp?}` | Project items, comp settings and layers. |
 | `get_layer {layer, comp?, time?, depth?, flat?}` | A layer's property tree (`depth` limits how many group levels expand). Every node has a `path`. |
 | `get_property {layer, path, comp?, time?}` | Value at a time, keyframes and expression. |
@@ -164,7 +164,8 @@ Things that tripped up a long agent-driven session (a multi-scene 3D piece built
 - **Loops in scripts.** `run_script` can call any engine command with `app.run(id, params)`, for
   example `app.run("layer.new3dPrimitive", {kind: "cube", position: [x, y, z]})` inside a loop. A
   script that throws keeps the edits it already made: wrap it in `app.beginUndoGroup()` /
-  `app.endUndoGroup()` so one `undo {}` removes them all. (`batch` rolls back on its own.)
+  `app.endUndoGroup()` so one `undo {}` removes them all. (`batch` rolls back on its own.) A script
+  stopped by its `timeout` or a cancel rolls back an undo group it left open.
 - **Save early in headless mode.** Without `--autosave` the headless server keeps the project in
   memory only, so a server restart loses unsaved work: start it with `mcp --autosave` (see above)
   or call `save_project {"path": …}` after each milestone.
