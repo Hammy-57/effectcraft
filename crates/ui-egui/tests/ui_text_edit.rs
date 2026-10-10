@@ -342,3 +342,44 @@ fn overlapping_duplicate_text_remains_editable_by_double_click_and_selected_type
     key(&mut h, Key::Z, Modifiers::COMMAND);
     assert_eq!(edited(&h).1, "alpha beta");
 }
+
+#[test]
+fn type_tool_selected_text_preference_skips_ineligible_layers_and_falls_back_to_topmost() {
+    for exclusion in ["hidden", "locked", "inactive", "unsoloed", "outside", "unselected"] {
+        let mut a = app();
+        let mut ids = vec![];
+        for _ in 0..2 {
+            ids.push(
+                a.session.execute("layer.newText", json!({"text": "alpha beta", "size": 40, "box": [40, 60, 250, 100]})).unwrap()["layer"].as_u64().unwrap(),
+            );
+        }
+        let original = ids[0];
+        let topmost = ids[1];
+        match exclusion {
+            "hidden" | "locked" => {
+                let switch = if exclusion == "hidden" { "video" } else { "locked" };
+                a.session.execute("layer.setSwitch", json!({"layers": [original], "switch": switch, "value": exclusion == "locked"})).unwrap();
+            }
+            "inactive" => {
+                let cid = a.session.active_comp_id().unwrap();
+                std::sync::Arc::make_mut(&mut a.session.project).comp_mut(cid).unwrap().layer_mut(LayerId(original)).unwrap().out_point =
+                    effectcraft_engine::time::Tick::ZERO;
+            }
+            "unsoloed" => {
+                a.session.execute("layer.setSwitch", json!({"layers": [topmost], "switch": "solo", "value": true})).unwrap();
+            }
+            "outside" => {
+                a.session.execute("prop.set", json!({"layer": original, "path": "transform/position", "value": [500, 300]})).unwrap();
+            }
+            _ => {}
+        }
+        a.session.state.selected_layers = if exclusion == "unselected" { vec![] } else { vec![LayerId(original)] };
+        a.ui.tool = effectcraft_ui_egui::state::Tool::Type;
+        let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).with_step_dt(1.0 / 60.0).build_eframe(move |_| a);
+        h.run_steps(3);
+        let comp = rect(&h, "viewer.comp");
+        let p = comp.min + egui::vec2(80.0, 85.0) * (comp.width() / 640.0);
+        click(&mut h, p, Modifiers::NONE);
+        assert_eq!(edited(&h).0, topmost, "{exclusion} selected text must not override the eligible hit");
+    }
+}
