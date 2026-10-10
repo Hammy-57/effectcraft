@@ -287,11 +287,13 @@ fn duplicated_text_boxes_both_remain_editable() {
         .unwrap()["layer"]
         .as_u64()
         .unwrap();
-    a.session.execute("edit.duplicate", json!({})).unwrap();
-    let duplicate = a.session.state.selected_layers[0].0;
-    assert_ne!(original, duplicate);
-    a.session.execute("prop.set", json!({"layer": duplicate, "path": "transform/position", "value": [465, 110]})).unwrap();
     let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).with_step_dt(1.0 / 60.0).build_eframe(move |_| a);
+    h.run_steps(3);
+    h.state_mut().ui.focused = PanelKind::Composition;
+    key(&mut h, Key::D, Modifiers::COMMAND);
+    let duplicate = h.state().session.state.selected_layers[0].0;
+    assert_ne!(original, duplicate);
+    h.state_mut().session.execute("prop.set", json!({"layer": duplicate, "path": "transform/position", "value": [465, 110]})).unwrap();
     h.run_steps(3);
     for (layer, x, text) in [(original, 80.0, "original edited"), (duplicate, 380.0, "duplicate edited")] {
         h.run_steps(40);
