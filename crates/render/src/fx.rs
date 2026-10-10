@@ -352,7 +352,7 @@ pub(crate) fn fx_origin(ctx: &EvalCtx, layer: &Layer, adjustment: bool) -> [f64;
 /// measured with CC Light Sweep, its centre, angle and width stay put in the comp whatever the
 /// layer's position, scale and rotation. The layer → comp affine of such a 2D layer (see
 /// [`EffectEnv::comp_space`]).
-fn fx_comp_space(ctx: &EvalCtx, layer: &Layer) -> Option<Mat3> {
+pub(crate) fn fx_comp_space(ctx: &EvalCtx, layer: &Layer) -> Option<Mat3> {
     if !layer.switches.collapse || layer.is_3d() || !matches!(layer.source, LayerSource::Shape | LayerSource::Text) {
         return None;
     }
