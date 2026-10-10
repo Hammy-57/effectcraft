@@ -1187,7 +1187,7 @@ impl<'g> Enc<'g> {
         // intermediate copy).
         self.read_rows(&img.texture, img.width, img.height, 16, |r| match bytemuck::try_cast_slice::<u8, [f32; 4]>(r) {
             Ok(px) => data.extend_from_slice(px),
-            Err(_) => data.extend(r.chunks_exact(16).map(bytemuck::pod_read_unaligned::<[f32; 4]>)),
+            Err(_) => data.extend(r.as_chunks::<16>().0.iter().map(|c| bytemuck::pod_read_unaligned::<[f32; 4]>(c))),
         })?;
         if data.len() != layout.len / 16 {
             log::error!("gpu image readback size mismatch");
