@@ -10,7 +10,7 @@ You need [Rust](https://rustup.rs/) 1.95 or newer.
 ```sh
 cargo run -p effectcraft -- --demo       # the desktop app, with the demo project
 cargo test --workspace
-cargo xtask ci                           # what every commit must pass
+cargo xtask ci                           # what every commit must pass (tests use --profile ci)
 ```
 
 ## Ground rules

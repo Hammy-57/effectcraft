@@ -425,15 +425,18 @@ const GUTTER_W: f32 = 18.0;
 /// The most a time ruler zooms in (pixels per second).
 const MAX_PPS: f64 = 4000.0;
 
+/// One `=` / `-` step (and one click on the footer's zoom buttons).
+pub(crate) const ZOOM_STEP: f64 = 1.5;
+
 /// Pixels per second that fit `comp` in a time graph `width` points wide.
-fn fit_pps(width: f32, comp: &Comp) -> f64 {
+pub(crate) fn fit_pps(width: f32, comp: &Comp) -> f64 {
     (width - 10.0).max(1.0) as f64 / comp.duration.seconds().max(0.01)
 }
 
 /// Zoom the time ruler to `pps` pixels per second, keeping comp time `at_t` at `at_px` pixels
 /// from the ruler's start. Zooming out stops at `fit`, where the whole comp shows (and the
 /// ruler keeps fitting it).
-fn set_zoom(tl: &mut crate::state::TimelineState, comp: &Comp, pps: f64, fit: f64, at_t: f64, at_px: f64) {
+pub(crate) fn set_zoom(tl: &mut crate::state::TimelineState, comp: &Comp, pps: f64, fit: f64, at_t: f64, at_px: f64) {
     let npps = pps.min(MAX_PPS.max(fit)).max(fit);
     if npps <= fit {
         tl.pps = None;
@@ -1163,6 +1166,11 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     if app.ui.timeline.pps.is_none() {
         app.ui.timeline.start = 0.0;
     }
+    // As in After Effects, the ruler never scrolls past the comp's end: zoomed in, the last
+    // visible time is at most the comp duration.
+    let visible_secs = ((graph_x1 - graph_x0 - 6.0).max(1.0) as f64 / pps.max(1e-6)).max(0.0);
+    let max_start = (comp.duration.seconds() - visible_secs).max(0.0);
+    app.ui.timeline.start = app.ui.timeline.start.clamp(0.0, max_start);
     let tm = TMap { x0: graph_x0 + 6.0, start: app.ui.timeline.start, pps };
     ctx.data_mut(|d| d.insert_temp(tl_map_id(), (tm.x0, tm.start, tm.pps)));
     let top = rect.min.y;
@@ -1433,6 +1441,17 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         let tt = Tick::from_seconds_f64(secs);
         app.session.set_time(tt);
         app.stop();
+        // Dragged past either edge of the ruler (over the layer outline, say), the view scrolls so
+        // the current time indicator stays in sight (After Effects).
+        if app.ui.timeline.pps.is_some() {
+            let now = app.session.time().seconds();
+            let span = tm.t(bin.min.x) - tm.start;
+            if now < tm.start {
+                app.ui.timeline.start = now.max(0.0);
+            } else if now > tm.start + span {
+                app.ui.timeline.start = (now - span).max(0.0);
+            }
+        }
         // Ctrl/Cmd-drag scrubs the audio too (After Effects).
         if rresp.dragged()
             && ui.input(|i| i.modifiers.command)
@@ -1586,6 +1605,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let mut ui_actions: Vec<UiAct> = Vec::new();
     let idx_of = |id: LayerId| comp.index_of(id).unwrap_or(0);
     let graph_on = app.ui.timeline.graph_editor;
+    super::graph::track_open(ui.ctx(), graph_on);
     let full_clip = ui.clip_rect();
     let left_clip = full_clip.intersect(Rect::from_min_max(pos2(rect.min.x, rows_rect.min.y), pos2(graph_x0 - 1.0, rows_rect.max.y)));
     let right_clip = full_clip.intersect(Rect::from_min_max(pos2(graph_x0, rows_rect.min.y), rows_rect.max));
@@ -2745,24 +2765,35 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     );
     // Zoom slider.
     let zs = Rect::from_min_max(pos2(graph_x0 + 30.0, footer.center().y - 2.0), pos2((graph_x0 + 230.0).min(rect.max.x - 30.0), footer.center().y + 2.0));
-    icons::paint(&p, Rect::from_center_size(pos2(zs.min.x - 14.0, footer.center().y), vec2(14.0, 14.0)), Icon::MountainSmall, t.text_dim);
-    icons::paint(&p, Rect::from_center_size(pos2(zs.max.x + 14.0, footer.center().y), vec2(16.0, 16.0)), Icon::MountainLarge, t.text_dim);
+    // Zoom out / zoom in buttons either side of the slider: the `-` / `=` steps. Everything here
+    // zooms around the CTI and sets the one time zoom the layer bars and the Graph Editor share.
+    let cti = time.seconds();
+    let cti_px = (cti - tm.start) * pps;
+    for (icon, size, cx, id, tip, k) in [
+        (Icon::MountainSmall, 14.0, zs.min.x - 14.0, "timeline.zoomOutButton", "Zoom Out (Time)", 1.0 / ZOOM_STEP),
+        (Icon::MountainLarge, 16.0, zs.max.x + 14.0, "timeline.zoomInButton", "Zoom In (Time)", ZOOM_STEP),
+    ] {
+        let r = Rect::from_center_size(pos2(cx, footer.center().y), vec2(20.0, 20.0));
+        let resp = ui.interact(r, egui::Id::new(id), Sense::click()).on_hover_text(crate::i18n::tr(tip));
+        icons::paint(&p, Rect::from_center_size(r.center(), vec2(size, size)), icon, if resp.hovered() { t.text } else { t.text_dim });
+        app.auto.add(id, r, tip);
+        if resp.clicked() {
+            set_zoom(&mut app.ui.timeline, &comp, pps * k, fit_pps, cti, cti_px);
+        }
+    }
     p.rect_filled(zs, 2.0, t.field_bg);
-    let maxpps = MAX_PPS;
+    let maxpps = MAX_PPS.max(fit_pps * 1.001);
     let frac = ((pps / fit_pps).ln() / (maxpps / fit_pps).ln()).clamp(0.0, 1.0) as f32;
     let knob = pos2(zs.min.x + zs.width() * frac, zs.center().y);
     p.circle_filled(knob, 6.0, t.text);
-    let zresp = ui.interact(zs.expand2(vec2(6.0, 8.0)), egui::Id::new("tl-zoom"), Sense::drag());
+    // Drag the knob, or click the track to jump there.
+    let zresp = ui.interact(zs.expand2(vec2(6.0, 8.0)), egui::Id::new("tl-zoom"), Sense::click_and_drag());
     app.auto.add("timeline.zoomSlider", zs, "Zoom");
-    if zresp.dragged()
+    if (zresp.dragged() || zresp.clicked())
         && let Some(pt) = zresp.interact_pointer_pos()
     {
-        let f = ((pt.x - zs.min.x) / zs.width()).clamp(0.0, 1.0) as f64;
-        let npps = fit_pps * (maxpps / fit_pps).powf(f);
-        let cti = time.seconds();
-        let rel = (cti - tm.start) * pps;
-        app.ui.timeline.start = (cti - rel / npps).max(0.0);
-        app.ui.timeline.pps = Some(npps);
+        let f = ((pt.x - zs.min.x) / zs.width().max(1.0)).clamp(0.0, 1.0) as f64;
+        set_zoom(&mut app.ui.timeline, &comp, fit_pps * (maxpps / fit_pps).powf(f), fit_pps, cti, cti_px);
     }
 
     // Composition markers in the ruler; protected regions shade the layer rows.
@@ -2847,21 +2878,28 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 let tl = &mut app.ui.timeline;
                 // Twirled by hand, the layer shows its whole tree again.
                 tl.reveal.clear();
-                tl.layer_reveal.remove(&id);
                 let open = !tl.open_layers.contains(&id);
-                if open {
-                    tl.open_layers.insert(id);
+                let targets = if app.session.state.selected_layers.contains(&LayerId(id)) {
+                    app.session.state.selected_layers.iter().map(|l| l.0).collect::<Vec<_>>()
                 } else {
-                    tl.open_layers.remove(&id);
-                }
-                if all && let Some(l) = comp.layer(LayerId(id)) {
-                    let mut uids = vec![];
-                    walk_groups(&l.props, &mut uids);
-                    for u in uids {
-                        if open {
-                            tl.open_groups.insert(u);
-                        } else {
-                            tl.open_groups.remove(&u);
+                    vec![id]
+                };
+                for id in targets {
+                    tl.layer_reveal.remove(&id);
+                    if open {
+                        tl.open_layers.insert(id);
+                    } else {
+                        tl.open_layers.remove(&id);
+                    }
+                    if all && let Some(l) = comp.layer(LayerId(id)) {
+                        let mut uids = vec![];
+                        walk_groups(&l.props, &mut uids);
+                        for u in uids {
+                            if open {
+                                tl.open_groups.insert(u);
+                            } else {
+                                tl.open_groups.remove(&u);
+                            }
                         }
                     }
                 }

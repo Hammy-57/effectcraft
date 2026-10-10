@@ -214,7 +214,8 @@ The most important missing piece: it turns every other estimate here into a meas
 
 ## For agents choosing work
 
-1. Read `plan/STATUS.md` for owner blockers and running work, then this file.
+1. Run `cargo xtask agents status` (running work and claims; regenerates `plan/STATUS.md`) and claim
+   your task with `cargo xtask agents claim`, then read this file.
 2. Prefer G1–G3 over new features. A feature that exists but behaves differently from After
    Effects is not done.
 3. When you fix a behaviour bug in a feature parity.md marks as done, add it to the evidence

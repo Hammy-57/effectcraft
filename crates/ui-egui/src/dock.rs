@@ -1152,13 +1152,14 @@ pub fn draw_group_chrome(ui: &mut egui::Ui, g: &Group, t: &Tokens, reg: &mut cra
             let menu_w = if is_active { 20.0 } else { 0.0 };
             // The lock belongs to the panel: on its shown document's tab only.
             let lock = e.deco.is_some_and(|d| d.viewer) && (e.doc.is_none() || is_active);
+            let show_close = is_active && (e.deco.is_some_and(|d| d.viewer) || *p == PanelKind::RenderQueue);
             // × (active tab only), swatch and lock before the label.
             let deco_w = match e.deco {
-                Some(d) if d.viewer => (if is_active { 16.0 } else { 0.0 }) + 14.0 + if lock { 16.0 } else { 0.0 },
+                Some(d) if d.viewer => 14.0 + if lock { 16.0 } else { 0.0 },
                 Some(_) => 14.0,
                 None => 0.0,
             };
-            let w = galley.size().x + 16.0 + menu_w + deco_w;
+            let w = galley.size().x + 16.0 + menu_w + deco_w + if show_close { 16.0 } else { 0.0 };
             if x + w > strip.max.x - 20.0 && k > ai {
                 let r = Rect::from_min_size(pos2(strip.max.x - 22.0, strip.min.y + 6.0), vec2(18.0, 20.0));
                 let resp = ui.interact(r, egui::Id::new(("tab-overflow", g.path.clone())), Sense::click());
@@ -1190,21 +1191,22 @@ pub fn draw_group_chrome(ui: &mut egui::Ui, g: &Group, t: &Tokens, reg: &mut cra
                 reg.add(&format!("panel.tab.{}", p.id()), tab, &e.label);
             }
             let mut label_x = tab.min.x + 8.0;
-            if let Some(d) = e.deco {
-                let mut dx = tab.min.x + 6.0;
-                if is_active && d.viewer {
-                    let cr = Rect::from_center_size(pos2(dx + 5.0, text_y), vec2(10.0, 10.0));
-                    let cresp = ui.interact(cr.expand(2.0), egui::Id::new(("tab-close", g.path.clone(), k)), Sense::click());
-                    let cc = if cresp.hovered() { t.tab_text_active } else { t.tab_text };
-                    let kk = 3.5;
-                    painter.line_segment([cr.center() + vec2(-kk, -kk), cr.center() + vec2(kk, kk)], Stroke::new(1.2, cc));
-                    painter.line_segment([cr.center() + vec2(-kk, kk), cr.center() + vec2(kk, -kk)], Stroke::new(1.2, cc));
-                    reg.add(&format!("panel.tab.{}.close", p.id()), cr, "Close");
-                    if cresp.clicked() {
-                        out.actions.push(close(e));
-                    }
-                    dx += 16.0;
+            let mut dx = tab.min.x + 6.0;
+            if show_close {
+                let cr = Rect::from_center_size(pos2(dx + 5.0, text_y), vec2(10.0, 10.0));
+                let cresp = ui.interact(cr.expand(2.0), egui::Id::new(("tab-close", g.path.clone(), k)), Sense::click());
+                let cc = if cresp.hovered() { t.tab_text_active } else { t.tab_text };
+                let kk = 3.5;
+                painter.line_segment([cr.center() + vec2(-kk, -kk), cr.center() + vec2(kk, kk)], Stroke::new(1.2, cc));
+                painter.line_segment([cr.center() + vec2(-kk, kk), cr.center() + vec2(kk, -kk)], Stroke::new(1.2, cc));
+                reg.add(&format!("panel.tab.{}.close", p.id()), cr, "Close");
+                if cresp.clicked() {
+                    out.actions.push(close(e));
                 }
+                dx += 16.0;
+                label_x = dx + 2.0;
+            }
+            if let Some(d) = e.deco {
                 let sw = Rect::from_center_size(pos2(dx + 5.0, text_y), vec2(9.0, 9.0));
                 painter.rect_filled(sw, 1.0, d.swatch);
                 dx += 14.0;

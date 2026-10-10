@@ -20,19 +20,22 @@ fn pts(v: Option<&Value>) -> Vec<[f64; 2]> {
     v.and_then(Value::as_array).map(|a| a.iter().filter_map(|p| pt(Some(p))).collect()).unwrap_or_default()
 }
 
-/// Index of a mask group by uid, 1-based index or name.
-fn mask_index(masks: &PropGroup, key: &Value) -> Option<usize> {
+/// Index of a mask group by uid (a number, never a position), `"#n"` (1-based) or name.
+pub(crate) fn mask_index(masks: &PropGroup, key: &Value) -> Option<usize> {
     match key {
         Value::Number(n) => {
             let n = n.as_u64()?;
-            masks.children.iter().position(|c| c.uid() == n).or_else(|| (n as usize).checked_sub(1).filter(|i| *i < masks.children.len()))
+            masks.children.iter().position(|c| c.uid() == n)
         }
-        Value::String(s) => masks.children.iter().position(|c| c.name() == s),
+        Value::String(s) => match s.strip_prefix('#').and_then(|i| i.parse::<usize>().ok()) {
+            Some(i) => i.checked_sub(1).filter(|i| *i < masks.children.len()),
+            None => masks.children.iter().position(|c| c.name() == s),
+        },
         _ => None,
     }
 }
 
-/// Find a mask group by uid, 1-based index or name.
+/// Find a mask group by uid, `"#n"` (1-based) or name.
 fn find_mask<'a>(masks: &'a mut PropGroup, key: &Value) -> Option<&'a mut PropGroup> {
     let i = mask_index(masks, key)?;
     masks.children.get_mut(i)?.as_group_mut()
@@ -43,7 +46,7 @@ pub(crate) fn is_path_group(g: &PropGroup) -> bool {
     matches!(g.get("path").map(|p| &p.value), Some(KV::Path(_))) && (matches!(g.kind, effectcraft_project::GroupKind::Mask { .. }) || g.match_id == "path")
 }
 
-/// A mask (uid, 1-based index or name) or, by uid, a shape layer's Path item.
+/// A mask (uid, `"#n"` (1-based) or name) or, by uid, a shape layer's Path item.
 pub(crate) fn path_group<'a>(props: &'a mut PropGroup, key: &Value) -> Option<&'a mut PropGroup> {
     if let Some(i) = props.sub("masks").and_then(|m| mask_index(m, key)) {
         return props.sub_mut("masks")?.children.get_mut(i)?.as_group_mut();
@@ -121,7 +124,7 @@ fn sync_keys(pr: &mut effectcraft_project::Property, lt: effectcraft_time::Tick,
 /// [`edit_path`] whose edit may change the vertex count (`f` says how).
 fn edit_path_counted<T>(s: &mut Session, p: &Value, label: &str, f: impl FnOnce(&mut ShapePath) -> Result<(T, Option<CountOp>)>) -> Result<(Uid, T)> {
     let (cid, lid) = layer_p(s, p, label)?;
-    let key = p.get("mask").cloned().ok_or_else(|| bad(label, "missing `mask` (uid, index or name)"))?;
+    let key = p.get("mask").cloned().ok_or_else(|| bad(label, "missing `mask` (uid, \"#n\" or name)"))?;
     let t = s.time();
     let preserve = s.prefs.general.preserve_constant_vertex_count;
     s.edit(label, merge_p(p), |proj, _| {

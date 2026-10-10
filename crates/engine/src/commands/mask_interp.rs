@@ -21,7 +21,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Track Mask",
             ["Animation"],
             None,
-            "{layer?, mask?: uid|index|name, method?: position|positionScale|positionScaleRotation|positionScaleRotationSkew|perspective|faceOutline|faceDetailed, direction?: forward|backward|frameForward|frameBackward, start? (s), end? (s), wait?: block until done}",
+            "{layer?, mask?: uid|\"#n\"|name, method?: position|positionScale|positionScaleRotation|positionScaleRotationSkew|perspective|faceOutline|faceDetailed, direction?: forward|backward|frameForward|frameBackward, start? (s), end? (s), wait?: block until done}",
             has_mask,
             track_mask
         ),
@@ -66,19 +66,12 @@ pub fn specs() -> Vec<CommandSpec> {
 
 // ---------------------------------------------------------------- mask tracking
 
-/// The mask a command works on: `mask` (uid, 1-based index or name), else the selected mask
+/// The mask a command works on: `mask` (uid, `"#n"` (1-based) or name), else the selected mask
 /// (Timeline selection or selected vertices), else the layer's only mask.
 pub(crate) fn mask_uid(s: &Session, layer: &Layer, p: &Value) -> Option<Uid> {
     let masks = layer.masks()?;
     if let Some(k) = p.get("mask") {
-        return match k {
-            Value::Number(n) => {
-                let n = n.as_u64()?;
-                masks.groups().find(|g| g.uid == n).or_else(|| masks.groups().nth((n as usize).checked_sub(1)?)).map(|g| g.uid)
-            }
-            Value::String(name) => masks.groups().find(|g| &g.name == name).map(|g| g.uid),
-            _ => None,
-        };
+        return super::pick_group(masks.groups(), k).map(|g| g.uid);
     }
     let is_mask = |u: Uid| masks.groups().any(|g| g.uid == u);
     if let Some(u) = s.state.selected_props.iter().filter(|(l, _)| *l == layer.id).map(|(_, u)| *u).find(|u| is_mask(*u)) {

@@ -46,14 +46,22 @@ Useful query commands for `engine.execute` (they aren't journaled or undoable): 
 export formats, parity summary), `jobs.list` (Progress panel jobs, e.g. the background
 `footage.check` after File ▸ Open), `render.snapshot {name, comp?, time?, max_side?, transparent?}`
 (keep a rendered frame in the session, 16 at most), `render.snapshots {clear?}` and
-`render.compare {a, b, threshold?, min_psnr?, max_side?, amplify?, diff_path?, diff_inline?}`
+`render.compare {a, b, threshold?, min_psnr?, max_side?, region?, amplify?, diff_path?, diff_inline?}`
 (`a`/`b`: a snapshot name, `{snapshot}`, `{path}` of a PNG/JPEG, or `{comp?, time?, transparent?}`
 rendered now) → `{width, height, max_abs, mean_abs, alpha_max_abs, psnr_db, ssim, changed_pixels,
-changed_pct, pass, diff_path?, diff_png?}` (metrics and size rules in
+changed_pct, pass, diffBounds, region?, diff_path?, diff_png?}` (`region: [x, y, w, h]` compares
+one rectangle; `diffBounds` boxes the changed pixels or is null; metrics and size rules in
 [agents.md](agents.md#verify-your-change-snapshot--edit--compare)). Analysis queries (see
 [mcp.md](mcp.md#analysis-tools)): `layer.bounds {comp?, time?, layers?, pixels?, overlaps?}`
 (layer geometry in comp space) and `audio.analyze {comp?, start?, end?, layer?, waveform?, path?}`
 (peak, RMS, LUFS, clipping and silences of the mix).
+
+`project.summary` and `editor.state` include the document `revision` (bumped on every change, undo and
+redo included). Every command's `params` also accepts `expectRevision` (the command doesn't run and
+errors with `document changed (revision X, expected Y)` when the document moved on) and `client` (a
+driver name: its undo steps are tagged, and `edit.undo {"client": …}` refuses unless that client made
+the last step). Both are handled by `Session::execute` and stripped before the command sees its params.
+A number always names an id (layer, effect, mask…), never a position; use `"#n"` for the n-th.
 
 Every engine command is reachable through `engine.execute`, and every interactive widget of every
 panel registers an element id; both are enforced by `crates/ui-egui/tests/ui_agent_audit.rs`.

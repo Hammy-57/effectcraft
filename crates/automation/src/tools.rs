@@ -154,6 +154,48 @@ pub fn output_schema(name: &str) -> Option<Value> {
             }),
             &["times", "frames", "count", "cols", "rows", "cell", "width", "height"],
         ),
+        "render_snapshot" => object(
+            json!({
+                "name": {"type": "string"}, "comp": int, "time": {"type": "number", "description": "Comp time in seconds."},
+                "width": int, "height": int,
+                "snapshots": {"type": "array", "items": {"type": "string"}, "description": "Kept snapshot names, oldest first."},
+                "evicted": {"type": "array", "items": {"type": "string"}, "description": "Snapshots dropped to make room."}
+            }),
+            &["name", "comp", "time", "width", "height", "snapshots"],
+        ),
+        "render_compare" => {
+            let num = json!({"type": "number"});
+            let rect = json!({"type": "array", "items": int, "minItems": 4, "maxItems": 4});
+            object(
+                json!({
+                    "width": int, "height": int,
+                    "max_abs": num, "mean_abs": num, "alpha_max_abs": num,
+                    "psnr_db": {"type": ["number", "string"], "description": "dB, or \"inf\" when the colour is identical."},
+                    "ssim": num, "changed_pixels": int, "changed_pct": num, "threshold": num, "pass": {"type": "boolean"},
+                    "diffBounds": {"type": ["array", "null"], "items": int, "minItems": 4, "maxItems": 4, "description": "[x, y, w, h] of the pixels over the threshold, in compared-frame pixels; null when none."},
+                    "region": rect, "min_psnr": num,
+                    "a": {"type": "object"}, "b": {"type": "object"},
+                    "resampled": {"type": "string", "enum": ["a", "b"]}, "sizes": {"type": "object"},
+                    "diff_path": {"type": "string"}, "diff_image": {"type": "array", "items": int, "description": "Size of the inline heatmap image."}
+                }),
+                &[
+                    "width",
+                    "height",
+                    "max_abs",
+                    "mean_abs",
+                    "alpha_max_abs",
+                    "psnr_db",
+                    "ssim",
+                    "changed_pixels",
+                    "changed_pct",
+                    "threshold",
+                    "pass",
+                    "diffBounds",
+                    "a",
+                    "b",
+                ],
+            )
+        }
         "undo" | "redo" => object(json!({"steps": int, "undoStack": {"type": "array", "items": {"type": "string"}}}), &["steps", "undoStack"]),
         "history" => {
             object(json!({"states": {"type": "array", "items": {"type": "object"}}, "current": {"type": ["integer", "null"]}, "branches": int}), &["states"])
@@ -553,6 +595,7 @@ fn render_compare(b: &mut Backend, a: &Value) -> Result<Reply> {
         ("threshold", get(a, "threshold")),
         ("min_psnr", get(a, "min_psnr")),
         ("max_side", get(a, "max_side")),
+        ("region", get(a, "region")),
         ("amplify", get(a, "amplify")),
         ("diff_path", get(a, "diff_path")),
     ]);
@@ -1062,7 +1105,7 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "render_compare",
-        description: "Compare two frames: snapshots (render_snapshot), image files (goldens, After Effects reference renders) or frames rendered now. Returns {width, height, max_abs, mean_abs (8-bit levels), alpha_max_abs, psnr_db (\"inf\" when identical), ssim, changed_pixels, changed_pct, pass} and, when something changed, the diff heatmap as an image (red -> yellow -> white by size of difference, over frame a dimmed to grey). `pass` = no channel differs by more than `threshold` levels (default 1), or with `min_psnr` PSNR >= min_psnr. Sizes: `max_side` scales both down first; the same aspect ratio at different sizes compares at the smaller size; different aspect ratios are an error.",
+        description: "Compare two frames: snapshots (render_snapshot), image files (goldens, After Effects reference renders) or frames rendered now. Returns {width, height, max_abs, mean_abs (8-bit levels), alpha_max_abs, psnr_db (\"inf\" when identical), ssim, changed_pixels, changed_pct, pass, diffBounds ([x, y, w, h] box of the changed pixels, null when none)} and, when something changed, the diff heatmap as an image (red -> yellow -> white by size of difference, over frame a dimmed to grey). `pass` = no channel differs by more than `threshold` levels (default 1), or with `min_psnr` PSNR >= min_psnr. Sizes: `max_side` scales both down first; the same aspect ratio at different sizes compares at the smaller size; different aspect ratios are an error. `region` compares just one rectangle.",
         bridge_only: false,
         schema: || {
             schema(
@@ -1072,6 +1115,7 @@ static TOOLS: &[ToolDef] = &[
                     "threshold": {"type": "number", "minimum": 0, "maximum": 255, "description": "Per-channel tolerance in 8-bit levels for `changed_pixels` and `pass` (default 1)."},
                     "min_psnr": {"type": "number", "minimum": 0, "description": "Pass when PSNR (dB) is at least this, instead of the exact threshold test (e.g. 35 for another app's render)."},
                     "max_side": {"type": "integer", "minimum": 0, "description": "Scale both down to this longest side before comparing (0 = full size, the default)."},
+                    "region": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4, "description": "[x, y, w, h] in pixels of the compared frames (comp pixels unless scaled): metrics, diffBounds and the heatmap cover only this rectangle (clipped to the frame)."},
                     "amplify": {"type": "number", "minimum": 1, "maximum": 255, "description": "Heatmap gain (default 8: a 32-level difference is white)."},
                     "diff_path": {"type": "string", "description": "Also write the heatmap PNG here (full size)."},
                     "inline": {"type": "boolean", "description": "Include the heatmap image in the reply when something changed (default true)."}

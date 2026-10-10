@@ -168,10 +168,12 @@ fn a_key_clicked_in_the_timeline_shows_in_the_graph_editor() {
 #[test]
 fn graph_editor_drags_move_every_selected_key_and_shift_keeps_an_axis() {
     let (mut h, id, uid) = harness();
+    // Opened before selecting, so it fits all graphs (the whole comp) rather than the two keys.
+    h.state_mut().ui.timeline.graph_editor = true;
+    h.run_steps(2);
     let s = &mut h.state_mut().session;
     s.execute("prop.select", json!({"layer": id.0, "prop": uid})).unwrap();
     s.execute("keys.selectAll", json!({})).unwrap();
-    h.state_mut().ui.timeline.graph_editor = true;
     h.run_steps(4);
     let at = |h: &Harness<'_, EffectcraftApp>, i: usize| {
         let e = h.state().auto.find(&format!("timeline.graph.key.{uid}.0.{i}")).unwrap_or_else(|| panic!("no graph key {i}")).clone();

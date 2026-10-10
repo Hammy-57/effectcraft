@@ -116,7 +116,7 @@ See [MCP conventions](mcp.md) for core tools, resources, strict arguments, and p
 | `get_layout {comp?, time?, layers?, pixels?, overlaps?}` | Where layers are on screen at a time, without rendering (`layer.bounds`): `visible` (and `why` not), comp-space `bounds` [x,y,w,h], `corners`, `center`, `anchorInComp`, `onScreen` (0-1) and the layer-space `source` rect, after parenting and (3D) the active camera. `pixels` adds the drawn pixels' bounds (effects included); `overlaps` lists overlapping visible layers. |
 | `analyze_audio {comp?, start?, end?, layer?, silence_db?, min_silence?, true_peak?, waveform?, width?, height?, path?}` | Measure the audio mix (`audio.analyze`): peak / true peak dBFS, RMS, integrated LUFS (BS.1770), clipped samples, silent ranges, per-channel stats; `waveform` returns a waveform image. No audio gives `hasAudio: false`. |
 | `render_snapshot {name, comp?, time?, max_side?, transparent?}` | Render a frame and keep it in the session under `name` (16 kept, oldest dropped; the same name replaces). |
-| `render_compare {a, b, threshold?, min_psnr?, max_side?, amplify?, diff_path?, inline?}` | Compare two frames. `a` and `b` are each a snapshot name (or `{snapshot}`), `{path}` (a PNG/JPEG golden or After Effects reference) or `{comp?, time?, transparent?}` (render now; `{}` = active comp at the CTI). Returns `{width, height, max_abs, mean_abs, alpha_max_abs, psnr_db, ssim, changed_pixels, changed_pct, pass}` and, when something changed, the diff heatmap as an image. See [Verify your change](#verify-your-change-snapshot--edit--compare). |
+| `render_compare {a, b, threshold?, min_psnr?, max_side?, region?, amplify?, diff_path?, inline?}` | Compare two frames. `a` and `b` are each a snapshot name (or `{snapshot}`), `{path}` (a PNG/JPEG golden or After Effects reference) or `{comp?, time?, transparent?}` (render now; `{}` = active comp at the CTI). Returns `{width, height, max_abs, mean_abs, alpha_max_abs, psnr_db, ssim, changed_pixels, changed_pct, pass, diffBounds}` and, when something changed, the diff heatmap as an image. `region: [x, y, w, h]` compares one rectangle. See [Verify your change](#verify-your-change-snapshot--edit--compare). |
 | `open_project {path \| demo \| new}` / `save_project {path?}` | Open and save files. |
 | `undo {steps?}` / `redo {steps?}` | History. |
 | `history {goto?}` | The branching undo history (History panel): every state with its index, id, label, branch depth and whether it's current; `goto` (an index or id) jumps to any state, on any branch, without losing the others. |
@@ -130,6 +130,20 @@ referenced by id or name, and default to the active comp. Property paths come fr
 example `transform/position`, `transform/opacity`, `effects/#1/blurriness` or `@57` (by uid). Times
 are in seconds. Keyframe times are layer time, which equals comp time unless the layer is offset or
 stretched.
+
+A number is always an id, never a position: a layer, effect, mask, tracker or text animator id that
+doesn't exist is an error (`no layer 7 (… use "#n" …)`), not whatever sits at that place. Use `"#n"` for
+"the n-th from the top" (`"layer": "#2"`, `"effect": "#1"`, `"mask": "#1"`). Ids are never reused, also
+after an undo, so an id you saw keeps meaning the same object or nothing.
+
+When you share the document with the user or other agents, two execute parameters (accepted by every
+command, also inside `engine.batch`) keep you from stepping on each other:
+
+- `expectRevision`: the `revision` from `project.summary` / `doc_inspect` / `editor.state`. If the
+  document changed since, the command doesn't run and returns `document changed (revision X, expected Y)`.
+- `client`: a name for you (`"client": "my-agent"`). Your undo steps are tagged with it, and
+  `edit.undo {"client": "my-agent"}` only undoes your own last step: if the last change was the user's
+  or another client's, it refuses and changes nothing. `edit.history.list` shows each state's `client`.
 
 Command params are checked against each command's `params` doc. An unknown key, such as
 `layer.select {"index": 2}`, returns an error that lists the accepted keys (here `layers, add, toggle`)
@@ -150,7 +164,7 @@ Don't just assume an edit did what you meant; look. Snapshot the frame, make the
 1. `render_snapshot {"name":"before","time":1.0}` → `{name, comp, time, width, height, snapshots}`
 2. `set_property {"layer":"EFFECTCRAFT","path":"transform/opacity","value":50}`
 3. `render_compare {"a":"before","b":{"time":1.0}}` (demo project) →
-   `{"width":1920,"height":1080,"max_abs":118.0,"mean_abs":1.8705,"alpha_max_abs":0.0,"psnr_db":27.091,"ssim":0.99214,"changed_pixels":135386,"changed_pct":6.529,"pass":false,…}`
+   `{"width":1920,"height":1080,"max_abs":118.0,"mean_abs":1.8705,"alpha_max_abs":0.0,"psnr_db":27.091,"ssim":0.99214,"changed_pixels":135386,"changed_pct":6.529,"pass":false,"diffBounds":[…],…}`
    plus the heatmap image (768 px wide inline): unchanged pixels are frame `a` dimmed to grey, differences within the
    threshold dark blue, changed pixels red → yellow → white by size (`amplify`, default 8: a
    32-level difference is white).
@@ -169,6 +183,11 @@ refactor that should change nothing gives `pass: true` with `psnr_db: "inf"`.
 - **Sizes.** `max_side` scales both images down (area average) first. Images with the same aspect
   ratio but different sizes (a half-resolution reference) are compared at the smaller size and the
   reply says which side was `resampled`; different aspect ratios are an error naming both sizes.
+- **Where.** `diffBounds` is the `[x, y, w, h]` box of the changed pixels (null when none), so an
+  edit that should touch only the title can be checked against the title's `get_layout` bounds.
+  `region: [x, y, w, h]` restricts the metrics, `diffBounds` and the heatmap to one rectangle
+  (clipped to the frame; an empty or outside region is an error). Both are in pixels of the
+  compared frames: comp pixels unless `max_side` or the size rule scaled them.
 - `diff_path` also writes the full-size heatmap PNG. Snapshots live in the session (the app's in
   bridge mode), not in the project; `execute_command render.snapshots {"clear":true}` lists or drops
   them. Over the control channel the same commands are `engine.execute render.snapshot` /
@@ -186,7 +205,7 @@ Short recipes; every step is one tool call.
 | Title card | `command_run comp.new {...}` → `command_run layer.newText {"text":"Hi","size":120}` → `render_preview {"time":0}` |
 | Animate | `add_keyframe {"layer":2,"path":"transform/scale","keys":[{"time":0,"value":[0,0]},{"time":0.5,"value":[100,100]}],"interpolation":"easyEase"}` |
 | Effect with settings | `list_effects {"filter":"glow"}` → `add_effect {"layer":2,"effect":"Glow","values":{"threshold":40,"radius":30}}` → `set_property {"layer":2,"path":"effects/#1/intensity","value":2}` |
-| Key a green screen | `add_effect {"layer":2,"effect":"Keylight (1.2)"}` → `command_run effect.pickColor {"layer":2,"effect":1,"param":"screenColour","x":20,"y":20,"average":true}` (a screen pixel, layer space; samples the effect's input) → `set_property {"layer":2,"path":"effects/#1/screenMatte/clipBlack","value":10}` → `render_preview {"transparent":true}` |
+| Key a green screen | `add_effect {"layer":2,"effect":"Keylight (1.2)"}` → `command_run effect.pickColor {"layer":2,"effect":"#1","param":"screenColour","x":20,"y":20,"average":true}` (a screen pixel, layer space; samples the effect's input) → `set_property {"layer":2,"path":"effects/#1/screenMatte/clipBlack","value":10}` → `render_preview {"transparent":true}` |
 | Drive with an expression | `set_property {"layer":2,"path":"transform/rotation","expression":"time*90"}` |
 | Inspect a layer | `get_layer {"layer":2,"flat":true}` (every property with its `path`, value, key count) |
 | Is the title centred and on screen? | `get_layout {"layers":["Title"],"time":2}` → compare `center` with half the comp size, `onScreen` should be 1; `get_layout {"overlaps":true}` for collisions |
@@ -430,7 +449,7 @@ no face in the mask).
 
 ```sh
 effectcraft-cli run clip.ecproj face.model.download '{"id":"mediapipe-face","wait":true}' face.model.select '{"id":"mediapipe-face","wait":true}' \
-  track.mask '{"layer":"#1","mask":1,"method":"faceDetailed","direction":"forward","wait":true}' --save
+  track.mask '{"layer":"#1","mask":"#1","method":"faceDetailed","direction":"forward","wait":true}' --save
 ```
 
 `mask.interpolate` (Window ▸ Mask Interpolation ▸ Apply) adds in-between Mask Path keys between
@@ -442,7 +461,7 @@ ends the same vertex count with a matched correspondence. Options: `keyframeRate
 panel's defaults.
 
 ```sh
-effectcraft-cli exec track.mask '{"layer":"#2","mask":1,"method":"perspective","wait":true}' clip.ecproj --save
+effectcraft-cli exec track.mask '{"layer":"#2","mask":"#1","method":"perspective","wait":true}' clip.ecproj --save
 effectcraft-cli exec mask.interpolate '{"layer":"#2","mask":"Mask 1","times":[0,2],"addVertices":10}' clip.ecproj --save --json
 ```
 
