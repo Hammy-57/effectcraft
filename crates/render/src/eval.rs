@@ -191,7 +191,8 @@ impl<'a> EvalCtx<'a> {
             * Mat4::translate(-Vec3::from(anchor))
     }
 
-    /// Layer space → comp (world) space, including parents.
+    /// Layer space → comp (world) space, including parents. Inside [`with_transform_memo`] the
+    /// parents' local matrices are evaluated once per (layer, time) and found by id in O(1).
     pub fn world_matrix(&self, layer: &Layer) -> Mat4 {
         let mut m = self.local_matrix_par(layer, self.par_ratio(layer));
         let mut cur = layer.parent;
@@ -201,11 +202,28 @@ impl<'a> EvalCtx<'a> {
             if guard > 64 {
                 break;
             }
-            let Some(p) = self.comp.layer(pid) else { break };
-            m = self.local_matrix(p) * m;
-            cur = p.parent;
+            // Same product order as without the memo: bit-identical.
+            let Some((local, next)) = self.parent_local(pid) else { break };
+            m = local * m;
+            cur = next;
         }
         m
+    }
+
+    /// A parent's local matrix and its own parent (memoised inside [`with_transform_memo`]).
+    fn parent_local(&self, pid: LayerId) -> Option<(Mat4, Option<LayerId>)> {
+        let key = memo::key(self, pid);
+        if let Some(k) = &key
+            && let Some(hit) = memo::get(k)
+        {
+            return Some(hit);
+        }
+        let p = key.as_ref().and_then(|k| memo::find(self, k)).unwrap_or_else(|| self.comp.layer(pid))?;
+        let v = (self.local_matrix(p), p.parent);
+        if let Some(k) = key {
+            memo::put(k, v);
+        }
+        Some(v)
     }
 
     pub fn opacity(&self, layer: &Layer) -> f64 {
@@ -251,6 +269,139 @@ impl<'a> EvalCtx<'a> {
     pub fn effect_to_comp(&self, layer: &Layer) -> Mat3 {
         let o = self.effect_bounds(layer).1;
         self.layer_to_comp(layer).0 * Mat3::translate(vec2(o[0], o[1]))
+    }
+}
+
+/// Run `f` with the parents' local matrices memoised per (layer, time) for `project` on this
+/// thread (see [`EvalCtx::world_matrix`]): for one frame's evaluation, while `project` cannot
+/// change. Nested calls for the same project share the memo; another project (a nested comp's
+/// Essential Properties copy) gets its own, dropped with it. Contexts of other projects or of
+/// comps outside `project` are evaluated as without the memo.
+pub fn with_transform_memo<R>(project: &Project, f: impl FnOnce() -> R) -> R {
+    let _scope = memo::Scope::enter(project);
+    f()
+}
+
+/// The transform memo behind [`with_transform_memo`].
+mod memo {
+    use super::EvalCtx;
+    use effectcraft_geom::Mat4;
+    use effectcraft_project::{Layer, LayerId, Project};
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    /// A parent's local matrix at one time, seen through one context: comp (address), layer,
+    /// time, expression host and footage source (addresses).
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    pub(super) struct Key {
+        comp: usize,
+        layer: LayerId,
+        time: i64,
+        expr: usize,
+        footage: usize,
+    }
+
+    struct Frame {
+        /// The project the memo is for (it outlives the frame: the scope borrows it).
+        project: usize,
+        /// Whether a comp address (with its id) is that project's comp.
+        comps: HashMap<(usize, u64), bool>,
+        /// Layer id → index in each comp.
+        index: HashMap<usize, HashMap<LayerId, usize>>,
+        locals: HashMap<Key, (Mat4, Option<LayerId>)>,
+    }
+
+    thread_local! {
+        static FRAMES: RefCell<Vec<Frame>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// An open memo scope: pushes a frame unless the innermost one is for the same project, pops
+    /// it when dropped (also when unwinding).
+    pub(super) struct Scope {
+        pushed: bool,
+    }
+
+    impl Scope {
+        pub(super) fn enter(project: &Project) -> Scope {
+            #[cfg(test)]
+            if super::tests::NO_MEMO.with(std::cell::Cell::get) {
+                return Scope { pushed: false };
+            }
+            let addr = project as *const Project as usize;
+            let pushed = FRAMES
+                .try_with(|f| {
+                    let Ok(mut v) = f.try_borrow_mut() else { return false };
+                    if v.last().is_some_and(|fr| fr.project == addr) {
+                        return false;
+                    }
+                    v.push(Frame { project: addr, comps: HashMap::new(), index: HashMap::new(), locals: HashMap::new() });
+                    true
+                })
+                .unwrap_or(false);
+            Scope { pushed }
+        }
+    }
+
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            if self.pushed {
+                let _ = FRAMES.try_with(|f| f.try_borrow_mut().map(|mut v| v.pop()));
+            }
+        }
+    }
+
+    fn addr<T: ?Sized>(r: Option<&T>) -> usize {
+        r.map_or(0, |r| r as *const T as *const () as usize)
+    }
+
+    /// The memo key of `pid` in `ctx`, when a memo is open for `ctx`'s project and `ctx.comp`
+    /// is that project's comp.
+    pub(super) fn key(ctx: &EvalCtx, pid: LayerId) -> Option<Key> {
+        let comp = ctx.comp as *const _ as usize;
+        let project = ctx.project as *const Project as usize;
+        let ok = FRAMES
+            .try_with(|f| {
+                let Ok(mut v) = f.try_borrow_mut() else { return false };
+                let Some(fr) = v.last_mut().filter(|fr| fr.project == project) else { return false };
+                *fr.comps.entry((comp, ctx.comp_id.0)).or_insert_with(|| ctx.project.comp(ctx.comp_id).is_some_and(|c| std::ptr::eq(c, ctx.comp)))
+            })
+            .unwrap_or(false);
+        ok.then(|| Key { comp, layer: pid, time: ctx.time.0, expr: addr(ctx.expr), footage: addr(ctx.footage) })
+    }
+
+    #[cfg(test)]
+    impl Key {
+        pub(super) fn layer_id(&self) -> LayerId {
+            self.layer
+        }
+    }
+
+    pub(super) fn get(k: &Key) -> Option<(Mat4, Option<LayerId>)> {
+        FRAMES.try_with(|f| f.try_borrow().ok().and_then(|v| v.last().and_then(|fr| fr.locals.get(k).copied()))).ok().flatten()
+    }
+
+    pub(super) fn put(k: Key, v: (Mat4, Option<LayerId>)) {
+        let _ = FRAMES.try_with(|f| {
+            if let Ok(mut fs) = f.try_borrow_mut()
+                && let Some(fr) = fs.last_mut()
+            {
+                fr.locals.insert(k, v);
+            }
+        });
+    }
+
+    /// The layer `k` names in `ctx.comp`, through the comp's id → index map (built once).
+    pub(super) fn find<'a>(ctx: &EvalCtx<'a>, k: &Key) -> Option<Option<&'a Layer>> {
+        let i = FRAMES
+            .try_with(|f| {
+                let mut fs = f.try_borrow_mut().ok()?;
+                let fr = fs.last_mut()?;
+                let index = fr.index.entry(k.comp).or_insert_with(|| ctx.comp.layers.iter().enumerate().rev().map(|(i, l)| (l.id, i)).collect());
+                Some(index.get(&k.layer).copied())
+            })
+            .ok()
+            .flatten()?;
+        Some(i.and_then(|i| ctx.comp.layers.get(i)))
     }
 }
 
@@ -344,5 +495,117 @@ pub fn source_size(project: &Project, layer: &Layer) -> (u32, u32) {
         }
         LayerSource::Null => (100, 100),
         _ => (0, 0),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use effectcraft_color::Label;
+    use effectcraft_keyframe::{Keyframe, Value};
+    use effectcraft_project::build;
+    use effectcraft_project::{BitDepth, Comp, ItemId, ItemKind, Layer, LayerId, LayerSource, Project, Solid};
+    use effectcraft_time::{FrameRate, Tick};
+
+    use super::{EvalCtx, with_transform_memo};
+    use crate::{NoFootage, RenderOpts, Renderer};
+
+    thread_local! {
+        /// Evaluate without the transform memo (the path before it).
+        pub(super) static NO_MEMO: Cell<bool> = const { Cell::new(false) };
+    }
+
+    fn keys(l: &mut Layer, path: &str, a: Value, b: Value) {
+        l.props.prop_mut(path).unwrap().keys = vec![Keyframe::new(Tick::ZERO, a), Keyframe::new(Tick::from_seconds_f64(1.0), b)];
+    }
+
+    /// Two animated nulls in a chain, three solids parented to them (one to a missing layer).
+    fn chain(p: &mut Project, comp: &Comp) -> Vec<Layer> {
+        let mut n1 = build::layer(p, comp, "N1", LayerSource::Null, (100, 100), None);
+        keys(&mut n1, "transform/rotation", Value::Scalar(0.0), Value::Scalar(37.0));
+        keys(&mut n1, "transform/position", Value::Vec3([20.0, 30.0, 0.0]), Value::Vec3([80.0, 40.0, 0.0]));
+        let mut n2 = build::layer(p, comp, "N2", LayerSource::Null, (100, 100), None);
+        keys(&mut n2, "transform/scale", Value::Vec3([100.0, 100.0, 100.0]), Value::Vec3([70.0, 130.0, 100.0]));
+        n2.props.prop_mut("transform/position").unwrap().value = Value::Vec3([33.3, 17.1, 0.0]);
+        n2.parent = Some(n1.id);
+        let mut v = vec![];
+        for (i, parent) in [Some(n2.id), Some(n2.id), Some(LayerId(987_654))].into_iter().enumerate() {
+            let sid = p.add_item("S", Label::Red, None, ItemKind::Solid(Solid { color: [0.2 * i as f32, 0.6, 0.9], width: 30, height: 20, pixel_aspect: 1.0 }));
+            let mut l = build::layer(p, comp, "S", LayerSource::Solid { item: sid }, (30, 20), None);
+            l.props.prop_mut("transform/position").unwrap().value = Value::Vec3([10.0 + 25.0 * i as f64, 12.5, 0.0]);
+            keys(&mut l, "transform/rotation", Value::Scalar(3.0 * i as f64), Value::Scalar(-20.0));
+            l.parent = parent;
+            v.push(l);
+        }
+        v.push(n2);
+        v.push(n1);
+        v
+    }
+
+    fn bits(m: &effectcraft_geom::Mat4) -> Vec<u64> {
+        m.0.iter().flatten().map(|v| v.to_bits()).collect()
+    }
+
+    /// World matrices through the memo (first evaluation and cached) are bit-identical.
+    #[test]
+    fn memoised_world_matrices_are_bit_identical() {
+        let mut p = Project::default();
+        let comp = Comp::new(200, 100, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+        let layers = chain(&mut p, &comp);
+        let mut c = comp;
+        c.layers = layers.into();
+        let cid = p.add_item("Comp", Label::Sandstone, None, ItemKind::Comp(c.into()));
+        let comp = p.comp(cid).unwrap();
+        for t in [0.0, 0.37, 1.2] {
+            let ctx = EvalCtx::new(&p, cid, comp, Tick::from_seconds_f64(t));
+            let plain: Vec<Vec<u64>> = comp.layers.iter().map(|l| bits(&ctx.world_matrix(l))).collect();
+            with_transform_memo(&p, || {
+                for _ in 0..2 {
+                    let memo: Vec<Vec<u64>> = comp.layers.iter().map(|l| bits(&ctx.world_matrix(l))).collect();
+                    assert_eq!(plain, memo, "t {t}");
+                }
+                // The parents are cached, keyed by time.
+                let k = super::memo::key(&ctx, comp.layers.get(3).unwrap().id).unwrap();
+                assert!(super::memo::get(&k).is_some());
+                assert!(super::memo::key(&ctx.at(Tick::from_seconds_f64(t + 0.5)), k.layer_id()).is_some_and(|k| super::memo::get(&k).is_none()));
+            });
+        }
+        // A copy of the comp outside the project is evaluated without the memo.
+        let copy = comp.clone();
+        let ctx = EvalCtx::new(&p, cid, &copy, Tick::ZERO);
+        with_transform_memo(&p, || assert!(super::memo::key(&ctx, LayerId(1)).is_none()));
+    }
+
+    /// Nested comps (with parented layers) render the same frames with and without the memo.
+    #[test]
+    fn nested_comps_render_the_same_with_the_memo() {
+        for depth in [BitDepth::Bpc8, BitDepth::Bpc32] {
+            let mut p = Project::default();
+            p.settings.bit_depth = depth;
+            let outer = Comp::new(200, 100, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+            let mut inner = Comp::new(150, 100, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+            inner.layers = chain(&mut p, &inner).into();
+            let iid = p.add_item("Inner", Label::Sandstone, None, ItemKind::Comp(inner.into()));
+            let mut layers = vec![];
+            for (i, collapse) in [false, true].into_iter().enumerate() {
+                let mut pre = build::layer(&mut p, &outer, "Inner", LayerSource::Comp { item: iid }, (150, 100), None);
+                pre.props.prop_mut("transform/position").unwrap().value = Value::Vec3([60.0 + 80.0 * i as f64, 50.0, 0.0]);
+                pre.switches.collapse = collapse;
+                layers.push(pre);
+            }
+            let mut c = outer;
+            c.layers = layers.into();
+            let cid: ItemId = p.add_item("Outer", Label::Sandstone, None, ItemKind::Comp(c.into()));
+            for t in [0.0, 0.5] {
+                let r = Renderer::new(&p, &NoFootage, RenderOpts::default());
+                let a = r.comp_frame(cid, Tick::from_seconds_f64(t));
+                NO_MEMO.with(|m| m.set(true));
+                let b = r.comp_frame(cid, Tick::from_seconds_f64(t));
+                NO_MEMO.with(|m| m.set(false));
+                assert!(a.data.iter().any(|p| p[3] > 0.0));
+                assert!(a == b, "{depth:?} t {t}: the memo changed the frame");
+            }
+        }
     }
 }

@@ -117,6 +117,8 @@ impl<'a> Renderer<'a> {
                     Some(p) => Renderer { project: p, ..base },
                     None => base,
                 };
+                // The nested frames share their layers' transforms (parents evaluated once).
+                let frame = |t| crate::eval::with_transform_memo(sub.project, || sub.comp_frame(*item, t));
                 // Frame blending between the nested comp's frames (time-stretched/remapped).
                 let mode = frame_blend_mode(ctx, layer);
                 if mode != FrameBlend::Off
@@ -124,12 +126,12 @@ impl<'a> Renderer<'a> {
                 {
                     let (i, w) = frame_position(lt, nc.frame_rate);
                     if w > 1e-6 {
-                        let a = sub.comp_frame(*item, nc.frame_rate.tick_of(i));
-                        let b = sub.comp_frame(*item, nc.frame_rate.tick_of(i + 1));
+                        let a = frame(nc.frame_rate.tick_of(i));
+                        let b = frame(nc.frame_rate.tick_of(i + 1));
                         return Some(Buf { img: blend_frames(mode, &a, &b, w as f32), offset: [0.0; 2], scale: bs });
                     }
                 }
-                Some(Buf { img: sub.comp_frame(*item, lt), offset: [0.0; 2], scale: bs })
+                Some(Buf { img: frame(lt), offset: [0.0; 2], scale: bs })
             }
             LayerSource::Footage { item } => {
                 let it = self.project.item(*item)?;
