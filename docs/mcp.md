@@ -2,7 +2,8 @@
 
 Run `effectcraft-cli mcp` for a headless session, `effectcraft-cli mcp --ui` for the full app
 offscreen (no window), or `effectcraft-cli mcp --bridge 9877` to use the desktop app's control
-channel. Existing ports are unchanged.
+channel (`--bridge` without a port uses
+`EFFECTCRAFT_CONTROL_PORT`, else 9877).
 
 `--ui` and `--bridge` both route every tool through control-channel requests
 (`docs/control-protocol.md`) behind the automation crate's `ControlTransport` trait: a TCP
@@ -162,6 +163,18 @@ out the tool flow (canonical tool names, the layer-time versus comp-time pitfall
 
 Argument values are strings. A missing required argument, an unknown argument or prompt, or a
 non-string value returns `-32602`.
+
+## Change notifications and retries
+
+The server advertises `resources.subscribe`. After `resources/subscribe {uri:
+"effectcraft://document"}`, every tool call that changed the project revision is followed by
+`notifications/resources/updated {uri}` (bridge mode reads the app's revision after each call,
+so edits made in the window are reported with the next call). `resources/unsubscribe` stops it.
+
+A `tools/call` with `params._meta.requestId` (or a `request_id` argument, which is removed before
+argument checking) is idempotent: the same id again returns the first result without running the
+tool (last 128 ids). Bridge calls also send a `requestId` on the control channel, so the bridge's
+reconnect-and-resend never runs a command twice.
 
 ## Progress and cancellation
 

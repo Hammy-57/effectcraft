@@ -614,7 +614,8 @@ fn screenshot(b: &mut Backend, a: &Value) -> Result<Reply> {
     }
     let path =
         keep.clone().unwrap_or_else(|| std::env::temp_dir().join(format!("effectcraft-mcp-shot-{}.png", std::process::id())).to_string_lossy().into_owned());
-    b.control("ui.screenshot", obj(&[("path", Some(&json!(path))), ("panel", get(a, "panel")), ("id", get(a, "id"))]))?;
+    // The app downscales before encoding (a full window is tens of MB otherwise).
+    b.control("ui.screenshot", obj(&[("path", Some(&json!(path))), ("panel", get(a, "panel")), ("id", get(a, "id")), ("max_side", Some(&json!(max_side)))]))?;
     let bytes = std::fs::read(&path).map_err(|e| Error::Other(format!("screenshot: {e}")))?;
     if keep.is_none() {
         let _ = std::fs::remove_file(&path);
