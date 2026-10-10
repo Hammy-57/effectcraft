@@ -65,6 +65,16 @@ impl FrameImage {
     }
 }
 
+/// A CPU frame's pixels as premultiplied RGBA bytes, shared with the RAM cache (`Color32` is
+/// premultiplied RGBA already): what a frame worker hands the disk cache's writer thread.
+struct ColorBytes(Arc<egui::ColorImage>);
+
+impl AsRef<[u8]> for ColorBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_raw()
+    }
+}
+
 /// A viewer frame: its comp's content, the frame, scale, view and render options. `revision` is
 /// the project revision it was asked for at (job bookkeeping); it is not part of the identity, so
 /// a later revision with the same content finds the frame.
@@ -1057,16 +1067,16 @@ impl Worker {
             },
         };
         let render_time = t0.elapsed();
-        // Publish the shared frame and wake the viewer before compression. Persistence still
-        // runs on this worker, using the same snapshot.
+        // Publish the shared frame and wake the viewer first; the disk cache's writer thread
+        // compresses and writes the same snapshot.
         self.finish(&job, ci.clone(), t0);
         let backlog = queue.lock().map(|q| q.jobs.iter().filter(|j| !j.urgent).count()).unwrap_or(0);
         if !disk_hit
             && keep_on_disk(render_time, job.urgent, backlog)
             && let (Some((dc, k)), FrameImage::Cpu(img)) = (&disk, &ci)
         {
-            // `Color32` is premultiplied RGBA bytes already: no copy before compression.
-            dc.put_frame(*k, img.size[0] as u32, img.size[1] as u32, img.as_raw());
+            // Hands over a reference to the frame (no copy, no compression here).
+            dc.put_frame(*k, img.size[0] as u32, img.size[1] as u32, ColorBytes(img.clone()));
             if let Some(ctx) = &self.ctx {
                 ctx.request_repaint();
             }
