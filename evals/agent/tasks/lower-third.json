@@ -1,7 +1,7 @@
 {
   "id": "lower-third",
   "title": "Lower third with a sliding bar",
-  "prompt": "In the comp \"Main\" (1920×1080, 30 fps, 5 s), build a lower third: a shape layer named \"Bar\" (a dark rectangle, 800×120 px), a text layer named \"Name\" reading \"Ada Lovelace\" and a text layer named \"Role\" reading \"Mathematician\", with the two texts on the bar. All three must sit in the lower part of the frame (their centres below y = 720) and inside the title-safe area once in place (from 0.6 s on). The title-safe area is the frame inset by 10% on each side (x 192–1728, y 108–972 in a 1920×1080 comp). The Bar slides in from off-screen left: completely off-screen at 0 s, in its final place at 0.6 s. Keep the text readable (good contrast, not tiny).",
+  "prompt": "In the comp \"Main\" (1920×1080, 30 fps, 5 s), build a lower third: a shape layer named \"Bar\" (a dark rectangle, 800×120 px), a text layer named \"Name\" reading \"Ada Lovelace\" and a text layer named \"Role\" reading \"Mathematician\", with the two texts on the bar. All three must sit in the lower part of the frame (their centres below y = 720) and inside the title-safe area once in place (from 0.6 s on). The title-safe area is the frame inset by 10% on each side (x 192–1728, y 108–972 in a 1920×1080 comp). The Bar slides in from off-screen left: completely off-screen at 0 s, in its final place at 0.6 s. Keep the text readable: good contrast, and characters at least 36 px tall on screen (1/30 of the frame height, what render.lint checks).",
   "setup": [
     {
       "command": "comp.new",
@@ -277,7 +277,7 @@
       "command": "layer.newText",
       "params": {
         "text": "Mathematician",
-        "size": 32,
+        "size": 40,
         "position": [
           600,
           900
