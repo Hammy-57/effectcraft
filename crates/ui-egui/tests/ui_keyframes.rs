@@ -22,6 +22,9 @@ fn harness() -> (Harness<'static, EffectcraftApp>, LayerId, u64) {
     let uid = s.active_comp().unwrap().layer(id).unwrap().props.prop("transform/opacity").unwrap().uid;
     s.execute("layer.select", json!({"layers": [id.0]})).unwrap();
     let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).build_eframe(|_| EffectcraftApp::new(s));
+    // Auto-Select Graph Type (the Graph Editor's default is the speed graph): Opacity shows its
+    // value graph.
+    h.state_mut().ui.timeline.graph_mode = "auto".into();
     h.run_steps(3);
     let ctx = h.ctx.clone();
     effectcraft_ui_egui::menus::invoke(h.state_mut(), &ctx, "timeline.reveal.opacity", json!({})).unwrap();
