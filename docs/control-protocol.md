@@ -22,7 +22,11 @@ window's status bar and on stderr: give each app its own port, and point its MCP
 - **Reply:** `{"id": 1, "ok": true, "result": ...}` or `{"id": 1, "ok": false, "error": "message"}`.
 - Requests run on the UI thread between frames. Input methods (`ui.click`, `ui.key` and similar)
   reply after the synthetic input has been processed. Methods that need an element that isn't drawn
-  yet are retried for a few frames. A request times out after 60 s. If the app hadn't started it
+  yet are retried for a few frames. A command that waits for a background job (`wait: true` on
+  `renderQueue.render`, the analyses, `footage.check`, Content-Aware Fill, Scene Edit Detection;
+  `jobs.wait`) starts the job and replies when it ends, with the same result as the blocking
+  command: the UI keeps drawing and other connections' requests run meanwhile. A request times
+  out after 60 s. If the app hadn't started it
   by then, it is cancelled and never runs: the reply has `"notRun": true` and says it is safe to
   retry. If it had started, the reply says it may still complete.
 - **Only requests are read:** every line must be a JSON object with a string `method` (blank lines are
