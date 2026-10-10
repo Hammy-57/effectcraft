@@ -69,8 +69,11 @@ pub fn start(s: &mut Session, items: Option<Vec<ItemId>>, wait: bool) -> crate::
                 exists(services.as_ref(), &f.path) || f.sequence.iter().any(|p| exists(services.as_ref(), p))
             };
             // Saved without metadata (a hand-written or converted project): probe it now.
-            let needs_probe = present && f.width == 0 && f.height == 0 && f.kind != FootageKind::Audio;
+            // Older versions saved every GIF as a still, losing its animation metadata.
+            let legacy_gif = present && f.kind == FootageKind::Still && f.codec.eq_ignore_ascii_case("gif");
+            let needs_probe = legacy_gif || (present && f.width == 0 && f.height == 0 && f.kind != FootageKind::Audio);
             let probed = importer.as_ref().filter(|_| needs_probe).map(|imp| match f.kind {
+                _ if legacy_gif => imp.probe(&f.path),
                 // A sequence keeps its files; its first one gives the metadata.
                 FootageKind::Sequence if !f.sequence.is_empty() => imp.probe(&f.path).map(|one| {
                     let mut nf = Footage {
@@ -88,6 +91,10 @@ pub fn start(s: &mut Session, items: Option<Vec<ItemId>>, wait: bool) -> crate::
             });
             match probed {
                 Some(Ok(mut nf)) => {
+                    if legacy_gif {
+                        // Repair timing without throwing away the user's colour/alpha interpretation.
+                        nf = Footage { kind: nf.kind, duration: nf.duration, frame_rate: nf.frame_rate, missing: false, ..f.clone() };
+                    }
                     nf.alpha = f.alpha;
                     nf.loop_count = f.loop_count;
                     found.push((j.id, Found::Probed(Box::new(nf))));
@@ -204,6 +211,53 @@ mod tests {
         let mut plain = Session::default();
         plain.execute("file.open", json!({"path": path.to_string_lossy()})).unwrap();
         assert!(plain.jobs().is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn check_upgrades_legacy_gif_timing_without_losing_interpretation() {
+        struct GifImporter;
+        impl crate::Importer for GifImporter {
+            fn probe(&self, path: &str) -> Result<Footage, String> {
+                Ok(Footage {
+                    path: path.into(),
+                    kind: FootageKind::Video,
+                    frame_rate: crate::time::FrameRate::new(100, 1),
+                    duration: crate::time::Tick::from_seconds_f64(0.4),
+                    ..Default::default()
+                })
+            }
+        }
+        let path = std::env::temp_dir().join(format!("ec-legacy-gif-{}.gif", std::process::id()));
+        std::fs::write(&path, b"mock importer").unwrap();
+        let mut s = session_with(&[path.to_str().unwrap()]);
+        s.importer = Some(std::sync::Arc::new(GifImporter));
+        for item in std::sync::Arc::make_mut(&mut s.project).items.values_mut() {
+            if let ItemKind::Footage(f) = &mut item.kind {
+                f.kind = FootageKind::Still;
+                f.codec = "GIF".into();
+                f.loop_count = 3;
+                f.preserve_rgb = true;
+                f.alpha = crate::project::AlphaMode::Ignore;
+            }
+        }
+        let r = s.execute("footage.check", json!({"wait": true})).unwrap();
+        assert_eq!(r["probed"], 1);
+        let f = s
+            .project
+            .items
+            .values()
+            .find_map(|i| match &i.kind {
+                ItemKind::Footage(f) => Some(f),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(f.kind, FootageKind::Video);
+        assert_eq!(f.duration, crate::time::Tick::from_seconds_f64(0.4));
+        assert_eq!(f.frame_rate, crate::time::FrameRate::new(100, 1));
+        assert!(f.preserve_rgb);
+        assert_eq!(f.loop_count, 3);
+        assert_eq!(f.alpha, crate::project::AlphaMode::Ignore);
         let _ = std::fs::remove_file(path);
     }
 }
