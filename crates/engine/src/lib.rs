@@ -747,6 +747,8 @@ impl Session {
             self.state = st;
             return Ok(r);
         }
+        // Footage removed: its files are closed (below).
+        let removed = p.items.len() < before.items.len();
         // A continuous gesture folds into one step, unless another client made the last step.
         let same = merge.is_some() && merge.map(str::to_string) == self.history.merge_key && self.history.author(&before) == self.client.as_deref();
         if !same {
@@ -758,6 +760,9 @@ impl Session {
         }
         self.history.merge_key = merge.map(str::to_string);
         self.project = Arc::new(p);
+        if removed {
+            self.release_unused_footage();
+        }
         self.analyses_checked = Arc::downgrade(&self.project);
         self.history.set_author(&self.project, self.client.clone());
         self.state = st;
@@ -1037,6 +1042,21 @@ impl Session {
         Ok((img.width, img.height, img.to_rgba8()))
     }
 
+    /// Close the files of footage the project no longer uses (decoders, parsed models, cached
+    /// frames): footage removed from the project, or the previous project's.
+    fn release_unused_footage(&self) {
+        let mut used = std::collections::HashSet::new();
+        for it in self.project.items.values() {
+            if let effectcraft_project::ItemKind::Footage(f) = &it.kind {
+                used.insert(f.path.as_str());
+            }
+            if let Some(px) = it.proxy.as_deref() {
+                used.insert(px.footage.path.as_str());
+            }
+        }
+        self.footage.retain_files(&|p| used.contains(p));
+    }
+
     /// Replace the whole project (open/new), resetting history and state.
     pub fn replace_project(&mut self, p: Project, path: Option<String>) {
         self.replace_project_with(p, path, None);
@@ -1069,6 +1089,7 @@ impl Session {
         p.fix_next_id();
         upgrade_effects(&mut p);
         self.project = Arc::new(p);
+        self.release_unused_footage();
         self.history = History::default();
         self.id_floor = 0;
         self.state = EditorState { snapping: true, view_layout: 1, ..Default::default() };

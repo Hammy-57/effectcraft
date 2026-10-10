@@ -1431,6 +1431,7 @@ name = "effectcraft-media"
 version = "0.7.0"
 dependencies = [
  "effectcraft-av1enc",
+ "effectcraft-color",
  "effectcraft-model",
  "effectcraft-pdf",
  "effectcraft-project",
@@ -1450,6 +1451,7 @@ dependencies = [
  "log",
  "rayon",
  "serde_json",
+ "symphonia",
  "thiserror 2.0.21",
 ]
 
