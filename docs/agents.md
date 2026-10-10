@@ -252,8 +252,10 @@ With the desktop app closed, a **windowless host** keeps one project in memory f
 (`effectcraft-cli mcp --bridge PORT`, or the MCP `hosts {join}` tool) and work on their own comps with
 their own `client` and `comp.claim`. Commands that wait for a job (renders, analyses, `jobs.wait`)
 reply when it ends without holding up the other agents; unsaved work is checkpointed (big projects
-at most every 30 s); `host.release {path?}` saves the project and stops the host, so the desktop app
-can open it. `ui.*` methods need the app.
+at most every 30 s); `host.release {path?}` saves the project and stops the host. Opening that project in the
+desktop app does this by itself (a handover: the app asks the host to save and stop, waits, then
+opens the saved file; the reply's `handover` says so), and the host's agents find the project in
+the app with the MCP `hosts` tool. `ui.*` methods need the app.
 
 Two copies of one file overwrite each other when saved, so saving is guarded: `file.save` /
 `file.saveAs` over a file that changed on disk since this process opened or saved it (another

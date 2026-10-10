@@ -189,6 +189,46 @@ pub(crate) fn open_elsewhere_warning(path: &str, others: &[Value]) -> Option<Str
     ))
 }
 
+/// Hand `path` over from a windowless host that has it open (`effectcraft-cli serve`): ask it to
+/// save and stop (`host.release`), and wait until it has, so this process opens the saved file
+/// instead of a second copy. Its agents find the project here again with the MCP `hosts` tool.
+/// Returns what happened, for the open's reply (`None`: no host had it).
+pub(crate) fn take_over(path: &str) -> Option<String> {
+    if cfg!(target_arch = "wasm32") {
+        return None;
+    }
+    let host = others_with(path).into_iter().find(|h| h["kind"] == "host")?;
+    let pid = host.get("pid").and_then(Value::as_u64).and_then(|p| u32::try_from(p).ok())?;
+    let Some(port) = host.get("port").and_then(Value::as_u64).and_then(|p| u16::try_from(p).ok()) else {
+        return Some(format!("a windowless host (pid {pid}) has this project open and can't be asked to hand it over"));
+    };
+    match release(port) {
+        Ok(()) => {
+            // It saves, then stops: wait for it to leave (a big project takes a few seconds).
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            while alive(pid) == Some(true) && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Some(format!("took the project over from the windowless host on port {port}, which saved it and stopped; its agents rejoin it here (MCP `hosts`)"))
+        }
+        Err(e) => Some(format!("the windowless host on port {port} has this project open and didn't hand it over ({e}): you are opening a copy")),
+    }
+}
+
+/// Ask the host on `port` to save its project and stop.
+fn release(port: u16) -> std::result::Result<(), String> {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let stream = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)).map_err(|e| e.to_string())?;
+    stream.set_read_timeout(Some(Duration::from_secs(120))).map_err(|e| e.to_string())?;
+    let mut w = stream.try_clone().map_err(|e| e.to_string())?;
+    writeln!(w, "{}", json!({"id": 1, "method": "host.release", "params": {}})).map_err(|e| e.to_string())?;
+    let mut line = String::new();
+    BufReader::new(stream).take(64 * 1024).read_line(&mut line).map_err(|e| e.to_string())?;
+    let reply: Value = serde_json::from_str(&line).map_err(|e| e.to_string())?;
+    if reply["ok"] == json!(true) { Ok(()) } else { Err(reply["error"].as_str().unwrap_or("refused").to_string()) }
+}
+
 /// Remember `path` as it is on disk now (just opened or saved by this process).
 pub(crate) fn remember(path: &str) {
     if let Some(s) = stamp(path) {
