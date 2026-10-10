@@ -103,3 +103,29 @@ fn deleting_a_layer_copies_only_the_layers_that_referred_to_it() {
     assert_eq!(reused, 18, "only the child (unparented) is copied");
     assert_eq!(after[1].parent, None);
 }
+
+/// Analyses are checked in full after an edit from a state that wasn't checked (an opened project,
+/// an undo), and only on the changed layers after that.
+#[test]
+fn stale_analyses_of_an_opened_project_are_cleared_by_the_first_edit() {
+    use effectcraft_effects::warp_stab::{ANALYSIS, ANALYSIS_KEY};
+    let (mut s, cid) = big(3);
+    let target = s.project.comp(cid).unwrap().layers[0].id;
+    s.execute("effect.apply", json!({"effect": "ec.distort.warpstabilizer", "layers": [target.0]})).unwrap();
+    let analysis = |p: &Project| {
+        let g = p.comp(cid).unwrap().layer(target).unwrap().effects().unwrap().groups().next().unwrap();
+        g.get(ANALYSIS).unwrap().value.clone()
+    };
+    // A saved analysis whose key no longer matches (made from other frames).
+    let uid = s.project.comp(cid).unwrap().layer(target).unwrap().effects().unwrap().groups().next().unwrap().uid;
+    let mut p = (*s.project).clone();
+    let g = p.comp_mut(cid).unwrap().layer_mut(target).unwrap().props.find_group_mut(uid).unwrap();
+    g.get_mut(ANALYSIS).unwrap().value = effectcraft_keyframe::Value::Str("{}".into());
+    g.get_mut(ANALYSIS_KEY).unwrap().value = effectcraft_keyframe::Value::Str("stale".into());
+    s.replace_project(p, None);
+    assert_eq!(analysis(&s.project), effectcraft_keyframe::Value::Str("{}".into()));
+    // An edit of another layer still checks every layer once.
+    s.execute("prop.set", json!({"layer": "#3", "path": "transform/opacity", "value": 50})).unwrap();
+    assert_eq!(analysis(&s.project), effectcraft_keyframe::Value::Str(String::new()));
+    assert!(s.warp_pending.iter().any(|w| w.1 == target));
+}

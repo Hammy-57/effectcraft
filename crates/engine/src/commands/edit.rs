@@ -255,7 +255,7 @@ fn copy(s: &mut Session, p: &Value) -> Result<Value> {
     let comp = s.project.comp(cid).ok_or(crate::EngineError::NoComp)?;
     let layers: Vec<Layer> = comp.layers.iter().filter(|l| ids.contains(&l.id)).cloned().collect();
     clear_clipboards(s);
-    s.state.clipboard = layers;
+    s.state.clipboard = layers.into();
     Ok(json!(s.state.clipboard.len()))
 }
 
@@ -313,7 +313,7 @@ fn copy_links(s: &mut Session, p: &Value, relative: bool) -> Result<Value> {
         }
         let n = layers.len();
         clear_clipboards(s);
-        s.state.clipboard = layers;
+        s.state.clipboard = layers.into();
         return Ok(json!({"layers": n}));
     }
     let comp = s.active_comp().ok_or(EngineError::NoComp)?;
