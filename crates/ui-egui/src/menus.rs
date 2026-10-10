@@ -4,12 +4,24 @@
 //! [`frontend`]. [`UI_COMMANDS`] holds the remaining UI-only shortcuts (tools, timeline
 //! navigation, reveal keys). `invoke` is the single entry point used by menus, shortcuts and the
 //! control channel.
+//!
+//! The UI and frontend commands themselves live in per-area files under `src/menus/` (`tool.rs`,
+//! `view.rs`, `window.rs`, `timeline.rs`, …), each listing its ids in `fn handlers()`; build.rs
+//! collects them into [`AREAS`] and [`dispatch`] looks ids up (docs/architecture.md,
+//! "Self-registering modules"). To add a UI command, add an entry to its area file or create a
+//! new area file; don't add a `match` arm here.
+
+// Every `src/menus/*.rs` file is a module, declared by build.rs, with `AREAS`: the files that
+// define `fn handlers()`.
+include!(concat!(env!("OUT_DIR"), "/menus.rs"));
+
+use self::dispatch::Stage;
+pub use self::timeline::reveal;
 
 use serde_json::{Value, json};
 
 use crate::EffectcraftApp;
 use crate::dock::PanelKind;
-use crate::state::{Resolution, Tool};
 use effectcraft_engine::menus::{MenuEntry, MenuNode};
 
 pub struct UiCommand {
@@ -136,61 +148,6 @@ pub fn panel_command_id(p: PanelKind) -> String {
     format!("window.panel.{}", p.id())
 }
 
-/// The reveal shortcuts (P, S, R, T, A, E, M, F, L…). `add` (Shift+key) adds the property to
-/// (or removes it from) those already revealed instead of replacing them.
-pub fn reveal(app: &mut EffectcraftApp, kind: &str, now: f64, add: bool) {
-    // The double-press shortcuts: the same key again within 0.6 s reveals its second set (LL
-    // Waveform, TT Mask Opacity, MM all mask properties, EE Expressions, RR Time Remap, AA
-    // Material Options, PP paint / Roto Brush / Puppet, SS selected properties, FF missing
-    // effects). A single M shows Mask Path.
-    let double = |k: &str| -> Option<&'static str> {
-        Some(match k {
-            "levels" => "waveform",
-            "opacity" => "maskOpacity",
-            "masks" => "masks",
-            "effects" => "expressions",
-            "rotation" => "timeRemap",
-            "anchor" => "material",
-            "position" => "paint",
-            "scale" => "selected",
-            "feather" => "missingEffects",
-            _ => return None,
-        })
-    };
-    let pressed = kind;
-    // (With Shift a second press removes the property again instead.)
-    let again = !add && matches!(app.last_reveal.take(), Some((k, t)) if k == pressed && now - t < 0.6);
-    app.last_reveal = Some((if again { String::new() } else { pressed.to_string() }, now));
-    let kind = match (again, double(pressed)) {
-        (true, Some(d)) => {
-            // The second press replaces what the first one revealed.
-            let first = if pressed == "masks" { "maskPath" } else { pressed };
-            app.ui.timeline.reveal.retain(|k| k != first);
-            d
-        }
-        _ if pressed == "masks" => "maskPath",
-        _ => pressed,
-    };
-    let targets = reveal_targets(app);
-    let tl = &mut app.ui.timeline;
-    let present = tl.reveal.iter().any(|k| k == kind);
-    let mut kinds = tl.reveal.clone();
-    if add {
-        if present {
-            kinds.retain(|k| k != kind);
-        } else {
-            kinds.retain(|k| k != "props" || !tl.reveal_props.is_empty());
-            kinds.push(kind.to_string());
-        }
-    } else if present && kinds.len() == 1 {
-        kinds.clear();
-    } else {
-        kinds = vec![kind.to_string()];
-    }
-    tl.apply_reveal(&targets, kinds.clone());
-    crate::panels::timeline::open_revealed(app, &targets, &kinds);
-}
-
 /// Show Time Remap on the layers of a `layer.enableTimeRemap` (`layers` by id, else the
 /// selected ones) that have it now.
 fn reveal_time_remap(app: &mut EffectcraftApp, params: &Value) {
@@ -205,72 +162,7 @@ fn reveal_time_remap(app: &mut EffectcraftApp, params: &Value) {
     }
 }
 
-/// After Alt+Shift+P (A, S, R, T) the Timeline shows the property on each layer it keyed, as in
-/// After Effects: added to what a reveal shortcut shows, else with the layer's Transform twirled
-/// open, else alone like P.
-fn reveal_keyed(app: &mut EffectcraftApp, keyed: &Value, kind: &str) {
-    let layers: std::collections::BTreeSet<u64> = keyed.as_array().into_iter().flatten().filter_map(|k| k.get("layer").and_then(Value::as_u64)).collect();
-    let Some(comp) = app.session.active_comp() else { return };
-    let tl = &mut app.ui.timeline;
-    for id in layers {
-        let shown = tl.layer_reveal.get(&id).filter(|k| !k.is_empty()).cloned();
-        match shown {
-            Some(mut kinds) => {
-                if !kinds.iter().any(|k| k == kind) {
-                    kinds.push(kind.to_string());
-                    tl.layer_reveal.insert(id, kinds);
-                }
-            }
-            None if tl.open_layers.contains(&id) => {
-                if let Some(tr) = comp.layer(effectcraft_engine::project::LayerId(id)).and_then(|l| l.transform()) {
-                    tl.open_groups.insert(tr.uid);
-                }
-            }
-            None => {
-                tl.open_layers.insert(id);
-                tl.layer_reveal.insert(id, vec![kind.to_string()]);
-            }
-        }
-    }
-}
-
-/// The layers a reveal shortcut acts on: the selected ones, else every layer of the active comp.
-fn reveal_targets(app: &EffectcraftApp) -> Vec<u64> {
-    if app.session.state.selected_layers.is_empty() {
-        app.session.active_comp().map(|c| c.layers.iter().map(|l| l.id.0).collect()).unwrap_or_default()
-    } else {
-        app.session.state.selected_layers.iter().map(|l| l.0).collect()
-    }
-}
-
-/// The arrow keys over the Composition panel or the Timeline: move the selected layers 1 pixel
-/// at the viewer's magnification (`up`, `down`, `left`, `right`), 10 with Shift (`up10`…), as
-/// After Effects does, so zoomed in they move by fractions of a comp pixel. Not while typing,
-/// or with mask points selected.
-fn nudge(app: &mut EffectcraftApp, ctx: &egui::Context, dir: &str) -> Result<Value, String> {
-    let (side, n) = match dir.strip_suffix("10") {
-        Some(side) => (side, 10.0),
-        None => (dir, 1.0),
-    };
-    let (x, y) = match side {
-        "up" => (0.0, -n),
-        "down" => (0.0, n),
-        "left" => (-n, 0.0),
-        "right" => (n, 0.0),
-        _ => return Err(format!("unknown nudge `{dir}`")),
-    };
-    let st = &app.session.state;
-    let over = matches!(app.ui.focused, PanelKind::Composition | PanelKind::Viewer(_) | PanelKind::Timeline);
-    if !over || st.selected_layers.is_empty() || st.text_edit.is_some() || !st.selected_vertices.is_empty() {
-        return Ok(Value::Null);
-    }
-    // Screen pixels per comp pixel.
-    let zoom = (app.ui.viewer.zoom.unwrap_or_else(|| crate::panels::viewer::last_fit(ctx)) * ctx.pixels_per_point()) as f64;
-    let k = if zoom.is_finite() && zoom > 1e-6 { 1.0 / zoom } else { 1.0 };
-    run_engine(app, ctx, "layer.nudge", json!({"x": x * k, "y": y * k}))
-}
-
-fn no_params(p: &Value) -> bool {
+pub(crate) fn no_params(p: &Value) -> bool {
     p.as_object().is_none_or(|m| m.is_empty())
 }
 
@@ -306,7 +198,6 @@ pub fn invoke(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: V
             None => Err("select a Render Queue item first".into()),
         };
     }
-    let now = ctx.input(|i| i.time);
     // Closing a modified project asks to save it first; the command runs once answered.
     if crate::panels::unsaved::guard(app, id, &params) {
         return Ok(json!({"dialog": "unsavedChanges"}));
@@ -336,393 +227,86 @@ pub fn invoke(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: V
     if crate::panels::layer_styles_dialog::route(app, id, &params)? {
         return Ok(Value::Null);
     }
-    // Legacy per-panel / per-workspace ids (`window.panel.Project`, `window.workspace.default`).
-    if let Some(rest) = id.strip_prefix("window.panel.") {
-        return frontend(app, ctx, "window.panel", json!({"panel": rest}));
+    // The UI commands of the area files (`menus/*.rs`): exact ids, then the longest prefix.
+    if let Some(h) = dispatch::find(Stage::Invoke, id) {
+        return (h.run)(app, ctx, id, params);
     }
-    if let Some(ws) = id.strip_prefix("window.workspace.") {
-        if ws == "reset" {
-            return frontend(app, ctx, "window.resetWorkspace", json!({}));
+    engine(app, ctx, id, params)
+}
+
+/// An engine command from the UI (no area file claims it, or its handler hands it on): file
+/// dialogs, the forms commands open without params, the panels some commands bring up.
+pub(crate) fn engine(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: Value) -> Result<Value, String> {
+    if id == "renderQueue.render" && params.get("wait").is_none() {
+        // The UI renders in the background; the panel shows progress.
+        let mut p = params.clone();
+        if let Some(m) = p.as_object_mut() {
+            m.insert("wait".into(), json!(false));
+        } else {
+            p = json!({"wait": false});
         }
-        return frontend(app, ctx, "window.workspace", json!({"name": ws}));
+        app.show_panel(PanelKind::RenderQueue);
+        return app.session.execute(id, p).map_err(|e| e.to_string());
     }
-    if let Some(t) = id.strip_prefix("tool.") {
-        // Slot shortcuts cycle through the slot's tools.
-        let slot = match t {
-            "shape" => Some(8),
-            "pen" => Some(9),
-            "type" => Some(10),
-            "brush" => Some(11),
-            "rotoBrush" => Some(14),
-            "puppet" => Some(15),
-            _ => None,
-        };
-        if let Some(si) = slot {
-            let tools: Vec<Tool> = match si {
-                11 => vec![Tool::Brush, Tool::Clone, Tool::Eraser],
-                _ => crate::state::Tool::SLOTS[si].to_vec(),
-            };
-            let cur = tools.iter().position(|x| *x == app.ui.tool);
-            let next = match cur {
-                Some(i) => tools[(i + 1) % tools.len()],
-                None => app.ui.slot_tools.get(si).copied().filter(|x| tools.contains(x)).unwrap_or(tools[0]),
-            };
-            app.ui.tool = next;
-            if si < app.ui.slot_tools.len() && si != 11 {
-                app.ui.slot_tools[si] = next;
-            }
-            return Ok(json!({"tool": next}));
+    if id == "renderQueue.add" {
+        let r = app.session.execute(id, params).map_err(|e| e.to_string());
+        match &r {
+            Ok(_) => app.show_panel(PanelKind::RenderQueue),
+            Err(e) => app.ui.status = e.clone(),
         }
-        let tool = Tool::from_name(t).ok_or_else(|| format!("unknown tool `{t}`"))?;
-        app.ui.tool = tool;
-        return Ok(json!({"tool": tool}));
+        return r;
     }
-    if let Some(dir) = id.strip_prefix("viewer.nudge.") {
-        return nudge(app, ctx, dir);
+    if let Some(r) = file_dialog(app, id, &params) {
+        return r;
     }
-    if let Some(k) = id.strip_prefix("timeline.reveal.") {
-        if k == "animated" {
-            return run_engine(app, ctx, "anim.reveal", json!({"kind": "keyframes"}));
-        }
-        reveal(app, k, now, false);
-        return Ok(Value::Null);
-    }
-    if let Some(k) = id.strip_prefix("timeline.keyAt.") {
-        let r = run_engine(app, ctx, "keys.toggleTransform", json!({"prop": k}))?;
-        reveal_keyed(app, &r, k);
-        return Ok(r);
-    }
-    if let Some(k) = id.strip_prefix("timeline.revealAdd.") {
-        reveal(app, k, now, true);
-        return Ok(json!({"revealed": app.ui.timeline.reveal}));
-    }
-    // U reveals keyframed properties; UU (pressed twice quickly) all modified properties; U
-    // again later hides them.
-    if id == "anim.reveal" && params.get("kind").and_then(Value::as_str) == Some("keyframes") {
-        let last = app.last_reveal.take();
-        app.last_reveal = Some(("keyframes".into(), now));
-        match last {
-            Some((k, t)) if k == "keyframes" && now - t < 0.6 => {
-                return run_engine(app, ctx, "anim.reveal", json!({"kind": "modified"}));
-            }
-            Some((k, _)) if k == "keyframes" && app.ui.timeline.reveal == ["props"] => {
-                let targets = reveal_targets(app);
-                app.ui.timeline.apply_reveal(&targets, vec![]);
-                return Ok(json!({"revealed": 0}));
-            }
-            _ => {}
-        }
-    }
-    // File ▸ Close (Cmd+W) closes the focused panel, as in After Effects; on a Composition or
-    // Timeline panel (or with a `comp`), its comp.
-    if id == "file.close" && no_params(&params) {
-        let p = app.ui.focused;
-        if !matches!(p, PanelKind::Composition | PanelKind::Viewer(_) | PanelKind::Timeline) && app.panel_group(p).is_some() {
-            app.close_panel(p);
-            return Ok(json!({"closed": p.id()}));
-        }
-    }
-    // Docking and the panel menu: {panel, anchor?, zone: center|left|right|top|bottom},
-    // {panel, rect?}, {panel?}, {panel, comp?}, {panel, stacked?}.
-    if let Some(op) = id.strip_prefix("window.").filter(|o| {
-        matches!(
-            *o,
-            "maximizePanel"
-                | "dockPanel"
-                | "floatPanel"
-                | "closePanel"
-                | "closeOtherPanels"
-                | "closePanelGroup"
-                | "floatPanelGroup"
-                | "stackPanelGroup"
-                | "panelMenu"
-        )
-    }) {
-        let panel_of = |k: &str| params.get(k).and_then(Value::as_str).map(|s| PanelKind::from_name(s).ok_or(format!("unknown panel `{s}`")));
-        let need = |op: &str| -> Result<PanelKind, String> { panel_of("panel").ok_or(format!("{op}: need `panel`"))? };
-        // A Timeline comp tab: `comp` (its id).
-        let comp = params.get("comp").and_then(Value::as_u64);
-        let rect = params.get("rect").and_then(Value::as_array).map(|a| {
-            let g = |i: usize| a.get(i).and_then(Value::as_f64).unwrap_or(0.0) as f32;
-            [g(0), g(1), g(2), g(3)]
-        });
-        match op {
-            "closeOtherPanels" => {
-                let n = app.close_other_panels(ctx, need(op)?, comp)?;
-                return Ok(json!({"closed": n}));
-            }
-            "closePanelGroup" => {
-                let n = app.close_panel_group(need(op)?)?;
-                return Ok(json!({"closed": n}));
-            }
-            "floatPanelGroup" => {
-                let p = need(op)?;
-                let r = rect.unwrap_or_else(|| crate::dock_ui::default_float_rect(ctx.content_rect()));
-                if !app.edit_layout(|l| l.float_group(p, r)) {
-                    return Err(format!("can't undock the panel group of {}", p.title()));
-                }
-                return Ok(Value::Null);
-            }
-            "stackPanelGroup" => {
-                let on = app.stack_panel_group(need(op)?, params.get("stacked").and_then(Value::as_bool))?;
-                return Ok(json!({"stacked": on}));
-            }
-            "panelMenu" => {
-                let p = need(op)?;
-                app.panel_group(p).ok_or_else(|| format!("{} is not open", p.title()))?;
-                let at = |k: &str| params.get(k).and_then(Value::as_f64).map(|v| v as f32);
-                let tab = app.auto.find(&format!("panel.tab.{}", p.id())).map(|e| egui::pos2(e.rect[0], e.rect[1] + e.rect[3]));
-                let pos = match (at("x"), at("y")) {
-                    (Some(x), Some(y)) => egui::pos2(x, y),
-                    _ => tab.unwrap_or_else(|| ctx.content_rect().center()),
-                };
-                let doc = comp.or_else(|| app.shown_doc(p));
-                crate::panels::panel_menu::open(ctx, p, doc, pos);
-                return Ok(Value::Null);
-            }
-            "maximizePanel" => {
-                let p = match panel_of("panel") {
-                    Some(p) => p?,
-                    None => app.panel_at(ctx.pointer_hover_pos()),
-                };
-                app.toggle_maximize(p);
-                return Ok(json!({"maximized": app.ui.maximized}));
-            }
-            "closePanel" => {
-                let p = need(op)?;
-                app.close_panel_tab(ctx, p, comp)?;
-                return Ok(Value::Null);
-            }
-            "floatPanel" => {
-                let p = need(op)?;
-                let r = rect.unwrap_or_else(|| crate::dock_ui::default_float_rect(ctx.content_rect()));
-                if !app.edit_layout(|l| l.float(p, r)) {
-                    return Err(format!("can't undock {}", p.title()));
-                }
-                return Ok(Value::Null);
-            }
-            _ => {
-                let p = need(op)?;
-                // Without an anchor: back to its usual docked place.
-                let Some(anchor) = panel_of("anchor") else {
-                    app.redock_panel(p);
-                    return Ok(Value::Null);
-                };
-                let anchor = anchor?;
-                let zone = params
-                    .get("zone")
-                    .and_then(Value::as_str)
-                    .map_or(Some(crate::dock::Zone::Center), crate::dock::Zone::from_name)
-                    .ok_or("zone: center|left|right|top|bottom")?;
-                if !app.edit_layout(|l| l.dock(p, anchor, zone)) {
-                    return Err(format!("can't dock {} at {} ({zone:?})", p.title(), anchor.title()));
-                }
-                app.show_panel(p);
-                return Ok(Value::Null);
-            }
-        }
-    }
-    if id == "markers.dialog" {
-        // The Composition/Layer Marker dialog (double-click a marker): {layer?, index}.
-        let index = params.get("index").and_then(Value::as_u64).ok_or("markers.dialog: need `index`")? as usize;
-        let layer = params.get("layer").and_then(Value::as_u64);
-        crate::panels::markers_ui::open_dialog(app, crate::panels::markers_ui::MarkerRef { layer, index })?;
+    if id == "layer.precompose" && params.get("name").is_none() {
+        crate::panels::precomp::open(app, &params)?;
         return Ok(json!({"dialog": id}));
     }
-    if id == "view.res.auto" {
-        app.ui.viewer.res = Resolution::Auto;
+    if crate::panels::dialogs::open_form(app, id, &params) {
+        return Ok(json!({"dialog": id}));
+    }
+    if id == "renderQueue.render" && params.get("wait").is_none() {
+        // The UI renders in the background; the panel shows progress.
+        let mut p = params.clone();
+        if let Some(m) = p.as_object_mut() {
+            m.insert("wait".into(), json!(false));
+        } else {
+            p = json!({"wait": false});
+        }
+        app.show_panel(PanelKind::RenderQueue);
+        return app.session.execute(id, p).map_err(|e| e.to_string());
+    }
+    if id == "renderQueue.add" {
+        let r = app.session.execute(id, params).map_err(|e| e.to_string());
+        match &r {
+            Ok(_) => app.show_panel(PanelKind::RenderQueue),
+            Err(e) => app.ui.status = e.clone(),
+        }
+        return r;
+    }
+    // An effect added to a layer (Effect menu, Last Effect, dropped on a layer) brings
+    // up Effect Controls on that layer, as in After Effects.
+    if matches!(id, "effect.apply" | "effect.applyLast") {
+        let r = run_engine(app, ctx, id, params.clone());
+        if r.is_ok() {
+            crate::panels::effect_controls::reveal_applied(app, &params);
+        }
+        return r;
+    }
+    // Enabling time remapping twirls its layers open on Time Remap and its two keys.
+    if id == "layer.enableTimeRemap" {
+        let r = run_engine(app, ctx, id, params.clone());
+        if r.as_ref().is_ok_and(|on| on.as_bool() == Some(true)) {
+            reveal_time_remap(app, &params);
+        }
+        return r;
+    }
+    if id == "layer.rename" && params.get("name").is_none() {
+        crate::panels::timeline::begin_rename(app, ctx);
         return Ok(Value::Null);
     }
-    if let Some(th) = id.strip_prefix("view.theme.") {
-        let k = crate::theme::ThemeKind::from_name(th).ok_or("unknown theme")?;
-        app.set_theme(ctx, k);
-        return Ok(Value::Null);
-    }
-    let timing = |app: &mut EffectcraftApp, op: &str| app.session.execute("layer.timing", json!({"op": op})).map_err(|e| e.to_string());
-    match id {
-        "playback.ramPreview" => {
-            app.toggle_play_with(now, effectcraft_engine::preview::PreviewShortcut::Numpad0);
-            return Ok(json!({"playing": app.playback.playing}));
-        }
-        "playback.preview.shiftSpacebar" | "playback.preview.shiftNumpad0" | "playback.preview.altNumpad0" => {
-            let sc = effectcraft_engine::preview::PreviewShortcut::parse(id.trim_start_matches("playback.preview.")).ok_or("unknown preview shortcut")?;
-            app.toggle_play_with(now, sc);
-            return Ok(json!({"playing": app.playback.playing}));
-        }
-        "playback.stop" => {
-            app.stop();
-            return Ok(Value::Null);
-        }
-        "view.fit" => {
-            app.ui.viewer.zoom = None;
-            app.ui.viewer.pan = [0.0, 0.0];
-            return Ok(Value::Null);
-        }
-        "view.actualSize" => {
-            app.ui.viewer.zoom = Some(1.0 / ctx.pixels_per_point());
-            app.ui.viewer.pan = [0.0, 0.0];
-            return Ok(Value::Null);
-        }
-        "view.safeMargins" => app.ui.viewer.safe_margins = !app.ui.viewer.safe_margins,
-        "view.transparencyGrid" => app.ui.viewer.transparency_grid = !app.ui.viewer.transparency_grid,
-        "view.fastPreviews" => {
-            // With a mode: Fast Previews ▸ Off / Adaptive Resolution / Draft / Fast Draft /
-            // Wireframe; without: toggle Draft quality (Settings ▸ Previews).
-            if params.get("mode").is_some() {
-                return run_engine(app, ctx, "view.fastPreviewMode", params);
-            }
-            let on = !app.ui.viewer.fast_preview;
-            app.set_pref("previews.fastPreviews", json!(on))?;
-            app.ui.viewer.fast_preview = on;
-        }
-        "timeline.zoomIn" | "timeline.zoomOut" => {
-            let k = if id == "timeline.zoomIn" { crate::panels::timeline::ZOOM_STEP } else { 1.0 / crate::panels::timeline::ZOOM_STEP };
-            crate::panels::timeline::zoom(app, ctx, k);
-            return Ok(Value::Null);
-        }
-        "timeline.zoomFit" => app.ui.timeline.pps = None,
-        "timeline.zoomFrameToggle" => crate::panels::timeline::toggle_frame_zoom(app, ctx),
-        "timeline.column" => {
-            let col = params.get("column").and_then(Value::as_str).ok_or("timeline.column: need `column`")?;
-            let on = params.get("visible").and_then(Value::as_bool).unwrap_or(!crate::panels::timeline::column_visible(&app.ui.timeline, col));
-            crate::panels::timeline::set_column(&mut app.ui.timeline, col, on)?;
-            let shown: Vec<&str> =
-                crate::panels::timeline::COLUMNS.iter().map(|c| c.0).filter(|c| crate::panels::timeline::column_visible(&app.ui.timeline, c)).collect();
-            return Ok(json!({"columns": shown}));
-        }
-        "project.column" => {
-            use crate::panels::project::{COLUMNS, set_column};
-            let col = params.get("column").and_then(Value::as_str).ok_or("project.column: need `column`")?;
-            if !COLUMNS.iter().any(|c| c.0 == col) {
-                return Err(format!("unknown column `{col}` (one of: {})", COLUMNS.map(|c| c.0).join(", ")));
-            }
-            let on = params.get("visible").and_then(Value::as_bool).unwrap_or(!app.ui.project_columns.iter().any(|c| c == col));
-            set_column(&mut app.ui.project_columns, col, on);
-            return Ok(json!({"columns": app.ui.project_columns}));
-        }
-        "timeline.sourceName" => {
-            let tl = &mut app.ui.timeline;
-            tl.source_name = params.get("value").and_then(Value::as_bool).unwrap_or(!tl.source_name);
-            return Ok(json!({"sourceName": tl.source_name}));
-        }
-        "flowchart.options" | "flowchart.graph" => return crate::panels::flowchart::command(app, id, &params),
-        "timeline.search" => {
-            app.ui.timeline.search = params.get("query").and_then(Value::as_str).unwrap_or_default().to_string();
-            app.show_panel(PanelKind::Timeline);
-        }
-        "timeline.graphEditor" => app.ui.timeline.graph_editor = !app.ui.timeline.graph_editor,
-        "timeline.switchesModes" => app.ui.timeline.show_modes = !app.ui.timeline.show_modes,
-        "timeline.collapseAll" => {
-            app.ui.timeline.open_layers.clear();
-            app.ui.timeline.open_groups.clear();
-            app.ui.timeline.reveal.clear();
-            app.ui.timeline.layer_reveal.clear();
-        }
-        // Ctrl+`: twirl the selected layers open (all closed ones) or closed (all open). From a
-        // reveal shortcut's view it opens their full property trees.
-        "timeline.twirlSelected" => {
-            let sel: Vec<u64> = app.session.state.selected_layers.iter().map(|l| l.0).collect();
-            let tl = &mut app.ui.timeline;
-            let revealing = sel.iter().any(|l| tl.layer_reveal.contains_key(l));
-            tl.reveal.clear();
-            for l in &sel {
-                tl.layer_reveal.remove(l);
-            }
-            if !revealing && sel.iter().all(|l| tl.open_layers.contains(l)) {
-                for l in &sel {
-                    tl.open_layers.remove(l);
-                }
-            } else {
-                tl.open_layers.extend(sel);
-            }
-        }
-        "timeline.workAreaBegin" => return app.session.execute("comp.workArea", json!({"set": "begin"})).map_err(|e| e.to_string()),
-        "timeline.workAreaEnd" => return app.session.execute("comp.workArea", json!({"set": "end"})).map_err(|e| e.to_string()),
-        "timeline.moveInToTime" => return timing(app, "moveInToTime"),
-        "timeline.moveOutToTime" => return timing(app, "moveOutToTime"),
-        "timeline.trimInToTime" => return timing(app, "trimInToTime"),
-        "timeline.trimOutToTime" => return timing(app, "trimOutToTime"),
-        "app.home" => app.ui.start_screen = !app.ui.start_screen,
-        "app.newComp" | "comp.new" if no_params(&params) => crate::panels::dialogs::open_new_comp(app),
-        "app.compSettings" | "comp.settings" if no_params(&params) => crate::panels::dialogs::open_comp_settings(app)?,
-        "app.solidSettings" | "layer.newSolid" if no_params(&params) => crate::panels::dialogs::open_new_solid(app)?,
-        "keys.velocity" if no_params(&params) => crate::panels::key_dialogs::open_velocity(app)?,
-        "keys.interpolation" if no_params(&params) => crate::panels::key_dialogs::open_interpolation(app)?,
-        "layer.timeStretch" if no_params(&params) => crate::panels::key_dialogs::open_time_stretch(app)?,
-        _ => {
-            if id == "renderQueue.render" && params.get("wait").is_none() {
-                // The UI renders in the background; the panel shows progress.
-                let mut p = params.clone();
-                if let Some(m) = p.as_object_mut() {
-                    m.insert("wait".into(), json!(false));
-                } else {
-                    p = json!({"wait": false});
-                }
-                app.show_panel(PanelKind::RenderQueue);
-                return app.session.execute(id, p).map_err(|e| e.to_string());
-            }
-            if id == "renderQueue.add" {
-                let r = app.session.execute(id, params).map_err(|e| e.to_string());
-                match &r {
-                    Ok(_) => app.show_panel(PanelKind::RenderQueue),
-                    Err(e) => app.ui.status = e.clone(),
-                }
-                return r;
-            }
-            if let Some(r) = file_dialog(app, id, &params) {
-                return r;
-            }
-            if id == "layer.precompose" && params.get("name").is_none() {
-                crate::panels::precomp::open(app, &params)?;
-                return Ok(json!({"dialog": id}));
-            }
-            if crate::panels::dialogs::open_form(app, id, &params) {
-                return Ok(json!({"dialog": id}));
-            }
-            if id == "renderQueue.render" && params.get("wait").is_none() {
-                // The UI renders in the background; the panel shows progress.
-                let mut p = params.clone();
-                if let Some(m) = p.as_object_mut() {
-                    m.insert("wait".into(), json!(false));
-                } else {
-                    p = json!({"wait": false});
-                }
-                app.show_panel(PanelKind::RenderQueue);
-                return app.session.execute(id, p).map_err(|e| e.to_string());
-            }
-            if id == "renderQueue.add" {
-                let r = app.session.execute(id, params).map_err(|e| e.to_string());
-                match &r {
-                    Ok(_) => app.show_panel(PanelKind::RenderQueue),
-                    Err(e) => app.ui.status = e.clone(),
-                }
-                return r;
-            }
-            // An effect added to a layer (Effect menu, Last Effect, dropped on a layer) brings
-            // up Effect Controls on that layer, as in After Effects.
-            if matches!(id, "effect.apply" | "effect.applyLast") {
-                let r = run_engine(app, ctx, id, params.clone());
-                if r.is_ok() {
-                    crate::panels::effect_controls::reveal_applied(app, &params);
-                }
-                return r;
-            }
-            // Enabling time remapping twirls its layers open on Time Remap and its two keys.
-            if id == "layer.enableTimeRemap" {
-                let r = run_engine(app, ctx, id, params.clone());
-                if r.as_ref().is_ok_and(|on| on.as_bool() == Some(true)) {
-                    reveal_time_remap(app, &params);
-                }
-                return r;
-            }
-            if id == "layer.rename" && params.get("name").is_none() {
-                crate::panels::timeline::begin_rename(app, ctx);
-                return Ok(Value::Null);
-            }
-            return run_engine(app, ctx, id, params);
-        }
-    }
-    Ok(Value::Null)
+    run_engine(app, ctx, id, params)
 }
 
 /// Run an engine command and perform the frontend events it emitted right away.
@@ -748,7 +332,7 @@ fn clipboard_note(s: &effectcraft_engine::Session) -> String {
     }
 }
 
-fn run_engine(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: Value) -> Result<Value, String> {
+pub(crate) fn run_engine(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: Value) -> Result<Value, String> {
     let r = app.session.execute(id, params).map_err(|e| e.to_string());
     if let Err(e) = &r {
         app.ui.status = e.clone();
@@ -769,441 +353,18 @@ fn run_engine(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: V
     r
 }
 
-fn toggle(slot: &mut bool, p: &Value) -> Value {
+pub(crate) fn toggle(slot: &mut bool, p: &Value) -> Value {
     *slot = p.get("value").and_then(Value::as_bool).unwrap_or(!*slot);
     json!(*slot)
 }
 
-/// Perform a frontend command (from `Event::Frontend`).
+/// Perform a frontend command (from `Event::Frontend`): the frontend handlers of the area files
+/// (`menus/*.rs`).
 pub fn frontend(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, p: Value) -> Result<Value, String> {
-    let now = ctx.input(|i| i.time);
-    let v = &mut app.ui.viewer;
-    Ok(match id {
-        "app.about" => {
-            app.dialog = Some(crate::Dialog::About);
-            Value::Null
-        }
-        // Window ▸ <ScriptUI panel>: dock (or bring forward) the panel the script built.
-        // Audio scrubbing: one frame of audio at `time` (default the current time).
-        "playback.scrubAudio" => {
-            let cid = app.session.active_comp_id().ok_or("no composition")?;
-            let t = p.get("time").and_then(Value::as_f64).map_or(app.session.time(), effectcraft_engine::time::Tick::from_seconds_f64);
-            app.scrub_audio(cid, t, now);
-            json!({"playing": app.scrub.is_some()})
-        }
-        // View ▸ New Viewer.
-        "view.newViewer" => json!({"viewer": crate::panels::viewers::new_viewer(app)}),
-        "window.scriptPanel" => {
-            let id = p.get("window").and_then(Value::as_u64).ok_or("no ScriptUI panel window")? as u32;
-            app.show_panel(PanelKind::ScriptPanel(id));
-            json!({"window": id})
-        }
-        "layer.style.options" => {
-            crate::panels::layer_styles_dialog::open(app, &p)?;
-            Value::Null
-        }
-        "app.settings" => {
-            let page = p.get("page").and_then(Value::as_str).unwrap_or("general");
-            crate::panels::settings::open(app, effectcraft_engine::prefs::page_id(page).unwrap_or("general"));
-            Value::Null
-        }
-        "app.gpuInfo" => {
-            let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-            crate::panels::dialogs::info(
-                app,
-                "GPU Information",
-                &format!(
-                    "Compositing: CPU, {threads} threads (pure Rust, rayon).\nDisplay: egui on wgpu.\nLayer cache: {} MB  •  Preview cache: {} MB.",
-                    app.session.layer_cache.budget() >> 20,
-                    app.frames.budget() >> 20
-                ),
-            );
-            Value::Null
-        }
-        "app.hide" | "app.hideOthers" | "app.showAll" => {
-            // The desktop app asks macOS (NSApplication hide / hideOtherApplications /
-            // unhideAllApplications); elsewhere Hide minimizes and the others don't apply.
-            if app.hooks.app_action.as_ref().is_some_and(|f| f(id)) {
-                return Ok(Value::Null);
-            }
-            match id {
-                "app.hide" => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
-                _ => return Err(format!("`{id}` is only available on macOS")),
-            }
-            Value::Null
-        }
-        "app.quit" => {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            Value::Null
-        }
-        "app.commandPalette" => {
-            app.dialog_state.palette_query = p.get("query").and_then(Value::as_str).unwrap_or_default().to_string();
-            app.dialog_state.palette_sel = 0;
-            app.dialog = Some(crate::Dialog::CommandPalette);
-            Value::Null
-        }
-        "app.fxConsole" => {
-            crate::panels::fx_console::open(app, ctx, p.get("query").and_then(Value::as_str).unwrap_or_default());
-            Value::Null
-        }
-        "app.keyboardShortcuts" => {
-            crate::panels::shortcut_editor::open(app);
-            Value::Null
-        }
-        "app.templates" => {
-            let kind = p.get("kind").and_then(Value::as_str).unwrap_or("renderSettings");
-            crate::panels::rq_templates::open(app, ctx, kind);
-            Value::Null
-        }
-        "renderQueue.notify" => {
-            // Render finished with Notify on: a toast, the dock/taskbar attention request, and the
-            // host's system sound (the desktop app handles `renderQueue.notify`).
-            let msg = p.get("message").and_then(Value::as_str).unwrap_or("Render finished").to_string();
-            app.toast = Some((msg, now));
-            ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Informational));
-            if let Some(f) = app.hooks.app_action.as_ref() {
-                f("renderQueue.notify");
-            }
-            Value::Null
-        }
-        "app.find" => {
-            if let Some(q) = p.get("query").and_then(Value::as_str) {
-                app.ui.project_search = q.to_string();
-            }
-            app.show_panel(PanelKind::Project);
-            Value::Null
-        }
-        "playback.toggle" => {
-            // The play button and Spacebar: `{shortcut?}` picks which Preview panel shortcut's
-            // options to play with (default Spacebar).
-            let sc = match p.get("shortcut").and_then(Value::as_str) {
-                Some(k) => effectcraft_engine::preview::PreviewShortcut::parse(k).ok_or_else(|| format!("unknown preview shortcut `{k}`"))?,
-                None => effectcraft_engine::preview::PreviewShortcut::Spacebar,
-            };
-            app.toggle_play_with(now, sc);
-            json!({"playing": app.playback.playing, "shortcut": sc.id()})
-        }
-        "playback.cacheWhenIdle" => {
-            let r = toggle(&mut app.ui.cache_when_idle, &p);
-            app.set_pref("previews.cacheFramesWhenIdle", r.clone())?;
-            r
-        }
-        "playback.audio" => {
-            // Include Audio of the shortcut shown in the Preview panel.
-            let mut on = app.session.prefs.preview.active().include_audio;
-            let r = toggle(&mut on, &p);
-            app.session.execute("playback.settings.set", json!({"includeAudio": on})).map_err(|e| e.to_string())?;
-            if !on {
-                app.audio = None;
-            }
-            r
-        }
-        "view.zoomIn" | "view.zoomOut" => {
-            let cur = v.zoom.unwrap_or_else(|| crate::panels::viewer::last_fit(ctx));
-            const STEPS: [f32; 16] = [0.015, 0.03, 0.0625, 0.125, 0.25, 0.333, 0.5, 0.66, 1.0, 1.5, 2.0, 3.0, 4.0, 8.0, 16.0, 32.0];
-            let next = if id == "view.zoomIn" {
-                STEPS.iter().copied().find(|s| *s > cur + 1e-3).unwrap_or(32.0)
-            } else {
-                STEPS.iter().rev().copied().find(|s| *s < cur - 1e-3).unwrap_or(0.015)
-            };
-            v.zoom = Some(next);
-            json!({"zoom": next})
-        }
-        "view.res.full" | "view.res.half" | "view.res.third" | "view.res.quarter" => {
-            let r = id.trim_start_matches("view.res.");
-            v.res = Resolution::ALL.into_iter().find(|x| x.label().eq_ignore_ascii_case(r)).ok_or("unknown resolution")?;
-            Value::Null
-        }
-        "view.res.custom" => {
-            match p.get("factor").and_then(Value::as_u64) {
-                Some(n) => {
-                    v.res = match n.clamp(1, 40) {
-                        1 => Resolution::Full,
-                        n => Resolution::Custom(n as u8),
-                    };
-                }
-                None => {
-                    let cur = match v.res {
-                        Resolution::Custom(n) => n as f64,
-                        _ => 2.0,
-                    };
-                    crate::panels::dialogs::form(
-                        app,
-                        "Custom Resolution",
-                        "view.res.custom",
-                        json!({}),
-                        vec![crate::panels::dialogs::Field::num("factor", "Render every n-th pixel", cur)],
-                    );
-                }
-            }
-            Value::Null
-        }
-        "view.rulers" => toggle(&mut v.rulers, &p),
-        "view.guides" => toggle(&mut v.guides, &p),
-        "view.snapToGuides" => toggle(&mut v.snap_guides, &p),
-        "view.lockGuides" => toggle(&mut v.lock_guides, &p),
-        "view.grid" => toggle(&mut v.grid, &p),
-        "view.snapToGrid" => toggle(&mut v.snap_grid, &p),
-        "view.layerControls" => toggle(&mut v.show_layer_controls, &p),
-        "view.options" => {
-            app.dialog = Some(crate::Dialog::ViewOptions);
-            Value::Null
-        }
-        "view.panelBackground" => {
-            if p.get("pick").and_then(Value::as_bool) == Some(true) {
-                let [r, g, b] = v.custom_pasteboard;
-                crate::panels::dialogs::form(
-                    app,
-                    "Panel Background Color",
-                    "view.panelBackground",
-                    json!({}),
-                    vec![crate::panels::dialogs::Field::text("color", "Color (#rrggbb)", &format!("#{r:02x}{g:02x}{b:02x}"))],
-                );
-                return Ok(Value::Null);
-            }
-            let c = p.get("color").and_then(Value::as_str).unwrap_or("mediumGray");
-            v.pasteboard = match c {
-                "black" => Some([0, 0, 0]),
-                "darkGray" => Some([0x2a, 0x2a, 0x2a]),
-                "mediumGray" => None,
-                "lightGray" => Some([0xb4, 0xb4, 0xb4]),
-                "white" => Some([0xff, 0xff, 0xff]),
-                "custom" => Some(v.custom_pasteboard),
-                hex => {
-                    let c = effectcraft_engine::color::Rgba::from_hex(hex).ok_or_else(|| format!("unknown colour `{hex}`"))?;
-                    let rgb = [(c.r * 255.0).round() as u8, (c.g * 255.0).round() as u8, (c.b * 255.0).round() as u8];
-                    v.custom_pasteboard = rgb;
-                    Some(rgb)
-                }
-            };
-            Value::Null
-        }
-        "view.fullScreen" => {
-            let full = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!full));
-            json!(!full)
-        }
-        "window.panel" => {
-            let name = p.get("panel").and_then(Value::as_str).unwrap_or_default();
-            if name.eq_ignore_ascii_case("tools") {
-                app.ui.status = "The Tools panel is the toolbar in the header".into();
-                return Ok(Value::Null);
-            }
-            let panel = PanelKind::from_name(name).ok_or_else(|| format!("unknown panel `{name}`"))?;
-            app.show_panel(panel);
-            Value::Null
-        }
-        "window.workspace" => {
-            let want = p.get("name").and_then(Value::as_str).unwrap_or("Default").to_ascii_lowercase().replace(' ', "");
-            let name = app
-                .workspace_names()
-                .into_iter()
-                .find(|w| w.to_ascii_lowercase().replace(' ', "") == want)
-                .ok_or_else(|| format!("unknown workspace `{want}`"))?;
-            app.set_workspace(&name);
-            json!({"workspace": name})
-        }
-        "window.resetWorkspace" => {
-            let name = app.ui.workspace.clone();
-            app.set_workspace(&name);
-            Value::Null
-        }
-        "window.saveWorkspace" => {
-            let name = app.ui.workspace.clone();
-            app.ui.saved_workspaces.insert(name.clone(), app.ui.dock.clone());
-            app.ui.saved_floating.insert(name.clone(), app.ui.floating.clone());
-            json!({"workspace": name})
-        }
-        "window.saveWorkspaceAs" => {
-            let Some(name) = p.get("name").and_then(Value::as_str).map(str::trim).filter(|n| !n.is_empty()).map(str::to_string) else {
-                crate::panels::dialogs::form(
-                    app,
-                    "New Workspace",
-                    "window.saveWorkspaceAs",
-                    json!({}),
-                    vec![crate::panels::dialogs::Field::text("name", "Name", "Untitled Workspace")],
-                );
-                return Ok(Value::Null);
-            };
-            app.ui.saved_workspaces.insert(name.clone(), app.ui.dock.clone());
-            app.ui.saved_floating.insert(name.clone(), app.ui.floating.clone());
-            app.ui.workspace = name.clone();
-            json!({"workspace": name})
-        }
-        "window.editWorkspaces" => {
-            let Some(name) = p.get("name").and_then(Value::as_str).map(str::to_string) else {
-                let cur = app.ui.workspace.clone();
-                crate::panels::dialogs::form(
-                    app,
-                    "Edit Workspaces",
-                    "window.editWorkspaces",
-                    json!({}),
-                    vec![
-                        crate::panels::dialogs::Field::text("name", "Workspace", &cur),
-                        crate::panels::dialogs::Field::text("rename", "Rename to", &cur),
-                        crate::panels::dialogs::Field::bool("delete", "Delete", false),
-                    ],
-                );
-                return Ok(Value::Null);
-            };
-            let builtin = crate::dock::WORKSPACES.contains(&name.as_str());
-            if p.get("delete").and_then(Value::as_bool) == Some(true) {
-                app.ui.saved_floating.remove(&name);
-                if app.ui.saved_workspaces.remove(&name).is_none() && !builtin {
-                    return Err(format!("no workspace `{name}`"));
-                }
-                if app.ui.workspace == name {
-                    app.set_workspace("Default");
-                }
-                return Ok(json!({"deleted": name}));
-            }
-            if let Some(new) = p.get("rename").and_then(Value::as_str).map(str::trim).filter(|n| !n.is_empty() && *n != name) {
-                if builtin {
-                    return Err(format!("`{name}` is a built-in workspace: save it as a new workspace instead"));
-                }
-                let dock = app.ui.saved_workspaces.remove(&name).ok_or_else(|| format!("no workspace `{name}`"))?;
-                app.ui.saved_workspaces.insert(new.to_string(), dock);
-                if let Some(f) = app.ui.saved_floating.remove(&name) {
-                    app.ui.saved_floating.insert(new.to_string(), f);
-                }
-                if app.ui.workspace == name {
-                    app.ui.workspace = new.to_string();
-                }
-                return Ok(json!({"renamed": new}));
-            }
-            json!({"workspaces": app.workspace_names()})
-        }
-        "view.lookAt" => {
-            let r: Vec<f64> = p.get("rect").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_f64).collect()).unwrap_or_default();
-            if r.len() == 4 {
-                let map: Option<crate::panels::viewer::ViewerMap> = ctx.data(|d| d.get_temp(egui::Id::new("viewer-map")));
-                if let Some(m) = map {
-                    let (rw, rh) = (((r[2] - r[0]) as f32).max(1.0), ((r[3] - r[1]) as f32).max(1.0));
-                    let zoom = ((m.area.width() - 40.0) / rw).min((m.area.height() - 40.0) / rh).clamp(0.015, 32.0);
-                    let rc = [(r[0] + r[2]) as f32 / 2.0, (r[1] + r[3]) as f32 / 2.0];
-                    let v = &mut app.ui.viewer;
-                    v.zoom = Some(zoom);
-                    v.pan = [m.comp[0] * zoom / 2.0 - rc[0] * zoom, m.comp[1] * zoom / 2.0 - rc[1] * zoom];
-                }
-            }
-            Value::Null
-        }
-        "comp.flowchart" => {
-            // Chart the active comp; Layer ▸ Reveal ▸ Reveal Layer in Project Flowchart shows
-            // layers and selects the layer's node.
-            app.ui.flowchart.root = app.session.active_comp_id().map(|c| c.0);
-            if let (Some(c), Some(l)) = (app.session.active_comp_id(), app.session.state.selected_layers.first()) {
-                app.ui.flowchart.layers = true;
-                app.ui.flowchart.selected = Some(format!("layer:{}:{}", c.0, l.0));
-            }
-            app.show_panel(PanelKind::Flowchart);
-            Value::Null
-        }
-        "comp.miniFlowchart" => {
-            let at = ctx.input(|i| i.pointer.hover_pos()).unwrap_or_else(|| ctx.content_rect().center());
-            app.ui.mini_flowchart = Some([at.x, at.y]);
-            Value::Null
-        }
-        "track.editTargetDialog" => {
-            crate::panels::tracker::open_target(app)?;
-            Value::Null
-        }
-        "track.optionsDialog" => {
-            crate::panels::tracker::open_options(app)?;
-            Value::Null
-        }
-        "layer.openLayer" => {
-            let id = p.get("layer").and_then(Value::as_u64).or_else(|| app.session.state.selected_layers.first().map(|l| l.0));
-            app.ui.layer_panel = id;
-            app.ui.layer_view = None;
-            app.show_panel(PanelKind::Layer);
-            Value::Null
-        }
-        "app.confirmExecute" => {
-            // Settings ▸ Scripting ▸ Warn User When Executing Files.
-            let path = p.get("path").and_then(Value::as_str).unwrap_or_default().to_string();
-            crate::panels::forms::form(
-                app,
-                "A script wants to open a file",
-                "file.executeFile",
-                json!({"path": path, "confirmed": true}),
-                vec![crate::panels::forms::Field::text("path", "Open", &path)],
-            );
-            Value::Null
-        }
-        "app.showReport" => {
-            let title = p.get("title").and_then(Value::as_str).unwrap_or("Report").to_string();
-            let text = p.get("text").and_then(Value::as_str).unwrap_or_default().to_string();
-            crate::panels::dialogs::info(app, &title, &text);
-            Value::Null
-        }
-        "window.assignWorkspaceShortcut" => {
-            let mut q = p.clone();
-            q["workspace"] = json!(app.ui.workspace);
-            return run_engine(app, ctx, "window.assignWorkspaceShortcut", q);
-        }
-        "file.interpretFootage" => {
-            // Import ▸ Interpret Unlabeled Alpha As: Ask User.
-            if let Some(i) = p.get("item").and_then(Value::as_u64) {
-                app.session.state.project_selection = vec![effectcraft_engine::project::ItemId(i)];
-            }
-            crate::panels::dialogs::open_form(app, "file.interpretFootage", &json!({}));
-            Value::Null
-        }
-        // Help ▸ In-App Tutorials: the Home screen's Learn tab.
-        "help.inAppTutorials" => {
-            app.ui.start_screen = true;
-            app.ui.home_learn = true;
-            app.ui.home_templates = false;
-            Value::Null
-        }
-        // File ▸ New ▸ New Project from Template…: the Home screen's Templates tab.
-        "file.newFromTemplate" => {
-            app.ui.start_screen = true;
-            app.ui.home_learn = false;
-            app.ui.home_templates = true;
-            Value::Null
-        }
-        "effect.manage" | "anim.browsePresets" => {
-            app.show_panel(PanelKind::EffectsPresets);
-            Value::Null
-        }
-        "timeline.revealProps" => {
-            let props = p.get("props").and_then(Value::as_array).cloned().unwrap_or_default();
-            let uids = |k: &str| -> Vec<u64> { props.iter().filter_map(|x| x.get(k).and_then(Value::as_u64)).collect() };
-            let (found, with_props) = (uids("prop"), uids("layer"));
-            // The layers it looked at (`layers`), else those it found something on. Layers that
-            // have nothing to show close; the others' reveals stay.
-            let targets: Vec<u64> = match p.get("layers").and_then(Value::as_array) {
-                Some(l) => l.iter().filter_map(Value::as_u64).collect(),
-                None => with_props.clone(),
-            };
-            // The targets' earlier picks go (U after UU shows the keyframed ones only).
-            let comp = app.session.active_comp_arc();
-            let theirs = |u: u64| {
-                comp.as_ref().is_some_and(|c| {
-                    targets
-                        .iter()
-                        .filter_map(|l| c.layer(effectcraft_engine::project::LayerId(*l)))
-                        .any(|l| l.props.find(u).is_some() || l.props.find_group(u).is_some())
-                })
-            };
-            let tl = &mut app.ui.timeline;
-            tl.reveal_props.retain(|u| !theirs(*u));
-            tl.reveal_props.extend(found.iter().copied());
-            let (shown, hidden): (Vec<u64>, Vec<u64>) = targets.into_iter().partition(|l| with_props.contains(l));
-            tl.apply_reveal(&hidden, vec![]);
-            if !shown.is_empty() {
-                tl.apply_reveal(&shown, vec!["props".into()]);
-            }
-            // Properties inside effects (puppet pins…) show under their effect, twirled open.
-            for (layer, prop) in props.iter().filter_map(|x| Some((x.get("layer")?.as_u64()?, x.get("prop")?.as_u64()?))) {
-                crate::panels::timeline::open_effect_paths(app, layer, &[prop]);
-            }
-            json!({"revealed": found.len()})
-        }
-        _ => return Err(format!("`{id}` is not a frontend command")),
-    })
+    match dispatch::find(Stage::Frontend, id) {
+        Some(h) => (h.run)(app, ctx, id, p),
+        None => Err(format!("`{id}` is not a frontend command")),
+    }
 }
 
 /// Commands that need a file or folder path: ask the host's file dialog when `params` lacks one.

@@ -582,6 +582,7 @@ the modules that define a conventional function.
 | `engine/src/*.rs` | a `pub` module | a top-level `specs()` too (`models`, `storage`, `learn`, …) |
 | `effects/src/*.rs` | a crate-private module | its `pub fn specs() -> Vec<EffectSpec>` in `registry()` |
 | `render/src/*.rs`, `ui-egui/src/*.rs`, `ui-egui/src/panels/*.rs` | a `pub` module | — |
+| `ui-egui/src/menus/*.rs` | a `pub(crate)` UI command area module (`tool`, `view`, `window`, `timeline`, `app`, …) | its `pub(crate) fn handlers() -> &'static [Handler]` in `menus::AREAS` |
 
 In all of them `tests.rs`, `tests_*.rs` and `*_tests.rs` become `#[cfg(test)]` modules. **To add a
 command, an effect, a panel module or a test file, create the file; don't touch `lib.rs` /
@@ -591,6 +592,20 @@ command, an effect, a panel module or a test file, create the file; don't touch 
 (`LEGACY_ORDER` in `commands/mod.rs`, frozen: the command list's order is observable); new ones
 follow by file name. Effects are sorted by category and name anyway. `cargo fmt` can't see the
 generated declarations, so format with `cargo xtask fmt` (`cargo xtask ci` checks it).
+
+UI commands (`menus::invoke`: tools, viewer, timeline navigation, reveal keys, docking…) and frontend
+commands (an engine command's `Event::Frontend`, run by `menus::frontend`) are dispatched from the
+area files' handler tables, not from a central `match`. Each entry declares its id as data:
+`Handler::ui("view.fit", fit)`, `Handler::ui_prefix("tool.", tool)` or
+`Handler::frontend("view.zoomIn", zoom)`. Lookup takes an exact id first, then the longest matching
+prefix; `invoke`'s cross-cutting guards (unsaved changes, panel focus, dialog routes) run before it
+and unclaimed ids go to the engine (`menus::engine`). **To add a UI command, add an entry to its
+area file or create a new area file**, and add the id next to its area's ids in `PINNED_INVOKE` /
+`PINNED_FRONTEND` (`menus/tests_dispatch.rs` pins the handled ids and fails when two area files
+claim the same id). A handler whose condition doesn't hold (a dialog that opens only without params) hands the
+command on to `menus::engine` itself. Labels and default shortcuts of UI-only commands stay in
+`menus::UI_COMMANDS`: its order is observable (the shortcut table and the Keyboard Shortcuts
+editor follow it).
 
 Shared docs avoid the same collisions differently: [parity.md](parity.md)'s cells hold only the
 current state, and history is appended to the union-merged [parity-log.md](parity-log.md).
