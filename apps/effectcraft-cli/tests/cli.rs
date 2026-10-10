@@ -210,6 +210,40 @@ fn mcp_over_stdio() {
     assert_eq!(replies[3]["result"]["content"][0]["type"], "image");
 }
 
+/// The older tool names are hidden from tools/list unless `--all-tools`, and callable either way.
+#[test]
+fn mcp_all_tools_lists_hidden_aliases() {
+    for (all, listed) in [(false, false), (true, true)] {
+        let mut cmd = bin();
+        cmd.arg("mcp");
+        if all {
+            cmd.arg("--all-tools");
+        }
+        let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+        {
+            let mut stdin = child.stdin.take().unwrap();
+            writeln!(stdin, "{}", json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})).unwrap();
+            writeln!(
+                stdin,
+                "{}",
+                json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "list_commands", "arguments": {"filter": "comp.new"}}})
+            )
+            .unwrap();
+        }
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success());
+        let replies: Vec<Value> = String::from_utf8(out.stdout).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        let names: Vec<&str> = replies[0]["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"command_list") && names.contains(&"render_preview"));
+        for alias in ["list_commands", "execute_command", "get_project", "render_frame"] {
+            assert_eq!(names.contains(&alias), listed, "{alias} with --all-tools={all}");
+        }
+        assert_eq!(replies[1]["result"]["isError"], false, "{}", replies[1]);
+    }
+    let out = bin().args(["info", "--all-tools"]).output().unwrap();
+    assert!(!out.status.success(), "--all-tools is for mcp only");
+}
+
 #[test]
 fn script_file_and_eval() {
     let proj = tmp("scripted.ecproj");
@@ -254,6 +288,9 @@ fn script_file_and_eval() {
 fn render_out_is_relative_to_the_working_directory() {
     let root = tmp("render-out");
     let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    // The CLI resolves against the canonical working directory (macOS: /var is /private/var).
+    let root = root.canonicalize().unwrap();
     let (proj, elsewhere) = (root.join("proj"), root.join("elsewhere"));
     std::fs::create_dir_all(&proj).unwrap();
     std::fs::create_dir_all(&elsewhere).unwrap();
@@ -453,4 +490,32 @@ fn mcp_autosave_is_opt_in_and_rejects_invalid_combinations() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("MCP auto-save"));
     assert!(!String::from_utf8_lossy(&out.stderr).contains("panicked"));
     std::fs::remove_dir_all(config).unwrap();
+}
+
+/// `replay`: a repro script runs headless with per-step results; a failing step exits 1 and is
+/// named as the first failure; malformed lines are failures, not crashes.
+#[test]
+fn replay_reports_steps_and_the_first_failure() {
+    let repro = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/repros/comp-zero-frame-rate.jsonl");
+    let v = ok_json(&["replay", repro.to_str().unwrap()]);
+    assert_eq!(v["ok"], true, "{v}");
+    assert!(v["steps"].as_array().unwrap().len() > 5);
+    let bad = tmp("bad-repro.jsonl");
+    std::fs::write(
+        &bad,
+        "{\"start\": \"new\"}\n{\"command\": \"comp.new\"}\n{\"expect\": {\"query\": \"comp.info\", \"pointer\": \"/width\", \"equals\": 1}}\nnot json\n",
+    )
+    .unwrap();
+    let (code, v) = run_json(&["replay", bad.to_str().unwrap()]);
+    assert_eq!(code, 1);
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["first_failure"]["line"], 3, "{v}");
+    assert_eq!(v["skipped"], 1);
+    let out = bin().args(["replay", bad.to_str().unwrap(), "--keep-going"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("line    2  ok    comp.new") && text.contains("line    4  FAIL  invalid: not JSON"), "{text}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("failed at line 3 (comp.info)"));
+    // The start line picks the project.
+    assert_eq!(bin().args(["replay", bad.to_str().unwrap(), "--demo"]).output().unwrap().status.code(), Some(2));
 }

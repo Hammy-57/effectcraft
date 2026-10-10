@@ -6,7 +6,7 @@ user can do, an agent can do too. There are three ways in:
 
 | Interface | Best for | Needs a window |
 |---|---|---|
-| **MCP** (`effectcraft-cli mcp`) | Claude Code and other MCP clients | no (headless), or yes with `--bridge` |
+| **MCP** (`effectcraft-cli mcp`) | Claude Code and other MCP clients | no (headless, or `--ui` with the app offscreen), or yes with `--bridge` |
 | **CLI** (`effectcraft-cli exec/get/set/...`) | one-shot scripting and CI; JSON output with `--json` | no |
 | **Control channel** (`effectcraft --control 9877`) | driving and seeing the live UI; see [control-protocol.md](control-protocol.md) | yes |
 
@@ -27,8 +27,9 @@ Code, add a `.mcp.json` at the project root:
 ```
 
 This repository ships a ready-made [`.mcp.json`](../.mcp.json): `effectcraft` (headless, demo
-project loaded) and `effectcraft-app` (bridged to a desktop app started with `--control 9877`). Both
-start through [`scripts/mcp.sh`](../scripts/mcp.sh), which keeps a release binary in `target/mcp`
+project loaded), `effectcraft-ui` (the full app offscreen with the demo project: screenshots and UI
+input without a window) and `effectcraft-app` (bridged to a desktop app started with
+`--control 9877`). All start through [`scripts/mcp.sh`](../scripts/mcp.sh), which keeps a release binary in `target/mcp`
 (its own target dir, so it never waits on another build's lock). Only the first start compiles in the
 foreground; after that the server starts at once, and when the sources are newer than the binary it
 rebuilds in the background (log: `target/mcp/build.log`), so reconnect (`/mcp`) to pick up the new
@@ -41,13 +42,24 @@ Desktop, Cursor and the like) take the same `command` and `args`.
 - **Headless** (`["mcp"]`): an in-process session with no window. Add `"--demo"` or
   `"--project", "file.ecproj"` to start with content. Startup is instant. It renders on the CPU
   unless you add `"--gpu"` (`["mcp", "--gpu"]`), which attaches the GPU compositor on a device of
-  its own; if no adapter is usable the server says why and exits. `get_project`'s `renderer`
+  its own; if no adapter is usable the server says why and exits. `doc_inspect`'s `project.renderer`
   (`render.backend`) reports `active` (`gpu` / `cpu`) and, on the CPU, `why`.
+- **Offscreen UI** (`["mcp", "--ui"]`, add `"--demo"` or a project as above): runs the full app in
+  the server process with no window (egui_kittest + wgpu, like the `snapshot` example), so
+  `screenshot` (with `panel` / `id` crops), the `ui_*` tools and `control` work exactly as in bridge
+  mode: every tool goes through the same control-channel requests, and clicks, drags, keys and
+  typing are real input events. Nothing appears on screen, focus is never taken, and several servers
+  can run side by side. `--ui-size 1680x1020` (points) and `--ui-scale 2` (screenshot pixels per
+  point) set the window. It needs a GPU adapter (startup says which; without one it exits with the
+  reason). `initialize` answers at once; the first tool call waits for the app's first frames
+  (about a second, longer while Metal/Vulkan compiles the GPU compositor's shaders on a cold cache). Work is in memory: `save_project` it (no `--autosave`).
+  Built with the CLI's default `ui` feature (`--no-default-features` drops it).
 - **Bridge** (`["mcp", "--bridge", "9877"]`): drives a running `effectcraft --control 9877`, so you
   see every change live. Bridge mode adds `screenshot` and the `ui_*` tools.
 
 The server speaks JSON-RPC 2.0 over stdio, one message per line, and supports MCP protocol versions
-2025-06-18, 2025-03-26 and 2024-11-05 (`initialize`, `ping`, `tools/list`, `tools/call`).
+2025-06-18, 2025-03-26 and 2024-11-05: tools (with structured results on 2025-06-18), resources and
+resource templates with subscriptions, workflow prompts and logging; see [MCP conventions](mcp.md).
 
 ### Keeping headless work across restarts
 
@@ -66,7 +78,7 @@ it reads settings without writing desktop preferences, shortcuts or crash-recove
 for recovery; remove old folders once their work is saved elsewhere.
 
 `initialize` instructions and `_meta.effectcraftAutoSave` list the current folder and up to five
-previous dirty sessions; `get_project.autosave` also reports the latest checkpoint and errors.
+previous dirty sessions; `doc_inspect`'s `project.autosave` also reports the latest checkpoint and errors.
 Recover explicitly with `open_project {"path":"<checkpoint .ecproj>"}`, then
 `save_project {"path":"Recovered.ecproj"}`. Prior sessions may still be running and are never
 opened automatically. Replacing a dirty project with `open_project` or `file.newProject` discards
@@ -76,18 +88,19 @@ Without `--autosave`, headless work is in memory until explicitly saved. The fla
 only; a bridged desktop app owns its auto-saves. An edit interrupted before its reply is received
 may be absent from the last checkpoint.
 
-See [MCP conventions](mcp.md) for core tools, resources, strict arguments, and render progress/cancellation.
+See [MCP conventions](mcp.md) for core tools, resources, strict arguments, and progress/cancellation of long calls (renders, analyses with `wait: true`, `jobs.wait`, scripts).
 
 ### Tools
 
 | Tool | What it does |
 |---|---|
-| `list_commands {filter?, enabled_only?, schemas?}` | Discover command ids, their param docs (and, with `schemas`, a JSON Schema each), and whether each can run now. |
+| `command_list {filter?, enabled_only?, schemas?}` | Discover command ids, their param docs (and, with `schemas`, a JSON Schema each), and whether each can run now. |
 | `describe_command {command \| id}` | One command in full: label, menu, shortcut, params doc, JSON `schema`, enabled / `why`. |
-| `execute_command {command \| id, params?}` | Run any command (undoable). Unknown parameter keys are rejected with the accepted list. |
+| `command_run {id, params?}` | Run any command (undoable). Unknown parameter keys are rejected with the accepted list. |
+| `command_batch {steps, stop_on_error?}` | Run commands in order with per-step results; each edit has its own undo step. |
 | `get_state` | Editor state (active comp, time, selections, tool) plus `app`: version, command and effect counts, export formats, parity summary. |
-| `run_script {code, name?}` | Run JavaScript with the After Effects-style scripting object model (`app.project`, `comp.layers.addText(…)`, `layer.property("ADBE Transform Group").property("ADBE Position").setValueAtTime(…)`…). Returns `{ok, result, output, error: {message, line, column}}`; edits are undoable. |
-| `get_project` / `get_comp {comp?}` | Project items, comp settings and layers. |
+| `run_script {code, name?, timeout?}` | Run JavaScript with the After Effects-style scripting object model (`app.project`, `comp.layers.addText(…)`, `layer.property("ADBE Transform Group").property("ADBE Position").setValueAtTime(…)`…). Returns `{ok, result, output, error: {message, line, column}}`; edits are undoable. Stops after `timeout` seconds (default 300, `0` = none) or on `notifications/cancelled`. |
+| `doc_inspect` / `get_comp {comp?}` | Project overview (items, active comp, time, selection, undo stack) with the active composition; one comp's settings and layers. |
 | `get_layer {layer, comp?, time?, depth?, flat?}` | A layer's property tree (`depth` limits how many group levels expand). Every node has a `path`. |
 | `get_property {layer, path, comp?, time?}` | Value at a time, keyframes and expression. |
 | `set_property {layer, path, value?, time?, expression?, comp?}` | Sets a static value. With `time` it sets a keyframe; with `expression` it sets an expression. |
@@ -95,18 +108,19 @@ See [MCP conventions](mcp.md) for core tools, resources, strict arguments, and r
 | `list_effects {filter?}` | Effect ids, names, categories, GPU / 32-bpc support and parameters. |
 | `list_fonts {query?, rescan?}` | Font families text layers can use, bundled and installed, with their styles, origin and own-language name; `rescan` picks up fonts installed since launch. |
 | `add_effect {layer, effect, values?, comp?}` | Apply an effect and set its parameters in one call and one undo step (a failing value leaves nothing applied); returns the instance path (`effects/#n`) and its parameter paths. |
-| `render_frame {comp?, time?, max_side?, path?, inline?, transparent?}` | Returns a PNG image of a frame; `transparent: true` keeps the alpha (as an RGB + Alpha render writes it) instead of compositing over the comp background. |
+| `render_preview {comp? \| item?, layer?, time?, max_side?, region?, overlays?, path?, inline?, transparent?}` | Returns a PNG image of a frame; `transparent: true` keeps the alpha (as an RGB + Alpha render writes it) instead of compositing over the comp background. `region: [x, y, w, h]` (comp pixels) renders just that rectangle at full resolution (then `max_side` applies to it); `layer` renders one layer solo in its place; `item` renders a footage or solid item on its own (source time). `overlays: true` (bounds + anchor) or a list of `bounds`, `anchor`, `motionPath`, `safeMargins`, `grid`, `all` draws the viewer's overlays (boxes tagged `#n name` in label colours) and returns each drawn layer's comp-space `bounds` [x, y, w, h] (the `get_layout` geometry), `anchor` and `keyPositions`. |
+| `render_frames {comp? \| item?, layer?, times? \| count?, start?, end?, cols?, max_side?, labels?, region?, overlays?, transparent?, path?, gif?, inline?}` | One contact-sheet PNG of several frames, each cell labelled with its time and frame number: `times` (s), or `count` frames (default 6, capped at 64) spread evenly over `start`..`end` (default the work area). `max_side` is the sheet's longest side (default 1600); `gif` also writes an animated GIF. Returns `{times, frames, cols, rows, cell, width, height}`. |
+| `get_layout {comp?, time?, layers?, pixels?, overlaps?}` | Where layers are on screen at a time, without rendering (`layer.bounds`): `visible` (and `why` not), comp-space `bounds` [x,y,w,h], `corners`, `center`, `anchorInComp`, `onScreen` (0-1) and the layer-space `source` rect, after parenting and (3D) the active camera. `pixels` adds the drawn pixels' bounds (effects included); `overlaps` lists overlapping visible layers. |
+| `analyze_audio {comp?, start?, end?, layer?, silence_db?, min_silence?, true_peak?, waveform?, width?, height?, path?}` | Measure the audio mix (`audio.analyze`): peak / true peak dBFS, RMS, integrated LUFS (BS.1770), clipped samples, silent ranges, per-channel stats; `waveform` returns a waveform image. No audio gives `hasAudio: false`. |
+| `render_snapshot {name, comp?, time?, max_side?, transparent?}` | Render a frame and keep it in the session under `name` (16 kept, oldest dropped; the same name replaces). |
+| `render_compare {a, b, threshold?, min_psnr?, max_side?, amplify?, diff_path?, inline?}` | Compare two frames. `a` and `b` are each a snapshot name (or `{snapshot}`), `{path}` (a PNG/JPEG golden or After Effects reference) or `{comp?, time?, transparent?}` (render now; `{}` = active comp at the CTI). Returns `{width, height, max_abs, mean_abs, alpha_max_abs, psnr_db, ssim, changed_pixels, changed_pct, pass}` and, when something changed, the diff heatmap as an image. See [Verify your change](#verify-your-change-snapshot--edit--compare). |
 | `open_project {path \| demo \| new}` / `save_project {path?}` | Open and save files. |
 | `undo {steps?}` / `redo {steps?}` | History. |
 | `history {goto?}` | The branching undo history (History panel): every state with its index, id, label, branch depth and whether it's current; `goto` (an index or id) jumps to any state, on any branch, without losing the others. |
 | `script_ui {action?, window?, widget?, value?, result?}` | Drive ScriptUI windows that scripts opened: `list` (default) the open windows, `get` a window's control tree, `click` a button / checkbox / radio button, `set` text, a slider or a list item, `close` a window (`result`: what a dialog's `show()` returns, default 2 = Cancel). |
 | `batch {steps: [{command, params}], label?, atomic?}` | Several commands in one call and one undo step (`engine.batch`); `"$N.key"` in a param is step N's result (`"$1.layer"`). A failing step rolls the batch back and names the step. |
-| *(bridge)* `screenshot {panel?, id?, max_side?, path?}`, `ui_inspect`, `ui_elements {prefix?}`, `ui_click`, `ui_drag`, `ui_key`, `ui_type`, `ui_set`, `control {method, params}` | Look at and operate the live window. |
-| `command_list` | List commands (same arguments as `list_commands`). |
-| `command_run {id, params?}` | Run a command. |
-| `command_batch {steps, stop_on_error?}` | Run commands in order with per-step results; each edit has its own undo step. |
-| `doc_inspect` | Project overview and active composition. |
-| `render_preview` | Render a PNG without writing a file (`comp`, `time`, `max_side`, `transparent`). |
+| *(UI: `--ui` or `--bridge`)* `screenshot {panel?, id?, max_side?, path?}`, `ui_inspect`, `ui_elements {prefix?}`, `ui_click`, `ui_drag`, `ui_key`, `ui_type`, `ui_set`, `control {method, params}` | Look at and operate the app window (offscreen with `--ui`, the live one with `--bridge`). |
+| *(hidden aliases)* `list_commands {filter?, enabled_only?, schemas?}`, `execute_command {command \| id, params?}`, `get_project`, `render_frame {comp? \| item?, layer?, time?, max_side?, region?, overlays?, path?, inline?, transparent?}` | Older names of `command_list`, `command_run`, `doc_inspect` (its `project`) and `render_preview`. Callable, but not in `tools/list` unless the server runs with `mcp --all-tools`. |
 
 Layers are referenced by id (from `get_comp`), `"#n"` (1-based index from the top) or name. Comps are
 referenced by id or name, and default to the active comp. Property paths come from `get_layer`, for
@@ -120,11 +134,43 @@ instead of being ignored.
 
 ### A typical session
 
-1. `execute_command {"command":"comp.new","params":{"name":"Intro","width":1920,"height":1080,"frameRate":30,"duration":4}}`
-2. `execute_command {"command":"layer.newText","params":{"text":"Hello","size":160,"fill":"#ffffff"}}` returns `{"layer": 2}`.
+1. `command_run {"id":"comp.new","params":{"name":"Intro","width":1920,"height":1080,"frameRate":30,"duration":4}}`
+2. `command_run {"id":"layer.newText","params":{"text":"Hello","size":160,"fill":"#ffffff"}}` returns `{"layer": 2}`.
 3. `add_keyframe {"layer":2,"path":"transform/position","keys":[{"time":0,"value":[-300,540]},{"time":1.5,"value":[960,540]}],"interpolation":"easyEase"}`
-4. `execute_command {"command":"effect.apply","params":{"layer":2,"effect":"Gaussian Blur"}}`, then `set_property {"layer":2,"path":"effects/#1/blurriness","value":8}`
-5. `render_frame {"time":1.0}` lets you look at the result, and `save_project {"path":"intro.ecproj"}` saves it.
+4. `command_run {"id":"effect.apply","params":{"layer":2,"effect":"Gaussian Blur"}}`, then `set_property {"layer":2,"path":"effects/#1/blurriness","value":8}`
+5. `render_preview {"time":1.0}` lets you look at the result, and `save_project {"path":"intro.ecproj"}` saves it.
+
+### Verify your change: snapshot → edit → compare
+
+Don't just assume an edit did what you meant; look. Snapshot the frame, make the change, and compare:
+
+1. `render_snapshot {"name":"before","time":1.0}` → `{name, comp, time, width, height, snapshots}`
+2. `set_property {"layer":"EFFECTCRAFT","path":"transform/opacity","value":50}`
+3. `render_compare {"a":"before","b":{"time":1.0}}` (demo project) →
+   `{"width":1920,"height":1080,"max_abs":118.0,"mean_abs":1.8705,"alpha_max_abs":0.0,"psnr_db":27.091,"ssim":0.99214,"changed_pixels":135386,"changed_pct":6.529,"pass":false,…}`
+   plus the heatmap image (768 px wide inline): unchanged pixels are frame `a` dimmed to grey, differences within the
+   threshold dark blue, changed pixels red → yellow → white by size (`amplify`, default 8: a
+   32-level difference is white).
+
+So a change that should touch only the title shows a heatmap lit only around the title, and a
+refactor that should change nothing gives `pass: true` with `psnr_db: "inf"`.
+
+- **Metrics.** Colour is compared premultiplied (each image over black, so colour under fully
+  transparent pixels never counts) in 8-bit levels: `max_abs` and `mean_abs` over R, G and B,
+  `alpha_max_abs` for alpha, `psnr_db` from the colour MSE (the string `"inf"` when identical),
+  `ssim` the mean luma SSIM over 8×8 windows (1 = identical). A pixel is *changed* when any channel
+  differs by more than `threshold` levels (default 1).
+- **Pass.** `pass` is true when no pixel changed. With `min_psnr` (dB) the PSNR decides instead,
+  for references that are close but never bit-exact, such as an After Effects render
+  (`render_compare {"a":{"path":"plan/aftereffects/ref/title.png"},"b":{},"min_psnr":35}`).
+- **Sizes.** `max_side` scales both images down (area average) first. Images with the same aspect
+  ratio but different sizes (a half-resolution reference) are compared at the smaller size and the
+  reply says which side was `resampled`; different aspect ratios are an error naming both sizes.
+- `diff_path` also writes the full-size heatmap PNG. Snapshots live in the session (the app's in
+  bridge mode), not in the project; `execute_command render.snapshots {"clear":true}` lists or drops
+  them. Over the control channel the same commands are `engine.execute render.snapshot` /
+  `render.compare` (`diff_inline: true` returns the heatmap as base64 `diff_png`).
+- For goldens and fidelity checks from the shell: `effectcraft-cli compare a.png b.png` (see [CLI](#cli)).
 
 ### Cookbook
 
@@ -132,18 +178,24 @@ Short recipes; every step is one tool call.
 
 | Goal | Calls |
 |---|---|
-| Orient yourself | `get_state` → `get_project` → `get_comp {}` |
-| Find the right command | `list_commands {"filter":"mask"}` → `describe_command {"command":"mask.new"}` (params + JSON Schema) |
-| Title card | `execute_command comp.new {...}` → `execute_command layer.newText {"text":"Hi","size":120}` → `render_frame {"time":0}` |
+| Orient yourself | `get_state` → `doc_inspect` → `get_comp {}` |
+| Find the right command | `command_list {"filter":"mask"}` → `describe_command {"command":"mask.new"}` (params + JSON Schema) |
+| Title card | `command_run comp.new {...}` → `command_run layer.newText {"text":"Hi","size":120}` → `render_preview {"time":0}` |
 | Animate | `add_keyframe {"layer":2,"path":"transform/scale","keys":[{"time":0,"value":[0,0]},{"time":0.5,"value":[100,100]}],"interpolation":"easyEase"}` |
 | Effect with settings | `list_effects {"filter":"glow"}` → `add_effect {"layer":2,"effect":"Glow","values":{"threshold":40,"radius":30}}` → `set_property {"layer":2,"path":"effects/#1/intensity","value":2}` |
-| Key a green screen | `add_effect {"layer":2,"effect":"Keylight (1.2)"}` → `execute_command effect.pickColor {"layer":2,"effect":1,"param":"screenColour","x":20,"y":20,"average":true}` (a screen pixel, layer space; samples the effect's input) → `set_property {"layer":2,"path":"effects/#1/screenMatte/clipBlack","value":10}` → `render_frame {"transparent":true}` |
+| Key a green screen | `add_effect {"layer":2,"effect":"Keylight (1.2)"}` → `command_run effect.pickColor {"layer":2,"effect":1,"param":"screenColour","x":20,"y":20,"average":true}` (a screen pixel, layer space; samples the effect's input) → `set_property {"layer":2,"path":"effects/#1/screenMatte/clipBlack","value":10}` → `render_preview {"transparent":true}` |
 | Drive with an expression | `set_property {"layer":2,"path":"transform/rotation","expression":"time*90"}` |
 | Inspect a layer | `get_layer {"layer":2,"flat":true}` (every property with its `path`, value, key count) |
-| Check the result | `render_frame {"time":1.5,"max_side":640}`; in bridge mode `screenshot {"panel":"Timeline"}` |
+| Is the title centred and on screen? | `get_layout {"layers":["Title"],"time":2}` → compare `center` with half the comp size, `onScreen` should be 1; `get_layout {"overlaps":true}` for collisions |
+| Check the soundtrack | `analyze_audio {}` → `integratedLufs` (streaming targets about -14), `truePeakDbtp` under -1, `clippedSamples` 0, `silences`; `analyze_audio {"waveform":true}` to see it |
+| Check the result | `render_preview {"time":1.5,"max_side":640}`; with a UI (`--ui` / `--bridge`) `screenshot {"panel":"Timeline"}` |
+| Prove what an edit changed | `render_snapshot {"name":"before"}` → edit → `render_compare {"a":"before","b":{}}` (metrics + diff heatmap) |
+| Check an animation | `render_frames {"count":8}` (one labelled sheet), `render_frames {"times":[0,0.5,1],"layer":2,"overlays":["motionPath"],"gif":"anim.gif"}` |
+| Where are the layers? | `render_preview {"overlays":true}` (boxes tagged `#n name`, anchors; reply `layers[].bounds`) |
+| Check a detail | `render_preview {"region":[800,400,320,180],"max_side":0}` (full resolution crop of a big comp) |
 | Undo a mistake | `undo {}`, or `history {}` then `history {"goto": n}` |
-| Missing media after opening | `execute_command footage.check {"wait":true}` → `{checked, missing, probed}`; then `file.findMissing {"what":"footage"}` |
-| Bring in a Figma design | `execute_command file.importFigma {"url":"https://www.figma.com/design/KEY/Name?node-id=12-345"}` (token from `FIGMA_TOKEN`); `{"payload": <Figma node JSON>}` when you already have the nodes |
+| Missing media after opening | `command_run footage.check {"wait":true}` → `{checked, missing, probed}`; then `file.findMissing {"what":"footage"}` |
+| Bring in a Figma design | No token: serialize with the Figma MCP's `use_figma` + `integrations/figma/serialize.js`, then `command_run file.importFigma {"payloadPaths": [<parts>]}` (see "Figma designs"). With a token: `{"url": "<figma link>"}` |
 | Save | `save_project {"path":"out.ecproj"}` |
 
 The desktop app checks footage in the background after every open (a "Checking footage" job in
@@ -154,17 +206,18 @@ the Progress panel, `jobs.list`); headless sessions run `footage.check` when the
 Things that tripped up a long agent-driven session (a multi-scene 3D piece built entirely over MCP).
 
 - **Layer time vs comp time.** `add_keyframe`, `set_property` with `time`, `prop.addKey`,
-  `keys.select` and `keys.set` take layer time; `get_property` and `render_frame` take comp time;
+  `keys.select` and `keys.set` take layer time; `get_property` and `render_preview` take comp time;
   `run_script`'s `setValueAtTime` and `keyTime` use comp time, as in After Effects. On a layer that
   doesn't start at 0, such as a nested comp placed later, subtract the layer's start time from the
   comp time before keying (unstretched layers), or set the keys from `run_script`
   ([#257](https://github.com/storytold/effectcraft/issues/257)).
-- **Moving a layer in time.** `execute_command layer.timing {"layers":["Scene 2"],"start":5.1}` sets
+- **Moving a layer in time.** `command_run layer.timing {"layers":["Scene 2"],"start":5.1}` sets
   the start time in comp seconds and moves the in and out points with it.
 - **Loops in scripts.** `run_script` can call any engine command with `app.run(id, params)`, for
   example `app.run("layer.new3dPrimitive", {kind: "cube", position: [x, y, z]})` inside a loop. A
   script that throws keeps the edits it already made: wrap it in `app.beginUndoGroup()` /
-  `app.endUndoGroup()` so one `undo {}` removes them all. (`batch` rolls back on its own.)
+  `app.endUndoGroup()` so one `undo {}` removes them all. (`batch` rolls back on its own.) A script
+  stopped by its `timeout` or a cancel rolls back an undo group it left open.
 - **Save early in headless mode.** Without `--autosave` the headless server keeps the project in
   memory only, so a server restart loses unsaved work: start it with `mcp --autosave` (see above)
   or call `save_project {"path": …}` after each milestone.
@@ -231,7 +284,7 @@ build real projects through these interfaces; they are worked examples of everyt
   {field: feather|expansion|opacity, value}`.
 * **Renders**: `renderQueue.add {comp, format: h264|prores|webm|png…, channels: rgba,
   proresProfile: 4444, output}` then `renderQueue.render {"wait": true}`. Check a render by
-  importing it (`file.import`, `file.newCompFromSelection`) and `render_frame {transparent: true}`
+  importing it (`file.import`, `file.newCompFromSelection`) and `render_preview {transparent: true}`
   for its alpha (ProRes 4444 and WebM VP9 alpha both read back as straight alpha).
 * **Essential Graphics**: controls can be addressed by name (`essential.set {"layer":"#1",
   "control":"Title","value":"John Smith"}`); a command that targets an explicit `comp` runs even
@@ -261,10 +314,48 @@ read and write these values as they are.
 comps or precomps, groups become nulls with their children parented, shapes become shape layers
 with editable paths, fills, gradients and strokes. Text becomes text layers with style runs, masks
 become track mattes, and shadows become layer styles. Image fills and node types without a native
-counterpart come in as 2x PNG renders. It is one undo step.
+counterpart come in as PDF footage (sharp at any scale, transparent; PNG when a PDF can't be
+used). It is one undo step.
 [`integrations/figma/README.md`](../integrations/figma/README.md) has the full mapping.
 
-* **From a link:** `{"url": "https://www.figma.com/design/KEY/Name?node-id=12-345"}`, or
+#### Figma without a token: the Figma MCP route
+
+Agents with the Figma MCP (signed in once, in Claude) need no token: its `use_figma` tool runs
+Figma Plugin API code inside the file, and [`integrations/figma/serialize.js`](../integrations/figma/serialize.js),
+the same serializer the plug-in uses, turns nodes into the payload `file.importFigma` reads.
+The Claude Code skill [`integrations/figma/skill/SKILL.md`](../integrations/figma/skill/SKILL.md)
+(installed at `~/.claude/skills/figma-to-effectcraft/`) does all of it when you say "import
+<figma link>":
+
+1. Parse the link: `figma.com/design/<fileKey>/…?node-id=12-345` → `fileKey`, node `12:345`.
+2. `use_figma {fileKey, code: <serialize.js> + "return await effectcraftSerialize({ids: ['12:345'], fileKey: '<fileKey>', images: 'none', budget: 18000});"}`
+   and write the reply as returned to `part-1.json`. `use_figma` replies are capped at 20 KB, so
+   with `budget` the serializer cuts subtrees that don't fit into stubs `{"$ref": "<id>"}` and
+   lists them in `pending`.
+3. While `pending` isn't empty: the same call with `{subtree: [<pending ids>], …}` returns those
+   nodes as `fragments` (and what is still `pending`); write each reply to the next part file.
+4. Images: every part's `rasterize` lists the nodes that come in as images (image fills, node types
+   without a counterpart, subtrees too large to transfer). Fetch each with the MCP's
+   `download_assets {fileKey, nodeId, defaultFormat: "pdf"}`, save the URL with `curl`, and write
+   `{"images": {"<id>": {"pdfPath": "<pdf>", "bounds": "render"}}}` as one more part. PDF is the
+   default: EffectCraft imports it as vector footage with Continuously Rasterize on, so it stays
+   sharp when scaled, and it keeps transparency. Add a PNG (`defaultFormat: "png", defaultScale: 2`,
+   as `"path": "<png>"`) only when the PDF can't be fetched or the import notes it failed:
+   EffectCraft tries the PDF first, then the PNG, and reports the `format` it used.
+5. `effectcraft-cli exec file.importFigma --bridge 9877 --params '{"payloadPaths": ["part-1.json", …, "images.json"]}'`
+   (the first file is the payload; the others add `fragments` and `images`).
+6. Report `native` vs `images`, `rasterized` (with `format`) and `notes` from the reply.
+
+`bounds: "render"` places the image over the node's render bounds (what `download_assets` and
+`get_screenshot` export, shadows included); the default is the node's bounding box (what
+`exportAsync` with `useAbsoluteBounds` and the REST API render). Instance sub-layer ids
+(`I1:2;3:4`) are refused by `download_assets`; render those with `{imagesOnly: [ids], images:
+'png'}` through `use_figma` instead. Requests on the control channel time out after 60 s, so split
+very large frames by child.
+
+#### Other sources
+
+* **From a link with a token** (optional): `{"url": "https://www.figma.com/design/KEY/Name?node-id=12-345"}`, or
   `{"fileKey": "KEY", "nodeIds": ["12:345"]}`. It fetches `GET /v1/files/:key/nodes?geometry=paths`
   and `GET /v1/images/:key` with a personal access token. The token comes from `token`,
   `FIGMA_TOKEN`, or one stored with `figma.setToken {token}` (`figma.status` says which is in use).
@@ -273,14 +364,17 @@ counterpart come in as 2x PNG renders. It is one undo step.
   split very large selections.
 * **From JSON you already have** (the Figma REST reply, the EffectCraft plug-in's payload, a node
   or an array of nodes): `{"payload": …}` or `{"payloadPath": "nodes.json"}`. Images go in
-  `"images": {"<node id>": {"png": "<base64>"}}`.
+  `"images": {"<node id>": {"pdf" | "png": "<base64>"} | {"pdfPath" | "path": "<file>", "bounds"?: "render" | {x, y, width, height}, "fallback"?: …}}`.
+  Large selections come in parts: `{"payloadPaths": ["part-1.json", …]}`.
 * `target`: `newComp` (frame size → comp size), `activeComp` (centred in the open comp), or `auto`
   (frames → new comps, anything else → the active comp). Use `frameRate` and `duration` for new comps.
 * `dryRun: true` returns the plan and changes nothing.
 * The reply has `{comp, comps, precomps, layers, native, images, rasterized: [{node, name, reason}],
   notes}`. Each layer's comment holds its Figma node id (`Figma 12:345`).
-* People use the Figma plug-in instead: it sends its selection through `effectcraft-cli figma-bridge`
-  to the same command.
+* People use the EffectCraft Transfer plug-in instead: the desktop app runs its bridge on
+  `127.0.0.1:7789` (Settings ▸ Let Figma Send Layers, on by default) and asks once to allow the
+  plug-in (`ui.figmaPair`, automation ids `figmaPair.allow` / `figmaPair.deny`). Its imports run
+  the same command.
 
 ### Motion tracking
 
@@ -288,13 +382,13 @@ Trackers live on the tracked layer (`Motion Trackers ▸ Tracker n ▸ Track Poi
 with `track.*` commands. `track.analyze` runs in the background in the app (poll `track.status`);
 pass `"wait": true` to block until it finishes, which is what the CLI and headless MCP want.
 
-1. `execute_command {"command":"track.motion","params":{"layer":"clip.mov"}}` creates a Transform
+1. `command_run {"id":"track.motion","params":{"layer":"clip.mov"}}` creates a Transform
    tracker (Motion Target: the layer above). Use `track.stabilize` for Stabilize, or `track.new` with
    `kind` `transform|stabilize|affine|perspective|raw` and `rotation`/`scale`.
-2. `execute_command {"command":"track.setPoint","params":{"point":1,"center":[812,440],"featureSize":[40,40],"searchSize":[96,96]}}`
-3. `execute_command {"command":"track.analyze","params":{"direction":"forward","wait":true}}` keys Feature
+2. `command_run {"id":"track.setPoint","params":{"point":1,"center":[812,440],"featureSize":[40,40],"searchSize":[96,96]}}`
+3. `command_run {"id":"track.analyze","params":{"direction":"forward","wait":true}}` keys Feature
    Center, Confidence and Attach Point on every frame from the current time to the layer's end.
-4. `execute_command {"command":"track.apply","params":{"dimensions":"xy"}}` keys the target's Position
+4. `command_run {"id":"track.apply","params":{"dimensions":"xy"}}` keys the target's Position
    (and Rotation/Scale), the layer's own Anchor Point and Position for Stabilize, or a Corner Pin
    effect for `affine`/`perspective` tracks. `track.options` sets the channel, blur/enhance,
    adapt-feature and "If Confidence is Below" behaviour; `track.status` reports the track points.
@@ -560,6 +654,8 @@ effectcraft-cli set Main '#1' transform/position '[100,360]' --time 0 main.ecpro
 effectcraft-cli get Main '#1' transform/position --time 0.5 main.ecproj --json
 effectcraft-cli run main.ecproj comp.open '{"comp":"Main"}' time.set '{"time":1}' --json
 effectcraft-cli render-frame main.ecproj --time 1 --max-side 640 --out f.png --json
+effectcraft-cli compare golden.png f.png --diff diff.png        # PASS/FAIL + metrics; exit 1 when they differ
+effectcraft-cli compare ae-ref.png f.png --min-psnr 35 --max-side 960 --json
 effectcraft-cli exec layer.newNull --bridge 9877                 # same commands, against the live app
 effectcraft-cli exec file.exportLottie '{"comp":"Main","path":"main.json","includeExpressions":true}' main.ecproj --json
 effectcraft-cli exec file.importLottie '{"path":"anim.json"}' main.ecproj --save
@@ -583,7 +679,7 @@ cannot express (most effects, cameras and lights, layer styles, audio, video foo
 agent can check what a player will not show. A `.lottie` path writes a dotLottie archive.
 `file.importLottie` returns `{comp, items, warnings}` and opens the new composition.
 
-Premiere Pro interop goes through timeline interchange (MCP: the `execute_command` tool; control channel: `engine.execute`
+Premiere Pro interop goes through timeline interchange (MCP: the `command_run` tool; control channel: `engine.execute`
 with the same ids):
 
 ```sh
@@ -603,10 +699,75 @@ not read or written.
 `<comp>` is an id or name, or `-` for the active comp. `<value>` is JSON (`50`, `[960,540]`,
 `"#ff0000"`) or a bare string.
 
+## Repro scripts
+
+Every command the app runs (menus, panels, shortcuts, agents, scripts) goes into the session's
+command journal. A **repro script** is that journal as JSON lines, so a bug or crash becomes
+something an agent can replay and a regression test becomes a data file.
+
+```text
+// comments: lines starting with // or #; blank lines are skipped
+{"start": "new" | "demo" | {"project": "rel/or/abs.ecproj"}, "allow_errors": false}   optional, first line
+{"command": "comp.new", "params": {"name": "Main", "frameRate": 30}}
+{"command": "comp.settings", "params": {"frameRate": 0}, "expect_error": "frameRate"}
+{"expect": {"query": "comp.info", "pointer": "/frameRate", "equals": 30}}
+{"expect_no_error": true}
+```
+
+- `start`: the project to begin with (default `new`). A relative `project` path is relative to the
+  script. Other header keys (`version`, `app`, `os`, `crash`, `note`) are for people.
+- `command`: run like the app runs it. It must succeed, unless it has `expect_error` (`true`, or a
+  text the error must contain) or the header says `allow_errors` (errors are reported but
+  tolerated). A panic always fails the replay.
+- `expect`: run a command, normally a query (`prop.get`, `comp.info`, `layer.tree`, `project.summary`),
+  and compare the value at the JSON `pointer` of its result with `equals` (numbers within 1e-6).
+  Without `equals` it only checks that the query succeeds.
+- `expect_no_error`: the previous command succeeded.
+
+Where scripts come from:
+
+- `journal.export {path?}` returns `{script, steps}` (or writes `path`): the commands since the
+  project was last replaced (`file.newProject`, `file.open`, `file.openDemoProject`). Queries and
+  saves are not in it; commands a script or `file.runScript` ran are covered by that one step.
+- `help.exportRepro {path?}` saves the same for a bug report, by default to `Repros/` in the
+  settings folder (macOS `~/Library/Application Support/EffectCraft/Repros`, next to `Logs/`).
+- **Crash repros**: when the last-resort guard catches a panic in a command, the app writes
+  `Repros/crash-<unix time>-<command>.jsonl` there automatically (the newest 20 are kept): the
+  journal, then the command that panicked, with `"allow_errors": true` and the error in the header.
+  The error the user or agent sees names the file. Headless sessions without a settings folder
+  (the CLI, tests) don't write one.
+
+Privacy: a repro holds command ids and parameters only, never project, image or media file
+contents. Parameters can include file paths, layer and item names and text typed into text
+layers, so read a repro before sharing it.
+
+Replay one headless (a fully wired session, like the CLI's other subcommands):
+
+```sh
+effectcraft-cli replay crash.jsonl            # per-step ok/FAIL lines, then the first failure
+effectcraft-cli replay crash.jsonl --json     # {ok, panicked, steps, first_failure, skipped}
+effectcraft-cli replay crash.jsonl --keep-going
+```
+
+It exits with status 1 when a step fails, an expectation is not met or a command panics, and
+stops at the first failure unless `--keep-going`. Steps that work on the user's files (`file.open`
+of their project, imports) need those files; replace them with a `start` project or generated
+content when you turn a report into a test. A repro only sees commands: UI state changed
+without one (a hover, a half-finished drag) is not in it.
+
+**Regression tests are data files.** A crash fix's regression test is the repro, trimmed to the
+steps that matter, with an `expect_error` or `expect` line where the fix changed the outcome,
+dropped into [`tests/repros/`](../tests/repros). `crates/host/tests/repros.rs` replays every
+`*.jsonl` there and fails on any panic or unmet expectation
+(`cargo nextest run -p effectcraft-host --test repros`).
+
 ## Seeing the UI
 
-To work on the UI, start the app with `cargo run -p effectcraft -- --control 9877` (add `--demo` to
-open the demo project; without it the app starts with an empty project) and use MCP bridge
-mode or the raw control channel. A good loop is: `ui_elements` to find an id, `ui_click` or `ui_drag`
-to act, then `screenshot {"panel":"Timeline"}` to check the result. `render_frame` shows the
+The quickest way is the offscreen UI: the `effectcraft-ui` server in `.mcp.json`
+(`effectcraft-cli mcp --ui --demo`) runs the whole app without a window, so screenshots and UI input
+work while you use the machine, on any Space, with the display asleep, and in parallel agents. The
+loop below works the same there. To watch changes live instead, start the app with
+`cargo run -p effectcraft -- --control 9877` (add `--demo` to open the demo project; without it the
+app starts with an empty project) and use MCP bridge mode or the raw control channel. A good loop is: `ui_elements` to find an id, `ui_click` or `ui_drag`
+to act, then `screenshot {"panel":"Timeline"}` to check the result. `render_preview` shows the
 composition itself at any zoom.

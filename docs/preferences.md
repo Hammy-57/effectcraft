@@ -149,6 +149,13 @@ Commands (CLI, MCP, control channel):
   channel ([control-protocol.md](control-protocol.md)) on this port at every launch, so agents and
   `effectcraft-cli mcp --bridge <port>` can drive it; unlike `--control`, the window still takes
   focus and the Home screen and crash recovery behave as usual. Takes effect at the next launch
+- `scripting.figmaBridge` (on by default): the desktop app runs the Figma bridge on
+  `127.0.0.1:7789`, so the EffectCraft Transfer plug-in in Figma can send layers straight into the
+  open project (`integrations/figma/README.md`). The first time, EffectCraft asks **Connect
+  Figma?** (Allow / Deny); the plug-in keeps the pairing code after that. Imports need the code,
+  and browsers may only call it from the plug-in or figma.com. Agent launches (`--control`) skip
+  it unless `EFFECTCRAFT_FIGMA_BRIDGE_PORT` is set (which also picks the port). Takes effect at
+  the next launch
 - `roto.model` (Settings ▸ Roto Brush): the segmentation model Roto Brush 2.0 / 3.0 use,
   `classical` (built in) or `mobilesam` (once installed). The page lists every registered model
   with its authors, licence, size, source and status, with Download, Install from File… and

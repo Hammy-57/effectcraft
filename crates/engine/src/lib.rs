@@ -10,44 +10,14 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
-pub mod autosave;
-pub mod camera_track;
+// Every `src/*.rs` file is a module (`tests*.rs` under `#[cfg(test)]`), declared by build.rs;
+// declare one here only for another visibility or a submodule folder. See docs/architecture.md
+// "Self-registering modules".
+include!(concat!(env!("OUT_DIR"), "/modules.rs"));
+// By hand: its `cmd!` / `query!` macros are `#[macro_export]`ed (not allowed from an `include!`).
 pub mod commands;
-pub mod config;
-pub mod demo;
-pub mod figma;
-pub mod footage_check;
-pub mod guard;
-pub mod history;
-pub mod jobs;
-pub mod learn;
-pub mod links;
-pub mod logging;
-pub mod mask_track;
-pub mod media_browser;
-pub mod media_cache;
 pub mod menus;
-pub mod models;
-pub mod offload;
-pub mod perf;
-pub mod prefs;
-pub mod preview;
-pub mod psd_import;
-pub mod remote;
-pub mod render_queue;
-pub mod roto;
-pub mod scriptui;
-pub mod sequence;
 mod session_settings;
-pub mod shortcuts;
-pub mod storage;
-pub mod sysinfo;
-pub mod templates;
-pub mod tracking;
-pub mod vector;
-pub mod viewer;
-pub mod warp;
-pub mod xml_project;
 
 use std::sync::Arc;
 
@@ -459,9 +429,14 @@ pub struct Session {
     pub autosave_folder_override: Option<std::path::PathBuf>,
     /// The viewer snapshot (Take Snapshot / Show Snapshot).
     pub snapshot: Option<viewer::Snapshot>,
+    /// Named rendered frames for `render.compare` (`render.snapshot`; bounded, oldest dropped).
+    pub frame_snapshots: commands::render_compare::FrameSnapshots,
     /// The JavaScript scripting engine (set by the host that links `effectcraft-script`):
     /// `script.run`, File ▸ Scripts ▸ Run Script File… (`.jsx`/`.js`) and the Script Console.
     pub script: Option<ScriptRunner>,
+    /// Stops the script that runs next (set by `script.run {timeout}` and by hosts that cancel
+    /// scripts, e.g. MCP `notifications/cancelled`); see [`ScriptInterrupt`].
+    pub script_interrupt: Option<ScriptInterrupt>,
     /// Loads WebAssembly effect plug-ins (set by the host that links `effectcraft-plugin` with
     /// its runtime): `effect.plugins.load`.
     pub plugin_loader: Option<PluginLoader>,
@@ -512,6 +487,37 @@ pub struct ScriptRequest<'a> {
     pub name: &'a str,
     /// Run in the Script Console's persistent context (variables survive between runs).
     pub console: bool,
+}
+
+/// Stops a running script from outside: a cancel flag another thread sets and/or a deadline. The
+/// scripting runtime checks it between batches of bytecode and in every object-model call, and
+/// then ends the script with an error that `try`/`catch` can't intercept.
+#[derive(Clone, Debug, Default)]
+pub struct ScriptInterrupt {
+    pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// When the time limit runs out (with the limit in seconds, for the message).
+    pub deadline: Option<(web_time::Instant, f64)>,
+}
+
+impl ScriptInterrupt {
+    /// A time limit of `seconds` from now (`None` for no limit, or a limit that is not a
+    /// positive finite number).
+    pub fn with_limit(mut self, seconds: Option<f64>) -> Self {
+        self.deadline = seconds
+            .filter(|s| s.is_finite() && *s > 0.0)
+            .and_then(|s| Some((web_time::Instant::now().checked_add(std::time::Duration::try_from_secs_f64(s).ok()?)?, s)));
+        self
+    }
+    /// Why the script must stop now, if it must.
+    pub fn stopped(&self) -> Option<String> {
+        if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Some("the script was cancelled".into());
+        }
+        match self.deadline {
+            Some((at, s)) if web_time::Instant::now() >= at => Some(format!("the script ran longer than its time limit ({s} s)")),
+            _ => None,
+        }
+    }
 }
 
 /// Runs a script against the session and reports `{ok, result, output, error: {message, line,
@@ -567,7 +573,9 @@ impl Default for Session {
             autosave: autosave::AutoSaveState::default(),
             autosave_folder_override: None,
             snapshot: None,
+            frame_snapshots: Default::default(),
             script: None,
+            script_interrupt: None,
             plugin_loader: None,
             script_ui: scriptui::ScriptUi::default(),
             sys_memory: None,
@@ -606,10 +614,15 @@ impl Session {
                 return Err(EngineError::Disabled(id.to_string(), why));
             }
         }
-        // Last-resort guard: a panicking command reports an error instead of crashing the app.
-        let r = guard::guarded(&format!("command `{id}`"), || (spec.run)(self, &params))?;
+        // Last-resort guard: a panicking command reports an error instead of crashing the app
+        // (and saves a repro of the steps that led there, see `replay::after_command`).
+        let nesting = replay::Nesting::enter(spec.journal);
+        let caught = guard::caught();
+        let r = guard::guarded(&format!("command `{id}`"), || (spec.run)(self, &params));
+        let r = replay::after_command(self, id, &params, &nesting, caught, r)?;
         self.learn_observe(id, &params);
-        if spec.journal {
+        // Commands run by a journaled command (a script's steps) replay with it, not again.
+        if spec.journal && !nesting.inside_journaled() {
             self.journal.push((id.to_string(), params));
             if self.journal.len() > 10_000 {
                 self.journal.drain(..1000);
@@ -1034,87 +1047,6 @@ pub fn upgrade_effects(p: &mut Project) {
     p.schema = effectcraft_project::SCHEMA_VERSION;
 }
 
-#[cfg(test)]
-mod rq_tests;
-#[cfg(test)]
-mod tests;
-#[cfg(test)]
-mod tests_3d;
-#[cfg(test)]
-mod tests_aep;
-#[cfg(test)]
-mod tests_import_project;
-#[cfg(test)]
-mod tests_anim_tools;
-#[cfg(test)]
-mod tests_camera_track;
-#[cfg(test)]
-mod tests_codec_options;
-#[cfg(test)]
-mod tests_color_view;
-#[cfg(test)]
-mod tests_disk_cache;
-#[cfg(test)]
-mod tests_effects;
-#[cfg(test)]
-mod tests_essential;
-#[cfg(test)]
-mod tests_essential_more;
-#[cfg(test)]
-mod tests_face;
-#[cfg(test)]
-mod tests_fidelity;
-#[cfg(test)]
-mod tests_frame_export;
-#[cfg(test)]
-mod tests_keylight;
-#[cfg(test)]
-mod tests_lottie;
-#[cfg(test)]
-mod tests_m137;
-#[cfg(test)]
-mod tests_m145;
-#[cfg(test)]
-mod tests_markers;
-#[cfg(test)]
-mod tests_mask_warp;
-#[cfg(test)]
-mod tests_menu_cmds;
-#[cfg(test)]
-mod tests_model3d;
-#[cfg(test)]
-mod tests_motion_blur_depth;
-#[cfg(test)]
-mod tests_project_items;
-#[cfg(test)]
-mod tests_proxy;
-#[cfg(test)]
-mod tests_rig3d;
-#[cfg(test)]
-mod tests_sequence;
-#[cfg(test)]
-mod tests_settings;
-#[cfg(test)]
-mod tests_stubs;
-#[cfg(test)]
-mod tests_styles;
-#[cfg(test)]
-mod tests_tail;
-#[cfg(test)]
-mod tests_text;
-#[cfg(test)]
-mod tests_text_edit;
-#[cfg(test)]
-mod tests_timeline;
-#[cfg(test)]
-mod tests_timeline_interchange;
-#[cfg(test)]
-mod tests_track;
-#[cfg(test)]
-mod tests_vector_import;
-#[cfg(test)]
-mod tests_viewer;
-
 /// Font families available to text layers (bundled + scanned system fonts).
 /// Text animation presets: (id, name), for menus.
 pub fn text_presets() -> Vec<(String, String)> {
@@ -1202,13 +1134,3 @@ pub fn font_menu(prefs: &prefs::Prefs) -> Vec<FontRow> {
     out.extend(all.iter().map(|f| row(f, false)));
     out
 }
-#[cfg(test)]
-mod tests_history;
-#[cfg(test)]
-mod tests_models;
-#[cfg(test)]
-mod tests_paint;
-#[cfg(test)]
-mod tests_panels;
-#[cfg(test)]
-mod tests_roto;

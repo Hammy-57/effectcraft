@@ -276,6 +276,9 @@ page!(Scripting {
     /// crash recovery stay as usual).
     agent_control: bool = false,
     agent_control_port: u32 = 9877,
+    /// Run the Figma bridge (127.0.0.1:7789) on every launch, so the EffectCraft Transfer
+    /// plug-in can send layers into the open project (paired once with an Allow prompt).
+    figma_bridge: bool = true,
 });
 
 /// One editable label: name and `#rrggbb` colour.
@@ -293,7 +296,7 @@ fn hex([r, g, b]: [u8; 3]) -> String {
     format!("#{r:02x}{g:02x}{b:02x}")
 }
 
-fn parse_hex(s: &str) -> Option<[u8; 3]> {
+pub(crate) fn parse_hex(s: &str) -> Option<[u8; 3]> {
     let h = s.trim().trim_start_matches('#');
     if h.len() != 6 {
         return None;
@@ -1183,6 +1186,7 @@ pub fn pages() -> Vec<Page> {
                 Section("Agents"),
                 s("scripting.agentControl", "Let Agents Control EffectCraft (localhost control channel)", B, true),
                 s("scripting.agentControlPort", "Control Channel Port", Kind::Int(1024, 65535, ""), true),
+                s("scripting.figmaBridge", "Let Figma Send Layers (EffectCraft Transfer plug-in, localhost:7789)", B, true),
                 Note("Expressions use the JavaScript engine. Script errors report their file and line in the Script Console; there is no step debugger."),
             ],
         },

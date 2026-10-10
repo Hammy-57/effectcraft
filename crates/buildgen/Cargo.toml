@@ -1,0 +1,11 @@
+[package]
+name = "effectcraft-buildgen"
+description = "Build-script helper: discovers a crate's module files and generates their `mod` declarations and registry tables, so adding a command or effect is adding a file"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true

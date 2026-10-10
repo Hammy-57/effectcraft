@@ -52,16 +52,16 @@ fn initialize_and_list_tools() {
     let tools = rpc(&mut s, 4, "tools/list", json!({}))["tools"].as_array().unwrap().clone();
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     for want in [
-        "list_commands",
-        "execute_command",
+        "command_list",
+        "command_run",
         "run_script",
-        "get_project",
+        "doc_inspect",
         "get_comp",
         "get_layer",
         "get_property",
         "set_property",
         "add_keyframe",
-        "render_frame",
+        "render_preview",
         "open_project",
         "save_project",
         "undo",
@@ -379,8 +379,29 @@ fn autosave_flushes_on_read_errors_and_broken_output() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-/// A fake desktop control channel: answers `engine.execute` from a real session, and canned
+/// A fake app's reply to one control request: `engine.execute` from a real session, and canned
 /// `render.frame` / `ui.screenshot` replies.
+fn fake_reply(session: &mut Session, method: &str, p: &Value) -> Value {
+    match method {
+        "engine.execute" => match session.execute(p["command"].as_str().unwrap(), p["params"].clone()) {
+            Ok(v) => json!({"ok": true, "result": v}),
+            Err(e) => json!({"ok": false, "error": e.to_string()}),
+        },
+        "render.frame" => {
+            let png = crate::encode_png(4, 2, vec![255; 32], 0).unwrap();
+            json!({"ok": true, "result": {"comp": 1, "time": 0.5, "width": 4, "height": 2, "png": base64::encode(&png)}})
+        }
+        "ui.screenshot" => {
+            let png = crate::encode_png(8, 8, vec![128; 256], 0).unwrap();
+            std::fs::write(p["path"].as_str().unwrap(), png).unwrap();
+            json!({"ok": true, "result": {"path": p["path"]}})
+        }
+        "ui.key" | "ui.click" => json!({"ok": true, "result": null}),
+        m => json!({"ok": false, "error": format!("unknown method `{m}`")}),
+    }
+}
+
+/// A fake desktop control channel over TCP (see [`fake_reply`]).
 fn fake_app() -> u16 {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
@@ -390,30 +411,57 @@ fn fake_app() -> u16 {
         let mut session = Session::default();
         for line in BufReader::new(stream).lines() {
             let msg: Value = serde_json::from_str(&line.unwrap()).unwrap();
-            let p = &msg["params"];
-            let reply = match msg["method"].as_str().unwrap() {
-                "engine.execute" => match session.execute(p["command"].as_str().unwrap(), p["params"].clone()) {
-                    Ok(v) => json!({"ok": true, "result": v}),
-                    Err(e) => json!({"ok": false, "error": e.to_string()}),
-                },
-                "render.frame" => {
-                    let png = crate::encode_png(4, 2, vec![255; 32], 0).unwrap();
-                    json!({"ok": true, "result": {"comp": 1, "time": 0.5, "width": 4, "height": 2, "png": base64::encode(&png)}})
-                }
-                "ui.screenshot" => {
-                    let png = crate::encode_png(8, 8, vec![128; 256], 0).unwrap();
-                    std::fs::write(p["path"].as_str().unwrap(), png).unwrap();
-                    json!({"ok": true, "result": {"path": p["path"]}})
-                }
-                "ui.key" => json!({"ok": true, "result": null}),
-                m => json!({"ok": false, "error": format!("unknown method `{m}`")}),
-            };
-            let mut reply = reply;
+            let mut reply = fake_reply(&mut session, msg["method"].as_str().unwrap(), &msg["params"]);
             reply["id"] = msg["id"].clone();
             writeln!(out, "{reply}").unwrap();
         }
     });
     port
+}
+
+/// An in-process control transport (as `mcp --ui`'s offscreen UI), recording the methods called.
+struct FakeTransport {
+    session: Session,
+    calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl crate::ControlTransport for FakeTransport {
+    fn call(&mut self, method: &str, params: Value) -> crate::Result<Value> {
+        self.calls.lock().unwrap().push(method.to_string());
+        crate::bridge::reply_result(fake_reply(&mut self.session, method, &params))
+    }
+    fn mode(&self) -> &'static str {
+        "headless-ui"
+    }
+}
+
+#[test]
+fn ui_tools_run_through_any_control_transport() {
+    let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut s = McpServer::new(Backend::transport(FakeTransport { session: Session::default(), calls: calls.clone() }));
+    let r = rpc(&mut s, 1, "initialize", json!({}));
+    assert!(r["serverInfo"]["title"].as_str().unwrap().contains("headless-ui"), "{r}");
+    let names: Vec<String> =
+        rpc(&mut s, 2, "tools/list", json!({}))["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
+    for want in ["screenshot", "ui_click", "ui_elements", "control", "command_run"] {
+        assert!(names.iter().any(|n| n == want), "{want} listed");
+    }
+    // Engine commands, inspection and renders go through the transport too.
+    call_json(&mut s, "execute_command", json!({"command": "comp.new", "params": {"name": "T", "width": 64, "height": 64}}));
+    assert_eq!(call_json(&mut s, "get_comp", json!({}))["name"], "T");
+    let (c, err) = call(&mut s, "render_frame", json!({}));
+    assert!(!err, "{c:?}");
+    assert_eq!(png_size(&base64::decode(c[0]["data"].as_str().unwrap()).unwrap()), Some((4, 2)));
+    let (c, err) = call(&mut s, "screenshot", json!({"panel": "Timeline", "max_side": 4}));
+    assert!(!err, "{c:?}");
+    assert_eq!(png_size(&base64::decode(c[0]["data"].as_str().unwrap()).unwrap()), Some((4, 4)));
+    assert!(!call(&mut s, "ui_click", json!({"id": "tools.Selection"})).1);
+    let (c, err) = call(&mut s, "control", json!({"method": "ui.nope"}));
+    assert!(err && c[0]["text"].as_str().unwrap().contains("unknown method"));
+    let calls = calls.lock().unwrap().clone();
+    for want in ["engine.execute", "render.frame", "ui.screenshot", "ui.click", "ui.nope"] {
+        assert!(calls.iter().any(|c| c == want), "{want} in {calls:?}");
+    }
 }
 
 #[test]
@@ -523,19 +571,18 @@ fn puppet_rigging_over_mcp() {
 }
 
 /// The agent-interface audit (MCP side): every registered engine command is listed by
-/// `list_commands` with a label, params doc and JSON Schema, described by `describe_command`,
-/// and routed by `execute_command` (an unknown parameter is rejected by that very command
+/// `command_list` with a label, params doc and JSON Schema, described by `describe_command`,
+/// and routed by `command_run` (an unknown parameter is rejected by that very command
 /// without running it).
 #[test]
 fn every_engine_command_is_reachable_over_mcp() {
     let mut s = server();
     let tools = rpc(&mut s, 1, "tools/list", json!({}))["tools"].as_array().unwrap().clone();
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-    for want in ["list_commands", "describe_command", "execute_command", "add_effect", "list_effects", "get_state", "render_frame", "get_layer", "set_property"]
-    {
+    for want in ["command_list", "describe_command", "command_run", "add_effect", "list_effects", "get_state", "render_preview", "get_layer", "set_property"] {
         assert!(names.contains(&want), "{want}");
     }
-    let listed = call_json(&mut s, "list_commands", json!({"schemas": true}));
+    let listed = call_json(&mut s, "command_list", json!({"schemas": true}));
     let listed: std::collections::HashMap<&str, &Value> = listed.as_array().unwrap().iter().map(|c| (c["id"].as_str().unwrap(), c)).collect();
     let specs = effectcraft_engine::command_specs();
     assert_eq!(listed.len(), specs.len());
@@ -547,7 +594,7 @@ fn every_engine_command_is_reachable_over_mcp() {
         assert!(c["schema"]["properties"].is_object(), "{}", spec.id);
         let d = call_json(&mut s, "describe_command", json!({"command": spec.id}));
         assert_eq!(d["schema"], c["schema"], "{}", spec.id);
-        let (content, err) = call(&mut s, "execute_command", json!({"command": spec.id, "params": {"__audit": 1}}));
+        let (content, err) = call(&mut s, "command_run", json!({"id": spec.id, "params": {"__audit": 1}}));
         let text = content[0]["text"].as_str().unwrap_or_default();
         assert!(err && text.contains("unknown parameter") && text.contains(spec.id), "{}: {text}", spec.id);
     }
@@ -647,7 +694,8 @@ fn agents_doc_tools_table_is_current() {
     let mut missing = vec![];
     for t in crate::tools::catalogue() {
         // `name` (no arguments) or `name {a, b?, …}`.
-        let Some(at) = table.find(&format!("`{}", t.name)).filter(|i| {
+        // (the first match may be a longer name: `render_frame` in `render_frames`)
+        let Some(at) = table.match_indices(&format!("`{}", t.name)).map(|(i, _)| i).find(|i| {
             let rest = &table[i + 1 + t.name.len()..];
             rest.starts_with('`') || rest.starts_with(" {")
         }) else {
@@ -1062,4 +1110,852 @@ fn command_tools_accept_id_as_an_alias() {
     call_json(&mut s, "execute_command", json!({"id": "comp.new", "params": {"name": "Alias", "width": 64, "height": 36}}));
     let (_, err) = call(&mut s, "execute_command", json!({}));
     assert!(err, "neither key is an error");
+}
+
+/// A headless server with a 320×180 comp, a red 100×100 solid at the centre ("Red") keyed to
+/// move, and a green 40×40 solid at (40, 40) ("Green").
+fn render_server() -> McpServer {
+    let mut s = server();
+    call_json(
+        &mut s,
+        "execute_command",
+        json!({"command": "comp.new", "params": {"name": "Main", "width": 320, "height": 180, "duration": 4, "frameRate": 30}}),
+    );
+    call_json(&mut s, "execute_command", json!({"command": "layer.newSolid", "params": {"color": "#ff0000", "width": 100, "height": 100, "name": "Red"}}));
+    call_json(&mut s, "execute_command", json!({"command": "layer.newSolid", "params": {"color": "#00ff00", "width": 40, "height": 40, "name": "Green"}}));
+    call_json(&mut s, "set_property", json!({"layer": "Green", "path": "transform/position", "value": [40, 40]}));
+    call_json(
+        &mut s,
+        "add_keyframe",
+        json!({"layer": "Red", "path": "transform/position", "keys": [{"time": 0, "value": [60, 90]}, {"time": 3, "value": [260, 90]}]}),
+    );
+    s
+}
+
+/// (png size, info) of an image reply; panics if the tool failed.
+fn call_image(s: &mut McpServer, name: &str, args: Value) -> ((u32, u32), Value) {
+    let (c, err) = call(s, name, args.clone());
+    assert!(!err, "{name} {args}: {c:?}");
+    assert_eq!(c[0]["type"], "image");
+    let png = base64::decode(c[0]["data"].as_str().unwrap()).unwrap();
+    (png_size(&png).unwrap(), serde_json::from_str(c[1]["text"].as_str().unwrap()).unwrap())
+}
+
+fn tool_error(s: &mut McpServer, name: &str, args: Value) -> String {
+    let (c, err) = call(s, name, args.clone());
+    assert!(err, "{name} {args} should fail: {c:?}");
+    c[0]["text"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn render_frame_region_solo_item_and_overlays() {
+    let mut s = render_server();
+    // Region at full resolution; max_side applies to the crop.
+    let (size, info) = call_image(&mut s, "render_frame", json!({"region": [100, 60, 80, 40], "max_side": 0}));
+    assert_eq!(size, (80, 40));
+    assert_eq!(info["region"], json!([100.0, 60.0, 80.0, 40.0]));
+    let (size, _) = call_image(&mut s, "render_preview", json!({"region": [0, 0, 160, 90], "max_side": 40}));
+    assert_eq!(size, (40, 23));
+    // Solo layer and a solid item on its own.
+    let (_, info) = call_image(&mut s, "render_frame", json!({"layer": "Green", "max_side": 64}));
+    assert!(info["layer"].is_u64());
+    let proj = call_json(&mut s, "get_project", json!({}));
+    let solid = proj["items"].as_array().unwrap().iter().find(|i| i["name"].as_str().is_some_and(|n| n.contains("Red"))).unwrap()["id"].clone();
+    let (size, info) = call_image(&mut s, "render_frame", json!({"item": solid, "max_side": 0}));
+    assert_eq!(size, (100, 100));
+    assert_eq!(info["item"], solid);
+    // Overlays report each drawn layer's comp-space bounds.
+    let (_, info) = call_image(&mut s, "render_frame", json!({"time": 1.5, "overlays": true, "max_side": 320}));
+    let red = info["layers"].as_array().unwrap().iter().find(|l| l["name"] == "Red").unwrap().clone();
+    assert_eq!(red["bounds"], json!([110.0, 40.0, 100.0, 100.0]));
+    let (_, info) = call_image(&mut s, "render_preview", json!({"overlays": ["motionPath", "safeMargins", "grid"]}));
+    assert_eq!(info["overlays"], json!(["motionPath", "safeMargins", "grid"]));
+    // Bad input is an error, never a crash; the session keeps serving.
+    assert!(tool_error(&mut s, "render_frame", json!({"region": [500, 500, 10, 10]})).contains("outside"));
+    assert!(tool_error(&mut s, "render_frame", json!({"region": [0, 0, 0, 10]})).contains("positive"));
+    assert!(tool_error(&mut s, "render_frame", json!({"region": [0, 0]})).contains("region"));
+    assert!(tool_error(&mut s, "render_frame", json!({"layer": "Nope"})).contains("no layer"));
+    assert!(tool_error(&mut s, "render_frame", json!({"item": 9999})).contains("no project item"));
+    assert!(tool_error(&mut s, "render_frame", json!({"overlays": ["sparkles"]})).contains("unknown overlay"));
+    assert!(tool_error(&mut s, "render_frame", json!({"max_side": -5})).contains("max_side"));
+    let (size, _) = call_image(&mut s, "render_frame", json!({"max_side": u64::MAX}));
+    assert_eq!(size, (320, 180), "a huge max_side is clamped to the comp size");
+}
+
+#[test]
+fn render_frames_contact_sheet() {
+    let mut s = render_server();
+    let (size, info) = call_image(&mut s, "render_frames", json!({"count": 4, "max_side": 800}));
+    assert_eq!(info["frames"], json!([0, 40, 79, 119]));
+    assert_eq!(size, (info["width"].as_u64().unwrap() as u32, info["height"].as_u64().unwrap() as u32));
+    assert!(size.0 <= 800 && size.1 <= 800);
+    assert!(info.get("png").is_none(), "the PNG travels as the image, not in the JSON");
+    let (_, info) = call_image(&mut s, "render_frames", json!({"times": [0, 1, 2], "layer": "Red", "overlays": ["motionPath"], "cols": 3, "labels": false}));
+    assert_eq!((info["cols"].as_u64(), info["rows"].as_u64()), (Some(3), Some(1)));
+    // Huge counts are capped, not trusted.
+    let (_, info) = call_image(&mut s, "render_frames", json!({"count": 1_000_000_000u64, "max_side": 256}));
+    assert_eq!(info["count"], 64);
+    assert_eq!(info["requested"], 1_000_000_000u64);
+    assert!(tool_error(&mut s, "render_frames", json!({"count": 0})).contains("at least 1"));
+    assert!(tool_error(&mut s, "render_frames", json!({"times": []})).contains("empty"));
+    assert!(tool_error(&mut s, "render_frames", json!({"start": 3, "end": 1})).contains("before"));
+    assert!(tool_error(&mut s, "render_frames", json!({"region": [400, 0, 10, 10]})).contains("outside"));
+    // Files: the sheet and an animated GIF.
+    let dir = std::env::temp_dir().join(format!("ec-mcp-frames-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (png, gif) = (dir.join("sheet.png"), dir.join("anim.gif"));
+    let info =
+        call_json(&mut s, "render_frames", json!({"count": 3, "max_side": 300, "path": png.to_string_lossy(), "gif": gif.to_string_lossy(), "inline": false}));
+    assert_eq!(info["gif"], json!(gif.to_string_lossy()));
+    assert!(std::fs::read(&png).unwrap().starts_with(b"\x89PNG"));
+    assert!(std::fs::read(&gif).unwrap().starts_with(b"GIF89a"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn bridge_render_frames_and_render_params() {
+    let port = fake_app();
+    let mut s = McpServer::new(Backend::bridge(&port.to_string()).unwrap());
+    call_json(&mut s, "execute_command", json!({"command": "comp.new", "params": {"name": "B", "width": 64, "height": 32}}));
+    // The contact sheet runs the engine command in the app.
+    let (size, info) = call_image(&mut s, "render_frames", json!({"count": 2, "max_side": 200}));
+    assert_eq!(info["count"], 2);
+    assert_eq!(size.0 as u64, info["width"].as_u64().unwrap());
+    // render_frame forwards the new arguments to the app's render.frame (the fake answers a 4×2 PNG).
+    let (size, _) = call_image(&mut s, "render_frame", json!({"region": [0, 0, 8, 8], "overlays": true}));
+    assert_eq!(size, (4, 2));
+}
+
+/// `get_layout`: comp-space geometry of layers, headless and bridged.
+#[test]
+fn get_layout_reports_layer_geometry() {
+    for bridge in [false, true] {
+        let mut s = if bridge { McpServer::new(Backend::bridge(&fake_app().to_string()).unwrap()) } else { server() };
+        call_json(&mut s, "command_run", json!({"id": "comp.new", "params": {"width": 400, "height": 300}}));
+        let l = call_json(&mut s, "command_run", json!({"id": "layer.newSolid", "params": {"width": 100, "height": 50}}))["layer"].clone();
+        call_json(&mut s, "set_property", json!({"layer": l, "path": "transform/position", "value": [0, 150]}));
+        let r = call_json(&mut s, "get_layout", json!({"layers": [l], "overlaps": true}));
+        let g = &r["layers"][0];
+        assert_eq!(g["bounds"], json!([-50.0, 125.0, 100.0, 50.0]), "{r}");
+        assert_eq!(g["onScreen"], 0.5);
+        assert_eq!(g["visible"], true);
+        assert_eq!(r["overlaps"], json!([]));
+        // A single layer reference works too; bad references are tool errors.
+        assert_eq!(call_json(&mut s, "get_layout", json!({"layers": "#1"}))["layers"].as_array().unwrap().len(), 1);
+        let (c, err) = call(&mut s, "get_layout", json!({"layers": ["Nope"]}));
+        assert!(err && c[0]["text"].as_str().unwrap().contains("no layer"), "{c:?}");
+    }
+}
+
+/// `analyze_audio`: levels of a Tone, a waveform image, no-audio comps.
+#[test]
+fn analyze_audio_levels_and_waveform() {
+    let mut s = server();
+    call_json(&mut s, "command_run", json!({"id": "comp.new", "params": {"width": 64, "height": 36, "duration": 1}}));
+    let r = call_json(&mut s, "analyze_audio", json!({}));
+    assert_eq!(r["hasAudio"], false, "{r}");
+    let l = call_json(&mut s, "command_run", json!({"id": "layer.newSolid", "params": {}}))["layer"].clone();
+    let values = json!({"frequency1": 1000, "frequency2": 0, "frequency3": 0, "frequency4": 0, "frequency5": 0, "level": 25});
+    call_json(&mut s, "add_effect", json!({"layer": l, "effect": "Tone", "values": values}));
+    let r = call_json(&mut s, "analyze_audio", json!({}));
+    assert!((r["peakDbfs"].as_f64().unwrap() + 12.04).abs() < 0.05, "{r}");
+    assert!((r["integratedLufs"].as_f64().unwrap() + 12.04).abs() < 0.2, "{r}");
+    let (c, err) = call(&mut s, "analyze_audio", json!({"waveform": true, "width": 120, "height": 50}));
+    assert!(!err, "{c:?}");
+    assert_eq!(png_size(&base64::decode(c[0]["data"].as_str().unwrap()).unwrap()), Some((120, 50)));
+    let info: Value = serde_json::from_str(c[1]["text"].as_str().unwrap()).unwrap();
+    assert!(info["waveform"].get("columns").is_none(), "columns become the image");
+    let (_, err) = call(&mut s, "analyze_audio", json!({"start": 0.5, "end": 0.5}));
+    assert!(err);
+}
+
+/// Send a request that must fail; returns the JSON-RPC error code.
+fn rpc_err(s: &mut McpServer, method: &str, params: Value) -> i64 {
+    let line = json!({"jsonrpc": "2.0", "id": 7, "method": method, "params": params}).to_string();
+    let reply: Value = serde_json::from_str(&s.handle_line(&line).expect("reply")).unwrap();
+    assert!(reply.get("result").is_none(), "{method} {params}: {reply}");
+    reply["error"]["code"].as_i64().unwrap()
+}
+
+/// Resource templates: comp, layer, frame (a PNG blob) and command; names are percent-decoded,
+/// and unknown or malformed URIs are errors, never panics.
+#[test]
+fn resource_templates_read_and_reject_bad_uris() {
+    use crate::resources::encode;
+    let mut s = server();
+    rpc(&mut s, 1, "initialize", json!({"protocolVersion": "2025-06-18"}));
+    let t = rpc(&mut s, 2, "resources/templates/list", json!({}));
+    let uris: Vec<&str> = t["resourceTemplates"].as_array().unwrap().iter().map(|t| t["uriTemplate"].as_str().unwrap()).collect();
+    assert_eq!(uris, ["effectcraft://comp/{comp}", "effectcraft://layer/{comp}/{layer}", "effectcraft://frame/{comp}/{time}", "effectcraft://command/{id}"]);
+    assert!(t["resourceTemplates"][0]["title"].is_string());
+
+    call_json(&mut s, "command_run", json!({"id": "comp.new", "params": {"name": "Main / Ünïcode", "width": 64, "height": 32, "duration": 2}}));
+    call_json(&mut s, "command_run", json!({"id": "layer.newSolid", "params": {"name": "Red bar", "color": "#ff0000"}}));
+    let comp = format!("effectcraft://comp/{}", encode("Main / Ünïcode"));
+    assert!(comp.contains("%2F"), "{comp}");
+    let read = |s: &mut McpServer, uri: &str| -> Value {
+        let r = rpc(s, 3, "resources/read", json!({"uri": uri}));
+        assert_eq!(r["contents"][0]["uri"], uri);
+        r["contents"][0].clone()
+    };
+    let json_of = |c: &Value| -> Value { serde_json::from_str(c["text"].as_str().unwrap()).unwrap() };
+    let c = read(&mut s, &comp);
+    assert_eq!(c["mimeType"], "application/json");
+    assert_eq!(json_of(&c), call_json(&mut s, "get_comp", json!({"comp": "Main / Ünïcode"})));
+    let id = json_of(&c)["id"].as_u64().unwrap();
+    assert_eq!(json_of(&read(&mut s, &format!("effectcraft://comp/{id}")))["id"], id, "numeric segment = item id");
+
+    let tree = json_of(&read(&mut s, &format!("{}/{}", comp.replace("/comp/", "/layer/"), encode("Red bar"))));
+    assert_eq!(tree["name"], "Red bar");
+    assert!(tree["properties"].is_object());
+    let flat = json_of(&read(&mut s, &format!("effectcraft://layer/{id}/%231?flat=true")));
+    assert!(flat["properties"].as_array().unwrap().iter().any(|p| p["path"] == "transform/opacity"), "{flat}");
+
+    let frame = read(&mut s, &format!("effectcraft://frame/{id}/0.5"));
+    assert_eq!(frame["mimeType"], "image/png");
+    assert!(frame.get("text").is_none());
+    assert_eq!(png_size(&base64::decode(frame["blob"].as_str().unwrap()).unwrap()), Some((64, 32)));
+    let small = read(&mut s, &format!("effectcraft://frame/{id}/0?max_side=16"));
+    assert_eq!(png_size(&base64::decode(small["blob"].as_str().unwrap()).unwrap()), Some((16, 8)));
+
+    let cmd = json_of(&read(&mut s, "effectcraft://command/layer.newText"));
+    assert_eq!(cmd["id"], "layer.newText");
+
+    for (uri, code) in [
+        ("effectcraft://nope/1", -32002),
+        ("https://example.com/", -32002),
+        ("effectcraft://comp/No%20such%20comp", -32002),
+        ("effectcraft://command/no.such", -32002),
+        (&format!("effectcraft://layer/{id}/Nobody") as &str, -32002),
+        ("effectcraft://comp/", -32602),
+        ("effectcraft://comp/a/b", -32602),
+        ("effectcraft://comp/%zz", -32602),
+        ("effectcraft://comp/%E2%28", -32602),
+        ("effectcraft://comp/%", -32602),
+        ("effectcraft://layer/1", -32602),
+        (&format!("effectcraft://frame/{id}/soon") as &str, -32602),
+        (&format!("effectcraft://frame/{id}/NaN") as &str, -32602),
+        (&format!("effectcraft://frame/{id}/1?max_side=-3") as &str, -32602),
+        (&format!("effectcraft://frame/{id}/1?bogus=1") as &str, -32602),
+        (&format!("effectcraft://layer/{id}/%231?flat=maybe") as &str, -32602),
+    ] {
+        assert_eq!(rpc_err(&mut s, "resources/read", json!({"uri": uri})), code, "{uri}");
+    }
+    assert_eq!(rpc_err(&mut s, "resources/read", json!({})), -32602);
+    assert_eq!(rpc(&mut s, 4, "ping", json!({})), json!({}));
+}
+
+/// Workflow prompts: listed with their arguments, rendered with the tool flow, and argument
+/// mistakes are invalid params.
+#[test]
+fn prompts_list_and_get() {
+    let mut s = server();
+    let init = rpc(&mut s, 1, "initialize", json!({"protocolVersion": "2025-06-18"}));
+    assert!(init["capabilities"]["prompts"].is_object());
+    let list = rpc(&mut s, 2, "prompts/list", json!({}));
+    let prompts = list["prompts"].as_array().unwrap();
+    let names: Vec<&str> = prompts.iter().map(|p| p["name"].as_str().unwrap()).collect();
+    for want in ["title_card", "lower_third", "port_ae_script", "check_against_reference", "animate_layer"] {
+        assert!(names.contains(&want), "missing {want}");
+    }
+    for p in prompts {
+        assert!(p["title"].is_string() && p["description"].is_string(), "{p}");
+        assert!(p["arguments"].as_array().unwrap().iter().any(|a| a["required"] == true), "{p}");
+    }
+    let r = rpc(&mut s, 3, "prompts/get", json!({"name": "title_card", "arguments": {"text": "Hello World"}}));
+    assert_eq!(r["messages"][0]["role"], "user");
+    let text = r["messages"][0]["content"]["text"].as_str().unwrap();
+    for needle in ["Hello World", "command_run comp.new", "layer.newText", "add_keyframe", "render_preview", "layer time"] {
+        assert!(text.contains(needle), "{needle}: {text}");
+    }
+    let r = rpc(&mut s, 4, "prompts/get", json!({"name": "check_against_reference", "arguments": {"reference_path": "/tmp/ref.png", "time": "1.5"}}));
+    let text = r["messages"][0]["content"]["text"].as_str().unwrap();
+    assert!(text.contains("render_compare") && text.contains("/tmp/ref.png") && text.contains("1.5 s"), "{text}");
+    let r = rpc(&mut s, 5, "prompts/get", json!({"name": "port_ae_script", "arguments": {"script": "app.project.items.addComp('X', 10, 10, 1, 1, 24);"}}));
+    assert!(r["messages"][0]["content"]["text"].as_str().unwrap().contains("run_script"));
+    for params in [
+        json!({"name": "lower_third", "arguments": {"name": "Ada"}}),
+        json!({"name": "lower_third", "arguments": {"name": "Ada", "title": "   "}}),
+        json!({"name": "title_card"}),
+        json!({"name": "title_card", "arguments": {"text": "x", "colour": "red"}}),
+        json!({"name": "title_card", "arguments": {"text": 5}}),
+        json!({"name": "title_card", "arguments": "text"}),
+        json!({"name": "no_such_prompt"}),
+        json!({}),
+    ] {
+        assert_eq!(rpc_err(&mut s, "prompts/get", params.clone()), -32602, "{params}");
+    }
+    // Older revisions don't get `title`.
+    let mut s = server();
+    rpc(&mut s, 1, "initialize", json!({"protocolVersion": "2025-03-26"}));
+    assert!(rpc(&mut s, 2, "prompts/list", json!({}))["prompts"][0].get("title").is_none());
+}
+
+/// The older duplicate tool names are left out of tools/list (unless `with_all_tools`), stay
+/// callable with their own arguments, and the canonical tools take everything they did.
+#[test]
+fn hidden_aliases_are_callable_but_not_listed() {
+    let names = |s: &mut McpServer| -> Vec<String> {
+        rpc(s, 1, "tools/list", json!({}))["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect()
+    };
+    let mut s = server();
+    let listed = names(&mut s);
+    for (alias, canonical) in crate::tools::HIDDEN_ALIASES {
+        assert!(!listed.iter().any(|n| n == alias), "{alias} is listed");
+        assert!(listed.iter().any(|n| n == canonical), "{canonical} is missing");
+        // The canonical tool accepts every argument of the alias (except execute_command's `command`).
+        let schema = |n: &str| crate::tools::find(n).unwrap().input_schema();
+        let (a, c) = (schema(alias), schema(canonical));
+        for k in a["properties"].as_object().unwrap().keys().filter(|k| *k != "command") {
+            assert!(c["properties"].get(k).is_some(), "{canonical} lacks `{k}` of {alias}");
+        }
+    }
+    call_json(&mut s, "execute_command", json!({"command": "comp.new", "params": {"name": "Alias", "width": 32, "height": 16}}));
+    assert!(call_json(&mut s, "list_commands", json!({"filter": "comp.new"})).as_array().unwrap().iter().any(|c| c["id"] == "comp.new"));
+    assert_eq!(call_json(&mut s, "get_project", json!({}))["items"], call_json(&mut s, "doc_inspect", json!({}))["project"]["items"]);
+    let (c, err) = call(&mut s, "render_frame", json!({"max_side": 16}));
+    assert!(!err && c[0]["type"] == "image", "{c:?}");
+    // render_preview took over render_frame's `path` and `inline`.
+    let png = std::env::temp_dir().join(format!("ec-alias-{}.png", std::process::id()));
+    let info = call_json(&mut s, "render_preview", json!({"max_side": 16, "inline": false, "path": png.to_string_lossy()}));
+    assert_eq!((info["width"].as_u64(), info["height"].as_u64()), (Some(16), Some(8)));
+    assert_eq!(png_size(&std::fs::read(&png).unwrap()), Some((16, 8)));
+    let _ = std::fs::remove_file(png);
+
+    let mut s = server().with_all_tools(true);
+    let tools = rpc(&mut s, 1, "tools/list", json!({}))["tools"].as_array().unwrap().clone();
+    for (alias, canonical) in crate::tools::HIDDEN_ALIASES {
+        let t = tools.iter().find(|t| t["name"] == *alias).unwrap_or_else(|| panic!("{alias} not listed with --all-tools"));
+        assert!(t["description"].as_str().unwrap().starts_with(&format!("Alias of {canonical}")), "{t}");
+    }
+    // The server's instructions name only canonical tools.
+    let init = rpc(&mut s, 2, "initialize", json!({"protocolVersion": "2025-06-18"}));
+    let text = init["instructions"].as_str().unwrap();
+    for (alias, _) in crate::tools::HIDDEN_ALIASES {
+        assert!(!text.contains(alias), "instructions mention {alias}");
+    }
+}
+
+/// The `uri`s of queued `notifications/resources/updated`.
+fn updated(s: &mut McpServer) -> Vec<String> {
+    s.take_notifications()
+        .iter()
+        .filter(|n| n["method"] == "notifications/resources/updated")
+        .map(|n| n["params"]["uri"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// Subscribed project resources are reported updated after an edit (and undo), never after a
+/// query; command resources don't follow the project; `serve` writes them after the reply.
+#[test]
+fn subscriptions_notify_after_edits_not_queries() {
+    let mut s = server();
+    let init = rpc(&mut s, 1, "initialize", json!({"protocolVersion": "2025-06-18"}));
+    assert_eq!(init["capabilities"]["resources"]["subscribe"], true);
+    assert!(init["capabilities"]["logging"].is_object());
+    call_json(&mut s, "command_run", json!({"id": "comp.new", "params": {"name": "Sub", "width": 32, "height": 32}}));
+    s.take_notifications();
+    for uri in ["effectcraft://document", "effectcraft://comp/Sub", "effectcraft://commands", "effectcraft://command/comp.new"] {
+        assert_eq!(rpc(&mut s, 2, "resources/subscribe", json!({"uri": uri})), json!({}));
+    }
+    assert_eq!(rpc_err(&mut s, "resources/subscribe", json!({"uri": "effectcraft://nope"})), -32002);
+    assert_eq!(rpc_err(&mut s, "resources/subscribe", json!({"uri": "effectcraft://comp/%zz"})), -32602);
+    assert_eq!(rpc_err(&mut s, "resources/subscribe", json!({})), -32602);
+
+    call_json(&mut s, "get_comp", json!({"comp": "Sub"}));
+    call_json(&mut s, "doc_inspect", json!({}));
+    rpc(&mut s, 3, "resources/read", json!({"uri": "effectcraft://document"}));
+    assert!(updated(&mut s).is_empty(), "queries change nothing");
+
+    call_json(&mut s, "command_run", json!({"id": "layer.newNull"}));
+    assert_eq!(updated(&mut s), ["effectcraft://comp/Sub", "effectcraft://document"]);
+    call_json(&mut s, "undo", json!({}));
+    assert_eq!(updated(&mut s).len(), 2, "undo changes the project too");
+    // A value set to what it already is isn't an edit.
+    call_json(&mut s, "command_run", json!({"id": "comp.settings", "params": {"comp": "Sub", "width": 32}}));
+    assert!(updated(&mut s).is_empty());
+
+    rpc(&mut s, 4, "resources/unsubscribe", json!({"uri": "effectcraft://document"}));
+    rpc(&mut s, 5, "resources/unsubscribe", json!({"uri": "effectcraft://comp/Sub"}));
+    rpc(&mut s, 6, "resources/unsubscribe", json!({"uri": "effectcraft://never-subscribed"}));
+    call_json(&mut s, "command_run", json!({"id": "layer.newNull"}));
+    assert!(updated(&mut s).is_empty());
+
+    // Over stdio the notification follows the reply.
+    let mut s = server();
+    let input = [
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}}),
+        json!({"jsonrpc": "2.0", "id": 2, "method": "resources/subscribe", "params": {"uri": "effectcraft://document"}}),
+        json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "command_run", "arguments": {"id": "comp.new"}}}),
+        json!({"jsonrpc": "2.0", "id": 4, "method": "ping"}),
+    ]
+    .iter()
+    .map(|v| v.to_string() + "\n")
+    .collect::<String>();
+    let mut out = Vec::new();
+    s.serve(input.as_bytes(), &mut out).unwrap();
+    let lines: Vec<Value> = String::from_utf8(out).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(lines.len(), 5, "{lines:?}");
+    assert_eq!(lines[2]["id"], 3);
+    assert_eq!(lines[3], json!({"jsonrpc": "2.0", "method": "notifications/resources/updated", "params": {"uri": "effectcraft://document"}}));
+    assert_eq!(lines[4]["id"], 4);
+}
+
+/// `notifications/message`: new expression errors after an edit and missing footage after
+/// open_project are warnings, toasts are info; `logging/setLevel` filters them.
+#[test]
+fn logging_levels_filter_warnings() {
+    let messages = |s: &mut McpServer| -> Vec<Value> {
+        s.take_notifications().into_iter().filter(|n| n["method"] == "notifications/message").map(|n| n["params"].clone()).collect()
+    };
+    let mut s = McpServer::new(Backend::headless(effectcraft_host::session()));
+    rpc(&mut s, 1, "initialize", json!({"protocolVersion": "2025-03-26"}));
+    call_json(&mut s, "command_run", json!({"id": "comp.new", "params": {"name": "L", "width": 64, "height": 64}}));
+    call_json(&mut s, "command_run", json!({"id": "layer.newSolid", "params": {"name": "S", "color": "#ff0000"}}));
+    assert!(messages(&mut s).is_empty());
+    assert_eq!(rpc_err(&mut s, "logging/setLevel", json!({"level": "loud"})), -32602);
+    assert_eq!(rpc_err(&mut s, "logging/setLevel", json!({})), -32602);
+
+    assert_eq!(rpc(&mut s, 2, "logging/setLevel", json!({"level": "error"})), json!({}));
+    call_json(&mut s, "set_property", json!({"layer": "S", "path": "transform/rotation", "expression": "nope*2"}));
+    assert!(messages(&mut s).is_empty(), "warnings are below `error`");
+
+    rpc(&mut s, 3, "logging/setLevel", json!({"level": "warning"}));
+    call_json(&mut s, "set_property", json!({"layer": "S", "path": "transform/opacity", "value": 50}));
+    let m = messages(&mut s);
+    assert_eq!(m.len(), 1, "{m:?}");
+    assert_eq!((&m[0]["level"], &m[0]["logger"]), (&json!("warning"), &json!("effectcraft")));
+    assert!(m[0]["data"]["errors"][0].as_str().unwrap().contains("nope"), "{m:?}");
+    call_json(&mut s, "set_property", json!({"layer": "S", "path": "transform/opacity", "value": 40}));
+    assert!(messages(&mut s).is_empty(), "the same error isn't repeated");
+    call_json(&mut s, "get_property", json!({"layer": "S", "path": "transform/opacity"}));
+    assert!(messages(&mut s).is_empty(), "queries log nothing");
+
+    // Missing footage after open_project.
+    let session = s.backend().session().unwrap();
+    let footage = effectcraft_engine::project::Footage { path: "/nonexistent/ec/gone.png".into(), width: 8, height: 8, has_video: true, ..Default::default() };
+    std::sync::Arc::make_mut(&mut session.project).add_item(
+        "gone",
+        effectcraft_engine::color::Label::None,
+        None,
+        effectcraft_engine::project::ItemKind::Footage(footage),
+    );
+    let path = std::env::temp_dir().join(format!("ec-mcp-log-{}.ecproj", std::process::id())).to_string_lossy().into_owned();
+    call_json(&mut s, "save_project", json!({"path": path}));
+    call_json(&mut s, "open_project", json!({"path": path}));
+    let m = messages(&mut s);
+    assert!(m.iter().any(|m| m["level"] == "warning" && m["data"]["missing"] == 1), "{m:?}");
+    // Toasts are info.
+    rpc(&mut s, 4, "logging/setLevel", json!({"level": "info"}));
+    call_json(&mut s, "command_run", json!({"id": "footage.check", "params": {"wait": true}}));
+    let m = messages(&mut s);
+    assert!(m.iter().any(|m| m["level"] == "info" && m["data"]["message"].as_str().unwrap().contains("missing")), "{m:?}");
+    rpc(&mut s, 5, "logging/setLevel", json!({"level": "emergency"}));
+    call_json(&mut s, "open_project", json!({"path": path}));
+    assert!(messages(&mut s).is_empty());
+    let _ = std::fs::remove_file(path);
+}
+
+/// A minimal JSON Schema check (type, required, properties, items): enough for outputSchema.
+fn validate(schema: &Value, v: &Value, at: &str) -> Result<(), String> {
+    if let Some(t) = schema.get("type") {
+        let types: Vec<&str> = match t {
+            Value::String(s) => vec![s.as_str()],
+            Value::Array(a) => a.iter().filter_map(Value::as_str).collect(),
+            _ => vec![],
+        };
+        let ok = types.iter().any(|t| match *t {
+            "object" => v.is_object(),
+            "array" => v.is_array(),
+            "string" => v.is_string(),
+            "integer" => v.is_i64() || v.is_u64(),
+            "number" => v.is_number(),
+            "boolean" => v.is_boolean(),
+            "null" => v.is_null(),
+            _ => false,
+        });
+        if !ok {
+            return Err(format!("{at}: {v} is not {t}"));
+        }
+    }
+    for r in schema.get("required").and_then(Value::as_array).into_iter().flatten() {
+        if v.get(r.as_str().unwrap()).is_none() {
+            return Err(format!("{at}: missing `{r}` in {v}"));
+        }
+    }
+    if let (Some(props), Some(o)) = (schema.get("properties").and_then(Value::as_object), v.as_object()) {
+        for (k, s) in props {
+            if let Some(x) = o.get(k) {
+                validate(s, x, &format!("{at}.{k}"))?;
+            }
+        }
+    }
+    if let (Some(items), Some(a)) = (schema.get("items"), v.as_array()) {
+        for (i, x) in a.iter().enumerate() {
+            validate(items, x, &format!("{at}[{i}]"))?;
+        }
+    }
+    Ok(())
+}
+
+/// MCP 2025-06-18: JSON results also come as `structuredContent` (always an object) and the
+/// stable ones declare an `outputSchema` it validates against; older revisions get neither, and
+/// keep the text content either way.
+#[test]
+fn structured_content_is_version_gated_and_matches_output_schemas() {
+    for (version, structured) in [("2025-06-18", true), ("2025-03-26", false), ("2024-11-05", false)] {
+        let mut s = server();
+        rpc(&mut s, 1, "initialize", json!({"protocolVersion": version}));
+        let tools = rpc(&mut s, 2, "tools/list", json!({}))["tools"].as_array().unwrap().clone();
+        let declared = tools.iter().filter(|t| t.get("outputSchema").is_some()).count();
+        assert_eq!(declared > 0, structured, "{version}");
+        let r = rpc(&mut s, 3, "tools/call", json!({"name": "command_run", "arguments": {"id": "comp.new", "params": {"width": 32, "height": 32}}}));
+        assert_eq!(r.get("structuredContent").is_some(), structured, "{version}: {r}");
+        assert_eq!(r["content"][0]["type"], "text", "{version}: text content stays");
+    }
+    // A modern request (revision in `_meta`, no initialize) gets them too.
+    let mut s = server();
+    let meta = json!({"io.modelcontextprotocol/protocolVersion": "2026-07-28"});
+    let r = rpc(&mut s, 1, "tools/call", json!({"_meta": meta, "name": "get_state", "arguments": {}}));
+    assert!(r["structuredContent"]["state"].is_object(), "{r}");
+
+    let mut s = server();
+    rpc(&mut s, 1, "initialize", json!({"protocolVersion": "2025-06-18"}));
+    let tools = rpc(&mut s, 2, "tools/list", json!({}))["tools"].as_array().unwrap().clone();
+    let schema = |n: &str| tools.iter().find(|t| t["name"] == n).and_then(|t| t.get("outputSchema")).cloned().unwrap_or_else(|| panic!("{n}: no outputSchema"));
+    for t in &tools {
+        if let Some(o) = t.get("outputSchema") {
+            assert_eq!(o["type"], "object", "{t}");
+        }
+    }
+    let path = std::env::temp_dir().join(format!("ec-structured-{}.ecproj", std::process::id())).to_string_lossy().into_owned();
+    let png = std::env::temp_dir().join(format!("ec-structured-{}.png", std::process::id())).to_string_lossy().into_owned();
+    let calls = [
+        ("command_run", json!({"id": "comp.new", "params": {"name": "S", "width": 64, "height": 36}})),
+        ("command_batch", json!({"steps": [{"id": "layer.newNull"}, {"id": "no.such"}], "stop_on_error": false})),
+        ("batch", json!({"steps": [{"command": "layer.newSolid", "params": {"color": "#ff0000"}}]})),
+        ("get_state", json!({})),
+        ("doc_inspect", json!({})),
+        ("render_preview", json!({"max_side": 16})),
+        ("render_preview", json!({"max_side": 16, "inline": false, "path": png})),
+        ("undo", json!({})),
+        ("redo", json!({})),
+        ("history", json!({})),
+        ("save_project", json!({"path": path})),
+        ("command_list", json!({"filter": "comp.new"})),
+    ];
+    for (name, args) in calls {
+        let r = rpc(&mut s, 3, "tools/call", json!({"name": name, "arguments": args}));
+        let sc = &r["structuredContent"];
+        assert!(sc.is_object(), "{name}: {r}");
+        if r["content"][0]["type"] == "text" {
+            let text: Value = serde_json::from_str(r["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert!(sc == &text || sc["items"] == text, "{name}: structuredContent mirrors the text");
+        }
+        if name != "command_list" && name != "command_run" {
+            validate(&schema(name), sc, name).unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
+    }
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(png);
+}
+
+/// AG5: render_snapshot → edit → render_compare, with the heatmap inline only when it shows something.
+#[test]
+fn render_snapshot_and_compare_tools() {
+    let mut s = server();
+    call_json(&mut s, "execute_command", json!({"command": "comp.new", "params": {"name": "C", "width": 320, "height": 180}}));
+    call_json(&mut s, "execute_command", json!({"command": "layer.newSolid", "params": {"name": "Box", "color": "#ffffff", "width": 40, "height": 40}}));
+    let snap = call_json(&mut s, "render_snapshot", json!({"name": "before"}));
+    assert_eq!((snap["width"].as_u64(), snap["snapshots"].clone()), (Some(320), json!(["before"])));
+    // Nothing changed: JSON only, a pass with infinite PSNR.
+    let same = call_json(&mut s, "render_compare", json!({"a": "before", "b": {}}));
+    assert_eq!((same["pass"].as_bool(), same["psnr_db"].as_str()), (Some(true), Some("inf")), "{same}");
+    assert!(same.get("diff_png").is_none());
+    // Move the box 10 px right: metrics plus the heatmap image.
+    call_json(&mut s, "set_property", json!({"layer": 1, "path": "transform/position", "value": [170, 90]}));
+    let (c, err) = call(&mut s, "render_compare", json!({"a": {"snapshot": "before"}, "b": {"time": 0}}));
+    assert!(!err, "{c:?}");
+    assert_eq!(c[0]["type"], "image");
+    let png = base64::decode(c[0]["data"].as_str().unwrap()).unwrap();
+    assert_eq!(png_size(&png), Some((320, 180)));
+    let info: Value = serde_json::from_str(c[1]["text"].as_str().unwrap()).unwrap();
+    assert_eq!((info["pass"].as_bool(), info["changed_pixels"].as_u64()), (Some(false), Some(800)), "{info}");
+    assert!(info.get("diff_png").is_none(), "base64 moved into the image content");
+    // inline: false keeps the reply to JSON; bad references are in-band errors.
+    let r = call_json(&mut s, "render_compare", json!({"a": "before", "b": {}, "inline": false}));
+    assert_eq!(r["pass"], false);
+    let (c, err) = call(&mut s, "render_compare", json!({"a": "missing", "b": {}}));
+    assert!(err && c[0]["text"].as_str().unwrap().contains("no snapshot `missing`"));
+    let (_, err) = call(&mut s, "render_compare", json!({"a": "before"}));
+    assert!(err);
+}
+
+/// Every command in the long-call table exists and takes `wait` (a typo would silently make it
+/// synchronous again).
+#[test]
+fn long_call_table_names_real_waiting_commands() {
+    let mut s = Session::default();
+    for id in crate::long_job::spec_commands() {
+        let d = s.execute("command.describe", json!({"command": id})).unwrap_or_else(|e| panic!("{id}: {e}"));
+        if id != "jobs.wait" {
+            assert!(d["schema"]["properties"].get("wait").is_some(), "{id} takes no `wait`: {d}");
+        }
+    }
+}
+
+/// A stdio MCP session on its own thread.
+struct Stdio {
+    input: Option<std::io::PipeWriter>,
+    lines: std::io::Lines<BufReader<std::io::PipeReader>>,
+    server: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Stdio {
+    fn new(session: Session) -> Self {
+        let (in_r, in_w) = std::io::pipe().unwrap();
+        let (out_r, out_w) = std::io::pipe().unwrap();
+        let server = std::thread::spawn(move || McpServer::new(Backend::headless(session)).serve(BufReader::new(in_r), out_w).unwrap());
+        let mut io = Stdio { input: Some(in_w), lines: BufReader::new(out_r).lines(), server: Some(server) };
+        io.send(json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}}));
+        io.next();
+        io
+    }
+    fn send(&mut self, v: Value) {
+        writeln!(self.input.as_mut().unwrap(), "{v}").unwrap();
+    }
+    fn next(&mut self) -> Value {
+        serde_json::from_str(&self.lines.next().unwrap().unwrap()).unwrap()
+    }
+    /// The next message that is not a progress notification.
+    fn reply(&mut self) -> Value {
+        loop {
+            let m = self.next();
+            if m["method"] != "notifications/progress" {
+                return m;
+            }
+        }
+    }
+    fn call(&mut self, id: u64, tool: &str, args: Value, token: Option<Value>) {
+        let mut p = json!({"name": tool, "arguments": args});
+        if let Some(t) = token {
+            p["_meta"] = json!({"progressToken": t});
+        }
+        self.send(json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": p}));
+    }
+    fn cancel(&mut self, id: u64) {
+        self.send(json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": id, "reason": "test"}}));
+    }
+    /// A tool result's JSON text.
+    fn json(m: &Value) -> Value {
+        assert_eq!(m["result"]["isError"], false, "{m}");
+        serde_json::from_str(m["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+    }
+}
+
+impl Drop for Stdio {
+    fn drop(&mut self) {
+        drop(self.input.take());
+        if let Some(s) = self.server.take() {
+            let _ = s.join();
+        }
+    }
+}
+
+/// A clip whose frames take ~2 ms each to decode (a textured image), with a tracker on it, for
+/// analyses that run long enough to watch.
+fn slow_clip_session(seconds: f64) -> Session {
+    use effectcraft_engine::{
+        color::Label,
+        project::{Footage, FootageKind, ItemId, ItemKind},
+        raster::Image,
+        render::FootageSource,
+        time::{FrameRate, Tick},
+    };
+    use std::sync::Arc;
+    struct Slow;
+    impl FootageSource for Slow {
+        fn frame(&self, _: ItemId, _: &Footage, _: Tick) -> Option<Arc<Image>> {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let mut img = Image::new(64, 64);
+            for y in 0..64 {
+                for x in 0..64 {
+                    let v = (((x * 7 + y * 13) % 17) as f32 / 17.0 + ((x * y) % 5) as f32 * 0.05).min(1.0);
+                    img.set(x, y, [v, v, v, 1.0]);
+                }
+            }
+            Some(Arc::new(img))
+        }
+    }
+    let mut s = Session { footage: Arc::new(Slow), ..Default::default() };
+    effectcraft_script::install(&mut s);
+    s.execute("comp.new", json!({"width": 64, "height": 64, "frameRate": 25, "duration": seconds})).unwrap();
+    let footage = Footage {
+        path: "slow.mov".into(),
+        kind: FootageKind::Video,
+        width: 64,
+        height: 64,
+        pixel_aspect: 1.0,
+        frame_rate: FrameRate::new(25, 1),
+        duration: Tick::from_seconds_f64(seconds),
+        has_video: true,
+        ..Default::default()
+    };
+    let item = Arc::make_mut(&mut s.project).add_item("slow", Label::Aqua, None, ItemKind::Footage(footage));
+    let layer = s.execute("layer.addItem", json!({"item": item.0})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("layer.select", json!({"layers": [layer]})).unwrap();
+    s.execute("track.motion", json!({})).unwrap();
+    s.execute("track.setPoint", json!({"point": 1, "center": [32, 32], "featureSize": [16, 16], "searchSize": [32, 32]})).unwrap();
+    s.execute("time.set", json!({"time": 0})).unwrap();
+    s
+}
+
+/// docs/mcp.md "Progress and cancellation" for an analysis: `track.analyze {wait: true}` runs
+/// on its background job, reports progress for its token, lets requests through meanwhile and
+/// replies like the blocking command once done.
+#[test]
+fn analysis_reports_progress_and_serves_requests() {
+    let mut io = Stdio::new(slow_clip_session(2.0));
+    io.call(1, "command_run", json!({"id": "track.analyze", "params": {"direction": "forward", "wait": true}}), Some(json!("trk")));
+    let (mut last, mut notes, mut pinged, mut answered) = (-1.0, 0, false, false);
+    let done = loop {
+        let m = io.next();
+        if m["method"] == "notifications/progress" {
+            let p = &m["params"];
+            assert_eq!(p["progressToken"], "trk", "{m}");
+            let v = p["progress"].as_f64().unwrap();
+            assert!(v > last, "strictly increasing: {m}");
+            if let Some(t) = p["total"].as_f64() {
+                assert!(v <= t, "{m}");
+            }
+            assert!(p["message"].as_str().is_some_and(|s| !s.is_empty()), "{m}");
+            (last, notes) = (v, notes + 1);
+            if !pinged {
+                pinged = true;
+                io.send(json!({"jsonrpc": "2.0", "id": 2, "method": "ping"}));
+                io.call(3, "get_project", json!({}), None);
+            }
+        } else if m["id"] == 2 || m["id"] == 3 {
+            answered |= m["id"] == 3;
+        } else {
+            assert_eq!(m["id"], 1, "{m}");
+            break m;
+        }
+    };
+    let v = Stdio::json(&done);
+    assert_eq!(v["running"], false, "{v}");
+    assert_eq!(v["frames"], 49, "{v}");
+    assert!(notes >= 2 && answered, "{notes} notifications; requests answered during the analysis: {answered}");
+    // the results are in the project, as one undo step
+    io.call(4, "get_project", json!({}), None);
+    let p = Stdio::json(&io.reply());
+    assert!(p["undo"].to_string().contains("Analyze Track"), "{p}");
+    // footage.check {wait: true} runs as a task: its reply is the task's result
+    io.call(5, "command_run", json!({"id": "footage.check", "params": {"wait": true}}), Some(json!(5)));
+    let r = Stdio::json(&io.reply());
+    assert_eq!(r["checked"], 1, "{r}");
+}
+
+/// `notifications/cancelled` stops a running analysis: no response for it, `ping` is answered,
+/// unknown and completed ids are ignored, and the project stays consistent (the tracker keeps
+/// the frames it analysed, as one undo step) and usable.
+#[test]
+fn analysis_cancel_stops_the_job_without_a_reply() {
+    let mut io = Stdio::new(slow_clip_session(40.0));
+    io.call(1, "command_run", json!({"id": "track.analyze", "params": {"direction": "forward", "wait": true}}), Some(json!(1)));
+    let first = io.next();
+    assert_eq!(first["method"], "notifications/progress", "{first}");
+    io.cancel(77); // unknown id: ignored
+    io.cancel(1);
+    let started = std::time::Instant::now();
+    io.send(json!({"jsonrpc": "2.0", "id": 2, "method": "ping"}));
+    assert_eq!(io.reply()["id"], 2);
+    io.call(3, "command_run", json!({"id": "jobs.list"}), None);
+    let m = io.reply();
+    assert_eq!(m["id"], 3, "no response for the cancelled request: {m}");
+    // the job winds down at its next frame
+    let mut jobs = Stdio::json(&m);
+    while jobs["running"] != json!([]) {
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "cancel did not stop the job: {jobs}");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        io.call(3, "command_run", json!({"id": "jobs.list"}), None);
+        let again = io.reply();
+        assert_eq!(again["id"], 3, "{again}");
+        jobs = Stdio::json(&again);
+    }
+    // partial results, one undo step; a new analysis can start
+    io.call(4, "get_project", json!({}), None);
+    let p = Stdio::json(&io.reply());
+    assert!(p["undo"].to_string().contains("Analyze Track"), "{p}");
+    io.call(5, "command_run", json!({"id": "track.analyze", "params": {"direction": "frameForward", "wait": true}}), None);
+    let r = Stdio::json(&io.reply());
+    assert_eq!(r["frames"], 1, "{r}");
+    io.cancel(1); // completed id: ignored
+    io.send(json!({"jsonrpc": "2.0", "id": 6, "method": "ping"}));
+    assert_eq!(io.reply()["id"], 6);
+}
+
+/// `run_script` over stdio: `ping` is answered while the script runs, other requests wait for
+/// it, and `notifications/cancelled` stops even `while (true) {}` inside `try` quickly, with no
+/// response.
+#[test]
+fn script_cancel_stops_an_endless_loop() {
+    let mut sess = Session::default();
+    effectcraft_script::install(&mut sess);
+    let mut io = Stdio::new(sess);
+    io.call(
+        1,
+        "run_script",
+        json!({"code": "app.project.items.addComp('Kept', 64, 64, 1, 1, 25); try { while (true) {} } catch (e) {} 'caught'", "timeout": 0}),
+        None,
+    );
+    io.send(json!({"jsonrpc": "2.0", "id": 2, "method": "ping"}));
+    assert_eq!(io.reply()["id"], 2, "ping answered while the script runs");
+    io.call(3, "get_project", json!({}), None); // waits for the script
+    io.call(4, "get_project", json!({}), None);
+    io.cancel(4); // a queued request that is cancelled is dropped
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let started = std::time::Instant::now();
+    io.cancel(1);
+    let m = io.reply();
+    assert!(started.elapsed() < std::time::Duration::from_secs(2), "cancel took {:?}", started.elapsed());
+    assert_eq!(m["id"], 3, "no response for the cancelled script or the cancelled queued request: {m}");
+    // edits outside an undo group are kept
+    assert!(Stdio::json(&m).to_string().contains("Kept"), "{m}");
+    io.call(5, "run_script", json!({"code": "1 + 1"}), None);
+    let m = io.reply();
+    assert_eq!(m["id"], 5, "{m}");
+    assert_eq!(Stdio::json(&m)["result"], 2);
+}
+
+/// `run_script {timeout}` ends a runaway script with an error; an undo group it left open is
+/// rolled back, edits outside one are kept, and either way the output says so.
+#[test]
+fn script_timeout_rolls_back_an_open_undo_group() {
+    let mut sess = Session::default();
+    effectcraft_script::install(&mut sess);
+    let mut s = McpServer::new(Backend::headless(sess));
+    let started = std::time::Instant::now();
+    let r = call_json(
+        &mut s,
+        "run_script",
+        json!({"code": "app.beginUndoGroup('Build'); app.project.items.addComp('Doomed', 64, 64, 1, 1, 25); while (true) {}", "timeout": 0.3}),
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(3), "timeout took {:?}", started.elapsed());
+    assert_eq!(r["ok"], false, "{r}");
+    assert!(r["error"]["message"].as_str().unwrap().contains("time limit"), "{r}");
+    assert!(r["output"].as_str().unwrap().contains("rolled back"), "{r}");
+    assert!(!call_json(&mut s, "get_project", json!({})).to_string().contains("Doomed"));
+    // an endless loop calling the object model, outside an undo group
+    let r = call_json(
+        &mut s,
+        "run_script",
+        json!({"code": "app.project.items.addComp('Kept', 64, 64, 1, 1, 25); for (;;) { app.project.numItems; }", "timeout": 0.3}),
+    );
+    assert_eq!(r["ok"], false, "{r}");
+    assert!(r["output"].as_str().unwrap().contains("kept"), "{r}");
+    assert!(call_json(&mut s, "get_project", json!({})).to_string().contains("Kept"));
+    // a script that finishes in time is unaffected
+    let r = call_json(&mut s, "run_script", json!({"code": "var n = 0; for (var i = 0; i < 1000; i++) n += i; n", "timeout": 5}));
+    assert_eq!(r["result"], 499500, "{r}");
 }

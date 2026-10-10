@@ -16,7 +16,8 @@
 //! - `ui.timeline.locate {layer, time?}`: screen point of a layer bar (at a comp time)
 //! - `ui.playback {action: play|stop|toggle}`
 //! - `ui.screenshot {path?, panel?, id?}`: PNG of the window (or one panel / element)
-//! - `render.frame {comp?, time?, max_side?, path?, base64?}`: PNG of a comp frame rendered by the session
+//! - `render.frame {comp?, item?, layer?, time?, max_side?, transparent?, region?, overlays?, path?, base64?}`: PNG of a frame rendered by the session
+//! - `ui.figmaPair {client}`: the one-time Figma pairing prompt; replies `{allowed}` once answered
 //! - `ui.resize {width, height}` / `ui.focus` / `app.quit {force?}` (a modified project asks to save first unless `force`)
 //!
 //! The full reference with examples is `docs/control-protocol.md`.
@@ -57,6 +58,8 @@ pub enum Outcome {
     },
     /// Reply once background jobs end (a `wait: true` command whose job runs in a worker).
     AwaitJobs(JobWaiter),
+    /// The handler kept the request's reply and sends it later.
+    Held,
 }
 
 /// A `wait: true` engine command whose job was sent to the session's offload (the browser's
@@ -297,7 +300,7 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
             if req.method == "ui.panel.show" {
                 app.show_panel(panel);
             } else {
-                app.ui.dock.close(panel);
+                app.close_panel(panel);
             }
             ok(Value::Null)
         }
@@ -436,6 +439,16 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             ok(Value::Null)
         }
+        "ui.figmaPair" => {
+            // The Figma bridge asks once whether the plug-in may send layers; the reply goes out
+            // when the person clicks Allow or Deny (`{allowed}`).
+            let client = s("client").unwrap_or("Figma plug-in").to_string();
+            if crate::panels::figma_pair::ask(app, ctx, &client, req.reply.clone()) {
+                Outcome::Held
+            } else {
+                err("EffectCraft is already asking to connect Figma")
+            }
+        }
         "app.quit" => {
             // A modified project asks to save first unless `force: true`.
             if p.get("force").and_then(Value::as_bool).unwrap_or(false) {
@@ -448,44 +461,15 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
     }
 }
 
-/// `render.frame {comp?, time?, max_side?, path?, base64?}`: render a comp frame through the session
-/// (independent of the viewer zoom/resolution) and return it as PNG, written to `path` (default a
-/// temp file) or inline as base64 when `base64: true`.
+/// `render.frame {comp?, item?, layer?, time?, frame?, max_side?, transparent?, region?, overlays?,
+/// path?, base64?}`: render through the session (independent of the viewer zoom/resolution) with
+/// the engine's `render.frame` code, so the MCP bridge matches headless renders. The PNG is
+/// written to `path` (default a temp file) or returned as base64 with `base64: true` (the web
+/// has no file system: inline unless a path is given).
 fn render_frame(app: &EffectcraftApp, p: &Value) -> Outcome {
-    let s = &app.session;
-    let cid = match s.resolve_comp(p.get("comp")) {
-        Ok(c) => c,
-        Err(e) => return err(e),
-    };
-    let t = p.get("time").or(p.get("seconds")).and_then(Value::as_f64).map(effectcraft_time::Tick::from_seconds_f64).unwrap_or_else(|| s.time());
-    let max_side = p.get("max_side").or(p.get("maxSide")).and_then(Value::as_u64).unwrap_or(0) as u32;
-    let transparent = p.get("transparent").and_then(Value::as_bool).unwrap_or(false);
-    let (w, h, rgba) = match s.render_rgba8_alpha(cid, t, max_side, transparent) {
-        Ok(r) => r,
-        Err(e) => return err(e),
-    };
-    let png = match encode_png(&rgba, w, h) {
-        Ok(p) => p,
-        Err(e) => return err(e),
-    };
-    let mut out = json!({"comp": cid.0, "time": t.seconds(), "width": w, "height": h});
-    // (the web has no file system: inline unless a path is given)
-    let inline = p.get("base64").and_then(Value::as_bool).unwrap_or(cfg!(target_arch = "wasm32") && p.get("path").is_none());
-    if inline {
-        out["png"] = json!(base64(&png));
-        return ok(out);
-    }
-    let path = p
-        .get("path")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| std::env::temp_dir().join(format!("effectcraft-frame-{}.png", std::process::id())).to_string_lossy().to_string());
-    match std::fs::write(&path, png) {
-        Ok(()) => {
-            out["path"] = json!(path);
-            ok(out)
-        }
-        Err(e) => err(format!("cannot write {path}: {e}")),
+    match effectcraft_engine::render_view::render_frame_reply(&app.session, p, cfg!(target_arch = "wasm32")) {
+        Ok(v) => ok(v),
+        Err(e) => err(e),
     }
 }
 

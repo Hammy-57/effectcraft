@@ -37,14 +37,23 @@ printf '{"id":1,"method":"engine.execute","params":{"command":"comp.new","params
 | UI commands (via either) | | `timeline.column {column, visible?}` (av, keys, label, num, comment, switches, modes, parent, in, out, duration, stretch), `timeline.sourceName {value?}`, `timeline.search {query}`, `timeline.reveal.<kind>` / `timeline.revealAdd.<kind>` (the property shortcuts and Shift+shortcut: position, scale, rotation, opacity, anchor, effects, masks, feather, levels, animated, and the double-press sets maskPath, maskOpacity, timeRemap, expressions, material, paint, selected, missingEffects, waveform), `timeline.keyAt.<anchor\|position\|scale\|rotation\|opacity>` (Alt+Shift+A/P/S/R/T), `timeline.twirlSelected` (Ctrl/Cmd+`), `timeline.collapseAll`, `flowchart.options {layers?, effects?, solids?, direction?: lr\|tb, comp?}`, `flowchart.graph {comp?}` → `{nodes, edges}`, `window.workspace {name}` (all After Effects workspaces). |
 | `engine.commands` | `{filter?, enabledOnly?}` | `[{id, label, menu, shortcut, params, enabled, why}]` |
 | `ui.menu.list` | `{}` | The menu tree with enablement. |
-| `render.frame` | `{comp?, time?, max_side?, path?, base64?}` | Renders a comp frame through the session, independent of the viewer zoom or resolution. `comp` is an id or name (default: the active comp), `time` is in comp seconds (default: the CTI), `max_side` caps the longest side (0 = full size). Writes a PNG to `path` (default: a temp file) and returns `{comp, time, width, height, path}`. With `base64: true` it returns `{…, png: "<base64>"}` and writes no file. |
+| `render.frame` | `{comp? \| item?, layer?, time? \| frame?, max_side?, transparent?, region?, overlays?, path?, base64?}` | Renders a frame through the session, independent of the viewer zoom or resolution; the same code as the engine command `render.frame`. `comp` is an id or name (default: the active comp), `time` is in comp seconds (default: the CTI), `max_side` caps the longest side (0 = full size). `item` renders a footage or solid item on its own (source time), `layer` one layer solo, `region: [x, y, w, h]` one comp rectangle at full resolution (clipped to the frame; `max_side` applies to it), and `overlays` (`true` = bounds + anchor, or a list of `bounds`, `anchor`, `motionPath`, `safeMargins`, `grid`, `all`) draws the viewer's overlays and adds `layers: [{id, index, name, bounds: [x, y, w, h], anchor, keyPositions?}]` (comp space, as `layer.bounds` measures them). Writes a PNG to `path` (default: a temp file) and returns `{comp \| item, time, frame, width, height, scale, region?, path}`. With `base64: true` it returns `{…, png: "<base64>"}` (and still writes `path` when one is given). Several frames on one labelled sheet: `engine.execute` `render.contactSheet {times? \| count?, start?, end?, cols?, max_side?, labels?, gif?, …}`. |
 
 Useful query commands for `engine.execute` (they aren't journaled or undoable): `project.summary`,
 `comp.info {comp?}`, `layer.tree {layer, comp?, depth?, time?}` (every node has a `path`),
 `prop.get {layer, path, comp?, time?}`, `editor.state`, `command.list {filter?, enabledOnly?, schemas?}`,
 `command.describe {command}` (params doc and JSON Schema), `app.capabilities` (version, counts,
 export formats, parity summary), `jobs.list` (Progress panel jobs, e.g. the background
-`footage.check` after File ▸ Open).
+`footage.check` after File ▸ Open), `render.snapshot {name, comp?, time?, max_side?, transparent?}`
+(keep a rendered frame in the session, 16 at most), `render.snapshots {clear?}` and
+`render.compare {a, b, threshold?, min_psnr?, max_side?, amplify?, diff_path?, diff_inline?}`
+(`a`/`b`: a snapshot name, `{snapshot}`, `{path}` of a PNG/JPEG, or `{comp?, time?, transparent?}`
+rendered now) → `{width, height, max_abs, mean_abs, alpha_max_abs, psnr_db, ssim, changed_pixels,
+changed_pct, pass, diff_path?, diff_png?}` (metrics and size rules in
+[agents.md](agents.md#verify-your-change-snapshot--edit--compare)). Analysis queries (see
+[mcp.md](mcp.md#analysis-tools)): `layer.bounds {comp?, time?, layers?, pixels?, overlaps?}`
+(layer geometry in comp space) and `audio.analyze {comp?, start?, end?, layer?, waveform?, path?}`
+(peak, RMS, LUFS, clipping and silences of the mix).
 
 Every engine command is reachable through `engine.execute`, and every interactive widget of every
 panel registers an element id; both are enforced by `crates/ui-egui/tests/ui_agent_audit.rs`.
@@ -57,9 +66,11 @@ panel registers an element id; both are enforced by `crates/ui-egui/tests/ui_age
 | `ui.elements` | `{prefix?}` | `[{id, label, rect: [x, y, w, h]}]`: the widgets drawn in the last frame, in points. |
 | `ui.set` | `{tool?, workspace?, theme?, focused?, viewer?, timeline?, menuBar?, home?}` | `viewer: {zoom (null = fit), res: Full\|Half\|Third\|Quarter\|Auto, pan: [x,y], grid, rulers, safeMargins, transparencyGrid}`; `timeline: {pps (null = fit), start, graphEditor, showModes, openLayers: [ids], openGroups: [uids]}`. |
 | `ui.panel.show` / `ui.panel.close` | `{panel}` | Panels: `Project`, `Composition`, `Timeline`, `EffectControls`, `EffectsPresets`, `Info`, `Preview`, `Character`, `Paragraph`, `Align` and others. |
+| `engine.execute` `window.*` (panel menu) | `{panel, comp?, rect?, stacked?, anchor?, zone?}` | The panel menu's items (≡ beside a tab name, or right-click a tab; automation ids `panelMenu.<key>`): `window.closePanel` (on a Timeline comp tab, `comp` closes that comp's Timeline), `window.floatPanel` (Undock Panel), `window.dockPanel` (with `anchor`/`zone`, or back to its usual place), `window.closeOtherPanels`, `window.closePanelGroup`, `window.floatPanelGroup`, `window.maximizePanel` (Maximize Panel Group, as `` ` ``), `window.stackPanelGroup`, and `window.panelMenu {panel, x?, y?}` to open the menu. |
 | `ui.playback` | `{action: play\|stop\|toggle\|status}` | `{playing, time, audio, levelsDb, peaksDb}` (audio: an audio preview is running; L/R meter levels and held peaks in dBFS) |
 | `ui.resize` | `{width, height}` | Resizes the window (points). |
 | `ui.focus` | `{}` | Activates the window and takes keyboard focus. Agents normally avoid this, because the app is started without stealing focus. |
+| `ui.figmaPair` | `{client}` | The one-time Figma pairing prompt the app's Figma bridge shows (**Connect Figma?**, automation ids `figmaPair.allow` / `figmaPair.deny`). The reply waits for the answer: `{allowed}` (a 120 s timeout counts as Deny). |
 | `app.quit` | `{force?}` | Closes the app. A modified project shows the Save / Don't Save / Cancel prompt first (automation ids `dialog.unsaved.save`, `dialog.unsaved.dontSave`, `dialog.unsaved.cancel`) unless `force: true`. |
 
 ## Input

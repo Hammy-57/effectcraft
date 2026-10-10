@@ -1,77 +1,29 @@
 //! The command registry. Ids follow After Effects' menu structure; every menu item, panel button,
 //! shortcut and viewer/timeline gesture maps to one of these.
+//!
+//! Every file of this folder is a command module, declared by build.rs; its
+//! `pub fn specs() -> Vec<CommandSpec>` is registered in [`command_specs`]. Adding commands is
+//! adding a file (docs/architecture.md, "Self-registering modules"). The modules below need `pub`.
 
-mod aep;
-mod align;
-mod align_data;
-mod anim;
+include!(concat!(env!("OUT_DIR"), "/commands.rs"));
 pub mod anim_tools;
-mod animation;
-pub(crate) mod app_more;
-mod autotrace;
-mod batch;
-mod camera_cmds;
-mod comp;
-pub(crate) mod comp_more;
 pub mod content_fill;
-mod create;
-mod edit;
-mod effect;
 pub mod essential;
 pub mod expr_tools;
-pub(crate) mod file;
-pub(crate) mod file_more;
-mod focus;
 pub mod footage_panel;
-pub(crate) mod frame_export;
-mod frontend;
-mod help;
-mod import_project;
-mod key_labels;
-mod key_transform;
-mod keys_more;
-mod layer;
-mod layer_menu;
-mod layer_time;
-pub(crate) mod link;
-mod liquify;
-mod lottie;
 pub mod markers;
-mod mask;
 pub mod mask_interp;
-pub(crate) mod model3d;
 pub mod paint;
 pub mod panels_cmds;
-pub(crate) mod path_nulls;
-mod paths;
-mod project_items;
-mod prop;
-mod prop_groups;
-mod proxy;
 pub mod puppet;
-mod query;
-mod render_queue;
-pub(crate) mod rig3d;
+pub mod render_compare;
 pub mod roto_cmds;
-mod scene_detect;
 pub mod scripts;
-mod settings;
 pub mod shape_stroke;
 pub mod shape_tool;
-mod stubs;
-mod styles;
-mod text_anim;
 pub mod text_edit;
-mod three_d;
 pub mod time;
-mod timeline;
-mod track;
-mod view;
 pub mod viewer_cmds;
-pub(crate) mod vpe;
-pub(crate) mod vr_editor;
-mod warp_cmds;
-pub(crate) mod watch_folder;
 #[cfg(test)]
 pub(crate) use app_more::report_text as report_text_for_tests;
 pub(crate) use app_more::view_command;
@@ -129,89 +81,104 @@ macro_rules! query {
     };
 }
 
+/// Registration order of the command modules that existed when registration became automatic
+/// (AG3). The command list's order is observable (`list_commands`, scripting's command indices,
+/// the first command to claim a shortcut), so it stays as it was. Modules added since come after
+/// these, by file name: don't add to this list. `crate::x` names a module next to `lib.rs`.
+pub(crate) const LEGACY_ORDER: &[&str] = &[
+    "file",
+    "crate::models",
+    "edit",
+    "comp",
+    "layer",
+    "styles",
+    "three_d",
+    "model3d",
+    "rig3d",
+    "text_anim",
+    "text_edit",
+    "layer_time",
+    "prop",
+    "prop_groups",
+    "project_items",
+    "anim",
+    "anim_tools",
+    "link",
+    "markers",
+    "mask",
+    "paths",
+    "effect",
+    "time",
+    "render_queue",
+    "help",
+    "journal",
+    "query",
+    "batch",
+    "crate::figma",
+    "layer_menu",
+    "create",
+    "animation",
+    "view",
+    "viewer_cmds",
+    "shape_stroke",
+    "shape_tool",
+    "focus",
+    "key_labels",
+    "key_transform",
+    "file_more",
+    "lottie",
+    "aep",
+    "timeline",
+    "comp_more",
+    "frame_export",
+    "watch_folder",
+    "vpe",
+    "path_nulls",
+    "vr_editor",
+    "frontend",
+    "track",
+    "mask_interp",
+    "warp_cmds",
+    "camera_cmds",
+    "roto_cmds",
+    "paint",
+    "puppet",
+    "liquify",
+    "settings",
+    "app_more",
+    "keys_more",
+    "essential",
+    "expr_tools",
+    "proxy",
+    "scripts",
+    "panels_cmds",
+    "footage_panel",
+    "autotrace",
+    "scene_detect",
+    "align_data",
+    "align",
+    "content_fill",
+    "stubs",
+    "crate::storage",
+    "crate::learn",
+    "crate::templates",
+    "crate::preview",
+    "render_compare",
+];
+
+/// Every command module's `specs()`, in registration order: [`LEGACY_ORDER`], then the others
+/// (`commands/*.rs`, then `src/*.rs` as `crate::x`) by file name.
+pub(crate) fn command_modules() -> Vec<(String, fn() -> Vec<CommandSpec>)> {
+    let all: Vec<(String, fn() -> Vec<CommandSpec>)> =
+        COMMAND_MODULES.iter().map(|(n, f)| (n.to_string(), *f)).chain(crate::COMMAND_MODULES.iter().map(|(n, f)| (format!("crate::{n}"), *f))).collect();
+    let mut out: Vec<(String, fn() -> Vec<CommandSpec>)> = LEGACY_ORDER.iter().filter_map(|name| all.iter().find(|(n, _)| n == name).cloned()).collect();
+    out.extend(all.into_iter().filter(|(n, _)| !LEGACY_ORDER.contains(&n.as_str())));
+    out
+}
+
 pub fn command_specs() -> &'static [CommandSpec] {
     static SPECS: OnceLock<Vec<CommandSpec>> = OnceLock::new();
-    SPECS.get_or_init(|| {
-        let mut v = Vec::new();
-        v.extend(file::specs());
-        v.extend(crate::models::specs());
-        v.extend(edit::specs());
-        v.extend(comp::specs());
-        v.extend(layer::specs());
-        v.extend(styles::specs());
-        v.extend(three_d::specs());
-        v.extend(model3d::specs());
-        v.extend(rig3d::specs());
-        v.extend(text_anim::specs());
-        v.extend(text_edit::specs());
-        v.extend(layer_time::specs());
-        v.extend(prop::specs());
-        v.extend(prop_groups::specs());
-        v.extend(project_items::specs());
-        v.extend(anim::specs());
-        v.extend(anim_tools::specs());
-        v.extend(link::specs());
-        v.extend(markers::specs());
-        v.extend(mask::specs());
-        v.extend(paths::specs());
-        v.extend(effect::specs());
-        v.extend(time::specs());
-        v.extend(render_queue::specs());
-        v.extend(help::specs());
-        v.extend(query::specs());
-        v.extend(batch::specs());
-        v.extend(crate::figma::specs());
-        v.extend(layer_menu::specs());
-        v.extend(create::specs());
-        v.extend(animation::specs());
-        v.extend(view::specs());
-        v.extend(viewer_cmds::specs());
-        v.extend(shape_stroke::specs());
-        v.extend(shape_tool::specs());
-        v.extend(focus::specs());
-        v.extend(key_labels::specs());
-        v.extend(key_transform::specs());
-        v.extend(file_more::specs());
-        v.extend(lottie::specs());
-        v.extend(aep::specs());
-        v.extend(import_project::specs());
-        v.extend(timeline::specs());
-        v.extend(comp_more::specs());
-        v.extend(frame_export::specs());
-        v.extend(watch_folder::specs());
-        v.extend(vpe::specs());
-        v.extend(path_nulls::specs());
-        v.extend(vr_editor::specs());
-        v.extend(frontend::specs());
-        v.extend(track::specs());
-        v.extend(mask_interp::specs());
-        v.extend(warp_cmds::specs());
-        v.extend(camera_cmds::specs());
-        v.extend(roto_cmds::specs());
-        v.extend(paint::specs());
-        v.extend(puppet::specs());
-        v.extend(liquify::specs());
-        v.extend(settings::specs());
-        v.extend(app_more::specs());
-        v.extend(keys_more::specs());
-        v.extend(essential::specs());
-        v.extend(expr_tools::specs());
-        v.extend(proxy::specs());
-        v.extend(scripts::specs());
-        v.extend(panels_cmds::specs());
-        v.extend(footage_panel::specs());
-        v.extend(autotrace::specs());
-        v.extend(scene_detect::specs());
-        v.extend(align_data::specs());
-        v.extend(align::specs());
-        v.extend(content_fill::specs());
-        v.extend(stubs::specs());
-        v.extend(crate::storage::specs());
-        v.extend(crate::learn::specs());
-        v.extend(crate::templates::specs());
-        v.extend(crate::preview::specs());
-        v
-    })
+    SPECS.get_or_init(|| command_modules().into_iter().flat_map(|(_, specs)| specs()).collect())
 }
 
 /// Set `footage` as the proxy of `item` (File ▸ Create Proxy's post-render action).
