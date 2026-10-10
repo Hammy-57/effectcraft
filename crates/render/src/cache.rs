@@ -13,15 +13,26 @@
 //!   item changes the key, so stale pixels are never returned.
 //!
 //! Layers whose pixels depend on time in ways the property values do not capture (time-based
-//! effects such as Noise or Wave Warp, Wiggle Paths, footage, precomps) either fold the layer
-//! time into the key or are not cached.
+//! effects such as Noise or Wave Warp, Wiggle Paths, moving footage) fold the layer time (or the
+//! source frame) into the key; a still is keyed by its item alone. A precomp is keyed by its
+//! nested comp's content at the nested time ([`crate::precomp_key`]), so a static precomp
+//! renders once.
+//!
+//! The static part of a key (the property tree's structure, formatted and hashed) is memoised
+//! per shared layer ([`LayerInfo`]): layers are `Arc`-shared between project snapshots and an
+//! edit makes a new allocation, so an allocation that is still alive still holds the same
+//! layer. The memo keeps a `Weak` on each allocation it describes, so the address can't be
+//! reused by another layer while the entry exists.
+//!
+//! Concurrent misses on one key (parallel frames reaching the same static layer) render it once:
+//! the first claims the key ([`LayerCache::claim`]) and the others wait for its buffer.
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, PoisonError, RwLock, Weak};
 
 use effectcraft_effects::Buf;
-use effectcraft_project::{ItemKind, Layer, LayerSource, Node, PropGroup};
+use effectcraft_project::{Comp, FootageKind, ItemKind, Layer, LayerSource, Node, PropGroup};
 
 use crate::eval::EvalCtx;
 use crate::packed::PackedBuf;
@@ -37,6 +48,10 @@ pub struct LayerCache {
     store: Mutex<Option<(Arc<dyn LayerStore>, u64)>>,
     /// While set, inserts are dropped (see [`LayerCache::set_gate`]).
     gate: Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>,
+    /// Keys being rendered right now, by whom (see [`LayerCache::claim`]).
+    inflight: Mutex<HashMap<u64, Arc<Flight>>>,
+    /// Precomp layers' consecutive key misses (see [`LayerCache::precomp_try`]).
+    streaks: Mutex<HashMap<u64, u32>>,
 }
 
 struct Entry {
@@ -64,6 +79,8 @@ struct Inner {
     clock: u64,
     hits: u64,
     misses: u64,
+    /// Buffers inserted (rendered, or read from disk).
+    inserts: u64,
     /// When each recent miss happened (to time the render that follows it).
     missed_at: HashMap<u64, web_time::Instant>,
 }
@@ -87,10 +104,12 @@ impl LayerCache {
     /// A cache holding at most `budget` bytes of pixels.
     pub fn new(budget: usize) -> LayerCache {
         LayerCache {
-            inner: Mutex::new(Inner { map: HashMap::new(), bytes: 0, budget, clock: 0, hits: 0, misses: 0, missed_at: HashMap::new() }),
+            inner: Mutex::new(Inner { map: HashMap::new(), bytes: 0, budget, clock: 0, hits: 0, misses: 0, inserts: 0, missed_at: HashMap::new() }),
             disk: Mutex::new(None),
             store: Mutex::new(None),
             gate: Mutex::new(None),
+            inflight: Mutex::new(HashMap::new()),
+            streaks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -218,6 +237,7 @@ impl LayerCache {
                 return;
             }
             g.clock += 1;
+            g.inserts += 1;
             let now = g.clock;
             if let Some(old) = g.map.insert(key, Entry { buf: Stored::Full(buf), bytes, last_use: now, unpackable: false }) {
                 g.bytes -= old.bytes;
@@ -322,6 +342,135 @@ impl LayerCache {
 
     pub fn stats(&self) -> CacheStats {
         self.inner.lock().map(|g| CacheStats { entries: g.map.len(), bytes: g.bytes, hits: g.hits, misses: g.misses }).unwrap_or_default()
+    }
+
+    /// Buffers inserted so far (each a render, or a disk read): tests count renders with it.
+    #[cfg(test)]
+    pub(crate) fn inserts(&self) -> u64 {
+        self.inner.lock().map(|g| g.inserts).unwrap_or(0)
+    }
+
+    /// After a miss on `key`: render it ([`Claim::Owner`], whose drop wakes the waiters), take
+    /// the buffer another thread just rendered under it ([`Claim::Ready`]), or render it anyway
+    /// ([`Claim::Render`]: this thread is already rendering it further up its stack, or the
+    /// other render didn't leave a buffer in time).
+    ///
+    /// A waiter on a rayon worker waits at most [`WAIT_POOL`]: rayon may run a frame that waits
+    /// here on top of a stolen piece of the very render it waits for (a join inside it), which
+    /// would never finish; the timeout turns that into a duplicate render, as before.
+    pub(crate) fn claim(&self, key: u64) -> Claim<'_> {
+        let me = std::thread::current().id();
+        let flight = {
+            let mut m = self.inflight.lock().unwrap_or_else(PoisonError::into_inner);
+            match m.get(&key) {
+                Some(f) if f.owner == me => return Claim::Render,
+                Some(f) => f.clone(),
+                None => {
+                    let f = Arc::new(Flight { owner: me, done: Mutex::new(false), cv: Condvar::new() });
+                    m.insert(key, f.clone());
+                    return Claim::Owner(FlightGuard { cache: self, key, flight: f });
+                }
+            }
+        };
+        if !flight.wait() {
+            return Claim::Render;
+        }
+        match self.peek(key) {
+            Some(b) => Claim::Ready(b),
+            None => Claim::Render,
+        }
+    }
+
+    /// Whether to key precomp layer `id` (a hash of its comp and layer) this time. A precomp
+    /// whose key missed on several frames in a row is animated: keying it evaluates its nested
+    /// comp's animated properties (expressions included) once more than rendering it does, so
+    /// it is keyed only every eighth frame until a key hits again.
+    pub(crate) fn precomp_try(&self, id: u64) -> bool {
+        let Ok(mut m) = self.streaks.lock() else { return true };
+        let n = m.get(&id).copied().unwrap_or(0);
+        let attempt = n < 2 || n % 8 == 0;
+        if !attempt {
+            if m.len() > 4096 {
+                m.clear();
+            }
+            m.insert(id, n.saturating_add(1));
+        }
+        attempt
+    }
+
+    /// The outcome of keying precomp layer `id` (see [`Self::precomp_try`]).
+    pub(crate) fn precomp_note(&self, id: u64, hit: bool) {
+        let Ok(mut m) = self.streaks.lock() else { return };
+        if m.len() > 4096 {
+            m.clear();
+        }
+        let n = m.entry(id).or_insert(0);
+        *n = if hit { 0 } else { n.saturating_add(1) };
+    }
+}
+
+/// How long a waiter on a rayon worker waits for another thread's render (see
+/// [`LayerCache::claim`]).
+const WAIT_POOL: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long any other thread waits.
+const WAIT_OTHER: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A key being rendered.
+struct Flight {
+    owner: std::thread::ThreadId,
+    done: Mutex<bool>,
+    cv: Condvar,
+}
+
+impl Flight {
+    /// Wait until the render is done (`true`) or the time is up (`false`).
+    fn wait(&self) -> bool {
+        // Single-threaded targets never get here (the owner is this thread, see `claim`).
+        if cfg!(target_arch = "wasm32") {
+            return false;
+        }
+        let limit = if rayon::current_thread_index().is_some() { WAIT_POOL } else { WAIT_OTHER };
+        let start = web_time::Instant::now();
+        let mut done = self.done.lock().unwrap_or_else(PoisonError::into_inner);
+        while !*done {
+            let Some(left) = limit.checked_sub(start.elapsed()) else { return false };
+            done = match self.cv.wait_timeout(done, left) {
+                Ok((g, _)) => g,
+                Err(e) => e.into_inner().0,
+            };
+        }
+        true
+    }
+}
+
+/// The outcome of [`LayerCache::claim`].
+pub(crate) enum Claim<'c> {
+    /// Render the buffer and insert it; dropping the guard (after the insert, or on failure)
+    /// wakes the waiters.
+    Owner(#[allow(dead_code)] FlightGuard<'c>),
+    /// Another thread rendered it.
+    Ready(Arc<Buf>),
+    /// Render it without waking anyone.
+    Render,
+}
+
+/// Ends a [`LayerCache::claim`] when dropped (also when the render panics).
+pub(crate) struct FlightGuard<'c> {
+    cache: &'c LayerCache,
+    key: u64,
+    flight: Arc<Flight>,
+}
+
+impl Drop for FlightGuard<'_> {
+    fn drop(&mut self) {
+        {
+            let mut m = self.cache.inflight.lock().unwrap_or_else(PoisonError::into_inner);
+            if m.get(&self.key).is_some_and(|f| Arc::ptr_eq(f, &self.flight)) {
+                m.remove(&self.key);
+            }
+        }
+        *self.flight.done.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        self.flight.cv.notify_all();
     }
 }
 
@@ -482,7 +631,7 @@ impl LayerStore for PrefetchStore {
 }
 
 /// FNV-1a style 64-bit hasher fed by `Debug` output (exact float formatting) and raw values.
-struct KeyHasher(u64);
+pub(crate) struct KeyHasher(u64);
 
 impl Hasher for KeyHasher {
     fn finish(&self) -> u64 {
@@ -503,10 +652,16 @@ impl std::fmt::Write for KeyHasher {
     }
 }
 
-fn hash_debug(h: &mut KeyHasher, v: &impl std::fmt::Debug) {
+
+pub(crate) fn hash_debug(h: &mut KeyHasher, v: &impl std::fmt::Debug) {
     use std::fmt::Write;
     let _ = write!(h, "{v:?}");
     Hasher::write_u8(h, 0xff);
+}
+
+/// A [`KeyHasher`] starting from `seed`.
+pub(crate) fn hasher(seed: u64) -> KeyHasher {
+    KeyHasher(seed)
 }
 
 /// Time-based layer content: does any part of the source/effects read the clock directly
@@ -552,7 +707,7 @@ fn group_has(g: &PropGroup, match_id: &str) -> bool {
 
 /// Feed every property of `g` that can change over time (keyframes or expression) as its value
 /// at the context time. The static structure is hashed separately.
-fn hash_values(h: &mut KeyHasher, ctx: &EvalCtx, layer: &Layer, g: &PropGroup) {
+pub(crate) fn hash_values(h: &mut KeyHasher, ctx: &EvalCtx, layer: &Layer, g: &PropGroup) {
     for c in &g.children {
         match c {
             Node::Prop(p) => {
@@ -566,27 +721,272 @@ fn hash_values(h: &mut KeyHasher, ctx: &EvalCtx, layer: &Layer, g: &PropGroup) {
     }
 }
 
+/// Does any property of `g` have keyframes or an expression?
+fn has_animation(g: &PropGroup) -> bool {
+    g.children.iter().any(|c| match c {
+        Node::Prop(p) => !p.keys.is_empty() || p.has_expression(),
+        Node::Group(sub) => has_animation(sub),
+    })
+}
+
+// ------------------------------------------------------------------------------ key memo
+
+/// What the keys need to know about a layer that changes only when the layer does: the hashed
+/// structure of its property groups and what reads the clock. Memoised per shared layer
+/// ([`layer_info`]), so a frame formats no unchanged layer's property tree.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LayerInfo {
+    /// Layer id, source and pixel switches.
+    head: u64,
+    /// Static structure of the content (every top-level node but Transform and Layer Styles):
+    /// values, keyframes, expressions, enabled flags, effect ids, modes.
+    content: u64,
+    /// The Layer Styles group's structure.
+    styles: u64,
+    /// Every field of the layer, every property included (a precomp's nested layers).
+    pub(crate) whole: u64,
+    /// A content group has keyframes or expressions.
+    content_animated: bool,
+    styles_animated: bool,
+    /// A property anywhere has keyframes or an expression.
+    pub(crate) animated: bool,
+    /// A property anywhere has an expression.
+    pub(crate) expressions: bool,
+    /// A group other than Transform has an expression.
+    content_expressions: bool,
+    pub(crate) time_dependent: bool,
+    pub(crate) reads_other_times: bool,
+    reads_comp_scene: bool,
+    /// Enabled paint strokes (their Duration spans show and hide them).
+    pub(crate) paint: bool,
+    masks_or_effects: bool,
+    /// An enabled effect has a layer parameter naming a layer (Displacement Map, Set Matte…).
+    layer_refs: bool,
+}
+
+impl LayerInfo {
+    fn of(layer: &Layer) -> LayerInfo {
+        let mut head = KeyHasher(0x8422_2325_cbf2_9ce4);
+        layer.id.hash(&mut head);
+        hash_debug(&mut head, &layer.source);
+        // (Audio, Lock and Shy don't change pixels.)
+        hash_debug(&mut head, &layer.switches.pixels());
+        let mut content = KeyHasher(0xcbf2_9ce4_8422_2325);
+        let (mut content_animated, mut content_expressions) = (false, false);
+        for c in &layer.props.children {
+            if let Node::Group(g) = c {
+                if g.match_id == "transform" {
+                    continue;
+                }
+                content_expressions |= has_expression(g);
+                if g.match_id == effectcraft_project::styles::GROUP {
+                    continue;
+                }
+                content_animated |= has_animation(g);
+            }
+            hash_debug(&mut content, c);
+        }
+        let mut styles = KeyHasher(0x9e37_79b9_7f4a_7c15);
+        let styles_animated = layer.layer_styles().is_some_and(|g| {
+            hash_debug(&mut styles, g);
+            has_animation(g)
+        });
+        let mut whole = KeyHasher(0x7c15_9e37_79b9_7f4a);
+        hash_debug(&mut whole, layer);
+        let fx = layer.switches.effects.then(|| layer.effects()).flatten();
+        LayerInfo {
+            head: head.finish(),
+            content: content.finish(),
+            styles: styles.finish(),
+            whole: whole.finish(),
+            content_animated,
+            styles_animated,
+            animated: has_animation(&layer.props),
+            expressions: has_expression(&layer.props),
+            content_expressions,
+            time_dependent: time_dependent(layer),
+            reads_other_times: reads_other_times(layer),
+            reads_comp_scene: reads_comp_scene(layer),
+            paint: fx.is_some_and(|fx| fx.groups().any(|g| g.enabled && effectcraft_effects::paint::is_paint(g))),
+            masks_or_effects: layer.masks().is_some_and(|m| !m.children.is_empty()) || layer.effects().is_some_and(|fx| !fx.children.is_empty()),
+            layer_refs: fx.is_some_and(|fx| fx.groups().any(|g| g.enabled && names_layers(g))),
+        }
+    }
+}
+
+/// Does a property of `g` name a layer (a layer parameter set to a layer, keyframed or driven by
+/// an expression)?
+fn names_layers(g: &PropGroup) -> bool {
+    g.children.iter().any(|c| match c {
+        Node::Prop(p) => {
+            matches!(p.value, effectcraft_keyframe::Value::Layer(_))
+                && (matches!(p.value, effectcraft_keyframe::Value::Layer(Some(_))) || !p.keys.is_empty() || p.has_expression())
+        }
+        Node::Group(sub) => names_layers(sub),
+    })
+}
+
+/// The layers `g`'s layer parameters name at the context time.
+fn named_layers(ctx: &EvalCtx, layer: &Layer, g: &PropGroup, out: &mut Vec<u64>) {
+    for c in &g.children {
+        match c {
+            Node::Prop(p) if matches!(p.value, effectcraft_keyframe::Value::Layer(_)) => {
+                let v = if p.keys.is_empty() && !p.has_expression() { p.value.clone() } else { ctx.value(layer, p) };
+                if let effectcraft_keyframe::Value::Layer(Some(id)) = v {
+                    out.push(id);
+                }
+            }
+            Node::Prop(_) => {}
+            Node::Group(sub) => named_layers(ctx, layer, sub, out),
+        }
+    }
+}
+
+/// Fold in what `layer`'s effects read from other layers through layer parameters: each named
+/// layer's structure, animated values and source at the context time, and the layers its own
+/// effects name. `None` when one can't be keyed here (a precomp, an effect reading the comp
+/// scene, too deep).
+fn hash_layer_refs(h: &mut KeyHasher, ctx: &EvalCtx, layer: &Layer, reads_other_times: bool, depth: usize) -> Option<()> {
+    if depth > 4 {
+        return None;
+    }
+    let Some(fx) = layer.effects() else { return Some(()) };
+    let mut ids = vec![];
+    for g in fx.groups().filter(|g| g.enabled) {
+        named_layers(ctx, layer, g, &mut ids);
+    }
+    for id in ids {
+        id.hash(h);
+        let Some(o) = ctx.layer(effectcraft_project::LayerId(id)) else { continue };
+        if o.id == layer.id {
+            continue;
+        }
+        let oi = layer_info(ctx.comp, o);
+        // Read at other times, an expression may read anything then.
+        if oi.reads_comp_scene || (reads_other_times && oi.expressions) {
+            return None;
+        }
+        oi.whole.hash(h);
+        if oi.animated {
+            hash_values(h, ctx, o, &o.props);
+        }
+        match &o.source {
+            LayerSource::Solid { item } => hash_debug(h, &ctx.project.item(*item).map(|i| &i.kind)),
+            LayerSource::Footage { item } | LayerSource::Model { item } => {
+                let it = ctx.project.item(*item)?;
+                hash_debug(h, &it.kind);
+                hash_debug(h, &it.proxy);
+                ctx.source_time(o).0.hash(h);
+            }
+            LayerSource::Comp { .. } => return None,
+            _ => {}
+        }
+        if oi.time_dependent || oi.reads_other_times || oi.paint || reads_other_times {
+            ctx.time.0.hash(h);
+        }
+        if o.switches.effects && oi.layer_refs {
+            hash_layer_refs(h, ctx, o, reads_other_times || oi.reads_other_times, depth + 1)?;
+        }
+    }
+    Some(())
+}
+
+/// Values memoised per shared allocation (`Arc<T>`), by address. Each entry keeps a `Weak` on
+/// its allocation, so while it exists the address can't be reused by anything else, and the
+/// value can't change in place (`Arc::get_mut` refuses and `Arc::make_mut` moves it to a new
+/// allocation while a `Weak` exists). Entries whose value was dropped are pruned as the map
+/// grows.
+pub(crate) struct Memo<T, V> {
+    map: HashMap<usize, (Weak<T>, V)>,
+    cap: usize,
+}
+
+const MEMO_MIN: usize = 1024;
+
+impl<T, V: Clone> Memo<T, V> {
+    pub(crate) fn new() -> Memo<T, V> {
+        Memo { map: HashMap::new(), cap: MEMO_MIN }
+    }
+
+    /// The value for the live allocation at `addr`.
+    pub(crate) fn get(&self, addr: *const T) -> Option<V> {
+        let (w, v) = self.map.get(&(addr as usize))?;
+        (std::ptr::eq(w.as_ptr(), addr) && w.strong_count() > 0).then(|| v.clone())
+    }
+
+    pub(crate) fn put(&mut self, arc: &Arc<T>, v: V) {
+        if self.map.len() >= self.cap {
+            self.map.retain(|_, (w, _)| w.strong_count() > 0);
+            self.cap = (self.map.len() * 2).max(MEMO_MIN);
+        }
+        self.map.insert(Arc::as_ptr(arc) as usize, (Arc::downgrade(arc), v));
+    }
+}
+
+static LAYERS: LazyLock<RwLock<Memo<Layer, LayerInfo>>> = LazyLock::new(|| RwLock::new(Memo::new()));
+
+/// `layer`'s [`LayerInfo`], memoised when `layer` is one of `comp`'s shared layers (a layer
+/// from elsewhere is described afresh).
+pub(crate) fn layer_info(comp: &Comp, layer: &Layer) -> LayerInfo {
+    let addr: *const Layer = layer;
+    if let Some(i) = LAYERS.read().ok().and_then(|m| m.get(addr)) {
+        return i;
+    }
+    match comp.layers.arcs().iter().find(|a| std::ptr::eq(Arc::as_ptr(a), addr)) {
+        Some(arc) => layer_info_arc(arc),
+        None => LayerInfo::of(layer),
+    }
+}
+
+/// [`layer_info`] of a shared layer.
+pub(crate) fn layer_info_arc(arc: &Arc<Layer>) -> LayerInfo {
+    if let Some(i) = LAYERS.read().ok().and_then(|m| m.get(Arc::as_ptr(arc))) {
+        return i;
+    }
+    let info = LayerInfo::of(arc);
+    if let Ok(mut m) = LAYERS.write() {
+        m.put(arc, info);
+    }
+    info
+}
+
+// ------------------------------------------------------------------------------ keys
+
 /// Cache key for the processed (source → masks → effects) buffer of `layer` at the context
-/// time, or `None` when the layer must not be cached (footage, precomps, cameras, adjustment
-/// layers…).
+/// time, or `None` when the layer must not be cached (precomps and moving footage without a
+/// source key, see [`layer_key_src`]; cameras, adjustment layers…).
 pub fn layer_key(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool) -> Option<u64> {
+    layer_key_src(ctx, layer, scale, draft, blur, None)
+}
+
+/// [`layer_key`] with the renderer's key for the layer's source (`src`): a precomp's nested
+/// content ([`crate::precomp_key`]), or for footage which proxy the render uses. Without it,
+/// precomps and footage aren't cached.
+pub(crate) fn layer_key_src(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool, src: Option<u64>) -> Option<u64> {
     // Time effects see property values at other times. Keyframes are part of the hashed
     // structure (and the layer time is folded in), but expressions may read other layers at
     // those times, which the key cannot see: such layers are not cached.
-    if reads_other_times(layer) && layer.props.children.iter().any(|c| matches!(c, Node::Group(g) if g.match_id != "transform" && has_expression(g))) {
+    let info = layer_info(ctx.comp, layer);
+    if info.reads_other_times && info.content_expressions {
         return None;
     }
-    key_with(ctx, layer, scale, draft, blur, false)
+    key_with(ctx, layer, scale, draft, blur, false, src)
 }
 
 /// Cache key for a layer's *input* at the context time: source → masks → its first `effects`
-/// effects (see `Renderer::layer_input`). Unlike [`layer_key`], footage layers are cached here
-/// (keyed by item and source time), since Time effects read many neighbouring frames.
+/// effects (see `Renderer::layer_input`). Unlike [`layer_key`], every footage frame is cached
+/// here (keyed by item and source time), since Time effects read many neighbouring frames.
 pub fn input_key(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool, effects: usize) -> Option<u64> {
+    input_key_src(ctx, layer, scale, draft, blur, effects, None)
+}
+
+/// [`input_key`] with the renderer's source key (see [`layer_key_src`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn input_key_src(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool, effects: usize, src: Option<u64>) -> Option<u64> {
     if layer.switches.adjustment {
         return None;
     }
-    let base = key_any(ctx, layer, scale, draft, blur, true, Some(effects))?;
+    let base = key_any(ctx, layer, scale, draft, blur, true, Some(effects), src)?;
     let mut h = KeyHasher(base ^ 0x5bd1_e995_7a3c_11d3);
     effects.hash(&mut h);
     Some(h.finish())
@@ -610,20 +1010,25 @@ fn has_expression(g: &PropGroup) -> bool {
 /// Cache key for an adjustment layer's footprint (its source through its masks, see
 /// `Renderer::adjustment_footprint`): the GPU compositor then uploads it once, not every frame.
 pub fn footprint_key(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool) -> Option<u64> {
-    Some(derive(key_any(ctx, layer, scale, draft, blur, false, None)?, 0xf007_9417))
+    Some(derive(key_any(ctx, layer, scale, draft, blur, false, None, None)?, 0xf007_9417))
 }
 
-fn key_with(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool, footage: bool) -> Option<u64> {
+#[allow(clippy::too_many_arguments)]
+fn key_with(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool, footage: bool, src: Option<u64>) -> Option<u64> {
     if layer.switches.adjustment {
         return None;
     }
-    key_any(ctx, layer, scale, draft, blur, footage, None)
+    key_any(ctx, layer, scale, draft, blur, footage, None, src)
 }
 
-/// `blur`: the layer is motion blurred in this render (`Renderer::mb_on`). `effects`: key only
-/// the first that many effects (a layer's input, see [`input_key`]).
+/// `blur`: the layer is motion blurred in this render (`Renderer::mb_on`). `footage`: key every
+/// footage frame (a layer's input); otherwise moving footage is kept only when masks or effects
+/// process it, as each frame is used about once. `effects`: key only the first that many
+/// effects (a layer's input, see [`input_key`]). `src`: the renderer's source key (see
+/// [`layer_key_src`]).
 #[allow(clippy::too_many_arguments)]
-fn key_any(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool, footage: bool, effects: Option<usize>) -> Option<u64> {
+fn key_any(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool, footage: bool, effects: Option<usize>, src: Option<u64>) -> Option<u64> {
+    let info = layer_info(ctx.comp, layer);
     let mut h = KeyHasher(0xcbf2_9ce4_8422_2325);
     match &layer.source {
         LayerSource::Solid { item } => {
@@ -632,19 +1037,29 @@ fn key_any(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool, fo
             hash_debug(&mut h, s);
         }
         LayerSource::Text | LayerSource::Shape => {}
-        LayerSource::Footage { item } if footage => {
+        LayerSource::Footage { item } => {
             let it = ctx.project.item(*item)?;
             let ItemKind::Footage(f) = &it.kind else { return None };
+            // A still (and a still proxy) shows the same picture at every time.
+            let still = f.kind == FootageKind::Still && it.proxy.as_ref().is_none_or(|p| p.footage.kind == FootageKind::Still);
+            if !footage && (src.is_none() || !(still || info.masks_or_effects)) {
+                return None;
+            }
             hash_debug(&mut h, f);
             // A proxy (and its Use Proxy switch) changes the pixels.
             hash_debug(&mut h, &it.proxy);
             item.hash(&mut h);
-            ctx.source_time(layer).0.hash(&mut h);
-            // Frame blending mixes neighbouring source frames.
-            ctx.comp.enable_frame_blending.hash(&mut h);
+            if !still {
+                ctx.source_time(layer).0.hash(&mut h);
+                // Frame blending mixes neighbouring source frames.
+                ctx.comp.enable_frame_blending.hash(&mut h);
+            }
         }
+        // The nested comp's content, from the renderer.
+        LayerSource::Comp { .. } if src.is_some() => {}
         _ => return None,
     }
+    src.hash(&mut h);
     // Bit depth and colour management change the pixels.
     crate::color::Pipe::of(&ctx.project.settings).key().hash(&mut h);
     ctx.comp_id.hash(&mut h);
@@ -652,52 +1067,66 @@ fn key_any(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool, fo
     ctx.comp.height.hash(&mut h);
     scale.to_bits().hash(&mut h);
     draft.hash(&mut h);
-    layer.id.hash(&mut h);
-    hash_debug(&mut h, &layer.source);
-    // (Audio, Lock and Shy don't change pixels.)
-    hash_debug(&mut h, &layer.switches.pixels());
+    info.head.hash(&mut h);
     // Mask motion blur and effects that read the shutter depend on whether the layer is motion
     // blurred in this render and on the comp's shutter.
-    if layer.masks().is_some_and(|m| !m.children.is_empty()) || layer.effects().is_some_and(|fx| !fx.children.is_empty()) {
+    if info.masks_or_effects {
         blur.hash(&mut h);
         ctx.comp.enable_motion_blur.hash(&mut h);
         ctx.comp.shutter_angle.to_bits().hash(&mut h);
         ctx.comp.shutter_phase.to_bits().hash(&mut h);
         ctx.comp.motion_blur_samples.hash(&mut h);
     }
-    for c in &layer.props.children {
-        // Transform is applied later; Layer Styles are keyed separately (see [`styles_key`]).
-        if let Node::Group(g) = c
-            && (g.match_id == "transform" || g.match_id == effectcraft_project::styles::GROUP)
-        {
-            continue;
-        }
-        // A layer's input runs only its first effects: the later ones (a Puppet whose pins are
-        // dragged, #212) don't change it, so it stays cached.
-        if let (Some(n), Node::Group(g)) = (effects, c)
-            && g.match_id == "effects"
-        {
-            let mut first = g.clone();
-            let mut seen = 0;
-            first.children.retain(|e| match e {
-                Node::Prop(_) => true,
-                Node::Group(_) => {
-                    seen += 1;
-                    seen <= n
+    match effects {
+        // Static structure (memoised), then the values of what's animated.
+        None => {
+            info.content.hash(&mut h);
+            if info.content_animated {
+                for c in &layer.props.children {
+                    if let Node::Group(g) = c
+                        && g.match_id != "transform"
+                        && g.match_id != effectcraft_project::styles::GROUP
+                    {
+                        hash_values(&mut h, ctx, layer, g);
+                    }
                 }
-            });
-            hash_debug(&mut h, &first);
-            hash_values(&mut h, ctx, layer, &first);
-            continue;
+            }
         }
-        // Static structure: values, keyframes, expressions, enabled flags, effect ids, modes.
-        hash_debug(&mut h, c);
-        if let Node::Group(g) = c {
-            hash_values(&mut h, ctx, layer, g);
+        Some(n) => {
+            for c in &layer.props.children {
+                // Transform is applied later; Layer Styles are keyed separately (see [`styles_key`]).
+                if let Node::Group(g) = c
+                    && (g.match_id == "transform" || g.match_id == effectcraft_project::styles::GROUP)
+                {
+                    continue;
+                }
+                // A layer's input runs only its first effects: the later ones (a Puppet whose
+                // pins are dragged, #212) don't change it, so it stays cached.
+                if let Node::Group(g) = c
+                    && g.match_id == "effects"
+                {
+                    let mut first = g.clone();
+                    let mut seen = 0;
+                    first.children.retain(|e| match e {
+                        Node::Prop(_) => true,
+                        Node::Group(_) => {
+                            seen += 1;
+                            seen <= n
+                        }
+                    });
+                    hash_debug(&mut h, &first);
+                    hash_values(&mut h, ctx, layer, &first);
+                    continue;
+                }
+                hash_debug(&mut h, c);
+                if let Node::Group(g) = c {
+                    hash_values(&mut h, ctx, layer, g);
+                }
+            }
         }
     }
     // Paint strokes appear and disappear with their Duration spans (not property values).
-    if layer.switches.effects
+    if info.paint
         && let Some(fx) = layer.effects()
     {
         let lt = layer.layer_time(ctx.time).seconds();
@@ -705,15 +1134,19 @@ fn key_any(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool, fo
             effectcraft_effects::paint::cache_key(g, lt).0.hash(&mut h);
         }
     }
-    if time_dependent(layer) {
+    if info.time_dependent {
         layer.layer_time(ctx.time).0.hash(&mut h);
         // Effects also see the layer's time mapping.
         layer.start_time.0.hash(&mut h);
         layer.stretch.to_bits().hash(&mut h);
     }
     // Effects that see the comp camera or lights (#397) change when they or the layer move.
-    if reads_comp_scene(layer) {
+    if info.reads_comp_scene {
         hash_debug(&mut h, &crate::comp_scene(ctx, layer));
+    }
+    // Effects that read other layers (layer parameters) see their pixels.
+    if info.layer_refs {
+        hash_layer_refs(&mut h, ctx, layer, info.reads_other_times, 0)?;
     }
     Some(h.finish())
 }
@@ -736,8 +1169,11 @@ fn reads_comp_scene(layer: &Layer) -> bool {
 pub fn styles_key(ctx: &EvalCtx, layer: &Layer, content_key: u64) -> u64 {
     let mut h = KeyHasher(content_key ^ 0x9e37_79b9_7f4a_7c15);
     if let Some(g) = layer.layer_styles() {
-        hash_debug(&mut h, g);
-        hash_values(&mut h, ctx, layer, g);
+        let info = layer_info(ctx.comp, layer);
+        info.styles.hash(&mut h);
+        if info.styles_animated {
+            hash_values(&mut h, ctx, layer, g);
+        }
     }
     h.finish()
 }
