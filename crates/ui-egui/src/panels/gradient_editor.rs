@@ -229,7 +229,7 @@ mod tests {
             let lid = s.active_comp().unwrap().layers.last().unwrap().id;
             s.execute("effect.apply", json!({"layers": [lid.0], "effect": "Color Control"})).unwrap();
             let cid = s.active_comp_id().unwrap();
-            let layer = s.project.comp_mut(cid).unwrap().layer_mut(lid).unwrap();
+            let layer = std::sync::Arc::make_mut(&mut s.project).comp_mut(cid).unwrap().layer_mut(lid).unwrap();
             let prop = layer.props.prop_mut("effects/#1/color").unwrap();
             prop.value = Value::gradient(Gradient::default());
             prop.ui = ParamUi::Gradient;
@@ -238,6 +238,7 @@ mod tests {
             let mut app = EffectcraftApp::new(s);
             app.ui.timeline.search = "Color".into();
             let ctx = egui::Context::default();
+            crate::theme::install(&ctx, &app.tokens, "en");
             let panel_frame = |app: &mut EffectcraftApp, events| {
                 app.auto.begin_frame();
                 let mut out = ctx.run_ui(
