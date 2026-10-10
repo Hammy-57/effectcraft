@@ -516,6 +516,15 @@ impl Frames {
         }
     }
 
+    /// Bounded auxiliary preview work shares the existing native frame pool.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn spawn_background(&self, task: impl FnOnce() + Send + 'static) {
+        match &self.pool {
+            Some(pool) => pool.spawn(task),
+            None => rayon::spawn(task),
+        }
+    }
+
     /// Actual native frame-worker capacity, including the OS fallback pool.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn parallelism(&self) -> usize {
