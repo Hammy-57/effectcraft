@@ -926,3 +926,6 @@ before.
 - MCP `hosts` tool: lists where projects are open and `join`s a host (by port or project path) as
   a named agent, so an agent hops between projects without restarting; refused while its own
   headless project has unsaved changes.
+- `effectcraft-cli serve`: a windowless host holding one project that several agents join over the
+  control channel (own cursors, comp claims, waiting jobs that don't block the others, throttled
+  checkpoints, in the host list); `host.release` saves and stops it.

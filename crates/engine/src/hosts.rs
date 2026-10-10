@@ -106,7 +106,7 @@ fn write_entry(m: &Me) {
 }
 
 /// The project this process now has open (`None`: none, or an unsaved one).
-pub(crate) fn set_project(path: Option<&str>) {
+pub fn set_project(path: Option<&str>) {
     let mut me = lock(&ME);
     if let Some(m) = me.as_mut() {
         m.project = path.map(key);
