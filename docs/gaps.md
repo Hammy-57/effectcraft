@@ -223,6 +223,10 @@ Issues #41–#47 (all from the Linux AppImage 0.1.1, 5 October): panning the vie
 
 - Benchmark projects at 1080p and 4K with many layers, heavy effects, long footage and nested
   comps; record preview frame times, RAM preview fill and render times on reference machines.
+  Started 10 October 2026: `cargo xtask bench` renders generated 1080p / 4K scenarios (many
+  layers with common effects, nested precomps, footage) at Full and Half and records peak memory,
+  CPU and wall time per run, with `--compare` against an earlier run (docs/testing.md, "Render
+  benchmark").
 - Compare with After Effects on the same machine where possible.
 - Done when: benchmark numbers are tracked over time and regressions fail a check.
 
