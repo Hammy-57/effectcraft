@@ -244,6 +244,59 @@ pub(crate) struct KeyHit {
     pub value: [f64; 3],
     /// Parent space → comp.
     pub p2c: Mat3,
+    pub curved: bool,
+}
+
+/// A displayed motion-path sample interval; times remain in the layer's clock.
+pub(crate) struct MotionSegment {
+    pub layer: LayerId,
+    pub prop: u64,
+    pub from: Pos2,
+    pub to: Pos2,
+    pub start: Tick,
+    pub end: Tick,
+}
+
+pub(crate) fn motion_key_at(hits: &[KeyHit], pos: Pos2) -> Option<KeyHit> {
+    hits.iter().rev().find(|h| h.tangent.is_none() && h.pos.distance(pos) < 6.0).copied()
+}
+
+pub(crate) fn motion_segment_at(segments: &[MotionSegment], pos: Pos2) -> Option<(LayerId, u64, Tick)> {
+    segments
+        .iter()
+        .rev()
+        .filter_map(|s| {
+            let delta = s.to - s.from;
+            if delta.length_sq() < 0.001 {
+                return None;
+            }
+            let f = ((pos - s.from).dot(delta) / delta.length_sq()).clamp(0.0, 1.0);
+            let distance = pos.distance(s.from + delta * f);
+            let time = Tick::from_seconds_f64(s.start.seconds() + (s.end.seconds() - s.start.seconds()) * f64::from(f));
+            (distance < 6.0).then_some((distance, s.layer, s.prop, time))
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, l, p, t)| (l, p, t))
+}
+
+pub(crate) fn edit_motion_key(app: &mut EffectcraftApp, h: KeyHit, delete: bool) {
+    let result = app.session.execute("keys.select", json!({"keys": [{"layer": h.layer.0, "prop": h.prop, "time": h.time.seconds()}]})).and_then(|_| {
+        if delete {
+            app.session.execute("keys.delete", json!({}))
+        } else {
+            app.session.execute("keys.interpolation", json!({"spatial": if h.curved { "linear" } else { "bezier" }}))
+        }
+    });
+    if let Err(e) = result {
+        app.ui.status = e.to_string();
+    }
+}
+
+pub(crate) fn insert_motion_key(app: &mut EffectcraftApp, hit: (LayerId, u64, Tick)) {
+    let (layer, prop, time) = hit;
+    if let Err(e) = app.session.execute("keys.insertSpatial", json!({"layer": layer.0, "prop": prop, "time": time.seconds()})) {
+        app.ui.status = e.to_string();
+    }
 }
 
 /// Parent space → comp matrix of a 2D layer at the context time.
@@ -259,9 +312,19 @@ pub(crate) fn parent_to_comp(ectx: &EvalCtx, l: &Layer) -> Mat3 {
 
 /// Draw the position motion path of a selected 2D layer: frame dots along the path, keyframe
 /// squares (filled when selected) and spatial Bezier tangent handles. Works through parents.
-pub(crate) fn motion_path(app: &mut EffectcraftApp, painter: &egui::Painter, map: &ViewerMap, ectx: &EvalCtx, l: &Layer, col: Color32, hits: &mut Vec<KeyHit>) {
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn motion_path(
+    app: &mut EffectcraftApp,
+    painter: &egui::Painter,
+    map: &ViewerMap,
+    ectx: &EvalCtx,
+    l: &Layer,
+    col: Color32,
+    hits: &mut Vec<KeyHit>,
+    segments: &mut Vec<MotionSegment>,
+) {
     let Some(pos) = l.transform().and_then(|tr| tr.get("position")) else { return };
-    if pos.keys.len() < 2 || l.is_3d() {
+    if pos.keys.is_empty() || l.is_3d() {
         return;
     }
     let p2c = parent_to_comp(ectx, l);
@@ -271,15 +334,34 @@ pub(crate) fn motion_path(app: &mut EffectcraftApp, painter: &egui::Painter, map
     };
     // Settings ▸ Composition ▸ Motion Path: all keyframes, none, or a window around the CTI.
     let times: Vec<Tick> = pos.keys.iter().map(|k| k.time).collect();
-    let Some((lt0, lt1)) = app.session.prefs.motion_path_span(&times, l.layer_time(ectx.time)) else { return };
+    let span = app
+        .session
+        .prefs
+        .motion_path_span(&times, l.layer_time(ectx.time))
+        .or_else(|| (times.len() == 1 && app.session.prefs.composition.motion_path != "none").then(|| times.first().copied().map(|t| (t, t))).flatten());
+    let Some((lt0, lt1)) = span else { return };
     let fd = ectx.comp.frame_duration();
     let mut pts = vec![];
+    let mut samples = vec![];
     let mut lt = lt0;
     while lt <= lt1 && pts.len() < 20_000 {
         pts.push(to_scr(pos.value_at(lt).as_vec3()));
+        samples.push(lt);
+        if fd <= Tick::ZERO || lt.0.checked_add(fd.0).is_none() {
+            break;
+        }
         lt += fd;
     }
     pts.push(to_scr(pos.value_at(lt1).as_vec3()));
+    samples.push(lt1);
+    for (points, times) in pts.windows(2).zip(samples.windows(2)) {
+        let (Some(&from), Some(&to), Some(&start), Some(&end)) = (points.first(), points.get(1), times.first(), times.get(1)) else { continue };
+        // Holds jump rather than travelling through the connecting line.
+        let held = pos.keys.iter().rev().find(|k| k.time <= start).is_some_and(|k| k.out_interp == effectcraft_engine::keyframe::Interp::Hold);
+        if !held {
+            segments.push(MotionSegment { layer: l.id, prop: pos.uid, from, to, start, end });
+        }
+    }
     let faint = col.gamma_multiply(0.8);
     painter.add(egui::Shape::line(pts.clone(), Stroke::new(1.0, faint)));
     for q in &pts {
@@ -292,6 +374,7 @@ pub(crate) fn motion_path(app: &mut EffectcraftApp, painter: &egui::Painter, map
         }
         let v = k.value.as_vec3();
         let s = to_scr(v);
+        let curved = k.spatial_auto || k.spatial_in != [0.0; 3] || k.spatial_out != [0.0; 3];
         // Auto-Bezier keys show handles on a side the path leaves straight too (a two-key path's
         // ends), to drag it into a curve; Linear keys (no tangents) show none.
         let (tin, tout) = if k.spatial_auto {
@@ -309,7 +392,7 @@ pub(crate) fn motion_path(app: &mut EffectcraftApp, painter: &egui::Painter, map
             painter.circle_filled(h, 3.0, col);
             let side = if out { "out" } else { "in" };
             app.auto.add(&format!("viewer.motionPath.{}.{i}.{side}", l.id.0), Rect::from_center_size(h, vec2(8.0, 8.0)), "Spatial tangent");
-            hits.push(KeyHit { layer: l.id, prop: pos.uid, time: k.time, pos: h, tangent: Some(out), value: v, p2c });
+            hits.push(KeyHit { layer: l.id, prop: pos.uid, time: k.time, pos: h, tangent: Some(out), value: v, p2c, curved });
         }
         let r = Rect::from_center_size(s, vec2(7.0, 7.0));
         if sel.contains(&KeyRef { layer: l.id, prop: pos.uid, time: k.time }) {
@@ -319,7 +402,7 @@ pub(crate) fn motion_path(app: &mut EffectcraftApp, painter: &egui::Painter, map
             painter.rect_stroke(r, 0.0, Stroke::new(1.0, col), StrokeKind::Inside);
         }
         app.auto.add(&format!("viewer.motionPath.{}.{i}", l.id.0), r.expand(2.0), "Position keyframe");
-        hits.push(KeyHit { layer: l.id, prop: pos.uid, time: k.time, pos: s, tangent: None, value: v, p2c });
+        hits.push(KeyHit { layer: l.id, prop: pos.uid, time: k.time, pos: s, tangent: None, value: v, p2c, curved });
     }
 }
 

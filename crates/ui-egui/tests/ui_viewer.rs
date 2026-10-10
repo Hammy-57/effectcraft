@@ -1656,3 +1656,79 @@ fn timeline_twirl_applies_clicked_state_to_selected_layers() {
     assert!(!h.state().ui.timeline.open_layers.contains(&a));
     assert!(!h.state().ui.timeline.open_layers.contains(&b));
 }
+
+/// #553: the vertex tools edit Position keys instead of creating a mask on the layer.
+#[test]
+fn motion_path_vertex_tools_insert_convert_drag_delete_and_undo() {
+    let mut h = harness();
+    let id = LayerId(layer_id(&h, "Box"));
+    let s = &mut h.state_mut().session;
+    s.execute("layer.select", json!({"layers": [id.0]})).unwrap();
+    for (time, value) in [(0.0, [100, 100, 0]), (2.0, [500, 100, 0])] {
+        s.execute("prop.addKey", json!({"layer": id.0, "path": "transform/position", "time": time, "value": value})).unwrap();
+    }
+    s.set_time(effectcraft_engine::time::Tick::from_seconds_f64(1.0));
+    let property =
+        |h: &Harness<'_, EffectcraftApp>| h.state().session.active_comp().unwrap().layer(id).unwrap().props.prop("transform/position").unwrap().clone();
+    let original = property(&h);
+    for tool in [Tool::PenAdd, Tool::Pen] {
+        h.state_mut().ui.tool = tool;
+        h.run_steps(2);
+        let midpoint = screen(&h, [300.0, 100.0]);
+        click(&mut h, midpoint);
+        let inserted = property(&h);
+        assert_eq!(inserted.keys.len(), 3, "{tool:?}: {}", h.state().ui.status);
+        assert!((inserted.keys[1].time.seconds() - 1.0).abs() < 0.01);
+        assert!((inserted.keys[1].value.as_vec3()[0] - 300.0).abs() < 1.0);
+        assert!(h.state().session.active_comp().unwrap().layer(id).unwrap().masks().is_none_or(|m| m.groups().next().is_none()));
+        h.state_mut().session.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(property(&h).keys, original.keys);
+    }
+    h.state_mut().ui.tool = Tool::PenConvert;
+    h.run_steps(2);
+    let at = screen(&h, [100.0, 100.0]);
+    click(&mut h, at);
+    assert!(!property(&h).keys[0].spatial_auto);
+    assert_eq!(property(&h).keys[0].spatial_out, [0.0; 3]);
+    let to = screen(&h, [170.0, 170.0]);
+    drag(&mut h, at, to);
+    let k = property(&h).keys[0].clone();
+    assert!((k.spatial_out[0] - 70.0).abs() < 2.0 && (k.spatial_out[1] - 70.0).abs() < 2.0, "{k:?}");
+    assert_eq!(k.spatial_in, k.spatial_out.map(|x| -x));
+    for tool in [Tool::PenDelete, Tool::Pen] {
+        h.state_mut().ui.tool = tool;
+        h.run_steps(2);
+        click(&mut h, at);
+        assert_eq!(property(&h).keys.len(), 1, "{tool:?}");
+        h.state_mut().session.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(property(&h).keys.len(), 2);
+    }
+}
+
+#[test]
+fn motion_path_pen_cursor_changes_with_tool_and_hover_target() {
+    use egui::CursorIcon;
+    let mut h = harness();
+    let id = layer_id(&h, "Box");
+    let s = &mut h.state_mut().session;
+    s.execute("layer.select", json!({"layers": [id]})).unwrap();
+    for (time, value) in [(0.0, [100, 100, 0]), (2.0, [500, 100, 0])] {
+        s.execute("prop.addKey", json!({"layer": id, "path": "transform/position", "time": time, "value": value})).unwrap();
+    }
+    s.set_time(effectcraft_engine::time::Tick::from_seconds_f64(1.0));
+    for (tool, point, expected) in [
+        (Tool::Pen, [100.0, 100.0], CursorIcon::NotAllowed),
+        (Tool::Pen, [300.0, 100.0], CursorIcon::Copy),
+        (Tool::Pen, [300.0, 300.0], CursorIcon::Crosshair),
+        (Tool::PenAdd, [100.0, 100.0], CursorIcon::Copy),
+        (Tool::PenDelete, [100.0, 100.0], CursorIcon::NotAllowed),
+        (Tool::PenConvert, [100.0, 100.0], CursorIcon::Alias),
+    ] {
+        h.state_mut().ui.tool = tool;
+        h.run_steps(2);
+        let point = screen(&h, point);
+        h.input_mut().events.push(Event::PointerMoved(point));
+        h.run_steps(2);
+        assert_eq!(h.output().platform_output.cursor_icon, expected, "{tool:?}");
+    }
+}
