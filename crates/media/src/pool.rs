@@ -317,6 +317,9 @@ struct Inner {
     /// Settings ▸ Disk ▸ Conformed Audio Folder: decoded audio tracks written once per file and
     /// rate, read back instead of decoding again (`None` = off).
     conform: Mutex<Option<std::path::PathBuf>>,
+    /// The read-ahead workers' queue (started on the first read-ahead).
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    prefetcher: OnceLock<Option<std::sync::mpsc::SyncSender<Prefetch>>>,
     /// Conformed files being written right now.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     conforming: Mutex<HashSet<std::path::PathBuf>>,
@@ -387,6 +390,7 @@ impl MediaPool {
                 prefetched: AtomicU64::new(0),
                 opened: AtomicU64::new(0),
                 conform: Mutex::default(),
+                prefetcher: OnceLock::new(),
                 conforming: Mutex::default(),
             }),
         }
@@ -837,14 +841,14 @@ impl Inner {
         Ok(px)
     }
 
+    /// Decode a frame ahead of playback on a read-ahead worker. A full queue drops the request
+    /// (playback is ahead of decoding anyway): a thread was spawned per frame before.
     #[cfg(not(target_arch = "wasm32"))]
     fn prefetch(self: &Arc<Self>, footage: &Footage, t: Tick, preview: Option<Preview>) {
-        let (me, f) = (self.clone(), footage.clone());
-        self.prefetched.fetch_add(1, Ordering::Relaxed);
-        // A plain thread, not a rayon job: the decode below parallelises with rayon itself.
-        std::thread::spawn(move || {
-            let _ = me.pixels_at(&f, t, false, preview);
-        });
+        let Some(tx) = self.prefetcher.get_or_init(start_prefetchers) else { return };
+        if tx.try_send((Arc::downgrade(self), footage.clone(), t, preview)).is_ok() {
+            self.prefetched.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -987,6 +991,38 @@ impl FootageSource for MediaPool {
         }
         Some(self.audio_samples(footage, t, frames, rate))
     }
+}
+
+/// A read-ahead request: the pool (not kept alive by the queue), the footage and its time.
+type Prefetch = (std::sync::Weak<Inner>, Footage, Tick, Option<Preview>);
+
+/// Read-ahead workers per pool, and requests queued for them.
+#[cfg(not(target_arch = "wasm32"))]
+const PREFETCH_WORKERS: usize = 2;
+#[cfg(not(target_arch = "wasm32"))]
+const PREFETCH_QUEUE: usize = 4;
+
+/// Start the read-ahead workers: plain threads, not rayon jobs (the decodes parallelise with
+/// rayon themselves). They end when the pool (holding the queue's sender) is dropped.
+#[cfg(not(target_arch = "wasm32"))]
+fn start_prefetchers() -> Option<std::sync::mpsc::SyncSender<Prefetch>> {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Prefetch>(PREFETCH_QUEUE);
+    let rx = Arc::new(Mutex::new(rx));
+    let mut started = 0;
+    for i in 0..PREFETCH_WORKERS {
+        let rx = rx.clone();
+        let spawned = std::thread::Builder::new().name(format!("ec-media-readahead-{i}")).spawn(move || {
+            loop {
+                let job = lock(&rx).recv();
+                let Ok((pool, f, t, preview)) = job else { return };
+                if let Some(me) = pool.upgrade() {
+                    let _ = me.pixels_at(&f, t, false, preview);
+                }
+            }
+        });
+        started += usize::from(spawned.is_ok());
+    }
+    (started > 0).then_some(tx)
 }
 
 impl MediaPool {
