@@ -1,7 +1,8 @@
 //! Panel Group Settings ▸ Solo Panels in Stack and Small Tabs (egui_kittest), as in After
 //! Effects: Solo keeps one panel of a stacked panel group expanded (expanding one collapses the
-//! others); Small Tabs gives a group a shorter tab strip. Both are `window.*` commands, check
-//! items of the panel menu, and stay with the layout when a workspace is saved and restored.
+//! others); Small Tabs gives a group a shorter tab strip, docked or undocked. Both are
+//! `window.*` commands, check items of the panel menu, and stay with the layout when a workspace
+//! is saved and restored.
 
 use effectcraft_engine::Session;
 use effectcraft_ui_egui::EffectcraftApp;
@@ -135,7 +136,47 @@ fn small_tabs_shorten_the_tab_strip() {
     // Explicit off.
     invoke(&mut h, "window.smallTabs", json!({"panel": "Project", "small": false})).unwrap();
     assert!((rect(&h, "panel.strip.Project").height() - strip.height()).abs() < 0.5);
-    assert!(invoke(&mut h, "window.smallTabs", json!({"panel": "Tracker"})).is_err(), "not docked");
+    assert!(invoke(&mut h, "window.smallTabs", json!({"panel": "Tracker"})).is_err(), "not open");
+}
+
+#[test]
+fn small_tabs_for_undocked_groups() {
+    let mut h = harness();
+    invoke(&mut h, "window.floatPanel", json!({"panel": "Project", "rect": [300, 200, 360, 260]})).unwrap();
+    let strip = rect(&h, "panel.strip.Project");
+    let body = rect(&h, "panel.Project");
+    // The panel menu's item works for an undocked group (from its tab's right-click menu).
+    assert_eq!(item(&h, PanelKind::Project, "smallTabs"), (true, false));
+    choose(&mut h, "panel.tab.Project", "smallTabs");
+    assert!(h.state().ui.floating[0].small);
+    assert_eq!(item(&h, PanelKind::Project, "smallTabs"), (true, true));
+    let small = rect(&h, "panel.strip.Project");
+    assert!(small.height() < strip.height() - 4.0, "{} → {}", strip.height(), small.height());
+    assert!((rect(&h, "panel.tab.Project").height() - small.height()).abs() < 0.5, "the tabs fit the strip");
+    let taller = rect(&h, "panel.Project");
+    assert!((taller.min.y - (body.min.y - (strip.height() - small.height()))).abs() < 0.5, "{body:?} → {taller:?}");
+    assert!((taller.max.y - body.max.y).abs() < 0.5, "the window keeps its size");
+    // The command toggles it, or sets it.
+    assert_eq!(invoke(&mut h, "window.smallTabs", json!({"panel": "Project"})).unwrap(), json!({"small": false}));
+    assert!((rect(&h, "panel.strip.Project").height() - strip.height()).abs() < 0.5);
+    assert_eq!(invoke(&mut h, "window.smallTabs", json!({"panel": "Project", "small": true})).unwrap(), json!({"small": true}));
+    // A tab added to the group shows small too; the setting is the group's.
+    invoke(&mut h, "window.dockPanel", json!({"panel": "Align", "anchor": "Project"})).unwrap();
+    assert!((rect(&h, "panel.tab.Align").height() - small.height()).abs() < 0.5);
+    // Undock Panel Group keeps a docked group's Small Tabs (as Stacked Panel Group does).
+    invoke(&mut h, "window.smallTabs", json!({"panel": "Timeline", "small": true})).unwrap();
+    invoke(&mut h, "window.floatPanelGroup", json!({"panel": "Timeline"})).unwrap();
+    let f = h.state().ui.floating.iter().find(|f| f.panels.contains(&PanelKind::Timeline)).cloned().unwrap();
+    assert!(f.small);
+    assert!(rect(&h, "panel.strip.Timeline").height() < strip.height() - 4.0);
+    // It persists with the UI state, and a group without it saves no field.
+    let json = serde_json::to_value(&h.state().ui).unwrap();
+    let back: effectcraft_ui_egui::state::UiState = serde_json::from_value(json).unwrap();
+    assert_eq!(back.floating, h.state().ui.floating);
+    invoke(&mut h, "window.smallTabs", json!({"panel": "Project", "small": false})).unwrap();
+    let json = serde_json::to_value(&h.state().ui.floating).unwrap();
+    assert!(json[0].get("small").is_none(), "{json}");
+    assert!(invoke(&mut h, "window.smallTabs", json!({"panel": "Tracker"})).is_err(), "not open");
 }
 
 #[test]

@@ -3,10 +3,10 @@
 use crate::composite::{apply_matte, window_rows, window_rows_ref};
 use crate::motion_blur::MotionMemo;
 use crate::{EvalCtx, Image, Renderer, color, masks};
-use effectcraft_raster::pool;
 use effectcraft_color::BlendMode;
 use effectcraft_effects::Buf;
 use effectcraft_project::Layer;
+use effectcraft_raster::pool;
 use rayon::prelude::*;
 
 impl<'a> Renderer<'a> {

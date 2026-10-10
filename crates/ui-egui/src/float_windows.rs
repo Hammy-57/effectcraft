@@ -11,12 +11,16 @@
 //!   menu's Dock Panel and Window ▸ <panel> work as for a group floating in the main window.
 //! - Shortcuts, the panel menu (≡) and tab drags work in it: a tab dragged out of it lands where
 //!   it is dropped, in the main window's dock or another undocked group.
+//! - A window saved on a monitor that is gone (unplugged since) opens over the main window
+//!   instead ([`rescue`]).
+//! - While EffectCraft is the active app the windows float above the main window (After
+//!   Effects' floating panels); when another app is, they are ordinary windows ([`OnTop`]).
 //! - Agents: automation elements drawn in it carry `window` (the group's [`Floating::id`]) and
 //!   their rect is in its coordinates; `ui.click`, `ui.drag`, `ui.scroll` on them (or with
 //!   `window`) are delivered to that window, and `ui.key`/`ui.type` follow the last pointer
 //!   input. `ui.screenshot` captures the main window only.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use egui::{Pos2, Rect, Sense, Stroke, StrokeKind, ViewportId, pos2, vec2};
 
@@ -63,6 +67,8 @@ pub struct OsWindows {
     /// The screen rect each open window was created with. Its builder keeps it, so egui doesn't
     /// move or resize the window back every frame.
     created: BTreeMap<u64, [f32; 4]>,
+    /// The open windows whose place was checked against the monitors (once, when they open).
+    checked: BTreeSet<u64>,
     /// The windows shown in the last frame: group id → content rect on screen (points).
     pub(crate) shown: BTreeMap<u64, Rect>,
     /// The windows shown so far this frame.
@@ -74,6 +80,69 @@ pub struct OsWindows {
     /// A tab drag that started in this group's window, and where its pointer is.
     pub(crate) drag_from: Option<u64>,
     pub(crate) drag_feed: Option<DragFeed>,
+    /// A tab drag's feedback for the window under the pointer, drawn in its next pass.
+    pub(crate) drag_overlay: Option<DragOverlay>,
+    /// Whether the windows float above the main window.
+    pub(crate) on_top: OnTop,
+}
+
+/// How long no EffectCraft window may have the focus before the undocked windows stop floating
+/// above the main window (seconds): focus moving from one of our windows to another passes
+/// through a frame or two in which none has it.
+const LEVEL_DEBOUNCE: f64 = 0.2;
+
+/// Whether the undocked windows float above the main window, as After Effects' floating panels
+/// do: while EffectCraft is the active app (one of its windows has the focus), and not when
+/// another app is, so they don't float above its windows. egui has no parent-window API, so
+/// this is their window level (`AlwaysOnTop` / `Normal`, set through their viewport builders,
+/// which send it only when it changes). Gaining the focus raises them at once; losing it lowers
+/// them once it has stayed lost for [`LEVEL_DEBOUNCE`].
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct OnTop {
+    pub on: bool,
+    /// Since when (seconds) no window has had the focus while `on`.
+    lost_at: Option<f64>,
+}
+
+impl OnTop {
+    /// A frame at `now` (seconds) in which `focused`: any EffectCraft window has the focus.
+    /// Returns the new state when it changes, and while a change waits, how long until it may
+    /// happen (repaint then).
+    pub(crate) fn update(&mut self, focused: bool, now: f64) -> (Option<bool>, Option<f64>) {
+        if focused {
+            self.lost_at = None;
+            let raised = !self.on;
+            self.on = true;
+            return (raised.then_some(true), None);
+        }
+        if !self.on {
+            return (None, None);
+        }
+        let since = *self.lost_at.get_or_insert(now);
+        let left = LEVEL_DEBOUNCE - (now - since);
+        if left > 0.0 && left <= LEVEL_DEBOUNCE {
+            return (None, Some(left));
+        }
+        // (Also when the clock is odd: never stay above other apps.)
+        *self = OnTop::default();
+        (Some(false), None)
+    }
+
+    /// The undocked windows' window level.
+    pub(crate) fn level(&self) -> egui::WindowLevel {
+        if self.on { egui::WindowLevel::AlwaysOnTop } else { egui::WindowLevel::Normal }
+    }
+}
+
+/// What an undocked window draws while a tab is dragged over it (in its own coordinates): the
+/// highlight of where the tab will land and the dragged tab.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct DragOverlay {
+    /// The group ([`Floating::id`]) whose window draws it.
+    pub window: u64,
+    pub panel: PanelKind,
+    pub pointer: Pos2,
+    pub mark: Option<crate::dock_ui::DropMark>,
 }
 
 /// The pointer of a tab drag that started in an OS window (which has the pointer until the
@@ -87,9 +156,17 @@ pub(crate) struct DragFeed {
 }
 
 impl OsWindows {
-    /// Start a frame's windows.
-    pub(crate) fn begin_frame(&mut self) {
+    /// Start a frame's windows: they float above the main window while EffectCraft is the
+    /// active app.
+    pub(crate) fn begin_frame(&mut self, ctx: &egui::Context) {
         self.building.clear();
+        if !enabled(ctx) {
+            return;
+        }
+        let (focused, now) = ctx.input(|i| (i.raw.viewports.values().any(|v| v.focused == Some(true)), i.time));
+        if let (_, Some(wait)) = self.on_top.update(focused, now) {
+            ctx.request_repaint_after(std::time::Duration::try_from_secs_f64(wait).unwrap_or_default());
+        }
     }
 
     /// After the floating groups are drawn: forget the windows that are gone (they close).
@@ -97,6 +174,7 @@ impl OsWindows {
         self.shown = std::mem::take(&mut self.building);
         let shown = &self.shown;
         self.created.retain(|id, _| shown.contains_key(id));
+        self.checked.retain(|id| shown.contains_key(id));
         if self.key_target.is_some_and(|w| !shown.contains_key(&w)) {
             self.key_target = None;
         }
@@ -104,6 +182,21 @@ impl OsWindows {
         let live: Vec<ViewportId> = shown.keys().map(|w| viewport_id(*w)).collect();
         ctx.with_plugin::<InputRouter, _>(|r| r.queue.retain(|(v, _)| live.contains(v)));
     }
+}
+
+/// Whether a saved screen rect can be a window's: finite, a size, not absurdly far away.
+fn plausible(s: &[f32; 4]) -> bool {
+    s.iter().all(|v| v.is_finite() && v.abs() < 100_000.0) && s[2] > 0.0 && s[3] > 0.0
+}
+
+/// Where a window that is on no monitor goes (on screen, points): inside the main window's
+/// content rect `main`, as near its rect `want` and as large as fits (at least [`MIN_SIZE`]).
+pub(crate) fn rescue(main: Rect, want: Rect) -> Rect {
+    let want = if want.is_finite() { want } else { Rect::from_min_size(main.min, MIN_SIZE) };
+    let size = want.size().min(main.size()).max(MIN_SIZE);
+    // (`min`/`max` rather than `clamp`, which panics on NaN.)
+    let min = want.min.min(main.max - size).max(main.min);
+    Rect::from_min_size(min, size)
 }
 
 /// Synthetic input (`ui.click` …) for the undocked windows: the main window's goes through
@@ -179,6 +272,8 @@ struct WindowOut {
     close: bool,
     outer: Option<Rect>,
     inner: Option<Rect>,
+    /// Whether the OS says the window is on a monitor.
+    on_monitor: bool,
 }
 
 impl EffectcraftApp {
@@ -197,7 +292,11 @@ impl EffectcraftApp {
     ) -> Option<(Group, Vec<(PanelKind, Rect)>)> {
         let f = self.ui.floating.get(i)?.clone();
         let vid = viewport_id(f.id);
-        let at = *self.os_windows.created.entry(f.id).or_insert_with(|| f.screen.unwrap_or([origin.x + f.rect[0], origin.y + f.rect[1], f.rect[2], f.rect[3]]));
+        let at = *self
+            .os_windows
+            .created
+            .entry(f.id)
+            .or_insert_with(|| f.screen.filter(plausible).unwrap_or([origin.x + f.rect[0], origin.y + f.rect[1], f.rect[2], f.rect[3]]));
         let size = vec2(at[2], at[3]).max(MIN_SIZE);
         let active = f.active.min(f.panels.len().saturating_sub(1));
         let title = f.panels.get(active).map(|p| (info.title)(*p)).unwrap_or_default();
@@ -206,6 +305,7 @@ impl EffectcraftApp {
             .with_position(pos2(at[0], at[1]))
             .with_inner_size(size)
             .with_min_inner_size(MIN_SIZE)
+            .with_window_level(self.os_windows.on_top.level())
             .with_taskbar(false);
         if self.os_windows.raise == Some(f.id) {
             self.os_windows.raise = None;
@@ -238,6 +338,23 @@ impl EffectcraftApp {
             fl.screen = Some(screen);
             fl.rect = [inner.min.x - origin.x, inner.min.y - origin.y, inner.width(), inner.height()];
         }
+        // Once it is open: a window on no monitor (saved on one that is gone) moves over the main
+        // window. (macOS says so reliably; Windows always names the nearest monitor.)
+        if out.outer.is_some() && self.os_windows.checked.insert(f.id) && !out.on_monitor {
+            // (Only when the main window is on a known monitor itself: some docked displays have
+            // no monitor id, and then nothing is known.)
+            let main = ctx.input(|i| i.raw.viewports.get(&ViewportId::ROOT).filter(|v| v.monitor_size.is_some()).and_then(|v| v.inner_rect));
+            if let Some(main) = main {
+                let r = rescue(main, Rect::from_min_size(pos2(at[0], at[1]), size));
+                // (The builder's new position and size move the window.)
+                self.os_windows.created.insert(f.id, [r.min.x, r.min.y, r.width(), r.height()]);
+                if let Some(fl) = self.ui.floating.get_mut(i).filter(|fl| fl.id == f.id) {
+                    fl.screen = Some([r.min.x, r.min.y, r.width(), r.height()]);
+                    fl.rect = [r.min.x - origin.x, r.min.y - origin.y, r.width(), r.height()];
+                }
+                ctx.request_repaint();
+            }
+        }
         let off = inner.min - origin;
         let g = Group { rect: out.group.rect.translate(off), content: out.group.content.translate(off), ..out.group };
         Some((g, out.tabs.into_iter().map(|(p, r)| (p, r.translate(off))).collect()))
@@ -255,7 +372,8 @@ impl EffectcraftApp {
         let r = ui.max_rect();
         ui.painter().rect_filled(r, 0.0, t.app_bg);
         // Drag the empty part of the tab strip to move the window (tabs take precedence).
-        let strip = Rect::from_min_size(r.min, vec2(r.width(), t.tab_h));
+        let strip_h = f.strip_h(&t);
+        let strip = Rect::from_min_size(r.min, vec2(r.width(), strip_h));
         let mv = ui.interact(strip, egui::Id::new(("floating-os-panel", f.id, "move")), Sense::drag());
         self.auto.add(&format!("panel.float.{i}.move"), strip, "Move floating panel");
         if mv.drag_started() {
@@ -264,7 +382,7 @@ impl EffectcraftApp {
         let g = Group {
             path: format!("f{i}"),
             rect: r,
-            content: Rect::from_min_max(pos2(r.min.x, r.min.y + t.tab_h), r.max),
+            content: Rect::from_min_max(pos2(r.min.x, r.min.y + strip_h), r.max),
             panels: f.panels.clone(),
             active,
             stacked: None,
@@ -292,25 +410,39 @@ impl EffectcraftApp {
         }
         crate::panels::panel_menu::show(self, ui);
         self.feed_tab_drag(ui, f.id);
-        let (close, outer, inner) = ui.input(|i| (i.viewport().close_requested(), i.viewport().outer_rect, i.viewport().inner_rect));
-        WindowOut { group: g, tabs: c.tabs, actions, close, outer, inner }
+        self.draw_drag_overlay(&ctx, f.id);
+        let (close, outer, inner, on_monitor) =
+            ui.input(|i| (i.viewport().close_requested(), i.viewport().outer_rect, i.viewport().inner_rect, i.viewport().monitor_size.is_some()));
+        WindowOut { group: g, tabs: c.tabs, actions, close, outer, inner, on_monitor }
     }
 
     /// A tab drag that started in this window: this window has the pointer, so it tells the
-    /// dock where it is (on screen) and draws the dragged tab while it is over the window.
+    /// dock where it is (on screen). (The window under the pointer draws the dragged tab.)
     fn feed_tab_drag(&mut self, ui: &egui::Ui, window: u64) {
         if self.os_windows.drag_from != Some(window) {
             return;
         }
         let ctx = ui.ctx().clone();
-        let Some(p) = ctx.data(|d| d.get_temp::<PanelKind>(crate::dock_ui::drag_id())) else { return };
+        if ctx.data(|d| d.get_temp::<PanelKind>(crate::dock_ui::drag_id())).is_none() {
+            return;
+        }
         let (pos, released, command, inner) = ui.input(|i| (i.pointer.latest_pos(), i.pointer.any_released(), i.modifiers.command, i.viewport().inner_rect));
         let (Some(pos), Some(inner)) = (pos, inner) else { return };
         self.os_windows.drag_feed = Some(DragFeed { screen: inner.min + pos.to_vec2(), released, command });
-        let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("dock-drop")));
-        crate::dock_ui::drag_ghost(&painter, p, pos, &self.tokens);
         ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
         ctx.request_repaint();
+    }
+
+    /// A tab dragged over this window (from anywhere): where it will land and the dragged tab,
+    /// as the dock's drop logic placed them last frame.
+    fn draw_drag_overlay(&self, ctx: &egui::Context, window: u64) {
+        let Some(o) = self.os_windows.drag_overlay.filter(|o| o.window == window) else { return };
+        let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("dock-drop")));
+        if let Some(m) = o.mark {
+            m.paint(&painter, &self.tokens);
+        }
+        crate::dock_ui::drag_ghost(&painter, o.panel, o.pointer, &self.tokens);
+        ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
     }
 }
 
@@ -354,6 +486,61 @@ mod tests {
         let old: Layout = serde_json::from_value(old).unwrap();
         let f = &old.floating[0];
         assert_eq!((f.id, f.screen, f.rect, &f.panels), (0, None, [200.0, 150.0, 320.0, 240.0], &vec![Info]));
+    }
+
+    #[test]
+    fn undocked_windows_float_above_the_main_window_only_while_effectcraft_is_active() {
+        let mut t = OnTop::default();
+        assert_eq!(t.level(), egui::WindowLevel::Normal);
+        // EffectCraft becomes the active app: at once.
+        assert_eq!(t.update(true, 1.0), (Some(true), None));
+        assert_eq!(t.level(), egui::WindowLevel::AlwaysOnTop);
+        assert_eq!(t.update(true, 1.1), (None, None), "no change, nothing sent");
+        // The focus moves from one of our windows to another (a frame with none focused).
+        let (change, wait) = t.update(false, 1.2);
+        assert_eq!(change, None);
+        assert!(wait.is_some_and(|w| (w - LEVEL_DEBOUNCE).abs() < 1e-9));
+        assert_eq!(t.update(false, 1.25).0, None);
+        assert_eq!(t.update(true, 1.3), (None, None));
+        assert!(t.on);
+        // Another app becomes active: once the focus has stayed away, they are ordinary windows.
+        assert_eq!(t.update(false, 2.0).0, None);
+        assert_eq!(t.update(false, 2.1).0, None);
+        assert_eq!(t.update(false, 2.0 + LEVEL_DEBOUNCE).0, Some(false));
+        assert_eq!(t.level(), egui::WindowLevel::Normal);
+        assert_eq!(t.update(false, 3.0), (None, None));
+        // A clock that jumps back never keeps them above other apps.
+        t.update(true, 5.0);
+        t.update(false, 5.1);
+        assert_eq!(t.update(false, 1.0).0, Some(false));
+    }
+
+    #[test]
+    fn a_window_on_a_monitor_that_is_gone_opens_over_the_main_window() {
+        let main = Rect::from_min_size(pos2(100.0, 50.0), vec2(1600.0, 1000.0));
+        // Saved left of the main window, on a second monitor that was unplugged.
+        let r = rescue(main, Rect::from_min_size(pos2(-1500.0, 80.0), vec2(640.0, 480.0)));
+        assert_eq!(r, Rect::from_min_size(pos2(100.0, 80.0), vec2(640.0, 480.0)));
+        // Below and right of it: kept whole inside.
+        let r = rescue(main, Rect::from_min_size(pos2(5000.0, 3000.0), vec2(640.0, 480.0)));
+        assert_eq!(r, Rect::from_min_size(pos2(1060.0, 570.0), vec2(640.0, 480.0)));
+        // Larger than the main window: shrunk to it.
+        let r = rescue(main, Rect::from_min_size(pos2(-3000.0, 0.0), vec2(4000.0, 3000.0)));
+        assert_eq!(r, main);
+        // A tiny main window: the smallest window, at its corner.
+        let small = Rect::from_min_size(pos2(10.0, 10.0), vec2(50.0, 40.0));
+        assert_eq!(rescue(small, Rect::from_min_size(pos2(900.0, 900.0), vec2(300.0, 200.0))), Rect::from_min_size(small.min, MIN_SIZE));
+        // Nonsense: at the main window's corner.
+        let nan = Rect::from_min_size(pos2(f32::NAN, 0.0), vec2(300.0, 200.0));
+        assert_eq!(rescue(main, nan), Rect::from_min_size(main.min, MIN_SIZE));
+        // A main window rect the platform got wrong doesn't panic.
+        let odd = Rect::from_min_size(pos2(f32::NAN, 0.0), vec2(f32::NAN, 100.0));
+        let _ = rescue(odd, Rect::from_min_size(pos2(10.0, 10.0), vec2(300.0, 200.0)));
+        // Saved rects that can't be a window's are ignored before it opens.
+        assert!(plausible(&[-1500.0, 80.0, 640.0, 480.0]));
+        assert!(!plausible(&[f32::INFINITY, 80.0, 640.0, 480.0]));
+        assert!(!plausible(&[1.0e9, 80.0, 640.0, 480.0]));
+        assert!(!plausible(&[0.0, 0.0, 0.0, 480.0]));
     }
 
     #[test]

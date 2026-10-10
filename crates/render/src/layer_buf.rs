@@ -240,7 +240,11 @@ impl<'a> Renderer<'a> {
         let key = cache::styles_key(ctx, layer, ckey);
         let body = blend(key)?;
         let content = blend(ckey)?;
-        let passes = styles::pass_modes(ctx, layer).into_iter().enumerate().map(|(i, m)| blend(cache::derive(key, i as u64 + 1)).map(|b| (b, m))).collect::<Option<Vec<_>>>()?;
+        let passes = styles::pass_modes(ctx, layer)
+            .into_iter()
+            .enumerate()
+            .map(|(i, m)| blend(cache::derive(key, i as u64 + 1)).map(|b| (b, m)))
+            .collect::<Option<Vec<_>>>()?;
         Some(StyledLayer { passes, body, content, key: Some(key), ckey: Some(ckey), plain: false })
     }
 

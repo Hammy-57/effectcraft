@@ -905,6 +905,18 @@ before.
   and Small Tabs (`window.smallTabs {panel, small?}`) gives a docked group or stack a shorter tab
   strip with smaller labels. Both are saved with the layout and its workspaces. Floating groups
   don't have Small Tabs yet.
+
+## Update: undocked panel windows, finishing touches (10 October)
+
+- Panel Group Settings ▸ Small Tabs works for undocked groups too (in their OS window and where
+  they float inside the main window), from the panel menu or `window.smallTabs`; Undock Panel
+  Group keeps a docked group's Small Tabs, and the setting is saved with the layout.
+- Dragging a tab over an undocked window shows where it will land (the tab strip highlight and
+  insertion mark) and the dragged tab in that window, whichever window the drag started in.
+- Undocked windows stay above the main window while EffectCraft is the active app, as After
+  Effects' floating panels do, and become ordinary windows when another app is active.
+- An undocked window saved on a monitor that has since been unplugged opens over the main
+  window instead of off-screen (macOS; Windows catches only absurd saved positions).
 - Agents sharing the desktop app over MCP get their own name by default: a bridged MCP server
   without `--client` runs as `<MCP client name>-<pid>`, so it never moves the user's selection,
   comp or time and can claim comps; `"client": ""` runs one call as the user.

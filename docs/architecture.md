@@ -634,11 +634,28 @@ workspace saves and relaunches; `Floating::rect` keeps the place relative to the
 for a new window and by the fallback. Older layouts without these fields load (`#[serde(default)]`).
 Closing the window closes its panels (as After Effects does); the panel menu's Dock Panel, the
 `window.*` commands and Window ▸ <panel> (which brings the window to the front) work as for any
-group. Shortcuts and the panel menu work in the window, and a tab dragged out of it lands where it
-is dropped, in the main window's dock or another undocked group (the window that has the pointer
-feeds it to the dock's drop logic). Where egui embeds viewports (`ctx.embed_viewports()`: the web,
-the headless test harness, the snapshot example and the offscreen `mcp --ui` app) undocked groups
-float inside the main window instead, unchanged. Automation elements drawn in an undocked window
+group, Panel Group Settings ▸ Small Tabs included (`Floating::small`; Undock Panel Group keeps a
+docked group's setting). Shortcuts and the panel menu work in the window, and a tab dragged out
+of it lands where it is dropped, in the main window's dock or another undocked group (the window that has the pointer
+feeds it to the dock's drop logic). While a tab is dragged, the window under the pointer draws
+the drop highlight and the dragged tab: an undocked window draws them in its next pass, as the
+dock's drop logic placed them, translated into its coordinates. While EffectCraft is the active app (any of its windows has
+the focus) undocked windows float above the main window, as After Effects' floating panels do;
+when another app becomes active they drop back to the normal window level, so they don't float
+above its windows. egui has no parent-window API, so this is the windows' level
+(`WindowLevel::AlwaysOnTop` / `Normal` in their viewport builders, which send it only when it
+changes; `float_windows::OnTop`): gaining the focus raises them at once, losing it lowers them once
+it has stayed lost for 0.2 s (focus moving between our own windows passes through a frame or two
+in which none has it). Setting a level doesn't take the focus. Limit: unlike a real child window,
+they don't minimise or hide with the main window. A window saved on a monitor that is gone
+(unplugged since) opens over the main window instead (`float_windows::rescue`, once, when it
+opens): the OS reports it on no monitor. macOS reports that reliably; Windows always names the
+nearest monitor, so there only an absurd saved position (non-finite or 100,000 points away) is
+caught; Dock Panel or a workspace reset brings any other lost window back. The check is skipped
+when the main window's own monitor is unknown (some docked displays have no monitor id). Where
+egui embeds viewports (`ctx.embed_viewports()`: the web, the headless test harness, the snapshot
+example and the offscreen `mcp --ui` app) undocked groups float inside the main window instead,
+unchanged. Automation elements drawn in an undocked window
 carry `window` (the group id), their rects are in its coordinates, and synthetic `ui.click` /
 `ui.drag` / `ui.scroll` input on them is delivered to that window (an egui plugin's input hook);
 `ui.screenshot` captures the main window only.
