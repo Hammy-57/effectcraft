@@ -105,3 +105,58 @@ fn screenshots_are_capped_and_compressed() {
     let (_, fw, fh) = control::shrink(rgba, w, h, 0);
     assert_eq!((fw, fh), (w, h));
 }
+
+/// Multi-agent fairness: on desktop a `wait: true` job command no longer blocks the UI thread
+/// (and with it every other client's requests). It starts the job, the reply waits for it, and
+/// the reply is what the blocking command returns. `jobs.wait` waits the same way.
+#[test]
+fn waiting_job_commands_reply_when_the_job_ends_without_blocking() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut h = Harness::builder().with_size(egui::vec2(1280.0, 800.0)).build_eframe(|_| EffectcraftApp::new(Session::default()).with_control(rx));
+    h.run_steps(2);
+    let run = |h: &mut Harness<'_, EffectcraftApp>, command: &str, params: Value| {
+        let (req, reply) = ControlRequest::new("engine.execute", json!({"command": command, "params": params}));
+        tx.send(req).unwrap();
+        h.run_steps(1);
+        reply
+    };
+    run(&mut h, "comp.new", json!({"name": "Main", "width": 64, "height": 36})).recv().unwrap();
+    run(&mut h, "layer.newSolid", json!({"name": "S", "width": 8, "height": 8})).recv().unwrap();
+    let mut blocking = Session::default();
+    blocking.execute_checked("comp.new", json!({"name": "Main", "width": 64, "height": 36})).unwrap();
+    blocking.execute_checked("layer.newSolid", json!({"name": "S", "width": 8, "height": 8})).unwrap();
+    let expected = blocking.execute_checked("footage.check", json!({"wait": true})).unwrap();
+
+    let waiting = run(&mut h, "footage.check", json!({"wait": true}));
+    // Another client's request is answered while the job runs (or right after it).
+    let other = run(&mut h, "comp.new", json!({"name": "Meanwhile"}));
+    let mut reply = None;
+    for _ in 0..200 {
+        if let Ok(v) = waiting.try_recv() {
+            reply = Some(v);
+            break;
+        }
+        h.run_steps(1);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let reply = reply.expect("the waiting command replied once its job ended");
+    assert_eq!(reply, json!({"ok": true, "result": expected}));
+    assert_eq!(other.recv().unwrap()["ok"], true);
+    assert!(h.state().session.jobs().is_empty());
+
+    // jobs.wait with a task running replies when it is done, with the finished jobs.
+    run(&mut h, "footage.check", json!({})).recv().unwrap();
+    let waited = run(&mut h, "jobs.wait", json!({}));
+    let mut finished = None;
+    for _ in 0..200 {
+        if let Ok(v) = waited.try_recv() {
+            finished = Some(v);
+            break;
+        }
+        h.run_steps(1);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let finished = finished.expect("jobs.wait replied");
+    assert_eq!(finished["ok"], true, "{finished}");
+    assert!(finished["result"]["finished"].as_array().is_some_and(|a| a.iter().any(|j| j["kind"] == "footageCheck")), "{finished}");
+}

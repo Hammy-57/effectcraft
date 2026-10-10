@@ -911,3 +911,7 @@ before.
 - MCP `--autosave` recovery stays bounded on disk: checkpoints of 8 MB or more are throttled to one
   every 30 s (flushed when the session ends), a normal save removes the session's recovery files,
   and new sessions prune finished saved sessions and folders untouched for 30 days.
+- Desktop control channel: a `wait: true` job command (render queue, analyses, footage check,
+  Content-Aware Fill, Scene Edit Detection) and `jobs.wait` start the job and reply when it ends,
+  instead of blocking the UI thread, so one agent's long job no longer stalls the other agents or
+  the window.
