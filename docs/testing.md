@@ -3,7 +3,53 @@
 ```sh
 cargo test --workspace     # everything
 cargo xtask ci             # fmt, clippy -D warnings, tests, layers, assets, wasm
+cargo xtask ci --affected  # the same gates, only for the crates your change can affect
 ```
+
+## Affected-only CI
+
+The full `cargo xtask ci` builds and tests every crate in release mode and takes over an hour.
+For each change, agents and contributors run the affected-only variant; the full CI runs before a
+release (and on any change it falls back to, below).
+
+```sh
+cargo xtask ci --affected                  # base: the merge-base of HEAD with main
+cargo xtask ci --affected --base HEAD~3    # any git revision
+cargo xtask ci --affected --dry-run        # print the plan only
+```
+
+It collects every file that differs from the base (committed, staged, unstaged and untracked) and
+maps each one to:
+
+- the workspace package whose directory holds it, and
+- every package whose sources point at it with a `../` path, such as
+  `include_bytes!("../../../assets/fonts/Inter-Regular.ttf")` or
+  `concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/effects.md")`. So editing
+  `docs/preferences.md` reruns the engine tests that check it.
+
+The affected set is those packages plus everything that depends on them (transitively through
+normal and build dependencies) and every package that uses one of them as a dev-dependency. For
+that set it runs `cargo fmt --check` (whole workspace, it is fast), `cargo clippy --all-targets
+--release -- -D warnings`, the tests (`cargo nextest run --release` plus `cargo test --release
+--doc` when cargo-nextest is installed, otherwise `cargo test --release`), the layers check, the
+assets check only when an asset, an `.attribution` sidecar or `ATTRIBUTION.md` changed, and the
+wasm check only for affected L0–L4 crates and the web crates. It prints the plan first and a timing
+table at the end:
+
+```text
+ci --affected: base bc0570888 (HEAD), 1 changed file(s)
+  changed: automation
+  affected: automation, cli (2 of 35 crates)
+  steps: fmt, clippy (2), nextest (2), doctests (1), layers (assets skipped: no asset changes)
+```
+
+Changes to the root `Cargo.toml`, `Cargo.lock`, `.cargo/`, `xtask/`, `rust-toolchain(.toml)` or
+`clippy.toml` can change every crate's build, so they run the full CI instead and say why. Changes
+no crate reads (most of `docs/`, `README.md`, `.github/`, `packaging/`) only get the cheap checks.
+
+Limits: a crate that reads a repo file at run time through a path that is not a `../` literal in its
+sources is not detected, and building a subset of packages can unify features differently from the
+whole workspace. Run the full `cargo xtask ci` before a release.
 
 ## What the tests cover
 

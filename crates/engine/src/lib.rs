@@ -35,6 +35,7 @@ pub mod preview;
 pub mod psd_import;
 pub mod remote;
 pub mod render_queue;
+pub mod replay;
 pub mod roto;
 pub mod scriptui;
 pub mod sequence;
@@ -641,10 +642,15 @@ impl Session {
                 return Err(EngineError::Disabled(id.to_string(), why));
             }
         }
-        // Last-resort guard: a panicking command reports an error instead of crashing the app.
-        let r = guard::guarded(&format!("command `{id}`"), || (spec.run)(self, &params))?;
+        // Last-resort guard: a panicking command reports an error instead of crashing the app
+        // (and saves a repro of the steps that led there, see `replay::after_command`).
+        let nesting = replay::Nesting::enter(spec.journal);
+        let caught = guard::caught();
+        let r = guard::guarded(&format!("command `{id}`"), || (spec.run)(self, &params));
+        let r = replay::after_command(self, id, &params, &nesting, caught, r)?;
         self.learn_observe(id, &params);
-        if spec.journal {
+        // Commands run by a journaled command (a script's steps) replay with it, not again.
+        if spec.journal && !nesting.inside_journaled() {
             self.journal.push((id.to_string(), params));
             if self.journal.len() > 10_000 {
                 self.journal.drain(..1000);
