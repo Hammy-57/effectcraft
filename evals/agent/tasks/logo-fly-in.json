@@ -1,0 +1,142 @@
+{
+  "id": "logo-fly-in",
+  "title": "Logo flies in from the left and holds",
+  "prompt": "In the comp \"Main\" (1920×1080, 30 fps, 4 s), animate the solid layer \"Logo\" (200×200) so it flies in from the left: completely off-screen to the left at 0 s, arriving at the centre of the frame (position 960, 540) at 1 s, then holding still there until the end of the comp.",
+  "setup": [
+    {
+      "command": "comp.new",
+      "params": {
+        "name": "Main",
+        "width": 1920,
+        "height": 1080,
+        "frameRate": 30,
+        "duration": 4
+      }
+    },
+    {
+      "command": "layer.newSolid",
+      "params": {
+        "name": "Logo",
+        "color": "#FFCC00",
+        "width": 200,
+        "height": 200
+      }
+    }
+  ],
+  "limits": {
+    "minutes": 5,
+    "toolCalls": 25
+  },
+  "checks": [
+    {
+      "id": "offscreen",
+      "desc": "Logo off-screen at 0 s, left of centre",
+      "query": "layer.bounds",
+      "params": {
+        "comp": "Main",
+        "layers": [
+          "Logo"
+        ],
+        "time": 0
+      },
+      "select": {
+        "array": "/layers",
+        "index": 0
+      },
+      "expect": [
+        {
+          "path": "/onScreen",
+          "op": "lte",
+          "value": 0.01
+        },
+        {
+          "path": "/center/0",
+          "op": "lt",
+          "value": 960
+        }
+      ]
+    },
+    {
+      "id": "arrives",
+      "desc": "Logo at the centre at 1 s",
+      "prop": {
+        "comp": "Main",
+        "layer": "Logo",
+        "path": "transform/position",
+        "time": 1
+      },
+      "op": "approx",
+      "value": [
+        960,
+        540
+      ],
+      "tol": 2
+    },
+    {
+      "id": "holds",
+      "desc": "Logo still at the centre at 3.9 s",
+      "prop": {
+        "comp": "Main",
+        "layer": "Logo",
+        "path": "transform/position",
+        "time": 3.9
+      },
+      "op": "approx",
+      "value": [
+        960,
+        540
+      ],
+      "tol": 2
+    },
+    {
+      "id": "motion",
+      "desc": "an enter from the left (0–1 s) then a hold",
+      "motion": {
+        "comp": "Main"
+      },
+      "layer": "Logo",
+      "segment": [
+        {
+          "kind": "enter",
+          "edge": "left",
+          "startApprox": 0,
+          "endApprox": 1,
+          "tol": 0.2
+        },
+        {
+          "kind": "hold",
+          "startApprox": 1,
+          "tol": 0.2
+        }
+      ]
+    }
+  ],
+  "solution": [
+    {
+      "command": "prop.addKey",
+      "params": {
+        "layer": "Logo",
+        "path": "transform/position",
+        "time": 0,
+        "value": [
+          -200,
+          540,
+          0
+        ]
+      }
+    },
+    {
+      "command": "prop.addKey",
+      "params": {
+        "layer": "Logo",
+        "path": "transform/position",
+        "time": 1,
+        "value": [
+          960,
+          540,
+          0
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,173 @@
+{
+  "id": "easy-ease",
+  "title": "Ease a linear move",
+  "prompt": "In the comp \"Main\" (1920×1080, 30 fps, 5 s), the solid \"Ball\" moves linearly from (200, 540) at 0 s to (1720, 540) at 2 s. Give both of its Position keyframes Easy Ease (eased in and out), keeping the keyframe times and values.",
+  "setup": [
+    {
+      "command": "comp.new",
+      "params": {
+        "name": "Main",
+        "width": 1920,
+        "height": 1080,
+        "frameRate": 30,
+        "duration": 5
+      }
+    },
+    {
+      "command": "layer.newSolid",
+      "params": {
+        "name": "Ball",
+        "color": "#FF5533",
+        "width": 100,
+        "height": 100
+      }
+    },
+    {
+      "command": "prop.addKey",
+      "params": {
+        "layer": "Ball",
+        "path": "transform/position",
+        "time": 0,
+        "value": [
+          200,
+          540,
+          0
+        ]
+      }
+    },
+    {
+      "command": "prop.addKey",
+      "params": {
+        "layer": "Ball",
+        "path": "transform/position",
+        "time": 2,
+        "value": [
+          1720,
+          540,
+          0
+        ]
+      }
+    }
+  ],
+  "limits": {
+    "minutes": 5,
+    "toolCalls": 20
+  },
+  "checks": [
+    {
+      "id": "two-keys",
+      "desc": "still two Position keyframes",
+      "prop": {
+        "comp": "Main",
+        "layer": "Ball",
+        "path": "transform/position",
+        "field": "keys"
+      },
+      "op": "len",
+      "value": 2
+    },
+    {
+      "id": "bezier",
+      "desc": "both keyframes are Bezier in and out",
+      "prop": {
+        "comp": "Main",
+        "layer": "Ball",
+        "path": "transform/position",
+        "field": "keys"
+      },
+      "op": "all",
+      "value": [
+        {
+          "path": "/in",
+          "op": "eq",
+          "value": "Bezier"
+        },
+        {
+          "path": "/out",
+          "op": "eq",
+          "value": "Bezier"
+        }
+      ]
+    },
+    {
+      "id": "start",
+      "desc": "starts at (200, 540)",
+      "prop": {
+        "comp": "Main",
+        "layer": "Ball",
+        "path": "transform/position",
+        "time": 0
+      },
+      "op": "approx",
+      "value": [
+        200,
+        540
+      ],
+      "tol": 0.5
+    },
+    {
+      "id": "end",
+      "desc": "ends at (1720, 540) at 2 s",
+      "prop": {
+        "comp": "Main",
+        "layer": "Ball",
+        "path": "transform/position",
+        "time": 2
+      },
+      "op": "approx",
+      "value": [
+        1720,
+        540
+      ],
+      "tol": 0.5
+    },
+    {
+      "id": "middle",
+      "desc": "half-way at 1 s (symmetric ease)",
+      "prop": {
+        "comp": "Main",
+        "layer": "Ball",
+        "path": "transform/position",
+        "time": 1
+      },
+      "op": "approx",
+      "value": [
+        960,
+        540
+      ],
+      "tol": 3
+    },
+    {
+      "id": "slow-start",
+      "desc": "slower than linear at 0.5 s (linear would be x = 580)",
+      "query": "prop.get",
+      "params": {
+        "comp": "Main",
+        "layer": "Ball",
+        "path": "transform/position",
+        "time": 0.5
+      },
+      "expect": [
+        {
+          "path": "/value/0",
+          "op": "lt",
+          "value": 520
+        }
+      ]
+    }
+  ],
+  "solution": [
+    {
+      "command": "keys.selectAll",
+      "params": {
+        "layers": [
+          "Ball"
+        ]
+      }
+    },
+    {
+      "command": "keys.easyEase",
+      "params": {}
+    }
+  ]
+}

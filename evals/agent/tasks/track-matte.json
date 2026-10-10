@@ -1,0 +1,87 @@
+{
+  "id": "track-matte",
+  "title": "Text as a track matte",
+  "prompt": "In the comp \"Main\", use the text layer \"MATTE\" as an alpha track matte for the solid \"Fill\", so Fill's colour only shows through the letters.",
+  "setup": [
+    {
+      "command": "comp.new",
+      "params": {
+        "name": "Main",
+        "width": 1920,
+        "height": 1080,
+        "frameRate": 30,
+        "duration": 5
+      }
+    },
+    {
+      "command": "layer.newSolid",
+      "params": {
+        "name": "Fill",
+        "color": "#FF3366"
+      }
+    },
+    {
+      "command": "layer.newText",
+      "params": {
+        "text": "MATTE",
+        "size": 300,
+        "position": [
+          960,
+          640
+        ],
+        "fill": "#FFFFFF",
+        "name": "MATTE"
+      }
+    }
+  ],
+  "limits": {
+    "minutes": 5,
+    "toolCalls": 20
+  },
+  "checks": [
+    {
+      "id": "matte",
+      "desc": "Fill uses an alpha matte",
+      "query": "comp.info",
+      "params": {
+        "comp": "Main"
+      },
+      "select": {
+        "array": "/layers",
+        "where": {
+          "name": "Fill"
+        }
+      },
+      "expect": [
+        {
+          "path": "/trackMatte/kind",
+          "op": "eq",
+          "value": "Alpha Matte"
+        },
+        {
+          "path": "/trackMatte/layer",
+          "op": "exists"
+        }
+      ]
+    },
+    {
+      "layerCount": {
+        "comp": "Main"
+      },
+      "id": "count",
+      "desc": "still two layers",
+      "op": "eq",
+      "value": 2
+    }
+  ],
+  "solution": [
+    {
+      "command": "layer.setTrackMatte",
+      "params": {
+        "layer": "Fill",
+        "matte": "MATTE",
+        "kind": "alpha"
+      }
+    }
+  ]
+}

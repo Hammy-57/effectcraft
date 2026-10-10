@@ -220,3 +220,6 @@ The most important missing piece: it turns every other estimate here into a meas
    above. That is how this assessment stays honest.
 4. Don't raise parity.md's numbers without evidence: a G1 score, a user-facing check on more than
    one platform, or both.
+5. How well agents drive EffectCraft is measured by the agent exam (`evals/agent/`, `cargo xtask
+   agent-exam --run`, nightly): a task that agents keep failing points at a missing command, a
+   confusing parameter or an unclear reply.

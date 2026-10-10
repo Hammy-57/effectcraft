@@ -1,0 +1,211 @@
+{
+  "id": "parenting",
+  "title": "Move two layers with a parent null",
+  "prompt": "In the comp \"Main\" (1920×1080), parent the solids \"Left\" and \"Right\" to the null \"Rig\". Then move Rig 200 px down, from (960, 540) to (960, 740), so both squares move with it: Left must end up centred at (760, 740) and Right at (1160, 740).",
+  "setup": [
+    {
+      "command": "comp.new",
+      "params": {
+        "name": "Main",
+        "width": 1920,
+        "height": 1080,
+        "frameRate": 30,
+        "duration": 5
+      }
+    },
+    {
+      "command": "layer.newNull",
+      "params": {
+        "name": "Rig"
+      }
+    },
+    {
+      "command": "layer.newSolid",
+      "params": {
+        "name": "Left",
+        "color": "#33AAFF",
+        "width": 100,
+        "height": 100
+      }
+    },
+    {
+      "command": "prop.set",
+      "params": {
+        "layer": "Left",
+        "path": "transform/position",
+        "value": [
+          760,
+          540,
+          0
+        ]
+      }
+    },
+    {
+      "command": "layer.newSolid",
+      "params": {
+        "name": "Right",
+        "color": "#FF5577",
+        "width": 100,
+        "height": 100
+      }
+    },
+    {
+      "command": "prop.set",
+      "params": {
+        "layer": "Right",
+        "path": "transform/position",
+        "value": [
+          1160,
+          540,
+          0
+        ]
+      }
+    }
+  ],
+  "limits": {
+    "minutes": 5,
+    "toolCalls": 20
+  },
+  "checks": [
+    {
+      "id": "left-parent",
+      "desc": "Left has a parent",
+      "query": "comp.info",
+      "params": {
+        "comp": "Main"
+      },
+      "select": {
+        "array": "/layers",
+        "where": {
+          "name": "Left"
+        }
+      },
+      "expect": [
+        {
+          "path": "/parent",
+          "op": "exists"
+        }
+      ]
+    },
+    {
+      "id": "right-parent",
+      "desc": "Right has a parent",
+      "query": "comp.info",
+      "params": {
+        "comp": "Main"
+      },
+      "select": {
+        "array": "/layers",
+        "where": {
+          "name": "Right"
+        }
+      },
+      "expect": [
+        {
+          "path": "/parent",
+          "op": "exists"
+        }
+      ]
+    },
+    {
+      "id": "rig",
+      "desc": "Rig at (960, 740)",
+      "prop": {
+        "comp": "Main",
+        "layer": "Rig",
+        "path": "transform/position"
+      },
+      "op": "approx",
+      "value": [
+        960,
+        740
+      ],
+      "tol": 1
+    },
+    {
+      "id": "left-pos",
+      "desc": "Left centred at (760, 740)",
+      "query": "layer.bounds",
+      "params": {
+        "comp": "Main",
+        "layers": [
+          "Left"
+        ]
+      },
+      "select": {
+        "array": "/layers",
+        "index": 0
+      },
+      "expect": [
+        {
+          "path": "/center",
+          "op": "approx",
+          "value": [
+            760,
+            740
+          ],
+          "tol": 1
+        }
+      ]
+    },
+    {
+      "id": "right-pos",
+      "desc": "Right centred at (1160, 740)",
+      "query": "layer.bounds",
+      "params": {
+        "comp": "Main",
+        "layers": [
+          "Right"
+        ]
+      },
+      "select": {
+        "array": "/layers",
+        "index": 0
+      },
+      "expect": [
+        {
+          "path": "/center",
+          "op": "approx",
+          "value": [
+            1160,
+            740
+          ],
+          "tol": 1
+        }
+      ]
+    },
+    {
+      "layerCount": {
+        "comp": "Main"
+      },
+      "id": "count",
+      "desc": "still three layers",
+      "op": "eq",
+      "value": 3
+    }
+  ],
+  "solution": [
+    {
+      "command": "layer.setParent",
+      "params": {
+        "layers": [
+          "Left",
+          "Right"
+        ],
+        "parent": "Rig"
+      }
+    },
+    {
+      "command": "prop.set",
+      "params": {
+        "layer": "Rig",
+        "path": "transform/position",
+        "value": [
+          960,
+          740,
+          0
+        ]
+      }
+    }
+  ]
+}
