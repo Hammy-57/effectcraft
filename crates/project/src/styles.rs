@@ -150,7 +150,7 @@ fn angle(ids: &mut Ids, m: &str, name: &str, v: f64) -> Property {
     ids.prop(m, name, Value::Scalar(v)).with_ui(ParamUi::Angle)
 }
 fn gradient(ids: &mut Ids, g: Gradient) -> Property {
-    ids.prop("colors", "Colors", Value::Gradient(g)).with_ui(ParamUi::Gradient)
+    ids.prop("colors", "Colors", Value::gradient(g)).with_ui(ParamUi::Gradient)
 }
 
 /// The default glow gradient: the glow colour fading to transparent.

@@ -56,6 +56,158 @@ impl Ease {
     pub const EASY: Ease = Ease { speed: 0.0, influence: 1.0 / 3.0 };
 }
 
+/// Dimensions stored without a heap allocation (scalars, 2D/3D values, spatial keys).
+const INLINE: usize = 3;
+
+/// The eases of one keyframe side: a slice of [`Ease`] that only allocates for more than three
+/// dimensions (colours). Serializes as a plain list, like the `Vec<Ease>` it replaced.
+#[derive(Clone)]
+pub struct Eases(Repr);
+
+#[derive(Clone)]
+enum Repr {
+    Inline { len: u8, buf: [Ease; INLINE] },
+    Heap(Vec<Ease>),
+}
+
+const ZERO: Ease = Ease { speed: 0.0, influence: 0.0 };
+
+impl Eases {
+    pub const fn new() -> Eases {
+        Eases(Repr::Inline { len: 0, buf: [ZERO; INLINE] })
+    }
+    /// `n` copies of `e` (like `vec![e; n]`).
+    pub fn splat(e: Ease, n: usize) -> Eases {
+        if n <= INLINE {
+            let mut buf = [ZERO; INLINE];
+            buf.iter_mut().take(n).for_each(|b| *b = e);
+            Eases(Repr::Inline { len: n as u8, buf })
+        } else {
+            Eases(Repr::Heap(vec![e; n]))
+        }
+    }
+    pub fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.as_slice().is_empty()
+    }
+    pub fn as_slice(&self) -> &[Ease] {
+        match &self.0 {
+            Repr::Inline { len, buf } => buf.get(..*len as usize).unwrap_or(&[]),
+            Repr::Heap(v) => v,
+        }
+    }
+    pub fn as_mut_slice(&mut self) -> &mut [Ease] {
+        match &mut self.0 {
+            Repr::Inline { len, buf } => buf.get_mut(..*len as usize).unwrap_or(&mut []),
+            Repr::Heap(v) => v,
+        }
+    }
+    pub fn push(&mut self, e: Ease) {
+        match &mut self.0 {
+            Repr::Inline { len, buf } => {
+                if let Some(slot) = buf.get_mut(*len as usize) {
+                    *slot = e;
+                    *len += 1;
+                } else {
+                    let mut v = buf.to_vec();
+                    v.push(e);
+                    self.0 = Repr::Heap(v);
+                }
+            }
+            Repr::Heap(v) => v.push(e),
+        }
+    }
+    pub fn clear(&mut self) {
+        *self = Eases::new();
+    }
+    pub fn to_vec(&self) -> Vec<Ease> {
+        self.as_slice().to_vec()
+    }
+}
+
+impl Default for Eases {
+    fn default() -> Self {
+        Eases::new()
+    }
+}
+
+impl std::ops::Deref for Eases {
+    type Target = [Ease];
+    fn deref(&self) -> &[Ease] {
+        self.as_slice()
+    }
+}
+
+impl std::ops::DerefMut for Eases {
+    fn deref_mut(&mut self) -> &mut [Ease] {
+        self.as_mut_slice()
+    }
+}
+
+impl PartialEq for Eases {
+    fn eq(&self, o: &Eases) -> bool {
+        self.as_slice() == o.as_slice()
+    }
+}
+
+impl std::fmt::Debug for Eases {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.as_slice().fmt(f)
+    }
+}
+
+impl FromIterator<Ease> for Eases {
+    fn from_iter<I: IntoIterator<Item = Ease>>(iter: I) -> Eases {
+        let mut out = Eases::new();
+        for e in iter {
+            out.push(e);
+        }
+        out
+    }
+}
+
+impl From<Vec<Ease>> for Eases {
+    fn from(v: Vec<Ease>) -> Eases {
+        if v.len() <= INLINE { v.into_iter().collect() } else { Eases(Repr::Heap(v)) }
+    }
+}
+
+impl From<&[Ease]> for Eases {
+    fn from(v: &[Ease]) -> Eases {
+        v.iter().copied().collect()
+    }
+}
+
+impl<'a> IntoIterator for &'a Eases {
+    type Item = &'a Ease;
+    type IntoIter = std::slice::Iter<'a, Ease>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_slice().iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut Eases {
+    type Item = &'a mut Ease;
+    type IntoIter = std::slice::IterMut<'a, Ease>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_mut_slice().iter_mut()
+    }
+}
+
+impl Serialize for Eases {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.as_slice().serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for Eases {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Eases, D::Error> {
+        Vec::<Ease>::deserialize(d).map(Eases::from)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Keyframe {
     pub time: Tick,
@@ -66,10 +218,10 @@ pub struct Keyframe {
     #[serde(default, skip_serializing_if = "is_linear")]
     pub out_interp: Interp,
     /// Per-dimension (or one entry for spatial / single-dimension values).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub in_ease: Vec<Ease>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub out_ease: Vec<Ease>,
+    #[serde(default, skip_serializing_if = "Eases::is_empty")]
+    pub in_ease: Eases,
+    #[serde(default, skip_serializing_if = "Eases::is_empty")]
+    pub out_ease: Eases,
     /// Temporal continuous / auto Bezier flags.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub continuous: bool,
@@ -120,8 +272,8 @@ impl Keyframe {
             value,
             in_interp: Interp::Linear,
             out_interp: Interp::Linear,
-            in_ease: vec![],
-            out_ease: vec![],
+            in_ease: Eases::new(),
+            out_ease: Eases::new(),
             continuous: false,
             auto_bezier: false,
             spatial_in: [0.0; 3],
@@ -142,8 +294,8 @@ impl Keyframe {
         self.in_interp = Interp::Bezier;
         self.out_interp = Interp::Bezier;
         let n = self.value.dims().max(1);
-        self.in_ease = vec![Ease::EASY; n];
-        self.out_ease = vec![Ease::EASY; n];
+        self.in_ease = Eases::splat(Ease::EASY, n);
+        self.out_ease = Eases::splat(Ease::EASY, n);
         self
     }
     /// Shape of the keyframe icon in the timeline.
@@ -625,11 +777,11 @@ pub fn easy_ease(k: &mut Keyframe, ease_in: bool, ease_out: bool) {
     let n = k.value.dims().max(1);
     if ease_in {
         k.in_interp = Interp::Bezier;
-        k.in_ease = vec![Ease::EASY; n];
+        k.in_ease = Eases::splat(Ease::EASY, n);
     }
     if ease_out {
         k.out_interp = Interp::Bezier;
-        k.out_ease = vec![Ease::EASY; n];
+        k.out_ease = Eases::splat(Ease::EASY, n);
     }
     k.auto_bezier = false;
 }
@@ -637,6 +789,73 @@ pub fn easy_ease(k: &mut Keyframe, ease_in: bool, ease_out: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eases_stay_inline_up_to_three_and_spill_beyond() {
+        let e = |s: f64| Ease { speed: s, influence: 0.5 };
+        let mut v = Eases::new();
+        for i in 0..5 {
+            v.push(e(i as f64));
+            assert_eq!(v.as_slice(), (0..=i).map(|j| e(j as f64)).collect::<Vec<_>>().as_slice());
+        }
+        assert_eq!(v, Eases::from(v.to_vec()));
+        assert_eq!(Eases::splat(Ease::EASY, 4).len(), 4);
+        assert_eq!(Eases::splat(Ease::EASY, 2), Eases::from(vec![Ease::EASY; 2]));
+        v.clear();
+        assert!(v.is_empty());
+        assert_eq!(format!("{:?}", Eases::splat(e(1.0), 1)), format!("{:?}", vec![e(1.0)]));
+        // Two (in/out) inline sides cost what the boxed `Value` saved: a keyframe does not grow.
+        assert!(std::mem::size_of::<Value>() <= 40 && std::mem::size_of::<Keyframe>() <= 216);
+    }
+
+    /// Every `Value` variant and keyframes with 0–4 eases per side, as saved before `Value` boxed
+    /// its large variants and eases moved inline: project files must stay byte-identical.
+    #[test]
+    fn serialized_values_and_eases_are_unchanged() {
+        let mut path = ShapePath::rect([10.0, 20.0], 30.0, 40.0);
+        path.feather.push(FeatherPoint { segment: 1, t: 0.25, radius: -3.5, tension: 0.5 });
+        let gradient = Gradient { color_midpoints: vec![0.25], ..Gradient::default() };
+        let values = vec![
+            Value::Scalar(1.5),
+            Value::Vec2([1.0, -2.0]),
+            Value::Vec3([1.0, 2.0, 3.25]),
+            Value::Color([1.0, 0.5, 0.0, 1.0]),
+            Value::Bool(true),
+            Value::Enum(2),
+            Value::Path(path.into()),
+            Value::Text(Box::new(TextDoc { text: "Hi".into(), ..TextDoc::default() })),
+            Value::Layer(Some(7)),
+            Value::Layer(None),
+            Value::Gradient(gradient.into()),
+            Value::Gradient(Gradient::default().into()),
+            Value::Str("s".into()),
+        ];
+        let json = serde_json::to_string(&values).unwrap();
+        assert_eq!(serde_json::from_str::<Vec<Value>>(&json).unwrap(), values);
+        // Text documents keep their own format (text_doc.rs); the rest is pinned here.
+        let json = serde_json::to_string(&values.iter().filter(|v| !matches!(v, Value::Text(_))).collect::<Vec<_>>()).unwrap();
+        let e = |s: f64| Ease { speed: s, influence: 0.25 };
+        let mut keys = vec![
+            Keyframe::new(Tick(1), Value::Scalar(0.0)),
+            Keyframe::new(Tick(2), Value::Scalar(1.0)).eased(),
+            Keyframe::new(Tick(3), Value::Vec3([0.0; 3])).eased(),
+            Keyframe::new(Tick(4), Value::Color([0.0; 4])).eased(),
+            Keyframe::new(Tick(5), Value::Vec2([0.0; 2])),
+        ];
+        keys[4].in_ease = vec![e(1.0), e(-2.0)].into();
+        keys[4].out_ease = vec![e(1.0), e(2.0), e(3.0), e(4.0), e(5.0)].into();
+        let kjson = serde_json::to_string(&keys).unwrap();
+        assert_eq!(serde_json::from_str::<Vec<Keyframe>>(&kjson).unwrap(), keys);
+        println!("{json}\n{kjson}");
+        assert_eq!(
+            json,
+            r#"[{"t":"Scalar","v":1.5},{"t":"Vec2","v":[1.0,-2.0]},{"t":"Vec3","v":[1.0,2.0,3.25]},{"t":"Color","v":[1.0,0.5,0.0,1.0]},{"t":"Bool","v":true},{"t":"Enum","v":2},{"t":"Path","v":{"vertices":[[-5.0,0.0],[25.0,0.0],[25.0,40.0],[-5.0,40.0]],"in_tangents":[[0.0,0.0],[0.0,0.0],[0.0,0.0],[0.0,0.0]],"out_tangents":[[0.0,0.0],[0.0,0.0],[0.0,0.0],[0.0,0.0]],"closed":true,"feather":[{"segment":1,"t":0.25,"radius":-3.5,"tension":0.5}]}},{"t":"Layer","v":7},{"t":"Layer","v":null},{"t":"Gradient","v":{"colors":[[0.0,[1.0,1.0,1.0,1.0]],[1.0,[0.0,0.0,0.0,1.0]]],"opacities":[[0.0,1.0],[1.0,1.0]],"color_midpoints":[0.25]}},{"t":"Gradient","v":{"colors":[[0.0,[1.0,1.0,1.0,1.0]],[1.0,[0.0,0.0,0.0,1.0]]],"opacities":[[0.0,1.0],[1.0,1.0]]}},{"t":"Str","v":"s"}]"#
+        );
+        assert_eq!(
+            kjson,
+            r#"[{"time":1,"value":{"t":"Scalar","v":0.0}},{"time":2,"value":{"t":"Scalar","v":1.0},"in_interp":"Bezier","out_interp":"Bezier","in_ease":[{"speed":0.0,"influence":0.3333333333333333}],"out_ease":[{"speed":0.0,"influence":0.3333333333333333}]},{"time":3,"value":{"t":"Vec3","v":[0.0,0.0,0.0]},"in_interp":"Bezier","out_interp":"Bezier","in_ease":[{"speed":0.0,"influence":0.3333333333333333},{"speed":0.0,"influence":0.3333333333333333},{"speed":0.0,"influence":0.3333333333333333}],"out_ease":[{"speed":0.0,"influence":0.3333333333333333},{"speed":0.0,"influence":0.3333333333333333},{"speed":0.0,"influence":0.3333333333333333}]},{"time":4,"value":{"t":"Color","v":[0.0,0.0,0.0,0.0]},"in_interp":"Bezier","out_interp":"Bezier","in_ease":[{"speed":0.0,"influence":0.3333333333333333},{"speed":0.0,"influence":0.3333333333333333},{"speed":0.0,"influence":0.3333333333333333},{"speed":0.0,"influence":0.3333333333333333}],"out_ease":[{"speed":0.0,"influence":0.3333333333333333},{"speed":0.0,"influence":0.3333333333333333},{"speed":0.0,"influence":0.3333333333333333},{"speed":0.0,"influence":0.3333333333333333}]},{"time":5,"value":{"t":"Vec2","v":[0.0,0.0]},"in_ease":[{"speed":1.0,"influence":0.25},{"speed":-2.0,"influence":0.25}],"out_ease":[{"speed":1.0,"influence":0.25},{"speed":2.0,"influence":0.25},{"speed":3.0,"influence":0.25},{"speed":4.0,"influence":0.25},{"speed":5.0,"influence":0.25}]}]"#
+        );
+    }
 
     /// The arc-length table before it moved to the stack and gained a cache: the oracle.
     struct SpatialSegRef {
@@ -807,8 +1026,8 @@ mod tests {
             let mut b = Keyframe::new(s(1.0), Value::Scalar(to));
             a.out_interp = Interp::Bezier;
             b.in_interp = Interp::Bezier;
-            a.out_ease = vec![Ease { speed: out_speed, influence: out_inf }];
-            b.in_ease = vec![Ease { speed: in_speed, influence: in_inf }];
+            a.out_ease = vec![Ease { speed: out_speed, influence: out_inf }].into();
+            b.in_ease = vec![Ease { speed: in_speed, influence: in_inf }].into();
             for (time, expected) in samples {
                 let value = evaluate(&[a.clone(), b.clone()], s(time), false).unwrap().as_f64();
                 assert!((value - expected).abs() < 1e-7, "{time}: {value} != {expected}");
@@ -832,7 +1051,7 @@ mod tests {
     /// M13.15: agents set gradients as plain JSON, not only the tagged form `get` returns.
     #[test]
     fn gradients_coerce_from_plain_json() {
-        let g = Value::Gradient(Gradient::default());
+        let g = Value::gradient(Gradient::default());
         let plain = serde_json::json!({"colors": [[0, [0, 0.5, 1, 1]], [1, "#ffff00"]], "opacities": [[0, 1], [1, 0.5]]});
         let Some(Value::Gradient(a)) = g.coerce_json(&plain) else { panic!("object form") };
         assert_eq!(a.colors, vec![(0.0, [0.0, 0.5, 1.0, 1.0]), (1.0, [1.0, 1.0, 0.0, 1.0])]);
@@ -884,8 +1103,8 @@ mod tests {
         let mut b = Keyframe::new(s(2.0), Value::Scalar(100.0));
         a.out_interp = Interp::Bezier;
         b.in_interp = Interp::Bezier;
-        a.out_ease = vec![Ease { speed: 50.0, influence: 1.0 / 3.0 }];
-        b.in_ease = vec![Ease { speed: 50.0, influence: 1.0 / 3.0 }];
+        a.out_ease = vec![Ease { speed: 50.0, influence: 1.0 / 3.0 }].into();
+        b.in_ease = vec![Ease { speed: 50.0, influence: 1.0 / 3.0 }].into();
         let keys = vec![a, b];
         for i in 0..=20 {
             let t = i as f64 * 0.1;
@@ -932,7 +1151,7 @@ mod tests {
         assert_eq!(evaluate(&keys, s(0.5), false).unwrap().as_color(), [0.5, 0.25, 0.0, 1.0]);
         let a = ShapePath::rect([0.0, 0.0], 10.0, 10.0);
         let b = ShapePath::rect([0.0, 0.0], 20.0, 20.0);
-        let keys = vec![Keyframe::new(s(0.0), Value::Path(a)), Keyframe::new(s(1.0), Value::Path(b))];
+        let keys = vec![Keyframe::new(s(0.0), Value::path(a)), Keyframe::new(s(1.0), Value::path(b))];
         let v = evaluate(&keys, s(0.5), false).unwrap();
         assert_eq!(v.as_path().unwrap().vertices[0], [-7.5, -7.5]);
     }
@@ -986,8 +1205,8 @@ mod tests {
         fn eased_values_stay_in_range(t in 0.0f64..1.0, i0 in 0.01f64..1.0, i1 in 0.01f64..1.0) {
             let mut a = Keyframe::new(s(0.0), Value::Scalar(0.0)).eased();
             let mut b = Keyframe::new(s(1.0), Value::Scalar(10.0)).eased();
-            a.out_ease = vec![Ease { speed: 0.0, influence: i0 }];
-            b.in_ease = vec![Ease { speed: 0.0, influence: i1 }];
+            a.out_ease = vec![Ease { speed: 0.0, influence: i0 }].into();
+            b.in_ease = vec![Ease { speed: 0.0, influence: i1 }].into();
             let v = evaluate(&[a, b], s(t), false).unwrap().as_f64();
             proptest::prop_assert!((-1e-9..=10.0 + 1e-9).contains(&v));
         }

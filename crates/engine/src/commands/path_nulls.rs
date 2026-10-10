@@ -94,7 +94,7 @@ fn info(s: &Session, cid: ItemId, lid: LayerId, uid: Uid, cmd: &str) -> Result<P
         .collect();
     let reference = from_other_layer(comp, layer, uid).ok_or_else(|| bad(cmd, "can't reference that path"))?;
     let prop_name = layer.props.name_path_of(uid).and_then(|n| n.split('/').rev().nth(1).map(str::to_string)).unwrap_or_else(|| pr.name.clone());
-    Ok(PathInfo { comp_pts, path, reference, layer_name: layer.name.clone(), prop_name, span: (layer.in_point.seconds(), layer.out_point.seconds()) })
+    Ok(PathInfo { comp_pts, path: *path, reference, layer_name: layer.name.clone(), prop_name, span: (layer.in_point.seconds(), layer.out_point.seconds()) })
 }
 
 /// An expression reference to `uid` of `layer` as another layer (the nulls) sees it.

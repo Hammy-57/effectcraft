@@ -145,8 +145,8 @@ fn default_fields_are_left_out_and_read_back() {
     let full = Keyframe {
         in_interp: Interp::Bezier,
         out_interp: Interp::Hold,
-        in_ease: vec![Ease::EASY],
-        out_ease: vec![Ease { speed: 3.0, influence: 0.5 }],
+        in_ease: vec![Ease::EASY].into(),
+        out_ease: vec![Ease { speed: 3.0, influence: 0.5 }].into(),
         continuous: true,
         auto_bezier: true,
         spatial_in: [1.0, -2.0, 0.0],

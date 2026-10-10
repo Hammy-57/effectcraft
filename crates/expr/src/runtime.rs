@@ -621,7 +621,7 @@ pub fn to_value(out: &Out, current: &Value) -> Result<Value, String> {
                     v.resize(n, [0.0; 2]);
                     v
                 };
-                Value::Path(effectcraft_keyframe::ShapePath {
+                Value::path(effectcraft_keyframe::ShapePath {
                     vertices: points.clone(),
                     in_tangents: fit(ins),
                     out_tangents: fit(outs),

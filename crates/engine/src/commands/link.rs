@@ -26,11 +26,11 @@ fn split_keys(keys: &[Keyframe], spatial: bool, d: usize) -> Vec<Keyframe> {
             let vel = |t: Tick| effectcraft_keyframe::velocity(keys, t, spatial).get(d).copied().unwrap_or(0.0);
             if k.in_interp == Interp::Bezier {
                 let inf = k.in_ease.first().map(|e| e.influence).unwrap_or(1.0 / 3.0);
-                s.in_ease = vec![Ease { speed: vel(k.time - h), influence: inf }];
+                s.in_ease = vec![Ease { speed: vel(k.time - h), influence: inf }].into();
             }
             if k.out_interp == Interp::Bezier {
                 let inf = k.out_ease.first().map(|e| e.influence).unwrap_or(1.0 / 3.0);
-                s.out_ease = vec![Ease { speed: vel(k.time + h), influence: inf }];
+                s.out_ease = vec![Ease { speed: vel(k.time + h), influence: inf }].into();
             }
             s
         })

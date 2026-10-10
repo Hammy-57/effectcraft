@@ -20,8 +20,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut b = Keyframe::new(Tick::from_seconds_f64(1.0), Value::Scalar(to));
         a.out_interp = Interp::Bezier;
         b.in_interp = Interp::Bezier;
-        a.out_ease = vec![Ease { speed: out_speed, influence: out_inf }];
-        b.in_ease = vec![Ease { speed: in_speed, influence: in_inf }];
+        a.out_ease = vec![Ease { speed: out_speed, influence: out_inf }].into();
+        b.in_ease = vec![Ease { speed: in_speed, influence: in_inf }].into();
         let keys = [a, b];
         let values: Vec<f64> = times
             .iter()

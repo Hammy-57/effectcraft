@@ -366,7 +366,7 @@ fn mask_shape(s: &mut Session, p: &Value) -> Result<Value> {
         let (cx, cy) = (r[0] + r[2] / 2.0, r[1] + r[3] / 2.0);
         let path = if ellipse { ShapePath::ellipse([cx, cy], r[2], r[3]) } else { ShapePath::rect([cx, cy], r[2], r[3]) };
         if let Some(pr) = g.get_mut("path") {
-            pr.set_value_at(lt, KV::Path(path));
+            pr.set_value_at(lt, KV::path(path));
         }
         Ok(())
     })
@@ -382,7 +382,7 @@ fn mask_reset(s: &mut Session, p: &Value) -> Result<Value> {
                 pr.value = v;
             }
         };
-        reset(g, "path", KV::Path(ShapePath::rect([w / 2.0, h / 2.0], w, h)));
+        reset(g, "path", KV::path(ShapePath::rect([w / 2.0, h / 2.0], w, h)));
         reset(g, "feather", KV::Vec2([0.0, 0.0]));
         reset(g, "opacity", KV::Scalar(100.0));
         reset(g, "expansion", KV::Scalar(0.0));

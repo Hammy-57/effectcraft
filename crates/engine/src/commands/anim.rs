@@ -271,7 +271,7 @@ fn set_ease(s: &mut Session, p: &Value) -> Result<Value> {
         let k = &mut pr.keys[i];
         let list = if out { &mut k.out_ease } else { &mut k.in_ease };
         if list.len() != n {
-            *list = cur.clone();
+            *list = cur.clone().into();
         }
         for (d, e) in list.iter_mut().enumerate() {
             if dim.is_some_and(|x| x != d) && n > 1 {

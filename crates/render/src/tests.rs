@@ -109,7 +109,7 @@ fn large_mask_expansion_covers_its_whole_reach() {
         (ShapePath::rect([526.0, 973.0], 400.0, 400.0), -150.0, (526 + 45, 973), (526 + 55, 973)),
     ] {
         let c = p.comp_mut(cid).unwrap();
-        c.layers[0].props.prop_mut("masks/#1/path").unwrap().value = Value::Path(shape);
+        c.layers[0].props.prop_mut("masks/#1/path").unwrap().value = Value::path(shape);
         c.layers[0].props.prop_mut("masks/#1/expansion").unwrap().value = Value::Scalar(exp);
         let img = render_frame(&p, cid, Tick::ZERO, 1.0);
         assert!(img.get(inside.0, inside.1)[3] > 0.99, "{exp}: inside {:?}", img.get(inside.0, inside.1));

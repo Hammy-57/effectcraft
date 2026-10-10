@@ -281,9 +281,9 @@ pub(crate) fn import_prop(im: &Im, j: &Json, p: &mut Property, conv: &dyn Fn(&Js
             keys[i + 1].in_interp = Interp::Linear;
         } else {
             keys[i].out_interp = Interp::Bezier;
-            keys[i].out_ease = outs;
+            keys[i].out_ease = outs.into();
             keys[i + 1].in_interp = Interp::Bezier;
-            keys[i + 1].in_ease = ins;
+            keys[i + 1].in_ease = ins.into();
         }
     }
     p.value = keys[0].value.clone();

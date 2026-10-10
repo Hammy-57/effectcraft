@@ -252,7 +252,7 @@ pub fn stroke_group(ids: &mut Ids, name: &str, s: &StrokeSpec) -> PropGroup {
     let mut g = ids.group(s.kind.match_id(), name);
     g.kind = GroupKind::Indexed;
     let path = ShapePath::polygon(&s.points, false);
-    g.children.push(ids.prop("path", "Path", Value::Path(path)).with_ui(ParamUi::Path).into());
+    g.children.push(ids.prop("path", "Path", Value::path(path)).with_ui(ParamUi::Path).into());
     g.children.push(hidden(ids, "mode", Value::Enum(s.mode)).into());
     g.children.push(hidden(ids, "in", Value::Scalar(s.in_time)).into());
     g.children.push(hidden(ids, "out", Value::Scalar(s.out_time)).into());

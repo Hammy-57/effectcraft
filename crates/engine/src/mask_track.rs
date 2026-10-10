@@ -351,7 +351,7 @@ fn write_frames(p: &mut Project, job: &MaskTrackJob, frames: &[MaskFrame]) {
         && let Some(pr) = g.get_mut("path")
     {
         for (lt, _, path, _) in frames {
-            effectcraft_keyframe::set_key(&mut pr.keys, Keyframe::new(*lt, Value::Path(path.clone())));
+            effectcraft_keyframe::set_key(&mut pr.keys, Keyframe::new(*lt, Value::path(path.clone())));
         }
     }
     if let Some(g) = points.and_then(|u| layer.props.find_group_mut(u)) {

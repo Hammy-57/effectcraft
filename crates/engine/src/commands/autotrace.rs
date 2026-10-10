@@ -176,7 +176,7 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
                 if let Some(path) = g.get_mut("path") {
                     for (f, lt) in frames.iter().zip(&layer_times) {
                         if let Some(tr) = f.get(k) {
-                            effectcraft_keyframe::set_key(&mut path.keys, Keyframe::new(*lt, KV::Path(tr.path.clone())));
+                            effectcraft_keyframe::set_key(&mut path.keys, Keyframe::new(*lt, KV::path(tr.path.clone())));
                         }
                     }
                 }

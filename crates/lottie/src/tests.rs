@@ -175,10 +175,10 @@ fn easing_converts_exactly_both_ways() {
     let rot = tr.get_mut("rotation").unwrap();
     let mut a = Keyframe::new(s(0.0), Value::Scalar(0.0));
     a.out_interp = Interp::Bezier;
-    a.out_ease = vec![Ease { speed: 300.0, influence: 0.6 }];
+    a.out_ease = vec![Ease { speed: 300.0, influence: 0.6 }].into();
     let mut b = Keyframe::new(s(0.8), Value::Scalar(180.0));
     b.in_interp = Interp::Bezier;
-    b.in_ease = vec![Ease { speed: -50.0, influence: 0.2 }];
+    b.in_ease = vec![Ease { speed: -50.0, influence: 0.2 }].into();
     b.out_interp = Interp::Hold;
     let c = Keyframe::new(s(1.2), Value::Scalar(90.0)).eased();
     let mut d = Keyframe::new(s(1.6), Value::Scalar(45.0));
@@ -189,7 +189,7 @@ fn easing_converts_exactly_both_ways() {
     rot.keys = vec![a, b, c, d, e];
     let sc = tr.get_mut("scale").unwrap();
     sc.keys = vec![Keyframe::new(s(0.0), Value::Vec3([100.0, 50.0, 100.0])).eased(), Keyframe::new(s(1.0), Value::Vec3([20.0, 150.0, 100.0])).eased()];
-    sc.keys[0].out_ease = vec![Ease { speed: 10.0, influence: 0.9 }, Ease { speed: 0.0, influence: 0.1 }, Ease::EASY];
+    sc.keys[0].out_ease = vec![Ease { speed: 10.0, influence: 0.9 }, Ease { speed: 0.0, influence: 0.1 }, Ease::EASY].into();
     push(&mut p, cid, l);
     let (q, nc, _, json) = roundtrip(&p, cid, &ExportOptions::default());
     // The Lottie tangents of the first rotation segment: o = (0.6, 300·0.6·0.8/180).
@@ -398,8 +398,8 @@ fn layers_parenting_timing_mattes_masks_and_blend_modes() {
         let mut m1 = build::mask(&mut ids, "Mask 1", ShapePath::rect([100.0, 60.0], 150.0, 90.0), MaskMode::Add, [255, 0, 0]);
         m1.get_mut("expansion").unwrap().value = Value::Scalar(-5.0);
         m1.get_mut("path").unwrap().keys = vec![
-            Keyframe::new(s(0.0), Value::Path(ShapePath::rect([100.0, 60.0], 150.0, 90.0))),
-            Keyframe::new(s(2.0), Value::Path(ShapePath::rect([90.0, 60.0], 120.0, 80.0))),
+            Keyframe::new(s(0.0), Value::path(ShapePath::rect([100.0, 60.0], 150.0, 90.0))),
+            Keyframe::new(s(2.0), Value::path(ShapePath::rect([90.0, 60.0], 120.0, 80.0))),
         ];
         let mut m2 = build::mask(&mut ids, "Mask 2", ShapePath::ellipse([100.0, 60.0], 40.0, 40.0), MaskMode::Subtract, [0, 255, 0]);
         m2.get_mut("opacity").unwrap().value = Value::Scalar(60.0);

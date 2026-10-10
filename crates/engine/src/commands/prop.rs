@@ -777,13 +777,13 @@ fn interpolation(s: &mut Session, p: &Value) -> Result<Value> {
         if let Some(x) = inn {
             keys[i].in_interp = x;
             if x == Interp::Bezier && keys[i].in_ease.is_empty() {
-                keys[i].in_ease = vec![Ease::default(); n];
+                keys[i].in_ease = vec![Ease::default(); n].into();
             }
         }
         if let Some(x) = out {
             keys[i].out_interp = x;
             if x == Interp::Bezier && keys[i].out_ease.is_empty() {
-                keys[i].out_ease = vec![Ease::default(); n];
+                keys[i].out_ease = vec![Ease::default(); n].into();
             }
         }
         if let Some(a) = auto {
@@ -800,10 +800,10 @@ fn interpolation(s: &mut Session, p: &Value) -> Result<Value> {
             k.in_interp = Interp::Bezier;
             k.out_interp = Interp::Bezier;
             if k.in_ease.len() != n {
-                k.in_ease = vec![Ease::default(); n];
+                k.in_ease = vec![Ease::default(); n].into();
             }
             if k.out_ease.len() != n {
-                k.out_ease = vec![Ease::default(); n];
+                k.out_ease = vec![Ease::default(); n].into();
             }
             for d in 0..n {
                 let sp = (k.in_ease[d].speed + k.out_ease[d].speed) / 2.0;
@@ -868,9 +868,9 @@ fn velocity(s: &mut Session, p: &Value) -> Result<Value> {
         let cur_in = cur(keys, false);
         let cur_out = cur(keys, true);
         let k = &mut keys[i];
-        let apply = |list: &mut Vec<Ease>, base: Vec<Ease>, sp: &Option<Vec<f64>>, inf: &Option<Vec<f64>>| {
+        let apply = |list: &mut effectcraft_keyframe::Eases, base: Vec<Ease>, sp: &Option<Vec<f64>>, inf: &Option<Vec<f64>>| {
             if list.len() != n {
-                *list = base;
+                *list = base.into();
             }
             for (d, e) in list.iter_mut().enumerate() {
                 if let Some(v) = sp.as_ref().and_then(|v| v.get(d).or(v.first())) {
