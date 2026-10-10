@@ -20,6 +20,8 @@ pub(crate) fn handlers() -> &'static [Handler] {
         Handler::ui("window.closePanelGroup", panel_op),
         Handler::ui("window.floatPanelGroup", panel_op),
         Handler::ui("window.stackPanelGroup", panel_op),
+        Handler::ui("window.soloPanels", panel_op),
+        Handler::ui("window.smallTabs", panel_op),
         Handler::ui("window.panelMenu", panel_op),
         // Window ▸ <ScriptUI panel>: dock (or bring forward) the panel the script built.
         Handler::frontend("window.scriptPanel", script_panel),
@@ -48,7 +50,7 @@ fn legacy_workspace(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, _pa
 }
 
 /// Docking and the panel menu: {panel, anchor?, zone: center|left|right|top|bottom},
-/// {panel, rect?}, {panel?}, {panel, comp?}, {panel, stacked?}.
+/// {panel, rect?}, {panel?}, {panel, comp?}, {panel, stacked?}, {panel, solo?}, {panel, small?}.
 fn panel_op(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: Value) -> Result<Value, String> {
     let op = id.strip_prefix("window.").unwrap_or(id);
     let panel_of = |k: &str| params.get(k).and_then(Value::as_str).map(|s| PanelKind::from_name(s).ok_or(format!("unknown panel `{s}`")));
@@ -79,6 +81,21 @@ fn panel_op(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: Val
         "stackPanelGroup" => {
             let on = app.stack_panel_group(need(op)?, params.get("stacked").and_then(Value::as_bool))?;
             Ok(json!({"stacked": on}))
+        }
+        // Panel Group Settings ▸ Solo Panels in Stack / Small Tabs: `solo` / `small`, or toggle.
+        "soloPanels" => {
+            let p = need(op)?;
+            let cur = app.ui.dock.solo(p).ok_or_else(|| format!("{} is not in a stacked panel group", p.title()))?;
+            let on = params.get("solo").and_then(Value::as_bool).unwrap_or(!cur);
+            app.ui.dock.set_solo(p, on);
+            Ok(json!({"solo": on}))
+        }
+        "smallTabs" => {
+            let p = need(op)?;
+            let cur = app.ui.dock.small_tabs(p).ok_or_else(|| format!("{} is not docked", p.title()))?;
+            let on = params.get("small").and_then(Value::as_bool).unwrap_or(!cur);
+            app.ui.dock.set_small_tabs(p, on);
+            Ok(json!({"small": on}))
         }
         "panelMenu" => {
             let p = need(op)?;

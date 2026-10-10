@@ -895,3 +895,10 @@ one in front and each one's current time, and opening it (Open, Open Recent, Rev
 recovered auto-save) brings them back, as After Effects does with an `.aep`. Changing tabs or
 the time doesn't mark the project modified; comps deleted since are skipped; older files open as
 before.
+## Update: Panel Group Settings ▸ Solo Panels in Stack and Small Tabs (10 October)
+
+- The panel menu's last two Panel Group Settings items work: Solo Panels in Stack
+  (`window.soloPanels {panel, solo?}`, stacked groups only) keeps one panel of the stack expanded,
+  and Small Tabs (`window.smallTabs {panel, small?}`) gives a docked group or stack a shorter tab
+  strip with smaller labels. Both are saved with the layout and its workspaces. Floating groups
+  don't have Small Tabs yet.

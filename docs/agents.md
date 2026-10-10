@@ -172,7 +172,10 @@ renders very differently from what you meant.
 ### Several agents at once
 
 Pass `client` on every request (`"client": "agentA"`) when you share the app with the user or other
-agents. Two things follow:
+agents. Over MCP, every tool takes it as an argument (`set_property {"layer": 2, …, "client":
+"agentA"}`; the engine commands the tool runs carry it, and renders default to your time), or start
+the server as `effectcraft-cli mcp --client agentA` (or set `EFFECTCRAFT_CLIENT`) so every call runs
+as you; a call's own `client` wins. Two things follow:
 
 - **Your own cursor.** Selection (layers, properties, keys, mask vertices, Project items), active comp
   and current time are yours: `layer.select`, `time.set`, `comp.new` / `comp.open` and every command
