@@ -93,6 +93,8 @@ mod ui_script_console;
 mod ui_scriptui;
 #[path = "../ui_scrolling.rs"]
 mod ui_scrolling;
+#[path = "../ui_source_icons.rs"]
+mod ui_source_icons;
 #[path = "../ui_tabs.rs"]
 mod ui_tabs;
 #[path = "../ui_tail.rs"]
@@ -105,6 +107,8 @@ mod ui_time_zoom_controls;
 mod ui_timeline_shapes;
 #[path = "../ui_timeline_switches.rs"]
 mod ui_timeline_switches;
+#[path = "../ui_timeline_trim.rs"]
+mod ui_timeline_trim;
 #[path = "../ui_timeline_zoom.rs"]
 mod ui_timeline_zoom;
 #[path = "../ui_tracker.rs"]
