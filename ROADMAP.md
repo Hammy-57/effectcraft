@@ -27,7 +27,7 @@ once.
 | M12 | Performance: layer cache, parallel and GPU compositing, disk cache, motion tracking (done); GPU versions of the remaining CPU-only effects | Mostly done |
 | M13 | Puppet tools, paint, Roto Brush, motion tracking, a plug-in API, Timeline depth | Done (trained models, open source, downloaded on demand, in a swappable model module: MobileSAM for Roto Brush 2.0 / 3.0, MediaPipe Face Landmarker for face tracking) |
 | M15 | The web app (WebAssembly, WebGPU) | Done: browser storage, Web Audio, renders and analyses in Web Workers, viewer frames and GPU effects in frame workers with their own WebGPU devices, the disk cache in the Origin Private File System, a storage manager, offline install ([docs/web.md](docs/web.md)) |
-| M14 | Built for agents: MCP server, command-line tool, control channel; Settings, keyboard shortcut editor, auto-save and crash recovery ([docs/preferences.md](docs/preferences.md)) | Done |
+| M14 | Built for agents: MCP server (headless, the full app offscreen with `--ui`, or bridged to the running app), command-line tool, control channel; rendering, comparison, layout and audio analysis tools, progress and cancellation, per-client undo and parallel-agent tooling ([docs/agents.md](docs/agents.md)); Settings, keyboard shortcut editor, auto-save and crash recovery ([docs/preferences.md](docs/preferences.md)) | Done |
 
 ## How far from full parity
 
