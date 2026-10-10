@@ -19,7 +19,7 @@ pub mod warp;
 use effectcraft_color::{BlendMode, blend_pixel};
 use rayon::prelude::*;
 
-pub use blur::{box_blur, directional_blur, gaussian_blur, gaussian_support, radial_blur};
+pub use blur::{box_blur, box_blur_plane, directional_blur, gaussian_blur, gaussian_blur_plane, gaussian_support, radial_blur};
 pub use channels3d::AuxChannels;
 pub use sparse::{Sparse, gaussian_blur_sparse, resample_sparse};
 pub use warp::{
