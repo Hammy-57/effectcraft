@@ -352,7 +352,7 @@ fn composite_warp_impl(dst: &mut Image, origin: [u32; 2], mips: &MipChain, m: &M
                 let seed = opts.seed;
                 affine_rows(dst, o, img, &inv, opts.sampling, op, x0, x1, y0, y1, |d, s, x, y| blend_pixel(mode, d, s, hash_noise(x, y, seed)))
             }
-            _ => affine_rows(dst, o, img, &inv, opts.sampling, op, x0, x1, y0, y1, |d, s, _, _| blend_pixel(mode, d, s, 0.5)),
+            _ => crate::with_blend_mode!(mode, blend, affine_rows(dst, o, img, &inv, opts.sampling, op, x0, x1, y0, y1, |d, s, _, _| blend(d, s, 0.5))),
         }
         return;
     }
