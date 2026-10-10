@@ -256,7 +256,7 @@ impl Session {
         drop(img);
         let mut info = match r.target {
             Target::Comp(c) => json!({"comp": c.0}),
-            Target::Item(i) => json!({"item": i.0}),
+            Target::Item(i) => json!({"comp": null, "item": i.0}),
         };
         info["time"] = json!(r.time.seconds());
         info["frame"] = json!(rate.frame_at(r.time));

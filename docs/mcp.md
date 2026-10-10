@@ -20,8 +20,8 @@ The server provides the same core conventions as FilmCraft #28:
 | `command_run` | `id`, `params?` | Engine command result |
 | `command_batch` | `steps: [{id, params?}]`, `stop_on_error?` | `completed`, `failed`, per-step `results` |
 | `doc_inspect` | none | Project overview and active composition |
-| `render_preview` | `comp?` / `item?`, `layer?`, `time?`, `max_side?`, `region?`, `overlays?`, `transparent?` | PNG and frame information |
-| `render_frames` | `times?` / `count?`, `start?`, `end?`, `cols?`, `max_side?`, `labels?`, `gif?`, `path?` and the render arguments | One labelled contact-sheet PNG and `{times, frames, cols, rows, cell}` |
+| `render_preview` | `comp?` / `item?`, `layer?`, `time?`, `max_side?`, `region?`, `overlays?`, `path?`, `inline?`, `transparent?` | PNG and frame information |
+| `render_frames` | `times?` / `count?`, `start?`, `end?`, `cols?`, `max_side?`, `labels?`, `gif?`, `path?`, `inline?` and the render arguments | One labelled contact-sheet PNG and `{times, frames, cols, rows, cell}` |
 
 To check visual work, `render_snapshot {name, comp?, time?}` keeps a frame and
 `render_compare {a, b, threshold?, min_psnr?, max_side?, diff_path?, inline?}` compares snapshots,
@@ -32,12 +32,22 @@ project. See [agents.md](agents.md#verify-your-change-snapshot--edit--compare).
 
 `command_batch` stops at the first error by default; false continues. Each edit has its
 own undo step. The existing `batch` tool retains its atomic undo grouping and result references.
-Existing tools, including `list_commands`, `execute_command`, and `batch`, remain listed
-because existing workflows use them; there are no hidden aliases. See [agents.md](agents.md)
-for the full catalog. Each tool has a title and read-only, destructive, idempotent and
-open-world hints. Tools with an optional output path are conservatively annotated as file writers.
+See [agents.md](agents.md) for the full catalog. Each tool has a title and read-only, destructive,
+idempotent and open-world hints. Tools with an optional output path are conservatively annotated
+as file writers.
 
-`render_frame`, `render_preview` and `render_frames` share the engine commands `render.frame` and
+Four older names duplicate a core tool. They are left out of `tools/list` but stay callable
+with their own arguments, so existing workflows keep working; `effectcraft-cli mcp --all-tools`
+lists them too (described as aliases):
+
+| Hidden alias | Canonical tool |
+| --- | --- |
+| `list_commands` | `command_list` (same arguments) |
+| `execute_command {command \| id, params?}` | `command_run {id, params?}` |
+| `get_project` | `doc_inspect` (its `project` is the same summary) |
+| `render_frame` | `render_preview` (same arguments, including `path` and `inline`) |
+
+`render_preview` (and its alias `render_frame`) and `render_frames` share the engine commands `render.frame` and
 `render.contactSheet` (headless and bridged alike): `region: [x, y, w, h]` renders one comp rectangle
 at full resolution, `layer` one layer solo, `item` a footage or solid item, and `overlays` draws layer
 bounds, anchors, motion paths, safe margins or the grid. Contact sheets hold at most 64 cells;
@@ -49,14 +59,86 @@ preserved. Tool failures (including escaped panics) return `isError: true`. Malf
 returns `-32700` with a null id and the session keeps serving. The MCP backend owns its session
 without a mutex; the engine's render-job mutexes already recover poisoned locks.
 
+## Structured results
+
+Sessions that negotiated MCP 2025-06-18 (and modern per-request clients) get each JSON tool
+result as `structuredContent` as well as the JSON text block older clients read. It is always an
+object: an array result is `{"items": [...]}`, a scalar `{"value": v}`, and an image reply carries
+its metadata (`comp`, `time`, `width`, `height`, `path?`). Tools with a stable shape declare it as
+`outputSchema` in `tools/list`: `get_state`, `doc_inspect`, `render_preview`, `undo`, `redo`,
+`history`, `command_batch`, `batch` and `save_project`. Earlier revisions see neither field.
+Long calls (below) reply the same way.
+
+## Resources
+
 Resources `effectcraft://document` and `effectcraft://commands` return JSON matching
 `doc_inspect` and `command_list`. Clients declaring MCP 2026-07-28 in per-request `_meta`
 receive `resultType: complete` and list/read cache hints; document reads are never cached.
 
+`resources/templates/list` offers four templates, read with `resources/read`:
+
+| Template | Content |
+| --- | --- |
+| `effectcraft://comp/{comp}` | `get_comp` JSON |
+| `effectcraft://layer/{comp}/{layer}` | `get_layer` tree JSON; `?flat=true` for the flat list |
+| `effectcraft://frame/{comp}/{time}` | PNG (`blob`, `image/png`) at comp time `time` seconds, longest side 960; `?max_side=N` (0 = full size, at most 8192) |
+| `effectcraft://command/{id}` | `describe_command` JSON |
+
+`{comp}` and `{layer}` take an id (a number), a name, or `#n` for a layer. Each segment is
+percent-encoded (`Main%20%2F%20Intro`, `%231`). An unknown scheme, kind, comp, layer or command
+returns `-32002`; malformed URIs (wrong segment count, bad escape or time, unknown query key)
+return `-32602`.
+
 ```json
 {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"command_run","arguments":{"id":"comp.new","params":{"width":640,"height":360}}}}
 {"jsonrpc":"2.0","id":2,"method":"resources/read","params":{"uri":"effectcraft://document"}}
+{"jsonrpc":"2.0","id":3,"method":"resources/read","params":{"uri":"effectcraft://frame/1/0.5?max_side=320"}}
 ```
+
+## Notifications
+
+The server writes notifications on stdout after the reply to the request that caused them.
+
+**Resource subscriptions** (`resources.subscribe: true`). `resources/subscribe {uri}` accepts any
+readable URI, including template matches (an unknown or malformed one is an error, as for
+`resources/read`); `resources/unsubscribe` removes it. When the project's revision changes
+(`project.summary.revision`; every edit, undo and redo, never a query or a value set to what it
+already was), each subscribed `document`, `comp`, `layer` and `frame` URI gets
+`notifications/resources/updated {uri}`. This is conservative: every subscribed project URI is
+reported, whichever comp changed. Command URIs never are. Headless sessions compare the revision
+after every request. In bridge mode, while anything is subscribed, each request polls
+`project.summary` once. Edits made in the app are therefore reported with the next request, not
+as they happen.
+
+**Logging** (`logging: {}`). `logging/setLevel {level}` takes an RFC 5424 level (`debug` …
+`emergency`). Until then, `warning` and above are sent. Entries are `notifications/message`
+with `logger: "effectcraft"` and `data: {message, …}`:
+
+| Level | When |
+| --- | --- |
+| `warning` | An edit leaves new expression errors in the active comp (`data.errors`, from `expr.errors`; each error is reported once) |
+| `warning` | `open_project` finds missing footage (headless; `data.missing`) |
+| `error` | A `--autosave` checkpoint failed (also appended to the tool reply) |
+| `error` / `info` | Session toasts (headless), such as "saved by a newer EffectCraft" |
+
+In bridge mode only the expression check applies; the app shows its own toasts and footage
+checks.
+
+## Prompts
+
+`prompts/list` and `prompts/get` serve workflow recipes. Each one is a single user message that spells
+out the tool flow (canonical tool names, the layer-time versus comp-time pitfall, rendering to check):
+
+| Prompt | Arguments |
+| --- | --- |
+| `title_card` | `text`, `style?` |
+| `lower_third` | `name`, `title` |
+| `port_ae_script` | `script` (After Effects ExtendScript, run through `run_script`) |
+| `check_against_reference` | `reference_path`, `comp?`, `time?` (`render_compare` against the reference) |
+| `animate_layer` | `layer`, `motion` |
+
+Argument values are strings. A missing required argument, an unknown argument or prompt, or a
+non-string value returns `-32602`.
 
 ## Progress and cancellation
 
