@@ -821,3 +821,14 @@ are pinned bit for bit by golden hashes (`crates/effects/tests/particle_golden.r
   root comp) and missing media.
 - Id shifting saturates instead of overflowing on damaged files, for both templates and
   projects.
+
+## Update: Libraries
+
+- **Libraries** ([libraries.md](libraries.md)): folders indexed by `library.json` hold reusable
+  comps (`.ecproj`), animation presets, footage and sound effects.
+  - `library.search` ranks entries by name, tags, category and description.
+  - `library.insert` imports a comp project and nests the entry's comp, adds media as a layer, or
+    applies a preset.
+  - `library.addFolder`, `library.removeFolder`, `library.folders` and `library.get` manage and
+    read them.
+  - Being engine commands, they reach MCP and the control channel with nothing extra.
