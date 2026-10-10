@@ -78,13 +78,22 @@ impl McpServer {
         is_modern(params) || self.version.is_some_and(|v| v >= STRUCTURED_SINCE)
     }
 
-    /// Opt in to durable headless checkpoints in a separate folder per server.
+    /// Opt in to durable checkpoints in a separate folder per server, for a session in this
+    /// process: headless, or the offscreen app of `mcp --ui` (checkpointed on its UI thread).
     /// `root` is the platform config directory; settings are read by the caller.
     pub fn with_autosave(mut self, root: &Path) -> crate::Result<Self> {
-        let s = self.backend.session().ok_or_else(|| crate::Error::BadArgs("--autosave is for headless MCP; the bridged app owns its auto-saves".into()))?;
-        s.autosave.background = false;
-        let autosave = AutoSave::new(root, &s.prefs).map_err(|e| crate::Error::Other(format!("MCP auto-save: {e}")))?;
-        s.autosave_folder_override = Some(autosave.folder().to_path_buf());
+        let in_process =
+            || crate::Error::BadArgs("--autosave is for MCP with the project in this process (headless or --ui); the bridged app owns its auto-saves".into());
+        let prefs = self.backend.session_prefs().ok_or_else(in_process)?;
+        let autosave = AutoSave::new(root, &prefs).map_err(|e| crate::Error::Other(format!("MCP auto-save: {e}")))?;
+        let folder = autosave.folder().to_path_buf();
+        // Queued for an app in this process: it runs once the app started, before any request.
+        self.backend
+            .queue_on_session(Box::new(move |s| {
+                s.autosave.background = false;
+                s.autosave_folder_override = Some(folder);
+            }))
+            .ok_or_else(in_process)??;
         self.autosave = Some(autosave);
         Ok(self)
     }
@@ -94,9 +103,22 @@ impl McpServer {
     }
 
     fn checkpoint(&mut self, finish: bool) -> std::io::Result<()> {
-        match (&mut self.autosave, self.backend.session()) {
-            (Some(a), Some(s)) => a.checkpoint(s, finish),
-            _ => Ok(()),
+        let Some(a) = &mut self.autosave else { return Ok(()) };
+        if let Some(s) = self.backend.session() {
+            return a.checkpoint(s, finish);
+        }
+        // An app in this process (`mcp --ui`): checkpoint on its UI thread, between frames.
+        let mut job = a.clone();
+        match self.backend.with_session(move |s| {
+            let r = job.checkpoint(s, finish);
+            (job, r)
+        }) {
+            Some(Ok((done, r))) => {
+                *a = done;
+                r
+            }
+            Some(Err(e)) => Err(a.failed(e)),
+            None => Ok(()),
         }
     }
 

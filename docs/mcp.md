@@ -10,7 +10,10 @@ channel. Existing ports are unchanged.
 UI thread. That thread steps the egui_kittest harness until each request is answered and the UI
 has settled, feeds the app's synthetic input as real events and renders screenshots with wgpu.
 `screenshot` and the `ui_*` / `control` tools are listed only in these two modes; the
-`initialize` title names the mode (`headless`, `headless-ui`, `bridge`).
+`initialize` title names the mode (`headless`, `headless-ui`, `bridge`). The offscreen app's
+session is in the server's process, so a transport can also run code on it
+(`ControlTransport::on_session`, run on the UI thread between frames): `mcp --ui --autosave`
+checkpoints the project that way, like headless `--autosave` ([agents.md](agents.md)).
 
 The server provides the same core conventions as FilmCraft #28:
 

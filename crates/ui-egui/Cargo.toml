@@ -41,6 +41,8 @@ pollster = { workspace = true }
 sys-locale = { workspace = true }
 
 [dev-dependencies]
+# Examples (`snapshot`) and tests use the offscreen app.
+effectcraft-ui-egui = { path = ".", features = ["offscreen"] }
 egui_kittest = { workspace = true, features = ["eframe", "wgpu"] }
 effectcraft-host = { workspace = true }
 exr = { workspace = true }
