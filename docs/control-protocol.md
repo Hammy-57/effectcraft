@@ -56,6 +56,13 @@ one rectangle; `diffBounds` boxes the changed pixels or is null; metrics and siz
 (layer geometry in comp space) and `audio.analyze {comp?, start?, end?, layer?, waveform?, path?}`
 (peak, RMS, LUFS, clipping and silences of the mix).
 
+`project.summary` and `editor.state` include the document `revision` (bumped on every change, undo and
+redo included). Every command's `params` also accepts `expectRevision` (the command doesn't run and
+errors with `document changed (revision X, expected Y)` when the document moved on) and `client` (a
+driver name: its undo steps are tagged, and `edit.undo {"client": …}` refuses unless that client made
+the last step). Both are handled by `Session::execute` and stripped before the command sees its params.
+A number always names an id (layer, effect, mask…), never a position; use `"#n"` for the n-th.
+
 Every engine command is reachable through `engine.execute`, and every interactive widget of every
 panel registers an element id; both are enforced by `crates/ui-egui/tests/ui_agent_audit.rs`.
 

@@ -990,25 +990,16 @@ fn add_mask(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn mask_props(s: &mut Session, p: &Value) -> Result<Value> {
     let (cid, lid) = layer_p(s, p, "layer.setMask")?;
-    let target = p.get("mask").cloned().unwrap_or(json!(1));
+    let target = p.get("mask").cloned().unwrap_or(json!("#1"));
     let mode = str_p(p, "mode").and_then(MaskMode::from_name);
     let inverted = b_p(p, "inverted");
     s.edit("Mask Settings", None, |proj, _| {
         let l = layer_mut(proj, cid, lid)?;
         let masks = l.props.sub_mut("masks").ok_or_else(|| bad("layer.setMask", "the layer has no masks (add one with layer.addMask)"))?;
-        let g = match &target {
-            Value::Number(n) => {
-                let n = n.as_u64().unwrap_or(1);
-                if let Some(i) = masks.children.iter().position(|c| c.uid() == n) {
-                    masks.children[i].as_group_mut()
-                } else {
-                    masks.children.get_mut(n.saturating_sub(1) as usize).and_then(|c| c.as_group_mut())
-                }
-            }
-            Value::String(name) => masks.children.iter_mut().find(|c| c.name() == name).and_then(|c| c.as_group_mut()),
-            _ => None,
-        }
-        .ok_or_else(|| bad("layer.setMask", "no such mask"))?;
+        let g = super::mask::mask_index(masks, &target)
+            .and_then(|i| masks.children.get_mut(i))
+            .and_then(|c| c.as_group_mut())
+            .ok_or_else(|| bad("layer.setMask", format!("no mask {target} (a number is the mask's uid; use \"#n\" for the n-th mask)")))?;
         if let GroupKind::Mask { mode: m, inverted: inv, .. } = &mut g.kind {
             if let Some(mm) = mode {
                 *m = mm;
@@ -1373,7 +1364,7 @@ pub fn specs() -> Vec<CommandSpec> {
             has_layers,
             add_mask
         ),
-        cmd!("layer.setMask", "Mask Mode", [], None, "{layer?, mask: index|uid|name, mode?, inverted?}", has_layers, mask_props),
+        cmd!("layer.setMask", "Mask Mode", [], None, "{layer?, mask: uid|\"#n\"|name (default the first), mode?, inverted?}", has_layers, mask_props),
         cmd!(
             "layer.addShapeItem",
             "Add (Shape)",

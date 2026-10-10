@@ -128,6 +128,20 @@ example `transform/position`, `transform/opacity`, `effects/#1/blurriness` or `@
 are in seconds. Keyframe times are layer time, which equals comp time unless the layer is offset or
 stretched.
 
+A number is always an id, never a position: a layer, effect, mask, tracker or text animator id that
+doesn't exist is an error (`no layer 7 (… use "#n" …)`), not whatever sits at that place. Use `"#n"` for
+"the n-th from the top" (`"layer": "#2"`, `"effect": "#1"`, `"mask": "#1"`). Ids are never reused, also
+after an undo, so an id you saw keeps meaning the same object or nothing.
+
+When you share the document with the user or other agents, two execute parameters (accepted by every
+command, also inside `engine.batch`) keep you from stepping on each other:
+
+- `expectRevision`: the `revision` from `project.summary` / `doc_inspect` / `editor.state`. If the
+  document changed since, the command doesn't run and returns `document changed (revision X, expected Y)`.
+- `client`: a name for you (`"client": "my-agent"`). Your undo steps are tagged with it, and
+  `edit.undo {"client": "my-agent"}` only undoes your own last step: if the last change was the user's
+  or another client's, it refuses and changes nothing. `edit.history.list` shows each state's `client`.
+
 Command params are checked against each command's `params` doc. An unknown key, such as
 `layer.select {"index": 2}`, returns an error that lists the accepted keys (here `layers, add, toggle`)
 instead of being ignored.
@@ -188,7 +202,7 @@ Short recipes; every step is one tool call.
 | Title card | `command_run comp.new {...}` → `command_run layer.newText {"text":"Hi","size":120}` → `render_preview {"time":0}` |
 | Animate | `add_keyframe {"layer":2,"path":"transform/scale","keys":[{"time":0,"value":[0,0]},{"time":0.5,"value":[100,100]}],"interpolation":"easyEase"}` |
 | Effect with settings | `list_effects {"filter":"glow"}` → `add_effect {"layer":2,"effect":"Glow","values":{"threshold":40,"radius":30}}` → `set_property {"layer":2,"path":"effects/#1/intensity","value":2}` |
-| Key a green screen | `add_effect {"layer":2,"effect":"Keylight (1.2)"}` → `command_run effect.pickColor {"layer":2,"effect":1,"param":"screenColour","x":20,"y":20,"average":true}` (a screen pixel, layer space; samples the effect's input) → `set_property {"layer":2,"path":"effects/#1/screenMatte/clipBlack","value":10}` → `render_preview {"transparent":true}` |
+| Key a green screen | `add_effect {"layer":2,"effect":"Keylight (1.2)"}` → `command_run effect.pickColor {"layer":2,"effect":"#1","param":"screenColour","x":20,"y":20,"average":true}` (a screen pixel, layer space; samples the effect's input) → `set_property {"layer":2,"path":"effects/#1/screenMatte/clipBlack","value":10}` → `render_preview {"transparent":true}` |
 | Drive with an expression | `set_property {"layer":2,"path":"transform/rotation","expression":"time*90"}` |
 | Inspect a layer | `get_layer {"layer":2,"flat":true}` (every property with its `path`, value, key count) |
 | Is the title centred and on screen? | `get_layout {"layers":["Title"],"time":2}` → compare `center` with half the comp size, `onScreen` should be 1; `get_layout {"overlaps":true}` for collisions |
@@ -432,7 +446,7 @@ no face in the mask).
 
 ```sh
 effectcraft-cli run clip.ecproj face.model.download '{"id":"mediapipe-face","wait":true}' face.model.select '{"id":"mediapipe-face","wait":true}' \
-  track.mask '{"layer":"#1","mask":1,"method":"faceDetailed","direction":"forward","wait":true}' --save
+  track.mask '{"layer":"#1","mask":"#1","method":"faceDetailed","direction":"forward","wait":true}' --save
 ```
 
 `mask.interpolate` (Window ▸ Mask Interpolation ▸ Apply) adds in-between Mask Path keys between
@@ -444,7 +458,7 @@ ends the same vertex count with a matched correspondence. Options: `keyframeRate
 panel's defaults.
 
 ```sh
-effectcraft-cli exec track.mask '{"layer":"#2","mask":1,"method":"perspective","wait":true}' clip.ecproj --save
+effectcraft-cli exec track.mask '{"layer":"#2","mask":"#1","method":"perspective","wait":true}' clip.ecproj --save
 effectcraft-cli exec mask.interpolate '{"layer":"#2","mask":"Mask 1","times":[0,2],"addVertices":10}' clip.ecproj --save --json
 ```
 
