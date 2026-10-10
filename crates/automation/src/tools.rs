@@ -68,7 +68,6 @@ const READ_ONLY: &[&str] = &[
     "list_commands",
     "describe_command",
     "doc_inspect",
-    "render_preview",
     "get_project",
     "get_comp",
     "get_layer",
@@ -80,7 +79,23 @@ const READ_ONLY: &[&str] = &[
     "ui_elements",
 ];
 /// Tools that write files (or keep session-side frames) without changing the project.
-const WRITES_FILES: &[&str] = &["save_project", "render_frame", "screenshot", "render_snapshot", "render_compare"];
+const WRITES_FILES: &[&str] = &["save_project", "render_frame", "render_preview", "screenshot", "render_snapshot", "render_compare"];
+
+/// Older tool names kept callable but left out of `tools/list` (`mcp --all-tools` lists them):
+/// (alias, canonical tool). The canonical one takes every argument the alias does, except
+/// `execute_command`'s `command` key (`command_run` takes `id`).
+pub const HIDDEN_ALIASES: &[(&str, &str)] =
+    &[("list_commands", "command_list"), ("execute_command", "command_run"), ("get_project", "doc_inspect"), ("render_frame", "render_preview")];
+
+/// The canonical tool a hidden alias stands for.
+pub fn alias_of(name: &str) -> Option<&'static str> {
+    HIDDEN_ALIASES.iter().find(|(alias, _)| *alias == name).map(|(_, canonical)| *canonical)
+}
+
+/// Whether a tool can change the project (anything but queries and file writers).
+pub fn may_edit(name: &str) -> bool {
+    !READ_ONLY.contains(&name) && !WRITES_FILES.contains(&name)
+}
 
 /// `get_project` → "Get project".
 fn title_of(name: &str) -> String {
@@ -101,6 +116,51 @@ pub fn find(name: &str) -> Option<&'static ToolDef> {
 /// The tools available on a backend (UI tools are hidden in headless mode without a UI).
 pub fn available(bridge: bool) -> impl Iterator<Item = &'static ToolDef> {
     TOOLS.iter().filter(move |t| bridge || !t.bridge_only)
+}
+
+/// The JSON Schema of a tool's `structuredContent` (MCP 2025-06-18 `outputSchema`), for tools
+/// whose result shape is stable. Clients that negotiated 2025-06-18+ get every JSON result as
+/// `structuredContent` too ([`structured`]); only these declare its shape.
+pub fn output_schema(name: &str) -> Option<Value> {
+    let object = |props: Value, required: &[&str]| json!({"type": "object", "properties": props, "required": required});
+    let int = json!({"type": "integer"});
+    Some(match name {
+        "get_state" => object(json!({"state": {"type": "object"}, "app": {"type": "object"}}), &["state", "app"]),
+        "doc_inspect" => object(json!({"project": {"type": "object"}, "activeComp": {"type": ["object", "null"]}}), &["project", "activeComp"]),
+        "render_preview" | "render_frame" => object(
+            json!({
+                "comp": {"type": ["integer", "string", "null"], "description": "Composition id."},
+                "time": {"type": "number", "description": "Comp time in seconds."},
+                "width": int, "height": int,
+                "path": {"type": "string", "description": "Where the PNG was written (with `path`)."}
+            }),
+            &["comp", "time", "width", "height"],
+        ),
+        "undo" | "redo" => object(json!({"steps": int, "undoStack": {"type": "array", "items": {"type": "string"}}}), &["steps", "undoStack"]),
+        "history" => {
+            object(json!({"states": {"type": "array", "items": {"type": "object"}}, "current": {"type": ["integer", "null"]}, "branches": int}), &["states"])
+        }
+        "command_batch" => object(
+            json!({
+                "completed": int, "failed": int,
+                "results": {"type": "array", "items": object(json!({"ok": {"type": "boolean"}, "result": {}, "error": {"type": "string"}}), &["ok"])}
+            }),
+            &["completed", "failed", "results"],
+        ),
+        "batch" => object(json!({"steps": int, "results": {"type": "array"}}), &["steps", "results"]),
+        "save_project" => object(json!({"path": {"type": ["string", "null"]}, "dirty": {"type": "boolean"}}), &["path", "dirty"]),
+        _ => return None,
+    })
+}
+
+/// A JSON result as MCP `structuredContent`, which must be an object: arrays become
+/// `{"items": [...]}`, other values `{"value": v}`.
+pub fn structured(v: Value) -> Value {
+    match v {
+        Value::Object(_) => v,
+        Value::Array(_) => json!({"items": v}),
+        other => json!({"value": other}),
+    }
 }
 
 /// Run a tool by name.
@@ -581,7 +641,7 @@ fn control(b: &mut Backend, a: &Value) -> Result<Reply> {
 static TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "list_commands",
-        description: "List engine commands: id, label, menu path, shortcut, `params` doc (e.g. `{name?, width?, height?, frameRate?, duration? (s)}`) and whether it can run now (`why` if not). Every menu item, shortcut and panel gesture maps to one of these ids; run them with execute_command. Narrow with `filter` (e.g. `layer.new`, `keys`, `effect`).",
+        description: "List engine commands: id, label, menu path, shortcut, `params` doc (e.g. `{name?, width?, height?, frameRate?, duration? (s)}`) and whether it can run now (`why` if not). Every menu item, shortcut and panel gesture maps to one of these ids; run them with command_run. Narrow with `filter` (e.g. `layer.new`, `keys`, `effect`).",
         bridge_only: false,
         schema: || {
             schema(
@@ -597,7 +657,7 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "describe_command",
-        description: "One command in full: id, label, menu path, shortcut, the `params` doc, a JSON Schema of its parameters (`schema`: properties, required, additionalProperties) and whether it can run now (`why` if not). Use before execute_command when unsure of the parameters; execute_command rejects unknown keys.",
+        description: "One command in full: id, label, menu path, shortcut, the `params` doc, a JSON Schema of its parameters (`schema`: properties, required, additionalProperties) and whether it can run now (`why` if not). Use before command_run when unsure of the parameters; command_run rejects unknown keys.",
         bridge_only: false,
         schema: || {
             schema(
@@ -614,9 +674,9 @@ static TOOLS: &[ToolDef] = &[
         schema: || {
             schema(
                 json!({
-                    "command": {"type": "string", "description": "Command id, e.g. `comp.new`, `layer.newText`, `effect.apply` (see list_commands)."},
+                    "command": {"type": "string", "description": "Command id, e.g. `comp.new`, `layer.newText`, `effect.apply` (see command_list)."},
                     "id": {"type": "string", "description": "Alias of `command`."},
-                    "params": {"type": "object", "description": "Command parameters as documented by list_commands.", "additionalProperties": true}
+                    "params": {"type": "object", "description": "Command parameters as documented by command_list.", "additionalProperties": true}
                 }),
                 &[],
             )
@@ -741,7 +801,7 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "list_fonts",
-        description: "The font families text layers can use, bundled and installed on this machine: family, styles, origin (bundled / system / user) and the name in the font's own language. Narrow with `query`; `rescan` picks up fonts installed since launch. Set one with execute_command `layer.setText {\"layer\", \"font\", \"style\"}`.",
+        description: "The font families text layers can use, bundled and installed on this machine: family, styles, origin (bundled / system / user) and the name in the font's own language. Narrow with `query`; `rescan` picks up fonts installed since launch. Set one with command_run `layer.setText {\"layer\", \"font\", \"style\"}`.",
         bridge_only: false,
         schema: || {
             schema(
@@ -987,7 +1047,7 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "command_list",
-        description: "List engine commands: id, label, menu path, shortcut, `params` doc (e.g. `{name?, width?, height?, frameRate?, duration? (s)}`) and whether it can run now (`why` if not). Every menu item, shortcut and panel gesture maps to one of these ids; run them with execute_command. Narrow with `filter` (e.g. `layer.new`, `keys`, `effect`).",
+        description: "List engine commands: id, label, menu path, shortcut, `params` doc (e.g. `{name?, width?, height?, frameRate?, duration? (s)}`) and whether it can run now (`why` if not). Every menu item, shortcut and panel gesture maps to one of these ids; run them with command_run. Narrow with `filter` (e.g. `layer.new`, `keys`, `effect`).",
         bridge_only: false,
         schema: || {
             schema(
@@ -1008,8 +1068,8 @@ static TOOLS: &[ToolDef] = &[
         schema: || {
             schema(
                 json!({
-                    "id": {"type": "string", "description": "Command id, e.g. `comp.new`, `layer.newText`, `effect.apply` (see list_commands)."},
-                    "params": {"type": "object", "description": "Command parameters as documented by list_commands.", "additionalProperties": true}
+                    "id": {"type": "string", "description": "Command id, e.g. `comp.new`, `layer.newText`, `effect.apply` (see command_list)."},
+                    "params": {"type": "object", "description": "Command parameters as documented by command_list.", "additionalProperties": true}
                 }),
                 &["id"],
             )
@@ -1018,7 +1078,7 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "render_preview",
-        description: "Render a composition frame (default: the active comp at the current time) and return it as a PNG image, longest side `max_side` (default 960, 0 = full size). Use it to check your work.",
+        description: "Render a composition frame (default: the active comp at the current time, in comp seconds) and return it as a PNG image, longest side `max_side` (default 960, 0 = full size). `path` also writes the PNG to disk; `inline: false` returns only the metadata. Use it to check your work.",
         bridge_only: false,
         schema: || {
             schema(
@@ -1026,6 +1086,8 @@ static TOOLS: &[ToolDef] = &[
                     "comp": comp_s(),
                     "time": {"type": "number", "description": "Comp time in seconds (default: current time)."},
                     "max_side": {"type": "integer", "description": "Longest side in pixels (default 960; 0 = full comp size)."},
+                    "path": {"type": "string", "description": "Also write the PNG here."},
+                    "inline": {"type": "boolean", "description": "Include the image in the reply (default true)."},
                     "transparent": {"type": "boolean", "description": "Keep the frame's alpha (RGBA PNG, as an RGB + Alpha render writes it) instead of compositing over the comp's background colour."}
                 }),
                 &[],
