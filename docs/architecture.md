@@ -75,10 +75,14 @@ Everything animatable is a `Property` in the layer's `PropGroup` tree, addressed
 `transform/position`, `effects/#1/blurriness`, `masks/#1/feather`, or by `@uid`. Effects, masks,
 text animators and shape contents are groups in the same tree.
 
-A project file (`.ecproj`) is the project as readable JSON, headed by `savedBy` (the EffectCraft
-version that wrote it) and `schema`; `.ecprojx` is the same data as XML (File ▸ Save a Copy As
-XML). Saving goes through `Project::to_file_json`, which checks that the text reads back before
-anything is written (JSON can't hold NaN or infinity), and files are written atomically. Opening
+A project file (`.ecproj`) is the project as compact JSON (no indentation; fields at their
+default value, such as a keyframe's linear interpolation or a property's `false` flags, are left
+out and read back as that default), headed by `savedBy` (the EffectCraft version that wrote it)
+and `schema`, with `openComps` last; `.ecprojx` is the same data as XML (File ▸ Save a Copy As
+XML). Saving goes through `Project::to_file_json`, which checks before anything is written that
+the text will read back (JSON can't hold NaN or infinity: `project/src/finite.rs` walks the values
+instead of parsing the text again, and the error names the property path), and files are written
+atomically. Opening
 a file that a newer EffectCraft saved shows a warning: fields this version doesn't know are
 dropped if it saves the project. Save, Save As, Save a Copy and Increment and Save keep the
 file's format (`.ecprojx` stays XML).

@@ -62,26 +62,35 @@ pub struct Property {
     pub keys: Vec<Keyframe>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expr: Option<Expression>,
-    #[serde(default)]
+    // Fields at their default value are left out of project files (they read back as it).
+    #[serde(default, skip_serializing_if = "is_number_ui")]
     pub ui: ParamUi,
     /// Motion-path semantics (Position, Anchor Point, points).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub spatial: bool,
     /// Only hold keyframes (Source Text, checkboxes, popups).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hold_only: bool,
     /// Valid only on 3D layers (Orientation, X/Y Rotation…).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub three_d_only: bool,
     /// Valid only on 2D layers.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub two_d_only: bool,
     /// Dimensions shown/edited (2 for 2D position etc.); 0 = all.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
     pub shown_dims: u8,
     /// Can't be keyframed (header-like values, e.g. Mask Mode). Shown without a stopwatch.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub static_only: bool,
+}
+
+fn is_number_ui(ui: &ParamUi) -> bool {
+    matches!(ui, ParamUi::Number)
+}
+
+fn is_zero_u8(v: &u8) -> bool {
+    *v == 0
 }
 
 impl Property {
