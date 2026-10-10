@@ -19,6 +19,8 @@ tree from scratch. The fix is to build less per agent, and to make each build ch
   It skips code generation and linking, so it's several times cheaper than a build.
 - Run only the tests you wrote or touched: `cargo test -p <crate> --lib <filter>`, or one
   integration test binary with a filter (UI tests: one binary, filter by file, see below).
+- Don't set `RUSTC_WRAPPER=sccache`: sccache is off on this machine (it only hit for rebuilds in
+  the same target dir, and every compile queued behind its one server).
 - Cap your jobs: `CARGO_BUILD_JOBS=4` (or `-j 4`). Several agents share 10 cores; more jobs than
   cores make everyone slower, not faster.
 - Don't run `cargo xtask ci`, `cargo xtask ci --affected`, a whole crate's test suite or a release
