@@ -44,8 +44,9 @@ computer.
 
 **The watchdog** (`.github/workflows/watchdog.yml`, set up at Elias's request) runs `cargo xtask ci
 --affected` on a free GitHub-hosted Linux runner after every push to `main`. It never blocks a push.
-A failure opens one issue labelled `watchdog` ("🔴 main is broken"), and the next green run closes it.
-If that issue is open, fixing main comes before new work.
+A failure shows as the red ❌ on the commit (`gh run list --workflow watchdog.yml`) and in GitHub's email;
+with issues turned on it also opens one `watchdog` issue that the next green run closes. If main is
+red, fixing it comes before new work.
 
 ## Building the app
 

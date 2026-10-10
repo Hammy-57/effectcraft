@@ -2,8 +2,9 @@
 #
 # The watchdog: work lands on main without a CI run first (docs/fork/agent-builds.md). After each
 # push to main this runs `cargo xtask ci --affected` for what the push changed, on a free
-# GitHub-hosted Linux runner. A failure opens (or comments on) one issue labelled `watchdog`; the
-# next green run closes it. Nothing blocks a push.
+# GitHub-hosted Linux runner. A failure shows as the red X on the commit plus GitHub's email, and
+# opens one issue labelled `watchdog` that the next green run closes. Nothing
+# blocks a push.
 name: Watchdog
 
 on:
@@ -53,8 +54,11 @@ jobs:
           echo "base: $base"
           cargo xtask ci --affected --base "$base"
 
+      # If issues are ever turned off these two steps skip quietly: a failure still shows as the red X
+      # on the commit and in GitHub's failed-run email.
       - name: Report a broken main
         if: failure()
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
           RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -70,6 +74,7 @@ jobs:
           fi
       - name: Close the issue once main is green again
         if: success()
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
