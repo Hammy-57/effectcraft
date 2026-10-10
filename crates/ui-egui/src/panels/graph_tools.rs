@@ -1,7 +1,9 @@
 //! Graph Editor and timeline keyframe tools: the transform box around several selected keys
 //! (scale and move them in time and value), key-time snapping, and Alt-drag of a key group's
-//! first or last key in the timeline to scale the group in time. Edits are `keys.transform`.
+//! first or last key in the timeline to scale the group in time (edits are `keys.transform`), and
+//! keyframe selection by press, click and marquee, shown live while the button is down.
 
+use effectcraft_engine::KeyRef;
 use effectcraft_engine::project::Comp;
 use egui::{Color32, Pos2, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
 use serde_json::{Value, json};
@@ -36,6 +38,91 @@ struct BoxDrag {
 
 fn box_id() -> egui::Id {
     egui::Id::new("graph-transform-box")
+}
+
+/// The selection a keyframe marquee gives (Timeline and Graph Editor): the keys in the box
+/// alone, added to the current selection with Shift, or toggled in it with Ctrl/Cmd. Keys show
+/// it while the box is dragged, and the release commits the same with [`marquee_params`].
+pub(crate) fn marquee_selection(current: &[KeyRef], in_box: &[KeyRef], mods: egui::Modifiers) -> Vec<KeyRef> {
+    if mods.command {
+        let mut sel: Vec<KeyRef> = current.iter().filter(|k| !in_box.contains(k)).copied().collect();
+        sel.extend(in_box.iter().filter(|k| !current.contains(k)));
+        sel
+    } else if mods.shift {
+        let mut sel = current.to_vec();
+        sel.extend(in_box.iter().filter(|k| !current.contains(k)));
+        sel
+    } else {
+        in_box.to_vec()
+    }
+}
+
+/// The `keys.select` parameters committing a marquee over `in_box` (see [`marquee_selection`]).
+pub(crate) fn marquee_params(in_box: &[KeyRef], mods: egui::Modifiers, select_properties: bool) -> Value {
+    let mut keys: Vec<KeyRef> = vec![];
+    for k in in_box {
+        if !keys.contains(k) {
+            keys.push(*k);
+        }
+    }
+    let keys: Vec<Value> = keys.iter().map(|k| json!({"layer": k.layer.0, "prop": k.prop, "time": k.time.seconds()})).collect();
+    let mut p = json!({"keys": keys});
+    if mods.command {
+        p["toggle"] = json!(true);
+    } else if mods.shift {
+        p["add"] = json!(true);
+    }
+    if select_properties {
+        p["selectProperties"] = json!(true);
+    }
+    p
+}
+
+/// Pressing and clicking a keyframe (Timeline and Graph Editor), as in After Effects: pressing
+/// an unselected key selects it at once (Shift adds it), so it shows selected while the button
+/// is still down and a drag moves it; pressing a selected key keeps the selection (a drag moves
+/// them all), and releasing without a drag then reduces the selection to that key (Shift takes
+/// it out instead). `this_key` is the `keys.select` parameters for the key alone; `selected` and
+/// `n_selected` describe the selection as drawn. Returns the `keys.select` parameters to queue.
+/// Ctrl/Cmd clicks are the caller's (interpolation); a Ctrl/Cmd drag still grabs the key.
+pub(crate) fn key_select_gesture(ui: &egui::Ui, resp: &egui::Response, this_key: &Value, selected: bool, n_selected: usize) -> Option<Value> {
+    let mods = ui.input(|i| i.modifiers);
+    let select = || {
+        let mut p = this_key.clone();
+        if mods.shift {
+            p["add"] = json!(true);
+        }
+        p
+    };
+    if mods.command {
+        return (resp.drag_started() && !selected).then(select);
+    }
+    // Whether the key was selected when the button went down, for the release.
+    let memo = resp.id.with("key-press-selected");
+    let mut out = None;
+    if resp.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_pressed()) {
+        ui.data_mut(|d| d.insert_temp(memo, selected));
+        if !selected {
+            out = Some(select());
+        }
+    }
+    if resp.clicked() {
+        let pressed = ui.data_mut(|d| d.remove_temp::<bool>(memo));
+        match (pressed.unwrap_or(selected), mods.shift) {
+            (true, true) => {
+                let mut p = this_key.clone();
+                p["toggle"] = json!(true);
+                out = Some(p);
+            }
+            (true, false) if n_selected > 1 => out = Some(this_key.clone()),
+            // The press went unseen: select on the click.
+            (false, _) if pressed.is_none() => out = Some(select()),
+            _ => {}
+        }
+    } else if out.is_none() && resp.drag_started() && !selected {
+        out = Some(select());
+    }
+    out
 }
 
 /// Bounds of the selected keys: (t0, v0, t1, v1).

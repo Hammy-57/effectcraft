@@ -142,6 +142,86 @@ impl EffectcraftApp {
         self.ui.maximized = if self.ui.maximized == Some(p) || !self.ui.dock.contains(p) { None } else { Some(p) };
     }
 
+    /// The document a panel shows as a tab of its own: the Timeline's active comp.
+    pub fn shown_doc(&self, p: PanelKind) -> Option<u64> {
+        let st = &self.session.state;
+        st.active_comp.filter(|c| p == PanelKind::Timeline && st.open_comps.contains(c)).map(|c| c.0)
+    }
+
+    /// The panel group holding `p` (docked or floating): its panels, the shown one and whether
+    /// it floats.
+    pub fn panel_group(&self, p: PanelKind) -> Option<(Vec<PanelKind>, usize, bool)> {
+        Layout { root: self.ui.dock.clone(), floating: self.ui.floating.clone() }.group_of(p)
+    }
+
+    /// The panel menu's Close Panel: a Timeline comp tab (`doc`) closes that comp's Timeline (the
+    /// panel stays for the other open comps), any other tab its panel.
+    pub fn close_panel_tab(&mut self, ctx: &egui::Context, p: PanelKind, doc: Option<u64>) -> Result<(), String> {
+        match doc {
+            Some(id) if p == PanelKind::Timeline => crate::menus::invoke(self, ctx, "comp.close", serde_json::json!({"comp": id})).map(|_| ()),
+            _ => {
+                self.close_panel(p);
+                Ok(())
+            }
+        }
+    }
+
+    /// Close Other Panels in Group: every other panel of `p`'s group, and on a Timeline comp tab
+    /// (`doc`) the other comps' Timeline tabs too. Returns how many tabs closed.
+    pub fn close_other_panels(&mut self, ctx: &egui::Context, p: PanelKind, doc: Option<u64>) -> Result<usize, String> {
+        let (group, _, _) = self.panel_group(p).ok_or_else(|| format!("{} is not open", p.title()))?;
+        let mut n = 0;
+        for q in group.into_iter().filter(|q| *q != p) {
+            self.close_panel(q);
+            n += 1;
+        }
+        if let Some(id) = doc.filter(|_| p == PanelKind::Timeline) {
+            let others: Vec<u64> = self.session.state.open_comps.iter().map(|c| c.0).filter(|c| *c != id).collect();
+            for c in others {
+                crate::menus::invoke(self, ctx, "comp.close", serde_json::json!({"comp": c}))?;
+                n += 1;
+            }
+        }
+        self.raise_panel(p);
+        Ok(n)
+    }
+
+    /// Panel Group Settings ▸ Close Panel Group: every panel of `p`'s group.
+    pub fn close_panel_group(&mut self, p: PanelKind) -> Result<usize, String> {
+        let (group, _, _) = self.panel_group(p).ok_or_else(|| format!("{} is not open", p.title()))?;
+        let n = group.len();
+        for q in group {
+            self.close_panel(q);
+        }
+        Ok(n)
+    }
+
+    /// Dock a floating (or closed) panel back in its usual place: with its neighbours in the
+    /// workspace's own layout when one of them is docked, else where Window ▸ <panel> opens it.
+    pub fn redock_panel(&mut self, p: PanelKind) {
+        if !self.ui.dock.contains(p) {
+            self.edit_layout(|l| l.unfloat(p));
+            let home = dock::workspace(&self.ui.workspace).group_of(p).map(|(g, _)| g).unwrap_or_default();
+            let anchor = home.iter().copied().find(|q| *q != p && self.ui.dock.contains(*q));
+            if !anchor.is_some_and(|a| self.ui.dock.insert_tab(p, a, home.iter().skip_while(|q| **q != p).nth(1).copied())) {
+                self.raise_panel(p);
+            }
+            // (Its usual neighbours may all be closed.)
+            self.ui.dock.add_anywhere(p);
+        }
+        self.show_panel(p);
+    }
+
+    /// Panel Group Settings ▸ Stacked Panel Group: `stacked`, or toggle when `None`. Returns the
+    /// new state.
+    pub fn stack_panel_group(&mut self, p: PanelKind, stacked: Option<bool>) -> Result<bool, String> {
+        let on = stacked.unwrap_or(!self.ui.dock.is_stacked(p));
+        if !self.ui.dock.set_stacked(p, on) {
+            return Err(format!("{} is not docked", p.title()));
+        }
+        Ok(on)
+    }
+
     /// The docked panel whose group is under `pos` (from the last frame), else the focused one.
     pub fn panel_at(&self, pos: Option<egui::Pos2>) -> PanelKind {
         pos.and_then(|p| self.dock_rects.iter().rev().find(|(_, r)| r.contains(p)).map(|(k, _)| *k)).unwrap_or(self.ui.focused)
@@ -243,9 +323,8 @@ impl EffectcraftApp {
                     }
                 }
                 DockAction::Close(p) => self.close_panel(p),
-                DockAction::PanelMenu(p, pos) => {
-                    ctx.data_mut(|d| d.insert_temp(egui::Id::new("panel-menu"), (p, pos)));
-                }
+                DockAction::PanelMenu(p, pos) => panels::panel_menu::open(&ctx, p, self.shown_doc(p), pos),
+                DockAction::TabMenu(p, doc, pos) => panels::panel_menu::open(&ctx, p, doc, pos),
                 DockAction::BeginDrag(p) => ctx.data_mut(|d| {
                     d.insert_temp(drag_id(), p);
                 }),
@@ -271,7 +350,7 @@ impl EffectcraftApp {
             }
         }
         self.tab_drag(&ctx, &groups, &float_groups, &tab_rects);
-        panels::panel_menu_popup(self, ui);
+        panels::panel_menu::show(self, ui);
     }
 
     /// One floating group: a window with a tab strip (drag the empty strip to move it, the
