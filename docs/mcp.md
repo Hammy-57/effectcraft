@@ -35,6 +35,19 @@ receive `resultType: complete` and list/read cache hints; document reads are nev
 {"jsonrpc":"2.0","id":2,"method":"resources/read","params":{"uri":"effectcraft://document"}}
 ```
 
+## Analysis tools
+
+Headless agents can't look at a render or hear the mix, so read-only tools return numbers.
+Each wraps an engine command, so the CLI, scripts (`app.run`) and the control channel get the same.
+
+| Tool | Command | Result |
+| --- | --- | --- |
+| `get_layout` | `layer.bounds` | Per layer: `visible` + `why`, comp-space `bounds`, `corners`, `center`, `anchorInComp`, `onScreen`, `source`; optional `pixelBounds` and `overlaps` |
+
+- **Geometry** is `sourceRectAtTime` through the transform, parents and, for 3D layers, the
+  active camera. A 3D layer partly behind the camera reports `projected: false` and no bounds.
+  The engine function is `effectcraft_engine::layout::layer_geometry`.
+
 ## Progress and cancellation
 
 Headless `command_run` / `execute_command` calls to `renderQueue.render` (unless `wait: false`)

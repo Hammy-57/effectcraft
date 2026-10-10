@@ -32,6 +32,7 @@ mod keys_more;
 mod layer;
 mod layer_menu;
 mod layer_time;
+mod layout_cmds;
 pub(crate) mod link;
 mod liquify;
 mod lottie;
@@ -197,6 +198,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(proxy::specs());
         v.extend(scripts::specs());
         v.extend(panels_cmds::specs());
+        v.extend(layout_cmds::specs());
         v.extend(footage_panel::specs());
         v.extend(autotrace::specs());
         v.extend(scene_detect::specs());

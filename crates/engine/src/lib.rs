@@ -20,6 +20,7 @@ pub mod footage_check;
 pub mod guard;
 pub mod history;
 pub mod jobs;
+pub mod layout;
 pub mod learn;
 pub mod links;
 pub mod logging;
@@ -1202,6 +1203,8 @@ pub fn font_menu(prefs: &prefs::Prefs) -> Vec<FontRow> {
 }
 #[cfg(test)]
 mod tests_history;
+#[cfg(test)]
+mod tests_layout;
 #[cfg(test)]
 mod tests_models;
 #[cfg(test)]
