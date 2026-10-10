@@ -51,7 +51,8 @@ Desktop, Cursor and the like) take the same `command` and `args`.
   typing are real input events. Nothing appears on screen, focus is never taken, and several servers
   can run side by side. `--ui-size 1680x1020` (points) and `--ui-scale 2` (screenshot pixels per
   point) set the window. It needs a GPU adapter (startup says which; without one it exits with the
-  reason) and starts in about a second. Work is in memory: `save_project` it (no `--autosave`).
+  reason). `initialize` answers at once; the first tool call waits for the app's first frames
+  (about a second, longer while Metal/Vulkan compiles the GPU compositor's shaders on a cold cache). Work is in memory: `save_project` it (no `--autosave`).
   Built with the CLI's default `ui` feature (`--no-default-features` drops it).
 - **Bridge** (`["mcp", "--bridge", "9877"]`): drives a running `effectcraft --control 9877`, so you
   see every change live. Bridge mode adds `screenshot` and the `ui_*` tools.
@@ -86,7 +87,7 @@ Without `--autosave`, headless work is in memory until explicitly saved. The fla
 only; a bridged desktop app owns its auto-saves. An edit interrupted before its reply is received
 may be absent from the last checkpoint.
 
-See [MCP conventions](mcp.md) for core tools, resources, strict arguments, and render progress/cancellation.
+See [MCP conventions](mcp.md) for core tools, resources, strict arguments, and progress/cancellation of long calls (renders, analyses with `wait: true`, `jobs.wait`, scripts).
 
 ### Tools
 
@@ -96,7 +97,7 @@ See [MCP conventions](mcp.md) for core tools, resources, strict arguments, and r
 | `describe_command {command \| id}` | One command in full: label, menu, shortcut, params doc, JSON `schema`, enabled / `why`. |
 | `execute_command {command \| id, params?}` | Run any command (undoable). Unknown parameter keys are rejected with the accepted list. |
 | `get_state` | Editor state (active comp, time, selections, tool) plus `app`: version, command and effect counts, export formats, parity summary. |
-| `run_script {code, name?}` | Run JavaScript with the After Effects-style scripting object model (`app.project`, `comp.layers.addText(…)`, `layer.property("ADBE Transform Group").property("ADBE Position").setValueAtTime(…)`…). Returns `{ok, result, output, error: {message, line, column}}`; edits are undoable. |
+| `run_script {code, name?, timeout?}` | Run JavaScript with the After Effects-style scripting object model (`app.project`, `comp.layers.addText(…)`, `layer.property("ADBE Transform Group").property("ADBE Position").setValueAtTime(…)`…). Returns `{ok, result, output, error: {message, line, column}}`; edits are undoable. Stops after `timeout` seconds (default 300, `0` = none) or on `notifications/cancelled`. |
 | `get_project` / `get_comp {comp?}` | Project items, comp settings and layers. |
 | `get_layer {layer, comp?, time?, depth?, flat?}` | A layer's property tree (`depth` limits how many group levels expand). Every node has a `path`. |
 | `get_property {layer, path, comp?, time?}` | Value at a time, keyframes and expression. |
@@ -153,7 +154,7 @@ Short recipes; every step is one tool call.
 | Check the result | `render_frame {"time":1.5,"max_side":640}`; with a UI (`--ui` / `--bridge`) `screenshot {"panel":"Timeline"}` |
 | Undo a mistake | `undo {}`, or `history {}` then `history {"goto": n}` |
 | Missing media after opening | `execute_command footage.check {"wait":true}` → `{checked, missing, probed}`; then `file.findMissing {"what":"footage"}` |
-| Bring in a Figma design | `execute_command file.importFigma {"url":"https://www.figma.com/design/KEY/Name?node-id=12-345"}` (token from `FIGMA_TOKEN`); `{"payload": <Figma node JSON>}` when you already have the nodes |
+| Bring in a Figma design | No token: serialize with the Figma MCP's `use_figma` + `integrations/figma/serialize.js`, then `execute_command file.importFigma {"payloadPaths": [<parts>]}` (see "Figma designs"). With a token: `{"url": "<figma link>"}` |
 | Save | `save_project {"path":"out.ecproj"}` |
 
 The desktop app checks footage in the background after every open (a "Checking footage" job in
@@ -174,7 +175,8 @@ Things that tripped up a long agent-driven session (a multi-scene 3D piece built
 - **Loops in scripts.** `run_script` can call any engine command with `app.run(id, params)`, for
   example `app.run("layer.new3dPrimitive", {kind: "cube", position: [x, y, z]})` inside a loop. A
   script that throws keeps the edits it already made: wrap it in `app.beginUndoGroup()` /
-  `app.endUndoGroup()` so one `undo {}` removes them all. (`batch` rolls back on its own.)
+  `app.endUndoGroup()` so one `undo {}` removes them all. (`batch` rolls back on its own.) A script
+  stopped by its `timeout` or a cancel rolls back an undo group it left open.
 - **Save early in headless mode.** Without `--autosave` the headless server keeps the project in
   memory only, so a server restart loses unsaved work: start it with `mcp --autosave` (see above)
   or call `save_project {"path": …}` after each milestone.
@@ -271,10 +273,48 @@ read and write these values as they are.
 comps or precomps, groups become nulls with their children parented, shapes become shape layers
 with editable paths, fills, gradients and strokes. Text becomes text layers with style runs, masks
 become track mattes, and shadows become layer styles. Image fills and node types without a native
-counterpart come in as 2x PNG renders. It is one undo step.
+counterpart come in as PDF footage (sharp at any scale, transparent; PNG when a PDF can't be
+used). It is one undo step.
 [`integrations/figma/README.md`](../integrations/figma/README.md) has the full mapping.
 
-* **From a link:** `{"url": "https://www.figma.com/design/KEY/Name?node-id=12-345"}`, or
+#### Figma without a token: the Figma MCP route
+
+Agents with the Figma MCP (signed in once, in Claude) need no token: its `use_figma` tool runs
+Figma Plugin API code inside the file, and [`integrations/figma/serialize.js`](../integrations/figma/serialize.js),
+the same serializer the plug-in uses, turns nodes into the payload `file.importFigma` reads.
+The Claude Code skill [`integrations/figma/skill/SKILL.md`](../integrations/figma/skill/SKILL.md)
+(installed at `~/.claude/skills/figma-to-effectcraft/`) does all of it when you say "import
+<figma link>":
+
+1. Parse the link: `figma.com/design/<fileKey>/…?node-id=12-345` → `fileKey`, node `12:345`.
+2. `use_figma {fileKey, code: <serialize.js> + "return await effectcraftSerialize({ids: ['12:345'], fileKey: '<fileKey>', images: 'none', budget: 18000});"}`
+   and write the reply as returned to `part-1.json`. `use_figma` replies are capped at 20 KB, so
+   with `budget` the serializer cuts subtrees that don't fit into stubs `{"$ref": "<id>"}` and
+   lists them in `pending`.
+3. While `pending` isn't empty: the same call with `{subtree: [<pending ids>], …}` returns those
+   nodes as `fragments` (and what is still `pending`); write each reply to the next part file.
+4. Images: every part's `rasterize` lists the nodes that come in as images (image fills, node types
+   without a counterpart, subtrees too large to transfer). Fetch each with the MCP's
+   `download_assets {fileKey, nodeId, defaultFormat: "pdf"}`, save the URL with `curl`, and write
+   `{"images": {"<id>": {"pdfPath": "<pdf>", "bounds": "render"}}}` as one more part. PDF is the
+   default: EffectCraft imports it as vector footage with Continuously Rasterize on, so it stays
+   sharp when scaled, and it keeps transparency. Add a PNG (`defaultFormat: "png", defaultScale: 2`,
+   as `"path": "<png>"`) only when the PDF can't be fetched or the import notes it failed:
+   EffectCraft tries the PDF first, then the PNG, and reports the `format` it used.
+5. `effectcraft-cli exec file.importFigma --bridge 9877 --params '{"payloadPaths": ["part-1.json", …, "images.json"]}'`
+   (the first file is the payload; the others add `fragments` and `images`).
+6. Report `native` vs `images`, `rasterized` (with `format`) and `notes` from the reply.
+
+`bounds: "render"` places the image over the node's render bounds (what `download_assets` and
+`get_screenshot` export, shadows included); the default is the node's bounding box (what
+`exportAsync` with `useAbsoluteBounds` and the REST API render). Instance sub-layer ids
+(`I1:2;3:4`) are refused by `download_assets`; render those with `{imagesOnly: [ids], images:
+'png'}` through `use_figma` instead. Requests on the control channel time out after 60 s, so split
+very large frames by child.
+
+#### Other sources
+
+* **From a link with a token** (optional): `{"url": "https://www.figma.com/design/KEY/Name?node-id=12-345"}`, or
   `{"fileKey": "KEY", "nodeIds": ["12:345"]}`. It fetches `GET /v1/files/:key/nodes?geometry=paths`
   and `GET /v1/images/:key` with a personal access token. The token comes from `token`,
   `FIGMA_TOKEN`, or one stored with `figma.setToken {token}` (`figma.status` says which is in use).
@@ -283,14 +323,17 @@ counterpart come in as 2x PNG renders. It is one undo step.
   split very large selections.
 * **From JSON you already have** (the Figma REST reply, the EffectCraft plug-in's payload, a node
   or an array of nodes): `{"payload": …}` or `{"payloadPath": "nodes.json"}`. Images go in
-  `"images": {"<node id>": {"png": "<base64>"}}`.
+  `"images": {"<node id>": {"pdf" | "png": "<base64>"} | {"pdfPath" | "path": "<file>", "bounds"?: "render" | {x, y, width, height}, "fallback"?: …}}`.
+  Large selections come in parts: `{"payloadPaths": ["part-1.json", …]}`.
 * `target`: `newComp` (frame size → comp size), `activeComp` (centred in the open comp), or `auto`
   (frames → new comps, anything else → the active comp). Use `frameRate` and `duration` for new comps.
 * `dryRun: true` returns the plan and changes nothing.
 * The reply has `{comp, comps, precomps, layers, native, images, rasterized: [{node, name, reason}],
   notes}`. Each layer's comment holds its Figma node id (`Figma 12:345`).
-* People use the Figma plug-in instead: it sends its selection through `effectcraft-cli figma-bridge`
-  to the same command.
+* People use the EffectCraft Transfer plug-in instead: the desktop app runs its bridge on
+  `127.0.0.1:7789` (Settings ▸ Let Figma Send Layers, on by default) and asks once to allow the
+  plug-in (`ui.figmaPair`, automation ids `figmaPair.allow` / `figmaPair.deny`). Its imports run
+  the same command.
 
 ### Motion tracking
 
@@ -613,13 +656,75 @@ not read or written.
 `<comp>` is an id or name, or `-` for the active comp. `<value>` is JSON (`50`, `[960,540]`,
 `"#ff0000"`) or a bare string.
 
+## Repro scripts
+
+Every command the app runs (menus, panels, shortcuts, agents, scripts) goes into the session's
+command journal. A **repro script** is that journal as JSON lines, so a bug or crash becomes
+something an agent can replay and a regression test becomes a data file.
+
+```text
+// comments: lines starting with // or #; blank lines are skipped
+{"start": "new" | "demo" | {"project": "rel/or/abs.ecproj"}, "allow_errors": false}   optional, first line
+{"command": "comp.new", "params": {"name": "Main", "frameRate": 30}}
+{"command": "comp.settings", "params": {"frameRate": 0}, "expect_error": "frameRate"}
+{"expect": {"query": "comp.info", "pointer": "/frameRate", "equals": 30}}
+{"expect_no_error": true}
+```
+
+- `start`: the project to begin with (default `new`). A relative `project` path is relative to the
+  script. Other header keys (`version`, `app`, `os`, `crash`, `note`) are for people.
+- `command`: run like the app runs it. It must succeed, unless it has `expect_error` (`true`, or a
+  text the error must contain) or the header says `allow_errors` (errors are reported but
+  tolerated). A panic always fails the replay.
+- `expect`: run a command, normally a query (`prop.get`, `comp.info`, `layer.tree`, `project.summary`),
+  and compare the value at the JSON `pointer` of its result with `equals` (numbers within 1e-6).
+  Without `equals` it only checks that the query succeeds.
+- `expect_no_error`: the previous command succeeded.
+
+Where scripts come from:
+
+- `journal.export {path?}` returns `{script, steps}` (or writes `path`): the commands since the
+  project was last replaced (`file.newProject`, `file.open`, `file.openDemoProject`). Queries and
+  saves are not in it; commands a script or `file.runScript` ran are covered by that one step.
+- `help.exportRepro {path?}` saves the same for a bug report, by default to `Repros/` in the
+  settings folder (macOS `~/Library/Application Support/EffectCraft/Repros`, next to `Logs/`).
+- **Crash repros**: when the last-resort guard catches a panic in a command, the app writes
+  `Repros/crash-<unix time>-<command>.jsonl` there automatically (the newest 20 are kept): the
+  journal, then the command that panicked, with `"allow_errors": true` and the error in the header.
+  The error the user or agent sees names the file. Headless sessions without a settings folder
+  (the CLI, tests) don't write one.
+
+Privacy: a repro holds command ids and parameters only, never project, image or media file
+contents. Parameters can include file paths, layer and item names and text typed into text
+layers, so read a repro before sharing it.
+
+Replay one headless (a fully wired session, like the CLI's other subcommands):
+
+```sh
+effectcraft-cli replay crash.jsonl            # per-step ok/FAIL lines, then the first failure
+effectcraft-cli replay crash.jsonl --json     # {ok, panicked, steps, first_failure, skipped}
+effectcraft-cli replay crash.jsonl --keep-going
+```
+
+It exits with status 1 when a step fails, an expectation is not met or a command panics, and
+stops at the first failure unless `--keep-going`. Steps that work on the user's files (`file.open`
+of their project, imports) need those files; replace them with a `start` project or generated
+content when you turn a report into a test. A repro only sees commands: UI state changed
+without one (a hover, a half-finished drag) is not in it.
+
+**Regression tests are data files.** A crash fix's regression test is the repro, trimmed to the
+steps that matter, with an `expect_error` or `expect` line where the fix changed the outcome,
+dropped into [`tests/repros/`](../tests/repros). `crates/host/tests/repros.rs` replays every
+`*.jsonl` there and fails on any panic or unmet expectation
+(`cargo nextest run -p effectcraft-host --test repros`).
+
 ## Seeing the UI
 
 The quickest way is the offscreen UI: the `effectcraft-ui` server in `.mcp.json`
 (`effectcraft-cli mcp --ui --demo`) runs the whole app without a window, so screenshots and UI input
 work while you use the machine, on any Space, with the display asleep, and in parallel agents. The
-loop below works the same there. To watch changes live instead, start the app with `cargo run -p effectcraft -- --control 9877` (add `--demo` to
-open the demo project; without it the app starts with an empty project) and use MCP bridge
-mode or the raw control channel. A good loop is: `ui_elements` to find an id, `ui_click` or `ui_drag`
+loop below works the same there. To watch changes live instead, start the app with
+`cargo run -p effectcraft -- --control 9877` (add `--demo` to open the demo project; without it the
+app starts with an empty project) and use MCP bridge mode or the raw control channel. A good loop is: `ui_elements` to find an id, `ui_click` or `ui_drag`
 to act, then `screenshot {"panel":"Timeline"}` to check the result. `render_frame` shows the
 composition itself at any zoom.

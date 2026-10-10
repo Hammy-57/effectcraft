@@ -296,6 +296,8 @@ pub struct EffectcraftApp {
     applied_prefs: Option<u64>,
     /// A previous run that didn't exit cleanly (shown by `Dialog::Recovery`).
     pub recovery: Option<effectcraft_engine::autosave::Recovery>,
+    /// The Figma bridge's one-time pairing prompt (`ui.figmaPair`).
+    pub(crate) figma_pair: Option<panels::figma_pair::Prompt>,
     /// Docked groups laid out last frame: (active panel, group rect) — `~` maximizes the one
     /// under the pointer.
     pub(crate) dock_rects: Vec<(PanelKind, egui::Rect)>,
@@ -361,6 +363,7 @@ impl EffectcraftApp {
             last_reveal: None,
             applied_prefs: None,
             recovery: None,
+            figma_pair: None,
             dock_rects: vec![],
             home_thumbs: Default::default(),
             home_thumb_saved: None,
@@ -1295,6 +1298,8 @@ impl EffectcraftApp {
                     }
                 }
                 control::Outcome::AfterInput => self.input_waiters.push(reply),
+                // The handler kept the reply and answers later (the Figma pairing prompt).
+                control::Outcome::Held => {}
                 control::Outcome::AwaitJobs(w) => {
                     self.job_waiters.push((w, reply));
                     ctx.request_repaint();
@@ -1500,6 +1505,7 @@ impl EffectcraftApp {
         panels::precomp::mini_flowchart(self, &ctx);
         panels::home::capture_thumbnail(self);
         panels::dialogs::show(self, &ctx);
+        panels::figma_pair::show(self, &ctx);
         panels::fx_console::show(self, &ctx);
         panels::scriptui_view::sync_panels(self);
         panels::scriptui_view::show_windows(self, &ctx);
