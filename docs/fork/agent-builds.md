@@ -59,6 +59,11 @@ A failure shows as the red ❌ on the commit (`gh run list --workflow watchdog.y
 with issues turned on it also opens one `watchdog` issue that the next green run closes. If main is
 red, fixing it comes before new work.
 
+**Formatting is checked before it lands.** A commit or merge on `main` whose changed Rust files
+aren't rustfmt-formatted is refused (`scripts/fork/hooks/`, about a second; installed once with
+`git config core.hooksPath scripts/fork/hooks`, shared by every worktree). Run `cargo xtask fmt`
+and commit again. On 10 October 2026, four of the watchdog's red runs were only formatting.
+
 ## Lanes: warm build folders
 
 A new worktree with an empty build folder compiles all ~600 crates (11 minutes on a 4-core cloud
