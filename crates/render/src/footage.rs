@@ -151,6 +151,18 @@ pub trait FootageSource: Send + Sync {
     /// Drop the decoded frames it keeps (Edit ▸ Purge ▸ All Memory / Image Cache Memory) and close
     /// the files nobody is reading: the next reads decode again. Sources without a cache ignore it.
     fn purge(&self) {}
+    /// A thumbnail of `footage` (its first frame) fitting in `max_side` × `max_side`, aspect
+    /// kept, for browsing files that aren't in the project: sources don't cache the frame or keep
+    /// the file open for it.
+    fn thumbnail(&self, footage: &Footage, max_side: u32) -> Option<Image> {
+        let img = self.frame(ItemId(u64::MAX), footage, Tick::ZERO)?;
+        let (w, h) = (img.width.max(1), img.height.max(1));
+        let s = (max_side.max(1) as f64 / w.max(h) as f64).min(1.0);
+        if s >= 1.0 {
+            return Some((*img).clone());
+        }
+        Some(effectcraft_raster::resample(&img, ((w as f64 * s).round() as u32).max(1), ((h as f64 * s).round() as u32).max(1)))
+    }
     /// Close the files (decoders, parsed models, cached frames) of footage `keep` doesn't name:
     /// called when footage leaves the project or another project is opened. Sources that keep
     /// nothing open ignore it.

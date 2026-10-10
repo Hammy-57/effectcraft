@@ -737,3 +737,18 @@ fn packed_and_preview_frames_render_like_float_frames() {
         }
     }
 }
+
+/// Media Browser thumbnails: the first frame is decoded without being cached and the movie's
+/// file isn't kept open (browsing a folder of movies held every one of them).
+#[test]
+fn thumbnails_leave_no_frames_or_files_behind() {
+    let (Some(movie), Some(still)) = (h264_mp4(), alpha_png()) else { return };
+    let pool = MediaPool::new();
+    for p in [movie, still] {
+        let f = probe(&p).expect("probe");
+        let th = FootageSource::thumbnail(&pool, &f, 128).expect("thumbnail");
+        assert_eq!(th.width.max(th.height), 128, "{}", p.display());
+        assert_eq!(pool.stats().frames, 0, "{}: no frame cached", p.display());
+        assert_eq!(pool.open_files(), 0, "{}: no file kept open", p.display());
+    }
+}

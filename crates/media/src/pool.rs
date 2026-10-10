@@ -580,8 +580,18 @@ impl MediaPool {
     }
 
     /// A thumbnail of `footage` (its first frame) fitting in `max_side` × `max_side`, aspect kept.
+    /// A cached frame is reused; otherwise the frame is decoded without being cached and a movie
+    /// not open already is closed again (browsing a folder doesn't fill memory with its files).
     pub fn thumbnail(&self, footage: &Footage, max_side: u32) -> Result<Image> {
-        let img = Inner::frame_at(&self.inner, footage, Tick::ZERO, false)?;
+        if !footage.has_video {
+            return Err(MediaError::Unsupported(format!("{}: no video", footage.path)));
+        }
+        let loc = Inner::locate(footage, Tick::ZERO);
+        let cached = lock(&self.inner.cache).lru.get(&loc.key);
+        let img = match cached {
+            Some(px) => px.image(),
+            None => self.inner.decode(&loc, footage, true)?.image(),
+        };
         let (w, h) = (img.width.max(1), img.height.max(1));
         let s = (max_side.max(1) as f64 / w.max(h) as f64).min(1.0);
         if s >= 1.0 {
@@ -663,6 +673,11 @@ impl Inner {
             sources.trim(path);
         }
         src
+    }
+
+    /// The source of `path` when it is open already.
+    fn open_source(&self, path: &str) -> Option<SharedSource> {
+        lock(&self.sources).map.get(path).and_then(|e| e.slot.get().cloned().flatten())
     }
 
     /// The frame index (in the footage's interpreted rate) shown at source time `t`, after
@@ -772,7 +787,7 @@ impl Inner {
             if rayon::current_thread_index().is_some() {
                 self.misses.fetch_add(1, Ordering::Relaxed);
                 drop(c);
-                return self.decode(&loc, footage);
+                return self.decode(&loc, footage, false);
             }
             c = self.done.wait(c).unwrap_or_else(|e| e.into_inner());
         }
@@ -780,7 +795,7 @@ impl Inner {
         c.inflight.insert(loc.key.clone());
         drop(c);
         let _guard = Inflight { inner: self, key: loc.key.clone() };
-        let px = self.decode(&loc, footage)?;
+        let px = self.decode(&loc, footage, false)?;
         lock(&self.cache).lru.insert(loc.key, px.clone(), self.budget());
         Ok(px)
     }
@@ -800,7 +815,9 @@ impl Inner {
 
     /// Decode the frame at `loc`: movies and 8 / 16-bit stills are kept as their samples
     /// ([`Packed`]), float stills, layered and vector documents as float pixels.
-    fn decode(&self, loc: &Loc, footage: &Footage) -> Result<Pixels> {
+    ///
+    /// `detached`: a movie not open already is opened for this frame only (thumbnails).
+    fn decode(&self, loc: &Loc, footage: &Footage, detached: bool) -> Result<Pixels> {
         // A reduced-resolution preview: the full frame (cached, or decoded and not kept)
         // resampled exactly as the renderer resamples it.
         if let (Some(p), Some([rw, rh])) = (loc.preview, loc.key.preview) {
@@ -808,7 +825,7 @@ impl Inner {
             let cached = lock(&self.cache).lru.get(&base.key);
             let full = match cached {
                 Some(px) => px,
-                None => self.decode(&base, footage)?,
+                None => self.decode(&base, footage, detached)?,
             };
             let img = full.image();
             if preview_size(img.width, p.w, p.h, p.s).is_none() {
@@ -841,7 +858,14 @@ impl Inner {
                 })
             }
             Some(mt) => {
-                let src = self.source(path).ok_or_else(|| MediaError::Io(format!("{path}: cannot open")))?;
+                let src = match detached {
+                    false => self.source(path),
+                    true => self.open_source(path).or_else(|| {
+                        let mem = lock(&self.files).get(&**path).cloned();
+                        crate::open::open_source(path, mem).ok().map(|(s, _)| s)
+                    }),
+                }
+                .ok_or_else(|| MediaError::Io(format!("{path}: cannot open")))?;
                 let frame = src.video_frame(FrameRequest::full(filmcraft_time::Tick(mt.0))).map_err(MediaError::from)?;
                 Ok(Pixels::Packed(Arc::new(Packed::Video { frame, op })))
             }
@@ -868,6 +892,12 @@ impl FootageSource for MediaPool {
     }
     fn retain_files(&self, keep: &dyn Fn(&str) -> bool) {
         MediaPool::retain_files(self, keep);
+    }
+    fn thumbnail(&self, footage: &Footage, max_side: u32) -> Option<Image> {
+        if footage.missing {
+            return None;
+        }
+        MediaPool::thumbnail(self, footage, max_side).map_err(|e| log::debug!("media: thumbnail of {}: {e}", footage.path)).ok()
     }
     fn cache_budget(&self) -> Option<usize> {
         Some(self.budget())
