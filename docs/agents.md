@@ -214,8 +214,11 @@ Two things follow:
 `edit.undo` undoes the caller's own latest step: the user's (no `client`) or the agent's. When
 someone else made the last step, only what the caller's step changed is reverted, as a new step
 (`{undone, selective: true}`), so the user's ⌘Z never removes an agent's work and an agent's undo
-never removes the user's. It's refused, changing nothing, when someone changed the same item (a
-comp, footage item, folder) or the project settings since; the error names who. The user's
+never removes the user's. Inside a comp it works layer by layer: an agent adding or changing other
+layers of the same comp doesn't get in the way. It's refused, changing nothing, when someone changed
+the same thing since (the same layer, a comp's settings or layer order the step changed, a footage
+item, a folder, the project settings); the error names who and what. Pressing it again goes on to
+the caller's step before (an own-step undo isn't itself undone next). The user's
 `edit.undo {any: true}` undoes the last step whoever made it, and the History panel still jumps to
 any state.
 
