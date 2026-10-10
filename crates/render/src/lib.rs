@@ -35,6 +35,7 @@ pub use footage::{
     preview_size,
 };
 pub(crate) use fx::comp_scene;
+pub use fx::effect_canvas_extent;
 pub use layer_buf::StyledLayer;
 pub use motion_blur::adaptive_samples;
 pub use placement::Placement;

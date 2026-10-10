@@ -135,6 +135,19 @@ impl effectcraft_render::FxTarget for GpuFx<'_, '_> {
         let out = f(Buf { img, offset: b.offset, scale: b.scale });
         self.b = self.e.g.upload_image(&out.img).map(|img| GBuf { img, offset: out.offset, scale: out.scale });
     }
+    fn expand_canvas(&mut self, size: [f64; 2]) {
+        let Some(b) = self.b.as_mut() else { return };
+        let Some(([w, h], pad)) = effectcraft_render::effect_canvas_extent([b.img.width, b.img.height], b.offset, b.scale, size) else { return };
+        if !self.e.g.fits(w, h) {
+            log::warn!("Text effect canvas exceeds the GPU texture limit; reduce the preview resolution");
+            return;
+        }
+        let out = self.e.image(w, h);
+        self.e.copy_into(&b.img, &out, pad[0], pad[1]);
+        b.img = out;
+        b.offset[0] += pad[0] as f64;
+        b.offset[1] += pad[1] as f64;
+    }
     fn shift(&mut self, d: [f64; 2]) {
         if let Some(b) = &mut self.b {
             b.offset = [b.offset[0] - d[0], b.offset[1] - d[1]];
