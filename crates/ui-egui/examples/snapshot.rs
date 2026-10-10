@@ -115,19 +115,24 @@ fn main() {
             continue;
         }
         // Pointer input straight into the harness (menus and popups need real input events):
-        // {"method":"pointer","params":{"x":237,"y":12,"click":true}}
+        // {"method":"pointer","params":{"x":237,"y":12,"click":true}}; `"down":true` presses
+        // and holds the button, later moves drag, `"up":true` releases (snap mid-drag).
         if method == "pointer" {
             let pos = egui::pos2(params["x"].as_f64().unwrap_or(0.0) as f32, params["y"].as_f64().unwrap_or(0.0) as f32);
             harness.input_mut().events.push(egui::Event::PointerMoved(pos));
-            if params["click"].as_bool() == Some(true) {
-                for pressed in [true, false] {
-                    harness.input_mut().events.push(egui::Event::PointerButton {
-                        pos,
-                        button: egui::PointerButton::Primary,
-                        pressed,
-                        modifiers: Default::default(),
-                    });
-                }
+            let presses: &[bool] = match (params["click"].as_bool(), params["down"].as_bool(), params["up"].as_bool()) {
+                (Some(true), _, _) => &[true, false],
+                (_, Some(true), _) => &[true],
+                (_, _, Some(true)) => &[false],
+                _ => &[],
+            };
+            for &pressed in presses {
+                harness.input_mut().events.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                });
             }
             settle(&mut harness, 0.3);
             println!("{}", json!({"method": method, "reply": {"ok": true}}));
