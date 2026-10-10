@@ -307,6 +307,9 @@ fn undo_reverts_your_own_step_behind_others() {
     let e = s.execute_checked("edit.undo", json!({"client": "agentA"})).unwrap_err().to_string();
     assert!(e.contains("made by the user") && e.contains("“Theirs”"), "{e}");
     assert_eq!(s.revision, rev);
+    // The Edit menu names the step ⌘Z undoes: the user's own latest, not the agent's last.
+    assert_eq!(crate::selective_undo::own_undo_label(&s, None).as_deref(), Some("New Solid"));
+    assert_eq!(crate::selective_undo::own_undo_label(&s, Some("nobody")), None);
     // `any: true` undoes the last step whoever made it.
     s.execute("edit.undo", json!({"any": true})).unwrap();
     assert_eq!(s.project.comp(theirs).unwrap().layers.len(), 1);

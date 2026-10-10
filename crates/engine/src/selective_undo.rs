@@ -105,3 +105,11 @@ pub fn undo_own(s: &mut Session, me: Option<&str>) -> Result<Option<String>> {
     s.sanitize_state();
     Ok(Some(label))
 }
+
+/// The step `edit.undo` would undo for `me` (`None`: the user): the last step when `me` made it,
+/// else `me`'s latest step (the Edit menu's "Undo <step>"). `None`: nothing to undo.
+pub fn own_undo_label(s: &Session, me: Option<&str>) -> Option<String> {
+    let n = s.history.undo.len();
+    let made = |k: usize| s.history.undo.get(k + 1).map_or_else(|| s.project.clone(), |(_, p)| p.clone());
+    (0..n).rev().find(|&k| s.history.author(&made(k)) == me).and_then(|k| s.history.undo.get(k).map(|(l, _)| l.clone()))
+}
