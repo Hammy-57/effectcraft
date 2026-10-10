@@ -12,8 +12,11 @@
 //! - `ci`: fmt check, clippy -D warnings, tests (`--profile ci`), layers, assets, wasm.
 //! - `ci --affected [--base REV] [--dry-run]`: the same gates for only the crates the change since
 //!   REV (default: the merge-base with `main`) can affect; see `affected.rs` and docs/testing.md.
+//! - `agent-exam <--list|--validate|--check P --task T|--run …>`: the agent exam (`evals/agent/`,
+//!   `agent_exam.rs`): motion-design tasks an AI agent performs over MCP, scored by `exam.check`.
 
 mod affected;
+mod agent_exam;
 mod ico;
 mod version;
 
@@ -425,6 +428,7 @@ fn main() -> ExitCode {
             let rest: Vec<String> = std::env::args().skip(2).collect();
             if rest.iter().any(|a| a == "--affected") { affected::run(&root(), &rest) } else { ci() }
         }
+        "agent-exam" => agent_exam::run(&root(), &std::env::args().skip(2).collect::<Vec<_>>()),
         "web" => web(&std::env::args().skip(2).collect::<Vec<_>>()),
         "ico" => {
             let rest: Vec<String> = std::env::args().skip(2).collect();
@@ -434,7 +438,7 @@ fn main() -> ExitCode {
             let rest: Vec<String> = std::env::args().skip(2).collect();
             version::run(&root(), &rest.iter().map(String::as_str).collect::<Vec<_>>())
         }
-        _ => Err("usage: cargo xtask <layers|assets|wasm|web [--dev] [--serve PORT]|ico OUT.ico IN.png…|version [set X.Y.Z]|ci [--affected [--base REV] [--dry-run]]>".into()),
+        _ => Err("usage: cargo xtask <layers|assets|wasm|web [--dev] [--serve PORT]|ico OUT.ico IN.png…|version [set X.Y.Z]|ci [--affected [--base REV] [--dry-run]]|agent-exam <--list|--validate|--check P --task T|--run …>>".into()),
     };
     match r {
         Ok(()) => ExitCode::SUCCESS,

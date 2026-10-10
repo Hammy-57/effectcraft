@@ -66,7 +66,10 @@ one rectangle; `diffBounds` boxes the changed pixels or is null; metrics and siz
 Analysis queries (see [mcp.md](mcp.md#analysis-tools)):
 `layer.bounds {comp?, time?, layers?, pixels?, overlaps?}` (layer geometry in comp space) and
 `audio.analyze {comp?, start?, end?, layer?, waveform?, path?}` (peak, RMS, LUFS, clipping and
-silences of the mix).
+silences of the mix). Agent exam: `exam.check {task? | checks?, base?}` scores the
+project against an exam task's checks (each runs one read-only query and tests its result) →
+`{passed, score, total, passedCount, results: [{id, desc, pass, reason, actual}]}`
+([evals/agent/README.md](../evals/agent/README.md)).
 
 `project.summary` and `editor.state` include the document `revision` (bumped on every change, undo and
 redo included). Every command's `params` also accepts `expectRevision` (the command doesn't run and

@@ -18,6 +18,7 @@ mod create;
 mod edit;
 mod effect;
 pub mod essential;
+pub(crate) mod exam_cmds;
 pub mod expr_tools;
 mod file;
 pub(crate) mod file_more;
@@ -221,6 +222,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(crate::render_view::specs());
         v.extend(import_project::specs());
         v.extend(library::specs());
+        v.extend(exam_cmds::specs());
         v
     })
 }

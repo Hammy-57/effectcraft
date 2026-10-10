@@ -734,6 +734,24 @@ not read or written.
 `<comp>` is an id or name, or `-` for the active comp. `<value>` is JSON (`50`, `[960,540]`,
 `"#ff0000"`) or a bare string.
 
+## Agent exam
+
+`evals/agent/` holds about twenty motion-design tasks (lower third, title card in the safe areas,
+logo fly-in, easing, parenting, precomp, shape layer, blur and glow, masks, track matte, fixing
+layout problems, retiming and renaming, a 9:16 reframe, a contrast fix) that an agent performs
+through the MCP server, each scored by deterministic checks. `cargo xtask agent-exam --run` builds
+each starting project, runs Claude Code headless against `effectcraft-cli mcp`, and writes
+`report.json` / `report.md` (pass rate, minutes, tool calls, failures with reasons); it is meant
+for a nightly cloud job. `--check P.ecproj --task ID` scores one saved project, `--list` and
+`--validate` are cheap.
+
+The checker is the engine query `exam.check {task | checks, base?}` → `{passed, score, total,
+passedCount, results: [{id, desc, pass, reason, actual}]}`. A check runs one read-only query
+(`comp.info`, `prop.get`, `layer.bounds`, `render.lint`, `comp.motion`…; commands that edit or
+write files are refused) and tests its JSON result with JSON Pointers and ops (`eq`, `approx`,
+`contains`, `any`, …), or uses a shorthand (`prop`, `layerCount`, `comp`, `lint`, `motion`,
+`compare`). Agents can run it on their own work too. Format: [evals/agent/README.md](../evals/agent/README.md).
+
 ## Repro scripts
 
 Every command the app runs (menus, panels, shortcuts, agents, scripts) goes into the session's

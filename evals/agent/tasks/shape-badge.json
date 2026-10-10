@@ -1,0 +1,123 @@
+{
+  "id": "shape-badge",
+  "title": "Draw a circular badge",
+  "prompt": "In the comp \"Main\" (1920×1080), create a shape layer named \"Badge\": a filled circle (ellipse) 300 px across, orange (#FF5500), centred in the frame.",
+  "setup": [
+    {
+      "command": "comp.new",
+      "params": {
+        "name": "Main",
+        "width": 1920,
+        "height": 1080,
+        "frameRate": 30,
+        "duration": 5
+      }
+    }
+  ],
+  "limits": {
+    "minutes": 5,
+    "toolCalls": 20
+  },
+  "checks": [
+    {
+      "id": "badge",
+      "desc": "a shape layer named Badge",
+      "query": "comp.info",
+      "params": {
+        "comp": "Main"
+      },
+      "expect": [
+        {
+          "path": "/layers",
+          "op": "contains",
+          "value": {
+            "name": "Badge",
+            "type": "Shape"
+          }
+        }
+      ]
+    },
+    {
+      "id": "size",
+      "desc": "about 300 × 300 px",
+      "query": "layer.bounds",
+      "params": {
+        "comp": "Main",
+        "layers": [
+          "Badge"
+        ]
+      },
+      "select": {
+        "array": "/layers",
+        "index": 0
+      },
+      "expect": [
+        {
+          "path": "/bounds/2",
+          "op": "approx",
+          "value": 300,
+          "tol": 6
+        },
+        {
+          "path": "/bounds/3",
+          "op": "approx",
+          "value": 300,
+          "tol": 6
+        }
+      ]
+    },
+    {
+      "id": "centre",
+      "desc": "centred",
+      "query": "layer.bounds",
+      "params": {
+        "comp": "Main",
+        "layers": [
+          "Badge"
+        ]
+      },
+      "select": {
+        "array": "/layers",
+        "index": 0
+      },
+      "expect": [
+        {
+          "path": "/center",
+          "op": "approx",
+          "value": [
+            960,
+            540
+          ],
+          "tol": 2
+        }
+      ]
+    },
+    {
+      "layerCount": {
+        "comp": "Main"
+      },
+      "id": "count",
+      "desc": "one layer",
+      "op": "eq",
+      "value": 1
+    }
+  ],
+  "solution": [
+    {
+      "command": "layer.newShape",
+      "params": {
+        "name": "Badge",
+        "kind": "ellipse",
+        "size": [
+          300,
+          300
+        ],
+        "fill": "#FF5500",
+        "position": [
+          960,
+          540
+        ]
+      }
+    }
+  ]
+}

@@ -16,6 +16,7 @@ pub mod camera_track;
 pub mod commands;
 pub mod config;
 pub mod demo;
+pub mod exam;
 pub mod footage_check;
 pub mod footage_reload;
 pub mod guard;
@@ -1325,3 +1326,5 @@ mod tests_roto;
 mod tests_import_project;
 #[cfg(test)]
 mod tests_key_time;
+#[cfg(test)]
+mod tests_exam;

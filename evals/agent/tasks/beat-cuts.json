@@ -1,0 +1,249 @@
+{
+  "id": "beat-cuts",
+  "title": "Cut shots on the beat",
+  "prompt": "The comp \"Edit\" (2 s, 30 fps) has composition markers on the beats at 0.5, 1.0 and 1.5 s, and four full-length solids \"Shot 1\" to \"Shot 4\". Cut them to the beat with their in and out points so exactly one shot plays at a time, in order: Shot 1 from 0 to 0.5 s, Shot 2 from 0.5 to 1.0 s, Shot 3 from 1.0 to 1.5 s and Shot 4 from 1.5 to 2.0 s. Keep the markers.",
+  "setup": [
+    {
+      "command": "comp.new",
+      "params": {
+        "name": "Edit",
+        "width": 1920,
+        "height": 1080,
+        "frameRate": 30,
+        "duration": 2
+      }
+    },
+    {
+      "command": "markers.set",
+      "params": {
+        "new": true,
+        "time": 0.5
+      }
+    },
+    {
+      "command": "markers.set",
+      "params": {
+        "new": true,
+        "time": 1.0
+      }
+    },
+    {
+      "command": "markers.set",
+      "params": {
+        "new": true,
+        "time": 1.5
+      }
+    },
+    {
+      "command": "layer.newSolid",
+      "params": {
+        "name": "Shot 1",
+        "color": "#E63946"
+      }
+    },
+    {
+      "command": "layer.newSolid",
+      "params": {
+        "name": "Shot 2",
+        "color": "#F1A208"
+      }
+    },
+    {
+      "command": "layer.newSolid",
+      "params": {
+        "name": "Shot 3",
+        "color": "#2A9D8F"
+      }
+    },
+    {
+      "command": "layer.newSolid",
+      "params": {
+        "name": "Shot 4",
+        "color": "#264653"
+      }
+    }
+  ],
+  "limits": {
+    "minutes": 8,
+    "toolCalls": 30
+  },
+  "checks": [
+    {
+      "id": "shot1",
+      "desc": "Shot 1 runs 0–0.5 s",
+      "query": "comp.info",
+      "params": {
+        "comp": "Edit"
+      },
+      "select": {
+        "array": "/layers",
+        "where": {
+          "name": "Shot 1"
+        }
+      },
+      "expect": [
+        {
+          "path": "/in",
+          "op": "approx",
+          "value": 0,
+          "tol": 0.02
+        },
+        {
+          "path": "/out",
+          "op": "approx",
+          "value": 0.5,
+          "tol": 0.02
+        }
+      ]
+    },
+    {
+      "id": "shot2",
+      "desc": "Shot 2 runs 0.5–1.0 s",
+      "query": "comp.info",
+      "params": {
+        "comp": "Edit"
+      },
+      "select": {
+        "array": "/layers",
+        "where": {
+          "name": "Shot 2"
+        }
+      },
+      "expect": [
+        {
+          "path": "/in",
+          "op": "approx",
+          "value": 0.5,
+          "tol": 0.02
+        },
+        {
+          "path": "/out",
+          "op": "approx",
+          "value": 1.0,
+          "tol": 0.02
+        }
+      ]
+    },
+    {
+      "id": "shot3",
+      "desc": "Shot 3 runs 1.0–1.5 s",
+      "query": "comp.info",
+      "params": {
+        "comp": "Edit"
+      },
+      "select": {
+        "array": "/layers",
+        "where": {
+          "name": "Shot 3"
+        }
+      },
+      "expect": [
+        {
+          "path": "/in",
+          "op": "approx",
+          "value": 1.0,
+          "tol": 0.02
+        },
+        {
+          "path": "/out",
+          "op": "approx",
+          "value": 1.5,
+          "tol": 0.02
+        }
+      ]
+    },
+    {
+      "id": "shot4",
+      "desc": "Shot 4 runs 1.5–2.0 s",
+      "query": "comp.info",
+      "params": {
+        "comp": "Edit"
+      },
+      "select": {
+        "array": "/layers",
+        "where": {
+          "name": "Shot 4"
+        }
+      },
+      "expect": [
+        {
+          "path": "/in",
+          "op": "approx",
+          "value": 1.5,
+          "tol": 0.02
+        },
+        {
+          "path": "/out",
+          "op": "approx",
+          "value": 2.0,
+          "tol": 0.02
+        }
+      ]
+    },
+    {
+      "id": "markers",
+      "desc": "the three beat markers are kept",
+      "query": "markers.list",
+      "params": {
+        "comp": "Edit"
+      },
+      "expect": [
+        {
+          "path": "",
+          "op": "len",
+          "value": 3
+        }
+      ]
+    },
+    {
+      "id": "on-beat",
+      "desc": "render.lint finds no off-beat cut",
+      "lint": {
+        "comp": "Edit",
+        "rules": [
+          "off-beat"
+        ]
+      }
+    }
+  ],
+  "solution": [
+    {
+      "command": "layer.timing",
+      "params": {
+        "layers": [
+          "Shot 1"
+        ],
+        "out": 0.5
+      }
+    },
+    {
+      "command": "layer.timing",
+      "params": {
+        "layers": [
+          "Shot 2"
+        ],
+        "in": 0.5,
+        "out": 1.0
+      }
+    },
+    {
+      "command": "layer.timing",
+      "params": {
+        "layers": [
+          "Shot 3"
+        ],
+        "in": 1.0,
+        "out": 1.5
+      }
+    },
+    {
+      "command": "layer.timing",
+      "params": {
+        "layers": [
+          "Shot 4"
+        ],
+        "in": 1.5
+      }
+    }
+  ]
+}

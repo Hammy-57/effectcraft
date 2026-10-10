@@ -1,0 +1,138 @@
+{
+  "id": "social-comp",
+  "title": "Set up a square social comp",
+  "prompt": "Create a composition named \"Social\": 1080×1080, 25 fps, 6 s long. In it, add a white solid named \"BG\" that fills the frame and a text layer named \"CTA\" reading \"Follow us\", centred in the frame.",
+  "setup": null,
+  "limits": {
+    "minutes": 5,
+    "toolCalls": 20
+  },
+  "checks": [
+    {
+      "id": "comp",
+      "desc": "Social is 1080 × 1080, 25 fps, 6 s",
+      "comp": {
+        "name": "Social"
+      },
+      "width": 1080,
+      "height": 1080,
+      "fps": 25,
+      "duration": 6
+    },
+    {
+      "id": "bg",
+      "desc": "a solid named BG",
+      "query": "comp.info",
+      "params": {
+        "comp": "Social"
+      },
+      "expect": [
+        {
+          "path": "/layers",
+          "op": "contains",
+          "value": {
+            "name": "BG",
+            "type": "Solid"
+          }
+        }
+      ]
+    },
+    {
+      "id": "bg-fills",
+      "desc": "BG fills the frame",
+      "query": "layer.bounds",
+      "params": {
+        "comp": "Social",
+        "layers": [
+          "BG"
+        ]
+      },
+      "select": {
+        "array": "/layers",
+        "index": 0
+      },
+      "expect": [
+        {
+          "path": "/bounds",
+          "op": "approx",
+          "value": [
+            0,
+            0,
+            1080,
+            1080
+          ],
+          "tol": 1
+        }
+      ]
+    },
+    {
+      "id": "cta-text",
+      "desc": "CTA reads Follow us",
+      "prop": {
+        "comp": "Social",
+        "layer": "CTA",
+        "path": "text/sourceText"
+      },
+      "op": "eq",
+      "value": "Follow us"
+    },
+    {
+      "id": "cta-centre",
+      "desc": "CTA centred",
+      "query": "layer.bounds",
+      "params": {
+        "comp": "Social",
+        "layers": [
+          "CTA"
+        ]
+      },
+      "select": {
+        "array": "/layers",
+        "index": 0
+      },
+      "expect": [
+        {
+          "path": "/center",
+          "op": "approx",
+          "value": [
+            540,
+            540
+          ],
+          "tol": 40
+        }
+      ]
+    }
+  ],
+  "solution": [
+    {
+      "command": "comp.new",
+      "params": {
+        "name": "Social",
+        "width": 1080,
+        "height": 1080,
+        "frameRate": 25,
+        "duration": 6
+      }
+    },
+    {
+      "command": "layer.newSolid",
+      "params": {
+        "name": "BG",
+        "color": "#FFFFFF"
+      }
+    },
+    {
+      "command": "layer.newText",
+      "params": {
+        "text": "Follow us",
+        "size": 80,
+        "position": [
+          540,
+          570
+        ],
+        "fill": "#111111",
+        "name": "CTA"
+      }
+    }
+  ]
+}
