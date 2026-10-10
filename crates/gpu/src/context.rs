@@ -1488,7 +1488,9 @@ mod upload_budget_tests {
     #[test]
     fn pool_pending_reuse_is_bounded_and_purge_cannot_repopulate_it() {
         crate::tests::hold_gpu_lock();
-        let Some(g) = GpuContext::headless() else { return };
+        let context = GpuContext::headless();
+        assert!(context.is_some() || !std::env::var("EFFECTCRAFT_REQUIRE_GPU").is_ok_and(|v| v == "1"), "required GPU unavailable");
+        let Some(g) = context else { return };
         let mut pool = Pool::default();
         pool.set_budget(2 * 8 * 8 * 16);
         let encoder = pool.open();
@@ -1517,7 +1519,9 @@ mod upload_budget_tests {
     #[test]
     fn auxiliary_caches_are_bounded_across_sizes_and_purged() {
         crate::tests::hold_gpu_lock();
-        let Some(g) = GpuContext::headless() else { return };
+        let context = GpuContext::headless();
+        assert!(context.is_some() || !std::env::var("EFFECTCRAFT_REQUIRE_GPU").is_ok_and(|v| v == "1"), "required GPU unavailable");
+        let Some(g) = context else { return };
         // A tiny budget makes changing layer extents exercise eviction with kilobytes.
         g.set_cache_budget(16 * 4096);
         for width in 8..40 {

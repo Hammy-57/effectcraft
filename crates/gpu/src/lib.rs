@@ -268,8 +268,8 @@ impl Gpu {
         }
     }
 
-    /// Run work in a native thread-local out-of-memory scope. A failed result is discarded
-    /// and cached allocations are released; callers can retry with a fresh CPU renderer.
+    /// Contain native allocation failures (out-of-memory, internal errors and unwinds).
+    /// A failed result is discarded and caches released; callers can retry on the CPU.
     /// Browser callers use the host/owned-device failure bridge and bounded readbacks instead
     /// of blocking their event loop on an error-scope future.
     pub fn within_memory<T>(&self, f: impl FnOnce() -> T) -> Result<T, String> {
