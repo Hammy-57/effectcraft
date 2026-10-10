@@ -353,10 +353,20 @@ pub fn comp_has_effects(project: &Project, comp: ItemId) -> bool {
     walk(project, comp, 0)
 }
 
+/// See [`Frames::failed`]: (key, revision) pairs.
+type Failed = Arc<Mutex<HashSet<(FrameKey, u64)>>>;
+
+/// Failed frames remembered at most (then forgotten, so retried once).
+const MAX_FAILED: usize = 256;
+
 pub struct Frames {
     cache: Arc<Mutex<Cache>>,
     /// Keys queued or rendering.
     inflight: Arc<Mutex<HashSet<FrameKey>>>,
+    /// Frames whose render panicked, with the project revision they were asked for at: not asked
+    /// for again until the project changes (or the caches are purged), instead of re-rendering
+    /// (and panicking) at every UI frame.
+    failed: Failed,
     /// Pending jobs, picked by priority when a pool thread frees up (the viewer's frame first).
     queue: Arc<Mutex<Queue>>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -387,6 +397,7 @@ impl Default for Frames {
         Frames {
             cache: Arc::new(Mutex::new(Cache { map: HashMap::new(), order: VecDeque::new(), bytes: 0, gpu_bytes: 0, budget: 3 << 30, gpu_budget: GPU_BUDGET })),
             inflight: Arc::new(Mutex::new(HashSet::new())),
+            failed: Failed::default(),
             queue: Arc::new(Mutex::new(Queue::default())),
             #[cfg(not(target_arch = "wasm32"))]
             // A panicking job would abort the whole process (rayon's default for `spawn`): log it
@@ -680,6 +691,14 @@ impl Frames {
             c.bytes = 0;
             c.gpu_bytes = 0;
         }
+        if let Ok(mut f) = self.failed.lock() {
+            f.clear();
+        }
+    }
+
+    /// The render of `key` panicked at its revision (it is not asked for again until then).
+    pub fn failed(&self, key: &FrameKey) -> bool {
+        self.failed.lock().is_ok_and(|f| f.contains(&(*key, key.revision)))
     }
 
     /// Queue a prefetch frame (no-op if cached or already queued/rendering).
@@ -698,7 +717,7 @@ impl Frames {
     }
 
     fn request_with(&self, src: &RenderSource, key: FrameKey, comp: ItemId, t: Tick, opts: RenderOpts, urgent: bool) {
-        if self.is_cached(&key) {
+        if self.is_cached(&key) || self.failed(&key) {
             return;
         }
         let Ok(mut q) = self.queue.lock() else { return };
@@ -758,6 +777,7 @@ impl Frames {
             queue: self.queue.clone(),
             cache: self.cache.clone(),
             inflight: self.inflight.clone(),
+            failed: self.failed.clone(),
             ctx: self.ctx.clone(),
             last: self.last_ms.clone(),
             content_keys: self.content_keys.clone(),
@@ -887,6 +907,7 @@ struct Worker {
     queue: Arc<Mutex<Queue>>,
     cache: Arc<Mutex<Cache>>,
     inflight: Arc<Mutex<HashSet<FrameKey>>>,
+    failed: Failed,
     ctx: Option<egui::Context>,
     last: Arc<Mutex<f64>>,
     content_keys: ContentKeys,
@@ -916,8 +937,8 @@ impl Worker {
             None => match self.render_guarded(&job) {
                 Some(ci) => ci,
                 None => {
-                    // Not "in progress" forever: the viewer asks for it again.
-                    self.release(job.key, job.urgent);
+                    // Not "in progress" forever; not asked for again until the project changes.
+                    self.give_up(job.key, job.urgent);
                     return true;
                 }
             },
@@ -948,6 +969,17 @@ impl Worker {
             && (!img.is_gpu() || !self.gpu_retired.load(Ordering::Acquire))
         {
             c.insert(key, img);
+        }
+        self.release(key, urgent);
+    }
+
+    /// The render of `key` failed: remember it (see [`Frames::failed`]) and release the job.
+    fn give_up(&self, key: FrameKey, urgent: bool) {
+        if let Ok(mut f) = self.failed.lock() {
+            if f.len() >= MAX_FAILED {
+                f.clear();
+            }
+            f.insert((key, key.revision));
         }
         self.release(key, urgent);
     }
@@ -1204,9 +1236,34 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        assert!(footage.0.load(Ordering::SeqCst) > 0, "the render reached the footage");
+        let tries = footage.0.load(Ordering::SeqCst);
+        assert!(tries > 0, "the render reached the footage");
         assert_eq!(f.inflight(), 0, "released");
         assert!(!f.is_cached(&key));
+        // No hot retry loop: the viewer asks again at every UI frame, but the same frame of the
+        // same project isn't rendered (and doesn't panic) again.
+        assert!(f.failed(&key));
+        for _ in 0..10 {
+            f.request(&src, key, cid, Tick::ZERO, RenderOpts::default());
+            f.request_urgent(&src, key, cid, Tick::ZERO, RenderOpts::default());
+        }
+        assert_eq!(f.inflight(), 0, "not queued again");
+        assert_eq!(footage.0.load(Ordering::SeqCst), tries);
+        // Once the project changes (a later revision), it is tried again.
+        let later = FrameKey { revision: key.revision + 1, ..key };
+        assert!(!f.failed(&later));
+        f.request(&src, later, cid, Tick::ZERO, RenderOpts::default());
+        for _ in 0..1000 {
+            if f.inflight() == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(footage.0.load(Ordering::SeqCst) > tries, "retried after a change");
+        assert!(f.failed(&later));
+        // Purge Caches forgets failures too.
+        f.clear();
+        assert!(!f.failed(&later));
     }
 
     /// #284: scrubbing asks for a viewer frame at every step; a newer one drops the comp's viewer
