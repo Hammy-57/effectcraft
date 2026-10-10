@@ -160,19 +160,46 @@ impl EffectHost for FxHost<'_, '_, '_> {
     }
 }
 
+/// An accelerator's kept effect result (see [`Accelerator::effects_kept`]): adopted by the
+/// buffer that stores its pixels, released otherwise (when dropped).
+pub(crate) struct Kept<'a> {
+    accel: &'a dyn Accelerator,
+    ticket: Option<u64>,
+}
+
+impl Kept<'_> {
+    /// `buf` stores the kept pixels unchanged (offsets may differ).
+    pub(crate) fn adopt(mut self, buf: &Arc<Buf>) {
+        if let Some(t) = self.ticket.take() {
+            self.accel.adopt(t, buf);
+        }
+    }
+}
+
+impl Drop for Kept<'_> {
+    fn drop(&mut self) {
+        if let Some(t) = self.ticket.take() {
+            self.accel.release(t);
+        }
+    }
+}
+
 /// The CPU effect target (GPU chains go through [`Accelerator::effects`]: upload, readback).
 struct CpuFx<'a> {
     accel: Option<&'a dyn Accelerator>,
     levels: Option<f32>,
     buf: Option<Buf>,
+    /// The accelerator's copy of `buf`, while the last step was a GPU chain.
+    kept: Option<Kept<'a>>,
 }
 
 impl FxTarget for CpuFx<'_> {
     fn gpu(&mut self, steps: &[FxStep]) -> bool {
         let (Some(a), Some(b)) = (self.accel, &self.buf) else { return false };
-        match a.effects(steps, b, self.levels) {
-            Some(out) => {
+        match a.effects_kept(steps, b, self.levels) {
+            Some((out, ticket)) => {
                 self.buf = Some(out);
+                self.kept = ticket.map(|t| Kept { accel: a, ticket: Some(t) });
                 true
             }
             None => false,
@@ -180,6 +207,7 @@ impl FxTarget for CpuFx<'_> {
     }
     fn cpu(&mut self, f: &mut dyn FnMut(Buf) -> Buf) {
         if let Some(b) = self.buf.take() {
+            self.kept = None;
             self.buf = Some(f(b));
         }
     }
@@ -207,16 +235,32 @@ impl<'a> Renderer<'a> {
         &self,
         ctx: &EvalCtx,
         layer: &Layer,
-        mut buf: Buf,
+        buf: Buf,
         adjustment: bool,
         limit: usize,
         timing: Option<&mut Vec<(String, f64)>>,
     ) -> Buf {
+        self.apply_effects_kept(ctx, layer, buf, adjustment, limit, timing).0
+    }
+
+    /// [`Renderer::apply_effects_timed`], with the accelerator's copy of the result when the
+    /// stack ended with a GPU chain (see [`Kept`]).
+    pub(crate) fn apply_effects_kept(
+        &self,
+        ctx: &EvalCtx,
+        layer: &Layer,
+        mut buf: Buf,
+        adjustment: bool,
+        limit: usize,
+        timing: Option<&mut Vec<(String, f64)>>,
+    ) -> (Buf, Option<Kept<'a>>) {
         let origin = fx_origin(ctx, layer, adjustment);
         buf.rebase(origin);
-        let mut out = self.effect_space_stack(ctx, layer, buf, adjustment, limit, timing, origin);
+        let mut t = CpuFx { accel: self.active_accel(), levels: self.pipe.levels, buf: Some(buf), kept: None };
+        self.run_effect_stack(ctx, layer, adjustment, limit, timing, origin, &mut t);
+        let mut out = t.buf.take().unwrap_or_else(|| Buf { img: Image::new(1, 1), offset: [0.0; 2], scale: self.opts.scale });
         out.rebase([-origin[0], -origin[1]]);
-        out
+        (out, t.kept.take())
     }
 
     /// [`Renderer::apply_effects_timed`] on a buffer already in effect space (measured from
@@ -232,7 +276,7 @@ impl<'a> Renderer<'a> {
         timing: Option<&mut Vec<(String, f64)>>,
         origin: [f64; 2],
     ) -> Buf {
-        let mut t = CpuFx { accel: self.active_accel(), levels: self.pipe.levels, buf: Some(buf) };
+        let mut t = CpuFx { accel: self.active_accel(), levels: self.pipe.levels, buf: Some(buf), kept: None };
         self.run_effect_stack(ctx, layer, adjustment, limit, timing, origin, &mut t);
         t.buf.unwrap_or_else(|| Buf { img: Image::new(1, 1), offset: [0.0; 2], scale: self.opts.scale })
     }

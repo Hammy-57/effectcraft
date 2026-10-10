@@ -45,6 +45,9 @@ pub const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
 /// Uploaded layer buffers kept on the GPU (bytes), at most (see [`GpuContext::set_cache_budget`]).
 const UPLOAD_BUDGET: usize = 1536 << 20;
 
+/// Effect chain results awaiting adoption (see [`GpuContext::keep`]), at most.
+const MAX_KEPT: usize = 16;
+
 /// Working textures kept for reuse once their last image is dropped (bytes), at most.
 const POOL_BUDGET: usize = 768 << 20;
 
@@ -262,6 +265,12 @@ struct Uploads {
     clock: u64,
     /// Byte budget (`None`: [`UPLOAD_BUDGET`]).
     budget: Option<usize>,
+    /// Effect chain results awaiting [`GpuContext::adopt`] by the layer buffer that stores
+    /// their pixels (ticket, image), oldest first.
+    kept: Vec<(u64, GpuImage)>,
+    next_ticket: u64,
+    /// Effect chain results are not kept (tests compare against the re-upload).
+    keep_off: bool,
 }
 
 impl Uploads {
@@ -914,16 +923,75 @@ impl GpuContext {
             }
         }
         let img = self.upload_image(&buf.img)?;
+        self.register(buf, img.clone());
+        Some(img)
+    }
+
+    /// Serve `buf` from `img` (its pixels) while `buf` lives (see [`Self::upload_buf`]).
+    fn register(&self, buf: &Arc<Buf>, img: GpuImage) {
+        let key = Arc::as_ptr(buf) as usize;
         if let Ok(mut u) = self.uploads.lock() {
             let bytes = buf.img.data.len() * 16;
             let now = u.clock;
-            if let Some(old) = u.map.insert(key, Upload { buf: Arc::downgrade(buf), img: img.clone(), bytes, last_use: now }) {
-                u.bytes -= old.bytes;
+            if let Some(old) = u.map.insert(key, Upload { buf: Arc::downgrade(buf), img, bytes, last_use: now }) {
+                u.bytes = u.bytes.saturating_sub(old.bytes);
             }
             u.bytes += bytes;
             u.trim();
         }
-        Some(img)
+    }
+
+    /// Keep an effect chain's result (what was read back) for [`Self::adopt`]: the ticket, or
+    /// `None` when not kept.
+    pub(crate) fn keep(&self, img: GpuImage) -> Option<u64> {
+        let mut u = self.uploads.lock().ok()?;
+        if u.keep_off {
+            return None;
+        }
+        u.next_ticket = u.next_ticket.wrapping_add(1);
+        let t = u.next_ticket;
+        // Tickets are adopted or released right after their chain (the renderer's `Kept`
+        // guard); the cap only bounds a stray one.
+        if u.kept.len() >= MAX_KEPT {
+            u.kept.remove(0);
+        }
+        u.kept.push((t, img));
+        Some(t)
+    }
+
+    /// `buf` stores kept result `ticket`'s pixels: [`Self::upload_buf`] serves it from that
+    /// image while `buf` lives, within the upload budget.
+    pub(crate) fn adopt(&self, ticket: u64, buf: &Arc<Buf>) {
+        let Some(img) = self.take_kept(ticket) else { return };
+        if (img.width, img.height) == (buf.img.width, buf.img.height) && !buf.img.is_empty() {
+            self.register(buf, img);
+        }
+    }
+
+    /// Forget kept result `ticket`.
+    pub(crate) fn release(&self, ticket: u64) {
+        let _ = self.take_kept(ticket);
+    }
+
+    fn take_kept(&self, ticket: u64) -> Option<GpuImage> {
+        let mut u = self.uploads.lock().ok()?;
+        let i = u.kept.iter().position(|(t, _)| *t == ticket)?;
+        Some(u.kept.remove(i).1)
+    }
+
+    /// Kept effect results not adopted or released yet (tests).
+    #[cfg(test)]
+    pub(crate) fn kept_count(&self) -> usize {
+        self.uploads.lock().map(|u| u.kept.len()).unwrap_or_default()
+    }
+
+    /// Stop (or resume) keeping effect chain results: composited layers then upload again.
+    #[cfg(test)]
+    pub(crate) fn set_keep_effects(&self, on: bool) {
+        if let Ok(mut u) = self.uploads.lock() {
+            u.keep_off = !on;
+            u.kept.clear();
+        }
     }
 
     /// Size the GPU-side caches after the layer cache's memory budget (Memory & CPU settings,
@@ -950,6 +1018,7 @@ impl GpuContext {
     pub fn clear_uploads(&self) {
         if let Ok(mut u) = self.uploads.lock() {
             u.map.clear();
+            u.kept.clear();
             u.bytes = 0;
         }
         if let Ok(mut p) = self.pool.lock() {
