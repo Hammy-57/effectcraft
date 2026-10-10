@@ -46,17 +46,15 @@ fn per_char_on(l: &Layer) -> bool {
     l.props.prop("text/perChar3d").is_some_and(|p| p.value.as_bool())
 }
 
-/// The animator a command targets: `animator` (uid or 1-based index), else the animator holding
-/// a selected property, else the last one.
+/// The animator a command targets: `animator` (uid, `"#n"` (1-based) or name), else the animator
+/// holding a selected property, else the last one.
 fn animator_uid(s: &Session, l: &Layer, p: &Value, cmd: &str) -> Result<u64> {
     let anims = l.props.group("text/animators").ok_or_else(|| bad(cmd, "not a text layer"))?;
     let list: Vec<&PropGroup> = anims.groups().collect();
     if let Some(v) = p.get("animator") {
-        let n = v.as_u64().ok_or_else(|| bad(cmd, "`animator` must be a uid or 1-based index"))?;
-        if let Some(g) = list.iter().find(|g| g.uid == n) {
-            return Ok(g.uid);
-        }
-        return list.get((n as usize).wrapping_sub(1)).map(|g| g.uid).ok_or_else(|| bad(cmd, format!("no animator {n}")));
+        return super::pick_group(list.iter().copied(), v)
+            .map(|g| g.uid)
+            .ok_or_else(|| bad(cmd, format!("no animator {v} (a number is the animator's uid; use \"#n\" for the n-th animator)")));
     }
     for (lid, uid) in &s.state.selected_props {
         if *lid != l.id {
@@ -440,7 +438,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Add Property",
             [],
             None,
-            "{layer?, animator?: uid|index, property: (see layer.addTextAnimator)}",
+            "{layer?, animator?: uid|\"#n\", property: (see layer.addTextAnimator)}",
             has_animator,
             add_animator_prop
         ),
@@ -449,7 +447,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Add Text Selector",
             [],
             None,
-            "{layer?, animator?: uid|index, kind: range|wiggly|expression}",
+            "{layer?, animator?: uid|\"#n\", kind: range|wiggly|expression}",
             has_animator,
             add_selector
         ),
@@ -468,7 +466,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Variable Font Axes",
             ["Animation", "Animate Text"],
             None,
-            "{layer?, axis?: tag|name (omit to list the font's axes), animator?: uid|index}",
+            "{layer?, axis?: tag|name (omit to list the font's axes), animator?: uid|\"#n\"}",
             has_text_layer,
             font_axes
         ),

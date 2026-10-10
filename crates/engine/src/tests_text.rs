@@ -53,8 +53,8 @@ fn animate_text_adds_animators_with_companion_properties() {
 fn add_property_and_selectors_with_undo_redo() {
     let (mut s, t) = session();
     s.execute("layer.addTextAnimator", json!({"layer": t, "property": "position"})).unwrap();
-    s.execute("layer.addTextAnimatorProperty", json!({"layer": t, "animator": 1, "property": "fillHue"})).unwrap();
-    assert!(s.execute("layer.addTextAnimatorProperty", json!({"layer": t, "animator": 1, "property": "bogus"})).is_err());
+    s.execute("layer.addTextAnimatorProperty", json!({"layer": t, "animator": "#1", "property": "fillHue"})).unwrap();
+    assert!(s.execute("layer.addTextAnimatorProperty", json!({"layer": t, "animator": "#1", "property": "bogus"})).is_err());
     for kind in ["wiggly", "expression", "range"] {
         s.execute("layer.addTextSelector", json!({"layer": t, "kind": kind})).unwrap();
     }

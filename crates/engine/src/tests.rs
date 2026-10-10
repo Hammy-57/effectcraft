@@ -221,7 +221,7 @@ fn layer_workflow_with_undo() {
     s.execute("layer.select", json!({"layers": [lid]})).unwrap();
     s.execute("edit.duplicate", json!({})).unwrap();
     assert_eq!(s.active_comp().unwrap().layers.len(), 2);
-    s.execute("layer.precompose", json!({"layers": [1, 2], "name": "Pre"})).unwrap();
+    s.execute("layer.precompose", json!({"layers": ["#1", "#2"], "name": "Pre"})).unwrap();
     assert_eq!(s.active_comp().unwrap().layers.len(), 1);
 }
 
@@ -234,7 +234,7 @@ fn text_shape_mask_matte_parent() {
     let sh = s.execute("layer.newShape", json!({"kind": "star", "fill": "#ffcc00"})).unwrap()["layer"].as_u64().unwrap();
     s.execute("layer.addShapeItem", json!({"layer": sh, "kind": "trim"})).unwrap();
     s.execute("layer.addMask", json!({"layer": sh, "shape": "ellipse"})).unwrap();
-    s.execute("layer.setMask", json!({"layer": sh, "mask": 1, "mode": "Subtract", "inverted": true})).unwrap();
+    s.execute("layer.setMask", json!({"layer": sh, "mask": "#1", "mode": "Subtract", "inverted": true})).unwrap();
     s.execute("layer.setTrackMatte", json!({"layer": sh, "matte": t, "kind": "luma"})).unwrap();
     s.execute("layer.setParent", json!({"layers": [sh], "parent": t})).unwrap();
     assert!(s.execute("layer.setParent", json!({"layers": [t], "parent": sh})).is_err());
@@ -546,7 +546,7 @@ fn execute_checked_rejects_unknown_params() {
 #[test]
 fn layer_tree_paths_resolve() {
     let mut s = demo();
-    s.execute("effect.apply", json!({"layer": 1, "effect": "Gaussian Blur"})).unwrap();
+    s.execute("effect.apply", json!({"layer": "#1", "effect": "Gaussian Blur"})).unwrap();
     let comp = s.execute("comp.info", json!({})).unwrap();
     let mut checked = 0;
     for l in comp["layers"].as_array().unwrap() {

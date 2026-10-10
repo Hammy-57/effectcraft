@@ -3,7 +3,7 @@
 //! (background job or blocking), apply, reset.
 //!
 //! A tracker is addressed by `layer` (the tracked layer, a.k.a. Motion Source) and `tracker`
-//! (group uid, name or 1-based index); both default to the Tracker panel's Current Track.
+//! (group uid, name or `"#n"`, 1-based); both default to the Tracker panel's Current Track.
 
 use effectcraft_project::build::Ids;
 use effectcraft_project::tracking::{self, LowConfidence, TrackChannel, TrackKind, TrackerSettings};
@@ -129,12 +129,10 @@ pub(crate) fn current(s: &Session, p: &V, cmd: &str) -> Result<(ItemId, LayerId,
     };
     let layer = comp.layer(lid).ok_or_else(|| bad(cmd, "no layer"))?;
     let uid = match p.get("tracker") {
-        Some(V::Number(n)) => {
-            let n = n.as_u64().unwrap_or(0);
-            layer.tracker(n).map(|(g, _)| g.uid).or_else(|| layer.trackers().nth((n as usize).saturating_sub(1)).map(|(g, _)| g.uid))
-        }
+        // A number is the tracker's uid (never a position); `"#n"` is the n-th tracker.
+        Some(V::Number(n)) => n.as_u64().and_then(|n| layer.tracker(n)).map(|(g, _)| g.uid),
         Some(V::String(name)) => match name.strip_prefix('#').and_then(|i| i.parse::<usize>().ok()) {
-            Some(i) => layer.trackers().nth(i.saturating_sub(1)).map(|(g, _)| g.uid),
+            Some(i) => i.checked_sub(1).and_then(|i| layer.trackers().nth(i)).map(|(g, _)| g.uid),
             None => layer.trackers().find(|(g, _)| &g.name == name).map(|(g, _)| g.uid),
         },
         _ => match s.state.current_track {

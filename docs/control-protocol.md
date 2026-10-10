@@ -46,6 +46,13 @@ Useful query commands for `engine.execute` (they aren't journaled or undoable): 
 export formats, parity summary), `jobs.list` (Progress panel jobs, e.g. the background
 `footage.check` after File ▸ Open).
 
+`project.summary` and `editor.state` include the document `revision` (bumped on every change, undo and
+redo included). Every command's `params` also accepts `expectRevision` (the command doesn't run and
+errors with `document changed (revision X, expected Y)` when the document moved on) and `client` (a
+driver name: its undo steps are tagged, and `edit.undo {"client": …}` refuses unless that client made
+the last step). Both are handled by `Session::execute` and stripped before the command sees its params.
+A number always names an id (layer, effect, mask…), never a position; use `"#n"` for the n-th.
+
 Every engine command is reachable through `engine.execute`, and every interactive widget of every
 panel registers an element id; both are enforced by `crates/ui-egui/tests/ui_agent_audit.rs`.
 
