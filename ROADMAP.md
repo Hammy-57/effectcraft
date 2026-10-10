@@ -42,8 +42,9 @@ in [docs/gaps.md](docs/gaps.md).
   a living can do client work in EffectCraft. What holds it back:
   - **Fidelity is unmeasured.** No test compares our output with After Effects itself, and users
     are still finding behaviour bugs in features marked done.
-  - **After Effects projects can't be opened.** EffectCraft can't read `.aep` / `.aepx` files,
-    and third-party After Effects plug-ins can't run.
+  - **After Effects projects open through a converter.** `.aep` files import via py-aep (an
+    external, MIT-licensed converter; 255 template projects render close to After Effects), `.aepx`
+    isn't read, and third-party After Effects plug-ins can't run.
   - **Reliability is uneven across platforms.** Early Linux users hit basic problems: viewer
     panning, panel docking, drag-and-drop import. A Windows user found the font menus offered only
     the bundled fonts (fixed 6 October: they list every installed font). Reports of 6 October
@@ -62,7 +63,7 @@ In priority order (details and "done" criteria in [docs/gaps.md](docs/gaps.md)):
 | G1 | Measure fidelity against After Effects: a corpus of test projects rendered and sampled in both apps, scored per feature | Turns every estimate into a measurement; a feature that behaves differently is not done |
 | G2 | Real-user reliability on macOS, Windows and Linux; fix every open user issue | Basic workflows must work everywhere before more features matter |
 | G3 | Stability: a green gate on the current toolchain, fuzzing of every input | A crash loses people's work |
-| G4 | Open After Effects projects (`.aep` / `.aepx`, pending an owner decision on clean-room scope); relinking moved footage | The biggest barrier to switching |
+| G4 | Open After Effects projects: `.aep` import works through py-aep (decided 10 October); next a second corpus, `.aepx`, relinking moved footage | The biggest barrier to switching |
 | G5 | Performance benchmarks at 1080p and 4K on real-world-sized projects | Unknown today |
 | G6 | Media depth: encoder efficiency, camera and phone formats | Files are larger than from mature encoders; camera formats are unverified |
 | G7 | Learned models: Roto Brush (M13.35: MobileSAM) and face tracking (M13.36: MediaPipe Face Landmarker), open source, optional downloads, swappable model module; next, measure them | Quality against After Effects is unmeasured |
