@@ -48,6 +48,8 @@ pub enum CompareError {
     BadBuffer { width: u32, height: u32, len: usize },
     /// A zero-sized image.
     Empty,
+    /// A crop rectangle that is empty or reaches outside the image.
+    BadRegion { region: [u32; 4], width: u32, height: u32 },
 }
 
 impl std::fmt::Display for CompareError {
@@ -58,6 +60,9 @@ impl std::fmt::Display for CompareError {
                 write!(f, "{width}x{height} RGBA image needs {} bytes, got {len}", (*width as u64) * (*height as u64) * 4)
             }
             CompareError::Empty => write!(f, "empty image"),
+            CompareError::BadRegion { region: [x, y, w, h], width, height } => {
+                write!(f, "region [{x}, {y}, {w}, {h}] is empty or outside the {width}x{height} image")
+            }
         }
     }
 }
@@ -101,6 +106,8 @@ pub struct CompareStats {
     pub changed_pixels: u64,
     /// `changed_pixels` as a percentage of all pixels.
     pub changed_pct: f64,
+    /// Bounding box `[x, y, w, h]` of the changed pixels (`None` when none changed).
+    pub diff_bounds: Option<[u32; 4]>,
 }
 
 impl CompareStats {
@@ -143,6 +150,9 @@ pub fn compare(a: &Rgba8, b: &Rgba8, opts: &CompareOpts) -> Result<CompareStats,
     let threshold = if opts.threshold.is_finite() { opts.threshold.max(0.0) } else { 0.0 };
     let (mut max_abs, mut sum_abs, mut sum_sq, mut alpha_max, mut changed) = (0f64, 0f64, 0f64, 0f64, 0u64);
     let (mut la, mut lb) = (Vec::with_capacity(n), Vec::with_capacity(n));
+    let w = a.width as usize;
+    // Changed-pixel box as (min x, min y, max x, max y), inclusive.
+    let mut bounds: Option<(usize, usize, usize, usize)> = None;
     for i in 0..n {
         let (pa, pb) = (premul(a.data, i), premul(b.data, i));
         let mut px_max = 0f64;
@@ -157,6 +167,11 @@ pub fn compare(a: &Rgba8, b: &Rgba8, opts: &CompareOpts) -> Result<CompareStats,
         alpha_max = alpha_max.max(da);
         if px_max.max(da) > threshold {
             changed += 1;
+            let (x, y) = (i % w, i / w);
+            bounds = Some(match bounds {
+                None => (x, y, x, y),
+                Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
+            });
         }
         la.push(luma(pa) as f32);
         lb.push(luma(pb) as f32);
@@ -176,6 +191,8 @@ pub fn compare(a: &Rgba8, b: &Rgba8, opts: &CompareOpts) -> Result<CompareStats,
         ssim,
         changed_pixels: changed,
         changed_pct: changed as f64 * 100.0 / n as f64,
+        // Coordinates are below the u32 width/height they came from.
+        diff_bounds: bounds.map(|(x0, y0, x1, y1)| [x0 as u32, y0 as u32, (x1 - x0 + 1) as u32, (y1 - y0 + 1) as u32]),
     })
 }
 
@@ -238,6 +255,28 @@ pub fn diff_heatmap(a: &Rgba8, b: &Rgba8, opts: &CompareOpts) -> Result<Vec<u8>,
             if d > 0.0 { [g / 2, g / 2, 140] } else { [g, g, g] }
         };
         out.extend_from_slice(&[px[0], px[1], px[2], 255]);
+    }
+    Ok(out)
+}
+
+/// The `[x, y, w, h]` rectangle of `src` as a new straight RGBA8 buffer. The rectangle must be
+/// non-empty and lie inside the image.
+pub fn crop(src: &Rgba8, region: [u32; 4]) -> Result<Vec<u8>, CompareError> {
+    src.check()?;
+    let [x, y, w, h] = region;
+    let bad = CompareError::BadRegion { region, width: src.width, height: src.height };
+    let inside = |o: u32, len: u32, side: u32| len > 0 && o.checked_add(len).is_some_and(|end| end <= side);
+    if !inside(x, w, src.width) || !inside(y, h, src.height) {
+        return Err(bad);
+    }
+    if (x, y, w, h) == (0, 0, src.width, src.height) {
+        return Ok(src.data.to_vec());
+    }
+    let (sw, x, w) = (src.width as usize, x as usize, w as usize);
+    let mut out = Vec::with_capacity(w.saturating_mul(h as usize).saturating_mul(4));
+    for row in y as usize..(y as usize + h as usize) {
+        let start = (row * sw + x) * 4;
+        out.extend_from_slice(src.data.get(start..start + w * 4).ok_or_else(|| bad.clone())?);
     }
     Ok(out)
 }
@@ -356,6 +395,53 @@ mod tests {
         assert!(s.psnr_db.is_infinite());
         assert!((s.ssim - 1.0).abs() < 1e-9);
         assert!(s.pass(None) && s.pass(Some(60.0)));
+        assert_eq!(s.diff_bounds, None);
+    }
+
+    /// A `w`×`h` black image with an opaque white `size`×`size` square at (`x`, `y`).
+    fn square(w: u32, h: u32, x: u32, y: u32, size: u32) -> Vec<u8> {
+        (0..w * h)
+            .flat_map(|i| {
+                let (px, py) = (i % w, i / w);
+                if (x..x + size).contains(&px) && (y..y + size).contains(&py) { [255, 255, 255, 255] } else { [0, 0, 0, 255] }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn diff_bounds_box_the_changed_pixels() {
+        // A 6×6 square moved 10 px right: the box spans where it left and where it arrived.
+        let (da, db) = (square(40, 20, 3, 5, 6), square(40, 20, 13, 5, 6));
+        let (a, b) = (Rgba8::new(40, 20, &da).unwrap(), Rgba8::new(40, 20, &db).unwrap());
+        let s = compare(&a, &b, &CompareOpts::default()).unwrap();
+        assert_eq!((s.changed_pixels, s.diff_bounds), (72, Some([3, 5, 16, 6])));
+        // One changed pixel is a 1×1 box; differences within the threshold don't count.
+        let (dc, mut dd) = (vec![9u8; 4 * 4 * 4], vec![9u8; 4 * 4 * 4]);
+        dd[(2 * 4 + 3) * 4] = 200;
+        dd[0] = 10;
+        let (c, d) = (Rgba8::new(4, 4, &dc).unwrap(), Rgba8::new(4, 4, &dd).unwrap());
+        assert_eq!(compare(&c, &d, &CompareOpts::default()).unwrap().diff_bounds, Some([3, 2, 1, 1]));
+    }
+
+    #[test]
+    fn crop_takes_the_rectangle_and_rejects_bad_ones() {
+        let d = square(40, 20, 3, 5, 6);
+        let a = Rgba8::new(40, 20, &d).unwrap();
+        let c = crop(&a, [2, 4, 3, 2]).unwrap();
+        assert_eq!(c.len(), 3 * 2 * 4);
+        // Row 4 is above the square; row 5 starts it at x = 3.
+        assert_eq!(c.chunks(4).map(|p| p[0]).collect::<Vec<_>>(), vec![0, 0, 0, 0, 255, 255]);
+        assert_eq!(crop(&a, [0, 0, 40, 20]).unwrap(), d);
+        for r in [[0, 0, 0, 5], [0, 0, 5, 0], [38, 0, 3, 1], [0, 19, 1, 2], [u32::MAX, 0, 2, 2], [0, 0, u32::MAX, 1]] {
+            assert!(matches!(crop(&a, r), Err(CompareError::BadRegion { .. })), "{r:?}");
+        }
+        // Compare on crops: the metrics see only the rectangle.
+        let e = square(40, 20, 13, 5, 6);
+        let b = Rgba8::new(40, 20, &e).unwrap();
+        let (ca, cb) = (crop(&a, [0, 0, 10, 20]).unwrap(), crop(&b, [0, 0, 10, 20]).unwrap());
+        let s = compare(&Rgba8::new(10, 20, &ca).unwrap(), &Rgba8::new(10, 20, &cb).unwrap(), &CompareOpts::default()).unwrap();
+        assert_eq!((s.changed_pixels, s.diff_bounds), (36, Some([3, 5, 6, 6])));
+        assert_eq!(diff_heatmap(&Rgba8::new(10, 20, &ca).unwrap(), &Rgba8::new(10, 20, &cb).unwrap(), &CompareOpts::default()).unwrap().len(), 10 * 20 * 4);
     }
 
     #[test]
