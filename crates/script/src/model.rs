@@ -625,6 +625,17 @@ fn resolve_add(s: &Session, a: &J) -> R {
             }
         }
         "animators" => json!({"kind": "animator"}),
+        // A stroke's Dashes: After Effects adds Dash 1, Gap 1, Dash 2… one by one; ours keeps
+        // Dash/Gap/Offset (Dash 0 = no dashes) and adds the extra pairs with the "+" button.
+        "dashes" if in_group => {
+            let Some((target, level)) = matchnames::dash_target(name) else {
+                return Ok(json!({"error": format!("Can not add \"{name}\" to Dashes (use ADBE Vector Stroke Dash 1…3, Gap 1…3 or Offset)")}));
+            };
+            let on = g.get("dash").is_some_and(|p| p.value.as_f64() > 0.0);
+            let have = if on { 1 + effectcraft_engine::project::build::EXTRA_DASHES.iter().filter(|(d, _)| g.get(d).is_some()).count() } else { 0 };
+            let stroke = l.props.parent_of(g.uid).map(|p| p.uid);
+            json!({"kind": "dash", "target": target, "adds": level.saturating_sub(have), "stroke": stroke})
+        }
         _ if in_contents && in_group => match matchnames::shape_kind(name) {
             Some(k) => {
                 json!({"kind": "shape", "shape": k, "group": if l.props.sub("contents").is_some_and(|c| c.uid == g.uid) { J::Null } else { json!(g.uid) }})
