@@ -3730,8 +3730,13 @@ fn value_editor(
                 t.hot_text,
             );
         }
-        Value::Gradient(_) => {
+        Value::Gradient(g) => {
             p.text(pos2(x, at.y), Align2::LEFT_CENTER, crate::i18n::tr("Edit Gradient…"), Tokens::ui(12.0), t.hot_text);
+            let r = Rect::from_min_size(pos2(x, at.y - 9.0), vec2(110.0, 18.0));
+            app.auto.add(&format!("timeline.prop.{uid}.value"), r, &prop.name);
+            if let Some(value) = super::gradient_editor::show(app, ui, egui::Id::new(("timeline-gradient", uid)), r, g) {
+                actions.push(("prop.set".into(), json!({"layer": layer.id.0, "prop": uid, "value": value})));
+            }
         }
         Value::Str(s) => {
             p.text(pos2(x, at.y), Align2::LEFT_CENTER, s.chars().take(30).collect::<String>(), Tokens::ui(12.0), t.text_dim);
