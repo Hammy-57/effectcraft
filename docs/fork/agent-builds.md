@@ -68,6 +68,11 @@ happened in between:
   Dock app's window and Stop button) and `scripts/fork/install-dock-app.sh` (builds the launcher
   with `swiftc` into `~/Applications/EffectCraft.app` and adds it to the Dock once). After changing
   the launcher, run the install script again.
+- Privacy permissions (Full Disk Access, Files and Folders) belong to `EffectCraft.app`. The
+  launcher starts the app itself and stays running, hidden, until the app quits, so one grant
+  covers every rebuilt binary. An app started from a terminal or by an agent (`scripts/fork/app.sh`)
+  gets that program's permissions instead. Reinstalling the launcher re-signs it: switch
+  EffectCraft off and on again in Full Disk Access.
 
 ## Cheaper builds
 

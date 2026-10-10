@@ -2,6 +2,11 @@
 // ~/Applications/EffectCraft.app. Click: opens the app, building it first only when the code changed
 // (scripts/fork/app.sh). While it builds, a small window shows progress; Stop, closing the window,
 // Cmd-Q or Quit from the Dock stop the build. A running EffectCraft is never quit or replaced.
+//
+// The launcher starts EffectCraft itself and stays running (hidden) until it quits: macOS privacy
+// permissions (Full Disk Access, Files and Folders) belong to the app that started a process, so
+// granting them to EffectCraft.app once covers every rebuilt binary. A launcher that quit right
+// away left the binary on its own, without them.
 
 import AppKit
 
@@ -58,6 +63,7 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var window: NSWindow?
     var detail = NSTextField(labelWithString: "Only what changed since the last build.")
     var build: Process?
+    var appProcess: Process?
     var timer: Timer?
     var stopping = false
 
@@ -67,10 +73,7 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate {
             bringForward()
             NSApp.terminate(nil)
         case "ready":
-            _ = run([])
-            Thread.sleep(forTimeInterval: 1)
-            bringForward()
-            NSApp.terminate(nil)
+            launchApp()
         default:
             startBuild()
         }
@@ -141,9 +144,39 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate {
             fail("The EffectCraft build failed.")
             return
         }
-        Thread.sleep(forTimeInterval: 1)
-        bringForward()
-        NSApp.terminate(nil)
+        launchApp()
+    }
+
+    /// Start EffectCraft as this launcher's child (so it runs with the launcher's privacy
+    /// permissions), hide the launcher, and quit when EffectCraft quits.
+    func launchApp() {
+        window?.orderOut(nil)
+        window = nil
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: appBinary)
+        p.currentDirectoryURL = URL(fileURLWithPath: root)
+        let logURL = URL(fileURLWithPath: root + "/target/local/app.log")
+        FileManager.default.createFile(atPath: logURL.path, contents: nil)
+        if let out = try? FileHandle(forWritingTo: logURL) {
+            p.standardOutput = out
+            p.standardError = out
+        }
+        p.terminationHandler = { _ in DispatchQueue.main.async { NSApp.terminate(nil) } }
+        do {
+            try p.run()
+        } catch {
+            fail("Couldn't start EffectCraft: \(error.localizedDescription)")
+            return
+        }
+        appProcess = p
+        NSApp.setActivationPolicy(.accessory)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { bringForward() }
+    }
+
+    /// A Dock click while EffectCraft runs: bring it to the front.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if appProcess?.isRunning == true { bringForward() }
+        return false
     }
 
     func fail(_ message: String) {
@@ -189,7 +222,7 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate {
         return .terminateNow
     }
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { appProcess == nil }
 }
 
 let app = NSApplication.shared
