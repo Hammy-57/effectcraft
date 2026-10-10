@@ -155,10 +155,8 @@ fn replace_with_layered_comp(s: &mut Session, p: &Value) -> Result<Value> {
                     continue;
                 }
                 if let Some(c) = proj.comp_mut(cid) {
-                    for l in &mut c.layers {
-                        if matches!(&l.source, LayerSource::Footage { item: i } if *i == item) {
-                            l.source = LayerSource::Comp { item: comp };
-                        }
+                    for l in c.layers.iter_mut_where(|l| matches!(&l.source, LayerSource::Footage { item: i } if *i == item)) {
+                        l.source = LayerSource::Comp { item: comp };
                     }
                 }
             }
