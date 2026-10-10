@@ -58,7 +58,13 @@ impl ToolDef {
         let props = schema.get("properties")?.as_object()?;
         let bad = m.keys().find(|k| !props.contains_key(*k))?;
         let accepted: Vec<&str> = props.keys().map(String::as_str).collect();
-        Some(format!("unknown argument \"{bad}\" for {}; expected: {}", self.name, accepted.join(", ")))
+        // `command` ↔ `id` is the usual mix-up between the command tools; else the closest name.
+        let hint = match bad.as_str() {
+            "command" if props.contains_key("id") => "; did you mean `id`?".to_string(),
+            "id" if props.contains_key("command") => "; did you mean `command`?".to_string(),
+            _ => effectcraft_engine::suggest::did_you_mean(bad, accepted.iter().copied()),
+        };
+        Some(format!("unknown argument \"{bad}\" for {}{hint}; expected: {}", self.name, accepted.join(", ")))
     }
 }
 
@@ -170,7 +176,10 @@ fn params_of(v: Option<&Value>) -> Result<Value> {
 
 fn list_commands(b: &mut Backend, a: &Value) -> Result<Reply> {
     let schemas = get(a, "schemas").and_then(Value::as_bool).unwrap_or(false).then_some(json!(true));
-    let r = b.exec("command.list", obj(&[("filter", get(a, "filter")), ("enabledOnly", get(a, "enabled_only")), ("schemas", schemas.as_ref())]))?;
+    let r = b.exec(
+        "command.list",
+        obj(&[("filter", get(a, "filter")), ("enabledOnly", get(a, "enabled_only")), ("schemas", schemas.as_ref()), ("brief", get(a, "brief"))]),
+    )?;
     // Drop empty fields to keep the listing compact.
     let list: Vec<Value> = r
         .as_array()
@@ -199,7 +208,7 @@ fn describe_command(b: &mut Backend, a: &Value) -> Result<Reply> {
 }
 
 fn list_effects(b: &mut Backend, a: &Value) -> Result<Reply> {
-    json_reply(b.exec("effect.list", obj(&[("filter", get(a, "filter"))]))?)
+    json_reply(b.exec("effect.list", obj(&[("filter", get(a, "filter")), ("brief", get(a, "brief"))]))?)
 }
 
 fn list_fonts(b: &mut Backend, a: &Value) -> Result<Reply> {
@@ -230,14 +239,43 @@ fn add_effect(b: &mut Backend, a: &Value) -> Result<Reply> {
     // The undo step is named like effect.apply's own ("Apply Gaussian Blur").
     let name = effect.as_str().map(|e| effectcraft_engine::effects::lookup(e).map_or(e, |s| s.name));
     let label = name.map(|n| json!(format!("Apply {n}")));
-    b.exec("engine.batch", obj(&[("steps", Some(&json!(steps))), ("label", label.as_ref())]))?;
+    let keys: Vec<&String> = get(a, "values").and_then(Value::as_object).map(|v| v.keys().collect()).unwrap_or_default();
+    let done = b.exec("engine.batch", obj(&[("steps", Some(&json!(steps))), ("label", label.as_ref())])).map_err(|e| add_effect_error(e, &keys))?;
+    let warnings: Vec<Value> = done["results"].as_array().map(|r| r.iter().flat_map(warnings_of).collect()).unwrap_or_default();
     let tree = b.exec("layer.tree", obj(&[("layer", Some(layer)), ("comp", comp)]))?;
     let inst = effects_group(&tree).and_then(|g| g.get("children")).and_then(Value::as_array).and_then(|c| c.get(index - 1)).cloned();
     let mut params = vec![];
     if let Some(i) = &inst {
         flatten(i, &mut params);
     }
-    json_reply(json!({"layer": tree["id"], "index": index, "path": prefix, "name": inst.as_ref().map(|i| i["name"].clone()), "set": set, "params": params}))
+    let mut out = json!({"layer": tree["id"], "index": index, "path": prefix, "name": inst.as_ref().map(|i| i["name"].clone()), "set": set, "params": params});
+    if !warnings.is_empty() {
+        out["warnings"] = json!(warnings);
+    }
+    json_reply(out)
+}
+
+/// An add_effect failure in the words of its arguments: the batch's `step 3 (prop.set): invalid
+/// parameters for `prop.set`: …` becomes `values.inBlack: …` (step 1 is the effect itself).
+fn add_effect_error(e: Error, keys: &[&String]) -> Error {
+    let msg = e.to_string();
+    let Some((head, rest)) = msg.strip_prefix("step ").and_then(|m| m.split_once("): ")) else { return e };
+    let Some(n) = head.split_whitespace().next().and_then(|n| n.parse::<usize>().ok()) else { return e };
+    let rest = rest.strip_suffix("; the batch was rolled back (nothing changed)").map_or(rest.to_string(), |r| format!("{r} (nothing was applied)"));
+    let inner = ["prop.set", "effect.apply"].iter().find_map(|c| rest.strip_prefix(&format!("invalid parameters for `{c}`: "))).unwrap_or(&rest).to_string();
+    match n.checked_sub(2).and_then(|i| keys.get(i)) {
+        Some(k) => Error::BadArgs(format!("values.{k}: {inner}")),
+        None => Error::BadArgs(inner),
+    }
+}
+
+/// The `warnings` of a command result (prop.set / prop.addKey report clamped or coerced values).
+fn warnings_of(v: &Value) -> Vec<Value> {
+    match v {
+        Value::Object(o) => o.get("warnings").and_then(Value::as_array).cloned().unwrap_or_default(),
+        Value::Array(a) => a.iter().flat_map(warnings_of).collect(),
+        _ => vec![],
+    }
 }
 
 /// The `effects` group of a `layer.tree` reply.
@@ -313,25 +351,29 @@ fn set_property(b: &mut Backend, a: &Value) -> Result<Reply> {
         return Err(Error::BadArgs("give `value` and/or `expression`".into()));
     }
     let base = [("layer", Some(layer)), ("path", Some(path)), ("comp", comp)];
+    let mut warnings = vec![];
     if let Some(v) = value {
         let mut p = obj(&base);
         p["value"] = v.clone();
-        match time {
+        let r = match time {
             Some(t) => {
                 p["time"] = t.clone();
-                b.exec("prop.addKey", p)?;
+                b.exec("prop.addKey", p)?
             }
-            None => {
-                b.exec("prop.set", p)?;
-            }
-        }
+            None => b.exec("prop.set", p)?,
+        };
+        warnings = warnings_of(&r);
     }
     if let Some(e) = expr {
         let mut p = obj(&base);
         p["expression"] = e.clone();
         b.exec("prop.setExpression", p)?;
     }
-    json_reply(b.exec("prop.get", obj(&[("layer", Some(layer)), ("path", Some(path)), ("comp", comp), ("time", time)]))?)
+    let mut r = b.exec("prop.get", obj(&[("layer", Some(layer)), ("path", Some(path)), ("comp", comp), ("time", time)]))?;
+    if !warnings.is_empty() {
+        r["warnings"] = json!(warnings);
+    }
+    json_reply(r)
 }
 
 fn add_keyframe(b: &mut Backend, a: &Value) -> Result<Reply> {
@@ -345,14 +387,21 @@ fn add_keyframe(b: &mut Backend, a: &Value) -> Result<Reply> {
         return Err(Error::BadArgs("no keys".into()));
     }
     let base = [("layer", Some(layer)), ("path", Some(path)), ("comp", comp)];
-    for k in &keys {
+    let mut warnings = vec![];
+    for (i, k) in keys.iter().enumerate() {
         let mut p = obj(&base);
-        p["time"] = need(k, "time")?.clone();
+        p["time"] = get(k, "time").ok_or_else(|| Error::BadArgs(format!("keys[{i}]: missing `time`; each key is {{time, value?}}, got {k}")))?.clone();
         if let Some(v) = get(k, "value") {
             p["value"] = v.clone();
         }
-        b.exec("prop.addKey", p)?;
+        warnings.extend(warnings_of(&b.exec("prop.addKey", p)?));
     }
+    let with_warnings = |mut r: Value| {
+        if !warnings.is_empty() {
+            r["warnings"] = json!(warnings);
+        }
+        r
+    };
     let info = b.exec("prop.get", obj(&base))?;
     if let Some(interp) = get(a, "interpolation").and_then(Value::as_str) {
         // Key selection works on the active comp.
@@ -368,9 +417,9 @@ fn add_keyframe(b: &mut Backend, a: &Value) -> Result<Reply> {
             i @ ("linear" | "bezier" | "hold") => b.exec("keys.interpolation", json!({"interpolation": i}))?,
             other => return Err(Error::BadArgs(format!("unknown interpolation `{other}` (linear, bezier, hold, easyEase, easyEaseIn, easyEaseOut)"))),
         };
-        return json_reply(b.exec("prop.get", obj(&base))?);
+        return json_reply(with_warnings(b.exec("prop.get", obj(&base))?));
     }
-    json_reply(info)
+    json_reply(with_warnings(info))
 }
 
 fn render_frame(b: &mut Backend, a: &Value) -> Result<Reply> {
@@ -519,14 +568,15 @@ fn control(b: &mut Backend, a: &Value) -> Result<Reply> {
 static TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "list_commands",
-        description: "List engine commands: id, label, menu path, shortcut, `params` doc (e.g. `{name?, width?, height?, frameRate?, duration? (s)}`) and whether it can run now (`why` if not). Every menu item, shortcut and panel gesture maps to one of these ids; run them with execute_command. Narrow with `filter` (e.g. `layer.new`, `keys`, `effect`).",
+        description: "List engine commands: id, label, menu path, shortcut, `params` doc (e.g. `{name?, width?, height?, frameRate?, duration? (s)}`) and whether it can run now (`why` if not). Every menu item, shortcut and panel gesture maps to one of these ids; run them with execute_command. The full list is large (~130 KB): narrow with `filter` (e.g. `layer.new`, `keys`, `effect`) or pass `brief: true` for just ids and labels, then describe_command for one command's parameters.",
         bridge_only: false,
         schema: || {
             schema(
                 json!({
                     "filter": {"type": "string", "description": "Only commands whose id or label contains this text (case-insensitive)."},
                     "enabled_only": {"type": "boolean", "description": "Only commands that can run right now."},
-                    "schemas": {"type": "boolean", "description": "Also return each command's parameter JSON Schema (`schema`)."}
+                    "schemas": {"type": "boolean", "description": "Also return each command's parameter JSON Schema (`schema`)."},
+                    "brief": {"type": "boolean", "description": "Only {id, label} per command (~40 KB instead of ~125 KB); describe_command gives one command's params."}
                 }),
                 &[],
             )
@@ -621,7 +671,7 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "set_property",
-        description: "Set a property. Without `time`: sets the static value (or a key at the current time if already animated). With `time`: adds/replaces a keyframe there, turning the stopwatch on. `expression` sets an After Effects-style JS expression (\"\" removes it). Returns the property as get_property does. Examples: {\"layer\":3,\"path\":\"transform/opacity\",\"value\":50}; {\"layer\":\"Title\",\"path\":\"transform/position\",\"value\":[200,540],\"time\":0}; {\"layer\":3,\"path\":\"transform/rotation\",\"expression\":\"time*90\"}.",
+        description: "Set a property. Without `time`: sets the static value (or a key at the current time if already animated). With `time`: adds/replaces a keyframe there, turning the stopwatch on. `expression` sets an After Effects-style JS expression (\"\" removes it). Returns the property as get_property does, plus `warnings` when the value was clamped to its valid range or reshaped (a number filling a vector, missing components set to 0). Popup properties take an option index (0-based) or name. Examples: {\"layer\":3,\"path\":\"transform/opacity\",\"value\":50}; {\"layer\":\"Title\",\"path\":\"transform/position\",\"value\":[200,540],\"time\":0}; {\"layer\":3,\"path\":\"transform/rotation\",\"expression\":\"time*90\"}.",
         bridge_only: false,
         schema: || {
             schema(
@@ -655,7 +705,7 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "add_effect",
-        description: "Apply an effect to a layer and optionally set its parameters in one undoable call. `effect` is an id (`ec.blur.gaussian`) or After Effects name (`Gaussian Blur`; see list_effects); `values` maps parameter ids to values, e.g. {\"blurriness\": 12}. One undo step; if a value fails, nothing is applied. Returns the instance `path` (`effects/#n`, for set_property / add_keyframe) and its parameters with their paths and current values.",
+        description: "Apply an effect to a layer and optionally set its parameters in one undoable call. `effect` is an id (`ec.blur.gaussian`) or After Effects name (`Gaussian Blur`; see list_effects); `values` maps parameter ids to values, e.g. {\"blurriness\": 12}. One undo step; if a value fails, nothing is applied. Returns the instance `path` (`effects/#n`, for set_property / add_keyframe) and its parameters with their paths and current values; values that were clamped to a parameter's range or otherwise adjusted are listed in `warnings`.",
         bridge_only: false,
         schema: || {
             schema(
@@ -671,9 +721,17 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "list_effects",
-        description: "The effect registry: id, After Effects name, category, GPU and 32-bpc support. Narrow with `filter` (id, name or category text). Apply with add_effect.",
+        description: "The effect registry: id, After Effects name, category, GPU and 32-bpc support, and each parameter (id, name, default, valid `range` of sliders, popup `options`). The full list is large (~360 KB): narrow with `filter` (id, name or category text) or pass `brief: true` for just ids and names (~19 KB). Apply with add_effect.",
         bridge_only: false,
-        schema: || schema(json!({"filter": {"type": "string", "description": "Only effects whose id, name or category contains this text."}}), &[]),
+        schema: || {
+            schema(
+                json!({
+                    "filter": {"type": "string", "description": "Only effects whose id, name or category contains this text."},
+                    "brief": {"type": "boolean", "description": "Only {id, name} per effect (no parameters)."}
+                }),
+                &[],
+            )
+        },
         run: list_effects,
     },
     ToolDef {
@@ -885,14 +943,15 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "command_list",
-        description: "List engine commands: id, label, menu path, shortcut, `params` doc (e.g. `{name?, width?, height?, frameRate?, duration? (s)}`) and whether it can run now (`why` if not). Every menu item, shortcut and panel gesture maps to one of these ids; run them with execute_command. Narrow with `filter` (e.g. `layer.new`, `keys`, `effect`).",
+        description: "List engine commands: id, label, menu path, shortcut, `params` doc (e.g. `{name?, width?, height?, frameRate?, duration? (s)}`) and whether it can run now (`why` if not). Every menu item, shortcut and panel gesture maps to one of these ids; run them with execute_command. The full list is large (~130 KB): narrow with `filter` (e.g. `layer.new`, `keys`, `effect`) or pass `brief: true` for just ids and labels, then describe_command for one command's parameters.",
         bridge_only: false,
         schema: || {
             schema(
                 json!({
                     "filter": {"type": "string", "description": "Only commands whose id or label contains this text (case-insensitive)."},
                     "enabled_only": {"type": "boolean", "description": "Only commands that can run right now."},
-                    "schemas": {"type": "boolean", "description": "Also return each command's parameter JSON Schema (`schema`)."}
+                    "schemas": {"type": "boolean", "description": "Also return each command's parameter JSON Schema (`schema`)."},
+                    "brief": {"type": "boolean", "description": "Only {id, label} per command (~40 KB instead of ~125 KB); describe_command gives one command's params."}
                 }),
                 &[],
             )

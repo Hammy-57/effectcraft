@@ -1063,3 +1063,43 @@ fn command_tools_accept_id_as_an_alias() {
     let (_, err) = call(&mut s, "execute_command", json!({}));
     assert!(err, "neither key is an error");
 }
+
+/// Agent-facing ergonomics: clamped values come back as `warnings`, errors name the argument and
+/// suggest a fix, and the catalogues have a cheap `brief` mode.
+#[test]
+fn warnings_hints_and_brief_listings() {
+    let mut s = server();
+    call_json(&mut s, "execute_command", json!({"command": "comp.new", "params": {"width": 100, "height": 100}}));
+    let l = call_json(&mut s, "execute_command", json!({"command": "layer.newSolid"}))["layer"].clone();
+    let r = call_json(&mut s, "add_effect", json!({"layer": l, "effect": "Levels", "values": {"inBlack": 20}}));
+    assert!(r["warnings"][0].as_str().unwrap().starts_with("inBlack: 20 is outside the valid range"), "{r}");
+    let r = call_json(&mut s, "set_property", json!({"layer": l, "path": "transform/position", "value": 5}));
+    assert_eq!(r["warnings"][0], "position: number 5 expanded to [5, 5, 5]", "{r}");
+    let r = call_json(&mut s, "add_keyframe", json!({"layer": l, "path": "effects/#1/gamma", "time": 0, "value": 99}));
+    assert!(r["warnings"][0].as_str().unwrap().contains("clamped to 10"), "{r}");
+    let r = call_json(&mut s, "batch", json!({"steps": [{"command": "prop.set", "params": {"layer": l, "path": "effects/#1/inWhite", "value": 7}}]}));
+    assert!(r["warnings"][0].as_str().unwrap().starts_with("step 1 (prop.set): inWhite"), "{r}");
+
+    // add_effect errors name the value, not the batch step.
+    let (c, err) = call(&mut s, "add_effect", json!({"layer": l, "effect": "Levels", "values": {"inputBlack": 0.1}}));
+    let t = c[0]["text"].as_str().unwrap();
+    assert!(err && t.starts_with("values.inputBlack: ") && t.contains("did you mean `inBlack`") && !t.contains("step "), "{t}");
+    assert!(t.ends_with("(nothing was applied)"), "{t}");
+    let (c, err) = call(&mut s, "add_effect", json!({"layer": l, "effect": "Gausian Blur"}));
+    assert!(err && c[0]["text"].as_str().unwrap().contains("did you mean `Gaussian Blur`"), "{c:?}");
+    let (c, err) = call(&mut s, "command_run", json!({"id": "layer.newSoild"}));
+    assert!(err && c[0]["text"].as_str().unwrap().contains("did you mean `layer.newSolid`"), "{c:?}");
+
+    // command_run takes `id`: the rejection says so.
+    let line = json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {"name": "command_run", "arguments": {"command": "comp.new"}}});
+    let r: Value = serde_json::from_str(&s.handle_line(&line.to_string()).unwrap()).unwrap();
+    assert_eq!(r["error"]["code"], -32602);
+    assert!(r["error"]["message"].as_str().unwrap().contains("did you mean `id`?"), "{r}");
+
+    // Brief listings: ids and labels / names only.
+    let full = call(&mut s, "command_list", json!({})).0[0]["text"].as_str().unwrap().len();
+    let brief = call(&mut s, "command_list", json!({"brief": true})).0[0]["text"].as_str().unwrap().len();
+    assert!(brief * 3 < full, "{brief} vs {full}");
+    let fx = call_json(&mut s, "list_effects", json!({"brief": true}));
+    assert!(fx.as_array().unwrap().iter().all(|e| e.as_object().unwrap().len() == 2), "{fx}");
+}

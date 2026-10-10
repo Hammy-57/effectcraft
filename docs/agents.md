@@ -82,7 +82,7 @@ See [MCP conventions](mcp.md) for core tools, resources, strict arguments, and r
 
 | Tool | What it does |
 |---|---|
-| `list_commands {filter?, enabled_only?, schemas?}` | Discover command ids, their param docs (and, with `schemas`, a JSON Schema each), and whether each can run now. |
+| `list_commands {filter?, enabled_only?, schemas?, brief?}` | Discover command ids, their param docs (and, with `schemas`, a JSON Schema each), and whether each can run now. The full list is ~130 KB: `brief: true` returns only `{id, label}` (~40 KB), then `describe_command` for one command. |
 | `describe_command {command \| id}` | One command in full: label, menu, shortcut, params doc, JSON `schema`, enabled / `why`. |
 | `execute_command {command \| id, params?}` | Run any command (undoable). Unknown parameter keys are rejected with the accepted list. |
 | `get_state` | Editor state (active comp, time, selections, tool) plus `app`: version, command and effect counts, export formats, parity summary. |
@@ -92,7 +92,7 @@ See [MCP conventions](mcp.md) for core tools, resources, strict arguments, and r
 | `get_property {layer, path, comp?, time?}` | Value at a time, keyframes and expression. |
 | `set_property {layer, path, value?, time?, expression?, comp?}` | Sets a static value. With `time` it sets a keyframe; with `expression` it sets an expression. |
 | `add_keyframe {layer, path, time+value \| keys:[...], interpolation?, comp?}` | Adds keys, then optionally applies linear/bezier/hold/easyEase. |
-| `list_effects {filter?}` | Effect ids, names, categories, GPU / 32-bpc support and parameters. |
+| `list_effects {filter?, brief?}` | Effect ids, names, categories, GPU / 32-bpc support and parameters (id, name, default, a slider's valid `range`, a popup's `options`). `brief: true` returns only `{id, name}` (~19 KB instead of ~360 KB). |
 | `list_fonts {query?, rescan?}` | Font families text layers can use, bundled and installed, with their styles, origin and own-language name; `rescan` picks up fonts installed since launch. |
 | `add_effect {layer, effect, values?, comp?}` | Apply an effect and set its parameters in one call and one undo step (a failing value leaves nothing applied); returns the instance path (`effects/#n`) and its parameter paths. |
 | `render_frame {comp?, time?, max_side?, path?, inline?, transparent?}` | Returns a PNG image of a frame; `transparent: true` keeps the alpha (as an RGB + Alpha render writes it) instead of compositing over the comp background. |
@@ -117,6 +117,19 @@ stretched.
 Command params are checked against each command's `params` doc. An unknown key, such as
 `layer.select {"index": 2}`, returns an error that lists the accepted keys (here `layers, add, toggle`)
 instead of being ignored.
+
+Errors say how to fix the call: an unknown command, effect, tool argument or property path names the
+closest match (`did you mean `inBlack`?`) and, for a path, the valid ids at the level that failed; a
+popup value that isn't an option lists the choices. Popups take an option index (0-based) or name
+(`"value": "Red"`).
+
+**Warnings.** Values are stored as before, but when what was stored differs from what was sent the
+result carries `warnings`: a slider value outside its valid range is clamped (`inBlack: 20 is outside
+the valid range -1 to 2 (slider 0 to 1); clamped to 2`), a single number fills a vector (`position:
+number 5 expanded to [5, 5, 5]`), missing components become 0. `prop.set` then returns `{value,
+warnings}` (`prop.addKey`: `{keys, warnings}`), `set_property`, `add_keyframe` and `add_effect` add a
+`warnings` array, and `batch` gathers them as `step N (id): …`. Read them: a clamped Levels value
+renders very differently from what you meant.
 
 ### A typical session
 
