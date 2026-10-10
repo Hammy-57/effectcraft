@@ -806,16 +806,40 @@ fn raster_pass(g: &PlacedGlyph, stroke: bool, paths: &[BezPath], m: &Mat3, rect:
     };
     let col = if stroke { g.stroke } else { g.fill };
     let op = (g.xf.opacity / 100.0).clamp(0.0, 1.0) as f32;
-    let a = col[3] * op;
+    paint_coverage(&cov.data, col, col[3] * op, w, h, blur_px)
+}
+
+/// A `w`×`h` patch of colour `col` (alpha `a`) × `cov`, blurred by `blur_px` (premultiplied).
+fn paint_coverage(cov: &[f32], col: [f32; 4], a: f32, w: u32, h: u32, blur_px: [f64; 2]) -> Image {
     let mut img = Image::new(w, h);
-    for (px, c) in img.data.iter_mut().zip(&cov.data) {
-        let k = c * a;
-        if k > 0.0 {
-            *px = [col[0] * k, col[1] * k, col[2] * k, k];
+    // Before any blur: colour × coverage where covered.
+    let k: Vec<f32> = cov.iter().map(|c| c * a).map(|k| if k > 0.0 { k } else { 0.0 }).collect();
+    if blur_px[0] <= 0.05 && blur_px[1] <= 0.05 {
+        for (px, &k) in img.data.iter_mut().zip(&k) {
+            if k > 0.0 {
+                *px = [col[0] * k, col[1] * k, col[2] * k, k];
+            }
+        }
+        return img;
+    }
+    // Each channel is the blur of colour × coverage, one plane at a time: a channel of colour 1
+    // is the coverage's own blur and one of colour 0 stays 0, so white, black and grey text blur
+    // one or two planes instead of four channels (the same sums, so the same pixels).
+    let (pw, ph) = (w as usize, h as usize);
+    let blur = |p: &[f32]| effectcraft_raster::gaussian_blur_plane(p, pw, ph, blur_px[0] / 2.0, blur_px[1] / 2.0, false);
+    let alpha = blur(&k);
+    let mut planes: Vec<(u32, Vec<f32>)> = vec![];
+    for c in col.iter().take(3) {
+        if *c != 1.0 && c.to_bits() != 0 && !planes.iter().any(|(b, _)| *b == c.to_bits()) {
+            let ck: Vec<f32> = k.iter().map(|&k| if k > 0.0 { c * k } else { 0.0 }).collect();
+            planes.push((c.to_bits(), blur(&ck)));
         }
     }
-    if blur_px[0] > 0.05 || blur_px[1] > 0.05 {
-        img = effectcraft_raster::gaussian_blur(&img, blur_px[0] / 2.0, blur_px[1] / 2.0, false);
+    let chan = |c: f32| -> Option<&[f32]> { if c == 1.0 { Some(&alpha) } else { planes.iter().find(|(b, _)| *b == c.to_bits()).map(|(_, p)| p.as_slice()) } };
+    let (r, g2, b) = (chan(col[0]), chan(col[1]), chan(col[2]));
+    let at = |p: Option<&[f32]>, i: usize| p.and_then(|p| p.get(i).copied()).unwrap_or(0.0);
+    for (i, px) in img.data.iter_mut().enumerate() {
+        *px = [at(r, i), at(g2, i), at(b, i), alpha.get(i).copied().unwrap_or(0.0)];
     }
     img
 }

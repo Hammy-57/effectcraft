@@ -91,25 +91,61 @@ impl<'a> Renderer<'a> {
 
     /// The layer cache key of a layer's content (`None` without a cache or for uncached layers).
     fn content_cache_key(&self, ctx: &EvalCtx, layer: &Layer) -> Option<u64> {
-        let key = self.cache.and_then(|_| cache::layer_key(ctx, layer, self.raster_scale(ctx, layer), self.opts.draft, self.mb_on(ctx, layer)));
-        self.content_key(ctx, layer, key)
+        self.content_cache_key_noted(ctx, layer).0
+    }
+
+    /// [`Self::content_cache_key`], and for a precomp layer that was keyed, its id for
+    /// [`cache::LayerCache::precomp_note`] (an animated precomp is keyed only now and then, see
+    /// [`cache::LayerCache::precomp_try`]).
+    fn content_cache_key_noted(&self, ctx: &EvalCtx, layer: &Layer) -> (Option<u64>, Option<u64>) {
+        let Some(c) = self.cache else { return (None, None) };
+        let (src, noted) = match layer.source {
+            LayerSource::Comp { .. } => {
+                let id = cache::derive(cache::derive(ctx.comp_id.0, layer.id.0), self.depth as u64);
+                if !c.precomp_try(id) {
+                    return (None, None);
+                }
+                (self.precomp_key(ctx, layer), Some(id))
+            }
+            // Which proxy the footage shows.
+            LayerSource::Footage { item } => (Some(self.proxy_for(item).is_some() as u64), None),
+            _ => (None, None),
+        };
+        let key = cache::layer_key_src(ctx, layer, self.raster_scale(ctx, layer), self.opts.draft, self.mb_on(ctx, layer), src);
+        (self.content_key(ctx, layer, key), noted)
     }
 
     fn content_buf_timed(&self, ctx: &EvalCtx, layer: &Layer, mut timing: Option<&mut LayerTiming>) -> Option<(Arc<Buf>, Option<u64>)> {
-        let key = self.content_cache_key(ctx, layer);
-        if let (Some(c), Some(k)) = (self.cache, key)
-            && let Some(b) = c.get(k)
-        {
-            if let Some(t) = timing.as_deref_mut() {
-                t.cached = true;
+        let (key, noted) = self.content_cache_key_noted(ctx, layer);
+        let mut _flight = None;
+        if let Some(c) = self.cache {
+            let hit = match key {
+                Some(k) => c.get(k).or_else(|| match c.claim(k) {
+                    cache::Claim::Ready(b) => Some(b),
+                    cache::Claim::Owner(g) => {
+                        _flight = Some(g);
+                        None
+                    }
+                    cache::Claim::Render => None,
+                }),
+                None => None,
+            };
+            if let Some(id) = noted {
+                c.precomp_note(id, hit.is_some());
             }
-            return Some((b, key));
+            if let Some(b) = hit {
+                if let Some(t) = timing.as_deref_mut() {
+                    t.cached = true;
+                }
+                return Some((b, key));
+            }
         }
         let buf = self.masked_source(ctx, layer)?;
         let buf = Arc::new(self.apply_effects_timed(ctx, layer, buf, false, usize::MAX, timing.map(|t| &mut t.effects)));
         if let (Some(c), Some(k)) = (self.cache, key) {
             c.insert(k, buf.clone());
         }
+        // (`_flight`, dropped here, wakes the threads waiting for this buffer.)
         Some((buf, key))
     }
 
@@ -118,7 +154,12 @@ impl<'a> Renderer<'a> {
     /// what effect `effects` sees. Served from / stored in the layer cache under its own key,
     /// so scrubbing reuses frames rendered for earlier output frames.
     pub fn layer_input(&self, ctx: &EvalCtx, layer: &Layer, effects: usize) -> Option<Arc<Buf>> {
-        let key = self.cache.and_then(|_| cache::input_key(ctx, layer, self.raster_scale(ctx, layer), self.opts.draft, self.mb_on(ctx, layer), effects));
+        let src = match layer.source {
+            LayerSource::Comp { .. } if self.cache.is_some() => self.precomp_key(ctx, layer),
+            LayerSource::Footage { item } => Some(self.proxy_for(item).is_some() as u64),
+            _ => None,
+        };
+        let key = self.cache.and_then(|_| cache::input_key_src(ctx, layer, self.raster_scale(ctx, layer), self.opts.draft, self.mb_on(ctx, layer), effects, src));
         let key = self.content_key(ctx, layer, key);
         if let (Some(c), Some(k)) = (self.cache, key)
             && let Some(b) = c.get(k)

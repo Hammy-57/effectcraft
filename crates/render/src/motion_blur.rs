@@ -7,6 +7,8 @@ use effectcraft_effects::Buf;
 use effectcraft_geom::{Mat3, vec2};
 use effectcraft_project::{Comp, Layer, LayerSource};
 use effectcraft_time::Tick;
+use std::cell::Cell;
+use std::collections::HashMap;
 
 /// A motion-blur shutter: the comp's, or for a collapsed precomp's layers the outermost
 /// containing comp's (they are drawn into its frames).
@@ -54,7 +56,7 @@ impl<'a> Renderer<'a> {
 
     /// Whether a layer moves within the shutter: its own motion blur, or that of a collapsed
     /// precomp layer it is drawn through.
-    fn blurred(&self, ctx: &EvalCtx, layer: &Layer) -> bool {
+    pub(crate) fn blurred(&self, ctx: &EvalCtx, layer: &Layer) -> bool {
         self.mb_on(ctx, layer) || (!self.through_lost && self.links().any(|l| l.blur))
     }
 
@@ -76,14 +78,17 @@ impl<'a> Renderer<'a> {
 
     /// [`Self::buf_matrix`] for the motion-blur sub-sample `dt` seconds into the shutter: the
     /// layer moves if it is motion blurred, the collapsed precomps above it if theirs are.
-    pub(crate) fn buf_matrix_at(&self, ctx: &EvalCtx, layer: &Layer, buf: &Buf, dt: f64) -> Mat3 {
-        if self.through_lost || self.links().next().is_none() {
-            return self.buf_matrix(&ctx.at(ctx.time + Tick::from_seconds_f64(dt)), layer, buf);
-        }
-        let (outer, t) = self.outer_at(ctx, dt);
-        let lctx = if self.mb_on(ctx, layer) { ctx.at(t) } else { *ctx };
-        let (l2c, _) = lctx.layer_to_comp(layer);
-        self.place_matrix(outer.map_or(l2c, |o| o * l2c), buf)
+    pub(crate) fn buf_matrix_at(&self, ctx: &EvalCtx, layer: &Layer, buf: &Buf, dt: f64, mo: &MotionMemo) -> Mat3 {
+        let l2c = mo.at(dt, || {
+            if self.through_lost || self.links().next().is_none() {
+                return self.comp_matrix(&ctx.at(ctx.time + Tick::from_seconds_f64(dt)), layer);
+            }
+            let (outer, t) = self.outer_at(ctx, dt);
+            let lctx = if self.mb_on(ctx, layer) { ctx.at(t) } else { *ctx };
+            let (l2c, _) = lctx.layer_to_comp(layer);
+            outer.map_or(l2c, |o| o * l2c)
+        });
+        self.place_matrix(l2c, buf)
     }
 
     /// Shape and text content that animates within the shutter (paths, Trim Paths, text
@@ -157,11 +162,11 @@ impl<'a> Renderer<'a> {
     /// layer gets about one sample per output pixel its corners travel during the shutter,
     /// at least Samples Per Frame and at most the comp's Adaptive Sample Limit; a layer that
     /// does not move within the shutter is drawn once.
-    pub(crate) fn mb_samples(&self, ctx: &EvalCtx, layer: &Layer, buf: &Buf) -> usize {
+    pub(crate) fn mb_samples(&self, ctx: &EvalCtx, layer: &Layer, buf: &Buf, mo: &MotionMemo) -> usize {
         if !self.blurred(ctx, layer) {
             return 1;
         }
-        let travel = self.shutter_travel(ctx, layer, buf);
+        let travel = self.shutter_travel(ctx, layer, buf, mo);
         if travel < 1e-3 {
             return 1;
         }
@@ -174,7 +179,7 @@ impl<'a> Renderer<'a> {
 
     /// Largest distance (output pixels) a corner of the layer buffer moves during the shutter,
     /// measured along the path at a few points.
-    fn shutter_travel(&self, ctx: &EvalCtx, layer: &Layer, buf: &Buf) -> f64 {
+    fn shutter_travel(&self, ctx: &EvalCtx, layer: &Layer, buf: &Buf, mo: &MotionMemo) -> f64 {
         let sh = self.shutter(ctx);
         let (w, h) = (buf.img.width as f64, buf.img.height as f64);
         let corners = [(0.0, 0.0), (w, 0.0), (0.0, h), (w, h), (w * 0.5, h * 0.5)];
@@ -182,7 +187,7 @@ impl<'a> Renderer<'a> {
         let mut prev: Option<Vec<effectcraft_geom::Vec2>> = None;
         let mut travel = vec![0.0f64; corners.len()];
         for i in 0..PROBES {
-            let m = self.buf_matrix_at(ctx, layer, buf, sh.offset(i, PROBES));
+            let m = self.buf_matrix_at(ctx, layer, buf, sh.offset(i, PROBES), mo);
             let pts: Vec<_> = corners.iter().map(|&(x, y)| m.apply(vec2(x, y))).collect();
             if let Some(p) = &prev {
                 for (k, (a, b)) in p.iter().zip(&pts).enumerate() {
@@ -195,7 +200,46 @@ impl<'a> Renderer<'a> {
     }
 }
 
-/// Convenience: render one frame of a comp with no footage source.
+/// A layer's layer → (top-level) comp matrices during one draw, at rest and at each shutter
+/// offset. Drawing a layer asks for them several times (the sample count probes the shutter, then
+/// every sub-sample is placed; styles place each pass; the changed region measures them again),
+/// and each one evaluates the layer's and its parents' transforms: the memo evaluates each once.
+/// The matrices don't depend on the buffer, so every buffer of the draw shares them.
+#[derive(Default)]
+pub(crate) struct MotionMemo {
+    still: Cell<Option<Mat3>>,
+    at: Cell<HashMap<u64, Mat3>>,
+}
+
+impl MotionMemo {
+    /// The matrix at rest (the frame time).
+    pub(crate) fn still(&self, f: impl FnOnce() -> Mat3) -> Mat3 {
+        if let Some(m) = self.still.get() {
+            return m;
+        }
+        let m = f();
+        self.still.set(Some(m));
+        m
+    }
+
+    /// The matrix `dt` seconds into the shutter.
+    pub(crate) fn at(&self, dt: f64, f: impl FnOnce() -> Mat3) -> Mat3 {
+        let mut map = self.at.take();
+        let m = *map.entry(dt.to_bits()).or_insert_with(f);
+        self.at.set(map);
+        m
+    }
+
+    /// Matrices evaluated so far (tests).
+    #[cfg(test)]
+    pub(crate) fn evaluated(&self) -> usize {
+        let map = self.at.take();
+        let n = map.len() + self.still.get().is_some() as usize;
+        self.at.set(map);
+        n
+    }
+}
+
 /// Adaptive motion-blur sample count for a layer whose corners travel `travel` output pixels
 /// during the shutter: one sample per pixel, clamped to Samples Per Frame … Adaptive Sample Limit.
 pub fn adaptive_samples(travel: f64, per_frame: u32, limit: u32) -> usize {
