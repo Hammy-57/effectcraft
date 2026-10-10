@@ -107,6 +107,51 @@ pub fn available(bridge: bool) -> impl Iterator<Item = &'static ToolDef> {
 /// shortcuts, Open Recent…) or call control-channel methods directly, past the command checks.
 const UNCONFINED_ONLY: &[&str] = &["control", "ui_click", "ui_drag", "ui_key", "ui_type", "ui_set", "script_ui"];
 
+/// The JSON Schema of a tool's `structuredContent` (MCP 2025-06-18 `outputSchema`), for tools
+/// whose result shape is stable. Clients that negotiated 2025-06-18+ get every JSON result as
+/// `structuredContent` too ([`structured`]); only these declare its shape.
+pub fn output_schema(name: &str) -> Option<Value> {
+    let object = |props: Value, required: &[&str]| json!({"type": "object", "properties": props, "required": required});
+    let int = json!({"type": "integer"});
+    Some(match name {
+        "get_state" => object(json!({"state": {"type": "object"}, "app": {"type": "object"}}), &["state", "app"]),
+        "doc_inspect" => object(json!({"project": {"type": "object"}, "activeComp": {"type": ["object", "null"]}}), &["project", "activeComp"]),
+        "render_preview" | "render_frame" => object(
+            json!({
+                "comp": {"type": ["integer", "string", "null"], "description": "Composition id."},
+                "time": {"type": "number", "description": "Comp time in seconds."},
+                "width": int, "height": int,
+                "path": {"type": "string", "description": "Where the PNG was written (with `path`)."}
+            }),
+            &["comp", "time", "width", "height"],
+        ),
+        "undo" | "redo" => object(json!({"steps": int, "undoStack": {"type": "array", "items": {"type": "string"}}}), &["steps", "undoStack"]),
+        "history" => {
+            object(json!({"states": {"type": "array", "items": {"type": "object"}}, "current": {"type": ["integer", "null"]}, "branches": int}), &["states"])
+        }
+        "command_batch" => object(
+            json!({
+                "completed": int, "failed": int,
+                "results": {"type": "array", "items": object(json!({"ok": {"type": "boolean"}, "result": {}, "error": {"type": "string"}}), &["ok"])}
+            }),
+            &["completed", "failed", "results"],
+        ),
+        "batch" => object(json!({"steps": int, "results": {"type": "array"}}), &["steps", "results"]),
+        "save_project" => object(json!({"path": {"type": ["string", "null"]}, "dirty": {"type": "boolean"}}), &["path", "dirty"]),
+        _ => return None,
+    })
+}
+
+/// A JSON result as MCP `structuredContent`, which must be an object: arrays become
+/// `{"items": [...]}`, other values `{"value": v}`.
+pub fn structured(v: Value) -> Value {
+    match v {
+        Value::Object(_) => v,
+        Value::Array(_) => json!({"items": v}),
+        other => json!({"value": other}),
+    }
+}
+
 /// Run a tool by name.
 pub fn run(b: &mut Backend, name: &str, args: &Value) -> Result<Reply> {
     let t = find(name).ok_or_else(|| Error::BadArgs(format!("unknown tool `{name}`")))?;
