@@ -111,92 +111,159 @@ fn prop(l: &mut Layer, path: &str, v: KV) {
     }
 }
 
-/// Bytes of a payload image: `{path}`, `{png: base64}`, a data URL or a plain path.
-fn payload_png(s: &Session, v: &Value) -> std::result::Result<Vec<u8>, String> {
-    let read = |p: &str| s.services.read_file(p).map_err(|e| format!("cannot read {p}: {e}"));
-    match v {
-        Value::String(x) if x.starts_with("data:") => fetch::base64_decode(x),
-        Value::String(x) => read(x),
-        Value::Object(o) => match (o.get("path").and_then(Value::as_str), o.get("png").or_else(|| o.get("base64")).and_then(Value::as_str)) {
-            (Some(p), _) => read(p),
-            (None, Some(b)) => fetch::base64_decode(b),
-            _ => Err("image entry needs `path` or `png`".into()),
-        },
-        _ => Err("bad image entry".into()),
+/// A rendered image's file format. PDF is the default (EffectCraft draws it as vector footage,
+/// sharp at any scale); PNG is the fallback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Fmt {
+    Pdf,
+    Png,
+}
+
+impl Fmt {
+    fn ext(self) -> &'static str {
+        match self {
+            Fmt::Pdf => "pdf",
+            Fmt::Png => "png",
+        }
+    }
+    fn sniff(b: &[u8]) -> Option<Fmt> {
+        if b.starts_with(b"%PDF-") {
+            Some(Fmt::Pdf)
+        } else if b.starts_with(b"\x89PNG\r\n\x1a\n") {
+            Some(Fmt::Png)
+        } else {
+            None
+        }
     }
 }
 
-/// PNG bytes for every planned image, in plan order.
-fn raster_bytes(s: &Session, plan: &Plan, src: &Source, scale: f64, notes: &mut Vec<String>) -> Vec<Option<Vec<u8>>> {
-    let mut out: Vec<Option<Vec<u8>>> = vec![None; plan.rasters.len()];
+/// The candidates of a payload image entry, PDF first: `{pdf: base64}`, `{pdfPath}`, `{png:
+/// base64}`, `{path}` (PDF or PNG, by content), a data URL or a plain path, and `fallback` (another
+/// entry tried after these).
+fn entry_candidates(s: &Session, v: &Value, depth: usize, out: &mut Vec<std::result::Result<Vec<u8>, String>>) {
+    let read = |p: &str| s.services.read_file(p).map_err(|e| format!("cannot read {p}: {e}"));
+    match v {
+        Value::String(x) if x.starts_with("data:") => out.push(fetch::base64_decode(x)),
+        Value::String(x) => out.push(read(x)),
+        Value::Object(o) => {
+            let before = out.len();
+            if let Some(b) = o.get("pdf").and_then(Value::as_str) {
+                out.push(fetch::base64_decode(b));
+            }
+            if let Some(p) = o.get("pdfPath").and_then(Value::as_str) {
+                out.push(read(p));
+            }
+            if let Some(p) = o.get("path").and_then(Value::as_str) {
+                out.push(read(p));
+            }
+            if let Some(b) = o.get("png").or_else(|| o.get("base64")).and_then(Value::as_str) {
+                out.push(fetch::base64_decode(b));
+            }
+            if let Some(f) = o.get("fallback").filter(|_| depth < 4) {
+                entry_candidates(s, f, depth + 1, out);
+            }
+            if out.len() == before {
+                out.push(Err("image entry needs `pdf`, `pdfPath`, `path` or `png`".into()));
+            }
+        }
+        _ => out.push(Err("bad image entry".into())),
+    }
+}
+
+/// Every planned image's candidates (bytes or why not), PDF ones first.
+type Candidates = Vec<std::result::Result<Vec<u8>, String>>;
+
+fn raster_candidates(s: &Session, plan: &Plan, src: &Source, scale: f64, notes: &mut Vec<String>) -> Vec<Candidates> {
+    let mut out: Vec<Candidates> = vec![vec![]; plan.rasters.len()];
     let mut want = vec![];
     for (i, r) in plan.rasters.iter().enumerate() {
         match src.images.get(&r.node_id) {
-            Some(v) => match payload_png(s, v) {
-                Ok(b) => out[i] = Some(b),
-                Err(e) => notes.push(format!("{}: image not imported ({e})", r.name)),
-            },
+            Some(v) => {
+                if let Some(slot) = out.get_mut(i) {
+                    entry_candidates(s, v, 0, slot);
+                    // PDFs first, whatever the entry's order.
+                    slot.sort_by_key(|c| !matches!(c, Ok(b) if Fmt::sniff(b) == Some(Fmt::Pdf)));
+                }
+            }
             None if src.rest.is_some() => want.push(i),
             None => notes.push(format!("{}: no image in the payload ({}), skipped", r.name, r.reason)),
         }
     }
     if let (Some((base, key, token)), false) = (&src.rest, want.is_empty()) {
         let ids: Vec<String> = want.iter().filter_map(|i| plan.rasters.get(*i).map(|r| r.node_id.clone())).collect();
-        match fetch::images(base, key, &ids, scale, token) {
-            Ok(got) => {
-                for (id, r) in got {
-                    let Some(i) = want.iter().copied().find(|i| plan.rasters.get(*i).is_some_and(|x| x.node_id == id)) else { continue };
-                    match r {
-                        Ok(b) => {
-                            if let Some(slot) = out.get_mut(i) {
-                                *slot = Some(b);
-                            }
+        // PDF renders, then PNG for every image (the fallback when a PDF fails to import).
+        for fmt in [Fmt::Pdf, Fmt::Png] {
+            match fetch::images(base, key, &ids, scale, token, fmt.ext()) {
+                Ok(got) => {
+                    for (id, r) in got {
+                        let Some(i) = want.iter().copied().find(|i| plan.rasters.get(*i).is_some_and(|x| x.node_id == id)) else { continue };
+                        if let Some(slot) = out.get_mut(i) {
+                            slot.push(r);
                         }
-                        Err(e) => notes.push(format!("{}: image not imported ({e})", plan.rasters.get(i).map(|r| r.name.as_str()).unwrap_or(&id))),
                     }
                 }
+                Err(e) => notes.push(format!("{} renders not fetched: {e}", fmt.ext().to_uppercase())),
             }
-            Err(e) => notes.push(format!("images not imported: {e}")),
         }
     }
     out
 }
 
-fn is_png(b: &[u8]) -> bool {
-    b.starts_with(b"\x89PNG\r\n\x1a\n")
-}
-
-/// Write and import the images; each import is its own step until [`fold`].
-fn import_rasters(s: &mut Session, plan: &Plan, src: &Source, scale: f64, notes: &mut Vec<String>) -> Vec<Option<ItemId>> {
-    let bytes = raster_bytes(s, plan, src, scale, notes);
+/// Write and import the images, PDF first and PNG when that fails; each import is its own step
+/// until [`fold`]. Per image: the footage item and the format used.
+fn import_rasters(s: &mut Session, plan: &Plan, src: &Source, scale: f64, notes: &mut Vec<String>) -> Vec<Option<(ItemId, Fmt)>> {
+    let cands = raster_candidates(s, plan, src, scale, notes);
     let dir = s.figma_assets_dir(&src.label);
     let mut items = vec![None; plan.rasters.len()];
-    if bytes.iter().all(Option::is_none) {
+    if cands.iter().all(Vec::is_empty) {
         return items;
     }
     if let Err(e) = std::fs::create_dir_all(&dir) {
         notes.push(format!("images not imported: cannot create {} ({e})", dir.display()));
         return items;
     }
-    for (i, b) in bytes.into_iter().enumerate() {
-        let (Some(b), Some(r)) = (b, plan.rasters.get(i)) else { continue };
-        if !is_png(&b) {
-            notes.push(format!("{}: the image is not a PNG, skipped", r.name));
+    for (i, list) in cands.into_iter().enumerate() {
+        let Some(r) = plan.rasters.get(i) else { continue };
+        if list.is_empty() {
             continue;
         }
         let safe: String = r.node_id.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).take(60).collect();
         let nm: String = r.name.chars().filter(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '_')).take(40).collect();
-        let path = dir.join(format!("{} {safe}.png", nm.trim())).to_string_lossy().into_owned();
-        if let Err(e) = s.services.write_file(&path, &b) {
-            notes.push(format!("{}: cannot write {path} ({e})", r.name));
-            continue;
+        let mut why = vec![];
+        for c in list {
+            let b = match c {
+                Ok(b) => b,
+                Err(e) => {
+                    why.push(e);
+                    continue;
+                }
+            };
+            let Some(fmt) = Fmt::sniff(&b) else {
+                why.push("not a PDF or PNG".into());
+                continue;
+            };
+            let path = dir.join(format!("{} {safe}.{}", nm.trim(), fmt.ext())).to_string_lossy().into_owned();
+            if let Err(e) = s.services.write_file(&path, &b) {
+                why.push(format!("cannot write {path} ({e})"));
+                continue;
+            }
+            match crate::commands::file::import(s, &json!({"paths": [path]})) {
+                Ok(v) => match v["items"].get(0).and_then(Value::as_u64) {
+                    Some(id) => {
+                        items[i] = Some((ItemId(id), fmt));
+                        break;
+                    }
+                    None => {
+                        why.push(format!("{} import failed: {}", fmt.ext().to_uppercase(), v["errors"].get(0).and_then(Value::as_str).unwrap_or("no item")))
+                    }
+                },
+                Err(e) => why.push(format!("{} import failed: {e}", fmt.ext().to_uppercase())),
+            }
         }
-        match crate::commands::file::import(s, &json!({"paths": [path]})) {
-            Ok(v) => match v["items"].get(0).and_then(Value::as_u64) {
-                Some(id) => items[i] = Some(ItemId(id)),
-                None => notes.push(format!("{}: image not imported ({})", r.name, v["errors"].get(0).and_then(Value::as_str).unwrap_or("import failed"))),
-            },
-            Err(e) => notes.push(format!("{}: image not imported ({e})", r.name)),
+        match items[i] {
+            None => notes.push(format!("{}: image not imported ({})", r.name, why.join("; "))),
+            Some((_, Fmt::Png)) if !why.is_empty() => notes.push(format!("{}: PNG used ({})", r.name, why.join("; "))),
+            Some(_) => {}
         }
     }
     items
@@ -209,7 +276,7 @@ fn make_layer(
     pl: &PLayer,
     comp_items: &[Option<ItemId>],
     comp_dims: &[(u32, u32)],
-    rasters: &[Option<ItemId>],
+    rasters: &[Option<(ItemId, Fmt)>],
     dur: Tick,
 ) -> Option<Layer> {
     let (source, size, ldur) = match &pl.kind {
@@ -218,7 +285,7 @@ fn make_layer(
         PKind::Null => (LayerSource::Null, (100, 100), None),
         PKind::Precomp(i) => (LayerSource::Comp { item: (*comp_items.get(*i)?)? }, *comp_dims.get(*i)?, Some(dur)),
         PKind::Raster(i) => {
-            let item = (*rasters.get(*i)?)?;
+            let (item, _) = (*rasters.get(*i)?)?;
             let (w, h) = match &proj.item(item)?.kind {
                 ItemKind::Footage(f) => (f.width, f.height),
                 _ => return None,
@@ -231,7 +298,7 @@ fn make_layer(
     let mut anchor = pl.anchor;
     let mut scale = pl.scale;
     if let PKind::Raster(_) = &pl.kind {
-        // The PNG is the node's box at `scale`×: fit it back to the box.
+        // The image covers the node's box (a PNG at `scale`×, a PDF at 1×): fit it back to the box.
         let (iw, ih) = (size.0.max(1) as f64, size.1.max(1) as f64);
         anchor = [iw / 2.0, ih / 2.0];
         scale = [scale[0] * (pl.anchor[0] * 2.0) / iw, scale[1] * (pl.anchor[1] * 2.0) / ih];
@@ -243,6 +310,12 @@ fn make_layer(
     prop(&mut l, "transform/opacity", KV::Scalar(pl.opacity));
     l.blend_mode = pl.blend;
     l.switches.video = pl.visible && !pl.is_matte;
+    // PDF renders are vector footage: Continuously Rasterize keeps them sharp when scaled.
+    if let PKind::Raster(i) = &pl.kind
+        && let Some(Some((_, Fmt::Pdf))) = rasters.get(*i)
+    {
+        l.switches.collapse = true;
+    }
     let mut ids = Ids(&mut proj.next_id);
     match &pl.kind {
         PKind::Shape(contents) => {
@@ -311,7 +384,7 @@ pub(super) fn run(s: &mut Session, plan: Plan, src: &Source, scale: f64, cfg: &S
             comp_items[i] = Some(proj.add_item(&pc.name, Label::Sandstone, parent, ItemKind::Comp(c.into())));
         }
         if let Some(f) = folder {
-            for it in raster_items.iter().flatten() {
+            for (it, _) in raster_items.iter().flatten() {
                 if let Some(item) = proj.items.get_mut(it) {
                     item.parent = Some(f);
                 }
@@ -396,7 +469,7 @@ pub(super) fn run(s: &mut Session, plan: Plan, src: &Source, scale: f64, cfg: &S
         "layers": top_layers.iter().map(|l| l.0).collect::<Vec<_>>(),
         "native": native,
         "images": images,
-        "rasterized": plan.rasters.iter().zip(&rasters).map(|(r, it)| json!({"node": r.node_id, "name": r.name, "reason": r.reason, "item": it.map(|i| i.0)})).collect::<Vec<_>>(),
+        "rasterized": plan.rasters.iter().zip(&rasters).map(|(r, it)| json!({"node": r.node_id, "name": r.name, "reason": r.reason, "item": it.map(|(i, _)| i.0), "format": it.map(|(_, f)| f.ext())})).collect::<Vec<_>>(),
         "notes": notes,
     }))
 }

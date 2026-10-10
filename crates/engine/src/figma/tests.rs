@@ -358,8 +358,11 @@ fn rest_path_against_a_fake_api() {
     assert!(heads[0].starts_with(&format!("GET /v1/files/{key}/nodes?ids=1%3A2&geometry=paths")), "{heads:?}");
     assert!(heads.iter().all(|h| h.contains("X-Figma-Token: figd_test-token")), "token sent to the API");
     assert!(heads.iter().any(|h| h.contains("/v1/images/") && h.contains("scale=2") && h.contains("use_absolute_bounds=true")));
+    // PDF renders first, then PNG (the fallback).
+    assert!(heads.iter().any(|h| h.contains("/v1/images/") && h.contains("format=pdf")), "{heads:?}");
+    assert!(heads.iter().any(|h| h.contains("/v1/images/") && h.contains("format=png")), "{heads:?}");
     let img_heads = img_log.lock().unwrap().clone();
-    assert_eq!(img_heads.len(), 1);
+    assert_eq!(img_heads.len(), 2);
     assert!(!img_heads[0].contains("X-Figma-Token"), "image links get no token");
     // The image was downloaded (this bare session has no media importer, so it stops there).
     let notes: Vec<&str> = r["notes"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
@@ -374,4 +377,77 @@ fn rest_path_against_a_fake_api() {
         .unwrap_err()
         .to_string();
     assert!(e.contains("apiBase"), "{e}");
+}
+
+#[test]
+fn image_bounds_render_moves_the_image_box() {
+    let mut nodes = vec![json!({"id": "1:1", "type": "FRAME", "children": [
+        {"id": "1:2", "type": "GROUP", "absoluteBoundingBox": {"x": 10, "y": 10, "width": 100, "height": 20},
+         "absoluteRenderBounds": {"x": 2, "y": 6, "width": 116, "height": 36}},
+        {"id": "1:3", "type": "RECTANGLE", "absoluteBoundingBox": {"x": 0, "y": 0, "width": 5, "height": 5}},
+        {"id": "1:4", "type": "RECTANGLE", "absoluteBoundingBox": {"x": 0, "y": 0, "width": 5, "height": 5}}
+    ]})];
+    let images = json!({
+        "1:2": {"path": "/x.png", "bounds": "render"},
+        "1:3": {"path": "/y.png", "bounds": {"x": 1, "y": 2, "width": 3, "height": 4}},
+        "1:4": {"path": "/z.png", "bounds": {"x": "bad"}}
+    });
+    super::image_bounds(&mut nodes, images.as_object().unwrap(), 0);
+    let c = &nodes[0]["children"];
+    assert_eq!(c[0]["absoluteBoundingBox"]["width"], 116);
+    assert_eq!(c[1]["absoluteBoundingBox"]["height"], 4);
+    assert_eq!(c[2]["absoluteBoundingBox"]["width"], 5, "malformed bounds are ignored");
+    // A node with an image entry comes in as that image, marked or not.
+    for n in c.as_array().unwrap() {
+        assert!(super::has_image_fill(n), "{n}");
+    }
+    let plan = map::plan(&nodes, &map::Options { target: map::Target::NewComp });
+    assert_eq!(plan.summary()["rasterized"].as_array().map(Vec::len), Some(3));
+}
+
+/// The plug-in (`code.js`) carries `serialize.js` verbatim: one serializer for the plug-in and
+/// the Figma MCP route. Regenerate with `integrations/figma/build-plugin.sh`.
+#[test]
+fn plugin_embeds_the_shared_serializer() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../integrations/figma");
+    let ser = std::fs::read_to_string(root.join("serialize.js")).unwrap();
+    let code = std::fs::read_to_string(root.join("plugin/code.js")).unwrap();
+    assert!(code.contains(ser.trim()), "plugin/code.js is out of date: run integrations/figma/build-plugin.sh");
+}
+
+#[test]
+fn payload_parts_resolve_refs() {
+    let mut nodes = vec![json!({"id": "1:1", "type": "FRAME", "children": [{"$ref": "1:2"}, {"id": "1:5", "type": "RECTANGLE"}]})];
+    let mut frags = json!({"1:2": {"id": "1:2", "type": "GROUP", "children": [{"$ref": "1:3"}]}, "1:3": {"id": "1:3", "type": "TEXT"}});
+    super::resolve_refs(&mut nodes, frags.as_object_mut().unwrap(), 0).unwrap();
+    assert_eq!(nodes[0]["children"][0]["children"][0]["type"], "TEXT");
+    // A missing part is an error that names the node.
+    let mut nodes = vec![json!({"id": "1:1", "children": [{"$ref": "9:9"}]})];
+    let e = super::resolve_refs(&mut nodes, &mut serde_json::Map::new(), 0).unwrap_err();
+    assert!(e.contains("9:9"), "{e}");
+    // A self-referencing fragment can't loop.
+    let mut nodes = vec![json!({"$ref": "1:1"})];
+    let mut frags = json!({"1:1": {"id": "1:1", "children": [{"$ref": "1:1"}]}});
+    assert!(super::resolve_refs(&mut nodes, frags.as_object_mut().unwrap(), 0).is_err());
+}
+
+#[test]
+fn import_from_payload_parts() {
+    let dir = std::env::temp_dir().join(format!("ec-figma-parts-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut root = card();
+    // Cut the card's first child out into a second part.
+    let first = root["nodes"]["1:2"]["document"]["children"][0].clone();
+    let id = first["id"].as_str().unwrap().to_string();
+    root["nodes"]["1:2"]["document"]["children"][0] = json!({"$ref": id});
+    let (a, b) = (dir.join("a.json"), dir.join("b.json"));
+    std::fs::write(&a, root.to_string()).unwrap();
+    std::fs::write(&b, json!({"fragments": {id.clone(): first}}).to_string()).unwrap();
+    let mut s = Session::new();
+    let whole = s.execute_checked("file.importFigma", json!({"payload": card(), "dryRun": true})).unwrap();
+    let parts = s.execute_checked("file.importFigma", json!({"payloadPaths": [a.to_string_lossy(), b.to_string_lossy()], "dryRun": true})).unwrap();
+    assert_eq!(whole, parts);
+    let e = s.execute_checked("file.importFigma", json!({"payloadPaths": [a.to_string_lossy()], "dryRun": true})).unwrap_err().to_string();
+    assert!(e.contains(&id), "{e}");
+    let _ = std::fs::remove_dir_all(&dir);
 }

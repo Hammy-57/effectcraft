@@ -10,7 +10,9 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::Sender;
+#[cfg(test)]
+use std::sync::mpsc::channel;
 use std::time::Duration;
 
 use effectcraft_ui_egui::ControlRequest;
@@ -22,18 +24,18 @@ pub const MAX_LINE: usize = 4 * 1024 * 1024;
 /// Connections served at once; further ones get an error line and are closed.
 pub const MAX_CONNECTIONS: usize = 16;
 
-pub fn start(port: u16, ctx: egui::Context) -> Receiver<ControlRequest> {
-    let (tx, rx) = channel::<ControlRequest>();
+/// Listen on `127.0.0.1:port`, sending requests into `tx` (the app's control queue, shared with
+/// the Figma bridge).
+pub fn start(port: u16, ctx: egui::Context, tx: Sender<ControlRequest>) {
     let listener = match TcpListener::bind(("127.0.0.1", port)) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("effectcraft: control server failed to bind 127.0.0.1:{port}: {e}");
-            return rx;
+            return;
         }
     };
     eprintln!("effectcraft: control server listening on 127.0.0.1:{port}");
     std::thread::spawn(move || accept_loop(listener, tx, ctx));
-    rx
 }
 
 fn accept_loop(listener: TcpListener, tx: Sender<ControlRequest>, ctx: egui::Context) {

@@ -35,6 +35,7 @@ pub mod preview;
 pub mod psd_import;
 pub mod remote;
 pub mod render_queue;
+pub mod replay;
 pub mod roto;
 pub mod scriptui;
 pub mod sequence;
@@ -462,6 +463,9 @@ pub struct Session {
     /// The JavaScript scripting engine (set by the host that links `effectcraft-script`):
     /// `script.run`, File ▸ Scripts ▸ Run Script File… (`.jsx`/`.js`) and the Script Console.
     pub script: Option<ScriptRunner>,
+    /// Stops the script that runs next (set by `script.run {timeout}` and by hosts that cancel
+    /// scripts, e.g. MCP `notifications/cancelled`); see [`ScriptInterrupt`].
+    pub script_interrupt: Option<ScriptInterrupt>,
     /// Loads WebAssembly effect plug-ins (set by the host that links `effectcraft-plugin` with
     /// its runtime): `effect.plugins.load`.
     pub plugin_loader: Option<PluginLoader>,
@@ -512,6 +516,37 @@ pub struct ScriptRequest<'a> {
     pub name: &'a str,
     /// Run in the Script Console's persistent context (variables survive between runs).
     pub console: bool,
+}
+
+/// Stops a running script from outside: a cancel flag another thread sets and/or a deadline. The
+/// scripting runtime checks it between batches of bytecode and in every object-model call, and
+/// then ends the script with an error that `try`/`catch` can't intercept.
+#[derive(Clone, Debug, Default)]
+pub struct ScriptInterrupt {
+    pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// When the time limit runs out (with the limit in seconds, for the message).
+    pub deadline: Option<(web_time::Instant, f64)>,
+}
+
+impl ScriptInterrupt {
+    /// A time limit of `seconds` from now (`None` for no limit, or a limit that is not a
+    /// positive finite number).
+    pub fn with_limit(mut self, seconds: Option<f64>) -> Self {
+        self.deadline = seconds
+            .filter(|s| s.is_finite() && *s > 0.0)
+            .and_then(|s| Some((web_time::Instant::now().checked_add(std::time::Duration::try_from_secs_f64(s).ok()?)?, s)));
+        self
+    }
+    /// Why the script must stop now, if it must.
+    pub fn stopped(&self) -> Option<String> {
+        if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Some("the script was cancelled".into());
+        }
+        match self.deadline {
+            Some((at, s)) if web_time::Instant::now() >= at => Some(format!("the script ran longer than its time limit ({s} s)")),
+            _ => None,
+        }
+    }
 }
 
 /// Runs a script against the session and reports `{ok, result, output, error: {message, line,
@@ -568,6 +603,7 @@ impl Default for Session {
             autosave_folder_override: None,
             snapshot: None,
             script: None,
+            script_interrupt: None,
             plugin_loader: None,
             script_ui: scriptui::ScriptUi::default(),
             sys_memory: None,
@@ -606,10 +642,15 @@ impl Session {
                 return Err(EngineError::Disabled(id.to_string(), why));
             }
         }
-        // Last-resort guard: a panicking command reports an error instead of crashing the app.
-        let r = guard::guarded(&format!("command `{id}`"), || (spec.run)(self, &params))?;
+        // Last-resort guard: a panicking command reports an error instead of crashing the app
+        // (and saves a repro of the steps that led there, see `replay::after_command`).
+        let nesting = replay::Nesting::enter(spec.journal);
+        let caught = guard::caught();
+        let r = guard::guarded(&format!("command `{id}`"), || (spec.run)(self, &params));
+        let r = replay::after_command(self, id, &params, &nesting, caught, r)?;
         self.learn_observe(id, &params);
-        if spec.journal {
+        // Commands run by a journaled command (a script's steps) replay with it, not again.
+        if spec.journal && !nesting.inside_journaled() {
             self.journal.push((id.to_string(), params));
             if self.journal.len() > 10_000 {
                 self.journal.drain(..1000);

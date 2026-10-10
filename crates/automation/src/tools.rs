@@ -317,8 +317,13 @@ fn run_script(b: &mut Backend, a: &Value) -> Result<Reply> {
     if let Some(n) = get(a, "name") {
         p["name"] = n.clone();
     }
+    // A time limit by default, so a runaway loop can't hold the session forever; 0 = none.
+    p["timeout"] = get(a, "timeout").cloned().unwrap_or(json!(SCRIPT_TIMEOUT));
     json_reply(b.exec("script.run", p)?)
 }
+
+/// The default `run_script` time limit, in seconds.
+pub const SCRIPT_TIMEOUT: f64 = 300.0;
 
 fn get_project(b: &mut Backend, _: &Value) -> Result<Reply> {
     json_reply(b.exec("project.summary", json!({}))?)
@@ -623,13 +628,14 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "run_script",
-        description: "Run JavaScript with an After Effects-style scripting object model (app, app.project, items.addComp, comp.layers.addSolid/addText/addShape/addNull/addCamera/addLight, layer.property(\"ADBE Transform Group\").property(\"ADBE Position\").setValueAtTime(t, v), Effects.addProperty(\"ADBE Gaussian Blur 2\"), expressions, markers, renderQueue…). Every edit is an undoable engine command; app.beginUndoGroup/endUndoGroup make one undo step. Returns {ok, result (last expression value), output (writeLn/$.writeln/alert text), error: {message, line, column} | null}. File access is limited to the project folder unless the user allows scripts to write files.",
+        description: "Run JavaScript with an After Effects-style scripting object model (app, app.project, items.addComp, comp.layers.addSolid/addText/addShape/addNull/addCamera/addLight, layer.property(\"ADBE Transform Group\").property(\"ADBE Position\").setValueAtTime(t, v), Effects.addProperty(\"ADBE Gaussian Blur 2\"), expressions, markers, renderQueue…). Every edit is an undoable engine command; app.beginUndoGroup/endUndoGroup make one undo step. Returns {ok, result (last expression value), output (writeLn/$.writeln/alert text), error: {message, line, column} | null}. Stops after `timeout` seconds (default 300, 0 = no limit) or on MCP notifications/cancelled (an open undo group is rolled back; other edits are kept). File access is limited to the project folder unless the user allows scripts to write files.",
         bridge_only: false,
         schema: || {
             schema(
                 json!({
                     "code": {"type": "string", "description": "JavaScript source, e.g. `var c = app.project.items.addComp(\"Main\", 1920, 1080, 1, 5, 30); c.layers.addText(\"Hi\"); c.numLayers`."},
-                    "name": {"type": "string", "description": "Script name used in error messages (default `script`)."}
+                    "name": {"type": "string", "description": "Script name used in error messages (default `script`)."},
+                    "timeout": {"type": "number", "minimum": 0, "description": "Stop the script after this many seconds (default 300; 0 = no limit)."}
                 }),
                 &["code"],
             )

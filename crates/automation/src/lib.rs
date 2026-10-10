@@ -19,6 +19,7 @@ mod autosave;
 pub mod backend;
 pub mod base64;
 pub mod bridge;
+pub mod figma_bridge;
 mod long_job;
 mod notify;
 mod prompts;
