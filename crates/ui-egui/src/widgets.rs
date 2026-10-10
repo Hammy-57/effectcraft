@@ -172,6 +172,11 @@ pub fn icon_toggle(ui: &mut Ui, rect: Rect, icon: Icon, on: bool, t: &Tokens, id
 
 /// Icon button (toolbar style) with optional active state.
 pub fn icon_button(ui: &mut Ui, rect: Rect, icon: Icon, active: bool, t: &Tokens, id: egui::Id) -> Response {
+    icon_button_local(ui, rect, icon, None, active, t, id)
+}
+
+/// [`icon_button`] showing the owner-local artwork `local` when it is present, else `icon`.
+pub fn icon_button_local(ui: &mut Ui, rect: Rect, icon: Icon, local: Option<&str>, active: bool, t: &Tokens, id: egui::Id) -> Response {
     let resp = ui.interact(rect, id, Sense::click());
     if active {
         ui.painter().rect_filled(rect, 4.0, t.accent);
@@ -185,7 +190,10 @@ pub fn icon_button(ui: &mut Ui, rect: Rect, icon: Icon, active: bool, t: &Tokens
     } else {
         t.icon
     };
-    icons::paint(ui.painter(), rect.shrink(rect.width() * 0.22), icon, col);
+    let inner = rect.shrink(rect.width() * 0.22);
+    if !local.is_some_and(|name| crate::local_assets::paint(ui.painter(), inner, name, col)) {
+        icons::paint(ui.painter(), inner, icon, col);
+    }
     resp
 }
 

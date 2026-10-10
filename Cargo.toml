@@ -59,7 +59,9 @@ gif = "0.14"
 proptest = "1"
 
 # scripting (expressions)
-boa_engine = { version = "0.22", default-features = false }
+# annex-b: the legacy builtins ExtendScript and AE expressions rely on (String.prototype.substr,
+# escape/unescape…).
+boa_engine = { version = "0.22", default-features = false, features = ["annex-b"] }
 # WebAssembly effect plug-ins (sandboxed interpreter; MIT/Apache-2.0, pure Rust)
 wasmi = { version = "2", default-features = false, features = ["std", "validate", "wat", "deterministic", "portable-dispatch"] }
 

@@ -622,6 +622,10 @@ PropertyGroup.prototype.addProperty = function (name) {
     var p = { comp: L.__comp, layer: L.__id, kind: r.shape };
     if (r.group !== null && r.group !== undefined) p.group = r.group;
     uid = __call("layer.addShapeItem", p).uid;
+  } else if (r.kind === "dash") {
+    // Turn dashes on / add Dash 2, Gap 2… with the Dashes "+" until the property exists.
+    for (var i = 0; i < r.adds; i++) __call("shape.dashes.add", { comp: L.__comp, layer: L.__id, prop: r.stroke });
+    return this.property(r.target);
   } else if (r.kind === "animator") {
     uid = __call("layer.addTextAnimator", { comp: L.__comp, layer: L.__id, properties: [] }).animator;
   } else if (r.kind === "animatorProperty") {

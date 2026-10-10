@@ -162,6 +162,38 @@ const SHAPE_PROPS: &[(&str, &str, &str)] = &[
     ("stroke", "join", "ADBE Vector Stroke Line Join"),
     ("stroke", "miter", "ADBE Vector Stroke Miter Limit"),
     ("stroke", "dashes", "ADBE Vector Stroke Dashes"),
+    ("gfill", "blend", "ADBE Vector Blend Mode"),
+    ("gfill", "rule", "ADBE Vector Fill Rule"),
+    ("gfill", "type", "ADBE Vector Grad Type"),
+    ("gfill", "start", "ADBE Vector Grad Start Pt"),
+    ("gfill", "end", "ADBE Vector Grad End Pt"),
+    ("gfill", "highlightLength", "ADBE Vector Grad HiLite Length"),
+    ("gfill", "highlightAngle", "ADBE Vector Grad HiLite Angle"),
+    ("gfill", "colors", "ADBE Vector Grad Colors"),
+    ("gfill", "opacity", "ADBE Vector Fill Opacity"),
+    ("gstroke", "blend", "ADBE Vector Blend Mode"),
+    ("gstroke", "composite", "ADBE Vector Composite Order"),
+    ("gstroke", "type", "ADBE Vector Grad Type"),
+    ("gstroke", "start", "ADBE Vector Grad Start Pt"),
+    ("gstroke", "end", "ADBE Vector Grad End Pt"),
+    ("gstroke", "highlightLength", "ADBE Vector Grad HiLite Length"),
+    ("gstroke", "highlightAngle", "ADBE Vector Grad HiLite Angle"),
+    ("gstroke", "colors", "ADBE Vector Grad Colors"),
+    ("gstroke", "opacity", "ADBE Vector Stroke Opacity"),
+    ("gstroke", "width", "ADBE Vector Stroke Width"),
+    ("gstroke", "cap", "ADBE Vector Stroke Line Cap"),
+    ("gstroke", "join", "ADBE Vector Stroke Line Join"),
+    ("gstroke", "miter", "ADBE Vector Stroke Miter Limit"),
+    ("gstroke", "dashes", "ADBE Vector Stroke Dashes"),
+    ("gstroke", "taper", "ADBE Vector Stroke Taper"),
+    ("gstroke", "wave", "ADBE Vector Stroke Wave"),
+    ("dashes", "dash", "ADBE Vector Stroke Dash 1"),
+    ("dashes", "gap", "ADBE Vector Stroke Gap 1"),
+    ("dashes", "dash2", "ADBE Vector Stroke Dash 2"),
+    ("dashes", "gap2", "ADBE Vector Stroke Gap 2"),
+    ("dashes", "dash3", "ADBE Vector Stroke Dash 3"),
+    ("dashes", "gap3", "ADBE Vector Stroke Gap 3"),
+    ("dashes", "offset", "ADBE Vector Stroke Offset"),
     ("stroke", "taper", "ADBE Vector Stroke Taper"),
     ("stroke", "wave", "ADBE Vector Stroke Wave"),
     ("trim", "start", "ADBE Vector Trim Start"),
@@ -178,6 +210,33 @@ const SHAPE_PROPS: &[(&str, &str, &str)] = &[
     ("twist", "center", "ADBE Vector Twist Center"),
     ("merge", "mode", "ADBE Vector Merge Type"),
 ];
+
+/// A Repeater's Transform: its own match names, not a shape group's (`ADBE Vector Position`).
+pub const REPEATER_TRANSFORM: &[(&str, &str)] = &[
+    ("anchor", "ADBE Vector Repeater Anchor"),
+    ("position", "ADBE Vector Repeater Position"),
+    ("scale", "ADBE Vector Repeater Scale"),
+    ("rotation", "ADBE Vector Repeater Rotation"),
+    ("startOpacity", "ADBE Vector Repeater Opacity 1"),
+    ("endOpacity", "ADBE Vector Repeater Opacity 2"),
+];
+
+/// Our Dashes property for an After Effects dash match name (or display name), and how many
+/// dash levels it needs (1: Dash/Gap, 2: Dash 2/Gap 2, 3: Dash 3/Gap 3; Offset needs none).
+pub fn dash_target(name: &str) -> Option<(&'static str, usize)> {
+    let loose: String = name.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_ascii_lowercase();
+    let key = loose.strip_prefix("adbevectorstroke").unwrap_or(&loose);
+    Some(match key {
+        "dash1" | "dash" => ("dash", 1),
+        "gap1" | "gap" => ("gap", 1),
+        "dash2" => ("dash2", 2),
+        "gap2" => ("gap2", 2),
+        "dash3" => ("dash3", 3),
+        "gap3" => ("gap3", 3),
+        "offset" => ("offset", 0),
+        _ => return None,
+    })
+}
 
 /// Effects: our effect id → AE match name (the documented ones; the rest keep our id).
 pub const EFFECTS: &[(&str, &str)] = &[
@@ -424,6 +483,9 @@ pub fn node(chain: &[&Node]) -> String {
                     return "ADBE Vector Shape - Star".into();
                 }
                 return find(SHAPE_ITEMS, id).map(str::to_string).unwrap_or_else(own);
+            }
+            if pid == "transform" && grand.map(|g| g.match_id()) == Some("repeater") {
+                return find(REPEATER_TRANSFORM, id).map(str::to_string).unwrap_or_else(own);
             }
             if let Some((_, _, m)) = SHAPE_PROPS.iter().find(|(item, prop, _)| *item == pid && *prop == id) {
                 return m.to_string();
