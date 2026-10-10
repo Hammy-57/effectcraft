@@ -641,13 +641,29 @@ fn remove_masks(s: &mut Session, p: &Value, all: bool) -> Result<Value> {
 pub fn specs() -> Vec<CommandSpec> {
     vec![
         cmd!("mask.new", "New Mask from Points", [], None, "{layer?, vertices: [[x,y]…], inTangents?, outTangents?, closed?, mode?}", has_layers, new_mask),
-        cmd!("mask.addVertex", "Add Mask Vertex", [], None, "{layer?, mask, point: [x,y], in?, out?, index?}", has_layers, add_vertex),
-        cmd!("mask.setVertex", "Set Mask Vertex", [], None, "{layer?, mask, index, point?, in?, out?, merge?}", has_layers, set_vertex),
+        cmd!(
+            "mask.addVertex",
+            "Add Mask Vertex",
+            [],
+            None,
+            "{layer?, mask, point: [x,y], in?, out?, index? (0-based vertex to insert before; default the end)}",
+            has_layers,
+            add_vertex
+        ),
+        cmd!("mask.setVertex", "Set Mask Vertex", [], None, "{layer?, mask, index (0-based vertex), point?, in?, out?, merge?}", has_layers, set_vertex),
         cmd!("mask.setClosed", "Closed", ["Layer", "Mask and Shape Path"], None, "{layer?, mask, closed?}", has_layers, set_closed),
         cmd!("mask.selectVertices", "Select Mask Vertices", [], None, "{vertices: [{layer, mask, index}], add?, toggle?}", has_comp, select_vertices),
         cmd!("mask.moveVertices", "Move Mask Vertices", [], None, "{vertices?: [{layer, mask, index}], delta: [dx,dy], merge?}", has_vertices, move_vertices),
         cmd!("mask.deleteVertices", "Delete Mask Vertices", [], None, "{vertices?}", has_vertices, delete_vertices),
-        cmd!("mask.convertVertex", "Convert Vertex", [], None, "{layer?, mask: uid (mask or shape Path item), index, smooth?}", has_comp, convert_vertex),
+        cmd!(
+            "mask.convertVertex",
+            "Convert Vertex",
+            [],
+            None,
+            "{layer?, mask: uid (mask or shape Path item), index (0-based vertex), smooth?}",
+            has_comp,
+            convert_vertex
+        ),
         cmd!("mask.insertVertex", "Add Vertex", [], None, "{layer?, mask: uid (mask or shape Path item), segment, t?: 0..1}", has_comp, insert_vertex),
         cmd!(
             "mask.featherPoint.add",

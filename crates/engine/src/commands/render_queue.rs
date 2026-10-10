@@ -982,7 +982,7 @@ pub fn specs() -> Vec<CommandSpec> {
             can_add,
             add
         ),
-        cmd!("renderQueue.remove", "Remove from Render Queue", [], None, "{item?: id, index?: n}", has_items, remove),
+        cmd!("renderQueue.remove", "Remove from Render Queue", [], None, "{item?: id, index?: n (1-based)}", has_items, remove),
         cmd!("renderQueue.setRender", "Render Queue: Render Checkbox", [], None, "{item?|index?, render?: bool (toggles)}", has_items, set_render),
         cmd!(
             "renderQueue.setRenderSettings",

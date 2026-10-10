@@ -289,7 +289,11 @@ pub fn params_schema(spec: &CommandSpec) -> Value {
             if !optional && !required.contains(&k) {
                 required.push(k.clone());
             }
-            props.insert(k, serde_json::json!({"description": piece}));
+            let mut sch = serde_json::json!({"description": piece});
+            if let Some(t) = param_type(&k, &piece) {
+                sch["type"] = t;
+            }
+            props.insert(k, sch);
         }
     }
     serde_json::json!({
@@ -299,6 +303,33 @@ pub fn params_schema(spec: &CommandSpec) -> Value {
         "required": required,
         "additionalProperties": accepted_params(spec.params).is_none(),
     })
+}
+
+/// The JSON Schema `type` of parameter `key`, read from its piece of the params doc (`index
+/// (1-based)`, `add?: bool`, `layers: [id|name|#n]`, `time? (s)`); `None` when the doc doesn't say.
+/// Index-like keys are integers; their docs say whether they count from 0 or 1.
+fn param_type(key: &str, piece: &str) -> Option<Value> {
+    // The doc after this key (`time? (s) | frame? | timecode?` says nothing about `timecode`).
+    let rest = piece.strip_prefix(key).map(|r| r.trim_start_matches('?').trim_start()).unwrap_or("");
+    let value = rest.strip_prefix(':').map(str::trim).unwrap_or("");
+    let t = if key == "index" || key.ends_with("Index") {
+        serde_json::json!("integer")
+    } else if value.starts_with('[') {
+        serde_json::json!("array")
+    } else if value.starts_with('{') {
+        serde_json::json!("object")
+    } else if value.starts_with("bool") || rest.starts_with("(bool") {
+        serde_json::json!("boolean")
+    } else if ["layer", "comp", "item", "effect", "mask"].contains(&key) {
+        serde_json::json!(["integer", "string"])
+    } else if ["layers", "items", "keys", "effects"].contains(&key) {
+        serde_json::json!("array")
+    } else if key == "time" || rest.starts_with("(s)") || rest.starts_with("(comp s)") || rest.starts_with("(s,") {
+        serde_json::json!("number")
+    } else {
+        return None;
+    };
+    Some(t)
 }
 
 /// Keys every command understands (comp targeting, gesture merging) and accepted aliases.
