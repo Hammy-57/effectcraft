@@ -607,6 +607,28 @@ command on to `menus::engine` itself. Labels and default shortcuts of UI-only co
 `menus::UI_COMMANDS`: its order is observable (the shortcut table and the Keyboard Shortcuts
 editor follow it).
 
+### Docking and undocked panels
+
+The dock (`ui-egui/src/dock.rs` layout, `dock_ui.rs` drawing and tab drag-and-drop) is a tree of
+tab groups plus a list of undocked (floating) groups, `Layout { root, floating }`, which workspaces
+save. On the desktop each undocked group is an OS window of its own, as in After Effects, so it
+can go anywhere, a second monitor included (`ui-egui/src/float_windows.rs`): an egui immediate
+viewport per group, keyed by the group's stable `Floating::id`, titled after its shown panel, with
+the same tab strip and panel body as a docked group. Its position and size are written back every
+frame to `Floating::screen` (outer top-left and content size, screen points), so they survive
+workspace saves and relaunches; `Floating::rect` keeps the place relative to the main window, used
+for a new window and by the fallback. Older layouts without these fields load (`#[serde(default)]`).
+Closing the window closes its panels (as After Effects does); the panel menu's Dock Panel, the
+`window.*` commands and Window ▸ <panel> (which brings the window to the front) work as for any
+group. Shortcuts and the panel menu work in the window, and a tab dragged out of it lands where it
+is dropped, in the main window's dock or another undocked group (the window that has the pointer
+feeds it to the dock's drop logic). Where egui embeds viewports (`ctx.embed_viewports()`: the web,
+the headless test harness, the snapshot example and the offscreen `mcp --ui` app) undocked groups
+float inside the main window instead, unchanged. Automation elements drawn in an undocked window
+carry `window` (the group id), their rects are in its coordinates, and synthetic `ui.click` /
+`ui.drag` / `ui.scroll` input on them is delivered to that window (an egui plugin's input hook);
+`ui.screenshot` captures the main window only.
+
 Shared docs avoid the same collisions differently: [parity.md](parity.md)'s cells hold only the
 current state, and history is appended to the union-merged [parity-log.md](parity-log.md).
 

@@ -131,7 +131,7 @@ unsubscribes.
 | Method | Params | Result |
 |---|---|---|
 | `ui.inspect` | `{}` | Window size, pixels per point, fps, serialized `UiState`, playback, time, active comp, selection, open dialog, last render ms. |
-| `ui.elements` | `{prefix?}` | `[{id, label, rect: [x, y, w, h]}]`: the widgets drawn in the last frame, in points. |
+| `ui.elements` | `{prefix?}` | `[{id, label, rect: [x, y, w, h], window?}]`: the widgets drawn in the last frame, in points. On the desktop an undocked panel group is an OS window of its own: its widgets carry `window` (the group's id) and their rect is in that window's coordinates. |
 | `ui.set` | `{tool?, workspace?, theme?, focused?, viewer?, timeline?, menuBar?, home?}` | `viewer: {zoom (null = fit), res: Full\|Half\|Third\|Quarter\|Auto, pan: [x,y], grid, rulers, safeMargins, transparencyGrid}`; `timeline: {pps (null = fit), start, graphEditor, showModes, openLayers: [ids], openGroups: [uids]}`. |
 | `ui.panel.show` / `ui.panel.close` | `{panel}` | Panels: `Project`, `Composition`, `Timeline`, `EffectControls`, `EffectsPresets`, `Info`, `Preview`, `Character`, `Paragraph`, `Align` and others. |
 | `engine.execute` `window.*` (panel menu) | `{panel, comp?, rect?, stacked?, anchor?, zone?}` | The panel menu's items (≡ beside a tab name, or right-click a tab; automation ids `panelMenu.<key>`): `window.closePanel` (on a Timeline comp tab, `comp` closes that comp's Timeline), `window.floatPanel` (Undock Panel), `window.dockPanel` (with `anchor`/`zone`, or back to its usual place), `window.closeOtherPanels`, `window.closePanelGroup`, `window.floatPanelGroup`, `window.maximizePanel` (Maximize Panel Group, as `` ` ``), `window.stackPanelGroup`, and `window.panelMenu {panel, x?, y?}` to open the menu. |
@@ -156,6 +156,10 @@ Points are logical window coordinates. A target is `{id}` (the element's centre;
 | `ui.key` | `{key}`, for example `Space`, `F9`, `Cmd+Z`, `Cmd+Shift+Z`, `PageDown`, `Escape` |
 | `ui.type` | `{text}`: text input into the focused field |
 
+Input on an element in an undocked panel group's OS window (one with `window` in `ui.elements`)
+goes to that window; with `x`,`y` pass `window` (the group id) for the same. `ui.key` and `ui.type`
+go to the window the last pointer input went to.
+
 Shortcut presets also accept `Physical+<shortcut>` for a keyboard position, using egui's
 US-position names (for example `Physical+6` and `Physical+Minus` distinguish AZERTY's
 `-` and `)` keys). Physical bindings take precedence over logical bindings for that key
@@ -175,7 +179,7 @@ frames and can be assigned through `shortcuts.set`.
 
 | Method | Params | Result |
 |---|---|---|
-| `ui.screenshot` | `{path?, panel?, id?, max_side?}` | `{path, width, height}`: a PNG of the window, or cropped to one panel or element, downscaled so the longest side is at most `max_side` pixels (default 1600, 0 = full size). |
+| `ui.screenshot` | `{path?, panel?, id?, max_side?}` | `{path, width, height}`: a PNG of the window, or cropped to one panel or element, downscaled so the longest side is at most `max_side` pixels (default 1600, 0 = full size). It captures the main window only: a panel in an undocked OS window is an error (dock it with `window.dockPanel` first). |
 
 Element ids are stable, for example `tools.Selection`, `panel.Timeline`, `panel.tab.EffectControls`,
 `panel.tab.Timeline.<comp>` (one Timeline tab per open comp; `panel.tab.Timeline` is the shown

@@ -1,15 +1,17 @@
 //! The dock area: lays out the docked tree (or the maximized panel), draws each group's chrome
-//! and body, floating (undocked) panel groups over it, and tab drag-and-drop: drag a tab onto a
-//! group to tab it there (center) or split it off to a side (After Effects' drop zones, with a
-//! highlight of where it will land); hold Cmd/Ctrl when releasing, or drop outside every group,
-//! to float it. `` ` `` maximizes the panel under the pointer.
+//! and body, floating (undocked) panel groups (OS windows of their own on the desktop, see
+//! [`crate::float_windows`]; over the dock where egui can't open windows), and tab
+//! drag-and-drop: drag a tab onto a group to tab it there (center) or split it off to a side
+//! (After Effects' drop zones, with a highlight of where it will land); hold Cmd/Ctrl when
+//! releasing, or drop outside every group, to float it. `` ` `` maximizes the panel under the
+//! pointer.
 
 use egui::{Color32, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
 
 use crate::dock::{self, DockAction, DockNode, Group, Layout, PanelKind, Zone};
 use crate::{EffectcraftApp, panels};
 
-fn drag_id() -> egui::Id {
+pub(crate) fn drag_id() -> egui::Id {
     egui::Id::new("dock-tab-drag")
 }
 
@@ -97,7 +99,8 @@ impl EffectcraftApp {
         // (the Composition, Timeline and Effect Controls tabs carry their swatch already)
         let _ = comp_label;
         for (p, label) in [(PanelKind::Properties, layer_label)] {
-            let (Some(label), Some(e)) = (label, self.auto.find(&format!("panel.tab.{}", p.id()))) else { continue };
+            // (Tabs in undocked OS windows are drawn there.)
+            let (Some(label), Some(e)) = (label, self.auto.find(&format!("panel.tab.{}", p.id())).filter(|e| e.window.is_none())) else { continue };
             if label == effectcraft_engine::color::Label::None {
                 continue;
             }
@@ -227,7 +230,7 @@ impl EffectcraftApp {
         pos.and_then(|p| self.dock_rects.iter().rev().find(|(_, r)| r.contains(p)).map(|(k, _)| *k)).unwrap_or(self.ui.focused)
     }
 
-    fn panel_body(&mut self, ui: &mut egui::Ui, p: PanelKind, rect: Rect) {
+    pub(crate) fn panel_body(&mut self, ui: &mut egui::Ui, p: PanelKind, rect: Rect) {
         self.auto.add(&format!("panel.{}", p.id()), rect, p.title());
         let mut content = rect.shrink(1.0);
         let viewer = p == panels::viewers::active_panel(self);
@@ -257,6 +260,9 @@ impl EffectcraftApp {
             let mut child = ui.new_child(egui::UiBuilder::new().max_rect(body).id_salt("home"));
             child.set_clip_rect(body.intersect(ui.clip_rect()));
             panels::home::show(self, &mut child, body);
+            // (Undocked OS windows wait behind it too.)
+            self.os_windows.begin_frame();
+            self.os_windows.end_frame(&ctx);
             return;
         }
         // The maximized panel fills the area; the tree is kept as it is.
@@ -297,12 +303,27 @@ impl EffectcraftApp {
                 ui.painter().rect_stroke(g.rect, 0.0, Stroke::new(1.0, t.focus), StrokeKind::Inside);
             }
         }
-        // Floating groups over the dock.
+        // Floating groups: OS windows of their own on the desktop, else over the dock.
         let mut float_groups: Vec<Group> = vec![];
+        dock::assign_floating_ids(&mut self.ui.floating);
+        let origin = crate::float_windows::main_origin(&ctx).filter(|_| crate::float_windows::enabled(&ctx));
+        let mut closed = vec![];
+        self.os_windows.begin_frame();
         for i in 0..self.ui.floating.len() {
-            if let Some((g, tabs)) = self.floating_window(&ctx, i, &info, &mut actions) {
+            let shown = match origin {
+                Some(o) => self.floating_os_window(&ctx, i, o, &info, &mut actions, &mut closed),
+                None => self.floating_window(&ctx, i, &info, &mut actions),
+            };
+            if let Some((g, tabs)) = shown {
                 tab_rects.push((g.path.clone(), tabs));
                 float_groups.push(g);
+            }
+        }
+        self.os_windows.end_frame(&ctx);
+        // An undocked window's close button closes its panels, as in After Effects.
+        for p in closed {
+            if let Err(e) = self.close_panel_group(p) {
+                self.ui.status = e;
             }
         }
         for a in actions {
@@ -327,9 +348,10 @@ impl EffectcraftApp {
                 DockAction::Close(p) => self.close_panel(p),
                 DockAction::PanelMenu(p, pos) => panels::panel_menu::open(&ctx, p, self.shown_doc(p), pos),
                 DockAction::TabMenu(p, doc, pos) => panels::panel_menu::open(&ctx, p, doc, pos),
-                DockAction::BeginDrag(p) => ctx.data_mut(|d| {
-                    d.insert_temp(drag_id(), p);
-                }),
+                DockAction::BeginDrag(p) => {
+                    ctx.data_mut(|d| d.insert_temp(drag_id(), p));
+                    self.os_windows.drag_from = None;
+                }
                 DockAction::ToggleLock(p) => {
                     if !self.ui.locked_tabs.remove(&p.id()) {
                         self.ui.locked_tabs.insert(p.id().to_string());
@@ -432,12 +454,33 @@ impl EffectcraftApp {
     /// too); near a group's edge, the half it will split off. On release it lands there (or
     /// floats with Cmd/Ctrl or outside every group).
     fn tab_drag(&mut self, ctx: &egui::Context, groups: &[Group], floats: &[Group], tab_rects: &[(String, Vec<(PanelKind, Rect)>)]) {
-        let Some(p) = ctx.data(|d| d.get_temp::<PanelKind>(drag_id())) else { return };
+        let Some(p) = ctx.data(|d| d.get_temp::<PanelKind>(drag_id())) else {
+            self.os_windows.drag_from = None;
+            self.os_windows.drag_feed = None;
+            return;
+        };
         let t = self.tokens;
-        let Some(pos) = ctx.pointer_latest_pos() else { return };
+        // The pointer (main-window points): a drag that started in an undocked OS window is
+        // followed by that window, which has the pointer until the button is released.
+        let (pos, released, float_drop) = match self.os_windows.drag_from {
+            Some(w) => {
+                let origin = crate::float_windows::main_origin(ctx);
+                if !self.os_windows.shown.contains_key(&w) || origin.is_none() {
+                    // (Its window closed.)
+                    ctx.data_mut(|d| d.remove::<PanelKind>(drag_id()));
+                    self.os_windows.drag_from = None;
+                    return;
+                }
+                let (Some(f), Some(o)) = (self.os_windows.drag_feed, origin) else { return };
+                (f.screen - o.to_vec2(), f.released, f.command)
+            }
+            None => {
+                let Some(pos) = ctx.pointer_latest_pos() else { return };
+                (pos, ctx.input(|i| i.pointer.any_released()), ctx.input(|i| i.modifiers.command))
+            }
+        };
         // Floating windows are on top; then the docked groups.
         let target = floats.iter().map(|g| (g, true)).chain(groups.iter().map(|g| (g, false))).find(|(g, _)| g.rect.contains(pos));
-        let float_drop = ctx.input(|i| i.modifiers.command);
         let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("dock-drop")));
         let plan: Option<DropPlan> = match target {
             Some((g, is_float)) if !float_drop => {
@@ -492,15 +535,13 @@ impl EffectcraftApp {
             }
             _ => None,
         };
-        // Ghost of the dragged tab.
-        let g = painter.layout_no_wrap(p.title().to_string(), crate::theme::Tokens::ui(12.0), Color32::WHITE);
-        let gr = Rect::from_min_size(pos + vec2(12.0, 10.0), g.size() + vec2(16.0, 8.0));
-        painter.rect_filled(gr, 4.0, t.focus.gamma_multiply(0.85));
-        painter.galley(gr.min + vec2(8.0, 4.0), g, Color32::WHITE);
+        drag_ghost(&painter, p, pos, &t);
         ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
         ctx.request_repaint();
-        if ctx.input(|i| i.pointer.any_released()) {
+        if released {
             ctx.data_mut(|d| d.remove::<PanelKind>(drag_id()));
+            self.os_windows.drag_from = None;
+            self.os_windows.drag_feed = None;
             let ok = match plan {
                 Some(DropPlan::Tab { anchor, before }) => self.edit_layout(|l| l.insert_tab(p, anchor, before)),
                 Some(DropPlan::Side { anchor, zone }) => self.edit_layout(|l| l.dock(p, anchor, zone)),
@@ -524,6 +565,14 @@ enum DropPlan {
     Tab { anchor: PanelKind, before: Option<PanelKind> },
     /// A new group split off one side of `anchor`'s group.
     Side { anchor: PanelKind, zone: Zone },
+}
+
+/// The ghost of a dragged tab at the pointer `pos`.
+pub(crate) fn drag_ghost(painter: &egui::Painter, p: PanelKind, pos: egui::Pos2, t: &crate::theme::Tokens) {
+    let g = painter.layout_no_wrap(p.title().to_string(), crate::theme::Tokens::ui(12.0), Color32::WHITE);
+    let gr = Rect::from_min_size(pos + vec2(12.0, 10.0), g.size() + vec2(16.0, 8.0));
+    painter.rect_filled(gr, 4.0, t.focus.gamma_multiply(0.85));
+    painter.galley(gr.min + vec2(8.0, 4.0), g, Color32::WHITE);
 }
 
 /// The insertion mark of a tab drag: a bar between two tabs at `x`, with caps.

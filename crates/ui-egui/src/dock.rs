@@ -237,7 +237,7 @@ pub const WORKSPACES: &[&str] = &[
 /// about 1680×1020 (they are kept inside the window when drawn).
 pub fn workspace_floating(name: &str) -> Vec<Floating> {
     use PanelKind::*;
-    let f = |panels: &[PanelKind], rect: [f32; 4]| Floating { panels: panels.to_vec(), active: 0, rect };
+    let f = |panels: &[PanelKind], rect: [f32; 4]| Floating::new(panels.to_vec(), 0, rect);
     match name {
         "Undocked Panels" => vec![
             f(&[Project, EffectControls], [24.0, 110.0, 320.0, 420.0]),
@@ -555,13 +555,48 @@ pub fn zone_rect(rect: Rect, zone: Zone) -> Rect {
     }
 }
 
-/// A panel group floating over the dock (undocked).
+/// A panel group floating over the dock (undocked). On the desktop it is a window of its own
+/// (an OS window, as in After Effects); where windows can't be opened (the web, headless
+/// contexts) it floats inside the main window.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Floating {
     pub panels: Vec<PanelKind>,
     pub active: usize,
-    /// [x, y, w, h] in points.
+    /// [x, y, w, h] in points, relative to the main window's content.
     pub rect: [f32; 4],
+    /// A stable id for the group's OS window (0 until one is assigned, see
+    /// [`assign_floating_ids`]).
+    #[serde(default)]
+    pub id: u64,
+    /// Where its OS window is on screen, in points: [x, y] of the window's outer top-left
+    /// corner (frame included) and [w, h] of its content, as the window was last seen. `None`
+    /// until it has had an OS window (it then opens at `rect` relative to the main window).
+    #[serde(default)]
+    pub screen: Option<[f32; 4]>,
+}
+
+impl Floating {
+    /// A new group (no OS window yet).
+    pub fn new(panels: Vec<PanelKind>, active: usize, rect: [f32; 4]) -> Self {
+        Floating { panels, active, rect, id: 0, screen: None }
+    }
+}
+
+/// Give each floating group a unique non-zero [`Floating::id`], keeping the ids already set
+/// (groups from older layouts, and new groups, have none). True if any id changed.
+pub fn assign_floating_ids(floating: &mut [Floating]) -> bool {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut next = floating.iter().map(|f| f.id).max().unwrap_or(0);
+    let mut changed = false;
+    for f in floating {
+        if f.id == 0 || !seen.insert(f.id) {
+            next = next.saturating_add(1);
+            f.id = next;
+            seen.insert(next);
+            changed = true;
+        }
+    }
+    changed
 }
 
 impl DockNode {
@@ -746,7 +781,7 @@ impl Layout {
         } else if !self.unfloat(p) {
             return false;
         }
-        self.floating.push(Floating { panels: vec![p], active: 0, rect });
+        self.floating.push(Floating::new(vec![p], 0, rect));
         true
     }
 
@@ -852,7 +887,7 @@ impl Layout {
         for q in &panels {
             self.root.close(*q);
         }
-        self.floating.push(Floating { panels, active, rect });
+        self.floating.push(Floating::new(panels, active, rect));
         true
     }
 }
