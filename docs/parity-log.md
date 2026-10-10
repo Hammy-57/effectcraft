@@ -905,3 +905,6 @@ before.
   and Small Tabs (`window.smallTabs {panel, small?}`) gives a docked group or stack a shorter tab
   strip with smaller labels. Both are saved with the layout and its workspaces. Floating groups
   don't have Small Tabs yet.
+- Agents sharing the desktop app over MCP get their own name by default: a bridged MCP server
+  without `--client` runs as `<MCP client name>-<pid>`, so it never moves the user's selection,
+  comp or time and can claim comps; `"client": ""` runs one call as the user.

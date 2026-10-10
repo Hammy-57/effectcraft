@@ -2137,3 +2137,31 @@ fn tools_run_as_the_calling_client() {
     assert_eq!(s.backend().session().unwrap().state.active_comp, None, "the user's view didn't move");
     assert_eq!(s.backend().client(), Some("agentC"));
 }
+
+/// Bridged to an app, an agent that gave no name runs as `<MCP client name>-<pid>` from
+/// `initialize` on, so it never moves the user's selection; `"client": ""` runs one call as the
+/// user. Headless servers (the agent is alone) and named servers keep their client.
+#[test]
+fn bridged_agents_get_a_name_by_default() {
+    let init = json!({"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "Claude Code", "version": "1"}});
+    let mut s = McpServer::new(Backend::bridge(&fake_app().to_string()).unwrap());
+    rpc(&mut s, 1, "initialize", init.clone());
+    let me = format!("claude-code-{}", std::process::id());
+    assert_eq!(s.backend().client(), Some(me.as_str()));
+    call_json(&mut s, "command_run", json!({"id": "comp.new", "params": {"name": "Main", "width": 64, "height": 36}}));
+    let a = call_json(&mut s, "command_run", json!({"id": "layer.newSolid", "params": {"name": "A", "width": 8, "height": 8}}))["layer"].clone();
+    call_json(&mut s, "command_run", json!({"id": "layer.select", "params": {"layers": [a]}}));
+    let mine = call_json(&mut s, "get_state", json!({}));
+    assert_eq!((mine["state"]["client"].clone(), mine["state"]["selected_layers"].clone()), (json!(me), json!([a])), "{mine}");
+    let user = call_json(&mut s, "get_state", json!({"client": ""}));
+    assert!(user["state"]["client"].is_null() && user["state"]["selected_layers"] != json!([a]), "the user's selection didn't move: {user}");
+    assert_eq!(s.backend().client(), Some(me.as_str()), "a per-call client is restored after the call");
+
+    let mut named = McpServer::new(Backend::bridge(&fake_app().to_string()).unwrap()).with_client(Some("agentC".into()));
+    rpc(&mut named, 1, "initialize", init.clone());
+    assert_eq!(named.backend().client(), Some("agentC"));
+    let mut alone = server();
+    rpc(&mut alone, 1, "initialize", json!({"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "!!!", "version": "1"}}));
+    assert_eq!(alone.backend().client(), None);
+    assert_eq!(crate::server::default_client(&json!({"clientInfo": {"name": "!!!"}})), format!("agent-{}", std::process::id()));
+}
