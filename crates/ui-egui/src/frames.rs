@@ -1027,13 +1027,11 @@ impl Worker {
             let Ok(mut q) = queue.lock() else { return false };
             let Some(i) = Queue::best(&q.jobs) else { return false };
             let j = &q.jobs[i];
-            // Prefetch waits while the frames already rendering would take more memory than the
-            // budget allows; the viewer's frame never waits. (wasm32 renders one frame at a time
-            // on the UI thread.) It waits in the queue, not on this thread: rayon runs queued
-            // spawns nested inside renders on the same pool, so a spawn blocked here could sit on
-            // top of the very render it waits for, and with every worker doing that nothing
-            // finished: playback held at the end of the cached frames forever.
-            if !(cfg!(target_arch = "wasm32") || j.urgent || q.running.len() < max_running(j)) {
+            // Keep one viewer slot beyond the prefetch budget, but never nest another viewer
+            // render inside it. Rayon can run queued jobs inside a parallel render: unlimited
+            // urgent jobs then retain every obsolete frame's buffers during a drag (#647).
+            // Wait in the queue, never on a pool thread needed by an unfinished render.
+            if !cfg!(target_arch = "wasm32") && !q.can_start(j) {
                 q.parked += 1;
                 return false;
             }
@@ -1266,6 +1264,11 @@ struct Queue {
 }
 
 impl Queue {
+    fn can_start(&self, job: &Job) -> bool {
+        let limit = max_running(job);
+        if job.urgent { self.urgent_running == 0 && self.running.len() <= limit } else { self.running.len() < limit }
+    }
+
     /// The job that matters most: urgent first (newest), then prefetch in request order.
     fn best(jobs: &[Job]) -> Option<usize> {
         jobs.iter().enumerate().max_by_key(|(_, j)| (j.urgent, if j.urgent { j.seq as i64 } else { -(j.seq as i64) })).map(|(i, _)| i)
@@ -1477,6 +1480,38 @@ mod tests {
         assert_eq!(max_running(&job(uhd, 0.5, gib)), 8, "Half resolution renders HD-sized frames");
         assert_eq!(max_running(&job(uhd, 1.0, 64 << 20)), 1);
         assert_eq!(max_running(&job(ItemId(9999), 1.0, gib)), gib, "no comp: nothing to bound");
+    }
+
+    /// #647: a viewer frame can jump past busy prefetch, but a drag cannot start an
+    /// unbounded stack of obsolete urgent renders through rayons nested job execution.
+    #[test]
+    fn dragging_keeps_only_one_running_viewer_render() {
+        let f = Frames::default();
+        let worker = f.worker();
+        let src = RenderSource {
+            project: Arc::default(),
+            footage: Arc::new(effectcraft_engine::render::NoFootage),
+            expr: None,
+            layer_cache: Arc::new(LayerCache::new(1)),
+            gpu: None,
+            gpu_display: false,
+            disk: None,
+        };
+        let old = key(1, 0, 0);
+        let latest = key(2, 0, 0);
+        let mut q = f.queue.lock().unwrap();
+        q.running.insert(old);
+        q.urgent_running = 1;
+        q.jobs.push(Job { key: latest, src, comp: ItemId(1), t: Tick::ZERO, opts: RenderOpts::default(), urgent: true, seq: 2 });
+        assert!(!q.can_start(&q.jobs[0]), "one urgent render is already in progress");
+        drop(q);
+        assert!(!worker.run_next(), "obsolete render must finish before allocating another frame");
+        let mut q = f.queue.lock().unwrap();
+        assert_eq!(q.jobs.len(), 1, "latest request remains queued");
+        q.urgent_running = 0;
+        assert!(q.can_start(&q.jobs[0]), "one reserved viewer slot beyond prefetch");
+        q.running.insert(key(3, 0, 0));
+        assert!(!q.can_start(&q.jobs[0]), "the reserve cannot exceed one frame");
     }
 
     /// #284: scrubbing asks for a viewer frame at every step; a newer one drops the comp's viewer
