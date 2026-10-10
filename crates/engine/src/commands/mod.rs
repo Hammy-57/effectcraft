@@ -27,6 +27,7 @@ pub(crate) mod frame_export;
 mod frontend;
 mod help;
 mod journal;
+mod import_project;
 mod key_labels;
 mod key_transform;
 mod keys_more;
@@ -217,6 +218,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(crate::preview::specs());
         v.extend(render_compare::specs());
         v.extend(crate::render_view::specs());
+        v.extend(import_project::specs());
         v
     })
 }
