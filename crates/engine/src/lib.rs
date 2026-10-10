@@ -32,6 +32,7 @@ pub mod media_browser;
 pub mod media_cache;
 pub mod menus;
 pub mod models;
+pub mod motion;
 pub mod offload;
 pub mod perf;
 pub mod prefs;
@@ -1331,3 +1332,7 @@ mod tests_import_project;
 mod tests_key_time;
 #[cfg(test)]
 mod tests_lint;
+
+
+#[cfg(test)]
+mod tests_motion;

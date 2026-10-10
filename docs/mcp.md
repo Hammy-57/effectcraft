@@ -86,7 +86,7 @@ result as `structuredContent` as well as the JSON text block older clients read.
 object: an array result is `{"items": [...]}`, a scalar `{"value": v}`, and an image reply carries
 its metadata (`comp`, `time`, `width`, `height`, `path?`). Tools with a stable shape declare it as
 `outputSchema` in `tools/list`: `get_state`, `doc_inspect`, `render_preview`, `render_frames`,
-`render_snapshot`, `render_compare`, `get_layout`, `lint_frame`, `analyze_audio`, `undo`, `redo`, `history`,
+`render_snapshot`, `render_compare`, `get_layout`, `get_motion`, `lint_frame`, `analyze_audio`, `undo`, `redo`, `history`,
 `command_batch`, `batch` and `save_project`. Earlier revisions see neither field.
 Long renders (below) reply with text only.
 
@@ -125,6 +125,7 @@ Each wraps an engine command, so the CLI, scripts (`app.run`) and the control ch
 | --- | --- | --- |
 | `get_layout` | `layer.bounds` | Per layer: `visible` + `why`, comp-space `bounds`, `corners`, `center`, `anchorInComp`, `onScreen`, `source`; optional `pixelBounds` and `overlaps` |
 | `lint_frame` | `render.lint` | Design problems at a time or over a range (`clean`, `counts`, `problems` with rule, severity, layer, time..until and a fix hint); rules in [agents.md](agents.md#design-lint) |
+| `get_motion` | `comp.motion` / `layer.motion` | Per layer over a time range: `segments` (enter, exit, move, hold, scale, rotate, fade-in, fade-out), `offscreen` intervals, a `summary` sentence; `overlaps` between drawn layers ([agents.md](agents.md#motion-summary)) |
 | `analyze_audio` | `audio.analyze` | Peak, true peak, RMS, integrated LUFS, clipped samples, silences, channels; optional waveform |
 
 - **Geometry** is `sourceRectAtTime` through the transform, parents and, for 3D layers, the

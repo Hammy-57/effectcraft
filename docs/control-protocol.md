@@ -71,7 +71,10 @@ project against an exam task's checks (each runs one read-only query and tests i
 `{passed, score, total, passedCount, results: [{id, desc, pass, reason, actual}]}`
 ([evals/agent/README.md](../evals/agent/README.md)). Design lint: `render.lint {comp?, time? | start?, end?, step?, rules?, minTextPx?, minContrast?}`
 → `{comp, compName, times, truncated, clean, counts {error, warning, info}, problems: [{rule, severity,
-layer, layerName, time, until, message, other?}], notes}` (rules and how to read it: [agents.md](agents.md#design-lint)).
+layer, layerName, time, until, message, other?}], notes}` (rules and how to read it: [agents.md](agents.md#design-lint)). Motion summaries: `comp.motion {comp?, layers?, start?, end?, step?}` /
+`layer.motion {comp?, layer, start?, end?, step?}` → per layer `segments` (enter, exit, move,
+hold, scale, rotate, fade-in, fade-out), `offscreen` intervals and a `summary` sentence, plus
+`overlaps` ([agents.md](agents.md#motion-summary)).
 
 `project.summary` and `editor.state` include the document `revision` (bumped on every change, undo and
 redo included). Every command's `params` also accepts `expectRevision` (the command doesn't run and

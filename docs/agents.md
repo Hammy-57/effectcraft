@@ -128,6 +128,7 @@ See [MCP conventions](mcp.md) for core tools, resources, strict arguments, and p
 | `render_snapshot {name, comp?, time?, max_side?, transparent?}` | Render a frame and keep it in the session under `name` (16 kept, oldest dropped; the same name replaces). |
 | `render_compare {a, b, threshold?, min_psnr?, max_side?, region?, amplify?, diff_path?, inline?}` | Compare two frames. `a` and `b` are each a snapshot name (or `{snapshot}`), `{path}` (a PNG/JPEG golden or After Effects reference) or `{comp?, time?, transparent?}` (render now; `{}` = active comp at the CTI). Returns `{width, height, max_abs, mean_abs, alpha_max_abs, psnr_db, ssim, changed_pixels, changed_pct, pass, diffBounds}` and, when something changed, the diff heatmap as an image. `region: [x, y, w, h]` compares one rectangle. See [Verify your change](#verify-your-change-snapshot--edit--compare). |
 | `get_layout {comp?, time?, layers?, pixels?, overlaps?}` | Where layers are on screen at a time, without rendering (`layer.bounds`): `visible` (and `why` not), comp-space `bounds` [x,y,w,h], `corners`, `center`, `anchorInComp`, `onScreen` (0-1) and the layer-space `source` rect, after parenting and (3D) the active camera. `pixels` adds the drawn pixels' bounds (effects included); `overlaps` lists overlapping visible layers. |
+| `get_motion {comp?, layer? \| layers?, start?, end?, step?}` | How layers move over a time range, without rendering (`comp.motion` / `layer.motion`): per layer `segments` (enter, exit, move, hold, scale, rotate, fade-in, fade-out with times, from / to, direction, edge), `offscreen` intervals and a one-sentence `summary`, plus `overlaps` between drawn layers. See [Motion summary](#motion-summary). |
 | `analyze_audio {comp?, start?, end?, layer?, silence_db?, min_silence?, true_peak?, waveform?, width?, height?, path?}` | Measure the audio mix (`audio.analyze`): peak / true peak dBFS, RMS, integrated LUFS (BS.1770), clipped samples, silent ranges, per-channel stats; `waveform` returns a waveform image. No audio gives `hasAudio: false`. |
 | `lint_frame {comp?, time?, start?, end?, step?, rules?, min_text_px?, min_contrast?}` | Design lint (`render.lint`): plain-language design problems at one time or over a range, each with a fix hint: text too small or low-contrast, outside title / action safe, cut off, overlapping text, layers switched on but not seen, keyframes just off the music's beat. Returns `{clean, counts, problems: [{rule, severity, layer, layerName, time, until, message, other?}]}`. See [Design lint](#design-lint). |
 | `open_project {path \| demo \| new}` / `save_project {path?}` | Open and save files. |
@@ -308,6 +309,7 @@ Short recipes; every step is one tool call.
 | Check a detail | `render_preview {"region":[800,400,320,180],"max_side":0}` (full resolution crop of a big comp) |
 | Prove what an edit changed | `render_snapshot {"name":"before"}` → edit → `render_compare {"a":"before","b":{}}` (metrics + diff heatmap) |
 | Is the title centred and on screen? | `get_layout {"layers":["Title"],"time":2}` → compare `center` with half the comp size, `onScreen` should be 1; `get_layout {"overlaps":true}` for collisions |
+| Does the animation read right? | `get_motion {}` → each layer's `summary` ("Logo flies in from the left 0–1s, holds 1–4s, fades out 4–5s."), `segments` for exact times, `overlaps` for collisions over time |
 | Check the soundtrack | `analyze_audio {}` → `integratedLufs` (streaming targets about -14), `truePeakDbtp` under -1, `clippedSamples` 0, `silences`; `analyze_audio {"waveform":true}` to see it |
 | Undo a mistake | `undo {}`, or `history {}` then `history {"goto": n}` |
 | Missing media after opening | `command_run footage.check {"wait":true}` → `{checked, missing, probed}`; then `file.findMissing {"what":"footage"}` |
@@ -315,6 +317,47 @@ Short recipes; every step is one tool call.
 
 The desktop app checks footage in the background after every open (a "Checking footage" job in
 the Progress panel, `jobs.list`); headless sessions run `footage.check` when they want it.
+
+### Motion summary
+
+Agents can't watch a video. `get_motion` (engine `comp.motion {comp?, layers?, start?, end?,
+step?}`, or `layer.motion {comp?, layer, start?, end?, step?}` for one layer) describes how layers
+move in text, from the same comp-space content boxes as `get_layout` plus each layer's opacity,
+scale and rotation; nothing is rendered, so it is cheap.
+
+```json
+{"comp": 1, "compName": "Intro", "start": 0, "end": 5, "step": 0.0417, "truncated": false,
+ "layers": [{"layer": 2, "name": "Logo", "inPoint": 0, "outPoint": 5,
+   "segments": [{"kind": "enter", "start": 0, "end": 1, "from": [-60, 90], "to": [160, 90], "direction": "right", "edge": "left"},
+                {"kind": "hold", "start": 1, "end": 4, "from": [160, 90], "to": [160, 90]},
+                {"kind": "fade-out", "start": 4, "end": 5, "from": 100, "to": 0}],
+   "offscreen": [{"start": 0, "end": 0.125}],
+   "summary": "Logo flies in from the left 0–1s, holds 1–4s, fades out 4–5s."}],
+ "overlaps": [{"a": 3, "b": 4, "aName": "A", "bName": "B", "start": 0.75, "end": 1.29, "maxFraction": 1}]}
+```
+
+- **Range and sampling.** Default the whole comp (0 to its duration, not the work area), one
+  sample per frame, or coarser for long comps so a layer gets at most 600 samples. Each layer is
+  also sampled at its in and out points and at every Transform keyframe of it and its parents
+  inside the range, so segment boundaries land on keys. Layers × samples is capped at 20 000:
+  past that the range is cut short, `end` says where it stopped and `truncated` is true (with
+  `notes`). Times are comp seconds.
+- **Segments.** `move`: the content centre travels at least 0.5% of the comp diagonal; `from` /
+  `to` are centres in comp pixels and `direction` the 8-way direction (`left`, `up-right`…); a
+  turn of more than 50° starts a new segment. `enter` / `exit`: a move during which the share of
+  the layer inside the frame rises / falls by at least 25%, with the frame `edge` it comes from /
+  leaves by; a move that does both (flies across) is split into enter, move and exit where it is
+  most on screen. A layer that just appears on screen at its in point is not an enter.
+  `scale` (average X/Y scale %), `rotate` (degrees, positive is clockwise), `fade-in` /
+  `fade-out` (opacity 0–100) are the layer's own Transform values changing by at least 1. `hold`:
+  nothing of the above for at least 0.25 s (and three samples); smaller jitter counts as holding.
+  Kinds overlap in time when a layer moves and fades at once.
+- **`offscreen`**: while the layer is on (in to out point), intervals where none of its box is
+  inside the frame. **`overlaps`**: pairs of drawn layers whose on-screen boxes overlap by more
+  than 5% of the smaller one, sampled on the grid, merged into intervals with the largest
+  fraction; layers covering the whole frame (backgrounds) are left out.
+- Cameras, lights, nulls, hidden (Video off) and content-less layers are listed with no segments
+  and a `summary` saying why.
 
 ### Pitfalls
 

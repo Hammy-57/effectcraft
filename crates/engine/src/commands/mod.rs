@@ -45,6 +45,7 @@ pub mod markers;
 mod mask;
 pub mod mask_interp;
 pub(crate) mod model3d;
+mod motion_cmds;
 pub mod paint;
 pub mod panels_cmds;
 pub(crate) mod path_nulls;
@@ -225,6 +226,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(library::specs());
         v.extend(exam_cmds::specs());
         v.extend(lint_cmds::specs());
+        v.extend(motion_cmds::specs());
         v
     })
 }
