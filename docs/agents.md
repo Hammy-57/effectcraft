@@ -126,6 +126,7 @@ See [MCP conventions](mcp.md) for core tools, resources, strict arguments, and p
 | `render_snapshot {name, comp?, time?, max_side?, transparent?}` | Render a frame and keep it in the session under `name` (16 kept, oldest dropped; the same name replaces). |
 | `render_compare {a, b, threshold?, min_psnr?, max_side?, region?, amplify?, diff_path?, inline?}` | Compare two frames. `a` and `b` are each a snapshot name (or `{snapshot}`), `{path}` (a PNG/JPEG golden or After Effects reference) or `{comp?, time?, transparent?}` (render now; `{}` = active comp at the CTI). Returns `{width, height, max_abs, mean_abs, alpha_max_abs, psnr_db, ssim, changed_pixels, changed_pct, pass, diffBounds}` and, when something changed, the diff heatmap as an image. `region: [x, y, w, h]` compares one rectangle. See [Verify your change](#verify-your-change-snapshot--edit--compare). |
 | `open_project {path \| demo \| new}` / `save_project {path?}` | Open and save files. |
+| `hosts {join?}` | Where projects are open (each running EffectCraft, its port and project); `join` (a port or a project path) switches this server onto that host as your own `client`, so several agents work in one project. Refused while your own project has unsaved changes. |
 | `undo {steps?}` / `redo {steps?}` | History. |
 | `history {goto?}` | The branching undo history (History panel): every state with its index, id, label, branch depth and whether it's current; `goto` (an index or id) jumps to any state, on any branch, without losing the others. |
 | `script_ui {action?, window?, widget?, value?, result?}` | Drive ScriptUI windows that scripts opened: `list` (default) the open windows, `get` a window's control tree, `click` a button / checkbox / radio button, `set` text, a slider or a list item, `close` a window (`result`: what a dialog's `show()` returns, default 2 = Cancel). |
@@ -213,8 +214,9 @@ Two things follow:
 One process holds one project. Every EffectCraft that holds one (the desktop app, a headless or
 `--ui` MCP server) is listed in `<config directory>/Hosts/` with its kind, control port and open
 project; `command_run hosts.list` returns the live ones (`{hosts: [{pid, kind, port, project, me}]}`).
-To work on a project that is already open, join that host (`--bridge <port>`, with your own
-`client`) instead of opening a copy: `file.open` of a project another host has open succeeds but
+To work on a project that is already open, join that host (the MCP `hosts {join: <port or
+project>}` tool, or start with `--bridge <port>`; you keep your own `client`) instead of opening a
+copy: `file.open` of a project another host has open succeeds but
 warns, and its reply lists them in `openElsewhere`.
 
 Two copies of one file overwrite each other when saved, so saving is guarded: `file.save` /

@@ -923,3 +923,6 @@ before.
   one has open warns with the port to join; saving over a project file that changed on disk since
   it was opened or saved here is refused unless `force: true`, so copies no longer overwrite each
   other's work silently.
+- MCP `hosts` tool: lists where projects are open and `join`s a host (by port or project path) as
+  a named agent, so an agent hops between projects without restarting; refused while its own
+  headless project has unsaved changes.

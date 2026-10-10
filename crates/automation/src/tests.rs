@@ -2228,3 +2228,26 @@ fn bridged_agents_get_a_name_by_default() {
     assert_eq!(alone.backend().client(), None);
     assert_eq!(crate::server::default_client(&json!({"clientInfo": {"name": "!!!"}})), format!("agent-{}", std::process::id()));
 }
+
+/// An agent hops between projects: `hosts` lists where projects are open, `join` (a port or a
+/// project path) switches the server onto that host as a named agent, and leaving unsaved
+/// headless work is refused.
+#[test]
+fn hosts_tool_lists_and_joins_a_running_app() {
+    let mut s = server();
+    let listed = call_json(&mut s, "hosts", json!({}));
+    assert!(listed["hosts"].is_array(), "{listed}");
+    call_json(&mut s, "execute_command", json!({"command": "comp.new", "params": {"name": "Unsaved"}}));
+    let port = fake_app();
+    let (c, err) = call(&mut s, "hosts", json!({"join": port}));
+    assert!(err && c[0]["text"].as_str().unwrap().contains("unsaved"), "{c:?}");
+    let mut clean = server();
+    let joined = call_json(&mut clean, "hosts", json!({"join": port}));
+    assert_eq!(joined["joined"], port);
+    let me = format!("mcp-{}", std::process::id());
+    assert_eq!(joined["client"], json!(me));
+    assert_eq!(clean.backend().mode(), "bridge");
+    assert_eq!(clean.backend().client(), Some(me.as_str()));
+    let (c, err) = call(&mut clean, "hosts", json!({"join": "/nowhere/Nope.ecproj"}));
+    assert!(err && c[0]["text"].as_str().unwrap().contains("no running EffectCraft"), "{c:?}");
+}

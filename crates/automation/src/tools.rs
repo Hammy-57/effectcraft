@@ -737,6 +737,44 @@ fn open_project(b: &mut Backend, a: &Value) -> Result<Reply> {
     get_project(b, &json!({}))
 }
 
+/// `hosts`: where projects are open; `join` switches this server to one of them (a running app or
+/// another host with a control port), keeping the agent's name so it works on its own cursor.
+fn hosts(b: &mut Backend, a: &Value) -> Result<Reply> {
+    let list = b.exec("hosts.list", json!({}))?;
+    let Some(join) = get(a, "join") else { return json_reply(list) };
+    let hosts = list["hosts"].as_array().cloned().unwrap_or_default();
+    let port = match join {
+        Value::Number(n) => n.as_u64().and_then(|p| u16::try_from(p).ok()).ok_or_else(|| Error::BadArgs(format!("`join`: {n} is not a port")))?,
+        Value::String(project) => {
+            let wanted = std::fs::canonicalize(project).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| project.clone());
+            let name = std::path::Path::new(project).file_name().map(|n| n.to_string_lossy().into_owned());
+            let found = hosts.iter().find(|h| h["project"].as_str() == Some(wanted.as_str())).or_else(|| {
+                hosts.iter().find(|h| {
+                    name.as_deref()
+                        .is_some_and(|n| h["project"].as_str().and_then(|p| std::path::Path::new(p).file_name()).is_some_and(|f| f.to_string_lossy() == n))
+                })
+            });
+            let h = found.ok_or_else(|| Error::BadArgs(format!("no running EffectCraft has {project} open (see `hosts`); open it with open_project instead")))?;
+            h["port"].as_u64().and_then(|p| u16::try_from(p).ok()).ok_or_else(|| {
+                Error::BadArgs(format!("{project} is open in {} {}, which agents can't join (no control port)", h["kind"].as_str().unwrap_or("a process"), h["pid"]))
+            })?
+        }
+        other => return Err(Error::BadArgs(format!("`join` is a port or a project path, not {other}"))),
+    };
+    // Leaving a headless project: never drop unsaved work.
+    if let Some(s) = b.session()
+        && s.is_dirty()
+    {
+        return Err(Error::BadArgs("this server's project has unsaved changes: save_project first, then join".into()));
+    }
+    let mut next = Backend::bridge(&port.to_string())?;
+    next.set_client(Some(b.client().map(str::to_string).unwrap_or_else(|| format!("mcp-{}", std::process::id()))));
+    let summary = next.exec("project.summary", json!({}))?;
+    let client = next.client().map(str::to_string);
+    *b = next;
+    json_reply(json!({"joined": port, "client": client, "project": summary}))
+}
+
 fn save_project(b: &mut Backend, a: &Value) -> Result<Reply> {
     match get(a, "path") {
         Some(p) => b.exec("file.saveAs", json!({"path": p}))?,
@@ -1306,6 +1344,18 @@ static TOOLS: &[ToolDef] = &[
             )
         },
         run: render_compare,
+    },
+    ToolDef {
+        name: "hosts",
+        description: "Where projects are open: every running EffectCraft (the desktop app, headless servers) with its control port and project. `join` (a port, or the path of a project one of them has open) switches this server onto that host, as your own `client`, so you work in the same project as the user and other agents instead of on a copy (claim your comp with command_run comp.claim). Refused while this server's own project has unsaved changes.",
+        bridge_only: false,
+        schema: || {
+            schema(
+                json!({"join": {"type": ["integer", "string"], "description": "A host's control port, or the path of a project a host has open."}}),
+                &[],
+            )
+        },
+        run: hosts,
     },
     ToolDef {
         name: "open_project",
