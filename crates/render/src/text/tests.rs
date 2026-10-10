@@ -526,3 +526,29 @@ fn touching_glyphs_join_without_a_seam() {
     let multiply = draw(vec![glyph(4.0, 10.5, white, false), glyph(10.5, 17.0, white, false)], BlendMode::Multiply).get(10, 10);
     assert!(multiply[3] < 0.9, "{multiply:?}");
 }
+
+/// Per-character blur blurs one plane per distinct colour value: exactly what blurring the
+/// colour × coverage image did (white, black, grey, coloured and HDR fills).
+#[test]
+fn character_blur_by_planes_equals_the_image_blur() {
+    let (w, h) = (37u32, 29u32);
+    let cov: Vec<f32> = (0..w * h).map(|i| if (i % 7) < 3 { 0.0 } else { effectcraft_raster::hash_noise(i % w, i / w, 5) }).collect();
+    for col in [[1.0, 1.0, 1.0, 1.0], [0.0, 0.0, 0.0, 1.0], [0.5, 0.5, 0.5, 0.8], [1.0, 0.25, 0.0, 1.0], [2.5, 0.3, 1.0, 0.6]] {
+        for blur in [[0.0, 0.0], [6.0, 2.0], [0.08, 0.08], [0.0, 9.0]] {
+            let a = col[3] * 0.9;
+            let mut old = Image::new(w, h);
+            for (px, c) in old.data.iter_mut().zip(&cov) {
+                let k = c * a;
+                if k > 0.0 {
+                    *px = [col[0] * k, col[1] * k, col[2] * k, k];
+                }
+            }
+            if blur[0] > 0.05 || blur[1] > 0.05 {
+                old = effectcraft_raster::gaussian_blur(&old, blur[0] / 2.0, blur[1] / 2.0, false);
+            }
+            let new = paint_coverage(&cov, col, a, w, h, blur);
+            let same = old.data.iter().zip(&new.data).all(|(p, q)| p.iter().zip(q).all(|(a, b)| a.to_bits() == b.to_bits()));
+            assert!(same, "{col:?} blur {blur:?}");
+        }
+    }
+}
