@@ -1926,7 +1926,14 @@ mod tests {
         for (k, v) in set {
             params.values.insert(k.to_string(), v.clone());
         }
-        let ctx = EffectCtx { params: &params, time: 0.0, layer_size: [buf.img.width as f64, buf.img.height as f64], seed: 1, adjustment: false, env: Default::default() };
+        let ctx = EffectCtx {
+            params: &params,
+            time: 0.0,
+            layer_size: [buf.img.width as f64, buf.img.height as f64],
+            seed: 1,
+            adjustment: false,
+            env: Default::default(),
+        };
         let cp = CellParams::new(&ctx, &buf);
         let mut old = buf.img.clone();
         map_xy(&mut old, |x, y, _| {
@@ -1943,7 +1950,13 @@ mod tests {
             vec![("size", num(7.0)), ("disperse", num(1.5)), ("evolution", num(123.0))],
             vec![("cellPattern", Value::Enum(9)), ("size", num(11.0)), ("offset", pt(-13.7, 41.2))],
             vec![("cellPattern", Value::Enum(10)), ("size", num(1.0)), ("disperse", num(1.2))],
-            vec![("cellPattern", Value::Enum(7)), ("size", num(5.5)), ("tilingOptions/enableTiling", Value::Bool(true)), ("tilingOptions/cellsHorizontal", num(3.0)), ("tilingOptions/cellsVertical", num(2.0))],
+            vec![
+                ("cellPattern", Value::Enum(7)),
+                ("size", num(5.5)),
+                ("tilingOptions/enableTiling", Value::Bool(true)),
+                ("tilingOptions/cellsHorizontal", num(3.0)),
+                ("tilingOptions/cellsVertical", num(2.0)),
+            ],
             vec![("cellPattern", Value::Enum(6)), ("size", num(9.0)), ("evolutionOptions/randomSeed", num(77.0)), ("offset", pt(1e6, -2e6))],
         ];
         for set in &sets {

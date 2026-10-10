@@ -160,7 +160,8 @@ impl<'a> Renderer<'a> {
             LayerSource::Footage { item } => Some(self.proxy_for(item).is_some() as u64),
             _ => None,
         };
-        let key = self.cache.and_then(|_| cache::input_key_src(ctx, layer, self.raster_scale(ctx, layer), self.opts.draft, self.mb_on(ctx, layer), effects, src));
+        let key =
+            self.cache.and_then(|_| cache::input_key_src(ctx, layer, self.raster_scale(ctx, layer), self.opts.draft, self.mb_on(ctx, layer), effects, src));
         let key = self.content_key(ctx, layer, key);
         if let (Some(c), Some(k)) = (self.cache, key)
             && let Some(b) = c.get(k)

@@ -170,7 +170,16 @@ impl FootageSource for CountingStill {
 fn still_scene() -> (Project, ItemId) {
     let mut p = project();
     let (cid, c) = comp(&mut p, "Comp");
-    let f = Footage { path: "still.png".into(), kind: FootageKind::Still, width: 40, height: 30, pixel_aspect: 1.0, has_video: true, loop_count: 1, ..Default::default() };
+    let f = Footage {
+        path: "still.png".into(),
+        kind: FootageKind::Still,
+        width: 40,
+        height: 30,
+        pixel_aspect: 1.0,
+        has_video: true,
+        loop_count: 1,
+        ..Default::default()
+    };
     let fid = p.add_item("Still", Label::Aqua, None, ItemKind::Footage(f));
     let mut l = build::layer(&mut p, &c, "Still", LayerSource::Footage { item: fid }, (40, 30), None);
     blur(&mut p, &mut l, 8.0);

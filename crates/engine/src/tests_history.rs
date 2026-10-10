@@ -311,7 +311,10 @@ fn undo_reverts_your_own_step_behind_others() {
     assert_eq!(s.project.comp(theirs).unwrap().layers.len(), 0);
     // A clash: the agent adds a layer, the user then renames that same layer; the agent's undo
     // is refused and nothing changes.
-    let a2 = s.execute_checked("layer.newSolid", json!({"comp": theirs.0, "name": "A2", "color": "#00ff00", "width": 8, "height": 8, "client": "agentA"})).unwrap()["layer"].clone();
+    let a2 = s
+        .execute_checked("layer.newSolid", json!({"comp": theirs.0, "name": "A2", "color": "#00ff00", "width": 8, "height": 8, "client": "agentA"}))
+        .unwrap()["layer"]
+        .clone();
     s.execute_checked("layer.rename", json!({"comp": theirs.0, "layer": a2, "name": "A2 (mine now)"})).unwrap();
     let rev = s.revision;
     let e = s.execute_checked("edit.undo", json!({"client": "agentA"})).unwrap_err().to_string();

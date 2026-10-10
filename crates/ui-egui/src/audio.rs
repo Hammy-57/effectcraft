@@ -214,7 +214,15 @@ impl AudioPlayback {
         let stop = Arc::new(AtomicBool::new(false));
         if cfg!(target_arch = "wasm32") {
             // The device takes samples only in `pump`, which fills the queue first.
-            let mut p = AudioPlayback { feed: feed.clone(), device, stop, thread: None, feeder: Some((src, comp, span.start, mix, AudioStream::default())), rate, span };
+            let mut p = AudioPlayback {
+                feed: feed.clone(),
+                device,
+                stop,
+                thread: None,
+                feeder: Some((src, comp, span.start, mix, AudioStream::default())),
+                rate,
+                span,
+            };
             p.device.start(feed)?;
             p.pump();
             return Ok(p);

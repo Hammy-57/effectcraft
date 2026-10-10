@@ -1076,7 +1076,8 @@ mod tests {
         let mut p = Project::default();
         let mut c = Comp::new(64, 64, effectcraft_time::FrameRate::FPS_30, effectcraft_time::Tick::from_seconds_f64(1.0));
         for (i, color) in [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]].into_iter().enumerate() {
-            let sid = p.add_item(&format!("S{i}"), effectcraft_color::Label::Red, None, ItemKind::Solid(Solid { color, width: 8, height: 8, pixel_aspect: 1.0 }));
+            let sid =
+                p.add_item(&format!("S{i}"), effectcraft_color::Label::Red, None, ItemKind::Solid(Solid { color, width: 8, height: 8, pixel_aspect: 1.0 }));
             let l = build::layer(&mut p, &c, "S", LayerSource::Solid { item: sid }, (8, 8), None);
             c.layers.push(l);
         }
