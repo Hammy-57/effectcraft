@@ -140,6 +140,20 @@ pub fn import_ir(
     source_dir: &str,
     resolve_media: &mut dyn FnMut(&str) -> Option<String>,
 ) -> Result<ImportResult, AepError> {
+    let mut next = project.clone();
+    let result = import_ir_into(&mut next, bytes, source_dir, resolve_media)?;
+    *project = next;
+    Ok(result)
+}
+
+/// [`import_ir`] without the copy: on an error `next` may be left half imported, so the caller
+/// must discard it (an undoable edit, which already works on a copy of the project, does).
+pub fn import_ir_into(
+    next: &mut Project,
+    bytes: &[u8],
+    source_dir: &str,
+    resolve_media: &mut dyn FnMut(&str) -> Option<String>,
+) -> Result<ImportResult, AepError> {
     // Large template packs export to a few hundred MiB of IR; the cap only stops runaway input.
     const MAX_BYTES: usize = 1024 * 1024 * 1024;
     if bytes.len() > MAX_BYTES {
@@ -157,7 +171,6 @@ pub fn import_ir(
     if items.len() > 100_000 {
         return Err(AepError::Invalid("too many items".into()));
     }
-    let mut next = project.clone();
     let mut result = ImportResult::default();
     let mut property_budget = 1_000_000usize;
     let source_depth = match doc.get("project").and_then(|p| integer(p, &["bits_per_channel"])) {
@@ -348,10 +361,10 @@ pub fn import_ir(
             if ir.get("properties").is_some_and(|v| !v.is_array()) {
                 return Err(AepError::Invalid(format!("comp {ae_id} layer {ae_layer}: properties must be an array")));
             }
-            let Some(source) = layer_source(ir, &next, &result.item_ids, ae_id, &mut result.losses) else { continue };
+            let Some(source) = layer_source(ir, next, &result.item_ids, ae_id, &mut result.losses) else { continue };
             let size = source.item().and_then(|i| next.item(i)).and_then(|i| i.dimensions()).unwrap_or((comp.width, comp.height));
             let name = string(ir, &["name"]).unwrap_or(source.type_name());
-            let mut layer = build::layer(&mut next, &comp, name, source, size, None);
+            let mut layer = build::layer(next, &comp, name, source, size, None);
             layer.name = name.to_owned();
             let timing = ir.get("timing").unwrap_or(ir);
             layer.start_time = tick(number(timing, &["start_time"]).unwrap_or(0.0));
@@ -427,15 +440,15 @@ pub fn import_ir(
                     continue;
                 }
                 if string(prop, &["match_name"]) == Some("ADBE Layer Overrides") {
-                    markers_essential::overrides(&mut next, &mut layer, prop, &mut result.losses, &format!("comp {ae_id} layer {ae_layer}"));
+                    markers_essential::overrides(next, &mut layer, prop, &mut result.losses, &format!("comp {ae_id} layer {ae_layer}"));
                     continue;
                 }
                 if string(prop, &["match_name"]) == Some("ADBE Layer Styles") {
-                    styles::import(&mut next, &mut layer, prop, &mut result.losses, &format!("comp {ae_id} layer {ae_layer}"));
+                    styles::import(next, &mut layer, prop, &mut result.losses, &format!("comp {ae_id} layer {ae_layer}"));
                     continue;
                 }
                 import_property(
-                    &mut next,
+                    next,
                     &mut layer.props,
                     prop,
                     0,
@@ -454,7 +467,7 @@ pub fn import_ir(
             if matches!(&layer.source, LayerSource::Model { .. }) {
                 let model_scale =
                     integer(ir, &["source_id"]).and_then(|id| items.iter().find(|i| integer(i, &["id"]) == Some(id))).and_then(|i| number(i, &["model_scale"]));
-                models3d::import(&mut next, &mut layer, ir, model_scale, &mut result.losses, &format!("comp {ae_id} layer {ae_layer}"));
+                models3d::import(next, &mut layer, ir, model_scale, &mut result.losses, &format!("comp {ae_id} layer {ae_layer}"));
                 result.losses.push(format!("comp {ae_id} layer {ae_layer}: 3D model coordinate/render parity with AE is unverified"));
             }
             local_ids.insert(ae_layer, layer.id);
@@ -509,7 +522,7 @@ pub fn import_ir(
             result.losses.push(format!("comp {ae_id}: 3D content has no default_camera field in this IR version"));
         }
         if let Some(default) = item.get("default_camera").filter(|v| !v.is_null()) {
-            let (ae_camera, camera) = import_implicit_camera(&mut next, &comp, ae_id, default, &mut property_budget, &mut result.losses)?;
+            let (ae_camera, camera) = import_implicit_camera(next, &comp, ae_id, default, &mut property_budget, &mut result.losses)?;
             if local_ids.contains_key(&ae_camera) {
                 return Err(AepError::Invalid(format!("comp {ae_id}: implicit camera id {ae_camera} collides with a timeline layer")));
             }
@@ -524,7 +537,7 @@ pub fn import_ir(
             i.kind = ItemKind::Comp(Arc::new(comp));
         }
     }
-    markers_essential::bind(&mut next, &mut result.losses);
+    markers_essential::bind(next, &mut result.losses);
     let referenced: std::collections::BTreeSet<ItemId> =
         next.comps().flat_map(|(_, c)| c.layers.iter().filter_map(|l| if let LayerSource::Comp { item } = &l.source { Some(*item) } else { None })).collect();
     let roots: Vec<ItemId> = result.comps.iter().copied().filter(|id| !referenced.contains(id)).collect();
@@ -538,7 +551,6 @@ pub fn import_ir(
         result.warnings.push(format!("{} top-level compositions; selected first as primary", roots.len()));
     }
     next.fix_next_id();
-    *project = next;
     Ok(result)
 }
 

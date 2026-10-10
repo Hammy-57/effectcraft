@@ -888,6 +888,16 @@ Recorded in one place on 10 October; each landed with tests.
   prompts, stable ids, per-client undo and `expectRevision`, repro scripts, `cargo xtask agents`
   ([agents.md](agents.md), [mcp.md](mcp.md), [control-protocol.md](control-protocol.md)).
 
+## Update: 10 October 2026, undocked panels as OS windows
+
+- Interface: an undocked (floating) panel group is now an OS window of its own on the desktop, as in After Effects (egui multi-viewport): it can go to a second monitor, keeps its screen position and size in the workspace and across relaunches, closes its panels from its close button, and docks back with the panel menu's Dock Panel or by dragging a tab into the main window. The web and headless contexts keep the in-window floating groups.
+## Update: projects reopen their open comps
+
+Saving a project remembers the comps open in the Timeline/Composition tabs (in tab order), the
+one in front and each one's current time, and opening it (Open, Open Recent, Revert, a
+recovered auto-save) brings them back, as After Effects does with an `.aep`. Changing tabs or
+the time doesn't mark the project modified; comps deleted since are skipped; older files open as
+before.
 ## Update: Panel Group Settings ▸ Solo Panels in Stack and Small Tabs (10 October)
 
 - The panel menu's last two Panel Group Settings items work: Solo Panels in Stack
@@ -895,3 +905,37 @@ Recorded in one place on 10 October; each landed with tests.
   and Small Tabs (`window.smallTabs {panel, small?}`) gives a docked group or stack a shorter tab
   strip with smaller labels. Both are saved with the layout and its workspaces. Floating groups
   don't have Small Tabs yet.
+- Agents sharing the desktop app over MCP get their own name by default: a bridged MCP server
+  without `--client` runs as `<MCP client name>-<pid>`, so it never moves the user's selection,
+  comp or time and can claim comps; `"client": ""` runs one call as the user.
+- MCP `--autosave` recovery stays bounded on disk: checkpoints of 8 MB or more are throttled to one
+  every 30 s (flushed when the session ends), a normal save removes the session's recovery files,
+  and new sessions prune finished saved sessions and folders untouched for 30 days.
+- Desktop control channel: a `wait: true` job command (render queue, analyses, footage check,
+  Content-Aware Fill, Scene Edit Detection) and `jobs.wait` start the job and reply when it ends,
+  instead of blocking the UI thread, so one agent's long job no longer stalls the other agents or
+  the window.
+- Renders requested over the desktop control channel (`render.frame`, `render.contactSheet`, and
+  the MCP bridge's renders) run as background tasks on a copy of the project, so the window and
+  other agents carry on; `wait: false` starts one from any client (`jobs.list`, quiet, no toast).
+- Host list and save guard: every EffectCraft holding a project (the app, MCP servers) is listed
+  in `<config>/Hosts/` (`hosts.list`: kind, control port, open project); opening a project another
+  one has open warns with the port to join; saving over a project file that changed on disk since
+  it was opened or saved here is refused unless `force: true`, so copies no longer overwrite each
+  other's work silently.
+- MCP `hosts` tool: lists where projects are open and `join`s a host (by port or project path) as
+  a named agent, so an agent hops between projects without restarting; refused while its own
+  headless project has unsaved changes.
+- `effectcraft-cli serve`: a windowless host holding one project that several agents join over the
+  control channel (own cursors, comp claims, waiting jobs that don't block the others, throttled
+  checkpoints, in the host list); `host.release` saves and stops it.
+- Handover: opening a project that a windowless host (`effectcraft-cli serve`) has open asks the
+  host to save and stop, then opens the saved file, instead of making a second copy; agents whose
+  host went away are pointed to the MCP `hosts` tool to rejoin.
+- `file.importAep` and `file.importProject` take `wait: false`: the After Effects export, or reading
+  a big project file, runs in the background (Window ▸ Progress) and the import applies as one undo
+  step when done; the desktop control channel and windowless hosts use it, so a 1 GB import no
+  longer stalls other agents.
+- Undo with agents in the project: `edit.undo` (⌘Z) undoes the caller's own latest step; behind
+  someone else's steps it reverts only what that step changed (per comp or item), refused when
+  they changed the same thing since; `edit.undo {any: true}` undoes the last step whoever made it.

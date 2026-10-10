@@ -136,6 +136,11 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
                                            --all-tools also lists the older tool aliases;
                                            --client NAME (or EFFECTCRAFT_CLIENT) runs every tool call as
                                            that agent: its own selection, comp and time, comp claims
+  serve [F.ecproj | --demo] [--control PORT] [--gpu]
+                                           a windowless host: one project that several agents work on at
+                                           once over the control channel (join with mcp --bridge PORT or
+                                           the MCP hosts tool); prints the port; checkpoints unsaved work;
+                                           in the host list until it stops (host.release saves and stops it)
   figma-bridge [--port 7789] [--control 9877] [--code CODE]
                                            local endpoint for the EffectCraft Figma plug-in: imports what it
                                            sends into the running app (file.importFigma); prints the pairing code
@@ -359,6 +364,11 @@ fn usage_err<T>(m: &str) -> Result<T, Failure> {
 /// Build the backend: a bridge to the app, the app offscreen (`--ui`), or a headless session, with
 /// the requested project.
 fn backend(args: &Args, default_demo: bool) -> Result<Backend, Failure> {
+    // Opening a project another EffectCraft has open warns (the host list), and saving over a
+    // file changed meanwhile is refused.
+    if let Some(dir) = effectcraft_host::config_dir() {
+        effectcraft_engine::hosts::init(&dir);
+    }
     if let Some(addr) = args.opt("--bridge") {
         if args.project.is_some() || args.flag("--demo") {
             return usage_err("--bridge drives the running app's project; use `exec file.open` to open another");
@@ -774,6 +784,13 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
             if args.flag("--autosave") && args.opt("--bridge").is_some() {
                 return usage_err("--autosave is for MCP with the project in this process (headless or --ui); the bridged app owns its auto-saves");
             }
+            // A project in this process (headless / --ui) is in the host list (announced before
+            // `--project` opens); a bridge isn't a host.
+            if args.opt("--bridge").is_none()
+                && let Some(dir) = effectcraft_host::config_dir()
+            {
+                effectcraft_engine::hosts::announce(&dir, "mcp", None);
+            }
             let b = backend(args, false)?;
             // --client NAME (or EFFECTCRAFT_CLIENT): every tool call runs as that agent (its own
             // selection, active comp and time; comp claims).
@@ -790,10 +807,37 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
                 server
             };
             // A client that closes its end of stdout has ended the session.
-            match server.serve_stdio() {
+            let served = server.serve_stdio();
+            effectcraft_engine::hosts::withdraw();
+            match served {
                 Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => return Err(e.to_string().into()),
                 _ => {}
             }
+        }
+        "serve" => {
+            let port = match args.opt("--control") {
+                Some(p) => p.parse::<u16>().map_err(|_| Failure::Usage(format!("--control: `{p}` is not a port")))?,
+                None => 0,
+            };
+            let (project, demo, gpu) = (args.project.clone(), args.flag("--demo"), args.flag("--gpu"));
+            let make = Box::new(move || -> Result<effectcraft_engine::Session, String> {
+                let mut s = effectcraft_host::session();
+                if gpu {
+                    let g = effectcraft_gpu::Gpu::try_headless().map_err(|e| format!("--gpu: no usable GPU adapter ({e})"))?;
+                    s.accel = Some(std::sync::Arc::new(g));
+                }
+                if let Some(p) = &project {
+                    s.execute("file.open", json!({"path": p})).map_err(|e| e.to_string())?;
+                } else if demo {
+                    s.execute("file.openDemoProject", json!({})).map_err(|e| e.to_string())?;
+                }
+                Ok(s)
+            });
+            let config = effectcraft_automation::host_server::HostConfig { port, config_dir: effectcraft_host::config_dir() };
+            effectcraft_automation::host_server::serve(config, make, |port| {
+                println!("EffectCraft host listening on 127.0.0.1:{port} (agents: effectcraft-cli mcp --bridge {port})");
+            })
+            .map_err(|e| Failure::Error(format!("serve: {e}")))?;
         }
         other => return usage_err(&format!("unknown subcommand `{other}`")),
     }
@@ -886,8 +930,9 @@ fn render(args: &Args, json_out: bool) -> Result<(), Failure> {
         let Some(out) = args.opt("--out") else { return usage_err("render: --out FILE is required (or --queue)") };
         let out = &from_cwd(out)?;
         let mut p = json!({"output": out});
-        if let Some(c) = args.opt("--comp") {
-            p["comp"] = json!(c);
+        // Same resolution as `render-frame`: a number is a comp id, `-` the active comp, else a name.
+        if let Some(c) = args.opt("--comp").and_then(reference) {
+            p["comp"] = c;
         }
         let ext = std::path::Path::new(out).extension().map(|e| e.to_string_lossy().to_string());
         if let Some(f) = args.opt("--format").map(str::to_string).or(ext) {
@@ -1343,7 +1388,7 @@ fn adv3d_bench_comp(p: &mut effectcraft_engine::project::Project) -> Option<Item
         set(l, "cameraOptions/highlightGain", Value::Scalar(20.0));
         set(l, "cameraOptions/highlightThreshold", Value::Scalar(200.0));
     });
-    comp.layers = layers;
+    comp.layers = layers.into();
     Some(p.add_item("Advanced 3D (bench)", effectcraft_engine::color::Label::None, None, ItemKind::Comp(comp.into())))
 }
 

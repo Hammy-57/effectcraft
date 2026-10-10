@@ -146,8 +146,9 @@ pub enum Outcome {
     Held,
 }
 
-/// A `wait: true` engine command whose job was sent to the session's offload (the browser's
-/// Web Workers) instead of blocking the UI thread: the reply goes out when the job ends.
+/// A `wait: true` engine command (or `jobs.wait`) whose job runs in the background instead of
+/// blocking the UI thread: on desktop a worker thread, in the browser the session's offload (Web
+/// Workers). The reply goes out when the job ends, and other clients' requests run meanwhile.
 pub struct JobWaiter {
     pub command: String,
     pub params: Value,
@@ -159,17 +160,30 @@ pub struct JobWaiter {
     pub log_len: usize,
 }
 
+/// Ids of the background jobs `jobs.wait` waits for (the generic tasks).
+fn task_ids(app: &EffectcraftApp) -> Vec<String> {
+    app.session.jobs().into_iter().map(|j| j.id).filter(|j| j.starts_with("task:")).collect()
+}
+
 /// Commands that block with `wait` (and its default).
 fn waits(command: &str, params: &Value) -> bool {
-    let default = command == "renderQueue.render";
+    // Frame renders and contact sheets too, so one agent's render never holds up the others.
+    let default = matches!(command, "renderQueue.render" | "render.frame" | "render.contactSheet" | "file.importAep" | "file.importProject");
     params.get("wait").and_then(Value::as_bool).unwrap_or(default)
 }
 
-/// Run an engine command. A waiting command (`wait: true`) whose job the session offloads
-/// runs with `wait: false` instead, and the reply waits for the job ([`Outcome::AwaitJobs`]),
-/// so the browser's UI keeps drawing while it runs.
+/// Run an engine command. A waiting command (`wait: true`) runs with `wait: false` instead, and
+/// the reply waits for the job it started ([`Outcome::AwaitJobs`]), so the UI keeps drawing and
+/// other clients' requests run while it works. `jobs.wait` likewise waits for the running tasks.
 fn execute_engine(app: &mut EffectcraftApp, id: &str, params: Value) -> Result<Outcome, String> {
-    if !app.session.offloads() || !waits(id, &params) {
+    if id == "jobs.wait" && !app.session.offloads() {
+        let jobs = task_ids(app);
+        if !jobs.is_empty() {
+            let log_len = app.session.offload_log.len();
+            return Ok(Outcome::AwaitJobs(JobWaiter { command: id.to_string(), params, result: json!({}), jobs, log_len }));
+        }
+    }
+    if !waits(id, &params) {
         return app.session.execute_checked(id, params).map(ok).map_err(|e| e.to_string());
     }
     let before: Vec<String> = app.session.jobs().into_iter().map(|j| j.id).collect();
@@ -195,9 +209,22 @@ impl JobWaiter {
     pub fn finish(self, app: &mut EffectcraftApp) -> Value {
         let s = &mut app.session;
         s.poll_render();
+        if self.command == "jobs.wait" {
+            return json!({"ok": true, "result": {"finished": s.job_log}});
+        }
         let errors: Vec<String> = s.offload_log.iter().skip(self.log_len).filter_map(|(_, e)| e.clone()).collect();
         if let Some(e) = errors.first() {
             return json!({"ok": false, "error": e});
+        }
+        // A generic task (desktop): the blocking command returned its result, or failed with its
+        // message.
+        let mut tasks: Vec<&mut effectcraft_engine::jobs::JobRecord> = s.job_log.iter_mut().filter(|r| self.jobs.contains(&r.id)).collect();
+        if let Some(r) = tasks.iter().find(|r| r.status != "done") {
+            return json!({"ok": false, "error": if r.message.is_empty() { r.status.clone() } else { r.message.clone() }});
+        }
+        if let [task] = tasks.as_mut_slice() {
+            // Taken, not copied: a render's PNG shouldn't stay in the job log.
+            return json!({"ok": true, "result": std::mem::take(&mut task.result)});
         }
         let mut r = self.result;
         if r.get("running").is_some() {
@@ -249,6 +276,15 @@ fn point(app: &EffectcraftApp, p: &Value) -> Result<egui::Pos2, String> {
     let x = p.get("x").and_then(Value::as_f64).ok_or("need `id` or `x`,`y`")?;
     let y = p.get("y").and_then(Value::as_f64).ok_or("need `y`")?;
     Ok(egui::pos2(x as f32, y as f32))
+}
+
+/// The undocked OS window a point is in: its element's window (`id`), else `window` (a floating
+/// group id, see `ui.elements`); `None` for the main window.
+fn point_window(app: &EffectcraftApp, p: &Value) -> Option<u64> {
+    match p.get("id").and_then(Value::as_str) {
+        Some(id) => app.auto.find(id).and_then(|e| e.window),
+        None => p.get("window").and_then(Value::as_u64),
+    }
 }
 
 pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlRequest) -> Outcome {
@@ -400,22 +436,23 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
                 Some("middle") => egui::PointerButton::Middle,
                 _ => egui::PointerButton::Primary,
             };
-            app.synthetic.push(egui::Event::PointerMoved(pos));
+            let mut events = vec![egui::Event::PointerMoved(pos)];
             if req.method == "ui.click" {
                 let count = p.get("count").and_then(Value::as_u64).unwrap_or(1);
                 for _ in 0..count {
-                    app.synthetic.push(egui::Event::PointerButton { pos, button, pressed: true, modifiers: m });
-                    app.synthetic.push(egui::Event::PointerButton { pos, button, pressed: false, modifiers: m });
+                    events.push(egui::Event::PointerButton { pos, button, pressed: true, modifiers: m });
+                    events.push(egui::Event::PointerButton { pos, button, pressed: false, modifiers: m });
                 }
             } else {
                 // A drag in steps: `down` presses and holds the button here, later moves drag,
                 // `up` releases (look at the UI mid-drag in between).
                 for (key, pressed) in [("down", true), ("up", false)] {
                     if p.get(key).and_then(Value::as_bool) == Some(true) {
-                        app.synthetic.push(egui::Event::PointerButton { pos, button, pressed, modifiers: m });
+                        events.push(egui::Event::PointerButton { pos, button, pressed, modifiers: m });
                     }
                 }
             }
+            crate::float_windows::send_pointer(app, ctx, point_window(app, p), events);
             Outcome::AfterInput
         }
         "ui.drag" => {
@@ -427,13 +464,15 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
             };
             let steps = p.get("steps").and_then(Value::as_u64).unwrap_or(12).max(2);
             let m = modifiers(p);
-            app.synthetic.push(egui::Event::PointerMoved(a));
-            app.synthetic.push(egui::Event::PointerButton { pos: a, button: egui::PointerButton::Primary, pressed: true, modifiers: m });
+            let mut events =
+                vec![egui::Event::PointerMoved(a), egui::Event::PointerButton { pos: a, button: egui::PointerButton::Primary, pressed: true, modifiers: m }];
             for i in 1..=steps {
                 let f = i as f32 / steps as f32;
-                app.synthetic.push(egui::Event::PointerMoved(a + (b - a) * f));
+                events.push(egui::Event::PointerMoved(a + (b - a) * f));
             }
-            app.synthetic.push(egui::Event::PointerButton { pos: b, button: egui::PointerButton::Primary, pressed: false, modifiers: m });
+            events.push(egui::Event::PointerButton { pos: b, button: egui::PointerButton::Primary, pressed: false, modifiers: m });
+            // (In the window the drag starts in, which has the pointer until it is released.)
+            crate::float_windows::send_pointer(app, ctx, point_window(app, from), events);
             Outcome::AfterInput
         }
         "ui.scroll" => {
@@ -443,19 +482,22 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
             };
             let dx = p.get("dx").and_then(Value::as_f64).unwrap_or(0.0) as f32;
             let dy = p.get("dy").and_then(Value::as_f64).unwrap_or(0.0) as f32;
-            app.synthetic.push(egui::Event::PointerMoved(pos));
-            app.synthetic.push(egui::Event::MouseWheel {
-                unit: egui::MouseWheelUnit::Point,
-                delta: egui::vec2(dx, dy),
-                modifiers: modifiers(p),
-                phase: egui::TouchPhase::Move,
-            });
-            app.synthetic.push(egui::Event::PointerButton {
-                pos: egui::pos2(-100.0, -100.0),
-                button: egui::PointerButton::Extra1,
-                pressed: false,
-                modifiers: Default::default(),
-            });
+            let events = vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(dx, dy),
+                    modifiers: modifiers(p),
+                    phase: egui::TouchPhase::Move,
+                },
+                egui::Event::PointerButton {
+                    pos: egui::pos2(-100.0, -100.0),
+                    button: egui::PointerButton::Extra1,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ];
+            crate::float_windows::send_pointer(app, ctx, point_window(app, p), events);
             Outcome::AfterInput
         }
         "ui.key" => {
@@ -464,14 +506,21 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
             let extra = modifiers(p);
             m |= extra;
             let physical_key = name.starts_with("Physical+").then_some(key);
-            app.synthetic.push(egui::Event::Key { key, physical_key, pressed: true, repeat: false, modifiers: m });
-            app.synthetic.push(egui::Event::Key { key, physical_key, pressed: false, repeat: false, modifiers: m });
+            let events = vec![
+                egui::Event::Key { key, physical_key, pressed: true, repeat: false, modifiers: m },
+                egui::Event::Key { key, physical_key, pressed: false, repeat: false, modifiers: m },
+            ];
+            // (To the window the last pointer input went to: an undocked one, or the main window.)
+            crate::float_windows::send_keys(app, ctx, events);
             Outcome::AfterInput
         }
         "ui.type" => {
             let Some(text) = s("text") else { return err("missing `text`") };
-            app.synthetic.push(egui::Event::Text(text.to_string()));
-            app.synthetic.push(egui::Event::Key { key: egui::Key::F35, physical_key: None, pressed: false, repeat: false, modifiers: Default::default() });
+            let events = vec![
+                egui::Event::Text(text.to_string()),
+                egui::Event::Key { key: egui::Key::F35, physical_key: None, pressed: false, repeat: false, modifiers: Default::default() },
+            ];
+            crate::float_windows::send_keys(app, ctx, events);
             Outcome::AfterInput
         }
         "ui.viewer.locate" => {
@@ -496,7 +545,14 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
         "ui.timeline.locate" => {
             let Some(l) = p.get("layer").and_then(Value::as_u64) else { return err("need `layer` (id)") };
             match crate::panels::timeline::locate(app, l, p.get("time").and_then(Value::as_f64)) {
-                Some((x, y)) => ok(json!({"x": x, "y": y})),
+                Some((x, y)) => {
+                    // (A Timeline in an undocked OS window: click with this `window`.)
+                    let mut r = json!({"x": x, "y": y});
+                    if let Some(w) = app.auto.find("timeline.ruler").and_then(|e| e.window) {
+                        r["window"] = json!(w);
+                    }
+                    ok(r)
+                }
                 None => Outcome::Retry("layer not visible in the timeline".into()),
             }
         }
@@ -513,14 +569,26 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
             )
         }
         "ui.screenshot" => {
-            let crop = s("panel").and_then(PanelKind::from_name).and_then(|pk| app.auto.find(&format!("panel.{}", pk.id())).map(|e| e.rect));
-            let crop = crop.or_else(|| s("id").and_then(|id| app.auto.find(id).map(|e| e.rect)));
+            let crop = s("panel").and_then(PanelKind::from_name).and_then(|pk| app.auto.find(&format!("panel.{}", pk.id())));
+            let crop = crop.or_else(|| s("id").and_then(|id| app.auto.find(id)));
+            // The capture is of the main window.
+            if let Some(w) = crop.and_then(|e| e.window) {
+                return err(format!(
+                    "that is in an undocked panel window ({w}): ui.screenshot captures the main window only (dock the panel with window.dockPanel first)"
+                ));
+            }
+            let crop = crop.map(|e| e.rect);
             // Bring the window on screen so a frame is presented, without taking keyboard focus.
             app.raise_for_control(ctx);
             let max_side = p.get("max_side").or(p.get("maxSide")).and_then(Value::as_u64).map_or(SCREENSHOT_MAX_SIDE, |m| u32::try_from(m).unwrap_or(u32::MAX));
             Outcome::Screenshot { path: s("path").map(str::to_string), crop, max_side }
         }
         "app.revision" => ok(json!({"revision": app.session.revision})),
+        // Desktop: rendered off the UI thread like the engine command (the reply waits for it).
+        "render.frame" if !cfg!(target_arch = "wasm32") => match execute_engine(app, "render.frame", p.clone()) {
+            Ok(o) => o,
+            Err(e) => err(e),
+        },
         "render.frame" => render_frame(app, p),
         "ui.resize" => {
             let w = p.get("width").and_then(Value::as_f64).unwrap_or(1600.0) as f32;

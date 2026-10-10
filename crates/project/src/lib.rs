@@ -8,6 +8,7 @@
 
 pub mod build;
 pub mod essential;
+pub mod layers;
 pub mod props;
 pub mod render_queue;
 pub mod render_templates;
@@ -26,6 +27,7 @@ use serde::{Deserialize, Serialize};
 
 pub use effectcraft_keyframe as keyframe;
 pub use effectcraft_keyframe::{Keyframe, Value};
+pub use layers::Layers;
 
 /// The project file schema. 2: effects on layers without a source rectangle (shape, text)
 /// measure positions from the top-left of their comp-sized bounds (effect space), not from
@@ -40,12 +42,55 @@ pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The EffectCraft version that wrote a project file (its `savedBy`), when it says.
 pub fn saved_by(text: &str) -> Option<String> {
+    file_meta(text).saved_by
+}
+
+/// The compositions open when a project was saved, as After Effects keeps them with the
+/// project: their Timeline/Composition tabs in tab order, each one's current time, and the one in
+/// front. A project file carries it next to the project (`openComps`, beside `savedBy`), not in
+/// [`Project`]: it is editor state, so it has no undo step and changing tabs or moving the
+/// current time doesn't make the project modified. Files without it (older versions, other
+/// apps) open as before.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct OpenComps {
+    /// Open compositions in tab order.
+    #[serde(default)]
+    pub comps: Vec<OpenComp>,
+    /// The comp in front (`None`: the first).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<ItemId>,
+}
+
+/// One open composition of [`OpenComps`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct OpenComp {
+    pub comp: ItemId,
+    /// Its current time (comp time, ticks).
+    #[serde(default)]
+    pub time: Tick,
+}
+
+/// What a project file holds besides the project.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FileMeta {
+    /// The version that wrote it (`savedBy`).
+    pub saved_by: Option<String>,
+    /// The open compositions (`openComps`); `None` when absent or unreadable.
+    pub open_comps: Option<OpenComps>,
+}
+
+/// Read a project file's [`FileMeta`] (one pass over the text; a malformed `openComps` is
+/// ignored rather than failing the rest).
+pub fn file_meta(text: &str) -> FileMeta {
     #[derive(Deserialize)]
     struct Meta {
         #[serde(rename = "savedBy", default)]
         saved_by: Option<String>,
+        #[serde(rename = "openComps", default)]
+        open_comps: Option<serde_json::Value>,
     }
-    serde_json::from_str::<Meta>(text).ok()?.saved_by
+    let Ok(m) = serde_json::from_str::<Meta>(text) else { return FileMeta::default() };
+    FileMeta { saved_by: m.saved_by, open_comps: m.open_comps.and_then(|v| serde_json::from_value(v).ok()) }
 }
 
 /// Whether version `a` (`major.minor.patch`, pre-release suffixes ignored) is newer than `b`.
@@ -294,8 +339,9 @@ pub struct Comp {
     pub display_start: Tick,
     pub background: [f32; 3],
     pub work_area: (Tick, Tick),
-    /// Layer #1 first (top of the stack).
-    pub layers: Vec<Layer>,
+    /// Layer #1 first (top of the stack). Each layer is shared between snapshots until an edit
+    /// changes it (copy-on-write per layer, see [`Layers`]).
+    pub layers: Layers,
     #[serde(default)]
     pub markers: Vec<Marker>,
     pub shutter_angle: f64,
@@ -364,7 +410,7 @@ impl Comp {
             display_start: Tick::ZERO,
             background: [0.0, 0.0, 0.0],
             work_area: (Tick::ZERO, duration),
-            layers: vec![],
+            layers: vec![].into(),
             markers: vec![],
             shutter_angle: 180.0,
             shutter_phase: -90.0,
@@ -409,8 +455,9 @@ impl Comp {
     pub fn layer(&self, id: LayerId) -> Option<&Layer> {
         self.layers.iter().find(|l| l.id == id)
     }
+    /// Copy-on-write access to one layer: the comp's other layers stay shared.
     pub fn layer_mut(&mut self, id: LayerId) -> Option<&mut Layer> {
-        self.layers.iter_mut().find(|l| l.id == id)
+        self.layers.find_mut(|l| l.id == id)
     }
     /// 1-based layer number (#) of a layer.
     pub fn index_of(&self, id: LayerId) -> Option<usize> {
@@ -746,7 +793,7 @@ impl Comp {
         }
         let mut c = self.clone();
         c.hide_shy = false;
-        for l in &mut c.layers {
+        for l in c.layers.iter_mut_where(|l| l.switches != l.switches.pixels()) {
             l.switches = l.switches.pixels();
         }
         std::borrow::Cow::Owned(c)
@@ -1301,14 +1348,21 @@ impl Project {
     /// to read back, so a save never writes a file that can't be opened (JSON has no NaN or
     /// infinity: such a value would be written as `null`).
     pub fn to_file_json(&self) -> Result<String, ProjectError> {
+        self.to_file_json_with(None)
+    }
+    /// [`Project::to_file_json`] with the comps open in the editor ([`OpenComps`], written as
+    /// `openComps` after the project).
+    pub fn to_file_json_with(&self, open: Option<&OpenComps>) -> Result<String, ProjectError> {
         #[derive(Serialize)]
         struct File<'a> {
             #[serde(rename = "savedBy")]
             saved_by: &'a str,
             #[serde(flatten)]
             project: &'a Project,
+            #[serde(rename = "openComps", skip_serializing_if = "Option::is_none")]
+            open_comps: Option<&'a OpenComps>,
         }
-        let text = serde_json::to_string_pretty(&File { saved_by: APP_VERSION, project: self })
+        let text = serde_json::to_string_pretty(&File { saved_by: APP_VERSION, project: self, open_comps: open })
             .map_err(|e| ProjectError::Invalid(format!("the project can't be saved: {e}")))?;
         Project::from_json(&text)
             .map_err(|e| ProjectError::Invalid(format!("the project can't be saved: it holds a value a project file can't store ({e})")))?;
@@ -1320,6 +1374,18 @@ impl Project {
     /// [`Project::to_json`] without indentation: smaller and faster (auto-saves).
     pub fn to_json_compact(&self) -> String {
         serde_json::to_string(self).unwrap_or_default()
+    }
+    /// [`Project::to_json_compact`] with the comps open in the editor (auto-saves: crash
+    /// recovery reopens them too).
+    pub fn to_json_compact_with(&self, open: Option<&OpenComps>) -> String {
+        #[derive(Serialize)]
+        struct File<'a> {
+            #[serde(flatten)]
+            project: &'a Project,
+            #[serde(rename = "openComps", skip_serializing_if = "Option::is_none")]
+            open_comps: Option<&'a OpenComps>,
+        }
+        serde_json::to_string(&File { project: self, open_comps: open }).unwrap_or_default()
     }
     pub fn from_json(s: &str) -> Result<Project, ProjectError> {
         let mut p: Project = serde_json::from_str(s).map_err(|e| ProjectError::Invalid(e.to_string()))?;

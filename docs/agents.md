@@ -73,12 +73,18 @@ and transport errors also flush outstanding changes. Queries do not rotate the s
 A failed checkpoint adds a warning to the tool reply; the edit remains in memory and the next
 call retries. Use `save_project {path}` to a writable location before disconnecting if warned.
 
+Recovery stays small on disk: a checkpoint of 8 MB or more is written at most every 30 seconds
+(the change waits, `autosave.pending` says so, and the session's end always writes it), each
+session keeps the Auto-Save setting's maximum number of versions, saving the project normally (or
+undoing back to the saved state) removes the session's recovery files, and a new session removes
+the folders of finished, saved sessions and of any session untouched for 30 days.
+
 Each server has its own folder under `<config directory>/EffectCraft Auto-Save/MCP/` (or
 `<custom Auto-Save folder>/MCP/`). The maximum-version setting applies within that folder.
 `--autosave` enables these checkpoints regardless of the desktop's Auto-Save toggle and interval;
 it reads settings without writing desktop preferences, shortcuts or crash-recovery state.
-`EFFECTCRAFT_CONFIG_DIR` overrides the platform config directory. Session folders are retained
-for recovery; remove old folders once their work is saved elsewhere.
+`EFFECTCRAFT_CONFIG_DIR` overrides the platform config directory. Unsaved sessions' folders are
+kept for recovery (up to 30 days).
 
 `initialize` instructions and `_meta.effectcraftAutoSave` list the current folder and up to five
 previous dirty sessions; `doc_inspect`'s `project.autosave` also reports the latest checkpoint and errors.
@@ -120,6 +126,7 @@ See [MCP conventions](mcp.md) for core tools, resources, strict arguments, and p
 | `render_snapshot {name, comp?, time?, max_side?, transparent?}` | Render a frame and keep it in the session under `name` (16 kept, oldest dropped; the same name replaces). |
 | `render_compare {a, b, threshold?, min_psnr?, max_side?, region?, amplify?, diff_path?, inline?}` | Compare two frames. `a` and `b` are each a snapshot name (or `{snapshot}`), `{path}` (a PNG/JPEG golden or After Effects reference) or `{comp?, time?, transparent?}` (render now; `{}` = active comp at the CTI). Returns `{width, height, max_abs, mean_abs, alpha_max_abs, psnr_db, ssim, changed_pixels, changed_pct, pass, diffBounds}` and, when something changed, the diff heatmap as an image. `region: [x, y, w, h]` compares one rectangle. See [Verify your change](#verify-your-change-snapshot--edit--compare). |
 | `open_project {path \| demo \| new}` / `save_project {path?}` | Open and save files. |
+| `hosts {join?}` | Where projects are open (each running EffectCraft, its port and project); `join` (a port or a project path) switches this server onto that host as your own `client`, so several agents work in one project. Refused while your own project has unsaved changes. |
 | `undo {steps?}` / `redo {steps?}` | History. |
 | `history {goto?}` | The branching undo history (History panel): every state with its index, id, label, branch depth and whether it's current; `goto` (an index or id) jumps to any state, on any branch, without losing the others. |
 | `script_ui {action?, window?, widget?, value?, result?}` | Drive ScriptUI windows that scripts opened: `list` (default) the open windows, `get` a window's control tree, `click` a button / checkbox / radio button, `set` text, a slider or a list item, `close` a window (`result`: what a dialog's `show()` returns, default 2 = Cancel). |
@@ -175,7 +182,12 @@ Pass `client` on every request (`"client": "agentA"`) when you share the app wit
 agents. Over MCP, every tool takes it as an argument (`set_property {"layer": 2, …, "client":
 "agentA"}`; the engine commands the tool runs carry it, and renders default to your time), or start
 the server as `effectcraft-cli mcp --client agentA` (or set `EFFECTCRAFT_CLIENT`) so every call runs
-as you; a call's own `client` wins. Two things follow:
+as you; a call's own `client` wins. A bridged MCP server (`mcp --bridge`) given no name names itself
+at `initialize`: the MCP client's name and the server's process id (`claude-code-4821`, also in the
+`initialize` instructions and `get_state`), so an agent sharing the app never moves the user's view
+by accident. Pass `"client": ""` on a call that should act as the user, for example to open a comp
+in their viewer. Headless and `--ui` servers keep running as the user (the agent is alone there).
+Two things follow:
 
 - **Your own cursor.** Selection (layers, properties, keys, mask vertices, Project items), active comp
   and current time are yours: `layer.select`, `time.set`, `comp.new` / `comp.open` and every command
@@ -184,7 +196,8 @@ as you; a call's own `client` wins. Two things follow:
   tab, but the user's viewer stays on what they are looking at. `editor.state` with your `client` is
   your view; without one it is the user's, plus `clients` (each agent's active comp, time and selected
   layers) and `claims`. At most 64 cursors are kept (the least recently used goes); requests without
-  `client` behave exactly as before.
+  `client` behave exactly as before. A project you save remembers the user's open comps, front comp
+  and current times (`openComps`), never yours.
 - **Claims.** `comp.claim {comp, ttl?}` reserves a comp for you (`ttl` seconds, default 300, at most
   24 h; claim again to renew). While it holds, another client's command that would change the comp (its
   layers, properties or name) or delete it is refused, changing nothing: `composition "Main" is claimed
@@ -195,6 +208,41 @@ as you; a call's own `client` wins. Two things follow:
   dropped when another project is opened, and the control channel releases a client's claims when the
   last connection that used that `client` closes (keep one connection open, as the MCP bridge does).
   Without `client`, `comp.release` needs `force: true` (the user overriding a claim).
+
+### Undo with several people in one project
+
+`edit.undo` undoes the caller's own latest step: the user's (no `client`) or the agent's. When
+someone else made the last step, only what the caller's step changed is reverted, as a new step
+(`{undone, selective: true}`), so the user's ⌘Z never removes an agent's work and an agent's undo
+never removes the user's. It's refused, changing nothing, when someone changed the same item (a
+comp, footage item, folder) or the project settings since; the error names who. The user's
+`edit.undo {any: true}` undoes the last step whoever made it, and the History panel still jumps to
+any state.
+
+### Which project is open where (hosts) and the save guard
+
+One process holds one project. Every EffectCraft that holds one (the desktop app, a headless or
+`--ui` MCP server) is listed in `<config directory>/Hosts/` with its kind, control port and open
+project; `command_run hosts.list` returns the live ones (`{hosts: [{pid, kind, port, project, me}]}`).
+To work on a project that is already open, join that host (the MCP `hosts {join: <port or
+project>}` tool, or start with `--bridge <port>`; you keep your own `client`) instead of opening a
+copy: `file.open` of a project another host has open succeeds but
+warns, and its reply lists them in `openElsewhere`.
+
+With the desktop app closed, a **windowless host** keeps one project in memory for several agents:
+`effectcraft-cli serve Project.ecproj [--control PORT]` prints its port; agents join it like the app
+(`effectcraft-cli mcp --bridge PORT`, or the MCP `hosts {join}` tool) and work on their own comps with
+their own `client` and `comp.claim`. Commands that wait for a job (renders, analyses, `jobs.wait`)
+reply when it ends without holding up the other agents; unsaved work is checkpointed (big projects
+at most every 30 s); `host.release {path?}` saves the project and stops the host. Opening that project in the
+desktop app does this by itself (a handover: the app asks the host to save and stop, waits, then
+opens the saved file; the reply's `handover` says so), and the host's agents find the project in
+the app with the MCP `hosts` tool. `ui.*` methods need the app.
+
+Two copies of one file overwrite each other when saved, so saving is guarded: `file.save` /
+`file.saveAs` over a file that changed on disk since this process opened or saved it (another
+app, an agent's CLI, a script) is refused, naming the ways out: save under a new name
+(`file.saveAs`), reload theirs (`file.revert`), or `force: true` to overwrite.
 
 ### A typical session
 

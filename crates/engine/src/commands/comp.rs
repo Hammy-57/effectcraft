@@ -35,7 +35,7 @@ fn apply_settings(c: &mut Comp, p: &Value) {
         let dx = (c.width as f64 - ow as f64) * (a % 3) as f64 / 2.0;
         let dy = (c.height as f64 - oh as f64) * (a / 3) as f64 / 2.0;
         if dx != 0.0 || dy != 0.0 {
-            for l in c.layers.iter_mut().filter(|l| l.parent.is_none()) {
+            for l in c.layers.iter_mut_where(|l| l.parent.is_none()) {
                 let Some(pr) = l.props.prop_mut("transform/position") else { continue };
                 let shift = |v: &mut effectcraft_keyframe::Value| {
                     if let effectcraft_keyframe::Value::Vec2(x) = v {

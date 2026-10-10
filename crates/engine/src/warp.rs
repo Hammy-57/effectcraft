@@ -132,27 +132,36 @@ pub fn signature(p: &Project, comp: ItemId, layer: &Layer) -> String {
     format!("{:016x}", fnv(&s))
 }
 
+/// Whether layer `i` of comp `cid` is the very layer it was before an edit (shared, not copied)
+/// and what its frames are made of outside the layer (source item, comp frame rate) is unchanged:
+/// nothing an analysis of it depends on changed, so the checks after an edit can skip it.
+/// `full`: check every layer anyway (the state before the edit wasn't checked).
+pub(crate) fn untouched(before: &Project, after: &Project, cid: ItemId, i: usize, l: &Layer, full: bool) -> bool {
+    !full && before.comp(cid).zip(after.comp(cid)).is_some_and(|(b, a)| a.layers.shares(&b.layers, i)) && signature(before, cid, l) == signature(after, cid, l)
+}
+
 fn is_warp(g: &PropGroup) -> bool {
     matches!(&g.kind, GroupKind::Effect { effect } if effect == warp_stab::ID)
 }
 
-fn str_of(g: &PropGroup, m: &str) -> String {
+fn str_of<'a>(g: &'a PropGroup, m: &str) -> &'a str {
     match g.get(m).map(|p| &p.value) {
-        Some(Value::Str(s)) => s.clone(),
-        _ => String::new(),
+        Some(Value::Str(s)) => s,
+        _ => "",
     }
 }
 
 /// Clear analyses that no longer match their layer, after an edit. Returns the Warp
-/// Stabilizers that need (re-)analysis: cleared ones and newly applied, unanalysed ones.
-pub(crate) fn invalidate(before: &Project, after: &mut Project) -> Vec<(ItemId, LayerId, Uid)> {
+/// Stabilizers that need (re-)analysis: cleared ones and newly applied, unanalysed ones. Layers
+/// the edit didn't touch are skipped unless `full` (see [`untouched`]).
+pub(crate) fn invalidate(before: &Project, after: &mut Project, full: bool) -> Vec<(ItemId, LayerId, Uid)> {
     let mut todo = vec![];
     let mut clear = vec![];
     for (cid, it) in &after.items {
         let ItemKind::Comp(c) = &it.kind else { continue };
-        for l in &c.layers {
+        for (i, l) in c.layers.iter().enumerate() {
             let Some(fx) = l.effects() else { continue };
-            if !fx.groups().any(is_warp) {
+            if !fx.groups().any(is_warp) || untouched(before, after, *cid, i, l, full) {
                 continue;
             }
             let sig = signature(after, *cid, l);

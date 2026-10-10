@@ -93,6 +93,9 @@ pub struct Cursors {
     /// Client → (cursor, last use).
     map: BTreeMap<String, (Cursor, u64)>,
     clock: u64,
+    /// The cursors of whoever ran before while a client's command runs (innermost last): the
+    /// first is the user's, which is what a project file saves ([`Session::open_comps_to_save`]).
+    suspended: Vec<Cursor>,
 }
 
 impl Cursors {
@@ -123,8 +126,17 @@ impl Cursors {
         self.map.is_empty()
     }
 
+    /// Forget every client cursor (another project was opened). The suspended outer cursors
+    /// point into the old project too: [`run_as`] starts them again from the current state.
     pub fn clear(&mut self) {
         self.map.clear();
+        self.suspended.clear();
+    }
+
+    /// The user's cursor while a client's command runs (`None`: no client command runs, the
+    /// user's cursor is [`Session::state`]'s).
+    pub fn user(&self) -> Option<&Cursor> {
+        self.suspended.first()
     }
 
     /// Clients, most recently used first.
@@ -150,7 +162,10 @@ pub(crate) fn run_as(s: &mut Session, client: String, f: impl FnOnce(&mut Sessio
     // Others' claims: keep what's needed to take back a change made outside `Session::edit`.
     let guard = s.claims.foreign(s.client.as_deref(), &s.project).then(|| s.history.clone());
     s.sanitize_state();
+    s.cursors.suspended.push(outer);
     let mut r = f(s);
+    // (Gone when the command opened another project: whoever ran before starts from its state.)
+    let mut outer = s.cursors.suspended.pop().unwrap_or_else(|| Cursor::of(&s.state));
     if let Some(history) = guard
         && r.is_ok()
         && let Some(e) = s.claim_conflict(&before, &s.project.clone())

@@ -187,7 +187,7 @@ fn mattes_preserve_transparency_precomps_and_adjustment_splits() {
         a.switches.three_d = true;
         set(&mut a, "transform/rotationX", Value::Scalar(40.0));
         let b = s.solid([0.2, 0.8, 0.4], 30, 20);
-        s.p.comp_mut(inner_id).unwrap().layers = vec![b, a];
+        s.p.comp_mut(inner_id).unwrap().layers = vec![b, a].into();
         let mut pre = build::layer(&mut s.p, &s.comp, "Inner", LayerSource::Comp { item: inner_id }, (80, 60), None);
         pre.switches.collapse = true;
         pre.switches.three_d = true;

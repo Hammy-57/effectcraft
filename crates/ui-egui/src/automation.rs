@@ -10,6 +10,10 @@ pub struct Element {
     pub id: String,
     pub label: String,
     pub rect: [f32; 4],
+    /// The undocked panel group's OS window the element is in ([`crate::dock::Floating::id`]);
+    /// `rect` is then in that window's coordinates. Absent for the main window.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window: Option<u64>,
 }
 
 #[derive(Default)]
@@ -20,11 +24,14 @@ pub struct Registry {
     /// The elements of two frames ago, whose strings `add` reuses (no two allocations per
     /// widget per frame).
     spare: Vec<Element>,
+    /// The OS window being drawn (elements added now are in it), `None` for the main window.
+    pub window: Option<u64>,
 }
 
 impl Registry {
     pub fn add(&mut self, id: &str, rect: Rect, label: &str) {
         let rect = [rect.min.x, rect.min.y, rect.width(), rect.height()];
+        let window = self.window;
         let e = match self.spare.pop() {
             Some(mut e) => {
                 e.id.clear();
@@ -32,9 +39,10 @@ impl Registry {
                 e.label.clear();
                 e.label.push_str(label);
                 e.rect = rect;
+                e.window = window;
                 e
             }
-            None => Element { id: id.to_string(), label: label.to_string(), rect },
+            None => Element { id: id.to_string(), label: label.to_string(), rect, window },
         };
         self.elements.push(e);
     }

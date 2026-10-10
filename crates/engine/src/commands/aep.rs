@@ -18,8 +18,9 @@ fn import_document(s: &mut Session, path: &str, bytes: &[u8], dir: &str, allow_l
             None
         }
     };
+    // The edit works on a copy of the project and drops it on an error: no second copy needed.
     let imported = s.edit("Import After Effects Project", None, |project, state| {
-        let result = effectcraft_aep::import_ir(project, bytes, dir, &mut resolve_media).map_err(|e| EngineError::Other(e.to_string()))?;
+        let result = effectcraft_aep::import_ir_into(project, bytes, dir, &mut resolve_media).map_err(|e| EngineError::Other(e.to_string()))?;
         if !allow_losses && !result.losses.is_empty() {
             return Err(EngineError::Other(format!("AEP import has {} fidelity gaps; project left unchanged", result.losses.len())));
         }
@@ -55,9 +56,21 @@ fn import_aep(s: &mut Session, p: &Value) -> Result<Value> {
     if !path.to_ascii_lowercase().ends_with(".aep") {
         return Err(bad("file.importAep", "expected an After Effects .aep project"));
     }
-    let bytes = s.services.export_aep_ir(&path).map_err(|e| EngineError::Other(format!("cannot import {path}: {e}")))?;
     let dir = std::path::Path::new(&path).parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
-    import_document(s, &path, &bytes, &dir, b_p(p, "allowLosses").unwrap_or(false))
+    let allow_losses = b_p(p, "allowLosses").unwrap_or(false);
+    // `wait: false`: the export (the After Effects reader, minutes for a big project) runs on a
+    // background thread; the import applies on the session's thread when it is done.
+    if b_p(p, "wait") == Some(false) {
+        let services = s.services.clone();
+        let name = std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.clone());
+        return s.spawn_task("importAep", format!("Importing {name}"), false, move |_ctl| {
+            let bytes = services.export_aep_ir(&path).map_err(|e| format!("cannot import {path}: {e}"))?;
+            let apply: crate::jobs::Apply = Box::new(move |s: &mut Session| import_document(s, &path, &bytes, &dir, allow_losses));
+            Ok(apply)
+        });
+    }
+    let bytes = s.services.export_aep_ir(&path).map_err(|e| EngineError::Other(format!("cannot import {path}: {e}")))?;
+    import_document(s, &path, &bytes, &dir, allow_losses)
 }
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -67,7 +80,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "After Effects Project...",
             ["File", "Import"],
             None,
-            "{path (.aep), allowLosses?: bool (inspect incomplete import)}",
+            "{path (.aep), allowLosses?: bool (inspect incomplete import), wait? (false: export in the background)}",
             always,
             import_aep
         ),

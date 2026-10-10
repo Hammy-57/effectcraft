@@ -147,10 +147,10 @@ pub(crate) fn is_roto(g: &PropGroup) -> bool {
     matches!(&g.kind, GroupKind::Effect { effect } if effect == fx::ID)
 }
 
-fn str_of(g: &PropGroup, m: &str) -> String {
+fn str_of<'a>(g: &'a PropGroup, m: &str) -> &'a str {
     match g.get(m).map(|p| &p.value) {
-        Some(Value::Str(s)) => s.clone(),
-        _ => String::new(),
+        Some(Value::Str(s)) => s,
+        _ => "",
     }
 }
 
@@ -189,14 +189,18 @@ pub fn input_key(p: &Project, comp: ItemId, layer: &Layer, uid: Uid) -> String {
 }
 
 /// After an edit: refresh Input Keys; frozen mattes made from other frames are dropped.
-/// Returns the instances whose segmentation changed (to propagate again).
-pub(crate) fn sync(before: &Project, after: &mut Project) -> Vec<(ItemId, LayerId, Uid)> {
+/// Returns the instances whose segmentation changed (to propagate again). Layers the edit didn't
+/// touch are skipped unless `full` (see [`crate::warp::untouched`]).
+pub(crate) fn sync(before: &Project, after: &mut Project, full: bool) -> Vec<(ItemId, LayerId, Uid)> {
     let mut todo = vec![];
     let mut set = vec![];
     for (cid, it) in &after.items {
         let ItemKind::Comp(c) = &it.kind else { continue };
-        for l in &c.layers {
+        for (i, l) in c.layers.iter().enumerate() {
             let Some(fxg) = l.effects() else { continue };
+            if !fxg.groups().any(is_roto) || crate::warp::untouched(before, after, *cid, i, l, full) {
+                continue;
+            }
             for g in fxg.groups().filter(|g| is_roto(g)) {
                 let key = input_key(after, *cid, l, g.uid);
                 let old = before.comp(*cid).and_then(|bc| bc.layer(l.id)).and_then(|ol| ol.props.find_group(g.uid));
@@ -548,7 +552,7 @@ impl Session {
             frames,
             task,
         };
-        let strokes = str_of(g, fx::STROKES);
+        let strokes = str_of(g, fx::STROKES).to_string();
         if !wait && self.offloads() {
             drop(work);
             self.offload_analysis(match task {
