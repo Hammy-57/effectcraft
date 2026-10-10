@@ -49,6 +49,8 @@ mod ui_control_channel;
 mod ui_drag_drop;
 #[path = "../ui_effect_controls.rs"]
 mod ui_effect_controls;
+#[path = "../ui_fingerprints.rs"]
+mod ui_fingerprints;
 #[path = "../ui_fx_console.rs"]
 mod ui_fx_console;
 #[path = "../ui_fx_editors.rs"]

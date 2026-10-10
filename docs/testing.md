@@ -80,7 +80,7 @@ whole workspace. Run the full `cargo xtask ci` before a release.
   to a 32×20 grey grid and compares it with `tests/ui_fingerprints.txt` with a tolerance: icon and
   font tweaks pass, a blank, clipped or rearranged panel fails and its render is written to
   `target/tmp/ui-fingerprints/`. Re-pinning after an intended UI change is expected:
-  `UI_FINGERPRINT_PRINT=1 cargo test -p effectcraft-ui-egui --test ui_fingerprints` (pinned for
+  `UI_FINGERPRINT_PRINT=1 cargo test -p effectcraft-ui-egui --test ui ui_fingerprints::` (pinned for
   aarch64 macOS; elsewhere it only checks no panel renders flat).
 
 ## One test binary per crate

@@ -6,7 +6,7 @@
 //! Pinned for aarch64 macOS; elsewhere it only checks that no panel renders as a flat image. Skips
 //! without a GPU adapter. On a mismatch the rendered panel is written to
 //! `target/tmp/ui-fingerprints/<panel>.png`. Re-pin after an intended UI change with
-//! `UI_FINGERPRINT_PRINT=1 cargo test -p effectcraft-ui-egui --test ui_fingerprints`.
+//! `UI_FINGERPRINT_PRINT=1 cargo test -p effectcraft-ui-egui --test ui ui_fingerprints::`.
 //! Original fixture; renders are review outputs, not shipped assets.
 use effectcraft_engine::Session;
 use effectcraft_ui_egui::{EffectcraftApp, dock::PanelKind};
@@ -60,6 +60,7 @@ fn unhex(s: &str) -> Vec<u8> {
 
 /// Renders every panel maximized; `None` without a GPU adapter.
 fn render_panels() -> Option<Vec<(String, image::RgbaImage)>> {
+    let _gpu = crate::gpu_lock();
     let Some(probe) = effectcraft_gpu::Gpu::headless() else {
         eprintln!("no GPU adapter: skipping the UI fingerprints");
         return None;
@@ -157,7 +158,7 @@ fn panel_fingerprints_match() {
     assert!(
         bad.is_empty(),
         "UI panel fingerprints changed:\n{}\nIf the change is intended, re-pin with \
-         `UI_FINGERPRINT_PRINT=1 cargo test -p effectcraft-ui-egui --test ui_fingerprints`.",
+         `UI_FINGERPRINT_PRINT=1 cargo test -p effectcraft-ui-egui --test ui ui_fingerprints::`.",
         bad.join("\n")
     );
 }
