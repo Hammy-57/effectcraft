@@ -671,8 +671,9 @@ fn render(args: &Args, json_out: bool) -> Result<(), Failure> {
         let Some(out) = args.opt("--out") else { return usage_err("render: --out FILE is required (or --queue)") };
         let out = &from_cwd(out)?;
         let mut p = json!({"output": out});
-        if let Some(c) = args.opt("--comp") {
-            p["comp"] = json!(c);
+        // Same resolution as `render-frame`: a number is a comp id, `-` the active comp, else a name.
+        if let Some(c) = args.opt("--comp").and_then(reference) {
+            p["comp"] = c;
         }
         let ext = std::path::Path::new(out).extension().map(|e| e.to_string_lossy().to_string());
         if let Some(f) = args.opt("--format").map(str::to_string).or(ext) {

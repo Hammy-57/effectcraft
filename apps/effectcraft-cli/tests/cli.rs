@@ -302,6 +302,37 @@ fn render_out_is_relative_to_the_working_directory() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// `render --comp` takes an id or a name like `render-frame` (`--comp 8` used to look for a comp
+/// named "8" and fail with `no composition "8"`).
+#[test]
+fn render_comp_takes_an_id_or_a_name() {
+    let root = tmp("render-comp-id");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let project = root.join("x.ecproj");
+    let p = project.to_str().unwrap();
+    let comp = r#"{"name":"A","width":32,"height":18,"duration":1}"#;
+    let v = ok_json(&["run", "comp.new", comp, "comp.new", &comp.replace('A', "B"), "--empty", "--save-as", p]);
+    // "B" is the active comp, so rendering "A" proves `--comp` was honoured.
+    let a = v["result"][0]["result"]["comp"].as_u64().unwrap().to_string();
+    let render = |c: &str, out: &str| {
+        let out = root.join(out);
+        let o = out.to_str().unwrap();
+        bin().args(["render", "--project", p, "--comp", c, "--format", "gif", "--start", "0", "--end", "0.05", "--out", o, "--json"]).output().unwrap()
+    };
+    for (c, out) in [(a.as_str(), "id.gif"), ("A", "name.gif")] {
+        let o = render(c, out);
+        assert!(o.status.success(), "--comp {c}: {}", String::from_utf8_lossy(&o.stderr));
+        let v: Value = serde_json::from_slice(&o.stdout).unwrap();
+        assert_eq!(v["rendered"][0]["comp"], "A", "--comp {c}: {v}");
+    }
+    let o = render("999999", "none.gif");
+    assert!(!o.status.success());
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("no composition 999999"), "{err}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A real stdio client: each edit's reply is read before disconnecting or killing the server.
 struct McpChild {
     child: std::process::Child,
