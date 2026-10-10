@@ -34,11 +34,18 @@ cargo xtask ci                           # what every commit must pass
 
 - **An effect:** add an `EffectSpec` in `crates/effects` (AE display name, category, parameters
   with AE's names, defaults and ranges) and its render function, with a determinism test and a
-  behaviour test. If it reads the clock directly, add it to `TIME_DEPENDENT`.
+  behaviour test. If it reads the clock directly, add it to `TIME_DEPENDENT`. A new file
+  `crates/effects/src/<name>.rs` with `pub fn specs() -> Vec<EffectSpec>` registers itself.
 - **A command:** register it with `cmd!` in `crates/engine/src/commands/`, place it in the menu
-  tree in `crates/engine/src/menus.rs`, and test it including undo.
+  tree in `crates/engine/src/menus.rs`, and test it including undo. A new file
+  `crates/engine/src/commands/<name>.rs` with `pub fn specs() -> Vec<CommandSpec>` registers itself.
 - **A panel or dialog:** `crates/ui-egui/src/panels/`; look at the result with the headless
   snapshot tool described in [docs/testing.md](docs/testing.md).
+- **A test file:** `src/tests_<topic>.rs` next to `lib.rs` (engine, render) is picked up on its own.
+
+New module files need no `mod` line ([self-registering modules](docs/architecture.md#self-registering-modules));
+format with `cargo xtask fmt`, since `cargo fmt` doesn't reach them. Parity notes go in a new
+`docs/parity/updates/<task>.md` (see [docs/parity.md](docs/parity.md)).
 
 ## Talk to us
 
