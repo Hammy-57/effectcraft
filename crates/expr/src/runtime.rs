@@ -59,6 +59,13 @@ impl Frame {
     pub fn has(&self, req: &Req) -> bool {
         self.memo.contains_key(req)
     }
+    pub fn answer(&self, req: &Req) -> Option<&Resp> {
+        self.memo.get(req).map(|a| &a.resp)
+    }
+    /// Move the answers to `reqs` (each listed once) out of the memo.
+    pub fn take_answers(&mut self, reqs: &[Req]) -> Option<Vec<Resp>> {
+        reqs.iter().map(|q| self.memo.remove(q).map(|a| a.resp)).collect()
+    }
 }
 
 thread_local! {
