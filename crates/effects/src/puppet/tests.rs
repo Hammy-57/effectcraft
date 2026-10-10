@@ -323,3 +323,21 @@ fn single_pin_on_a_traced_solid_does_not_rotate_it() {
         }
     }
 }
+
+#[test]
+fn deformation_cache_preserves_results_and_rejects_changed_inputs() {
+    let mesh = rect_mesh(96.0, 48.0, 60.0);
+    let mut pins = [pin(PinKind::Position, [0.0, 0.0], [0.0, 0.0]), pin(PinKind::Position, [96.0, 48.0], [80.0, 64.0])];
+    let expected = solve_uncached(&mesh, &pins, 2);
+    assert_eq!(solve(&mesh, &pins, 2), expected);
+    assert_eq!(solve(&mesh, &pins, 2), expected);
+    let entry = Deformation { mesh: mesh.clone(), pins: pins.to_vec(), refine: 2, vertices: expected };
+    assert!(entry.matches(&mesh, &pins, 2));
+    assert!(!entry.matches(&mesh, &pins, 3));
+    pins[1].position[0] += 5.0;
+    assert!(!entry.matches(&mesh, &pins, 2));
+    assert_eq!(solve(&mesh, &pins, 2), solve_uncached(&mesh, &pins, 2));
+    let mut changed_mesh = mesh.clone();
+    changed_mesh.verts[0][0] += 1.0;
+    assert!(!entry.matches(&changed_mesh, &entry.pins, 2));
+}
