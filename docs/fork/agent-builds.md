@@ -46,8 +46,8 @@ computer.
 
 **Day and night.** During the day, agents write the regression test but don't run it: `cargo
 check` and clippy on the touched crates, then merge, saying in the merge message which tests
-weren't run. Every night at 22:00 UTC a cloud routine ("EffectCraft nightly: CI, tests, fixes,
-community PRs") does the heavy part. At 22:40 Mac time a LaunchAgent
+weren't run. Every night at 01:00 UTC (02:00 Mac time) a cloud routine ("EffectCraft nightly: CI, tests, fixes,
+community PRs") does the heavy part. At 01:40 Mac time a LaunchAgent
 (`scripts/fork/push-main.sh`, log `~/Library/Logs/EffectCraft push-main.log`) pushes `main` first
 in case a merge wasn't pushed: fast-forward only, never other branches. The routine then it merges upstream, runs those tests and the full CI, fixes
 main until green, opens or updates focused PRs to storytold for finished work, and leaves a
