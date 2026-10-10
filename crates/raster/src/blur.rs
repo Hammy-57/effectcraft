@@ -34,13 +34,30 @@ fn box_h_into(src: &[Px], out: &mut [Px], w: usize, r: usize, repeat: bool) {
                 acc[c] += p[c];
             }
         }
-        for x in 0..w {
-            o[x] = acc.map(|v| v * norm);
+        // Interior pixels (both window ends inside the row) skip the edge checks; the sums are
+        // the same operations in the same order.
+        let (inner_lo, inner_hi) = (r.min(w), w.saturating_sub(r + 1).max(r.min(w)));
+        let edge = |x: usize, acc: &mut [f32; 4], o: &mut Px| {
+            *o = acc.map(|v| v * norm);
             let add = get(x as isize + r as isize + 1);
             let sub = get(x as isize - r as isize);
             for c in 0..4 {
                 acc[c] += add[c] - sub[c];
             }
+        };
+        let (head, rest) = o.split_at_mut(inner_lo);
+        let (mid, tail) = rest.split_at_mut(inner_hi - inner_lo);
+        for (x, out) in head.iter_mut().enumerate() {
+            edge(x, &mut acc, out);
+        }
+        for ((out, add), sub) in mid.iter_mut().zip(row.get(inner_lo + r + 1..).unwrap_or(&[])).zip(row.get(inner_lo.saturating_sub(r)..).unwrap_or(&[])) {
+            *out = acc.map(|v| v * norm);
+            for c in 0..4 {
+                acc[c] += add[c] - sub[c];
+            }
+        }
+        for (i, out) in tail.iter_mut().enumerate() {
+            edge(inner_hi + i, &mut acc, out);
         }
     });
 }
@@ -150,11 +167,20 @@ pub fn box_blur(img: &Image, rx: usize, ry: usize, iterations: usize, repeat: bo
     box_passes(img, &vec![rx; n], &vec![ry; n], repeat)
 }
 
+/// Box radii of [`gaussian_blur`] along one axis (none for a negligible sigma).
+fn gaussian_radii(sigma: f64) -> Vec<usize> {
+    if sigma > 0.05 { box_radii(sigma, 3) } else { vec![] }
+}
+
 /// Gaussian blur with standard deviations in pixels (3 box passes per axis).
 pub fn gaussian_blur(img: &Image, sigma_x: f64, sigma_y: f64, repeat: bool) -> Image {
-    let rx = if sigma_x > 0.05 { box_radii(sigma_x, 3) } else { vec![] };
-    let ry = if sigma_y > 0.05 { box_radii(sigma_y, 3) } else { vec![] };
-    box_passes(img, &rx, &ry, repeat)
+    box_passes(img, &gaussian_radii(sigma_x), &gaussian_radii(sigma_y), repeat)
+}
+
+/// How far (in pixels) [`gaussian_blur`] of `sigma` spreads a pixel along its axis: the sum of
+/// its box radii. Past it a transparent-edged blur of a transparent surround is zero.
+pub fn gaussian_support(sigma: f64) -> usize {
+    gaussian_radii(sigma).into_iter().fold(0, usize::saturating_add)
 }
 
 /// Motion blur along `angle_deg` (0 = vertical in AE's Directional Blur, measured clockwise from

@@ -454,3 +454,31 @@ fn mcp_autosave_is_opt_in_and_rejects_invalid_combinations() {
     assert!(!String::from_utf8_lossy(&out.stderr).contains("panicked"));
     std::fs::remove_dir_all(config).unwrap();
 }
+
+/// `replay`: a repro script runs headless with per-step results; a failing step exits 1 and is
+/// named as the first failure; malformed lines are failures, not crashes.
+#[test]
+fn replay_reports_steps_and_the_first_failure() {
+    let repro = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/repros/comp-zero-frame-rate.jsonl");
+    let v = ok_json(&["replay", repro.to_str().unwrap()]);
+    assert_eq!(v["ok"], true, "{v}");
+    assert!(v["steps"].as_array().unwrap().len() > 5);
+    let bad = tmp("bad-repro.jsonl");
+    std::fs::write(
+        &bad,
+        "{\"start\": \"new\"}\n{\"command\": \"comp.new\"}\n{\"expect\": {\"query\": \"comp.info\", \"pointer\": \"/width\", \"equals\": 1}}\nnot json\n",
+    )
+    .unwrap();
+    let (code, v) = run_json(&["replay", bad.to_str().unwrap()]);
+    assert_eq!(code, 1);
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["first_failure"]["line"], 3, "{v}");
+    assert_eq!(v["skipped"], 1);
+    let out = bin().args(["replay", bad.to_str().unwrap(), "--keep-going"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("line    2  ok    comp.new") && text.contains("line    4  FAIL  invalid: not JSON"), "{text}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("failed at line 3 (comp.info)"));
+    // The start line picks the project.
+    assert_eq!(bin().args(["replay", bad.to_str().unwrap(), "--demo"]).output().unwrap().status.code(), Some(2));
+}
