@@ -173,6 +173,10 @@ static SRGB_DECODE_LUT: OnceLock<Vec<f32>> = OnceLock::new();
 static SRGB_ENCODE_LUT: OnceLock<Vec<f32>> = OnceLock::new();
 static GAMMA24_DECODE_LUT: OnceLock<Vec<f32>> = OnceLock::new();
 static GAMMA24_ENCODE_LUT: OnceLock<Vec<f32>> = OnceLock::new();
+static PQ_DECODE_LUT: OnceLock<Vec<f32>> = OnceLock::new();
+static PQ_ENCODE_LUT: OnceLock<Vec<f32>> = OnceLock::new();
+static HLG_DECODE_LUT: OnceLock<Vec<f32>> = OnceLock::new();
+static HLG_ENCODE_LUT: OnceLock<Vec<f32>> = OnceLock::new();
 
 /// `f` sampled at `i / LUT_N` (in `f64`), built on first use.
 fn lut(cell: &'static OnceLock<Vec<f32>>, f: fn(f64) -> f64) -> &'static [f32] {
@@ -206,6 +210,36 @@ fn gamma24_decode_f64(v: f64) -> f64 {
 fn gamma24_encode_f64(v: f64) -> f64 {
     v.powf(1.0 / 2.4)
 }
+fn pq_decode_f64(v: f64) -> f64 {
+    pq_decode(v) * 10_000.0 / PQ_REFERENCE_WHITE
+}
+fn pq_encode_f64(v: f64) -> f64 {
+    pq_encode(v * PQ_REFERENCE_WHITE / 10_000.0)
+}
+fn hlg_decode_f64(v: f64) -> f64 {
+    hlg_decode(v) / HLG_REFERENCE
+}
+fn hlg_encode_f64(v: f64) -> f64 {
+    hlg_encode(v * HLG_REFERENCE)
+}
+fn srgb_decode_exact(v: f32) -> f32 {
+    if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+}
+fn srgb_encode_exact(v: f32) -> f32 {
+    if v <= 0.003_130_8 { v * 12.92 } else { 1.055 * v.max(0.0).powf(1.0 / 2.4) - 0.055 }
+}
+fn pq_decode_exact(a: f32) -> f32 {
+    pq_decode_f64(a as f64) as f32
+}
+fn pq_encode_exact(a: f32) -> f32 {
+    pq_encode_f64(a as f64) as f32
+}
+fn hlg_decode_exact(a: f32) -> f32 {
+    hlg_decode_f64(a as f64) as f32
+}
+fn hlg_encode_exact(a: f32) -> f32 {
+    hlg_encode_f64(a as f64) as f32
+}
 fn gamma24_decode_exact(a: f32) -> f32 {
     a.powf(2.4)
 }
@@ -213,14 +247,15 @@ fn gamma24_encode_exact(a: f32) -> f32 {
     a.powf(1.0 / 2.4)
 }
 
-// Transfer curves on magnitudes (`a >= 0`, or NaN).
+// Transfer curves on magnitudes (`a >= 0`, or NaN). The sRGB ones also serve negative input
+// (the exact linear segment), for [`crate::srgb_to_linear`] / [`crate::linear_to_srgb`].
 #[inline(always)]
-fn srgb_decode_mag(a: f32) -> f32 {
-    curve_lut(a, &SRGB_DECODE_LUT, srgb_decode_f64, crate::srgb_to_linear)
+pub(crate) fn srgb_decode_mag(a: f32) -> f32 {
+    curve_lut(a, &SRGB_DECODE_LUT, srgb_decode_f64, srgb_decode_exact)
 }
 #[inline(always)]
-fn srgb_encode_mag(a: f32) -> f32 {
-    curve_lut(a, &SRGB_ENCODE_LUT, srgb_encode_f64, crate::linear_to_srgb)
+pub(crate) fn srgb_encode_mag(a: f32) -> f32 {
+    curve_lut(a, &SRGB_ENCODE_LUT, srgb_encode_f64, srgb_encode_exact)
 }
 #[inline(always)]
 fn gamma24_decode_mag(a: f32) -> f32 {
@@ -232,19 +267,19 @@ fn gamma24_encode_mag(a: f32) -> f32 {
 }
 #[inline(always)]
 fn pq_decode_mag(a: f32) -> f32 {
-    (pq_decode(a as f64) * 10_000.0 / PQ_REFERENCE_WHITE) as f32
+    curve_lut(a, &PQ_DECODE_LUT, pq_decode_f64, pq_decode_exact)
 }
 #[inline(always)]
 fn pq_encode_mag(a: f32) -> f32 {
-    pq_encode(a as f64 * PQ_REFERENCE_WHITE / 10_000.0) as f32
+    curve_lut(a, &PQ_ENCODE_LUT, pq_encode_f64, pq_encode_exact)
 }
 #[inline(always)]
 fn hlg_decode_mag(a: f32) -> f32 {
-    (hlg_decode(a as f64) / HLG_REFERENCE) as f32
+    curve_lut(a, &HLG_DECODE_LUT, hlg_decode_f64, hlg_decode_exact)
 }
 #[inline(always)]
 fn hlg_encode_mag(a: f32) -> f32 {
-    hlg_encode(a as f64 * HLG_REFERENCE) as f32
+    curve_lut(a, &HLG_ENCODE_LUT, hlg_encode_f64, hlg_encode_exact)
 }
 
 impl ColorSpace {
@@ -631,12 +666,15 @@ mod tests {
     fn exact_curve(c: Curve, v: f32, decode: bool) -> f32 {
         let a = v.abs();
         let r = match (c, decode) {
-            (Curve::Srgb, true) => crate::srgb_to_linear(a),
-            (Curve::Srgb, false) => crate::linear_to_srgb(a),
+            (Curve::Srgb, true) => srgb_decode_exact(a),
+            (Curve::Srgb, false) => srgb_encode_exact(a),
             (Curve::Gamma24, true) => a.powf(2.4),
             (Curve::Gamma24, false) => a.powf(1.0 / 2.4),
-            (c, true) => return c.decode(v),
-            (c, false) => return c.encode(v),
+            (Curve::Pq, true) => pq_decode_exact(a),
+            (Curve::Pq, false) => pq_encode_exact(a),
+            (Curve::Hlg, true) => hlg_decode_exact(a),
+            (Curve::Hlg, false) => hlg_encode_exact(a),
+            (Curve::Linear, _) => a,
         };
         r.copysign(v)
     }
@@ -666,6 +704,10 @@ mod tests {
             ("srgb linearize", Some(Conversion::linearize(ColorSpace::Srgb))),
             ("srgb delinearize", Some(Conversion::delinearize(ColorSpace::Srgb))),
             ("rec709 linearize", Some(Conversion::linearize(ColorSpace::Rec709))),
+            ("pq linearize", Some(Conversion::linearize(ColorSpace::Rec2100Pq))),
+            ("pq delinearize", Some(Conversion::delinearize(ColorSpace::Rec2100Pq))),
+            ("hlg linearize", Some(Conversion::linearize(ColorSpace::Rec2100Hlg))),
+            ("hlg delinearize", Some(Conversion::delinearize(ColorSpace::Rec2100Hlg))),
         ];
         let time = |f: &dyn Fn([f32; 3]) -> [f32; 3]| {
             let mut best = std::time::Duration::MAX;
@@ -713,24 +755,31 @@ mod tests {
 
     #[test]
     fn transfer_luts_are_accurate() {
-        let curves: [(&str, fn(f32) -> f32, fn(f32) -> f32); 4] = [
-            ("srgb decode", srgb_decode_mag, crate::srgb_to_linear),
-            ("srgb encode", srgb_encode_mag, crate::linear_to_srgb),
+        let curves: [(&str, fn(f32) -> f32, fn(f32) -> f32); 8] = [
+            ("srgb decode", srgb_decode_mag, srgb_decode_exact),
+            ("srgb encode", srgb_encode_mag, srgb_encode_exact),
             ("gamma 2.4 decode", gamma24_decode_mag, gamma24_decode_exact),
             ("gamma 2.4 encode", gamma24_encode_mag, gamma24_encode_exact),
+            ("pq decode", pq_decode_mag, pq_decode_exact),
+            ("pq encode", pq_encode_mag, pq_encode_exact),
+            ("hlg decode", hlg_decode_mag, hlg_decode_exact),
+            ("hlg encode", hlg_encode_mag, hlg_encode_exact),
         ];
         for (name, fast, exact) in curves {
             let mut max = 0.0f32;
+            let mut rel = 0.0f32;
             // Every 5th f32 from 1/256 to 1, across the table's lower edge.
             let mut b = (1.0f32 / 256.0).to_bits();
             while b <= 1.0f32.to_bits() {
                 let a = f32::from_bits(b);
                 max = max.max((fast(a) - exact(a)).abs());
+                rel = rel.max((fast(a) - exact(a)).abs() / exact(a).abs().max(1.0));
                 b += 5;
             }
-            eprintln!("{name}: max abs error {max:e}");
-            // An 8-bit step is 3.9e-3, a 16-bit one 1.5e-5.
-            assert!(max < 1e-5, "{name}: {max:e}");
+            eprintln!("{name}: max abs error {max:e}, relative to max(1, |exact|) {rel:e}");
+            // An 8-bit step is 3.9e-3, a 16-bit one 1.5e-5. HDR decodes reach 49 (PQ) and 3.8 (HLG)
+            // times reference white, so their error is measured relative to the value above 1.
+            assert!(rel < 1e-5, "{name}: {rel:e}");
             // Outside the table: the exact curve.
             for a in [0.0, 1e-6, 0.004, 1.0, 1.5, 40.0] {
                 assert_eq!(fast(a).to_bits(), exact(a).to_bits(), "{name} {a}");
