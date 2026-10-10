@@ -190,3 +190,89 @@ fn a_session_restored_with_unsaved_changes_stays_modified() {
     s.execute("edit.undo", json!({})).unwrap();
     assert!(s.is_dirty(), "undo doesn't reach a saved state");
 }
+
+// ---------------------------------------------------------------- agents and the user together
+
+fn new_solid(s: &mut Session, name: &str, client: Option<&str>) -> u64 {
+    let mut p = json!({"name": name, "color": "#ff0000", "width": 10, "height": 10});
+    if let Some(c) = client {
+        p["client"] = json!(c);
+    }
+    s.execute_checked("layer.newSolid", p).unwrap()["layer"].as_u64().unwrap()
+}
+
+#[test]
+fn a_number_is_a_layer_id_never_a_stack_position() {
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "Ids", "width": 64, "height": 64})).unwrap();
+    let red = new_solid(&mut s, "Red", None);
+    let blue = new_solid(&mut s, "Blue", None);
+    // A number that is no layer's id is an error naming it, not the layer at that position.
+    let missing = (1..).find(|n| *n != red && *n != blue).unwrap();
+    let e = s.execute_checked("layer.rename", json!({"layer": missing, "name": "Oops"})).unwrap_err().to_string();
+    assert!(e.contains(&format!("no layer {missing}")) && e.contains("\"#n\""), "{e}");
+    assert_eq!(names(&s), ["Blue", "Red"]);
+    // "#n" is the stack position; an id stays the same layer after a reorder.
+    s.execute_checked("layer.rename", json!({"layer": "#2", "name": "Red 2"})).unwrap();
+    s.execute_checked("layer.arrange", json!({"layers": [red], "to": "front"})).unwrap();
+    s.execute_checked("layer.rename", json!({"layer": red, "name": "Red 3"})).unwrap();
+    assert_eq!(names(&s), ["Red 3", "Blue"]);
+    // A deleted layer's id hits nothing (not the layer now at that position).
+    s.execute_checked("edit.clear", json!({"layers": [blue]})).unwrap();
+    assert!(s.execute_checked("layer.rename", json!({"layer": blue, "name": "Stale"})).is_err());
+    assert_eq!(names(&s), ["Red 3"]);
+}
+
+#[test]
+fn ids_are_not_reused_after_undo() {
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "Ids", "width": 64, "height": 64})).unwrap();
+    let a = new_solid(&mut s, "Agent", Some("agent"));
+    s.execute("edit.undo", json!({})).unwrap();
+    let b = new_solid(&mut s, "User", None);
+    assert_ne!(a, b, "an undone layer's id is never handed to another layer");
+    s.execute("edit.undo", json!({})).unwrap();
+    s.execute("edit.redo", json!({})).unwrap();
+    assert!(s.active_comp().unwrap().layer(effectcraft_project::LayerId(b)).is_some());
+}
+
+#[test]
+fn a_client_undoes_only_its_own_last_step() {
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "U", "width": 64, "height": 64})).unwrap();
+    new_solid(&mut s, "Agent's", Some("agent-1"));
+    new_solid(&mut s, "User's", None);
+    let rev = s.revision;
+    let e = s.execute_checked("edit.undo", json!({"client": "agent-1"})).unwrap_err().to_string();
+    assert!(e.contains("made by the user") && e.contains("undo without `client`"), "{e}");
+    assert_eq!(s.revision, rev, "a refused undo changes nothing");
+    assert_eq!(names(&s), ["User's", "Agent's"]);
+    // Another client's step is refused too; the user's undo (no client) works as always.
+    new_solid(&mut s, "Other's", Some("agent-2"));
+    let e = s.execute_checked("edit.undo", json!({"client": "agent-1"})).unwrap_err().to_string();
+    assert!(e.contains("client `agent-2`"), "{e}");
+    s.execute_checked("edit.undo", json!({"client": "agent-2"})).unwrap();
+    s.execute("edit.undo", json!({})).unwrap();
+    s.execute_checked("edit.undo", json!({"client": "agent-1"})).unwrap();
+    assert!(names(&s).is_empty());
+    // The History list names who made each state; batch steps inherit the batch's client.
+    s.execute_checked("engine.batch", json!({"client": "agent-3", "steps": [{"command": "layer.newSolid", "params": {"color": "#00ff00"}}]})).unwrap();
+    assert_eq!(list(&mut s).iter().find(|n| n["current"] == true).unwrap()["client"], "agent-3");
+    s.execute_checked("edit.undo", json!({"client": "agent-3"})).unwrap();
+    assert!(s.client.is_none(), "the client is only set while its command runs");
+}
+
+#[test]
+fn expect_revision_refuses_a_changed_document() {
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "R", "width": 64, "height": 64})).unwrap();
+    let rev = s.execute_checked("project.summary", json!({})).unwrap()["revision"].as_u64().unwrap();
+    assert_eq!(s.execute_checked("editor.state", json!({})).unwrap()["revision"], rev);
+    new_solid(&mut s, "Meanwhile", None);
+    let e = s.execute_checked("layer.newSolid", json!({"color": "#0000ff", "expectRevision": rev})).unwrap_err().to_string();
+    assert!(e.contains(&format!("document changed (revision {}, expected {rev})", s.revision)), "{e}");
+    assert_eq!(names(&s), ["Meanwhile"], "nothing ran");
+    let now = s.revision;
+    s.execute_checked("layer.newSolid", json!({"color": "#0000ff", "expectRevision": now, "client": "agent"})).unwrap();
+    assert_eq!(names(&s).len(), 2);
+}

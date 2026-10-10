@@ -115,11 +115,7 @@ fn find_fx(s: &Session, p: &Value, cmd: &str) -> Result<(effectcraft_project::It
     let layer = s.project.comp(cid).and_then(|c| c.layer(lid)).ok_or(EngineError::NoComp)?;
     let fx = layer.effects().ok_or_else(|| bad(cmd, "no effects"))?;
     let g = match p.get("effect") {
-        Some(Value::Number(n)) => {
-            let n = n.as_u64().unwrap_or(0);
-            fx.groups().find(|g| g.uid == n).or_else(|| fx.groups().nth(n.saturating_sub(1) as usize))
-        }
-        Some(Value::String(name)) => fx.groups().find(|g| &g.name == name || g.match_id == *name),
+        Some(v @ (Value::Number(_) | Value::String(_))) => super::pick_group(fx.groups(), v),
         _ => s.state.selected_props.iter().find_map(|(l, u)| (*l == lid).then(|| fx.groups().find(|g| g.uid == *u)).flatten()),
     }
     .ok_or_else(|| bad(cmd, "no such effect"))?;
@@ -261,7 +257,7 @@ pub(crate) fn selected_effects(s: &Session) -> Vec<(LayerId, Uid)> {
     out
 }
 
-/// Effects named by `effect` / `effects` (uids, names or 1-based indexes), else the selection.
+/// Effects named by `effect` / `effects` (uids, names or `"#n"`, 1-based), else the selection.
 fn effects_p(s: &Session, p: &Value, cmd: &str) -> Result<Vec<(LayerId, Uid)>> {
     if p.get("effect").is_some() {
         let (_, lid, uid) = find_fx(s, p, cmd)?;

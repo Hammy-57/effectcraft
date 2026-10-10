@@ -6,9 +6,12 @@ cargo xtask ci             # fmt, clippy -D warnings, tests, layers, assets, was
 cargo xtask ci --affected  # the same gates, only for the crates your change can affect
 ```
 
+`xtask ci` builds clippy and tests with `--profile ci` (release optimisation without LTO, 16 codegen
+units, output in `target/ci/`): fast to build, still optimised enough for the pixel and perf tests.
+
 ## Affected-only CI
 
-The full `cargo xtask ci` builds and tests every crate in release mode and takes over an hour.
+The full `cargo xtask ci` builds and tests every crate with `--profile ci`.
 For each change, agents and contributors run the affected-only variant; the full CI runs before a
 release (and on any change it falls back to, below).
 
@@ -30,8 +33,8 @@ maps each one to:
 The affected set is those packages plus everything that depends on them (transitively through
 normal and build dependencies) and every package that uses one of them as a dev-dependency. For
 that set it runs `cargo fmt --check` (whole workspace, it is fast), `cargo clippy --all-targets
---release -- -D warnings`, the tests (`cargo nextest run --release` plus `cargo test --release
---doc` when cargo-nextest is installed, otherwise `cargo test --release`), the layers check, the
+--profile ci -- -D warnings`, the tests (`cargo nextest run --profile ci` plus `cargo test --profile ci
+--doc` when cargo-nextest is installed, otherwise `cargo test --profile ci`), the layers check, the
 assets check only when an asset, an `.attribution` sidecar or `ATTRIBUTION.md` changed, and the
 wasm check only for affected L0–L4 crates and the web crates. It prints the plan first and a timing
 table at the end:
@@ -82,7 +85,9 @@ cargo run -p effectcraft-ui-egui --example snapshot -- --out ui.png \
 ```
 
 Each `--step` is a control-channel request; `{"method":"snap","params":{"path":"x.png"}}` writes an
-intermediate image.
+intermediate image and `{"method":"pointer","params":{"x":…,"y":…,"click":true}}` clicks (or
+`"down"` / `"up"` for a drag in steps). It runs the same offscreen app as `effectcraft-cli mcp --ui`
+(`effectcraft_ui_egui::offscreen`).
 
 ## Benchmarks
 

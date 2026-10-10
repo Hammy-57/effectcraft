@@ -16,10 +16,6 @@ lock="$target/build.lock"
 log="$target/build.log"
 
 mkdir -p "$target"
-if command -v sccache >/dev/null 2>&1; then
-    export RUSTC_WRAPPER="${RUSTC_WRAPPER:-sccache}"
-fi
-
 build() {
     CARGO_TARGET_DIR="$target" cargo build --quiet --release -p effectcraft-cli --manifest-path "$root/Cargo.toml"
 }

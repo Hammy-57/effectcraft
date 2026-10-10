@@ -48,6 +48,17 @@ fn has_selected_footage(s: &Session) -> std::result::Result<(), String> {
 
 fn undo(s: &mut Session, _: &Value) -> Result<Value> {
     let label = s.history.undo.last().map(|u| u.0.clone());
+    // A client (agent, script) only undoes its own last step, never someone else's.
+    if let Some(client) = s.client.as_deref()
+        && label.is_some()
+    {
+        let author = s.history.author(&s.project);
+        if author != Some(client) {
+            let who = author.map_or_else(|| "the user".to_string(), |a| format!("client `{a}`"));
+            let step = label.unwrap_or_default();
+            return Err(EngineError::Other(format!("the last change (“{step}”) was made by {who}, not `{client}`; undo it there, or undo without `client`")));
+        }
+    }
     s.undo();
     Ok(json!({"undone": label}))
 }
@@ -680,7 +691,7 @@ fn purge(s: &mut Session, _: &Value) -> Result<Value> {
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
-        cmd!("edit.undo", "Undo", ["Edit"], Some("Cmd+Z"), "{}", can_undo, undo),
+        cmd!("edit.undo", "Undo", ["Edit"], Some("Cmd+Z"), "{client? (only undo when this client made the last step)}", can_undo, undo),
         cmd!("edit.redo", "Redo", ["Edit"], Some("Cmd+Shift+Z"), "{}", can_redo, redo),
         cmd!("edit.cut", "Cut", ["Edit"], Some("Cmd+X"), "{layers?} (keyframes, effects or shape items when they are selected)", layers_or_keys, cut),
         cmd!("edit.copy", "Copy", ["Edit"], Some("Cmd+C"), "{layers?} (keyframes, effects or shape items when they are selected)", layers_or_keys, copy),

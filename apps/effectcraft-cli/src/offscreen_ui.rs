@@ -1,9 +1,11 @@
 //! `mcp --ui`: the full app offscreen in this process ([`effectcraft_ui_egui::offscreen`]) as the
 //! MCP server's control transport, so every bridge tool (screenshot, `ui_*`, `control`) works with
-//! no window. The automation crate stays free of egui; this app layer joins the two.
+//! no window. The automation crate stays free of egui; this app layer joins the two. The app's
+//! session is in this process, so `--autosave` checkpoints it on the UI thread.
 
 use effectcraft_automation::bridge::reply_result;
-use effectcraft_automation::{ControlTransport, Error, Result};
+use effectcraft_automation::{ControlTransport, Error, Result, SessionJob};
+use effectcraft_engine::prefs::Prefs;
 use effectcraft_ui_egui::offscreen::{OffscreenOptions, OffscreenUi};
 use serde_json::Value;
 
@@ -29,5 +31,13 @@ impl ControlTransport for Offscreen {
 
     fn mode(&self) -> &'static str {
         "headless-ui"
+    }
+
+    fn session_prefs(&self) -> Option<Prefs> {
+        Some(self.0.prefs().clone())
+    }
+
+    fn on_session(&mut self, job: SessionJob) -> Option<Result<()>> {
+        Some(self.0.on_session(job).map_err(Error::Other))
     }
 }

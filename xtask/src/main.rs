@@ -11,11 +11,14 @@
 //! - `ico <out.ico> <in.png>…`: pack PNGs into a Windows `.ico` (used by `packaging/icons.sh`).
 //! - `fmt [--check]`: rustfmt every source file, including the modules `build.rs` declares
 //!   (`cargo fmt` doesn't see those; see `effectcraft-buildgen`).
-//! - `ci`: fmt check, clippy -D warnings, tests, layers, assets, wasm.
+//! - `ci`: fmt check, clippy -D warnings, tests (`--profile ci`), layers, assets, wasm.
 //! - `ci --affected [--base REV] [--dry-run]`: the same gates for only the crates the change since
 //!   REV (default: the merge-base with `main`) can affect; see `affected.rs` and docs/testing.md.
+//! - `agents <status|claim|release|gc>`: worktrees, target dirs and claims of parallel agents
+//!   (`agents.rs`).
 
 mod affected;
+mod agents;
 mod fmt;
 mod ico;
 mod version;
@@ -413,8 +416,8 @@ fn serve_dir(dir: &std::path::Path, port: u16) -> Result<(), String> {
 fn ci() -> Result<(), String> {
     let cargo = env!("CARGO");
     fmt::run(&["--check".into()])?;
-    run(Command::new(cargo).args(["clippy", "--workspace", "--all-targets", "--release", "--", "-D", "warnings"]))?;
-    run(Command::new(cargo).args(["test", "--workspace", "--release"]))?;
+    run(Command::new(cargo).args(["clippy", "--workspace", "--all-targets", "--profile", "ci", "--", "-D", "warnings"]))?;
+    run(Command::new(cargo).args(["test", "--workspace", "--profile", "ci"]))?;
     layers()?;
     assets()?;
     wasm()
@@ -431,6 +434,7 @@ fn main() -> ExitCode {
             if rest.iter().any(|a| a == "--affected") { affected::run(&root(), &rest) } else { ci() }
         }
         "fmt" => fmt::run(&std::env::args().skip(2).collect::<Vec<_>>()),
+        "agents" => agents::run(&std::env::args().skip(2).collect::<Vec<_>>()),
         "web" => web(&std::env::args().skip(2).collect::<Vec<_>>()),
         "ico" => {
             let rest: Vec<String> = std::env::args().skip(2).collect();
@@ -440,7 +444,7 @@ fn main() -> ExitCode {
             let rest: Vec<String> = std::env::args().skip(2).collect();
             version::run(&root(), &rest.iter().map(String::as_str).collect::<Vec<_>>())
         }
-        _ => Err("usage: cargo xtask <layers|assets|wasm|web [--dev] [--serve PORT]|ico OUT.ico IN.png…|version [set X.Y.Z]|fmt [--check]|ci [--affected [--base REV] [--dry-run]]>".into()),
+        _ => Err("usage: cargo xtask <layers|assets|wasm|web [--dev] [--serve PORT]|ico OUT.ico IN.png…|version [set X.Y.Z]|fmt [--check]|ci [--affected [--base REV] [--dry-run]]|agents <status|claim|release|gc>>".into()),
     };
     match r {
         Ok(()) => ExitCode::SUCCESS,

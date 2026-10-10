@@ -10,7 +10,10 @@ channel. Existing ports are unchanged.
 UI thread. That thread steps the egui_kittest harness until each request is answered and the UI
 has settled, feeds the app's synthetic input as real events and renders screenshots with wgpu.
 `screenshot` and the `ui_*` / `control` tools are listed only in these two modes; the
-`initialize` title names the mode (`headless`, `headless-ui`, `bridge`).
+`initialize` title names the mode (`headless`, `headless-ui`, `bridge`). The offscreen app's
+session is in the server's process, so a transport can also run code on it
+(`ControlTransport::on_session`, run on the UI thread between frames): `mcp --ui --autosave`
+checkpoints the project that way, like headless `--autosave` ([agents.md](agents.md)).
 
 The server provides the same core conventions as FilmCraft #28:
 
@@ -24,9 +27,9 @@ The server provides the same core conventions as FilmCraft #28:
 | `render_frames` | `times?` / `count?`, `start?`, `end?`, `cols?`, `max_side?`, `labels?`, `gif?`, `path?`, `inline?` and the render arguments | One labelled contact-sheet PNG and `{times, frames, cols, rows, cell}` |
 
 To check visual work, `render_snapshot {name, comp?, time?}` keeps a frame and
-`render_compare {a, b, threshold?, min_psnr?, max_side?, diff_path?, inline?}` compares snapshots,
-image files or frames rendered now, returning the metrics as JSON and, when something changed, the
-diff heatmap as image content (longest side 768; `diff_path` writes it full size). Both are
+`render_compare {a, b, threshold?, min_psnr?, max_side?, region?, diff_path?, inline?}` compares snapshots,
+image files or frames rendered now, returning the metrics and `diffBounds` (box of the changed pixels, or null) as
+JSON and, when something changed, the diff heatmap as image content (longest side 768; `diff_path` writes it full size). Both are
 annotated like file writers (not read-only, not destructive, idempotent): they never change the
 project. See [agents.md](agents.md#verify-your-change-snapshot--edit--compare).
 
@@ -65,8 +68,9 @@ Sessions that negotiated MCP 2025-06-18 (and modern per-request clients) get eac
 result as `structuredContent` as well as the JSON text block older clients read. It is always an
 object: an array result is `{"items": [...]}`, a scalar `{"value": v}`, and an image reply carries
 its metadata (`comp`, `time`, `width`, `height`, `path?`). Tools with a stable shape declare it as
-`outputSchema` in `tools/list`: `get_state`, `doc_inspect`, `render_preview`, `undo`, `redo`,
-`history`, `command_batch`, `batch` and `save_project`. Earlier revisions see neither field.
+`outputSchema` in `tools/list`: `get_state`, `doc_inspect`, `render_preview`, `render_frames`,
+`render_snapshot`, `render_compare`, `get_layout`, `analyze_audio`, `undo`, `redo`, `history`,
+`command_batch`, `batch` and `save_project`. Earlier revisions see neither field.
 Long calls (below) reply the same way.
 
 ## Resources
