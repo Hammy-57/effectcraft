@@ -37,9 +37,13 @@ fn choices(key: &str) -> Option<&'static [(&'static str, &'static str)]> {
     match key {
         "general.language" => Some(LANGUAGES),
         "startup.windowGraphics" => Some(WINDOW_GRAPHICS),
+        "graphType" => Some(GRAPH_TYPES),
         _ => None,
     }
 }
+
+/// Graph Editor graph types (`graphType`).
+const GRAPH_TYPES: &[(&str, &str)] = &[("Speed Graph", "speed"), ("Value Graph", "value"), ("Auto-Select Graph Type", "auto")];
 
 fn is_choice(choices: &[(&str, &str)], v: &str) -> bool {
     choices.iter().any(|(_, c)| *c == v)
@@ -348,6 +352,9 @@ pub struct Prefs {
     pub preview: crate::preview::PreviewSettings,
     /// View ▸ Simulate Output ▸ My Custom RGB.
     pub custom_rgb: crate::viewer::CustomRgb,
+    /// The Graph Editor's graph type, as last chosen with its buttons: `speed` (the default),
+    /// `value` or `auto` (Auto-Select Graph Type).
+    pub graph_type: String,
     /// Top-level keys this version doesn't know (kept for newer versions).
     #[serde(flatten)]
     pub extra: Extra,
@@ -384,6 +391,7 @@ impl Default for Prefs {
             libraries: vec![],
             preview: crate::preview::PreviewSettings::default(),
             custom_rgb: crate::viewer::CustomRgb::default(),
+            graph_type: "speed".into(),
             extra: Extra::new(),
         }
     }
