@@ -345,11 +345,38 @@ pub fn render_frame_reply(s: &Session, p: &Value, inline_default: bool) -> Resul
 }
 
 fn render_frame_cmd(s: &mut Session, p: &Value) -> Result<Value> {
+    if b_p(p, "wait") == Some(false) {
+        return in_background(s, "Render Frame", p, |w, p| render_frame_reply(w, p, false));
+    }
     render_frame_reply(s, p, false)
 }
 
 fn contact_sheet_cmd(s: &mut Session, p: &Value) -> Result<Value> {
+    if b_p(p, "wait") == Some(false) {
+        return in_background(s, "Render Contact Sheet", p, sheet::contact_sheet_reply);
+    }
     sheet::contact_sheet_reply(s, p)
+}
+
+/// Run `render` as a background task (`wait: false`): on a session that shares what a render
+/// reads (project, footage, expressions, GPU, layer cache, preferences, files) and copies the
+/// caller's cursor (its comp and time, also an agent's own), so the UI thread and other clients
+/// carry on meanwhile. Returns `{job}`; the task's result (quiet: no toast) is what the blocking
+/// command returns, and a control-channel request waits for it.
+fn in_background(s: &mut Session, label: &str, p: &Value, render: fn(&Session, &Value) -> Result<Value>) -> Result<Value> {
+    let mut p = p.clone();
+    if let Some(o) = p.as_object_mut() {
+        o.remove("wait");
+    }
+    let (project, services, footage, expr) = (s.project.clone(), s.services.clone(), s.footage.clone(), s.expr.clone());
+    let (accel, layer_cache, prefs, state) = (s.accel.clone(), s.layer_cache.clone(), s.prefs.clone(), s.state.clone());
+    s.spawn_task("render", label.to_string(), false, move |_ctl| {
+        let w = Session { project, services, footage, expr, accel, layer_cache, prefs, state, ..Session::default() };
+        let mut v = render(&w, &p).map_err(|e| e.to_string())?;
+        v["quiet"] = json!(true);
+        let apply: crate::jobs::Apply = Box::new(move |_| Ok(v));
+        Ok(apply)
+    })
 }
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -357,13 +384,13 @@ pub fn specs() -> Vec<CommandSpec> {
         query!(
             "render.frame",
             "Render Frame",
-            "{comp?, item?, layer?, time? (s), frame?, max_side?, transparent?, region?: [x, y, w, h], overlays?: true|[bounds, anchor, motionPath, safeMargins, grid], path?, base64?}",
+            "{comp?, item?, layer?, time? (s), frame?, max_side?, transparent?, region?: [x, y, w, h], overlays?: true|[bounds, anchor, motionPath, safeMargins, grid], path?, base64?, wait? (false: a background task)}",
             render_frame_cmd
         ),
         query!(
             "render.contactSheet",
             "Render Contact Sheet",
-            "{comp?, item?, layer?, times?: [s], count?, start? (s), end? (s), cols?, max_side?, labels?, transparent?, region?: [x, y, w, h], overlays?: true|[bounds, anchor, motionPath, safeMargins, grid], path?, gif?, base64?}",
+            "{comp?, item?, layer?, times?: [s], count?, start? (s), end? (s), cols?, max_side?, labels?, transparent?, region?: [x, y, w, h], overlays?: true|[bounds, anchor, motionPath, safeMargins, grid], path?, gif?, base64?, wait? (false: a background task)}",
             contact_sheet_cmd
         ),
     ]
