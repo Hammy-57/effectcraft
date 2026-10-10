@@ -1166,6 +1166,7 @@ dependencies = [
  "effectcraft-segment",
  "effectcraft-time",
  "image",
+ "serde",
  "serde_json",
  "thiserror 2.0.21",
 ]
