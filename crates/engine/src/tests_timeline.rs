@@ -766,3 +766,32 @@ fn toggle_transform_key_covers_selected_layers_separated_position_and_3d_rotatio
     }
     assert!(s.execute("keys.toggleTransform", json!({"prop": "skew"})).is_err());
 }
+
+/// `inDelta` / `outDelta` trim every layer by the same amount (the Timeline's trim drag over
+/// several selected layers), each within its own limits, and a drag is one undo step.
+#[test]
+fn timing_deltas_trim_each_layer_within_its_limits() {
+    let (mut s, a) = setup();
+    let b = s.execute("layer.newSolid", json!({"color": "#ff0000", "width": 10, "height": 10})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("layer.timing", json!({"layers": [a], "in": 0.5, "out": 2.0})).unwrap();
+    s.execute("layer.timing", json!({"layers": [b], "in": 1.0, "out": 3.5})).unwrap();
+    let times = |s: &Session| -> Vec<(f64, f64)> {
+        let c = s.active_comp().unwrap();
+        [a, b].iter().map(|id| c.layer(effectcraft_project::LayerId(*id)).map(|l| (l.in_point.seconds(), l.out_point.seconds())).unwrap()).collect()
+    };
+    let before = times(&s);
+    // A drag: two steps of half a second, one merge key; B stops at the comp's end (4 s).
+    for _ in 0..2 {
+        s.execute("layer.timing", json!({"layers": [a, b], "outDelta": 0.5, "merge": "bar-1"})).unwrap();
+    }
+    assert_eq!(times(&s), vec![(0.5, 3.0), (1.0, 4.0)]);
+    assert!(s.undo());
+    assert_eq!(times(&s), before, "one undo step restores every layer");
+    // In points: A stops at the comp's start; neither crosses its Out point.
+    s.execute("layer.timing", json!({"layers": [a, b], "inDelta": -1.0})).unwrap();
+    assert_eq!(times(&s), vec![(0.0, 2.0), (0.0, 3.5)]);
+    s.execute("layer.timing", json!({"layers": [a, b], "inDelta": 3.0})).unwrap();
+    let fd = 1.0 / 30.0;
+    let t = times(&s);
+    assert!((t[0].0 - (2.0 - fd)).abs() < 1e-9 && (t[1].0 - 3.0).abs() < 1e-9, "{t:?}");
+}
