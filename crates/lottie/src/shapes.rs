@@ -44,7 +44,7 @@ pub(crate) fn to_path(j: &Json) -> Option<Value> {
         v.resize(n, [0.0; 2]);
         v
     };
-    Some(Value::Path(ShapePath {
+    Some(Value::path(ShapePath {
         in_tangents: fit(pts("i")),
         out_tangents: fit(pts("o")),
         vertices,
@@ -56,7 +56,7 @@ pub(crate) fn to_path(j: &Json) -> Option<Value> {
 /// Gradient as Lottie's flat stop list: `[pos, r, g, b]…` then `[pos, alpha]…`.
 pub(crate) fn gradient_flat(v: &Value) -> Json {
     let g = match v {
-        Value::Gradient(g) => g.clone(),
+        Value::Gradient(g) => (**g).clone(),
         _ => Gradient::default(),
     };
     let mut out = vec![];
@@ -81,7 +81,7 @@ pub(crate) fn to_gradient(j: &Json, ncolors: usize) -> Option<Value> {
     if opacities.is_empty() {
         opacities = vec![(0.0, 1.0), (1.0, 1.0)];
     }
-    Some(Value::Gradient(Gradient { colors, opacities, ..Default::default() }))
+    Some(Value::gradient(Gradient { colors, opacities, ..Default::default() }))
 }
 
 fn blend_index(m: BlendMode) -> u32 {

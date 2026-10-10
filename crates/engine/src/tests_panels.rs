@@ -492,7 +492,7 @@ fn mask_paths(s: &Session, cid: ItemId, lid: LayerId, lt: Tick) -> Vec<effectcra
         .groups()
         .filter(|g| g.get("opacity").unwrap().value_at(lt).as_f64() > 0.0)
         .map(|g| match g.get("path").unwrap().value_at(lt) {
-            effectcraft_project::Value::Path(p) => p,
+            effectcraft_project::Value::Path(p) => *p,
             _ => panic!("path"),
         })
         .collect()

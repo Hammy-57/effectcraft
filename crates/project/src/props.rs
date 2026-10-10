@@ -775,7 +775,7 @@ mod node_serde_tests {
             slider_max: 50.0,
             decimals: 1,
         });
-        let path = Property::new(5, "path", "Mask Path", Value::Path(ShapePath::rect([0.0, 0.0], 10.0, 20.0)));
+        let path = Property::new(5, "path", "Mask Path", Value::path(ShapePath::rect([0.0, 0.0], 10.0, 20.0)));
         let mut mask = PropGroup::new(4, "mask", "Mask 1");
         mask.kind = GroupKind::Mask {
             mode: MaskMode::Subtract,

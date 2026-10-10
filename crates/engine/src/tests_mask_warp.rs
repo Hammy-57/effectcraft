@@ -138,7 +138,7 @@ fn mask_interpolation_creates_matching_keys() {
     let (t0, t1) = (frame_time(0), frame_time(20));
     s.edit("keys", None, |p, _| {
         let pr = p.comp_mut(cid).unwrap().layer_mut(clip).unwrap().props.find_group_mut(uid).unwrap().get_mut("path").unwrap();
-        pr.keys = vec![Keyframe::new(t0, KV::Path(a.clone())), Keyframe::new(t1, KV::Path(b.clone()))];
+        pr.keys = vec![Keyframe::new(t0, KV::path(a.clone())), Keyframe::new(t1, KV::path(b.clone()))];
         Ok(())
     })
     .unwrap();

@@ -161,7 +161,7 @@ pub(crate) fn value(j: &Json) -> Option<Value> {
                 .collect::<Option<Vec<_>>>()?
         }
     };
-    Some(Value::Path(ShapePath { vertices, in_tangents, out_tangents, closed, feather }))
+    Some(Value::path(ShapePath { vertices, in_tangents, out_tangents, closed, feather }))
 }
 
 #[cfg(test)]

@@ -80,7 +80,7 @@ pub fn mask(ids: &mut Ids, name: &str, path: ShapePath, mode: MaskMode, color: [
         feather_falloff: Default::default(),
         roto_bezier: false,
     };
-    g.with(ids.prop("path", "Mask Path", Value::Path(path)).with_ui(ParamUi::Path))
+    g.with(ids.prop("path", "Mask Path", Value::path(path)).with_ui(ParamUi::Path))
         .with(ids.prop("feather", "Mask Feather", Value::Vec2([0.0, 0.0])).with_ui(ParamUi::Pixels))
         .with(ids.prop("opacity", "Mask Opacity", Value::Scalar(100.0)).with_ui(slider(0.0, 100.0, 0.0, 100.0, 0)))
         .with(ids.prop("expansion", "Mask Expansion", Value::Scalar(0.0)).with_ui(ParamUi::Pixels))
@@ -410,7 +410,7 @@ pub fn shape_star(ids: &mut Ids, star: bool, points: f64, position: [f64; 2], ou
 pub fn shape_path(ids: &mut Ids, path: ShapePath) -> PropGroup {
     indexed(ids.group("path", "Path 1"))
         .with(ids.prop("direction", "Path Direction", Value::Enum(0)).with_ui(ParamUi::Hidden))
-        .with(ids.prop("path", "Path", Value::Path(path)).with_ui(ParamUi::Path))
+        .with(ids.prop("path", "Path", Value::path(path)).with_ui(ParamUi::Path))
 }
 
 pub fn shape_fill(ids: &mut Ids, color: [f64; 4]) -> PropGroup {
@@ -476,7 +476,7 @@ pub fn shape_gradient_fill(ids: &mut Ids, radial: bool, start: [f64; 2], end: [f
         .with(ids.prop("end", "End Point", Value::Vec2(end)).with_ui(ParamUi::Point))
         .with(ids.prop("highlightLength", "Highlight Length", Value::Scalar(0.0)).with_ui(ParamUi::Percent))
         .with(ids.prop("highlightAngle", "Highlight Angle", Value::Scalar(0.0)).with_ui(ParamUi::Angle))
-        .with(ids.prop("colors", "Colors", Value::Gradient(g)).with_ui(ParamUi::Gradient))
+        .with(ids.prop("colors", "Colors", Value::gradient(g)).with_ui(ParamUi::Gradient))
         .with(ids.prop("opacity", "Opacity", Value::Scalar(100.0)).with_ui(slider(0.0, 100.0, 0.0, 100.0, 0)))
 }
 
@@ -490,7 +490,7 @@ pub fn shape_gradient_stroke(ids: &mut Ids, radial: bool, start: [f64; 2], end: 
         .with(ids.prop("end", "End Point", Value::Vec2(end)).with_ui(ParamUi::Point))
         .with(ids.prop("highlightLength", "Highlight Length", Value::Scalar(0.0)).with_ui(ParamUi::Percent))
         .with(ids.prop("highlightAngle", "Highlight Angle", Value::Scalar(0.0)).with_ui(ParamUi::Angle))
-        .with(ids.prop("colors", "Colors", Value::Gradient(g)).with_ui(ParamUi::Gradient))
+        .with(ids.prop("colors", "Colors", Value::gradient(g)).with_ui(ParamUi::Gradient))
         .with(ids.prop("opacity", "Opacity", Value::Scalar(100.0)).with_ui(slider(0.0, 100.0, 0.0, 100.0, 0)))
         .with(ids.prop("width", "Stroke Width", Value::Scalar(width)).with_ui(ParamUi::Pixels))
         .with(ids.prop("cap", "Line Cap", Value::Enum(0)).with_ui(popup(&["Butt Cap", "Round Cap", "Projecting Cap"])))

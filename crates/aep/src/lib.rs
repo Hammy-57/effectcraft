@@ -1518,8 +1518,8 @@ fn fill_property(prop: &mut Property, ir: &Json, value: Value, value_type: &str,
         let mut k = Keyframe::new(layer_time.at(time), keyed);
         k.in_interp = interpolation(field(key, &["in_interpolation_type", "in_interpolation", "in_interp"]));
         k.out_interp = interpolation(field(key, &["out_interpolation_type", "out_interpolation", "out_interp"]));
-        k.in_ease = eases(field(key, &["in_temporal_ease", "in_ease"]));
-        k.out_ease = eases(field(key, &["out_temporal_ease", "out_ease"]));
+        k.in_ease = eases(field(key, &["in_temporal_ease", "in_ease"])).into();
+        k.out_ease = eases(field(key, &["out_temporal_ease", "out_ease"])).into();
         if let Some(v) = field(key, &["in_spatial_tangent", "spatial_in"]).and_then(vec3) {
             k.spatial_in = v;
             k.spatial_auto = false;
@@ -1720,7 +1720,7 @@ fn gradient_value(j: &Json) -> Option<Value> {
     opacities.sort_by(|a, b| a.0.total_cmp(&b.0));
     let color_midpoints = colors.iter().map(|(_, _, m)| *m).collect();
     let opacity_midpoints = opacities.iter().map(|(_, _, m)| *m).collect();
-    Some(Value::Gradient(Gradient {
+    Some(Value::gradient(Gradient {
         colors: colors.into_iter().map(|(pos, color, _)| (pos, color)).collect(),
         opacities: opacities.into_iter().map(|(pos, alpha, _)| (pos, alpha)).collect(),
         color_midpoints,

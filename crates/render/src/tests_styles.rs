@@ -223,7 +223,7 @@ fn overlays_leave_antialiased_edges_clean() {
             "Gradient Overlay",
             Box::new(|p, c, l| {
                 add(p, c, l, "gradientOverlay");
-                set(l, "gradientOverlay/colors", Value::Gradient(flat.clone()));
+                set(l, "gradientOverlay/colors", Value::gradient(flat.clone()));
             }),
         ),
         (
@@ -471,7 +471,7 @@ fn gradient_glow_uses_gradient() {
         set(
             l,
             "outerGlow/colors",
-            Value::Gradient(Gradient {
+            Value::gradient(Gradient {
                 colors: vec![(0.0, [1.0, 0.0, 0.0, 1.0]), (1.0, [0.0, 0.0, 1.0, 1.0])],
                 opacities: vec![(0.0, 1.0), (1.0, 0.0)],
                 ..Default::default()
