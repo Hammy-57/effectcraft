@@ -1,7 +1,7 @@
 {
   "id": "fix-layout",
   "title": "Fix the layout problems",
-  "prompt": "The comp \"Main\" (1920×1080) has layout problems: the text layer \"Headline\" is cut off at the frame edge and the text layer \"Fine print\" is tiny and outside the safe area. Fix them so render.lint reports no errors or warnings: both texts fully inside the title-safe area, \"Fine print\" at least 20 px tall and \"Headline\" at least 60 px tall. The title-safe area is the frame inset by 10% on each side (x 192–1728, y 108–972 in a 1920×1080 comp). Don't delete layers or change the wording.",
+  "prompt": "The comp \"Main\" (1920×1080) has layout problems: the text layer \"Headline\" is cut off at the frame edge and the text layer \"Fine print\" is tiny and outside the safe area. Fix them so render.lint reports no errors or warnings: both texts fully inside the title-safe area, \"Fine print\" at a legible size (render.lint wants characters at least 1/30 of the frame height, 36 px here) and \"Headline\" at least 60 px tall. The title-safe area is the frame inset by 10% on each side (x 192–1728, y 108–972 in a 1920×1080 comp). Don't delete layers or change the wording.",
   "setup": [
     {
       "command": "comp.new",
@@ -201,7 +201,7 @@
       "command": "layer.setText",
       "params": {
         "layer": "Fine print",
-        "size": 32
+        "size": 40
       }
     },
     {

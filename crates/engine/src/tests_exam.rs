@@ -167,8 +167,6 @@ fn expand(c: Value) -> Check {
 
 #[test]
 fn lint_shorthand_expands_to_render_lint() {
-    // TODO(coordinator): once render.lint is merged, add an end-to-end lint check test (a
-    // too-small text layer fails `{"lint": {}}`, a fixed one passes).
     let c = expand(json!({"id": "clean", "desc": "no problems", "lint": {"comp": "Main", "rules": ["cut-off"]}}));
     assert_eq!(c.id, "clean");
     assert_eq!(c.desc, "no problems");
@@ -196,8 +194,6 @@ fn lint_shorthand_expands_to_render_lint() {
 
 #[test]
 fn motion_shorthand_expands_to_comp_motion() {
-    // TODO(coordinator): once comp.motion is merged, add an end-to-end motion check test (a
-    // layer keyed from x = -200 at 0 s to the centre at 1 s has an `enter` segment from the left).
     let c = expand(
         json!({"id": "fly", "motion": {"comp": "Main"}, "layer": "Logo", "segment": {"kind": "enter", "edge": "left", "startApprox": 0, "endApprox": 1, "tol": 0.2}}),
     );
@@ -443,8 +439,7 @@ fn missing_query(c: &Value) -> Option<String> {
 }
 
 /// Every task in `evals/agent/tasks`: `setup` builds a start that does not pass, and `solution`
-/// makes every check pass. Checks whose query this build lacks (render.lint and comp.motion
-/// until their branches merge) are skipped.
+/// makes every check pass. Every check runs: a check whose query this build lacks fails the test.
 #[test]
 fn every_task_is_solvable() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../evals/agent/tasks");
@@ -490,7 +485,31 @@ fn every_task_is_solvable() {
             .collect();
         assert!(failed.is_empty(), "{id}: the solution fails\n  {}", failed.join("\n  "));
     }
-    // TODO(coordinator): after render.lint and comp.motion merge, this set is empty and every
-    // lint / motion check runs here too.
-    eprintln!("checks skipped (query not in this build): {skipped:?}");
+    assert!(skipped.is_empty(), "checks whose query is not in this build: {skipped:?}");
+}
+
+#[test]
+fn lint_check_end_to_end() {
+    let mut s = project();
+    let t = s.execute("layer.newText", json!({"name": "Fine print", "text": "Hello", "size": 8, "fill": "#ffffff", "position": [960, 540]})).unwrap()["layer"]
+        .clone();
+    let check = json!({"id": "legible", "lint": {"comp": "Main", "time": 0, "rules": ["text-too-small"]}});
+    let r = one(&mut s, check.clone());
+    assert_eq!(r["pass"], false, "{r}");
+    s.execute("layer.setText", json!({"layer": t, "size": 72})).unwrap();
+    let r = one(&mut s, check);
+    assert_eq!(r["pass"], true, "{r}");
+}
+
+#[test]
+fn motion_check_end_to_end() {
+    let mut s = project();
+    let check = json!({"id": "fly", "motion": {"comp": "Main"}, "layer": "Logo",
+        "segment": {"kind": "enter", "edge": "left", "startApprox": 0, "endApprox": 1, "tol": 0.2}});
+    assert_eq!(one(&mut s, check.clone())["pass"], false);
+    for (time, x) in [(0.0, -200.0), (1.0, 960.0)] {
+        s.execute("prop.addKey", json!({"layer": "Logo", "path": "transform/position", "time": time, "value": [x, 540.0]})).unwrap();
+    }
+    let r = one(&mut s, check);
+    assert_eq!(r["pass"], true, "{r}");
 }
