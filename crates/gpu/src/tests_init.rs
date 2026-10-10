@@ -176,7 +176,7 @@ fn reproduced_fxc_pointwise_failure_returns_error_without_escaping_or_notifying_
 
 /// The shipped Windows x64 configuration must compile the complete compositor on DX12.
 #[test]
-#[cfg(all(target_os = "windows", target_env = "msvc", not(target_arch = "aarch64")))]
+#[cfg(all(target_os = "windows", target_env = "msvc", target_arch = "x86_64"))]
 fn dx12_auto_compiler_builds_compositor_with_linked_dxc() {
     let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
     desc.backends = wgpu::Backends::DX12;
