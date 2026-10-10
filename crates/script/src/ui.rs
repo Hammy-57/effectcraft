@@ -221,6 +221,11 @@ fn host_main(name: String, code: String, link: Link) {
             }
         };
         let r = crate::runtime::eval_with_tasks(&mut ctx, &code, &file);
+        if crate::runtime::stopped().is_some() {
+            // Stopped by the host: no windows, and the context is not used again.
+            yield_wait(outcome(settle(), r), vec![], true);
+            return;
+        }
         let mut out = outcome(settle(), r);
         loop {
             let windows = snapshot(&mut ctx);

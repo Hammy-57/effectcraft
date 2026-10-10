@@ -1,7 +1,16 @@
 # MCP conventions
 
-Run `effectcraft-cli mcp` for a headless session, or `effectcraft-cli mcp --bridge 9877`
-to use the desktop app's control channel. Existing ports are unchanged.
+Run `effectcraft-cli mcp` for a headless session, `effectcraft-cli mcp --ui` for the full app
+offscreen (no window), or `effectcraft-cli mcp --bridge 9877` to use the desktop app's control
+channel. Existing ports are unchanged.
+
+`--ui` and `--bridge` both route every tool through control-channel requests
+(`docs/control-protocol.md`) behind the automation crate's `ControlTransport` trait: a TCP
+`BridgeClient`, or the CLI's offscreen transport, which owns `effectcraft_ui_egui::offscreen`'s
+UI thread. That thread steps the egui_kittest harness until each request is answered and the UI
+has settled, feeds the app's synthetic input as real events and renders screenshots with wgpu.
+`screenshot` and the `ui_*` / `control` tools are listed only in these two modes; the
+`initialize` title names the mode (`headless`, `headless-ui`, `bridge`).
 
 The server provides the same core conventions as FilmCraft #28:
 
@@ -13,6 +22,13 @@ The server provides the same core conventions as FilmCraft #28:
 | `doc_inspect` | none | Project overview and active composition |
 | `render_preview` | `comp?` / `item?`, `layer?`, `time?`, `max_side?`, `region?`, `overlays?`, `transparent?` | PNG and frame information |
 | `render_frames` | `times?` / `count?`, `start?`, `end?`, `cols?`, `max_side?`, `labels?`, `gif?`, `path?` and the render arguments | One labelled contact-sheet PNG and `{times, frames, cols, rows, cell}` |
+
+To check visual work, `render_snapshot {name, comp?, time?}` keeps a frame and
+`render_compare {a, b, threshold?, min_psnr?, max_side?, diff_path?, inline?}` compares snapshots,
+image files or frames rendered now, returning the metrics as JSON and, when something changed, the
+diff heatmap as image content (longest side 768; `diff_path` writes it full size). Both are
+annotated like file writers (not read-only, not destructive, idempotent): they never change the
+project. See [agents.md](agents.md#verify-your-change-snapshot--edit--compare).
 
 `command_batch` stops at the first error by default; false continues. Each edit has its
 own undo step. The existing `batch` tool retains its atomic undo grouping and result references.
@@ -44,20 +60,42 @@ receive `resultType: complete` and list/read cache hints; document reads are nev
 
 ## Progress and cancellation
 
-Headless `command_run` / `execute_command` calls to `renderQueue.render` (unless `wait: false`)
-run the existing background job while the MCP server keeps reading stdin. A
-`params._meta.progressToken` string or number opts into `notifications/progress`, at most ten
-per second, strictly increasing with a queue-item total. No token means no notifications.
-`ping`, inspection and other requests are served while rendering. The existing engine refuses
-a second render while one is active. Closing stdin lets the pending render finish and reply.
+Long calls don't block the server. While one runs, `ping` is answered at once and other
+requests are served (see below); `notifications/cancelled` with `params.requestId` stops it, and
+no response is sent for the cancelled request. Unknown and completed ids are ignored; a
+cancelled request that is still waiting in line is dropped. A `params._meta.progressToken`
+string or number opts into `notifications/progress` (`progress`, `total` when known, `message`),
+at most ten per second and strictly increasing. Closing stdin lets a running call finish and
+reply.
 
-Send `notifications/cancelled` with `params.requestId` to stop the matching request at the next
-frame batch. No response is sent for that cancelled request. Unknown and completed ids are
-ignored. The exporter records the exact files it opens, including storage overflow paths, and
-removes those files on cancellation; it never scans for similarly named files. Finished earlier
-queue items and skipped existing frames remain. Custom exporters implement the same cleanup
-contract. A failed queue item gives `isError: true`.
+**Background-job commands.** `command_run` / `execute_command` of these commands, when they
+block, start their engine job with `wait: false`, watch it through `jobs.list` (renders:
+`renderQueue.list`) and reply what the blocking command returns. The table is `SPECS` in
+`crates/automation/src/long_job.rs`.
 
-Bridge calls, `wait: false`, batch tools and single-frame tools retain synchronous/polling
-behaviour and do not report MCP progress or cancellation. Use a direct blocking command call
-for an MCP-cancellable render.
+| Command (blocks) | Progress | On cancel |
+| --- | --- | --- |
+| `renderQueue.render` (unless `wait: false`) | queue items | stops at the next frame batch; the exporter deletes the files it opened for the stopped item; finished items and skipped frames stay |
+| `track.analyze`, `track.mask` (`wait: true`) | frames | stops; the frames analysed so far stay, as the one "Analyze Track" / "Track Mask" undo step (as After Effects' Stop) |
+| `warp.analyze`, `track.warpStabilizer`, `camera.analyze`, `track.camera`, `camera.deletePoints` (`wait: true`) | frames (per phase) | nothing is written |
+| `roto.propagate`, `roto.freeze` (`wait: true`) | frames | propagation keeps the frames it cached (no project change); Freeze writes nothing |
+| `contentFill.generate`, `layer.sceneEditDetection`, `footage.check` (`wait: true`) | the task's steps | the task's result is discarded; the project is unchanged |
+| `jobs.wait` | finished tasks | only the waiting stops; the tasks keep running |
+
+The job works on a snapshot of the project (or writes its results when it ends, as in the app),
+so other requests are served while it runs, including edits. Another long call, a script, and
+everything sent after them wait in line until the job ends, then run in order. This works
+headless and bridged (`--bridge`: the app runs the job; the server polls it).
+
+**Scripts.** Headless `run_script` runs on a worker thread that owns the session meanwhile, so
+other requests wait in line (in order) and `ping` is answered. A cancel or the `timeout`
+(seconds, default 300, `0` = no limit; also `script.run {timeout}`) ends the script with an error
+`try`/`catch` cannot intercept: checked every ~100k bytecode steps and in every object-model call.
+An undo group the script left open is rolled back (Edit ▸ Redo restores it); edits outside undo
+groups are kept; the output says which. Code inside a built-in's callback (`Array.forEach`, a
+sort comparator) that never calls the object model is only stopped by the loop-iteration limit.
+Bridged scripts honour `timeout` (in the app) but can't be cancelled.
+
+Batch tools (`batch`, `command_batch`), single-frame tools, other synchronous commands
+(`render.saveCurrentPreview`, `file.importAep`, `layer.autoTrace`, imports without `background`)
+and every call with `wait: false` stay synchronous: no progress, no cancellation.

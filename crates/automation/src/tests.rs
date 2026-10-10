@@ -379,8 +379,29 @@ fn autosave_flushes_on_read_errors_and_broken_output() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-/// A fake desktop control channel: answers `engine.execute` from a real session, and canned
+/// A fake app's reply to one control request: `engine.execute` from a real session, and canned
 /// `render.frame` / `ui.screenshot` replies.
+fn fake_reply(session: &mut Session, method: &str, p: &Value) -> Value {
+    match method {
+        "engine.execute" => match session.execute(p["command"].as_str().unwrap(), p["params"].clone()) {
+            Ok(v) => json!({"ok": true, "result": v}),
+            Err(e) => json!({"ok": false, "error": e.to_string()}),
+        },
+        "render.frame" => {
+            let png = crate::encode_png(4, 2, vec![255; 32], 0).unwrap();
+            json!({"ok": true, "result": {"comp": 1, "time": 0.5, "width": 4, "height": 2, "png": base64::encode(&png)}})
+        }
+        "ui.screenshot" => {
+            let png = crate::encode_png(8, 8, vec![128; 256], 0).unwrap();
+            std::fs::write(p["path"].as_str().unwrap(), png).unwrap();
+            json!({"ok": true, "result": {"path": p["path"]}})
+        }
+        "ui.key" | "ui.click" => json!({"ok": true, "result": null}),
+        m => json!({"ok": false, "error": format!("unknown method `{m}`")}),
+    }
+}
+
+/// A fake desktop control channel over TCP (see [`fake_reply`]).
 fn fake_app() -> u16 {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
@@ -390,30 +411,57 @@ fn fake_app() -> u16 {
         let mut session = Session::default();
         for line in BufReader::new(stream).lines() {
             let msg: Value = serde_json::from_str(&line.unwrap()).unwrap();
-            let p = &msg["params"];
-            let reply = match msg["method"].as_str().unwrap() {
-                "engine.execute" => match session.execute(p["command"].as_str().unwrap(), p["params"].clone()) {
-                    Ok(v) => json!({"ok": true, "result": v}),
-                    Err(e) => json!({"ok": false, "error": e.to_string()}),
-                },
-                "render.frame" => {
-                    let png = crate::encode_png(4, 2, vec![255; 32], 0).unwrap();
-                    json!({"ok": true, "result": {"comp": 1, "time": 0.5, "width": 4, "height": 2, "png": base64::encode(&png)}})
-                }
-                "ui.screenshot" => {
-                    let png = crate::encode_png(8, 8, vec![128; 256], 0).unwrap();
-                    std::fs::write(p["path"].as_str().unwrap(), png).unwrap();
-                    json!({"ok": true, "result": {"path": p["path"]}})
-                }
-                "ui.key" => json!({"ok": true, "result": null}),
-                m => json!({"ok": false, "error": format!("unknown method `{m}`")}),
-            };
-            let mut reply = reply;
+            let mut reply = fake_reply(&mut session, msg["method"].as_str().unwrap(), &msg["params"]);
             reply["id"] = msg["id"].clone();
             writeln!(out, "{reply}").unwrap();
         }
     });
     port
+}
+
+/// An in-process control transport (as `mcp --ui`'s offscreen UI), recording the methods called.
+struct FakeTransport {
+    session: Session,
+    calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl crate::ControlTransport for FakeTransport {
+    fn call(&mut self, method: &str, params: Value) -> crate::Result<Value> {
+        self.calls.lock().unwrap().push(method.to_string());
+        crate::bridge::reply_result(fake_reply(&mut self.session, method, &params))
+    }
+    fn mode(&self) -> &'static str {
+        "headless-ui"
+    }
+}
+
+#[test]
+fn ui_tools_run_through_any_control_transport() {
+    let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut s = McpServer::new(Backend::transport(FakeTransport { session: Session::default(), calls: calls.clone() }));
+    let r = rpc(&mut s, 1, "initialize", json!({}));
+    assert!(r["serverInfo"]["title"].as_str().unwrap().contains("headless-ui"), "{r}");
+    let names: Vec<String> =
+        rpc(&mut s, 2, "tools/list", json!({}))["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
+    for want in ["screenshot", "ui_click", "ui_elements", "control", "execute_command"] {
+        assert!(names.iter().any(|n| n == want), "{want} listed");
+    }
+    // Engine commands, inspection and renders go through the transport too.
+    call_json(&mut s, "execute_command", json!({"command": "comp.new", "params": {"name": "T", "width": 64, "height": 64}}));
+    assert_eq!(call_json(&mut s, "get_comp", json!({}))["name"], "T");
+    let (c, err) = call(&mut s, "render_frame", json!({}));
+    assert!(!err, "{c:?}");
+    assert_eq!(png_size(&base64::decode(c[0]["data"].as_str().unwrap()).unwrap()), Some((4, 2)));
+    let (c, err) = call(&mut s, "screenshot", json!({"panel": "Timeline", "max_side": 4}));
+    assert!(!err, "{c:?}");
+    assert_eq!(png_size(&base64::decode(c[0]["data"].as_str().unwrap()).unwrap()), Some((4, 4)));
+    assert!(!call(&mut s, "ui_click", json!({"id": "tools.Selection"})).1);
+    let (c, err) = call(&mut s, "control", json!({"method": "ui.nope"}));
+    assert!(err && c[0]["text"].as_str().unwrap().contains("unknown method"));
+    let calls = calls.lock().unwrap().clone();
+    for want in ["engine.execute", "render.frame", "ui.screenshot", "ui.click", "ui.nope"] {
+        assert!(calls.iter().any(|c| c == want), "{want} in {calls:?}");
+    }
 }
 
 #[test]
@@ -1176,4 +1224,304 @@ fn bridge_render_frames_and_render_params() {
     // render_frame forwards the new arguments to the app's render.frame (the fake answers a 4×2 PNG).
     let (size, _) = call_image(&mut s, "render_frame", json!({"region": [0, 0, 8, 8], "overlays": true}));
     assert_eq!(size, (4, 2));
+}
+
+/// AG5: render_snapshot → edit → render_compare, with the heatmap inline only when it shows something.
+#[test]
+fn render_snapshot_and_compare_tools() {
+    let mut s = server();
+    call_json(&mut s, "execute_command", json!({"command": "comp.new", "params": {"name": "C", "width": 320, "height": 180}}));
+    call_json(&mut s, "execute_command", json!({"command": "layer.newSolid", "params": {"name": "Box", "color": "#ffffff", "width": 40, "height": 40}}));
+    let snap = call_json(&mut s, "render_snapshot", json!({"name": "before"}));
+    assert_eq!((snap["width"].as_u64(), snap["snapshots"].clone()), (Some(320), json!(["before"])));
+    // Nothing changed: JSON only, a pass with infinite PSNR.
+    let same = call_json(&mut s, "render_compare", json!({"a": "before", "b": {}}));
+    assert_eq!((same["pass"].as_bool(), same["psnr_db"].as_str()), (Some(true), Some("inf")), "{same}");
+    assert!(same.get("diff_png").is_none());
+    // Move the box 10 px right: metrics plus the heatmap image.
+    call_json(&mut s, "set_property", json!({"layer": 1, "path": "transform/position", "value": [170, 90]}));
+    let (c, err) = call(&mut s, "render_compare", json!({"a": {"snapshot": "before"}, "b": {"time": 0}}));
+    assert!(!err, "{c:?}");
+    assert_eq!(c[0]["type"], "image");
+    let png = base64::decode(c[0]["data"].as_str().unwrap()).unwrap();
+    assert_eq!(png_size(&png), Some((320, 180)));
+    let info: Value = serde_json::from_str(c[1]["text"].as_str().unwrap()).unwrap();
+    assert_eq!((info["pass"].as_bool(), info["changed_pixels"].as_u64()), (Some(false), Some(800)), "{info}");
+    assert!(info.get("diff_png").is_none(), "base64 moved into the image content");
+    // inline: false keeps the reply to JSON; bad references are in-band errors.
+    let r = call_json(&mut s, "render_compare", json!({"a": "before", "b": {}, "inline": false}));
+    assert_eq!(r["pass"], false);
+    let (c, err) = call(&mut s, "render_compare", json!({"a": "missing", "b": {}}));
+    assert!(err && c[0]["text"].as_str().unwrap().contains("no snapshot `missing`"));
+    let (_, err) = call(&mut s, "render_compare", json!({"a": "before"}));
+    assert!(err);
+}
+
+/// Every command in the long-call table exists and takes `wait` (a typo would silently make it
+/// synchronous again).
+#[test]
+fn long_call_table_names_real_waiting_commands() {
+    let mut s = Session::default();
+    for id in crate::long_job::spec_commands() {
+        let d = s.execute("command.describe", json!({"command": id})).unwrap_or_else(|e| panic!("{id}: {e}"));
+        if id != "jobs.wait" {
+            assert!(d["schema"]["properties"].get("wait").is_some(), "{id} takes no `wait`: {d}");
+        }
+    }
+}
+
+/// A stdio MCP session on its own thread.
+struct Stdio {
+    input: Option<std::io::PipeWriter>,
+    lines: std::io::Lines<BufReader<std::io::PipeReader>>,
+    server: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Stdio {
+    fn new(session: Session) -> Self {
+        let (in_r, in_w) = std::io::pipe().unwrap();
+        let (out_r, out_w) = std::io::pipe().unwrap();
+        let server = std::thread::spawn(move || McpServer::new(Backend::headless(session)).serve(BufReader::new(in_r), out_w).unwrap());
+        let mut io = Stdio { input: Some(in_w), lines: BufReader::new(out_r).lines(), server: Some(server) };
+        io.send(json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}}));
+        io.next();
+        io
+    }
+    fn send(&mut self, v: Value) {
+        writeln!(self.input.as_mut().unwrap(), "{v}").unwrap();
+    }
+    fn next(&mut self) -> Value {
+        serde_json::from_str(&self.lines.next().unwrap().unwrap()).unwrap()
+    }
+    /// The next message that is not a progress notification.
+    fn reply(&mut self) -> Value {
+        loop {
+            let m = self.next();
+            if m["method"] != "notifications/progress" {
+                return m;
+            }
+        }
+    }
+    fn call(&mut self, id: u64, tool: &str, args: Value, token: Option<Value>) {
+        let mut p = json!({"name": tool, "arguments": args});
+        if let Some(t) = token {
+            p["_meta"] = json!({"progressToken": t});
+        }
+        self.send(json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": p}));
+    }
+    fn cancel(&mut self, id: u64) {
+        self.send(json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": id, "reason": "test"}}));
+    }
+    /// A tool result's JSON text.
+    fn json(m: &Value) -> Value {
+        assert_eq!(m["result"]["isError"], false, "{m}");
+        serde_json::from_str(m["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+    }
+}
+
+impl Drop for Stdio {
+    fn drop(&mut self) {
+        drop(self.input.take());
+        if let Some(s) = self.server.take() {
+            let _ = s.join();
+        }
+    }
+}
+
+/// A clip whose frames take ~2 ms each to decode (a textured image), with a tracker on it, for
+/// analyses that run long enough to watch.
+fn slow_clip_session(seconds: f64) -> Session {
+    use effectcraft_engine::{
+        color::Label,
+        project::{Footage, FootageKind, ItemId, ItemKind},
+        raster::Image,
+        render::FootageSource,
+        time::{FrameRate, Tick},
+    };
+    use std::sync::Arc;
+    struct Slow;
+    impl FootageSource for Slow {
+        fn frame(&self, _: ItemId, _: &Footage, _: Tick) -> Option<Arc<Image>> {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let mut img = Image::new(64, 64);
+            for y in 0..64 {
+                for x in 0..64 {
+                    let v = (((x * 7 + y * 13) % 17) as f32 / 17.0 + ((x * y) % 5) as f32 * 0.05).min(1.0);
+                    img.set(x, y, [v, v, v, 1.0]);
+                }
+            }
+            Some(Arc::new(img))
+        }
+    }
+    let mut s = Session { footage: Arc::new(Slow), ..Default::default() };
+    effectcraft_script::install(&mut s);
+    s.execute("comp.new", json!({"width": 64, "height": 64, "frameRate": 25, "duration": seconds})).unwrap();
+    let footage = Footage {
+        path: "slow.mov".into(),
+        kind: FootageKind::Video,
+        width: 64,
+        height: 64,
+        pixel_aspect: 1.0,
+        frame_rate: FrameRate::new(25, 1),
+        duration: Tick::from_seconds_f64(seconds),
+        has_video: true,
+        ..Default::default()
+    };
+    let item = Arc::make_mut(&mut s.project).add_item("slow", Label::Aqua, None, ItemKind::Footage(footage));
+    let layer = s.execute("layer.addItem", json!({"item": item.0})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("layer.select", json!({"layers": [layer]})).unwrap();
+    s.execute("track.motion", json!({})).unwrap();
+    s.execute("track.setPoint", json!({"point": 1, "center": [32, 32], "featureSize": [16, 16], "searchSize": [32, 32]})).unwrap();
+    s.execute("time.set", json!({"time": 0})).unwrap();
+    s
+}
+
+/// docs/mcp.md "Progress and cancellation" for an analysis: `track.analyze {wait: true}` runs
+/// on its background job, reports progress for its token, lets requests through meanwhile and
+/// replies like the blocking command once done.
+#[test]
+fn analysis_reports_progress_and_serves_requests() {
+    let mut io = Stdio::new(slow_clip_session(2.0));
+    io.call(1, "command_run", json!({"id": "track.analyze", "params": {"direction": "forward", "wait": true}}), Some(json!("trk")));
+    let (mut last, mut notes, mut pinged, mut answered) = (-1.0, 0, false, false);
+    let done = loop {
+        let m = io.next();
+        if m["method"] == "notifications/progress" {
+            let p = &m["params"];
+            assert_eq!(p["progressToken"], "trk", "{m}");
+            let v = p["progress"].as_f64().unwrap();
+            assert!(v > last, "strictly increasing: {m}");
+            if let Some(t) = p["total"].as_f64() {
+                assert!(v <= t, "{m}");
+            }
+            assert!(p["message"].as_str().is_some_and(|s| !s.is_empty()), "{m}");
+            (last, notes) = (v, notes + 1);
+            if !pinged {
+                pinged = true;
+                io.send(json!({"jsonrpc": "2.0", "id": 2, "method": "ping"}));
+                io.call(3, "get_project", json!({}), None);
+            }
+        } else if m["id"] == 2 || m["id"] == 3 {
+            answered |= m["id"] == 3;
+        } else {
+            assert_eq!(m["id"], 1, "{m}");
+            break m;
+        }
+    };
+    let v = Stdio::json(&done);
+    assert_eq!(v["running"], false, "{v}");
+    assert_eq!(v["frames"], 49, "{v}");
+    assert!(notes >= 2 && answered, "{notes} notifications; requests answered during the analysis: {answered}");
+    // the results are in the project, as one undo step
+    io.call(4, "get_project", json!({}), None);
+    let p = Stdio::json(&io.reply());
+    assert!(p["undo"].to_string().contains("Analyze Track"), "{p}");
+    // footage.check {wait: true} runs as a task: its reply is the task's result
+    io.call(5, "command_run", json!({"id": "footage.check", "params": {"wait": true}}), Some(json!(5)));
+    let r = Stdio::json(&io.reply());
+    assert_eq!(r["checked"], 1, "{r}");
+}
+
+/// `notifications/cancelled` stops a running analysis: no response for it, `ping` is answered,
+/// unknown and completed ids are ignored, and the project stays consistent (the tracker keeps
+/// the frames it analysed, as one undo step) and usable.
+#[test]
+fn analysis_cancel_stops_the_job_without_a_reply() {
+    let mut io = Stdio::new(slow_clip_session(40.0));
+    io.call(1, "command_run", json!({"id": "track.analyze", "params": {"direction": "forward", "wait": true}}), Some(json!(1)));
+    let first = io.next();
+    assert_eq!(first["method"], "notifications/progress", "{first}");
+    io.cancel(77); // unknown id: ignored
+    io.cancel(1);
+    let started = std::time::Instant::now();
+    io.send(json!({"jsonrpc": "2.0", "id": 2, "method": "ping"}));
+    assert_eq!(io.reply()["id"], 2);
+    io.call(3, "command_run", json!({"id": "jobs.list"}), None);
+    let m = io.reply();
+    assert_eq!(m["id"], 3, "no response for the cancelled request: {m}");
+    // the job winds down at its next frame
+    let mut jobs = Stdio::json(&m);
+    while jobs["running"] != json!([]) {
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "cancel did not stop the job: {jobs}");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        io.call(3, "command_run", json!({"id": "jobs.list"}), None);
+        let again = io.reply();
+        assert_eq!(again["id"], 3, "{again}");
+        jobs = Stdio::json(&again);
+    }
+    // partial results, one undo step; a new analysis can start
+    io.call(4, "get_project", json!({}), None);
+    let p = Stdio::json(&io.reply());
+    assert!(p["undo"].to_string().contains("Analyze Track"), "{p}");
+    io.call(5, "command_run", json!({"id": "track.analyze", "params": {"direction": "frameForward", "wait": true}}), None);
+    let r = Stdio::json(&io.reply());
+    assert_eq!(r["frames"], 1, "{r}");
+    io.cancel(1); // completed id: ignored
+    io.send(json!({"jsonrpc": "2.0", "id": 6, "method": "ping"}));
+    assert_eq!(io.reply()["id"], 6);
+}
+
+/// `run_script` over stdio: `ping` is answered while the script runs, other requests wait for
+/// it, and `notifications/cancelled` stops even `while (true) {}` inside `try` quickly, with no
+/// response.
+#[test]
+fn script_cancel_stops_an_endless_loop() {
+    let mut sess = Session::default();
+    effectcraft_script::install(&mut sess);
+    let mut io = Stdio::new(sess);
+    io.call(
+        1,
+        "run_script",
+        json!({"code": "app.project.items.addComp('Kept', 64, 64, 1, 1, 25); try { while (true) {} } catch (e) {} 'caught'", "timeout": 0}),
+        None,
+    );
+    io.send(json!({"jsonrpc": "2.0", "id": 2, "method": "ping"}));
+    assert_eq!(io.reply()["id"], 2, "ping answered while the script runs");
+    io.call(3, "get_project", json!({}), None); // waits for the script
+    io.call(4, "get_project", json!({}), None);
+    io.cancel(4); // a queued request that is cancelled is dropped
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let started = std::time::Instant::now();
+    io.cancel(1);
+    let m = io.reply();
+    assert!(started.elapsed() < std::time::Duration::from_secs(2), "cancel took {:?}", started.elapsed());
+    assert_eq!(m["id"], 3, "no response for the cancelled script or the cancelled queued request: {m}");
+    // edits outside an undo group are kept
+    assert!(Stdio::json(&m).to_string().contains("Kept"), "{m}");
+    io.call(5, "run_script", json!({"code": "1 + 1"}), None);
+    let m = io.reply();
+    assert_eq!(m["id"], 5, "{m}");
+    assert_eq!(Stdio::json(&m)["result"], 2);
+}
+
+/// `run_script {timeout}` ends a runaway script with an error; an undo group it left open is
+/// rolled back, edits outside one are kept, and either way the output says so.
+#[test]
+fn script_timeout_rolls_back_an_open_undo_group() {
+    let mut sess = Session::default();
+    effectcraft_script::install(&mut sess);
+    let mut s = McpServer::new(Backend::headless(sess));
+    let started = std::time::Instant::now();
+    let r = call_json(
+        &mut s,
+        "run_script",
+        json!({"code": "app.beginUndoGroup('Build'); app.project.items.addComp('Doomed', 64, 64, 1, 1, 25); while (true) {}", "timeout": 0.3}),
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(3), "timeout took {:?}", started.elapsed());
+    assert_eq!(r["ok"], false, "{r}");
+    assert!(r["error"]["message"].as_str().unwrap().contains("time limit"), "{r}");
+    assert!(r["output"].as_str().unwrap().contains("rolled back"), "{r}");
+    assert!(!call_json(&mut s, "get_project", json!({})).to_string().contains("Doomed"));
+    // an endless loop calling the object model, outside an undo group
+    let r = call_json(
+        &mut s,
+        "run_script",
+        json!({"code": "app.project.items.addComp('Kept', 64, 64, 1, 1, 25); for (;;) { app.project.numItems; }", "timeout": 0.3}),
+    );
+    assert_eq!(r["ok"], false, "{r}");
+    assert!(r["output"].as_str().unwrap().contains("kept"), "{r}");
+    assert!(call_json(&mut s, "get_project", json!({})).to_string().contains("Kept"));
+    // a script that finishes in time is unaffected
+    let r = call_json(&mut s, "run_script", json!({"code": "var n = 0; for (var i = 0; i < 1000; i++) n += i; n", "timeout": 5}));
+    assert_eq!(r["result"], 499500, "{r}");
 }

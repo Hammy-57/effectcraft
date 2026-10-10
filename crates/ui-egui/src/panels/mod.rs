@@ -12,6 +12,7 @@ pub mod effects_presets;
 pub mod essential;
 pub mod expr_bar;
 pub mod expr_editor;
+pub mod figma_pair;
 pub mod flowchart;
 pub mod footage_panel;
 pub mod forms;
@@ -31,6 +32,7 @@ pub mod media_panels;
 pub mod misc;
 pub mod paint_panels;
 pub mod panel_kit;
+pub mod panel_menu;
 pub mod path_vr_panels;
 pub mod precomp;
 pub mod project;
@@ -57,7 +59,6 @@ pub mod viewer_tools;
 pub mod viewers;
 pub mod waveform;
 
-use crate::i18n::tr;
 use effectcraft_engine::Session;
 use effectcraft_engine::project::Comp;
 use effectcraft_engine::time::Tick;
@@ -129,71 +130,5 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: PanelKind, rect: Rec
         PanelKind::ContentAwareFill => content_fill_panel::show(app, ui, rect),
         PanelKind::CreateNullsFromPaths => path_vr_panels::create_nulls(app, ui, rect),
         PanelKind::VrCompEditor => path_vr_panels::vr_editor(app, ui, rect),
-    }
-}
-
-/// The ≡ panel menu (opened from a tab).
-pub fn panel_menu_popup(app: &mut EffectcraftApp, ui: &mut egui::Ui) {
-    let id = egui::Id::new("panel-menu");
-    let Some((panel, pos)) = ui.ctx().data(|d| d.get_temp::<(PanelKind, egui::Pos2)>(id)) else { return };
-    let mut close = false;
-    let area = egui::Area::new(id.with("area")).order(egui::Order::Foreground).fixed_pos(pos).show(ui.ctx(), |ui| {
-        egui::Frame::popup(ui.style()).show(ui, |ui| {
-            ui.set_min_width(200.0);
-            if ui.button(tr("Close Panel")).clicked() {
-                app.close_panel(panel);
-                close = true;
-            }
-            let floating = app.ui.floating.iter().any(|f| f.panels.contains(&panel));
-            if !floating && ui.button(tr("Undock Panel")).clicked() {
-                let r = crate::dock_ui::default_float_rect(ui.ctx().content_rect());
-                app.edit_layout(|l| l.float(panel, r));
-                close = true;
-            }
-            if !floating && ui.button(if app.ui.maximized == Some(panel) { tr("Restore Panel Size") } else { tr("Maximize Panel") }).clicked() {
-                app.toggle_maximize(panel);
-                close = true;
-            }
-            ui.separator();
-            match panel {
-                PanelKind::Timeline => {
-                    for (label, id) in [
-                        ("Hide Shy Layers", "hideShy"),
-                        ("Enable Frame Blending", "frameBlending"),
-                        ("Enable Motion Blur", "motionBlur"),
-                        ("Draft 3D", "draft3d"),
-                    ] {
-                        if ui.button(label).clicked() {
-                            let _ = app.session.execute("comp.setSwitch", serde_json::json!({"switch": id}));
-                            close = true;
-                        }
-                    }
-                    if ui.button(tr("Composition Settings…")).clicked() {
-                        let _ = dialogs::open_comp_settings(app);
-                        close = true;
-                    }
-                }
-                PanelKind::Composition | PanelKind::Viewer(_) => {
-                    for (label, cmd) in [
-                        ("New Viewer", "view.newViewer"),
-                        ("Composition Settings…", "app.compSettings"),
-                        ("View Options…", "view.layerControls"),
-                        ("Show Grid", "view.grid"),
-                        ("Title/Action Safe", "view.safeMargins"),
-                    ] {
-                        if ui.button(label).clicked() {
-                            let _ = crate::menus::invoke(app, &ui.ctx().clone(), cmd, serde_json::json!({}));
-                            close = true;
-                        }
-                    }
-                }
-                _ => {
-                    ui.label(egui::RichText::new(panel.title()).weak());
-                }
-            }
-        });
-    });
-    if close || crate::widgets::pressed_outside(ui.ctx(), &area.response) {
-        ui.ctx().data_mut(|d| d.remove::<(PanelKind, egui::Pos2)>(id));
     }
 }

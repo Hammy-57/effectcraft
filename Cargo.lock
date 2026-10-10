@@ -1137,6 +1137,7 @@ name = "effectcraft"
 version = "0.6.0"
 dependencies = [
  "cpal",
+ "effectcraft-automation",
  "effectcraft-engine",
  "effectcraft-host",
  "effectcraft-ui-egui",

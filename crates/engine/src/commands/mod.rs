@@ -26,6 +26,7 @@ pub mod footage_panel;
 pub(crate) mod frame_export;
 mod frontend;
 mod help;
+mod journal;
 mod key_labels;
 mod key_transform;
 mod keys_more;
@@ -49,6 +50,7 @@ mod prop_groups;
 mod proxy;
 pub mod puppet;
 mod query;
+pub mod render_compare;
 mod render_queue;
 pub(crate) mod rig3d;
 pub mod roto_cmds;
@@ -157,6 +159,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(time::specs());
         v.extend(render_queue::specs());
         v.extend(help::specs());
+        v.extend(journal::specs());
         v.extend(query::specs());
         v.extend(batch::specs());
         v.extend(crate::figma::specs());
@@ -208,6 +211,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(crate::learn::specs());
         v.extend(crate::templates::specs());
         v.extend(crate::preview::specs());
+        v.extend(render_compare::specs());
         v.extend(crate::render_view::specs());
         v
     })

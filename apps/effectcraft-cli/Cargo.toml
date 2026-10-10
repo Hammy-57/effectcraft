@@ -12,6 +12,12 @@ workspace = true
 name = "effectcraft-cli"
 path = "src/main.rs"
 
+[features]
+default = ["ui"]
+## `mcp --ui`: the full app offscreen in-process, so `screenshot` and the `ui_*` tools work without
+## a window.
+ui = ["effectcraft-ui-egui/offscreen"]
+
 [dependencies]
 effectcraft-engine = { workspace = true }
 effectcraft-host = { workspace = true }

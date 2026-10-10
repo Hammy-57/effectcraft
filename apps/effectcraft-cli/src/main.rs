@@ -17,12 +17,15 @@
 //!     [--keyint FRAMES] [--webm-codec vp9|av1] [--audio-bitrate KBPS] [--opus-app audio|voice]
 //!     (a relative --out is relative to the working directory; --queue outputs follow the project's own settings)
 //! effectcraft-cli render F.ecproj --queue                    render the project's Render Queue
+//! effectcraft-cli compare A.png B.png [--threshold L] [--min-psnr DB] [--max-side PX] [--diff D.png]
+//!     compare two images (goldens, After Effects references): metrics; exit 1 when they differ
 //! effectcraft-cli bench [--comp C] [--time S] [--scale K] [--n N] [--play N] [--gpu [--adv3d]]   render timings
 //!     (--gpu: CPU vs GPU ms/frame for every comp at Full and Half)
 //! effectcraft-cli bench --ops [--small] [--layers N] [--comps N] [--footage N]   everyday-operation timings
 //!     on a large generated project (open, save, auto-save, undo/redo, timeline, Project panel)
 //! effectcraft-cli script FILE.jsx [F.ecproj] | --eval CODE    run an After Effects-style script
-//! effectcraft-cli mcp [--autosave | --bridge PORT]            MCP server on stdio
+//! effectcraft-cli replay SCRIPT.jsonl [--keep-going]        replay a repro script (docs/agents.md)
+//! effectcraft-cli mcp [--autosave | --bridge PORT | --ui]     MCP server on stdio
 //! effectcraft-cli figma-bridge [--port 7789] [--control 9877] local endpoint for the Figma plug-in
 //!
 //! Project:  --project F.ecproj (or a positional *.ecproj) | --demo | --empty   (default: demo; mcp: empty)
@@ -30,6 +33,8 @@
 //! GPU:      --gpu renders on the GPU compositor (Mercury GPU Acceleration) when an adapter exists;
 //!           the default is the CPU (Mercury Software Only)
 //! Bridge:   --bridge PORT drives a running `effectcraft --control PORT` instead of a headless session
+//! UI:       mcp --ui [--ui-size WxH] [--ui-scale K] runs the full app offscreen (no window) for
+//!           screenshot and the ui_* tools (feature `ui`, on by default)
 //! Output:   --json for one compact JSON document on stdout (errors: {"error": …}, exit 1)
 //! ```
 //!
@@ -41,6 +46,8 @@
 use std::io::Write;
 
 mod figma_bridge;
+#[cfg(feature = "ui")]
+mod offscreen_ui;
 
 use effectcraft_automation::tools::{self, Reply};
 use effectcraft_automation::{Backend, McpServer};
@@ -88,7 +95,7 @@ fn stdout_broken() -> bool {
     STDOUT_FAILED.get().is_some_and(|k| *k != std::io::ErrorKind::BrokenPipe)
 }
 
-const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|set|render-frame|render|script|mcp|figma-bridge> [args] [--json]
+const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|set|render-frame|render|compare|script|replay|mcp|figma-bridge> [args] [--json]
   info                                     project + engine summary
   commands [--filter TEXT] [--enabled]     list engine commands
   exec <command-id> [--params JSON]        run one engine command (exec --list: list them, as `commands`)
@@ -105,6 +112,9 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
                                            (formats h264|hevc|av1|prores|webm|png|jpeg|tiff|exr|gif|wav|aiff;
                                            --profile..--keyint: HEVC / AV1, --audio-bitrate/--opus-app: WebM Opus)
                                            a relative --out is relative to the working directory
+  compare A.png B.png [--threshold L] [--min-psnr DB] [--max-side PX] [--amplify K] [--diff D.png]
+                                           compare two PNG/JPEG images (max/mean abs diff, PSNR, SSIM, changed
+                                           pixels; --diff writes a heatmap); exit 1 when they don't pass
   bench [--comp C] [--time S] [--scale K] [--n N] [--play N] [--gpu [--adv3d]]   per-layer/effect render timings;
                                            --play N renders N consecutive frames with/without the layer cache;
                                            --gpu compares CPU and GPU ms/frame for every comp at Full and Half
@@ -114,7 +124,12 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
   script FILE.jsx [F.ecproj] | --eval CODE run JavaScript with the After Effects-style object model
                                            (app.project, comps, layers, properties…); prints writeLn
                                            output and the result; errors exit 1 with file:line:col
-  mcp [--autosave | --bridge PORT]         MCP server (JSON-RPC over stdio); --autosave preserves unsaved headless work
+  replay SCRIPT.jsonl [--keep-going]       replay a repro script headless (journal.export, crash repros):
+                                           per-step ok/error and the first failure; exits 1 when a step
+                                           fails, an expectation is not met or a command panics
+  mcp [--autosave | --bridge PORT | --ui]  MCP server (JSON-RPC over stdio); --autosave preserves unsaved headless work;
+                                           --ui [--ui-size 1680x1020] [--ui-scale 2] runs the app offscreen
+                                           (no window) so screenshot and the ui_* tools work
   figma-bridge [--port 7789] [--control 9877] [--code CODE]
                                            local endpoint for the EffectCraft Figma plug-in: imports what it
                                            sends into the running app (file.importFigma); prints the pairing code
@@ -145,6 +160,13 @@ const VALUED: &[&str] = &[
     "--port",
     "--control",
     "--code",
+    // compare
+    "--threshold",
+    "--min-psnr",
+    "--diff",
+    "--amplify",
+    "--ui-size",
+    "--ui-scale",
     // render
     "--format",
     "--start",
@@ -185,6 +207,8 @@ const FLAGS: &[&str] = &[
     "--small",
     "--adv3d",
     "--autosave",
+    "--ui",
+    "--keep-going",
 ];
 
 struct Args {
@@ -312,13 +336,17 @@ fn usage_err<T>(m: &str) -> Result<T, Failure> {
     Err(Failure::Usage(m.to_string()))
 }
 
-/// Build the backend: a bridge to the app, or a headless session with the requested project.
+/// Build the backend: a bridge to the app, the app offscreen (`--ui`), or a headless session, with
+/// the requested project.
 fn backend(args: &Args, default_demo: bool) -> Result<Backend, Failure> {
     if let Some(addr) = args.opt("--bridge") {
         if args.project.is_some() || args.flag("--demo") {
             return usage_err("--bridge drives the running app's project; use `exec file.open` to open another");
         }
         return Ok(Backend::bridge(addr)?);
+    }
+    if args.flag("--ui") {
+        return offscreen_backend(args, default_demo);
     }
     let mut b = Backend::headless(session(args)?);
     if let Some(p) = &args.project {
@@ -327,6 +355,45 @@ fn backend(args: &Args, default_demo: bool) -> Result<Backend, Failure> {
         b.exec("file.openDemoProject", json!({}))?;
     }
     Ok(b)
+}
+
+/// `--ui`: the full app offscreen, reached through its control channel like a bridged app.
+#[cfg(feature = "ui")]
+fn offscreen_backend(args: &Args, default_demo: bool) -> Result<Backend, Failure> {
+    use effectcraft_ui_egui::offscreen::OffscreenOptions;
+    let mut opts = OffscreenOptions::default();
+    if let Some(v) = args.opt("--ui-size") {
+        let parsed = v.split_once('x').and_then(|(w, h)| Some([w.trim().parse::<f32>().ok()?, h.trim().parse::<f32>().ok()?]));
+        opts.size = parsed.ok_or_else(|| Failure::Usage(format!("--ui-size: expected WxH in points, e.g. 1680x1020, got {v}")))?;
+    }
+    if let Some(k) = args.num("--ui-scale")? {
+        if !(0.5..=4.0).contains(&k) {
+            return usage_err("--ui-scale: expected 0.5 to 4");
+        }
+        opts.pixels_per_point = k as f32;
+    }
+    // The project opens before the app starts (errors surface now, and `initialize` needn't wait
+    // for the app's first frames). The app attaches the GPU compositor on its own wgpu device, as
+    // the desktop app does.
+    let open = match &args.project {
+        Some(p) => Some(("file.open", json!({"path": p}))),
+        None if args.flag("--demo") || (default_demo && !args.flag("--empty")) => Some(("file.openDemoProject", json!({}))),
+        None => None,
+    };
+    let ui = offscreen_ui::Offscreen::start(opts, move || {
+        let mut s = effectcraft_host::session();
+        if let Some((id, params)) = open {
+            s.execute_checked(id, params).map_err(|e| e.to_string())?;
+        }
+        Ok(s)
+    })?;
+    note!("effectcraft mcp: offscreen UI on {}", ui.adapter());
+    Ok(Backend::transport(ui))
+}
+
+#[cfg(not(feature = "ui"))]
+fn offscreen_backend(_args: &Args, _default_demo: bool) -> Result<Backend, Failure> {
+    Err(Failure::Error("--ui: this effectcraft-cli was built without the `ui` feature (cargo build -p effectcraft-cli --features ui)".into()))
 }
 
 /// A wired session; `--gpu` attaches the GPU compositor (renders then follow the project's
@@ -415,6 +482,56 @@ fn script_cmd(args: &Args, json_out: bool) -> Result<(), Failure> {
     Ok(())
 }
 
+/// `replay SCRIPT.jsonl`: run a repro script against a headless session (its start line picks
+/// the project) and report every step. Exits 1 when the replay fails.
+fn replay_cmd(args: &Args, json_out: bool) -> Result<(), Failure> {
+    use effectcraft_engine::replay;
+    let Some(file) = args.pos.first() else { return usage_err("replay needs a .jsonl script") };
+    if args.opt("--bridge").is_some() || args.project.is_some() || args.flag("--demo") || args.flag("--empty") {
+        return usage_err("replay runs headless from the script's start line ({\"start\": \"new\" | \"demo\" | {\"project\": path}})");
+    }
+    let path = std::path::Path::new(file);
+    let size = std::fs::metadata(path).map_err(|e| Failure::Error(format!("cannot read {file}: {e}")))?.len();
+    if size > replay::MAX_SCRIPT_BYTES as u64 {
+        return Err(Failure::Error(format!("{file} is larger than {} MB", replay::MAX_SCRIPT_BYTES >> 20)));
+    }
+    let script = std::fs::read_to_string(path).map_err(|e| Failure::Error(format!("cannot read {file}: {e}")))?;
+    let mut s = session(args)?;
+    let opts = replay::Options { keep_going: args.flag("--keep-going"), base_dir: path.parent().map(std::path::Path::to_path_buf) };
+    let report = replay::run(&mut s, &script, &opts);
+    if json_out {
+        emit(&serde_json::to_value(&report).unwrap_or_else(|e| json!({"error": e.to_string()})), true);
+    } else {
+        for st in &report.steps {
+            let what = st.command.as_deref().unwrap_or(st.kind);
+            match (&st.error, st.ok) {
+                (None, _) => say!("line {:>4}  ok    {what}", st.line),
+                (Some(e), true) => say!("line {:>4}  ok    {what} (tolerated error: {e})", st.line),
+                (Some(e), false) => say!("line {:>4}  FAIL  {what}: {e}", st.line),
+            }
+        }
+    }
+    let Some(first) = &report.first_failure else {
+        if !json_out {
+            say!("replay ok: {} steps", report.steps.len());
+        }
+        return Ok(());
+    };
+    let msg = format!(
+        "failed at line {} ({}){}: {}{}",
+        first.line,
+        first.command.as_deref().unwrap_or(first.kind),
+        if report.panicked { ", a command panicked" } else { "" },
+        first.error.as_deref().unwrap_or(""),
+        if report.skipped > 0 { format!(" ({} later steps not run)", report.skipped) } else { String::new() }
+    );
+    if json_out {
+        note!("effectcraft-cli replay: {msg}");
+        std::process::exit(1);
+    }
+    Err(Failure::Error(msg))
+}
+
 /// Print a result: compact JSON with `--json`, else pretty JSON.
 fn emit(v: &Value, json_out: bool) {
     if json_out {
@@ -428,6 +545,23 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
     if args.flag("--autosave") && cmd != "mcp" {
         return usage_err("--autosave is only supported by mcp");
     }
+    if cmd != "mcp" {
+        if let Some(o) = ["--ui", "--ui-size", "--ui-scale"].into_iter().find(|o| args.opts.iter().any(|(k, _)| k == o)) {
+            return usage_err(&format!("{o} is only supported by mcp"));
+        }
+    } else if args.flag("--ui") {
+        for (o, why) in [
+            ("--bridge", "--ui runs its own app offscreen; --bridge drives a running one"),
+            ("--autosave", "--autosave is for headless MCP; the offscreen app keeps the project in memory (save_project)"),
+            ("--gpu", "the offscreen UI renders on the GPU compositor of its own device when one is usable"),
+        ] {
+            if args.opts.iter().any(|(k, _)| k == o) {
+                return usage_err(why);
+            }
+        }
+    } else if args.opt("--ui-size").is_some() || args.opt("--ui-scale").is_some() {
+        return usage_err("--ui-size and --ui-scale need --ui");
+    }
     match cmd {
         "render" => render(args, json_out)?,
         "figma-bridge" => {
@@ -439,13 +573,14 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
             figma_bridge::serve(figma_bridge::Config { port, control, code: args.opt("--code").map(str::to_string) })?;
         }
         "bench" => bench_cmd(args)?,
+        "compare" => compare_cmd(args, json_out)?,
         "info" => {
             let mut b = backend(args, true)?;
             let p = tool(&mut b, "get_project", json!({}))?;
             let comp = tool(&mut b, "get_comp", json!({})).ok();
             let info = json!({
                 "version": env!("CARGO_PKG_VERSION"),
-                "mode": if b.is_bridge() { "bridge" } else { "headless" },
+                "mode": b.mode(),
                 "commands": effectcraft_engine::command_specs().len(),
                 "effects": effectcraft_engine::effects::registry().len(),
                 "project": p,
@@ -484,6 +619,7 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
         "commands" => list_commands_cmd(args, json_out)?,
         "exec" if args.flag("--list") => list_commands_cmd(args, json_out)?,
         "script" => script_cmd(args, json_out)?,
+        "replay" => replay_cmd(args, json_out)?,
         "exec" => {
             let Some(id) = args.pos.first().cloned() else { return usage_err("exec needs a command id") };
             let params = match (args.opt("--params"), args.pos.get(1).map(String::as_str)) {
@@ -618,6 +754,48 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
             }
         }
         other => return usage_err(&format!("unknown subcommand `{other}`")),
+    }
+    Ok(())
+}
+
+/// `compare A B`: `render.compare` on two image files in an empty headless session. Prints the
+/// metrics; exits 1 when the images don't pass (golden tests and AE fidelity checks).
+fn compare_cmd(args: &Args, json_out: bool) -> Result<(), Failure> {
+    let [a, b] = positional::<2>(args, "compare <a.png> <b.png> [--threshold L] [--min-psnr DB] [--max-side PX] [--diff D.png]")?;
+    let mut p = json!({"a": {"path": a}, "b": {"path": b}});
+    for (opt, key) in [("--threshold", "threshold"), ("--min-psnr", "min_psnr"), ("--amplify", "amplify")] {
+        if let Some(v) = args.num(opt)? {
+            p[key] = json!(v);
+        }
+    }
+    if let Some(m) = args.num("--max-side")? {
+        p["max_side"] = json!(m.max(0.0) as u64);
+    }
+    if let Some(d) = args.opt("--diff") {
+        p["diff_path"] = json!(d);
+    }
+    let mut bk = Backend::headless(session(args)?);
+    let r = bk.exec("render.compare", p)?;
+    let pass = r["pass"].as_bool().unwrap_or(false);
+    if json_out {
+        emit(&r, true);
+    } else {
+        say!(
+            "{} {}x{}  max {} mean {} psnr {} dB ssim {} changed {}% ({} px){}",
+            if pass { "PASS" } else { "FAIL" },
+            r["width"],
+            r["height"],
+            r["max_abs"],
+            r["mean_abs"],
+            r["psnr_db"].as_str().map(str::to_string).unwrap_or_else(|| r["psnr_db"].to_string()),
+            r["ssim"],
+            r["changed_pct"],
+            r["changed_pixels"],
+            r["diff_path"].as_str().map(|d| format!("  diff -> {d}")).unwrap_or_default()
+        );
+    }
+    if !pass {
+        std::process::exit(1);
     }
     Ok(())
 }
