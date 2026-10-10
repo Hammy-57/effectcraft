@@ -7,6 +7,7 @@ import argparse
 import base64
 import hashlib
 import json
+import re
 import math
 import struct
 import sys
@@ -38,6 +39,14 @@ def is_file(path):
         return path.is_file()
     except OSError:
         return False
+
+
+def windows_bytes_to_text(text):
+    """Bytes that weren't UTF-8 (kept as lone surrogates, e.g. a Windows-1252 ’ saved by AE on
+    Windows) become the Windows-1252 character they stand for, so the IR is valid UTF-8."""
+    def char(m):
+        return bytes([ord(m.group()) - 0xDC00]).decode("cp1252", errors="replace")
+    return re.sub("[\udc80-\udcff]", char, text)
 
 
 def media_name(name):
@@ -783,7 +792,7 @@ def main():
     destination.add_argument("--stdout", action="store_true")
     args = parser.parse_args()
     data = Exporter(font_search_root=args.font_search_root).export(args.source)
-    encoded = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    encoded = windows_bytes_to_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")))
     if args.stdout:
         sys.stdout.write(encoded + "\n")
     else:
