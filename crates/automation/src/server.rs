@@ -1,5 +1,6 @@
 //! MCP server: JSON-RPC 2.0, one message per line (the MCP stdio transport). Implements
-//! tools and JSON resources. The stdio loop handles progress and cancellation for long renders.
+//! tools, resources (with templates and subscriptions), prompts and logging. The stdio loop
+//! handles progress and cancellation for long renders and writes queued notifications.
 
 use std::io::{BufRead, Write};
 use std::path::Path;
@@ -16,7 +17,7 @@ use crate::{Backend, Error, base64};
 /// Protocol revisions we speak, newest first. We answer with the client's if we know it.
 pub const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 
-const INSTRUCTIONS: &str = "EffectCraft is an After Effects-class motion graphics compositor. Everything is an engine command: command_list discovers ids and params, command_run {id, params} runs them (undoable; command_batch runs several in order). Typical flow: command_run comp.new -> command_run layer.newText / layer.newSolid (returns the layer id) -> set_property / add_keyframe -> command_run effect.apply -> render_preview to look at the result. Inspect with doc_inspect, get_project, get_comp and get_layer (every property node carries its `path`, e.g. `transform/position`, `effects/#1/blurriness`). Times are seconds. In bridge mode (app started with `--control <port>`) screenshot and the ui_* tools show and operate the live window.";
+const INSTRUCTIONS: &str = "EffectCraft is an After Effects-class motion graphics compositor. Everything is an engine command: command_list discovers ids and params (describe_command shows one in full), command_run {id, params} runs them (undoable; command_batch runs several in order, batch as one undo step). Typical flow: command_run comp.new -> command_run layer.newText / layer.newSolid (returns the layer id) -> set_property / add_keyframe / add_effect -> render_preview to look at the result. Inspect with doc_inspect, get_comp and get_layer (every property node carries its `path`, e.g. `transform/position`, `effects/#1/blurriness`). Times are seconds: keyframe times (add_keyframe, set_property with `time`) are layer time, render_preview and get_property use comp time. Resources and resource templates (effectcraft://document, comp/{comp}, layer/{comp}/{layer}, frame/{comp}/{time}, command/{id}) and workflow prompts are available too. In bridge mode (app started with `--control <port>`) screenshot and the ui_* tools show and operate the live window.";
 
 // JSON-RPC error codes.
 const PARSE_ERROR: i64 = -32700;
@@ -35,12 +36,21 @@ pub struct McpServer {
     /// The protocol revision `initialize` negotiated (`None` before it).
     version: Option<&'static str>,
     notify: Notifier,
+    /// List the hidden aliases too (`mcp --all-tools`).
+    all_tools: bool,
 }
 
 impl McpServer {
     pub fn new(mut backend: Backend) -> Self {
         let notify = Notifier::new(&mut backend);
-        Self { backend, autosave: None, version: None, notify }
+        Self { backend, autosave: None, version: None, notify, all_tools: false }
+    }
+
+    /// Also list the older tool names (`list_commands`, `execute_command`, `get_project`,
+    /// `render_frame`) in `tools/list`. They are callable either way.
+    pub fn with_all_tools(mut self, all: bool) -> Self {
+        self.all_tools = all;
+        self
     }
 
     /// Server-initiated notifications queued since the last call (resource updates, log
@@ -220,8 +230,14 @@ impl McpServer {
             "tools/list" => {
                 let structured = self.structured(params);
                 let tools: Vec<Value> = tools::available(self.backend.is_bridge())
+                    .filter(|t| self.all_tools || tools::alias_of(t.name).is_none())
                     .map(|t| {
                         let mut d = t.descriptor();
+                        if let Some(canonical) = tools::alias_of(t.name)
+                            && let Some(o) = d.as_object_mut()
+                        {
+                            o.insert("description".into(), json!(format!("Alias of {canonical} (kept for older workflows). {}", t.description)));
+                        }
                         if let Some(schema) = tools::output_schema(t.name).filter(|_| structured)
                             && let Some(o) = d.as_object_mut()
                         {

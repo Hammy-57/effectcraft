@@ -11,14 +11,24 @@ The server provides the same core conventions as FilmCraft #28:
 | `command_run` | `id`, `params?` | Engine command result |
 | `command_batch` | `steps: [{id, params?}]`, `stop_on_error?` | `completed`, `failed`, per-step `results` |
 | `doc_inspect` | none | Project overview and active composition |
-| `render_preview` | `comp?`, `time?`, `max_side?`, `transparent?` | PNG and frame information |
+| `render_preview` | `comp?`, `time?`, `max_side?`, `path?`, `inline?`, `transparent?` | PNG and frame information |
 
 `command_batch` stops at the first error by default; false continues. Each edit has its
 own undo step. The existing `batch` tool retains its atomic undo grouping and result references.
-Existing tools, including `list_commands`, `execute_command`, and `batch`, remain listed
-because existing workflows use them; there are no hidden aliases. See [agents.md](agents.md)
-for the full catalog. Each tool has a title and read-only, destructive, idempotent and
-open-world hints. Tools with an optional output path are conservatively annotated as file writers.
+See [agents.md](agents.md) for the full catalog. Each tool has a title and read-only, destructive,
+idempotent and open-world hints. Tools with an optional output path are conservatively annotated
+as file writers.
+
+Four older names duplicate a core tool. They are left out of `tools/list` but stay callable
+with their own arguments, so existing workflows keep working; `effectcraft-cli mcp --all-tools`
+lists them too (described as aliases):
+
+| Hidden alias | Canonical tool |
+| --- | --- |
+| `list_commands` | `command_list` (same arguments) |
+| `execute_command {command \| id, params?}` | `command_run {id, params?}` |
+| `get_project` | `doc_inspect` (its `project` is the same summary) |
+| `render_frame` | `render_preview` (same arguments, including `path` and `inline`) |
 
 Unknown top-level tool argument keys return JSON-RPC `-32602` naming the key and accepted
 arguments. EffectCraft already rejects unknown engine command parameters; that behaviour is

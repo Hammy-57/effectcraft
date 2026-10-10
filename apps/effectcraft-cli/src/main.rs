@@ -22,7 +22,7 @@
 //! effectcraft-cli bench --ops [--small] [--layers N] [--comps N] [--footage N]   everyday-operation timings
 //!     on a large generated project (open, save, auto-save, undo/redo, timeline, Project panel)
 //! effectcraft-cli script FILE.jsx [F.ecproj] | --eval CODE    run an After Effects-style script
-//! effectcraft-cli mcp [--autosave | --bridge PORT]            MCP server on stdio
+//! effectcraft-cli mcp [--autosave | --bridge PORT] [--all-tools] MCP server on stdio
 //! effectcraft-cli figma-bridge [--port 7789] [--control 9877] local endpoint for the Figma plug-in
 //!
 //! Project:  --project F.ecproj (or a positional *.ecproj) | --demo | --empty   (default: demo; mcp: empty)
@@ -114,7 +114,9 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
   script FILE.jsx [F.ecproj] | --eval CODE run JavaScript with the After Effects-style object model
                                            (app.project, comps, layers, properties…); prints writeLn
                                            output and the result; errors exit 1 with file:line:col
-  mcp [--autosave | --bridge PORT]         MCP server (JSON-RPC over stdio); --autosave preserves unsaved headless work
+  mcp [--autosave | --bridge PORT] [--all-tools]
+                                           MCP server (JSON-RPC over stdio); --autosave preserves unsaved
+                                           headless work; --all-tools also lists the older tool aliases
   figma-bridge [--port 7789] [--control 9877] [--code CODE]
                                            local endpoint for the EffectCraft Figma plug-in: imports what it
                                            sends into the running app (file.importFigma); prints the pairing code
@@ -185,6 +187,7 @@ const FLAGS: &[&str] = &[
     "--small",
     "--adv3d",
     "--autosave",
+    "--all-tools",
 ];
 
 struct Args {
@@ -428,6 +431,9 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
     if args.flag("--autosave") && cmd != "mcp" {
         return usage_err("--autosave is only supported by mcp");
     }
+    if args.flag("--all-tools") && cmd != "mcp" {
+        return usage_err("--all-tools is only supported by mcp");
+    }
     match cmd {
         "render" => render(args, json_out)?,
         "figma-bridge" => {
@@ -603,7 +609,7 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
                 return usage_err("--autosave is for headless MCP; the bridged app owns its auto-saves");
             }
             let b = backend(args, false)?;
-            let server = McpServer::new(b);
+            let server = McpServer::new(b).with_all_tools(args.flag("--all-tools"));
             let mut server = if args.flag("--autosave") {
                 let root =
                     effectcraft_host::config_dir().ok_or_else(|| Failure::Error("--autosave: no config directory; set EFFECTCRAFT_CONFIG_DIR".into()))?;
