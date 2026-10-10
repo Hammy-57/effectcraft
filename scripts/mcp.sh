@@ -6,7 +6,7 @@
 # runs in the background; reconnect the MCP server (Claude Code: /mcp) to pick it up. Only the very
 # first start has to compile in the foreground.
 #
-# Usage: scripts/mcp.sh [effectcraft-cli mcp arguments], e.g. `scripts/mcp.sh --demo`.
+# Usage: scripts/mcp.sh [effectcraft-cli mcp arguments], e.g. `scripts/mcp.sh --demo` or `scripts/mcp.sh --ui --demo`.
 set -u
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -27,7 +27,7 @@ build() {
 if [ ! -x "$bin" ]; then
     echo "effectcraft mcp: first start, compiling effectcraft-cli (if the client times out, wait for this and reconnect)" >&2
     build >"$log" 2>&1 || { cat "$log" >&2; exit 1; }
-elif [ -n "$(find "$root/crates" "$root/Cargo.toml" "$root/Cargo.lock" -newer "$bin" \( -name '*.rs' -o -name '*.toml' -o -name '*.lock' -o -name '*.json' -o -name '*.wgsl' \) -print 2>/dev/null | head -n 1)" ]; then
+elif [ -n "$(find "$root/crates" "$root/apps/effectcraft-cli" "$root/Cargo.toml" "$root/Cargo.lock" -newer "$bin" \( -name '*.rs' -o -name '*.toml' -o -name '*.lock' -o -name '*.json' -o -name '*.wgsl' \) -print 2>/dev/null | head -n 1)" ]; then
     # Stale: serve the current binary now, rebuild once in the background (mkdir is an atomic lock).
     if mkdir "$lock" 2>/dev/null; then
         echo "effectcraft mcp: sources changed, rebuilding in the background; reconnect to use the new build" >&2
