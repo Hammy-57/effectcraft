@@ -26,10 +26,11 @@ use crate::runtime::{Begin, Out};
 
 /// Results remembered per thread.
 const MAX_ENTRIES: usize = 8192;
-/// Recorded answers per thread (all entries together).
-const MAX_ANSWERS: usize = 1 << 20;
-/// Most answers worth recording for one result.
+/// Approximate bytes of recorded answers per thread (all entries together).
+const MAX_BYTES: usize = 32 << 20;
+/// Most answers, and approximate bytes of answers, worth recording for one result.
 const MAX_DEPS: usize = 4096;
+const MAX_ENTRY_BYTES: usize = 1 << 20;
 
 /// The inputs of one evaluation that hash cheaply (the script text is hashed; the entry keeps
 /// the full text and the rest of [`Begin`] to compare).
@@ -73,12 +74,22 @@ struct Entry {
     reqs: Vec<Req>,
     resps: Vec<Resp>,
     out: Out,
+    bytes: usize,
 }
 
 #[derive(Default)]
 struct Memo {
     entries: HashMap<Key, Entry>,
-    answers: usize,
+    bytes: usize,
+}
+
+/// Approximate heap size of an answer.
+fn weight(r: &Resp) -> usize {
+    16 + match r {
+        Resp::Str(s) => s.len(),
+        Resp::List(items) => items.iter().map(weight).fold(0, usize::saturating_add),
+        _ => 0,
+    }
 }
 
 thread_local! {
@@ -148,16 +159,20 @@ pub fn store(key: Key, text: &str, b: &Begin, reqs: Vec<Req>, resps: Vec<Resp>, 
     if reqs.len() != resps.len() || reqs.len() > MAX_DEPS || !cacheable(text) {
         return;
     }
+    let bytes = resps.iter().map(weight).fold(weight(b.value), usize::saturating_add);
+    if bytes > MAX_ENTRY_BYTES {
+        return;
+    }
     MEMO.with(|m| {
         let mut m = m.borrow_mut();
         if let Some(old) = m.entries.remove(&key) {
-            m.answers = m.answers.saturating_sub(old.reqs.len());
+            m.bytes = m.bytes.saturating_sub(old.bytes);
         }
-        if m.entries.len() >= MAX_ENTRIES || m.answers.saturating_add(reqs.len()) > MAX_ANSWERS {
+        if m.entries.len() >= MAX_ENTRIES || m.bytes.saturating_add(bytes) > MAX_BYTES {
             m.entries.clear();
-            m.answers = 0;
+            m.bytes = 0;
         }
-        m.answers = m.answers.saturating_add(reqs.len());
-        m.entries.insert(key, Entry { text: text.into(), path: b.path.into(), value: b.value.clone(), reqs, resps, out });
+        m.bytes = m.bytes.saturating_add(bytes);
+        m.entries.insert(key, Entry { text: text.into(), path: b.path.into(), value: b.value.clone(), reqs, resps, out, bytes });
     });
 }

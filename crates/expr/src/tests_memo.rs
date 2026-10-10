@@ -70,16 +70,19 @@ pub(crate) fn frame(p: &Project, cid: ItemId, t: f64) -> Vec<f64> {
 #[ignore = "timing readout"]
 fn rig_timing() {
     let (p, cid) = rig(100);
-    let _ = frame(&p, cid, 0.0);
-    let frames = 30;
-    let runs = script_runs();
-    let start = Instant::now();
-    for f in 1..=frames {
-        let _ = frame(&p, cid, f as f64 / 30.0);
+    for off in [true, false] {
+        memo::set_off(off);
+        let _ = frame(&p, cid, 0.0);
+        let frames = 150;
+        let runs = script_runs();
+        let start = Instant::now();
+        for f in 1..=frames {
+            let _ = frame(&p, cid, f as f64 / 30.0);
+        }
+        let ms = start.elapsed().as_secs_f64() * 1000.0 / frames as f64;
+        let runs = (script_runs() - runs) as f64 / frames as f64;
+        println!("rig of 100 layers, memo {}: {ms:.2} ms/frame, {runs:.0} script runs/frame", if off { "off" } else { "on" });
     }
-    let ms = start.elapsed().as_secs_f64() * 1000.0 / frames as f64;
-    let runs = (script_runs() - runs) as f64 / frames as f64;
-    println!("rig of 100 layers: {ms:.2} ms/frame, {runs:.0} script runs/frame");
 }
 
 /// `f` on a thread with the memo off (the oracle: every evaluation runs its script), leaving
