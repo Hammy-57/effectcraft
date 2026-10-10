@@ -23,7 +23,7 @@ fn crop(s: &mut Session, cid: effectcraft_project::ItemId, r: [f64; 4], label: &
         let c = proj.comp_mut(cid).ok_or(EngineError::NoComp)?;
         c.width = w;
         c.height = h;
-        for l in c.layers.iter_mut().filter(|l| l.parent.is_none()) {
+        for l in c.layers.iter_mut_where(|l| l.parent.is_none()) {
             let Some(pos) = l.transform_mut().and_then(|tr| tr.get_mut("position")) else { continue };
             let mv = |v: &KV| {
                 let a = v.as_vec3();

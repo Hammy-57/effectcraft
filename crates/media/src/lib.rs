@@ -19,6 +19,7 @@ mod avif;
 mod convert;
 pub mod exr_channels;
 mod layered;
+mod open;
 pub use layered::vector_doc;
 mod pool;
 mod probe;

@@ -21,7 +21,7 @@ mod session_settings;
 
 use std::sync::Arc;
 
-use effectcraft_project::{Comp, ItemId, Layer, LayerId, Project, Uid};
+use effectcraft_project::{Comp, ItemId, LayerId, Project, Uid};
 use effectcraft_raster::Image;
 use effectcraft_render::{ExprHost, FootageSource, LayerCache, NoFootage, RenderOpts, Renderer};
 use effectcraft_time::Tick;
@@ -209,9 +209,10 @@ pub struct EditorState {
     pub selected_props: Vec<(LayerId, Uid)>,
     pub selected_keys: Vec<KeyRef>,
     pub project_selection: Vec<ItemId>,
-    /// Layer clipboard (serialized layers) and keyframe clipboard.
+    /// Layer clipboard (serialized layers) and keyframe clipboard. Shared layers: cloning the
+    /// state for an edit doesn't copy them.
     #[serde(skip)]
-    pub clipboard: Vec<Layer>,
+    pub clipboard: effectcraft_project::Layers,
     /// Copied keyframes (times relative to the earliest copied key).
     #[serde(skip)]
     pub key_clipboard: Vec<KeyClip>,
@@ -403,6 +404,9 @@ pub struct Session {
     pub warp_job: Option<warp::WarpJob>,
     /// Warp Stabilizers waiting for (re-)analysis: (comp, layer, effect uid).
     pub warp_pending: Vec<(ItemId, LayerId, Uid)>,
+    /// The last state whose analyses (Warp Stabilizer, 3D Camera Tracker, Roto Brush) were all
+    /// checked after an edit: the next edit from it checks only the layers it changed.
+    pub analyses_checked: std::sync::Weak<Project>,
     /// The running (or finished, not yet polled) 3D Camera Tracker analysis.
     pub camera_job: Option<camera_track::CameraJob>,
     /// 3D Camera Trackers waiting for (re-)analysis: (comp, layer, effect uid).
@@ -574,6 +578,7 @@ impl Default for Session {
             mask_job: None,
             warp_job: None,
             warp_pending: vec![],
+            analyses_checked: std::sync::Weak::new(),
             camera_job: None,
             camera_pending: vec![],
             roto_job: None,
@@ -716,29 +721,34 @@ impl Session {
         if let Some(e) = self.claim_conflict(&before, &p) {
             return Err(e);
         }
-        // Warp Stabilizer analyses made from other frames are cleared (and queued again).
-        for w in warp::invalidate(&before, &mut p) {
+        // Warp Stabilizer analyses made from other frames are cleared (and queued again). From a
+        // checked state only the layers the edit changed are looked at (the rest are shared).
+        let full = !std::ptr::eq(self.analyses_checked.as_ptr(), Arc::as_ptr(&before));
+        for w in warp::invalidate(&before, &mut p, full) {
             if !self.warp_pending.contains(&w) {
                 self.warp_pending.push(w);
             }
         }
         // So are 3D Camera Tracker tracks (and solves made with other settings).
-        for w in camera_track::invalidate(&before, &mut p) {
+        for w in camera_track::invalidate(&before, &mut p, full) {
             if !self.camera_pending.contains(&w) {
                 self.camera_pending.push(w);
             }
         }
         // Roto Brush Input Keys follow the frames; edited instances propagate again.
-        for r in roto::sync(&before, &mut p) {
+        for r in roto::sync(&before, &mut p, full) {
             if !self.roto_pending.contains(&r) {
                 self.roto_pending.push(r);
             }
         }
         // Nothing changed (a value set to what it already was): no undo step, not modified.
         if p.same_content(&before) {
+            self.analyses_checked = Arc::downgrade(&before);
             self.state = st;
             return Ok(r);
         }
+        // Footage removed: its files are closed (below).
+        let removed = p.items.len() < before.items.len();
         // A continuous gesture folds into one step, unless another client made the last step.
         let same = merge.is_some() && merge.map(str::to_string) == self.history.merge_key && self.history.author(&before) == self.client.as_deref();
         if !same {
@@ -750,6 +760,10 @@ impl Session {
         }
         self.history.merge_key = merge.map(str::to_string);
         self.project = Arc::new(p);
+        if removed {
+            self.release_unused_footage();
+        }
+        self.analyses_checked = Arc::downgrade(&self.project);
         self.history.set_author(&self.project, self.client.clone());
         self.state = st;
         self.bump();
@@ -1028,6 +1042,21 @@ impl Session {
         Ok((img.width, img.height, img.to_rgba8()))
     }
 
+    /// Close the files of footage the project no longer uses (decoders, parsed models, cached
+    /// frames): footage removed from the project, or the previous project's.
+    fn release_unused_footage(&self) {
+        let mut used = std::collections::HashSet::new();
+        for it in self.project.items.values() {
+            if let effectcraft_project::ItemKind::Footage(f) = &it.kind {
+                used.insert(f.path.as_str());
+            }
+            if let Some(px) = it.proxy.as_deref() {
+                used.insert(px.footage.path.as_str());
+            }
+        }
+        self.footage.retain_files(&|p| used.contains(p));
+    }
+
     /// Replace the whole project (open/new), resetting history and state.
     pub fn replace_project(&mut self, p: Project, path: Option<String>) {
         self.replace_project_with(p, path, None);
@@ -1060,6 +1089,7 @@ impl Session {
         p.fix_next_id();
         upgrade_effects(&mut p);
         self.project = Arc::new(p);
+        self.release_unused_footage();
         self.history = History::default();
         self.id_floor = 0;
         self.state = EditorState { snapping: true, view_layout: 1, ..Default::default() };

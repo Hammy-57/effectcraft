@@ -18,10 +18,10 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(test)]
 use std::sync::mpsc::channel;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -107,24 +107,31 @@ fn serve(stream: TcpStream, shared: &Shared) {
     let Ok(read) = stream.try_clone() else { return };
     let Ok(closer) = stream.try_clone() else { return };
     let out = SharedOut(Arc::new(Mutex::new(stream)));
-    let closed = Arc::new(AtomicBool::new(false));
-    let mut subscribed = false;
+    // The event stream's sender, kept to wake its writer thread when the connection closes.
+    let mut subscribed: Option<Sender<Value>> = None;
     let mut used = BTreeSet::new();
     let events_out = out.clone();
-    let events_closed = Arc::clone(&closed);
     serve_lines(read, out, |method, params, request_id| {
         note_client(shared, &mut used, &method, &params);
         if method == "events.subscribe" {
-            let (rx, revision) = shared.events.subscribe();
-            if !subscribed {
-                subscribed = true;
-                forward_events(rx, events_out.clone(), Arc::clone(&events_closed));
-            }
+            let revision = match &subscribed {
+                // Already streaming: one stream per connection.
+                Some(_) => shared.events.subscribe().1,
+                None => {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    forward_events(rx, events_out.clone());
+                    let revision = shared.events.attach(tx.clone());
+                    subscribed = Some(tx);
+                    revision
+                }
+            };
             return Some(json!({"ok": true, "result": {"subscribed": true, "revision": revision, "events": EVENTS}}));
         }
         dispatch(shared, method, params, request_id.as_deref())
     });
-    closed.store(true, Ordering::SeqCst);
+    if let Some(tx) = subscribed {
+        let _ = tx.send(Value::Null);
+    }
     let _ = closer.shutdown(std::net::Shutdown::Both);
     release_clients(shared, used);
 }
@@ -178,18 +185,13 @@ fn release_clients(shared: &Shared, used: BTreeSet<String>) {
     }
 }
 
-/// Write change events to a subscribed connection until it closes.
-fn forward_events<W: Write + Send + 'static>(rx: Receiver<Value>, mut out: SharedOut<W>, closed: Arc<AtomicBool>) {
+/// Write change events to a subscribed connection until it closes (`null` on the channel: the
+/// connection's reader wakes it then, so it sleeps between events instead of polling).
+fn forward_events<W: Write + Send + 'static>(rx: Receiver<Value>, mut out: SharedOut<W>) {
     std::thread::spawn(move || {
-        while !closed.load(Ordering::SeqCst) {
-            match rx.recv_timeout(Duration::from_millis(500)) {
-                Ok(event) => {
-                    if write_line(&mut out, &event).is_err() {
-                        return;
-                    }
-                }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => return,
+        while let Ok(event) = rx.recv() {
+            if event.is_null() || write_line(&mut out, &event).is_err() {
+                return;
             }
         }
     });

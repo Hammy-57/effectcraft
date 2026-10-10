@@ -5,7 +5,7 @@ use effectcraft_project::{Comp, Expression, ItemKind, Layer, LayerId, LayerSourc
 use effectcraft_time::Tick;
 use serde_json::{Value, json};
 
-use super::{CommandSpec, has_comp, has_layers, layers_p, match_path_of, selected_leaf_props, str_p};
+use super::{CommandSpec, b_p, has_comp, has_layers, layers_p, match_path_of, selected_leaf_props, str_p};
 use crate::{EngineError, LinkClip, Result, Session, cmd};
 
 fn can_undo(s: &Session) -> std::result::Result<(), String> {
@@ -46,21 +46,28 @@ fn has_selected_footage(s: &Session) -> std::result::Result<(), String> {
     if original_path(s).is_some() { Ok(()) } else { Err("select a footage item or layer".into()) }
 }
 
-fn undo(s: &mut Session, _: &Value) -> Result<Value> {
+fn undo(s: &mut Session, p: &Value) -> Result<Value> {
     let label = s.history.undo.last().map(|u| u.0.clone());
-    // A client (agent, script) only undoes its own last step, never someone else's.
-    if let Some(client) = s.client.as_deref()
-        && label.is_some()
-    {
-        let author = s.history.author(&s.project);
-        if author != Some(client) {
+    let me = s.client.clone();
+    let author = s.history.author(&s.project).map(str::to_string);
+    // The caller made the last step (or the user asks for whoever's last step): a plain undo.
+    let any = me.is_none() && b_p(p, "any").unwrap_or(false);
+    if label.is_none() || any || author == me {
+        s.undo();
+        return Ok(json!({"undone": label}));
+    }
+    // Someone else made the last step: undo only the caller's own latest step
+    // (crate::selective_undo), never their work.
+    match crate::selective_undo::undo_own(s, me.as_deref())? {
+        Some(own) => Ok(json!({"undone": own, "selective": true})),
+        None => {
+            let mine = me.as_deref().map_or_else(|| "you".to_string(), |m| format!("`{m}`"));
             let who = author.map_or_else(|| "the user".to_string(), |a| format!("client `{a}`"));
             let step = label.unwrap_or_default();
-            return Err(EngineError::Other(format!("the last change (“{step}”) was made by {who}, not `{client}`; undo it there, or undo without `client`")));
+            let way = if me.is_some() { "undo it there, or undo without `client`" } else { "edit.undo {any: true} undoes it anyway" };
+            Err(EngineError::Other(format!("nothing of {mine} to undo: the last change (“{step}”) was made by {who}, not {mine}; {way}")))
         }
     }
-    s.undo();
-    Ok(json!({"undone": label}))
 }
 fn redo(s: &mut Session, _: &Value) -> Result<Value> {
     let label = s.history.redo.last().map(|u| u.0.clone());
@@ -95,7 +102,7 @@ fn deselect_all(s: &mut Session, _: &Value) -> Result<Value> {
 fn relink_copies(comp: &mut Comp, map: &[(LayerId, LayerId)]) {
     let present: Vec<LayerId> = comp.layers.iter().map(|l| l.id).collect();
     let link = |id: LayerId| map.iter().find(|(o, _)| *o == id).map(|(_, c)| *c).or(present.contains(&id).then_some(id));
-    for l in comp.layers.iter_mut().filter(|l| map.iter().any(|(_, c)| *c == l.id)) {
+    for l in comp.layers.iter_mut_where(|l| map.iter().any(|(_, c)| *c == l.id)) {
         l.parent = l.parent.and_then(link);
         l.track_matte = l.track_matte.and_then(|m| link(m.layer).map(|layer| TrackMatte { layer, ..m }));
     }
@@ -196,7 +203,8 @@ fn delete(s: &mut Session, p: &Value) -> Result<Value> {
     s.edit("Clear", None, |proj, st| {
         let comp = proj.comp_mut(cid).ok_or(crate::EngineError::NoComp)?;
         comp.layers.retain(|l| !ids.contains(&l.id));
-        for l in &mut comp.layers {
+        let refers = |l: &Layer| l.parent.is_some_and(|p| ids.contains(&p)) || l.track_matte.is_some_and(|m| ids.contains(&m.layer));
+        for l in comp.layers.iter_mut_where(refers) {
             if l.parent.is_some_and(|p| ids.contains(&p)) {
                 l.parent = None;
                 if let Some(f) = fixes.iter().find(|f| f.layer == l.id) {
@@ -254,7 +262,7 @@ fn copy(s: &mut Session, p: &Value) -> Result<Value> {
     let comp = s.project.comp(cid).ok_or(crate::EngineError::NoComp)?;
     let layers: Vec<Layer> = comp.layers.iter().filter(|l| ids.contains(&l.id)).cloned().collect();
     clear_clipboards(s);
-    s.state.clipboard = layers;
+    s.state.clipboard = layers.into();
     Ok(json!(s.state.clipboard.len()))
 }
 
@@ -312,7 +320,7 @@ fn copy_links(s: &mut Session, p: &Value, relative: bool) -> Result<Value> {
         }
         let n = layers.len();
         clear_clipboards(s);
-        s.state.clipboard = layers;
+        s.state.clipboard = layers.into();
         return Ok(json!({"layers": n}));
     }
     let comp = s.active_comp().ok_or(EngineError::NoComp)?;
@@ -483,7 +491,7 @@ fn label(s: &mut Session, p: &Value) -> Result<Value> {
             }
         }
         if let Some(comp) = proj.comp_mut(cid) {
-            for l in comp.layers.iter_mut().filter(|l| ids.contains(&l.id)) {
+            for l in comp.layers.iter_mut_where(|l| ids.contains(&l.id)) {
                 l.label = lab;
             }
         }
@@ -691,7 +699,15 @@ fn purge(s: &mut Session, _: &Value) -> Result<Value> {
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
-        cmd!("edit.undo", "Undo", ["Edit"], Some("Cmd+Z"), "{client? (only undo when this client made the last step)}", can_undo, undo),
+        cmd!(
+            "edit.undo",
+            "Undo",
+            ["Edit"],
+            Some("Cmd+Z"),
+            "{client?, any?} — undoes the caller's own latest step (the user's, or this client's); when someone else made the last step, only what the caller's step changed is reverted, refused if they changed it since; any: true (the user) undoes the last step whoever made it",
+            can_undo,
+            undo
+        ),
         cmd!("edit.redo", "Redo", ["Edit"], Some("Cmd+Shift+Z"), "{}", can_redo, redo),
         cmd!("edit.cut", "Cut", ["Edit"], Some("Cmd+X"), "{layers?} (keyframes, effects or shape items when they are selected)", layers_or_keys, cut),
         cmd!("edit.copy", "Copy", ["Edit"], Some("Cmd+C"), "{layers?} (keyframes, effects or shape items when they are selected)", layers_or_keys, copy),

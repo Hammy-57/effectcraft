@@ -12,9 +12,10 @@
 
 use crate::i18n::tr;
 use effectcraft_engine::media_browser as mb;
-use effectcraft_engine::project::ItemId;
 use egui::{Align2, Color32, Rect, Sense, Stroke, pos2, vec2};
 use serde_json::{Value, json};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use super::DragPayload;
 use super::panel_kit as kit;
@@ -25,40 +26,93 @@ use crate::{EffectcraftApp, widgets};
 
 type Thumb = Option<(egui::TextureHandle, [u32; 2])>;
 
-/// Thumbnail of a file (cached per path; `None` while not decoded or not decodable).
+/// A thumbnail's pixels (size, unpremultiplied RGBA), `None` when the file has no picture.
+type ThumbPixels = Option<([u32; 2], Vec<u8>)>;
+
+/// A thumbnail being made on a worker thread (set when done).
+type ThumbJob = Arc<OnceLock<ThumbPixels>>;
+
+/// Thumbnails being made right now: at most [`MAX_THUMB_JOBS`] at once.
+static THUMB_JOBS: AtomicUsize = AtomicUsize::new(0);
+const MAX_THUMB_JOBS: usize = 2;
+
+/// Counts a running thumbnail job (also when it panics).
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+struct ThumbSlot;
+
+impl Drop for ThumbSlot {
+    fn drop(&mut self) {
+        THUMB_JOBS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Probe `path` and make its thumbnail. The media layer decodes the first frame without caching
+/// it or keeping the file open: browsing a folder of movies doesn't fill memory.
+fn make_thumbnail(imp: &dyn effectcraft_engine::Importer, footage: &dyn effectcraft_engine::render::FootageSource, path: &str) -> ThumbPixels {
+    let f = imp.probe(path).ok()?;
+    if !f.has_video {
+        return None;
+    }
+    let img = footage.thumbnail(&f, 128)?;
+    Some(([img.width, img.height], img.to_rgba8()))
+}
+
+/// File thumbnails kept (128 px, ~64 KB each); the least recently shown go first.
+const MAX_THUMBS: usize = 256;
+
+/// Thumbnail of a file (cached per path; `None` while not decoded or not decodable). Files are
+/// probed and decoded on a worker thread, never on the UI thread.
 fn thumbnail(app: &EffectcraftApp, ctx: &egui::Context, path: &str, budget: &mut u32) -> Thumb {
     let id = egui::Id::new(("mb-thumb", path));
     if let Some(t) = ctx.data(|d| d.get_temp::<Thumb>(id)) {
+        crate::thumb_lru::touch::<Thumb>(ctx, "mb-thumb", id, MAX_THUMBS);
         return t;
     }
-    if *budget == 0 {
+    let jid = egui::Id::new(("mb-thumb-job", path));
+    if let Some(job) = ctx.data(|d| d.get_temp::<ThumbJob>(jid)) {
+        let done = job.get()?;
+        let thumb = done.as_ref().map(|([w, h], px)| {
+            let img = egui::ColorImage::from_rgba_unmultiplied([*w as usize, *h as usize], px);
+            (ctx.load_texture(format!("mb-{path}"), img, egui::TextureOptions::LINEAR), [*w, *h])
+        });
+        ctx.data_mut(|d| {
+            d.insert_temp(id, thumb.clone());
+            d.remove::<ThumbJob>(jid);
+        });
+        crate::thumb_lru::touch::<Thumb>(ctx, "mb-thumb", id, MAX_THUMBS);
+        return thumb;
+    }
+    if *budget == 0 || THUMB_JOBS.load(Ordering::Relaxed) >= MAX_THUMB_JOBS {
         return None;
     }
+    let Some(imp) = app.session.importer.clone() else {
+        ctx.data_mut(|d| d.insert_temp::<Thumb>(id, None));
+        return None;
+    };
     *budget -= 1;
-    let thumb = (|| {
-        let imp = app.session.importer.clone()?;
-        let f = imp.probe(path).ok()?;
-        if !f.has_video {
-            return None;
+    let footage = app.session.footage.clone();
+    let job: ThumbJob = Arc::default();
+    ctx.data_mut(|d| d.insert_temp(jid, job.clone()));
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = job.set(make_thumbnail(&*imp, &*footage, path));
+        ctx.request_repaint();
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        THUMB_JOBS.fetch_add(1, Ordering::Relaxed);
+        let slot = ThumbSlot;
+        let (ctx2, path2) = (ctx.clone(), path.to_string());
+        let spawned = std::thread::Builder::new().name("ec-thumbnail".into()).spawn(move || {
+            let _slot = slot;
+            let _ = job.set(make_thumbnail(&*imp, &*footage, &path2));
+            ctx2.request_repaint();
+        });
+        if spawned.is_err() {
+            ctx.data_mut(|d| d.remove::<ThumbJob>(jid));
         }
-        // A synthetic item id keyed by the path (the frame cache keys on the path).
-        let hid = path.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3)) | (1 << 62);
-        let img = app.session.footage.frame(ItemId(hid), &f, effectcraft_engine::time::Tick::ZERO)?;
-        let step = (img.width.max(img.height) as f32 / 128.0).ceil().max(1.0) as u32;
-        let (w, h) = (img.width.div_ceil(step), img.height.div_ceil(step));
-        let full = img.to_rgba8();
-        let mut px = Vec::with_capacity((w * h * 4) as usize);
-        for y in 0..h {
-            for x in 0..w {
-                let i = (((y * step) * img.width + x * step) * 4) as usize;
-                px.extend_from_slice(&full[i..i + 4]);
-            }
-        }
-        let tex = ctx.load_texture(format!("mb-{path}"), egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &px), egui::TextureOptions::LINEAR);
-        Some((tex, [w, h]))
-    })();
-    ctx.data_mut(|d| d.insert_temp(id, thumb.clone()));
-    thumb
+    }
+    None
 }
 
 pub fn media_browser(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {

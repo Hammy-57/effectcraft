@@ -6,6 +6,7 @@ use crate::{EvalCtx, Image, LayerTiming, Renderer, StyledLayer, styles};
 use effectcraft_color::BlendMode;
 use effectcraft_effects::Buf;
 use effectcraft_project::{Layer, MatteKind, Quality};
+use effectcraft_raster::pool;
 use rayon::prelude::*;
 
 impl<'a> Renderer<'a> {
@@ -32,8 +33,7 @@ impl<'a> Renderer<'a> {
         }
         let mut timing = self.profile.map(|_| LayerTiming { depth: self.depth, layer: layer.name.clone(), ..Default::default() });
         let t0 = web_time::Instant::now();
-        let Some(st) = self.styled(ctx, layer, timing.as_mut()) else { return Region::Empty };
-        let st = self.styled_to_blend(st);
+        let Some(st) = self.styled_blend(ctx, layer, timing.as_mut()) else { return Region::Empty };
         let t1 = web_time::Instant::now();
         let changed = if st.plain {
             self.composite_layer(ctx, layer, &st.body, canvas, opacity);
@@ -59,7 +59,7 @@ impl<'a> Renderer<'a> {
         let bl = styles::blending(ctx, layer);
         let matte = layer.track_matte.is_some_and(|tm| tm.layer != layer.id && ctx.comp.layer(tm.layer).is_some());
         if matte || layer.preserve_transparency {
-            let mut iso = Image::new(canvas.width, canvas.height);
+            let mut iso = pool::zeroed(canvas.width, canvas.height);
             for (b, m) in &st.passes {
                 self.place(ctx, layer, b, &mut iso, *m, 1.0);
             }
@@ -67,9 +67,9 @@ impl<'a> Renderer<'a> {
             self.composite_iso(ctx, layer, iso, canvas, opacity);
             return;
         }
-        let mut tmp = canvas.clone();
+        let mut tmp = pool::copy_of(canvas);
         if bl.knockout > 0 {
-            let mut k = Image::new(canvas.width, canvas.height);
+            let mut k = pool::zeroed(canvas.width, canvas.height);
             self.place(ctx, layer, &st.content, &mut k, BlendMode::Normal, 1.0);
             tmp.data.par_iter_mut().zip(k.data.par_iter()).for_each(|(p, q)| {
                 let keep = 1.0 - q[3].clamp(0.0, 1.0);
@@ -77,6 +77,7 @@ impl<'a> Renderer<'a> {
                     *c *= keep;
                 }
             });
+            pool::recycle(k);
         }
         for (b, m) in &st.passes {
             self.place(ctx, layer, b, &mut tmp, *m, 1.0);
@@ -89,6 +90,7 @@ impl<'a> Renderer<'a> {
                 c[i] += (v - c[i]) * opacity;
             }
         });
+        pool::recycle(tmp);
     }
 
     fn composite_layer(&self, ctx: &EvalCtx, layer: &Layer, buf: &Buf, canvas: &mut Image, opacity: f32) {
@@ -98,7 +100,7 @@ impl<'a> Renderer<'a> {
             return;
         }
         // Render in isolation, then matte / preserve transparency, then blend.
-        let mut iso = Image::new(canvas.width, canvas.height);
+        let mut iso = pool::zeroed(canvas.width, canvas.height);
         self.place(ctx, layer, buf, &mut iso, BlendMode::Normal, 1.0);
         self.composite_iso(ctx, layer, iso, canvas, opacity);
     }
@@ -119,6 +121,7 @@ impl<'a> Renderer<'a> {
                 _ => self.matte_image(ctx, m, canvas.width, canvas.height),
             };
             apply_matte(&mut iso, &mimg, kind);
+            pool::recycle(mimg);
         }
         if preserve {
             iso.data.par_iter_mut().zip(canvas.data.par_iter()).for_each(|(p, q)| {
@@ -128,11 +131,12 @@ impl<'a> Renderer<'a> {
             });
         }
         canvas.blend_from(&iso, layer.blend_mode, opacity, layer.id.0 as u32);
+        pool::recycle(iso);
     }
 
     /// A track matte layer's pixels placed in the comp (`w`×`h`).
     pub(crate) fn matte_image(&self, ctx: &EvalCtx, m: &Layer, w: u32, h: u32) -> Image {
-        let mut mimg = Image::new(w, h);
+        let mut mimg = pool::zeroed(w, h);
         if m.is_active_at(ctx.time)
             && let Some(mb) = self.matte_buf(ctx, m)
         {

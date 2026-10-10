@@ -4,13 +4,132 @@
 use crate::{EvalCtx, Image, Renderer, color};
 use effectcraft_effects::Buf;
 use effectcraft_project::{Footage, FootageKind, FrameBlend, ItemId, ItemKind, Layer};
+use effectcraft_raster::Px;
 use effectcraft_time::{FrameRate, TICKS_PER_SECOND, Tick};
+use rayon::prelude::*;
 use std::sync::Arc;
+
+/// A decoded footage frame as its source keeps it, turned into compositor pixels a band of rows
+/// at a time: float frames are copied, compact ones (a decoder's 8-bit Y'CbCr samples) are
+/// converted from their samples straight into the caller's buffer.
+pub trait FramePixels: Send + Sync {
+    /// Width and height in pixels.
+    fn size(&self) -> (u32, u32);
+    /// Rows `y0..` (as many whole rows as `out` holds): exactly the pixels
+    /// [`FootageSource::frame`] returns for the frame.
+    fn rows(&self, y0: usize, out: &mut [Px]);
+    /// The pixels themselves when they are an [`Image`] already.
+    fn image(&self) -> Option<&Image> {
+        None
+    }
+}
+
+impl FramePixels for Image {
+    fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+    fn rows(&self, y0: usize, out: &mut [Px]) {
+        let start = y0.saturating_mul(self.width as usize);
+        if let Some(src) = self.data.get(start..start.saturating_add(out.len()).min(self.data.len())) {
+            out.get_mut(..src.len()).unwrap_or_default().copy_from_slice(src);
+        }
+    }
+    fn image(&self) -> Option<&Image> {
+        Some(self)
+    }
+}
+
+/// A footage frame shared with its source's cache.
+pub type SharedFrame = Arc<dyn FramePixels>;
+
+/// The size a footage frame `frame_width` pixels wide is resampled to for a layer of nominal
+/// size `w`×`h` drawn at render scale `s`: `None` at (nearly) full resolution, or when the frame
+/// is smaller than the layer (an upscaled proxy keeps its pixels).
+pub fn preview_size(frame_width: u32, w: u32, h: u32, s: f64) -> Option<(u32, u32)> {
+    let k = if frame_width > 0 { w.max(1) as f64 / frame_width as f64 } else { 1.0 };
+    (s < 0.75 && k <= 1.0 + 1e-9).then(|| (((w as f64 * s).round() as u32).max(1), ((h as f64 * s).round() as u32).max(1)))
+}
+
+/// A footage frame for a layer: `preview` when its source has already resampled it to
+/// [`preview_size`] for the layer's nominal size at this render's scale.
+#[derive(Clone)]
+pub struct FootageFrame {
+    pub px: SharedFrame,
+    pub preview: bool,
+}
+
+/// A footage frame as [`Renderer::footage_buf`] takes it.
+pub(crate) trait AsFootageFrame {
+    fn pixels(&self) -> &dyn FramePixels;
+    fn is_preview(&self) -> bool {
+        false
+    }
+}
+
+impl AsFootageFrame for Arc<Image> {
+    fn pixels(&self) -> &dyn FramePixels {
+        &**self
+    }
+}
+
+impl AsFootageFrame for FootageFrame {
+    fn pixels(&self) -> &dyn FramePixels {
+        &*self.px
+    }
+    fn is_preview(&self) -> bool {
+        self.preview
+    }
+}
+
+/// Rows converted per parallel task.
+const ROWS: usize = 8;
+
+/// `px` as an [`Image`], converted with `conv` (as [`color::convert`] would after it) in the same
+/// pass: one write of the frame instead of a copy and a second sweep.
+fn expand(px: &dyn FramePixels, conv: Option<&effectcraft_color::Conversion>) -> Image {
+    let (w, h) = px.size();
+    let mut img = Image::new(w, h);
+    if w == 0 || h == 0 {
+        return img;
+    }
+    img.data.par_chunks_mut(w as usize * ROWS).enumerate().for_each(|(i, band)| {
+        px.rows(i * ROWS, band);
+        if let Some(c) = conv {
+            for p in band.iter_mut() {
+                convert_px(p, c);
+            }
+        }
+    });
+    img
+}
+
+/// [`color::convert`] of one premultiplied pixel.
+#[inline(always)]
+fn convert_px(p: &mut Px, c: &effectcraft_color::Conversion) {
+    let a = p[3];
+    if a <= 0.0 {
+        return;
+    }
+    let o = c.apply([p[0] / a, p[1] / a, p[2] / a]);
+    *p = [o[0] * a, o[1] * a, o[2] * a, a];
+}
 
 /// Supplies decoded footage frames (implemented by the media layer).
 pub trait FootageSource: Send + Sync {
     /// The frame of `item` at source time `t`, straight from the file (any size).
     fn frame(&self, item: ItemId, footage: &Footage, t: Tick) -> Option<Arc<Image>>;
+    /// [`Self::frame`] as the source keeps it: a compact frame is converted by the caller,
+    /// straight into its own buffer.
+    fn frame_pixels(&self, item: ItemId, footage: &Footage, t: Tick) -> Option<SharedFrame> {
+        self.frame(item, footage, t).map(|img| img as SharedFrame)
+    }
+    /// The frame for a layer of nominal size `w`×`h` drawn at render scale `scale`: sources
+    /// that keep frames at preview size return it resampled to [`preview_size`] (exactly as the
+    /// renderer resamples it; `preview` set), others the frame as [`Self::frame_pixels`].
+    fn preview_frame(&self, item: ItemId, footage: &Footage, t: Tick, w: u32, h: u32, scale: f64) -> Option<FootageFrame> {
+        let _ = (w, h, scale);
+        self.frame_pixels(item, footage, t).map(|px| FootageFrame { px, preview: false })
+    }
     /// `frames` interleaved stereo sample frames of `item`'s audio from source time `t` at
     /// `rate` Hz (`None` when unavailable).
     fn audio(&self, _item: ItemId, _footage: &Footage, _t: Tick, _frames: usize, _rate: u32) -> Option<Vec<f32>> {
@@ -29,9 +148,25 @@ pub trait FootageSource: Send + Sync {
     /// Set the decoded-frame cache budget in bytes (Settings ▸ Memory & CPU); sources without
     /// a cache ignore it.
     fn set_cache_budget(&self, _bytes: usize) {}
-    /// Drop the decoded frames it keeps (Edit ▸ Purge ▸ All Memory / Image Cache Memory): the
-    /// next reads decode again. Sources without a cache ignore it.
+    /// Drop the decoded frames it keeps (Edit ▸ Purge ▸ All Memory / Image Cache Memory) and close
+    /// the files nobody is reading: the next reads decode again. Sources without a cache ignore it.
     fn purge(&self) {}
+    /// A thumbnail of `footage` (its first frame) fitting in `max_side` × `max_side`, aspect
+    /// kept, for browsing files that aren't in the project: sources don't cache the frame or keep
+    /// the file open for it.
+    fn thumbnail(&self, footage: &Footage, max_side: u32) -> Option<Image> {
+        let img = self.frame(ItemId(u64::MAX), footage, Tick::ZERO)?;
+        let (w, h) = (img.width.max(1), img.height.max(1));
+        let s = (max_side.max(1) as f64 / w.max(h) as f64).min(1.0);
+        if s >= 1.0 {
+            return Some((*img).clone());
+        }
+        Some(effectcraft_raster::resample(&img, ((w as f64 * s).round() as u32).max(1), ((h as f64 * s).round() as u32).max(1)))
+    }
+    /// Close the files (decoders, parsed models, cached frames) of footage `keep` doesn't name:
+    /// called when footage leaves the project or another project is opened. Sources that keep
+    /// nothing open ignore it.
+    fn retain_files(&self, _keep: &dyn Fn(&str) -> bool) {}
     /// Settings ▸ Disk ▸ Conformed Audio Folder: where decoded audio is kept between reads
     /// (`None` = off); sources that don't decode audio ignore it.
     fn set_conform_folder(&self, _folder: Option<std::path::PathBuf>) {}
@@ -69,27 +204,47 @@ impl<'a> Renderer<'a> {
 
     /// A decoded frame of `f` as a layer buffer covering `w`×`h` layer pixels (the footage's
     /// nominal size; proxies are scaled up to it), converted from its colour profile.
-    pub(crate) fn footage_buf(&self, img: &Image, f: &Footage, w: u32, h: u32) -> Buf {
+    ///
+    /// The frame is written into the buffer once: a compact frame is converted from its samples
+    /// and the colour conversion applied in the same pass (the cached f32 frame used to be
+    /// copied, then swept again).
+    pub(crate) fn footage_buf(&self, img: &impl AsFootageFrame, f: &Footage, w: u32, h: u32) -> Buf {
         let s = self.opts.scale;
-        let k = if img.width > 0 { w.max(1) as f64 / img.width as f64 } else { 1.0 };
-        // Keep native pixels when downsampling is small; resample otherwise.
-        let mut buf = if s < 0.75 && k <= 1.0 + 1e-9 {
-            let rw = ((w as f64 * s).round() as u32).max(1);
-            let rh = ((h as f64 * s).round() as u32).max(1);
-            Buf { img: effectcraft_raster::resample(img, rw, rh), offset: [0.0; 2], scale: s }
-        } else {
-            Buf { img: img.clone(), offset: [0.0; 2], scale: 1.0 / k }
-        };
-        if let Some(c) = self.pipe.media_in(f) {
-            color::convert(&mut buf.img, &c);
+        let px = img.pixels();
+        let conv = self.pipe.media_in(f);
+        // Resampled to the preview size by the source already.
+        if img.is_preview() {
+            let mut out = expand(px, conv.as_ref());
+            if let Some((rw, rh)) = preview_size(w, w, h, s)
+                && (out.width, out.height) != (rw, rh)
+            {
+                out = effectcraft_raster::resample(&out, rw, rh);
+            }
+            return Buf { img: out, offset: [0.0; 2], scale: s };
         }
-        buf
+        let (iw, _) = px.size();
+        let k = if iw > 0 { w.max(1) as f64 / iw as f64 } else { 1.0 };
+        // Keep native pixels when downsampling is small; resample otherwise.
+        match preview_size(iw, w, h, s) {
+            Some((rw, rh)) => {
+                let mut out = match px.image() {
+                    Some(full) => effectcraft_raster::resample(full, rw, rh),
+                    None => effectcraft_raster::resample(&expand(px, None), rw, rh),
+                };
+                if let Some(c) = &conv {
+                    color::convert(&mut out, c);
+                }
+                Buf { img: out, offset: [0.0; 2], scale: s }
+            }
+            None => Buf { img: expand(px, conv.as_ref()), offset: [0.0; 2], scale: 1.0 / k },
+        }
     }
 
     /// A footage frame at source time `t`, frame-blended between the two nearest source frames
     /// when the layer's Frame Blending switch (and the comp's Enable Frame Blending) is on and
     /// `t` falls between frames (footage rate ≠ comp rate, time stretch, time remapping).
-    pub(crate) fn footage_frame(&self, ctx: &EvalCtx, layer: &Layer, item: ItemId, f: &Footage, t: Tick) -> Option<Arc<Image>> {
+    pub(crate) fn footage_frame(&self, ctx: &EvalCtx, layer: &Layer, item: ItemId, f: &Footage, t: Tick) -> Option<FootageFrame> {
+        let full = |img: Arc<Image>| FootageFrame { px: img, preview: false };
         // Interpret Footage ▸ Separate Fields: each field is a frame at twice the rate.
         if f.fields != effectcraft_project::FieldOrder::Off && matches!(f.kind, FootageKind::Video | FootageKind::Sequence) {
             let field_rate = FrameRate::new(f.frame_rate.num * 2, f.frame_rate.den);
@@ -98,13 +253,35 @@ impl<'a> Renderer<'a> {
             let dominant_upper = f.fields == effectcraft_project::FieldOrder::UpperFirst;
             // Upper field = even lines (0, 2, …).
             let parity = if (i % 2 == 0) == dominant_upper { 0 } else { 1 };
-            return Some(Arc::new(interpret_pixels(&field_frame(&img, parity), f)));
+            return Some(full(Arc::new(interpret_pixels(&field_frame(&img, parity), f))));
         }
-        let img = self.footage_frame_raw(ctx, layer, item, f, t)?;
-        if f.invert_alpha || f.linear_light_applies() { Some(Arc::new(interpret_pixels(&img, f))) } else { Some(img) }
+        if f.invert_alpha || f.linear_light_applies() {
+            let img = self.footage_frame_raw(ctx, layer, item, f, t)?;
+            return Some(full(Arc::new(interpret_pixels(&img, f))));
+        }
+        if let Some(img) = self.blended_frame(ctx, layer, item, f, t) {
+            return Some(full(img));
+        }
+        // The layer's nominal size: the proxy fills the footage's frame.
+        let nominal = match self.project.item(item).map(|it| &it.kind) {
+            Some(ItemKind::Footage(orig)) => Some((orig.width, orig.height)),
+            _ => None,
+        };
+        match nominal {
+            Some((w, h)) if self.opts.scale < 0.75 => self.footage.preview_frame(item, f, t, w, h, self.opts.scale),
+            _ => self.footage.frame_pixels(item, f, t).map(|px| FootageFrame { px, preview: false }),
+        }
     }
 
     fn footage_frame_raw(&self, ctx: &EvalCtx, layer: &Layer, item: ItemId, f: &Footage, t: Tick) -> Option<Arc<Image>> {
+        if let Some(img) = self.blended_frame(ctx, layer, item, f, t) {
+            return Some(img);
+        }
+        self.footage.frame(item, f, t)
+    }
+
+    /// The frame-blended footage frame at `t` (`None` when frame blending doesn't apply there).
+    fn blended_frame(&self, ctx: &EvalCtx, layer: &Layer, item: ItemId, f: &Footage, t: Tick) -> Option<Arc<Image>> {
         let mode = frame_blend_mode(ctx, layer);
         if mode != FrameBlend::Off && matches!(f.kind, FootageKind::Video | FootageKind::Sequence) {
             let (i, w) = frame_position(t, f.frame_rate);
@@ -132,7 +309,7 @@ impl<'a> Renderer<'a> {
                 }
             }
         }
-        self.footage.frame(item, f, t)
+        None
     }
 }
 

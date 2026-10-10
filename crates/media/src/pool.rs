@@ -6,11 +6,11 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use effectcraft_project::{AlphaMode, Footage, FootageKind, ItemId};
 use effectcraft_raster::{Image, Px};
-use effectcraft_render::FootageSource;
+use effectcraft_render::{FootageFrame, FootageSource, SharedFrame, preview_size};
 use effectcraft_time::{FrameRate, TICKS_PER_SECOND, Tick};
 use filmcraft_media::{FrameRequest, SharedSource};
 
-use crate::convert::{AlphaOp, dynamic_to_image, frame_to_image_in};
+use crate::convert::{AlphaOp, Packed, pack_dynamic};
 use crate::{MediaError, Result};
 
 /// Default frame-cache budget: 1 GiB of decoded frames.
@@ -42,10 +42,54 @@ struct Key {
     interp: u8,
     matte: [u32; 3],
     crop: Option<[u64; 4]>,
+    /// The preview size a frame is resampled to (reduced-resolution previews).
+    preview: Option<[u32; 2]>,
+}
+
+/// A layer drawn at reduced resolution: its nominal size `w`×`h` at render scale `s` (< 0.75).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Preview {
+    w: u32,
+    h: u32,
+    s: f64,
+}
+
+/// A cached frame: float pixels, or the decoder's samples converted on use (8-bit 4:2:0 video
+/// takes 1.5 bytes a pixel instead of 16; see [`Packed`]).
+#[derive(Clone)]
+pub(crate) enum Pixels {
+    Float(Arc<Image>),
+    Packed(Arc<Packed>),
+    /// Resampled to the preview size its key names, as the renderer would.
+    Preview(Arc<Image>),
+}
+
+impl Pixels {
+    /// Bytes held (what the cache budget counts).
+    fn bytes(&self) -> usize {
+        64 + match self {
+            Pixels::Float(img) | Pixels::Preview(img) => img.data.len() * std::mem::size_of::<Px>(),
+            Pixels::Packed(p) => p.bytes(),
+        }
+    }
+    /// The frame as compositor pixels (a packed frame is converted now).
+    pub(crate) fn image(&self) -> Arc<Image> {
+        match self {
+            Pixels::Float(img) | Pixels::Preview(img) => img.clone(),
+            Pixels::Packed(p) => Arc::new(p.to_image()),
+        }
+    }
+    /// The frame for the renderer to convert into its own buffer.
+    fn shared(&self) -> SharedFrame {
+        match self {
+            Pixels::Float(img) | Pixels::Preview(img) => img.clone(),
+            Pixels::Packed(p) => p.clone(),
+        }
+    }
 }
 
 struct Entry {
-    img: Arc<Image>,
+    px: Pixels,
     stamp: u64,
     bytes: usize,
 }
@@ -77,9 +121,6 @@ fn sample_time(at: usize, rate: u32) -> Tick {
     Tick::from_units(i64::try_from(at).unwrap_or(i64::MAX), i64::from(rate))
 }
 
-/// At most this many recycled pixel buffers are kept (outside the budget).
-const MAX_SPARE: usize = 4;
-
 /// Least-recently-used frames, bounded by bytes.
 #[derive(Default)]
 struct Lru {
@@ -87,24 +128,21 @@ struct Lru {
     order: BTreeMap<u64, Key>,
     clock: u64,
     bytes: usize,
-    /// Pixel buffers of evicted frames nobody else holds, reused for new frames: playback then
-    /// writes into memory that is already mapped instead of faulting in fresh pages every frame.
-    spare: Vec<Vec<Px>>,
 }
 
 impl Lru {
-    fn get(&mut self, k: &Key) -> Option<Arc<Image>> {
+    fn get(&mut self, k: &Key) -> Option<Pixels> {
         let e = self.map.get_mut(k)?;
         self.order.remove(&e.stamp);
         self.clock += 1;
         e.stamp = self.clock;
         self.order.insert(e.stamp, k.clone());
-        Some(e.img.clone())
+        Some(e.px.clone())
     }
-    fn insert(&mut self, k: Key, img: Arc<Image>, budget: usize) {
-        let bytes = img.data.len() * std::mem::size_of::<Px>() + 64;
+    fn insert(&mut self, k: Key, px: Pixels, budget: usize) {
+        let bytes = px.bytes();
         self.clock += 1;
-        if let Some(old) = self.map.insert(k.clone(), Entry { img, stamp: self.clock, bytes }) {
+        if let Some(old) = self.map.insert(k.clone(), Entry { px, stamp: self.clock, bytes }) {
             self.order.remove(&old.stamp);
             self.bytes -= old.bytes;
         }
@@ -124,19 +162,7 @@ impl Lru {
             let Some((_, k)) = self.order.pop_first() else { break };
             if let Some(e) = self.map.remove(&k) {
                 self.bytes -= e.bytes;
-                if self.spare.len() < MAX_SPARE
-                    && let Ok(img) = Arc::try_unwrap(e.img)
-                {
-                    self.spare.push(img.data);
-                }
             }
-        }
-    }
-    /// A recycled buffer of exactly `len` pixels, or an empty Vec.
-    fn take_spare(&mut self, len: usize) -> Vec<Px> {
-        match self.spare.iter().position(|b| b.len() == len) {
-            Some(i) => self.spare.swap_remove(i),
-            None => Vec::new(),
         }
     }
 }
@@ -170,13 +196,115 @@ struct CacheState {
 /// (`None`: failed to open; not retried until `forget`).
 type SourceSlot = Arc<OnceLock<Option<SharedSource>>>;
 
+/// At most this many movie/audio files stay open (least recently used closed first).
+const MAX_SOURCES: usize = 24;
+
+/// Open files whose decoders hold their whole contents (WAV bytes, decoded MP3 / FLAC samples)
+/// are closed beyond this many bytes of such data (least recently used first).
+const SOURCE_BUDGET: usize = 1 << 30;
+
+struct SourceEntry {
+    slot: SourceSlot,
+    stamp: u64,
+    /// Bytes the source keeps in memory (estimated once it is open).
+    held: usize,
+}
+
+/// Open movie/audio files by path, least recently used closed first beyond [`MAX_SOURCES`] or
+/// [`SOURCE_BUDGET`].
+#[derive(Default)]
+struct Sources {
+    map: HashMap<Arc<str>, SourceEntry>,
+    clock: u64,
+}
+
+impl Sources {
+    /// The slot of `path` (created empty), marked as just used.
+    fn slot(&mut self, path: &Arc<str>) -> SourceSlot {
+        self.clock += 1;
+        let clock = self.clock;
+        let e = self.map.entry(path.clone()).or_insert_with(|| SourceEntry { slot: SourceSlot::default(), stamp: clock, held: 0 });
+        e.stamp = clock;
+        e.slot.clone()
+    }
+    /// Whether nothing but this map uses the source of `e` (no decode in progress, nobody waiting
+    /// for it to open).
+    fn idle(e: &SourceEntry) -> bool {
+        Arc::strong_count(&e.slot) == 1 && e.slot.get().is_none_or(|s| s.as_ref().is_none_or(|s| Arc::strong_count(s) == 1))
+    }
+    /// Close idle sources, least recently used first, until within the count and byte bounds
+    /// (`keep` stays open).
+    fn trim(&mut self, keep: &str) {
+        loop {
+            let held: usize = self.map.values().map(|e| e.held).fold(0, usize::saturating_add);
+            if self.map.len() <= MAX_SOURCES && held <= SOURCE_BUDGET {
+                return;
+            }
+            let oldest = self.map.iter().filter(|(p, e)| &***p != keep && Self::idle(e)).min_by_key(|(_, e)| e.stamp).map(|(p, _)| p.clone());
+            let Some(p) = oldest else { return };
+            self.map.remove(&p);
+        }
+    }
+    /// Close every idle source.
+    fn close_idle(&mut self) {
+        self.map.retain(|_, e| !Self::idle(e));
+    }
+}
+
+/// At most this many parsed Photoshop documents are kept (each holds its file) …
+const MAX_PSDS: usize = 4;
+/// … and at most this many bytes of them (the most recent one always stays).
+const PSD_BUDGET: usize = 1 << 29;
+
+/// Parsed Photoshop documents, most recently used last: a document imported as a composition
+/// has a footage item per layer, and each decoded frame re-read and re-parsed the whole file.
+#[derive(Default)]
+struct PsdCache {
+    list: Vec<(Arc<str>, Arc<effectcraft_psd::Psd>, usize)>,
+}
+
+impl PsdCache {
+    fn get(&mut self, path: &str) -> Option<Arc<effectcraft_psd::Psd>> {
+        let i = self.list.iter().position(|(p, ..)| &**p == path)?;
+        let e = self.list.remove(i);
+        let psd = e.1.clone();
+        self.list.push(e);
+        Some(psd)
+    }
+    fn insert(&mut self, path: Arc<str>, psd: Arc<effectcraft_psd::Psd>, bytes: usize) {
+        self.remove(&path);
+        self.list.push((path, psd, bytes));
+        while self.list.len() > 1 && (self.list.len() > MAX_PSDS || self.list.iter().map(|e| e.2).fold(0, usize::saturating_add) > PSD_BUDGET) {
+            self.list.remove(0);
+        }
+    }
+    fn remove(&mut self, path: &str) {
+        self.list.retain(|(p, ..)| &**p != path);
+    }
+}
+
+/// Bytes a source keeps in memory: decoders that read the file whole keep its bytes (WAV) or its
+/// decoded samples (MP3, FLAC); containers read through the file keep their index.
+fn held_bytes(src: &SharedSource, whole: bool) -> usize {
+    if !whole {
+        return 1 << 20;
+    }
+    let info = src.info();
+    let file = info.file_size.unwrap_or(0);
+    let decoded =
+        info.audio.as_ref().map_or(0.0, |a| info.duration.0 as f64 / TICKS_PER_SECOND as f64 * f64::from(a.sample_rate) * f64::from(a.channels) * 4.0);
+    usize::try_from(file).unwrap_or(usize::MAX).max(decoded.clamp(0.0, usize::MAX as f64) as usize)
+}
+
 struct Inner {
     /// Opened movie/audio sources by path.
-    sources: Mutex<HashMap<Arc<str>, SourceSlot>>,
+    sources: Mutex<Sources>,
     /// Files opened into `sources` (see [`PoolStats::opened`]).
     opened: AtomicU64,
     /// In-memory files registered with `add_bytes` (web builds, tests).
     files: Mutex<HashMap<String, Arc<[u8]>>>,
+    /// Parsed Photoshop documents by path.
+    psds: Mutex<PsdCache>,
     /// Parsed 3D models by path (`None`: failed to load; not retried until `forget`).
     models: Mutex<HashMap<String, Option<Arc<effectcraft_model::Model>>>>,
     cache: Mutex<CacheState>,
@@ -189,6 +317,9 @@ struct Inner {
     /// Settings ▸ Disk ▸ Conformed Audio Folder: decoded audio tracks written once per file and
     /// rate, read back instead of decoding again (`None` = off).
     conform: Mutex<Option<std::path::PathBuf>>,
+    /// The read-ahead workers' queue (started on the first read-ahead).
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    prefetcher: OnceLock<Option<std::sync::mpsc::SyncSender<Prefetch>>>,
     /// Conformed files being written right now.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     conforming: Mutex<HashSet<std::path::PathBuf>>,
@@ -219,6 +350,8 @@ struct Loc {
     key: Key,
     /// Media time for movies (`None`: an image file, `key.path`).
     media_t: Option<Tick>,
+    /// Resampled for a reduced-resolution preview (`key.preview` is its size).
+    preview: Option<Preview>,
 }
 
 /// Removes an in-flight key and wakes waiters, also when decoding panics.
@@ -247,6 +380,7 @@ impl MediaPool {
                 sources: Mutex::default(),
                 files: Mutex::default(),
                 models: Mutex::default(),
+                psds: Mutex::default(),
                 cache: Mutex::default(),
                 done: Condvar::new(),
                 budget: AtomicU64::new(bytes as u64),
@@ -256,6 +390,7 @@ impl MediaPool {
                 prefetched: AtomicU64::new(0),
                 opened: AtomicU64::new(0),
                 conform: Mutex::default(),
+                prefetcher: OnceLock::new(),
                 conforming: Mutex::default(),
             }),
         }
@@ -300,13 +435,30 @@ impl MediaPool {
     /// Drop every cached frame and decoder.
     pub fn clear(&self) {
         self.clear_frames();
-        lock(&self.inner.sources).clear();
+        lock(&self.inner.sources).map.clear();
+    }
+
+    /// Movie and audio files open now.
+    pub fn open_files(&self) -> usize {
+        lock(&self.inner.sources).map.len()
+    }
+
+    /// Forget every file `keep` doesn't name: close its decoder, drop its parsed model and its
+    /// cached frames (after footage is removed from the project, or another project is opened).
+    pub fn retain_files(&self, keep: &dyn Fn(&str) -> bool) {
+        let gone: Vec<Arc<str>> = lock(&self.inner.sources).map.keys().filter(|p| !keep(p)).cloned().collect();
+        for p in &gone {
+            self.forget(p);
+        }
+        lock(&self.inner.models).retain(|p, _| keep(p));
+        lock(&self.inner.psds).list.retain(|(p, ..)| keep(p));
     }
 
     /// Forget a file (after it changed on disk, or to retry a file that failed to open).
     pub fn forget(&self, path: &str) {
-        lock(&self.inner.sources).remove(path);
+        lock(&self.inner.sources).map.remove(path);
         lock(&self.inner.models).remove(path);
+        lock(&self.inner.psds).remove(path);
         let mut c = lock(&self.inner.cache);
         let keys: Vec<Key> = c.lru.map.keys().filter(|k| &*k.path == path).cloned().collect();
         for k in keys {
@@ -469,8 +621,18 @@ impl MediaPool {
     }
 
     /// A thumbnail of `footage` (its first frame) fitting in `max_side` × `max_side`, aspect kept.
+    /// A cached frame is reused; otherwise the frame is decoded without being cached and a movie
+    /// not open already is closed again (browsing a folder doesn't fill memory with its files).
     pub fn thumbnail(&self, footage: &Footage, max_side: u32) -> Result<Image> {
-        let img = Inner::frame_at(&self.inner, footage, Tick::ZERO, false)?;
+        if !footage.has_video {
+            return Err(MediaError::Unsupported(format!("{}: no video", footage.path)));
+        }
+        let loc = Inner::locate(footage, Tick::ZERO);
+        let cached = lock(&self.inner.cache).lru.get(&loc.key);
+        let img = match cached {
+            Some(px) => px.image(),
+            None => self.inner.decode(&loc, footage, true)?.image(),
+        };
         let (w, h) = (img.width.max(1), img.height.max(1));
         let s = (max_side.max(1) as f64 / w.max(h) as f64).min(1.0);
         if s >= 1.0 {
@@ -513,31 +675,50 @@ impl Inner {
         if let Some(b) = lock(&self.files).get(path) {
             return Ok(b.clone());
         }
-        std::fs::read(path).map(Into::into).map_err(|e| MediaError::Io(format!("{path}: {e}")))
+        crate::open::read_file(path)
     }
 
     /// The opened movie/audio source for `path`. The first caller opens it, outside the map's
-    /// lock (reading and parsing a large file takes a moment; FLAC, MP3, Ogg and AIFF files are
-    /// decoded whole); callers asking for the same file meanwhile wait for that instead of opening
-    /// it again: a preview's frame workers, audio feeder, conform and waveform threads each
-    /// decoded a long FLAC in full at once (#408).
+    /// lock (parsing a large file takes a moment; FLAC, MP3 and AIFF files are decoded whole);
+    /// callers asking for the same file meanwhile wait for that instead of opening it again: a
+    /// preview's frame workers, audio feeder, conform and waveform threads each decoded a long
+    /// FLAC in full at once (#408). Containers are read through the file (index now, samples on
+    /// demand), not held in memory.
     fn source(&self, path: &Arc<str>) -> Option<SharedSource> {
-        let slot = lock(&self.sources).entry(path.clone()).or_default().clone();
-        slot.get_or_init(|| {
-            self.opened.fetch_add(1, Ordering::Relaxed);
-            let opened = self.read(path).and_then(|bytes| {
-                let name = std::path::Path::new(&**path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                filmcraft_codecs::open_bytes(&name, bytes).map_err(MediaError::from)
-            });
-            match opened {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    log::warn!("media: cannot open {path}: {e}");
-                    None
+        let slot = lock(&self.sources).slot(path);
+        let mut held = None;
+        let src = slot
+            .get_or_init(|| {
+                self.opened.fetch_add(1, Ordering::Relaxed);
+                let mem = lock(&self.files).get(&**path).cloned();
+                match crate::open::open_source(path, mem) {
+                    Ok((s, whole)) => {
+                        held = Some(held_bytes(&s, whole));
+                        Some(s)
+                    }
+                    Err(e) => {
+                        log::warn!("media: cannot open {path}: {e}");
+                        None
+                    }
                 }
+            })
+            .clone();
+        if let Some(h) = held {
+            let mut sources = lock(&self.sources);
+            if let Some(e) = sources.map.get_mut(path)
+                && Arc::ptr_eq(&e.slot, &slot)
+            {
+                e.held = h;
             }
-        })
-        .clone()
+            drop(slot);
+            sources.trim(path);
+        }
+        src
+    }
+
+    /// The source of `path` when it is open already.
+    fn open_source(&self, path: &str) -> Option<SharedSource> {
+        lock(&self.sources).map.get(path).and_then(|e| e.slot.get().cloned().flatten())
     }
 
     /// The frame index (in the footage's interpreted rate) shown at source time `t`, after
@@ -563,14 +744,14 @@ impl Inner {
         let interp = alpha | (u8::from(footage.preserve_rgb) << 2);
         let matte = if footage.alpha == AlphaMode::Premultiplied { footage.premul_color.map(f32::to_bits) } else { [0; 3] };
         let crop = footage.layer.as_ref().and_then(|l| l.crop_bounds).map(|b| b.map(f64::to_bits));
-        let key = |path: &str, frame| Key { path: path.into(), frame, interp, matte, crop };
+        let key = |path: &str, frame| Key { path: path.into(), frame, interp, matte, crop, preview: None };
         match footage.kind {
             FootageKind::Sequence if !footage.sequence.is_empty() => {
                 let i = Self::frame_index(footage.frame_rate, t, footage.sequence_frames(), footage.loop_count);
                 match footage.sequence_file(i) {
-                    Some(path) => Loc { key: key(path, 0), media_t: None },
+                    Some(path) => Loc { key: key(path, 0), media_t: None, preview: None },
                     // A gap in the numbering: colour bars, as in After Effects.
-                    None => Loc { key: key(PLACEHOLDER, ((footage.width as i64) << 32) | footage.height as i64), media_t: None },
+                    None => Loc { key: key(PLACEHOLDER, ((footage.width as i64) << 32) | footage.height as i64), media_t: None, preview: None },
                 }
             }
             // A layer of a layered still is keyed by its layer index and size mode (smart objects
@@ -578,9 +759,11 @@ impl Inner {
             FootageKind::Still if footage.layer.is_some() || footage.page != 0 => {
                 let l = footage.layer.as_ref().map_or(0, |l| 1 + l.index as i64 * 2 + l.layer_size as i64 + if l.embedded.is_some() { 1 << 40 } else { 0 })
                     + ((footage.page as i64) << 42);
-                Loc { key: key(&footage.path, l), media_t: None }
+                Loc { key: key(&footage.path, l), media_t: None, preview: None }
             }
-            FootageKind::Still | FootageKind::Sequence | FootageKind::Model | FootageKind::Data => Loc { key: key(&footage.path, 0), media_t: None },
+            FootageKind::Still | FootageKind::Sequence | FootageKind::Model | FootageKind::Data => {
+                Loc { key: key(&footage.path, 0), media_t: None, preview: None }
+            }
             FootageKind::Video | FootageKind::Audio => {
                 let rate = footage.frame_rate;
                 let n = Self::frame_count(rate, footage.duration);
@@ -588,16 +771,35 @@ impl Inner {
                 // Middle of the frame in the file's own timing (robust to timestamp rounding).
                 let native = footage.native_rate.unwrap_or(rate);
                 let mt = native.tick_of(i) + Tick(native.frame_duration().0 / 2);
-                Loc { key: key(&footage.path, i), media_t: Some(mt) }
+                Loc { key: key(&footage.path, i), media_t: Some(mt), preview: None }
             }
         }
     }
 
     fn frame_at(self: &Arc<Self>, footage: &Footage, t: Tick, playback: bool) -> Result<Arc<Image>> {
+        Ok(self.pixels_at(footage, t, playback, None)?.image())
+    }
+
+    /// Where the frame of `footage` at `t` comes from, resampled for `preview` when the footage's
+    /// frames are larger than the preview needs.
+    fn locate_for(footage: &Footage, t: Tick, preview: Option<Preview>) -> Loc {
+        let mut loc = Self::locate(footage, t);
+        if let Some(p) = preview
+            && let Some((w, h)) = preview_size(footage.width, p.w, p.h, p.s)
+        {
+            loc.key.preview = Some([w, h]);
+            loc.preview = Some(p);
+        }
+        loc
+    }
+
+    /// The cached (or newly decoded) pixels of `footage` at source time `t` (resampled for
+    /// `preview`).
+    fn pixels_at(self: &Arc<Self>, footage: &Footage, t: Tick, playback: bool, preview: Option<Preview>) -> Result<Pixels> {
         if !footage.has_video {
             return Err(MediaError::Unsupported(format!("{}: no video", footage.path)));
         }
-        let loc = Self::locate(footage, t);
+        let loc = Self::locate_for(footage, t, preview);
         let movie = loc.media_t.is_some();
         let mut c = lock(&self.cache);
         // sequential playback of a movie: read the next frame ahead
@@ -605,16 +807,16 @@ impl Inner {
             let prev = c.last.insert(loc.key.path.clone(), loc.key.frame);
             if prev == Some(loc.key.frame - 1) && self.read_ahead.load(Ordering::Relaxed) {
                 let next_t = t + footage.frame_rate.frame_duration();
-                let next = Self::locate(footage, next_t);
+                let next = Self::locate_for(footage, next_t, preview);
                 if next.key != loc.key && !c.lru.map.contains_key(&next.key) && !c.inflight.contains(&next.key) {
-                    self.prefetch(footage, next_t);
+                    self.prefetch(footage, next_t, preview);
                 }
             }
         }
         loop {
-            if let Some(img) = c.lru.get(&loc.key) {
+            if let Some(px) = c.lru.get(&loc.key) {
                 self.hits.fetch_add(1, Ordering::Relaxed);
-                return Ok(img);
+                return Ok(px);
             }
             if !c.inflight.contains(&loc.key) {
                 break;
@@ -626,7 +828,7 @@ impl Inner {
             if rayon::current_thread_index().is_some() {
                 self.misses.fetch_add(1, Ordering::Relaxed);
                 drop(c);
-                return Ok(Arc::new(self.decode(&loc, footage)?));
+                return self.decode(&loc, footage, false);
             }
             c = self.done.wait(c).unwrap_or_else(|e| e.into_inner());
         }
@@ -634,49 +836,90 @@ impl Inner {
         c.inflight.insert(loc.key.clone());
         drop(c);
         let _guard = Inflight { inner: self, key: loc.key.clone() };
-        let img = Arc::new(self.decode(&loc, footage)?);
-        lock(&self.cache).lru.insert(loc.key, img.clone(), self.budget());
-        Ok(img)
+        let px = self.decode(&loc, footage, false)?;
+        lock(&self.cache).lru.insert(loc.key, px.clone(), self.budget());
+        Ok(px)
     }
 
+    /// Decode a frame ahead of playback on a read-ahead worker. A full queue drops the request
+    /// (playback is ahead of decoding anyway): a thread was spawned per frame before.
     #[cfg(not(target_arch = "wasm32"))]
-    fn prefetch(self: &Arc<Self>, footage: &Footage, t: Tick) {
-        let (me, f) = (self.clone(), footage.clone());
-        self.prefetched.fetch_add(1, Ordering::Relaxed);
-        // A plain thread, not a rayon job: the decode below parallelises with rayon itself.
-        std::thread::spawn(move || {
-            let _ = me.frame_at(&f, t, false);
-        });
+    fn prefetch(self: &Arc<Self>, footage: &Footage, t: Tick, preview: Option<Preview>) {
+        let Some(tx) = self.prefetcher.get_or_init(start_prefetchers) else { return };
+        if tx.try_send((Arc::downgrade(self), footage.clone(), t, preview)).is_ok() {
+            self.prefetched.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     #[cfg(target_arch = "wasm32")]
-    fn prefetch(self: &Arc<Self>, _footage: &Footage, _t: Tick) {}
+    fn prefetch(self: &Arc<Self>, _footage: &Footage, _t: Tick, _preview: Option<Preview>) {}
 
-    fn decode(&self, loc: &Loc, footage: &Footage) -> Result<Image> {
+    /// Decode the frame at `loc`: movies and 8 / 16-bit stills are kept as their samples
+    /// ([`Packed`]), float stills, layered and vector documents as float pixels.
+    ///
+    /// `detached`: a movie not open already is opened for this frame only (thumbnails).
+    fn decode(&self, loc: &Loc, footage: &Footage, detached: bool) -> Result<Pixels> {
+        // A reduced-resolution preview: the full frame (cached, or decoded and not kept)
+        // resampled exactly as the renderer resamples it.
+        if let (Some(p), Some([rw, rh])) = (loc.preview, loc.key.preview) {
+            let base = Loc { key: Key { preview: None, ..loc.key.clone() }, media_t: loc.media_t, preview: None };
+            let cached = lock(&self.cache).lru.get(&base.key);
+            let full = match cached {
+                Some(px) => px,
+                None => self.decode(&base, footage, detached)?,
+            };
+            let img = full.image();
+            if preview_size(img.width, p.w, p.h, p.s).is_none() {
+                return Ok(full);
+            }
+            return Ok(Pixels::Preview(Arc::new(effectcraft_raster::resample(&img, rw, rh))));
+        }
         let op = AlphaOp::of(footage);
         let path = &loc.key.path;
+        let float = |img: Image| Pixels::Float(Arc::new(img));
         match loc.media_t {
-            None if &**path == PLACEHOLDER => Ok(colour_bars(footage.width, footage.height)),
+            None if &**path == PLACEHOLDER => Ok(float(colour_bars(footage.width, footage.height))),
             None => {
+                // Photoshop documents are parsed once per file, not once per layer item.
+                if let Some(psd) = lock(&self.psds).get(path) {
+                    return Ok(float(crate::layered::decode_psd(path, &psd, footage, op)?));
+                }
                 let bytes = self.read(path)?;
+                if effectcraft_psd::is_psd(&bytes) {
+                    let psd = Arc::new(crate::layered::parse_psd(path, &bytes)?);
+                    if !detached {
+                        lock(&self.psds).insert(path.clone(), psd.clone(), bytes.len());
+                    }
+                    return Ok(float(crate::layered::decode_psd(path, &psd, footage, op)?));
+                }
                 if let Some(img) = crate::layered::decode(path, &bytes, footage, op)? {
-                    return Ok(img);
+                    return Ok(float(img));
                 }
                 if let Some(img) = crate::avif::decode(path, &bytes, op)? {
-                    return Ok(img);
+                    return Ok(float(img));
                 }
                 let img = match image::load_from_memory(&bytes) {
                     Ok(img) => img,
                     // A multi-layer OpenEXR file without an unnamed RGB layer: its colour layer.
                     Err(e) => crate::exr_channels::layered_image(&bytes).ok_or_else(|| MediaError::Decode(format!("{path}: {e}")))?,
                 };
-                Ok(dynamic_to_image(&img, op))
+                drop(bytes);
+                Ok(match pack_dynamic(img, op) {
+                    Ok(img) => float(img),
+                    Err(packed) => Pixels::Packed(Arc::new(packed)),
+                })
             }
             Some(mt) => {
-                let src = self.source(path).ok_or_else(|| MediaError::Io(format!("{path}: cannot open")))?;
-                let vf = src.video_frame(FrameRequest::full(filmcraft_time::Tick(mt.0))).map_err(MediaError::from)?;
-                let buf = lock(&self.cache).lru.take_spare(vf.width as usize * vf.height as usize);
-                Ok(frame_to_image_in(&vf, op, buf))
+                let src = match detached {
+                    false => self.source(path),
+                    true => self.open_source(path).or_else(|| {
+                        let mem = lock(&self.files).get(&**path).cloned();
+                        crate::open::open_source(path, mem).ok().map(|(s, _)| s)
+                    }),
+                }
+                .ok_or_else(|| MediaError::Io(format!("{path}: cannot open")))?;
+                let frame = src.video_frame(FrameRequest::full(filmcraft_time::Tick(mt.0))).map_err(MediaError::from)?;
+                Ok(Pixels::Packed(Arc::new(Packed::Video { frame, op })))
             }
         }
     }
@@ -697,21 +940,29 @@ impl FootageSource for MediaPool {
     }
     fn purge(&self) {
         self.clear_frames();
+        lock(&self.inner.sources).close_idle();
+    }
+    fn retain_files(&self, keep: &dyn Fn(&str) -> bool) {
+        MediaPool::retain_files(self, keep);
+    }
+    fn thumbnail(&self, footage: &Footage, max_side: u32) -> Option<Image> {
+        if footage.missing {
+            return None;
+        }
+        MediaPool::thumbnail(self, footage, max_side).map_err(|e| log::debug!("media: thumbnail of {}: {e}", footage.path)).ok()
     }
     fn cache_budget(&self) -> Option<usize> {
         Some(self.budget())
     }
     fn frame(&self, _item: ItemId, footage: &Footage, t: Tick) -> Option<Arc<Image>> {
-        if footage.missing {
-            return None;
-        }
-        match self.frame_at(footage, t) {
-            Ok(img) => Some(img),
-            Err(e) => {
-                log::warn!("media: frame of {} at {:?}: {e}", footage.path, t);
-                None
-            }
-        }
+        self.pixels(footage, t, None).map(|px| px.image())
+    }
+    fn frame_pixels(&self, _item: ItemId, footage: &Footage, t: Tick) -> Option<SharedFrame> {
+        self.pixels(footage, t, None).map(|px| px.shared())
+    }
+    fn preview_frame(&self, _item: ItemId, footage: &Footage, t: Tick, w: u32, h: u32, scale: f64) -> Option<FootageFrame> {
+        let px = self.pixels(footage, t, Some(Preview { w, h, s: scale }))?;
+        Some(FootageFrame { preview: matches!(px, Pixels::Preview(_)), px: px.shared() })
     }
 
     fn vector_frame(&self, _item: ItemId, footage: &Footage, scale: f64) -> Option<Arc<Image>> {
@@ -739,6 +990,55 @@ impl FootageSource for MediaPool {
             return None;
         }
         Some(self.audio_samples(footage, t, frames, rate))
+    }
+}
+
+/// A read-ahead request: the pool (not kept alive by the queue), the footage and its time.
+type Prefetch = (std::sync::Weak<Inner>, Footage, Tick, Option<Preview>);
+
+/// Read-ahead workers per pool, and requests queued for them.
+#[cfg(not(target_arch = "wasm32"))]
+const PREFETCH_WORKERS: usize = 2;
+#[cfg(not(target_arch = "wasm32"))]
+const PREFETCH_QUEUE: usize = 4;
+
+/// Start the read-ahead workers: plain threads, not rayon jobs (the decodes parallelise with
+/// rayon themselves). They end when the pool (holding the queue's sender) is dropped.
+#[cfg(not(target_arch = "wasm32"))]
+fn start_prefetchers() -> Option<std::sync::mpsc::SyncSender<Prefetch>> {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Prefetch>(PREFETCH_QUEUE);
+    let rx = Arc::new(Mutex::new(rx));
+    let mut started = 0;
+    for i in 0..PREFETCH_WORKERS {
+        let rx = rx.clone();
+        let spawned = std::thread::Builder::new().name(format!("ec-media-readahead-{i}")).spawn(move || {
+            loop {
+                let job = lock(&rx).recv();
+                let Ok((pool, f, t, preview)) = job else { return };
+                if let Some(me) = pool.upgrade() {
+                    let _ = me.pixels_at(&f, t, false, preview);
+                }
+            }
+        });
+        started += usize::from(spawned.is_ok());
+    }
+    (started > 0).then_some(tx)
+}
+
+impl MediaPool {
+    /// The pixels of `footage` at `t` for the renderer (playback read-ahead on), logged and
+    /// `None` when they can't be decoded.
+    fn pixels(&self, footage: &Footage, t: Tick, preview: Option<Preview>) -> Option<Pixels> {
+        if footage.missing {
+            return None;
+        }
+        match Inner::pixels_at(&self.inner, footage, t, true, preview) {
+            Ok(px) => Some(px),
+            Err(e) => {
+                log::warn!("media: frame of {} at {:?}: {e}", footage.path, t);
+                None
+            }
+        }
     }
 }
 
@@ -824,6 +1124,79 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Open files are bounded (least recently used closed first), purging closes the idle ones,
+    /// and files the project no longer names are closed.
+    #[test]
+    fn open_files_are_bounded_and_released() {
+        let pool = MediaPool::new();
+        let wav: Arc<[u8]> = filmcraft_media::wav::write_wav16(&[0.25; 9600], 2, 48_000).into();
+        let footage = |i: usize| {
+            let path = format!("/mem/tone{i}.wav");
+            pool.add_bytes(&path, wav.clone());
+            Footage { path, kind: FootageKind::Audio, duration: Tick::from_seconds_f64(0.1), has_audio: true, ..Default::default() }
+        };
+        let files: Vec<Footage> = (0..MAX_SOURCES + 6).map(footage).collect();
+        for f in &files {
+            assert!(pool.audio_samples(f, Tick::ZERO, 16, 48_000).iter().all(|v| (*v - 0.25).abs() < 1e-3));
+        }
+        assert_eq!(pool.open_files(), MAX_SOURCES);
+        assert!(lock(&pool.inner.sources).map.contains_key(files[MAX_SOURCES + 5].path.as_str()), "the newest stays open");
+        assert!(!lock(&pool.inner.sources).map.contains_key(files[0].path.as_str()), "the oldest was closed");
+        // Reopened on demand.
+        assert!(pool.audio_samples(&files[0], Tick::ZERO, 16, 48_000).iter().all(|v| (*v - 0.25).abs() < 1e-3));
+        pool.retain_files(&|p| p == files[1].path || p == files[2].path || p == files[0].path);
+        assert!(pool.open_files() <= 3);
+        // A source in use isn't closed by a purge.
+        let busy = pool.inner.source(&Arc::from(files[0].path.as_str()));
+        FootageSource::purge(&pool);
+        assert_eq!(pool.open_files(), 1);
+        drop(busy);
+        FootageSource::purge(&pool);
+        assert_eq!(pool.open_files(), 0);
+    }
+
+    /// A Photoshop document imported as a composition: every layer item decodes from one parsed
+    /// document (each re-read and re-parsed the whole file), with the same pixels; parsed
+    /// documents are bounded and forgotten with their file.
+    #[test]
+    fn psd_layers_share_one_parsed_document() {
+        use effectcraft_psd::Rect;
+        use effectcraft_psd::write::{WDoc, WLayer};
+        let pool = MediaPool::new();
+        let mut doc = WDoc::new(32, 16);
+        doc.layers =
+            vec![WLayer::solid("Back", Rect::new(0, 0, 32, 16), [0.2, 0.3, 0.4, 1.0]), WLayer::solid("Red", Rect::new(4, 2, 10, 8), [1.0, 0.0, 0.0, 1.0])];
+        let bytes: Arc<[u8]> = effectcraft_psd::write::write(&doc).into();
+        let psd_footage = |path: &str, index: Option<u32>| Footage {
+            path: path.into(),
+            kind: FootageKind::Still,
+            width: 32,
+            height: 16,
+            has_video: true,
+            alpha: AlphaMode::Straight,
+            layer: index.map(|index| effectcraft_project::SourceLayer { index, name: String::new(), ..Default::default() }),
+            ..Default::default()
+        };
+        pool.add_bytes("/doc.psd", bytes.clone());
+        for index in [None, Some(0), Some(1)] {
+            let f = psd_footage("/doc.psd", index);
+            let got = pool.frame_at(&f, Tick::ZERO).unwrap();
+            let fresh = crate::layered::decode_psd("/doc.psd", &crate::layered::parse_psd("/doc.psd", &bytes).unwrap(), &f, AlphaOp::of(&f)).unwrap();
+            assert_eq!(*got, fresh, "layer {index:?}");
+        }
+        assert_eq!(lock(&pool.inner.psds).list.len(), 1, "parsed once");
+        pool.forget("/doc.psd");
+        assert!(lock(&pool.inner.psds).list.is_empty());
+        for i in 0..MAX_PSDS + 2 {
+            let path = format!("/doc{i}.psd");
+            pool.add_bytes(&path, bytes.clone());
+            pool.frame_at(&psd_footage(&path, Some(1)), Tick::ZERO).unwrap();
+        }
+        let psds = lock(&pool.inner.psds);
+        assert_eq!(psds.list.len(), MAX_PSDS);
+        assert_eq!(&*psds.list[MAX_PSDS - 1].0, format!("/doc{}.psd", MAX_PSDS + 1));
+    }
+
     #[test]
     fn frame_index_loops_and_clamps() {
         let r = FrameRate::FPS_30;
@@ -849,10 +1222,10 @@ mod tests {
     }
 
     #[test]
-    fn lru_respects_budget_and_recycles() {
+    fn lru_respects_budget() {
         let mut c = Lru::default();
-        let img = || Arc::new(Image::new(16, 16)); // 4 KiB + overhead
-        let k = |i| Key { path: "a".into(), frame: i, interp: 0, matte: [0; 3], crop: None };
+        let img = || Pixels::Float(Arc::new(Image::new(16, 16))); // 4 KiB + overhead
+        let k = |i| Key { path: "a".into(), frame: i, interp: 0, matte: [0; 3], crop: None, preview: None };
         let budget = 3 * (4096 + 64);
         for i in 0..10 {
             c.insert(k(i), img(), budget);
@@ -863,9 +1236,6 @@ mod tests {
         c.get(&k(7));
         c.insert(k(10), img(), budget);
         assert!(c.get(&k(7)).is_some() && c.get(&k(8)).is_none());
-        assert_eq!(c.spare.len(), MAX_SPARE);
-        assert_eq!(c.take_spare(256).len(), 256);
-        assert!(c.take_spare(17).is_empty());
     }
 
     /// #411: Interpret Footage ▸ Preserve RGB reads a float OpenEXR's values as the file stores

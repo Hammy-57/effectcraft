@@ -32,6 +32,11 @@ const MAGIC: &[u8; 4] = b"ECDC";
 /// Pending writes before new ones are dropped.
 #[cfg(not(target_arch = "wasm32"))]
 const QUEUE_LIMIT: usize = 64;
+/// Bytes of pending (compressed) writes before new ones are dropped: a 4K `f32` layer can
+/// compress to tens of MB, so 64 of them could hold gigabytes. A single larger write still
+/// goes when nothing else is pending.
+#[cfg(not(target_arch = "wasm32"))]
+const QUEUE_BYTES: usize = 256 << 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kind {
@@ -212,7 +217,17 @@ enum Job {
 
 struct Queue {
     jobs: std::collections::VecDeque<Job>,
+    /// Payload bytes in `jobs`.
+    bytes: usize,
     busy: bool,
+}
+
+impl Queue {
+    /// No room for another write of `bytes` (see [`QUEUE_LIMIT`], [`QUEUE_BYTES`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn full(&self, bytes: usize) -> bool {
+        self.jobs.len() >= QUEUE_LIMIT || (!self.jobs.is_empty() && self.bytes.saturating_add(bytes) > QUEUE_BYTES)
+    }
 }
 
 pub struct DiskCache {
@@ -298,7 +313,7 @@ impl DiskCache {
             evictions: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             tmp_counter: AtomicU64::new(0),
-            queue: Arc::new((Mutex::new(Queue { jobs: Default::default(), busy: false }), Condvar::new())),
+            queue: Arc::new((Mutex::new(Queue { jobs: Default::default(), bytes: 0, busy: false }), Condvar::new())),
             min_layer_ms: AtomicU64::new(30),
         });
         dc.rescan();
@@ -415,6 +430,7 @@ impl DiskCache {
         #[cfg(target_arch = "wasm32")]
         {
             q.jobs.clear();
+            q.bytes = 0;
         }
         while !q.jobs.is_empty() || q.busy {
             q = match cv.wait(q) {
@@ -472,10 +488,11 @@ impl DiskCache {
         {
             let (m, cv) = &*self.queue;
             let Ok(mut q) = m.lock() else { return };
-            if q.jobs.len() >= QUEUE_LIMIT {
+            if q.full(payload.len()) {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
                 return;
             }
+            q.bytes += payload.len();
             q.jobs.push_back(Job::Write(kind, key, payload));
             cv.notify_all();
         }
@@ -544,10 +561,25 @@ impl DiskCache {
 
     /// Queue a layer buffer for writing.
     pub fn put_layer(&self, key: u128, buf: &Buf) {
-        if self.contains(Kind::Layer, key) {
+        if self.contains(Kind::Layer, key) || self.queue_full() {
             return;
         }
         self.enqueue(Kind::Layer, key, encode_layer(buf));
+    }
+
+    /// The write queue has no room (checked before encoding a layer, which costs a pass over
+    /// its pixels and a compressed copy).
+    fn queue_full(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let full = self.queue.0.lock().map(|q| q.full(0)).unwrap_or(true);
+            if full {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+            full
+        }
+        #[cfg(target_arch = "wasm32")]
+        false
     }
 
     /// Write a layer buffer synchronously (tests).
@@ -569,6 +601,8 @@ fn writer(dc: std::sync::Weak<DiskCache>, q: Arc<(Mutex<Queue>, Condvar)>) {
             let Ok(mut g) = m.lock() else { return };
             loop {
                 if let Some(j) = g.jobs.pop_front() {
+                    let Job::Write(_, _, p) = &j;
+                    g.bytes = g.bytes.saturating_sub(p.len());
                     g.busy = true;
                     break j;
                 }
@@ -853,6 +887,24 @@ mod tests {
             *p = [v, v * 0.5, 1.0 - v, if i % 7 == 0 { 0.0 } else { 1.0 }];
         }
         Buf { img, offset: [1.5, -2.25], scale: 0.5 }
+    }
+
+    /// The write queue is bounded by bytes as well as by count; one oversized write still goes
+    /// when nothing else is pending.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn write_queue_is_bounded_by_bytes() {
+        let mut q = Queue { jobs: Default::default(), bytes: 0, busy: false };
+        assert!(!q.full(QUEUE_BYTES * 2), "empty: one big write goes");
+        q.jobs.push_back(Job::Write(Kind::Layer, 1, vec![]));
+        q.bytes = QUEUE_BYTES - 10;
+        assert!(!q.full(10));
+        assert!(q.full(11));
+        q.bytes = 0;
+        for k in 1..QUEUE_LIMIT {
+            q.jobs.push_back(Job::Write(Kind::Layer, k as u128, vec![]));
+        }
+        assert!(q.full(0), "count limit");
     }
 
     #[test]
