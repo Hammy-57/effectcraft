@@ -915,3 +915,6 @@ before.
   Content-Aware Fill, Scene Edit Detection) and `jobs.wait` start the job and reply when it ends,
   instead of blocking the UI thread, so one agent's long job no longer stalls the other agents or
   the window.
+- Renders requested over the desktop control channel (`render.frame`, `render.contactSheet`, and
+  the MCP bridge's renders) run as background tasks on a copy of the project, so the window and
+  other agents carry on; `wait: false` starts one from any client (`jobs.list`, quiet, no toast).
