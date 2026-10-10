@@ -223,12 +223,14 @@ impl Session {
         let prefs = self.autosave_prefs();
         let fail = |e: std::io::Error| EngineError::Other(format!("auto-save failed: {e}"));
         let plan = autosave::plan_in(self.file_ops(), &prefs, self.path.as_deref(), root.as_deref(), self.autosave.last_slot).map_err(fail)?;
+        // The open comps too: crash recovery reopens them like File ▸ Open does.
+        let open = self.open_comps_to_save();
         if self.autosave.background && !cfg!(target_arch = "wasm32") {
             let project = self.project.clone();
             let config = self.config.clone();
             let job = plan.clone();
             let pending = autosave::PendingWrite::spawn(plan.path.clone(), move || {
-                let json = project.to_json_compact();
+                let json = project.to_json_compact_with(open.as_ref());
                 match &config {
                     Some(c) => job.write(c.files(), json.as_bytes()),
                     None => job.write(&crate::config::StdFiles, json.as_bytes()),
@@ -237,7 +239,7 @@ impl Session {
             .map_err(fail)?;
             self.autosave.pending = Some(pending);
         } else {
-            let json = self.project.to_json_compact();
+            let json = self.project.to_json_compact_with(open.as_ref());
             plan.write(self.file_ops(), json.as_bytes()).map_err(fail)?;
         }
         let (path, slot) = (plan.path, plan.slot);
