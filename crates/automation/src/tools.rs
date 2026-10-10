@@ -80,7 +80,8 @@ const READ_ONLY: &[&str] = &[
     "get_layout",
 ];
 /// Tools that write files (or keep session-side frames) without changing the project.
-const WRITES_FILES: &[&str] = &["save_project", "render_frame", "render_preview", "screenshot", "render_snapshot", "render_compare", "analyze_audio"];
+const WRITES_FILES: &[&str] =
+    &["save_project", "render_frame", "render_preview", "render_frames", "screenshot", "render_snapshot", "render_compare", "analyze_audio"];
 
 /// Older tool names kept callable but left out of `tools/list` (`mcp --all-tools` lists them):
 /// (alias, canonical tool). The canonical one takes every argument the alias does, except
@@ -130,12 +131,28 @@ pub fn output_schema(name: &str) -> Option<Value> {
         "doc_inspect" => object(json!({"project": {"type": "object"}, "activeComp": {"type": ["object", "null"]}}), &["project", "activeComp"]),
         "render_preview" | "render_frame" => object(
             json!({
-                "comp": {"type": ["integer", "string", "null"], "description": "Composition id."},
+                "comp": {"type": ["integer", "string", "null"], "description": "Composition id (null for an `item` render)."},
+                "item": {"type": "integer", "description": "The footage or solid item rendered (with `item`)."},
+                "layer": {"type": "integer", "description": "The soloed layer (with `layer`)."},
                 "time": {"type": "number", "description": "Comp time in seconds."},
+                "frame": int,
                 "width": int, "height": int,
+                "scale": {"type": "number", "description": "Output pixels per comp pixel."},
+                "region": {"type": "array", "items": {"type": "number"}, "description": "The rendered [x, y, w, h] (with `region`)."},
+                "overlays": {"type": "array", "items": {"type": "string"}},
+                "layers": {"type": "array", "items": {"type": "object"}, "description": "Drawn layers with comp-space `bounds` and `anchor` (with bounds / anchor / motionPath overlays)."},
                 "path": {"type": "string", "description": "Where the PNG was written (with `path`)."}
             }),
             &["comp", "time", "width", "height"],
+        ),
+        "render_frames" => object(
+            json!({
+                "times": {"type": "array", "items": {"type": "number"}}, "frames": {"type": "array", "items": int},
+                "count": int, "requested": int, "cols": int, "rows": int,
+                "cell": {"type": "array", "items": int}, "width": int, "height": int,
+                "path": {"type": "string"}, "gif": {"type": "string"}
+            }),
+            &["times", "frames", "count", "cols", "rows", "cell", "width", "height"],
         ),
         "undo" | "redo" => object(json!({"steps": int, "undoStack": {"type": "array", "items": {"type": "string"}}}), &["steps", "undoStack"]),
         "history" => {
@@ -206,6 +223,18 @@ fn layer_s() -> Value {
 }
 fn path_s() -> Value {
     json!({"type": "string", "description": "Property path from get_layer: match ids joined by `/`, `#n` for the nth child, or `@uid`. E.g. `transform/position`, `transform/opacity`, `transform/scale`, `transform/rotation`, `effects/#1/blurriness`, `masks/#1/feather`, `@57`."})
+}
+fn item_s() -> Value {
+    json!({"type": ["integer", "string"], "description": "Render a project item on its own instead of a comp: a footage or solid item (id or name), at source time `time`; a comp item is the same as `comp`."})
+}
+fn solo_s() -> Value {
+    json!({"type": ["integer", "string"], "description": "Render only this layer (solo, in its place in the comp): id, \"#n\" or name."})
+}
+fn region_s() -> Value {
+    json!({"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4, "description": "[x, y, w, h] in comp pixels: render just this rectangle at full resolution (clipped to the frame; `max_side` then applies to it). For detail checks on big comps."})
+}
+fn overlays_s() -> Value {
+    json!({"type": ["boolean", "array", "string"], "items": {"type": "string", "enum": ["bounds", "anchor", "motionPath", "safeMargins", "grid", "all"]}, "description": "Draw the viewer's overlays on top: `bounds` (layer boxes tagged `#n name`, in label colours), `anchor`, `motionPath` (anchor path with keyframe squares), `safeMargins`, `grid`, or `all`; true = bounds + anchor. The reply's `layers` lists each drawn layer's comp-space `bounds` and `anchor`."})
 }
 fn value_s() -> Value {
     json!({"description": "Number for 1-D properties (50), array for vectors ([960,540]), \"#rrggbb\" or [r,g,b,a] (0-1) for colours, bool for checkboxes, string for text/menus."})
@@ -458,19 +487,46 @@ fn add_keyframe(b: &mut Backend, a: &Value) -> Result<Reply> {
     json_reply(info)
 }
 
+/// The render arguments shared by render_frame / render_preview / render_frames.
+fn render_params(a: &Value, keys: &[&str]) -> Value {
+    let entries: Vec<(&str, Option<&Value>)> = keys.iter().map(|k| (*k, get(a, k))).collect();
+    obj(&entries)
+}
+
+const VIEW_KEYS: &[&str] = &["comp", "item", "layer", "time", "transparent", "region", "overlays"];
+
 fn render_frame(b: &mut Backend, a: &Value) -> Result<Reply> {
-    let max_side = get(a, "max_side").and_then(Value::as_u64).unwrap_or(960) as u32;
-    let transparent = get(a, "transparent").and_then(Value::as_bool).unwrap_or(false);
-    let f = b.render_with(get(a, "comp"), get(a, "time").and_then(Value::as_f64), max_side, transparent)?;
-    let mut info = json!({"comp": f.comp, "time": f.time, "width": f.width, "height": f.height});
+    let mut p = render_params(a, VIEW_KEYS);
+    p["max_side"] = get(a, "max_side").cloned().unwrap_or(json!(960));
+    let (png, mut info) = b.render_view(p)?;
     if let Some(p) = get(a, "path").and_then(Value::as_str) {
-        std::fs::write(p, &f.png).map_err(|e| Error::Other(format!("cannot write {p}: {e}")))?;
+        std::fs::write(p, &png).map_err(|e| Error::Other(format!("cannot write {p}: {e}")))?;
         info["path"] = json!(p);
     }
     if get(a, "inline").and_then(Value::as_bool) == Some(false) {
         return json_reply(info);
     }
-    Ok(Reply::Image { png: f.png, info })
+    Ok(Reply::Image { png, info })
+}
+
+fn render_frames(b: &mut Backend, a: &Value) -> Result<Reply> {
+    let mut p = render_params(
+        a,
+        &["comp", "item", "layer", "times", "count", "start", "end", "cols", "max_side", "labels", "transparent", "region", "overlays", "path", "gif"],
+    );
+    p["base64"] = json!(true);
+    let mut r = b.exec("render.contactSheet", p)?;
+    let png = take_png(&mut r, "render.contactSheet")?;
+    if get(a, "inline").and_then(Value::as_bool) == Some(false) {
+        return json_reply(r);
+    }
+    Ok(Reply::Image { png, info: r })
+}
+
+/// Remove and decode the base64 `png` of a render reply.
+pub(crate) fn take_png(r: &mut Value, what: &str) -> Result<Vec<u8>> {
+    let data = r.as_object_mut().and_then(|o| o.remove("png")).ok_or_else(|| Error::App(format!("{what} returned no `png`")))?;
+    crate::base64::decode(data.as_str().unwrap_or_default()).ok_or_else(|| Error::App(format!("{what}: bad base64")))
 }
 
 fn render_snapshot(b: &mut Backend, a: &Value) -> Result<Reply> {
@@ -894,14 +950,18 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "render_frame",
-        description: "Render a composition frame (default: the active comp at the current time) and return it as a PNG image, longest side `max_side` (default 960, 0 = full size). `path` also writes the PNG to disk; `inline: false` returns only the metadata. Use it to check your work.",
+        description: "Render a composition frame (default: the active comp at the current time) and return it as a PNG image, longest side `max_side` (default 960, 0 = full size). `region` renders one rectangle at full resolution (detail checks); `layer` renders one layer solo; `item` renders a footage or solid item on its own; `overlays` draws layer bounds, anchor points, motion paths, safe margins or the grid on top and lists each layer's comp-space bounds. `path` also writes the PNG to disk; `inline: false` returns only the metadata. Use it to check your work; render_frames shows several times at once.",
         bridge_only: false,
         schema: || {
             schema(
                 json!({
                     "comp": comp_s(),
-                    "time": {"type": "number", "description": "Comp time in seconds (default: current time)."},
-                    "max_side": {"type": "integer", "description": "Longest side in pixels (default 960; 0 = full comp size)."},
+                    "item": item_s(),
+                    "layer": solo_s(),
+                    "time": {"type": "number", "description": "Comp time in seconds (default: current time); source time for `item`."},
+                    "max_side": {"type": "integer", "description": "Longest side in pixels (default 960; 0 = full size of the frame or region)."},
+                    "region": region_s(),
+                    "overlays": overlays_s(),
                     "path": {"type": "string", "description": "Also write the PNG here."},
                     "inline": {"type": "boolean", "description": "Include the image in the reply (default true)."},
                     "transparent": {"type": "boolean", "description": "Keep the frame's alpha (RGBA PNG, as an RGB + Alpha render writes it) instead of compositing over the comp's background colour."}
@@ -910,6 +970,35 @@ static TOOLS: &[ToolDef] = &[
             )
         },
         run: render_frame,
+    },
+    ToolDef {
+        name: "render_frames",
+        description: "Several frames on ONE contact-sheet PNG, each cell labelled with its time and frame number: check an animation in one call. `times` (seconds) or `count` frames (default 6, at most 64) spread evenly over `start`..`end` (default the work area). `max_side` is the sheet's longest side (default 1600); `cols` overrides the grid. Takes render_preview's `layer`, `item`, `region`, `overlays` and `transparent`. `path` also writes the sheet, `gif` also writes an animated GIF of the frames. Returns the image plus {times, frames, cols, rows, cell, width, height}.",
+        bridge_only: false,
+        schema: || {
+            schema(
+                json!({
+                    "comp": comp_s(),
+                    "item": item_s(),
+                    "layer": solo_s(),
+                    "times": {"type": "array", "items": {"type": "number"}, "description": "Comp times in seconds (at most 64)."},
+                    "count": {"type": "integer", "minimum": 1, "description": "Frames spread evenly from `start` to `end` when `times` is not given (default 6, capped at 64)."},
+                    "start": {"type": "number", "description": "First time in seconds (default: work area start)."},
+                    "end": {"type": "number", "description": "End time in seconds, exclusive (default: work area end)."},
+                    "cols": {"type": "integer", "minimum": 1, "description": "Columns (default: a grid close to 16:10)."},
+                    "max_side": {"type": "integer", "description": "Longest side of the whole sheet in pixels (default 1600, 64-8192; 0 = 8192). Cells never exceed the frame's own size."},
+                    "labels": {"type": "boolean", "description": "Label each cell with its time and frame number (default true)."},
+                    "region": region_s(),
+                    "overlays": overlays_s(),
+                    "transparent": {"type": "boolean", "description": "Keep alpha (transparent gutters) instead of compositing over the comp background."},
+                    "path": {"type": "string", "description": "Also write the sheet PNG here."},
+                    "gif": {"type": "string", "description": "Also write an animated GIF of the frames here (delays follow the times)."},
+                    "inline": {"type": "boolean", "description": "Include the image in the reply (default true)."}
+                }),
+                &[],
+            )
+        },
+        run: render_frames,
     },
     ToolDef {
         name: "get_layout",
@@ -1191,14 +1280,18 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "render_preview",
-        description: "Render a composition frame (default: the active comp at the current time, in comp seconds) and return it as a PNG image, longest side `max_side` (default 960, 0 = full size). `path` also writes the PNG to disk; `inline: false` returns only the metadata. Use it to check your work.",
+        description: "Render a composition frame (default: the active comp at the current time, in comp seconds) and return it as a PNG image, longest side `max_side` (default 960, 0 = full size). `region` renders one rectangle at full resolution (detail checks); `layer` renders one layer solo; `item` renders a footage or solid item on its own; `overlays` draws layer bounds, anchor points, motion paths, safe margins or the grid on top and lists each layer's comp-space bounds. `path` also writes the PNG to disk; `inline: false` returns only the metadata. Use it to check your work; render_frames shows several times at once.",
         bridge_only: false,
         schema: || {
             schema(
                 json!({
                     "comp": comp_s(),
-                    "time": {"type": "number", "description": "Comp time in seconds (default: current time)."},
-                    "max_side": {"type": "integer", "description": "Longest side in pixels (default 960; 0 = full comp size)."},
+                    "item": item_s(),
+                    "layer": solo_s(),
+                    "time": {"type": "number", "description": "Comp time in seconds (default: current time); source time for `item`."},
+                    "max_side": {"type": "integer", "description": "Longest side in pixels (default 960; 0 = full size of the frame or region)."},
+                    "region": region_s(),
+                    "overlays": overlays_s(),
                     "path": {"type": "string", "description": "Also write the PNG here."},
                     "inline": {"type": "boolean", "description": "Include the image in the reply (default true)."},
                     "transparent": {"type": "boolean", "description": "Keep the frame's alpha (RGBA PNG, as an RGB + Alpha render writes it) instead of compositing over the comp's background colour."}

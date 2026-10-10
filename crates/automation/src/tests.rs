@@ -694,7 +694,8 @@ fn agents_doc_tools_table_is_current() {
     let mut missing = vec![];
     for t in crate::tools::catalogue() {
         // `name` (no arguments) or `name {a, b?, …}`.
-        let Some(at) = table.find(&format!("`{}", t.name)).filter(|i| {
+        // (the first match may be a longer name: `render_frame` in `render_frames`)
+        let Some(at) = table.match_indices(&format!("`{}", t.name)).map(|(i, _)| i).find(|i| {
             let rest = &table[i + 1 + t.name.len()..];
             rest.starts_with('`') || rest.starts_with(" {")
         }) else {
@@ -1109,6 +1110,120 @@ fn command_tools_accept_id_as_an_alias() {
     call_json(&mut s, "execute_command", json!({"id": "comp.new", "params": {"name": "Alias", "width": 64, "height": 36}}));
     let (_, err) = call(&mut s, "execute_command", json!({}));
     assert!(err, "neither key is an error");
+}
+
+/// A headless server with a 320×180 comp, a red 100×100 solid at the centre ("Red") keyed to
+/// move, and a green 40×40 solid at (40, 40) ("Green").
+fn render_server() -> McpServer {
+    let mut s = server();
+    call_json(
+        &mut s,
+        "execute_command",
+        json!({"command": "comp.new", "params": {"name": "Main", "width": 320, "height": 180, "duration": 4, "frameRate": 30}}),
+    );
+    call_json(&mut s, "execute_command", json!({"command": "layer.newSolid", "params": {"color": "#ff0000", "width": 100, "height": 100, "name": "Red"}}));
+    call_json(&mut s, "execute_command", json!({"command": "layer.newSolid", "params": {"color": "#00ff00", "width": 40, "height": 40, "name": "Green"}}));
+    call_json(&mut s, "set_property", json!({"layer": "Green", "path": "transform/position", "value": [40, 40]}));
+    call_json(
+        &mut s,
+        "add_keyframe",
+        json!({"layer": "Red", "path": "transform/position", "keys": [{"time": 0, "value": [60, 90]}, {"time": 3, "value": [260, 90]}]}),
+    );
+    s
+}
+
+/// (png size, info) of an image reply; panics if the tool failed.
+fn call_image(s: &mut McpServer, name: &str, args: Value) -> ((u32, u32), Value) {
+    let (c, err) = call(s, name, args.clone());
+    assert!(!err, "{name} {args}: {c:?}");
+    assert_eq!(c[0]["type"], "image");
+    let png = base64::decode(c[0]["data"].as_str().unwrap()).unwrap();
+    (png_size(&png).unwrap(), serde_json::from_str(c[1]["text"].as_str().unwrap()).unwrap())
+}
+
+fn tool_error(s: &mut McpServer, name: &str, args: Value) -> String {
+    let (c, err) = call(s, name, args.clone());
+    assert!(err, "{name} {args} should fail: {c:?}");
+    c[0]["text"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn render_frame_region_solo_item_and_overlays() {
+    let mut s = render_server();
+    // Region at full resolution; max_side applies to the crop.
+    let (size, info) = call_image(&mut s, "render_frame", json!({"region": [100, 60, 80, 40], "max_side": 0}));
+    assert_eq!(size, (80, 40));
+    assert_eq!(info["region"], json!([100.0, 60.0, 80.0, 40.0]));
+    let (size, _) = call_image(&mut s, "render_preview", json!({"region": [0, 0, 160, 90], "max_side": 40}));
+    assert_eq!(size, (40, 23));
+    // Solo layer and a solid item on its own.
+    let (_, info) = call_image(&mut s, "render_frame", json!({"layer": "Green", "max_side": 64}));
+    assert!(info["layer"].is_u64());
+    let proj = call_json(&mut s, "get_project", json!({}));
+    let solid = proj["items"].as_array().unwrap().iter().find(|i| i["name"].as_str().is_some_and(|n| n.contains("Red"))).unwrap()["id"].clone();
+    let (size, info) = call_image(&mut s, "render_frame", json!({"item": solid, "max_side": 0}));
+    assert_eq!(size, (100, 100));
+    assert_eq!(info["item"], solid);
+    // Overlays report each drawn layer's comp-space bounds.
+    let (_, info) = call_image(&mut s, "render_frame", json!({"time": 1.5, "overlays": true, "max_side": 320}));
+    let red = info["layers"].as_array().unwrap().iter().find(|l| l["name"] == "Red").unwrap().clone();
+    assert_eq!(red["bounds"], json!([110.0, 40.0, 100.0, 100.0]));
+    let (_, info) = call_image(&mut s, "render_preview", json!({"overlays": ["motionPath", "safeMargins", "grid"]}));
+    assert_eq!(info["overlays"], json!(["motionPath", "safeMargins", "grid"]));
+    // Bad input is an error, never a crash; the session keeps serving.
+    assert!(tool_error(&mut s, "render_frame", json!({"region": [500, 500, 10, 10]})).contains("outside"));
+    assert!(tool_error(&mut s, "render_frame", json!({"region": [0, 0, 0, 10]})).contains("positive"));
+    assert!(tool_error(&mut s, "render_frame", json!({"region": [0, 0]})).contains("region"));
+    assert!(tool_error(&mut s, "render_frame", json!({"layer": "Nope"})).contains("no layer"));
+    assert!(tool_error(&mut s, "render_frame", json!({"item": 9999})).contains("no project item"));
+    assert!(tool_error(&mut s, "render_frame", json!({"overlays": ["sparkles"]})).contains("unknown overlay"));
+    assert!(tool_error(&mut s, "render_frame", json!({"max_side": -5})).contains("max_side"));
+    let (size, _) = call_image(&mut s, "render_frame", json!({"max_side": u64::MAX}));
+    assert_eq!(size, (320, 180), "a huge max_side is clamped to the comp size");
+}
+
+#[test]
+fn render_frames_contact_sheet() {
+    let mut s = render_server();
+    let (size, info) = call_image(&mut s, "render_frames", json!({"count": 4, "max_side": 800}));
+    assert_eq!(info["frames"], json!([0, 40, 79, 119]));
+    assert_eq!(size, (info["width"].as_u64().unwrap() as u32, info["height"].as_u64().unwrap() as u32));
+    assert!(size.0 <= 800 && size.1 <= 800);
+    assert!(info.get("png").is_none(), "the PNG travels as the image, not in the JSON");
+    let (_, info) = call_image(&mut s, "render_frames", json!({"times": [0, 1, 2], "layer": "Red", "overlays": ["motionPath"], "cols": 3, "labels": false}));
+    assert_eq!((info["cols"].as_u64(), info["rows"].as_u64()), (Some(3), Some(1)));
+    // Huge counts are capped, not trusted.
+    let (_, info) = call_image(&mut s, "render_frames", json!({"count": 1_000_000_000u64, "max_side": 256}));
+    assert_eq!(info["count"], 64);
+    assert_eq!(info["requested"], 1_000_000_000u64);
+    assert!(tool_error(&mut s, "render_frames", json!({"count": 0})).contains("at least 1"));
+    assert!(tool_error(&mut s, "render_frames", json!({"times": []})).contains("empty"));
+    assert!(tool_error(&mut s, "render_frames", json!({"start": 3, "end": 1})).contains("before"));
+    assert!(tool_error(&mut s, "render_frames", json!({"region": [400, 0, 10, 10]})).contains("outside"));
+    // Files: the sheet and an animated GIF.
+    let dir = std::env::temp_dir().join(format!("ec-mcp-frames-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (png, gif) = (dir.join("sheet.png"), dir.join("anim.gif"));
+    let info =
+        call_json(&mut s, "render_frames", json!({"count": 3, "max_side": 300, "path": png.to_string_lossy(), "gif": gif.to_string_lossy(), "inline": false}));
+    assert_eq!(info["gif"], json!(gif.to_string_lossy()));
+    assert!(std::fs::read(&png).unwrap().starts_with(b"\x89PNG"));
+    assert!(std::fs::read(&gif).unwrap().starts_with(b"GIF89a"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn bridge_render_frames_and_render_params() {
+    let port = fake_app();
+    let mut s = McpServer::new(Backend::bridge(&port.to_string()).unwrap());
+    call_json(&mut s, "execute_command", json!({"command": "comp.new", "params": {"name": "B", "width": 64, "height": 32}}));
+    // The contact sheet runs the engine command in the app.
+    let (size, info) = call_image(&mut s, "render_frames", json!({"count": 2, "max_side": 200}));
+    assert_eq!(info["count"], 2);
+    assert_eq!(size.0 as u64, info["width"].as_u64().unwrap());
+    // render_frame forwards the new arguments to the app's render.frame (the fake answers a 4×2 PNG).
+    let (size, _) = call_image(&mut s, "render_frame", json!({"region": [0, 0, 8, 8], "overlays": true}));
+    assert_eq!(size, (4, 2));
 }
 
 /// `get_layout`: comp-space geometry of layers, headless and bridged.
