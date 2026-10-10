@@ -13,7 +13,7 @@ use effectcraft_engine::project::{Item, ItemId, ItemKind};
 use egui::{Align2, Color32, Rect, Sense, Stroke, pos2, vec2};
 use serde_json::json;
 
-use crate::icons::{self, Icon};
+use crate::icons::{self, Icon, SourceIcon};
 use crate::panels::DragPayload;
 use crate::theme::Tokens;
 use crate::{EffectcraftApp, widgets};
@@ -21,18 +21,21 @@ use crate::{EffectcraftApp, widgets};
 /// Item row height (After Effects' Project panel rows are compact, about 19 pt).
 const ROW_H: f32 = 19.0;
 
-fn item_icon(it: &Item) -> Icon {
-    match &it.kind {
+/// The icon After Effects shows for a project item: folder, comp, footage / still / audio /
+/// 3D model artwork, or for solids a swatch of the solid's colour.
+pub fn item_icon(it: &Item) -> SourceIcon {
+    use effectcraft_engine::project::FootageKind;
+    SourceIcon::Glyph(match &it.kind {
         ItemKind::Folder => Icon::Folder,
         ItemKind::Comp(_) => Icon::Comp,
-        ItemKind::Solid(_) => Icon::Solid,
+        ItemKind::Solid(s) => return SourceIcon::swatch(s.color),
         ItemKind::Footage(f) => match f.kind {
-            effectcraft_engine::project::FootageKind::Still | effectcraft_engine::project::FootageKind::Sequence => Icon::Image,
-            effectcraft_engine::project::FootageKind::Audio => Icon::Audio,
-            effectcraft_engine::project::FootageKind::Model => Icon::Cube,
+            FootageKind::Still | FootageKind::Sequence => Icon::Image,
+            FootageKind::Audio => Icon::Audio,
+            FootageKind::Model => Icon::Model,
             _ => Icon::Footage,
         },
-    }
+    })
 }
 
 /// Duration as AE prints it in the Project panel header: `0:00:10:00` (h:mm:ss:ff).
@@ -229,7 +232,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     let [w, h] = tex.size();
                     p.image(tex.id(), fit(thumb, w as f32, h as f32), Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
                 }
-                None => icons::paint(&p, Rect::from_center_size(thumb.center(), vec2(24.0, 24.0)), item_icon(&it), t.text_dim),
+                None => icons::paint_source(&p, Rect::from_center_size(thumb.center(), vec2(24.0, 24.0)), item_icon(&it), t.text_dim),
             },
         }
         app.auto.add("project.thumbnail", thumb, &it.name);
@@ -422,7 +425,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             }
             app.auto.add(&format!("project.item.{}.twirl", id.0), tw, &it.name);
         }
-        icons::paint(&lp, Rect::from_center_size(pos2(x0 + 18.0, r.center().y), vec2(14.0, 14.0)), item_icon(it), t.text_dim);
+        icons::paint_source(&lp, Rect::from_center_size(pos2(x0 + 18.0, r.center().y), vec2(14.0, 14.0)), item_icon(it), t.text_dim);
         // Proxy indicator: filled = the proxy is used, hollow = set but off. Click to switch.
         if let Some(px) = it.proxy.as_ref() {
             let pr = Rect::from_center_size(pos2(x0 + 4.0, r.center().y), vec2(9.0, 9.0));
