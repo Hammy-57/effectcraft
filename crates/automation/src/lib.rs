@@ -22,6 +22,7 @@ pub mod backend;
 pub mod base64;
 pub mod bridge;
 pub mod confine;
+pub mod host_server;
 mod long_job;
 mod notify;
 mod prompts;

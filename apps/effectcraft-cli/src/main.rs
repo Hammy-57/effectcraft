@@ -143,6 +143,11 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
       [--automation-read-root DIR] [--automation-write-root DIR]
                                            confine the agent's file access: reads under a read or write root,
                                            writes under a write root (each repeatable); scripts are refused
+  serve [F.ecproj | --demo] [--control PORT] [--gpu]
+                                           a windowless host: one project that several agents work on at
+                                           once over the control channel (join with mcp --bridge PORT or
+                                           the MCP hosts tool); prints the port; checkpoints unsaved work;
+                                           in the host list until it stops (host.release saves and stops it)
 options: --project F.ecproj | --demo | --empty   --save | --save-as F   --bridge PORT   --json   --gpu
 <comp>: id or name, '-' = active comp; <layer>: id, '#n' or name; <value>: JSON or bare string";
 
@@ -175,6 +180,8 @@ const VALUED: &[&str] = &[
     "--amplify",
     "--ui-size",
     "--ui-scale",
+    // serve
+    "--control",
     // render
     "--template",
     "--values",
@@ -819,6 +826,31 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
                 Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => return Err(e.to_string().into()),
                 _ => {}
             }
+        }
+        "serve" => {
+            let port = match args.opt("--control") {
+                Some(p) => p.parse::<u16>().map_err(|_| Failure::Usage(format!("--control: `{p}` is not a port")))?,
+                None => 0,
+            };
+            let (project, demo, gpu) = (args.project.clone(), args.flag("--demo"), args.flag("--gpu"));
+            let make = Box::new(move || -> Result<effectcraft_engine::Session, String> {
+                let mut s = effectcraft_host::session();
+                if gpu {
+                    let g = effectcraft_gpu::Gpu::try_headless().map_err(|e| format!("--gpu: no usable GPU adapter ({e})"))?;
+                    s.accel = Some(std::sync::Arc::new(g));
+                }
+                if let Some(p) = &project {
+                    s.execute("file.open", json!({"path": p})).map_err(|e| e.to_string())?;
+                } else if demo {
+                    s.execute("file.openDemoProject", json!({})).map_err(|e| e.to_string())?;
+                }
+                Ok(s)
+            });
+            let config = effectcraft_automation::host_server::HostConfig { port, config_dir: effectcraft_host::config_dir() };
+            effectcraft_automation::host_server::serve(config, make, |port| {
+                println!("EffectCraft host listening on 127.0.0.1:{port} (agents: effectcraft-cli mcp --bridge {port})");
+            })
+            .map_err(|e| Failure::Error(format!("serve: {e}")))?;
         }
         other => return usage_err(&format!("unknown subcommand `{other}`")),
     }

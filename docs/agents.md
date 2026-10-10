@@ -247,6 +247,14 @@ project>}` tool, or start with `--bridge <port>`; you keep your own `client`) in
 copy: `file.open` of a project another host has open succeeds but
 warns, and its reply lists them in `openElsewhere`.
 
+With the desktop app closed, a **windowless host** keeps one project in memory for several agents:
+`effectcraft-cli serve Project.ecproj [--control PORT]` prints its port; agents join it like the app
+(`effectcraft-cli mcp --bridge PORT`, or the MCP `hosts {join}` tool) and work on their own comps with
+their own `client` and `comp.claim`. Commands that wait for a job (renders, analyses, `jobs.wait`)
+reply when it ends without holding up the other agents; unsaved work is checkpointed (big projects
+at most every 30 s); `host.release {path?}` saves the project and stops the host, so the desktop app
+can open it. `ui.*` methods need the app.
+
 Two copies of one file overwrite each other when saved, so saving is guarded: `file.save` /
 `file.saveAs` over a file that changed on disk since this process opened or saved it (another
 app, an agent's CLI, a script) is refused, naming the ways out: save under a new name
