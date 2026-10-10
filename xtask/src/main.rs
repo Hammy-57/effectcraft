@@ -11,10 +11,13 @@
 //! - `ico <out.ico> <in.png>…`: pack PNGs into a Windows `.ico` (used by `packaging/icons.sh`).
 //! - `fmt [--check]`: rustfmt every source file, including the modules `build.rs` declares
 //!   (`cargo fmt` doesn't see those; see `effectcraft-buildgen`).
-//! - `ci`: fmt check, clippy -D warnings, tests, layers, assets, wasm.
+//! - `parity [--check] [--out FILE]`: check the parts of `docs/parity/` and assemble them into
+//!   one page (default `<target>/parity.md`).
+//! - `ci`: fmt check, clippy -D warnings, tests, layers, assets, parity, wasm.
 
 mod fmt;
 mod ico;
+mod parity;
 mod version;
 
 use std::process::{Command, ExitCode};
@@ -413,6 +416,7 @@ fn ci() -> Result<(), String> {
     run(Command::new(cargo).args(["test", "--workspace", "--release"]))?;
     layers()?;
     assets()?;
+    parity::run(&["--check".into()])?;
     wasm()
 }
 
@@ -423,6 +427,7 @@ fn main() -> ExitCode {
         "wasm" => wasm(),
         "assets" => assets(),
         "ci" => ci(),
+        "parity" => parity::run(&std::env::args().skip(2).collect::<Vec<_>>()),
         "fmt" => fmt::run(&std::env::args().skip(2).collect::<Vec<_>>()),
         "web" => web(&std::env::args().skip(2).collect::<Vec<_>>()),
         "ico" => {
@@ -433,7 +438,7 @@ fn main() -> ExitCode {
             let rest: Vec<String> = std::env::args().skip(2).collect();
             version::run(&root(), &rest.iter().map(String::as_str).collect::<Vec<_>>())
         }
-        _ => Err("usage: cargo xtask <layers|assets|wasm|fmt [--check]|web [--dev] [--serve PORT]|ico OUT.ico IN.png…|version [set X.Y.Z]|ci>".into()),
+        _ => Err("usage: cargo xtask <layers|assets|wasm|fmt [--check]|parity [--check] [--out FILE]|web [--dev] [--serve PORT]|ico OUT.ico IN.png…|version [set X.Y.Z]|ci>".into()),
     };
     match r {
         Ok(()) => ExitCode::SUCCESS,
