@@ -26,6 +26,7 @@ pub mod footage_panel;
 pub(crate) mod frame_export;
 mod frontend;
 mod help;
+mod import_project;
 mod key_labels;
 mod key_transform;
 mod keys_more;
@@ -173,6 +174,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(file_more::specs());
         v.extend(lottie::specs());
         v.extend(aep::specs());
+        v.extend(import_project::specs());
         v.extend(timeline::specs());
         v.extend(comp_more::specs());
         v.extend(frame_export::specs());

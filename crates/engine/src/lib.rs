@@ -1043,6 +1043,8 @@ mod tests_3d;
 #[cfg(test)]
 mod tests_aep;
 #[cfg(test)]
+mod tests_import_project;
+#[cfg(test)]
 mod tests_anim_tools;
 #[cfg(test)]
 mod tests_camera_track;
