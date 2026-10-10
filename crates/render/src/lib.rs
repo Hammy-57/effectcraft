@@ -8,19 +8,12 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
-pub mod audio;
-pub mod auto;
-pub mod cache;
-pub mod color;
-pub mod disk_cache;
-use color::Region;
-pub mod eval;
-pub mod masks;
-pub mod passes;
+// Every `src/*.rs` file is a module (`tests*.rs` under `#[cfg(test)]`), declared by build.rs (docs/architecture.md,
+// "Self-registering modules"); declare one here only for another visibility or a submodule folder.
+include!(concat!(env!("OUT_DIR"), "/modules.rs"));
 pub mod shapes;
-pub mod styles;
 pub mod text;
-pub mod three_d;
+use color::Region;
 
 use std::sync::Arc;
 
@@ -2048,17 +2041,6 @@ pub fn render_frame(project: &Project, comp: ItemId, t: Tick, scale: f64) -> Ima
     Renderer::new(project, &NoFootage, RenderOpts { scale, ..Default::default() }).comp_frame(comp, t)
 }
 
-#[cfg(test)]
-mod tests;
-#[cfg(test)]
-mod tests_auto;
-#[cfg(test)]
-mod tests_remap;
-#[cfg(test)]
-mod tests_roi;
-#[cfg(test)]
-mod tests_styles;
-
 /// Layer-space bounds `[x0, y0, x1, y1]` of a layer's content at the context time (source size
 /// for solids/footage/precomps, glyph bounds for text, painted bounds for shapes). Used for viewer
 /// handles and hit testing.
@@ -2082,21 +2064,3 @@ pub fn content_bounds(ctx: &EvalCtx, layer: &effectcraft_project::Layer) -> Opti
 pub fn kurbo_path(sp: &effectcraft_keyframe::ShapePath) -> kurbo::BezPath {
     effectcraft_path::to_kurbo(sp)
 }
-#[cfg(test)]
-mod tests_audio_fx;
-#[cfg(test)]
-mod tests_aux;
-#[cfg(test)]
-mod tests_collapse;
-#[cfg(test)]
-mod tests_color;
-#[cfg(test)]
-mod tests_frame_blend;
-#[cfg(test)]
-mod tests_mask_blur;
-#[cfg(test)]
-mod tests_nested;
-#[cfg(test)]
-mod tests_paint;
-#[cfg(test)]
-mod tests_time;

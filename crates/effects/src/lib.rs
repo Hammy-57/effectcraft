@@ -8,60 +8,26 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+// Every `src/*.rs` file is a module, declared by build.rs, and each one with a top-level
+// `fn specs()` is in the registry: adding effects is adding a file (docs/architecture.md,
+// "Self-registering modules"). The modules below need `pub` or have a submodule folder.
+include!(concat!(env!("OUT_DIR"), "/modules.rs"));
 pub mod audio_fx;
-mod blur2;
-mod blur3;
 pub mod camera_tracker;
-mod card3d;
 pub mod catalog;
-mod channel;
-mod channel2;
-mod channel3d;
-mod color2;
-mod color3;
-mod color_fx;
 pub mod controls;
-mod distort;
-mod distort2;
-mod distort3;
 pub mod distort4;
 pub mod face_track;
-mod generate;
-mod generate2;
-mod generate3;
-mod keying;
-mod keying2;
 pub mod keylight;
-mod matte;
 pub mod migrate;
-mod misc;
 pub mod mocha_shape;
-mod noise;
-mod noise2;
-mod noise3;
-mod obsolete;
-mod ocio;
 pub mod ocio_config;
 pub mod paint;
-mod perspective;
-mod perspective2;
 pub mod plugin;
 pub mod psim;
 pub mod puppet;
 pub mod roto;
-mod sim;
-mod sim2;
-mod sim3;
-mod stylize2;
-mod stylize3;
-mod textfx;
-mod time_fx;
-mod transition;
-mod transition2;
 pub mod util;
-mod utility;
-mod utility2;
-mod vr;
 pub mod warp_stab;
 
 use std::collections::HashMap;
@@ -418,55 +384,8 @@ pub(crate) fn col(r: f64, g: f64, b: f64) -> Value {
 pub fn registry() -> &'static [EffectSpec] {
     static R: OnceLock<Vec<EffectSpec>> = OnceLock::new();
     R.get_or_init(|| {
-        let mut v = Vec::new();
-        v.extend(misc::specs());
-        v.extend(color_fx::specs());
-        v.extend(generate::specs());
-        v.extend(distort::specs());
-        v.extend(controls::specs());
-        v.extend(keying::specs());
-        v.extend(matte::specs());
-        v.extend(channel::specs());
-        v.extend(blur2::specs());
-        v.extend(color2::specs());
-        v.extend(stylize2::specs());
-        v.extend(noise::specs());
-        v.extend(generate2::specs());
-        v.extend(distort2::specs());
-        v.extend(perspective::specs());
-        v.extend(transition::specs());
-        v.extend(utility::specs());
-        v.extend(sim::specs());
-        v.extend(sim2::specs());
-        v.extend(distort3::specs());
-        v.extend(perspective2::specs());
-        v.extend(utility2::specs());
-        v.extend(generate3::specs());
-        v.extend(textfx::specs());
-        v.extend(stylize3::specs());
-        v.extend(transition2::specs());
-        v.extend(channel2::specs());
-        v.extend(keying2::specs());
-        v.extend(noise2::specs());
-        v.extend(noise3::specs());
-        v.extend(color3::specs());
-        v.extend(obsolete::specs());
-        v.extend(ocio::specs());
-        v.extend(vr::specs());
-        v.extend(blur3::specs());
-        v.extend(distort4::specs());
-        v.extend(keylight::specs());
-        v.extend(mocha_shape::specs());
-        v.extend(sim3::specs());
-        v.extend(channel3d::specs());
-        v.extend(time_fx::specs());
-        v.extend(audio_fx::specs());
-        v.extend(paint::specs());
-        v.extend(puppet::specs());
-        v.extend(warp_stab::specs());
-        v.extend(camera_tracker::specs());
-        v.extend(face_track::specs());
-        v.extend(roto::specs());
+        // Module order doesn't matter: the list is sorted below.
+        let mut v: Vec<EffectSpec> = EFFECT_MODULES.iter().flat_map(|(_, specs)| specs()).collect();
         v.sort_by(|a, b| a.category.cmp(b.category).then(a.name.cmp(b.name)));
         for s in v.iter_mut() {
             if GPU_EFFECTS.contains(&s.id) {

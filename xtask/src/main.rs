@@ -9,8 +9,11 @@
 //! - `assets`: every asset file (image, icon, font, LUT, audio, video…) has a complete
 //!   `<file>.attribution` sidecar and an entry in `ATTRIBUTION.md` (AGENTS.md §1).
 //! - `ico <out.ico> <in.png>…`: pack PNGs into a Windows `.ico` (used by `packaging/icons.sh`).
+//! - `fmt [--check]`: rustfmt every source file, including the modules `build.rs` declares
+//!   (`cargo fmt` doesn't see those; see `effectcraft-buildgen`).
 //! - `ci`: fmt check, clippy -D warnings, tests, layers, assets, wasm.
 
+mod fmt;
 mod ico;
 mod version;
 
@@ -25,6 +28,7 @@ const LAYERS: &[(&str, u8)] = &[
     ("color", 0),
     ("vp9enc", 0),
     ("testkit", 0),
+    ("buildgen", 0),
     ("opusenc", 0),
     ("hevcenc", 0),
     ("av1enc", 0),
@@ -404,7 +408,7 @@ fn serve_dir(dir: &std::path::Path, port: u16) -> Result<(), String> {
 
 fn ci() -> Result<(), String> {
     let cargo = env!("CARGO");
-    run(Command::new(cargo).args(["fmt", "--check"]))?;
+    fmt::run(&["--check".into()])?;
     run(Command::new(cargo).args(["clippy", "--workspace", "--all-targets", "--release", "--", "-D", "warnings"]))?;
     run(Command::new(cargo).args(["test", "--workspace", "--release"]))?;
     layers()?;
@@ -419,6 +423,7 @@ fn main() -> ExitCode {
         "wasm" => wasm(),
         "assets" => assets(),
         "ci" => ci(),
+        "fmt" => fmt::run(&std::env::args().skip(2).collect::<Vec<_>>()),
         "web" => web(&std::env::args().skip(2).collect::<Vec<_>>()),
         "ico" => {
             let rest: Vec<String> = std::env::args().skip(2).collect();
@@ -428,7 +433,7 @@ fn main() -> ExitCode {
             let rest: Vec<String> = std::env::args().skip(2).collect();
             version::run(&root(), &rest.iter().map(String::as_str).collect::<Vec<_>>())
         }
-        _ => Err("usage: cargo xtask <layers|assets|wasm|web [--dev] [--serve PORT]|ico OUT.ico IN.png…|version [set X.Y.Z]|ci>".into()),
+        _ => Err("usage: cargo xtask <layers|assets|wasm|fmt [--check]|web [--dev] [--serve PORT]|ico OUT.ico IN.png…|version [set X.Y.Z]|ci>".into()),
     };
     match r {
         Ok(()) => ExitCode::SUCCESS,

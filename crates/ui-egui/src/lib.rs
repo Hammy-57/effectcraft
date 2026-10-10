@@ -7,23 +7,9 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
-pub mod audio;
-pub mod automation;
-pub mod bench;
-pub mod control;
-pub mod dock;
-pub mod dock_ui;
-pub mod frames;
-pub mod header;
-pub mod i18n;
-pub mod icons;
-pub mod menus;
-pub mod native_menu;
-pub mod panels;
-pub mod prefs_live;
-pub mod state;
-pub mod theme;
-pub mod widgets;
+// Every `src/*.rs` file is a module, declared by build.rs (docs/architecture.md,
+// "Self-registering modules"); declare one here only for another visibility or a submodule folder.
+include!(concat!(env!("OUT_DIR"), "/modules.rs"));
 
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
