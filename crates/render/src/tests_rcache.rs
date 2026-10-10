@@ -365,3 +365,39 @@ fn a_precomp_used_twice_in_a_frame_renders_its_content_once() {
     assert_same(&img, &frame(&p, oid, 0.5, &NoFootage, None, None), "t=0.5");
     assert_eq!((cache.inserts(), cache.admission().0), (3, 3));
 }
+
+/// An animated precomp's buffer has a new key every frame: played forward it isn't kept (only
+/// its static nested layer is), rendered again after its frame (scrubbing back) it is admitted,
+/// and the frame after that hits it. Pixels match an uncached render throughout.
+#[test]
+fn animated_precomp_buffers_are_kept_only_when_rendered_again() {
+    let (mut p, oid, iid) = precomp_scene();
+    moving(&mut p.comp_mut(iid).unwrap().layers[0]);
+    let cache = LayerCache::default();
+    let check = |t: f64, inserts: u64, entries: usize| {
+        let img = frame(&p, oid, t, &NoFootage, None, Some(&cache));
+        assert_same(&img, &frame(&p, oid, t, &NoFootage, None, None), &format!("t={t}"));
+        assert_eq!((cache.inserts(), cache.stats().entries), (inserts, entries), "t={t}");
+    };
+    // The nested solid only (on probation).
+    check(0.0, 1, 1);
+    // Rendered again after its frame: the solid hits (admitted), the precomp's buffer is admitted.
+    check(0.0, 2, 2);
+    assert_eq!(cache.admission().0, 2);
+    // A hit: nothing rendered.
+    check(0.0, 2, 2);
+}
+
+/// The probation window follows the frame size (two frames' worth, at least 16 MB, at most
+/// 1/16 of the budget and 128 MB).
+#[test]
+fn probation_window_follows_the_frame() {
+    let cache = LayerCache::default();
+    assert_eq!(cache.window(), 64 << 20, "before any frame: the budget's");
+    drop(cache.begin_frame(1280, 720));
+    assert_eq!(cache.window(), 1280 * 720 * 16 * 2, "720p");
+    drop(cache.begin_frame(3840, 2160));
+    assert_eq!(cache.window(), 64 << 20, "4K: capped by the budget");
+    drop(cache.begin_frame(100, 80));
+    assert_eq!(cache.window(), 16 << 20, "small frames: the floor");
+}

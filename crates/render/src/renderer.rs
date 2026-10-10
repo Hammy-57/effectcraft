@@ -202,6 +202,7 @@ impl<'a> Renderer<'a> {
     /// Render a composition at comp time `t` (transparent background, comp size × scale).
     /// Top-level frames go to the GPU when [`Self::active_accel`] is set and handles them.
     pub fn comp_frame(&self, comp_id: ItemId, t: Tick) -> Image {
+        let _frame = self.begin_frame(comp_id);
         // Classic 3D runs composite on the GPU too (M12.7), so Auto sends 3D comps there as well;
         // Auto renders each comp on whichever compositor measured faster ([`AutoPick`]).
         if self.depth == 0
@@ -239,8 +240,20 @@ impl<'a> Renderer<'a> {
         Some((a.auto_pick()?, AutoKey::new(comp, self.opts.scale, display)))
     }
 
+    /// Tell the layer cache a top-level frame starts (it lasts while the mark lives, see
+    /// [`crate::cache::LayerCache::begin_frame`]).
+    fn begin_frame(&self, comp_id: ItemId) -> Option<crate::cache::FrameMark<'a>> {
+        if self.depth != 0 {
+            return None;
+        }
+        let (c, comp) = (self.cache?, self.project.comp(comp_id)?);
+        let s = self.opts.scale;
+        Some(c.begin_frame((comp.width as f64 * s).round() as u32, (comp.height as f64 * s).round() as u32))
+    }
+
     /// [`Self::comp_frame`] on the CPU compositor only.
     pub fn comp_frame_cpu(&self, comp_id: ItemId, t: Tick) -> Image {
+        let _frame = self.begin_frame(comp_id);
         let Some(comp) = self.project.comp(comp_id) else { return Image::new(1, 1) };
         let s = self.opts.scale;
         let w = ((comp.width as f64 * s).round() as u32).max(1);
