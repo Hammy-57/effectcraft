@@ -25,7 +25,7 @@
 //!     on a large generated project (open, save, auto-save, undo/redo, timeline, Project panel)
 //! effectcraft-cli script FILE.jsx [F.ecproj] | --eval CODE    run an After Effects-style script
 //! effectcraft-cli replay SCRIPT.jsonl [--keep-going]        replay a repro script (docs/agents.md)
-//! effectcraft-cli mcp [--autosave | --bridge PORT | --ui]     MCP server on stdio
+//! effectcraft-cli mcp [--autosave | --bridge PORT | --ui] [--all-tools]  MCP server on stdio
 //! effectcraft-cli figma-bridge [--port 7789] [--control 9877] local endpoint for the Figma plug-in
 //!
 //! Project:  --project F.ecproj (or a positional *.ecproj) | --demo | --empty   (default: demo; mcp: empty)
@@ -129,7 +129,8 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
                                            fails, an expectation is not met or a command panics
   mcp [--autosave | --bridge PORT | --ui]  MCP server (JSON-RPC over stdio); --autosave preserves unsaved headless work;
                                            --ui [--ui-size 1680x1020] [--ui-scale 2] runs the app offscreen
-                                           (no window) so screenshot and the ui_* tools work
+                                           (no window) so screenshot and the ui_* tools work;
+                                           --all-tools also lists the older tool aliases
   figma-bridge [--port 7789] [--control 9877] [--code CODE]
                                            local endpoint for the EffectCraft Figma plug-in: imports what it
                                            sends into the running app (file.importFigma); prints the pairing code
@@ -207,6 +208,7 @@ const FLAGS: &[&str] = &[
     "--small",
     "--adv3d",
     "--autosave",
+    "--all-tools",
     "--ui",
     "--keep-going",
 ];
@@ -545,6 +547,9 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
     if args.flag("--autosave") && cmd != "mcp" {
         return usage_err("--autosave is only supported by mcp");
     }
+    if args.flag("--all-tools") && cmd != "mcp" {
+        return usage_err("--all-tools is only supported by mcp");
+    }
     if cmd != "mcp" {
         if let Some(o) = ["--ui", "--ui-size", "--ui-scale"].into_iter().find(|o| args.opts.iter().any(|(k, _)| k == o)) {
             return usage_err(&format!("{o} is only supported by mcp"));
@@ -739,7 +744,7 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
                 return usage_err("--autosave is for headless MCP; the bridged app owns its auto-saves");
             }
             let b = backend(args, false)?;
-            let server = McpServer::new(b);
+            let server = McpServer::new(b).with_all_tools(args.flag("--all-tools"));
             let mut server = if args.flag("--autosave") {
                 let root =
                     effectcraft_host::config_dir().ok_or_else(|| Failure::Error("--autosave: no config directory; set EFFECTCRAFT_CONFIG_DIR".into()))?;
