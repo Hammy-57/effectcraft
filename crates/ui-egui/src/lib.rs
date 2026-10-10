@@ -1425,7 +1425,16 @@ impl EffectcraftApp {
         while let Ok(req) = rx.try_recv() {
             reqs.push((req, now + 3.0));
         }
-        for (req, deadline) in reqs {
+        // Agents sharing the app take turns (one request per client before anyone's next), and a
+        // frame runs at most CONTROL_FRAME_BUDGET of requests so the window keeps drawing; the
+        // rest run on the next frame.
+        let started = web_time::Instant::now();
+        for (req, deadline) in control::fair_order(reqs) {
+            if started.elapsed() > control::CONTROL_FRAME_BUDGET {
+                self.deferred.push((req, deadline));
+                ctx.request_repaint();
+                continue;
+            }
             // The transport gave up on it (timed out) and told the client it didn't run.
             if !req.state.start() {
                 continue;

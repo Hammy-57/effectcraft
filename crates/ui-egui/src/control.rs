@@ -156,6 +156,32 @@ fn task_ids(app: &EffectcraftApp) -> Vec<String> {
     app.session.jobs().into_iter().map(|j| j.id).filter(|j| j.starts_with("task:")).collect()
 }
 
+/// The most time one frame spends running control requests (the rest wait for the next frame).
+pub const CONTROL_FRAME_BUDGET: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Requests in turns by client (`engine.execute`'s `client`; the user and UI requests count as
+/// one): each client's first request, then each one's second, and so on, in arrival order.
+pub fn fair_order<T>(reqs: Vec<(ControlRequest, T)>) -> Vec<(ControlRequest, T)> {
+    let client = |r: &ControlRequest| r.params.get("params").and_then(|p| p.get("client")).and_then(Value::as_str).unwrap_or_default().to_string();
+    let mut queues: Vec<(String, std::collections::VecDeque<(ControlRequest, T)>)> = vec![];
+    for r in reqs {
+        let c = client(&r.0);
+        match queues.iter_mut().find(|(k, _)| *k == c) {
+            Some((_, q)) => q.push_back(r),
+            None => queues.push((c, std::collections::VecDeque::from([r]))),
+        }
+    }
+    let mut out = vec![];
+    while queues.iter().any(|(_, q)| !q.is_empty()) {
+        for (_, q) in queues.iter_mut() {
+            if let Some(r) = q.pop_front() {
+                out.push(r);
+            }
+        }
+    }
+    out
+}
+
 /// Commands that block with `wait` (and its default).
 fn waits(command: &str, params: &Value) -> bool {
     // Frame renders and contact sheets too, so one agent's render never holds up the others.

@@ -133,7 +133,7 @@ pub(crate) fn entry(app: &EffectcraftApp, e: &MenuEntry, shown: String) -> Strin
         _ => return shown,
     };
     match e.command.as_str() {
-        "edit.undo" => app.session.history.undo.last().map(|u| format!("{undo} {}", u.0)).unwrap_or_else(|| no_undo.into()),
+        "edit.undo" => effectcraft_engine::selective_undo::own_undo_label(&app.session, None).map(|l| format!("{undo} {l}")).unwrap_or_else(|| no_undo.into()),
         "edit.redo" => app.session.history.redo.last().map(|u| format!("{redo} {}", u.0)).unwrap_or_else(|| no_redo.into()),
         "window.panel" => {
             let prefix = format!("{}: ", e.label);

@@ -28,7 +28,9 @@ window's status bar and on stderr: give each app its own port, and point its MCP
   `file.importProject`, which reads the file in the background)
   starts the job and replies when it ends, with the same result as the blocking
   command: the UI keeps drawing and other connections' requests run meanwhile. A request times
-  out after 60 s. If the app hadn't started it
+  out after 60 s. Clients sharing the app take turns: each `client`'s first request runs before
+  anyone's second, and one frame runs at most 50 ms of requests (the rest run on the next frame),
+  so the window keeps drawing. If the app hadn't started it
   by then, it is cancelled and never runs: the reply has `"notRun": true` and says it is safe to
   retry. If it had started, the reply says it may still complete.
 - **Only requests are read:** every line must be a JSON object with a string `method` (blank lines are
@@ -36,7 +38,7 @@ window's status bar and on stderr: give each app its own port, and point its MCP
   invalid UTF-8, a line longer than 4 MiB) gets one error reply ending in "closing the connection", and
   the server closes the connection, so nothing sent after it runs. An HTTP request (for example a web
   page's cross-origin `fetch` to `127.0.0.1:<port>`) therefore can't smuggle a command in its body: its
-  request line is rejected first. At most 16 connections are served at once; further ones get an error
+  request line is rejected first. At most 32 connections are served at once; further ones get an error
   line and are closed. The port has no authentication, so only enable it while you use it.
 
 Quick test:
