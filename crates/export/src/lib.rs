@@ -103,7 +103,14 @@ pub struct JobOptions<'a> {
     pub storage: Option<&'a dyn StorageQuota>,
     /// Overflow folders, in order.
     pub overflow: Vec<String>,
+    /// Memory for the job's layer cache and for frames rendering at once (bytes; `None`:
+    /// [`DEFAULT_MEMORY_BUDGET`]). The app passes its Memory & CPU layer cache budget (after
+    /// RAM Reserved for Other Applications).
+    pub memory_budget: Option<usize>,
 }
+
+/// [`JobOptions::memory_budget`] when the caller sets none.
+pub const DEFAULT_MEMORY_BUDGET: usize = 1 << 30;
 
 /// Progress after a batch of frames.
 #[derive(Clone, Copy, Debug, Default)]
@@ -225,9 +232,21 @@ impl State<'_> {
     }
 }
 
-/// Frames per parallel batch.
-pub(crate) fn batch_size() -> u64 {
-    rayon::current_num_threads().clamp(2, 16) as u64
+/// Frames per parallel batch for `comp` at the Render Settings' resolution, bounded by the
+/// job's memory budget ([`frames_in_flight`]).
+pub(crate) fn batch_size(cx: &Cx, comp: &Comp) -> u64 {
+    let s = cx.settings.resolution.clamp(0.01, 4.0);
+    let (w, h) = ((comp.width as f64 * s).ceil() as u32, (comp.height as f64 * s).ceil() as u32);
+    frames_in_flight(w, h, cx.options.memory_budget.unwrap_or(DEFAULT_MEMORY_BUDGET))
+}
+
+/// Frames rendering at once: one per core (2–16), fewer when that many `w × h` frames would
+/// take more than `budget` bytes in flight (a 4K frame and the canvases and layer buffers
+/// rendering it take about four `f32` frames, ~530 MB).
+pub(crate) fn frames_in_flight(w: u32, h: u32, budget: usize) -> u64 {
+    let threads = rayon::current_num_threads().clamp(2, 16) as u64;
+    let frame = (w as u64).saturating_mul(h as u64).saturating_mul(16 * 4).max(1);
+    (budget as u64 / frame).clamp(1, threads)
 }
 
 /// Crop/pad 8-bit RGBA to `w`×`h` (codec rounding).
@@ -255,7 +274,7 @@ async fn sequence(cx: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut State<'_>) 
         Channels::Rgba if !fmt.supports_alpha() => Channels::Rgb,
         c => c,
     };
-    let batch = batch_size();
+    let batch = batch_size(cx, comp);
     let mut bytes = 0u64;
     let mut i = 0;
     while i < st.total {
@@ -365,7 +384,7 @@ async fn gif_export(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut State<'_
     let cs_per_frame = 100.0 * rate.den as f64 / rate.num as f64;
     let mut clock = 0.0f64;
     let mut emitted = 0u64;
-    let batch = batch_size();
+    let batch = batch_size(job, comp);
     let mut i = 0;
     while i < st.total {
         let end = (i + batch).min(st.total);
@@ -409,5 +428,22 @@ mod tests {
         assert_eq!(&p[12..16], &[0, 0, 0, 0]);
         assert_eq!(OutputFormat::H264.coded_size(1, 101), (2, 100));
         assert_eq!(OutputFormat::Gif.coded_size(1, 101), (1, 101));
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    /// Frames rendering at once are bounded by the memory budget: 4K frames get fewer than HD.
+    #[test]
+    fn batch_size_follows_frame_bytes_and_budget() {
+        let threads = rayon::current_num_threads().clamp(2, 16) as u64;
+        let gib = 1 << 30;
+        // ~530 MB per 4K frame in flight: two fit 1 GiB.
+        assert_eq!(super::frames_in_flight(3840, 2160, gib), 2.min(threads));
+        assert_eq!(super::frames_in_flight(1920, 1080, gib), 8.min(threads));
+        // Always at least one, never more than the threads.
+        assert_eq!(super::frames_in_flight(8192, 8192, 64 << 20), 1);
+        assert_eq!(super::frames_in_flight(16, 16, gib), threads);
+        assert_eq!(super::frames_in_flight(0, 0, 0), 1);
     }
 }

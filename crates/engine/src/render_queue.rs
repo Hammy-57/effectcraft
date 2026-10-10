@@ -33,6 +33,9 @@ pub struct ExportJob<'a> {
     pub label: String,
     /// Settings ▸ General ▸ Switches Affect Nested Comps.
     pub nested_switches: bool,
+    /// Memory for the export's layer cache and frames in flight (the Memory & CPU layer cache
+    /// budget, see [`crate::prefs::Prefs::cache_budgets`]); `None`: the exporter's default.
+    pub memory_budget: Option<usize>,
 }
 
 /// What an export wrote.
@@ -155,6 +158,8 @@ struct Work {
     items: Vec<Vec<(RenderQueueItem, String)>>,
     /// Settings ▸ General ▸ Switches Affect Nested Comps.
     nested_switches: bool,
+    /// See [`ExportJob::memory_budget`].
+    memory_budget: usize,
 }
 
 /// Bits per channel an output format writes for a project bit depth (named in the file when
@@ -225,6 +230,7 @@ pub(crate) async fn run_items(
         storage: s.storage_quota.clone(),
         items,
         nested_switches: s.prefs.general.switches_affect_nested_comps,
+        memory_budget: s.prefs.cache_budgets(s.sys_memory).layer,
     };
     run_work(work, shared, notify).await;
 }
@@ -268,6 +274,7 @@ async fn run_work(w: Work, shared: &JobShared, notify: &mut dyn FnMut(&JobShared
                 storage: w.storage.as_deref(),
                 label: format!("#{index} {name} (output module {})", mi + 1),
                 nested_switches: w.nested_switches,
+                memory_budget: Some(w.memory_budget),
             };
             let rr = w
                 .exporter
@@ -488,6 +495,7 @@ impl Session {
             storage: self.storage_quota.clone(),
             items,
             nested_switches: self.prefs.general.switches_affect_nested_comps,
+            memory_budget: self.prefs.cache_budgets(self.sys_memory).layer,
         };
         let shared = Arc::new(JobShared::default());
         if wait {
