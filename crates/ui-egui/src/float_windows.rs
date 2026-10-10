@@ -194,7 +194,8 @@ fn plausible(s: &[f32; 4]) -> bool {
 pub(crate) fn rescue(main: Rect, want: Rect) -> Rect {
     let want = if want.is_finite() { want } else { Rect::from_min_size(main.min, MIN_SIZE) };
     let size = want.size().min(main.size()).max(MIN_SIZE);
-    let min = want.min.clamp(main.min, (main.max - size).max(main.min));
+    // (`min`/`max` rather than `clamp`, which panics on NaN.)
+    let min = want.min.min(main.max - size).max(main.min);
     Rect::from_min_size(min, size)
 }
 
@@ -291,7 +292,11 @@ impl EffectcraftApp {
     ) -> Option<(Group, Vec<(PanelKind, Rect)>)> {
         let f = self.ui.floating.get(i)?.clone();
         let vid = viewport_id(f.id);
-        let at = *self.os_windows.created.entry(f.id).or_insert_with(|| f.screen.filter(plausible).unwrap_or([origin.x + f.rect[0], origin.y + f.rect[1], f.rect[2], f.rect[3]]));
+        let at = *self
+            .os_windows
+            .created
+            .entry(f.id)
+            .or_insert_with(|| f.screen.filter(plausible).unwrap_or([origin.x + f.rect[0], origin.y + f.rect[1], f.rect[2], f.rect[3]]));
         let size = vec2(at[2], at[3]).max(MIN_SIZE);
         let active = f.active.min(f.panels.len().saturating_sub(1));
         let title = f.panels.get(active).map(|p| (info.title)(*p)).unwrap_or_default();
@@ -336,7 +341,9 @@ impl EffectcraftApp {
         // Once it is open: a window on no monitor (saved on one that is gone) moves over the main
         // window. (macOS says so reliably; Windows always names the nearest monitor.)
         if out.outer.is_some() && self.os_windows.checked.insert(f.id) && !out.on_monitor {
-            let main = ctx.input(|i| i.raw.viewports.get(&ViewportId::ROOT).and_then(|v| v.inner_rect));
+            // (Only when the main window is on a known monitor itself: some docked displays have
+            // no monitor id, and then nothing is known.)
+            let main = ctx.input(|i| i.raw.viewports.get(&ViewportId::ROOT).filter(|v| v.monitor_size.is_some()).and_then(|v| v.inner_rect));
             if let Some(main) = main {
                 let r = rescue(main, Rect::from_min_size(pos2(at[0], at[1]), size));
                 // (The builder's new position and size move the window.)
@@ -526,6 +533,9 @@ mod tests {
         // Nonsense: at the main window's corner.
         let nan = Rect::from_min_size(pos2(f32::NAN, 0.0), vec2(300.0, 200.0));
         assert_eq!(rescue(main, nan), Rect::from_min_size(main.min, MIN_SIZE));
+        // A main window rect the platform got wrong doesn't panic.
+        let odd = Rect::from_min_size(pos2(f32::NAN, 0.0), vec2(f32::NAN, 100.0));
+        let _ = rescue(odd, Rect::from_min_size(pos2(10.0, 10.0), vec2(300.0, 200.0)));
         // Saved rects that can't be a window's are ignored before it opens.
         assert!(plausible(&[-1500.0, 80.0, 640.0, 480.0]));
         assert!(!plausible(&[f32::INFINITY, 80.0, 640.0, 480.0]));
