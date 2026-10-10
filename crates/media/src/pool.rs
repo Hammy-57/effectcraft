@@ -251,6 +251,38 @@ impl Sources {
     }
 }
 
+/// At most this many parsed Photoshop documents are kept (each holds its file) …
+const MAX_PSDS: usize = 4;
+/// … and at most this many bytes of them (the most recent one always stays).
+const PSD_BUDGET: usize = 1 << 29;
+
+/// Parsed Photoshop documents, most recently used last: a document imported as a composition
+/// has a footage item per layer, and each decoded frame re-read and re-parsed the whole file.
+#[derive(Default)]
+struct PsdCache {
+    list: Vec<(Arc<str>, Arc<effectcraft_psd::Psd>, usize)>,
+}
+
+impl PsdCache {
+    fn get(&mut self, path: &str) -> Option<Arc<effectcraft_psd::Psd>> {
+        let i = self.list.iter().position(|(p, ..)| &**p == path)?;
+        let e = self.list.remove(i);
+        let psd = e.1.clone();
+        self.list.push(e);
+        Some(psd)
+    }
+    fn insert(&mut self, path: Arc<str>, psd: Arc<effectcraft_psd::Psd>, bytes: usize) {
+        self.remove(&path);
+        self.list.push((path, psd, bytes));
+        while self.list.len() > 1 && (self.list.len() > MAX_PSDS || self.list.iter().map(|e| e.2).fold(0, usize::saturating_add) > PSD_BUDGET) {
+            self.list.remove(0);
+        }
+    }
+    fn remove(&mut self, path: &str) {
+        self.list.retain(|(p, ..)| &**p != path);
+    }
+}
+
 /// Bytes a source keeps in memory: decoders that read the file whole keep its bytes (WAV) or its
 /// decoded samples (MP3, FLAC); containers read through the file keep their index.
 fn held_bytes(src: &SharedSource, whole: bool) -> usize {
@@ -271,6 +303,8 @@ struct Inner {
     opened: AtomicU64,
     /// In-memory files registered with `add_bytes` (web builds, tests).
     files: Mutex<HashMap<String, Arc<[u8]>>>,
+    /// Parsed Photoshop documents by path.
+    psds: Mutex<PsdCache>,
     /// Parsed 3D models by path (`None`: failed to load; not retried until `forget`).
     models: Mutex<HashMap<String, Option<Arc<effectcraft_model::Model>>>>,
     cache: Mutex<CacheState>,
@@ -343,6 +377,7 @@ impl MediaPool {
                 sources: Mutex::default(),
                 files: Mutex::default(),
                 models: Mutex::default(),
+                psds: Mutex::default(),
                 cache: Mutex::default(),
                 done: Condvar::new(),
                 budget: AtomicU64::new(bytes as u64),
@@ -412,12 +447,14 @@ impl MediaPool {
             self.forget(p);
         }
         lock(&self.inner.models).retain(|p, _| keep(p));
+        lock(&self.inner.psds).list.retain(|(p, ..)| keep(p));
     }
 
     /// Forget a file (after it changed on disk, or to retry a file that failed to open).
     pub fn forget(&self, path: &str) {
         lock(&self.inner.sources).map.remove(path);
         lock(&self.inner.models).remove(path);
+        lock(&self.inner.psds).remove(path);
         let mut c = lock(&self.inner.cache);
         let keys: Vec<Key> = c.lru.map.keys().filter(|k| &*k.path == path).cloned().collect();
         for k in keys {
@@ -839,7 +876,18 @@ impl Inner {
         match loc.media_t {
             None if &**path == PLACEHOLDER => Ok(float(colour_bars(footage.width, footage.height))),
             None => {
+                // Photoshop documents are parsed once per file, not once per layer item.
+                if let Some(psd) = lock(&self.psds).get(path) {
+                    return Ok(float(crate::layered::decode_psd(path, &psd, footage, op)?));
+                }
                 let bytes = self.read(path)?;
+                if effectcraft_psd::is_psd(&bytes) {
+                    let psd = Arc::new(crate::layered::parse_psd(path, &bytes)?);
+                    if !detached {
+                        lock(&self.psds).insert(path.clone(), psd.clone(), bytes.len());
+                    }
+                    return Ok(float(crate::layered::decode_psd(path, &psd, footage, op)?));
+                }
                 if let Some(img) = crate::layered::decode(path, &bytes, footage, op)? {
                     return Ok(float(img));
                 }
@@ -1069,6 +1117,48 @@ mod tests {
         drop(busy);
         FootageSource::purge(&pool);
         assert_eq!(pool.open_files(), 0);
+    }
+
+    /// A Photoshop document imported as a composition: every layer item decodes from one parsed
+    /// document (each re-read and re-parsed the whole file), with the same pixels; parsed
+    /// documents are bounded and forgotten with their file.
+    #[test]
+    fn psd_layers_share_one_parsed_document() {
+        use effectcraft_psd::Rect;
+        use effectcraft_psd::write::{WDoc, WLayer};
+        let pool = MediaPool::new();
+        let mut doc = WDoc::new(32, 16);
+        doc.layers =
+            vec![WLayer::solid("Back", Rect::new(0, 0, 32, 16), [0.2, 0.3, 0.4, 1.0]), WLayer::solid("Red", Rect::new(4, 2, 10, 8), [1.0, 0.0, 0.0, 1.0])];
+        let bytes: Arc<[u8]> = effectcraft_psd::write::write(&doc).into();
+        let psd_footage = |path: &str, index: Option<u32>| Footage {
+            path: path.into(),
+            kind: FootageKind::Still,
+            width: 32,
+            height: 16,
+            has_video: true,
+            alpha: AlphaMode::Straight,
+            layer: index.map(|index| effectcraft_project::SourceLayer { index, name: String::new(), ..Default::default() }),
+            ..Default::default()
+        };
+        pool.add_bytes("/doc.psd", bytes.clone());
+        for index in [None, Some(0), Some(1)] {
+            let f = psd_footage("/doc.psd", index);
+            let got = pool.frame_at(&f, Tick::ZERO).unwrap();
+            let fresh = crate::layered::decode_psd("/doc.psd", &crate::layered::parse_psd("/doc.psd", &bytes).unwrap(), &f, AlphaOp::of(&f)).unwrap();
+            assert_eq!(*got, fresh, "layer {index:?}");
+        }
+        assert_eq!(lock(&pool.inner.psds).list.len(), 1, "parsed once");
+        pool.forget("/doc.psd");
+        assert!(lock(&pool.inner.psds).list.is_empty());
+        for i in 0..MAX_PSDS + 2 {
+            let path = format!("/doc{i}.psd");
+            pool.add_bytes(&path, bytes.clone());
+            pool.frame_at(&psd_footage(&path, Some(1)), Tick::ZERO).unwrap();
+        }
+        let psds = lock(&pool.inner.psds);
+        assert_eq!(psds.list.len(), MAX_PSDS);
+        assert_eq!(&*psds.list[MAX_PSDS - 1].0, format!("/doc{}.psd", MAX_PSDS + 1));
     }
 
     #[test]

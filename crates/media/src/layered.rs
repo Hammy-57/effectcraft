@@ -3,6 +3,8 @@
 //! (`effectcraft-svg`), PDF / Illustrator / EPS (`effectcraft-pdf`; one layer of the file for
 //! footage imported as a composition).
 
+use std::sync::Arc;
+
 use effectcraft_project::{AlphaMode, Footage};
 use effectcraft_raster::Image;
 
@@ -41,10 +43,15 @@ pub(crate) fn claims(path: &str, head: &[u8]) -> bool {
     effectcraft_psd::is_psd(head) || is_svg(path, head) || effectcraft_pdf::sniff(head).is_some()
 }
 
+/// Parse a Photoshop document (sharing `bytes`: the parser keeps the file to read layers from).
+pub(crate) fn parse_psd(path: &str, bytes: &Arc<[u8]>) -> Result<effectcraft_psd::Psd> {
+    effectcraft_psd::Psd::parse(bytes.clone()).map_err(|e| MediaError::Decode(format!("{path}: {e}")))
+}
+
 /// Footage for a Photoshop or vector file (`None` for other formats).
-pub(crate) fn probe(path: &str, bytes: &[u8]) -> Result<Option<Footage>> {
+pub(crate) fn probe(path: &str, bytes: &Arc<[u8]>) -> Result<Option<Footage>> {
     if effectcraft_psd::is_psd(bytes) {
-        let psd = effectcraft_psd::Psd::parse(bytes.to_vec()).map_err(|e| MediaError::Decode(format!("{path}: {e}")))?;
+        let psd = parse_psd(path, bytes)?;
         let mut f = crate::probe::still_footage(path, psd.width, psd.height, image::ImageFormat::Png, true);
         f.codec = if psd.psb { "PSB".into() } else { "PSD".into() };
         f.alpha = if psd.merged_alpha || !psd.layers.is_empty() { AlphaMode::Straight } else { AlphaMode::Ignore };
@@ -69,46 +76,47 @@ pub(crate) fn probe(path: &str, bytes: &[u8]) -> Result<Option<Footage>> {
     Ok(None)
 }
 
-/// Decode a Photoshop or SVG still (`None` for other formats).
-pub(crate) fn decode(path: &str, bytes: &[u8], footage: &Footage, op: AlphaOp) -> Result<Option<Image>> {
-    if effectcraft_psd::is_psd(bytes) {
-        let psd = effectcraft_psd::Psd::parse(bytes.to_vec()).map_err(|e| MediaError::Decode(format!("{path}: {e}")))?;
-        // A smart object's embedded file: an embedded document's merged image, or an image.
-        if let Some(l) = footage.layer.as_ref()
-            && let Some(uuid) = l.embedded.as_deref()
+/// Decode a Photoshop document: its merged image, or the footage's layer or smart object.
+pub(crate) fn decode_psd(path: &str, psd: &effectcraft_psd::Psd, footage: &Footage, op: AlphaOp) -> Result<Image> {
+    // A smart object's embedded file: an embedded document's merged image, or an image.
+    if let Some(l) = footage.layer.as_ref()
+        && let Some(uuid) = l.embedded.as_deref()
+    {
+        let data = psd.linked_data(uuid).ok_or_else(|| MediaError::Decode(format!("{path}: no embedded file {uuid}")))?;
+        let px = if effectcraft_psd::is_psd(data) {
+            let inner = effectcraft_psd::Psd::parse(Arc::<[u8]>::from(data)).map_err(|e| MediaError::Decode(format!("{path} (smart object): {e}")))?;
+            inner.composite().map_err(|e| MediaError::Decode(format!("{path} (smart object): {e}")))?
+        } else {
+            let img = image::load_from_memory(data).map_err(|e| MediaError::Decode(format!("{path} (smart object): {e}")))?;
+            let rgba = img.to_rgba32f();
+            effectcraft_psd::Pixels { width: rgba.width(), height: rgba.height(), data: rgba.pixels().map(|p| p.0).collect() }
+        };
+        // A perspective quad or a warp: baked as placed.
+        if l.placed
+            && let Some(so) = psd.layers.get(l.index as usize).and_then(|pl| pl.smart_object.as_ref())
         {
-            let data = psd.linked_data(uuid).ok_or_else(|| MediaError::Decode(format!("{path}: no embedded file {uuid}")))?;
-            let px = if effectcraft_psd::is_psd(data) {
-                let inner = effectcraft_psd::Psd::parse(data.to_vec()).map_err(|e| MediaError::Decode(format!("{path} (smart object): {e}")))?;
-                inner.composite().map_err(|e| MediaError::Decode(format!("{path} (smart object): {e}")))?
-            } else {
-                let img = image::load_from_memory(data).map_err(|e| MediaError::Decode(format!("{path} (smart object): {e}")))?;
-                let rgba = img.to_rgba32f();
-                effectcraft_psd::Pixels { width: rgba.width(), height: rgba.height(), data: rgba.pixels().map(|p| p.0).collect() }
-            };
-            // A perspective quad or a warp: baked as placed.
-            if l.placed
-                && let Some(so) = psd.layers.get(l.index as usize).and_then(|pl| pl.smart_object.as_ref())
-            {
-                let bb = so.placed_bounds(px.width as f64, px.height as f64);
-                let k = footage.width as f64 / (bb[2] - bb[0]).max(1e-9);
-                if let Some((baked, _)) = so.render_placed(&px, k, Some((footage.width, footage.height))) {
-                    return Ok(Some(straight_to_image(baked.width, baked.height, &baked.data, op)));
-                }
+            let bb = so.placed_bounds(px.width as f64, px.height as f64);
+            let k = footage.width as f64 / (bb[2] - bb[0]).max(1e-9);
+            if let Some((baked, _)) = so.render_placed(&px, k, Some((footage.width, footage.height))) {
+                return Ok(straight_to_image(baked.width, baked.height, &baked.data, op));
             }
-            return Ok(Some(straight_to_image(px.width, px.height, &px.data, op)));
         }
-        let px = match &footage.layer {
-            Some(l) => psd.layer_pixels(l.index as usize, !l.layer_size).map(|px| match (l.layer_size, l.crop_bounds, psd.layers.get(l.index as usize)) {
-                // After Effects trims a Layer Size footage to the layer's visible pixels.
-                (true, Some(b), Some(rec)) if rec.fill.is_none() => crop_layer(&px, (rec.rect.left, rec.rect.top), b).unwrap_or(px),
-                _ => px,
-            }),
-            None => psd.composite(),
-        }
-        .map_err(|e| MediaError::Decode(format!("{path}: {e}")))?;
-        return Ok(Some(straight_to_image(px.width, px.height, &px.data, op)));
+        return Ok(straight_to_image(px.width, px.height, &px.data, op));
     }
+    let px = match &footage.layer {
+        Some(l) => psd.layer_pixels(l.index as usize, !l.layer_size).map(|px| match (l.layer_size, l.crop_bounds, psd.layers.get(l.index as usize)) {
+            // After Effects trims a Layer Size footage to the layer's visible pixels.
+            (true, Some(b), Some(rec)) if rec.fill.is_none() => crop_layer(&px, (rec.rect.left, rec.rect.top), b).unwrap_or(px),
+            _ => px,
+        }),
+        None => psd.composite(),
+    }
+    .map_err(|e| MediaError::Decode(format!("{path}: {e}")))?;
+    Ok(straight_to_image(px.width, px.height, &px.data, op))
+}
+
+/// Decode an SVG / PDF / Illustrator / EPS still (`None` for other formats).
+pub(crate) fn decode(path: &str, bytes: &[u8], footage: &Footage, op: AlphaOp) -> Result<Option<Image>> {
     if is_svg(path, bytes) || is_pdf_like(path, bytes) {
         let doc = vector_doc(path, bytes, footage.layer.as_ref(), footage.page).unwrap_or(Err(String::new())).map_err(MediaError::Decode)?;
         let (w, h) = doc.pixel_size();
