@@ -1601,8 +1601,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             }
             Gesture::Marquee { start } | Gesture::PinMarquee { start } => {
                 let r = Rect::from_two_pos(start, pos);
-                painter.rect_filled(r, 0.0, t.accent.gamma_multiply(0.12));
-                painter.rect_stroke(r, 0.0, Stroke::new(1.0, t.accent), StrokeKind::Middle);
+                crate::widgets::marquee(&painter, r, &t);
             }
         }
     }
