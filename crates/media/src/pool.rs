@@ -513,22 +513,21 @@ impl Inner {
         if let Some(b) = lock(&self.files).get(path) {
             return Ok(b.clone());
         }
-        std::fs::read(path).map(Into::into).map_err(|e| MediaError::Io(format!("{path}: {e}")))
+        crate::open::read_file(path)
     }
 
     /// The opened movie/audio source for `path`. The first caller opens it, outside the map's
-    /// lock (reading and parsing a large file takes a moment; FLAC, MP3, Ogg and AIFF files are
-    /// decoded whole); callers asking for the same file meanwhile wait for that instead of opening
-    /// it again: a preview's frame workers, audio feeder, conform and waveform threads each
-    /// decoded a long FLAC in full at once (#408).
+    /// lock (parsing a large file takes a moment; FLAC, MP3 and AIFF files are decoded whole);
+    /// callers asking for the same file meanwhile wait for that instead of opening it again: a
+    /// preview's frame workers, audio feeder, conform and waveform threads each decoded a long
+    /// FLAC in full at once (#408). Containers are read through the file (index now, samples on
+    /// demand), not held in memory.
     fn source(&self, path: &Arc<str>) -> Option<SharedSource> {
         let slot = lock(&self.sources).entry(path.clone()).or_default().clone();
         slot.get_or_init(|| {
             self.opened.fetch_add(1, Ordering::Relaxed);
-            let opened = self.read(path).and_then(|bytes| {
-                let name = std::path::Path::new(&**path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                filmcraft_codecs::open_bytes(&name, bytes).map_err(MediaError::from)
-            });
+            let mem = lock(&self.files).get(&**path).cloned();
+            let opened = crate::open::open_source(path, mem);
             match opened {
                 Ok(s) => Some(s),
                 Err(e) => {

@@ -27,6 +27,7 @@ filmcraft-time = { workspace = true }
 exr = { workspace = true }
 image = { workspace = true, features = ["gif", "webp", "tiff", "bmp", "exr"] }
 rayon = { workspace = true }
+symphonia = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
