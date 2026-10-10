@@ -891,3 +891,10 @@ Recorded in one place on 10 October; each landed with tests.
 ## Update: 10 October 2026, undocked panels as OS windows
 
 - Interface: an undocked (floating) panel group is now an OS window of its own on the desktop, as in After Effects (egui multi-viewport): it can go to a second monitor, keeps its screen position and size in the workspace and across relaunches, closes its panels from its close button, and docks back with the panel menu's Dock Panel or by dragging a tab into the main window. The web and headless contexts keep the in-window floating groups.
+## Update: Panel Group Settings ▸ Solo Panels in Stack and Small Tabs (10 October)
+
+- The panel menu's last two Panel Group Settings items work: Solo Panels in Stack
+  (`window.soloPanels {panel, solo?}`, stacked groups only) keeps one panel of the stack expanded,
+  and Small Tabs (`window.smallTabs {panel, small?}`) gives a docked group or stack a shorter tab
+  strip with smaller labels. Both are saved with the layout and its workspaces. Floating groups
+  don't have Small Tabs yet.

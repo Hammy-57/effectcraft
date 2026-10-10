@@ -2095,3 +2095,45 @@ fn warnings_hints_and_brief_listings() {
     let fx = call_json(&mut s, "list_effects", json!({"brief": true}));
     assert!(fx.as_array().unwrap().iter().all(|e| e.as_object().unwrap().len() == 2), "{fx}");
 }
+
+/// Every tool takes the agent's name as `client` (or the server runs as `mcp --client NAME`): the
+/// engine commands it runs carry it, so each agent has its own selection, comp and time, renders
+/// at its own time, and other agents' typed-tool edits to a comp it claimed are refused.
+#[test]
+fn tools_run_as_the_calling_client() {
+    for bridge in [false, true] {
+        let mut s = if bridge { McpServer::new(Backend::bridge(&fake_app().to_string()).unwrap()) } else { server() };
+        call_json(&mut s, "command_run", json!({"id": "comp.new", "params": {"name": "Main", "width": 64, "height": 36, "frameRate": 24, "duration": 2}}));
+        let a = call_json(&mut s, "command_run", json!({"id": "layer.newSolid", "params": {"name": "A", "width": 8, "height": 8}}))["layer"].clone();
+        let b = call_json(&mut s, "command_run", json!({"id": "layer.newSolid", "params": {"name": "B", "width": 8, "height": 8}}))["layer"].clone();
+        call_json(&mut s, "command_run", json!({"id": "layer.select", "params": {"layers": [a]}, "client": "agentA"}));
+        call_json(&mut s, "command_run", json!({"id": "layer.select", "params": {"layers": [b]}, "client": "agentB"}));
+        let st = call_json(&mut s, "get_state", json!({"client": "agentA"}));
+        assert_eq!((st["state"]["client"].clone(), st["state"]["selected_layers"].clone()), (json!("agentA"), json!([a])), "bridge {bridge}: {st}");
+        assert_eq!(call_json(&mut s, "get_state", json!({"client": "agentB"}))["state"]["selected_layers"], json!([b]));
+        // A selection edit lands on the calling agent's own layer.
+        call_json(&mut s, "command_run", json!({"id": "prop.set", "params": {"path": "transform/opacity", "value": 10}, "client": "agentA"}));
+        let opacity = |s: &mut McpServer, l: &Value| call_json(s, "get_property", json!({"layer": l, "path": "transform/opacity"}))["value"].clone();
+        assert_eq!((opacity(&mut s, &a), opacity(&mut s, &b)), (json!(10.0), json!(100.0)), "bridge {bridge}");
+        // Renders default to the agent's own time (bridged too: through the engine command).
+        call_json(&mut s, "command_run", json!({"id": "time.set", "params": {"time": 1}, "client": "agentA"}));
+        let (c, err) = call(&mut s, "render_preview", json!({"client": "agentA", "max_side": 16}));
+        assert!(!err, "{c:?}");
+        let meta = c.iter().find(|x| x["type"] == "text").map(|x| serde_json::from_str::<Value>(x["text"].as_str().unwrap()).unwrap()).unwrap();
+        assert_eq!(meta["time"], json!(1.0), "bridge {bridge}: {meta}");
+        // A claim refuses the other agent's typed-tool edit, never the user's.
+        call_json(&mut s, "command_run", json!({"id": "comp.claim", "params": {"comp": "Main"}, "client": "agentA"}));
+        let (c, err) = call(&mut s, "set_property", json!({"layer": b, "path": "transform/opacity", "value": 50, "client": "agentB"}));
+        assert!(err && c[0]["text"].as_str().unwrap().contains("claimed by agentA"), "bridge {bridge}: {c:?}");
+        call_json(&mut s, "set_property", json!({"layer": b, "path": "transform/opacity", "value": 50}));
+        call_json(&mut s, "set_property", json!({"layer": a, "path": "transform/opacity", "value": 20, "client": "agentA"}));
+        let (c, err) = call(&mut s, "get_state", json!({"client": 5}));
+        assert!(err && c[0]["text"].as_str().unwrap().contains("`client`"), "{c:?}");
+    }
+    // `mcp --client NAME`: every call runs as that agent; the user's cursor stays as it was.
+    let mut s = server().with_client(Some("agentC".into()));
+    call_json(&mut s, "command_run", json!({"id": "comp.new", "params": {"name": "Theirs", "width": 64, "height": 36}}));
+    assert_eq!(call_json(&mut s, "get_state", json!({}))["state"]["client"], "agentC");
+    assert_eq!(s.backend().session().unwrap().state.active_comp, None, "the user's view didn't move");
+    assert_eq!(s.backend().client(), Some("agentC"));
+}

@@ -64,7 +64,7 @@ fn group_of(n: &DockNode, p: PanelKind) -> Option<Vec<PanelKind>> {
     match n {
         DockNode::Split { a, b, .. } => group_of(a, p).or_else(|| group_of(b, p)),
         DockNode::Tabs { panels, .. } => panels.contains(&p).then(|| panels.clone()),
-        DockNode::Stack { entries } => entries.iter().any(|e| e.panel == p).then(|| entries.iter().map(|e| e.panel).collect()),
+        DockNode::Stack { entries, .. } => entries.iter().any(|e| e.panel == p).then(|| entries.iter().map(|e| e.panel).collect()),
     }
 }
 
@@ -209,7 +209,7 @@ fn stacked_panel_gaps_resize_the_panels() {
         match n {
             DockNode::Split { a, b, .. } => height(a, p).or_else(|| height(b, p)),
             DockNode::Tabs { .. } => None,
-            DockNode::Stack { entries } => entries.iter().find(|e| e.panel == p).map(|e| e.height),
+            DockNode::Stack { entries, .. } => entries.iter().find(|e| e.panel == p).map(|e| e.height),
         }
     }
     let (preview, props) = (rect(&h, "panel.Preview"), rect(&h, "panel.Properties"));

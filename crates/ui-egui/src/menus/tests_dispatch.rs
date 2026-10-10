@@ -24,6 +24,8 @@ const PINNED_INVOKE: &[&str] = &[
     "window.closePanelGroup",
     "window.floatPanelGroup",
     "window.stackPanelGroup",
+    "window.soloPanels",
+    "window.smallTabs",
     "window.panelMenu",
     "markers.dialog",
     "view.res.auto",
@@ -160,7 +162,7 @@ fn handles_exactly_the_pinned_ids() {
         want.sort();
         assert_eq!(got, want, "{stage:?}: the handled ids changed; update PINNED_* only for a deliberate change");
     }
-    assert_eq!(PINNED_INVOKE.len() + PINNED_FRONTEND.len(), 119);
+    assert_eq!(PINNED_INVOKE.len() + PINNED_FRONTEND.len(), 121);
 }
 
 #[test]

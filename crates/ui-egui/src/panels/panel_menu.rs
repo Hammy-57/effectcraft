@@ -109,9 +109,15 @@ pub fn entries(app: &EffectcraftApp, panel: PanelKind, doc: Option<u64>) -> Vec<
             check("maximizePanel", tr("Maximize Panel Group"), "window.maximizePanel", p.clone(), !floating, app.ui.maximized == Some(panel)),
             Entry::Separator,
             check("stackPanelGroup", tr("Stacked Panel Group"), "window.stackPanelGroup", p.clone(), !floating, app.ui.dock.is_stacked(panel)),
-            // (Not available yet: one expanded panel per stack, and small tab labels.)
-            item("soloPanels", tr("Solo Panels in Stack"), "", Value::Null, false),
-            item("smallTabs", tr("Small Tabs"), "", Value::Null, false),
+            check(
+                "soloPanels",
+                tr("Solo Panels in Stack"),
+                "window.soloPanels",
+                p.clone(),
+                !floating && app.ui.dock.is_stacked(panel),
+                app.ui.dock.solo(panel) == Some(true),
+            ),
+            check("smallTabs", tr("Small Tabs"), "window.smallTabs", p.clone(), !floating, app.ui.dock.small_tabs(panel) == Some(true)),
         ],
     });
     let own = panel_items(app, panel);

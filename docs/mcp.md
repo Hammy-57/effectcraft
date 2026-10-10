@@ -161,6 +161,16 @@ argument checking) is idempotent: the same id again returns the first result wit
 tool (last 128 ids). Bridge calls also send a `requestId` on the control channel, so the bridge's
 reconnect-and-resend never runs a command twice.
 
+## Several agents (`client`)
+
+Every tool takes an optional `client` argument, the agent's name (a non-empty string, at most 128
+bytes). The engine commands the call runs carry it, so the agent works on its own selection, active
+comp and current time (render tools default to that time) and can reserve comps with
+`command_run comp.claim`; another agent's edit to a claimed comp is a tool error naming the owner.
+`effectcraft-cli mcp --client NAME` (or `EFFECTCRAFT_CLIENT`) runs every call as `NAME`; a call's own
+`client` overrides it. Without either, tools act on the user's cursor as before. Details:
+[agents.md](agents.md#several-agents-at-once).
+
 ## Prompts
 
 `prompts/list` and `prompts/get` serve workflow recipes. Each one is a single user message that spells
