@@ -11,6 +11,7 @@ use effectcraft_raster::{Image, Px};
 use filmcraft_color::{Matrix, Range};
 use filmcraft_frame::{Chroma, PixelData, VideoFrame};
 use rayon::prelude::*;
+use std::sync::Arc;
 
 /// How to turn a (colour, alpha) sample into a premultiplied pixel.
 #[derive(Clone, Copy)]
@@ -57,6 +58,9 @@ pub(crate) fn frame_to_image(f: &VideoFrame, op: AlphaOp) -> Image {
     frame_to_image_in(f, op, Vec::new())
 }
 
+/// Rows converted per parallel task.
+const ROWS: usize = 8;
+
 /// Convert a FilmCraft frame to an [`Image`], reusing `buf`'s allocation when it is large enough
 /// (every pixel is overwritten, so a recycled frame's contents do not matter).
 pub(crate) fn frame_to_image_in(f: &VideoFrame, op: AlphaOp, mut buf: Vec<Px>) -> Image {
@@ -68,39 +72,146 @@ pub(crate) fn frame_to_image_in(f: &VideoFrame, op: AlphaOp, mut buf: Vec<Px>) -
     if w == 0 || h == 0 {
         return img;
     }
+    img.data.par_chunks_mut(w * ROWS).enumerate().for_each(|(i, rows)| frame_rows(f, op, i * ROWS, rows));
+    img
+}
+
+/// Rows `y0..` of `f` (as many whole rows as `out` holds) as compositor pixels: the pixels of
+/// [`frame_to_image`], a band at a time.
+pub(crate) fn frame_rows(f: &VideoFrame, op: AlphaOp, y0: usize, out: &mut [Px]) {
+    let (w, h) = (f.width as usize, f.height as usize);
+    if w == 0 {
+        return;
+    }
     match &f.data {
         PixelData::Rgba8(d) => {
-            img.data.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
-                let src = &d[y * w * 4..(y + 1) * w * 4];
+            for (r, row) in out.chunks_mut(w).enumerate() {
+                let y = y0 + r;
+                let Some(src) = d.get(y * w * 4..(y + 1) * w * 4) else { continue };
                 for (o, s) in row.iter_mut().zip(src.as_chunks::<4>().0.iter()) {
                     *o = op.apply([U8[s[0] as usize], U8[s[1] as usize], U8[s[2] as usize]], U8[s[3] as usize]);
                 }
-            });
+            }
         }
         PixelData::RgbaF32(d) => {
             // linear premultiplied → encoded premultiplied
-            img.data.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
-                let src = &d[y * w * 4..(y + 1) * w * 4];
+            for (r, row) in out.chunks_mut(w).enumerate() {
+                let y = y0 + r;
+                let Some(src) = d.get(y * w * 4..(y + 1) * w * 4) else { continue };
                 for (o, s) in row.iter_mut().zip(src.as_chunks::<4>().0.iter()) {
                     let a = s[3];
                     let inv = if a > 0.0 { 1.0 / a } else { 0.0 };
                     let c = [op.float(s[0] * inv) * a, op.float(s[1] * inv) * a, op.float(s[2] * inv) * a];
                     *o = if op.mode == AlphaMode::Ignore { [c[0], c[1], c[2], 1.0] } else { [c[0], c[1], c[2], a] };
                 }
-            });
+            }
         }
         PixelData::Yuv8 { planes, chroma, alpha } => {
             let yuv = Yuv::new(f.color.matrix, f.color.range, 8);
             let amax = 255.0;
-            convert_yuv(&mut img, w, h, *chroma, [&planes[0][..], &planes[1][..], &planes[2][..]], alpha.as_deref().map(|a| &a[..]), amax, &yuv, op);
+            yuv_rows(w, h, *chroma, [&planes[0][..], &planes[1][..], &planes[2][..]], alpha.as_deref().map(|a| &a[..]), amax, &yuv, op, y0, out);
         }
         PixelData::Yuv16 { planes, chroma, bits, alpha } => {
-            let yuv = Yuv::new(f.color.matrix, f.color.range, *bits);
-            let amax = ((1u32 << *bits) - 1) as f32;
-            convert_yuv(&mut img, w, h, *chroma, [&planes[0][..], &planes[1][..], &planes[2][..]], alpha.as_deref().map(|a| &a[..]), amax, &yuv, op);
+            let bits = (*bits).clamp(8, 16);
+            let yuv = Yuv::new(f.color.matrix, f.color.range, bits);
+            let amax = ((1u32 << bits) - 1) as f32;
+            yuv_rows(w, h, *chroma, [&planes[0][..], &planes[1][..], &planes[2][..]], alpha.as_deref().map(|a| &a[..]), amax, &yuv, op, y0, out);
         }
     }
-    img
+}
+
+/// A decoded picture kept compactly and turned into compositor pixels on use, exactly as
+/// [`frame_to_image`] / [`dynamic_to_image`] convert it: the decoder's own samples (8-bit 4:2:0
+/// Y'CbCr is 1.5 bytes a pixel, 10-bit 3) or a still's 8 / 16-bit RGBA, instead of 16 bytes a
+/// pixel of f32.
+pub(crate) enum Packed {
+    Video { frame: Arc<VideoFrame>, op: AlphaOp },
+    Rgba8 { width: u32, height: u32, data: Vec<u8>, op: AlphaOp },
+    Rgba16 { width: u32, height: u32, data: Vec<u16>, op: AlphaOp },
+}
+
+impl Packed {
+    pub(crate) fn size(&self) -> (u32, u32) {
+        match self {
+            Packed::Video { frame, .. } => (frame.width, frame.height),
+            Packed::Rgba8 { width, height, .. } | Packed::Rgba16 { width, height, .. } => (*width, *height),
+        }
+    }
+
+    /// Bytes of samples held.
+    pub(crate) fn bytes(&self) -> usize {
+        match self {
+            Packed::Video { frame, .. } => match &frame.data {
+                PixelData::Rgba8(d) => d.len(),
+                PixelData::RgbaF32(d) => d.len() * 4,
+                PixelData::Yuv8 { planes, alpha, .. } => planes.iter().map(|p| p.len()).sum::<usize>() + alpha.as_ref().map_or(0, |a| a.len()),
+                PixelData::Yuv16 { planes, alpha, .. } => (planes.iter().map(|p| p.len()).sum::<usize>() + alpha.as_ref().map_or(0, |a| a.len())) * 2,
+            },
+            Packed::Rgba8 { data, .. } => data.len(),
+            Packed::Rgba16 { data, .. } => data.len() * 2,
+        }
+    }
+
+    /// Rows `y0..` (as many whole rows as `out` holds) as compositor pixels.
+    pub(crate) fn rows(&self, y0: usize, out: &mut [Px]) {
+        match self {
+            Packed::Video { frame, op } => frame_rows(frame, *op, y0, out),
+            Packed::Rgba8 { width, data, op, .. } => {
+                let w = *width as usize;
+                for (r, row) in out.chunks_mut(w.max(1)).enumerate() {
+                    let y = y0 + r;
+                    let Some(src) = data.get(y * w * 4..(y + 1) * w * 4) else { continue };
+                    for (o, s) in row.iter_mut().zip(src.as_chunks::<4>().0.iter()) {
+                        *o = op.apply([U8[s[0] as usize], U8[s[1] as usize], U8[s[2] as usize]], U8[s[3] as usize]);
+                    }
+                }
+            }
+            Packed::Rgba16 { width, data, op, .. } => {
+                let w = *width as usize;
+                let k = 1.0 / 65535.0;
+                for (r, row) in out.chunks_mut(w.max(1)).enumerate() {
+                    let y = y0 + r;
+                    let Some(src) = data.get(y * w * 4..(y + 1) * w * 4) else { continue };
+                    for (o, s) in row.iter_mut().zip(src.as_chunks::<4>().0.iter()) {
+                        *o = op.apply([s[0] as f32 * k, s[1] as f32 * k, s[2] as f32 * k], s[3] as f32 * k);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The whole picture as an [`Image`].
+    pub(crate) fn to_image(&self) -> Image {
+        let (w, h) = self.size();
+        let mut img = Image::new(w, h);
+        if w == 0 || h == 0 {
+            return img;
+        }
+        img.data.par_chunks_mut(w as usize * ROWS).enumerate().for_each(|(i, rows)| self.rows(i * ROWS, rows));
+        img
+    }
+}
+
+impl effectcraft_render::FramePixels for Packed {
+    fn size(&self) -> (u32, u32) {
+        Packed::size(self)
+    }
+    fn rows(&self, y0: usize, out: &mut [Px]) {
+        Packed::rows(self, y0, out);
+    }
+}
+
+/// A still decoded by the `image` crate, kept packed (8 / 16-bit) or as float pixels.
+pub(crate) fn pack_dynamic(img: image::DynamicImage, op: AlphaOp) -> std::result::Result<Image, Packed> {
+    use image::DynamicImage as D;
+    let (width, height) = (img.width(), img.height());
+    match img {
+        D::ImageRgb32F(_) | D::ImageRgba32F(_) => Ok(dynamic_to_image(&img, op)),
+        D::ImageLuma16(_) | D::ImageLumaA16(_) | D::ImageRgb16(_) | D::ImageRgba16(_) => {
+            Err(Packed::Rgba16 { width, height, data: img.into_rgba16().into_raw(), op })
+        }
+        _ => Err(Packed::Rgba8 { width, height, data: img.into_rgba8().into_raw(), op }),
+    }
 }
 
 /// 0..255 → 0..1.
@@ -182,64 +293,68 @@ fn centred(i: usize, n: usize) -> (usize, usize) {
     (c, o)
 }
 
+/// Rows `y0..` (as many whole rows as `out` holds) of a planar Y'CbCr picture `w`×`h`.
 #[allow(clippy::too_many_arguments)]
-fn convert_yuv<T: Sample>(img: &mut Image, w: usize, h: usize, chroma: Chroma, planes: [&[T]; 3], alpha: Option<&[T]>, amax: f32, k: &Yuv, op: AlphaOp) {
+fn yuv_rows<T: Sample>(w: usize, h: usize, chroma: Chroma, planes: [&[T]; 3], alpha: Option<&[T]>, amax: f32, k: &Yuv, op: AlphaOp, y0: usize, out: &mut [Px]) {
     let (sx, sy) = chroma.shifts();
     let cw = w.div_ceil(1 << sx);
     let ch = h.div_ceil(1 << sy);
+    if cw == 0 || ch == 0 {
+        return;
+    }
     let inv_amax = 1.0 / amax;
-    img.data.par_chunks_mut(w).enumerate().for_each_init(
-        || (vec![0f32; cw], vec![0f32; cw], vec![0f32; w], vec![0f32; w]),
-        |(uc, vc, uf, vf), (y, row)| {
-            // vertical chroma interpolation into normalised rows (Cb, Cr in −0.5..0.5)
-            let (r0, r1, t) = if sy == 1 {
-                let (c, o) = centred(y, ch);
-                (c, o, 0.25)
-            } else {
-                (y, y, 0.0)
-            };
-            for (dst, plane) in [(&mut *uc, planes[1]), (&mut *vc, planes[2])] {
-                let a = &plane[r0 * cw..r0 * cw + cw];
-                let b = &plane[r1 * cw..r1 * cw + cw];
-                for ((d, a), b) in dst.iter_mut().zip(a).zip(b) {
-                    let v = a.f() * (1.0 - t) + b.f() * t;
-                    *d = (v - k.c_off) * k.c_scale;
+    let (mut uc, mut vc, mut uf, mut vf) = (vec![0f32; cw], vec![0f32; cw], vec![0f32; w], vec![0f32; w]);
+    for (r, row) in out.chunks_mut(w).enumerate() {
+        let y = y0 + r;
+        if y >= h {
+            break;
+        }
+        // vertical chroma interpolation into normalised rows (Cb, Cr in −0.5..0.5)
+        let (r0, r1, t) = if sy == 1 {
+            let (c, o) = centred(y, ch);
+            (c, o, 0.25)
+        } else {
+            (y, y, 0.0)
+        };
+        for (dst, plane) in [(&mut uc, planes[1]), (&mut vc, planes[2])] {
+            let (Some(a), Some(b)) = (plane.get(r0 * cw..r0 * cw + cw), plane.get(r1 * cw..r1 * cw + cw)) else { continue };
+            for ((d, a), b) in dst.iter_mut().zip(a).zip(b) {
+                let v = a.f() * (1.0 - t) + b.f() * t;
+                *d = (v - k.c_off) * k.c_scale;
+            }
+        }
+        // horizontal
+        if sx == 1 {
+            for x in 0..w {
+                let (c, o) = centred(x, cw);
+                uf[x] = uc[c] * 0.75 + uc[o] * 0.25;
+                vf[x] = vc[c] * 0.75 + vc[o] * 0.25;
+            }
+        } else {
+            uf.copy_from_slice(&uc[..w]);
+            vf.copy_from_slice(&vc[..w]);
+        }
+        let Some(yrow) = planes[0].get(y * w..y * w + w) else { continue };
+        let rgb = |x: usize| {
+            let (u, v) = (uf[x], vf[x]);
+            let yy = (yrow[x].f() - k.y_off) * k.y_scale;
+            [(yy + k.cr_r * v).clamp(0.0, 1.0), (yy - k.cr_g * v - k.cb_g * u).clamp(0.0, 1.0), (yy + k.cb_b * u).clamp(0.0, 1.0)]
+        };
+        match alpha.and_then(|al| al.get(y * w..y * w + w)) {
+            // opaque: every alpha interpretation gives the colour itself
+            None => {
+                for (x, o) in row.iter_mut().enumerate() {
+                    let c = rgb(x);
+                    *o = [c[0], c[1], c[2], 1.0];
                 }
             }
-            // horizontal
-            if sx == 1 {
-                for x in 0..w {
-                    let (c, o) = centred(x, cw);
-                    uf[x] = uc[c] * 0.75 + uc[o] * 0.25;
-                    vf[x] = vc[c] * 0.75 + vc[o] * 0.25;
-                }
-            } else {
-                uf.copy_from_slice(&uc[..w]);
-                vf.copy_from_slice(&vc[..w]);
-            }
-            let yrow = &planes[0][y * w..y * w + w];
-            let rgb = |x: usize| {
-                let (u, v) = (uf[x], vf[x]);
-                let yy = (yrow[x].f() - k.y_off) * k.y_scale;
-                [(yy + k.cr_r * v).clamp(0.0, 1.0), (yy - k.cr_g * v - k.cb_g * u).clamp(0.0, 1.0), (yy + k.cb_b * u).clamp(0.0, 1.0)]
-            };
-            match alpha {
-                // opaque: every alpha interpretation gives the colour itself
-                None => {
-                    for (x, o) in row.iter_mut().enumerate() {
-                        let c = rgb(x);
-                        *o = [c[0], c[1], c[2], 1.0];
-                    }
-                }
-                Some(al) => {
-                    let arow = &al[y * w..y * w + w];
-                    for (x, o) in row.iter_mut().enumerate() {
-                        *o = op.apply(rgb(x), (arow[x].f() * inv_amax).clamp(0.0, 1.0));
-                    }
+            Some(arow) => {
+                for (x, o) in row.iter_mut().enumerate() {
+                    *o = op.apply(rgb(x), (arow[x].f() * inv_amax).clamp(0.0, 1.0));
                 }
             }
-        },
-    );
+        }
+    }
 }
 
 /// Convert a still decoded by the `image` crate. Float images (OpenEXR, float TIFF) hold linear
@@ -364,6 +479,233 @@ mod tests {
         let img = image::DynamicImage::ImageRgba32F(image::ImageBuffer::from_raw(1, 1, vec![0.2140, 1.0, 4.0, 1.0]).expect("buf"));
         let p = dynamic_to_image(&img, AlphaOp::new(AlphaMode::Premultiplied, [0.0; 3])).data[0];
         assert!((p[0] - 0.5).abs() < 1e-3 && (p[1] - 1.0).abs() < 1e-5 && p[2] > 1.5, "{p:?}");
+    }
+
+    /// The conversion as it was before frames were kept packed and converted a band at a time
+    /// (verbatim): the packed paths must give exactly its pixels.
+    mod reference {
+        use super::super::*;
+
+        pub(super) fn frame_to_image_in(f: &VideoFrame, op: AlphaOp, mut buf: Vec<Px>) -> Image {
+            let (w, h) = (f.width as usize, f.height as usize);
+            if buf.len() != w * h {
+                buf = vec![[0.0; 4]; w * h];
+            }
+            let mut img = Image { width: f.width, height: f.height, data: buf };
+            if w == 0 || h == 0 {
+                return img;
+            }
+            match &f.data {
+                PixelData::Rgba8(d) => {
+                    img.data.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+                        let src = &d[y * w * 4..(y + 1) * w * 4];
+                        for (o, s) in row.iter_mut().zip(src.as_chunks::<4>().0.iter()) {
+                            *o = op.apply([U8[s[0] as usize], U8[s[1] as usize], U8[s[2] as usize]], U8[s[3] as usize]);
+                        }
+                    });
+                }
+                PixelData::RgbaF32(d) => {
+                    // linear premultiplied → encoded premultiplied
+                    img.data.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+                        let src = &d[y * w * 4..(y + 1) * w * 4];
+                        for (o, s) in row.iter_mut().zip(src.as_chunks::<4>().0.iter()) {
+                            let a = s[3];
+                            let inv = if a > 0.0 { 1.0 / a } else { 0.0 };
+                            let c = [op.float(s[0] * inv) * a, op.float(s[1] * inv) * a, op.float(s[2] * inv) * a];
+                            *o = if op.mode == AlphaMode::Ignore { [c[0], c[1], c[2], 1.0] } else { [c[0], c[1], c[2], a] };
+                        }
+                    });
+                }
+                PixelData::Yuv8 { planes, chroma, alpha } => {
+                    let yuv = Yuv::new(f.color.matrix, f.color.range, 8);
+                    let amax = 255.0;
+                    convert_yuv(&mut img, w, h, *chroma, [&planes[0][..], &planes[1][..], &planes[2][..]], alpha.as_deref().map(|a| &a[..]), amax, &yuv, op);
+                }
+                PixelData::Yuv16 { planes, chroma, bits, alpha } => {
+                    let yuv = Yuv::new(f.color.matrix, f.color.range, *bits);
+                    let amax = ((1u32 << *bits) - 1) as f32;
+                    convert_yuv(&mut img, w, h, *chroma, [&planes[0][..], &planes[1][..], &planes[2][..]], alpha.as_deref().map(|a| &a[..]), amax, &yuv, op);
+                }
+            }
+            img
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn convert_yuv<T: Sample>(
+            img: &mut Image,
+            w: usize,
+            h: usize,
+            chroma: Chroma,
+            planes: [&[T]; 3],
+            alpha: Option<&[T]>,
+            amax: f32,
+            k: &Yuv,
+            op: AlphaOp,
+        ) {
+            let (sx, sy) = chroma.shifts();
+            let cw = w.div_ceil(1 << sx);
+            let ch = h.div_ceil(1 << sy);
+            let inv_amax = 1.0 / amax;
+            img.data.par_chunks_mut(w).enumerate().for_each_init(
+                || (vec![0f32; cw], vec![0f32; cw], vec![0f32; w], vec![0f32; w]),
+                |(uc, vc, uf, vf), (y, row)| {
+                    // vertical chroma interpolation into normalised rows (Cb, Cr in −0.5..0.5)
+                    let (r0, r1, t) = if sy == 1 {
+                        let (c, o) = centred(y, ch);
+                        (c, o, 0.25)
+                    } else {
+                        (y, y, 0.0)
+                    };
+                    for (dst, plane) in [(&mut *uc, planes[1]), (&mut *vc, planes[2])] {
+                        let a = &plane[r0 * cw..r0 * cw + cw];
+                        let b = &plane[r1 * cw..r1 * cw + cw];
+                        for ((d, a), b) in dst.iter_mut().zip(a).zip(b) {
+                            let v = a.f() * (1.0 - t) + b.f() * t;
+                            *d = (v - k.c_off) * k.c_scale;
+                        }
+                    }
+                    // horizontal
+                    if sx == 1 {
+                        for x in 0..w {
+                            let (c, o) = centred(x, cw);
+                            uf[x] = uc[c] * 0.75 + uc[o] * 0.25;
+                            vf[x] = vc[c] * 0.75 + vc[o] * 0.25;
+                        }
+                    } else {
+                        uf.copy_from_slice(&uc[..w]);
+                        vf.copy_from_slice(&vc[..w]);
+                    }
+                    let yrow = &planes[0][y * w..y * w + w];
+                    let rgb = |x: usize| {
+                        let (u, v) = (uf[x], vf[x]);
+                        let yy = (yrow[x].f() - k.y_off) * k.y_scale;
+                        [(yy + k.cr_r * v).clamp(0.0, 1.0), (yy - k.cr_g * v - k.cb_g * u).clamp(0.0, 1.0), (yy + k.cb_b * u).clamp(0.0, 1.0)]
+                    };
+                    match alpha {
+                        // opaque: every alpha interpretation gives the colour itself
+                        None => {
+                            for (x, o) in row.iter_mut().enumerate() {
+                                let c = rgb(x);
+                                *o = [c[0], c[1], c[2], 1.0];
+                            }
+                        }
+                        Some(al) => {
+                            let arow = &al[y * w..y * w + w];
+                            for (x, o) in row.iter_mut().enumerate() {
+                                *o = op.apply(rgb(x), (arow[x].f() * inv_amax).clamp(0.0, 1.0));
+                            }
+                        }
+                    }
+                },
+            );
+        }
+    }
+
+    fn frame(w: u32, h: u32, data: PixelData, color: filmcraft_color::ColorInfo) -> VideoFrame {
+        VideoFrame { width: w, height: h, data, color, par: (1, 1), pts: filmcraft_time::Tick::ZERO }
+    }
+
+    fn noise8(n: usize, seed: u32) -> Arc<Vec<u8>> {
+        Arc::new((0..n as u32).map(|i| (i.wrapping_mul(2_654_435_761).wrapping_add(seed) >> 13) as u8).collect())
+    }
+
+    fn noise16(n: usize, seed: u32, bits: u32) -> Arc<Vec<u16>> {
+        Arc::new((0..n as u32).map(|i| ((i.wrapping_mul(2_654_435_761).wrapping_add(seed) >> 7) & ((1 << bits) - 1)) as u16).collect())
+    }
+
+    fn assert_bit_exact(a: &Image, b: &Image, what: &str) {
+        assert_eq!((a.width, a.height), (b.width, b.height), "{what}");
+        for (i, (p, q)) in a.data.iter().zip(&b.data).enumerate() {
+            assert!(p.iter().zip(q).all(|(x, y)| x.to_bits() == y.to_bits()), "{what}: pixel {i}: {p:?} vs {q:?}");
+        }
+    }
+
+    /// Frames kept as the decoder's samples convert to exactly the f32 pixels the cache held
+    /// before (every layout, odd sizes, alpha interpretations, limited and full range).
+    #[test]
+    fn packed_frames_expand_bit_exact() {
+        let ops = [
+            AlphaOp::new(AlphaMode::Straight, [0.0; 3]),
+            AlphaOp::new(AlphaMode::Premultiplied, [1.0, 0.5, 0.0]),
+            AlphaOp::new(AlphaMode::Ignore, [0.0; 3]),
+            AlphaOp { preserve_rgb: true, ..AlphaOp::new(AlphaMode::Premultiplied, [0.0; 3]) },
+        ];
+        let full = filmcraft_color::ColorInfo { range: Range::Full, ..filmcraft_color::ColorInfo::REC709 };
+        let mut frames = Vec::new();
+        for (w, h) in [(37u32, 21u32), (64, 18), (1, 1), (2, 9)] {
+            let n = (w * h) as usize;
+            for (chroma, (cw, ch)) in [(Chroma::C420, (w.div_ceil(2), h.div_ceil(2))), (Chroma::C422, (w.div_ceil(2), h)), (Chroma::C444, (w, h))] {
+                let cn = (cw * ch) as usize;
+                for (alpha, color) in [(None, filmcraft_color::ColorInfo::REC709), (Some(noise8(n, 9)), full)] {
+                    frames.push(frame(w, h, PixelData::Yuv8 { planes: [noise8(n, 1), noise8(cn, 2), noise8(cn, 3)], chroma, alpha }, color));
+                }
+                for bits in [10u32, 12] {
+                    let alpha = (bits == 10).then(|| noise16(n, 9, bits));
+                    frames.push(frame(
+                        w,
+                        h,
+                        PixelData::Yuv16 { planes: [noise16(n, 1, bits), noise16(cn, 2, bits), noise16(cn, 3, bits)], chroma, bits, alpha },
+                        full,
+                    ));
+                }
+            }
+            frames.push(frame(w, h, PixelData::Rgba8(noise8(n * 4, 5)), full));
+            let f: Vec<f32> = noise8(n * 4, 6).iter().map(|v| *v as f32 / 97.0).collect();
+            frames.push(frame(w, h, PixelData::RgbaF32(Arc::new(f)), full));
+        }
+        for f in frames {
+            let f = Arc::new(f);
+            for op in ops {
+                let old = reference::frame_to_image_in(&f, op, Vec::new());
+                assert_bit_exact(&frame_to_image(&f, op), &old, "frame_to_image");
+                let packed = Packed::Video { frame: f.clone(), op };
+                assert_bit_exact(&packed.to_image(), &old, "packed");
+                // a band at a time, as a renderer expands it
+                let mut band = vec![[0.0; 4]; f.width as usize * 3];
+                for y0 in (0..f.height as usize).step_by(3) {
+                    let rows = (f.height as usize - y0).min(3);
+                    packed.rows(y0, &mut band[..rows * f.width as usize]);
+                    let want = &old.data[y0 * f.width as usize..(y0 + rows) * f.width as usize];
+                    assert!(band[..want.len()].iter().zip(want).all(|(p, q)| p.map(f32::to_bits) == q.map(f32::to_bits)), "band at {y0}");
+                }
+            }
+        }
+    }
+
+    /// Stills kept as 8 / 16-bit RGBA convert to exactly the f32 pixels decoded before.
+    #[test]
+    fn packed_stills_expand_bit_exact() {
+        use image::DynamicImage as D;
+        let (w, h) = (13u32, 7u32);
+        let px = |c: usize| noise8((w * h) as usize * c, c as u32).to_vec();
+        let px16 = |c: usize| noise16((w * h) as usize * c, c as u32, 16).to_vec();
+        let stills = [
+            D::ImageRgba8(image::ImageBuffer::from_raw(w, h, px(4)).expect("rgba8")),
+            D::ImageRgb8(image::ImageBuffer::from_raw(w, h, px(3)).expect("rgb8")),
+            D::ImageLuma8(image::ImageBuffer::from_raw(w, h, px(1)).expect("l8")),
+            D::ImageLumaA8(image::ImageBuffer::from_raw(w, h, px(2)).expect("la8")),
+            D::ImageRgba16(image::ImageBuffer::from_raw(w, h, px16(4)).expect("rgba16")),
+            D::ImageRgb16(image::ImageBuffer::from_raw(w, h, px16(3)).expect("rgb16")),
+            D::ImageLuma16(image::ImageBuffer::from_raw(w, h, px16(1)).expect("l16")),
+        ];
+        for img in stills {
+            for op in [
+                AlphaOp::new(AlphaMode::Straight, [0.0; 3]),
+                AlphaOp::new(AlphaMode::Premultiplied, [0.2, 0.4, 0.6]),
+                AlphaOp::new(AlphaMode::Ignore, [0.0; 3]),
+            ] {
+                let old = dynamic_to_image(&img, op);
+                match pack_dynamic(img.clone(), op) {
+                    Err(packed) => {
+                        assert!(packed.bytes() <= (w * h) as usize * 8);
+                        assert_bit_exact(&packed.to_image(), &old, "still");
+                    }
+                    Ok(_) => panic!("8 / 16-bit stills are kept packed"),
+                }
+            }
+        }
+        let float = D::ImageRgba32F(image::ImageBuffer::from_raw(1, 1, vec![0.2, 1.0, 4.0, 1.0]).expect("f32"));
+        assert!(pack_dynamic(float, AlphaOp::new(AlphaMode::Straight, [0.0; 3])).is_ok(), "float stills stay float");
     }
 
     /// `cargo test -p effectcraft-media --lib bench -- --ignored --nocapture`

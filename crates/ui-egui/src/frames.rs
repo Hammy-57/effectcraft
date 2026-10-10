@@ -25,7 +25,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use effectcraft_engine::project::{Comp, ItemId, ItemKind, LayerSource, Node, Project, PropGroup};
 use effectcraft_engine::render::disk_cache::{self, DiskCache};
@@ -353,12 +353,24 @@ pub fn comp_has_effects(project: &Project, comp: ItemId) -> bool {
     walk(project, comp, 0)
 }
 
+/// See [`Frames::failed`]: (key, revision) pairs.
+type Failed = Arc<Mutex<HashSet<(FrameKey, u64)>>>;
+
+/// Failed frames remembered at most (then forgotten, so retried once).
+const MAX_FAILED: usize = 256;
+
 pub struct Frames {
     cache: Arc<Mutex<Cache>>,
     /// Keys queued or rendering.
     inflight: Arc<Mutex<HashSet<FrameKey>>>,
+    /// Frames whose render panicked, with the project revision they were asked for at: not asked
+    /// for again until the project changes (or the caches are purged), instead of re-rendering
+    /// (and panicking) at every UI frame.
+    failed: Failed,
     /// Pending jobs, picked by priority when a pool thread frees up (the viewer's frame first).
     queue: Arc<Mutex<Queue>>,
+    /// Signalled when a job stops running (workers waiting for memory, see [`max_running`]).
+    freed: Arc<Condvar>,
     #[cfg(not(target_arch = "wasm32"))]
     /// None if the OS refused the threads: jobs then go to rayon's global pool.
     pool: Option<rayon::ThreadPool>,
@@ -387,7 +399,9 @@ impl Default for Frames {
         Frames {
             cache: Arc::new(Mutex::new(Cache { map: HashMap::new(), order: VecDeque::new(), bytes: 0, gpu_bytes: 0, budget: 3 << 30, gpu_budget: GPU_BUDGET })),
             inflight: Arc::new(Mutex::new(HashSet::new())),
+            failed: Failed::default(),
             queue: Arc::new(Mutex::new(Queue::default())),
+            freed: Arc::default(),
             #[cfg(not(target_arch = "wasm32"))]
             // A panicking job would abort the whole process (rayon's default for `spawn`): log it
             // and lose only that frame (the panic hook has logged the message).
@@ -408,6 +422,17 @@ impl Default for Frames {
             remote_busy: Arc::default(),
         }
     }
+}
+
+/// Frames that may render at once given `job`'s size: each takes about four `f32` frames (the
+/// comp canvas, layer buffers, matte / adjustment temporaries), and together they stay within
+/// the layer cache's memory budget (Memory & CPU settings): a 4K comp (~530 MB a frame) renders
+/// two frames at once on the default 1 GB, an HD comp eight. At least one.
+fn max_running(job: &Job) -> usize {
+    let (w, h) = job.src.project.comp(job.comp).map_or((0, 0), |c| (c.width, c.height));
+    let s = job.opts.scale.clamp(0.01, 4.0);
+    let frame = ((w as f64 * s).ceil() * (h as f64 * s).ceil() * 16.0 * 4.0).max(1.0);
+    ((job.src.layer_cache.budget() as f64 / frame) as usize).max(1)
 }
 
 /// Premultiplied f32 → egui premultiplied Color32 (alpha kept, so the viewer can show the
@@ -457,11 +482,26 @@ pub fn fit_texture(img: egui::ColorImage, max_side: usize) -> egui::ColorImage {
 
 /// [`fit_texture`] averaging down by at least `min_k` (see [`fit_factor`]).
 pub fn fit_texture_by(img: egui::ColorImage, max_side: usize, min_k: usize) -> egui::ColorImage {
-    let [w, h] = img.size;
     let k = fit_factor(img.size, max_side, min_k);
     if k == 1 {
         return img;
     }
+    average_down(&img, k)
+}
+
+/// [`fit_texture_by`] for a shared frame: one that fits is handed to egui as it is (no copy of
+/// its pixels; egui uploads straight from the `Arc`).
+pub fn fit_texture_shared(img: &Arc<egui::ColorImage>, max_side: usize, min_k: usize) -> Arc<egui::ColorImage> {
+    let k = fit_factor(img.size, max_side, min_k);
+    if k == 1 {
+        return Arc::clone(img);
+    }
+    Arc::new(average_down(img, k))
+}
+
+/// `img` averaged down by `k` (rounded up at the edges).
+fn average_down(img: &egui::ColorImage, k: usize) -> egui::ColorImage {
+    let [w, h] = img.size;
     let (fw, fh) = (w.div_ceil(k), h.div_ceil(k));
     let px: Vec<egui::Color32> = (0..fw * fh)
         .into_par_iter()
@@ -665,6 +705,14 @@ impl Frames {
             c.bytes = 0;
             c.gpu_bytes = 0;
         }
+        if let Ok(mut f) = self.failed.lock() {
+            f.clear();
+        }
+    }
+
+    /// The render of `key` panicked at its revision (it is not asked for again until then).
+    pub fn failed(&self, key: &FrameKey) -> bool {
+        self.failed.lock().is_ok_and(|f| f.contains(&(*key, key.revision)))
     }
 
     /// Queue a prefetch frame (no-op if cached or already queued/rendering).
@@ -683,7 +731,7 @@ impl Frames {
     }
 
     fn request_with(&self, src: &RenderSource, key: FrameKey, comp: ItemId, t: Tick, opts: RenderOpts, urgent: bool) {
-        if self.is_cached(&key) {
+        if self.is_cached(&key) || self.failed(&key) {
             return;
         }
         let Ok(mut q) = self.queue.lock() else { return };
@@ -719,6 +767,10 @@ impl Frames {
         q.jobs.push(Job { key, src: src.clone(), comp, t, opts, urgent, seq });
         drop(inf);
         drop(q);
+        // A worker waiting for memory takes the viewer's frame at once.
+        if urgent {
+            self.freed.notify_all();
+        }
         #[cfg(not(target_arch = "wasm32"))]
         if self.remote.is_none() {
             let w = self.worker();
@@ -741,8 +793,10 @@ impl Frames {
     fn worker(&self) -> Worker {
         Worker {
             queue: self.queue.clone(),
+            freed: self.freed.clone(),
             cache: self.cache.clone(),
             inflight: self.inflight.clone(),
+            failed: self.failed.clone(),
             ctx: self.ctx.clone(),
             last: self.last_ms.clone(),
             content_keys: self.content_keys.clone(),
@@ -870,8 +924,10 @@ impl Frames {
 /// Renders queued jobs (on a pool thread, or the UI thread on wasm32).
 struct Worker {
     queue: Arc<Mutex<Queue>>,
+    freed: Arc<Condvar>,
     cache: Arc<Mutex<Cache>>,
     inflight: Arc<Mutex<HashSet<FrameKey>>>,
+    failed: Failed,
     ctx: Option<egui::Context>,
     last: Arc<Mutex<f64>>,
     content_keys: ContentKeys,
@@ -884,7 +940,18 @@ impl Worker {
         let Worker { queue, content_keys, .. } = self;
         let job = {
             let Ok(mut q) = queue.lock() else { return false };
-            let Some(i) = Queue::best(&q.jobs) else { return false };
+            let i = loop {
+                let Some(i) = Queue::best(&q.jobs) else { return false };
+                let j = &q.jobs[i];
+                // Prefetch waits while the frames already rendering would take more memory than
+                // the budget allows; the viewer's frame never waits. (wasm32 renders one frame
+                // at a time on the UI thread, which must not block.)
+                if cfg!(target_arch = "wasm32") || j.urgent || q.running.len() < max_running(j) {
+                    break i;
+                }
+                let Ok((g, _)) = self.freed.wait_timeout(q, std::time::Duration::from_millis(50)) else { return false };
+                q = g;
+            };
             let job = q.jobs.swap_remove(i);
             q.running.insert(job.key);
             if job.urgent {
@@ -901,8 +968,8 @@ impl Worker {
             None => match self.render_guarded(&job) {
                 Some(ci) => ci,
                 None => {
-                    // Not "in progress" forever: the viewer asks for it again.
-                    self.release(job.key, job.urgent);
+                    // Not "in progress" forever; not asked for again until the project changes.
+                    self.give_up(job.key, job.urgent);
                     return true;
                 }
             },
@@ -937,6 +1004,17 @@ impl Worker {
         self.release(key, urgent);
     }
 
+    /// The render of `key` failed: remember it (see [`Frames::failed`]) and release the job.
+    fn give_up(&self, key: FrameKey, urgent: bool) {
+        if let Ok(mut f) = self.failed.lock() {
+            if f.len() >= MAX_FAILED {
+                f.clear();
+            }
+            f.insert((key, key.revision));
+        }
+        self.release(key, urgent);
+    }
+
     /// The job of `key` is no longer queued or running (rendered or dropped).
     fn release(&self, key: FrameKey, urgent: bool) {
         if let Ok(mut inf) = self.inflight.lock() {
@@ -948,6 +1026,7 @@ impl Worker {
                 q.urgent_running = q.urgent_running.saturating_sub(1);
             }
         }
+        self.freed.notify_all();
         if let Some(ctx) = &self.ctx {
             ctx.request_repaint();
         }
@@ -1109,6 +1188,12 @@ mod tests {
         assert_eq!(fit_texture(img.clone(), 5).pixels, img.pixels);
         let mixed = fit_texture(egui::ColorImage::new([2, 1], vec![w, b]), 1);
         assert_eq!(mixed.pixels, vec![egui::Color32::from_rgba_premultiplied(128, 128, 128, 255)]);
+        // A shared frame that fits goes to egui as it is (no pixel copy); one that doesn't is
+        // averaged down exactly like an owned one.
+        let shared = Arc::new(img.clone());
+        assert!(Arc::ptr_eq(&fit_texture_shared(&shared, 5, 1), &shared));
+        assert_eq!(fit_texture_shared(&shared, 2, 1).pixels, out.pixels);
+        assert_eq!(fit_texture_shared(&shared, 5, 2).pixels, fit_texture_by(img, 5, 2).pixels);
     }
 
     #[test]
@@ -1183,9 +1268,69 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        assert!(footage.0.load(Ordering::SeqCst) > 0, "the render reached the footage");
+        let tries = footage.0.load(Ordering::SeqCst);
+        assert!(tries > 0, "the render reached the footage");
         assert_eq!(f.inflight(), 0, "released");
         assert!(!f.is_cached(&key));
+        // No hot retry loop: the viewer asks again at every UI frame, but the same frame of the
+        // same project isn't rendered (and doesn't panic) again.
+        assert!(f.failed(&key));
+        for _ in 0..10 {
+            f.request(&src, key, cid, Tick::ZERO, RenderOpts::default());
+            f.request_urgent(&src, key, cid, Tick::ZERO, RenderOpts::default());
+        }
+        assert_eq!(f.inflight(), 0, "not queued again");
+        assert_eq!(footage.0.load(Ordering::SeqCst), tries);
+        // Once the project changes (a later revision), it is tried again.
+        let later = FrameKey { revision: key.revision + 1, ..key };
+        assert!(!f.failed(&later));
+        f.request(&src, later, cid, Tick::ZERO, RenderOpts::default());
+        for _ in 0..1000 {
+            if f.inflight() == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(footage.0.load(Ordering::SeqCst) > tries, "retried after a change");
+        assert!(f.failed(&later));
+        // Purge Caches forgets failures too.
+        f.clear();
+        assert!(!f.failed(&later));
+    }
+
+    /// Frames rendering at once are bounded by their size against the layer cache budget: 4K
+    /// comps render fewer at once than HD ones, and never fewer than one.
+    #[test]
+    fn concurrent_frames_follow_frame_size_and_budget() {
+        use effectcraft_engine::Session;
+        use serde_json::json;
+        let mut s = Session::default();
+        let comp = |s: &mut Session, w: u32, h: u32| ItemId(s.execute("comp.new", json!({"name": "C", "width": w, "height": h, "duration": 1})).unwrap()["comp"].as_u64().unwrap());
+        let uhd = comp(&mut s, 3840, 2160);
+        let hd = comp(&mut s, 1920, 1080);
+        let job = |cid: ItemId, scale: f64, budget: usize| Job {
+            key: key(cid.0, 0, 0),
+            src: RenderSource {
+                project: s.project.clone(),
+                footage: Arc::new(effectcraft_engine::render::NoFootage),
+                expr: None,
+                layer_cache: Arc::new(LayerCache::new(budget)),
+                gpu: None,
+                gpu_display: false,
+                disk: None,
+            },
+            comp: cid,
+            t: Tick::ZERO,
+            opts: RenderOpts { scale, ..Default::default() },
+            urgent: false,
+            seq: 0,
+        };
+        let gib = 1 << 30;
+        assert_eq!(max_running(&job(uhd, 1.0, gib)), 2);
+        assert_eq!(max_running(&job(hd, 1.0, gib)), 8);
+        assert_eq!(max_running(&job(uhd, 0.5, gib)), 8, "Half resolution renders HD-sized frames");
+        assert_eq!(max_running(&job(uhd, 1.0, 64 << 20)), 1);
+        assert_eq!(max_running(&job(ItemId(9999), 1.0, gib)), gib, "no comp: nothing to bound");
     }
 
     /// #284: scrubbing asks for a viewer frame at every step; a newer one drops the comp's viewer

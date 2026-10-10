@@ -256,7 +256,7 @@ pub(crate) async fn webm(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut Sta
     // Frames render in parallel, the next batch while this one encodes; the VP9 streams
     // (inter-coded) encode in order, colour and alpha side by side.
     let render = |_: u64, img: effectcraft_raster::Image| job.pixels(&img, comp, if alpha { Channels::Rgba } else { colour_channels }, w, h);
-    job.batches(comp, total, batch_size(), render, async |batches: &mut Batches<'_, '_, Vec<u8>>| -> Result<()> {
+    job.batches(comp, total, batch_size(job, comp), render, async |batches: &mut Batches<'_, '_, Vec<u8>>| -> Result<()> {
         while let Some((i, end, pixels)) = batches.next().await? {
             let mut frames: Vec<Frame> = Vec::with_capacity(pixels.len());
             for (j, px) in pixels.iter().enumerate() {

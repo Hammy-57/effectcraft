@@ -316,7 +316,7 @@ impl<'a> Renderer<'a> {
     pub fn styled_layer(&self, ctx: &EvalCtx, layer: &Layer) -> Option<StyledLayer> {
         let mut timing = self.profile.map(|_| LayerTiming { depth: self.depth, layer: layer.name.clone(), ..Default::default() });
         let t0 = web_time::Instant::now();
-        let st = self.styled(ctx, layer, timing.as_mut()).map(|st| self.styled_to_blend(st));
+        let st = self.styled_blend(ctx, layer, timing.as_mut());
         if let (Some(prof), Some(mut timing)) = (self.profile, timing) {
             timing.process_ms = t0.elapsed().as_secs_f64() * 1e3;
             if let Ok(mut v) = prof.lock() {

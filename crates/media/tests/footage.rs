@@ -230,10 +230,13 @@ fn h264_mp4_probe_and_frames() {
     let last = pool.frame_at(&f, Tick(10 * TICKS_PER_SECOND)).expect("frame");
     let db = psnr(&last, &reference_frame(&p, 59));
     assert!(db > 35.0, "clamp: {db:.2} dB");
-    // cached
+    // cached (kept as the decoder's 4:2:0 samples, converted on use: the same pixels)
     let a = pool.frame_at(&f, t_of(f.frame_rate, 45)).expect("frame");
+    let hits = pool.stats().hits;
     let b = pool.frame_at(&f, t_of(f.frame_rate, 45)).expect("frame");
-    assert!(Arc::ptr_eq(&a, &b));
+    assert_eq!(pool.stats().hits, hits + 1);
+    assert!(a.data == b.data);
+    assert!(pool.stats().bytes <= pool.stats().frames * (1920 * 1080 * 3 / 2 + 64), "{:?}", pool.stats());
 }
 
 #[test]
@@ -424,7 +427,9 @@ fn png_with_alpha() {
     let pool = MediaPool::new();
     let a = pool.frame_at(&f, Tick::ZERO).expect("frame");
     let b = pool.frame_at(&f, Tick(5 * TICKS_PER_SECOND)).expect("frame");
-    assert!(Arc::ptr_eq(&a, &b), "stills are timeless");
+    let st = pool.stats();
+    assert!(st.frames == 1 && st.hits == 1 && a.data == b.data, "stills are timeless: {st:?}");
+    assert_eq!(st.bytes, 256 * 128 * 4 + 64, "kept as 8-bit RGBA");
     assert_eq!(*a, load_png(&p));
     assert!(a.data[0][3] == 0.0 && a.data[a.data.len() - 1][3] > 0.98);
     let th = pool.thumbnail(&f, 64).expect("thumb");
@@ -453,7 +458,8 @@ fn wav_audio() {
 fn cache_budget_evicts() {
     let Some(p) = vp9_webm() else { return };
     let f = probe(&p).expect("probe");
-    let frame_bytes = 640 * 360 * 16;
+    // 8-bit 4:2:0 frames are cached as their samples: 1.5 bytes a pixel.
+    let frame_bytes = 640 * 360 * 3 / 2 + 64;
     let pool = MediaPool::with_budget(3 * frame_bytes + 1024);
     for n in 0..10 {
         pool.frame_at(&f, t_of(f.frame_rate, n)).expect("frame");
@@ -650,4 +656,99 @@ fn conformed_flac_audio_reads_back_like_the_decoder() {
     assert_eq!(conformed, decoded);
     assert_eq!(pool.audio_samples(&f, at, 4800, 48_000), decoded);
     let _ = std::fs::remove_dir_all(&folder);
+}
+
+/// Probing reads standalone audio from its headers and packet framing (no decode) and movies
+/// from their index (through the file): it describes them exactly as opening the whole file in
+/// memory does.
+#[test]
+fn header_probe_matches_a_whole_file_probe() {
+    let Some(flac) = sine_flac(5, 44_100, 2, "s16") else { return };
+    let mp3 = ffmpeg_fixture("sine_3s.mp3", &["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100:duration=3", "-c:a", "libmp3lame", "-b:a", "128k"]);
+    let mp3_cbr_no_tag = ffmpeg_fixture(
+        "sine_2s_notag.mp3",
+        &["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=2", "-c:a", "libmp3lame", "-write_xing", "0"],
+    );
+    let files = [Some(flac), mp3, mp3_cbr_no_tag, h264_mp4(), vp9_webm(), tone_wav(), alpha_png()];
+    for p in files.into_iter().flatten() {
+        let fast = probe(&p).expect("probe");
+        let bytes: Arc<[u8]> = std::fs::read(&p).expect("read").into();
+        let whole = effectcraft_media::probe_bytes(&p.to_string_lossy(), bytes).expect("probe bytes");
+        assert_eq!(fast, whole, "{}", p.display());
+    }
+}
+
+/// Footage read only through [`FootageSource::frame`] (float frames at full size): the
+/// renderer's reference path, before frames were kept packed and resampled by the pool.
+struct FloatFrames(MediaPool);
+
+impl FootageSource for FloatFrames {
+    fn frame(&self, item: ItemId, f: &Footage, t: Tick) -> Option<Arc<Image>> {
+        self.0.frame(item, f, t)
+    }
+}
+
+/// A comp of `f`'s size holding one layer of it, colour-managed or not.
+fn footage_comp(f: &Footage, managed: bool) -> (effectcraft_project::Project, ItemId) {
+    use effectcraft_project::{BitDepth, Comp, ItemKind, LayerSource, Project, build};
+    let mut p = Project::default();
+    p.settings.bit_depth = BitDepth::Bpc32;
+    if managed {
+        p.settings.working_space = Some(effectcraft_project::ColorSpace::DisplayP3);
+    }
+    let comp = Comp::new(f.width, f.height, FrameRate::FPS_30, Tick::from_seconds_f64(1.0));
+    let cid = p.add_item("Comp", effectcraft_color::Label::default(), None, ItemKind::Comp(comp.clone().into()));
+    let fid = p.add_item("clip", effectcraft_color::Label::default(), None, ItemKind::Footage(f.clone()));
+    let l = build::layer(&mut p, &comp, "clip", LayerSource::Footage { item: fid }, (f.width, f.height), None);
+    p.comp_mut(cid).expect("comp").layers.push(l);
+    (p, cid)
+}
+
+/// Footage layers render the same pixels whether their frames come packed (converted straight
+/// into the layer buffer with the colour conversion) and, at reduced resolution, already
+/// resampled by the pool, or as full-size float frames the renderer copies and resamples.
+#[test]
+fn packed_and_preview_frames_render_like_float_frames() {
+    use effectcraft_render::{RenderOpts, Renderer};
+    let (Some(movie), Some(still)) = (h264_mp4(), alpha_png()) else { return };
+    for path in [movie, still] {
+        let f = probe(&path).expect("probe");
+        for managed in [false, true] {
+            let (p, cid) = footage_comp(&f, managed);
+            for scale in [1.0, 0.5, 1.0 / 3.0, 0.25] {
+                let pool = MediaPool::new();
+                let reference = FloatFrames(MediaPool::new());
+                let opts = RenderOpts { scale, ..RenderOpts::default() };
+                for k in [0i64, 1] {
+                    let t = FrameRate::FPS_30.tick_of(k);
+                    let a = Renderer::new(&p, &pool, opts).comp_frame(cid, t);
+                    let b = Renderer::new(&p, &reference, opts).comp_frame(cid, t);
+                    assert_eq!((a.width, a.height), (b.width, b.height));
+                    let same = a.data.iter().zip(&b.data).all(|(x, y)| x.map(f32::to_bits) == y.map(f32::to_bits));
+                    assert!(same, "{} managed {managed} scale {scale} frame {k}", path.display());
+                }
+                let st = pool.stats();
+                if scale < 0.75 {
+                    // only the preview-size frames are kept
+                    let (w, h) = (((f.width as f64 * scale).round() as usize), ((f.height as f64 * scale).round() as usize));
+                    assert!(st.frames > 0 && st.bytes == st.frames * (w * h * 16 + 64), "{} scale {scale}: {st:?}", path.display());
+                }
+            }
+        }
+    }
+}
+
+/// Media Browser thumbnails: the first frame is decoded without being cached and the movie's
+/// file isn't kept open (browsing a folder of movies held every one of them).
+#[test]
+fn thumbnails_leave_no_frames_or_files_behind() {
+    let (Some(movie), Some(still)) = (h264_mp4(), alpha_png()) else { return };
+    let pool = MediaPool::new();
+    for p in [movie, still] {
+        let f = probe(&p).expect("probe");
+        let th = FootageSource::thumbnail(&pool, &f, 128).expect("thumbnail");
+        assert_eq!(th.width.max(th.height), 128, "{}", p.display());
+        assert_eq!(pool.stats().frames, 0, "{}: no frame cached", p.display());
+        assert_eq!(pool.open_files(), 0, "{}: no file kept open", p.display());
+    }
 }

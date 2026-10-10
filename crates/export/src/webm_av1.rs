@@ -147,7 +147,7 @@ pub(crate) async fn webm_av1(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut
     let channels = if job.output.channels == Channels::Alpha { Channels::Alpha } else { Channels::Rgb };
     // The next batch renders while this one encodes.
     let render = |_: u64, img: effectcraft_raster::Image| job.pixels(&img, comp, channels, w, h);
-    job.batches(comp, total, batch_size(), render, async |batches: &mut Batches<'_, '_, Vec<u8>>| -> Result<()> {
+    job.batches(comp, total, batch_size(job, comp), render, async |batches: &mut Batches<'_, '_, Vec<u8>>| -> Result<()> {
         while let Some((i, end, frames)) = batches.next().await? {
             for (j, px) in frames.iter().enumerate() {
                 let k = i + j as u64;
