@@ -44,8 +44,9 @@ computer.
 
 **The watchdog** (`.github/workflows/watchdog.yml`, set up at Elias's request) runs `cargo xtask ci
 --affected` on a free GitHub-hosted Linux runner after every push to `main`. It never blocks a push.
-A failure opens one issue labelled `watchdog` ("🔴 main is broken"), and the next green run closes it.
-If that issue is open, fixing main comes before new work.
+A failure shows as the red ❌ on the commit (`gh run list --workflow watchdog.yml`) and in GitHub's email;
+with issues turned on it also opens one `watchdog` issue that the next green run closes. If main is
+red, fixing it comes before new work.
 
 ## Building the app
 
@@ -59,10 +60,14 @@ happened in between:
   replaced: the click brings it to the front.
 - **Command line:** `scripts/fork/app.sh` (same thing; `--status` prints `running` / `stale` /
   `ready`, `--build-only` builds without opening).
-- It builds with the `local` profile (release speed without link-time optimisation, parallel and
-  incremental codegen) in `target/local`, one build at a time (a lock), so a rebuild only recompiles
-  what changed. Published releases still use `release`.
-- After changing `scripts/fork/launcher.swift`, reinstall with `scripts/fork/install-dock-app.sh`.
+- It builds with `[profile.local]` in the root `Cargo.toml` (inherits `release`; `lto = false`,
+  `codegen-units = 16`, `incremental = true`) in `target/local`, one build at a time (a lock), so a
+  rebuild only recompiles what changed. Exit status 130 means the build was stopped, 1 that it
+  failed (log: `target/local/build.log`). Published releases still use `release`.
+- The files: `scripts/fork/app.sh` (the build-and-open logic), `scripts/fork/launcher.swift` (the
+  Dock app's window and Stop button) and `scripts/fork/install-dock-app.sh` (builds the launcher
+  with `swiftc` into `~/Applications/EffectCraft.app` and adds it to the Dock once). After changing
+  the launcher, run the install script again.
 
 ## Cheaper builds
 
@@ -84,3 +89,14 @@ Landed in AG2.16 (details: docs/testing.md, "One test binary per crate").
 For large agent fleets, run the agents and CI on a cloud Linux machine with 32–64 cores, and keep
 the Mac for the app, After Effects and UI checks. This goes with the plan to speed up CI in the
 cloud.
+
+## Owner-local icons
+
+On the owner's machine the app shows After Effects' own icons and cursors (layer-source and
+Project item icons, the toolbar, the viewer footer, the timeline trim cursor), extracted from the
+owner's licensed install into `~/Library/Application Support/EffectCraft/owner-assets` (outside
+every checkout; `EFFECTCRAFT_ICON_REFERENCE` points elsewhere). `crates/ui-egui/src/local_assets.rs`
+loads them at runtime. This is the owner-approved exception in `AGENTS.md` §1.9: the artwork is
+never committed, embedded, shipped or attached anywhere, code names an asset only by file name, and
+every icon keeps its code-drawn fallback, so builds without the folder (CI, other machines,
+upstream) look as before.

@@ -2,14 +2,20 @@
 #
 # The watchdog: work lands on main without a CI run first (docs/fork/agent-builds.md). After each
 # push to main this runs `cargo xtask ci --affected` for what the push changed, on a free
-# GitHub-hosted Linux runner. A failure opens (or comments on) one issue labelled `watchdog`; the
-# next green run closes it. Nothing blocks a push.
+# GitHub-hosted Linux runner. A failure shows as the red X on the commit plus GitHub's email, and
+# opens one issue labelled `watchdog` that the next green run closes. Nothing
+# blocks a push.
 name: Watchdog
 
 on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      base:
+        description: "Test everything since this commit (empty: since the last green watchdog run)"
+        type: string
+        default: ""
 
 # A newer push replaces a run that is still going.
 concurrency:
@@ -19,6 +25,7 @@ concurrency:
 permissions:
   contents: read
   issues: write
+  actions: read
 
 jobs:
   affected:
@@ -45,16 +52,27 @@ jobs:
         with:
           key: watchdog
       - name: cargo xtask ci --affected
+        # Base: the last commit a watchdog run passed on, so changes from cancelled or failed runs are
+        # tested again until main is green (else the push's previous commit, else HEAD~1).
         env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_BASE: ${{ inputs.base }}
           BEFORE: ${{ github.event.before }}
         run: |
-          base="$BEFORE"
-          if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then base="HEAD~1"; fi
-          echo "base: $base"
+          ok() { [ -n "$1" ] && git cat-file -e "$1^{commit}" 2>/dev/null && git merge-base --is-ancestor "$1" HEAD; }
+          green=$(gh run list --workflow watchdog.yml --branch main --status success --limit 1 --json headSha --jq '.[0].headSha // ""' || true)
+          base=""
+          for b in "$INPUT_BASE" "$green" "$BEFORE" HEAD~1; do
+            if ok "$b"; then base="$b"; break; fi
+          done
+          echo "base: $base (input: ${INPUT_BASE:-none}, last green: ${green:-none})"
           cargo xtask ci --affected --base "$base"
 
+      # If issues are ever turned off these two steps skip quietly: a failure still shows as the red X
+      # on the commit and in GitHub's failed-run email.
       - name: Report a broken main
         if: failure()
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
           RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -70,6 +88,7 @@ jobs:
           fi
       - name: Close the issue once main is green again
         if: success()
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

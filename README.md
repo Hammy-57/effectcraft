@@ -168,9 +168,11 @@ cannot express; File ▸ Import ▸ Lottie… opens one as a new composition.
 Everything you can do from a menu is a command with an id, and agents can reach every one of
 them:
 
-- **MCP server:** `effectcraft-cli mcp` speaks the Model Context Protocol over stdio, headless
-  or bridged to the running app (`--bridge 9877`). Tools cover commands, the project and property
-  tree, keyframes and rendered frames. This repository ships a ready [`.mcp.json`](.mcp.json).
+- **MCP server:** `effectcraft-cli mcp` speaks the Model Context Protocol over stdio, headless,
+  with the full app offscreen (`--ui`: screenshots and real input, no window) or bridged to the
+  running app (`--bridge 9877`). Tools cover commands, the project and property tree, keyframes,
+  rendered frames and contact sheets, before/after comparisons, layer layout and audio loudness.
+  This repository ships a ready [`.mcp.json`](.mcp.json) ([docs/mcp.md](docs/mcp.md)).
 - **Command line:** one-shot calls with JSON output, for example
   `effectcraft-cli set Main '#1' transform/position '[100,360]' --time 0 main.ecproj --save`
   or `effectcraft-cli render --comp Main --out main.mp4`, or
@@ -224,8 +226,10 @@ exists, including all of its effects, but existing is not the same as behaving e
 Effects, and we haven't measured that yet. Today it's a good place to try things and to tell us
 what breaks. It isn't yet a replacement for After Effects on client work. In particular:
 
-- **After Effects projects can't be opened.** Projects are saved as `.ecproj`, readable versioned
-  JSON, but EffectCraft can't open `.aep` / `.aepx` files, and After Effects plug-ins don't run.
+- **After Effects projects open through a converter.** File ▸ Import ▸ After Effects Project
+  converts an `.aep` with the MIT-licensed [py-aep](https://github.com/forticheprod/py-aep), so
+  Python with py-aep is needed while converting ([packaging/aep/README.md](packaging/aep/README.md));
+  the result is a native `.ecproj`. `.aepx` isn't read, and After Effects plug-ins don't run.
 - **Behaviour still differs from After Effects in places.** Nothing yet compares our renders with
   After Effects automatically, so please report differences.
 - **macOS is the most tested platform.** Linux and Windows users have hit basic interaction
