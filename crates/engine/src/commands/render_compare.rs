@@ -372,7 +372,7 @@ mod tests {
     fn moved_layer_shows_up_and_undo_restores_it() {
         let mut s = session();
         s.execute("render.snapshot", json!({"name": "before"})).unwrap();
-        s.execute("prop.set", json!({"layer": 1, "path": "transform/position", "value": [33, 18]})).unwrap();
+        s.execute("prop.set", json!({"layer": "#1", "path": "transform/position", "value": [33, 18]})).unwrap();
         let diff = tmp("diff.png");
         let r = s.execute("render.compare", json!({"a": "before", "b": {"comp": "C"}, "diff_path": diff, "diff_inline": true})).unwrap();
         assert_eq!(r["pass"], false, "{r}");
@@ -399,7 +399,7 @@ mod tests {
         let r = s.execute("render.compare", json!({"a": "before", "b": {}})).unwrap();
         assert_eq!(r["diffBounds"], json!(null), "identical frames: {r}");
         // The 16×16 box (x 24..40, y 10..26) moves 10 px right: the box spans x 24..50.
-        s.execute("prop.set", json!({"layer": 1, "path": "transform/position", "value": [42, 18]})).unwrap();
+        s.execute("prop.set", json!({"layer": "#1", "path": "transform/position", "value": [42, 18]})).unwrap();
         let r = s.execute("render.compare", json!({"a": "before", "b": {}})).unwrap();
         assert_eq!((r["diffBounds"].clone(), r["changed_pixels"].as_u64()), (json!([24, 10, 26, 16]), Some(320)), "{r}");
         assert!(r.get("region").is_none());

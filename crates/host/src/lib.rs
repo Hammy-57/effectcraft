@@ -251,7 +251,8 @@ mod tests {
         s.execute("prop.set", json!({"layer": layer, "path": "transform/rotationX", "value": 20})).unwrap();
         let cid = s.active_comp_id().unwrap();
         let img = s.render(cid, s.time(), effectcraft_engine::render::RenderOpts { scale: 0.25, ..Default::default() });
-        let red = img.data.iter().filter(|p| p[3] > 0.99 && p[0] > 0.2 && p[1] < 0.05 && p[2] < 0.05).count();
+        // Clearly red: the shading lifts green and blue a little (about 0.06 on the fork's renderer).
+        let red = img.data.iter().filter(|p| p[3] > 0.99 && p[0] > 0.2 && p[1] < 0.15 && p[2] < 0.15).count();
         let _ = std::fs::remove_file(&path);
         // Half the comp height wide, seen at an angle: well over 5% of the frame.
         assert!(red * 20 > img.data.len(), "red cube pixels: {red} of {}", img.data.len());

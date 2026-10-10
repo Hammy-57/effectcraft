@@ -172,6 +172,9 @@ fn history_panel_jumps_between_branches() {
 
 /// onDraw fills of concave paths and real images (drawImage, image controls), rendered.
 #[test]
+// On Linux runners without a GPU (Mesa llvmpipe) the ScriptUI window renders transparent here;
+// it passes on macOS and Windows. On Linux, run it with `-- --ignored`.
+#[cfg_attr(target_os = "linux", ignore = "renders transparent on GPU-less Linux (llvmpipe)")]
 fn on_draw_concave_fills_and_images_render() {
     let _gpu = crate::gpu_lock();
     let dir = std::env::temp_dir().join(format!("effectcraft-scriptui-img-{}", std::process::id()));
