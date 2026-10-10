@@ -1,6 +1,12 @@
 //! MCP server: JSON-RPC 2.0, one message per line (the MCP stdio transport). Implements
 //! tools and JSON resources. The stdio loop handles progress and cancellation for long renders.
+//!
+//! Clients can subscribe to `effectcraft://document`: after a tool call that changed the project
+//! (its revision), the server sends `notifications/resources/updated`. A `tools/call` carrying
+//! `_meta.requestId` (or a `request_id` argument) is answered from a small cache when the same id
+//! comes again, so a retried call never runs twice.
 
+use std::collections::VecDeque;
 use std::io::{BufRead, Write};
 use std::path::Path;
 
@@ -23,14 +29,47 @@ const INVALID_PARAMS: i64 = -32602;
 const INTERNAL_ERROR: i64 = -32603;
 const RESOURCE_NOT_FOUND: i64 = -32002;
 
+/// Tool-call `requestId`s remembered (with their results) for retries.
+const REPLY_CACHE: usize = 128;
+
 pub struct McpServer {
     backend: Backend,
     autosave: Option<AutoSave>,
+    /// The project revision when `effectcraft://document` was subscribed or last reported
+    /// (`None`: not subscribed).
+    watched: Option<u64>,
+    /// Notifications to send after the current reply.
+    outbox: Vec<Value>,
+    /// Recent `tools/call` results by request id.
+    replies: VecDeque<(String, Value)>,
 }
 
 impl McpServer {
     pub fn new(backend: Backend) -> Self {
-        Self { backend, autosave: None }
+        Self { backend, autosave: None, watched: None, outbox: Vec::new(), replies: VecDeque::new() }
+    }
+
+    /// Notifications due after the last reply (`notifications/resources/updated`), oldest first.
+    pub fn take_notifications(&mut self) -> Vec<Value> {
+        std::mem::take(&mut self.outbox)
+    }
+
+    /// The project revision: the session's, or the app's in bridge mode (`None` when unknown).
+    fn revision(&mut self) -> Option<u64> {
+        if let Backend::Headless(s) = &self.backend {
+            return Some(s.revision);
+        }
+        self.backend.control("app.revision", json!({})).ok()?.get("revision")?.as_u64()
+    }
+
+    /// Queue `notifications/resources/updated` when a subscribed document changed.
+    fn notify_if_changed(&mut self) {
+        let Some(before) = self.watched else { return };
+        let Some(now) = self.revision() else { return };
+        if now != before {
+            self.watched = Some(now);
+            self.outbox.push(json!({"jsonrpc": "2.0", "method": "notifications/resources/updated", "params": {"uri": DOCUMENT_URI}}));
+        }
     }
 
     /// Opt in to durable headless checkpoints in a separate folder per server.
@@ -137,6 +176,11 @@ impl McpServer {
                     output.write_all(b"\n")?;
                     output.flush()?;
                 }
+                for note in self.take_notifications() {
+                    output.write_all(note.to_string().as_bytes())?;
+                    output.write_all(b"\n")?;
+                    output.flush()?;
+                }
             }
             match read_error.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
                 Some(e) => Err(e),
@@ -168,7 +212,7 @@ impl McpServer {
                 };
                 Ok(json!({
                     "protocolVersion": version,
-                    "capabilities": {"tools": {"listChanged": false}, "resources": {"listChanged": false, "subscribe": false}},
+                    "capabilities": {"tools": {"listChanged": false}, "resources": {"listChanged": false, "subscribe": true}},
                     "serverInfo": {"name": "effectcraft", "title": format!("EffectCraft ({mode})"), "version": env!("CARGO_PKG_VERSION")},
                     "instructions": instructions,
                     "_meta": {"effectcraftAutoSave": self.autosave_info()},
@@ -181,7 +225,12 @@ impl McpServer {
             }
             "tools/call" => {
                 let name = params.get("name").and_then(Value::as_str).ok_or((INVALID_PARAMS, "missing tool `name`".to_string()))?;
-                let args = params.get("arguments").cloned().unwrap_or(json!({}));
+                let mut args = params.get("arguments").cloned().unwrap_or(json!({}));
+                // Idempotency key: `_meta.requestId` or a `request_id` argument (never passed on).
+                let request_id = take_request_id(params, &mut args);
+                if let Some(cached) = request_id.as_ref().and_then(|rid| self.replies.iter().find(|(k, _)| k == rid)) {
+                    return Ok(cached.1.clone());
+                }
                 if tools::available(self.backend.is_bridge()).all(|t| t.name != name) {
                     let hint = if tools::find(name).is_some() { format!(" ({})", crate::backend::NEED_BRIDGE) } else { String::new() };
                     return Err((INVALID_PARAMS, format!("unknown tool `{name}`{hint}")));
@@ -217,6 +266,13 @@ impl McpServer {
                     summary["autosave"] = self.autosave_info();
                     *text = Value::String(summary.to_string());
                 }
+                if let Some(rid) = request_id {
+                    while self.replies.len() >= REPLY_CACHE {
+                        self.replies.pop_front();
+                    }
+                    self.replies.push_back((rid, result.clone()));
+                }
+                self.notify_if_changed();
                 Ok(result)
             }
             "resources/list" => Ok(json!({"resources": [
@@ -224,6 +280,14 @@ impl McpServer {
                 {"uri": COMMANDS_URI, "name": "commands", "title": "Command catalog", "description": "Every engine command with id, label, menu, shortcut and params (same as command_list).", "mimeType": "application/json"},
             ]})),
             "resources/templates/list" => Ok(json!({"resourceTemplates": []})),
+            "resources/subscribe" | "resources/unsubscribe" => {
+                let uri = params.get("uri").and_then(Value::as_str).ok_or((INVALID_PARAMS, "missing `uri`".to_string()))?;
+                if uri != DOCUMENT_URI {
+                    return Err((RESOURCE_NOT_FOUND, format!("only {DOCUMENT_URI} can be subscribed, not {uri}")));
+                }
+                self.watched = if method == "resources/subscribe" { Some(self.revision().unwrap_or(0)) } else { None };
+                Ok(json!({}))
+            }
             "resources/read" => {
                 let uri = params.get("uri").and_then(Value::as_str).ok_or((INVALID_PARAMS, "missing `uri`".to_string()))?;
                 let tool = match uri {
@@ -241,6 +305,22 @@ impl McpServer {
             m => Err((METHOD_NOT_FOUND, format!("method not found: {m}"))),
         }
     }
+}
+
+/// Remove and return a `tools/call`'s idempotency key: `params._meta.requestId`, or a
+/// `request_id` / `requestId` argument (strings or numbers).
+fn take_request_id(params: &Value, args: &mut Value) -> Option<String> {
+    let key = |v: Option<Value>| match v? {
+        Value::String(s) => Some(s),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    };
+    let from_args = args.as_object_mut().and_then(|a| {
+        let rid = a.remove("request_id");
+        let camel = a.remove("requestId");
+        key(rid).or(key(camel))
+    });
+    key(params.pointer("/_meta/requestId").cloned()).or(from_args)
 }
 
 /// A `tools/call` result: tool failures are reported in-band (`isError`) so the model can react.

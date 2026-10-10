@@ -51,6 +51,9 @@ impl BridgeClient {
     /// Call a control method; returns the reply's `result`, or the app's `error` as [`Error::App`].
     pub fn call(&mut self, method: &str, params: Value) -> Result<Value> {
         let mut last = Error::Bridge("not attempted".into());
+        // The same `requestId` on the resend: if the app ran the first attempt before the
+        // connection died, it answers from its reply cache instead of running it again.
+        let request_id = format!("mcp-{}-{}", std::process::id(), self.next_id);
         for attempt in 0..2 {
             if self.conn.is_none() {
                 self.conn = Some(self.connect()?);
@@ -58,7 +61,7 @@ impl BridgeClient {
             let id = self.next_id;
             self.next_id += 1;
             let Some((r, w)) = self.conn.as_mut() else { continue };
-            let line = format!("{}\n", json!({"id": id, "method": method, "params": params}));
+            let line = format!("{}\n", json!({"id": id, "requestId": request_id, "method": method, "params": params}));
             // `Ok(Err(_))`: the connection is dead before a reply (safe to resend once);
             // `Err(_)`: a timeout or bad reply (never resent: the app may have run the request).
             let res = (|| -> Result<std::result::Result<Value, Error>> {

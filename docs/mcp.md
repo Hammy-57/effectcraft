@@ -1,7 +1,8 @@
 # MCP conventions
 
 Run `effectcraft-cli mcp` for a headless session, or `effectcraft-cli mcp --bridge 9877`
-to use the desktop app's control channel. Existing ports are unchanged.
+to use the desktop app's control channel (`--bridge` without a port uses
+`EFFECTCRAFT_CONTROL_PORT`, else 9877).
 
 The server provides the same core conventions as FilmCraft #28:
 
@@ -34,6 +35,18 @@ receive `resultType: complete` and list/read cache hints; document reads are nev
 {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"command_run","arguments":{"id":"comp.new","params":{"width":640,"height":360}}}}
 {"jsonrpc":"2.0","id":2,"method":"resources/read","params":{"uri":"effectcraft://document"}}
 ```
+
+## Change notifications and retries
+
+The server advertises `resources.subscribe`. After `resources/subscribe {uri:
+"effectcraft://document"}`, every tool call that changed the project revision is followed by
+`notifications/resources/updated {uri}` (bridge mode reads the app's revision after each call,
+so edits made in the window are reported with the next call). `resources/unsubscribe` stops it.
+
+A `tools/call` with `params._meta.requestId` (or a `request_id` argument, which is removed before
+argument checking) is idempotent: the same id again returns the first result without running the
+tool (last 128 ids). Bridge calls also send a `requestId` on the control channel, so the bridge's
+reconnect-and-resend never runs a command twice.
 
 ## Progress and cancellation
 
