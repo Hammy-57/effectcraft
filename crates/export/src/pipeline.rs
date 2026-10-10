@@ -136,6 +136,59 @@ impl<'a> Cx<'a> {
         ks.into_par_iter().map(|k| f(k, self.frame(comp, k))).collect()
     }
 
+    /// Output frames `0..total` in batches of `batch` frames, each frame mapped by `f`
+    /// (encoding), handed to `body` in order through [`Batches::next`]. On native targets the
+    /// next batch renders on a scoped thread while `body` encodes the current one: at most two
+    /// batches are held, the one being encoded and the one rendered next (handed over through a
+    /// rendezvous channel). In passes (deferred readbacks), on the web and on a rayon worker (it
+    /// must not block on frames its own pool renders) batches render one after another.
+    ///
+    /// When `body` returns (done, an encode error or a stop) the renderer stops at its next
+    /// frame; a renderer that stops early (a panic) makes [`Batches::next`] an error.
+    pub async fn batches<T: Send, R>(
+        &self,
+        comp: &Comp,
+        total: u64,
+        batch: u64,
+        f: impl Fn(u64, Image) -> T + Sync + Send,
+        body: impl AsyncFnOnce(&mut Batches<'_, '_, T>) -> crate::Result<R>,
+    ) -> crate::Result<R> {
+        let batch = batch.max(1);
+        if self.deferred() || cfg!(target_arch = "wasm32") || rayon::current_thread_index().is_some() {
+            let f: &(dyn Fn(u64, Image) -> T + Sync + Send) = &f;
+            return body(&mut Batches { next: 0, total, batch, src: Source::Serial { cx: self, comp, f } }).await;
+        }
+        use rayon::prelude::*;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<T>>(0);
+            let (stop, f) = (&stop, &f);
+            let renderer = s.spawn(move || {
+                let mut i = 0;
+                while i < total && !stop.load(Ordering::Relaxed) {
+                    let end = i.saturating_add(batch).min(total);
+                    // Frames not started once the encode side has stopped are skipped.
+                    let frames: Option<Vec<T>> = (i..end).into_par_iter().map(|k| (!stop.load(Ordering::Relaxed)).then(|| f(k, self.frame(comp, k)))).collect();
+                    let Some(frames) = frames else { break };
+                    if tx.send(frames).is_err() {
+                        break;
+                    }
+                    i = end;
+                }
+            });
+            let mut batches = Batches { next: 0, total, batch, src: Source::Thread(rx) };
+            let r = effectcraft_render::passes::block_on(body(&mut batches));
+            // Stop the renderer: skip its remaining frames and fail its next hand-off.
+            stop.store(true, Ordering::Relaxed);
+            drop(batches);
+            match (r, renderer.join()) {
+                (Err(_), Err(_)) => Err(crate::ExportError::Encode("rendering failed".into())),
+                (r, _) => r,
+            }
+        })
+    }
+
     /// Output frame `i`: sampled (fields, pulldown), at the colour depth, cropped and resized.
     pub fn frame(&self, comp: &Comp, i: u64) -> Image {
         effectcraft_render::passes::block_on(self.frame_async(comp, i))
@@ -296,6 +349,37 @@ impl<'a> Cx<'a> {
     }
 }
 
+/// The batches of [`Cx::batches`], in order.
+pub(crate) struct Batches<'c, 'a, T> {
+    next: u64,
+    total: u64,
+    batch: u64,
+    src: Source<'c, 'a, T>,
+}
+
+enum Source<'c, 'a, T> {
+    /// Rendered when asked for ([`Cx::frames`]).
+    Serial { cx: &'c Cx<'a>, comp: &'c Comp, f: &'c (dyn Fn(u64, Image) -> T + Sync + Send) },
+    /// Rendered ahead on the renderer thread.
+    Thread(std::sync::mpsc::Receiver<Vec<T>>),
+}
+
+impl<T: Send> Batches<'_, '_, T> {
+    /// The next batch: its output frames `start..end` and their mapped frames; `None` after the last.
+    pub async fn next(&mut self) -> crate::Result<Option<(u64, u64, Vec<T>)>> {
+        if self.next >= self.total {
+            return Ok(None);
+        }
+        let (i, end) = (self.next, self.next.saturating_add(self.batch).min(self.total));
+        let frames = match &self.src {
+            Source::Serial { cx, comp, f } => cx.frames(comp, (i..end).collect(), *f).await,
+            Source::Thread(rx) => rx.recv().map_err(|_| crate::ExportError::Encode("rendering stopped".into()))?,
+        };
+        self.next = end;
+        Ok(Some((i, end, frames)))
+    }
+}
+
 /// Weave two fields: the dominant field's lines (even lines when `upper_first`) from `first`.
 pub(crate) fn interleave(first: &Image, second: &Image, upper_first: bool) -> Image {
     let mut out = first.clone();
@@ -416,6 +500,97 @@ mod tests {
         let stats = cx.cache.stats();
         assert_eq!(stats.misses, renders, "the solid rendered on the first frame only");
         assert!(stats.hits >= 9, "{stats:?}");
+    }
+
+    /// Run `f` with the job of a `frames`-frame comp of one solid.
+    fn with_cx<R>(frames: u64, f: impl FnOnce(&Cx, &Comp) -> R) -> R {
+        use effectcraft_color::Label;
+        use effectcraft_project::render_queue::{OutputFormat, OutputModule, RenderSettings};
+        use effectcraft_project::{ItemKind, LayerSource, Solid, build};
+        use effectcraft_render::NoFootage;
+        use effectcraft_time::FrameRate;
+        let mut p = Project::default();
+        let mut comp = Comp::new(16, 16, FrameRate::FPS_25, FrameRate::FPS_25.tick_of(frames as i64));
+        let sid = p.add_item("Solid", Label::Red, None, ItemKind::Solid(Solid { color: [1.0, 0.0, 0.0], width: 8, height: 8, pixel_aspect: 1.0 }));
+        comp.layers.push(build::layer(&mut p, &comp, "Solid", LayerSource::Solid { item: sid }, (8, 8), None));
+        let cid = p.add_item("Comp", Label::Sandstone, None, ItemKind::Comp(comp.into()));
+        let (settings, output) = (RenderSettings::default(), OutputModule::for_format(OutputFormat::H264));
+        let job = Job {
+            project: &p,
+            footage: &NoFootage,
+            expr: None,
+            accel: None,
+            comp: cid,
+            settings: &settings,
+            output: &output,
+            path: "/c/x.mp4",
+            sink: None,
+            nested_switches: true,
+            options: Default::default(),
+        };
+        let cx = Cx::new(&job);
+        let comp = cx.comp().unwrap();
+        f(&cx, comp)
+    }
+
+    #[test]
+    fn an_encode_error_stops_the_renderer() {
+        // G5 B1: the next batch renders while one encodes. An encode error returns at once;
+        // the renderer stops after at most the batch it had in flight (no hang on the hand-off).
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let batch = 4;
+        let rendered = AtomicU64::new(0);
+        let r = with_cx(batch * 10, |cx, comp| {
+            let render = |k: u64, _| {
+                rendered.fetch_add(1, Ordering::Relaxed);
+                k
+            };
+            effectcraft_render::passes::block_on(cx.batches(comp, batch * 10, batch, render, async |b: &mut Batches<'_, '_, u64>| -> crate::Result<()> {
+                let (i, end, ks) = b.next().await?.unwrap();
+                assert_eq!((i, end, ks), (0, batch, vec![0, 1, 2, 3]));
+                Err(crate::ExportError::Encode("boom".into()))
+            }))
+        });
+        assert!(matches!(r, Err(crate::ExportError::Encode(ref e)) if e == "boom"), "{r:?}");
+        let n = rendered.load(Ordering::Relaxed);
+        assert!(n <= batch * 2, "rendered {n} frames after the encoder failed");
+    }
+
+    #[test]
+    fn batches_arrive_in_order_and_a_failed_render_is_an_error() {
+        let batch = 3;
+        let got = with_cx(10, |cx, comp| {
+            effectcraft_render::passes::block_on(cx.batches(
+                comp,
+                10,
+                batch,
+                |k, _| k,
+                async |b: &mut Batches<'_, '_, u64>| -> crate::Result<Vec<(u64, u64, Vec<u64>)>> {
+                    let mut v = vec![];
+                    while let Some(x) = b.next().await? {
+                        v.push(x);
+                    }
+                    Ok(v)
+                },
+            ))
+        });
+        assert_eq!(got.unwrap(), vec![(0, 3, vec![0, 1, 2]), (3, 6, vec![3, 4, 5]), (6, 9, vec![6, 7, 8]), (9, 10, vec![9])]);
+        // A renderer that dies (a panic in the second batch) fails the export instead of
+        // ending it early with a truncated file, and does not hang.
+        let r = with_cx(10, |cx, comp| {
+            let render = |k: u64, _| {
+                assert!(k != 4, "render failure");
+                k
+            };
+            effectcraft_render::passes::block_on(cx.batches(comp, 10, batch, render, async |b: &mut Batches<'_, '_, u64>| -> crate::Result<u64> {
+                let mut n = 0;
+                while let Some((_, _, ks)) = b.next().await? {
+                    n += ks.len() as u64;
+                }
+                Ok(n)
+            }))
+        });
+        assert!(matches!(r, Err(crate::ExportError::Encode(_))), "{r:?}");
     }
 
     #[test]

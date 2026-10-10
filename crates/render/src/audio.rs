@@ -7,14 +7,20 @@
 //! Callers mix in short blocks (one video frame, or an audio device buffer). Effects and levels
 //! are evaluated once per block. To make the result independent of block boundaries, layer
 //! effects are run from a cleared state over a pre-roll of earlier audio and only the block's
-//! tail is kept — so preview playback and export produce identical samples.
+//! tail is kept — so preview playback and export produce the same samples. A caller that mixes
+//! consecutive blocks (playback) can hold an [`AudioStream`]: it keeps each layer's effect chain
+//! running, so the next contiguous block with unchanged effect parameters only processes its own
+//! samples (the result is what one long call from the first block would give) instead of the
+//! pre-roll again (seconds of audio for a compressor or reverb, per 1024-frame block).
 //!
 //! Time-stretched layers are resampled nearest-sample; reversed (negative stretch) layers are
 //! silent for now.
 
+use std::sync::Mutex;
+
 use effectcraft_effects::Params;
-use effectcraft_effects::audio_fx;
-use effectcraft_project::{Comp, GroupKind, ItemId, ItemKind, Layer, LayerSource, Node, Project};
+use effectcraft_effects::audio_fx::{self, Processor};
+use effectcraft_project::{Comp, GroupKind, ItemId, ItemKind, Layer, LayerId, LayerSource, Node, Project};
 use effectcraft_time::{TICKS_PER_SECOND, Tick};
 
 use crate::{EvalCtx, ExprHost, FootageSource};
@@ -25,8 +31,128 @@ const MAX_DEPTH: usize = 16;
 /// interleaved (L R L R …).
 pub fn mix_comp(project: &Project, footage: &dyn FootageSource, expr: Option<&dyn ExprHost>, comp: ItemId, start: Tick, frames: usize, rate: u32) -> Vec<f32> {
     let mut out = vec![0.0f32; frames * 2];
-    mix_into(project, footage, expr, comp, start, rate, &mut out, 1.0, 1.0, 0);
+    mix_into(project, footage, expr, comp, start, rate, &mut out, 1.0, 1.0, 0, None);
     out
+}
+
+/// Layer effect chains kept running between consecutive [`AudioStream::mix`] calls, so playback
+/// pays an effect's pre-roll once per seek instead of once per block.
+///
+/// Hold one per playback of one project snapshot (its state is the history of that project's
+/// audio): a block that continues the previous one for a layer (it starts where that ended, or
+/// within its last few frames) with the same effect parameters carries the chain on; anything
+/// else (a seek or loop, a parameter change, Backwards) renders from a cleared state over the
+/// pre-roll as [`mix_comp`] does and starts a new chain. The cache is bounded and shareable
+/// between threads.
+#[derive(Default)]
+pub struct AudioStream {
+    chains: Mutex<Chains>,
+}
+
+/// Chains kept at most.
+const MAX_CHAINS: usize = 64;
+/// Heap bytes of effect state (delay lines) kept at most.
+const MAX_CHAIN_BYTES: usize = 64 << 20;
+/// Output frames kept per chain, so a block that re-reads the end of the previous one (a mix
+/// resampled to the device rate overlaps by a frame or two) still continues.
+const TAIL_FRAMES: usize = 64;
+
+#[derive(Default)]
+struct Chains {
+    list: Vec<Chain>,
+    clock: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ChainKey {
+    /// The precomp nesting the layer is reached through (one chain per instance).
+    path: u64,
+    comp: ItemId,
+    layer: LayerId,
+    rate: u32,
+}
+
+/// One layer's running effect chain.
+struct Chain {
+    key: ChainKey,
+    /// Effect ids and parameters the chain was built with.
+    fx: Vec<(String, Params)>,
+    procs: Vec<Processor>,
+    /// Comp sample index of the next frame the chain would produce.
+    end: i64,
+    /// The last output frames (up to [`TAIL_FRAMES`]), ending at `end`.
+    tail: Vec<f32>,
+    used: u64,
+}
+
+impl Chain {
+    fn bytes(&self) -> usize {
+        self.procs.iter().map(Processor::state_bytes).sum::<usize>() + self.tail.capacity() * 4
+    }
+
+    fn keep_tail(&mut self, out: &[f32]) {
+        self.tail.extend_from_slice(out);
+        let extra = self.tail.len().saturating_sub(TAIL_FRAMES * 2);
+        self.tail.drain(..extra);
+    }
+}
+
+impl AudioStream {
+    /// [`mix_comp`], continuing the layer effect chains of the previous calls where the block
+    /// follows on.
+    pub fn mix(&self, project: &Project, footage: &dyn FootageSource, expr: Option<&dyn ExprHost>, comp: ItemId, start: Tick, frames: usize, rate: u32) -> Vec<f32> {
+        let mut out = vec![0.0f32; frames * 2];
+        mix_into(project, footage, expr, comp, start, rate, &mut out, 1.0, 1.0, 0, Some((self, 0)));
+        out
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Chains> {
+        self.chains.lock().unwrap_or_else(|e| {
+            // A panic mid-update leaves nothing half-written that matters: start over.
+            let mut g = e.into_inner();
+            g.list.clear();
+            self.chains.clear_poison();
+            g
+        })
+    }
+
+    /// Take `key`'s chain out (it is put back after the block; the lock isn't held while
+    /// rendering, which may mix precomps through this stream).
+    fn take(&self, key: ChainKey) -> Option<Chain> {
+        let mut g = self.lock();
+        let i = g.list.iter().position(|c| c.key == key)?;
+        Some(g.list.swap_remove(i))
+    }
+
+    fn put(&self, mut chain: Chain) {
+        if chain.bytes() > MAX_CHAIN_BYTES {
+            return;
+        }
+        let mut g = self.lock();
+        g.clock = g.clock.saturating_add(1);
+        chain.used = g.clock;
+        g.list.retain(|c| c.key != chain.key);
+        g.list.push(chain);
+        while g.list.len() > MAX_CHAINS || g.list.iter().map(Chain::bytes).sum::<usize>() > MAX_CHAIN_BYTES {
+            let Some(i) = g.list.iter().enumerate().min_by_key(|(_, c)| c.used).map(|(i, _)| i) else { break };
+            g.list.swap_remove(i);
+        }
+    }
+
+    /// Chains held (tests).
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.lock().list.len()
+    }
+}
+
+/// Instance path of a precomp reached through layer `layer` of comp `comp` from `path`.
+fn sub_path(path: u64, comp: ItemId, layer: LayerId) -> u64 {
+    let mut h = path ^ 0x9e37_79b9_7f4a_7c15;
+    for v in [comp.0, layer.0] {
+        h = (h ^ v).wrapping_mul(0x0100_0000_01b3).rotate_left(29);
+    }
+    h
 }
 
 /// Whether the comp has anything audible (footage with audio, a sound generator, or a precomp
@@ -96,6 +222,8 @@ struct MixEnv<'a> {
     comp: &'a Comp,
     rate: u32,
     depth: usize,
+    /// The stream continuing effect chains, and the precomp instance path of this comp.
+    stream: Option<(&'a AudioStream, u64)>,
 }
 
 impl MixEnv<'_> {
@@ -148,7 +276,8 @@ impl MixEnv<'_> {
                     return out;
                 }
                 let mut sub = vec![0.0f32; src_n * 2];
-                mix_into(self.project, self.footage, self.expr, *item, lt, rate, &mut sub, 1.0, 1.0, self.depth + 1);
+                let stream = self.stream.map(|(s, path)| (s, sub_path(path, self.comp_id, l.id)));
+                mix_into(self.project, self.footage, self.expr, *item, lt, rate, &mut sub, 1.0, 1.0, self.depth + 1, stream);
                 sub
             }
             _ => return out,
@@ -186,15 +315,62 @@ impl MixEnv<'_> {
             return self.layer_raw(l, i0, n, false);
         }
         let reversed = fx.iter().any(|(id, _)| audio_fx::reverses(id));
+        // Backwards plays the span mirrored: consecutive blocks don't continue one signal.
+        let Some((stream, path)) = self.stream.filter(|_| !reversed) else { return self.fresh_audio(l, &fx, i0, n, reversed).0 };
+        let key = ChainKey { path, comp: self.comp_id, layer: l.id, rate: self.rate };
+        if let Some(mut chain) = stream.take(key)
+            && let Some(out) = self.continue_chain(l, &mut chain, &fx, i0, n)
+        {
+            stream.put(chain);
+            return out;
+        }
+        let (out, procs) = self.fresh_audio(l, &fx, i0, n, false);
+        let fx = fx.into_iter().map(|(id, p)| (id.to_string(), p)).collect();
+        let mut chain = Chain { key, fx, procs, end: i0.saturating_add(n as i64), tail: vec![], used: 0 };
+        chain.keep_tail(&out);
+        stream.put(chain);
+        out
+    }
+
+    /// The layer's processed audio for `i0 .. i0 + n` from a cleared state over the effects'
+    /// pre-roll, and the processors left running at the block's end.
+    fn fresh_audio(&self, l: &Layer, fx: &[(&str, Params)], i0: i64, n: usize, reversed: bool) -> (Vec<f32>, Vec<Processor>) {
         let pre_s: f64 = fx.iter().map(|(id, p)| audio_fx::preroll(id, p)).sum();
         let pre = (pre_s * self.rate as f64).ceil() as usize;
         let mut buf = self.layer_raw(l, i0 - pre as i64, n + pre, reversed);
         let start = l.layer_time(sample_tick(i0 - pre as i64, self.rate)).seconds();
-        for (id, p) in &fx {
-            audio_fx::process(id, p, &mut buf, self.rate, start);
+        let mut procs: Vec<Processor> = fx.iter().filter_map(|(id, p)| Processor::new(id, p, self.rate, start)).collect();
+        for p in &mut procs {
+            p.process_block(&mut buf);
         }
         buf.drain(..pre * 2);
-        buf
+        (buf, procs)
+    }
+
+    /// The block from `chain` when it follows on (starts at the chain's end or within its kept
+    /// tail, same effects and parameters); `None` to render it fresh.
+    fn continue_chain(&self, l: &Layer, chain: &mut Chain, fx: &[(&str, Params)], i0: i64, n: usize) -> Option<Vec<f32>> {
+        let same = chain.fx.len() == fx.len() && chain.fx.iter().zip(fx).all(|((a, pa), (b, pb))| a == b && pa.values == pb.values);
+        let back = usize::try_from(chain.end.checked_sub(i0)?).ok()?;
+        let tail_frames = chain.tail.len() / 2;
+        if !same || back > tail_frames {
+            return None;
+        }
+        // Frames of the block the chain already produced, then the new ones.
+        let from = (tail_frames - back) * 2;
+        let mut out = Vec::with_capacity(n * 2);
+        out.extend_from_slice(chain.tail.get(from..from + back.min(n) * 2)?);
+        let m = n - back.min(n);
+        if m > 0 {
+            let mut buf = self.layer_raw(l, chain.end, m, false);
+            for p in &mut chain.procs {
+                p.process_block(&mut buf);
+            }
+            chain.end = chain.end.saturating_add(m as i64);
+            chain.keep_tail(&buf);
+            out.extend_from_slice(&buf);
+        }
+        Some(out)
     }
 }
 
@@ -210,12 +386,13 @@ fn mix_into(
     gl: f32,
     gr: f32,
     depth: usize,
+    stream: Option<(&AudioStream, u64)>,
 ) {
     let Some(comp) = project.comp(comp_id) else { return };
     if depth >= MAX_DEPTH || rate == 0 {
         return;
     }
-    let env = MixEnv { project, footage, expr, comp_id, comp, rate, depth };
+    let env = MixEnv { project, footage, expr, comp_id, comp, rate, depth, stream };
     let frames = out.len() / 2;
     let any_solo = comp.layers.iter().any(|l| l.switches.solo && audible(project, l));
     let s0 = start.to_units_floor(rate as i64);
@@ -353,5 +530,169 @@ mod tests {
         // second half (≥ 1 s): a + b
         let i = 700 * 2;
         assert!((m[i] - 0.375).abs() < 1e-3 && (m[i + 1] + 0.25).abs() < 1e-3, "{} {}", m[i], m[i + 1]);
+    }
+
+    /// Noise footage addressed by absolute sample index (so any split of a range reads the same
+    /// samples), counting the frames read.
+    #[derive(Default)]
+    struct Noise(std::sync::atomic::AtomicUsize);
+    impl FootageSource for Noise {
+        fn frame(&self, _: ItemId, _: &Footage, _: Tick) -> Option<Arc<Image>> {
+            None
+        }
+        fn audio(&self, _: ItemId, _: &Footage, start: Tick, frames: usize, rate: u32) -> Option<Vec<f32>> {
+            self.0.fetch_add(frames, std::sync::atomic::Ordering::Relaxed);
+            let s0 = start.to_units_floor(rate as i64);
+            Some(
+                (0..frames as i64)
+                    .flat_map(|i| {
+                        let k = s0 + i;
+                        if k < 0 {
+                            return [0.0, 0.0];
+                        }
+                        let x = ((k as f64 * 12.9898).sin() * 43758.5453).fract() as f32;
+                        // Loud and quiet passages, so dynamics effects move.
+                        let env = if (k / 900) % 3 == 0 { 0.9 } else { 0.05 };
+                        [x * env, -x * env * 0.5]
+                    })
+                    .collect(),
+            )
+        }
+    }
+
+    impl Noise {
+        fn read(&self) -> usize {
+            self.0.swap(0, std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    const SR: u32 = 8000;
+    const BLOCK: usize = 1024;
+
+    /// A comp with one footage-audio layer (or a solid, for Tone) carrying effect `id`.
+    fn fx_comp(id: &str, vals: &[(&str, effectcraft_project::Value)]) -> (Project, ItemId) {
+        let mut p = Project::default();
+        let comp = Comp::new(64, 64, FrameRate::new(25, 1), Tick::from_seconds_f64(20.0));
+        let src = if id == "ec.audio.tone" {
+            let sid = p.add_item("S", effectcraft_color::Label::Red, None, ItemKind::Solid(effectcraft_project::Solid { color: [1.0; 3], width: 64, height: 64, pixel_aspect: 1.0 }));
+            LayerSource::Solid { item: sid }
+        } else {
+            let f = Footage { kind: FootageKind::Audio, frame_rate: FrameRate::new(25, 1), duration: Tick::from_seconds_f64(20.0), has_audio: true, ..Default::default() };
+            LayerSource::Footage { item: p.add_item("n.wav", effectcraft_color::Label::SeaFoam, None, ItemKind::Footage(f)) }
+        };
+        let mut l = build::layer(&mut p, &comp, "a", src, (64, 64), None);
+        let spec = effectcraft_effects::find(id).unwrap();
+        let mut next = p.next_id;
+        let mut g = effectcraft_effects::instantiate(spec, &mut build::Ids(&mut next), spec.name, [64.0, 64.0]);
+        p.next_id = next;
+        for (k, v) in vals {
+            g.prop_mut(k).unwrap().value = v.clone();
+        }
+        l.props.sub_mut("effects").unwrap().children.push(g.into());
+        let mut comp = comp;
+        comp.layers = vec![l].into();
+        let cid = p.add_item("C", effectcraft_color::Label::Sandstone, None, ItemKind::Comp(comp.into()));
+        (p, cid)
+    }
+
+    fn at(i: i64) -> Tick {
+        sample_tick(i, SR)
+    }
+
+    fn bits(b: &[f32]) -> Vec<u32> {
+        b.iter().map(|v| v.to_bits()).collect()
+    }
+
+    fn streamable() -> Vec<(&'static str, Vec<(&'static str, effectcraft_project::Value)>)> {
+        use effectcraft_project::Value as V;
+        vec![
+            ("ec.audio.basstreble", vec![("bass", V::Scalar(50.0))]),
+            ("ec.audio.compressor", vec![]),
+            ("ec.audio.compressor", vec![("autoRelease", V::Bool(false)), ("threshold", V::Scalar(-30.0))]),
+            ("ec.audio.delay", vec![("delayTime", V::Scalar(90.0))]),
+            ("ec.audio.distortion", vec![("downsample", V::Scalar(3.0))]),
+            ("ec.audio.flangechorus", vec![]),
+            ("ec.audio.gate", vec![("threshold", V::Scalar(-12.0))]),
+            ("ec.audio.highlowpass", vec![]),
+            ("ec.audio.modulator", vec![("amplitudeModulation", V::Scalar(30.0))]),
+            ("ec.audio.parametriceq", vec![("band1BoostCut", V::Scalar(9.0))]),
+            ("ec.audio.reverb", vec![]),
+            ("ec.audio.stereomixer", vec![("leftPan", V::Scalar(40.0))]),
+            ("ec.audio.tone", vec![]),
+        ]
+    }
+
+    /// Playback-sized blocks through an [`AudioStream`] equal one long mix of the whole range
+    /// bit for bit, stay within the block-boundary tolerance of per-block fresh mixes, and read
+    /// only each block's own samples after the first (no pre-roll).
+    #[test]
+    fn stream_blocks_match_one_long_mix() {
+        let i0 = 1601i64;
+        let blocks = 8;
+        for (id, vals) in streamable() {
+            let (p, cid) = fx_comp(id, &vals);
+            let src = Noise::default();
+            let long = mix_comp(&p, &src, None, cid, at(i0), BLOCK * blocks, SR);
+            let stream = AudioStream::default();
+            let (mut streamed, mut fresh) = (vec![], vec![]);
+            for k in 0..blocks {
+                let s = i0 + (k * BLOCK) as i64;
+                src.read();
+                streamed.extend(stream.mix(&p, &src, None, cid, at(s), BLOCK, SR));
+                let read = src.read();
+                if k > 0 && id != "ec.audio.tone" {
+                    assert_eq!(read, BLOCK, "{id}: block {k} read {read} frames");
+                }
+                fresh.extend(mix_comp(&p, &src, None, cid, at(s), BLOCK, SR));
+            }
+            assert_eq!(bits(&streamed), bits(&long), "{id}");
+            let worst = streamed.iter().zip(&fresh).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            assert!(worst < 2e-3, "{id}: {worst}");
+            assert_eq!(stream.len(), 1);
+        }
+    }
+
+    /// A seek (back or forward), a parameter change or a re-read overlapping the previous block
+    /// falls back or continues correctly.
+    #[test]
+    fn stream_seek_param_change_and_overlap() {
+        let (p, cid) = fx_comp("ec.audio.compressor", &[]);
+        let src = Noise::default();
+        let stream = AudioStream::default();
+        for k in 0..4 {
+            stream.mix(&p, &src, None, cid, at(8000 + k * BLOCK as i64), BLOCK, SR);
+        }
+        // Jump back: the block renders fresh (pre-roll), then continues from there.
+        let back = stream.mix(&p, &src, None, cid, at(2000), BLOCK, SR);
+        assert_eq!(bits(&back), bits(&mix_comp(&p, &src, None, cid, at(2000), BLOCK, SR)));
+        let next = stream.mix(&p, &src, None, cid, at(2000 + BLOCK as i64), BLOCK, SR);
+        let long = mix_comp(&p, &src, None, cid, at(2000), 2 * BLOCK, SR);
+        assert_eq!(bits(&next), bits(&long[BLOCK * 2..]));
+        // A block that re-reads the previous one's last frames (resampled playback) continues.
+        let ov = stream.mix(&p, &src, None, cid, at(2000 + 2 * BLOCK as i64 - 3), BLOCK, SR);
+        let long = mix_comp(&p, &src, None, cid, at(2000), 3 * BLOCK - 3, SR);
+        assert_eq!(bits(&ov), bits(&long[(2 * BLOCK - 3) * 2..]));
+        // Changed parameters: the contiguous block renders fresh with the new values.
+        // (The same comp and layer ids, another threshold.)
+        let (p2, cid2) = fx_comp("ec.audio.compressor", &[("threshold", effectcraft_project::Value::Scalar(-40.0))]);
+        assert_eq!(cid2, cid);
+        let s = 2000 + 3 * BLOCK as i64 - 3;
+        let changed = stream.mix(&p2, &src, None, cid, at(s), BLOCK, SR);
+        assert_eq!(bits(&changed), bits(&mix_comp(&p2, &src, None, cid, at(s), BLOCK, SR)));
+        assert_ne!(bits(&changed), bits(&mix_comp(&p, &src, None, cid, at(s), BLOCK, SR)));
+    }
+
+    /// Backwards (a mirrored time mapping) never continues a chain: every block is fresh.
+    #[test]
+    fn stream_backwards_renders_fresh() {
+        let (p, cid) = fx_comp("ec.audio.backwards", &[]);
+        let src = Noise::default();
+        let stream = AudioStream::default();
+        for k in 0..3 {
+            let s = 4000 + k * BLOCK as i64;
+            let a = stream.mix(&p, &src, None, cid, at(s), BLOCK, SR);
+            assert_eq!(bits(&a), bits(&mix_comp(&p, &src, None, cid, at(s), BLOCK, SR)));
+        }
+        assert_eq!(stream.len(), 0);
     }
 }
