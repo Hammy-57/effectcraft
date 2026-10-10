@@ -7,6 +7,7 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use crate::autosave::AutoSave;
+use crate::notify::Notifier;
 use crate::prompts;
 use crate::resources::{self, Target, UriError};
 use crate::tools::{self, Reply};
@@ -33,11 +34,32 @@ pub struct McpServer {
     autosave: Option<AutoSave>,
     /// The protocol revision `initialize` negotiated (`None` before it).
     version: Option<&'static str>,
+    notify: Notifier,
 }
 
 impl McpServer {
-    pub fn new(backend: Backend) -> Self {
-        Self { backend, autosave: None, version: None }
+    pub fn new(mut backend: Backend) -> Self {
+        let notify = Notifier::new(&mut backend);
+        Self { backend, autosave: None, version: None, notify }
+    }
+
+    /// Server-initiated notifications queued since the last call (resource updates, log
+    /// entries), oldest first. [`McpServer::serve`] writes them after each reply.
+    pub fn take_notifications(&mut self) -> Vec<Value> {
+        self.notify.take()
+    }
+
+    /// Write the queued notifications, one per line.
+    pub(crate) fn flush_notifications(&mut self, out: &mut impl Write) -> std::io::Result<()> {
+        let queued = self.notify.take();
+        for n in &queued {
+            out.write_all(n.to_string().as_bytes())?;
+            out.write_all(b"\n")?;
+        }
+        if !queued.is_empty() {
+            out.flush()?;
+        }
+        Ok(())
     }
 
     /// Whether replies to this request may use 2025-06-18 fields (`structuredContent`,
@@ -92,7 +114,11 @@ impl McpServer {
             return None; // notification (notifications/initialized, notifications/cancelled, ...)
         };
         let params = msg.get("params").cloned().unwrap_or(json!({}));
-        Some(match self.request(method, &params) {
+        let result = self.request(method, &params);
+        if method != "tools/call" {
+            self.notify.after_request(&mut self.backend);
+        }
+        Some(match result {
             Ok(mut result) => {
                 modern_result_fields(method, &params, &mut result);
                 json!({"jsonrpc": "2.0", "id": id, "result": result})
@@ -150,6 +176,7 @@ impl McpServer {
                     output.write_all(b"\n")?;
                     output.flush()?;
                 }
+                self.flush_notifications(&mut output)?;
             }
             match read_error.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
                 Some(e) => Err(e),
@@ -183,7 +210,7 @@ impl McpServer {
                 };
                 Ok(json!({
                     "protocolVersion": version,
-                    "capabilities": {"tools": {"listChanged": false}, "resources": {"listChanged": false, "subscribe": false}, "prompts": {"listChanged": false}},
+                    "capabilities": {"tools": {"listChanged": false}, "resources": {"listChanged": false, "subscribe": true}, "prompts": {"listChanged": false}, "logging": {}},
                     "serverInfo": {"name": "effectcraft", "title": format!("EffectCraft ({mode})"), "version": env!("CARGO_PKG_VERSION")},
                     "instructions": instructions,
                     "_meta": {"effectcraftAutoSave": self.autosave_info()},
@@ -236,10 +263,14 @@ impl McpServer {
                 let mut result = call_result_with(reply, self.structured(params));
                 if let Err(e) = saved {
                     let _ = writeln!(std::io::stderr(), "{e}");
+                    let text = format!("Warning: {e}. Use save_project with a writable path before disconnecting.");
                     if let Some(content) = result.get_mut("content").and_then(Value::as_array_mut) {
-                        content.push(json!({"type": "text", "text": format!("Warning: {e}. Use save_project with a writable path before disconnecting.")}));
+                        content.push(json!({"type": "text", "text": text}));
                     }
+                    self.notify.log("error", json!({"message": text}));
                 }
+                let ok = result.get("isError") == Some(&Value::Bool(false));
+                self.notify.after_tool(&mut self.backend, name, ok);
                 if self.autosave.is_some()
                     && let Some(obj) = result.as_object_mut()
                 {
@@ -249,6 +280,21 @@ impl McpServer {
                     }
                 }
                 Ok(result)
+            }
+            "resources/subscribe" => {
+                let uri = params.get("uri").and_then(Value::as_str).ok_or((INVALID_PARAMS, "missing `uri`".to_string()))?;
+                self.notify.subscribe(&mut self.backend, uri).map_err(uri_error)?;
+                Ok(json!({}))
+            }
+            "resources/unsubscribe" => {
+                let uri = params.get("uri").and_then(Value::as_str).ok_or((INVALID_PARAMS, "missing `uri`".to_string()))?;
+                self.notify.unsubscribe(uri);
+                Ok(json!({}))
+            }
+            "logging/setLevel" => {
+                let level = params.get("level").and_then(Value::as_str).ok_or((INVALID_PARAMS, "missing `level`".to_string()))?;
+                self.notify.set_level(level).map_err(|m| (INVALID_PARAMS, m))?;
+                Ok(json!({}))
             }
             "resources/list" => Ok(json!({"resources": resources::list()})),
             "resources/templates/list" => Ok(json!({"resourceTemplates": resources::templates(self.structured(params))})),

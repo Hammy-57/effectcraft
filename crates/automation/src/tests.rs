@@ -1186,6 +1186,126 @@ fn prompts_list_and_get() {
     assert!(rpc(&mut s, 2, "prompts/list", json!({}))["prompts"][0].get("title").is_none());
 }
 
+/// The `uri`s of queued `notifications/resources/updated`.
+fn updated(s: &mut McpServer) -> Vec<String> {
+    s.take_notifications()
+        .iter()
+        .filter(|n| n["method"] == "notifications/resources/updated")
+        .map(|n| n["params"]["uri"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// Subscribed project resources are reported updated after an edit (and undo), never after a
+/// query; command resources don't follow the project; `serve` writes them after the reply.
+#[test]
+fn subscriptions_notify_after_edits_not_queries() {
+    let mut s = server();
+    let init = rpc(&mut s, 1, "initialize", json!({"protocolVersion": "2025-06-18"}));
+    assert_eq!(init["capabilities"]["resources"]["subscribe"], true);
+    assert!(init["capabilities"]["logging"].is_object());
+    call_json(&mut s, "command_run", json!({"id": "comp.new", "params": {"name": "Sub", "width": 32, "height": 32}}));
+    s.take_notifications();
+    for uri in ["effectcraft://document", "effectcraft://comp/Sub", "effectcraft://commands", "effectcraft://command/comp.new"] {
+        assert_eq!(rpc(&mut s, 2, "resources/subscribe", json!({"uri": uri})), json!({}));
+    }
+    assert_eq!(rpc_err(&mut s, "resources/subscribe", json!({"uri": "effectcraft://nope"})), -32002);
+    assert_eq!(rpc_err(&mut s, "resources/subscribe", json!({"uri": "effectcraft://comp/%zz"})), -32602);
+    assert_eq!(rpc_err(&mut s, "resources/subscribe", json!({})), -32602);
+
+    call_json(&mut s, "get_comp", json!({"comp": "Sub"}));
+    call_json(&mut s, "doc_inspect", json!({}));
+    rpc(&mut s, 3, "resources/read", json!({"uri": "effectcraft://document"}));
+    assert!(updated(&mut s).is_empty(), "queries change nothing");
+
+    call_json(&mut s, "command_run", json!({"id": "layer.newNull"}));
+    assert_eq!(updated(&mut s), ["effectcraft://comp/Sub", "effectcraft://document"]);
+    call_json(&mut s, "undo", json!({}));
+    assert_eq!(updated(&mut s).len(), 2, "undo changes the project too");
+    // A value set to what it already is isn't an edit.
+    call_json(&mut s, "command_run", json!({"id": "comp.settings", "params": {"comp": "Sub", "width": 32}}));
+    assert!(updated(&mut s).is_empty());
+
+    rpc(&mut s, 4, "resources/unsubscribe", json!({"uri": "effectcraft://document"}));
+    rpc(&mut s, 5, "resources/unsubscribe", json!({"uri": "effectcraft://comp/Sub"}));
+    rpc(&mut s, 6, "resources/unsubscribe", json!({"uri": "effectcraft://never-subscribed"}));
+    call_json(&mut s, "command_run", json!({"id": "layer.newNull"}));
+    assert!(updated(&mut s).is_empty());
+
+    // Over stdio the notification follows the reply.
+    let mut s = server();
+    let input = [
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}}),
+        json!({"jsonrpc": "2.0", "id": 2, "method": "resources/subscribe", "params": {"uri": "effectcraft://document"}}),
+        json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "command_run", "arguments": {"id": "comp.new"}}}),
+        json!({"jsonrpc": "2.0", "id": 4, "method": "ping"}),
+    ]
+    .iter()
+    .map(|v| v.to_string() + "\n")
+    .collect::<String>();
+    let mut out = Vec::new();
+    s.serve(input.as_bytes(), &mut out).unwrap();
+    let lines: Vec<Value> = String::from_utf8(out).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(lines.len(), 5, "{lines:?}");
+    assert_eq!(lines[2]["id"], 3);
+    assert_eq!(lines[3], json!({"jsonrpc": "2.0", "method": "notifications/resources/updated", "params": {"uri": "effectcraft://document"}}));
+    assert_eq!(lines[4]["id"], 4);
+}
+
+/// `notifications/message`: new expression errors after an edit and missing footage after
+/// open_project are warnings, toasts are info; `logging/setLevel` filters them.
+#[test]
+fn logging_levels_filter_warnings() {
+    let messages = |s: &mut McpServer| -> Vec<Value> {
+        s.take_notifications().into_iter().filter(|n| n["method"] == "notifications/message").map(|n| n["params"].clone()).collect()
+    };
+    let mut s = McpServer::new(Backend::headless(effectcraft_host::session()));
+    rpc(&mut s, 1, "initialize", json!({"protocolVersion": "2025-03-26"}));
+    call_json(&mut s, "command_run", json!({"id": "comp.new", "params": {"name": "L", "width": 64, "height": 64}}));
+    call_json(&mut s, "command_run", json!({"id": "layer.newSolid", "params": {"name": "S", "color": "#ff0000"}}));
+    assert!(messages(&mut s).is_empty());
+    assert_eq!(rpc_err(&mut s, "logging/setLevel", json!({"level": "loud"})), -32602);
+    assert_eq!(rpc_err(&mut s, "logging/setLevel", json!({})), -32602);
+
+    assert_eq!(rpc(&mut s, 2, "logging/setLevel", json!({"level": "error"})), json!({}));
+    call_json(&mut s, "set_property", json!({"layer": "S", "path": "transform/rotation", "expression": "nope*2"}));
+    assert!(messages(&mut s).is_empty(), "warnings are below `error`");
+
+    rpc(&mut s, 3, "logging/setLevel", json!({"level": "warning"}));
+    call_json(&mut s, "set_property", json!({"layer": "S", "path": "transform/opacity", "value": 50}));
+    let m = messages(&mut s);
+    assert_eq!(m.len(), 1, "{m:?}");
+    assert_eq!((&m[0]["level"], &m[0]["logger"]), (&json!("warning"), &json!("effectcraft")));
+    assert!(m[0]["data"]["errors"][0].as_str().unwrap().contains("nope"), "{m:?}");
+    call_json(&mut s, "set_property", json!({"layer": "S", "path": "transform/opacity", "value": 40}));
+    assert!(messages(&mut s).is_empty(), "the same error isn't repeated");
+    call_json(&mut s, "get_property", json!({"layer": "S", "path": "transform/opacity"}));
+    assert!(messages(&mut s).is_empty(), "queries log nothing");
+
+    // Missing footage after open_project.
+    let session = s.backend().session().unwrap();
+    let footage = effectcraft_engine::project::Footage { path: "/nonexistent/ec/gone.png".into(), width: 8, height: 8, has_video: true, ..Default::default() };
+    std::sync::Arc::make_mut(&mut session.project).add_item(
+        "gone",
+        effectcraft_engine::color::Label::None,
+        None,
+        effectcraft_engine::project::ItemKind::Footage(footage),
+    );
+    let path = std::env::temp_dir().join(format!("ec-mcp-log-{}.ecproj", std::process::id())).to_string_lossy().into_owned();
+    call_json(&mut s, "save_project", json!({"path": path}));
+    call_json(&mut s, "open_project", json!({"path": path}));
+    let m = messages(&mut s);
+    assert!(m.iter().any(|m| m["level"] == "warning" && m["data"]["missing"] == 1), "{m:?}");
+    // Toasts are info.
+    rpc(&mut s, 4, "logging/setLevel", json!({"level": "info"}));
+    call_json(&mut s, "command_run", json!({"id": "footage.check", "params": {"wait": true}}));
+    let m = messages(&mut s);
+    assert!(m.iter().any(|m| m["level"] == "info" && m["data"]["message"].as_str().unwrap().contains("missing")), "{m:?}");
+    rpc(&mut s, 5, "logging/setLevel", json!({"level": "emergency"}));
+    call_json(&mut s, "open_project", json!({"path": path}));
+    assert!(messages(&mut s).is_empty());
+    let _ = std::fs::remove_file(path);
+}
+
 /// A minimal JSON Schema check (type, required, properties, items): enough for outputSchema.
 fn validate(schema: &Value, v: &Value, at: &str) -> Result<(), String> {
     if let Some(t) = schema.get("type") {

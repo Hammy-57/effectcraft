@@ -150,6 +150,7 @@ impl McpServer {
                         out.write_all(b"\n")?;
                         out.flush()?;
                     }
+                    self.flush_notifications(out)?;
                 }
                 Ok(None) | Err(RecvTimeoutError::Disconnected) => open = false,
                 Err(RecvTimeoutError::Timeout) => {}

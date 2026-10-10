@@ -49,7 +49,10 @@ impl Backend {
         match self {
             Backend::Headless(s) => {
                 let r = s.execute_checked(id, params);
-                s.drain_events();
+                // Toasts (user-facing warnings) stay for the MCP log; other events are dropped.
+                s.events.retain(|e| matches!(e, effectcraft_engine::Event::Toast { .. }));
+                let excess = s.events.len().saturating_sub(MAX_TOASTS);
+                s.events.drain(..excess);
                 Ok(r?)
             }
             Backend::Bridge(b) => b.call("engine.execute", json!({"command": id, "params": params})),
@@ -101,6 +104,9 @@ impl Backend {
         }
     }
 }
+
+/// Toasts kept between MCP requests at most.
+const MAX_TOASTS: usize = 100;
 
 fn no_comp(comp: Option<&Value>) -> Error {
     match comp.filter(|c| !c.is_null()) {

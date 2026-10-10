@@ -62,6 +62,35 @@ return `-32602`.
 {"jsonrpc":"2.0","id":3,"method":"resources/read","params":{"uri":"effectcraft://frame/1/0.5?max_side=320"}}
 ```
 
+## Notifications
+
+The server writes notifications on stdout after the reply to the request that caused them.
+
+**Resource subscriptions** (`resources.subscribe: true`). `resources/subscribe {uri}` accepts any
+readable URI, including template matches (an unknown or malformed one is an error, as for
+`resources/read`); `resources/unsubscribe` removes it. When the project's revision changes
+(`project.summary.revision`; every edit, undo and redo, never a query or a value set to what it
+already was), each subscribed `document`, `comp`, `layer` and `frame` URI gets
+`notifications/resources/updated {uri}`. This is conservative: every subscribed project URI is
+reported, whichever comp changed. Command URIs never are. Headless sessions compare the revision
+after every request. In bridge mode, while anything is subscribed, each request polls
+`project.summary` once. Edits made in the app are therefore reported with the next request, not
+as they happen.
+
+**Logging** (`logging: {}`). `logging/setLevel {level}` takes an RFC 5424 level (`debug` …
+`emergency`). Until then, `warning` and above are sent. Entries are `notifications/message`
+with `logger: "effectcraft"` and `data: {message, …}`:
+
+| Level | When |
+| --- | --- |
+| `warning` | An edit leaves new expression errors in the active comp (`data.errors`, from `expr.errors`; each error is reported once) |
+| `warning` | `open_project` finds missing footage (headless; `data.missing`) |
+| `error` | A `--autosave` checkpoint failed (also appended to the tool reply) |
+| `error` / `info` | Session toasts (headless), such as "saved by a newer EffectCraft" |
+
+In bridge mode only the expression check applies; the app shows its own toasts and footage
+checks.
+
 ## Prompts
 
 `prompts/list` and `prompts/get` serve workflow recipes. Each one is a single user message that spells
