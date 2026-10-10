@@ -46,5 +46,6 @@ effectcraft-host = { workspace = true }
 exr = { workspace = true }
 
 [build-dependencies]
+effectcraft-buildgen = { workspace = true }
 serde_json = { workspace = true }
 toml = "1"

@@ -289,7 +289,8 @@ fn cargo(args: &[&str], pkgs: &[&String], tail: &[&str]) -> Command {
 }
 
 fn steps(plan: &Plan, pkgs: &[Pkg], nextest: bool) -> Vec<Step> {
-    let mut v = vec![Step { label: "fmt".into(), cmd: Some(cargo(&["fmt", "--check"], &[], &[])), check: None }];
+    // `cargo xtask fmt --check`: `cargo fmt` misses the modules build.rs declares (effectcraft-buildgen).
+    let mut v = vec![Step { label: "fmt".into(), cmd: None, check: Some(crate::fmt::check) }];
     let aff: Vec<&String> = plan.affected.iter().collect();
     if !aff.is_empty() {
         let n = aff.len();
@@ -563,5 +564,17 @@ let out = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-out");
         // without nextest: one cargo test step; an asset change adds the assets check
         let s = steps(&plan(&files(&["assets/fonts/A.ttf"]), &p), &p, false);
         assert!(labels(&s).contains(&"test (7)".to_string()) && labels(&s).contains(&"assets".to_string()));
+    }
+
+    /// effectcraft-buildgen is only a build-dependency, yet it generates its dependents' module
+    /// lists: a change to it must reach them.
+    #[test]
+    fn buildgen_reaches_the_crates_that_build_with_it() {
+        let md = crate::metadata().unwrap();
+        let p = packages(&crate::root(), &md);
+        let a = plan(&files(&["crates/buildgen/src/lib.rs"]), &p).affected;
+        for c in ["effectcraft-buildgen", "effectcraft-engine", "effectcraft-effects", "effectcraft-render", "effectcraft-ui-egui", "effectcraft"] {
+            assert!(a.contains(c), "{c} not affected by a buildgen change: {a:?}");
+        }
     }
 }

@@ -7,29 +7,15 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
-pub mod audio;
-pub mod automation;
-pub mod bench;
-pub mod control;
-pub mod credits;
-pub mod dock;
-pub mod dock_ui;
-pub mod frames;
-pub mod gpu_failure;
-pub mod header;
+// Every `src/*.rs` file is a module, declared by build.rs (docs/architecture.md,
+// "Self-registering modules"); declare one here only for another visibility or a submodule folder.
+include!(concat!(env!("OUT_DIR"), "/modules.rs"));
+// By hand: submodules in `i18n/`.
 pub mod i18n;
-pub mod icons;
 mod local_assets;
-pub mod menu_keys;
-pub mod menus;
-pub mod native_menu;
+// By hand: behind a feature.
 #[cfg(all(feature = "offscreen", not(target_arch = "wasm32")))]
 pub mod offscreen;
-pub mod panels;
-pub mod prefs_live;
-pub mod state;
-pub mod theme;
-pub mod widgets;
 
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};

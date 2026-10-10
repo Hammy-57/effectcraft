@@ -9,6 +9,9 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[build-dependencies]
+effectcraft-buildgen = { workspace = true }
+
 [dependencies]
 effectcraft-geom = { workspace = true }
 effectcraft-color = { workspace = true }
@@ -21,4 +24,3 @@ rayon = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
-
