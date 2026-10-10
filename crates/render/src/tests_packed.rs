@@ -113,3 +113,39 @@ fn rendered_8bpc_layer_packs_losslessly() {
     assert_eq!(p.bytes(), b.img.data.len() * 4);
     assert_eq!(bits(&p.unpack()), bits(&b));
 }
+
+/// Linear blending: a cached frame is served from the blending-space copies alone (one hit per
+/// layer, not two), so the working-space buffers they came from go cold; pixels are unchanged.
+#[test]
+fn linear_blend_hits_skip_the_working_space_copy() {
+    use effectcraft_color::Label;
+    use effectcraft_project::{Comp, ItemKind, LayerSource, Project, Solid, build};
+    use effectcraft_time::{FrameRate, Tick};
+
+    let mut p = Project::default();
+    p.settings.blend_linear = true;
+    let comp = Comp::new(40, 20, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+    let cid = p.add_item("Comp", Label::Sandstone, None, ItemKind::Comp(comp.clone().into()));
+    for (i, c) in [[0.8, 0.2, 0.1], [0.1, 0.5, 0.9]].into_iter().enumerate() {
+        let sid = p.add_item("S", Label::Red, None, ItemKind::Solid(Solid { color: c, width: 20 + i as u32 * 10, height: 20, pixel_aspect: 1.0 }));
+        let mut l = build::layer(&mut p, &comp, "S", LayerSource::Solid { item: sid }, (20 + i as u32 * 10, 20), None);
+        l.blend_mode = effectcraft_color::BlendMode::Screen;
+        let Some(c) = p.comp_mut(cid) else { panic!("comp") };
+        c.layers.insert(0, l);
+    }
+    let cache = LayerCache::default();
+    let frame = || {
+        let mut r = crate::Renderer::new(&p, &crate::NoFootage, crate::RenderOpts::default());
+        r.cache = Some(&cache);
+        r.comp_frame(cid, Tick::ZERO)
+    };
+    let a = frame();
+    let entries = cache.stats().entries;
+    assert_eq!(entries, 4, "two layers, each in the working and the blending space");
+    let hits = cache.stats().hits;
+    let b = frame();
+    assert_eq!(cache.stats().hits, hits + 2, "one hit per layer");
+    assert_eq!(a.data, b.data);
+    let uncached = crate::Renderer::new(&p, &crate::NoFootage, crate::RenderOpts::default()).comp_frame(cid, Tick::ZERO);
+    assert_eq!(a.data, uncached.data);
+}

@@ -32,8 +32,7 @@ impl<'a> Renderer<'a> {
         }
         let mut timing = self.profile.map(|_| LayerTiming { depth: self.depth, layer: layer.name.clone(), ..Default::default() });
         let t0 = web_time::Instant::now();
-        let Some(st) = self.styled(ctx, layer, timing.as_mut()) else { return Region::Empty };
-        let st = self.styled_to_blend(st);
+        let Some(st) = self.styled_blend(ctx, layer, timing.as_mut()) else { return Region::Empty };
         let t1 = web_time::Instant::now();
         let changed = if st.plain {
             self.composite_layer(ctx, layer, &st.body, canvas, opacity);

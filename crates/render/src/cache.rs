@@ -158,39 +158,42 @@ impl LayerCache {
     }
 
     pub fn get(&self, key: u64) -> Option<Arc<Buf>> {
+        if let Some(b) = self.peek(key) {
+            return Some(b);
+        }
+        {
+            let mut g = self.inner.lock().ok()?;
+            g.misses += 1;
+            if g.missed_at.len() > 4096 {
+                g.missed_at.clear();
+            }
+            g.missed_at.insert(key, web_time::Instant::now());
+        }
+        // Disk cache: a hit comes back into memory.
+        let (dc, dk) = self.disk_key(key)?;
+        let buf = dc.get_layer(dk)?;
+        self.insert_mem(key, buf.clone());
+        Some(buf)
+    }
+
+    /// [`Self::get`] for a buffer that is only worth having from memory: no disk lookup, and a
+    /// miss is not counted (the caller falls back to a path that looks it up properly).
+    pub(crate) fn peek(&self, key: u64) -> Option<Arc<Buf>> {
         let mut g = self.inner.lock().ok()?;
         g.clock += 1;
         let now = g.clock;
-        match g.map.get_mut(&key) {
-            Some(e) => {
-                e.last_use = now;
-                let stored = match &e.buf {
-                    Stored::Full(b) => Ok(b.clone()),
-                    Stored::Packed(p) => Err(p.clone()),
-                };
-                g.hits += 1;
-                match stored {
-                    Ok(b) => Some(b),
-                    Err(p) => {
-                        drop(g);
-                        Some(self.unpacked(key, &p))
-                    }
-                }
-            }
-            None => {
-                g.misses += 1;
-                if g.missed_at.len() > 4096 {
-                    g.missed_at.clear();
-                }
-                g.missed_at.insert(key, web_time::Instant::now());
-                drop(g);
-                // Disk cache: a hit comes back into memory.
-                let (dc, dk) = self.disk_key(key)?;
-                let buf = dc.get_layer(dk)?;
-                self.insert_mem(key, buf.clone());
-                Some(buf)
-            }
-        }
+        let e = g.map.get_mut(&key)?;
+        e.last_use = now;
+        let stored = match &e.buf {
+            Stored::Full(b) => Ok(b.clone()),
+            Stored::Packed(p) => Err(p.clone()),
+        };
+        g.hits += 1;
+        drop(g);
+        Some(match stored {
+            Ok(b) => b,
+            Err(p) => self.unpacked(key, &p),
+        })
     }
 
     pub fn insert(&self, key: u64, buf: Arc<Buf>) {
