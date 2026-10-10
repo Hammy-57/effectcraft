@@ -13,6 +13,9 @@ include!(concat!(env!("OUT_DIR"), "/modules.rs"));
 // By hand: submodules in `i18n/`.
 pub mod i18n;
 mod local_assets;
+// By hand: behind a feature.
+#[cfg(all(feature = "offscreen", not(target_arch = "wasm32")))]
+pub mod offscreen;
 
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
