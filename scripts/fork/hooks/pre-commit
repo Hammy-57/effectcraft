@@ -1,0 +1,17 @@
+#!/bin/sh
+# Fork-only (eliasx45/effectcraft): a commit or merge on `main` whose Rust files aren't formatted
+# is refused, so the watchdog's first step (rustfmt) doesn't go red after the push. Only the files
+# the commit changes are checked (about a second). Fix: `cargo xtask fmt`, then commit again.
+# Skip once: `git commit --no-verify` / `git merge --no-verify`. Installed with
+# `git config core.hooksPath scripts/fork/hooks` (docs/fork/agent-builds.md).
+[ "$(git symbolic-ref --short -q HEAD)" = main ] || exit 0
+command -v rustfmt >/dev/null 2>&1 || exit 0
+files=$(git diff --cached --name-only --diff-filter=ACMR -- '*.rs')
+[ -n "$files" ] || exit 0
+# shellcheck disable=SC2086
+if bad=$(rustfmt --edition 2024 --check -l $files 2>/dev/null); then
+    exit 0
+fi
+echo "main: Rust files need formatting (run \`cargo xtask fmt\`, then commit again):" >&2
+echo "${bad:-$files}" | sed 's/^/  /' >&2
+exit 1
