@@ -123,7 +123,7 @@ See [MCP conventions](mcp.md) for core tools, resources, strict arguments, and p
 | `script_ui {action?, window?, widget?, value?, result?}` | Drive ScriptUI windows that scripts opened: `list` (default) the open windows, `get` a window's control tree, `click` a button / checkbox / radio button, `set` text, a slider or a list item, `close` a window (`result`: what a dialog's `show()` returns, default 2 = Cancel). |
 | `batch {steps: [{command, params}], label?, atomic?}` | Several commands in one call and one undo step (`engine.batch`); `"$N.key"` in a param is step N's result (`"$1.layer"`). A failing step rolls the batch back and names the step. |
 | *(UI: `--ui` or `--bridge`)* `screenshot {panel?, id?, max_side?, path?}`, `ui_inspect`, `ui_elements {prefix?}`, `ui_click`, `ui_drag`, `ui_key`, `ui_type`, `ui_set`, `control {method, params}` | Look at and operate the app window (offscreen with `--ui`, the live one with `--bridge`). |
-| *(hidden aliases)* `list_commands {filter?, enabled_only?, schemas?}`, `execute_command {command \| id, params?}`, `get_project`, `render_frame {comp? \| item?, layer?, time?, max_side?, region?, overlays?, path?, inline?, transparent?}` | Older names of `command_list`, `command_run`, `doc_inspect` (its `project`) and `render_preview`. Callable, but not in `tools/list` unless the server runs with `mcp --all-tools`. |
+| *(hidden aliases)* `list_commands {filter?, enabled_only?, schemas?, brief?}`, `execute_command {command \| id, params?}`, `get_project`, `render_frame {comp? \| item?, layer?, time?, max_side?, region?, overlays?, path?, inline?, transparent?}` | Older names of `command_list`, `command_run`, `doc_inspect` (its `project`) and `render_preview`. Callable, but not in `tools/list` unless the server runs with `mcp --all-tools`. |
 
 Layers are referenced by id (from `get_comp`), `"#n"` (1-based index from the top) or name. Comps are
 referenced by id or name, and default to the active comp. Property paths come from `get_layer`, for
@@ -144,6 +144,11 @@ command, also inside `engine.batch`) keep you from stepping on each other:
 - `client`: a name for you (`"client": "my-agent"`). Your undo steps are tagged with it, and
   `edit.undo {"client": "my-agent"}` only undoes your own last step: if the last change was the user's
   or another client's, it refuses and changes nothing. `edit.history.list` shows each state's `client`.
+
+To notice edits made by someone else without polling, the control channel's `events.subscribe`
+sends `project.changed` and `selection.changed` lines with the new `revision`
+([control-protocol.md](control-protocol.md#change-events)); MCP clients subscribe to resources
+([mcp.md](mcp.md#notifications)).
 
 Command params are checked against each command's `params` doc. An unknown key, such as
 `layer.select {"index": 2}`, returns an error that lists the accepted keys (here `layers, add, toggle`)
@@ -231,6 +236,9 @@ Short recipes; every step is one tool call.
 | Undo a mistake | `undo {}`, or `history {}` then `history {"goto": n}` |
 | Missing media after opening | `command_run footage.check {"wait":true}` → `{checked, missing, probed}`; then `file.findMissing {"what":"footage"}` |
 | Bring in a Figma design | No token: serialize with the Figma MCP's `use_figma` + `integrations/figma/serialize.js`, then `command_run file.importFigma {"payloadPaths": [<parts>]}` (see "Figma designs"). With a token: `{"url": "<figma link>"}` |
+| Open an After Effects project | `command_run file.importAep {"path":"x.aep"}` (needs Python with py-aep while converting; [packaging/aep/README.md](../packaging/aep/README.md)); the result is a native project |
+| Merge another EffectCraft project | `command_run file.importProject {"path":"other.ecproj"}` → `{folder, items, comps, rootComps, primaryComp, missingMedia, warnings}` (into a folder named after the file) |
+| Reuse motion from a library | `command_run library.search {"query":"lower third"}` → `command_run library.insert {"id":"<id>","time":2}` ([libraries.md](libraries.md)) |
 | Save | `save_project {"path":"out.ecproj"}` |
 
 The desktop app checks footage in the background after every open (a "Checking footage" job in
@@ -417,7 +425,8 @@ very large frames by child.
 * People use the EffectCraft Transfer plug-in instead: the desktop app runs its bridge on
   `127.0.0.1:7789` (Settings ▸ Let Figma Send Layers, on by default) and asks once to allow the
   plug-in (`ui.figmaPair`, automation ids `figmaPair.allow` / `figmaPair.deny`). Its imports run
-  the same command.
+  the same command. With the app's bridge off, `effectcraft-cli figma-bridge` (`--port`, `--control`,
+  `--code`) serves the plug-in standalone and forwards to the app's control channel.
 
 ### Motion tracking
 
@@ -830,3 +839,18 @@ loop below works the same there. To watch changes live instead, start the app wi
 app starts with an empty project) and use MCP bridge mode or the raw control channel. A good loop is: `ui_elements` to find an id, `ui_click` or `ui_drag`
 to act, then `screenshot {"panel":"Timeline"}` to check the result. `render_preview` shows the
 composition itself at any zoom.
+
+## Parallel agents
+
+Several agents can work in one repository at once, each in its own git worktree with its own
+target directory. `cargo xtask agents` keeps them apart:
+
+| Command | Does |
+|---|---|
+| `cargo xtask agents status` | Every worktree (branch, age, commits ahead of `main`, dirty files and a verdict: `unmerged work`, `merged but dirty`, `safe to remove`), every `target/agent-*` directory (size, age, owner or `ORPHAN`) and the active claims. Also written to `plan/STATUS.md` |
+| `cargo xtask agents claim <slug> --task "…" [--paths a,b]` | Records the claim in `plan/claims/<slug>.toml`, warns when a path overlaps another agent's claim, and prints the environment to use: `CARGO_TARGET_DIR=target/agent-<slug>`, a free `EFFECTCRAFT_CONTROL_PORT` (from 9880; 9877 is left to the user's app) and `CARGO_BUILD_JOBS=4` |
+| `cargo xtask agents release <slug>` | Deletes the claim when you are done |
+| `cargo xtask agents gc [--yes]` | Lists merged, clean worktrees and orphan target directories (a dry run); `--yes` removes only those, never a dirty, locked, unmerged or claimed one, or the main checkout |
+
+Agents that need to look at the app use the offscreen UI (`mcp --ui`), which takes no port and no
+window; a desktop app started with that environment listens on the claimed port.

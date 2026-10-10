@@ -42,7 +42,7 @@ pub(super) fn parse_hex(encoded: &str) -> Result<LookState, String> {
         }
     }
     let mut raw = Vec::with_capacity(encoded.len() / 2);
-    for pair in encoded.as_bytes().chunks_exact(2) {
+    for pair in encoded.as_bytes().as_chunks::<2>().0 {
         raw.push((nibble(pair[0])? << 4) | nibble(pair[1])?);
     }
     parse(&raw)
@@ -97,8 +97,8 @@ pub(super) fn parse(raw: &[u8]) -> Result<LookState, String> {
                     return Err("invalid MBL2 parameter vector".into());
                 }
                 let mut params = Vec::with_capacity(count);
-                for bytes in value[12..].chunks_exact(8) {
-                    let v = f64::from_be_bytes(bytes.try_into().map_err(|_| "short MBL2 float")?);
+                for bytes in value[12..].as_chunks::<8>().0 {
+                    let v = f64::from_be_bytes(*bytes);
                     if !v.is_finite() {
                         return Err("nonfinite MBL2 parameter".into());
                     }

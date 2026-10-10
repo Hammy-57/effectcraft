@@ -302,17 +302,17 @@ fn steps(plan: &Plan, pkgs: &[Pkg], nextest: bool) -> Vec<Step> {
         if nextest {
             v.push(Step {
                 label: format!("nextest ({n})"),
-                cmd: Some(cargo(&["nextest", "run", "--cargo-profile", "ci", "--no-tests=pass"], &aff, &[])),
+                cmd: Some(cargo(&["nextest", "run", "--cargo-profile", "ci", "--no-tests=pass", "--no-fail-fast"], &aff, &[])),
                 check: None,
             });
             // Same package set as nextest (bin-only packages are skipped by cargo), so features
             // unify the same way and the dependency builds are reused instead of rebuilt.
             let libs = aff.iter().filter(|a| pkgs.iter().any(|p| p.name == ***a && p.has_lib)).count();
             if libs > 0 {
-                v.push(Step { label: format!("doctests ({libs})"), cmd: Some(cargo(&["test", "--profile", "ci", "--doc"], &aff, &[])), check: None });
+                v.push(Step { label: format!("doctests ({libs})"), cmd: Some(cargo(&["test", "--profile", "ci", "--doc", "--no-fail-fast"], &aff, &[])), check: None });
             }
         } else {
-            v.push(Step { label: format!("test ({n})"), cmd: Some(cargo(&["test", "--profile", "ci"], &aff, &[])), check: None });
+            v.push(Step { label: format!("test ({n})"), cmd: Some(cargo(&["test", "--profile", "ci", "--no-fail-fast"], &aff, &[])), check: None });
         }
     }
     v.push(Step { label: "layers".into(), cmd: None, check: Some(crate::layers) });

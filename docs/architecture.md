@@ -44,8 +44,8 @@ cpal or muda. Everything in L0 to L4, the egui UI and the web app also build for
 | L4 | `engine` | `Session`: project, branching undo history, editor state, the command registry and menus, the ScriptUI window model (`scriptui`) |
 | L4 | `script` | Scripting: JavaScript (boa) with an After Effects-style object model (`app.project`, comps, layers, properties, render queue) and ScriptUI (dialogs, palettes, dockable panels; script-host threads so dialogs block `show()`), whose edits run engine commands; AE match names |
 | L4 | `host` | A fully wired `Session` (media, expressions, scripting, WebAssembly plug-ins, exporter) for the frontends |
-| L5 | `ui-egui` | The desktop interface: docking, panels, viewer, timeline, graph editor, dialogs, control channel |
-| L5 | `automation` | The MCP server, headless or bridged to the running app |
+| L5 | `ui-egui` | The desktop interface: docking, panels, viewer, timeline, graph editor, dialogs, control channel; the same app offscreen (`offscreen`: egui_kittest + wgpu, no window) for `mcp --ui` and the `snapshot` example |
+| L5 | `automation` | The MCP server: headless, or through a `ControlTransport` (bridged to the running app's control channel, or the CLI's offscreen app for `mcp --ui`); the Figma plug-in's local bridge (`figma_bridge`) |
 | L6 | apps `effectcraft`, `effectcraft-cli`, `effectcraft-web` | Desktop app; command-line tool (render, exec, get/set, MCP); the browser app (wasm32, [web.md](web.md)) |
 
 Allowed same-layer edges: `path → keyframe, raster`, `text → path`, `pdf → svg, text`, `effects → project, text, path, track`,
