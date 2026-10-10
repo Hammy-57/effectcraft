@@ -2263,10 +2263,23 @@ fn windowless_host_serves_several_agents_one_project() {
     let config = HostConfig { port: 0, config_dir: Some(dir.clone()) };
     let host = std::thread::spawn(move || serve(config, Box::new(|| Ok(Session::default())), move |p| port_tx.send(p).unwrap()));
     let port = port_rx.recv().unwrap();
+    // Each agent keeps its connection open, as an MCP bridge does: a client's claims are released
+    // when its last connection closes.
+    let connect = || {
+        let c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(std::time::Duration::from_secs(60))).unwrap();
+        std::cell::RefCell::new((std::io::BufReader::new(c.try_clone().unwrap()), c))
+    };
+    let conns = [("agentA", connect()), ("agentB", connect())];
     let exec = |client: &str, command: &str, params: Value| {
+        use std::io::{BufRead, Write};
         let mut p = params;
         p["client"] = json!(client);
-        request(port, "engine.execute", json!({"command": command, "params": p})).unwrap()
+        let mut conn = conns.iter().find(|(c, _)| *c == client).unwrap().1.borrow_mut();
+        writeln!(conn.1, "{}", json!({"id": 1, "method": "engine.execute", "params": {"command": command, "params": p}})).unwrap();
+        let mut line = String::new();
+        conn.0.read_line(&mut line).unwrap();
+        serde_json::from_str::<Value>(&line).unwrap()
     };
     let a = exec("agentA", "comp.new", json!({"name": "A", "width": 64, "height": 36}));
     let b = exec("agentB", "comp.new", json!({"name": "B", "width": 64, "height": 36}));

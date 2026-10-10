@@ -5,9 +5,9 @@
 use std::sync::Mutex;
 
 use effectcraft_project::render_queue::{
-    AlphaMode, Channels, ColorDepth, CurrentOrOff, EffectsMode, FrameSample, RenderLog, ResizeQuality, SwitchOverride, log_path,
+    AlphaMode, Channels, ColorDepth, CurrentOrOff, EffectsMode, FrameSample, RenderLog, RenderSettings, ResizeQuality, SwitchOverride, TimeSpan, log_path,
 };
-use effectcraft_project::{Comp, Project};
+use effectcraft_project::{Comp, ItemId, Project};
 use effectcraft_raster::Image;
 use effectcraft_render::{Backend, LayerCache, RenderOpts, Renderer};
 use effectcraft_time::Tick;
@@ -68,12 +68,114 @@ pub(crate) fn apply_overrides(p: &mut Project, job: &Job) {
     }
 }
 
+/// What decides a job's overridden project and layer buffers: jobs with equal keys (and equal
+/// projects) render the same frames. The time span is left out (segments of one output, output
+/// modules cut at different segment frames); so is everything per output module (format, crop,
+/// resize, channels), which applies after rendering.
+#[derive(PartialEq)]
+struct WarmKey {
+    comp: ItemId,
+    settings: RenderSettings,
+    nested_switches: bool,
+    budget: usize,
+    /// Addresses of the job's footage source, expression host and accelerator: the same
+    /// session's objects.
+    footage: usize,
+    expr: Option<usize>,
+    accel: Option<usize>,
+}
+
+impl WarmKey {
+    fn of(job: &Job) -> WarmKey {
+        WarmKey {
+            comp: job.comp,
+            settings: RenderSettings { time_span: TimeSpan::LengthOfComp, ..job.settings.clone() },
+            nested_switches: job.nested_switches,
+            budget: job.options.memory_budget.unwrap_or(crate::DEFAULT_MEMORY_BUDGET),
+            footage: job.footage as *const dyn effectcraft_render::FootageSource as *const () as usize,
+            expr: job.expr.map(|e| e as *const dyn effectcraft_render::ExprHost as *const () as usize),
+            accel: job.accel.map(|a| a as *const dyn effectcraft_render::Accelerator as *const () as usize),
+        }
+    }
+}
+
+/// A finished job's project (as its Render Settings render it) and layer cache, kept for the
+/// next job that renders the same frames: a Render Queue item exports its output modules one
+/// after another, each a job of its own, and every module after the first finds the layers the
+/// first rendered in the cache instead of rendering them again. Layer buffers are keyed by
+/// their content (see [`LayerCache`]), so a warm cache gives the frames a cold one gives.
+struct Warm {
+    key: WarmKey,
+    /// The job's project before the overrides: the next job's must be equal.
+    source: Project,
+    project: Project,
+    cache: LayerCache,
+}
+
+/// How long a finished job's [`Warm`] waits for the next job (the next output module starts
+/// as soon as the previous one returns); then it is dropped with its memory.
+const WARM_FOR: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The one kept [`Warm`], with its generation (for the timer that drops it) and when it was kept.
+static WARM: Mutex<Option<(u64, Instant, Warm)>> = Mutex::new(None);
+static WARM_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn warm_slot() -> std::sync::MutexGuard<'static, Option<(u64, Instant, Warm)>> {
+    WARM.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The kept [`Warm`] when `job` renders the same frames as the job that left it.
+fn take_warm(job: &Job) -> Option<Warm> {
+    let (_, at, warm) = warm_slot().take()?;
+    (at.elapsed() < WARM_FOR && warm.key == WarmKey::of(job) && warm.source == *job.project).then_some(warm)
+}
+
 impl<'a> Cx<'a> {
     pub fn new(job: &'a Job<'a>) -> Cx<'a> {
         let mut project = job.project.clone();
         apply_overrides(&mut project, job);
-        let frame_times = (job.options.log == RenderLog::PlusPerFrameInfo).then(|| Mutex::new(Vec::new()));
         let cache = LayerCache::new(job.options.memory_budget.unwrap_or(crate::DEFAULT_MEMORY_BUDGET));
+        Cx::with(job, project, cache)
+    }
+
+    /// [`Cx::new`], continuing from the job that rendered the same frames just before, if any
+    /// (its project and layer cache, see [`Warm`]).
+    pub fn resume(job: &'a Job<'a>) -> Cx<'a> {
+        match take_warm(job) {
+            Some(w) => Cx::with(job, w.project, w.cache),
+            None => Cx::new(job),
+        }
+    }
+
+    /// Keep this finished job's project and layer cache for the next job ([`Cx::resume`]) for
+    /// [`WARM_FOR`]. Not on the web, where nothing would drop them after that.
+    pub fn keep_warm(self) {
+        if cfg!(target_arch = "wasm32") {
+            return;
+        }
+        let warm = Warm { key: WarmKey::of(self.job), source: self.job.project.clone(), project: self.project, cache: self.cache };
+        let generation = WARM_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // (the job kept before, if no job took it, goes now)
+        let old = warm_slot().replace((generation, Instant::now(), warm));
+        drop(old);
+        // Dropped after `WARM_FOR` unless a job took it (or kept its own) by then.
+        let expire = move || {
+            let mut slot = warm_slot();
+            let kept = if slot.as_ref().is_some_and(|(g, _, _)| *g == generation) { slot.take() } else { None };
+            drop(slot);
+            drop(kept);
+        };
+        let later = move || {
+            std::thread::sleep(WARM_FOR);
+            expire();
+        };
+        if std::thread::Builder::new().name("export-warm".into()).spawn(later).is_err() {
+            expire();
+        }
+    }
+
+    fn with(job: &'a Job<'a>, project: Project, cache: LayerCache) -> Cx<'a> {
+        let frame_times = (job.options.log == RenderLog::PlusPerFrameInfo).then(|| Mutex::new(Vec::new()));
         // With deferred readbacks, buffers computed from a missed pass's placeholders are not kept.
         cache.set_gate(job.accel.and_then(|a| a.miss_gate()));
         Cx { job, project, cache, frame_times, overflowed: Mutex::new(vec![]), written: Mutex::new(vec![]) }
@@ -500,6 +602,77 @@ mod tests {
         let stats = cx.cache.stats();
         assert_eq!(stats.misses, renders, "the solid rendered on the first frame only");
         assert!(stats.hits >= 9, "{stats:?}");
+    }
+
+    #[test]
+    fn the_next_output_module_continues_from_the_layer_cache() {
+        // G5: a Render Queue item with two output modules rendered every layer twice. The
+        // second module's job takes the first one's layer cache when it renders the same frames.
+        use effectcraft_color::Label;
+        use effectcraft_project::render_queue::{OutputFormat, OutputModule, RenderSettings};
+        use effectcraft_project::{ItemKind, LayerSource, Solid, build};
+        use effectcraft_time::FrameRate;
+        let mut p = Project::default();
+        let mut comp = Comp::new(32, 24, FrameRate::FPS_25, FrameRate::FPS_25.tick_of(4));
+        let sid = p.add_item("Solid", Label::Red, None, ItemKind::Solid(Solid { color: [1.0, 0.0, 0.0], width: 8, height: 8, pixel_aspect: 1.0 }));
+        comp.layers.push(build::layer(&mut p, &comp, "Solid", LayerSource::Solid { item: sid }, (8, 8), None));
+        let cid = p.add_item("Comp", Label::Sandstone, None, ItemKind::Comp(comp.into()));
+        // (two pools: a job takes the kept one only with the same footage source)
+        let (footage, other_footage) = (effectcraft_media::MediaPool::new(), effectcraft_media::MediaPool::new());
+        let settings = RenderSettings::default();
+        let (png, h264) = (OutputModule::for_format(OutputFormat::PngSequence), OutputModule::for_format(OutputFormat::H264));
+        let sink = |_: &str, _: Vec<u8>| {};
+        fn job<'a>(
+            p: &'a Project,
+            cid: ItemId,
+            settings: &'a RenderSettings,
+            output: &'a OutputModule,
+            footage: &'a dyn effectcraft_render::FootageSource,
+        ) -> Job<'a> {
+            Job {
+                project: p,
+                footage,
+                expr: None,
+                accel: None,
+                comp: cid,
+                settings,
+                output,
+                path: "/mem/x",
+                sink: None,
+                nested_switches: true,
+                options: Default::default(),
+            }
+        }
+        let mut first = job(&p, cid, &settings, &png, &footage);
+        first.sink = Some(&sink);
+        // Other tests of this binary don't export, so the kept job is this one's.
+        let r = crate::export(&first, &mut |_| true);
+        assert!(r.is_ok(), "{r:?}");
+        // A job rendering other frames does not take it (and the kept job is gone either way).
+        let half = RenderSettings { resolution: 0.5, ..RenderSettings::default() };
+        let mut edited = p.clone();
+        if let Some(c) = edited.comp_mut(cid) {
+            c.background = [0.0, 1.0, 0.0];
+        }
+        for other in [job(&p, cid, &half, &h264, &footage), job(&edited, cid, &settings, &h264, &footage), job(&p, cid, &settings, &h264, &other_footage)] {
+            assert!(crate::export(&first, &mut |_| true).is_ok());
+            assert!(take_warm(&other).is_none());
+        }
+        assert!(crate::export(&first, &mut |_| true).is_ok());
+        let second = job(&p, cid, &settings, &h264, &footage);
+        let warm = take_warm(&second).expect("the first module's job is kept");
+        assert!(take_warm(&second).is_none(), "taken once");
+        let cx = Cx::with(&second, warm.project, warm.cache);
+        let misses = cx.cache.stats().misses;
+        assert!(misses > 0);
+        let comp = cx.comp().unwrap();
+        for i in 0..4 {
+            let img = cx.frame(comp, i);
+            let mut uncached = cx.renderer();
+            uncached.cache = None;
+            assert_eq!(img.data, uncached.comp_frame(cid, settings.frame_time(comp, i)).data, "frame {i}");
+        }
+        assert_eq!(cx.cache.stats().misses, misses, "the second module rendered no layer again");
     }
 
     /// Run `f` with the job of a `frames`-frame comp of one solid.

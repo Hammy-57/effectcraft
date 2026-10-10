@@ -214,8 +214,11 @@ Two things follow:
 `edit.undo` undoes the caller's own latest step: the user's (no `client`) or the agent's. When
 someone else made the last step, only what the caller's step changed is reverted, as a new step
 (`{undone, selective: true}`), so the user's ⌘Z never removes an agent's work and an agent's undo
-never removes the user's. It's refused, changing nothing, when someone changed the same item (a
-comp, footage item, folder) or the project settings since; the error names who. The user's
+never removes the user's. Inside a comp it works layer by layer: an agent adding or changing other
+layers of the same comp doesn't get in the way. It's refused, changing nothing, when someone changed
+the same thing since (the same layer, a comp's settings or layer order the step changed, a footage
+item, a folder, the project settings); the error names who and what. Pressing it again goes on to
+the caller's step before (an own-step undo isn't itself undone next). The user's
 `edit.undo {any: true}` undoes the last step whoever made it, and the History panel still jumps to
 any state.
 
@@ -1032,7 +1035,8 @@ target directory. `cargo xtask agents` keeps them apart:
 |---|---|
 | `cargo xtask agents status` | Every worktree (branch, age, commits ahead of `main`, dirty files and a verdict: `unmerged work`, `merged but dirty`, `safe to remove`), every `target/agent-*` directory (size, age, owner or `ORPHAN`) and the active claims. Also written to `plan/STATUS.md` |
 | `cargo xtask agents claim <slug> --task "…" [--paths a,b]` | Records the claim in `plan/claims/<slug>.toml`, warns when a path overlaps another agent's claim, and prints the environment to use: `CARGO_TARGET_DIR=target/agent-<slug>`, a free `EFFECTCRAFT_CONTROL_PORT` (from 9880; 9877 is left to the user's app) and `CARGO_BUILD_JOBS=4` |
-| `cargo xtask agents release <slug>` | Deletes the claim when you are done |
+| `cargo xtask agents lane <slug> --task "…" [--paths a,b] [--branch b]` | Like `claim`, in a lane: one of a few permanent worktrees (`../effectcraft-lane-<n>`, 4 by default, `EFFECTCRAFT_LANES`) with its own warm build folder (`target/lane-<n>`), switched to a new branch `agents/<slug>` from `main`, so a build only compiles what changed. Fails when every lane is busy |
+| `cargo xtask agents release <slug>` | Deletes the claim when you are done. A lane must have no uncommitted changes; it goes back to `main` and its branch is deleted if merged |
 | `cargo xtask agents gc [--yes]` | Lists merged, clean worktrees and orphan target directories (a dry run); `--yes` removes only those, never a dirty, locked, unmerged or claimed one, or the main checkout |
 
 Agents that need to look at the app use the offscreen UI (`mcp --ui`), which takes no port and no

@@ -954,3 +954,10 @@ before.
 - Control channel fairness: agents sharing the app take turns per `client`, a frame spends at most
   50 ms on requests (the window keeps drawing), and up to 32 connections are served; the Edit
   menu's Undo names the step ⌘Z undoes (your own latest, behind agents' steps).
+- Undo with agents in the project works layer by layer inside a comp: the user's ⌘Z undoes their
+  change to one layer while an agent adds or edits other layers of the same comp (refused only for
+  the same layer, or the comp settings / layer order the step changed), and pressing ⌘Z again goes
+  on to the step before instead of bringing the undone one back.
+- The desktop app's control server and the windowless host (`effectcraft-cli serve`) share one
+  control-channel implementation: the host now also rejects junk lines, bounds line length and
+  answers repeated `requestId`s from the reply cache, and both use the same wait-for-job replies.

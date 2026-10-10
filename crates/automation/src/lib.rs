@@ -21,6 +21,7 @@ mod autosave;
 pub mod backend;
 pub mod base64;
 pub mod bridge;
+pub mod control_wire;
 pub mod figma_bridge;
 pub mod host_server;
 mod long_job;

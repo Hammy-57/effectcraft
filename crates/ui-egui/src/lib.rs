@@ -1420,10 +1420,10 @@ impl EffectcraftApp {
         self.session.poll_offload();
         let waiters = std::mem::take(&mut self.job_waiters);
         for (w, reply) in waiters {
-            if w.pending(self) {
+            if w.pending(&self.session) {
                 self.job_waiters.push((w, reply));
             } else {
-                let v = w.finish(self);
+                let v = w.finish(&mut self.session);
                 let _ = reply.send(v);
             }
         }

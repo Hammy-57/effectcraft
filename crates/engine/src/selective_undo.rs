@@ -8,13 +8,14 @@
 //! Otherwise it refuses, naming who did, and changes nothing.
 //!
 //! What a step changed is compared per project item (a composition, a footage item, a folder)
-//! and for the project's own settings; comps and their layers are shared between states, so
-//! comparing them is cheap.
+//! and for the project's own settings, and inside a composition per layer: an agent working on
+//! one layer doesn't block undoing the user's change to another layer of the same comp. Comps and
+//! their layers are shared between states, so comparing them is cheap.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use effectcraft_project::{Item, ItemId, ItemKind, Project};
+use effectcraft_project::{Comp, Item, ItemId, ItemKind, Layer, LayerId, Layers, Project};
 
 use crate::{EngineError, Result, Session};
 
@@ -27,10 +28,106 @@ fn item_eq(a: Option<&Item>, b: Option<&Item>) -> bool {
                 (ItemKind::Comp(x), ItemKind::Comp(y)) => Arc::ptr_eq(x, y) || x == y,
                 (x, y) => x == y,
             };
-            kind && a.id == b.id && a.name == b.name && a.label == b.label && a.comment == b.comment && a.parent == b.parent && a.proxy == b.proxy
+            kind && meta_eq(a, b)
         }
         _ => false,
     }
+}
+
+/// Whether two items have the same name, label, comment, folder and proxy (everything but their
+/// contents).
+fn meta_eq(a: &Item, b: &Item) -> bool {
+    a.id == b.id && a.name == b.name && a.label == b.label && a.comment == b.comment && a.parent == b.parent && a.proxy == b.proxy
+}
+
+fn layer_eq(a: Option<&Arc<Layer>>, b: Option<&Arc<Layer>>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b) || a == b,
+        _ => false,
+    }
+}
+
+fn find(c: &Comp, id: LayerId) -> Option<&Arc<Layer>> {
+    c.layers.arcs().iter().find(|l| l.id == id)
+}
+
+/// Layer ids in stack order.
+fn order(c: &Comp) -> Vec<LayerId> {
+    c.layers.iter().map(|l| l.id).collect()
+}
+
+/// A comp's settings (everything but its layers).
+fn settings(c: &Comp) -> Comp {
+    Comp { layers: Layers::new(), ..c.clone() }
+}
+
+/// Revert a step's change to a composition (`before` → `after`) in its current version `cur`,
+/// which others changed since, layer by layer. `Err`: what both the step and someone after it
+/// changed (layers, the comp's settings or name, or the layer order).
+fn merge_comp(before: &Item, after: &Item, cur: &Item) -> std::result::Result<Item, Vec<String>> {
+    let (ItemKind::Comp(b), ItemKind::Comp(a), ItemKind::Comp(c)) = (&before.kind, &after.kind, &cur.kind) else {
+        return Err(vec![format!("“{}”", after.name)]);
+    };
+    let mut clashes = vec![];
+    let meta = if meta_eq(before, after) {
+        cur
+    } else if meta_eq(cur, after) {
+        before
+    } else {
+        clashes.push(format!("the name or folder of “{}”", after.name));
+        cur
+    };
+    let mut comp = if settings(b) == settings(a) {
+        (**c).clone()
+    } else if settings(c) == settings(a) {
+        Comp { layers: c.layers.clone(), ..(**b).clone() }
+    } else {
+        clashes.push(format!("the settings of “{}”", after.name));
+        (**c).clone()
+    };
+    let ids: BTreeSet<LayerId> = order(b).into_iter().chain(order(a)).collect();
+    let changed: Vec<LayerId> = ids.into_iter().filter(|&id| !layer_eq(find(b, id), find(a, id))).collect();
+    for &id in &changed {
+        if !layer_eq(find(c, id), find(a, id)) {
+            let name = find(c, id).or(find(a, id)).or(find(b, id)).map(|l| l.name.clone()).unwrap_or_default();
+            clashes.push(format!("“{name}” in “{}”", after.name));
+        }
+    }
+    // Did the step move layers (not just add or delete them)?
+    let common = |x: &Comp, y: &Comp| order(x).into_iter().filter(|id| find(y, *id).is_some()).collect::<Vec<_>>();
+    let moved = common(b, a) != common(a, b);
+    if moved && order(c) != order(a) {
+        clashes.push(format!("the layer order of “{}”", after.name));
+    }
+    if !clashes.is_empty() {
+        return Err(clashes);
+    }
+    let layers: Vec<Arc<Layer>> = if moved {
+        // Nobody added, deleted or moved layers since: the step's order, with others' changes.
+        order(b).into_iter().filter_map(|id| if changed.contains(&id) { find(b, id) } else { find(c, id) }.cloned()).collect()
+    } else {
+        // Revert the step's layers where they are now; drop the ones it added and put back the
+        // ones it deleted (above the layer that followed them).
+        let mut out: Vec<Arc<Layer>> = c
+            .layers
+            .arcs()
+            .iter()
+            .filter(|l| !changed.contains(&l.id) || find(b, l.id).is_some())
+            .map(|l| if changed.contains(&l.id) { find(b, l.id).cloned().unwrap_or_else(|| l.clone()) } else { l.clone() })
+            .collect();
+        let was = b.layers.arcs();
+        for (i, l) in was.iter().enumerate().rev() {
+            if find(a, l.id).is_some() {
+                continue;
+            }
+            let at = was.get(i + 1..).and_then(|below| below.iter().find_map(|n| out.iter().position(|o| o.id == n.id))).unwrap_or(out.len());
+            out.insert(at.min(out.len()), l.clone());
+        }
+        out
+    };
+    comp.layers = layers.into_iter().collect();
+    Ok(Item { kind: ItemKind::Comp(Arc::new(comp)), ..meta.clone() })
 }
 
 /// The project without its items and id counter (its settings, render queue, …).
@@ -51,7 +148,7 @@ pub fn undo_own(s: &mut Session, me: Option<&str>) -> Result<Option<String>> {
     let n = s.history.undo.len();
     // State k + 1 is what step k made (the last one made the current state).
     let made: Vec<Arc<Project>> = (0..n).map(|k| s.history.undo.get(k + 1).map_or_else(|| s.project.clone(), |(_, p)| p.clone())).collect();
-    let Some(k) = (0..n).rev().find(|&k| made.get(k).is_some_and(|after| s.history.author(after) == me)) else { return Ok(None) };
+    let Some(k) = (0..n).rev().find(|&k| made.get(k).is_some_and(|after| s.history.author(after) == me && !s.history.settled(after))) else { return Ok(None) };
     let (Some((label, before)), Some(after)) = (s.history.undo.get(k).cloned(), made.get(k).cloned()) else { return Ok(None) };
     let cur = s.project.clone();
     let later: Vec<(String, Option<String>)> =
@@ -66,8 +163,16 @@ pub fn undo_own(s: &mut Session, me: Option<&str>) -> Result<Option<String>> {
             continue;
         }
         if !item_eq(cur.items.get(&id), a) {
-            let name = a.or(b).map(|i| i.name.clone()).unwrap_or_default();
-            clashes.push(format!("“{name}”"));
+            // Someone changed it since: a comp may still be undone layer by layer.
+            match (b, a, cur.items.get(&id)) {
+                (Some(b), Some(a), Some(c)) => match merge_comp(b, a, c) {
+                    Ok(item) => {
+                        items.insert(id, item);
+                    }
+                    Err(c) => clashes.extend(c),
+                },
+                _ => clashes.push(format!("“{}”", a.or(b).map(|i| i.name.clone()).unwrap_or_default())),
+            }
             continue;
         }
         match b {
@@ -102,6 +207,10 @@ pub fn undo_own(s: &mut Session, me: Option<&str>) -> Result<Option<String>> {
         *p = next;
         Ok(())
     })?;
+    // Undone, and the undo itself isn't a step to undo next: ⌘Z again goes on to the one before.
+    s.history.settle(&after);
+    let undo_step = s.project.clone();
+    s.history.settle(&undo_step);
     s.sanitize_state();
     Ok(Some(label))
 }
@@ -111,5 +220,11 @@ pub fn undo_own(s: &mut Session, me: Option<&str>) -> Result<Option<String>> {
 pub fn own_undo_label(s: &Session, me: Option<&str>) -> Option<String> {
     let n = s.history.undo.len();
     let made = |k: usize| s.history.undo.get(k + 1).map_or_else(|| s.project.clone(), |(_, p)| p.clone());
-    (0..n).rev().find(|&k| s.history.author(&made(k)) == me).and_then(|k| s.history.undo.get(k).map(|(l, _)| l.clone()))
+    let own = (0..n).rev().find(|&k| {
+        let after = made(k);
+        s.history.author(&after) == me && !s.history.settled(&after)
+    });
+    // Nothing left but own-step undos: the last one is undone plainly (it brings its step back).
+    let k = own.or_else(|| n.checked_sub(1).filter(|_| s.history.author(&s.project) == me))?;
+    s.history.undo.get(k).map(|(l, _)| l.clone())
 }

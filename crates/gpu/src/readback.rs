@@ -327,22 +327,28 @@ thread_local! {
 
 /// Validate every row before publishing tightly packed bytes.
 pub(crate) fn packed(view: &[u8], row: usize, stride: usize, height: usize) -> Result<Vec<u8>, Error> {
+    let size = row.checked_mul(height).ok_or("GPU readback output size overflow")?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(size).map_err(|e| format!("allocating GPU readback output: {e}"))?;
+    for_rows(view, row, stride, height, |r| out.extend_from_slice(r))?;
+    Ok(out)
+}
+
+/// Hand each of `height` rows (`row` bytes every `stride` bytes) of a mapped readback to `f`,
+/// after checking that all of them are there (no partial rows).
+pub(crate) fn for_rows(view: &[u8], row: usize, stride: usize, height: usize, mut f: impl FnMut(&[u8])) -> Result<(), Error> {
     if row == 0 || height == 0 || stride < row {
         return Err("invalid GPU readback layout".into());
     }
-    let size = row.checked_mul(height).ok_or("GPU readback output size overflow")?;
     let end = (height - 1).checked_mul(stride).and_then(|s| s.checked_add(row)).ok_or("GPU readback mapped size overflow")?;
     if view.len() < end {
         return Err(format!("short GPU readback: {} bytes, needs {end}", view.len()));
     }
-    let mut out = Vec::new();
-    out.try_reserve_exact(size).map_err(|e| format!("allocating GPU readback output: {e}"))?;
     for y in 0..height {
         let start = y.checked_mul(stride).ok_or("GPU readback row overflow")?;
-        let bytes = view.get(start..start + row).ok_or("short GPU readback row")?;
-        out.extend_from_slice(bytes);
+        f(view.get(start..start + row).ok_or("short GPU readback row")?);
     }
-    Ok(out)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -601,5 +607,17 @@ mod tests {
     fn no_partial_rows() {
         assert!(packed(&[0; 7], 4, 4, 2).is_err());
         assert_eq!(packed(&[1, 2, 0, 0, 3, 4], 2, 4, 2).unwrap(), vec![1, 2, 3, 4]);
+    }
+
+    /// Rows are handed over in order without their padding; a short view yields none.
+    #[test]
+    fn for_rows_skips_padding_and_rejects_short_views() {
+        let mut seen = Vec::new();
+        for_rows(&[1, 2, 9, 9, 3, 4], 2, 4, 2, |r| seen.push(r.to_vec())).unwrap();
+        assert_eq!(seen, vec![vec![1, 2], vec![3, 4]]);
+        let mut calls = 0;
+        assert!(for_rows(&[0; 7], 4, 4, 2, |_| calls += 1).is_err());
+        assert!(for_rows(&[0; 8], 4, 2, 2, |_| calls += 1).is_err());
+        assert_eq!(calls, 0);
     }
 }
