@@ -21,6 +21,7 @@ EffectCraft is a clean-room, open-source, pure-Rust motion graphics and visual e
 - **Everything is agent-drivable:** every interactive widget registers an automation id; UI state is serde.
 - **Community links** (Help menu, About, header Discord button): https://discord.gg/artcraft, https://getartcraft.com, https://getartcraft.com/apps/effectcraft, https://github.com/storytold/effectcraft.
 - **Quality gates** before every commit: `cargo xtask ci` (fmt, clippy -D warnings, tests, layers, assets, wasm). Agents: `cargo xtask ci --affected` per change (only the crates the change can affect, see `docs/testing.md`); full `cargo xtask ci` before release.
+- **Integration tests are one binary per crate** where a crate has many (`ui-egui`: `--test ui`; `host`, `export`, `effects`: `--test host|export|effects`): `tests/<name>/main.rs` declares each `tests/*.rs` as a module (`#[path = "../x.rs"] mod x;`, a test fails until a new file is declared). One file's tests: `cargo test -p effectcraft-ui-egui --test ui ui_viewer::`.
 - **Commits:** one task id per commit (`M6.3: trim paths`). Only green states.
 - parity.md cells hold the current state; append history to docs/parity-log.md (union-merged).
 

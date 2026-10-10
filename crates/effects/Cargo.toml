@@ -5,6 +5,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+# The integration tests are one binary (tests/effects/main.rs declares every tests/*.rs): one link
+# instead of one per file. `cargo test -p effectcraft-effects --test effects sim_golden::`
+autotests = false
+
+[[test]]
+name = "effects"
+path = "tests/effects/main.rs"
 
 [lints]
 workspace = true

@@ -759,7 +759,7 @@ without one (a hover, a half-finished drag) is not in it.
 steps that matter, with an `expect_error` or `expect` line where the fix changed the outcome,
 dropped into [`tests/repros/`](../tests/repros). `crates/host/tests/repros.rs` replays every
 `*.jsonl` there and fails on any panic or unmet expectation
-(`cargo nextest run -p effectcraft-host --test repros`).
+(`cargo nextest run -p effectcraft-host --test host repros::`).
 
 ## Seeing the UI
 

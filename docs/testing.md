@@ -74,6 +74,37 @@ whole workspace. Run the full `cargo xtask ci` before a release.
   the command-line tool's JSON output.
 - **Interface** (`crates/ui-egui`): headless egui_kittest tests for panels and dialogs.
 
+## One test binary per crate
+
+Each `tests/*.rs` file is normally its own test binary, and each one links the crate and all its
+dependencies again (46 copies of the whole app for `crates/ui-egui`). The crates with many
+integration tests set `autotests = false` and build them as one binary instead, whose root declares
+every file as a module:
+
+| Crate | Binary | Root |
+| --- | --- | --- |
+| `effectcraft-ui-egui` | `ui` | `crates/ui-egui/tests/ui/main.rs` |
+| `effectcraft-host` | `host` | `crates/host/tests/host/main.rs` |
+| `effectcraft-export` | `export` | `crates/export/tests/export/main.rs` |
+| `effectcraft-effects` | `effects` | `crates/effects/tests/effects/main.rs` |
+
+```sh
+cargo test -p effectcraft-ui-egui --test ui                      # all of them
+cargo test -p effectcraft-ui-egui --test ui ui_viewer::          # one file (a name filter)
+cargo test -p effectcraft-ui-egui --test ui ui_tabs:: -- --ignored   # its opt-in snapshots
+cargo nextest run -p effectcraft-host --test host repros::
+```
+
+A new `tests/x.rs` needs `#[path = "../x.rs"] mod x;` in the root; until then cargo ignores the
+file and the root's `every_test_file_is_a_module` test fails. Tests of different files now share a
+process and run in parallel: a ui test that creates a GPU device holds `crate::gpu_lock()`
+(wgpu's GL backend on Mesa crashes with concurrent devices), and process-wide state (env vars,
+fixed temp file names) must not be shared between tests.
+
+Dev and test builds carry line tables only (`debug = "line-tables-only"`, dependencies none):
+backtraces keep file and line, links are smaller. `CARGO_PROFILE_DEV_DEBUG=true` brings full debug
+info back for the workspace crates when you need a debugger.
+
 ## Looking at the interface without a window
 
 ```sh

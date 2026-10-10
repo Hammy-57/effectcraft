@@ -5,9 +5,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+# The integration tests are one binary (tests/ui/main.rs declares every tests/*.rs): one link of
+# the app instead of one per file. `cargo test -p effectcraft-ui-egui --test ui ui_viewer::`
+autotests = false
 
 [lints]
 workspace = true
+
+[[test]]
+name = "ui"
+path = "tests/ui/main.rs"
 
 [features]
 ## The full app offscreen (`offscreen::OffscreenUi`: egui_kittest + wgpu, no window), used by
