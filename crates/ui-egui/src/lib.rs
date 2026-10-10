@@ -409,7 +409,11 @@ impl EffectcraftApp {
         ctx.set_zoom_factor(p.appearance.ui_scale as f32 / 100.0);
         self.ui.cache_when_idle = p.previews.cache_frames_when_idle;
         self.ui.viewer.fast_preview = p.previews.fast_previews;
-        self.frames.set_budget(p.cache_budgets(self.session.sys_memory).preview);
+        let budgets = p.cache_budgets(self.session.sys_memory);
+        self.frames.set_budget(budgets.preview);
+        if let Some(g) = &self.gpu {
+            g.context().set_cache_budget(budgets.layer);
+        }
     }
 
     /// Change settings from the UI (applied next frame and saved).
@@ -627,6 +631,7 @@ impl EffectcraftApp {
                     }
                 }
                 log::info!("GPU compositor: {}", effectcraft_engine::render::Accelerator::name(&g));
+                g.context().set_cache_budget(self.session.prefs.cache_budgets(self.session.sys_memory).layer);
                 self.session.accel = Some(Arc::new(g.clone()));
                 self.gpu = Some(g);
                 self.wgpu = Some(rs.clone());

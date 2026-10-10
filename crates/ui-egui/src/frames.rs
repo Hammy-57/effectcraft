@@ -25,7 +25,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use effectcraft_engine::project::{Comp, ItemId, ItemKind, LayerSource, Node, Project, PropGroup};
 use effectcraft_engine::render::disk_cache::{self, DiskCache};
@@ -359,6 +359,8 @@ pub struct Frames {
     inflight: Arc<Mutex<HashSet<FrameKey>>>,
     /// Pending jobs, picked by priority when a pool thread frees up (the viewer's frame first).
     queue: Arc<Mutex<Queue>>,
+    /// Signalled when a job stops running (workers waiting for memory, see [`max_running`]).
+    freed: Arc<Condvar>,
     #[cfg(not(target_arch = "wasm32"))]
     /// None if the OS refused the threads: jobs then go to rayon's global pool.
     pool: Option<rayon::ThreadPool>,
@@ -388,6 +390,7 @@ impl Default for Frames {
             cache: Arc::new(Mutex::new(Cache { map: HashMap::new(), order: VecDeque::new(), bytes: 0, gpu_bytes: 0, budget: 3 << 30, gpu_budget: GPU_BUDGET })),
             inflight: Arc::new(Mutex::new(HashSet::new())),
             queue: Arc::new(Mutex::new(Queue::default())),
+            freed: Arc::default(),
             #[cfg(not(target_arch = "wasm32"))]
             // A panicking job would abort the whole process (rayon's default for `spawn`): log it
             // and lose only that frame (the panic hook has logged the message).
@@ -408,6 +411,17 @@ impl Default for Frames {
             remote_busy: Arc::default(),
         }
     }
+}
+
+/// Frames that may render at once given `job`'s size: each takes about four `f32` frames (the
+/// comp canvas, layer buffers, matte / adjustment temporaries), and together they stay within
+/// the layer cache's memory budget (Memory & CPU settings): a 4K comp (~530 MB a frame) renders
+/// two frames at once on the default 1 GB, an HD comp eight. At least one.
+fn max_running(job: &Job) -> usize {
+    let (w, h) = job.src.project.comp(job.comp).map_or((0, 0), |c| (c.width, c.height));
+    let s = job.opts.scale.clamp(0.01, 4.0);
+    let frame = ((w as f64 * s).ceil() * (h as f64 * s).ceil() * 16.0 * 4.0).max(1.0);
+    ((job.src.layer_cache.budget() as f64 / frame) as usize).max(1)
 }
 
 /// Premultiplied f32 → egui premultiplied Color32 (alpha kept, so the viewer can show the
@@ -719,6 +733,10 @@ impl Frames {
         q.jobs.push(Job { key, src: src.clone(), comp, t, opts, urgent, seq });
         drop(inf);
         drop(q);
+        // A worker waiting for memory takes the viewer's frame at once.
+        if urgent {
+            self.freed.notify_all();
+        }
         #[cfg(not(target_arch = "wasm32"))]
         if self.remote.is_none() {
             let w = self.worker();
@@ -741,6 +759,7 @@ impl Frames {
     fn worker(&self) -> Worker {
         Worker {
             queue: self.queue.clone(),
+            freed: self.freed.clone(),
             cache: self.cache.clone(),
             inflight: self.inflight.clone(),
             ctx: self.ctx.clone(),
@@ -870,6 +889,7 @@ impl Frames {
 /// Renders queued jobs (on a pool thread, or the UI thread on wasm32).
 struct Worker {
     queue: Arc<Mutex<Queue>>,
+    freed: Arc<Condvar>,
     cache: Arc<Mutex<Cache>>,
     inflight: Arc<Mutex<HashSet<FrameKey>>>,
     ctx: Option<egui::Context>,
@@ -884,7 +904,18 @@ impl Worker {
         let Worker { queue, content_keys, .. } = self;
         let job = {
             let Ok(mut q) = queue.lock() else { return false };
-            let Some(i) = Queue::best(&q.jobs) else { return false };
+            let i = loop {
+                let Some(i) = Queue::best(&q.jobs) else { return false };
+                let j = &q.jobs[i];
+                // Prefetch waits while the frames already rendering would take more memory than
+                // the budget allows; the viewer's frame never waits. (wasm32 renders one frame
+                // at a time on the UI thread, which must not block.)
+                if cfg!(target_arch = "wasm32") || j.urgent || q.running.len() < max_running(j) {
+                    break i;
+                }
+                let Ok((g, _)) = self.freed.wait_timeout(q, std::time::Duration::from_millis(50)) else { return false };
+                q = g;
+            };
             let job = q.jobs.swap_remove(i);
             q.running.insert(job.key);
             if job.urgent {
@@ -948,6 +979,7 @@ impl Worker {
                 q.urgent_running = q.urgent_running.saturating_sub(1);
             }
         }
+        self.freed.notify_all();
         if let Some(ctx) = &self.ctx {
             ctx.request_repaint();
         }
@@ -1186,6 +1218,41 @@ mod tests {
         assert!(footage.0.load(Ordering::SeqCst) > 0, "the render reached the footage");
         assert_eq!(f.inflight(), 0, "released");
         assert!(!f.is_cached(&key));
+    }
+
+    /// Frames rendering at once are bounded by their size against the layer cache budget: 4K
+    /// comps render fewer at once than HD ones, and never fewer than one.
+    #[test]
+    fn concurrent_frames_follow_frame_size_and_budget() {
+        use effectcraft_engine::Session;
+        use serde_json::json;
+        let mut s = Session::default();
+        let comp = |s: &mut Session, w: u32, h: u32| ItemId(s.execute("comp.new", json!({"name": "C", "width": w, "height": h, "duration": 1})).unwrap()["comp"].as_u64().unwrap());
+        let uhd = comp(&mut s, 3840, 2160);
+        let hd = comp(&mut s, 1920, 1080);
+        let job = |cid: ItemId, scale: f64, budget: usize| Job {
+            key: key(cid.0, 0, 0),
+            src: RenderSource {
+                project: s.project.clone(),
+                footage: Arc::new(effectcraft_engine::render::NoFootage),
+                expr: None,
+                layer_cache: Arc::new(LayerCache::new(budget)),
+                gpu: None,
+                gpu_display: false,
+                disk: None,
+            },
+            comp: cid,
+            t: Tick::ZERO,
+            opts: RenderOpts { scale, ..Default::default() },
+            urgent: false,
+            seq: 0,
+        };
+        let gib = 1 << 30;
+        assert_eq!(max_running(&job(uhd, 1.0, gib)), 2);
+        assert_eq!(max_running(&job(hd, 1.0, gib)), 8);
+        assert_eq!(max_running(&job(uhd, 0.5, gib)), 8, "Half resolution renders HD-sized frames");
+        assert_eq!(max_running(&job(uhd, 1.0, 64 << 20)), 1);
+        assert_eq!(max_running(&job(ItemId(9999), 1.0, gib)), gib, "no comp: nothing to bound");
     }
 
     /// #284: scrubbing asks for a viewer frame at every step; a newer one drops the comp's viewer

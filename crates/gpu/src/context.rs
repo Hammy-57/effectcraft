@@ -42,10 +42,10 @@ const EXT_ENTRIES: &[&str] = &["classic3d"];
 /// 8/16 bpc are emulated by clamping and quantising, as on the CPU).
 pub const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
 
-/// Uploaded layer buffers kept on the GPU (bytes).
+/// Uploaded layer buffers kept on the GPU (bytes), at most (see [`GpuContext::set_cache_budget`]).
 const UPLOAD_BUDGET: usize = 1536 << 20;
 
-/// Working textures kept for reuse once their last image is dropped (bytes).
+/// Working textures kept for reuse once their last image is dropped (bytes), at most.
 const POOL_BUDGET: usize = 768 << 20;
 
 /// A GPU image: premultiplied RGBA f32 in a texture (cheap to clone; immutable once written).
@@ -107,6 +107,8 @@ pub(crate) struct Pool {
     open: BTreeSet<u64>,
     next: u64,
     bytes: usize,
+    /// Byte budget of the free textures (`None`: [`POOL_BUDGET`]).
+    budget: Option<usize>,
     /// Working textures reused / newly allocated (diagnostics, tests).
     hits: u64,
     misses: u64,
@@ -153,7 +155,7 @@ impl Pool {
 
     fn make_free(&mut self, t: wgpu::Texture) {
         let b = tex_bytes(&t);
-        if self.bytes + b > POOL_BUDGET {
+        if self.bytes + b > self.budget.unwrap_or(POOL_BUDGET) {
             return;
         }
         self.bytes += b;
@@ -196,6 +198,18 @@ impl Pool {
         self.free.clear();
         self.bytes = 0;
     }
+
+    /// Keep at most `budget` bytes of free textures from now on (drops the excess now).
+    fn set_budget(&mut self, budget: usize) {
+        self.budget = Some(budget);
+        for list in self.free.values_mut() {
+            while self.bytes > budget {
+                let Some(t) = list.pop() else { break };
+                self.bytes = self.bytes.saturating_sub(tex_bytes(&t));
+            }
+        }
+        self.free.retain(|_, l| !l.is_empty());
+    }
 }
 
 /// Uniform parameter block shared by every kernel (see `shaders/common.wgsl`).
@@ -234,6 +248,27 @@ struct Uploads {
     map: HashMap<usize, Upload>,
     bytes: usize,
     clock: u64,
+    /// Byte budget (`None`: [`UPLOAD_BUDGET`]).
+    budget: Option<usize>,
+}
+
+impl Uploads {
+    /// Drop textures whose layer buffer is gone (evicted from the layer cache, an older frame's),
+    /// then the least recently used over budget.
+    fn trim(&mut self) {
+        let before = self.map.len();
+        self.map.retain(|_, e| e.buf.strong_count() > 0);
+        if self.map.len() != before {
+            self.bytes = self.map.values().map(|e| e.bytes).sum();
+        }
+        let budget = self.budget.unwrap_or(UPLOAD_BUDGET);
+        while self.bytes > budget {
+            let Some(k) = self.map.iter().min_by_key(|(_, e)| e.last_use).map(|(k, _)| *k) else { break };
+            if let Some(e) = self.map.remove(&k) {
+                self.bytes = self.bytes.saturating_sub(e.bytes);
+            }
+        }
+    }
 }
 
 /// The device and everything compiled for it.
@@ -825,23 +860,29 @@ impl GpuContext {
                 u.bytes -= old.bytes;
             }
             u.bytes += bytes;
-            // Drop textures of freed buffers, then the least recently used over budget.
-            if u.bytes > UPLOAD_BUDGET {
-                let dead: Vec<usize> = u.map.iter().filter(|(_, e)| e.buf.strong_count() == 0).map(|(k, _)| *k).collect();
-                for k in dead {
-                    if let Some(e) = u.map.remove(&k) {
-                        u.bytes -= e.bytes;
-                    }
-                }
-            }
-            while u.bytes > UPLOAD_BUDGET {
-                let Some(k) = u.map.iter().min_by_key(|(_, e)| e.last_use).map(|(k, _)| *k) else { break };
-                if let Some(e) = u.map.remove(&k) {
-                    u.bytes -= e.bytes;
-                }
-            }
+            u.trim();
         }
         Some(img)
+    }
+
+    /// Size the GPU-side caches after the layer cache's memory budget (Memory & CPU settings,
+    /// after RAM Reserved for Other Applications): uploaded layer textures mirror cached layer
+    /// buffers, so they get at most the same budget (capped at [`UPLOAD_BUDGET`]), and free
+    /// working textures half of it (capped at [`POOL_BUDGET`]). On unified memory (Apple
+    /// silicon) both come out of system RAM.
+    pub fn set_cache_budget(&self, layer_cache: usize) {
+        if let Ok(mut u) = self.uploads.lock() {
+            u.budget = Some(layer_cache.min(UPLOAD_BUDGET));
+            u.trim();
+        }
+        if let Ok(mut p) = self.pool.lock() {
+            p.set_budget((layer_cache / 2).min(POOL_BUDGET));
+        }
+    }
+
+    /// Uploaded layer textures kept: (count, bytes) (diagnostics, tests).
+    pub fn upload_stats(&self) -> (usize, usize) {
+        self.uploads.lock().map(|u| (u.map.len(), u.bytes)).unwrap_or_default()
     }
 
     /// Forget uploaded layer textures.
@@ -1255,4 +1296,37 @@ impl<'g> Enc<'g> {
 /// Mip levels of a full chain for a `w × h` texture (down to 1 × 1).
 pub(crate) fn mip_levels(w: u32, h: u32) -> u32 {
     u32::BITS - w.max(h).max(1).leading_zeros()
+}
+
+#[cfg(test)]
+mod upload_budget_tests {
+    use super::*;
+
+    fn buf(w: u32) -> Arc<Buf> {
+        Arc::new(Buf { img: Image::filled(w, 8, [0.5, 0.25, 0.125, 0.5]), offset: [0.0; 2], scale: 1.0 })
+    }
+
+    /// Textures of layer buffers that are gone are dropped at the next upload, not only once the
+    /// upload budget overflows; the budget follows the layer cache's.
+    #[test]
+    fn dead_uploads_are_purged_and_budget_follows_prefs() {
+        crate::tests::hold_gpu_lock();
+        let Some(g) = GpuContext::headless() else { return };
+        let a = buf(8);
+        let b = buf(16);
+        assert!(g.upload_buf(&a).is_some() && g.upload_buf(&b).is_some());
+        assert_eq!(g.upload_stats(), (2, (8 + 16) * 8 * 16));
+        drop(a);
+        let c = buf(4);
+        assert!(g.upload_buf(&c).is_some());
+        assert_eq!(g.upload_stats(), (2, (16 + 4) * 8 * 16), "a's texture dropped");
+        // A budget below b + c keeps the most recently used.
+        g.set_cache_budget(4 * 8 * 16 + 100);
+        assert_eq!(g.upload_stats(), (1, 4 * 8 * 16));
+        // Re-uploading the same live buffer is a hit.
+        let ups = g.transfer_stats().uploads;
+        assert!(g.upload_buf(&c).is_some());
+        assert_eq!(g.transfer_stats().uploads, ups);
+        drop(b);
+    }
 }

@@ -89,9 +89,14 @@ impl<'a> Renderer<'a> {
         self.content_buf_timed(ctx, layer, None).map(|(b, _)| b)
     }
 
-    fn content_buf_timed(&self, ctx: &EvalCtx, layer: &Layer, mut timing: Option<&mut LayerTiming>) -> Option<(Arc<Buf>, Option<u64>)> {
+    /// The layer cache key of a layer's content (`None` without a cache or for uncached layers).
+    fn content_cache_key(&self, ctx: &EvalCtx, layer: &Layer) -> Option<u64> {
         let key = self.cache.and_then(|_| cache::layer_key(ctx, layer, self.raster_scale(ctx, layer), self.opts.draft, self.mb_on(ctx, layer)));
-        let key = self.content_key(ctx, layer, key);
+        self.content_key(ctx, layer, key)
+    }
+
+    fn content_buf_timed(&self, ctx: &EvalCtx, layer: &Layer, mut timing: Option<&mut LayerTiming>) -> Option<(Arc<Buf>, Option<u64>)> {
+        let key = self.content_cache_key(ctx, layer);
         if let (Some(c), Some(k)) = (self.cache, key)
             && let Some(b) = c.get(k)
         {
@@ -166,6 +171,36 @@ impl<'a> Renderer<'a> {
             }
         }
         Some(StyledLayer { passes, body, content, key, ckey, plain: false })
+    }
+
+    /// [`Self::styled`] in the blending space ([`Self::styled_to_blend`]). With linear blending,
+    /// the blending-space copies are looked up first: on a hit the working-space buffers they
+    /// were converted from aren't touched, so they go cold in the layer cache (packed or evicted
+    /// under pressure) instead of being kept hot next to their converted copies.
+    pub(crate) fn styled_blend(&self, ctx: &EvalCtx, layer: &Layer, mut timing: Option<&mut LayerTiming>) -> Option<StyledLayer> {
+        if let Some(st) = self.styled_blend_cached(ctx, layer) {
+            if let Some(t) = timing.as_deref_mut() {
+                t.cached = true;
+            }
+            return Some(st);
+        }
+        self.styled(ctx, layer, timing).map(|st| self.styled_to_blend(st))
+    }
+
+    fn styled_blend_cached(&self, ctx: &EvalCtx, layer: &Layer) -> Option<StyledLayer> {
+        let c = self.cache?;
+        self.pipe.to_blend()?;
+        let ckey = self.content_cache_key(ctx, layer)?;
+        let blend = |k: u64| c.peek(cache::derive(k, 0x1ea7));
+        if !styles::active(ctx, layer) {
+            let body = blend(ckey)?;
+            return Some(StyledLayer { passes: vec![], content: body.clone(), body, key: Some(ckey), ckey: Some(ckey), plain: true });
+        }
+        let key = cache::styles_key(ctx, layer, ckey);
+        let body = blend(key)?;
+        let content = blend(ckey)?;
+        let passes = styles::pass_modes(ctx, layer).into_iter().enumerate().map(|(i, m)| blend(cache::derive(key, i as u64 + 1)).map(|b| (b, m))).collect::<Option<Vec<_>>>()?;
+        Some(StyledLayer { passes, body, content, key: Some(key), ckey: Some(ckey), plain: false })
     }
 
     /// The styled layer's buffers in the blending space.
