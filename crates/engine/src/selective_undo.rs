@@ -83,7 +83,11 @@ pub fn undo_own(s: &mut Session, me: Option<&str>) -> Result<Option<String>> {
         let (last, last_by) = later.last().cloned().unwrap_or_default();
         let mine = me.map_or_else(|| "you".to_string(), |m| format!("`{m}`"));
         let others: BTreeSet<String> = later.iter().filter(|(_, a)| a.as_deref() != me).map(|(_, a)| who(a.as_deref())).collect();
-        let way = if me.is_some() { "undo it there, or undo without `client`" } else { "use the History panel, or edit.undo {any: true} to undo the last change whoever made it" };
+        let way = if me.is_some() {
+            "undo it there, or undo without `client`"
+        } else {
+            "use the History panel, or edit.undo {any: true} to undo the last change whoever made it"
+        };
         return Err(EngineError::Other(format!(
             "the last change (“{last}”) was made by {}, not {mine}, and {} changed {} since your “{label}”; {way}",
             who(last_by.as_deref()),

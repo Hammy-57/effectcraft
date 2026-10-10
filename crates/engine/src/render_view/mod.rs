@@ -373,15 +373,7 @@ fn in_background(s: &mut Session, cmd: &str, label: &str, p: &Value, render: fn(
     let (project, services, footage, expr) = (s.project.clone(), s.services.clone(), s.footage.clone(), s.expr.clone());
     let (accel, layer_cache, prefs, state) = (s.accel.clone(), s.layer_cache.clone(), s.prefs.clone(), s.state.clone());
     s.spawn_task("render", label.to_string(), false, move |_ctl| {
-        let mut w = Session::default();
-        w.project = project;
-        w.services = services;
-        w.footage = footage;
-        w.expr = expr;
-        w.accel = accel;
-        w.layer_cache = layer_cache;
-        w.prefs = prefs;
-        w.state = state;
+        let w = Session { project, services, footage, expr, accel, layer_cache, prefs, state, ..Session::default() };
         let mut v = render(&w, &p).map_err(|e| e.to_string())?;
         v["quiet"] = json!(true);
         let apply: crate::jobs::Apply = Box::new(move |_| Ok(v));
