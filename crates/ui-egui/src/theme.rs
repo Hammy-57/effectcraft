@@ -288,7 +288,16 @@ static JETBRAINS_MONO: &[u8] = include_bytes!("../../../assets/fonts/JetBrainsMo
 /// script is registered first, so a Chinese interface is drawn by a Chinese face and a Japanese one
 /// by a Japanese face. `install` is called again when the language changes (see the `EffectcraftApp`
 /// frame loop), so the fonts do not need a restart.
+///
+/// Finding the fallbacks scans the system's fonts, so the first time for a language it runs on a
+/// worker thread: the bundled fonts draw the interface until it is done and installs them.
 pub fn install(ctx: &egui::Context, t: &Tokens, language: &str) {
+    install_fonts(ctx, language);
+    apply_visuals(ctx, t);
+}
+
+/// The bundled fonts in every family.
+fn bundled_fonts() -> FontDefinitions {
     let mut fonts = FontDefinitions::default();
     fonts.font_data.insert("inter".into(), Arc::new(FontData::from_static(INTER_REGULAR)));
     fonts.font_data.insert("inter-medium".into(), Arc::new(FontData::from_static(INTER_MEDIUM)));
@@ -298,9 +307,89 @@ pub fn install(ctx: &egui::Context, t: &Tokens, language: &str) {
     fonts.families.entry(FontFamily::Monospace).or_default().insert(0, "jbmono".into());
     fonts.families.insert(FontFamily::Name("semibold".into()), vec!["inter-semibold".into(), "inter".into()]);
     fonts.families.insert(FontFamily::Name("medium".into()), vec!["inter-medium".into(), "inter".into()]);
-    install_script_fallbacks(&mut fonts, language);
+    fonts
+}
+
+/// A system face registered as a fallback: its name, file and index in the file.
+#[derive(Clone)]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+struct ScriptFallback {
+    name: &'static str,
+    bytes: &'static [u8],
+    index: u32,
+}
+
+/// The fallbacks found per interface language, and a count of [`install_fonts`] calls. Held while
+/// fonts are set, so an older worker can't overwrite a newer language's fonts.
+#[derive(Default)]
+struct FallbackState {
+    found: std::collections::HashMap<String, Vec<ScriptFallback>>,
+    generation: u64,
+}
+
+/// Where a context keeps the generation of its newest [`install_fonts`] call: only that call's
+/// worker installs its fallbacks.
+fn generation_id() -> egui::Id {
+    egui::Id::new("theme-font-generation")
+}
+
+fn fallback_state() -> std::sync::MutexGuard<'static, FallbackState> {
+    static STATE: std::sync::OnceLock<std::sync::Mutex<FallbackState>> = std::sync::OnceLock::new();
+    STATE.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Set the bundled fonts plus `language`'s script fallbacks: at once when they are known,
+/// otherwise the bundled fonts now and the fallbacks once a worker has found them.
+fn install_fonts(ctx: &egui::Context, language: &str) {
+    #[cfg(not(target_arch = "wasm32"))]
+    // Han text follows the interface language, not the operating system's locale.
+    effectcraft_text::fonts::set_cjk_locale(cjk_locale(language));
+    let mut state = fallback_state();
+    state.generation = state.generation.wrapping_add(1);
+    let generation = state.generation;
+    ctx.data_mut(|d| d.insert_temp(generation_id(), generation));
+    let mut fonts = bundled_fonts();
+    if let Some(found) = state.found.get(language) {
+        add_script_fallbacks(&mut fonts, found);
+        ctx.set_fonts(fonts);
+        return;
+    }
     ctx.set_fonts(fonts);
-    apply_visuals(ctx, t);
+    drop(state);
+    let (ctx, language) = (ctx.clone(), language.to_string());
+    let finish = move || {
+        let found = find_script_fallbacks(&language);
+        let mut state = fallback_state();
+        if ctx.data(|d| d.get_temp::<u64>(generation_id())) == Some(generation) {
+            let mut fonts = bundled_fonts();
+            add_script_fallbacks(&mut fonts, &found);
+            ctx.set_fonts(fonts);
+            ctx.request_repaint();
+        }
+        state.found.insert(language, found);
+    };
+    #[cfg(target_arch = "wasm32")]
+    finish();
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // A failed spawn leaves the bundled fonts only (the next language change tries again).
+        let _ = std::thread::Builder::new().name("ui-font-fallbacks".into()).spawn(finish);
+    }
+}
+
+/// Whether `language`'s script fallbacks have been found and installed (or there are none).
+#[cfg(test)]
+fn fallbacks_ready(language: &str) -> bool {
+    fallback_state().found.contains_key(language)
+}
+
+/// Wait (up to a minute) for [`install`]'s worker to install `language`'s script fallbacks.
+#[cfg(test)]
+fn wait_for_fallbacks(language: &str) {
+    let start = std::time::Instant::now();
+    while !fallbacks_ready(language) && start.elapsed() < std::time::Duration::from_secs(60) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
 }
 
 /// Scripts the bundled fonts lack beyond CJK, each probed with one of its letters: names typed in
@@ -323,22 +412,22 @@ const SCRIPT_PROBES: &[(char, &str)] = &[
     ('ก', "thai-system"),
 ];
 
-/// Register the system fallbacks for scripts the bundled fonts lack in every font family, and
-/// return their names in registration order (empty when nothing installed covers a probe, so a
-/// machine without those fonts simply keeps the bundled ones). A face that covers several probes
-/// (Segoe UI draws Arabic and Hebrew, Nirmala UI every Indic script) is registered once.
+/// The system fallbacks for scripts the bundled fonts lack, in registration order (empty when
+/// nothing installed covers a probe, so a machine without those fonts simply keeps the bundled
+/// ones). A face that covers several probes (Segoe UI draws Arabic and Hebrew, Nirmala UI every
+/// Indic script) is listed once. Scans the system's fonts the first time: not on the UI thread.
 ///
 /// CJK comes first. The text engine has its own script-aware fallback (#84), but which face it
 /// picks for Han ideographs depends on the locale environment: a Chinese interface on a
 /// Japanese-locale machine would be drawn with the Japanese face. The interface language is the
 /// better signal, so the probe for its script comes first — kana for Japanese, a Han character for
 /// the Chinese catalogs. Both scripts are registered, so file, layer and template names in the
-/// other one still render; then [`SCRIPT_PROBES`]. The web build has no system fonts and installs
+/// other one still render; then [`SCRIPT_PROBES`]. The web build has no system fonts and finds
 /// nothing.
-fn install_script_fallbacks(family_fonts: &mut FontDefinitions, language: &str) -> Vec<String> {
+fn find_script_fallbacks(language: &str) -> Vec<ScriptFallback> {
     #[cfg(target_arch = "wasm32")]
     {
-        let _ = (family_fonts, language);
+        let _ = language;
         Vec::new()
     }
     #[cfg(not(target_arch = "wasm32"))]
@@ -348,11 +437,9 @@ fn install_script_fallbacks(family_fonts: &mut FontDefinitions, language: &str) 
         // language's face draws them.
         const KANA: (char, &str) = ('あ', "japanese-system");
         const HAN: (char, &str) = ('文', "chinese-system");
-        // Han text follows the interface language, not the operating system's locale.
-        fonts::set_cjk_locale(cjk_locale(language));
         let base = fonts::resolve("Inter", "Regular").face;
         let cjk = if is_chinese(language) { [HAN, KANA] } else { [KANA, HAN] };
-        let mut names = Vec::new();
+        let mut found = Vec::new();
         let mut seen = Vec::new();
         for &(probe, name) in cjk.iter().chain(SCRIPT_PROBES) {
             let id = fonts::fallback_for(probe, base);
@@ -368,17 +455,34 @@ fn install_script_fallbacks(family_fonts: &mut FontDefinitions, language: &str) 
             }
             let Some(bytes) = face.static_bytes() else { continue };
             seen.push(id);
-            // Share the text engine's bytes rather than reading or copying a font file again.
-            let mut data = FontData::from_static(bytes);
-            data.index = face.info.index;
-            family_fonts.font_data.insert(name.to_string(), Arc::new(data));
-            for family in family_fonts.families.values_mut() {
-                family.push(name.to_string());
-            }
-            names.push(name.to_string());
+            found.push(ScriptFallback { name, bytes, index: face.info.index });
         }
-        names
+        found
     }
+}
+
+/// Register `found` in every font family, after the fonts already there.
+fn add_script_fallbacks(family_fonts: &mut FontDefinitions, found: &[ScriptFallback]) {
+    for f in found {
+        // Share the text engine's bytes rather than reading or copying a font file again.
+        let mut data = FontData::from_static(f.bytes);
+        data.index = f.index;
+        family_fonts.font_data.insert(f.name.to_string(), Arc::new(data));
+        for family in family_fonts.families.values_mut() {
+            family.push(f.name.to_string());
+        }
+    }
+}
+
+/// Register the system fallbacks for `language` in `family_fonts` right away and return their
+/// names in registration order.
+#[cfg(test)]
+fn install_script_fallbacks(family_fonts: &mut FontDefinitions, language: &str) -> Vec<String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    effectcraft_text::fonts::set_cjk_locale(cjk_locale(language));
+    let found = find_script_fallbacks(language);
+    add_script_fallbacks(family_fonts, &found);
+    found.iter().map(|f| f.name.to_string()).collect()
 }
 
 /// The CJK locale the text engine should prefer for Han text: the interface language when it names
@@ -465,6 +569,7 @@ mod script_font_tests {
     fn assert_drawn(language: &str, text: &str) {
         let ctx = egui::Context::default();
         super::install(&ctx, &super::Tokens::for_kind(super::ThemeKind::Dark), language);
+        super::wait_for_fallbacks(language);
         let mut out = ctx.run_ui(egui::RawInput::default(), |_| {});
         // No renderer here: drop the frame's texture uploads (egui asserts on unhandled ones in debug).
         out.textures_delta.clear();
@@ -527,6 +632,7 @@ mod script_font_tests {
         }
         let ctx = egui::Context::default();
         super::install(&ctx, &super::Tokens::for_kind(super::ThemeKind::Dark), "en");
+        super::wait_for_fallbacks("en");
         let mut out = ctx.run_ui(egui::RawInput::default(), |_| {});
         out.textures_delta.clear();
         ctx.fonts_mut(|fonts| {
