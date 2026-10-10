@@ -457,11 +457,26 @@ pub fn fit_texture(img: egui::ColorImage, max_side: usize) -> egui::ColorImage {
 
 /// [`fit_texture`] averaging down by at least `min_k` (see [`fit_factor`]).
 pub fn fit_texture_by(img: egui::ColorImage, max_side: usize, min_k: usize) -> egui::ColorImage {
-    let [w, h] = img.size;
     let k = fit_factor(img.size, max_side, min_k);
     if k == 1 {
         return img;
     }
+    average_down(&img, k)
+}
+
+/// [`fit_texture_by`] for a shared frame: one that fits is handed to egui as it is (no copy of
+/// its pixels; egui uploads straight from the `Arc`).
+pub fn fit_texture_shared(img: &Arc<egui::ColorImage>, max_side: usize, min_k: usize) -> Arc<egui::ColorImage> {
+    let k = fit_factor(img.size, max_side, min_k);
+    if k == 1 {
+        return Arc::clone(img);
+    }
+    Arc::new(average_down(img, k))
+}
+
+/// `img` averaged down by `k` (rounded up at the edges).
+fn average_down(img: &egui::ColorImage, k: usize) -> egui::ColorImage {
+    let [w, h] = img.size;
     let (fw, fh) = (w.div_ceil(k), h.div_ceil(k));
     let px: Vec<egui::Color32> = (0..fw * fh)
         .into_par_iter()
@@ -1109,6 +1124,12 @@ mod tests {
         assert_eq!(fit_texture(img.clone(), 5).pixels, img.pixels);
         let mixed = fit_texture(egui::ColorImage::new([2, 1], vec![w, b]), 1);
         assert_eq!(mixed.pixels, vec![egui::Color32::from_rgba_premultiplied(128, 128, 128, 255)]);
+        // A shared frame that fits goes to egui as it is (no pixel copy); one that doesn't is
+        // averaged down exactly like an owned one.
+        let shared = Arc::new(img.clone());
+        assert!(Arc::ptr_eq(&fit_texture_shared(&shared, 5, 1), &shared));
+        assert_eq!(fit_texture_shared(&shared, 2, 1).pixels, out.pixels);
+        assert_eq!(fit_texture_shared(&shared, 5, 2).pixels, fit_texture_by(img, 5, 2).pixels);
     }
 
     #[test]
