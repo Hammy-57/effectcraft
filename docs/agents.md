@@ -73,12 +73,18 @@ and transport errors also flush outstanding changes. Queries do not rotate the s
 A failed checkpoint adds a warning to the tool reply; the edit remains in memory and the next
 call retries. Use `save_project {path}` to a writable location before disconnecting if warned.
 
+Recovery stays small on disk: a checkpoint of 8 MB or more is written at most every 30 seconds
+(the change waits, `autosave.pending` says so, and the session's end always writes it), each
+session keeps the Auto-Save setting's maximum number of versions, saving the project normally (or
+undoing back to the saved state) removes the session's recovery files, and a new session removes
+the folders of finished, saved sessions and of any session untouched for 30 days.
+
 Each server has its own folder under `<config directory>/EffectCraft Auto-Save/MCP/` (or
 `<custom Auto-Save folder>/MCP/`). The maximum-version setting applies within that folder.
 `--autosave` enables these checkpoints regardless of the desktop's Auto-Save toggle and interval;
 it reads settings without writing desktop preferences, shortcuts or crash-recovery state.
-`EFFECTCRAFT_CONFIG_DIR` overrides the platform config directory. Session folders are retained
-for recovery; remove old folders once their work is saved elsewhere.
+`EFFECTCRAFT_CONFIG_DIR` overrides the platform config directory. Unsaved sessions' folders are
+kept for recovery (up to 30 days).
 
 `initialize` instructions and `_meta.effectcraftAutoSave` list the current folder and up to five
 previous dirty sessions; `doc_inspect`'s `project.autosave` also reports the latest checkpoint and errors.

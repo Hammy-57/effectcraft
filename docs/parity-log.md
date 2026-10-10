@@ -908,3 +908,6 @@ before.
 - Agents sharing the desktop app over MCP get their own name by default: a bridged MCP server
   without `--client` runs as `<MCP client name>-<pid>`, so it never moves the user's selection,
   comp or time and can claim comps; `"client": ""` runs one call as the user.
+- MCP `--autosave` recovery stays bounded on disk: checkpoints of 8 MB or more are throttled to one
+  every 30 s (flushed when the session ends), a normal save removes the session's recovery files,
+  and new sessions prune finished saved sessions and folders untouched for 30 days.
