@@ -15,14 +15,18 @@
 //! - `ui.viewer.locate {x, y}`: screen point of a comp pixel; `ui.viewer.hit {x, y}`: comp pixel at a screen point
 //! - `ui.timeline.locate {layer, time?}`: screen point of a layer bar (at a comp time)
 //! - `ui.playback {action: play|stop|toggle}`
-//! - `ui.screenshot {path?, panel?, id?}`: PNG of the window (or one panel / element)
+//! - `ui.screenshot {path?, panel?, id?, max_side?}`: PNG of the window (or one panel / element),
+//!   longest side at most `max_side` pixels (default 1600, 0 = full size)
+//! - `app.revision`: the session's `{revision}` (a cheap change check)
 //! - `render.frame {comp?, item?, layer?, time?, max_side?, transparent?, region?, overlays?, path?, base64?}`: PNG of a frame rendered by the session
 //! - `ui.figmaPair {client}`: the one-time Figma pairing prompt; replies `{allowed}` once answered
 //! - `ui.resize {width, height}` / `ui.focus` / `app.quit {force?}` (a modified project asks to save first unless `force`)
 //!
 //! The full reference with examples is `docs/control-protocol.md`.
 
-use std::sync::mpsc::Sender;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use serde_json::{Value, json};
 
@@ -33,16 +37,88 @@ use crate::state::{Resolution, Tool};
 /// Prefix marking errors that may resolve after another frame.
 pub const RETRY: &str = "\u{1}";
 
+/// `ui.screenshot`'s default longest side in pixels (a full 4K window is a 30 MB PNG otherwise).
+pub const SCREENSHOT_MAX_SIDE: u32 = 1600;
+
 pub struct ControlRequest {
     pub method: String,
     pub params: Value,
     pub reply: Sender<Value>,
+    /// Shared with the transport: a request it gave up on (timed out) before the UI thread
+    /// started it is skipped, so a client's retry can't make it run twice.
+    pub state: RequestState,
 }
 
 impl ControlRequest {
-    pub fn new(method: impl Into<String>, params: Value) -> (Self, std::sync::mpsc::Receiver<Value>) {
+    pub fn new(method: impl Into<String>, params: Value) -> (Self, Receiver<Value>) {
         let (tx, rx) = std::sync::mpsc::channel();
-        (Self { method: method.into(), params, reply: tx }, rx)
+        (Self { method: method.into(), params, reply: tx, state: RequestState::default() }, rx)
+    }
+}
+
+/// Whether a queued [`ControlRequest`] was started or cancelled, shared by the transport thread
+/// and the UI thread (whichever acts first wins).
+#[derive(Clone, Debug, Default)]
+pub struct RequestState(Arc<AtomicU8>);
+
+const QUEUED: u8 = 0;
+const STARTED: u8 = 1;
+const CANCELLED: u8 = 2;
+
+impl RequestState {
+    /// The UI thread calls this before handling the request: `false` when it was cancelled (skip
+    /// it). A deferred request that already started may be handled again.
+    pub fn start(&self) -> bool {
+        match self.0.compare_exchange(QUEUED, STARTED, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => true,
+            Err(now) => now == STARTED,
+        }
+    }
+
+    /// The transport calls this when it gives up waiting: `true` when the request had not
+    /// started, so it never will; `false` when it is already running (it may still complete).
+    pub fn cancel(&self) -> bool {
+        self.0.compare_exchange(QUEUED, CANCELLED, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::SeqCst) == CANCELLED
+    }
+}
+
+/// Change events for control-channel connections that called `events.subscribe`: the transport
+/// subscribes, the app publishes `project.changed` and `selection.changed` (coalesced, at most ten
+/// bursts a second). Subscribers that went away are dropped on the next publish.
+#[derive(Clone, Default)]
+pub struct ControlEvents(Arc<Mutex<EventsInner>>);
+
+#[derive(Default)]
+struct EventsInner {
+    subscribers: Vec<Sender<Value>>,
+    /// The session revision at the last frame.
+    revision: u64,
+}
+
+impl ControlEvents {
+    /// A new subscriber's event stream, and the current revision.
+    pub fn subscribe(&self) -> (Receiver<Value>, u64) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut g = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        g.subscribers.push(tx);
+        (rx, g.revision)
+    }
+
+    pub fn subscribers(&self) -> usize {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).subscribers.len()
+    }
+
+    pub(crate) fn set_revision(&self, revision: u64) {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).revision = revision;
+    }
+
+    /// Send `event` to every subscriber, dropping those that went away.
+    pub fn publish(&self, event: &Value) {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).subscribers.retain(|s| s.send(event.clone()).is_ok());
     }
 }
 
@@ -55,6 +131,8 @@ pub enum Outcome {
     Screenshot {
         path: Option<String>,
         crop: Option<[f32; 4]>,
+        /// Longest side in pixels (0 = full size).
+        max_side: u32,
     },
     /// Reply once background jobs end (a `wait: true` command whose job runs in a worker).
     AwaitJobs(JobWaiter),
@@ -425,8 +503,10 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
             let crop = crop.or_else(|| s("id").and_then(|id| app.auto.find(id).map(|e| e.rect)));
             // Bring the window on screen so a frame is presented, without taking keyboard focus.
             app.raise_for_control(ctx);
-            Outcome::Screenshot { path: s("path").map(str::to_string), crop }
+            let max_side = p.get("max_side").or(p.get("maxSide")).and_then(Value::as_u64).map_or(SCREENSHOT_MAX_SIDE, |m| u32::try_from(m).unwrap_or(u32::MAX));
+            Outcome::Screenshot { path: s("path").map(str::to_string), crop, max_side }
         }
+        "app.revision" => ok(json!({"revision": app.session.revision})),
         "render.frame" => render_frame(app, p),
         "ui.resize" => {
             let w = p.get("width").and_then(Value::as_f64).unwrap_or(1600.0) as f32;
@@ -509,7 +589,7 @@ pub fn inspect(app: &EffectcraftApp, ctx: &egui::Context) -> Value {
 }
 
 /// Save a screenshot (optionally cropped to a rect in points) as PNG; returns the reply JSON.
-pub fn save_screenshot(ctx: &egui::Context, image: &egui::ColorImage, path: Option<&str>, crop: Option<[f32; 4]>) -> Value {
+pub fn save_screenshot(ctx: &egui::Context, image: &egui::ColorImage, path: Option<&str>, crop: Option<[f32; 4]>, max_side: u32) -> Value {
     let ppp = ctx.pixels_per_point();
     let [w, h] = image.size;
     let (x0, y0, cw, ch) = match crop {
@@ -527,21 +607,48 @@ pub fn save_screenshot(ctx: &egui::Context, image: &egui::ColorImage, path: Opti
             rgba.extend_from_slice(&[c.r(), c.g(), c.b(), 255]);
         }
     }
+    let (rgba, cw, ch) = shrink(rgba, cw as u32, ch as u32, max_side);
     if path.is_none() && cfg!(target_arch = "wasm32") {
         // no file system on the web: inline PNG
-        return match encode_png(&rgba, cw as u32, ch as u32) {
+        return match encode_png_fast(&rgba, cw, ch) {
             Ok(png) => json!({"ok": true, "result": {"png": base64(&png), "width": cw, "height": ch}}),
             Err(e) => json!({"ok": false, "error": e}),
         };
     }
     let path = path.map(str::to_string).unwrap_or_else(|| std::env::temp_dir().join("effectcraft-screenshot.png").to_string_lossy().to_string());
-    match encode_png(&rgba, cw as u32, ch as u32) {
+    match encode_png_fast(&rgba, cw, ch) {
         Ok(png) => match std::fs::write(&path, png) {
             Ok(()) => json!({"ok": true, "result": {"path": path, "width": cw, "height": ch}}),
             Err(e) => json!({"ok": false, "error": e.to_string()}),
         },
         Err(e) => json!({"ok": false, "error": e}),
     }
+}
+
+/// Downscale RGBA8 pixels so the longest side is at most `max_side` (0 = keep), as the MCP
+/// bridge's `screenshot` tool does. Returns the pixels and their size.
+pub fn shrink(rgba: Vec<u8>, w: u32, h: u32, max_side: u32) -> (Vec<u8>, u32, u32) {
+    if max_side == 0 || w.max(h) <= max_side {
+        return (rgba, w, h);
+    }
+    let Some(img) = image::RgbaImage::from_raw(w, h, rgba.clone()) else { return (rgba, w, h) };
+    let s = f64::from(max_side) / f64::from(w.max(h));
+    let (nw, nh) = (((f64::from(w) * s).round() as u32).max(1), ((f64::from(h) * s).round() as u32).max(1));
+    let img = image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Triangle);
+    (img.into_raw(), nw, nh)
+}
+
+/// Compressed PNG (fast deflate, opaque RGB): screenshots are a few hundred KB instead of the
+/// stored encoder's raw size.
+pub fn encode_png_fast(rgba: &[u8], w: u32, h: u32) -> Result<Vec<u8>, String> {
+    use image::ImageEncoder;
+    use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+    let rgb: Vec<u8> = rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
+    let mut out = Vec::new();
+    PngEncoder::new_with_quality(&mut out, CompressionType::Fast, FilterType::Adaptive)
+        .write_image(&rgb, w, h, image::ExtendedColorType::Rgb8)
+        .map_err(|e| format!("png: {e}"))?;
+    Ok(out)
 }
 
 /// Minimal PNG encoder (stored deflate blocks, no compression dependency).

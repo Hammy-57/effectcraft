@@ -25,7 +25,7 @@
 //!     on a large generated project (open, save, auto-save, undo/redo, timeline, Project panel)
 //! effectcraft-cli script FILE.jsx [F.ecproj] | --eval CODE    run an After Effects-style script
 //! effectcraft-cli replay SCRIPT.jsonl [--keep-going]        replay a repro script (docs/agents.md)
-//! effectcraft-cli mcp [--autosave | --bridge PORT | --ui] [--all-tools]  MCP server on stdio
+//! effectcraft-cli mcp [--autosave | --bridge [PORT] | --ui] [--all-tools]  MCP server on stdio
 //! effectcraft-cli figma-bridge [--port 7789] [--control 9877] local endpoint for the Figma plug-in
 //!
 //! Project:  --project F.ecproj (or a positional *.ecproj) | --demo | --empty   (default: demo; mcp: empty)
@@ -127,7 +127,8 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
   replay SCRIPT.jsonl [--keep-going]       replay a repro script headless (journal.export, crash repros):
                                            per-step ok/error and the first failure; exits 1 when a step
                                            fails, an expectation is not met or a command panics
-  mcp [--autosave | --bridge PORT | --ui]  MCP server (JSON-RPC over stdio); --autosave preserves unsaved headless work;
+  mcp [--autosave | --bridge [PORT] | --ui] MCP server (JSON-RPC over stdio); --autosave preserves unsaved headless work;
+                                           --bridge without a port uses EFFECTCRAFT_CONTROL_PORT, else 9877;
                                            --ui [--ui-size 1680x1020] [--ui-scale 2] runs the app offscreen
                                            (no window) so screenshot and the ui_* tools work;
                                            --all-tools also lists the older tool aliases
@@ -223,7 +224,7 @@ struct Args {
 impl Args {
     fn parse(raw: Vec<String>) -> Result<Args, String> {
         let (mut pos, mut opts, mut unknown) = (vec![], vec![], vec![]);
-        let mut it = raw.into_iter();
+        let mut it = raw.into_iter().peekable();
         while let Some(a) = it.next() {
             if a.starts_with("--") && a.len() > 2 {
                 let (k, inline) = match a.split_once('=') {
@@ -231,7 +232,10 @@ impl Args {
                     None => (a, None),
                 };
                 if VALUED.contains(&k.as_str()) {
-                    let v = inline.or_else(|| it.next()).ok_or_else(|| format!("{k} needs a value"))?;
+                    // `--bridge` / `--control` without a port: the app's default control port.
+                    let port_default = matches!(k.as_str(), "--bridge" | "--control") && inline.is_none() && it.peek().is_none_or(|n| n.starts_with("--"));
+                    let v = if port_default { Some(default_control_port()) } else { inline.or_else(|| it.next()) };
+                    let v = v.ok_or_else(|| format!("{k} needs a value"))?;
                     opts.push((k, Some(v)));
                 } else if !FLAGS.contains(&k.as_str()) {
                     unknown.push(format!("`{k}`"));
@@ -266,6 +270,15 @@ impl Args {
     fn num(&self, k: &str) -> Result<Option<f64>, String> {
         self.opt(k).map(|v| v.parse::<f64>().map_err(|_| format!("{k}: not a number: {v}"))).transpose()
     }
+}
+
+/// The desktop app's control port: `EFFECTCRAFT_CONTROL_PORT` when set, else 9877.
+fn default_control_port() -> String {
+    control_port_or_default(std::env::var("EFFECTCRAFT_CONTROL_PORT").ok())
+}
+
+fn control_port_or_default(env: Option<String>) -> String {
+    env.map(|p| p.trim().to_string()).filter(|p| p.parse::<u16>().is_ok()).unwrap_or_else(|| "9877".to_string())
 }
 
 /// A comp/layer reference: number → id, `-` → none (active), else a name / `#n`.
@@ -574,7 +587,7 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
                 Some(p) => p.parse::<u16>().map_err(|_| Failure::Usage(format!("--port: not a port: {p}")))?,
                 None => 7789,
             };
-            let control = args.opt("--control").or(args.opt("--bridge")).unwrap_or("9877").to_string();
+            let control = args.opt("--control").or(args.opt("--bridge")).map_or_else(default_control_port, str::to_string);
             figma_bridge::serve(figma_bridge::Config { port, control, code: args.opt("--code").map(str::to_string) })?;
         }
         "bench" => bench_cmd(args)?,
@@ -1441,6 +1454,20 @@ mod tests {
         let a = parse(&["render", "t.ecproj", "--comp=Main", "--work-area", "--out", "x.mp4", "--json"]).unwrap();
         assert_eq!((a.project.as_deref(), a.opt("--comp"), a.opt("--out")), (Some("t.ecproj"), Some("Main"), Some("x.mp4")));
         assert!(a.flag("--work-area") && a.flag("--json"));
+    }
+
+    /// `--bridge` without a port uses the app's control port (`EFFECTCRAFT_CONTROL_PORT`, else 9877).
+    #[test]
+    fn bridge_without_a_port_uses_the_default_control_port() {
+        let a = parse(&["mcp", "--bridge", "9000"]).unwrap();
+        assert_eq!(a.opt("--bridge"), Some("9000"));
+        let a = parse(&["mcp", "--bridge"]).unwrap();
+        assert_eq!(a.opt("--bridge"), Some(default_control_port().as_str()));
+        let a = parse(&["info", "--bridge", "--json"]).unwrap();
+        assert!(a.opt("--bridge").is_some() && a.flag("--json"));
+        assert_eq!(control_port_or_default(Some("9901".into())), "9901");
+        assert_eq!(control_port_or_default(Some("nope".into())), "9877");
+        assert_eq!(control_port_or_default(None), "9877");
     }
 
     /// Rounded seconds name the frame they print (SceneYard Typo: 1.483333 s = frame 89 at 60 fps,

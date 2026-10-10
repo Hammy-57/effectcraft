@@ -2,7 +2,8 @@
 
 Run `effectcraft-cli mcp` for a headless session, `effectcraft-cli mcp --ui` for the full app
 offscreen (no window), or `effectcraft-cli mcp --bridge 9877` to use the desktop app's control
-channel. Existing ports are unchanged.
+channel (`--bridge` without a port uses `EFFECTCRAFT_CONTROL_PORT`, else 9877). Existing ports are
+unchanged.
 
 `--ui` and `--bridge` both route every tool through control-channel requests
 (`docs/control-protocol.md`) behind the automation crate's `ControlTransport` trait: a TCP
@@ -146,6 +147,13 @@ with `logger: "effectcraft"` and `data: {message, …}`:
 
 In bridge mode only the expression check applies; the app shows its own toasts and footage
 checks.
+
+## Retries
+
+A `tools/call` with `params._meta.requestId` (or a `request_id` argument, which is removed before
+argument checking) is idempotent: the same id again returns the first result without running the
+tool (last 128 ids). Bridge calls also send a `requestId` on the control channel, so the bridge's
+reconnect-and-resend never runs a command twice.
 
 ## Prompts
 
