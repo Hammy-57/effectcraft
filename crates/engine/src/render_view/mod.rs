@@ -21,7 +21,7 @@ use effectcraft_render::{Backend, RenderOpts, Renderer};
 use effectcraft_time::{FrameRate, Tick};
 use serde_json::{Value, json};
 
-pub use overlay::{LayerGeom, Overlays, layer_geometry};
+pub use overlay::{LayerGeom, Overlays, overlay_layers};
 pub use sheet::MAX_CELLS;
 
 use crate::commands::{CommandSpec, b_p, bad, comp_id, resolve_layer, str_p};
@@ -275,7 +275,7 @@ impl Session {
         }
         if r.overlays.any() {
             let geo = match r.target {
-                Target::Comp(c) => layer_geometry(self, c, r.time, r.layer, &r.overlays),
+                Target::Comp(c) => overlay_layers(self, c, r.time, r.layer, &r.overlays),
                 Target::Item(_) => vec![],
             };
             let place = overlay::Placement { origin: [region[0], region[1]], scale, frame: [fw as f64, fh as f64] };

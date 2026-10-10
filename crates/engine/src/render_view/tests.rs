@@ -125,7 +125,7 @@ fn overlays_draw_and_report_layer_bounds() {
     assert_eq!(v["overlays"], json!(["bounds", "anchor"]));
     let layers = v["layers"].as_array().unwrap();
     let red = layers.iter().find(|l| l["name"] == "Red").unwrap();
-    assert_eq!(red["bounds"], json!([110.0, 40.0, 210.0, 140.0]));
+    assert_eq!(red["bounds"], json!([110.0, 40.0, 100.0, 100.0]));
     assert_eq!(red["anchor"], json!([160.0, 90.0]));
     assert_eq!(red["index"], 2);
     // Bounds draw on the box edge; the inside of the box is untouched.

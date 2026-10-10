@@ -3,9 +3,9 @@
 //! and the grid, in the layers' label colours as the Composition viewer draws them. Pure raster
 //! code on straight 8-bit RGBA (no UI toolkit), anti-aliased through the path rasteriser.
 //!
-//! [`layer_geometry`] measures layers in comp space (content bounds through the layer → comp
-//! matrix, like Layer ▸ sourceRectAtTime mapped by toComp). It is internal to these renders; a
-//! public `layer.bounds` query can share it.
+//! [`overlay_layers`] measures the layers with the engine's canonical geometry
+//! ([`crate::layout::layer_geometry`] and [`crate::layout::anchor_in_comp`], as `layer.bounds`
+//! reports them), so the boxes drawn match `get_layout`.
 
 use effectcraft_geom::{Mat3, vec2};
 use effectcraft_path::{Cap, FillRule, Join, StrokeStyle, fill_coverage, stroke_outline};
@@ -89,9 +89,9 @@ pub struct LayerGeom {
     pub name: String,
     /// Label colour (sRGB).
     pub color: [u8; 3],
-    /// Content box corners (top left, top right, bottom right, bottom left); `None` for layers
-    /// without bounds (cameras, lights, empty text / shapes).
-    pub quad: Option<[[f64; 2]; 4]>,
+    /// The canonical geometry (`layer.bounds`); `None` for layers without content (cameras,
+    /// lights, empty text / shapes) or partly behind a 3D camera.
+    pub geometry: Option<crate::layout::LayerGeometry>,
     pub anchor: Option<[f64; 2]>,
     /// The anchor point's comp-space path over the layer's time span (animated layers only).
     pub path: Vec<[f64; 2]>,
@@ -104,20 +104,15 @@ fn r2(v: f64) -> f64 {
 }
 
 impl LayerGeom {
-    /// Axis-aligned comp-space bounds `[x0, y0, x1, y1]` of the content box.
-    pub fn bounds(&self) -> Option<[f64; 4]> {
-        let q = self.quad?;
-        let xs = q.map(|p| p[0]);
-        let ys = q.map(|p| p[1]);
-        let min = |a: [f64; 4]| a.into_iter().fold(f64::INFINITY, f64::min);
-        let max = |a: [f64; 4]| a.into_iter().fold(f64::NEG_INFINITY, f64::max);
-        Some([min(xs), min(ys), max(xs), max(ys)])
+    /// Content box corners in comp pixels (top left, top right, bottom right, bottom left).
+    pub fn quad(&self) -> Option<[[f64; 2]; 4]> {
+        self.geometry.as_ref().map(|g| g.corners)
     }
 
     pub fn to_json(&self) -> Value {
         let mut v = json!({"id": self.id.0, "index": self.index, "name": self.name});
-        if let Some(b) = self.bounds() {
-            v["bounds"] = json!(b.map(r2));
+        if let Some(g) = &self.geometry {
+            v["bounds"] = json!(g.bounds.map(r2));
         }
         if let Some(a) = self.anchor {
             v["anchor"] = json!(a.map(r2));
@@ -129,21 +124,8 @@ impl LayerGeom {
     }
 }
 
-fn finite(p: [f64; 2]) -> Option<[f64; 2]> {
-    (p[0].is_finite() && p[1].is_finite()).then_some(p)
-}
-
-fn apply(m: &Mat3, x: f64, y: f64) -> Option<[f64; 2]> {
-    let q = m.apply(vec2(x, y));
-    finite([q.x, q.y])
-}
-
-/// The anchor point in comp space at the context time.
 fn anchor_at(ctx: &EvalCtx, l: &Layer) -> Option<[f64; 2]> {
-    let tr = l.transform()?;
-    let a = ctx.v3(l, tr, "anchor", [0.0; 3]);
-    let (m, _) = ctx.layer_to_comp(l);
-    apply(&m, a[0], a[1])
+    crate::layout::anchor_in_comp(ctx, l)
 }
 
 /// Position-like transform properties that move the anchor (Position, its separated X/Y/Z, Anchor
@@ -155,7 +137,7 @@ fn moves(l: &Layer) -> bool {
 
 /// The layers an overlay shows at `t`: `only`, or every visible layer active at `t` (soloed ones
 /// when any is soloed), cameras and lights excluded, at most [`MAX_LAYERS`].
-pub fn layer_geometry(s: &Session, cid: ItemId, t: Tick, only: Option<LayerId>, o: &Overlays) -> Vec<LayerGeom> {
+pub fn overlay_layers(s: &Session, cid: ItemId, t: Tick, only: Option<LayerId>, o: &Overlays) -> Vec<LayerGeom> {
     let Some(comp) = s.project.comp(cid) else { return vec![] };
     let ctx = EvalCtx { footage: Some(s.footage.as_ref()), expr: s.expr.as_deref(), ..EvalCtx::new(&s.project, cid, comp, t) };
     let any_solo = comp.layers.iter().any(|l| l.switches.solo && l.has_video());
@@ -171,12 +153,10 @@ pub fn layer_geometry(s: &Session, cid: ItemId, t: Tick, only: Option<LayerId>, 
         if out.len() >= MAX_LAYERS {
             break;
         }
-        let (m, _) = ctx.layer_to_comp(l);
-        let quad = effectcraft_render::content_bounds(&ctx, l)
-            .and_then(|b| Some([apply(&m, b[0], b[1])?, apply(&m, b[2], b[1])?, apply(&m, b[2], b[3])?, apply(&m, b[0], b[3])?]));
+        let geometry = crate::layout::layer_geometry(&ctx, l).filter(|g| g.projected);
         let anchor = anchor_at(&ctx, l);
         let (path, keys) = if o.motion_path && moves(l) { motion_path(&ctx, l) } else { (vec![], vec![]) };
-        out.push(LayerGeom { id: l.id, index: i + 1, name: l.name.clone(), color: s.prefs.label_rgb(l.label), quad, anchor, path, keys });
+        out.push(LayerGeom { id: l.id, index: i + 1, name: l.name.clone(), color: s.prefs.label_rgb(l.label), geometry, anchor, path, keys });
     }
     out
 }
@@ -415,7 +395,7 @@ pub fn draw(rgba: &mut [u8], w: u32, h: u32, at: &Placement, prefs: &Prefs, geo:
     }
     if o.bounds {
         for g in geo {
-            let Some(q) = g.quad else { continue };
+            let Some(q) = g.quad() else { continue };
             let p = polyline(q.iter().map(|c| at.out(*c)), true);
             paint(rgba, w, h, std::slice::from_ref(&p), Some(3.0), [0, 0, 0, 110]);
             paint(rgba, w, h, &[p], Some(1.25), [g.color[0], g.color[1], g.color[2], 255]);
@@ -439,7 +419,7 @@ pub fn draw(rgba: &mut [u8], w: u32, h: u32, at: &Placement, prefs: &Prefs, geo:
         // Name tags last, on top, at each box's top-left-most corner.
         let mut placed = vec![];
         for g in geo.iter().take(MAX_TAGS) {
-            let Some(q) = g.quad else { continue };
+            let Some(q) = g.quad() else { continue };
             let Some(corner) = q.iter().map(|c| at.out(*c)).min_by(|a, b| (a.y + a.x * 0.01).total_cmp(&(b.y + b.x * 0.01))) else { continue };
             let name: String = g.name.chars().take(28).collect();
             tag(rgba, w, h, &format!("#{} {name}", g.index), kurbo::Point::new(corner.x, corner.y - 17.0), 11.0, g.color, &mut placed);
