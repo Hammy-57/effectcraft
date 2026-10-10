@@ -24,7 +24,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let mut y = rect.min.y + 10.0;
     let st = app.session.state.content_fill.clone();
     let comp = app.session.active_comp_arc();
-    let layer = comp.as_ref().and_then(|c| app.session.state.selected_layers.first().and_then(|l| c.layer(*l)).cloned());
+    let layer = comp.as_ref().and_then(|c| app.session.state.selected_layers.first().and_then(|l| c.layer(*l)));
     // Fill Target.
     p.text(pos2(x0, y + 9.0), Align2::LEFT_CENTER, tr("Fill Target"), Tokens::semibold(12.0), t.text);
     y += ROW - 6.0;

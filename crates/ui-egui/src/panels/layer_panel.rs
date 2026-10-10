@@ -45,10 +45,10 @@ fn tex_id() -> egui::Id {
 }
 
 /// The layer shown: the opened one, else the first selected layer.
-pub fn current_layer(app: &EffectcraftApp) -> Option<Layer> {
+pub fn current_layer(app: &EffectcraftApp) -> Option<std::sync::Arc<Layer>> {
     let comp = app.session.active_comp()?;
     let id = app.ui.layer_panel.map(LayerId).filter(|id| comp.layer(*id).is_some()).or_else(|| app.session.state.selected_layers.first().copied())?;
-    comp.layer(id).cloned()
+    super::layer_arc(comp, id)
 }
 
 /// Number of effects shown by default: the Roto Brush's input while a Roto Brush tool is active

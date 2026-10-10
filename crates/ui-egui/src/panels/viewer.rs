@@ -423,6 +423,88 @@ fn parent_inverse(ctx: &EvalCtx, layer: &Layer) -> Mat3 {
     }
 }
 
+/// A frame for an extra view: see [`pooled_texture`].
+enum Pooled {
+    /// Its texture, or the last one while the frame renders (`None` before the first).
+    Shown(Option<egui::TextureHandle>),
+    /// Rendering, nothing to show yet.
+    Rendering,
+    /// Frames stay on the GPU here (the browser's viewer): render it on the UI thread.
+    OnUiThread,
+}
+
+fn view_key(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut h);
+    h.finish()
+}
+
+/// Apply the display colour conversion to `img`'s pixels.
+fn display_color(dc: &effectcraft_engine::viewer::DisplayColor, img: &mut egui::ColorImage) {
+    let mut px: Vec<[u8; 4]> = img.pixels.iter().map(|c| c.to_array()).collect();
+    dc.apply(&mut px);
+    img.pixels = px.into_iter().map(|a| Color32::from_rgba_premultiplied(a[0], a[1], a[2], a[3])).collect();
+}
+
+/// The texture of an extra view (split 3D views, the locked viewer): frame `t` of `comp`
+/// rendered with `opts` by the frame workers, off the UI thread (it used to render there on
+/// every frame of playback), then uploaded (through `dc`) into the texture kept under `id`.
+/// Until a new frame is in, the last texture stays up. `view` tells views apart.
+#[allow(clippy::too_many_arguments)]
+fn pooled_texture(
+    app: &EffectcraftApp,
+    ctx: &egui::Context,
+    id: egui::Id,
+    name: &str,
+    comp: effectcraft_engine::project::ItemId,
+    t: Tick,
+    opts: effectcraft_engine::render::RenderOpts,
+    view: u64,
+    dc: Option<effectcraft_engine::viewer::DisplayColor>,
+) -> Pooled {
+    use crate::frames::{FrameImage, FrameKey};
+    let Some(c) = app.session.project.comp(comp) else { return Pooled::Rendering };
+    let revision = app.session.revision;
+    let frame = c.frame_rate.frame_at(t);
+    let key = FrameKey {
+        revision,
+        content: app.frames.content_of(&app.session.project, revision, comp),
+        comp: comp.0,
+        frame,
+        scale: (opts.scale * 1000.0).round() as u32,
+        view,
+        opts: crate::frames::opts_hash(&opts),
+    };
+    let cached: Option<(FrameKey, egui::TextureHandle)> = ctx.data(|d| d.get_temp(id));
+    if let Some((k, tex)) = &cached
+        && *k == key
+    {
+        return Pooled::Shown(Some(tex.clone()));
+    }
+    let src = app.render_source();
+    if src.gpu_display {
+        return Pooled::OnUiThread;
+    }
+    app.frames.request(&src, key, comp, c.frame_rate.tick_of(frame), opts);
+    match app.frames.get(&key) {
+        Some(FrameImage::Cpu(img)) => {
+            let mut ci = (*img).clone();
+            if let Some(dc) = &dc {
+                display_color(dc, &mut ci);
+            }
+            let tex = crate::frames::load_fitted(ctx, name, ci, egui::TextureOptions::LINEAR);
+            ctx.data_mut(|d| d.insert_temp(id, (key, tex.clone())));
+            Pooled::Shown(Some(tex))
+        }
+        Some(FrameImage::Gpu(_)) => Pooled::OnUiThread,
+        None => match cached {
+            Some((_, tex)) => Pooled::Shown(Some(tex)),
+            None => Pooled::Rendering,
+        },
+    }
+}
+
 /// Draw the extra views of a 2- or 4-view layout and return the main view's rectangle.
 fn aux_views(
     app: &mut EffectcraftApp,
@@ -465,27 +547,36 @@ fn aux_views(
         let cr = Rect::from_center_size(r.center(), vec2(cw * fit, ch * fit));
         let scale = (fit * ctx.pixels_per_point()).min(1.0) as f64;
         let cam = views.cam(v, comp.width as f64, comp.height as f64).state();
-        let key = {
-            use std::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            (app.session.revision, cid.0, t.0, i, scale.to_bits(), format!("{cam:?}")).hash(&mut h);
-            h.finish()
-        };
         let id = egui::Id::new(("viewer-aux", i));
-        let cached: Option<(u64, egui::TextureHandle)> = ctx.data(|d| d.get_temp(id));
-        let tex = match cached {
-            Some((k, tex)) if k == key => tex,
-            _ => {
-                let opts = effectcraft_engine::render::RenderOpts { scale, view: comp.has_3d().then_some(cam), draft: true, ..Default::default() };
-                let img = app.session.render(cid, t, opts);
-                let tex = crate::frames::load_fitted(&ctx, format!("viewer-aux-{i}"), crate::frames::to_color_image(&img), egui::TextureOptions::LINEAR);
-                ctx.data_mut(|d| d.insert_temp(id, (key, tex.clone())));
-                tex
+        let opts = effectcraft_engine::render::RenderOpts { scale, view: comp.has_3d().then_some(cam), draft: true, ..Default::default() };
+        let view = view_key(&format!("{cam:?}"));
+        let tex = match pooled_texture(app, &ctx, id, &format!("viewer-aux-{i}"), cid, t, opts, view, None) {
+            Pooled::Shown(tex) => tex,
+            Pooled::Rendering => None,
+            Pooled::OnUiThread => {
+                let key = {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    (app.session.revision, cid.0, t.0, i, scale.to_bits(), format!("{cam:?}")).hash(&mut h);
+                    h.finish()
+                };
+                let cached: Option<(u64, egui::TextureHandle)> = ctx.data(|d| d.get_temp(id));
+                Some(match cached {
+                    Some((k, tex)) if k == key => tex,
+                    _ => {
+                        let img = app.session.render(cid, t, opts);
+                        let tex = crate::frames::load_fitted(&ctx, format!("viewer-aux-{i}"), crate::frames::to_color_image(&img), egui::TextureOptions::LINEAR);
+                        ctx.data_mut(|d| d.insert_temp(id, (key, tex.clone())));
+                        tex
+                    }
+                })
             }
         };
         let b = comp.background;
         p.rect_filled(cr, 0.0, Color32::from_rgb((b[0] * 255.0) as u8, (b[1] * 255.0) as u8, (b[2] * 255.0) as u8));
-        p.image(tex.id(), cr, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+        if let Some(tex) = tex {
+            p.image(tex.id(), cr, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+        }
         p.rect_stroke(cr, 0.0, Stroke::new(1.0, Color32::from_black_alpha(160)), StrokeKind::Outside);
         if share && app.ui.viewer.safe_margins {
             for k in [0.9, 0.8] {
@@ -521,33 +612,41 @@ fn locked_pane(app: &mut EffectcraftApp, ui: &mut egui::Ui, full: Rect, bg: Colo
     let cam = (lv.view != View3D::ActiveCamera && comp.has_3d())
         .then(|| app.session.state.views3d.get(&lv.comp).cloned().unwrap_or_default().cam(lv.view, comp.width as f64, comp.height as f64).state());
     let dc = effectcraft_engine::viewer::DisplayColor::of(&app.session);
-    let key = {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        (app.session.revision, lv.comp.0, t.0, scale.to_bits(), format!("{cam:?}{}", dc.is_some())).hash(&mut h);
-        h.finish()
-    };
     let id = egui::Id::new("viewer-locked");
-    let cached: Option<(u64, egui::TextureHandle)> = ctx.data(|d| d.get_temp(id));
-    let tex = match cached {
-        Some((k, tex)) if k == key => tex,
-        _ => {
-            let opts = effectcraft_engine::render::RenderOpts { scale, view: cam, ..Default::default() };
-            let img = app.session.render(lv.comp, t, opts);
-            let mut ci = crate::frames::to_color_image(&img);
-            if let Some(dc) = dc {
-                let mut px: Vec<[u8; 4]> = ci.pixels.iter().map(|c| c.to_array()).collect();
-                dc.apply(&mut px);
-                ci = egui::ColorImage::new(ci.size, px.into_iter().map(|a| Color32::from_rgba_premultiplied(a[0], a[1], a[2], a[3])).collect());
-            }
-            let tex = crate::frames::load_fitted(&ctx, "viewer-locked", ci, egui::TextureOptions::LINEAR);
-            ctx.data_mut(|d| d.insert_temp(id, (key, tex.clone())));
-            tex
+    let opts = effectcraft_engine::render::RenderOpts { scale, view: cam, ..Default::default() };
+    // The display conversion is applied on upload: part of the texture's key, not the frame's.
+    let view = view_key(&format!("{cam:?}{:?}", dc.is_some()));
+    let tex = match pooled_texture(app, &ctx, id, "viewer-locked", lv.comp, t, opts, view, dc.clone()) {
+        Pooled::Shown(tex) => tex,
+        Pooled::Rendering => None,
+        Pooled::OnUiThread => {
+            let key = {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                (app.session.revision, lv.comp.0, t.0, scale.to_bits(), format!("{cam:?}{}", dc.is_some())).hash(&mut h);
+                h.finish()
+            };
+            let cached: Option<(u64, egui::TextureHandle)> = ctx.data(|d| d.get_temp(id));
+            Some(match cached {
+                Some((k, tex)) if k == key => tex,
+                _ => {
+                    let img = app.session.render(lv.comp, t, opts);
+                    let mut ci = crate::frames::to_color_image(&img);
+                    if let Some(dc) = &dc {
+                        display_color(dc, &mut ci);
+                    }
+                    let tex = crate::frames::load_fitted(&ctx, "viewer-locked", ci, egui::TextureOptions::LINEAR);
+                    ctx.data_mut(|d| d.insert_temp(id, (key, tex.clone())));
+                    tex
+                }
+            })
         }
     };
     let b = comp.background;
     p.rect_filled(cr, 0.0, Color32::from_rgb((b[0] * 255.0) as u8, (b[1] * 255.0) as u8, (b[2] * 255.0) as u8));
-    p.image(tex.id(), cr, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+    if let Some(tex) = tex {
+        p.image(tex.id(), cr, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+    }
     p.rect_stroke(cr, 0.0, Stroke::new(1.0, Color32::from_black_alpha(160)), StrokeKind::Outside);
     let label = crate::i18n::tr_args("Locked: {} — {}", &[&name, &(if comp.has_3d() { lv.view.label() } else { crate::i18n::tr("Active Camera") })]);
     p.text(r.left_top() + vec2(8.0, 8.0), Align2::LEFT_TOP, &label, Tokens::ui(11.0), Color32::from_white_alpha(210));

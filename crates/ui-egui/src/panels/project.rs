@@ -59,10 +59,11 @@ pub fn fmt_size(bytes: u64) -> String {
     }
 }
 
-/// Footage file size on disk (comps, solids and folders have none).
+/// Footage file size on disk (comps, solids and folders have none), through the disk cache's
+/// file stamps (stat-ed again when the app regains focus, else every few seconds).
 fn file_size(it: &Item) -> Option<u64> {
     match &it.kind {
-        ItemKind::Footage(f) => std::fs::metadata(&f.path).ok().map(|m| m.len()),
+        ItemKind::Footage(f) => effectcraft_engine::render::disk_cache::file_len(&f.path),
         _ => None,
     }
 }
@@ -85,12 +86,14 @@ pub const COLUMNS: [(&str, &str, f32); 6] = [
 ];
 
 /// Sort siblings by the Project panel's sort column; ties fall back to the name.
-pub fn sort_items(items: &mut [&Item], col: &str, desc: bool) {
-    let name = |i: &Item| i.name.to_lowercase();
-    items.sort_by(|a, b| {
+pub fn sort_items<'a>(items: &mut [&'a Item], col: &str, desc: bool) {
+    // Names and sizes once per item, not per comparison (a size stats the file).
+    let mut keyed: Vec<(String, Option<u64>, &'a Item)> =
+        items.iter().map(|i| (i.name.to_lowercase(), if col == "size" { file_size(i) } else { None }, *i)).collect();
+    keyed.sort_by(|(name_a, size_a, a), (name_b, size_b, b)| {
         let o = match col {
             "type" => a.type_name().cmp(b.type_name()),
-            "size" => file_size(a).cmp(&file_size(b)),
+            "size" => size_a.cmp(size_b),
             "fps" => a.frame_rate().map(|r| r.as_f64()).partial_cmp(&b.frame_rate().map(|r| r.as_f64())).unwrap_or(std::cmp::Ordering::Equal),
             "duration" => a.duration().cmp(&b.duration()),
             "path" => file_path(a).cmp(file_path(b)),
@@ -98,9 +101,12 @@ pub fn sort_items(items: &mut [&Item], col: &str, desc: bool) {
             "label" => (a.label as u8).cmp(&(b.label as u8)),
             _ => std::cmp::Ordering::Equal,
         }
-        .then_with(|| name(a).cmp(&name(b)));
+        .then_with(|| name_a.cmp(name_b));
         if desc { o.reverse() } else { o }
     });
+    for (slot, (_, _, it)) in items.iter_mut().zip(keyed) {
+        *slot = it;
+    }
 }
 
 /// Where a drop at a row lands: into a folder row, else into the row's folder; `None` row = root.

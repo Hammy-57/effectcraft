@@ -55,7 +55,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let p = ui.painter().with_clip_rect(rect);
     let ctx = ui.ctx().clone();
     let comp = app.session.active_comp_arc();
-    let layer = comp.as_ref().and_then(|c| app.session.state.selected_layers.first().and_then(|id| c.layer(*id)).cloned());
+    let layer = comp.as_ref().and_then(|c| app.session.state.selected_layers.first().and_then(|id| super::layer_arc(c, *id)));
     let (Some(comp), Some(cid), Some(layer)) = (comp, app.session.active_comp_id(), layer) else {
         p.text(rect.center(), Align2::CENTER_CENTER, crate::i18n::tr("Select a layer to see its properties"), Tokens::ui(12.0), t.text_faint);
         return;
@@ -72,7 +72,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let mut actions: Actions = vec![];
 
     // ---------------------------------------------------------------- Layer Transform
-    if let Some(tr) = layer.transform().cloned() {
+    if let Some(tr) = layer.transform() {
         section_header(app, ui, &p, x0, w, y, "Layer Transform", "properties.transform");
         let rr = Rect::from_min_size(pos2(x0 + w - 40.0, y), vec2(40.0, ROW_H));
         let resp = ui.interact(rr, egui::Id::new("props-reset"), Sense::click());

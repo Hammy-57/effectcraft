@@ -109,20 +109,44 @@ fn shown_dims(l: &Layer, pr: &Property) -> usize {
     if pr.shown_dims > 0 && !l.is_3d() { (pr.shown_dims as usize).min(n) } else { n.min(4) }
 }
 
-/// Build the curves for the visible time span.
-fn curves<'a>(app: &EffectcraftApp, comp: &'a Comp, ectx: &EvalCtx, tm: TMap, plot: Rect, speed: bool) -> Vec<Curve<'a>> {
+/// The sampled curves of one graph type: (key of what they depend on, points per curve).
+type Samples = (u64, std::sync::Arc<Vec<Vec<(f64, f64)>>>);
+
+/// Build the curves for the visible time span. Their samples evaluate every shown property
+/// (expressions too) across the plot, so they are remembered until the project, the shown
+/// properties or the view change.
+fn curves<'a>(app: &EffectcraftApp, ctx: &egui::Context, comp: &'a Comp, ectx: &EvalCtx, tm: TMap, plot: Rect, speed: bool) -> Vec<Curve<'a>> {
     let sel = &app.session.state.selected_keys;
     let n = ((plot.width() / 2.0) as usize).max(2);
+    let props = shown_props(app, comp);
+    let samples_key = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (app.session.revision, ectx.comp_id.0, n, &props).hash(&mut h);
+        for v in [plot.min.x, plot.max.x, tm.x0] {
+            v.to_bits().hash(&mut h);
+        }
+        (tm.start.to_bits(), tm.pps.to_bits()).hash(&mut h);
+        h.finish()
+    };
+    let samples_id = egui::Id::new(("graph-samples", speed));
+    let cached = ctx.data(|d| d.get_temp::<Samples>(samples_id)).filter(|(k, _)| *k == samples_key).map(|(_, s)| s);
+    let mut sampled: Vec<Vec<(f64, f64)>> = vec![];
     let mut out = vec![];
-    for (pi, (lid, uid)) in shown_props(app, comp).into_iter().enumerate() {
+    for (pi, (lid, uid)) in props.into_iter().enumerate() {
         let Some(l) = comp.layer(lid) else { continue };
         let Some(pr) = l.props.find(uid) else { continue };
         let spatial = pr.spatial && matches!(pr.value, Value::Vec2(_) | Value::Vec3(_));
         let dims = if speed && spatial { 1 } else { shown_dims(l, pr) };
         for d in 0..dims {
             let color = if dims > 1 { DIM_COLORS[d % 4] } else { PROP_COLORS[pi % PROP_COLORS.len()] };
+            let ci = sampled.len();
             let mut pts = Vec::with_capacity(n);
-            for i in 0..n {
+            if let Some(c) = cached.as_ref().and_then(|c| c.get(ci)) {
+                pts.extend_from_slice(c);
+            }
+            let todo = if pts.is_empty() { n } else { 0 };
+            for i in 0..todo {
                 let x = plot.min.x + plot.width() * i as f32 / (n - 1) as f32;
                 let ct = tm.t(x);
                 let tt = Tick::from_seconds_f64(ct);
@@ -138,6 +162,7 @@ fn curves<'a>(app: &EffectcraftApp, comp: &'a Comp, ectx: &EvalCtx, tm: TMap, pl
                 };
                 pts.push((ct, v));
             }
+            sampled.push(pts.clone());
             let mut keys = vec![];
             for (i, k) in pr.keys.iter().enumerate() {
                 let ks = sel.contains(&KeyRef { layer: lid, prop: uid, time: k.time });
@@ -166,6 +191,9 @@ fn curves<'a>(app: &EffectcraftApp, comp: &'a Comp, ectx: &EvalCtx, tm: TMap, pl
             }
             out.push(Curve { layer: l, prop: pr, dim: d, color, pts, keys, editable: !spatial });
         }
+    }
+    if cached.is_none() {
+        ctx.data_mut(|d| d.insert_temp::<Samples>(samples_id, (samples_key, std::sync::Arc::new(sampled))));
     }
     out
 }
@@ -222,7 +250,7 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
     p.rect_filled(area, 0.0, Color32::from_rgb(0x1d, 0x1d, 0x1d));
     app.auto.add("timeline.graph", plot, &app.ui.timeline.graph_mode.clone());
     let speed = speed_graph(app, comp);
-    let cs = curves(app, comp, ectx, tm, plot, speed);
+    let cs = curves(app, &ctx, comp, ectx, tm, plot, speed);
     // Just opened, or the graph type changed (value and speed have different units): frame the
     // graphs (Fit Selection to View, else Fit All Graphs to View).
     let was_speed_id = egui::Id::new("graph-was-speed");
@@ -293,7 +321,7 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
 
     // Show Reference Graph: the other graph type, faint, scaled to the plot.
     if app.ui.timeline.graph_reference && !cs.is_empty() {
-        let other = curves(app, comp, ectx, tm, plot, !speed);
+        let other = curves(app, &ctx, comp, ectx, tm, plot, !speed);
         let (mut rlo, mut rhi) = (f64::INFINITY, f64::NEG_INFINITY);
         for c in &other {
             for (_, v) in &c.pts {
