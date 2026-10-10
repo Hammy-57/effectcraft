@@ -915,3 +915,5 @@ before.
   insertion mark) and the dragged tab in that window, whichever window the drag started in.
 - Undocked windows stay above the main window while EffectCraft is the active app, as After
   Effects' floating panels do, and become ordinary windows when another app is active.
+- An undocked window saved on a monitor that has since been unplugged opens over the main
+  window instead of off-screen (macOS; Windows catches only absurd saved positions).

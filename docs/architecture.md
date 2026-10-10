@@ -643,7 +643,11 @@ above its windows. egui has no parent-window API, so this is the windows' level
 changes; `float_windows::OnTop`): gaining the focus raises them at once, losing it lowers them once
 it has stayed lost for 0.2 s (focus moving between our own windows passes through a frame or two
 in which none has it). Setting a level doesn't take the focus. Limit: unlike a real child window,
-they don't minimise or hide with the main window. Where egui embeds viewports (`ctx.embed_viewports()`: the web,
+they don't minimise or hide with the main window. A window saved on a monitor that is gone
+(unplugged since) opens over the main window instead (`float_windows::rescue`, once, when it
+opens): the OS reports it on no monitor. macOS reports that reliably; Windows always names the
+nearest monitor, so there only an absurd saved position (non-finite or 100,000 points away) is
+caught; Dock Panel or a workspace reset brings any other lost window back. Where egui embeds viewports (`ctx.embed_viewports()`: the web,
 the headless test harness, the snapshot example and the offscreen `mcp --ui` app) undocked groups
 float inside the main window instead, unchanged. Automation elements drawn in an undocked window
 carry `window` (the group id), their rects are in its coordinates, and synthetic `ui.click` /
