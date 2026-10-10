@@ -1,8 +1,8 @@
 //! Time zoom in the Timeline driven over the control channel, as an agent (or a person) uses it:
 //! the `=` / `-` keys, the zoom-out / zoom-in buttons and the slider in the footer, and the
-//! time navigator's ends. The layer bars and the Graph Editor share one time zoom (After
-//! Effects): the same controls zoom the graph's time axis, centred on the current time, and
-//! switching between the views keeps it.
+//! time navigator's ends. The same controls zoom the Graph Editor's time axis, centred on the
+//! current time; leaving the Graph Editor puts back the layer bars' zoom from before it opened
+//! (its fit doesn't stick, at the owner's request).
 
 use effectcraft_engine::Session;
 use effectcraft_ui_egui::EffectcraftApp;
@@ -141,23 +141,28 @@ fn graph_curves_follow_the_time_zoom_and_the_navigator() {
     assert_eq!(key_x(&h).len(), 1, "the 8 s key is past the visible span");
 }
 
+/// Opening the Graph Editor fits the graphs (ui_graph_fit) and zooming in there changes its
+/// view; leaving it shows the layer bars as they were before (it used to keep the graph's zoom,
+/// so the bars came back zoomed in on the keys).
 #[test]
-fn leaving_the_graph_keeps_its_time_zoom() {
+fn leaving_the_graph_restores_the_zoom_from_before_it_opened() {
     let mut h = harness(false);
-    // Opening the Graph Editor fits the graphs (ui_graph_fit); the zoom set there stays.
+    send(&mut h, "ui.key", json!({"key": "="}));
+    let before = view(&h);
     send(&mut h, "ui.click", json!({"id": "timeline.switch.graph"}));
     assert!(h.state().ui.timeline.graph_editor);
     send(&mut h, "ui.key", json!({"key": "="}));
-    let graph = view(&h);
+    send(&mut h, "ui.key", json!({"key": "="}));
+    assert_ne!(view(&h), before, "the graph has its own view while open");
     send(&mut h, "ui.click", json!({"id": "timeline.switch.graph"}));
     assert!(!h.state().ui.timeline.graph_editor);
-    assert_eq!(view(&h), graph);
+    assert_eq!(view(&h), before);
 }
 
 #[test]
 fn azerty_physical_zoom_keys_zoom_the_graph() {
     let mut h = harness(true);
-    // The "Elias AE"-style bindings: AZERTY's - (US 6 position) zooms in, ) (US minus) out.
+    // Custom by-position bindings (a French PC layout: `-` on the US 6 key, `)` on US minus).
     for (command, keys) in [("timeline.zoomIn", "Physical+6"), ("timeline.zoomOut", "Physical+Minus")] {
         h.state_mut().session.execute("shortcuts.set", json!({"command": command, "keys": keys})).unwrap();
     }

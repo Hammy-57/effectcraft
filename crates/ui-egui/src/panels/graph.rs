@@ -512,8 +512,7 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
         actions.push(("keys.select".into(), json!({"keys": []})));
     }
     if let Some(br) = key_box.filter(|_| bg.dragged()) {
-        pc.rect_filled(br, 0.0, t.accent.gamma_multiply(0.12));
-        pc.rect_stroke(br, 0.0, Stroke::new(1.0, t.accent), StrokeKind::Middle);
+        crate::widgets::marquee(&pc, br, &t);
         ctx.data_mut(|d| d.insert_temp(egui::Id::new("graph-box"), br));
     }
     // Releasing the marquee commits the selection its keys showed.
@@ -552,14 +551,14 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
         "autoSelectGraphType",
         "Auto-Select Graph Type (speed graph for spatial properties, else value graph)",
     ) {
-        app.ui.timeline.graph_mode = if auto_type { if speed { "speed" } else { "value" } } else { "auto" }.into();
+        set_graph_type(app, if auto_type { if speed { "speed" } else { "value" } } else { "auto" });
     }
     // Choosing a graph type turns Auto-Select off, as in After Effects.
     if text_button(app, ui, p, &mut x, y, "Value", !speed, "valueGraph", "Edit Value Graph") {
-        app.ui.timeline.graph_mode = "value".into();
+        set_graph_type(app, "value");
     }
     if text_button(app, ui, p, &mut x, y, "Speed", speed, "speedGraph", "Edit Speed Graph") {
-        app.ui.timeline.graph_mode = "speed".into();
+        set_graph_type(app, "speed");
     }
     x += 6.0;
     if text_button(app, ui, p, &mut x, y, "Selected", show_sel, "showSelected", "Show Selected Properties (else all animated properties)") {
@@ -608,6 +607,16 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
     }
 }
 
+/// Show graph type `mode` and remember it (Preferences `graphType`): the Graph Editor opens on
+/// it until another type is chosen, across launches.
+fn set_graph_type(app: &mut EffectcraftApp, mode: &str) {
+    app.ui.timeline.graph_mode = mode.into();
+    if app.session.prefs.graph_type != mode {
+        app.session.prefs.graph_type = mode.into();
+        app.session.save_prefs();
+    }
+}
+
 /// Fit All Graphs to View: the whole comp in time, auto-zoomed values.
 fn fit_all(app: &mut EffectcraftApp) {
     app.ui.timeline.graph_auto_zoom = true;
@@ -618,18 +627,28 @@ fn fit_pending_id() -> egui::Id {
     egui::Id::new("graph-fit-pending")
 }
 
-/// Called every Timeline frame with whether the Graph Editor is on: switching it on (header
-/// button, menu, Shift+F3 or the control channel) frames the graphs on its first frame, when the
-/// plot rect is known, as After Effects does.
-pub(crate) fn track_open(ctx: &egui::Context, on: bool) {
+/// Called every Timeline frame: switching the Graph Editor on (header button, menu, Shift+F3 or
+/// the control channel) frames the graphs on its first frame, when the plot rect is known, as
+/// After Effects does; switching it off puts back the time zoom from before it opened, so the
+/// fit doesn't leave the layer bars zoomed in.
+pub(crate) fn track_open(ctx: &egui::Context, tl: &mut crate::state::TimelineState) {
+    let on = tl.graph_editor;
     let was_id = egui::Id::new("graph-editor-was-on");
+    let zoom_id = egui::Id::new("graph-editor-zoom-before");
     let was = ctx.data(|d| d.get_temp::<bool>(was_id)).unwrap_or(false);
-    ctx.data_mut(|d| {
-        d.insert_temp(was_id, on);
-        if on && !was {
+    if on && !was {
+        ctx.data_mut(|d| {
             d.insert_temp(fit_pending_id(), true);
-        }
-    });
+            d.insert_temp(zoom_id, (tl.start, tl.pps));
+        });
+    } else if was
+        && !on
+        && let Some((start, pps)) = ctx.data_mut(|d| d.remove_temp::<(f64, Option<f64>)>(zoom_id))
+    {
+        tl.start = start;
+        tl.pps = pps;
+    }
+    ctx.data_mut(|d| d.insert_temp(was_id, on));
 }
 
 /// Zoom time and value to the selected keys (and their handles).

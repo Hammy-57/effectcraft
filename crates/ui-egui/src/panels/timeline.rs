@@ -1726,8 +1726,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let sel_keys = app.session.state.selected_keys.clone();
     let mut ui_actions: Vec<UiAct> = Vec::new();
     let idx_of = |id: LayerId| comp.index_of(id).unwrap_or(0);
+    super::graph::track_open(ui.ctx(), &mut app.ui.timeline);
     let graph_on = app.ui.timeline.graph_editor;
-    super::graph::track_open(ui.ctx(), graph_on);
     let full_clip = ui.clip_rect();
     let left_clip = full_clip.intersect(Rect::from_min_max(pos2(rect.min.x, rows_rect.min.y), pos2(graph_x0 - 1.0, rows_rect.max.y)));
     let right_clip = full_clip.intersect(Rect::from_min_max(pos2(graph_x0, rows_rect.min.y), rows_rect.max));
@@ -2714,8 +2714,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         && outline_empty.dragged()
     {
         let box_rect = Rect::from_two_pos(start, end).intersect(outline_rect);
-        lp.rect_filled(box_rect, 0.0, t.accent.gamma_multiply(0.12));
-        lp.rect_stroke(box_rect, 0.0, Stroke::new(1.0, t.accent), StrokeKind::Inside);
+        crate::widgets::marquee(&lp, box_rect, &t);
         ctx.data_mut(|d| d.insert_temp(egui::Id::new("tl-layer-box"), box_rect));
     }
     if outline_empty.drag_stopped()
@@ -2804,8 +2803,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         actions.push(("layer.select".into(), json!({"layers": []})));
     }
     if let Some(br) = key_box.filter(|_| empty.dragged()) {
-        gp.rect_filled(br, 0.0, t.accent.gamma_multiply(0.12));
-        gp.rect_stroke(br, 0.0, Stroke::new(1.0, t.accent), StrokeKind::Middle);
+        crate::widgets::marquee(&gp, br, &t);
         ctx.data_mut(|d| d.insert_temp(egui::Id::new("tl-box"), br));
     }
     // Layer reorder drag: a line where the layers will land; the release moves them there.
