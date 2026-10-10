@@ -1,0 +1,37 @@
+# User reports: 10–11 October 2026
+
+The owner's two screenshots named fifteen bugs and three later requests. This pass covers the
+bugs plus the broken Gradient Edit and empty-timeline drop workflows. In-place precomp expansion
+(#601) and a whole Properties-panel parity audit remain separate feature work.
+
+| Report | Result and regression evidence |
+|---|---|
+| #580 Chromatic Aberrations Pan/Tilt crash | **Still unreproduced.** The released v0.7.0 did expose these controls; this fork replaced that model earlier. Current direction controls pass CPU/GPU comparisons, but the original input, backend and crash diagnostic are missing. See [GPU evidence](gpu-580-591-613.md). |
+| #591 GPU memory/device loss | GPU retention is bounded, including pending texture reuse; purge and document replacement clear CPU/GPU caches. Real compositor-device destruction preserves the document, undo and a working CPU preview/presentation in `ui_gpu::compositor_device_loss_keeps_the_window_rendering_and_the_document_editable`. The original Adreno/ARM64 project and loss of the presentation device itself remain unverified. |
+| #613 DX12 compositor startup | Windows x64 links DXC. Six focused tests passed on an RTX 4060 Laptop using DX12, including actual pointwise pixels. ARM64 and x86 do not get this static compiler. See [GPU evidence](gpu-580-591-613.md). |
+| #624 duplicated text cannot be edited | Reproduced with overlapping copies: the Type tool chose the top copy instead of the explicitly selected original. Selected eligible text now wins for Type clicks; double-click still chooses the topmost text. Nine `ui_text_edit` regressions pass, including undo and hidden/locked/inactive/solo exclusions. |
+| #652 missing media in the app | Ordinary project opening now anchors relative footage, sequence and proxy paths to the project folder. A generated H.264/WAV project opened with app-style background checks renders both picture and audio and exports an MP4 containing both streams (`relative_media`). The reporter's actual project was not supplied. |
+| #660 Windows black strip/click offset | **Left unresolved at the owner's request.** The supplied screenshot is VectorCraft; no EffectCraft reproduction was provided. See [investigation](windows-titlebar-660.md). |
+| #647 drag CPU/memory growth | Urgent viewer renders no longer bypass admission limits and nest without bound. Auxiliary Puppet renders share one additional permit across layers. Queue/admission tests and `viewer-drag-memory.jsonl` cover the mechanism; the replay's native-viewer requirement is explicit. |
+| #595 playback cache gaps and third-resolution indicators | Near-playhead frames are protected from speculative eviction, lookahead respects capacity, and scale hashing uses the same precision as the cache bar. Queue, eviction and one-third-resolution regressions pass. Smooth playback on the reporter's Linux/Wayland machine was not measured. |
+| #586 Puppet drag lag | Later poses solve off the UI thread; one running/latest pose is kept, pin handles stay current, stale project results are rejected, and failures release admission. Shared deformation results also avoid duplicate solves. Initial mesh selection and the wasm path remain synchronous. Synthetic solver measurements are not a native-screen frame-rate claim. |
+| #637 precomp double-click | Existing navigation is verified by real pointer regressions in both the Timeline and Composition viewer; each opens the nested comp's own tab. No speculative navigation change was needed. |
+| #570 viewer Cmd/Ctrl +/- | Focused Composition viewers accept these aliases while preserving explicit shortcut bindings and text editing. `command_plus_minus_zoom_the_focused_composition` passes. |
+| #553 motion-path vertex tools | Pen/Add/Delete/Convert tools and contextual cursors now work on motion paths, including tangent dragging and undo. Insertion subdivides spatial/temporal curves and keeps layer-time semantics. Hold, roving, reversing/overshooting and degenerate insertions return explicit unsupported errors rather than silently changing motion. |
+| #659 text effect clipping | Text effects can draw beyond the glyph raster, including full/half-resolution CC Tiler and CC Smear. Controls and reviewed color-only effects retain tight rasters. CPU and Metal comparisons pass. |
+| #658 CC Smear above 100 | Reach accepts -1000…1000; the default-tip brush now follows measured AE behavior and produces the extended/thinned droplet. Three CPU regressions, renderer coverage and Metal comparisons pass. See [measurements and limits](../fidelity/cc-smear.md). |
+| #651 GIF playback | GIFs use their frame delays in preview/export rather than decoding only the first frame. Tests cover unequal/zero delays, looping and rate interpretation; older still-GIF metadata is repaired on footage checking. |
+| #612 Gradient Edit | Timeline and Effect Controls open a shared color/opacity-stop editor with midpoints, Apply, Cancel and undo. Full-app pointer tests verify a real Gradient Fill, including Escape discarding a draft. A local screenshot was inspected. |
+| #649 drop into an empty timeline | Dropped footage creates a composition using its dimensions, frame rate, duration and pixel aspect. Video/still pointer tests verify one-step undo preserves the source footage. |
+
+## Validation
+
+Focused engine, host, effects, keyframe, UI and GPU regressions were run; all checked-in repro
+scripts replay cleanly. The UI command/widget automation audit passes. Changed crates passed
+all-target Clippy with warnings denied, and the browser target passed `cargo check`. CPU/Metal
+effect comparisons and the six Windows/DX12 checks are separate evidence, not a claim that every
+workflow was tested on every platform. Full workspace CI and a release/app rebuild were not run.
+
+Private logs, the gradient screenshot and raw AE-generated reference frames stay under ignored
+`plan/user-bugs-validation/` and `plan/aftereffects/ref/user-bugs-658/`; no reference media ships
+with these changes. The test logs retain the initial failures and their successful reruns.
