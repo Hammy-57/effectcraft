@@ -119,3 +119,37 @@ fn dragging_bar_ends_trims_in_and_out() {
     let (i, o, s) = timing(&h, pre);
     assert!((i - 3.0).abs() < 1e-6 && (o - 8.0).abs() < 1.5 / 30.0 && s.abs() < 1e-6, "out extended to ~8 s, not slipped: in {i} out {o} start {s}");
 }
+
+/// Trimming a selected layer's end trims every selected layer by the same amount (one undo
+/// step), as in After Effects; an unselected layer's end trims that layer alone.
+#[test]
+fn dragging_a_selected_bar_end_trims_every_selected_layer() {
+    let (mut h, solid, pre) = harness();
+    h.state_mut().session.execute("layer.select", json!({"layers": [solid, pre]})).unwrap();
+    h.run_steps(2);
+    let b = bar(&h, pre);
+    let pps = bar(&h, solid).width() as f64 / 4.0;
+    let y = b.center().y;
+    drag(&mut h, pos2(b.max.x - 2.0, y), pos2(b.max.x - 2.0 + pps as f32, y));
+    let ((si, so, _), (pi, po, _)) = (timing(&h, solid), timing(&h, pre));
+    assert!((so - 7.0).abs() < 1.5 / 30.0 && (po - 8.0).abs() < 1.5 / 30.0, "both outs ~+1 s: solid {so}, precomp {po}");
+    assert!((so - 6.0 - (po - 7.0)).abs() < 1e-9, "the same delta for both");
+    assert!((si - 2.0).abs() < 1e-9 && (pi - 3.0).abs() < 1e-9, "in points untouched");
+    // The In end too.
+    let b = bar(&h, solid);
+    drag(&mut h, pos2(b.min.x + 2.0, b.center().y), pos2(b.min.x + 2.0 + pps as f32 / 2.0, b.center().y));
+    let ((si, _, _), (pi, _, _)) = (timing(&h, solid), timing(&h, pre));
+    assert!((si - 2.5).abs() < 1.5 / 30.0 && (si - 2.0 - (pi - 3.0)).abs() < 1e-9, "both ins ~+0.5 s: solid {si}, precomp {pi}");
+    // One undo step per drag.
+    h.state_mut().session.undo();
+    h.state_mut().session.undo();
+    h.run_steps(2);
+    assert_eq!((timing(&h, solid), timing(&h, pre)), ((2.0, 6.0, 0.0), (3.0, 7.0, 0.0)));
+    // An unselected layer's end: only it.
+    h.state_mut().session.execute("layer.select", json!({"layers": [solid]})).unwrap();
+    h.run_steps(2);
+    let b = bar(&h, pre);
+    drag(&mut h, pos2(b.max.x - 2.0, y), pos2(b.max.x - 2.0 + pps as f32, y));
+    assert_eq!(timing(&h, solid), (2.0, 6.0, 0.0), "the selected layer stays");
+    assert!((timing(&h, pre).1 - 8.0).abs() < 1.5 / 30.0);
+}
