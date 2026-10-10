@@ -887,3 +887,11 @@ Recorded in one place on 10 October; each landed with tests.
   analysis tools, progress and cancellation, resource templates, subscriptions, logging and
   prompts, stable ids, per-client undo and `expectRevision`, repro scripts, `cargo xtask agents`
   ([agents.md](agents.md), [mcp.md](mcp.md), [control-protocol.md](control-protocol.md)).
+
+## Update: projects reopen their open comps
+
+Saving a project remembers the comps open in the Timeline/Composition tabs (in tab order), the
+one in front and each one's current time, and opening it (Open, Open Recent, Revert, a
+recovered auto-save) brings them back, as After Effects does with an `.aep`. Changing tabs or
+the time doesn't mark the project modified; comps deleted since are skipped; older files open as
+before.

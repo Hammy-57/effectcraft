@@ -44,10 +44,13 @@ pub(crate) fn open(s: &mut Session, p: &Value) -> Result<Value> {
     // XML copies (File ▸ Save a Copy As XML…) open like the JSON project.
     let text = if crate::xml_project::is_xml(&text) { crate::xml_project::from_xml(&text).map_err(EngineError::Other)? } else { text };
     let proj = Project::from_json(&text).map_err(|e| EngineError::Other(format!("{path} is not a project EffectCraft can open: {e}")))?;
-    s.replace_project(proj, Some(path.to_string()));
+    // The comps open when it was saved reopen, in their tabs, at their times (as in After
+    // Effects).
+    let meta = effectcraft_project::file_meta(&text);
+    s.replace_project_with(proj, Some(path.to_string()), meta.open_comps.as_ref());
     s.note_project_path(path);
     // Written by a newer EffectCraft: what this version doesn't know would be lost on saving.
-    let saved_by = effectcraft_project::saved_by(&text);
+    let saved_by = meta.saved_by;
     if let Some(v) = saved_by.as_deref().filter(|v| effectcraft_project::is_newer_version(v, effectcraft_project::APP_VERSION)) {
         s.toast(format!(
             "This project was saved by EffectCraft {v}, newer than this version ({}). Settings this version doesn't know are lost if you save it.",
@@ -62,11 +65,18 @@ pub(crate) fn open(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"path": path, "savedBy": saved_by}))
 }
 
+/// The project file's JSON: the project, and the user's open comps as they are now
+/// ([`Session::open_comps_to_save`]; filled in here at save time, so changing tabs or the
+/// current time never marks the project modified).
+pub(crate) fn file_json(s: &Session) -> Result<String> {
+    Ok(s.project.to_file_json_with(s.open_comps_to_save().as_ref())?)
+}
+
 /// The project file's text for `path`: `.ecproj` JSON, or XML for `.ecprojx` / `.xml` (a
 /// project opened from an XML copy saves as XML again). Fails, writing nothing, when the project
 /// wouldn't read back.
 pub(crate) fn file_text(s: &Session, path: &str) -> Result<String> {
-    let json = s.project.to_file_json()?;
+    let json = file_json(s)?;
     if crate::xml_project::is_xml_path(path) { crate::xml_project::to_xml(&json).map_err(EngineError::Other) } else { Ok(json) }
 }
 
