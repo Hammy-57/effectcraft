@@ -168,6 +168,23 @@ with `logger: "effectcraft"` and `data: {message, …}`:
 In bridge mode only the expression check applies; the app shows its own toasts and footage
 checks.
 
+## Retries
+
+A `tools/call` with `params._meta.requestId` (or a `request_id` argument, which is removed before
+argument checking) is idempotent: the same id again returns the first result without running the
+tool (last 128 ids). Bridge calls also send a `requestId` on the control channel, so the bridge's
+reconnect-and-resend never runs a command twice.
+
+## Several agents (`client`)
+
+Every tool takes an optional `client` argument, the agent's name (a non-empty string, at most 128
+bytes). The engine commands the call runs carry it, so the agent works on its own selection, active
+comp and current time (render tools default to that time) and can reserve comps with
+`command_run comp.claim`; another agent's edit to a claimed comp is a tool error naming the owner.
+`effectcraft-cli mcp --client NAME` (or `EFFECTCRAFT_CLIENT`) runs every call as `NAME`; a call's own
+`client` overrides it. Without either, tools act on the user's cursor as before. Details:
+[agents.md](agents.md#several-agents-at-once).
+
 ## Prompts
 
 `prompts/list` and `prompts/get` serve workflow recipes. Each one is a single user message that spells
@@ -183,18 +200,6 @@ out the tool flow (canonical tool names, the layer-time versus comp-time pitfall
 
 Argument values are strings. A missing required argument, an unknown argument or prompt, or a
 non-string value returns `-32602`.
-
-## Change notifications and retries
-
-The server advertises `resources.subscribe`. After `resources/subscribe {uri:
-"effectcraft://document"}`, every tool call that changed the project revision is followed by
-`notifications/resources/updated {uri}` (bridge mode reads the app's revision after each call,
-so edits made in the window are reported with the next call). `resources/unsubscribe` stops it.
-
-A `tools/call` with `params._meta.requestId` (or a `request_id` argument, which is removed before
-argument checking) is idempotent: the same id again returns the first result without running the
-tool (last 128 ids). Bridge calls also send a `requestId` on the control channel, so the bridge's
-reconnect-and-resend never runs a command twice.
 
 ## Progress and cancellation
 

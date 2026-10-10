@@ -27,7 +27,7 @@
 //!     on a large generated project (open, save, auto-save, undo/redo, timeline, Project panel)
 //! effectcraft-cli script FILE.jsx [F.ecproj] | --eval CODE    run an After Effects-style script
 //! effectcraft-cli replay SCRIPT.jsonl [--keep-going]        replay a repro script (docs/agents.md)
-//! effectcraft-cli mcp [--autosave] [--bridge [PORT] | --ui] [--all-tools] MCP server on stdio
+//! effectcraft-cli mcp [--autosave] [--bridge [PORT] | --ui] [--all-tools] [--client NAME]  MCP server on stdio
 //!
 //! Project:  --project F.ecproj (or a positional *.ecproj) | --demo | --empty   (default: demo; mcp: empty)
 //! Saving:   --save (back to --project) | --save-as F.ecproj
@@ -137,7 +137,9 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
                                            also lists the older tool aliases; --bridge without a port uses
                                            EFFECTCRAFT_CONTROL_PORT, else 9877;
                                            --ui [--ui-size 1680x1020] [--ui-scale 2] runs the app offscreen
-                                           (no window) so screenshot and the ui_* tools work
+                                           (no window) so screenshot and the ui_* tools work;
+                                           --client NAME (or EFFECTCRAFT_CLIENT) runs every tool call as
+                                           that agent: its own selection, comp and time, comp claims
       [--automation-read-root DIR] [--automation-write-root DIR]
                                            confine the agent's file access: reads under a read or write root,
                                            writes under a write root (each repeatable); scripts are refused
@@ -154,6 +156,7 @@ const VALUED: &[&str] = &[
     "--params",
     "--project",
     "--bridge",
+    "--client",
     "--save-as",
     "--filter",
     "--time",
@@ -778,12 +781,18 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
                 return usage_err("--autosave is for MCP with the project in this process (headless or --ui); the bridged app owns its auto-saves");
             }
             let mut b = backend(args, false)?;
+            // --client NAME (or EFFECTCRAFT_CLIENT): every tool call runs as that agent (its own
+            // selection, active comp and time; comp claims).
+            let client = args.opt("--client").map(str::to_string).or_else(|| std::env::var("EFFECTCRAFT_CLIENT").ok()).filter(|c| !c.is_empty());
+            if client.as_ref().is_some_and(|c| c.len() > effectcraft_engine::agents::MAX_CLIENT_LEN) {
+                return usage_err("--client: the name is longer than 128 bytes");
+            }
             let (read, write) = (args.opts("--automation-read-root"), args.opts("--automation-write-root"));
             if !read.is_empty() || !write.is_empty() {
                 let roots = |r: Vec<&str>| r.into_iter().map(std::path::PathBuf::from).collect::<Vec<_>>();
                 b.confine(effectcraft_automation::confine::Confinement::new(&roots(read), &roots(write))?);
             }
-            let server = McpServer::new(b).with_all_tools(args.flag("--all-tools"));
+            let server = McpServer::new(b).with_all_tools(args.flag("--all-tools")).with_client(client);
             let mut server = if args.flag("--autosave") {
                 let root =
                     effectcraft_host::config_dir().ok_or_else(|| Failure::Error("--autosave: no config directory; set EFFECTCRAFT_CONFIG_DIR".into()))?;

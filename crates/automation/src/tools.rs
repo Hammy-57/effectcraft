@@ -56,7 +56,8 @@ impl ToolDef {
         let Some(m) = args.as_object() else { return Some("arguments must be an object".into()) };
         let schema = self.input_schema();
         let props = schema.get("properties")?.as_object()?;
-        let bad = m.keys().find(|k| !props.contains_key(*k))?;
+        // `client` (who the agent is) goes with every tool: see `server::guarded_run`.
+        let bad = m.keys().find(|k| k.as_str() != "client" && !props.contains_key(*k))?;
         let accepted: Vec<&str> = props.keys().map(String::as_str).collect();
         // `command` ↔ `id` is the usual mix-up between the command tools; else the closest name.
         let hint = match bad.as_str() {
