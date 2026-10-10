@@ -1227,6 +1227,10 @@ impl EffectcraftApp {
             let next = plan.and_then(|p| p.frame_after(cur, 1)).unwrap_or(if cur + 1 > wb { wa } else { cur + 1 });
             if self.frames.is_cached(&FrameKey { frame: next, ..series }) {
                 self.session.set_time(fr.tick_of(next));
+            } else {
+                // The frame playback waits for renders before any prefetch (the prefetch window
+                // can be full of frames further on, or of other comps').
+                self.request_frame_urgent(cid, next, scale);
             }
             self.playback.start_wall = now;
             self.playback.start_frame = fr.frame_at(self.session.time());

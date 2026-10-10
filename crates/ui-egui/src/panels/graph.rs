@@ -115,6 +115,21 @@ type Samples = (u64, std::sync::Arc<Vec<Vec<(f64, f64)>>>);
 /// Build the curves for the visible time span. Their samples evaluate every shown property
 /// (expressions too) across the plot, so they are remembered until the project, the shown
 /// properties or the view change.
+/// The graph's value of dimension `d` of `pr` at comp time `ct` (s): its value, or in the speed
+/// graph its speed (spatial properties) or velocity.
+fn sample(ectx: &EvalCtx, l: &Layer, pr: &Property, d: usize, speed: bool, ct: f64) -> f64 {
+    let tt = Tick::from_seconds_f64(ct);
+    if !speed {
+        return ectx.at(tt).value(l, pr).components().get(d).copied().unwrap_or(0.0);
+    }
+    let lt = l.layer_time(tt);
+    if pr.spatial && matches!(pr.value, Value::Vec2(_) | Value::Vec3(_)) {
+        effectcraft_engine::keyframe::speed(&pr.keys, lt, true)
+    } else {
+        effectcraft_engine::keyframe::velocity(&pr.keys, lt, false).get(d).copied().unwrap_or(0.0).abs()
+    }
+}
+
 fn curves<'a>(app: &EffectcraftApp, ctx: &egui::Context, comp: &'a Comp, ectx: &EvalCtx, tm: TMap, plot: Rect, speed: bool) -> Vec<Curve<'a>> {
     let sel = &app.session.state.selected_keys;
     let n = ((plot.width() / 2.0) as usize).max(2);
@@ -149,18 +164,7 @@ fn curves<'a>(app: &EffectcraftApp, ctx: &egui::Context, comp: &'a Comp, ectx: &
             for i in 0..todo {
                 let x = plot.min.x + plot.width() * i as f32 / (n - 1) as f32;
                 let ct = tm.t(x);
-                let tt = Tick::from_seconds_f64(ct);
-                let v = if speed {
-                    let lt = l.layer_time(tt);
-                    if spatial {
-                        effectcraft_engine::keyframe::speed(&pr.keys, lt, true)
-                    } else {
-                        effectcraft_engine::keyframe::velocity(&pr.keys, lt, false).get(d).copied().unwrap_or(0.0).abs()
-                    }
-                } else {
-                    ectx.at(tt).value(l, pr).components().get(d).copied().unwrap_or(0.0)
-                };
-                pts.push((ct, v));
+                pts.push((ct, sample(ectx, l, pr, d, speed, ct)));
             }
             sampled.push(pts.clone());
             let mut keys = vec![];
@@ -258,7 +262,7 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
     ctx.data_mut(|d| d.insert_temp(was_speed_id, speed));
     if ctx.data_mut(|d| d.remove_temp::<bool>(fit_pending_id())).unwrap_or(false) || type_changed {
         if cs.iter().any(|c| c.keys.iter().any(|k| k.sel)) {
-            fit_selection(app, &cs, tm, plot);
+            fit_selection(app, &cs, ectx, speed, plot);
         } else {
             fit_all(app);
         }
@@ -568,7 +572,7 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
         fit_all(app);
     }
     if text_button(app, ui, p, &mut x, y, "Fit Selection", false, "fitSelection", "Fit selection to view") {
-        fit_selection(app, &cs, tm, plot);
+        fit_selection(app, &cs, ectx, speed, plot);
     }
     x += 6.0;
     let (snap, reference, tbox) = (app.ui.timeline.graph_snap, app.ui.timeline.graph_reference, app.ui.timeline.graph_transform_box);
@@ -629,7 +633,7 @@ pub(crate) fn track_open(ctx: &egui::Context, on: bool) {
 }
 
 /// Zoom time and value to the selected keys (and their handles).
-fn fit_selection(app: &mut EffectcraftApp, cs: &[Curve], tm: TMap, plot: Rect) {
+fn fit_selection(app: &mut EffectcraftApp, cs: &[Curve], ectx: &EvalCtx, speed: bool, plot: Rect) {
     let mut t0 = f64::INFINITY;
     let mut t1 = f64::NEG_INFINITY;
     let mut v0 = f64::INFINITY;
@@ -661,6 +665,17 @@ fn fit_selection(app: &mut EffectcraftApp, cs: &[Curve], tm: TMap, plot: Rect) {
             }
         }
     }
+    // And the curves between them: an eased speed graph is 0 at both keys and peaks in between
+    // (sampled here: the drawn samples only cover the view before the fit).
+    for c in cs.iter().filter(|c| c.keys.iter().any(|k| k.sel)) {
+        for i in 0..=FIT_SAMPLES {
+            let v = sample(ectx, c.layer, c.prop, c.dim, speed, t0 + (t1 - t0) * i as f64 / FIT_SAMPLES as f64);
+            if v.is_finite() {
+                v0 = v0.min(v);
+                v1 = v1.max(v);
+            }
+        }
+    }
     let span = (t1 - t0).max(0.2);
     let pps = plot.width() as f64 * 0.8 / span;
     // Through the timeline's zoom, so the fit never zooms out past the whole comp.
@@ -671,8 +686,10 @@ fn fit_selection(app: &mut EffectcraftApp, cs: &[Curve], tm: TMap, plot: Rect) {
     let pad = ((v1 - v0) * 0.15).max(1.0);
     app.ui.timeline.graph_auto_zoom = false;
     app.ui.timeline.graph_range = Some((v0 - pad, v1 + pad));
-    let _ = tm;
 }
+
+/// Curve samples Fit Selection to View takes between the selected keys.
+const FIT_SAMPLES: usize = 200;
 
 fn nice_step(raw: f64) -> f64 {
     let raw = raw.abs().max(1e-9);

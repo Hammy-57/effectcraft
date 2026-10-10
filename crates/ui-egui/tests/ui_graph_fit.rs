@@ -77,3 +77,25 @@ fn open_graph_toggle_twice(h: &mut Harness<'_, EffectcraftApp>) {
     assert!(!h.state().ui.timeline.graph_editor);
     open_graph(h);
 }
+
+/// Regression: an eased Position move opens on the speed graph, where both keys sit at speed 0
+/// and the curve peaks between them. Fit Selection framed only the keys (a flat -1..1 range) and
+/// left the curve off the top; it frames the curve between the selected keys too.
+#[test]
+fn opening_the_graph_editor_frames_the_speed_curve_between_eased_keys() {
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "Ease", "width": 320, "height": 180, "frameRate": 30, "duration": 10})).unwrap();
+    s.execute("layer.newSolid", json!({"name": "Box", "color": "#e04020", "width": 40, "height": 40})).unwrap();
+    let id = s.active_comp().unwrap().layers[0].id;
+    for (t, x) in [(0.0, 0.0), (1.0, 300.0)] {
+        s.execute("prop.addKey", json!({"layer": id.0, "path": "transform/position", "time": t, "value": [x, 90.0, 0.0]})).unwrap();
+    }
+    let uid = s.active_comp().unwrap().layer(id).unwrap().props.prop("transform/position").unwrap().uid;
+    s.execute("keys.select", json!({"keys": [{"layer": id.0, "prop": uid, "time": 0.0}, {"layer": id.0, "prop": uid, "time": 1.0}]})).unwrap();
+    s.execute("keys.velocity", json!({"inSpeed": 0, "inInfluence": 85, "outSpeed": 0, "outInfluence": 35})).unwrap();
+    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).build_eframe(|_| EffectcraftApp::new(s));
+    h.run_steps(3);
+    open_graph(&mut h);
+    // 300 px in 1 s: the average speed is 300 px/s, so the peak is higher; the keys are at 0.
+    assert_framed(&h, uid, &[0, 1], 0.0, 300.0);
+}
