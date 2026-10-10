@@ -7,7 +7,7 @@ use effectcraft_project::styles::{self as st, GROUP};
 use effectcraft_project::{Comp, ItemId, ItemKind, Layer, LayerSource, MaskMode, Project, Solid};
 use effectcraft_time::{FrameRate, Tick};
 
-use crate::{render_frame, Image, NoFootage, RenderOpts, Renderer};
+use crate::{Image, NoFootage, RenderOpts, Renderer, render_frame};
 
 const NORMAL: u32 = 0;
 const MULTIPLY: u32 = 3;
