@@ -346,14 +346,14 @@ pub fn render_frame_reply(s: &Session, p: &Value, inline_default: bool) -> Resul
 
 fn render_frame_cmd(s: &mut Session, p: &Value) -> Result<Value> {
     if b_p(p, "wait") == Some(false) {
-        return in_background(s, "Render Frame", p, |w, p| render_frame_reply(w, p, false));
+        return in_background(s, "render.frame", "Render Frame", p, |w, p| render_frame_reply(w, p, false));
     }
     render_frame_reply(s, p, false)
 }
 
 fn contact_sheet_cmd(s: &mut Session, p: &Value) -> Result<Value> {
     if b_p(p, "wait") == Some(false) {
-        return in_background(s, "Render Contact Sheet", p, sheet::contact_sheet_reply);
+        return in_background(s, "render.contactSheet", "Render Contact Sheet", p, sheet::contact_sheet_reply);
     }
     sheet::contact_sheet_reply(s, p)
 }
@@ -362,12 +362,14 @@ fn contact_sheet_cmd(s: &mut Session, p: &Value) -> Result<Value> {
 /// reads (project, footage, expressions, GPU, layer cache, preferences, files) and copies the
 /// caller's cursor (its comp and time, also an agent's own), so the UI thread and other clients
 /// carry on meanwhile. Returns `{job}`; the task's result (quiet: no toast) is what the blocking
-/// command returns, and a control-channel request waits for it.
-fn in_background(s: &mut Session, label: &str, p: &Value, render: fn(&Session, &Value) -> Result<Value>) -> Result<Value> {
+/// command returns, and a control-channel request waits for it. A bad request (no such comp,
+/// item or layer, a bad time or region) fails up front, not in the task.
+fn in_background(s: &mut Session, cmd: &str, label: &str, p: &Value, render: fn(&Session, &Value) -> Result<Value>) -> Result<Value> {
     let mut p = p.clone();
     if let Some(o) = p.as_object_mut() {
         o.remove("wait");
     }
+    request(s, &p, cmd)?;
     let (project, services, footage, expr) = (s.project.clone(), s.services.clone(), s.footage.clone(), s.expr.clone());
     let (accel, layer_cache, prefs, state) = (s.accel.clone(), s.layer_cache.clone(), s.prefs.clone(), s.state.clone());
     s.spawn_task("render", label.to_string(), false, move |_ctl| {
