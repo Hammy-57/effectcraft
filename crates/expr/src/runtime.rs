@@ -1,7 +1,7 @@
 //! The per-thread boa runtime: one `Context` with the prelude loaded, a compiled-script cache,
 //! the native functions, and the request/miss bookkeeping (see [`crate::host`]).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::mem::ManuallyDrop;
 
@@ -18,12 +18,47 @@ const PENDING: &str = "\u{1}effectcraft: pending host request";
 const MAX_SCRIPTS: usize = 4096;
 /// The part of boa's stack-size limit error the runtime recovers from (see [`run`]).
 const STACK_LIMIT: &str = "maximum stack size";
+/// Loop iterations per call frame a script may run.
+const LOOP_LIMIT: u64 = 10_000_000;
+/// Loop iterations per call frame once a run is only collecting misses (see [`native_host`]).
+const SPECULATIVE_LOOP_LIMIT: u64 = 10_000;
+/// Misses one run collects before it stops.
+const MAX_MISSES: usize = 512;
+/// Nesting depth from which runs stop at their first miss again: stand-in answers can ask for
+/// things the script never reads, and inside a chain of expressions reading each other (a
+/// cycle, until [`crate::MAX_DEPTH`] stops it) that extra work would multiply per level.
+const SPECULATE_DEPTH: usize = 4;
+
+/// A memoized host answer, stamped with the last run that asked for it.
+pub struct Answer {
+    resp: Resp,
+    run: u32,
+}
 
 /// Memoized host answers and pending misses of one expression evaluation.
 #[derive(Default)]
 pub struct Frame {
-    pub memo: HashMap<Req, Resp>,
+    pub memo: HashMap<Req, Answer>,
     pub misses: Vec<Req>,
+    /// The requests the current run asked for (each once, in order). After the final run this
+    /// is exactly what the expression read, which its next evaluation prefetches.
+    pub used: Vec<Req>,
+    run: u32,
+    /// Whether a run carries on past a miss (see [`native_host`]).
+    speculate: bool,
+}
+
+impl Frame {
+    /// The frame of an evaluation nested `depth` levels deep.
+    pub fn new(depth: usize) -> Frame {
+        Frame { speculate: depth < SPECULATE_DEPTH, ..Frame::default() }
+    }
+    pub fn insert(&mut self, req: Req, resp: Resp) {
+        self.memo.insert(req, Answer { resp, run: 0 });
+    }
+    pub fn has(&self, req: &Req) -> bool {
+        self.memo.contains_key(req)
+    }
 }
 
 thread_local! {
@@ -32,6 +67,13 @@ thread_local! {
     static RUNTIME: RefCell<Option<ManuallyDrop<Result<Runtime, String>>>> = const { RefCell::new(None) };
     /// Evaluation stack (nested when one expression reads another's value).
     pub static FRAMES: RefCell<Vec<Frame>> = const { RefCell::new(Vec::new()) };
+    /// Script runs on this thread (for tests and perf readouts).
+    static RUNS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Script runs on this thread so far (each evaluation runs its script one or more times).
+pub fn runs() -> u64 {
+    RUNS.with(Cell::get)
 }
 
 struct Runtime {
@@ -117,7 +159,55 @@ fn to_js(r: &Resp, ctx: &mut Context) -> JsValue {
     }
 }
 
-/// `__h(op, …)`: answer a host request from the memo, or record a miss and abort.
+/// A stand-in answer for a request that isn't answered yet, shaped like the real one so the
+/// rest of the script keeps running and reports its other misses in the same run. Results of a
+/// run with misses are thrown away, so stand-ins never reach a result.
+fn placeholder(req: &Req) -> Resp {
+    let n = Resp::Num;
+    let s = |x: &str| Resp::Str(x.into());
+    // Ids that name nothing (`-1` reads back as `u64::MAX`), so follow-up requests answer null.
+    let none = n(-1.0);
+    let ident = |k: usize| Resp::List((0..k * k).map(|i| n(if i % (k + 1) == 0 { 1.0 } else { 0.0 })).collect());
+    match req {
+        Req::CompInfo { .. } => {
+            Resp::List(vec![s(""), n(100.0), n(100.0), n(1.0), n(1.0 / 30.0), n(0.0), n(1.0), n(0.0), Resp::List(vec![n(0.0), n(0.0), n(0.0), n(1.0)])])
+        }
+        Req::CompByName { .. } | Req::LayerLookup { .. } => none,
+        Req::LayerInfo { .. } => Resp::List(vec![
+            s(""),
+            n(1.0),
+            n(0.0),
+            n(1.0),
+            n(0.0),
+            n(100.0),
+            n(100.0),
+            Resp::Null,
+            Resp::Bool(true),
+            Resp::Bool(false),
+            s(""),
+            Resp::Bool(true),
+        ]),
+        Req::Child { .. } => Resp::List(vec![s("\u{1}"), Resp::Bool(true), s(""), s(""), n(0.0), n(1.0)]),
+        Req::PropInfo { .. } => Resp::List(vec![s(""), n(0.0), s("number"), n(1.0), n(0.0), Resp::Null, Resp::Bool(false), n(1.0), s("")]),
+        Req::Keys { .. } => Resp::List(vec![Resp::List(vec![]), Resp::List(vec![])]),
+        Req::Value { .. } => n(0.0),
+        Req::Xform { .. } => Resp::List(vec![ident(3), ident(3), ident(4), ident(4)]),
+        Req::SourceRect { .. } | Req::Sample { .. } => Resp::List(vec![n(0.0); 4]),
+        Req::Markers { .. } => Resp::List(vec![]),
+        Req::Project => Resp::List(vec![n(8.0), Resp::Bool(false), s("")]),
+        Req::Doc { .. } | Req::Footage { .. } | Req::FootageData { .. } => Resp::Null,
+    }
+}
+
+/// `__h(op, …)`: answer a host request from the memo, or record a miss.
+///
+/// A miss used to abort the run, so a script reading N things not yet known ran N+1 times (and
+/// loops over layers ran O(N²) work). Now the first miss switches the run to collecting: the
+/// miss gets a [`placeholder`] answer and the script carries on, recording every further miss,
+/// until it ends, fails, or reaches [`MAX_MISSES`] (which aborts as before). Loops are capped at
+/// [`SPECULATIVE_LOOP_LIMIT`] meanwhile, so a stand-in can't spin a loop for long. The run's
+/// result is discarded either way; the evaluator answers the misses and runs again. Evaluations
+/// nested [`SPECULATE_DEPTH`] deep abort at their first miss, as every run used to.
 fn native_host(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let op = num(args, 0, ctx)? as i64;
     let req = match op {
@@ -160,21 +250,31 @@ fn native_host(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsV
             t: secs(num(args, 8, ctx)?),
         },
         14 => Req::Project,
+        15 => Req::Keys { comp: id(args, 1, ctx)?, layer: id(args, 2, ctx)?, path: string(args, 3, ctx)? },
         _ => return Err(JsNativeError::typ().with_message("unknown host request").into()),
     };
     let found = FRAMES.with(|f| {
         let mut f = f.borrow_mut();
         let frame = f.last_mut()?;
-        match frame.memo.get(&req) {
-            Some(r) => Some(r.clone()),
-            None => {
-                frame.misses.push(req);
-                None
+        if let Some(a) = frame.memo.get_mut(&req) {
+            if a.run != frame.run {
+                a.run = frame.run;
+                frame.used.push(req);
             }
+            return Some(to_js(&a.resp, ctx));
         }
+        let stop = !frame.speculate || frame.misses.len() >= MAX_MISSES;
+        let stand_in = (!stop).then(|| to_js(&placeholder(&req), ctx));
+        if frame.misses.len() < MAX_MISSES && !frame.misses.contains(&req) {
+            frame.misses.push(req);
+        }
+        if stand_in.is_some() {
+            ctx.runtime_limits_mut().set_loop_iteration_limit(SPECULATIVE_LOOP_LIMIT);
+        }
+        stand_in
     });
     match found {
-        Some(r) => Ok(to_js(&r, ctx)),
+        Some(v) => Ok(v),
         None => Err(JsNativeError::error().with_message(PENDING).into()),
     }
 }
@@ -209,7 +309,7 @@ impl Runtime {
     fn new() -> Result<Runtime, String> {
         let mut ctx = Context::default();
         let limits = ctx.runtime_limits_mut();
-        limits.set_loop_iteration_limit(10_000_000);
+        limits.set_loop_iteration_limit(LOOP_LIMIT);
         limits.set_recursion_limit(400);
         let natives: [(JsString, usize, fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>); 4] = [
             (js_string!("__h"), 6, native_host),
@@ -254,6 +354,14 @@ impl Runtime {
             Err(e) => return Run::Done(Err(e)),
         };
         let ctx = &mut self.ctx;
+        ctx.runtime_limits_mut().set_loop_iteration_limit(LOOP_LIMIT);
+        FRAMES.with(|f| {
+            if let Some(fr) = f.borrow_mut().last_mut() {
+                fr.run = fr.run.wrapping_add(1).max(1);
+                fr.used.clear();
+            }
+        });
+        RUNS.with(|r| r.set(r.get().saturating_add(1)));
         let args = [
             JsValue::from(b.time),
             to_js(b.value, ctx),
