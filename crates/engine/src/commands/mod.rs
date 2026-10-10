@@ -8,6 +8,7 @@ mod anim_presets;
 pub mod anim_tools;
 mod animation;
 pub(crate) mod app_more;
+mod audio_cmds;
 mod autotrace;
 mod batch;
 mod camera_cmds;
@@ -219,6 +220,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(scripts::specs());
         v.extend(panels_cmds::specs());
         v.extend(layout_cmds::specs());
+        v.extend(audio_cmds::specs());
         v.extend(footage_panel::specs());
         v.extend(autotrace::specs());
         v.extend(scene_detect::specs());

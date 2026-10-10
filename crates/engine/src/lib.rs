@@ -10,6 +10,7 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod audio_analysis;
 pub mod autosave;
 pub mod camera_track;
 pub mod commands;
@@ -1321,6 +1322,8 @@ pub fn font_menu(prefs: &prefs::Prefs) -> Vec<FontRow> {
     out.extend(all.iter().map(|f| row(f, false)));
     out
 }
+#[cfg(test)]
+mod tests_audio_analysis;
 #[cfg(test)]
 mod tests_history;
 #[cfg(test)]
