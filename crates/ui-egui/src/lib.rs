@@ -1047,8 +1047,18 @@ impl EffectcraftApp {
             // background renders cannot be preempted by the priority queue.
             self.frames_parallelism().saturating_sub(1).min(2) as i64
         };
+        let ahead = ahead.min(self.frames_that_fit(&c, scale));
         let mut queued = self.frames.inflight();
         let series = self.frame_series(cid, scale);
+        // In-flight renders far ahead may finish after the near frames. Keep their completion
+        // from evicting the very frames playback needs next (#595).
+        self.frames.protect_frames(
+            series,
+            (0..ahead.max(2)).filter_map(|k| match plan {
+                Some(p) => p.frame_after(cur, k),
+                None => Some(wa + (cur.saturating_sub(wa).saturating_add(k)).rem_euclid(wb.saturating_sub(wa).saturating_add(1).max(1))),
+            }),
+        );
         if self.playback.caching
             && let Some(p) = plan
         {
