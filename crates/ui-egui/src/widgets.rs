@@ -570,3 +570,13 @@ pub fn popup_is_open(ui: &Ui, id: egui::Id) -> bool {
 pub fn open_popup(ui: &Ui, id: egui::Id) {
     ui.data_mut(|d| d.insert_temp(id.with("open"), true));
 }
+
+/// A selection marquee (a box dragged to select keys, layers, items, points): a faint fill and a
+/// 1 pt edge on whole physical pixels, so it stays crisp wherever the pointer is (a line at a
+/// fractional position blurs over two pixels).
+pub fn marquee(p: &egui::Painter, r: Rect, t: &Tokens) {
+    use egui::emath::GuiRounding;
+    let r = r.round_to_pixels(p.ctx().pixels_per_point());
+    p.rect_filled(r, 0.0, t.accent.gamma_multiply(0.12));
+    p.rect_stroke(r, 0.0, Stroke::new(1.0, t.accent), StrokeKind::Inside);
+}
