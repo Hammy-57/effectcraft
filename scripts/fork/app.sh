@@ -85,6 +85,13 @@ build() {
     return "$status"
 }
 
+# The Dock launcher (scripts/fork/launcher.swift) starts EffectCraft itself after the build, so it
+# keeps the launcher's privacy permissions: started by it, only build. (Launchers installed before
+# it passed --build-only ran this without it and got a second copy of the app.)
+case "$(ps -o comm= -p "$PPID" 2>/dev/null)" in
+*.app/Contents/MacOS/EffectCraft) set -- --build-only "$@" ;;
+esac
+
 if [ "${1:-}" = "--build-only" ]; then
     shift
     if stale; then build || exit 1; fi
