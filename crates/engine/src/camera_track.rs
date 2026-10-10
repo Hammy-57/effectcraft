@@ -115,10 +115,10 @@ pub(crate) fn is_tracker(g: &PropGroup) -> bool {
     matches!(&g.kind, GroupKind::Effect { effect } if effect == ct::ID)
 }
 
-fn str_of(g: &PropGroup, m: &str) -> String {
+fn str_of<'a>(g: &'a PropGroup, m: &str) -> &'a str {
     match g.prop(m).map(|p| &p.value) {
-        Some(Value::Str(s)) => s.clone(),
-        _ => String::new(),
+        Some(Value::Str(s)) => s,
+        _ => "",
     }
 }
 
@@ -151,15 +151,16 @@ fn clear(g: &mut PropGroup, all: bool) {
 
 /// Clear analyses that no longer match, after an edit: tracks made from other frames (and their
 /// solve), and solves made with other settings. Returns the trackers that need (re-)analysis:
-/// cleared ones and newly applied, unanalysed ones.
-pub(crate) fn invalidate(before: &Project, after: &mut Project) -> Vec<(ItemId, LayerId, Uid)> {
+/// cleared ones and newly applied, unanalysed ones. Layers the edit didn't touch are skipped
+/// unless `full` (see [`crate::warp::untouched`]).
+pub(crate) fn invalidate(before: &Project, after: &mut Project, full: bool) -> Vec<(ItemId, LayerId, Uid)> {
     let mut todo = vec![];
     let mut clears = vec![];
     for (cid, it) in &after.items {
         let ItemKind::Comp(c) = &it.kind else { continue };
-        for l in &c.layers {
+        for (i, l) in c.layers.iter().enumerate() {
             let Some(fx) = l.effects() else { continue };
-            if !fx.groups().any(is_tracker) {
+            if !fx.groups().any(is_tracker) || crate::warp::untouched(before, after, *cid, i, l, full) {
                 continue;
             }
             let old_layer = before.comp(*cid).and_then(|bc| bc.layer(l.id));
