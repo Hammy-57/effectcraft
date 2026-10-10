@@ -366,14 +366,22 @@ fn release(s: &mut Session, p: &Value) -> Result<Value> {
                 && let Some(c) = s.claims.get(cid)
                 && c.owner != client
             {
-                return Err(bad(C, format!("composition \"{}\" is claimed by {}, not by {client}; only its owner (or the user, with `force`) can release it", comp_name(&s.project, cid), c.owner)));
+                return Err(bad(
+                    C,
+                    format!(
+                        "composition \"{}\" is claimed by {}, not by {client}; only its owner (or the user, with `force`) can release it",
+                        comp_name(&s.project, cid),
+                        c.owner
+                    ),
+                ));
             }
             let ids = s.claims.release(&client, comp);
             Ok(names(s, ids.into_iter().map(|id| (id, client.clone())).collect()))
         }
         None if !force => Err(bad(C, "without a `client` this releases other clients' claims: pass `force: true` to do that (agents pass their `client`)")),
         None => {
-            let ids: Vec<(ItemId, String)> = s.claims.map.iter().filter(|(id, _)| comp.is_none_or(|c| c == **id)).map(|(id, c)| (*id, c.owner.clone())).collect();
+            let ids: Vec<(ItemId, String)> =
+                s.claims.map.iter().filter(|(id, _)| comp.is_none_or(|c| c == **id)).map(|(id, c)| (*id, c.owner.clone())).collect();
             for (id, _) in &ids {
                 s.claims.map.remove(id);
             }
