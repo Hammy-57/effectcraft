@@ -56,6 +56,8 @@ pub struct GpuImage {
     pub texture: wgpu::Texture,
     pub width: u32,
     pub height: u32,
+    /// The texture's default view, made once (kernels bind it on every dispatch).
+    pub(crate) view: wgpu::TextureView,
     _lease: Option<Arc<Lease>>,
     /// Already clamped and quantised to this many levels (8/16 bpc), so quantising again is a
     /// no-op (see `ops::quantize`).
@@ -65,7 +67,8 @@ pub struct GpuImage {
 impl GpuImage {
     /// An image on a texture of its own (not pooled).
     pub fn new(texture: wgpu::Texture, width: u32, height: u32) -> GpuImage {
-        GpuImage { texture, width, height, _lease: None, levels: None }
+        let view = texture.create_view(&Default::default());
+        GpuImage { texture, width, height, view, _lease: None, levels: None }
     }
 }
 
@@ -212,6 +215,15 @@ impl Pool {
     }
 }
 
+/// Bytes of a [`Params`] block.
+const PARAMS_SIZE: u64 = 256;
+
+/// [`Params`] blocks per uniform ring: one per dispatch until [`Enc::dispatch_ext`] submits.
+const RING_SLOTS: usize = 256;
+
+/// Uniform rings kept for reuse once their [`Enc`] is dropped, at most.
+const RINGS_KEPT: usize = 8;
+
 /// Uniform parameter block shared by every kernel (see `shaders/common.wgsl`).
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Params {
@@ -284,9 +296,13 @@ pub struct GpuContext {
     display: wgpu::ComputePipeline,
     /// The display texture's next mip level from the one above (`display.wgsl` `mip`).
     display_mip: wgpu::ComputePipeline,
-    dummy: wgpu::Texture,
-    dummy_tex: wgpu::TextureView,
+    /// A 1 × 1 image bound where a kernel reads no image.
+    dummy: GpuImage,
     dummy_buf: wgpu::Buffer,
+    /// Bytes between the [`Params`] blocks of a uniform ring ([`Enc::dispatch_ext`]).
+    uniform_stride: u64,
+    /// Uniform rings no [`Enc`] holds (reused: see [`Enc::dispatch_ext`]).
+    uniforms: Mutex<Vec<wgpu::Buffer>>,
     uploads: Mutex<Uploads>,
     pool: Arc<Mutex<Pool>>,
     /// CPU ↔ GPU traffic (diagnostics: `bench --gpu`).
@@ -574,6 +590,9 @@ impl GpuContext {
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("dummy"), contents: &[0u8; 16], usage: wgpu::BufferUsages::STORAGE })
         })?;
         let dummy_tex = init_resource(&device, "dummy texture view", || dummy.create_view(&Default::default()))?;
+        let dummy = GpuImage { texture: dummy, width: 1, height: 1, view: dummy_tex, _lease: None, levels: None };
+        let align = u64::from(device.limits().min_uniform_buffer_offset_alignment.max(1));
+        let uniform_stride = PARAMS_SIZE.div_ceil(align).saturating_mul(align);
         let max_dim = device.limits().max_texture_dimension_2d;
         Ok(GpuContext {
             device,
@@ -586,9 +605,10 @@ impl GpuContext {
             display_bgl,
             display,
             display_mip,
-            dummy_tex,
             dummy,
             dummy_buf,
+            uniform_stride,
+            uniforms: Default::default(),
             uploads: Mutex::new(Uploads::default()),
             pool: Default::default(),
             staging: Default::default(),
@@ -842,7 +862,8 @@ impl GpuContext {
         let was_reused = reused.is_some();
         let texture = reused.unwrap_or_else(|| self.texture(w, h));
         let lease = Arc::new(Lease { texture: texture.clone(), pool: Arc::downgrade(&self.pool) });
-        (GpuImage { texture, width: w, height: h, _lease: Some(lease), levels: None }, was_reused)
+        let view = texture.create_view(&Default::default());
+        (GpuImage { texture, width: w, height: h, view, _lease: Some(lease), levels: None }, was_reused)
     }
 
     /// Uploads and readbacks so far (images; uploads of cached layers count once).
@@ -948,6 +969,8 @@ pub(crate) struct Enc<'g> {
     pending: usize,
     /// The latest submission (readbacks wait for it, not for every worker's GPU work).
     submitted: Option<wgpu::SubmissionIndex>,
+    /// This encoder's uniform ring (see [`Enc::dispatch_ext`]).
+    ring: Option<wgpu::Buffer>,
 }
 
 impl Drop for Enc<'_> {
@@ -958,12 +981,18 @@ impl Drop for Enc<'_> {
         {
             p.close(id);
         }
+        if let Some(ring) = self.ring.take()
+            && let Ok(mut u) = self.g.uniforms.lock()
+            && u.len() < RINGS_KEPT
+        {
+            u.push(ring);
+        }
     }
 }
 
 impl<'g> Enc<'g> {
     pub fn new(g: &'g GpuContext) -> Enc<'g> {
-        Enc { g, enc: None, pending: 0, submitted: None }
+        Enc { g, enc: None, pending: 0, submitted: None, ring: None }
     }
 
     pub(crate) fn encoder(&mut self) -> &mut wgpu::CommandEncoder {
@@ -1010,7 +1039,7 @@ impl<'g> Enc<'g> {
     fn fill(&mut self, img: &GpuImage, v: f32) {
         let mut p = Params::default();
         p.f[0] = [v; 4];
-        let dummy = GpuImage::new(self.g.dummy.clone(), 1, 1);
+        let dummy = self.g.dummy.clone();
         self.pixels("fill", &p, &dummy, None, img, None);
     }
 
@@ -1046,18 +1075,35 @@ impl<'g> Enc<'g> {
             log::error!("gpu: no kernel {entry}");
             return;
         };
-        let ub = g.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: &p.bytes(), usage: wgpu::BufferUsages::UNIFORM });
-        let sv = src.texture.create_view(&Default::default());
-        let av = aux.map(|a| a.texture.create_view(&Default::default()));
-        let ov = out.texture.create_view(&Default::default());
+        // Each dispatch until the next submit gets its own block of the encoder's uniform ring.
+        // `write_buffer` lands before the next submission's commands and after earlier
+        // submissions', so a ring is reused (after a submit, or by a later encoder) safely.
+        if self.pending >= RING_SLOTS {
+            self.submit();
+        }
+        let offset = (self.pending as u64).saturating_mul(g.uniform_stride);
+        let ring = self.ring.get_or_insert_with(|| {
+            g.uniforms.lock().ok().and_then(|mut u| u.pop()).unwrap_or_else(|| {
+                g.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("params"),
+                    size: g.uniform_stride.saturating_mul(RING_SLOTS as u64),
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            })
+        });
+        g.queue.write_buffer(ring, offset, &p.bytes());
         let bg = g.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &g.bgl,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: ub.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&sv) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(av.as_ref().unwrap_or(&g.dummy_tex)) },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&ov) },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: ring, offset, size: wgpu::BufferSize::new(PARAMS_SIZE) }),
+                },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&src.view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(aux.map_or(&g.dummy.view, |a| &a.view)) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&out.view) },
                 wgpu::BindGroupEntry { binding: 4, resource: data.unwrap_or(&g.dummy_buf).as_entire_binding() },
             ],
         });
@@ -1323,7 +1369,7 @@ impl<'g> Enc<'g> {
         });
         let level = |l: u32| tex.create_view(&wgpu::TextureViewDescriptor { base_mip_level: l, mip_level_count: Some(1), ..Default::default() });
         // Level 0 from the frame, then each level the 2 × 2 mean of the one above.
-        let mut steps = vec![(&g.display, img.texture.create_view(&Default::default()), level(0), img.width, img.height)];
+        let mut steps = vec![(&g.display, img.view.clone(), level(0), img.width, img.height)];
         for l in 1..levels {
             steps.push((&g.display_mip, level(l - 1), level(l), (img.width >> l).max(1), (img.height >> l).max(1)));
         }
@@ -1371,6 +1417,36 @@ mod upload_budget_tests {
         assert_eq!(bytemuck::cast_slice::<_, u8>(&down.data), bytemuck::cast_slice::<_, u8>(&img.data));
         let bytes = e.read_texture(&up.texture, w, h, 16).unwrap();
         assert_eq!(bytes, bytemuck::cast_slice::<_, u8>(&img.data));
+    }
+
+    /// Every dispatch reads its own uniform ring slot, also across the automatic submit after
+    /// [`RING_SLOTS`] dispatches and when a dropped encoder's ring is reused.
+    #[test]
+    fn uniform_ring_slots_keep_each_dispatch_params() {
+        crate::tests::hold_gpu_lock();
+        let Some(g) = GpuContext::headless() else { return };
+        for _ in 0..2 {
+            let mut e = Enc::new(&g);
+            let n = RING_SLOTS + 44;
+            let imgs: Vec<GpuImage> = (0..n)
+                .map(|i| {
+                    let img = GpuImage::new(g.texture(2, 2), 2, 2);
+                    e.fill(&img, i as f32);
+                    img
+                })
+                .collect();
+            for (i, img) in imgs.iter().enumerate() {
+                let px = e.download(img).unwrap();
+                assert!(px.data.iter().all(|p| *p == [i as f32; 4]), "dispatch {i}: {:?}", px.data);
+            }
+        }
+        assert!(g.uniforms.lock().unwrap().len() <= RINGS_KEPT);
+    }
+
+    /// A [`Params`] block fills exactly one uniform ring slot's binding.
+    #[test]
+    fn params_fill_one_ring_slot() {
+        assert_eq!(Params::default().bytes().len() as u64, PARAMS_SIZE);
     }
 
     fn buf(w: u32) -> Arc<Buf> {
