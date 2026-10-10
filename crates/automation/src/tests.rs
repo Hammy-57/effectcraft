@@ -1501,6 +1501,33 @@ fn subscriptions_notify_after_edits_not_queries() {
     assert_eq!(lines[4]["id"], 4);
 }
 
+/// A retried tool call with the same request id returns the first result and doesn't run again
+/// (no duplicate comp, no second change notification); `request_id` is not an unknown argument.
+#[test]
+fn a_repeated_request_id_runs_once() {
+    let mut s = server();
+    let revision = |s: &mut McpServer| s.backend().session().unwrap().revision;
+    rpc(&mut s, 1, "resources/subscribe", json!({"uri": "effectcraft://document"}));
+    let call = json!({"name": "command_run", "arguments": {"id": "comp.new", "params": {"name": "Dup"}}, "_meta": {"requestId": "agent-1"}});
+    let first = rpc(&mut s, 2, "tools/call", call.clone());
+    assert_eq!(first["isError"], false, "{first}");
+    assert_eq!(updated(&mut s), ["effectcraft://document"]);
+    let rev = revision(&mut s);
+    assert_eq!(rpc(&mut s, 3, "tools/call", call), first);
+    assert_eq!(revision(&mut s), rev, "the retry must not run");
+    assert!(updated(&mut s).is_empty());
+
+    let call = json!({"name": "command_run", "arguments": {"id": "comp.new", "params": {}, "request_id": "agent-2"}});
+    let first = rpc(&mut s, 4, "tools/call", call.clone());
+    assert_eq!(first["isError"], false, "{first}");
+    let rev = revision(&mut s);
+    assert_eq!(rpc(&mut s, 5, "tools/call", call), first);
+    assert_eq!(revision(&mut s), rev);
+    // Another id runs.
+    rpc(&mut s, 6, "tools/call", json!({"name": "command_run", "arguments": {"id": "comp.new", "params": {}, "request_id": "agent-3"}}));
+    assert!(revision(&mut s) > rev);
+}
+
 /// `notifications/message`: new expression errors after an edit and missing footage after
 /// open_project are warnings, toasts are info; `logging/setLevel` filters them.
 #[test]

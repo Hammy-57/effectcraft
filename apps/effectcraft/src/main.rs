@@ -212,7 +212,19 @@ fn main() -> eframe::Result {
                 let (tx, rx) = std::sync::mpsc::channel();
                 if let Some(port) = listen_port {
                     disable_app_nap();
-                    control_server::start(port, cc.egui_ctx.clone(), tx.clone());
+                    match control_server::start(port, cc.egui_ctx.clone(), tx.clone()) {
+                        Ok(started) => {
+                            eprintln!("effectcraft: control server listening on 127.0.0.1:{}", started.port);
+                            app = app.with_control_events(started.events);
+                        }
+                        // Another app (often a second EffectCraft) holds the port: say so in the
+                        // window, or an agent's `--bridge` silently drives the other app.
+                        Err(e) => {
+                            eprintln!("effectcraft: {e}");
+                            log::error!("{e}");
+                            app.ui.status = e;
+                        }
+                    }
                 }
                 if figma_bridge {
                     figma_host::start(tx, cc.egui_ctx.clone());

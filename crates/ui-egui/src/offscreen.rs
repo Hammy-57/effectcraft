@@ -293,7 +293,7 @@ impl Ui {
     }
 
     fn serve(&mut self, req: ControlRequest) {
-        let ControlRequest { method, params, reply } = req;
+        let ControlRequest { method, params, reply, .. } = req;
         let v = catch_unwind(AssertUnwindSafe(|| self.request(&method, params)))
             .unwrap_or_else(|p| json!({"ok": false, "error": format!("internal error in the offscreen UI: {}", panic_message(&*p))}));
         let _ = reply.send(v);

@@ -233,7 +233,12 @@ pub struct EffectcraftApp {
     /// Control requests waiting for an offloaded job (`wait: true` in the browser).
     pub(crate) job_waiters: Vec<(control::JobWaiter, Sender<serde_json::Value>)>,
     queued_screenshots: Vec<(u64, f64, u32)>,
-    pending_screenshots: Vec<(u64, Option<String>, Option<[f32; 4]>, Sender<serde_json::Value>, f64)>,
+    /// (token, path, crop, max_side, reply, deadline)
+    pending_screenshots: Vec<(u64, Option<String>, Option<[f32; 4]>, u32, Sender<serde_json::Value>, f64)>,
+    /// `events.subscribe` connections (desktop control server).
+    control_events: Option<control::ControlEvents>,
+    /// (time, revision, selected layers) last published to [`Self::control_events`].
+    events_sent: (f64, u64, Vec<effectcraft_engine::project::LayerId>),
     next_token: u64,
     pub(crate) last_ui_time: f64,
     /// When the user last did something (input or an edit): Cache Frames When Idle waits for
@@ -322,6 +327,8 @@ impl EffectcraftApp {
             job_waiters: vec![],
             queued_screenshots: vec![],
             pending_screenshots: vec![],
+            control_events: None,
+            events_sent: (f64::NEG_INFINITY, 0, vec![]),
             next_token: 1,
             last_ui_time: 0.0,
             last_activity: (0.0, 0),
@@ -409,6 +416,14 @@ impl EffectcraftApp {
 
     pub fn with_control(mut self, rx: Receiver<ControlRequest>) -> Self {
         self.control_rx = Some(rx);
+        self
+    }
+
+    /// Publish change events to the control channel's `events.subscribe` connections.
+    pub fn with_control_events(mut self, events: control::ControlEvents) -> Self {
+        self.events_sent = (f64::NEG_INFINITY, self.session.revision, self.session.state.selected_layers.clone());
+        events.set_revision(self.session.revision);
+        self.control_events = Some(events);
         self
     }
 
@@ -1270,6 +1285,10 @@ impl EffectcraftApp {
             reqs.push((req, now + 3.0));
         }
         for (req, deadline) in reqs {
+            // The transport gave up on it (timed out) and told the client it didn't run.
+            if !req.state.start() {
+                continue;
+            }
             let reply = req.reply.clone();
             match control::handle(self, ctx, &req) {
                 control::Outcome::Done(v) => {
@@ -1290,7 +1309,7 @@ impl EffectcraftApp {
                     self.job_waiters.push((w, reply));
                     ctx.request_repaint();
                 }
-                control::Outcome::Screenshot { path, crop } => {
+                control::Outcome::Screenshot { path, crop, max_side } => {
                     // A covered or minimized window presents no frames (macOS skips its redraws), so
                     // a screenshot would never arrive and nothing would tick its timeout.
                     if ctx.input(|i| i.viewport().occluded == Some(true) || i.viewport().minimized == Some(true)) {
@@ -1301,12 +1320,42 @@ impl EffectcraftApp {
                     self.next_token += 1;
                     let settle = now + 0.35;
                     self.queued_screenshots.push((token, settle, 0));
-                    self.pending_screenshots.push((token, path, crop, reply, settle + SCREENSHOT_TIMEOUT_S));
+                    self.pending_screenshots.push((token, path, crop, max_side, reply, settle + SCREENSHOT_TIMEOUT_S));
                 }
             }
         }
         self.control_rx = Some(rx);
         self.finish_job_waiters(ctx);
+    }
+
+    /// Tell `events.subscribe` connections that the project (revision) or the layer selection
+    /// changed: one `project.changed` / `selection.changed` line per change, at most ten bursts a
+    /// second (later changes wait for the next slot and are coalesced).
+    fn publish_control_events(&mut self, ctx: &egui::Context) {
+        let Some(events) = &self.control_events else { return };
+        let revision = self.session.revision;
+        events.set_revision(revision);
+        let selection = &self.session.state.selected_layers;
+        let (project, selected) = (revision != self.events_sent.1, *selection != self.events_sent.2);
+        if !project && !selected {
+            return;
+        }
+        let now = ctx.input(|i| i.time);
+        if events.subscribers() > 0 {
+            let wait = self.events_sent.0 + 0.1 - now;
+            if wait > 0.0 {
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait));
+                return;
+            }
+            if project {
+                events.publish(&json!({"event": "project.changed", "revision": revision}));
+            }
+            if selected {
+                let layers: Vec<u64> = selection.iter().map(|l| l.0).collect();
+                events.publish(&json!({"event": "selection.changed", "revision": revision, "layers": layers}));
+            }
+        }
+        self.events_sent = (now, revision, selection.clone());
     }
 
     /// Reply to the control requests whose offloaded jobs ended.
@@ -1379,8 +1428,8 @@ impl EffectcraftApp {
         });
         for (token, image) in events {
             if let Some(i) = self.pending_screenshots.iter().position(|(t, ..)| *t == token) {
-                let (_, path, crop, reply, _) = self.pending_screenshots.remove(i);
-                let r = control::save_screenshot(ctx, &image, path.as_deref(), crop);
+                let (_, path, crop, max_side, reply, _) = self.pending_screenshots.remove(i);
+                let r = control::save_screenshot(ctx, &image, path.as_deref(), crop, max_side);
                 let _ = reply.send(r);
             }
         }
@@ -1618,6 +1667,7 @@ impl eframe::App for EffectcraftApp {
         }
         self.last_time = now;
         self.drain_control(ctx);
+        self.publish_control_events(ctx);
         if !self.synthetic.is_empty() {
             ctx.request_repaint();
         } else if !self.input_waiters.is_empty() {
@@ -1653,6 +1703,8 @@ impl eframe::App for EffectcraftApp {
         if self.frames.inflight() > 0 {
             ctx.request_repaint_after(std::time::Duration::from_millis(30));
         }
+        // Edits made by this frame's input.
+        self.publish_control_events(&ctx);
     }
 }
 
