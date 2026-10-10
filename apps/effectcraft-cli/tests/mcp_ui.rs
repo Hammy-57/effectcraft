@@ -3,6 +3,7 @@
 #![cfg(feature = "ui")]
 
 use std::io::{BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 
 use effectcraft_automation::{base64, png_size};
@@ -17,14 +18,16 @@ struct Server {
 impl Server {
     /// Start `mcp --ui …` and initialize it; `None` (skip) when no GPU adapter is usable.
     fn start(args: &[&str]) -> Option<(Self, Value)> {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_effectcraft-cli"))
-            .args(["mcp", "--ui"])
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+        Self::start_in(args, None)
+    }
+
+    /// [`Server::start`] with `EFFECTCRAFT_CONFIG_DIR` set to `config`.
+    fn start_in(args: &[&str], config: Option<&Path>) -> Option<(Self, Value)> {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_effectcraft-cli"));
+        if let Some(dir) = config {
+            cmd.env("EFFECTCRAFT_CONFIG_DIR", dir);
+        }
+        let mut child = cmd.args(["mcp", "--ui"]).args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
         let output = BufReader::new(child.stdout.take().unwrap());
         let mut s = Server { child, output, next_id: 1 };
         match s.try_rpc("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}})) {
@@ -68,6 +71,12 @@ impl Server {
     fn json(&mut self, name: &str, arguments: Value) -> Value {
         let c = self.call(name, arguments);
         serde_json::from_str(c[0]["text"].as_str().unwrap()).unwrap()
+    }
+
+    /// Close stdin and wait for the server to exit.
+    fn finish(mut self) -> std::process::ExitStatus {
+        drop(self.child.stdin.take());
+        self.child.wait().unwrap()
     }
 }
 
@@ -131,14 +140,41 @@ fn ui_tools_work_offscreen() {
 #[test]
 fn ui_options_are_checked() {
     let bin = env!("CARGO_BIN_EXE_effectcraft-cli");
-    for args in [
-        &["info", "--ui"][..],
-        &["mcp", "--ui", "--bridge", "9877"],
-        &["mcp", "--ui", "--autosave"],
-        &["mcp", "--ui-size", "800x600"],
-        &["mcp", "--ui", "--ui-scale", "9"],
-    ] {
+    for args in [&["info", "--ui"][..], &["mcp", "--ui", "--bridge", "9877"], &["mcp", "--ui-size", "800x600"], &["mcp", "--ui", "--ui-scale", "9"]] {
         let out = Command::new(bin).args(args).stdin(Stdio::null()).output().unwrap();
         assert_eq!(out.status.code(), Some(2), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
     }
+}
+
+/// `mcp --ui --autosave`: an edit made through the offscreen app is checkpointed (in the MCP
+/// auto-save folder, before the reply) like headless work, and EOF ends the session's manifest.
+#[test]
+fn ui_autosave_checkpoints_the_offscreen_app() {
+    let dir = std::env::temp_dir().join(format!("ec-mcp-ui-autosave-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let Some((mut s, init)) = Server::start_in(&["--autosave", "--ui-scale", "1"], Some(&dir)) else { return };
+    let status = &init["_meta"]["effectcraftAutoSave"];
+    assert_eq!(status["enabled"], true, "{init}");
+    let folder = PathBuf::from(status["folder"].as_str().unwrap());
+    assert!(folder.starts_with(dir.join("EffectCraft Auto-Save").join("MCP")), "{folder:?}");
+    assert_eq!(status["latestPath"], Value::Null);
+
+    // An edit through the app's control channel is on disk when its reply arrives.
+    let r = s.rpc("tools/call", json!({"name": "command_run", "arguments": {"id": "comp.new", "params": {"name": "Saved Comp"}}}));
+    assert_eq!(r["isError"], false, "{r}");
+    let saved = r["_meta"]["effectcraftAutoSave"]["latestPath"].as_str().unwrap_or_else(|| panic!("no checkpoint: {r}")).to_string();
+    assert!(Path::new(&saved).starts_with(&folder) && Path::new(&saved).is_file(), "{saved}");
+    assert!(std::fs::read_to_string(&saved).unwrap().contains("Saved Comp"));
+    let manifest: Value = serde_json::from_str(&std::fs::read_to_string(folder.join("session.json")).unwrap()).unwrap();
+    assert_eq!(manifest["autosave"], saved.as_str());
+    assert_eq!((manifest["dirty"].as_bool(), manifest["ended"].as_bool()), (Some(true), Some(false)), "{manifest}");
+    // A query reports it too and doesn't write another version.
+    assert_eq!(s.json("doc_inspect", json!({}))["project"]["autosave"]["latestPath"], saved.as_str());
+
+    assert!(s.finish().success());
+    let manifest: Value = serde_json::from_str(&std::fs::read_to_string(folder.join("session.json")).unwrap()).unwrap();
+    assert_eq!(manifest["ended"], true, "{manifest}");
+    assert_eq!(std::fs::read_dir(&folder).unwrap().count(), 2, "one checkpoint and the manifest");
+    let _ = std::fs::remove_dir_all(&dir);
 }

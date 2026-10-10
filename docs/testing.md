@@ -85,7 +85,9 @@ cargo run -p effectcraft-ui-egui --example snapshot -- --out ui.png \
 ```
 
 Each `--step` is a control-channel request; `{"method":"snap","params":{"path":"x.png"}}` writes an
-intermediate image.
+intermediate image and `{"method":"pointer","params":{"x":…,"y":…,"click":true}}` clicks (or
+`"down"` / `"up"` for a drag in steps). It runs the same offscreen app as `effectcraft-cli mcp --ui`
+(`effectcraft_ui_egui::offscreen`).
 
 ## Benchmarks
 

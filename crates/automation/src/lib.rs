@@ -30,7 +30,7 @@ pub mod server;
 pub mod tools;
 
 pub use backend::{Backend, Frame};
-pub use bridge::{BridgeClient, ControlTransport};
+pub use bridge::{BridgeClient, ControlTransport, SessionJob};
 pub use effectcraft_engine::Session;
 pub use server::McpServer;
 

@@ -52,7 +52,8 @@ Desktop, Cursor and the like) take the same `command` and `args`.
   can run side by side. `--ui-size 1680x1020` (points) and `--ui-scale 2` (screenshot pixels per
   point) set the window. It needs a GPU adapter (startup says which; without one it exits with the
   reason). `initialize` answers at once; the first tool call waits for the app's first frames
-  (about a second, longer while Metal/Vulkan compiles the GPU compositor's shaders on a cold cache). Work is in memory: `save_project` it (no `--autosave`).
+  (about a second, longer while Metal/Vulkan compiles the GPU compositor's shaders on a cold cache). Work is in memory until you
+  `save_project` it; add `"--autosave"` (`["mcp", "--ui", "--autosave"]`) for the checkpoints below.
   Built with the CLI's default `ui` feature (`--no-default-features` drops it).
 - **Bridge** (`["mcp", "--bridge", "9877"]`): drives a running `effectcraft --control 9877`, so you
   see every change live. Bridge mode adds `screenshot` and the `ui_*` tools.
@@ -63,8 +64,10 @@ resource templates with subscriptions, workflow prompts and logging; see [MCP co
 
 ### Keeping headless work across restarts
 
-Start `effectcraft-cli mcp --autosave` (MCP args `["mcp", "--autosave"]`) to preserve
-unsaved headless work. Each tool call that changes a dirty project writes a checkpoint before
+Start `effectcraft-cli mcp --autosave` (MCP args `["mcp", "--autosave"]`, or
+`["mcp", "--ui", "--autosave"]` for the offscreen app) to preserve unsaved headless work. With
+`--ui` the app's project is checkpointed on its UI thread, between frames, with the same folder,
+rules and metadata as below. Each tool call that changes a dirty project writes a checkpoint before
 its reply is sent, so even killing the server after that reply leaves the work on disk. EOF
 and transport errors also flush outstanding changes. Queries do not rotate the saved versions.
 A failed checkpoint adds a warning to the tool reply; the edit remains in memory and the next
@@ -84,8 +87,8 @@ Recover explicitly with `open_project {"path":"<checkpoint .ecproj>"}`, then
 opened automatically. Replacing a dirty project with `open_project` or `file.newProject` discards
 it intentionally; save it first. The metadata describes the current project in each session.
 
-Without `--autosave`, headless work is in memory until explicitly saved. The flag is headless
-only; a bridged desktop app owns its auto-saves. An edit interrupted before its reply is received
+Without `--autosave`, headless work is in memory until explicitly saved. The flag is for a
+project in the server's process (headless or `--ui`); a bridged desktop app owns its auto-saves. An edit interrupted before its reply is received
 may be absent from the last checkpoint.
 
 See [MCP conventions](mcp.md) for core tools, resources, strict arguments, and progress/cancellation of long calls (renders, analyses with `wait: true`, `jobs.wait`, scripts).
