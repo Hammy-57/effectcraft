@@ -192,6 +192,15 @@ impl Packed {
     }
 }
 
+impl effectcraft_render::FramePixels for Packed {
+    fn size(&self) -> (u32, u32) {
+        Packed::size(self)
+    }
+    fn rows(&self, y0: usize, out: &mut [Px]) {
+        Packed::rows(self, y0, out);
+    }
+}
+
 /// A still decoded by the `image` crate, kept packed (8 / 16-bit) or as float pixels.
 pub(crate) fn pack_dynamic(img: image::DynamicImage, op: AlphaOp) -> std::result::Result<Image, Packed> {
     use image::DynamicImage as D;

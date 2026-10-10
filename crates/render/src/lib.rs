@@ -30,7 +30,10 @@ pub use auto::{AutoKey, AutoPick};
 pub use cache::{CacheStats, LayerCache, LayerStore, PrefetchStore};
 pub use effectcraft_raster::Image;
 pub use eval::{EvalCtx, ExprHost, effect_bounds, source_size};
-pub use footage::{FootageSource, NoFootage, blend_frames, field_frame, frame_position, interpret_pixels, is_vector_footage};
+pub use footage::{
+    FootageFrame, FootageSource, FramePixels, NoFootage, SharedFrame, blend_frames, field_frame, frame_position, interpret_pixels, is_vector_footage,
+    preview_size,
+};
 pub(crate) use fx::comp_scene;
 pub use layer_buf::StyledLayer;
 pub use motion_blur::adaptive_samples;

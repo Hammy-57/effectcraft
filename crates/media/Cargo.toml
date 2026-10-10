@@ -33,4 +33,5 @@ thiserror = { workspace = true }
 log = { workspace = true }
 
 [dev-dependencies]
+effectcraft-color = { workspace = true }
 effectcraft-av1enc = { workspace = true }

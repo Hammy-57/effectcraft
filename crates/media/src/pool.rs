@@ -6,7 +6,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use effectcraft_project::{AlphaMode, Footage, FootageKind, ItemId};
 use effectcraft_raster::{Image, Px};
-use effectcraft_render::FootageSource;
+use effectcraft_render::{FootageFrame, FootageSource, SharedFrame, preview_size};
 use effectcraft_time::{FrameRate, TICKS_PER_SECOND, Tick};
 use filmcraft_media::{FrameRequest, SharedSource};
 
@@ -42,6 +42,16 @@ struct Key {
     interp: u8,
     matte: [u32; 3],
     crop: Option<[u64; 4]>,
+    /// The preview size a frame is resampled to (reduced-resolution previews).
+    preview: Option<[u32; 2]>,
+}
+
+/// A layer drawn at reduced resolution: its nominal size `w`×`h` at render scale `s` (< 0.75).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Preview {
+    w: u32,
+    h: u32,
+    s: f64,
 }
 
 /// A cached frame: float pixels, or the decoder's samples converted on use (8-bit 4:2:0 video
@@ -50,21 +60,30 @@ struct Key {
 pub(crate) enum Pixels {
     Float(Arc<Image>),
     Packed(Arc<Packed>),
+    /// Resampled to the preview size its key names, as the renderer would.
+    Preview(Arc<Image>),
 }
 
 impl Pixels {
     /// Bytes held (what the cache budget counts).
     fn bytes(&self) -> usize {
         64 + match self {
-            Pixels::Float(img) => img.data.len() * std::mem::size_of::<Px>(),
+            Pixels::Float(img) | Pixels::Preview(img) => img.data.len() * std::mem::size_of::<Px>(),
             Pixels::Packed(p) => p.bytes(),
         }
     }
     /// The frame as compositor pixels (a packed frame is converted now).
     pub(crate) fn image(&self) -> Arc<Image> {
         match self {
-            Pixels::Float(img) => img.clone(),
+            Pixels::Float(img) | Pixels::Preview(img) => img.clone(),
             Pixels::Packed(p) => Arc::new(p.to_image()),
+        }
+    }
+    /// The frame for the renderer to convert into its own buffer.
+    fn shared(&self) -> SharedFrame {
+        match self {
+            Pixels::Float(img) | Pixels::Preview(img) => img.clone(),
+            Pixels::Packed(p) => p.clone(),
         }
     }
 }
@@ -294,6 +313,8 @@ struct Loc {
     key: Key,
     /// Media time for movies (`None`: an image file, `key.path`).
     media_t: Option<Tick>,
+    /// Resampled for a reduced-resolution preview (`key.preview` is its size).
+    preview: Option<Preview>,
 }
 
 /// Removes an in-flight key and wakes waiters, also when decoding panics.
@@ -667,14 +688,14 @@ impl Inner {
         let interp = alpha | (u8::from(footage.preserve_rgb) << 2);
         let matte = if footage.alpha == AlphaMode::Premultiplied { footage.premul_color.map(f32::to_bits) } else { [0; 3] };
         let crop = footage.layer.as_ref().and_then(|l| l.crop_bounds).map(|b| b.map(f64::to_bits));
-        let key = |path: &str, frame| Key { path: path.into(), frame, interp, matte, crop };
+        let key = |path: &str, frame| Key { path: path.into(), frame, interp, matte, crop, preview: None };
         match footage.kind {
             FootageKind::Sequence if !footage.sequence.is_empty() => {
                 let i = Self::frame_index(footage.frame_rate, t, footage.sequence_frames(), footage.loop_count);
                 match footage.sequence_file(i) {
-                    Some(path) => Loc { key: key(path, 0), media_t: None },
+                    Some(path) => Loc { key: key(path, 0), media_t: None, preview: None },
                     // A gap in the numbering: colour bars, as in After Effects.
-                    None => Loc { key: key(PLACEHOLDER, ((footage.width as i64) << 32) | footage.height as i64), media_t: None },
+                    None => Loc { key: key(PLACEHOLDER, ((footage.width as i64) << 32) | footage.height as i64), media_t: None, preview: None },
                 }
             }
             // A layer of a layered still is keyed by its layer index and size mode (smart objects
@@ -682,9 +703,11 @@ impl Inner {
             FootageKind::Still if footage.layer.is_some() || footage.page != 0 => {
                 let l = footage.layer.as_ref().map_or(0, |l| 1 + l.index as i64 * 2 + l.layer_size as i64 + if l.embedded.is_some() { 1 << 40 } else { 0 })
                     + ((footage.page as i64) << 42);
-                Loc { key: key(&footage.path, l), media_t: None }
+                Loc { key: key(&footage.path, l), media_t: None, preview: None }
             }
-            FootageKind::Still | FootageKind::Sequence | FootageKind::Model | FootageKind::Data => Loc { key: key(&footage.path, 0), media_t: None },
+            FootageKind::Still | FootageKind::Sequence | FootageKind::Model | FootageKind::Data => {
+                Loc { key: key(&footage.path, 0), media_t: None, preview: None }
+            }
             FootageKind::Video | FootageKind::Audio => {
                 let rate = footage.frame_rate;
                 let n = Self::frame_count(rate, footage.duration);
@@ -692,21 +715,35 @@ impl Inner {
                 // Middle of the frame in the file's own timing (robust to timestamp rounding).
                 let native = footage.native_rate.unwrap_or(rate);
                 let mt = native.tick_of(i) + Tick(native.frame_duration().0 / 2);
-                Loc { key: key(&footage.path, i), media_t: Some(mt) }
+                Loc { key: key(&footage.path, i), media_t: Some(mt), preview: None }
             }
         }
     }
 
     fn frame_at(self: &Arc<Self>, footage: &Footage, t: Tick, playback: bool) -> Result<Arc<Image>> {
-        Ok(self.pixels_at(footage, t, playback)?.image())
+        Ok(self.pixels_at(footage, t, playback, None)?.image())
     }
 
-    /// The cached (or newly decoded) pixels of `footage` at source time `t`.
-    fn pixels_at(self: &Arc<Self>, footage: &Footage, t: Tick, playback: bool) -> Result<Pixels> {
+    /// Where the frame of `footage` at `t` comes from, resampled for `preview` when the footage's
+    /// frames are larger than the preview needs.
+    fn locate_for(footage: &Footage, t: Tick, preview: Option<Preview>) -> Loc {
+        let mut loc = Self::locate(footage, t);
+        if let Some(p) = preview
+            && let Some((w, h)) = preview_size(footage.width, p.w, p.h, p.s)
+        {
+            loc.key.preview = Some([w, h]);
+            loc.preview = Some(p);
+        }
+        loc
+    }
+
+    /// The cached (or newly decoded) pixels of `footage` at source time `t` (resampled for
+    /// `preview`).
+    fn pixels_at(self: &Arc<Self>, footage: &Footage, t: Tick, playback: bool, preview: Option<Preview>) -> Result<Pixels> {
         if !footage.has_video {
             return Err(MediaError::Unsupported(format!("{}: no video", footage.path)));
         }
-        let loc = Self::locate(footage, t);
+        let loc = Self::locate_for(footage, t, preview);
         let movie = loc.media_t.is_some();
         let mut c = lock(&self.cache);
         // sequential playback of a movie: read the next frame ahead
@@ -714,9 +751,9 @@ impl Inner {
             let prev = c.last.insert(loc.key.path.clone(), loc.key.frame);
             if prev == Some(loc.key.frame - 1) && self.read_ahead.load(Ordering::Relaxed) {
                 let next_t = t + footage.frame_rate.frame_duration();
-                let next = Self::locate(footage, next_t);
+                let next = Self::locate_for(footage, next_t, preview);
                 if next.key != loc.key && !c.lru.map.contains_key(&next.key) && !c.inflight.contains(&next.key) {
-                    self.prefetch(footage, next_t);
+                    self.prefetch(footage, next_t, preview);
                 }
             }
         }
@@ -749,21 +786,36 @@ impl Inner {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn prefetch(self: &Arc<Self>, footage: &Footage, t: Tick) {
+    fn prefetch(self: &Arc<Self>, footage: &Footage, t: Tick, preview: Option<Preview>) {
         let (me, f) = (self.clone(), footage.clone());
         self.prefetched.fetch_add(1, Ordering::Relaxed);
         // A plain thread, not a rayon job: the decode below parallelises with rayon itself.
         std::thread::spawn(move || {
-            let _ = me.pixels_at(&f, t, false);
+            let _ = me.pixels_at(&f, t, false, preview);
         });
     }
 
     #[cfg(target_arch = "wasm32")]
-    fn prefetch(self: &Arc<Self>, _footage: &Footage, _t: Tick) {}
+    fn prefetch(self: &Arc<Self>, _footage: &Footage, _t: Tick, _preview: Option<Preview>) {}
 
     /// Decode the frame at `loc`: movies and 8 / 16-bit stills are kept as their samples
     /// ([`Packed`]), float stills, layered and vector documents as float pixels.
     fn decode(&self, loc: &Loc, footage: &Footage) -> Result<Pixels> {
+        // A reduced-resolution preview: the full frame (cached, or decoded and not kept)
+        // resampled exactly as the renderer resamples it.
+        if let (Some(p), Some([rw, rh])) = (loc.preview, loc.key.preview) {
+            let base = Loc { key: Key { preview: None, ..loc.key.clone() }, media_t: loc.media_t, preview: None };
+            let cached = lock(&self.cache).lru.get(&base.key);
+            let full = match cached {
+                Some(px) => px,
+                None => self.decode(&base, footage)?,
+            };
+            let img = full.image();
+            if preview_size(img.width, p.w, p.h, p.s).is_none() {
+                return Ok(full);
+            }
+            return Ok(Pixels::Preview(Arc::new(effectcraft_raster::resample(&img, rw, rh))));
+        }
         let op = AlphaOp::of(footage);
         let path = &loc.key.path;
         let float = |img: Image| Pixels::Float(Arc::new(img));
@@ -821,16 +873,14 @@ impl FootageSource for MediaPool {
         Some(self.budget())
     }
     fn frame(&self, _item: ItemId, footage: &Footage, t: Tick) -> Option<Arc<Image>> {
-        if footage.missing {
-            return None;
-        }
-        match self.frame_at(footage, t) {
-            Ok(img) => Some(img),
-            Err(e) => {
-                log::warn!("media: frame of {} at {:?}: {e}", footage.path, t);
-                None
-            }
-        }
+        self.pixels(footage, t, None).map(|px| px.image())
+    }
+    fn frame_pixels(&self, _item: ItemId, footage: &Footage, t: Tick) -> Option<SharedFrame> {
+        self.pixels(footage, t, None).map(|px| px.shared())
+    }
+    fn preview_frame(&self, _item: ItemId, footage: &Footage, t: Tick, w: u32, h: u32, scale: f64) -> Option<FootageFrame> {
+        let px = self.pixels(footage, t, Some(Preview { w, h, s: scale }))?;
+        Some(FootageFrame { preview: matches!(px, Pixels::Preview(_)), px: px.shared() })
     }
 
     fn vector_frame(&self, _item: ItemId, footage: &Footage, scale: f64) -> Option<Arc<Image>> {
@@ -858,6 +908,23 @@ impl FootageSource for MediaPool {
             return None;
         }
         Some(self.audio_samples(footage, t, frames, rate))
+    }
+}
+
+impl MediaPool {
+    /// The pixels of `footage` at `t` for the renderer (playback read-ahead on), logged and
+    /// `None` when they can't be decoded.
+    fn pixels(&self, footage: &Footage, t: Tick, preview: Option<Preview>) -> Option<Pixels> {
+        if footage.missing {
+            return None;
+        }
+        match Inner::pixels_at(&self.inner, footage, t, true, preview) {
+            Ok(px) => Some(px),
+            Err(e) => {
+                log::warn!("media: frame of {} at {:?}: {e}", footage.path, t);
+                None
+            }
+        }
     }
 }
 
@@ -1002,7 +1069,7 @@ mod tests {
     fn lru_respects_budget() {
         let mut c = Lru::default();
         let img = || Pixels::Float(Arc::new(Image::new(16, 16))); // 4 KiB + overhead
-        let k = |i| Key { path: "a".into(), frame: i, interp: 0, matte: [0; 3], crop: None };
+        let k = |i| Key { path: "a".into(), frame: i, interp: 0, matte: [0; 3], crop: None, preview: None };
         let budget = 3 * (4096 + 64);
         for i in 0..10 {
             c.insert(k(i), img(), budget);

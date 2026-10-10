@@ -677,3 +677,63 @@ fn header_probe_matches_a_whole_file_probe() {
         assert_eq!(fast, whole, "{}", p.display());
     }
 }
+
+/// Footage read only through [`FootageSource::frame`] (float frames at full size): the
+/// renderer's reference path, before frames were kept packed and resampled by the pool.
+struct FloatFrames(MediaPool);
+
+impl FootageSource for FloatFrames {
+    fn frame(&self, item: ItemId, f: &Footage, t: Tick) -> Option<Arc<Image>> {
+        self.0.frame(item, f, t)
+    }
+}
+
+/// A comp of `f`'s size holding one layer of it, colour-managed or not.
+fn footage_comp(f: &Footage, managed: bool) -> (effectcraft_project::Project, ItemId) {
+    use effectcraft_project::{BitDepth, Comp, ItemKind, LayerSource, Project, build};
+    let mut p = Project::default();
+    p.settings.bit_depth = BitDepth::Bpc32;
+    if managed {
+        p.settings.working_space = Some(effectcraft_project::ColorSpace::DisplayP3);
+    }
+    let comp = Comp::new(f.width, f.height, FrameRate::FPS_30, Tick::from_seconds_f64(1.0));
+    let cid = p.add_item("Comp", effectcraft_color::Label::default(), None, ItemKind::Comp(comp.clone().into()));
+    let fid = p.add_item("clip", effectcraft_color::Label::default(), None, ItemKind::Footage(f.clone()));
+    let l = build::layer(&mut p, &comp, "clip", LayerSource::Footage { item: fid }, (f.width, f.height), None);
+    p.comp_mut(cid).expect("comp").layers.push(l);
+    (p, cid)
+}
+
+/// Footage layers render the same pixels whether their frames come packed (converted straight
+/// into the layer buffer with the colour conversion) and, at reduced resolution, already
+/// resampled by the pool, or as full-size float frames the renderer copies and resamples.
+#[test]
+fn packed_and_preview_frames_render_like_float_frames() {
+    use effectcraft_render::{RenderOpts, Renderer};
+    let (Some(movie), Some(still)) = (h264_mp4(), alpha_png()) else { return };
+    for path in [movie, still] {
+        let f = probe(&path).expect("probe");
+        for managed in [false, true] {
+            let (p, cid) = footage_comp(&f, managed);
+            for scale in [1.0, 0.5, 1.0 / 3.0, 0.25] {
+                let pool = MediaPool::new();
+                let reference = FloatFrames(MediaPool::new());
+                let opts = RenderOpts { scale, ..RenderOpts::default() };
+                for k in [0i64, 1] {
+                    let t = FrameRate::FPS_30.tick_of(k);
+                    let a = Renderer::new(&p, &pool, opts).comp_frame(cid, t);
+                    let b = Renderer::new(&p, &reference, opts).comp_frame(cid, t);
+                    assert_eq!((a.width, a.height), (b.width, b.height));
+                    let same = a.data.iter().zip(&b.data).all(|(x, y)| x.map(f32::to_bits) == y.map(f32::to_bits));
+                    assert!(same, "{} managed {managed} scale {scale} frame {k}", path.display());
+                }
+                let st = pool.stats();
+                if scale < 0.75 {
+                    // only the preview-size frames are kept
+                    let (w, h) = (((f.width as f64 * scale).round() as usize), ((f.height as f64 * scale).round() as usize));
+                    assert!(st.frames > 0 && st.bytes == st.frames * (w * h * 16 + 64), "{} scale {scale}: {st:?}", path.display());
+                }
+            }
+        }
+    }
+}
