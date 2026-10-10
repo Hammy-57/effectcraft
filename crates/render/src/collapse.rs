@@ -2,12 +2,16 @@
 //! (concatenated transforms, its 3D layers in the comp's 3D space).
 
 use crate::color::Region;
+use crate::eval::with_transform_memo;
+use crate::placement::Window;
 use crate::{EvalCtx, Image, Renderer, color, styles, three_d};
 use effectcraft_color::BlendMode;
 use effectcraft_effects::Buf;
 use effectcraft_geom::{Mat3, Mat4};
 use effectcraft_project::{Comp, ItemId, Layer, LayerSource};
+use effectcraft_raster::pool;
 use effectcraft_time::Tick;
+use rayon::prelude::*;
 
 /// One collapsed precomp layer a nested comp is drawn through.
 #[derive(Clone, Copy)]
@@ -158,15 +162,14 @@ impl<'a> Renderer<'a> {
         let matte = layer.track_matte.is_some_and(|tm| tm.layer != layer.id && ctx.comp.layer(tm.layer).is_some());
         if layer.blend_mode == BlendMode::Normal && !matte && !layer.preserve_transparency {
             if let Some((sub, nctx)) = self.collapse_into(ctx, layer, item, opacity) {
-                sub.draw_comp(&nctx, canvas, blank);
+                with_transform_memo(self.project, || sub.draw_comp(&nctx, canvas, blank));
             }
             return Region::Empty;
         }
         let Some((sub, nctx)) = self.collapse_into(ctx, layer, item, 1.0) else { return Region::Empty };
-        let mut iso = effectcraft_raster::pool::zeroed(canvas.width, canvas.height);
-        sub.draw_comp(&nctx, &mut iso, true);
-        self.composite_iso(ctx, layer, iso, canvas, opacity);
-        Region::Full
+        let mut iso = pool::zeroed(canvas.width, canvas.height);
+        with_transform_memo(self.project, || sub.draw_comp(&nctx, &mut iso, true));
+        self.composite_drawn(ctx, layer, iso, canvas, opacity)
     }
 
     /// Draw a collapsed precomp layer with effects ([`Self::collapsed_fx`]): the nested layers
@@ -178,8 +181,8 @@ impl<'a> Renderer<'a> {
             return Region::Empty;
         }
         let Some((sub, nctx)) = self.collapse_into(ctx, layer, item, 1.0) else { return Region::Empty };
-        let mut iso = effectcraft_raster::pool::zeroed(canvas.width, canvas.height);
-        sub.draw_comp(&nctx, &mut iso, true);
+        let mut iso = pool::zeroed(canvas.width, canvas.height);
+        with_transform_memo(self.project, || sub.draw_comp(&nctx, &mut iso, true));
         let offset = self.roi_offset().map(|(x, y, _, _)| [-x, -y]).unwrap_or([0.0; 2]);
         let mut buf = Buf { img: iso, offset, scale: self.opts.scale };
         // Effects run in the working space, not the linear blending space.
@@ -193,7 +196,196 @@ impl<'a> Renderer<'a> {
         if done.img.width != canvas.width || done.img.height != canvas.height {
             return Region::Empty;
         }
-        self.composite_iso(ctx, layer, done.img, canvas, opacity);
-        Region::Full
+        self.composite_drawn(ctx, layer, done.img, canvas, opacity)
+    }
+
+    /// Composite a collapsed precomp's isolated canvas-sized render (`iso`) with the layer's
+    /// matte, Preserve Transparency, mode and opacity, over only the window its non-zero pixels
+    /// cover (outside it every pixel is transparent black, which a matte and Preserve
+    /// Transparency keep transparent and non-stencil modes skip). Stencil modes, which clear
+    /// the comp outside the layer, take the whole canvas. Returns the region it changed.
+    fn composite_drawn(&self, ctx: &EvalCtx, layer: &Layer, iso: Image, canvas: &mut Image, opacity: f32) -> Region {
+        let size = (canvas.width, canvas.height);
+        #[cfg(test)]
+        let whole_only = crate::tests_footprint::full_windows() || tests::WHOLE.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let whole_only = false;
+        if whole_only || layer.blend_mode.is_stencil() || (iso.width, iso.height) != size {
+            self.composite_iso(ctx, layer, iso, canvas, opacity);
+            return Region::Full;
+        }
+        let win = drawn_window(&iso);
+        if win.is_empty() {
+            pool::recycle(iso);
+            return Region::Empty;
+        }
+        if win.is_whole(size) {
+            self.composite_iso(ctx, layer, iso, canvas, opacity);
+            return Region::Full;
+        }
+        let part = pool::crop_of(&iso, win.x, win.y, win.w, win.h);
+        pool::recycle(iso);
+        self.composite_iso_at(ctx, layer, part, win, canvas, opacity, None);
+        win.region(size)
+    }
+}
+
+/// The smallest window of `img` holding every pixel that is not transparent black (a NaN
+/// channel counts as drawn).
+fn drawn_window(img: &Image) -> Window {
+    let w = img.width.max(1) as usize;
+    let drawn = |p: &[f32; 4]| p.iter().any(|c| *c != 0.0);
+    let rows = img
+        .data
+        .par_chunks(w)
+        .enumerate()
+        .filter_map(|(y, row)| {
+            let x0 = row.iter().position(drawn)?;
+            let x1 = row.iter().rposition(drawn).unwrap_or(x0);
+            Some((x0, x1 + 1, y, y + 1))
+        })
+        .reduce_with(|a, b| (a.0.min(b.0), a.1.max(b.1), a.2.min(b.2), a.3.max(b.3)));
+    match rows {
+        Some((x0, x1, y0, y1)) => Window { x: x0 as u32, y: y0 as u32, w: (x1 - x0) as u32, h: (y1 - y0) as u32 },
+        None => Window { x: 0, y: 0, w: 0, h: 0 },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use effectcraft_color::{BlendMode, Label};
+    use effectcraft_keyframe::{Keyframe, Value};
+    use effectcraft_project::build::{self, Ids};
+    use effectcraft_project::{BitDepth, Comp, ItemId, ItemKind, Layer, LayerSource, MatteKind, Project, Solid, TrackMatte};
+    use effectcraft_time::{FrameRate, Tick};
+
+    use super::drawn_window;
+    use crate::{Image, NoFootage, RenderOpts, Renderer};
+
+    thread_local! {
+        /// Composite collapsed precomps over the whole canvas (the path before windows).
+        pub(super) static WHOLE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    fn solid(p: &mut Project, comp: &Comp, color: [f32; 3], (w, h): (u32, u32), pos: [f64; 2]) -> Layer {
+        let sid = p.add_item("Solid", Label::Red, None, ItemKind::Solid(Solid { color, width: w, height: h, pixel_aspect: 1.0 }));
+        let mut l = build::layer(p, comp, "Solid", LayerSource::Solid { item: sid }, (w, h), None);
+        l.props.prop_mut("transform/position").unwrap().value = Value::Vec3([pos[0], pos[1], 0.0]);
+        l
+    }
+
+    /// A 200×100 comp over a two-solid background with a collapsed precomp of two small solids
+    /// (one moving), rotated and scaled, set up by `f` (mode, matte, effects…).
+    fn scene(depth: BitDepth, f: &dyn Fn(&mut Project, &Comp, &mut Layer) -> Vec<Layer>) -> (Project, ItemId) {
+        let mut p = Project::default();
+        p.settings.bit_depth = depth;
+        let outer = Comp::new(200, 100, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+        let inner = Comp::new(100, 100, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+        let a = solid(&mut p, &inner, [0.7, 0.2, 0.1], (30, 20), [40.0, 50.0]);
+        let mut b = solid(&mut p, &inner, [0.1, 0.4, 0.8], (20, 30), [60.0, 40.0]);
+        b.props.prop_mut("transform/position").unwrap().keys =
+            vec![Keyframe::new(Tick::ZERO, Value::Vec3([60.0, 40.0, 0.0])), Keyframe::new(Tick::from_seconds_f64(1.0), Value::Vec3([20.0, 70.0, 0.0]))];
+        b.props.prop_mut("transform/opacity").unwrap().value = Value::Scalar(75.0);
+        let mut inner = inner;
+        inner.layers = vec![b, a].into();
+        let iid = p.add_item("Inner", Label::Sandstone, None, ItemKind::Comp(inner.into()));
+        let mut pre = build::layer(&mut p, &outer, "Inner", LayerSource::Comp { item: iid }, (100, 100), None);
+        pre.props.prop_mut("transform/position").unwrap().value = Value::Vec3([110.0, 45.0, 0.0]);
+        pre.props.prop_mut("transform/rotation").unwrap().value = Value::Scalar(12.0);
+        pre.props.prop_mut("transform/scale").unwrap().value = Value::Vec3([90.0, 110.0, 100.0]);
+        pre.switches.collapse = true;
+        let mut layers = f(&mut p, &outer, &mut pre);
+        layers.push(pre);
+        let mut bg = solid(&mut p, &outer, [0.2, 0.5, 0.3], (120, 100), [60.0, 50.0]);
+        bg.props.prop_mut("transform/opacity").unwrap().value = Value::Scalar(70.0);
+        layers.push(bg);
+        layers.push(solid(&mut p, &outer, [0.9, 0.6, 0.2], (200, 100), [100.0, 50.0]));
+        let mut c = outer;
+        c.layers = layers.into();
+        let cid = p.add_item("Outer", Label::Sandstone, None, ItemKind::Comp(c.into()));
+        (p, cid)
+    }
+
+    fn render(p: &Project, cid: ItemId, t: f64, whole: bool) -> Image {
+        WHOLE.with(|w| w.set(whole));
+        let img = Renderer::new(p, &NoFootage, RenderOpts::default()).comp_frame(cid, Tick::from_seconds_f64(t));
+        WHOLE.with(|w| w.set(false));
+        img
+    }
+
+    fn assert_same(what: &str, f: &dyn Fn(&mut Project, &Comp, &mut Layer) -> Vec<Layer>) {
+        for depth in [BitDepth::Bpc8, BitDepth::Bpc16, BitDepth::Bpc32] {
+            let (p, cid) = scene(depth, f);
+            for t in [0.0, 0.4] {
+                let (a, b) = (render(&p, cid, t, false), render(&p, cid, t, true));
+                assert!(a == b, "{what} {depth:?} t {t}: windowed collapsed composite differs from the whole-canvas one");
+            }
+        }
+    }
+
+    fn matte(p: &mut Project, c: &Comp) -> Layer {
+        let mut m = solid(p, c, [0.8, 0.5, 0.8], (60, 40), [100.0, 50.0]);
+        m.props.prop_mut("transform/rotation").unwrap().value = Value::Scalar(-9.0);
+        m.switches.video = false;
+        m
+    }
+
+    fn blur(p: &mut Project, l: &mut Layer, amount: f64) {
+        let spec = effectcraft_effects::find("ec.blur.gaussian").unwrap();
+        let mut next = p.next_id;
+        let mut g = effectcraft_effects::instantiate(spec, &mut Ids(&mut next), spec.name, [100.0, 100.0]);
+        p.next_id = next;
+        g.prop_mut("blurriness").unwrap().value = Value::Scalar(amount);
+        l.props.sub_mut("effects").unwrap().children.push(g.into());
+    }
+
+    /// Collapsed precomps composited in isolation (mode, matte, Preserve Transparency, effects)
+    /// only over the window their pixels cover: the same frame as over the whole canvas.
+    #[test]
+    fn isolated_collapsed_precomps_composite_only_their_window() {
+        for mode in [BlendMode::Multiply, BlendMode::Dissolve, BlendMode::Screen, BlendMode::StencilAlpha] {
+            assert_same(&format!("{mode:?}"), &|_, _, l| {
+                l.blend_mode = mode;
+                l.props.prop_mut("transform/opacity").unwrap().value = Value::Scalar(60.0);
+                vec![]
+            });
+        }
+        for kind in [MatteKind::Alpha, MatteKind::LumaInverted] {
+            assert_same(&format!("matte {kind:?}"), &|p, c, l| {
+                let m = matte(p, c);
+                l.track_matte = Some(TrackMatte { layer: m.id, kind });
+                vec![m]
+            });
+        }
+        assert_same("preserve", &|_, _, l| {
+            l.preserve_transparency = true;
+            vec![]
+        });
+        assert_same("effects", &|p, _, l| {
+            blur(p, l, 8.0);
+            vec![]
+        });
+        assert_same("effects matte multiply", &|p, c, l| {
+            blur(p, l, 4.0);
+            l.blend_mode = BlendMode::Multiply;
+            let m = matte(p, c);
+            l.track_matte = Some(TrackMatte { layer: m.id, kind: MatteKind::Alpha });
+            vec![m]
+        });
+    }
+
+    #[test]
+    fn drawn_window_bounds_non_zero_pixels() {
+        let mut img = Image::new(10, 8);
+        assert!(drawn_window(&img).is_empty());
+        img.set(3, 2, [0.0, 0.0, 0.0, 0.5]);
+        img.set(6, 5, [0.1, 0.0, 0.0, 0.0]);
+        let w = drawn_window(&img);
+        assert_eq!((w.x, w.y, w.w, w.h), (3, 2, 4, 4));
+        img.set(9, 7, [0.0, f32::NAN, 0.0, 0.0]);
+        let w = drawn_window(&img);
+        assert_eq!((w.x, w.y, w.w, w.h), (3, 2, 7, 6));
     }
 }
