@@ -12,6 +12,7 @@ pub mod effects_presets;
 pub mod essential;
 pub mod expr_bar;
 pub mod expr_editor;
+pub mod figma_pair;
 pub mod flowchart;
 pub mod footage_panel;
 pub mod forms;

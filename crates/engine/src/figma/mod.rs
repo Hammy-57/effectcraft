@@ -6,10 +6,11 @@
 //! Gaussian Blur; opacity, blend modes and visibility. Image fills and node types without a native
 //! counterpart come in as PNG renders (2×) placed exactly over the node.
 //!
-//! Sources: a Figma link or file key + node ids, fetched with a personal access token through
-//! the REST API ([`fetch`]); or node JSON passed in (`payload` / `payloadPath`): the REST
-//! `nodes` reply, or what the EffectCraft Figma plug-in sends through `effectcraft-cli
-//! figma-bridge`. [`map`] plans the import; [`build`] makes it one undo step.
+//! Sources: node JSON passed in (`payload` / `payloadPath`): what `integrations/figma/serialize.js`
+//! produces (in the EffectCraft Transfer plug-in, through the app's Figma bridge, or in the Figma
+//! MCP's `use_figma`, no token), or the REST `nodes` reply; or, optionally, a Figma link or file
+//! key + node ids fetched with a personal access token through the REST API ([`fetch`]).
+//! [`map`] plans the import; [`build`] makes it one undo step.
 //!
 //! The token comes from `token`, the `FIGMA_TOKEN` environment variable or the one stored with
 //! `figma.setToken` (a file next to the settings, readable only by the user). It is never
@@ -114,17 +115,41 @@ fn source(s: &mut Session, p: &Value) -> Result<Source> {
         Some(Value::String(x)) => x.split(',').map(|x| fetch::normalize_id(x).ok_or_else(|| bad(CMD, format!("bad node id `{x}`")))).collect::<Result<_>>()?,
         _ => vec![],
     };
-    let payload = match (p.get("payload"), str_p(p, "payloadPath")) {
-        (Some(v), _) if !v.is_null() => Some(v.clone()),
-        (_, Some(path)) => {
-            let bytes = s.services.read_file(path).map_err(|e| bad(CMD, format!("cannot read {path}: {e}")))?;
-            Some(serde_json::from_slice::<Value>(&bytes).map_err(|e| bad(CMD, format!("{path}: not JSON ({e})")))?)
-        }
-        _ => None,
+    let read_json = |s: &Session, path: &str| -> Result<Value> {
+        let bytes = s.services.read_file(path).map_err(|e| bad(CMD, format!("cannot read {path}: {e}")))?;
+        serde_json::from_slice::<Value>(&bytes).map_err(|e| bad(CMD, format!("{path}: not JSON ({e})")))
     };
-    if let Some(payload) = payload {
-        let nodes = map::select_nodes(&payload, &ids).map_err(|e| bad(CMD, e))?;
-        let images = payload.get("images").and_then(Value::as_object).cloned().unwrap_or_default();
+    // `payloadPaths`: the first file is the payload, the others add `fragments` and `images`.
+    let mut parts: Vec<Value> = vec![];
+    match (p.get("payload"), str_p(p, "payloadPath"), p.get("payloadPaths")) {
+        (Some(v), _, _) if !v.is_null() => parts.push(v.clone()),
+        (_, Some(path), _) => parts.push(read_json(s, path)?),
+        (_, _, Some(Value::Array(a))) if !a.is_empty() => {
+            if a.len() > 10_000 {
+                return Err(bad(CMD, "too many payload parts"));
+            }
+            for path in a {
+                let path = path.as_str().ok_or_else(|| bad(CMD, "payloadPaths: file paths"))?;
+                parts.push(read_json(s, path)?);
+            }
+        }
+        _ => {}
+    }
+    if !parts.is_empty() {
+        let payload = parts.first().cloned().unwrap_or(Value::Null);
+        let mut nodes = map::select_nodes(&payload, &ids).map_err(|e| bad(CMD, e))?;
+        let mut images = serde_json::Map::new();
+        let mut fragments = serde_json::Map::new();
+        for part in &parts {
+            if let Some(m) = part.get("images").and_then(Value::as_object) {
+                images.extend(m.clone());
+            }
+            if let Some(m) = part.get("fragments").and_then(Value::as_object) {
+                fragments.extend(m.clone());
+            }
+        }
+        resolve_refs(&mut nodes, &mut fragments, 0).map_err(|e| bad(CMD, e))?;
+        image_bounds(&mut nodes, &images, 0);
         let label = payload.get("fileKey").and_then(Value::as_str).unwrap_or("payload").to_string();
         return Ok(Source { nodes, images, rest: None, label });
     }
@@ -150,6 +175,80 @@ fn source(s: &mut Session, p: &Value) -> Result<Source> {
     let reply = fetch::nodes(&base, &key, &ids, &token).map_err(EngineError::Other)?;
     let nodes = map::select_nodes(&reply, &[]).map_err(|e| bad(CMD, e))?;
     Ok(Source { nodes, images: Default::default(), rest: Some((base, key.clone(), token)), label: key })
+}
+
+/// Large selections arrive in parts (the Figma MCP's replies are size-limited): a child too big
+/// for its part is a stub `{"$ref": "<node id>"}`, and a later part carries the node in
+/// `fragments`. Replace every stub with its fragment (each used once); a missing one is an error.
+fn resolve_refs(nodes: &mut [Value], fragments: &mut serde_json::Map<String, Value>, depth: usize) -> std::result::Result<(), String> {
+    // Deeper than the mapper goes (it skips those levels with a note): nothing to resolve.
+    if depth > 128 {
+        return Ok(());
+    }
+    for n in nodes.iter_mut() {
+        if let Some(id) = n.get("$ref").and_then(Value::as_str).map(str::to_string) {
+            match fragments.remove(&id) {
+                Some(f) if f.get("$ref").is_none() => *n = f,
+                _ => return Err(format!("the payload part for node {id} is missing (serialize it with {{subtree: '{id}'}} and add its file)")),
+            }
+        }
+        if let Some(Value::Array(c)) = n.get_mut("children") {
+            resolve_refs(c, fragments, depth + 1)?;
+        }
+    }
+    Ok(())
+}
+
+/// An image entry's `bounds` says which box its PNG covers: `"render"` (the node's
+/// `absoluteRenderBounds`, shadows and strokes included, as Figma's export endpoints and the
+/// Figma MCP's `download_assets` render it) or `{x, y, width, height}`. The node's image is placed
+/// over that box instead of its bounding box (the default, which `exportAsync` with
+/// `useAbsoluteBounds` and the REST `use_absolute_bounds=true` produce). Every node with an image
+/// entry is marked with an image paint, so it comes in as that image.
+fn image_bounds(nodes: &mut [Value], images: &serde_json::Map<String, Value>, depth: usize) {
+    if images.is_empty() || depth > 64 {
+        return;
+    }
+    for n in nodes {
+        let id = n.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
+        let id = id.as_str();
+        // A node the payload supplies an image for comes in as that image, even when the sender
+        // didn't mark it with an image paint (older serializers left its fills out).
+        if images.contains_key(id)
+            && !has_image_fill(n)
+            && let Some(o) = n.as_object_mut()
+        {
+            match o.get_mut("fills") {
+                Some(Value::Array(f)) => f.push(serde_json::json!({"type": "IMAGE"})),
+                _ => {
+                    o.insert("fills".into(), serde_json::json!([{"type": "IMAGE"}]));
+                }
+            }
+        }
+        if let Some(b) = images.get(id).and_then(|e| e.get("bounds")) {
+            let bounds = match b {
+                Value::String(k) if k == "render" => n.get("absoluteRenderBounds").filter(|r| r.is_object()).cloned(),
+                Value::Object(o) if ["x", "y", "width", "height"].iter().all(|k| o.get(*k).and_then(Value::as_f64).is_some_and(f64::is_finite)) => {
+                    Some(b.clone())
+                }
+                _ => None,
+            };
+            if let (Some(bb), Some(o)) = (bounds, n.as_object_mut()) {
+                o.insert("absoluteBoundingBox".into(), bb);
+            }
+        }
+        if let Some(Value::Array(c)) = n.get_mut("children") {
+            image_bounds(c, images, depth + 1);
+        }
+    }
+}
+
+fn has_image_fill(n: &Value) -> bool {
+    n.get("fills").and_then(Value::as_array).is_some_and(|f| {
+        f.iter().any(|p| {
+            p.get("visible") != Some(&Value::Bool(false)) && matches!(p.get("type").and_then(Value::as_str), Some("IMAGE" | "VIDEO" | "EMOJI" | "PATTERN"))
+        })
+    })
 }
 
 fn import(s: &mut Session, p: &Value) -> Result<Value> {
@@ -199,7 +298,7 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "Figma...",
             menu: &[],
             shortcut: None,
-            params: "{url? (Figma link with ?node-id=), fileKey?, nodeIds? [\"1:2\"], payload? (Figma node JSON: the REST nodes reply, the plug-in payload, a node or an array), payloadPath?, target?: auto|newComp|activeComp (auto: frames → new comps, else into the active comp), comp?, frameRate? (30), duration? (10 s), scale? (image renders, 2), token? (else FIGMA_TOKEN or figma.setToken), apiBase? (loopback test servers only), dryRun? (plan only)} → {comp, comps, precomps, layers, native, images, rasterized: [{node, name, reason}], notes}",
+            params: "{url? (Figma link with ?node-id=), fileKey?, nodeIds? [\"1:2\"], payload? (Figma node JSON: the REST nodes reply, serialize.js output, a node or an array), payloadPath?, payloadPaths? [payload, parts with fragments / images…], target?: auto|newComp|activeComp (auto: frames → new comps, else into the active comp), comp?, frameRate? (30), duration? (10 s), scale? (image renders, 2), token? (else FIGMA_TOKEN or figma.setToken), apiBase? (loopback test servers only), dryRun? (plan only)} → {comp, comps, precomps, layers, native, images, rasterized: [{node, name, reason}], notes}",
             enabled: always,
             run: import,
             // Never journaled: the params can hold a token.
