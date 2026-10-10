@@ -388,6 +388,22 @@ type Failed = Arc<Mutex<HashSet<(FrameKey, u64)>>>;
 /// Failed frames remembered at most (then forgotten, so retried once).
 const MAX_FAILED: usize = 256;
 
+#[cfg(not(target_arch = "wasm32"))]
+struct BackgroundPermit {
+    busy: Arc<AtomicBool>,
+    ctx: Option<egui::Context>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for BackgroundPermit {
+    fn drop(&mut self) {
+        self.busy.store(false, Ordering::Release);
+        if let Some(ctx) = &self.ctx {
+            ctx.request_repaint();
+        }
+    }
+}
+
 pub struct Frames {
     cache: Arc<Mutex<Cache>>,
     /// Keys queued or rendering.
@@ -401,6 +417,8 @@ pub struct Frames {
     #[cfg(not(target_arch = "wasm32"))]
     /// None if the OS refused the threads: jobs then go to rayon's global pool.
     pool: Option<Arc<rayon::ThreadPool>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    background_running: Arc<AtomicBool>,
     ctx: Option<egui::Context>,
     /// Render time of the last viewer (urgent) frame in ms, for the Info panel / perf readout.
     pub last_ms: Arc<Mutex<f64>>,
@@ -459,6 +477,8 @@ impl Default for Frames {
                 .build()
                 .ok()
                 .map(Arc::new),
+            #[cfg(not(target_arch = "wasm32"))]
+            background_running: Arc::default(),
             ctx: None,
             last_ms: Arc::new(Mutex::new(0.0)),
             content_keys: Arc::default(),
@@ -602,13 +622,25 @@ impl Frames {
         }
     }
 
-    /// Bounded auxiliary preview work shares the existing native frame pool.
+    /// One auxiliary render across all layers, admitted before Rayon can nest it inside
+    /// another render's parallel pixel loop (#586/#647). Rejected callers retry on repaint.
     #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn spawn_background(&self, task: impl FnOnce() + Send + 'static) {
-        match &self.pool {
-            Some(pool) => pool.spawn(task),
-            None => rayon::spawn(task),
+    pub(crate) fn try_spawn_background(&self, task: impl FnOnce() + Send + 'static) -> bool {
+        if self.background_running.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return false;
         }
+        let permit = BackgroundPermit { busy: self.background_running.clone(), ctx: self.ctx.clone() };
+        let run = move || {
+            let _permit = permit;
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(task)).is_err() {
+                log::error!("an auxiliary preview render panicked; its slot was released");
+            }
+        };
+        match &self.pool {
+            Some(pool) => pool.spawn(run),
+            None => rayon::spawn(run),
+        }
+        true
     }
 
     /// Actual native frame-worker capacity, including the OS fallback pool.
@@ -1303,6 +1335,38 @@ impl Queue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn auxiliary_renders_cannot_nest_and_panics_release_the_shared_slot() {
+        let frames = Arc::new(Frames::default());
+        let nested = frames.clone();
+        let (started, rx) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        assert!(frames.try_spawn_background(move || {
+            started.send(nested.try_spawn_background(|| {})).unwrap();
+            wait.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        }));
+        assert!(!rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap(), "a nested pool job cannot acquire a second slot");
+        for _ in 0..100 {
+            assert!(!frames.try_spawn_background(|| {}), "other selected layers must wait outside the pool");
+        }
+        release.send(()).unwrap();
+        let idle = || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while frames.background_running.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(!frames.background_running.load(Ordering::Acquire), "the auxiliary slot was not released");
+        };
+        idle();
+        assert!(frames.try_spawn_background(|| panic!("synthetic auxiliary render failure")));
+        idle();
+        let (done, rx) = std::sync::mpsc::channel();
+        assert!(frames.try_spawn_background(move || done.send(()).unwrap()));
+        rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        idle();
+    }
 
     /// Frames larger than the texture limit are averaged down by a whole factor (#201: an
     /// 11000×2200 comp at Full resolution against an 8192 limit).

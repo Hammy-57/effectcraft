@@ -101,14 +101,21 @@ struct Mailbox {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl Mailbox {
+    fn not_admitted(&mut self) {
+        self.running = false;
+        self.requested = None;
+        // An unselected layer may never be visited again. Do not pin its old document while
+        // waiting for admission; the next visible frame reconstructs the latest pose instead.
+        self.pending = None;
+    }
+
     /// Only the running pose and the latest requested pose retain project snapshots.
     fn request(&mut self, job: OverlayJob) -> bool {
-        if self.requested == Some(job.key) {
-            return false;
+        if self.requested != Some(job.key) {
+            self.requested = Some(job.key);
+            self.pending = Some(job);
         }
-        self.requested = Some(job.key);
-        self.pending = Some(job);
-        if self.running {
+        if self.running || self.pending.is_none() {
             return false;
         }
         self.running = true;
@@ -205,8 +212,11 @@ pub fn overlay(app: &mut EffectcraftApp, ctx: &egui::Context, cid: ItemId, layer
         let job = OverlayJob { key, source: app.render_source(), effect: fx.uid };
         let start = mailbox.lock().unwrap_or_else(std::sync::PoisonError::into_inner).request(job);
         if start {
-            let ctx = ctx.clone();
-            app.frames.spawn_background(move || run_mailbox(&mailbox, &ctx, compute_overlay));
+            let worker = mailbox.clone();
+            let repaint = ctx.clone();
+            if !app.frames.try_spawn_background(move || run_mailbox(&worker, &repaint, compute_overlay)) {
+                mailbox.lock().unwrap_or_else(std::sync::PoisonError::into_inner).not_admitted();
+            }
         }
         let comp = app.session.project.comp(cid)?;
         let eval = EvalCtx { project: &app.session.project, comp_id: cid, comp, time: t, expr: app.session.expr.as_deref(), footage: None };
@@ -369,6 +379,21 @@ mod async_tests {
             },
             effect: 3,
         }
+    }
+
+    #[test]
+    fn rejected_admission_retries_the_same_pending_pose() {
+        let mut mailbox = Mailbox::default();
+        let first = job(1, 0);
+        let old_project = Arc::downgrade(&first.source.project);
+        assert!(mailbox.request(first));
+        // Another layer owns the shared render permit; no worker was submitted.
+        mailbox.not_admitted();
+        assert!(old_project.upgrade().is_none(), "deselection must not retain a rejected document snapshot");
+        assert!(mailbox.request(job(1, 0)), "retry pending work when the permit becomes free");
+        assert_eq!(mailbox.pending.as_ref().unwrap().key.revision, 1);
+        assert!(!mailbox.request(job(2, 0)), "coalesce while the retried worker runs");
+        assert_eq!(mailbox.pending.as_ref().unwrap().key.revision, 2);
     }
 
     #[test]
