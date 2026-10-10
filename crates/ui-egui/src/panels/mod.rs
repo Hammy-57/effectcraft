@@ -1,63 +1,8 @@
 //! Panel bodies.
 
-pub mod anim_tools;
-pub mod camera_tracker_ui;
-pub mod comp_settings;
-pub mod content_fill_panel;
-pub mod delete_items;
-pub mod dialogs;
-pub mod dialogs_3d;
-pub mod effect_controls;
-pub mod effects_presets;
-pub mod essential;
-pub mod expr_bar;
-pub mod expr_editor;
-pub mod figma_pair;
-pub mod flowchart;
-pub mod footage_panel;
-pub mod forms;
-pub mod fx_console;
-pub mod fx_editors;
-pub mod fx_widgets;
-pub mod graph;
-pub mod graph_tools;
-pub mod home;
-pub mod info;
-pub mod key_dialogs;
-pub mod layer_panel;
-pub mod layer_styles_dialog;
-pub mod learn;
-pub mod markers_ui;
-pub mod media_panels;
-pub mod misc;
-pub mod paint_panels;
-pub mod panel_kit;
-pub mod panel_menu;
-pub mod path_vr_panels;
-pub mod precomp;
-pub mod project;
-pub mod properties;
-pub mod puppet_tool;
-pub mod render_queue;
-pub mod roto_tool;
-pub mod rq_templates;
-pub mod scopes_panel;
-pub mod script_console;
-pub mod scriptui_view;
-pub mod settings;
-pub mod shortcut_editor;
-pub mod templates;
-pub mod text_panels;
-pub mod timeline;
-pub mod tracker;
-pub mod unsaved;
-pub mod viewer;
-pub mod viewer_drop;
-pub mod viewer_overlays;
-pub mod viewer_text;
-pub mod viewer_tools;
-pub mod viewers;
-pub mod waveform;
+// Every `src/panels/*.rs` file is a module, declared by build.rs (docs/architecture.md,
+// "Self-registering modules"); declare one here only for another visibility or a submodule folder.
+include!(concat!(env!("OUT_DIR"), "/panels.rs"));
 
 use effectcraft_engine::Session;
 use effectcraft_engine::project::Comp;

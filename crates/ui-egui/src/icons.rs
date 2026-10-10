@@ -443,10 +443,11 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             pen.line(&[(2.0, 9.0), (2.0, 14.0), (14.0, 14.0), (14.0, 9.0)]);
         }
         Folder => pen.closed(&[(1.5, 4.0), (6.0, 4.0), (7.5, 5.5), (14.5, 5.5), (14.5, 13.0), (1.5, 13.0)]),
+        // A frame with a play triangle, stacked on a second frame behind it: "a nested timeline".
         Comp => {
-            pen.rect(2.0, 3.0, 14.0, 13.0);
-            pen.rect_fill(4.0, 5.0, 8.0, 9.0);
-            pen.rect(7.0, 7.5, 12.0, 11.0);
+            pen.line(&[(4.5, 5.0), (4.5, 2.5), (14.0, 2.5), (14.0, 10.5), (11.5, 10.5)]);
+            pen.rect(1.5, 5.0, 11.5, 13.5);
+            pen.fill(&[(5.0, 7.3), (5.0, 11.2), (8.6, 9.25)]);
         }
         Footage => {
             pen.rect(2.0, 3.0, 14.0, 13.0);

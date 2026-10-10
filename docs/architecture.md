@@ -559,6 +559,32 @@ applied on the UI thread.
 The shortcut dispatcher and the menus read the active preset. See
 [preferences.md](preferences.md).
 
+### Self-registering modules
+
+Central lists are where parallel branches collide, so the busiest ones are generated. A crate's
+`build.rs` runs `effectcraft-buildgen` over a directory and the parent module `include!`s the
+result from `OUT_DIR`: one `mod` per file (sorted, absolute `#[path]`s) and, where asked, a table of
+the modules that define a conventional function.
+
+| Directory | Every file becomes | Registered |
+|---|---|---|
+| `engine/src/commands/*.rs` | a `pub(crate)` command module | its `pub fn specs() -> Vec<CommandSpec>` in `command_specs()` |
+| `engine/src/*.rs` | a `pub` module | a top-level `specs()` too (`models`, `storage`, `learn`, …) |
+| `effects/src/*.rs` | a crate-private module | its `pub fn specs() -> Vec<EffectSpec>` in `registry()` |
+| `render/src/*.rs`, `ui-egui/src/*.rs`, `ui-egui/src/panels/*.rs` | a `pub` module | — |
+
+In all of them `tests.rs`, `tests_*.rs` and `*_tests.rs` become `#[cfg(test)]` modules. **To add a
+command, an effect, a panel module or a test file, create the file; don't touch `lib.rs` /
+`mod.rs`.** Declare a module by hand in the parent only when it needs another visibility, a
+`#[cfg]`, has submodules in a folder next to it (`menus.rs` + `menus/`) or defines
+`#[macro_export]` macros (`commands`); the generator skips modules the parent declares. Command modules that existed before AG3 keep their registration order
+(`LEGACY_ORDER` in `commands/mod.rs`, frozen: the command list's order is observable); new ones
+follow by file name. Effects are sorted by category and name anyway. `cargo fmt` can't see the
+generated declarations, so format with `cargo xtask fmt` (`cargo xtask ci` checks it).
+
+Shared docs avoid the same collisions differently: [parity.md](parity.md)'s cells hold only the
+current state, and history is appended to the union-merged [parity-log.md](parity-log.md).
+
 ## 6a. Premiere Pro interop (timeline interchange)
 
 After Effects' File ▸ Import / Export ▸ Adobe Premiere Pro Project… go through the public

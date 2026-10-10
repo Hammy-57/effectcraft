@@ -10,45 +10,14 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
-pub mod autosave;
-pub mod camera_track;
+// Every `src/*.rs` file is a module (`tests*.rs` under `#[cfg(test)]`), declared by build.rs;
+// declare one here only for another visibility or a submodule folder. See docs/architecture.md
+// "Self-registering modules".
+include!(concat!(env!("OUT_DIR"), "/modules.rs"));
+// By hand: its `cmd!` / `query!` macros are `#[macro_export]`ed (not allowed from an `include!`).
 pub mod commands;
-pub mod config;
-pub mod demo;
-pub mod figma;
-pub mod footage_check;
-pub mod guard;
-pub mod history;
-pub mod jobs;
-pub mod learn;
-pub mod links;
-pub mod logging;
-pub mod mask_track;
-pub mod media_browser;
-pub mod media_cache;
 pub mod menus;
-pub mod models;
-pub mod offload;
-pub mod perf;
-pub mod prefs;
-pub mod preview;
-pub mod psd_import;
-pub mod remote;
-pub mod render_queue;
-pub mod replay;
-pub mod roto;
-pub mod scriptui;
-pub mod sequence;
 mod session_settings;
-pub mod shortcuts;
-pub mod storage;
-pub mod sysinfo;
-pub mod templates;
-pub mod tracking;
-pub mod vector;
-pub mod viewer;
-pub mod warp;
-pub mod xml_project;
 
 use std::sync::Arc;
 
@@ -460,6 +429,8 @@ pub struct Session {
     pub autosave_folder_override: Option<std::path::PathBuf>,
     /// The viewer snapshot (Take Snapshot / Show Snapshot).
     pub snapshot: Option<viewer::Snapshot>,
+    /// Named rendered frames for `render.compare` (`render.snapshot`; bounded, oldest dropped).
+    pub frame_snapshots: commands::render_compare::FrameSnapshots,
     /// The JavaScript scripting engine (set by the host that links `effectcraft-script`):
     /// `script.run`, File ▸ Scripts ▸ Run Script File… (`.jsx`/`.js`) and the Script Console.
     pub script: Option<ScriptRunner>,
@@ -602,6 +573,7 @@ impl Default for Session {
             autosave: autosave::AutoSaveState::default(),
             autosave_folder_override: None,
             snapshot: None,
+            frame_snapshots: Default::default(),
             script: None,
             script_interrupt: None,
             plugin_loader: None,
@@ -1075,85 +1047,6 @@ pub fn upgrade_effects(p: &mut Project) {
     p.schema = effectcraft_project::SCHEMA_VERSION;
 }
 
-#[cfg(test)]
-mod rq_tests;
-#[cfg(test)]
-mod tests;
-#[cfg(test)]
-mod tests_3d;
-#[cfg(test)]
-mod tests_aep;
-#[cfg(test)]
-mod tests_anim_tools;
-#[cfg(test)]
-mod tests_camera_track;
-#[cfg(test)]
-mod tests_codec_options;
-#[cfg(test)]
-mod tests_color_view;
-#[cfg(test)]
-mod tests_disk_cache;
-#[cfg(test)]
-mod tests_effects;
-#[cfg(test)]
-mod tests_essential;
-#[cfg(test)]
-mod tests_essential_more;
-#[cfg(test)]
-mod tests_face;
-#[cfg(test)]
-mod tests_fidelity;
-#[cfg(test)]
-mod tests_frame_export;
-#[cfg(test)]
-mod tests_keylight;
-#[cfg(test)]
-mod tests_lottie;
-#[cfg(test)]
-mod tests_m137;
-#[cfg(test)]
-mod tests_m145;
-#[cfg(test)]
-mod tests_markers;
-#[cfg(test)]
-mod tests_mask_warp;
-#[cfg(test)]
-mod tests_menu_cmds;
-#[cfg(test)]
-mod tests_model3d;
-#[cfg(test)]
-mod tests_motion_blur_depth;
-#[cfg(test)]
-mod tests_project_items;
-#[cfg(test)]
-mod tests_proxy;
-#[cfg(test)]
-mod tests_rig3d;
-#[cfg(test)]
-mod tests_sequence;
-#[cfg(test)]
-mod tests_settings;
-#[cfg(test)]
-mod tests_stubs;
-#[cfg(test)]
-mod tests_styles;
-#[cfg(test)]
-mod tests_tail;
-#[cfg(test)]
-mod tests_text;
-#[cfg(test)]
-mod tests_text_edit;
-#[cfg(test)]
-mod tests_timeline;
-#[cfg(test)]
-mod tests_timeline_interchange;
-#[cfg(test)]
-mod tests_track;
-#[cfg(test)]
-mod tests_vector_import;
-#[cfg(test)]
-mod tests_viewer;
-
 /// Font families available to text layers (bundled + scanned system fonts).
 /// Text animation presets: (id, name), for menus.
 pub fn text_presets() -> Vec<(String, String)> {
@@ -1241,13 +1134,3 @@ pub fn font_menu(prefs: &prefs::Prefs) -> Vec<FontRow> {
     out.extend(all.iter().map(|f| row(f, false)));
     out
 }
-#[cfg(test)]
-mod tests_history;
-#[cfg(test)]
-mod tests_models;
-#[cfg(test)]
-mod tests_paint;
-#[cfg(test)]
-mod tests_panels;
-#[cfg(test)]
-mod tests_roto;

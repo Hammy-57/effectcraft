@@ -5,7 +5,7 @@
 use serde_json::{Map, Value, json};
 
 use crate::backend::NEED_BRIDGE;
-use crate::{Backend, Error, Result, recompress_png};
+use crate::{Backend, Error, Result, encode_png, recompress_png};
 
 /// A tool's output.
 pub enum Reply {
@@ -20,7 +20,7 @@ pub enum Reply {
 pub struct ToolDef {
     pub name: &'static str,
     pub description: &'static str,
-    /// Only listed (and usable) when bridged to the running app.
+    /// Only listed (and usable) with a UI: bridged to the running app, or `mcp --ui` (offscreen).
     pub bridge_only: bool,
     schema: fn() -> Value,
     run: fn(&mut Backend, &Value) -> Result<Reply>,
@@ -68,7 +68,6 @@ const READ_ONLY: &[&str] = &[
     "list_commands",
     "describe_command",
     "doc_inspect",
-    "render_preview",
     "get_project",
     "get_comp",
     "get_layer",
@@ -78,9 +77,27 @@ const READ_ONLY: &[&str] = &[
     "get_state",
     "ui_inspect",
     "ui_elements",
+    "get_layout",
 ];
-/// Tools that write files without changing the project.
-const WRITES_FILES: &[&str] = &["save_project", "render_frame", "screenshot"];
+/// Tools that write files (or keep session-side frames) without changing the project.
+const WRITES_FILES: &[&str] =
+    &["save_project", "render_frame", "render_preview", "render_frames", "screenshot", "render_snapshot", "render_compare", "analyze_audio"];
+
+/// Older tool names kept callable but left out of `tools/list` (`mcp --all-tools` lists them):
+/// (alias, canonical tool). The canonical one takes every argument the alias does, except
+/// `execute_command`'s `command` key (`command_run` takes `id`).
+pub const HIDDEN_ALIASES: &[(&str, &str)] =
+    &[("list_commands", "command_list"), ("execute_command", "command_run"), ("get_project", "doc_inspect"), ("render_frame", "render_preview")];
+
+/// The canonical tool a hidden alias stands for.
+pub fn alias_of(name: &str) -> Option<&'static str> {
+    HIDDEN_ALIASES.iter().find(|(alias, _)| *alias == name).map(|(_, canonical)| *canonical)
+}
+
+/// Whether a tool can change the project (anything but queries and file writers).
+pub fn may_edit(name: &str) -> bool {
+    !READ_ONLY.contains(&name) && !WRITES_FILES.contains(&name)
+}
 
 /// `get_project` → "Get project".
 fn title_of(name: &str) -> String {
@@ -98,9 +115,89 @@ pub fn find(name: &str) -> Option<&'static ToolDef> {
     TOOLS.iter().find(|t| t.name == name)
 }
 
-/// The tools available on a backend (bridge-only tools are hidden in headless mode).
+/// The tools available on a backend (UI tools are hidden in headless mode without a UI).
 pub fn available(bridge: bool) -> impl Iterator<Item = &'static ToolDef> {
     TOOLS.iter().filter(move |t| bridge || !t.bridge_only)
+}
+
+/// The JSON Schema of a tool's `structuredContent` (MCP 2025-06-18 `outputSchema`), for tools
+/// whose result shape is stable. Clients that negotiated 2025-06-18+ get every JSON result as
+/// `structuredContent` too ([`structured`]); only these declare its shape.
+pub fn output_schema(name: &str) -> Option<Value> {
+    let object = |props: Value, required: &[&str]| json!({"type": "object", "properties": props, "required": required});
+    let int = json!({"type": "integer"});
+    Some(match name {
+        "get_state" => object(json!({"state": {"type": "object"}, "app": {"type": "object"}}), &["state", "app"]),
+        "doc_inspect" => object(json!({"project": {"type": "object"}, "activeComp": {"type": ["object", "null"]}}), &["project", "activeComp"]),
+        "render_preview" | "render_frame" => object(
+            json!({
+                "comp": {"type": ["integer", "string", "null"], "description": "Composition id (null for an `item` render)."},
+                "item": {"type": "integer", "description": "The footage or solid item rendered (with `item`)."},
+                "layer": {"type": "integer", "description": "The soloed layer (with `layer`)."},
+                "time": {"type": "number", "description": "Comp time in seconds."},
+                "frame": int,
+                "width": int, "height": int,
+                "scale": {"type": "number", "description": "Output pixels per comp pixel."},
+                "region": {"type": "array", "items": {"type": "number"}, "description": "The rendered [x, y, w, h] (with `region`)."},
+                "overlays": {"type": "array", "items": {"type": "string"}},
+                "layers": {"type": "array", "items": {"type": "object"}, "description": "Drawn layers with comp-space `bounds` and `anchor` (with bounds / anchor / motionPath overlays)."},
+                "path": {"type": "string", "description": "Where the PNG was written (with `path`)."}
+            }),
+            &["comp", "time", "width", "height"],
+        ),
+        "render_frames" => object(
+            json!({
+                "times": {"type": "array", "items": {"type": "number"}}, "frames": {"type": "array", "items": int},
+                "count": int, "requested": int, "cols": int, "rows": int,
+                "cell": {"type": "array", "items": int}, "width": int, "height": int,
+                "path": {"type": "string"}, "gif": {"type": "string"}
+            }),
+            &["times", "frames", "count", "cols", "rows", "cell", "width", "height"],
+        ),
+        "undo" | "redo" => object(json!({"steps": int, "undoStack": {"type": "array", "items": {"type": "string"}}}), &["steps", "undoStack"]),
+        "history" => {
+            object(json!({"states": {"type": "array", "items": {"type": "object"}}, "current": {"type": ["integer", "null"]}, "branches": int}), &["states"])
+        }
+        "command_batch" => object(
+            json!({
+                "completed": int, "failed": int,
+                "results": {"type": "array", "items": object(json!({"ok": {"type": "boolean"}, "result": {}, "error": {"type": "string"}}), &["ok"])}
+            }),
+            &["completed", "failed", "results"],
+        ),
+        "batch" => object(json!({"steps": int, "results": {"type": "array"}}), &["steps", "results"]),
+        "save_project" => object(json!({"path": {"type": ["string", "null"]}, "dirty": {"type": "boolean"}}), &["path", "dirty"]),
+        "get_layout" => object(
+            json!({
+                "comp": int, "time": {"type": "number"}, "width": int, "height": int,
+                "layers": {"type": "array", "items": object(json!({"id": int, "name": {"type": "string"}, "visible": {"type": "boolean"}, "bounds": {"type": ["array", "null"]}}), &["id", "visible"])},
+                "overlaps": {"type": "array", "items": {"type": "object"}}
+            }),
+            &["comp", "time", "width", "height", "layers"],
+        ),
+        "analyze_audio" => {
+            let db = json!({"type": ["number", "null"]});
+            object(
+                json!({
+                    "comp": int, "start": {"type": "number"}, "end": {"type": "number"}, "hasAudio": {"type": "boolean"},
+                    "peakDbfs": db, "truePeakDbtp": db, "rmsDbfs": db, "integratedLufs": db,
+                    "clippedSamples": int, "silences": {"type": "array", "items": {"type": "object"}}, "channels": {"type": "array", "items": {"type": "object"}}
+                }),
+                &["comp", "start", "end", "hasAudio"],
+            )
+        }
+        _ => return None,
+    })
+}
+
+/// A JSON result as MCP `structuredContent`, which must be an object: arrays become
+/// `{"items": [...]}`, other values `{"value": v}`.
+pub fn structured(v: Value) -> Value {
+    match v {
+        Value::Object(_) => v,
+        Value::Array(_) => json!({"items": v}),
+        other => json!({"value": other}),
+    }
 }
 
 /// Run a tool by name.
@@ -126,6 +223,18 @@ fn layer_s() -> Value {
 }
 fn path_s() -> Value {
     json!({"type": "string", "description": "Property path from get_layer: match ids joined by `/`, `#n` for the nth child, or `@uid`. E.g. `transform/position`, `transform/opacity`, `transform/scale`, `transform/rotation`, `effects/#1/blurriness`, `masks/#1/feather`, `@57`."})
+}
+fn item_s() -> Value {
+    json!({"type": ["integer", "string"], "description": "Render a project item on its own instead of a comp: a footage or solid item (id or name), at source time `time`; a comp item is the same as `comp`."})
+}
+fn solo_s() -> Value {
+    json!({"type": ["integer", "string"], "description": "Render only this layer (solo, in its place in the comp): id, \"#n\" or name."})
+}
+fn region_s() -> Value {
+    json!({"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4, "description": "[x, y, w, h] in comp pixels: render just this rectangle at full resolution (clipped to the frame; `max_side` then applies to it). For detail checks on big comps."})
+}
+fn overlays_s() -> Value {
+    json!({"type": ["boolean", "array", "string"], "items": {"type": "string", "enum": ["bounds", "anchor", "motionPath", "safeMargins", "grid", "all"]}, "description": "Draw the viewer's overlays on top: `bounds` (layer boxes tagged `#n name`, in label colours), `anchor`, `motionPath` (anchor path with keyframe squares), `safeMargins`, `grid`, or `all`; true = bounds + anchor. The reply's `layers` lists each drawn layer's comp-space `bounds` and `anchor`."})
 }
 fn value_s() -> Value {
     json!({"description": "Number for 1-D properties (50), array for vectors ([960,540]), \"#rrggbb\" or [r,g,b,a] (0-1) for colours, bool for checkboxes, string for text/menus."})
@@ -378,19 +487,103 @@ fn add_keyframe(b: &mut Backend, a: &Value) -> Result<Reply> {
     json_reply(info)
 }
 
+/// The render arguments shared by render_frame / render_preview / render_frames.
+fn render_params(a: &Value, keys: &[&str]) -> Value {
+    let entries: Vec<(&str, Option<&Value>)> = keys.iter().map(|k| (*k, get(a, k))).collect();
+    obj(&entries)
+}
+
+const VIEW_KEYS: &[&str] = &["comp", "item", "layer", "time", "transparent", "region", "overlays"];
+
 fn render_frame(b: &mut Backend, a: &Value) -> Result<Reply> {
-    let max_side = get(a, "max_side").and_then(Value::as_u64).unwrap_or(960) as u32;
-    let transparent = get(a, "transparent").and_then(Value::as_bool).unwrap_or(false);
-    let f = b.render_with(get(a, "comp"), get(a, "time").and_then(Value::as_f64), max_side, transparent)?;
-    let mut info = json!({"comp": f.comp, "time": f.time, "width": f.width, "height": f.height});
+    let mut p = render_params(a, VIEW_KEYS);
+    p["max_side"] = get(a, "max_side").cloned().unwrap_or(json!(960));
+    let (png, mut info) = b.render_view(p)?;
     if let Some(p) = get(a, "path").and_then(Value::as_str) {
-        std::fs::write(p, &f.png).map_err(|e| Error::Other(format!("cannot write {p}: {e}")))?;
+        std::fs::write(p, &png).map_err(|e| Error::Other(format!("cannot write {p}: {e}")))?;
         info["path"] = json!(p);
     }
     if get(a, "inline").and_then(Value::as_bool) == Some(false) {
         return json_reply(info);
     }
-    Ok(Reply::Image { png: f.png, info })
+    Ok(Reply::Image { png, info })
+}
+
+fn render_frames(b: &mut Backend, a: &Value) -> Result<Reply> {
+    let mut p = render_params(
+        a,
+        &["comp", "item", "layer", "times", "count", "start", "end", "cols", "max_side", "labels", "transparent", "region", "overlays", "path", "gif"],
+    );
+    p["base64"] = json!(true);
+    let mut r = b.exec("render.contactSheet", p)?;
+    let png = take_png(&mut r, "render.contactSheet")?;
+    if get(a, "inline").and_then(Value::as_bool) == Some(false) {
+        return json_reply(r);
+    }
+    Ok(Reply::Image { png, info: r })
+}
+
+/// Remove and decode the base64 `png` of a render reply.
+pub(crate) fn take_png(r: &mut Value, what: &str) -> Result<Vec<u8>> {
+    let data = r.as_object_mut().and_then(|o| o.remove("png")).ok_or_else(|| Error::App(format!("{what} returned no `png`")))?;
+    crate::base64::decode(data.as_str().unwrap_or_default()).ok_or_else(|| Error::App(format!("{what}: bad base64")))
+}
+
+fn render_snapshot(b: &mut Backend, a: &Value) -> Result<Reply> {
+    let p = obj(&[
+        ("name", get(a, "name")),
+        ("comp", get(a, "comp")),
+        ("time", get(a, "time")),
+        ("max_side", get(a, "max_side")),
+        ("transparent", get(a, "transparent")),
+    ]);
+    json_reply(b.exec("render.snapshot", p)?)
+}
+
+/// Longest side of the diff heatmap returned inline.
+const DIFF_INLINE_SIDE: u32 = 768;
+
+fn render_compare(b: &mut Backend, a: &Value) -> Result<Reply> {
+    need(a, "a")?;
+    need(a, "b")?;
+    let inline = get(a, "inline").and_then(Value::as_bool) != Some(false);
+    let mut p = obj(&[
+        ("a", get(a, "a")),
+        ("b", get(a, "b")),
+        ("threshold", get(a, "threshold")),
+        ("min_psnr", get(a, "min_psnr")),
+        ("max_side", get(a, "max_side")),
+        ("amplify", get(a, "amplify")),
+        ("diff_path", get(a, "diff_path")),
+    ]);
+    if inline {
+        p["diff_inline"] = json!(true);
+    }
+    let mut r = b.exec("render.compare", p)?;
+    let diff = r.as_object_mut().and_then(|o| o.remove("diff_png"));
+    // The heatmap is worth looking at only when something changed.
+    let changed = r["changed_pixels"].as_u64().unwrap_or(0) > 0;
+    match diff.as_ref().and_then(Value::as_str).filter(|_| changed) {
+        Some(b64) => {
+            let raw = crate::base64::decode(b64).ok_or_else(|| Error::App("render.compare: bad base64".into()))?;
+            let (png, w, h) = recompress_png(&raw, DIFF_INLINE_SIDE)?;
+            r["diff_image"] = json!([w, h]);
+            Ok(Reply::Image { png, info: r })
+        }
+        None => json_reply(r),
+    }
+}
+
+fn frame_source_s() -> Value {
+    json!({
+        "description": "A snapshot name (string), {\"snapshot\": name}, {\"path\": \"file.png\"} (PNG/JPEG, e.g. a golden or an After Effects reference render) or {\"comp\"?, \"time\"?, \"transparent\"?} to render now ({} = active comp at the current time).",
+        "oneOf": [
+            {"type": "string"},
+            {"type": "object", "properties": {"snapshot": {"type": "string"}}, "required": ["snapshot"], "additionalProperties": false},
+            {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"], "additionalProperties": false},
+            {"type": "object", "properties": {"comp": comp_s(), "time": {"type": "number"}, "transparent": {"type": "boolean"}}, "additionalProperties": false}
+        ]
+    })
 }
 
 fn open_project(b: &mut Backend, a: &Value) -> Result<Reply> {
@@ -472,7 +665,58 @@ fn batch_tool(b: &mut Backend, a: &Value) -> Result<Reply> {
     json_reply(b.exec("engine.batch", obj(&[("steps", Some(&steps)), ("label", get(a, "label")), ("atomic", get(a, "atomic"))]))?)
 }
 
-// ------------------------------------------------------------------ bridge-only tools
+// ------------------------------------------------------------------ analysis tools
+
+fn get_layout(b: &mut Backend, a: &Value) -> Result<Reply> {
+    let layers = match get(a, "layers") {
+        Some(Value::Array(v)) => Some(json!(v)),
+        Some(v) => Some(json!([v])),
+        None => None,
+    };
+    let p =
+        obj(&[("comp", get(a, "comp")), ("time", get(a, "time")), ("layers", layers.as_ref()), ("pixels", get(a, "pixels")), ("overlaps", get(a, "overlaps"))]);
+    json_reply(b.exec("layer.bounds", p)?)
+}
+
+fn analyze_audio(b: &mut Backend, a: &Value) -> Result<Reply> {
+    let waveform = get(a, "waveform").and_then(Value::as_bool).unwrap_or(false);
+    let on = json!(true);
+    let p = obj(&[
+        ("comp", get(a, "comp")),
+        ("start", get(a, "start")),
+        ("end", get(a, "end")),
+        ("layer", get(a, "layer")),
+        ("silenceDb", get(a, "silence_db")),
+        ("minSilence", get(a, "min_silence")),
+        ("truePeak", get(a, "true_peak")),
+        ("waveform", waveform.then_some(&on)),
+        ("width", get(a, "width")),
+        ("height", get(a, "height")),
+        ("path", get(a, "path")),
+    ]);
+    let mut info = b.exec("audio.analyze", p)?;
+    let Some(w) = info.get_mut("waveform").and_then(Value::as_object_mut) else { return json_reply(info) };
+    // Draw the waveform here from its columns (headless or bridged alike) and drop them.
+    let cols: Vec<[f32; 4]> = w
+        .remove("columns")
+        .and_then(|c| c.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .map(|c| {
+            let f = |i: usize| c.get(i).and_then(Value::as_f64).unwrap_or(0.0) as f32;
+            [f(0), f(1), f(2), f(3)]
+        })
+        .collect();
+    let height = w.get("height").and_then(Value::as_u64).unwrap_or(160) as u32;
+    if !waveform || cols.is_empty() {
+        return json_reply(info);
+    }
+    let (pw, ph, rgba) = effectcraft_engine::audio_analysis::waveform_rgba(&cols, height);
+    let png = encode_png(pw, ph, rgba, 0)?;
+    Ok(Reply::Image { png, info })
+}
+
+// ------------------------------------------------------------------ UI tools (bridge or offscreen UI)
 
 fn screenshot(b: &mut Backend, a: &Value) -> Result<Reply> {
     let max_side = get(a, "max_side").and_then(Value::as_u64).unwrap_or(1600) as u32;
@@ -524,7 +768,7 @@ fn control(b: &mut Backend, a: &Value) -> Result<Reply> {
 static TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "list_commands",
-        description: "List engine commands: id, label, menu path, shortcut, `params` doc (e.g. `{name?, width?, height?, frameRate?, duration? (s)}`) and whether it can run now (`why` if not). Every menu item, shortcut and panel gesture maps to one of these ids; run them with execute_command. Narrow with `filter` (e.g. `layer.new`, `keys`, `effect`).",
+        description: "List engine commands: id, label, menu path, shortcut, `params` doc (e.g. `{name?, width?, height?, frameRate?, duration? (s)}`) and whether it can run now (`why` if not). Every menu item, shortcut and panel gesture maps to one of these ids; run them with command_run. Narrow with `filter` (e.g. `layer.new`, `keys`, `effect`).",
         bridge_only: false,
         schema: || {
             schema(
@@ -540,7 +784,7 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "describe_command",
-        description: "One command in full: id, label, menu path, shortcut, the `params` doc, a JSON Schema of its parameters (`schema`: properties, required, additionalProperties) and whether it can run now (`why` if not). Use before execute_command when unsure of the parameters; execute_command rejects unknown keys.",
+        description: "One command in full: id, label, menu path, shortcut, the `params` doc, a JSON Schema of its parameters (`schema`: properties, required, additionalProperties) and whether it can run now (`why` if not). Use before command_run when unsure of the parameters; command_run rejects unknown keys.",
         bridge_only: false,
         schema: || {
             schema(
@@ -557,9 +801,9 @@ static TOOLS: &[ToolDef] = &[
         schema: || {
             schema(
                 json!({
-                    "command": {"type": "string", "description": "Command id, e.g. `comp.new`, `layer.newText`, `effect.apply` (see list_commands)."},
+                    "command": {"type": "string", "description": "Command id, e.g. `comp.new`, `layer.newText`, `effect.apply` (see command_list)."},
                     "id": {"type": "string", "description": "Alias of `command`."},
-                    "params": {"type": "object", "description": "Command parameters as documented by list_commands.", "additionalProperties": true}
+                    "params": {"type": "object", "description": "Command parameters as documented by command_list.", "additionalProperties": true}
                 }),
                 &[],
             )
@@ -684,7 +928,7 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "list_fonts",
-        description: "The font families text layers can use, bundled and installed on this machine: family, styles, origin (bundled / system / user) and the name in the font's own language. Narrow with `query`; `rescan` picks up fonts installed since launch. Set one with execute_command `layer.setText {\"layer\", \"font\", \"style\"}`.",
+        description: "The font families text layers can use, bundled and installed on this machine: family, styles, origin (bundled / system / user) and the name in the font's own language. Narrow with `query`; `rescan` picks up fonts installed since launch. Set one with command_run `layer.setText {\"layer\", \"font\", \"style\"}`.",
         bridge_only: false,
         schema: || {
             schema(
@@ -706,14 +950,18 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "render_frame",
-        description: "Render a composition frame (default: the active comp at the current time) and return it as a PNG image, longest side `max_side` (default 960, 0 = full size). `path` also writes the PNG to disk; `inline: false` returns only the metadata. Use it to check your work.",
+        description: "Render a composition frame (default: the active comp at the current time) and return it as a PNG image, longest side `max_side` (default 960, 0 = full size). `region` renders one rectangle at full resolution (detail checks); `layer` renders one layer solo; `item` renders a footage or solid item on its own; `overlays` draws layer bounds, anchor points, motion paths, safe margins or the grid on top and lists each layer's comp-space bounds. `path` also writes the PNG to disk; `inline: false` returns only the metadata. Use it to check your work; render_frames shows several times at once.",
         bridge_only: false,
         schema: || {
             schema(
                 json!({
                     "comp": comp_s(),
-                    "time": {"type": "number", "description": "Comp time in seconds (default: current time)."},
-                    "max_side": {"type": "integer", "description": "Longest side in pixels (default 960; 0 = full comp size)."},
+                    "item": item_s(),
+                    "layer": solo_s(),
+                    "time": {"type": "number", "description": "Comp time in seconds (default: current time); source time for `item`."},
+                    "max_side": {"type": "integer", "description": "Longest side in pixels (default 960; 0 = full size of the frame or region)."},
+                    "region": region_s(),
+                    "overlays": overlays_s(),
                     "path": {"type": "string", "description": "Also write the PNG here."},
                     "inline": {"type": "boolean", "description": "Include the image in the reply (default true)."},
                     "transparent": {"type": "boolean", "description": "Keep the frame's alpha (RGBA PNG, as an RGB + Alpha render writes it) instead of compositing over the comp's background colour."}
@@ -722,6 +970,116 @@ static TOOLS: &[ToolDef] = &[
             )
         },
         run: render_frame,
+    },
+    ToolDef {
+        name: "render_frames",
+        description: "Several frames on ONE contact-sheet PNG, each cell labelled with its time and frame number: check an animation in one call. `times` (seconds) or `count` frames (default 6, at most 64) spread evenly over `start`..`end` (default the work area). `max_side` is the sheet's longest side (default 1600); `cols` overrides the grid. Takes render_preview's `layer`, `item`, `region`, `overlays` and `transparent`. `path` also writes the sheet, `gif` also writes an animated GIF of the frames. Returns the image plus {times, frames, cols, rows, cell, width, height}.",
+        bridge_only: false,
+        schema: || {
+            schema(
+                json!({
+                    "comp": comp_s(),
+                    "item": item_s(),
+                    "layer": solo_s(),
+                    "times": {"type": "array", "items": {"type": "number"}, "description": "Comp times in seconds (at most 64)."},
+                    "count": {"type": "integer", "minimum": 1, "description": "Frames spread evenly from `start` to `end` when `times` is not given (default 6, capped at 64)."},
+                    "start": {"type": "number", "description": "First time in seconds (default: work area start)."},
+                    "end": {"type": "number", "description": "End time in seconds, exclusive (default: work area end)."},
+                    "cols": {"type": "integer", "minimum": 1, "description": "Columns (default: a grid close to 16:10)."},
+                    "max_side": {"type": "integer", "description": "Longest side of the whole sheet in pixels (default 1600, 64-8192; 0 = 8192). Cells never exceed the frame's own size."},
+                    "labels": {"type": "boolean", "description": "Label each cell with its time and frame number (default true)."},
+                    "region": region_s(),
+                    "overlays": overlays_s(),
+                    "transparent": {"type": "boolean", "description": "Keep alpha (transparent gutters) instead of compositing over the comp background."},
+                    "path": {"type": "string", "description": "Also write the sheet PNG here."},
+                    "gif": {"type": "string", "description": "Also write an animated GIF of the frames here (delays follow the times)."},
+                    "inline": {"type": "boolean", "description": "Include the image in the reply (default true)."}
+                }),
+                &[],
+            )
+        },
+        run: render_frames,
+    },
+    ToolDef {
+        name: "get_layout",
+        description: "Where layers are on screen at a comp time (layer.bounds), without rendering: per layer whether it is drawn (`visible`; `why` not: in/out, Video switch, opacity 0, solo, guide...), its comp-space axis-aligned `bounds` [x,y,w,h] after transform, parenting and (3D) the active camera, the four `corners` (rotated layers), `center`, `anchorInComp`, the raw `position`/`anchor`, `onScreen` (0-1 share inside the comp frame) and the layer-space `source` rect (sourceRectAtTime). `pixels: true` also measures the drawn pixels (`pixelBounds`: masks, effects, styles); `overlaps: true` lists pairwise overlaps of the visible layers. Use it to check a title is centred, on screen or clear of other layers.",
+        bridge_only: false,
+        schema: || {
+            schema(
+                json!({
+                    "comp": comp_s(),
+                    "time": {"type": "number", "description": "Comp time in seconds (default: current time)."},
+                    "layers": {"type": "array", "items": layer_s(), "description": "Layers to measure (default every layer)."},
+                    "pixels": {"type": "boolean", "description": "Also measure the drawn pixels incl. effects (renders each layer)."},
+                    "overlaps": {"type": "boolean", "description": "Also return pairwise overlaps {layers, area, fraction} of the visible layers."}
+                }),
+                &[],
+            )
+        },
+        run: get_layout,
+    },
+    ToolDef {
+        name: "analyze_audio",
+        description: "Measure the comp's audio mix (what preview and export play) over [start, end) seconds (audio.analyze): peakDbfs, truePeakDbtp (4x oversampled), rmsDbfs, integratedLufs (ITU-R BS.1770, gated), momentary / short-term max LUFS, clippedSamples, silent ranges (below silence_db for at least min_silence s) and per-channel stats; null levels mean silence. `layer` measures one layer alone. `waveform: true` returns a waveform image (left channel on top, red where it clips). A comp without audio returns hasAudio: false.",
+        bridge_only: false,
+        schema: || {
+            schema(
+                json!({
+                    "comp": comp_s(),
+                    "start": {"type": "number", "description": "Start, comp seconds (default 0)."},
+                    "end": {"type": "number", "description": "End, comp seconds (default the comp's duration)."},
+                    "layer": layer_s(),
+                    "silence_db": {"type": "number", "description": "Silence threshold in dBFS (default -60)."},
+                    "min_silence": {"type": "number", "description": "Shortest silence reported, seconds (default 0.25)."},
+                    "true_peak": {"type": "boolean", "description": "Estimate the true peak (default true)."},
+                    "waveform": {"type": "boolean", "description": "Return a waveform image."},
+                    "width": {"type": "integer", "description": "Waveform width in pixels (default 800)."},
+                    "height": {"type": "integer", "description": "Waveform height in pixels (default 160)."},
+                    "path": {"type": "string", "description": "Also write the waveform PNG here."}
+                }),
+                &[],
+            )
+        },
+        run: analyze_audio,
+    },
+    ToolDef {
+        name: "render_snapshot",
+        description: "Render a frame (default: the active comp at the current time) and keep it in the session under `name`, for render_compare. Verify an edit by looking: render_snapshot {\"name\":\"before\"} -> edit -> render_compare {\"a\":\"before\",\"b\":{}}. Up to 16 are kept (oldest dropped); taking a name again replaces it.",
+        bridge_only: false,
+        schema: || {
+            schema(
+                json!({
+                    "name": {"type": "string", "description": "Snapshot name."},
+                    "comp": comp_s(),
+                    "time": {"type": "number", "description": "Comp time in seconds (default: current time)."},
+                    "max_side": {"type": "integer", "minimum": 0, "description": "Longest side in pixels (default 0 = full comp size)."},
+                    "transparent": {"type": "boolean", "description": "Keep the frame's alpha instead of compositing over the comp background."}
+                }),
+                &["name"],
+            )
+        },
+        run: render_snapshot,
+    },
+    ToolDef {
+        name: "render_compare",
+        description: "Compare two frames: snapshots (render_snapshot), image files (goldens, After Effects reference renders) or frames rendered now. Returns {width, height, max_abs, mean_abs (8-bit levels), alpha_max_abs, psnr_db (\"inf\" when identical), ssim, changed_pixels, changed_pct, pass} and, when something changed, the diff heatmap as an image (red -> yellow -> white by size of difference, over frame a dimmed to grey). `pass` = no channel differs by more than `threshold` levels (default 1), or with `min_psnr` PSNR >= min_psnr. Sizes: `max_side` scales both down first; the same aspect ratio at different sizes compares at the smaller size; different aspect ratios are an error.",
+        bridge_only: false,
+        schema: || {
+            schema(
+                json!({
+                    "a": frame_source_s(),
+                    "b": frame_source_s(),
+                    "threshold": {"type": "number", "minimum": 0, "maximum": 255, "description": "Per-channel tolerance in 8-bit levels for `changed_pixels` and `pass` (default 1)."},
+                    "min_psnr": {"type": "number", "minimum": 0, "description": "Pass when PSNR (dB) is at least this, instead of the exact threshold test (e.g. 35 for another app's render)."},
+                    "max_side": {"type": "integer", "minimum": 0, "description": "Scale both down to this longest side before comparing (0 = full size, the default)."},
+                    "amplify": {"type": "number", "minimum": 1, "maximum": 255, "description": "Heatmap gain (default 8: a 32-level difference is white)."},
+                    "diff_path": {"type": "string", "description": "Also write the heatmap PNG here (full size)."},
+                    "inline": {"type": "boolean", "description": "Include the heatmap image in the reply when something changed (default true)."}
+                }),
+                &["a", "b"],
+            )
+        },
+        run: render_compare,
     },
     ToolDef {
         name: "open_project",
@@ -780,7 +1138,7 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "screenshot",
-        description: "Screenshot of the live app window, or one panel (`Composition`, `Timeline`, `EffectControls`, `Project`, ...) or element id, as PNG (longest side `max_side`, default 1600). Use it to check what the UI looks like after an action.",
+        description: "Screenshot of the app window (the live one when bridged, the offscreen one with `mcp --ui`), or one panel (`Composition`, `Timeline`, `EffectControls`, `Project`, ...) or element id, as PNG (longest side `max_side`, default 1600). Use it to check what the UI looks like after an action.",
         bridge_only: true,
         schema: || {
             schema(
@@ -891,7 +1249,7 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "command_list",
-        description: "List engine commands: id, label, menu path, shortcut, `params` doc (e.g. `{name?, width?, height?, frameRate?, duration? (s)}`) and whether it can run now (`why` if not). Every menu item, shortcut and panel gesture maps to one of these ids; run them with execute_command. Narrow with `filter` (e.g. `layer.new`, `keys`, `effect`).",
+        description: "List engine commands: id, label, menu path, shortcut, `params` doc (e.g. `{name?, width?, height?, frameRate?, duration? (s)}`) and whether it can run now (`why` if not). Every menu item, shortcut and panel gesture maps to one of these ids; run them with command_run. Narrow with `filter` (e.g. `layer.new`, `keys`, `effect`).",
         bridge_only: false,
         schema: || {
             schema(
@@ -912,8 +1270,8 @@ static TOOLS: &[ToolDef] = &[
         schema: || {
             schema(
                 json!({
-                    "id": {"type": "string", "description": "Command id, e.g. `comp.new`, `layer.newText`, `effect.apply` (see list_commands)."},
-                    "params": {"type": "object", "description": "Command parameters as documented by list_commands.", "additionalProperties": true}
+                    "id": {"type": "string", "description": "Command id, e.g. `comp.new`, `layer.newText`, `effect.apply` (see command_list)."},
+                    "params": {"type": "object", "description": "Command parameters as documented by command_list.", "additionalProperties": true}
                 }),
                 &["id"],
             )
@@ -922,14 +1280,20 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "render_preview",
-        description: "Render a composition frame (default: the active comp at the current time) and return it as a PNG image, longest side `max_side` (default 960, 0 = full size). Use it to check your work.",
+        description: "Render a composition frame (default: the active comp at the current time, in comp seconds) and return it as a PNG image, longest side `max_side` (default 960, 0 = full size). `region` renders one rectangle at full resolution (detail checks); `layer` renders one layer solo; `item` renders a footage or solid item on its own; `overlays` draws layer bounds, anchor points, motion paths, safe margins or the grid on top and lists each layer's comp-space bounds. `path` also writes the PNG to disk; `inline: false` returns only the metadata. Use it to check your work; render_frames shows several times at once.",
         bridge_only: false,
         schema: || {
             schema(
                 json!({
                     "comp": comp_s(),
-                    "time": {"type": "number", "description": "Comp time in seconds (default: current time)."},
-                    "max_side": {"type": "integer", "description": "Longest side in pixels (default 960; 0 = full comp size)."},
+                    "item": item_s(),
+                    "layer": solo_s(),
+                    "time": {"type": "number", "description": "Comp time in seconds (default: current time); source time for `item`."},
+                    "max_side": {"type": "integer", "description": "Longest side in pixels (default 960; 0 = full size of the frame or region)."},
+                    "region": region_s(),
+                    "overlays": overlays_s(),
+                    "path": {"type": "string", "description": "Also write the PNG here."},
+                    "inline": {"type": "boolean", "description": "Include the image in the reply (default true)."},
                     "transparent": {"type": "boolean", "description": "Keep the frame's alpha (RGBA PNG, as an RGB + Alpha render writes it) instead of compositing over the comp's background colour."}
                 }),
                 &[],

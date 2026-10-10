@@ -1,16 +1,18 @@
-//! Where tools run: an in-process session, or the desktop app over its control channel.
+//! Where tools run: an in-process session, or an app reached through its control channel (the
+//! desktop app over TCP, or an offscreen app in this process).
 
 use effectcraft_engine::Session;
 use effectcraft_engine::time::Tick;
 use serde_json::{Value, json};
 
-use crate::{BridgeClient, Error, Result, base64, encode_png, recompress_png};
+use crate::{BridgeClient, ControlTransport, Error, Result, base64, encode_png, recompress_png};
 
 pub enum Backend {
     /// An in-process session (no window): engine commands, inspection and rendering.
     Headless(Box<Session>),
-    /// A running desktop app reached over its control channel: everything, plus the live UI.
-    Bridge(BridgeClient),
+    /// An app reached through its control channel (a running desktop app, or the offscreen UI of
+    /// `mcp --ui`): everything, plus the UI.
+    Bridge(Box<dyn ControlTransport>),
 }
 
 /// A rendered comp frame.
@@ -29,11 +31,25 @@ impl Backend {
 
     /// Bridge to the app's control channel at `addr` (`9877` or `127.0.0.1:9877`).
     pub fn bridge(addr: &str) -> Result<Self> {
-        Ok(Backend::Bridge(BridgeClient::new(addr)?))
+        Ok(Backend::Bridge(Box::new(BridgeClient::new(addr)?)))
     }
 
+    /// Drive an app through any control transport (e.g. an offscreen UI in this process).
+    pub fn transport(t: impl ControlTransport + 'static) -> Self {
+        Backend::Bridge(Box::new(t))
+    }
+
+    /// Whether tools reach an app with a UI (bridge-only tools such as `screenshot` and `ui_*` work).
     pub fn is_bridge(&self) -> bool {
         matches!(self, Backend::Bridge(_))
+    }
+
+    /// `headless`, or the transport's mode (`bridge`, `headless-ui`).
+    pub fn mode(&self) -> &'static str {
+        match self {
+            Backend::Headless(_) => "headless",
+            Backend::Bridge(t) => t.mode(),
+        }
     }
 
     pub fn session(&mut self) -> Option<&mut Session> {
@@ -49,7 +65,10 @@ impl Backend {
         match self {
             Backend::Headless(s) => {
                 let r = s.execute_checked(id, params);
-                s.drain_events();
+                // Toasts (user-facing warnings) stay for the MCP log; other events are dropped.
+                s.events.retain(|e| matches!(e, effectcraft_engine::Event::Toast { .. }));
+                let excess = s.events.len().saturating_sub(MAX_TOASTS);
+                s.events.drain(..excess);
                 Ok(r?)
             }
             Backend::Bridge(b) => b.call("engine.execute", json!({"command": id, "params": params})),
@@ -62,6 +81,30 @@ impl Backend {
             Backend::Bridge(b) => b.call(method, if params.is_null() { json!({}) } else { params }),
             Backend::Headless(_) => Err(Error::BadArgs(NEED_BRIDGE.into())),
         }
+    }
+
+    /// `render.frame` with `params` (`comp | item`, `layer`, `time`, `max_side`, `transparent`,
+    /// `region`, `overlays`): the engine command headless, the control method bridged (the app
+    /// runs the same engine code). Returns the PNG and the reply without it.
+    pub fn render_view(&mut self, mut params: Value) -> Result<(Vec<u8>, Value)> {
+        let max_side = params.get("max_side").and_then(Value::as_u64).unwrap_or(0).min(u32::MAX as u64) as u32;
+        params["base64"] = json!(true);
+        let mut r = match self {
+            Backend::Headless(_) => self.exec("render.frame", params)?,
+            Backend::Bridge(b) => b.call("render.frame", params)?,
+        };
+        let raw = crate::tools::take_png(&mut r, "render.frame")?;
+        // (an older app may ignore `max_side`)
+        let png = match crate::png_size(&raw) {
+            Some((w, h)) if max_side > 0 && w.max(h) > max_side => {
+                let (png, w, h) = recompress_png(&raw, max_side)?;
+                r["width"] = json!(w);
+                r["height"] = json!(h);
+                png
+            }
+            _ => raw,
+        };
+        Ok((png, r))
     }
 
     /// Render a comp frame (comp time `time` seconds, default the CTI) as PNG, longest side at most
@@ -102,12 +145,14 @@ impl Backend {
     }
 }
 
+/// Toasts kept between MCP requests at most.
+const MAX_TOASTS: usize = 100;
+
 fn no_comp(comp: Option<&Value>) -> Error {
     match comp.filter(|c| !c.is_null()) {
-        Some(c) => Error::BadArgs(format!("no composition {c} (see get_project)")),
-        None => Error::BadArgs("no active composition: create one (execute_command comp.new) or open a project".into()),
+        Some(c) => Error::BadArgs(format!("no composition {c} (see doc_inspect)")),
+        None => Error::BadArgs("no active composition: create one (command_run comp.new) or open a project".into()),
     }
 }
 
-pub const NEED_BRIDGE: &str =
-    "this tool drives the live app: start it with `effectcraft --control 9877` and run the MCP server as `effectcraft-cli mcp --bridge 9877`";
+pub const NEED_BRIDGE: &str = "this tool needs the app's UI: run the MCP server as `effectcraft-cli mcp --ui` (the full app offscreen, no window), or start the app with `effectcraft --control 9877` and run `effectcraft-cli mcp --bridge 9877`";
