@@ -1271,6 +1271,11 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         let span = ((graph_x1 - graph_x0 - 6.0) as f64 / pps).max(0.0);
         app.ui.timeline.start = page_to_cti(app.ui.timeline.start, span, comp.duration.seconds(), app.session.time().seconds());
     }
+    // As in After Effects, the ruler never scrolls past the comp's end: zoomed in, the last
+    // visible time is at most the comp duration.
+    let visible_secs = ((graph_x1 - graph_x0 - 6.0).max(1.0) as f64 / pps.max(1e-6)).max(0.0);
+    let max_start = (comp.duration.seconds() - visible_secs).max(0.0);
+    app.ui.timeline.start = app.ui.timeline.start.clamp(0.0, max_start);
     let tm = TMap { x0: graph_x0 + 6.0, start: app.ui.timeline.start, pps };
     ctx.data_mut(|d| d.insert_temp(tl_map_id(), (tm.x0, tm.start, tm.pps)));
     let top = rect.min.y;
@@ -1561,6 +1566,17 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         let tt = Tick::from_seconds_f64(secs);
         app.session.set_time(tt);
         app.stop();
+        // Dragged past either edge of the ruler (over the layer outline, say), the view scrolls so
+        // the current time indicator stays in sight (After Effects).
+        if app.ui.timeline.pps.is_some() {
+            let now = app.session.time().seconds();
+            let span = tm.t(bin.min.x) - tm.start;
+            if now < tm.start {
+                app.ui.timeline.start = now.max(0.0);
+            } else if now > tm.start + span {
+                app.ui.timeline.start = (now - span).max(0.0);
+            }
+        }
         // Ctrl/Cmd-drag scrubs the audio too (After Effects).
         if rresp.dragged()
             && ui.input(|i| i.modifiers.command)

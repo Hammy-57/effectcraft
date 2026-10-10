@@ -169,3 +169,29 @@ fn azerty_physical_zoom_keys_zoom_the_graph() {
     let (_, span2) = view(&h);
     assert!(span2 > span1 * 1.2, "Physical+Minus zooms the graph out: {span1} -> {span2}");
 }
+
+#[test]
+fn zoomed_in_the_ruler_stops_at_the_comp_end_and_a_scrub_past_the_edge_scrolls() {
+    let mut h = harness(false);
+    for _ in 0..4 {
+        send(&mut h, "ui.key", json!({"key": "="}));
+    }
+    // Scrolled as far right as it goes: the view ends at the comp's end, not past it (AE).
+    h.state_mut().ui.timeline.start = 9.9;
+    h.run_steps(3);
+    let (start, span) = view(&h);
+    assert!(span < 9.0, "zoomed in: {span}");
+    assert!((start + span - 10.0).abs() < 0.05, "the view ends at 10 s: {start} + {span}");
+    // A click at the ruler's right end puts the CTI there.
+    let ruler = h.state().auto.find("timeline.ruler").unwrap().rect;
+    let y = ruler[1] + ruler[3] - 4.0;
+    send(&mut h, "ui.click", json!({"x": ruler[0] + ruler[2] - 26.0, "y": y}));
+    let t = h.state().session.time().seconds();
+    assert!(t > start + span * 0.9, "the CTI jumps to the click near the end: {t}");
+    // Dragged from the ruler out over the layer outline, the view scrolls with the CTI.
+    send(&mut h, "ui.drag", json!({"from": {"x": ruler[0] + 40.0, "y": y}, "to": {"x": ruler[0] - 200.0, "y": y}, "steps": 20}));
+    let (start2, span2) = view(&h);
+    let t2 = h.state().session.time().seconds();
+    assert!(t2 < start, "the CTI moved left of the old view: {t2} vs {start}");
+    assert!(t2 >= start2 - 1e-6 && t2 <= start2 + span2, "the CTI stays in view: {t2} in {start2}+{span2}");
+}
