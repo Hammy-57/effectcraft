@@ -18,6 +18,10 @@ impl<'a> Renderer<'a> {
         // The footprint only covers the window the layer reaches: the comp outside it is kept.
         let mo = MotionMemo::default();
         let win = self.reach(ctx, layer, &[&foot], &mo, (canvas.width, canvas.height));
+        if win.is_empty() {
+            // Off the comp: its effects would change nothing.
+            return;
+        }
         let mut matte = pool::zeroed(win.w, win.h);
         self.place_at(ctx, layer, &foot, &mut matte, win.origin(), BlendMode::Normal, 1.0, &mo);
         // A track matte limits where the adjustment applies (SceneYard UI Google search: a

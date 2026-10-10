@@ -30,11 +30,18 @@ impl<'a> Renderer<'a> {
             return Region::Empty;
         }
         if layer.switches.adjustment {
+            // At opacity 0 the adjusted comp is mixed in at 0: nothing to run.
+            if opacity <= 0.0 {
+                return Region::Empty;
+            }
             self.draw_adjustment(ctx, layer, canvas, opacity);
             return Region::Full;
         }
         // The layer's transforms are evaluated once for all of its buffers and steps.
         let mo = MotionMemo::default();
+        if self.off_canvas(ctx, layer, (canvas.width, canvas.height), &mo) {
+            return Region::Empty;
+        }
         let mut timing = self.profile.map(|_| LayerTiming { depth: self.depth, layer: layer.name.clone(), ..Default::default() });
         let t0 = web_time::Instant::now();
         let Some(st) = self.styled_blend(ctx, layer, timing.as_mut()) else { return Region::Empty };

@@ -56,7 +56,7 @@ impl<'a> Renderer<'a> {
 
     /// Whether a layer moves within the shutter: its own motion blur, or that of a collapsed
     /// precomp layer it is drawn through.
-    fn blurred(&self, ctx: &EvalCtx, layer: &Layer) -> bool {
+    pub(crate) fn blurred(&self, ctx: &EvalCtx, layer: &Layer) -> bool {
         self.mb_on(ctx, layer) || (!self.through_lost && self.links().any(|l| l.blur))
     }
 

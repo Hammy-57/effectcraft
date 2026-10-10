@@ -227,3 +227,57 @@ fn motion_blur_accumulates_only_the_window_it_reaches() {
         });
     }
 }
+
+/// Layers drawn this frame (the per-layer timing sink records each one that renders).
+fn drawn(p: &Project, cid: ItemId, t: f64) -> (Image, Vec<String>) {
+    let prof = std::sync::Mutex::new(vec![]);
+    let mut r = Renderer::new(p, &NoFootage, RenderOpts::default());
+    r.profile = Some(&prof);
+    let img = r.comp_frame(cid, Tick::from_seconds_f64(t));
+    let names = prof.into_inner().unwrap().into_iter().map(|t| t.layer).collect();
+    (img, names)
+}
+
+/// Off-comp layers are skipped before their source renders; ones that reach the comp by a pixel,
+/// grow through effects or styles, or blur into it are still drawn.
+#[test]
+fn layers_off_the_comp_are_not_rendered() {
+    let (mut p, cid, comp) = setup();
+    let named = |p: &mut Project, name: &str, pos: [f64; 2], f: &dyn Fn(&mut Project, &mut Layer)| {
+        let mut l = solid(p, &comp, [0.4, 0.6, 0.8], 40, 30);
+        l.name = name.into();
+        l.props.prop_mut("transform/position").unwrap().value = Value::Vec3([pos[0], pos[1], 0.0]);
+        f(p, &mut l);
+        l
+    };
+    let none = |_: &mut Project, _: &mut Layer| {};
+    let off = named(&mut p, "off", [400.0, 50.0], &none);
+    let off_multiply = named(&mut p, "off multiply", [-300.0, -200.0], &|_, l| l.blend_mode = BlendMode::Multiply);
+    // Its right edge (x 1) is just inside the comp.
+    let edge = named(&mut p, "edge", [-19.0, 50.0], &none);
+    let fx = named(&mut p, "off fx", [400.0, 50.0], &|p, l| {
+        let spec = effectcraft_effects::find("ec.blur.gaussian").unwrap();
+        let mut next = p.next_id;
+        let g = effectcraft_effects::instantiate(spec, &mut Ids(&mut next), spec.name, [40.0, 30.0]);
+        p.next_id = next;
+        l.props.sub_mut("effects").unwrap().children.push(g.into());
+    });
+    let stencil = named(&mut p, "off stencil", [400.0, 50.0], &|_, l| l.blend_mode = BlendMode::StencilAlpha);
+    let mut adj = named(&mut p, "adjustment", [100.0, 50.0], &|_, l| l.props.prop_mut("transform/opacity").unwrap().value = Value::Scalar(0.0));
+    adj.switches.adjustment = true;
+    let bg = solid(&mut p, &comp, [0.9, 0.4, 0.1], 200, 100);
+    let layers = vec![adj, off, off_multiply, edge, fx, bg.clone()];
+    p.comp_mut(cid).unwrap().layers = layers.into();
+    let (img, names) = drawn(&p, cid, 0.0);
+    assert!(!names.iter().any(|n| n == "off" || n == "off multiply"), "off-comp layers render nothing: {names:?}");
+    assert!(names.iter().any(|n| n == "edge") && names.iter().any(|n| n == "off fx"), "{names:?}");
+    assert!(img.get(0, 50)[2] > 0.7, "the edge layer's last column: {:?}", img.get(0, 50));
+    // The same pixels as the visible layers alone (opacity-0 adjustment layer included).
+    p.comp_mut(cid).unwrap().layers = vec![named(&mut p, "edge", [-19.0, 50.0], &none), bg.clone()].into();
+    let (only, _) = drawn(&p, cid, 0.0);
+    assert!(img == only, "culled layers changed nothing");
+    // A stencil layer changes the comp outside itself: never culled.
+    p.comp_mut(cid).unwrap().layers = vec![stencil, bg].into();
+    let (_, names) = drawn(&p, cid, 0.0);
+    assert!(names.iter().any(|n| n == "off stencil"), "{names:?}");
+}

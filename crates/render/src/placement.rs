@@ -3,11 +3,11 @@
 
 use crate::color::Region;
 use crate::motion_blur::MotionMemo;
-use crate::{EvalCtx, Image, Renderer, color};
+use crate::{EvalCtx, Image, Renderer, color, source_size};
 use effectcraft_color::BlendMode;
 use effectcraft_effects::Buf;
 use effectcraft_geom::{Mat3, Rect, vec2};
-use effectcraft_project::{Layer, Quality, Sampling};
+use effectcraft_project::{ItemKind, Layer, LayerSource, Quality, Sampling};
 use effectcraft_raster::{MipChain, WarpOpts, accumulate_warp_at, composite_warp_at, pool, warp_bounds};
 
 impl<'a> Renderer<'a> {
@@ -163,6 +163,43 @@ impl<'a> Renderer<'a> {
         }
         target.blend_from_at(origin, &acc, win.origin(), mode, opacity, pl.seed);
         pool::recycle(acc);
+    }
+
+    /// Whether a 2D layer certainly draws nothing on a `w`×`h` canvas, before its source is
+    /// rendered: its source rectangle (with a margin for the buffer's rounding and the filters)
+    /// lands outside the canvas. Only layers whose pixels stay inside their source rectangle
+    /// qualify: solids, precomps and raster footage without effects or layer styles (effects
+    /// may grow the buffer or read other layers), not motion blurred, not in a stencil mode
+    /// (which changes the comp outside the layer) and not seen through a perspective.
+    pub(crate) fn off_canvas(&self, ctx: &EvalCtx, layer: &Layer, (w, h): (u32, u32), mo: &MotionMemo) -> bool {
+        let rect_source = match &layer.source {
+            LayerSource::Solid { .. } | LayerSource::Comp { .. } => true,
+            LayerSource::Footage { item } => matches!(self.project.item(*item).map(|i| &i.kind), Some(ItemKind::Footage(f)) if !crate::is_vector_footage(f)),
+            _ => false,
+        };
+        if !rect_source
+            || layer.is_3d()
+            || layer.blend_mode.is_stencil()
+            || layer.effects().is_some_and(|g| !g.children.is_empty())
+            || layer.layer_styles().is_some()
+            || self.blurred(ctx, layer)
+        {
+            return false;
+        }
+        let (sw, sh) = source_size(self.project, layer);
+        if sw == 0 || sh == 0 {
+            return false;
+        }
+        let s = self.opts.scale;
+        let m = self.out_matrix() * Mat3::scale(vec2(s, s)) * mo.still(|| self.comp_matrix(ctx, layer));
+        if !m.is_affine() {
+            return false;
+        }
+        let pad = (0.1 * sw.max(sh) as f64).max(4.0);
+        let r = m.map_rect(&Rect::new(-pad, -pad, sw as f64 + pad, sh as f64 + pad)).inflate(4.0);
+        // NaN bounds (a degenerate transform) never count as outside.
+        let outside = r.x1 < 0.0 || r.y1 < 0.0 || r.x0 > w as f64 || r.y0 > h as f64;
+        outside && [r.x0, r.y0, r.x1, r.y1].iter().all(|v| !v.is_nan())
     }
 
     /// The window of a `w`×`h` canvas that drawing `bufs` for `layer` can change: their
