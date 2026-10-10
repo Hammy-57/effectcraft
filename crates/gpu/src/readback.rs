@@ -2,7 +2,7 @@
 // Browser callbacks stay on their worker thread. The workspace's wgpu feature still
 // requires Send callbacks on non-atomic wasm, and ParticleSim requires Send + Sync.
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::Duration;
 
 pub(crate) const TIMEOUT: Duration = Duration::from_secs(10);
@@ -21,8 +21,31 @@ struct State {
     #[cfg(target_arch = "wasm32")]
     timer_armed: bool,
 }
+/// Wakes the native deadline worker: it sleeps on this (no polling) while nothing is pending.
+/// Locked after [`State`] wherever both are held, so a readback started while the worker
+/// decides to sleep is never missed.
 #[derive(Default)]
-pub(crate) struct Readbacks(Mutex<State>);
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+struct Signal {
+    flags: Mutex<Flags>,
+    cv: Condvar,
+}
+#[derive(Default)]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+struct Flags {
+    /// Readbacks are pending: the worker checks their deadlines.
+    pending: bool,
+    /// The [`Readbacks`] is gone: the worker exits.
+    closed: bool,
+}
+impl Signal {
+    fn set(&self, f: impl FnOnce(&mut Flags)) {
+        f(&mut self.flags.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        self.cv.notify_all();
+    }
+}
+#[derive(Default)]
+pub(crate) struct Readbacks(Mutex<State>, Arc<Signal>);
 pub(crate) struct Ticket {
     owner: Weak<Readbacks>,
     id: u64,
@@ -51,18 +74,38 @@ impl Readbacks {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let weak = Arc::downgrade(&me);
+            let signal = me.1.clone();
             std::thread::Builder::new()
                 .name("gpu-readback-deadlines".into())
                 .spawn(move || {
                     loop {
+                        // Idle (no readback pending) costs no wakeups.
+                        {
+                            let mut f = signal.flags.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                            while !f.pending && !f.closed {
+                                f = signal.cv.wait(f).unwrap_or_else(std::sync::PoisonError::into_inner);
+                            }
+                            if f.closed {
+                                break;
+                            }
+                        }
                         std::thread::sleep(Duration::from_millis(100));
                         let Some(me) = weak.upgrade() else { break };
                         me.expire(web_time::Instant::now());
+                        me.sleep_if_idle();
                     }
                 })
                 .map_err(|e| format!("starting GPU readback deadline worker: {e}"))?;
         }
         Ok(me)
+    }
+
+    /// Nothing pending: the deadline worker waits for the next [`Readbacks::start`].
+    fn sleep_if_idle(&self) {
+        let s = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if s.pending.is_empty() {
+            self.1.set(|f| f.pending = false);
+        }
     }
 
     pub(crate) fn check(&self) -> Result<(), Error> {
@@ -85,6 +128,7 @@ impl Readbacks {
                 s.next = id;
                 if let Some(done) = done.take() {
                     s.pending.insert(id, Entry { deadline: web_time::Instant::now() + TIMEOUT, done });
+                    self.1.set(|f| f.pending = true);
                 }
                 Ok(Ticket { owner: Arc::downgrade(self), id })
             } else {
@@ -165,6 +209,7 @@ impl Readbacks {
 impl Drop for Readbacks {
     fn drop(&mut self) {
         self.retire("GPU readback context dropped".into());
+        self.1.set(|f| f.closed = true);
     }
 }
 
@@ -399,6 +444,37 @@ mod tests {
         rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(me.0.lock().unwrap().pending.is_empty());
         assert!(me.check().is_err());
+    }
+
+    /// The deadline worker sleeps (no 10 Hz polling) while nothing is pending, wakes for a new
+    /// readback, and exits with its context.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn deadline_worker_idles_without_pending_readbacks_and_exits_with_its_context() {
+        let me = Readbacks::new().unwrap();
+        let flags = |me: &Readbacks| {
+            let f = me.1.flags.lock().unwrap();
+            (f.pending, f.closed)
+        };
+        assert_eq!(flags(&me), (false, false), "idle from the start");
+        let ticket = me.start(|r| assert_eq!(r, Ok(vec![1]))).unwrap();
+        assert_eq!(flags(&me), (true, false), "a readback wakes the worker");
+        ticket.complete(Ok(vec![1]));
+        let t0 = std::time::Instant::now();
+        while flags(&me).0 && t0.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(flags(&me), (false, false), "back to sleep once nothing is pending");
+        // A later readback still times out (the worker woke up again).
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _late = me.start(move |r| tx.send(r.is_err()).unwrap()).unwrap();
+        for entry in me.0.lock().unwrap().pending.values_mut() {
+            entry.deadline = web_time::Instant::now();
+        }
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)), Ok(true));
+        let signal = me.1.clone();
+        drop(me);
+        assert!(signal.flags.lock().unwrap().closed, "the worker is told to exit");
     }
 
     #[test]
