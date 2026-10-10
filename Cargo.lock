@@ -1189,6 +1189,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "effectcraft-buildgen"
+version = "0.6.0"
+
+[[package]]
 name = "effectcraft-cli"
 version = "0.6.0"
 dependencies = [
@@ -1216,6 +1220,7 @@ dependencies = [
 name = "effectcraft-effects"
 version = "0.6.0"
 dependencies = [
+ "effectcraft-buildgen",
  "effectcraft-color",
  "effectcraft-geom",
  "effectcraft-keyframe",
@@ -1234,6 +1239,7 @@ name = "effectcraft-engine"
 version = "0.6.0"
 dependencies = [
  "effectcraft-aep",
+ "effectcraft-buildgen",
  "effectcraft-color",
  "effectcraft-effects",
  "effectcraft-geom",
@@ -1533,6 +1539,7 @@ dependencies = [
 name = "effectcraft-render"
 version = "0.6.0"
 dependencies = [
+ "effectcraft-buildgen",
  "effectcraft-color",
  "effectcraft-effects",
  "effectcraft-geom",
@@ -1624,6 +1631,7 @@ dependencies = [
 name = "effectcraft-ui-egui"
 version = "0.6.0"
 dependencies = [
+ "effectcraft-buildgen",
  "effectcraft-color",
  "effectcraft-engine",
  "effectcraft-geom",
