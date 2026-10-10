@@ -455,7 +455,7 @@ fn value_widget(app: &mut EffectcraftApp, ui: &mut egui::Ui, auto: &str, ty: Opt
 fn instance(app: &mut EffectcraftApp, ui: &mut egui::Ui, actions: &mut Actions) {
     let t = app.tokens;
     let Some(comp) = app.session.active_comp_arc() else { return };
-    let Some(layer) = app.session.state.selected_layers.iter().filter_map(|l| comp.layer(*l)).find(|l| essential::group(l).is_some()).cloned() else { return };
+    let Some(layer) = app.session.state.selected_layers.iter().filter_map(|l| comp.layer(*l)).find(|l| essential::group(l).is_some()) else { return };
     let LayerSource::Comp { item: src } = layer.source else { return };
     let Some(eg) = app.session.project.comp(src).and_then(|c| c.essential.clone()) else { return };
     let over = essential::overridden(&layer);

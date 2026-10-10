@@ -27,6 +27,12 @@ pub enum DragPayload {
 
 /// The current time formatted per project settings (timecode with `;` for drop-frame, frames
 /// or Feet + Frames).
+/// Layer `id` of `comp`, shared (a reference count, not a copy of its property tree): panels
+/// that keep the layer while they mutate the app hold this.
+pub(crate) fn layer_arc(comp: &Comp, id: effectcraft_engine::project::LayerId) -> Option<std::sync::Arc<effectcraft_engine::project::Layer>> {
+    comp.layers.arcs().iter().find(|l| l.id == id).cloned()
+}
+
 pub fn timecode(session: &Session, comp: &Comp, t: Tick) -> String {
     effectcraft_engine::commands::time::display_time(session, comp, t)
 }
