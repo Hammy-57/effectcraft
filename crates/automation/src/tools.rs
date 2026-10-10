@@ -20,7 +20,7 @@ pub enum Reply {
 pub struct ToolDef {
     pub name: &'static str,
     pub description: &'static str,
-    /// Only listed (and usable) when bridged to the running app.
+    /// Only listed (and usable) with a UI: bridged to the running app, or `mcp --ui` (offscreen).
     pub bridge_only: bool,
     schema: fn() -> Value,
     run: fn(&mut Backend, &Value) -> Result<Reply>,
@@ -80,8 +80,8 @@ const READ_ONLY: &[&str] = &[
     "ui_elements",
     "get_layout",
 ];
-/// Tools that write files without changing the project.
-const WRITES_FILES: &[&str] = &["save_project", "render_frame", "screenshot", "analyze_audio"];
+/// Tools that write files (or keep session-side frames) without changing the project.
+const WRITES_FILES: &[&str] = &["save_project", "render_frame", "screenshot", "render_snapshot", "render_compare", "analyze_audio"];
 
 /// `get_project` → "Get project".
 fn title_of(name: &str) -> String {
@@ -99,7 +99,7 @@ pub fn find(name: &str) -> Option<&'static ToolDef> {
     TOOLS.iter().find(|t| t.name == name)
 }
 
-/// The tools available on a backend (bridge-only tools are hidden in headless mode).
+/// The tools available on a backend (UI tools are hidden in headless mode without a UI).
 pub fn available(bridge: bool) -> impl Iterator<Item = &'static ToolDef> {
     TOOLS.iter().filter(move |t| bridge || !t.bridge_only)
 }
@@ -258,8 +258,13 @@ fn run_script(b: &mut Backend, a: &Value) -> Result<Reply> {
     if let Some(n) = get(a, "name") {
         p["name"] = n.clone();
     }
+    // A time limit by default, so a runaway loop can't hold the session forever; 0 = none.
+    p["timeout"] = get(a, "timeout").cloned().unwrap_or(json!(SCRIPT_TIMEOUT));
     json_reply(b.exec("script.run", p)?)
 }
+
+/// The default `run_script` time limit, in seconds.
+pub const SCRIPT_TIMEOUT: f64 = 300.0;
 
 fn get_project(b: &mut Backend, _: &Value) -> Result<Reply> {
     json_reply(b.exec("project.summary", json!({}))?)
@@ -387,6 +392,63 @@ fn render_frame(b: &mut Backend, a: &Value) -> Result<Reply> {
         return json_reply(info);
     }
     Ok(Reply::Image { png: f.png, info })
+}
+
+fn render_snapshot(b: &mut Backend, a: &Value) -> Result<Reply> {
+    let p = obj(&[
+        ("name", get(a, "name")),
+        ("comp", get(a, "comp")),
+        ("time", get(a, "time")),
+        ("max_side", get(a, "max_side")),
+        ("transparent", get(a, "transparent")),
+    ]);
+    json_reply(b.exec("render.snapshot", p)?)
+}
+
+/// Longest side of the diff heatmap returned inline.
+const DIFF_INLINE_SIDE: u32 = 768;
+
+fn render_compare(b: &mut Backend, a: &Value) -> Result<Reply> {
+    need(a, "a")?;
+    need(a, "b")?;
+    let inline = get(a, "inline").and_then(Value::as_bool) != Some(false);
+    let mut p = obj(&[
+        ("a", get(a, "a")),
+        ("b", get(a, "b")),
+        ("threshold", get(a, "threshold")),
+        ("min_psnr", get(a, "min_psnr")),
+        ("max_side", get(a, "max_side")),
+        ("amplify", get(a, "amplify")),
+        ("diff_path", get(a, "diff_path")),
+    ]);
+    if inline {
+        p["diff_inline"] = json!(true);
+    }
+    let mut r = b.exec("render.compare", p)?;
+    let diff = r.as_object_mut().and_then(|o| o.remove("diff_png"));
+    // The heatmap is worth looking at only when something changed.
+    let changed = r["changed_pixels"].as_u64().unwrap_or(0) > 0;
+    match diff.as_ref().and_then(Value::as_str).filter(|_| changed) {
+        Some(b64) => {
+            let raw = crate::base64::decode(b64).ok_or_else(|| Error::App("render.compare: bad base64".into()))?;
+            let (png, w, h) = recompress_png(&raw, DIFF_INLINE_SIDE)?;
+            r["diff_image"] = json!([w, h]);
+            Ok(Reply::Image { png, info: r })
+        }
+        None => json_reply(r),
+    }
+}
+
+fn frame_source_s() -> Value {
+    json!({
+        "description": "A snapshot name (string), {\"snapshot\": name}, {\"path\": \"file.png\"} (PNG/JPEG, e.g. a golden or an After Effects reference render) or {\"comp\"?, \"time\"?, \"transparent\"?} to render now ({} = active comp at the current time).",
+        "oneOf": [
+            {"type": "string"},
+            {"type": "object", "properties": {"snapshot": {"type": "string"}}, "required": ["snapshot"], "additionalProperties": false},
+            {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"], "additionalProperties": false},
+            {"type": "object", "properties": {"comp": comp_s(), "time": {"type": "number"}, "transparent": {"type": "boolean"}}, "additionalProperties": false}
+        ]
+    })
 }
 
 fn open_project(b: &mut Backend, a: &Value) -> Result<Reply> {
@@ -519,7 +581,7 @@ fn analyze_audio(b: &mut Backend, a: &Value) -> Result<Reply> {
     Ok(Reply::Image { png, info })
 }
 
-// ------------------------------------------------------------------ bridge-only tools
+// ------------------------------------------------------------------ UI tools (bridge or offscreen UI)
 
 fn screenshot(b: &mut Backend, a: &Value) -> Result<Reply> {
     let max_side = get(a, "max_side").and_then(Value::as_u64).unwrap_or(1600) as u32;
@@ -615,13 +677,14 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "run_script",
-        description: "Run JavaScript with an After Effects-style scripting object model (app, app.project, items.addComp, comp.layers.addSolid/addText/addShape/addNull/addCamera/addLight, layer.property(\"ADBE Transform Group\").property(\"ADBE Position\").setValueAtTime(t, v), Effects.addProperty(\"ADBE Gaussian Blur 2\"), expressions, markers, renderQueue…). Every edit is an undoable engine command; app.beginUndoGroup/endUndoGroup make one undo step. Returns {ok, result (last expression value), output (writeLn/$.writeln/alert text), error: {message, line, column} | null}. File access is limited to the project folder unless the user allows scripts to write files.",
+        description: "Run JavaScript with an After Effects-style scripting object model (app, app.project, items.addComp, comp.layers.addSolid/addText/addShape/addNull/addCamera/addLight, layer.property(\"ADBE Transform Group\").property(\"ADBE Position\").setValueAtTime(t, v), Effects.addProperty(\"ADBE Gaussian Blur 2\"), expressions, markers, renderQueue…). Every edit is an undoable engine command; app.beginUndoGroup/endUndoGroup make one undo step. Returns {ok, result (last expression value), output (writeLn/$.writeln/alert text), error: {message, line, column} | null}. Stops after `timeout` seconds (default 300, 0 = no limit) or on MCP notifications/cancelled (an open undo group is rolled back; other edits are kept). File access is limited to the project folder unless the user allows scripts to write files.",
         bridge_only: false,
         schema: || {
             schema(
                 json!({
                     "code": {"type": "string", "description": "JavaScript source, e.g. `var c = app.project.items.addComp(\"Main\", 1920, 1080, 1, 5, 30); c.layers.addText(\"Hi\"); c.numLayers`."},
-                    "name": {"type": "string", "description": "Script name used in error messages (default `script`)."}
+                    "name": {"type": "string", "description": "Script name used in error messages (default `script`)."},
+                    "timeout": {"type": "number", "minimum": 0, "description": "Stop the script after this many seconds (default 300; 0 = no limit)."}
                 }),
                 &["code"],
             )
@@ -812,6 +875,45 @@ static TOOLS: &[ToolDef] = &[
         run: analyze_audio,
     },
     ToolDef {
+        name: "render_snapshot",
+        description: "Render a frame (default: the active comp at the current time) and keep it in the session under `name`, for render_compare. Verify an edit by looking: render_snapshot {\"name\":\"before\"} -> edit -> render_compare {\"a\":\"before\",\"b\":{}}. Up to 16 are kept (oldest dropped); taking a name again replaces it.",
+        bridge_only: false,
+        schema: || {
+            schema(
+                json!({
+                    "name": {"type": "string", "description": "Snapshot name."},
+                    "comp": comp_s(),
+                    "time": {"type": "number", "description": "Comp time in seconds (default: current time)."},
+                    "max_side": {"type": "integer", "minimum": 0, "description": "Longest side in pixels (default 0 = full comp size)."},
+                    "transparent": {"type": "boolean", "description": "Keep the frame's alpha instead of compositing over the comp background."}
+                }),
+                &["name"],
+            )
+        },
+        run: render_snapshot,
+    },
+    ToolDef {
+        name: "render_compare",
+        description: "Compare two frames: snapshots (render_snapshot), image files (goldens, After Effects reference renders) or frames rendered now. Returns {width, height, max_abs, mean_abs (8-bit levels), alpha_max_abs, psnr_db (\"inf\" when identical), ssim, changed_pixels, changed_pct, pass} and, when something changed, the diff heatmap as an image (red -> yellow -> white by size of difference, over frame a dimmed to grey). `pass` = no channel differs by more than `threshold` levels (default 1), or with `min_psnr` PSNR >= min_psnr. Sizes: `max_side` scales both down first; the same aspect ratio at different sizes compares at the smaller size; different aspect ratios are an error.",
+        bridge_only: false,
+        schema: || {
+            schema(
+                json!({
+                    "a": frame_source_s(),
+                    "b": frame_source_s(),
+                    "threshold": {"type": "number", "minimum": 0, "maximum": 255, "description": "Per-channel tolerance in 8-bit levels for `changed_pixels` and `pass` (default 1)."},
+                    "min_psnr": {"type": "number", "minimum": 0, "description": "Pass when PSNR (dB) is at least this, instead of the exact threshold test (e.g. 35 for another app's render)."},
+                    "max_side": {"type": "integer", "minimum": 0, "description": "Scale both down to this longest side before comparing (0 = full size, the default)."},
+                    "amplify": {"type": "number", "minimum": 1, "maximum": 255, "description": "Heatmap gain (default 8: a 32-level difference is white)."},
+                    "diff_path": {"type": "string", "description": "Also write the heatmap PNG here (full size)."},
+                    "inline": {"type": "boolean", "description": "Include the heatmap image in the reply when something changed (default true)."}
+                }),
+                &["a", "b"],
+            )
+        },
+        run: render_compare,
+    },
+    ToolDef {
         name: "open_project",
         description: "Open a project: `path` to an .ecproj file, `demo: true` for the built-in demo project, or `new: true` for an empty project. Returns the project overview.",
         bridge_only: false,
@@ -868,7 +970,7 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "screenshot",
-        description: "Screenshot of the live app window, or one panel (`Composition`, `Timeline`, `EffectControls`, `Project`, ...) or element id, as PNG (longest side `max_side`, default 1600). Use it to check what the UI looks like after an action.",
+        description: "Screenshot of the app window (the live one when bridged, the offscreen one with `mcp --ui`), or one panel (`Composition`, `Timeline`, `EffectControls`, `Project`, ...) or element id, as PNG (longest side `max_side`, default 1600). Use it to check what the UI looks like after an action.",
         bridge_only: true,
         schema: || {
             schema(

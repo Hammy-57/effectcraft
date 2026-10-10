@@ -52,6 +52,7 @@ mod prop_groups;
 mod proxy;
 pub mod puppet;
 mod query;
+pub mod render_compare;
 mod render_queue;
 pub(crate) mod rig3d;
 pub mod roto_cmds;
@@ -214,6 +215,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(crate::learn::specs());
         v.extend(crate::templates::specs());
         v.extend(crate::preview::specs());
+        v.extend(render_compare::specs());
         v
     })
 }

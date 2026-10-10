@@ -15,6 +15,7 @@
 mod appimage;
 mod audio_out;
 mod control_server;
+mod figma_host;
 mod launch_guard;
 #[cfg(target_os = "macos")]
 mod native_menu;
@@ -202,9 +203,20 @@ fn main() -> eframe::Result {
                 app.hooks.app_action = Some(Box::new(native_menu::app_action));
                 app.hooks.clipboard_text = Some(Box::new(native_menu::clipboard_text));
             }
-            if let Some(port) = listen_port {
-                disable_app_nap();
-                let rx = control_server::start(port, cc.egui_ctx.clone());
+            // The control channel and the Figma bridge feed the same request queue.
+            // Not for agent launches (`--control`), which would take the person's port 7789,
+            // unless EFFECTCRAFT_FIGMA_BRIDGE_PORT asks for it.
+            let figma_bridge =
+                app.session.prefs.scripting.figma_bridge && (control_port.is_none() || std::env::var_os("EFFECTCRAFT_FIGMA_BRIDGE_PORT").is_some());
+            if listen_port.is_some() || figma_bridge {
+                let (tx, rx) = std::sync::mpsc::channel();
+                if let Some(port) = listen_port {
+                    disable_app_nap();
+                    control_server::start(port, cc.egui_ctx.clone(), tx.clone());
+                }
+                if figma_bridge {
+                    figma_host::start(tx, cc.egui_ctx.clone());
+                }
                 app = app.with_control(rx);
             }
             log::info!("app created; the window shows after its first frame");

@@ -9,6 +9,6 @@
   "networkAccess": {
     "allowedDomains": ["none"],
     "devAllowedDomains": ["http://localhost:7789", "http://127.0.0.1:7789"],
-    "reasoning": "Sends the selection to the EffectCraft bridge running on this computer (effectcraft-cli figma-bridge)."
+    "reasoning": "Sends the selection to EffectCraft running on this computer (its Figma bridge on localhost:7789)."
   }
 }

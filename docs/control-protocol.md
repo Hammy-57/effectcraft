@@ -44,10 +44,16 @@ Useful query commands for `engine.execute` (they aren't journaled or undoable): 
 `prop.get {layer, path, comp?, time?}`, `editor.state`, `command.list {filter?, enabledOnly?, schemas?}`,
 `command.describe {command}` (params doc and JSON Schema), `app.capabilities` (version, counts,
 export formats, parity summary), `jobs.list` (Progress panel jobs, e.g. the background
-`footage.check` after File ▸ Open). Analysis queries (see [mcp.md](mcp.md#analysis-tools)):
-`layer.bounds {comp?, time?, layers?, pixels?, overlaps?}` (layer geometry in comp space) and
-`audio.analyze {comp?, start?, end?, layer?, waveform?, path?}` (peak, RMS, LUFS, clipping and
-silences of the mix).
+`footage.check` after File ▸ Open), `render.snapshot {name, comp?, time?, max_side?, transparent?}`
+(keep a rendered frame in the session, 16 at most), `render.snapshots {clear?}` and
+`render.compare {a, b, threshold?, min_psnr?, max_side?, amplify?, diff_path?, diff_inline?}`
+(`a`/`b`: a snapshot name, `{snapshot}`, `{path}` of a PNG/JPEG, or `{comp?, time?, transparent?}`
+rendered now) → `{width, height, max_abs, mean_abs, alpha_max_abs, psnr_db, ssim, changed_pixels,
+changed_pct, pass, diff_path?, diff_png?}` (metrics and size rules in
+[agents.md](agents.md#verify-your-change-snapshot--edit--compare)). Analysis queries (see
+[mcp.md](mcp.md#analysis-tools)): `layer.bounds {comp?, time?, layers?, pixels?, overlaps?}`
+(layer geometry in comp space) and `audio.analyze {comp?, start?, end?, layer?, waveform?, path?}`
+(peak, RMS, LUFS, clipping and silences of the mix).
 
 Every engine command is reachable through `engine.execute`, and every interactive widget of every
 panel registers an element id; both are enforced by `crates/ui-egui/tests/ui_agent_audit.rs`.
@@ -64,6 +70,7 @@ panel registers an element id; both are enforced by `crates/ui-egui/tests/ui_age
 | `ui.playback` | `{action: play\|stop\|toggle\|status}` | `{playing, time, audio, levelsDb, peaksDb}` (audio: an audio preview is running; L/R meter levels and held peaks in dBFS) |
 | `ui.resize` | `{width, height}` | Resizes the window (points). |
 | `ui.focus` | `{}` | Activates the window and takes keyboard focus. Agents normally avoid this, because the app is started without stealing focus. |
+| `ui.figmaPair` | `{client}` | The one-time Figma pairing prompt the app's Figma bridge shows (**Connect Figma?**, automation ids `figmaPair.allow` / `figmaPair.deny`). The reply waits for the answer: `{allowed}` (a 120 s timeout counts as Deny). |
 | `app.quit` | `{force?}` | Closes the app. A modified project shows the Save / Don't Save / Cancel prompt first (automation ids `dialog.unsaved.save`, `dialog.unsaved.dontSave`, `dialog.unsaved.cancel`) unless `force: true`. |
 
 ## Input

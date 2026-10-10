@@ -13,7 +13,7 @@ use crate::{Backend, Error, base64};
 /// Protocol revisions we speak, newest first. We answer with the client's if we know it.
 pub const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 
-const INSTRUCTIONS: &str = "EffectCraft is an After Effects-class motion graphics compositor. Everything is an engine command: command_list discovers ids and params, command_run {id, params} runs them (undoable; command_batch runs several in order). Typical flow: command_run comp.new -> command_run layer.newText / layer.newSolid (returns the layer id) -> set_property / add_keyframe -> command_run effect.apply -> render_preview to look at the result. Inspect with doc_inspect, get_project, get_comp and get_layer (every property node carries its `path`, e.g. `transform/position`, `effects/#1/blurriness`). Times are seconds. In bridge mode (app started with `--control <port>`) screenshot and the ui_* tools show and operate the live window.";
+const INSTRUCTIONS: &str = "EffectCraft is an After Effects-class motion graphics compositor. Everything is an engine command: command_list discovers ids and params, command_run {id, params} runs them (undoable; command_batch runs several in order). Typical flow: command_run comp.new -> command_run layer.newText / layer.newSolid (returns the layer id) -> set_property / add_keyframe -> command_run effect.apply -> render_preview to look at the result. Inspect with doc_inspect, get_project, get_comp and get_layer (every property node carries its `path`, e.g. `transform/position`, `effects/#1/blurriness`). Times are seconds. With a UI (bridge mode `--bridge <port>` to a running app, or `--ui` for the app offscreen) screenshot and the ui_* tools show and operate it.";
 
 // JSON-RPC error codes.
 const PARSE_ERROR: i64 = -32700;
@@ -101,8 +101,9 @@ impl McpServer {
         Some(reply.to_string())
     }
 
-    /// Serve until EOF on `input`. Input is read on its own thread so a long render can report
-    /// progress, be cancelled and let other requests through while it runs (`long_job`).
+    /// Serve until EOF on `input`. Input is read on its own thread so a long call (a render, an
+    /// analysis, a script) can report progress, be cancelled and let other requests through
+    /// while it runs (`long_job`).
     pub fn serve(&mut self, input: impl BufRead + Send, mut output: impl Write) -> std::io::Result<()> {
         let (tx, inbox) = std::sync::mpsc::channel::<Option<String>>();
         // A read error ends the input like EOF and is returned once the queued requests are answered.
@@ -124,12 +125,12 @@ impl McpServer {
                 }
                 let _ = tx.send(None);
             })?;
-            while let Ok(Some(line)) = inbox.recv() {
-                let long = serde_json::from_str::<Value>(line.trim()).ok().and_then(|m| crate::long_job::long_call(self, &m));
+            let mut inbox = crate::long_job::Inbox::new(inbox);
+            while let Some(line) = inbox.next() {
+                let bridge = self.backend.is_bridge();
+                let long = serde_json::from_str::<Value>(line.trim()).ok().and_then(|m| crate::long_job::long_call(bridge, &m));
                 if let Some(call) = long {
-                    if !self.run_long(call, &inbox, &mut output)? {
-                        break;
-                    }
+                    self.run_long(call, &mut inbox, &mut output)?;
                     continue;
                 }
                 if let Some(reply) = self.handle_line(&line) {
@@ -160,7 +161,7 @@ impl McpServer {
             "initialize" => {
                 let asked = params.get("protocolVersion").and_then(Value::as_str).unwrap_or("");
                 let version = PROTOCOL_VERSIONS.iter().find(|v| **v == asked).copied().unwrap_or(PROTOCOL_VERSIONS.first().copied().unwrap_or("2025-06-18"));
-                let mode = if self.backend.is_bridge() { "bridge" } else { "headless" };
+                let mode = self.backend.mode();
                 let instructions = if self.autosave.is_some() {
                     format!("{INSTRUCTIONS} Headless auto-save and recovery: {}", self.autosave_info())
                 } else {
@@ -189,35 +190,8 @@ impl McpServer {
                 if let Some(m) = tools::find(name).and_then(|t| t.unknown_arg(&args)) {
                     return Err((INVALID_PARAMS, m));
                 }
-                let mut result = call_result(self.guarded(name, &args));
-                // Also checkpoint a partially successful tool that returned an error. The
-                // project is durable before the client receives its reply (even if it kills
-                // the process immediately afterwards).
-                if let Err(e) = self.checkpoint(false) {
-                    let _ = writeln!(std::io::stderr(), "{e}");
-                    if let Some(content) = result.get_mut("content").and_then(Value::as_array_mut) {
-                        content.push(json!({"type": "text", "text": format!("Warning: {e}. Use save_project with a writable path before disconnecting.")}));
-                    }
-                }
-                if self.autosave.is_some()
-                    && let Some(obj) = result.as_object_mut()
-                {
-                    let meta = obj.entry("_meta").or_insert_with(|| json!({}));
-                    if let Some(meta) = meta.as_object_mut() {
-                        meta.insert("effectcraftAutoSave".into(), self.autosave_info());
-                    }
-                }
-                if self.autosave.is_some()
-                    && name == "get_project"
-                    && result["isError"] == false
-                    && let Some(text) = result.get_mut("content").and_then(Value::as_array_mut).and_then(|c| c.first_mut()).and_then(|c| c.get_mut("text"))
-                    && let Some(summary) = text.as_str().and_then(|t| serde_json::from_str::<Value>(t).ok())
-                {
-                    let mut summary = summary;
-                    summary["autosave"] = self.autosave_info();
-                    *text = Value::String(summary.to_string());
-                }
-                Ok(result)
+                let r = self.guarded(name, &args);
+                Ok(self.finish_call(name, r))
             }
             "resources/list" => Ok(json!({"resources": [
                 {"uri": DOCUMENT_URI, "name": "document", "title": "Project", "description": "The project overview and the active composition (same as doc_inspect).", "mimeType": "application/json"},
@@ -264,12 +238,49 @@ impl McpServer {
     /// Run a tool with panics caught: a panic becomes an error result and the session keeps
     /// serving (docs/mcp.md).
     pub(crate) fn guarded(&mut self, name: &str, args: &Value) -> Result<Reply, Error> {
-        let backend = &mut self.backend;
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tools::run(backend, name, args))).unwrap_or_else(|p| {
-            let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_else(|| "panic".into());
-            Err(Error::Other(format!("internal error: {msg}")))
-        })
+        guarded_run(&mut self.backend, name, args)
     }
+
+    /// A tool call's MCP result, after an auto-save checkpoint (`--autosave`).
+    pub(crate) fn finish_call(&mut self, name: &str, r: Result<Reply, Error>) -> Value {
+        let mut result = call_result(r);
+        // Also checkpoint a partially successful tool that returned an error. The project is
+        // durable before the client receives its reply (even if it kills the process
+        // immediately afterwards).
+        if let Err(e) = self.checkpoint(false) {
+            let _ = writeln!(std::io::stderr(), "{e}");
+            if let Some(content) = result.get_mut("content").and_then(Value::as_array_mut) {
+                content.push(json!({"type": "text", "text": format!("Warning: {e}. Use save_project with a writable path before disconnecting.")}));
+            }
+        }
+        if self.autosave.is_some()
+            && let Some(obj) = result.as_object_mut()
+        {
+            let meta = obj.entry("_meta").or_insert_with(|| json!({}));
+            if let Some(meta) = meta.as_object_mut() {
+                meta.insert("effectcraftAutoSave".into(), self.autosave_info());
+            }
+        }
+        if self.autosave.is_some()
+            && name == "get_project"
+            && result["isError"] == false
+            && let Some(text) = result.get_mut("content").and_then(Value::as_array_mut).and_then(|c| c.first_mut()).and_then(|c| c.get_mut("text"))
+            && let Some(summary) = text.as_str().and_then(|t| serde_json::from_str::<Value>(t).ok())
+        {
+            let mut summary = summary;
+            summary["autosave"] = self.autosave_info();
+            *text = Value::String(summary.to_string());
+        }
+        result
+    }
+}
+
+/// Run a tool with panics caught (see [`McpServer::guarded`]).
+pub(crate) fn guarded_run(backend: &mut Backend, name: &str, args: &Value) -> Result<Reply, Error> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tools::run(backend, name, args))).unwrap_or_else(|p| {
+        let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_else(|| "panic".into());
+        Err(Error::Other(format!("internal error: {msg}")))
+    })
 }
 
 /// The craft catalog resources (docs/mcp.md).

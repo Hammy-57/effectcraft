@@ -4,6 +4,10 @@
       "command": "sh",
       "args": ["scripts/mcp.sh", "--demo"]
     },
+    "effectcraft-ui": {
+      "command": "sh",
+      "args": ["scripts/mcp.sh", "--ui", "--demo"]
+    },
     "effectcraft-app": {
       "command": "sh",
       "args": ["scripts/mcp.sh", "--bridge", "9877"]
