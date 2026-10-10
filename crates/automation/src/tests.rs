@@ -1084,3 +1084,25 @@ fn get_layout_reports_layer_geometry() {
         assert!(err && c[0]["text"].as_str().unwrap().contains("no layer"), "{c:?}");
     }
 }
+
+/// `analyze_audio`: levels of a Tone, a waveform image, no-audio comps.
+#[test]
+fn analyze_audio_levels_and_waveform() {
+    let mut s = server();
+    call_json(&mut s, "command_run", json!({"id": "comp.new", "params": {"width": 64, "height": 36, "duration": 1}}));
+    let r = call_json(&mut s, "analyze_audio", json!({}));
+    assert_eq!(r["hasAudio"], false, "{r}");
+    let l = call_json(&mut s, "command_run", json!({"id": "layer.newSolid", "params": {}}))["layer"].clone();
+    let values = json!({"frequency1": 1000, "frequency2": 0, "frequency3": 0, "frequency4": 0, "frequency5": 0, "level": 25});
+    call_json(&mut s, "add_effect", json!({"layer": l, "effect": "Tone", "values": values}));
+    let r = call_json(&mut s, "analyze_audio", json!({}));
+    assert!((r["peakDbfs"].as_f64().unwrap() + 12.04).abs() < 0.05, "{r}");
+    assert!((r["integratedLufs"].as_f64().unwrap() + 12.04).abs() < 0.2, "{r}");
+    let (c, err) = call(&mut s, "analyze_audio", json!({"waveform": true, "width": 120, "height": 50}));
+    assert!(!err, "{c:?}");
+    assert_eq!(png_size(&base64::decode(c[0]["data"].as_str().unwrap()).unwrap()), Some((120, 50)));
+    let info: Value = serde_json::from_str(c[1]["text"].as_str().unwrap()).unwrap();
+    assert!(info["waveform"].get("columns").is_none(), "columns become the image");
+    let (_, err) = call(&mut s, "analyze_audio", json!({"start": 0.5, "end": 0.5}));
+    assert!(err);
+}

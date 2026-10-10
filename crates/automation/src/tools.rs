@@ -5,7 +5,7 @@
 use serde_json::{Map, Value, json};
 
 use crate::backend::NEED_BRIDGE;
-use crate::{Backend, Error, Result, recompress_png};
+use crate::{Backend, Error, Result, encode_png, recompress_png};
 
 /// A tool's output.
 pub enum Reply {
@@ -81,7 +81,7 @@ const READ_ONLY: &[&str] = &[
     "get_layout",
 ];
 /// Tools that write files without changing the project.
-const WRITES_FILES: &[&str] = &["save_project", "render_frame", "screenshot"];
+const WRITES_FILES: &[&str] = &["save_project", "render_frame", "screenshot", "analyze_audio"];
 
 /// `get_project` → "Get project".
 fn title_of(name: &str) -> String {
@@ -481,6 +481,44 @@ fn get_layout(b: &mut Backend, a: &Value) -> Result<Reply> {
     json_reply(b.exec("layer.bounds", p)?)
 }
 
+fn analyze_audio(b: &mut Backend, a: &Value) -> Result<Reply> {
+    let waveform = get(a, "waveform").and_then(Value::as_bool).unwrap_or(false);
+    let on = json!(true);
+    let p = obj(&[
+        ("comp", get(a, "comp")),
+        ("start", get(a, "start")),
+        ("end", get(a, "end")),
+        ("layer", get(a, "layer")),
+        ("silenceDb", get(a, "silence_db")),
+        ("minSilence", get(a, "min_silence")),
+        ("truePeak", get(a, "true_peak")),
+        ("waveform", waveform.then_some(&on)),
+        ("width", get(a, "width")),
+        ("height", get(a, "height")),
+        ("path", get(a, "path")),
+    ]);
+    let mut info = b.exec("audio.analyze", p)?;
+    let Some(w) = info.get_mut("waveform").and_then(Value::as_object_mut) else { return json_reply(info) };
+    // Draw the waveform here from its columns (headless or bridged alike) and drop them.
+    let cols: Vec<[f32; 4]> = w
+        .remove("columns")
+        .and_then(|c| c.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .map(|c| {
+            let f = |i: usize| c.get(i).and_then(Value::as_f64).unwrap_or(0.0) as f32;
+            [f(0), f(1), f(2), f(3)]
+        })
+        .collect();
+    let height = w.get("height").and_then(Value::as_u64).unwrap_or(160) as u32;
+    if !waveform || cols.is_empty() {
+        return json_reply(info);
+    }
+    let (pw, ph, rgba) = effectcraft_engine::audio_analysis::waveform_rgba(&cols, height);
+    let png = encode_png(pw, ph, rgba, 0)?;
+    Ok(Reply::Image { png, info })
+}
+
 // ------------------------------------------------------------------ bridge-only tools
 
 fn screenshot(b: &mut Backend, a: &Value) -> Result<Reply> {
@@ -748,6 +786,30 @@ static TOOLS: &[ToolDef] = &[
             )
         },
         run: get_layout,
+    },
+    ToolDef {
+        name: "analyze_audio",
+        description: "Measure the comp's audio mix (what preview and export play) over [start, end) seconds (audio.analyze): peakDbfs, truePeakDbtp (4x oversampled), rmsDbfs, integratedLufs (ITU-R BS.1770, gated), momentary / short-term max LUFS, clippedSamples, silent ranges (below silence_db for at least min_silence s) and per-channel stats; null levels mean silence. `layer` measures one layer alone. `waveform: true` returns a waveform image (left channel on top, red where it clips). A comp without audio returns hasAudio: false.",
+        bridge_only: false,
+        schema: || {
+            schema(
+                json!({
+                    "comp": comp_s(),
+                    "start": {"type": "number", "description": "Start, comp seconds (default 0)."},
+                    "end": {"type": "number", "description": "End, comp seconds (default the comp's duration)."},
+                    "layer": layer_s(),
+                    "silence_db": {"type": "number", "description": "Silence threshold in dBFS (default -60)."},
+                    "min_silence": {"type": "number", "description": "Shortest silence reported, seconds (default 0.25)."},
+                    "true_peak": {"type": "boolean", "description": "Estimate the true peak (default true)."},
+                    "waveform": {"type": "boolean", "description": "Return a waveform image."},
+                    "width": {"type": "integer", "description": "Waveform width in pixels (default 800)."},
+                    "height": {"type": "integer", "description": "Waveform height in pixels (default 160)."},
+                    "path": {"type": "string", "description": "Also write the waveform PNG here."}
+                }),
+                &[],
+            )
+        },
+        run: analyze_audio,
     },
     ToolDef {
         name: "open_project",
