@@ -60,31 +60,32 @@ impl Ease {
 pub struct Keyframe {
     pub time: Tick,
     pub value: Value,
-    #[serde(default)]
+    // Fields at their default value are left out of project files (they read back as it).
+    #[serde(default, skip_serializing_if = "is_linear")]
     pub in_interp: Interp,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_linear")]
     pub out_interp: Interp,
     /// Per-dimension (or one entry for spatial / single-dimension values).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub in_ease: Vec<Ease>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub out_ease: Vec<Ease>,
     /// Temporal continuous / auto Bezier flags.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub continuous: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub auto_bezier: bool,
     /// Spatial tangents relative to the key value (spatial properties only).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero3")]
     pub spatial_in: [f64; 3],
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero3")]
     pub spatial_out: [f64; 3],
     /// Spatial auto-Bezier: tangents computed from neighbours.
-    #[serde(default = "yes")]
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
     pub spatial_auto: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub spatial_continuous: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub roving: bool,
     /// Keyframe color label: index into the label list (0 = None).
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -93,6 +94,19 @@ pub struct Keyframe {
 
 fn is_zero(v: &u8) -> bool {
     *v == 0
+}
+
+fn is_linear(i: &Interp) -> bool {
+    *i == Interp::Linear
+}
+
+/// `[0, 0, 0]` exactly (not `-0.0`, which then keeps its sign).
+fn is_zero3(v: &[f64; 3]) -> bool {
+    v.iter().all(|x| x.to_bits() == 0)
+}
+
+fn is_true(v: &bool) -> bool {
+    *v
 }
 
 fn yes() -> bool {

@@ -163,7 +163,7 @@ impl<'a> Renderer<'a> {
             return Region::Empty;
         }
         let Some((sub, nctx)) = self.collapse_into(ctx, layer, item, 1.0) else { return Region::Empty };
-        let mut iso = Image::new(canvas.width, canvas.height);
+        let mut iso = effectcraft_raster::pool::zeroed(canvas.width, canvas.height);
         sub.draw_comp(&nctx, &mut iso, true);
         self.composite_iso(ctx, layer, iso, canvas, opacity);
         Region::Full
@@ -178,7 +178,7 @@ impl<'a> Renderer<'a> {
             return Region::Empty;
         }
         let Some((sub, nctx)) = self.collapse_into(ctx, layer, item, 1.0) else { return Region::Empty };
-        let mut iso = Image::new(canvas.width, canvas.height);
+        let mut iso = effectcraft_raster::pool::zeroed(canvas.width, canvas.height);
         sub.draw_comp(&nctx, &mut iso, true);
         let offset = self.roi_offset().map(|(x, y, _, _)| [-x, -y]).unwrap_or([0.0; 2]);
         let mut buf = Buf { img: iso, offset, scale: self.opts.scale };

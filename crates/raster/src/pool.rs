@@ -55,6 +55,24 @@ pub fn copy_of(img: &Image) -> Image {
     }
 }
 
+/// The `width × height` window of `img` at (`x`, `y`) (clipped: transparent past its edges), on
+/// a recycled buffer when one of that size is free.
+pub fn crop_of(img: &Image, x: u32, y: u32, width: u32, height: u32) -> Image {
+    if x == 0 && y == 0 && width == img.width && height == img.height {
+        return copy_of(img);
+    }
+    let mut out = zeroed(width, height);
+    let (sw, w) = (img.width as usize, width as usize);
+    out.data.par_chunks_mut(w.max(1)).enumerate().for_each(|(r, row)| {
+        let sy = y as usize + r;
+        let Some(src) = img.data.get(sy * sw..(sy + 1) * sw).and_then(|s| s.get(x as usize..)) else { return };
+        for (d, s) in row.iter_mut().zip(src) {
+            *d = *s;
+        }
+    });
+    out
+}
+
 /// Give `img`'s buffer back for reuse (freed when the pool is full).
 pub fn recycle(img: Image) {
     let v = img.data;
