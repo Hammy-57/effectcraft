@@ -951,3 +951,6 @@ before.
 - Undo with agents in the project: `edit.undo` (⌘Z) undoes the caller's own latest step; behind
   someone else's steps it reverts only what that step changed (per comp or item), refused when
   they changed the same thing since; `edit.undo {any: true}` undoes the last step whoever made it.
+- Control channel fairness: agents sharing the app take turns per `client`, a frame spends at most
+  50 ms on requests (the window keeps drawing), and up to 32 connections are served; the Edit
+  menu's Undo names the step ⌘Z undoes (your own latest, behind agents' steps).

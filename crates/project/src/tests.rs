@@ -111,13 +111,159 @@ fn project_files_name_their_version_and_always_read_back() {
     let (mut p, cid) = project_with_layer();
     let text = p.to_file_json().unwrap();
     assert_eq!(crate::saved_by(&text).as_deref(), Some(crate::APP_VERSION));
-    assert!(text.trim_start().starts_with("{\n  \"savedBy\""), "the version comes first");
+    assert!(text.starts_with("{\"savedBy\""), "the version comes first");
+    assert!(!text.contains('\n'), "compact");
     assert_eq!(Project::from_json(&text).unwrap(), p);
     assert_eq!(crate::saved_by(&p.to_json()), None, "plain JSON (worker hand-offs) has none");
     // JSON can't hold NaN: saving refuses instead of writing a file that can't be opened.
     p.comp_mut(cid).unwrap().layers[0].props.prop_mut("transform/opacity").unwrap().value = Value::Scalar(f64::NAN);
     let e = p.to_file_json().unwrap_err().to_string();
     assert!(e.contains("can't be saved"), "{e}");
+    assert!(e.contains("isn't finite") && e.contains("/props/") && e.ends_with("/value/v)"), "names where: {e}");
+    let k = Keyframe::new(Tick(0), Value::Scalar(1.0));
+    p.comp_mut(cid).unwrap().layers[0].props.prop_mut("transform/opacity").unwrap().keys =
+        vec![Keyframe { spatial_in: [0.0, f64::INFINITY, 0.0], ..k.clone() }];
+    p.comp_mut(cid).unwrap().layers[0].props.prop_mut("transform/opacity").unwrap().value = Value::Scalar(1.0);
+    assert!(p.to_file_json().unwrap_err().to_string().contains("spatial_in/1"));
+    // What the save check passes reads back, and what it refuses doesn't.
+    assert!(crate::finite::check(&Some(f64::NAN)).is_ok() && serde_json::from_str::<Option<f64>>("null").is_ok(), "Some(NaN) reads back as None");
+    assert!(crate::finite::check(&Some([f64::NAN])).is_err() && crate::finite::check(&vec![1.0f32, f32::NEG_INFINITY]).is_err());
+    assert!(crate::finite::check(&std::collections::BTreeMap::from([(1u64, Some(f64::NAN))])).is_ok());
     assert!(crate::is_newer_version("0.2.0", "0.1.9") && crate::is_newer_version("1.0.0-rc.1", "0.9.9"));
     assert!(!crate::is_newer_version("0.1.1", "0.1.1") && !crate::is_newer_version("0.1.0", "0.1.1"));
+}
+
+/// Fields at their default value are left out of a project file and read back as it; files that
+/// write them all (older versions, pretty-printed) still load the same.
+#[test]
+fn default_fields_are_left_out_and_read_back() {
+    use crate::props::ParamUi;
+    use effectcraft_keyframe::{Ease, Interp};
+    let (mut p, cid) = project_with_layer();
+    let layer = &mut p.comp_mut(cid).unwrap().layers[0];
+    let plain = Keyframe::new(Tick(0), Value::Vec3([1.0, 2.0, 3.0]));
+    let full = Keyframe {
+        in_interp: Interp::Bezier,
+        out_interp: Interp::Hold,
+        in_ease: vec![Ease::EASY],
+        out_ease: vec![Ease { speed: 3.0, influence: 0.5 }],
+        continuous: true,
+        auto_bezier: true,
+        spatial_in: [1.0, -2.0, 0.0],
+        spatial_out: [-0.0, 0.0, 0.0],
+        spatial_auto: false,
+        spatial_continuous: true,
+        roving: true,
+        label: 3,
+        ..Keyframe::new(Tick(1000), Value::Vec3([4.0, 5.0, 6.0]))
+    };
+    let pos = layer.props.prop_mut("transform/position").unwrap();
+    pos.keys = vec![plain.clone(), full];
+    let opacity = layer.props.prop_mut("transform/opacity").unwrap();
+    opacity.ui = ParamUi::Slider { min: 0.0, max: 100.0, slider_min: 0.0, slider_max: 100.0, decimals: 1 };
+    opacity.spatial = true;
+    opacity.hold_only = true;
+    opacity.three_d_only = true;
+    opacity.two_d_only = true;
+    opacity.shown_dims = 2;
+    opacity.static_only = true;
+    let rotation = layer.props.prop_mut("transform/rotation").unwrap();
+    rotation.ui = ParamUi::Number;
+    rotation.hold_only = false;
+
+    let text = p.to_file_json().unwrap();
+    let back = Project::from_json(&text).unwrap();
+    assert_eq!(back, p);
+    let keys = &back.comp(cid).unwrap().layers[0].props.prop("transform/position").unwrap().keys;
+    assert_eq!(keys[1].spatial_out[0].to_bits(), (-0.0f64).to_bits(), "-0 keeps its sign");
+    let plain_json = serde_json::to_value(&plain).unwrap();
+    assert_eq!(plain_json, serde_json::json!({"time": 0, "value": {"t": "Vec3", "v": [1.0, 2.0, 3.0]}}), "a plain key writes only time and value");
+    let rot = serde_json::to_value(back.comp(cid).unwrap().layers[0].props.prop("transform/rotation").unwrap()).unwrap();
+    for k in ["ui", "spatial", "hold_only", "three_d_only", "two_d_only", "shown_dims", "static_only", "keys", "expr"] {
+        assert!(rot.get(k).is_none(), "{k} left out: {rot}");
+    }
+
+    // An old-style file: every field written, pretty-printed.
+    let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    fn fill(v: &mut serde_json::Value) {
+        match v {
+            serde_json::Value::Object(o) => {
+                if o.contains_key("match") && o.contains_key("uid") {
+                    for (k, d) in [
+                        ("ui", serde_json::json!({"kind": "Number"})),
+                        ("spatial", false.into()),
+                        ("hold_only", false.into()),
+                        ("three_d_only", false.into()),
+                        ("two_d_only", false.into()),
+                        ("shown_dims", 0.into()),
+                        ("static_only", false.into()),
+                    ] {
+                        o.entry(k).or_insert(d);
+                    }
+                }
+                if o.contains_key("time") && o.contains_key("value") && !o.contains_key("uid") {
+                    for (k, d) in [
+                        ("in_interp", "Linear".into()),
+                        ("out_interp", "Linear".into()),
+                        ("in_ease", serde_json::json!([])),
+                        ("out_ease", serde_json::json!([])),
+                        ("continuous", false.into()),
+                        ("auto_bezier", false.into()),
+                        ("spatial_in", serde_json::json!([0.0, 0.0, 0.0])),
+                        ("spatial_out", serde_json::json!([0.0, 0.0, 0.0])),
+                        ("spatial_auto", true.into()),
+                        ("spatial_continuous", false.into()),
+                        ("roving", false.into()),
+                    ] {
+                        o.entry(k).or_insert(d);
+                    }
+                }
+                o.values_mut().for_each(fill);
+            }
+            serde_json::Value::Array(a) => a.iter_mut().for_each(fill),
+            _ => {}
+        }
+    }
+    fill(&mut v);
+    let old = serde_json::to_string_pretty(&v).unwrap();
+    assert!(old.len() > text.len() && old.contains("\"spatial_auto\": true") && old.contains("\"hold_only\": false"));
+    assert_eq!(Project::from_json(&old).unwrap(), p);
+}
+
+/// `file_meta` reads `savedBy` and `openComps` from the ends of a file EffectCraft wrote, and
+/// gives the same answer as a full pass for any other layout.
+#[test]
+fn file_meta_reads_the_ends_or_the_whole_file() {
+    let (mut p, cid) = project_with_layer();
+    // A string `"openComps"` that isn't the member.
+    p.comp_mut(cid).unwrap().layers[0].name = "openComps".into();
+    let open = crate::OpenComps { comps: vec![crate::OpenComp { comp: cid, time: Tick(7) }], active: Some(cid) };
+    let with = p.to_file_json_with(Some(&open)).unwrap();
+    let without = p.to_file_json().unwrap();
+    let slow = |text: &str| {
+        let v: serde_json::Value = serde_json::from_str(text).unwrap();
+        crate::FileMeta { saved_by: v["savedBy"].as_str().map(String::from), open_comps: serde_json::from_value(v["openComps"].clone()).ok() }
+    };
+    assert!(crate::file_meta_at_ends(&with).is_some(), "EffectCraft's own file");
+    assert!(crate::file_meta_at_ends(&without).is_none(), "the layer name isn't the member: a full pass");
+    let mut q = p.clone();
+    q.comp_mut(cid).unwrap().layers[0].name = "x\"openComps".into();
+    assert!(crate::file_meta_at_ends(&q.to_file_json().unwrap()).is_none());
+    assert_eq!(crate::file_meta(&q.to_file_json().unwrap()).open_comps, None);
+    q.comp_mut(cid).unwrap().layers[0].name = "Plain".into();
+    assert_eq!(crate::file_meta_at_ends(&q.to_file_json().unwrap()), Some(crate::FileMeta { saved_by: Some(crate::APP_VERSION.into()), open_comps: None }));
+    assert_eq!(crate::file_meta(&with), crate::FileMeta { saved_by: Some(crate::APP_VERSION.into()), open_comps: Some(open.clone()) });
+    assert_eq!(crate::file_meta(&without), crate::FileMeta { saved_by: Some(crate::APP_VERSION.into()), open_comps: None });
+    // Other layouts: pretty, keys sorted (`openComps` not last, `savedBy` not first), no version.
+    let v: serde_json::Value = serde_json::from_str(&with).unwrap();
+    let sorted = serde_json::to_string(&v).unwrap();
+    let pretty = serde_json::to_string_pretty(&v).unwrap();
+    let mut bare = v.clone();
+    bare.as_object_mut().unwrap().remove("savedBy");
+    let bare = serde_json::to_string(&bare).unwrap();
+    for text in [&with, &without, &sorted, &pretty, &bare, &p.to_json()] {
+        assert_eq!(crate::file_meta(text), slow(text), "{}", &text[..text.len().min(80)]);
+    }
+    assert_eq!(crate::file_meta("{\"savedBy\":\"1.0.0\",\"openComps\":5}").open_comps, None, "a malformed openComps is ignored");
+    assert_eq!(crate::file_meta("{\"savedBy\":\"1.0.0\",\"openComps\":5}").saved_by.as_deref(), Some("1.0.0"));
 }

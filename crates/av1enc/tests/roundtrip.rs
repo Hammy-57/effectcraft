@@ -90,3 +90,43 @@ fn headers() {
     assert_eq!(&c[4..], &enc.sequence_header_obu()[..]);
     assert_eq!(enc.sequence_header_obu()[0], 0x0A);
 }
+
+/// FNV-1a over every packet (length then bytes).
+fn stream_hash(run: &common::Run) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for p in &run.packets {
+        for b in (p.data.len() as u64).to_le_bytes().iter().chain(&p.data) {
+            h = (h ^ *b as u64).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    h
+}
+
+/// The encoder's output is pinned byte for byte: speed work (scratch buffers, parallel
+/// superblock decisions) must not change a single bit. Clips with several superblock rows and
+/// columns, odd edges, both bit depths, inter frames and the first-frame rate-control passes.
+#[test]
+fn bitstream_is_stable() {
+    let mut got = Vec::new();
+    let pics: Vec<Pic> = (0..2).map(|t| synth(250, 150, 8, t)).collect();
+    got.push(("intra 250x150", stream_hash(&encode_and_check(cfg(250, 150, 8, 70, 1), &pics))));
+    let pics: Vec<Pic> = (0..4).map(|t| synth(320, 200, 8, t)).collect();
+    got.push(("inter 320x200", stream_hash(&encode_and_check(cfg(320, 200, 8, 90, 30), &pics))));
+    let pics: Vec<Pic> = (0..3).map(|t| synth(200, 136, 10, t)).collect();
+    got.push(("10-bit inter 200x136", stream_hash(&encode_and_check(cfg(200, 136, 10, 110, 30), &pics))));
+    let pics: Vec<Pic> = (0..3).map(|t| synth(256, 192, 8, t)).collect();
+    let mut c = cfg(256, 192, 8, 0, 30);
+    c.rate = RateControl::Bitrate { kbps: 600 };
+    got.push(("bitrate 256x192", stream_hash(&encode_and_check(c, &pics))));
+    let pics = vec![noise(136, 72, 8, 3)];
+    got.push(("noise 136x72", stream_hash(&encode_and_check(cfg(136, 72, 8, 20, 1), &pics))));
+    eprintln!("{got:#x?}");
+    let want: [(&str, u64); 5] = [
+        ("intra 250x150", 0x4448a919c11598ff),
+        ("inter 320x200", 0x5f93a0b1f0a4f0d1),
+        ("10-bit inter 200x136", 0xcf20671005e62b11),
+        ("bitrate 256x192", 0x18911ac7b31d9906),
+        ("noise 136x72", 0xa3634854a234f8ed),
+    ];
+    assert_eq!(got, want);
+}

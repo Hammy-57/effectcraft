@@ -33,7 +33,7 @@ use serde_json::{Value, json};
 /// anything longer is refused and the connection closed.
 pub const MAX_LINE: usize = 4 * 1024 * 1024;
 /// Connections served at once; further ones get an error line and are closed.
-pub const MAX_CONNECTIONS: usize = 16;
+pub const MAX_CONNECTIONS: usize = 32;
 /// How long a request may wait for the UI thread.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// `requestId`s remembered (with their replies) for retries.
