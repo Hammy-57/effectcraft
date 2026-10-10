@@ -1,7 +1,16 @@
 # MCP conventions
 
-Run `effectcraft-cli mcp` for a headless session, or `effectcraft-cli mcp --bridge 9877`
-to use the desktop app's control channel. Existing ports are unchanged.
+Run `effectcraft-cli mcp` for a headless session, `effectcraft-cli mcp --ui` for the full app
+offscreen (no window), or `effectcraft-cli mcp --bridge 9877` to use the desktop app's control
+channel. Existing ports are unchanged.
+
+`--ui` and `--bridge` both route every tool through control-channel requests
+(`docs/control-protocol.md`) behind the automation crate's `ControlTransport` trait: a TCP
+`BridgeClient`, or the CLI's offscreen transport, which owns `effectcraft_ui_egui::offscreen`'s
+UI thread. That thread steps the egui_kittest harness until each request is answered and the UI
+has settled, feeds the app's synthetic input as real events and renders screenshots with wgpu.
+`screenshot` and the `ui_*` / `control` tools are listed only in these two modes; the
+`initialize` title names the mode (`headless`, `headless-ui`, `bridge`).
 
 ## Confining file access
 

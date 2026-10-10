@@ -1,11 +1,12 @@
-//! Where tools run: an in-process session, or the desktop app over its control channel.
+//! Where tools run: an in-process session, or an app reached through its control channel (the
+//! desktop app over TCP, or an offscreen app in this process).
 
 use effectcraft_engine::Session;
 use effectcraft_engine::time::Tick;
 use serde_json::{Value, json};
 
 use crate::confine::Confinement;
-use crate::{BridgeClient, Error, Result, base64, encode_png, recompress_png};
+use crate::{BridgeClient, ControlTransport, Error, Result, base64, encode_png, recompress_png};
 
 pub struct Backend {
     target: Target,
@@ -16,8 +17,9 @@ pub struct Backend {
 enum Target {
     /// An in-process session (no window): engine commands, inspection and rendering.
     Headless(Box<Session>),
-    /// A running desktop app reached over its control channel: everything, plus the live UI.
-    Bridge(BridgeClient),
+    /// An app reached through its control channel (a running desktop app, or the offscreen UI of
+    /// `mcp --ui`): everything, plus the UI.
+    Bridge(Box<dyn ControlTransport>),
 }
 
 /// A rendered comp frame.
@@ -36,7 +38,7 @@ impl Backend {
 
     /// Bridge to the app's control channel at `addr` (`9877` or `127.0.0.1:9877`).
     pub fn bridge(addr: &str) -> Result<Self> {
-        Ok(Backend { target: Target::Bridge(BridgeClient::new(addr)?), confinement: None })
+        Ok(Backend { target: Target::Bridge(Box::new(BridgeClient::new(addr)?)), confinement: None })
     }
 
     /// Confine the files the commands run here may read and write ([`Confinement`]).
@@ -48,8 +50,22 @@ impl Backend {
         self.confinement.as_ref()
     }
 
+    /// Drive an app through any control transport (e.g. an offscreen UI in this process).
+    pub fn transport(t: impl ControlTransport + 'static) -> Self {
+        Backend { target: Target::Bridge(Box::new(t)), confinement: None }
+    }
+
+    /// Whether tools reach an app with a UI (bridge-only tools such as `screenshot` and `ui_*` work).
     pub fn is_bridge(&self) -> bool {
         matches!(self.target, Target::Bridge(_))
+    }
+
+    /// `headless`, or the transport's mode (`bridge`, `headless-ui`).
+    pub fn mode(&self) -> &'static str {
+        match &self.target {
+            Target::Headless(_) => "headless",
+            Target::Bridge(t) => t.mode(),
+        }
     }
 
     pub fn session(&mut self) -> Option<&mut Session> {
@@ -145,5 +161,4 @@ fn no_comp(comp: Option<&Value>) -> Error {
     }
 }
 
-pub const NEED_BRIDGE: &str =
-    "this tool drives the live app: start it with `effectcraft --control 9877` and run the MCP server as `effectcraft-cli mcp --bridge 9877`";
+pub const NEED_BRIDGE: &str = "this tool needs the app's UI: run the MCP server as `effectcraft-cli mcp --ui` (the full app offscreen, no window), or start the app with `effectcraft --control 9877` and run `effectcraft-cli mcp --bridge 9877`";

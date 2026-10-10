@@ -24,13 +24,15 @@
 //! effectcraft-cli bench --ops [--small] [--layers N] [--comps N] [--footage N]   everyday-operation timings
 //!     on a large generated project (open, save, auto-save, undo/redo, timeline, Project panel)
 //! effectcraft-cli script FILE.jsx [F.ecproj] | --eval CODE    run an After Effects-style script
-//! effectcraft-cli mcp [--autosave | --bridge PORT] [--all-tools] MCP server on stdio
+//! effectcraft-cli mcp [--autosave | --bridge PORT | --ui] [--all-tools] MCP server on stdio
 //!
 //! Project:  --project F.ecproj (or a positional *.ecproj) | --demo | --empty   (default: demo; mcp: empty)
 //! Saving:   --save (back to --project) | --save-as F.ecproj
 //! GPU:      --gpu renders on the GPU compositor (Mercury GPU Acceleration) when an adapter exists;
 //!           the default is the CPU (Mercury Software Only)
 //! Bridge:   --bridge PORT drives a running `effectcraft --control PORT` instead of a headless session
+//! UI:       mcp --ui [--ui-size WxH] [--ui-scale K] runs the full app offscreen (no window) for
+//!           screenshot and the ui_* tools (feature `ui`, on by default)
 //! Output:   --json for one compact JSON document on stdout (errors: {"error": …}, exit 1)
 //! ```
 //!
@@ -41,6 +43,8 @@
 
 use std::io::Write;
 
+#[cfg(feature = "ui")]
+mod offscreen_ui;
 mod template;
 
 use effectcraft_automation::tools::{self, Reply};
@@ -116,9 +120,11 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
   script FILE.jsx [F.ecproj] | --eval CODE run JavaScript with the After Effects-style object model
                                            (app.project, comps, layers, properties…); prints writeLn
                                            output and the result; errors exit 1 with file:line:col
-  mcp [--autosave | --bridge PORT] [--all-tools]
+  mcp [--autosave | --bridge PORT | --ui] [--all-tools]
                                            MCP server (JSON-RPC over stdio); --autosave preserves unsaved
-                                           headless work; --all-tools also lists the older tool aliases
+                                           headless work; --all-tools also lists the older tool aliases;
+                                           --ui [--ui-size 1680x1020] [--ui-scale 2] runs the app offscreen
+                                           (no window) so screenshot and the ui_* tools work
       [--automation-read-root DIR] [--automation-write-root DIR]
                                            confine the agent's file access: reads under a read or write root,
                                            writes under a write root (each repeatable); scripts are refused
@@ -146,6 +152,8 @@ const VALUED: &[&str] = &[
     "--expression",
     "--depth",
     "--eval",
+    "--ui-size",
+    "--ui-scale",
     // render
     "--template",
     "--values",
@@ -192,6 +200,7 @@ const FLAGS: &[&str] = &[
     "--adv3d",
     "--autosave",
     "--all-tools",
+    "--ui",
 ];
 
 struct Args {
@@ -323,13 +332,17 @@ fn usage_err<T>(m: &str) -> Result<T, Failure> {
     Err(Failure::Usage(m.to_string()))
 }
 
-/// Build the backend: a bridge to the app, or a headless session with the requested project.
+/// Build the backend: a bridge to the app, the app offscreen (`--ui`), or a headless session, with
+/// the requested project.
 fn backend(args: &Args, default_demo: bool) -> Result<Backend, Failure> {
     if let Some(addr) = args.opt("--bridge") {
         if args.project.is_some() || args.flag("--demo") {
             return usage_err("--bridge drives the running app's project; use `exec file.open` to open another");
         }
         return Ok(Backend::bridge(addr)?);
+    }
+    if args.flag("--ui") {
+        return offscreen_backend(args, default_demo);
     }
     let mut b = Backend::headless(session(args)?);
     if let Some(p) = &args.project {
@@ -338,6 +351,45 @@ fn backend(args: &Args, default_demo: bool) -> Result<Backend, Failure> {
         b.exec("file.openDemoProject", json!({}))?;
     }
     Ok(b)
+}
+
+/// `--ui`: the full app offscreen, reached through its control channel like a bridged app.
+#[cfg(feature = "ui")]
+fn offscreen_backend(args: &Args, default_demo: bool) -> Result<Backend, Failure> {
+    use effectcraft_ui_egui::offscreen::OffscreenOptions;
+    let mut opts = OffscreenOptions::default();
+    if let Some(v) = args.opt("--ui-size") {
+        let parsed = v.split_once('x').and_then(|(w, h)| Some([w.trim().parse::<f32>().ok()?, h.trim().parse::<f32>().ok()?]));
+        opts.size = parsed.ok_or_else(|| Failure::Usage(format!("--ui-size: expected WxH in points, e.g. 1680x1020, got {v}")))?;
+    }
+    if let Some(k) = args.num("--ui-scale")? {
+        if !(0.5..=4.0).contains(&k) {
+            return usage_err("--ui-scale: expected 0.5 to 4");
+        }
+        opts.pixels_per_point = k as f32;
+    }
+    // The project opens before the app starts (errors surface now, and `initialize` needn't wait
+    // for the app's first frames). The app attaches the GPU compositor on its own wgpu device, as
+    // the desktop app does.
+    let open = match &args.project {
+        Some(p) => Some(("file.open", json!({"path": p}))),
+        None if args.flag("--demo") || (default_demo && !args.flag("--empty")) => Some(("file.openDemoProject", json!({}))),
+        None => None,
+    };
+    let ui = offscreen_ui::Offscreen::start(opts, move || {
+        let mut s = effectcraft_host::session();
+        if let Some((id, params)) = open {
+            s.execute_checked(id, params).map_err(|e| e.to_string())?;
+        }
+        Ok(s)
+    })?;
+    note!("effectcraft mcp: offscreen UI on {}", ui.adapter());
+    Ok(Backend::transport(ui))
+}
+
+#[cfg(not(feature = "ui"))]
+fn offscreen_backend(_args: &Args, _default_demo: bool) -> Result<Backend, Failure> {
+    Err(Failure::Error("--ui: this effectcraft-cli was built without the `ui` feature (cargo build -p effectcraft-cli --features ui)".into()))
 }
 
 /// A wired session; `--gpu` attaches the GPU compositor (renders then follow the project's
@@ -440,6 +492,23 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
         return usage_err("--autosave is only supported by mcp");
     }
     template::validate(cmd, args)?;
+    if cmd != "mcp" {
+        if let Some(o) = ["--ui", "--ui-size", "--ui-scale"].into_iter().find(|o| args.opts.iter().any(|(k, _)| k == o)) {
+            return usage_err(&format!("{o} is only supported by mcp"));
+        }
+    } else if args.flag("--ui") {
+        for (o, why) in [
+            ("--bridge", "--ui runs its own app offscreen; --bridge drives a running one"),
+            ("--autosave", "--autosave is for headless MCP; the offscreen app keeps the project in memory (save_project)"),
+            ("--gpu", "the offscreen UI renders on the GPU compositor of its own device when one is usable"),
+        ] {
+            if args.opts.iter().any(|(k, _)| k == o) {
+                return usage_err(why);
+            }
+        }
+    } else if args.opt("--ui-size").is_some() || args.opt("--ui-scale").is_some() {
+        return usage_err("--ui-size and --ui-scale need --ui");
+    }
     if args.flag("--all-tools") && cmd != "mcp" {
         return usage_err("--all-tools is only supported by mcp");
     }
@@ -452,7 +521,7 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
             let comp = tool(&mut b, "get_comp", json!({})).ok();
             let info = json!({
                 "version": env!("CARGO_PKG_VERSION"),
-                "mode": if b.is_bridge() { "bridge" } else { "headless" },
+                "mode": b.mode(),
                 "commands": effectcraft_engine::command_specs().len(),
                 "effects": effectcraft_engine::effects::registry().len(),
                 "project": p,

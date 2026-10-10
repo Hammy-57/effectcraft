@@ -6,7 +6,7 @@ user can do, an agent can do too. There are three ways in:
 
 | Interface | Best for | Needs a window |
 |---|---|---|
-| **MCP** (`effectcraft-cli mcp`) | Claude Code and other MCP clients | no (headless), or yes with `--bridge` |
+| **MCP** (`effectcraft-cli mcp`) | Claude Code and other MCP clients | no (headless, or `--ui` with the app offscreen), or yes with `--bridge` |
 | **CLI** (`effectcraft-cli exec/get/set/...`) | one-shot scripting and CI; JSON output with `--json` | no |
 | **Control channel** (`effectcraft --control 9877`) | driving and seeing the live UI; see [control-protocol.md](control-protocol.md) | yes |
 
@@ -40,6 +40,15 @@ Desktop, Cursor and the like) take the same `command` and `args`.
   unless you add `"--gpu"` (`["mcp", "--gpu"]`), which attaches the GPU compositor on a device of
   its own; if no adapter is usable the server says why and exits. `doc_inspect`'s `project.renderer`
   (`render.backend`) reports `active` (`gpu` / `cpu`) and, on the CPU, `why`.
+- **Offscreen UI** (`["mcp", "--ui"]`, add `"--demo"` or a project as above): runs the full app in
+  the server process with no window (egui_kittest + wgpu, like the `snapshot` example), so
+  `screenshot` (with `panel` / `id` crops), the `ui_*` tools and `control` work exactly as in bridge
+  mode: every tool goes through the same control-channel requests, and clicks, drags, keys and
+  typing are real input events. Nothing appears on screen, focus is never taken, and several servers
+  can run side by side. `--ui-size 1680x1020` (points) and `--ui-scale 2` (screenshot pixels per
+  point) set the window. It needs a GPU adapter (startup says which; without one it exits with the
+  reason) and starts in about a second. Work is in memory: `save_project` it (no `--autosave`).
+  Built with the CLI's default `ui` feature (`--no-default-features` drops it).
 - **Bridge** (`["mcp", "--bridge", "9877"]`): drives a running `effectcraft --control 9877`, so you
   see every change live. Bridge mode adds `screenshot` and the `ui_*` tools.
 
@@ -119,7 +128,7 @@ See [MCP conventions](mcp.md) for core tools, resources, strict arguments, and p
 | `history {goto?}` | The branching undo history (History panel): every state with its index, id, label, branch depth and whether it's current; `goto` (an index or id) jumps to any state, on any branch, without losing the others. |
 | `script_ui {action?, window?, widget?, value?, result?}` | Drive ScriptUI windows that scripts opened: `list` (default) the open windows, `get` a window's control tree, `click` a button / checkbox / radio button, `set` text, a slider or a list item, `close` a window (`result`: what a dialog's `show()` returns, default 2 = Cancel). |
 | `batch {steps: [{command, params}], label?, atomic?}` | Several commands in one call and one undo step (`engine.batch`); `"$N.key"` in a param is step N's result (`"$1.layer"`). A failing step rolls the batch back and names the step. |
-| *(bridge)* `screenshot {panel?, id?, max_side?, path?}`, `ui_inspect`, `ui_elements {prefix?}`, `ui_click`, `ui_drag`, `ui_key`, `ui_type`, `ui_set`, `control {method, params}` | Look at and operate the live window. |
+| *(UI: `--ui` or `--bridge`)* `screenshot {panel?, id?, max_side?, path?}`, `ui_inspect`, `ui_elements {prefix?}`, `ui_click`, `ui_drag`, `ui_key`, `ui_type`, `ui_set`, `control {method, params}` | Look at and operate the app window (offscreen with `--ui`, the live one with `--bridge`). |
 | *(hidden aliases)* `list_commands {filter?, enabled_only?, schemas?}`, `execute_command {command \| id, params?}`, `get_project`, `render_frame {comp?, time?, max_side?, path?, inline?, transparent?}` | Older names of `command_list`, `command_run`, `doc_inspect` (its `project`) and `render_preview`. Callable, but not in `tools/list` unless the server runs with `mcp --all-tools`. |
 
 Layers are referenced by id (from `get_comp`), `"#n"` (1-based index from the top) or name. Comps are
@@ -177,7 +186,7 @@ Short recipes; every step is one tool call.
 | Key a green screen | `add_effect {"layer":2,"effect":"Keylight (1.2)"}` → `command_run effect.pickColor {"layer":2,"effect":1,"param":"screenColour","x":20,"y":20,"average":true}` (a screen pixel, layer space; samples the effect's input) → `set_property {"layer":2,"path":"effects/#1/screenMatte/clipBlack","value":10}` → `render_preview {"transparent":true}` |
 | Drive with an expression | `set_property {"layer":2,"path":"transform/rotation","expression":"time*90"}` |
 | Inspect a layer | `get_layer {"layer":2,"flat":true}` (every property with its `path`, value, key count) |
-| Check the result | `render_preview {"time":1.5,"max_side":640}`; in bridge mode `screenshot {"panel":"Timeline"}` |
+| Check the result | `render_preview {"time":1.5,"max_side":640}`; with a UI (`--ui` / `--bridge`) `screenshot {"panel":"Timeline"}` |
 | Is the title centred and on screen? | `get_layout {"layers":["Title"],"time":2}` → compare `center` with half the comp size, `onScreen` should be 1; `get_layout {"overlaps":true}` for collisions |
 | Check the soundtrack | `analyze_audio {}` → `integratedLufs` (streaming targets about -14), `truePeakDbtp` under -1, `clippedSamples` 0, `silences`; `analyze_audio {"waveform":true}` to see it |
 | Undo a mistake | `undo {}`, or `history {}` then `history {"goto": n}` |
@@ -666,7 +675,9 @@ not read or written.
 
 ## Seeing the UI
 
-To work on the UI, start the app with `cargo run -p effectcraft -- --control 9877` (add `--demo` to
+The quickest way is the offscreen UI (`effectcraft-cli mcp --ui --demo`): it runs the whole app without a window, so screenshots and UI input
+work while you use the machine, on any Space, with the display asleep, and in parallel agents. The
+loop below works the same there. To watch changes live instead, start the app with `cargo run -p effectcraft -- --control 9877` (add `--demo` to
 open the demo project; without it the app starts with an empty project) and use MCP bridge
 mode or the raw control channel. A good loop is: `ui_elements` to find an id, `ui_click` or `ui_drag`
 to act, then `screenshot {"panel":"Timeline"}` to check the result. `render_preview` shows the
