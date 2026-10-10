@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use effectcraft_engine::project::ItemId;
+use effectcraft_engine::render::audio::AudioStream;
 use effectcraft_engine::time::{FrameRate, Tick};
 
 use crate::frames::RenderSource;
@@ -180,7 +181,7 @@ pub struct AudioPlayback {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     /// wasm32 (no threads): what the feeder thread would own, run by [`AudioPlayback::pump`].
-    feeder: Option<(RenderSource, ItemId, i64, u32)>,
+    feeder: Option<(RenderSource, ItemId, i64, u32, AudioStream)>,
     pub rate: u32,
     pub span: PlaySpan,
 }
@@ -213,7 +214,7 @@ impl AudioPlayback {
         let stop = Arc::new(AtomicBool::new(false));
         if cfg!(target_arch = "wasm32") {
             // The device takes samples only in `pump`, which fills the queue first.
-            let mut p = AudioPlayback { feed: feed.clone(), device, stop, thread: None, feeder: Some((src, comp, span.start, mix)), rate, span };
+            let mut p = AudioPlayback { feed: feed.clone(), device, stop, thread: None, feeder: Some((src, comp, span.start, mix, AudioStream::default())), rate, span };
             p.device.start(feed)?;
             p.pump();
             return Ok(p);
@@ -229,9 +230,11 @@ impl AudioPlayback {
                 .spawn(move || {
                     let mut cursor = span.start;
                     let target = queue_target(rate);
+                    // Keeps layer audio effects running from block to block (no pre-roll per block).
+                    let stream = AudioStream::default();
                     while !stop.load(Ordering::Relaxed) {
                         if feed.queued_frames() < target && !feed.finished.load(Ordering::Relaxed) {
-                            cursor = feed_block(&src, comp, &feed, &span, cursor, rate, mix);
+                            cursor = feed_block(&src, comp, &feed, &span, cursor, rate, mix, &stream);
                         } else {
                             std::thread::sleep(std::time::Duration::from_millis(4));
                         }
@@ -246,10 +249,10 @@ impl AudioPlayback {
     /// Every UI frame while playing: on wasm32 mix ahead into the feed (what the feeder thread
     /// does elsewhere), then let the device take what it needs.
     pub fn pump(&mut self) {
-        if let Some((src, comp, cursor, mix)) = &mut self.feeder {
+        if let Some((src, comp, cursor, mix, stream)) = &mut self.feeder {
             let target = queue_target(self.rate);
             while self.feed.queued_frames() < target && !self.feed.finished.load(Ordering::Relaxed) {
-                *cursor = feed_block(src, *comp, &self.feed, &self.span, *cursor, self.rate, *mix);
+                *cursor = feed_block(src, *comp, &self.feed, &self.span, *cursor, self.rate, *mix, stream);
             }
         }
         self.device.pump();
@@ -281,7 +284,8 @@ impl Drop for AudioPlayback {
 
 /// Mix one block at `cursor` into the feed; returns the next cursor (wrapping or finishing at
 /// the work-area end).
-fn feed_block(src: &RenderSource, comp: ItemId, feed: &AudioFeed, span: &PlaySpan, cursor: i64, rate: u32, mix: u32) -> i64 {
+#[allow(clippy::too_many_arguments)]
+fn feed_block(src: &RenderSource, comp: ItemId, feed: &AudioFeed, span: &PlaySpan, cursor: i64, rate: u32, mix: u32, stream: &AudioStream) -> i64 {
     let mut cursor = cursor;
     if cursor >= span.wb {
         if !span.looping {
@@ -291,15 +295,17 @@ fn feed_block(src: &RenderSource, comp: ItemId, feed: &AudioFeed, span: &PlaySpa
         cursor = span.wa;
     }
     let n = ((span.wb - cursor) as usize).min(BLOCK);
-    feed.push(&mix_block(src, comp, sample_time(cursor, rate), n, rate, mix));
+    feed.push(&mix_block(src, comp, sample_time(cursor, rate), n, rate, mix, Some(stream)));
     cursor + n as i64
 }
 
 /// `n` stereo frames of `comp`'s mix from comp time `t` at the device `rate`, mixed at `mix` Hz
-/// (resampled when they differ).
-fn mix_block(src: &RenderSource, comp: ItemId, t: Tick, n: usize, rate: u32, mix: u32) -> Vec<f32> {
-    let render =
-        |frames: usize, at: u32| effectcraft_engine::render::audio::mix_comp(&src.project, src.footage.as_ref(), src.expr.as_deref(), comp, t, frames, at);
+/// (resampled when they differ). `stream` continues the previous block's effect chains.
+fn mix_block(src: &RenderSource, comp: ItemId, t: Tick, n: usize, rate: u32, mix: u32, stream: Option<&AudioStream>) -> Vec<f32> {
+    let render = |frames: usize, at: u32| match stream {
+        Some(s) => s.mix(&src.project, src.footage.as_ref(), src.expr.as_deref(), comp, t, frames, at),
+        None => effectcraft_engine::render::audio::mix_comp(&src.project, src.footage.as_ref(), src.expr.as_deref(), comp, t, frames, at),
+    };
     if mix == rate {
         return render(n, rate);
     }
@@ -341,7 +347,7 @@ impl AudioScrub {
         let rate = self.rate;
         let mix = if mix_rate == 0 { rate } else { mix_rate.clamp(8000, 192_000) };
         let n = (c.frame_duration().seconds().clamp(0.03, 0.1) * rate as f64) as usize;
-        let mut buf = mix_block(src, comp, c.frame_rate.tick_of(frame), n, rate, mix);
+        let mut buf = mix_block(src, comp, c.frame_rate.tick_of(frame), n, rate, mix, None);
         // 3 ms fades: no clicks where snippets meet.
         let fade = (rate as usize * 3 / 1000).clamp(1, n / 2 + 1);
         let frames = buf.len() / 2;
