@@ -166,7 +166,12 @@ fn preserve_transparency_draws_only_the_window_it_reaches() {
 #[test]
 fn styled_layers_draw_only_the_window_they_reach() {
     let shadow = [("dropShadow/distance", Value::Scalar(12.0)), ("dropShadow/size", Value::Scalar(6.0))];
-    for (matte, knockout, mode, mb) in [(false, 0, BlendMode::Normal, false), (false, 2, BlendMode::Overlay, true), (true, 0, BlendMode::Normal, false), (false, 0, BlendMode::StencilAlpha, false)] {
+    for (matte, knockout, mode, mb) in [
+        (false, 0, BlendMode::Normal, false),
+        (false, 2, BlendMode::Overlay, true),
+        (true, 0, BlendMode::Normal, false),
+        (false, 0, BlendMode::StencilAlpha, false),
+    ] {
         assert_windows_match(&format!("styles matte {matte} knockout {knockout} {mode:?} mb {mb}"), |p, c| {
             let mut l = small(p, c, mb);
             style(p, c, &mut l, "dropShadow", &shadow);

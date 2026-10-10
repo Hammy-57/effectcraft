@@ -161,7 +161,16 @@ impl<'a> Renderer<'a> {
     /// [`Self::composite_iso_with`] for an isolated render of the window `win` of the canvas
     /// (`iso` is `win`'s size; `matte_img`, if any, the whole canvas's).
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn composite_iso_at(&self, ctx: &EvalCtx, layer: &Layer, mut iso: Image, win: Window, canvas: &mut Image, opacity: f32, matte_img: Option<Image>) {
+    pub(crate) fn composite_iso_at(
+        &self,
+        ctx: &EvalCtx,
+        layer: &Layer,
+        mut iso: Image,
+        win: Window,
+        canvas: &mut Image,
+        opacity: f32,
+        matte_img: Option<Image>,
+    ) {
         let matte = layer.track_matte.and_then(|tm| ctx.comp.layer(tm.layer).filter(|m| m.id != layer.id).map(|m| (m, tm.kind)));
         let preserve = layer.preserve_transparency;
         let size = (canvas.width, canvas.height);

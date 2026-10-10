@@ -140,7 +140,17 @@ impl<'a> Renderer<'a> {
     /// [`Self::place_memo`] into `target`, the window of the canvas at `origin` (see
     /// [`Self::reach`]): exactly the canvas's pixels there.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn place_at(&self, ctx: &EvalCtx, layer: &Layer, buf: &Buf, target: &mut Image, origin: [u32; 2], mode: BlendMode, opacity: f32, mo: &MotionMemo) {
+    pub(crate) fn place_at(
+        &self,
+        ctx: &EvalCtx,
+        layer: &Layer,
+        buf: &Buf,
+        target: &mut Image,
+        origin: [u32; 2],
+        mode: BlendMode,
+        opacity: f32,
+        mo: &MotionMemo,
+    ) {
         let pl = self.placement_memo(ctx, layer, buf, mo);
         let opts = WarpOpts { sampling: pl.sampling, opacity, mode, seed: pl.seed, clip: None };
         // One minification chain for every sub-sample (built only when the layer is shrunk).

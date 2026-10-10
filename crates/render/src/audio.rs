@@ -100,7 +100,16 @@ impl Chain {
 impl AudioStream {
     /// [`mix_comp`], continuing the layer effect chains of the previous calls where the block
     /// follows on.
-    pub fn mix(&self, project: &Project, footage: &dyn FootageSource, expr: Option<&dyn ExprHost>, comp: ItemId, start: Tick, frames: usize, rate: u32) -> Vec<f32> {
+    pub fn mix(
+        &self,
+        project: &Project,
+        footage: &dyn FootageSource,
+        expr: Option<&dyn ExprHost>,
+        comp: ItemId,
+        start: Tick,
+        frames: usize,
+        rate: u32,
+    ) -> Vec<f32> {
         let mut out = vec![0.0f32; frames * 2];
         mix_into(project, footage, expr, comp, start, rate, &mut out, 1.0, 1.0, 0, Some((self, 0)));
         out
@@ -574,10 +583,21 @@ mod tests {
         let mut p = Project::default();
         let comp = Comp::new(64, 64, FrameRate::new(25, 1), Tick::from_seconds_f64(20.0));
         let src = if id == "ec.audio.tone" {
-            let sid = p.add_item("S", effectcraft_color::Label::Red, None, ItemKind::Solid(effectcraft_project::Solid { color: [1.0; 3], width: 64, height: 64, pixel_aspect: 1.0 }));
+            let sid = p.add_item(
+                "S",
+                effectcraft_color::Label::Red,
+                None,
+                ItemKind::Solid(effectcraft_project::Solid { color: [1.0; 3], width: 64, height: 64, pixel_aspect: 1.0 }),
+            );
             LayerSource::Solid { item: sid }
         } else {
-            let f = Footage { kind: FootageKind::Audio, frame_rate: FrameRate::new(25, 1), duration: Tick::from_seconds_f64(20.0), has_audio: true, ..Default::default() };
+            let f = Footage {
+                kind: FootageKind::Audio,
+                frame_rate: FrameRate::new(25, 1),
+                duration: Tick::from_seconds_f64(20.0),
+                has_audio: true,
+                ..Default::default()
+            };
             LayerSource::Footage { item: p.add_item("n.wav", effectcraft_color::Label::SeaFoam, None, ItemKind::Footage(f)) }
         };
         let mut l = build::layer(&mut p, &comp, "a", src, (64, 64), None);

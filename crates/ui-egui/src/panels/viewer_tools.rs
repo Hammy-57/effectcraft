@@ -777,7 +777,8 @@ mod tests {
     #[test]
     fn display_transform_in_bands_matches_one_pass() {
         let n = (1 << 16) * 2 + 77;
-        let px: Vec<Color32> = (0..n).map(|i| Color32::from_rgba_premultiplied((i % 200) as u8, (i % 97) as u8, (i % 31) as u8, 200 + (i % 50) as u8)).collect();
+        let px: Vec<Color32> =
+            (0..n).map(|i| Color32::from_rgba_premultiplied((i % 200) as u8, (i % 97) as u8, (i % 31) as u8, 200 + (i % 50) as u8)).collect();
         let img = egui::ColorImage::new([n, 1], px);
         for (ch, stops) in [(Channel::Rgb, 1.5), (Channel::Red, -0.5), (Channel::Alpha, 0.0), (Channel::RgbStraight, 2.0)] {
             let mut one: Vec<[u8; 4]> = img.pixels.iter().map(|c| c.to_array()).collect();

@@ -779,7 +779,6 @@ impl std::fmt::Write for KeyHasher {
     }
 }
 
-
 pub(crate) fn hash_debug(h: &mut KeyHasher, v: &impl std::fmt::Debug) {
     use std::fmt::Write;
     let _ = write!(h, "{v:?}");

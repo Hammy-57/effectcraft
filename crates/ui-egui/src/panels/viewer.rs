@@ -565,7 +565,8 @@ fn aux_views(
                     Some((k, tex)) if k == key => tex,
                     _ => {
                         let img = app.session.render(cid, t, opts);
-                        let tex = crate::frames::load_fitted(&ctx, format!("viewer-aux-{i}"), crate::frames::to_color_image(&img), egui::TextureOptions::LINEAR);
+                        let tex =
+                            crate::frames::load_fitted(&ctx, format!("viewer-aux-{i}"), crate::frames::to_color_image(&img), egui::TextureOptions::LINEAR);
                         ctx.data_mut(|d| d.insert_temp(id, (key, tex.clone())));
                         tex
                     }
