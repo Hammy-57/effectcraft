@@ -76,13 +76,7 @@ fn reverse_direction(s: &mut Session, p: &Value) -> Result<Value> {
             }
             vec![uid]
         }
-        None => s
-            .state
-            .selected_props
-            .iter()
-            .filter(|(sl, su)| *sl == lid && contents.find_group(*su).is_some_and(has_direction))
-            .map(|(_, su)| *su)
-            .collect(),
+        None => s.state.selected_props.iter().filter(|(sl, su)| *sl == lid && contents.find_group(*su).is_some_and(has_direction)).map(|(_, su)| *su).collect(),
     };
     let Some(first) = uids.first().and_then(|u| contents.find_group(*u)) else {
         return Err(bad(c, "select a Path, Rectangle, Ellipse or Polystar"));

@@ -181,7 +181,6 @@ pub fn command_specs() -> &'static [CommandSpec] {
     SPECS.get_or_init(|| command_modules().into_iter().flat_map(|(_, specs)| specs()).collect())
 }
 
-
 /// Set `footage` as the proxy of `item` (File ▸ Create Proxy's post-render action).
 pub(crate) fn proxy_set(s: &mut Session, item: ItemId, footage: effectcraft_project::Footage) -> Result<()> {
     proxy::set_proxy_footage(s, &[item], footage)
