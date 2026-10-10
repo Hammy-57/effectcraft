@@ -21,6 +21,8 @@ fn every_test_file_is_a_module() {
 mod hevc_av1_roundtrip;
 #[path = "../opus_roundtrip.rs"]
 mod opus_roundtrip;
+#[path = "../pipelined.rs"]
+mod pipelined;
 #[path = "../render_settings.rs"]
 mod render_settings;
 #[path = "../roundtrip.rs"]

@@ -1,6 +1,6 @@
 # effectcraft-av1enc
 
-Clean-room, pure-Rust AV1 encoder for EffectCraft's MP4 / WebM export (layer L0, `std` only,
+Clean-room, pure-Rust AV1 encoder for EffectCraft's MP4 / WebM export (layer L0, `std` and rayon,
 no `unsafe`, builds for `wasm32-unknown-unknown`).
 
 Output is decoded **bit-exactly** by libdav1d (`ffmpeg -c:v libdav1d`, checked in
@@ -50,6 +50,12 @@ reconstruction, so prediction never drifts.
 - **Rate control**: `ConstantQ(base_q_idx)`; `Bitrate { kbps }` adapts `base_q_idx` per frame
   towards the average target (key frames get a lower quantizer and a larger share; the first
   key frame is searched in a few passes).
+- **Speed**: superblock rows are decided in parallel (rayon) as a wavefront, each row two
+  superblocks behind the row above, since a decision reads only the last reconstructed row and
+  motion vectors of the row above up to the superblock above-right. The output is bit-identical
+  to the serial order whatever the thread count (`tests/roundtrip.rs` pins the bitstream bytes).
+  Syntax writing, loop-filter search and filtering (under 1 % of the time) stay serial;
+  transform trials and block decisions reuse scratch buffers.
 
 ## Limits
 

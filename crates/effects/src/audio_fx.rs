@@ -6,8 +6,10 @@
 //! composition mixdown (`effectcraft_render::audio`), which preview playback and export share.
 //!
 //! The mixdown renders in short blocks. To keep the result independent of block boundaries
-//! every effect is stateless across calls: the mixer feeds [`preroll`] seconds of the layer's
-//! audio before the block, runs the chain from a cleared state and keeps the tail.
+//! the mixer feeds [`preroll`] seconds of the layer's audio before a block, runs the chain from a
+//! cleared state and keeps the tail. Each effect is a [`Processor`] that carries its state from
+//! one block to the next, so a caller mixing consecutive blocks (playback) continues the chain
+//! instead of paying the pre-roll again: blocks fed in turn equal one long call, bit for bit.
 //!
 //! DSP is textbook: second-order sections use the public RBJ "Audio EQ Cookbook" formulas;
 //! Reverb is a Schroeder/Moorer network (parallel low-pass feedback combs into series
@@ -240,60 +242,372 @@ pub fn preroll(id: &str, params: &Params) -> f64 {
 /// Run audio effect `id` over interleaved stereo `buf` (L R L R …) at `rate` Hz, from a cleared
 /// state. `start` is the layer time (seconds) of the first sample (oscillator phase).
 pub fn process(id: &str, params: &Params, buf: &mut [f32], rate: u32, start: f64) {
-    if rate == 0 || buf.len() < 2 {
-        return;
+    if let Some(mut p) = Processor::new(id, params, rate, start) {
+        p.process_block(buf);
     }
-    let sr = rate as f64;
-    match id {
-        "ec.audio.backwards" => {
-            if params.b("swapChannels") {
-                buf.as_chunks_mut::<2>().0.iter_mut().for_each(|f| f.swap(0, 1));
-            }
+}
+
+/// A running audio effect: its parameters (fixed for its life) and the state it carries from one
+/// block to the next (filter memories, envelopes, delay lines, the oscillator clock). Feeding a
+/// signal through [`Processor::process_block`] in any number of consecutive blocks gives exactly
+/// the samples of one call over the whole signal ([`process`] is a new processor run once).
+pub struct Processor {
+    kind: Kind,
+    sr: f64,
+    /// Layer time (seconds) of the first sample the processor saw.
+    start: f64,
+    /// Sample frames processed so far (the run index of the next one).
+    pos: u64,
+}
+
+enum Kind {
+    Pass,
+    Swap,
+    /// Cascaded second-order sections; `mix` = (dry, wet) when the dry signal is mixed back.
+    Biquads {
+        sections: Vec<Section>,
+        mix: Option<(f32, f32)>,
+    },
+    Delay {
+        d: u64,
+        amount: f32,
+        fb: f32,
+        dry: f32,
+        wet: f32,
+        x: History,
+        e: History,
+    },
+    Compressor(Box<Compressor>),
+    Gate {
+        th: f64,
+        att: f64,
+        rel: f64,
+        hold: usize,
+        g: f64,
+        held: usize,
+    },
+    Distortion {
+        kind: u32,
+        drive: f32,
+        pre: f32,
+        mix: f32,
+        vol: f32,
+        q: Option<f32>,
+        down: i64,
+        first: i64,
+        held: [f32; 2],
+    },
+    Flange(Box<Flange>),
+    Modulator {
+        kind: u32,
+        rate: f64,
+        depth: f64,
+        am: f64,
+        x: History,
+    },
+    Reverb(Box<Reverb>),
+    StereoMixer {
+        ll: f32,
+        rl: f32,
+        l_to_l: f32,
+        l_to_r: f32,
+        r_to_l: f32,
+        r_to_r: f32,
+        inv: f32,
+    },
+    Tone {
+        kind: u32,
+        level: f32,
+        freqs: Vec<f64>,
+    },
+}
+
+impl Processor {
+    /// A processor for audio effect `id` (`None` for a zero rate). `start` is the layer time
+    /// (seconds) of the first sample it will see.
+    pub fn new(id: &str, params: &Params, rate: u32, start: f64) -> Option<Processor> {
+        if rate == 0 {
+            return None;
         }
-        "ec.audio.basstreble" => {
-            let bass = params.f("bass") / 100.0 * 12.0;
-            let treble = params.f("treble") / 100.0 * 12.0;
-            if bass != 0.0 {
-                run_biquad(buf, Biquad::low_shelf(sr, 200.0, bass));
-            }
-            if treble != 0.0 {
-                run_biquad(buf, Biquad::high_shelf(sr, 4000.0, treble));
-            }
-        }
-        "ec.audio.highlowpass" => {
-            let fc = params.f("cutoffFrequency").clamp(1.0, sr * 0.49);
-            let q = std::f64::consts::FRAC_1_SQRT_2;
-            let bq = if params.e("filterOptions") == 1 { Biquad::low_pass(sr, fc, q) } else { Biquad::high_pass(sr, fc, q) };
-            let dry = (params.f("dryOut") / 100.0) as f32;
-            let wet = (params.f("wetOut") / 100.0) as f32;
-            let orig = buf.to_vec();
-            run_biquad(buf, bq);
-            mix_dry_wet(buf, &orig, dry, wet);
-        }
-        "ec.audio.parametriceq" => {
-            for n in 1..=3 {
-                if !params.b(&format!("band{n}Enable")) {
-                    continue;
+        let sr = rate as f64;
+        let kind = match id {
+            "ec.audio.backwards" if params.b("swapChannels") => Kind::Swap,
+            "ec.audio.basstreble" => {
+                let bass = params.f("bass") / 100.0 * 12.0;
+                let treble = params.f("treble") / 100.0 * 12.0;
+                let mut sections = vec![];
+                if bass != 0.0 {
+                    sections.push(Section::new(Biquad::low_shelf(sr, 200.0, bass)));
                 }
-                let g = params.f(&format!("band{n}BoostCut"));
-                if g == 0.0 {
-                    continue;
+                if treble != 0.0 {
+                    sections.push(Section::new(Biquad::high_shelf(sr, 4000.0, treble)));
                 }
-                let f = params.f(&format!("band{n}Frequency")).clamp(1.0, sr * 0.49);
-                let bw = (params.f(&format!("band{n}Bandwidth")) / 100.0 * 3.0).max(0.05);
-                run_biquad(buf, Biquad::peaking(sr, f, bw, g));
+                Kind::Biquads { sections, mix: None }
             }
+            "ec.audio.highlowpass" => {
+                let fc = params.f("cutoffFrequency").clamp(1.0, sr * 0.49);
+                let q = std::f64::consts::FRAC_1_SQRT_2;
+                let bq = if params.e("filterOptions") == 1 { Biquad::low_pass(sr, fc, q) } else { Biquad::high_pass(sr, fc, q) };
+                let dry = (params.f("dryOut") / 100.0) as f32;
+                let wet = (params.f("wetOut") / 100.0) as f32;
+                Kind::Biquads { sections: vec![Section::new(bq)], mix: Some((dry, wet)) }
+            }
+            "ec.audio.parametriceq" => {
+                let mut sections = vec![];
+                for n in 1..=3 {
+                    if !params.b(&format!("band{n}Enable")) {
+                        continue;
+                    }
+                    let g = params.f(&format!("band{n}BoostCut"));
+                    if g == 0.0 {
+                        continue;
+                    }
+                    let f = params.f(&format!("band{n}Frequency")).clamp(1.0, sr * 0.49);
+                    let bw = (params.f(&format!("band{n}Bandwidth")) / 100.0 * 3.0).max(0.05);
+                    sections.push(Section::new(Biquad::peaking(sr, f, bw, g)));
+                }
+                Kind::Biquads { sections, mix: None }
+            }
+            "ec.audio.delay" => {
+                let d = ((params.f("delayTime").max(0.0) / 1000.0 * sr).round() as u64).max(1);
+                let keep = usize::try_from(d).unwrap_or(usize::MAX);
+                Kind::Delay {
+                    d,
+                    amount: (params.f("delayAmount") / 100.0) as f32,
+                    fb: (params.f("feedback") / 100.0).clamp(0.0, 0.99) as f32,
+                    dry: (params.f("dryOut") / 100.0) as f32,
+                    wet: (params.f("wetOut") / 100.0) as f32,
+                    x: History::new(keep),
+                    e: History::new(keep),
+                }
+            }
+            "ec.audio.compressor" => Kind::Compressor(Box::new(Compressor::new(params, sr))),
+            "ec.audio.distortion" => {
+                let bits = params.f("bitDepth").round().clamp(1.0, 24.0);
+                Kind::Distortion {
+                    kind: params.e("distortionType"),
+                    drive: (params.f("drive") / 100.0) as f32,
+                    // Gain: pre-distortion amplification (25 = unity); Volume: output level (11 = unity).
+                    pre: (params.f("gain").max(0.0) / 25.0) as f32,
+                    mix: (params.f("mix") / 100.0).clamp(0.0, 1.0) as f32,
+                    vol: (params.f("volume").max(0.0) / 11.0) as f32,
+                    q: (bits < 24.0).then(|| 2f32.powf(bits as f32 - 1.0)),
+                    down: params.f("downsample").round().clamp(1.0, 64.0) as i64,
+                    // Sample-and-hold on absolute sample positions, so blocks agree with one long run.
+                    first: (start * sr).round() as i64,
+                    held: [0.0; 2],
+                }
+            }
+            "ec.audio.gate" => Kind::Gate {
+                th: db_to_lin(params.f("threshold")),
+                att: smoothing(params.f("attack"), sr),
+                rel: smoothing(params.f("release").max(0.001), sr),
+                hold: (params.f("hold").max(0.0) / 1000.0 * sr) as usize,
+                g: 0.0,
+                held: 0,
+            },
+            "ec.audio.flangechorus" => Kind::Flange(Box::new(Flange::new(params, sr))),
+            "ec.audio.modulator" => {
+                // Depth: vibrato as a modulated delay of up to 5 ms; amplitude: tremolo.
+                let depth = (params.f("modulationDepth") / 100.0).clamp(0.0, 1.0) * 0.005 * sr;
+                Kind::Modulator {
+                    kind: params.e("modulationType"),
+                    rate: params.f("modulationRate").max(0.0),
+                    depth,
+                    am: (params.f("amplitudeModulation") / 100.0).clamp(0.0, 1.0),
+                    x: History::new(depth.ceil() as usize + 2),
+                }
+            }
+            "ec.audio.reverb" => Kind::Reverb(Box::new(Reverb::new(params, sr))),
+            "ec.audio.stereomixer" => {
+                // Linear pan law: −100 = all left, 0 = both at full, +100 = all right.
+                let pan = |p: f64| -> (f32, f32) {
+                    let p = (p / 100.0).clamp(-1.0, 1.0);
+                    ((1.0 - p).min(1.0) as f32, (1.0 + p).min(1.0) as f32)
+                };
+                let (l_to_l, l_to_r) = pan(params.f("leftPan"));
+                let (r_to_l, r_to_r) = pan(params.f("rightPan"));
+                Kind::StereoMixer {
+                    ll: (params.f("leftLevel") / 100.0) as f32,
+                    rl: (params.f("rightLevel") / 100.0) as f32,
+                    l_to_l,
+                    l_to_r,
+                    r_to_l,
+                    r_to_r,
+                    inv: if params.b("invertPhase") { -1.0 } else { 1.0 },
+                }
+            }
+            "ec.audio.tone" => Kind::Tone {
+                kind: params.e("waveformOptions"),
+                level: (params.f("level") / 100.0) as f32,
+                freqs: (1..=5).map(|i| params.f(&format!("frequency{i}"))).filter(|f| *f > 0.0).collect(),
+            },
+            _ => Kind::Pass,
+        };
+        Some(Processor { kind, sr, start, pos: 0 })
+    }
+
+    /// Process the next block of interleaved stereo samples in place.
+    pub fn process_block(&mut self, buf: &mut [f32]) {
+        let frames = buf.len() / 2;
+        let Some(buf) = buf.get_mut(..frames * 2) else { return };
+        if frames == 0 {
+            return;
         }
-        "ec.audio.delay" => delay(params, buf, sr),
-        "ec.audio.compressor" => compressor(params, buf, sr),
-        "ec.audio.distortion" => distortion(params, buf, sr, start),
-        "ec.audio.gate" => gate(params, buf, sr),
-        "ec.audio.flangechorus" => flange_chorus(params, buf, sr, start),
-        "ec.audio.modulator" => modulator(params, buf, sr, start),
-        "ec.audio.reverb" => reverb(params, buf, sr),
-        "ec.audio.stereomixer" => stereo_mixer(params, buf),
-        "ec.audio.tone" => tone(params, buf, sr, start),
-        _ => {}
+        let (sr, start, pos) = (self.sr, self.start, self.pos);
+        match &mut self.kind {
+            Kind::Pass => {}
+            Kind::Swap => buf.as_chunks_mut::<2>().0.iter_mut().for_each(|f| f.swap(0, 1)),
+            Kind::Biquads { sections, mix } => {
+                let orig = mix.map(|_| buf.to_vec());
+                for s in sections.iter_mut() {
+                    s.run(buf);
+                }
+                if let (Some((dry, wet)), Some(orig)) = (mix, orig) {
+                    mix_dry_wet(buf, &orig, *dry, *wet);
+                }
+            }
+            Kind::Delay { d, amount, fb, dry, wet, x, e } => {
+                // Echo line: e[i] = x[i-d] + fb * e[i-d]; out = dry*x + wet*amount*e.
+                x.push(buf);
+                for (i, f) in buf.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+                    let r = pos + i as u64;
+                    let mut ev = [0.0f32; 2];
+                    if let Some(k) = r.checked_sub(*d) {
+                        for (ch, v) in ev.iter_mut().enumerate() {
+                            *v = x.get(k, ch) + *fb * e.get(k, ch);
+                        }
+                    }
+                    e.push(&ev);
+                    for (o, v) in f.iter_mut().zip(ev) {
+                        *o = *o * *dry + v * *wet * *amount;
+                    }
+                }
+                x.trim();
+                e.trim();
+            }
+            Kind::Compressor(c) => c.run(buf),
+            Kind::Gate { th, att, rel, hold, g, held } => {
+                // Openness 0..1 (closed..open) is the gain: a closed gate mutes.
+                for f in buf.as_chunks_mut::<2>().0.iter_mut() {
+                    let peak = f[0].abs().max(f[1].abs()) as f64;
+                    let open = if peak >= *th {
+                        *held = *hold;
+                        true
+                    } else if *held > 0 {
+                        *held -= 1;
+                        true
+                    } else {
+                        false
+                    };
+                    let target = if open { 1.0 } else { 0.0 };
+                    let k = if target > *g { *att } else { *rel };
+                    *g = target + (*g - target) * k;
+                    let lin = *g as f32;
+                    f[0] *= lin;
+                    f[1] *= lin;
+                }
+            }
+            Kind::Distortion { kind, drive, pre, mix, vol, q, down, first, held } => {
+                for (i, f) in buf.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+                    let r = pos + i as u64;
+                    let take = r == 0 || first.wrapping_add(r as i64).rem_euclid(*down) == 0;
+                    for ch in 0..2 {
+                        let x = f[ch];
+                        let mut y = distort_sample(*kind, x * *pre, *drive);
+                        if let Some(q) = q {
+                            y = (y * *q).round() / *q;
+                        }
+                        if take {
+                            held[ch] = y;
+                        }
+                        f[ch] = (x * (1.0 - *mix) + held[ch] * *mix) * *vol;
+                    }
+                }
+            }
+            Kind::Flange(fl) => fl.run(buf, sr, start, pos),
+            Kind::Modulator { kind, rate, depth, am, x } => {
+                x.push(buf);
+                for (i, f) in buf.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+                    let r = pos + i as u64;
+                    let t = start + r as f64 / sr;
+                    let l = lfo(*kind, *rate * t);
+                    let d = *depth * (1.0 + l) * 0.5;
+                    let g = (1.0 - *am * (1.0 - l) * 0.5) as f32;
+                    for (ch, o) in f.iter_mut().enumerate() {
+                        let v = if *depth > 0.0 { read_frac(x, r, ch, d) } else { x.get(r, ch) };
+                        *o = v * g;
+                    }
+                }
+                x.trim();
+            }
+            Kind::Reverb(rv) => rv.run(buf, pos),
+            Kind::StereoMixer { ll, rl, l_to_l, l_to_r, r_to_l, r_to_r, inv } => {
+                for f in buf.as_chunks_mut::<2>().0.iter_mut() {
+                    let (l, r) = (f[0] * *ll, f[1] * *rl);
+                    f[0] = (l * *l_to_l + r * *r_to_l) * *inv;
+                    f[1] = (l * *l_to_r + r * *r_to_r) * *inv;
+                }
+            }
+            Kind::Tone { kind, level, freqs } => tone(*kind, *level, freqs, buf, sr, start, pos),
+        }
+        self.pos = pos.saturating_add(frames as u64);
+    }
+
+    /// Approximate heap bytes held by the processor's state (delay lines, histories).
+    pub fn state_bytes(&self) -> usize {
+        let f = std::mem::size_of::<f32>();
+        let d = std::mem::size_of::<f64>();
+        match &self.kind {
+            Kind::Delay { x, e, .. } => (x.buf.capacity() + e.buf.capacity()) * f,
+            Kind::Modulator { x, .. } => x.buf.capacity() * f,
+            Kind::Flange(fl) => fl.x.buf.capacity() * f,
+            Kind::Reverb(rv) => {
+                rv.x.buf.capacity() * f
+                    + rv.chans.iter().flat_map(|c| c.combs.iter().map(|l| l.0.capacity()).chain(c.aps.iter().map(|l| l.0.capacity()))).sum::<usize>() * d
+            }
+            Kind::Biquads { sections, .. } => sections.capacity() * std::mem::size_of::<Section>(),
+            Kind::Tone { freqs, .. } => freqs.capacity() * d,
+            _ => 0,
+        }
+    }
+}
+
+/// Input history of a delay-line effect: interleaved frames from run index `base` on, keeping at
+/// least the last `keep` frames.
+struct History {
+    buf: Vec<f32>,
+    base: u64,
+    keep: usize,
+}
+
+impl History {
+    fn new(keep: usize) -> History {
+        History { buf: vec![], base: 0, keep }
+    }
+
+    fn push(&mut self, frames: &[f32]) {
+        self.buf.extend_from_slice(frames);
+    }
+
+    /// Channel `ch` of the frame with run index `r` (silence before the run started).
+    fn get(&self, r: u64, ch: usize) -> f32 {
+        r.checked_sub(self.base)
+            .and_then(|k| usize::try_from(k).ok())
+            .and_then(|k| k.checked_mul(2))
+            .and_then(|k| self.buf.get(k.saturating_add(ch)))
+            .copied()
+            .unwrap_or(0.0)
+    }
+
+    /// Drop frames older than `keep` (amortised: only once the excess is large).
+    fn trim(&mut self) {
+        let frames = self.buf.len() / 2;
+        if frames > self.keep.saturating_mul(2).saturating_add(4096) {
+            let drop = frames - self.keep;
+            self.buf.drain(..drop * 2);
+            self.base = self.base.saturating_add(drop as u64);
+        }
     }
 }
 
@@ -369,54 +683,49 @@ impl Biquad {
     }
 }
 
-/// Direct form I over both channels of an interleaved buffer.
-fn run_biquad(buf: &mut [f32], q: Biquad) {
-    for ch in 0..2 {
-        let (mut x1, mut x2, mut y1, mut y2) = (0.0f64, 0.0, 0.0, 0.0);
-        for i in (ch..buf.len()).step_by(2) {
-            let x = buf[i] as f64;
-            let y = q.b[0] * x + q.b[1] * x1 + q.b[2] * x2 - q.a[0] * y1 - q.a[1] * y2;
-            x2 = x1;
-            x1 = x;
-            y2 = y1;
-            y1 = y;
-            buf[i] = y as f32;
+/// A biquad with its direct form I memories (x1, x2, y1, y2) per channel.
+struct Section {
+    q: Biquad,
+    mem: [[f64; 4]; 2],
+}
+
+impl Section {
+    fn new(q: Biquad) -> Section {
+        Section { q, mem: [[0.0; 4]; 2] }
+    }
+
+    /// Direct form I over both channels of an interleaved buffer.
+    fn run(&mut self, buf: &mut [f32]) {
+        let q = self.q;
+        for (ch, mem) in self.mem.iter_mut().enumerate() {
+            let [mut x1, mut x2, mut y1, mut y2] = *mem;
+            for i in (ch..buf.len()).step_by(2) {
+                let x = buf[i] as f64;
+                let y = q.b[0] * x + q.b[1] * x1 + q.b[2] * x2 - q.a[0] * y1 - q.a[1] * y2;
+                x2 = x1;
+                x1 = x;
+                y2 = y1;
+                y1 = y;
+                buf[i] = y as f32;
+            }
+            *mem = [x1, x2, y1, y2];
         }
     }
 }
 
 // ---------------------------------------------------------------- delay lines
 
-/// Linear-interpolated read `d` samples (fractional) behind position `i` of channel `ch`.
-fn read_frac(src: &[f32], i: usize, ch: usize, d: f64) -> f32 {
-    let pos = i as f64 - d;
+/// Linear-interpolated read `d` samples (fractional) behind run index `r` of channel `ch`.
+fn read_frac(src: &History, r: u64, ch: usize, d: f64) -> f32 {
+    let pos = r as f64 - d;
     if pos < 0.0 {
         return 0.0;
     }
-    let p0 = pos.floor() as usize;
+    let p0 = pos.floor() as u64;
     let f = (pos - p0 as f64) as f32;
-    let a = src[p0 * 2 + ch];
-    let b = if p0 < i { src[(p0 + 1) * 2 + ch] } else { a };
+    let a = src.get(p0, ch);
+    let b = if p0 < r { src.get(p0 + 1, ch) } else { a };
     a + (b - a) * f
-}
-
-fn delay(params: &Params, buf: &mut [f32], sr: f64) {
-    let d = ((params.f("delayTime").max(0.0) / 1000.0 * sr).round() as usize).max(1);
-    let amount = (params.f("delayAmount") / 100.0) as f32;
-    let fb = (params.f("feedback") / 100.0).clamp(0.0, 0.99) as f32;
-    let dry = (params.f("dryOut") / 100.0) as f32;
-    let wet = (params.f("wetOut") / 100.0) as f32;
-    let n = buf.len() / 2;
-    // Echo line: e[i] = x[i-d] + fb * e[i-d]; out = dry*x + wet*amount*e.
-    let mut e = vec![0.0f32; buf.len()];
-    for i in d..n {
-        for ch in 0..2 {
-            e[i * 2 + ch] = buf[(i - d) * 2 + ch] + fb * e[(i - d) * 2 + ch];
-        }
-    }
-    for (o, v) in buf.iter_mut().zip(&e) {
-        *o = *o * dry + v * wet * amount;
-    }
 }
 
 #[inline]
@@ -458,62 +767,60 @@ const AUTO_RELEASE_FAST_MS: f64 = 60.0;
 const AUTO_RELEASE_SLOW_ATTACK_MS: f64 = 150.0;
 const AUTO_RELEASE_SLOW_MS: f64 = 900.0;
 
-fn compressor(params: &Params, buf: &mut [f32], sr: f64) {
-    let th = params.f("threshold");
-    let ratio = params.f("ratio").max(0.1);
-    let knee = params.f("knee").max(0.0);
-    let att = smoothing(params.f("attack"), sr);
-    let auto = params.b("autoRelease");
-    let rel = smoothing(if auto { AUTO_RELEASE_FAST_MS } else { params.f("release").max(0.001) }, sr);
-    let (att_s, rel_s) = (smoothing(AUTO_RELEASE_SLOW_ATTACK_MS, sr), smoothing(AUTO_RELEASE_SLOW_MS, sr));
-    let makeup = params.f("makeupGain");
-    // Output Limit: a final ceiling (brick-wall clip) so the result never exceeds it.
-    let limit = db_to_lin(params.f("outputLimit").min(0.0)) as f32;
-    // Smoothed gain change in dB: attack while the reduction grows, release as it shrinks.
-    let (mut g, mut gs) = (0.0f64, 0.0f64);
-    for f in buf.as_chunks_mut::<2>().0.iter_mut() {
-        let peak = f[0].abs().max(f[1].abs()) as f64;
-        let target = compressor_gain_db(lin_to_db(peak), th, ratio, knee);
-        let k = if target < g { att } else { rel };
-        g = target + (g - target) * k;
-        let mut eff = g;
-        if auto {
-            let k = if target < gs { att_s } else { rel_s };
-            gs = target + (gs - target) * k;
-            eff = g.min(gs);
-        }
-        let lin = db_to_lin(eff + makeup) as f32;
-        for v in f.iter_mut() {
-            *v = (*v * lin).clamp(-limit, limit);
-        }
-    }
+struct Compressor {
+    th: f64,
+    ratio: f64,
+    knee: f64,
+    att: f64,
+    auto: bool,
+    rel: f64,
+    att_s: f64,
+    rel_s: f64,
+    makeup: f64,
+    limit: f32,
+    /// Smoothed gain change in dB (fast and, with Auto Release, slow envelope).
+    g: f64,
+    gs: f64,
 }
 
-fn gate(params: &Params, buf: &mut [f32], sr: f64) {
-    let th = db_to_lin(params.f("threshold"));
-    let att = smoothing(params.f("attack"), sr);
-    let rel = smoothing(params.f("release").max(0.001), sr);
-    let hold = (params.f("hold").max(0.0) / 1000.0 * sr) as usize;
-    // Openness 0..1 (closed..open) is the gain: a closed gate mutes.
-    let mut g = 0.0f64;
-    let mut held = 0usize;
-    for f in buf.as_chunks_mut::<2>().0.iter_mut() {
-        let peak = f[0].abs().max(f[1].abs()) as f64;
-        let open = if peak >= th {
-            held = hold;
-            true
-        } else if held > 0 {
-            held -= 1;
-            true
-        } else {
-            false
-        };
-        let target = if open { 1.0 } else { 0.0 };
-        let k = if target > g { att } else { rel };
-        g = target + (g - target) * k;
-        let lin = g as f32;
-        f[0] *= lin;
-        f[1] *= lin;
+impl Compressor {
+    fn new(params: &Params, sr: f64) -> Compressor {
+        let auto = params.b("autoRelease");
+        Compressor {
+            th: params.f("threshold"),
+            ratio: params.f("ratio").max(0.1),
+            knee: params.f("knee").max(0.0),
+            att: smoothing(params.f("attack"), sr),
+            auto,
+            rel: smoothing(if auto { AUTO_RELEASE_FAST_MS } else { params.f("release").max(0.001) }, sr),
+            att_s: smoothing(AUTO_RELEASE_SLOW_ATTACK_MS, sr),
+            rel_s: smoothing(AUTO_RELEASE_SLOW_MS, sr),
+            makeup: params.f("makeupGain"),
+            // Output Limit: a final ceiling (brick-wall clip) so the result never exceeds it.
+            limit: db_to_lin(params.f("outputLimit").min(0.0)) as f32,
+            g: 0.0,
+            gs: 0.0,
+        }
+    }
+
+    fn run(&mut self, buf: &mut [f32]) {
+        // Attack while the reduction grows, release as it shrinks.
+        for f in buf.as_chunks_mut::<2>().0.iter_mut() {
+            let peak = f[0].abs().max(f[1].abs()) as f64;
+            let target = compressor_gain_db(lin_to_db(peak), self.th, self.ratio, self.knee);
+            let k = if target < self.g { self.att } else { self.rel };
+            self.g = target + (self.g - target) * k;
+            let mut eff = self.g;
+            if self.auto {
+                let k = if target < self.gs { self.att_s } else { self.rel_s };
+                self.gs = target + (self.gs - target) * k;
+                eff = self.g.min(self.gs);
+            }
+            let lin = db_to_lin(eff + self.makeup) as f32;
+            for v in f.iter_mut() {
+                *v = (*v * lin).clamp(-self.limit, self.limit);
+            }
+        }
     }
 }
 
@@ -547,35 +854,6 @@ pub fn distort_sample(kind: u32, x: f32, drive: f32) -> f32 {
     .clamp(-1.0, 1.0)
 }
 
-fn distortion(params: &Params, buf: &mut [f32], sr: f64, start: f64) {
-    let kind = params.e("distortionType");
-    let drive = (params.f("drive") / 100.0) as f32;
-    // Gain: pre-distortion amplification (25 = unity); Volume: output level (11 = unity).
-    let pre = (params.f("gain").max(0.0) / 25.0) as f32;
-    let mix = (params.f("mix") / 100.0).clamp(0.0, 1.0) as f32;
-    let vol = (params.f("volume").max(0.0) / 11.0) as f32;
-    let bits = params.f("bitDepth").round().clamp(1.0, 24.0);
-    let q = (bits < 24.0).then(|| 2f32.powf(bits as f32 - 1.0));
-    let down = params.f("downsample").round().clamp(1.0, 64.0) as i64;
-    // Sample-and-hold on absolute sample positions, so blocks agree with one long run.
-    let first = (start * sr).round() as i64;
-    let mut held = [0.0f32; 2];
-    for (i, f) in buf.as_chunks_mut::<2>().0.iter_mut().enumerate() {
-        let take = i == 0 || (first + i as i64).rem_euclid(down) == 0;
-        for ch in 0..2 {
-            let x = f[ch];
-            let mut y = distort_sample(kind, x * pre, drive);
-            if let Some(q) = q {
-                y = (y * q).round() / q;
-            }
-            if take {
-                held[ch] = y;
-            }
-            f[ch] = (x * (1.0 - mix) + held[ch] * mix) * vol;
-        }
-    }
-}
-
 fn lfo(kind: u32, phase: f64) -> f64 {
     let ph = phase.rem_euclid(1.0);
     match kind {
@@ -584,57 +862,64 @@ fn lfo(kind: u32, phase: f64) -> f64 {
     }
 }
 
-fn flange_chorus(params: &Params, buf: &mut [f32], sr: f64, start: f64) {
-    let sep = params.f("voiceSeparationTime").max(0.0) / 1000.0 * sr;
-    let voices = params.f("voices").round().clamp(1.0, 8.0) as usize;
-    let rate = params.f("modulationRate").max(0.0);
-    let depth = (params.f("modulationDepth") / 100.0).clamp(0.0, 1.0);
-    let vphase = params.f("voicePhaseChange") / 360.0;
-    let inv = if params.b("invertPhase") { -1.0 } else { 1.0 };
-    let stereo = params.b("stereoVoices");
-    let dry = (params.f("dryOut") / 100.0) as f32;
-    let wet = (params.f("wetOut") / 100.0) as f32;
-    let src = buf.to_vec();
-    let n = buf.len() / 2;
-    for i in 0..n {
-        let t = start + i as f64 / sr;
-        let mut acc = [0.0f32; 2];
-        let mut cnt = [0usize; 2];
-        for v in 0..voices {
-            let base = sep * (v + 1) as f64;
-            let d = (base * (1.0 + depth * lfo(0, rate * t + vphase * v as f64))).max(0.0);
-            for ch in 0..2 {
-                if stereo && voices > 1 && v % 2 != ch {
-                    continue;
-                }
-                acc[ch] += read_frac(&src, i, ch, d);
-                cnt[ch] += 1;
-            }
-        }
-        for ch in 0..2 {
-            let w = if cnt[ch] > 0 { acc[ch] / cnt[ch] as f32 } else { 0.0 };
-            buf[i * 2 + ch] = src[i * 2 + ch] * dry + inv * w * wet;
-        }
-    }
+struct Flange {
+    sep: f64,
+    voices: usize,
+    rate: f64,
+    depth: f64,
+    vphase: f64,
+    inv: f32,
+    stereo: bool,
+    dry: f32,
+    wet: f32,
+    x: History,
 }
 
-fn modulator(params: &Params, buf: &mut [f32], sr: f64, start: f64) {
-    let kind = params.e("modulationType");
-    let rate = params.f("modulationRate").max(0.0);
-    // Depth: vibrato as a modulated delay of up to 5 ms; amplitude: tremolo.
-    let depth = (params.f("modulationDepth") / 100.0).clamp(0.0, 1.0) * 0.005 * sr;
-    let am = (params.f("amplitudeModulation") / 100.0).clamp(0.0, 1.0);
-    let src = buf.to_vec();
-    let n = buf.len() / 2;
-    for i in 0..n {
-        let t = start + i as f64 / sr;
-        let l = lfo(kind, rate * t);
-        let d = depth * (1.0 + l) * 0.5;
-        let g = (1.0 - am * (1.0 - l) * 0.5) as f32;
-        for ch in 0..2 {
-            let x = if depth > 0.0 { read_frac(&src, i, ch, d) } else { src[i * 2 + ch] };
-            buf[i * 2 + ch] = x * g;
+impl Flange {
+    fn new(params: &Params, sr: f64) -> Flange {
+        let sep = params.f("voiceSeparationTime").max(0.0) / 1000.0 * sr;
+        let voices = params.f("voices").round().clamp(1.0, 8.0) as usize;
+        let depth = (params.f("modulationDepth") / 100.0).clamp(0.0, 1.0);
+        // The longest delay any voice reaches.
+        let keep = (sep * voices as f64 * (1.0 + depth)).ceil() as usize + 2;
+        Flange {
+            sep,
+            voices,
+            rate: params.f("modulationRate").max(0.0),
+            depth,
+            vphase: params.f("voicePhaseChange") / 360.0,
+            inv: if params.b("invertPhase") { -1.0 } else { 1.0 },
+            stereo: params.b("stereoVoices"),
+            dry: (params.f("dryOut") / 100.0) as f32,
+            wet: (params.f("wetOut") / 100.0) as f32,
+            x: History::new(keep),
         }
+    }
+
+    fn run(&mut self, buf: &mut [f32], sr: f64, start: f64, pos: u64) {
+        self.x.push(buf);
+        for (i, f) in buf.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+            let r = pos + i as u64;
+            let t = start + r as f64 / sr;
+            let mut acc = [0.0f32; 2];
+            let mut cnt = [0usize; 2];
+            for v in 0..self.voices {
+                let base = self.sep * (v + 1) as f64;
+                let d = (base * (1.0 + self.depth * lfo(0, self.rate * t + self.vphase * v as f64))).max(0.0);
+                for ch in 0..2 {
+                    if self.stereo && self.voices > 1 && v % 2 != ch {
+                        continue;
+                    }
+                    acc[ch] += read_frac(&self.x, r, ch, d);
+                    cnt[ch] += 1;
+                }
+            }
+            for ch in 0..2 {
+                let w = if cnt[ch] > 0 { acc[ch] / cnt[ch] as f32 } else { 0.0 };
+                f[ch] = self.x.get(r, ch) * self.dry + self.inv * w * self.wet;
+            }
+        }
+        self.x.trim();
     }
 }
 
@@ -648,70 +933,85 @@ fn reverb_params(params: &Params) -> (f64, f64, f64, f64) {
     (fb, damp, ap, pre)
 }
 
-fn reverb(params: &Params, buf: &mut [f32], sr: f64) {
-    const COMBS: [usize; 8] = [1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617];
-    const ALLPASS: [usize; 4] = [556, 441, 341, 225];
-    const SPREAD: usize = 23;
-    let (fb, damp, apg, pre) = reverb_params(params);
-    let dry = (params.f("dryOut") / 100.0) as f32;
-    let wet = (params.f("wetOut") / 100.0) as f32;
-    let k = sr / 44100.0;
-    let pre_n = (pre * sr).round() as usize;
-    let n = buf.len() / 2;
-    let src = buf.to_vec();
-    for ch in 0..2 {
-        let spread = if ch == 1 { SPREAD } else { 0 };
-        let mut combs: Vec<(Vec<f64>, usize, f64)> = COMBS.iter().map(|&l| (vec![0.0; (((l + spread) as f64 * k) as usize).max(1)], 0, 0.0)).collect();
-        let mut aps: Vec<(Vec<f64>, usize)> = ALLPASS.iter().map(|&l| (vec![0.0; (((l + spread) as f64 * k) as usize).max(1)], 0)).collect();
-        for i in 0..n {
-            let x = if i >= pre_n { (src[(i - pre_n) * 2] as f64 + src[(i - pre_n) * 2 + 1] as f64) * 0.5 * 0.03 } else { 0.0 };
-            let mut out = 0.0;
-            for (line, pos, filt) in combs.iter_mut() {
-                let y = line[*pos];
-                *filt = y * (1.0 - damp) + *filt * damp;
-                line[*pos] = x + *filt * fb;
-                *pos = (*pos + 1) % line.len();
-                out += y;
-            }
-            for (line, pos) in aps.iter_mut() {
-                let b = line[*pos];
-                let y = -out + b;
-                line[*pos] = out + b * apg;
-                *pos = (*pos + 1) % line.len();
-                out = y;
-            }
-            buf[i * 2 + ch] = src[i * 2 + ch] * dry + out as f32 * wet * 3.0;
+/// One channel's comb (line, position, low-pass memory) and all-pass (line, position) network.
+struct ReverbChan {
+    combs: Vec<(Vec<f64>, usize, f64)>,
+    aps: Vec<(Vec<f64>, usize)>,
+}
+
+struct Reverb {
+    fb: f64,
+    damp: f64,
+    apg: f64,
+    dry: f32,
+    wet: f32,
+    pre_n: u64,
+    chans: [ReverbChan; 2],
+    x: History,
+}
+
+impl Reverb {
+    fn new(params: &Params, sr: f64) -> Reverb {
+        const COMBS: [usize; 8] = [1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617];
+        const ALLPASS: [usize; 4] = [556, 441, 341, 225];
+        const SPREAD: usize = 23;
+        let (fb, damp, apg, pre) = reverb_params(params);
+        let k = sr / 44100.0;
+        let pre_n = (pre * sr).round() as u64;
+        let chan = |spread: usize| ReverbChan {
+            combs: COMBS.iter().map(|&l| (vec![0.0; (((l + spread) as f64 * k) as usize).max(1)], 0, 0.0)).collect(),
+            aps: ALLPASS.iter().map(|&l| (vec![0.0; (((l + spread) as f64 * k) as usize).max(1)], 0)).collect(),
+        };
+        Reverb {
+            fb,
+            damp,
+            apg,
+            dry: (params.f("dryOut") / 100.0) as f32,
+            wet: (params.f("wetOut") / 100.0) as f32,
+            pre_n,
+            chans: [chan(0), chan(SPREAD)],
+            x: History::new(usize::try_from(pre_n).unwrap_or(usize::MAX).saturating_add(1)),
         }
     }
-}
 
-fn stereo_mixer(params: &Params, buf: &mut [f32]) {
-    let ll = (params.f("leftLevel") / 100.0) as f32;
-    let rl = (params.f("rightLevel") / 100.0) as f32;
-    // Linear pan law: −100 = all left, 0 = both at full, +100 = all right.
-    let pan = |p: f64| -> (f32, f32) {
-        let p = (p / 100.0).clamp(-1.0, 1.0);
-        ((1.0 - p).min(1.0) as f32, (1.0 + p).min(1.0) as f32)
-    };
-    let (l_to_l, l_to_r) = pan(params.f("leftPan"));
-    let (r_to_l, r_to_r) = pan(params.f("rightPan"));
-    let inv = if params.b("invertPhase") { -1.0 } else { 1.0 };
-    for f in buf.as_chunks_mut::<2>().0.iter_mut() {
-        let (l, r) = (f[0] * ll, f[1] * rl);
-        f[0] = (l * l_to_l + r * r_to_l) * inv;
-        f[1] = (l * l_to_r + r * r_to_r) * inv;
+    fn run(&mut self, buf: &mut [f32], pos: u64) {
+        self.x.push(buf);
+        let n = buf.len() / 2;
+        let (fb, damp, apg) = (self.fb, self.damp, self.apg);
+        for (ch, chan) in self.chans.iter_mut().enumerate() {
+            for i in 0..n {
+                let r = pos + i as u64;
+                let x = match r.checked_sub(self.pre_n) {
+                    Some(k) => (self.x.get(k, 0) as f64 + self.x.get(k, 1) as f64) * 0.5 * 0.03,
+                    None => 0.0,
+                };
+                let mut out = 0.0;
+                for (line, p, filt) in chan.combs.iter_mut() {
+                    let y = line[*p];
+                    *filt = y * (1.0 - damp) + *filt * damp;
+                    line[*p] = x + *filt * fb;
+                    *p = (*p + 1) % line.len();
+                    out += y;
+                }
+                for (line, p) in chan.aps.iter_mut() {
+                    let b = line[*p];
+                    let y = -out + b;
+                    line[*p] = out + b * apg;
+                    *p = (*p + 1) % line.len();
+                    out = y;
+                }
+                buf[i * 2 + ch] = self.x.get(r, ch) * self.dry + out as f32 * self.wet * 3.0;
+            }
+        }
+        self.x.trim();
     }
 }
 
-fn tone(params: &Params, buf: &mut [f32], sr: f64, start: f64) {
-    let kind = params.e("waveformOptions");
-    let level = (params.f("level") / 100.0) as f32;
-    let freqs: Vec<f64> = (1..=5).map(|i| params.f(&format!("frequency{i}"))).filter(|f| *f > 0.0).collect();
-    let n = buf.len() / 2;
-    for i in 0..n {
-        let t = start + i as f64 / sr;
+fn tone(kind: u32, level: f32, freqs: &[f64], buf: &mut [f32], sr: f64, start: f64, pos: u64) {
+    for (i, out) in buf.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+        let t = start + (pos + i as u64) as f64 / sr;
         let mut v = 0.0f64;
-        for f in &freqs {
+        for f in freqs {
             let ph = (f * t).rem_euclid(1.0);
             v += match kind {
                 1 => lfo(1, ph - 0.25),
@@ -733,14 +1033,365 @@ fn tone(params: &Params, buf: &mut [f32], sr: f64, start: f64) {
             };
         }
         let v = v as f32 * level;
-        buf[i * 2] += v;
-        buf[i * 2 + 1] += v;
+        out[0] += v;
+        out[1] += v;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pre-streaming implementation (stateless functions over one buffer), kept as the oracle
+    /// the processors must match bit for bit.
+    #[allow(clippy::all)]
+    mod legacy {
+        use super::super::*;
+
+        /// Run audio effect `id` over interleaved stereo `buf` (L R L R …) at `rate` Hz, from a cleared
+        /// state. `start` is the layer time (seconds) of the first sample (oscillator phase).
+        pub(super) fn process(id: &str, params: &Params, buf: &mut [f32], rate: u32, start: f64) {
+            if rate == 0 || buf.len() < 2 {
+                return;
+            }
+            let sr = rate as f64;
+            match id {
+                "ec.audio.backwards" => {
+                    if params.b("swapChannels") {
+                        buf.as_chunks_mut::<2>().0.iter_mut().for_each(|f| f.swap(0, 1));
+                    }
+                }
+                "ec.audio.basstreble" => {
+                    let bass = params.f("bass") / 100.0 * 12.0;
+                    let treble = params.f("treble") / 100.0 * 12.0;
+                    if bass != 0.0 {
+                        run_biquad(buf, Biquad::low_shelf(sr, 200.0, bass));
+                    }
+                    if treble != 0.0 {
+                        run_biquad(buf, Biquad::high_shelf(sr, 4000.0, treble));
+                    }
+                }
+                "ec.audio.highlowpass" => {
+                    let fc = params.f("cutoffFrequency").clamp(1.0, sr * 0.49);
+                    let q = std::f64::consts::FRAC_1_SQRT_2;
+                    let bq = if params.e("filterOptions") == 1 { Biquad::low_pass(sr, fc, q) } else { Biquad::high_pass(sr, fc, q) };
+                    let dry = (params.f("dryOut") / 100.0) as f32;
+                    let wet = (params.f("wetOut") / 100.0) as f32;
+                    let orig = buf.to_vec();
+                    run_biquad(buf, bq);
+                    mix_dry_wet(buf, &orig, dry, wet);
+                }
+                "ec.audio.parametriceq" => {
+                    for n in 1..=3 {
+                        if !params.b(&format!("band{n}Enable")) {
+                            continue;
+                        }
+                        let g = params.f(&format!("band{n}BoostCut"));
+                        if g == 0.0 {
+                            continue;
+                        }
+                        let f = params.f(&format!("band{n}Frequency")).clamp(1.0, sr * 0.49);
+                        let bw = (params.f(&format!("band{n}Bandwidth")) / 100.0 * 3.0).max(0.05);
+                        run_biquad(buf, Biquad::peaking(sr, f, bw, g));
+                    }
+                }
+                "ec.audio.delay" => delay(params, buf, sr),
+                "ec.audio.compressor" => compressor(params, buf, sr),
+                "ec.audio.distortion" => distortion(params, buf, sr, start),
+                "ec.audio.gate" => gate(params, buf, sr),
+                "ec.audio.flangechorus" => flange_chorus(params, buf, sr, start),
+                "ec.audio.modulator" => modulator(params, buf, sr, start),
+                "ec.audio.reverb" => reverb(params, buf, sr),
+                "ec.audio.stereomixer" => stereo_mixer(params, buf),
+                "ec.audio.tone" => tone(params, buf, sr, start),
+                _ => {}
+            }
+        }
+
+        fn mix_dry_wet(buf: &mut [f32], dry_src: &[f32], dry: f32, wet: f32) {
+            for (o, d) in buf.iter_mut().zip(dry_src) {
+                *o = *o * wet + *d * dry;
+            }
+        }
+
+        /// Direct form I over both channels of an interleaved buffer.
+        fn run_biquad(buf: &mut [f32], q: Biquad) {
+            for ch in 0..2 {
+                let (mut x1, mut x2, mut y1, mut y2) = (0.0f64, 0.0, 0.0, 0.0);
+                for i in (ch..buf.len()).step_by(2) {
+                    let x = buf[i] as f64;
+                    let y = q.b[0] * x + q.b[1] * x1 + q.b[2] * x2 - q.a[0] * y1 - q.a[1] * y2;
+                    x2 = x1;
+                    x1 = x;
+                    y2 = y1;
+                    y1 = y;
+                    buf[i] = y as f32;
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------- delay lines
+
+        /// Linear-interpolated read `d` samples (fractional) behind position `i` of channel `ch`.
+        fn read_frac(src: &[f32], i: usize, ch: usize, d: f64) -> f32 {
+            let pos = i as f64 - d;
+            if pos < 0.0 {
+                return 0.0;
+            }
+            let p0 = pos.floor() as usize;
+            let f = (pos - p0 as f64) as f32;
+            let a = src[p0 * 2 + ch];
+            let b = if p0 < i { src[(p0 + 1) * 2 + ch] } else { a };
+            a + (b - a) * f
+        }
+
+        fn delay(params: &Params, buf: &mut [f32], sr: f64) {
+            let d = ((params.f("delayTime").max(0.0) / 1000.0 * sr).round() as usize).max(1);
+            let amount = (params.f("delayAmount") / 100.0) as f32;
+            let fb = (params.f("feedback") / 100.0).clamp(0.0, 0.99) as f32;
+            let dry = (params.f("dryOut") / 100.0) as f32;
+            let wet = (params.f("wetOut") / 100.0) as f32;
+            let n = buf.len() / 2;
+            // Echo line: e[i] = x[i-d] + fb * e[i-d]; out = dry*x + wet*amount*e.
+            let mut e = vec![0.0f32; buf.len()];
+            for i in d..n {
+                for ch in 0..2 {
+                    e[i * 2 + ch] = buf[(i - d) * 2 + ch] + fb * e[(i - d) * 2 + ch];
+                }
+            }
+            for (o, v) in buf.iter_mut().zip(&e) {
+                *o = *o * dry + v * wet * amount;
+            }
+        }
+        fn compressor(params: &Params, buf: &mut [f32], sr: f64) {
+            let th = params.f("threshold");
+            let ratio = params.f("ratio").max(0.1);
+            let knee = params.f("knee").max(0.0);
+            let att = smoothing(params.f("attack"), sr);
+            let auto = params.b("autoRelease");
+            let rel = smoothing(if auto { AUTO_RELEASE_FAST_MS } else { params.f("release").max(0.001) }, sr);
+            let (att_s, rel_s) = (smoothing(AUTO_RELEASE_SLOW_ATTACK_MS, sr), smoothing(AUTO_RELEASE_SLOW_MS, sr));
+            let makeup = params.f("makeupGain");
+            // Output Limit: a final ceiling (brick-wall clip) so the result never exceeds it.
+            let limit = db_to_lin(params.f("outputLimit").min(0.0)) as f32;
+            // Smoothed gain change in dB: attack while the reduction grows, release as it shrinks.
+            let (mut g, mut gs) = (0.0f64, 0.0f64);
+            for f in buf.as_chunks_mut::<2>().0.iter_mut() {
+                let peak = f[0].abs().max(f[1].abs()) as f64;
+                let target = compressor_gain_db(lin_to_db(peak), th, ratio, knee);
+                let k = if target < g { att } else { rel };
+                g = target + (g - target) * k;
+                let mut eff = g;
+                if auto {
+                    let k = if target < gs { att_s } else { rel_s };
+                    gs = target + (gs - target) * k;
+                    eff = g.min(gs);
+                }
+                let lin = db_to_lin(eff + makeup) as f32;
+                for v in f.iter_mut() {
+                    *v = (*v * lin).clamp(-limit, limit);
+                }
+            }
+        }
+
+        fn gate(params: &Params, buf: &mut [f32], sr: f64) {
+            let th = db_to_lin(params.f("threshold"));
+            let att = smoothing(params.f("attack"), sr);
+            let rel = smoothing(params.f("release").max(0.001), sr);
+            let hold = (params.f("hold").max(0.0) / 1000.0 * sr) as usize;
+            // Openness 0..1 (closed..open) is the gain: a closed gate mutes.
+            let mut g = 0.0f64;
+            let mut held = 0usize;
+            for f in buf.as_chunks_mut::<2>().0.iter_mut() {
+                let peak = f[0].abs().max(f[1].abs()) as f64;
+                let open = if peak >= th {
+                    held = hold;
+                    true
+                } else if held > 0 {
+                    held -= 1;
+                    true
+                } else {
+                    false
+                };
+                let target = if open { 1.0 } else { 0.0 };
+                let k = if target > g { att } else { rel };
+                g = target + (g - target) * k;
+                let lin = g as f32;
+                f[0] *= lin;
+                f[1] *= lin;
+            }
+        }
+        fn distortion(params: &Params, buf: &mut [f32], sr: f64, start: f64) {
+            let kind = params.e("distortionType");
+            let drive = (params.f("drive") / 100.0) as f32;
+            // Gain: pre-distortion amplification (25 = unity); Volume: output level (11 = unity).
+            let pre = (params.f("gain").max(0.0) / 25.0) as f32;
+            let mix = (params.f("mix") / 100.0).clamp(0.0, 1.0) as f32;
+            let vol = (params.f("volume").max(0.0) / 11.0) as f32;
+            let bits = params.f("bitDepth").round().clamp(1.0, 24.0);
+            let q = (bits < 24.0).then(|| 2f32.powf(bits as f32 - 1.0));
+            let down = params.f("downsample").round().clamp(1.0, 64.0) as i64;
+            // Sample-and-hold on absolute sample positions, so blocks agree with one long run.
+            let first = (start * sr).round() as i64;
+            let mut held = [0.0f32; 2];
+            for (i, f) in buf.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+                let take = i == 0 || (first + i as i64).rem_euclid(down) == 0;
+                for ch in 0..2 {
+                    let x = f[ch];
+                    let mut y = distort_sample(kind, x * pre, drive);
+                    if let Some(q) = q {
+                        y = (y * q).round() / q;
+                    }
+                    if take {
+                        held[ch] = y;
+                    }
+                    f[ch] = (x * (1.0 - mix) + held[ch] * mix) * vol;
+                }
+            }
+        }
+        fn flange_chorus(params: &Params, buf: &mut [f32], sr: f64, start: f64) {
+            let sep = params.f("voiceSeparationTime").max(0.0) / 1000.0 * sr;
+            let voices = params.f("voices").round().clamp(1.0, 8.0) as usize;
+            let rate = params.f("modulationRate").max(0.0);
+            let depth = (params.f("modulationDepth") / 100.0).clamp(0.0, 1.0);
+            let vphase = params.f("voicePhaseChange") / 360.0;
+            let inv = if params.b("invertPhase") { -1.0 } else { 1.0 };
+            let stereo = params.b("stereoVoices");
+            let dry = (params.f("dryOut") / 100.0) as f32;
+            let wet = (params.f("wetOut") / 100.0) as f32;
+            let src = buf.to_vec();
+            let n = buf.len() / 2;
+            for i in 0..n {
+                let t = start + i as f64 / sr;
+                let mut acc = [0.0f32; 2];
+                let mut cnt = [0usize; 2];
+                for v in 0..voices {
+                    let base = sep * (v + 1) as f64;
+                    let d = (base * (1.0 + depth * lfo(0, rate * t + vphase * v as f64))).max(0.0);
+                    for ch in 0..2 {
+                        if stereo && voices > 1 && v % 2 != ch {
+                            continue;
+                        }
+                        acc[ch] += read_frac(&src, i, ch, d);
+                        cnt[ch] += 1;
+                    }
+                }
+                for ch in 0..2 {
+                    let w = if cnt[ch] > 0 { acc[ch] / cnt[ch] as f32 } else { 0.0 };
+                    buf[i * 2 + ch] = src[i * 2 + ch] * dry + inv * w * wet;
+                }
+            }
+        }
+
+        fn modulator(params: &Params, buf: &mut [f32], sr: f64, start: f64) {
+            let kind = params.e("modulationType");
+            let rate = params.f("modulationRate").max(0.0);
+            // Depth: vibrato as a modulated delay of up to 5 ms; amplitude: tremolo.
+            let depth = (params.f("modulationDepth") / 100.0).clamp(0.0, 1.0) * 0.005 * sr;
+            let am = (params.f("amplitudeModulation") / 100.0).clamp(0.0, 1.0);
+            let src = buf.to_vec();
+            let n = buf.len() / 2;
+            for i in 0..n {
+                let t = start + i as f64 / sr;
+                let l = lfo(kind, rate * t);
+                let d = depth * (1.0 + l) * 0.5;
+                let g = (1.0 - am * (1.0 - l) * 0.5) as f32;
+                for ch in 0..2 {
+                    let x = if depth > 0.0 { read_frac(&src, i, ch, d) } else { src[i * 2 + ch] };
+                    buf[i * 2 + ch] = x * g;
+                }
+            }
+        }
+        fn reverb(params: &Params, buf: &mut [f32], sr: f64) {
+            const COMBS: [usize; 8] = [1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617];
+            const ALLPASS: [usize; 4] = [556, 441, 341, 225];
+            const SPREAD: usize = 23;
+            let (fb, damp, apg, pre) = reverb_params(params);
+            let dry = (params.f("dryOut") / 100.0) as f32;
+            let wet = (params.f("wetOut") / 100.0) as f32;
+            let k = sr / 44100.0;
+            let pre_n = (pre * sr).round() as usize;
+            let n = buf.len() / 2;
+            let src = buf.to_vec();
+            for ch in 0..2 {
+                let spread = if ch == 1 { SPREAD } else { 0 };
+                let mut combs: Vec<(Vec<f64>, usize, f64)> = COMBS.iter().map(|&l| (vec![0.0; (((l + spread) as f64 * k) as usize).max(1)], 0, 0.0)).collect();
+                let mut aps: Vec<(Vec<f64>, usize)> = ALLPASS.iter().map(|&l| (vec![0.0; (((l + spread) as f64 * k) as usize).max(1)], 0)).collect();
+                for i in 0..n {
+                    let x = if i >= pre_n { (src[(i - pre_n) * 2] as f64 + src[(i - pre_n) * 2 + 1] as f64) * 0.5 * 0.03 } else { 0.0 };
+                    let mut out = 0.0;
+                    for (line, pos, filt) in combs.iter_mut() {
+                        let y = line[*pos];
+                        *filt = y * (1.0 - damp) + *filt * damp;
+                        line[*pos] = x + *filt * fb;
+                        *pos = (*pos + 1) % line.len();
+                        out += y;
+                    }
+                    for (line, pos) in aps.iter_mut() {
+                        let b = line[*pos];
+                        let y = -out + b;
+                        line[*pos] = out + b * apg;
+                        *pos = (*pos + 1) % line.len();
+                        out = y;
+                    }
+                    buf[i * 2 + ch] = src[i * 2 + ch] * dry + out as f32 * wet * 3.0;
+                }
+            }
+        }
+
+        fn stereo_mixer(params: &Params, buf: &mut [f32]) {
+            let ll = (params.f("leftLevel") / 100.0) as f32;
+            let rl = (params.f("rightLevel") / 100.0) as f32;
+            // Linear pan law: −100 = all left, 0 = both at full, +100 = all right.
+            let pan = |p: f64| -> (f32, f32) {
+                let p = (p / 100.0).clamp(-1.0, 1.0);
+                ((1.0 - p).min(1.0) as f32, (1.0 + p).min(1.0) as f32)
+            };
+            let (l_to_l, l_to_r) = pan(params.f("leftPan"));
+            let (r_to_l, r_to_r) = pan(params.f("rightPan"));
+            let inv = if params.b("invertPhase") { -1.0 } else { 1.0 };
+            for f in buf.as_chunks_mut::<2>().0.iter_mut() {
+                let (l, r) = (f[0] * ll, f[1] * rl);
+                f[0] = (l * l_to_l + r * r_to_l) * inv;
+                f[1] = (l * l_to_r + r * r_to_r) * inv;
+            }
+        }
+
+        fn tone(params: &Params, buf: &mut [f32], sr: f64, start: f64) {
+            let kind = params.e("waveformOptions");
+            let level = (params.f("level") / 100.0) as f32;
+            let freqs: Vec<f64> = (1..=5).map(|i| params.f(&format!("frequency{i}"))).filter(|f| *f > 0.0).collect();
+            let n = buf.len() / 2;
+            for i in 0..n {
+                let t = start + i as f64 / sr;
+                let mut v = 0.0f64;
+                for f in &freqs {
+                    let ph = (f * t).rem_euclid(1.0);
+                    v += match kind {
+                        1 => lfo(1, ph - 0.25),
+                        2 => 2.0 * ph - 1.0,
+                        3 => {
+                            if ph < 0.5 {
+                                1.0
+                            } else {
+                                -1.0
+                            }
+                        }
+                        // White noise: a hash of the absolute sample position (every frequency alike).
+                        4 => {
+                            let h = ((t * sr).round() as i64 as u64 ^ f.to_bits()).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                            let h = (h ^ (h >> 29)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                            ((h ^ (h >> 32)) >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0
+                        }
+                        _ => (2.0 * PI * ph).sin(),
+                    };
+                }
+                let v = v as f32 * level;
+                buf[i * 2] += v;
+                buf[i * 2 + 1] += v;
+            }
+        }
+    }
 
     fn defaults(id: &str) -> Params {
         let s = crate::find(id).unwrap();
@@ -1021,5 +1672,97 @@ mod tests {
             rms(&b, 4800)
         };
         assert!(burst(true) > burst(false) * 1.2, "{} {}", burst(true), burst(false));
+    }
+
+    /// Parameter sets covering every audio effect's branches.
+    fn cases() -> Vec<(&'static str, Params)> {
+        let with = |id: &'static str, vals: &[(&str, Value)]| {
+            let mut p = defaults(id);
+            for (k, v) in vals {
+                p.values.insert((*k).into(), v.clone());
+            }
+            (id, p)
+        };
+        let mut out = vec![
+            with("ec.audio.backwards", &[("swapChannels", Value::Bool(true))]),
+            with("ec.audio.basstreble", &[("bass", num(60.0)), ("treble", num(-40.0))]),
+            with("ec.audio.compressor", &[]),
+            with("ec.audio.compressor", &[("autoRelease", Value::Bool(false)), ("threshold", num(-30.0)), ("knee", num(0.0)), ("outputLimit", num(-6.0))]),
+            with("ec.audio.delay", &[]),
+            with("ec.audio.delay", &[("delayTime", num(37.0)), ("feedback", num(80.0))]),
+            with("ec.audio.distortion", &[]),
+            with("ec.audio.distortion", &[("distortionType", Value::Enum(4)), ("bitDepth", num(6.0)), ("downsample", num(5.0)), ("mix", num(60.0))]),
+            with("ec.audio.flangechorus", &[]),
+            with(
+                "ec.audio.flangechorus",
+                &[("voices", num(3.0)), ("stereoVoices", Value::Bool(true)), ("voicePhaseChange", num(90.0)), ("invertPhase", Value::Bool(true))],
+            ),
+            with("ec.audio.gate", &[("threshold", num(-12.0))]),
+            with("ec.audio.highlowpass", &[]),
+            with("ec.audio.highlowpass", &[("filterOptions", Value::Enum(1)), ("dryOut", num(30.0))]),
+            with("ec.audio.modulator", &[("amplitudeModulation", num(40.0))]),
+            with("ec.audio.modulator", &[("modulationType", Value::Enum(1)), ("modulationDepth", num(100.0))]),
+            with("ec.audio.parametriceq", &[("band1BoostCut", num(9.0)), ("band2Enable", Value::Bool(true)), ("band2BoostCut", num(-6.0))]),
+            with("ec.audio.reverb", &[]),
+            with("ec.audio.reverb", &[("reverbTime", num(3.0)), ("decay", num(90.0)), ("brightness", num(80.0))]),
+            with("ec.audio.stereomixer", &[("leftPan", num(30.0)), ("rightLevel", num(150.0)), ("invertPhase", Value::Bool(true))]),
+        ];
+        for w in 0..5 {
+            out.push(with("ec.audio.tone", &[("waveformOptions", Value::Enum(w))]));
+        }
+        out
+    }
+
+    /// Deterministic noisy stereo test signal with loud and quiet passages.
+    fn signal(n: usize) -> Vec<f32> {
+        (0..n)
+            .flat_map(|i| {
+                let x = ((i as f64 * 12.9898).sin() * 43758.5453).fract() as f32;
+                let env = if (i / 700) % 3 == 0 { 0.9 } else { 0.05 };
+                [x * env, -x * env * 0.5]
+            })
+            .collect()
+    }
+
+    fn bits(b: &[f32]) -> Vec<u32> {
+        b.iter().map(|v| v.to_bits()).collect()
+    }
+
+    /// The processors reproduce the stateless implementation they replaced, bit for bit.
+    #[test]
+    fn processors_match_legacy_bit_for_bit() {
+        for rate in [8000u32, 48000] {
+            for (id, p) in cases() {
+                let src = signal(6000);
+                let (mut old, mut new) = (src.clone(), src.clone());
+                legacy::process(id, &p, &mut old, rate, 0.37);
+                process(id, &p, &mut new, rate, 0.37);
+                assert_eq!(bits(&old), bits(&new), "{id} at {rate} Hz");
+            }
+        }
+    }
+
+    /// Feeding a processor consecutive blocks (playback's 1024 frames, or odd sizes) equals one
+    /// call over the whole signal, bit for bit.
+    #[test]
+    fn processor_blocks_match_one_call() {
+        let rate = 8000;
+        for (id, p) in cases() {
+            let src = signal(12000);
+            let mut whole = src.clone();
+            process(id, &p, &mut whole, rate, 1.25);
+            for sizes in [&[1024usize][..], &[1, 7, 333, 1024, 4000, 2]] {
+                let Some(mut proc) = Processor::new(id, &p, rate, 1.25) else { panic!("{id}") };
+                let mut out = src.clone();
+                let (mut at, mut k) = (0, 0);
+                while at < 12000 {
+                    let m = sizes[k % sizes.len()].min(12000 - at);
+                    proc.process_block(&mut out[at * 2..(at + m) * 2]);
+                    at += m;
+                    k += 1;
+                }
+                assert_eq!(bits(&whole), bits(&out), "{id} in blocks of {sizes:?}");
+            }
+        }
     }
 }
