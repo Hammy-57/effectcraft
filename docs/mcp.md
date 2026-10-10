@@ -177,12 +177,14 @@ reconnect-and-resend never runs a command twice.
 
 ## Several agents (`client`)
 
-Every tool takes an optional `client` argument, the agent's name (a non-empty string, at most 128
-bytes). The engine commands the call runs carry it, so the agent works on its own selection, active
+Every tool takes an optional `client` argument, the agent's name (a string of at most 128 bytes;
+`""` runs that call as the user). The engine commands the call runs carry it, so the agent works on its own selection, active
 comp and current time (render tools default to that time) and can reserve comps with
 `command_run comp.claim`; another agent's edit to a claimed comp is a tool error naming the owner.
 `effectcraft-cli mcp --client NAME` (or `EFFECTCRAFT_CLIENT`) runs every call as `NAME`; a call's own
-`client` overrides it. Without either, tools act on the user's cursor as before. Details:
+`client` overrides it. Without either, a bridged server (`--bridge`) names itself at `initialize`
+(`<clientInfo.name>-<pid>`, e.g. `claude-code-4821`), and headless and `--ui` servers act on the
+user's cursor. Details:
 [agents.md](agents.md#several-agents-at-once).
 
 ## Prompts

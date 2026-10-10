@@ -204,7 +204,12 @@ Pass `client` on every request (`"client": "agentA"`) when you share the app wit
 agents. Over MCP, every tool takes it as an argument (`set_property {"layer": 2, …, "client":
 "agentA"}`; the engine commands the tool runs carry it, and renders default to your time), or start
 the server as `effectcraft-cli mcp --client agentA` (or set `EFFECTCRAFT_CLIENT`) so every call runs
-as you; a call's own `client` wins. Two things follow:
+as you; a call's own `client` wins. A bridged MCP server (`mcp --bridge`) given no name names itself
+at `initialize`: the MCP client's name and the server's process id (`claude-code-4821`, also in the
+`initialize` instructions and `get_state`), so an agent sharing the app never moves the user's view
+by accident. Pass `"client": ""` on a call that should act as the user, for example to open a comp
+in their viewer. Headless and `--ui` servers keep running as the user (the agent is alone there).
+Two things follow:
 
 - **Your own cursor.** Selection (layers, properties, keys, mask vertices, Project items), active comp
   and current time are yours: `layer.select`, `time.set`, `comp.new` / `comp.open` and every command
