@@ -1,5 +1,9 @@
 //! Blocking client for the desktop app's JSON-lines control channel (`docs/control-protocol.md`).
 //! One persistent loopback connection, reconnected once if the app went away.
+//!
+//! [`ControlTransport`] abstracts where control requests go: [`BridgeClient`] (a running app over
+//! TCP) or an app embedded in this process, such as `effectcraft-cli mcp --ui`'s offscreen UI
+//! (implemented above this crate, which never depends on egui).
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -11,6 +15,30 @@ use crate::{Error, Result};
 
 /// Slightly longer than the app's own 60 s per-request timeout, so its error reply wins.
 const READ_TIMEOUT: Duration = Duration::from_secs(65);
+
+/// Something that answers control-channel requests (`docs/control-protocol.md`).
+pub trait ControlTransport: Send {
+    /// Call a control method; returns the reply's `result`, or the app's `error` as [`Error::App`].
+    fn call(&mut self, method: &str, params: Value) -> Result<Value>;
+    /// The MCP mode name this transport gives (`initialize`'s server title, `effectcraft-cli info`).
+    fn mode(&self) -> &'static str {
+        "bridge"
+    }
+}
+
+/// Unwrap a control reply (`{"ok": true, "result": …}` / `{"ok": false, "error": …}`).
+pub fn reply_result(v: Value) -> Result<Value> {
+    if v.get("ok").and_then(Value::as_bool) == Some(true) {
+        return Ok(v.get("result").cloned().unwrap_or(Value::Null));
+    }
+    Err(Error::App(v.get("error").and_then(Value::as_str).unwrap_or("error").to_string()))
+}
+
+impl ControlTransport for BridgeClient {
+    fn call(&mut self, method: &str, params: Value) -> Result<Value> {
+        BridgeClient::call(self, method, params)
+    }
+}
 
 pub struct BridgeClient {
     addr: String,
@@ -77,8 +105,7 @@ impl BridgeClient {
                 serde_json::from_str(&buf).map(Ok).map_err(|e| Error::Bridge(format!("bad reply: {e}")))
             })();
             match res {
-                Ok(Ok(v)) if v.get("ok").and_then(Value::as_bool) == Some(true) => return Ok(v.get("result").cloned().unwrap_or(Value::Null)),
-                Ok(Ok(v)) => return Err(Error::App(v.get("error").and_then(Value::as_str).unwrap_or("error").to_string())),
+                Ok(Ok(v)) => return reply_result(v),
                 Ok(Err(e)) => {
                     // Stale connection (app restarted): reconnect and resend once.
                     self.conn = None;

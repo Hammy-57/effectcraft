@@ -379,8 +379,29 @@ fn autosave_flushes_on_read_errors_and_broken_output() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-/// A fake desktop control channel: answers `engine.execute` from a real session, and canned
+/// A fake app's reply to one control request: `engine.execute` from a real session, and canned
 /// `render.frame` / `ui.screenshot` replies.
+fn fake_reply(session: &mut Session, method: &str, p: &Value) -> Value {
+    match method {
+        "engine.execute" => match session.execute(p["command"].as_str().unwrap(), p["params"].clone()) {
+            Ok(v) => json!({"ok": true, "result": v}),
+            Err(e) => json!({"ok": false, "error": e.to_string()}),
+        },
+        "render.frame" => {
+            let png = crate::encode_png(4, 2, vec![255; 32], 0).unwrap();
+            json!({"ok": true, "result": {"comp": 1, "time": 0.5, "width": 4, "height": 2, "png": base64::encode(&png)}})
+        }
+        "ui.screenshot" => {
+            let png = crate::encode_png(8, 8, vec![128; 256], 0).unwrap();
+            std::fs::write(p["path"].as_str().unwrap(), png).unwrap();
+            json!({"ok": true, "result": {"path": p["path"]}})
+        }
+        "ui.key" | "ui.click" => json!({"ok": true, "result": null}),
+        m => json!({"ok": false, "error": format!("unknown method `{m}`")}),
+    }
+}
+
+/// A fake desktop control channel over TCP (see [`fake_reply`]).
 fn fake_app() -> u16 {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
@@ -390,30 +411,60 @@ fn fake_app() -> u16 {
         let mut session = Session::default();
         for line in BufReader::new(stream).lines() {
             let msg: Value = serde_json::from_str(&line.unwrap()).unwrap();
-            let p = &msg["params"];
-            let reply = match msg["method"].as_str().unwrap() {
-                "engine.execute" => match session.execute(p["command"].as_str().unwrap(), p["params"].clone()) {
-                    Ok(v) => json!({"ok": true, "result": v}),
-                    Err(e) => json!({"ok": false, "error": e.to_string()}),
-                },
-                "render.frame" => {
-                    let png = crate::encode_png(4, 2, vec![255; 32], 0).unwrap();
-                    json!({"ok": true, "result": {"comp": 1, "time": 0.5, "width": 4, "height": 2, "png": base64::encode(&png)}})
-                }
-                "ui.screenshot" => {
-                    let png = crate::encode_png(8, 8, vec![128; 256], 0).unwrap();
-                    std::fs::write(p["path"].as_str().unwrap(), png).unwrap();
-                    json!({"ok": true, "result": {"path": p["path"]}})
-                }
-                "ui.key" => json!({"ok": true, "result": null}),
-                m => json!({"ok": false, "error": format!("unknown method `{m}`")}),
-            };
-            let mut reply = reply;
+            let mut reply = fake_reply(&mut session, msg["method"].as_str().unwrap(), &msg["params"]);
             reply["id"] = msg["id"].clone();
             writeln!(out, "{reply}").unwrap();
         }
     });
     port
+}
+
+/// An in-process control transport (as `mcp --ui`'s offscreen UI), recording the methods called.
+struct FakeTransport {
+    session: Session,
+    calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl crate::ControlTransport for FakeTransport {
+    fn call(&mut self, method: &str, params: Value) -> crate::Result<Value> {
+        self.calls.lock().unwrap().push(method.to_string());
+        crate::bridge::reply_result(fake_reply(&mut self.session, method, &params))
+    }
+    fn mode(&self) -> &'static str {
+        "headless-ui"
+    }
+}
+
+#[test]
+fn ui_tools_run_through_any_control_transport() {
+    let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut s = McpServer::new(Backend::transport(FakeTransport { session: Session::default(), calls: calls.clone() }));
+    let r = rpc(&mut s, 1, "initialize", json!({}));
+    assert!(r["serverInfo"]["title"].as_str().unwrap().contains("headless-ui"), "{r}");
+    let names: Vec<String> =
+        rpc(&mut s, 2, "tools/list", json!({}))["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
+    for want in ["screenshot", "ui_click", "ui_elements", "control", "execute_command"] {
+        assert!(names.iter().any(|n| n == want), "{want} listed");
+    }
+    // Engine commands, inspection and renders go through the transport too.
+    call_json(&mut s, "execute_command", json!({"command": "comp.new", "params": {"name": "T", "width": 64, "height": 64}}));
+    assert_eq!(call_json(&mut s, "get_comp", json!({}))["name"], "T");
+    let (c, err) = call(&mut s, "render_frame", json!({}));
+    assert!(!err, "{c:?}");
+    assert_eq!(png_size(&base64::decode(c[0]["data"].as_str().unwrap()).unwrap()), Some((4, 2)));
+    let (c, err) = call(&mut s, "screenshot", json!({"panel": "Timeline", "max_side": 4}));
+    assert!(!err, "{c:?}");
+    assert_eq!(png_size(&base64::decode(c[0]["data"].as_str().unwrap()).unwrap()), Some((4, 4)));
+    assert!(!call(&mut s, "ui_click", json!({"id": "tools.Selection"})).1);
+    let (c, err) = call(&mut s, "control", json!({"method": "ui.nope"}));
+    assert!(err && c[0]["text"].as_str().unwrap().contains("unknown method"));
+    let calls = calls.lock().unwrap().clone();
+    for want in ["engine.execute", "render.frame", "ui.screenshot", "ui.click", "ui.nope"] {
+        assert!(calls.iter().any(|c| c == want), "{want} in {calls:?}");
+    }
+    // A blocking render is not a headless long job here: it goes to the app like any command.
+    let render = json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {"name": "command_run", "arguments": {"id": "renderQueue.render"}}});
+    assert!(crate::long_job::long_call(&mut s, &render).is_none());
 }
 
 #[test]
