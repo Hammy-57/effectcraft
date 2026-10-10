@@ -291,3 +291,77 @@ fn nested_motion_blur_is_keyed_by_time() {
         }
     }
 }
+
+/// Admission: a layer whose effect animates has a new key every frame. Played through, none of
+/// its buffers is admitted to the cache (they would fill the budget and never hit): only the
+/// probation window holds the latest, and the frames are unchanged.
+#[test]
+fn per_frame_buffers_are_not_kept() {
+    let mut p = project();
+    let (cid, c) = comp(&mut p, "Comp");
+    let mut l = solid(&mut p, &c, [0.2, 0.6, 1.0]);
+    blur(&mut p, &mut l, 2.0);
+    l.props.prop_mut("effects/#1/blurriness").unwrap().keys = vec![Keyframe::new(Tick::ZERO, Value::Scalar(2.0)), Keyframe::new(s(2.0), Value::Scalar(12.0))];
+    p.comp_mut(cid).unwrap().layers.push(l);
+    // A window smaller than two of its buffers.
+    let cache = LayerCache::new(512 << 10);
+    for f in 0..30 {
+        let t = f as f64 / 30.0;
+        let img = frame(&p, cid, t, &NoFootage, None, Some(&cache));
+        assert_same(&img, &frame(&p, cid, t, &NoFootage, None, None), &format!("t={t}"));
+    }
+    assert_eq!(cache.inserts(), 30, "rendered every frame");
+    let (admitted, probation, bytes) = cache.admission();
+    assert_eq!(admitted, 0, "nothing admitted");
+    assert!(probation >= 1 && bytes <= cache.window().max(cache.stats().bytes / probation), "{probation} on probation, {bytes} bytes");
+    assert!(cache.stats().bytes <= 2 * cache.window(), "{:?}", cache.stats());
+}
+
+/// A static layer is admitted on its first hit; one flushed from the probation window before
+/// that (a busy frame) is admitted when it is rendered the second time.
+#[test]
+fn static_layers_are_admitted_on_second_sight() {
+    let mut p = project();
+    let (cid, c) = comp(&mut p, "Comp");
+    for (i, color) in [[1.0, 0.5, 0.0], [0.0, 0.5, 1.0]].into_iter().enumerate() {
+        let mut l = solid(&mut p, &c, color);
+        blur(&mut p, &mut l, 4.0 + i as f64);
+        p.comp_mut(cid).unwrap().layers.push(l);
+    }
+    // Plenty of room: the second frame hits both on probation and admits them.
+    let cache = LayerCache::default();
+    frame(&p, cid, 0.0, &NoFootage, None, Some(&cache));
+    assert_eq!(cache.admission().0, 0);
+    assert_eq!(cache.admission().1, 2);
+    frame(&p, cid, 0.5, &NoFootage, None, Some(&cache));
+    assert_eq!((cache.inserts(), cache.admission().0), (2, 2), "hit on probation, admitted, not rendered again");
+    // A window that holds one buffer: the first layer is flushed by the second, so the next
+    // frame renders it again (and admits it at once), the frame after hits both.
+    let cache = LayerCache::new(256 << 10);
+    let want = frame(&p, cid, 0.0, &NoFootage, None, None);
+    for (t, inserts) in [(0.0, 2), (0.5, 3), (1.0, 3), (1.5, 3)] {
+        assert_same(&frame(&p, cid, t, &NoFootage, None, Some(&cache)), &want, &format!("t={t}"));
+        assert_eq!(cache.inserts(), inserts, "t={t}");
+    }
+    assert_eq!(cache.admission().0, 2);
+}
+
+/// One precomp used twice in a frame: the second instance finds the nested layer the first
+/// rendered (on probation), so it is rendered once, and admitted.
+#[test]
+fn a_precomp_used_twice_in_a_frame_renders_its_content_once() {
+    let (mut p, oid, _) = precomp_scene();
+    let outer = p.comp(oid).unwrap().clone();
+    let LayerSource::Comp { item } = outer.layers[0].source else { panic!("precomp") };
+    let second = build::layer(&mut p, &outer, "Inner 2", LayerSource::Comp { item }, (100, 80), None);
+    p.comp_mut(oid).unwrap().layers.push(second);
+    let cache = LayerCache::default();
+    let img = frame(&p, oid, 0.0, &NoFootage, None, Some(&cache));
+    assert_same(&img, &frame(&p, oid, 0.0, &NoFootage, None, None), "t=0");
+    // The nested solid once, each precomp layer's buffer once.
+    assert_eq!(cache.inserts(), 3);
+    assert_eq!(cache.admission().0, 1, "the nested solid, hit by the second instance");
+    let img = frame(&p, oid, 0.5, &NoFootage, None, Some(&cache));
+    assert_same(&img, &frame(&p, oid, 0.5, &NoFootage, None, None), "t=0.5");
+    assert_eq!((cache.inserts(), cache.admission().0), (3, 3));
+}
