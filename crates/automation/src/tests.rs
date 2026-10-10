@@ -339,6 +339,68 @@ fn autosave_errors_preserve_tool_success_retry_and_fail_shutdown() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// Big checkpoints are throttled (a 1 GB project must not be rewritten after every agent edit):
+/// the change waits, `pending` says so, and the session's end writes it.
+#[test]
+fn autosave_throttles_big_checkpoints_and_flushes_at_the_end() {
+    let dir = autosave_test_dir("throttle");
+    let mut s = server().with_autosave(&dir).unwrap();
+    s.throttle_autosave(1, std::time::Duration::from_secs(3600));
+    call_json(&mut s, "execute_command", json!({"command": "comp.new", "params": {"name": "First"}}));
+    let path = autosave_status(&mut s)["latestPath"].as_str().unwrap().to_string();
+    call_json(&mut s, "execute_command", json!({"command": "comp.new", "params": {"name": "Second"}}));
+    assert!(!std::fs::read_to_string(&path).unwrap().contains("Second"), "throttled: not written yet");
+    assert_eq!(autosave_status(&mut s)["pending"], true);
+    s.serve(&b""[..], Vec::new()).unwrap();
+    let latest = s.backend().session().unwrap().autosave.last_path.clone().unwrap();
+    assert!(std::fs::read_to_string(latest).unwrap().contains("Second"), "the end of the session flushes the pending change");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Recovery copies clean themselves up: saving the project normally empties the session's folder,
+/// and a session that ends saved leaves nothing behind.
+#[test]
+fn autosave_folder_is_removed_once_the_project_is_saved() {
+    let dir = autosave_test_dir("cleanup");
+    let mut s = server().with_autosave(&dir).unwrap();
+    call_json(&mut s, "execute_command", json!({"command": "comp.new", "params": {"name": "Saved later"}}));
+    let status = autosave_status(&mut s);
+    let folder = std::path::PathBuf::from(status["folder"].as_str().unwrap());
+    assert!(std::path::Path::new(status["latestPath"].as_str().unwrap()).is_file());
+    call_json(&mut s, "save_project", json!({"path": dir.join("Saved.ecproj")}));
+    assert!(!folder.exists(), "saved normally: the recovery copies are gone");
+    assert_eq!(autosave_status(&mut s)["latestPath"], Value::Null);
+    // A later change checkpoints again into a recreated folder.
+    call_json(&mut s, "execute_command", json!({"command": "comp.new", "params": {"name": "After save"}}));
+    assert!(std::fs::read_to_string(autosave_status(&mut s)["latestPath"].as_str().unwrap()).unwrap().contains("After save"));
+    call_json(&mut s, "save_project", json!({}));
+    s.serve(&b""[..], Vec::new()).unwrap();
+    assert!(!folder.exists());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A new session prunes folders of finished, saved sessions and any folder untouched for 30 days;
+/// recent unsaved work and folders it didn't make stay.
+#[test]
+fn autosave_prunes_finished_and_abandoned_sessions() {
+    let dir = autosave_test_dir("prune");
+    let base = dir.join(effectcraft_engine::autosave::AUTOSAVE_FOLDER).join("MCP");
+    let session = |name: &str, record: Value| {
+        let f = base.join(name);
+        std::fs::create_dir_all(&f).unwrap();
+        std::fs::write(f.join("session.json"), record.to_string()).unwrap();
+        f
+    };
+    let saved = session("1-100-0", json!({"dirty": false, "ended": true}));
+    let unsaved = session("2-200-0", json!({"dirty": true, "ended": false, "autosave": null}));
+    let other = session("notes", json!({"dirty": false, "ended": true}));
+    let _s = server().with_autosave(&dir).unwrap();
+    assert!(!saved.exists() && unsaved.exists() && other.exists());
+    crate::autosave::prune(&base, std::time::SystemTime::now() + crate::autosave::ABANDONED_AFTER);
+    assert!(!unsaved.exists() && other.exists(), "untouched for 30 days: removed; foreign folders kept");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn autosave_keeps_sessions_and_desktop_recovery_separate() {
     let dir = autosave_test_dir("isolated");
@@ -375,16 +437,17 @@ fn autosave_marks_saved_or_undone_work_clean_without_losing_its_path() {
     let mut s = server().with_autosave(&dir).unwrap();
     call_json(&mut s, "execute_command", json!({"command": "comp.new", "params": {"name": "Undo me"}}));
     let status = autosave_status(&mut s);
-    let folder = std::path::Path::new(status["folder"].as_str().unwrap());
+    let folder = std::path::PathBuf::from(status["folder"].as_str().unwrap());
+    // Undone back to the saved state: nothing is unsaved, so the recovery copies go.
     call_json(&mut s, "undo", json!({}));
-    let manifest: Value = serde_json::from_str(&std::fs::read_to_string(folder.join("session.json")).unwrap()).unwrap();
-    assert_eq!(manifest["dirty"], false);
+    assert!(!folder.exists());
+    assert_eq!(autosave_status(&mut s)["latestPath"], Value::Null);
+    // Redone: unsaved again, checkpointed again.
     call_json(&mut s, "redo", json!({}));
-    let path = autosave_status(&mut s)["latestPath"].clone();
+    let path = autosave_status(&mut s)["latestPath"].as_str().unwrap().to_string();
+    assert!(std::fs::read_to_string(&path).unwrap().contains("Undo me"));
     call_json(&mut s, "save_project", json!({"path": dir.join("Saved.ecproj")}));
-    assert_eq!(autosave_status(&mut s)["latestPath"], path, "save resets the engine bookkeeping but the server remembers the recovery file");
-    let manifest: Value = serde_json::from_str(&std::fs::read_to_string(folder.join("session.json")).unwrap()).unwrap();
-    assert_eq!(manifest["dirty"], false);
+    assert_eq!(autosave_status(&mut s)["latestPath"], Value::Null, "saved normally: no recovery file is kept");
     let mut next = server().with_autosave(&dir).unwrap();
     assert!(autosave_status(&mut next)["previousSessions"].as_array().unwrap().is_empty());
     std::fs::remove_dir_all(dir).unwrap();

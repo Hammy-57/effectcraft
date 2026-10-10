@@ -107,6 +107,12 @@ impl McpServer {
         Ok(self)
     }
 
+    /// Throttle checkpoints of at least `bytes` to one per `interval` (see [`AutoSave`]).
+    #[cfg(test)]
+    pub(crate) fn throttle_autosave(&mut self, bytes: u64, interval: std::time::Duration) {
+        self.autosave = self.autosave.take().map(|a| a.with_throttle(bytes, interval));
+    }
+
     fn autosave_info(&self) -> Value {
         self.autosave.as_ref().map(AutoSave::info).unwrap_or_else(|| json!({"enabled": false}))
     }
