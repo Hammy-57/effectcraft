@@ -140,9 +140,10 @@ pub fn import_ir(
     source_dir: &str,
     resolve_media: &mut dyn FnMut(&str) -> Option<String>,
 ) -> Result<ImportResult, AepError> {
-    const MAX_BYTES: usize = 128 * 1024 * 1024;
+    // Large template packs export to a few hundred MiB of IR; the cap only stops runaway input.
+    const MAX_BYTES: usize = 1024 * 1024 * 1024;
     if bytes.len() > MAX_BYTES {
-        return Err(AepError::Invalid("IR exceeds 128 MiB".into()));
+        return Err(AepError::Invalid("IR exceeds 1 GiB".into()));
     }
     if json_depth_exceeds(bytes, 128) {
         return Err(AepError::Invalid("IR nesting exceeds 128 levels".into()));
