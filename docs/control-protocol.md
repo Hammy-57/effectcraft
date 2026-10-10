@@ -14,6 +14,13 @@ effectcraft --control 9877        # or EFFECTCRAFT_CONTROL_PORT=9877
 - Requests run on the UI thread between frames. Input methods (`ui.click`, `ui.key` and similar)
   reply after the synthetic input has been processed. Methods that need an element that isn't drawn
   yet are retried for a few frames. A request times out after 60 s.
+- **Only requests are read:** every line must be a JSON object with a string `method` (blank lines are
+  skipped). Anything else (text that isn't JSON, a JSON array or number, an object without `method`,
+  invalid UTF-8, a line longer than 4 MiB) gets one error reply ending in "closing the connection", and
+  the server closes the connection, so nothing sent after it runs. An HTTP request (for example a web
+  page's cross-origin `fetch` to `127.0.0.1:<port>`) therefore can't smuggle a command in its body: its
+  request line is rejected first. At most 16 connections are served at once; further ones get an error
+  line and are closed. The port has no authentication, so only enable it while you use it.
 
 Quick test:
 
@@ -37,7 +44,13 @@ Useful query commands for `engine.execute` (they aren't journaled or undoable): 
 `prop.get {layer, path, comp?, time?}`, `editor.state`, `command.list {filter?, enabledOnly?, schemas?}`,
 `command.describe {command}` (params doc and JSON Schema), `app.capabilities` (version, counts,
 export formats, parity summary), `jobs.list` (Progress panel jobs, e.g. the background
-`footage.check` after File ▸ Open).
+`footage.check` after File ▸ Open), `render.snapshot {name, comp?, time?, max_side?, transparent?}`
+(keep a rendered frame in the session, 16 at most), `render.snapshots {clear?}` and
+`render.compare {a, b, threshold?, min_psnr?, max_side?, amplify?, diff_path?, diff_inline?}`
+(`a`/`b`: a snapshot name, `{snapshot}`, `{path}` of a PNG/JPEG, or `{comp?, time?, transparent?}`
+rendered now) → `{width, height, max_abs, mean_abs, alpha_max_abs, psnr_db, ssim, changed_pixels,
+changed_pct, pass, diff_path?, diff_png?}` (metrics and size rules in
+[agents.md](agents.md#verify-your-change-snapshot--edit--compare)).
 
 Every engine command is reachable through `engine.execute`, and every interactive widget of every
 panel registers an element id; both are enforced by `crates/ui-egui/tests/ui_agent_audit.rs`.
@@ -50,6 +63,7 @@ panel registers an element id; both are enforced by `crates/ui-egui/tests/ui_age
 | `ui.elements` | `{prefix?}` | `[{id, label, rect: [x, y, w, h]}]`: the widgets drawn in the last frame, in points. |
 | `ui.set` | `{tool?, workspace?, theme?, focused?, viewer?, timeline?, menuBar?, home?}` | `viewer: {zoom (null = fit), res: Full\|Half\|Third\|Quarter\|Auto, pan: [x,y], grid, rulers, safeMargins, transparencyGrid}`; `timeline: {pps (null = fit), start, graphEditor, showModes, openLayers: [ids], openGroups: [uids]}`. |
 | `ui.panel.show` / `ui.panel.close` | `{panel}` | Panels: `Project`, `Composition`, `Timeline`, `EffectControls`, `EffectsPresets`, `Info`, `Preview`, `Character`, `Paragraph`, `Align` and others. |
+| `engine.execute` `window.*` (panel menu) | `{panel, comp?, rect?, stacked?, anchor?, zone?}` | The panel menu's items (≡ beside a tab name, or right-click a tab; automation ids `panelMenu.<key>`): `window.closePanel` (on a Timeline comp tab, `comp` closes that comp's Timeline), `window.floatPanel` (Undock Panel), `window.dockPanel` (with `anchor`/`zone`, or back to its usual place), `window.closeOtherPanels`, `window.closePanelGroup`, `window.floatPanelGroup`, `window.maximizePanel` (Maximize Panel Group, as `` ` ``), `window.stackPanelGroup`, and `window.panelMenu {panel, x?, y?}` to open the menu. |
 | `ui.playback` | `{action: play\|stop\|toggle\|status}` | `{playing, time, audio, levelsDb, peaksDb}` (audio: an audio preview is running; L/R meter levels and held peaks in dBFS) |
 | `ui.resize` | `{width, height}` | Resizes the window (points). |
 | `ui.focus` | `{}` | Activates the window and takes keyboard focus. Agents normally avoid this, because the app is started without stealing focus. |
@@ -69,6 +83,13 @@ Points are logical window coordinates. A target is `{id}` (the element's centre;
 | `ui.scroll` | `{id \| x,y, dx, dy}` |
 | `ui.key` | `{key}`, for example `Space`, `F9`, `Cmd+Z`, `Cmd+Shift+Z`, `PageDown`, `Escape` |
 | `ui.type` | `{text}`: text input into the focused field |
+
+Shortcut presets also accept `Physical+<shortcut>` for a keyboard position, using egui's
+US-position names (for example `Physical+6` and `Physical+Minus` distinguish AZERTY's
+`-` and `)` keys). Physical bindings take precedence over logical bindings for that key
+press. `ui.key` accepts the same notation to test them. Ordinary shortcuts remain layout-aware.
+`time.workAreaStart` and `time.workAreaEnd` navigate to the first and last included work-area
+frames and can be assigned through `shortcuts.set`.
 
 ## Locating things
 
@@ -91,8 +112,9 @@ one), `panel.tab.Viewer(<n>)` and `viewers.<n>` (View ▸ New Viewer's other Com
 renames it), `viewer.comp`, `viewer.handle.<layer>.<i>`,
 `timeline.layer.<id>.bar`, `timeline.layer.<id>.nestedMarker.<i>` (a precomp's comp markers), `timeline.layer.<id>.twirl`, `timeline.layer.<id>.row` (click selects,
 Enter or a double-click renames, drag reorders), `timeline.prop.<uid>.stopwatch`,
-`timeline.key.<uid>.<frame>`, `timeline.cti`, `effectControls.prop.<uid>.value` and
-`effects.item.<name>`. The Composition viewer adds `viewer.magnification`, `viewer.resolution`,
+`timeline.key.<uid>.<frame>`, `timeline.cti`, `effectControls.prop.<uid>.value` (an angle's
+revolutions are `timeline.prop.<uid>.revolutions`, `effectControls.prop.<uid>.revolutions` and
+`properties.prop.<uid>.revolutions`) and `effects.item.<name>`. The Composition viewer adds `viewer.magnification`, `viewer.resolution`,
 `viewer.roi`, `viewer.grid`, `viewer.channel`, `viewer.exposure`, `viewer.snapshot`,
 `viewer.showSnapshot`, `viewer.fastPreviews` (their popup entries are `viewer.<menu>Item.<n>`),
 `viewer.ruler.top|left|origin`, `viewer.mask.<uid>.vertex.<i>`, `viewer.shapePath.<uid>.vertex.<i>`,
@@ -101,10 +123,15 @@ Enter or a double-click renames, drag reorders), `timeline.prop.<uid>.stopwatch`
 `viewer.regionOfInterest`; the Graph Editor adds `timeline.graph.transformBox[.<i>]`,
 `timeline.graph.snap` and `timeline.graph.reference`. Use `ui.elements` to see what is on screen.
 
-Viewer state that agents drive headless too: `view.snapping`, `view.channel {channel, colorized?}`,
+Viewer state that agents drive headless too: `view.snapping`, `view.snappingOptions
+{edgesExtended?, collapsedFeatures?, toggle?}` (the Tools bar's Snapping options,
+`header.snappingOptions`: After Effects' Snap Edges Extended and Snap to Features in Collapsed
+Compositions and Text Layers), `view.channel {channel, colorized?}`,
 `view.exposure {stops | delta}`, `view.resetExposure`, `view.takeSnapshot`, `view.showSnapshot`,
 `view.fastPreviewMode {mode}`, `view.setRegionOfInterest {rect}`, `view.addGuide`,
 `view.moveGuide`, `view.removeGuide`; editing: `shape.newPath` (Pen on shape layers),
+`shape.newShape` (the shape tools: a new group in the selected shape layer, else a new shape layer),
+`shape.toolOptions` (the Tools bar's Tool Creates Shape / Mask and Fill and Stroke Options),
 `mask.insertVertex`, `mask.convertVertex`, `mask.deleteVertices`, `path.freeTransform` (masks and
 shape paths by uid), `keys.setSpatialTangents` (motion-path handles) and `keys.transform` (Graph
 Editor transform box, timeline Alt-drag scaling).

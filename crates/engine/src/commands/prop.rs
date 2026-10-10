@@ -1,12 +1,12 @@
 //! Properties, keyframes and expressions (Animation menu + timeline/Effect Controls gestures).
 
 use effectcraft_keyframe::{Ease, Interp, Keyframe, easy_ease, key_at, set_key};
-use effectcraft_project::{ItemId, LayerId, Property, Uid};
+use effectcraft_project::{GroupKind, ItemId, Layer, LayerId, Property, Uid};
 use effectcraft_time::Tick;
 use serde_json::{Value, json};
 
 use super::{CommandSpec, b_p, bad, f_p, has_comp, has_keys, has_layers, layer_mut, layer_p, layers_p, merge_p, str_p};
-use crate::{EngineError, KeyRef, Result, Session, cmd, query};
+use crate::{EngineError, KeyRef, Result, Session, VertexRef, cmd, query};
 
 /// Resolve `{layer, path}` (or `{layer, prop: uid}`) to (comp, layer, prop uid).
 pub(crate) fn prop_ref(s: &Session, p: &Value, cmd: &str) -> Result<(ItemId, LayerId, Uid)> {
@@ -118,8 +118,14 @@ fn get(s: &mut Session, p: &Value) -> Result<Value> {
         "keys": keys, "expression": pr.expr.as_ref().map(|e| e.text.clone()),
     });
     // With an expression, `value` is the keyframed (pre-expression) value; also report what the
-    // expression makes of it (what renders), or why it fails.
-    if pr.has_expression()
+    // expression makes of it (what renders), or why it fails. A disabled one renders `value`; one
+    // disabled by its syntax error (prop.setExpression) reports that error.
+    if let Some(e) = pr.expr.as_ref().filter(|e| !e.enabled && !e.text.trim().is_empty()) {
+        out["evaluated"] = raw.to_json();
+        if let Some(err) = s.expr_check.and_then(|check| check(&e.text).err()) {
+            out["expressionError"] = json!(err);
+        }
+    } else if pr.has_expression()
         && let (Some(h), Some(comp)) = (s.expr.as_deref(), s.project.comp(cid))
     {
         let mut ctx = crate::render::EvalCtx::new(&s.project, cid, comp, t);
@@ -138,7 +144,7 @@ fn get(s: &mut Session, p: &Value) -> Result<Value> {
 fn toggle_anim(s: &mut Session, p: &Value) -> Result<Value> {
     let (cid, lid, uid) = prop_ref(s, p, "prop.toggleAnimation")?;
     let on = b_p(p, "value");
-    with_prop(s, "Toggle Animation", None, cid, lid, uid, |pr, lt| {
+    with_prop(s, "Toggle Animation", merge_p(p), cid, lid, uid, |pr, lt| {
         if pr.static_only {
             return Err(bad("prop.toggleAnimation", "this property can't be animated"));
         }
@@ -287,11 +293,19 @@ fn select_prop(s: &mut Session, p: &Value) -> Result<Value> {
     let add = b_p(p, "add").unwrap_or(false);
     if !add {
         s.state.selected_props.clear();
+        s.state.selected_vertices.clear();
     }
     if !s.state.selected_layers.contains(&lid) {
         s.state.selected_layers = vec![lid];
     }
     s.state.selected_props.push((lid, uid));
+    // Selecting a mask (or its Mask Path, or a shape's Path) selects all its points, so the
+    // viewer drags the whole mask (as in AE, #203).
+    let t = s.time();
+    if let Some((mask, n)) = s.active_comp().and_then(|c| c.layer(lid)).and_then(|l| path_points(l, uid, l.layer_time(t))) {
+        s.state.selected_vertices.retain(|v| !(v.layer == lid && v.mask == mask));
+        s.state.selected_vertices.extend((0..n).map(|index| VertexRef { layer: lid, mask, index }));
+    }
     // Selecting a property selects all its keys (as in AE).
     if b_p(p, "selectKeys").unwrap_or(true)
         && let Some(pr) = s.active_comp().and_then(|c| c.layer(lid)).and_then(|l| l.props.find(uid))
@@ -303,6 +317,23 @@ fn select_prop(s: &mut Session, p: &Value) -> Result<Value> {
         s.state.selected_keys.extend(keys);
     }
     Ok(Value::Null)
+}
+
+/// The mask or shape Path item that `uid` (the group, or its Path property) is, with its number
+/// of points at layer time `lt`.
+fn path_points(l: &Layer, uid: Uid, lt: Tick) -> Option<(Uid, usize)> {
+    let owner = match l.props.find_group(uid) {
+        Some(g) => g,
+        None => l.props.parent_of(uid).filter(|g| g.get("path").is_some_and(|p| p.uid == uid))?,
+    };
+    let in_contents = owner.match_id == "path" && l.props.sub("contents").is_some_and(|c| c.find_group(owner.uid).is_some());
+    if !matches!(owner.kind, GroupKind::Mask { .. }) && !in_contents {
+        return None;
+    }
+    match owner.get("path")?.value_at(lt) {
+        effectcraft_keyframe::Value::Path(p) => Some((owner.uid, p.vertices.len())),
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------- keyframes
@@ -355,6 +386,24 @@ fn select_keys(s: &mut Session, p: &Value) -> Result<Value> {
         }
     } else {
         s.state.selected_keys = sel;
+    }
+    // From the Timeline, selected keys select their properties and layers too, as in After
+    // Effects, so the Graph Editor shows them (#252).
+    if b_p(p, "selectProperties").unwrap_or(false) && !s.state.selected_keys.is_empty() {
+        let extend = b_p(p, "add").unwrap_or(false) || b_p(p, "toggle").unwrap_or(false);
+        let st = &mut s.state;
+        if !extend {
+            st.selected_props.clear();
+            st.selected_layers.clear();
+        }
+        for k in &st.selected_keys {
+            if !st.selected_props.contains(&(k.layer, k.prop)) {
+                st.selected_props.push((k.layer, k.prop));
+            }
+            if !st.selected_layers.contains(&k.layer) {
+                st.selected_layers.push(k.layer);
+            }
+        }
     }
     Ok(json!(s.state.selected_keys.len()))
 }
@@ -540,7 +589,8 @@ fn interpolation(s: &mut Session, p: &Value) -> Result<Value> {
     let roving = b_p(p, "roving");
     edit_keys(s, "Keyframe Interpolation", None, move |keys, i, _| {
         if let Some(sp) = spatial.as_deref() {
-            let (tin, tout) = effectcraft_keyframe::spatial_tangents(keys, i);
+            // (Bezier keeps the current handles, with handles where the path left straight.)
+            let (tin, tout) = effectcraft_keyframe::spatial_handles(keys, i);
             let k = &mut keys[i];
             match sp {
                 "linear" => {
@@ -720,7 +770,7 @@ pub fn specs() -> Vec<CommandSpec> {
     vec![
         query!("prop.get", "Get Property", "{layer?, path|prop, time? (comp s)}", get),
         cmd!("prop.set", "Set Property Value", [], None, "{layer?, path|prop, value, time?, merge?}", has_layers, set),
-        cmd!("prop.toggleAnimation", "Toggle Stopwatch", [], None, "{layer?, path|prop, value?}", has_layers, toggle_anim),
+        cmd!("prop.toggleAnimation", "Toggle Stopwatch", [], None, "{layer?, path|prop, value?, merge?}", has_layers, toggle_anim),
         cmd!("prop.addKey", "Add Keyframe", [], None, "{layer?, path|prop, time?, value?}", has_layers, add_key),
         cmd!("prop.toggleKey", "Add or Remove Keyframe at Current Time", [], None, "{layer?, path|prop}", has_layers, toggle_key),
         cmd!(
@@ -749,7 +799,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Select Keyframes",
             [],
             None,
-            "{keys: [{layer, prop: uid | path (or `path`), time (layer s)}], add?, toggle?: bool (Shift+click: in or out of the selection)}",
+            "{keys: [{layer, prop: uid | path (or `path`), time (layer s)}], add?, toggle?: bool (Shift+click: in or out of the selection), selectProperties?: bool (their properties and layers too, as a Timeline click does)}",
             has_comp,
             select_keys
         ),

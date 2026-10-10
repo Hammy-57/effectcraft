@@ -319,11 +319,86 @@ fn wav_and_aiff_channels_and_formats() {
     let d = files.lock().unwrap()[0].1.clone();
     let u16_at = |o: usize| u16::from_le_bytes([d[o], d[o + 1]]);
     assert_eq!((u16_at(20), u16_at(22), u16_at(32), u16_at(34)), (3, 2, 8, 32), "IEEE float stereo");
-    // AIFF has no float: 24-bit.
+    // Plain AIFF has no float: 32-bit float is AIFF-C with `fl32` samples (#317).
     let mut aiff = OutputModule::for_format(OutputFormat::Aiff);
     aiff.audio_format = AudioFormat::F32;
     let files = run(&p, cid, &s, &aiff, "/w/c.aif");
     let d = files.lock().unwrap()[0].1.clone();
+    let u32_at = |o: usize| u32::from_be_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]);
+    assert_eq!((&d[..4], u32_at(4) as usize + 8, &d[8..12]), (&b"FORM"[..], d.len(), &b"AIFC"[..]));
+    assert_eq!((&d[12..16], u32_at(16), u32_at(20)), (&b"FVER"[..], 4, 0xA280_5140));
+    assert_eq!(&d[24..28], b"COMM");
+    let comm = 32;
+    assert_eq!(u32_at(28) as usize, 18 + 4 + 22, "COMM: AIFF fields, compression type, name");
+    assert_eq!(u16::from_be_bytes([d[comm], d[comm + 1]]), 2, "stereo");
+    assert_eq!(u32_at(comm + 2), 24_000, "half a second at 48 kHz");
+    assert_eq!(u16::from_be_bytes([d[comm + 6], d[comm + 7]]), 32, "sample size");
+    assert_eq!(&d[comm + 18..comm + 22], b"fl32");
+    assert_eq!(&d[comm + 22..comm + 44], b"\x1532-bit floating point");
+    let ssnd = comm + 44;
+    assert_eq!((&d[ssnd..ssnd + 4], u32_at(ssnd + 4) as usize), (&b"SSND"[..], 8 + 24_000 * 2 * 4));
+    // 16- and 24-bit stay plain AIFF.
+    aiff.audio_format = AudioFormat::S24;
+    let files = run(&p, cid, &s, &aiff, "/w/d.aif");
+    let d = files.lock().unwrap()[0].1.clone();
     assert_eq!(&d[8..12], b"AIFF");
     assert_eq!(u16::from_be_bytes([d[26], d[27]]), 24, "sample size");
+}
+
+#[test]
+fn cancelled_export_removes_only_files_it_opened() {
+    use effectcraft_export::ExportError;
+    let dir = std::env::temp_dir().join(format!("ec-cancel-owned-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (p, cid) = project(FrameRate::new(25, 1), |_, _| {});
+    struct Overflow;
+    impl StorageQuota for Overflow {
+        fn has_room(&self, path: &str, _: u64) -> bool {
+            path.contains("overflow")
+        }
+    }
+    for overflow in [false, true] {
+        let output_dir = if overflow { dir.join("overflow") } else { dir.clone() };
+        std::fs::create_dir_all(&output_dir).unwrap();
+        let settings = RenderSettings { skip_existing: true, storage_overflow: overflow, ..Default::default() };
+        for format in [OutputFormat::PngSequence, OutputFormat::H264] {
+            let om = OutputModule::for_format(format);
+            let path = dir.join(if format.is_sequence() { "clip_[#####].png" } else { "clip.mp4" });
+            let path = path.to_str().unwrap();
+            let decoys = ["clip.aep", "clip2.psd", "clip000.mp4", "clip_99999.png", "clip_00000.png", "clip.txt", "clip_RenderLog.txt"];
+            for name in decoys {
+                std::fs::write(output_dir.join(name), b"keep").unwrap();
+            }
+            // Skip-existing checks the primary destination even when the new frames overflow.
+            std::fs::write(dir.join("clip_00000.png"), b"keep").unwrap();
+            let result = export(
+                &Job {
+                    project: &p,
+                    footage: &NoFootage,
+                    expr: None,
+                    accel: None,
+                    comp: cid,
+                    settings: &settings,
+                    output: &om,
+                    path,
+                    sink: None,
+                    nested_switches: true,
+                    options: JobOptions {
+                        log: RenderLog::PlusPerFrameInfo,
+                        storage: Some(&Overflow),
+                        overflow: vec![output_dir.to_string_lossy().into_owned()],
+                        ..Default::default()
+                    },
+                },
+                &mut |progress| progress.done == 0,
+            );
+            assert!(matches!(result, Err(ExportError::Cancelled)), "{result:?}");
+            for name in decoys {
+                assert_eq!(std::fs::read(output_dir.join(name)).unwrap(), b"keep", "{name}");
+            }
+            let remaining: Vec<_> = std::fs::read_dir(&output_dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+            assert_eq!(remaining.len(), decoys.len(), "partial files remain: {remaining:?}");
+        }
+    }
+    std::fs::remove_dir_all(dir).unwrap();
 }

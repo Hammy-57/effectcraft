@@ -5,6 +5,7 @@
 //!
 //! Automation ids: `dialog.deleteItems.delete`, `dialog.deleteItems.cancel`.
 
+use crate::i18n::tr;
 use egui::{Color32, vec2};
 use serde_json::Value;
 
@@ -56,15 +57,15 @@ pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
         );
         ui.label(egui::RichText::new(text).color(t.tab_text_active));
         ui.add_space(4.0);
-        ui.label(egui::RichText::new("You can undo this.").color(t.text_dim).size(11.0));
+        ui.label(egui::RichText::new(tr("You can undo this.")).color(t.text_dim).size(11.0));
         ui.add_space(18.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let r = ui.add(egui::Button::new(egui::RichText::new("  Delete  ").color(Color32::WHITE)).fill(t.danger));
+            let r = ui.add(egui::Button::new(egui::RichText::new(tr("  Delete  ")).color(Color32::WHITE)).fill(t.danger));
             app.auto.add("dialog.deleteItems.delete", r.rect, "Delete");
             if r.clicked() {
                 answer = Some(true);
             }
-            let r = ui.button("Cancel");
+            let r = ui.button(tr("Cancel"));
             app.auto.add("dialog.deleteItems.cancel", r.rect, "Cancel");
             if r.clicked() {
                 answer = Some(false);

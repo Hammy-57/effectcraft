@@ -24,6 +24,7 @@ pub(crate) struct Cx<'a> {
     pub frame_times: Option<Mutex<Vec<(u64, f64)>>>,
     /// Files written to an overflow folder.
     pub overflowed: Mutex<Vec<String>>,
+    written: Mutex<Vec<String>>,
 }
 
 impl<'a> std::ops::Deref for Cx<'a> {
@@ -68,7 +69,7 @@ impl<'a> Cx<'a> {
         let mut project = job.project.clone();
         apply_overrides(&mut project, job);
         let frame_times = (job.options.log == RenderLog::PlusPerFrameInfo).then(|| Mutex::new(Vec::new()));
-        Cx { job, project, frame_times, overflowed: Mutex::new(vec![]) }
+        Cx { job, project, frame_times, overflowed: Mutex::new(vec![]), written: Mutex::new(vec![]) }
     }
 
     pub fn comp(&self) -> Option<&Comp> {
@@ -187,6 +188,30 @@ impl<'a> Cx<'a> {
         crate::fit(px, img.width, img.height, w, h)
     }
 
+    /// Open a file and remember ownership for cancellation cleanup (including overflow paths).
+    pub fn create(&self, path: &str) -> crate::Result<out::Out<'_>> {
+        let file = out::create(self.sink, path)?;
+        if self.sink.is_none() {
+            self.written.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(path.to_owned());
+        }
+        Ok(file)
+    }
+
+    pub fn remove_cancelled_outputs(&self) -> crate::Result<()> {
+        let mut failure = None;
+        for path in self.written.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter() {
+            if let Err(e) = std::fs::remove_file(path)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                failure.get_or_insert_with(|| crate::ExportError::Io(format!("cannot remove cancelled output {path}: {e}")));
+            }
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
     /// Where a file goes: `path`, or (Use Storage Overflow) the first overflow folder with room
     /// for `bytes` when the quota hook says the output volume is full.
     pub fn place(&self, path: &str, bytes: u64) -> String {
@@ -246,7 +271,7 @@ impl<'a> Cx<'a> {
                 s.push_str(&format!("  Frame {} ({:.3} s): rendered in {:.1} ms\n", f0 + i as i64, t.seconds(), secs * 1000.0));
             }
         }
-        let mut f = out::create(self.job.sink, &path).ok()?;
+        let mut f = self.create(&path).ok()?;
         std::io::Write::write_all(&mut f, s.as_bytes()).ok()?;
         f.finish().ok()?;
         Some(path)

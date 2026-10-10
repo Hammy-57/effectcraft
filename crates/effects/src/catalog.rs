@@ -7,7 +7,20 @@ use crate::{CATEGORIES, registry};
 /// Effects whose implementation is known to fall short of the reference behaviour:
 /// `(effect id, what is missing)`. Everything else in the registry is implemented in full as far
 /// as the public behaviour documentation describes it.
-pub const PARTIAL: &[(&str, &str)] = &[];
+pub const PARTIAL: &[(&str, &str)] = &[
+    ("ec.stylize.deepglow", "Approximate falloff, tint, chromatic aberration and downsampling; edge modes and masking are not fully matched"),
+    ("ec.perspective.shadowstudio2", "Approximate sampled directional shadow; easing, texture, inner and point modes are not implemented"),
+    ("ec.perspective.shadowstudio3", "Approximate sampled directional shadow; raytracing, gradients, texture, inner and point modes are not implemented"),
+    ("ec.perspective.cccylinder", "Orthographic 3D projection; AE camera and rotation-order settings are not yet matched"),
+    ("ec.noise.addgrain", "RGB color matching is calibrated for corpus defaults; other criteria, matte blur and external mask input are not implemented"),
+    ("S_CartoonPaint", "Approximate smoothing and edges; brush strokes, Mocha geometry, mask blur and mask combining are not implemented"),
+    ("S_DropShadow", "Basic alpha shadow; matte and background inputs are not implemented"),
+    ("S_Glow", "Bright-pass Gaussian; atmosphere and combine modes are not implemented"),
+    ("S_Gradient", "Linear ramp with limited combine modes"),
+    ("S_Grid", "2D grid only; latitude, swing and perspective are not implemented"),
+    ("S_HalfTone", "Basic monochrome dot screen"),
+    ("S_Monochrome", "Layer/path mask input is implemented; Mocha geometry, mask blur and mask combining are not implemented"),
+];
 
 /// Whether Effect Controls shows parameter (or twirl-down group) `param` (spec id path,
 /// `group/param`) of an instance of effect `effect`, given the instance's current values
@@ -63,7 +76,20 @@ pub fn param_shown(effect: &str, param: &str, value: &dyn Fn(&str) -> Option<eff
 /// Controls of GPU-accelerated effects that only the CPU implements: while any of them is away
 /// from its default the effect renders on the CPU. (Prefixes ending in `/` cover a whole group.)
 const CPU_ONLY_CONTROLS: &[(&str, &[&str])] = &[
-    ("ec.color.lumetri", &["highDynamicRange", "curves/rgbCurves/", "curves/hueSaturationCurves/", "hslSecondary/"]),
+    (
+        "ec.color.lumetri",
+        &[
+            "highDynamicRange",
+            "basicCorrection/active",
+            "creative/active",
+            "curves/active",
+            "colorWheels/active",
+            "vignette/active",
+            "curves/rgbCurves/",
+            "curves/hueSaturationCurves/",
+            "hslSecondary/",
+        ],
+    ),
     (
         "ec.color.colorama",
         &["inputPhase/addPhase", "outputCycle/usePresetPalette", "modify/", "pixelSelection/matchingMode", "masking/maskingMode", "masking/compositeOverLayer"],
@@ -82,7 +108,20 @@ const CPU_ONLY_CONTROLS: &[(&str, &[&str])] = &[
             "sourceCrops/edgeColourAlpha",
         ],
     ),
-    ("ec.noise.addgrain", &["viewingMode", "preset", "color/redBalance", "color/greenBalance", "color/blueBalance", "previewRegion/"]),
+    (
+        "ec.noise.addgrain",
+        &[
+            "viewingMode",
+            "preset",
+            "color/redBalance",
+            "color/greenBalance",
+            "color/blueBalance",
+            "previewRegion/",
+            "application/channelBalance/",
+            "application/matchAmount",
+        ],
+    ),
+    ("ec.perspective.cccylinder", &["positionX", "positionY", "positionZ", "rotationX", "rotationY", "rotationZ"]),
     ("ec.blur.cameralens", &["irisProperties/diffractionFringe", "blurMap/blurMapLayer"]),
     ("ec.noise.removegrain", &["temporalFiltering/enabled"]),
     ("ec.distort.liquify", &["viewFreezeAreaMask", "viewMesh"]),
@@ -198,6 +237,15 @@ mod tests {
         assert!(ok("ec.color.lumetri", &[]));
         assert!(!ok("ec.color.lumetri", &[("hslSecondary/correction/saturation", Value::Scalar(50.0))]));
         assert!(!ok("ec.noise.addgrain", &[("preset", Value::Enum(2))]));
+        for section in ["basicCorrection", "creative", "curves", "colorWheels", "vignette", "hslSecondary"] {
+            assert!(!ok("ec.color.lumetri", &[(&format!("{section}/active"), Value::Bool(false))]));
+        }
+        assert!(!ok("ec.noise.addgrain", &[("application/matchAmount", Value::Scalar(50.0))]));
+        assert!(!ok("ec.noise.addgrain", &[("application/channelBalance/redShadows", Value::Scalar(0.5))]));
+        assert!(ok("ec.perspective.cccylinder", &[]));
+        for control in ["positionX", "positionY", "positionZ", "rotationX", "rotationY", "rotationZ"] {
+            assert!(!ok("ec.perspective.cccylinder", &[(control, Value::Scalar(15.0))]));
+        }
         assert!(ok("ec.generate.cellpattern", &[("cellPattern", Value::Enum(3))]));
         assert!(!ok("ec.generate.cellpattern", &[("cellPattern", Value::Enum(9))]));
         assert!(!ok("ec.distort.turbulentdisplace", &[("pinning", Value::Enum(9))]));

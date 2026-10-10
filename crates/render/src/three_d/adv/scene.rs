@@ -69,6 +69,11 @@ pub struct Material {
     pub diffuse_k: f32,
     pub specular_k: f32,
     pub ambient_k: f32,
+    /// Strength of a metal's coloured reflection (1 = physically based; cards: see
+    /// `card_material`).
+    pub metal_k: f32,
+    /// A card's classic Metal: applied to direct lights only (environment light unmeasured).
+    pub direct_metal_only: bool,
 }
 
 impl Default for Material {
@@ -97,6 +102,8 @@ impl Default for Material {
             diffuse_k: 1.0,
             specular_k: 1.0,
             ambient_k: 1.0,
+            metal_k: 1.0,
+            direct_metal_only: false,
         }
     }
 }
@@ -215,6 +222,8 @@ pub(crate) struct Builder {
     /// World of the collapsed precomp layers the current layers are drawn through (identity at
     /// the top level).
     outer: Mat4,
+    /// Materials of model and primitive meshes (lit by the default environment light).
+    mesh_mats: Vec<u32>,
 }
 
 impl Builder {
@@ -356,6 +365,10 @@ impl Builder {
 fn card_material(ctx: &EvalCtx, layer: &Layer) -> Material {
     let c = ClassicMaterial::of(ctx, layer);
     Material {
+        // Fitted with aerender on 50 % grey and coloured cards at Metal 0 / 50 / 80 / 100 ×
+        // Shininess 5 / 90 × Specular 50 / 100: Metal acts as metalness^1.5 (Specular no longer
+        // matters on a full metal), and a rough metal reflects about 4× a smooth one's colour.
+        metallic: c.metal.powf(1.5),
         roughness: (1.0 - c.shininess).clamp(0.05, 1.0),
         double_sided: true,
         accepts_lights: c.accepts_lights,
@@ -365,6 +378,10 @@ fn card_material(ctx: &EvalCtx, layer: &Layer) -> Material {
         diffuse_k: c.diffuse,
         specular_k: c.specular * 2.0,
         ambient_k: c.ambient,
+        metal_k: 1.0 + 3.0 * (1.0 - c.shininess),
+        // AE renders of environment-lit cards at the default Metal 100 (SceneYard 19355662,
+        // 67cf74c5, 812d9956) look like ours without Metal; not measured, so keep that.
+        direct_metal_only: true,
         ..Material::default()
     }
 }
@@ -432,6 +449,25 @@ pub fn model_to_layer(unit_scale: f64) -> Mat4 {
     Mat4::scale(vec3(unit_scale, -unit_scale, -unit_scale))
 }
 
+/// AE's model source coordinates use the raw mesh axes. Its common glTF root
+/// −90° X conversion is already represented by the editable AE Orientation.
+fn ae_root_correction(m: &model::Model) -> Mat4 {
+    let [root] = m.roots.as_slice() else { return Mat4::IDENTITY };
+    let Some(matrix) = m.nodes.get(*root).and_then(|n| n.matrix) else { return Mat4::IDENTITY };
+    let expected = Mat4::rotate_x(-90.0);
+    if (0..4).all(|i| (0..4).all(|j| (matrix.0[i][j] - expected.0[i][j]).abs() < 1e-6)) { matrix.inverse().unwrap_or(Mat4::IDENTITY) } else { Mat4::IDENTITY }
+}
+
+/// A model layer imported from After Effects (Geometry Options ▸ AE Source Axes): its mesh
+/// keeps AE's raw source axes, and its Orientation composes like AE's model Orientation,
+/// Z applied first (Rx·Ry·Rz, the order of the separate Rotation controls). AE's model
+/// orientations are authored that way: an upright model turned about its own vertical axis
+/// reads as (≈270°, ≈0°, yaw), the yaw spinning the raw Z-up mesh before X stands it up.
+/// Other layers keep the Rz·Ry·Rx Orientation of [`Mat4::orientation`].
+pub fn ae_model_axes(ctx: &EvalCtx, layer: &Layer) -> bool {
+    matches!(layer.source, LayerSource::Model { .. }) && layer.props.sub("geometryOptions").is_some_and(|g| ctx.b(layer, g, "aeSourceSpace"))
+}
+
 fn model_layer(r: &Renderer, ctx: &EvalCtx, layer: &Layer, b: &mut Builder) {
     let lin = b.s.linear_io;
     let (opts, prim_mat) = model_options(ctx, layer, lin);
@@ -459,7 +495,16 @@ fn model_layer(r: &Renderer, ctx: &EvalCtx, layer: &Layer, b: &mut Builder) {
         }
         _ => return,
     };
-    let world = b.outer * ctx.world_matrix(layer) * model_to_layer(unit);
+    let correction = if ae_model_axes(ctx, layer) { ae_root_correction(&mdl) } else { Mat4::IDENTITY };
+    // Object Scale (AE's model settings): scales the model about the layer's anchor point.
+    let object = geo.map_or(100.0, |g| ctx.f(layer, g, "objectScale", 100.0)) / 100.0;
+    let object = if object.is_finite() && (object - 1.0).abs() > 1e-12 {
+        let a = Vec3::from(layer.transform().map_or([0.0; 3], |tr| ctx.v3(layer, tr, "anchor", [0.0; 3])));
+        Mat4::translate(a) * Mat4::scale(vec3(object, object, object)) * Mat4::translate(-a)
+    } else {
+        Mat4::IDENTITY
+    };
+    let world = b.outer * ctx.world_matrix(layer) * object * model_to_layer(unit) * correction;
     // Materials of the model (one default when it has none).
     let mut mats: Vec<u32> = vec![];
     let defaults = [model::Material::plain([0.8, 0.8, 0.8, 1.0], 0.0, 0.5)];
@@ -491,7 +536,9 @@ fn model_layer(r: &Renderer, ctx: &EvalCtx, layer: &Layer, b: &mut Builder) {
             unlit: mm.unlit,
             ..opts
         };
-        mats.push(b.material(m));
+        let id = b.material(m);
+        b.mesh_mats.push(id);
+        mats.push(id);
     }
     for inst in mdl.instances(clip, t) {
         for p in &inst.mesh.primitives {
@@ -652,6 +699,9 @@ fn card_layer(r: &Renderer, ctx: &EvalCtx, layer: &Layer, b: &mut Builder) {
     }
 }
 
+/// Exponent applying a light's Intensity in Advanced 3D (see [`lights`]).
+const LIGHT_INTENSITY_GAMMA: f32 = 2.3;
+
 /// Evaluated lights: (scene lights, ambient sum, environment light (layer, intensity × colour,
 /// rotation)).
 fn lights(ctx: &EvalCtx, lin: bool) -> (Vec<Light>, [f32; 3], Option<(Option<u64>, [f32; 3], f32)>) {
@@ -662,7 +712,11 @@ fn lights(ctx: &EvalCtx, lin: bool) -> (Vec<Light>, [f32; 3], Option<(Option<u64
     for layer in ctx.comp.layers.iter().filter(|l| l.is_light() && l.switches.video && l.is_active_at(ctx.time)) {
         let LayerSource::Light { kind } = layer.source else { continue };
         let Some(g) = layer.props.sub("lightOptions") else { continue };
-        let k = (ctx.f(layer, g, "intensity", 100.0) / 100.0) as f32;
+        let k = (ctx.f(layer, g, "intensity", 100.0) / 100.0).max(0.0) as f32;
+        // Advanced 3D reads Intensity like a display value: measured with aerender, an ambient
+        // light at 10 / 25 / 50 / 100 / 200 % lights a card by 0.006 / 0.045 / 0.20 / 1 / >1 of
+        // its colour, i.e. Intensity^2.3 in linear light (the environment light keeps its scale).
+        let k = if kind == LightKind::Environment { k } else { k.powf(LIGHT_INTENSITY_GAMMA) };
         let c = ctx.color(layer, g, "color");
         let color = [l(c[0]) * k, l(c[1]) * k, l(c[2]) * k];
         match kind {
@@ -805,6 +859,52 @@ pub(crate) fn add_environment(b: &mut Builder, w: u32, h: u32, data: Vec<[f32; 4
     b.s.env = Some(EnvInfo { radiance: first, mips: levels, irradiance: ii, intensity: k, rotation });
 }
 
+/// The default environment light of a comp without an active light layer: like After Effects'
+/// Advanced 3D, model and primitive meshes are lit by a neutral environment (no shadows)
+/// instead of drawing their raw base colour. It is our own procedural studio (no image
+/// asset): a dim surround, a soft key above the camera and two side lights, tuned against
+/// reference frames so dielectrics keep about their base colour facing the camera while metals
+/// show reflections. Cards and extrusions (lit through their classic Material Options) stay
+/// unlit, as without lights.
+fn default_environment(b: &mut Builder) {
+    let (w, h, data) = studio_environment();
+    add_environment(b, w, h, data, [1.0; 3], 0.0);
+    let meshes: std::collections::HashSet<u32> = b.mesh_mats.iter().copied().collect();
+    for (i, m) in b.s.materials.iter_mut().enumerate() {
+        if !meshes.contains(&(i as u32)) {
+            m.accepts_lights = false;
+        }
+    }
+}
+
+/// The procedural studio environment of [`default_environment`] (linear radiance, 64×32
+/// equirectangular).
+fn studio_environment() -> (u32, u32, Vec<[f32; 4]>) {
+    let (w, h) = (64u32, 32u32);
+    // A dim surround, a soft key above the camera and two side lights (radiance; linear).
+    let (base, key, key_el, rad, side, side_el, side_az) = (0.05f32, 6.0f32, 35.0f32, 30.0f32, 3.0f32, 20.0f32, 90.0f32);
+    // AE world: +X right, +Y down, the default camera looks along +Z.
+    let dir = |az: f32, el: f32| {
+        let (az, el) = (az.to_radians(), el.to_radians());
+        [el.cos() * az.sin(), -el.sin(), -el.cos() * az.cos()]
+    };
+    let boxes = [(dir(0.0, key_el), key), (dir(side_az, side_el), side), (dir(-side_az, side_el), side)];
+    let (c0, c1) = ((rad * 1.25).to_radians().cos(), (rad * 0.75).to_radians().cos());
+    let data: Vec<[f32; 4]> = (0..h)
+        .flat_map(|y| (0..w).map(move |x| (x, y)))
+        .map(|(x, y)| {
+            let d = super::shade::equirect_dir((x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32, 0.0);
+            let mut v = base;
+            for (c, k) in boxes {
+                let t = ((super::shade::dot(d, c) - c0) / (c1 - c0)).clamp(0.0, 1.0);
+                v += k * t * t * (3.0 - 2.0 * t);
+            }
+            [v, v, v, 1.0]
+        })
+        .collect();
+    (w, h, data)
+}
+
 /// The environment layer's pixels as linear straight RGBA.
 fn env_pixels(r: &Renderer, ctx: &EvalCtx, src: Option<u64>, lin: bool) -> Option<(u32, u32, Vec<[f32; 4]>)> {
     let layer = match src {
@@ -903,6 +1003,7 @@ pub(crate) fn build_at(r: &Renderer, ctx: &EvalCtx, sub: Option<&EvalCtx>, run: 
         tri_depth: vec![],
         cam,
         outer: r.collapse3d.map_or(Mat4::IDENTITY, |c| c.world),
+        mesh_mats: vec![],
     };
     for layer in run {
         let ctx = if sub.is_some() && motion_blurred(r, base, layer) { at } else { base };
@@ -917,10 +1018,15 @@ pub(crate) fn build_at(r: &Renderer, ctx: &EvalCtx, sub: Option<&EvalCtx>, run: 
         let (ls, amb, env) = lights(ctx, lin);
         b.s.lights = ls;
         b.s.ambient = amb;
-        if let Some((src, k, rot)) = env
-            && let Some((w, h, d)) = env_pixels(r, ctx, src, lin)
-        {
+        if let Some((src, k, rot)) = env {
+            // No source layer (or none to be found): After Effects lights with its default
+            // environment, through the light's Intensity, Colour and Rotation.
+            let (w, h, d) = env_pixels(r, ctx, src, lin).unwrap_or_else(studio_environment);
             add_environment(&mut b, w, h, d, k, rot);
+        }
+        let any_light = ctx.comp.layers.iter().any(|l| l.is_light() && l.switches.video && l.is_active_at(ctx.time));
+        if !any_light && !b.mesh_mats.is_empty() {
+            default_environment(&mut b);
         }
         if r.opts.shadows() {
             super::raster::shadow_maps(&mut b.s, r.opts.draft);
@@ -961,4 +1067,21 @@ pub(crate) fn build_at(r: &Renderer, ctx: &EvalCtx, sub: Option<&EvalCtx>, run: 
     b.s.eye = [cam.eye.x as f32, cam.eye.y as f32, cam.eye.z as f32];
     b.s.ortho = cam.ortho;
     b.s
+}
+
+#[cfg(test)]
+mod ae_model_tests {
+    use super::*;
+
+    #[test]
+    fn ae_source_axes_cancel_only_the_common_gltf_root() {
+        let root = Mat4::rotate_x(-90.0);
+        let mut model = model::Model { nodes: vec![model::Node { matrix: Some(root), ..Default::default() }], roots: vec![0], ..Default::default() };
+        let point = vec3(1.0, 2.0, 3.0);
+        let actual = (model_to_layer(512.0) * ae_root_correction(&model) * root).apply(point);
+        let expected = model_to_layer(512.0).apply(point);
+        assert!((actual.x - expected.x).abs() < 1e-6 && (actual.y - expected.y).abs() < 1e-6 && (actual.z - expected.z).abs() < 1e-6);
+        model.nodes[0].matrix = Some(Mat4::rotate_y(20.0));
+        assert_eq!(ae_root_correction(&model), Mat4::IDENTITY);
+    }
 }

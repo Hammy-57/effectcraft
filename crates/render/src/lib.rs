@@ -26,7 +26,7 @@ use effectcraft_project::{Comp, Footage, FootageKind, FrameBlend, GroupKind, Ite
 pub use effectcraft_raster::Image;
 use effectcraft_raster::{WarpOpts, composite_warp};
 use effectcraft_time::{FrameRate, TICKS_PER_SECOND, Tick};
-pub use eval::{EvalCtx, ExprHost, source_size};
+pub use eval::{EvalCtx, ExprHost, effect_bounds, source_size};
 use rayon::prelude::*;
 
 /// Supplies decoded footage frames (implemented by the media layer).
@@ -73,13 +73,30 @@ pub fn is_vector_footage(f: &Footage) -> bool {
     matches!(f.codec.as_str(), "SVG" | "PDF" | "AI" | "EPS")
 }
 
-/// Layer parameters and audio for effects (see [`effectcraft_effects::EffectHost`]).
+/// Layer parameters and audio for effects (see [`effectcraft_effects::EffectHost`]). What it
+/// hands out is in effect space (see [`effect_bounds`]): the other layer's for its pixels, the
+/// running layer's for its own frames and the comp scene.
 struct FxHost<'r, 'a, 'c> {
     r: &'r Renderer<'a>,
     ctx: &'c EvalCtx<'a>,
     layer: &'c Layer,
+    /// Where the stack's effect space starts in layer coordinates (zero on adjustment layers,
+    /// whose effects run on the comp below).
+    origin: [f64; 2],
     /// Index of the effect being rendered (bounds `self_at` to effects before it).
     index: std::sync::atomic::AtomicUsize,
+}
+
+impl FxHost<'_, '_, '_> {
+    /// Another layer's pixels for a layer parameter, in its effect space; `layer_space`: `buf`
+    /// is still in layer space (its source or its content).
+    fn pixels(&self, other: &Layer, mut buf: Buf, layer_space: bool) -> LayerPixels {
+        let (size, origin) = self.ctx.effect_bounds(other);
+        if layer_space {
+            buf.rebase(origin);
+        }
+        LayerPixels { buf, size }
+    }
 }
 
 /// Nesting limit for effects that render layers (other layers, other times).
@@ -97,9 +114,7 @@ impl EffectHost for FxHost<'_, '_, '_> {
         let sub = self.r.nested();
         // The cached layer buffer is shared; effects get their own copy.
         let buf = if masks_and_effects { (*sub.content_buf(self.ctx, other)?).clone() } else { sub.source(self.ctx, other)? };
-        let size = source_size(self.r.project, other);
-        let size = if size.0 == 0 { [self.ctx.comp.width as f64, self.ctx.comp.height as f64] } else { [size.0 as f64, size.1 as f64] };
-        Some(LayerPixels { buf, size })
+        Some(self.pixels(other, buf, true))
     }
 
     fn layer_masks(&self, id: u64) -> Option<LayerPixels> {
@@ -109,9 +124,7 @@ impl EffectHost for FxHost<'_, '_, '_> {
         }
         let sub = self.r.nested();
         let buf = (*sub.layer_input(self.ctx, other, 0)?).clone();
-        let size = source_size(self.r.project, other);
-        let size = if size.0 == 0 { [self.ctx.comp.width as f64, self.ctx.comp.height as f64] } else { [size.0 as f64, size.1 as f64] };
-        Some(LayerPixels { buf, size })
+        Some(self.pixels(other, buf, false))
     }
 
     fn audio(&self, id: u64, start: f64, frames: usize, rate: u32) -> Option<Vec<f32>> {
@@ -187,7 +200,7 @@ impl EffectHost for FxHost<'_, '_, '_> {
             };
             Some(effectcraft_effects::CompLight { pos: [pos.x, pos.y, pos.z], dir: [dir.x / len, dir.y / len, dir.z / len], color: l.color, kind })
         });
-        Some(effectcraft_effects::CompScene { camera: Some(camera), light })
+        Some(effectcraft_effects::CompScene { camera: Some(camera), light }.rebased(self.origin))
     }
 
     fn layer_at(&self, id: u64, comp_time: f64, masks_and_effects: bool) -> Option<LayerPixels> {
@@ -197,10 +210,11 @@ impl EffectHost for FxHost<'_, '_, '_> {
         }
         let ctx = self.ctx.at(Tick::from_seconds_f64(comp_time));
         let sub = self.r.nested();
-        let buf = if masks_and_effects { (*sub.content_buf(&ctx, other)?).clone() } else { (*sub.layer_input(&ctx, other, 0)?).clone() };
-        let size = source_size(self.r.project, other);
-        let size = if size.0 == 0 { [self.ctx.comp.width as f64, self.ctx.comp.height as f64] } else { [size.0 as f64, size.1 as f64] };
-        Some(LayerPixels { buf, size })
+        Some(if masks_and_effects {
+            self.pixels(other, (*sub.content_buf(&ctx, other)?).clone(), true)
+        } else {
+            self.pixels(other, (*sub.layer_input(&ctx, other, 0)?).clone(), false)
+        })
     }
 }
 
@@ -329,6 +343,8 @@ pub trait FxTarget {
     fn gpu(&mut self, steps: &[FxStep]) -> bool;
     /// Run one CPU effect: `f` maps the buffer.
     fn cpu(&mut self, f: &mut dyn FnMut(Buf) -> Buf);
+    /// Move the buffer's effect coordinates: subtract `d` (buffer px) from its offset.
+    fn shift(&mut self, d: [f64; 2]);
 }
 
 /// The CPU effect target (GPU chains go through [`Accelerator::effects`]: upload, readback).
@@ -354,6 +370,11 @@ impl FxTarget for CpuFx<'_> {
             self.buf = Some(f(b));
         }
     }
+    fn shift(&mut self, d: [f64; 2]) {
+        if let Some(b) = &mut self.buf {
+            b.offset = [b.offset[0] - d[0], b.offset[1] - d[1]];
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
@@ -375,9 +396,9 @@ pub struct RenderOpts {
     pub roi: Option<[f64; 4]>,
     /// Which proxies stand in for footage and compositions (Render Settings ▸ Proxy Use).
     pub proxy: effectcraft_project::render_queue::ProxyUse,
-    /// Switches Affect Nested Comps (Settings ▸ General): a precomp layer's Quality and Motion
-    /// Blur switches also limit the layers of the nested comp (Draft/Wireframe or motion blur off
-    /// propagate down; they never raise a nested layer's own setting).
+    /// Switches Affect Nested Comps (Settings ▸ General): a precomp layer's Quality switch also
+    /// limits the layers of the nested comp (Draft/Wireframe propagate down; they never raise a
+    /// nested layer's own setting). Its Motion Blur switch does not reach them in AE.
     pub nested_switches: bool,
     /// Realtime Shadows in Draft (Settings ▸ 3D): draft renders (`draft`) still cast shadows.
     pub draft_shadows: bool,
@@ -429,9 +450,9 @@ pub struct Renderer<'a> {
     opacity_mul: f32,
     /// Collapsed precomp: nested 3D layers join the parent's 3D space.
     pub(crate) collapse3d: Option<Collapse3d<'a>>,
-    /// Switches inherited from the precomp layers this comp is rendered through (see
-    /// [`RenderOpts::nested_switches`]): the worst quality and whether motion blur is allowed.
-    pub(crate) inherited: Option<(Quality, bool)>,
+    /// The worst Quality switch of the precomp layers this comp is rendered through (see
+    /// [`RenderOpts::nested_switches`]).
+    pub(crate) inherited: Option<Quality>,
     /// Classic 3D depth of field is left to an accelerator ([`three_d::Plane3d::dof`]).
     pub(crate) defer_dof: bool,
     /// This renderer draws into the top-level frame's canvas (the top comp, or a collapsed
@@ -540,14 +561,16 @@ impl<'a> Renderer<'a> {
             Quality::Wireframe => 2,
         };
         match self.inherited {
-            Some((q, _)) if rank(q) > rank(layer.switches.quality) => q,
+            Some(q) if rank(q) > rank(layer.switches.quality) => q,
             _ => layer.switches.quality,
         }
     }
 
-    /// A layer's Motion Blur switch, limited by the precomp layers above it.
+    /// A layer's Motion Blur switch. Unlike Quality, the precomp layers above do not limit it:
+    /// AE still motion blurs nested layers under a precomp layer whose Motion Blur is off
+    /// (aerender, SceneYard Student Computer Workflow: trimmed strokes two precomps down).
     pub(crate) fn layer_motion_blur(&self, layer: &Layer) -> bool {
-        layer.switches.motion_blur && self.inherited.is_none_or(|(_, mb)| mb)
+        layer.switches.motion_blur
     }
 
     /// The renderer for the nested comp of precomp layer `layer`: its switches pass down when
@@ -555,7 +578,7 @@ impl<'a> Renderer<'a> {
     fn nested_through(&self, layer: &Layer) -> Renderer<'a> {
         let mut sub = self.nested();
         if self.opts.nested_switches {
-            sub.inherited = Some((self.quality(layer), self.layer_motion_blur(layer)));
+            sub.inherited = Some(self.quality(layer));
         }
         sub
     }
@@ -579,6 +602,56 @@ impl<'a> Renderer<'a> {
     /// Collapse Transformations switch is on and the layer has no masks, effects or layer
     /// styles (those force a flattened render of the precomp, as in After Effects).
     pub fn collapsed(&self, ctx: &EvalCtx, layer: &Layer) -> Option<ItemId> {
+        if self.collapses_isolated(ctx, layer) {
+            return None;
+        }
+        self.collapse_target(ctx, layer)
+    }
+
+    /// A collapsed precomp drawn as one isolated layer ([`Self::collapsed_fx`]): it has effects,
+    /// or it is 3D and holds 2D layers (those are placed by the precomp layer's transform without
+    /// the camera's perspective, so they cannot join this comp's 3D space as planes).
+    fn collapses_isolated(&self, ctx: &EvalCtx, layer: &Layer) -> bool {
+        let effects = layer.switches.effects && layer.effects().is_some_and(|fx| fx.groups().any(|g| g.enabled));
+        effects || (layer.is_3d() && self.collapse_target(ctx, layer).is_some_and(|item| self.holds_2d(item)))
+    }
+
+    /// How a collapsed precomp layer places its nested comp's 2D layers: its transform, without
+    /// the camera even when it is 3D (aerender, SceneYard Trump Photo Zoom In: the paper card
+    /// keeps its size and place when the precomp moves in depth, and becomes as small as the 3D
+    /// layers once made 3D). A 3D precomp without 2D layers keeps the camera's projection, which
+    /// sizes its continuously rasterized layers.
+    fn collapse_matrix(&self, ctx: &EvalCtx, layer: &Layer) -> Mat3 {
+        let flat = layer.is_3d() && matches!(layer.source, LayerSource::Comp { item } if self.holds_2d(item));
+        if !flat {
+            return ctx.layer_to_comp(layer).0;
+        }
+        let m = &ctx.world_matrix(layer).0;
+        Mat3([[m[0][0], m[0][1], m[0][3]], [m[1][0], m[1][1], m[1][3]], [0.0, 0.0, 1.0]])
+    }
+
+    /// Whether a comp has 2D layers that draw (not cameras, lights, adjustment or guide layers).
+    fn holds_2d(&self, item: ItemId) -> bool {
+        self.project
+            .comp(item)
+            .is_some_and(|c| c.layers.iter().any(|l| !l.is_3d() && l.has_video() && !l.switches.adjustment && !l.switches.guide && l.source.is_av()))
+    }
+
+    /// A collapsed precomp layer with effects, or a collapsed 3D precomp holding 2D layers:
+    /// After Effects still collapses its nested layers (3D ones seen through this comp's camera,
+    /// unclipped by the precomp's frame), then runs the effects on the result and composites it
+    /// as one layer that does not intersect the comp's other 3D layers (aerender, SceneYard
+    /// Trump Photo Zoom In: the street behind the collapsed scene fills the frame; flattened, it
+    /// stopped at the precomp's edges).
+    pub fn collapsed_fx(&self, ctx: &EvalCtx, layer: &Layer) -> Option<ItemId> {
+        if !self.collapses_isolated(ctx, layer) {
+            return None;
+        }
+        self.collapse_target(ctx, layer)
+    }
+
+    /// [`Self::collapsed`] without the effects condition.
+    fn collapse_target(&self, ctx: &EvalCtx, layer: &Layer) -> Option<ItemId> {
         if !layer.switches.collapse || layer.switches.adjustment || self.depth > 12 {
             return None;
         }
@@ -587,9 +660,6 @@ impl<'a> Renderer<'a> {
             return None;
         }
         if layer.masks().is_some_and(|m| !m.children.is_empty()) {
-            return None;
-        }
-        if layer.switches.effects && layer.effects().is_some_and(|fx| fx.groups().any(|g| g.enabled)) {
             return None;
         }
         if styles::active(ctx, layer) {
@@ -613,9 +683,9 @@ impl<'a> Renderer<'a> {
             return None;
         }
         let nctx = EvalCtx { comp_id: item, comp: nc, time: t, ..*ctx };
-        let (l2c, _) = ctx.layer_to_comp(layer);
-        let outer = Some(self.outer.map_or(l2c, |o| o * l2c));
         let world = ctx.world_matrix(layer);
+        let l2c = self.collapse_matrix(ctx, layer);
+        let outer = Some(self.outer.map_or(l2c, |o| o * l2c));
         let c3 = Collapse3d {
             world: self.collapse3d.map_or(world, |c| c.world * world),
             cam: three_d::compose::camera_for(self, ctx),
@@ -657,6 +727,34 @@ impl<'a> Renderer<'a> {
         let mut iso = Image::new(canvas.width, canvas.height);
         sub.draw_comp(&nctx, &mut iso, true);
         self.composite_iso(ctx, layer, iso, canvas, opacity);
+        Region::Full
+    }
+
+    /// Draw a collapsed precomp layer with effects ([`Self::collapsed_fx`]): the nested layers
+    /// are drawn collapsed into an isolated frame, the precomp layer's effects run on it in comp
+    /// space (as for an adjustment layer) and it takes the layer's matte, mode and opacity.
+    pub fn draw_collapsed_fx(&self, ctx: &EvalCtx<'a>, layer: &'a Layer, item: ItemId, canvas: &mut Image) -> Region {
+        let opacity = ctx.opacity(layer) as f32 * self.opacity_mul;
+        if opacity <= 0.0 {
+            return Region::Empty;
+        }
+        let Some((sub, nctx)) = self.collapse_into(ctx, layer, item, 1.0) else { return Region::Empty };
+        let mut iso = Image::new(canvas.width, canvas.height);
+        sub.draw_comp(&nctx, &mut iso, true);
+        let offset = self.roi_offset().map(|(x, y, _, _)| [-x, -y]).unwrap_or([0.0; 2]);
+        let mut buf = Buf { img: iso, offset, scale: self.opts.scale };
+        // Effects run in the working space, not the linear blending space.
+        if let Some(c) = self.pipe.from_blend() {
+            color::convert(&mut buf.img, &c);
+        }
+        let mut done = self.apply_effects(ctx, layer, buf, true);
+        if let Some(c) = self.pipe.to_blend() {
+            color::convert(&mut done.img, &c);
+        }
+        if done.img.width != canvas.width || done.img.height != canvas.height {
+            return Region::Empty;
+        }
+        self.composite_iso(ctx, layer, done.img, canvas, opacity);
         Region::Full
     }
 
@@ -826,8 +924,15 @@ impl<'a> Renderer<'a> {
     /// Draw a comp's layers (bottom to top) into `canvas` (blending space).
     /// `blank`: the canvas is fully transparent (lets the first layer skip re-quantising).
     fn draw_comp(&self, ctx: &EvalCtx<'a>, canvas: &mut Image, mut blank: bool) {
+        for (ctx, visible) in self.draw_passes(ctx) {
+            self.draw_layers(&ctx, &visible, canvas, blank);
+            blank = blank && visible.is_empty();
+        }
+    }
+
+    /// Draw `visible` (bottom to top) into `canvas`.
+    fn draw_layers(&self, ctx: &EvalCtx<'a>, visible: &[&'a Layer], canvas: &mut Image, mut blank: bool) {
         // Bottom-to-top, with runs of consecutive 3D layers depth-sorted (farthest first).
-        let visible = self.visible_layers(ctx);
         let mut i = 0;
         while i < visible.len() {
             if visible[i].is_3d() {
@@ -840,9 +945,10 @@ impl<'a> Renderer<'a> {
                 self.pipe.quantize(canvas);
                 blank = false;
             } else {
-                let changed = match self.collapsed(ctx, visible[i]) {
-                    Some(item) => self.draw_collapsed(ctx, visible[i], item, canvas, blank),
-                    None => self.draw_layer(ctx, visible[i], canvas, blank),
+                let changed = match (self.collapsed(ctx, visible[i]), self.collapsed_fx(ctx, visible[i])) {
+                    (Some(item), _) => self.draw_collapsed(ctx, visible[i], item, canvas, blank),
+                    (None, Some(item)) => self.draw_collapsed_fx(ctx, visible[i], item, canvas),
+                    (None, None) => self.draw_layer(ctx, visible[i], canvas, blank),
                 };
                 i += 1;
                 // 8/16 bpc: the comp is an integer buffer after every layer (only the pixels the
@@ -863,16 +969,39 @@ impl<'a> Renderer<'a> {
         self.apply_effects_timed(ctx, layer, buf, adjustment, usize::MAX, None)
     }
 
-    /// Run the first `limit` effects of the layer's stack (by position; disabled ones count).
-    fn apply_effects_timed(&self, ctx: &EvalCtx, layer: &Layer, buf: Buf, adjustment: bool, limit: usize, timing: Option<&mut Vec<(String, f64)>>) -> Buf {
+    /// Run the first `limit` effects of the layer's stack (by position; disabled ones count) on
+    /// `buf` (layer space, or the comp below for an adjustment layer).
+    fn apply_effects_timed(&self, ctx: &EvalCtx, layer: &Layer, mut buf: Buf, adjustment: bool, limit: usize, timing: Option<&mut Vec<(String, f64)>>) -> Buf {
+        let origin = fx_origin(ctx, layer, adjustment);
+        buf.rebase(origin);
+        let mut out = self.effect_space_stack(ctx, layer, buf, adjustment, limit, timing, origin);
+        out.rebase([-origin[0], -origin[1]]);
+        out
+    }
+
+    /// [`Renderer::apply_effects_timed`] on a buffer already in effect space (measured from
+    /// `origin`, in layer coordinates); the result stays in effect space.
+    #[allow(clippy::too_many_arguments)]
+    fn effect_space_stack(
+        &self,
+        ctx: &EvalCtx,
+        layer: &Layer,
+        buf: Buf,
+        adjustment: bool,
+        limit: usize,
+        timing: Option<&mut Vec<(String, f64)>>,
+        origin: [f64; 2],
+    ) -> Buf {
         let mut t = CpuFx { accel: self.active_accel(), levels: self.pipe.levels, buf: Some(buf) };
-        self.run_effect_stack(ctx, layer, adjustment, limit, timing, &mut t);
+        self.run_effect_stack(ctx, layer, adjustment, limit, timing, origin, &mut t);
         t.buf.unwrap_or_else(|| Buf { img: Image::new(1, 1), offset: [0.0; 2], scale: self.opts.scale })
     }
 
-    /// Run the layer's video effect stack on `target`: runs of GPU-capable effects go to
-    /// [`FxTarget::gpu`] (when an accelerator is active and supports them), the rest to
-    /// [`FxTarget::cpu`] one by one (quantised to the bit depth after each).
+    /// Run the layer's video effect stack on `target` (in effect space, measured from `origin`
+    /// in layer coordinates): runs of GPU-capable effects go to [`FxTarget::gpu`] (when an
+    /// accelerator is active and supports them), the rest to [`FxTarget::cpu`] one by one
+    /// (quantised to the bit depth after each).
+    #[allow(clippy::too_many_arguments)]
     fn run_effect_stack(
         &self,
         ctx: &EvalCtx,
@@ -880,6 +1009,7 @@ impl<'a> Renderer<'a> {
         adjustment: bool,
         limit: usize,
         mut timing: Option<&mut Vec<(String, f64)>>,
+        origin: [f64; 2],
         target: &mut dyn FxTarget,
     ) {
         if !layer.switches.effects {
@@ -887,10 +1017,14 @@ impl<'a> Renderer<'a> {
         }
         let Some(fx) = layer.effects() else { return };
         let lt = layer.layer_time(ctx.time);
-        let size = source_size(self.project, layer);
-        let layer_size = if size.0 == 0 { [ctx.comp.width as f64, ctx.comp.height as f64] } else { [size.0 as f64, size.1 as f64] };
-        let mask_shapes = masks::shapes(ctx, layer);
-        let host = FxHost { r: self, ctx, layer, index: Default::default() };
+        let layer_size = ctx.effect_bounds(layer).0;
+        let mut mask_shapes = masks::shapes(ctx, layer);
+        if origin != [0.0; 2] {
+            for q in mask_shapes.iter_mut().flat_map(|m| m.points.iter_mut()) {
+                *q = [q[0] - origin[0], q[1] - origin[1]];
+            }
+        }
+        let host = FxHost { r: self, ctx, layer, origin, index: Default::default() };
         let env = EffectEnv {
             masks: &mask_shapes,
             host: Some(&host),
@@ -900,6 +1034,11 @@ impl<'a> Renderer<'a> {
             working_space: self.pipe.space,
             working_linear: self.pipe.linear,
             shutter: self.mb_on(ctx, layer).then_some((ctx.comp.shutter_angle, ctx.comp.shutter_phase, ctx.comp.motion_blur_samples)),
+            // Comp space maps effect space, so it follows the origin.
+            comp_space: fx_comp_space(ctx, layer).map(|m| {
+                let m = m * Mat3::translate(vec2(origin[0], origin[1]));
+                [m.0[0], m.0[1]]
+            }),
         };
         // Video effects in stack order (index, group, spec); disabled and audio effects skipped.
         let stack: Vec<(usize, &effectcraft_project::PropGroup, &'static effectcraft_effects::EffectSpec)> = fx
@@ -933,7 +1072,8 @@ impl<'a> Renderer<'a> {
                     })
                     .collect();
                 let t0 = web_time::Instant::now();
-                if target.gpu(&steps) {
+                let done = target.gpu(&steps);
+                if done {
                     if let Some(v) = timing.as_deref_mut() {
                         let ms = t0.elapsed().as_secs_f64() * 1e3 / run.len() as f64;
                         v.extend(run.iter().map(|(_, _, s)| (format!("{} (gpu)", s.id), ms)));
@@ -1154,6 +1294,13 @@ impl<'a> Renderer<'a> {
         self.layer_buf_keyed(ctx, layer).map(|(b, _)| b)
     }
 
+    /// The pixels a layer lends as a track matte: its content (source, masks, effects) before
+    /// Layer Styles and their blending options. After Effects mattes through a shape whose Fill
+    /// Opacity is 0 as through the shape (SceneYard "Apple Maps Route").
+    pub fn matte_buf(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Arc<Buf>> {
+        self.styled(ctx, layer, None).map(|st| st.content)
+    }
+
     /// [`Self::layer_buf`] in the blending space (linear with Blend Colors Using 1.0 Gamma).
     pub fn blend_layer_buf(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Arc<Buf>> {
         let (b, k) = self.layer_buf_keyed(ctx, layer)?;
@@ -1228,8 +1375,9 @@ impl<'a> Renderer<'a> {
     }
 
     /// A layer's input at the context time: source → masks → its first `effects` effects
-    /// (what Time effects read at neighbouring times). Served from / stored in the layer cache
-    /// under its own key, so scrubbing reuses frames rendered for earlier output frames.
+    /// (what Time effects read at neighbouring times), in effect space (see [`effect_bounds`]):
+    /// what effect `effects` sees. Served from / stored in the layer cache under its own key,
+    /// so scrubbing reuses frames rendered for earlier output frames.
     pub fn layer_input(&self, ctx: &EvalCtx, layer: &Layer, effects: usize) -> Option<Arc<Buf>> {
         let key = self.cache.and_then(|_| cache::input_key(ctx, layer, self.raster_scale(ctx, layer), self.opts.draft, self.mb_on(ctx, layer), effects));
         let key = self.content_key(ctx, layer, key);
@@ -1239,8 +1387,10 @@ impl<'a> Renderer<'a> {
             return Some(b);
         }
         let mut buf = self.masked_source(ctx, layer)?;
+        let origin = ctx.effect_bounds(layer).1;
+        buf.rebase(origin);
         if effects > 0 {
-            buf = self.apply_effects_timed(ctx, layer, buf, false, effects, None);
+            buf = self.effect_space_stack(ctx, layer, buf, false, effects, None, origin);
         }
         let buf = Arc::new(buf);
         if let (Some(c), Some(k)) = (self.cache, key) {
@@ -1384,7 +1534,7 @@ impl<'a> Renderer<'a> {
         let mut t: Option<Tick> = None;
         for l in self.links() {
             let at = EvalCtx { comp_id: l.comp_id, comp: l.comp, time: t.unwrap_or(l.time + shift), ..*ctx };
-            let (m, _) = if l.blur { at.layer_to_comp(l.layer) } else { EvalCtx { time: l.time, ..at }.layer_to_comp(l.layer) };
+            let m = if l.blur { self.collapse_matrix(&at, l.layer) } else { self.collapse_matrix(&EvalCtx { time: l.time, ..at }, l.layer) };
             outer = Some(outer.map_or(m, |o| o * m));
             t = Some(at.nested_time(l.layer));
         }
@@ -1455,8 +1605,8 @@ impl<'a> Renderer<'a> {
     }
 
     /// Whether a layer is motion blurred: the render options, the comp's switch and the layer's
-    /// switch (limited by the precomp layers above when switches affect nested comps). Layer
-    /// motion, mask motion blur, effects that read the shutter and Advanced 3D all ask this.
+    /// switch. Layer motion, mask motion blur, effects that read the shutter and Advanced 3D all
+    /// ask this.
     pub(crate) fn mb_on(&self, ctx: &EvalCtx, layer: &Layer) -> bool {
         self.opts.motion_blur && ctx.comp.enable_motion_blur && self.layer_motion_blur(layer)
     }
@@ -1464,7 +1614,7 @@ impl<'a> Renderer<'a> {
     /// What a layer's mask motion blur may do in this render (see [`masks::MaskBlur`]).
     fn mask_blur(&self, ctx: &EvalCtx, layer: &Layer) -> masks::MaskBlur {
         masks::MaskBlur {
-            allowed: self.opts.motion_blur && ctx.comp.enable_motion_blur && self.inherited.is_none_or(|(_, mb)| mb),
+            allowed: self.opts.motion_blur && ctx.comp.enable_motion_blur,
             layer: self.layer_motion_blur(layer),
             samples: if self.opts.draft { 4 } else { ctx.comp.motion_blur_samples as usize },
         }
@@ -1680,29 +1830,9 @@ impl<'a> Renderer<'a> {
         if let Some((m, kind)) = matte {
             let mimg = match matte_img {
                 Some(i) if i.width == canvas.width && i.height == canvas.height => i,
-                _ => {
-                    let mut mimg = Image::new(canvas.width, canvas.height);
-                    if m.is_active_at(ctx.time)
-                        && let Some(mb) = self.layer_buf(ctx, m)
-                    {
-                        let mo = ctx.opacity(m) as f32;
-                        self.place(ctx, m, &mb, &mut mimg, BlendMode::Normal, mo);
-                    }
-                    mimg
-                }
+                _ => self.matte_image(ctx, m, canvas.width, canvas.height),
             };
-            iso.data.par_iter_mut().zip(mimg.data.par_iter()).for_each(|(p, q)| {
-                let k = match kind {
-                    MatteKind::Alpha => q[3],
-                    MatteKind::AlphaInverted => 1.0 - q[3],
-                    MatteKind::Luma => effectcraft_color::luminance(q[0], q[1], q[2]),
-                    MatteKind::LumaInverted => 1.0 - effectcraft_color::luminance(q[0], q[1], q[2]),
-                }
-                .clamp(0.0, 1.0);
-                for c in p.iter_mut() {
-                    *c *= k;
-                }
-            });
+            apply_matte(&mut iso, &mimg, kind);
         }
         if preserve {
             iso.data.par_iter_mut().zip(canvas.data.par_iter()).for_each(|(p, q)| {
@@ -1714,32 +1844,120 @@ impl<'a> Renderer<'a> {
         canvas.blend_from(&iso, layer.blend_mode, opacity, layer.id.0 as u32);
     }
 
-    /// Adjustment layer: effects applied to the comp below, limited to the layer's footprint.
+    /// A track matte layer's pixels placed in the comp (`w`×`h`).
+    fn matte_image(&self, ctx: &EvalCtx, m: &Layer, w: u32, h: u32) -> Image {
+        let mut mimg = Image::new(w, h);
+        if m.is_active_at(ctx.time)
+            && let Some(mb) = self.matte_buf(ctx, m)
+        {
+            let mo = ctx.opacity(m) as f32;
+            self.place(ctx, m, &mb, &mut mimg, BlendMode::Normal, mo);
+        }
+        mimg
+    }
+
+    /// Adjustment layer: effects applied to the comp below, limited to the layer's footprint
+    /// (its source, masks and track matte).
     fn draw_adjustment(&self, ctx: &EvalCtx, layer: &Layer, canvas: &mut Image, opacity: f32) {
         let Some(mut foot) = self.source(ctx, layer) else { return };
         let _ = masks::apply(ctx, layer, &mut foot, self.mask_blur(ctx, layer));
         let mut matte = Image::new(canvas.width, canvas.height);
         self.place(ctx, layer, &foot, &mut matte, BlendMode::Normal, 1.0);
+        // A track matte limits where the adjustment applies (SceneYard UI Google search: a
+        // tint + blur only inside a rounded card).
+        if let Some((m, kind)) = self.track_matte(ctx, layer) {
+            let mimg = self.matte_image(ctx, m, canvas.width, canvas.height);
+            apply_matte(&mut matte, &mimg, kind);
+        }
         let o = self.roi_offset().map(|(x, y, _, _)| [-x, -y]).unwrap_or([0.0; 2]);
-        let mut below = Buf { img: canvas.clone(), offset: o, scale: self.opts.scale };
+        // The effects' points and sizes are in the adjustment layer's space: map a moved or
+        // uniformly scaled (unrotated 2D) layer onto the comp below; others keep comp space.
+        let (offset, scale) = match (layer.is_3d(), ctx.layer_to_comp(layer).0.0) {
+            (false, [[a, b, tx], [c, d, ty], [0.0, 0.0, 1.0]])
+                if b == 0.0 && c == 0.0 && a > 0.0 && (a - d).abs() < 1e-9 && tx.is_finite() && ty.is_finite() =>
+            {
+                ([o[0] + tx * self.opts.scale, o[1] + ty * self.opts.scale], self.opts.scale * a)
+            }
+            _ => (o, self.opts.scale),
+        };
+        let mut below = Buf { img: canvas.clone(), offset, scale };
         // Effects run in the working space, not the linear blending space.
         if let Some(c) = self.pipe.from_blend() {
             color::convert(&mut below.img, &c);
         }
         let mut adjusted = self.apply_effects(ctx, layer, below, true);
+        if adjusted.img.width != canvas.width || adjusted.img.height != canvas.height {
+            // An effect grew the buffer (Motion Tile's Output Width): back to the comp.
+            let Some((x, y)) = adjustment_crop(adjusted.offset, offset, (adjusted.img.width, adjusted.img.height), (canvas.width, canvas.height)) else {
+                return;
+            };
+            adjusted.img = adjusted.img.crop(x, y, canvas.width, canvas.height);
+        }
         if let Some(c) = self.pipe.to_blend() {
             color::convert(&mut adjusted.img, &c);
         }
         if adjusted.img.width != canvas.width || adjusted.img.height != canvas.height {
             return;
         }
+        // A blending mode composites the adjusted comp onto the layers below with that mode
+        // (SceneYard Billiard Balls: a white-to-black 4-Color Gradient adjustment in Overlay
+        // shades the felt; Normal washed it out to grey).
+        let mode = layer.blend_mode;
         canvas.data.par_iter_mut().zip(adjusted.img.data.par_iter()).zip(matte.data.par_iter()).for_each(|((c, a), m)| {
             let k = m[3] * opacity;
+            let a = if mode == BlendMode::Normal { *a } else { effectcraft_color::blend_pixel(mode, *c, *a, 0.5) };
             for i in 0..4 {
                 c[i] += (a[i] - c[i]) * k;
             }
         });
     }
+}
+
+/// Where the comp canvas sits inside an adjustment layer's effect output that grew around it:
+/// the whole-pixel shift between the output's and the input's layer origins (`offset` vs
+/// `input_offset`). `None` when the shift is fractional or the canvas would not fit inside.
+pub fn adjustment_crop(offset: [f64; 2], input_offset: [f64; 2], size: (u32, u32), canvas: (u32, u32)) -> Option<(i64, i64)> {
+    let (dx, dy) = (offset[0] - input_offset[0], offset[1] - input_offset[1]);
+    if !dx.is_finite() || !dy.is_finite() || (dx - dx.round()).abs() > 1e-6 || (dy - dy.round()).abs() > 1e-6 {
+        return None;
+    }
+    let (x, y) = (dx.round() as i64, dy.round() as i64);
+    let fits = x >= 0 && y >= 0 && x + canvas.0 as i64 <= size.0 as i64 && y + canvas.1 as i64 <= size.1 as i64;
+    fits.then_some((x, y))
+}
+
+/// Where a layer's effect space starts, in layer coordinates (see [`EvalCtx::effect_bounds`]).
+/// The comp below an adjustment layer stays as it is, except that a shape layer's effects
+/// always measure from its comp-sized canvas centred on the anchor (as After Effects does).
+fn fx_origin(ctx: &EvalCtx, layer: &Layer, adjustment: bool) -> [f64; 2] {
+    if adjustment && !matches!(layer.source, LayerSource::Shape) { [0.0; 2] } else { ctx.effect_bounds(layer).1 }
+}
+
+/// After Effects runs a Continuously Rasterize shape or text layer's effects in comp space:
+/// measured with CC Light Sweep, its centre, angle and width stay put in the comp whatever the
+/// layer's position, scale and rotation. The layer → comp affine of such a 2D layer (see
+/// [`EffectEnv::comp_space`]).
+fn fx_comp_space(ctx: &EvalCtx, layer: &Layer) -> Option<Mat3> {
+    if !layer.switches.collapse || layer.is_3d() || !matches!(layer.source, LayerSource::Shape | LayerSource::Text) {
+        return None;
+    }
+    Some(ctx.layer_to_comp(layer).0)
+}
+
+/// Multiply `img` by a track matte's coverage (`mimg`, same size).
+fn apply_matte(img: &mut Image, mimg: &Image, kind: MatteKind) {
+    img.data.par_iter_mut().zip(mimg.data.par_iter()).for_each(|(p, q)| {
+        let k = match kind {
+            MatteKind::Alpha => q[3],
+            MatteKind::AlphaInverted => 1.0 - q[3],
+            MatteKind::Luma => effectcraft_color::luminance(q[0], q[1], q[2]),
+            MatteKind::LumaInverted => 1.0 - effectcraft_color::luminance(q[0], q[1], q[2]),
+        }
+        .clamp(0.0, 1.0);
+        for c in p.iter_mut() {
+            *c *= k;
+        }
+    });
 }
 
 /// A layer ready to composite (see [`Renderer::styled_layer`]).
@@ -1802,6 +2020,60 @@ impl<'a> Renderer<'a> {
             .rev()
             .filter(|l| l.is_active_at(t) && l.has_video() && !l.environment && (!any_solo || l.switches.solo) && (self.opts.guides || !l.switches.guide))
             .collect()
+    }
+
+    /// The comp's visible layers (bottom to top) in drawing passes, each with the time it is
+    /// drawn at. A 2D adjustment layer with Posterize Time holds everything below it (and itself)
+    /// on its frame grid, as After Effects does: SceneYard UI Google search's "Glow / Posterize
+    /// Time" adjustment steps the Gaussian Blur adjustment and the layers under it to 15 fps.
+    /// Above that layer the comp runs at the real time. Effects of other layers see their own
+    /// pass's time.
+    pub fn draw_passes(&self, ctx: &EvalCtx<'a>) -> Vec<(EvalCtx<'a>, Vec<&'a Layer>)> {
+        let mut out = Vec::new();
+        self.collect_passes(ctx, None, 0, &mut out);
+        out
+    }
+
+    fn collect_passes(&self, ctx: &EvalCtx<'a>, below: Option<usize>, depth: usize, out: &mut Vec<(EvalCtx<'a>, Vec<&'a Layer>)>) {
+        let comp = ctx.comp;
+        let index = |l: &Layer| comp.layers.iter().position(|x| std::ptr::eq(x, l)).unwrap_or(0);
+        let visible: Vec<&'a Layer> = self.visible_layers(ctx).into_iter().filter(|l| below.is_none_or(|b| index(l) >= b)).collect();
+        let split = if depth < 16 {
+            visible.iter().enumerate().rev().find_map(|(k, l)| {
+                let t = self.posterized_comp_time(ctx, l)?;
+                ((t.0 - ctx.time.0).abs() > 0).then_some((k, t))
+            })
+        } else {
+            None
+        };
+        match split {
+            Some((k, t)) => {
+                self.collect_passes(&ctx.at(t), Some(index(visible[k])), depth + 1, out);
+                out.push((*ctx, visible.get(k + 1..).unwrap_or_default().to_vec()));
+            }
+            None => out.push((*ctx, visible)),
+        }
+    }
+
+    /// The comp time a 2D adjustment layer's first enabled Posterize Time holds at `ctx`.
+    fn posterized_comp_time(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Tick> {
+        if !layer.switches.adjustment || layer.is_3d() || !layer.switches.effects {
+            return None;
+        }
+        let g = layer.effects()?.groups().find(|g| g.enabled && matches!(&g.kind, GroupKind::Effect { effect } if effect == "ec.time.posterizetime"))?;
+        let rate = self.effect_params(ctx, layer, g).f("frameRate");
+        let lt = layer.layer_time(ctx.time).seconds();
+        let held = effectcraft_effects::posterized_time(lt, rate);
+        if !held.is_finite() {
+            return None;
+        }
+        // The held time lands on the comp's next frame (SceneYard Twisting text gradient: 20 fps
+        // in a 30 fps comp holds frame 44 at frame 44, not at 43.5, so its footage keeps frame
+        // 44's picture).
+        let t = layer.comp_time(Tick::from_seconds_f64(held)).seconds();
+        let fps = ctx.comp.frame_rate.as_f64();
+        let t = if fps > 0.0 { (t * fps - 1e-6).ceil() / fps } else { t };
+        t.is_finite().then(|| Tick::from_seconds_f64(t))
     }
 
     /// Draw a run of consecutive 3D layers into `canvas` (CPU).
@@ -1873,7 +2145,13 @@ impl<'a> Renderer<'a> {
     /// parameters and environment. `adjustment`: the stack runs on the comp below (adjustment
     /// layers).
     pub fn run_effects_on(&self, ctx: &EvalCtx, layer: &Layer, adjustment: bool, target: &mut dyn FxTarget) {
-        self.run_effect_stack(ctx, layer, adjustment, usize::MAX, None, target);
+        // `target` is the comp below in the layer's space for adjustment layers (the callers);
+        // a shape layer's effects still measure from its anchor-centred canvas ([`fx_origin`]).
+        let origin = fx_origin(ctx, layer, adjustment);
+        let d = [origin[0] * self.opts.scale, origin[1] * self.opts.scale];
+        target.shift([-d[0], -d[1]]);
+        self.run_effect_stack(ctx, layer, adjustment, usize::MAX, None, origin, target);
+        target.shift(d);
     }
 
     /// An adjustment layer's footprint (its source with masks applied, layer space): where

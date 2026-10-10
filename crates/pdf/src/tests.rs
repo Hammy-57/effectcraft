@@ -508,3 +508,30 @@ fn multiple_pages_and_calculator_shadings() {
     assert!(img.get(5, 25)[0] < 0.1 && img.get(95, 25)[0] > 0.9, "{:?} {:?}", img.get(5, 25), img.get(95, 25));
     assert_eq!(parse_page(&bytes, 2), Err(Error::PageOutOfRange(2)));
 }
+
+#[test]
+fn saved_layer_crop_selects_pixels_in_document_coordinates() {
+    let doc = parse(&sample_pdf(false)).unwrap();
+    let selected = selected_layer_doc(&doc, 1, "Art", Some([20.25, 20.5, 40.5, 60.75])).unwrap();
+    assert_eq!(selected.pixel_size(), (21, 41));
+    assert_eq!(selected.root.children.len(), 1);
+    // PDF y-flip stays inside the new document-space translation.
+    let pixel = px(&selected, 5, 5);
+    assert!(pixel[0] > 0.99 && pixel[1] < 0.01 && pixel[3] > 0.99);
+    // The bounds are in PDF user space (y up, as AE saves them; SceneYard Retro Desktop's
+    // title bar sits at y 3333..3471 of a 4141-high page, i.e. near the top): the top of the
+    // clipped red art (y 85..90) is inside, the empty band above it (y 90..95) too.
+    let top = selected_layer_doc(&doc, 1, "Art", Some([0.0, 85.0, 50.0, 95.0])).unwrap();
+    assert!(px(&top, 15, 7)[0] > 0.99, "{:?}", px(&top, 15, 7));
+    assert!(px(&top, 15, 2)[3] < 0.01, "{:?}", px(&top, 15, 2));
+    assert!(selected_layer_doc(&doc, usize::MAX, "", None).is_err());
+    let shifted = selected_layer_doc(&doc, 99, "Art", None).unwrap();
+    assert_eq!(layer_names(&shifted), ["Art"]);
+    assert!(selected_layer_doc(&doc, 0, "Missing", None).is_err());
+    let mut ambiguous = doc.clone();
+    ambiguous.root.children.push(doc.root.children[1].clone());
+    assert!(selected_layer_doc(&ambiguous, 99, "Art", None).is_err());
+    for bounds in [[0.0, 0.0, f64::NAN, 5.0], [10.0, 0.0, 5.0, 5.0], [0.0, 0.0, 30001.0, 5.0]] {
+        assert!(selected_layer_doc(&doc, 1, "Art", Some(bounds)).is_err());
+    }
+}

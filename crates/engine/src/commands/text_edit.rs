@@ -498,6 +498,33 @@ pub fn font_features(s: &mut Session, p: &Value) -> Result<Value> {
     }))
 }
 
+/// The installed font families (bundled and system), with their styles, where each comes from
+/// and its name in the font's own language. `query` keeps the families whose English or native
+/// name contains it (case-insensitive); `rescan` first looks for fonts installed since the app
+/// started.
+pub fn fonts(_s: &mut Session, p: &Value) -> Result<Value> {
+    use effectcraft_text::fonts;
+    let added = if p.get("rescan").and_then(Value::as_bool).unwrap_or(false) { fonts::rescan_system() } else { 0 };
+    let query = p.get("query").and_then(Value::as_str).map(str::to_lowercase).unwrap_or_default();
+    let native = fonts::native_families();
+    let mut origin: std::collections::BTreeMap<String, &'static str> = Default::default();
+    for f in fonts::all_faces() {
+        origin.entry(f.info.family.clone()).or_insert(f.info.origin);
+    }
+    let list: Vec<Value> = effectcraft_text::families()
+        .into_iter()
+        .filter(|(f, _)| query.is_empty() || f.to_lowercase().contains(&query) || native.get(f).is_some_and(|n| n.to_lowercase().contains(&query)))
+        .map(|(f, styles)| {
+            let mut v = json!({"family": f, "styles": styles, "origin": origin.get(&f).copied().unwrap_or("system")});
+            if let Some(n) = native.get(&f) {
+                v["nativeName"] = json!(n);
+            }
+            v
+        })
+        .collect();
+    Ok(json!({"count": list.len(), "families": list, "added": added}))
+}
+
 fn always_ok(_: &Session) -> std::result::Result<(), String> {
     Ok(())
 }
@@ -526,6 +553,15 @@ pub fn specs() -> Vec<CommandSpec> {
             "{layer?, font?, style?} → {family, style, features: [tags], options: {smallCaps, superscript, stylisticSets: [n], fractions, …}} (what the font sets with its own glyphs)",
             always_ok,
             font_features
+        ),
+        cmd!(
+            "text.fonts",
+            "List Fonts",
+            [],
+            None,
+            "{query?, rescan?} → {count, families: [{family, styles, origin: bundled|system|user, nativeName?}], added} (rescan picks up fonts installed since launch)",
+            always_ok,
+            fonts
         ),
         cmd!(
             "text.setSelection",

@@ -2,6 +2,7 @@
 //! Settings, Layer Settings on a camera or light). OK runs `layer.newCamera` / `layer.newLight`
 //! or `layer.cameraSettings` / `layer.lightSettings` with the dialog's values.
 
+use crate::i18n::tr;
 use effectcraft_engine::project::{AutoOrient, LayerSource, LightKind};
 use effectcraft_engine::render::three_d::camera::{PRESETS, angle_of_view, default_aperture, focal_for_zoom, zoom_for_focal};
 use egui::{Color32, vec2};
@@ -144,12 +145,12 @@ pub fn open_light(app: &mut EffectcraftApp, layer: Option<u64>) -> Result<(), St
 fn buttons(ui: &mut egui::Ui, t: &Tokens, ok: &mut bool, close: &mut bool) -> (egui::Rect, egui::Rect) {
     let mut r = (egui::Rect::NOTHING, egui::Rect::NOTHING);
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        let b = ui.add(egui::Button::new(egui::RichText::new("   OK   ").color(Color32::WHITE)).fill(t.accent));
+        let b = ui.add(egui::Button::new(egui::RichText::new(tr("   OK   ")).color(Color32::WHITE)).fill(t.accent));
         r.0 = b.rect;
         if b.clicked() {
             *ok = true;
         }
-        let c = ui.button("Cancel");
+        let c = ui.button(tr("Cancel"));
         r.1 = c.rect;
         if c.clicked() {
             *close = true;
@@ -165,16 +166,16 @@ pub fn camera(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
     let mut rects = (egui::Rect::NOTHING, egui::Rect::NOTHING);
     super::dialogs::modal(ctx, "Camera Settings", vec2(520.0, 420.0), t, |ui| {
         egui::Grid::new("cam-grid").num_columns(2).spacing([14.0, 9.0]).show(ui, |ui| {
-            ui.label("Type");
+            ui.label(tr("Type"));
             egui::ComboBox::from_id_salt("cam-type").selected_text(if d.two_node { "Two-Node Camera" } else { "One-Node Camera" }).show_ui(ui, |ui| {
-                ui.selectable_value(&mut d.two_node, true, "Two-Node Camera");
-                ui.selectable_value(&mut d.two_node, false, "One-Node Camera");
+                ui.selectable_value(&mut d.two_node, true, tr("Two-Node Camera"));
+                ui.selectable_value(&mut d.two_node, false, tr("One-Node Camera"));
             });
             ui.end_row();
-            ui.label("Name");
+            ui.label(tr("Name"));
             ui.add(egui::TextEdit::singleline(&mut d.name).desired_width(240.0));
             ui.end_row();
-            ui.label("Preset");
+            ui.label(tr("Preset"));
             let focal = focal_for_zoom(w, d.zoom);
             let cur = PRESETS.iter().find(|(_, f)| (f - focal).abs() < 1e-6).map(|(n, _)| *n).unwrap_or("Custom");
             egui::ComboBox::from_id_salt("cam-preset").selected_text(cur).show_ui(ui, |ui| {
@@ -185,7 +186,7 @@ pub fn camera(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
                 }
             });
             ui.end_row();
-            ui.label("Zoom");
+            ui.label(tr("Zoom"));
             ui.horizontal(|ui| {
                 ui.add(egui::DragValue::new(&mut d.zoom).range(1.0..=100000.0).speed(1.0).suffix(" px"));
                 let mut aov = angle_of_view(w, d.zoom);
@@ -198,19 +199,19 @@ pub fn camera(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
                 }
             });
             ui.end_row();
-            ui.label("Depth of Field");
-            ui.checkbox(&mut d.dof, "Enable Depth of Field");
+            ui.label(tr("Depth of Field"));
+            ui.checkbox(&mut d.dof, tr("Enable Depth of Field"));
             ui.end_row();
-            ui.label("Focus Distance");
+            ui.label(tr("Focus Distance"));
             ui.horizontal(|ui| {
                 ui.add_enabled(!d.lock_to_zoom, egui::DragValue::new(&mut d.focus).range(0.0..=100000.0).suffix(" px"));
-                ui.checkbox(&mut d.lock_to_zoom, "Lock to Zoom");
+                ui.checkbox(&mut d.lock_to_zoom, tr("Lock to Zoom"));
             });
             ui.end_row();
-            ui.label("Aperture");
+            ui.label(tr("Aperture"));
             ui.add(egui::DragValue::new(&mut d.aperture).range(0.0..=10000.0).speed(0.1).suffix(" px"));
             ui.end_row();
-            ui.label("Blur Level");
+            ui.label(tr("Blur Level"));
             ui.add(egui::DragValue::new(&mut d.blur).range(0.0..=10000.0).suffix(" %"));
             ui.end_row();
         });
@@ -256,33 +257,33 @@ pub fn light(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
     let mut rects = (egui::Rect::NOTHING, egui::Rect::NOTHING);
     super::dialogs::modal(ctx, "Light Settings", vec2(480.0, 470.0), t, |ui| {
         egui::Grid::new("light-grid").num_columns(2).spacing([14.0, 9.0]).show(ui, |ui| {
-            ui.label("Name");
+            ui.label(tr("Name"));
             ui.add(egui::TextEdit::singleline(&mut d.name).desired_width(220.0));
             ui.end_row();
-            ui.label("Light Type");
+            ui.label(tr("Light Type"));
             egui::ComboBox::from_id_salt("light-type").selected_text(KINDS[d.kind.min(3)].label()).show_ui(ui, |ui| {
                 for (i, k) in KINDS.iter().enumerate() {
                     ui.selectable_value(&mut d.kind, i, k.label());
                 }
             });
             ui.end_row();
-            ui.label("Color");
+            ui.label(tr("Color"));
             ui.color_edit_button_rgb(&mut d.color);
             ui.end_row();
-            ui.label("Intensity");
+            ui.label(tr("Intensity"));
             ui.add(egui::DragValue::new(&mut d.intensity).range(-10000.0..=10000.0).suffix(" %"));
             ui.end_row();
             let kind = KINDS[d.kind.min(3)];
             if kind == LightKind::Spot {
-                ui.label("Cone Angle");
+                ui.label(tr("Cone Angle"));
                 ui.add(egui::DragValue::new(&mut d.cone_angle).range(0.0..=180.0).suffix("°"));
                 ui.end_row();
-                ui.label("Cone Feather");
+                ui.label(tr("Cone Feather"));
                 ui.add(egui::DragValue::new(&mut d.cone_feather).range(0.0..=100.0).suffix(" %"));
                 ui.end_row();
             }
             if kind != LightKind::Ambient {
-                ui.label("Falloff");
+                ui.label(tr("Falloff"));
                 egui::ComboBox::from_id_salt("light-falloff").selected_text(FALLOFFS[d.falloff.min(2)]).show_ui(ui, |ui| {
                     for (i, f) in FALLOFFS.iter().enumerate() {
                         ui.selectable_value(&mut d.falloff, i, *f);
@@ -290,26 +291,26 @@ pub fn light(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
                 });
                 ui.end_row();
                 if d.falloff > 0 {
-                    ui.label("Radius");
+                    ui.label(tr("Radius"));
                     ui.add(egui::DragValue::new(&mut d.radius).range(0.0..=100000.0).suffix(" px"));
                     ui.end_row();
-                    ui.label("Falloff Distance");
+                    ui.label(tr("Falloff Distance"));
                     ui.add(egui::DragValue::new(&mut d.falloff_distance).range(0.0..=100000.0).suffix(" px"));
                     ui.end_row();
                 }
-                ui.label("Shadows");
-                ui.checkbox(&mut d.casts_shadows, "Casts Shadows");
+                ui.label(tr("Shadows"));
+                ui.checkbox(&mut d.casts_shadows, tr("Casts Shadows"));
                 ui.end_row();
-                ui.label("Shadow Darkness");
+                ui.label(tr("Shadow Darkness"));
                 ui.add_enabled(d.casts_shadows, egui::DragValue::new(&mut d.shadow_darkness).range(0.0..=100.0).suffix(" %"));
                 ui.end_row();
-                ui.label("Shadow Diffusion");
+                ui.label(tr("Shadow Diffusion"));
                 ui.add_enabled(d.casts_shadows, egui::DragValue::new(&mut d.shadow_diffusion).range(0.0..=1000.0).suffix(" px"));
                 ui.end_row();
             }
         });
         ui.add_space(14.0);
-        ui.label(egui::RichText::new("Note: Shadows are only cast from layers with Cast Shadows enabled.").font(Tokens::ui(11.0)).color(t.text_dim));
+        ui.label(egui::RichText::new(tr("Note: Shadows are only cast from layers with Cast Shadows enabled.")).font(Tokens::ui(11.0)).color(t.text_dim));
         ui.add_space(8.0);
         rects = buttons(ui, t, &mut ok, &mut close);
     });

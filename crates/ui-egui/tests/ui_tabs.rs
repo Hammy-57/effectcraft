@@ -200,6 +200,41 @@ fn panels_dock_beside_others_and_gutters_resize_them() {
     assert!((wider.width() - project.width() - 60.0).abs() < 2.0, "{} → {}", project.width(), wider.width());
 }
 
+/// Issue #171: the gaps between the right column's stacked panels drag to resize them (Preview
+/// was stuck at its default height), not below a minimum; the heights stay in the layout.
+#[test]
+fn stacked_panel_gaps_resize_the_panels() {
+    let (mut h, _, _) = harness();
+    fn height(n: &DockNode, p: PanelKind) -> Option<Option<f32>> {
+        match n {
+            DockNode::Split { a, b, .. } => height(a, p).or_else(|| height(b, p)),
+            DockNode::Tabs { .. } => None,
+            DockNode::Stack { entries } => entries.iter().find(|e| e.panel == p).map(|e| e.height),
+        }
+    }
+    let (preview, props) = (rect(&h, "panel.Preview"), rect(&h, "panel.Properties"));
+    let gap = rect(&h, "dock.gutter.bs0");
+    assert!(gap.center().y > preview.max.y && gap.center().y < props.min.y, "the gap below Preview: {gap:?}");
+    drag(&mut h, gap.center(), gap.center() + egui::vec2(0.0, 150.0));
+    let (p2, q2) = (rect(&h, "panel.Preview"), rect(&h, "panel.Properties"));
+    assert!((p2.height() - preview.height() - 150.0).abs() < 2.0, "Preview {} → {}", preview.height(), p2.height());
+    assert!((props.height() - q2.height() - 150.0).abs() < 2.0, "Properties {} → {}", props.height(), q2.height());
+    assert!((q2.max.y - props.max.y).abs() < 1.0, "the column stays filled");
+    let saved = height(&h.state().ui.dock, PanelKind::Preview).flatten().expect("Preview's height is in the layout");
+    assert!((saved - p2.height()).abs() < 2.0, "{saved} vs {}", p2.height());
+    assert_eq!(height(&h.state().ui.dock, PanelKind::Properties), Some(None), "Properties still takes the rest");
+    // Collapsing and expanding Preview keeps its height.
+    let tab = rect(&h, "panel.tab.Preview");
+    click_n(&mut h, tab.center(), 1);
+    assert!(!h.state().ui.dock.is_visible(PanelKind::Preview));
+    click_n(&mut h, tab.center(), 1);
+    assert!((rect(&h, "panel.Preview").height() - p2.height()).abs() < 1.0);
+    // Not below the minimum.
+    let gap = rect(&h, "dock.gutter.bs0");
+    drag(&mut h, gap.center(), gap.center() - egui::vec2(0.0, 400.0));
+    assert!((rect(&h, "panel.Preview").height() - 40.0).abs() < 1.0, "{}", rect(&h, "panel.Preview").height());
+}
+
 /// Issue #45: the Project panel's details (name, size, duration) stay inside the panel with a
 /// margin, cut short with "…" when they don't fit; so does the hint shown with nothing selected.
 #[test]

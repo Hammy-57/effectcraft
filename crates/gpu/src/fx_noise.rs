@@ -156,14 +156,17 @@ pub(crate) fn fractal(e: &mut Enc, ctx: &EffectCtx, b: GBuf, turbulent: bool) ->
 /// noise::median_image (of the straight colour with alpha 1 when `straight`).
 pub(crate) fn median_image(e: &mut Enc, img: &GpuImage, r: usize, straight: bool) -> GpuImage {
     let q = run(e, "fxn_quant", &with_u0([straight as u32, 0, 0, 0]), img, None, None);
+    // Preserve the CPU's rounded level / 511 values before the strict Dust & Scratches
+    // threshold. GPU division (even residual-corrected) may differ by one ulp.
+    let levels = e.data(&(0..512).map(|level| level as f32 / 511.0).collect::<Vec<_>>());
     if r <= MEDIAN_BISECT_R {
-        return run(e, "fxn_median", &with_u0([r as u32, 0, 0, 0]), &q, None, None);
+        return run(e, "fxn_median", &with_u0([r as u32, 0, 0, 0]), &q, None, Some(&levels));
     }
     // Segments long enough that filling the first window (2r + 1)² costs about as much as
     // sliding along the rest.
     let seg = (4 * r as u32).clamp(32, 512).min(q.width);
     let out = e.scratch(q.width, q.height);
-    e.dispatch("fxn_median_huang", &with_u0([r as u32, seg, 0, 0]), &q, None, &out, None, (q.height.div_ceil(64), q.width.div_ceil(seg)));
+    e.dispatch("fxn_median_huang", &with_u0([r as u32, seg, 0, 0]), &q, None, &out, Some(&levels), (q.height.div_ceil(64), q.width.div_ceil(seg)));
     out
 }
 

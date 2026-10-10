@@ -11,13 +11,13 @@
 //! - `ico <out.ico> <in.png>…`: pack PNGs into a Windows `.ico` (used by `packaging/icons.sh`).
 //! - `fmt [--check]`: rustfmt every source file, including the modules `build.rs` declares
 //!   (`cargo fmt` doesn't see those; see `effectcraft-buildgen`).
-//! - `parity [--check] [--out FILE]`: check the parts of `docs/parity/` and assemble them into
-//!   one page (default `<target>/parity.md`).
-//! - `ci`: fmt check, clippy -D warnings, tests, layers, assets, parity, wasm.
+//! - `ci`: fmt check, clippy -D warnings, tests, layers, assets, wasm.
+//! - `ci --affected [--base REV] [--dry-run]`: the same gates for only the crates the change since
+//!   REV (default: the merge-base with `main`) can affect; see `affected.rs` and docs/testing.md.
 
+mod affected;
 mod fmt;
 mod ico;
-mod parity;
 mod version;
 
 use std::process::{Command, ExitCode};
@@ -53,6 +53,7 @@ const LAYERS: &[(&str, u8)] = &[
     ("export", 3),
     ("gpu", 3),
     ("lottie", 3),
+    ("aep", 3),
     ("format", 3),
     ("plugin", 3),
     ("interchange", 3),
@@ -416,7 +417,6 @@ fn ci() -> Result<(), String> {
     run(Command::new(cargo).args(["test", "--workspace", "--release"]))?;
     layers()?;
     assets()?;
-    parity::run(&["--check".into()])?;
     wasm()
 }
 
@@ -426,8 +426,10 @@ fn main() -> ExitCode {
         "layers" => layers(),
         "wasm" => wasm(),
         "assets" => assets(),
-        "ci" => ci(),
-        "parity" => parity::run(&std::env::args().skip(2).collect::<Vec<_>>()),
+        "ci" => {
+            let rest: Vec<String> = std::env::args().skip(2).collect();
+            if rest.iter().any(|a| a == "--affected") { affected::run(&root(), &rest) } else { ci() }
+        }
         "fmt" => fmt::run(&std::env::args().skip(2).collect::<Vec<_>>()),
         "web" => web(&std::env::args().skip(2).collect::<Vec<_>>()),
         "ico" => {
@@ -438,7 +440,7 @@ fn main() -> ExitCode {
             let rest: Vec<String> = std::env::args().skip(2).collect();
             version::run(&root(), &rest.iter().map(String::as_str).collect::<Vec<_>>())
         }
-        _ => Err("usage: cargo xtask <layers|assets|wasm|fmt [--check]|parity [--check] [--out FILE]|web [--dev] [--serve PORT]|ico OUT.ico IN.png…|version [set X.Y.Z]|ci>".into()),
+        _ => Err("usage: cargo xtask <layers|assets|wasm|web [--dev] [--serve PORT]|ico OUT.ico IN.png…|version [set X.Y.Z]|fmt [--check]|ci [--affected [--base REV] [--dry-run]]>".into()),
     };
     match r {
         Ok(()) => ExitCode::SUCCESS,
@@ -451,5 +453,5 @@ fn main() -> ExitCode {
 
 /// The workspace root (the parent of `xtask/`).
 pub fn root() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("xtask has a parent dir").to_path_buf()
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().map(std::path::Path::to_path_buf).unwrap_or_else(|| std::path::PathBuf::from("."))
 }

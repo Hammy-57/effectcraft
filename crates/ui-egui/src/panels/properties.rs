@@ -2,7 +2,7 @@
 //! like After Effects' Properties panel. Sections appear by layer type:
 //!
 //! - **Layer Transform** (all layers but cameras/lights): keyframe navigator (◀ ◆ ▶) or
-//!   stopwatch, scrubbable values, linked Scale, `Nx+N°` Rotation, Reset.
+//!   stopwatch, scrubbable values, linked Scale, `Nx+N°` Rotation (revolutions and degrees scrub on their own), Reset.
 //! - **Text** (text layers): font family/style, size, leading, tracking, stroke width, fill and
 //!   stroke with enable checkboxes; "More" opens the Character panel.
 //! - **Paragraph** (text layers): the seven alignment buttons; "More" opens the Paragraph panel.
@@ -50,12 +50,6 @@ fn decimals(v: f64) -> usize {
     if (v - v.round()).abs() < 1e-6 { 0 } else { 1 }
 }
 
-/// Rotation as AE shows it: revolutions and remaining degrees (`1x+30°`, `-0x-45°`).
-pub fn split_rotation(deg: f64) -> (i64, f64) {
-    let rev = (deg / 360.0).trunc();
-    (rev as i64, deg - rev * 360.0)
-}
-
 pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let t = app.tokens;
     let p = ui.painter().with_clip_rect(rect);
@@ -63,7 +57,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let comp = app.session.active_comp_arc();
     let layer = comp.as_ref().and_then(|c| app.session.state.selected_layers.first().and_then(|id| c.layer(*id)).cloned());
     let (Some(comp), Some(cid), Some(layer)) = (comp, app.session.active_comp_id(), layer) else {
-        p.text(rect.center(), Align2::CENTER_CENTER, "Select a layer to see its properties", Tokens::ui(12.0), t.text_faint);
+        p.text(rect.center(), Align2::CENTER_CENTER, crate::i18n::tr("Select a layer to see its properties"), Tokens::ui(12.0), t.text_faint);
         return;
     };
     let project = app.session.project.clone();
@@ -72,14 +66,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let ectx = EvalCtx { project: &project, comp_id: cid, comp: &comp, time: now, expr: expr.as_deref(), footage: None };
     let x0 = rect.min.x + PAD;
     let w = rect.width() - 2.0 * PAD;
-    // Vertical scrolling: content height is known after drawing, so clamp with last frame's.
-    let scroll_id = egui::Id::new("props-scroll");
-    let (mut scroll, content_h): (f32, f32) = ui.data(|d| d.get_temp(scroll_id)).unwrap_or((0.0, 0.0));
-    if ui.rect_contains_pointer(rect) {
-        scroll -= ui.input(|i| i.smooth_scroll_delta.y);
-    }
-    scroll = scroll.clamp(0.0, (content_h - rect.height()).max(0.0));
-    let top = rect.min.y + 8.0 - scroll;
+    let scroll = widgets::PanelScroll::begin(ui, egui::Id::new("props-scroll"), rect);
+    let top = rect.min.y + 8.0 - scroll.offset;
     let mut y = top;
     let mut actions: Actions = vec![];
 
@@ -88,7 +76,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         section_header(app, ui, &p, x0, w, y, "Layer Transform", "properties.transform");
         let rr = Rect::from_min_size(pos2(x0 + w - 40.0, y), vec2(40.0, ROW_H));
         let resp = ui.interact(rr, egui::Id::new("props-reset"), Sense::click());
-        p.text(rr.right_center(), Align2::RIGHT_CENTER, "Reset", Tokens::ui(12.0), if resp.hovered() { t.accent_hover } else { t.accent });
+        p.text(rr.right_center(), Align2::RIGHT_CENTER, crate::i18n::tr("Reset"), Tokens::ui(12.0), if resp.hovered() { t.accent_hover } else { t.accent });
         app.auto.add("properties.transform.reset", rr, "Reset Transform");
         if resp.clicked() {
             for pr in tr.props() {
@@ -124,7 +112,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         let resp = ui.interact(br, egui::Id::new("props-add-animator"), Sense::click());
         p.rect_stroke(br, 4.0, Stroke::new(1.0, if resp.hovered() { t.text_dim } else { t.field_border }), egui::StrokeKind::Inside);
         icons::paint(&p, Rect::from_center_size(pos2(br.min.x + 14.0, br.center().y), vec2(10.0, 10.0)), Icon::Plus, t.text);
-        p.text(pos2(br.min.x + 26.0, br.center().y), Align2::LEFT_CENTER, "Add Animator", Tokens::ui(12.0), t.text);
+        p.text(pos2(br.min.x + 26.0, br.center().y), Align2::LEFT_CENTER, crate::i18n::tr("Add Animator"), Tokens::ui(12.0), t.text);
         app.auto.add("properties.addAnimator", br, "Add Animator");
         let pop = egui::Id::new("props-add-animator-pop");
         if resp.clicked() {
@@ -144,7 +132,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         let pr = Rect::from_min_size(pos2(br.max.x + 8.0, y), vec2(84.0, 24.0));
         let presp = ui.interact(pr, egui::Id::new("props-text-presets"), Sense::click());
         p.rect_stroke(pr, 4.0, Stroke::new(1.0, if presp.hovered() { t.text_dim } else { t.field_border }), egui::StrokeKind::Inside);
-        p.text(pr.center(), Align2::CENTER_CENTER, "Presets", Tokens::ui(12.0), t.text);
+        p.text(pr.center(), Align2::CENTER_CENTER, crate::i18n::tr("Presets"), Tokens::ui(12.0), t.text);
         app.auto.add("properties.textPresets", pr, "Text Animation Presets");
         let ppop = egui::Id::new("props-text-presets-pop");
         if presp.clicked() {
@@ -159,15 +147,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     }
 
     y += 40.0;
-    let content_h = y - top;
-    ui.data_mut(|d| d.insert_temp(scroll_id, (scroll, content_h)));
-    if content_h > rect.height() {
-        // Thin scroll indicator.
-        let frac = rect.height() / content_h;
-        let bar_h = (rect.height() * frac).max(24.0);
-        let by = rect.min.y + (rect.height() - bar_h) * (scroll / (content_h - rect.height()).max(1.0));
-        p.rect_filled(Rect::from_min_size(pos2(rect.max.x - 5.0, by), vec2(3.0, bar_h)), 1.5, t.text_faint.gamma_multiply(0.6));
-    }
+    scroll.end(ui, &mut app.auto, "properties.scroll", y - top, &t);
     for (id, params) in actions {
         let params = match &text_target {
             Some(tt) if id == "layer.setText" => tt.params(params),
@@ -259,15 +239,12 @@ fn transform_row(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter,
     let suffix = if pct { "%" } else { "" };
     match &value {
         Value::Scalar(v) if pr.name == "Rotation" || pr.name.ends_with(" Rotation") => {
-            let (rev, deg) = split_rotation(*v);
-            let g = p.layout_no_wrap(format!("{rev}x{}", if deg < 0.0 { "" } else { "+" }), Tokens::ui(12.0), t.hot_text);
-            let gw = g.size().x;
-            p.galley(pos2(vx + 2.0, cy - g.size().y / 2.0), g, t.hot_text);
-            let (vr, nv, _) =
-                widgets::hot_number_at(ui, pos2(vx + gw, cy - 9.0), egui::Id::new(("props-v", uid)), deg, 0.5, (-1e9, 1e9), decimals(deg), "°", &t);
-            app.auto.add(&format!("{base}.value"), vr, &pr.name);
+            let (_, deg) = super::fx_widgets::split_angle(*v);
+            let (rr, dr, nv) = super::fx_widgets::angle_field(ui, pos2(vx, cy - 9.0), egui::Id::new(("props-v", uid)), *v, decimals(deg), &t);
+            app.auto.add(&format!("{base}.value"), dr, &pr.name);
+            app.auto.add(&format!("{base}.revolutions"), rr, &pr.name);
             if let Some(nv) = nv {
-                set(actions, json!(rev as f64 * 360.0 + nv));
+                set(actions, json!(nv));
             }
         }
         Value::Scalar(v) => {
@@ -345,9 +322,10 @@ fn text_section(
         widgets::open_popup(ui, pop);
     }
     app.auto.add("properties.text.font", fr, "Font family");
-    let fams: Vec<String> = effectcraft_engine::text_families();
-    if let Some(i) = widgets::popup_menu(ui, pop, fr.left_bottom(), &fams, fams.iter().position(|f| *f == doc.font)) {
-        set(actions, json!({"font": fams[i]}));
+    // Every installed family (built only while the menu is open: it can be long).
+    let fams: Vec<String> = if widgets::popup_is_open(ui, pop) { effectcraft_engine::text_families() } else { vec![] };
+    if let Some(f) = widgets::popup_menu(ui, pop, fr.left_bottom(), &fams, fams.iter().position(|f| *f == doc.font)).and_then(|i| fams.get(i)) {
+        set(actions, json!({"font": f}));
     }
     y += 28.0;
     let sr = Rect::from_min_size(pos2(x0, y), vec2(w, 22.0));
@@ -356,9 +334,10 @@ fn text_section(
         widgets::open_popup(ui, spop);
     }
     app.auto.add("properties.text.style", sr, "Font style");
-    let styles: Vec<String> = ["Regular", "Medium", "SemiBold", "Bold", "Italic"].iter().map(|s| s.to_string()).collect();
-    if let Some(i) = widgets::popup_menu(ui, spop, sr.left_bottom(), &styles, styles.iter().position(|s| *s == doc.style)) {
-        set(actions, json!({"style": styles[i]}));
+    // The family's own styles.
+    let styles: Vec<String> = if widgets::popup_is_open(ui, spop) { effectcraft_engine::font_styles(&doc.font) } else { vec![] };
+    if let Some(st) = widgets::popup_menu(ui, spop, sr.left_bottom(), &styles, styles.iter().position(|s| *s == doc.style)).and_then(|i| styles.get(i)) {
+        set(actions, json!({"style": st}));
     }
     y += 32.0;
     // Size / leading, tracking / stroke width.
@@ -383,7 +362,13 @@ fn text_section(
             p.text(pos2(col2, y + 9.0), Align2::LEFT_CENTER, "A", Tokens::semibold(11.0), t.text_dim);
             let r = Rect::from_min_size(pos2(col2 + 26.0, y), vec2(40.0, 18.0));
             let resp = ui.interact(r, egui::Id::new("props-leading-auto"), Sense::click());
-            p.text(pos2(r.min.x + 2.0, r.center().y), Align2::LEFT_CENTER, "Auto", Tokens::ui(12.0), if resp.hovered() { t.accent_hover } else { t.hot_text });
+            p.text(
+                pos2(r.min.x + 2.0, r.center().y),
+                Align2::LEFT_CENTER,
+                crate::i18n::tr("Auto"),
+                Tokens::ui(12.0),
+                if resp.hovered() { t.accent_hover } else { t.hot_text },
+            );
             app.auto.add("properties.text.leading", r, "leading");
             if resp.clicked() {
                 set(actions, json!({"leading": (doc.size * 1.2).round()}));
@@ -501,7 +486,7 @@ fn more_button(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, x
     let resp = ui.interact(r, egui::Id::new(id), Sense::click());
     p.rect_filled(r, 4.0, if resp.hovered() { t.hover } else { t.field_bg });
     p.text(pos2(r.min.x + 8.0, r.center().y), Align2::LEFT_CENTER, "···", Tokens::semibold(12.0), t.text);
-    p.text(pos2(r.min.x + 26.0, r.center().y), Align2::LEFT_CENTER, "More", Tokens::ui(12.0), t.text);
+    p.text(pos2(r.min.x + 26.0, r.center().y), Align2::LEFT_CENTER, crate::i18n::tr("More"), Tokens::ui(12.0), t.text);
     app.auto.add(auto, r, "More");
     if resp.clicked() {
         app.show_panel(panel);
@@ -512,14 +497,6 @@ fn more_button(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, x
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn rotation_splits_like_ae() {
-        assert_eq!(split_rotation(0.0), (0, 0.0));
-        assert_eq!(split_rotation(390.0), (1, 30.0));
-        assert_eq!(split_rotation(-45.0), (0, -45.0));
-        assert_eq!(split_rotation(-725.0), (-2, -5.0));
-    }
 
     #[test]
     fn decimals_hide_whole_numbers() {

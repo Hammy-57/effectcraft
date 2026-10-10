@@ -9,19 +9,24 @@
 //! effectcraft-cli props <comp> <layer> [--flat] [--time S]    a layer's property tree (with paths)
 //! effectcraft-cli get <comp> <layer> <path> [--time S]        read a property
 //! effectcraft-cli set <comp> <layer> <path> <value> [--time S] [--expression E]
-//! effectcraft-cli render-frame [--comp C] [--time S|--frame N] [--max-side PX|--scale K] [--out F.png]
+//! effectcraft-cli render-frame [--comp C] [--time S|--frame N] [--max-side PX|--scale K] [--out F.png] [--transparent]
 //! effectcraft-cli render [--comp C] --out FILE [--format h264|hevc|av1|prores|webm|png|jpeg|tiff|exr|gif|wav|aiff] [--start S] [--end S]
 //!     [--work-area] [--fps N] [--resolution full|half|third|quarter|K] [--quality best|draft] [--channels rgb|rgba]
 //!     [--jpeg-quality N] [--bitrate KBPS] [--prores proxy|lt|standard|hq|4444|4444xq] [--audio auto|on|off]
 //!     [--profile main|main10] [--level auto|4.1] [--rate-control bitrate|quality] [--video-quality 1-100]
 //!     [--keyint FRAMES] [--webm-codec vp9|av1] [--audio-bitrate KBPS] [--opus-app audio|voice]
+//!     (a relative --out is relative to the working directory; --queue outputs follow the project's own settings)
 //! effectcraft-cli render F.ecproj --queue                    render the project's Render Queue
+//! effectcraft-cli compare A.png B.png [--threshold L] [--min-psnr DB] [--max-side PX] [--diff D.png]
+//!     compare two images (goldens, After Effects references): metrics; exit 1 when they differ
 //! effectcraft-cli bench [--comp C] [--time S] [--scale K] [--n N] [--play N] [--gpu [--adv3d]]   render timings
 //!     (--gpu: CPU vs GPU ms/frame for every comp at Full and Half)
 //! effectcraft-cli bench --ops [--small] [--layers N] [--comps N] [--footage N]   everyday-operation timings
 //!     on a large generated project (open, save, auto-save, undo/redo, timeline, Project panel)
 //! effectcraft-cli script FILE.jsx [F.ecproj] | --eval CODE    run an After Effects-style script
-//! effectcraft-cli mcp [--bridge PORT]                         MCP server on stdio
+//! effectcraft-cli replay SCRIPT.jsonl [--keep-going]        replay a repro script (docs/agents.md)
+//! effectcraft-cli mcp [--autosave | --bridge PORT]            MCP server on stdio
+//! effectcraft-cli figma-bridge [--port 7789] [--control 9877] local endpoint for the Figma plug-in
 //!
 //! Project:  --project F.ecproj (or a positional *.ecproj) | --demo | --empty   (default: demo; mcp: empty)
 //! Saving:   --save (back to --project) | --save-as F.ecproj
@@ -36,11 +41,57 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+use std::io::Write;
+
+mod figma_bridge;
+
 use effectcraft_automation::tools::{self, Reply};
 use effectcraft_automation::{Backend, McpServer};
 use serde_json::{Value, json};
 
-const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|set|render-frame|render|script|mcp> [args] [--json]
+/// `println!` that never panics: see [`write_line`].
+macro_rules! say {
+    ($($t:tt)*) => {
+        write_line(format_args!($($t)*))
+    };
+}
+
+/// `eprintln!` that never panics: a diagnostic that can't be written is dropped.
+macro_rules! note {
+    ($($t:tt)*) => {{
+        let _ = writeln!(std::io::stderr(), $($t)*);
+    }};
+}
+
+/// Why stdout stopped taking output, once it has.
+static STDOUT_FAILED: std::sync::OnceLock<std::io::ErrorKind> = std::sync::OnceLock::new();
+
+/// Write a line to stdout. Once that fails, later output is dropped but the command still
+/// finishes its work (a `run … --save` sequence isn't cut short). A reader that closes stdout
+/// early (`info --json | head`) has read what it wanted; any other failure is reported and makes
+/// the exit status 1 ([`stdout_broken`]).
+fn write_line(text: std::fmt::Arguments) {
+    if STDOUT_FAILED.get().is_some() {
+        return;
+    }
+    let r = {
+        let mut out = std::io::stdout().lock();
+        out.write_fmt(text).and_then(|()| out.write_all(b"\n"))
+    };
+    if let Err(e) = r {
+        let _ = STDOUT_FAILED.set(e.kind());
+        if e.kind() != std::io::ErrorKind::BrokenPipe {
+            note!("effectcraft-cli: cannot write to stdout: {e}");
+        }
+    }
+}
+
+/// Whether stdout failed for a reason other than its reader closing it early.
+fn stdout_broken() -> bool {
+    STDOUT_FAILED.get().is_some_and(|k| *k != std::io::ErrorKind::BrokenPipe)
+}
+
+const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|set|render-frame|render|compare|script|replay|mcp|figma-bridge> [args] [--json]
   info                                     project + engine summary
   commands [--filter TEXT] [--enabled]     list engine commands
   exec <command-id> [--params JSON]        run one engine command (exec --list: list them, as `commands`)
@@ -48,7 +99,7 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
   props <comp> <layer> [--flat] [--time S] a layer's property tree with paths
   get <comp> <layer> <path> [--time S]     read a property
   set <comp> <layer> <path> <value> [--time S] [--expression E]
-  render-frame [--comp C] [--time S | --frame N] [--max-side PX | --scale K] [--out F.png]
+  render-frame [--comp C] [--time S | --frame N] [--max-side PX | --scale K] [--out F.png] [--transparent]
   render [--comp C] --out FILE [--format F] [--start S] [--end S] [--work-area] [--fps N]
          [--resolution full|half|third|quarter|K] [--quality best|draft] [--channels rgb|rgba]
          [--jpeg-quality N] [--bitrate KBPS] [--prores PROFILE] [--audio auto|on|off]
@@ -56,6 +107,10 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
          [--keyint FRAMES] [--webm-codec vp9|av1] [--audio-bitrate KBPS] [--opus-app audio|voice] | --queue
                                            (formats h264|hevc|av1|prores|webm|png|jpeg|tiff|exr|gif|wav|aiff;
                                            --profile..--keyint: HEVC / AV1, --audio-bitrate/--opus-app: WebM Opus)
+                                           a relative --out is relative to the working directory
+  compare A.png B.png [--threshold L] [--min-psnr DB] [--max-side PX] [--amplify K] [--diff D.png]
+                                           compare two PNG/JPEG images (max/mean abs diff, PSNR, SSIM, changed
+                                           pixels; --diff writes a heatmap); exit 1 when they don't pass
   bench [--comp C] [--time S] [--scale K] [--n N] [--play N] [--gpu [--adv3d]]   per-layer/effect render timings;
                                            --play N renders N consecutive frames with/without the layer cache;
                                            --gpu compares CPU and GPU ms/frame for every comp at Full and Half
@@ -65,7 +120,13 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
   script FILE.jsx [F.ecproj] | --eval CODE run JavaScript with the After Effects-style object model
                                            (app.project, comps, layers, properties…); prints writeLn
                                            output and the result; errors exit 1 with file:line:col
-  mcp [--bridge PORT]                      MCP server (JSON-RPC over stdio)
+  replay SCRIPT.jsonl [--keep-going]       replay a repro script headless (journal.export, crash repros):
+                                           per-step ok/error and the first failure; exits 1 when a step
+                                           fails, an expectation is not met or a command panics
+  mcp [--autosave | --bridge PORT]         MCP server (JSON-RPC over stdio); --autosave preserves unsaved headless work
+  figma-bridge [--port 7789] [--control 9877] [--code CODE]
+                                           local endpoint for the EffectCraft Figma plug-in: imports what it
+                                           sends into the running app (file.importFigma); prints the pairing code
 options: --project F.ecproj | --demo | --empty   --save | --save-as F   --bridge PORT   --json   --gpu
 <comp>: id or name, '-' = active comp; <layer>: id, '#n' or name; <value>: JSON or bare string";
 
@@ -90,6 +151,14 @@ const VALUED: &[&str] = &[
     "--expression",
     "--depth",
     "--eval",
+    "--port",
+    "--control",
+    "--code",
+    // compare
+    "--threshold",
+    "--min-psnr",
+    "--diff",
+    "--amplify",
     // render
     "--format",
     "--start",
@@ -112,6 +181,27 @@ const VALUED: &[&str] = &[
     "--opus-app",
 ];
 
+/// Options without a value. Any other `--option` is a usage error.
+const FLAGS: &[&str] = &[
+    "--json",
+    "--save",
+    "--demo",
+    "--empty",
+    "--gpu",
+    "--list",
+    "--schemas",
+    "--enabled",
+    "--flat",
+    "--transparent",
+    "--work-area",
+    "--queue",
+    "--ops",
+    "--small",
+    "--adv3d",
+    "--autosave",
+    "--keep-going",
+];
+
 struct Args {
     pos: Vec<String>,
     opts: Vec<(String, Option<String>)>,
@@ -121,7 +211,7 @@ struct Args {
 
 impl Args {
     fn parse(raw: Vec<String>) -> Result<Args, String> {
-        let (mut pos, mut opts) = (vec![], vec![]);
+        let (mut pos, mut opts, mut unknown) = (vec![], vec![], vec![]);
         let mut it = raw.into_iter();
         while let Some(a) = it.next() {
             if a.starts_with("--") && a.len() > 2 {
@@ -132,12 +222,22 @@ impl Args {
                 if VALUED.contains(&k.as_str()) {
                     let v = inline.or_else(|| it.next()).ok_or_else(|| format!("{k} needs a value"))?;
                     opts.push((k, Some(v)));
+                } else if !FLAGS.contains(&k.as_str()) {
+                    unknown.push(format!("`{k}`"));
+                } else if inline.is_some() {
+                    return Err(format!("{k} takes no value"));
                 } else {
                     opts.push((k, None));
                 }
             } else {
                 pos.push(a);
             }
+        }
+        // Before anything runs: a misspelt option must not run the command with defaults, or
+        // leave its value behind as a positional (`--saveas x.ecproj` opening x.ecproj).
+        if !unknown.is_empty() {
+            let s = if unknown.len() == 1 { "" } else { "s" };
+            return Err(format!("unknown option{s} {}", unknown.join(", ")));
         }
         let mut a = Args { pos, opts, project: None };
         a.project = match a.opt("--project") {
@@ -173,11 +273,11 @@ fn value_arg(s: &str) -> Value {
 fn main() {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     if matches!(raw.first().map(String::as_str), Some("--version" | "-V" | "version")) {
-        println!("effectcraft-cli {}", env!("CARGO_PKG_VERSION"));
+        say!("effectcraft-cli {}", env!("CARGO_PKG_VERSION"));
         return;
     }
     if raw.is_empty() || raw.iter().any(|a| a == "-h" || a == "--help") {
-        println!("{USAGE}");
+        say!("{USAGE}");
         std::process::exit(if raw.is_empty() { 2 } else { 0 });
     }
     let mut args = match Args::parse(raw) {
@@ -190,20 +290,21 @@ fn main() {
     }
     let cmd = args.pos.remove(0);
     match run(&cmd, &args, json_out) {
+        Ok(()) if stdout_broken() => std::process::exit(1),
         Ok(()) => {}
         Err(Failure::Usage(e)) => fail_usage(&e),
         Err(Failure::Error(e)) => {
             if json_out {
-                println!("{}", json!({"error": e}));
+                say!("{}", json!({"error": e}));
             }
-            eprintln!("effectcraft-cli {cmd}: {e}");
+            note!("effectcraft-cli {cmd}: {e}");
             std::process::exit(1);
         }
     }
 }
 
 fn fail_usage(e: &str) -> ! {
-    eprintln!("effectcraft-cli: {e}\n{USAGE}");
+    note!("effectcraft-cli: {e}\n{USAGE}");
     std::process::exit(2)
 }
 
@@ -247,9 +348,22 @@ fn backend(args: &Args, default_demo: bool) -> Result<Backend, Failure> {
 /// renderer setting, Mercury GPU Acceleration by default).
 fn session(args: &Args) -> Result<effectcraft_engine::Session, Failure> {
     let mut s = effectcraft_host::session();
+    if args.flag("--autosave") {
+        let dir = effectcraft_host::config_dir().ok_or_else(|| Failure::Error("--autosave: no config directory; set EFFECTCRAFT_CONFIG_DIR".into()))?;
+        // Read only auto-save settings. Opting in must not change headless rendering or load
+        // the desktop's models, shortcuts, disk cache or recovery sentinel.
+        use effectcraft_engine::config::ConfigStore;
+        let config = effectcraft_engine::config::DirConfig::new(dir);
+        if let Some(text) = config.read(effectcraft_engine::prefs::PREFS_FILE) {
+            s.prefs.auto_save = effectcraft_engine::prefs::Prefs::from_json(&text).auto_save;
+        }
+        s.prefs.normalize();
+    }
     if args.flag("--gpu") {
-        let g = effectcraft_gpu::Gpu::headless().ok_or_else(|| Failure::Error("--gpu: no usable GPU adapter".into()))?;
+        let g = effectcraft_gpu::Gpu::try_headless().map_err(|e| Failure::Error(format!("--gpu: no usable GPU adapter ({e})")))?;
         s.accel = Some(std::sync::Arc::new(g));
+    } else {
+        s.accel_note = Some("headless: renders on the CPU unless started with --gpu".into());
     }
     Ok(s)
 }
@@ -292,13 +406,13 @@ fn script_cmd(args: &Args, json_out: bool) -> Result<(), Failure> {
         emit(&o, true);
     } else {
         if let Some(out) = r["output"].as_str().filter(|o| !o.is_empty()) {
-            println!("{out}");
+            say!("{out}");
         }
         if !r["result"].is_null() && r["error"].is_null() {
-            println!("{}", r["result"]);
+            say!("{}", r["result"]);
         }
         if let Some(p) = saved {
-            eprintln!("saved {p}");
+            note!("saved {p}");
         }
     }
     if let Some(e) = r.get("error").filter(|e| !e.is_null()) {
@@ -316,19 +430,81 @@ fn script_cmd(args: &Args, json_out: bool) -> Result<(), Failure> {
     Ok(())
 }
 
+/// `replay SCRIPT.jsonl`: run a repro script against a headless session (its start line picks
+/// the project) and report every step. Exits 1 when the replay fails.
+fn replay_cmd(args: &Args, json_out: bool) -> Result<(), Failure> {
+    use effectcraft_engine::replay;
+    let Some(file) = args.pos.first() else { return usage_err("replay needs a .jsonl script") };
+    if args.opt("--bridge").is_some() || args.project.is_some() || args.flag("--demo") || args.flag("--empty") {
+        return usage_err("replay runs headless from the script's start line ({\"start\": \"new\" | \"demo\" | {\"project\": path}})");
+    }
+    let path = std::path::Path::new(file);
+    let size = std::fs::metadata(path).map_err(|e| Failure::Error(format!("cannot read {file}: {e}")))?.len();
+    if size > replay::MAX_SCRIPT_BYTES as u64 {
+        return Err(Failure::Error(format!("{file} is larger than {} MB", replay::MAX_SCRIPT_BYTES >> 20)));
+    }
+    let script = std::fs::read_to_string(path).map_err(|e| Failure::Error(format!("cannot read {file}: {e}")))?;
+    let mut s = session(args)?;
+    let opts = replay::Options { keep_going: args.flag("--keep-going"), base_dir: path.parent().map(std::path::Path::to_path_buf) };
+    let report = replay::run(&mut s, &script, &opts);
+    if json_out {
+        emit(&serde_json::to_value(&report).unwrap_or_else(|e| json!({"error": e.to_string()})), true);
+    } else {
+        for st in &report.steps {
+            let what = st.command.as_deref().unwrap_or(st.kind);
+            match (&st.error, st.ok) {
+                (None, _) => say!("line {:>4}  ok    {what}", st.line),
+                (Some(e), true) => say!("line {:>4}  ok    {what} (tolerated error: {e})", st.line),
+                (Some(e), false) => say!("line {:>4}  FAIL  {what}: {e}", st.line),
+            }
+        }
+    }
+    let Some(first) = &report.first_failure else {
+        if !json_out {
+            say!("replay ok: {} steps", report.steps.len());
+        }
+        return Ok(());
+    };
+    let msg = format!(
+        "failed at line {} ({}){}: {}{}",
+        first.line,
+        first.command.as_deref().unwrap_or(first.kind),
+        if report.panicked { ", a command panicked" } else { "" },
+        first.error.as_deref().unwrap_or(""),
+        if report.skipped > 0 { format!(" ({} later steps not run)", report.skipped) } else { String::new() }
+    );
+    if json_out {
+        note!("effectcraft-cli replay: {msg}");
+        std::process::exit(1);
+    }
+    Err(Failure::Error(msg))
+}
+
 /// Print a result: compact JSON with `--json`, else pretty JSON.
 fn emit(v: &Value, json_out: bool) {
     if json_out {
-        println!("{v}");
+        say!("{v}");
     } else {
-        println!("{}", serde_json::to_string_pretty(v).unwrap_or_default());
+        say!("{}", serde_json::to_string_pretty(v).unwrap_or_default());
     }
 }
 
 fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
+    if args.flag("--autosave") && cmd != "mcp" {
+        return usage_err("--autosave is only supported by mcp");
+    }
     match cmd {
         "render" => render(args, json_out)?,
+        "figma-bridge" => {
+            let port = match args.opt("--port") {
+                Some(p) => p.parse::<u16>().map_err(|_| Failure::Usage(format!("--port: not a port: {p}")))?,
+                None => 7789,
+            };
+            let control = args.opt("--control").or(args.opt("--bridge")).unwrap_or("9877").to_string();
+            figma_bridge::serve(figma_bridge::Config { port, control, code: args.opt("--code").map(str::to_string) })?;
+        }
         "bench" => bench_cmd(args)?,
+        "compare" => compare_cmd(args, json_out)?,
         "info" => {
             let mut b = backend(args, true)?;
             let p = tool(&mut b, "get_project", json!({}))?;
@@ -344,19 +520,19 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
             if json_out {
                 emit(&info, true);
             } else {
-                println!(
+                say!(
                     "EffectCraft {} ({}), {} commands, {} effects",
                     info["version"].as_str().unwrap_or(""),
                     info["mode"].as_str().unwrap_or(""),
                     info["commands"],
                     info["effects"]
                 );
-                println!("project: {}", p["path"].as_str().unwrap_or("(unsaved)"));
+                say!("project: {}", p["path"].as_str().unwrap_or("(unsaved)"));
                 for i in p["items"].as_array().into_iter().flatten() {
-                    println!("  item {:>3}  {:<12} {}", i["id"], i["type"].as_str().unwrap_or(""), i["name"].as_str().unwrap_or(""));
+                    say!("  item {:>3}  {:<12} {}", i["id"], i["type"].as_str().unwrap_or(""), i["name"].as_str().unwrap_or(""));
                 }
                 if let Some(c) = comp {
-                    println!(
+                    say!(
                         "active comp {} \"{}\" {}x{} @ {} fps, {} s",
                         c["id"],
                         c["name"].as_str().unwrap_or(""),
@@ -366,7 +542,7 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
                         c["duration"]
                     );
                     for l in c["layers"].as_array().into_iter().flatten() {
-                        println!("  #{:<3} id {:<4} {:<10} {}", l["index"], l["id"], l["type"].as_str().unwrap_or(""), l["name"].as_str().unwrap_or(""));
+                        say!("  #{:<3} id {:<4} {:<10} {}", l["index"], l["id"], l["type"].as_str().unwrap_or(""), l["name"].as_str().unwrap_or(""));
                     }
                 }
             }
@@ -374,6 +550,7 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
         "commands" => list_commands_cmd(args, json_out)?,
         "exec" if args.flag("--list") => list_commands_cmd(args, json_out)?,
         "script" => script_cmd(args, json_out)?,
+        "replay" => replay_cmd(args, json_out)?,
         "exec" => {
             let Some(id) = args.pos.first().cloned() else { return usage_err("exec needs a command id") };
             let params = match (args.opt("--params"), args.pos.get(1).map(String::as_str)) {
@@ -422,7 +599,7 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
             if json_out {
                 emit(&v, true);
             } else {
-                println!("layer {} \"{}\" ({}) at {} s", v["id"], v["name"].as_str().unwrap_or(""), v["type"].as_str().unwrap_or(""), v["time"]);
+                say!("layer {} \"{}\" ({}) at {} s", v["id"], v["name"].as_str().unwrap_or(""), v["type"].as_str().unwrap_or(""), v["time"]);
                 for p in v["properties"].as_array().into_iter().flatten() {
                     let mut extra = String::new();
                     if let Some(k) = p.get("keys") {
@@ -431,7 +608,7 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
                     if let Some(e) = p.get("expression").and_then(Value::as_str) {
                         extra += &format!("  expr: {e}");
                     }
-                    println!("  {:<44} {:<8} {}{extra}", p["path"].as_str().unwrap_or(""), p["type"].as_str().unwrap_or(""), p["value"]);
+                    say!("  {:<44} {:<8} {}{extra}", p["path"].as_str().unwrap_or(""), p["type"].as_str().unwrap_or(""), p["value"]);
                 }
             }
         }
@@ -461,12 +638,16 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
             let comp = args.opt("--comp").and_then(reference);
             let mut time = args.num("--time")?;
             let mut max_side = args.num("--max-side")?.map(|m| m as u32).unwrap_or(0);
-            let needs_info = args.opt("--frame").is_some() || args.opt("--scale").is_some();
+            let needs_info = time.is_some() || args.opt("--frame").is_some() || args.opt("--scale").is_some();
             if needs_info {
                 let c = tool(&mut b, "get_comp", json!({"comp": comp}))?;
+                let fps = c["frameRate"].as_f64().filter(|r| r.is_finite() && *r > 0.0).unwrap_or(30.0);
                 if let Some(f) = args.num("--frame")? {
-                    time = Some(f / c["frameRate"].as_f64().unwrap_or(30.0));
+                    time = Some(f / fps);
                 }
+                // A time printed in rounded seconds ("1.483333" for frame 89 at 60 fps) means that
+                // frame, not the instant just before it where layers cut at the frame still show.
+                time = time.map(|t| snap_to_frame(t, fps));
                 if let Some(k) = args.num("--scale")? {
                     let long = c["width"].as_f64().unwrap_or(0.0).max(c["height"].as_f64().unwrap_or(0.0));
                     max_side = (long * k).round().max(1.0) as u32;
@@ -474,23 +655,87 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
             }
             let out = args.opt("--out").unwrap_or("frame.png").to_string();
             let t0 = std::time::Instant::now();
-            let f = b.render(comp.as_ref(), time, max_side)?;
+            let f = b.render_with(comp.as_ref(), time, max_side, args.flag("--transparent"))?;
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
             std::fs::write(&out, &f.png).map_err(|e| format!("cannot write {out}: {e}"))?;
             let info = json!({"path": out, "comp": f.comp, "time": f.time, "width": f.width, "height": f.height, "ms": (ms * 10.0).round() / 10.0});
             if json_out {
                 emit(&info, true);
             } else {
-                eprintln!("rendered {}x{} at {:.3}s in {ms:.1} ms -> {out}", f.width, f.height, f.time);
+                note!("rendered {}x{} at {:.3}s in {ms:.1} ms -> {out}", f.width, f.height, f.time);
             }
         }
         "mcp" => {
+            if args.flag("--autosave") && args.opt("--bridge").is_some() {
+                return usage_err("--autosave is for headless MCP; the bridged app owns its auto-saves");
+            }
             let b = backend(args, false)?;
-            McpServer::new(b).serve_stdio().map_err(|e| e.to_string())?;
+            let server = McpServer::new(b);
+            let mut server = if args.flag("--autosave") {
+                let root =
+                    effectcraft_host::config_dir().ok_or_else(|| Failure::Error("--autosave: no config directory; set EFFECTCRAFT_CONFIG_DIR".into()))?;
+                server.with_autosave(&root)?
+            } else {
+                server
+            };
+            // A client that closes its end of stdout has ended the session.
+            match server.serve_stdio() {
+                Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => return Err(e.to_string().into()),
+                _ => {}
+            }
         }
         other => return usage_err(&format!("unknown subcommand `{other}`")),
     }
     Ok(())
+}
+
+/// `compare A B`: `render.compare` on two image files in an empty headless session. Prints the
+/// metrics; exits 1 when the images don't pass (golden tests and AE fidelity checks).
+fn compare_cmd(args: &Args, json_out: bool) -> Result<(), Failure> {
+    let [a, b] = positional::<2>(args, "compare <a.png> <b.png> [--threshold L] [--min-psnr DB] [--max-side PX] [--diff D.png]")?;
+    let mut p = json!({"a": {"path": a}, "b": {"path": b}});
+    for (opt, key) in [("--threshold", "threshold"), ("--min-psnr", "min_psnr"), ("--amplify", "amplify")] {
+        if let Some(v) = args.num(opt)? {
+            p[key] = json!(v);
+        }
+    }
+    if let Some(m) = args.num("--max-side")? {
+        p["max_side"] = json!(m.max(0.0) as u64);
+    }
+    if let Some(d) = args.opt("--diff") {
+        p["diff_path"] = json!(d);
+    }
+    let mut bk = Backend::headless(session(args)?);
+    let r = bk.exec("render.compare", p)?;
+    let pass = r["pass"].as_bool().unwrap_or(false);
+    if json_out {
+        emit(&r, true);
+    } else {
+        say!(
+            "{} {}x{}  max {} mean {} psnr {} dB ssim {} changed {}% ({} px){}",
+            if pass { "PASS" } else { "FAIL" },
+            r["width"],
+            r["height"],
+            r["max_abs"],
+            r["mean_abs"],
+            r["psnr_db"].as_str().map(str::to_string).unwrap_or_else(|| r["psnr_db"].to_string()),
+            r["ssim"],
+            r["changed_pct"],
+            r["changed_pixels"],
+            r["diff_path"].as_str().map(|d| format!("  diff -> {d}")).unwrap_or_default()
+        );
+    }
+    if !pass {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// `t` (seconds) moved onto the nearest frame of a `fps` grid when it is within 1/1000 frame of it.
+fn snap_to_frame(t: f64, fps: f64) -> f64 {
+    let f = t * fps;
+    let r = f.round();
+    if (f - r).abs() < 1e-3 { r / fps } else { t }
 }
 
 fn positional<const N: usize>(args: &Args, usage: &str) -> Result<[String; N], Failure> {
@@ -505,6 +750,12 @@ fn with_saved(v: Value, saved: Option<String>) -> Value {
         None => v,
         Some(p) => json!({"result": v, "saved": p}),
     }
+}
+
+/// A relative `--out` is relative to the working directory, like `--project` and every other CLI
+/// path. The Render Queue alone would resolve it against the project's folder.
+fn from_cwd(path: &str) -> Result<String, Failure> {
+    std::path::absolute(path).map(|p| p.to_string_lossy().into_owned()).map_err(|e| Failure::Error(format!("render: cannot resolve --out {path}: {e}")))
 }
 
 /// `render`: queue `--comp` (or the active comp) with the given settings unless `--queue`, then
@@ -522,6 +773,7 @@ fn render(args: &Args, json_out: bool) -> Result<(), Failure> {
     let err = |e: effectcraft_engine::EngineError| Failure::Error(e.to_string());
     if !args.flag("--queue") {
         let Some(out) = args.opt("--out") else { return usage_err("render: --out FILE is required (or --queue)") };
+        let out = &from_cwd(out)?;
         let mut p = json!({"output": out});
         if let Some(c) = args.opt("--comp") {
             p["comp"] = json!(c);
@@ -577,7 +829,7 @@ fn render(args: &Args, json_out: bool) -> Result<(), Failure> {
             let _ = s.execute("renderQueue.setRender", json!({"index": k + 1, "render": false}));
         }
         let r = s.execute("renderQueue.add", p).map_err(err)?;
-        eprintln!(
+        note!(
             "{} → {} ({}×{}, {} frames, {})",
             r["compName"].as_str().unwrap_or("?"),
             r["outputPath"].as_str().unwrap_or("?"),
@@ -593,7 +845,8 @@ fn render(args: &Args, json_out: bool) -> Result<(), Failure> {
         std::thread::sleep(std::time::Duration::from_millis(100));
         if tty && let Some(p) = s.render_progress() {
             let left = p.remaining.map(|r| format!(", ~{r:.1}s left")).unwrap_or_default();
-            eprint!(
+            let _ = write!(
+                std::io::stderr(),
                 "
   [{}/{}] frame {}/{}  {:.1}s{left}\x1b[K",
                 (p.items_done + 1).min(p.items_total),
@@ -607,7 +860,7 @@ fn render(args: &Args, json_out: bool) -> Result<(), Failure> {
     }
     s.poll_render();
     if tty {
-        eprintln!();
+        note!();
     }
     let mut results = vec![];
     let mut failed = vec![];
@@ -615,7 +868,7 @@ fn render(args: &Args, json_out: bool) -> Result<(), Failure> {
         let name = s.project.item(it.comp).map(|i| i.name.clone()).unwrap_or_else(|| "?".into());
         match &it.status {
             RenderStatus::Done => {
-                eprintln!("done: {name} → {} in {:.2}s", it.last_output.as_deref().unwrap_or("?"), it.render_time.unwrap_or(0.0));
+                note!("done: {name} → {} in {:.2}s", it.last_output.as_deref().unwrap_or("?"), it.render_time.unwrap_or(0.0));
                 results.push(json!({"comp": name, "output": it.last_output, "seconds": it.render_time}));
             }
             RenderStatus::Failed(e) => failed.push(format!("{name}: {e}")),
@@ -640,7 +893,7 @@ fn list_commands_cmd(args: &Args, json_out: bool) -> Result<(), Failure> {
         emit(&v, true);
     } else {
         for c in v.as_array().into_iter().flatten() {
-            println!(
+            say!(
                 "{:<36} {:<36} {:<16} {}",
                 c["id"].as_str().unwrap_or(""),
                 c["label"].as_str().unwrap_or(""),
@@ -708,7 +961,7 @@ fn bench_ops(args: &Args) -> Result<(), Failure> {
     m.extend(effectcraft_ui_egui::bench::ui_ops(|| {
         let mut s = effectcraft_host::session();
         if let Err(e) = s.execute("file.open", json!({"path": path})) {
-            eprintln!("bench --ops: {e}");
+            note!("bench --ops: {e}");
         }
         s
     }));
@@ -716,9 +969,9 @@ fn bench_ops(args: &Args) -> Result<(), Failure> {
     if args.flag("--json") {
         emit(&json!({"spec": format!("{spec:?}"), "measures": m.iter().map(perf::Measure::json).collect::<Vec<_>>()}), true);
     } else {
-        println!("bench --ops: {} comps, {} layers in Main, {} footage items", spec.comps, spec.main_layers, spec.footage);
+        say!("bench --ops: {} comps, {} layers in Main, {} footage items", spec.comps, spec.main_layers, spec.footage);
         for x in &m {
-            println!("  {:<22} {:>10.2} ms  {}", x.name, x.ms, x.note);
+            say!("  {:<22} {:>10.2} ms  {}", x.name, x.ms, x.note);
         }
     }
     Ok(())
@@ -788,7 +1041,7 @@ fn bench(s: &Session, cid: ItemId, t: Tick, opts: RenderOpts, n: usize) {
             }
         }
     }
-    eprintln!(
+    note!(
         "bench (no cache): {n} runs at scale {}: wall min {:.2} ms, median {:.2} ms; CPU (all threads) min {:.2} ms",
         opts.scale,
         min(&totals),
@@ -796,9 +1049,9 @@ fn bench(s: &Session, cid: ItemId, t: Tick, opts: RenderOpts, n: usize) {
         min(&cpus)
     );
     for (d, name, p, c, fx) in per_layer {
-        eprintln!("  {:indent$}{name:<28} process {:8.2} ms  composite {:8.2} ms  (min)", "", min(&p), min(&c), indent = d * 2);
+        note!("  {:indent$}{name:<28} process {:8.2} ms  composite {:8.2} ms  (min)", "", min(&p), min(&c), indent = d * 2);
         for (id, v) in fx {
-            eprintln!("  {:indent$}  fx {id:<30} {:8.2} ms", "", min(&v), indent = d * 2);
+            note!("  {:indent$}  fx {id:<30} {:8.2} ms", "", min(&v), indent = d * 2);
         }
     }
 }
@@ -819,7 +1072,7 @@ fn bench_play(s: &Session, cid: ItemId, t: Tick, opts: RenderOpts, n: usize) {
         let mut v: Vec<f64> = runs.iter().map(|r| r.0).collect();
         let mean = v.iter().sum::<f64>() / n as f64;
         let cpu = runs.iter().map(|r| r.1).sum::<f64>() / n as f64;
-        eprintln!(
+        note!(
             "bench-play ({label}): {n} frames at scale {}: wall mean {mean:.2} ms, median {:.2} ms, min {:.2} ms; CPU mean {cpu:.2} ms",
             opts.scale,
             median(&mut v),
@@ -827,7 +1080,7 @@ fn bench_play(s: &Session, cid: ItemId, t: Tick, opts: RenderOpts, n: usize) {
         );
     }
     let st = cache.stats();
-    eprintln!("  layer cache: {} hits, {} misses, {} entries, {:.1} MB", st.hits, st.misses, st.entries, st.bytes as f64 / 1e6);
+    note!("  layer cache: {} hits, {} misses, {} entries, {:.1} MB", st.hits, st.misses, st.entries, st.bytes as f64 / 1e6);
 }
 
 /// Median wall time (ms) of `n` runs of `f` after one warm-up run.
@@ -990,7 +1243,7 @@ fn adv3d_bench_comp(p: &mut effectcraft_engine::project::Project) -> Option<Item
 /// warm; "up/dn MB" are the GPU's uploads / readbacks per warm GPU frame.
 fn bench_gpu(s: &Session, args: &Args) -> Result<(), Failure> {
     use effectcraft_render::Backend;
-    let gpu = effectcraft_gpu::Gpu::headless().ok_or_else(|| Failure::Error("--gpu: no usable GPU adapter".into()))?;
+    let gpu = effectcraft_gpu::Gpu::try_headless().map_err(|e| Failure::Error(format!("--gpu: no usable GPU adapter ({e})")))?;
     let n = args.num("--n")?.unwrap_or(10.0).max(1.0) as usize;
     // Every comp, plus an adjustment-layer comp built for the benchmark (the main comp under a
     // full-frame adjustment layer with a GPU effect stack) and an Advanced 3D comp (`--adv3d`:
@@ -1008,10 +1261,21 @@ fn bench_gpu(s: &Session, args: &Args) -> Result<(), Failure> {
         }
     };
     let project = &project;
-    eprintln!("GPU: {} — median of {n} runs (ms/frame)", effectcraft_render::Accelerator::name(&gpu));
-    eprintln!(
+    note!("GPU: {} — median of {n} runs (ms/frame)", effectcraft_render::Accelerator::name(&gpu));
+    note!(
         "{:<28} {:>5} {:>10} {:>9} {:>9} {:>9} {:>9} {:>9} {:>8} {:>9} {:>9} {:>11}",
-        "comp", "res", "size", "cpu cold", "gpu cold", "cpu warm", "gpu warm", "gpu view", "speedup", "auto", "gpu≠cpu", "up/dn MB"
+        "comp",
+        "res",
+        "size",
+        "cpu cold",
+        "gpu cold",
+        "cpu warm",
+        "gpu warm",
+        "gpu view",
+        "speedup",
+        "auto",
+        "gpu≠cpu",
+        "up/dn MB"
     );
     for cid in comps {
         let Some(comp) = project.comp(cid) else { continue };
@@ -1077,10 +1341,55 @@ fn bench_gpu(s: &Session, args: &Args) -> Result<(), Failure> {
                 .count();
             let pct = 100.0 * off as f64 / a.data.len().max(1) as f64;
             let speedup = cpu_warm / gpu_warm.max(1e-9);
-            eprintln!(
+            note!(
                 "{name:<28} {label:>5} {size:>10} {cpu_cold:>9.2} {gpu_cold:>9.2} {cpu_warm:>9.2} {gpu_warm:>9.2} {view:>9.2} {speedup:>7.2}x {auto:>9.2} {pct:>8.3}% {traffic:>11}"
             );
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Args, String> {
+        Args::parse(args.iter().map(|a| a.to_string()).collect())
+    }
+
+    /// Unknown options are usage errors naming them, not ignored (#168).
+    #[test]
+    fn unknown_options_are_refused() {
+        let err = |args: &[&str]| parse(args).err().unwrap();
+        assert_eq!(err(&["exec", "comp.new", "--bogus", "--empty", "--saveas", "z.ecproj"]), "unknown options `--bogus`, `--saveas`");
+        assert_eq!(err(&["render", "--bogus=1"]), "unknown option `--bogus`");
+        assert_eq!(err(&["info", "--json=yes"]), "--json takes no value");
+        let a = parse(&["render", "t.ecproj", "--comp=Main", "--work-area", "--out", "x.mp4", "--json"]).unwrap();
+        assert_eq!((a.project.as_deref(), a.opt("--comp"), a.opt("--out")), (Some("t.ecproj"), Some("Main"), Some("x.mp4")));
+        assert!(a.flag("--work-area") && a.flag("--json"));
+    }
+
+    /// Rounded seconds name the frame they print (SceneYard Typo: 1.483333 s = frame 89 at 60 fps,
+    /// where the first scene's layers end); other times are kept.
+    #[test]
+    fn rounded_render_times_snap_to_their_frame() {
+        assert_eq!(snap_to_frame(1.483333, 60.0), 89.0 / 60.0);
+        assert_eq!(snap_to_frame(0.813559, 29.5), 24.0 / 29.5);
+        assert_eq!(snap_to_frame(1.49, 60.0), 1.49);
+    }
+
+    /// Every `--option` the CLI reads is declared in VALUED or FLAGS, so none is refused.
+    #[test]
+    fn every_option_read_is_declared() {
+        let code = include_str!("main.rs").split("#[cfg(test)]").next().unwrap();
+        for rest in code.split("\"--").skip(1) {
+            let name: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '-').collect();
+            let opt = format!("--{name}");
+            // `--help` and `--version` are handled before parsing.
+            if name.is_empty() || !rest[name.len()..].starts_with('"') || ["--help", "--version"].contains(&opt.as_str()) {
+                continue;
+            }
+            assert!(VALUED.contains(&opt.as_str()) || FLAGS.contains(&opt.as_str()), "{opt} is read but not declared");
+        }
+    }
 }

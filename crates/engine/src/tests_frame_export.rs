@@ -76,3 +76,48 @@ fn proexr_writes_layer_prefixed_channels_and_the_composite() {
     assert!((at("A", 16, 16) - 1.0).abs() < 1e-3);
     assert!(at("R", 16, 16) < 0.5, "multiplied by 50% blue (linear)");
 }
+
+/// Save a 32×32 comp holding one opaque solid of `color` (an sRGB-encoded triple) as ProEXR and
+/// return the centre pixel of the composite and of the solid's own layer: `[R, G, B]` each.
+fn proexr_centre(color: [f64; 3], bit_depth: u64) -> ([f32; 3], [f32; 3]) {
+    use exr::prelude::*;
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "Bright", "width": 32, "height": 32, "frameRate": 24, "duration": 1})).unwrap();
+    s.execute("file.projectSettings", json!({"bitDepth": bit_depth})).unwrap();
+    s.execute("layer.newSolid", json!({"name": "Bright", "color": color})).unwrap();
+    let dir = out_dir(&format!("frame-exr-over-{}", color[0]));
+    let path = dir.join(format!("frame{bit_depth}.exr")).to_string_lossy().to_string();
+    s.execute("comp.saveFrameAsExr", json!({"path": path})).unwrap();
+    let img = read().no_deep_data().largest_resolution_level().all_channels().all_layers().all_attributes().from_file(&path).unwrap();
+    let layer = &img.layer_data[0];
+    let at = |n: &str| {
+        let c = layer.channel_data.list.iter().find(|c| c.name.to_string() == n).unwrap_or_else(|| panic!("no channel {n}"));
+        match &c.sample_data {
+            FlatSamples::F32(v) => v[16 * 32 + 16],
+            o => panic!("{o:?}"),
+        }
+    };
+    ([at("R"), at("G"), at("B")], [at("Bright.R"), at("Bright.G"), at("Bright.B")])
+}
+
+#[test]
+fn proexr_keeps_values_above_one_in_32_bpc() {
+    // Issue #339: over-range colour reaches the EXR in scene-linear light (sRGB decode, uncapped).
+    let src = [1.5, 1.25, 0.75];
+    let (comp, layer) = proexr_centre(src, 32);
+    for i in 0..3 {
+        let want = effectcraft_color::srgb_to_linear(src[i] as f32);
+        for got in [comp[i], layer[i]] {
+            assert!((got - want).abs() < 1e-3 * want.max(1.0), "channel {i}: got {got}, want {want} ({comp:?} / {layer:?})");
+        }
+    }
+    assert!(comp[0] > 1.5 && comp[1] > 1.25, "{comp:?}");
+}
+
+#[test]
+fn proexr_values_at_or_below_one_are_unchanged() {
+    let (comp, layer) = proexr_centre([1.0, 0.4, 0.0], 32);
+    for got in [comp, layer] {
+        assert!((got[0] - 1.0).abs() < 1e-4 && (got[1] - 0.1329).abs() < 1e-3 && got[2].abs() < 1e-6, "{got:?}");
+    }
+}

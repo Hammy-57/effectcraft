@@ -194,6 +194,39 @@ pub fn layer_doc(doc: &Doc, index: usize) -> Doc {
     d
 }
 
+/// Select a saved vector footage layer and optionally crop it to authored artwork bounds.
+/// Bounds are in document coordinates, after the PDF page transform.
+pub fn selected_layer_doc(doc: &Doc, index: usize, name: &str, bounds: Option<[f64; 4]>) -> Result<Doc, String> {
+    let names = layer_names(doc);
+    let index = if names.get(index).is_some_and(|selected| name.is_empty() || selected == name) {
+        index
+    } else {
+        // Empty PDF layers need not emit artwork nodes, so their saved indices can shift.
+        let mut matches = names.iter().enumerate().filter(|(_, candidate)| !name.is_empty() && *candidate == name);
+        let (matched, _) = matches.next().ok_or_else(|| "vector source layer is missing".to_owned())?;
+        if matches.next().is_some() {
+            return Err("vector source layer name is ambiguous".into());
+        }
+        matched
+    };
+    let mut selected = layer_doc(doc, index);
+    if let Some([x0, y0, x1, y1]) = bounds {
+        if [x0, y0, x1, y1].iter().any(|v| !v.is_finite() || v.abs() > 1_000_000.0) || x1 <= x0 || y1 <= y0 || x1 - x0 > 30000.0 || y1 - y0 > 30000.0 {
+            return Err("invalid vector source layer crop bounds".into());
+        }
+        // AE saves the layer's bounds in PDF user space (y up, as Illustrator measures them):
+        // map them through the page transform into the document's top-down pixels.
+        let [m0, m1, m2, m3, m4, m5] = doc.root.transform.as_coeffs();
+        let page = |x: f64, y: f64| (m0 * x + m2 * y + m4, m1 * x + m3 * y + m5);
+        let (a, b) = (page(x0, y0), page(x1, y1));
+        let (x0, y0, x1, y1) = (a.0.min(b.0), a.1.min(b.1), a.0.max(b.0), a.1.max(b.1));
+        selected.width = (x1 - x0).ceil();
+        selected.height = (y1 - y0).ceil();
+        selected.root.transform = Affine::translate((-x0, -y0)) * selected.root.transform;
+    }
+    Ok(selected)
+}
+
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

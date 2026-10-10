@@ -16,16 +16,17 @@ pub mod mask_interp;
 pub mod paint;
 pub mod panels_cmds;
 pub mod puppet;
+pub mod render_compare;
 pub mod roto_cmds;
 pub mod scripts;
+pub mod shape_stroke;
+pub mod shape_tool;
 pub mod text_edit;
 pub mod time;
 pub mod viewer_cmds;
 #[cfg(test)]
 pub(crate) use app_more::report_text as report_text_for_tests;
 pub(crate) use app_more::view_command;
-#[cfg(test)]
-pub(crate) use file::missing_frames as missing_frames_for_tests;
 #[cfg(test)]
 pub(crate) use keys_more::amplitudes as amplitudes_for_tests;
 #[cfg(test)]
@@ -110,19 +111,23 @@ pub(crate) const LEGACY_ORDER: &[&str] = &[
     "time",
     "render_queue",
     "help",
+    "journal",
     "query",
     "batch",
+    "crate::figma",
     "layer_menu",
     "create",
     "animation",
     "view",
     "viewer_cmds",
     "shape_stroke",
+    "shape_tool",
     "focus",
     "key_labels",
     "key_transform",
     "file_more",
     "lottie",
+    "aep",
     "timeline",
     "comp_more",
     "frame_export",
@@ -158,6 +163,7 @@ pub(crate) const LEGACY_ORDER: &[&str] = &[
     "crate::learn",
     "crate::templates",
     "crate::preview",
+    "render_compare",
 ];
 
 /// Every command module's `specs()`, in registration order: [`LEGACY_ORDER`], then the others
@@ -174,6 +180,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
     static SPECS: OnceLock<Vec<CommandSpec>> = OnceLock::new();
     SPECS.get_or_init(|| command_modules().into_iter().flat_map(|(_, specs)| specs()).collect())
 }
+
 
 /// Set `footage` as the proxy of `item` (File ▸ Create Proxy's post-render action).
 pub(crate) fn proxy_set(s: &mut Session, item: ItemId, footage: effectcraft_project::Footage) -> Result<()> {
@@ -408,9 +415,10 @@ pub(crate) fn merge_p(p: &Value) -> Option<&str> {
 
 /// `comp`: item id or name; default the active comp.
 pub(crate) fn comp_id(s: &Session, p: &Value) -> Result<ItemId> {
+    let missing = |v: &Value| EngineError::NoSuchComp(v.to_string());
     match p.get("comp") {
-        Some(Value::Number(n)) => n.as_u64().map(ItemId).filter(|id| s.project.comp(*id).is_some()).ok_or(EngineError::NoComp),
-        Some(Value::String(name)) => s.project.items.values().find(|i| &i.name == name && i.as_comp().is_some()).map(|i| i.id).ok_or(EngineError::NoComp),
+        Some(v @ Value::Number(n)) => n.as_u64().map(ItemId).filter(|id| s.project.comp(*id).is_some()).ok_or_else(|| missing(v)),
+        Some(v @ Value::String(name)) => s.project.items.values().find(|i| &i.name == name && i.as_comp().is_some()).map(|i| i.id).ok_or_else(|| missing(v)),
         _ => s.active_comp_id().ok_or(EngineError::NoComp),
     }
 }

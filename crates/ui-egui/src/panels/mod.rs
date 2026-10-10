@@ -31,6 +31,12 @@ pub fn timecode(session: &Session, comp: &Comp, t: Tick) -> String {
     effectcraft_engine::commands::time::display_time(session, comp, t)
 }
 
+/// Spacebar held outside a text field: the Hand tool (drags pan the viewer and scroll the
+/// Timeline).
+pub(crate) fn space_hand(ctx: &egui::Context) -> bool {
+    ctx.input(|i| i.key_down(egui::Key::Space)) && !ctx.egui_wants_keyboard_input()
+}
+
 pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: PanelKind, rect: Rect) {
     match p {
         PanelKind::Composition => viewers::show(app, ui, 0, rect),
@@ -69,71 +75,5 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: PanelKind, rect: Rec
         PanelKind::ContentAwareFill => content_fill_panel::show(app, ui, rect),
         PanelKind::CreateNullsFromPaths => path_vr_panels::create_nulls(app, ui, rect),
         PanelKind::VrCompEditor => path_vr_panels::vr_editor(app, ui, rect),
-    }
-}
-
-/// The ≡ panel menu (opened from a tab).
-pub fn panel_menu_popup(app: &mut EffectcraftApp, ui: &mut egui::Ui) {
-    let id = egui::Id::new("panel-menu");
-    let Some((panel, pos)) = ui.ctx().data(|d| d.get_temp::<(PanelKind, egui::Pos2)>(id)) else { return };
-    let mut close = false;
-    let area = egui::Area::new(id.with("area")).order(egui::Order::Foreground).fixed_pos(pos).show(ui.ctx(), |ui| {
-        egui::Frame::popup(ui.style()).show(ui, |ui| {
-            ui.set_min_width(200.0);
-            if ui.button("Close Panel").clicked() {
-                app.close_panel(panel);
-                close = true;
-            }
-            let floating = app.ui.floating.iter().any(|f| f.panels.contains(&panel));
-            if !floating && ui.button("Undock Panel").clicked() {
-                let r = crate::dock_ui::default_float_rect(ui.ctx().content_rect());
-                app.edit_layout(|l| l.float(panel, r));
-                close = true;
-            }
-            if !floating && ui.button(if app.ui.maximized == Some(panel) { "Restore Panel Size" } else { "Maximize Panel" }).clicked() {
-                app.toggle_maximize(panel);
-                close = true;
-            }
-            ui.separator();
-            match panel {
-                PanelKind::Timeline => {
-                    for (label, id) in [
-                        ("Hide Shy Layers", "hideShy"),
-                        ("Enable Frame Blending", "frameBlending"),
-                        ("Enable Motion Blur", "motionBlur"),
-                        ("Draft 3D", "draft3d"),
-                    ] {
-                        if ui.button(label).clicked() {
-                            let _ = app.session.execute("comp.setSwitch", serde_json::json!({"switch": id}));
-                            close = true;
-                        }
-                    }
-                    if ui.button("Composition Settings…").clicked() {
-                        let _ = dialogs::open_comp_settings(app);
-                        close = true;
-                    }
-                }
-                PanelKind::Composition | PanelKind::Viewer(_) => {
-                    for (label, cmd) in [
-                        ("New Viewer", "view.newViewer"),
-                        ("Composition Settings…", "app.compSettings"),
-                        ("View Options…", "view.layerControls"),
-                        ("Show Grid", "view.grid"),
-                        ("Title/Action Safe", "view.safeMargins"),
-                    ] {
-                        if ui.button(label).clicked() {
-                            let _ = crate::menus::invoke(app, &ui.ctx().clone(), cmd, serde_json::json!({}));
-                            close = true;
-                        }
-                    }
-                }
-                _ => {
-                    ui.label(egui::RichText::new(panel.title()).weak());
-                }
-            }
-        });
-    });
-    if close || (ui.input(|i| i.pointer.any_pressed()) && !area.response.contains_pointer() && !area.response.hovered()) {
-        ui.ctx().data_mut(|d| d.remove::<(PanelKind, egui::Pos2)>(id));
     }
 }

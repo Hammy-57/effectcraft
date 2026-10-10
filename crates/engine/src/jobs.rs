@@ -1,6 +1,7 @@
 //! Background jobs: one list (Window ▸ Progress, `jobs.list`, `jobs.cancel`) over the render
 //! queue, the analyses (tracker, mask tracker, Warp Stabilizer, 3D Camera Tracker, Roto Brush) and
-//! the generic background tasks started here (Content-Aware Fill, Scene Edit Detection).
+//! the generic background tasks started here (Content-Aware Fill, Scene Edit Detection, footage
+//! checks and imports).
 //!
 //! A generic task runs a closure on a background thread (inline on wasm32 or when the caller
 //! waits). The closure reports progress through [`TaskCtl`] and returns an [`Apply`]: a function
@@ -162,7 +163,8 @@ impl Session {
         let cancelled = t.ctl.cancelled();
         let (status, message, result) = match r {
             Some(Ok(apply)) if !cancelled => match apply(self) {
-                Ok(v) => ("done", String::new(), v),
+                // A task may say how it went (`toast`: "Imported 3 items").
+                Ok(v) => ("done", v.get("toast").and_then(Value::as_str).unwrap_or_default().to_string(), v),
                 Err(e) => ("failed", e.to_string(), Value::Null),
             },
             Some(Ok(_)) => ("cancelled", String::new(), Value::Null),
@@ -180,6 +182,7 @@ impl Session {
             seconds: t.started.elapsed().as_secs_f64(),
         };
         let toast = match status {
+            "done" if !message.is_empty() => message.clone(),
             "done" => format!("{} finished", t.label),
             "cancelled" => format!("{} cancelled", t.label),
             _ => format!("{} failed: {message}", t.label),

@@ -105,7 +105,7 @@ fn spawn(p: js_sys::Promise, what: &'static str, then: impl FnOnce(&mut effectcr
                 crate::post(move |app| then(app, v));
             }
             Err(e) => {
-                let msg = e.as_string().or_else(|| js_sys::Reflect::get(&e, &"message".into()).ok().and_then(|m| m.as_string())).unwrap_or_default();
+                let msg = crate::persist::js_err(e);
                 // Cancelling a picker is not an error.
                 if !msg.contains("abort") && !msg.contains("AbortError") {
                     crate::post(move |app| app.ui.status = format!("{what}: {msg}"));
@@ -234,20 +234,42 @@ impl Browser for WebBrowser {
                 Ok(json!({"pending": true}))
             }
             "addFiles" | "uploadFolder" => {
+                let what = if id == "uploadFolder" { "Upload Folder…" } else { "Add Files…" };
                 let p = pick_files(id == "uploadFolder");
                 wasm_bindgen_futures::spawn_local(async move {
-                    let Ok(list) = wasm_bindgen_futures::JsFuture::from(p).await else { return };
-                    let mut n = 0;
-                    for f in js_sys::Array::from(&list).iter() {
-                        let path = js_sys::Reflect::get(&f, &"path".into()).ok().and_then(|v| v.as_string());
-                        let bytes = js_sys::Reflect::get(&f, &"bytes".into()).ok().and_then(|b| b.dyn_into::<js_sys::Uint8Array>().ok());
-                        if let (Some(path), Some(bytes)) = (path, bytes) {
-                            crate::files::put(&format!("/{}", path.trim_start_matches('/')), bytes.to_vec().into());
-                            n += 1;
+                    let list = match wasm_bindgen_futures::JsFuture::from(p).await {
+                        Ok(list) => js_sys::Array::from(&list),
+                        Err(e) => {
+                            let msg = crate::persist::js_err(e);
+                            crate::post(move |app| app.ui.status = format!("{what}: {msg}"));
+                            return;
                         }
+                    };
+                    // Files that can't be read are reported, not dropped silently (#226).
+                    let (mut n, mut unread) = (0, vec![]);
+                    for f in list.iter() {
+                        let get = |key: &str| js_sys::Reflect::get(&f, &key.into()).ok();
+                        let Some(path) = get("path").and_then(|v| v.as_string()) else { continue };
+                        match get("bytes").and_then(|b| b.dyn_into::<js_sys::Uint8Array>().ok()) {
+                            Some(bytes) => {
+                                crate::files::put(&format!("/{}", path.trim_start_matches('/')), bytes.to_vec().into());
+                                n += 1;
+                            }
+                            None => unread.push(match get("error").and_then(|e| e.as_string()).filter(|e| !e.is_empty()) {
+                                Some(why) => format!("{path} ({why})"),
+                                None => path,
+                            }),
+                        }
+                    }
+                    // Cancelled: nothing to report.
+                    if n == 0 && unread.is_empty() {
+                        return;
                     }
                     crate::post(move |app| {
                         app.ui.status = format!("{n} file(s) added to Browser Storage");
+                        if !unread.is_empty() {
+                            app.ui.status += &format!(". Could not read {}: try {what} again", unread.join(", "));
+                        }
                         go(app, STORAGE);
                     });
                 });

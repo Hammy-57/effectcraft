@@ -622,6 +622,51 @@ impl OutputFormat {
         let ext = std::path::Path::new(path).extension()?.to_string_lossy().to_ascii_lowercase();
         OutputFormat::from_name(&ext)
     }
+    /// An output `path` without its extensions, for this format to add its own: the project
+    /// extensions a save dialog filtered to projects appended (`Comp 1.png.ecproj`, #293), one
+    /// output format's extension (the one being replaced), and any more of this format's
+    /// (`Comp 2.mov.mov`, from a format change or a comp named `Comp 2.mov`). Another extension
+    /// stays part of the name (`logo.png.mov`).
+    pub fn output_stem(self, path: &str) -> &str {
+        let stem = without_project_extension(path);
+        let mut stem = strip_extension(stem, |e| OutputFormat::from_name(e).is_some()).unwrap_or(stem);
+        while let Some(s) = strip_extension(stem, |e| e.eq_ignore_ascii_case(self.extension())) {
+            stem = s;
+        }
+        stem
+    }
+    /// `path` ending in this format's extension exactly once (see [`OutputFormat::output_stem`]);
+    /// a path that already does is kept as it is. Templates still to expand `[fileExtension]` are
+    /// kept too.
+    pub fn with_extension(self, path: &str) -> String {
+        if path.contains("[fileExtension]") {
+            return path.to_string();
+        }
+        let fixed = format!("{}.{}", self.output_stem(path), self.extension());
+        if fixed.eq_ignore_ascii_case(path) { path.to_string() } else { fixed }
+    }
+}
+
+/// Project file extensions: never a render's output.
+const PROJECT_EXTENSIONS: [&str; 2] = ["ecproj", "ecprojx"];
+
+/// An output `path` without the project extensions a save dialog filtered to projects appended
+/// to it (`Comp 1.mov.ecproj` → `Comp 1.mov`, #293).
+pub fn without_project_extension(path: &str) -> &str {
+    let mut p = path;
+    while let Some(s) = strip_extension(p, |e| PROJECT_EXTENSIONS.iter().any(|x| e.eq_ignore_ascii_case(x))) {
+        p = s;
+    }
+    p
+}
+
+/// `path` without its last extension when `strip` accepts that extension.
+fn strip_extension(path: &str, strip: impl Fn(&str) -> bool) -> Option<&str> {
+    let ext = std::path::Path::new(path).extension()?.to_str()?;
+    if !strip(ext) {
+        return None;
+    }
+    path.strip_suffix(ext)?.strip_suffix('.')
 }
 
 /// Output Module ▸ Channels.
@@ -1130,8 +1175,7 @@ impl OutputModule {
             }
             return;
         }
-        let p = std::path::Path::new(&self.output);
-        let mut stem = p.with_extension("").to_string_lossy().to_string();
+        let mut stem = format.output_stem(&self.output).to_string();
         if format.is_sequence() && !stem.contains('#') {
             stem.push_str("_[#####]");
         } else if !format.is_sequence() {
@@ -1449,6 +1493,42 @@ mod tests {
         assert_eq!(OutputFormat::from_name("TIFF"), Some(OutputFormat::TiffSequence));
         assert_eq!(ProResProfile::from_name("4444"), Some(ProResProfile::P4444));
         assert_eq!(ProResProfile::from_name("hq"), Some(ProResProfile::Hq));
+    }
+
+    /// Output names end in the format's extension exactly once (#293): a save dialog filtered to
+    /// projects appended `.ecproj` (`Comp 1.mov.ecproj`, `Comp 1_00001.png.ecproj` for every
+    /// frame), and a format change or a comp named `Comp 2.mov` doubled it (`Comp 2.mov.mov`).
+    #[test]
+    fn output_names_end_in_the_format_extension_once() {
+        use OutputFormat::*;
+        for (path, format, want) in [
+            ("/out/Comp 1.mov.ecproj", ProRes, "/out/Comp 1.mov"),
+            ("/out/Comp 1_[#####].png.ecproj", PngSequence, "/out/Comp 1_[#####].png"),
+            ("/out/Comp 1.mov.ecprojx.ecproj", ProRes, "/out/Comp 1.mov"),
+            ("/out/Comp 2.mov.mov", ProRes, "/out/Comp 2.mov"),
+            ("/out/Comp 2.mov.mov.mov", ProRes, "/out/Comp 2.mov"),
+            ("/out/render", ProRes, "/out/render.mov"),
+            ("/out/frames_[#####]", PngSequence, "/out/frames_[#####].png"),
+            ("/out/logo.png.mov", ProRes, "/out/logo.png.mov"),
+            ("/out/v1.2", H264, "/out/v1.2.mp4"),
+            ("/my.folder/Clip.MOV", ProRes, "/my.folder/Clip.MOV"),
+            ("/out/x.mp4", Hevc, "/out/x.mp4"),
+            ("[compName].[fileExtension]", ProRes, "[compName].[fileExtension]"),
+        ] {
+            assert_eq!(format.with_extension(path), want, "{path} as {format:?}");
+        }
+        assert_eq!(without_project_extension("C:/out/Comp 1.mov.ecproj"), "C:/out/Comp 1.mov");
+        assert_eq!(without_project_extension("Comp 1.mov"), "Comp 1.mov");
+        // Changing the format replaces one extension and drops the project one.
+        let mut m = OutputModule { output: "/out/Comp 1.mov.ecproj".into(), ..OutputModule::for_format(ProRes) };
+        m.set_format(H264);
+        assert_eq!(m.output, "/out/Comp 1.mp4");
+        m.output = "/out/Comp 2.mov.mov".into();
+        m.set_format(ProRes);
+        assert_eq!(m.output, "/out/Comp 2.mov");
+        m.output = "/out/Comp 2.mov.ecproj".into();
+        m.set_format(PngSequence);
+        assert_eq!(m.output, "/out/Comp 2_[#####].png");
     }
 
     #[test]

@@ -297,7 +297,7 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
             if req.method == "ui.panel.show" {
                 app.show_panel(panel);
             } else {
-                app.ui.dock.close(panel);
+                app.close_panel(panel);
             }
             ok(Value::Null)
         }
@@ -368,8 +368,9 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
             let Some((mut m, key)) = crate::menus::parse_shortcut(name) else { return err(format!("unknown key `{name}`")) };
             let extra = modifiers(p);
             m |= extra;
-            app.synthetic.push(egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: m });
-            app.synthetic.push(egui::Event::Key { key, physical_key: None, pressed: false, repeat: false, modifiers: m });
+            let physical_key = name.starts_with("Physical+").then_some(key);
+            app.synthetic.push(egui::Event::Key { key, physical_key, pressed: true, repeat: false, modifiers: m });
+            app.synthetic.push(egui::Event::Key { key, physical_key, pressed: false, repeat: false, modifiers: m });
             Outcome::AfterInput
         }
         "ui.type" => {

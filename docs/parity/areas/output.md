@@ -1,6 +1,0 @@
-# Output
-
-- Weighted parity: 97%
-- Remaining (agent-hours): 0.8
-
-Render Settings complete (field render + 3:2 pulldown, effects/solo/guide/depth/blending/blur overrides, time sampling, storage overflow), Output Module crop/ROI/resize, alpha modes, post-render actions, PCM formats, templates with defaults, render logs, Notify (M10.2); WebM VP9 key + inter frames with motion search, loop filter and rate control; M13.4: HEVC export (MP4 `hvc1`, `effectcraft-hevcenc`: Main / Main 10, IDR + P slices, quarter-pel motion, deblocking, bit-exact with ffmpeg) and AV1 export (MP4 `av01` and WebM, `effectcraft-av1enc`: 8/10-bit key + inter frames, quarter-pel motion, loop filter, bit-exact with libdav1d) with profile, level, bitrate / constant-quality and key-frame interval options; Opus SILK (NB/MB/WB, mid/side stereo) and hybrid (SWB/FB) modes chosen by bitrate and Audio/Voice tuning, with the Opus bitrate in the Output Module. HEVC/AV1 import decodes through FilmCraft (MP4/MOV/MKV/WebM); WebM VP9 alpha (BlockAdditions) imports as straight alpha. Left: HEVC/AV1 have no B-frames, multi-reference, SAO/CDEF/restoration or alpha (compression below mature encoders); Opus has no FEC/DTX and only 20 ms frames; Photoshop sequence output, overflow for movies only checks at file creation

@@ -24,9 +24,30 @@ fn put(px: &mut Px, g: [f32; 3], ga: f32, blend_orig: f32) {
     }
 }
 
+/// Where Gradient Ramp's points lie for a buffer (`offset`, `scale` as in [`Buf`]): the ramp is
+/// evaluated at `m · (x + 0.5, y + 0.5, 1)` for buffer pixel (x, y), between `start` and `end`
+/// in that space. Normally layer pixels (`m` the identity, points through [`Buf::to_px`]); on a
+/// Continuously Rasterize layer ([`crate::EffectEnv::comp_space`]) the points are comp pixels and
+/// `m` takes buffer pixels to comp, as After Effects renders it (SceneYard "Spotify Music Player
+/// UI": a ramp from (960, −64) to (960, 900) on text scaled 468 %).
+pub fn gradient_ramp_space(ctx: &EffectCtx, offset: [f64; 2], scale: f64) -> ([[f64; 3]; 2], (f64, f64), (f64, f64)) {
+    let (s, e) = (ctx.params.v2("start"), ctx.params.v2("end"));
+    let scale = if scale.is_finite() && scale > 1e-9 { scale } else { 1.0 };
+    let m = ctx.env.comp_space.filter(|m| {
+        let det = m[0][0] * m[1][1] - m[0][1] * m[1][0];
+        det.is_finite() && det.abs() > 1e-12 && m.iter().flatten().all(|v| v.is_finite())
+    });
+    if let Some(m) = m {
+        // Buffer px → effect coordinates p = (px − offset) / scale → comp = M p + t.
+        let row = |r: [f64; 3]| [r[0] / scale, r[1] / scale, r[2] - (r[0] * offset[0] + r[1] * offset[1]) / scale];
+        return ([row(m[0]), row(m[1])], (s[0], s[1]), (e[0], e[1]));
+    }
+    let px = |p: [f64; 2]| (p[0] * scale + offset[0], p[1] * scale + offset[1]);
+    ([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], px(s), px(e))
+}
+
 fn gradient_ramp(ctx: &EffectCtx, mut b: Buf) -> Buf {
-    let s = b.to_px(ctx.params.v2("start"));
-    let e = b.to_px(ctx.params.v2("end"));
+    let (m, s, e) = gradient_ramp_space(ctx, b.offset, b.scale);
     let c0 = ctx.params.color("startColor");
     let c1 = ctx.params.color("endColor");
     let radial = ctx.params.e("shape") == 1;
@@ -37,14 +58,18 @@ fn gradient_ramp(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let seed = ctx.seed;
     b.img.rows_mut().for_each(|(y, row)| {
         for (x, px) in row.iter_mut().enumerate() {
-            let (vx, vy) = (x as f64 + 0.5 - s.0, y as f64 + 0.5 - s.1);
+            let (cx, cy) = (x as f64 + 0.5, y as f64 + 0.5);
+            let (qx, qy) = (m[0][0] * cx + m[0][1] * cy + m[0][2], m[1][0] * cx + m[1][1] * cy + m[1][2]);
+            let (vx, vy) = (qx - s.0, qy - s.1);
             let mut t = if radial { ((vx * vx + vy * vy) / len2).sqrt() } else { (vx * dx + vy * dy) / len2 } as f32;
             if scatter > 0.0 {
                 t += (effectcraft_raster::hash_noise(x as u32, y as u32, seed) - 0.5) * scatter;
             }
             let t = t.clamp(0.0, 1.0);
             let c = [c0[0] + (c1[0] - c0[0]) * t, c0[1] + (c1[1] - c0[1]) * t, c0[2] + (c1[2] - c0[2]) * t];
-            put(px, c, 1.0, blend);
+            // Gradient Ramp colours the already-masked layer; it must not fill transparent pixels.
+            let alpha = px[3];
+            put(px, c, alpha, blend);
         }
     });
     b
@@ -110,10 +135,19 @@ pub(crate) fn gen_blend(o: Px, g: Px, mode: u32) -> Px {
     }
 }
 
+/// 4-Color Gradient's weight softening (Blend², in buffer pixels²): each point weighs
+/// `1 / (d² + softening)`.
+pub fn four_color_softening(blend: f64, scale: f64) -> f64 {
+    (blend.max(1.0) * scale).powi(2).max(1e-6)
+}
+
 fn four_color(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let pts: Vec<((f64, f64), [f32; 4])> =
         (1..=4).map(|i| (b.to_px(ctx.params.v2(&format!("positionsColors/point{i}"))), ctx.params.color(&format!("positionsColors/color{i}")))).collect();
-    let blend = ctx.params.f("blend").max(1.0);
+    // Inverse-square weights softened by Blend (in pixels): w = 1 / (d² + Blend²). Fitted to
+    // After Effects renders at Blend 20..500 (SceneYard Liquid Glass: ~0.004 mean error, where
+    // the former 1 / d³ falloff gave sharp blobs around each point at 0.03).
+    let blend = four_color_softening(ctx.params.f("blend"), b.scale);
     let jitter = (ctx.params.f("jitter") / 100.0).clamp(0.0, 1.0) as f32;
     let op = ctx.params.f("opacity") as f32 / 100.0;
     let mode = ctx.params.e("blendingMode");
@@ -124,7 +158,7 @@ fn four_color(ctx: &EffectCtx, mut b: Buf) -> Buf {
             let mut wsum = 0.0;
             for ((qx, qy), c) in &pts {
                 let d2 = (x as f64 + 0.5 - qx).powi(2) + (y as f64 + 0.5 - qy).powi(2);
-                let w = 1.0 / (d2 / (blend * 100.0) + 1e-6).powf(1.5);
+                let w = 1.0 / (d2 + blend);
                 for i in 0..3 {
                     acc[i] += c[i] as f64 * w;
                 }
@@ -136,7 +170,16 @@ fn four_color(ctx: &EffectCtx, mut b: Buf) -> Buf {
                 let n = (effectcraft_raster::hash_noise(x as u32, y as u32, seed) - 0.5) * jitter * (8.0 / 255.0);
                 c = c.map(|v| v + n);
             }
-            *px = gen_blend(*px, [c[0] * op, c[1] * op, c[2] * op, op], mode);
+            *px = if gen_mode(mode).is_none() {
+                // None replaces the layer's colour: the gradient takes the layer's own alpha (AE
+                // colours a stroked ring or text, not its whole canvas) and Opacity fades that
+                // result; the original colour does not show through (SceneYard 4 Feature Card
+                // Slider: red cards under a 40% grey gradient render as translucent grey).
+                let a = px[3] * op;
+                [c[0] * a, c[1] * a, c[2] * a, a]
+            } else {
+                gen_blend(*px, [c[0] * op, c[1] * op, c[2] * op, op], mode)
+            };
         }
     });
     b
@@ -262,7 +305,7 @@ fn circle(ctx: &EffectCtx, mut b: Buf) -> Buf {
 // ---- value noise / fBm (our own lattice noise with quintic fade) ----
 
 #[inline]
-fn lattice(ix: i32, iy: i32, iz: i32, seed: u32) -> f32 {
+pub(crate) fn lattice(ix: i32, iy: i32, iz: i32, seed: u32) -> f32 {
     let mut h =
         (ix as u32).wrapping_mul(0x27d4_eb2d) ^ (iy as u32).wrapping_mul(0x1656_67b1) ^ (iz as u32).wrapping_mul(0x9e37_79b9) ^ seed.wrapping_mul(0x85eb_ca6b);
     h ^= h >> 15;
@@ -274,7 +317,7 @@ fn lattice(ix: i32, iy: i32, iz: i32, seed: u32) -> f32 {
 }
 
 #[inline]
-fn fade(t: f32) -> f32 {
+pub(crate) fn fade(t: f32) -> f32 {
     t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
 }
 
@@ -401,6 +444,39 @@ mod generator_tests {
     }
 
     #[test]
+    fn gradient_ramp_preserves_masked_alpha() {
+        let mut img = Image::new(3, 1);
+        img.data[1] = [0.5, 0.0, 0.0, 0.5];
+        img.data[2] = [1.0, 0.0, 0.0, 1.0];
+        let out = run_fx(
+            "ec.generate.gradientramp",
+            &[("startColor", Value::Color([0.0, 0.0, 1.0, 1.0])), ("endColor", Value::Color([0.0, 0.0, 1.0, 1.0]))],
+            img,
+            0.0,
+            EffectEnv::default(),
+        );
+        assert_eq!(out.img.data[0], [0.0; 4]);
+        assert_eq!(out.img.data[1], [0.0, 0.0, 0.5, 0.5]);
+        assert_eq!(out.img.data[2], [0.0, 0.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn gradient_ramp_points_are_comp_pixels_on_continuously_rasterized_layers() {
+        // SceneYard "Spotify Music Player UI": text scaled 468 % with a ramp given in comp pixels;
+        // read in layer space the points fell off the layer and it rendered all black.
+        let set = [("start", Value::Vec2([600.0, 100.0])), ("end", Value::Vec2([600.0, 100.0 + 4.68 * 40.0]))];
+        let env = EffectEnv { comp_space: Some([[4.68, 0.0, 500.0], [0.0, 4.68, 100.0]]), ..Default::default() };
+        let out = run_fx("ec.generate.gradientramp", &set, Image::filled(40, 40, [1.0; 4]), 0.0, env);
+        for y in [2, 20, 30] {
+            let v = out.img.get(10, y)[0];
+            assert!((v - (y as f32 + 0.5) / 40.0).abs() < 1e-3, "row {y}: {v}");
+        }
+        // Without comp space the same points are layer pixels (all past the start: black).
+        let out = run_fx("ec.generate.gradientramp", &set, Image::filled(40, 40, [1.0; 4]), 0.0, EffectEnv::default());
+        assert_eq!(out.img.get(10, 30)[0], 0.0);
+    }
+
+    #[test]
     fn checkerboard_blending_none_shows_pattern_only_and_size_from_width() {
         let set = [("width", num(8.0)), ("height", num(2.0))];
         // None (default): the off squares are transparent; Width Slider makes 8×8 squares.
@@ -466,12 +542,51 @@ mod generator_tests {
             .collect();
         let mut half = pts.clone();
         half.push(("opacity", num(50.0)));
-        // None: the gradient alone at half opacity.
-        let o = run_fx("ec.generate.fourcolor", &half, red(), 0.0, EffectEnv::default());
-        assert!((o.img.get(16, 16)[3] - 0.5).abs() < 1e-3);
+        // None replaces the layer's colour within its own alpha: half opacity fades the
+        // gradient instead of mixing it with the original (SceneYard 4 Feature Card Slider:
+        // red cards under a 40% grey gradient are translucent grey, not pink), and an empty
+        // pixel stays empty (SceneYard UI 3 Stages: a stroked ring, not a square).
+        let mut ring = red();
+        ring.set(2, 2, [0.0; 4]);
+        let o = run_fx("ec.generate.fourcolor", &half, ring, 0.0, EffectEnv::default());
+        let px = o.img.get(16, 16);
+        assert!((px[3] - 0.5).abs() < 1e-3, "faded by Opacity {px:?}");
+        // The default gradient (yellow, green, magenta, blue) averages to a dull grey at the
+        // centre; the red layer colour does not leak through.
+        assert!(px[0] < 0.4 && (px[0] - px[1]).abs() < 0.2, "gradient only {px:?}");
+        assert_eq!(o.img.get(2, 2), [0.0; 4]);
         // Normal: over the opaque layer.
         half.push(("blendingMode", Value::Enum(1)));
         let o = run_fx("ec.generate.fourcolor", &half, red(), 0.0, EffectEnv::default());
         assert!((o.img.get(16, 16)[3] - 1.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn four_color_weights_are_inverse_square_softened_by_blend() {
+        // Two points, black at x = 0 and white at x = 64 (the others far away on the same
+        // colours' sides are symmetric): at x = 16 the weights are 1/(16² + B²) and
+        // 1/(48² + B²), so Blend 1 gives 0.1 white and a huge Blend tends to an even mix.
+        let set = |blend: f64| -> Vec<(&'static str, Value)> {
+            vec![
+                ("positionsColors/point1", Value::Vec2([0.0, 0.0])),
+                ("positionsColors/color1", Value::Color([0.0, 0.0, 0.0, 1.0])),
+                ("positionsColors/point2", Value::Vec2([64.0, 0.0])),
+                ("positionsColors/color2", Value::Color([1.0, 1.0, 1.0, 1.0])),
+                ("positionsColors/point3", Value::Vec2([0.0, 0.0])),
+                ("positionsColors/color3", Value::Color([0.0, 0.0, 0.0, 1.0])),
+                ("positionsColors/point4", Value::Vec2([64.0, 0.0])),
+                ("positionsColors/color4", Value::Color([1.0, 1.0, 1.0, 1.0])),
+                ("blend", num(blend)),
+            ]
+        };
+        let expect = |b: f64| {
+            let (w0, w1) = (1.0 / (15.5f64.powi(2) + 0.25 + b * b), 1.0 / (48.5f64.powi(2) + 0.25 + b * b));
+            w1 / (w0 + w1)
+        };
+        for b in [1.0, 100.0] {
+            let o = run_fx("ec.generate.fourcolor", &set(b), red(), 0.0, EffectEnv::default());
+            let v = o.img.get(15, 0)[0] as f64;
+            assert!((v - expect(b)).abs() < 1e-3, "blend {b}: {v} vs {}", expect(b));
+        }
     }
 }

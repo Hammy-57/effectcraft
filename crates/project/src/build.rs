@@ -671,6 +671,8 @@ pub fn model_geometry_options(ids: &mut Ids, unit_scale: f64, clips: &[String]) 
     opts.extend(clips.iter().map(String::as_str));
     ids.group("geometryOptions", "Geometry Options")
         .with(ids.prop("unitScale", "Model Scale", Value::Scalar(unit_scale)).with_ui(slider(0.0, 1.0e6, 0.0, 1000.0, 2)))
+        .with(ids.prop("aeSourceSpace", "AE Source Axes", Value::Bool(false)).with_ui(ParamUi::Checkbox))
+        .with(ids.prop("objectScale", "Object Scale", Value::Scalar(100.0)).with_ui(ParamUi::Percent))
         .with(ids.prop("animation", "Animation", Value::Enum(if clips.is_empty() { 0 } else { 1 })).with_ui(popup(&opts)))
         .with(ids.prop("loopAnimation", "Loop Animation", Value::Bool(true)).with_ui(ParamUi::Checkbox))
         .with(ids.prop("animationSpeed", "Animation Speed", Value::Scalar(100.0)).with_ui(ParamUi::Percent))
@@ -715,15 +717,15 @@ pub fn audio(ids: &mut Ids) -> PropGroup {
 
 // ---------------------------------------------------------------- layers
 
-/// Default label colour for a layer source (Labels preferences defaults).
+/// Label colour for a new layer: its Project item's label when it has one (later changes to the
+/// item's label leave existing layers alone), else the Labels preferences default for its type.
 pub fn default_label(src: &LayerSource, project: &Project) -> Label {
+    if let Some(it) = src.item().and_then(|i| project.item(i)) {
+        return it.label;
+    }
     match src {
         LayerSource::Comp { .. } => Label::Sandstone,
-        LayerSource::Footage { item } => match project.item(*item).map(|i| i.type_name()) {
-            Some("Image") | Some("Image Sequence") => Label::Lavender,
-            Some("Audio") => Label::SeaFoam,
-            _ => Label::Aqua,
-        },
+        LayerSource::Footage { .. } => Label::Aqua,
         LayerSource::Solid { .. } => Label::Red,
         LayerSource::Text => Label::Red,
         LayerSource::Shape => Label::Blue,

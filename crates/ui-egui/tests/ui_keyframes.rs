@@ -1,5 +1,5 @@
 //! Headless checks for Timeline keyframes as a person uses them: dragging keys over many frames
-//! in one gesture (the drag used to end after the first frame), Shift-snapping, and Ctrl+C /
+//! in one gesture (the drag used to end after the first frame), Shift-snapping, Ctrl+C /
 //! Ctrl+V, which the windowing layer delivers as clipboard events rather than key presses.
 
 use effectcraft_engine::Session;
@@ -148,6 +148,23 @@ fn shift_click_toggles_and_ctrl_click_switches_interpolation() {
     assert_eq!(key(&h).out_interp, effectcraft_engine::keyframe::Interp::Hold);
 }
 
+/// Clicking a key in the Timeline selects its property and layer too, as in After Effects, so
+/// the Graph Editor shows the key's curve (#252).
+#[test]
+fn a_key_clicked_in_the_timeline_shows_in_the_graph_editor() {
+    let (mut h, id, uid) = harness();
+    h.state_mut().session.execute("edit.deselectAll", json!({})).unwrap();
+    h.run_steps(2);
+    let ks = keys(&h, uid);
+    click_with(&mut h, ks[1], Default::default());
+    let st = &h.state().session.state;
+    assert_eq!(st.selected_keys.len(), 1);
+    assert_eq!((st.selected_props.clone(), st.selected_layers.clone()), (vec![(id, uid)], vec![id]), "the key's property and layer");
+    h.state_mut().ui.timeline.graph_editor = true;
+    h.run_steps(4);
+    assert!(h.state().auto.find(&format!("timeline.graph.key.{uid}.0.1")).is_some(), "the Graph Editor shows the key");
+}
+
 #[test]
 fn graph_editor_drags_move_every_selected_key_and_shift_keeps_an_axis() {
     let (mut h, id, uid) = harness();
@@ -235,4 +252,178 @@ fn k_follows_the_revealed_properties_and_auto_select_picks_the_speed_graph_for_p
     h.state_mut().ui.timeline.graph_mode = "value".into();
     h.run_steps(3);
     assert!(h.state().auto.find(&format!("timeline.graph.key.{pos}.1.0")).is_some(), "value graph: X and Y");
+}
+
+/// #284: in the Graph Editor, dragging the handle of one selected key moves the same handle of
+/// every selected key with it (After Effects), in one undo step.
+#[test]
+fn a_graph_handle_drag_moves_the_handles_of_every_selected_key() {
+    let (mut h, id, uid) = harness();
+    let s = &mut h.state_mut().session;
+    s.execute("prop.addKey", json!({"layer": id.0, "path": "transform/opacity", "time": 2.0, "value": 0.0})).unwrap();
+    s.execute("prop.select", json!({"layer": id.0, "prop": uid})).unwrap();
+    s.execute("keys.selectAll", json!({})).unwrap();
+    s.execute("keys.easyEase", json!({})).unwrap();
+    h.state_mut().ui.timeline.graph_editor = true;
+    h.run_steps(4);
+    // (in, out) influence of each key.
+    let influences = |h: &Harness<'_, EffectcraftApp>| -> Vec<(f64, f64)> {
+        let l = h.state().session.active_comp().unwrap().layer(id).unwrap().clone();
+        let keys = l.props.prop("transform/opacity").unwrap().keys.clone();
+        keys.iter().map(|k| (k.in_ease.first().map_or(0.0, |e| e.influence), k.out_ease.first().map_or(0.0, |e| e.influence))).collect()
+    };
+    let before = influences(&h);
+    let handle = |h: &Harness<'_, EffectcraftApp>, key: usize| {
+        let e = h.state().auto.find(&format!("timeline.graph.handle.{uid}.0.{key}.out")).unwrap_or_else(|| panic!("no handle {key}")).clone();
+        pos2(e.rect[0] + e.rect[2] / 2.0, e.rect[1] + e.rect[3] / 2.0)
+    };
+    let px_per_s = {
+        let at = |i: usize| h.state().auto.find(&format!("timeline.graph.key.{uid}.0.{i}")).unwrap().rect[0];
+        at(1) - at(0)
+    };
+    let (k0, k1) = (handle(&h, 0), handle(&h, 1));
+    let undo = h.state().session.history.undo.len();
+    // Key 1's out handle 0.2 s further out (the keys are 1 s apart): key 0's goes along.
+    drag(&mut h, k1, k1 + egui::vec2(px_per_s * 0.2, 0.0), Default::default());
+    let after = influences(&h);
+    for i in [0, 1] {
+        assert!((after[i].1 - before[i].1 - 0.2).abs() < 0.01, "key {i}: {:?} → {:?}", before[i], after[i]);
+    }
+    assert_eq!((after[1].0, after[2].0), (before[1].0, before[2].0), "the in handles stay");
+    assert_eq!(h.state().session.history.undo.len(), undo + 1, "one undo step");
+    assert!((handle(&h, 0).x - k0.x - px_per_s * 0.2).abs() < 2.0, "key 0's handle moved on screen");
+}
+
+/// Whether the key mark `id` was drawn selected in the last frame (its automation label says so).
+fn drawn_selected(h: &Harness<'_, EffectcraftApp>, id: &str) -> bool {
+    let a = &h.state().auto;
+    let e = a.elements.iter().chain(a.previous.iter()).find(|e| e.id == id).unwrap_or_else(|| panic!("no element {id}"));
+    e.label.ends_with("(selected)")
+}
+
+/// The property's key mark ids, left to right.
+fn key_ids(h: &Harness<'_, EffectcraftApp>, uid: u64) -> Vec<String> {
+    let mut v: Vec<(f32, String)> = h.state().auto.query(&format!("timeline.key.{uid}.")).iter().map(|e| (e.rect[0], e.id.clone())).collect();
+    v.sort_by(|a, b| a.0.total_cmp(&b.0));
+    v.into_iter().map(|(_, id)| id).collect()
+}
+
+fn press(h: &mut Harness<'_, EffectcraftApp>, p: Pos2, modifiers: egui::Modifiers) {
+    h.input_mut().events.push(Event::PointerMoved(p));
+    h.step();
+    h.input_mut().events.push(Event::ModifiersChanged(modifiers));
+    h.input_mut().events.push(Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed: true, modifiers });
+    h.step();
+}
+
+/// Move with the button held, in small steps.
+fn move_to(h: &mut Harness<'_, EffectcraftApp>, from: Pos2, to: Pos2) {
+    for i in 1..=8 {
+        h.input_mut().events.push(Event::PointerMoved(from + (to - from) * (i as f32 / 8.0)));
+        h.step();
+    }
+}
+
+fn release(h: &mut Harness<'_, EffectcraftApp>, p: Pos2, modifiers: egui::Modifiers) {
+    h.input_mut().events.push(Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed: false, modifiers });
+    h.step();
+    h.input_mut().events.push(Event::ModifiersChanged(Default::default()));
+    h.run_steps(2);
+}
+
+/// A key marquee shows the keys it would select while it is dragged, Shift adding them to the
+/// selection; leaving the box un-highlights them; the release commits what was shown (After
+/// Effects highlights live; keys used to turn selected only on release).
+#[test]
+fn a_key_marquee_highlights_keys_while_the_button_is_down() {
+    let (mut h, _, uid) = harness();
+    h.state_mut().session.execute("keys.select", json!({"keys": []})).unwrap();
+    h.run_steps(2);
+    let ks = keys(&h, uid);
+    let ids = key_ids(&h, uid);
+    // From between the keys (empty time graph), over the 1 s key.
+    let start = pos2((ks[0].x + ks[1].x) / 2.0, ks[1].y - 6.0);
+    let over = pos2(ks[1].x + 20.0, ks[1].y + 6.0);
+    press(&mut h, start, Default::default());
+    move_to(&mut h, start, over);
+    assert!(drawn_selected(&h, &ids[1]), "the key in the box shows selected while dragging");
+    assert!(!drawn_selected(&h, &ids[0]));
+    assert!(h.state().session.state.selected_keys.is_empty(), "not committed before the release");
+    // Back out of it: un-highlighted, live.
+    let back = pos2(ks[1].x - 20.0, ks[1].y + 6.0);
+    move_to(&mut h, over, back);
+    assert!(!drawn_selected(&h, &ids[1]), "leaving the box un-highlights it");
+    move_to(&mut h, back, over);
+    assert!(drawn_selected(&h, &ids[1]));
+    release(&mut h, over, Default::default());
+    assert_eq!(h.state().session.state.selected_keys.len(), 1, "the release commits what was shown");
+    assert!(drawn_selected(&h, &ids[1]) && !drawn_selected(&h, &ids[0]));
+
+    // Shift: the box adds to the selection, shown live too.
+    let shift = egui::Modifiers { shift: true, ..Default::default() };
+    let start = pos2(ks[0].x + 15.0, ks[0].y - 6.0);
+    let over = pos2(ks[0].x - 8.0, ks[0].y + 6.0);
+    press(&mut h, start, shift);
+    move_to(&mut h, start, over);
+    assert!(drawn_selected(&h, &ids[0]) && drawn_selected(&h, &ids[1]), "Shift shows the keys added to the selection");
+    release(&mut h, over, shift);
+    assert_eq!(h.state().session.state.selected_keys.len(), 2);
+}
+
+/// Pressing a key selects it on the press, as in After Effects; pressing one of several selected
+/// keys keeps them all (a drag moves them all) and a release without a drag reduces the
+/// selection to that key.
+#[test]
+fn a_key_turns_selected_on_the_press() {
+    let (mut h, id, uid) = harness();
+    h.state_mut().session.execute("keys.select", json!({"keys": []})).unwrap();
+    h.run_steps(2);
+    let ks = keys(&h, uid);
+    let ids = key_ids(&h, uid);
+    press(&mut h, ks[1], Default::default());
+    h.run_steps(1);
+    assert_eq!(h.state().session.state.selected_keys.len(), 1, "selected while the button is down");
+    assert!(drawn_selected(&h, &ids[1]));
+    release(&mut h, ks[1], Default::default());
+    assert_eq!(h.state().session.state.selected_keys.len(), 1);
+
+    // Two selected: pressing one keeps both; releasing without a drag reduces to it.
+    h.state_mut().session.execute("keys.selectAll", json!({})).unwrap();
+    h.run_steps(2);
+    press(&mut h, ks[0], Default::default());
+    h.run_steps(1);
+    assert_eq!(h.state().session.state.selected_keys.len(), 2, "the group stays selected on the press");
+    release(&mut h, ks[0], Default::default());
+    assert_eq!(h.state().session.state.selected_keys.len(), 1, "a click reduces the selection to the key");
+
+    // Two selected: pressing one and dragging moves both.
+    h.state_mut().session.execute("keys.selectAll", json!({})).unwrap();
+    h.run_steps(2);
+    let px_per_s = ks[1].x - ks[0].x;
+    drag(&mut h, ks[0], pos2(ks[0].x + px_per_s * 0.5, ks[0].y), Default::default());
+    assert_eq!(key_times(&h, id), vec![0.5, 1.5], "both selected keys moved");
+    assert_eq!(h.state().session.state.selected_keys.len(), 2);
+}
+
+/// The Graph Editor's key marquee highlights live too.
+#[test]
+fn a_graph_editor_marquee_highlights_keys_while_the_button_is_down() {
+    let (mut h, id, uid) = harness();
+    let s = &mut h.state_mut().session;
+    s.execute("prop.select", json!({"layer": id.0, "prop": uid})).unwrap();
+    s.execute("keys.select", json!({"keys": []})).unwrap();
+    h.state_mut().ui.timeline.graph_editor = true;
+    h.run_steps(4);
+    let key = |i: usize| format!("timeline.graph.key.{uid}.0.{i}");
+    let e = h.state().auto.find(&key(1)).unwrap().clone();
+    let k1 = pos2(e.rect[0] + e.rect[2] / 2.0, e.rect[1] + e.rect[3] / 2.0);
+    let start = pos2(k1.x - 30.0, k1.y + 30.0);
+    let over = pos2(k1.x + 12.0, k1.y - 8.0);
+    press(&mut h, start, Default::default());
+    move_to(&mut h, start, over);
+    assert!(drawn_selected(&h, &key(1)), "the key in the box shows selected while dragging");
+    assert!(!drawn_selected(&h, &key(0)));
+    assert!(h.state().session.state.selected_keys.is_empty(), "not committed before the release");
+    release(&mut h, over, Default::default());
+    assert_eq!(h.state().session.state.selected_keys.len(), 1);
 }

@@ -557,7 +557,8 @@ impl Func {
     }
 }
 
-/// PDF text string → Rust string (UTF-16BE with a byte-order mark, else PDFDocEncoding ≈ Latin-1).
+/// PDF text string → Rust string (ISO 32000-1:2008, Table D.2 PDFDocEncoding;
+/// a byte-order mark selects UTF-16BE or PDF 2.0 UTF-8).
 pub fn text_string(b: &[u8]) -> String {
     if b.starts_with(&[0xFE, 0xFF]) {
         let u: Vec<u16> = b[2..].as_chunks::<2>().0.iter().map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
@@ -566,12 +567,34 @@ pub fn text_string(b: &[u8]) -> String {
     if let Some(rest) = b.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
         return String::from_utf8_lossy(rest).into_owned();
     }
-    b.iter().map(|&c| c as char).collect()
+    const ACCENTS: [char; 8] = ['˘', 'ˇ', 'ˆ', '˙', '˝', '˛', '˚', '˜'];
+    const SPECIAL: [char; 31] = [
+        '•', '†', '‡', '…', '—', '–', 'ƒ', '⁄', '‹', '›', '−', '‰', '„', '“', '”', '‘', '’', '‚', '™', 'ﬁ', 'ﬂ', 'Ł', 'Œ', 'Š', 'Ÿ', 'Ž', 'ı', 'ł', 'œ', 'š',
+        'ž',
+    ];
+    b.iter()
+        .map(|&c| match c {
+            0x18..=0x1f => ACCENTS.get((c - 0x18) as usize).copied().unwrap_or('\u{fffd}'),
+            0x80..=0x9e => SPECIAL.get((c - 0x80) as usize).copied().unwrap_or('\u{fffd}'),
+            0xa0 => '€',
+            0x00..=0x08 | 0x0b..=0x0c | 0x0e..=0x17 | 0x7f | 0x9f | 0xad => '\u{fffd}',
+            _ => c as char,
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pdf_document_layer_names_decode_punctuation_and_accents() {
+        assert_eq!(text_string(b"C\xf4TE\r D\x90IVOIRE"), "CôTE\r D’IVOIRE");
+        assert_eq!(text_string(&[0x18, 0x1f, 0x80, 0x8a, 0x93, 0x9e, 0xa0]), "˘˜•−ﬁž€");
+        assert_eq!(text_string(&[0x7f, 0x9f, 0xad]), "\u{fffd}\u{fffd}\u{fffd}");
+        assert_eq!(text_string(&[0xfe, 0xff, 0x20, 0x19]), "’");
+        assert_eq!(text_string(&[0xef, 0xbb, 0xbf, 0xc3, 0xb4]), "ô");
+    }
 
     #[test]
     fn calculator_functions() {

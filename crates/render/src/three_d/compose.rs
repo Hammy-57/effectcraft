@@ -103,11 +103,7 @@ fn geo(cam: &CameraState, world: Mat4, b: [f64; 4], comp: (f64, f64), scale: f64
     let hinv = h.inverse()?;
     let cv = cam.view * world;
     let depth = [cv.0[2][0], cv.0[2][1], cv.0[2][3]];
-    let normal = world.apply_vec(vec3(1.0, 0.0, 0.0)).cross(world.apply_vec(vec3(0.0, 1.0, 0.0)));
-    if normal.length() < 1e-12 {
-        return None;
-    }
-    let normal = normal.normalize();
+    let normal = plane_normal(world)?;
     let corners = [(b[0], b[1]), (b[2], b[1]), (b[2], b[3]), (b[0], b[3])];
     let (mut x0, mut y0, mut x1, mut y1) = (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
     let mut behind = 0;
@@ -144,6 +140,13 @@ fn geo(cam: &CameraState, world: Mat4, b: [f64; 4], comp: (f64, f64), scale: f64
 fn buf_bounds(buf: &Buf) -> [f64; 4] {
     let s = buf.scale.max(1e-9);
     [-buf.offset[0] / s, -buf.offset[1] / s, (buf.img.width as f64 - buf.offset[0]) / s, (buf.img.height as f64 - buf.offset[1]) / s]
+}
+
+/// The unit normal of a layer plane at `world` (layer → world); `None` for a plane scaled to
+/// nothing along an axis, which shows nothing.
+fn plane_normal(world: Mat4) -> Option<Vec3> {
+    let normal = world.apply_vec(vec3(1.0, 0.0, 0.0)).cross(world.apply_vec(vec3(0.0, 1.0, 0.0)));
+    (normal.length() >= 1e-12).then(|| normal.normalize())
 }
 
 /// Inverse-map an output pixel centre onto a plane: (u, v, camera depth).
@@ -235,7 +238,8 @@ fn prepare_with<'a>(
     // layer facing the camera, progressive for a tilted one).
     let mut plane_dof = None;
     let mut bounds = buf_bounds(&buf);
-    if let Some(dof) = cam.dof.filter(|_| !ctx.comp.draft_3d && !r.opts.draft) {
+    // A degenerate plane is never drawn (see [`geo`]): blurring it would only cost.
+    if let Some(dof) = cam.dof.filter(|_| !ctx.comp.draft_3d && !r.opts.draft && plane_normal(world).is_some()) {
         if r.defer_dof {
             // An accelerator blurs: hand it the radius map of the padded buffer.
             if let Some((pd, padded_bounds)) = dof_plan(&cam, &dof, world, &buf) {
@@ -259,7 +263,13 @@ fn prepare_with<'a>(
                 let f = phase + angle * i as f64 / (n - 1) as f64;
                 let sub = ctx.at(ctx.time + Tick::from_seconds_f64(f * fd));
                 let c = camera_for(r, &sub);
-                geo(&c, outer * sub.world_matrix(layer) * local, bounds, comp, s, out, r.out_offset())
+                let w = outer * sub.world_matrix(layer) * local;
+                // Depth from the frame's camera, as for unblurred layers: planes that stay
+                // coplanar keep their stack order while the camera moves.
+                geo(&c, w, bounds, comp, s, out, r.out_offset()).map(|g| {
+                    let cv = cam.view * w;
+                    Geo { depth: [cv.0[2][0], cv.0[2][1], cv.0[2][3]], ..g }
+                })
             })
             .collect()
     };
@@ -295,13 +305,14 @@ fn dof_radii(cam: &CameraState, dof: &super::camera::Dof, world: Mat4, buf: &Buf
     dof_radii_at(cam, dof, world, (buf.img.width as usize, buf.img.height as usize), buf.offset, buf.scale)
 }
 
-fn dof_radii_at(cam: &CameraState, dof: &super::camera::Dof, world: Mat4, (w, h): (usize, usize), offset: [f64; 2], scale: f64) -> Vec<f32> {
+pub(super) fn dof_radii_at(cam: &CameraState, dof: &super::camera::Dof, world: Mat4, (w, h): (usize, usize), offset: [f64; 2], scale: f64) -> Vec<f32> {
     let s = scale.max(1e-9);
     let sx = world.apply_vec(vec3(1.0, 0.0, 0.0)).length().max(1e-9);
     let at = |x: f64, y: f64| cam.depth(world.apply(vec3((x - offset[0]) / s, (y - offset[1]) / s, 0.0)));
     // Camera depth is affine across a plane.
     let z0 = at(0.5, 0.5);
     let (zx, zy) = (at(1.5, 0.5) - z0, at(0.5, 1.5) - z0);
+    let cap = MAX_DOF_REACH / iris_stretch(dof);
     let mut out = vec![0.0f32; w * h];
     out.par_chunks_mut(w.max(1)).enumerate().for_each(|(y, row)| {
         for (x, o) in row.iter_mut().enumerate() {
@@ -309,17 +320,31 @@ fn dof_radii_at(cam: &CameraState, dof: &super::camera::Dof, world: Mat4, (w, h)
             if z <= super::camera::NEAR {
                 continue;
             }
-            // coc · ½ / (zoom / z · sx) · scale
-            *o = (dof.coc(z) * 0.5 * z / (cam.zoom * sx) * s) as f32;
+            // coc · ½ / (zoom / z · sx) · scale, bounded (a plane scaled almost to nothing
+            // magnifies it without limit).
+            let r = dof.coc(z) * 0.5 * z / (cam.zoom * sx) * s;
+            *o = if r.is_nan() { 0.0 } else { r.clamp(0.0, cap) as f32 };
         }
     });
     out
 }
 
+/// The farthest a depth-of-field blur reaches (buffer pixels, along the iris' long axis). Real
+/// cameras stay far below it; only a plane scaled almost to nothing (its layer pixels tiny on
+/// screen) gets near, and blurs less than the optics say rather than allocating without limit.
+pub(super) const MAX_DOF_REACH: f64 = 1024.0;
+
+/// How far the iris' aspect ratio stretches a blur radius along its long axis.
+fn iris_stretch(dof: &super::camera::Dof) -> f64 {
+    let aspect = if dof.iris.aspect.is_finite() { dof.iris.aspect.clamp(0.01, 100.0) } else { 1.0 };
+    let a = aspect.sqrt();
+    a.max(1.0 / a)
+}
+
 /// The padding [`dof_blur`] gives a buffer whose largest blur radius is `rmax`.
-fn dof_pad(dof: &super::camera::Dof, rmax: f64) -> u32 {
-    let a = dof.iris.aspect.clamp(0.01, 100.0).sqrt().max(1.0 / dof.iris.aspect.clamp(0.01, 100.0).sqrt());
-    (rmax * a).ceil() as u32 + 2
+pub(super) fn dof_pad(dof: &super::camera::Dof, rmax: f64) -> u32 {
+    let reach = (rmax * iris_stretch(dof)).ceil();
+    if reach.is_nan() { 2 } else { reach.clamp(0.0, MAX_DOF_REACH) as u32 + 2 }
 }
 
 /// [`dof_blur`] planned for an accelerator: the padding, radius map and levels, and the padded
@@ -373,7 +398,7 @@ fn matte_for(r: &Renderer, ctx: &EvalCtx, layer: &Layer, out: (u32, u32)) -> Opt
                 let lights = scene_lights(ctx);
                 composite(&mut img, &its, &lights, &[], m.id.0 as u32);
             }
-        } else if let Some(mb) = r.layer_buf(ctx, m) {
+        } else if let Some(mb) = r.matte_buf(ctx, m) {
             r.place(ctx, m, &mb, &mut img, BlendMode::Normal, ctx.opacity(m) as f32);
         }
     }
@@ -413,6 +438,13 @@ pub(crate) fn draw_run(r: &Renderer, ctx: &EvalCtx, run: &[&Layer], canvas: &mut
     if let Some(k) = run.iter().position(|l| l.switches.adjustment) {
         draw_run(r, ctx, &run[..k], canvas);
         r.draw_layer(ctx, run[k], canvas, false);
+        draw_run(r, ctx, &run[k + 1..], canvas);
+        return;
+    }
+    // A collapsed precomp with effects is drawn as one layer that does not intersect the run.
+    if let Some((k, item)) = run.iter().enumerate().find_map(|(k, l)| r.collapsed_fx(ctx, l).map(|item| (k, item))) {
+        draw_run(r, ctx, &run[..k], canvas);
+        r.draw_collapsed_fx(ctx, run[k], item, canvas);
         draw_run(r, ctx, &run[k + 1..], canvas);
         return;
     }

@@ -681,46 +681,109 @@ fn angle(a: V3, b: V3) -> f64 {
     dot(a, b).clamp(-1.0, 1.0).acos()
 }
 
-fn vr_chromatic(ctx: &EffectCtx, mut b: Buf) -> Buf {
-    let k = [ctx.params.f("aberrationRed"), ctx.params.f("aberrationGreen"), ctx.params.f("aberrationBlue")].map(|v| v / 100.0 * 0.1);
-    if k.iter().all(|v| *v == 0.0) {
-        return b;
+/// VR Chromatic Aberrations' per-eye geometry, shared with the GPU path. Measured on After
+/// Effects' renders of a dot grid (aerender, VR Chromatic Aberrations 2026):
+///
+/// - each eye is an equirectangular patch spanning Horizontal × Vertical Field of View, centred
+///   on the front; the Point of Interest is in eye pixels, wrapping at the eye's size (a stereo
+///   frame's centre is the top / left edge of each eye); Falloff Invert moves it to its antipode;
+/// - a channel at angle θ from the point samples the source along the same great circle at
+///   θ · (1 − 0.0095 · aberration · cos(θ / 2)^(11.3 − 0.1 · falloff)), so positive values push
+///   the channel outward, negative pull it in; the bearing is unchanged;
+/// - directions outside the patch are transparent; the alpha is the mean of the three
+///   channels' samples (each channel keeps its own premultiplied value).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ChromaticSetup {
+    /// Per channel: 0.0095 · aberration.
+    pub k: [f64; 3],
+    /// Falloff exponent of cos(θ / 2).
+    pub power: f64,
+    /// Point of interest as fractions of the eye (0..1).
+    pub poi: [f64; 2],
+    pub invert: bool,
+    /// Field of view, radians.
+    pub fov: [f64; 2],
+}
+
+impl ChromaticSetup {
+    /// `None` when every aberration is zero (identity).
+    pub fn new(ctx: &EffectCtx) -> Option<Self> {
+        let pr = ctx.params;
+        let k = [pr.f("aberrationRed"), pr.f("aberrationGreen"), pr.f("aberrationBlue")].map(|v| if v.is_finite() { v * 0.0095 } else { 0.0 });
+        if k.iter().all(|v| *v == 0.0) {
+            return None;
+        }
+        let power = 11.3 - 0.1 * pr.f("falloff").clamp(0.0, 100.0);
+        let (cols, rows) = match layout(ctx) {
+            1 => (1.0, 2.0),
+            2 => (2.0, 1.0),
+            _ => (1.0, 1.0),
+        };
+        let eye = [(ctx.layer_size[0] / cols).max(1e-9), (ctx.layer_size[1] / rows).max(1e-9)];
+        let pt = pr.v2("pointOfInterest");
+        let frac = |v: f64, n: f64| if v.is_finite() { (v / n).rem_euclid(1.0) } else { 0.5 };
+        let fov = |id: &str, max: f64| {
+            let v = pr.f(id);
+            (if v.is_finite() { v.clamp(1.0, max) } else { max }).to_radians()
+        };
+        Some(Self {
+            k,
+            power,
+            poi: [frac(pt[0], eye[0]), frac(pt[1], eye[1])],
+            invert: pr.b("falloffInvert"),
+            fov: [fov("horizontalFov", 360.0), fov("verticalFov", 180.0)],
+        })
     }
-    let center = mv(&rotation(ctx.params.f("centerTilt"), ctx.params.f("centerPan"), 0.0), [0.0, 0.0, 1.0]);
-    let falloff = (ctx.params.f("falloff") / 100.0).clamp(0.0, 1.0);
-    // Falloff Invert keeps the aberration near the point of interest instead of away from it.
-    let invert = ctx.params.b("falloffInvert");
+
+    /// Direction of the eye position (u, v) in fractions.
+    pub fn dir(&self, u: f64, v: f64) -> V3 {
+        let lon = (u - 0.5) * self.fov[0];
+        let lat = (0.5 - v) * self.fov[1];
+        [lat.cos() * lon.sin(), lat.sin(), lat.cos() * lon.cos()]
+    }
+
+    /// The point of interest's direction (the antipode with Falloff Invert).
+    pub fn center(&self) -> V3 {
+        let c = self.dir(self.poi[0], self.poi[1]);
+        if self.invert { [-c[0], -c[1], -c[2]] } else { c }
+    }
+
+    /// Whether the patch is the whole sphere (samples wrap instead of turning transparent).
+    pub fn full_sphere(&self) -> bool {
+        self.fov[0] >= 2.0 * PI - 1e-9 && self.fov[1] >= PI - 1e-9
+    }
+}
+
+fn vr_chromatic(ctx: &EffectCtx, mut b: Buf) -> Buf {
+    let Some(cs) = ChromaticSetup::new(ctx) else {
+        return b;
+    };
+    let center = cs.center();
+    let wrap = cs.full_sphere();
     b.img = per_eye(&b.img, layout(ctx), |e, _| {
         let (w, h) = (e.width as f64, e.height as f64);
         let mut o = Image::new(e.width, e.height);
         o.rows_mut().for_each(|(y, row)| {
             for (x, px) in row.iter_mut().enumerate() {
-                let d = equi_dir(x as f64 + 0.5, y as f64 + 0.5, w, h);
-                let th = angle(d, center);
-                // Axis perpendicular to centre and d: rotate d about it toward/away from centre.
-                let ax = [center[1] * d[2] - center[2] * d[1], center[2] * d[0] - center[0] * d[2], center[0] * d[1] - center[1] * d[0]];
-                let al = dot(ax, ax).sqrt();
-                let weight = (th / PI).powf(1.0 + falloff * 3.0);
-                let weight = if invert { 1.0 - weight } else { weight };
-                let mut out = [0.0f32; 4];
-                for c in 0..3 {
-                    let s = if al < 1e-9 {
-                        e.data[(y * e.width as usize) + x]
-                    } else {
-                        let new_th = th * (1.0 - k[c] * weight);
-                        // Direction at angle new_th from the centre in the plane of (centre, d).
-                        let perp = norm([d[0] - center[0] * th.cos(), d[1] - center[1] * th.cos(), d[2] - center[2] * th.cos()]);
-                        let nd = [
-                            center[0] * new_th.cos() + perp[0] * new_th.sin(),
-                            center[1] * new_th.cos() + perp[1] * new_th.sin(),
-                            center[2] * new_th.cos() + perp[2] * new_th.sin(),
-                        ];
-                        let (sx, sy) = equi_px(nd, w, h);
-                        sample_equi(e, sx, sy)
-                    };
-                    out[c] = s[c];
-                    out[3] = out[3].max(s[3]);
-                }
+                let d = cs.dir((x as f64 + 0.5) / w, (y as f64 + 0.5) / h);
+                let c = dot(center, d).clamp(-1.0, 1.0);
+                let th = c.acos();
+                let perp = [d[0] - center[0] * c, d[1] - center[1] * c, d[2] - center[2] * c];
+                let pl = dot(perp, perp).sqrt();
+                let weight = (th * 0.5).cos().max(0.0).powf(cs.power);
+                let s = cs.k.map(|k| {
+                    if pl < 1e-12 {
+                        return e.data.get(y * e.width as usize + x).copied().unwrap_or([0.0; 4]);
+                    }
+                    let nt = th * (1.0 - k * weight);
+                    let (sn, cn) = nt.sin_cos();
+                    let nd = [0, 1, 2].map(|i| center[i] * cn + perp[i] / pl * sn);
+                    let lon = nd[0].atan2(nd[2]);
+                    let lat = nd[1].clamp(-1.0, 1.0).asin();
+                    let (sx, sy) = ((lon / cs.fov[0] + 0.5) * w, (0.5 - lat / cs.fov[1]) * h);
+                    if wrap { sample_equi(e, sx, sy) } else { e.sample_bilinear(sx, sy) }
+                });
+                let out = [s[0][0], s[1][1], s[2][2], (s[0][3] + s[1][3] + s[2][3]) / 3.0];
                 *px = out;
             }
         });
@@ -996,12 +1059,14 @@ pub fn specs() -> Vec<EffectSpec> {
             "ec.vr.chromaticaberrations",
             "VR Chromatic Aberrations",
             vec![
+                p("autoVrProperties", "Auto VR Properties", Value::Bool(false), ParamUi::Checkbox),
                 layout_param(),
-                ang("centerTilt", "Center Tilt"),
-                ang("centerPan", "Center Pan"),
+                p("horizontalFov", "Horizontal Field of View", num(360.0), slider(1.0, 360.0, 1.0, 360.0, 1)),
+                p("verticalFov", "Vertical Field of View", num(180.0), slider(1.0, 180.0, 1.0, 180.0, 1)),
+                p("pointOfInterest", "Point of Interest", Value::Vec2([0.5, 0.5]), ParamUi::Point),
                 p("aberrationRed", "Aberration (Red)", num(10.0), slider(-100.0, 100.0, -100.0, 100.0, 1)),
                 p("aberrationGreen", "Aberration (Green)", num(0.0), slider(-100.0, 100.0, -100.0, 100.0, 1)),
-                p("aberrationBlue", "Aberration (Blue)", num(-10.0), slider(-100.0, 100.0, -100.0, 100.0, 1)),
+                p("aberrationBlue", "Aberration (Blue)", num(10.0), slider(-100.0, 100.0, -100.0, 100.0, 1)),
                 p("falloff", "Falloff Distance", num(50.0), slider(0.0, 100.0, 0.0, 100.0, 1)),
                 p("falloffInvert", "Falloff Invert", Value::Bool(false), ParamUi::Checkbox),
             ],
@@ -1320,6 +1385,43 @@ mod tests {
         let pic = Image::filled(64, 32, [1.0, 0.0, 0.0, 1.0]);
         let s = run_fx("ec.vr.planetosphere", &[], pic, 0.0, EffectEnv::default());
         assert!(s.img.get(32, 16)[3] > 0.99 && s.img.get(1, 16)[3] < 0.01);
+    }
+
+    /// VR Chromatic Aberrations follows After Effects' measured model: on a 360 × 180 frame (one
+    /// pixel per degree) a white dot 30° right of the Point of Interest keeps its green, while red
+    /// at Aberration 5 lands where θ · (1 − 0.0475 · cos(θ / 2)^6.3) = 30°, further out.
+    #[test]
+    fn chromatic_aberrations_follow_the_measured_model() {
+        let mut img = Image::filled(360, 180, [0.0, 0.0, 0.0, 1.0]);
+        for (x, y) in [(209, 89), (210, 89), (209, 90), (210, 90)] {
+            img.set(x, y, [1.0, 1.0, 1.0, 1.0]);
+        }
+        let vals = [("aberrationRed", num(5.0)), ("aberrationBlue", num(0.0)), ("pointOfInterest", Value::Vec2([180.0, 90.0]))];
+        let out = run_fx("ec.vr.chromaticaberrations", &vals, img, 0.0, EffectEnv::default());
+        let centroid = |c: usize| {
+            let (mut s, mut m) = (0.0, 0.0);
+            for x in 150..300i64 {
+                let v = (out.img.get(x, 89)[c] + out.img.get(x, 90)[c]) as f64;
+                s += v * (x as f64 + 0.5);
+                m += v;
+            }
+            s / m
+        };
+        let (mut lo, mut hi) = (30.0f64, 40.0f64);
+        for _ in 0..60 {
+            let mid = 0.5 * (lo + hi);
+            let src = mid * (1.0 - 0.0475 * (mid.to_radians() * 0.5).cos().powf(6.3));
+            if src < 30.0 { lo = mid } else { hi = mid }
+        }
+        assert!((centroid(1) - 210.0).abs() < 0.05, "green {}", centroid(1));
+        assert!((centroid(0) - (180.0 + lo)).abs() < 0.1, "red {} vs {}", centroid(0), 180.0 + lo);
+        // Outside a partial sphere is transparent; the alpha averages the channels' samples.
+        let solid = Image::filled(100, 50, [1.0, 1.0, 1.0, 1.0]);
+        let vals = [("horizontalFov", num(200.0)), ("verticalFov", num(100.0)), ("aberrationRed", num(-40.0)), ("aberrationBlue", num(0.0))];
+        let out = run_fx("ec.vr.chromaticaberrations", &vals, solid, 0.0, EffectEnv::default());
+        let corner = out.img.get(0, 0);
+        assert!(corner[0] < 1e-6 && (corner[3] - 2.0 / 3.0).abs() < 1e-3, "{corner:?}");
+        assert!((out.img.get(50, 25)[3] - 1.0).abs() < 1e-6);
     }
 
     #[test]

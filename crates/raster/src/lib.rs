@@ -7,17 +7,20 @@
 
 pub mod blur;
 pub mod channels3d;
+pub mod compare;
 pub mod cuts;
 pub mod flow;
 pub mod inpaint;
 pub mod scopes;
+pub mod sparse;
 pub mod warp;
 
 use effectcraft_color::{BlendMode, blend_pixel};
 use rayon::prelude::*;
 
-pub use blur::{box_blur, directional_blur, gaussian_blur, radial_blur};
+pub use blur::{box_blur, directional_blur, gaussian_blur, gaussian_support, radial_blur};
 pub use channels3d::AuxChannels;
+pub use sparse::{Sparse, gaussian_blur_sparse, resample_sparse};
 pub use warp::{Sampling, WarpOpts, accumulate_warp, composite_warp, composite_warp_reference, resample};
 
 pub type Px = [f32; 4];

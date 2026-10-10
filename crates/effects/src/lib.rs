@@ -41,7 +41,7 @@ pub use color_fx::{
 };
 pub use color2::{Curve, auto_correct_settings, color_link_mode, color_link_sample, equalize_tables, luma_clip_points, shadow_highlight_amounts};
 pub use color3::OffsetCurve;
-pub use distort::transform_shutter;
+pub use distort::{BULGE_STRENGTH, transform_effect_matrix, transform_extent, transform_shutter, twirl_radius, wave_warp_cycles};
 pub use distort2::{MAGNIFY_MODES, bezier_grid, parse_mesh};
 pub use distort3::{RESHAPE_POINTS, ReshapeSetup, SmearSetup, reshape_setup, smear_setup, warp_inverse_map};
 pub use distort4::liquify_mesh;
@@ -49,15 +49,20 @@ use effectcraft_keyframe::Value;
 use effectcraft_project::build::Ids;
 use effectcraft_project::{GroupKind, ParamUi, PropGroup, Property};
 pub use effectcraft_raster::{AuxChannels, Image};
-pub use misc::{INVERT_ALPHA, INVERT_CHANNELS, glow_ab_t, glow_operation};
+pub use generate::four_color_softening;
+pub use misc::{
+    GLOW_KNEE, GLOW_OPERATIONS, GLOW_SIGMA_PER_RADIUS, INVERT_ALPHA, INVERT_CHANNELS, glow_ab_position, glow_ab_t, glow_bright, glow_composite, glow_operation,
+};
 pub use sim::particle_state;
 pub use sim3::{PgBlit, PgPlan, playground_plan, playground_state};
+pub use stylize2::motion_tile_growth;
 pub use stylize2::strobe_on;
 // CPU helpers the GPU kernels share (effectcraft-gpu).
 pub use blur2::{camera_lens_plain, camera_lens_spans};
 pub use generate::gen_mode;
+pub use generate::gradient_ramp_space;
 pub use generate2::pattern_kind as cell_pattern_kind;
-pub use generate2::{BoltSeg, Contour, Ghost, RadioPlan, Wave, flare_ghosts, lightning_segments, radio_plan};
+pub use generate2::{BoltSeg, Contour, Ghost, RadioPlan, SweepGeometry, Wave, flare_ghosts, light_sweep_geometry, lightning_segments, radio_plan};
 pub use generate3::{
     Coverage, MarksPlan, PaintPlan, Seg, eyedropper_color, marks_plan, paint_bucket_region, paint_plan, plan_reads_pixels, poly_segs, scribble_style,
 };
@@ -82,7 +87,7 @@ pub use sim2::{
     wave_world_plan,
 };
 pub use utility::{Lut, load_lut};
-pub use vr::{equi_dir as vr_equi_dir, rotation as vr_rotation};
+pub use vr::{ChromaticSetup as VrChromaticSetup, equi_dir as vr_equi_dir, rotation as vr_rotation};
 
 /// Effect categories in Effects & Presets order.
 pub const CATEGORIES: &[&str] = &[
@@ -204,7 +209,8 @@ pub fn flatten_params(g: &PropGroup, eval: &mut dyn FnMut(&Property) -> Value) -
     Params { values }
 }
 
-/// A layer image in flight: layer-space point `p` sits at pixel `p * scale + offset`.
+/// A layer image in flight: point `p` sits at pixel `p * scale + offset`. Points are in layer
+/// space, or in effect space while the layer's effects run (see [`Buf::rebase`]).
 #[derive(Clone, Debug, Default)]
 pub struct Buf {
     pub img: Image,
@@ -215,6 +221,12 @@ pub struct Buf {
 impl Buf {
     pub fn to_px(&self, p: [f64; 2]) -> (f64, f64) {
         (p[0] * self.scale + self.offset[0], p[1] * self.scale + self.offset[1])
+    }
+    /// Measure from `origin` (in the current coordinates): a point `p` becomes `p − origin`.
+    /// Moves between layer space and effect space (the renderer's `effect_bounds`).
+    pub fn rebase(&mut self, origin: [f64; 2]) {
+        self.offset[0] += origin[0] * self.scale;
+        self.offset[1] += origin[1] * self.scale;
     }
     /// Grow by `pad` transparent pixels on every side.
     pub fn pad(&mut self, pad: u32) {
@@ -258,8 +270,8 @@ pub trait EffectHost: Sync {
         self.layer(id, false)
     }
     /// The effect's own layer at another **layer time** `layer_time` (seconds): its source with
-    /// masks applied, followed by the first `effects` effects of its stack (0 = none, which is
-    /// what After Effects' Time effects see). `None` when unavailable (no host, recursion
+    /// masks applied, followed by the first `effects` effects of its stack (0 = none; the host
+    /// never goes past the effect being rendered). `None` when unavailable (no host, recursion
     /// limit, adjustment layers). Time effects use this to read neighbouring frames.
     fn self_at(&self, _layer_time: f64, _effects: usize) -> Option<Buf> {
         None
@@ -313,6 +325,38 @@ pub struct EffectEnv<'a> {
     /// comp's and the layer's motion blur switches are on (Transform's Use Composition's
     /// Shutter Angle).
     pub shutter: Option<(f64, f64, u32)>,
+    /// A Continuously Rasterize (collapsed) shape or text layer: After Effects runs its effects
+    /// in comp space, their points, angles and sizes in comp pixels. The affine rows `[a, b, c]`,
+    /// `[d, e, f]` take the effect coordinates [`Buf::to_px`] places to comp coordinates
+    /// (`x' = a x + b y + c`). Effects that honour it say so.
+    pub comp_space: Option<[[f64; 3]; 2]>,
+}
+
+impl EffectEnv<'_> {
+    /// Layer units per comp pixel along the effect's x and y axes: `[1, 1]` unless the layer
+    /// runs its effects in comp space ([`Self::comp_space`]). A size measured in comp pixels
+    /// (a blur radius) times these is the size in layer units. For a rotated non-uniform scale
+    /// this is the size's spread along each layer axis (the marginal of the comp-space
+    /// footprint), exact for uniform scale with any rotation and for axis-aligned scale.
+    pub fn comp_px(&self) -> [f64; 2] {
+        let Some([[a, b, _], [d, e, _]]) = self.comp_space else { return [1.0, 1.0] };
+        let det = a * e - b * d;
+        let det2 = det * det;
+        if !det2.is_finite() || det2 < 1e-12 {
+            return [1.0, 1.0];
+        }
+        // Layer-space covariance of a unit comp-space footprint: (MᵀM)⁻¹.
+        let kx = ((b * b + e * e) / det2).sqrt();
+        let ky = ((a * a + d * d) / det2).sqrt();
+        if kx.is_finite() && ky.is_finite() { [kx, ky] } else { [1.0, 1.0] }
+    }
+}
+
+/// Gaussian Blur's standard deviation (pixels) for a Blurriness: measured on After Effects 2026
+/// (the edge of a blurred solid fits a Gaussian with σ = 0.280 × Blurriness for Blurriness 10 to
+/// 160).
+pub fn gaussian_sigma(blurriness: f64) -> f64 {
+    blurriness.max(0.0) * 0.28
 }
 
 /// What an effect gets to render with.
@@ -424,7 +468,12 @@ pub fn categories() -> Vec<&'static str> {
 }
 
 /// After Effects' third-party display names of effects we register under a generic name.
-const ALIASES: &[(&str, &[&str])] = &[("ec.keying.keylight", keylight::KEYLIGHT_ALIASES)];
+const ALIASES: &[(&str, &[&str])] = &[
+    ("ec.keying.keylight", keylight::KEYLIGHT_ALIASES),
+    ("ec.stylize.deepglow", &["PEDG", "Deep Glow"]),
+    ("ec.perspective.shadowstudio2", &["PESS2", "Shadow Studio 2"]),
+    ("ec.perspective.shadowstudio3", &["PESS3", "Shadow Studio 3"]),
+];
 
 /// Other names effect `id` answers to (in [`lookup`] and searches).
 pub fn aliases(id: &str) -> &'static [&'static str] {
@@ -1026,6 +1075,9 @@ pub const TIME_DEPENDENT: &[&str] = &[
     "ec.obsolete.lightning",
     "ec.text.timecode",
     "ec.text.numbers",
+    // The audio visualisers read the Audio Layer's samples around the frame time.
+    "ec.generate.audiospectrum",
+    "ec.generate.audiowaveform",
     // Path Text's jitter changes every frame.
     "ec.obsolete.pathtext",
     // Time effects read neighbouring frames of the layer.

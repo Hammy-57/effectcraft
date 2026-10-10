@@ -47,6 +47,139 @@ fn demo_layer_cache_is_transparent() {
     }
 }
 
+/// `layer.addItem` puts the layer at `index` (1-based) in the stack and starts it at `time`, as a
+/// drop in the Timeline does (#89).
+#[test]
+fn add_item_at_a_stack_index_and_time() {
+    let mut s = Session::default();
+    let clip = s.execute("comp.new", json!({"name": "Clip", "width": 16, "height": 16, "frameRate": 30, "duration": 1})).unwrap()["comp"].as_u64().unwrap();
+    s.execute("comp.new", json!({"name": "Main", "width": 32, "height": 32, "frameRate": 30, "duration": 4})).unwrap();
+    for name in ["C", "B", "A"] {
+        s.execute("layer.newSolid", json!({"name": name})).unwrap();
+    }
+    let names = |s: &Session| s.active_comp().unwrap().layers.iter().map(|l| l.name.clone()).collect::<Vec<_>>();
+    s.execute("layer.addItem", json!({"item": clip, "index": 2, "time": 1.01})).unwrap();
+    assert_eq!(names(&s), ["A", "Clip", "B", "C"]);
+    let l = &s.active_comp().unwrap().layers[1];
+    assert_eq!(l.in_point, effectcraft_time::Tick::from_seconds_f64(1.0), "on the nearest frame");
+    // Past the bottom: the bottom.
+    s.execute("layer.addItem", json!({"item": clip, "index": 99})).unwrap();
+    assert_eq!(names(&s).last().map(String::as_str), Some("Clip 2"));
+    assert!(s.execute("layer.addItem", json!({"item": clip, "index": 0})).is_err(), "1-based");
+}
+
+/// Files dropped on the Timeline or the Composition viewer (`file.import {addToComp}`) become
+/// layers of the comp that was active, one under the other, where they were dropped (#85, #89).
+#[test]
+fn imported_files_go_into_the_comp_where_they_were_dropped() {
+    use effectcraft_project::{Footage, FootageKind};
+    struct Probe;
+    impl crate::Importer for Probe {
+        fn probe(&self, path: &str) -> Result<Footage, String> {
+            Ok(Footage { path: path.into(), kind: FootageKind::Still, width: 64, height: 32, has_video: true, ..Default::default() })
+        }
+    }
+    let mut s = Session { importer: Some(std::sync::Arc::new(Probe)), ..Default::default() };
+    s.execute("comp.new", json!({"name": "Main", "width": 320, "height": 180, "frameRate": 30, "duration": 4})).unwrap();
+    s.execute("layer.newSolid", json!({"name": "Bg"})).unwrap();
+    let params = json!({"paths": ["/drop/a.png", "/drop/b.png"], "addToComp": true, "position": [40.0, 50.0], "index": 1, "time": 1.0});
+    s.execute("file.import", params).unwrap();
+    let comp = s.active_comp().unwrap();
+    assert_eq!(comp.layers.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["a.png", "b.png", "Bg"]);
+    for l in &comp.layers[..2] {
+        assert_eq!(l.props.prop("transform/position").map(|p| p.value.clone()), Some(effectcraft_keyframe::Value::Vec3([40.0, 50.0, 0.0])));
+        assert_eq!(l.in_point, effectcraft_time::Tick::from_seconds_f64(1.0));
+    }
+    // Without `addToComp` they only import.
+    s.execute("file.import", json!({"paths": ["/drop/c.png"]})).unwrap();
+    assert_eq!(s.active_comp().unwrap().layers.len(), 3);
+    assert!(s.execute("layer.addItem", json!({"item": "a.png", "position": [1.0]})).is_err(), "position needs x and y");
+}
+
+/// #270: files dropped or picked in the Import dialog (`file.import {background}`) are probed in
+/// a background job that says which file it is reading and how many are left; then they arrive
+/// in one undo step, all selected, with a count. The same file imported again arrives again.
+#[test]
+fn background_imports_report_progress_and_select_what_arrived() {
+    use effectcraft_project::{Footage, FootageKind, ItemId};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    /// Probes file k once `allow` > k (a slow video; 5 s at most, so an import that waits for it
+    /// fails the test instead of hanging it); `.xyz` files fail.
+    struct Gated {
+        started: AtomicUsize,
+        allow: Arc<AtomicUsize>,
+    }
+    impl crate::Importer for Gated {
+        fn probe(&self, path: &str) -> Result<Footage, String> {
+            let k = self.started.fetch_add(1, Ordering::SeqCst);
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while self.allow.load(Ordering::SeqCst) <= k && std::time::Instant::now() < until {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            if path.ends_with(".xyz") {
+                return Err("unsupported file".into());
+            }
+            Ok(Footage { path: path.into(), kind: FootageKind::Still, width: 64, height: 32, has_video: true, ..Default::default() })
+        }
+    }
+    let allow = Arc::new(AtomicUsize::new(1));
+    let mut s = Session { importer: Some(Arc::new(Gated { started: AtomicUsize::new(0), allow: allow.clone() })), ..Default::default() };
+    s.execute("comp.new", json!({"name": "Main", "width": 320, "height": 180, "frameRate": 30, "duration": 4})).unwrap();
+    let undo = s.history.undo.len();
+    let r = s.execute("file.import", json!({"paths": ["/drop/a.png", "/drop/b.png", "/drop/a.png"], "background": true})).unwrap();
+    let job = r["job"].as_str().unwrap().to_string();
+    // The first file is through; the second is being read.
+    let running = |s: &mut Session| s.execute("jobs.list", json!({})).unwrap()["running"].as_array().unwrap().clone();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while running(&mut s)[0]["done"] != json!(1) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let row = running(&mut s)[0].clone();
+    assert_eq!(row["id"], json!(job));
+    assert_eq!(row["label"], json!("Importing 3 files"));
+    assert_eq!(row["message"], json!("b.png (2 of 3)"));
+    assert_eq!((row["done"].as_u64(), row["total"].as_u64()), (Some(1), Some(3)));
+    assert!(s.project.items.values().all(|i| i.name != "a.png"), "nothing is added before the import finishes");
+    allow.store(usize::MAX, Ordering::SeqCst);
+    s.execute("jobs.wait", json!({})).unwrap();
+    let names = |s: &Session, ids: &[ItemId]| ids.iter().map(|i| s.project.item(*i).unwrap().name.clone()).collect::<Vec<_>>();
+    assert_eq!(names(&s, &s.state.project_selection), ["a.png", "b.png", "a.png"], "everything imported is selected, the same file twice too");
+    assert_eq!(s.history.undo.len(), undo + 1, "one undo step");
+    let rec = s.job_log.last().unwrap();
+    assert_eq!((rec.status.as_str(), rec.message.as_str()), ("done", "Imported 3 items"));
+    assert!(s.drain_events().iter().any(|e| matches!(e, crate::Event::Toast { message, .. } if message == "Imported 3 items")));
+    // Dropped on the viewer: they become layers too; a file that can't be read is reported.
+    s.execute("file.import", json!({"paths": ["/drop/c.png", "/drop/d.xyz"], "background": true, "addToComp": true, "position": [10.0, 20.0]})).unwrap();
+    s.execute("jobs.wait", json!({})).unwrap();
+    assert_eq!(s.active_comp().unwrap().layers.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["c.png"]);
+    assert_eq!(s.job_log.last().unwrap().message, "Imported 1 item. /drop/d.xyz: unsupported file");
+    // Agents and scripts import at once by default.
+    let r = s.execute("file.import", json!({"paths": ["/drop/e.png"]})).unwrap();
+    assert_eq!(r["items"].as_array().map(Vec::len), Some(1));
+}
+
+/// Audio, Lock and Shy don't change pixels: toggling them keeps the cached layers (#103).
+#[test]
+fn audio_lock_and_shy_keep_cached_layers() {
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "C", "width": 160, "height": 90, "frameRate": 30, "duration": 1})).unwrap();
+    s.execute("layer.newSolid", json!({"color": "#3080ff", "width": 80, "height": 40})).unwrap();
+    s.execute("effect.apply", json!({"layer": "#1", "effect": "Gaussian Blur"})).unwrap();
+    s.execute("prop.set", json!({"layer": "#1", "path": "effects/#1/blurriness", "value": 12})).unwrap();
+    let cid = s.active_comp_id().unwrap();
+    let t = s.time();
+    s.render(cid, t, Default::default());
+    let before = s.layer_cache.stats();
+    for sw in ["audio", "lock", "shy"] {
+        s.execute("layer.setSwitch", json!({"layers": ["#1"], "switch": sw, "value": sw != "audio"})).unwrap();
+    }
+    s.render(cid, t, Default::default());
+    let after = s.layer_cache.stats();
+    assert_eq!(after.misses, before.misses, "no layer rendered again");
+    assert!(after.hits > before.hits);
+}
+
 #[test]
 fn every_command_has_unique_id_and_runs_or_reports() {
     let mut ids = std::collections::HashSet::new();
@@ -111,6 +244,162 @@ fn text_shape_mask_matte_parent() {
     let _ = s.render(cid, s.time(), Default::default());
     let info = s.execute("comp.info", json!({})).unwrap();
     assert_eq!(info["layers"].as_array().unwrap().len(), 2);
+}
+
+/// The toolbar's Fill / Stroke change a selected shape layer's paint (#205): a shape drawn
+/// without a stroke gets one, later edits change it, and the Contents "Add:" items (#206) include
+/// an empty Path and a Gradient Stroke that render.
+#[test]
+fn toolbar_fill_and_stroke_paint_selected_shape_layers() {
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"width": 400, "height": 300, "duration": 2})).unwrap();
+    let sh = s.execute("layer.newShape", json!({"kind": "rect", "fill": "#ff0000"})).unwrap()["layer"].as_u64().unwrap();
+    let paint = |s: &mut Session| s.execute("shape.fillStroke", json!({})).unwrap();
+    assert_eq!(paint(&mut s)["stroke"], serde_json::Value::Null, "drawn without a stroke");
+    s.execute("shape.fillStroke", json!({"stroke": "#00ff00", "strokeWidth": 6})).unwrap();
+    let p = paint(&mut s);
+    assert_eq!((p["stroke"][1].as_f64(), p["strokeWidth"].as_f64()), (Some(1.0), Some(6.0)), "{p}");
+    s.execute("shape.fillStroke", json!({"fill": "#0000ff", "strokeWidth": 3})).unwrap();
+    let p = paint(&mut s);
+    assert_eq!((p["fill"][2].as_f64(), p["strokeWidth"].as_f64()), (Some(1.0), Some(3.0)), "{p}");
+    // One stroke, before the fill (paths, stroke, fill), and each change is one undo step.
+    let l = s.active_comp().unwrap().layer(effectcraft_project::LayerId(sh)).unwrap().clone();
+    let group = l.props.group("contents/group").unwrap();
+    let order: Vec<&str> = group.sub("contents").unwrap().groups().map(|g| g.match_id.as_str()).collect();
+    assert_eq!(order, ["rect", "stroke", "fill"]);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(paint(&mut s)["strokeWidth"].as_f64(), Some(6.0));
+    // Only shape layers.
+    s.execute("layer.newSolid", json!({"color": "#808080"})).unwrap();
+    assert!(s.execute("shape.fillStroke", json!({"fill": "#ffffff"})).is_err());
+    for kind in ["path", "gstroke"] {
+        let r = s.execute("layer.addShapeItem", json!({"layer": sh, "kind": kind})).unwrap();
+        assert!(r["path"].as_str().is_some_and(|p| p.starts_with("contents/")), "{r}");
+    }
+    let cid = s.active_comp_id().unwrap();
+    let _ = s.render(cid, s.time(), Default::default());
+}
+
+/// The toolbar's Fill / Stroke kinds (Option-click on the swatch, Fill Options) change the
+/// selected shape layers, as in After Effects: None switches the fill off (it stays, its eye
+/// off, and the shape renders without it), Solid Color switches it back on, a gradient converts it
+/// to a Gradient Fill (and back), each in one undo step; blend mode and opacity apply too.
+#[test]
+fn toolbar_fill_stroke_kinds_apply_to_selected_shape_layers() {
+    use effectcraft_keyframe::Value as KV;
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"width": 400, "height": 300, "duration": 2})).unwrap();
+    let sh = s.execute("layer.newShape", json!({"kind": "rect", "fill": "#ff0000"})).unwrap()["layer"].as_u64().unwrap();
+    let cid = s.active_comp_id().unwrap();
+    let items = |s: &Session| {
+        let l = s.active_comp().unwrap().layer(effectcraft_project::LayerId(sh)).unwrap();
+        l.props.group("contents/group").unwrap().sub("contents").unwrap().groups().cloned().collect::<Vec<_>>()
+    };
+    let item = |s: &Session, m: &str| items(s).into_iter().find(|g| g.match_id == m);
+    let centre = |s: &Session| s.render(cid, s.time(), Default::default()).get(200, 150);
+    let fs = |s: &mut Session, v: serde_json::Value| s.execute("shape.fillStroke", v).unwrap();
+    let red = |p: [f32; 4]| p[3] > 0.99 && p[0] > 0.9 && p[1] < 0.1 && p[2] < 0.1;
+    assert!(red(centre(&s)), "{:?}", centre(&s));
+    let opacity_uid = item(&s, "fill").unwrap().get("opacity").unwrap().uid;
+
+    // None: the Fill is kept, switched off, and no longer paints.
+    let r = fs(&mut s, json!({"fillType": "none"}));
+    assert_eq!(r["fillType"], "none", "{r}");
+    let f = item(&s, "fill").expect("the fill is kept");
+    assert!(!f.enabled);
+    assert!(centre(&s)[3] < 0.01, "{:?}", centre(&s));
+    // One undo step brings it back; redo hides it again.
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(item(&s, "fill").unwrap().enabled && red(centre(&s)));
+    s.execute("edit.redo", json!({})).unwrap();
+    assert!(!item(&s, "fill").unwrap().enabled && centre(&s)[3] < 0.01);
+    // Solid Color switches it back on, colour unchanged.
+    let r = fs(&mut s, json!({"fillType": "solid"}));
+    assert_eq!(r["fillType"], "solid", "{r}");
+    assert!(item(&s, "fill").unwrap().enabled && red(centre(&s)), "{:?}", centre(&s));
+    // `fill: false` is None too.
+    fs(&mut s, json!({"fill": false}));
+    assert!(!item(&s, "fill").unwrap().enabled);
+    fs(&mut s, json!({"fillType": "solid"}));
+
+    // Linear Gradient converts the Fill into a Gradient Fill in its place, keeping its shared
+    // properties; Radial changes its type; Solid Color converts it back.
+    let r = fs(&mut s, json!({"fillType": "linear"}));
+    assert_eq!(r["fillType"], "linear", "{r}");
+    let order: Vec<String> = items(&s).iter().map(|g| g.match_id.clone()).filter(|m| m != "transform").collect();
+    assert_eq!(order, ["rect", "gfill"]);
+    assert!(item(&s, "fill").is_none());
+    let g = item(&s, "gfill").unwrap();
+    assert_eq!(g.name, "Gradient Fill 1");
+    assert_eq!(g.get("opacity").unwrap().uid, opacity_uid);
+    assert_eq!(g.get("type").unwrap().value, KV::Enum(0));
+    let px = centre(&s);
+    assert!(px[3] > 0.99 && (px[0] - px[1]).abs() < 0.05 && (px[1] - px[2]).abs() < 0.05 && px[0] > 0.05 && px[0] < 0.95, "grey mid-gradient: {px:?}");
+    assert_eq!(fs(&mut s, json!({"fillType": "radial"}))["fillType"], "radial");
+    assert_eq!(item(&s, "gfill").unwrap().get("type").unwrap().value, KV::Enum(1));
+    let r = fs(&mut s, json!({"fillType": "solid", "fill": "#ff0000"}));
+    assert_eq!(r["fillType"], "solid", "{r}");
+    assert!(item(&s, "gfill").is_none() && item(&s, "fill").is_some_and(|f| f.name == "Fill 1"));
+    assert!(red(centre(&s)), "{:?}", centre(&s));
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(item(&s, "gfill").is_some() && item(&s, "fill").is_none(), "one undo step");
+    s.execute("edit.redo", json!({})).unwrap();
+
+    // Fill Options' blend mode and opacity.
+    fs(&mut s, json!({"fillBlend": "multiply", "fillOpacity": 40}));
+    let f = item(&s, "fill").unwrap();
+    let multiply = effectcraft_color::BlendMode::ALL.iter().position(|m| *m == effectcraft_color::BlendMode::Multiply).unwrap() as u32;
+    assert_eq!((f.get("blend").unwrap().value.clone(), f.get("opacity").unwrap().value.as_f64()), (KV::Enum(multiply), 40.0));
+
+    // Stroke kinds: a gradient gives the stroke-less path a Gradient Stroke (before the fill);
+    // None switches it off.
+    let r = fs(&mut s, json!({"strokeType": "radial"}));
+    assert_eq!(r["strokeType"], "radial", "{r}");
+    let order: Vec<String> = items(&s).iter().map(|g| g.match_id.clone()).filter(|m| m != "transform").collect();
+    assert_eq!(order, ["rect", "gstroke", "fill"]);
+    assert_eq!(fs(&mut s, json!({"strokeType": "none"}))["strokeType"], "none");
+    assert!(!item(&s, "gstroke").unwrap().enabled);
+    assert_eq!(fs(&mut s, json!({"strokeType": "solid"}))["strokeType"], "solid");
+    assert!(item(&s, "stroke").is_some_and(|g| g.enabled && g.name == "Stroke 1") && item(&s, "gstroke").is_none());
+
+    // A shape drawn with no fill gets one from a fill kind.
+    let none = s.execute("layer.newShape", json!({"kind": "ellipse", "fill": false})).unwrap()["layer"].as_u64().unwrap();
+    let r = s.execute("shape.fillStroke", json!({"layers": [none], "fillType": "solid", "fill": "#00ff00"})).unwrap();
+    assert_eq!((r["fillType"].as_str(), r["fill"][1].as_f64()), (Some("solid"), Some(1.0)), "{r}");
+    // The query still only reports.
+    assert_eq!(s.execute("shape.fillStroke", json!({"layers": [none]})).unwrap()["fillType"], "solid");
+    assert!(s.execute("shape.fillStroke", json!({"fillType": "plaid"})).is_err());
+}
+
+/// Selecting a mask in the Timeline (its row or its Mask Path) selects all of its points, so the
+/// viewer drags the whole mask (#203); a shape's Path item works the same way.
+#[test]
+fn selecting_a_mask_selects_its_points() {
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"width": 400, "height": 300, "duration": 2})).unwrap();
+    let l = s.execute("layer.newSolid", json!({"color": "#808080"})).unwrap()["layer"].as_u64().unwrap();
+    let m1 = s.execute("layer.addMask", json!({"layer": l, "shape": "rect"})).unwrap()["mask"].as_u64().unwrap();
+    let m2 = s.execute("layer.addMask", json!({"layer": l, "shape": "ellipse"})).unwrap()["mask"].as_u64().unwrap();
+    let points = |s: &Session, m: u64| s.state.selected_vertices.iter().filter(|v| v.mask == m).count();
+    s.execute("prop.select", json!({"layer": l, "prop": m1, "selectKeys": false})).unwrap();
+    assert_eq!((points(&s, m1), s.state.selected_vertices.len()), (4, 4));
+    // Mask Path selects them too; Shift-adding another mask keeps the first.
+    let path = s.active_comp().unwrap().layer(effectcraft_project::LayerId(l)).unwrap().props.find_group(m2).unwrap().get("path").unwrap().uid;
+    s.execute("prop.select", json!({"layer": l, "prop": path, "add": true})).unwrap();
+    assert_eq!((points(&s, m1), points(&s, m2)), (4, 4));
+    // Another mask replaces them; another property deselects them.
+    s.execute("prop.select", json!({"layer": l, "prop": m2})).unwrap();
+    assert_eq!((points(&s, m1), points(&s, m2)), (0, 4));
+    // Delete removes the selected mask (not only its points).
+    s.execute("edit.clear", json!({})).unwrap();
+    let masks = |s: &Session| s.active_comp().unwrap().layer(effectcraft_project::LayerId(l)).unwrap().masks().unwrap().children.len();
+    assert_eq!(masks(&s), 1);
+    s.execute("prop.select", json!({"layer": l, "path": "transform/opacity"})).unwrap();
+    assert!(s.state.selected_vertices.is_empty());
+    let sh = s.execute("layer.newShape", json!({"kind": "star"})).unwrap()["layer"].as_u64().unwrap();
+    let star = s.execute("layer.addShapeItem", json!({"layer": sh, "kind": "path"})).unwrap()["uid"].as_u64().unwrap();
+    s.execute("prop.select", json!({"layer": sh, "prop": star})).unwrap();
+    assert_eq!(s.state.selected_vertices.len(), 0, "an empty Path has no points");
 }
 
 #[test]
@@ -299,6 +588,27 @@ fn comp_settings_anchor_start_timecode_renderer() {
     let c = s.active_comp().unwrap();
     assert_eq!(c.display_start, c.frame_rate.tick_of(30));
     assert_eq!(c.renderer, crate::project::Renderer::Advanced3D);
+}
+
+/// `advanced3D` is a value of `renderer`, not a key: comp.new / comp.settings don't advertise it
+/// in their schemas and reject it as unknown instead of ignoring it (#177).
+#[test]
+fn renderer_values_are_not_parameter_keys() {
+    let mut s = Session::default();
+    for (id, p) in [("comp.new", json!({"name": "A"})), ("comp.settings", json!({}))] {
+        let spec = crate::command_specs().iter().find(|c| c.id == id).unwrap();
+        let keys = crate::commands::accepted_params(spec.params).unwrap();
+        assert!(keys.contains(&"renderer".to_string()) && !keys.contains(&"advanced3D".to_string()), "{id}: {keys:?}");
+        let mut bad = p.clone();
+        bad["advanced3D"] = json!(true);
+        let e = s.execute_checked(id, bad).unwrap_err().to_string();
+        assert!(e.contains("unknown parameter(s) `advanced3D`"), "{id}: {e}");
+        let mut good = p;
+        good["renderer"] = json!("advanced3D");
+        s.execute_checked(id, good).unwrap();
+        assert_eq!(s.active_comp().unwrap().renderer, crate::project::Renderer::Advanced3D, "{id}");
+        s.execute("comp.renderer", json!({"renderer": "classic3d"})).unwrap();
+    }
 }
 
 #[test]

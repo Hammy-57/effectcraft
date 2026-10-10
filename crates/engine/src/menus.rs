@@ -52,6 +52,8 @@ pub enum MenuNode {
 pub struct DynCtx<'a> {
     /// The current workspace (Window ▸ Assign Shortcut to "…" Workspace).
     pub workspace: Option<&'a str>,
+    /// Workspaces the user saved (Save as New Workspace), listed in Window ▸ Workspace.
+    pub saved_workspaces: &'a [String],
 }
 
 fn file_name(p: &str) -> String {
@@ -70,8 +72,9 @@ fn holder_of(s: &Session, keys: &str) -> Option<String> {
 
 /// The entries of a `@dynamic:<name>` node, and the disabled placeholder shown when there are
 /// none: `recentProjects`, `recentFootage`, `recentPresets`, `history` (undo steps, newest
-/// first), `view3dShortcuts`, `workspaceShortcuts` and `openViewers` (open compositions other
-/// than the active one), `scripts` (File ▸ Scripts) and `scriptPanels` (ScriptUI panels).
+/// first), `view3dShortcuts`, `workspaceShortcuts`, `savedWorkspaces` (Window ▸ Workspace) and
+/// `openViewers` (open compositions other than the active one), `scripts` (File ▸ Scripts) and
+/// `scriptPanels` (ScriptUI panels).
 pub fn dynamic(s: &Session, name: &str, cx: &DynCtx) -> (Vec<MenuEntry>, Option<&'static str>) {
     use serde_json::json;
     let indexed = |list: &[String], cmd: &str, stem: bool| -> Vec<MenuEntry> {
@@ -122,6 +125,7 @@ pub fn dynamic(s: &Session, name: &str, cx: &DynCtx) -> (Vec<MenuEntry>, Option<
                 .collect(),
             None,
         ),
+        "savedWorkspaces" => (cx.saved_workspaces.iter().map(|w| dyn_entry(w.clone(), "window.workspace", json!({"name": w}))).collect(), None),
         "openViewers" => (
             s.state
                 .open_comps
@@ -521,6 +525,7 @@ File
     File... | file.import
     Multiple Files... | file.importMultiple
     Adobe Premiere Pro Project... | file.importTimeline
+    After Effects Project... | file.importAep
     Placeholder... | file.importPlaceholder
     Solid... | file.importSolid
     Lottie... | file.importLottie
@@ -587,6 +592,7 @@ Edit
     @dynamic:history
   ---
   Quick Apply... | app.commandPalette
+  Effect Console... | app.fxConsole
   ---
   Cut | edit.cut
   Copy | edit.copy
@@ -1151,6 +1157,7 @@ Window
     Paint | window.workspace {"name":"Paint"}
     Text | window.workspace {"name":"Text"}
     Undocked Panels | window.workspace {"name":"Undocked Panels"}
+    @dynamic:savedWorkspaces
     ---
     Reset to Saved Layout | window.resetWorkspace
     Save Changes to this Workspace | window.saveWorkspace

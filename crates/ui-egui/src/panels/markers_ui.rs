@@ -4,15 +4,18 @@
 //! Gestures, as in After Effects: drag moves a marker (snapping to the current time, the work
 //! area and other markers), Alt-drag sets its duration, Cmd-click (Ctrl-click elsewhere)
 //! deletes it, double-click opens the Marker dialog, right-click offers Settings / Convert /
-//! Delete. Protected regions (Responsive Design) shade the timeline. Every change is a
-//! `markers.*` engine command, so it is undoable and agent-drivable.
+//! Delete. Protected regions (Responsive Design) shade the timeline. A marker dragged out of the
+//! composition marker bin, at the right end of the time ruler, adds a composition marker where it
+//! is dropped. Every change is an engine command, so it is undoable and agent-drivable.
 
+use crate::i18n::tr;
 use effectcraft_engine::project::{Comp, Layer, Marker};
 use effectcraft_engine::time::Tick;
-use egui::{Align2, Color32, Rect, Sense, Stroke, pos2, vec2};
+use egui::{Align2, Color32, Pos2, Rect, Sense, Stroke, pos2, vec2};
 use serde_json::{Value, json};
 
 use super::timeline::TMap;
+use crate::icons::{self, Icon};
 use crate::theme::Tokens;
 use crate::{Dialog, EffectcraftApp};
 
@@ -124,46 +127,46 @@ pub fn dialog(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
     let title = d.title.clone();
     super::dialogs::modal(ctx, &title, vec2(520.0, 560.0), t, |ui| {
         egui::Grid::new("marker-grid").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-            ui.label("Time:");
+            ui.label(tr("Time:"));
             let r = ui.add(egui::DragValue::new(&mut d.time).speed(0.01).range(0.0..=1e6).suffix(" s").max_decimals(3));
             app.auto.add("dialog.marker.time", r.rect, "Time");
             ui.end_row();
-            ui.label("Duration:");
+            ui.label(tr("Duration:"));
             let r = ui.add(egui::DragValue::new(&mut d.duration).speed(0.01).range(0.0..=1e6).suffix(" s").max_decimals(3));
             app.auto.add("dialog.marker.duration", r.rect, "Duration");
             ui.end_row();
-            ui.label("Comment:");
+            ui.label(tr("Comment:"));
             let r = ui.add(egui::TextEdit::multiline(&mut d.comment).desired_rows(3).desired_width(320.0));
             app.auto.add("dialog.marker.comment", r.rect, "Comment");
             ui.end_row();
-            ui.label("Chapter:");
+            ui.label(tr("Chapter:"));
             text_field(ui, app, "dialog.marker.chapter", &mut d.chapter, 320.0);
             ui.end_row();
-            ui.label("URL:");
+            ui.label(tr("URL:"));
             text_field(ui, app, "dialog.marker.url", &mut d.url, 320.0);
             ui.end_row();
-            ui.label("Frame Target:");
+            ui.label(tr("Frame Target:"));
             text_field(ui, app, "dialog.marker.frameTarget", &mut d.frame_target, 320.0);
             ui.end_row();
         });
         ui.add_space(8.0);
-        let r = ui.checkbox(&mut d.cue, "Cue Point");
+        let r = ui.checkbox(&mut d.cue, tr("Cue Point"));
         app.auto.add("dialog.marker.cue", r.rect, "Cue Point");
         ui.add_enabled_ui(d.cue, |ui| {
             ui.horizontal(|ui| {
-                let r = ui.radio_value(&mut d.cue_navigation, false, "Event");
+                let r = ui.radio_value(&mut d.cue_navigation, false, tr("Event"));
                 app.auto.add("dialog.marker.cue.event", r.rect, "Event");
-                let r = ui.radio_value(&mut d.cue_navigation, true, "Navigation");
+                let r = ui.radio_value(&mut d.cue_navigation, true, tr("Navigation"));
                 app.auto.add("dialog.marker.cue.navigation", r.rect, "Navigation");
-                ui.label("Name:");
+                ui.label(tr("Name:"));
                 text_field(ui, app, "dialog.marker.cue.name", &mut d.cue_name, 160.0);
             });
             let mut remove = None;
             for (i, (k, v)) in d.cue_params.iter_mut().enumerate() {
                 ui.horizontal(|ui| {
-                    ui.label("Parameter Name:");
+                    ui.label(tr("Parameter Name:"));
                     text_field(ui, app, &format!("dialog.marker.cue.param.{i}.name"), k, 110.0);
-                    ui.label("Value:");
+                    ui.label(tr("Value:"));
                     text_field(ui, app, &format!("dialog.marker.cue.param.{i}.value"), v, 110.0);
                     let r = ui.small_button("−");
                     app.auto.add(&format!("dialog.marker.cue.param.{i}.remove"), r.rect, "Remove");
@@ -183,33 +186,31 @@ pub fn dialog(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
         });
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            let r = ui.checkbox(&mut d.protected, "Protected Region");
+            let r = ui.checkbox(&mut d.protected, tr("Protected Region"));
             app.auto.add("dialog.marker.protected", r.rect, "Protected Region");
             ui.add_space(20.0);
-            ui.label("Label:");
+            ui.label(tr("Label:"));
             let labels = effectcraft_engine::color::Label::ALL;
             let cur = labels.get(d.label).copied().unwrap_or_default();
             let r = egui::ComboBox::from_id_salt("dialog.marker.label").selected_text(app.session.prefs.label_name(cur)).show_ui(ui, |ui| {
-                for (i, l) in labels.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        let (r, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
-                        ui.painter().rect_filled(r, 2.0, app.tokens.label(*l));
-                        ui.selectable_value(&mut d.label, i, app.session.prefs.label_name(*l));
-                    });
+                for (i, l) in labels.into_iter().enumerate() {
+                    if crate::widgets::label_entry(ui, l, &app.session.prefs.label_name(l), d.label == i, &app.tokens).clicked() {
+                        d.label = i;
+                    }
                 }
             });
             app.auto.add("dialog.marker.label", r.response.rect, "Label");
         });
         ui.add_space(14.0);
         ui.horizontal(|ui| {
-            let r = ui.button("Delete");
+            let r = ui.button(tr("Delete"));
             app.auto.add("dialog.marker.delete", r.rect, "Delete");
             delete = r.clicked();
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let r = ui.add(egui::Button::new(egui::RichText::new("   OK   ").color(Color32::WHITE)).fill(app.tokens.accent));
+                let r = ui.add(egui::Button::new(egui::RichText::new(tr("   OK   ")).color(Color32::WHITE)).fill(app.tokens.accent));
                 app.auto.add("dialog.marker.ok", r.rect, "OK");
                 ok = r.clicked();
-                let r = ui.button("Cancel");
+                let r = ui.button(tr("Cancel"));
                 app.auto.add("dialog.marker.cancel", r.rect, "Cancel");
                 cancel = r.clicked();
             });
@@ -255,6 +256,17 @@ fn snap(app: &EffectcraftApp, comp: &Comp, tm: TMap, t: f64, skip: MarkerRef) ->
     t
 }
 
+/// A marker's colour: its label's, pale yellow without one.
+fn marker_color(t: &Tokens, label: effectcraft_engine::color::Label) -> Color32 {
+    if label == effectcraft_engine::color::Label::None { Color32::from_rgb(0xd8, 0xd8, 0x60) } else { t.label(label) }
+}
+
+/// The marker glyph at `x` from `y0`, `h` points tall: a tab pointing down at the time.
+fn marker_shape(x: f32, y0: f32, h: f32) -> Vec<Pos2> {
+    let ym = y0 + h * 0.6;
+    vec![pos2(x - 4.0, y0), pos2(x + 4.0, y0), pos2(x + 4.0, ym), pos2(x, y0 + h), pos2(x - 4.0, ym)]
+}
+
 /// Draw one marker (triangle + duration bar + comment) at `x` in a strip `[y0, y1]` and handle
 /// its gestures. `comp_t` is the marker's comp time.
 #[allow(clippy::too_many_arguments)]
@@ -262,9 +274,8 @@ fn marker(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, comp: 
     let t = app.tokens;
     let ctx = ui.ctx().clone();
     let x = tm.x(comp_t);
-    let col = if m.label == effectcraft_engine::color::Label::None { Color32::from_rgb(0xd8, 0xd8, 0x60) } else { t.label(m.label) };
+    let col = marker_color(&t, m.label);
     let h = (y1 - y0).min(10.0);
-    let ym = y0 + h * 0.6;
     if m.duration > Tick(0) {
         let xe = tm.x(comp_t + m.duration.seconds());
         let bar = Rect::from_min_max(pos2(x, y0 + 1.0), pos2(xe, y0 + h - 1.0));
@@ -278,7 +289,7 @@ fn marker(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, comp: 
         }
         p.line_segment([pos2(xe, y0), pos2(xe, y0 + h)], Stroke::new(1.0, col));
     }
-    p.add(egui::Shape::convex_polygon(vec![pos2(x - 4.0, y0), pos2(x + 4.0, y0), pos2(x + 4.0, ym), pos2(x, y0 + h), pos2(x - 4.0, ym)], col, Stroke::NONE));
+    p.add(egui::Shape::convex_polygon(marker_shape(x, y0, h), col, Stroke::NONE));
     if !m.comment.is_empty() {
         p.text(pos2(x + 7.0, y0 + h / 2.0), Align2::LEFT_CENTER, m.comment.lines().next().unwrap_or_default(), Tokens::ui(10.0), t.text);
     }
@@ -367,6 +378,37 @@ pub(crate) fn comp_markers(app: &mut EffectcraftApp, ui: &mut egui::Ui, comp: &C
     }
 }
 
+/// The composition marker bin at the right end of the time ruler (`bin`), as in After Effects
+/// (#275): drag a marker out of it and it follows the pointer along the marker strip `strip`
+/// (snapping like a dragged marker); dropping it there adds a composition marker at that time,
+/// one undo step. Dropped back on the bin or outside the time graph's width, nothing is added.
+pub(crate) fn marker_bin(app: &mut EffectcraftApp, ui: &mut egui::Ui, comp: &Comp, tm: TMap, bin: Rect, strip: Rect) {
+    let t = app.tokens;
+    let resp = ui.interact(bin, egui::Id::new("marker-bin"), Sense::drag()).on_hover_text(tr("Composition marker bin: drag a marker to the time ruler"));
+    app.auto.add("timeline.markerBin", bin, "Composition marker bin");
+    let hot = resp.hovered() || resp.dragged();
+    if hot {
+        ui.ctx().set_cursor_icon(if resp.dragged() { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
+    }
+    icons::paint(ui.painter(), bin, Icon::MarkerBin, if hot { t.icon_active } else { t.icon });
+    let at = resp.interact_pointer_pos().filter(|p| p.x >= strip.min.x && p.x < strip.max.x).map(|p| {
+        let snapped = snap(app, comp, tm, tm.t(p.x), MarkerRef { layer: None, index: usize::MAX });
+        snapped.min(comp.duration.seconds())
+    });
+    let Some(at) = at else { return };
+    if resp.dragged() {
+        let h = strip.height().min(10.0);
+        let col = marker_color(&t, effectcraft_engine::color::Label::None);
+        let p = ui.painter().with_clip_rect(strip);
+        p.add(egui::Shape::convex_polygon(marker_shape(tm.x(at), strip.min.y, h), col, Stroke::NONE));
+    }
+    if resp.drag_stopped()
+        && let Err(e) = app.session.execute("comp.addMarker", json!({"time": at}))
+    {
+        app.ui.status = e.to_string();
+    }
+}
+
 /// Layer markers on a layer's row `r`; on a precomp layer, its comp's markers too (read-only,
 /// outlined: hover names them, a double-click opens the nested comp at the marker).
 pub(crate) fn layer_markers(app: &mut EffectcraftApp, ui: &mut egui::Ui, clip: Rect, comp: &Comp, layer: &Layer, tm: TMap, r: Rect) {
@@ -401,10 +443,8 @@ fn nested_markers(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter
     let (y0, h) = (r.min.y + 3.0, (r.height() - 6.0).min(10.0));
     for (ct, i, m) in list {
         let x = tm.x(ct.seconds());
-        let col = if m.label == effectcraft_engine::color::Label::None { Color32::from_rgb(0xd8, 0xd8, 0x60) } else { t.label(m.label) }.gamma_multiply(0.75);
-        let ym = y0 + h * 0.6;
-        let pts = vec![pos2(x - 4.0, y0), pos2(x + 4.0, y0), pos2(x + 4.0, ym), pos2(x, y0 + h), pos2(x - 4.0, ym)];
-        p.add(egui::Shape::closed_line(pts, Stroke::new(1.2, col)));
+        let col = marker_color(&t, m.label).gamma_multiply(0.75);
+        p.add(egui::Shape::closed_line(marker_shape(x, y0, h), Stroke::new(1.2, col)));
         if !m.comment.is_empty() {
             p.text(pos2(x + 7.0, y0 + h / 2.0), Align2::LEFT_CENTER, m.comment.lines().next().unwrap_or_default(), Tokens::ui(10.0), t.text_dim);
         }

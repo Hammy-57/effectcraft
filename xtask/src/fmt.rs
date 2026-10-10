@@ -10,6 +10,11 @@ use std::process::Command;
 /// Files per rustfmt invocation (keeps command lines short on Windows).
 const BATCH: usize = 200;
 
+/// `run(["--check"])`, as a plain fn for the CI step lists.
+pub fn check() -> Result<(), String> {
+    run(&["--check".into()])
+}
+
 pub fn run(args: &[String]) -> Result<(), String> {
     let check = args.iter().any(|a| a == "--check");
     let root = crate::root();

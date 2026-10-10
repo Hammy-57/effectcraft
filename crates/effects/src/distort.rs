@@ -6,6 +6,7 @@ use effectcraft_project::ParamUi;
 use effectcraft_raster::Image;
 use rayon::prelude::*;
 
+use crate::util::layer_rect;
 use crate::{Buf, EffectCtx, EffectSpec, num, p, popup, slider};
 
 fn spec(id: &'static str, name: &'static str, params: Vec<crate::ParamSpec>, render: crate::RenderFn) -> EffectSpec {
@@ -24,10 +25,23 @@ fn remap(src: &Image, repeat: bool, f: impl Fn(f64, f64) -> (f64, f64) + Sync) -
     out
 }
 
+/// Twirl's radius in buffer pixels: Twirl Radius is a percentage of the larger dimension of
+/// the effect's input, so after a growing Motion Tile it spans the tiled canvas. The 1.035 is
+/// measured: After Effects renders of Liquid Glass (2560 and 7680 px inputs) put the rim there.
+pub fn twirl_radius(pct: f64, buf_w: u32, buf_h: u32) -> f64 {
+    (pct / 100.0 * f64::from(buf_w.max(buf_h)) * 1.035).max(1.0)
+}
+
+/// Twirl's share of Angle at normalised distance `t` = 1 - d / radius: a smoothstep, so the
+/// rotation eases out to nothing at the rim (fitted to After Effects at 90°, 360° and 720°).
+#[inline]
+pub(crate) fn twirl_falloff(t: f64) -> f64 {
+    t * t * (3.0 - 2.0 * t)
+}
+
 fn twirl(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let ang = ctx.params.f("angle").to_radians();
-    // Twirl Radius is a percentage of the layer's larger dimension: 50 reaches the edges.
-    let r = (ctx.params.f("radius") / 100.0 * b.layer_w(ctx).max(b.layer_h(ctx)) * b.scale).max(1.0);
+    let r = twirl_radius(ctx.params.f("radius"), b.img.width, b.img.height);
     let c = b.to_px(ctx.params.v2("center"));
     b.img = remap(&b.img, false, |x, y| {
         let (dx, dy) = (x - c.0, y - c.1);
@@ -35,8 +49,7 @@ fn twirl(ctx: &EffectCtx, mut b: Buf) -> Buf {
         if d >= r {
             return (x, y);
         }
-        let t = 1.0 - d / r;
-        let a = -ang * t * t;
+        let a = -ang * twirl_falloff(1.0 - d / r);
         let (s, co) = a.sin_cos();
         (c.0 + dx * co - dy * s, c.1 + dx * s + dy * co)
     });
@@ -59,6 +72,9 @@ fn spherize(ctx: &EffectCtx, mut b: Buf) -> Buf {
     b
 }
 
+/// Bulge displacement at the centre per unit of Bulge Height (fraction of the radius).
+pub const BULGE_STRENGTH: f64 = 0.35;
+
 fn bulge(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let rx = (ctx.params.f("hradius") * b.scale).max(1.0);
     let ry = (ctx.params.f("vradius") * b.scale).max(1.0);
@@ -67,8 +83,7 @@ fn bulge(ctx: &EffectCtx, mut b: Buf) -> Buf {
     // Taper Radius: higher values make the sides of the bulge shallower (a more peaked profile).
     let taper = 1.0 + ctx.params.f("taperRadius").max(0.0) / 100.0 * 3.0;
     let pin = ctx.params.b("pinAllEdges");
-    let (lx, ly) = (b.offset[0], b.offset[1]);
-    let (lw, lh) = (b.layer_w(ctx) * b.scale, b.layer_h(ctx) * b.scale);
+    let (lx, ly, lw, lh) = layer_rect(ctx, &b);
     let edge = (lw.min(lh) * 0.1).max(1.0);
     b.img = remap(&b.img, false, |x, y| {
         let (dx, dy) = ((x - c.0) / rx, (y - c.1) / ry);
@@ -76,7 +91,9 @@ fn bulge(ctx: &EffectCtx, mut b: Buf) -> Buf {
         if d2 >= 1.0 {
             return (x, y);
         }
-        let mut amt = h * (1.0 - d2).powf(taper) * 0.5;
+        // Strength per unit Bulge Height, matched to After Effects renders (SceneYard Assistive
+        // Touch, Paper Reveal, Liquid): 0.5 magnified the centre about a third too much.
+        let mut amt = h * (1.0 - d2).powf(taper) * BULGE_STRENGTH;
         if pin {
             let ex = ((x - lx - 0.5).min(lx + lw - 0.5 - x) / edge).clamp(0.0, 1.0);
             let ey = ((y - ly - 0.5).min(ly + lh - 0.5 - y) / edge).clamp(0.0, 1.0);
@@ -155,24 +172,36 @@ fn wave_pin(pin: u32, x: f64, y: f64, rect: (f64, f64, f64, f64)) -> f64 {
     }
 }
 
+/// Wave Warp's wave phase in cycles at input-buffer pixel (x, y): one wave (crest and trough)
+/// spans twice Wave Width, measured from the input's top-left, and the waves move with time
+/// (`time * speed` cycles subtracted). Fitted to After Effects renders of SceneYard Liquid
+/// Glass (Sine, Square and Circle at three times): 1× Wave Width packed twice the waves and
+/// drifted the wrong way.
+pub fn wave_warp_cycles(x: f64, y: f64, dir: (f64, f64), width: f64, phase_deg: f64, time: f64, speed: f64) -> f64 {
+    (x * dir.0 + y * dir.1) / (2.0 * width) + phase_deg / 360.0 - time * speed
+}
+
 fn wave_warp(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let h = ctx.params.f("height") * b.scale;
     let w = (ctx.params.f("width") * b.scale).max(1.0);
     let dir = ctx.params.f("direction").to_radians();
-    let speed = ctx.params.f("speed");
-    let phase = ctx.params.f("phase").to_radians() + ctx.time * speed * std::f64::consts::TAU;
+    let (speed, phase) = (ctx.params.f("speed"), ctx.params.f("phase"));
     let kind = ctx.params.e("waveType");
     let pin = ctx.params.e("pinning");
     let seed = ctx.seed ^ 0x3a7e;
     let (dx, dy) = (dir.sin(), -dir.cos());
-    if !ctx.adjustment {
-        b.pad(h.abs().ceil() as u32 + 1);
+    // The waves are anchored to the input's top-left, before the room for the displacement.
+    let pad = if ctx.adjustment { 0.0 } else { h.abs().ceil() + 1.0 };
+    if pad > 0.0 {
+        b.pad(pad as u32);
     }
-    let rect = (b.offset[0], b.offset[1], (b.layer_w(ctx) * b.scale).max(1.0), (b.layer_h(ctx) * b.scale).max(1.0));
+    let (x0, y0, lw, lh) = layer_rect(ctx, &b);
+    let rect = (x0, y0, lw.max(1.0), lh.max(1.0));
+    let time = ctx.time;
     b.img = remap(&b.img, false, |x, y| {
         // Waves travel along `dir`; displacement is perpendicular to it.
-        let along = x * dx + y * dy;
-        let disp = wave_shape(kind, along / w * std::f64::consts::TAU + phase, seed) * h * wave_pin(pin, x, y, rect);
+        let cyc = wave_warp_cycles(x - pad, y - pad, (dx, dy), w, phase, time, speed);
+        let disp = wave_shape(kind, cyc * std::f64::consts::TAU, seed) * h * wave_pin(pin, x, y, rect);
         (x + dy * disp, y - dx * disp)
     });
     b
@@ -272,26 +301,57 @@ pub fn transform_shutter(ctx: &EffectCtx) -> Option<(f64, f64, u32)> {
 }
 
 fn transform_matrix(pr: &crate::Params, b: &Buf) -> Mat3 {
-    let anchor = b.to_px(pr.v2("anchor"));
-    let pos = b.to_px(pr.v2("position"));
+    transform_effect_matrix(pr, b.to_px(pr.v2("anchor")), b.to_px(pr.v2("position")))
+}
+
+/// The Transform effect's matrix in buffer pixels (`anchor` / `position` already in pixels).
+/// As in After Effects, the skew is applied after the rotation: Skew Axis 0 tilts horizontal
+/// lines (a vertical shear), so Rotation -20° with Skew 20° gives a pure horizontal shear.
+pub fn transform_effect_matrix(pr: &crate::Params, anchor: (f64, f64), pos: (f64, f64)) -> Mat3 {
     let sh = pr.f("scaleHeight");
     let sw = if pr.b("uniform") { sh } else { pr.f("scaleWidth") };
     Mat3::translate(vec2(pos.0, pos.1))
+        * Mat3::skew_deg(-pr.f("skew"), pr.f("skewAxis") + 90.0)
         * Mat3::rotate_deg(pr.f("rotation"))
-        * Mat3::skew_deg(pr.f("skew"), pr.f("skewAxis"))
         * Mat3::scale(vec2(sw / 100.0, sh / 100.0))
         * Mat3::translate(vec2(-anchor.0, -anchor.1))
+}
+
+pub fn transform_extent(adjustment: bool, size: (u32, u32), ms: &[Mat3]) -> (i64, i64, u32, u32) {
+    // An adjustment layer works on the comp below in place.
+    if adjustment {
+        return (0, 0, size.0, size.1);
+    }
+    let (w, h) = (size.0 as f64, size.1 as f64);
+    let (mut x0, mut y0, mut x1, mut y1) = (0.0f64, 0.0f64, w, h);
+    for m in ms {
+        for (x, y) in [(0.0, 0.0), (w, 0.0), (0.0, h), (w, h)] {
+            let q = m.apply(vec2(x, y));
+            if !(q.x.is_finite() && q.y.is_finite()) {
+                return (0, 0, size.0, size.1);
+            }
+            (x0, y0, x1, y1) = (x0.min(q.x), y0.min(q.y), x1.max(q.x), y1.max(q.y));
+        }
+    }
+    let (x0, y0) = (x0.floor(), y0.floor());
+    let (nw, nh) = ((x1.ceil() - x0).max(1.0), (y1.ceil() - y0).max(1.0));
+    // Cap the allocation (a huge scale would otherwise ask for an unbounded buffer).
+    if nw * nh > 64.0e6 || nw > 32768.0 || nh > 32768.0 {
+        return (0, 0, size.0, size.1);
+    }
+    (x0 as i64, y0 as i64, nw as u32, nh as u32)
+}
+
+/// Move `b` onto the grown canvas `ext` (pixel (0, 0) = old pixel (x0, y0)).
+fn regrid(b: &mut Buf, ext: (i64, i64, u32, u32), img: Image) {
+    b.img = img;
+    b.offset[0] -= ext.0 as f64;
+    b.offset[1] -= ext.1 as f64;
 }
 
 fn transform(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let anchor = b.to_px(ctx.params.v2("anchor"));
     let pos = b.to_px(ctx.params.v2("position"));
-    let uniform = ctx.params.b("uniform");
-    let sh = ctx.params.f("scaleHeight");
-    let sw = if uniform { sh } else { ctx.params.f("scaleWidth") };
-    let skew = ctx.params.f("skew");
-    let skew_axis = ctx.params.f("skewAxis");
-    let rot = ctx.params.f("rotation");
     let opacity = ctx.params.f("opacity") as f32 / 100.0;
     let sampling = if ctx.params.e("sampling") == 1 { effectcraft_raster::Sampling::Bicubic } else { effectcraft_raster::Sampling::Bilinear };
     // Motion blur: the transform at Samples instants across the shutter, averaged (the
@@ -300,36 +360,40 @@ fn transform(ctx: &EffectCtx, mut b: Buf) -> Buf {
         && let Some(host) = ctx.env.host
     {
         let fd = 1.0 / ctx.fps();
-        let mut acc = Image::new(b.img.width, b.img.height);
-        let mut count = 0.0f32;
-        for k in 0..n {
-            let t = ctx.time + (phase + angle * k as f64 / (n - 1) as f64) / 360.0 * fd;
-            let Some(pr) = host.params_at(t) else { continue };
-            let mut one = Image::new(b.img.width, b.img.height);
-            let op = pr.f("opacity") as f32 / 100.0;
-            effectcraft_raster::composite_warp(
-                &mut one,
-                &b.img,
-                &transform_matrix(&pr, &b),
-                &effectcraft_raster::WarpOpts { opacity: op, sampling, ..Default::default() },
-            );
-            acc.data.iter_mut().zip(&one.data).for_each(|(a, o)| (0..4).for_each(|c| a[c] += o[c]));
-            count += 1.0;
-        }
-        if count > 0.0 {
-            acc.data.iter_mut().for_each(|p| p.iter_mut().for_each(|v| *v /= count));
-            b.img = acc;
+        let samples: Vec<(Mat3, f32)> = (0..n)
+            .filter_map(|k| {
+                let t = ctx.time + (phase + angle * k as f64 / (n - 1) as f64) / 360.0 * fd;
+                let pr = host.params_at(t)?;
+                Some((transform_matrix(&pr, &b), pr.f("opacity") as f32 / 100.0))
+            })
+            .collect();
+        if !samples.is_empty() {
+            let ms: Vec<Mat3> = samples.iter().map(|s| s.0).collect();
+            let ext = transform_extent(ctx.adjustment, (b.img.width, b.img.height), &ms);
+            let shift = Mat3::translate(vec2(-ext.0 as f64, -ext.1 as f64));
+            let mut acc = Image::new(ext.2, ext.3);
+            for (m, op) in &samples {
+                let mut one = Image::new(ext.2, ext.3);
+                effectcraft_raster::composite_warp(
+                    &mut one,
+                    &b.img,
+                    &(shift * *m),
+                    &effectcraft_raster::WarpOpts { opacity: *op, sampling, ..Default::default() },
+                );
+                acc.data.iter_mut().zip(&one.data).for_each(|(a, o)| (0..4).for_each(|c| a[c] += o[c]));
+            }
+            let k = 1.0 / samples.len() as f32;
+            acc.data.iter_mut().for_each(|p| p.iter_mut().for_each(|v| *v *= k));
+            regrid(&mut b, ext, acc);
             return b;
         }
     }
-    let m = Mat3::translate(vec2(pos.0, pos.1))
-        * Mat3::rotate_deg(rot)
-        * Mat3::skew_deg(skew, skew_axis)
-        * Mat3::scale(vec2(sw / 100.0, sh / 100.0))
-        * Mat3::translate(vec2(-anchor.0, -anchor.1));
-    let mut out = Image::new(b.img.width, b.img.height);
-    effectcraft_raster::composite_warp(&mut out, &b.img, &m, &effectcraft_raster::WarpOpts { opacity, sampling, ..Default::default() });
-    b.img = out;
+    let m = transform_effect_matrix(ctx.params, anchor, pos);
+    let ext = transform_extent(ctx.adjustment, (b.img.width, b.img.height), &[m]);
+    let mut out = Image::new(ext.2, ext.3);
+    let shift = Mat3::translate(vec2(-ext.0 as f64, -ext.1 as f64));
+    effectcraft_raster::composite_warp(&mut out, &b.img, &(shift * m), &effectcraft_raster::WarpOpts { opacity, sampling, ..Default::default() });
+    regrid(&mut b, ext, out);
     b
 }
 
@@ -500,12 +564,33 @@ mod tests {
 
     #[test]
     fn twirl_radius_is_a_percentage_of_the_larger_dimension() {
-        // 60×20 layer, radius 50 → 30 px: a pixel 20 px right of the centre is twirled (the old
-        // smaller-dimension rule gave 5 px), corners (> 30 px away) are not.
+        // 60×20 layer, radius 45 → 27.9 px: a pixel 20 px right of the centre is twirled (the old
+        // smaller-dimension rule gave 5 px), corners (31 px away) are not.
         let im = img(60, 20);
-        let o = run("ec.distort.twirl", &[("angle", num(90.0)), ("radius", num(50.0))], im.clone());
+        let o = run("ec.distort.twirl", &[("angle", num(90.0)), ("radius", num(45.0))], im.clone());
         assert!(differs(o.img.get(50, 10), im.get(50, 10)));
         assert_eq!(o.img.get(0, 0), im.get(0, 0));
+    }
+
+    #[test]
+    fn twirl_radius_follows_the_input_and_eases_out() {
+        // Liquid Glass: a 300% Motion Tile triples the input, and Twirl Radius with it.
+        assert!((twirl_radius(15.4, 7680, 4320) / twirl_radius(15.4, 2560, 1440) - 3.0).abs() < 1e-9);
+        assert!((twirl_radius(15.4, 2560, 1440) - 408.0).abs() < 1.0);
+        // Full Angle at the centre, half way at half the radius, nothing at the rim.
+        assert_eq!(twirl_falloff(1.0), 1.0);
+        assert_eq!(twirl_falloff(0.5), 0.5);
+        assert_eq!(twirl_falloff(0.0), 0.0);
+    }
+
+    #[test]
+    fn wave_warp_wave_spans_twice_the_width_and_moves_backwards_in_time() {
+        let dir = (1.0, 0.0);
+        // One full wave (crest and trough) per 2 × Wave Width.
+        assert!((wave_warp_cycles(200.0, 0.0, dir, 100.0, 0.0, 0.0, 0.0) - 1.0).abs() < 1e-12);
+        // Wave Speed 0.5 for 1 s: half a cycle back; Phase 90° a quarter forward.
+        assert!((wave_warp_cycles(0.0, 0.0, dir, 100.0, 0.0, 1.0, 0.5) + 0.5).abs() < 1e-12);
+        assert!((wave_warp_cycles(0.0, 0.0, dir, 100.0, 90.0, 0.0, 0.0) - 0.25).abs() < 1e-12);
     }
 
     #[test]
@@ -519,6 +604,32 @@ mod tests {
         assert!(asym.img.data.iter().zip(&sym.img.data).any(|(a, b)| differs(*a, *b)));
         // Corners lie beyond radius 100 % (half the layer) and stay put.
         assert_eq!(asym.img.get(0, 0), im.get(0, 0));
+    }
+
+    #[test]
+    fn transform_effect_skews_after_rotating_and_keeps_moved_pixels() {
+        // SceneYard Calendar Page Tear: Rotation -20 with Skew 20 leans a page into a pure
+        // horizontal shear (rows stay rows, about 1/cos 20° further from the anchor), as in AE.
+        let mut im = Image::new(60, 60);
+        for x in 10..50 {
+            im.set(x, 40, [1.0; 4]);
+        }
+        let set = [("anchor", Value::Vec2([30.0, 30.0])), ("position", Value::Vec2([30.0, 30.0])), ("skew", num(20.0)), ("rotation", num(-20.0))];
+        let out = run("ec.distort.transform", &set, im);
+        let row = |b: &Buf, y: i64| (0..b.img.width as i64).filter(|&x| b.img.get(x, y)[3] > 0.3).count();
+        let y = (40.0 - 30.0) / 20f64.to_radians().cos() + 30.0 + out.offset[1];
+        assert!(row(&out, y.floor() as i64) + row(&out, y.ceil() as i64) >= 30, "the bar stays one horizontal row");
+        // A rotation that carries content past the old edges grows the buffer instead of cutting it.
+        let mut sq = Image::new(40, 10);
+        for x in 0..40 {
+            for y in 0..10 {
+                sq.set(x, y, [1.0; 4]);
+            }
+        }
+        let rot = run("ec.distort.transform", &[("anchor", Value::Vec2([20.0, 5.0])), ("position", Value::Vec2([20.0, 5.0])), ("rotation", num(90.0))], sq);
+        assert!(rot.img.height >= 40, "{}x{}", rot.img.width, rot.img.height);
+        let covered: f32 = rot.img.data.iter().map(|p| p[3]).sum();
+        assert!((covered - 400.0).abs() < 10.0, "{covered}");
     }
 
     #[test]

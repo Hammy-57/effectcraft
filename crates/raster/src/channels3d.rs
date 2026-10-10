@@ -63,6 +63,41 @@ impl AuxChannels {
         self.channels.iter().map(|(n, _)| n.as_str()).collect()
     }
 
+    /// The layers of the channels (OpenEXR layers: the name before the last `.`; `""` for the
+    /// unnamed layer), in channel order.
+    pub fn layers(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = vec![];
+        for (n, _) in &self.channels {
+            let (layer, _) = split_channel(n);
+            if !out.contains(&layer) {
+                out.push(layer);
+            }
+        }
+        out
+    }
+
+    /// A layer's channels as the names to show in red, green, blue and alpha (`""` = none):
+    /// its R, G, B, A channels (or red / green / blue / alpha, X / Y / Z, U / V); a layer of one
+    /// channel (depth, an ID) shows it in all three colours.
+    pub fn layer_rgba(&self, layer: &str) -> [String; 4] {
+        let chans: Vec<&str> = self.channels.iter().map(|(n, _)| n.as_str()).filter(|n| split_channel(n).0 == layer).collect();
+        let pick = |names: &[&str]| -> String {
+            chans.iter().find(|c| names.iter().any(|n| split_channel(c).1.eq_ignore_ascii_case(n))).map_or(String::new(), |c| c.to_string())
+        };
+        if let [one] = chans.as_slice() {
+            return [one.to_string(), one.to_string(), one.to_string(), String::new()];
+        }
+        [pick(&["R", "red", "X", "U"]), pick(&["G", "green", "Y", "V"]), pick(&["B", "blue", "Z"]), pick(&["A", "alpha"])]
+    }
+}
+
+/// A channel name's layer and channel: `diffuse.R` → (`diffuse`, `R`), `ViewLayer.Combined.R`
+/// → (`ViewLayer.Combined`, `R`), `Z` → (`""`, `Z`).
+pub fn split_channel(name: &str) -> (&str, &str) {
+    name.rsplit_once('.').unwrap_or(("", name))
+}
+
+impl AuxChannels {
     pub fn depth(&self) -> Option<&[f32]> {
         self.find(&["Z", "depth", "Depth", "zDepth", "Z-Depth"])
     }

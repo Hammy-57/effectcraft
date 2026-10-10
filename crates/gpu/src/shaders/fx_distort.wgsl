@@ -31,7 +31,8 @@ fn dst_twirl(@builtin(global_invocation_id) gid: vec3<u32>) {
     var s = q;
     if (d < r) {
         let t = 1.0 - d / r;
-        let a = -P.f[0].w * t * t;
+        // distort::twirl_falloff: a smoothstep.
+        let a = -P.f[0].w * t * t * (3.0 - 2.0 * t);
         let sn = sin(a);
         let co = cos(a);
         s = vec2<f32>(c.x + dx * co - dy * sn, c.y + dx * sn + dy * co);
@@ -40,7 +41,7 @@ fn dst_twirl(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 // ---------------------------------------------------------------- Bulge (distort::bulge)
-// f[0] = (cx, cy, rx, ry); f[1] = (height, taper, pin, edge); f[2] = layer rect (x, y, w, h)
+// f[0] = (cx, cy, rx, ry); f[1] = (height × strength, taper, pin, edge); f[2] = layer rect (x, y, w, h)
 @compute @workgroup_size(16, 16)
 fn dst_bulge(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = vec2<i32>(gid.xy);
@@ -56,7 +57,7 @@ fn dst_bulge(@builtin(global_invocation_id) gid: vec3<u32>) {
     let d2 = dx * dx + dy * dy;
     var s = q;
     if (d2 < 1.0) {
-        var amt = P.f[1].x * pow(1.0 - d2, P.f[1].y) * 0.5;
+        var amt = P.f[1].x * pow(1.0 - d2, P.f[1].y);
         if (P.f[1].z > 0.5) {
             let l = P.f[2];
             let edge = P.f[1].w;
@@ -196,7 +197,7 @@ fn dst_ripple(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 // ---------------------------------------------------------------- CC Lens (distort2::cc_lens)
-// f[0] = (cx, cy, radius, convergence exponent)
+// f[0] = (cx, cy, radius, convergence / 100)
 @compute @workgroup_size(16, 16)
 fn dst_cclens(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = vec2<i32>(gid.xy);
@@ -213,12 +214,8 @@ fn dst_cclens(@builtin(global_invocation_id) gid: vec3<u32>) {
         textureStore(out, p, vec4<f32>(0.0));
         return;
     }
-    var s = q;
-    if (d >= 1e-9) {
-        let g = powz(asin_p(min(d / r, 1.0)) / DST_HALF_PI, P.f[0].w);
-        let k = r * g / d;
-        s = vec2<f32>(c.x + dx * k, c.y + dy * k);
-    }
+    let k = 1.0 - P.f[0].w * (d / r) * (d / r);
+    let s = vec2<f32>(c.x + dx * k, c.y + dy * k);
     textureStore(out, p, sample_bilinear(src, s.x, s.y));
 }
 

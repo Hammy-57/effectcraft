@@ -277,7 +277,7 @@ pub(crate) async fn movie(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut St
     st.advance(first_end)?;
 
     let path = job.place(job.path, 1);
-    let mut file = crate::out::create(job.sink, &path)?;
+    let mut file = job.create(&path)?;
     let opts = WriterOptions::new(brand);
     let movie_ts = opts.movie_timescale.max(1) as i128;
     let mut mux: Writer = Mp4Writer::new(&mut file, opts).map_err(mux_err)?;

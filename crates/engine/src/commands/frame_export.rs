@@ -165,7 +165,7 @@ pub fn layered_exr(s: &Session, cid: ItemId, t: Tick, scale: f64) -> Result<(Vec
             let sp = straight(*p);
             let a = sp[3];
             for c in 0..3 {
-                out[c].push(srgb_to_linear(sp[c].clamp(0.0, 1.0)) * a);
+                out[c].push(srgb_to_linear(sp[c].max(0.0)) * a);
             }
             out[3].push(a);
         }

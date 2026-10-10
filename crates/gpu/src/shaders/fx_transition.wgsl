@@ -614,6 +614,9 @@ fn ftr_blob(@builtin(global_invocation_id) gid: vec3<u32>) {
 // GPU's approximate atan2 can land just across it, which wraps to the opposite edge of the
 // texture). x = ±0 takes the CPU's −π (its zero is negative there).
 fn ftr_lon_u(x: f32, z: f32) -> f32 {
+    if (x == 0.0) {
+        return select(0.5, 0.0, z < 0.0);
+    }
     let u = 0.5 + atan2(x, z) / 6.283185307179586;
     if (x <= 0.0) {
         return clamp(u, 0.0, 0.5);
@@ -623,7 +626,7 @@ fn ftr_lon_u(x: f32, z: f32) -> f32 {
 
 // ---------------------------------------------------------------- CC Cylinder / CC Sphere (perspective.rs)
 // Shading (perspective::Shading): f[3] = (light direction, intensity); f[4] = (light colour,
-// ambient); f[5] = (diffuse, specular, shininess); f[6] = half vector. The layer rectangle in
+// ambient); f[5] = (diffuse, specular, shininess, metal); f[6] = half vector. The layer rectangle in
 // f[1] = (x0, y0, width, height).
 
 fn ftr_shade(px: vec4<f32>, n: vec3<f32>) -> vec4<f32> {
@@ -638,7 +641,8 @@ fn ftr_shade(px: vec4<f32>, n: vec3<f32>) -> vec4<f32> {
         spec = powz(max(dot(n, P.f[6].xyz), 0.0), P.f[5].z) * P.f[5].y;
     }
     let lc = P.f[4].xyz * P.f[3].w;
-    let o = c * (P.f[4].w + P.f[5].x * nl * lc) + spec * lc;
+    let highlight = lc * (1.0 - P.f[5].w) + c * P.f[3].w * P.f[5].w;
+    let o = c * (P.f[4].w + P.f[5].x * nl * lc) + spec * highlight;
     return vec4<f32>(o * a, a);
 }
 

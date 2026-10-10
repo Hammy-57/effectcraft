@@ -5,6 +5,7 @@
 //! selected layers; dragging an effect onto a layer (timeline, viewer, Effect Controls) applies
 //! it there.
 
+use crate::i18n::tr;
 use egui::{Align2, Color32, Rect, Sense, Stroke, pos2, vec2};
 use serde_json::json;
 
@@ -244,7 +245,7 @@ fn preset_row(
 }
 
 /// User preset files, rescanned every few seconds (and on Refresh List).
-fn user_presets(ctx: &egui::Context, force: bool) -> Vec<PresetFile> {
+pub(crate) fn user_presets(ctx: &egui::Context, force: bool) -> Vec<PresetFile> {
     let id = egui::Id::new("fx-user-presets");
     let now = ctx.input(|i| i.time);
     if !force
@@ -276,7 +277,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     // Contents menu.
     let mr = Rect::from_center_size(pos2(rect.max.x - 18.0, sr.center().y), vec2(22.0, 22.0));
     let mpop = egui::Id::new("fx-contents-menu");
-    if widgets::icon_button(ui, mr, Icon::Hamburger, false, &t, egui::Id::new("fx-menu")).on_hover_text("Effects & Presets options").clicked() {
+    if widgets::icon_button(ui, mr, Icon::Hamburger, false, &t, egui::Id::new("fx-menu")).on_hover_text(tr("Effects & Presets options")).clicked() {
         widgets::open_popup(ui, mpop);
     }
     app.auto.add("effects.menu", mr, "Effects & Presets options");
@@ -313,14 +314,10 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let view = app.ui.effects_view.clone();
     let list = Rect::from_min_max(pos2(rect.min.x, sr.max.y + 6.0), rect.max);
     let lp = p.with_clip_rect(list);
-    let scroll_id = egui::Id::new("fx-scroll");
-    let mut scroll: f32 = ctx.data(|d| d.get_temp(scroll_id).unwrap_or(0.0));
-    if ui.rect_contains_pointer(list) {
-        scroll = (scroll - ui.input(|i| i.smooth_scroll_delta.y)).max(0.0);
-    }
+    let scroll = widgets::PanelScroll::begin(ui, egui::Id::new("fx-scroll"), list);
     let query = q.trim().to_lowercase();
     let searching = !query.is_empty();
-    let mut y = list.min.y - scroll;
+    let mut y = list.min.y - scroll.offset;
     let mut apply: Option<Apply> = None;
     let reg = effectcraft_engine::effects::all();
     let keep =
@@ -397,12 +394,11 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             }
         }
     }
-    if y == list.min.y - scroll && searching {
-        lp.text(pos2(list.center().x, list.min.y + 24.0), Align2::CENTER_CENTER, "No matching effects or presets", Tokens::ui(12.0), t.text_faint);
+    if y == list.min.y - scroll.offset && searching {
+        lp.text(pos2(list.center().x, list.min.y + 24.0), Align2::CENTER_CENTER, tr("No matching effects or presets"), Tokens::ui(12.0), t.text_faint);
     }
-    let content = y + scroll - list.min.y;
-    scroll = scroll.min((content - list.height()).max(0.0));
-    ctx.data_mut(|d| d.insert_temp(scroll_id, scroll));
+    let content = y + scroll.offset - list.min.y;
+    scroll.end(ui, &mut app.auto, "effects.scroll", content, &t);
     if let Some(DragPayload::Effect(id)) = egui::DragAndDrop::payload::<DragPayload>(&ctx).as_deref()
         && let Some(pos) = ctx.pointer_hover_pos()
     {

@@ -69,7 +69,14 @@ fn on_cpu(e: &mut Enc, canvas: &mut GpuImage, f: impl FnOnce(&mut Image)) -> Opt
 }
 
 fn draw_comp<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, canvas: &mut GpuImage) -> Option<()> {
-    let visible = r.visible_layers(ctx);
+    // Passes as on the CPU (Posterize Time adjustment layers hold what is below them).
+    for (ctx, visible) in r.draw_passes(ctx) {
+        draw_layers(e, r, &ctx, &visible, canvas)?;
+    }
+    Some(())
+}
+
+fn draw_layers<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, visible: &[&'a Layer], canvas: &mut GpuImage) -> Option<()> {
     let levels = r.pipe().levels;
     let mut i = 0;
     while i < visible.len() {
@@ -81,9 +88,12 @@ fn draw_comp<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, canvas: &mut 
             draw_3d(e, r, ctx, &visible[i..j], canvas)?;
             i = j;
         } else {
-            match r.collapsed(ctx, visible[i]) {
-                Some(item) => draw_collapsed(e, r, ctx, visible[i], item, canvas)?,
-                None => draw_layer(e, r, ctx, visible[i], canvas)?,
+            match (r.collapsed(ctx, visible[i]), r.collapsed_fx(ctx, visible[i])) {
+                (Some(item), _) => draw_collapsed(e, r, ctx, visible[i], item, canvas)?,
+                (None, Some(item)) => on_cpu(e, canvas, |img| {
+                    r.draw_collapsed_fx(ctx, visible[i], item, img);
+                })?,
+                (None, None) => draw_layer(e, r, ctx, visible[i], canvas)?,
             }
             i += 1;
         }
@@ -113,6 +123,13 @@ fn draw_3d<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, run: &[&'a Laye
     if let Some(k) = run.iter().position(|l| l.switches.adjustment) {
         draw_3d(e, r, ctx, &run[..k], canvas)?;
         draw_layer(e, r, ctx, run[k], canvas)?;
+        return draw_3d(e, r, ctx, &run[k + 1..], canvas);
+    }
+    if let Some((k, item)) = run.iter().enumerate().find_map(|(k, l)| r.collapsed_fx(ctx, l).map(|item| (k, item))) {
+        draw_3d(e, r, ctx, &run[..k], canvas)?;
+        on_cpu(e, canvas, |img| {
+            r.draw_collapsed_fx(ctx, run[k], item, img);
+        })?;
         return draw_3d(e, r, ctx, &run[k + 1..], canvas);
     }
     if run.is_empty() {
@@ -247,6 +264,10 @@ fn draw_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &
 /// resident on the GPU (non-GPU effects read back, run on the CPU and upload), and the result
 /// replaces the canvas inside the layer's footprint × opacity. `None` = draw it on the CPU.
 fn draw_adjustment(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut GpuImage) -> Option<()> {
+    // A track matte or a blending mode on the adjustment layer is applied by the CPU path.
+    if r.track_matte(ctx, layer).is_some() || layer.blend_mode != BlendMode::Normal {
+        return None;
+    }
     let opacity = r.layer_opacity(ctx, layer);
     let Some(foot) = r.adjustment_footprint(ctx, layer) else { return Some(()) };
     let (w, h) = (canvas.width, canvas.height);
@@ -259,9 +280,13 @@ fn draw_adjustment(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canv
     };
     let mut fx = crate::effects::GpuFx::new(e, below, [0.0; 2], r.opts.scale, pipe.levels);
     r.run_effects_on(ctx, layer, true, &mut fx);
-    let (mut adjusted, _, _) = fx.finish()?;
+    let (mut adjusted, offset, _) = fx.finish()?;
     if adjusted.width != w || adjusted.height != h {
-        return Some(());
+        // An effect grew the buffer (Motion Tile's Output Width): back to the comp.
+        let Some((x, y)) = effectcraft_render::adjustment_crop(offset, [0.0; 2], (adjusted.width, adjusted.height), (w, h)) else {
+            return Some(());
+        };
+        adjusted = e.crop(&adjusted, x as u32, y as u32, w, h);
     }
     if let Some(c) = pipe.to_blend() {
         adjusted = ops::convert(e, &adjusted, &c);
@@ -307,7 +332,7 @@ fn composite_iso_with(
             None => {
                 let mut mimg = e.zeros(canvas.width, canvas.height);
                 if m.is_active_at(ctx.time)
-                    && let Some(mb) = r.layer_buf(ctx, m)
+                    && let Some(mb) = r.matte_buf(ctx, m)
                 {
                     let mo = ctx.opacity(m) as f32;
                     mimg = place(e, r, ctx, m, &mb, &mimg, BlendMode::Normal, mo, None)?;

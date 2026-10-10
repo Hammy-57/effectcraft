@@ -8,7 +8,8 @@ use crate::shortcuts::{Keymaps, SHORTCUTS_FILE, ShortcutTable, UiCommand};
 use crate::{EngineError, Result, Session};
 
 impl Session {
-    /// Load settings and shortcut presets from the config store and apply them.
+    /// Load settings, shortcut presets and scripts' settings from the config store and apply
+    /// them.
     pub fn load_settings(&mut self) {
         if let Some(c) = &self.config {
             if let Some(t) = c.read(PREFS_FILE) {
@@ -18,6 +19,7 @@ impl Session {
                 self.keymaps = Keymaps::from_json(&t);
             }
         }
+        crate::commands::scripts::load_script_settings(self);
         self.prefs_changed();
         self.shortcuts_changed();
     }
@@ -196,6 +198,17 @@ impl Session {
         }
     }
 
+    /// Auto-save preferences with the host's isolation folder applied, without changing or
+    /// persisting the user's settings.
+    pub fn autosave_prefs(&self) -> crate::prefs::Prefs {
+        let mut prefs = self.prefs.clone();
+        if let Some(folder) = &self.autosave_folder_override {
+            prefs.auto_save.location = "custom".into();
+            prefs.auto_save.folder = folder.to_string_lossy().into_owned();
+        }
+        prefs
+    }
+
     /// Write an auto-save now (whether or not the project is dirty). Returns its path.
     ///
     /// With [`autosave::AutoSaveState::background`] the project is serialised and written on a
@@ -205,8 +218,9 @@ impl Session {
         // One write at a time: the previous one must land before its slot rotates.
         self.autosave_wait()?;
         let root = self.default_autosave_root();
+        let prefs = self.autosave_prefs();
         let fail = |e: std::io::Error| EngineError::Other(format!("auto-save failed: {e}"));
-        let plan = autosave::plan_in(self.file_ops(), &self.prefs, self.path.as_deref(), root.as_deref(), self.autosave.last_slot).map_err(fail)?;
+        let plan = autosave::plan_in(self.file_ops(), &prefs, self.path.as_deref(), root.as_deref(), self.autosave.last_slot).map_err(fail)?;
         if self.autosave.background && !cfg!(target_arch = "wasm32") {
             let project = self.project.clone();
             let config = self.config.clone();
@@ -263,7 +277,8 @@ impl Session {
         if !self.is_dirty() || self.autosave.saved_revision == Some(self.revision) || self.render_job.is_some() {
             return None;
         }
-        if self.path.is_none() && self.prefs.auto_save.location != "custom" && self.default_autosave_root().is_none() {
+        if self.path.is_none() && self.prefs.auto_save.location != "custom" && self.default_autosave_root().is_none() && self.autosave_folder_override.is_none()
+        {
             return None;
         }
         let r = self.autosave_now();

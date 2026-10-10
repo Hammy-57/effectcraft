@@ -16,7 +16,7 @@ fn brdf_matches_cook_torrance_formula() {
     let v = shade::norm([0.3, 0.1, 1.0]);
     let l = shade::norm([-0.4, 0.2, 1.0]);
     let (base, metal, rough) = ([0.8, 0.4, 0.2], 0.3f32, 0.45f32);
-    let got = shade::brdf(base, metal, rough, 1.0, 1.0, n, v, l);
+    let got = shade::brdf(base, metal, rough, 1.0, 1.0, 1.0, n, v, l);
     let h = shade::norm([v[0] + l[0], v[1] + l[1], v[2] + l[2]]);
     let (nv, nl, nh, vh) = (shade::dot(n, v), shade::dot(n, l), shade::dot(n, h), shade::dot(v, h));
     let a2 = (rough * rough).powi(2);
@@ -30,9 +30,9 @@ fn brdf_matches_cook_torrance_formula() {
         assert!((got[c] - expect).abs() < 1e-5, "channel {c}: {} vs {expect}", got[c]);
     }
     // No light from behind the surface.
-    assert_eq!(shade::brdf(base, metal, rough, 1.0, 1.0, n, v, [0.0, 0.0, -1.0]), [0.0; 3]);
+    assert_eq!(shade::brdf(base, metal, rough, 1.0, 1.0, 1.0, n, v, [0.0, 0.0, -1.0]), [0.0; 3]);
     // A white rough dielectric lit head-on reflects about its base colour (π folded in).
-    let w = shade::brdf([1.0; 3], 0.0, 1.0, 1.0, 1.0, n, n, n);
+    let w = shade::brdf([1.0; 3], 0.0, 1.0, 1.0, 1.0, 1.0, n, n, n);
     assert!(w[0] > 0.95 && w[0] < 1.05, "{w:?}");
 }
 
@@ -193,13 +193,20 @@ fn lit_cube_renders_with_depth_and_shading() {
     let centre = img.data[60 * 160 + 80];
     assert!(centre[3] > 0.99, "cube covers the centre: {centre:?}");
     assert_eq!(img.data[2 * 160 + 2][3], 0.0, "corner is empty");
-    // No lights: unlit (base colour) — add a light and faces get different shades.
+    let shades = |img: &crate::Image| {
+        let mut s: Vec<i32> = img.data.iter().filter(|q| q[3] > 0.99).map(|q| (q[0] * 20.0) as i32).collect();
+        s.sort();
+        s.dedup();
+        s
+    };
+    // No light layer: the default environment light shades the faces (not the flat base colour).
+    let default_lit = shades(&img);
+    assert!(default_lit.len() >= 3, "default light shades the faces: {default_lit:?}");
+    // A light layer replaces the default light.
     add(&mut p, cid, LayerSource::Light { kind: LightKind::Parallel }, |_| {});
     let lit = render(&p, cid);
-    let mut shades: Vec<i32> = lit.data.iter().filter(|q| q[3] > 0.99).map(|q| (q[0] * 20.0) as i32).collect();
-    shades.sort();
-    shades.dedup();
-    assert!(shades.len() >= 3, "faces are shaded differently: {shades:?}");
+    assert!(shades(&lit).len() >= 3, "faces are shaded differently: {:?}", shades(&lit));
+    assert!(lit.data.iter().zip(&img.data).any(|(a, b)| (a[0] - b[0]).abs() > 0.05), "the light layer turns the default light off");
     // Classic 3D draws no meshes.
     p.comp_mut(cid).unwrap().renderer = R3::Classic3D;
     assert!(render(&p, cid).data.iter().all(|q| q[3] == 0.0));
@@ -270,6 +277,35 @@ fn cards_and_environment_light() {
     assert_eq!(lit.data[80 * 120 + 110][3], 0.0);
 }
 
+/// An Environment light with no source layer lights with the default environment, scaled by
+/// its Intensity and Colour (SceneYard "Space Vision": Environment 180%, no source, the purple
+/// floor about 1.8× its solid colour in After Effects). It added no light at all and, being a
+/// light layer, also kept the no-light default away: the scene rendered black.
+#[test]
+fn environment_light_without_a_source_uses_the_default_environment() {
+    let (mut p, cid) = project(120, 90);
+    let sid = p.add_item(
+        "S",
+        Default::default(),
+        None,
+        ItemKind::Solid(effectcraft_project::Solid { color: [0.3, 0.2, 0.4], width: 60, height: 40, pixel_aspect: 1.0 }),
+    );
+    add(&mut p, cid, LayerSource::Solid { item: sid }, |l| l.switches.three_d = true);
+    let unlit = render(&p, cid).data[20 * 120 + 30];
+    add(&mut p, cid, LayerSource::Light { kind: LightKind::Environment }, |l| set(l, "lightOptions/intensity", Value::Scalar(180.0)));
+    let lit = render(&p, cid).data[20 * 120 + 30];
+    for c in 0..3 {
+        assert!(lit[c] > unlit[c] * 1.3 && lit[c] < unlit[c] * 2.5, "channel {c}: {lit:?} vs unlit {unlit:?}");
+    }
+    // Half the intensity: less light, still lit.
+    let l = p.comp_mut(cid).unwrap().layers.iter_mut().find(|l| l.is_light()).unwrap();
+    set(l, "lightOptions/intensity", Value::Scalar(90.0));
+    let half = render(&p, cid).data[20 * 120 + 30];
+    for c in 0..3 {
+        assert!(half[c] >= unlit[c] - 1e-6 && half[c] < lit[c], "channel {c}: {half:?} vs {lit:?}");
+    }
+}
+
 #[test]
 fn depth_of_field_blurs_out_of_focus_surfaces() {
     let mut img = Image::new(64, 64);
@@ -283,7 +319,14 @@ fn depth_of_field_blurs_out_of_focus_surfaces() {
         let m: f32 = im.data.iter().map(|p| p[0]).sum::<f32>() / im.data.len() as f32;
         im.data.iter().map(|p| (p[0] - m).powi(2)).sum::<f32>() / im.data.len() as f32
     };
-    let dof = crate::three_d::camera::Dof { focus: 1000.0, aperture: 40.0, blur_level: 1.0, iris: Default::default(), highlight: Default::default() };
+    let dof = crate::three_d::camera::Dof {
+        focus: 1000.0,
+        aperture: 40.0,
+        blur_level: 1.0,
+        focal_length: 0.0,
+        iris: Default::default(),
+        highlight: Default::default(),
+    };
     let sharp = depth_of_field(&img, &vec![1000.0; 64 * 64], &dof, 1.0);
     assert!((var(&sharp) - var(&img)).abs() < 1e-6, "in focus: unchanged");
     let blurred = depth_of_field(&img, &vec![3000.0; 64 * 64], &dof, 1.0);
@@ -534,4 +577,73 @@ fn stroke_regions_are_rings() {
     let outlines = effectcraft_model::extrude::group_contours(scene::contours(&r, 0.25));
     assert_eq!(outlines.len(), 1);
     assert_eq!(outlines[0].holes.len(), 1);
+}
+
+#[test]
+fn ae_model_orientation_turns_z_first() {
+    // AE-imported models compose Orientation as Rx·Ry·Rz: (270°, 0°, 30°) stands a Z-up mesh
+    // up and then yaws it about its own vertical axis (Rz·Ry·Rx would roll it on screen).
+    use effectcraft_geom::{Mat4, vec3};
+    let (mut p, cid) = project(160, 120);
+    let item = p.add_item(
+        "m.glb",
+        Default::default(),
+        None,
+        ItemKind::Footage(effectcraft_project::Footage { kind: effectcraft_project::FootageKind::Model, missing: true, ..Default::default() }),
+    );
+    for ae in [true, false] {
+        add(&mut p, cid, LayerSource::Model { item }, |l| {
+            set(l, "transform/orientation", Value::Vec3([270.0, 0.0, 30.0]));
+            set(l, "transform/anchor", Value::Vec3([0.0, 0.0, 0.0]));
+            set(l, "transform/position", Value::Vec3([0.0, 0.0, 0.0]));
+            set(l, "geometryOptions/aeSourceSpace", Value::Bool(ae));
+        });
+        let comp = p.comp(cid).unwrap();
+        let ctx = crate::EvalCtx::new(&p, cid, comp, Tick::ZERO);
+        let m = ctx.world_matrix(&comp.layers[0]);
+        let want = if ae { Mat4::rotate_x(270.0) * Mat4::rotate_y(0.0) * Mat4::rotate_z(30.0) } else { Mat4::orientation(vec3(270.0, 0.0, 30.0)) };
+        for i in 0..3 {
+            for j in 0..3 {
+                assert!((m.0[i][j] - want.0[i][j]).abs() < 1e-9, "ae={ae}: {m:?} vs {want:?}");
+            }
+        }
+        p.comp_mut(cid).unwrap().layers.remove(0);
+    }
+}
+
+/// Advanced 3D Material Options and light Intensity as measured with aerender (SceneYard Glass
+/// UI List's Metal 80 cards): an ambient light at 50 % lights a 50 % grey card to about 0.20 of
+/// its linear colour (Intensity^2.3), and a smooth (Shininess 90) full metal lit by a point light
+/// is far darker than the same dielectric, while a rough (Shininess 5) metal is brighter.
+#[test]
+fn card_metal_and_light_intensity_follow_after_effects() {
+    let shade = |metal: f64, shininess: f64, ambient: bool| {
+        let (mut p, cid) = project(120, 90);
+        let sid = p.add_item(
+            "S",
+            Default::default(),
+            None,
+            ItemKind::Solid(effectcraft_project::Solid { color: [0.5, 0.5, 0.5], width: 120, height: 90, pixel_aspect: 1.0 }),
+        );
+        add(&mut p, cid, LayerSource::Solid { item: sid }, |l| {
+            l.switches.three_d = true;
+            set(l, "materialOptions/metal", Value::Scalar(metal));
+            set(l, "materialOptions/specularShininess", Value::Scalar(shininess));
+        });
+        if ambient {
+            add(&mut p, cid, LayerSource::Light { kind: LightKind::Ambient }, |l| set(l, "lightOptions/intensity", Value::Scalar(50.0)));
+        } else {
+            add(&mut p, cid, LayerSource::Light { kind: LightKind::Point }, |l| {
+                set(l, "transform/position", Value::Vec3([60.0, 45.0, -300.0]));
+                set(l, "lightOptions/intensity", Value::Scalar(600.0));
+            });
+        }
+        render(&p, cid).data[45 * 120 + 20]
+    };
+    let lin = |v: f32| effectcraft_color::srgb_to_linear(v);
+    let amb = shade(0.0, 5.0, true);
+    assert!((lin(amb[0]) / lin(0.5) - 0.2).abs() < 0.03, "{amb:?}");
+    let (dielectric, smooth_metal, rough_metal) = (shade(0.0, 90.0, false), shade(100.0, 90.0, false), shade(100.0, 5.0, false));
+    assert!(smooth_metal[0] < dielectric[0] * 0.6, "{smooth_metal:?} vs {dielectric:?}");
+    assert!(rough_metal[0] > shade(0.0, 5.0, false)[0], "{rough_metal:?}");
 }

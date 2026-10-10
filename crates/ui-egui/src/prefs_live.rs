@@ -17,7 +17,10 @@ pub fn frame(app: &mut EffectcraftApp, ctx: &egui::Context) {
     video_preview(app, ctx);
 }
 
-/// Files dropped on the window are imported (layered files as Default Drag Import As says).
+/// Files dropped on the window are imported (layered files as Default Drag Import As says) in
+/// the background, with the Importing card showing what is read (#270). Dropped on the
+/// Composition viewer, they also become layers centred there, as in After Effects (#85), when the
+/// platform reports where the pointer is during file drags.
 fn dropped_files(app: &mut EffectcraftApp, ctx: &egui::Context) {
     let paths: Vec<String> =
         ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_string_lossy().to_string()).filter(|p| std::path::Path::new(p).is_absolute()).collect());
@@ -34,7 +37,11 @@ fn dropped_files(app: &mut EffectcraftApp, ctx: &egui::Context) {
         app.ui.status = e;
     }
     if !rest.is_empty() {
-        let params = json!({"paths": rest, "drag": true, "importAs": app.session.prefs.drag_import_as()});
+        let viewer = app.auto.find("viewer.area").map(|e| Rect::from_min_size(egui::pos2(e.rect[0], e.rect[1]), egui::vec2(e.rect[2], e.rect[3])));
+        let at =
+            ctx.input(|i| i.pointer.hover_pos()).filter(|p| viewer.is_some_and(|v| v.contains(*p))).and_then(|p| crate::panels::viewer::screen_to_comp(ctx, p));
+        let params =
+            json!({"paths": rest, "drag": true, "importAs": app.session.prefs.drag_import_as(), "addToComp": at.is_some(), "position": at, "background": true});
         if let Err(e) = crate::menus::invoke(app, ctx, "file.import", params) {
             app.ui.status = e;
         }
@@ -103,10 +110,10 @@ fn video_preview(app: &mut EffectcraftApp, ctx: &egui::Context) {
                 let opts = crate::panels::viewer::zoom_texture_options(app.session.prefs.viewer_zoom_smooth());
                 let t = match prev {
                     Some((_, mut t)) => {
-                        t.set((*img).clone(), opts);
+                        t.set(crate::frames::fit_texture((*img).clone(), crate::frames::max_texture_side(ctx)), opts);
                         t
                     }
-                    None => ctx.load_texture("video-preview", (*img).clone(), opts),
+                    None => crate::frames::load_fitted(ctx, "video-preview", (*img).clone(), opts),
                 };
                 ctx.data_mut(|d| d.insert_temp(tex_id, (k, t.clone())));
                 Some(t)

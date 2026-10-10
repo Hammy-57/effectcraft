@@ -8,7 +8,7 @@ work apply to everyone, people and AI agents alike, and they are not negotiable.
 You need [Rust](https://rustup.rs/) 1.95 or newer.
 
 ```sh
-cargo run -p effectcraft                 # the desktop app, with the demo project
+cargo run -p effectcraft -- --demo       # the desktop app, with the demo project
 cargo test --workspace
 cargo xtask ci                           # what every commit must pass
 ```
@@ -44,8 +44,9 @@ cargo xtask ci                           # what every commit must pass
 - **A test file:** `src/tests_<topic>.rs` next to `lib.rs` (engine, render) is picked up on its own.
 
 New module files need no `mod` line ([self-registering modules](docs/architecture.md#self-registering-modules));
-format with `cargo xtask fmt`, since `cargo fmt` doesn't reach them. Parity notes go in a new
-`docs/parity/updates/<task>.md` (see [docs/parity.md](docs/parity.md)).
+format with `cargo xtask fmt`, since `cargo fmt` doesn't reach them. Parity history is appended
+to [docs/parity-log.md](docs/parity-log.md) (union-merged); [docs/parity.md](docs/parity.md) keeps
+the current state only.
 
 ## Talk to us
 

@@ -204,6 +204,60 @@ fn echo_and_posterize_time() {
 }
 
 #[test]
+fn median_levels_match_cpu_division() {
+    let Some(g) = crate::tests::gpu() else { return };
+    let mut image = effectcraft_raster::Image::new(512, 1);
+    for (i, pixel) in image.data.iter_mut().enumerate() {
+        *pixel = [i as f32 / 511.0; 4];
+    }
+    let input = g.ctx.upload_image(&image).unwrap();
+    for radius in [3, 5] {
+        // A monotone row's median is its centre, including repeated edges. Exercise both
+        // the bisection and sliding-histogram kernels at every quantised level.
+        let mut enc = crate::context::Enc::new(&g.ctx);
+        let median = crate::fx_noise::median_image(&mut enc, &input, radius, false);
+        let actual = enc.download(&median).unwrap();
+        for (level, (want, got)) in image.data.iter().zip(&actual.data).enumerate() {
+            assert_eq!(got, want, "radius {radius}, level {level}");
+        }
+    }
+}
+
+#[test]
+fn dust_strict_threshold_boundaries() {
+    let Some(g) = crate::tests::gpu() else { return };
+    let spec = effectcraft_effects::find("ec.noise.dustscratches").unwrap();
+    let size = [7.0, 7.0];
+    let mut params =
+        effectcraft_effects::Params { values: spec.params.iter().map(|p| (p.id.to_string(), effectcraft_effects::default_value(p, size))).collect() };
+    let exact = 63.75_f32;
+    let half_colour = [128.0 / 511.0, 128.0 / 511.0, 128.0 / 511.0, 256.0 / 511.0];
+    let cases = [
+        // The NVIDIA failure: rounding 154 / 511 down changes the keep/replace decision.
+        ([126.0 / 511.0, 60.0 / 511.0, 62.0 / 511.0, 154.0 / 511.0], [73.0 / 255.0, 32.0 / 255.0, 32.0 / 255.0, 77.0 / 255.0], 10.0, true),
+        // Candidate red = 0.25, original red = 0.5. Equality must keep the original;
+        // adjacent representable thresholds exercise both sides of the strict comparison.
+        (half_colour, [0.5, 0.25, 0.25, 0.5], exact.next_down(), true),
+        (half_colour, [0.5, 0.25, 0.25, 0.5], exact, false),
+        (half_colour, [0.5, 0.25, 0.25, 0.5], exact.next_up(), false),
+    ];
+    for radius in [3.0, 5.0] {
+        params.values.insert("radius".into(), n(radius));
+        for (median, original, threshold, replaced) in cases {
+            params.values.insert("threshold".into(), n(threshold as f64));
+            let ctx = || effectcraft_effects::EffectCtx { params: &params, time: 0.0, layer_size: size, seed: 0, adjustment: false, env: Default::default() };
+            let mut img = effectcraft_raster::Image::filled(7, 7, median);
+            img.set(3, 3, original);
+            let buf = effectcraft_effects::Buf { img, offset: [0.0; 2], scale: 1.0 };
+            let cpu = (spec.render)(&ctx(), buf.clone());
+            assert_eq!(cpu.img.data[24] != original, replaced, "CPU radius {radius}, threshold {threshold}");
+            let gpu = effectcraft_render::Accelerator::effects(g, &[effectcraft_render::FxStep { spec, ctx: ctx() }], &buf, None).unwrap();
+            assert_eq!(gpu.img.data[24], cpu.img.data[24], "radius {radius}, threshold {threshold}");
+        }
+    }
+}
+
+#[test]
 fn dust_threshold_on_quantized_input() {
     let Some(g) = crate::tests::gpu() else { return };
     let spec = effectcraft_effects::find("ec.noise.dustscratches").unwrap();

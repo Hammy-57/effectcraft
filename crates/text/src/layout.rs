@@ -88,6 +88,8 @@ pub struct TextStyle {
     /// Variable font axis values (tag, user units): shaping (advances through HVAR / gvar
     /// phantom points) and outlines use this design-space position.
     pub variations: Vec<(String, f32)>,
+    /// Use vertical alternates for upright CJK glyphs (runtime layout setting only).
+    pub vertical: bool,
 }
 
 impl Default for TextStyle {
@@ -113,6 +115,7 @@ impl Default for TextStyle {
             leading: None,
             opentype: OpenType::default(),
             variations: Vec::new(),
+            vertical: false,
         }
     }
 }
@@ -198,6 +201,7 @@ impl Hash for TextStyle {
         self.leading.map(f32::to_bits).hash(h);
         (self.kerning, self.optical, self.ligatures, self.faux_bold, self.faux_italic, self.caps, self.underline, self.script).hash(h);
         self.opentype.hash(h);
+        self.vertical.hash(h);
         for (t, v) in &self.variations {
             t.hash(h);
             hf(h, *v);
@@ -450,6 +454,10 @@ fn shape_item(chars: &[(usize, char, char)], rtl: bool, face: FaceId, size: f32,
     buf.set_direction(if rtl { Direction::RightToLeft } else { Direction::LeftToRight });
     buf.guess_segment_properties();
     let mut feats = Vec::new();
+    if style.vertical && chars.first().is_some_and(|(_, c, _)| crate::is_cjk(*c)) {
+        feats.push(Feature::new(Tag::new(b"vert"), 1, ..));
+        feats.push(Feature::new(Tag::new(b"vrt2"), 1, ..));
+    }
     if !style.kerning || style.optical || style.manual_kern.is_some() {
         feats.push(Feature::new(Tag::new(b"kern"), 0, ..));
     }
@@ -666,13 +674,14 @@ fn paragraph(text: &str, base: usize, runs: &[(Range<usize>, TextStyle)], primar
     let mut items: Vec<Item> = Vec::new();
     let mut i = 0;
     while i < chars.len() {
-        let key = |c: &(usize, char, char, FaceId, bool, Form, usize)| (c.3, c.4, c.5, c.6);
+        let key =
+            |c: &(usize, char, char, FaceId, bool, Form, usize)| (c.3, c.4, c.5, c.6, runs.get(c.6).is_some_and(|run| run.1.vertical) && crate::is_cjk(c.1));
         let k0 = key(&chars[i]);
         let mut j = i + 1;
         while j < chars.len() && key(&chars[j]) == k0 {
             j += 1;
         }
-        let (face, rtl, form, si) = k0;
+        let (face, rtl, form, si, _) = k0;
         let style = &runs[si].1;
         let sub: Vec<(usize, char, char)> = chars[i..j].iter().map(|c| (c.0, c.1, c.2)).collect();
         let size = match form {
@@ -968,11 +977,18 @@ pub fn layout_rich_uncached(text: &str, runs: &[(Range<usize>, TextStyle)], para
             baseline += adv;
         }
         let shown = pl.content - pl.hang.0 - pl.hang.1;
-        let (ml, mr) = pl.margins;
+        let (ml, _) = pl.margins;
+        // Point text (no box, one line per paragraph): as in After Effects, the indent on the
+        // edge the alignment pins is applied (Indent Before for start-aligned lines, Indent
+        // After for end-aligned ones, neither for centred lines) and the first-line indent
+        // always moves the line along the reading direction.
+        let (rtl, fi) = (para.rtl == Some(true), para.indent_first);
         let shift = match (pl.avail, pl.align) {
-            (None, Align::Left | Align::Justify) => ml,
-            (None, Align::Center) => -shown / 2.0 + (ml - mr) / 2.0,
-            (None, Align::Right) => -shown - mr,
+            (None, Align::Left | Align::Justify) if rtl => para.indent_end - fi,
+            (None, Align::Left | Align::Justify) => para.indent_start + fi,
+            (None, Align::Center) => -shown / 2.0 + if rtl { -fi } else { fi },
+            (None, Align::Right) if rtl => -shown - para.indent_start - fi,
+            (None, Align::Right) => -shown - para.indent_end + fi,
             (Some(_), Align::Left | Align::Justify) => ml,
             (Some(a), Align::Center) => ml + (a - shown) / 2.0,
             (Some(a), Align::Right) => ml + a - shown,
@@ -1342,7 +1358,8 @@ mod tests {
         assert!((l.lines[1].x - 30.0).abs() < 1e-3);
         assert!(l.lines.iter().all(|ln| ln.x + ln.width <= 400.0 + 0.5));
         assert!(!l.lines[0].para_end);
-        // Point text: a right-aligned paragraph's end indent moves it left of the origin.
+        // The generic layout honours explicitly supplied point indents. `layout_doc` clears
+        // them for AE Source Text point layers (3 Item Slider parity); other callers may opt in.
         let l = layout_rich_uncached("abc", &[(0..3, s)], &[ParagraphStyle { align: Align::Right, indent_end: 12.0, ..Default::default() }]);
         assert!((l.lines[0].x + l.lines[0].width + 12.0).abs() < 1e-3);
     }

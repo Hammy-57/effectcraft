@@ -60,8 +60,8 @@ impl Offload for WorkerOffload {
         let id = req.id;
         let files = js_sys::Array::new();
         for p in &req.files {
-            if let Some(d) = crate::files::get(p) {
-                files.push(&js_sys::Array::of2(&JsValue::from_str(p), &js_sys::Uint8Array::from(&d[..])));
+            if let Some((d, version)) = crate::files::get_versioned(p) {
+                files.push(&js_sys::Array::of3(&JsValue::from_str(p), &js_sys::Uint8Array::from(&d[..]), &JsValue::from_f64(version as f64)));
             }
         }
         let json = serde_json::to_string(&req).map_err(|e| e.to_string())?;

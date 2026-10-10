@@ -10,11 +10,12 @@
 //! Video containers (MP4/MOV, Matroska/WebM) and codecs (H.264, HEVC, VP9, AV1, ProRes, DNxHD,
 //! MJPEG; AAC, Opus, PCM, MP3/FLAC/Vorbis) come from FilmCraft's pure-Rust crates (git dependency,
 //! pinned; `plan/adr/0001`). FilmCraft types never leave this crate. Stills use the `image` crate
-//! (PNG, JPEG, GIF, WebP, TIFF, BMP, OpenEXR); Photoshop documents (merged image or one layer) come
+//! (PNG, JPEG, GIF, WebP, TIFF, BMP, OpenEXR), AVIF through FilmCraft's AV1 decoder; Photoshop documents (merged image or one layer) come
 //! from `effectcraft-psd` and SVG from `effectcraft-svg` (rasterised at any scale).
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+mod avif;
 mod convert;
 pub mod exr_channels;
 mod layered;
@@ -23,7 +24,7 @@ mod pool;
 mod probe;
 
 pub use pool::{DEFAULT_BUDGET, MediaPool, PoolStats};
-pub use probe::{DEFAULT_SEQUENCE_RATE, probe, probe_bytes, probe_model, probe_single, sequence_files};
+pub use probe::{DEFAULT_SEQUENCE_RATE, probe, probe_bytes, probe_model};
 
 /// Errors from probing or decoding footage.
 #[derive(Debug, thiserror::Error)]
@@ -50,7 +51,7 @@ impl From<filmcraft_media::MediaError> for MediaError {
 }
 
 /// File extensions recognised as stills.
-pub const STILL_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "tif", "tiff", "bmp", "exr", "psd", "psb", "svg", "pdf", "ai", "eps"];
+pub const STILL_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "avif", "tif", "tiff", "bmp", "exr", "psd", "psb", "svg", "pdf", "ai", "eps"];
 /// File extensions recognised as audio-only files.
 pub const AUDIO_EXTENSIONS: &[&str] = filmcraft_media::AUDIO_EXTENSIONS;
 /// File extensions recognised as movies.

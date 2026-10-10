@@ -17,10 +17,11 @@ vendor: Learning Machines LLC
 homepage: https://getartcraft.com/apps/effectcraft
 license: MIT OR Apache-2.0
 description: |-
-  Open-source, native image editor that works the way Photoshop users expect.
-  Layers, masks, adjustment layers, layer styles, type and brushes; opens and
-  saves layered PSD/PSB files; 8/16/32-bit documents; GPU compositing (wgpu).
-  Includes effectcraft-cli, a headless converter and command runner.
+  Open-source motion graphics and visual effects compositor.
+  Layers with keyframes and a graph editor, masks and shapes, text animators,
+  expressions, 3D cameras and lights, over 300 effects and a render queue
+  (H.264, HEVC, AV1, ProRes, WebM, image sequences); GPU compositing (wgpu).
+  Includes effectcraft-cli, a headless renderer, command runner and MCP server.
 
 # The binaries link only glibc and libgcc_s directly. Windowing (X11/Wayland, xkbcommon) and the
 # GPU (Vulkan, EGL/GL) are loaded at runtime, so they are dependencies/recommendations here

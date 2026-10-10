@@ -292,7 +292,13 @@ pub(crate) fn motion_path(app: &mut EffectcraftApp, painter: &egui::Painter, map
         }
         let v = k.value.as_vec3();
         let s = to_scr(v);
-        let (tin, tout) = effectcraft_engine::keyframe::spatial_tangents(&pos.keys, i);
+        // Auto-Bezier keys show handles on a side the path leaves straight too (a two-key path's
+        // ends), to drag it into a curve; Linear keys (no tangents) show none.
+        let (tin, tout) = if k.spatial_auto {
+            effectcraft_engine::keyframe::spatial_handles(&pos.keys, i)
+        } else {
+            effectcraft_engine::keyframe::spatial_tangents(&pos.keys, i)
+        };
         for (out, tg) in [(false, tin), (true, tout)] {
             let has = (out && i + 1 < pos.keys.len()) || (!out && i > 0);
             if !has || (tg[0] == 0.0 && tg[1] == 0.0) {

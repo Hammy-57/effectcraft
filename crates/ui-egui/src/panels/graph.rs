@@ -164,7 +164,20 @@ fn curves<'a>(app: &EffectcraftApp, comp: &'a Comp, ectx: &EvalCtx, tm: TMap, pl
 
 fn text_button(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, x: &mut f32, y: f32, label: &str, on: bool, id: &str, tip: &str) -> bool {
     let t = app.tokens;
-    let w = p.layout_no_wrap(label.to_string(), Tokens::ui(11.0), t.text).size().x + 14.0;
+    let name = match label {
+        "Fit" => "graph-fit",
+        "Fit Selection" => "graph-fit-selection",
+        "Separate Dimensions" => "graph-separate",
+        "Hold" => "graph-hold",
+        "Linear" => "graph-linear",
+        "Auto Bezier" => "graph-auto-bezier",
+        "Easy Ease" => "graph-ease",
+        "Ease In" => "graph-ease-in",
+        "Ease Out" => "graph-ease-out",
+        _ => "",
+    };
+    let icon = if name.is_empty() { None } else { crate::local_assets::icon(ui.ctx(), name) };
+    let w = if icon.is_some() { 24.0 } else { p.layout_no_wrap(label.to_string(), Tokens::ui(11.0), t.text).size().x + 14.0 };
     let r = Rect::from_min_size(pos2(*x, y - 9.0), vec2(w, 18.0));
     let resp = ui.interact(r, egui::Id::new(("graph-btn", id)), Sense::click()).on_hover_text(tip);
     p.rect_filled(
@@ -178,7 +191,12 @@ fn text_button(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, x
             Color32::from_rgb(0x2c, 0x2c, 0x2c)
         },
     );
-    p.text(r.center(), Align2::CENTER_CENTER, label, Tokens::ui(11.0), if on { Color32::WHITE } else { t.text });
+    let color = if on { Color32::WHITE } else { t.text };
+    if let Some(icon) = icon {
+        p.image(icon.id(), Rect::from_center_size(r.center(), vec2(16.0, 16.0)), Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), color);
+    } else {
+        p.text(r.center(), Align2::CENTER_CENTER, label, Tokens::ui(11.0), color);
+    }
     app.auto.add(&format!("timeline.graph.{id}"), r, tip);
     *x += w + 4.0;
     resp.clicked()
@@ -244,7 +262,13 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
         gv += step;
     }
     if cs.is_empty() {
-        p.text(plot.center(), Align2::CENTER_CENTER, "Select animated properties to show them in the Graph Editor", Tokens::ui(12.0), t.text_faint);
+        p.text(
+            plot.center(),
+            Align2::CENTER_CENTER,
+            crate::i18n::tr("Select animated properties to show them in the Graph Editor"),
+            Tokens::ui(12.0),
+            t.text_faint,
+        );
     }
 
     // Show Reference Graph: the other graph type, faint, scaled to the plot.
@@ -286,8 +310,31 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
         .collect();
     let all_key_times: Vec<(u64, usize, f64)> = cs.iter().flat_map(|c| c.keys.iter().map(move |k| (c.prop.uid, k.idx, k.t))).collect();
     super::graph_tools::transform_box(app, ui, &pc, &sel_keys, tm, &ymap, &vmap, speed, false, actions);
+    // Key marquee (dragging the background): the box now (the last one on release), the keys
+    // inside it, and the selection the keys show while it is dragged, as in After Effects.
+    let key_box = match (bg.dragged(), ctx.input(|i| i.pointer.press_origin()), bg.interact_pointer_pos()) {
+        (true, Some(o), Some(cur)) => Some(Rect::from_two_pos(o, cur)),
+        _ if bg.drag_stopped() => ctx.data(|d| d.get_temp::<Rect>(egui::Id::new("graph-box"))),
+        _ => None,
+    };
+    let box_keys: Option<Vec<KeyRef>> = key_box.map(|br| {
+        cs.iter()
+            .filter(|c| !c.layer.switches.locked)
+            .flat_map(|c| {
+                c.keys
+                    .iter()
+                    .filter(move |k| {
+                        let kp = pos2(tm.x(k.t), ymap(k.v));
+                        plot.expand(6.0).contains(kp) && br.contains(kp)
+                    })
+                    .map(move |k| KeyRef { layer: c.layer.id, prop: c.prop.uid, time: k.time })
+            })
+            .collect()
+    });
+    let current = app.session.state.selected_keys.clone();
+    let key_preview = box_keys.as_ref().map(|in_box| super::graph_tools::marquee_selection(&current, in_box, ui.input(|i| i.modifiers)));
+    let n_selected = current.len();
     // Keys and handles.
-    let mut key_screens: Vec<(serde_json::Value, Pos2)> = vec![];
     for c in &cs {
         let (lid, uid, d) = (c.layer.id, c.prop.uid, c.dim);
         for k in &c.keys {
@@ -296,7 +343,6 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
                 continue;
             }
             let kjson = json!({"layer": lid.0, "prop": uid, "time": k.time.seconds()});
-            key_screens.push((kjson.clone(), kp));
             // Handles (selected keys).
             for h in &k.handles {
                 let hp = pos2(tm.x(h.t), ymap(h.v));
@@ -306,38 +352,59 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
                 let hr = Rect::from_center_size(hp, vec2(10.0, 10.0));
                 let hresp = ui.interact(hr, egui::Id::new(("ghandle", uid, d, k.idx, side)), Sense::drag());
                 app.auto.add(&format!("timeline.graph.handle.{uid}.{d}.{}.{side}", k.idx), hr, "Bezier handle");
+                // The same side's handles of every selected key move with it, by as much as the
+                // pointer moved (After Effects), in one undo step.
+                if hresp.drag_started() {
+                    let grabs: Vec<HandleGrab> = cs
+                        .iter()
+                        .flat_map(|c2| {
+                            c2.keys.iter().flat_map(move |k2| {
+                                k2.handles.iter().filter(|h2| h2.out == h.out).map(move |h2| HandleGrab {
+                                    layer: c2.layer.id,
+                                    prop: c2.prop.uid,
+                                    dim: c2.editable.then_some(c2.dim),
+                                    time: k2.time,
+                                    out: h2.out,
+                                    key: (k2.t, k2.v),
+                                    end: (h2.t, h2.v),
+                                    negative: h2.speed < 0.0,
+                                    dur: h2.dur,
+                                })
+                            })
+                        })
+                        .collect();
+                    let press = ui.input(|i| i.pointer.press_origin()).unwrap_or(hp);
+                    ctx.data_mut(|dd| dd.insert_temp::<HandleDrag>(handle_drag_id(), (press, grabs)));
+                }
                 if hresp.dragged()
                     && let Some(pt) = hresp.interact_pointer_pos()
+                    && let Some((press, grabs)) = ctx.data(|dd| dd.get_temp::<HandleDrag>(handle_drag_id()))
                 {
                     ctx.data_mut(|dd| dd.insert_temp(drag_id, true));
-                    let mut dt = (tm.t(pt.x) - k.t) * if h.out { 1.0 } else { -1.0 };
-                    dt = dt.max(h.dur * 0.001);
-                    let influence = (dt / h.dur.max(1e-9) * 100.0).clamp(0.1, 100.0);
-                    let sp = if speed {
-                        let mag = vmap(pt.y).max(0.0);
-                        if h.speed < 0.0 { -mag } else { mag }
-                    } else {
-                        let dv = vmap(pt.y) - k.v;
-                        dv / dt * if h.out { 1.0 } else { -1.0 }
-                    };
-                    let mut params = json!({"layer": lid.0, "prop": uid, "time": k.time.seconds(), "side": side, "speed": sp, "influence": influence, "merge": format!("ghandle-{uid}-{}", k.idx)});
-                    if c.editable {
-                        params["dim"] = json!(d);
+                    let (dt, dv) = (tm.t(pt.x) - tm.t(press.x), vmap(pt.y) - vmap(press.y));
+                    let merge = format!("ghandle-{uid}-{}", k.idx);
+                    for g in &grabs {
+                        actions.push(("keys.setEase".into(), g.ease(g.end.0 + dt, g.end.1 + dv, speed, &merge)));
                     }
-                    actions.push(("keys.setEase".into(), params));
                 }
                 if hresp.drag_stopped() {
-                    ctx.data_mut(|dd| dd.insert_temp(drag_id, false));
+                    ctx.data_mut(|dd| {
+                        dd.insert_temp(drag_id, false);
+                        dd.remove::<HandleDrag>(handle_drag_id());
+                    });
                     actions.push(("__endMerge".into(), json!({})));
                 }
             }
             // The key itself.
-            let col = if k.sel { t.keyframe_selected } else { Color32::from_gray(0xe0) };
+            // Drawn selected: what a marquee being dragged would select, else the selection.
+            let shown = key_preview.as_ref().map_or(k.sel, |p| p.contains(&KeyRef { layer: lid, prop: uid, time: k.time }));
+            let col = if shown { t.keyframe_selected } else { Color32::from_gray(0xe0) };
             pc.rect_filled(Rect::from_center_size(kp, vec2(7.0, 7.0)), 0.0, col);
             pc.rect_stroke(Rect::from_center_size(kp, vec2(7.0, 7.0)), 0.0, Stroke::new(1.0, c.color), StrokeKind::Outside);
             let kr = Rect::from_center_size(kp, vec2(11.0, 11.0));
             let kresp = ui.interact(kr, egui::Id::new(("gkey", uid, d, k.idx)), Sense::click_and_drag());
-            app.auto.add(&format!("timeline.graph.key.{uid}.{d}.{}", k.idx), kr, &c.prop.name);
+            let label = if shown { format!("{} (selected)", c.prop.name) } else { c.prop.name.clone() };
+            app.auto.add(&format!("timeline.graph.key.{uid}.{d}.{}", k.idx), kr, &label);
             let mods = ui.input(|i| i.modifiers);
             let key = &c.prop.keys[k.idx];
             if kresp.clicked() && mods.command {
@@ -349,10 +416,10 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
                     let linear = key.in_interp == Interp::Linear && key.out_interp == Interp::Linear;
                     actions.push(("keys.interpolation".into(), json!({"interpolation": if linear { "autoBezier" } else { "linear" }})));
                 }
-            } else if kresp.clicked() && mods.shift {
-                actions.push(("keys.select".into(), json!({"keys": [kjson.clone()], "toggle": true})));
-            } else if (kresp.clicked() || kresp.drag_started()) && !k.sel {
-                actions.push(("keys.select".into(), json!({"keys": [kjson.clone()], "add": mods.shift})));
+            } else if let Some(p) = super::graph_tools::key_select_gesture(ui, &kresp, &json!({"keys": [kjson.clone()]}), k.sel, n_selected) {
+                // Selected on the press (Shift adds); a click on a selected key reduces the
+                // selection to it (Shift: takes it out).
+                actions.push(("keys.select".into(), p));
             }
             // A drag moves every selected key, by how far the pointer went from where the button
             // went down (the key doesn't jump under the pointer); Shift keeps it to the time or
@@ -392,20 +459,17 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
     if bg.clicked() {
         actions.push(("keys.select".into(), json!({"keys": []})));
     }
-    if bg.dragged()
-        && let (Some(o), Some(cur)) = (ctx.input(|i| i.pointer.press_origin()), bg.interact_pointer_pos())
-    {
-        let br = Rect::from_two_pos(o, cur);
+    if let Some(br) = key_box.filter(|_| bg.dragged()) {
         pc.rect_filled(br, 0.0, t.accent.gamma_multiply(0.12));
         pc.rect_stroke(br, 0.0, Stroke::new(1.0, t.accent), StrokeKind::Middle);
         ctx.data_mut(|d| d.insert_temp(egui::Id::new("graph-box"), br));
     }
+    // Releasing the marquee commits the selection its keys showed.
     if bg.drag_stopped()
-        && let Some(br) = ctx.data(|d| d.get_temp::<Rect>(egui::Id::new("graph-box")))
+        && let Some(in_box) = &box_keys
     {
         ctx.data_mut(|d| d.remove::<Rect>(egui::Id::new("graph-box")));
-        let keys: Vec<serde_json::Value> = key_screens.iter().filter(|(_, sp)| br.contains(*sp)).map(|(k, _)| k.clone()).collect();
-        actions.push(("keys.select".into(), json!({"keys": keys, "add": ui.input(|i| i.modifiers.shift)})));
+        actions.push(("keys.select".into(), super::graph_tools::marquee_params(in_box, ui.input(|i| i.modifiers), false)));
     }
     // Wheel over the graph with Alt/Ctrl zooms the value axis (turns auto-zoom off).
     if ui.rect_contains_pointer(plot) {
@@ -557,4 +621,51 @@ struct KeyGrab {
 
 fn key_grab_id() -> egui::Id {
     egui::Id::new("graph-key-grab")
+}
+
+/// A Bezier handle moving with a handle drag: its key, side and dimension, the key's place
+/// (comp seconds, graph value) and the handle's end when the drag began.
+#[derive(Clone, Debug)]
+struct HandleGrab {
+    layer: LayerId,
+    prop: u64,
+    /// `None` for a property drawn as one curve (spatial).
+    dim: Option<usize>,
+    time: Tick,
+    out: bool,
+    key: (f64, f64),
+    end: (f64, f64),
+    /// The speed was negative (the speed graph shows its magnitude).
+    negative: bool,
+    /// Segment duration (layer seconds) the influence is relative to.
+    dur: f64,
+}
+
+impl HandleGrab {
+    /// `keys.setEase` putting the handle's end at (`t` comp seconds, `v` in the graph).
+    fn ease(&self, t: f64, v: f64, speed: bool, merge: &str) -> serde_json::Value {
+        let dir = if self.out { 1.0 } else { -1.0 };
+        let dt = ((t - self.key.0) * dir).max(self.dur * 0.001);
+        let influence = (dt / self.dur.max(1e-9) * 100.0).clamp(0.1, 100.0);
+        let sp = if speed {
+            let mag = v.max(0.0);
+            if self.negative { -mag } else { mag }
+        } else {
+            (v - self.key.1) / dt * dir
+        };
+        let side = if self.out { "out" } else { "in" };
+        let mut params =
+            json!({"layer": self.layer.0, "prop": self.prop, "time": self.time.seconds(), "side": side, "speed": sp, "influence": influence, "merge": merge});
+        if let Some(d) = self.dim {
+            params["dim"] = json!(d);
+        }
+        params
+    }
+}
+
+/// A handle drag: where the button went down, and the handles that move.
+type HandleDrag = (Pos2, Vec<HandleGrab>);
+
+fn handle_drag_id() -> egui::Id {
+    egui::Id::new("graph-handle-drag")
 }

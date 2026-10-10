@@ -117,6 +117,12 @@ fn footage_changes_change_the_salt() {
     s.execute("prop.set", json!({"layer": "#1", "path": "transform/opacity", "value": 50})).unwrap();
     let k2 = effectcraft_render::disk_cache::comp_content_key(&s.project, cid);
     assert_ne!(k1, k2);
+    // Switches that don't change pixels (Audio, Lock, Shy, Hide Shy Layers) don't change it (#103).
+    for sw in ["audio", "lock", "shy"] {
+        s.execute("layer.setSwitch", json!({"layers": ["#1"], "switch": sw, "value": sw != "audio"})).unwrap();
+    }
+    s.execute("comp.setSwitch", json!({"switch": "hideShy", "value": true})).unwrap();
+    assert_eq!(effectcraft_render::disk_cache::comp_content_key(&s.project, cid), k2);
     // Unrelated comps do not change it.
     s.execute("comp.new", json!({"name": "Other", "width": 10, "height": 10, "frameRate": 30, "duration": 1})).unwrap();
     assert_eq!(effectcraft_render::disk_cache::comp_content_key(&s.project, cid), k2);

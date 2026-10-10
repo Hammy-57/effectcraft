@@ -242,8 +242,7 @@ pub(crate) fn params_at(p: &Project, cid: ItemId, layer: &Layer, g: &PropGroup, 
 
 /// The layer's source size (layer pixels).
 pub(crate) fn layer_size(p: &Project, comp: &effectcraft_project::Comp, layer: &Layer) -> [f64; 2] {
-    let (w, h) = effectcraft_render::source_size(p, layer);
-    if w == 0 { [comp.width as f64, comp.height as f64] } else { [w as f64, h as f64] }
+    effectcraft_render::effect_bounds(p, comp, layer).0
 }
 
 /// First and last layer frame of the layer inside the comp (inclusive).

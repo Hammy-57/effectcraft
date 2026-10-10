@@ -56,6 +56,7 @@
   <a href="#get-started">Get started</a> ·
   <a href="#where-it-stands">Status</a> ·
   <a href="#how-its-made">How it's made</a> ·
+  <a href="#downloads">Downloads</a> ·
   <a href="#the-crafting-apps">The Crafting Apps</a> ·
   <a href="#license-and-credits">License</a>
 </p>
@@ -85,7 +86,9 @@ then to go further in a few places where it matters to us:
 
 The panels, menus and shortcuts follow After Effects, so your muscle memory carries over:
 Project, Composition, Timeline, Effect Controls, Properties, Effects & Presets, Character,
-Paragraph, Align, Info, Preview, Audio and the Render Queue, docked the way you expect.
+Paragraph, Align, Info, Preview, Audio and the Render Queue, docked the way you expect. Drag
+footage, comps and effects between them: onto the comp viewer, where they land under the pointer,
+or into the Timeline, between layers and at the time you point to.
 
 - **Layers of every kind:** solids, shapes, text, footage, nested compositions, nulls,
   adjustment layers, cameras and lights; parenting, track mattes, all 38 blend modes, motion blur.
@@ -97,8 +100,8 @@ Paragraph, Align, Info, Preview, Audio and the Render Queue, docked the way you 
 - **Shapes and masks:** shape layers with trim paths, repeaters, round corners, offset, zig zag,
   twist, wiggle, merge paths and gradient strokes; masks drawn with the pen tool, with modes,
   feather, expansion and vertex editing in the viewer.
-- **Text:** point and paragraph text with real shaping, the Character and Paragraph panels, and
-  text animators with range selectors.
+- **Text:** point and paragraph text with real shaping in any font installed on your machine, the
+  Character and Paragraph panels, and text animators with range selectors.
 - **Expressions:** JavaScript with the After Effects object model (`wiggle`, `loopOut`,
   `thisComp.layer("…")`, vector maths on arrays), an inline editor and the pick-whip.
 - **Timeline like you know it:** twirl layers open to Transform, masks, effects and the rest; drag
@@ -179,15 +182,36 @@ See [docs/agents.md](docs/agents.md) and [docs/control-protocol.md](docs/control
 
 ## Get started
 
-You need [Rust](https://rustup.rs/) 1.95 or newer.
+Installers for each version are on the [Releases](https://github.com/storytold/effectcraft/releases)
+page: a universal macOS app; Windows MSIs and portable zips for x64, x86 and ARM64; Linux
+AppImage, Flatpak, deb, rpm and tar.gz for x86_64 and aarch64; a FreeBSD x86_64 tarball; and the
+web build. [Downloads](#downloads) lists every file. The Windows ARM64 build runs natively on
+Windows on ARM, without x64 emulation. CI installs that MSI on Windows 11 ARM64 hardware, checks
+both programs are ARM64 and runs the command-line tool there, but it doesn't open the app's window
+or run the test suite natively on ARM64 yet, so please report anything that behaves differently.
+
+On Gentoo, the community [::snakebyte overlay](https://github.com/switch87/snakebyte-overlay) packages
+the Linux release as `media-video/effectcraft-bin` (not maintained by the EffectCraft team):
+
+```sh
+eselect repository add snakebyte git https://github.com/switch87/snakebyte-overlay.git
+emaint sync -r snakebyte
+echo 'media-video/effectcraft-bin ~amd64' >> /etc/portage/package.accept_keywords/effectcraft
+emerge --ask media-video/effectcraft-bin
+```
+
+To build it yourself you need [Rust](https://rustup.rs/) 1.95 or newer.
 
 ```sh
 git clone https://github.com/storytold/effectcraft
 cd effectcraft
-cargo run --release -p effectcraft          # the app, with the demo project open
+cargo run --release -p effectcraft          # the app (add `-- --demo` to open the demo project)
 cargo run --release -p effectcraft-cli -- render --out intro.mp4    # render the demo headless
 cargo xtask web --serve 8765                # the browser build on http://127.0.0.1:8765/ (docs/web.md)
 ```
+
+New to it? [docs/footage.md](docs/footage.md) covers importing footage and image sequences and
+Interpret Footage.
 
 To work on it: `cargo test --workspace`, and `cargo xtask ci` before every commit (format, lints,
 tests, layering, asset attribution and the WebAssembly build). See [CONTRIBUTING.md](CONTRIBUTING.md),
@@ -226,6 +250,51 @@ send us right now.
 - **One family.** EffectCraft shares its time model and text engine design with FilmCraft, and
   gets its video and audio codecs from it.
 
+## Downloads
+
+**New to EffectCraft?** Download it from the [EffectCraft page on getartcraft.com](https://getartcraft.com/apps/effectcraft). That's the easiest way to install it.
+
+**Want a specific build or format?** On GitHub, the [latest release](https://github.com/storytold/effectcraft/releases/latest) has every build listed below, and [all releases](https://github.com/storytold/effectcraft/releases) has earlier versions and their notes. `<ver>` in the file names is the version number, and `SHA256SUMS.txt` lists a checksum for every file.
+
+### Windows
+
+| Build | Installer | Portable |
+|---|---|---|
+| x64 (64-bit Intel/AMD) | `effectcraft-<ver>-windows-x64.msi` | `effectcraft-<ver>-windows-x64-portable.zip` |
+| arm64 (Snapdragon and other ARM PCs) | `effectcraft-<ver>-windows-arm64.msi` | `effectcraft-<ver>-windows-arm64-portable.zip` |
+| x86 (32-bit) | `effectcraft-<ver>-windows-x86.msi` | `effectcraft-<ver>-windows-x86-portable.zip` |
+
+Installers and executables are code-signed.
+
+### macOS
+
+| Build | File | Notes |
+|---|---|---|
+| App, universal (Apple silicon + Intel) | `effectcraft-<ver>-macos-universal.dmg` | Signed and notarized |
+| Command-line tool, universal | `effectcraft-cli-<ver>-macos-universal.zip` | Signed and notarized |
+
+### Linux
+
+| Format | x86_64 | aarch64 (ARM64) | Notes |
+|---|---|---|---|
+| AppImage | `effectcraft-<ver>-linux-x86_64.AppImage` | `effectcraft-<ver>-linux-aarch64.AppImage` | Runs anywhere; updates itself with [AppImageUpdate](https://github.com/AppImageCommunity/AppImageUpdate) (`.zsync` files) |
+| Flatpak | `effectcraft-<ver>-linux-x86_64.flatpak` | `effectcraft-<ver>-linux-aarch64.flatpak` | Sandboxed; `flatpak install --user <file>` |
+| Debian/Ubuntu | `effectcraft-<ver>-linux-x86_64.deb` | `effectcraft-<ver>-linux-aarch64.deb` | |
+| Fedora/RHEL/openSUSE | `effectcraft-<ver>-linux-x86_64.rpm` | `effectcraft-<ver>-linux-aarch64.rpm` | |
+| Tarball | `effectcraft-<ver>-linux-x86_64.tar.gz` | `effectcraft-<ver>-linux-aarch64.tar.gz` | Unpack anywhere |
+
+### FreeBSD
+
+| Build | File |
+|---|---|
+| x86_64 | `effectcraft-<ver>-freebsd-x86_64.tar.gz` |
+
+### Web (WebAssembly)
+
+| Build | File | Notes |
+|---|---|---|
+| Static site | `effectcraft-web-<ver>.zip` | Runs in a modern browser; host it on any static server |
+
 ## The Crafting Apps
 
 EffectCraft is one of the **Crafting Apps**: free, open-source creative tools from the
@@ -238,7 +307,7 @@ stand on its own.
 | <img src="https://raw.githubusercontent.com/storytold/vectorcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.vectorcraft.png" alt="" width="32" height="32"> | **VectorCraft** | Vector illustration | [GitHub](https://github.com/storytold/vectorcraft) | [Website](https://getartcraft.com/apps/vectorcraft) |
 | <img src="https://raw.githubusercontent.com/storytold/filmcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.filmcraft.png" alt="" width="32" height="32"> | **FilmCraft** | Video editing, color and sound | [GitHub](https://github.com/storytold/filmcraft) | [Website](https://getartcraft.com/apps/filmcraft) |
 | <img src="https://raw.githubusercontent.com/storytold/lightcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.lightcraft.png" alt="" width="32" height="32"> | **LightCraft** | Photo library and raw development | [GitHub](https://github.com/storytold/lightcraft) | [Website](https://getartcraft.com/apps/lightcraft) |
-| <img src="https://raw.githubusercontent.com/storytold/printcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.printcraft.png" alt="" width="32" height="32"> | **PrintCraft** | Reading, organizing and protecting PDFs | [GitHub](https://github.com/storytold/printcraft) | [Website](https://getartcraft.com/apps/printcraft) |
+| <img src="https://raw.githubusercontent.com/storytold/pdfcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.pdfcraft.png" alt="" width="32" height="32"> | **PdfCraft** | Reading, organizing and protecting PDFs | [GitHub](https://github.com/storytold/pdfcraft) | [Website](https://getartcraft.com/apps/pdfcraft) |
 | <img src="https://raw.githubusercontent.com/storytold/effectcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.effectcraft.png" alt="" width="32" height="32"> | **EffectCraft** | **Motion graphics and visual effects · you are here** | [GitHub](https://github.com/storytold/effectcraft) | [Website](https://getartcraft.com/apps/effectcraft) |
 | <img src="https://raw.githubusercontent.com/storytold/designcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.designcraft.png" alt="" width="32" height="32"> | **DesignCraft** | Page layout and publishing | [GitHub](https://github.com/storytold/designcraft) | [Website](https://getartcraft.com/apps/designcraft) |
 
@@ -285,3 +354,7 @@ Forks and modified versions must remove them.
   <a href="https://getartcraft.com/"><img alt="ArtCraft" src="docs/brand/artcraft-mark.svg" width="28"></a><br>
   <sub>Made by the <a href="https://getartcraft.com/">ArtCraft</a> team and community.</sub>
 </p>
+
+## Star history
+
+[![Star History Chart](https://api.star-history.com/svg?repos=storytold/effectcraft&type=Date&legend=top-left)](https://www.star-history.com/?repos=storytold%2Feffectcraft&type=date&legend=top-left)

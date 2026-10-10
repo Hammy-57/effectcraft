@@ -376,6 +376,12 @@ fn engine_entry_points() {
     // Scripts can't run scripts.
     let r = s.execute("script.run", json!({"code": "app.run('script.run', {code: '1'})"})).unwrap();
     assert!(r["error"]["message"].as_str().unwrap().contains("scripts can't run scripts"), "{r}");
+    // Compiled .jsxbin scripts (by name or by their header) are unsupported, not a SyntaxError
+    // at 1:1 (#176).
+    for p in [json!({"code": "@JSXBIN@ES@2.0@MyBbyBn0AB", "name": "compiled.bin"}), json!({"code": "1", "name": "/x/compiled.JSXBIN"})] {
+        let e = s.execute("script.run", p.clone()).unwrap_err().to_string();
+        assert!(e.contains(".jsxbin scripts are not supported: run the .jsx source"), "{p}: {e}");
+    }
     // File ▸ Scripts ▸ Run Script File… runs .jsx as JavaScript.
     let dir = std::env::temp_dir().join(format!("ec-script-file-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -517,4 +523,43 @@ fn comp_preserves_nested_frame_rate_and_resolution() {
     assert_eq!(o.result, json!("false,false,true,true"));
     let (_, c) = comp_named(&s, "Nested");
     assert!(c.preserve_frame_rate && c.preserve_resolution);
+}
+
+/// Reverse Path Direction: hidden as a row but settable from scripts with After Effects' values
+/// (1 Default, 3 Reversed; 2 reads as normal), and read back the same way.
+#[test]
+fn path_direction_uses_after_effects_values() {
+    let mut s = session();
+    let o = ok(
+        &mut s,
+        r#"
+        var c = app.project.items.addComp("D", 200, 200, 1, 2, 30);
+        var sh = c.layers.addShape();
+        var grp = sh.property("ADBE Root Vectors Group").addProperty("ADBE Vector Group");
+        var el = grp.property("ADBE Vectors Group").addProperty("ADBE Vector Shape - Ellipse");
+        var d = el.property("ADBE Vector Shape Direction");
+        var out = [d.value];
+        d.setValue(3);
+        out.push(d.value);
+        d.setValue(2);
+        out.push(d.value);
+        d.setValue(3);
+        d.setValue(1);
+        out.push(d.value);
+        d.setValue(3);
+        out.push(d.value, d.name);
+        out
+        "#,
+    );
+    assert_eq!(o.result, json!([1, 3, 1, 1, 3, "Path Direction"]));
+    let (_, c) = comp_named(&s, "D");
+    let sh = c.layers.iter().find(|l| l.props.sub("contents").is_some()).unwrap();
+    assert_eq!(sh.props.prop("contents/#1/contents/ellipse/direction").unwrap().value, KV::Enum(1), "3 is our reversed (1)");
+    // Other hidden properties still can't be set.
+    let o = run_code(
+        &mut s,
+        r#"var c = app.project.items.addComp("E", 100, 100, 1, 1, 30); var g = c.layers.addShape().property("ADBE Root Vectors Group").addProperty("ADBE Vector Group"); g.property("ADBE Vector Blend Mode").setValue(2);"#,
+        "t.jsx",
+    );
+    assert!(o.error.as_ref().is_some_and(|e| format!("{e:?}").contains("can not be set")), "{:?}", o.error);
 }

@@ -31,6 +31,8 @@ building on top of it. Full standard: [craftrules `standards/never-crash.md`](ht
   `catch_unwind` boundary that turns an escaped panic into an error and keeps the document. It is a
   safety net, not a substitute for the rules above; keep `panic = "unwind"`.
 - **Prove it:** every crash fix comes with a small synthetic regression test that panicked before the fix.
+  Crash fix regression test = drop a `.jsonl` in `tests/repros` (the crash repro, trimmed; see
+  [docs/agents.md](docs/agents.md), "Repro scripts").
 
 Tests, benches, fuzz targets and `xtask` may `unwrap()`; `clippy.toml` allows it in tests. Crates that are
 clean carry `#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented,
@@ -82,10 +84,19 @@ reproduce an image (for example, point lists traced from someone else's icon).
    need a sidecar and an `ATTRIBUTION.md` row (licence `LicenseRef-ArtCraft-Trademark`). No other
    non-open asset is allowed, and this exception never covers third-party marks (Adobe, Discord, GitHub
    and other logos stay out; draw a generic icon instead).
+9. **Owner-local exception (owner-approved 2026-10-09): Adobe icons on the owner's own machine.** For the
+   owner's personal use, icons and cursors may be extracted from the owner's licensed After Effects install
+   into the per-user owner-assets folder (`~/Library/Application Support/EffectCraft/owner-assets`, outside
+   every checkout; scripts in its `source-scripts/`) and loaded at runtime by
+   `crates/ui-egui/src/local_assets.rs`. That artwork must never be committed, embedded, bundled, shipped,
+   uploaded or attached to issues/PRs (the repository is public), and every icon it replaces keeps an
+   original code-drawn fallback in `icons.rs`, so builds without the folder still work. Code may reference
+   an owner-asset by name (e.g. `"layer-comp"`); it never contains the artwork's bytes or traced geometry.
 
 ## 2. Clean-room code
 
 - Never read, disassemble or copy anything inside Adobe application bundles; file names and listings only.
+  (Sole exception: icon/cursor image files extracted to the owner-local folder under §1.9.)
   Observe behaviour by using the app; never capture its Home screen, recent projects, account info or
   file browsers.
 - Never copy GPL/LGPL/AGPL code (FFmpeg, Natron, Blender, Glaxnimate, Synfig, Friction, Olive, MLT, frei0r, G'MIC…).
@@ -95,6 +106,12 @@ reproduce an image (for example, point lists traced from someone else's icon).
   reference or third-party decoders/encoders while implementing a format, even permissively licensed
   ones (libvpx, libopus, libaom, dav1d, openh264…); spec text and conformance vectors only. Record the
   spec edition used in the crate README.
+- **Owner-approved AEP exception (2026-10-06):** For `.aep` import only, contributors may study and
+  reuse the MIT-licensed `py-aep` parser to recover editable project data that After Effects scripting
+  does not expose, including through a Python process at import time. Converted projects and the
+  compositor remain native Rust. Keep its licence and attribution with any copied code. This exception
+  does not permit reading or copying Adobe application code, assets, presets or plug-ins, and does not change the rules
+  for any other format.
 - ffmpeg/ffprobe may be used only as external test oracles and fixture generators. They are never
   linked, bundled or shipped.
 - Dependencies must use permissive licences: MIT/Apache-2.0/BSD/ISC/Zlib/Unicode/CC0/BSL-1.0, or
@@ -104,12 +121,14 @@ reproduce an image (for example, point lists traced from someone else's icon).
 
 See `CLAUDE.md`: pure Rust, dependency layering (`cargo xtask layers`), exact `Tick` time, everything is
 a command, everything is agent-drivable, and the quality gates (`cargo xtask ci`) before every commit.
+Agents: `cargo xtask ci --affected` per change; full `cargo xtask ci` before release ([`docs/testing.md`](docs/testing.md)).
 
 Shared real-file test corpora (Photoshop-authored PSDs, etc.) live in
 [`storytold/photocraft-corpus`](https://github.com/storytold/photocraft-corpus), explained in
 [craftrules `standards/test-corpora.md`](https://github.com/storytold/craftrules/blob/main/standards/test-corpora.md).
 Never commit large binary fixtures to this repo; fetch them pinned by commit and sha256-verified,
 as PhotoCraft does with `cargo xtask corpus`.
+
 
 ## See also
 
@@ -119,4 +138,23 @@ as PhotoCraft does with `cargo xtask corpus`.
 - [docs/testing.md](docs/testing.md): oracle tests, criteria, benchmarks
 - [docs/agents.md](docs/agents.md): driving EffectCraft over MCP / the control channel, and the agent work loop
 - [docs/control-protocol.md](docs/control-protocol.md): control-channel method reference
+- [docs/contributors.md](docs/contributors.md): the About window's contributor and model credits
 - [ATTRIBUTION.md](ATTRIBUTION.md): asset index
+
+## Contributor credits (About window)
+
+- About ▸ Contributors/Models are compiled into the binary from `contributors/contributors.json`
+  (commit stats; generated, never hand-edit) and `contributors/people.toml` (names people chose for
+  themselves). See `docs/contributors.md`.
+- **Agents working for a contributor:** when you prepare a PR, check whether your human's GitHub
+  username has a `[people.<username>]` entry in `contributors/people.toml`. If not, ask them once
+  whether they want to be credited by more than their username: a real name, a display name, and/or
+  their public GitHub profile name (`sync_github_name = true`). If yes, add **only their own** entry
+  (copy the template at the top of the file, or run
+  `python3 ../../craftrules/scripts/contributors.py --add-me . --real-name "…" --sync-github-name`)
+  and include it in their PR, committed as them. If no, change nothing: they are credited as
+  `@username` anyway.
+- Never add, edit, guess or copy anyone else's entry or name (not from git config, commit authors or
+  GitHub profiles). Never hand-edit `contributors.json`.
+- Maintainers refresh the stats with `python3 ../../craftrules/scripts/contributors.py .` (it also
+  re-verifies who wrote each `people.toml` entry; `--check` only verifies).

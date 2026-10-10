@@ -1,6 +1,0 @@
-# Web
-
-- Weighted parity: 98%
-- Remaining (agent-hours): 0.1
-
-No shared-memory threads inside one engine instance (the decided design is one engine instance per worker; a threaded build needs nightly `build-std`) (M13.30: Render Queue, analyses and Content-Aware Fill render on each job worker's own WebGPU device in passes, particles and Advanced 3D read back under keys, layer buffers in the browser's disk cache; browser storage, Web Audio, Web Worker renders/analyses, WebGPU viewer and offline install landed in M15.2; viewer frames in frame workers fed by project diffs, Roto Brush propagation in a worker, non-blocking `wait: true` jobs and a browser Media Browser (File System Access folders, browser storage) in M13.10; WEB-1 in M13.24: GPU effects and the GPU compositor in the frame workers on their own WebGPU devices with deferred readbacks (frames render in passes; Backend Auto per comp), the disk cache in the Origin Private File System (written by the workers with sync access handles, LRU under the settings' limit, served after a reload), the storage manager (Settings ▸ Disk ▸ Browser Storage, `storage.info` / `storage.persist` / `storage.clear`), and a WGSL constant Chrome rejected (it disabled every GPU kernel in Chrome) fixed)

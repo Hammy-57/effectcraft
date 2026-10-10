@@ -7,6 +7,7 @@ use effectcraft_ui_egui::EffectcraftApp;
 use effectcraft_ui_egui::dock::PanelKind;
 use egui::{Event, Pos2, pos2};
 use egui_kittest::Harness;
+use egui_kittest::kittest::Queryable;
 use serde_json::json;
 
 fn harness() -> Harness<'static, EffectcraftApp> {
@@ -101,6 +102,134 @@ fn progress_panel_cancels_a_job() {
     h.run_steps(2);
     assert!(h.state().session.jobs().is_empty());
     assert_eq!(h.state().session.job_log.last().unwrap().status, "cancelled");
+}
+
+fn click_at(h: &mut Harness<'_, EffectcraftApp>, p: Pos2) {
+    h.input_mut().events.push(Event::PointerMoved(p));
+    h.input_mut().events.push(Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+    h.step();
+    h.input_mut().events.push(Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+    h.run_steps(2);
+}
+
+fn hover(h: &mut Harness<'_, EffectcraftApp>, p: Pos2) {
+    h.input_mut().events.push(Event::PointerMoved(p));
+    h.run_steps(3);
+}
+
+/// Issue #191: a workspace saved with Save as New Workspace is listed in Window ▸ Workspace
+/// (below the built-ins, where the submenu used to be cut off) and choosing it there brings its
+/// layout back.
+#[test]
+fn saved_workspace_is_listed_in_the_workspace_menu() {
+    let mut h = harness();
+    let ctx = h.ctx.clone();
+    effectcraft_ui_egui::menus::invoke(h.state_mut(), &ctx, "window.workspace", json!({"name": "Minimal"})).unwrap();
+    effectcraft_ui_egui::menus::invoke(h.state_mut(), &ctx, "window.saveWorkspaceAs", json!({"name": "My Layout"})).unwrap();
+    h.run_steps(3);
+    let saved = h.state().ui.dock.clone();
+    assert_eq!(h.state().saved_workspace_names(), ["My Layout"]);
+    let cx = effectcraft_engine::menus::DynCtx { workspace: Some("My Layout"), saved_workspaces: &["My Layout".to_string()] };
+    let (entries, _) = effectcraft_engine::menus::dynamic(&h.state().session, "savedWorkspaces", &cx);
+    assert_eq!(entries.len(), 1);
+    assert_eq!((entries[0].label.as_str(), entries[0].command.as_str(), &entries[0].params), ("My Layout", "window.workspace", &json!({"name": "My Layout"})));
+    // Leave it, then pick it from the in-window menu bar.
+    effectcraft_ui_egui::menus::invoke(h.state_mut(), &ctx, "window.workspace", json!({"name": "Default"})).unwrap();
+    h.run_steps(3);
+    assert_ne!(h.state().ui.dock, saved);
+    click(&mut h, "menu.Window");
+    let ws = h.query_by_label(" Workspace ⏵").expect("Window ▸ Workspace").rect();
+    hover(&mut h, ws.center());
+    let entry = h.state().auto.find("menu.savedWorkspaces.0").expect("the saved workspace is listed").clone();
+    assert_eq!(entry.label, "My Layout");
+    let at = h.query_by_label(" My Layout").expect("the saved workspace entry").rect().center();
+    // Into the submenu, then down it (as a pointer moves).
+    hover(&mut h, pos2(at.x, ws.center().y));
+    for k in 1..=10 {
+        hover(&mut h, pos2(at.x, ws.center().y + (at.y - ws.center().y) * k as f32 / 10.0));
+    }
+    click_at(&mut h, at);
+    assert_eq!(h.state().ui.workspace, "My Layout");
+    assert_eq!(h.state().ui.dock, saved, "its layout came back");
+}
+
+/// Edit ▸ Label shows each label's colour before its name (#290), and choosing one labels the
+/// selected layer.
+#[test]
+fn edit_label_menu_shows_the_label_colours() {
+    let mut h = harness();
+    click(&mut h, "menu.Edit");
+    let label = h.query_by_label(" Label ⏵").expect("Edit ▸ Label").rect();
+    hover(&mut h, label.center());
+    // (Not Dark Green; the entry's label starts with its check-mark column.)
+    let green = h.query_by_label(" Green").expect("the Label submenu is open").rect();
+    let col = h.state().tokens.label(effectcraft_engine::color::Label::Green);
+    let swatch = |s: &egui::Shape| matches!(s, egui::Shape::Rect(r) if r.fill == col && r.rect.width() < 16.0 && green.contains(r.rect.center()));
+    let shapes: Vec<egui::Shape> = h.output().shapes.iter().map(|c| c.shape.clone()).collect();
+    assert!(shapes.iter().any(|s| swatch(s) || matches!(s, egui::Shape::Vec(v) if v.iter().any(swatch))), "no Green swatch");
+    // Into the submenu, then down to Green.
+    hover(&mut h, pos2(green.center().x, label.center().y));
+    for k in 1..=10 {
+        hover(&mut h, pos2(green.center().x, label.center().y + (green.center().y - label.center().y) * k as f32 / 10.0));
+    }
+    click_at(&mut h, green.center());
+    assert_eq!(h.state().session.active_comp().unwrap().layers[0].label, effectcraft_engine::color::Label::Green);
+}
+
+/// Learn opens the Home screen's tutorials; clicking another workspace tab closes them again,
+/// however quickly the tabs are clicked (they stayed over every workspace, #272).
+#[test]
+fn leaving_the_learn_workspace_closes_its_tutorials() {
+    let mut h = harness();
+    for name in ["Learn", "Default", "Learn", "Review", "Learn", "Learn", "Small Screen", "Standard", "Learn", "Default"] {
+        click(&mut h, &format!("header.workspace.{name}"));
+        assert_eq!(h.state().ui.workspace, name);
+        let learn = name == "Learn";
+        assert_eq!(h.state().ui.start_screen, learn, "{name}: the Home screen shows only for Learn");
+        assert_eq!(!h.state().auto.query("home.learn.").is_empty(), learn, "{name}: the tutorials show only for Learn");
+    }
+}
+
+/// #284: Settings ▸ Appearance ▸ UI Scale sizes the whole interface as soon as it is chosen,
+/// Cancel puts it back, OK keeps it; Ctrl+0 (Window ▸ Project) doesn't reset it.
+#[test]
+fn ui_scale_setting_sizes_the_interface() {
+    let mut h = harness();
+    let ctx = h.ctx.clone();
+    let choose = |h: &mut Harness<'_, EffectcraftApp>, label: &str| {
+        let ctx = h.ctx.clone();
+        effectcraft_ui_egui::menus::invoke(h.state_mut(), &ctx, "app.settings", json!({"page": "appearance"})).unwrap();
+        h.run_steps(3);
+        click(h, "settings.appearance.uiScale");
+        let option = h.query_by_label(label).unwrap_or_else(|| panic!("the {label} choice")).rect().center();
+        click_at(h, option);
+        h.run_steps(2);
+    };
+    assert_eq!(ctx.zoom_factor(), 1.0);
+    choose(&mut h, "150%");
+    assert_eq!(h.state().session.prefs.appearance.ui_scale, 150);
+    assert_eq!(ctx.zoom_factor(), 1.5, "live");
+    click(&mut h, "settings.cancel");
+    h.run_steps(2);
+    assert_eq!((h.state().session.prefs.appearance.ui_scale, ctx.zoom_factor()), (100, 1.0), "Cancel put it back");
+    choose(&mut h, "125%");
+    click(&mut h, "settings.ok");
+    h.run_steps(2);
+    assert_eq!(h.state().dialog, None);
+    assert_eq!((h.state().session.prefs.appearance.ui_scale, ctx.zoom_factor()), (125, 1.25), "OK kept it");
+    // Ctrl+0 opens the Project panel; egui's own Ctrl+0 zoom reset stays out of it.
+    for pressed in [true, false] {
+        h.input_mut().events.push(Event::Key { key: egui::Key::Num0, physical_key: None, pressed, repeat: false, modifiers: egui::Modifiers::COMMAND });
+        h.step();
+    }
+    h.run_steps(2);
+    assert_eq!(ctx.zoom_factor(), 1.25);
+    // A saved scale applies from the first frame.
+    let mut s = Session::default();
+    s.prefs.set("appearance.uiScale", json!(175)).unwrap();
+    let mut h2 = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).build_eframe(|_| EffectcraftApp::new(s));
+    h2.run_steps(3);
+    assert_eq!(h2.ctx.zoom_factor(), 1.75);
 }
 
 /// Headless look at the panels (wgpu offscreen; needs a GPU adapter). Run with
