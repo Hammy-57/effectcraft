@@ -5,7 +5,12 @@
 //!   `plan/STATUS.md` in the main checkout.
 //! - `claim <slug> --task "…" [--paths a,b]`: writes `plan/claims/<slug>.toml` with a target dir and
 //!   a free control port, warns about overlapping paths and prints the env lines to use.
-//! - `release <slug>`: deletes the claim.
+//! - `lane <slug> --task "…" [--paths a,b] [--branch b]`: like `claim`, but in a lane: one of a few
+//!   permanent worktrees (`../effectcraft-lane-<n>`) with its own warm build folder
+//!   (`target/lane-<n>`). The lane switches to a new branch from `main`, so only the files that differ
+//!   get new dates and cargo rebuilds only what changed. All lanes busy: wait or release one.
+//! - `release <slug>`: deletes the claim. A lane must be clean; it goes back to `main` (detached) and
+//!   its branch is deleted if merged.
 //! - `gc [--yes]`: lists merged + clean worktrees and orphan target dirs (dry run); `--yes` removes
 //!   only those. Never touches dirty, locked, unmerged or claimed ones, or the main checkout.
 
@@ -16,7 +21,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const USAGE: &str = "usage: cargo xtask agents <status | claim SLUG --task TEXT [--paths a,b] | release SLUG | gc [--yes]>";
+const USAGE: &str =
+    "usage: cargo xtask agents <status | claim SLUG --task TEXT [--paths a,b] | lane SLUG --task TEXT [--paths a,b] [--branch B] | release SLUG | gc [--yes]>";
+/// Lanes (`lane`); `EFFECTCRAFT_LANES` overrides. Also the most agents that build at once.
+const LANES: usize = 4;
 /// Control ports handed out by `claim` start here (9877 is the owner's app).
 const FIRST_PORT: u16 = 9880;
 /// Walk depth limit for sizing target dirs.
@@ -31,6 +39,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     match a.as_slice() {
         ["status"] | [] => status(),
         ["claim", slug, rest @ ..] => claim(slug, rest),
+        ["lane", slug, rest @ ..] => lane(slug, rest),
         ["release", slug] => release(slug),
         ["gc"] => gc(false),
         ["gc", "--yes"] => gc(true),
@@ -116,7 +125,7 @@ impl State {
         let here = git(&["rev-parse", "--show-toplevel"], None).map(|p| canon(Path::new(&p)));
         self.worktrees
             .iter()
-            .filter(|w| w.verdict(&self.main) == "safe to remove" && !w.locked)
+            .filter(|w| w.verdict(&self.main) == "safe to remove" && !w.locked && lane_number(&self.main, &w.path).is_none())
             .filter(|w| self.claimed_worktree(&w.path).is_none() && here.as_deref() != Some(w.path.as_path()))
             .collect()
     }
@@ -195,6 +204,18 @@ fn report(s: &State) -> String {
         let _ = writeln!(o, "  {:28} {:>8} {:>5}  {}", clip(&name, 28), size(t.bytes), age(t.age), owner.as_deref().unwrap_or("ORPHAN"));
     }
     let _ = writeln!(o, "  total {}, orphan {}", size(total), size(orphan));
+    let _ = writeln!(o, "\nLanes (cargo xtask agents lane):");
+    for n in 1..=lane_count() {
+        let p = lane_path(main, n);
+        let state = if let Some(c) = s.claimed_worktree(&canon(&p)) {
+            format!("claimed by {} ({})", c.slug, c.branch)
+        } else if let Some(w) = s.worktrees.iter().find(|w| w.path == canon(&p)) {
+            if w.dirty > 0 { format!("unclaimed but dirty ({} files)", w.dirty) } else { "free".into() }
+        } else {
+            "not created yet (the first agent in it builds from scratch)".into()
+        };
+        let _ = writeln!(o, "  lane {n}  {:32} {state}", short(&p, main));
+    }
     let _ = writeln!(o, "\nClaims (plan/claims/):");
     if s.claims.is_empty() {
         let _ = writeln!(o, "  none");
@@ -218,9 +239,14 @@ fn report(s: &State) -> String {
 
 // ------------------------------------------------------------------------------------- claims
 
-fn claim(slug: &str, rest: &[&str]) -> Result<(), String> {
-    check_slug(slug)?;
-    let (mut task, mut paths) = (None, Vec::new());
+struct ClaimArgs {
+    task: String,
+    paths: Vec<String>,
+    branch: Option<String>,
+}
+
+fn claim_args(rest: &[&str], branch_ok: bool) -> Result<ClaimArgs, String> {
+    let (mut task, mut paths, mut branch) = (None, Vec::new(), None);
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         match *a {
@@ -229,14 +255,19 @@ fn claim(slug: &str, rest: &[&str]) -> Result<(), String> {
                 paths =
                     it.next().map(|p| p.split(',').map(|s| s.trim().trim_end_matches('/').to_string()).filter(|s| !s.is_empty()).collect()).unwrap_or_default()
             }
+            "--branch" if branch_ok => branch = it.next().map(|b| b.to_string()),
             _ => return Err(USAGE.into()),
         }
     }
     let task = task.ok_or("claim needs --task \"what you are doing\"")?;
-    let main = main_checkout()?;
-    let others: Vec<Claim> = claims(&main)?.into_iter().filter(|c| c.slug != slug).collect();
+    Ok(ClaimArgs { task, paths, branch })
+}
+
+/// A claim for `slug` (overlap warnings printed, a free control port), not yet saved.
+fn new_claim(main: &Path, slug: &str, a: ClaimArgs, branch: String, worktree: String, target: &Path) -> Result<Claim, String> {
+    let others: Vec<Claim> = claims(main)?.into_iter().filter(|c| c.slug != slug).collect();
     for c in &others {
-        for p in &paths {
+        for p in &a.paths {
             if let Some(q) = c.paths.iter().find(|q| overlaps(p, q)) {
                 eprintln!("warning: {p} overlaps {q} claimed by {} ({}, {})", c.slug, c.branch, c.task);
             }
@@ -244,28 +275,132 @@ fn claim(slug: &str, rest: &[&str]) -> Result<(), String> {
     }
     let used: BTreeSet<u16> = others.iter().map(|c| c.port).collect();
     let port = (FIRST_PORT..u16::MAX).find(|p| !used.contains(p) && std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok()).ok_or("no free control port")?;
+    let t = now();
+    Ok(Claim {
+        slug: slug.into(),
+        task: a.task,
+        paths: a.paths,
+        branch,
+        worktree,
+        target_dir: target.to_string_lossy().into_owned(),
+        port,
+        claimed: utc(t),
+        claimed_unix: t,
+    })
+}
+
+fn save_claim(main: &Path, c: &Claim) -> Result<PathBuf, String> {
+    let dir = main.join("plan").join("claims");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let file = dir.join(format!("{}.toml", c.slug));
+    std::fs::write(&file, write_claim(c)).map_err(|e| format!("{}: {e}", file.display()))?;
+    Ok(file)
+}
+
+fn claim(slug: &str, rest: &[&str]) -> Result<(), String> {
+    check_slug(slug)?;
+    let a = claim_args(rest, false)?;
+    let main = main_checkout()?;
     let worktree = git(&["rev-parse", "--show-toplevel"], None).ok_or("not inside a git checkout")?;
     let branch = git(&["branch", "--show-current"], None).unwrap_or_default();
     let target = main.join("target").join(format!("agent-{slug}"));
-    let t = now();
-    let c =
-        Claim { slug: slug.into(), task, paths, branch, worktree, target_dir: target.to_string_lossy().into_owned(), port, claimed: utc(t), claimed_unix: t };
-    let dir = main.join("plan").join("claims");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let file = dir.join(format!("{slug}.toml"));
-    std::fs::write(&file, write_claim(&c)).map_err(|e| format!("{}: {e}", file.display()))?;
+    let c = new_claim(&main, slug, a, branch, worktree, &target)?;
+    let file = save_claim(&main, &c)?;
     println!("claimed {slug} ({})", file.display());
-    println!("export CARGO_TARGET_DIR={} EFFECTCRAFT_CONTROL_PORT={port} CARGO_BUILD_JOBS=4", c.target_dir);
+    println!("export CARGO_TARGET_DIR={} EFFECTCRAFT_CONTROL_PORT={} CARGO_BUILD_JOBS=4", c.target_dir, c.port);
     println!("# when done: cargo xtask agents release {slug}");
+    Ok(())
+}
+
+fn lane(slug: &str, rest: &[&str]) -> Result<(), String> {
+    check_slug(slug)?;
+    let a = claim_args(rest, true)?;
+    let main = main_checkout()?;
+    let all = claims(&main)?;
+    if all.iter().any(|c| c.slug == slug) {
+        return Err(format!("{slug} is already claimed (cargo xtask agents status)"));
+    }
+    let mut busy = Vec::new();
+    let mut free = None;
+    for n in 1..=lane_count() {
+        let p = lane_path(&main, n);
+        if let Some(c) = all.iter().find(|c| canon(Path::new(&c.worktree)) == canon(&p)) {
+            busy.push(format!("lane {n}: {} ({})", c.slug, c.task));
+        } else if p.exists() && git(&["status", "--porcelain"], Some(&p)).is_none_or(|s| !s.trim().is_empty()) {
+            busy.push(format!("lane {n}: unclaimed but has uncommitted changes ({})", p.display()));
+        } else {
+            free = Some((n, p));
+            break;
+        }
+    }
+    let Some((n, path)) = free else {
+        return Err(format!("all {} lanes are busy; wait for one, or release a finished one:\n  {}", lane_count(), busy.join("\n  ")));
+    };
+    let p = path.to_string_lossy().into_owned();
+    if !path.exists() {
+        git(&["worktree", "add", "--detach", &p, "main"], Some(&main)).ok_or_else(|| format!("git worktree add {p} failed"))?;
+        println!("created lane {n} at {p} (its first build compiles everything once; later agents reuse it)");
+    }
+    let branch = a.branch.clone().unwrap_or_else(|| format!("agents/{slug}"));
+    let exists = git(&["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")], Some(&main)).is_some();
+    let switch: Vec<&str> = if exists { vec!["switch", &branch] } else { vec!["switch", "-c", &branch, "main"] };
+    // Only files that differ change on disk (and get new dates), so the warm build stays valid.
+    git(&switch, Some(&path)).ok_or_else(|| format!("git {} failed in {p} (is {branch} checked out elsewhere?)", switch.join(" ")))?;
+    let target = lane_target(&main, n);
+    let c = new_claim(&main, slug, a, branch.clone(), p.clone(), &target)?;
+    save_claim(&main, &c)?;
+    println!("lane {n} → {p} on {branch} (build folder {})", target.display());
+    println!("cd {p} && export CARGO_TARGET_DIR={} EFFECTCRAFT_CONTROL_PORT={} CARGO_BUILD_JOBS=4", c.target_dir, c.port);
+    println!("# when done (merged, worktree clean): cargo xtask agents release {slug}");
     Ok(())
 }
 
 fn release(slug: &str) -> Result<(), String> {
     check_slug(slug)?;
-    let file = main_checkout()?.join("plan").join("claims").join(format!("{slug}.toml"));
+    let main = main_checkout()?;
+    let file = main.join("plan").join("claims").join(format!("{slug}.toml"));
+    let text = std::fs::read_to_string(&file).map_err(|e| format!("{}: {e}", file.display()))?;
+    let c = parse_claim(slug, &text);
+    let wt = PathBuf::from(&c.worktree);
+    if let Some(n) = lane_number(&main, &wt).filter(|_| wt.exists()) {
+        // Never lose work: a lane with uncommitted changes stays claimed.
+        let dirty = git(&["status", "--porcelain"], Some(&wt)).is_none_or(|s| !s.trim().is_empty());
+        if dirty {
+            return Err(format!("lane {n} ({}) has uncommitted changes: commit or discard them, then release again", wt.display()));
+        }
+        git(&["switch", "--detach", "main"], Some(&wt)).ok_or_else(|| format!("git switch --detach main failed in {}", wt.display()))?;
+        if !c.branch.is_empty() && c.branch != "main" {
+            if git(&["branch", "-d", &c.branch], Some(&main)).is_some() {
+                println!("deleted merged branch {}", c.branch);
+            } else {
+                println!("kept branch {} (not merged into main)", c.branch);
+            }
+        }
+        println!("lane {n} is free again (back on main, build folder kept warm)");
+    }
     std::fs::remove_file(&file).map_err(|e| format!("{}: {e}", file.display()))?;
     println!("released {slug}");
     Ok(())
+}
+
+fn lane_count() -> usize {
+    std::env::var("EFFECTCRAFT_LANES").ok().and_then(|v| v.parse().ok()).filter(|n| (1..=16).contains(n)).unwrap_or(LANES)
+}
+
+/// `../<main checkout name>-lane-<n>`.
+fn lane_path(main: &Path, n: usize) -> PathBuf {
+    let name = main.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "effectcraft".into());
+    main.with_file_name(format!("{name}-lane-{n}"))
+}
+
+fn lane_target(main: &Path, n: usize) -> PathBuf {
+    main.join("target").join(format!("lane-{n}"))
+}
+
+/// Which lane `p` is, if any.
+fn lane_number(main: &Path, p: &Path) -> Option<usize> {
+    let p = canon(p);
+    (1..=16).find(|n| canon(&lane_path(main, *n)) == p)
 }
 
 fn check_slug(slug: &str) -> Result<(), String> {
@@ -598,6 +733,11 @@ mod tests {
         let back = parse_claim("x", &write_claim(&c));
         assert_eq!((back.task.as_str(), back.paths.clone(), back.port, back.claimed_unix), (c.task.as_str(), c.paths.clone(), 9881, 5));
         assert!(overlaps("crates/ui-egui", "crates/ui-egui/src/dock.rs"));
+        let main = Path::new("/nonexistent/dev/effectcraft");
+        assert_eq!(lane_path(main, 2), Path::new("/nonexistent/dev/effectcraft-lane-2"));
+        assert_eq!(lane_target(main, 2), Path::new("/nonexistent/dev/effectcraft/target/lane-2"));
+        assert_eq!(lane_number(main, Path::new("/nonexistent/dev/effectcraft-lane-3")), Some(3));
+        assert_eq!(lane_number(main, Path::new("/nonexistent/dev/effectcraft-other")), None);
         assert!(!overlaps("crates/ui", "crates/ui-egui"));
         assert_eq!(utc(0), "1970-01-01 00:00 UTC");
         assert_eq!(utc(1_791_590_400), "2026-10-10 00:00 UTC");
