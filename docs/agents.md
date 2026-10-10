@@ -73,12 +73,18 @@ and transport errors also flush outstanding changes. Queries do not rotate the s
 A failed checkpoint adds a warning to the tool reply; the edit remains in memory and the next
 call retries. Use `save_project {path}` to a writable location before disconnecting if warned.
 
+Recovery stays small on disk: a checkpoint of 8 MB or more is written at most every 30 seconds
+(the change waits, `autosave.pending` says so, and the session's end always writes it), each
+session keeps the Auto-Save setting's maximum number of versions, saving the project normally (or
+undoing back to the saved state) removes the session's recovery files, and a new session removes
+the folders of finished, saved sessions and of any session untouched for 30 days.
+
 Each server has its own folder under `<config directory>/EffectCraft Auto-Save/MCP/` (or
 `<custom Auto-Save folder>/MCP/`). The maximum-version setting applies within that folder.
 `--autosave` enables these checkpoints regardless of the desktop's Auto-Save toggle and interval;
 it reads settings without writing desktop preferences, shortcuts or crash-recovery state.
-`EFFECTCRAFT_CONFIG_DIR` overrides the platform config directory. Session folders are retained
-for recovery; remove old folders once their work is saved elsewhere.
+`EFFECTCRAFT_CONFIG_DIR` overrides the platform config directory. Unsaved sessions' folders are
+kept for recovery (up to 30 days).
 
 `initialize` instructions and `_meta.effectcraftAutoSave` list the current folder and up to five
 previous dirty sessions; `doc_inspect`'s `project.autosave` also reports the latest checkpoint and errors.
@@ -175,7 +181,12 @@ Pass `client` on every request (`"client": "agentA"`) when you share the app wit
 agents. Over MCP, every tool takes it as an argument (`set_property {"layer": 2, …, "client":
 "agentA"}`; the engine commands the tool runs carry it, and renders default to your time), or start
 the server as `effectcraft-cli mcp --client agentA` (or set `EFFECTCRAFT_CLIENT`) so every call runs
-as you; a call's own `client` wins. Two things follow:
+as you; a call's own `client` wins. A bridged MCP server (`mcp --bridge`) given no name names itself
+at `initialize`: the MCP client's name and the server's process id (`claude-code-4821`, also in the
+`initialize` instructions and `get_state`), so an agent sharing the app never moves the user's view
+by accident. Pass `"client": ""` on a call that should act as the user, for example to open a comp
+in their viewer. Headless and `--ui` servers keep running as the user (the agent is alone there).
+Two things follow:
 
 - **Your own cursor.** Selection (layers, properties, keys, mask vertices, Project items), active comp
   and current time are yours: `layer.select`, `time.set`, `comp.new` / `comp.open` and every command
