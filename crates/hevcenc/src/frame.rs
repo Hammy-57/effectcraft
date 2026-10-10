@@ -59,6 +59,7 @@ struct Tb {
 }
 
 /// Saved samples and block state of a square region.
+#[derive(Default)]
 struct Snap {
     x: usize,
     y: usize,
@@ -98,6 +99,8 @@ pub struct FrameCoder<'a> {
     coefs: Vec<i32>,
     pred: Vec<i16>,
     scratch: [Vec<i32>; 2],
+    /// Spent snapshots, reused so mode decisions don't allocate.
+    snaps: Vec<Snap>,
 }
 
 #[inline]
@@ -155,6 +158,7 @@ impl<'a> FrameCoder<'a> {
             coefs: Vec::with_capacity(64 * 64 * 2),
             pred: vec![0; 64 * 64],
             scratch: [vec![0; 32 * 32], vec![0; 32 * 32]],
+            snaps: Vec::new(),
         }
     }
 
@@ -213,20 +217,24 @@ impl<'a> FrameCoder<'a> {
         crate::deblock::deblock(&mut self.rec, &self.blk, self.w, self.h, self.slice_qp, self.bd);
     }
 
-    fn snap(&self, x: usize, y: usize, n: usize) -> Snap {
-        let mut planes: [Vec<u16>; 3] = Default::default();
-        for (c, p) in planes.iter_mut().enumerate() {
+    /// Snapshot of the region (in a recycled snapshot's buffers when there is one).
+    fn snap(&mut self, x: usize, y: usize, n: usize) -> Snap {
+        let mut s = self.snaps.pop().unwrap_or_default();
+        for (c, p) in s.planes.iter_mut().enumerate() {
             let (px, py, pn, stride) = if c == 0 { (x, y, n, self.w) } else { (x / 2, y / 2, n / 2, self.cw) };
+            p.clear();
             p.reserve(pn * pn);
             for r in 0..pn {
                 p.extend_from_slice(&self.rec[c][(py + r) * stride + px..][..pn]);
             }
         }
-        let mut blk = Vec::with_capacity((n / 4) * (n / 4));
+        s.blk.clear();
+        s.blk.reserve((n / 4) * (n / 4));
         for by in (y >> 2)..((y + n) >> 2) {
-            blk.extend_from_slice(&self.blk[by * self.w4 + (x >> 2)..by * self.w4 + ((x + n) >> 2)]);
+            s.blk.extend_from_slice(&self.blk[by * self.w4 + (x >> 2)..by * self.w4 + ((x + n) >> 2)]);
         }
-        Snap { x, y, n, planes, blk }
+        (s.x, s.y, s.n) = (x, y, n);
+        s
     }
 
     fn restore(&mut self, s: &Snap) {
@@ -328,7 +336,10 @@ impl<'a> FrameCoder<'a> {
                 let (eff, dist) = me.encode_cu(&mut e, x, y, log2, depth, mode);
                 let cost = me.cost(dist, e.bits - base);
                 if best.as_ref().is_none_or(|b| cost < b.0) {
-                    *best = Some((cost, e, me.snap(x, y, n), eff));
+                    let snap = me.snap(x, y, n);
+                    if let Some(old) = best.replace((cost, e, snap, eff)) {
+                        me.snaps.push(old.2);
+                    }
                 }
             };
             let mut inter_satd = u64::MAX;
@@ -377,6 +388,9 @@ impl<'a> FrameCoder<'a> {
             if cost < limit {
                 *est = e;
                 decs.extend(d2);
+                if let Some(b) = best {
+                    self.snaps.push(b.2);
+                }
                 return cost;
             }
         }
@@ -384,6 +398,7 @@ impl<'a> FrameCoder<'a> {
         // slices); without one, report an infinite cost.
         let Some((cost, e, snap, mode)) = best else { return f64::INFINITY };
         self.restore(&snap);
+        self.snaps.push(snap);
         *est = e;
         decs.push(CuDec { x: x as u32, y: y as u32, log2, mode });
         cost
