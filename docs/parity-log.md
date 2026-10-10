@@ -932,3 +932,7 @@ before.
 - Handover: opening a project that a windowless host (`effectcraft-cli serve`) has open asks the
   host to save and stop, then opens the saved file, instead of making a second copy; agents whose
   host went away are pointed to the MCP `hosts` tool to rejoin.
+- `file.importAep` and `file.importProject` take `wait: false`: the After Effects export, or reading
+  a big project file, runs in the background (Window ▸ Progress) and the import applies as one undo
+  step when done; the desktop control channel and windowless hosts use it, so a 1 GB import no
+  longer stalls other agents.

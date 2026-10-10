@@ -206,7 +206,7 @@ fn connection(stream: TcpStream, tx: &Sender<Msg>, clients: &Mutex<BTreeMap<Stri
 
 /// Commands that wait for their job unless `wait: false` (others only with `wait: true`).
 fn waits(command: &str, params: &Value) -> bool {
-    let default = matches!(command, "renderQueue.render" | "render.frame" | "render.contactSheet");
+    let default = matches!(command, "renderQueue.render" | "render.frame" | "render.contactSheet" | "file.importAep" | "file.importProject");
     params.get("wait").and_then(Value::as_bool).unwrap_or(default)
 }
 
