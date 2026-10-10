@@ -2228,3 +2228,67 @@ fn bridged_agents_get_a_name_by_default() {
     assert_eq!(alone.backend().client(), None);
     assert_eq!(crate::server::default_client(&json!({"clientInfo": {"name": "!!!"}})), format!("agent-{}", std::process::id()));
 }
+
+/// An agent hops between projects: `hosts` lists where projects are open, `join` (a port or a
+/// project path) switches the server onto that host as a named agent, and leaving unsaved
+/// headless work is refused.
+#[test]
+fn hosts_tool_lists_and_joins_a_running_app() {
+    let mut s = server();
+    let listed = call_json(&mut s, "hosts", json!({}));
+    assert!(listed["hosts"].is_array(), "{listed}");
+    call_json(&mut s, "execute_command", json!({"command": "comp.new", "params": {"name": "Unsaved"}}));
+    let port = fake_app();
+    let (c, err) = call(&mut s, "hosts", json!({"join": port}));
+    assert!(err && c[0]["text"].as_str().unwrap().contains("unsaved"), "{c:?}");
+    let mut clean = server();
+    let joined = call_json(&mut clean, "hosts", json!({"join": port}));
+    assert_eq!(joined["joined"], port);
+    let me = format!("mcp-{}", std::process::id());
+    assert_eq!(joined["client"], json!(me));
+    assert_eq!(clean.backend().mode(), "bridge");
+    assert_eq!(clean.backend().client(), Some(me.as_str()));
+    let (c, err) = call(&mut clean, "hosts", json!({"join": "/nowhere/Nope.ecproj"}));
+    assert!(err && c[0]["text"].as_str().unwrap().contains("no running EffectCraft"), "{c:?}");
+}
+
+/// A windowless host: two agents join one in-memory project, each claims and edits its own comp,
+/// renders reply without blocking the other agent, and `host.release` saves the project and stops
+/// the host (in the host list while it runs).
+#[test]
+fn windowless_host_serves_several_agents_one_project() {
+    use crate::host_server::{HostConfig, request, serve};
+    let dir = autosave_test_dir("host");
+    let (port_tx, port_rx) = std::sync::mpsc::channel();
+    let config = HostConfig { port: 0, config_dir: Some(dir.clone()) };
+    let host = std::thread::spawn(move || serve(config, Box::new(|| Ok(Session::default())), move |p| port_tx.send(p).unwrap()));
+    let port = port_rx.recv().unwrap();
+    let exec = |client: &str, command: &str, params: Value| {
+        let mut p = params;
+        p["client"] = json!(client);
+        request(port, "engine.execute", json!({"command": command, "params": p})).unwrap()
+    };
+    let a = exec("agentA", "comp.new", json!({"name": "A", "width": 64, "height": 36}));
+    let b = exec("agentB", "comp.new", json!({"name": "B", "width": 64, "height": 36}));
+    assert_eq!((a["ok"].clone(), b["ok"].clone()), (json!(true), json!(true)), "{a} {b}");
+    assert_eq!(exec("agentA", "comp.claim", json!({"comp": "A"}))["ok"], true);
+    assert_eq!(exec("agentA", "layer.newSolid", json!({"comp": "A", "width": 8, "height": 8}))["ok"], true);
+    let refused = exec("agentB", "layer.newSolid", json!({"comp": "A", "width": 8, "height": 8}));
+    assert!(refused["error"].as_str().unwrap_or("").contains("claimed by agentA"), "{refused}");
+    let frame = exec("agentB", "render.frame", json!({"comp": "B", "base64": true, "max_side": 16}));
+    assert_eq!(frame["ok"], true, "{frame}");
+    assert!(frame["result"]["png"].is_string());
+    let info = request(port, "host.info", json!({})).unwrap();
+    assert_eq!(info["result"]["dirty"], true);
+    assert!(request(port, "ui.click", json!({})).unwrap()["error"].as_str().unwrap().contains("desktop app"));
+    let listed = exec("agentA", "hosts.list", json!({}));
+    assert!(listed["result"]["hosts"].as_array().unwrap().iter().any(|h| h["port"] == port && h["kind"] == "host"), "{listed}");
+    let saved = dir.join("Shared.ecproj");
+    let r = request(port, "host.release", json!({"path": saved.to_string_lossy()})).unwrap();
+    assert_eq!(r["result"]["released"], true, "{r}");
+    host.join().unwrap().unwrap();
+    let text = std::fs::read_to_string(&saved).unwrap();
+    assert!(text.contains("\"A\"") && text.contains("\"B\""), "both agents' comps are in the saved project");
+    assert!(!dir.join(effectcraft_engine::hosts::HOSTS_FOLDER).join(format!("{}.json", std::process::id())).exists(), "left the host list");
+    std::fs::remove_dir_all(dir).unwrap();
+}

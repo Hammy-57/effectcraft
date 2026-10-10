@@ -228,7 +228,7 @@ fn ids_are_not_reused_after_undo() {
     let mut s = Session::default();
     s.execute("comp.new", json!({"name": "Ids", "width": 64, "height": 64})).unwrap();
     let a = new_solid(&mut s, "Agent", Some("agent"));
-    s.execute("edit.undo", json!({})).unwrap();
+    s.execute_checked("edit.undo", json!({"client": "agent"})).unwrap();
     let b = new_solid(&mut s, "User", None);
     assert_ne!(a, b, "an undone layer's id is never handed to another layer");
     s.execute("edit.undo", json!({})).unwrap();
@@ -275,4 +275,39 @@ fn expect_revision_refuses_a_changed_document() {
     let now = s.revision;
     s.execute_checked("layer.newSolid", json!({"color": "#0000ff", "expectRevision": now, "client": "agent"})).unwrap();
     assert_eq!(names(&s).len(), 2);
+}
+
+/// Multi-agent undo: ⌘Z undoes your own latest step, not an agent's that came after it; an
+/// agent's undo likewise skips the user's later steps. Only what that step changed is reverted
+/// (a new step), and it's refused, changing nothing, when someone changed the same thing since.
+#[test]
+fn undo_reverts_your_own_step_behind_others() {
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "Mine", "width": 64, "height": 64})).unwrap();
+    s.execute("comp.new", json!({"name": "Theirs", "width": 64, "height": 64})).unwrap();
+    let theirs = s.active_comp_id().unwrap();
+    s.execute("comp.new", json!({"name": "Mine 2", "width": 64, "height": 64})).unwrap();
+    // The user renames a comp; then an agent adds a layer to another comp.
+    let mine = s.project.find_by_name("Mine").unwrap().id;
+    s.execute("project.rename", json!({"item": mine.0, "name": "Renamed"})).unwrap();
+    s.execute_checked("layer.newSolid", json!({"comp": theirs.0, "name": "Agent's", "color": "#00ff00", "width": 8, "height": 8, "client": "agentA"})).unwrap();
+    // ⌘Z: the user's rename goes, the agent's layer stays.
+    let r = s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(r["selective"], true, "{r}");
+    assert!(s.project.find_by_name("Mine").is_some() && s.project.find_by_name("Renamed").is_none());
+    assert_eq!(s.project.comp(theirs).unwrap().layers.len(), 1, "the agent's work is untouched");
+    // The agent undoes its own layer even though the user's undo came after it.
+    s.execute_checked("edit.undo", json!({"client": "agentA"})).unwrap();
+    assert_eq!(s.project.comp(theirs).unwrap().layers.len(), 0);
+    // A clash: the agent adds a layer, the user then edits that same comp; the agent's undo is
+    // refused and nothing changes.
+    s.execute_checked("layer.newSolid", json!({"comp": theirs.0, "name": "A2", "color": "#00ff00", "width": 8, "height": 8, "client": "agentA"})).unwrap();
+    s.execute_checked("layer.newSolid", json!({"comp": theirs.0, "name": "U2", "color": "#0000ff", "width": 8, "height": 8})).unwrap();
+    let rev = s.revision;
+    let e = s.execute_checked("edit.undo", json!({"client": "agentA"})).unwrap_err().to_string();
+    assert!(e.contains("made by the user") && e.contains("“Theirs”"), "{e}");
+    assert_eq!(s.revision, rev);
+    // `any: true` undoes the last step whoever made it.
+    s.execute("edit.undo", json!({"any": true})).unwrap();
+    assert_eq!(s.project.comp(theirs).unwrap().layers.len(), 1);
 }

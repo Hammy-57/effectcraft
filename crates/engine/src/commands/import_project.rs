@@ -7,7 +7,7 @@ use effectcraft_color::Label;
 use effectcraft_project::{ItemId, ItemKind, LayerSource, Project, essential};
 use serde_json::{Value, json};
 
-use super::{CommandSpec, always, bad, str_p};
+use super::{CommandSpec, always, b_p, bad, str_p};
 use crate::{EngineError, Result, Session, cmd};
 
 const C: &str = "file.importProject";
@@ -19,8 +19,8 @@ pub(crate) fn is_project_path(path: &str) -> bool {
 }
 
 /// Read a project file (JSON or its XML copy), as File ▸ Open does.
-fn read_project(s: &Session, path: &str) -> Result<(Project, Option<String>)> {
-    let bytes = s.services.read_file(path).map_err(|e| EngineError::Other(format!("cannot read {path}: {e}")))?;
+fn read_project(services: &dyn crate::Services, path: &str) -> Result<(Project, Option<String>)> {
+    let bytes = services.read_file(path).map_err(|e| EngineError::Other(format!("cannot read {path}: {e}")))?;
     let text = String::from_utf8(bytes).map_err(|_| bad(C, format!("{path} is not a text project file")))?;
     let text = if crate::xml_project::is_xml(&text) { crate::xml_project::from_xml(&text).map_err(EngineError::Other)? } else { text };
     let project = Project::from_json(&text).map_err(|e| bad(C, format!("{path} is not a project EffectCraft can open: {e}")))?;
@@ -76,7 +76,24 @@ fn root_comps(project: &Project) -> Vec<ItemId> {
 
 fn import_project(s: &mut Session, p: &Value) -> Result<Value> {
     let path = str_p(p, "path").ok_or_else(|| bad(C, "missing `path` (.ecproj)"))?.to_string();
-    let (mut sub, saved_by) = read_project(s, &path)?;
+    // `wait: false`: read and parse the file (the slow part for a big project) on a background
+    // thread, then merge it on the session's thread, as one undo step.
+    if b_p(p, "wait") == Some(false) {
+        let services = s.services.clone();
+        let name = std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.clone());
+        return s.spawn_task("importProject", format!("Importing {name}"), false, move |_ctl| {
+            let (sub, saved_by) = read_project(services.as_ref(), &path).map_err(|e| e.to_string())?;
+            let apply: crate::jobs::Apply = Box::new(move |s: &mut Session| merge(s, &path, sub, saved_by));
+            Ok(apply)
+        });
+    }
+    let (sub, saved_by) = read_project(s.services.as_ref(), &path)?;
+    merge(s, &path, sub, saved_by)
+}
+
+/// Merge `sub` (read from `path`) into the open project, as one undo step.
+fn merge(s: &mut Session, path: &str, mut sub: Project, saved_by: Option<String>) -> Result<Value> {
+    let path = path.to_string();
     crate::upgrade_effects(&mut sub);
     let file = std::path::Path::new(&path);
     let dir = file.parent().map(|d| d.to_path_buf()).unwrap_or_default();
@@ -136,7 +153,7 @@ pub fn specs() -> Vec<CommandSpec> {
         "EffectCraft Project...",
         ["File", "Import"],
         None,
-        "{path (.ecproj or .ecprojx)} — merges the project into a folder named after the file; returns {folder, items, comps, rootComps, primaryComp (the only root comp, else null), missingMedia, warnings}",
+        "{path (.ecproj or .ecprojx), wait? (false: read it in the background)} — merges the project into a folder named after the file; returns {folder, items, comps, rootComps, primaryComp (the only root comp, else null), missingMedia, warnings}",
         always,
         import_project
     )]

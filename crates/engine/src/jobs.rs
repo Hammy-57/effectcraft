@@ -161,10 +161,15 @@ impl Session {
         }
         let r = lock(&t.result).take();
         let cancelled = t.ctl.cancelled();
+        let mut quiet = false;
         let (status, message, result) = match r {
             Some(Ok(apply)) if !cancelled => match apply(self) {
-                // A task may say how it went (`toast`: "Imported 3 items").
-                Ok(v) => ("done", v.get("toast").and_then(Value::as_str).unwrap_or_default().to_string(), v),
+                // A task may say how it went (`toast`: "Imported 3 items"), or that it finished
+                // quietly (`quiet`: an agent's render).
+                Ok(mut v) => {
+                    quiet = v.as_object_mut().and_then(|o| o.remove("quiet")) == Some(Value::Bool(true));
+                    ("done", v.get("toast").and_then(Value::as_str).unwrap_or_default().to_string(), v)
+                }
                 Err(e) => ("failed", e.to_string(), Value::Null),
             },
             Some(Ok(_)) => ("cancelled", String::new(), Value::Null),
@@ -187,7 +192,9 @@ impl Session {
             "cancelled" => format!("{} cancelled", t.label),
             _ => format!("{} failed: {message}", t.label),
         };
-        self.events.push(crate::Event::Toast { message: toast, error: status == "failed" });
+        if !(quiet && status == "done") {
+            self.events.push(crate::Event::Toast { message: toast, error: status == "failed" });
+        }
         self.job_log.push(rec.clone());
         if self.job_log.len() > 50 {
             self.job_log.remove(0);

@@ -126,6 +126,7 @@ See [MCP conventions](mcp.md) for core tools, resources, strict arguments, and p
 | `render_snapshot {name, comp?, time?, max_side?, transparent?}` | Render a frame and keep it in the session under `name` (16 kept, oldest dropped; the same name replaces). |
 | `render_compare {a, b, threshold?, min_psnr?, max_side?, region?, amplify?, diff_path?, inline?}` | Compare two frames. `a` and `b` are each a snapshot name (or `{snapshot}`), `{path}` (a PNG/JPEG golden or After Effects reference) or `{comp?, time?, transparent?}` (render now; `{}` = active comp at the CTI). Returns `{width, height, max_abs, mean_abs, alpha_max_abs, psnr_db, ssim, changed_pixels, changed_pct, pass, diffBounds}` and, when something changed, the diff heatmap as an image. `region: [x, y, w, h]` compares one rectangle. See [Verify your change](#verify-your-change-snapshot--edit--compare). |
 | `open_project {path \| demo \| new}` / `save_project {path?}` | Open and save files. |
+| `hosts {join?}` | Where projects are open (each running EffectCraft, its port and project); `join` (a port or a project path) switches this server onto that host as your own `client`, so several agents work in one project. Refused while your own project has unsaved changes. |
 | `undo {steps?}` / `redo {steps?}` | History. |
 | `history {goto?}` | The branching undo history (History panel): every state with its index, id, label, branch depth and whether it's current; `goto` (an index or id) jumps to any state, on any branch, without losing the others. |
 | `script_ui {action?, window?, widget?, value?, result?}` | Drive ScriptUI windows that scripts opened: `list` (default) the open windows, `get` a window's control tree, `click` a button / checkbox / radio button, `set` text, a slider or a list item, `close` a window (`result`: what a dialog's `show()` returns, default 2 = Cancel). |
@@ -207,6 +208,41 @@ Two things follow:
   dropped when another project is opened, and the control channel releases a client's claims when the
   last connection that used that `client` closes (keep one connection open, as the MCP bridge does).
   Without `client`, `comp.release` needs `force: true` (the user overriding a claim).
+
+### Undo with several people in one project
+
+`edit.undo` undoes the caller's own latest step: the user's (no `client`) or the agent's. When
+someone else made the last step, only what the caller's step changed is reverted, as a new step
+(`{undone, selective: true}`), so the user's ⌘Z never removes an agent's work and an agent's undo
+never removes the user's. It's refused, changing nothing, when someone changed the same item (a
+comp, footage item, folder) or the project settings since; the error names who. The user's
+`edit.undo {any: true}` undoes the last step whoever made it, and the History panel still jumps to
+any state.
+
+### Which project is open where (hosts) and the save guard
+
+One process holds one project. Every EffectCraft that holds one (the desktop app, a headless or
+`--ui` MCP server) is listed in `<config directory>/Hosts/` with its kind, control port and open
+project; `command_run hosts.list` returns the live ones (`{hosts: [{pid, kind, port, project, me}]}`).
+To work on a project that is already open, join that host (the MCP `hosts {join: <port or
+project>}` tool, or start with `--bridge <port>`; you keep your own `client`) instead of opening a
+copy: `file.open` of a project another host has open succeeds but
+warns, and its reply lists them in `openElsewhere`.
+
+With the desktop app closed, a **windowless host** keeps one project in memory for several agents:
+`effectcraft-cli serve Project.ecproj [--control PORT]` prints its port; agents join it like the app
+(`effectcraft-cli mcp --bridge PORT`, or the MCP `hosts {join}` tool) and work on their own comps with
+their own `client` and `comp.claim`. Commands that wait for a job (renders, analyses, `jobs.wait`)
+reply when it ends without holding up the other agents; unsaved work is checkpointed (big projects
+at most every 30 s); `host.release {path?}` saves the project and stops the host. Opening that project in the
+desktop app does this by itself (a handover: the app asks the host to save and stop, waits, then
+opens the saved file; the reply's `handover` says so), and the host's agents find the project in
+the app with the MCP `hosts` tool. `ui.*` methods need the app.
+
+Two copies of one file overwrite each other when saved, so saving is guarded: `file.save` /
+`file.saveAs` over a file that changed on disk since this process opened or saved it (another
+app, an agent's CLI, a script) is refused, naming the ways out: save under a new name
+(`file.saveAs`), reload theirs (`file.revert`), or `force: true` to overwrite.
 
 ### A typical session
 

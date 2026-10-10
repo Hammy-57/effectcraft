@@ -243,3 +243,30 @@ fn contact_sheet_writes_png_and_gif() {
     assert!(g.starts_with(b"GIF89a"));
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Multi-agent fairness: `wait: false` renders as a background task on a copy of what the render
+/// reads (the caller's comp and time included), so the session carries on meanwhile. The task's
+/// result is the blocking command's, pixel for pixel, and it finishes without a toast.
+#[test]
+fn renders_run_as_quiet_background_tasks() {
+    let mut s = session();
+    s.execute("time.set", json!({"time": 1})).unwrap();
+    for (cmd, p) in [("render.frame", json!({"base64": true, "max_side": 160})), ("render.contactSheet", json!({"count": 2, "base64": true, "max_side": 200}))]
+    {
+        let blocking = s.execute(cmd, p.clone()).unwrap();
+        let mut bg = p.clone();
+        bg["wait"] = json!(false);
+        let started = s.execute(cmd, bg).unwrap();
+        let job = started["job"].as_str().unwrap().to_string();
+        assert!(s.jobs().iter().any(|j| j.id == job), "{cmd}: listed while it runs");
+        s.events.clear();
+        s.wait_jobs();
+        let rec = s.job_log.iter().find(|r| r.id == job).unwrap();
+        assert_eq!((rec.status.as_str(), rec.kind.as_str()), ("done", "render"));
+        assert_eq!(rec.result, blocking, "{cmd}: the same result as the blocking command");
+        assert!(rec.result.get("quiet").is_none());
+        assert!(!s.events.iter().any(|e| matches!(e, crate::Event::Toast { .. })), "{cmd}: no toast for an agent's render");
+    }
+    // A bad request fails up front, not in the task.
+    assert!(s.execute("render.frame", json!({"wait": false, "layer": "Nope"})).is_err());
+}
