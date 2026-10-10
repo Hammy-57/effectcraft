@@ -168,16 +168,23 @@ struct Snapshot {
     decoded: Box<[[[bool; 35]; 35]; 3]>,
 }
 
+/// Decides one superblock row. The row keeps its own strip of the reconstruction and of the
+/// decision motion vectors: local row 0 holds the last row of the strip above (copied in by
+/// `load_above` before each superblock), local rows 1.. are the row's own. Decisions only read
+/// that one row above, up to the superblock above-right, so rows can be decided in a wavefront
+/// (each row two superblocks behind the one above) with exactly the serial result.
 pub(crate) struct Decider<'a> {
-    pub g: &'a FrameGeom,
-    pub bd: u32,
-    pub intra_only: bool,
-    pub src: &'a [Plane; 3],
-    pub rec: [Plane; 3],
-    pub refr: Option<&'a RefFrame>,
+    g: &'a FrameGeom,
+    bd: u32,
+    intra_only: bool,
+    src: &'a [Plane; 3],
+    sb_row: usize,
+    /// Reconstruction strip per plane ((64 >> ss) + 1 rows).
+    rec: [Plane; 3],
+    refr: Option<&'a RefFrame>,
     decoded: Box<[[[bool; 35]; 35]; 3]>,
-    /// Decision motion vectors per 4x4 (search candidates).
-    pub mvs: Vec<[i32; 2]>,
+    /// Decision motion vectors per 4x4 (search candidates), 17 rows of the strip.
+    mvs: Vec<[i32; 2]>,
     dc_q: f32,
     ac_q: f32,
     dc_qi: i64,
@@ -185,7 +192,7 @@ pub(crate) struct Decider<'a> {
     lambda: f64,
     lambda_sad: f64,
     /// Half-sample interpolations of the reference luma (visible area): (8, 0), (0, 8), (8, 8).
-    half: [Vec<u16>; 3],
+    half: &'a [Vec<u16>; 3],
     tx: TxBufs,
     leaf_bufs: LeafBufs,
     /// Released snapshots, reused by `snapshot`.
@@ -194,8 +201,77 @@ pub(crate) struct Decider<'a> {
 
 const MODE_BITS_INTRA: f64 = 3.0;
 
+/// The superblock column that row `sbr` decides in wavefront step `t` (rows trail the row above
+/// by two superblocks).
+fn wave_col(t: usize, sbr: usize, sb_cols: usize) -> Option<usize> {
+    let c = t.checked_sub(2 * sbr)?;
+    (c < sb_cols).then_some(c)
+}
+
+/// The decisions of a frame: superblock trees in raster order, the reconstruction (padded
+/// planes, before the loop filter) and the decision motion vectors per 4x4. Superblock rows run
+/// in parallel as a wavefront; the result is identical to deciding the superblocks one after
+/// another in raster order, whatever the thread count.
+pub(crate) fn decide_frame(
+    g: &FrameGeom,
+    bd: u32,
+    qidx: u8,
+    intra_only: bool,
+    src: &[Plane; 3],
+    refr: Option<&RefFrame>,
+) -> (Vec<Node>, [Plane; 3], Vec<[i32; 2]>) {
+    use rayon::prelude::*;
+    let half: [Vec<u16>; 3] = match refr {
+        Some(rf) => {
+            let sub = |(fx, fy): (usize, usize)| subpel_plane(&rf.planes[0], g.width, g.height, fx, fy, bd);
+            let (h0, (h1, h2)) = rayon::join(|| sub((8, 0)), || rayon::join(|| sub((0, 8)), || sub((8, 8))));
+            [h0, h1, h2]
+        }
+        None => Default::default(),
+    };
+    let mut rows: Vec<Decider> = (0..g.sb_rows).map(|r| Decider::new(g, bd, qidx, intra_only, src, refr, &half, r)).collect();
+    let mut nodes: Vec<Node> = (0..g.sb_rows * g.sb_cols).map(|_| Node::Out).collect();
+    let steps = g.sb_cols + 2 * g.sb_rows.saturating_sub(1);
+    for t in 0..steps {
+        for r in 1..rows.len() {
+            if let Some(c) = wave_col(t, r, g.sb_cols)
+                && let (above, [cur, ..]) = rows.split_at_mut(r)
+                && let Some(prev) = above.last()
+            {
+                cur.load_above(prev, c);
+            }
+        }
+        let done: Vec<(usize, Node)> =
+            rows.par_iter_mut().enumerate().filter_map(|(r, d)| wave_col(t, r, g.sb_cols).map(|c| (r * g.sb_cols + c, d.superblock(c)))).collect();
+        for (i, node) in done {
+            if let Some(slot) = nodes.get_mut(i) {
+                *slot = node;
+            }
+        }
+    }
+    let mut rec = std::array::from_fn(|p| {
+        let (w, h) = g.padded(p);
+        Plane::new(w, h)
+    });
+    let mut mvs = vec![[0, 0]; g.mi_cols * g.mi_rows];
+    for d in &rows {
+        d.store(&mut rec, &mut mvs);
+    }
+    (nodes, rec, mvs)
+}
+
 impl<'a> Decider<'a> {
-    pub fn new(g: &'a FrameGeom, bd: u32, qidx: u8, intra_only: bool, src: &'a [Plane; 3], refr: Option<&'a RefFrame>) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        g: &'a FrameGeom,
+        bd: u32,
+        qidx: u8,
+        intra_only: bool,
+        src: &'a [Plane; 3],
+        refr: Option<&'a RefFrame>,
+        half: &'a [Vec<u16>; 3],
+        sb_row: usize,
+    ) -> Self {
         let bdi = ((bd - 8) >> 1) as usize;
         let dc_qi = DC_QLOOKUP[bdi][qidx as usize] as i64;
         let ac_qi = AC_QLOOKUP[bdi][qidx as usize] as i64;
@@ -203,36 +279,92 @@ impl<'a> Decider<'a> {
         let step = ac_qi as f64 / 8.0;
         let lambda = 0.25 * step * step;
         let rec = std::array::from_fn(|p| {
-            let (w, h) = g.padded(p);
-            Plane::new(w, h)
+            let (w, _) = g.padded(p);
+            Plane::new(w, (64 >> (p > 0) as usize) + 1)
         });
         Decider {
             g,
             bd,
             intra_only,
             src,
+            sb_row,
             rec,
             refr,
             decoded: Box::new([[[false; 35]; 35]; 3]),
-            mvs: vec![[0, 0]; g.mi_cols * g.mi_rows],
+            mvs: vec![[0, 0]; g.mi_cols * 17],
             dc_q: dc_qi as f32,
             ac_q: ac_qi as f32,
             dc_qi,
             ac_qi,
             lambda,
             lambda_sad: lambda.sqrt(),
-            half: match refr {
-                Some(rf) => [(8, 0), (0, 8), (8, 8)].map(|(fx, fy)| subpel_plane(&rf.planes[0], g.width, g.height, fx, fy, bd)),
-                None => Default::default(),
-            },
+            half,
             tx: TxBufs::default(),
             leaf_bufs: LeafBufs::default(),
             snaps: Vec::new(),
         }
     }
 
-    /// Decides one 64x64 superblock (reconstruction is written to `rec`).
-    pub fn superblock(&mut self, r: usize, c: usize) -> Node {
+    /// Strip row of the sample row `y` (frame coordinates) of plane `p`.
+    #[inline(always)]
+    fn ry(&self, p: usize, y: usize) -> usize {
+        (y + 1).saturating_sub((self.sb_row * 64) >> (p > 0) as usize)
+    }
+
+    /// Strip index of the motion vector of 4x4 (r, c).
+    #[inline(always)]
+    fn mv_idx(&self, r: usize, c: usize) -> usize {
+        (r + 1).saturating_sub(self.sb_row * 16) * self.g.mi_cols + c
+    }
+
+    /// Copies what superblock `sbc` of this row reads from the row above (its last
+    /// reconstructed row and motion vectors, from superblock `sbc - 1` to `sbc + 1`).
+    fn load_above(&mut self, above: &Decider, sbc: usize) {
+        for p in 0..3 {
+            let s = (p > 0) as usize;
+            let (w, _) = self.g.padded(p);
+            let x0 = (sbc.saturating_sub(1) * 64) >> s;
+            let x1 = (((sbc + 2) * 64) >> s).min(w);
+            let last = 64 >> s;
+            let (src, dst) = (&above.rec[p], &mut self.rec[p]);
+            if let (Some(a), Some(d)) = (src.data.get(last * src.stride + x0..last * src.stride + x1), dst.data.get_mut(x0..x1)) {
+                d.copy_from_slice(a);
+            }
+        }
+        let cols = self.g.mi_cols;
+        let (c0, c1) = (sbc.saturating_sub(1) * 16, ((sbc + 2) * 16).min(cols));
+        if let (Some(a), Some(d)) = (above.mvs.get(16 * cols + c0..16 * cols + c1), self.mvs.get_mut(c0..c1)) {
+            d.copy_from_slice(a);
+        }
+    }
+
+    /// Copies the row's reconstruction and motion vectors into the frame.
+    fn store(&self, rec: &mut [Plane; 3], mvs: &mut [[i32; 2]]) {
+        for p in 0..3 {
+            let s = (p > 0) as usize;
+            let h = 64 >> s;
+            let y0 = self.sb_row * h;
+            let (src, dst) = (&self.rec[p], &mut rec[p]);
+            let n = src.stride.min(dst.stride);
+            for i in 0..h {
+                if let (Some(a), Some(d)) =
+                    (src.data.get((i + 1) * src.stride..(i + 1) * src.stride + n), dst.data.get_mut((y0 + i) * dst.stride..(y0 + i) * dst.stride + n))
+                {
+                    d.copy_from_slice(a);
+                }
+            }
+        }
+        let cols = self.g.mi_cols;
+        let r0 = self.sb_row * 16;
+        let rows = 16.min(self.g.mi_rows.saturating_sub(r0));
+        if let (Some(a), Some(d)) = (self.mvs.get(cols..(rows + 1) * cols), mvs.get_mut(r0 * cols..(r0 + rows) * cols)) {
+            d.copy_from_slice(a);
+        }
+    }
+
+    /// Decides superblock `sbc` of the row (reconstruction is written to `rec`).
+    fn superblock(&mut self, sbc: usize) -> Node {
+        let (r, c) = (self.sb_row * 16, sbc * 16);
         // clear_block_decoded_flags( r, c, sbSize4 )
         for plane in 0..3 {
             let s = (plane > 0) as usize;
@@ -278,7 +410,7 @@ impl<'a> Decider<'a> {
         let mut snap = self.snaps.pop().unwrap_or_else(|| Snapshot { planes: Default::default(), decoded: Box::new([[[false; 35]; 35]; 3]) });
         for (p, v) in snap.planes.iter_mut().enumerate() {
             let s = (p > 0) as usize;
-            let (x0, y0, n) = ((c * 4) >> s, (r * 4) >> s, (n4 * 4) >> s);
+            let (x0, y0, n) = ((c * 4) >> s, self.ry(p, (r * 4) >> s), (n4 * 4) >> s);
             let pl = &self.rec[p];
             v.clear();
             for y in y0..y0 + n {
@@ -296,7 +428,7 @@ impl<'a> Decider<'a> {
     fn restore(&mut self, snap: &Snapshot, r: usize, c: usize, n4: usize) {
         for p in 0..3 {
             let s = (p > 0) as usize;
-            let (x0, y0, n) = ((c * 4) >> s, (r * 4) >> s, (n4 * 4) >> s);
+            let (x0, y0, n) = ((c * 4) >> s, self.ry(p, (r * 4) >> s), (n4 * 4) >> s);
             let pl = &mut self.rec[p];
             for (i, y) in (y0..y0 + n).enumerate() {
                 pl.data[y * pl.stride + x0..y * pl.stride + x0 + n].copy_from_slice(&snap.planes[p][i * n..i * n + n]);
@@ -308,7 +440,8 @@ impl<'a> Decider<'a> {
     fn set_mvs(&mut self, r: usize, c: usize, n4: usize, mv: [i32; 2]) {
         for y in r..(r + n4).min(self.g.mi_rows) {
             for x in c..(c + n4).min(self.g.mi_cols) {
-                self.mvs[y * self.g.mi_cols + x] = mv;
+                let i = self.mv_idx(y, x);
+                self.mvs[i] = mv;
             }
         }
     }
@@ -407,16 +540,18 @@ impl<'a> Decider<'a> {
         let bd = self.bd;
         let n = 1usize << log2;
         // luma
+        // edges are read in strip coordinates: y and max_y shift by the strip origin
+        let y_org = self.sb_row as i32 * 64 - 1;
         let e = IntraEdge {
             x: c * 4,
-            y: r * 4,
+            y: self.ry(0, r * 4),
             have_left: c > 0,
             have_above: r > 0,
             have_above_right: self.decoded_at(0, sbr - 1, sbc + n4 as isize),
             have_below_left: self.decoded_at(0, sbr + n4 as isize, sbc - 1),
             log2,
             max_x: (self.g.mi_cols * 4) as i32 - 1,
-            max_y: (self.g.mi_rows * 4) as i32 - 1,
+            max_y: (self.g.mi_rows * 4) as i32 - 1 - y_org,
             bit_depth: bd,
         };
         let ed = edges(&self.rec[0], &e);
@@ -478,16 +613,17 @@ impl<'a> Decider<'a> {
         let cn = n >> 1;
         let clog2 = log2 - 1;
         let (csbr, csbc) = (sbr >> 1, sbc >> 1);
+        let cy_org = self.sb_row as i32 * 32 - 1;
         let ce: [IntraEdge; 2] = std::array::from_fn(|i| IntraEdge {
             x: c * 2,
-            y: r * 2,
+            y: self.ry(1, r * 2),
             have_left: c > 0,
             have_above: r > 0,
             have_above_right: self.decoded_at(1 + i, csbr - 1, csbc + (n4 >> 1) as isize),
             have_below_left: self.decoded_at(1 + i, csbr + (n4 >> 1) as isize, csbc - 1),
             log2: clog2,
             max_x: (self.g.mi_cols * 2) as i32 - 1,
-            max_y: (self.g.mi_rows * 2) as i32 - 1,
+            max_y: (self.g.mi_rows * 2) as i32 - 1 - cy_org,
             bit_depth: bd,
         });
         let ced = [edges(&self.rec[1], &ce[0]), edges(&self.rec[2], &ce[1])];
@@ -568,7 +704,7 @@ impl<'a> Decider<'a> {
     fn motion_search(&self, r: usize, c: usize, n: usize, parent_mv: Option<[i32; 2]>, buf: &mut [u16]) -> ([i32; 2], f64) {
         let g = self.g;
         let Some(refr) = self.refr else { return ([0, 0], 0.0) };
-        let mi = |rr: usize, cc: usize| self.mvs[rr * g.mi_cols + cc];
+        let mi = |rr: usize, cc: usize| self.mvs[self.mv_idx(rr, cc)];
         let mut pred_mv = [0, 0];
         // at most six candidates: zero, left, above, above-right, parent, co-located
         let mut cand_buf = [[0i32; 2]; 6];
@@ -852,6 +988,7 @@ impl<'a> Decider<'a> {
     }
 
     fn put(&mut self, p: usize, x: usize, y: usize, n: usize, blk: &[u16]) {
+        let y = self.ry(p, y);
         let pl = &mut self.rec[p];
         for i in 0..n {
             let o = (y + i) * pl.stride + x;
