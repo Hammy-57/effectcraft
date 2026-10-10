@@ -812,7 +812,9 @@ fn interpret(s: &mut Session, p: &Value) -> Result<Value> {
             // Layers that ran to the footage's end still do (After Effects re-times them too).
             let ids: Vec<ItemId> = proj.comps().map(|(id, _)| *id).collect();
             for cid in ids {
-                for l in proj.comp_mut(cid).into_iter().flat_map(|c| c.layers.iter_mut_where(|l| l.source.item() == Some(*i) && (l.stretch - 100.0).abs() < 1e-9 && l.out_point == l.start_time + old)) {
+                for l in proj.comp_mut(cid).into_iter().flat_map(|c| {
+                    c.layers.iter_mut_where(|l| l.source.item() == Some(*i) && (l.stretch - 100.0).abs() < 1e-9 && l.out_point == l.start_time + old)
+                }) {
                     l.out_point = l.start_time + new;
                 }
             }

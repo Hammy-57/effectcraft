@@ -28,7 +28,9 @@ window's status bar and on stderr: give each app its own port, and point its MCP
   `file.importAep` / `file.importProject`, which read the file in the background)
   starts the job and replies when it ends, with the same result as the blocking
   command: the UI keeps drawing and other connections' requests run meanwhile. A request times
-  out after 60 s. If the app hadn't started it
+  out after 60 s. Clients sharing the app take turns: each `client`'s first request runs before
+  anyone's second, and one frame runs at most 50 ms of requests (the rest run on the next frame),
+  so the window keeps drawing. If the app hadn't started it
   by then, it is cancelled and never runs: the reply has `"notRun": true` and says it is safe to
   retry. If it had started, the reply says it may still complete.
 - **Only requests are read:** every line must be a JSON object with a string `method` (blank lines are
@@ -36,7 +38,7 @@ window's status bar and on stderr: give each app its own port, and point its MCP
   invalid UTF-8, a line longer than 4 MiB) gets one error reply ending in "closing the connection", and
   the server closes the connection, so nothing sent after it runs. An HTTP request (for example a web
   page's cross-origin `fetch` to `127.0.0.1:<port>`) therefore can't smuggle a command in its body: its
-  request line is rejected first. At most 16 connections are served at once; further ones get an error
+  request line is rejected first. At most 32 connections are served at once; further ones get an error
   line and are closed. The port has no authentication, so only enable it while you use it.
 
 Quick test:
@@ -140,7 +142,7 @@ unsubscribes.
 | `ui.elements` | `{prefix?}` | `[{id, label, rect: [x, y, w, h], window?}]`: the widgets drawn in the last frame, in points. On the desktop an undocked panel group is an OS window of its own: its widgets carry `window` (the group's id) and their rect is in that window's coordinates. |
 | `ui.set` | `{tool?, workspace?, theme?, focused?, viewer?, timeline?, menuBar?, home?}` | `viewer: {zoom (null = fit), res: Full\|Half\|Third\|Quarter\|Auto, pan: [x,y], grid, rulers, safeMargins, transparencyGrid}`; `timeline: {pps (null = fit), start, graphEditor, showModes, openLayers: [ids], openGroups: [uids]}`. |
 | `ui.panel.show` / `ui.panel.close` | `{panel}` | Panels: `Project`, `Composition`, `Timeline`, `EffectControls`, `EffectsPresets`, `Info`, `Preview`, `Character`, `Paragraph`, `Align` and others. |
-| `engine.execute` `window.*` (panel menu) | `{panel, comp?, rect?, stacked?, solo?, small?, anchor?, zone?}` | The panel menu's items (≡ beside a tab name, or right-click a tab; automation ids `panelMenu.<key>`): `window.closePanel` (on a Timeline comp tab, `comp` closes that comp's Timeline), `window.floatPanel` (Undock Panel), `window.dockPanel` (with `anchor`/`zone`, or back to its usual place), `window.closeOtherPanels`, `window.closePanelGroup`, `window.floatPanelGroup`, `window.maximizePanel` (Maximize Panel Group, as `` ` ``), `window.stackPanelGroup`, `window.soloPanels` (Solo Panels in Stack: one expanded panel at a time; `solo`, or toggle), `window.smallTabs` (Small Tabs: a shorter tab strip; `small`, or toggle), and `window.panelMenu {panel, x?, y?}` to open the menu. |
+| `engine.execute` `window.*` (panel menu) | `{panel, comp?, rect?, stacked?, solo?, small?, anchor?, zone?}` | The panel menu's items (≡ beside a tab name, or right-click a tab; automation ids `panelMenu.<key>`): `window.closePanel` (on a Timeline comp tab, `comp` closes that comp's Timeline), `window.floatPanel` (Undock Panel), `window.dockPanel` (with `anchor`/`zone`, or back to its usual place), `window.closeOtherPanels`, `window.closePanelGroup`, `window.floatPanelGroup`, `window.maximizePanel` (Maximize Panel Group, as `` ` ``), `window.stackPanelGroup`, `window.soloPanels` (Solo Panels in Stack: one expanded panel at a time; `solo`, or toggle), `window.smallTabs` (Small Tabs: a shorter tab strip, for a docked or undocked group; `small`, or toggle), and `window.panelMenu {panel, x?, y?}` to open the menu. |
 | `ui.playback` | `{action: play\|stop\|toggle\|status}` | `{playing, time, audio, levelsDb, peaksDb}` (audio: an audio preview is running; L/R meter levels and held peaks in dBFS) |
 | `ui.resize` | `{width, height}` | Resizes the window (points). |
 | `ui.focus` | `{}` | Activates the window and takes keyboard focus. Agents normally avoid this, because the app is started without stealing focus. |

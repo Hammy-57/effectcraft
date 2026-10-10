@@ -1369,7 +1369,9 @@ mod tests {
         use effectcraft_engine::Session;
         use serde_json::json;
         let mut s = Session::default();
-        let comp = |s: &mut Session, w: u32, h: u32| ItemId(s.execute("comp.new", json!({"name": "C", "width": w, "height": h, "duration": 1})).unwrap()["comp"].as_u64().unwrap());
+        let comp = |s: &mut Session, w: u32, h: u32| {
+            ItemId(s.execute("comp.new", json!({"name": "C", "width": w, "height": h, "duration": 1})).unwrap()["comp"].as_u64().unwrap())
+        };
         let uhd = comp(&mut s, 3840, 2160);
         let hd = comp(&mut s, 1920, 1080);
         let job = |cid: ItemId, scale: f64, budget: usize| Job {

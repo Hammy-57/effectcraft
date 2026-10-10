@@ -7,41 +7,41 @@
 
 use rayon::prelude::*;
 
-use crate::{Image, Px};
+use crate::Image;
 
 /// One horizontal box pass of radius `r` (window 2r+1) over each row of `src` (width `w`) into
 /// `out`; `repeat` = edge pixels extend, otherwise transparent.
-fn box_h_into(src: &[Px], out: &mut [Px], w: usize, r: usize, repeat: bool) {
+fn box_h_into<const N: usize>(src: &[[f32; N]], out: &mut [[f32; N]], w: usize, r: usize, repeat: bool) {
     if r == 0 {
         out.copy_from_slice(src);
         return;
     }
     let norm = 1.0 / (2 * r + 1) as f32;
     out.par_chunks_mut(w).zip(src.par_chunks(w)).for_each(|(o, row)| {
-        let get = |i: isize| -> Px {
+        let get = |i: isize| -> [f32; N] {
             if i < 0 {
-                if repeat { row[0] } else { [0.0; 4] }
+                if repeat { row[0] } else { [0.0; N] }
             } else if i as usize >= w {
-                if repeat { row[w - 1] } else { [0.0; 4] }
+                if repeat { row[w - 1] } else { [0.0; N] }
             } else {
                 row[i as usize]
             }
         };
-        let mut acc = [0.0f32; 4];
+        let mut acc = [0.0f32; N];
         for i in -(r as isize)..=(r as isize) {
             let p = get(i);
-            for c in 0..4 {
+            for c in 0..N {
                 acc[c] += p[c];
             }
         }
         // Interior pixels (both window ends inside the row) skip the edge checks; the sums are
         // the same operations in the same order.
         let (inner_lo, inner_hi) = (r.min(w), w.saturating_sub(r + 1).max(r.min(w)));
-        let edge = |x: usize, acc: &mut [f32; 4], o: &mut Px| {
+        let edge = |x: usize, acc: &mut [f32; N], o: &mut [f32; N]| {
             *o = acc.map(|v| v * norm);
             let add = get(x as isize + r as isize + 1);
             let sub = get(x as isize - r as isize);
-            for c in 0..4 {
+            for c in 0..N {
                 acc[c] += add[c] - sub[c];
             }
         };
@@ -52,7 +52,7 @@ fn box_h_into(src: &[Px], out: &mut [Px], w: usize, r: usize, repeat: bool) {
         }
         for ((out, add), sub) in mid.iter_mut().zip(row.get(inner_lo + r + 1..).unwrap_or(&[])).zip(row.get(inner_lo.saturating_sub(r)..).unwrap_or(&[])) {
             *out = acc.map(|v| v * norm);
-            for c in 0..4 {
+            for c in 0..N {
                 acc[c] += add[c] - sub[c];
             }
         }
@@ -63,14 +63,14 @@ fn box_h_into(src: &[Px], out: &mut [Px], w: usize, r: usize, repeat: bool) {
 }
 
 /// One vertical box pass (same semantics as [`box_h_into`] along columns).
-fn box_v_into(src: &[Px], out: &mut [Px], w: usize, h: usize, r: usize, repeat: bool) {
+fn box_v_into<const N: usize>(src: &[[f32; N]], out: &mut [[f32; N]], w: usize, h: usize, r: usize, repeat: bool) {
     if r == 0 {
         out.copy_from_slice(src);
         return;
     }
     let norm = 1.0 / (2 * r + 1) as f32;
     let block = (4 * r).clamp(32, 256);
-    let row = |i: isize| -> Option<&[Px]> {
+    let row = |i: isize| -> Option<&[[f32; N]]> {
         if i < 0 {
             repeat.then(|| &src[0..w])
         } else if i as usize >= h {
@@ -81,11 +81,11 @@ fn box_v_into(src: &[Px], out: &mut [Px], w: usize, h: usize, r: usize, repeat: 
     };
     out.par_chunks_mut(w * block).enumerate().for_each(|(bi, chunk)| {
         let ya = (bi * block) as isize;
-        let mut acc = vec![[0.0f32; 4]; w];
+        let mut acc = vec![[0.0f32; N]; w];
         for i in ya - r as isize..=ya + r as isize {
             if let Some(rw) = row(i) {
                 for (a, p) in acc.iter_mut().zip(rw) {
-                    for c in 0..4 {
+                    for c in 0..N {
                         a[c] += p[c];
                     }
                 }
@@ -99,21 +99,21 @@ fn box_v_into(src: &[Px], out: &mut [Px], w: usize, h: usize, r: usize, repeat: 
             match (row(y + r as isize + 1), row(y - r as isize)) {
                 (Some(add), Some(sub)) => {
                     for ((a, p), q) in acc.iter_mut().zip(add).zip(sub) {
-                        for c in 0..4 {
+                        for c in 0..N {
                             a[c] += p[c] - q[c];
                         }
                     }
                 }
                 (Some(add), None) => {
                     for (a, p) in acc.iter_mut().zip(add) {
-                        for c in 0..4 {
+                        for c in 0..N {
                             a[c] += p[c];
                         }
                     }
                 }
                 (None, Some(sub)) => {
                     for (a, q) in acc.iter_mut().zip(sub) {
-                        for c in 0..4 {
+                        for c in 0..N {
                             a[c] -= q[c];
                         }
                     }
@@ -127,22 +127,41 @@ fn box_v_into(src: &[Px], out: &mut [Px], w: usize, h: usize, r: usize, repeat: 
 /// Run horizontal passes with radii `rx` then vertical passes with radii `ry`.
 fn box_passes(img: &Image, rx: &[usize], ry: &[usize], repeat: bool) -> Image {
     let (w, h) = (img.width as usize, img.height as usize);
-    let passes: Vec<(bool, usize)> = rx.iter().map(|&r| (false, r)).chain(ry.iter().map(|&r| (true, r))).filter(|p| p.1 > 0).collect();
-    if passes.is_empty() || w == 0 || h == 0 {
-        return img.clone();
+    match box_passes_px(&img.data, w, h, rx, ry, repeat) {
+        Some(data) => Image { width: img.width, height: img.height, data },
+        None => img.clone(),
     }
-    let mut a = Image::new(img.width, img.height);
-    let mut b = Image::new(img.width, img.height);
+}
+
+/// [`box_passes`] over `w`×`h` pixels of `N` independent channels (each channel's sums are the
+/// same operations in the same order whatever `N`); `None` when no pass runs.
+fn box_passes_px<const N: usize>(data: &[[f32; N]], w: usize, h: usize, rx: &[usize], ry: &[usize], repeat: bool) -> Option<Vec<[f32; N]>> {
+    let passes: Vec<(bool, usize)> = rx.iter().map(|&r| (false, r)).chain(ry.iter().map(|&r| (true, r))).filter(|p| p.1 > 0).collect();
+    if passes.is_empty() || w == 0 || h == 0 || data.len() != w * h {
+        return None;
+    }
+    let mut a = vec![[0.0f32; N]; w * h];
+    let mut b = vec![[0.0f32; N]; w * h];
     for (i, &(vertical, r)) in passes.iter().enumerate() {
-        let src: &[Px] = if i == 0 { &img.data } else { &a.data };
+        let src: &[[f32; N]] = if i == 0 { data } else { &a };
         if vertical {
-            box_v_into(src, &mut b.data, w, h, r, repeat);
+            box_v_into(src, &mut b, w, h, r, repeat);
         } else {
-            box_h_into(src, &mut b.data, w, r, repeat);
+            box_h_into(src, &mut b, w, r, repeat);
         }
         std::mem::swap(&mut a, &mut b);
     }
-    a
+    Some(a)
+}
+
+/// [`box_passes`] of one plane (a coverage mask): exactly the alpha channel of blurring it as
+/// an image, at a quarter of the work.
+fn box_passes_plane(data: &[f32], w: usize, h: usize, rx: &[usize], ry: &[usize], repeat: bool) -> Vec<f32> {
+    let px: Vec<[f32; 1]> = data.iter().map(|&v| [v]).collect();
+    match box_passes_px(&px, w, h, rx, ry, repeat) {
+        Some(out) => out.into_iter().map(|[v]| v).collect(),
+        None => data.to_vec(),
+    }
 }
 
 /// Box radii for `n` passes approximating a Gaussian of `sigma` (Kovesi / "boxes for Gauss").
@@ -175,6 +194,19 @@ fn gaussian_radii(sigma: f64) -> Vec<usize> {
 /// Gaussian blur with standard deviations in pixels (3 box passes per axis).
 pub fn gaussian_blur(img: &Image, sigma_x: f64, sigma_y: f64, repeat: bool) -> Image {
     box_passes(img, &gaussian_radii(sigma_x), &gaussian_radii(sigma_y), repeat)
+}
+
+/// [`box_blur`] of one `w`×`h` plane (a coverage mask): equals the alpha of [`box_blur`] of
+/// the plane as an image, exactly.
+pub fn box_blur_plane(data: &[f32], w: usize, h: usize, rx: usize, ry: usize, iterations: usize, repeat: bool) -> Vec<f32> {
+    let n = iterations.max(1);
+    box_passes_plane(data, w, h, &vec![rx; n], &vec![ry; n], repeat)
+}
+
+/// [`gaussian_blur`] of one `w`×`h` plane (a coverage mask): equals the alpha of
+/// [`gaussian_blur`] of the plane as an image, exactly.
+pub fn gaussian_blur_plane(data: &[f32], w: usize, h: usize, sigma_x: f64, sigma_y: f64, repeat: bool) -> Vec<f32> {
+    box_passes_plane(data, w, h, &gaussian_radii(sigma_x), &gaussian_radii(sigma_y), repeat)
 }
 
 /// How far (in pixels) [`gaussian_blur`] of `sigma` spreads a pixel along its axis: the sum of
@@ -244,6 +276,30 @@ pub fn radial_blur(img: &Image, center: (f64, f64), amount: f64, zoom: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Blurring one plane gives exactly that channel of blurring an image (masks, text).
+    #[test]
+    fn plane_blur_equals_the_channel_blur() {
+        let (w, h) = (53u32, 31u32);
+        let mut img = Image::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let a = if (x * 7 + y * 3) % 11 < 4 { 0.0 } else { crate::hash_noise(x, y, 1) };
+                img.set(x, y, [crate::hash_noise(x, y, 2) * a, 0.3 * a, a * 0.9, a]);
+            }
+        }
+        for c in 0..4 {
+            let plane: Vec<f32> = img.data.iter().map(|p| p[c]).collect();
+            for (sx, sy, repeat) in [(3.0, 1.5, false), (0.04, 7.0, true), (12.0, 0.0, false)] {
+                let full = gaussian_blur(&img, sx, sy, repeat);
+                let one = gaussian_blur_plane(&plane, w as usize, h as usize, sx, sy, repeat);
+                assert!(full.data.iter().zip(&one).all(|(p, v)| p[c].to_bits() == v.to_bits()), "gaussian {c} {sx} {sy}");
+            }
+            let full = box_blur(&img, 4, 2, 1, false);
+            let one = box_blur_plane(&plane, w as usize, h as usize, 4, 2, 1, false);
+            assert!(full.data.iter().zip(&one).all(|(p, v)| p[c].to_bits() == v.to_bits()), "box {c}");
+        }
+    }
 
     #[test]
     fn directional_blur_repeat_keeps_an_opaque_frame_opaque() {

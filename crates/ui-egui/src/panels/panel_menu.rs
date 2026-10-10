@@ -117,7 +117,14 @@ pub fn entries(app: &EffectcraftApp, panel: PanelKind, doc: Option<u64>) -> Vec<
                 !floating && app.ui.dock.is_stacked(panel),
                 app.ui.dock.solo(panel) == Some(true),
             ),
-            check("smallTabs", tr("Small Tabs"), "window.smallTabs", p.clone(), !floating, app.ui.dock.small_tabs(panel) == Some(true)),
+            check(
+                "smallTabs",
+                tr("Small Tabs"),
+                "window.smallTabs",
+                p.clone(),
+                true,
+                crate::dock::small_tabs(&app.ui.dock, &app.ui.floating, panel) == Some(true),
+            ),
         ],
     });
     let own = panel_items(app, panel);

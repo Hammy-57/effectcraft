@@ -23,11 +23,16 @@
 //! * **Runtime**: one boa `Context` per thread with compiled scripts cached by text. Scripts read
 //!   the project through memoized host requests (see [`host`]), so nothing borrowed ever enters
 //!   the JS heap. Expressions reading each other nest up to [`MAX_DEPTH`] levels.
+//! * **Cost**: a run that meets unanswered requests keeps going on stand-in answers to collect
+//!   them all, so an evaluation takes a handful of runs instead of one per request; and each
+//!   evaluation first answers what the same expression read last time (see [`prefetch`]), so
+//!   from the second frame on most expressions run exactly once.
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod host;
 mod noise;
+mod prefetch;
 pub mod rewrite;
 mod runtime;
 mod sample;
@@ -37,8 +42,13 @@ use effectcraft_project::{ItemId, Layer, LayerId, Project, Property};
 use effectcraft_render::{EvalCtx, ExprHost};
 use effectcraft_time::Tick;
 
-use host::{Own, Req, Resolver, prop_dims, value_resp};
+use host::{Own, Req, Resolver, prop_dims, secs, value_resp};
 use runtime::{Begin, FRAMES, Frame, Run};
+
+/// Script runs on this thread so far (each evaluation runs its script one or more times).
+pub fn script_runs() -> u64 {
+    runtime::runs()
+}
 
 /// Maximum nesting of expressions that read other expressions (cycles stop here).
 pub const MAX_DEPTH: usize = 16;
@@ -117,7 +127,7 @@ fn evaluate_out(
     }
     let ctx = EvalCtx { project: ctx.project, comp_id: ctx.comp_id, comp: ctx.comp, time: ctx.time, expr: Some(host), footage: ctx.footage };
     let comp = ctx.comp_id.0;
-    let path = layer.props.path_of(prop.uid).unwrap_or_else(|| format!("@{}", prop.uid));
+    let path = prefetch::own_path(layer, prop);
     let resolver = Resolver { ctx, own: Own { comp, layer, prop, path: path.clone() } };
     let current = value_resp(value, prop_dims(layer, prop));
     let begin = Begin {
@@ -133,27 +143,44 @@ fn evaluate_out(
         selector,
     };
     // Answer the requests nearly every expression makes up front.
-    let mut frame = Frame::default();
+    let mut frame = Frame::new(depth);
     for req in [Req::CompInfo { comp }, Req::LayerInfo { comp, layer: layer.id.0 }, Req::PropInfo { comp, layer: layer.id.0, path: path.clone() }] {
         let r = resolver.resolve(&req);
-        frame.memo.insert(req, r);
+        frame.insert(req, r);
     }
     FRAMES.with(|f| f.borrow_mut().push(frame));
     let _guard = FrameGuard;
+    // Answer what this expression read last time (pushed first: answers that evaluate other
+    // expressions nest exactly as they do when a run asks for them).
+    let key = prefetch::Key::new(text, comp, layer.id.0, prop.uid);
+    let now = secs(ctx.time.seconds());
+    answer(&resolver, depth, prefetch::predicted(&key, now));
     for _ in 0..MAX_PASSES {
         match runtime::run(text, &begin) {
-            Run::Done(r) => return r,
+            Run::Done(r) => {
+                let used = FRAMES.with(|f| f.borrow_mut().get_mut(depth).map(|fr| std::mem::take(&mut fr.used)).unwrap_or_default());
+                prefetch::store(key, now, used);
+                return r;
+            }
             Run::Pending => {
                 let misses = FRAMES.with(|f| f.borrow_mut().get_mut(depth).map(|fr| std::mem::take(&mut fr.misses)).unwrap_or_default());
-                for m in misses {
-                    // May evaluate other expressions (nested frames above ours).
-                    let r = resolver.resolve(&m);
-                    FRAMES.with(|f| f.borrow_mut().get_mut(depth).map(|fr| fr.memo.insert(m, r)));
-                }
+                answer(&resolver, depth, misses);
             }
         }
     }
     Err("Error: expression needs too many property reads".into())
+}
+
+/// Resolve `reqs` not answered yet into the memo of the frame at `depth`.
+fn answer(resolver: &Resolver, depth: usize, reqs: Vec<Req>) {
+    for req in reqs {
+        if FRAMES.with(|f| f.borrow().get(depth).is_none_or(|fr| fr.has(&req))) {
+            continue;
+        }
+        // May evaluate other expressions (nested frames above ours).
+        let r = resolver.resolve(&req);
+        FRAMES.with(|f| f.borrow_mut().get_mut(depth).map(|fr| fr.insert(req, r)));
+    }
 }
 
 /// Evaluate `text` as if it were the expression on the property at `path` (e.g.
@@ -190,3 +217,5 @@ pub fn check_syntax(text: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_perf;

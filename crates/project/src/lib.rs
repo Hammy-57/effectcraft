@@ -8,6 +8,7 @@
 
 pub mod build;
 pub mod essential;
+mod finite;
 pub mod layers;
 pub mod props;
 pub mod render_queue;
@@ -79,9 +80,14 @@ pub struct FileMeta {
     pub open_comps: Option<OpenComps>,
 }
 
-/// Read a project file's [`FileMeta`] (one pass over the text; a malformed `openComps` is
-/// ignored rather than failing the rest).
+/// Read a project file's [`FileMeta`] (a malformed `openComps` is ignored rather than failing the
+/// rest). EffectCraft writes `savedBy` first and `openComps` last, so they are read from the two
+/// ends of the text without going over the project again; a file laid out otherwise (another
+/// writer) takes one pass over the whole text.
 pub fn file_meta(text: &str) -> FileMeta {
+    if let Some(meta) = file_meta_at_ends(text) {
+        return meta;
+    }
     #[derive(Deserialize)]
     struct Meta {
         #[serde(rename = "savedBy", default)]
@@ -91,6 +97,38 @@ pub fn file_meta(text: &str) -> FileMeta {
     }
     let Ok(m) = serde_json::from_str::<Meta>(text) else { return FileMeta::default() };
     FileMeta { saved_by: m.saved_by, open_comps: m.open_comps.and_then(|v| serde_json::from_value(v).ok()) }
+}
+
+/// [`file_meta`] when `savedBy` is the first member (or absent) and `openComps` the last (or
+/// absent); `None` when the file isn't laid out like that.
+fn file_meta_at_ends(text: &str) -> Option<FileMeta> {
+    const SAVED_BY: &str = "\"savedBy\"";
+    const OPEN_COMPS: &str = "\"openComps\"";
+    let saved_by = match text.trim_start().strip_prefix('{')?.trim_start().strip_prefix(SAVED_BY) {
+        Some(rest) => Some(json_prefix::<String>(rest.trim_start().strip_prefix(':')?)?.0),
+        None if !text.contains(SAVED_BY) => None,
+        None => return None,
+    };
+    let open_comps = match text.rfind(OPEN_COMPS) {
+        None => None,
+        Some(at) => {
+            let rest = text.get(at.saturating_add(OPEN_COMPS.len())..)?.trim_start().strip_prefix(':')?;
+            let (value, len) = json_prefix::<serde_json::Value>(rest)?;
+            // Only the root object's last member is followed by nothing but its `}`.
+            if rest.get(len..)?.trim() != "}" {
+                return None;
+            }
+            serde_json::from_value(value).ok()
+        }
+    };
+    Some(FileMeta { saved_by, open_comps })
+}
+
+/// The JSON value at the start of `text` and the length of its text.
+fn json_prefix<T: serde::de::DeserializeOwned>(text: &str) -> Option<(T, usize)> {
+    let mut values = serde_json::Deserializer::from_str(text).into_iter::<T>();
+    let value = values.next()?.ok()?;
+    Some((value, values.byte_offset()))
 }
 
 /// Whether version `a` (`major.minor.patch`, pre-release suffixes ignored) is newer than `b`.
@@ -1344,9 +1382,9 @@ impl Project {
             && self.render_templates == other.render_templates
             && self.render_prefs == other.render_prefs
     }
-    /// The project file's text: the project with the version that wrote it (`savedBy`), checked
-    /// to read back, so a save never writes a file that can't be opened (JSON has no NaN or
-    /// infinity: such a value would be written as `null`).
+    /// The project file's text (compact JSON): the project with the version that wrote it
+    /// (`savedBy`), checked to read back, so a save never writes a file that can't be opened (JSON
+    /// has no NaN or infinity: such a value would be written as `null`).
     pub fn to_file_json(&self) -> Result<String, ProjectError> {
         self.to_file_json_with(None)
     }
@@ -1362,11 +1400,12 @@ impl Project {
             #[serde(rename = "openComps", skip_serializing_if = "Option::is_none")]
             open_comps: Option<&'a OpenComps>,
         }
-        let text = serde_json::to_string_pretty(&File { saved_by: APP_VERSION, project: self, open_comps: open })
-            .map_err(|e| ProjectError::Invalid(format!("the project can't be saved: {e}")))?;
-        Project::from_json(&text)
+        // Check before writing (a walk over the values, much cheaper than parsing the text back).
+        finite::check(self)
+            .and_then(|()| finite::check(&open))
             .map_err(|e| ProjectError::Invalid(format!("the project can't be saved: it holds a value a project file can't store ({e})")))?;
-        Ok(text)
+        serde_json::to_string(&File { saved_by: APP_VERSION, project: self, open_comps: open })
+            .map_err(|e| ProjectError::Invalid(format!("the project can't be saved: {e}")))
     }
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).unwrap_or_default()
