@@ -44,7 +44,7 @@ fn scene(color: [f32; 3], bg: Option<[f32; 3]>, f: impl FnOnce(&mut Project, &Co
     if let Some(bg) = bg {
         layers.push(solid(&mut p, &comp, bg, 200, 100));
     }
-    p.comp_mut(cid).unwrap().layers = layers;
+    p.comp_mut(cid).unwrap().layers = layers.into();
     (p, cid)
 }
 
@@ -495,7 +495,7 @@ fn track_matte_reads_the_layer_before_its_styles() {
     set(&mut matte, "blendingOptions/advancedBlending/fillOpacity", Value::Scalar(0.0));
     let mut fill = solid(&mut p, &comp, [0.0, 0.0, 1.0], 200, 100);
     fill.track_matte = Some(effectcraft_project::TrackMatte { layer: matte.id, kind: effectcraft_project::MatteKind::Alpha });
-    p.comp_mut(cid).unwrap().layers = vec![matte, fill];
+    p.comp_mut(cid).unwrap().layers = vec![matte, fill].into();
     let img = render(&p, cid);
     // Inside the square (x 80..120): the blue layer, not just the ring.
     assert!(img.get(100, 50)[2] > 0.98 && img.get(100, 50)[3] > 0.98, "{:?}", img.get(100, 50));

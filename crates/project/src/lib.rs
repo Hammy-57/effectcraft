@@ -8,6 +8,7 @@
 
 pub mod build;
 pub mod essential;
+pub mod layers;
 pub mod props;
 pub mod render_queue;
 pub mod render_templates;
@@ -26,6 +27,7 @@ use serde::{Deserialize, Serialize};
 
 pub use effectcraft_keyframe as keyframe;
 pub use effectcraft_keyframe::{Keyframe, Value};
+pub use layers::Layers;
 
 /// The project file schema. 2: effects on layers without a source rectangle (shape, text)
 /// measure positions from the top-left of their comp-sized bounds (effect space), not from
@@ -337,8 +339,9 @@ pub struct Comp {
     pub display_start: Tick,
     pub background: [f32; 3],
     pub work_area: (Tick, Tick),
-    /// Layer #1 first (top of the stack).
-    pub layers: Vec<Layer>,
+    /// Layer #1 first (top of the stack). Each layer is shared between snapshots until an edit
+    /// changes it (copy-on-write per layer, see [`Layers`]).
+    pub layers: Layers,
     #[serde(default)]
     pub markers: Vec<Marker>,
     pub shutter_angle: f64,
@@ -407,7 +410,7 @@ impl Comp {
             display_start: Tick::ZERO,
             background: [0.0, 0.0, 0.0],
             work_area: (Tick::ZERO, duration),
-            layers: vec![],
+            layers: vec![].into(),
             markers: vec![],
             shutter_angle: 180.0,
             shutter_phase: -90.0,
@@ -452,8 +455,9 @@ impl Comp {
     pub fn layer(&self, id: LayerId) -> Option<&Layer> {
         self.layers.iter().find(|l| l.id == id)
     }
+    /// Copy-on-write access to one layer: the comp's other layers stay shared.
     pub fn layer_mut(&mut self, id: LayerId) -> Option<&mut Layer> {
-        self.layers.iter_mut().find(|l| l.id == id)
+        self.layers.find_mut(|l| l.id == id)
     }
     /// 1-based layer number (#) of a layer.
     pub fn index_of(&self, id: LayerId) -> Option<usize> {
@@ -789,7 +793,7 @@ impl Comp {
         }
         let mut c = self.clone();
         c.hide_shy = false;
-        for l in &mut c.layers {
+        for l in c.layers.iter_mut_where(|l| l.switches != l.switches.pixels()) {
             l.switches = l.switches.pixels();
         }
         std::borrow::Cow::Owned(c)

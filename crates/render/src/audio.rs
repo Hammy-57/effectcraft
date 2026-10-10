@@ -520,7 +520,7 @@ mod tests {
             pr.value = effectcraft_project::Value::Vec2([-6.0206, -96.0]);
         }
         let mut comp = comp;
-        comp.layers = vec![l1, l2];
+        comp.layers = vec![l1, l2].into();
         let cid = p.add_item("C", effectcraft_color::Label::Sandstone, None, ItemKind::Comp(comp.into()));
         assert!(comp_has_audio(&p, cid));
         let rate = 1000;

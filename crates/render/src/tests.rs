@@ -225,7 +225,7 @@ fn particle_world_scene(pan: f64) -> (Project, ItemId) {
         let Value::Vec3(v) = pr.value else { panic!("{path}: {:?}", pr.value) };
         pr.value = Value::Vec3([v[0] + pan, v[1], v[2]]);
     }
-    p.comp_mut(cid).unwrap().layers = vec![cam, l];
+    p.comp_mut(cid).unwrap().layers = vec![cam, l].into();
     (p, cid)
 }
 
@@ -306,7 +306,7 @@ fn cache_scene() -> (Project, ItemId) {
         vec![Keyframe::new(Tick::ZERO, Value::Vec3([20.0, 70.0, 0.0])), Keyframe::new(Tick::from_seconds_f64(1.0), Value::Vec3([120.0, 70.0, 0.0]))];
     add_effect_200(&mut p, &mut text, "ec.blur.gaussian", &[("blurriness", Value::Scalar(6.0))]);
     let c = p.comp_mut(cid).unwrap();
-    c.layers = vec![text, shape, bg];
+    c.layers = vec![text, shape, bg].into();
     (p, cid)
 }
 
@@ -713,7 +713,7 @@ fn edge_pinning_displaces_all_of_a_centred_shape_layer() {
         p.comp_mut(cid).unwrap().layers.push(l.clone());
         let plain = render_frame(&p, cid, Tick::ZERO, 1.0);
         add_effect_200(&mut p, &mut l, id, &vals);
-        p.comp_mut(cid).unwrap().layers = vec![l];
+        p.comp_mut(cid).unwrap().layers = vec![l].into();
         let warped = render_frame(&p, cid, Tick::ZERO, 1.0);
         // Alpha change per comp quadrant (TL, TR, BL, BR): the rectangle's edges move in each.
         let mut q = [0.0f32; 4];
@@ -747,7 +747,7 @@ fn default_effect_points_sit_at_the_centre_of_a_shape_layer() {
         p.comp_mut(cid).unwrap().layers.push(l.clone());
         let plain = render_frame(&p, cid, Tick::ZERO, 1.0);
         add_effect_200(&mut p, &mut l, id, &vals);
-        p.comp_mut(cid).unwrap().layers = vec![l];
+        p.comp_mut(cid).unwrap().layers = vec![l].into();
         let warped = render_frame(&p, cid, Tick::ZERO, 1.0);
         // Alpha change per comp quadrant (TL, TR, BL, BR): the top and bottom edges move in each.
         let mut q = [0.0f32; 4];
@@ -780,7 +780,7 @@ fn layer_parameters_see_a_whole_shape_layer() {
     let matte_id = shape.id;
     let mut s = solid(&mut p, &comp, [0.0, 0.0, 1.0], 200, 100);
     add_effect_200(&mut p, &mut s, "ec.channel.setmatte", &[("takeMatteFromLayer", Value::Layer(Some(matte_id.0)))]);
-    p.comp_mut(cid).unwrap().layers = vec![s, shape];
+    p.comp_mut(cid).unwrap().layers = vec![s, shape].into();
     let f = render_frame(&p, cid, Tick::ZERO, 1.0);
     // The matte covers x 50..150, y 25..75: kept inside (all four quadrants), gone outside.
     for (x, y) in [(60, 30), (140, 30), (60, 70), (140, 70)] {
