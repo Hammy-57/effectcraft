@@ -11,6 +11,7 @@ pub mod compare;
 pub mod cuts;
 pub mod flow;
 pub mod inpaint;
+pub mod pool;
 pub mod scopes;
 pub mod sparse;
 pub mod warp;

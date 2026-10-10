@@ -2,6 +2,7 @@
 
 use crate::composite::apply_matte;
 use crate::{EvalCtx, Image, Renderer, color, masks};
+use effectcraft_raster::pool;
 use effectcraft_color::BlendMode;
 use effectcraft_effects::Buf;
 use effectcraft_project::Layer;
@@ -13,13 +14,14 @@ impl<'a> Renderer<'a> {
     pub(crate) fn draw_adjustment(&self, ctx: &EvalCtx, layer: &Layer, canvas: &mut Image, opacity: f32) {
         let Some(mut foot) = self.source(ctx, layer) else { return };
         let _ = masks::apply(ctx, layer, &mut foot, self.mask_blur(ctx, layer));
-        let mut matte = Image::new(canvas.width, canvas.height);
+        let mut matte = pool::zeroed(canvas.width, canvas.height);
         self.place(ctx, layer, &foot, &mut matte, BlendMode::Normal, 1.0);
         // A track matte limits where the adjustment applies (SceneYard UI Google search: a
         // tint + blur only inside a rounded card).
         if let Some((m, kind)) = self.track_matte(ctx, layer) {
             let mimg = self.matte_image(ctx, m, canvas.width, canvas.height);
             apply_matte(&mut matte, &mimg, kind);
+            pool::recycle(mimg);
         }
         let o = self.roi_offset().map(|(x, y, _, _)| [-x, -y]).unwrap_or([0.0; 2]);
         // The effects' points and sizes are in the adjustment layer's space: map a moved or
@@ -32,7 +34,7 @@ impl<'a> Renderer<'a> {
             }
             _ => (o, self.opts.scale),
         };
-        let mut below = Buf { img: canvas.clone(), offset, scale };
+        let mut below = Buf { img: pool::copy_of(canvas), offset, scale };
         // Effects run in the working space, not the linear blending space.
         if let Some(c) = self.pipe.from_blend() {
             color::convert(&mut below.img, &c);
@@ -62,6 +64,8 @@ impl<'a> Renderer<'a> {
                 c[i] += (a[i] - c[i]) * k;
             }
         });
+        pool::recycle(adjusted.img);
+        pool::recycle(matte);
     }
 }
 
