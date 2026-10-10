@@ -1172,7 +1172,7 @@ fn add_mask(s: &mut Session, p: &Value) -> Result<Value> {
         .ok_or_else(|| bad("layer.addMask", format!("unknown shape `{shape}`; one of rect, ellipse, rounded, polygon, star")))?;
     let mode = str_p(p, "mode").and_then(MaskMode::from_name).unwrap_or(MaskMode::Add);
     let cycle = s.prefs.appearance.cycle_mask_colors;
-    let uid = s.edit("New Mask", None, |proj, _| {
+    let (uid, nth) = s.edit("New Mask", None, |proj, _| {
         let mut next = proj.next_id;
         let l = layer_mut(proj, cid, lid)?;
         let masks = l.props.sub_mut("masks").ok_or_else(|| bad("layer.addMask", "this layer can't have masks"))?;
@@ -1181,9 +1181,10 @@ fn add_mask(s: &mut Session, p: &Value) -> Result<Value> {
         let uid = g.uid;
         masks.children.push(g.into());
         proj.next_id = next;
-        Ok(uid)
+        Ok((uid, n + 1))
     })?;
-    Ok(json!({"mask": uid}))
+    // `path` addresses the mask's properties (`masks/#2/feather`); `name` is how layer.setMask finds it.
+    Ok(json!({"mask": uid, "path": format!("masks/#{nth}"), "name": format!("Mask {nth}")}))
 }
 
 fn mask_props(s: &mut Session, p: &Value) -> Result<Value> {
@@ -1315,7 +1316,7 @@ fn set_text(s: &mut Session, p: &Value) -> Result<Value> {
         }
         s.bump();
     }
-    s.edit("Edit Text", merge_p(p), |proj, _| {
+    let text = s.edit("Edit Text", merge_p(p), |proj, _| {
         let l = layer_mut(proj, cid, lid)?;
         let lt = l.layer_time(t);
         let pr = l.props.prop_mut("text/sourceText").ok_or_else(|| bad("layer.setText", "not a text layer"))?;
@@ -1333,9 +1334,10 @@ fn set_text(s: &mut Session, p: &Value) -> Result<Value> {
         {
             l.name = first.chars().take(40).collect();
         }
-        Ok(())
+        Ok(doc.text.chars().take(200).collect::<String>())
     })?;
-    Ok(Value::Null)
+    // What the layer says now (the first 200 characters).
+    Ok(json!({"layer": lid.0, "text": text}))
 }
 
 /// Move Position by `(dx, dy)`, including every key. Separated dimensions move X and Y as well
@@ -1613,7 +1615,15 @@ pub fn specs() -> Vec<CommandSpec> {
             p["frames"] = json!(1);
             slip(s, &p)
         }),
-        cmd!("layer.arrange", "Arrange", ["Layer", "Arrange"], None, "{layers?, to: front|forward|backward|back, index?, above?: layer}", has_layers, arrange),
+        cmd!(
+            "layer.arrange",
+            "Arrange",
+            ["Layer", "Arrange"],
+            None,
+            "{layers?, to: front|forward|backward|back, index? (1-based stack position), above?: layer}",
+            has_layers,
+            arrange
+        ),
         cmd!(
             "layer.precompose",
             "Pre-compose...",
@@ -1628,7 +1638,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "New Mask",
             ["Layer", "Mask"],
             Some("Cmd+Shift+N"),
-            "{layer?, shape?: rect|ellipse|rounded|polygon|star, rect? [x,y,w,h] (layer space; a polygon or star fits its width), mode?}",
+            "{layer?, shape?: rect|ellipse|rounded|polygon|star, rect? [x,y,w,h] (layer space; a polygon or star fits its width), mode?} → {mask: uid, path: masks/#n, name}",
             has_layers,
             add_mask
         ),
@@ -1647,7 +1657,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Edit Text",
             [],
             None,
-            "{layer?, range?: [start, end] (characters; default all), text?, font?, style?, size?, fill?, stroke?, applyFill?, applyStroke?, strokeWidth?, tracking?, leading?: px|\"auto\", baselineShift? px, hScale? %, vScale? %, tsume? %, fauxBold?, fauxItalic?, allCaps?, smallCaps?, baseline?: normal|superscript|subscript, superscript?, subscript?, kerning?: metrics|optical|number, ligatures?, discretionaryLigatures? (OpenType), contextualAlternates?, stylisticAlternates?, stylisticSets?: [1–20], ss01?, ss02?, ss03?, ss04?, ss05?, ss06?, ss07?, ss08?, ss09?, ss10?, ss11?, ss12?, ss13?, ss14?, ss15?, ss16?, ss17?, ss18?, ss19?, ss20?, swash?, titling?, ordinals?, fractions?, allSmallCaps?, figureStyle?: default|lining|oldStyle, figureWidth?: default|proportional|tabular, figures?, variations?: {tag: value} (variable font axes; null resets), justify?: left|center|right|justifyLeft|justifyCenter|justifyRight|justifyAll, indentLeft?, indentRight?, indentFirst?, spaceBefore?, spaceAfter?, direction?: ltr|rtl, composer?: everyLine|singleLine, hangingPunctuation?, strokeOverFill?, box?: [x,y,w,h]|null (layer space), vertical?}",
+            "{layer?, range?: [start, end] (characters; default all), text?, font?, style?, size?, fill?, stroke?, applyFill?, applyStroke?, strokeWidth?, tracking?, leading?: px|\"auto\", baselineShift? px, hScale? %, vScale? %, tsume? %, fauxBold?, fauxItalic?, allCaps?, smallCaps?, baseline?: normal|superscript|subscript, superscript?, subscript?, kerning?: metrics|optical|number, ligatures?, discretionaryLigatures? (OpenType), contextualAlternates?, stylisticAlternates?, stylisticSets?: [1–20], ss01?, ss02?, ss03?, ss04?, ss05?, ss06?, ss07?, ss08?, ss09?, ss10?, ss11?, ss12?, ss13?, ss14?, ss15?, ss16?, ss17?, ss18?, ss19?, ss20?, swash?, titling?, ordinals?, fractions?, allSmallCaps?, figureStyle?: default|lining|oldStyle, figureWidth?: default|proportional|tabular, figures?, variations?: {tag: value} (variable font axes; null resets), justify?: left|center|right|justifyLeft|justifyCenter|justifyRight|justifyAll, indentLeft?, indentRight?, indentFirst?, spaceBefore?, spaceAfter?, direction?: ltr|rtl, composer?: everyLine|singleLine, hangingPunctuation?, strokeOverFill?, box?: [x,y,w,h]|null (layer space), vertical?} → {layer, text}",
             has_layers,
             set_text
         ),

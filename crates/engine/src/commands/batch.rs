@@ -90,7 +90,32 @@ fn batch(s: &mut Session, p: &Value) -> Result<Value> {
         }
     }
     fold(s, &project, &label);
-    Ok(json!({"steps": results.len(), "results": results}))
+    // Steps' warnings (clamped or coerced values), gathered so they aren't missed.
+    let warnings: Vec<String> = results
+        .iter()
+        .enumerate()
+        .flat_map(|(i, r)| {
+            let id = steps.get(i).and_then(|st| st.get("command").or_else(|| st.get("id"))).and_then(Value::as_str).unwrap_or("?");
+            step_warnings(r).into_iter().map(move |w| format!("step {} ({id}): {w}", i + 1))
+        })
+        .collect();
+    let mut out = json!({"steps": results.len(), "results": results});
+    if !warnings.is_empty() {
+        out["warnings"] = json!(warnings);
+    }
+    Ok(out)
+}
+
+/// The `warnings` of a step's result (also inside an array result, e.g. prop.set on a Position
+/// with separated dimensions).
+fn step_warnings(r: &Value) -> Vec<String> {
+    match r {
+        Value::Object(o) => {
+            o.get("warnings").and_then(Value::as_array).map(|w| w.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default()
+        }
+        Value::Array(a) => a.iter().flat_map(step_warnings).collect(),
+        _ => vec![],
+    }
 }
 
 /// Fold the undo steps recorded since the project was `snap` into one step called `label`.
@@ -110,7 +135,7 @@ pub fn specs() -> Vec<CommandSpec> {
         menu: &[],
         shortcut: None,
         alt_shortcuts: &[],
-        params: "{steps: [{command, params?}], label? (undo step name, default Batch), atomic?: bool (default true: a failing step rolls the whole batch back)} → {steps, results: [each step's result]}; a string param \"$N\" or \"$N.key.0\" is step N's result (1-based), e.g. {\"layer\": \"$1.layer\"}",
+        params: "{steps: [{command, params?}], label? (undo step name, default Batch), atomic?: bool (default true: a failing step rolls the whole batch back)} → {steps, results: [each step's result], warnings?: [clamped/coerced values, by step]}; a string param \"$N\" or \"$N.key.0\" is step N's result (1-based), e.g. {\"layer\": \"$1.layer\"}",
         enabled: always,
         run: batch,
         // The steps journal themselves.
