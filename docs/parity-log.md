@@ -936,3 +936,7 @@ before.
   a big project file, runs in the background (Window ▸ Progress) and the import applies as one undo
   step when done; the desktop control channel and windowless hosts use it, so a 1 GB import no
   longer stalls other agents.
+
+- Undo with agents in the project: `edit.undo` (⌘Z) undoes the caller's own latest step; behind
+  someone else's steps it reverts only what that step changed (per comp or item), refused when
+  they changed the same thing since; `edit.undo {any: true}` undoes the last step whoever made it.
