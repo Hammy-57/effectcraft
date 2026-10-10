@@ -24,7 +24,7 @@ The server provides the same core conventions as FilmCraft #28:
 | `command_run` | `id`, `params?` | Engine command result |
 | `command_batch` | `steps: [{id, params?}]`, `stop_on_error?` | `completed`, `failed`, per-step `results` |
 | `doc_inspect` | none | Project overview and active composition |
-| `render_preview` | `comp?`, `time?`, `max_side?`, `path?`, `inline?`, `transparent?` | PNG and frame information |
+| `render_preview` | `comp?` / `item?`, `layer?`, `time?`, `max_side?`, `region?`, `overlays?`, `path?`, `inline?`, `transparent?` | PNG and frame information |
 
 To check visual work, `render_snapshot {name, comp?, time?}` keeps a frame and
 `render_compare {a, b, threshold?, min_psnr?, max_side?, diff_path?, inline?}` compares snapshots,
@@ -49,6 +49,10 @@ lists them too (described as aliases):
 | `execute_command {command \| id, params?}` | `command_run {id, params?}` |
 | `get_project` | `doc_inspect` (its `project` is the same summary) |
 | `render_frame` | `render_preview` (same arguments, including `path` and `inline`) |
+
+`render_frame` and `render_preview` share the engine command `render.frame` (headless and bridged alike): `region: [x, y, w, h]` renders one comp rectangle
+at full resolution, `layer` one layer solo, `item` a footage or solid item, and `overlays` draws layer
+bounds, anchors, motion paths, safe margins or the grid.
 
 Unknown top-level tool argument keys return JSON-RPC `-32602` naming the key and accepted
 arguments. EffectCraft already rejects unknown engine command parameters; that behaviour is

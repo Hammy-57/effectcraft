@@ -97,6 +97,30 @@ impl Backend {
         }
     }
 
+    /// `render.frame` with `params` (`comp | item`, `layer`, `time`, `max_side`, `transparent`,
+    /// `region`, `overlays`): the engine command headless, the control method bridged (the app
+    /// runs the same engine code). Returns the PNG and the reply without it.
+    pub fn render_view(&mut self, mut params: Value) -> Result<(Vec<u8>, Value)> {
+        let max_side = params.get("max_side").and_then(Value::as_u64).unwrap_or(0).min(u32::MAX as u64) as u32;
+        params["base64"] = json!(true);
+        let mut r = match self {
+            Backend::Headless(_) => self.exec("render.frame", params)?,
+            Backend::Bridge(b) => b.call("render.frame", params)?,
+        };
+        let raw = crate::tools::take_png(&mut r, "render.frame")?;
+        // (an older app may ignore `max_side`)
+        let png = match crate::png_size(&raw) {
+            Some((w, h)) if max_side > 0 && w.max(h) > max_side => {
+                let (png, w, h) = recompress_png(&raw, max_side)?;
+                r["width"] = json!(w);
+                r["height"] = json!(h);
+                png
+            }
+            _ => raw,
+        };
+        Ok((png, r))
+    }
+
     /// Render a comp frame (comp time `time` seconds, default the CTI) as PNG, longest side at most
     /// `max_side` (0 = full size).
     pub fn render(&mut self, comp: Option<&Value>, time: Option<f64>, max_side: u32) -> Result<Frame> {

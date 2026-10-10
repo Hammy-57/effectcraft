@@ -37,6 +37,7 @@ pub mod preview;
 pub mod psd_import;
 pub mod remote;
 pub mod render_queue;
+pub mod render_view;
 pub mod roto;
 pub mod scriptui;
 pub mod sequence;
