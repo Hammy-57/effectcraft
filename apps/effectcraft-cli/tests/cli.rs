@@ -484,7 +484,13 @@ fn mcp_autosave_is_opt_in_and_rejects_invalid_combinations() {
     let mut client = McpChild::start(&config, false);
     client.tool("execute_command", json!({"command":"comp.new","params":{"name":"Ephemeral"}}));
     client.eof();
-    assert!(std::fs::read_dir(&config).unwrap().next().is_none());
+    // No auto-save without --autosave. The only trace is the host list folder (AN8: a headless
+    // MCP server announces itself in <config>/Hosts while it runs), and its entry is gone.
+    let left: Vec<PathBuf> = std::fs::read_dir(&config).unwrap().map(|e| e.unwrap().path()).collect();
+    assert!(left.iter().all(|p| p.file_name() == Some(std::ffi::OsStr::new(effectcraft_engine::hosts::HOSTS_FOLDER))), "{left:?}");
+    for hosts in &left {
+        assert!(std::fs::read_dir(hosts).unwrap().next().is_none(), "the host entry is withdrawn at EOF");
+    }
     for args in [["mcp", "--autosave", "--bridge", "1"].as_slice(), ["info", "--autosave"].as_slice()] {
         let out = bin().args(args).env("EFFECTCRAFT_CONFIG_DIR", &config).output().unwrap();
         assert_eq!(out.status.code(), Some(2));
