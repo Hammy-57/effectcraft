@@ -51,6 +51,8 @@ mod ui_drag_drop;
 mod ui_effect_controls;
 #[path = "../ui_fingerprints.rs"]
 mod ui_fingerprints;
+#[path = "../ui_float_windows.rs"]
+mod ui_float_windows;
 #[path = "../ui_fx_console.rs"]
 mod ui_fx_console;
 #[path = "../ui_fx_editors.rs"]

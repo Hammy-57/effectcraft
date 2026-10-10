@@ -116,7 +116,7 @@ Mocha and Cineware are third-party and not counted.
 7. ~~Point tracking and stabilization~~ (M6.x; Warp Stabilizer M12.5, 3D Camera Tracker M12.6).
 8. ~~Frame blending, collapse transformations, slip edit.~~ (M4.3–M4.4)
 9. ~~A real 8/16/32-bit pipeline with linear blending and colour management.~~ (third wave; OCIO / ACES in M7.7)
-10. ~~Drag-to-dock and floating panels, saved workspaces, native macOS menus.~~
+10. ~~Drag-to-dock and floating panels, saved workspaces, native macOS menus.~~ (Undocked panel groups are OS windows of their own on the desktop.)
 11. ~~Auto-save, crash recovery, recent projects~~ (M3.7, M14); unsaved-changes prompts (M3.9).
 12. ~~Expression gaps: `sampleImage`, `footage()`~~ (landed with data footage, the error bar and the Expression Language menu; the `sourceText` style API landed in M9.9).
 13. ~~Lottie, WebM, SVG and PSD import~~ (landed; a disk cache too).
