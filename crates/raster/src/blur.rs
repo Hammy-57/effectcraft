@@ -7,7 +7,7 @@
 
 use rayon::prelude::*;
 
-use crate::Image;
+use crate::{Image, Px};
 
 /// One horizontal box pass of radius `r` (window 2r+1) over each row of `src` (width `w`) into
 /// `out`; `repeat` = edge pixels extend, otherwise transparent.
@@ -218,12 +218,23 @@ pub fn gaussian_support(sigma: f64) -> usize {
 /// Motion blur along `angle_deg` (0 = vertical in AE's Directional Blur, measured clockwise from
 /// up) over `length` pixels.
 pub fn directional_blur(img: &Image, angle_deg: f64, length: f64, repeat: bool) -> Image {
-    if length < 0.5 {
+    // Non-finite input has no meaningful blur (and would overflow the sample coordinates).
+    if length < 0.5 || !length.is_finite() || !angle_deg.is_finite() {
         return img.clone();
     }
+    // Past a billion pixels every off-centre sample is far outside any image already.
+    let length = length.min(1e9);
+    let n = (length.ceil() as usize).saturating_mul(2).saturating_add(1).clamp(3, 257);
+    if let Some(out) = directional_blur_axis(img, angle_deg, length, n, repeat) {
+        return out;
+    }
+    directional_blur_sampled(img, angle_deg, length, n, repeat)
+}
+
+/// [`directional_blur`] at any angle: `n` bilinear samples per pixel.
+fn directional_blur_sampled(img: &Image, angle_deg: f64, length: f64, n: usize, repeat: bool) -> Image {
     let a = angle_deg.to_radians();
     let (dx, dy) = (a.sin(), -a.cos());
-    let n = (length.ceil() as usize * 2 + 1).clamp(3, 257);
     let mut out = Image::new(img.width, img.height);
     out.rows_mut().for_each(|(y, row)| {
         for (x, px) in row.iter_mut().enumerate() {
@@ -240,6 +251,183 @@ pub fn directional_blur(img: &Image, angle_deg: f64, length: f64, repeat: bool) 
         }
     });
     out
+}
+
+/// Whole-pixel taps of an axis-aligned [`directional_blur`]: the bilinear weights its `n`
+/// samples put on each pixel offset along the axis (summed, not yet divided by `n`), split into
+/// a constant `run_w` over every offset in `lo..=hi` (applied as a running sum) plus the
+/// residual `taps` where the weight differs from it.
+struct AxisKernel {
+    lo: isize,
+    hi: isize,
+    run_w: f64,
+    taps: Vec<(isize, f64)>,
+    n: f64,
+}
+
+/// Widest tap span the axis-aligned path handles; longer blurs keep the sampled path.
+const AXIS_MAX_SPAN: isize = 4096;
+
+/// The [`AxisKernel`] of `n` samples spread over `length` pixels in direction `sign` (±1).
+fn axis_kernel(sign: f64, length: f64, n: usize) -> Option<AxisKernel> {
+    if !length.is_finite() || n < 2 || length > AXIS_MAX_SPAN as f64 {
+        return None;
+    }
+    let mut w: Vec<(isize, f64)> = Vec::with_capacity(2 * n);
+    for i in 0..n {
+        // The same offset as the sampled path, whose bilinear sample at `x + o` puts
+        // `1 - frac(o)` on pixel `x + floor(o)` and `frac(o)` on the next one.
+        let o = sign * ((i as f64 / (n - 1) as f64 - 0.5) * length);
+        let f = o.floor();
+        let k = f as isize;
+        w.push((k, 1.0 - (o - f)));
+        w.push((k.checked_add(1)?, o - f));
+    }
+    w.sort_by_key(|&(k, _)| k);
+    let mut merged: Vec<(isize, f64)> = Vec::with_capacity(w.len());
+    for (k, v) in w {
+        match merged.last_mut() {
+            Some(last) if last.0 == k => last.1 += v,
+            _ => merged.push((k, v)),
+        }
+    }
+    let (lo, hi) = (merged.first()?.0, merged.last()?.0);
+    let span = hi.checked_sub(lo)?;
+    if span > AXIS_MAX_SPAN {
+        return None;
+    }
+    // Contiguous taps (sample spacing ≤ 1 px) share one weight except near the ends for whole
+    // lengths: that shared weight runs as a box sum, the rest as individual taps.
+    let contiguous = merged.len() as isize == span + 1;
+    let run_w = if contiguous { merged.get(merged.len() / 2).map_or(0.0, |t| t.1) } else { 0.0 };
+    let taps = merged.into_iter().map(|(k, v)| (k, v - run_w)).filter(|t| t.1.abs() > 1e-9).collect();
+    Some(AxisKernel { lo, hi, run_w, taps, n: n as f64 })
+}
+
+/// [`directional_blur`] along an axis (0/90/180/270°, where the bilinear samples never leave
+/// the pixel's row or column): a running box sum plus a few taps instead of `n` samples per
+/// pixel. Equal to the sampled path to float rounding; `None` at other angles.
+fn directional_blur_axis(img: &Image, angle_deg: f64, length: f64, n: usize, repeat: bool) -> Option<Image> {
+    if !angle_deg.is_finite() {
+        return None;
+    }
+    let quarter = angle_deg / 90.0;
+    let q = quarter.round();
+    if (quarter - q).abs() > 1e-12 {
+        return None;
+    }
+    // Offsets along +x (90°), +y (180°), -x (270°) or -y (0°).
+    let (vertical, sign) = match (q as i64).rem_euclid(4) {
+        0 => (true, -1.0),
+        1 => (false, 1.0),
+        2 => (true, 1.0),
+        _ => (false, -1.0),
+    };
+    let k = axis_kernel(sign, length, n)?;
+    let (w, h) = (img.width as usize, img.height as usize);
+    if w == 0 || h == 0 || img.data.len() != w * h {
+        return None;
+    }
+    let mut out = Image::new(img.width, img.height);
+    if vertical {
+        axis_v(&img.data, &mut out.data, w, h, &k, repeat);
+    } else {
+        axis_h(&img.data, &mut out.data, w, &k, repeat);
+    }
+    Some(out)
+}
+
+/// [`AxisKernel`] along each row: the row is padded once (transparent or edge-repeated) so every
+/// tap reads in bounds.
+fn axis_h(src: &[Px], out: &mut [Px], w: usize, k: &AxisKernel, repeat: bool) {
+    let span = k.hi.abs_diff(k.lo);
+    out.par_chunks_mut(w).zip(src.par_chunks(w)).for_each(|(o, row)| {
+        let (Some(&first), Some(&last)) = (row.first(), row.last()) else { return };
+        let pad = |j: usize| -> Px {
+            // Padded index `j` is source offset `j + lo`.
+            let x = j as isize + k.lo;
+            match usize::try_from(x).ok().and_then(|x| row.get(x)) {
+                Some(&p) => p,
+                None if !repeat => [0.0; 4],
+                None if x < 0 => first,
+                None => last,
+            }
+        };
+        let padded: Vec<Px> = (0..w + span).map(pad).collect();
+        let mut run = [0.0f64; 4];
+        if k.run_w != 0.0 {
+            for p in padded.get(..span + 1).unwrap_or(&[]) {
+                for c in 0..4 {
+                    run[c] += p[c] as f64;
+                }
+            }
+        }
+        for (x, px) in o.iter_mut().enumerate() {
+            let mut acc = run.map(|v| v * k.run_w);
+            for &(t, tw) in &k.taps {
+                if let Some(p) = padded.get(x + t.abs_diff(k.lo)) {
+                    for c in 0..4 {
+                        acc[c] += tw * p[c] as f64;
+                    }
+                }
+            }
+            *px = acc.map(|v| (v / k.n) as f32);
+            if k.run_w != 0.0 {
+                let add = padded.get(x + span + 1).copied().unwrap_or([0.0; 4]);
+                let sub = padded.get(x).copied().unwrap_or([0.0; 4]);
+                for c in 0..4 {
+                    run[c] += add[c] as f64 - sub[c] as f64;
+                }
+            }
+        }
+    });
+}
+
+/// [`AxisKernel`] along each column, whole rows at a time over blocks of output rows (a running
+/// per-column sum, as in [`box_v_into`]).
+fn axis_v(src: &[Px], out: &mut [Px], w: usize, h: usize, k: &AxisKernel, repeat: bool) {
+    let span = k.hi.abs_diff(k.lo);
+    let block = (2 * span).clamp(32, 256);
+    let row = |i: isize| -> Option<&[Px]> {
+        let y = if repeat { i.clamp(0, h as isize - 1) } else { i };
+        let start = usize::try_from(y).ok()?.checked_mul(w)?;
+        src.get(start..start.checked_add(w)?)
+    };
+    let add_row = |acc: &mut [[f64; 4]], rw: Option<&[Px]>, wt: f64| {
+        if let Some(rw) = rw {
+            for (a, p) in acc.iter_mut().zip(rw) {
+                for c in 0..4 {
+                    a[c] += wt * p[c] as f64;
+                }
+            }
+        }
+    };
+    out.par_chunks_mut(w * block).enumerate().for_each(|(bi, chunk)| {
+        let ya = (bi * block) as isize;
+        let mut run = vec![[0.0f64; 4]; w];
+        if k.run_w != 0.0 {
+            for i in ya + k.lo..=ya + k.hi {
+                add_row(&mut run, row(i), 1.0);
+            }
+        }
+        let mut acc = vec![[0.0f64; 4]; w];
+        for (yy, o) in chunk.chunks_mut(w).enumerate() {
+            let y = ya + yy as isize;
+            for (a, r) in acc.iter_mut().zip(&run) {
+                *a = r.map(|v| v * k.run_w);
+            }
+            for &(t, tw) in &k.taps {
+                add_row(&mut acc, row(y + t), tw);
+            }
+            for (o, a) in o.iter_mut().zip(&acc) {
+                *o = a.map(|v| (v / k.n) as f32);
+            }
+            if k.run_w != 0.0 {
+                add_row(&mut run, row(y + k.hi + 1), 1.0);
+                add_row(&mut run, row(y + k.lo), -1.0);
+            }
+        }
+    });
 }
 
 /// Radial blur around `center`: `spin` (degrees) or zoom (`amount` as a fraction of distance).
@@ -311,6 +499,79 @@ mod tests {
         assert!(fade.get(0, 0)[3] < 0.9);
         let kept = directional_blur(&img, 142.0, 20.0, true);
         assert!(kept.data.iter().all(|p| (p[3] - 1.0).abs() < 1e-5));
+    }
+
+    fn noisy(w: u32, h: u32) -> Image {
+        let mut img = Image::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let a = if (x * 5 + y * 3) % 13 < 3 { 0.0 } else { crate::hash_noise(x, y, 7) };
+                img.set(x, y, [crate::hash_noise(x, y, 8) * a, 0.6 * a, crate::hash_noise(x, y, 9) * 4.0 * a, a]);
+            }
+        }
+        img
+    }
+
+    fn assert_close(a: &Image, b: &Image, what: &str) {
+        for (i, (p, q)) in a.data.iter().zip(&b.data).enumerate() {
+            for c in 0..4 {
+                assert!((p[c] - q[c]).abs() <= 2e-5 * q[c].abs().max(1.0), "{what} px {i}: {p:?} vs {q:?}");
+            }
+        }
+    }
+
+    /// The axis-aligned Directional Blur path equals the per-pixel bilinear sampling it replaces
+    /// (kept as `directional_blur_sampled`) to float rounding, at whole, fractional, sub-pixel
+    /// and long lengths, both edge modes and every axis direction.
+    #[test]
+    fn directional_axis_path_matches_sampled() {
+        let img = noisy(37, 29);
+        for angle in [0.0, 90.0, 180.0, 270.0, 360.0, -90.0, 450.0] {
+            for length in [0.5f64, 0.75, 1.0, 1.5, 2.0, 3.3, 7.0, 10.0, 17.25, 40.0, 127.6, 200.0, 333.0] {
+                for repeat in [false, true] {
+                    let n = (length.ceil() as usize * 2 + 1).clamp(3, 257);
+                    let fast = directional_blur_axis(&img, angle, length, n, repeat).expect("axis angle");
+                    let slow = directional_blur_sampled(&img, angle, length, n, repeat);
+                    assert_close(&fast, &slow, &format!("angle {angle} length {length} repeat {repeat}"));
+                }
+            }
+        }
+        assert!(directional_blur_axis(&img, 45.0, 10.0, 21, false).is_none());
+        assert!(directional_blur_axis(&img, 90.5, 10.0, 21, false).is_none());
+        assert!(directional_blur_axis(&img, f64::NAN, 10.0, 21, false).is_none());
+    }
+
+    /// Degenerate inputs neither crash nor take the axis path wrongly. Regression: an infinite
+    /// length overflowed the sample count and the bilinear sample coordinates.
+    #[test]
+    fn directional_blur_degenerate_inputs() {
+        let img = noisy(5, 1);
+        assert_eq!(directional_blur(&img, 0.0, f64::INFINITY, true), img);
+        for (angle, length) in [(0.0, f64::INFINITY), (90.0, f64::NAN), (90.0, 1e12), (0.0, 1e5), (f64::NAN, 4.0), (33.0, 1e300)] {
+            let out = directional_blur(&img, angle, length, true);
+            assert_eq!(out.data.len(), img.data.len());
+        }
+        let empty = Image::new(0, 4);
+        assert!(directional_blur(&empty, 90.0, 10.0, false).data.is_empty());
+        let one = noisy(1, 1);
+        let slow = directional_blur_sampled(&one, 0.0, 6.0, 13, true);
+        assert_close(&directional_blur(&one, 0.0, 6.0, true), &slow, "1x1");
+    }
+
+    /// Rough timing: `cargo test -p effectcraft-raster --release --lib blur_timing -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn blur_timing() {
+        let img = noisy(1920, 1080);
+        for (angle, length) in [(0.0, 20.0f64), (90.0, 20.0), (90.0, 100.0), (0.0, 100.0)] {
+            let n = (length.ceil() as usize * 2 + 1).clamp(3, 257);
+            let t = std::time::Instant::now();
+            let _ = directional_blur_sampled(&img, angle, length, n, false);
+            let slow = t.elapsed();
+            let t = std::time::Instant::now();
+            let _ = directional_blur(&img, angle, length, false);
+            eprintln!("directional {angle} deg len {length}: {slow:?} -> {:?}", t.elapsed());
+        }
     }
 
     #[test]
