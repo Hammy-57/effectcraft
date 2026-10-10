@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use effectcraft_raster::AuxChannels;
-use effectcraft_raster::channels3d::BACKGROUND_DEPTH;
+use effectcraft_raster::channels3d::{BACKGROUND_DEPTH, split_channel};
 
 fn is_depth(name: &str) -> bool {
     let last = name.rsplit('.').next().unwrap_or(name);
@@ -94,13 +94,23 @@ pub fn read_exr_channels(bytes: &[u8]) -> Option<AuxChannels> {
     Some(aux)
 }
 
-/// The picture of a multi-layer OpenEXR file without an unnamed RGB layer (Blender's
-/// `ViewLayer.Combined.R`, Nuke's `beauty.R`, …), which the image decoder rejects: its colour
-/// layer (preferring one named combined, beauty or rgba), else its first channel as grey.
-/// Linear, straight RGBA as the file stores it. `None` when it is not a readable EXR.
-pub fn layered_image(bytes: &[u8]) -> Option<image::DynamicImage> {
-    let aux = read_exr_channels(bytes)?;
-    let layers = aux.layers();
+/// Names of the beauty pass, most preferred first, matched against the last part of a layer's
+/// name (Blender's `ViewLayer.Combined` is `Combined`): Blender's Combined pass and its
+/// compositor's File Output default `Image`, the beauty / rgba / rgb / color of Nuke, Arnold and
+/// V-Ray.
+const BEAUTY: [&str; 7] = ["combined", "beauty", "image", "rgba", "rgb", "color", "colour"];
+
+/// A data pass, never the picture: Cryptomatte (`CryptoMaterial00`), depth, mist, normals,
+/// motion vectors, positions, UVs and object / material indices.
+fn is_data_layer(layer: &str) -> bool {
+    let last = layer.rsplit('.').next().unwrap_or(layer).to_ascii_lowercase();
+    last.starts_with("crypto")
+        || ["z", "uv", "id", "mist", "indexob", "indexma"].contains(&last.as_str())
+        || ["depth", "normal", "vector", "position", "velocity", "motion", "objectid", "materialid"].iter().any(|k| last.contains(k))
+}
+
+/// The layer whose colour a multi-layer file shows (see [`layered_image`]).
+fn picture_layer<'a>(aux: &AuxChannels, layers: &[&'a str]) -> Option<&'a str> {
     // Colour layers: three different channels (not one channel, such as depth, shown in all).
     let rgb: Vec<&str> = layers
         .iter()
@@ -110,13 +120,33 @@ pub fn layered_image(bytes: &[u8]) -> Option<image::DynamicImage> {
             !r.is_empty() && !g.is_empty() && !b.is_empty() && r != g
         })
         .collect();
-    let colour = rgb
-        .iter()
-        .find(|l| ["combined", "beauty", "rgba"].iter().any(|k| l.to_ascii_lowercase().contains(k)))
+    let last = |l: &str| l.rsplit('.').next().unwrap_or(l).to_ascii_lowercase();
+    let pictures = || rgb.iter().filter(|l| !is_data_layer(l));
+    // The unnamed layer (plain R, G, B), then the beauty pass by name.
+    rgb.iter()
+        .find(|l| l.is_empty())
+        .or_else(|| BEAUTY.iter().find_map(|k| rgb.iter().find(|l| last(l) == *k)))
+        .or_else(|| pictures().find(|l| ["combined", "beauty"].iter().any(|k| last(l).contains(k))))
+        .or_else(|| pictures().next())
+        .or_else(|| layers.iter().find(|l| !is_data_layer(l)))
         .or_else(|| rgb.first())
-        .or_else(|| layers.first())?;
+        .or_else(|| layers.first())
+        .copied()
+}
+
+/// The picture of a multi-layer OpenEXR file without an unnamed RGB layer (Blender's
+/// `ViewLayer.Combined.R`, the compositor's `Image.R`, Nuke's `beauty.R`, …), which the image
+/// decoder rejects. After Effects shows a file's main RGBA channels and leaves the other layers
+/// to EXtractoR; here that is the beauty pass by name ([`BEAUTY`]), else the first colour layer
+/// that is not a data pass (never Cryptomatte, depth or normals, #412), else the first channel
+/// as grey. Linear, straight RGBA as the file stores it. `None` when it is not a readable EXR.
+pub fn layered_image(bytes: &[u8]) -> Option<image::DynamicImage> {
+    let aux = read_exr_channels(bytes)?;
+    let layers = aux.layers();
+    let colour = picture_layer(&aux, &layers)?;
     let names = aux.layer_rgba(colour);
-    let first = aux.channels.first().map(|(n, _)| n.as_str()).unwrap_or_default();
+    // A layer without R, G and B channels shows its first channel as grey.
+    let first = aux.names().into_iter().find(|n| split_channel(n).0 == colour).unwrap_or_default();
     let plane = |k: usize| -> Option<&[f32]> { aux.get(names.get(k).map(String::as_str).filter(|n| !n.is_empty()).unwrap_or(first)) };
     let (r, g, b) = (plane(0)?, plane(1)?, plane(2)?);
     let a = names.get(3).filter(|n| !n.is_empty()).and_then(|n| aux.get(n));
@@ -212,5 +242,50 @@ mod tests {
         let aux = read_exr_channels(&b).unwrap();
         assert_eq!(aux.layers(), ["depth", "diffuse"]);
         assert_eq!(aux.layer_rgba("diffuse"), ["diffuse.R", "diffuse.G", "diffuse.B", ""].map(String::from));
+    }
+
+    /// Straight RGBA of [`layered_image`] at pixel 0 for a file of single-value channels.
+    fn picture<S: AsRef<str>>(channels: &[(S, f32)]) -> Vec<f32> {
+        use exr::prelude::*;
+        let (w, h) = (2usize, 2usize);
+        let list: Vec<AnyChannel<FlatSamples>> = channels.iter().map(|(n, v)| AnyChannel::new(n.as_ref(), FlatSamples::F32(vec![*v; w * h]))).collect();
+        let image = Image::from_layer(Layer::new((w, h), LayerAttributes::default(), Encoding::FAST_LOSSLESS, AnyChannels::sort(list.into())));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image.write().to_buffered(&mut bytes).unwrap();
+        let img = layered_image(bytes.get_ref()).unwrap().to_rgba32f();
+        img.get_pixel(0, 0).0.to_vec()
+    }
+
+    /// #412: a Blender compositor File Output (multilayer) names its beauty pass `Image`, and its
+    /// Cryptomatte layers (lowercase `r, g, b, a`) sort first. The picture was CryptoMaterial00;
+    /// it is the Image layer, and data passes are never the picture.
+    #[test]
+    fn layered_exr_shows_the_beauty_pass_not_cryptomatte() {
+        let mut blender = vec![];
+        for layer in ["CryptoMaterial00", "CryptoMaterial01", "CryptoMaterial02"] {
+            blender.extend(["r", "g", "b", "a"].map(|c| (format!("{layer}.{c}"), 0.9)));
+        }
+        for (layer, v) in [("GlossCol", 0.3), ("GlossDir", 0.4), ("Image", 0.5), ("VolDir", 0.6)] {
+            blender.extend(["R", "G", "B", "A"].map(|c| (format!("{layer}.{c}"), v)));
+        }
+        blender.push(("Mist.Z".into(), 0.7));
+        assert_eq!(picture(&blender), [0.5; 4], "the Image layer");
+        // Blender's render-layer names and Nuke's beauty.
+        assert_eq!(
+            picture(&[
+                ("ViewLayer.CryptoObject00.r", 0.9),
+                ("ViewLayer.CryptoObject00.g", 0.9),
+                ("ViewLayer.CryptoObject00.b", 0.9),
+                ("ViewLayer.Combined.R", 0.2),
+                ("ViewLayer.Combined.G", 0.2),
+                ("ViewLayer.Combined.B", 0.2)
+            ]),
+            [0.2, 0.2, 0.2, 1.0]
+        );
+        // No beauty name: the first colour layer that isn't a data pass.
+        let no_beauty: Vec<(String, f32)> = blender.iter().filter(|(n, _)| !n.starts_with("Image")).cloned().collect();
+        assert_eq!(picture(&no_beauty), [0.3; 4], "GlossCol, not Cryptomatte");
+        // Only data and a grey pass: the grey pass, not depth.
+        assert_eq!(picture(&[("Depth.Z", 9.0), ("AO.Y", 0.25)]), [0.25, 0.25, 0.25, 1.0]);
     }
 }

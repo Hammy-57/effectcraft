@@ -99,6 +99,34 @@ impl FxHost<'_, '_, '_> {
     }
 }
 
+/// The comp's camera and first light relative to `layer`, in its layer pixels (see
+/// [`EffectHost::comp_scene`]): the comp camera's view of the layer (as if 3D at its transform),
+/// brought back into the layer's own pixel grid through the inverse of how the layer itself
+/// composites.
+pub(crate) fn comp_scene(ctx: &EvalCtx, layer: &Layer) -> Option<effectcraft_effects::CompScene> {
+    let world = ctx.world_matrix(layer);
+    let (cam, _, _) = ctx.camera();
+    let p = (cam * world).0;
+    let back = ctx.layer_to_comp(layer).0.inverse()?.0;
+    let rows = [p[0], p[1], p[3]];
+    let camera: [[f64; 4]; 3] = std::array::from_fn(|i| std::array::from_fn(|j| (0..3).map(|k| back[i][k] * rows[k][j]).sum()));
+    let inv = world.inverse();
+    let light = three_d::light::lights_at(ctx).first().and_then(|l| {
+        let inv = inv.as_ref()?;
+        let pos = inv.apply(l.pos);
+        let dir = inv.apply_vec(l.dir);
+        let len = (dir.x * dir.x + dir.y * dir.y + dir.z * dir.z).sqrt().max(1e-12);
+        let kind = match l.kind {
+            effectcraft_project::LightKind::Parallel => 0,
+            effectcraft_project::LightKind::Ambient => 2,
+            _ => 1,
+        };
+        Some(effectcraft_effects::CompLight { pos: [pos.x, pos.y, pos.z], dir: [dir.x / len, dir.y / len, dir.z / len], color: l.color, kind })
+    });
+    let camera_layer = ctx.comp.active_camera(ctx.time).is_some();
+    Some(effectcraft_effects::CompScene { camera: Some(camera), camera_layer, light })
+}
+
 /// Nesting limit for effects that render layers (other layers, other times).
 const MAX_FX_DEPTH: usize = 8;
 
@@ -179,28 +207,7 @@ impl EffectHost for FxHost<'_, '_, '_> {
     }
 
     fn comp_scene(&self) -> Option<effectcraft_effects::CompScene> {
-        // The comp camera's view of the layer (as if 3D at its transform), brought back into the
-        // layer's own pixel grid through the inverse of how the layer itself composites.
-        let world = self.ctx.world_matrix(self.layer);
-        let (cam, _, _) = self.ctx.camera();
-        let p = (cam * world).0;
-        let back = self.ctx.layer_to_comp(self.layer).0.inverse()?.0;
-        let rows = [p[0], p[1], p[3]];
-        let camera: [[f64; 4]; 3] = std::array::from_fn(|i| std::array::from_fn(|j| (0..3).map(|k| back[i][k] * rows[k][j]).sum()));
-        let inv = world.inverse();
-        let light = three_d::light::lights_at(self.ctx).first().and_then(|l| {
-            let inv = inv.as_ref()?;
-            let pos = inv.apply(l.pos);
-            let dir = inv.apply_vec(l.dir);
-            let len = (dir.x * dir.x + dir.y * dir.y + dir.z * dir.z).sqrt().max(1e-12);
-            let kind = match l.kind {
-                effectcraft_project::LightKind::Parallel => 0,
-                effectcraft_project::LightKind::Ambient => 2,
-                _ => 1,
-            };
-            Some(effectcraft_effects::CompLight { pos: [pos.x, pos.y, pos.z], dir: [dir.x / len, dir.y / len, dir.z / len], color: l.color, kind })
-        });
-        Some(effectcraft_effects::CompScene { camera: Some(camera), light }.rebased(self.origin))
+        Some(comp_scene(self.ctx, self.layer)?.rebased(self.origin))
     }
 
     fn layer_at(&self, id: u64, comp_time: f64, masks_and_effects: bool) -> Option<LayerPixels> {
@@ -758,18 +765,21 @@ impl<'a> Renderer<'a> {
         Region::Full
     }
 
-    /// Rasterisation scale of a layer's source: the output scale, or — for Continuously
-    /// Rasterize text and shape layers — the output scale times the layer's on-screen scale
-    /// (quarter-octave steps, rounded up, so vector content is drawn at its final size and
-    /// stays sharp when scaled up).
+    /// Rasterisation scale of a layer's source: the output scale, or — for text layers, which are
+    /// always continuously rasterised, and Continuously Rasterize shape layers and vector footage —
+    /// the output scale times the layer's on-screen scale (quarter-octave steps, rounded up, so
+    /// vector content is drawn at its final size and stays sharp when scaled up).
     pub fn raster_scale(&self, ctx: &EvalCtx, layer: &Layer) -> f64 {
         let s = self.opts.scale;
-        let vector = match layer.source {
-            LayerSource::Text | LayerSource::Shape => true,
-            LayerSource::Footage { item } => matches!(self.project.item(item).map(|i| &i.kind), Some(ItemKind::Footage(f)) if is_vector_footage(f)),
+        let continuous = match layer.source {
+            LayerSource::Text => true,
+            LayerSource::Shape => layer.switches.collapse,
+            LayerSource::Footage { item } => {
+                layer.switches.collapse && matches!(self.project.item(item).map(|i| &i.kind), Some(ItemKind::Footage(f)) if is_vector_footage(f))
+            }
             _ => false,
         };
-        if !layer.switches.collapse || !vector {
+        if !continuous {
             return s;
         }
         let (l2c, _) = ctx.layer_to_comp(layer);
@@ -782,7 +792,10 @@ impl<'a> Renderer<'a> {
         if !k.is_finite() || k <= 1e-6 {
             return s;
         }
-        let mut k = 2f64.powf((k.log2() * 4.0).ceil() / 4.0).clamp(1.0 / 16.0, 64.0);
+        // The step is rounded up past rounding noise only: an unscaled layer whose position isn't
+        // a whole number maps the unit vectors to lengths a hair over 1, which must stay 1 (#390:
+        // rounded up to 2^¼, unscaled text was drawn larger and resampled, softer).
+        let mut k = 2f64.powf((k.log2() * 4.0 - 1e-6).ceil() / 4.0).clamp(1.0 / 16.0, 64.0);
         // Keep the buffer within about 16 million pixels.
         if let Some(b) = content_bounds(ctx, layer) {
             let area = ((b[2] - b[0]) * (b[3] - b[1])).max(1.0) * s * s;
@@ -1173,7 +1186,7 @@ impl<'a> Renderer<'a> {
                     let k = self.raster_scale(ctx, layer);
                     if let Some(img) = self.footage.vector_frame(*item, f, k) {
                         let mut buf = Buf { img: (*img).clone(), offset: [0.0; 2], scale: k };
-                        if let Some(c) = self.pipe.media_in(f.color_profile) {
+                        if let Some(c) = self.pipe.media_in(f) {
                             color::convert(&mut buf.img, &c);
                         }
                         return Some(buf);
@@ -1211,7 +1224,7 @@ impl<'a> Renderer<'a> {
         } else {
             Buf { img: img.clone(), offset: [0.0; 2], scale: 1.0 / k }
         };
-        if let Some(c) = self.pipe.media_in(f.color_profile) {
+        if let Some(c) = self.pipe.media_in(f) {
             color::convert(&mut buf.img, &c);
         }
         buf
@@ -1240,7 +1253,7 @@ impl<'a> Renderer<'a> {
             return Some(Arc::new(interpret_pixels(&field_frame(&img, parity), f)));
         }
         let img = self.footage_frame_raw(ctx, layer, item, f, t)?;
-        if f.invert_alpha || f.linear_light { Some(Arc::new(interpret_pixels(&img, f))) } else { Some(img) }
+        if f.invert_alpha || f.linear_light_applies() { Some(Arc::new(interpret_pixels(&img, f))) } else { Some(img) }
     }
 
     fn footage_frame_raw(&self, ctx: &EvalCtx, layer: &Layer, item: ItemId, f: &Footage, t: Tick) -> Option<Arc<Image>> {
@@ -2242,7 +2255,8 @@ pub fn field_frame(img: &Image, parity: usize) -> Image {
 /// Interpret Footage ▸ Invert Alpha and Interpret As Linear Light on decoded (premultiplied)
 /// pixels.
 pub fn interpret_pixels(img: &Image, f: &Footage) -> Image {
-    if !f.invert_alpha && !f.linear_light {
+    let linear = f.linear_light_applies();
+    if !f.invert_alpha && !linear {
         return img.clone();
     }
     let space = f.color_profile.unwrap_or(effectcraft_color::ColorSpace::Srgb);
@@ -2250,7 +2264,7 @@ pub fn interpret_pixels(img: &Image, f: &Footage) -> Image {
     for p in out.data.iter_mut() {
         let a = p[3];
         let mut c = if a > 1e-6 { [p[0] / a, p[1] / a, p[2] / a] } else { [0.0; 3] };
-        if f.linear_light {
+        if linear {
             // The file's values are linear light: encode them like the rest of the footage.
             c = c.map(|v| space.encode(v));
         }

@@ -17,7 +17,7 @@
 //!   pixels to their parent). Without a working space the sRGB curve is used.
 
 use effectcraft_color::{ColorSpace, Conversion};
-use effectcraft_project::{HdrMode, ProjectSettings};
+use effectcraft_project::{Footage, HdrMode, ProjectSettings};
 use effectcraft_raster::Image;
 use rayon::prelude::*;
 
@@ -57,10 +57,11 @@ impl Pipe {
         self.space.unwrap_or(ColorSpace::Srgb)
     }
 
-    /// Footage with colour profile `profile` (`None` = sRGB) → working space.
-    pub fn media_in(&self, profile: Option<ColorSpace>) -> Option<Conversion> {
-        let ws = self.space?;
-        Conversion::new(profile.unwrap_or(ColorSpace::Srgb), false, ws, self.linear)
+    /// Footage `f` from its colour profile (`None` = sRGB) → working space; nothing for
+    /// Preserve RGB, whose values enter the working space as the file stores them.
+    pub fn media_in(&self, f: &Footage) -> Option<Conversion> {
+        let ws = self.space.filter(|_| !f.preserve_rgb)?;
+        Conversion::new(f.color_profile.unwrap_or(ColorSpace::Srgb), false, ws, self.linear)
     }
 
     /// Authored colours (solids, text, shapes) → working space: linearised in a linear working

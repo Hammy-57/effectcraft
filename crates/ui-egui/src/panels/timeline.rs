@@ -118,14 +118,26 @@ fn keys_in_box(comp: &Comp, rows: &[Row], top: f32, rh: f32, tm: TMap, br: Rect)
 /// Row height (expression editors grow with their text).
 fn row_height(row: &Row, rh: f32) -> f32 {
     match row.kind {
-        RowKind::Expr { lines, .. } => rh * lines.clamp(1, 8) as f32 + 6.0,
+        RowKind::Expr { lines, .. } => rh * lines as f32 + 6.0,
         RowKind::Waveform { .. } => rh * 3.0,
         _ => rh,
     }
 }
 
-/// Insert an expression editor row after every property that has an expression.
-fn with_expr_rows(rows: Vec<Row>, comp: &Comp, closed: &std::collections::BTreeSet<u64>) -> Vec<Row> {
+/// An inline expression editor grows with its text up to this many lines (After Effects)...
+const EXPR_AUTO_LINES: usize = 8;
+/// ...and its bottom edge drags it up to this many.
+const EXPR_MAX_LINES: usize = 100;
+
+/// The text of the expression being edited (while its editor has the keyboard).
+fn expr_buf_id(prop: u64) -> egui::Id {
+    egui::Id::new(("expr-buf", prop))
+}
+
+/// Insert an expression editor row after every property that has an expression: as many lines
+/// as its text (the text being edited, so it grows while typing), up to 8, or the height its
+/// bottom edge was dragged to.
+fn with_expr_rows(rows: Vec<Row>, comp: &Comp, tl: &crate::state::TimelineState, ctx: &egui::Context) -> Vec<Row> {
     let mut out = Vec::with_capacity(rows.len());
     // Rows come grouped by layer: look each layer up once (a linear search per property row
     // made twirling open many layers of a big comp quadratic).
@@ -133,15 +145,17 @@ fn with_expr_rows(rows: Vec<Row>, comp: &Comp, closed: &std::collections::BTreeS
     for r in rows {
         let mut extra = None;
         if let RowKind::Prop { uid } = r.kind
-            && !closed.contains(&uid)
+            && !tl.expr_closed.contains(&uid)
         {
             if cur.is_none_or(|l| l.id != r.layer) {
                 cur = comp.layer(r.layer);
             }
-            extra = cur.and_then(|l| l.props.find(uid)).and_then(|p| p.expr.as_ref()).map(|e| Row {
-                layer: r.layer,
-                depth: r.depth,
-                kind: RowKind::Expr { uid, lines: e.text.lines().count().max(1) },
+            extra = cur.and_then(|l| l.props.find(uid)).and_then(|p| p.expr.as_ref()).map(|e| {
+                let lines = tl.expr_lines.get(&uid).copied().unwrap_or_else(|| {
+                    let edited = ctx.data(|d| d.get_temp::<String>(expr_buf_id(uid)));
+                    edited.as_deref().unwrap_or(&e.text).split('\n').count().min(EXPR_AUTO_LINES)
+                });
+                Row { layer: r.layer, depth: r.depth, kind: RowKind::Expr { uid, lines: lines.clamp(1, EXPR_MAX_LINES) } }
             });
         }
         out.push(r);
@@ -150,11 +164,76 @@ fn with_expr_rows(rows: Vec<Row>, comp: &Comp, closed: &std::collections::BTreeS
     out
 }
 
-/// A pick-whip drag in progress: (parent = 0 / property = 1, layer, prop uid, start point).
+/// A pick-whip drag in progress: (kind, layer, prop uid, start point). The kinds are the
+/// layer's parent pick whip, an expression's and a property's (Parent & Link column).
 type PickWhip = (u8, u64, u64, Pos2);
+const WHIP_PARENT: u8 = 0;
+const WHIP_EXPR: u8 = 1;
+const WHIP_PROP: u8 = 2;
 
 fn pick_whip_id() -> egui::Id {
     egui::Id::new("tl-pickwhip")
+}
+
+/// A pick whip at `rect`: dragging it starts a pick whip of `kind` from `layer`'s `prop` (0 for
+/// the layer's own), drawn and dropped at the end of [`show`].
+#[allow(clippy::too_many_arguments)]
+fn pick_whip(
+    app: &mut EffectcraftApp,
+    ui: &egui::Ui,
+    p: &egui::Painter,
+    rect: Rect,
+    (kind, layer, prop): (u8, u64, u64),
+    auto: &str,
+    label: &str,
+    hint: &str,
+) -> egui::Response {
+    let resp = ui.interact(rect, egui::Id::new(("pick-whip", kind, layer, prop)), Sense::drag()).on_hover_text(hint);
+    icons::paint(p, rect.shrink(1.0), Icon::PickWhip, if resp.hovered() || resp.dragged() { app.tokens.text } else { app.tokens.text_dim });
+    app.auto.add(auto, rect, label);
+    if resp.drag_started() {
+        let state: PickWhip = (kind, layer, prop, rect.center());
+        ui.ctx().data_mut(|d| d.insert_temp(pick_whip_id(), state));
+    }
+    resp
+}
+
+/// Properties shown outside the Timeline (Effect Controls) that a pick whip can be dropped on:
+/// (row, layer, prop uid, its value fields per dimension), and the pass they were shown in.
+type WhipTargets = (u64, Vec<(Rect, u64, u64, Vec<Rect>)>);
+
+fn whip_targets_id() -> egui::Id {
+    egui::Id::new("tl-pickwhip-targets")
+}
+
+/// While a pick whip is being dragged, `layer`'s property `prop` shown at `row` in another panel
+/// is a target too; `dims` are its value fields, one per dimension.
+pub(crate) fn whip_target(ctx: &egui::Context, row: Rect, layer: u64, prop: u64, dims: Vec<Rect>) {
+    if ctx.data(|d| d.get_temp::<PickWhip>(pick_whip_id())).is_none() {
+        return;
+    }
+    let pass = ctx.cumulative_pass_nr();
+    ctx.data_mut(|d| {
+        let targets = d.get_temp_mut_or_default::<WhipTargets>(whip_targets_id());
+        if targets.0 != pass {
+            *targets = (pass, vec![]);
+        }
+        targets.1.push((row, layer, prop, dims));
+    });
+}
+
+/// Autoscroll speed (points per second, up negative) of a drag held at height `y` within
+/// `zone` of the top or bottom edge of `rows`, or past it: faster the deeper.
+fn edge_scroll_speed(rows: Rect, y: f32, zone: f32) -> f32 {
+    let zone = zone.min(rows.height() / 2.0).max(1.0);
+    let depth = if y < rows.min.y + zone {
+        y - (rows.min.y + zone)
+    } else if y > rows.max.y - zone {
+        y - (rows.max.y - zone)
+    } else {
+        return 0.0;
+    };
+    (depth / zone).clamp(-3.0, 3.0) * 400.0
 }
 
 /// The text of an expression being edited when its pick whip was pressed, and the selection in
@@ -1189,9 +1268,16 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let tc_rect = Rect::from_min_size(pos2(rect.min.x + 12.0, top + 6.0), vec2(150.0, 24.0));
     let tc_resp = ui.interact(tc_rect, egui::Id::new("tl-timecode"), Sense::click_and_drag());
     p.text(tc_rect.left_center(), Align2::LEFT_CENTER, &tc, Tokens::semibold(16.0), t.timecode);
-    let sub = format!("{:05} ({:.2} fps)", fr.frame_at(time) + app.session.project.settings.frame_start, fr.as_f64());
-    p.text(pos2(tc_rect.min.x, tc_rect.max.y + 8.0), Align2::LEFT_CENTER, sub, Tokens::ui(10.5), t.text_faint);
+    // Under it the other style (frames under timecode, timecode under frames) and the rate.
+    let settings = &app.session.project.settings;
+    let other = if settings.time_display == effectcraft_engine::project::TimeDisplayStyle::Timecode {
+        format!("{:05}", fr.frame_at(time) + settings.frame_start)
+    } else {
+        effectcraft_engine::time::format_timecode_ae(fr.frame_at(time + comp.display_start), fr, false)
+    };
+    p.text(pos2(tc_rect.min.x, tc_rect.max.y + 8.0), Align2::LEFT_CENTER, format!("{other} ({:.2} fps)", fr.as_f64()), Tokens::ui(10.5), t.text_faint);
     app.auto.add("timeline.timecode", tc_rect, &tc);
+    super::toggle_time_display(app, &tc_resp);
     if tc_resp.dragged() {
         let d = tc_resp.drag_delta().x as f64;
         let f = fr.frame_at(time) + (d * 0.5).round() as i64;
@@ -1569,7 +1655,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let _ = cw.end;
 
     // ---- rows.
-    let rows = with_expr_rows(build_rows(app, &comp), &comp, &app.ui.timeline.expr_closed);
+    let rows = with_expr_rows(build_rows(app, &comp), &comp, &app.ui.timeline, &ctx);
     let rh = t.row_h;
     let total_h: f32 = rows.iter().map(|r| row_height(r, rh)).sum();
     let max_scroll = (total_h - rows_rect.height() + rh).max(0.0);
@@ -1593,7 +1679,18 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             }
         }
     }
-    app.ui.timeline.scroll_y = app.ui.timeline.scroll_y.min(max_scroll);
+    // A pick whip held near the top or bottom of the layers (or past it) scrolls them, as in
+    // After Effects.
+    if ctx.data(|d| d.get_temp::<PickWhip>(pick_whip_id())).is_some()
+        && let Some(ptr) = ctx.input(|i| i.pointer.latest_pos()).filter(|p| rect.x_range().contains(p.x))
+    {
+        let speed = edge_scroll_speed(rows_rect, ptr.y, rh);
+        if speed != 0.0 {
+            app.ui.timeline.scroll_y += speed * ctx.input(|i| i.stable_dt).min(0.1);
+            ctx.request_repaint();
+        }
+    }
+    app.ui.timeline.scroll_y = app.ui.timeline.scroll_y.clamp(0.0, max_scroll);
     let snap_project = app.session.project.clone();
     let snap_expr = app.session.expr.clone();
     let ectx = EvalCtx { project: &snap_project, comp_id: cid, comp: &comp, time, expr: snap_expr.as_deref(), footage: None };
@@ -1625,6 +1722,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let box_keys = key_box.map(|br| keys_in_box(&comp, &rows, rows_rect.min.y - app.ui.timeline.scroll_y, rh, tm, br));
     let key_preview = box_keys.as_ref().map(|in_box| super::graph_tools::marquee_selection(&sel_keys, in_box, ui.input(|i| i.modifiers)));
     let mut hit_rows: Vec<(Rect, Row)> = vec![];
+    // The value fields of multi-dimension properties (per dimension), for the pick whip.
+    let mut dim_hits: Vec<(u64, Vec<Rect>)> = vec![];
     for (ri, row) in rows.iter().enumerate() {
         // Outline widgets never spill into the time graph (narrow timelines).
         ui.set_clip_rect(left_clip);
@@ -1706,6 +1805,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 if let Some((rl, mut buf)) = renaming.filter(|(rl, _)| *rl == layer.id.0) {
                     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(name_rect.shrink2(vec2(0.0, 2.0))));
                     let er = child.add(egui::TextEdit::singleline(&mut buf).font(Tokens::ui(12.0)).desired_width(name_rect.width()));
+                    app.auto.add(&format!("timeline.layer.{rl}.nameEdit"), er.rect, &buf);
                     if ctx.data_mut(|d| d.remove_temp::<bool>(rename_focus_id())).unwrap_or(false) {
                         // Just started: focus the field with the whole name selected.
                         er.request_focus();
@@ -1856,16 +1956,16 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 }
                 // Parent.
                 if vis.parent {
-                    let pw_rect = Rect::from_center_size(pos2(cw.parent + 9.0, cy), vec2(15.0, 15.0));
-                    let pw = ui
-                        .interact(pw_rect, egui::Id::new(("parent-whip", layer.id.0)), Sense::drag())
-                        .on_hover_text(crate::i18n::tr("Parent pick whip: drag onto a layer"));
-                    icons::paint(&lp, pw_rect.shrink(1.0), Icon::PickWhip, if pw.hovered() || pw.dragged() { t.text } else { t.text_dim });
-                    app.auto.add(&format!("timeline.layer.{}.pickWhip", layer.id.0), pw_rect, "Parent pick whip");
-                    if pw.drag_started() {
-                        let pw_state: PickWhip = (0, layer.id.0, 0, pw_rect.center());
-                        ctx.data_mut(|d| d.insert_temp(pick_whip_id(), pw_state));
-                    }
+                    pick_whip(
+                        app,
+                        ui,
+                        &lp,
+                        Rect::from_center_size(pos2(cw.parent + 9.0, cy), vec2(15.0, 15.0)),
+                        (WHIP_PARENT, layer.id.0, 0),
+                        &format!("timeline.layer.{}.pickWhip", layer.id.0),
+                        "Parent pick whip",
+                        crate::i18n::tr("Parent pick whip: drag onto a layer"),
+                    );
                     let pr_rect = Rect::from_min_size(pos2(cw.parent + 20.0, cy - 9.0), vec2(94.0, 18.0));
                     let plabel = layer.parent.and_then(|p| comp.layer(p)).map(|l| format!("{}. {}", idx_of(l.id), l.name)).unwrap_or_else(|| "None".into());
                     let presp = widgets::dropdown(ui, pr_rect, &plabel, &t, egui::Id::new(("parent", layer.id.0)));
@@ -2133,6 +2233,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             RowKind::Expr { uid, lines } => {
                 let Some(prop) = layer.props.find(*uid) else { continue };
                 let Some(ex) = prop.expr.clone() else { continue };
+                let (buf_id, edit_id) = (expr_buf_id(*uid), egui::Id::new(("expr-edit", uid)));
                 lp.rect_filled(left, 0.0, t.row_alt);
                 let indent = cw.name + 6.0 + 14.0 * row.depth as f32;
                 lp.text(pos2(indent + 12.0, cy), Align2::LEFT_CENTER, crate::i18n::tr("Expression:"), Tokens::ui(11.5), t.text_dim);
@@ -2153,19 +2254,23 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 if en.clicked() {
                     actions.push(("prop.setExpression".into(), json!({"layer": layer.id.0, "prop": uid, "enabled": !ex.enabled})));
                 }
-                let pw_rect = Rect::from_center_size(pos2(cw.switches + 30.0, cy), vec2(15.0, 15.0));
-                let pw = ui
-                    .interact(pw_rect, egui::Id::new(("expr-whip", uid)), Sense::drag())
-                    .on_hover_text(crate::i18n::tr("Expression pick whip: drag onto a property"));
-                icons::paint(&lp, pw_rect.shrink(1.0), Icon::PickWhip, if pw.hovered() || pw.dragged() { t.text } else { t.text_dim });
-                app.auto.add(&format!("timeline.prop.{uid}.pickWhip"), pw_rect, "Expression pick whip");
+                let pw = pick_whip(
+                    app,
+                    ui,
+                    &lp,
+                    Rect::from_center_size(pos2(cw.switches + 30.0, cy), vec2(15.0, 15.0)),
+                    (WHIP_EXPR, layer.id.0, *uid),
+                    &format!("timeline.prop.{uid}.pickWhip"),
+                    "Expression pick whip",
+                    crate::i18n::tr("Expression pick whip: drag onto a property"),
+                );
                 if pw.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_pressed()) {
                     // Pressed while the expression is being edited (its text is buffered while
                     // the editor has the focus): the reference will go in at the cursor,
                     // replacing the selection (#284).
-                    let into = ctx.data(|d| d.get_temp::<String>(egui::Id::new(("expr-buf", uid)))).map(|buf| {
+                    let into = ctx.data(|d| d.get_temp::<String>(buf_id)).map(|buf| {
                         let n = buf.chars().count();
-                        let sel = egui::text_edit::TextEditState::load(&ctx, egui::Id::new(("expr-edit", uid)))
+                        let sel = egui::text_edit::TextEditState::load(&ctx, edit_id)
                             .and_then(|st| st.cursor.char_range())
                             .map_or([n, n], |r| [r.primary.index.0.min(r.secondary.index.0).min(n), r.primary.index.0.max(r.secondary.index.0).min(n)]);
                         (buf, sel)
@@ -2177,10 +2282,6 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                             d.remove::<WhipInto>(whip_into_id(*uid));
                         }
                     });
-                }
-                if pw.drag_started() {
-                    let pw_state: PickWhip = (1, layer.id.0, *uid, pw_rect.center());
-                    ctx.data_mut(|d| d.insert_temp(pick_whip_id(), pw_state));
                 }
                 // Syntax errors: warning in the outline (the expression is disabled).
                 if let Some(check) = app.session.expr_check
@@ -2212,8 +2313,6 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     }
                 });
                 if let Some(text) = picked {
-                    let edit_id = egui::Id::new(("expr-edit", uid));
-                    let buf_id = egui::Id::new(("expr-buf", uid));
                     let cur: String = ctx.data(|d| d.get_temp(buf_id)).unwrap_or_else(|| ex.text.clone());
                     let at = egui::text_edit::TextEditState::load(&ctx, edit_id)
                         .and_then(|st| st.cursor.char_range())
@@ -2230,8 +2329,6 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 ui.set_clip_rect(right_clip);
                 gp.rect_filled(Rect::from_min_max(pos2(graph_x0, r.min.y), r.max), 0.0, Color32::from_rgb(0x1a, 0x1a, 0x1a));
                 let er = Rect::from_min_max(pos2(graph_x0 + 8.0, r.min.y + 3.0), pos2(rect.max.x - 14.0, r.max.y - 3.0));
-                let buf_id = egui::Id::new(("expr-buf", uid));
-                let edit_id = egui::Id::new(("expr-edit", uid));
                 let mut buf: String = ctx.data(|d| d.get_temp(buf_id)).unwrap_or_else(|| ex.text.clone());
                 if let Some(after) = ctx.data_mut(|d| d.remove_temp::<usize>(expr_refocus_id(*uid))) {
                     // A pick whip just put a reference in: editing goes on in the new text,
@@ -2244,8 +2341,19 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 }
                 // Settings ▸ Scripting & Expressions ▸ Expressions Editor.
                 let sp = app.session.prefs.scripting.clone();
-                let resp = super::expr_editor::editor(ui, edit_id, &mut buf, er, &sp, if ex.enabled { expr_col } else { t.text_dim }, (*lines).clamp(1, 8), &t);
+                let resp = super::expr_editor::editor(ui, edit_id, &mut buf, er, &sp, if ex.enabled { expr_col } else { t.text_dim }, *lines, &t);
                 app.auto.add(&format!("timeline.prop.{uid}.expression"), er, &prop.name);
+                // Its bottom edge drags to set its height in whole lines, as in After Effects.
+                let edge = Rect::from_min_max(pos2(er.min.x, r.max.y - 4.0), pos2(er.max.x, r.max.y));
+                let eresp = ui.interact(edge, egui::Id::new(("expr-edge", uid)), Sense::drag());
+                app.auto.add(&format!("timeline.prop.{uid}.expressionHeight"), edge, "Expression field height");
+                if eresp.hovered() || eresp.dragged() {
+                    ctx.set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                }
+                if let Some(py) = eresp.interact_pointer_pos().filter(|_| eresp.dragged()).map(|p| p.y) {
+                    let n = ((py - r.min.y - 6.0) / rh).round().clamp(1.0, EXPR_MAX_LINES as f32);
+                    app.ui.timeline.expr_lines.insert(*uid, n as usize);
+                }
                 let commit = resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) && (i.modifiers.command || i.modifiers.ctrl));
                 if commit {
                     resp.surrender_focus();
@@ -2359,10 +2467,28 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 if name_resp.clicked() {
                     actions.push(("prop.select".into(), json!({"layer": layer.id.0, "prop": uid, "add": ui.input(|i| i.modifiers.shift)})));
                 }
+                name_resp.context_menu(|ui| prop_menu(ui, &mut app.auto, cid, layer, prop, &mut actions));
                 // Value editors.
                 let value = ectx.value(layer, prop);
                 let vx = (cw.switches + 4.0).max(name_x + 120.0);
-                value_editor(app, ui, &lp, layer, prop, &value, pos2(vx, cy), &mut actions);
+                let dims = value_editor(app, ui, &lp, layer, prop, &value, pos2(vx, cy), &mut actions);
+                if !dims.is_empty() {
+                    dim_hits.push((*uid, dims));
+                }
+                // The property pick whip (Parent & Link column, AE CC 2018 and later): dropped on
+                // a property it links this one to it, adding the expression if there is none.
+                if vis.parent && !prop.static_only {
+                    pick_whip(
+                        app,
+                        ui,
+                        &lp,
+                        Rect::from_center_size(pos2(cw.parent + 9.0, cy), vec2(15.0, 15.0)),
+                        (WHIP_PROP, layer.id.0, *uid),
+                        &format!("timeline.prop.{uid}.propertyPickWhip"),
+                        "Property pick whip",
+                        crate::i18n::tr("Property pick whip: drag onto a property"),
+                    );
+                }
                 ui.set_clip_rect(right_clip);
                 // Expression text row hint.
                 if let Some(e) = prop.expr.as_ref().filter(|e| e.enabled && app.ui.timeline.expr_closed.contains(uid)) {
@@ -2515,10 +2641,6 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 }
             }
         }
-        if !matches!(row.kind, RowKind::Layer) {
-            widgets::parameter_separator(&lp, left, &t);
-            widgets::parameter_separator(&gp, Rect::from_min_max(pos2(graph_x0, r.min.y), r.max), &t);
-        }
     }
     ui.set_clip_rect(full_clip);
     // The background responses sit below rows, bars and editors, preserving their menus.
@@ -2577,25 +2699,52 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             .collect();
         actions.push(("layer.select".into(), json!({"layers": layers, "add": ui.input(|i| i.modifiers.shift || i.modifiers.command)})));
     }
-    // Pick whips: a line follows the pointer; releasing over a row links to it.
+    // Pick whips: a line follows the pointer; releasing over a row links to it (an expression's
+    // or a property's, also over a property in Effect Controls).
     if let Some((kind, src_layer, src_prop, start)) = ctx.data(|d| d.get_temp::<PickWhip>(pick_whip_id())) {
         let ptr = ctx.input(|i| i.pointer.latest_pos()).unwrap_or(start);
         let fg = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("tl-pickwhip-line")));
         fg.line_segment([start, ptr], Stroke::new(1.5, t.accent));
         fg.circle_stroke(ptr, 4.0, Stroke::new(1.5, t.accent));
         let target = hit_rows.iter().find(|(r, _)| r.contains(ptr)).map(|(r, row)| (*r, row.clone()));
+        // Shown this pass or the last one (Effect Controls may draw after the Timeline).
+        let pass = ctx.cumulative_pass_nr();
+        let elsewhere = (target.is_none() && kind != WHIP_PARENT)
+            .then(|| ctx.data(|d| d.get_temp::<WhipTargets>(whip_targets_id())))
+            .flatten()
+            .filter(|(p, _)| p.saturating_add(1) >= pass)
+            .and_then(|(_, targets)| targets.into_iter().find(|(r, ..)| r.contains(ptr)));
         if let Some((tr, _)) = &target {
             fg.rect_stroke(Rect::from_min_max(tr.min, pos2(graph_x0 - 1.0, tr.max.y)), 0.0, Stroke::new(1.0, t.accent), StrokeKind::Inside);
+        } else if let Some((tr, ..)) = &elsewhere {
+            fg.rect_stroke(*tr, 0.0, Stroke::new(1.0, t.accent), StrokeKind::Inside);
         }
         if ctx.input(|i| !i.pointer.any_down()) {
-            ctx.data_mut(|d| d.remove::<PickWhip>(pick_whip_id()));
-            let into = (kind == 1).then(|| ctx.data_mut(|d| d.remove_temp::<WhipInto>(whip_into_id(src_prop)))).flatten();
-            match (kind, target) {
-                (0, Some((_, row))) if row.layer.0 != src_layer => {
+            ctx.data_mut(|d| {
+                d.remove::<PickWhip>(pick_whip_id());
+                d.remove::<WhipTargets>(whip_targets_id());
+            });
+            let into = (kind == WHIP_EXPR).then(|| ctx.data_mut(|d| d.remove_temp::<WhipInto>(whip_into_id(src_prop)))).flatten();
+            // The property dropped on, and the value (dimension) if on one of them: `position[0]`.
+            let dim = |fields: &[Rect]| fields.iter().position(|r| r.contains(ptr));
+            let prop_target = match (&target, elsewhere) {
+                (Some((_, Row { layer, kind: RowKind::Prop { uid }, .. })), _) => {
+                    Some((layer.0, *uid, dim_hits.iter().find(|(u, _)| u == uid).and_then(|(_, rs)| dim(rs))))
+                }
+                (None, Some((_, l, u, fields))) => Some((l, u, dim(&fields))),
+                _ => None,
+            };
+            match (kind, target, prop_target) {
+                (WHIP_PARENT, Some((_, row)), _) if row.layer.0 != src_layer => {
                     actions.push(("layer.setParent".into(), json!({"layers": [src_layer], "parent": row.layer.0})));
                 }
-                (1, Some((_, Row { layer, kind: RowKind::Prop { uid }, .. }))) if uid != src_prop => {
-                    let mut params = json!({"layer": src_layer, "prop": src_prop, "target": {"layer": layer.0, "prop": uid}});
+                // The property pick whip replaces the expression with the reference (or adds one),
+                // as the expression pick whip does when its expression isn't being edited.
+                (WHIP_EXPR | WHIP_PROP, _, Some((tl, tu, d))) if tu != src_prop => {
+                    let mut params = json!({"layer": src_layer, "prop": src_prop, "target": {"layer": tl, "prop": tu}});
+                    if let Some(d) = d {
+                        params["target"]["dimension"] = json!(d);
+                    }
                     if let Some((text, [a, b])) = into {
                         // Into the expression being edited, which goes on being edited.
                         params["expression"] = json!(text);
@@ -3278,6 +3427,43 @@ fn kind_name(k: MatteKind) -> &'static str {
     }
 }
 
+/// Is property `uid` the layer's Position (or, separated, its X, Y or Z Position)?
+pub(crate) fn is_position(layer: &Layer, uid: u64) -> bool {
+    layer.transform().is_some_and(|tr| ["position", "positionX", "positionY", "positionZ"].iter().any(|m| tr.get(m).is_some_and(|p| p.uid == uid)))
+}
+
+/// A property's context menu (right-click its name in the Timeline), as in After Effects.
+fn prop_menu(
+    ui: &mut egui::Ui,
+    auto: &mut crate::automation::Registry,
+    comp: ItemId,
+    layer: &Layer,
+    prop: &Property,
+    actions: &mut Vec<(String, serde_json::Value)>,
+) {
+    let (l, uid) = (layer.id.0, prop.uid);
+    let mut item = |ui: &mut egui::Ui, key: &str, label: &str, selected: bool, cmd: &str, params: serde_json::Value| {
+        let resp = ui.add(egui::Button::new(label).selected(selected));
+        auto.add(&format!("timeline.prop.{uid}.menu.{key}"), resp.rect, label);
+        if resp.clicked() {
+            actions.push((cmd.into(), params));
+            ui.close();
+        }
+    };
+    item(ui, "reset", "Reset", false, "prop.reset", json!({"layer": l, "prop": uid}));
+    if matches!(prop.value, Value::Scalar(_) | Value::Vec2(_) | Value::Vec3(_)) {
+        item(ui, "editValue", "Edit Value…", false, "prop.set", json!({"layer": l, "prop": uid}));
+    }
+    if is_position(layer, uid) {
+        let separated = layer.transform().is_some_and(|tr| tr.get("positionX").is_some());
+        item(ui, "separateDimensions", "Separate Dimensions", separated, "prop.separateDimensions", json!({"layer": l, "value": !separated}));
+    }
+    ui.separator();
+    let (key, label) = if prop.expr.is_some() { ("removeExpression", "Remove Expression") } else { ("addExpression", "Add Expression") };
+    item(ui, key, label, false, "prop.setExpression", json!({"layer": l, "prop": uid}));
+    item(ui, "essentialGraphics", "Add Property to Essential Graphics", false, "essential.addProperty", json!({"comp": comp.0, "layer": l, "prop": uid}));
+}
+
 fn layer_context_menu(resp: &egui::Response, layer: &Layer, actions: &mut Vec<(String, serde_json::Value)>) {
     resp.context_menu(|ui| layer_menu(ui, &[layer.id.0], actions));
 }
@@ -3367,7 +3553,8 @@ fn constrained(c: &[f64], d: usize, v: f64) -> Vec<f64> {
         .collect()
 }
 
-/// Inline value editor for a property row; pushes `prop.set` actions.
+/// Inline value editor for a property row; pushes `prop.set` actions. Returns the rects of a
+/// multi-dimension value's fields, one per dimension (none for other values).
 fn value_editor(
     app: &mut EffectcraftApp,
     ui: &mut egui::Ui,
@@ -3377,9 +3564,10 @@ fn value_editor(
     value: &Value,
     at: Pos2,
     actions: &mut Vec<(String, serde_json::Value)>,
-) {
+) -> Vec<Rect> {
     let t = app.tokens;
     let uid = prop.uid;
+    let mut dims = vec![];
     let merge = format!("scrub-{uid}");
     let set = |actions: &mut Vec<(String, serde_json::Value)>, v: serde_json::Value| {
         actions.push(("prop.set".into(), json!({"layer": layer.id.0, "prop": uid, "value": v, "merge": merge})))
@@ -3434,6 +3622,7 @@ fn value_editor(
                 let suffix = if pct && d + 1 == n { "%" } else { "" };
                 let (r, nv, _) = widgets::hot_number_at(ui, pos2(x, y), egui::Id::new(("v", uid, d)), c[d], if pct { 0.5 } else { 1.0 }, range, 1, suffix, &t);
                 app.auto.add(&format!("timeline.prop.{uid}.value.{d}"), r, &prop.name);
+                dims.push(r);
                 if let Some(nv) = nv {
                     let mut nc = c.clone();
                     // Alt edits one value of a linked pair.
@@ -3516,6 +3705,7 @@ fn value_editor(
             p.text(pos2(x, at.y), Align2::LEFT_CENTER, s.chars().take(30).collect::<String>(), Tokens::ui(12.0), t.text_dim);
         }
     }
+    dims
 }
 
 #[cfg(test)]

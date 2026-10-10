@@ -421,7 +421,7 @@ pub(crate) fn draw_frame(app: &mut EffectcraftApp, ctx: &egui::Context, painter:
         }
         comp_rect
     } else {
-        let Some((tex, k)) = app.viewer_tex.clone() else { return };
+        let Some((tex, k, minify)) = app.viewer_tex.clone() else { return };
         if k.comp != cid.0 {
             return;
         }
@@ -431,29 +431,40 @@ pub(crate) fn draw_frame(app: &mut EffectcraftApp, ctx: &egui::Context, painter:
             None => comp_rect,
         };
         if plain {
+            let uv = app.viewer_image.as_ref().map_or(uv, |src| fitted_uv(ctx, src.size, minify));
             painter.image(tex.id(), rect, uv, Color32::WHITE);
             return;
         }
         rect
     };
     let Some(src) = app.viewer_image.clone() else { return };
-    let zoom_opts = super::viewer::zoom_texture_options(app.session.prefs.viewer_zoom_smooth());
+    let smooth = app.session.prefs.viewer_zoom_smooth();
+    // Averaged down for the magnification, as the frame's own texture is (#417).
+    let minify = super::viewer::minify_factor(smooth, src.size[0] as f64, (rect.width() * ctx.pixels_per_point()) as f64);
     let key = {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        (std::sync::Arc::as_ptr(&src) as usize, opts.channel.id(), opts.colorized, opts.exposure.to_bits(), &dc_key).hash(&mut h);
+        (std::sync::Arc::as_ptr(&src) as usize, opts.channel.id(), opts.colorized, opts.exposure.to_bits(), &dc_key, minify).hash(&mut h);
         h.finish()
     };
     let id = egui::Id::new("viewer-display-tex");
     let tex = match ctx.data(|d| d.get_temp::<(u64, egui::TextureHandle)>(id)) {
         Some((k, tex)) if k == key => tex,
         _ => {
-            let tex = crate::frames::load_fitted(ctx, "viewer-display", transformed(&src, opts.channel, opts.colorized, opts.exposure, dc), zoom_opts);
+            let img =
+                crate::frames::fit_texture_by(transformed(&src, opts.channel, opts.colorized, opts.exposure, dc), crate::frames::max_texture_side(ctx), minify);
+            let tex = ctx.load_texture("viewer-display", img, super::viewer::zoom_texture_options(smooth));
             ctx.data_mut(|d| d.insert_temp(id, (key, tex.clone())));
             tex
         }
     };
-    painter.image(tex.id(), rect, uv, Color32::WHITE);
+    painter.image(tex.id(), rect, fitted_uv(ctx, src.size, minify), Color32::WHITE);
+}
+
+/// The texture coordinates of a frame of `size` in its texture, fitted with at least `minify`
+/// (see [`crate::frames::fitted_uv`]).
+fn fitted_uv(ctx: &egui::Context, size: [usize; 2], minify: usize) -> Rect {
+    crate::frames::fitted_uv(size, crate::frames::fit_factor(size, crate::frames::max_texture_side(ctx), minify))
 }
 
 // ---------------------------------------------------------------- bottom bar
@@ -746,7 +757,9 @@ pub(crate) fn bottom_bar(app: &mut EffectcraftApp, ui: &mut egui::Ui, bar: Rect,
     let g = p.layout_no_wrap(tc, Tokens::mono(12.0), t.timecode);
     let tr = Rect::from_min_size(pos2(x + 4.0, cy - 9.0), g.size() + vec2(8.0, 4.0));
     p.galley(pos2(tr.min.x + 4.0, tr.min.y + 2.0), g, t.timecode);
+    let resp = ui.interact(tr, egui::Id::new("vw-timecode"), Sense::click());
     app.auto.add("viewer.timecode", tr, "Current time");
+    crate::panels::toggle_time_display(app, &resp);
     // Right: render time.
     let ms = app.frames.last_ms.lock().map(|v| *v).unwrap_or(0.0);
     if tr.max.x + 50.0 < bar.max.x {
@@ -767,5 +780,49 @@ mod tests {
         assert_eq!(resolution_label(Resolution::Auto, 0.5), "(Half)");
         assert_eq!(resolution_label(Resolution::Quarter, 0.25), "Quarter");
         assert_eq!(resolution_label(Resolution::Custom(5), 0.2), "Custom (5)");
+    }
+
+    /// Auto renders the pixels the magnification needs, as in After Effects: Full above 50 %,
+    /// Half down to 33.3 %, Third down to 25 %, Quarter below — never fewer pixels than the
+    /// screen shows (#417: 60 % rendered at Half).
+    #[test]
+    fn auto_resolution_follows_the_magnification() {
+        let auto = |zoom: f32, ppp: f32| resolution_label(Resolution::Auto, Resolution::Auto.scale(zoom, ppp));
+        for (zoom, want) in [(2.0, "(Full)"), (1.0, "(Full)"), (0.6, "(Full)"), (0.51, "(Full)"), (0.5, "(Half)"), (0.46, "(Half)"), (0.34, "(Half)")] {
+            assert_eq!(auto(zoom, 1.0), want, "{zoom}");
+        }
+        for (zoom, want) in [(1.0 / 3.0, "(Third)"), (0.26, "(Third)"), (0.25, "(Quarter)"), (0.1, "(Quarter)"), (0.0, "(Quarter)")] {
+            assert_eq!(auto(zoom, 1.0), want, "{zoom}");
+        }
+        // Magnification in points on a 150 % display: 40 % shows 60 % of the comp's pixels.
+        assert_eq!(auto(0.4, 1.5), "(Full)");
+        assert_eq!(auto(f32::NAN, 1.0), "(Full)");
+        assert_eq!(Resolution::Full.scale(0.1, 1.0), 1.0);
+    }
+
+    /// CPU frames go up averaged down to about one texel per screen pixel (More Accurate only),
+    /// drawn with texture coordinates that keep each texel over its pixels (#417).
+    #[test]
+    fn minified_frames_keep_their_texels_in_place() {
+        use crate::panels::viewer::minify_factor;
+        assert_eq!(minify_factor(true, 1.0, 0.46), 2);
+        assert_eq!(minify_factor(true, 1.0, 0.5), 2);
+        assert_eq!(minify_factor(true, 1.0, 0.51), 1);
+        assert_eq!(minify_factor(true, 0.5, 0.46), 1, "a Half frame at 46 %");
+        assert_eq!(minify_factor(true, 1.0, 1.0 / 3.0), 3);
+        assert_eq!(minify_factor(true, 1.0, 2.0), 1);
+        assert_eq!(minify_factor(false, 1.0, 0.1), 1, "Faster keeps every pixel");
+        assert_eq!(minify_factor(true, 1.0, 0.0), 256);
+        assert_eq!(minify_factor(true, f64::NAN, 1.0), 1);
+        // 2560 px by 3: 854 texels hold 2562 px, the image is 2560 / 2562 of them.
+        let uv = crate::frames::fitted_uv([2560, 1440], 3);
+        assert!((uv.max.x - 2560.0 / 2562.0).abs() < 1e-6 && uv.max.y == 1.0, "{uv:?}");
+        assert_eq!(crate::frames::fitted_uv([7, 5], 1).max, egui::pos2(1.0, 1.0));
+        let img =
+            egui::ColorImage::new([5, 1], vec![egui::Color32::WHITE, egui::Color32::BLACK, egui::Color32::WHITE, egui::Color32::BLACK, egui::Color32::WHITE]);
+        let out = crate::frames::fit_texture_by(img, 4096, 2);
+        assert_eq!(out.size, [3, 1]);
+        assert_eq!(out.pixels[1], egui::Color32::from_gray(128), "texels average their pixels");
+        assert_eq!(out.pixels[2], egui::Color32::WHITE, "the last one only the pixels it holds");
     }
 }

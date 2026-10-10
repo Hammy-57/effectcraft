@@ -198,6 +198,34 @@ fn footage_profile_is_converted_into_the_working_space() {
     assert!((o[0] - 1.0).abs() < 2e-3 && o[1].abs() < 2e-3 && o[2].abs() < 2e-3, "{o:?}");
 }
 
+/// #411: Interpret Footage ▸ Preserve RGB: the footage's values enter the composition as the file
+/// stores them, whatever its colour profile, Interpret As Linear Light or the working space.
+#[test]
+fn preserve_rgb_footage_is_not_converted() {
+    let render = |linearize: bool, f: Footage| {
+        let (mut p, cid, comp) = setup(BitDepth::Bpc32);
+        p.settings.working_space = Some(ColorSpace::Rec2020);
+        p.settings.linearize = linearize;
+        let fid = p.add_item("F", Label::Aqua, None, ItemKind::Footage(f));
+        let l = build::layer(&mut p, &comp, "F", LayerSource::Footage { item: fid }, (40, 20), None);
+        p.comp_mut(cid).unwrap().layers.push(l);
+        let src = Flat([0.18, 0.5, 0.75]);
+        let out = Renderer::new(&p, &src, RenderOpts::default()).comp_frame(cid, Tick::ZERO).get(5, 5);
+        // Back from the output conversion (working space → sRGB) to the working space's values.
+        let ws = effectcraft_color::Conversion::new(ColorSpace::Srgb, false, ColorSpace::Rec2020, linearize).unwrap();
+        let c = ws.apply([out[0], out[1], out[2]]);
+        [c[0], c[1], c[2], out[3]]
+    };
+    let preserve = Footage { preserve_rgb: true, linear_light: true, ..footage(Some(ColorSpace::DisplayP3)) };
+    for linearize in [false, true] {
+        let o = render(linearize, preserve.clone());
+        assert!((o[0] - 0.18).abs() < 1e-3 && (o[1] - 0.5).abs() < 1e-3 && (o[2] - 0.75).abs() < 1e-3, "linearize {linearize}: {o:?}");
+        // Without Preserve RGB the profile and linear light convert the values.
+        let o = render(linearize, Footage { preserve_rgb: false, ..preserve.clone() });
+        assert!((o[0] - 0.18).abs() > 0.05, "linearize {linearize}: {o:?}");
+    }
+}
+
 #[test]
 fn layer_cache_is_keyed_by_colour_settings() {
     let (mut p, cid, _) = setup(BitDepth::Bpc8);

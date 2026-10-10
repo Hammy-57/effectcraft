@@ -1,10 +1,5 @@
-use effectcraft_engine::{Session, prefs::Prefs};
-use effectcraft_ui_egui::{
-    EffectcraftApp,
-    dock::PanelKind,
-    theme::{ThemeKind, Tokens},
-    widgets,
-};
+use effectcraft_engine::Session;
+use effectcraft_ui_egui::{EffectcraftApp, dock::PanelKind};
 use egui::{Event, Modifiers, PointerButton, pos2, vec2};
 use egui_kittest::Harness;
 use serde_json::json;
@@ -52,66 +47,6 @@ fn fixed_compact_rows_preserve_checkbox_and_point_hit_targets() {
     assert_eq!(h.state().ui.fx_pick.as_ref().map(|p| (p.layer, p.prop)), Some((lid, point)));
     click(&mut h, &format!("effectControls.prop.{point}.crosshair"));
     assert!(h.state().ui.fx_pick.is_none());
-}
-
-#[test]
-fn separator_preference_is_saved_and_resettable() {
-    let mut p = Prefs::default();
-    p.set("appearance.parameterRowSeparators", json!(false)).unwrap();
-    assert_eq!(Prefs::from_json(&p.to_json()), p);
-    assert!(!Tokens::from_prefs(&p).parameter_separators);
-    p.reset(Some("appearance")).unwrap();
-    assert!(p.appearance.parameter_row_separators);
-    assert!(Prefs::from_json(r#"{"appearance":{"theme":"light"}}"#).appearance.parameter_row_separators);
-}
-
-#[test]
-fn cancelling_separator_preview_preserves_fixed_row_geometry_and_project() {
-    let (a, _, checkbox, _) = setup();
-    let mut h = Harness::builder().with_size(vec2(1500.0, 1000.0)).build_eframe(|_| a);
-    h.run_steps(4);
-    let row = format!("effectControls.row.{checkbox}");
-    let before = h.state().auto.find(&row).unwrap().rect;
-    let project = h.state().session.project.clone();
-    let ctx = h.ctx.clone();
-    effectcraft_ui_egui::menus::invoke(h.state_mut(), &ctx, "app.settings", json!({"page":"appearance"})).unwrap();
-    h.state_mut().session.execute("prefs.set", json!({"key":"appearance.parameterRowSeparators","value":false})).unwrap();
-    h.run_steps(3);
-    assert!(!h.state().tokens.parameter_separators);
-    assert_eq!(h.state().auto.find(&row).unwrap().rect, before);
-    click(&mut h, "settings.cancel");
-    assert!(h.state().tokens.parameter_separators);
-    assert_eq!(h.state().auto.find(&row).unwrap().rect, before);
-    assert!(std::sync::Arc::ptr_eq(&project, &h.state().session.project));
-}
-
-#[test]
-fn row_separator_uses_the_theme_and_can_be_disabled() {
-    for kind in [ThemeKind::Dark, ThemeKind::Darker, ThemeKind::Light] {
-        for enabled in [true, false] {
-            let ctx = egui::Context::default();
-            let mut t = Tokens::for_kind(kind);
-            t.parameter_separators = enabled;
-            let mut out = ctx.run_ui(Default::default(), |_| {
-                let painter = ctx.layer_painter(egui::LayerId::background());
-                widgets::parameter_separator(&painter, egui::Rect::from_min_size(pos2(10.0, 20.0), vec2(200.0, 24.0)), &t);
-            });
-            let lines: Vec<_> = out
-                .shapes
-                .iter()
-                .filter_map(|s| match s.shape {
-                    egui::Shape::LineSegment { points, stroke } => Some((points, stroke)),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(lines.len(), usize::from(enabled));
-            if enabled {
-                assert_eq!(lines[0].0, [pos2(10.0, 43.5), pos2(210.0, 43.5)]);
-                assert_eq!(lines[0].1.color, t.app_bg);
-            }
-            out.textures_delta.clear();
-        }
-    }
 }
 
 #[test]

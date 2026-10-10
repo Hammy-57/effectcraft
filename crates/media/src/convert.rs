@@ -6,7 +6,7 @@
 //! Values stay gamma-encoded: like After Effects, footage pixels enter the working space as they
 //! are encoded in the file. Alpha follows the footage's [`AlphaMode`] interpretation.
 
-use effectcraft_project::AlphaMode;
+use effectcraft_project::{AlphaMode, Footage};
 use effectcraft_raster::{Image, Px};
 use filmcraft_color::{Matrix, Range};
 use filmcraft_frame::{Chroma, PixelData, VideoFrame};
@@ -17,11 +17,24 @@ use rayon::prelude::*;
 pub(crate) struct AlphaOp {
     mode: AlphaMode,
     matte: [f32; 3],
+    /// Interpret Footage ▸ Preserve RGB: float values stay as the file stores them (not
+    /// sRGB-encoded).
+    preserve_rgb: bool,
 }
 
 impl AlphaOp {
     pub(crate) fn new(mode: AlphaMode, matte: [f32; 3]) -> Self {
-        Self { mode, matte }
+        Self { mode, matte, preserve_rgb: false }
+    }
+    /// The interpretation of footage `f`.
+    pub(crate) fn of(f: &Footage) -> Self {
+        Self { preserve_rgb: f.preserve_rgb, ..Self::new(f.alpha, f.premul_color) }
+    }
+    /// A linear float value as the compositor takes it: sRGB-encoded, or the file's own value
+    /// under Preserve RGB.
+    #[inline(always)]
+    fn float(self, v: f32) -> f32 {
+        if self.preserve_rgb { v } else { encode(v) }
     }
     /// `c` is the file's colour (straight or premultiplied as the mode says), `a` its alpha.
     #[inline(always)]
@@ -71,7 +84,7 @@ pub(crate) fn frame_to_image_in(f: &VideoFrame, op: AlphaOp, mut buf: Vec<Px>) -
                 for (o, s) in row.iter_mut().zip(src.as_chunks::<4>().0.iter()) {
                     let a = s[3];
                     let inv = if a > 0.0 { 1.0 / a } else { 0.0 };
-                    let c = [encode(s[0] * inv) * a, encode(s[1] * inv) * a, encode(s[2] * inv) * a];
+                    let c = [op.float(s[0] * inv) * a, op.float(s[1] * inv) * a, op.float(s[2] * inv) * a];
                     *o = if op.mode == AlphaMode::Ignore { [c[0], c[1], c[2], 1.0] } else { [c[0], c[1], c[2], a] };
                 }
             });
@@ -230,7 +243,7 @@ fn convert_yuv<T: Sample>(img: &mut Image, w: usize, h: usize, chroma: Chroma, p
 }
 
 /// Convert a still decoded by the `image` crate. Float images (OpenEXR, float TIFF) hold linear
-/// light and are sRGB-encoded here (values above 1 are kept).
+/// light and are sRGB-encoded here (values above 1 are kept), unless the footage preserves RGB.
 pub(crate) fn dynamic_to_image(img: &image::DynamicImage, op: AlphaOp) -> Image {
     use image::DynamicImage as D;
     let (w, h) = (img.width(), img.height());
@@ -250,9 +263,9 @@ pub(crate) fn dynamic_to_image(img: &image::DynamicImage, op: AlphaOp) -> Image 
                     let a = s[3];
                     let c = if premul {
                         let inv = if a > 0.0 { 1.0 / a } else { 0.0 };
-                        [encode(s[0] * inv) * a, encode(s[1] * inv) * a, encode(s[2] * inv) * a]
+                        [op.float(s[0] * inv) * a, op.float(s[1] * inv) * a, op.float(s[2] * inv) * a]
                     } else {
-                        [encode(s[0]), encode(s[1]), encode(s[2])]
+                        [op.float(s[0]), op.float(s[1]), op.float(s[2])]
                     };
                     *o = op.apply(c, a.clamp(0.0, 1.0));
                 }

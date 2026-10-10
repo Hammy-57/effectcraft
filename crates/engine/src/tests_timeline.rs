@@ -482,6 +482,60 @@ fn pick_whip_generates_ae_reference_expressions() {
     assert!(s.execute("prop.pickWhip", json!({"layer": l, "path": "transform/opacity", "target": {"layer": l, "path": "transform/opacity"}})).is_err());
 }
 
+/// #407: Reset without a value gives a property its own default (a Transform property's, an
+/// effect parameter's) besides removing its keyframes and expression.
+#[test]
+fn reset_gives_a_property_its_default() {
+    let (mut s, l) = setup();
+    s.execute("effect.apply", json!({"layer": l, "effect": "Gaussian Blur"})).unwrap();
+    let blur = prop(&s, l, "effects/#1/blurriness").value;
+    let set = [
+        ("transform/anchor", json!([10, 20, 0])),
+        ("transform/position", json!([10, 20, 0])),
+        ("transform/scale", json!([50, 70, 100])),
+        ("transform/rotation", json!(30)),
+        ("transform/opacity", json!(40)),
+        ("effects/#1/blurriness", json!(25)),
+    ];
+    for (path, v) in &set {
+        s.execute("prop.set", json!({"layer": l, "path": path, "value": v})).unwrap();
+    }
+    animate(&mut s, l, "transform/rotation", &[(0.0, json!(10)), (1.0, json!(20))]);
+    s.execute("prop.setExpression", json!({"layer": l, "path": "transform/opacity", "expression": "50"})).unwrap();
+    for (path, _) in &set {
+        s.execute("prop.reset", json!({"layer": l, "path": path})).unwrap();
+    }
+    let v = |s: &Session, path: &str| prop(s, l, path).value;
+    assert_eq!(v(&s, "transform/anchor"), KV::Vec3([50.0, 50.0, 0.0]), "the solid's centre");
+    assert_eq!(v(&s, "transform/position"), KV::Vec3([200.0, 150.0, 0.0]), "the comp's centre");
+    assert_eq!(v(&s, "transform/scale"), KV::Vec3([100.0; 3]));
+    assert_eq!(v(&s, "transform/rotation"), KV::Scalar(0.0));
+    assert!(!prop(&s, l, "transform/rotation").is_animated());
+    assert_eq!(v(&s, "transform/opacity"), KV::Scalar(100.0));
+    assert!(prop(&s, l, "transform/opacity").expr.is_none());
+    assert_eq!(v(&s, "effects/#1/blurriness"), blur);
+    // A given default still wins.
+    s.execute("prop.reset", json!({"layer": l, "path": "transform/opacity", "default": 30})).unwrap();
+    assert_eq!(v(&s, "transform/opacity"), KV::Scalar(30.0));
+}
+
+/// #363: dropped on one of the target's values the pick whip picks that dimension
+/// (`position[0]`), as in After Effects; a multi-dimension property follows it on every axis.
+#[test]
+fn pick_whip_picks_one_dimension_of_the_target() {
+    let (mut s, l) = setup();
+    let o = s.execute("layer.newSolid", json!({"name": "Other", "color": "#00ff00"})).unwrap()["layer"].as_u64().unwrap();
+    let whip = |s: &mut Session, path: &str, d: u64| {
+        s.execute("prop.pickWhip", json!({"layer": l, "path": path, "target": {"layer": o, "path": "transform/position", "dimension": d}}))
+    };
+    let r = "thisComp.layer(\"Other\").transform.position";
+    assert_eq!(whip(&mut s, "transform/rotation", 0).unwrap(), json!(format!("{r}[0]")));
+    assert_eq!(whip(&mut s, "transform/scale", 1).unwrap(), json!(format!("temp = {r}[1];\n[temp, temp]")));
+    assert_eq!(prop(&s, l, "transform/scale").expr.unwrap().text, format!("temp = {r}[1];\n[temp, temp]"));
+    // A 2D layer's Position has two.
+    assert!(whip(&mut s, "transform/rotation", 2).is_err());
+}
+
 /// #284: with the expression being edited, the pick whip puts the reference at the cursor,
 /// replacing the selected characters (After Effects), in one undo step.
 #[test]

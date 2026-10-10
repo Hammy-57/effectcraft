@@ -462,9 +462,15 @@ pub fn layer_or_self(ctx: &crate::EffectCtx, b: &crate::Buf, id: &str, masks_and
 /// A stable hash of an effect instance's evaluated parameters, seed, layer size and buffer
 /// scale (cache key for simulations).
 pub fn params_key(ctx: &crate::EffectCtx, b: &crate::Buf, salt: u64) -> u64 {
+    params_key_except(ctx, b, salt, &[])
+}
+
+/// [`params_key`] without the parameters whose ids start with one of `skip` (ones that only
+/// change how the simulation is viewed, so animating them doesn't restart it).
+pub fn params_key_except(ctx: &crate::EffectCtx, b: &crate::Buf, salt: u64, skip: &[&str]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    let mut keys: Vec<&String> = ctx.params.values.keys().collect();
+    let mut keys: Vec<&String> = ctx.params.values.keys().filter(|k| !skip.iter().any(|s| k.starts_with(s))).collect();
     keys.sort();
     for k in keys {
         k.hash(&mut h);

@@ -963,6 +963,11 @@ pub struct Footage {
     /// Interpret Footage ▸ Color ▸ Interpret As Linear Light: the file's values are linear.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub linear_light: bool,
+    /// Interpret Footage ▸ Color ▸ Preserve RGB: the file's values enter the composition
+    /// unconverted. Float footage (OpenEXR, float TIFF) is not sRGB-encoded on decode, and the
+    /// colour profile, Interpret As Linear Light and the working space don't apply.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub preserve_rgb: bool,
     /// Data footage ([`FootageKind::Data`]): the file's text (JSON, CSV or TSV), kept in the
     /// project so expressions read it everywhere (and on the web).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1009,6 +1014,7 @@ impl Default for Footage {
             fields: FieldOrder::Off,
             invert_alpha: false,
             linear_light: false,
+            preserve_rgb: false,
             data: None,
             layer: None,
             page: 0,
@@ -1019,6 +1025,11 @@ impl Default for Footage {
 }
 
 impl Footage {
+    /// Interpret As Linear Light applies (Preserve RGB passes the file's values through).
+    pub fn linear_light_applies(&self) -> bool {
+        self.linear_light && !self.preserve_rgb
+    }
+
     /// Source time as the footage's timecode: its frame `frame` from Start Timecode
     /// (`0:00:41:20`), as the Footage panel shows it.
     pub fn timecode(&self, frame: i64) -> String {

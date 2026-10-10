@@ -322,3 +322,32 @@ fn opening_a_schema_1_project_moves_text_layer_effect_points_into_effect_space()
     let _ = std::fs::remove_dir_all(dir);
     check(&s3);
 }
+
+/// #410: `effect.warning` reports what an OCIO effect can't render as asked (Effect Controls
+/// shows it under the effect's name): a transform of its custom config that passes colours
+/// through, a colour space the config lacks or a config it can't read; nothing for the
+/// built-in config.
+#[test]
+fn ocio_effect_warns_about_unsupported_config_transforms() {
+    let (mut s, a, _) = comp_with_two_solids();
+    let fx = apply(&mut s, a, "OCIO Color Space Transform");
+    let warning = |s: &mut Session| s.execute("effect.warning", json!({"layer": a, "effect": fx})).unwrap()["warning"].clone();
+    assert!(warning(&mut s).is_null(), "built-in config");
+    let set = |s: &mut Session, param: &str, value: serde_json::Value| {
+        let uid = layer(s, a).effects().unwrap().groups().next().unwrap().get(param).unwrap().uid;
+        s.execute("prop.set", json!({"layer": a, "prop": uid, "value": value})).unwrap();
+    };
+    let config = "ocio_profile_version: 2\ncolorspaces:\n  - !<ColorSpace>\n    name: lin\n  - !<ColorSpace>\n    name: graded\n    from_scene_reference: !<GradingToneTransform> {}\n";
+    set(&mut s, "config", json!(1));
+    set(&mut s, "configFile", json!(config));
+    set(&mut s, "sourceName", json!("lin"));
+    set(&mut s, "destinationName", json!("graded"));
+    let w = warning(&mut s);
+    assert!(w.as_str().is_some_and(|w| w.contains("GradingToneTransform")), "{w}");
+    set(&mut s, "destinationName", json!("lin"));
+    assert!(warning(&mut s).is_null());
+    set(&mut s, "destinationName", json!("nowhere"));
+    assert!(warning(&mut s).as_str().is_some_and(|w| w.contains("no color space `nowhere`")));
+    set(&mut s, "configFile", json!("/no/such/config.ocio"));
+    assert!(warning(&mut s).as_str().is_some_and(|w| w.starts_with("Can't read the OCIO config")));
+}

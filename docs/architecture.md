@@ -164,7 +164,8 @@ collapsed 3D precomps (drawn flattened), morph targets, extruded strokes.
 
 A **layer cache** keeps each layer's finished pixels (source, masks and effects) keyed by a hash of
 its evaluated inputs, excluding the transform. Static and transform-only layers render once;
-editing one layer re-renders only that layer. Effects that read the clock directly are declared in
+editing one layer re-renders only that layer. Each Render Queue job keeps its own layer cache
+for its frames. Effects that read the clock directly are declared in
 `effects::TIME_DEPENDENT`, and a test checks every registered effect against that list.
 
 The viewer's **RAM preview** (`ui-egui/src/frames.rs`) keeps finished frames keyed by project
@@ -173,6 +174,11 @@ options (Draft / Fast Previews, shadows, nested switches), so frames rendered un
 options are never shown. When the budget (Settings ▸ Memory & CPU) is full the least recently
 shown frames go first, and frames of an older revision are dropped as soon as the project
 changes. The timeline's green bar counts the frames of exactly what the viewer shows.
+Resolution Auto renders the pixels the magnification needs, as in After Effects (Full above
+50 %, Half down to 33.3 %, Third down to 25 %, then Quarter). Below 100 % the viewer averages
+instead of skipping pixels (Viewer Zoom Quality More Accurate): GPU frames carry a mip chain
+sampled trilinearly, CPU frames go up averaged down by the whole factor that leaves about one
+texel per screen pixel.
 
 A persistent **disk cache** (`render::disk_cache`, Settings ▸ Media & Disk Cache) backs both
 the layer cache and the viewer's RAM preview: layer buffers that were slow to render and every
@@ -209,8 +215,9 @@ switches that don't change pixels (Audio, Lock, Shy, Hide Shy Layers: `Switches:
 **Layer styles** (Layer ▸ Layer Styles; `crates/render/src/styles.rs`) render in layer space and
 may grow the layer's bounds. Drop Shadow and Outer Glow become separate passes composited below the
 layer with their own blend modes; the interior styles, Stroke and Bevel and Emboss are baked into
-the layer body. Layer opacity fades the whole stack; Knockout and the R/G/B channel switches apply
-at composite time. Styled pixels are cached separately from the layer content, so editing a style
+the layer body. Interior styles are clipped to the layer: they blend onto its colour inside its
+shape and keep its alpha, so an anti-aliased edge mixes the style and the background only. Layer
+opacity fades the whole stack; Knockout and the R/G/B channel switches apply at composite time. Styled pixels are cached separately from the layer content, so editing a style
 reuses the cached source/masks/effects. Global Light is one setting per comp, mirrored into every
 layer's Blending Options and kept in step after each edit.
 
@@ -238,6 +245,8 @@ whichever compositor measured faster for it (`render::auto::AutoPick`, kept by t
 per comp, output scale and path (readback or viewer display) it averages CPU and GPU frame times
 (warm-up on both sides, the fastest warm-up frame starting the average, single stalls capped),
 picks the GPU unless the CPU is clearly faster, and re-measures the other side every 48 frames.
+Render Queue jobs don't use Auto: every frame of a job renders on the project's renderer (the
+GPU compositor with Mercury GPU Acceleration), so runs of a render don't differ by timing.
 Light comps (a few small layers, which the CPU composites only within their bounds) then stay on
 the CPU instead of paying for full-frame passes and a readback. A GPU frame walks the comp like
 `draw_comp`: cached layer buffers are uploaded once per buffer, then transformed with the CPU's
@@ -354,8 +363,9 @@ hierarchical block-matching optical flow and a bidirectional warp (Pixel Motion,
 its nested layers straight into the parent with concatenated transforms (one resample), so
 nested blend modes and adjustment layers act on the parent's layers; nested 3D layers use the
 parent's camera and lights and, when the precomp layer is 3D, are depth-sorted with the parent's
-3D run. Masks, effects or styles force a flattened render. On text and shape layers the switch is
-Continuously Rasterize: the source is rasterised at its on-screen scale. Quality: Draft samples
+3D run. Masks, effects or styles force a flattened render. Text layers are always rasterised at
+their on-screen scale, as text is vector in After Effects; on shape layers and vector footage the
+switch is Continuously Rasterize and does the same. Quality: Draft samples
 nearest-neighbour, Wireframe draws the layer bounds. Slip edit (`layer.slip`, Alt+PageUp/Down,
 dragging the source bar in the timeline) moves the source under fixed in/out points.
 

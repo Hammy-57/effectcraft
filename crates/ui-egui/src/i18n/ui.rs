@@ -14,7 +14,9 @@
 //! drop a value, and `tr_args` itself cannot panic.
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::fmt::Display;
+use std::sync::OnceLock;
 
 thread_local! {
     /// The resolved interface language ("en", "ja", "zh-hans", "zh-hant"); "en" until the first
@@ -33,18 +35,24 @@ pub(crate) fn current() -> &'static str {
     CURRENT.with(Cell::get)
 }
 
-/// The catalog for `language`: empty for English and for any language that has no rows yet.
-fn catalog(language: &str) -> &'static [(&'static str, &'static str)] {
-    match language {
-        "zh-hans" => SIMPLIFIED_CHINESE,
-        "zh-hant" => TRADITIONAL_CHINESE,
-        _ => &[],
-    }
+type Index = HashMap<&'static str, &'static str>;
+
+/// The catalog for `language`, indexed by English source (built on first use: panels translate
+/// hundreds of strings a frame); `None` for English and any language that has no rows yet.
+fn catalog(language: &str) -> Option<&'static Index> {
+    static HANS: OnceLock<Index> = OnceLock::new();
+    static HANT: OnceLock<Index> = OnceLock::new();
+    let (index, rows) = match language {
+        "zh-hans" => (&HANS, SIMPLIFIED_CHINESE),
+        "zh-hant" => (&HANT, TRADITIONAL_CHINESE),
+        _ => return None,
+    };
+    Some(index.get_or_init(|| rows.iter().copied().collect()))
 }
 
 /// Translate one interface string: the current language's row for `text`, or `text` itself.
 pub(crate) fn tr(text: &str) -> &str {
-    catalog(current()).iter().find(|(en, _)| *en == text).map_or(text, |(_, translated)| *translated)
+    catalog(current()).and_then(|c| c.get(text)).copied().unwrap_or(text)
 }
 
 /// Translate an interface string that carries values: each `{}` takes the next argument. A missing
@@ -346,6 +354,7 @@ const SIMPLIFIED_CHINESE: &[(&str, &str)] = &[
     ),
     ("Project: {}", "项目：{}"),
     ("Projects", "项目"),
+    ("Property pick whip: drag onto a property", "属性拾取器：拖到属性上"),
     ("Protected Region", "受保护区域"),
     ("Proxy Use: {}", "代理使用：{}"),
     ("Push All to Comp", "全部推送到合成"),
@@ -769,6 +778,7 @@ const TRADITIONAL_CHINESE: &[(&str, &str)] = &[
     ),
     ("Project: {}", "專案：{}"),
     ("Projects", "專案"),
+    ("Property pick whip: drag onto a property", "屬性拾取線：拖到屬性上"),
     ("Protected Region", "受保護區域"),
     ("Proxy Use: {}", "代理使用：{}"),
     ("Push All to Comp", "全部推送到合成"),

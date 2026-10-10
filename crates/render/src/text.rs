@@ -4,6 +4,8 @@
 //! inter-character blending). Per-character 3D characters are handed to the 3D compositor as
 //! separate planes (see [`per_char_planes`]).
 
+use std::borrow::Cow;
+
 use effectcraft_color::BlendMode;
 use effectcraft_effects::Buf;
 use effectcraft_geom::{Mat3, Mat4, Vec3, vec2, vec3};
@@ -790,16 +792,17 @@ fn passes(geom: &TextGeom) -> Vec<Pass> {
     v
 }
 
-/// Rasterize one pass of a glyph (path already in target pixels via `m`) into a premultiplied
-/// patch over the target rect, blurred when the character has Blur.
-fn raster_pass(g: &PlacedGlyph, stroke: bool, path: &BezPath, m: &Mat3, rect: [i64; 4], blur_px: [f64; 2]) -> Image {
+/// Rasterize one pass of a glyph — or of a run of glyphs painted alike, as one outline — (paths
+/// mapped into target pixels by `m`) into a premultiplied patch over the target rect, blurred
+/// when the character has Blur.
+fn raster_pass(g: &PlacedGlyph, stroke: bool, paths: &[BezPath], m: &Mat3, rect: [i64; 4], blur_px: [f64; 2]) -> Image {
     let (w, h) = ((rect[2] - rect[0]) as u32, (rect[3] - rect[1]) as u32);
     let mm = Mat3::translate(vec2(-rect[0] as f64, -rect[1] as f64)) * *m;
     let cov = if stroke {
         let st = StrokeStyle { width: g.stroke_width, join: effectcraft_path::Join::Round, ..Default::default() };
-        effectcraft_path::stroke_coverage(std::slice::from_ref(path), &st, &mm, w, h)
+        effectcraft_path::stroke_coverage(paths, &st, &mm, w, h)
     } else {
-        effectcraft_path::fill_coverage(std::slice::from_ref(path), &mm, w, h, FillRule::NonZero)
+        effectcraft_path::fill_coverage(paths, &mm, w, h, FillRule::NonZero)
     };
     let col = if stroke { g.stroke } else { g.fill };
     let op = (g.xf.opacity / 100.0).clamp(0.0, 1.0) as f32;
@@ -838,20 +841,57 @@ fn blit(dst: &mut Image, src: &Image, at: [i64; 2], mode: BlendMode) {
     }
 }
 
-/// Draw glyphs (paths mapped by `to_px` from layer space into `img`).
-fn draw_glyphs(geom: &TextGeom, img: &mut Image, to_px: &Mat3, s: f64, only: Option<usize>) {
-    let (w, h) = (img.width as i64, img.height as i64);
+/// An opaque, unblurred fill pass: where such fills of one colour touch or overlap, compositing
+/// them one by one would let their anti-aliased edges show the background through.
+fn solid_fill(g: &PlacedGlyph, stroke: bool) -> bool {
+    !stroke && g.xf.blur == [0.0; 2] && g.fill[3] >= 1.0 && g.xf.opacity >= 100.0
+}
+
+/// The passes in drawing order, consecutive opaque fills of one colour gathered into a run that
+/// is rasterised as one outline, as After Effects draws a line of text: glyphs that touch (the
+/// crossbars of "ff") or overlap join without a seam (#415). Under an Inter-Character Blending
+/// mode other than Normal every character is still composited onto the others on its own.
+fn runs(geom: &TextGeom) -> Vec<(Vec<usize>, bool)> {
+    let mut out: Vec<(Vec<usize>, bool)> = vec![];
     for (gi, stroke) in passes(geom) {
-        if only.is_some_and(|o| o != gi) {
-            continue;
-        }
         let g = &geom.glyphs[gi];
         if g.xf.opacity <= 0.0 {
             continue;
         }
-        let m = *to_px * if only.is_some() { Mat3::IDENTITY } else { g.m2() };
-        let path = &g.local;
-        let Some(b) = effectcraft_path::bounds(std::slice::from_ref(path)) else { continue };
+        if geom.blend == BlendMode::Normal
+            && solid_fill(g, stroke)
+            && let Some((run, false)) = out.last_mut()
+            && run.last().is_some_and(|&p| solid_fill(&geom.glyphs[p], false) && geom.glyphs[p].fill == g.fill)
+        {
+            run.push(gi);
+            continue;
+        }
+        out.push((vec![gi], stroke));
+    }
+    out
+}
+
+/// Draw glyphs (paths mapped by `to_px` from layer space into `img`).
+fn draw_glyphs(geom: &TextGeom, img: &mut Image, to_px: &Mat3, s: f64, only: Option<usize>) {
+    let (w, h) = (img.width as i64, img.height as i64);
+    let runs = match only {
+        Some(o) => passes(geom).into_iter().filter(|(gi, _)| *gi == o && geom.glyphs[*gi].xf.opacity > 0.0).map(|(gi, st)| (vec![gi], st)).collect(),
+        None => runs(geom),
+    };
+    for (run, stroke) in runs {
+        let Some(g) = run.first().map(|&gi| &geom.glyphs[gi]) else { continue };
+        // One glyph is drawn from its own outline; a run from its glyphs' outlines in layer
+        // space, all wound the same way so overlaps add up instead of cancelling (NonZero).
+        let local = Cow::Borrowed(std::slice::from_ref(&g.local));
+        let (paths, m): (Cow<[BezPath]>, Mat3) = match (only, run.as_slice()) {
+            (Some(_), _) => (local, *to_px),
+            (None, [_]) => (local, *to_px * g.m2()),
+            (None, _) => {
+                let wound = |p: BezPath| if kurbo::Shape::area(&p) < 0.0 { p.reverse_subpaths() } else { p };
+                (Cow::Owned(run.iter().map(|&gi| wound(geom.glyphs[gi].path())).collect()), *to_px)
+            }
+        };
+        let Some(b) = effectcraft_path::bounds(&paths) else { continue };
         let blur = [g.xf.blur[0] * s, g.xf.blur[1] * s];
         let pad = g.stroke_width * m.mean_scale() + 2.0 + blur[0].max(blur[1]) * 1.5;
         let r = m.map_rect(&effectcraft_geom::Rect::new(b.x0, b.y0, b.x1, b.y1));
@@ -864,7 +904,7 @@ fn draw_glyphs(geom: &TextGeom, img: &mut Image, to_px: &Mat3, s: f64, only: Opt
         if rect[2] <= rect[0] || rect[3] <= rect[1] {
             continue;
         }
-        let patch = raster_pass(g, stroke, path, &m, rect, blur);
+        let patch = raster_pass(g, stroke, &paths, &m, rect, blur);
         blit(img, &patch, [rect[0], rect[1]], if only.is_some() { BlendMode::Normal } else { geom.blend });
     }
 }

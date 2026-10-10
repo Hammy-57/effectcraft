@@ -209,6 +209,18 @@ pub fn flatten_params(g: &PropGroup, eval: &mut dyn FnMut(&Property) -> Value) -
     Params { values }
 }
 
+/// The warning shown with effect instance `g` (Effect Controls, `effect.warning`), its
+/// parameters evaluated by `eval`: settings it can't render as asked, such as an OCIO config it
+/// can't read or transforms it passes through. `None` when it renders as asked.
+pub fn warning(g: &PropGroup, eval: &mut dyn FnMut(&Property) -> Value) -> Option<String> {
+    let GroupKind::Effect { effect } = &g.kind else { return None };
+    // Only the effects that can warn evaluate their parameters.
+    if !ocio::CUSTOM_CONFIG_FX.contains(&effect.as_str()) {
+        return None;
+    }
+    ocio::warning(effect, &flatten_params(g, eval))
+}
+
 /// A layer image in flight: point `p` sits at pixel `p * scale + offset`. Points are in layer
 /// space, or in effect space while the layer's effects run (see [`Buf::rebase`]).
 #[derive(Clone, Debug, Default)]
@@ -630,6 +642,7 @@ pub const PARAM_GROUPS: &[(&str, &str)] = &[
     ("sourceCrops", "Source Crops"),
     // Simulation.
     ("extras", "Extras"),
+    ("effectCamera", "Effect Camera"),
     ("wiggle", "Wiggle"),
     ("light", "Light"),
     ("shading", "Shading"),
@@ -1056,6 +1069,11 @@ pub const GPU_EFFECTS: &[&str] = &[
     "ec.obsolete.basictext",
     "ec.obsolete.pathtext",
 ];
+
+/// Effects that can read [`EffectHost::comp_scene`] (the comp camera or the first comp light):
+/// their output changes when the camera, the lights or the layer's own transform move, so the
+/// renderer's layer cache folds the comp scene into the key for these.
+pub const READS_COMP_SCENE: &[&str] = &["ec.sim.carddance", "ec.sim.shatter", "ec.transition.cardwipe", "ec.sim.caustics", "ec.sim.ccparticleworld"];
 
 /// Effects whose output depends on [`EffectCtx::time`] directly (not only through animated
 /// parameters). The renderer's layer cache folds the layer time into the key for these.

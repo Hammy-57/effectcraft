@@ -593,7 +593,8 @@ fn resolve_by_name(name: &str) -> Option<Resolved> {
 
 /// The writing systems that need a dedicated fallback family: the bundled fonts cover none of
 /// them, and picking "any face with the glyph" gives Chinese glyph shapes to Japanese text (or the
-/// other way round), since Han ideographs are shared.
+/// other way round), since Han ideographs are shared, and a calligraphic display face to Arabic,
+/// Hebrew, Indic or Thai text when that is the first installed face that covers it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum FallbackScript {
     /// Kana: unambiguously Japanese.
@@ -603,7 +604,21 @@ enum FallbackScript {
     /// Han ideographs, CJK punctuation and full-width forms: shared by Japanese, Chinese and
     /// Korean; the locale decides which family to try first.
     Han,
+    Arabic,
+    Hebrew,
+    /// Devanagari, Bengali, Gurmukhi, Gujarati, Oriya, Tamil, Telugu, Kannada, Malayalam and
+    /// Sinhala (one family covers them all on Windows; elsewhere each has its own).
+    Indic,
+    Thai,
     Other,
+}
+
+impl FallbackScript {
+    /// Kana, Hangul or Han: these share the Han ideographs, so each tries the others' families
+    /// next.
+    fn is_cjk(self) -> bool {
+        matches!(self, FallbackScript::Japanese | FallbackScript::Korean | FallbackScript::Han)
+    }
 }
 
 fn script_of(c: char) -> FallbackScript {
@@ -619,6 +634,10 @@ fn script_of(c: char) -> FallbackScript {
         | 0xFE30..=0xFE4F
         | 0xFF00..=0xFFEF
         | 0x20000..=0x3FFFF => FallbackScript::Han,
+        0x0600..=0x06FF | 0x0750..=0x077F | 0x0870..=0x08FF | 0xFB50..=0xFDFF | 0xFE70..=0xFEFE => FallbackScript::Arabic,
+        0x0590..=0x05FF | 0xFB1D..=0xFB4F => FallbackScript::Hebrew,
+        0x0900..=0x0DFF | 0xA8E0..=0xA8FF => FallbackScript::Indic,
+        0x0E00..=0x0E7F => FallbackScript::Thai,
         _ => FallbackScript::Other,
     }
 }
@@ -657,6 +676,38 @@ const CHINESE_FAMILIES: &[&str] = &[
     "WenQuanYi Micro Hei",
 ];
 const KOREAN_FAMILIES: &[&str] = &["Malgun Gothic", "Gulim", "Apple SD Gothic Neo", "Noto Sans CJK KR", "Noto Sans KR", "Source Han Sans KR", "NanumGothic"];
+/// The platforms' plain text families for the other scripts the bundled fonts lack, in the same
+/// order (Windows, macOS, then the Linux/Noto names).
+const ARABIC_FAMILIES: &[&str] = &["Segoe UI", "Tahoma", "Geeza Pro", "Noto Sans Arabic", "Noto Naskh Arabic", "DejaVu Sans", "Arial"];
+const HEBREW_FAMILIES: &[&str] = &["Segoe UI", "Tahoma", "Arial Hebrew", "Noto Sans Hebrew", "DejaVu Sans", "Arial"];
+const INDIC_FAMILIES: &[&str] = &[
+    "Nirmala UI",
+    "Kohinoor Devanagari",
+    "Kohinoor Bangla",
+    "Kohinoor Gujarati",
+    "Kohinoor Telugu",
+    "Devanagari Sangam MN",
+    "Bangla Sangam MN",
+    "Gurmukhi Sangam MN",
+    "Gujarati Sangam MN",
+    "Oriya Sangam MN",
+    "Tamil Sangam MN",
+    "Telugu Sangam MN",
+    "Kannada Sangam MN",
+    "Malayalam Sangam MN",
+    "Sinhala Sangam MN",
+    "Noto Sans Devanagari",
+    "Noto Sans Bengali",
+    "Noto Sans Gurmukhi",
+    "Noto Sans Gujarati",
+    "Noto Sans Oriya",
+    "Noto Sans Tamil",
+    "Noto Sans Telugu",
+    "Noto Sans Kannada",
+    "Noto Sans Malayalam",
+    "Noto Sans Sinhala",
+];
+const THAI_FAMILIES: &[&str] = &["Leelawadee UI", "Tahoma", "Thonburi", "Noto Sans Thai", "Noto Sans Thai UI", "Loma", "Garuda"];
 
 /// The CJK locale the host asked fallbacks to prefer, when it has one (see [`set_cjk_locale`]).
 static REQUESTED_CJK_LOCALE: RwLock<Option<String>> = RwLock::new(None);
@@ -717,6 +768,10 @@ fn families_for(s: FallbackScript) -> &'static [&'static str] {
         FallbackScript::Japanese => JAPANESE_FAMILIES,
         FallbackScript::Han => CHINESE_FAMILIES,
         FallbackScript::Korean => KOREAN_FAMILIES,
+        FallbackScript::Arabic => ARABIC_FAMILIES,
+        FallbackScript::Hebrew => HEBREW_FAMILIES,
+        FallbackScript::Indic => INDIC_FAMILIES,
+        FallbackScript::Thai => THAI_FAMILIES,
         FallbackScript::Other => &[],
     }
 }
@@ -830,11 +885,12 @@ fn system_fallback(c: char, style: &str) -> Option<FaceId> {
     let order: Vec<FallbackScript> = match script {
         FallbackScript::Other => vec![],
         FallbackScript::Han => han_order().to_vec(),
-        s => {
+        s if s.is_cjk() => {
             let mut v = vec![s];
             v.extend(han_order().iter().copied().filter(|o| *o != s));
             v
         }
+        s => vec![s],
     };
     for s in order {
         for fam in families_for(s) {
@@ -978,7 +1034,33 @@ mod tests {
         assert_eq!(script_of('Ａ'), FallbackScript::Han);
         assert_eq!(script_of('\u{20000}'), FallbackScript::Han);
         assert_eq!(script_of('A'), FallbackScript::Other);
-        assert_eq!(script_of('\u{5d0}'), FallbackScript::Other);
+        assert_eq!(script_of('م'), FallbackScript::Arabic);
+        assert_eq!(script_of('\u{fefb}'), FallbackScript::Arabic);
+        assert_eq!(script_of('\u{5d0}'), FallbackScript::Hebrew);
+        assert_eq!(script_of('क'), FallbackScript::Indic);
+        assert_eq!(script_of('த'), FallbackScript::Indic);
+        assert_eq!(script_of('ก'), FallbackScript::Thai);
+        assert_eq!(script_of('\u{feff}'), FallbackScript::Other, "the byte order mark is no Arabic letter");
+    }
+
+    /// Native: Arabic, Hebrew, Indic and Thai text in a Latin-only family falls back to the
+    /// platform's plain text family for its script (#394), not to the first installed face that
+    /// covers it (on Windows a calligraphic Arabic face sorts first). Skipped per script where no
+    /// family from its list is installed.
+    #[test]
+    fn other_scripts_fall_back_to_a_plain_system_family() {
+        scan_system();
+        let inter = resolve("Inter", "Regular").face;
+        for (c, families) in [('م', ARABIC_FAMILIES), ('א', HEBREW_FAMILIES), ('क', INDIC_FAMILIES), ('த', INDIC_FAMILIES), ('ก', THAI_FAMILIES)] {
+            let covering = families.iter().any(|n| resolve_in(n, "Regular").is_some_and(|r| face(r.face).has_char(c)));
+            if !covering {
+                eprintln!("{c}: no family from the list is installed; skipping");
+                continue;
+            }
+            let f = face(fallback_for(c, inter));
+            assert!(f.has_char(c), "{c}: {} lacks it", f.info.family);
+            assert!(families.iter().any(|n| f.info.family.eq_ignore_ascii_case(n)), "{c} → {}", f.info.family);
+        }
     }
 
     /// Native: Japanese text in a Latin-only family falls back to an installed Japanese family

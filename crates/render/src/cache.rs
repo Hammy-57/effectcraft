@@ -620,7 +620,23 @@ fn key_any(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool, fo
         layer.start_time.0.hash(&mut h);
         layer.stretch.to_bits().hash(&mut h);
     }
+    // Effects that see the comp camera or lights (#397) change when they or the layer move.
+    if reads_comp_scene(layer) {
+        hash_debug(&mut h, &crate::comp_scene(ctx, layer));
+    }
     Some(h.finish())
+}
+
+/// Does the layer run an effect that reads the comp camera or lights (Card Dance, CC Particle
+/// World…)?
+fn reads_comp_scene(layer: &Layer) -> bool {
+    layer.switches.effects
+        && layer.effects().is_some_and(|fx| {
+            fx.groups().any(|g| {
+                g.enabled
+                    && matches!(&g.kind, effectcraft_project::GroupKind::Effect { effect } if effectcraft_effects::READS_COMP_SCENE.contains(&effect.as_str()))
+            })
+        })
 }
 
 /// Cache key for the styled layer (content key + the Layer Styles group: structure, eye
