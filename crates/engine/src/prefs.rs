@@ -342,6 +342,9 @@ pub struct Prefs {
     pub recent_presets: Vec<String>,
     /// Character panel: recently used font families, newest first.
     pub recent_fonts: Vec<String>,
+    /// Library folders (each with a `library.json`) that `library.search` / `library.insert`
+    /// use.
+    pub libraries: Vec<String>,
     /// Preview panel: every shortcut's options.
     pub preview: crate::preview::PreviewSettings,
     /// View ▸ Simulate Output ▸ My Custom RGB.
@@ -379,6 +382,7 @@ impl Default for Prefs {
             recent_footage: vec![],
             recent_presets: vec![],
             recent_fonts: vec![],
+            libraries: vec![],
             preview: crate::preview::PreviewSettings::default(),
             custom_rgb: crate::viewer::CustomRgb::default(),
             extra: Extra::new(),
@@ -528,6 +532,7 @@ impl Prefs {
                 recent_footage: std::mem::take(&mut self.recent_footage),
                 recent_presets: std::mem::take(&mut self.recent_presets),
                 recent_fonts: std::mem::take(&mut self.recent_fonts),
+                libraries: std::mem::take(&mut self.libraries),
                 preview: std::mem::take(&mut self.preview),
                 ..d
             };

@@ -526,6 +526,7 @@ File
     Multiple Files... | file.importMultiple
     Adobe Premiere Pro Project... | file.importTimeline
     After Effects Project... | file.importAep
+    EffectCraft Project... | file.importProject
     Placeholder... | file.importPlaceholder
     Solid... | file.importSolid
     Lottie... | file.importLottie
