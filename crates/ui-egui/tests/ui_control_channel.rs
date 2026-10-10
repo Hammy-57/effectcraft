@@ -202,3 +202,18 @@ fn renders_reply_without_blocking_the_ui_thread() {
     assert_eq!(wait(&mut h, &meanwhile)["ok"], true);
     assert!(h.state().session.job_log.iter().all(|r| r.result.is_null()), "rendered PNGs don't stay in the job log");
 }
+
+/// Agents sharing the app take turns: each client's first request runs before anyone's second.
+#[test]
+fn control_requests_take_turns_by_client() {
+    let req = |client: &str, n: u32| {
+        let mut p = json!({"command": "comp.new", "params": {"name": format!("{client}{n}")}});
+        if !client.is_empty() {
+            p["params"]["client"] = json!(client);
+        }
+        (ControlRequest::new("engine.execute", p).0, n)
+    };
+    let reqs = vec![req("a", 1), req("a", 2), req("a", 3), req("b", 1), req("", 1), req("b", 2)];
+    let order: Vec<String> = control::fair_order(reqs).iter().map(|(r, _)| r.params["params"]["name"].as_str().unwrap().to_string()).collect();
+    assert_eq!(order, ["a1", "b1", "1", "a2", "b2", "a3"]);
+}

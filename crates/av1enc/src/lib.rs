@@ -21,7 +21,7 @@ mod transform;
 mod writer;
 
 use bitw::{BitWriter, obu};
-use decide::{Decider, FrameGeom, RefFrame};
+use decide::{FrameGeom, RefFrame, decide_frame};
 use loopfilter::{LfInfo, loop_filter};
 use pred::Plane;
 use writer::TileWriter;
@@ -365,17 +365,17 @@ impl Encoder {
     fn encode_frame(&self, src: &[Plane; 3], key: bool, qidx: u8) -> (Vec<u8>, RefFrame) {
         let g = &self.geom;
         let refr = if key { None } else { self.refr.as_ref() };
-        let mut dec = Decider::new(g, self.cfg.bit_depth as u32, qidx, key, src, refr);
+        // decisions (superblock rows in parallel), then the syntax in raster order
+        let (nodes, mut rec, mvs) = decide_frame(g, self.cfg.bit_depth as u32, qidx, key, src, refr);
         let mut tw = TileWriter::new(g, key, qidx, refr.map(|r| &*r.cdfs));
-        for sbr in 0..g.sb_rows {
+        for (sbr, row) in nodes.chunks(g.sb_cols.max(1)).enumerate() {
             tw.start_sb_row();
-            for sbc in 0..g.sb_cols {
-                let node = dec.superblock(sbr * 16, sbc * 16);
-                tw.superblock(sbr * 16, sbc * 16, &node);
+            for (sbc, node) in row.iter().enumerate() {
+                tw.superblock(sbr * 16, sbc * 16, node);
             }
         }
-        let lf_level = self.pick_filter_level(&dec.rec, &tw.lf_info(), src, qidx);
-        loop_filter(&mut dec.rec, &tw.lf_info(), [lf_level; 4], self.cfg.bit_depth as u32, false, 1);
+        let lf_level = self.pick_filter_level(&rec, &tw.lf_info(), src, qidx);
+        loop_filter(&mut rec, &tw.lf_info(), [lf_level; 4], self.cfg.bit_depth as u32, false, 1);
         let (tile, cdfs) = tw.finish();
         let mut w = BitWriter::new();
         self.frame_header(&mut w, key, qidx, lf_level);
@@ -385,7 +385,7 @@ impl Encoder {
         payload.extend_from_slice(&tile);
         let mut out = Vec::with_capacity(payload.len() + 8);
         obu(OBU_FRAME, &payload, &mut out);
-        let rf = RefFrame { planes: dec.rec, mvs: dec.mvs, lf_level, cdfs };
+        let rf = RefFrame { planes: rec, mvs, lf_level, cdfs };
         (out, rf)
     }
 

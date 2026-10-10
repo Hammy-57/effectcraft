@@ -1,6 +1,7 @@
 //! Adjustment layers: their effects run on the comp below, within their footprint.
 
-use crate::composite::apply_matte;
+use crate::composite::{apply_matte, window_rows, window_rows_ref};
+use crate::motion_blur::MotionMemo;
 use crate::{EvalCtx, Image, Renderer, color, masks};
 use effectcraft_raster::pool;
 use effectcraft_color::BlendMode;
@@ -14,12 +15,19 @@ impl<'a> Renderer<'a> {
     pub(crate) fn draw_adjustment(&self, ctx: &EvalCtx, layer: &Layer, canvas: &mut Image, opacity: f32) {
         let Some(mut foot) = self.source(ctx, layer) else { return };
         let _ = masks::apply(ctx, layer, &mut foot, self.mask_blur(ctx, layer));
-        let mut matte = pool::zeroed(canvas.width, canvas.height);
-        self.place(ctx, layer, &foot, &mut matte, BlendMode::Normal, 1.0);
+        // The footprint only covers the window the layer reaches: the comp outside it is kept.
+        let mo = MotionMemo::default();
+        let win = self.reach(ctx, layer, &[&foot], &mo, (canvas.width, canvas.height));
+        if win.is_empty() {
+            // Off the comp: its effects would change nothing.
+            return;
+        }
+        let mut matte = pool::zeroed(win.w, win.h);
+        self.place_at(ctx, layer, &foot, &mut matte, win.origin(), BlendMode::Normal, 1.0, &mo);
         // A track matte limits where the adjustment applies (SceneYard UI Google search: a
         // tint + blur only inside a rounded card).
         if let Some((m, kind)) = self.track_matte(ctx, layer) {
-            let mimg = self.matte_image(ctx, m, canvas.width, canvas.height);
+            let mimg = self.matte_image_at(ctx, m, win);
             apply_matte(&mut matte, &mimg, kind);
             pool::recycle(mimg);
         }
@@ -57,11 +65,14 @@ impl<'a> Renderer<'a> {
         // (SceneYard Billiard Balls: a white-to-black 4-Color Gradient adjustment in Overlay
         // shades the felt; Normal washed it out to grey).
         let mode = layer.blend_mode;
-        canvas.data.par_iter_mut().zip(adjusted.img.data.par_iter()).zip(matte.data.par_iter()).for_each(|((c, a), m)| {
-            let k = m[3] * opacity;
-            let a = if mode == BlendMode::Normal { *a } else { effectcraft_color::blend_pixel(mode, *c, *a, 0.5) };
-            for i in 0..4 {
-                c[i] += (a[i] - c[i]) * k;
+        let rows = window_rows(canvas, win).zip(window_rows_ref(&adjusted.img, win)).zip(matte.data.par_chunks(win.w.max(1) as usize));
+        rows.for_each(|((crow, arow), mrow)| {
+            for ((c, a), m) in crow.iter_mut().zip(arow).zip(mrow) {
+                let k = m[3] * opacity;
+                let a = if mode == BlendMode::Normal { *a } else { effectcraft_color::blend_pixel(mode, *c, *a, 0.5) };
+                for i in 0..4 {
+                    c[i] += (a[i] - c[i]) * k;
+                }
             }
         });
         pool::recycle(adjusted.img);
