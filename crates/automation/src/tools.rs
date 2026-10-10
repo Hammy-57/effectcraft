@@ -78,6 +78,7 @@ const READ_ONLY: &[&str] = &[
     "get_state",
     "ui_inspect",
     "ui_elements",
+    "get_layout",
 ];
 /// Tools that write files without changing the project.
 const WRITES_FILES: &[&str] = &["save_project", "render_frame", "screenshot"];
@@ -532,6 +533,19 @@ fn batch_tool(b: &mut Backend, a: &Value) -> Result<Reply> {
     json_reply(b.exec("engine.batch", obj(&[("steps", Some(&steps)), ("label", get(a, "label")), ("atomic", get(a, "atomic"))]))?)
 }
 
+// ------------------------------------------------------------------ analysis tools
+
+fn get_layout(b: &mut Backend, a: &Value) -> Result<Reply> {
+    let layers = match get(a, "layers") {
+        Some(Value::Array(v)) => Some(json!(v)),
+        Some(v) => Some(json!([v])),
+        None => None,
+    };
+    let p =
+        obj(&[("comp", get(a, "comp")), ("time", get(a, "time")), ("layers", layers.as_ref()), ("pixels", get(a, "pixels")), ("overlaps", get(a, "overlaps"))]);
+    json_reply(b.exec("layer.bounds", p)?)
+}
+
 // ------------------------------------------------------------------ bridge-only tools
 
 fn screenshot(b: &mut Backend, a: &Value) -> Result<Reply> {
@@ -787,6 +801,24 @@ static TOOLS: &[ToolDef] = &[
             )
         },
         run: render_frame,
+    },
+    ToolDef {
+        name: "get_layout",
+        description: "Where layers are on screen at a comp time (layer.bounds), without rendering: per layer whether it is drawn (`visible`; `why` not: in/out, Video switch, opacity 0, solo, guide...), its comp-space axis-aligned `bounds` [x,y,w,h] after transform, parenting and (3D) the active camera, the four `corners` (rotated layers), `center`, `anchorInComp`, the raw `position`/`anchor`, `onScreen` (0-1 share inside the comp frame) and the layer-space `source` rect (sourceRectAtTime). `pixels: true` also measures the drawn pixels (`pixelBounds`: masks, effects, styles); `overlaps: true` lists pairwise overlaps of the visible layers. Use it to check a title is centred, on screen or clear of other layers.",
+        bridge_only: false,
+        schema: || {
+            schema(
+                json!({
+                    "comp": comp_s(),
+                    "time": {"type": "number", "description": "Comp time in seconds (default: current time)."},
+                    "layers": {"type": "array", "items": layer_s(), "description": "Layers to measure (default every layer)."},
+                    "pixels": {"type": "boolean", "description": "Also measure the drawn pixels incl. effects (renders each layer)."},
+                    "overlaps": {"type": "boolean", "description": "Also return pairwise overlaps {layers, area, fraction} of the visible layers."}
+                }),
+                &[],
+            )
+        },
+        run: get_layout,
     },
     ToolDef {
         name: "open_project",

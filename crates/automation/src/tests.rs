@@ -1362,3 +1362,24 @@ fn structured_content_is_version_gated_and_matches_output_schemas() {
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(png);
 }
+
+/// `get_layout`: comp-space geometry of layers, headless and bridged.
+#[test]
+fn get_layout_reports_layer_geometry() {
+    for bridge in [false, true] {
+        let mut s = if bridge { McpServer::new(Backend::bridge(&fake_app().to_string()).unwrap()) } else { server() };
+        call_json(&mut s, "command_run", json!({"id": "comp.new", "params": {"width": 400, "height": 300}}));
+        let l = call_json(&mut s, "command_run", json!({"id": "layer.newSolid", "params": {"width": 100, "height": 50}}))["layer"].clone();
+        call_json(&mut s, "set_property", json!({"layer": l, "path": "transform/position", "value": [0, 150]}));
+        let r = call_json(&mut s, "get_layout", json!({"layers": [l], "overlaps": true}));
+        let g = &r["layers"][0];
+        assert_eq!(g["bounds"], json!([-50.0, 125.0, 100.0, 50.0]), "{r}");
+        assert_eq!(g["onScreen"], 0.5);
+        assert_eq!(g["visible"], true);
+        assert_eq!(r["overlaps"], json!([]));
+        // A single layer reference works too; bad references are tool errors.
+        assert_eq!(call_json(&mut s, "get_layout", json!({"layers": "#1"}))["layers"].as_array().unwrap().len(), 1);
+        let (c, err) = call(&mut s, "get_layout", json!({"layers": ["Nope"]}));
+        assert!(err && c[0]["text"].as_str().unwrap().contains("no layer"), "{c:?}");
+    }
+}
