@@ -754,9 +754,14 @@ fn hosts(b: &mut Backend, a: &Value) -> Result<Reply> {
                         .is_some_and(|n| h["project"].as_str().and_then(|p| std::path::Path::new(p).file_name()).is_some_and(|f| f.to_string_lossy() == n))
                 })
             });
-            let h = found.ok_or_else(|| Error::BadArgs(format!("no running EffectCraft has {project} open (see `hosts`); open it with open_project instead")))?;
+            let h =
+                found.ok_or_else(|| Error::BadArgs(format!("no running EffectCraft has {project} open (see `hosts`); open it with open_project instead")))?;
             h["port"].as_u64().and_then(|p| u16::try_from(p).ok()).ok_or_else(|| {
-                Error::BadArgs(format!("{project} is open in {} {}, which agents can't join (no control port)", h["kind"].as_str().unwrap_or("a process"), h["pid"]))
+                Error::BadArgs(format!(
+                    "{project} is open in {} {}, which agents can't join (no control port)",
+                    h["kind"].as_str().unwrap_or("a process"),
+                    h["pid"]
+                ))
             })?
         }
         other => return Err(Error::BadArgs(format!("`join` is a port or a project path, not {other}"))),
@@ -1350,10 +1355,7 @@ static TOOLS: &[ToolDef] = &[
         description: "Where projects are open: every running EffectCraft (the desktop app, headless servers) with its control port and project. `join` (a port, or the path of a project one of them has open) switches this server onto that host, as your own `client`, so you work in the same project as the user and other agents instead of on a copy (claim your comp with command_run comp.claim). Refused while this server's own project has unsaved changes.",
         bridge_only: false,
         schema: || {
-            schema(
-                json!({"join": {"type": ["integer", "string"], "description": "A host's control port, or the path of a project a host has open."}}),
-                &[],
-            )
+            schema(json!({"join": {"type": ["integer", "string"], "description": "A host's control port, or the path of a project a host has open."}}), &[])
         },
         run: hosts,
     },
