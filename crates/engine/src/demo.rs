@@ -37,11 +37,11 @@ fn keys_out(list: &[(f64, Value)]) -> Vec<Keyframe> {
         let d = key.value.dims().max(1);
         if i + 1 < n {
             key.out_interp = Interp::Bezier;
-            key.out_ease = vec![Ease { speed: 0.0, influence: 0.05 }; d];
+            key.out_ease = vec![Ease { speed: 0.0, influence: 0.05 }; d].into();
         }
         if i > 0 {
             key.in_interp = Interp::Bezier;
-            key.in_ease = vec![Ease { speed: 0.0, influence: 0.85 }; d];
+            key.in_ease = vec![Ease { speed: 0.0, influence: 0.85 }; d].into();
         }
     }
     k

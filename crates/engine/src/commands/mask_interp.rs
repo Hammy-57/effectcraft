@@ -177,7 +177,7 @@ fn track_mask(s: &mut Session, p: &Value) -> Result<Value> {
         cache: s.layer_cache.clone(),
         comp: cid,
         layer: lid,
-        path,
+        path: *path,
         method,
         times: times.clone(),
         face_model: if method.is_face() { s.models.face() } else { None },
@@ -497,7 +497,7 @@ fn interpolate(s: &mut Session, p: &Value) -> Result<Value> {
         // Keys strictly inside the interpolated span are replaced.
         pr.keys.retain(|k| k.time <= first || k.time >= last || times.contains(&k.time));
         for (t, sp) in &out {
-            effectcraft_keyframe::set_key(&mut pr.keys, Keyframe::new(*t, KV::Path(sp.clone())));
+            effectcraft_keyframe::set_key(&mut pr.keys, Keyframe::new(*t, KV::path(sp.clone())));
         }
         Ok(())
     })?;

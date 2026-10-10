@@ -26,8 +26,8 @@ fn project(comp_blur: bool) -> (Project, ItemId) {
     }
     let path = m.get_mut("path").unwrap();
     path.keys = vec![
-        Keyframe::new(Tick::ZERO, Value::Path(ShapePath::rect([20.0, 50.0], 20.0, 100.0))),
-        Keyframe::new(FrameRate::FPS_30.tick_of(1), Value::Path(ShapePath::rect([60.0, 50.0], 20.0, 100.0))),
+        Keyframe::new(Tick::ZERO, Value::path(ShapePath::rect([20.0, 50.0], 20.0, 100.0))),
+        Keyframe::new(FrameRate::FPS_30.tick_of(1), Value::path(ShapePath::rect([60.0, 50.0], 20.0, 100.0))),
     ];
     l.props.sub_mut("masks").unwrap().children.push(Node::Group(m));
     l.switches.motion_blur = false;

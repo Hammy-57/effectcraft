@@ -4,7 +4,8 @@
 use crate::{EvalCtx, LayerTiming, Renderer, cache, color, masks, source_size, styles};
 use effectcraft_color::BlendMode;
 use effectcraft_effects::Buf;
-use effectcraft_project::{Layer, LayerSource};
+use effectcraft_keyframe::Value;
+use effectcraft_project::{Comp, Layer, LayerSource, Node, PropGroup};
 use std::sync::Arc;
 
 impl<'a> Renderer<'a> {
@@ -226,7 +227,58 @@ impl<'a> Renderer<'a> {
             }
             return Some(st);
         }
+        if self.blend_only(ctx, layer) {
+            return self.plain_blend(ctx, layer, timing);
+        }
         self.styled(ctx, layer, timing).map(|st| self.styled_to_blend(st))
+    }
+
+    /// With linear blending, is `layer` a plain layer (no Layer Styles) whose working-space
+    /// pixels nothing else reads? Then only its blending-space copy is worth caching.
+    fn blend_only(&self, ctx: &EvalCtx, layer: &Layer) -> bool {
+        self.cache.is_some() && self.pipe.to_blend().is_some() && !styles::active(ctx, layer) && !working_read(ctx.comp, layer)
+    }
+
+    /// [`Self::styled_blend`] of a [`Self::blend_only`] layer: its content is converted in place
+    /// and cached in the blending space alone (no working-space copy cloned and kept next to
+    /// it). The same pixels as [`Self::content_buf_timed`] then [`Self::to_blend`].
+    fn plain_blend(&self, ctx: &EvalCtx, layer: &Layer, mut timing: Option<&mut LayerTiming>) -> Option<StyledLayer> {
+        let (ckey, noted) = self.content_cache_key_noted(ctx, layer);
+        let key = ckey.map(|k| cache::derive(k, 0x1ea7));
+        let mut _flight = None;
+        if let Some(c) = self.cache {
+            let hit = match key {
+                Some(k) => c.get(k).or_else(|| match c.claim(k) {
+                    cache::Claim::Ready(b) => Some(b),
+                    cache::Claim::Owner(g) => {
+                        _flight = Some(g);
+                        None
+                    }
+                    cache::Claim::Render => None,
+                }),
+                None => None,
+            };
+            if let Some(id) = noted {
+                c.precomp_note(id, hit.is_some());
+            }
+            if let Some(b) = hit {
+                if let Some(t) = timing.as_deref_mut() {
+                    t.cached = true;
+                }
+                return Some(StyledLayer { passes: vec![], content: b.clone(), body: b, key: ckey, ckey, plain: true });
+            }
+        }
+        let buf = self.masked_source(ctx, layer)?;
+        let mut buf = self.apply_effects_timed(ctx, layer, buf, false, usize::MAX, timing.map(|t| &mut t.effects));
+        if let Some(c) = self.pipe.to_blend() {
+            color::convert(&mut buf.img, &c);
+        }
+        let buf = Arc::new(buf);
+        if let (Some(c), Some(k)) = (self.cache, key) {
+            c.insert(k, buf.clone());
+        }
+        // (`_flight`, dropped here, wakes the threads waiting for this buffer.)
+        Some(StyledLayer { passes: vec![], content: buf.clone(), body: buf, key: ckey, ckey, plain: true })
     }
 
     fn styled_blend_cached(&self, ctx: &EvalCtx, layer: &Layer) -> Option<StyledLayer> {
@@ -261,6 +313,34 @@ impl<'a> Renderer<'a> {
     }
 }
 
+/// Could anything in `layer`'s comp read its working-space pixels (its content buffer) other
+/// than compositing it: a track matte naming it, an effect's layer parameter (Displacement Map,
+/// Set Matte…) or an expression's `sampleImage`? Errs towards yes: a wrong yes only keeps a
+/// copy in the layer cache, a wrong no only re-renders the layer for that reader.
+fn working_read(comp: &Comp, layer: &Layer) -> bool {
+    comp.layers.iter().any(|l| {
+        l.track_matte.as_ref().is_some_and(|m| m.layer == layer.id)
+            || l.effects().is_some_and(names_a_layer)
+            || (cache::layer_info(comp, l).expressions && samples_pixels(&l.props))
+    })
+}
+
+/// Does a property of `g` take a layer (whatever its value)?
+fn names_a_layer(g: &PropGroup) -> bool {
+    g.children.iter().any(|c| match c {
+        Node::Prop(p) => matches!(p.value, Value::Layer(_)),
+        Node::Group(sub) => names_a_layer(sub),
+    })
+}
+
+/// Does an expression in `g` read rendered pixels (`sampleImage`)?
+fn samples_pixels(g: &PropGroup) -> bool {
+    g.children.iter().any(|c| match c {
+        Node::Prop(p) => p.expr.as_ref().is_some_and(|e| e.text.contains("sampleImage")),
+        Node::Group(sub) => samples_pixels(sub),
+    })
+}
+
 /// A layer ready to composite (see [`Renderer::styled_layer`]).
 pub struct StyledLayer {
     /// Exterior style passes (Drop Shadow, Outer Glow) with their blend modes.
@@ -274,4 +354,111 @@ pub struct StyledLayer {
     ckey: Option<u64>,
     /// No layer styles: composite `body` the usual way.
     pub plain: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{LayerCache, NoFootage, RenderOpts};
+    use effectcraft_color::Label;
+    use effectcraft_project::build::{self, Ids};
+    use effectcraft_project::{Expression, ItemId, ItemKind, MatteKind, Project, Property, Solid, TrackMatte};
+    use effectcraft_time::{FrameRate, Tick};
+
+    fn solid(p: &mut Project, c: &Comp, color: [f32; 3], w: u32) -> Layer {
+        let sid = p.add_item("S", Label::Red, None, ItemKind::Solid(Solid { color, width: w, height: 20, pixel_aspect: 1.0 }));
+        build::layer(p, c, "S", LayerSource::Solid { item: sid }, (w, 20), None)
+    }
+
+    fn blur(p: &mut Project, l: &mut Layer, amount: f64) {
+        let Some(spec) = effectcraft_effects::find("ec.blur.gaussian") else { panic!("gaussian") };
+        let mut next = p.next_id;
+        let mut g = effectcraft_effects::instantiate(spec, &mut Ids(&mut next), spec.name, [40.0, 20.0]);
+        p.next_id = next;
+        let Some(b) = g.prop_mut("blurriness") else { panic!("blurriness") };
+        b.value = Value::Scalar(amount);
+        let Some(fx) = l.props.sub_mut("effects") else { panic!("effects") };
+        fx.children.push(g.into());
+    }
+
+    /// A linear-blending comp: a blurred solid screened over a solid, the top one optionally
+    /// the bottom one's track matte.
+    fn scene(matte: bool) -> (Project, ItemId) {
+        let mut p = Project::default();
+        p.settings.blend_linear = true;
+        let comp = Comp::new(40, 20, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+        let cid = p.add_item("Comp", Label::Sandstone, None, ItemKind::Comp(comp.clone().into()));
+        let bottom = solid(&mut p, &comp, [0.1, 0.5, 0.9], 40);
+        let mut top = solid(&mut p, &comp, [0.8, 0.2, 0.1], 24);
+        blur(&mut p, &mut top, 3.0);
+        top.blend_mode = BlendMode::Screen;
+        let mut bottom = bottom;
+        if matte {
+            bottom.track_matte = Some(TrackMatte { layer: top.id, kind: MatteKind::Alpha });
+        }
+        let Some(c) = p.comp_mut(cid) else { panic!("comp") };
+        c.layers.insert(0, bottom);
+        c.layers.insert(0, top);
+        (p, cid)
+    }
+
+    /// With linear blending, layers nothing else reads are cached in the blending space alone
+    /// (one entry per layer, not two) and the frame is bit-identical to an uncached render,
+    /// which converts a working-space copy.
+    #[test]
+    fn linear_blend_caches_unread_layers_once() {
+        let (p, cid) = scene(false);
+        let cache = LayerCache::default();
+        let frame = || {
+            let mut r = Renderer::new(&p, &NoFootage, RenderOpts::default());
+            r.cache = Some(&cache);
+            r.comp_frame(cid, Tick::ZERO)
+        };
+        let a = frame();
+        assert_eq!(cache.stats().entries, 2, "one blending-space copy per layer");
+        let hits = cache.stats().hits;
+        let b = frame();
+        assert_eq!(cache.stats().hits, hits + 2, "one hit per layer");
+        assert_eq!(cache.stats().entries, 2);
+        let uncached = Renderer::new(&p, &NoFootage, RenderOpts::default()).comp_frame(cid, Tick::ZERO);
+        let bits = |i: &effectcraft_raster::Image| i.data.iter().flat_map(|px| px.map(f32::to_bits)).collect::<Vec<_>>();
+        assert_eq!(bits(&a), bits(&uncached));
+        assert_eq!(bits(&b), bits(&uncached));
+    }
+
+    /// A layer another layer reads as its track matte keeps its working-space copy (the matte
+    /// reads it); pixels are unchanged either way.
+    #[test]
+    fn linear_blend_keeps_working_copies_that_are_read() {
+        let (p, cid) = scene(true);
+        let cache = LayerCache::default();
+        let mut r = Renderer::new(&p, &NoFootage, RenderOpts::default());
+        r.cache = Some(&cache);
+        let a = r.comp_frame(cid, Tick::ZERO);
+        // The matte (top) layer: working and blending copies; the matted layer: blending only.
+        assert_eq!(cache.stats().entries, 3);
+        let uncached = Renderer::new(&p, &NoFootage, RenderOpts::default()).comp_frame(cid, Tick::ZERO);
+        assert_eq!(a.data, uncached.data);
+    }
+
+    /// Layer parameters and `sampleImage` expressions count as readers.
+    #[test]
+    fn working_readers() {
+        let (mut p, cid) = scene(false);
+        let read = |p: &Project| {
+            let Some(c) = p.comp(cid) else { panic!("comp") };
+            c.layers.iter().map(|l| working_read(c, l)).collect::<Vec<_>>()
+        };
+        assert_eq!(read(&p), [false, false]);
+        let Some(c) = p.comp_mut(cid) else { panic!("comp") };
+        let Some(pos) = c.layers.get_mut(1).and_then(|l| l.props.prop_mut("transform/position")) else { panic!("position") };
+        pos.expr = Some(Expression { text: "thisComp.layer(1).sampleImage([10, 10])".into(), enabled: true });
+        assert_eq!(read(&p), [true, true]);
+        let mut fx = PropGroup::new(1, "fx", "Fx");
+        assert!(!names_a_layer(&fx));
+        let mut sub = PropGroup::new(2, "sub", "Sub");
+        sub.children.push(Node::Prop(Property::new(3, "layer", "Layer", Value::Layer(None))));
+        fx.children.push(Node::Group(sub));
+        assert!(names_a_layer(&fx));
+    }
 }

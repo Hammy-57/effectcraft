@@ -265,15 +265,24 @@ pub enum Value {
     Bool(bool),
     /// Index into a popup's options (1-based like AE's dropdown values is a UI concern; this is 0-based).
     Enum(u32),
-    Path(ShapePath),
+    /// Boxed (with `Gradient`) so a `Value` stays small: every property and keyframe holds one.
+    Path(Box<ShapePath>),
     Text(Box<TextDoc>),
     /// Layer reference (layer id), e.g. Layer Control effects, track matte sources.
     Layer(Option<u64>),
-    Gradient(Gradient),
+    Gradient(Box<Gradient>),
     Str(String),
 }
 
 impl Value {
+    /// A path value (boxes `p`).
+    pub fn path(p: ShapePath) -> Value {
+        Value::Path(Box::new(p))
+    }
+    /// A gradient value (boxes `g`).
+    pub fn gradient(g: Gradient) -> Value {
+        Value::Gradient(Box::new(g))
+    }
     /// Numeric components (empty for non-numeric values).
     pub fn components(&self) -> Vec<f64> {
         match self {
@@ -314,7 +323,7 @@ impl Value {
     }
     pub fn lerp(&self, o: &Value, t: f64) -> Value {
         match (self, o) {
-            (Value::Path(a), Value::Path(b)) => Value::Path(a.lerp(b, t)),
+            (Value::Path(a), Value::Path(b)) => Value::path(a.lerp(b, t)),
             (Value::Gradient(a), Value::Gradient(b)) if a.colors.len() == b.colors.len() && a.opacities.len() == b.opacities.len() => {
                 let colors = a
                     .colors
@@ -337,7 +346,7 @@ impl Value {
                         })
                         .collect()
                 };
-                Value::Gradient(Gradient {
+                Value::gradient(Gradient {
                     colors,
                     opacities,
                     color_midpoints: midpoint_lerp(&a.color_midpoints, &b.color_midpoints, a.colors.len().saturating_sub(1)),
@@ -455,12 +464,12 @@ impl Value {
                 }
             }
             Value::Layer(_) => Some(Value::Layer(j.as_u64())),
-            Value::Path(_) => serde_json::from_value::<ShapePath>(j.clone()).ok().map(Value::Path).or_else(|| serde_json::from_value::<Value>(j.clone()).ok()),
+            Value::Path(_) => serde_json::from_value::<ShapePath>(j.clone()).ok().map(Value::path).or_else(|| serde_json::from_value::<Value>(j.clone()).ok()),
             Value::Gradient(_) => serde_json::from_value::<Value>(j.clone())
                 .ok()
                 .filter(|v| matches!(v, Value::Gradient(_)))
-                .or_else(|| serde_json::from_value::<Gradient>(j.clone()).ok().map(Value::Gradient))
-                .or_else(|| gradient_json(j).map(Value::Gradient)),
+                .or_else(|| serde_json::from_value::<Gradient>(j.clone()).ok().map(Value::gradient))
+                .or_else(|| gradient_json(j).map(Value::gradient)),
         }
     }
     /// JSON for display/automation (numbers/arrays for numeric kinds).
@@ -496,9 +505,9 @@ mod gradient_tests {
         let at = g.sample(0.25);
         assert!((at[0] - 0.5).abs() < 1e-6);
         assert!((g.sample(0.75)[3] - 0.5).abs() < 1e-6);
-        let json = serde_json::to_value(Value::Gradient(g.clone())).unwrap();
-        assert_eq!(Value::Gradient(Gradient::default()).coerce_json(&json), Some(Value::Gradient(g.clone())));
-        let Value::Gradient(mid) = Value::Gradient(g).lerp(&Value::Gradient(Gradient::default()), 0.5) else { panic!("gradient") };
+        let json = serde_json::to_value(Value::gradient(g.clone())).unwrap();
+        assert_eq!(Value::gradient(Gradient::default()).coerce_json(&json), Some(Value::gradient(g.clone())));
+        let Value::Gradient(mid) = Value::gradient(g).lerp(&Value::gradient(Gradient::default()), 0.5) else { panic!("gradient") };
         assert_eq!(mid.color_midpoints[0], 0.375);
     }
 }

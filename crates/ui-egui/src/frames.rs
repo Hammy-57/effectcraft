@@ -973,6 +973,19 @@ impl Frames {
     }
 }
 
+/// Frames that rendered faster than this aren't written to the disk cache: rendering them
+/// again costs about as much as reading and decompressing them, and the copy + LZ4 compression
+/// would come out of the frame worker's time.
+const DISK_MIN_RENDER: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Whether a freshly rendered frame goes to the disk cache: only frames that were expensive to
+/// render, and no prefetch frame while more prefetch is queued (playback and RAM preview keep the
+/// workers busy; there compression would slow the frames being waited for). The viewer's frame
+/// is kept whenever it was expensive.
+fn keep_on_disk(render: std::time::Duration, urgent: bool, prefetch_queued: usize) -> bool {
+    render >= DISK_MIN_RENDER && (urgent || prefetch_queued == 0)
+}
+
 /// Renders queued jobs (on a pool thread, or the UI thread on wasm32).
 #[derive(Clone)]
 struct Worker {
@@ -1043,12 +1056,17 @@ impl Worker {
                 }
             },
         };
-        // Publish the shared frame and wake the viewer before optional RGBA conversion
-        // and compression. Persistence still runs on this worker, using the same snapshot.
+        let render_time = t0.elapsed();
+        // Publish the shared frame and wake the viewer before compression. Persistence still
+        // runs on this worker, using the same snapshot.
         self.finish(&job, ci.clone(), t0);
-        if !disk_hit && let (Some((dc, k)), FrameImage::Cpu(img)) = (&disk, &ci) {
-            let rgba: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_array()).collect();
-            dc.put_frame(*k, img.size[0] as u32, img.size[1] as u32, &rgba);
+        let backlog = queue.lock().map(|q| q.jobs.iter().filter(|j| !j.urgent).count()).unwrap_or(0);
+        if !disk_hit
+            && keep_on_disk(render_time, job.urgent, backlog)
+            && let (Some((dc, k)), FrameImage::Cpu(img)) = (&disk, &ci)
+        {
+            // `Color32` is premultiplied RGBA bytes already: no copy before compression.
+            dc.put_frame(*k, img.size[0] as u32, img.size[1] as u32, img.as_raw());
             if let Some(ctx) = &self.ctx {
                 ctx.request_repaint();
             }
@@ -1557,6 +1575,19 @@ mod tests {
         insert(&f, key(1, 2, 0));
         assert!(f.disk_frames(&src, &key(1, 0, 0), 5, &opts).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only expensive frames go to the disk cache, and prefetch frames only when no other
+    /// prefetch is waiting (playback / RAM preview).
+    #[test]
+    fn disk_cache_keeps_only_expensive_idle_frames() {
+        let ms = std::time::Duration::from_millis;
+        assert!(!keep_on_disk(ms(2), true, 0), "cheap viewer frame");
+        assert!(!keep_on_disk(ms(2), false, 0), "cheap prefetch frame");
+        assert!(keep_on_disk(DISK_MIN_RENDER, true, 0), "expensive viewer frame");
+        assert!(keep_on_disk(ms(400), true, 12), "the viewer's frame doesn't wait for prefetch");
+        assert!(keep_on_disk(ms(400), false, 0), "the last prefetch frame");
+        assert!(!keep_on_disk(ms(400), false, 1), "prefetch still queued: playback");
     }
 
     #[test]

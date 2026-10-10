@@ -33,8 +33,8 @@ mod tests {
         let mut b = Keyframe::new(s(29.48), Value::Color([0.0, 0.0, 0.0, 1.0]));
         a.out_interp = Interp::Bezier;
         b.in_interp = Interp::Bezier;
-        a.out_ease = vec![Ease { speed: 0.0, influence: 1.0 / 3.0 }];
-        b.in_ease = vec![Ease { speed: 1380.2279514757106, influence: 1.0 }];
+        a.out_ease = vec![Ease { speed: 0.0, influence: 1.0 / 3.0 }].into();
+        b.in_ease = vec![Ease { speed: 1380.2279514757106, influence: 1.0 }].into();
         let mut keys = [a, b];
         normalize(&mut keys);
         let Value::Color(mid) = evaluate(&keys, s(29.32), false).unwrap() else { panic!("expected Color") };

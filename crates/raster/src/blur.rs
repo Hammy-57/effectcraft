@@ -231,26 +231,98 @@ pub fn directional_blur(img: &Image, angle_deg: f64, length: f64, repeat: bool) 
     directional_blur_sampled(img, angle_deg, length, n, repeat)
 }
 
-/// [`directional_blur`] at any angle: `n` bilinear samples per pixel.
+/// One sample of [`directional_blur_sampled`]: the bilinear sample at a pixel centre plus the
+/// tap's offset reads the 2×2 block whose top-left is `(kx, ky)` pixels away, with fractions
+/// `(tx, ty)`, the same for every pixel.
+struct DirTap {
+    kx: i64,
+    ky: i64,
+    tx: f32,
+    ty: f32,
+}
+
+/// [`directional_blur`] at any angle: `n` bilinear samples per pixel, their footprints computed
+/// once per call. Pixels whose every footprint lies inside the image read the 2×2 blocks by
+/// offset from the pixel's index; the rest sample per tap with the edge mode.
 fn directional_blur_sampled(img: &Image, angle_deg: f64, length: f64, n: usize, repeat: bool) -> Image {
     let a = angle_deg.to_radians();
     let (dx, dy) = (a.sin(), -a.cos());
+    let taps: Vec<DirTap> = (0..n)
+        .map(|i| {
+            let t = (i as f64 / (n - 1) as f64 - 0.5) * length;
+            let (ox, oy) = (dx * t, dy * t);
+            let (fx, fy) = (ox.floor(), oy.floor());
+            DirTap { kx: fx as i64, ky: fy as i64, tx: (ox - fx) as f32, ty: (oy - fy) as f32 }
+        })
+        .collect();
+    let (w, h) = (img.width as i64, img.height as i64);
     let mut out = Image::new(img.width, img.height);
+    if w == 0 || h == 0 || img.data.len() as i64 != w.saturating_mul(h) {
+        return out;
+    }
+    let (kx0, kx1) = taps.iter().fold((i64::MAX, i64::MIN), |(lo, hi), t| (lo.min(t.kx), hi.max(t.kx)));
+    let (ky0, ky1) = taps.iter().fold((i64::MAX, i64::MIN), |(lo, hi), t| (lo.min(t.ky), hi.max(t.ky)));
+    // Each tap's block starts this many pixels from the output pixel's index.
+    let offs: Vec<i64> = taps.iter().map(|t| t.ky.saturating_mul(w).saturating_add(t.kx)).collect();
+    // Columns whose blocks all fit horizontally: x + kx0 >= 0 and x + kx1 + 1 <= w - 1.
+    let x_lo = kx0.saturating_neg().clamp(0, w);
+    let x_hi = w.saturating_sub(1).saturating_sub(kx1).clamp(x_lo, w);
+    let wu = w as usize;
+    let edge = |x: i64, y: i64, t: &DirTap| -> Px {
+        let (x0, y0) = (x.saturating_add(t.kx), y.saturating_add(t.ky));
+        let (x1, y1) = (x0.saturating_add(1), y0.saturating_add(1));
+        if repeat {
+            bilerp(img.get_clamped(x0, y0), img.get_clamped(x1, y0), img.get_clamped(x0, y1), img.get_clamped(x1, y1), t.tx, t.ty)
+        } else {
+            bilerp(img.get(x0, y0), img.get(x1, y0), img.get(x0, y1), img.get(x1, y1), t.tx, t.ty)
+        }
+    };
     out.rows_mut().for_each(|(y, row)| {
+        let y = y as i64;
+        let rows_inside = y.saturating_add(ky0) >= 0 && y.saturating_add(ky1).saturating_add(1) < h;
+        let base = y.saturating_mul(w);
         for (x, px) in row.iter_mut().enumerate() {
+            let x = x as i64;
             let mut acc = [0.0f32; 4];
-            for i in 0..n {
-                let t = (i as f64 / (n - 1) as f64 - 0.5) * length;
-                let (sx, sy) = (x as f64 + 0.5 + dx * t, y as f64 + 0.5 + dy * t);
-                let p = if repeat { img.sample_bilinear_clamped(sx, sy) } else { img.sample_bilinear(sx, sy) };
-                for c in 0..4 {
-                    acc[c] += p[c];
+            if rows_inside && (x_lo..x_hi).contains(&x) {
+                for (t, &off) in taps.iter().zip(&offs) {
+                    // In bounds by construction; a miss (never) falls back to the edge sample.
+                    let block = usize::try_from(base.saturating_add(x).saturating_add(off)).ok().and_then(|i| {
+                        let (r0, r1) = (i.checked_add(wu)?, i.checked_add(wu)?.checked_add(2)?);
+                        Some((img.data.get(i..i.checked_add(2)?)?, img.data.get(r0..r1)?))
+                    });
+                    let p = match block {
+                        Some((&[a, b], &[c, d])) => bilerp(a, b, c, d, t.tx, t.ty),
+                        _ => edge(x, y, t),
+                    };
+                    for c in 0..4 {
+                        acc[c] += p[c];
+                    }
+                }
+            } else {
+                for t in &taps {
+                    let p = edge(x, y, t);
+                    for c in 0..4 {
+                        acc[c] += p[c];
+                    }
                 }
             }
             *px = acc.map(|v| v / n as f32);
         }
     });
     out
+}
+
+/// [`Image::sample_bilinear`]'s interpolation of a 2×2 block.
+#[inline(always)]
+fn bilerp(a: Px, b: Px, c: Px, d: Px, tx: f32, ty: f32) -> Px {
+    let mut o = [0.0; 4];
+    for i in 0..4 {
+        let top = a[i] + (b[i] - a[i]) * tx;
+        let bot = c[i] + (d[i] - c[i]) * tx;
+        o[i] = top + (bot - top) * ty;
+    }
+    o
 }
 
 /// Whole-pixel taps of an axis-aligned [`directional_blur`]: the bilinear weights its `n`
@@ -531,7 +603,7 @@ mod tests {
                 for repeat in [false, true] {
                     let n = (length.ceil() as usize * 2 + 1).clamp(3, 257);
                     let fast = directional_blur_axis(&img, angle, length, n, repeat).expect("axis angle");
-                    let slow = directional_blur_sampled(&img, angle, length, n, repeat);
+                    let slow = directional_blur_ref(&img, angle, length, n, repeat);
                     assert_close(&fast, &slow, &format!("angle {angle} length {length} repeat {repeat}"));
                 }
             }
@@ -539,6 +611,55 @@ mod tests {
         assert!(directional_blur_axis(&img, 45.0, 10.0, 21, false).is_none());
         assert!(directional_blur_axis(&img, 90.5, 10.0, 21, false).is_none());
         assert!(directional_blur_axis(&img, f64::NAN, 10.0, 21, false).is_none());
+    }
+
+    /// [`directional_blur_sampled`] before its taps were precomputed: per pixel and tap, a bilinear
+    /// sample at the tap's position.
+    fn directional_blur_ref(img: &Image, angle_deg: f64, length: f64, n: usize, repeat: bool) -> Image {
+        let a = angle_deg.to_radians();
+        let (dx, dy) = (a.sin(), -a.cos());
+        let mut out = Image::new(img.width, img.height);
+        out.rows_mut().for_each(|(y, row)| {
+            for (x, px) in row.iter_mut().enumerate() {
+                let mut acc = [0.0f32; 4];
+                for i in 0..n {
+                    let t = (i as f64 / (n - 1) as f64 - 0.5) * length;
+                    let (sx, sy) = (x as f64 + 0.5 + dx * t, y as f64 + 0.5 + dy * t);
+                    let p = if repeat { img.sample_bilinear_clamped(sx, sy) } else { img.sample_bilinear(sx, sy) };
+                    for c in 0..4 {
+                        acc[c] += p[c];
+                    }
+                }
+                *px = acc.map(|v| v / n as f32);
+            }
+        });
+        out
+    }
+
+    /// The general-angle path equals the per-pixel sampling it replaces to float rounding, at
+    /// angles off the axes, lengths shorter and longer than the image, both edge modes and
+    /// images narrower than the blur.
+    #[test]
+    fn directional_sampled_matches_reference() {
+        let mut max = 0.0f32;
+        for img in [noisy(37, 29), noisy(1, 1), noisy(3, 2), noisy(64, 5)] {
+            for angle in [45.0, 33.0, 142.0, 271.3, -17.0, 89.9, 180.0001, 1e-7] {
+                for length in [0.5f64, 1.0, 3.3, 10.0, 40.0, 200.0] {
+                    for repeat in [false, true] {
+                        let n = (length.ceil() as usize * 2 + 1).clamp(3, 257);
+                        let fast = directional_blur_sampled(&img, angle, length, n, repeat);
+                        let slow = directional_blur_ref(&img, angle, length, n, repeat);
+                        assert_close(&fast, &slow, &format!("angle {angle} length {length} repeat {repeat}"));
+                        for (p, q) in fast.data.iter().zip(&slow.data) {
+                            for c in 0..4 {
+                                max = max.max((p[c] - q[c]).abs());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("directional sampled vs reference: max abs difference {max:e}");
     }
 
     /// Degenerate inputs neither crash nor take the axis path wrongly. Regression: an infinite
@@ -554,7 +675,7 @@ mod tests {
         let empty = Image::new(0, 4);
         assert!(directional_blur(&empty, 90.0, 10.0, false).data.is_empty());
         let one = noisy(1, 1);
-        let slow = directional_blur_sampled(&one, 0.0, 6.0, 13, true);
+        let slow = directional_blur_ref(&one, 0.0, 6.0, 13, true);
         assert_close(&directional_blur(&one, 0.0, 6.0, true), &slow, "1x1");
     }
 
@@ -601,10 +722,10 @@ mod tests {
     #[ignore]
     fn blur_timing() {
         let img = noisy(1920, 1080);
-        for (angle, length) in [(0.0, 20.0f64), (90.0, 20.0), (90.0, 100.0), (0.0, 100.0)] {
+        for (angle, length) in [(0.0, 20.0f64), (90.0, 20.0), (90.0, 100.0), (0.0, 100.0), (45.0, 20.0), (33.0, 100.0)] {
             let n = (length.ceil() as usize * 2 + 1).clamp(3, 257);
             let t = std::time::Instant::now();
-            let _ = directional_blur_sampled(&img, angle, length, n, false);
+            let _ = directional_blur_ref(&img, angle, length, n, false);
             let slow = t.elapsed();
             let t = std::time::Instant::now();
             let _ = directional_blur(&img, angle, length, false);

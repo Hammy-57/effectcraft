@@ -218,7 +218,7 @@ fn evaluate(ctx: &EvalCtx, layer: &Layer, g: &PropGroup) -> Styles {
         let col = |m: &str| rgb(ctx.color(layer, sg, m));
         let ang = || if ctx.b(layer, sg, "useGlobalLight") { ga } else { f("angle", st::DEFAULT_ANGLE) };
         let grad = || match ctx.group_value(layer, sg, "colors") {
-            Some(Value::Gradient(g)) => g,
+            Some(Value::Gradient(g)) => *g,
             _ => Gradient::default(),
         };
         match sg.match_id.as_str() {

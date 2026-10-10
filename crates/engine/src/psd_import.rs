@@ -664,7 +664,7 @@ fn apply_effects(proj: &mut Project, layer: &mut Layer, fx: &Descriptor, gl: &st
             }
             "gradientOverlay" => {
                 if let Some(gr) = gradient_of(d) {
-                    set(g, "colors", Value::Gradient(gr));
+                    set(g, "colors", Value::gradient(gr));
                 }
                 if let Some(a) = d.num("Angl") {
                     set(g, "angle", Value::Scalar(a));

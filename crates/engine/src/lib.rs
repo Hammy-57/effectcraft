@@ -1163,6 +1163,27 @@ impl Session {
 /// ([`effectcraft_effects::migrate::to_effect_space`]). Stamps the current schema.
 pub fn upgrade_effects(p: &mut Project) {
     let to_effect_space = p.schema < effectcraft_project::SCHEMA_EFFECT_SPACE;
+    // The layers with an instance to change (any registered effect when moving into effect
+    // space): only those are made unique, so a project of current instances isn't copied.
+    let mut todo = std::collections::HashSet::new();
+    for (cid, c) in p.comps() {
+        for l in &c.layers {
+            let Some(fx) = l.props.sub("effects") else { continue };
+            let stale = fx.groups().any(|g| match &g.kind {
+                effectcraft_project::GroupKind::Effect { effect } => {
+                    effectcraft_effects::find(effect).is_some_and(|spec| to_effect_space || !effectcraft_effects::migrate::is_current(spec, g))
+                }
+                _ => false,
+            });
+            if stale {
+                todo.insert((*cid, l.id));
+            }
+        }
+    }
+    if todo.is_empty() {
+        p.schema = effectcraft_project::SCHEMA_VERSION;
+        return;
+    }
     // Effect bounds per layer: (size, top-left in layer coordinates).
     let mut bounds = std::collections::HashMap::new();
     for (cid, c) in p.comps() {
@@ -1174,8 +1195,12 @@ pub fn upgrade_effects(p: &mut Project) {
     let mut next = p.next_id;
     for (cid, it) in p.items.iter_mut() {
         let effectcraft_project::ItemKind::Comp(c) = &mut it.kind else { continue };
-        for l in &mut std::sync::Arc::make_mut(c).layers {
-            let (size, origin, _) = bounds.get(&(*cid, l.id)).copied().unwrap_or(([100.0, 100.0], [0.0; 2], false));
+        let cid = *cid;
+        if !c.layers.iter().any(|l| todo.contains(&(cid, l.id))) {
+            continue;
+        }
+        for l in std::sync::Arc::make_mut(c).layers.iter_mut_where(|l| todo.contains(&(cid, l.id))) {
+            let (size, origin, _) = bounds.get(&(cid, l.id)).copied().unwrap_or(([100.0, 100.0], [0.0; 2], false));
             // Effect space starts at the bounds' top-left: positions move by minus that corner.
             // Adjustment layers run their effects on the comp below as it is: nothing moves.
             // Shape layers already measured effect points from their anchor-centred comp-sized
@@ -1183,7 +1208,7 @@ pub fn upgrade_effects(p: &mut Project) {
             let shift = |o: [f64; 2]| [-o[0], -o[1]];
             let d = if l.switches.adjustment || matches!(l.source, effectcraft_project::LayerSource::Shape) { [0.0; 2] } else { shift(origin) };
             let clone_d = |src: Option<u64>| match src {
-                Some(id) => bounds.get(&(*cid, effectcraft_project::LayerId(id))).map_or([0.0; 2], |b| if b.2 { [0.0; 2] } else { shift(b.1) }),
+                Some(id) => bounds.get(&(cid, effectcraft_project::LayerId(id))).map_or([0.0; 2], |b| if b.2 { [0.0; 2] } else { shift(b.1) }),
                 None => d,
             };
             let Some(fx) = l.props.sub_mut("effects") else { continue };

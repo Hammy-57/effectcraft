@@ -240,7 +240,7 @@ fn collect(ctx: &EvalCtx, layer: &Layer, contents: &PropGroup, arena: &mut Vec<B
             }
             "gfill" | "gstroke" => {
                 let gr = match ctx.group_value(layer, g, "colors") {
-                    Some(Value::Gradient(gr)) => gr,
+                    Some(Value::Gradient(gr)) => *gr,
                     _ => Gradient::default(),
                 };
                 let stroke = (g.match_id == "gstroke").then(|| stroke_style(ctx, layer, g));
