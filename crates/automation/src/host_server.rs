@@ -11,26 +11,21 @@
 //! (throttled for big projects, see `autosave`), the host is in the host list while it runs, and
 //! `host.release` saves the project and stops the host (a handover: the desktop app opens it).
 
-use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::collections::BTreeSet;
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use effectcraft_engine::Session;
+use effectcraft_engine::job_waiter::{JobWaiter, Started};
 use serde_json::{Value, json};
 
 use crate::autosave::AutoSave;
+use crate::control_wire::{self, Clients, ReplyCache, serve_lines};
 
-/// Connections served at once (ten agents, their tools and the user's).
-pub const MAX_CONNECTIONS: usize = 32;
-/// Longest request line.
-const MAX_LINE: u64 = 4 * 1024 * 1024;
-/// Client names one connection may use.
-const MAX_CLIENTS_PER_CONNECTION: usize = 16;
 /// How often background jobs are polled while some run or a reply waits for one.
 const TICK: Duration = Duration::from_millis(50);
 /// How long an idle host sleeps between checks (a throttled checkpoint waits at most this long).
@@ -54,20 +49,11 @@ enum Msg {
     Closed(Vec<String>),
 }
 
-/// A reply that waits for background jobs.
-struct Waiter {
-    command: String,
-    result: Value,
-    jobs: Vec<String>,
-    reply: Sender<Value>,
-}
-
 /// Serve until `host.release` (or the listener fails). `make` builds the session on the host's
 /// own thread; `ready` gets the port once it listens.
 pub fn serve(config: HostConfig, make: Box<dyn FnOnce() -> Result<Session, String> + Send>, ready: impl FnOnce(u16)) -> std::io::Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", config.port))?;
     let port = listener.local_addr()?.port();
-    listener.set_nonblocking(true)?;
     let stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = channel::<Msg>();
     let (started_tx, started_rx) = channel::<Result<(), String>>();
@@ -86,6 +72,7 @@ pub fn serve(config: HostConfig, make: Box<dyn FnOnce() -> Result<Session, Strin
             let _ = started_tx.send(Ok(()));
             run(session, rx, &stop, port, dir);
             stop.store(true, Ordering::SeqCst);
+            control_wire::wake(port);
         })?
     };
     match started_rx.recv() {
@@ -94,128 +81,32 @@ pub fn serve(config: HostConfig, make: Box<dyn FnOnce() -> Result<Session, Strin
         Err(_) => return Err(std::io::Error::other("the host stopped while starting")),
     }
     ready(port);
-    let open = Arc::new(AtomicUsize::new(0));
-    let clients: Arc<Mutex<BTreeMap<String, usize>>> = Arc::default();
-    while !stop.load(Ordering::SeqCst) {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                let _ = stream.set_nonblocking(false);
-                if open.load(Ordering::SeqCst) >= MAX_CONNECTIONS {
-                    let mut s = stream;
-                    let _ = writeln!(
-                        s,
-                        "{}",
-                        json!({"id": null, "ok": false, "error": format!("the host serves at most {MAX_CONNECTIONS} connections; closing the connection")})
-                    );
-                    continue;
-                }
-                open.fetch_add(1, Ordering::SeqCst);
-                let (conn_tx, conn_open, conn_clients) = (tx.clone(), Arc::clone(&open), Arc::clone(&clients));
-                let spawned = std::thread::Builder::new().name("ec-host-conn".into()).spawn(move || {
-                    connection(stream, &conn_tx, &conn_clients);
-                    conn_open.fetch_sub(1, Ordering::SeqCst);
-                });
-                if spawned.is_err() {
-                    open.fetch_sub(1, Ordering::SeqCst);
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(100)),
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) => {
-                stop.store(true, Ordering::SeqCst);
-                drop(tx);
-                let _ = worker.join();
-                return Err(e);
-            }
-        }
-    }
-    drop(tx);
+    let clients: Arc<Clients> = Arc::default();
+    let replies: Arc<Mutex<ReplyCache>> = Arc::default();
+    control_wire::accept_loop(listener, Arc::clone(&stop), move |stream| connection(stream, &tx, &clients, &replies));
     let _ = worker.join();
     // Let connection threads write their last replies (`host.release`'s).
     std::thread::sleep(Duration::from_millis(200));
     Ok(())
 }
 
-/// The `client` an engine request runs as.
-fn request_client(method: &str, params: &Value) -> Option<String> {
-    if method != "engine.execute" {
-        return None;
-    }
-    let c = params.get("params")?.get("client")?.as_str()?;
-    (!c.is_empty() && c.len() <= effectcraft_engine::agents::MAX_CLIENT_LEN).then(|| c.to_string())
-}
-
-fn connection(stream: TcpStream, tx: &Sender<Msg>, clients: &Mutex<BTreeMap<String, usize>>) {
+fn connection(stream: TcpStream, tx: &Sender<Msg>, clients: &Clients, replies: &Mutex<ReplyCache>) {
     let Ok(read) = stream.try_clone() else { return };
-    let mut out = stream;
-    let mut used: Vec<String> = vec![];
-    let mut reader = BufReader::new(read);
-    loop {
-        let mut line = String::new();
-        match (&mut reader).take(MAX_LINE).read_line(&mut line) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let msg: Value = match serde_json::from_str(line) {
-            Ok(v @ Value::Object(_)) => v,
-            _ => {
-                let _ = writeln!(out, "{}", json!({"id": null, "ok": false, "error": "not a JSON request object; closing the connection"}));
-                break;
+    let mut used = BTreeSet::new();
+    serve_lines(read, stream, |method, params, request_id| {
+        clients.note(&mut used, &method, &params);
+        control_wire::once(replies, request_id.as_deref(), || {
+            let (reply_tx, reply_rx) = channel();
+            if tx.send(Msg::Request { method, params, reply: reply_tx }).is_err() {
+                return Some((err("the host stopped"), false));
             }
-        };
-        let id = msg.get("id").cloned().unwrap_or(Value::Null);
-        let Some(method) = msg.get("method").and_then(Value::as_str).map(str::to_string) else {
-            let _ = writeln!(out, "{}", json!({"id": id, "ok": false, "error": "missing `method`; closing the connection"}));
-            break;
-        };
-        let params = msg.get("params").cloned().filter(|p| !p.is_null()).unwrap_or_else(|| json!({}));
-        if let Some(c) = request_client(&method, &params)
-            && !used.contains(&c)
-            && used.len() < MAX_CLIENTS_PER_CONNECTION
-        {
-            *clients.lock().unwrap_or_else(PoisonError::into_inner).entry(c.clone()).or_insert(0) += 1;
-            used.push(c);
-        }
-        let (reply_tx, reply_rx) = channel();
-        if tx.send(Msg::Request { method, params, reply: reply_tx }).is_err() {
-            let _ = writeln!(out, "{}", json!({"id": id, "ok": false, "error": "the host stopped"}));
-            break;
-        }
-        let mut reply = reply_rx.recv().unwrap_or_else(|_| json!({"ok": false, "error": "the host stopped"}));
-        reply["id"] = id;
-        if writeln!(out, "{reply}").is_err() {
-            break;
-        }
-    }
-    let gone: Vec<String> = {
-        let mut map = clients.lock().unwrap_or_else(PoisonError::into_inner);
-        used.into_iter()
-            .filter(|c| match map.get_mut(c) {
-                Some(n) if *n > 1 => {
-                    *n -= 1;
-                    false
-                }
-                Some(_) => {
-                    map.remove(c);
-                    true
-                }
-                None => false,
-            })
-            .collect()
-    };
+            Some((reply_rx.recv().unwrap_or_else(|_| err("the host stopped")), true))
+        })
+    });
+    let gone = clients.closed(used);
     if !gone.is_empty() {
         let _ = tx.send(Msg::Closed(gone));
     }
-}
-
-/// Commands that wait for their job unless `wait: false` (others only with `wait: true`).
-fn waits(command: &str, params: &Value) -> bool {
-    let default = matches!(command, "renderQueue.render" | "render.frame" | "render.contactSheet" | "file.importAep" | "file.importProject");
-    params.get("wait").and_then(Value::as_bool).unwrap_or(default)
 }
 
 fn ok(v: Value) -> Value {
@@ -237,7 +128,7 @@ fn run(mut s: Session, rx: Receiver<Msg>, stop: &AtomicBool, port: u16, dir: Opt
         s.autosave.background = false;
         s.autosave_folder_override = Some(a.folder().to_path_buf());
     }
-    let mut waiters: Vec<Waiter> = vec![];
+    let mut waiters: Vec<(JobWaiter, Sender<Value>)> = vec![];
     while !stop.load(Ordering::SeqCst) {
         let busy = !waiters.is_empty() || !s.jobs().is_empty();
         let msg = match rx.recv_timeout(if busy { TICK } else { IDLE }) {
@@ -267,11 +158,10 @@ fn run(mut s: Session, rx: Receiver<Msg>, stop: &AtomicBool, port: u16, dir: Opt
             None => {}
         }
         s.poll_background();
-        let (done, still): (Vec<Waiter>, Vec<Waiter>) = waiters.into_iter().partition(|w| !s.jobs().iter().any(|j| w.jobs.contains(&j.id)));
+        let (done, still): (Vec<_>, Vec<_>) = waiters.into_iter().partition(|(w, _)| !w.pending(&s));
         waiters = still;
-        for w in done {
-            let reply = w.reply.clone();
-            let _ = reply.send(finish(&mut s, w));
+        for (w, reply) in done {
+            let _ = reply.send(w.finish(&mut s));
         }
         if let Some(a) = autosave.as_mut()
             && (s.revision != before || a.info()["pending"] == json!(true))
@@ -279,8 +169,8 @@ fn run(mut s: Session, rx: Receiver<Msg>, stop: &AtomicBool, port: u16, dir: Opt
             let _ = a.checkpoint(&mut s, false);
         }
     }
-    for w in waiters {
-        let _ = w.reply.send(err("the host stopped before the job ended"));
+    for (_, reply) in waiters {
+        let _ = reply.send(err("the host stopped before the job ended"));
     }
     if let Some(a) = autosave.as_mut() {
         let _ = a.checkpoint(&mut s, true);
@@ -302,7 +192,7 @@ fn release(s: &mut Session, p: &Value) -> Value {
     }
 }
 
-fn handle(s: &mut Session, method: &str, p: Value, reply: Sender<Value>) -> Option<Waiter> {
+fn handle(s: &mut Session, method: &str, p: Value, reply: Sender<Value>) -> Option<(JobWaiter, Sender<Value>)> {
     let r = match method {
         "engine.execute" => {
             let Some(id) = p.get("command").or(p.get("id")).and_then(Value::as_str).map(str::to_string) else {
@@ -324,82 +214,28 @@ fn handle(s: &mut Session, method: &str, p: Value, reply: Sender<Value>) -> Opti
 }
 
 /// Run an engine command; a waiting one starts its job and replies when it ends.
-fn execute(s: &mut Session, id: &str, params: Value, reply: Sender<Value>) -> Option<Waiter> {
-    let tasks = |s: &Session| s.jobs().into_iter().map(|j| j.id).filter(|j| j.starts_with("task:")).collect::<Vec<_>>();
-    if id == "jobs.wait" {
-        let jobs = tasks(s);
-        if !jobs.is_empty() {
-            return Some(Waiter { command: id.to_string(), result: json!({}), jobs, reply });
+fn execute(s: &mut Session, id: &str, params: Value, reply: Sender<Value>) -> Option<(JobWaiter, Sender<Value>)> {
+    match effectcraft_engine::job_waiter::start(s, id, params) {
+        Ok(Started::Waiting(w)) => return Some((w, reply)),
+        Ok(Started::Done(v)) => {
+            let _ = reply.send(ok(v));
         }
-    }
-    if !waits(id, &params) {
-        let _ = reply.send(s.execute_checked(id, params).map_or_else(err, ok));
-        return None;
-    }
-    let before: Vec<String> = s.jobs().into_iter().map(|j| j.id).collect();
-    let mut p = params;
-    if let Some(o) = p.as_object_mut() {
-        o.insert("wait".into(), json!(false));
-    }
-    match s.execute_checked(id, p) {
         Err(e) => {
             let _ = reply.send(err(e));
-            None
-        }
-        Ok(result) => {
-            let jobs: Vec<String> = s.jobs().into_iter().map(|j| j.id).filter(|j| !before.contains(j)).collect();
-            if jobs.is_empty() {
-                let _ = reply.send(ok(result));
-                return None;
-            }
-            Some(Waiter { command: id.to_string(), result, jobs, reply })
         }
     }
-}
-
-/// The reply for a finished wait: what the blocking command returns, or the job's error.
-fn finish(s: &mut Session, w: Waiter) -> Value {
-    if w.command == "jobs.wait" {
-        return ok(json!({"finished": s.job_log}));
-    }
-    let mut tasks: Vec<&mut effectcraft_engine::jobs::JobRecord> = s.job_log.iter_mut().filter(|r| w.jobs.contains(&r.id)).collect();
-    if let Some(r) = tasks.iter().find(|r| r.status != "done") {
-        return err(if r.message.is_empty() { r.status.clone() } else { r.message.clone() });
-    }
-    if let [task] = tasks.as_mut_slice() {
-        return ok(std::mem::take(&mut task.result));
-    }
-    let mut r = w.result;
-    if r.get("running").is_some() {
-        r["running"] = json!(false);
-    }
-    if w.command == "renderQueue.render" {
-        let ids: Vec<Value> = r["items"].as_array().map(|a| a.iter().map(|i| i["id"].clone()).collect()).unwrap_or_default();
-        if let Ok(list) = s.execute("renderQueue.list", json!({})) {
-            r["items"] = json!(list["items"].as_array().map(|a| a.iter().filter(|i| ids.contains(&i["id"])).cloned().collect::<Vec<_>>()).unwrap_or_default());
-        }
-    }
-    let prefix = w.command.split('.').next().unwrap_or("");
-    if matches!(prefix, "warp" | "camera" | "roto")
-        && r.get("layer").is_some()
-        && let Ok(st) = s.execute(&format!("{prefix}.status"), json!({"layer": r["layer"], "effect": r["effect"]}))
-    {
-        r["status"] = st;
-    }
-    if r.get("progress").is_some() {
-        r["progress"] = Value::Null;
-    }
-    ok(r)
+    None
 }
 
 /// Talk to a host (or the desktop app) once: send `method` with `params`, return its reply.
 pub fn request(port: u16, method: &str, params: Value) -> std::io::Result<Value> {
+    use std::io::{BufRead, BufReader, Read, Write};
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
     stream.set_read_timeout(Some(Duration::from_secs(120)))?;
     let mut w = stream.try_clone()?;
     writeln!(w, "{}", json!({"id": 1, "method": method, "params": params}))?;
     let mut line = String::new();
-    BufReader::new(stream).take(MAX_LINE).read_line(&mut line)?;
+    BufReader::new(stream).take(u64::try_from(control_wire::MAX_LINE).unwrap_or(u64::MAX)).read_line(&mut line)?;
     serde_json::from_str(&line).map_err(std::io::Error::other)
 }

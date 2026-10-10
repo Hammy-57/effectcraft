@@ -36,6 +36,9 @@ pub struct History {
     /// Who made each state (the `client` of the step that led to it), by state address; states
     /// the user made aren't listed. The weak reference keeps the address from being reused.
     authors: HashMap<usize, (Weak<Project>, String)>,
+    /// States own-step undo skips (`crate::selective_undo`): steps it undid and the steps that
+    /// undid them, so the next ⌘Z goes on to the step before instead of bringing one back.
+    settled: HashMap<usize, Weak<Project>>,
 }
 
 /// A line of states that grows from another state of the history.
@@ -286,6 +289,17 @@ impl History {
                 self.authors.remove(&key(state));
             }
         }
+    }
+
+    /// Whether own-step undo is done with the step that made `state` (see `settled`).
+    pub fn settled(&self, state: &Arc<Project>) -> bool {
+        self.settled.get(&key(state)).is_some_and(|w| w.strong_count() > 0)
+    }
+
+    /// Mark the step that made `state` as done with for own-step undo.
+    pub fn settle(&mut self, state: &Arc<Project>) {
+        self.settled.retain(|_, w| w.strong_count() > 0);
+        self.settled.insert(key(state), Arc::downgrade(state));
     }
 
     /// Number of states on branches (not on the working line).
