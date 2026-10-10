@@ -359,6 +359,11 @@ fn usage_err<T>(m: &str) -> Result<T, Failure> {
 /// Build the backend: a bridge to the app, the app offscreen (`--ui`), or a headless session, with
 /// the requested project.
 fn backend(args: &Args, default_demo: bool) -> Result<Backend, Failure> {
+    // Opening a project another EffectCraft has open warns (the host list), and saving over a
+    // file changed meanwhile is refused.
+    if let Some(dir) = effectcraft_host::config_dir() {
+        effectcraft_engine::hosts::init(&dir);
+    }
     if let Some(addr) = args.opt("--bridge") {
         if args.project.is_some() || args.flag("--demo") {
             return usage_err("--bridge drives the running app's project; use `exec file.open` to open another");
@@ -774,6 +779,13 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
             if args.flag("--autosave") && args.opt("--bridge").is_some() {
                 return usage_err("--autosave is for MCP with the project in this process (headless or --ui); the bridged app owns its auto-saves");
             }
+            // A project in this process (headless / --ui) is in the host list (announced before
+            // `--project` opens); a bridge isn't a host.
+            if args.opt("--bridge").is_none()
+                && let Some(dir) = effectcraft_host::config_dir()
+            {
+                effectcraft_engine::hosts::announce(&dir, "mcp", None);
+            }
             let b = backend(args, false)?;
             // --client NAME (or EFFECTCRAFT_CLIENT): every tool call runs as that agent (its own
             // selection, active comp and time; comp claims).
@@ -790,7 +802,9 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
                 server
             };
             // A client that closes its end of stdout has ended the session.
-            match server.serve_stdio() {
+            let served = server.serve_stdio();
+            effectcraft_engine::hosts::withdraw();
+            match served {
                 Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => return Err(e.to_string().into()),
                 _ => {}
             }

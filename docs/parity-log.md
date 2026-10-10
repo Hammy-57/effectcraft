@@ -918,3 +918,8 @@ before.
 - Renders requested over the desktop control channel (`render.frame`, `render.contactSheet`, and
   the MCP bridge's renders) run as background tasks on a copy of the project, so the window and
   other agents carry on; `wait: false` starts one from any client (`jobs.list`, quiet, no toast).
+- Host list and save guard: every EffectCraft holding a project (the app, MCP servers) is listed
+  in `<config>/Hosts/` (`hosts.list`: kind, control port, open project); opening a project another
+  one has open warns with the port to join; saving over a project file that changed on disk since
+  it was opened or saved here is refused unless `force: true`, so copies no longer overwrite each
+  other's work silently.
