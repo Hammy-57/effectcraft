@@ -24,7 +24,7 @@
 //! effectcraft-cli bench --ops [--small] [--layers N] [--comps N] [--footage N]   everyday-operation timings
 //!     on a large generated project (open, save, auto-save, undo/redo, timeline, Project panel)
 //! effectcraft-cli script FILE.jsx [F.ecproj] | --eval CODE    run an After Effects-style script
-//! effectcraft-cli mcp [--autosave | --bridge [PORT] | --ui] [--all-tools] MCP server on stdio
+//! effectcraft-cli mcp [--autosave] [--bridge [PORT] | --ui] [--all-tools] MCP server on stdio
 //!
 //! Project:  --project F.ecproj (or a positional *.ecproj) | --demo | --empty   (default: demo; mcp: empty)
 //! Saving:   --save (back to --project) | --save-as F.ecproj
@@ -32,7 +32,8 @@
 //!           the default is the CPU (Mercury Software Only)
 //! Bridge:   --bridge PORT drives a running `effectcraft --control PORT` instead of a headless session
 //! UI:       mcp --ui [--ui-size WxH] [--ui-scale K] runs the full app offscreen (no window) for
-//!           screenshot and the ui_* tools (feature `ui`, on by default)
+//!           screenshot and the ui_* tools (feature `ui`, on by default); with --autosave its
+//!           project is checkpointed like headless work
 //! Output:   --json for one compact JSON document on stdout (errors: {"error": …}, exit 1)
 //! ```
 //!
@@ -120,10 +121,11 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
   script FILE.jsx [F.ecproj] | --eval CODE run JavaScript with the After Effects-style object model
                                            (app.project, comps, layers, properties…); prints writeLn
                                            output and the result; errors exit 1 with file:line:col
-  mcp [--autosave | --bridge [PORT] | --ui] [--all-tools]
-                                           MCP server (JSON-RPC over stdio); --autosave preserves unsaved
-                                           headless work; --all-tools also lists the older tool aliases;
-                                           --bridge without a port uses EFFECTCRAFT_CONTROL_PORT, else 9877;
+  mcp [--autosave] [--bridge [PORT] | --ui] [--all-tools]
+                                           MCP server (JSON-RPC over stdio); --autosave preserves unsaved work
+                                           (headless or --ui; a bridged app owns its auto-saves); --all-tools
+                                           also lists the older tool aliases; --bridge without a port uses
+                                           EFFECTCRAFT_CONTROL_PORT, else 9877;
                                            --ui [--ui-size 1680x1020] [--ui-scale 2] runs the app offscreen
                                            (no window) so screenshot and the ui_* tools work
       [--automation-read-root DIR] [--automation-write-root DIR]
@@ -389,8 +391,13 @@ fn offscreen_backend(args: &Args, default_demo: bool) -> Result<Backend, Failure
         None if args.flag("--demo") || (default_demo && !args.flag("--empty")) => Some(("file.openDemoProject", json!({}))),
         None => None,
     };
+    let auto_save = autosave_prefs(args)?;
     let ui = offscreen_ui::Offscreen::start(opts, move || {
         let mut s = effectcraft_host::session();
+        if let Some(a) = auto_save {
+            s.prefs.auto_save = a;
+            s.prefs.normalize();
+        }
         if let Some((id, params)) = open {
             s.execute_checked(id, params).map_err(|e| e.to_string())?;
         }
@@ -405,19 +412,28 @@ fn offscreen_backend(_args: &Args, _default_demo: bool) -> Result<Backend, Failu
     Err(Failure::Error("--ui: this effectcraft-cli was built without the `ui` feature (cargo build -p effectcraft-cli --features ui)".into()))
 }
 
+/// `--autosave`: the Auto-Save settings from the config directory (defaults without a settings
+/// file). Only those are read: opting in must not change rendering or load the desktop's models,
+/// shortcuts, disk cache or recovery sentinel.
+fn autosave_prefs(args: &Args) -> Result<Option<effectcraft_engine::prefs::AutoSave>, Failure> {
+    if !args.flag("--autosave") {
+        return Ok(None);
+    }
+    let dir = effectcraft_host::config_dir().ok_or_else(|| Failure::Error("--autosave: no config directory; set EFFECTCRAFT_CONFIG_DIR".into()))?;
+    use effectcraft_engine::config::ConfigStore;
+    let config = effectcraft_engine::config::DirConfig::new(dir);
+    Ok(Some(match config.read(effectcraft_engine::prefs::PREFS_FILE) {
+        Some(text) => effectcraft_engine::prefs::Prefs::from_json(&text).auto_save,
+        None => effectcraft_engine::prefs::Prefs::default().auto_save,
+    }))
+}
+
 /// A wired session; `--gpu` attaches the GPU compositor (renders then follow the project's
 /// renderer setting, Mercury GPU Acceleration by default).
 fn session(args: &Args) -> Result<effectcraft_engine::Session, Failure> {
     let mut s = effectcraft_host::session();
-    if args.flag("--autosave") {
-        let dir = effectcraft_host::config_dir().ok_or_else(|| Failure::Error("--autosave: no config directory; set EFFECTCRAFT_CONFIG_DIR".into()))?;
-        // Read only auto-save settings. Opting in must not change headless rendering or load
-        // the desktop's models, shortcuts, disk cache or recovery sentinel.
-        use effectcraft_engine::config::ConfigStore;
-        let config = effectcraft_engine::config::DirConfig::new(dir);
-        if let Some(text) = config.read(effectcraft_engine::prefs::PREFS_FILE) {
-            s.prefs.auto_save = effectcraft_engine::prefs::Prefs::from_json(&text).auto_save;
-        }
+    if let Some(a) = autosave_prefs(args)? {
+        s.prefs.auto_save = a;
         s.prefs.normalize();
     }
     if args.flag("--gpu") {
@@ -512,7 +528,6 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
     } else if args.flag("--ui") {
         for (o, why) in [
             ("--bridge", "--ui runs its own app offscreen; --bridge drives a running one"),
-            ("--autosave", "--autosave is for headless MCP; the offscreen app keeps the project in memory (save_project)"),
             ("--gpu", "the offscreen UI renders on the GPU compositor of its own device when one is usable"),
         ] {
             if args.opts.iter().any(|(k, _)| k == o) {
@@ -691,7 +706,7 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
         }
         "mcp" => {
             if args.flag("--autosave") && args.opt("--bridge").is_some() {
-                return usage_err("--autosave is for headless MCP; the bridged app owns its auto-saves");
+                return usage_err("--autosave is for MCP with the project in this process (headless or --ui); the bridged app owns its auto-saves");
             }
             let mut b = backend(args, false)?;
             let (read, write) = (args.opts("--automation-read-root"), args.opts("--automation-write-root"));

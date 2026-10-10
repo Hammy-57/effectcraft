@@ -1,35 +1,37 @@
-//! Headless UI snapshot: runs the real [`EffectcraftApp`] without a window (egui_kittest + wgpu)
-//! and writes PNGs. Works regardless of window focus, Spaces or display sleep, so agents can
-//! look at the UI at any time.
+//! Headless UI snapshot: runs the real [`EffectcraftApp`](effectcraft_ui_egui::EffectcraftApp)
+//! without a window (the [`offscreen`](effectcraft_ui_egui::offscreen) app that `effectcraft-cli
+//! mcp --ui` serves) and writes PNGs. Works regardless of window focus, Spaces or display sleep, so
+//! agents can look at the UI at any time.
 //!
 //! ```text
 //! cargo run -p effectcraft-ui-egui --example snapshot -- [--out ui.png] [--size 1680x1020]
-//!     [--scale 2] [--settle 1.5] [--empty] [--script steps.jsonl | --step '<json>']...
+//!     [--scale 2] [--settle 1.5] [--demo | --empty] [--script steps.jsonl | --step '<json>']...
 //! ```
 //!
 //! Each script step is a control-channel request (`{"method":"engine.execute","params":{...}}`,
-//! see `docs/control-protocol.md`), run in order with the app settling in between. The extra
-//! method `{"method":"snap","params":{"path":"x.png"}}` writes an intermediate snapshot.
-//! Replies are printed to stdout as JSON lines.
+//! see `docs/control-protocol.md`), run in order with the app settling in between. Extra methods:
+//! `{"method":"snap","params":{"path":"x.png"}}` writes an intermediate snapshot;
+//! `{"method":"pointer","params":{"x":237,"y":12,"click":true}}` moves the pointer to a window
+//! point and clicks (`"down":true` presses and holds the button, later moves drag, `"up":true`
+//! releases: snap mid-drag). Replies are printed to stdout as JSON lines.
 
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use effectcraft_ui_egui::{ControlRequest, EffectcraftApp};
-use egui_kittest::Harness;
+use effectcraft_ui_egui::offscreen::{OffscreenOptions, OffscreenUi};
 use serde_json::{Value, json};
 
 struct Args {
     out: String,
-    size: (f32, f32),
-    scale: f32,
+    opts: OffscreenOptions,
     settle: f64,
     demo: bool,
     steps: Vec<Value>,
 }
 
+const USAGE: &str = "usage: snapshot [--out ui.png] [--size WxH] [--scale 2] [--settle secs] [--demo | --empty] [--script f.jsonl | --step json]...";
+
 fn parse_args() -> Result<Args, String> {
-    let mut a = Args { out: "ui.png".into(), size: (1680.0, 1020.0), scale: 2.0, settle: 1.5, demo: true, steps: Vec::new() };
+    let mut a = Args { out: "ui.png".into(), opts: OffscreenOptions::default(), settle: 1.5, demo: true, steps: Vec::new() };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut val = || it.next().ok_or_else(|| format!("{arg} needs a value"));
@@ -38,10 +40,11 @@ fn parse_args() -> Result<Args, String> {
             "--size" => {
                 let v = val()?;
                 let (w, h) = v.split_once('x').ok_or("--size WxH")?;
-                a.size = (w.parse().map_err(|_| "bad width")?, h.parse().map_err(|_| "bad height")?);
+                a.opts.size = [w.parse().map_err(|_| "bad width")?, h.parse().map_err(|_| "bad height")?];
             }
-            "--scale" => a.scale = val()?.parse().map_err(|_| "bad --scale")?,
+            "--scale" => a.opts.pixels_per_point = val()?.parse().map_err(|_| "bad --scale")?,
             "--settle" => a.settle = val()?.parse().map_err(|_| "bad --settle")?,
+            "--demo" => a.demo = true,
             "--empty" => a.demo = false,
             "--step" => a.steps.push(serde_json::from_str(&val()?).map_err(|e| format!("--step: {e}"))?),
             "--script" => {
@@ -51,39 +54,78 @@ fn parse_args() -> Result<Args, String> {
                     a.steps.push(serde_json::from_str(line).map_err(|e| format!("{path}: {e}: {line}"))?);
                 }
             }
-            "-h" | "--help" => {
-                return Err("usage: snapshot [--out ui.png] [--size WxH] [--scale 2] [--settle secs] [--empty] [--script f.jsonl | --step json]...".into());
-            }
-            _ => return Err(format!("unknown argument {arg}")),
+            "-h" | "--help" => return Err(USAGE.into()),
+            _ => return Err(format!("unknown argument {arg}\n{USAGE}")),
         }
+    }
+    if !(a.settle.is_finite() && (0.0..=600.0).contains(&a.settle)) {
+        return Err("--settle: expected 0 to 600 seconds".into());
     }
     Ok(a)
 }
 
-/// One frame, first queueing the app's synthetic input (kittest doesn't call
-/// `raw_input_hook`); the harness runs one frame per queued event.
-fn step_frame(h: &mut Harness<'_, EffectcraftApp>) {
-    for e in h.state_mut().take_synthetic_input() {
-        h.event(e);
-    }
-    h.step();
+/// Let background work (frame renders landing in the viewer) finish: the offscreen UI runs frames
+/// on its own whenever the app asks for a repaint.
+fn settle(secs: f64) {
+    std::thread::sleep(Duration::from_secs_f64(secs));
 }
 
-/// Step the app for `secs` of wall time so background frame renders land in the viewer.
-fn settle(h: &mut Harness<'_, EffectcraftApp>, secs: f64) {
-    let end = Instant::now() + Duration::from_secs_f64(secs);
-    while Instant::now() < end {
-        step_frame(h);
-        std::thread::sleep(Duration::from_millis(30));
+/// `ui.screenshot` to `path`, printed as `{"snapshot", "width", "height"}`.
+fn snap(ui: &OffscreenUi, path: &str) -> Result<(), String> {
+    let r = ui.call("ui.screenshot", json!({"path": path}))?;
+    if r["ok"] != json!(true) {
+        return Err(format!("{path}: {}", r["error"].as_str().unwrap_or("screenshot failed")));
     }
-    step_frame(h);
-}
-
-fn snap(h: &mut Harness<'_, EffectcraftApp>, path: &str) -> Result<(), String> {
-    let img = h.render()?;
-    img.save(path).map_err(|e| format!("{path}: {e}"))?;
-    println!("{}", json!({"snapshot": path, "width": img.width(), "height": img.height()}));
+    println!("{}", json!({"snapshot": path, "width": r["result"]["width"], "height": r["result"]["height"]}));
     Ok(())
+}
+
+/// The control request for a step: `pointer` is `ui.click` at its point, or `ui.move` (with
+/// `down` / `up`).
+fn request(method: &str, params: Value) -> (&str, Value) {
+    if method != "pointer" {
+        return (method, params);
+    }
+    let mut p = json!({"x": params["x"].as_f64().unwrap_or(0.0), "y": params["y"].as_f64().unwrap_or(0.0)});
+    if params["click"].as_bool() == Some(true) {
+        return ("ui.click", p);
+    }
+    for key in ["down", "up"] {
+        if params[key].as_bool() == Some(true) {
+            p[key] = json!(true);
+        }
+    }
+    ("ui.move", p)
+}
+
+fn run(args: Args) -> Result<(), String> {
+    let demo = args.demo;
+    let ui = OffscreenUi::start(args.opts, move || {
+        let mut session = effectcraft_host::session();
+        if demo {
+            session.execute_checked("file.openDemoProject", json!({})).map_err(|e| e.to_string())?;
+        }
+        Ok(session)
+    })?;
+    ui.wait_started()?;
+    settle(args.settle);
+    for step in &args.steps {
+        let method = step["method"].as_str().unwrap_or_default();
+        let params = step.get("params").cloned().unwrap_or(json!({}));
+        if method == "snap" {
+            if let Err(e) = snap(&ui, params["path"].as_str().unwrap_or("snap.png")) {
+                eprintln!("{e}");
+            }
+            continue;
+        }
+        // The reply comes once the app answered and the UI settled.
+        let (control, params) = request(method, params);
+        let reply = ui.call(control, params).unwrap_or_else(|e| json!({"ok": false, "error": e}));
+        println!("{}", json!({"method": method, "reply": reply}));
+        settle(0.3);
+    }
+    settle(args.settle.min(1.0));
+    snap(&ui, &args.out)
 }
 
 fn main() {
@@ -94,64 +136,7 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let mut session = effectcraft_host::session();
-    if args.demo {
-        let _ = session.execute("file.openDemoProject", json!({}));
-    }
-    let (tx, rx) = mpsc::channel::<ControlRequest>();
-    let mut harness = Harness::builder()
-        .with_size(egui::vec2(args.size.0, args.size.1))
-        .with_pixels_per_point(args.scale)
-        .wgpu()
-        .build_eframe(move |_cc| EffectcraftApp::new(session).with_control(rx));
-    settle(&mut harness, args.settle);
-    for step in &args.steps {
-        let method = step["method"].as_str().unwrap_or_default().to_string();
-        let params = step.get("params").cloned().unwrap_or(json!({}));
-        if method == "snap" {
-            if let Err(e) = snap(&mut harness, params["path"].as_str().unwrap_or("snap.png")) {
-                eprintln!("{e}");
-            }
-            continue;
-        }
-        // Pointer input straight into the harness (menus and popups need real input events):
-        // {"method":"pointer","params":{"x":237,"y":12,"click":true}}
-        if method == "pointer" {
-            let pos = egui::pos2(params["x"].as_f64().unwrap_or(0.0) as f32, params["y"].as_f64().unwrap_or(0.0) as f32);
-            harness.input_mut().events.push(egui::Event::PointerMoved(pos));
-            if params["click"].as_bool() == Some(true) {
-                for pressed in [true, false] {
-                    harness.input_mut().events.push(egui::Event::PointerButton {
-                        pos,
-                        button: egui::PointerButton::Primary,
-                        pressed,
-                        modifiers: Default::default(),
-                    });
-                }
-            }
-            settle(&mut harness, 0.3);
-            println!("{}", json!({"method": method, "reply": {"ok": true}}));
-            continue;
-        }
-        let (reply_tx, reply_rx) = mpsc::channel();
-        let _ = tx.send(ControlRequest { method: method.clone(), params, reply: reply_tx, state: Default::default() });
-        // Requests are answered on a later frame (some wait for input to be processed).
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let reply = loop {
-            step_frame(&mut harness);
-            if let Ok(v) = reply_rx.try_recv() {
-                break v;
-            }
-            if Instant::now() > deadline {
-                break json!({"ok": false, "error": "no reply within 10 s"});
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        };
-        println!("{}", json!({"method": method, "reply": reply}));
-        settle(&mut harness, 0.3);
-    }
-    settle(&mut harness, args.settle.min(1.0));
-    if let Err(e) = snap(&mut harness, &args.out) {
+    if let Err(e) = run(args) {
         eprintln!("{e}");
         std::process::exit(1);
     }

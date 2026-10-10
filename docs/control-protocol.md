@@ -126,7 +126,7 @@ Points are logical window coordinates. A target is `{id}` (the element's centre;
 | Method | Params |
 |---|---|
 | `ui.click` | `{id \| x,y, button?: left\|right\|middle, count?, modifiers?}` |
-| `ui.move` | `{id \| x,y}` |
+| `ui.move` | `{id \| x,y, down?, up?, button?, modifiers?}`: `down` presses and holds the button there, later moves drag, `up` releases |
 | `ui.drag` | `{from: target, to: target, steps? (12), modifiers?}`: press, move, release |
 | `ui.scroll` | `{id \| x,y, dx, dy}` |
 | `ui.key` | `{key}`, for example `Space`, `F9`, `Cmd+Z`, `Cmd+Shift+Z`, `PageDown`, `Escape` |

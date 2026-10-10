@@ -12,6 +12,9 @@
 //! (egui_kittest answers the app's `ViewportCommand::Screenshot`). Frame time follows the wall
 //! clock, so the app's timeouts and screenshot settling behave as in the desktop app.
 //!
+//! [`OffscreenUi::on_session`] runs code on the app's [`Session`] on the UI thread, between
+//! frames and in order with requests (`mcp --ui --autosave` checkpoints the project that way).
+//!
 //! wgpu renders offscreen from any thread (no surface, no main-thread requirement on macOS).
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -20,6 +23,7 @@ use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use effectcraft_engine::Session;
+use effectcraft_engine::prefs::Prefs;
 use eframe::egui_wgpu;
 use egui_kittest::Harness;
 use egui_kittest::wgpu::WgpuTestRenderer;
@@ -53,6 +57,15 @@ const IDLE_POLL: Duration = Duration::from_millis(250);
 
 const STOPPED: &str = "the offscreen UI stopped (restart the MCP server)";
 
+/// Code run on the app's session on the UI thread ([`OffscreenUi::on_session`]).
+pub type SessionJob = Box<dyn FnOnce(&mut Session) + Send>;
+
+/// What the UI thread is asked to do.
+enum Job {
+    Control(ControlRequest),
+    Session(SessionJob),
+}
+
 /// Whether the app's first frames are done (they compile the GPU compositor's shaders, which can
 /// take minutes on a cold shader cache under load).
 enum Startup {
@@ -63,8 +76,9 @@ enum Startup {
 
 /// A handle to an offscreen app. Dropping it ends the UI thread.
 pub struct OffscreenUi {
-    jobs: Sender<ControlRequest>,
+    jobs: Sender<Job>,
     adapter: String,
+    prefs: Prefs,
     startup: Mutex<Startup>,
 }
 
@@ -73,8 +87,8 @@ impl OffscreenUi {
     /// once the session is built and a GPU adapter is found (failing when there's none); the app's
     /// first frames run in the background and the first [`OffscreenUi::call`] waits for them.
     pub fn start(opts: OffscreenOptions, make_session: impl FnOnce() -> Result<Session, String> + Send + 'static) -> Result<Self, String> {
-        let (jobs, inbox) = mpsc::channel::<ControlRequest>();
-        let (ready_tx, ready_rx) = mpsc::channel::<Result<String, String>>();
+        let (jobs, inbox) = mpsc::channel::<Job>();
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<(String, Prefs), String>>();
         let (started_tx, started_rx) = mpsc::channel::<Result<(), String>>();
         std::thread::Builder::new()
             .name("offscreen-ui".into())
@@ -82,8 +96,20 @@ impl OffscreenUi {
             .stack_size(64 << 20)
             .spawn(move || run(opts, make_session, inbox, ready_tx, started_tx))
             .map_err(|e| format!("cannot start the offscreen UI thread: {e}"))?;
-        let adapter = ready_rx.recv().map_err(|_| "the offscreen UI stopped while starting".to_string())??;
-        Ok(Self { jobs, adapter, startup: Mutex::new(Startup::Pending(started_rx)) })
+        let (adapter, prefs) = ready_rx.recv().map_err(|_| "the offscreen UI stopped while starting".to_string())??;
+        Ok(Self { jobs, adapter, prefs, startup: Mutex::new(Startup::Pending(started_rx)) })
+    }
+
+    /// The session's preferences as `make_session` built them (before the app started).
+    pub fn prefs(&self) -> &Prefs {
+        &self.prefs
+    }
+
+    /// Queue `job` to run on the app's session on the UI thread, after the app's first frames and
+    /// before any later request (it doesn't wait). A panic in it is caught and dropped (the job's
+    /// own reply channel, if any, disconnects). `Err` when the UI thread is gone.
+    pub fn on_session(&self, job: SessionJob) -> Result<(), String> {
+        self.jobs.send(Job::Session(job)).map_err(|_| STOPPED.to_string())
     }
 
     /// The wgpu adapter the UI renders with (`name (backend)`).
@@ -112,7 +138,7 @@ impl OffscreenUi {
     pub fn call(&self, method: &str, params: Value) -> Result<Value, String> {
         self.wait_started()?;
         let (req, rx) = ControlRequest::new(method, params);
-        self.jobs.send(req).map_err(|_| STOPPED.to_string())?;
+        self.jobs.send(Job::Control(req)).map_err(|_| STOPPED.to_string())?;
         // The UI thread always replies within REQUEST_TIMEOUT plus settling; the margin covers a
         // GPU readback stuck in the driver.
         rx.recv_timeout(REQUEST_TIMEOUT + Duration::from_secs(30)).map_err(|e| match e {
@@ -175,14 +201,14 @@ fn build(opts: OffscreenOptions, session: Session, renderer: WgpuTestRenderer) -
 fn run(
     opts: OffscreenOptions,
     make_session: impl FnOnce() -> Result<Session, String>,
-    inbox: Receiver<ControlRequest>,
-    ready: Sender<Result<String, String>>,
+    inbox: Receiver<Job>,
+    ready: Sender<Result<(String, Prefs), String>>,
     started: Sender<Result<(), String>>,
 ) {
     // Last-resort guard: the harness panics on failures it doesn't expect (AGENTS.md).
     let (session, renderer) = match catch_unwind(AssertUnwindSafe(|| prepare(opts, make_session))) {
         Ok(Ok((session, renderer, adapter))) => {
-            let _ = ready.send(Ok(adapter));
+            let _ = ready.send(Ok((adapter, session.prefs.clone())));
             (session, renderer)
         }
         Ok(Err(e)) => {
@@ -206,7 +232,10 @@ fn run(
     };
     loop {
         match inbox.recv_timeout(ui.idle_wait()) {
-            Ok(req) => ui.serve(req),
+            Ok(Job::Control(req)) => ui.serve(req),
+            Ok(Job::Session(job)) => {
+                let _ = catch_unwind(AssertUnwindSafe(|| job(&mut ui.h.state_mut().session)));
+            }
             Err(RecvTimeoutError::Timeout) => {
                 if ui.repaint_due() {
                     let _ = catch_unwind(AssertUnwindSafe(|| ui.step()));

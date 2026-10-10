@@ -1636,6 +1636,7 @@ dependencies = [
  "effectcraft-render",
  "effectcraft-text",
  "effectcraft-time",
+ "effectcraft-ui-egui",
  "eframe",
  "egui",
  "egui_kittest",

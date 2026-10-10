@@ -1,12 +1,21 @@
 //! Where tools run: an in-process session, or an app reached through its control channel (the
 //! desktop app over TCP, or an offscreen app in this process).
 
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::Duration;
+
 use effectcraft_engine::Session;
+use effectcraft_engine::prefs::Prefs;
 use effectcraft_engine::time::Tick;
 use serde_json::{Value, json};
 
+use crate::bridge::SessionJob;
 use crate::confine::Confinement;
 use crate::{BridgeClient, ControlTransport, Error, Result, base64, encode_png, recompress_png};
+
+/// Longest [`Backend::with_session`] waits for an in-process app: its first job waits for the
+/// app's first frames, which compile the GPU compositor's shaders (minutes on a cold cache).
+const SESSION_WAIT: Duration = Duration::from_secs(600);
 
 pub struct Backend {
     target: Target,
@@ -73,6 +82,46 @@ impl Backend {
             Target::Headless(s) => Some(s),
             Target::Bridge(_) => None,
         }
+    }
+
+    /// The session's preferences when it is in this process: headless, or an app in this process
+    /// (`mcp --ui`). `None` for an app in another process.
+    pub fn session_prefs(&self) -> Option<Prefs> {
+        match &self.target {
+            Target::Headless(s) => Some(s.prefs.clone()),
+            Target::Bridge(t) => t.session_prefs(),
+        }
+    }
+
+    /// Run `job` on the session in this process: now (headless), or queued on the UI thread of
+    /// an app in this process without waiting ([`ControlTransport::on_session`]). `None` when the
+    /// session is in another process.
+    pub fn queue_on_session(&mut self, job: SessionJob) -> Option<Result<()>> {
+        match &mut self.target {
+            Target::Headless(s) => {
+                job(s);
+                Some(Ok(()))
+            }
+            Target::Bridge(t) => t.on_session(job),
+        }
+    }
+
+    /// Run `f` on the session in this process and wait for its result (see
+    /// [`Backend::queue_on_session`]). `None` when the session is in another process.
+    pub fn with_session<R: Send + 'static>(&mut self, f: impl FnOnce(&mut Session) -> R + Send + 'static) -> Option<Result<R>> {
+        if let Target::Headless(s) = &mut self.target {
+            return Some(Ok(f(s)));
+        }
+        let (tx, rx) = mpsc::channel();
+        if let Err(e) = self.queue_on_session(Box::new(move |s| {
+            let _ = tx.send(f(s));
+        }))? {
+            return Some(Err(e));
+        }
+        Some(rx.recv_timeout(SESSION_WAIT).map_err(|e| match e {
+            RecvTimeoutError::Timeout => Error::Other(format!("the app's session did not answer within {} s", SESSION_WAIT.as_secs())),
+            RecvTimeoutError::Disconnected => Error::Other("the app stopped (or failed) before the job on its session finished".into()),
+        }))
     }
 
     /// Run an engine command by id (checked against the [`Confinement`], if any).

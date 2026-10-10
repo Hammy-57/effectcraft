@@ -394,20 +394,28 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
                 Err(e) => return err(e),
             };
             let m = modifiers(p);
+            let button = match s("button") {
+                Some("right") => egui::PointerButton::Secondary,
+                Some("middle") => egui::PointerButton::Middle,
+                _ => egui::PointerButton::Primary,
+            };
             // egui keeps the modifiers from `ModifiersChanged` (not the ones on a pointer event)
             // and the synthetic events arrive one per frame: hold them for the whole gesture.
             app.synthetic.push(egui::Event::ModifiersChanged(m));
             app.synthetic.push(egui::Event::PointerMoved(pos));
             if req.method == "ui.click" {
-                let button = match s("button") {
-                    Some("right") => egui::PointerButton::Secondary,
-                    Some("middle") => egui::PointerButton::Middle,
-                    _ => egui::PointerButton::Primary,
-                };
                 let count = p.get("count").and_then(Value::as_u64).unwrap_or(1);
                 for _ in 0..count {
                     app.synthetic.push(egui::Event::PointerButton { pos, button, pressed: true, modifiers: m });
                     app.synthetic.push(egui::Event::PointerButton { pos, button, pressed: false, modifiers: m });
+                }
+            } else {
+                // A drag in steps: `down` presses and holds the button here, later moves drag,
+                // `up` releases (look at the UI mid-drag in between).
+                for (key, pressed) in [("down", true), ("up", false)] {
+                    if p.get(key).and_then(Value::as_bool) == Some(true) {
+                        app.synthetic.push(egui::Event::PointerButton { pos, button, pressed, modifiers: m });
+                    }
                 }
             }
             app.synthetic.push(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
