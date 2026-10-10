@@ -6,7 +6,7 @@
 //! releasing, or drop outside every group, to float it. `` ` `` maximizes the panel under the
 //! pointer.
 
-use egui::{Color32, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
+use egui::{Color32, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2, pos2, vec2};
 
 use crate::dock::{self, DockAction, DockNode, Group, Layout, PanelKind, Zone};
 use crate::{EffectcraftApp, panels};
@@ -261,6 +261,7 @@ impl EffectcraftApp {
             child.set_clip_rect(body.intersect(ui.clip_rect()));
             panels::home::show(self, &mut child, body);
             // (Undocked OS windows wait behind it too.)
+            self.os_windows.drag_overlay = None;
             self.os_windows.begin_frame();
             self.os_windows.end_frame(&ctx);
             return;
@@ -305,6 +306,8 @@ impl EffectcraftApp {
         }
         // Floating groups: OS windows of their own on the desktop, else over the dock.
         let mut float_groups: Vec<Group> = vec![];
+        // Each one's OS window (none where they float in the main window).
+        let mut float_windows: Vec<Option<u64>> = vec![];
         dock::assign_floating_ids(&mut self.ui.floating);
         let origin = crate::float_windows::main_origin(&ctx).filter(|_| crate::float_windows::enabled(&ctx));
         let mut closed = vec![];
@@ -317,6 +320,7 @@ impl EffectcraftApp {
             if let Some((g, tabs)) = shown {
                 tab_rects.push((g.path.clone(), tabs));
                 float_groups.push(g);
+                float_windows.push(origin.and_then(|_| self.ui.floating.get(i)).map(|f| f.id));
             }
         }
         self.os_windows.end_frame(&ctx);
@@ -373,7 +377,7 @@ impl EffectcraftApp {
                 }
             }
         }
-        self.tab_drag(&ctx, &groups, &float_groups, &tab_rects);
+        self.tab_drag(&ctx, &groups, &float_groups, &float_windows, &tab_rects);
         panels::panel_menu::show(self, ui);
     }
 
@@ -454,8 +458,11 @@ impl EffectcraftApp {
     /// A tab being dragged. Over a tab strip (or the middle of a group) it shows where the tab
     /// will land: an insertion mark between two tabs (a drop there reorders a group's own tabs
     /// too); near a group's edge, the half it will split off. On release it lands there (or
-    /// floats with Cmd/Ctrl or outside every group).
-    fn tab_drag(&mut self, ctx: &egui::Context, groups: &[Group], floats: &[Group], tab_rects: &[(String, Vec<(PanelKind, Rect)>)]) {
+    /// floats with Cmd/Ctrl or outside every group). Over an undocked OS window that window
+    /// draws the highlight and the dragged tab (`floats` are the floating groups, `windows`
+    /// their OS windows).
+    fn tab_drag(&mut self, ctx: &egui::Context, groups: &[Group], floats: &[Group], windows: &[Option<u64>], tab_rects: &[(String, Vec<(PanelKind, Rect)>)]) {
+        self.os_windows.drag_overlay = None;
         let Some(p) = ctx.data(|d| d.get_temp::<PanelKind>(drag_id())) else {
             self.os_windows.drag_from = None;
             self.os_windows.drag_feed = None;
@@ -481,73 +488,36 @@ impl EffectcraftApp {
                 (pos, ctx.input(|i| i.pointer.any_released()), ctx.input(|i| i.modifiers.command))
             }
         };
-        // Floating windows are on top; then the docked groups.
-        let target = floats.iter().map(|g| (g, true)).chain(groups.iter().map(|g| (g, false))).find(|(g, _)| g.rect.contains(pos));
-        let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("dock-drop")));
-        let plan: Option<DropPlan> = match target {
-            Some((g, is_float)) if !float_drop => {
-                let others: Vec<PanelKind> = g.panels.iter().copied().filter(|x| *x != p).collect();
-                let zone = if is_float { Zone::Center } else { dock::drop_zone(g.rect, g.strip_h(&t), pos) };
-                match (others.first().copied(), zone) {
-                    // The dragged tab alone in its group: nowhere to go here.
-                    (None, _) => None,
-                    (Some(first), Zone::Center) => {
-                        let rects: Vec<(PanelKind, Rect)> = tab_rects
-                            .iter()
-                            .find(|(path, _)| *path == g.path)
-                            .map(|(_, r)| r.iter().copied().filter(|(k, _)| *k != p).collect())
-                            .unwrap_or_default();
-                        let strip = Rect::from_min_size(g.rect.min, vec2(g.rect.width(), g.strip_h(&t)));
-                        let before = if strip.contains(pos) {
-                            // Before the first tab whose middle is right of the pointer.
-                            rects.iter().find(|(_, r)| r.center().x > pos.x).map(|(k, _)| *k)
-                        } else if g.panels.contains(&p) {
-                            // The middle of its own group: it stays where it is.
-                            Some(p)
-                        } else {
-                            // The middle of another group: right after its shown tab.
-                            let shown = g.panels.get(g.active).and_then(|a| others.iter().position(|x| x == a)).unwrap_or(others.len());
-                            others.get(shown + 1).copied()
-                        };
-                        if before == Some(p) {
-                            None
-                        } else {
-                            let x = match before.and_then(|b| rects.iter().find(|(k, _)| *k == b)) {
-                                Some((_, r)) => r.min.x - 4.0,
-                                None => rects.last().map_or(strip.min.x + 8.0, |(_, r)| r.max.x + 4.0),
-                            };
-                            painter.rect_filled(strip.shrink2(vec2(2.0, 1.0)), t.radius, t.focus.gamma_multiply(0.12));
-                            if !strip.contains(pos) {
-                                painter.rect_stroke(g.rect, t.radius, Stroke::new(1.0, t.focus.gamma_multiply(0.6)), StrokeKind::Inside);
-                            }
-                            insertion_mark(&painter, x, strip, t.focus);
-                            Some(DropPlan::Tab { anchor: first, before })
-                        }
-                    }
-                    (Some(first), zone) => {
-                        let shown = g.panels.get(g.active).copied().filter(|a| *a != p).unwrap_or(first);
-                        let hr = dock::zone_rect(g.rect, zone).shrink(2.0);
-                        painter.rect_filled(hr, t.radius, t.focus.gamma_multiply(0.25));
-                        painter.rect_stroke(hr, t.radius, Stroke::new(2.0, t.focus), StrokeKind::Inside);
-                        // Outline the whole group for the side zones, like AE's drop-zone frame.
-                        painter.rect_stroke(g.rect, t.radius, Stroke::new(1.0, t.focus.gamma_multiply(0.6)), StrokeKind::Inside);
-                        Some(DropPlan::Side { anchor: shown, zone })
-                    }
-                }
+        let target = drop_target(p, pos, float_drop, groups, floats, tab_rects, &t);
+        // The undocked OS window under the pointer draws the feedback in its next pass, in its
+        // own coordinates (this window's painter can't reach it); else it is drawn here.
+        let window = target.float.and_then(|i| windows.get(i).copied().flatten());
+        let to_window = window.and_then(|w| Some((w, self.os_windows.shown.get(&w)?.min, crate::float_windows::main_origin(ctx)?)));
+        match to_window {
+            Some((w, inner, origin)) => {
+                let d = origin - inner;
+                self.os_windows.drag_overlay =
+                    Some(crate::float_windows::DragOverlay { window: w, panel: p, pointer: pos + d, mark: target.mark.map(|m| m.translate(d)) });
             }
-            _ => None,
-        };
-        drag_ghost(&painter, p, pos, &t);
+            None => {
+                let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("dock-drop")));
+                if let Some(m) = target.mark {
+                    m.paint(&painter, &t);
+                }
+                drag_ghost(&painter, p, pos, &t);
+            }
+        }
         ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
         ctx.request_repaint();
         if released {
             ctx.data_mut(|d| d.remove::<PanelKind>(drag_id()));
             self.os_windows.drag_from = None;
             self.os_windows.drag_feed = None;
-            let ok = match plan {
+            self.os_windows.drag_overlay = None;
+            let ok = match target.plan {
                 Some(DropPlan::Tab { anchor, before }) => self.edit_layout(|l| l.insert_tab(p, anchor, before)),
                 Some(DropPlan::Side { anchor, zone }) => self.edit_layout(|l| l.dock(p, anchor, zone)),
-                None if float_drop || target.is_none() => {
+                None if float_drop || !target.over_group => {
                     let r = [pos.x - 40.0, pos.y - 12.0, 420.0, 320.0];
                     self.edit_layout(|l| l.float(p, r))
                 }
@@ -561,7 +531,113 @@ impl EffectcraftApp {
     }
 }
 
+/// What a tab drag would do with the pointer at `pos`: the group under it, where the tab would
+/// land and the highlight that shows it.
+struct DropTarget {
+    /// The floating group under the pointer (an index into the floating groups).
+    float: Option<usize>,
+    /// Whether any group is under the pointer (a drop elsewhere floats the tab).
+    over_group: bool,
+    plan: Option<DropPlan>,
+    mark: Option<DropMark>,
+}
+
+/// Where dragged tab `p` would land with the pointer at `pos` (main-window points): floating
+/// groups are on top, then the docked groups; `float_drop` (Cmd/Ctrl held) floats it anyway.
+/// `floats` are in main-window points too (an undocked OS window's group is translated by where
+/// the window is); `tab_rects` are each group's tabs, by [`Group::path`].
+fn drop_target(
+    p: PanelKind,
+    pos: Pos2,
+    float_drop: bool,
+    groups: &[Group],
+    floats: &[Group],
+    tab_rects: &[(String, Vec<(PanelKind, Rect)>)],
+    t: &crate::theme::Tokens,
+) -> DropTarget {
+    let float = floats.iter().position(|g| g.rect.contains(pos));
+    let target = match float.and_then(|i| floats.get(i)) {
+        Some(g) => Some((g, true)),
+        None => groups.iter().find(|g| g.rect.contains(pos)).map(|g| (g, false)),
+    };
+    let mut out = DropTarget { float, over_group: target.is_some(), plan: None, mark: None };
+    let Some((g, is_float)) = target.filter(|_| !float_drop) else { return out };
+    let others: Vec<PanelKind> = g.panels.iter().copied().filter(|x| *x != p).collect();
+    // The dragged tab alone in its group: nowhere to go here.
+    let Some(first) = others.first().copied() else { return out };
+    let zone = if is_float { Zone::Center } else { dock::drop_zone(g.rect, g.strip_h(t), pos) };
+    if zone != Zone::Center {
+        let shown = g.panels.get(g.active).copied().filter(|a| *a != p).unwrap_or(first);
+        out.plan = Some(DropPlan::Side { anchor: shown, zone });
+        out.mark = Some(DropMark::Side { zone: dock::zone_rect(g.rect, zone).shrink(2.0), group: g.rect });
+        return out;
+    }
+    let rects: Vec<(PanelKind, Rect)> =
+        tab_rects.iter().find(|(path, _)| *path == g.path).map(|(_, r)| r.iter().copied().filter(|(k, _)| *k != p).collect()).unwrap_or_default();
+    let strip = Rect::from_min_size(g.rect.min, vec2(g.rect.width(), g.strip_h(t)));
+    let before = if strip.contains(pos) {
+        // Before the first tab whose middle is right of the pointer.
+        rects.iter().find(|(_, r)| r.center().x > pos.x).map(|(k, _)| *k)
+    } else if g.panels.contains(&p) {
+        // The middle of its own group: it stays where it is.
+        Some(p)
+    } else {
+        // The middle of another group: right after its shown tab.
+        let shown = g.panels.get(g.active).and_then(|a| others.iter().position(|x| x == a)).unwrap_or(others.len());
+        others.get(shown + 1).copied()
+    };
+    if before == Some(p) {
+        return out;
+    }
+    let x = match before.and_then(|b| rects.iter().find(|(k, _)| *k == b)) {
+        Some((_, r)) => r.min.x - 4.0,
+        None => rects.last().map_or(strip.min.x + 8.0, |(_, r)| r.max.x + 4.0),
+    };
+    out.plan = Some(DropPlan::Tab { anchor: first, before });
+    out.mark = Some(DropMark::Tab { strip, x, group: (!strip.contains(pos)).then_some(g.rect) });
+    out
+}
+
+/// The highlight of where a dragged tab will land.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum DropMark {
+    /// A tab in the tab strip `strip`, at the insertion mark `x`; `group` is outlined when the
+    /// pointer is over its body.
+    Tab { strip: Rect, x: f32, group: Option<Rect> },
+    /// The half `zone` split off `group`.
+    Side { zone: Rect, group: Rect },
+}
+
+impl DropMark {
+    /// Moved by `d` (into another window's coordinates).
+    pub(crate) fn translate(self, d: Vec2) -> Self {
+        match self {
+            DropMark::Tab { strip, x, group } => DropMark::Tab { strip: strip.translate(d), x: x + d.x, group: group.map(|g| g.translate(d)) },
+            DropMark::Side { zone, group } => DropMark::Side { zone: zone.translate(d), group: group.translate(d) },
+        }
+    }
+
+    pub(crate) fn paint(&self, painter: &egui::Painter, t: &crate::theme::Tokens) {
+        match *self {
+            DropMark::Tab { strip, x, group } => {
+                painter.rect_filled(strip.shrink2(vec2(2.0, 1.0)), t.radius, t.focus.gamma_multiply(0.12));
+                if let Some(g) = group {
+                    painter.rect_stroke(g, t.radius, Stroke::new(1.0, t.focus.gamma_multiply(0.6)), StrokeKind::Inside);
+                }
+                insertion_mark(painter, x, strip, t.focus);
+            }
+            DropMark::Side { zone, group } => {
+                painter.rect_filled(zone, t.radius, t.focus.gamma_multiply(0.25));
+                painter.rect_stroke(zone, t.radius, Stroke::new(2.0, t.focus), StrokeKind::Inside);
+                // Outline the whole group for the side zones, like AE's drop-zone frame.
+                painter.rect_stroke(group, t.radius, Stroke::new(1.0, t.focus.gamma_multiply(0.6)), StrokeKind::Inside);
+            }
+        }
+    }
+}
+
 /// Where a dragged tab lands.
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum DropPlan {
     /// A tab in the group of `anchor`, before `before` (last when `None`).
     Tab { anchor: PanelKind, before: Option<PanelKind> },
@@ -590,4 +666,50 @@ fn insertion_mark(painter: &egui::Painter, x: f32, strip: Rect, col: Color32) {
 pub fn default_float_rect(screen: Rect) -> [f32; 4] {
     let c = screen.center();
     [c.x - 210.0, c.y - 160.0, 420.0, 320.0]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::theme::{ThemeKind, Tokens};
+    use PanelKind::*;
+
+    fn group(path: &str, rect: Rect, panels: Vec<PanelKind>, t: &Tokens) -> Group {
+        Group { path: path.into(), rect, content: Rect::from_min_max(pos2(rect.min.x, rect.min.y + t.tab_h), rect.max), panels, active: 0, stacked: None }
+    }
+
+    #[test]
+    fn a_tab_dragged_over_an_undocked_window_lands_in_its_group_and_is_drawn_there() {
+        let t = Tokens::for_kind(ThemeKind::Dark);
+        let docked = group("a", Rect::from_min_size(Pos2::ZERO, vec2(1200.0, 800.0)), vec![Project, Composition], &t);
+        // An undocked OS window: content at (1900, 300) on screen, the main window's at (100, 50);
+        // its group in main-window points.
+        let (origin, inner) = (pos2(100.0, 50.0), pos2(1900.0, 300.0));
+        let off = inner - origin;
+        let float = group("f0", Rect::from_min_size(Pos2::ZERO, vec2(400.0, 300.0)).translate(off), vec![Info, Audio], &t);
+        let strip = |x0: f32, x1: f32| Rect::from_min_max(pos2(x0, 0.0), pos2(x1, t.tab_h)).translate(off);
+        let tabs = vec![("f0".to_string(), vec![(Info, strip(0.0, 60.0)), (Audio, strip(60.0, 130.0))])];
+        let (groups, floats) = (vec![docked], vec![float]);
+        // Over its tab strip, between its two tabs.
+        let pos = pos2(70.0, 10.0) + off;
+        let d = drop_target(Project, pos, false, &groups, &floats, &tabs, &t);
+        assert_eq!(d.float, Some(0));
+        assert_eq!(d.plan, Some(DropPlan::Tab { anchor: Info, before: Some(Audio) }));
+        // In the window's own coordinates, the mark is where its tabs are.
+        let Some(DropMark::Tab { strip: s, x, group: None }) = d.mark.map(|m| m.translate(origin - inner)) else { panic!("{:?}", d.mark) };
+        assert_eq!((s.min, x), (Pos2::ZERO, 56.0));
+        // Over its body: after its shown tab, the whole group outlined.
+        let d = drop_target(Project, pos2(200.0, 200.0) + off, false, &groups, &floats, &tabs, &t);
+        assert_eq!(d.plan, Some(DropPlan::Tab { anchor: Info, before: Some(Audio) }));
+        assert!(matches!(d.mark, Some(DropMark::Tab { group: Some(_), .. })));
+        // With Cmd/Ctrl the tab floats, but the window is still the one under the pointer.
+        let d = drop_target(Project, pos, true, &groups, &floats, &tabs, &t);
+        assert_eq!((d.float, d.plan, d.mark, d.over_group), (Some(0), None, None, true));
+        // Over the docked group's edge (the main window): a side split, drawn there.
+        let d = drop_target(Info, pos2(1190.0, 400.0), false, &groups, &floats, &tabs, &t);
+        assert_eq!((d.float, d.plan), (None, Some(DropPlan::Side { anchor: Project, zone: Zone::Right })));
+        // Outside every group: it floats.
+        let d = drop_target(Info, pos2(1500.0, 900.0), false, &groups, &floats, &tabs, &t);
+        assert_eq!((d.float, d.over_group, d.plan), (None, false, None));
+    }
 }

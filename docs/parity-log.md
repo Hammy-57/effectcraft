@@ -911,3 +911,5 @@ before.
 - Panel Group Settings ▸ Small Tabs works for undocked groups too (in their OS window and where
   they float inside the main window), from the panel menu or `window.smallTabs`; Undock Panel
   Group keeps a docked group's Small Tabs, and the setting is saved with the layout.
+- Dragging a tab over an undocked window shows where it will land (the tab strip highlight and
+  insertion mark) and the dragged tab in that window, whichever window the drag started in.

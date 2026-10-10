@@ -633,7 +633,9 @@ Closing the window closes its panels (as After Effects does); the panel menu's D
 group, Panel Group Settings ▸ Small Tabs included (`Floating::small`; Undock Panel Group keeps a
 docked group's setting). Shortcuts and the panel menu work in the window, and a tab dragged out
 of it lands where it is dropped, in the main window's dock or another undocked group (the window that has the pointer
-feeds it to the dock's drop logic). Where egui embeds viewports (`ctx.embed_viewports()`: the web,
+feeds it to the dock's drop logic). While a tab is dragged, the window under the pointer draws
+the drop highlight and the dragged tab: an undocked window draws them in its next pass, as the
+dock's drop logic placed them, translated into its coordinates. Where egui embeds viewports (`ctx.embed_viewports()`: the web,
 the headless test harness, the snapshot example and the offscreen `mcp --ui` app) undocked groups
 float inside the main window instead, unchanged. Automation elements drawn in an undocked window
 carry `window` (the group id), their rects are in its coordinates, and synthetic `ui.click` /

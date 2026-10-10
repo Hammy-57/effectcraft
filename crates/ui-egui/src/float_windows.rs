@@ -74,6 +74,19 @@ pub struct OsWindows {
     /// A tab drag that started in this group's window, and where its pointer is.
     pub(crate) drag_from: Option<u64>,
     pub(crate) drag_feed: Option<DragFeed>,
+    /// A tab drag's feedback for the window under the pointer, drawn in its next pass.
+    pub(crate) drag_overlay: Option<DragOverlay>,
+}
+
+/// What an undocked window draws while a tab is dragged over it (in its own coordinates): the
+/// highlight of where the tab will land and the dragged tab.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct DragOverlay {
+    /// The group ([`Floating::id`]) whose window draws it.
+    pub window: u64,
+    pub panel: PanelKind,
+    pub pointer: Pos2,
+    pub mark: Option<crate::dock_ui::DropMark>,
 }
 
 /// The pointer of a tab drag that started in an OS window (which has the pointer until the
@@ -293,25 +306,38 @@ impl EffectcraftApp {
         }
         crate::panels::panel_menu::show(self, ui);
         self.feed_tab_drag(ui, f.id);
+        self.draw_drag_overlay(&ctx, f.id);
         let (close, outer, inner) = ui.input(|i| (i.viewport().close_requested(), i.viewport().outer_rect, i.viewport().inner_rect));
         WindowOut { group: g, tabs: c.tabs, actions, close, outer, inner }
     }
 
     /// A tab drag that started in this window: this window has the pointer, so it tells the
-    /// dock where it is (on screen) and draws the dragged tab while it is over the window.
+    /// dock where it is (on screen). (The window under the pointer draws the dragged tab.)
     fn feed_tab_drag(&mut self, ui: &egui::Ui, window: u64) {
         if self.os_windows.drag_from != Some(window) {
             return;
         }
         let ctx = ui.ctx().clone();
-        let Some(p) = ctx.data(|d| d.get_temp::<PanelKind>(crate::dock_ui::drag_id())) else { return };
+        if ctx.data(|d| d.get_temp::<PanelKind>(crate::dock_ui::drag_id())).is_none() {
+            return;
+        }
         let (pos, released, command, inner) = ui.input(|i| (i.pointer.latest_pos(), i.pointer.any_released(), i.modifiers.command, i.viewport().inner_rect));
         let (Some(pos), Some(inner)) = (pos, inner) else { return };
         self.os_windows.drag_feed = Some(DragFeed { screen: inner.min + pos.to_vec2(), released, command });
-        let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("dock-drop")));
-        crate::dock_ui::drag_ghost(&painter, p, pos, &self.tokens);
         ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
         ctx.request_repaint();
+    }
+
+    /// A tab dragged over this window (from anywhere): where it will land and the dragged tab,
+    /// as the dock's drop logic placed them last frame.
+    fn draw_drag_overlay(&self, ctx: &egui::Context, window: u64) {
+        let Some(o) = self.os_windows.drag_overlay.filter(|o| o.window == window) else { return };
+        let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("dock-drop")));
+        if let Some(m) = o.mark {
+            m.paint(&painter, &self.tokens);
+        }
+        crate::dock_ui::drag_ghost(&painter, o.panel, o.pointer, &self.tokens);
+        ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
     }
 }
 
