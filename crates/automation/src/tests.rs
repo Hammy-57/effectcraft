@@ -1628,8 +1628,12 @@ fn structured_content_is_version_gated_and_matches_output_schemas() {
         ("doc_inspect", json!({})),
         ("render_preview", json!({"max_side": 16})),
         ("render_preview", json!({"max_side": 16, "inline": false, "path": png})),
+        ("render_snapshot", json!({"name": "s"})),
         ("undo", json!({})),
+        // Something changed: the heatmap image, with the metrics as structuredContent.
+        ("render_compare", json!({"a": "s", "b": {}})),
         ("redo", json!({})),
+        ("render_compare", json!({"a": "s", "b": {}, "region": [0, 0, 32, 18], "min_psnr": 30})),
         ("history", json!({})),
         ("save_project", json!({"path": path})),
         ("command_list", json!({"filter": "comp.new"})),
@@ -1983,6 +1987,21 @@ fn render_snapshot_and_compare_tools() {
     assert_eq!(png_size(&png), Some((320, 180)));
     let info: Value = serde_json::from_str(c[1]["text"].as_str().unwrap()).unwrap();
     assert_eq!((info["pass"].as_bool(), info["changed_pixels"].as_u64()), (Some(false), Some(800)), "{info}");
+    // The 40×40 box (x 140..180) moved to x 150..190: the changed pixels span x 140..190.
+    assert_eq!(info["diffBounds"], json!([140, 70, 50, 40]), "{info}");
+    assert_eq!(same["diffBounds"], json!(null), "{same}");
+    // `region` restricts the comparison (and the heatmap) to one rectangle.
+    let (c, err) = call(&mut s, "render_compare", json!({"a": "before", "b": {}, "region": [100, 50, 45, 80]}));
+    assert!(!err, "{c:?}");
+    assert_eq!(png_size(&base64::decode(c[0]["data"].as_str().unwrap()).unwrap()), Some((45, 80)));
+    let info: Value = serde_json::from_str(c[1]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        (info["region"].clone(), info["diffBounds"].clone(), info["changed_pixels"].as_u64()),
+        (json!([100, 50, 45, 80]), json!([140, 70, 5, 40]), Some(200)),
+        "{info}"
+    );
+    let (c, err) = call(&mut s, "render_compare", json!({"a": "before", "b": {}, "region": [400, 0, 10, 10]}));
+    assert!(err && c[0]["text"].as_str().unwrap().contains("outside"), "{c:?}");
     assert!(info.get("diff_png").is_none(), "base64 moved into the image content");
     // inline: false keeps the reply to JSON; bad references are in-band errors.
     let r = call_json(&mut s, "render_compare", json!({"a": "before", "b": {}, "inline": false}));

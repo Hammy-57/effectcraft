@@ -46,10 +46,11 @@ Useful query commands for `engine.execute` (they aren't journaled or undoable): 
 export formats, parity summary), `jobs.list` (Progress panel jobs, e.g. the background
 `footage.check` after File ▸ Open), `render.snapshot {name, comp?, time?, max_side?, transparent?}`
 (keep a rendered frame in the session, 16 at most), `render.snapshots {clear?}` and
-`render.compare {a, b, threshold?, min_psnr?, max_side?, amplify?, diff_path?, diff_inline?}`
+`render.compare {a, b, threshold?, min_psnr?, max_side?, region?, amplify?, diff_path?, diff_inline?}`
 (`a`/`b`: a snapshot name, `{snapshot}`, `{path}` of a PNG/JPEG, or `{comp?, time?, transparent?}`
 rendered now) → `{width, height, max_abs, mean_abs, alpha_max_abs, psnr_db, ssim, changed_pixels,
-changed_pct, pass, diff_path?, diff_png?}` (metrics and size rules in
+changed_pct, pass, diffBounds, region?, diff_path?, diff_png?}` (`region: [x, y, w, h]` compares
+one rectangle; `diffBounds` boxes the changed pixels or is null; metrics and size rules in
 [agents.md](agents.md#verify-your-change-snapshot--edit--compare)).
 Analysis queries (see [mcp.md](mcp.md#analysis-tools)):
 `layer.bounds {comp?, time?, layers?, pixels?, overlaps?}` (layer geometry in comp space) and

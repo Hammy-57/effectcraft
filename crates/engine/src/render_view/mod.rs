@@ -154,7 +154,7 @@ pub fn request(s: &Session, p: &Value, cmd: &str) -> Result<ViewRequest> {
 }
 
 /// `region: [x, y, w, h]` (comp pixels) → whole pixels clipped to the `fw` × `fh` frame.
-fn region_p(v: &Value, fw: u32, fh: u32, cmd: &str) -> Result<[f64; 4]> {
+pub(crate) fn region_p(v: &Value, fw: u32, fh: u32, cmd: &str) -> Result<[f64; 4]> {
     let nums: Vec<f64> = v.as_array().map(|a| a.iter().filter_map(Value::as_f64).filter(|n| n.is_finite()).collect()).unwrap_or_default();
     let [x, y, w, h] = nums[..] else {
         return Err(bad(cmd, format!("`region` must be [x, y, width, height] in comp pixels, not {v}")));
