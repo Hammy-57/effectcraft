@@ -138,6 +138,7 @@ See [MCP conventions](mcp.md) for core tools, resources, strict arguments, and p
 | `analyze_audio {comp?, start?, end?, layer?, silence_db?, min_silence?, true_peak?, waveform?, width?, height?, path?}` | Measure the audio mix (`audio.analyze`): peak / true peak dBFS, RMS, integrated LUFS (BS.1770), clipped samples, silent ranges, per-channel stats; `waveform` returns a waveform image. No audio gives `hasAudio: false`. |
 | `lint_frame {comp?, time?, start?, end?, step?, rules?, min_text_px?, min_contrast?}` | Design lint (`render.lint`): plain-language design problems at one time or over a range, each with a fix hint: text too small or low-contrast, outside title / action safe, cut off, overlapping text, layers switched on but not seen, keyframes just off the music's beat. Returns `{clean, counts, problems: [{rule, severity, layer, layerName, time, until, message, other?}]}`. See [Design lint](#design-lint). |
 | `open_project {path \| demo \| new}` / `save_project {path?}` | Open and save files. |
+| `hosts {join?}` | Where projects are open (each running EffectCraft, its port and project); `join` (a port or a project path) switches this server onto that host as your own `client`, so several agents work in one project. Refused while your own project has unsaved changes. |
 | `undo {steps?}` / `redo {steps?}` | History. |
 | `history {goto?}` | The branching undo history (History panel): every state with its index, id, label, branch depth and whether it's current; `goto` (an index or id) jumps to any state, on any branch, without losing the others. |
 | `script_ui {action?, window?, widget?, value?, result?}` | Drive ScriptUI windows that scripts opened: `list` (default) the open windows, `get` a window's control tree, `click` a button / checkbox / radio button, `set` text, a slider or a list item, `close` a window (`result`: what a dialog's `show()` returns, default 2 = Cancel). |
@@ -241,8 +242,9 @@ Two things follow:
 One process holds one project. Every EffectCraft that holds one (the desktop app, a headless or
 `--ui` MCP server) is listed in `<config directory>/Hosts/` with its kind, control port and open
 project; `command_run hosts.list` returns the live ones (`{hosts: [{pid, kind, port, project, me}]}`).
-To work on a project that is already open, join that host (`--bridge <port>`, with your own
-`client`) instead of opening a copy: `file.open` of a project another host has open succeeds but
+To work on a project that is already open, join that host (the MCP `hosts {join: <port or
+project>}` tool, or start with `--bridge <port>`; you keep your own `client`) instead of opening a
+copy: `file.open` of a project another host has open succeeds but
 warns, and its reply lists them in `openElsewhere`.
 
 Two copies of one file overwrite each other when saved, so saving is guarded: `file.save` /

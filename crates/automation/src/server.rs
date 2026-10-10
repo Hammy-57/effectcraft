@@ -504,6 +504,10 @@ pub(crate) fn guarded_run(backend: &mut Backend, name: &str, args: &Value) -> Re
     if let Some(outer) = outer {
         backend.set_client(outer);
     }
+    // A call that joined an app (`hosts {join}`) as a one-off name: stay a named agent there.
+    if name == "hosts" && backend.mode() == "bridge" && backend.client().is_none() {
+        backend.set_client(Some(format!("mcp-{}", std::process::id())));
+    }
     r
 }
 
