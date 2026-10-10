@@ -333,3 +333,20 @@ fn precomp_layer_double_click_opens_its_timeline_tab() {
     assert_eq!(h.state().session.active_comp_id(), Some(ItemId(pre)));
     assert!(h.state().auto.find(&format!("panel.tab.Timeline.{pre}")).is_some());
 }
+
+#[test]
+fn precomp_viewer_double_click_opens_its_own_tab() {
+    let mut s = Session::default();
+    let pre = s.execute("comp.new", json!({"name": "Pre", "width": 320, "height": 180, "duration": 4})).unwrap()["comp"].as_u64().unwrap();
+    s.execute("layer.newSolid", json!({"color": "#3366ff"})).unwrap();
+    let main = s.execute("comp.new", json!({"name": "Main", "width": 320, "height": 180, "duration": 4})).unwrap()["comp"].as_u64().unwrap();
+    s.execute("layer.addItem", json!({"item": pre})).unwrap();
+    s.state.open_comps = vec![ItemId(main)];
+    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).build_eframe(|_| EffectcraftApp::new(s));
+    h.run_steps(3);
+    let point = rect(&h, "viewer.comp").center() + egui::vec2(30.0, 10.0);
+    click_n(&mut h, point, 2);
+    assert_eq!(h.state().session.active_comp_id(), Some(ItemId(pre)));
+    assert_eq!(open_comps(&h), vec![main, pre]);
+    assert!(h.state().auto.find(&format!("panel.tab.Timeline.{pre}")).is_some());
+}
