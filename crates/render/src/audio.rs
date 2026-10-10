@@ -590,7 +590,7 @@ mod tests {
         }
         l.props.sub_mut("effects").unwrap().children.push(g.into());
         let mut comp = comp;
-        comp.layers = vec![l];
+        comp.layers = vec![l].into();
         let cid = p.add_item("C", effectcraft_color::Label::Sandstone, None, ItemKind::Comp(comp.into()));
         (p, cid)
     }
