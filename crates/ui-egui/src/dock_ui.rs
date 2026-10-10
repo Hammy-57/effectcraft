@@ -262,8 +262,8 @@ impl EffectcraftApp {
         // The maximized panel fills the area; the tree is kept as it is.
         let maximized = self.ui.maximized.filter(|m| self.ui.dock.contains(*m));
         let mut dock = match maximized {
-            Some(m) => DockNode::Tabs { panels: vec![m], active: 0 },
-            None => std::mem::replace(&mut self.ui.dock, DockNode::Tabs { panels: vec![], active: 0 }),
+            Some(m) => DockNode::Tabs { panels: vec![m], active: 0, small: self.ui.dock.small_tabs(m).unwrap_or(false) },
+            None => std::mem::replace(&mut self.ui.dock, DockNode::Tabs { panels: vec![], active: 0, small: false }),
         };
         let mut groups = Vec::new();
         dock::layout(ui, &mut dock, body, &t, "", &mut groups, &mut self.auto);
@@ -442,7 +442,7 @@ impl EffectcraftApp {
         let plan: Option<DropPlan> = match target {
             Some((g, is_float)) if !float_drop => {
                 let others: Vec<PanelKind> = g.panels.iter().copied().filter(|x| *x != p).collect();
-                let zone = if is_float { Zone::Center } else { dock::drop_zone(g.rect, t.tab_h, pos) };
+                let zone = if is_float { Zone::Center } else { dock::drop_zone(g.rect, g.strip_h(&t), pos) };
                 match (others.first().copied(), zone) {
                     // The dragged tab alone in its group: nowhere to go here.
                     (None, _) => None,
@@ -452,7 +452,7 @@ impl EffectcraftApp {
                             .find(|(path, _)| *path == g.path)
                             .map(|(_, r)| r.iter().copied().filter(|(k, _)| *k != p).collect())
                             .unwrap_or_default();
-                        let strip = Rect::from_min_size(g.rect.min, vec2(g.rect.width(), t.tab_h));
+                        let strip = Rect::from_min_size(g.rect.min, vec2(g.rect.width(), g.strip_h(&t)));
                         let before = if strip.contains(pos) {
                             // Before the first tab whose middle is right of the pointer.
                             rects.iter().find(|(_, r)| r.center().x > pos.x).map(|(k, _)| *k)
