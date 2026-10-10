@@ -3,7 +3,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![recursion_limit = "256"]
 
-use std::{collections::BTreeMap, path::Path, sync::Arc};
+use std::{borrow::Cow, collections::BTreeMap, path::Path, sync::Arc};
 
 use effectcraft_color::{BlendMode, Label};
 use effectcraft_keyframe::{Ease, Gradient, Interp, Keyframe, ShapePath, Value};
@@ -12,7 +12,8 @@ use effectcraft_project::{
     Property, TrackMatte, build,
 };
 use effectcraft_time::{FrameRate, Tick};
-use serde_json::Value as Json;
+use serde::Deserialize;
+use serde_json::{Value as Json, value::RawValue};
 
 mod color_ease;
 mod effect_defaults;
@@ -127,6 +128,171 @@ fn source_issue(j: &Json) -> String {
     if parts.is_empty() { j.to_string() } else { parts.join(": ") }
 }
 
+/// The IR's top level, read in one pass with each item's `layers` and `default_camera` left
+/// unparsed: the layer pass parses one comp's layers at a time, so the dynamic tree of the whole
+/// export (several times its few hundred MiB of JSON) never exists at once. Fields read as a
+/// whole-document parse reads them: the last of a duplicated key wins.
+struct RawDoc<'a> {
+    fields: BTreeMap<String, Json>,
+    /// `None` when `items` is missing or not an array.
+    items: Option<Vec<RawItem<'a>>>,
+}
+
+/// An item's own fields, and its unparsed `layers` and `default_camera`. An item that is not
+/// an object reads as null: neither has an id.
+struct RawItem<'a> {
+    header: Json,
+    layers: Option<&'a RawValue>,
+    default_camera: Option<&'a RawValue>,
+}
+
+impl RawItem<'_> {
+    fn not_object() -> Self {
+        RawItem { header: Json::Null, layers: None, default_camera: None }
+    }
+
+    /// The whole item, as a whole-document parse would have read it.
+    fn parse(self) -> Result<Json, AepError> {
+        let mut item = self.header;
+        if let Json::Object(fields) = &mut item {
+            for (key, raw) in [("layers", self.layers), ("default_camera", self.default_camera)] {
+                if let Some(raw) = raw {
+                    fields.insert(key.to_owned(), parse_ir(raw)?);
+                }
+            }
+        }
+        Ok(item)
+    }
+}
+
+fn parse_ir(raw: &RawValue) -> Result<Json, AepError> {
+    serde_json::from_str(raw.get()).map_err(|e| AepError::Invalid(e.to_string()))
+}
+
+/// Parses a value that a later duplicate key replaces, so malformed JSON in it still fails.
+fn check_shadowed<E: serde::de::Error>(raw: Option<&RawValue>) -> Result<(), E> {
+    raw.map_or(Ok(()), |raw| serde_json::from_str::<Json>(raw.get()).map(drop).map_err(E::custom))
+}
+
+impl<'de> Deserialize<'de> for RawDoc<'de> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Doc;
+        impl<'de> serde::de::Visitor<'de> for Doc {
+            type Value = RawDoc<'de>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut doc = RawDoc { fields: BTreeMap::new(), items: None };
+                while let Some(key) = map.next_key::<String>()? {
+                    if key == "items" {
+                        for shadowed in std::mem::replace(&mut doc.items, map.next_value::<Items>()?.0).into_iter().flatten() {
+                            check_shadowed(shadowed.layers)?;
+                            check_shadowed(shadowed.default_camera)?;
+                        }
+                    } else {
+                        doc.fields.insert(key, map.next_value()?);
+                    }
+                }
+                Ok(doc)
+            }
+        }
+        deserializer.deserialize_map(Doc)
+    }
+}
+
+/// `items`: the items when it is an array, else nothing.
+struct Items<'a>(Option<Vec<RawItem<'a>>>);
+
+impl<'de> Deserialize<'de> for Items<'de> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Array;
+        impl<'de> serde::de::Visitor<'de> for Array {
+            type Value = Items<'de>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("any JSON value")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut items = Vec::new();
+                while let Some(item) = seq.next_element()? {
+                    items.push(item);
+                }
+                Ok(Items(Some(items)))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+                Json::deserialize(serde::de::value::MapAccessDeserializer::new(map)).map(|_| Items(None))
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(Items(None))
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(Items(None))
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(Items(None))
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(Items(None))
+            }
+            fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(Items(None))
+            }
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(Items(None))
+            }
+        }
+        deserializer.deserialize_any(Array)
+    }
+}
+
+impl<'de> Deserialize<'de> for RawItem<'de> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Item;
+        impl<'de> serde::de::Visitor<'de> for Item {
+            type Value = RawItem<'de>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("any JSON value")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut fields = serde_json::Map::new();
+                let (mut layers, mut default_camera) = (None, None);
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "layers" => check_shadowed(layers.replace(map.next_value()?))?,
+                        "default_camera" => check_shadowed(default_camera.replace(map.next_value()?))?,
+                        _ => {
+                            fields.insert(key, map.next_value()?);
+                        }
+                    }
+                }
+                Ok(RawItem { header: Json::Object(fields), layers, default_camera })
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
+                Json::deserialize(serde::de::value::SeqAccessDeserializer::new(seq)).map(|_| RawItem::not_object())
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(RawItem::not_object())
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(RawItem::not_object())
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(RawItem::not_object())
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(RawItem::not_object())
+            }
+            fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(RawItem::not_object())
+            }
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(RawItem::not_object())
+            }
+        }
+        deserializer.deserialize_any(Item)
+    }
+}
+
 fn preferred_comp_name(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     name == "main" || name == "final" || name.starts_with("main ") || name.starts_with("final ")
@@ -159,21 +325,40 @@ pub fn import_ir_into(
     if bytes.len() > MAX_BYTES {
         return Err(AepError::Invalid("IR exceeds 1 GiB".into()));
     }
-    if json_depth_exceeds(bytes, 128) {
+    let depth = json_depth(bytes, 128);
+    if depth > 128 {
         return Err(AepError::Invalid("IR nesting exceeds 128 levels".into()));
     }
-    let doc: Json = serde_json::from_slice(bytes).map_err(|e| AepError::Invalid(e.to_string()))?;
-    let version = doc.get("schema_version").and_then(Json::as_u64).ok_or_else(|| AepError::Invalid("missing schema_version".into()))?;
+    // serde_json's recursion limit (128) only fires on a whole-document parse; near it, parse the
+    // whole document once so the error matches.
+    if depth > 100 {
+        serde_json::from_slice::<Json>(bytes).map_err(|e| AepError::Invalid(e.to_string()))?;
+    }
+    import_doc(next, bytes, source_dir, resolve_media).map_err(|e| {
+        // Unparsed spans are skipped, not checked: malformed JSON reports the whole-document parse
+        // error, as when the document was parsed up front.
+        match serde_json::from_slice::<Json>(bytes) {
+            Err(parse) => AepError::Invalid(parse.to_string()),
+            Ok(_) => e,
+        }
+    })
+}
+
+fn import_doc(next: &mut Project, bytes: &[u8], source_dir: &str, resolve_media: &mut dyn FnMut(&str) -> Option<String>) -> Result<ImportResult, AepError> {
+    // Valid JSON that is not an object has no schema_version; invalid JSON reports its parse
+    // error from `import_ir_into`.
+    let doc = serde_json::from_slice::<RawDoc>(bytes).map_err(|_| AepError::Invalid("missing schema_version".into()))?;
+    let version = doc.fields.get("schema_version").and_then(Json::as_u64).ok_or_else(|| AepError::Invalid("missing schema_version".into()))?;
     if version != 1 {
         return Err(AepError::Schema(version));
     }
-    let items = doc.get("items").and_then(Json::as_array).ok_or_else(|| AepError::Invalid("missing items".into()))?;
+    let items = doc.items.ok_or_else(|| AepError::Invalid("missing items".into()))?;
     if items.len() > 100_000 {
         return Err(AepError::Invalid("too many items".into()));
     }
     let mut result = ImportResult::default();
     let mut property_budget = 1_000_000usize;
-    let source_depth = match doc.get("project").and_then(|p| integer(p, &["bits_per_channel"])) {
+    let source_depth = match doc.fields.get("project").and_then(|p| integer(p, &["bits_per_channel"])) {
         Some(16) => BitDepth::Bpc16,
         Some(32) => BitDepth::Bpc32,
         _ => BitDepth::Bpc8,
@@ -183,18 +368,22 @@ pub fn import_ir_into(
     } else if next.settings.bit_depth != source_depth {
         result.losses.push("project bit depth differs from imported AEP".into());
     }
-    for loss in array(&doc, "losses") {
+    for loss in doc.fields.get("losses").and_then(Json::as_array).map(Vec::as_slice).unwrap_or(&[]) {
         result.losses.push(source_issue(loss));
     }
-    for issue in array(&doc, "media_issues") {
+    for issue in doc.fields.get("media_issues").and_then(Json::as_array).map(Vec::as_slice).unwrap_or(&[]) {
         result.warnings.push(source_issue(issue));
     }
+    // A model layer's scale lives on its source item, which the layer pass no longer holds.
+    let mut model_scales = BTreeMap::new();
     // Create every item before resolving parent folders or precomp references.
-    for item in items {
+    for raw in &items {
+        let item = &raw.header;
         let ae_id = integer(item, &["id"]).ok_or_else(|| AepError::Invalid("item without integer id".into()))?;
         if result.item_ids.contains_key(&ae_id) {
             return Err(AepError::Invalid(format!("duplicate item id {ae_id}")));
         }
+        model_scales.insert(ae_id, number(item, &["model_scale"]));
         let kind = string(item, &["kind"]).unwrap_or("unknown");
         let name = string(item, &["name"]).unwrap_or("Untitled");
         if ae_id == 0 && kind == "folder" {
@@ -264,7 +453,7 @@ pub fn import_ir_into(
                         .and_then(|e| e.to_str())
                         .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "glb" | "gltf" | "obj"));
                     let source_layer = item.get("source_layer").and_then(|raw| {
-                        let layer = serde_json::from_value::<effectcraft_project::SourceLayer>(raw.clone()).ok();
+                        let layer = effectcraft_project::SourceLayer::deserialize(raw).ok();
                         match layer {
                             Some(layer)
                                 if layer.index < 65535
@@ -327,7 +516,10 @@ pub fn import_ir_into(
             result.comps.push(id);
         }
     }
-    for item in items {
+    // One item's full tree at a time: a template pack's IR is a few hundred MiB of JSON and
+    // several times that as a dynamic tree.
+    for raw in items {
+        let item = &raw.parse()?;
         let Some(ae_id) = integer(item, &["id"]) else { continue };
         let Some(&id) = result.item_ids.get(&ae_id) else { continue };
         if let Some(parent) = integer(item, &["parent_id"]).filter(|p| *p != 0) {
@@ -465,14 +657,13 @@ pub fn import_ir_into(
                 keep_environment_light_defaults(&mut layer, &mut result.losses, &format!("comp {ae_id} layer {ae_layer}"));
             }
             if matches!(&layer.source, LayerSource::Model { .. }) {
-                let model_scale =
-                    integer(ir, &["source_id"]).and_then(|id| items.iter().find(|i| integer(i, &["id"]) == Some(id))).and_then(|i| number(i, &["model_scale"]));
+                let model_scale = integer(ir, &["source_id"]).and_then(|id| model_scales.get(&id).copied().flatten());
                 models3d::import(next, &mut layer, ir, model_scale, &mut result.losses, &format!("comp {ae_id} layer {ae_layer}"));
                 result.losses.push(format!("comp {ae_id} layer {ae_layer}: 3D model coordinate/render parity with AE is unverified"));
             }
             local_ids.insert(ae_layer, layer.id);
             result.layer_ids.insert((ae_id, ae_layer), layer.id);
-            refs.push((layer.id, integer(ir, &["parent_id"]), ir.get("matte").filter(|m| !m.is_null()).cloned()));
+            refs.push((layer.id, integer(ir, &["parent_id"]), ir.get("matte").filter(|m| !m.is_null())));
             comp.layers.push(layer);
         }
         for (id, parent, matte) in refs {
@@ -481,7 +672,7 @@ pub fn import_ir_into(
                     layer.parent = local_ids.get(&p).copied();
                 }
                 if let Some(m) = matte {
-                    let mid = integer(&m, &["layer_id"]);
+                    let mid = integer(m, &["layer_id"]);
                     let kind = match m.get("type") {
                         Some(Json::Number(n)) => match n.as_i64() {
                             Some(5013) => Some(MatteKind::Alpha),
@@ -725,8 +916,10 @@ fn check_property_budget(ir: &Json, remaining: &mut usize, depth: usize) -> bool
     array(ir, "children").iter().all(|child| check_property_budget(child, remaining, depth + 1))
 }
 
-fn json_depth_exceeds(bytes: &[u8], limit: usize) -> bool {
+/// The deepest nesting of `bytes`, or `limit + 1` as soon as it exceeds `limit`.
+fn json_depth(bytes: &[u8], limit: usize) -> usize {
     let mut depth = 0usize;
+    let mut deepest = 0usize;
     let mut quoted = false;
     let mut escaped = false;
     for &b in bytes {
@@ -744,15 +937,16 @@ fn json_depth_exceeds(bytes: &[u8], limit: usize) -> bool {
                 b'[' | b'{' => {
                     depth += 1;
                     if depth > limit {
-                        return true;
+                        return depth;
                     }
+                    deepest = deepest.max(depth);
                 }
                 b']' | b'}' => depth = depth.saturating_sub(1),
                 _ => {}
             }
         }
     }
-    false
+    deepest
 }
 
 fn layer_source(ir: &Json, project: &Project, item_ids: &BTreeMap<i64, ItemId>, comp_id: i64, losses: &mut Vec<String>) -> Option<LayerSource> {
@@ -1243,13 +1437,13 @@ fn import_property(
             {
                 let f = |v: f64| v + 1.0;
                 let value = if let Value::Scalar(v) = value { Value::Scalar(f(v)) } else { value };
-                fill_property(prop, &remapped(ir, f), value, value_type, scale, layer_time, losses, context);
+                fill_property_mapped(prop, ir, value, value_type, scale, Some(&f), layer_time, losses, context);
             } else if match_id == "direction" && matches!(parent.match_id.as_str(), "path" | "rect" | "ellipse" | "star") {
                 // Path Direction is 1 Default / 3 Reversed in AE (2 is normal too); ours is 0 / 1
                 // after the popup adapter's minus one.
                 let f = |v: f64| if v >= 2.5 { 2.0 } else { 1.0 };
                 let value = if let Value::Scalar(v) = value { Value::Scalar(f(v)) } else { value };
-                fill_property(prop, &remapped(ir, f), value, value_type, scale, layer_time, losses, context);
+                fill_property_mapped(prop, ir, value, value_type, scale, Some(&f), layer_time, losses, context);
             } else {
                 fill_property(prop, ir, value, value_type, scale, layer_time, losses, context);
             }
@@ -1459,7 +1653,7 @@ fn import_native_effect_params(
         };
         if let Some(f) = remap {
             let adjusted_value = if let Value::Scalar(v) = value { Value::Scalar(f(v)) } else { value };
-            fill_property(prop, &remapped(child, f), adjusted_value, value_type, scale, layer_time, losses, context);
+            fill_property_mapped(prop, child, adjusted_value, value_type, scale, Some(&f), layer_time, losses, context);
         } else {
             fill_property(prop, child, value, value_type, scale, layer_time, losses, context);
         }
@@ -1476,23 +1670,32 @@ fn unauthored_raw_default_point(ir: &Json, value: &Value) -> bool {
         && matches!(value, Value::Vec2(v) if v.iter().any(|c| c.abs() >= 10_000.0))
 }
 
-/// A copy of a property's IR with its scalar value and keyframe values mapped by `f`.
-fn remapped(ir: &Json, f: impl Fn(f64) -> f64) -> Json {
-    let mut adjusted = ir.clone();
-    if let Some(v) = adjusted.get("value").and_then(Json::as_f64) {
-        adjusted["value"] = Json::from(f(v));
+/// An IR value with a numeric value mapped by `f` (a non-finite result reads as null, as JSON
+/// can't hold it); other values are borrowed unchanged.
+fn remap_json<'a>(j: &'a Json, f: Option<&dyn Fn(f64) -> f64>) -> Cow<'a, Json> {
+    match (f, j.as_f64()) {
+        (Some(f), Some(v)) => Cow::Owned(Json::from(f(v))),
+        _ => Cow::Borrowed(j),
     }
-    if let Some(keys) = adjusted.get_mut("keyframes").and_then(Json::as_array_mut) {
-        for key in keys {
-            if let Some(v) = key.get("value").and_then(Json::as_f64) {
-                key["value"] = Json::from(f(v));
-            }
-        }
-    }
-    adjusted
 }
 
 fn fill_property(prop: &mut Property, ir: &Json, value: Value, value_type: &str, scale: f64, layer_time: LayerTime, losses: &mut Vec<String>, context: &str) {
+    fill_property_mapped(prop, ir, value, value_type, scale, None, layer_time, losses, context);
+}
+
+/// [`fill_property`] with keyframe values mapped by `remap` as they are read (`value` is
+/// already mapped), so a remapped property's IR is never copied.
+fn fill_property_mapped(
+    prop: &mut Property,
+    ir: &Json,
+    value: Value,
+    value_type: &str,
+    scale: f64,
+    remap: Option<&dyn Fn(f64) -> f64>,
+    layer_time: LayerTime,
+    losses: &mut Vec<String>,
+    context: &str,
+) {
     let raw = string(ir, &["match_name"]).unwrap_or("?");
     let native_template = prop.value.clone();
     prop.value = adapt_value(scale_value(value, scale), &native_template);
@@ -1507,7 +1710,7 @@ fn fill_property(prop: &mut Property, ir: &Json, value: Value, value_type: &str,
             losses.push(format!("{context}: invalid keyframe time on {raw}"));
             continue;
         };
-        let Some(kval) = key.get("value").and_then(|v| convert_value(v, value_type)) else {
+        let Some(kval) = key.get("value").and_then(|v| convert_value(&remap_json(v, remap), value_type)) else {
             losses.push(format!("{context}: keyframe on {raw} has unsupported value"));
             continue;
         };
@@ -1731,6 +1934,174 @@ fn gradient_value(j: &Json) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The importer as it was when it parsed the whole document up front: every outcome must match.
+    fn whole_document_outcome(bytes: &[u8]) -> Result<(String, String), String> {
+        if json_depth(bytes, 128) > 128 {
+            return Err(AepError::Invalid("IR nesting exceeds 128 levels".into()).to_string());
+        }
+        let doc: Json = serde_json::from_slice(bytes).map_err(|e| AepError::Invalid(e.to_string()).to_string())?;
+        // A re-serialized document has no duplicate keys or skippable spans left.
+        import_outcome(doc.to_string().as_bytes())
+    }
+
+    fn import_outcome(bytes: &[u8]) -> Result<(String, String), String> {
+        let mut project = Project::default();
+        let result = import_ir(&mut project, bytes, "", &mut |_| None).map_err(|e| e.to_string())?;
+        Ok((project.to_file_json().map_err(|e| e.to_string())?, format!("{result:?}")))
+    }
+
+    fn fidelity_fixture() -> String {
+        let keyed = |a: f64, b: f64| {
+            format!(r#""keyframes":[{{"time":0.0,"value":{a},"in_temporal_ease":[{{"speed":1,"influence":33}}]}},{{"time":1.0,"value":{b}}}]"#)
+        };
+        format!(
+            r#"{{"schema_version":1,"source":{{"path":"x.aep"}},"counts":{{"items":5}},"project":{{"bits_per_channel":16}},
+            "losses":[{{"scope":"p","reason":"r","detail":"d"}},7],"media_issues":[{{"scope":"m"}}],
+            "items":[{{"id":1,"kind":"comp","name":"shadowed","layers":[]}}],
+            "items":[
+              {{"id":0,"kind":"folder","name":"Root"}},
+              {{"id":9,"kind":"folder","name":"Bin"}},
+              {{"id":2,"kind":"footage","name":"model.glb","file":"/offline/model.glb","model_scale":0.5,"parent_id":9}},
+              {{"id":3,"kind":"footage","name":"art.psd","file":"/offline/art.psd","source_layer":{{"index":2,"name":"Hand","layer_size":true,"crop_bounds":[1.0,2.0,30.0,40.0]}}}},
+              {{"id":4,"kind":"comp","name":"Nested","width":100,"height":100,"duration":5,"frame_rate":30,"layers":[]}},
+              {{"id":5,"kind":"comp","name":"Main","width":400,"height":200,"duration":5,"frame_rate":23.976,"unknown_field":{{"deep":[1,2,{{"x":null}}]}},
+               "layers":[{{"id":99,"kind":"null","name":"shadowed layer"}}],
+               "default_camera":null,
+               "layers":[
+                {{"id":10,"index":1,"kind":"text","name":"Card","three_d_layer":true,"parent_id":11,"matte":{{"layer_id":11,"type":5013}},"properties":[
+                  {{"kind":"group","match_name":"ADBE Transform Group","children":[
+                    {{"kind":"property","match_name":"ADBE Position","value":[10,20,0],"keyframes":[{{"time":0.5,"value":[1,2,0],"in_spatial_tangent":[1,0,0]}},{{"time":1.5,"value":[3,4,0]}}]}},
+                    {{"kind":"property","match_name":"ADBE Opacity","value":50,"expression":"value","expression_enabled":true}}]}},
+                  {{"kind":"group","match_name":"ADBE Material Options Group","children":[
+                    {{"kind":"property","match_name":"ADBE Casts Shadows","value":1.0,{}}},
+                    {{"kind":"property","match_name":"ADBE Accepts Shadows","value":2}}]}},
+                  {{"kind":"group","match_name":"ADBE Text Properties","children":[
+                    {{"kind":"property","match_name":"ADBE Text Document","value":{{"type":"TextDocument","data":{{"text":"Hi","font_size":50}}}}}},
+                    {{"kind":"group","match_name":"ADBE Text Path Options","children":[
+                      {{"kind":"property","match_name":"ADBE Text Path","authored":true,"value":1,{}}}]}}]}}]}},
+                {{"id":11,"index":2,"kind":"ShapeLayer","name":"Dirs","properties":[{{"kind":"group","match_name":"ADBE Root Vectors Group","children":[
+                  {{"kind":"group","match_name":"ADBE Vector Shape - Ellipse","children":[
+                    {{"kind":"property","match_name":"ADBE Vector Shape Direction","value":3,{}}},
+                    {{"kind":"property","match_name":"ADBE Vector Ellipse Size","value":[40,40]}}]}}]}}]}},
+                {{"id":12,"index":3,"kind":"solid","name":"Effects","switches":{{"blending_mode":5}},"timing":{{"start_time":0.5,"stretch":-100}},"properties":[
+                  {{"kind":"group","match_name":"ADBE Effect Parade","children":[
+                    {{"kind":"group","match_name":"Keylight 906","name":"Keylight","children":[
+                      {{"kind":"property","match_name":"Keylight 906-0023","value":1.0,{}}},
+                      {{"kind":"property","match_name":"Keylight 906-0005","value":100.0}}]}},
+                    {{"kind":"group","match_name":"ADBE Glo2","name":"Glow","children":[{{"kind":"property","match_name":"ADBE Glo2-0002","value":153.0}}]}},
+                    {{"kind":"group","match_name":"CC Page Turn","name":"Page","children":[{{"kind":"property","match_name":"CC Page Turn-0001","value":4.0,{}}}]}},
+                    {{"kind":"group","match_name":"ADBE Set Matte3","name":"Set Matte","children":[{{"kind":"property","match_name":"ADBE Set Matte3-0001","value":2.0}}]}}]}}]}},
+                {{"id":13,"index":4,"kind":"footage","source_id":2,"name":"Model","three_d_layer":true,"properties":[
+                  {{"kind":"group","match_name":"ADBE Material Options Group","children":[
+                    {{"kind":"property","match_name":"ADBE Casts Shadows","value_type":6417,"value":2.0,{}}},
+                    {{"kind":"property","match_name":"ADBE Accepts Lights","value_type":6417,"value":0.0}}]}}]}},
+                {{"id":14,"index":5,"kind":"precomp","source_id":4,"name":"Nested","switches":{{"time_remap_enabled":false}},"properties":[
+                  {{"kind":"property","match_name":"ADBE Time Remapping","value":0.0,{}}}]}},
+                {{"id":15,"index":6,"kind":"footage","source_id":3,"name":"Art"}}
+              ]}}
+            ]}}"#,
+            keyed(0.0, 2.0),
+            keyed(0.0, 1.0),
+            keyed(1.0, 3.0),
+            keyed(0.0, 2.0),
+            keyed(1.0, 4.0),
+            keyed(0.0, 2.0),
+            keyed(0.0, 1.0),
+        )
+    }
+
+    #[test]
+    fn item_at_a_time_import_matches_the_whole_document_parse() {
+        let fixture = fidelity_fixture();
+        let imported = import_outcome(fixture.as_bytes()).unwrap();
+        assert_eq!(Ok(imported.clone()), whole_document_outcome(fixture.as_bytes()));
+        // The fixture reaches every remapped property path, both item passes and duplicate keys.
+        assert!(imported.0.contains("Hand") && !imported.0.contains("shadowed"), "{}", imported.1);
+    }
+
+    #[test]
+    fn malformed_or_odd_ir_fails_as_the_whole_document_parse_did() {
+        let layered = |layers: &str| format!(r#"{{"schema_version":1,"items":[{{"id":1,"kind":"comp","name":"C","layers":{layers}}}]}}"#);
+        let deep = |n: usize| layered(&format!("[{{\"id\":2,\"x\":{}1{}}}]", "[".repeat(n), "]".repeat(n)));
+        let mut cases: Vec<Vec<u8>> = [
+            layered(r#"[{"id":2,"x":1e400}]"#),
+            layered(r#"[{"id":2,"name":"\ud800"}]"#),
+            layered(r#"[{"id":2,"name":"\x"}]"#),
+            layered(r#"[{"id":2,}]"#),
+            layered(r#"{"not":"an array"}"#),
+            layered("[1,2"),
+            deep(100),
+            deep(120),
+            deep(122),
+            deep(123),
+            deep(124),
+            deep(125),
+            deep(126),
+            r#"{"schema_version":1,"counts":1e400,"items":[]}"#.into(),
+            r#"{"schema_version":1,"items":[{"id":1,"layers":[1e400]}],"items":[]}"#.into(),
+            r#"{"schema_version":1,"items":[{"id":1,"kind":"comp","layers":[1e400],"layers":[]}]}"#.into(),
+            r#"{"schema_version":1,"items":[{"id":1,"kind":"comp","default_camera":{"a":1e400},"default_camera":null}]}"#.into(),
+            r#"{"schema_version":1,"items":[{"id":1,"kind":"comp"},{"id":1,"layers":[1e400]}]}"#.into(),
+            r#"{"schema_version":1,"items":[5,[1e400]]}"#.into(),
+            r#"{"schema_version":1,"items":[5]}"#.into(),
+            r#"{"schema_version":1,"items":[[1]]}"#.into(),
+            r#"{"schema_version":1,"items":{"a":1}}"#.into(),
+            r#"{"schema_version":1,"items":{"a":1e400}}"#.into(),
+            r#"{"schema_version":1,"items":"x"}"#.into(),
+            r#"{"schema_version":1}"#.into(),
+            r#"{"schema_version":2,"items":[]}"#.into(),
+            r#"{"items":[]}"#.into(),
+            r#"{"schema_version":1,"items":[]} x"#.into(),
+            "[1,2]".into(),
+            "7".into(),
+            "".into(),
+        ]
+        .into_iter()
+        .map(String::into_bytes)
+        .collect();
+        let mut invalid_utf8 = layered(r#"[{"id":2,"name":"ab"}]"#).into_bytes();
+        let at = invalid_utf8.iter().position(|b| *b == b'a').unwrap();
+        invalid_utf8[at] = 0xff;
+        cases.push(invalid_utf8);
+        for case in cases {
+            assert_eq!(import_outcome(&case), whole_document_outcome(&case), "{}", String::from_utf8_lossy(&case));
+        }
+    }
+
+    #[test]
+    fn remapped_keys_match_a_remapped_copy_of_the_ir() {
+        // The importer once copied a property's IR with its values mapped; mapping on read must agree.
+        fn remapped(ir: &Json, f: impl Fn(f64) -> f64) -> Json {
+            let mut adjusted = ir.clone();
+            if let Some(v) = adjusted.get("value").and_then(Json::as_f64) {
+                adjusted["value"] = Json::from(f(v));
+            }
+            if let Some(keys) = adjusted.get_mut("keyframes").and_then(Json::as_array_mut) {
+                for key in keys {
+                    if let Some(v) = key.get("value").and_then(Json::as_f64) {
+                        key["value"] = Json::from(f(v));
+                    }
+                }
+            }
+            adjusted
+        }
+        let ir = serde_json::json!({"match_name":"ADBE Text Path","value":1,"expression":"value","keyframes":[
+            {"time":0.0,"value":0},{"time":0.5,"value":1.5e308},{"time":1.0,"value":[1,2]},{"time":1.5,"value":"x"},{"time":2.0},
+            {"time":2.5,"value":true},{"time":3.0,"value":-1},{"time":3.5,"value":null}]});
+        let funcs: [fn(f64) -> f64; 3] = [|v| v + 1.0, |v| v * 10.0, |v| if v >= 2.5 { 2.0 } else { 1.0 }];
+        for f in funcs {
+            for (template, stretch) in [(Value::Enum(0), 100.0), (Value::Scalar(0.0), -50.0), (Value::Layer(None), 100.0)] {
+                let clock = LayerTime { start: Tick::ZERO, stretch };
+                let (mut copied, mut mapped) = (Property::new(1, "p", "P", template.clone()), Property::new(1, "p", "P", template));
+                let (mut copied_losses, mut mapped_losses) = (Vec::new(), Vec::new());
+                fill_property(&mut copied, &remapped(&ir, f), Value::Scalar(f(1.0)), "", 1.0, clock, &mut copied_losses, "t");
+                fill_property_mapped(&mut mapped, &ir, Value::Scalar(f(1.0)), "", 1.0, Some(&f), clock, &mut mapped_losses, "t");
+                assert_eq!(copied, mapped);
+                assert_eq!(copied_losses, mapped_losses);
+            }
+        }
+    }
 
     #[test]
     fn curves_state_restores_five_editable_lookup_tables() {

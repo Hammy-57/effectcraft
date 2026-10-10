@@ -54,26 +54,11 @@ pub(super) fn import(_project: &mut Project, layer: &mut Layer, ir: &Json, model
         };
         // AE model tri-state values are 0=Off, 1=On, 2=Only. The common
         // property adapter expects AE's usual 1-based enum, so offset here.
-        let adjusted = if matches!(target, "castsShadows" | "acceptsShadows") {
-            let mut adjusted = source.clone();
-            if let Some(v) = adjusted.get("value").and_then(Json::as_f64) {
-                adjusted["value"] = Json::from(v + 1.0);
-            }
-            if let Some(keys) = adjusted.get_mut("keyframes").and_then(Json::as_array_mut) {
-                for key in keys {
-                    if let Some(v) = key.get("value").and_then(Json::as_f64) {
-                        key["value"] = Json::from(v + 1.0);
-                    }
-                }
-            }
-            adjusted
-        } else {
-            source.clone()
-        };
-        let raw = adjusted.get("value").unwrap_or(&Json::Null);
-        let value_type = string(&adjusted, &["value_type"]).unwrap_or("");
-        if let Some(value) = convert_value(raw, value_type) {
-            fill_property(prop, &adjusted, value, value_type, 1.0, layer_time, losses, context);
+        let remap: Option<&dyn Fn(f64) -> f64> = if matches!(target, "castsShadows" | "acceptsShadows") { Some(&|v| v + 1.0) } else { None };
+        let raw = remap_json(source.get("value").unwrap_or(&Json::Null), remap);
+        let value_type = string(source, &["value_type"]).unwrap_or("");
+        if let Some(value) = convert_value(&raw, value_type) {
+            fill_property_mapped(prop, source, value, value_type, 1.0, remap, layer_time, losses, context);
         }
     }
 }
