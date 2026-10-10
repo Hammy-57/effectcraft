@@ -2084,8 +2084,12 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                                 continue;
                             }
                             let gresp = ui
-                                .interact(gr, egui::Id::new(("ghost", side, layer.id.0)), Sense::drag())
+                                .interact(gr, egui::Id::new(("ghost", side, layer.id.0)), Sense::click_and_drag())
                                 .on_hover_text(crate::i18n::tr("Drag to slip the source"));
+                            // Outside the bar it is empty track area: a plain click deselects.
+                            if gresp.clicked() && !ui.input(|i| i.modifiers.shift || i.modifiers.command) {
+                                actions.push(("layer.select".into(), json!({"layers": []})));
+                            }
                             app.auto.add(&format!("timeline.layer.{}.source{}", layer.id.0, side), gr, "Slip");
                             if gresp.hovered() || gresp.dragged() {
                                 ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
@@ -2812,14 +2816,11 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     if graph_on {
         super::graph::show(app, ui, &gp, &comp, &ectx, tm, Rect::from_min_max(pos2(graph_x0, rows_rect.min.y), rows_rect.max), &mut actions);
     }
-    // Empty-area click in the graph: deselect keys (below the last row, the layers too, as in
-    // After Effects); drag: box-select keys.
-    if empty.clicked() {
-        actions.push(("keys.select".into(), json!({"keys": []})));
-        let below = empty.interact_pointer_pos().is_some_and(|p| hit_rows.iter().all(|(r, _)| p.y > r.max.y));
-        if below && !ui.input(|i| i.modifiers.shift || i.modifiers.command) {
-            actions.push(("layer.select".into(), json!({"layers": []})));
-        }
+    // A plain click on empty track area (beside a layer's bar, on a property row's empty span or
+    // below the last row) deselects the layers and their keys and properties, as in After
+    // Effects; Shift / Cmd keep the selection. Drag: box-select keys.
+    if empty.clicked() && !ui.input(|i| i.modifiers.shift || i.modifiers.command) {
+        actions.push(("layer.select".into(), json!({"layers": []})));
     }
     if let (true, Some(origin), Some(cur)) =
         (empty.dragged(), empty.interact_pointer_pos().and_then(|_| ctx.input(|i| i.pointer.press_origin())), empty.interact_pointer_pos())
@@ -2925,7 +2926,13 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 }
             }
         }
-        actions.push(("keys.select".into(), json!({"keys": keys, "add": ui.input(|i| i.modifiers.shift), "selectProperties": true})));
+        let mods = ui.input(|i| i.modifiers);
+        if keys.is_empty() && !(mods.shift || mods.command) {
+            // A marquee that catches nothing leaves nothing selected (layers included).
+            actions.push(("layer.select".into(), json!({"layers": []})));
+        } else {
+            actions.push(("keys.select".into(), json!({"keys": keys, "add": mods.shift, "selectProperties": true})));
+        }
     }
 
     // CTI.
