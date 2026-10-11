@@ -11,7 +11,7 @@ use effectcraft_render::{FootageFrame, FootageSource, SharedFrame, preview_size}
 use effectcraft_time::{FrameRate, TICKS_PER_SECOND, Tick};
 use filmcraft_media::{FrameRequest, SharedSource};
 
-use crate::convert::{AlphaOp, Packed, frame_to_image_scaled, pack_dynamic};
+use crate::convert::{AlphaOp, Packed, pack_dynamic};
 use crate::gif_anim::{self, Anim};
 use crate::{MediaError, Result};
 
@@ -1103,18 +1103,12 @@ impl Inner {
             let cached = lock(&self.cache).lru.get(&base.key);
             let full = match cached {
                 Some(px) => px,
-                // A movie frame of the footage's own size: converted straight at the preview
-                // size from the decoder's samples when they allow it (a quarter of the pixels
-                // converted), as `resample` of the full frame would make it.
+                // The full frame, decoded and not kept, then resampled exactly as the renderer
+                // resamples it (bit-identical to a full-size render scaled down; the faster
+                // quarter-pixel 4:2:0 conversion differs where colours clip).
                 None => match base.media_t.filter(|_| !gif_anim::is_gif(footage)) {
                     Some(mt) => {
                         let frame = self.video_frame(&base.key.path, mt, detached)?;
-                        if (frame.width, frame.height) == (footage.width, footage.height)
-                            && preview_size(frame.width, p.w, p.h, p.s) == Some((rw, rh))
-                            && let Some(img) = frame_to_image_scaled(&frame, rw, rh)
-                        {
-                            return Ok(Pixels::Preview(Arc::new(img)));
-                        }
                         Pixels::Packed(Arc::new(Packed::Video { frame, op: AlphaOp::of(footage) }))
                     }
                     None => self.decode(&base, footage, detached)?,
