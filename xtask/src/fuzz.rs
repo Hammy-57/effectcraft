@@ -51,15 +51,8 @@ pub fn run(root: &Path, args: &[String]) -> Result<(), String> {
             .current_dir(&dir)
             .args(["+nightly", "fuzz", "run", t.as_str()])
             .arg(&corpus)
-            .args([
-                "--",
-                &format!("-max_total_time={seconds}"),
-                "-timeout=10",
-                "-rss_limit_mb=4096",
-                "-max_len=1048576",
-                &format!("-jobs={jobs}"),
-                &format!("-workers={jobs}"),
-            ])
+            .arg("--")
+            .args(libfuzzer_args(t, seconds, jobs))
             .status()
             .map_err(|e| format!("fuzz: cannot run cargo fuzz (cargo install cargo-fuzz; rustup toolchain install nightly): {e}"))?;
         if !status.success() {
@@ -72,6 +65,22 @@ pub fn run(root: &Path, args: &[String]) -> Result<(), String> {
     } else {
         Err(format!("fuzz: {} found a crash, hang or memory blow-up; the input is in fuzz/artifacts/<target>/", crashed.join(", ")))
     }
+}
+
+/// libFuzzer's options for one run of `target`.
+fn libfuzzer_args(target: &str, seconds: u64, jobs: u32) -> Vec<String> {
+    let mut a = vec![format!("-max_total_time={seconds}"), "-timeout=10".into(), "-rss_limit_mb=4096".into(), "-max_len=1048576".into()];
+    // More than one job sends each one's output to fuzz-N.log; one job prints here.
+    if jobs > 1 {
+        a.push(format!("-jobs={jobs}"));
+        a.push(format!("-workers={jobs}"));
+    }
+    // boa (the JavaScript engine) keeps some garbage-collected objects of a thrown exception
+    // past the end of an evaluation, which LeakSanitizer reports; it is not EffectCraft's leak.
+    if target == "expr_eval" {
+        a.push("-detect_leaks=0".into());
+    }
+    a
 }
 
 fn seeds(dir: &Path) -> Result<(), String> {

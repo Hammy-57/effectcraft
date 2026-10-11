@@ -46,3 +46,25 @@ cargo run --release -p effectcraft-cli -- bench --n 10 --play 30
 
 prints per-layer and per-effect timings for one frame, and playback timings with and without the
 layer cache.
+
+## Fuzzing
+
+`fuzz/` holds cargo-fuzz targets for every input EffectCraft doesn't control: `project_open`
+(`.ecproj` JSON and XML, loaded and rendered), `aep_ir` (the py-aep import document),
+`lottie_import`, `svg_parse`, `psd_parse`, `pdf_parse` (PDF / AI / EPS), `interchange_import` (FCP7
+XML, FCPXML, OTIO, EDL), `expr_eval`, `media_probe` (stills, video and audio, probed and decoded)
+and `engine_command` (commands with fuzzed parameters on the demo project, as agents send them).
+The crate is outside the workspace, so ordinary builds don't compile it; its targets never touch
+the disk, the network or other processes.
+
+```sh
+rustup toolchain install nightly && cargo install cargo-fuzz   # once
+cargo xtask fuzz --seeds                                       # write the seed corpus
+cargo xtask fuzz --seconds 300                                 # every target, 5 minutes each
+cargo xtask fuzz expr_eval media_probe --seconds 3600 --jobs 4
+```
+
+A crash, a hang over 10 s or more than 4 GB of memory stops the run and leaves the input in
+`fuzz/artifacts/<target>/`. Fix it in the crate that crashed with a regression test there (AGENTS.md
+"Never crash"), then check `cargo +nightly fuzz run <target> <artifact>` passes. Only the
+`seed-*` files of `fuzz/corpus/` are committed.
