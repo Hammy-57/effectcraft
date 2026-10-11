@@ -27,7 +27,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let brand = Rect::from_min_size(pos2(x, cy - 12.0), vec2(24.0, 24.0));
     paint_logo(&p, brand);
     let bresp = ui.interact(brand, egui::Id::new("brand"), Sense::click());
-    app.auto.add("header.about", brand, "About EffectCraft");
+    app.auto.add_response("header.about", &bresp, "About EffectCraft");
+    widgets::focus_outline(ui, &bresp, &t);
     if bresp.on_hover_text(tr("About EffectCraft")).clicked() {
         app.dialog = Some(Dialog::About);
     }
@@ -35,10 +36,11 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
 
     // Home.
     let home = Rect::from_min_size(pos2(x, cy - 13.0), vec2(26.0, 26.0));
-    if widgets::icon_button(ui, home, Icon::Home, app.ui.start_screen, &t, egui::Id::new("tool-home")).on_hover_text(tr("Home")).clicked() {
+    let home_response = widgets::icon_button(ui, home, Icon::Home, app.ui.start_screen, &t, egui::Id::new("tool-home")).on_hover_text(tr("Home"));
+    app.auto.add_response("header.home", &home_response, "Home");
+    if home_response.clicked() {
         app.ui.start_screen = !app.ui.start_screen;
     }
-    app.auto.add("header.home", home, "Home");
     x += 30.0;
     p.line_segment([pos2(x, cy - 10.0), pos2(x, cy + 10.0)], Stroke::new(1.0, t.separator));
     x += 6.0;
@@ -62,7 +64,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 Stroke::NONE,
             ));
         }
-        app.auto.add(&format!("tools.{cur:?}"), r, cur.label());
+        app.auto.add_response(&format!("tools.{cur:?}"), &resp, cur.label());
         let tip = match cur.shortcut() {
             Some(s) => format!("{} ({})", cur.label(), crate::menus::shortcut_text(s)),
             None => cur.label().to_string(),

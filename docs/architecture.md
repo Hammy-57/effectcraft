@@ -54,6 +54,19 @@ Allowed same-layer edges: `path → keyframe, raster`, `text → path`, `pdf →
 `media / expr / export / gpu → render`, `export → media`, `lottie → format`, `host → engine, script`,
 `script → engine`.
 
+The frontend uses `craft-ui::docking` for atomic layout transactions and pointer drop targets,
+and `craft-ui::layout` for bounded split geometry and resize interactions. A small adapter
+preserves EffectCraft's saved dock tree, stacked entries, floating rectangles and dynamic
+viewer/ScriptUI identities. Tab moves, edge splits, reordering, float/redock, activation and
+close operations use the shared model. The app retains composition-tab behavior, accordion
+height allocation and ScriptUI close callbacks. Lower layers cannot depend on `craft-ui`.
+
+Viewer controls retain their native widgets inside a horizontal scroll area, so narrow panels
+keep dropdowns, exposure dragging and snapshot holds reachable. Keyboard focus scrolls the
+focused control into view. Active composition breadcrumbs use the selected-row theme color.
+The `viewer_geometry` tests inspect actual painted contrast, scroll geometry and pointer/keyboard
+reachability across the three themes.
+
 ## 2. Time
 
 All time is an integer `Tick`, 254 016 000 000 per second, the least common multiple of every

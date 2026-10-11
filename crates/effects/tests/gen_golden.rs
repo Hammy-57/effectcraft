@@ -2,8 +2,9 @@
 //!
 //! The GPU compositor rasterises these effects from geometry the CPU computes (bolts, strokes,
 //! glyphs, audio marks, wave lists, flood-fill regions, sampled colours); the CPU effects were
-//! refactored to build the same plans, and must render exactly what they did before. Each
-//! effect renders on a generated layer with masks, another layer and an audio track, at default
+//! refactored to build the same plans. The hashes guard against unintended output changes;
+//! intended behavior changes require a focused regression test before re-pinning. Each effect
+//! renders on a generated layer with masks, another layer and an audio track, at default
 //! and non-default parameters and two layer times, in an 8 bpc pipeline (input and output
 //! clamped and quantised) and a 32 bpc one, at full and at half resolution. Each frame's pixels
 //! are hashed (FNV-1a over the `f32` bits) and compared with the pinned hashes below.
@@ -323,6 +324,70 @@ fn hashes() -> Vec<(String, u64)> {
     v
 }
 
+/// Pin the intended linear spectrum behavior independently of the pixel hash table.
+#[test]
+fn audio_spectrum_uses_linear_frequency_and_amplitude() {
+    struct Tone {
+        frequency: f64,
+        amplitude: f64,
+    }
+    impl EffectHost for Tone {
+        fn layer(&self, _: u64, _: bool) -> Option<LayerPixels> {
+            None
+        }
+        fn audio(&self, _: u64, start: f64, frames: usize, rate: u32) -> Option<Vec<f32>> {
+            Some(
+                (0..frames)
+                    .flat_map(|i| {
+                        let t = start + i as f64 / rate as f64;
+                        let sample = (self.amplitude * (t * self.frequency * std::f64::consts::TAU).sin()) as f32;
+                        [sample, sample]
+                    })
+                    .collect(),
+            )
+        }
+    }
+    let id = "ec.generate.audiospectrum";
+    let spec = find(id).unwrap();
+    let size = [320.0, 100.0];
+    let mut params = Params { values: spec.params.iter().map(|p| (p.id.to_string(), default_value(p, size))).collect() };
+    for (key, value) in [
+        ("audioLayer", Value::Layer(Some(MAP))),
+        ("startPoint", pt(0.0, 50.0)),
+        ("endPoint", pt(320.0, 50.0)),
+        ("startFrequency", n(0.0)),
+        ("endFrequency", n(1500.0)),
+        ("frequencyBands", n(33.0)),
+        ("maximumHeight", n(40.0)),
+        ("audioDuration", n(256.0)),
+    ] {
+        params.values.insert(key.to_string(), value);
+    }
+    let buf = Buf { img: Image::new(320, 100), offset: [0.0; 2], scale: 1.0 };
+    for (frequency, expected_band) in [(375.0, 8), (750.0, 16), (1125.0, 24)] {
+        let mut peaks = Vec::new();
+        for amplitude in [0.0, 0.125, 0.25] {
+            let host = Tone { frequency, amplitude };
+            let env = EffectEnv { host: Some(&host), comp_time: 1.0, ..Default::default() };
+            let ctx = EffectCtx { params: &params, time: 1.0, layer_size: size, seed: 1, adjustment: false, env };
+            let plan = effectcraft_effects::marks_plan(id, &ctx, &buf).unwrap();
+            assert_eq!(plan.segs.len(), 33);
+            let heights: Vec<f64> = plan.segs.iter().map(|seg| (seg.b[1] - seg.a[1]).abs()).collect();
+            assert!(heights.iter().all(|height| height.is_finite()));
+            if amplitude == 0.0 {
+                assert!(heights.iter().all(|height| *height == 0.0), "silence has no bar height");
+                continue;
+            }
+            let (band, height) = heights.iter().enumerate().max_by(|(_, a), (_, b)| a.total_cmp(b)).unwrap();
+            assert_eq!(band, expected_band, "{frequency} Hz uses its linear frequency position");
+            // A windowed pure tone retains its amplitude, allowing for the finite Hann window.
+            assert!((height - amplitude * 40.0).abs() < 0.01, "{frequency} Hz at {amplitude}: height {height}");
+            peaks.push(*height);
+        }
+        assert!((peaks[1] - 2.0 * peaks[0]).abs() < 1e-6, "doubling the signal doubles the height: {peaks:?}");
+    }
+}
+
 #[test]
 fn plan_effects_golden_hashes() {
     let got = hashes();
@@ -520,6 +585,7 @@ const GOLDEN: &[(&str, u64)] = &[
     ("ec.generate.eyedropperfill/2/32bpc/t1.3", 0x500e27795935722a),
     ("ec.generate.eyedropperfill/2/32bpc/half/t0.4", 0x480fd6a293c6597c),
     ("ec.generate.eyedropperfill/2/32bpc/half/t1.3", 0x480fd6a293c6597c),
+    // Linear frequency bands and amplitude from 581326ec; all other effects retain their hashes.
     ("ec.generate.audiospectrum/0/8bpc/t0.4", 0x07be49f76890493c),
     ("ec.generate.audiospectrum/0/8bpc/t1.3", 0xc0109e19c3958517),
     ("ec.generate.audiospectrum/0/32bpc/t0.4", 0x24fe2e48cc432c1f),

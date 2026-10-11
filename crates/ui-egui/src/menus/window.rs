@@ -13,6 +13,9 @@ pub(crate) fn handlers() -> &'static [Handler] {
         Handler::ui_prefix("window.panel.", legacy_panel),
         Handler::ui_prefix("window.workspace.", legacy_workspace),
         Handler::ui("window.maximizePanel", panel_op),
+        // A shared docking transaction (`{action}`, craft-ui's `docking::Action`), applied
+        // atomically: panel moves, tab order, edge splits, floating, resizing.
+        Handler::ui("window.dockAction", dock_action),
         // A UI-only command (not in the engine's menus): run as its frontend command.
         Handler::ui("window.maximizeApp", maximize_app),
         Handler::frontend("window.maximizeApp", maximize_app),
@@ -59,6 +62,34 @@ fn legacy_workspace(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, _pa
     super::frontend(app, ctx, "window.workspace", json!({"name": ws}))
 }
 
+/// `window.dockAction`: one shared docking transaction. Opening goes through the panel open
+/// commands (they keep the viewer and ScriptUI lifecycle); closing runs the app's close so a
+/// closed viewer or script panel is released too.
+fn dock_action(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, params: Value) -> Result<Value, String> {
+    let value = params.get("action").cloned().ok_or("missing docking action")?;
+    let action: craft_ui::docking::Action<PanelKind> = serde_json::from_value(value).map_err(|error| format!("invalid docking action: {error}"))?;
+    if matches!(&action, craft_ui::docking::Action::Open { .. } | craft_ui::docking::Action::OpenAt { .. }) {
+        return Err("use the panel open commands to preserve viewer and ScriptUI lifecycle callbacks".into());
+    }
+    if let craft_ui::docking::Action::Close { panel } = &action {
+        let mut layout = crate::dock_shared::encode(&app.ui.dock, &app.ui.floating)?;
+        layout.apply(action.clone()).map_err(|error| error.to_string())?;
+        app.close_panel(*panel);
+        return Ok(Value::Null);
+    }
+    let mut error = None;
+    if !app.edit_layout(|layout| match layout.apply(action) {
+        Ok(()) => true,
+        Err(reason) => {
+            error = Some(reason);
+            false
+        }
+    }) {
+        return Err(error.unwrap_or_else(|| "invalid docking layout".into()));
+    }
+    Ok(Value::Null)
+}
+
 /// Docking and the panel menu: {panel, anchor?, zone: center|left|right|top|bottom},
 /// {panel, rect?}, {panel?}, {panel, comp?}, {panel, stacked?}, {panel, solo?}, {panel, small?}.
 fn panel_op(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: Value) -> Result<Value, String> {
@@ -67,10 +98,10 @@ fn panel_op(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: Val
     let need = |op: &str| -> Result<PanelKind, String> { panel_of("panel").ok_or(format!("{op}: need `panel`"))? };
     // A Timeline comp tab: `comp` (its id).
     let comp = params.get("comp").and_then(Value::as_u64);
-    let rect = params.get("rect").and_then(Value::as_array).map(|a| {
-        let g = |i: usize| a.get(i).and_then(Value::as_f64).unwrap_or(0.0) as f32;
-        [g(0), g(1), g(2), g(3)]
-    });
+    let rect = match params.get("rect") {
+        Some(value) => Some(serde_json::from_value::<[f32; 4]>(value.clone()).map_err(|_| "rect must contain four finite numbers")?),
+        None => None,
+    };
     match op {
         "closeOtherPanels" => {
             let n = app.close_other_panels(ctx, need(op)?, comp)?;

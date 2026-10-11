@@ -138,7 +138,7 @@ unsubscribes.
 
 | Method | Params | Result |
 |---|---|---|
-| `ui.inspect` | `{}` | Window size, pixels per point, UI fps, serialized `UiState`, playback (`achievedFps`, `targetFps`, `realTime`, `shown`, `caching`, `waiting`), time, active comp, selection, open dialog, last render ms. Read-only `preview` diagnostics are described below. |
+| `ui.inspect` | `{}` | Window size, pixels per point, UI fps, serialized `UiState`, playback (`achievedFps`, `targetFps`, `realTime`, `shown`, `caching`, `waiting`), time, active comp, selection, open dialog, last render ms, `keyboardFocus`, `windowFocused`, `workspaceStorageError`. Read-only `preview` diagnostics are described below. |
 | `ui.elements` | `{prefix?}` | `[{id, label, rect: [x, y, w, h], window?}]`: the widgets from the most recently completed paint pass, in points. ID-based input uses that same snapshot, without falling back to widgets removed since an older frame. On the desktop an undocked panel group is an OS window of its own: its widgets carry `window` (the group's id) and their rect is in that window's coordinates. |
 | `ui.set` | `{tool?, workspace?, theme?, focused?, viewer?, timeline?, menuBar?, home?}` | `viewer: {zoom (null = fit), res: Full\|Half\|Third\|Quarter\|Auto, pan: [x,y], grid, rulers, safeMargins, transparencyGrid}`; `timeline: {pps (null = fit), start, graphEditor, showModes, openLayers: [ids], openGroups: [uids]}`. |
 | `ui.panel.show` / `ui.panel.close` | `{panel}` | Panels: `Project`, `Composition`, `Timeline`, `EffectControls`, `EffectsPresets`, `Info`, `Preview`, `Character`, `Paragraph`, `Align` and others. |
@@ -169,6 +169,26 @@ The rate window is pruned only when another frame advance is recorded, so the di
 remain stale during a stall. Inspect its age and `waiting`, and sample `time`/`frame` over known
 playback loop ranges to observe timeline progress. Neither these samples nor `shown` establish
 physical presentation FPS. The existing `playback` object remains available for compatibility.
+
+`keyboardFocus` is `null` when no egui widget has keyboard focus. Otherwise it contains the
+actual widget `id` (hexadecimal), its `rect: [x, y, w, h]` when available, an `automationId`
+when the widget registered its response identity, and `registryCandidates` containing exact
+rectangle matches. Candidates alone do not establish widget identity. Header, toolbar and
+dock-tab controls register their response identity. `ui.focused` continues to identify the
+focused panel; it is separate from keyboard widget focus. `windowFocused` reports the native
+window focus received by egui, which can differ from the retained widget focus.
+
+When a configuration store is available, current dock and floating geometry, focused and
+maximized panels, and named workspace snapshots persist in `workspaces.json`. The current
+layout and named snapshots are independent: changing a divider does not overwrite the named
+snapshot until `window.saveWorkspace` runs. Changes save after pointer release, at most once
+per second, with a final save on normal exit. Version 1 files are limited to 1 MiB and bounded
+workspace trees; extra viewer IDs must be between 1 and 65,535. Native reads enforce the size
+limit while reading and report I/O and UTF-8
+errors. Unreadable, invalid or newer files leave the default workspace available and are
+preserved for the entire session, including after later layout changes. Load and save errors
+appear in the status message and the nullable
+`workspaceStorageError` field; a failed write remains eligible for retry.
 
 ## Input
 
@@ -270,3 +290,21 @@ including outside the layer's `[in, out)` range. Timing metadata carries outside
 `keys.set` and `prop.get.keys[]` report both bases and warnings without an explicit base too.
 `prop.get.time` is comp seconds. For these commands, `path` or `prop` identifies a property, not a group.
 Set a layer's offset with `layer.timing {layer, start}` (comp seconds).
+
+Panel moves, tab ordering, edge splits and floating geometry use shared docking transactions.
+`window.floatPanel` requires exactly four finite numbers when `rect` is supplied. Invalid
+geometry or missing source/anchor panels leaves the layout unchanged. The persisted workspace
+shape is unchanged: accordion open states and explicit heights, floating groups, and dynamic
+viewer/ScriptUI identities remain app data. Pointer drops use the same shared placement rules
+as commands, with floating groups resolved in their actual window stacking order.
+
+`window.dockAction` accepts `{action}` using the shared docking action's JSON form. It
+covers tab moves and ordering, split and floating geometry, activation, and closing.
+For example, `{"action":{"ResizeSplit":{"path":[],"size":{"FixedFirst":360}}}}`
+resizes the root split; path entries use `false` for the first child and `true` for
+the second. `{"action":{"MoveFloating":{"panel":"Info","rect":[45,65,420,320]}}}`
+repositions and resizes the floating group containing Info. Invalid actions leave the
+layout unchanged. Pointer gestures dispatch through this same catalog command.
+EffectCraft also supports `SetStackOpen` and `ResizeStack`. Dynamic panel identities use
+`{"Viewer":42}` or `{"ScriptPanel":77}` in the action. Closing runs the existing viewer
+and ScriptUI lifecycle callbacks; opening uses the existing panel creation commands.

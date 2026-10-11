@@ -545,19 +545,45 @@ pub(crate) fn bottom_bar(app: &mut EffectcraftApp, ui: &mut egui::Ui, bar: Rect,
     let p = ui.painter().clone();
     p.rect_filled(bar, 0.0, t.panel_bg);
     p.line_segment([bar.left_top(), bar.right_top()], Stroke::new(1.0, t.separator));
+    app.auto.add("viewer.controls", bar, "Viewer controls");
+    ui.scope_builder(egui::UiBuilder::new().max_rect(bar), |ui| {
+        let scroll = &mut ui.style_mut().spacing.scroll;
+        scroll.floating = false;
+        scroll.foreground_color = true;
+        scroll.bar_width = 4.0;
+        scroll.bar_inner_margin = 1.0;
+        scroll.bar_outer_margin = 1.0;
+        egui::ScrollArea::horizontal().id_salt("viewer-controls").auto_shrink([false, false]).show(ui, |ui| {
+            let row = Rect::from_min_size(ui.max_rect().min, vec2(bar.width(), 30.0));
+            let first_control = app.auto.elements.len();
+            let width = bottom_bar_contents(app, ui, row, zoom, fit, time, comp);
+            ui.allocate_rect(Rect::from_min_size(row.min, vec2(width, row.height())), Sense::hover());
+            if let Some(focused) = ui.ctx().memory(|memory| memory.focused())
+                && app.auto.elements.get(first_control..).is_some_and(|controls| controls.iter().any(|control| control.response_id == Some(focused)))
+                && let Some(response) = ui.ctx().read_response(focused)
+                && response.gained_focus()
+            {
+                ui.scroll_to_rect(response.rect, None);
+            }
+        });
+    });
+}
+
+fn bottom_bar_contents(app: &mut EffectcraftApp, ui: &mut egui::Ui, bar: Rect, zoom: f32, fit: f32, time: Tick, comp: &Comp) -> f32 {
+    let t = app.tokens;
+    let p = ui.painter().clone();
     let cy = bar.center().y;
     let mut x = bar.min.x + 8.0;
     let ppp = ui.ctx().pixels_per_point();
 
     // Magnification.
     let r = Rect::from_min_size(pos2(x, cy - 10.0), vec2(80.0, 20.0));
-    if widgets::dropdown(ui, r, &magnification_label(zoom * ppp * 100.0), &t, egui::Id::new("vw-mag"))
-        .on_hover_text(crate::i18n::tr("Magnification ratio popup"))
-        .clicked()
-    {
+    let response = widgets::dropdown(ui, r, &magnification_label(zoom * ppp * 100.0), &t, egui::Id::new("vw-mag"))
+        .on_hover_text(crate::i18n::tr("Magnification ratio popup"));
+    if response.clicked() {
         toggle_popup(ui, "vw-mag-pop");
     }
-    app.auto.add("viewer.magnification", r, "Magnification");
+    app.auto.add_response("viewer.magnification", &response, "Magnification");
     const MAGS: [&str; 15] = ["Fit", "Fit up to 100%", "-", "1.5%", "3.1%", "6.25%", "12.5%", "25%", "33.3%", "50%", "100%", "200%", "400%", "800%", "1600%"];
     let cur = (zoom * ppp * 100.0 * 10.0).round() / 10.0;
     let items: Vec<(String, bool)> = MAGS
@@ -583,13 +609,12 @@ pub(crate) fn bottom_bar(app: &mut EffectcraftApp, ui: &mut egui::Ui, bar: Rect,
     // Resolution / down-sample factor.
     let r = Rect::from_min_size(pos2(x, cy - 10.0), vec2(84.0, 20.0));
     let scale = app.viewer_scale(zoom, ppp);
-    if widgets::dropdown(ui, r, &resolution_label(app.ui.viewer.res, scale), &t, egui::Id::new("vw-res"))
-        .on_hover_text(crate::i18n::tr("Resolution/Down Sample Factor Popup"))
-        .clicked()
-    {
+    let response = widgets::dropdown(ui, r, &resolution_label(app.ui.viewer.res, scale), &t, egui::Id::new("vw-res"))
+        .on_hover_text(crate::i18n::tr("Resolution/Down Sample Factor Popup"));
+    if response.clicked() {
         toggle_popup(ui, "vw-res-pop");
     }
-    app.auto.add("viewer.resolution", r, "Resolution/Down Sample Factor");
+    app.auto.add_response("viewer.resolution", &response, "Resolution/Down Sample Factor");
     let res = app.ui.viewer.res;
     let items: Vec<(String, bool)> = vec![
         ("Full".into(), res == Resolution::Full),
@@ -627,7 +652,7 @@ pub(crate) fn bottom_bar(app: &mut EffectcraftApp, ui: &mut egui::Ui, bar: Rect,
         // The tip is the English source: the tooltip is looked up in the catalog, while the
         // automation label stays English for scripts and tests.
         let resp = widgets::icon_button_local(ui, r, icon, local, on, &t, egui::Id::new(("vw-btn", id))).on_hover_text(crate::i18n::tr(tip));
-        auto.add(&format!("viewer.{id}"), r, tip);
+        auto.add_response(&format!("viewer.{id}"), &resp, tip);
         *x += 24.0;
         (resp.clicked(), r)
     };
@@ -708,7 +733,7 @@ pub(crate) fn bottom_bar(app: &mut EffectcraftApp, ui: &mut egui::Ui, bar: Rect,
         ),
     );
     let resp = resp.on_hover_text(crate::i18n::tr("Adjust Exposure (stops)"));
-    app.auto.add("viewer.exposure", er, "Adjust Exposure");
+    app.auto.add_response("viewer.exposure", &resp, "Adjust Exposure");
     if resp.changed() {
         let _ = app.session.execute("view.exposure", json!({"stops": ev}));
     }
@@ -724,7 +749,7 @@ pub(crate) fn bottom_bar(app: &mut EffectcraftApp, ui: &mut egui::Ui, bar: Rect,
     let showing = showing_snapshot(app, ui.ctx());
     let (_, sr) = tog(ui, &mut app.auto, &mut x, Icon::ShowSnapshot, showing, "showSnapshot", "Show Snapshot (hold)");
     // Show Snapshot works while the button is held, like F5.
-    let held = ui.input(|i| i.pointer.primary_down()) && ui.input(|i| i.pointer.press_origin()).is_some_and(|o| sr.contains(o));
+    let held = ui.input(|i| i.pointer.primary_down()) && ui.input(|i| i.pointer.press_origin()).is_some_and(|o| sr.intersect(ui.clip_rect()).contains(o));
     if app.session.snapshot.is_some() && held != app.session.state.viewer.show_snapshot {
         let _ = app.session.execute("view.showSnapshot", json!({"value": held}));
     }
@@ -762,10 +787,11 @@ pub(crate) fn bottom_bar(app: &mut EffectcraftApp, ui: &mut egui::Ui, bar: Rect,
         let cid = app.session.active_comp_id();
         let cur = cid.and_then(|c| app.session.state.views3d.get(&c)).map(|v| v.current).unwrap_or_default();
         let r = Rect::from_min_size(pos2(x, cy - 10.0), vec2(118.0, 20.0));
-        if widgets::dropdown(ui, r, cur.label(), &t, egui::Id::new("vw-cam")).clicked() {
+        let response = widgets::dropdown(ui, r, cur.label(), &t, egui::Id::new("vw-cam"));
+        if response.clicked() {
             toggle_popup(ui, "vw-cam-pop");
         }
-        app.auto.add("viewer.view3d", r, "3D View");
+        app.auto.add_response("viewer.view3d", &response, "3D View");
         use effectcraft_engine::render::three_d::View3D;
         let items: Vec<(String, bool)> = View3D::ALL.iter().map(|v| (v.label().to_string(), *v == cur)).collect();
         if let Some(i) = popup(app, ui, "vw-cam-pop", r, &items, "view3dItem") {
@@ -785,13 +811,18 @@ pub(crate) fn bottom_bar(app: &mut EffectcraftApp, ui: &mut egui::Ui, bar: Rect,
     let tr = Rect::from_min_size(pos2(x + 4.0, cy - 9.0), g.size() + vec2(8.0, 4.0));
     p.galley(pos2(tr.min.x + 4.0, tr.min.y + 2.0), g, t.timecode);
     let resp = ui.interact(tr, egui::Id::new("vw-timecode"), Sense::click());
-    app.auto.add("viewer.timecode", tr, "Current time");
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Current time"));
+    if resp.has_focus() {
+        p.rect_stroke(tr.shrink(1.0), 2.0, Stroke::new(1.0, t.focus), StrokeKind::Inside);
+    }
+    app.auto.add_response("viewer.timecode", &resp, "Current time");
     crate::panels::toggle_time_display(app, &resp);
     // Right: render time.
     let ms = app.frames.last_ms.lock().map(|v| *v).unwrap_or(0.0);
     if tr.max.x + 50.0 < bar.max.x {
         p.text(pos2(bar.max.x - 10.0, cy), Align2::RIGHT_CENTER, format!("{ms:.0} ms"), Tokens::ui(11.0), t.text_faint);
     }
+    (tr.right() + 8.0 - bar.left()).max(bar.width())
 }
 
 #[cfg(test)]
