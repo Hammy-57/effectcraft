@@ -380,6 +380,8 @@ fn mask_reuse_forced_blur_rejects_coverage_properties_but_preserves_opacity() {
     for name in MASK_PROPERTIES {
         let (mut before, id, path) = mask_scene(name);
         let comp = Arc::make_mut(&mut before).comp_mut(id).unwrap();
+        // New comps start with Motion Blur off (G2); the masks' blur needs it on.
+        comp.enable_motion_blur = true;
         comp.shutter_angle = 360.;
         comp.shutter_phase = 0.;
         let layer = comp.layers.get_mut(0).unwrap();
