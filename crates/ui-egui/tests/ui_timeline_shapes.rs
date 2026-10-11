@@ -235,3 +235,108 @@ fn reverse_path_direction_button_toggles_the_path_direction() {
     h.state_mut().session.execute("edit.undo", json!({})).unwrap();
     assert_eq!(dir(&h), effectcraft_engine::keyframe::Value::Enum(1), "each click is one undo step");
 }
+
+/// #612: the real shape Gradient Fill property, driven through the complete app and its
+/// timeline, commits one undoable document change. Optional local screenshots show the editor.
+#[test]
+fn gradient_fill_editor_applies_undoes_and_escape_discards() {
+    use effectcraft_engine::keyframe::Value;
+    let mut s = session();
+    let layer = s.execute("layer.newShape", json!({"name": "Gradient rectangle"})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("layer.addShapeItem", json!({"layer": layer, "kind": "rect"})).unwrap();
+    s.execute("layer.addShapeItem", json!({"layer": layer, "kind": "gradientFill"})).unwrap();
+    let prop = s.active_comp().unwrap().layer(LayerId(layer)).unwrap().props.prop("contents/gfill/colors").unwrap();
+    let uid = prop.uid;
+    let original = prop.value.clone();
+    let mut h = harness(s);
+    h.state_mut().ui.timeline.search = "Colors".into();
+    h.run_steps(3);
+    let entry = format!("timeline.prop.{uid}.value");
+    click(&mut h, &entry);
+    click(&mut h, "gradient.color.add");
+    let undo_before = h.state().session.history.undo.len();
+    let value =
+        |h: &Harness<'_, EffectcraftApp>| h.state().session.active_comp().unwrap().layer(LayerId(layer)).unwrap().props.find(uid).unwrap().value.clone();
+    assert_eq!(value(&h), original, "editing the draft does not alter the project");
+    if let Ok(dir) = std::env::var("EC_SNAPSHOT_DIR") {
+        std::fs::create_dir_all(&dir).unwrap();
+        h.render().expect("gradient editor screenshot").save(format!("{dir}/gradient_fill_editor.png")).unwrap();
+    }
+    click(&mut h, "gradient.apply");
+    let Value::Gradient(edited) = value(&h) else { panic!("gradient fill lost its gradient value") };
+    let Value::Gradient(before) = &original else { panic!("fixture must be a gradient") };
+    assert_eq!(edited.colors.len(), before.colors.len() + 1);
+    assert_ne!(edited.sample(0.5), before.sample(0.5), "the committed gradient changes the renderer's sampled color");
+    assert_eq!(h.state().session.history.undo.len(), undo_before + 1);
+    h.state_mut().session.execute("edit.undo", json!({})).unwrap();
+    h.run_steps(3);
+    assert_eq!(value(&h), original);
+    click(&mut h, &entry);
+    click(&mut h, "gradient.opacity.add");
+    let project_before_escape = serde_json::to_value(&h.state().session.project).unwrap();
+    let history_before_escape = h.state().session.history.undo.len();
+    for pressed in [true, false] {
+        h.input_mut().events.push(Event::Key { key: Key::Escape, physical_key: None, pressed, repeat: false, modifiers: Modifiers::NONE });
+        h.step();
+    }
+    h.run_steps(3);
+    assert!(h.state().auto.find("gradient.apply").is_none(), "Escape closes the draft editor");
+    assert_eq!(serde_json::to_value(&h.state().session.project).unwrap(), project_before_escape, "Escape never deletes a layer or changes the project");
+    assert_eq!(h.state().session.history.undo.len(), history_before_escape);
+    assert_eq!(value(&h), original);
+}
+
+/// Issue #633: a colour property in the Timeline (a shape's Fill Color) has an eyedropper after
+/// its swatch, as in After Effects: click it, then click in the Composition panel to sample.
+#[test]
+fn timeline_colour_eyedropper_samples_the_comp() {
+    let mut s = session();
+    s.execute("layer.newSolid", json!({"name": "Back", "color": "#20c040"})).unwrap();
+    let l = s.execute("layer.newShape", json!({"kind": "rect", "fill": [1.0, 0.0, 0.0], "size": [100.0, 60.0]})).unwrap()["layer"].as_u64().unwrap();
+    let layer = s.active_comp().unwrap().layer(LayerId(l)).unwrap().clone();
+    let mut fill = None;
+    layer.props.walk("", &mut |_, p| {
+        if fill.is_none() && matches!(p.value, effectcraft_engine::keyframe::Value::Color(_)) {
+            fill = Some(p.uid);
+        }
+    });
+    let fill = fill.expect("a fill colour");
+    fn groups(g: &effectcraft_engine::project::PropGroup, out: &mut Vec<u64>) {
+        for c in g.groups() {
+            out.push(c.uid);
+            groups(c, out);
+        }
+    }
+    let mut open = vec![];
+    groups(&layer.props, &mut open);
+    let mut h = harness(s);
+    h.state_mut().ui.timeline.open_groups.extend(open);
+    open_layer(&mut h, l);
+    h.run_steps(2);
+    // The viewer renders in the frame pool: sample once its frame is shown.
+    for _ in 0..600 {
+        h.step();
+        if h.state().frames.inflight() == 0 && h.state().frames.last_ms.lock().map(|v| *v > 0.0).unwrap_or(false) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    h.run_steps(4);
+    click(&mut h, &format!("timeline.prop.{fill}.eyedropper"));
+    assert_eq!(h.state().ui.fx_pick.as_ref().map(|p| (p.prop, p.kind.as_str())), Some((fill, "color")), "the eyedropper waits for a viewer click");
+    let pos = effectcraft_ui_egui::panels::viewer::comp_to_screen(&h.ctx, [6.0, 6.0]).unwrap();
+    click_at(&mut h, pos);
+    assert!(h.state().ui.fx_pick.is_none(), "the pick is used up");
+    let layer = h.state().session.active_comp().unwrap().layer(LayerId(l)).unwrap().clone();
+    let mut got = None;
+    layer.props.walk("", &mut |_, p| {
+        if p.uid == fill {
+            got = Some(p.value.clone());
+        }
+    });
+    let Some(effectcraft_engine::keyframe::Value::Color(c)) = got else { panic!("{got:?}") };
+    let want = [0x20 as f64 / 255.0, 0xc0 as f64 / 255.0, 0x40 as f64 / 255.0];
+    for k in 0..3 {
+        assert!((c[k] - want[k]).abs() < 0.02, "{c:?} vs {want:?}");
+    }
+}

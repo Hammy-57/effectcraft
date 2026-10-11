@@ -139,7 +139,7 @@ unsubscribes.
 | Method | Params | Result |
 |---|---|---|
 | `ui.inspect` | `{}` | Window size, pixels per point, UI fps, serialized `UiState`, playback (`achievedFps`, `targetFps`, `realTime`, `shown`, `caching`, `waiting`), time, active comp, selection, open dialog, last render ms. Playback FPS is distinct from UI FPS. |
-| `ui.elements` | `{prefix?}` | `[{id, label, rect: [x, y, w, h], window?}]`: the widgets drawn in the last frame, in points. On the desktop an undocked panel group is an OS window of its own: its widgets carry `window` (the group's id) and their rect is in that window's coordinates. |
+| `ui.elements` | `{prefix?}` | `[{id, label, rect: [x, y, w, h], window?}]`: the widgets from the most recently completed paint pass, in points. ID-based input uses that same snapshot, without falling back to widgets removed since an older frame. On the desktop an undocked panel group is an OS window of its own: its widgets carry `window` (the group's id) and their rect is in that window's coordinates. |
 | `ui.set` | `{tool?, workspace?, theme?, focused?, viewer?, timeline?, menuBar?, home?}` | `viewer: {zoom (null = fit), res: Full\|Half\|Third\|Quarter\|Auto, pan: [x,y], grid, rulers, safeMargins, transparencyGrid}`; `timeline: {pps (null = fit), start, graphEditor, showModes, openLayers: [ids], openGroups: [uids]}`. |
 | `ui.panel.show` / `ui.panel.close` | `{panel}` | Panels: `Project`, `Composition`, `Timeline`, `EffectControls`, `EffectsPresets`, `Info`, `Preview`, `Character`, `Paragraph`, `Align` and others. |
 | `engine.execute` `window.*` (panel menu) | `{panel, comp?, rect?, stacked?, solo?, small?, anchor?, zone?}` | The panel menu's items (≡ beside a tab name, or right-click a tab; automation ids `panelMenu.<key>`): `window.closePanel` (on a Timeline comp tab, `comp` closes that comp's Timeline), `window.floatPanel` (Undock Panel), `window.dockPanel` (with `anchor`/`zone`, or back to its usual place), `window.closeOtherPanels`, `window.closePanelGroup`, `window.floatPanelGroup`, `window.maximizePanel` (Maximize Panel Group, as `` ` ``), `window.stackPanelGroup`, `window.soloPanels` (Solo Panels in Stack: one expanded panel at a time; `solo`, or toggle), `window.smallTabs` (Small Tabs: a shorter tab strip, for a docked or undocked group; `small`, or toggle), and `window.panelMenu {panel, x?, y?}` to open the menu. |
@@ -198,7 +198,11 @@ renames it), `viewer.comp`, `viewer.handle.<layer>.<i>`,
 Enter or a double-click renames, drag reorders), `timeline.prop.<uid>.stopwatch`,
 `timeline.key.<uid>.<frame>`, `timeline.cti`, `effectControls.prop.<uid>.value` (an angle's
 revolutions are `timeline.prop.<uid>.revolutions`, `effectControls.prop.<uid>.revolutions` and
-`properties.prop.<uid>.revolutions`) and `effects.item.<name>`. The Composition viewer adds `viewer.magnification`, `viewer.resolution`,
+`properties.prop.<uid>.revolutions`), the Properties panel's shape rows
+`properties.shape.<key>[.value[.0|.1]|.stopwatch|.prevKey|.keyKey|.nextKey]` for the first shape group and
+`properties.shape.<n>.<key>` for the n-th (`size`, `roundness`, `ellipseSize`, `points`,
+`outerRadius`, `innerRadius`, `outerRoundness`, `innerRoundness`, `fillColor`, `fillOpacity`,
+`strokeColor`, `strokeWidth`), a solid's `properties.solid.roundness`, and `effects.item.<name>`. The Composition viewer adds `viewer.magnification`, `viewer.resolution`,
 `viewer.roi`, `viewer.grid`, `viewer.channel`, `viewer.exposure`, `viewer.snapshot`,
 `viewer.showSnapshot`, `viewer.fastPreviews` (their popup entries are `viewer.<menu>Item.<n>`),
 `viewer.ruler.top|left|origin`, `viewer.mask.<uid>.vertex.<i>`, `viewer.shapePath.<uid>.vertex.<i>`,
@@ -214,7 +218,13 @@ Compositions and Text Layers), `view.channel {channel, colorized?}`,
 `view.exposure {stops | delta}`, `view.resetExposure`, `view.takeSnapshot`, `view.showSnapshot`,
 `view.fastPreviewMode {mode}`, `view.setRegionOfInterest {rect}`, `view.addGuide`,
 `view.moveGuide`, `view.removeGuide`; editing: `shape.newPath` (Pen on shape layers),
-`shape.newShape` (the shape tools: a new group in the selected shape layer, else a new shape layer),
+`shape.newShape` (the shape tools: a new group in the selected shape layer, else a new shape layer;
+`roundness` px rounds a rect's corners), `layer.roundCorners {layer?|layers?, roundness?}` (Layer ›
+Create › Round Corners and the Properties panel's Roundness: sets the Roundness of a shape layer's
+Rectangle Paths; a solid becomes, in one undo step, a shape layer drawing a rectangle of its size
+and colour that keeps its id, name, timing, transform, switches, masks, styles and markers, and
+renders the same at roundness 0; solids with effects, adjustment layers and other solids that
+could not render the same are refused with the reason),
 `shape.toolOptions` (the Tools bar's Tool Creates Shape / Mask and Fill and Stroke Options),
 `mask.insertVertex`, `mask.convertVertex`, `mask.deleteVertices`, `path.freeTransform` (masks and
 shape paths by uid), `keys.setSpatialTangents` (motion-path handles) and `keys.transform` (Graph
@@ -222,3 +232,20 @@ Editor transform box, timeline Alt-drag scaling).
 
 The MCP server's bridge mode (`effectcraft-cli mcp --bridge 9877`) is a thin client of this protocol;
 see [agents.md](agents.md).
+
+Keyframe command times (`prop.set`, `prop.addKey`, `keys.set`, `keys.select`) default to layer
+seconds. Set `timeBase: "comp"` for comp seconds; `keys.set.newTime` and every
+`keys.select.keys[].time` use the same input base. Omitted `prop.set` or `prop.addKey` times use
+the target comp's CTI. Supplied write times snap to its nearest comp frame before conversion
+to stored layer time, including on stretched or reversed layers. Existing `keys.set` neighbor
+constraints and roving adjustment can change the final stored time.
+
+Explicit bases add `layerTime` and `compTime` to unsplit `prop.set` and `prop.addKey` replies,
+alongside `value` or `count`. Separated Position `prop.set` keeps an array of per-axis replies.
+Explicit `keys.select` replies contain `count` and `keys[]`, with timing on each key in the
+resulting selection. Key metadata's `time` remains layer seconds regardless of the input base.
+Without `timeBase`, these three commands retain their existing JSON value/count replies,
+including outside the layer's `[in, out)` range. Timing metadata carries outside-range warnings;
+`keys.set` and `prop.get.keys[]` report both bases and warnings without an explicit base too.
+`prop.get.time` is comp seconds. For these commands, `path` or `prop` identifies a property, not a group.
+Set a layer's offset with `layer.timing {layer, start}` (comp seconds).

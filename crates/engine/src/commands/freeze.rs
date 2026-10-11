@@ -78,7 +78,7 @@ fn create(s: &mut Session, p: &Value) -> Result<Value> {
         .map(|s| s.id)
     {
         let mut config = json!({"section":id});
-        for key in ["quickDraft", "name"] {
+        for key in ["quickDraft", "name", "start", "end", "followCompositionRange"] {
             if let Some(value) = p.get(key) {
                 config[key] = value.clone();
             }
@@ -115,6 +115,14 @@ fn create(s: &mut Session, p: &Value) -> Result<Value> {
         }
     });
     let draft = b_p(p, "quickDraft").unwrap_or(true);
+    let explicit_range = p.get("start").is_some_and(|v| !v.is_null()) || p.get("end").is_some_and(|v| !v.is_null());
+    let follow_comp_range = match p.get("followCompositionRange") {
+        Some(v) => v.as_bool().ok_or_else(|| bad("freeze.freeze", "followCompositionRange must be a boolean"))?,
+        None => !explicit_range,
+    };
+    if follow_comp_range && explicit_range {
+        return Err(bad("freeze.freeze", "choose composition duration or an explicit range, not both"));
+    }
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| bad("freeze.freeze", e.to_string()))?.as_nanos();
     let id = s.edit("Smart Freeze Section", None, |project, _| {
         if project.freeze.namespace.is_empty() {
@@ -122,7 +130,8 @@ fn create(s: &mut Session, p: &Value) -> Result<Value> {
         }
         let id = project.next_id;
         project.next_id = id.checked_add(1).ok_or_else(|| bad("freeze.freeze", "project IDs exhausted"))?;
-        let section = Section { id, name, target, start, end, enabled: true, auto: false, quick_draft: draft, cache: None, previous: vec![] };
+        let section =
+            Section { id, name, target, start, end, follow_comp_range, enabled: true, auto: false, quick_draft: draft, cache: None, previous: vec![] };
         section.validate().map_err(EngineError::Other)?;
         project.freeze.sections.push(section);
         Ok(id)
@@ -209,11 +218,19 @@ fn start_stage(s: &mut Session, job: FreezeJob, wait: bool) -> Result<Value> {
         let FreezeJob { original, capture, section, epoch, client, footage, expr, opts, pause, prior, slot, accel, latest, claim_at_start, automatic } = job;
         let slot_for_next = slot.clone();
         let id = section.id;
+        let fresh_capture = capture.is_none();
         let capture = match capture {
             Some(c) => c,
             None => Arc::new(crate::freeze::Capture::new(original.clone(), &section)?),
         };
         capture.verify_media()?;
+        if fresh_capture {
+            // A verified file may differ from a decoder/frame already kept by the editor.
+            // Refresh must render the current bytes, not rebake the old media cache.
+            for stamp in &capture.media {
+                footage.forget(&stamp.path);
+            }
+        }
         if ctl.cancelled() {
             return Err("Smart Freeze cancelled".into());
         }
@@ -233,8 +250,9 @@ fn start_stage(s: &mut Session, job: FreezeJob, wait: bool) -> Result<Value> {
 
         let comp = capture.render.comp(section.target.comp()).ok_or("Smart Freeze composition disappeared")?;
         let rate = comp.frame_rate;
-        let first = rate.frame_at(section.start);
-        let end = rate.frame_at(section.end - Tick(1)).checked_add(1).ok_or("Smart Freeze frame range overflow")?;
+        let (range_start, range_end) = section.range(comp.duration)?;
+        let first = rate.frame_at(range_start);
+        let end = rate.frame_at(range_end - Tick(1)).checked_add(1).ok_or("Smart Freeze frame range overflow")?;
         let count = end
             .checked_sub(first)
             .and_then(|n| u64::try_from(n).ok())
@@ -351,6 +369,10 @@ fn start_stage(s: &mut Session, job: FreezeJob, wait: bool) -> Result<Value> {
             if session.epoch != epoch || !capture.still_matches(&session.project) || !session.project.freeze.sections.iter().any(|s| s == &section) {
                 return Err(EngineError::Other("Smart Freeze changed while rendering; originals remain available; refresh again".into()));
             }
+            if !capture.media.is_empty() {
+                session.layer_cache.clear();
+                session.events.push(crate::Event::PurgeCaches);
+            }
             if automatic {
                 session.attach_automatic_freeze(id, version.clone())?;
             } else {
@@ -358,6 +380,8 @@ fn start_stage(s: &mut Session, job: FreezeJob, wait: bool) -> Result<Value> {
                 let attached = session.edit("Attach Smart Freeze", None, |project, _| {
                     let current = project.freeze.sections.iter_mut().find(|s| s.id == id).ok_or_else(|| bad("freeze.refresh", "section removed"))?;
                     current.enabled = true;
+                    current.start = range_start;
+                    current.end = range_end;
                     if let Some(old) = current.cache.take() {
                         current.previous.push(old);
                     }
@@ -458,39 +482,81 @@ pub fn specs() -> Vec<CommandSpec> {
             "Freeze",
             ["Composition", "Smart Freeze"],
             None,
-            "{comp?, layers?, mode?: auto|comp|precomp|selection, name?, start?, end?, quickDraft?, wait?}",
+            "{comp?, layers?, mode?: auto|comp|precomp|selection, name?, start?, end?, followCompositionRange?: bool, quickDraft?, wait?}",
             has_comp,
             create
         ),
         cmd!("freeze.refresh", "Refresh", [], None, "{section, wait?, automatic?: bool (scheduler; no authoring undo step)}", super::always, refresh),
         cmd!("freeze.edit", "Edit Originals", [], None, "{section}", super::always, edit),
-        cmd!("freeze.configure", "Configure Freeze Section", [], None, "{section, quickDraft?: bool, name?: string}", super::always, |s, p| {
-            let id = section_id(p)?;
-            let draft = match p.get("quickDraft") {
-                Some(v) => Some(v.as_bool().ok_or_else(|| bad("freeze.configure", "quickDraft must be a boolean"))?),
-                None => None,
-            };
-            let name = match p.get("name") {
-                Some(v) => Some(
-                    v.as_str()
-                        .filter(|v| !v.trim().is_empty() && v.len() <= 512)
-                        .ok_or_else(|| bad("freeze.configure", "name must be 1–512 bytes"))?
-                        .to_owned(),
-                ),
-                None => None,
-            };
-            s.edit("Configure Smart Freeze", None, |project, _| {
-                let section = project.freeze.sections.iter_mut().find(|s| s.id == id).ok_or_else(|| bad("freeze.configure", "section not found"))?;
-                if let Some(draft) = draft {
-                    section.quick_draft = draft;
+        cmd!(
+            "freeze.configure",
+            "Configure Freeze Section",
+            [],
+            None,
+            "{section, quickDraft?: bool, name?: string, start?, end?, followCompositionRange?: bool}",
+            super::always,
+            |s, p| {
+                let id = section_id(p)?;
+                let start = crate::render_view::seconds_p(p, "start", "freeze.configure")?.map(Tick::from_seconds_f64);
+                let end = crate::render_view::seconds_p(p, "end", "freeze.configure")?.map(Tick::from_seconds_f64);
+                let follow = p
+                    .get("followCompositionRange")
+                    .map(|v| v.as_bool().ok_or_else(|| bad("freeze.configure", "followCompositionRange must be a boolean")))
+                    .transpose()?;
+                if follow == Some(true) && (start.is_some() || end.is_some()) {
+                    return Err(bad("freeze.configure", "choose composition duration or an explicit range, not both"));
                 }
-                if let Some(name) = name {
-                    section.name = name;
-                }
-                Ok(())
-            })?;
-            Ok(json!({"section":id}))
-        }),
+                let range = if start.is_some() || end.is_some() || follow.is_some() {
+                    let section = s.project.freeze.sections.iter().find(|s| s.id == id).ok_or_else(|| bad("freeze.configure", "section not found"))?;
+                    let duration = s.project.comp(section.target.comp()).ok_or(EngineError::NoComp)?.duration;
+                    let (old_start, old_end) = if section.follow_comp_range { (Tick::ZERO, duration) } else { (section.start, section.end) };
+                    let follow = follow.unwrap_or(false);
+                    let (start, end) = if follow { (Tick::ZERO, duration) } else { (start.unwrap_or(old_start), end.unwrap_or(old_end)) };
+                    if start < Tick::ZERO || end <= start || end > duration {
+                        return Err(bad("freeze.configure", "range must lie inside the composition"));
+                    }
+                    Some((start, end, follow))
+                } else {
+                    None
+                };
+                let draft = match p.get("quickDraft") {
+                    Some(v) => Some(v.as_bool().ok_or_else(|| bad("freeze.configure", "quickDraft must be a boolean"))?),
+                    None => None,
+                };
+                let name = match p.get("name") {
+                    Some(v) => Some(
+                        v.as_str()
+                            .filter(|v| !v.trim().is_empty() && v.len() <= 512)
+                            .ok_or_else(|| bad("freeze.configure", "name must be 1–512 bytes"))?
+                            .to_owned(),
+                    ),
+                    None => None,
+                };
+                s.edit("Configure Smart Freeze", None, |project, _| {
+                    let section = project.freeze.sections.iter_mut().find(|s| s.id == id).ok_or_else(|| bad("freeze.configure", "section not found"))?;
+                    if let Some(draft) = draft {
+                        section.quick_draft = draft;
+                    }
+                    if let Some(name) = name {
+                        section.name = name;
+                    }
+                    if let Some((start, end, follow)) = range {
+                        if let Some(old) = section.cache.take() {
+                            section.previous.push(old);
+                            if section.previous.len() > 32 {
+                                section.previous.remove(0);
+                            }
+                        }
+                        section.start = start;
+                        section.end = end;
+                        section.follow_comp_range = follow;
+                        section.enabled = false;
+                    }
+                    Ok(())
+                })?;
+                Ok(json!({"section":id}))
+            }
+        ),
         cmd!("freeze.remove", "Remove Freeze Section", [], None, "{section}", super::always, |s, p| {
             let id = section_id(p)?;
             cancel_freeze(s);
@@ -502,6 +568,7 @@ pub fn specs() -> Vec<CommandSpec> {
                 Ok(())
             })?;
             s.freeze_runtime.proofs.remove(&id);
+            s.freeze_runtime.pixel_epochs.remove(&id);
             s.freeze_runtime.reasons.remove(&id);
             Ok(json!({"removed":id,"cacheRetained":true}))
         }),

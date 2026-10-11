@@ -303,6 +303,23 @@ pub struct ProjectSettings {
     /// sRGB; Rec. 2100 PQ / HLG give HDR output.
     #[serde(default)]
     pub output_space: Option<ColorSpace>,
+    /// Working Gamma, 2.2 or 2.4 (`app.project.workingGamma`): with no working space, the curve
+    /// Interpret As Linear Light footage is encoded with and Blend Colors Using 1.0 Gamma
+    /// linearizes with: the sRGB curve at 2.2, a pure 2.4 power curve at 2.4. Ignored with a
+    /// working space (as in After Effects).
+    #[serde(default = "gamma_22")]
+    pub working_gamma: f64,
+}
+
+fn gamma_22() -> f64 {
+    2.2
+}
+
+impl ProjectSettings {
+    /// Working Gamma is 2.4 (anything else reads as 2.2).
+    pub fn working_gamma_24(&self) -> bool {
+        (self.working_gamma - 2.4).abs() < 0.05
+    }
 }
 
 impl Default for ProjectSettings {
@@ -320,6 +337,7 @@ impl Default for ProjectSettings {
             color_engine: ColorEngine::Adobe,
             hdr: HdrMode::Clip,
             output_space: None,
+            working_gamma: 2.2,
         }
     }
 }

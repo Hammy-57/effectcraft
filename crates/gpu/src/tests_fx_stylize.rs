@@ -137,6 +137,9 @@ fn cc_slant_smear_split() {
     effect_case("ec.distort.ccslant", &[("slant", n(-20.0)), ("stretching", on()), ("height", n(120.0))]);
     effect_case("ec.distort.ccsmear", &[]);
     effect_case("ec.distort.ccsmear", &[("reach", n(-40.0)), ("radius", n(20.0)), ("to", pt(40.0, 10.0))]);
+    for reach in [-1000.0, -150.0, 100.0, 150.0, 200.0, 1000.0] {
+        effect_case("ec.distort.ccsmear", &[("reach", n(reach)), ("radius", n(20.0)), ("from", pt(20.0, 20.0)), ("to", pt(40.0, 10.0))]);
+    }
     effect_case("ec.distort.ccsplit", &[]);
     effect_case("ec.distort.ccsplit2", &[("split1", n(30.0)), ("split2", n(80.0)), ("pointB", pt(60.0, 30.0))]);
 }
@@ -222,5 +225,26 @@ fn transform_motion_blur() {
         let label = format!("transform motion blur {depth:?}");
         check(&label, compare_at(&s, opts(), Tick::from_seconds_f64(0.3)), 0.0);
         check(&format!("{label} half"), compare_at(&s, RenderOpts { scale: 0.5, ..opts() }, Tick::from_seconds_f64(0.3)), 0.0);
+    }
+}
+
+#[test]
+fn text_distortions_use_expanded_canvas() {
+    use effectcraft_keyframe::TextDoc;
+    use effectcraft_project::{LayerSource, build};
+    for id in ["ec.distort.cctiler", "ec.distort.ccsmear"] {
+        let mut s = Scene::new(BitDepth::Bpc32);
+        let mut l = build::layer(&mut s.p, &s.comp, "Text", LayerSource::Text, (97, 61), None);
+        set(&mut l, "text/sourceText", Value::Text(Box::new(TextDoc { text: "H".into(), size: 14.0, ..Default::default() })));
+        let values = if id.ends_with("cctiler") {
+            vec![("scale", n(50.0))]
+        } else {
+            vec![("from", pt(52.0, 25.0)), ("to", pt(75.0, 25.0)), ("radius", n(20.0)), ("reach", n(150.0))]
+        };
+        s.effect(&mut l, id, &values);
+        s.push(l);
+        for scale in [1.0, 0.5] {
+            check(id, compare_at(&s, RenderOpts { scale, ..opts() }, Tick::ZERO), 0.0);
+        }
     }
 }

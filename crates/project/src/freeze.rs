@@ -60,6 +60,9 @@ pub struct Section {
     pub target: Target,
     pub start: Tick,
     pub end: Tick,
+    /// Default UI freezes follow later composition-duration edits; explicit ranges stay fixed.
+    #[serde(default)]
+    pub follow_comp_range: bool,
     /// Explicit Edit turns this off and suppresses automatic Undo reuse.
     pub enabled: bool,
     #[serde(default)]
@@ -118,6 +121,13 @@ impl Sample {
 }
 
 impl Section {
+    pub fn range(&self, duration: Tick) -> Result<(Tick, Tick), String> {
+        let (start, end) = if self.follow_comp_range { (Tick::ZERO, duration) } else { (self.start, self.end) };
+        if start < Tick::ZERO || end <= start || end > duration {
+            return Err("Smart Freeze range must lie inside the composition; configure the range or freeze the composition again".into());
+        }
+        Ok((start, end))
+    }
     /// Called at the command/cache boundary even for sections loaded from disk.
     pub fn validate(&self) -> Result<(), String> {
         if self.previous.len() > 32 {
@@ -169,6 +179,7 @@ mod tests {
             target: Target::Selection { comp: ItemId(2), layers: vec![LayerId(3), LayerId(4)] },
             start: Tick::ZERO,
             end: Tick(100),
+            follow_comp_range: false,
             enabled: true,
             auto: false,
             quick_draft: true,

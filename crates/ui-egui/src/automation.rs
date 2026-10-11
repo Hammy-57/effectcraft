@@ -19,7 +19,7 @@ pub struct Element {
 #[derive(Default)]
 pub struct Registry {
     pub elements: Vec<Element>,
-    /// Last frame's elements (for lookups from control handlers between frames).
+    /// Previous paint pass (for lookups while the current pass is being registered).
     pub previous: Vec<Element>,
     /// The elements of two frames ago, whose strings `add` reuses (no two allocations per
     /// widget per frame).
@@ -51,9 +51,21 @@ impl Registry {
         self.spare.append(&mut recycled);
         self.elements = recycled;
     }
+    /// Look up a widget during painting, before the current registry is complete.
     pub fn find(&self, id: &str) -> Option<&Element> {
         self.previous.iter().chain(self.elements.iter()).find(|e| e.id == id)
     }
+    /// Look up a widget after painting completes (control dispatch and headless input).
+    /// Removed widgets must not fall back to rectangles from an older frame.
+    pub fn find_current(&self, id: &str) -> Option<&Element> {
+        self.elements.iter().find(|e| e.id == id)
+    }
+
+    /// The latest completed paint pass's widgets, for between-frame control queries.
+    pub fn query_current(&self, prefix: &str) -> Vec<&Element> {
+        self.elements.iter().filter(|e| e.id.starts_with(prefix)).collect()
+    }
+
     /// Elements whose id starts with a prefix.
     pub fn query(&self, prefix: &str) -> Vec<&Element> {
         self.previous.iter().filter(|e| e.id.starts_with(prefix)).collect()

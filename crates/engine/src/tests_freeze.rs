@@ -27,6 +27,7 @@ fn section(s: &Session) -> Section {
         target: Target::Comp { comp: s.active_comp_id().unwrap() },
         start: Tick::ZERO,
         end: Tick::from_seconds_f64(0.2),
+        follow_comp_range: false,
         enabled: true,
         auto: false,
         quick_draft: false,
@@ -433,6 +434,117 @@ fn freeze_auto_waits_for_eight_seconds_after_recent_interaction() {
 }
 
 #[test]
+fn freeze_default_range_follows_duration_but_explicit_ranges_stay_fixed() {
+    let mut s = fixture();
+    s.execute("freeze.freeze", json!({"wait":true,"quickDraft":false})).unwrap();
+    let id = s.project.freeze.sections[0].id;
+    assert_eq!(s.project.freeze.sections[0].cache.as_ref().unwrap().frames, 2);
+    s.execute("comp.settings", json!({"duration":0.4})).unwrap();
+    s.execute("freeze.refresh", json!({"section":id,"wait":true})).unwrap();
+    assert_eq!(s.project.freeze.sections[0].cache.as_ref().unwrap().frames, 4);
+    assert_eq!(s.project.freeze.sections[0].end, Tick::from_seconds_f64(0.4));
+    s.execute("freeze.auto", json!({"section":id,"enabled":true})).unwrap();
+    s.execute("comp.settings", json!({"duration":0.3})).unwrap();
+    let undo = s.history.undo.len();
+    s.execute("freeze.refresh", json!({"section":id,"wait":true,"automatic":true})).unwrap();
+    assert_eq!(s.project.freeze.sections[0].cache.as_ref().unwrap().frames, 3);
+    assert_eq!(s.project.freeze.sections[0].end, Tick::from_seconds_f64(0.3));
+    assert_eq!(s.history.undo.len(), undo);
+    s.execute("freeze.freeze", json!({"start":0.1,"end":0.2,"wait":true,"quickDraft":false})).unwrap();
+    assert_eq!(s.project.freeze.sections.len(), 1, "a repeated target updates its existing range");
+    assert!(!s.project.freeze.sections[0].follow_comp_range);
+    s.execute("comp.settings", json!({"duration":0.5})).unwrap();
+    s.execute("freeze.refresh", json!({"section":id,"wait":true})).unwrap();
+    assert_eq!(s.project.freeze.sections[0].cache.as_ref().unwrap().frames, 1);
+    s.execute("freeze.configure", json!({"section":id,"followCompositionRange":true})).unwrap();
+    s.execute("freeze.refresh", json!({"section":id,"wait":true})).unwrap();
+    assert_eq!(s.project.freeze.sections[0].cache.as_ref().unwrap().frames, 5);
+    std::fs::remove_dir_all(crate::freeze_storage::root(&s.project.freeze.namespace).unwrap()).unwrap();
+}
+
+#[test]
+fn freeze_refresh_and_auto_verification_discard_stale_decoded_media() {
+    #[derive(Default)]
+    struct CachedFile(std::sync::Mutex<Option<Arc<effectcraft_render::Image>>>);
+    impl effectcraft_render::FootageSource for CachedFile {
+        fn frame(&self, _: ItemId, footage: &effectcraft_project::Footage, _: Tick) -> Option<Arc<effectcraft_render::Image>> {
+            let mut cached = self.0.lock().unwrap();
+            if cached.is_none() {
+                let bytes = std::fs::read(&footage.path).ok()?;
+                let color = if bytes.first() == Some(&1) { [0.0, 0.0, 1.0, 1.0] } else { [1.0, 0.0, 0.0, 1.0] };
+                let mut image = effectcraft_render::Image::new(16, 16);
+                image.data.fill(color);
+                *cached = Some(Arc::new(image));
+            }
+            cached.clone()
+        }
+        fn forget(&self, _: &str) {
+            *self.0.lock().unwrap() = None;
+        }
+    }
+    let mut s = fixture();
+    let file = std::env::temp_dir().join(format!("freeze-reload-{}-{}.bin", std::process::id(), crate::freeze_runtime::now_millis()));
+    std::fs::write(&file, [0]).unwrap();
+    let item = s
+        .edit("Synthetic cached media", None, |p, _| {
+            Ok(p.add_item(
+                "Cached file",
+                effectcraft_color::Label::Red,
+                None,
+                effectcraft_project::ItemKind::Footage(effectcraft_project::Footage {
+                    path: file.to_string_lossy().into_owned(),
+                    width: 16,
+                    height: 16,
+                    has_video: true,
+                    duration: Tick::from_seconds_f64(0.2),
+                    ..Default::default()
+                }),
+            ))
+        })
+        .unwrap();
+    s.execute("layer.addItem", json!({"item":item.0})).unwrap();
+    s.footage = Arc::new(CachedFile::default());
+    let red = pixels(&s, false);
+    s.execute("freeze.freeze", json!({"wait":true,"quickDraft":false})).unwrap();
+    let id = s.project.freeze.sections[0].id;
+    std::fs::write(&file, [1, 1]).unwrap();
+    assert_eq!(pixels(&s, false), red, "fixture retains stale decoded bytes until forgotten");
+    s.execute("freeze.refresh", json!({"section":id,"wait":true})).unwrap();
+    assert_ne!(pixels(&s, true), red, "Refresh must bake the changed file, not its old decoded frame");
+    let directory = s.project.freeze.sections[0].cache.as_ref().unwrap().directory.clone();
+    s.execute("freeze.auto", json!({"section":id,"enabled":true})).unwrap();
+    std::fs::write(&file, [0, 0, 0]).unwrap();
+    s.freeze_runtime.proofs.get_mut(&id).unwrap().checked = web_time::Instant::now() - std::time::Duration::from_secs(16);
+    s.freeze_runtime.activity = web_time::Instant::now() - std::time::Duration::from_secs(4);
+    s.poll_freeze();
+    s.wait_jobs();
+    assert_eq!(pixels(&s, false), red, "Auto's live originals must use freshly decoded media while refresh waits for idle");
+    assert_eq!(s.project.freeze.sections[0].cache.as_ref().unwrap().directory, directory);
+    std::fs::remove_dir_all(crate::freeze_storage::root(&s.project.freeze.namespace).unwrap()).unwrap();
+    std::fs::remove_file(file).unwrap();
+}
+
+#[test]
+fn freeze_pixel_epochs_are_scoped_to_the_affected_composition() {
+    let mut s = fixture();
+    let first = s.active_comp_id().unwrap();
+    s.execute("freeze.freeze", json!({"wait":true,"quickDraft":false})).unwrap();
+    let first_section = s.project.freeze.sections[0].id;
+    let before = s.freeze_runtime.pixel_epoch(&s.project, first);
+    s.execute("comp.new", json!({"name":"Other","width":16,"height":16,"duration":0.2,"frameRate":10})).unwrap();
+    s.execute("freeze.freeze", json!({"wait":true,"quickDraft":false})).unwrap();
+    let second = s.project.freeze.sections[1].id;
+    let capture = s.freeze_runtime.proofs[&second].capture.clone();
+    s.freeze_runtime.accept(second, s.revision, capture);
+    assert_eq!(s.freeze_runtime.pixel_epoch(&s.project, first), before, "checking another section must not evict this composition");
+    let revision = s.revision;
+    s.freeze_runtime.invalidate_section(first_section);
+    assert_ne!(s.freeze_runtime.pixel_epoch(&s.project, first), before);
+    assert_eq!(s.revision, revision, "derived preview invalidation is not a document edit");
+    std::fs::remove_dir_all(crate::freeze_storage::root(&s.project.freeze.namespace).unwrap()).unwrap();
+}
+
+#[test]
 fn freeze_partial_refresh_reuses_unaffected_visible_frames() {
     let mut s = fixture();
     let cid = s.active_comp_id().unwrap();
@@ -475,6 +587,7 @@ fn freeze_121_manual_sections_do_not_poll_media_or_copy_the_project() {
             target: Target::Comp { comp },
             start: Tick::ZERO,
             end: Tick::from_seconds_f64(1.0),
+            follow_comp_range: false,
             enabled: true,
             auto: false,
             quick_draft: false,

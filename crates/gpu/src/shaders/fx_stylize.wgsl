@@ -174,7 +174,7 @@ fn fxs_point(@builtin(global_invocation_id) gid: vec3<u32>) {
 //  3 Polar Coordinates (distort::polar, edges repeated): u[0].y = to polar;
 //    f[0] = (w, h, cx, cy); f[1] = (rmax, interpolation)
 //  4 CC Slant (distort3::cc_slant): f[0] = (floor x, floor y, 1 / height, slant); f[1].x = x scale
-//  5 CC Smear (distort3::cc_smear): f[0] = (from x, from y, dx, dy); f[1] = (len², reach, radius)
+//  5 CC Smear (distort3::cc_smear): f[0] = (from x, from y, dx, dy); f[1] = (length, unused, radius); dx/dy include reach
 //  6 CC Split (distort3::split_impl): f[0] = (ax, ay, ux, uy); f[1] = (len, split 1, split 2, reach)
 //  7 Optics Compensation (distort2::optics_compensation): u[0].y = reverse;
 //    f[0] = (cx, cy, fit, f); f[1] = (reference radius, half FOV)
@@ -294,14 +294,16 @@ fn fxs_warp(@builtin(global_invocation_id) gid: vec3<u32>) {
             let fr = P.f[0].xy;
             let dx = P.f[0].z;
             let dy = P.f[0].w;
-            let t = clamp(((x - fr.x) * dx + (y - fr.y) * dy) / P.f[1].x, 0.0, 1.0);
-            let px = fr.x + dx * t;
-            let py = fr.y + dy * t;
-            let d = sqrt((x - px) * (x - px) + (y - py) * (y - py));
-            let w0 = max(1.0 - d / P.f[1].z, 0.0);
-            let w = w0 * w0 * (3.0 - 2.0 * w0);
-            let k = P.f[1].y * w * t;
-            s = vec2<f32>(x - dx * k, y - dy * k);
+            let len = P.f[1].x;
+            let radius = P.f[1].z;
+            let u = vec2<f32>(dx, dy) / len;
+            let r = vec2<f32>(x, y) - fr - vec2<f32>(dx, dy);
+            let along = dot(r, u);
+            let across = dot(r, vec2<f32>(-u.y, u.x));
+            let back_radius = select(radius, radius + len, along < 0.0);
+            let w0 = max(vec2<f32>(1.0) - abs(vec2<f32>(along / back_radius, across / radius)), vec2<f32>(0.0));
+            let w = w0 * w0 * (vec2<f32>(3.0) - 2.0 * w0);
+            s = vec2<f32>(x - dx * w.x * w.y, y - dy * w.x * w.y);
         }
         case 6u: {
             let a = P.f[0].xy;

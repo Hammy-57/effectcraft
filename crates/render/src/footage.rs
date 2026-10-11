@@ -131,7 +131,8 @@ pub trait FootageSource: Send + Sync {
         self.frame_pixels(item, footage, t).map(|px| FootageFrame { px, preview: false })
     }
     /// `frames` interleaved stereo sample frames of `item`'s audio from source time `t` at
-    /// `rate` Hz (`None` when unavailable).
+    /// `rate` Hz (`None` when unavailable). The first sample is `t.to_units_floor(rate)`;
+    /// a sample boundary uses the earliest representable tick that selects that sample.
     fn audio(&self, _item: ItemId, _footage: &Footage, _t: Tick, _frames: usize, _rate: u32) -> Option<Vec<f32>> {
         None
     }
@@ -151,6 +152,10 @@ pub trait FootageSource: Send + Sync {
     /// Drop the decoded frames it keeps (Edit ▸ Purge ▸ All Memory / Image Cache Memory) and close
     /// the files nobody is reading: the next reads decode again. Sources without a cache ignore it.
     fn purge(&self) {}
+    /// The file at `path` changed on disk (Reload Footage): drop what it keeps of it (decoded
+    /// frames, open decoders, parsed models), so the next reads see the new contents. Sources
+    /// without a cache ignore it.
+    fn forget(&self, _path: &str) {}
     /// A thumbnail of `footage` (its first frame) fitting in `max_side` × `max_side`, aspect
     /// kept, for browsing files that aren't in the project: sources don't cache the frame or keep
     /// the file open for it.
@@ -253,11 +258,11 @@ impl<'a> Renderer<'a> {
             let dominant_upper = f.fields == effectcraft_project::FieldOrder::UpperFirst;
             // Upper field = even lines (0, 2, …).
             let parity = if (i % 2 == 0) == dominant_upper { 0 } else { 1 };
-            return Some(full(Arc::new(interpret_pixels(&field_frame(&img, parity), f))));
+            return Some(full(Arc::new(interpret_pixels(&field_frame(&img, parity), f, self.pipe.linear_footage_space(f)))));
         }
         if f.invert_alpha || f.linear_light_applies() {
             let img = self.footage_frame_raw(ctx, layer, item, f, t)?;
-            return Some(full(Arc::new(interpret_pixels(&img, f))));
+            return Some(full(Arc::new(interpret_pixels(&img, f, self.pipe.linear_footage_space(f)))));
         }
         if let Some(img) = self.blended_frame(ctx, layer, item, f, t) {
             return Some(full(img));
@@ -345,13 +350,12 @@ pub fn field_frame(img: &Image, parity: usize) -> Image {
 }
 
 /// Interpret Footage ▸ Invert Alpha and Interpret As Linear Light on decoded (premultiplied)
-/// pixels.
-pub fn interpret_pixels(img: &Image, f: &Footage) -> Image {
+/// pixels; linear light is encoded in `space` ([`color::Pipe::linear_footage_space`]).
+pub fn interpret_pixels(img: &Image, f: &Footage, space: effectcraft_color::ColorSpace) -> Image {
     let linear = f.linear_light_applies();
     if !f.invert_alpha && !linear {
         return img.clone();
     }
-    let space = f.color_profile.unwrap_or(effectcraft_color::ColorSpace::Srgb);
     let mut out = img.clone();
     for p in out.data.iter_mut() {
         let a = p[3];

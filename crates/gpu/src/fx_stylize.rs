@@ -298,14 +298,17 @@ fn cc_slant(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     )
 }
 
-fn cc_smear(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
+fn cc_smear(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
+    if !ctx.adjustment {
+        b.pad(e, effectcraft_effects::cc_smear_pad(ctx, [b.img.width, b.img.height], b.offset, b.scale))?;
+    }
     let from = b.to_px(ctx.params.v2("from"));
     let to = b.to_px(ctx.params.v2("to"));
-    let reach = ctx.params.f("reach") / 100.0;
-    let radius = (ctx.params.f("radius") * b.scale).max(0.5);
-    let (dx, dy) = (to.0 - from.0, to.1 - from.1);
-    let l2 = dx * dx + dy * dy;
-    if l2 < 1e-12 || reach == 0.0 {
+    let reach = ctx.params.f("reach").clamp(-1000.0, 1000.0) / 100.0;
+    let radius = (ctx.params.f("radius").clamp(0.0, 4000.0) * b.scale).max(0.5);
+    let (dx, dy) = ((to.0 - from.0) * reach, (to.1 - from.1) * reach);
+    let len = dx.hypot(dy);
+    if [from.0, from.1, to.0, to.1, len, radius].iter().any(|v| !v.is_finite() || v.abs() > 1e9) || len < 1e-6 {
         return Some(b);
     }
     warp(
@@ -313,7 +316,7 @@ fn cc_smear(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
         5,
         |p| {
             p.f[0] = [from.0 as f32, from.1 as f32, dx as f32, dy as f32];
-            p.f[1] = [l2 as f32, reach as f32, radius as f32, 0.0];
+            p.f[1] = [len as f32, 0.0, radius as f32, 0.0];
         },
         b,
         None,
@@ -485,6 +488,9 @@ fn ripple_pulse(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
 }
 
 fn power_pin(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
+    if ctx.params.b("unstretch") {
+        return None; // Unstretch (reverse pinning) renders on the CPU (catalog CPU_ONLY_CONTROLS).
+    }
     let persp = (ctx.params.f("perspective") / 100.0).clamp(0.0, 1.0);
     let (lw, lh) = (ctx.layer_size[0].max(1.0), ctx.layer_size[1].max(1.0));
     let ex = [ctx.params.f("expandTop"), ctx.params.f("expandLeft"), ctx.params.f("expandRight"), ctx.params.f("expandBottom")];
@@ -581,8 +587,11 @@ fn offset(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
     table(e, b, &data, false, blend.max(0.0))
 }
 
-fn cc_tiler(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
+fn cc_tiler(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     let s = (ctx.params.f("scale") / 100.0).max(0.001);
+    if !ctx.adjustment {
+        b.pad(e, effectcraft_effects::util::layer_cover_pad(ctx, [b.img.width, b.img.height], b.offset, b.scale))?;
+    }
     let c = b.to_px(ctx.params.v2("center"));
     let blend = (ctx.params.f("blendWithOriginal") / 100.0) as f32;
     let (x0, y0, w, h) = layer_rect(ctx, &b);

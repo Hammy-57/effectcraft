@@ -202,7 +202,7 @@ fn modifiers(p: &Value) -> egui::Modifiers {
 /// Resolve a point from `{id}` (element centre) or `{x, y}`.
 fn point(app: &EffectcraftApp, p: &Value) -> Result<egui::Pos2, String> {
     if let Some(id) = p.get("id").and_then(Value::as_str) {
-        let e = app.auto.find(id).ok_or_else(|| format!("{RETRY}no element `{id}` (see ui.elements)"))?;
+        let e = app.auto.find_current(id).ok_or_else(|| format!("{RETRY}no element `{id}` (see ui.elements)"))?;
         let fx = p.get("fx").and_then(Value::as_f64).unwrap_or(0.5) as f32;
         let fy = p.get("fy").and_then(Value::as_f64).unwrap_or(0.5) as f32;
         return Ok(egui::pos2(e.rect[0] + e.rect[2] * fx, e.rect[1] + e.rect[3] * fy));
@@ -216,7 +216,7 @@ fn point(app: &EffectcraftApp, p: &Value) -> Result<egui::Pos2, String> {
 /// group id, see `ui.elements`); `None` for the main window.
 fn point_window(app: &EffectcraftApp, p: &Value) -> Option<u64> {
     match p.get("id").and_then(Value::as_str) {
-        Some(id) => app.auto.find(id).and_then(|e| e.window),
+        Some(id) => app.auto.find_current(id).and_then(|e| e.window),
         None => p.get("window").and_then(Value::as_u64),
     }
 }
@@ -252,7 +252,7 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
         "ui.inspect" => ok(inspect(app, ctx)),
         "ui.elements" => {
             let prefix = s("prefix").unwrap_or("");
-            ok(serde_json::to_value(app.auto.query(prefix)).unwrap_or_default())
+            ok(serde_json::to_value(app.auto.query_current(prefix)).unwrap_or_default())
         }
         "ui.set" => {
             if let Some(t) = s("tool") {
@@ -484,7 +484,7 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
                 Some((x, y)) => {
                     // (A Timeline in an undocked OS window: click with this `window`.)
                     let mut r = json!({"x": x, "y": y});
-                    if let Some(w) = app.auto.find("timeline.ruler").and_then(|e| e.window) {
+                    if let Some(w) = app.auto.find_current("timeline.ruler").and_then(|e| e.window) {
                         r["window"] = json!(w);
                     }
                     ok(r)
@@ -505,8 +505,8 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
             )
         }
         "ui.screenshot" => {
-            let crop = s("panel").and_then(PanelKind::from_name).and_then(|pk| app.auto.find(&format!("panel.{}", pk.id())));
-            let crop = crop.or_else(|| s("id").and_then(|id| app.auto.find(id)));
+            let crop = s("panel").and_then(PanelKind::from_name).and_then(|pk| app.auto.find_current(&format!("panel.{}", pk.id())));
+            let crop = crop.or_else(|| s("id").and_then(|id| app.auto.find_current(id)));
             // The capture is of the main window.
             if let Some(w) = crop.and_then(|e| e.window) {
                 return err(format!(
@@ -602,7 +602,7 @@ pub fn inspect(app: &EffectcraftApp, ctx: &egui::Context) -> Value {
         "activeComp": app.session.state.active_comp.map(|i| i.0),
         "selectedLayers": app.session.state.selected_layers.iter().map(|c| c.0).collect::<Vec<_>>(),
         "selectedKeys": app.session.state.selected_keys.len(),
-        "elements": app.auto.previous.len(),
+        "elements": app.auto.elements.len(),
         "dialog": app.dialog.map(|d| format!("{d:?}")),
         "renderMs": app.frames.last_ms.lock().map(|v| *v).unwrap_or(0.0),
     })
@@ -724,6 +724,45 @@ pub fn encode_png(rgba: &[u8], w: u32, h: u32) -> Result<Vec<u8>, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn between_frame_controls_use_current_geometry_and_do_not_resurrect_removed_widgets() {
+        use super::*;
+        use egui::{Rect, pos2, vec2};
+        let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+        let ctx = egui::Context::default();
+        let old = Rect::from_min_size(pos2(10.0, 10.0), vec2(10.0, 10.0));
+        let current = Rect::from_min_size(pos2(40.0, 60.0), vec2(10.0, 12.0));
+        app.auto.window = Some(7);
+        app.auto.add("handle", old, "old");
+        app.auto.add("removed", old, "gone");
+        app.auto.begin_frame();
+        app.auto.window = None;
+        app.auto.add("handle", current, "current");
+        app.auto.add("timeline.ruler", Rect::from_min_size(pos2(100.0, 100.0), vec2(100.0, 20.0)), "2,20");
+        app.auto.add("timeline.layer.1.bar", Rect::from_min_size(pos2(100.0, 200.0), vec2(50.0, 20.0)), "layer");
+        assert_eq!(app.auto.find("handle").unwrap().label, "old", "during-paint lookup remains unchanged");
+        let request = |method, params| ControlRequest::new(method, params).0;
+        assert!(matches!(handle(&mut app, &ctx, &request("ui.click", json!({"id": "handle"}))), Outcome::AfterInput));
+        let events = app.take_synthetic_input();
+        assert_eq!(events.len(), 3, "new main-window target must not route to the old floating window");
+        assert!(matches!(events.first(), Some(egui::Event::PointerMoved(p)) if *p == current.center()));
+        let Outcome::Done(list) = handle(&mut app, &ctx, &request("ui.elements", json!({"prefix": "handle"}))) else { panic!("expected elements") };
+        assert_eq!(list["result"][0]["label"], "current");
+        assert_eq!(list["result"][0]["rect"], json!([40.0, 60.0, 10.0, 12.0]));
+        assert_eq!(inspect(&app, &ctx)["elements"], 3);
+        let Outcome::Done(located) = handle(&mut app, &ctx, &request("ui.timeline.locate", json!({"layer": 1, "time": 3}))) else {
+            panic!("expected location")
+        };
+        assert_eq!(located["result"], json!({"x": 126.0, "y": 210.0}));
+        let Outcome::Screenshot { crop, .. } = handle(&mut app, &ctx, &request("ui.screenshot", json!({"id": "handle"}))) else {
+            panic!("expected screenshot crop")
+        };
+        assert_eq!(crop, Some([40.0, 60.0, 10.0, 12.0]));
+        assert!(matches!(handle(&mut app, &ctx, &request("ui.click", json!({"id": "removed"}))), Outcome::Retry(_)));
+        assert!(app.auto.find_current("removed").is_none());
+        assert!(app.auto.query_current("removed").is_empty());
+    }
+
     #[test]
     fn base64_rfc4648_vectors() {
         for (i, o) in [("", ""), ("f", "Zg=="), ("fo", "Zm8="), ("foo", "Zm9v"), ("foob", "Zm9vYg=="), ("fooba", "Zm9vYmE="), ("foobar", "Zm9vYmFy")] {

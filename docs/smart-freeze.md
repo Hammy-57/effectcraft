@@ -47,15 +47,18 @@ Cache reads/rendering/dependency capture must not run on the UI thread.
 Open **Window → Smart Freeze**. With no selection (or every layer selected), Freeze
 targets the composition. One selected precomp targets its source; other supported
 selections stay in their existing timeline. Edit restores originals; Refresh creates
-a new cache version. Auto must be enabled explicitly for each section.
+a new cache version. Auto must be enabled explicitly for each section. Default freezes
+follow composition-duration edits on Refresh. Explicit `start`/`end` ranges stay fixed;
+`freeze.configure` can restore `followCompositionRange: true`. Changing a range restores
+originals until the next Refresh.
 
 | Command | Parameters / result |
 |---|---|
-| `freeze.freeze` | `comp?`, `layers?`, `mode: auto|comp|precomp|selection`, `name?`, `start?`, `end?`, `quickDraft?`, `wait?` |
+| `freeze.freeze` | `comp?`, `layers?`, `mode: auto|comp|precomp|selection`, `name?`, `start?`, `end?`, `followCompositionRange?`, `quickDraft?`, `wait?` |
 | `freeze.list` | Persisted section intent, cache versions and measurements |
 | `freeze.edit` / `freeze.refresh` | `section`; Refresh also accepts `wait` |
 | `freeze.auto` | `section`, `enabled` |
-| `freeze.configure` | `section`, `quickDraft?`, `name?` |
+| `freeze.configure` | `section`, `quickDraft?`, `name?`, `start?`, `end?`, `followCompositionRange?` |
 | `freeze.cancel` | Cancel the owned freeze/check jobs; a completed draft remains usable |
 | `freeze.originals` | Restore originals and stop Auto for all sections |
 | `freeze.remove` | Remove one section's controls; retain its derived cache files |
@@ -111,7 +114,7 @@ evidence does not establish rendering fidelity or responsiveness.
 
 ## Validation record (2026-10-11)
 
-Focused engine checks passed: 27 tests, with the native Trash test separately enabled
+Focused engine checks passed: 30 tests, with the native Trash test separately enabled
 and passed on macOS. Coverage includes cache pixels, original export/audio, draft/full,
 cancellation, blocked-worker project switches, Undo, scoped dependencies, partial frame
 reuse, ROI and sub-frame fallback. The UI checks exercise real pointer controls and

@@ -28,7 +28,9 @@ fn harness() -> Harness<'static, EffectcraftApp> {
 }
 
 fn rect(h: &Harness<'_, EffectcraftApp>, id: &str) -> Rect {
-    let e = h.state().auto.find(id).unwrap_or_else(|| panic!("no {id}"));
+    // Harness steps have completed painting: use the geometry actually shown, not Registry's
+    // during-paint lookup (an async puppet solve can move a handle this frame).
+    let e = h.state().auto.find_current(id).unwrap_or_else(|| panic!("no current {id}"));
     Rect::from_min_size(pos2(e.rect[0], e.rect[1]), vec2(e.rect[2], e.rect[3]))
 }
 
@@ -368,6 +370,201 @@ fn tool_creates_mask_draws_a_mask_on_the_selected_shape_layer() {
     assert!(!h.state().session.state.shape_tool.creates_mask);
 }
 
+// ---- the shape tools' drag ghost
+
+/// Run frames until the viewer's background frame has landed, so the comp is painted (and not
+/// still black) before the drag begins: the ghost is then the only thing that changes.
+fn settle_viewer(h: &mut Harness<'_, EffectcraftApp>) {
+    for _ in 0..600 {
+        h.step();
+        if h.state().frames.inflight() == 0 && h.state().frames.last_ms.lock().map(|v| *v > 0.0).unwrap_or(false) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    h.run_steps(4);
+}
+
+/// Press at `from`, drag to `to` with `mods` held and return the frame drawn with the button still
+/// down — what the user sees mid-drag, before anything is committed. egui only takes modifiers
+/// from [`egui::Event::ModifiersChanged`], so they are set before the press and stay set.
+fn mid_drag(h: &mut Harness<'_, EffectcraftApp>, from: Pos2, to: Pos2, mods: egui::Modifiers) -> image::RgbaImage {
+    h.input_mut().events.push(Event::ModifiersChanged(mods));
+    h.input_mut().events.push(Event::PointerMoved(from));
+    h.input_mut().events.push(Event::PointerButton { pos: from, button: egui::PointerButton::Primary, pressed: true, modifiers: mods });
+    h.step();
+    for i in 1..=8 {
+        h.input_mut().events.push(Event::PointerMoved(from + (to - from) * (i as f32 / 8.0)));
+        h.step();
+    }
+    h.render().expect("the mid-drag frame")
+}
+
+/// Release the button where the drag left it.
+fn release(h: &mut Harness<'_, EffectcraftApp>, at: Pos2, mods: egui::Modifiers) {
+    h.input_mut().events.push(Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: false, modifiers: mods });
+    h.run_steps(2);
+}
+
+/// The pixel at a comp point of a rendered frame.
+fn px_at(img: &image::RgbaImage, h: &Harness<'_, EffectcraftApp>, p: [f32; 2]) -> [u8; 3] {
+    let s = screen(h, p);
+    let p = img.get_pixel(s.x.round() as u32, s.y.round() as u32).0;
+    [p[0], p[1], p[2]]
+}
+
+/// How different two pixels are, summed over the channels.
+fn delta(a: [u8; 3], b: [u8; 3]) -> u32 {
+    (0..3).map(|i| (a[i] as i32 - b[i] as i32).unsigned_abs()).sum()
+}
+
+/// The Tools-bar Fill as bytes, the colour a filled ghost carries.
+fn fill_rgb(h: &Harness<'_, EffectcraftApp>) -> [u8; 3] {
+    let c = h.state().session.state.shape_tool.fill.color;
+    std::array::from_fn(|i| (c[i].clamp(0.0, 1.0) * 255.0).round() as u8)
+}
+
+/// The shape tools show the shape they will draw under the cursor while the drag is still going:
+/// filled with the Tools bar's Fill, so it reads at any zoom where the 1 px outline it replaces was
+/// invisible, and in the tool's own form — only the Rectangle fills the corner of the box.
+#[test]
+fn shape_drag_ghost_shows_the_tools_own_shape_while_dragging() {
+    let (from, to) = ([140.0, 100.0], [400.0, 300.0]);
+    let centre = [270.0, 200.0];
+    // 6 comp px inside the box's top-left corner: inside a rectangle, outside every other kind.
+    let corner = [146.0, 106.0];
+    for (tool, fills_corner) in [(Tool::Rectangle, true), (Tool::RoundedRect, false), (Tool::Ellipse, false), (Tool::Polygon, false), (Tool::Star, false)] {
+        let mut h = harness();
+        h.state_mut().ui.tool = tool;
+        settle_viewer(&mut h);
+        let (a, b) = (screen(&h, from), screen(&h, to));
+        let before = h.render().expect("the frame before the drag");
+        let mid = mid_drag(&mut h, a, b, egui::Modifiers::default());
+        let fill = fill_rgb(&h);
+
+        // Drawn while the button is down, and painted with the Fill rather than left to a hairline.
+        let was = px_at(&before, &h, centre);
+        let now = px_at(&mid, &h, centre);
+        assert!(delta(was, now) > 30, "{tool:?}: no ghost drawn mid-drag ({was:?} → {now:?})");
+        assert!(delta(now, fill) < delta(was, fill), "{tool:?}: the ghost is not the Fill colour ({now:?} vs {was:?})");
+
+        // The tool's own form: only the Rectangle reaches the corner of its box.
+        let was_c = px_at(&before, &h, corner);
+        let now_c = px_at(&mid, &h, corner);
+        assert_eq!(delta(was_c, now_c) > 30, fills_corner, "{tool:?}: the ghost is not drawn in its own shape");
+
+        release(&mut h, b, egui::Modifiers::default());
+    }
+}
+
+/// The ghost and the shape the release commits share one normalisation, so nothing it shows is a
+/// lie: Shift squares the box and Ctrl/Cmd draws it from the press point (as in After Effects), both live.
+#[test]
+fn shape_drag_ghost_normalises_the_same_way_as_the_release() {
+    let from = [140.0f64, 100.0];
+    let to = [400.0f64, 260.0];
+    // (mods, centre, size): Shift squares the box from its top-left, Ctrl/Cmd centres it on the press.
+    for (mods, centre, size) in [
+        (egui::Modifiers::default(), [270.0, 180.0], [260.0, 160.0]),
+        (egui::Modifiers::SHIFT, [270.0, 230.0], [260.0, 260.0]),
+        (egui::Modifiers::COMMAND, [140.0, 100.0], [520.0, 320.0]),
+        (egui::Modifiers { shift: true, ..egui::Modifiers::COMMAND }, [140.0, 100.0], [520.0, 520.0]),
+    ] {
+        let mut h = harness();
+        h.state_mut().ui.tool = Tool::Ellipse;
+        settle_viewer(&mut h);
+        let (a, b) = (screen(&h, from.map(|v| v as f32)), screen(&h, to.map(|v| v as f32)));
+        let before = h.render().expect("the frame before the drag");
+        // Measured with the button down, so this is the ghost and not the committed shape.
+        let mid = mid_drag(&mut h, a, b, mods);
+        let on = [centre[0] as f32 + size[0] as f32 / 4.0, centre[1] as f32 + size[1] as f32 / 4.0];
+        assert!(delta(px_at(&before, &h, on), px_at(&mid, &h, on)) > 30, "{mods:?}: the ghost is not where it will land");
+        release(&mut h, b, mods);
+
+        // And the shape it commits is that box: a new shape layer carries the position, its
+        // group sits at its own centre's origin.
+        let comp = h.state().session.active_comp().unwrap().clone();
+        let layer = comp.layers.first().expect("a new shape layer").clone();
+        assert!(matches!(layer.source, effectcraft_engine::project::LayerSource::Shape), "{mods:?}: no shape layer");
+        let at = layer.transform().unwrap().get("position").unwrap().value.components();
+        assert!((at[0] - centre[0]).abs() < 1.0 && (at[1] - centre[1]).abs() < 1.0, "{mods:?}: at {at:?}, not {centre:?}");
+        let group = layer.props.sub("contents").unwrap().groups().next().unwrap().clone();
+        let path = group.sub("contents").unwrap().sub("ellipse").unwrap();
+        let s = path.get("size").unwrap().value.components();
+        assert!((s[0] - size[0]).abs() < 1.0 && (s[1] - size[1]).abs() < 1.0, "{mods:?}: sized {s:?}, not {size:?}");
+    }
+}
+
+/// The ghost says where the shape lands: a mask on the selected layer is drawn in the mask colour
+/// and not painted with the Fill, where a shape drawn into the selected shape layer is.
+#[test]
+fn shape_drag_ghost_shows_where_the_shape_will_land() {
+    let (from, to) = ([140.0, 100.0], [400.0, 300.0]);
+    let centre = [270.0, 200.0];
+
+    // Nothing selected: the shape becomes a new layer, painted with the Fill.
+    let mut h = harness();
+    h.state_mut().ui.tool = Tool::Ellipse;
+    settle_viewer(&mut h);
+    let (a, b) = (screen(&h, from), screen(&h, to));
+    let shape_mid = mid_drag(&mut h, a, b, egui::Modifiers::default());
+    let shape_px = px_at(&shape_mid, &h, centre);
+    let fill = fill_rgb(&h);
+    assert!(delta(shape_px, fill) < delta(shape_px, [0xff, 0xc0, 0x00]), "a shape ghost is painted with the Fill, not the mask colour");
+    release(&mut h, b, egui::Modifiers::default());
+
+    // A solid selected: the same drag is a mask on it, in the mask colour.
+    let mut h = harness();
+    let plate = h.state().session.active_comp().unwrap().layers.iter().find(|l| l.name == "Box").unwrap().id;
+    h.state_mut().session.execute("layer.select", json!({"layers": [plate.0]})).unwrap();
+    h.state_mut().ui.tool = Tool::Ellipse;
+    settle_viewer(&mut h);
+    let (a, b) = (screen(&h, from), screen(&h, to));
+    let mask_mid = mid_drag(&mut h, a, b, egui::Modifiers::default());
+    let mask_px = px_at(&mask_mid, &h, centre);
+    assert!(delta(mask_px, shape_px) > 20, "a mask ghost must not look like the shape ghost ({mask_px:?} vs {shape_px:?})");
+    release(&mut h, b, egui::Modifiers::default());
+    let comp = h.state().session.active_comp().unwrap();
+    assert_eq!(comp.layer(plate).unwrap().props.sub("masks").unwrap().groups().count(), 1, "the drag drew a mask");
+}
+
+/// Dragging a layer moves its picture while the button is still down. Every pointer move replaces
+/// the comp's content identity, so the exact frame on screen is re-rendered at every step: waiting
+/// for it would freeze the viewer on the last completed frame for the whole drag.
+#[test]
+fn a_layer_drag_moves_the_picture_while_the_button_is_down() {
+    let mut h = harness();
+    let box_ = h.state().session.active_comp().unwrap().layers.iter().find(|l| l.name == "Box").unwrap().id;
+    h.state_mut().session.execute("layer.select", json!({"layers": [box_.0]})).unwrap();
+    settle_viewer(&mut h);
+    let from = screen(&h, [320.0, 180.0]);
+    let to = screen(&h, [520.0, 180.0]);
+    h.input_mut().events.push(Event::PointerMoved(from));
+    h.input_mut().events.push(Event::PointerButton { pos: from, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+    h.step();
+    // Where the layer is not (yet): the plate behind it.
+    let plate = px_at(&h.render().unwrap(), &h, [440.0, 200.0]);
+
+    // Drag in small steps, still holding the button, and give the renders a chance to land.
+    let mut moved = false;
+    for i in 1..=40 {
+        let p = from + (to - from) * (i as f32 / 40.0);
+        h.input_mut().events.push(Event::PointerMoved(p));
+        h.step();
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        // 30 comp px behind the pointer: inside the layer, well away from its outline, its anchor
+        // icon and where it started.
+        let at = px_at(&h.render().expect("mid-drag frame"), &h, [320.0 + 200.0 * (i as f32 / 40.0) - 30.0, 200.0]);
+        if i >= 30 && delta(at, plate) > 30 {
+            moved = true;
+            break;
+        }
+    }
+    assert!(moved, "the layer's pixels did not follow the pointer while the button was down");
+    h.input_mut().events.push(Event::PointerButton { pos: to, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+    h.run_steps(2);
+}
+
 /// Clicking the word "Fill" opens Fill Options: a radial gradient in Multiply at 40% paints the
 /// next shape drawn (#227).
 #[test]
@@ -555,8 +752,28 @@ fn pen_mask_undoes_step_by_step_and_double_click_moves_the_whole_mask() {
     assert!(back.vertices.iter().zip(&moved.vertices).all(|(v, c)| near(*v, *c)), "{back:?}");
 }
 
-/// A straight two-key motion path shows Bezier handles at both keys (it had none), and dragging
-/// one pulls the path into a curve (#290).
+/// #513: clicking away from a mask's path, even on its own layer, deselects the mask's points;
+/// the layer stays selected.
+#[test]
+fn clicking_off_a_mask_deselects_its_points() {
+    let mut h = harness();
+    let plate = layer_id(&h, "Plate");
+    let s = &mut h.state_mut().session;
+    s.execute("layer.select", json!({"layers": [plate]})).unwrap();
+    s.execute("mask.new", json!({"layer": plate, "vertices": [[100.0, 60.0], [500.0, 60.0], [500.0, 300.0], [100.0, 300.0]], "closed": true})).unwrap();
+    h.state_mut().ui.tool = Tool::Selection;
+    h.run_steps(2);
+    let at = screen(&h, [500.0, 60.0]);
+    click(&mut h, at);
+    assert_eq!(h.state().session.state.selected_vertices.len(), 1, "a click on a point selects it");
+    let away = screen(&h, [200.0, 250.0]);
+    click(&mut h, away);
+    assert!(h.state().session.state.selected_vertices.is_empty(), "a click off the path deselects its points");
+    assert_eq!(h.state().session.state.selected_layers, vec![LayerId(plate)], "the layer stays selected");
+}
+
+/// A straight two-key motion path shows Bezier handles at both keys, and dragging one pulls the
+/// path into a curve (#290).
 #[test]
 fn a_straight_motion_path_has_handles_to_curve_it() {
     let mut h = harness();
@@ -570,15 +787,16 @@ fn a_straight_motion_path_has_handles_to_curve_it() {
     h.run_steps(3);
     let (out0, in1) = (format!("viewer.motionPath.{}.0.out", box_id.0), format!("viewer.motionPath.{}.1.in", box_id.0));
     assert!(h.state().auto.find(&in1).is_some(), "the second key has a handle");
-    // The first key's handle lies a third of the way along the path: drag it down 150 px.
+    // The first key's auto-Bezier handle lies a sixth of the way along the path, as After Effects
+    // puts it: drag it down 150 px.
     let from = rect(&h, &out0).center();
-    assert!(from.distance(screen(&h, [200.0, 100.0])) < 2.0, "{from:?}");
-    let to = screen(&h, [200.0, 250.0]);
+    assert!(from.distance(screen(&h, [150.0, 100.0])) < 2.0, "{from:?}");
+    let to = screen(&h, [150.0, 250.0]);
     drag(&mut h, from, to);
     let p = h.state().session.active_comp().unwrap().layer(box_id).unwrap().props.prop("transform/position").unwrap().clone();
     assert!(!p.keys[0].spatial_auto);
     let t = p.keys[0].spatial_out;
-    assert!((t[0] - 100.0).abs() < 2.0 && (t[1] - 150.0).abs() < 2.0, "{t:?}");
+    assert!((t[0] - 50.0).abs() < 2.0 && (t[1] - 150.0).abs() < 2.0, "{t:?}");
     let mid = p.value_at(effectcraft_engine::time::Tick::from_seconds_f64(1.0)).as_vec3();
     assert!(mid[1] > 130.0, "the path curves: {mid:?}");
 }
@@ -885,6 +1103,30 @@ fn puppet_bend_pin_rotates_by_its_ring_and_scales_by_its_square() {
     drag(&mut h, square, center + (square - center) * 2.0);
     let sc = pin_value(&h, id, bend, "scale");
     assert!((sc - 200.0).abs() < 2.0, "scale {sc}");
+}
+
+#[test]
+fn puppet_scale_uses_current_handles_when_previous_registry_geometry_lags() {
+    let (mut h, id, bend) = puppet_harness();
+    let pin_id = format!("viewer.puppetPin.{bend}");
+    let scale_id = format!("{pin_id}.scale");
+    let ring_id = format!("{pin_id}.rotate");
+    // Model an async completion adopted on the last idle frame: the previous registry still
+    // describes another mesh pose. A two-pixel lag stays hittable, but changes the scale ratio
+    // if the test uses those old coordinates rather than the handles currently on screen.
+    let mut shifted = 0;
+    for element in &mut h.state_mut().auto.previous {
+        if element.id == pin_id || element.id == scale_id || element.id == ring_id {
+            element.rect[0] += 2.0;
+            shifted += 1;
+        }
+    }
+    assert_eq!(shifted, 3, "the stale snapshot contains the pin and both handles");
+    let center = rect(&h, &pin_id).center();
+    let square = rect(&h, &scale_id).center();
+    drag(&mut h, square, center + (square - center) * 2.0);
+    let scale = pin_value(&h, id, bend, "scale");
+    assert!((scale - 200.0).abs() < 2.0, "scale {scale}");
 }
 
 #[test]
@@ -1492,6 +1734,32 @@ fn handle_drags_scale_about_the_anchor_and_follow_the_pointer() {
     assert!(close(scale(&h), [162.5, 162.5]), "{:?}", scale(&h));
 }
 
+/// #491: with several layers selected, a handle drag scales all of them by the same ratio, each
+/// about its own anchor point, in one undo step.
+#[test]
+fn handle_drags_scale_every_selected_layer() {
+    let mut h = harness();
+    let layers = h.state().session.active_comp().unwrap().layers.iter().map(|l| l.id).collect::<Vec<_>>();
+    let (box_id, plate) = (layers[0], layers[1]);
+    let scale = |h: &Harness<'_, EffectcraftApp>, id: LayerId| {
+        let l = h.state().session.active_comp().unwrap().layer(id).unwrap().clone();
+        l.props.prop("transform/scale").unwrap().value.as_vec3()
+    };
+    h.state_mut().session.execute("prop.set", json!({"layer": plate.0, "path": "transform/scale", "value": [50, 50, 100]})).unwrap();
+    h.state_mut().session.execute("layer.select", json!({"layers": [box_id.0, plate.0]})).unwrap();
+    h.state_mut().session.execute("view.snapping", json!({"value": false})).unwrap();
+    h.run_steps(2);
+    let undo0 = h.state().session.history.undo.len();
+    // The box's bottom-right corner (360, 220) to (400, 260): twice the box's size.
+    let corner = rect(&h, &format!("viewer.handle.{}.2", box_id.0)).center();
+    let to = screen(&h, [400.0, 260.0]);
+    drag_path(&mut h, &[corner, to], Default::default());
+    let (b, p) = (scale(&h, box_id), scale(&h, plate));
+    assert!((b[0] - 200.0).abs() < 1.0 && (b[1] - 200.0).abs() < 1.0, "{b:?}");
+    assert!((p[0] - 100.0).abs() < 1.0 && (p[1] - 100.0).abs() < 1.0, "the other layer doubles too: {p:?}");
+    assert_eq!(h.state().session.history.undo.len(), undo0 + 1, "one undo step");
+}
+
 /// #252: with snapping on, a dragged handle snaps to the comp's corners and edges (and other
 /// layers'), so a layer scales exactly to the comp; Shift keeps the proportions and still lands
 /// on the comp's size.
@@ -1655,4 +1923,166 @@ fn timeline_twirl_applies_clicked_state_to_selected_layers() {
     assert!(h.state().ui.timeline.open_layers.contains(&c));
     assert!(!h.state().ui.timeline.open_layers.contains(&a));
     assert!(!h.state().ui.timeline.open_layers.contains(&b));
+}
+
+/// #553: the vertex tools edit Position keys instead of creating a mask on the layer.
+#[test]
+fn motion_path_vertex_tools_insert_convert_drag_delete_and_undo() {
+    let mut h = harness();
+    let id = LayerId(layer_id(&h, "Box"));
+    let s = &mut h.state_mut().session;
+    s.execute("layer.select", json!({"layers": [id.0]})).unwrap();
+    for (time, value) in [(0.0, [100, 100, 0]), (2.0, [500, 100, 0])] {
+        s.execute("prop.addKey", json!({"layer": id.0, "path": "transform/position", "time": time, "value": value})).unwrap();
+    }
+    s.set_time(effectcraft_engine::time::Tick::from_seconds_f64(1.0));
+    let property =
+        |h: &Harness<'_, EffectcraftApp>| h.state().session.active_comp().unwrap().layer(id).unwrap().props.prop("transform/position").unwrap().clone();
+    let original = property(&h);
+    for tool in [Tool::PenAdd, Tool::Pen] {
+        h.state_mut().ui.tool = tool;
+        h.run_steps(2);
+        let midpoint = screen(&h, [300.0, 100.0]);
+        click(&mut h, midpoint);
+        let inserted = property(&h);
+        assert_eq!(inserted.keys.len(), 3, "{tool:?}: {}", h.state().ui.status);
+        assert!((inserted.keys[1].time.seconds() - 1.0).abs() < 0.01);
+        assert!((inserted.keys[1].value.as_vec3()[0] - 300.0).abs() < 1.0);
+        assert!(h.state().session.active_comp().unwrap().layer(id).unwrap().masks().is_none_or(|m| m.groups().next().is_none()));
+        h.state_mut().session.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(property(&h).keys, original.keys);
+    }
+    h.state_mut().ui.tool = Tool::PenConvert;
+    h.run_steps(2);
+    let at = screen(&h, [100.0, 100.0]);
+    click(&mut h, at);
+    assert!(!property(&h).keys[0].spatial_auto);
+    assert_eq!(property(&h).keys[0].spatial_out, [0.0; 3]);
+    let to = screen(&h, [170.0, 170.0]);
+    drag(&mut h, at, to);
+    let k = property(&h).keys[0].clone();
+    assert!((k.spatial_out[0] - 70.0).abs() < 2.0 && (k.spatial_out[1] - 70.0).abs() < 2.0, "{k:?}");
+    assert_eq!(k.spatial_in, k.spatial_out.map(|x| -x));
+    for tool in [Tool::PenDelete, Tool::Pen] {
+        h.state_mut().ui.tool = tool;
+        h.run_steps(2);
+        click(&mut h, at);
+        assert_eq!(property(&h).keys.len(), 1, "{tool:?}");
+        h.state_mut().session.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(property(&h).keys.len(), 2);
+    }
+}
+
+#[test]
+fn motion_path_pen_tools_paint_their_own_pointer() {
+    use egui::CursorIcon;
+    let mut h = harness();
+    let id = layer_id(&h, "Box");
+    let s = &mut h.state_mut().session;
+    s.execute("layer.select", json!({"layers": [id]})).unwrap();
+    for (time, value) in [(0.0, [100, 100, 0]), (2.0, [500, 100, 0])] {
+        s.execute("prop.addKey", json!({"layer": id, "path": "transform/position", "time": time, "value": value})).unwrap();
+    }
+    s.set_time(effectcraft_engine::time::Tick::from_seconds_f64(1.0));
+    // The Pen tools paint their own pen pointer (the tool's glyph, Add Vertex's over a path) and
+    // hide the system one, over a motion path's keys and segments as elsewhere.
+    for (tool, point) in [
+        (Tool::Pen, [100.0, 100.0]),
+        (Tool::Pen, [300.0, 100.0]),
+        (Tool::Pen, [300.0, 300.0]),
+        (Tool::PenAdd, [100.0, 100.0]),
+        (Tool::PenDelete, [100.0, 100.0]),
+        (Tool::PenConvert, [100.0, 100.0]),
+    ] {
+        h.state_mut().ui.tool = tool;
+        h.run_steps(2);
+        let point = screen(&h, point);
+        h.input_mut().events.push(Event::PointerMoved(point));
+        h.run_steps(2);
+        assert_eq!(h.output().platform_output.cursor_icon, CursorIcon::None, "{tool:?}");
+    }
+}
+
+/// #509: ⌘/Ctrl-drag in the Layer panel resizes the Roto Brush (as in After Effects) without
+/// painting, the next stroke uses the new size, and the tool options show the Diameter.
+#[test]
+fn roto_brush_ctrl_drag_resizes_the_brush() {
+    let mut h = harness();
+    let id = h.state().session.active_comp().unwrap().layers.iter().find(|l| l.name == "Box").unwrap().id.0;
+    h.state_mut().session.execute("layer.select", json!({"layers": [id]})).unwrap();
+    h.state_mut().ui.layer_panel = Some(id);
+    h.state_mut().show_panel(effectcraft_ui_egui::dock::PanelKind::Layer);
+    h.state_mut().ui.tool = Tool::RotoBrush;
+    h.run_steps(3);
+    assert!(h.state().auto.find("header.roto.diameter").is_some(), "the Diameter field");
+    let canvas = rect(&h, "layerPanel.canvas");
+    let zoom = canvas.width() / 80.0;
+    let c = canvas.center();
+    h.input_mut().events.push(Event::ModifiersChanged(egui::Modifiers::COMMAND));
+    drag(&mut h, c, c + vec2(20.0 * zoom, 0.0));
+    h.input_mut().events.push(Event::ModifiersChanged(egui::Modifiers::NONE));
+    h.run_steps(2);
+    let dia = h.state().session.state.roto.diameter;
+    assert!((dia - 40.0).abs() <= 1.0, "a 20 px drag makes a 40 px brush: {dia}");
+    let strokes = |h: &Harness<'_, EffectcraftApp>| {
+        let l = h.state().session.active_comp().unwrap().layer(LayerId(id)).unwrap().clone();
+        let roto = effectcraft_engine::effects::roto::ID;
+        let g = l
+            .effects()
+            .and_then(|fx| fx.groups().find(|g| matches!(&g.kind, effectcraft_engine::project::GroupKind::Effect { effect } if effect == roto)).cloned());
+        g.map(|g| effectcraft_engine::effects::roto::data(&effectcraft_engine::effects::flatten_params(&g, &mut |p| p.value.clone())).strokes.clone())
+            .unwrap_or_default()
+    };
+    assert!(strokes(&h).is_empty(), "resizing paints nothing");
+    drag(&mut h, c - vec2(10.0 * zoom, 0.0), c + vec2(10.0 * zoom, 0.0));
+    let s = strokes(&h);
+    assert_eq!(s.len(), 1);
+    assert!((s[0].radius - dia / 2.0).abs() < 1e-6, "{} vs {dia}", s[0].radius);
+}
+
+/// #553: the Pen slot's tools work on a motion path as in After Effects: Add Vertex (and the
+/// Pen) add a keyframe where the path is clicked, Convert Vertex switches a keyframe between
+/// Linear and Auto Bezier, Delete Vertex removes it; the pointer is the tool's pen.
+#[test]
+fn vertex_tools_edit_motion_path_keyframes() {
+    let mut h = harness();
+    let box_id: LayerId = h.state().session.active_comp().unwrap().layers[0].id;
+    let s = &mut h.state_mut().session;
+    s.execute("layer.select", json!({"layers": [box_id.0]})).unwrap();
+    s.execute("prop.addKey", json!({"layer": box_id.0, "path": "transform/position", "time": 0.0, "value": [100, 100, 0]})).unwrap();
+    s.execute("prop.addKey", json!({"layer": box_id.0, "path": "transform/position", "time": 2.0, "value": [500, 100, 0]})).unwrap();
+    s.execute("view.snapping", json!({"value": false})).unwrap();
+    s.set_time(effectcraft_engine::time::Tick::from_seconds_f64(3.0));
+    let keys = |h: &Harness<'_, EffectcraftApp>| {
+        h.state().session.active_comp().unwrap().layer(box_id).unwrap().props.prop("transform/position").unwrap().keys.clone()
+    };
+    h.state_mut().ui.tool = Tool::PenAdd;
+    h.run_steps(3);
+    let mid = screen(&h, [300.0, 100.0]);
+    h.input_mut().events.push(Event::PointerMoved(mid));
+    h.step();
+    assert_eq!(h.output().platform_output.cursor_icon, egui::CursorIcon::None, "the pen is painted in place of the system pointer");
+    click(&mut h, mid);
+    let k = keys(&h);
+    assert_eq!(k.len(), 3, "Add Vertex adds a keyframe on the path");
+    let v = k[1].value.as_vec3();
+    assert!((v[0] - 300.0).abs() < 10.0 && (v[1] - 100.0).abs() < 1.0, "{v:?}");
+    assert!((k[1].time.seconds() - 1.0).abs() < 0.1, "{:?}", k[1].time);
+    // Convert Vertex: the new key's handles go (Linear), then come back (Auto Bezier).
+    h.state_mut().ui.tool = Tool::PenConvert;
+    let at = screen(&h, [v[0] as f32, v[1] as f32]);
+    click(&mut h, at);
+    let k = keys(&h);
+    assert!(!k[1].spatial_auto && k[1].spatial_in == [0.0; 3] && k[1].spatial_out == [0.0; 3], "Linear");
+    click(&mut h, at);
+    assert!(keys(&h)[1].spatial_auto, "Auto Bezier");
+    // Delete Vertex removes it.
+    h.state_mut().ui.tool = Tool::PenDelete;
+    click(&mut h, at);
+    assert_eq!(keys(&h).len(), 2);
+    // The Pen adds one too.
+    h.state_mut().ui.tool = Tool::Pen;
+    let quarter = screen(&h, [200.0, 100.0]);
+    click(&mut h, quarter);
+    assert_eq!(keys(&h).len(), 3);
 }

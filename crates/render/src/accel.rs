@@ -54,6 +54,17 @@ pub trait Accelerator: Send + Sync {
     /// Run a chain of supported effects on `buf`, clamping and quantising to `levels` after
     /// every effect when set (8/16 bpc). `None` = not handled.
     fn effects(&self, chain: &[FxStep], buf: &Buf, levels: Option<f32>) -> Option<Buf>;
+    /// [`Self::effects`], keeping the result's image on the accelerator under the returned
+    /// ticket (`None` = not kept): the renderer hands the ticket back to [`Self::adopt`] once
+    /// the pixels are stored unchanged in a shared buffer, or to [`Self::release`].
+    fn effects_kept(&self, chain: &[FxStep], buf: &Buf, levels: Option<f32>) -> Option<(Buf, Option<u64>)> {
+        self.effects(chain, buf, levels).map(|b| (b, None))
+    }
+    /// `buf` holds kept result `ticket`'s pixels: its compositor may draw `buf` from the kept
+    /// image (while `buf` lives) instead of uploading it again.
+    fn adopt(&self, _ticket: u64, _buf: &Arc<Buf>) {}
+    /// Forget kept result `ticket`.
+    fn release(&self, _ticket: u64) {}
     /// Rasterise and shade an Advanced 3D scene at its raster size (depth buffer, PBR, image
     /// based light, shadow maps), with the CPU rasteriser's semantics
     /// ([`three_d::adv::raster::render`]). `None` = not handled (the CPU renders it).
@@ -281,6 +292,42 @@ impl<'a> Renderer<'a> {
         target.shift([-d[0], -d[1]]);
         self.run_effect_stack(ctx, layer, adjustment, usize::MAX, None, origin, target);
         target.shift(d);
+    }
+
+    /// [`Renderer::run_effects_on`] for a (non-adjustment) layer's own pixels: `target` holds
+    /// them in effect space (as [`Renderer::layer_input`] hands them out) and the result stays
+    /// there. Returns the effect-space origin in layer coordinates (rebase by its negation).
+    pub fn run_layer_effects_on(&self, ctx: &EvalCtx, layer: &Layer, target: &mut dyn FxTarget) -> [f64; 2] {
+        let origin = fx_origin(ctx, layer, false);
+        self.run_effect_stack(ctx, layer, false, usize::MAX, None, origin, target);
+        origin
+    }
+
+    /// A precomp layer's nested comp for an accelerator to render resident (no CPU render and
+    /// upload of the nested frame): the renderer one level down, the comp, its time and the
+    /// buffer scale, exactly as [`Renderer::source`]'s comp branch would render it. `None`
+    /// when that branch does more (composition proxy, Essential Properties overrides, frame
+    /// blending, recursion, motion-blur sub-frames) or draws nothing (outside the nested comp's
+    /// span): use the CPU path.
+    pub fn precomp_source(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(Renderer<'a>, ItemId, Tick, f64)> {
+        let effectcraft_project::LayerSource::Comp { item } = layer.source else { return None };
+        if layer.switches.adjustment || self.project.comp_contains(item, ctx.comp_id) {
+            return None;
+        }
+        let nc = self.project.comp(item)?;
+        let lt = ctx.nested_time(layer);
+        if self.content_times(ctx, layer).is_some() {
+            return None;
+        }
+        if !nc.covers(lt)
+            || self.proxy_for(item).is_some()
+            || !crate::essential_overrides(ctx, layer).is_empty()
+            || crate::footage::frame_blend_mode(ctx, layer) != effectcraft_project::FrameBlend::Off
+        {
+            return None;
+        }
+        let (sub, bs) = self.precomp_renderer(layer, item);
+        Some((sub, item, lt, bs))
     }
 
     /// An adjustment layer's footprint (its source with masks applied, layer space): where

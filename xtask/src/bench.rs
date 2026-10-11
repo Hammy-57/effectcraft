@@ -13,15 +13,19 @@ use std::time::Instant;
 
 use serde_json::{Value, json};
 
+#[path = "bench_gpu.rs"]
+mod gpu;
+
 const HELP: &str = "usage: cargo xtask bench [options]
 
 Renders generated scenarios with effectcraft-cli and records memory, CPU and wall time.
 Run it under `nice -n 10` on a busy machine; the table notes the load average of every run.
 
+  --gpu                 RT0 suite: completed GPU viewer p50/p95 + CPU/GPU stage traces; builds the profiling CLI unless --bin is supplied
   --bin PATH            use this effectcraft-cli binary. Without it, effectcraft-cli is built once
                         with `cargo build --profile local` into target/bench (its own target dir:
                         the first build compiles everything, later ones are incremental)
-  --scenario a,b        only these scenarios: demo, layers, precomps, footage (default: all)
+  --scenario a,b        GPU: footage-4k,mograph-1080,adv3d-1080; otherwise: demo, layers, precomps, footage (default: all)
   --project F --comp C  benchmark this project's comp (name or id) instead of the scenarios
   --start S             first frame time in seconds for --project (default 0)
   --frames N            frames per Full / Half render (default 60; --quick: 8)
@@ -48,6 +52,7 @@ struct Opts {
     start: f64,
     frames: Option<u32>,
     quick: bool,
+    gpu: bool,
     format: String,
     regen: bool,
     compare: Option<PathBuf>,
@@ -67,6 +72,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             "--start" => o.start = val("--start")?.parse().map_err(|_| "--start: seconds expected")?,
             "--frames" => o.frames = Some(val("--frames")?.parse().map_err(|_| "--frames: a number expected")?),
             "--quick" => o.quick = true,
+            "--gpu" => o.gpu = true,
             "--format" => o.format = val("--format")?,
             "--regen" => o.regen = true,
             "--compare" => o.compare = Some(PathBuf::from(val("--compare")?)),
@@ -96,6 +102,9 @@ pub fn run(root: &Path, args: &[String]) -> Result<(), String> {
         let (old, new) = (read_jsonl(old)?, read_jsonl(new)?);
         print!("{}", compare_table(&latest_per_key(&old), &latest_per_key(&new)));
         return Ok(());
+    }
+    if o.gpu {
+        return gpu::run(root, &o);
     }
     let dir = root.join("target").join("bench");
     std::fs::create_dir_all(dir.join("projects")).map_err(|e| format!("{}: {e}", dir.display()))?;

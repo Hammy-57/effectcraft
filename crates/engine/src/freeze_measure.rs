@@ -17,8 +17,9 @@ pub fn measure(
 ) -> Option<Sample> {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let rate = version.frame_rate;
-        let first = rate.frame_at(section.start);
-        let last = rate.frame_at(section.end - effectcraft_time::Tick(1));
+        let (range_start, range_end) = section.range(project.comp(section.target.comp())?.duration).ok()?;
+        let first = rate.frame_at(range_start);
+        let last = rate.frame_at(range_end - effectcraft_time::Tick(1));
         let frames = std::collections::BTreeSet::from([first, first.saturating_add(last.saturating_sub(first) / 2), last]);
         let mut frozen_project = project.clone();
         let mut frozen_section = section.clone();

@@ -239,6 +239,33 @@ fn h264_mp4_probe_and_frames() {
     assert!(pool.stats().bytes <= pool.stats().frames * (1920 * 1080 * 3 / 2 + 64), "{:?}", pool.stats());
 }
 
+/// A reduced-resolution render's movie frames are converted at its size: they match resampling
+/// the full frames (testsrc2's saturated colours clip, where the two differ most), and are cached
+/// per size.
+#[test]
+fn h264_frames_at_reduced_sizes() {
+    let Some(p) = h264_mp4() else { return };
+    let f = probe(&p).expect("probe");
+    let pool = MediaPool::new();
+    for (n, (w, h)) in [(0i64, (960, 540)), (1, (640, 360)), (2, (480, 270)), (30, (323, 182))] {
+        let t = t_of(f.frame_rate, n);
+        let scale = w as f64 / f.width as f64;
+        let preview = pool.preview_frame(ItemId(1), &f, t, f.width, f.height, scale).expect("frame");
+        assert!(preview.preview, "resampled by the pool");
+        let sized = preview.px.image().expect("float pixels").clone();
+        let full = pool.frame(ItemId(1), &f, t).expect("frame");
+        assert_eq!((sized.width, sized.height), (w, h));
+        let db = psnr(&sized, &effectcraft_raster::resample(&full, w, h));
+        eprintln!("h264 frame {n} at {w}×{h}: {db:.2} dB against the resampled full frame");
+        // Converting at half size averages before the YUV→RGB clip, so saturated pixels differ
+        // slightly; how much depends on the encoder that made the fixture (50 dB with x264 from
+        // ffmpeg 6.1, above 55 with newer ones), all well past visible.
+        assert!(db > 45.0, "frame {n} at {w}×{h}: {db:.2} dB");
+        let again = pool.preview_frame(ItemId(1), &f, t, f.width, f.height, scale).expect("frame");
+        assert!(Arc::ptr_eq(&preview.px, &again.px), "cached");
+    }
+}
+
 #[test]
 fn h264_audio_samples() {
     let Some(p) = h264_mp4() else { return };
@@ -538,10 +565,15 @@ fn rayon_workers_wait_for_an_in_flight_frame() {
     let f = probe(&p).expect("probe");
     let pool = MediaPool::new();
     let workers = rayon::ThreadPoolBuilder::new().num_threads(10).build().expect("pool");
+    // Read frame 39 first, so the shared decode of frame 40 is one step of an open decoder: a
+    // decode from the keyframe can outlast the workers' stall timeout when the machine is busy
+    // (the full suite), and then they decode private copies.
+    pool.frame_at(&f, t_of(f.frame_rate, 39)).expect("frame 39");
+    let before = pool.stats();
     let t = t_of(f.frame_rate, 40);
     let frames: Vec<Arc<Image>> = workers.install(|| (0..10).into_par_iter().with_max_len(1).map(|_| pool.frame_at(&f, t).expect("frame")).collect());
     let st = pool.stats();
-    assert_eq!((st.misses, st.hits), (1, 9), "{st:?}");
+    assert_eq!((st.misses - before.misses, st.hits - before.hits), (1, 9), "{st:?}");
     assert!(frames.iter().all(|img| img.data == frames[0].data));
     let db = psnr(&frames[0], &reference_frame(&p, 40));
     assert!(db > 35.0, "frame 40: {db:.2} dB");

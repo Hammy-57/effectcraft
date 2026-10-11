@@ -6,7 +6,6 @@
 use std::sync::{Mutex, OnceLock};
 
 use effectcraft_effects::psim::{ParticleSystem, SimParticle, SimRequest};
-use wgpu::util::DeviceExt;
 
 use crate::context::GpuContext;
 
@@ -34,42 +33,53 @@ pub(crate) struct Checkpoints {
     clock: u64,
 }
 
-fn pipes(g: &GpuContext) -> &Pipes {
-    g.particles.get_or_init(|| {
-        let d = &g.device;
-        let src = [include_str!("shaders/common.wgsl"), include_str!("shaders/kernels.wgsl"), include_str!("shaders/particles.wgsl")].concat();
-        let module =
-            d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("effectcraft particles"), source: wgpu::ShaderSource::Wgsl(src.into()) });
-        let buffer = |binding: u32, ty: wgpu::BufferBindingType| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None },
-            count: None,
-        };
-        let bgl = d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("effectcraft particles"),
-            entries: &[
-                buffer(0, wgpu::BufferBindingType::Uniform),
-                buffer(1, wgpu::BufferBindingType::Storage { read_only: true }),
-                buffer(2, wgpu::BufferBindingType::Storage { read_only: true }),
-                buffer(3, wgpu::BufferBindingType::Storage { read_only: false }),
-            ],
-        });
-        let layout = d.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("effectcraft particles"),
-            bind_group_layouts: &[None, Some(&bgl)],
-            immediate_size: 0,
-        });
-        let pipe = d.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("particles"),
-            layout: Some(&layout),
-            module: &module,
-            entry_point: Some("particles"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-        Pipes { bgl, pipe }
-    })
+fn pipes(g: &GpuContext) -> Result<&Pipes, String> {
+    g.particles
+        .get_or_init(|| {
+            let pipes = crate::context::init_resource(&g.device, "particle pipeline", || {
+                let d = &g.device;
+                let src = [include_str!("shaders/common.wgsl"), include_str!("shaders/kernels.wgsl"), include_str!("shaders/particles.wgsl")].concat();
+                let module =
+                    d.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("effectcraft particles"), source: wgpu::ShaderSource::Wgsl(src.into()) });
+                let buffer = |binding: u32, ty: wgpu::BufferBindingType| wgpu::BindGroupLayoutEntry {
+                    binding,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                };
+                let bgl = d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("effectcraft particles"),
+                    entries: &[
+                        buffer(0, wgpu::BufferBindingType::Uniform),
+                        buffer(1, wgpu::BufferBindingType::Storage { read_only: true }),
+                        buffer(2, wgpu::BufferBindingType::Storage { read_only: true }),
+                        buffer(3, wgpu::BufferBindingType::Storage { read_only: false }),
+                    ],
+                });
+                let layout = d.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("effectcraft particles"),
+                    bind_group_layouts: &[None, Some(&bgl)],
+                    immediate_size: 0,
+                });
+                let pipe = d.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("particles"),
+                    layout: Some(&layout),
+                    module: &module,
+                    entry_point: Some("particles"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                });
+                Pipes { bgl, pipe }
+            })?;
+            g.static_pipeline_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(pipes)
+        })
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
+pub(crate) fn warm(g: &GpuContext) -> Result<(), String> {
+    pipes(g).map(|_| ())
 }
 
 /// The shader's parameter block.
@@ -136,7 +146,7 @@ pub(crate) fn simulate(g: &GpuContext, req: &SimRequest) -> Option<Vec<SimPartic
     if size > g.device.limits().max_storage_buffer_binding_size {
         return None;
     }
-    let p = pipes(g);
+    let p = pipes(g).ok()?;
     // The latest checkpoint at or before the target step.
     let (s0, prev, prev_n) = {
         let mut c = g.particle_states.lock().ok()?;
@@ -152,7 +162,7 @@ pub(crate) fn simulate(g: &GpuContext, req: &SimRequest) -> Option<Vec<SimPartic
     };
     let d = &g.device;
     let births: Vec<u8> = req.births.iter().flat_map(|b| b.to_le_bytes()).collect();
-    let births = d.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("births"), contents: &births, usage: wgpu::BufferUsages::STORAGE });
+    let births = g.buffer_init(Some("births"), &births, wgpu::BufferUsages::STORAGE);
     let prev = prev.unwrap_or_else(|| {
         d.create_buffer(&wgpu::BufferDescriptor { label: Some("particles"), size: STATE_BYTES, usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false })
     });
@@ -162,11 +172,7 @@ pub(crate) fn simulate(g: &GpuContext, req: &SimRequest) -> Option<Vec<SimPartic
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
-    let ub = d.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("particles"),
-        contents: &uniforms(req, n, s0, prev_n),
-        usage: wgpu::BufferUsages::UNIFORM,
-    });
+    let ub = g.buffer_init(Some("particles"), &uniforms(req, n, s0, prev_n), wgpu::BufferUsages::UNIFORM);
     let bg = d.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
         layout: &p.bgl,
@@ -245,5 +251,5 @@ fn keep_checkpoint(g: &GpuContext, req: &SimRequest, n: u32, next: wgpu::Buffer)
     }
 }
 
-pub(crate) type PipesCell = OnceLock<Pipes>;
+pub(crate) type PipesCell = OnceLock<Result<Pipes, String>>;
 pub(crate) type StatesCell = Mutex<Checkpoints>;

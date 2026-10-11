@@ -65,6 +65,16 @@ impl FrameImage {
     }
 }
 
+/// A CPU frame's pixels as premultiplied RGBA bytes, shared with the RAM cache (`Color32` is
+/// premultiplied RGBA already): what a frame worker hands the disk cache's writer thread.
+struct ColorBytes(Arc<egui::ColorImage>);
+
+impl AsRef<[u8]> for ColorBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_raw()
+    }
+}
+
 /// A viewer frame: its comp's content, the frame, scale, view and render options. `revision` is
 /// the project revision it was asked for at (job bookkeeping); it is not part of the identity, so
 /// a later revision with the same content finds the frame.
@@ -112,6 +122,7 @@ impl std::hash::Hash for FrameKey {
 struct Cache {
     map: HashMap<FrameKey, FrameImage>,
     order: VecDeque<FrameKey>,
+    protected: HashMap<FrameKey, usize>,
     bytes: usize,
     /// Bytes of GPU frames (also counted in `bytes`).
     gpu_bytes: usize,
@@ -135,16 +146,13 @@ impl Cache {
         if gpu {
             self.gpu_bytes += sz;
         }
-        while self.bytes > self.budget {
-            let Some(old) = self.order.pop_front() else { break };
-            self.remove(&old);
-        }
+        self.evict_to_budget();
         self.evict_gpu();
     }
     /// Video memory: drop the oldest GPU frames past their own budget.
     fn evict_gpu(&mut self) {
         while self.gpu_bytes > self.gpu_budget {
-            let Some(i) = self.order.iter().position(|k| self.map.get(k).is_some_and(FrameImage::is_gpu)) else { break };
+            let Some(i) = self.eviction_index(true) else { break };
             if let Some(old) = self.order.remove(i) {
                 self.remove(&old);
             }
@@ -183,9 +191,18 @@ impl Cache {
         }
         self.order.retain(|k| !gone.contains(&k.content));
     }
+    fn eviction_index(&self, gpu_only: bool) -> Option<usize> {
+        let eligible = |k: &FrameKey| !gpu_only || self.map.get(k).is_some_and(FrameImage::is_gpu);
+        self.order.iter().position(|k| eligible(k) && !self.protected.contains_key(k)).or_else(|| {
+            // If the window itself does not fit, sacrifice its furthest frame, not the playhead.
+            self.order.iter().enumerate().filter(|(_, k)| eligible(k)).max_by_key(|(_, k)| self.protected.get(*k).copied().unwrap_or(0)).map(|(i, _)| i)
+        })
+    }
+
     fn evict_to_budget(&mut self) {
         while self.bytes > self.budget {
-            let Some(old) = self.order.pop_front() else { break };
+            let Some(i) = self.eviction_index(false) else { break };
+            let Some(old) = self.order.remove(i) else { break };
             self.remove(&old);
         }
     }
@@ -311,8 +328,11 @@ fn hash_debug(h: &mut impl std::hash::Hasher, v: &impl std::fmt::Debug) {
     h.write_u8(0xff);
 }
 
-/// Hash of render options (part of [`FrameKey`] and of the disk key).
+/// Hash of render options (part of [`FrameKey`] and of the disk key). The scale counts as the
+/// key's thousandths ([`FrameKey::scale`]): a series rebuilt from the key (the cache bars) has
+/// the same options as the frames rendered at 1/3 = 0.333… (#595).
 pub fn opts_hash(o: &RenderOpts) -> u64 {
+    let o = RenderOpts { scale: (o.scale * 1000.0).round() / 1000.0, ..*o };
     let mut h = disk_cache::Hash128::default();
     h.write(format!("{o:?}").as_bytes());
     h.finish() as u64
@@ -390,6 +410,22 @@ type Failed = Arc<Mutex<HashSet<(FrameKey, u64)>>>;
 /// Failed frames remembered at most (then forgotten, so retried once).
 const MAX_FAILED: usize = 256;
 
+#[cfg(not(target_arch = "wasm32"))]
+struct BackgroundPermit {
+    busy: Arc<AtomicBool>,
+    ctx: Option<egui::Context>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for BackgroundPermit {
+    fn drop(&mut self) {
+        self.busy.store(false, Ordering::Release);
+        if let Some(ctx) = &self.ctx {
+            ctx.request_repaint();
+        }
+    }
+}
+
 pub struct Frames {
     cache: Arc<Mutex<Cache>>,
     /// Keys queued or rendering.
@@ -403,9 +439,12 @@ pub struct Frames {
     #[cfg(not(target_arch = "wasm32"))]
     /// None if the OS refused the threads: jobs then go to rayon's global pool.
     pool: Option<Arc<rayon::ThreadPool>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    background_running: Arc<AtomicBool>,
     ctx: Option<egui::Context>,
     /// Render time of the last viewer (urgent) frame in ms, for the Info panel / perf readout.
     pub last_ms: Arc<Mutex<f64>>,
+    playback_budget: Arc<Mutex<crate::playback_budget::Budget>>,
     content_keys: ContentKeys,
     gpu_retired: Arc<AtomicBool>,
     /// [`comp_content`] identities by (revision, comp), with the project that keeps an identity
@@ -447,7 +486,7 @@ impl Default for Frames {
         #[cfg(not(target_arch = "wasm32"))]
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 16);
         Frames {
-            cache: Arc::new(Mutex::new(Cache { map: HashMap::new(), order: VecDeque::new(), bytes: 0, gpu_bytes: 0, budget: 3 << 30, gpu_budget: GPU_BUDGET, generation: 0 })),
+            cache: Arc::new(Mutex::new(Cache { map: HashMap::new(), order: VecDeque::new(), protected: HashMap::new(), bytes: 0, gpu_bytes: 0, budget: 3 << 30, gpu_budget: GPU_BUDGET, generation: 0 })),
             inflight: Arc::new(Mutex::new(HashSet::new())),
             failed: Failed::default(),
             queue: Arc::new(Mutex::new(Queue::default())),
@@ -461,8 +500,11 @@ impl Default for Frames {
                 .build()
                 .ok()
                 .map(Arc::new),
+            #[cfg(not(target_arch = "wasm32"))]
+            background_running: Arc::default(),
             ctx: None,
             last_ms: Arc::new(Mutex::new(0.0)),
+            playback_budget: Arc::default(),
             content_keys: Arc::default(),
             gpu_retired: Arc::default(),
             identities: Mutex::default(),
@@ -586,11 +628,24 @@ pub fn load_fitted(ctx: &egui::Context, name: impl Into<String>, img: egui::Colo
 }
 
 impl Frames {
+    #[cfg(test)]
+    pub(crate) fn playback_sample(&self, key: FrameKey, ms: f64) {
+        let mut budget = self.playback_budget.lock().unwrap();
+        if let Some(ticket) = budget.ticket(key) {
+            budget.record(ticket, ms, false);
+        }
+    }
+
+    pub(crate) fn adapt_playback(&self, config: Option<crate::playback_budget::Config>) -> bool {
+        self.playback_budget.lock().unwrap_or_else(std::sync::PoisonError::into_inner).configure(config)
+    }
+
     /// Retire only GPU preview state; documents, CPU frames and running job leases survive.
     /// Publication checks the same latch while holding the cache lock, so a late GPU frame
     /// cannot restore an invalid texture after this removal.
     pub fn retire_gpu(&self) {
         self.gpu_retired.store(true, Ordering::Release);
+        self.adapt_playback(None);
         if let Ok(mut cache) = self.cache.lock() {
             let keys: Vec<_> = cache.map.iter().filter_map(|(key, image)| image.is_gpu().then_some(*key)).collect();
             for key in keys {
@@ -602,6 +657,27 @@ impl Frames {
         if let Some(ctx) = &self.ctx {
             ctx.request_repaint();
         }
+    }
+
+    /// One auxiliary render across all layers, admitted before Rayon can nest it inside
+    /// another render's parallel pixel loop (#586/#647). Rejected callers retry on repaint.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn try_spawn_background(&self, task: impl FnOnce() + Send + 'static) -> bool {
+        if self.background_running.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return false;
+        }
+        let permit = BackgroundPermit { busy: self.background_running.clone(), ctx: self.ctx.clone() };
+        let run = move || {
+            let _permit = permit;
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(task)).is_err() {
+                log::error!("an auxiliary preview render panicked; its slot was released");
+            }
+        };
+        match &self.pool {
+            Some(pool) => pool.spawn(run),
+            None => rayon::spawn(run),
+        }
+        true
     }
 
     /// Actual native frame-worker capacity, including the OS fallback pool.
@@ -630,6 +706,42 @@ impl Frames {
         let img = c.map.get(k).cloned()?;
         c.touch(k);
         Some(img)
+    }
+
+    /// Prefer the exact requested frame. While an edit renders, advance to the newest completed
+    /// revision of the same comp, time, scale, view and render options instead of freezing on the
+    /// image from before the drag. Input may arrive before the viewer draws on every UI frame,
+    /// so even a fast worker cannot always finish the *latest* revision in time.
+    ///
+    /// Never move backwards when workers finish out of order, and never substitute another time
+    /// or view while scrubbing or switching comps. The exact content lookup above also means an
+    /// undo can immediately reuse an old cache entry, regardless of its original revision.
+    pub fn get_for_viewer(&self, wanted: &FrameKey, shown: Option<&FrameKey>) -> Option<(FrameKey, FrameImage)> {
+        if let Some(img) = self.get(wanted) {
+            return Some((*wanted, img));
+        }
+        let shown = shown?;
+        if shown.comp != wanted.comp || shown.frame != wanted.frame || shown.view != wanted.view || shown.revision >= wanted.revision {
+            return None;
+        }
+        let mut c = self.cache.lock().ok()?;
+        let newest = c
+            .map
+            .keys()
+            .filter(|k| {
+                k.revision > shown.revision
+                    && k.revision < wanted.revision
+                    && k.comp == wanted.comp
+                    && k.frame == wanted.frame
+                    && k.scale == wanted.scale
+                    && k.view == wanted.view
+                    && k.opts == wanted.opts
+            })
+            .max_by_key(|k| k.revision)
+            .copied()?;
+        let img = c.map.get(&newest).cloned()?;
+        c.touch(&newest);
+        Some((newest, img))
     }
 
     /// The [`comp_content`] identity of `comp` in `project` at `revision` (taken once per
@@ -764,11 +876,21 @@ impl Frames {
         }
     }
 
+    /// Keep the playhead and its immediate look-ahead ahead of speculative frames for eviction.
+    /// This never overrides either memory budget, even if the whole window does not fit.
+    pub fn protect_frames(&self, base: FrameKey, frames: impl IntoIterator<Item = i64>) {
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.protected.clear();
+            cache.protected.extend(frames.into_iter().enumerate().map(|(rank, frame)| (FrameKey { frame, ..base }, rank)));
+        }
+    }
+
     pub fn budget(&self) -> usize {
         self.cache.lock().map(|c| c.budget).unwrap_or(0)
     }
 
     pub fn clear(&self) {
+        self.adapt_playback(None);
         if let Some(r) = &self.remote {
             r.purge();
         }
@@ -778,6 +900,12 @@ impl Frames {
             c.order.clear();
             c.bytes = 0;
             c.gpu_bytes = 0;
+        }
+        // Disk keys hash the footage files' size and time, but are remembered per revision; a
+        // file reloaded from disk without a new revision (a re-rendered image sequence) must be
+        // keyed again, or the disk cache serves the frames from before.
+        if let Ok(mut k) = self.content_keys.lock() {
+            k.clear();
         }
         if let Ok(mut f) = self.failed.lock() {
             f.clear();
@@ -820,8 +948,9 @@ impl Frames {
             // Only the newest viewer frame is urgent. The comp's earlier viewer frames that
             // haven't started are dropped (scrubbing: rendering every frame the pointer passed
             // would hold the workers the frame under it needs); frames already rendering finish
-            // into the cache, and the viewer shows its last frame until the new one is in
-            // (#284). Other comps' viewer frames become prefetch.
+            // into the cache. During edits the viewer advances through compatible completed
+            // revisions; scrubbing holds its last frame until the requested time is in (#284).
+            // Other comps' viewer frames become prefetch.
             q.jobs.retain(|j| {
                 let superseded = j.urgent && j.key != key && j.key.comp == key.comp;
                 if superseded {
@@ -843,7 +972,7 @@ impl Frames {
         drop(q);
         #[cfg(not(target_arch = "wasm32"))]
         if self.remote.is_none() {
-            // One spawn per job; each spawn renders whichever queued job matters most right now.
+            // One spawn per job; each spawn renders whichever queued jobs matter most right now.
             self.worker().spawn_next();
         }
         #[cfg(target_arch = "wasm32")]
@@ -861,6 +990,7 @@ impl Frames {
             failed: self.failed.clone(),
             ctx: self.ctx.clone(),
             last: self.last_ms.clone(),
+            playback_budget: self.playback_budget.clone(),
             content_keys: self.content_keys.clone(),
             gpu_retired: self.gpu_retired.clone(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -1009,6 +1139,7 @@ struct Worker {
     failed: Failed,
     ctx: Option<egui::Context>,
     last: Arc<Mutex<f64>>,
+    playback_budget: Arc<Mutex<crate::playback_budget::Budget>>,
     content_keys: ContentKeys,
     gpu_retired: Arc<AtomicBool>,
     /// The pool frames render on (`None`: rayon's global pool).
@@ -1016,18 +1147,52 @@ struct Worker {
     pool: Option<Arc<rayon::ThreadPool>>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+thread_local! {
+    /// This pool thread is inside [`Worker::drain`] (rendering a frame).
+    static DRAINING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Clears [`DRAINING`] when the drain ends, even by a panic.
+#[cfg(not(target_arch = "wasm32"))]
+struct Draining;
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for Draining {
+    fn drop(&mut self) {
+        DRAINING.set(false);
+    }
+}
+
 impl Worker {
-    /// Run [`Worker::run_next`] on the frame pool.
+    /// Run [`Worker::drain`] on the frame pool.
     #[cfg(not(target_arch = "wasm32"))]
     fn spawn_next(&self) {
         let w = self.clone();
-        let job = move || {
-            w.run_next();
-        };
+        let job = move || w.drain();
         match &self.pool {
             Some(pool) => pool.spawn(job),
             None => rayon::spawn(job),
         }
+    }
+
+    /// Render queued jobs, most important first, until the queue is empty (or the next job has
+    /// to wait for memory).
+    ///
+    /// A pool thread waiting inside a render (on a parallel loop's join) runs other pool work
+    /// meanwhile, including the spawns of newer requests: each would start a whole frame render
+    /// on top of the one waiting, with all of its buffers. Dragging a layer asks for a new frame
+    /// every UI frame, so renders piled up on every thread until memory ran out (#647). A spawn
+    /// that lands inside a render returns at once instead; the render below it takes the queued
+    /// jobs when it is done, so each thread renders one frame at a time.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn drain(&self) {
+        if DRAINING.get() {
+            return;
+        }
+        DRAINING.set(true);
+        let _reset = Draining;
+        while self.run_next() {}
     }
 
     /// Render the queued job that matters most right now. `false` when the queue was empty, or
@@ -1038,13 +1203,11 @@ impl Worker {
             let Ok(mut q) = queue.lock() else { return false };
             let Some(i) = Queue::best(&q.jobs) else { return false };
             let j = &q.jobs[i];
-            // Prefetch waits while the frames already rendering would take more memory than the
-            // budget allows; the viewer's frame never waits. (wasm32 renders one frame at a time
-            // on the UI thread.) It waits in the queue, not on this thread: rayon runs queued
-            // spawns nested inside renders on the same pool, so a spawn blocked here could sit on
-            // top of the very render it waits for, and with every worker doing that nothing
-            // finished: playback held at the end of the cached frames forever.
-            if !(cfg!(target_arch = "wasm32") || j.urgent || q.running.len() < max_running(j)) {
+            // Keep one viewer slot beyond the prefetch budget, but never nest another viewer
+            // render inside it. Rayon can run queued jobs inside a parallel render: unlimited
+            // urgent jobs then retain every obsolete frame's buffers during a drag (#647).
+            // Wait in the queue, never on a pool thread needed by an unfinished render.
+            if !cfg!(target_arch = "wasm32") && !q.can_start(j) {
                 q.parked += 1;
                 return false;
             }
@@ -1059,6 +1222,8 @@ impl Worker {
         let disk = job.src.disk.as_ref().map(|dc| (dc.clone(), frame_disk_key(content_keys, &job.src.project, &job.key, opts_hash(&job.opts))));
         let from_disk = disk.as_ref().and_then(|(dc, k)| dc.get_frame(*k));
         let disk_hit = from_disk.is_some();
+        let ticket = self.playback_budget.lock().unwrap_or_else(std::sync::PoisonError::into_inner).ticket(job.key);
+        let service_start = web_time::Instant::now();
         let ci = match from_disk {
             Some(f) => FrameImage::Cpu(Arc::new(egui::ColorImage::from_rgba_premultiplied([f.width as usize, f.height as usize], &f.rgba))),
             None => match self.render_guarded(&job) {
@@ -1070,17 +1235,27 @@ impl Worker {
                 }
             },
         };
+        if !disk_hit
+            && !(ci.is_gpu() && self.gpu_retired.load(Ordering::Acquire))
+            && let Some(ticket) = ticket
+        {
+            self.playback_budget.lock().unwrap_or_else(std::sync::PoisonError::into_inner).record(
+                ticket,
+                service_start.elapsed().as_secs_f64() * 1000.0,
+                ci.is_gpu(),
+            );
+        }
         let render_time = t0.elapsed();
-        // Publish the shared frame and wake the viewer before compression. Persistence still
-        // runs on this worker, using the same snapshot.
+        // Publish the shared frame and wake the viewer first; the disk cache's writer thread
+        // compresses and writes the same snapshot.
         self.finish(&job, ci.clone(), t0);
         let backlog = queue.lock().map(|q| q.jobs.iter().filter(|j| !j.urgent).count()).unwrap_or(0);
         if !disk_hit
             && keep_on_disk(render_time, job.urgent, backlog)
             && let (Some((dc, k)), FrameImage::Cpu(img)) = (&disk, &ci)
         {
-            // `Color32` is premultiplied RGBA bytes already: no copy before compression.
-            dc.put_frame(*k, img.size[0] as u32, img.size[1] as u32, img.as_raw());
+            // Hands over a reference to the frame (no copy, no compression here).
+            dc.put_frame(*k, img.size[0] as u32, img.size[1] as u32, ColorBytes(img.clone()));
             if let Some(ctx) = &self.ctx {
                 ctx.request_repaint();
             }
@@ -1282,6 +1457,11 @@ struct Queue {
 }
 
 impl Queue {
+    fn can_start(&self, job: &Job) -> bool {
+        let limit = max_running(job);
+        if job.urgent { self.urgent_running == 0 && self.running.len() <= limit } else { self.running.len() < limit }
+    }
+
     /// The job that matters most: urgent first (newest), then prefetch in request order.
     fn best(jobs: &[Job]) -> Option<usize> {
         jobs.iter().enumerate().max_by_key(|(_, j)| (j.urgent, if j.urgent { j.seq as i64 } else { -(j.seq as i64) })).map(|(i, _)| i)
@@ -1291,6 +1471,38 @@ impl Queue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn auxiliary_renders_cannot_nest_and_panics_release_the_shared_slot() {
+        let frames = Arc::new(Frames::default());
+        let nested = frames.clone();
+        let (started, rx) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        assert!(frames.try_spawn_background(move || {
+            started.send(nested.try_spawn_background(|| {})).unwrap();
+            wait.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        }));
+        assert!(!rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap(), "a nested pool job cannot acquire a second slot");
+        for _ in 0..100 {
+            assert!(!frames.try_spawn_background(|| {}), "other selected layers must wait outside the pool");
+        }
+        release.send(()).unwrap();
+        let idle = || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while frames.background_running.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(!frames.background_running.load(Ordering::Acquire), "the auxiliary slot was not released");
+        };
+        idle();
+        assert!(frames.try_spawn_background(|| panic!("synthetic auxiliary render failure")));
+        idle();
+        let (done, rx) = std::sync::mpsc::channel();
+        assert!(frames.try_spawn_background(move || done.send(()).unwrap()));
+        rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        idle();
+    }
 
     /// Frames larger than the texture limit are averaged down by a whole factor (#201: an
     /// 11000×2200 comp at Full resolution against an 8192 limit).
@@ -1498,6 +1710,114 @@ mod tests {
         assert_eq!(max_running(&job(ItemId(9999), 1.0, gib)), gib, "no comp: nothing to bound");
     }
 
+    /// #647: a viewer frame can jump past busy prefetch, but a drag cannot start an
+    /// unbounded stack of obsolete urgent renders through rayons nested job execution.
+    #[test]
+    fn dragging_keeps_only_one_running_viewer_render() {
+        let f = Frames::default();
+        let worker = f.worker();
+        let src = RenderSource {
+            freeze_feedback: Default::default(),
+            project: Arc::default(),
+            footage: Arc::new(effectcraft_engine::render::NoFootage),
+            expr: None,
+            layer_cache: Arc::new(LayerCache::new(1)),
+            gpu: None,
+            gpu_display: false,
+            disk: None,
+        };
+        let old = key(1, 0, 0);
+        let latest = key(2, 0, 0);
+        let mut q = f.queue.lock().unwrap();
+        q.running.insert(old);
+        q.urgent_running = 1;
+        q.jobs.push(Job { key: latest, src, comp: ItemId(1), t: Tick::ZERO, opts: RenderOpts::default(), urgent: true, seq: 2 });
+        assert!(!q.can_start(&q.jobs[0]), "one urgent render is already in progress");
+        drop(q);
+        assert!(!worker.run_next(), "obsolete render must finish before allocating another frame");
+        let mut q = f.queue.lock().unwrap();
+        assert_eq!(q.jobs.len(), 1, "latest request remains queued");
+        q.urgent_running = 0;
+        assert!(q.can_start(&q.jobs[0]), "one reserved viewer slot beyond prefetch");
+        q.running.insert(key(3, 0, 0));
+        assert!(!q.can_start(&q.jobs[0]), "the reserve cannot exceed one frame");
+    }
+
+    /// #647: a pool thread waiting inside a render (on a parallel loop) never starts another
+    /// frame render on top of it. Dragging a layer queues a frame every UI frame; renders used to
+    /// nest on every thread, each holding its buffers, until memory ran out.
+    #[test]
+    fn a_waiting_render_never_starts_another_on_its_thread() {
+        use effectcraft_engine::Session;
+        use effectcraft_engine::project::{Footage, FootageKind};
+        use effectcraft_engine::render::Image;
+        use effectcraft_engine::time::FrameRate;
+        use serde_json::json;
+        use std::cell::Cell;
+        use std::sync::atomic::AtomicUsize;
+        thread_local! {
+            static DEPTH: Cell<usize> = const { Cell::new(0) };
+        }
+        /// A decoder that works in parallel, as the renderer does: its thread joins the loop and
+        /// may wait for the parts other threads took.
+        #[derive(Default)]
+        struct Parallel {
+            calls: AtomicUsize,
+            deepest: AtomicUsize,
+        }
+        impl FootageSource for Parallel {
+            fn frame(&self, _: ItemId, _: &Footage, _: Tick) -> Option<Arc<Image>> {
+                let d = DEPTH.get() + 1;
+                DEPTH.set(d);
+                self.deepest.fetch_max(d, Ordering::SeqCst);
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                (0..64).into_par_iter().for_each(|_| std::thread::sleep(std::time::Duration::from_millis(1)));
+                DEPTH.set(d - 1);
+                Some(Arc::new(Image::new(4, 4)))
+            }
+        }
+        let mut s = Session::default();
+        let cid = ItemId(s.execute("comp.new", json!({"name": "A", "width": 8, "height": 8, "duration": 10})).unwrap()["comp"].as_u64().unwrap());
+        let clip = Footage {
+            kind: FootageKind::Video,
+            width: 4,
+            height: 4,
+            has_video: true,
+            frame_rate: FrameRate::FPS_30,
+            duration: Tick::from_seconds_f64(10.0),
+            ..Default::default()
+        };
+        let item = Arc::make_mut(&mut s.project).add_item("clip.mov", Default::default(), None, ItemKind::Footage(clip));
+        s.execute("layer.addItem", json!({"item": item.0})).unwrap();
+        let footage = Arc::new(Parallel::default());
+        let src = RenderSource {
+            freeze_feedback: Default::default(),
+            project: s.project.clone(),
+            footage: footage.clone(),
+            expr: None,
+            layer_cache: Arc::default(),
+            gpu: None,
+            gpu_display: false,
+            disk: None,
+        };
+        let f = Frames::default();
+        let content = f.content_of(&s.project, s.revision, cid);
+        let frames = 60;
+        for frame in 0..frames {
+            let key = FrameKey { revision: s.revision, content, comp: cid.0, frame, scale: 1000, view: 0, opts: 0 };
+            f.request(&src, key, cid, FrameRate::FPS_30.tick_of(frame), RenderOpts::default());
+        }
+        for _ in 0..4000 {
+            if f.inflight() == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(f.inflight(), 0, "every queued frame rendered");
+        assert!(footage.calls.load(Ordering::SeqCst) >= frames as usize);
+        assert_eq!(footage.deepest.load(Ordering::SeqCst), 1, "renders nested on a waiting thread");
+    }
+
     /// #284: scrubbing asks for a viewer frame at every step; a newer one drops the comp's viewer
     /// frames still waiting (they would all render first), but not prefetch frames or another
     /// comp's viewer frame.
@@ -1564,6 +1884,32 @@ mod tests {
         assert!(f.is_cached(&key(1, 2, 0)) && f.is_cached(&key(1, 3, 0)));
     }
 
+    /// #595: finishing far-ahead jobs must not evict the next frame playback is waiting for.
+    #[test]
+    fn playback_window_survives_speculative_frames_within_the_budget() {
+        let f = Frames::default();
+        f.set_budget(3 * 16);
+        f.protect_frames(key(1, 0, 0), [0, 1]);
+        insert(&f, key(1, 0, 0));
+        insert(&f, key(1, 1, 0));
+        for frame in 100..200 {
+            insert(&f, key(1, frame, 0));
+        }
+        assert!(f.is_cached(&key(1, 0, 0)));
+        assert!(f.is_cached(&key(1, 1, 0)));
+        assert_eq!(f.cache.lock().unwrap().bytes, 3 * 16);
+        f.protect_frames(key(1, 0, 0), 0..200);
+        for frame in 2..200 {
+            insert(&f, key(1, frame, 0));
+        }
+        assert!(f.is_cached(&key(1, 0, 0)) && f.is_cached(&key(1, 1, 0)), "even when the protected window exceeds memory");
+        f.set_budget(16);
+        assert!(f.cache.lock().unwrap().bytes <= 16, "protection never exceeds the budget");
+        f.protect_frames(key(1, 0, 0), [200, 201]);
+        insert(&f, key(1, 200, 0));
+        assert!(f.is_cached(&key(1, 200, 0)), "protection follows the playhead");
+    }
+
     /// The cache bar's frame lists are remembered, and follow frames coming and going.
     #[test]
     fn cache_bar_follows_the_cache() {
@@ -1626,6 +1972,53 @@ mod tests {
         // A later revision with the same content finds the frame (an edit elsewhere, an undo).
         assert!(f.is_cached(&FrameKey { revision: 99, ..key(1, 0, 0) }));
         assert!(!f.is_cached(&key(3, 0, 0)));
+    }
+
+    #[test]
+    fn live_edits_present_the_newest_completed_revision_without_going_backwards() {
+        let f = Frames::default();
+        let shown = key(1, 0, 0);
+        let newest = key(3, 0, 0);
+        let wanted = key(5, 0, 0);
+        insert(&f, shown);
+        insert(&f, newest);
+        insert(&f, key(2, 0, 0)); // Older worker finishes after the newer one.
+        let displayed = f.get_for_viewer(&wanted, Some(&shown)).unwrap().0;
+        assert_eq!(displayed, newest);
+        assert!(f.get_for_viewer(&wanted, Some(&displayed)).is_none(), "never replay an older completion");
+        insert(&f, wanted);
+        assert_eq!(f.get_for_viewer(&wanted, Some(&displayed)).unwrap().0, wanted, "settle on the exact final edit");
+        // Undo reuses the content of an earlier revision immediately.
+        let undo = FrameKey { revision: 6, ..shown };
+        let reused = f.get_for_viewer(&undo, Some(&wanted)).unwrap().0;
+        assert_eq!(reused.content, shown.content);
+        assert_eq!(reused.revision, undo.revision);
+    }
+
+    #[test]
+    fn live_edits_do_not_substitute_other_times_views_or_render_settings() {
+        let f = Frames::default();
+        let shown = key(1, 0, 0);
+        let wanted = key(3, 0, 0);
+        let done = key(2, 0, 0);
+        for mismatch in [
+            FrameKey { comp: 9, ..done },
+            FrameKey { frame: 1, ..done },
+            FrameKey { scale: 500, ..done },
+            FrameKey { view: 1, ..done },
+            FrameKey { opts: 1, ..done },
+            FrameKey { revision: 4, ..done },
+        ] {
+            f.clear();
+            insert(&f, mismatch);
+            assert!(f.get_for_viewer(&wanted, Some(&shown)).is_none(), "wrong candidate: {mismatch:?}");
+        }
+        f.clear();
+        insert(&f, done);
+        assert!(f.get_for_viewer(&wanted, None).is_none(), "no stale content on opening a viewer");
+        assert!(f.get_for_viewer(&wanted, Some(&FrameKey { comp: 9, ..shown })).is_none());
+        assert!(f.get_for_viewer(&wanted, Some(&FrameKey { frame: 1, ..shown })).is_none());
+        assert!(f.get_for_viewer(&wanted, Some(&FrameKey { view: 1, ..shown })).is_none());
     }
 
     #[test]

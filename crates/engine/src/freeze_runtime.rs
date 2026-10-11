@@ -26,6 +26,8 @@ pub struct Runtime {
     pub proofs: BTreeMap<u64, Proof>,
     pub reasons: BTreeMap<u64, String>,
     pub generation: u64,
+    pub pixel_epochs: BTreeMap<u64, u64>,
+    pixel_keys: Mutex<BTreeMap<(usize, u64, effectcraft_project::ItemId), Option<u64>>>,
     pub pause_until: Arc<AtomicU64>,
     pub render_slot: Arc<Mutex<()>>,
     pub changed: web_time::Instant,
@@ -44,6 +46,8 @@ impl Default for Runtime {
             proofs: BTreeMap::new(),
             reasons: BTreeMap::new(),
             generation: 0,
+            pixel_epochs: BTreeMap::new(),
+            pixel_keys: Mutex::new(BTreeMap::new()),
             pause_until: Arc::default(),
             render_slot: Arc::default(),
             changed: web_time::Instant::now(),
@@ -73,7 +77,43 @@ impl Runtime {
     pub fn accept(&mut self, id: u64, revision: u64, capture: Arc<Capture>) {
         self.proofs.insert(id, Proof { revision, capture, checked: web_time::Instant::now() });
         self.reasons.remove(&id);
+        self.invalidate_section(id);
+    }
+
+    pub fn invalidate_section(&mut self, id: u64) {
+        let epoch = self.pixel_epochs.entry(id).or_default();
+        *epoch = epoch.saturating_add(1);
         self.generation = self.generation.saturating_add(1);
+    }
+
+    /// Pixel changes outside document edits, scoped to the viewer's reachable sections.
+    /// Memoization keeps dependency walks out of steady-state UI frames.
+    pub fn pixel_epoch(&self, project: &Arc<Project>, comp: effectcraft_project::ItemId) -> Option<u64> {
+        if self.pixel_epochs.is_empty() || project.freeze.sections.is_empty() {
+            return None;
+        }
+        let fonts = effectcraft_text::fonts::revision();
+        let key = (Arc::as_ptr(project) as usize, self.generation.saturating_add(fonts), comp);
+        let mut keys = self.pixel_keys.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(value) = keys.get(&key) {
+            return *value;
+        }
+        use std::hash::{Hash, Hasher};
+        let scope = crate::freeze::reachable_comps(project, comp);
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        let mut any = false;
+        for section in project.freeze.sections.iter().filter(|s| s.enabled && scope.contains(&s.target.comp())) {
+            if let Some(epoch) = self.pixel_epochs.get(&section.id) {
+                (section.id, epoch, if section.auto { fonts } else { 0 }).hash(&mut hash);
+                any = true;
+            }
+        }
+        let value = any.then(|| hash.finish());
+        if keys.len() >= 64 {
+            keys.clear();
+        }
+        keys.insert(key, value);
+        value
     }
 
     pub fn preview(&self, project: &Arc<Project>, revision: u64) -> Arc<Project> {
@@ -116,10 +156,14 @@ impl Session {
     /// editor's history/author and its verified analyses while publishing the new cache.
     pub(crate) fn attach_automatic_freeze(&mut self, id: u64, version: effectcraft_project::freeze::Version) -> crate::Result<()> {
         let before = self.project.clone();
+        let intent = before.freeze.sections.iter().find(|s| s.id == id).ok_or(crate::EngineError::NoComp)?;
+        let (start, end) = intent.range(before.comp(intent.target.comp()).ok_or(crate::EngineError::NoComp)?.duration).map_err(crate::EngineError::Other)?;
         let revision = self.revision;
         let author = self.history.author(&before).map(str::to_owned);
         let mut project = (*before).clone();
         let section = project.freeze.sections.iter_mut().find(|s| s.id == id).ok_or(crate::EngineError::NoComp)?;
+        section.start = start;
+        section.end = end;
         section.previous.retain(|v| v.directory != version.directory);
         if let Some(old) = section.cache.replace(version) {
             section.previous.push(old);
@@ -162,7 +206,7 @@ impl Session {
             {
                 self.freeze_runtime.reasons.insert(fault.section, fault.message);
                 self.freeze_runtime.proofs.remove(&fault.section);
-                self.freeze_runtime.generation = self.freeze_runtime.generation.saturating_add(1);
+                self.freeze_runtime.invalidate_section(fault.section);
                 if self.freeze_runtime.bad_versions.len() > 32_768 {
                     self.freeze_runtime.bad_versions.pop_first();
                 }
@@ -209,15 +253,26 @@ impl Session {
         };
         // Stop using media-backed versions before statting files, never while a stale proof
         // remains visible. Graphics-only versions have no periodic checks.
-        self.freeze_runtime.proofs.remove(&section.id);
+        let previous = self.freeze_runtime.proofs.remove(&section.id);
         self.freeze_runtime.reasons.insert(section.id, "Checking dependencies".into());
-        self.freeze_runtime.generation = self.freeze_runtime.generation.saturating_add(1);
+        self.freeze_runtime.invalidate_section(section.id);
         let (project, revision, epoch) = (self.project.clone(), self.revision, self.epoch);
+        let footage = self.footage.clone();
         let result = self.spawn_task("freezeCheck", format!("Check {}", section.name), false, move |ctl| {
             if ctl.cancelled() {
                 return Err("Smart Freeze check cancelled".into());
             }
             let captured = Capture::new(project, &section).map(Arc::new);
+            let mut media_changed = false;
+            if let Ok(capture) = &captured {
+                let old: BTreeMap<_, _> = previous.as_ref().into_iter().flat_map(|p| &p.capture.media).map(|s| (s.path.as_str(), s)).collect();
+                for stamp in &capture.media {
+                    if old.get(stamp.path.as_str()).is_none_or(|before| **before != *stamp) {
+                        footage.forget(&stamp.path);
+                        media_changed = true;
+                    }
+                }
+            }
             Ok(Box::new(move |s| {
                 if s.epoch != epoch || s.revision != revision {
                     return Ok(json!({"stale":true}));
@@ -228,6 +283,11 @@ impl Session {
                 }
                 match captured {
                     Ok(capture) => {
+                        if media_changed {
+                            s.layer_cache.clear();
+                            s.events.push(crate::Event::PurgeCaches);
+                            s.freeze_runtime.invalidate_section(section.id);
+                        }
                         if section.cache.as_ref().is_some_and(|v| v.identity == capture.identity && !s.freeze_runtime.bad_versions.contains(&v.directory)) {
                             s.freeze_runtime.accept(section.id, revision, capture);
                         } else if let Some(version) = section

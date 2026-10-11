@@ -213,6 +213,6 @@ mod tests {
         let levels = levels.as_array().unwrap().iter().find(|e| e["id"] == "ec.color.levels").unwrap().clone();
         let param = |id: &str| levels["params"].as_array().unwrap().iter().find(|p| p["id"] == id).unwrap().clone();
         assert_eq!(param("inBlack")["range"], json!([-1.0, 2.0]));
-        assert_eq!(param("channel")["options"][1], "Red");
+        assert_eq!(param("channel")["options"][1]["label"], "Red");
     }
 }

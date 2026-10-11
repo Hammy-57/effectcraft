@@ -25,6 +25,32 @@ pub enum DragPayload {
     Files(Vec<String>),
 }
 
+/// Layers carried by a Project item drag. Dragging a selected item uses the
+/// complete selection, while dragging an unselected item uses only that item.
+/// Folders and data files are not composition layers.
+pub(crate) fn project_drop_items(app: &EffectcraftApp, dragged: u64) -> Vec<u64> {
+    use effectcraft_engine::project::{FootageKind, ItemId, ItemKind};
+
+    let selected = &app.session.state.project_selection;
+    let candidates: Vec<u64> = if selected.iter().any(|id| id.0 == dragged) {
+        selected.iter().map(|id| id.0).collect()
+    } else {
+        // One unselected item goes through as is, so a folder or data file still gets the
+        // engine's error instead of a silent no-op.
+        return vec![dragged];
+    };
+    candidates
+        .into_iter()
+        .filter(|id| {
+            app.session.project.item(ItemId(*id)).is_some_and(|item| match &item.kind {
+                ItemKind::Comp(_) | ItemKind::Solid(_) => true,
+                ItemKind::Footage(f) => f.kind != FootageKind::Data,
+                ItemKind::Folder => false,
+            })
+        })
+        .collect()
+}
+
 /// The current time formatted per project settings (timecode with `;` for drop-frame, frames
 /// or Feet + Frames).
 /// Layer `id` of `comp`, shared (a reference count, not a copy of its property tree): panels

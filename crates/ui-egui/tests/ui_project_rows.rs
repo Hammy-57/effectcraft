@@ -148,6 +148,32 @@ fn footage_context_menu_interprets_the_footage() {
     assert_eq!(h.state().dialog, Some(Dialog::Form), "the Interpret Footage dialog opened");
 }
 
+/// #360: the row menu's New Comp from Selection works on the whole selection, as File ▸ New
+/// Comp from Selection does: with several items selected it asks how in After Effects' New
+/// Composition from Selection dialog, and Multiple Compositions makes one per item.
+#[test]
+fn context_menu_new_comp_from_selection_uses_the_selection() {
+    let (mut h, _, comp, solid) = harness();
+    h.state_mut().session.state.project_selection = vec![comp, solid];
+    h.run_steps(2);
+    let at = center(&h, &format!("project.item.{}.name", solid.0));
+    h.input_mut().events.push(Event::PointerMoved(at));
+    h.step();
+    for pressed in [true, false] {
+        h.input_mut().events.push(Event::PointerButton { pos: at, button: egui::PointerButton::Secondary, pressed, modifiers: Modifiers::NONE });
+        h.step();
+    }
+    h.run_steps(2);
+    assert_eq!(h.state().session.state.project_selection, vec![comp, solid], "the selection stays");
+    let item = h.query_by_label_contains("New Comp from Selection").expect("in the menu").rect();
+    click_at(&mut h, item.center());
+    assert_eq!(h.state().dialog, Some(Dialog::Form));
+    assert!(h.state().auto.find("form.field.single").is_some(), "the New Composition from Selection dialog");
+    let comps = h.state().session.project.comps().count();
+    h.state_mut().session.execute_checked("file.newCompFromSelection", json!({"single": false})).unwrap();
+    assert_eq!(h.state().session.project.comps().count(), comps + 2, "one per item");
+}
+
 /// Dragging from the Project panel's empty area draws a selection box that selects the rows it
 /// touches; a click there deselects (#203).
 #[test]
@@ -181,5 +207,56 @@ fn a_short_project_panel_draws() {
         let mut h = Harness::builder().with_size(egui::vec2(640.0, height)).build_eframe(|_| EffectcraftApp::new(Session::default()));
         h.run_steps(3);
         assert!(h.state().auto.find("project.empty").is_some(), "the Project panel drew at {height} points");
+    }
+}
+
+#[test]
+fn dropping_footage_into_empty_timeline_creates_a_matching_comp() {
+    use effectcraft_engine::time::{FrameRate, Tick};
+    use effectcraft_ui_egui::dock::PanelKind;
+    for (kind, path, expected_rate, expected_duration) in
+        [(FootageKind::Video, "clip.mp4", FrameRate::FPS_24, 3.0), (FootageKind::Still, "image.png", FrameRate::FPS_29_97, 7.0)]
+    {
+        let mut s = Session::default();
+        s.prefs.import.still_footage = "seconds".into();
+        s.prefs.import.still_seconds = 7.0;
+        let footage = Footage {
+            kind,
+            path: path.into(),
+            width: 720,
+            height: 480,
+            has_video: true,
+            frame_rate: FrameRate::FPS_24,
+            duration: Tick::from_seconds_f64(3.0),
+            pixel_aspect: 1.2,
+            ..Default::default()
+        };
+        let item = std::sync::Arc::make_mut(&mut s.project).add_item("Clip", Default::default(), None, ItemKind::Footage(footage));
+        let mut a = EffectcraftApp::new(s);
+        a.show_panel(PanelKind::Timeline);
+        let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).build_eframe(move |_| a);
+        h.run_steps(3);
+        let from = center(&h, &format!("project.item.{}.name", item.0));
+        let to = center(&h, "timeline.empty");
+        h.input_mut().events.push(Event::PointerMoved(from));
+        h.step();
+        button(&mut h, from, true);
+        h.step();
+        for k in 1..=8 {
+            h.input_mut().events.push(Event::PointerMoved(from + (to - from) * (k as f32 / 8.0)));
+            h.step();
+        }
+        button(&mut h, to, false);
+        h.run_steps(3);
+        let comp = h.state().session.active_comp().expect("drop opens the created composition");
+        assert_eq!(
+            (comp.width, comp.height, comp.frame_rate, comp.duration, comp.pixel_aspect),
+            (720, 480, expected_rate, Tick::from_seconds_f64(expected_duration), 1.2)
+        );
+        assert_eq!(comp.layers.len(), 1);
+        assert!(matches!(comp.layers[0].source, effectcraft_engine::project::LayerSource::Footage { item: source } if source == item));
+        h.state_mut().session.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(h.state().session.project.comps().count(), 0, "one undo removes the new composition");
+        assert!(h.state().session.project.item(item).is_some(), "the original footage stays in the project");
     }
 }

@@ -234,6 +234,7 @@ impl Capture {
     pub fn new(original: Arc<Project>, section: &Section) -> Result<Self, String> {
         section.validate()?;
         validate_target(&original, &section.target)?;
+        let (start, end) = section.range(original.comp(section.target.comp()).ok_or("Smart Freeze composition is missing")?.duration)?;
         let mut layer_dependencies = selection_dependencies(&original, &section.target)?;
         let mut items = BTreeSet::new();
         let mut pending = vec![(section.target.comp(), 0usize)];
@@ -340,11 +341,8 @@ impl Capture {
                 Ok(())
             }
         }
-        serde_json::to_writer(
-            HashWriter { hash: &mut hash, bytes: 0 },
-            &(&original.settings, &section.target, section.start, section.end, deps, &media, font_signatures),
-        )
-        .map_err(|e| e.to_string())?;
+        serde_json::to_writer(HashWriter { hash: &mut hash, bytes: 0 }, &(&original.settings, &section.target, start, end, deps, &media, font_signatures))
+            .map_err(|e| e.to_string())?;
         Ok(Self {
             original,
             render,
@@ -446,6 +444,7 @@ impl Capture {
 /// Lightweight render-worker view of accepted manual caches. Auto versions are deliberately
 /// excluded until the scheduler has verified their current dependencies.
 pub struct Preview<'a> {
+    project: &'a Project,
     sections: Vec<(&'a Section, Vec<LayerId>)>,
     namespace: &'a str,
     feedback: Option<&'a Mutex<Vec<Fault>>>,
@@ -501,6 +500,7 @@ pub fn preview_identity(project: &Project, root: ItemId) -> Option<u64> {
                     &section.target,
                     section.start,
                     section.end,
+                    section.follow_comp_range,
                     &cache.directory,
                     &cache.identity,
                     cache.draft,
@@ -535,6 +535,10 @@ impl<'a> Preview<'a> {
                 invalid.push((section, "Frozen composition was removed; remove this freeze section".into()));
                 continue;
             };
+            if let Err(error) = section.range(comp.duration) {
+                invalid.push((section, error));
+                continue;
+            }
             let ids = match &section.target {
                 Target::Selection { layers, .. } => {
                     let ids: Vec<_> = comp.layers.iter().rev().filter(|l| layers.contains(&l.id)).map(|l| l.id).collect();
@@ -548,7 +552,7 @@ impl<'a> Preview<'a> {
             };
             sections.push((section, ids));
         }
-        Self { sections, namespace: &project.freeze.namespace, feedback: None, invalid }
+        Self { project, sections, namespace: &project.freeze.namespace, feedback: None, invalid }
     }
 
     pub fn with_feedback(mut self, feedback: &'a Mutex<Vec<Fault>>) -> Self {
@@ -585,7 +589,11 @@ impl effectcraft_render::freeze::FreezeSource for Preview<'_> {
         time: effectcraft_time::Tick,
         opts: &effectcraft_render::RenderOpts,
     ) -> Option<Arc<effectcraft_render::Image>> {
-        let (section, _) = self.sections.iter().find(|(s, ids)| s.target.comp() == comp && ids == layers && time >= s.start && time < s.end)?;
+        let duration = self.project.comp(comp)?.duration;
+        let (section, _) = self
+            .sections
+            .iter()
+            .find(|(s, ids)| s.target.comp() == comp && ids == layers && s.range(duration).is_ok_and(|(start, end)| time >= start && time < end))?;
         let version = section.cache.as_ref()?;
         if version.frame_rate.num <= 0 || version.frame_rate.den <= 0 {
             return None;
@@ -601,6 +609,10 @@ impl effectcraft_render::freeze::FreezeSource for Preview<'_> {
             return None;
         }
         let frame = version.frame_rate.frame_at(time);
+        let first = version.frame_rate.frame_at(section.range(duration).ok()?.0);
+        if frame.checked_sub(first).and_then(|n| u64::try_from(n).ok()).is_none_or(|n| n >= version.frames) {
+            return None;
+        }
         // A baked frame cannot stand in for arbitrary sub-frame evaluation (slow precomps,
         // motion-blur samples). Exact-time originals preserve those contexts.
         if version.frame_rate.tick_of(frame) != time {

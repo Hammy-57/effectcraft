@@ -187,3 +187,39 @@ fn import_project_in_the_background_matches_the_blocking_import() {
     assert_eq!(s.job_log.iter().find(|r| r.id == job).unwrap().status, "failed");
     assert_eq!(s.project.items.len(), before);
 }
+
+/// Ordinary File > Open must resolve media exactly as project import does, before its lazy
+/// background check. Relative paths belong to the document, including proxies and sequences.
+#[test]
+fn opening_project_anchors_relative_footage_sequences_and_proxies() {
+    use crate::project::{Footage, FootageKind, Proxy};
+    let dir = out_dir("open-relative-media");
+    let mut s = Session::default();
+    let p = std::sync::Arc::make_mut(&mut s.project);
+    let id = p.add_item(
+        "frames",
+        crate::color::Label::None,
+        None,
+        ItemKind::Footage(Footage {
+            path: "frames/one.png".into(),
+            kind: FootageKind::Sequence,
+            sequence: vec!["frames/one.png".into(), "frames/two.png".into()],
+            ..Default::default()
+        }),
+    );
+    p.item_mut(id).unwrap().proxy = Some(Box::new(Proxy { footage: Footage { path: "proxy.mov".into(), ..Default::default() }, enabled: true }));
+    let absolute = dir.join("absolute.wav").to_string_lossy().into_owned();
+    let aid = p.add_item("absolute", crate::color::Label::None, None, ItemKind::Footage(Footage { path: absolute.clone(), ..Default::default() }));
+    let path = dir.join("show.ecproj");
+    std::fs::write(&path, p.to_json()).unwrap();
+    let mut opened = Session::default();
+    opened.execute("file.open", json!({"path": path})).unwrap();
+    let item = opened.project.item(id).unwrap();
+    let ItemKind::Footage(f) = &item.kind else { panic!("footage") };
+    assert_eq!(std::path::Path::new(&f.path), dir.join("frames/one.png"));
+    assert_eq!(f.sequence.iter().map(std::path::PathBuf::from).collect::<Vec<_>>(), [dir.join("frames/one.png"), dir.join("frames/two.png")]);
+    assert_eq!(std::path::Path::new(&item.proxy.as_ref().unwrap().footage.path), dir.join("proxy.mov"));
+    let ItemKind::Footage(f) = &opened.project.item(aid).unwrap().kind else { panic!("footage") };
+    assert_eq!(f.path, absolute);
+    assert!(!opened.is_dirty());
+}

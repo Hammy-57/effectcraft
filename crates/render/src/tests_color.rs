@@ -254,3 +254,43 @@ fn layer_cache_is_keyed_by_colour_settings() {
     assert!((frame(&p) - a).abs() < 1e-9);
     assert_eq!(cache.stats().hits, hits + 1);
 }
+
+/// #495: with no working space, Interpret As Linear Light footage is encoded with the project's
+/// Working Gamma: the sRGB curve at 2.2, a pure 2.4 power curve at 2.4 (as After Effects does);
+/// Blend Colors Using 1.0 Gamma linearizes with the same curve. A working space ignores it.
+#[test]
+fn working_gamma_24_encodes_linear_footage_with_a_power_curve() {
+    let render = |gamma: f64, ws: Option<ColorSpace>| {
+        let (mut p, cid, comp) = setup(BitDepth::Bpc32);
+        p.settings.working_gamma = gamma;
+        p.settings.working_space = ws;
+        let fid = p.add_item("F", Label::Aqua, None, ItemKind::Footage(Footage { linear_light: true, ..footage(None) }));
+        let l = build::layer(&mut p, &comp, "F", LayerSource::Footage { item: fid }, (40, 20), None);
+        p.comp_mut(cid).unwrap().layers.push(l);
+        let src = Flat([0.051, 0.18, 0.5]);
+        Renderer::new(&p, &src, RenderOpts::default()).comp_frame(cid, Tick::ZERO).get(5, 5)
+    };
+    let near = |o: [f32; 4], want: [f32; 3]| (0..3).all(|i| (o[i] - want[i]).abs() < 2e-3);
+    let o = render(2.4, None);
+    assert!(near(o, [0.290, 0.490, 0.749]), "2.4: {o:?}");
+    let o = render(2.2, None);
+    assert!(near(o, [0.250, 0.461, 0.735]), "2.2: {o:?}");
+    // A working space ignores Working Gamma.
+    assert_eq!(render(2.4, Some(ColorSpace::Srgb)), render(2.2, Some(ColorSpace::Srgb)));
+    // Blending with 1.0 gamma: 50% white over black is 0.5 linear, encoded with the curve.
+    let blend = |gamma: f64| {
+        let (mut p, cid, _) = setup(BitDepth::Bpc32);
+        p.settings.working_gamma = gamma;
+        p.settings.blend_linear = true;
+        add_solid(&mut p, cid, [0.0, 0.0, 0.0], BlendMode::Normal, 100.0);
+        add_solid(&mut p, cid, [1.0, 1.0, 1.0], BlendMode::Normal, 50.0);
+        px(&p, cid)[0]
+    };
+    assert!((blend(2.4) - 0.5f32.powf(1.0 / 2.4)).abs() < 2e-3, "{}", blend(2.4));
+    assert!((blend(2.2) - 0.7354).abs() < 2e-3, "{}", blend(2.2));
+    assert_ne!(crate::color::Pipe::of(&Project::default().settings).key(), {
+        let mut s = Project::default().settings;
+        s.working_gamma = 2.4;
+        crate::color::Pipe::of(&s).key()
+    });
+}
