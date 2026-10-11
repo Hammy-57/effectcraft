@@ -634,6 +634,8 @@ fn coplanar_layers_keep_stack_order_under_a_moving_camera_with_motion_blur() {
     // Hand balance collage: a motion-blurred background under unblurred layers in the same
     // plane hid them while the camera dollied (its sub-sample depths sorted it in front).
     let (mut p, cid, comp) = setup();
+    // (Comp motion blur is off by default.)
+    p.comp_mut(cid).unwrap().enable_motion_blur = true;
     let mut cam = camera(&mut p, &comp);
     let pr = cam.props.prop_mut("transform/position").unwrap();
     pr.keys = vec![

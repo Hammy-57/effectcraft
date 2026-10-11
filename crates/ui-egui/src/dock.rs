@@ -1544,13 +1544,14 @@ pub fn draw_group_chrome(ui: &mut egui::Ui, g: &Group, t: &Tokens, reg: &mut cra
                 let label_w = painter.layout_no_wrap(e.label.clone(), Tokens::ui(font), t.tab_text).size().x;
                 let menu_w = if is_active { menu_gap + 8.0 } else { 0.0 };
                 let lock = e.deco.is_some_and(|d| d.viewer) && (e.doc.is_none() || is_active);
-                let show_close = is_active && (e.deco.is_some_and(|d| d.viewer) || e.panel == PanelKind::RenderQueue);
+                // The × has its slot on every closable tab (shown on the active or hovered one).
+                let closable = e.deco.is_some_and(|d| d.viewer) || e.panel == PanelKind::RenderQueue;
                 let deco_w = match e.deco {
                     Some(d) if d.viewer => 14.0 + if lock { 16.0 } else { 0.0 },
                     Some(_) => 14.0,
                     None => 0.0,
                 };
-                label_w + pad + menu_w + deco_w + if show_close { 16.0 } else { 0.0 }
+                label_w + pad + menu_w + deco_w + if closable { 16.0 } else { 0.0 }
             })
             .collect();
         let sid = egui::Id::new(("tab-scroll", g.path.clone()));
@@ -1605,14 +1606,16 @@ pub fn draw_group_chrome(ui: &mut egui::Ui, g: &Group, t: &Tokens, reg: &mut cra
             let menu_w = if is_active { menu_gap + 8.0 } else { 0.0 };
             // The lock belongs to the panel: on its shown document's tab only.
             let lock = e.deco.is_some_and(|d| d.viewer) && (e.doc.is_none() || is_active);
-            let show_close = is_active && (e.deco.is_some_and(|d| d.viewer) || *p == PanelKind::RenderQueue);
-            // × (active tab only), swatch and lock before the label.
+            // × (on the active tab, and on another closable tab while the pointer is over it, as in
+            // After Effects; its slot is always there so hovering doesn't shift the tabs), swatch
+            // and lock before the label.
+            let closable = e.deco.is_some_and(|d| d.viewer) || *p == PanelKind::RenderQueue;
             let deco_w = match e.deco {
                 Some(d) if d.viewer => 14.0 + if lock { 16.0 } else { 0.0 },
                 Some(_) => 14.0,
                 None => 0.0,
             };
-            let w = galley.size().x + pad + menu_w + deco_w + if show_close { 16.0 } else { 0.0 };
+            let w = galley.size().x + pad + menu_w + deco_w + if closable { 16.0 } else { 0.0 };
             if x + w > strip.max.x - 20.0 && k > start {
                 let r = Rect::from_center_size(pos2(strip.max.x - 13.0, text_y), vec2(18.0, if small { 14.0 } else { 20.0 }));
                 let resp = ui.interact(r, egui::Id::new(("tab-overflow", g.path.clone())), Sense::click());
@@ -1648,14 +1651,22 @@ pub fn draw_group_chrome(ui: &mut egui::Ui, g: &Group, t: &Tokens, reg: &mut cra
             }
             let mut label_x = tab.min.x + pad / 2.0;
             let mut dx = tab.min.x + 6.0;
-            if show_close {
+            if closable {
                 let cr = Rect::from_center_size(pos2(dx + 5.0, text_y), vec2(10.0, 10.0));
                 let cresp = ui.interact(cr.expand(2.0), egui::Id::new(("tab-close", g.path.clone(), k)), Sense::click());
-                let cc = if cresp.hovered() { t.tab_text_active } else { t.tab_text };
-                let kk = 3.5;
-                painter.line_segment([cr.center() + vec2(-kk, -kk), cr.center() + vec2(kk, kk)], Stroke::new(1.2, cc));
-                painter.line_segment([cr.center() + vec2(-kk, kk), cr.center() + vec2(kk, -kk)], Stroke::new(1.2, cc));
-                reg.add_response(&format!("panel.tab.{}.close", p.id()), &cresp, "Close");
+                // Hovering the tab or its × (a drag in progress elsewhere doesn't count).
+                let pointer_over = !ui.ctx().dragged_id().is_some_and(|id| id != resp.id) && (resp.hovered() || cresp.hovered());
+                if is_active || pointer_over {
+                    let cc = if cresp.hovered() { t.tab_text_active } else { t.tab_text };
+                    let kk = 3.5;
+                    painter.line_segment([cr.center() + vec2(-kk, -kk), cr.center() + vec2(kk, kk)], Stroke::new(1.2, cc));
+                    painter.line_segment([cr.center() + vec2(-kk, kk), cr.center() + vec2(kk, -kk)], Stroke::new(1.2, cc));
+                }
+                let close_id = match e.doc {
+                    Some(id) if !e.shown_doc => format!("panel.tab.{}.{id}.close", p.id()),
+                    _ => format!("panel.tab.{}.close", p.id()),
+                };
+                reg.add_response(&close_id, &cresp, "Close");
                 crate::widgets::focus_outline(ui, &cresp, t);
                 if cresp.clicked() {
                     out.actions.push(close(e));

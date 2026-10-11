@@ -414,7 +414,9 @@ pub struct Comp {
     /// Comp switches (timeline toolbar).
     #[serde(default)]
     pub hide_shy: bool,
-    #[serde(default = "yes")]
+    /// Off by default, as Frame Blending: a new comp renders without motion blur until its
+    /// switch is turned on.
+    #[serde(default)]
     pub enable_motion_blur: bool,
     /// Off by default, as in After Effects (layers' Frame Blend switches do nothing until on).
     #[serde(default)]
@@ -476,7 +478,7 @@ impl Comp {
             motion_blur_adaptive_limit: 128,
             renderer: Renderer::Classic3D,
             hide_shy: false,
-            enable_motion_blur: true,
+            enable_motion_blur: false,
             enable_frame_blending: false,
             draft_3d: false,
             preserve_frame_rate: false,

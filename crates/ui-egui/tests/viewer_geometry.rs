@@ -161,14 +161,15 @@ fn click_control(h: &mut Harness<'_, EffectcraftApp>, id: &str) {
 fn tab_traversal_reveals_the_last_control() {
     let mut h = harness(300.0, ThemeKind::Dark);
     let last = egui::Id::new("vw-timecode");
-    for _ in 0..80 {
-        h.key_press(egui::Key::Tab);
+    // (Plain Tab is the Mini-Flowchart; Shift+Tab walks keyboard focus.)
+    for _ in 0..400 {
+        h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::Tab);
         h.run_steps(3);
         if h.ctx.memory(|memory| memory.focused()) == Some(last) {
             break;
         }
     }
-    assert_eq!(h.ctx.memory(|memory| memory.focused()), Some(last), "Tab must reach the actual timecode control");
+    assert_eq!(h.ctx.memory(|memory| memory.focused()), Some(last), "Shift+Tab must reach the actual timecode control");
     h.run_steps(12);
     let response = h.ctx.read_response(last).unwrap();
     let row = rect(&h, "viewer.controls");

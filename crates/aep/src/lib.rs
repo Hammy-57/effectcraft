@@ -422,6 +422,9 @@ fn import_doc(next: &mut Project, bytes: &[u8], source_dir: &str, resolve_media:
                 if let Some(v) = field(item, &["frame_blending"]).and_then(Json::as_bool) {
                     comp.enable_frame_blending = v;
                 }
+                if let Some(v) = field(item, &["motion_blur"]).and_then(Json::as_bool) {
+                    comp.enable_motion_blur = v;
+                }
                 ItemKind::Comp(Arc::new(comp))
             }
             "footage" => {

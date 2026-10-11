@@ -258,6 +258,11 @@ impl Ui {
         let last = self.h.ctx.input(|i| i.time);
         self.h.input_mut().time = Some(now.max(last));
         for e in self.h.state_mut().take_synthetic_input() {
+            // As a windowing backend reports them: the modifiers a scripted click, drag or key
+            // carries are held (`i.modifiers`), not only attached to that event.
+            if let egui::Event::PointerButton { modifiers, .. } | egui::Event::Key { modifiers, .. } = &e {
+                self.h.event(egui::Event::ModifiersChanged(*modifiers));
+            }
             self.h.event(e);
         }
         self.h.step();
