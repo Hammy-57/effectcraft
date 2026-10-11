@@ -1396,6 +1396,50 @@ fn resize_stacked(entries: &mut [StackEntry], bodies: &[f32], above: usize, belo
 /// Draw a group's frame + tab strip: one tab per panel, or per document for panels that show
 /// several (the Timeline's comps). Tab labels may name the comp or layer they show (After
 /// Effects style).
+/// A tab strip's scroll position (egui temp data, per group).
+#[derive(Clone, Copy, Default)]
+struct TabScroll {
+    /// The first tab shown.
+    start: usize,
+    /// The shown tab when last drawn (a new one scrolls into view).
+    shown: Option<(PanelKind, Option<u64>)>,
+    /// Wheel movement not yet turned into a tab step.
+    wheel: f32,
+}
+
+/// Room taken by the ‹ chevron of a scrolled tab strip.
+const TAB_PREV_W: f32 = 14.0;
+/// Wheel movement (points) that scrolls the tab strip by one tab.
+const TAB_WHEEL_STEP: f32 = 30.0;
+
+/// The last first tab that still leaves the strip full: the tabs from it on fit in `room`.
+fn tab_scroll_max(widths: &[f32], gap: f32, room: f32) -> usize {
+    let mut used = 0.0;
+    for (k, w) in widths.iter().enumerate().rev() {
+        used += w + gap;
+        if used - gap > room {
+            return (k + 1).min(widths.len().saturating_sub(1));
+        }
+    }
+    0
+}
+
+/// The first tab to show: `start`, within range, and moved so that tab `active` is shown when
+/// `reveal` (it was just brought forward).
+fn tab_scroll_start(widths: &[f32], gap: f32, room: f32, active: usize, start: usize, reveal: bool) -> usize {
+    let mut start = start.min(tab_scroll_max(widths, gap, room));
+    if reveal && active < widths.len() {
+        if active < start {
+            start = active;
+        }
+        let span = |s: usize| widths.get(s..=active).map_or(0.0, |ws| ws.iter().map(|w| w + gap).sum::<f32>() - gap);
+        while start < active && span(start) > room {
+            start += 1;
+        }
+    }
+    start
+}
+
 pub fn draw_group_chrome(ui: &mut egui::Ui, g: &Group, t: &Tokens, reg: &mut crate::automation::Registry, info: &TabInfo) -> Chrome {
     struct Entry {
         panel: PanelKind,
@@ -1467,7 +1511,63 @@ pub fn draw_group_chrome(ui: &mut egui::Ui, g: &Group, t: &Tokens, reg: &mut cra
         let mut x = strip.min.x + if small { 8.0 } else { 12.0 };
         // The label's middle and the shown tab's underline.
         let (text_y, under_y) = if small { (strip.min.y + strip_h * 0.5, strip.max.y - 3.5) } else { (strip.min.y + 16.0, strip.min.y + 23.0) };
-        for (k, e) in entries.iter().enumerate() {
+        // More tabs than fit (open comps' Timelines): the strip scrolls. Shift + wheel (or a
+        // sideways scroll) over it moves through the tabs; a newly shown tab scrolls into view.
+        let widths: Vec<f32> = entries
+            .iter()
+            .enumerate()
+            .map(|(k, e)| {
+                let is_active = k == ai && g.stacked != Some(false);
+                let label_w = painter.layout_no_wrap(e.label.clone(), Tokens::ui(font), t.tab_text).size().x;
+                let menu_w = if is_active { menu_gap + 8.0 } else { 0.0 };
+                let lock = e.deco.is_some_and(|d| d.viewer) && (e.doc.is_none() || is_active);
+                let show_close = is_active && (e.deco.is_some_and(|d| d.viewer) || e.panel == PanelKind::RenderQueue);
+                let deco_w = match e.deco {
+                    Some(d) if d.viewer => 14.0 + if lock { 16.0 } else { 0.0 },
+                    Some(_) => 14.0,
+                    None => 0.0,
+                };
+                label_w + pad + menu_w + deco_w + if show_close { 16.0 } else { 0.0 }
+            })
+            .collect();
+        let sid = egui::Id::new(("tab-scroll", g.path.clone()));
+        let mut scroll: TabScroll = ui.data(|d| d.get_temp(sid)).unwrap_or_default();
+        let shown = entries.get(ai).map(|e| (e.panel, e.doc));
+        // Room for the tabs between the ‹ and » chevrons.
+        let room = strip.max.x - 20.0 - x - TAB_PREV_W;
+        scroll.start = tab_scroll_start(&widths, gap, room, ai, scroll.start, scroll.shown != shown);
+        scroll.shown = shown;
+        if ui.rect_contains_pointer(strip) {
+            let (d, shift) = ui.input(|i| (i.smooth_scroll_delta, i.modifiers.shift));
+            let delta = if d.x != 0.0 { d.x } else if shift { d.y } else { 0.0 };
+            if delta != 0.0 {
+                scroll.wheel += delta;
+                let max_start = tab_scroll_max(&widths, gap, room);
+                while scroll.wheel <= -TAB_WHEEL_STEP {
+                    scroll.start = (scroll.start + 1).min(max_start);
+                    scroll.wheel += TAB_WHEEL_STEP;
+                }
+                while scroll.wheel >= TAB_WHEEL_STEP {
+                    scroll.start = scroll.start.saturating_sub(1);
+                    scroll.wheel -= TAB_WHEEL_STEP;
+                }
+            }
+        }
+        if scroll.start > 0 {
+            let r = Rect::from_center_size(pos2(x + 4.0, text_y), vec2(14.0, if small { 14.0 } else { 20.0 }));
+            let resp = ui.interact(r, egui::Id::new(("tab-prev", g.path.clone())), Sense::click());
+            icons::paint(&painter, r.shrink(3.0), Icon::ChevronLeft, if resp.hovered() { t.tab_text_active } else { t.tab_text });
+            if let Some(e) = entries.get(ai) {
+                reg.add(&format!("panel.tabs.{}.prev", e.panel.id()), r, "Scroll tabs left");
+            }
+            if resp.clicked() {
+                scroll.start -= 1;
+            }
+            x += TAB_PREV_W;
+        }
+        let start = scroll.start;
+        ui.data_mut(|d| d.insert_temp(sid, scroll));
+        for (k, e) in entries.iter().enumerate().skip(start) {
             let p = &e.panel;
             // A collapsed stacked panel's header is plain text (no underline or panel menu).
             let is_active = k == ai && g.stacked != Some(false);
@@ -1483,11 +1583,12 @@ pub fn draw_group_chrome(ui: &mut egui::Ui, g: &Group, t: &Tokens, reg: &mut cra
                 None => 0.0,
             };
             let w = galley.size().x + pad + menu_w + deco_w + if show_close { 16.0 } else { 0.0 };
-            if x + w > strip.max.x - 20.0 && k > ai {
+            if x + w > strip.max.x - 20.0 && k > start {
                 let r = Rect::from_center_size(pos2(strip.max.x - 13.0, text_y), vec2(18.0, if small { 14.0 } else { 20.0 }));
                 let resp = ui.interact(r, egui::Id::new(("tab-overflow", g.path.clone())), Sense::click());
                 icons::paint(&painter, r.shrink(4.0).translate(vec2(-2.0, 0.0)), Icon::ChevronRight, t.tab_text);
                 icons::paint(&painter, r.shrink(4.0).translate(vec2(2.0, 0.0)), Icon::ChevronRight, t.tab_text);
+                reg.add(&format!("panel.tabs.{}.next", p.id()), r, "Show next tab");
                 if resp.clicked()
                     && let Some(next) = entries.get((ai + 1) % entries.len())
                 {
@@ -1633,6 +1734,22 @@ pub fn placeholder(ui: &mut egui::Ui, rect: Rect, t: &Tokens, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// More tabs than fit: the strip scrolls to show a newly shown tab, never past the point
+    /// where the last tabs fill it, and keeps a scrolled position otherwise.
+    #[test]
+    fn tab_strip_scrolls_to_the_shown_tab() {
+        let w = [100.0; 10];
+        // Room for three tabs (with 8 px gaps).
+        let room = 320.0;
+        assert_eq!(tab_scroll_max(&w, 8.0, room), 7);
+        assert_eq!(tab_scroll_max(&w[..2], 8.0, room), 0, "all fit");
+        assert_eq!(tab_scroll_start(&w, 8.0, room, 9, 0, true), 7, "the last tab comes into view");
+        assert_eq!(tab_scroll_start(&w, 8.0, room, 1, 7, true), 1, "an earlier tab too");
+        assert_eq!(tab_scroll_start(&w, 8.0, room, 9, 4, false), 4, "a scrolled strip stays");
+        assert_eq!(tab_scroll_start(&w, 8.0, room, 0, 50, false), 7, "clamped");
+        assert_eq!(tab_scroll_start(&[], 8.0, room, 0, 3, true), 0);
+    }
 
     #[test]
     fn open_near_in_an_empty_dock_makes_the_panel_the_dock() {

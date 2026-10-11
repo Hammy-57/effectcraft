@@ -739,6 +739,20 @@ impl DiskCache {
         false
     }
 
+    /// The write queue has room for `bytes` more without dropping a write (not counted as a
+    /// drop): background producers (Cache Frames When Idle past the RAM preview) pace on it.
+    pub fn has_room(&self, bytes: usize) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.queue.0.lock().is_ok_and(|q| !q.full(bytes))
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = bytes;
+            true
+        }
+    }
+
     /// Write a layer buffer synchronously (tests).
     pub fn put_layer_now(&self, key: u128, buf: &Buf) {
         self.write_now(Kind::Layer, key, &encode_layer(buf));
