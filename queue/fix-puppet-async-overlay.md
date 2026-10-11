@@ -13,3 +13,6 @@ Dragging a Puppet pin solved the mesh synchronously on the UI thread every frame
 
 ## How tested
 - On this branch (upstream/main + these commits): `cargo clippy -p effectcraft-engine -p effectcraft-effects -p effectcraft-ui-egui --all-targets -- -D warnings`; `cargo test -p effectcraft-effects --lib puppet` and `cargo test -p effectcraft-ui-egui --lib puppet` (mailbox coalescing / worker exit tests); rustfmt --check.
+
+## Added later
+- Fix #586: preserve puppet handle geometry until pointer gesture capture
