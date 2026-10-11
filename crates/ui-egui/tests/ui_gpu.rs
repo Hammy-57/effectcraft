@@ -152,6 +152,9 @@ fn a_lost_device_draws_nothing_autosaves_and_closes() {
     s.execute("comp.new", json!({"name": "Unsaved", "width": 64, "height": 64, "duration": 1})).unwrap();
     assert!(s.is_dirty());
     let mut h = Harness::builder().with_size(egui::vec2(1200.0, 800.0)).build_eframe(|_| EffectcraftApp::new(s));
+    let told = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let log = told.clone();
+    h.state_mut().hooks.device_lost = Some(Box::new(move |saved| log.borrow_mut().push(saved)));
     h.run_steps(3);
     assert!(!h.output().shapes.is_empty(), "the UI draws before the loss");
     let bridge = effectcraft_ui_egui::gpu_failure::GpuFailureBridge::new(&h.ctx);
@@ -165,5 +168,6 @@ fn a_lost_device_draws_nothing_autosaves_and_closes() {
     assert!(h.output().shapes.is_empty());
     let saved = h.state().session.autosave.last_path.clone().expect("unsaved changes auto-saved");
     assert!(std::path::Path::new(&saved).is_file(), "{saved}");
+    assert_eq!(*told.borrow(), vec![Some(Ok(saved))], "the user is told once, with the recovery copy");
     let _ = std::fs::remove_dir_all(&dir);
 }

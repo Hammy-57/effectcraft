@@ -266,7 +266,7 @@ fn half_420<T: Sample>(w: usize, h: usize, [luma, cb, cr]: [&[T]; 3], k: &Yuv) -
                 (dst[0], dst[cw + 1]) = (dst[1], dst[cw]);
             }
             let (top, bottom) = (row_of(luma, 2 * cy, w), row_of(luma, 2 * cy + 1, w));
-            let pixels = top.as_chunks::<2>().0.iter().zip(bottom.as_chunks::<2>().0.iter()).zip(uc.windows(3).zip(vc.windows(3)));
+            let pixels = top.as_chunks::<2>().0.iter().zip(bottom.as_chunks::<2>().0).zip(uc.windows(3).zip(vc.windows(3)));
             for (o, ((a, b), (u, v))) in row.iter_mut().zip(pixels) {
                 let (u, v) = ((u[0] + u[2]) * 0.125 + u[1] * 0.75, (v[0] + v[2]) * 0.125 + v[1] * 0.75);
                 let yy = ((a[0].f() + a[1].f() + b[0].f() + b[1].f()) * 0.25 - k.y_off) * k.y_scale;

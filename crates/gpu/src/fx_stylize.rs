@@ -298,7 +298,10 @@ fn cc_slant(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     )
 }
 
-fn cc_smear(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
+fn cc_smear(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
+    if !ctx.adjustment {
+        b.pad(e, effectcraft_effects::cc_smear_pad(ctx, [b.img.width, b.img.height], b.offset, b.scale))?;
+    }
     let from = b.to_px(ctx.params.v2("from"));
     let to = b.to_px(ctx.params.v2("to"));
     let reach = ctx.params.f("reach").clamp(-1000.0, 1000.0) / 100.0;
@@ -584,8 +587,11 @@ fn offset(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
     table(e, b, &data, false, blend.max(0.0))
 }
 
-fn cc_tiler(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
+fn cc_tiler(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     let s = (ctx.params.f("scale") / 100.0).max(0.001);
+    if !ctx.adjustment {
+        b.pad(e, effectcraft_effects::util::layer_cover_pad(ctx, [b.img.width, b.img.height], b.offset, b.scale))?;
+    }
     let c = b.to_px(ctx.params.v2("center"));
     let blend = (ctx.params.f("blendWithOriginal") / 100.0) as f32;
     let (x0, y0, w, h) = layer_rect(ctx, &b);

@@ -185,6 +185,9 @@ pub struct Hooks {
     /// the commands' dialogs (File ▸ Import, Open, Save As…) where a modal dialog's nested event
     /// loop inside a frame is unsafe: on macOS a drag over the window then aborted the app (#511).
     pub file_dialog_async: Option<Box<dyn Fn(FileDialog, DialogDone)>>,
+    /// Tells the user the graphics device was lost and the window is closing, once. `saved` is
+    /// the auto-save of unsaved changes (`None`: nothing was unsaved), its path or why it failed.
+    pub device_lost: Option<Box<dyn Fn(Option<Result<String, String>>)>>,
 }
 
 impl Hooks {
@@ -767,14 +770,21 @@ impl EffectcraftApp {
             return;
         }
         let keep_recovery = self.session.is_dirty();
-        if keep_recovery {
-            match self.session.autosave_now().and_then(|path| self.session.autosave_wait().map(|()| path)) {
-                Ok(path) => log::warn!("graphics device lost: auto-saved {path}; the next launch offers to recover it"),
-                Err(e) => log::error!("graphics device lost: {e}"),
+        let saved = keep_recovery.then(|| match self.session.autosave_now().and_then(|path| self.session.autosave_wait().map(|()| path)) {
+            Ok(path) => {
+                log::warn!("graphics device lost: auto-saved {path}; the next launch offers to recover it");
+                Ok(path)
             }
-        }
+            Err(e) => {
+                log::error!("graphics device lost: {e}");
+                Err(e.to_string())
+            }
+        });
         self.device_lost_close = Some(keep_recovery);
         log::warn!("graphics device lost: closing the window");
+        if let Some(tell) = &self.hooks.device_lost {
+            tell(saved);
+        }
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 
