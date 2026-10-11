@@ -34,7 +34,7 @@ use effectcraft_engine::time::Tick;
 use effectcraft_gpu::{DisplayFrame, Gpu};
 use rayon::prelude::*;
 
-mod opacity_reuse;
+mod property_reuse;
 
 /// Comp identities (and the project snapshots behind them) the RAM preview keeps frames of.
 const MAX_KEEPERS: usize = 64;
@@ -829,7 +829,7 @@ impl Frames {
         // Their full keys remain distinct; queued/inflight work follows normal cancellation.
         if let Some((base_id, base)) = bases.get(&comp.0)
             && *base_id != plain
-            && let Some(proof) = opacity_reuse::Proof::between(base, project, comp)
+            && let Some(proof) = property_reuse::Proof::between(base, project, comp)
             && let Ok(mut cache) = self.cache.lock()
         {
             proof.rekey(&mut cache, *base_id, plain, revision, comp);

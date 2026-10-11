@@ -1,7 +1,7 @@
-//! A deliberately narrow proof for completed RAM frames after one opacity edit.
+//! A bounded proof for completed RAM frames after one supported property edit.
 //! Unknown temporal/dependency contexts keep the ordinary full-comp invalidation.
 use super::{Cache, FrameKey, comp_content_with};
-use effectcraft_engine::project::{Comp, FrameBlend, ItemId, ItemKind, LayerSource, Node, Project, Property, Renderer};
+use effectcraft_engine::project::{AutoOrient, Comp, FrameBlend, ItemId, ItemKind, LayerSource, Node, Project, Property, Renderer};
 use effectcraft_engine::render::EvalCtx;
 use effectcraft_keyframe::Value;
 use std::io::{self, Write};
@@ -18,7 +18,7 @@ const MAX_FRAMES: usize = 2048;
 struct SizeLimit(usize);
 impl Write for SizeLimit {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0 = self.0.checked_sub(bytes.len()).ok_or_else(|| io::Error::other("opacity proof size limit"))?;
+        self.0 = self.0.checked_sub(bytes.len()).ok_or_else(|| io::Error::other("property proof size limit"))?;
         Ok(bytes.len())
     }
     fn flush(&mut self) -> io::Result<()> {
@@ -77,8 +77,18 @@ fn bounded_simple(comp: &Comp) -> bool {
     serde_json::to_writer(SizeLimit(MAX_BYTES), comp).is_ok()
 }
 
-fn scalar(p: &Property) -> bool {
-    matches!(p.value, Value::Scalar(v) if v.is_finite()) && p.keys.iter().all(|k| matches!(k.value, Value::Scalar(v) if v.is_finite()))
+const PATHS: [&str; 5] = ["transform/opacity", "transform/position", "transform/scale", "transform/anchor", "transform/rotation"];
+
+fn finite(value: &Value, vector: bool) -> bool {
+    match value {
+        Value::Scalar(v) if !vector => v.is_finite(),
+        Value::Vec3(v) if vector => v.iter().all(|x| x.is_finite()),
+        _ => false,
+    }
+}
+fn supported(p: &Property, path: &str) -> bool {
+    let vector = matches!(path, "transform/position" | "transform/scale" | "transform/anchor");
+    finite(&p.value, vector) && p.keys.iter().all(|k| finite(&k.value, vector))
 }
 
 pub(super) struct Proof<'a> {
@@ -87,6 +97,7 @@ pub(super) struct Proof<'a> {
     old_comp: &'a Comp,
     new_comp: &'a Comp,
     layer: usize,
+    path: &'static str,
 }
 
 impl<'a> Proof<'a> {
@@ -108,10 +119,28 @@ impl<'a> Proof<'a> {
             }
         }
         let layer = changed?;
-        let old = old_comp.layers.get(layer)?.props.prop("transform/opacity")?;
-        let new = new_comp.layers.get(layer)?.props.prop("transform/opacity")?;
-        if old == new || !scalar(old) || !scalar(new) {
+        let old_layer = old_comp.layers.get(layer)?;
+        let new_layer = new_comp.layers.get(layer)?;
+        let mut selected = None;
+        for path in PATHS {
+            let (Some(old), Some(new)) = (old_layer.props.prop(path), new_layer.props.prop(path)) else { continue };
+            if old != new && selected.replace(path).is_some() {
+                return None;
+            }
+        }
+        let path = selected?;
+        let old = old_layer.props.prop(path)?;
+        let new = new_layer.props.prop(path)?;
+        if !supported(old, path) || !supported(new, path) {
             return None;
+        }
+        if path != "transform/opacity" {
+            // Along-path orientation samples neighboring times. Separated position
+            // and compound edits need a different proof; keep full invalidation.
+            let tr = old_layer.transform()?;
+            if old_layer.auto_orient != AutoOrient::Off || ["positionX", "positionY", "positionZ"].iter().any(|p| tr.get(p).is_some()) {
+                return None;
+            }
         }
         // Only values/keyframes may change; metadata, expression and interpretation may not.
         let mut prop = new.clone();
@@ -121,12 +150,12 @@ impl<'a> Proof<'a> {
             return None;
         }
         let mut normalized = new_comp.clone();
-        *normalized.layers.get_mut(layer)?.props.prop_mut("transform/opacity")? = old.clone();
+        *normalized.layers.get_mut(layer)?.props.prop_mut(path)? = old.clone();
         if &normalized != old_comp {
             return None;
         }
         // Preserve the existing complete dependency/settings identity, substituting only
-        // the comp for which the exact opacity-only comparison above succeeded.
+        // the comp for which the exact single-property comparison above succeeded.
         let old_id = super::comp_content(before, id);
         if comp_content_with(after, id, |cid, c| {
             if cid == id
@@ -140,7 +169,7 @@ impl<'a> Proof<'a> {
         {
             return None;
         }
-        Some(Self { before, after, old_comp, new_comp, layer })
+        Some(Self { before, after, old_comp, new_comp, layer, path })
     }
 
     fn unchanged(&self, comp: ItemId, frame: i64) -> bool {
@@ -148,9 +177,16 @@ impl<'a> Proof<'a> {
         let Some(new) = self.new_comp.layers.get(self.layer) else { return false };
         let time = self.old_comp.frame_rate.tick_of(frame);
         // The renderer owns start/stretch mapping; no guessed keyframe influence interval.
-        let a = EvalCtx::new(self.before, comp, self.old_comp, time).opacity(old);
-        let b = EvalCtx::new(self.after, comp, self.new_comp, time).opacity(new);
-        a.is_finite() && b.is_finite() && a == b
+        let a = EvalCtx::new(self.before, comp, self.old_comp, time);
+        let b = EvalCtx::new(self.after, comp, self.new_comp, time);
+        if self.path == "transform/opacity" {
+            let (a, b) = (a.opacity(old), b.opacity(new));
+            return a.is_finite() && b.is_finite() && a == b;
+        }
+        let (Some(old_prop), Some(new_prop)) = (old.props.prop(self.path), new.props.prop(self.path)) else { return false };
+        let (a, b) = (a.value(old, old_prop), b.value(new, new_prop));
+        let vector = self.path != "transform/rotation";
+        finite(&a, vector) && finite(&b, vector) && a == b
     }
 
     pub(super) fn rekey(&self, cache: &mut Cache, old: u64, new: u64, revision: u64, comp: ItemId) {
@@ -407,3 +443,7 @@ mod tests {
         assert!(timings.get(1).unwrap().3 < timings.first().unwrap().3);
     }
 }
+
+#[cfg(test)]
+#[path = "property_reuse_tests.rs"]
+mod transform_tests;
