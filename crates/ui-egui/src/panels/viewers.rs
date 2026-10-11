@@ -169,7 +169,11 @@ fn set_texture(
         }
         (FrameImage::Cpu(img), old) => {
             free(app, old.map(|(_, t)| t));
-            PassiveTexture::Cpu(ctx.load_texture(format!("viewer-{id}"), crate::frames::fit_texture_shared(&img, crate::frames::max_texture_side(ctx), 1), opts))
+            PassiveTexture::Cpu(ctx.load_texture(
+                format!("viewer-{id}"),
+                crate::frames::fit_texture_shared(&img, crate::frames::max_texture_side(ctx), 1),
+                opts,
+            ))
         }
         (FrameImage::Gpu(f), old) => {
             let Some(rs) = &app.wgpu else { return };
