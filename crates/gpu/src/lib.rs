@@ -544,6 +544,8 @@ mod tests_fx_warp;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests_init;
 #[cfg(test)]
+mod tests_inplace;
+#[cfg(test)]
 mod tests_particles;
 #[cfg(test)]
 mod tests_precomp_resident;

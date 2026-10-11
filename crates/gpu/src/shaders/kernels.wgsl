@@ -21,20 +21,41 @@ fn warp_blend(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (x >= dims.x || y >= dims.y) {
         return;
     }
+    let d = textureLoad(aux, vec2<i32>(x, y), 0);
+    store_q(vec2<i32>(x, y), warp_blend_px(x, y, d), P.f[3].z, P.f[3].w);
+}
+
+// `warp_blend` in place, over the canvas rectangle u[1] = (x0, y0, x1, y1) only (the layer's
+// bounds): `out` is the canvas itself, `aux` that rectangle of it (copied out first: a pass
+// can't read and write one texture), and the pixels outside it stay as they are.
+@compute @workgroup_size(16, 16)
+fn warp_blend_at(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dims = out_dims();
+    let o = P.u[1];
+    let x = i32(o.x + gid.x);
+    let y = i32(o.y + gid.y);
+    if (x >= i32(o.z) || y >= i32(o.w) || x >= dims.x || y >= dims.y) {
+        return;
+    }
+    let d = textureLoad(aux, vec2<i32>(gid.xy), 0);
+    store_q(vec2<i32>(x, y), warp_blend_px(x, y, d), P.f[3].z, P.f[3].w);
+}
+
+// One `warp_blend` pixel: the value stored at (x, y) over the canvas pixel `d0`.
+fn warp_blend_px(x: i32, y: i32, d0: vec4<f32>) -> vec4<f32> {
     let mode = P.u[0].x;
     let sampling = P.u[0].y;
     let seed = P.u[0].z;
     let flags = P.u[0].w;
     let b = P.f[4];
-    var d = textureLoad(aux, vec2<i32>(x, y), 0);
+    var d = d0;
     let fx = f32(x) + 0.5;
     let fy = f32(y) + 0.5;
     if (fx < b.x || fy < b.y || fx > b.z || fy > b.w) {
         if ((flags & 2u) != 0u) {
             d = vec4<f32>(0.0);
         }
-        store_q(vec2<i32>(x, y), d, P.f[3].z, P.f[3].w);
-        return;
+        return d;
     }
     let r0 = P.f[0];
     let r1 = P.f[1];
@@ -52,20 +73,17 @@ fn warp_blend(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (stencil && (flags & 1u) == 0u) {
             d = blend_pixel(mode, d, vec4<f32>(0.0), 0.5);
         }
-        store_q(vec2<i32>(x, y), d, P.f[3].z, P.f[3].w);
-        return;
+        return d;
     }
     var s = sample(src, sampling, px, py);
     if ((flags & 1u) != 0u) {
         if (s.w > 0.0) {
             d = d + s * P.f[3].y;
         }
-        store_q(vec2<i32>(x, y), d, P.f[3].z, P.f[3].w);
-        return;
+        return d;
     }
     if (s.w <= 0.0 && !stencil) {
-        store_q(vec2<i32>(x, y), d, P.f[3].z, P.f[3].w);
-        return;
+        return d;
     }
     let op = P.f[3].x;
     if (op < 1.0) {
@@ -75,7 +93,7 @@ fn warp_blend(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (mode == 1u || mode == 2u) {
         n = hash_noise(u32(x), u32(y), seed);
     }
-    store_q(vec2<i32>(x, y), blend_pixel(mode, d, s, n), P.f[3].z, P.f[3].w);
+    return blend_pixel(mode, d, s, n);
 }
 
 // Motion-blur sub-samples of one source in one pass: `aux` plus each sample's warp of `src`
