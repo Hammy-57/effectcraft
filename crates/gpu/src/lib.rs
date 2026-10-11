@@ -57,9 +57,11 @@ mod adv3d;
 mod bokeh;
 mod classic3d;
 mod context;
+mod cull;
 pub mod deferred;
 mod effects;
 mod fusion;
+mod mips;
 mod warmup;
 pub use warmup::WarmupReport;
 /// Whether per-pixel effect fusion is enabled (profiling builds support an A/B override).
@@ -88,6 +90,7 @@ mod fx_vr;
 mod fx_warp;
 mod ops;
 mod particles;
+mod prepass;
 mod readback;
 #[cfg(feature = "profile")]
 mod timestamps;
@@ -257,6 +260,33 @@ impl Gpu {
             return;
         }
         Enc::new(&self.ctx).read_texture_async(&f.texture, f.width, f.height, 4, done);
+    }
+
+    /// [`Gpu::read_display_async`] for a native frame worker that goes on to other work instead
+    /// of waiting: `done` gets exactly [`Gpu::read_display`]'s bytes, or `None` on failure,
+    /// exactly once (possibly before this returns), from whichever thread polls the device after
+    /// the copy finished. Returns the submission that copies the frame, for
+    /// [`Gpu::wait_submission`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn read_display_start(&self, f: &DisplayFrame, done: impl FnOnce(Option<Vec<u8>>) + Send + 'static) -> Option<wgpu::SubmissionIndex> {
+        if let Err(e) = self.ctx.check_health() {
+            log::error!("gpu display readback: {e}");
+            crate::readback::reject(done, e);
+            return None;
+        }
+        self.ctx.transfers.count(false, (f.width as usize).saturating_mul(f.height as usize).saturating_mul(4));
+        let mut e = Enc::new(&self.ctx);
+        e.read_texture_async(&f.texture, f.width, f.height, 4, done);
+        e.last_submission()
+    }
+
+    /// Wait until `submission` has finished on the GPU, running the callbacks of the readbacks it
+    /// completed. Bounded by the readback deadline, whose expiry retires the context as a
+    /// blocking readback's does.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn wait_submission(&self, submission: &wgpu::SubmissionIndex) -> Result<(), String> {
+        let wait = wgpu::PollType::Wait { submission_index: Some(submission.clone()), timeout: Some(crate::readback::TIMEOUT) };
+        self.ctx.poll_readbacks(wait).map(|_| ())
     }
 
     /// Render a frame on the GPU and read it back (`None` = not handled).
@@ -544,6 +574,8 @@ mod tests_fx_warp;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests_init;
 #[cfg(test)]
+mod tests_inplace;
+#[cfg(test)]
 mod tests_particles;
 #[cfg(test)]
 mod tests_precomp_resident;
@@ -572,7 +604,13 @@ pub fn yuv_transport_enabled() -> bool {
 mod tests_cache_policy;
 
 #[cfg(test)]
+mod tests_cull;
+
+#[cfg(test)]
 mod tests_collapsed_resident;
 
 #[cfg(test)]
 mod tests_motion_blur_accum;
+
+#[cfg(test)]
+mod tests_dispatch;

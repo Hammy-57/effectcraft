@@ -1,5 +1,6 @@
 //! Compositing primitives: each mirrors a CPU operation in `effectcraft-raster` /
-//! `effectcraft-render` and returns a new image (GPU images are immutable).
+//! `effectcraft-render` and returns a new image (GPU images are immutable; only [`warp_q_in`]
+//! draws on a canvas in place, one no one else can see).
 
 use effectcraft_color::{BlendMode, Conversion};
 use effectcraft_geom::{Mat3, Rect, vec2};
@@ -63,29 +64,66 @@ pub fn warp_q(
     accumulate: Option<f32>,
     levels: Option<f32>,
 ) -> GpuImage {
-    if src.width == 0 || src.height == 0 || opacity <= 0.0 {
-        return dst.clone();
+    warp_onto(e, dst, src, m, sampling, mode, opacity, seed, accumulate, levels, false).unwrap_or_else(|| dst.clone())
+}
+
+/// [`warp_q`] onto `dst` itself (`*dst = warp_q(e, dst, ..)`, the same pixels): drawn in
+/// place over the layer's bounds only when this encoder owns `dst` ([`Enc::owns`]), instead of
+/// writing a whole new canvas per layer.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn warp_q_in(
+    e: &mut Enc,
+    dst: &mut GpuImage,
+    src: &GpuImage,
+    m: &Mat3,
+    sampling: Sampling,
+    mode: BlendMode,
+    opacity: f32,
+    seed: u32,
+    accumulate: Option<f32>,
+    levels: Option<f32>,
+) {
+    let owned = e.owns(dst);
+    match warp_onto(e, dst, src, m, sampling, mode, opacity, seed, accumulate, levels, owned) {
+        Some(out) => *dst = out,
+        None => dst.levels = levels,
     }
-    let Some(inv0) = m.inverse() else { return dst.clone() };
+}
+
+/// [`warp_q`]'s pass; with `in_place`, drawn into `dst` itself when [`warp_in_place`] can
+/// (`None`).
+#[allow(clippy::too_many_arguments)]
+fn warp_onto(
+    e: &mut Enc,
+    dst: &GpuImage,
+    src: &GpuImage,
+    m: &Mat3,
+    sampling: Sampling,
+    mode: BlendMode,
+    opacity: f32,
+    seed: u32,
+    accumulate: Option<f32>,
+    levels: Option<f32>,
+    in_place: bool,
+) -> Option<GpuImage> {
+    if src.width == 0 || src.height == 0 || opacity <= 0.0 {
+        return Some(dst.clone());
+    }
+    let Some(inv0) = m.inverse() else { return Some(dst.clone()) };
     // Minification: pick a pre-filtered level so sampling doesn't alias.
     let scale = m.mean_scale();
     let mut img = src.clone();
     let mut inv = inv0;
     if scale < 0.5 && m.is_affine() {
-        let mut s = scale * 2.0;
-        let mut f = 0.5;
-        img = half(e, src);
-        while s < 0.5 && img.width > 1 && img.height > 1 {
-            img = half(e, &img);
-            f *= 0.5;
-            s *= 2.0;
-        }
+        // Halved until the remaining scale is ≥ ½; a retained image keeps its levels (`mips`).
+        let (level, f) = crate::mips::minify(e, src, scale);
+        img = level;
         inv = Mat3::scale(vec2(f, f)) * inv;
     }
     let bounds = m.map_rect(&Rect::from_size(src.width as f64, src.height as f64)).inflate(1.0).round_out();
     let area = bounds.intersect(&Rect::from_size(dst.width as f64, dst.height as f64));
     if area.is_empty() {
-        return dst.clone();
+        return Some(dst.clone());
     }
     let (x0, x1) = (area.x0.max(0.0) as u32, area.x1.min(dst.width as f64) as u32);
     let (y0, y1) = (area.y0.max(0.0) as u32, area.y1.min(dst.height as f64) as u32);
@@ -99,10 +137,37 @@ pub fn warp_q(
     p.f[2] = r[2];
     p.f[3] = [opacity, accumulate.unwrap_or(1.0), levels.unwrap_or(0.0), levels.map_or(0.0, |v| 1.0 / v)];
     p.f[4] = [x0 as f32, y0 as f32, x1 as f32, y1 as f32];
+    if in_place && warp_in_place(e, dst, &img, &p, [x0, y0, x1, y1], levels) {
+        return None;
+    }
     let mut out = e.scratch(dst.width, dst.height);
     e.pixels("warp_blend", &p, &img, Some(dst), &out, None);
     out.levels = levels;
-    out
+    Some(out)
+}
+
+/// `warp_blend` in place: only the layer's bounds `[x0, y0, x1, y1)` of the canvas `dst` are
+/// read and written (`warp_blend_at`), with the same per-pixel arithmetic and quantisation as
+/// the full pass, which writes the pixels outside the bounds back unchanged. `false` (nothing
+/// recorded) when the full pass must run instead: stencil modes clear outside the bounds, a
+/// canvas not already quantised to `levels` is quantised outside them too, and a layer
+/// covering half the canvas or more is cheaper as one full pass (in place, its bounds are
+/// copied out, then read and written again).
+fn warp_in_place(e: &mut Enc, dst: &GpuImage, img: &GpuImage, p: &Params, [x0, y0, x1, y1]: [u32; 4], levels: Option<f32>) -> bool {
+    let (w, h) = (x1.saturating_sub(x0), y1.saturating_sub(y0));
+    let area = u64::from(w).saturating_mul(u64::from(h));
+    let canvas = u64::from(dst.width).saturating_mul(u64::from(dst.height));
+    // Quantising is idempotent (see `quantize`): a canvas quantised to `levels` stays as it is.
+    let outside_unchanged = p.u[0][3] & 2 == 0 && (levels.is_none() || dst.levels == levels);
+    if !outside_unchanged || w == 0 || h == 0 || area.saturating_mul(2) >= canvas || x1 > dst.width || y1 > dst.height || !e.has_kernel("warp_blend_at") {
+        return false;
+    }
+    // The kernel can't read and write one texture in a pass: it reads the bounds from a copy.
+    let under = e.crop(dst, x0, y0, w, h);
+    let mut q = *p;
+    q.u[1] = [x0, y0, x1, y1];
+    e.dispatch("warp_blend_at", &q, img, Some(&under), dst, None, (w.div_ceil(16), h.div_ceil(16)));
+    true
 }
 
 /// Motion-blur sub-samples: `dst` plus `src` warped by each of `matrices` times `weight`, summed
