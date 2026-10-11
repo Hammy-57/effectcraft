@@ -14,6 +14,7 @@ include!(concat!(env!("OUT_DIR"), "/modules.rs"));
 pub mod i18n;
 // By hand: UI command area files in `menus/` (`AREAS`, see menus.rs).
 mod local_assets;
+pub mod frames;
 pub mod menus;
 // By hand: behind a feature.
 #[cfg(all(feature = "offscreen", not(target_arch = "wasm32")))]
