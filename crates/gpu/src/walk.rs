@@ -269,11 +269,28 @@ fn draw_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &
     Some(())
 }
 
+// Profile-only experiment: disable the ordinary resident producer without
+// changing shared ownership or native YUV caching. Read once per process.
+#[cfg(feature = "profile")]
+fn ordinary_resident_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("EFFECTCRAFT_GPU_RESIDENT").map_or(true, |value| value != "0"))
+}
+
+#[cfg(not(feature = "profile"))]
+fn ordinary_resident_enabled() -> bool {
+    true
+}
+
 /// Ordinary plain layers retain layer-space Processed pixels. Styles and precomps
 /// keep their existing paths; keys declined by dependency analysis are not retained.
 fn draw_ordinary_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut GpuImage, opacity: f32) -> Option<Option<()>> {
     use effectcraft_render::cache::{Claim, GpuStage};
-    if !e.can_retain_resident() || styles::active(ctx, layer) || matches!(layer.source, effectcraft_project::LayerSource::Comp { .. }) {
+    if !ordinary_resident_enabled()
+        || !e.can_retain_resident()
+        || styles::active(ctx, layer)
+        || matches!(layer.source, effectcraft_project::LayerSource::Comp { .. })
+    {
         return None;
     }
     let cache = r.cache?;

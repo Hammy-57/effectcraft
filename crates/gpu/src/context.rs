@@ -2405,6 +2405,11 @@ mod upload_budget_tests {
         assert!(Arc::ptr_eq(&cpu, &cache.get(key).unwrap()));
         assert!(cache.gpu_owner().unwrap().resident(key, GpuStage::Processed).is_none());
         assert!(gpu.render_display(&renderer, scene.cid, effectcraft_time::Tick::ZERO).is_none());
+        let fallback = renderer.comp_frame(scene.cid, effectcraft_time::Tick::ZERO);
+        let oracle =
+            effectcraft_render::Renderer::new(&scene.p, &crate::tests::Pattern, Default::default()).comp_frame_cpu(scene.cid, effectcraft_time::Tick::ZERO);
+        assert_eq!(fallback, oracle, "public renderer falls back to the exact CPU frame after device failure");
+        assert_eq!(gpu.ctx.transfer_stats().readbacks, before.readbacks, "fallback does not retry failed-device readback");
         drop(slot);
         assert_eq!(cache.retained_stats().live_bytes, cpu.img.data.capacity() * std::mem::size_of::<[f32; 4]>());
     }
