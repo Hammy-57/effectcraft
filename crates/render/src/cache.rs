@@ -580,6 +580,12 @@ impl LayerCache {
         })
     }
 
+    /// Whether `key` is in memory, without counting a use (unlike [`Self::peek`]): the
+    /// pre-pass asks before producing what the walk will look up anyway.
+    pub(crate) fn holds(&self, key: u64) -> bool {
+        self.inner.lock().is_ok_and(|g| g.map.contains_key(&key))
+    }
+
     pub fn insert(&self, key: u64, buf: Arc<Buf>) {
         self.insert_with(key, buf, false);
     }

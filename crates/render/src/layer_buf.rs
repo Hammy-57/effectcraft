@@ -437,6 +437,20 @@ impl<'a> Renderer<'a> {
         Some(StyledLayer { passes, body, content, key: Some(key), ckey: Some(ckey), plain: false })
     }
 
+    /// Would [`Self::styled_blend`] find all of `layer`'s buffers in the layer cache? Counts no
+    /// use: the pre-pass leaves such layers to the walk, which then hits once per layer.
+    pub(crate) fn styled_blend_held(&self, ctx: &EvalCtx, layer: &Layer) -> bool {
+        let Some(c) = self.cache else { return false };
+        let Some(ckey) = self.content_cache_key(ctx, layer) else { return false };
+        let linear = self.pipe.to_blend().is_some();
+        let held = |k: u64| c.holds(if linear { cache::derive(k, 0x1ea7) } else { k });
+        if !styles::active(ctx, layer) {
+            return held(ckey);
+        }
+        let key = cache::styles_key(ctx, layer, ckey);
+        held(key) && held(ckey) && (0..styles::pass_modes(ctx, layer).len()).all(|i| held(cache::derive(key, i as u64 + 1)))
+    }
+
     /// The styled layer's buffers in the blending space.
     pub(crate) fn styled_to_blend(&self, st: StyledLayer) -> StyledLayer {
         if self.pipe.to_blend().is_none() {

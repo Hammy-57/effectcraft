@@ -157,7 +157,9 @@ impl<'a> Renderer<'a> {
         {
             return [matte, Some(Job::Resident(layer, key, clip))];
         }
-        [matte, (!has_effects(layer)).then_some(Job::Styled(layer))]
+        // Already cached: the walk's lookup is the only one (a pre-pass lookup would count a
+        // second use and take the entry off probation early).
+        [matte, (!has_effects(layer) && !self.styled_blend_held(ctx, layer)).then_some(Job::Styled(layer))]
     }
 
     /// Run one job: the bytes it made, and a resident source with its slot.
