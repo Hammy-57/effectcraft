@@ -10,6 +10,7 @@ use effectcraft_engine::time::Tick;
 use serde_json::{Value, json};
 
 use crate::bridge::SessionJob;
+use crate::confine::Confinement;
 use crate::{BridgeClient, ControlTransport, Error, Result, base64, encode_png, recompress_png};
 
 /// Longest [`Backend::with_session`] waits for an in-process app: its first job waits for the
@@ -22,6 +23,8 @@ pub struct Backend {
     /// command it runs carries this `client`, so it gets its own selection, active comp and time
     /// and can claim comps (docs/agents.md, "Several agents at once"). `None` = the user's cursor.
     client: Option<String>,
+    /// File access confined to folders (`--automation-read-root` / `--automation-write-root`).
+    confinement: Option<Confinement>,
 }
 
 enum Kind {
@@ -43,17 +46,26 @@ pub struct Frame {
 
 impl Backend {
     pub fn headless(session: Session) -> Self {
-        Backend { kind: Kind::Headless(Box::new(session)), client: None }
+        Backend { kind: Kind::Headless(Box::new(session)), client: None, confinement: None }
     }
 
     /// Bridge to the app's control channel at `addr` (`9877` or `127.0.0.1:9877`).
     pub fn bridge(addr: &str) -> Result<Self> {
-        Ok(Backend { kind: Kind::Bridge(Box::new(BridgeClient::new(addr)?)), client: None })
+        Ok(Backend { kind: Kind::Bridge(Box::new(BridgeClient::new(addr)?)), client: None, confinement: None })
     }
 
     /// Drive an app through any control transport (e.g. an offscreen UI in this process).
     pub fn transport(t: impl ControlTransport + 'static) -> Self {
-        Backend { kind: Kind::Bridge(Box::new(t)), client: None }
+        Backend { kind: Kind::Bridge(Box::new(t)), client: None, confinement: None }
+    }
+
+    /// Confine the files the commands run here may read and write ([`Confinement`]).
+    pub fn confine(&mut self, confinement: Confinement) {
+        self.confinement = Some(confinement);
+    }
+
+    pub fn confinement(&self) -> Option<&Confinement> {
+        self.confinement.as_ref()
     }
 
     /// The agent's name that engine commands run under (see [`Backend`]'s `client`).
@@ -134,9 +146,23 @@ impl Backend {
         }))
     }
 
-    /// Run an engine command by id.
+    /// Run an engine command by id (checked against the [`Confinement`], if any).
     pub fn exec(&mut self, id: &str, params: Value) -> Result<Value> {
         let params = self.with_client(if params.is_null() { json!({}) } else { params });
+        if let Some(c) = self.confinement.clone() {
+            let lookup = match c.check_command(id, &params)? {
+                Some(crate::confine::Lookup::ProjectFile) => Some((crate::confine::Lookup::ProjectFile, self.run("project.summary", json!({}))?)),
+                Some(crate::confine::Lookup::RenderOutputs) => Some((crate::confine::Lookup::RenderOutputs, self.run("renderQueue.list", json!({}))?)),
+                None => None,
+            };
+            if let Some((lookup, found)) = lookup {
+                c.check_lookup(&lookup, &found)?;
+            }
+        }
+        self.run(id, params)
+    }
+
+    fn run(&mut self, id: &str, params: Value) -> Result<Value> {
         match &mut self.kind {
             Kind::Headless(s) => {
                 let r = s.execute_checked(id, params);

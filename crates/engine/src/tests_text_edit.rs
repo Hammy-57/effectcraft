@@ -259,3 +259,19 @@ fn fonts_lists_bundled_and_installed_families() {
     assert_eq!(crate::font_styles("NOTO SERIF"), styles);
     assert_eq!(crate::font_styles("No Such Family").len(), 5);
 }
+
+/// `layer.setText`'s schema lists every OpenType key as optional, so checked execution (control
+/// channel, MCP) accepts them and requires none (#520).
+#[test]
+fn set_text_schema_accepts_every_opentype_key_and_requires_none() {
+    let spec = crate::commands::find("layer.setText").unwrap();
+    let schema = crate::commands::params_schema(spec);
+    assert_eq!(schema["required"], json!([]));
+    for key in ["discretionaryLigatures", "ss01", "ss02", "ss20", "swash"] {
+        assert!(schema["properties"].get(key).is_some(), "{key} is not in the schema");
+    }
+    assert!(schema["properties"].get("OpenType").is_none());
+    let (mut s, t) = session("Office 1/2");
+    s.execute_checked("layer.setText", json!({"layer": t, "discretionaryLigatures": true, "ss02": true, "ss20": true})).unwrap();
+    assert!(doc(&s, t).style_at(0).opentype.stylistic_set(20));
+}

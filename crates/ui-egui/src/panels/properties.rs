@@ -3,18 +3,28 @@
 //!
 //! - **Layer Transform** (all layers but cameras/lights): keyframe navigator (◀ ◆ ▶) or
 //!   stopwatch, scrubbable values, linked Scale, `Nx+N°` Rotation (revolutions and degrees scrub on their own), Reset.
+//! - **Layer Contents** (shape layers): like After Effects 2024+, the first few shape groups by
+//!   name with their paths' properties (Rectangle: Size, Roundness; Ellipse: Size; Polystar:
+//!   Points, radii, roundness) and the group's Fill colour/opacity and Stroke colour/width, in
+//!   the Layer Transform row style; Reset restores them all. Automation ids
+//!   `properties.shape.<key>` for the first group, `properties.shape.<n>.<key>` for the n-th.
+//! - **Solid** (solid layers, beyond After Effects): a Roundness row; rounding runs
+//!   `layer.roundCorners`, which turns the solid into a shape layer drawing a rounded rectangle
+//!   (one undo step; a scrub continues on the new layer's Roundness row). Solids it cannot
+//!   convert without changing their pixels say why on hover.
 //! - **Text** (text layers): font family/style, size, leading, tracking, stroke width, fill and
 //!   stroke with enable checkboxes; "More" opens the Character panel.
 //! - **Paragraph** (text layers): the seven alignment buttons; "More" opens the Paragraph panel.
 //! - **Text Animation** (text layers): Add Animator menu.
 
 use effectcraft_engine::keyframe::{Justify, TextDoc, Value};
-use effectcraft_engine::project::{Layer, LayerSource, Property};
+use effectcraft_engine::project::{Layer, LayerSource, PropGroup, Property};
 use effectcraft_engine::render::EvalCtx;
 use egui::{Align2, Color32, Rect, Sense, Stroke, pos2, vec2};
 use serde_json::json;
 
 use crate::dock::PanelKind;
+use crate::i18n::tr;
 use crate::icons::{self, Icon};
 use crate::theme::Tokens;
 use crate::{EffectcraftApp, widgets};
@@ -71,14 +81,21 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let mut y = top;
     let mut actions: Actions = vec![];
 
+    // Several layers selected: "(3) Selected Objects", as in After Effects. The rows show the
+    // first layer; the stopwatch, keyframe button and value edits apply to all of them (#355).
+    let selected = app.session.state.selected_layers.iter().filter(|id| comp.layer(**id).is_some()).count();
+    if selected > 1 {
+        let n = selected.to_string();
+        let label = crate::i18n::tr_args("({}) Selected Objects", &[&n]);
+        p.text(pos2(x0, y + ROW_H / 2.0), Align2::LEFT_CENTER, &label, Tokens::semibold(12.0), t.text);
+        app.auto.add("properties.selectedObjects", Rect::from_min_size(pos2(x0, y), vec2(w, ROW_H)), &label);
+        y += ROW_H + 4.0;
+    }
+
     // ---------------------------------------------------------------- Layer Transform
     if let Some(tr) = layer.transform() {
         section_header(app, ui, &p, x0, w, y, "Layer Transform", "properties.transform");
-        let rr = Rect::from_min_size(pos2(x0 + w - 40.0, y), vec2(40.0, ROW_H));
-        let resp = ui.interact(rr, egui::Id::new("props-reset"), Sense::click());
-        p.text(rr.right_center(), Align2::RIGHT_CENTER, crate::i18n::tr("Reset"), Tokens::ui(12.0), if resp.hovered() { t.accent_hover } else { t.accent });
-        app.auto.add("properties.transform.reset", rr, "Reset Transform");
-        if resp.clicked() {
+        if reset_button(app, ui, &p, x0, w, y, "props-reset", "properties.transform.reset", "Reset Transform") {
             for pr in tr.props() {
                 actions.push(("prop.reset".into(), json!({"layer": layer.id.0, "prop": pr.uid})));
             }
@@ -88,10 +105,21 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             if pr.three_d_only && !layer.is_3d() {
                 continue;
             }
-            transform_row(app, ui, &p, &layer, pr, &ectx, Rect::from_min_size(pos2(x0, y), vec2(w, ROW_H)), &mut actions);
+            transform_row(app, ui, &p, &layer, pr, &Row::of(pr), &ectx, Rect::from_min_size(pos2(x0, y), vec2(w, ROW_H)), &mut actions);
             y += ROW_H;
         }
         y += 10.0;
+    }
+
+    // ---------------------------------------------------------------- Layer Contents / Solid
+    if matches!(layer.source, LayerSource::Shape)
+        && let Some(contents) = layer.props.sub("contents")
+    {
+        divider(&p, x0, w, y - 4.0, &t);
+        y = shape_section(app, ui, &p, &layer, contents, &ectx, x0, w, y + 4.0, &mut actions);
+    } else if matches!(layer.source, LayerSource::Solid { .. }) {
+        divider(&p, x0, w, y - 4.0, &t);
+        y = solid_section(app, ui, &p, &layer, &ectx, x0, w, y + 4.0, &mut actions);
     }
 
     // ---------------------------------------------------------------- Text / Paragraph / Animation
@@ -120,7 +148,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         }
         let per_char = layer.props.prop("text/perChar3d").is_some_and(|q| q.value.as_bool());
         let entries = animator_entries(per_char);
-        let labels: Vec<String> = entries.iter().map(|(l, _)| l.clone()).collect();
+        // The entries are the English source strings; the menu draws them translated.
+        let labels: Vec<String> = entries.iter().map(|(l, _)| tr(l).to_string()).collect();
         if let Some(i) = widgets::popup_menu(ui, pop, br.left_bottom(), &labels, None) {
             match entries[i].1 {
                 "" => {}
@@ -167,6 +196,17 @@ fn section_header(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter
     app.auto.add(auto, r, title);
 }
 
+/// The "Reset" link at the right of a section header; whether it was clicked.
+#[allow(clippy::too_many_arguments)]
+fn reset_button(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, x0: f32, w: f32, y: f32, id: &str, auto: &str, label: &str) -> bool {
+    let t = app.tokens;
+    let rr = Rect::from_min_size(pos2(x0 + w - 40.0, y), vec2(40.0, ROW_H));
+    let resp = ui.interact(rr, egui::Id::new(id), Sense::click());
+    p.text(rr.right_center(), Align2::RIGHT_CENTER, crate::i18n::tr("Reset"), Tokens::ui(12.0), if resp.hovered() { t.accent_hover } else { t.accent });
+    app.auto.add(auto, rr, label);
+    resp.clicked()
+}
+
 fn divider(p: &egui::Painter, x0: f32, w: f32, y: f32, t: &Tokens) {
     p.line_segment([pos2(x0 - 4.0, y), pos2(x0 + w + 4.0, y)], Stroke::new(1.0, t.separator));
 }
@@ -176,14 +216,50 @@ fn triangle(p: &egui::Painter, c: egui::Pos2, left: bool, col: Color32) {
     p.add(egui::Shape::convex_polygon(vec![pos2(c.x + dx, c.y), pos2(c.x - dx, c.y - h), pos2(c.x - dx, c.y + h)], col, Stroke::NONE));
 }
 
-/// One transform row: keyframe navigator or stopwatch, name, value fields.
+/// How a property row names itself: its automation id prefix, the undo merge key of its edits,
+/// the egui id of its value field, the label shown, and the value range and suffix when they
+/// differ from what the property's name implies.
+struct Row {
+    auto: String,
+    merge: String,
+    wid: egui::Id,
+    label: String,
+    range: Option<(f64, f64)>,
+    suffix: Option<&'static str>,
+}
+
+impl Row {
+    /// A Layer Transform row: `properties.prop.<uid>`.
+    fn of(pr: &Property) -> Row {
+        Row {
+            auto: format!("properties.prop.{}", pr.uid),
+            merge: format!("props-{}", pr.uid),
+            wid: egui::Id::new(("props-v", pr.uid)),
+            label: pr.name.clone(),
+            range: None,
+            suffix: None,
+        }
+    }
+}
+
+/// One property row: keyframe navigator or stopwatch, name, value fields.
 #[allow(clippy::too_many_arguments)]
-fn transform_row(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, layer: &Layer, pr: &Property, ectx: &EvalCtx, r: Rect, actions: &mut Actions) {
+fn transform_row(
+    app: &mut EffectcraftApp,
+    ui: &mut egui::Ui,
+    p: &egui::Painter,
+    layer: &Layer,
+    pr: &Property,
+    row: &Row,
+    ectx: &EvalCtx,
+    r: Rect,
+    actions: &mut Actions,
+) {
     let t = app.tokens;
     let cy = r.center().y;
     let uid = pr.uid;
     let lid = layer.id.0;
-    let base = format!("properties.prop.{uid}");
+    let base = row.auto.as_str();
     if pr.is_animated() {
         // ◀ ◆ ▶: previous key, add/remove key at the CTI, next key.
         let now = ectx.time;
@@ -211,12 +287,12 @@ fn transform_row(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter,
                     }
                 }
             }
-            app.auto.add(&format!("{base}.{what}Key"), cr, &pr.name);
+            app.auto.add(&format!("{base}.{what}Key"), cr, &row.label);
             if resp.clicked() {
                 match what {
                     "prev" => actions.push(("time.go".into(), json!({"to": "prevKey", "prop": uid}))),
                     "next" => actions.push(("time.go".into(), json!({"to": "nextKey", "prop": uid}))),
-                    _ => actions.push(("prop.toggleKey".into(), json!({"layer": lid, "prop": uid}))),
+                    _ => actions.push(("prop.toggleKey".into(), json!({"layer": lid, "prop": uid, "selected": true}))),
                 }
             }
         }
@@ -224,33 +300,40 @@ fn transform_row(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter,
         let swr = Rect::from_center_size(pos2(r.min.x + 16.0, cy), vec2(14.0, 14.0));
         let resp = ui.interact(swr, egui::Id::new(("props-sw", uid)), Sense::click());
         icons::paint(p, swr, Icon::Stopwatch, if resp.hovered() { t.text } else { t.text_dim });
-        app.auto.add(&format!("{base}.stopwatch"), swr, &pr.name);
+        app.auto.add(&format!("{base}.stopwatch"), swr, &row.label);
         if resp.clicked() {
-            actions.push(("prop.toggleAnimation".into(), json!({"layer": lid, "prop": uid})));
+            actions.push(("prop.toggleAnimation".into(), json!({"layer": lid, "prop": uid, "selected": true})));
         }
     }
-    p.text(pos2(r.min.x + 42.0, cy), Align2::LEFT_CENTER, &pr.name, Tokens::ui(12.0), t.text);
-    let vx = r.min.x + (r.width() * 0.5).max(130.0);
-    let merge = format!("props-{uid}");
-    let set = |actions: &mut Actions, v: serde_json::Value| actions.push(("prop.set".into(), json!({"layer": lid, "prop": uid, "value": v, "merge": merge})));
+    let lr = p.text(pos2(r.min.x + 42.0, cy), Align2::LEFT_CENTER, &row.label, Tokens::ui(12.0), t.text);
+    // Long labels ("Outer Roundness") push their values right rather than under them.
+    let vx = (r.min.x + (r.width() * 0.5).max(130.0)).max(lr.max.x + 10.0);
+    let merge = row.merge.as_str();
+    // With several layers selected the edit applies to all: a scrub by the same change, a typed
+    // value as it is.
+    let scrub = ui.ctx().dragged_id().is_some() && ui.input(|i| i.pointer.is_decidedly_dragging());
+    let set = |actions: &mut Actions, v: serde_json::Value| {
+        actions.push(("prop.set".into(), json!({"layer": lid, "prop": uid, "value": v, "merge": merge, "selected": true, "offset": scrub})))
+    };
     let value = ectx.value(layer, pr);
     let is_scale = pr.name == "Scale";
     let pct = is_scale || pr.name == "Opacity";
-    let suffix = if pct { "%" } else { "" };
+    let suffix = row.suffix.unwrap_or(if pct { "%" } else { "" });
+    let wid = row.wid;
     match &value {
         Value::Scalar(v) if pr.name == "Rotation" || pr.name.ends_with(" Rotation") => {
             let (_, deg) = super::fx_widgets::split_angle(*v);
-            let (rr, dr, nv) = super::fx_widgets::angle_field(ui, pos2(vx, cy - 9.0), egui::Id::new(("props-v", uid)), *v, decimals(deg), &t);
-            app.auto.add(&format!("{base}.value"), dr, &pr.name);
-            app.auto.add(&format!("{base}.revolutions"), rr, &pr.name);
+            let (rr, dr, nv) = super::fx_widgets::angle_field(ui, pos2(vx, cy - 9.0), wid, *v, decimals(deg), &t);
+            app.auto.add(&format!("{base}.value"), dr, &row.label);
+            app.auto.add(&format!("{base}.revolutions"), rr, &row.label);
             if let Some(nv) = nv {
                 set(actions, json!(nv));
             }
         }
         Value::Scalar(v) => {
-            let range = if pr.name == "Opacity" { (0.0, 100.0) } else { (-1e9, 1e9) };
-            let (vr, nv, _) = widgets::hot_number_at(ui, pos2(vx, cy - 9.0), egui::Id::new(("props-v", uid)), *v, 0.5, range, decimals(*v), suffix, &t);
-            app.auto.add(&format!("{base}.value"), vr, &pr.name);
+            let range = row.range.unwrap_or(if pr.name == "Opacity" { (0.0, 100.0) } else { (-1e9, 1e9) });
+            let (vr, nv, _) = widgets::hot_number_at(ui, pos2(vx, cy - 9.0), wid, *v, 0.5, range, decimals(*v), suffix, &t);
+            app.auto.add(&format!("{base}.value"), vr, &row.label);
             if let Some(nv) = nv {
                 set(actions, json!(nv));
             }
@@ -272,9 +355,9 @@ fn transform_row(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter,
                 }
             }
             for d in 0..n.min(c.len()) {
-                let (vr, nv, _) =
-                    widgets::hot_number_at(ui, pos2(x, cy - 9.0), egui::Id::new(("props-v", uid, d)), c[d], 1.0, (-1e9, 1e9), decimals(c[d]), suffix, &t);
-                app.auto.add(&format!("{base}.value.{d}"), vr, &pr.name);
+                let range = row.range.unwrap_or((-1e9, 1e9));
+                let (vr, nv, _) = widgets::hot_number_at(ui, pos2(x, cy - 9.0), wid.with(d), c[d], 1.0, range, decimals(c[d]), suffix, &t);
+                app.auto.add(&format!("{base}.value.{d}"), vr, &row.label);
                 if let Some(nv) = nv {
                     let mut nc = c.clone();
                     if linked && c[d].abs() > 1e-9 {
@@ -289,8 +372,193 @@ fn transform_row(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter,
                 x = vr.max.x + 10.0;
             }
         }
+        Value::Color(c) => {
+            let sw = Rect::from_min_size(pos2(vx, cy - 8.0), vec2(16.0, 16.0));
+            let c4 = [c[0] as f32, c[1] as f32, c[2] as f32, c[3] as f32];
+            let pop = wid.with("pop");
+            if widgets::swatch(ui, sw, c4, wid, &t).clicked() {
+                widgets::open_popup(ui, pop);
+            }
+            app.auto.add(&format!("{base}.value"), sw, &row.label);
+            let mut rgb = [c4[0], c4[1], c4[2]];
+            if crate::widgets::color_popup(ui, pop, sw.left_bottom(), &mut rgb) {
+                set(actions, json!([rgb[0], rgb[1], rgb[2], c[3]]));
+            }
+        }
         _ => {}
     }
+}
+
+/// Shape groups the Layer Contents section lists at most (After Effects lists the first few).
+const SHAPE_GROUPS: usize = 4;
+
+/// A shape group with paths, as the Layer Contents section lists it: its name and its paths,
+/// Fill and Stroke (direct items of its Contents).
+struct ShapeEntry<'a> {
+    name: &'a str,
+    items: Vec<&'a PropGroup>,
+}
+
+fn is_path(g: &PropGroup) -> bool {
+    matches!(g.match_id.as_str(), "rect" | "ellipse" | "star")
+}
+
+/// The groups with paths below `contents` (itself first, as `name`), in Contents order.
+fn shape_entries<'a>(contents: &'a PropGroup, name: &'a str, out: &mut Vec<ShapeEntry<'a>>, depth: usize) {
+    if depth > 32 {
+        return;
+    }
+    let items: Vec<&PropGroup> = contents.groups().filter(|g| is_path(g) || matches!(g.match_id.as_str(), "fill" | "stroke")).collect();
+    if items.iter().any(|g| is_path(g)) {
+        out.push(ShapeEntry { name, items });
+    }
+    for g in contents.groups().filter(|g| g.match_id == "group") {
+        if let Some(c) = g.sub("contents") {
+            shape_entries(c, &g.name, out, depth + 1);
+        }
+    }
+}
+
+/// The rows of a shape item: (automation key, property, label, range, suffix).
+type ItemRow = (&'static str, &'static str, &'static str, Option<(f64, f64)>, Option<&'static str>);
+
+fn item_rows(g: &PropGroup) -> &'static [ItemRow] {
+    const POS: Option<(f64, f64)> = Some((0.0, 1e9));
+    match g.match_id.as_str() {
+        "rect" => &[("size", "size", "Size", POS, None), ("roundness", "roundness", "Roundness", POS, None)],
+        "ellipse" => &[("ellipseSize", "size", "Size", POS, None)],
+        "star" => &[
+            ("points", "points", "Points", Some((3.0, 100.0)), None),
+            ("outerRadius", "outerRadius", "Outer Radius", POS, None),
+            ("innerRadius", "innerRadius", "Inner Radius", POS, None),
+            ("outerRoundness", "outerRoundness", "Outer Roundness", None, Some("%")),
+            ("innerRoundness", "innerRoundness", "Inner Roundness", None, Some("%")),
+        ],
+        "fill" => &[("fillColor", "color", "Fill Color", None, None), ("fillOpacity", "opacity", "Fill Opacity", None, None)],
+        "stroke" => &[("strokeColor", "color", "Stroke Color", None, None), ("strokeWidth", "width", "Stroke Width", POS, None)],
+        _ => &[],
+    }
+}
+
+/// Layer Contents section of a shape layer; returns the y below it.
+#[allow(clippy::too_many_arguments)]
+fn shape_section(
+    app: &mut EffectcraftApp,
+    ui: &mut egui::Ui,
+    p: &egui::Painter,
+    layer: &Layer,
+    contents: &PropGroup,
+    ectx: &EvalCtx,
+    x0: f32,
+    w: f32,
+    mut y: f32,
+    actions: &mut Actions,
+) -> f32 {
+    let t = app.tokens;
+    let lid = layer.id.0;
+    let mut entries = vec![];
+    shape_entries(contents, "Contents", &mut entries, 0);
+    section_header(app, ui, p, x0, w, y, "Layer Contents", "properties.shape");
+    let shown: Vec<&Property> =
+        entries.iter().take(SHAPE_GROUPS).flat_map(|e| e.items.iter().flat_map(|g| item_rows(g).iter().filter_map(|r| g.get(r.1)))).collect();
+    if !shown.is_empty() && reset_button(app, ui, p, x0, w, y, "props-shape-reset", "properties.shape.reset", "Reset Layer Contents") {
+        for pr in &shown {
+            actions.push(("prop.reset".into(), json!({"layer": lid, "prop": pr.uid})));
+        }
+    }
+    y += ROW_H + 2.0;
+    if entries.is_empty() {
+        p.text(pos2(x0, y + ROW_H / 2.0), Align2::LEFT_CENTER, crate::i18n::tr("No shapes yet"), Tokens::ui(12.0), t.text_faint);
+        return y + ROW_H + 10.0;
+    }
+    // The first rectangle's Roundness shares the Solid section's field: a scrub that turns a
+    // solid into a shape layer carries on here (one undo step).
+    let mut first_round = true;
+    for (n, e) in entries.iter().take(SHAPE_GROUPS).enumerate() {
+        let gr = Rect::from_min_size(pos2(x0, y), vec2(w, ROW_H));
+        p.text(pos2(x0, gr.center().y), Align2::LEFT_CENTER, e.name, Tokens::semibold(11.0), t.text_dim);
+        let prefix = if n == 0 { "properties.shape".to_string() } else { format!("properties.shape.{}", n + 1) };
+        app.auto.add(&format!("{prefix}.group"), gr, e.name);
+        y += ROW_H;
+        let mut used: Vec<String> = vec![];
+        for g in &e.items {
+            for (key, prop, label, range, suffix) in item_rows(g) {
+                let Some(pr) = g.get(prop) else { continue };
+                // A second rectangle in one group: `roundness2`.
+                let mut k = key.to_string();
+                let mut i = 1;
+                while used.contains(&k) {
+                    i += 1;
+                    k = format!("{key}{i}");
+                }
+                used.push(k.clone());
+                let shared = *key == "roundness" && std::mem::take(&mut first_round);
+                let row = Row {
+                    auto: format!("{prefix}.{k}"),
+                    merge: if shared { format!("props-roundness-{lid}") } else { format!("props-{}", pr.uid) },
+                    wid: if shared { egui::Id::new(("props-roundness", lid)) } else { egui::Id::new(("props-v", pr.uid)) },
+                    label: label.to_string(),
+                    range: *range,
+                    suffix: *suffix,
+                };
+                transform_row(app, ui, p, layer, pr, &row, ectx, Rect::from_min_size(pos2(x0, y), vec2(w, ROW_H)), actions);
+                y += ROW_H;
+            }
+        }
+        y += 4.0;
+    }
+    if entries.len() > SHAPE_GROUPS {
+        let more = entries.len() - SHAPE_GROUPS;
+        let r = Rect::from_min_size(pos2(x0, y), vec2(w, ROW_H));
+        p.text(r.left_center(), Align2::LEFT_CENTER, format!("+{more} more in the Timeline"), Tokens::ui(11.0), t.text_faint);
+        app.auto.add("properties.shape.more", r, "More shape groups");
+        y += ROW_H;
+    }
+    y + 10.0
+}
+
+/// Solid section: Roundness (0) whose change runs `layer.roundCorners`; returns the y below it.
+#[allow(clippy::too_many_arguments)]
+fn solid_section(
+    app: &mut EffectcraftApp,
+    ui: &mut egui::Ui,
+    p: &egui::Painter,
+    layer: &Layer,
+    ectx: &EvalCtx,
+    x0: f32,
+    w: f32,
+    mut y: f32,
+    actions: &mut Actions,
+) -> f32 {
+    let t = app.tokens;
+    let lid = layer.id.0;
+    section_header(app, ui, p, x0, w, y, "Solid", "properties.solid");
+    y += ROW_H + 2.0;
+    let r = Rect::from_min_size(pos2(x0, y), vec2(w, ROW_H));
+    let cy = r.center().y;
+    let vx = r.min.x + (r.width() * 0.5).max(130.0);
+    match effectcraft_engine::commands::round_corners::convertible_solid(ectx.project, ectx.comp, layer) {
+        Ok(_) => {
+            p.text(pos2(r.min.x + 42.0, cy), Align2::LEFT_CENTER, crate::i18n::tr("Roundness"), Tokens::ui(12.0), t.text);
+            let (vr, nv, _) = widgets::hot_number_at(ui, pos2(vx, cy - 9.0), egui::Id::new(("props-roundness", lid)), 0.0, 0.5, (0.0, 1e9), 0, "", &t);
+            app.auto.add("properties.solid.roundness", vr, "Roundness");
+            if let Some(v) = nv.filter(|v| *v > 0.0) {
+                actions.push(("layer.roundCorners".into(), json!({"layer": lid, "roundness": v, "merge": format!("props-roundness-{lid}")})));
+            }
+            y += ROW_H;
+            p.text(pos2(r.min.x + 42.0, y + 8.0), Align2::LEFT_CENTER, crate::i18n::tr("Rounding makes it a shape layer"), Tokens::ui(11.0), t.text_faint);
+            y += 16.0;
+        }
+        Err(why) => {
+            p.text(pos2(r.min.x + 42.0, cy), Align2::LEFT_CENTER, crate::i18n::tr("Roundness"), Tokens::ui(12.0), t.text_faint);
+            p.text(pos2(vx, cy), Align2::LEFT_CENTER, "0", Tokens::ui(12.0), t.text_faint);
+            let resp = ui.interact(r, egui::Id::new(("props-roundness-off", lid)), Sense::hover());
+            let _ = resp.on_hover_text(why);
+            app.auto.add("properties.solid.roundness", r, "Roundness (unavailable)");
+            y += ROW_H;
+        }
+    }
+    y + 10.0
 }
 
 /// Text section; returns the y below it.
@@ -318,13 +586,7 @@ fn text_section(
     // Font family and style.
     let fr = Rect::from_min_size(pos2(x0, y), vec2(w, 22.0));
     let pop = egui::Id::new("props-font-pop");
-    if widgets::dropdown(ui, fr, &doc.font, &t, egui::Id::new("props-font")).clicked() {
-        widgets::open_popup(ui, pop);
-    }
-    app.auto.add("properties.text.font", fr, "Font family");
-    // Every installed family (built only while the menu is open: it can be long).
-    let fams: Vec<String> = if widgets::popup_is_open(ui, pop) { effectcraft_engine::text_families() } else { vec![] };
-    if let Some(f) = widgets::popup_menu(ui, pop, fr.left_bottom(), &fams, fams.iter().position(|f| *f == doc.font)).and_then(|i| fams.get(i)) {
+    if let Some(f) = super::text_panels::font_picker(app, ui, pop, fr, &doc.font, "properties.text.font", true) {
         set(actions, json!({"font": f}));
     }
     y += 28.0;
@@ -399,7 +661,7 @@ fn text_section(
         }
         app.auto.add(&format!("properties.text.{key}"), sw, label);
         let mut rgb = [c[0], c[1], c[2]];
-        if crate::header::color_popup(ui, pop, sw.left_bottom(), &mut rgb) {
+        if crate::widgets::color_popup(ui, pop, sw.left_bottom(), &mut rgb) {
             set(actions, json!({key: [rgb[0], rgb[1], rgb[2]], "merge": format!("props-text-{key}")}));
         }
         p.text(pos2(sw.max.x + 8.0, sw.center().y), Align2::LEFT_CENTER, label, Tokens::ui(12.0), t.text);

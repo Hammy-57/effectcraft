@@ -98,7 +98,9 @@ pub(crate) fn path_of(ectx: &EvalCtx, layer: LayerId, uid: u64) -> Option<PathIn
     Some(PathInfo { layer, uid, m, sp, is_mask, feather: Vec::new() })
 }
 
-fn flatten(sp: &ShapePath, m: &Mat3, map: &ViewerMap) -> Vec<Pos2> {
+/// The path on screen: `sp` through `m` and the viewer map, flattened, with the closing point
+/// repeated for a closed path.
+pub(crate) fn flatten(sp: &ShapePath, m: &Mat3, map: &ViewerMap) -> Vec<Pos2> {
     let k = effectcraft_engine::render::kurbo_path(sp);
     let mut pts: Vec<Pos2> = vec![];
     kurbo::flatten(k.iter(), 0.5, |el| match el {
@@ -284,7 +286,8 @@ pub(crate) fn edit_motion_key(app: &mut EffectcraftApp, h: KeyHit, delete: bool)
         if delete {
             app.session.execute("keys.delete", json!({}))
         } else {
-            app.session.execute("keys.interpolation", json!({"spatial": if h.curved { "linear" } else { "bezier" }}))
+            // Convert Vertex: a curved key becomes Linear, a corner Auto Bezier (as in After Effects).
+            app.session.execute("keys.interpolation", json!({"spatial": if h.curved { "linear" } else { "autoBezier" }}))
         }
     });
     if let Err(e) = result {
@@ -297,6 +300,27 @@ pub(crate) fn insert_motion_key(app: &mut EffectcraftApp, hit: (LayerId, u64, Ti
     if let Err(e) = app.session.execute("keys.insertSpatial", json!({"layer": layer.0, "prop": prop, "time": time.seconds()})) {
         app.ui.status = e.to_string();
     }
+}
+
+/// A frame on a motion path (one of its dots): where the Pen and Add Vertex tools add a
+/// keyframe.
+#[derive(Clone, Copy)]
+pub(crate) struct PathFrame {
+    pub layer: LayerId,
+    pub prop: u64,
+    /// Layer time of the frame.
+    pub time: Tick,
+    pub pos: Pos2,
+}
+
+/// The motion-path frame nearest `pos` (within a few points) where a keyframe can be added: not
+/// on a keyframe dot already there.
+pub(crate) fn motion_frame_at(frames: &[PathFrame], hits: &[KeyHit], pos: Pos2) -> Option<PathFrame> {
+    if motion_key_at(hits, pos).is_some() {
+        return None;
+    }
+    let near = frames.iter().filter(|f| f.pos.distance(pos) < 5.0).min_by(|a, b| a.pos.distance(pos).total_cmp(&b.pos.distance(pos)))?;
+    (!hits.iter().any(|h| h.tangent.is_none() && h.layer == near.layer && h.prop == near.prop && h.time == near.time)).then_some(*near)
 }
 
 /// Parent space → comp matrix of a 2D layer at the context time.
@@ -322,6 +346,7 @@ pub(crate) fn motion_path(
     col: Color32,
     hits: &mut Vec<KeyHit>,
     segments: &mut Vec<MotionSegment>,
+    frames: &mut Vec<PathFrame>,
 ) {
     let Some(pos) = l.transform().and_then(|tr| tr.get("position")) else { return };
     if pos.keys.is_empty() || l.is_3d() {
@@ -345,7 +370,9 @@ pub(crate) fn motion_path(
     let mut samples = vec![];
     let mut lt = lt0;
     while lt <= lt1 && pts.len() < 20_000 {
-        pts.push(to_scr(pos.value_at(lt).as_vec3()));
+        let q = to_scr(pos.value_at(lt).as_vec3());
+        frames.push(PathFrame { layer: l.id, prop: pos.uid, time: lt, pos: q });
+        pts.push(q);
         samples.push(lt);
         if fd <= Tick::ZERO || lt.0.checked_add(fd.0).is_none() {
             break;

@@ -188,6 +188,25 @@ fn polystar_of(kind: &str, size: [f64; 2]) -> Option<(bool, f64, f64, f64)> {
     }
 }
 
+/// The `roundness` parameter (pixels, not negative) of a new `kind` shape: only rectangles
+/// have one.
+pub(crate) fn roundness_p(p: &Value, kind: &str, cmd: &str) -> Result<Option<f64>> {
+    match p.get("roundness") {
+        None | Some(Value::Null) => Ok(None),
+        Some(_) if !matches!(kind, "rect" | "rectangle" | "rounded" | "roundedRect") => Err(bad(cmd, "`roundness` is for rect and rounded shapes")),
+        Some(v) => Ok(Some(v.as_f64().filter(|v| v.is_finite()).ok_or_else(|| bad(cmd, "`roundness`: pixels"))?.max(0.0))),
+    }
+}
+
+/// Set the Roundness of a [`shape_group`] rectangle (when `r` is given).
+pub(crate) fn set_roundness(g: &mut PropGroup, r: Option<f64>) {
+    if let Some(r) = r
+        && let Some(pr) = g.prop_mut("contents/rect/roundness")
+    {
+        pr.value = KV::Scalar(r);
+    }
+}
+
 /// A new shape group for a shape tool `kind` of `size`, centred on the group's origin, painted
 /// with `paint` ("Rectangle 1", "Ellipse 1" or "Polystar 1"). None for another kind.
 pub(crate) fn shape_group(ids: &mut Ids, kind: &str, size: [f64; 2], paint: &ShapeTool) -> Option<PropGroup> {
@@ -205,8 +224,10 @@ pub(crate) fn shape_group(ids: &mut Ids, kind: &str, size: [f64; 2], paint: &Sha
     Some(build::shape_group(ids, gname, items))
 }
 
-/// The mask a shape tool draws: `kind` of `size` centred at `centre` (layer space).
-pub(crate) fn mask_path(kind: &str, centre: [f64; 2], size: [f64; 2]) -> Option<ShapePath> {
+/// The path a shape tool draws: `kind` of `size` centred at `centre` (layer space). The geometry
+/// of every one of the five kinds, so a caller that only wants to draw it (the viewer's
+/// drag ghost) cannot drift from what `shape.newShape` / `layer.addMask` commit.
+pub fn mask_path(kind: &str, centre: [f64; 2], size: [f64; 2]) -> Option<ShapePath> {
     let bez = match kind {
         "rect" | "rectangle" => return Some(ShapePath::rect(centre, size[0], size[1])),
         "ellipse" => return Some(ShapePath::ellipse(centre, size[0], size[1])),
@@ -219,12 +240,18 @@ pub(crate) fn mask_path(kind: &str, centre: [f64; 2], size: [f64; 2]) -> Option<
     effectcraft_path::from_kurbo(&bez).into_iter().next()
 }
 
+/// The layer a shape tool draws into when no `layer` is given: the first selected unlocked shape
+/// layer, else none (a new shape layer).
+pub fn selected_shape_target(s: &Session, comp: &Comp) -> Option<LayerId> {
+    s.state.selected_layers.iter().copied().find(|l| comp.layer(*l).is_some_and(|l| matches!(l.source, LayerSource::Shape) && !l.switches.locked))
+}
+
 /// The shape layer a shape tool or the Pen draws into: `layer` (which must be a shape layer),
 /// else the first selected unlocked shape layer, else none (a new shape layer).
 pub(crate) fn draw_target(s: &Session, comp: &Comp, p: &Value, cmd: &str) -> Result<Option<LayerId>> {
     let target = match p.get("layer") {
         Some(l) => Some(super::resolve_layer(comp, l).ok_or_else(|| bad(cmd, format!("no layer {l}")))?),
-        None => s.state.selected_layers.iter().copied().find(|l| comp.layer(*l).is_some_and(|l| matches!(l.source, LayerSource::Shape) && !l.switches.locked)),
+        None => selected_shape_target(s, comp),
     };
     if target.and_then(|l| comp.layer(l)).is_some_and(|l| !matches!(l.source, LayerSource::Shape)) {
         return Err(bad(cmd, "the layer is not a shape layer"));
@@ -295,6 +322,7 @@ fn new_shape(s: &mut Session, p: &Value) -> Result<Value> {
     };
     let pos = position_p(p, c)?.unwrap_or([comp.width as f64 / 2.0, comp.height as f64 / 2.0]);
     let paint = paint_p(p, &s.state.shape_tool, c)?;
+    let round = roundness_p(p, kind, c)?;
     let target = draw_target(s, &comp, p, c)?;
     // In the target layer's space: the centre maps through the layer's transform, the size by
     // its scale.
@@ -322,7 +350,8 @@ fn new_shape(s: &mut Session, p: &Value) -> Result<Value> {
             None => new_shape_layer(proj, st, &comp, cid, name, Some(pos))?,
         };
         let mut next = proj.next_id;
-        let g = shape_group(&mut Ids(&mut next), kind, size, &paint).ok_or_else(|| bad(c, "unknown kind"))?;
+        let mut g = shape_group(&mut Ids(&mut next), kind, size, &paint).ok_or_else(|| bad(c, "unknown kind"))?;
+        set_roundness(&mut g, round);
         proj.next_id = next;
         let group = add_to_contents(proj, cid, lid, g, centre, c)?;
         st.selected_layers = vec![lid];
@@ -351,7 +380,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Shape Tool",
             [],
             None,
-            "{layer?, kind?: rect|rounded|ellipse|polygon|star, size? [w,h], position? [x,y] (the centre), space?: comp|layer, name? (a new layer's), fill?, fillType?, fillBlend?, fillOpacity?, stroke?, strokeType?, strokeBlend?, strokeOpacity?, strokeWidth? (default the Tools bar's, shape.toolOptions)} → {layer, group}",
+            "{layer?, kind?: rect|rounded|ellipse|polygon|star, size? [w,h], position? [x,y] (the centre), space?: comp|layer, roundness? px (rect/rounded corners; rounded defaults to 15% of the shorter side), name? (a new layer's), fill?, fillType?, fillBlend?, fillOpacity?, stroke?, strokeType?, strokeBlend?, strokeOpacity?, strokeWidth? (default the Tools bar's, shape.toolOptions)} → {layer, group}",
             has_comp,
             new_shape
         ),

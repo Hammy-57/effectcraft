@@ -43,6 +43,8 @@ mod ui_azerty_shortcuts;
 mod ui_blank_context_menus;
 #[path = "../ui_camera_tracker.rs"]
 mod ui_camera_tracker;
+#[path = "../ui_color_hex.rs"]
+mod ui_color_hex;
 #[path = "../ui_control_channel.rs"]
 mod ui_control_channel;
 #[path = "../ui_drag_drop.rs"]
@@ -53,6 +55,8 @@ mod ui_effect_controls;
 mod ui_fingerprints;
 #[path = "../ui_float_windows.rs"]
 mod ui_float_windows;
+#[path = "../ui_font_search.rs"]
+mod ui_font_search;
 #[path = "../ui_fx_console.rs"]
 mod ui_fx_console;
 #[path = "../ui_fx_editors.rs"]
@@ -67,8 +71,12 @@ mod ui_inline_edit;
 mod ui_keyframes;
 #[path = "../ui_large_project.rs"]
 mod ui_large_project;
+#[path = "../ui_live_preview.rs"]
+mod ui_live_preview;
 #[path = "../ui_local_assets.rs"]
 mod ui_local_assets;
+#[path = "../ui_locked_color.rs"]
+mod ui_locked_color;
 #[path = "../ui_menus.rs"]
 mod ui_menus;
 #[path = "../ui_panel_focus.rs"]
@@ -85,6 +93,8 @@ mod ui_preview_align;
 mod ui_project_delete;
 #[path = "../ui_project_rows.rs"]
 mod ui_project_rows;
+#[path = "../ui_properties.rs"]
+mod ui_properties;
 #[path = "../ui_ram_preview.rs"]
 mod ui_ram_preview;
 #[path = "../ui_render_queue.rs"]
@@ -95,6 +105,8 @@ mod ui_script_console;
 mod ui_scriptui;
 #[path = "../ui_scrolling.rs"]
 mod ui_scrolling;
+#[path = "../ui_settings_info.rs"]
+mod ui_settings_info;
 #[path = "../ui_solo_small_tabs.rs"]
 mod ui_solo_small_tabs;
 #[path = "../ui_source_icons.rs"]
@@ -131,3 +143,5 @@ mod ui_web_job_gpu;
 mod ui_web_offload;
 #[path = "../ui_workflow_selection.rs"]
 mod ui_workflow_selection;
+#[path = "../viewer_passive_display.rs"]
+mod viewer_passive_display;

@@ -5,7 +5,6 @@ use std::sync::{Arc, Mutex, Weak};
 
 use effectcraft_effects::Buf;
 use effectcraft_raster::Image;
-use wgpu::util::DeviceExt;
 
 /// Compute entry points in `kernels.wgsl` (one pipeline each).
 const ENTRIES: &[&str] = &[
@@ -18,21 +17,17 @@ const ENTRIES: &[&str] = &[
     "quantize",
     "convert",
     "half",
-    "box_h",
-    "box_v",
-    "directional",
-    "glow_bright",
-    "glow_combine",
-    "glow_ab",
-    "shadow_make",
-    "shadow_combine",
-    "pointwise",
     "adjust_mix",
     "bokeh_boost",
     "bokeh_prefix",
     "bokeh_gather",
     "fill",
 ];
+
+/// Effect entry points in `kernels.wgsl`. Like the `fx_*` kernels, one that fails to build
+/// (a driver's shader compiler rejecting it, #613) leaves its effects to the CPU instead of
+/// turning the whole compositor off.
+const EFFECT_ENTRIES: &[&str] = &["box_h", "box_v", "directional", "glow_bright", "glow_combine", "glow_ab", "shadow_make", "shadow_combine", "pointwise"];
 
 /// Entry points that also bind group 1 (four read-only storage buffers; see
 /// [`Enc::dispatch_ext`]).
@@ -44,6 +39,9 @@ pub const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
 
 /// Uploaded layer buffers kept on the GPU (bytes), at most (see [`GpuContext::set_cache_budget`]).
 const UPLOAD_BUDGET: usize = 1536 << 20;
+
+/// Effect chain results awaiting adoption (see [`GpuContext::keep`]), at most.
+const MAX_KEPT: usize = 16;
 
 /// Working textures kept for reuse once their last image is dropped (bytes), at most.
 const POOL_BUDGET: usize = 768 << 20;
@@ -292,6 +290,12 @@ struct Uploads {
     clock: u64,
     /// Byte budget (`None`: [`UPLOAD_BUDGET`]).
     budget: Option<usize>,
+    /// Effect chain results awaiting [`GpuContext::adopt`] by the layer buffer that stores
+    /// their pixels (ticket, image), oldest first.
+    kept: Vec<(u64, GpuImage)>,
+    next_ticket: u64,
+    /// Effect chain results are not kept (tests compare against the re-upload).
+    keep_off: bool,
 }
 
 impl Uploads {
@@ -304,13 +308,30 @@ impl Uploads {
             self.bytes = self.map.values().map(|e| e.bytes).sum();
         }
         let budget = self.budget.unwrap_or(UPLOAD_BUDGET);
-        while self.bytes > budget {
+        // Kept effect results awaiting adoption count against the same budget.
+        self.trim_kept(0);
+        let kept = self.kept.iter().map(|(_, img)| img_bytes(img)).fold(0, usize::saturating_add);
+        while self.bytes.saturating_add(kept) > budget {
             let Some(k) = self.map.iter().min_by_key(|(_, e)| e.last_use).map(|(k, _)| *k) else { break };
             if let Some(e) = self.map.remove(&k) {
                 self.bytes = self.bytes.saturating_sub(e.bytes);
             }
         }
     }
+
+    /// Drop the oldest kept effect results until they and `extra` more bytes fit the budget.
+    fn trim_kept(&mut self, extra: usize) {
+        let budget = self.budget.unwrap_or(UPLOAD_BUDGET);
+        let mut kept = self.kept.iter().map(|(_, img)| img_bytes(img)).fold(extra, usize::saturating_add);
+        while kept > budget && !self.kept.is_empty() {
+            kept = kept.saturating_sub(img_bytes(&self.kept.remove(0).1));
+        }
+    }
+}
+
+/// Bytes of an RGBA f32 image.
+fn img_bytes(img: &GpuImage) -> usize {
+    (img.width as usize).saturating_mul(img.height as usize).saturating_mul(16)
 }
 
 /// The device and everything compiled for it.
@@ -321,9 +342,12 @@ pub struct GpuContext {
     pub(crate) max_dim: u32,
     integrated: bool,
     auxiliary_budget: std::sync::atomic::AtomicU64,
-    bgl: wgpu::BindGroupLayout,
+    pub(crate) bgl: wgpu::BindGroupLayout,
     bgl_ext: wgpu::BindGroupLayout,
+    pub(crate) fusion: crate::fusion::Pipelines,
     pipelines: HashMap<&'static str, wgpu::ComputePipeline>,
+    /// Effect kernels that failed to build, and why (their effects render on the CPU).
+    unavailable: Vec<(&'static str, String)>,
     display_bgl: wgpu::BindGroupLayout,
     display: wgpu::ComputePipeline,
     /// The display texture's next mip level from the one above (`display.wgsl` `mip`).
@@ -344,7 +368,8 @@ pub struct GpuContext {
     /// Transparent read-only images by size (see [`Enc::zeros`]).
     zeros: Mutex<HashMap<(u32, u32), GpuImage>>,
     /// Advanced 3D render pipelines (built on first use).
-    pub(crate) adv3d: std::sync::OnceLock<crate::adv3d::Pipes>,
+    pub(crate) adv3d: std::sync::OnceLock<Result<crate::adv3d::Pipes, String>>,
+    pub(crate) static_pipeline_count: std::sync::atomic::AtomicU64,
     /// The adapter can run the Advanced 3D rasteriser (`adv3d::raster_unsupported`); without
     /// it Advanced 3D scenes render on the CPU.
     pub(crate) adv3d_raster: bool,
@@ -406,11 +431,38 @@ pub(crate) fn init_resource<T>(device: &wgpu::Device, label: &str, create: impl 
 /// Browser scope completion is asynchronous. Preserve the existing browser constructor;
 /// never block its event loop or introduce a guard across an asynchronous boundary here.
 #[cfg(target_arch = "wasm32")]
-fn init_resource<T>(_device: &wgpu::Device, _label: &str, create: impl FnOnce() -> T) -> Result<T, String> {
+pub(crate) fn init_resource<T>(_device: &wgpu::Device, _label: &str, create: impl FnOnce() -> T) -> Result<T, String> {
     Ok(create())
 }
 
+/// A buffer holding `contents` (padded to 4 bytes), written through the queue. Unlike
+/// `DeviceExt::create_buffer_init`, which maps the buffer at creation and panics when the
+/// allocation failed (a driver reports it as an internal error, not out-of-memory: Adreno's
+/// `ERROR_INITIALIZATION_FAILED`, #591), a failed allocation only yields an invalid buffer and
+/// an error for the caller's error scope.
+pub(crate) fn buffer_init(device: &wgpu::Device, queue: &wgpu::Queue, label: Option<&str>, contents: &[u8], usage: wgpu::BufferUsages) -> wgpu::Buffer {
+    let align = wgpu::COPY_BUFFER_ALIGNMENT as usize;
+    let padded = contents.len().div_ceil(align).saturating_mul(align);
+    let buffer =
+        device.create_buffer(&wgpu::BufferDescriptor { label, size: padded as u64, usage: usage | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+    if padded > 0 {
+        if padded == contents.len() {
+            queue.write_buffer(&buffer, 0, contents);
+        } else {
+            let mut data = contents.to_vec();
+            data.resize(padded, 0);
+            queue.write_buffer(&buffer, 0, &data);
+        }
+    }
+    buffer
+}
+
 impl GpuContext {
+    /// [`buffer_init`] on this context's device.
+    pub(crate) fn buffer_init(&self, label: Option<&str>, contents: &[u8], usage: wgpu::BufferUsages) -> wgpu::Buffer {
+        buffer_init(&self.device, &self.queue, label, contents, usage)
+    }
+
     /// Build on an existing device (the desktop app shares egui-wgpu's). `Err` when the
     /// adapter cannot run the compositor (no compute shaders, e.g. WebGL2; no float storage
     /// textures) or the device was created with limits below what its pipelines bind.
@@ -534,7 +586,29 @@ impl GpuContext {
                 immediate_size: 0,
             })
         })?;
-        let pipelines = ENTRIES
+        let build = |e: &'static str, layout: &wgpu::PipelineLayout| {
+            init_resource(&device, e, || {
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(e),
+                    layout: Some(layout),
+                    module: &module,
+                    entry_point: Some(e),
+                    compilation_options: Default::default(),
+                    cache: None,
+                })
+            })
+        };
+        // The compositor's own kernels are required; an effect kernel that doesn't build is
+        // left out, and its effects render on the CPU (see `Enc::take_missing`).
+        let mut pipelines = ENTRIES
+            .iter()
+            .chain(crate::adv3d::SKY_KERNELS)
+            .map(|e| (e, &layout))
+            .chain(EXT_ENTRIES.iter().map(|e| (e, &layout_ext)))
+            .map(|(e, layout)| Ok((*e, build(e, layout)?)))
+            .collect::<Result<HashMap<_, _>, String>>()?;
+        let mut unavailable = vec![];
+        for e in EFFECT_ENTRIES
             .iter()
             .chain(crate::fx_color::KERNELS)
             .chain(crate::fx_distort::KERNELS)
@@ -556,23 +630,17 @@ impl GpuContext {
             .chain(crate::fx_time::KERNELS)
             .chain(crate::fx_pixel2::KERNELS)
             .chain(crate::fx_gen2::KERNELS)
-            .chain(crate::adv3d::SKY_KERNELS)
-            .map(|e| (e, &layout))
-            .chain(EXT_ENTRIES.iter().map(|e| (e, &layout_ext)))
-            .map(|(e, layout)| {
-                let p = init_resource(&device, e, || {
-                    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                        label: Some(e),
-                        layout: Some(layout),
-                        module: &module,
-                        entry_point: Some(e),
-                        compilation_options: Default::default(),
-                        cache: None,
-                    })
-                })?;
-                Ok((*e, p))
-            })
-            .collect::<Result<HashMap<_, _>, String>>()?;
+        {
+            match build(e, &layout) {
+                Ok(p) => {
+                    pipelines.insert(*e, p);
+                }
+                Err(why) => {
+                    log::warn!("gpu {name}: kernel {e} unavailable, its effects render on the CPU: {why}");
+                    unavailable.push((*e, why));
+                }
+            }
+        }
         let dmodule = init_resource(&device, "display shader module", || {
             device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("effectcraft display"),
@@ -618,9 +686,8 @@ impl GpuContext {
                 view_formats: &[],
             })
         })?;
-        let dummy_buf = init_resource(&device, "dummy storage buffer", || {
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("dummy"), contents: &[0u8; 16], usage: wgpu::BufferUsages::STORAGE })
-        })?;
+        let dummy_buf =
+            init_resource(&device, "dummy storage buffer", || buffer_init(&device, &queue, Some("dummy"), &[0u8; 16], wgpu::BufferUsages::STORAGE))?;
         let dummy_tex = init_resource(&device, "dummy texture view", || dummy.create_view(&Default::default()))?;
         let dummy = GpuImage { texture: dummy, width: 1, height: 1, view: dummy_tex, _lease: None, levels: None };
         let align = u64::from(device.limits().min_uniform_buffer_offset_alignment.max(1));
@@ -628,6 +695,7 @@ impl GpuContext {
         let max_dim = device.limits().max_texture_dimension_2d;
         let integrated = info.device_type == wgpu::DeviceType::IntegratedGpu;
         let (upload_budget, pool_budget, auxiliary_budget) = cache_budgets(UPLOAD_BUDGET, integrated);
+        let static_pipeline_count = std::sync::atomic::AtomicU64::new(pipelines.len() as u64 + 2);
         Ok(GpuContext {
             device,
             queue,
@@ -636,6 +704,8 @@ impl GpuContext {
             bgl,
             bgl_ext,
             pipelines,
+            fusion: Default::default(),
+            unavailable,
             display_bgl,
             display,
             display_mip,
@@ -651,6 +721,7 @@ impl GpuContext {
             transfers: Default::default(),
             zeros: Default::default(),
             adv3d: std::sync::OnceLock::new(),
+            static_pipeline_count,
             adv3d_raster: adv3d_unsupported.is_none(),
             particles: Default::default(),
             particle_states: Default::default(),
@@ -840,7 +911,12 @@ impl GpuContext {
             ..wgpu::Limits::default()
         };
         let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor { label: Some("effectcraft gpu"), required_limits, ..Default::default() })
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("effectcraft gpu"),
+                required_limits,
+                required_features: profile_features(adapter.features()),
+                ..Default::default()
+            })
             .await
             .map_err(|e| format!("no device: {e}"))?;
         let context = GpuContext::new(adapter, device, queue)?;
@@ -858,6 +934,18 @@ impl GpuContext {
 
     /// Readbacks (GPU → CPU) are possible: waited for natively, or deferred (a browser
     /// worker, [`crate::deferred`]). Impossible on the browser's main thread.
+    /// Effect kernels the device couldn't build, with why: their effects render on the CPU.
+    pub fn unavailable_kernels(&self) -> &[(&'static str, String)] {
+        &self.unavailable
+    }
+
+    /// Leave kernel `entry` out, as if it had failed to build (tests of the CPU fallback).
+    #[cfg(test)]
+    pub(crate) fn drop_kernel(&mut self, entry: &'static str) {
+        self.pipelines.remove(entry);
+        self.unavailable.push((entry, "dropped by a test".into()));
+    }
+
     pub fn can_readback(&self) -> bool {
         self.readbacks.check().is_ok() && (self.can_wait() || self.deferred.is_some())
     }
@@ -921,6 +1009,7 @@ impl GpuContext {
 
     /// Upload a CPU image (`None` when it does not fit the device).
     pub fn upload_image(&self, img: &Image) -> Option<GpuImage> {
+        let _profile = effectcraft_render::profile::span("upload");
         if !self.fits(img.width, img.height) {
             return None;
         }
@@ -950,16 +1039,79 @@ impl GpuContext {
             }
         }
         let img = self.upload_image(&buf.img)?;
+        self.register(buf, img.clone());
+        Some(img)
+    }
+
+    /// Serve `buf` from `img` (its pixels) while `buf` lives (see [`Self::upload_buf`]).
+    fn register(&self, buf: &Arc<Buf>, img: GpuImage) {
+        let key = Arc::as_ptr(buf) as usize;
         if let Ok(mut u) = self.uploads.lock() {
             let bytes = buf.img.data.len() * 16;
             let now = u.clock;
-            if let Some(old) = u.map.insert(key, Upload { buf: Arc::downgrade(buf), img: img.clone(), bytes, last_use: now }) {
-                u.bytes -= old.bytes;
+            if let Some(old) = u.map.insert(key, Upload { buf: Arc::downgrade(buf), img, bytes, last_use: now }) {
+                u.bytes = u.bytes.saturating_sub(old.bytes);
             }
             u.bytes += bytes;
             u.trim();
         }
-        Some(img)
+    }
+
+    /// Keep an effect chain's result (what was read back) for [`Self::adopt`]: the ticket, or
+    /// `None` when not kept.
+    pub(crate) fn keep(&self, img: GpuImage) -> Option<u64> {
+        let mut u = self.uploads.lock().ok()?;
+        // Kept results count against the upload budget they are adopted into (#591).
+        let bytes = img_bytes(&img);
+        if u.keep_off || bytes > u.budget.unwrap_or(UPLOAD_BUDGET) {
+            return None;
+        }
+        u.trim_kept(bytes);
+        u.next_ticket = u.next_ticket.wrapping_add(1);
+        let t = u.next_ticket;
+        // Tickets are adopted or released right after their chain (the renderer's `Kept`
+        // guard); the cap only bounds a stray one.
+        if u.kept.len() >= MAX_KEPT {
+            u.kept.remove(0);
+        }
+        u.kept.push((t, img));
+        u.trim();
+        Some(t)
+    }
+
+    /// `buf` stores kept result `ticket`'s pixels: [`Self::upload_buf`] serves it from that
+    /// image while `buf` lives, within the upload budget.
+    pub(crate) fn adopt(&self, ticket: u64, buf: &Arc<Buf>) {
+        let Some(img) = self.take_kept(ticket) else { return };
+        if (img.width, img.height) == (buf.img.width, buf.img.height) && !buf.img.is_empty() {
+            self.register(buf, img);
+        }
+    }
+
+    /// Forget kept result `ticket`.
+    pub(crate) fn release(&self, ticket: u64) {
+        let _ = self.take_kept(ticket);
+    }
+
+    fn take_kept(&self, ticket: u64) -> Option<GpuImage> {
+        let mut u = self.uploads.lock().ok()?;
+        let i = u.kept.iter().position(|(t, _)| *t == ticket)?;
+        Some(u.kept.remove(i).1)
+    }
+
+    /// Kept effect results not adopted or released yet (tests).
+    #[cfg(test)]
+    pub(crate) fn kept_count(&self) -> usize {
+        self.uploads.lock().map(|u| u.kept.len()).unwrap_or_default()
+    }
+
+    /// Stop (or resume) keeping effect chain results: composited layers then upload again.
+    #[cfg(test)]
+    pub(crate) fn set_keep_effects(&self, on: bool) {
+        if let Ok(mut u) = self.uploads.lock() {
+            u.keep_off = !on;
+            u.kept.clear();
+        }
     }
 
     /// Size the GPU-side caches after the layer cache's memory budget (Memory & CPU settings,
@@ -1002,6 +1154,7 @@ impl GpuContext {
     pub fn clear_uploads(&self) {
         if let Ok(mut u) = self.uploads.lock() {
             u.map.clear();
+            u.kept.clear();
             u.bytes = 0;
         }
         if let Ok(mut p) = self.pool.lock() {
@@ -1016,8 +1169,18 @@ impl GpuContext {
     }
 }
 
+fn profile_features(available: wgpu::Features) -> wgpu::Features {
+    if cfg!(feature = "profile") {
+        available & (wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS)
+    } else {
+        wgpu::Features::empty()
+    }
+}
+
 /// Records GPU work for one render (a command encoder submitted at readback or the end).
 pub(crate) struct Enc<'g> {
+    #[cfg(feature = "profile")]
+    pub(crate) timestamps: Option<crate::timestamps::Batch>,
     pub g: &'g GpuContext,
     /// The open command encoder and its id in the texture pool.
     enc: Option<(wgpu::CommandEncoder, u64)>,
@@ -1026,6 +1189,8 @@ pub(crate) struct Enc<'g> {
     submitted: Option<wgpu::SubmissionIndex>,
     /// This encoder's uniform ring (see [`Enc::dispatch_ext`]).
     ring: Option<wgpu::Buffer>,
+    /// A dispatch named a kernel the device doesn't have (see [`Enc::take_missing`]).
+    missing: bool,
 }
 
 impl Drop for Enc<'_> {
@@ -1047,7 +1212,22 @@ impl Drop for Enc<'_> {
 
 impl<'g> Enc<'g> {
     pub fn new(g: &'g GpuContext) -> Enc<'g> {
-        Enc { g, enc: None, pending: 0, submitted: None, ring: None }
+        Enc {
+            g,
+            enc: None,
+            pending: 0,
+            submitted: None,
+            ring: None,
+            missing: false,
+            #[cfg(feature = "profile")]
+            timestamps: None,
+        }
+    }
+
+    /// Whether a dispatch since the last call named a kernel the device doesn't have (one
+    /// that failed to build): its output is wrong, and the effect must render on the CPU.
+    pub(crate) fn take_missing(&mut self) -> bool {
+        std::mem::take(&mut self.missing)
     }
 
     pub(crate) fn encoder(&mut self) -> &mut wgpu::CommandEncoder {
@@ -1139,9 +1319,29 @@ impl<'g> Enc<'g> {
     ) {
         let g = self.g;
         let Some(pipe) = g.pipelines.get(entry) else {
-            log::error!("gpu: no kernel {entry}");
+            if !g.unavailable.iter().any(|(e, _)| *e == entry) {
+                log::error!("gpu: no kernel {entry}");
+            }
+            self.missing = true;
             return;
         };
+        self.dispatch_pipeline(entry, pipe, p, src, aux, out, data, groups, ext);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dispatch_pipeline(
+        &mut self,
+        entry: &str,
+        pipe: &wgpu::ComputePipeline,
+        p: &Params,
+        src: &GpuImage,
+        aux: Option<&GpuImage>,
+        out: &GpuImage,
+        data: Option<&wgpu::Buffer>,
+        groups: (u32, u32),
+        ext: Option<[&wgpu::Buffer; 4]>,
+    ) {
+        let g = self.g;
         // Each dispatch until the next submit gets its own block of the encoder's uniform ring.
         // `write_buffer` lands before the next submission's commands and after earlier
         // submissions', so a ring is reused (after a submit, or by a later encoder) safely.
@@ -1186,15 +1386,25 @@ impl<'g> Enc<'g> {
                 ],
             })
         });
+        #[cfg(feature = "profile")]
+        let mut batch = self.timestamps.take().or_else(|| crate::timestamps::Batch::new(g));
+        #[cfg(feature = "profile")]
+        let timestamp_writes = batch.as_mut().and_then(|b| b.mark(entry));
+        #[cfg(not(feature = "profile"))]
+        let timestamp_writes = None;
         let enc = self.encoder();
         {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(entry), timestamp_writes: None });
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(entry), timestamp_writes });
             pass.set_pipeline(pipe);
             pass.set_bind_group(0, &bg, &[]);
             if let Some(b) = &bg_ext {
                 pass.set_bind_group(1, b, &[]);
             }
             pass.dispatch_workgroups(groups.0.max(1), groups.1.max(1), 1);
+        }
+        #[cfg(feature = "profile")]
+        {
+            self.timestamps = batch;
         }
         self.pending += 1;
         // Keep command buffers (and the transient textures they hold) bounded.
@@ -1234,8 +1444,15 @@ impl<'g> Enc<'g> {
 
     /// Submit recorded work.
     pub fn submit(&mut self) {
-        if let Some((enc, id)) = self.enc.take() {
+        #[allow(unused_mut)]
+        if let Some((mut enc, id)) = self.enc.take() {
+            #[cfg(feature = "profile")]
+            let timing = self.timestamps.take().and_then(|b| b.resolve(self.g, &mut enc));
             self.submitted = Some(self.g.queue.submit([enc.finish()]));
+            #[cfg(feature = "profile")]
+            if let Some(timing) = timing {
+                timing.map(self.g.queue.get_timestamp_period());
+            }
             if let Ok(mut p) = self.g.pool.lock() {
                 p.close(id);
             }
@@ -1280,6 +1497,7 @@ impl<'g> Enc<'g> {
     /// [`Enc::read_texture`] row by row (`w × bpp` bytes each, top to bottom) through a reused
     /// staging buffer: `row` reads each straight from the mapped buffer.
     fn read_rows(&mut self, texture: &wgpu::Texture, w: u32, h: u32, bpp: u32, row: impl FnMut(&[u8])) -> Option<()> {
+        let _profile = effectcraft_render::profile::span("readback");
         if !self.g.can_wait() {
             return None;
         }
@@ -1434,7 +1652,7 @@ impl<'g> Enc<'g> {
         while bytes.len() < 16 || !bytes.len().is_multiple_of(4) {
             bytes.push(0);
         }
-        self.g.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("data"), contents: &bytes, usage: wgpu::BufferUsages::STORAGE })
+        self.g.buffer_init(Some("data"), &bytes, wgpu::BufferUsages::STORAGE)
     }
 
     /// Convert to the viewer's premultiplied RGBA8 texture (egui-wgpu's native texture format),
@@ -1458,8 +1676,15 @@ impl<'g> Enc<'g> {
         for l in 1..levels {
             steps.push((&g.display_mip, level(l - 1), level(l), (img.width >> l).max(1), (img.height >> l).max(1)));
         }
+        #[cfg(feature = "profile")]
+        let mut batch = self.timestamps.take().or_else(|| crate::timestamps::Batch::new(g));
         let enc = self.encoder();
-        for (pipeline, src, dst, w, h) in &steps {
+        for (step, (pipeline, src, dst, w, h)) in steps.iter().enumerate() {
+            let entry = if step == 0 { "display" } else { "display_mip" };
+            #[cfg(feature = "profile")]
+            let timestamp_writes = batch.as_mut().and_then(|b| b.mark(entry));
+            #[cfg(not(feature = "profile"))]
+            let timestamp_writes = None;
             let bg = g.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
                 layout: &g.display_bgl,
@@ -1468,10 +1693,14 @@ impl<'g> Enc<'g> {
                     wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(dst) },
                 ],
             });
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("display"), timestamp_writes: None });
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(entry), timestamp_writes });
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(w.div_ceil(16), h.div_ceil(16), 1);
+        }
+        #[cfg(feature = "profile")]
+        {
+            self.timestamps = batch;
         }
         tex
     }
@@ -1507,6 +1736,39 @@ mod upload_budget_tests {
         assert_eq!(pool.bytes, 0);
         assert_eq!(pool.released_bytes, 0);
         assert!(pool.free.is_empty());
+    }
+
+    /// Kept effect results awaiting adoption count against the upload budget: an oversized
+    /// one is not kept, older ones and uploads make room, and a lower budget drops them.
+    #[test]
+    fn kept_effect_results_count_against_the_upload_budget() {
+        crate::tests::hold_gpu_lock();
+        let context = GpuContext::headless();
+        assert!(context.is_some() || !std::env::var("EFFECTCRAFT_REQUIRE_GPU").is_ok_and(|v| v == "1"), "required GPU unavailable");
+        let Some(g) = context else { return };
+        let one = 8 * 8 * 16;
+        g.set_cache_budget(2 * one);
+        assert!(g.keep(g.image(16, 16)).is_none(), "larger than the budget");
+        let buf = Arc::new(Buf { img: Image::new(8, 8), offset: [0.0; 2], scale: 1.0 });
+        assert!(g.upload_buf(&buf).is_some());
+        let a = g.keep(g.image(8, 8)).unwrap();
+        assert_eq!((g.kept_count(), g.upload_stats()), (1, (1, one)));
+        let b = g.keep(g.image(8, 8)).unwrap();
+        assert_eq!((g.kept_count(), g.upload_stats()), (2, (0, 0)), "the upload makes room");
+        let _c = g.keep(g.image(8, 8)).unwrap();
+        assert_eq!(g.kept_count(), 2, "the oldest kept result makes room");
+        g.adopt(a, &buf);
+        assert_eq!(g.upload_stats(), (0, 0), "the dropped ticket adopts nothing");
+        g.set_cache_budget(one);
+        assert_eq!(g.kept_count(), 1);
+        g.adopt(b, &buf);
+        assert_eq!(g.upload_stats(), (0, 0));
+        g.set_cache_budget(0);
+        assert_eq!(g.kept_count(), 0);
+        g.set_cache_budget(UPLOAD_BUDGET);
+        let _d = g.keep(g.image(8, 8)).unwrap();
+        g.clear_uploads();
+        assert_eq!(g.kept_count(), 0);
     }
 
     #[test]

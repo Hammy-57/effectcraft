@@ -54,7 +54,7 @@ pub fn start(s: &mut Session, items: Option<Vec<ItemId>>, wait: bool) -> crate::
     let services = s.services.clone();
     let importer = s.importer.clone();
     let rate = s.sequence_rate();
-    let project_dir = s.path.as_deref().and_then(crate::commands::relink::project_dir);
+    let project_dir = s.path.as_deref().and_then(crate::commands::relink_moved::project_dir);
     let n = jobs.len();
     s.spawn_task("footageCheck", format!("Checking footage ({n} items)"), wait, move |ctl| {
         let mut found: Vec<(ItemId, Found)> = Vec::with_capacity(jobs.len());
@@ -74,7 +74,7 @@ pub fn start(s: &mut Session, items: Option<Vec<ItemId>>, wait: bool) -> crate::
             // Moved with the project: the same place under the project's folder.
             if !present
                 && let Some(dir) = &project_dir
-                && let Some(nf) = crate::commands::relink::find_moved(services.as_ref(), dir, f)
+                && let Some(nf) = crate::commands::relink_moved::find_moved(services.as_ref(), dir, f)
             {
                 found.push((j.id, Found::Moved(Box::new(nf))));
                 continue;
@@ -220,6 +220,32 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(s.project.items.values().all(|i| matches!(&i.kind, ItemKind::Footage(f) if f.missing)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #652: footage saved with a relative path is found next to the project, wherever the
+    /// app was started (the desktop app doesn't start in the project's folder, the CLI often
+    /// does).
+    #[test]
+    fn relative_footage_is_found_next_to_the_project() {
+        let dir = std::env::temp_dir().join(format!("ec-relative-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("media")).unwrap();
+        let clip = dir.join("media").join("ec-relative-clip.png");
+        std::fs::write(&clip, b"x").unwrap();
+        let mut s = session_with(&["media/ec-relative-clip.png", "/nonexistent/ec/abs.png", "media/ec-relative-gone.png"]);
+        let path = dir.join("p.ecproj");
+        s.execute("file.saveAs", json!({"path": path.to_string_lossy()})).unwrap();
+        let mut o = Session::default();
+        o.execute("file.open", json!({"path": path.to_string_lossy()})).unwrap();
+        let mut paths: Vec<String> =
+            o.project.items.values().filter_map(|i| if let ItemKind::Footage(f) = &i.kind { Some(f.path.clone()) } else { None }).collect();
+        paths.sort();
+        // A missing relative file is anchored next to the project too (the fork's resolve_footage).
+        let gone = dir.join("media").join("ec-relative-gone.png");
+        assert_eq!(paths, ["/nonexistent/ec/abs.png", clip.to_str().unwrap(), gone.to_str().unwrap()]);
+        assert!(!o.is_dirty(), "finding the files is no edit");
+        let r = o.execute("footage.check", json!({"wait": true})).unwrap();
+        assert_eq!(r["missing"], 2);
         let _ = std::fs::remove_dir_all(dir);
     }
 

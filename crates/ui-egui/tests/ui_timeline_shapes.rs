@@ -285,3 +285,58 @@ fn gradient_fill_editor_applies_undoes_and_escape_discards() {
     assert_eq!(h.state().session.history.undo.len(), history_before_escape);
     assert_eq!(value(&h), original);
 }
+
+/// Issue #633: a colour property in the Timeline (a shape's Fill Color) has an eyedropper after
+/// its swatch, as in After Effects: click it, then click in the Composition panel to sample.
+#[test]
+fn timeline_colour_eyedropper_samples_the_comp() {
+    let mut s = session();
+    s.execute("layer.newSolid", json!({"name": "Back", "color": "#20c040"})).unwrap();
+    let l = s.execute("layer.newShape", json!({"kind": "rect", "fill": [1.0, 0.0, 0.0], "size": [100.0, 60.0]})).unwrap()["layer"].as_u64().unwrap();
+    let layer = s.active_comp().unwrap().layer(LayerId(l)).unwrap().clone();
+    let mut fill = None;
+    layer.props.walk("", &mut |_, p| {
+        if fill.is_none() && matches!(p.value, effectcraft_engine::keyframe::Value::Color(_)) {
+            fill = Some(p.uid);
+        }
+    });
+    let fill = fill.expect("a fill colour");
+    fn groups(g: &effectcraft_engine::project::PropGroup, out: &mut Vec<u64>) {
+        for c in g.groups() {
+            out.push(c.uid);
+            groups(c, out);
+        }
+    }
+    let mut open = vec![];
+    groups(&layer.props, &mut open);
+    let mut h = harness(s);
+    h.state_mut().ui.timeline.open_groups.extend(open);
+    open_layer(&mut h, l);
+    h.run_steps(2);
+    // The viewer renders in the frame pool: sample once its frame is shown.
+    for _ in 0..600 {
+        h.step();
+        if h.state().frames.inflight() == 0 && h.state().frames.last_ms.lock().map(|v| *v > 0.0).unwrap_or(false) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    h.run_steps(4);
+    click(&mut h, &format!("timeline.prop.{fill}.eyedropper"));
+    assert_eq!(h.state().ui.fx_pick.as_ref().map(|p| (p.prop, p.kind.as_str())), Some((fill, "color")), "the eyedropper waits for a viewer click");
+    let pos = effectcraft_ui_egui::panels::viewer::comp_to_screen(&h.ctx, [6.0, 6.0]).unwrap();
+    click_at(&mut h, pos);
+    assert!(h.state().ui.fx_pick.is_none(), "the pick is used up");
+    let layer = h.state().session.active_comp().unwrap().layer(LayerId(l)).unwrap().clone();
+    let mut got = None;
+    layer.props.walk("", &mut |_, p| {
+        if p.uid == fill {
+            got = Some(p.value.clone());
+        }
+    });
+    let Some(effectcraft_engine::keyframe::Value::Color(c)) = got else { panic!("{got:?}") };
+    let want = [0x20 as f64 / 255.0, 0xc0 as f64 / 255.0, 0x40 as f64 / 255.0];
+    for k in 0..3 {
+        assert!((c[k] - want[k]).abs() < 0.02, "{c:?} vs {want:?}");
+    }
+}

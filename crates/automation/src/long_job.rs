@@ -243,9 +243,20 @@ fn triage(line: String, call: &LongCall, bridge: bool, inbox: &mut Inbox, out: &
             send(out, &json!({"jsonrpc": "2.0", "id": msg["id"], "result": {}}))?;
             Ok(Seen::Done)
         }
-        _ if !inbox.queue.is_empty() || long_call(bridge, &msg).is_some() => Ok(queue(inbox, line)),
-        _ => Ok(Seen::Serve(line)),
+        _ if !inbox.queue.is_empty() => Ok(queue(inbox, line)),
+        _ => match long_call(bridge, &msg) {
+            // A second render while one runs is refused at once rather than waiting in line
+            // (docs/mcp.md "Requests during a render").
+            Some(next) if is_render(&next) && is_render(call) => Ok(Seen::Serve(line)),
+            Some(_) => Ok(queue(inbox, line)),
+            None => Ok(Seen::Serve(line)),
+        },
     }
+}
+
+/// Whether `call` waits for a render-queue render.
+fn is_render(call: &LongCall) -> bool {
+    matches!(&call.what, What::Command { spec, .. } if matches!(spec.job, Job::Render))
 }
 
 fn queue(inbox: &mut Inbox, line: String) -> Seen {

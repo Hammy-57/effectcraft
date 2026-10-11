@@ -492,6 +492,8 @@ fn run_script(s: &mut Session, p: &Value) -> Result<Value> {
         }
         _ => return Err(bad("file.runScript", "missing `path` (or inline `steps`)")),
     };
+    // A command script read from a file is a script: it can't change what scripts may do.
+    let from_file = p.get("steps").is_none();
     let mut results = vec![];
     for (i, step) in steps.iter().enumerate() {
         let (id, params) = match (step.get("command").or(step.get("id")).and_then(Value::as_str), step.get("method").and_then(Value::as_str)) {
@@ -505,7 +507,8 @@ fn run_script(s: &mut Session, p: &Value) -> Result<Value> {
         if id == "file.runScript" || id == "script.run" {
             return Err(bad("file.runScript", "scripts can't run scripts"));
         }
-        let r = s.execute(&id, params).map_err(|e| EngineError::Other(format!("step {} ({id}): {e}", i + 1)))?;
+        let r = if from_file { s.execute_for_script(&id, params) } else { s.execute(&id, params) };
+        let r = r.map_err(|e| EngineError::Other(format!("step {} ({id}): {e}", i + 1)))?;
         results.push(r);
     }
     Ok(json!({"steps": results.len(), "results": results}))
@@ -895,7 +898,7 @@ fn replace_footage(s: &mut Session, p: &Value) -> Result<Value> {
     // does when you locate one).
     let moved = match s.project.item(item).map(|it| &it.kind) {
         Some(ItemKind::Footage(previous)) if previous.missing || !s.services.exists(&previous.path) => {
-            super::relink::moved_with(s, item, &previous.path, &path)
+            super::relink_moved::moved_with(s, item, &previous.path, &path)
         }
         _ => vec![],
     };
@@ -973,43 +976,7 @@ fn replace_with_solid(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn reload(s: &mut Session, p: &Value) -> Result<Value> {
     let items = items_p(s, p);
-    if s.importer.is_none() {
-        return Err(EngineError::Other("media import is not available in this build".into()));
-    }
-    // Footage files are stat-ed again for the disk cache's keys.
-    effectcraft_render::disk_cache::refresh_file_stamps();
-    let mut updates = vec![];
-    for i in &items {
-        if let Some(ItemKind::Footage(f)) = s.project.item(*i).map(|x| &x.kind) {
-            // An image sequence picks up frames added to (or removed from) its run.
-            let mut nf = match s.probe_footage(&f.path) {
-                Ok(n) => n,
-                Err(_) => Footage { missing: true, ..f.clone() },
-            };
-            // Keep the interpretation.
-            nf.alpha = f.alpha;
-            nf.loop_count = f.loop_count;
-            nf.pixel_aspect = f.pixel_aspect;
-            nf.start_timecode = f.start_timecode;
-            if nf.kind == FootageKind::Sequence && f.kind == FootageKind::Sequence {
-                nf.frame_rate = f.frame_rate;
-                nf.native_rate = f.native_rate;
-                nf.alphabetical = f.alphabetical;
-                nf.sync_sequence_duration();
-            }
-            updates.push((*i, nf));
-        }
-    }
-    let n = updates.len();
-    s.edit("Reload Footage", None, |proj, _| {
-        for (i, f) in updates {
-            if let Some(it) = proj.item_mut(i) {
-                it.kind = ItemKind::Footage(f);
-            }
-        }
-        Ok(())
-    })?;
-    s.events.push(crate::Event::PurgeCaches);
+    let n = crate::footage_reload::reload_items(s, &items)?;
     Ok(json!({"reloaded": n}))
 }
 
@@ -1072,6 +1039,15 @@ pub fn specs() -> Vec<CommandSpec> {
             "{items?: [id], wait?} — look for every footage file (in the background unless `wait`) and flag missing items",
             has_items,
             crate::footage_check::command
+        ),
+        cmd!(
+            "footage.reloadChanged",
+            "Reload Changed Footage",
+            [],
+            None,
+            "{} — reload the footage whose file changed on disk since it was last seen (size or modification time; Settings ▸ Import ▸ Automatically Reload Footage runs this in the background; image sequences only with All Footage); files seen for the first time are only remembered. Returns {files, reloaded}",
+            has_items,
+            crate::footage_reload::command
         ),
         cmd!(
             "file.runScript",

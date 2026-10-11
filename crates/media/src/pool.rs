@@ -12,6 +12,7 @@ use effectcraft_time::{FrameRate, TICKS_PER_SECOND, Tick};
 use filmcraft_media::{FrameRequest, SharedSource};
 
 use crate::convert::{AlphaOp, Packed, pack_dynamic};
+use crate::gif_anim::{self, Anim};
 use crate::{MediaError, Result};
 
 /// Default frame-cache budget: 1 GiB of decoded frames.
@@ -96,8 +97,10 @@ struct Entry {
 }
 
 /// Conformed audio files written by builds before this version are ignored (and written again):
-/// version 1 files of sources longer than about 12:36 at 48 kHz were silent from there on (#172).
-const CONFORM_VERSION: u32 = 2;
+/// version 1 files of sources longer than about 12:36 at 48 kHz were silent from there on (#172);
+/// version 2 files were written silent where the source failed to decode, and kept the footage
+/// silent from then on (#324).
+const CONFORM_VERSION: u32 = 3;
 
 /// Footage longer than this (24 hours) is read from its decoder rather than conformed: its
 /// duration comes from the file's header, and a damaged one claiming days of audio had the
@@ -338,6 +341,8 @@ fn held_bytes(src: &SharedSource, whole: bool) -> usize {
         info.audio.as_ref().map_or(0.0, |a| info.duration.0 as f64 / TICKS_PER_SECOND as f64 * f64::from(a.sample_rate) * f64::from(a.channels) * 4.0);
     usize::try_from(file).unwrap_or(usize::MAX).max(decoded.clamp(0.0, usize::MAX as f64) as usize)
 }
+/// An animated GIF by path, as [`SourceSlot`] (the error message when it failed to load).
+type GifSlot = Arc<OnceLock<std::result::Result<Arc<Anim>, String>>>;
 
 struct Inner {
     /// Opened movie/audio sources by path.
@@ -350,6 +355,9 @@ struct Inner {
     psds: Mutex<PsdCache>,
     /// Parsed 3D models by path (`None`: failed to load; not retried until `forget`).
     models: Mutex<HashMap<String, Option<Arc<effectcraft_model::Model>>>>,
+    /// Decoded animated GIFs by path, loaded by the first caller while the others wait (an
+    /// `Err` is not retried until `forget`).
+    gifs: Mutex<HashMap<Arc<str>, GifSlot>>,
     cache: Mutex<CacheState>,
     done: Condvar,
     budget: AtomicU64,
@@ -367,6 +375,10 @@ struct Inner {
     /// Conformed files being written right now.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     conforming: Mutex<HashSet<std::path::PathBuf>>,
+    /// Conformed files that failed to write (the source didn't decode) this session: their
+    /// audio is read from the decoder instead of trying again on every read.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    conform_failed: Mutex<HashSet<std::path::PathBuf>>,
 }
 
 /// Decodes footage for the renderer: stills, image sequences and movies (FilmCraft codecs), plus
@@ -430,6 +442,7 @@ impl MediaPool {
                 files: Mutex::default(),
                 models: Mutex::default(),
                 psds: Mutex::default(),
+                gifs: Mutex::default(),
                 cache: Mutex::default(),
                 done: Condvar::new(),
                 budget: AtomicU64::new(bytes as u64),
@@ -441,6 +454,7 @@ impl MediaPool {
                 conform: Mutex::default(),
                 ahead_pool: OnceLock::new(),
                 conforming: Mutex::default(),
+                conform_failed: Mutex::default(),
             }),
         }
     }
@@ -481,6 +495,9 @@ impl MediaPool {
         c.last.clear();
         // Running decode-aheads stop.
         c.ahead.clear();
+        drop(c);
+        // Decoded GIFs sit outside the frame budget; Purge frees them too.
+        lock(&self.inner.gifs).clear();
     }
 
     /// Drop every cached frame and decoder.
@@ -510,6 +527,7 @@ impl MediaPool {
         lock(&self.inner.sources).map.remove(path);
         lock(&self.inner.models).remove(path);
         lock(&self.inner.psds).remove(path);
+        lock(&self.inner.gifs).remove(path);
         let mut c = lock(&self.inner.cache);
         let keys: Vec<Key> = c.lru.map.keys().filter(|k| &*k.path == path).cloned().collect();
         for k in keys {
@@ -517,6 +535,8 @@ impl MediaPool {
         }
         c.last.remove(path);
         c.ahead.remove(path);
+        drop(c);
+        crate::exr_channels::forget(path);
     }
 
     /// Provide the contents of `path` from memory (used instead of the file system; web builds).
@@ -572,18 +592,23 @@ impl MediaPool {
     /// thread (once).
     #[cfg(not(target_arch = "wasm32"))]
     fn conform(&self, footage: &Footage, file: std::path::PathBuf, frames: usize, rate: u32) {
-        if !lock(&self.inner.conforming).insert(file.clone()) {
+        if lock(&self.inner.conform_failed).contains(&file) || !lock(&self.inner.conforming).insert(file.clone()) {
             return;
         }
         let (pool, f) = (self.clone(), footage.clone());
         let spawned = std::thread::Builder::new().name("ec-conform-audio".into()).spawn(move || {
             let tmp = file.with_extension("tmp");
-            let ok = file.parent().is_some_and(|d| std::fs::create_dir_all(d).is_ok())
-                && pool.write_conformed(&f, &tmp, frames, rate).is_ok()
-                && std::fs::rename(&tmp, &file).is_ok();
-            if !ok {
+            let written = match file.parent().map(std::fs::create_dir_all) {
+                Some(Ok(())) => pool.write_conformed(&f, &tmp, frames, rate).and_then(|()| std::fs::rename(&tmp, &file)),
+                Some(Err(e)) => Err(e),
+                None => Err(std::io::Error::other("no folder")),
+            };
+            // A failed decode leaves no file: one written silent would keep the footage silent
+            // in every later session (#324).
+            if let Err(e) = written {
                 let _ = std::fs::remove_file(&tmp);
-                log::warn!("media: could not write conformed audio {}", file.display());
+                log::warn!("media: could not write conformed audio {} of {}: {e}", file.display(), f.path);
+                lock(&pool.inner.conform_failed).insert(file.clone());
             }
             lock(&pool.inner.conforming).remove(&file);
         });
@@ -594,6 +619,7 @@ impl MediaPool {
 
     /// Write `frames` sample frames of `footage`'s audio at `rate` to `path` (raw interleaved
     /// stereo `f32`) a chunk at a time: the whole track was held in memory before it was written.
+    /// Fails when any chunk doesn't decode.
     #[cfg(not(target_arch = "wasm32"))]
     fn write_conformed(&self, footage: &Footage, path: &std::path::Path, frames: usize, rate: u32) -> std::io::Result<()> {
         use std::io::Write;
@@ -601,7 +627,7 @@ impl MediaPool {
         let mut at = 0usize;
         while at < frames {
             let n = (frames - at).min(1 << 16);
-            for v in self.decode_audio(footage, sample_time(at, rate), n, rate) {
+            for v in self.try_decode_audio(footage, sample_time(at, rate), n, rate).map_err(std::io::Error::other)? {
                 out.write_all(&v.to_le_bytes())?;
             }
             at += n;
@@ -645,19 +671,27 @@ impl MediaPool {
     /// applied the edit list's priming offset twice and ramped the start of every read: AAC
     /// footage not at the mix rate stuttered in previews and exports (#274).
     fn decode_audio(&self, footage: &Footage, start: Tick, frames: usize, rate: u32) -> Vec<f32> {
+        self.try_decode_audio(footage, start, frames, rate).unwrap_or_else(|e| {
+            log::warn!("media: audio of {}: {e}", footage.path);
+            vec![0.0; frames * 2]
+        })
+    }
+
+    /// [`MediaPool::decode_audio`], failing when the source can't be opened or read.
+    fn try_decode_audio(&self, footage: &Footage, start: Tick, frames: usize, rate: u32) -> std::result::Result<Vec<f32>, String> {
         let path: Arc<str> = footage.path.as_str().into();
-        let Some(src) = self.inner.source(&path) else { return vec![0.0; frames * 2] };
+        let src = self.inner.source(&path).ok_or("the file can't be opened")?;
         let s0 = start.to_units_floor(rate as i64);
         let native = src.info().audio.as_ref().map_or(rate, |a| a.sample_rate);
         if native == 0 || rate == 0 || native == rate {
-            return read_stereo(&src, &path, s0, frames, rate);
+            return read_stereo(&src, s0, frames, rate);
         }
         // Output sample `n` sits at source position n × native / rate.
         let (native_i, rate_i) = (i128::from(native), i128::from(rate));
         let first = (i128::from(s0) * native_i).div_euclid(rate_i);
         let last = ((i128::from(s0) + frames as i128) * native_i).div_euclid(rate_i) + 1;
-        let (Ok(first64), Ok(count)) = (i64::try_from(first), usize::try_from(last - first + 1)) else { return vec![0.0; frames * 2] };
-        let buf = read_stereo(&src, &path, first64, count, native);
+        let (Ok(first64), Ok(count)) = (i64::try_from(first), usize::try_from(last - first + 1)) else { return Ok(vec![0.0; frames * 2]) };
+        let buf = read_stereo(&src, first64, count, native)?;
         let mut out = Vec::with_capacity(frames * 2);
         for k in 0..frames as i128 {
             let pos = (i128::from(s0) + k) * native_i;
@@ -669,7 +703,7 @@ impl MediaPool {
                 out.push(a + (b - a) * f);
             }
         }
-        out
+        Ok(out)
     }
 
     /// A thumbnail of `footage` (its first frame) fitting in `max_side` × `max_side`, aspect kept.
@@ -771,6 +805,20 @@ impl Inner {
     /// The source of `path` when it is open already.
     fn open_source(&self, path: &str) -> Option<SharedSource> {
         lock(&self.sources).map.get(path).and_then(|e| e.slot.get().cloned().flatten())
+    }
+
+    /// The decoded frames of the animated GIF at `path`. The first caller decodes it, outside the
+    /// map's lock; callers asking for the same file meanwhile wait for that.
+    fn gif(&self, path: &Arc<str>) -> Result<Arc<Anim>> {
+        let slot = lock(&self.gifs).entry(path.clone()).or_default().clone();
+        let loaded = slot.get_or_init(|| {
+            let loaded = self.read(path).and_then(|bytes| Anim::load(&bytes));
+            loaded.map(Arc::new).map_err(|e| {
+                log::warn!("media: cannot decode {path}: {e}");
+                e.to_string()
+            })
+        });
+        loaded.clone().map_err(|e| MediaError::Decode(format!("{path}: {e}")))
     }
 
     /// The frame index (in the footage's interpreted rate) shown at source time `t`, after
@@ -1047,6 +1095,7 @@ impl Inner {
     ///
     /// `detached`: a movie not open already is opened for this frame only (thumbnails).
     fn decode(&self, loc: &Loc, footage: &Footage, detached: bool) -> Result<Pixels> {
+        let _profile = effectcraft_render::profile::span("decode");
         // A reduced-resolution preview: the full frame (cached, or decoded and not kept)
         // resampled exactly as the renderer resamples it.
         if let (Some(p), Some([rw, rh])) = (loc.preview, loc.key.preview) {
@@ -1054,7 +1103,16 @@ impl Inner {
             let cached = lock(&self.cache).lru.get(&base.key);
             let full = match cached {
                 Some(px) => px,
-                None => self.decode(&base, footage, detached)?,
+                // The full frame, decoded and not kept, then resampled exactly as the renderer
+                // resamples it (bit-identical to a full-size render scaled down; the faster
+                // quarter-pixel 4:2:0 conversion differs where colours clip).
+                None => match base.media_t.filter(|_| !gif_anim::is_gif(footage)) {
+                    Some(mt) => {
+                        let frame = self.video_frame(&base.key.path, mt, detached)?;
+                        Pixels::Packed(Arc::new(Packed::Video { frame, op: AlphaOp::of(footage) }))
+                    }
+                    None => self.decode(&base, footage, detached)?,
+                },
             };
             let img = full.image();
             if preview_size(img.width, p.w, p.h, p.s).is_none() {
@@ -1086,10 +1144,17 @@ impl Inner {
                 if let Some(img) = crate::avif::decode(path, &bytes, op)? {
                     return Ok(float(img));
                 }
+                // (an OpenEXR compression the decoder lacks came out transparent or as a missing
+                // channel error)
+                if path.to_ascii_lowercase().ends_with(".exr")
+                    && let Some(why) = crate::exr_channels::unsupported_compression(&bytes)
+                {
+                    return Err(MediaError::Decode(format!("{path}: {why}")));
+                }
                 let img = match image::load_from_memory(&bytes) {
                     Ok(img) => img,
                     // A multi-layer OpenEXR file without an unnamed RGB layer: its colour layer.
-                    Err(e) => crate::exr_channels::layered_image(&bytes).ok_or_else(|| MediaError::Decode(format!("{path}: {e}")))?,
+                    Err(e) => crate::exr_channels::cached_layered_image(path, bytes.clone()).ok_or_else(|| MediaError::Decode(format!("{path}: {e}")))?,
                 };
                 drop(bytes);
                 Ok(match pack_dynamic(img, op) {
@@ -1097,27 +1162,34 @@ impl Inner {
                     Err(packed) => Pixels::Packed(Arc::new(packed)),
                 })
             }
-            Some(mt) if footage.codec.eq_ignore_ascii_case("gif") => {
-                let bytes = self.read(path)?;
-                let img = crate::gif::frame(&bytes, mt)?;
-                Ok(match pack_dynamic(img, op) {
+            Some(mt) if gif_anim::is_gif(footage) => {
+                // A thumbnail decodes the GIF without keeping it.
+                let anim = if detached { Arc::new(Anim::load(&self.read(path)?)?) } else { self.gif(path)? };
+                let frame = anim.frame_at(Tick(mt.0)).ok_or_else(|| MediaError::Decode(format!("{path}: no frames")))?;
+                Ok(match pack_dynamic(frame.clone(), op) {
                     Ok(img) => float(img),
                     Err(packed) => Pixels::Packed(Arc::new(packed)),
                 })
             }
             Some(mt) => {
-                let src = match detached {
-                    false => self.source(path),
-                    true => self.open_source(path).or_else(|| {
-                        let mem = lock(&self.files).get(&**path).cloned();
-                        crate::open::open_source(path, mem).ok().map(|(s, _)| s)
-                    }),
-                }
-                .ok_or_else(|| MediaError::Io(format!("{path}: cannot open")))?;
-                let frame = src.video_frame(FrameRequest::full(filmcraft_time::Tick(mt.0))).map_err(MediaError::from)?;
+                let frame = self.video_frame(path, mt, detached)?;
                 Ok(Pixels::Packed(Arc::new(Packed::Video { frame, op })))
             }
         }
+    }
+
+    /// The decoded movie frame of `path` at media time `mt`. `detached`: a movie not open already
+    /// is opened for this frame only.
+    fn video_frame(&self, path: &Arc<str>, mt: Tick, detached: bool) -> Result<Arc<filmcraft_frame::VideoFrame>> {
+        let src = match detached {
+            false => self.source(path),
+            true => self.open_source(path).or_else(|| {
+                let mem = lock(&self.files).get(&**path).cloned();
+                crate::open::open_source(path, mem).ok().map(|(s, _)| s)
+            }),
+        }
+        .ok_or_else(|| MediaError::Io(format!("{path}: cannot open")))?;
+        src.video_frame(FrameRequest::full(filmcraft_time::Tick(mt.0))).map_err(MediaError::from)
     }
 }
 
@@ -1140,6 +1212,9 @@ impl FootageSource for MediaPool {
     }
     fn retain_files(&self, keep: &dyn Fn(&str) -> bool) {
         MediaPool::retain_files(self, keep);
+    }
+    fn forget(&self, path: &str) {
+        MediaPool::forget(self, path);
     }
     fn thumbnail(&self, footage: &Footage, max_side: u32) -> Option<Image> {
         if footage.missing {
@@ -1227,27 +1302,21 @@ impl MediaPool {
 
 /// `frames` stereo sample frames (interleaved) of `src` from sample `s0` at `rate` Hz, which
 /// FilmCraft serves as decoded when it is the source's own rate. Mono is duplicated to both
-/// channels; silence before the start and where decoding fails.
-fn read_stereo(src: &SharedSource, path: &str, s0: i64, frames: usize, rate: u32) -> Vec<f32> {
+/// channels; silence before the start. An error where decoding fails.
+fn read_stereo(src: &SharedSource, s0: i64, frames: usize, rate: u32) -> std::result::Result<Vec<f32>, String> {
     let mut out = vec![0.0; frames * 2];
     let skip = usize::try_from(s0.saturating_neg()).unwrap_or(0);
     if skip >= frames {
-        return out;
+        return Ok(out);
     }
-    let buf = match src.audio(s0.max(0), frames - skip, rate) {
-        Ok(b) => b,
-        Err(e) => {
-            log::warn!("media: audio of {path}: {e}");
-            return out;
-        }
-    };
-    let (Some(l), Some(r)) = (buf.channels.first(), buf.channels.get(1).or(buf.channels.first())) else { return out };
-    let Some(dst) = skip.checked_mul(2).and_then(|i| out.get_mut(i..)) else { return out };
+    let buf = src.audio(s0.max(0), frames - skip, rate).map_err(|e| e.to_string())?;
+    let (Some(l), Some(r)) = (buf.channels.first(), buf.channels.get(1).or(buf.channels.first())) else { return Ok(out) };
+    let Some(dst) = skip.checked_mul(2).and_then(|i| out.get_mut(i..)) else { return Ok(out) };
     for ([o0, o1], (a, b)) in dst.as_chunks_mut::<2>().0.iter_mut().zip(l.iter().zip(r)) {
         *o0 = *a;
         *o1 = *b;
     }
-    out
+    Ok(out)
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -1380,6 +1449,43 @@ mod tests {
         assert_eq!(&*psds.list[MAX_PSDS - 1].0, format!("/doc{}.psd", MAX_PSDS + 1));
     }
 
+    /// #324: audio that fails to decode isn't conformed. A conformed file of silence was written
+    /// instead, and as it is found by the file's path, size and date the footage stayed silent
+    /// in every later session (a renamed copy played).
+    #[test]
+    fn audio_that_fails_to_decode_is_not_conformed() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-conform-fail");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("song.mp3");
+        std::fs::write(&path, b"ID3, not really").unwrap();
+        let footage = Footage {
+            path: path.to_string_lossy().into(),
+            kind: FootageKind::Audio,
+            duration: Tick::from_seconds_f64(2.0),
+            has_audio: true,
+            ..Default::default()
+        };
+        let pool = MediaPool::new();
+        let conformed = dir.join("conformed");
+        pool.set_conform_folder(Some(conformed.clone()));
+        let file = pool.conformed_path(&footage.path, 48_000).unwrap();
+        assert!(pool.audio_samples(&footage, Tick::ZERO, 1024, 48_000).iter().all(|v| *v == 0.0));
+        for _ in 0..500 {
+            if lock(&pool.inner.conforming).is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(lock(&pool.inner.conforming).is_empty(), "the conform thread finished");
+        assert!(!file.exists() && !file.with_extension("tmp").exists(), "no conformed file was left");
+        assert!(lock(&pool.inner.conform_failed).contains(&file));
+        // Later reads go to the decoder without trying again.
+        pool.audio_samples(&footage, Tick::ZERO, 1024, 48_000);
+        assert!(lock(&pool.inner.conforming).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn frame_index_loops_and_clamps() {
         let r = FrameRate::FPS_30;
@@ -1419,6 +1525,32 @@ mod tests {
         c.get(&k(7));
         c.insert(k(10), img(), budget);
         assert!(c.get(&k(7)).is_some() && c.get(&k(8)).is_none());
+    }
+
+    /// #482: an OpenEXR file with HTJ2K compression (which the decoder lacks) says so on import
+    /// and when its frame is read, instead of "no non-deep rgb channels" or a transparent frame.
+    #[test]
+    fn htj2k_exr_is_reported_as_unsupported() {
+        use exr::prelude::*;
+        let channels =
+            AnyChannels::sort(vec![AnyChannel::new("R", FlatSamples::F32(vec![0.5; 4])), AnyChannel::new("G", FlatSamples::F32(vec![0.5; 4]))].into());
+        let image = exr::image::Image::from_layer(Layer::new((2, 2), LayerAttributes::default(), Encoding::UNCOMPRESSED, channels));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image.write().to_buffered(&mut bytes).unwrap();
+        let mut bytes = bytes.into_inner();
+        assert_eq!(crate::exr_channels::unsupported_compression(&bytes), None);
+        // The header's compression attribute (name, type, size 1, value) says HTJ2K32 (11).
+        let tag = b"compression\0compression\0\x01\0\0\0";
+        let at = bytes.windows(tag.len()).position(|w| w == tag).unwrap() + tag.len();
+        bytes[at] = 11;
+        let b: Arc<[u8]> = bytes.into();
+        let e = crate::probe_bytes("/shot.exr", b.clone()).unwrap_err().to_string();
+        assert!(e.contains("/shot.exr: OpenEXR HTJ2K compression isn't supported yet"), "{e}");
+        let pool = MediaPool::new();
+        pool.add_bytes("/shot.exr", b);
+        let f = Footage { path: "/shot.exr".into(), kind: FootageKind::Still, width: 2, height: 2, has_video: true, ..Default::default() };
+        let e = pool.frame_at(&f, Tick::ZERO).unwrap_err().to_string();
+        assert!(e.contains("HTJ2K compression isn't supported yet"), "{e}");
     }
 
     /// #411: Interpret Footage ▸ Preserve RGB reads a float OpenEXR's values as the file stores

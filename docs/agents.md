@@ -58,6 +58,23 @@ Desktop, Cursor and the like) take the same `command` and `args`.
 - **Bridge** (`["mcp", "--bridge", "9877"]`): drives a running `effectcraft --control 9877`, so you
   see every change live. Bridge mode adds `screenshot` and the `ui_*` tools.
 
+### From an installed release
+
+The release packages ship `effectcraft-cli` alongside the desktop app, so no build is needed:
+
+| Install | CLI |
+|---|---|
+| Windows (MSI) | `C:\Program Files\EffectCraft\effectcraft-cli.exe` by default (wherever you installed it otherwise), not on `PATH` |
+| Linux (deb, rpm) | `/usr/bin/effectcraft-cli` |
+| macOS | the separate `effectcraft-cli-<version>-macos-<arch>.zip` release asset (the `.app` holds only the desktop app) |
+
+```sh
+# Windows, default install folder
+claude mcp add effectcraft -- "C:\Program Files\EffectCraft\effectcraft-cli.exe" mcp
+# Linux, or macOS with the CLI unzipped onto PATH
+claude mcp add effectcraft -- effectcraft-cli mcp
+```
+
 The server speaks JSON-RPC 2.0 over stdio, one message per line, and supports MCP protocol versions
 2025-06-18, 2025-03-26 and 2024-11-05: tools (with structured results on 2025-06-18), resources and
 resource templates with subscriptions, workflow prompts and logging; see [MCP conventions](mcp.md).
@@ -111,9 +128,9 @@ See [MCP conventions](mcp.md) for core tools, resources, strict arguments, and p
 | `run_script {code, name?, timeout?}` | Run JavaScript with the After Effects-style scripting object model (`app.project`, `comp.layers.addText(…)`, `layer.property("ADBE Transform Group").property("ADBE Position").setValueAtTime(…)`…). Returns `{ok, result, output, error: {message, line, column}}`; edits are undoable. Stops after `timeout` seconds (default 300, `0` = none) or on `notifications/cancelled`. |
 | `doc_inspect` / `get_comp {comp?}` | Project overview (items, active comp, time, selection, undo stack) with the active composition; one comp's settings and layers. |
 | `get_layer {layer, comp?, time?, depth?, flat?}` | A layer's property tree (`depth` limits how many group levels expand). Every node has a `path`. |
-| `get_property {layer, path, comp?, time?}` | Value at a time, keyframes and expression. |
-| `set_property {layer, path, value?, time?, expression?, comp?}` | Sets a static value. With `time` it sets a keyframe; with `expression` it sets an expression. |
-| `add_keyframe {layer, path, time+value \| keys:[...], interpolation?, comp?}` | Adds keys, then optionally applies linear/bezier/hold/easyEase. |
+| `get_property {layer, path, comp?, time?}` | A leaf property's value at a time, keyframes and expression. Group paths (for example `geometryOptions`) contain children: inspect them with `get_layer`, then query a leaf such as `geometryOptions/extrusionDepth`. |
+| `set_property {layer, path, value?, time?, timeBase?, expression?, comp?}` | Sets a static value. With `time` it sets a keyframe (`timeBase: "comp"` for comp seconds); with `expression` it sets an expression. |
+| `add_keyframe {layer, path, time+value \| keys:[...], timeBase?, interpolation?, comp?}` | Adds keys (layer seconds, or comp seconds with `timeBase: "comp"`), then optionally applies linear/bezier/hold/easyEase. |
 | `list_effects {filter?, brief?}` | Effect ids, names, categories, GPU / 32-bpc support and parameters (id, name, default, a slider's valid `range`, a popup's `options`). `brief: true` returns only `{id, name}` (~19 KB instead of ~360 KB). |
 | `list_fonts {query?, rescan?}` | Font families text layers can use, bundled and installed, with their styles, origin and own-language name; `rescan` picks up fonts installed since launch. |
 | `add_effect {layer, effect, values?, comp?}` | Apply an effect and set its parameters in one call and one undo step (a failing value leaves nothing applied); returns the instance path (`effects/#n`) and its parameter paths. |
@@ -158,6 +175,28 @@ To notice edits made by someone else without polling, the control channel's `eve
 sends `project.changed` and `selection.changed` lines with the new `revision`
 ([control-protocol.md](control-protocol.md#change-events)); MCP clients subscribe to resources
 ([mcp.md](mcp.md#notifications)).
+
+Use MCP `execute_command` for engine commands `prop.set`, `prop.addKey`, `keys.set` and
+`keys.select` with `timeBase: "layer" | "comp"`; omitted means `layer`. The convenience tools
+`set_property` and `add_keyframe` take the same `timeBase` (layer time when omitted). The input base applies to
+both `keys.set.time` and `newTime`, and to every `keys.select.keys[].time`.
+Omitted `prop.set` or `prop.addKey` times use the target comp's CTI. Supplied write times snap
+to its nearest comp frame before conversion to stored layer time, including stretched or
+reversed layers; existing `keys.set` neighbor constraints and roving adjustment still apply.
+
+Explicit bases add timing metadata to mutation replies; `keys.select` reports timing in
+`keys[]` for the resulting selection. Returned key `time` and `layerTime` are layer seconds;
+`compTime` is comp seconds. Omitted-base `prop.set`, `prop.addKey` and `keys.select` retain
+their existing JSON value/count replies even outside the active range. Timing metadata
+carries outside-range warnings; the existing objects from `keys.set` and `prop.get.keys[]`
+also report both bases and warnings. `prop.get.time` is comp seconds. Separated Position
+`prop.set` retains per-axis replies; for these commands, `path` or `prop` identifies a property, not a group.
+
+Set offsets with `layer.timing {layer, start: 10.5}`; `in`, `out` and `delta` also use comp seconds.
+For an unstretched layer starting at 10.5 s in a 30 fps comp,
+`prop.addKey {layer: "A", path: "transform/opacity", time: 15.3,
+timeBase: "comp", value: 0}` writes a key at comp 15.3 s (layer 4.8 s), matching
+`prop.get {layer: "A", path: "transform/opacity", time: 15.3}`.
 
 Command params are checked against each command's `params` doc. An unknown key, such as
 `layer.select {"index": 2}`, returns an error that lists the accepted keys (here `layers, add, toggle`)
@@ -416,11 +455,11 @@ scale and rotation; nothing is rendered, so it is cheap.
 
 Things that tripped up a long agent-driven session (a multi-scene 3D piece built entirely over MCP).
 
-- **Layer time vs comp time.** `add_keyframe`, `set_property` with `time`, `prop.addKey`,
-  `keys.select` and `keys.set` take layer time; `get_property` and `render_preview` take comp time;
-  `run_script`'s `setValueAtTime` and `keyTime` use comp time, as in After Effects. On a layer that
-  doesn't start at 0, such as a nested comp placed later, subtract the layer's start time from the
-  comp time before keying (unstretched layers), or set the keys from `run_script`
+- **Layer time vs comp time.** `add_keyframe` and `set_property` with `time` take layer time;
+  `get_property` and `render_preview` take comp time. Those tools and the engine keyframe commands
+  default to layer time; pass `timeBase: "comp"` to supply comp seconds on offset or
+  stretched layers. `run_script`'s `setValueAtTime` and `keyTime` also use comp time. Without an
+  explicit engine time base, subtract the layer's start time before keying an unstretched layer
   ([#257](https://github.com/storytold/effectcraft/issues/257)).
 - **Moving a layer in time.** `command_run layer.timing {"layers":["Scene 2"],"start":5.1}` sets
   the start time in comp seconds and moves the in and out points with it.
@@ -482,7 +521,8 @@ build real projects through these interfaces; they are worked examples of everyt
   `{"colors":[[0,"#0080ff"],[1,[1,1,0]]],"opacities":[[0,1],[1,0.5]]}`.
 * **Image sequences**: `file.import {"paths":["/r/shot_0001.png"]}` imports the file's whole
   numbered run as one item (several picked frames: that range; a folder: each run in it;
-  `"sequence": false`: one still; `"alphabetical": true`: Force Alphabetical Order, the files
+  `"sequence": false`: one still; dropped files, `"drag": true`, import as stills unless
+  `"sequence": true`, as in After Effects; `"alphabetical": true`: Force Alphabetical Order, the files
   play one after another) at `frameRate` or 30 fps (Settings ▸ Import). Missing frames show
   colour bars, as in After Effects. `file.interpretFootage {"items":[id], "frameRate":12,
   "startTimecode":1001}` conforms them and sets Override Start (the item and layers that ran to its end get the new
@@ -508,6 +548,14 @@ build real projects through these interfaces; they are worked examples of everyt
 * **Essential Graphics**: controls can be addressed by name (`essential.set {"layer":"#1",
   "control":"Title","value":"John Smith"}`); a command that targets an explicit `comp` runs even
   when the active comp would disable it (`essential.exportTemplate {"comp":"Lower Third", …}`).
+  The CLI also renders an exported template directly:
+  `effectcraft-cli render --template lt.ectemplate --values values.json --out 'title_[#####].png'`.
+  `values.json` is an object such as `{"Title":"John Smith","Bar Color":"#00c080","Bar Opacity":50}`;
+  names follow `essential.set`, including its case-insensitive matching. Values override one
+  imported instance; the template file and its source controls keep their defaults. Omit
+  `--values` to render those defaults, or use the same options with `render-frame` for a PNG.
+  Values must fit in 1 MiB. Invalid JSON, unknown controls and invalid values fail before rendering.
+  Template mode cannot be combined with `--project`, `--demo`, `--bridge`, `--queue` or `--comp`.
 * **History**: Levels of Undo defaults to 32 (`prefs.set {"key":"general.undoLevels","value":99}`);
   `history` lists branches and `history {"goto": id}` jumps between them. A command that changes
   nothing (a value set to what it already is) records no undo step. `get_state` reports `dirty`
@@ -784,6 +832,8 @@ styles, origin (`bundled`, `system`, `user`) and own-language name (`{"query":"g
 by name; `{"rescan":true}` first picks up fonts installed since launch). Pass a listed `family` and
 one of its `styles` to `layer.setText {"font", "style"}`; `text.fontFeatures` says which OpenType
 options a font draws with its own glyphs.
+A tool with its own font library can hand it over without installing it: folders listed in
+`EFFECTCRAFT_FONT_DIRS` (a path list, `:`-separated, `;` on Windows) are scanned like the system font folders.
 
 In expressions, `text.sourceText.style` / `getStyleAt(i, t)` read styles and the setters
 (`setFontSize(v, start?, count?)`, `setFillColor`, `setText`, `setJustification`…) return a

@@ -1,409 +1,414 @@
-//! Relinking footage that moved (gaps.md G4; After Effects' Replace Footage on a missing file,
-//! which then finds the other missing files in the same place).
-//!
-//! - `footage.relink {item, path}`: point a footage item at `path`, keeping its interpretation, and
-//!   relink every other missing item that sits in the same place relative to it (the folder moved,
-//!   or a drive was renamed). One undo step.
-//! - `footage.relinkFolder {folder, depth?}`: look in `folder` (and its subfolders, `depth` levels,
-//!   default 3) for every missing item's file by name. One undo step.
-//! - When a project opens from a folder it wasn't saved in, the footage check ([`moved_candidates`])
-//!   tries each missing file at the same place under the project's new folder.
-//!
-//! Paths are compared by their parts, split on `/` and `\`, so a project made on Windows relinks on
-//! macOS and the other way round.
+//! Recover moved media without replacing interpretation, sequence ranges or layer timing.
 
-use effectcraft_project::{Footage, FootageKind, ItemId, ItemKind, Project};
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use effectcraft_project::{Footage, FootageKind, ItemId, ItemKind};
 use serde_json::{Value, json};
 
 use super::{CommandSpec, bad, str_p};
-use crate::{Result, Services, Session, cmd};
+use crate::{Result, Session, cmd};
 
-/// Most files a folder search looks at.
-const MAX_SEARCH_FILES: usize = 50_000;
-/// Deepest folder search.
-const MAX_DEPTH: u64 = 8;
-/// Trailing parts of a path tried under a moved project's folder.
-const MOVED_PARTS: usize = 4;
+const COMMAND: &str = "file.relinkFootage";
+const ENTRY_LIMIT: usize = 100_000;
 
-fn parts(path: &str) -> Vec<&str> {
-    path.split(['/', '\\']).filter(|p| !p.is_empty()).collect()
+fn enabled(_: &Session) -> std::result::Result<(), String> {
+    if cfg!(target_arch = "wasm32") { Err("folder relinking requires the desktop filesystem".into()) } else { Ok(()) }
 }
 
-/// The separator `path` uses (Windows paths keep theirs).
-fn sep_of(path: &str) -> char {
-    if path.contains('\\') && !path.contains('/') { '\\' } else { '/' }
-}
-
-fn file_name(path: &str) -> &str {
-    parts(path).last().copied().unwrap_or("")
-}
-
-/// `prefix` and `rest` joined with `prefix`'s separator.
-fn join(prefix: &str, rest: &[&str]) -> String {
-    let sep = sep_of(prefix);
-    let mut out = prefix.trim_end_matches(['/', '\\']).to_string();
-    for p in rest {
-        out.push(sep);
-        out.push_str(p);
-    }
-    out
-}
-
-/// What moved: `old` became `new`. The parts they end with in common are the same file's place
-/// inside the moved folder; what comes before is the folder's old and new location.
-/// `("/a/b/shots/x.mov", "/c/shots/x.mov")` → `(["a", "b"], "/c")`.
-fn moved_root<'a>(old: &'a str, new: &str) -> Option<(Vec<&'a str>, String)> {
-    let (o, n) = (parts(old), parts(new));
-    let common = o.iter().rev().zip(n.iter().rev()).take_while(|(a, b)| a == b).count();
-    // At least the file name must match, else it's a different file (then only its folder moved).
-    let common = common.max(1).min(o.len()).min(n.len());
-    let old_root: Vec<&str> = o.get(..o.len() - common)?.to_vec();
-    // The new root keeps a leading `/` or a drive letter as written.
-    let new_parts = n.len() - common;
-    let mut new_root = String::new();
-    if new.starts_with('/') {
-        new_root.push('/');
-    } else if new.starts_with("\\\\") {
-        new_root.push_str("\\\\");
-    }
-    let sep = sep_of(new);
-    for (i, p) in n.iter().take(new_parts).enumerate() {
-        if i > 0 {
-            new_root.push(sep);
-        }
-        new_root.push_str(p);
-    }
-    Some((old_root, new_root))
-}
-
-/// `path` under the moved root, when it was under the old one.
-fn remap(path: &str, old_root: &[&str], new_root: &str) -> Option<String> {
-    let p = parts(path);
-    if p.len() <= old_root.len() || p.get(..old_root.len())? != old_root {
-        return None;
-    }
-    Some(join(new_root, p.get(old_root.len()..)?))
-}
-
-/// The item's file and, for an image sequence, every frame, moved by `f`; `None` unless its main
-/// file maps.
-fn moved_footage(footage: &Footage, f: impl Fn(&str) -> Option<String>) -> Option<Footage> {
-    let mut nf = footage.clone();
-    nf.path = f(&footage.path)?;
-    nf.sequence = footage.sequence.iter().map(|p| f(p).unwrap_or_else(|| p.clone())).collect();
-    nf.missing = false;
-    Some(nf)
-}
-
-fn present(s: &dyn Services, f: &Footage) -> bool {
-    !f.path.is_empty() && s.exists(&f.path)
-}
-
-/// Footage items whose file is gone (flagged by the footage check, or not there now).
-fn missing_items(s: &Session) -> Vec<(ItemId, Footage)> {
-    s.project
-        .items
-        .values()
-        .filter_map(|i| match &i.kind {
-            ItemKind::Footage(f) if f.kind != FootageKind::Data && !f.path.is_empty() && (f.missing || !present(s.services.as_ref(), f)) => {
-                Some((i.id, f.clone()))
+fn files(folder: &Path, ctl: &crate::jobs::TaskCtl) -> std::result::Result<BTreeMap<String, Vec<String>>, String> {
+    let mut pending = vec![folder.to_path_buf()];
+    let mut found: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut count = 0usize;
+    while let Some(dir) = pending.pop() {
+        ctl.message(dir.display().to_string());
+        let entries = std::fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        for entry in entries {
+            if ctl.cancelled() {
+                return Err(crate::render_queue::CANCELLED.into());
             }
-            _ => None,
+            count = count.saturating_add(1);
+            if count > ENTRY_LIMIT {
+                return Err(format!("search exceeds {ENTRY_LIMIT} entries; choose a smaller folder"));
+            }
+            let entry = entry.map_err(|e| format!("{}: {e}", dir.display()))?;
+            let ty = entry.file_type().map_err(|e| format!("{}: {e}", entry.path().display()))?;
+            // Do not follow symlinks: no cycles or traversal outside the chosen tree.
+            if ty.is_dir() {
+                pending.push(entry.path());
+            } else if ty.is_file()
+                && let (Some(name), Some(path)) = (entry.file_name().to_str(), entry.path().to_str())
+            {
+                found.entry(name.to_string()).or_default().push(path.to_string());
+            }
+        }
+    }
+    for paths in found.values_mut() {
+        paths.sort();
+    }
+    Ok(found)
+}
+
+fn compatible(old: &Footage, new: &Footage) -> bool {
+    let kind = if old.kind == FootageKind::Sequence { FootageKind::Still } else { old.kind };
+    kind == new.kind
+        && old.width == new.width
+        && old.height == new.height
+        && old.has_video == new.has_video
+        && old.has_audio == new.has_audio
+        && (old.kind == FootageKind::Audio || (old.width > 0 && old.height > 0))
+        && (old.codec.is_empty() || old.codec == new.codec)
+        && (!matches!(old.kind, FootageKind::Video | FootageKind::Audio)
+            || (old.native_rate.unwrap_or(old.frame_rate) == new.frame_rate && old.frame_rate.frame_at(old.duration) == new.frame_rate.frame_at(new.duration)))
+}
+
+fn sequence_at(old: &Footage, path: &str) -> Option<Vec<String>> {
+    let parent = Path::new(path).parent()?;
+    old.sequence
+        .iter()
+        .map(|file| {
+            let mapped = parent.join(Path::new(file).file_name()?);
+            std::fs::symlink_metadata(&mapped).is_ok_and(|m| m.is_file()).then(|| mapped.to_str().map(str::to_string)).flatten()
         })
         .collect()
 }
 
-/// Where a file a moved project lost may be now: the same place under the project's new folder,
-/// trying the longest tail of its old path first (`/old/proj/shots/a.mov` with the project now in
-/// `/new/proj` → `/new/proj/old/proj/shots/a.mov`, …, `/new/proj/shots/a.mov`, `/new/proj/a.mov`).
-pub(crate) fn moved_candidates(project_dir: &str, path: &str) -> Vec<String> {
-    let p = parts(path);
-    (1..=MOVED_PARTS.min(p.len())).rev().filter_map(|k| p.get(p.len() - k..)).map(|tail| join(project_dir, tail)).collect()
-}
-
-/// A missing item found again under a moved project's folder ([`moved_candidates`]), with its
-/// sequence frames moved alongside.
-pub(crate) fn find_moved(services: &dyn Services, project_dir: &str, f: &Footage) -> Option<Footage> {
-    moved_candidates(project_dir, &f.path).into_iter().filter(|c| services.exists(c)).find_map(|hit| {
-        let (old_root, new_root) = moved_root(&f.path, &hit)?;
-        moved_footage(f, |q| if q == f.path { Some(hit.clone()) } else { remap(q, &old_root, &new_root) })
+fn run(s: &mut Session, p: &Value) -> Result<Value> {
+    let folder = str_p(p, "folder").filter(|f| !f.trim().is_empty()).ok_or_else(|| bad(COMMAND, "missing `folder`"))?;
+    let folder = std::fs::canonicalize(folder).map_err(|e| bad(COMMAND, format!("{folder}: {e}")))?;
+    if !folder.is_dir() {
+        return Err(bad(COMMAND, "folder must be a directory"));
+    }
+    let importer = s.importer.clone().ok_or_else(|| bad(COMMAND, "media import is not available in this build"))?;
+    let services = s.services.clone();
+    let missing: Vec<(ItemId, Footage)> = s
+        .project
+        .items
+        .values()
+        .filter_map(|item| match &item.kind {
+            ItemKind::Footage(f) if !f.path.is_empty() && !services.exists(&f.path) => Some((item.id, f.clone())),
+            _ => None,
+        })
+        .collect();
+    let dry_run = p.get("dryRun").and_then(Value::as_bool).unwrap_or(false);
+    let wait = p.get("wait").and_then(Value::as_bool).unwrap_or(false);
+    s.spawn_task("relink", "Relinking missing footage", wait, move |ctl| {
+        let index = files(&folder, ctl)?;
+        let mut rows = vec![];
+        let mut updates = vec![];
+        for (n, (id, old)) in missing.iter().enumerate() {
+            if !ctl.progress(n as u64, missing.len() as u64) {
+                return Err(crate::render_queue::CANCELLED.into());
+            }
+            let supported = matches!(old.kind, FootageKind::Still | FootageKind::Sequence | FootageKind::Video | FootageKind::Audio)
+                && old.layer.is_none() && old.page == 0;
+            let name = Path::new(&old.path).file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let paths = index.get(name).cloned().unwrap_or_default();
+            let mut candidates = vec![];
+            let mut accepted = vec![];
+            for path in paths {
+                if ctl.cancelled() {
+                    return Err(crate::render_queue::CANCELLED.into());
+                }
+                let mut reason = "source type requires manual replacement".to_string();
+                let mut confidence = "low";
+                if supported {
+                    match importer.probe(&path) {
+                        Ok(f) if compatible(old, &f) => {
+                            if old.kind != FootageKind::Sequence || (!old.sequence.is_empty() && sequence_at(old, &path).is_some()) {
+                                confidence = "high";
+                                reason = "exact filename and compatible source metadata".into();
+                                accepted.push(path.clone());
+                            } else {
+                                reason = "sequence is incomplete".into();
+                            }
+                        }
+                        Ok(_) => reason = "source metadata differs".into(),
+                        Err(e) => reason = format!("cannot decode candidate: {e}"),
+                    }
+                }
+                if ctl.cancelled() {
+                    return Err(crate::render_queue::CANCELLED.into());
+                }
+                candidates.push(json!({"path": path, "confidence": confidence, "reason": reason}));
+            }
+            let status = if !supported { "unsupported" } else if candidates.is_empty() { "notFound" } else if candidates.len() > 1 { "ambiguous" } else if accepted.len() == 1 { "matched" } else { "incompatible" };
+            if status == "matched" && let Some(path) = accepted.first() {
+                let mut new = old.clone();
+                new.path = path.clone();
+                if old.kind == FootageKind::Sequence {
+                    new.sequence = sequence_at(old, path).ok_or_else(|| "sequence changed during search; run the search again".to_string())?;
+                }
+                new.missing = false;
+                updates.push((*id, old.clone(), new));
+            }
+            rows.push(json!({"item": id.0, "original": old.path, "status": status, "candidates": candidates}));
+        }
+        ctl.progress(missing.len() as u64, missing.len() as u64);
+        let apply: crate::jobs::Apply = Box::new(move |s| {
+            // A background search must not overwrite edits made while it was running.
+            for (id, old, new) in &updates {
+                if s.project.item(*id).is_none_or(|i| !matches!(&i.kind, ItemKind::Footage(f) if f == old))
+                    || services.exists(&old.path) || !services.exists(&new.path)
+                    || (new.kind == FootageKind::Sequence && new.sequence.iter().any(|p| !services.exists(p)))
+                {
+                    return Err(bad(COMMAND, "footage changed during search; run the search again"));
+                }
+            }
+            let matched = updates.len();
+            if !dry_run && !updates.is_empty() {
+                s.edit("Relink Missing Footage", None, |project, _| {
+                    for (id, _, new) in updates {
+                        if let Some(item) = project.item_mut(id) {
+                            item.kind = ItemKind::Footage(new);
+                        }
+                    }
+                    Ok(())
+                })?;
+            }
+            let unresolved = rows.len().saturating_sub(matched);
+            let toast = format!("{} {matched} high-confidence match(es); {unresolved} unresolved. Duplicate filenames are left for Replace Footage.", if dry_run { "Found" } else { "Relinked" });
+            Ok(json!({"dryRun": dry_run, "matched": matched, "relinked": if dry_run { 0 } else { matched }, "unresolved": unresolved, "items": rows, "toast": toast}))
+        });
+        Ok(apply)
     })
 }
 
-/// The folder a project file is in.
-pub(crate) fn project_dir(project_path: &str) -> Option<String> {
-    let p = parts(project_path);
-    if p.len() < 2 {
-        return None;
-    }
-    let mut dir = join(if project_path.starts_with('/') { "/" } else { "" }, p.get(..p.len() - 1)?);
-    if !project_path.starts_with('/') {
-        dir = dir.trim_start_matches(['/', '\\']).to_string();
-    }
-    Some(dir)
-}
-
-/// Relink `found` in one undo step and say how many.
-fn apply(s: &mut Session, label: &str, found: Vec<(ItemId, Footage)>) -> Result<Value> {
-    if found.is_empty() {
-        return Ok(json!({"relinked": [], "stillMissing": missing_items(s).len()}));
-    }
-    let ids: Vec<u64> = found.iter().map(|(id, _)| id.0).collect();
-    s.edit(label, None, |proj: &mut Project, _| {
-        for (id, nf) in found {
-            if let Some(it) = proj.item_mut(id) {
-                it.kind = ItemKind::Footage(nf);
-            }
-        }
-        Ok(())
-    })?;
-    s.events.push(crate::Event::PurgeCaches);
-    let still = missing_items(s).len();
-    s.toast(match still {
-        0 => format!("Relinked {} footage item(s)", ids.len()),
-        n => format!("Relinked {} footage item(s); {n} still missing", ids.len()),
-    });
-    Ok(json!({"relinked": ids, "stillMissing": still}))
-}
-
-/// The other missing items that moved the way `item` did (`old_path` → `new_path`): the same place
-/// under the moved folder, else the same name in the new file's folder. Used by `footage.relink`
-/// and by Replace Footage on a missing item.
-pub(crate) fn moved_with(s: &Session, item: ItemId, old_path: &str, new_path: &str) -> Vec<(ItemId, Footage)> {
-    let Some((old_root, new_root)) = moved_root(old_path, new_path) else { return vec![] };
-    let services = s.services.clone();
-    let new_dir = project_dir(new_path);
-    let mut found = vec![];
-    for (id, f) in missing_items(s) {
-        if id == item {
-            continue;
-        }
-        let same_place = moved_footage(&f, |q| remap(q, &old_root, &new_root)).filter(|nf| present(services.as_ref(), nf));
-        let same_folder = || {
-            let dir = new_dir.as_deref()?;
-            let dir_parts = parts(dir);
-            let old_dir_len = parts(&f.path).len().checked_sub(1)?;
-            let old_dir: Vec<&str> = parts(&f.path).get(..old_dir_len)?.to_vec();
-            moved_footage(&f, |q| remap(q, &old_dir, dir).or_else(|| Some(join(dir, &[file_name(q)])))).filter(|nf| {
-                // Only frames in that one folder (a name match, not a guess deeper down).
-                present(services.as_ref(), nf) && parts(&nf.path).len() == dir_parts.len() + 1
-            })
-        };
-        if let Some(nf) = same_place.or_else(same_folder) {
-            found.push((id, nf));
-        }
-    }
-    found
-}
-
-/// `footage.relink {item, path}`
-fn relink(s: &mut Session, p: &Value) -> Result<Value> {
-    const CMD: &str = "footage.relink";
-    let path = str_p(p, "path").filter(|p| !p.trim().is_empty()).ok_or_else(|| bad(CMD, "missing `path` (the file's new location)"))?.to_string();
-    let item = p.get("item").and_then(Value::as_u64).map(ItemId).ok_or_else(|| bad(CMD, "missing `item` (a footage item id)"))?;
-    let Some(ItemKind::Footage(old)) = s.project.item(item).map(|i| &i.kind) else { return Err(bad(CMD, "`item` is not a footage item")) };
-    let old = old.clone();
-    if !s.services.exists(&path) {
-        return Err(bad(CMD, format!("there is no file at {path}")));
-    }
-    let (old_root, new_root) = moved_root(&old.path, &path).ok_or_else(|| bad(CMD, "cannot compare the old and new paths"))?;
-    // The item itself: its file is `path`; its sequence frames move with it.
-    let main =
-        moved_footage(&old, |q| if q == old.path { Some(path.clone()) } else { remap(q, &old_root, &new_root) }).ok_or_else(|| bad(CMD, "cannot relink"))?;
-    let mut found = vec![(item, main)];
-    found.extend(moved_with(s, item, &old.path, &path));
-    apply(s, "Relink Footage", found)
-}
-
-/// The files under `dir`, `depth` levels down, at most [`MAX_SEARCH_FILES`].
-fn walk(s: &dyn Services, dir: &str, depth: u64, out: &mut Vec<String>) {
-    if out.len() >= MAX_SEARCH_FILES {
-        return;
-    }
-    let files = s.list_dir(dir);
-    out.extend(files.into_iter().take(MAX_SEARCH_FILES.saturating_sub(out.len())));
-    if depth == 0 {
-        return;
-    }
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
-    let mut subs: Vec<String> = rd
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()) && !e.file_name().to_string_lossy().starts_with('.'))
-        .map(|e| e.path().to_string_lossy().to_string())
-        .collect();
-    subs.sort();
-    for d in subs {
-        walk(s, &d, depth - 1, out);
-    }
-}
-
-/// `footage.relinkFolder {folder, depth?}`
-fn relink_folder(s: &mut Session, p: &Value) -> Result<Value> {
-    const CMD: &str = "footage.relinkFolder";
-    let folder = str_p(p, "folder").filter(|f| !f.trim().is_empty()).ok_or_else(|| bad(CMD, "missing `folder`"))?.to_string();
-    let depth = match p.get("depth") {
-        None | Some(Value::Null) => 3,
-        Some(v) => v.as_u64().filter(|d| *d <= MAX_DEPTH).ok_or_else(|| bad(CMD, format!("`depth` must be 0 to {MAX_DEPTH}")))?,
-    };
-    if !s.services.is_dir(&folder) {
-        return Err(bad(CMD, format!("{folder} is not a folder")));
-    }
-    let mut files = vec![];
-    walk(s.services.as_ref(), &folder, depth, &mut files);
-    // Name → the first file with it (folders sorted, so the shallowest, then alphabetical).
-    let mut by_name: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    for f in files {
-        by_name.entry(file_name(&f).to_string()).or_insert(f);
-    }
-    let services = s.services.clone();
-    let mut found = vec![];
-    for (id, f) in missing_items(s) {
-        let Some(hit) = by_name.get(file_name(&f.path)) else { continue };
-        let Some((old_root, new_root)) = moved_root(&f.path, hit) else { continue };
-        if let Some(nf) =
-            moved_footage(&f, |q| if q == f.path { Some(hit.clone()) } else { remap(q, &old_root, &new_root) }).filter(|nf| present(services.as_ref(), nf))
-        {
-            found.push((id, nf));
-        }
-    }
-    apply(s, "Relink Footage", found)
-}
-
-/// `footage.missing`: the missing footage items and where they were.
-fn missing(s: &mut Session, _: &Value) -> Result<Value> {
-    let list: Vec<Value> = missing_items(s)
-        .into_iter()
-        .map(|(id, f)| json!({"item": id.0, "name": s.project.item(id).map(|i| i.name.clone()).unwrap_or_default(), "path": f.path}))
-        .collect();
-    Ok(json!({"missing": list}))
-}
-
-fn has_footage(s: &Session) -> std::result::Result<(), String> {
-    if s.project.items.values().any(|i| matches!(i.kind, ItemKind::Footage(_))) { Ok(()) } else { Err("the project has no footage".into()) }
-}
-
 pub fn specs() -> Vec<CommandSpec> {
-    vec![
-        cmd!(
-            "footage.relink",
-            "Relink Footage",
-            [],
-            None,
-            "{item, path} — point a footage item at its file's new location (keeps the interpretation) and relink the other missing files found in the same place",
-            has_footage,
-            relink
-        ),
-        cmd!(
-            "footage.relinkFolder",
-            "Relink Missing Footage in Folder...",
-            ["File", "Dependencies"],
-            None,
-            "{folder, depth? (subfolder levels, default 3)} — find every missing footage file in `folder` by name and relink it",
-            has_footage,
-            relink_folder
-        ),
-        crate::query!("footage.missing", "Missing Footage", "{} → {missing: [{item, name, path}]}", missing),
-    ]
+    vec![cmd!(
+        "file.relinkFootage",
+        "Relink Missing Footage...",
+        ["File", "Dependencies"],
+        None,
+        "{folder: string (recursive desktop search, no symlinks; max 100000 entries), dryRun?: bool (report only), wait?: bool (return results inline; otherwise jobs.list/jobs.wait)} — relinks only unique exact filenames with compatible metadata; preserves interpretation and sequence ranges. Reports high/low confidence and ambiguous, incompatible, unsupported or notFound items.",
+        enabled,
+        run
+    )]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    struct Probe;
+    impl crate::Importer for Probe {
+        fn probe(&self, path: &str) -> std::result::Result<Footage, String> {
+            if std::fs::read(path).map_err(|e| e.to_string())? != b"valid" {
+                return Err("invalid media".into());
+            }
+            Ok(Footage { path: path.into(), width: 64, height: 32, has_video: true, codec: "PNG".into(), ..Default::default() })
+        }
+    }
+
+    struct Fixture(std::path::PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let dir = std::env::temp_dir().join(format!("ec-relink-{}-{}", std::process::id(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+            std::fs::create_dir(&dir).unwrap();
+            Self(std::fs::canonicalize(dir).unwrap())
+        }
+        fn file(&self, name: &str, bytes: &[u8]) -> String {
+            let path = self.0.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, bytes).unwrap();
+            path.to_str().unwrap().into()
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    fn setup(dir: &Fixture, name: &str) -> (Session, ItemId, Footage) {
+        let mut s = Session { importer: Some(Arc::new(Probe)), ..Default::default() };
+        let path = dir.file(&format!("old/{name}"), b"valid");
+        let id = s.execute("file.import", json!({"paths": [path], "sequence": false})).unwrap()["items"][0].as_u64().unwrap();
+        let id = ItemId(id);
+        let ItemKind::Footage(f) = &mut Arc::make_mut(&mut s.project).item_mut(id).unwrap().kind else { panic!("footage") };
+        f.invert_alpha = true;
+        f.loop_count = 3;
+        f.start_timecode = Some(1001);
+        let old = f.clone();
+        std::fs::remove_file(&old.path).unwrap();
+        (s, id, old)
+    }
+
+    fn search(s: &mut Session, dir: &Fixture, dry: bool) -> Value {
+        s.execute(COMMAND, json!({"folder": dir.0.join("new"), "wait": true, "dryRun": dry})).unwrap()
+    }
+
+    fn get(s: &Session, id: ItemId) -> Footage {
+        let ItemKind::Footage(f) = &s.project.item(id).unwrap().kind else { panic!("footage") };
+        f.clone()
+    }
 
     #[test]
-    fn moved_roots_and_remaps() {
-        let (old, new) = moved_root("/a/b/shots/x.mov", "/c/shots/x.mov").unwrap();
-        assert_eq!((old, new.as_str()), (vec!["a", "b"], "/c"));
-        assert_eq!(remap("/a/b/shots/y.mov", &["a", "b"], "/c").as_deref(), Some("/c/shots/y.mov"));
-        assert_eq!(remap("/a/z/y.mov", &["a", "b"], "/c"), None);
-        // Windows to macOS.
-        let (old, new) = moved_root("D:\\Work\\Job\\audio\\m.wav", "/Volumes/Work/Job/audio/m.wav").unwrap();
-        assert_eq!((old, new.as_str()), (vec!["D:"], "/Volumes"));
-        assert_eq!(remap("D:\\Work\\Job\\img\\a.png", &["D:"], "/Volumes").as_deref(), Some("/Volumes/Work/Job/img/a.png"));
-        // A different file name: only the folder moved.
-        let (old, new) = moved_root("/a/x.mov", "/b/y.mov").unwrap();
-        assert_eq!((old, new.as_str()), (vec!["a"], "/b"));
-        assert_eq!(
-            moved_candidates("/new/p", "/old/p/shots/a.mov"),
-            ["/new/p/old/p/shots/a.mov", "/new/p/p/shots/a.mov", "/new/p/shots/a.mov", "/new/p/a.mov"]
-        );
-        assert_eq!(project_dir("/x/y/p.ecproj").as_deref(), Some("/x/y"));
-        assert_eq!(project_dir("p.ecproj"), None);
-        // Hostile input doesn't panic.
-        for (a, b) in [("", ""), ("/", "/"), ("x", ""), ("\\\\", "//"), ("/a", "/a/b/c")] {
-            let _ = moved_root(a, b);
-            let _ = moved_candidates(b, a);
-            let _ = project_dir(a);
-        }
-    }
-
-    fn temp(name: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("ec-relink-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        d
-    }
-
-    fn add(s: &mut Session, path: &str) -> ItemId {
-        let f = Footage { path: path.into(), width: 8, height: 8, has_video: true, missing: true, ..Default::default() };
-        std::sync::Arc::make_mut(&mut s.project).add_item(file_name(path), crate::color::Label::None, None, ItemKind::Footage(f))
-    }
-
-    fn path_of(s: &Session, id: ItemId) -> String {
-        match s.project.item(id).map(|i| &i.kind) {
-            Some(ItemKind::Footage(f)) => f.path.clone(),
-            _ => String::new(),
-        }
-    }
-
-    #[test]
-    fn relinking_one_file_finds_the_others_that_moved_with_it() {
-        let d = temp("one");
-        let new = d.join("moved");
-        std::fs::create_dir_all(new.join("shots")).unwrap();
-        std::fs::create_dir_all(new.join("audio")).unwrap();
-        for f in ["shots/a.mov", "shots/b.mov", "audio/m.wav"] {
-            std::fs::write(new.join(f), b"x").unwrap();
-        }
-        let mut s = Session::default();
-        let a = add(&mut s, "/gone/proj/shots/a.mov");
-        let b = add(&mut s, "/gone/proj/shots/b.mov");
-        let m = add(&mut s, "/gone/proj/audio/m.wav");
-        let other = add(&mut s, "/elsewhere/c.mov");
-        let target = new.join("shots/a.mov").to_string_lossy().to_string();
-        let r = s.execute("footage.relink", json!({"item": a.0, "path": target})).unwrap();
-        assert_eq!(r["relinked"], json!([a.0, b.0, m.0]), "{r}");
-        assert_eq!(r["stillMissing"], 1);
-        assert_eq!(path_of(&s, m), new.join("audio/m.wav").to_string_lossy());
-        assert_eq!(path_of(&s, other), "/elsewhere/c.mov");
-        // One undo step brings every path back.
+    fn recursive_relink_preserves_interpretation_and_supports_undo_redo() {
+        let dir = Fixture::new();
+        let (mut s, id, old) = setup(&dir, "plate.png");
+        let new = dir.file("new/deep/shots/plate.png", b"valid");
+        s.execute("comp.new", json!({"name": "Main", "width": 64, "height": 32, "duration": 1})).unwrap();
+        s.execute("layer.addItem", json!({"item": id.0})).unwrap();
+        let key = |s: &Session| {
+            let cid = s.active_comp_id().unwrap();
+            let c = s.project.comp(cid).unwrap();
+            let ctx = crate::render::eval::EvalCtx::new(&s.project, cid, c, crate::time::Tick::ZERO);
+            crate::render::cache::input_key(&ctx, &c.layers[0], 1.0, false, false, 0).unwrap()
+        };
+        let original_key = key(&s);
+        let revision = s.revision;
+        let before = s.history.undo.len();
+        let report = search(&mut s, &dir, true);
+        assert_eq!(report["items"][0]["candidates"][0]["confidence"], "high");
+        assert_eq!(report["relinked"], 0);
+        assert_eq!(get(&s, id), old);
+        assert_eq!(s.history.undo.len(), before);
+        assert_eq!(search(&mut s, &dir, false)["relinked"], 1);
+        let expected = Footage { path: new, missing: false, ..old.clone() };
+        assert_eq!(get(&s, id), expected);
+        assert!(s.revision > revision);
+        assert_ne!(key(&s), original_key, "restored footage cannot reuse the missing source's rendered layer");
+        assert_eq!(s.history.undo.len(), before + 1);
         s.execute("edit.undo", json!({})).unwrap();
-        assert_eq!(path_of(&s, b), "/gone/proj/shots/b.mov");
-        // Errors: no such file, not footage.
-        assert!(s.execute("footage.relink", json!({"item": a.0, "path": "/nope/a.mov"})).is_err());
-        assert!(s.execute("footage.relink", json!({"item": 999_999, "path": target})).is_err());
-        let _ = std::fs::remove_dir_all(d);
+        assert_eq!(get(&s, id), old);
+        assert_eq!(key(&s), original_key);
+        s.execute("edit.redo", json!({})).unwrap();
+        assert_eq!(get(&s, id), expected);
     }
 
     #[test]
-    fn a_folder_search_relinks_by_name() {
-        let d = temp("folder");
-        std::fs::create_dir_all(d.join("deep/er")).unwrap();
-        std::fs::write(d.join("deep/a.png"), b"x").unwrap();
-        std::fs::write(d.join("deep/er/b.wav"), b"x").unwrap();
-        let mut s = Session::default();
-        let a = add(&mut s, "C:\\old\\a.png");
-        let b = add(&mut s, "/old/sound/b.wav");
-        let c = add(&mut s, "/old/c.mov");
-        let missing = s.execute("footage.missing", json!({})).unwrap();
-        assert_eq!(missing["missing"].as_array().map(Vec::len), Some(3));
-        let r = s.execute("footage.relinkFolder", json!({"folder": d.to_string_lossy(), "depth": 1})).unwrap();
-        assert_eq!(r["relinked"], json!([a.0]), "depth 1 doesn't reach deep/er: {r}");
-        let r = s.execute("footage.relinkFolder", json!({"folder": d.to_string_lossy()})).unwrap();
-        assert_eq!(r["relinked"], json!([b.0]), "{r}");
-        assert_eq!(r["stillMissing"], 1);
-        assert_eq!(path_of(&s, c), "/old/c.mov");
-        assert!(s.execute("footage.relinkFolder", json!({"folder": "/no/such/folder"})).is_err());
-        assert!(s.execute("footage.relinkFolder", json!({"folder": d.to_string_lossy(), "depth": 99})).is_err());
-        let _ = std::fs::remove_dir_all(d);
+    fn duplicates_and_invalid_media_are_reported_without_edits() {
+        let dir = Fixture::new();
+        let (mut s, id, old) = setup(&dir, "plate.png");
+        dir.file("new/a/plate.png", b"valid");
+        let b = dir.file("new/b/plate.png", b"valid");
+        assert_eq!(search(&mut s, &dir, false)["items"][0]["status"], "ambiguous");
+        assert_eq!(get(&s, id), old);
+        std::fs::remove_file(b).unwrap();
+        dir.file("new/a/plate.png", b"corrupt");
+        let r = search(&mut s, &dir, false);
+        assert_eq!(r["items"][0]["status"], "incompatible");
+        assert_eq!(r["items"][0]["candidates"][0]["confidence"], "low");
+        assert_eq!(get(&s, id), old);
+        std::fs::remove_file(dir.0.join("new/a/plate.png")).unwrap();
+        assert_eq!(search(&mut s, &dir, false)["items"][0]["status"], "notFound");
+    }
+
+    #[test]
+    fn sequence_relink_preserves_picked_range_and_requires_every_saved_frame() {
+        let dir = Fixture::new();
+        let (mut s, id, mut old) = setup(&dir, "shot_0002.png");
+        old.kind = FootageKind::Sequence;
+        old.sequence = vec![old.path.clone(), dir.0.join("old/shot_0004.png").to_str().unwrap().into()];
+        Arc::make_mut(&mut s.project).item_mut(id).unwrap().kind = ItemKind::Footage(old.clone());
+        dir.file("new/shot_0002.png", b"valid");
+        assert_eq!(search(&mut s, &dir, false)["relinked"], 0);
+        dir.file("new/shot_0004.png", b"valid");
+        dir.file("new/shot_0001.png", b"valid");
+        assert_eq!(search(&mut s, &dir, false)["relinked"], 1);
+        let f = get(&s, id);
+        assert_eq!(f.sequence.len(), 2);
+        assert!(f.sequence[0].ends_with("shot_0002.png"));
+        assert!(f.sequence[1].ends_with("shot_0004.png"));
+        assert_eq!(f.start_timecode, old.start_timecode);
+    }
+
+    #[test]
+    fn invalid_folder_errors_and_existing_media_is_untouched() {
+        let dir = Fixture::new();
+        let (mut s, id, old) = setup(&dir, "plate.png");
+        assert!(s.execute(COMMAND, json!({"folder": dir.0.join("absent"), "wait": true})).is_err());
+        assert!(s.execute(COMMAND, json!({"wait": true})).is_err());
+        dir.file("old/plate.png", b"valid");
+        dir.file("new/plate.png", b"valid");
+        assert_eq!(search(&mut s, &dir, false)["relinked"], 0);
+        assert_eq!(get(&s, id), old);
+    }
+
+    struct BlockingProbe {
+        started: std::sync::mpsc::Sender<()>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl crate::Importer for BlockingProbe {
+        fn probe(&self, path: &str) -> std::result::Result<Footage, String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.started.send(()).map_err(|e| e.to_string())?;
+            self.release.lock().map_err(|e| e.to_string())?.recv_timeout(std::time::Duration::from_secs(10)).map_err(|e| e.to_string())?;
+            Probe.probe(path)
+        }
+    }
+
+    #[test]
+    fn cancellation_between_candidate_probes_leaves_project_untouched() {
+        let dir = Fixture::new();
+        let (mut s, id, old) = setup(&dir, "plate.png");
+        dir.file("new/a/plate.png", b"valid");
+        dir.file("new/b/plate.png", b"valid");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        s.importer = Some(Arc::new(BlockingProbe { started: started_tx, release: std::sync::Mutex::new(release_rx), calls: calls.clone() }));
+        let r = s.execute(COMMAND, json!({"folder": dir.0.join("new")})).unwrap();
+        started_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        assert!(s.cancel_job(r["job"].as_str().unwrap()));
+        release_tx.send(()).unwrap();
+        s.execute("jobs.wait", json!({})).unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(get(&s, id), old);
+        assert_eq!(s.job_log.last().unwrap().status, "cancelled");
+    }
+
+    #[test]
+    fn background_result_does_not_overwrite_interpretation_edited_during_search() {
+        let dir = Fixture::new();
+        let (mut s, id, old) = setup(&dir, "plate.png");
+        dir.file("new/plate.png", b"valid");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        s.importer = Some(Arc::new(BlockingProbe { started: started_tx, release: std::sync::Mutex::new(release_rx), calls: Arc::default() }));
+        s.execute(COMMAND, json!({"folder": dir.0.join("new")})).unwrap();
+        started_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        s.execute("file.interpretFootage", json!({"items": [id.0], "invertAlpha": false})).unwrap();
+        release_tx.send(()).unwrap();
+        s.execute("jobs.wait", json!({})).unwrap();
+        assert_eq!(get(&s, id).path, old.path);
+        assert!(!get(&s, id).invert_alpha);
+        assert_eq!(s.job_log.last().unwrap().status, "failed");
+    }
+
+    #[test]
+    fn movie_confidence_checks_native_frame_count_and_rate() {
+        let new = Footage {
+            kind: FootageKind::Video,
+            width: 64,
+            height: 32,
+            has_video: true,
+            frame_rate: crate::time::FrameRate::FPS_30,
+            duration: crate::time::Tick::from_seconds_f64(1.0),
+            ..Default::default()
+        };
+        let mut old = new.clone();
+        old.native_rate = Some(old.frame_rate);
+        old.frame_rate = crate::time::FrameRate::FPS_24;
+        old.duration = old.frame_rate.tick_of(30);
+        assert!(compatible(&old, &new), "conformed playback preserves native frame count");
+        assert!(!compatible(&old, &Footage { duration: crate::time::Tick::from_seconds_f64(2.0), ..new.clone() }));
+        assert!(!compatible(&old, &Footage { width: 128, ..new }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_cycles_and_external_files_are_skipped() {
+        let dir = Fixture::new();
+        let (mut s, _, _) = setup(&dir, "plate.png");
+        let outside = dir.file("outside/plate.png", b"valid");
+        std::fs::create_dir(dir.0.join("new")).unwrap();
+        std::os::unix::fs::symlink(dir.0.join("new"), dir.0.join("new/cycle")).unwrap();
+        std::os::unix::fs::symlink(outside, dir.0.join("new/plate.png")).unwrap();
+        assert_eq!(search(&mut s, &dir, false)["items"][0]["status"], "notFound");
     }
 }

@@ -351,6 +351,14 @@ fn transformed(img: &egui::ColorImage, ch: Channel, colorized: bool, stops: f32,
     egui::ColorImage::new(img.size, px.into_par_iter().map(|a| Color32::from_rgba_premultiplied(a[0], a[1], a[2], a[3])).collect())
 }
 
+/// The display conversion's inputs, for the texture caches.
+pub(crate) fn display_key(app: &EffectcraftApp, has_conversion: bool) -> String {
+    let opts = &app.session.state.viewer;
+    let custom = if opts.simulation.profile == vw::SimProfile::MyCustom { format!("{:?}", app.session.prefs.custom_rgb) } else { String::new() };
+    format!("{:?}{:?}{}{custom}", has_conversion, opts.simulation, app.session.prefs.previews.display_profile)
+        + &format!("{:?}{:?}{}", app.session.project.settings.working_space, app.session.project.settings.output_space, opts.display_color_management)
+}
+
 /// Draw the frame into `comp_rect`: the rendered frame (covering the region of interest when one
 /// is set), or the snapshot while Show Snapshot is on / F5 is held, through Show Channel and the
 /// exposure. Fast Previews ▸ Wireframe draws layer outlines instead.
@@ -380,10 +388,7 @@ pub(crate) fn draw_frame(app: &mut EffectcraftApp, ctx: &egui::Context, painter:
         return;
     }
     let dc = vw::DisplayColor::of(&app.session);
-    // The display conversion's inputs, for the texture caches.
-    let custom = if opts.simulation.profile == vw::SimProfile::MyCustom { format!("{:?}", app.session.prefs.custom_rgb) } else { String::new() };
-    let dc_key = format!("{:?}{:?}{}{custom}", dc.is_some(), opts.simulation, app.session.prefs.previews.display_profile)
-        + &format!("{:?}{:?}{}", app.session.project.settings.working_space, app.session.project.settings.output_space, opts.display_color_management);
+    let dc_key = display_key(app, dc.is_some());
     let plain = opts.channel == Channel::Rgb && opts.exposure == 0.0 && dc.is_none();
     let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
     if snap {
@@ -488,7 +493,9 @@ fn popup(app: &mut EffectcraftApp, ui: &mut egui::Ui, id: &str, anchor: Rect, it
                 ui.separator();
                 continue;
             }
-            let r = ui.selectable_label(*on, label.as_str());
+            // The item is the English source: the drawn text is looked up in the catalog, while
+            // the automation label stays English for scripts and tests.
+            let r = ui.selectable_label(*on, crate::i18n::tr(label));
             app.auto.add(&format!("viewer.{auto}.{i}"), r.rect, label);
             if r.clicked() {
                 chosen = Some(i);
@@ -522,10 +529,10 @@ pub(crate) fn resolution_label(res: Resolution, scale: f64) -> String {
             } else {
                 "Quarter"
             };
-            format!("({r})")
+            format!("({})", crate::i18n::tr(r))
         }
-        Resolution::Custom(n) => format!("Custom ({n})"),
-        r => r.label().to_string(),
+        Resolution::Custom(n) => format!("{} ({n})", crate::i18n::tr("Custom")),
+        r => crate::i18n::tr(r.label()).to_string(),
     }
 }
 
@@ -617,7 +624,9 @@ pub(crate) fn bottom_bar(app: &mut EffectcraftApp, ui: &mut egui::Ui, bar: Rect,
             "fastPreviews" => Some("viewer-fast-previews"),
             _ => None,
         };
-        let resp = widgets::icon_button_local(ui, r, icon, local, on, &t, egui::Id::new(("vw-btn", id))).on_hover_text(tip);
+        // The tip is the English source: the tooltip is looked up in the catalog, while the
+        // automation label stays English for scripts and tests.
+        let resp = widgets::icon_button_local(ui, r, icon, local, on, &t, egui::Id::new(("vw-btn", id))).on_hover_text(crate::i18n::tr(tip));
         auto.add(&format!("viewer.{id}"), r, tip);
         *x += 24.0;
         (resp.clicked(), r)
@@ -690,11 +699,13 @@ pub(crate) fn bottom_bar(app: &mut EffectcraftApp, ui: &mut egui::Ui, bar: Rect,
     let mut ev = vo.exposure as f64;
     let resp = ui.put(
         er,
-        egui::DragValue::new(&mut ev)
-            .speed(0.05)
-            .range(-40.0..=40.0)
-            .fixed_decimals(1)
-            .custom_formatter(|v, _| if v == 0.0 { "0.0".into() } else { format!("{v:+.1}") }),
+        crate::widgets::drag_value(
+            egui::DragValue::new(&mut ev)
+                .speed(0.05)
+                .range(-40.0..=40.0)
+                .fixed_decimals(1)
+                .custom_formatter(|v, _| if v == 0.0 { "0.0".into() } else { format!("{v:+.1}") }),
+        ),
     );
     let resp = resp.on_hover_text(crate::i18n::tr("Adjust Exposure (stops)"));
     app.auto.add("viewer.exposure", er, "Adjust Exposure");
@@ -730,9 +741,23 @@ pub(crate) fn bottom_bar(app: &mut EffectcraftApp, ui: &mut egui::Ui, bar: Rect,
     x += 4.0;
     // 3D renderer + view.
     if comp.has_3d() {
+        // The comp's 3D renderer, as After Effects' Composition panel shows it: the menu switches
+        // it through Composition Settings (undoable), and the automation label is the renderer.
+        use effectcraft_engine::project::Renderer;
+        let renderers = [(Renderer::Classic3D, "Classic 3D", "classic3D"), (Renderer::Advanced3D, "Advanced 3D", "advanced3D")];
+        let current = renderers.iter().find(|(r, ..)| *r == comp.renderer).map_or("Classic 3D", |(_, label, _)| *label);
         let r = Rect::from_min_size(pos2(x, cy - 10.0), vec2(96.0, 20.0));
-        let _ = widgets::dropdown(ui, r, "Classic 3D", &t, egui::Id::new("vw-3d"));
-        app.auto.add("viewer.renderer3d", r, "3D Renderer");
+        if widgets::dropdown(ui, r, crate::i18n::tr(current), &t, egui::Id::new("vw-3d")).clicked() {
+            toggle_popup(ui, "vw-3d-pop");
+        }
+        app.auto.add("viewer.renderer3d", r, current);
+        let items: Vec<(String, bool)> = renderers.iter().map(|(r, label, _)| (label.to_string(), *r == comp.renderer)).collect();
+        if let Some((renderer, _, id)) = popup(app, ui, "vw-3d-pop", r, &items, "renderer3dItem").and_then(|i| renderers.get(i))
+            && *renderer != comp.renderer
+            && let Err(e) = app.session.execute("comp.settings", json!({"renderer": id}))
+        {
+            app.ui.status = e.to_string();
+        }
         x = r.max.x + 4.0;
         let cid = app.session.active_comp_id();
         let cur = cid.and_then(|c| app.session.state.views3d.get(&c)).map(|v| v.current).unwrap_or_default();

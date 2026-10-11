@@ -13,6 +13,7 @@ pub(crate) fn handlers() -> &'static [Handler] {
     const H: &[Handler] = &[
         Handler::ui_prefix("viewer.nudge.", nudge_cmd),
         Handler::ui("view.res.auto", res_auto),
+        Handler::ui("view.theme.toggle", theme_toggle),
         Handler::ui_prefix("view.theme.", theme),
         Handler::ui("view.fit", fit),
         Handler::ui("view.actualSize", actual_size),
@@ -77,6 +78,12 @@ fn nudge(app: &mut EffectcraftApp, ctx: &egui::Context, dir: &str) -> Result<Val
 fn res_auto(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, _params: Value) -> Result<Value, String> {
     app.ui.viewer.res = Resolution::Auto;
     Ok(Value::Null)
+}
+
+/// View ▸ Next Appearance Mode: Dark ↔ Light.
+fn theme_toggle(app: &mut EffectcraftApp, ctx: &egui::Context, _id: &str, _params: Value) -> Result<Value, String> {
+    app.cycle_appearance(ctx);
+    Ok(json!({"appearanceMode": app.session.prefs.appearance.appearance_mode}))
 }
 
 fn theme(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, _params: Value) -> Result<Value, String> {

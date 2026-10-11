@@ -11,15 +11,17 @@ use std::sync::Arc;
 /// Layer parameters and audio for effects (see [`effectcraft_effects::EffectHost`]). What it
 /// hands out is in effect space (see [`effect_bounds`]): the other layer's for its pixels, the
 /// running layer's for its own frames and the comp scene.
-struct FxHost<'r, 'a, 'c> {
-    r: &'r Renderer<'a>,
-    ctx: &'c EvalCtx<'a>,
-    layer: &'c Layer,
+pub(crate) struct FxHost<'r, 'a, 'c> {
+    pub(crate) r: &'r Renderer<'a>,
+    pub(crate) ctx: &'c EvalCtx<'a>,
+    pub(crate) layer: &'c Layer,
     /// Where the stack's effect space starts in layer coordinates (zero on adjustment layers,
     /// whose effects run on the comp below).
-    origin: [f64; 2],
+    pub(crate) origin: [f64; 2],
     /// Index of the effect being rendered (bounds `self_at` to effects before it).
-    index: std::sync::atomic::AtomicUsize,
+    pub(crate) index: std::sync::atomic::AtomicUsize,
+    /// The stack's input before any effect ran (CC Composite's original).
+    pub(crate) original: Option<&'c Buf>,
 }
 
 impl FxHost<'_, '_, '_> {
@@ -63,15 +65,19 @@ pub(crate) fn comp_scene(ctx: &EvalCtx, layer: &Layer) -> Option<effectcraft_eff
 }
 
 /// Nesting limit for effects that render layers (other layers, other times).
-const MAX_FX_DEPTH: usize = 8;
+pub(crate) const MAX_FX_DEPTH: usize = 8;
 
 impl EffectHost for FxHost<'_, '_, '_> {
+    fn original(&self) -> Option<&Buf> {
+        self.original
+    }
+
     fn particles(&self) -> Option<&dyn effectcraft_effects::psim::ParticleSim> {
         self.r.active_accel().and_then(|a| a.particles())
     }
     fn layer(&self, id: u64, masks_and_effects: bool) -> Option<LayerPixels> {
         let other = self.ctx.layer(effectcraft_project::LayerId(id))?;
-        if other.id == self.layer.id || self.r.depth > MAX_FX_DEPTH {
+        if (other.id == self.layer.id && masks_and_effects) || self.r.depth > MAX_FX_DEPTH {
             return None;
         }
         let sub = self.r.nested();
@@ -82,7 +88,7 @@ impl EffectHost for FxHost<'_, '_, '_> {
 
     fn layer_masks(&self, id: u64) -> Option<LayerPixels> {
         let other = self.ctx.layer(effectcraft_project::LayerId(id))?;
-        if other.id == self.layer.id || self.r.depth > MAX_FX_DEPTH {
+        if self.r.depth > MAX_FX_DEPTH {
             return None;
         }
         let sub = self.r.nested();
@@ -147,16 +153,43 @@ impl EffectHost for FxHost<'_, '_, '_> {
 
     fn layer_at(&self, id: u64, comp_time: f64, masks_and_effects: bool) -> Option<LayerPixels> {
         let other = self.ctx.layer(effectcraft_project::LayerId(id))?;
-        if other.id == self.layer.id || self.r.depth > MAX_FX_DEPTH {
+        if (other.id == self.layer.id && masks_and_effects) || !comp_time.is_finite() || self.r.depth > MAX_FX_DEPTH {
             return None;
         }
         let ctx = self.ctx.at(Tick::from_seconds_f64(comp_time));
         let sub = self.r.nested();
         Some(if masks_and_effects {
             self.pixels(other, (*sub.content_buf(&ctx, other)?).clone(), true)
+        } else if other.id == self.layer.id {
+            self.pixels(other, sub.source(&ctx, other)?, true)
         } else {
+            // Preserve other-layer reads: time effects historically see source + masks.
             self.pixels(other, (*sub.layer_input(&ctx, other, 0)?).clone(), false)
         })
+    }
+}
+
+/// An accelerator's kept effect result (see [`Accelerator::effects_kept`]): adopted by the
+/// buffer that stores its pixels, released otherwise (when dropped).
+pub(crate) struct Kept<'a> {
+    accel: &'a dyn Accelerator,
+    ticket: Option<u64>,
+}
+
+impl Kept<'_> {
+    /// `buf` stores the kept pixels unchanged (offsets may differ).
+    pub(crate) fn adopt(mut self, buf: &Arc<Buf>) {
+        if let Some(t) = self.ticket.take() {
+            self.accel.adopt(t, buf);
+        }
+    }
+}
+
+impl Drop for Kept<'_> {
+    fn drop(&mut self) {
+        if let Some(t) = self.ticket.take() {
+            self.accel.release(t);
+        }
     }
 }
 
@@ -165,14 +198,17 @@ struct CpuFx<'a> {
     accel: Option<&'a dyn Accelerator>,
     levels: Option<f32>,
     buf: Option<Buf>,
+    /// The accelerator's copy of `buf`, while the last step was a GPU chain.
+    kept: Option<Kept<'a>>,
 }
 
 impl FxTarget for CpuFx<'_> {
     fn gpu(&mut self, steps: &[FxStep]) -> bool {
         let (Some(a), Some(b)) = (self.accel, &self.buf) else { return false };
-        match a.effects(steps, b, self.levels) {
-            Some(out) => {
+        match a.effects_kept(steps, b, self.levels) {
+            Some((out, ticket)) => {
                 self.buf = Some(out);
+                self.kept = ticket.map(|t| Kept { accel: a, ticket: Some(t) });
                 true
             }
             None => false,
@@ -180,6 +216,7 @@ impl FxTarget for CpuFx<'_> {
     }
     fn cpu(&mut self, f: &mut dyn FnMut(Buf) -> Buf) {
         if let Some(b) = self.buf.take() {
+            self.kept = None;
             self.buf = Some(f(b));
         }
     }
@@ -207,16 +244,32 @@ impl<'a> Renderer<'a> {
         &self,
         ctx: &EvalCtx,
         layer: &Layer,
-        mut buf: Buf,
+        buf: Buf,
         adjustment: bool,
         limit: usize,
         timing: Option<&mut Vec<(String, f64)>>,
     ) -> Buf {
+        self.apply_effects_kept(ctx, layer, buf, adjustment, limit, timing).0
+    }
+
+    /// [`Renderer::apply_effects_timed`], with the accelerator's copy of the result when the
+    /// stack ended with a GPU chain (see [`Kept`]).
+    pub(crate) fn apply_effects_kept(
+        &self,
+        ctx: &EvalCtx,
+        layer: &Layer,
+        mut buf: Buf,
+        adjustment: bool,
+        limit: usize,
+        timing: Option<&mut Vec<(String, f64)>>,
+    ) -> (Buf, Option<Kept<'a>>) {
         let origin = fx_origin(ctx, layer, adjustment);
         buf.rebase(origin);
-        let mut out = self.effect_space_stack(ctx, layer, buf, adjustment, limit, timing, origin);
+        let mut t = CpuFx { accel: self.active_accel(), levels: self.pipe.levels, buf: Some(buf), kept: None };
+        self.run_effect_stack(ctx, layer, adjustment, limit, timing, origin, &mut t);
+        let mut out = t.buf.take().unwrap_or_else(|| Buf { img: Image::new(1, 1), offset: [0.0; 2], scale: self.opts.scale });
         out.rebase([-origin[0], -origin[1]]);
-        out
+        (out, t.kept.take())
     }
 
     /// [`Renderer::apply_effects_timed`] on a buffer already in effect space (measured from
@@ -232,7 +285,7 @@ impl<'a> Renderer<'a> {
         timing: Option<&mut Vec<(String, f64)>>,
         origin: [f64; 2],
     ) -> Buf {
-        let mut t = CpuFx { accel: self.active_accel(), levels: self.pipe.levels, buf: Some(buf) };
+        let mut t = CpuFx { accel: self.active_accel(), levels: self.pipe.levels, buf: Some(buf), kept: None };
         self.run_effect_stack(ctx, layer, adjustment, limit, timing, origin, &mut t);
         t.buf.unwrap_or_else(|| Buf { img: Image::new(1, 1), offset: [0.0; 2], scale: self.opts.scale })
     }
@@ -264,7 +317,18 @@ impl<'a> Renderer<'a> {
                 *q = [q[0] - origin[0], q[1] - origin[1]];
             }
         }
-        let host = FxHost { r: self, ctx, layer, origin, index: Default::default() };
+        // Capture once, before preceding effects can expand or replace the input. An
+        // adjustment stack's original is the comp below, not its solid source.
+        let needs_original =
+            fx.groups().take(limit).any(|g| g.enabled && matches!(&g.kind, GroupKind::Effect { effect } if effect == "ec.channel.cccomposite"));
+        let mut original = None;
+        if needs_original {
+            target.cpu(&mut |buf| {
+                original = Some(buf.clone());
+                buf
+            });
+        }
+        let host = FxHost { r: self, ctx, layer, origin, index: Default::default(), original: original.as_ref() };
         let env = EffectEnv {
             masks: &mask_shapes,
             host: Some(&host),
@@ -357,7 +421,7 @@ pub(crate) fn fx_origin(ctx: &EvalCtx, layer: &Layer, adjustment: bool) -> [f64;
 /// measured with CC Light Sweep, its centre, angle and width stay put in the comp whatever the
 /// layer's position, scale and rotation. The layer → comp affine of such a 2D layer (see
 /// [`EffectEnv::comp_space`]).
-fn fx_comp_space(ctx: &EvalCtx, layer: &Layer) -> Option<Mat3> {
+pub(crate) fn fx_comp_space(ctx: &EvalCtx, layer: &Layer) -> Option<Mat3> {
     if !layer.switches.collapse || layer.is_3d() || !matches!(layer.source, LayerSource::Shape | LayerSource::Text) {
         return None;
     }
@@ -366,7 +430,7 @@ fn fx_comp_space(ctx: &EvalCtx, layer: &Layer) -> Option<Mat3> {
 
 /// Colour-only effects and expression controls neither move pixels nor create coverage.
 /// The colour effects listed here can modify zero alpha, so keep their larger canvas.
-fn text_needs_canvas(spec: &effectcraft_effects::EffectSpec) -> bool {
+pub(crate) fn text_needs_canvas(spec: &effectcraft_effects::EffectSpec) -> bool {
     match spec.category {
         "Expression Controls" => false,
         "Color Correction" => matches!(

@@ -70,6 +70,9 @@ const PINNED_INVOKE: &[&str] = &[
     "keys.velocity",
     "keys.interpolation",
     "layer.timeStretch",
+    "window.maximizeApp",
+    "view.theme.toggle",
+    "project.deleteWithoutConfirmation",
 ];
 
 /// The ids `menus::frontend` handled (frontend events of engine commands), in the old match order.
@@ -132,6 +135,8 @@ const PINNED_FRONTEND: &[&str] = &[
     "effect.manage",
     "anim.browsePresets",
     "timeline.revealProps",
+    "window.maximizeApp",
+    "project.deleteWithoutConfirmation",
 ];
 
 fn pinned(stage: Stage) -> &'static [&'static str] {
@@ -162,7 +167,7 @@ fn handles_exactly_the_pinned_ids() {
         want.sort();
         assert_eq!(got, want, "{stage:?}: the handled ids changed; update PINNED_* only for a deliberate change");
     }
-    assert_eq!(PINNED_INVOKE.len() + PINNED_FRONTEND.len(), 121);
+    assert_eq!(PINNED_INVOKE.len() + PINNED_FRONTEND.len(), 126);
 }
 
 #[test]

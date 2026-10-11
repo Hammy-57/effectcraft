@@ -555,7 +555,7 @@ File
     Find Missing Effects | file.findMissing {"what":"effects"}
     Find Missing Fonts | file.findMissing {"what":"fonts"}
     Find Missing Footage | file.findMissing {"what":"footage"}
-    Relink Missing Footage in Folder... | footage.relinkFolder
+    Relink Missing Footage... | file.relinkFootage
   Watch Folder... | file.watchFolder
   ---
   Scripts
@@ -924,6 +924,7 @@ Layer
     Create Shapes from Text | layer.create {"op":"shapesFromText"}
     Create Masks from Text | layer.create {"op":"masksFromText"}
     Create Shapes from Vector Layer | layer.create {"op":"shapesFromVector"}
+    Round Corners | layer.roundCorners
     Create Keyframes from Data | layer.create {"op":"keyframesFromData"}
     Null Controllers for Positional Points | layer.create {"op":"nullsPositional"}
     Null Controllers for Path Points | layer.create {"op":"nullsPathPoints"}

@@ -6,7 +6,7 @@ use std::io::Write;
 
 use effectcraft_project::Comp;
 use effectcraft_project::render_queue::{AudioFormat, Channels, OutputFormat, ProResProfile};
-use effectcraft_time::{FrameRate, TICKS_PER_SECOND, Tick};
+use effectcraft_time::{FrameRate, Tick};
 use filmcraft_isobmff::{Brand, FourCc, Mp4Writer, PcmConfig, SampleEntry, TrackConfig, WriteSample, WriterOptions};
 use rayon::prelude::*;
 
@@ -335,7 +335,8 @@ pub(crate) async fn movie(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut St
                 return Ok(());
             }
             let n = (end - *cursor) as usize;
-            let start = Tick(((*cursor as i128 * TICKS_PER_SECOND as i128) / sr as i128) as i64);
+            let start = Tick::from_units(*cursor, i64::from(sr));
+            let start = if start.to_units_floor(i64::from(sr)) < *cursor { Tick(start.0.saturating_add(1)) } else { start };
             let buf = mix(job, start, n, sr);
             *cursor = end;
             match a {

@@ -422,7 +422,7 @@ Effects are addressed by id (`ec.<category>.<name>`) or display name in commands
 
 | Effect | Id | Params | GPU | 32 | Status |
 |---|---|---:|:-:|:-:|---|
-| Apply Color LUT | `ec.utility.applylut` | 0 | GPU | 32 | Implemented |
+| Apply Color LUT | `ec.utility.applylut` | 1 | GPU | 32 | Implemented |
 | CC Overbrights | `ec.utility.ccoverbrights` | 2 | GPU | 32 | Implemented |
 | Cineon Converter | `ec.utility.cineon` | 7 | GPU | 32 | Implemented |
 | Color Profile Converter | `ec.utility.colorprofileconverter` | 7 | GPU | 32 | Implemented |

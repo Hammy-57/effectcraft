@@ -184,6 +184,14 @@ struct Work {
     memory_budget: usize,
 }
 
+/// Where a relative render output goes when there is no default folder and the project is unsaved:
+/// `~/Movies` when it exists, else the home folder itself.
+pub(crate) fn default_output_base(home: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
+    let home = home.filter(|h| !h.as_os_str().is_empty())?;
+    let movies = home.join("Movies");
+    Some(if movies.is_dir() { movies } else { home })
+}
+
 /// Bits per channel an output format writes for a project bit depth (named in the file when
 /// Settings ▸ Export ▸ Append Bit Depth to File Name is on).
 pub fn output_bits(format: OutputFormat, depth: effectcraft_project::BitDepth) -> u32 {
@@ -369,7 +377,7 @@ impl Session {
 
     /// The output path of a queue item: template tokens expanded, ending in the format's
     /// extension exactly once ([`OutputFormat::with_extension`]), relative paths resolved against
-    /// the project's folder (or the working directory). `None` when the comp is gone or the
+    /// the project's folder (an unsaved project's against ~/Movies or home). `None` when the comp is gone or the
     /// output is empty ("Needs Output").
     pub fn resolve_output(&self, item: &RenderQueueItem) -> Option<String> {
         let comp = self.project.comp(item.comp)?;
@@ -396,6 +404,10 @@ impl Session {
         let base = (!folder.is_empty()).then(|| std::path::PathBuf::from(folder));
         let base =
             base.or_else(|| self.path.as_deref().and_then(|s| std::path::Path::new(s).parent().map(|d| d.to_path_buf())).filter(|d| !d.as_os_str().is_empty()));
+        // Unsaved project: ~/Movies, else the home folder (as FilmCraft's exports do). The working directory
+        // is `/` for an app started from the macOS Finder, where nothing can be written (#446).
+        let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(std::path::PathBuf::from);
+        let base = base.or_else(|| default_output_base(home));
         // (the web has no working directory: relative outputs land in its virtual root)
         let base = base.or_else(|| std::env::current_dir().ok()).or_else(|| cfg!(target_arch = "wasm32").then(|| "/".into()))?;
         Some(base.join(path).to_string_lossy().to_string())

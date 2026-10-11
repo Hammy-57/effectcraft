@@ -482,9 +482,16 @@ TextDocument.prototype = {
   get smallCaps() { return this.__style("smallCaps", false); },
   set smallCaps(v) { this.__set("smallCaps", !!v); },
   get superscript() { return this.__style("baseline", "normal") === "superscript"; },
-  set superscript(v) { this.__set("superscript", !!v); },
+  set superscript(v) {
+    // The pending document reads the same canonical baseline that setValue will apply.
+    if (v) this.__set("baseline", "superscript");
+    else if (this.superscript) this.__set("baseline", "normal");
+  },
   get subscript() { return this.__style("baseline", "normal") === "subscript"; },
-  set subscript(v) { this.__set("subscript", !!v); },
+  set subscript(v) {
+    if (v) this.__set("baseline", "subscript");
+    else if (this.subscript) this.__set("baseline", "normal");
+  },
   get tsume() { return this.__style("tsume", 0); },
   set tsume(v) { this.__set("tsume", __num(v)); },
   get boxText() { return !!(this.__base && this.__base.box_size); },
@@ -576,7 +583,9 @@ PropertyBase.prototype = {
     return false;
   },
   set selected(v) {
-    if (v) __call("prop.select", { comp: this.__layer.__comp, layer: this.__layer.__id, prop: this.__uid, add: true });
+    var ref = { comp: this.__layer.__comp, layer: this.__layer.__id, prop: this.__uid };
+    if (v) __call("prop.select", { comp: ref.comp, layer: ref.layer, prop: ref.prop, add: true });
+    else __call("prop.deselect", ref);
   },
   propertyGroup: function (n) {
     var p = this;
@@ -1238,6 +1247,7 @@ LayerCollection.prototype = {
     if (name !== undefined) p.name = String(name);
     if (width !== undefined) p.width = Math.round(__num(width, "width"));
     if (height !== undefined) p.height = Math.round(__num(height, "height"));
+    if (pixelAspect !== undefined) p.pixelAspect = __num(pixelAspect, "pixelAspect");
     return this.__dur(this.__new(__call("layer.newSolid", p)), duration);
   },
   addNull: function (duration) { return this.__dur(this.__new(__call("layer.newNull", { comp: this.__comp })), duration); },
@@ -1345,7 +1355,18 @@ Item.prototype = {
   get parentFolder() { return __item(this.__info().parent); },
   set parentFolder(f) { __call("project.move", { items: [this.__id], folder: f && f.__id ? f.__id : null }); },
   get selected() { return this.__info().selected; },
-  set selected(v) { if (v) __call("project.select", { items: [this.__id], add: true }); },
+  set selected(v) {
+    var selection = __get("project").selection;
+    var selected = selection.indexOf(this.__id) !== -1;
+    if (!!v === selected) return;
+    if (v) {
+      __call("project.select", { items: [this.__id], add: true });
+    } else {
+      var id = this.__id;
+      // Replace just this item, preserving the other Project panel selections and their order.
+      __call("project.select", { items: selection.filter(function (item) { return item !== id; }) });
+    }
+  },
   get usedIn() { return this.__info().usedIn.map(function (c) { return new CompItem(c); }); },
   remove: function () { __call("project.delete", { items: [this.__id] }); },
 };
@@ -1692,6 +1713,8 @@ Project.prototype = {
   set linearizeWorkingSpace(v) { __call("file.projectSettings", { linearize: !!v }); },
   get workingSpace() { return this.__info().workingSpace; },
   set workingSpace(v) { __call("file.projectSettings", { workingSpace: String(v) || "none" }); },
+  get workingGamma() { return this.__info().workingGamma; },
+  set workingGamma(v) { __call("file.projectSettings", { workingGamma: __num(v) }); },
   get timeDisplayType() { return this.__info().timeDisplayFrames ? TimeDisplayType.FRAMES : TimeDisplayType.TIMECODE; },
   set timeDisplayType(v) { __call("file.projectSettings", { timeDisplay: v === TimeDisplayType.FRAMES ? "frames" : "timecode" }); },
   get expressionEngine() { return "javascript-1.0"; },
@@ -1720,7 +1743,10 @@ Project.prototype = {
   importFile: function (opts) {
     var f = opts instanceof ImportOptions ? opts.file : opts;
     if (!f) throw __err("importFile(): no file");
-    var r = __call("file.import", { paths: [__str(f)] });
+    var args = { paths: [__str(f)] };
+    // After Effects imports just the picked file unless ImportOptions.sequence is set.
+    if (opts instanceof ImportOptions) args.sequence = !!opts.sequence;
+    var r = __call("file.import", args);
     if (r.errors && r.errors.length) throw __err(r.errors.join("; "));
     return __item(r.items[0]);
   },

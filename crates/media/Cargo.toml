@@ -25,6 +25,7 @@ filmcraft-frame = { workspace = true }
 filmcraft-color = { workspace = true }
 filmcraft-time = { workspace = true }
 exr = { workspace = true }
+gif = { workspace = true }
 image = { workspace = true, features = ["gif", "webp", "tiff", "bmp", "exr"] }
 rayon = { workspace = true }
 symphonia = { workspace = true }
