@@ -9,6 +9,15 @@ iconography, images or other Adobe assets; open licences only; every asset attri
 
 | Asset | Author | Source | Licence |
 |---|---|---|---|
+| `fuzz/corpus/svg_parse/seed-basic-shapes.svg` | EffectCraft contributors | Original synthetic seed from `fuzz/examples/seeds.rs` | MIT OR Apache-2.0 |
+| `fuzz/corpus/media_probe/seed-basic-shapes.svg` | EffectCraft contributors | Original synthetic seed from `fuzz/examples/seeds.rs` | MIT OR Apache-2.0 |
+| `fuzz/corpus/svg_parse/seed-paths-gradients.svg` | EffectCraft contributors | Original synthetic seed from `fuzz/examples/seeds.rs` | MIT OR Apache-2.0 |
+| `fuzz/corpus/media_probe/seed-paths-gradients.svg` | EffectCraft contributors | Original synthetic seed from `fuzz/examples/seeds.rs` | MIT OR Apache-2.0 |
+| `fuzz/corpus/media_probe/seed-icon.png` | EffectCraft contributors (drawing by the project owner in ArtCraft) | Original EffectCraft app icon copied by `fuzz/examples/seeds.rs` (selector-prefixed) | MIT OR Apache-2.0 |
+| `fuzz/corpus/pdf_parse/seed-min.pdf` | EffectCraft contributors | Original synthetic seed from `fuzz/examples/seeds.rs` | MIT OR Apache-2.0 |
+| `fuzz/corpus/pdf_parse/seed-min.eps` | EffectCraft contributors | Original synthetic seed from `fuzz/examples/seeds.rs` | MIT OR Apache-2.0 |
+| `fuzz/corpus/psd_parse/seed-header-only.psd` | EffectCraft contributors | Original synthetic seed from `fuzz/examples/seeds.rs` | MIT OR Apache-2.0 |
+| `fuzz/corpus/media_probe/seed-tone.wav` | EffectCraft contributors | Original synthetic seed from `fuzz/examples/seeds.rs` | MIT OR Apache-2.0 |
 | `assets/fonts/Inter-Regular.ttf` | The Inter Project Authors | https://github.com/rsms/inter | OFL-1.1 (`assets/fonts/OFL-Inter.txt`) |
 | `assets/fonts/Inter-Medium.ttf` | The Inter Project Authors | https://github.com/rsms/inter | OFL-1.1 (`assets/fonts/OFL-Inter.txt`) |
 | `assets/fonts/Inter-SemiBold.ttf` | The Inter Project Authors | https://github.com/rsms/inter | OFL-1.1 (`assets/fonts/OFL-Inter.txt`) |
