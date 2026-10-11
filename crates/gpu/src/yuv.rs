@@ -31,12 +31,21 @@ pub(crate) struct Pipelines {
     decode_layout: wgpu::BindGroupLayout,
     mask: wgpu::ComputePipeline,
     mask_layout: wgpu::BindGroupLayout,
+    /// Packed layer codes to floats (`unpack.wgsl`, [`GpuContext::upload_image`]).
+    pub(crate) unpack: wgpu::ComputePipeline,
+    pub(crate) unpack_layout: wgpu::BindGroupLayout,
 }
 
 impl Pipelines {
     pub(crate) fn new(adapter: &wgpu::Adapter, device: &wgpu::Device) -> Result<Self, String> {
         let usage = wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING;
-        for format in [wgpu::TextureFormat::R8Uint, wgpu::TextureFormat::R16Uint, wgpu::TextureFormat::R32Float] {
+        for format in [
+            wgpu::TextureFormat::R8Uint,
+            wgpu::TextureFormat::R16Uint,
+            wgpu::TextureFormat::R32Float,
+            wgpu::TextureFormat::Rgba8Uint,
+            wgpu::TextureFormat::Rgba16Uint,
+        ] {
             if !adapter.get_texture_format_features(format).allowed_usages.contains(usage) {
                 return Err(format!("native video plane format {format:?} lacks upload/sampling support"));
             }
@@ -45,7 +54,14 @@ impl Pipelines {
             device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("native YUV"),
                 source: wgpu::ShaderSource::Wgsl(
-                    format!("{}\n{}\n{}", include_str!("ieee_add.wgsl"), include_str!("ieee_mul.wgsl"), include_str!("yuv.wgsl")).into(),
+                    format!(
+                        "{}\n{}\n{}\n{}",
+                        include_str!("ieee_add.wgsl"),
+                        include_str!("ieee_mul.wgsl"),
+                        include_str!("yuv.wgsl"),
+                        include_str!("unpack.wgsl")
+                    )
+                    .into(),
                 ),
             })
         })?;
@@ -86,6 +102,23 @@ impl Pipelines {
                 ],
             })
         })?;
+        let unpack_layout = init_resource(device, "packed upload layout", || {
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("packed upload"),
+                entries: &[
+                    entry(5, output),
+                    entry(8, texture(wgpu::TextureSampleType::Uint)),
+                    entry(
+                        9,
+                        wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: wgpu::BufferSize::new(16),
+                        },
+                    ),
+                ],
+            })
+        })?;
         let pipeline = |name, bgl: &wgpu::BindGroupLayout| {
             let layout = init_resource(device, "YUV pipeline layout", || {
                 device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some(name), bind_group_layouts: &[Some(bgl)], immediate_size: 0 })
@@ -103,7 +136,8 @@ impl Pipelines {
         };
         let decode = pipeline("decode", &decode_layout)?;
         let mask = pipeline("mask", &mask_layout)?;
-        Ok(Self { decode, decode_layout, mask, mask_layout })
+        let unpack = pipeline("unpack", &unpack_layout)?;
+        Ok(Self { decode, decode_layout, mask, mask_layout, unpack, unpack_layout })
     }
 }
 
@@ -118,16 +152,7 @@ fn upload(g: &GpuContext, plane: Plane<'_>) -> Option<wgpu::Texture> {
         _ => return None,
     };
     let stride = u32::try_from(plane.stride.checked_mul(plane.samples.bytes_per_sample())?).ok()?;
-    let texture = g.device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("native video plane"),
-        size: wgpu::Extent3d { width: plane.width, height: plane.height, depth_or_array_layers: 1 },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format,
-        usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
-        view_formats: &[],
-    });
+    let texture = g.plane_texture(plane.width, plane.height, format, "native video plane");
     g.queue.write_texture(
         wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
         bytes.get(..n)?,
@@ -192,6 +217,9 @@ pub(crate) fn decode(e: &mut Enc, view: View<'_>) -> Option<GpuImage> {
         ],
     });
     e.custom_pixels("yuv_decode", &p.decode, &bg, (view.width, view.height));
+    for t in [Some(y), Some(u), Some(v), a].into_iter().flatten() {
+        e.stage(t);
+    }
     g.transfers.count_yuv(input_bytes);
     Some(out)
 }
@@ -205,16 +233,7 @@ pub(crate) fn mask(e: &mut Enc, source: &GpuImage, mask: &effectcraft_raster::Ma
     let n = (mask.width as usize).checked_mul(mask.height as usize)?;
     let data = mask.data.get(..n)?;
     let bytes = bytemuck::cast_slice(data);
-    let texture = g.device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("source mask plane"),
-        size: wgpu::Extent3d { width: mask.width, height: mask.height, depth_or_array_layers: 1 },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::R32Float,
-        usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
-        view_formats: &[],
-    });
+    let texture = g.plane_texture(mask.width, mask.height, wgpu::TextureFormat::R32Float, "source mask plane");
     g.queue.write_texture(
         wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
         bytes,
@@ -234,6 +253,7 @@ pub(crate) fn mask(e: &mut Enc, source: &GpuImage, mask: &effectcraft_raster::Ma
         ],
     });
     e.custom_pixels("yuv_source_mask", &p.mask, &bg, (mask.width, mask.height));
+    e.stage(texture);
     Some(out)
 }
 
