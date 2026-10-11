@@ -330,7 +330,13 @@ impl<'a> Renderer<'a> {
                 | "ec.color.tint"
                 | "ec.color.brightnesscontrast"
                 | "ec.color.exposure"
-                | "ec.channel.invert" => 0.0,
+                | "ec.channel.invert" => {
+                    // Text effects that can create alpha fill the expanded effect canvas (#659).
+                    if matches!(layer.source, LayerSource::Text) && crate::fx::text_needs_canvas(spec) {
+                        return None;
+                    }
+                    0.0
+                }
                 _ if spec.category == "Expression Controls" => 0.0,
                 _ => return None,
             };
@@ -791,6 +797,36 @@ mod tests {
             let t0 = std::time::Instant::now();
             let (_, names) = frame_at(&p, cid, cull, Tick::from_seconds_f64(0.5), 1.0);
             eprintln!("cull {cull}: {:.1} ms, {} layers drawn", t0.elapsed().as_secs_f64() * 1e3, names.len());
+        }
+    }
+
+    /// Text effects that can create alpha (Levels, Invert alpha) fill the expanded effect canvas
+    /// beyond the glyphs (#659): a text layer whose glyphs miss the comp but whose canvas reaches
+    /// it is drawn, never culled. Colour effects that keep zero alpha still cull.
+    #[test]
+    fn text_alpha_creating_effects_are_not_culled() {
+        let n = |v: f64| Value::Scalar(v);
+        let cases: [(&str, Vec<(&str, Value)>, bool); 3] = [
+            ("ec.color.levels", vec![("alphaOutBlack", n(1.0))], false),
+            ("ec.channel.invert", vec![("channel", Value::Enum(effectcraft_effects::INVERT_ALPHA))], false),
+            ("ec.color.tint", vec![("amount", n(70.0))], true),
+        ];
+        for (id, vals, cullable) in cases {
+            let (mut p, cid, comp) = setup();
+            let mut l = text(&mut p, &comp, 0.0);
+            // Glyphs right of the comp, the comp-sized canvas centred on the anchor reaching into it.
+            place(&mut l, [260.0, 50.0], 0.0, 100.0);
+            effect(&mut p, &mut l, id, &vals);
+            l.name = "L".into();
+            p.comp_mut(cid).unwrap().layers = vec![l].into();
+            let t = Tick::ZERO;
+            let (a, names) = frame_at(&p, cid, true, t, 1.0);
+            let (b, _) = frame_at(&p, cid, false, t, 1.0);
+            assert!(a == b, "{id}: culling changed the frame (drawn {names:?})");
+            assert_eq!(names.is_empty(), cullable, "{id}: drawn {names:?}");
+            if !cullable {
+                assert!(b.get(190, 50)[3] > 0.5, "{id}: the canvas reaches the comp");
+            }
         }
     }
 }

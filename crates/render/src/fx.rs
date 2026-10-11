@@ -410,7 +410,7 @@ pub(crate) fn fx_comp_space(ctx: &EvalCtx, layer: &Layer) -> Option<Mat3> {
 
 /// Colour-only effects and expression controls neither move pixels nor create coverage.
 /// The colour effects listed here can modify zero alpha, so keep their larger canvas.
-fn text_needs_canvas(spec: &effectcraft_effects::EffectSpec) -> bool {
+pub(crate) fn text_needs_canvas(spec: &effectcraft_effects::EffectSpec) -> bool {
     match spec.category {
         "Expression Controls" => false,
         "Color Correction" => matches!(
