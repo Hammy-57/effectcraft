@@ -64,3 +64,12 @@ until the viewer captures the gesture; live pin values continue updating, and me
 during the established drag. Property-panel pointer interactions do not hold the viewer's mesh.
 Five existing Puppet pointer tests and six focused worker/input tests pass, including deterministic
 completion injection before capture and verification that feedback resumes before release.
+
+The replacement watchdog on `5e86b07f` exposed a second, distinct problem: post-frame tests and
+between-frame control requests preferred the registry's older geometry. The Puppet test could then
+press a stale handle coordinate and report 208 % instead of 200 %. A deterministic two-pixel stale
+snapshot reproduced the error locally at 181.8 % before correction. These callers now use only the
+latest painted elements; the existing during-paint lookup contract remains unchanged. Removed
+widgets cannot be clicked through an older snapshot. All 48 viewer tests, six control-channel tests,
+seven time-control tests and the new control geometry regression pass (62 total), with the original
+scale tolerance unchanged.
