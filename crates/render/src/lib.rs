@@ -14,6 +14,7 @@ include!(concat!(env!("OUT_DIR"), "/modules.rs"));
 pub mod cache;
 pub mod shapes;
 pub mod text;
+pub mod yuv;
 
 // The compositor is split by topic: `renderer` (the `Renderer`, its options, the comp walk),
 // `sources` and `footage` (layer sources), `layer_buf` (source → masks → effects → styles,

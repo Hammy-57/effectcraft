@@ -223,6 +223,7 @@ impl Gpu {
         // Reject failures observed during rendering/submission before publishing the frame.
         // A later device fault still requires the presentation host's lifecycle handling.
         self.ctx.check_health().map_err(|e| log::error!("gpu display: {e}")).ok()?;
+        e.publish_native();
         Some(DisplayFrame { texture, width: img.width, height: img.height })
     }
 
@@ -255,6 +256,9 @@ impl Gpu {
         let img = walk::render(&mut e, r, comp, t)?;
         let image = e.download(&img);
         self.ctx.check_health().ok()?;
+        if image.is_some() {
+            e.publish_native();
+        }
         image
     }
 
@@ -514,3 +518,19 @@ mod tests_init;
 mod tests_particles;
 #[cfg(test)]
 mod tests_warmup;
+
+mod yuv;
+
+/// Whether native YUV plane transport is enabled. Profiling builds support an
+/// A/B switch; ordinary builds always use the validated path when supported.
+pub fn yuv_transport_enabled() -> bool {
+    #[cfg(feature = "profile")]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("EFFECTCRAFT_PROFILE_YUV").as_deref() != Ok("0"))
+    }
+    #[cfg(not(feature = "profile"))]
+    {
+        true
+    }
+}

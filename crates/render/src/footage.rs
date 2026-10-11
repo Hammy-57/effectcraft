@@ -18,6 +18,11 @@ pub trait FramePixels: Send + Sync {
     /// Rows `y0..` (as many whole rows as `out` holds): exactly the pixels
     /// [`FootageSource::frame`] returns for the frame.
     fn rows(&self, y0: usize, out: &mut [Px]);
+    /// Native planar video samples, when their interpretation is supported.
+    /// The source keeps ownership; CPU consumers continue using `rows`.
+    fn yuv(&self) -> Option<crate::yuv::View<'_>> {
+        None
+    }
     /// The pixels themselves when they are an [`Image`] already.
     fn image(&self) -> Option<&Image> {
         None
@@ -199,7 +204,63 @@ impl FootageSource for NoFootage {
     }
 }
 
+/// Compact native footage and its placement/colour interpretation. RGB resampling
+/// must precede `conversion`, just as on the CPU preview path.
+pub struct NativeFootage {
+    pub pixels: SharedFrame,
+    pub preview: Option<(u32, u32)>,
+    pub scale: f64,
+    pub conversion: Option<effectcraft_color::Conversion>,
+}
+
 impl<'a> Renderer<'a> {
+    /// Resolve original dimensions, proxy selection and source time together.
+    pub(crate) fn footage_selection(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(ItemId, &'a Footage, &'a Footage, Tick)> {
+        let effectcraft_project::LayerSource::Footage { item } = layer.source else { return None };
+        let ItemKind::Footage(original) = &self.project.item(item)?.kind else { return None };
+        if !original.has_video {
+            return None;
+        }
+        Some((item, original, self.proxy_for(item).unwrap_or(original), ctx.source_time(layer)))
+    }
+
+    /// Native planar footage for an accelerator. Interpretations requiring CPU
+    /// temporal sampling deliberately retain the existing footage path.
+    pub fn native_footage(&self, ctx: &EvalCtx, layer: &Layer) -> Option<NativeFootage> {
+        let (item, original, footage, time) = self.footage_selection(ctx, layer)?;
+        // Non-power preview ratios can amplify CPU/GPU bilinear-coordinate
+        // rounding beyond the integer-depth oracle. Keep those on the reference path.
+        if ![1.0, 0.5, 0.25].contains(&self.opts.scale) {
+            return None;
+        }
+        if self.content_times(ctx, layer).is_some()
+            || footage.fields != effectcraft_project::FieldOrder::Off
+            || footage.invert_alpha
+            || footage.linear_light_applies()
+            || frame_blend_mode(ctx, layer) != FrameBlend::Off
+            || is_vector_footage(original)
+            || is_vector_footage(footage)
+        {
+            return None;
+        }
+        let conversion = self.pipe.media_in(footage);
+        // Integer working-space buffers amplify tiny resampling/conversion
+        // differences at quantisation thresholds (especially dark linear RGB).
+        // Keep the CPU reference conversion until that boundary is exact.
+        if conversion.is_some() && self.pipe.levels.is_some() {
+            return None;
+        }
+        let pixels = self.footage.frame_pixels(item, footage, time)?;
+        let view = pixels.yuv()?;
+        view.validate().ok()?;
+        if pixels.size() != (view.width, view.height) {
+            return None;
+        }
+        let preview = preview_size(view.width, original.width, original.height, self.opts.scale);
+        let scale = if preview.is_some() { self.opts.scale } else { view.width as f64 / original.width.max(1) as f64 };
+        Some(NativeFootage { pixels, preview, scale, conversion })
+    }
+
     /// The proxy footage used for `item` under this render's Proxy Use, if any.
     pub fn proxy_for(&self, item: ItemId) -> Option<&'a Footage> {
         let it = self.project.item(item)?;

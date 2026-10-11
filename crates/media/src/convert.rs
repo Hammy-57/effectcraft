@@ -195,6 +195,41 @@ impl Packed {
 }
 
 impl effectcraft_render::FramePixels for Packed {
+    fn yuv(&self) -> Option<effectcraft_render::yuv::View<'_>> {
+        use effectcraft_render::yuv::{ChromaSiting, Coefficients, Plane, Samples, View};
+        let Self::Video { frame, op } = self else { return None };
+        let (samples, alpha, chroma, bits) = match &frame.data {
+            PixelData::Yuv8 { planes, chroma, alpha } => {
+                (planes.each_ref().map(|p| Samples::U8(&p[..])), alpha.as_ref().map(|p| Samples::U8(&p[..])), *chroma, 8)
+            }
+            PixelData::Yuv16 { planes, chroma, bits, alpha } => {
+                (planes.each_ref().map(|p| Samples::U16(&p[..])), alpha.as_ref().map(|p| Samples::U16(&p[..])), *chroma, (*bits).clamp(8, 16))
+            }
+            _ => return None,
+        };
+        let (sx, sy) = chroma.shifts();
+        if sx > 1 || sy > 1 {
+            return None;
+        }
+        let (width, height) = (frame.width, frame.height);
+        let cw = width.div_ceil(1 << sx);
+        let ch = height.div_ceil(1 << sy);
+        let plane = |samples, w, h| Plane { samples, width: w, height: h, stride: w as usize };
+        let planes = [plane(samples[0], width, height), plane(samples[1], cw, ch), plane(samples[2], cw, ch)];
+        let k = Yuv::new(frame.color.matrix, frame.color.range, bits);
+        Some(View {
+            width,
+            height,
+            planes,
+            alpha: alpha.map(|a| plane(a, width, height)),
+            bits,
+            subsampling: [sx, sy],
+            siting: ChromaSiting::Centered,
+            coefficients: Coefficients { luma: [k.y_off, k.y_scale], chroma: [k.c_off, k.c_scale], rgb: [k.cr_r, k.cr_g, k.cb_g, k.cb_b] },
+            alpha_mode: op.mode,
+            matte: op.matte,
+        })
+    }
     fn size(&self) -> (u32, u32) {
         Packed::size(self)
     }
@@ -495,6 +530,7 @@ pub(crate) fn straight_to_image(w: u32, h: u32, px: &[[f32; 4]], op: AlphaOp) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use effectcraft_render::FramePixels;
     use std::sync::Arc;
 
     fn yuv_frame(y: u8, u: u8, v: u8, color: filmcraft_color::ColorInfo) -> VideoFrame {
@@ -766,6 +802,14 @@ mod tests {
                 assert_bit_exact(&frame_to_image(&f, op), &old, "frame_to_image");
                 let packed = Packed::Video { frame: f.clone(), op };
                 assert_bit_exact(&packed.to_image(), &old, "packed");
+                if let Some(view) = packed.yuv() {
+                    assert_eq!((view.width, view.height), packed.size());
+                    assert!(view.validate().is_ok());
+                    assert_eq!(view.alpha_mode, op.mode);
+                    assert_eq!(view.matte, op.matte);
+                } else {
+                    assert!(matches!(f.data, PixelData::Rgba8(_) | PixelData::RgbaF32(_)));
+                }
                 // a band at a time, as a renderer expands it
                 let mut band = vec![[0.0; 4]; f.width as usize * 3];
                 for y0 in (0..f.height as usize).step_by(3) {
