@@ -135,6 +135,8 @@ pub(crate) struct Transfers {
     up_bytes: std::sync::atomic::AtomicU64,
     downs: std::sync::atomic::AtomicU64,
     down_bytes: std::sync::atomic::AtomicU64,
+    yuv_conversions: std::sync::atomic::AtomicU64,
+    yuv_bytes: std::sync::atomic::AtomicU64,
 }
 
 /// A snapshot of [`GpuContext::transfer_stats`].
@@ -144,10 +146,19 @@ pub struct TransferStats {
     pub upload_bytes: u64,
     pub readbacks: u64,
     pub readback_bytes: u64,
+    /// Native plane conversion dispatches and their input sample bytes.
+    pub yuv_conversions: u64,
+    pub yuv_bytes: u64,
 }
 
 impl Transfers {
-    fn count(&self, up: bool, bytes: usize) {
+    pub(crate) fn count_yuv(&self, bytes: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.yuv_conversions.fetch_add(1, Relaxed);
+        self.yuv_bytes.fetch_add(bytes as u64, Relaxed);
+    }
+
+    pub(crate) fn count(&self, up: bool, bytes: usize) {
         use std::sync::atomic::Ordering::Relaxed;
         let (n, b) = if up { (&self.ups, &self.up_bytes) } else { (&self.downs, &self.down_bytes) };
         n.fetch_add(1, Relaxed);
@@ -156,7 +167,7 @@ impl Transfers {
 }
 
 fn tex_bytes(t: &wgpu::Texture) -> usize {
-    t.width() as usize * t.height() as usize * 16
+    (t.width() as usize).saturating_mul(t.height() as usize).saturating_mul(16)
 }
 
 impl Pool {
@@ -214,7 +225,34 @@ impl Pool {
                 self.bytes -= tex_bytes(t);
                 self.hits += 1;
             }
-            None => self.misses += 1,
+            None => {
+                self.misses += 1;
+                // A cached large texture must not permanently prevent reuse at a
+                // smaller preview size. Evict only a free size that cannot coexist
+                // with the requested texture at all. Preserve useful mixed smaller
+                // sizes when their collective occupancy reaches the budget.
+                let required = (w as usize).saturating_mul(h as usize).saturating_mul(16);
+                let budget = self.budget.unwrap_or(POOL_BUDGET);
+                if required <= budget {
+                    while self.bytes.saturating_add(self.released_bytes).saturating_add(required) > budget {
+                        let Some(key) = self
+                            .free
+                            .keys()
+                            .filter(|(w, h)| (*w as usize).saturating_mul(*h as usize).saturating_mul(16).saturating_add(required) > budget)
+                            .max_by_key(|(w, h)| u64::from(*w) * u64::from(*h))
+                            .copied()
+                        else {
+                            break;
+                        };
+                        if let Some(texture) = self.free.get_mut(&key).and_then(Vec::pop) {
+                            self.bytes = self.bytes.saturating_sub(tex_bytes(&texture));
+                        }
+                        if self.free.get(&key).is_some_and(Vec::is_empty) {
+                            self.free.remove(&key);
+                        }
+                    }
+                }
+            }
         }
         t
     }
@@ -283,9 +321,25 @@ struct Upload {
     last_use: u64,
 }
 
+#[derive(Clone)]
+pub(crate) struct NativeImage {
+    pub img: GpuImage,
+    pub offset: [f64; 2],
+    pub scale: f64,
+}
+struct NativeUpload {
+    owner: Weak<dyn effectcraft_render::footage::FramePixels>,
+    token: effectcraft_render::cache::ResidentToken,
+    metadata: Vec<u64>,
+    image: NativeImage,
+    bytes: usize,
+    last_use: u64,
+}
+
 #[derive(Default)]
 struct Uploads {
     map: HashMap<usize, Upload>,
+    native: HashMap<(usize, usize, u64), NativeUpload>,
     bytes: usize,
     clock: u64,
     /// Byte budget (`None`: [`UPLOAD_BUDGET`]).
@@ -302,20 +356,30 @@ impl Uploads {
     /// Drop textures whose layer buffer is gone (evicted from the layer cache, an older frame's),
     /// then the least recently used over budget.
     fn trim(&mut self) {
-        let before = self.map.len();
         self.map.retain(|_, e| e.buf.strong_count() > 0);
-        if self.map.len() != before {
-            self.bytes = self.map.values().map(|e| e.bytes).sum();
+        self.native.retain(|_, e| e.owner.strong_count() > 0 && e.token.valid());
+        self.bytes = self.map.values().map(|e| e.bytes).chain(self.native.values().map(|e| e.bytes)).fold(0, usize::saturating_add);
+        // Pixel bytes alone do not bound metadata for many tiny decoded frames.
+        while self.native.len() > 1024 {
+            let Some(key) = self.native.iter().min_by_key(|(_, e)| e.last_use).map(|(k, _)| *k) else { break };
+            if let Some(old) = self.native.remove(&key) {
+                self.bytes = self.bytes.saturating_sub(old.bytes);
+            }
         }
         let budget = self.budget.unwrap_or(UPLOAD_BUDGET);
         // Kept effect results awaiting adoption count against the same budget.
         self.trim_kept(0);
         let kept = self.kept.iter().map(|(_, img)| img_bytes(img)).fold(0, usize::saturating_add);
         while self.bytes.saturating_add(kept) > budget {
-            let Some(k) = self.map.iter().min_by_key(|(_, e)| e.last_use).map(|(k, _)| *k) else { break };
-            if let Some(e) = self.map.remove(&k) {
-                self.bytes = self.bytes.saturating_sub(e.bytes);
-            }
+            let plain = self.map.iter().min_by_key(|(_, e)| e.last_use).map(|(k, e)| (*k, e.last_use));
+            let native = self.native.iter().min_by_key(|(_, e)| e.last_use).map(|(k, e)| (*k, e.last_use));
+            let bytes = match (plain, native) {
+                (Some((k, a)), Some((_, b))) if a <= b => self.map.remove(&k).map(|e| e.bytes),
+                (_, Some((k, _))) => self.native.remove(&k).map(|e| e.bytes),
+                (Some((k, _)), None) => self.map.remove(&k).map(|e| e.bytes),
+                (None, None) => break,
+            };
+            self.bytes = self.bytes.saturating_sub(bytes.unwrap_or(0));
         }
     }
 
@@ -345,6 +409,7 @@ pub struct GpuContext {
     pub(crate) bgl: wgpu::BindGroupLayout,
     bgl_ext: wgpu::BindGroupLayout,
     pub(crate) fusion: crate::fusion::Pipelines,
+    pub(crate) yuv: Option<crate::yuv::Pipelines>,
     pipelines: HashMap<&'static str, wgpu::ComputePipeline>,
     /// Effect kernels that failed to build, and why (their effects render on the CPU).
     unavailable: Vec<(&'static str, String)>,
@@ -695,7 +760,14 @@ impl GpuContext {
         let max_dim = device.limits().max_texture_dimension_2d;
         let integrated = info.device_type == wgpu::DeviceType::IntegratedGpu;
         let (upload_budget, pool_budget, auxiliary_budget) = cache_budgets(UPLOAD_BUDGET, integrated);
-        let static_pipeline_count = std::sync::atomic::AtomicU64::new(pipelines.len() as u64 + 2);
+        let yuv = match crate::yuv::Pipelines::new(adapter, &device) {
+            Ok(p) => Some(p),
+            Err(reason) => {
+                unavailable.push(("yuv", reason));
+                None
+            }
+        };
+        let static_pipeline_count = std::sync::atomic::AtomicU64::new(pipelines.len() as u64 + 2 + if yuv.is_some() { 2 } else { 0 });
         Ok(GpuContext {
             device,
             queue,
@@ -705,6 +777,7 @@ impl GpuContext {
             bgl_ext,
             pipelines,
             fusion: Default::default(),
+            yuv,
             unavailable,
             display_bgl,
             display,
@@ -999,6 +1072,8 @@ impl GpuContext {
             upload_bytes: t.up_bytes.load(Relaxed),
             readbacks: t.downs.load(Relaxed),
             readback_bytes: t.down_bytes.load(Relaxed),
+            yuv_conversions: t.yuv_conversions.load(Relaxed),
+            yuv_bytes: t.yuv_bytes.load(Relaxed),
         }
     }
 
@@ -1145,15 +1220,67 @@ impl GpuContext {
         }
     }
 
+    pub(crate) fn native_get(
+        &self,
+        owner: &effectcraft_render::footage::SharedFrame,
+        key: u64,
+        token: &effectcraft_render::cache::ResidentToken,
+        metadata: &[u64],
+    ) -> Option<NativeImage> {
+        let _profile = effectcraft_render::profile::span("native_cache_lookup");
+        if !token.valid() || self.check_health().is_err() {
+            return None;
+        }
+        let mut u = self.uploads.lock().ok()?;
+        u.trim();
+        u.clock = u.clock.wrapping_add(1);
+        let now = u.clock;
+        let k = (Arc::as_ptr(owner) as *const () as usize, token.identity(), key);
+        let e = u.native.get_mut(&k)?;
+        if e.metadata != metadata || !Arc::ptr_eq(&e.owner.upgrade()?, owner) {
+            return None;
+        }
+        e.last_use = now;
+        Some(e.image.clone())
+    }
+
+    pub(crate) fn native_keep(
+        &self,
+        owner: &effectcraft_render::footage::SharedFrame,
+        key: u64,
+        token: effectcraft_render::cache::ResidentToken,
+        metadata: Vec<u64>,
+        image: NativeImage,
+    ) {
+        if !token.valid() || self.check_health().is_err() {
+            return;
+        }
+        let Ok(mut u) = self.uploads.lock() else { return };
+        let bytes = img_bytes(&image.img);
+        if bytes > u.budget.unwrap_or(UPLOAD_BUDGET) {
+            return;
+        }
+        u.clock = u.clock.wrapping_add(1);
+        let last_use = u.clock;
+        let k = (Arc::as_ptr(owner) as *const () as usize, token.identity(), key);
+        let entry = NativeUpload { owner: Arc::downgrade(owner), token, metadata, image, bytes, last_use };
+        if let Some(old) = u.native.insert(k, entry) {
+            u.bytes = u.bytes.saturating_sub(old.bytes);
+        }
+        u.bytes = u.bytes.saturating_add(bytes);
+        u.trim();
+    }
+
     /// Uploaded layer textures kept: (count, bytes) (diagnostics, tests).
     pub fn upload_stats(&self) -> (usize, usize) {
-        self.uploads.lock().map(|u| (u.map.len(), u.bytes)).unwrap_or_default()
+        self.uploads.lock().map(|u| (u.map.len().saturating_add(u.native.len()), u.bytes)).unwrap_or_default()
     }
 
     /// Forget uploaded layer textures.
     pub fn clear_uploads(&self) {
         if let Ok(mut u) = self.uploads.lock() {
             u.map.clear();
+            u.native.clear();
             u.kept.clear();
             u.bytes = 0;
         }
@@ -1178,7 +1305,16 @@ fn profile_features(available: wgpu::Features) -> wgpu::Features {
 }
 
 /// Records GPU work for one render (a command encoder submitted at readback or the end).
+struct PendingNative {
+    owner: effectcraft_render::footage::SharedFrame,
+    key: u64,
+    token: effectcraft_render::cache::ResidentToken,
+    metadata: Vec<u64>,
+    image: NativeImage,
+}
+
 pub(crate) struct Enc<'g> {
+    native_pending: Vec<PendingNative>,
     #[cfg(feature = "profile")]
     pub(crate) timestamps: Option<crate::timestamps::Batch>,
     pub g: &'g GpuContext,
@@ -1213,6 +1349,7 @@ impl Drop for Enc<'_> {
 impl<'g> Enc<'g> {
     pub fn new(g: &'g GpuContext) -> Enc<'g> {
         Enc {
+            native_pending: Vec::new(),
             g,
             enc: None,
             pending: 0,
@@ -1413,6 +1550,30 @@ impl<'g> Enc<'g> {
         }
     }
 
+    /// Dispatch a dedicated texture layout while retaining profiling and batch bounds.
+    pub(crate) fn custom_pixels(&mut self, entry: &str, pipe: &wgpu::ComputePipeline, bg: &wgpu::BindGroup, size: (u32, u32)) {
+        #[cfg(feature = "profile")]
+        let mut batch = self.timestamps.take().or_else(|| crate::timestamps::Batch::new(self.g));
+        #[cfg(feature = "profile")]
+        let timestamp_writes = batch.as_mut().and_then(|b| b.mark(entry));
+        #[cfg(not(feature = "profile"))]
+        let timestamp_writes = None;
+        {
+            let mut pass = self.encoder().begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(entry), timestamp_writes });
+            pass.set_pipeline(pipe);
+            pass.set_bind_group(0, bg, &[]);
+            pass.dispatch_workgroups(size.0.div_ceil(16), size.1.div_ceil(16), 1);
+        }
+        #[cfg(feature = "profile")]
+        {
+            self.timestamps = batch;
+        }
+        self.pending += 1;
+        if self.pending >= 256 {
+            self.submit();
+        }
+    }
+
     /// Per-pixel kernel over `out`'s size (16×16 workgroups).
     pub fn pixels(&mut self, entry: &str, p: &Params, src: &GpuImage, aux: Option<&GpuImage>, out: &GpuImage, data: Option<&wgpu::Buffer>) {
         let groups = (out.width.div_ceil(16), out.height.div_ceil(16));
@@ -1440,6 +1601,33 @@ impl<'g> Enc<'g> {
             wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
         );
         out
+    }
+
+    pub(crate) fn keep_native(
+        &mut self,
+        owner: effectcraft_render::footage::SharedFrame,
+        key: u64,
+        token: effectcraft_render::cache::ResidentToken,
+        metadata: Vec<u64>,
+        image: NativeImage,
+    ) {
+        // Deferred CPU-effect placeholders must never become persistent native pixels.
+        let budget = self.g.uploads.lock().map(|u| u.budget.unwrap_or(UPLOAD_BUDGET)).unwrap_or(0);
+        let retained = self.native_pending.iter().map(|p| img_bytes(&p.image.img)).fold(img_bytes(&image.img), usize::saturating_add);
+        if self.g.deferred.is_none() && self.native_pending.len() < 256 && retained <= budget {
+            self.native_pending.push(PendingNative { owner, key, token, metadata, image });
+        }
+    }
+
+    /// Publish only after the top-level render successfully submits/reads back.
+    pub(crate) fn publish_native(&mut self) {
+        if self.g.check_health().is_err() {
+            self.native_pending.clear();
+            return;
+        }
+        for entry in self.native_pending.drain(..) {
+            self.g.native_keep(&entry.owner, entry.key, entry.token, entry.metadata, entry.image);
+        }
     }
 
     /// Submit recorded work.
@@ -1714,6 +1902,29 @@ pub(crate) fn mip_levels(w: u32, h: u32) -> u32 {
 #[cfg(test)]
 mod upload_budget_tests {
     use super::*;
+
+    #[test]
+    fn pool_size_transition_reuses_small_textures_without_touching_pending() {
+        let Some(g) = crate::tests::gpu() else { return };
+        let mut pool = Pool::default();
+        pool.set_budget(8 * 8 * 16);
+        pool.release(g.ctx.texture(8, 8));
+        assert!(pool.take(4, 4).is_none());
+        assert_eq!(pool.bytes, 0, "large free texture makes room for new size");
+        let encoder = pool.open();
+        pool.release(g.ctx.texture(4, 4));
+        assert_eq!(pool.released.len(), 1);
+        assert!(pool.take(4, 4).is_none(), "unsubmitted texture is not reused");
+        assert_eq!(pool.released.len(), 1, "pending resources are not evicted");
+        pool.close(encoder);
+        assert!(pool.take(4, 4).is_some(), "new preview size now reuses its allocation");
+        pool.release(g.ctx.texture(4, 4));
+        pool.release(g.ctx.texture(4, 4));
+        pool.release(g.ctx.texture(4, 4));
+        assert!(pool.take(6, 4).is_none());
+        assert_eq!(pool.bytes, 3 * 4 * 4 * 16, "collective pressure preserves useful smaller sizes");
+        assert_eq!(pool.free.get(&(4, 4)).map(Vec::len), Some(3));
+    }
 
     #[test]
     fn pool_pending_reuse_is_bounded_and_purge_cannot_repopulate_it() {

@@ -217,6 +217,7 @@ const VALUED: &[&str] = &[
 /// Options without a value. Any other `--option` is a usage error.
 const FLAGS: &[&str] = &[
     "--rt-profile",
+    "--rt-drag",
     "--rt-warmup",
     "--json",
     "--save",

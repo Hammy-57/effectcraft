@@ -13,6 +13,7 @@ include!(concat!(env!("OUT_DIR"), "/modules.rs"));
 // By hand: submodules in `i18n/`.
 pub mod i18n;
 // By hand: UI command area files in `menus/` (`AREAS`, see menus.rs).
+pub mod frames;
 mod local_assets;
 pub mod menus;
 // By hand: behind a feature.
@@ -686,13 +687,11 @@ impl EffectcraftApp {
         }
     }
 
-    /// Keep GPU-composited viewer frames on the GPU (drawn from their texture). The browser can't
-    /// read frames back (its thread can't wait for the GPU), so there the viewer shows GPU frames
-    /// directly whenever it draws them plainly (RGB, no exposure, no region of interest); the
-    /// desktop reads them back (see [`frames::RenderSource::gpu_display`]).
+    /// Prepare plain viewer pixels on the compositor. The browser keeps its
+    /// texture; native workers read back RGBA8 for the separate egui device.
     fn gpu_display(&self) -> bool {
         let v = &self.session.state.viewer;
-        cfg!(target_arch = "wasm32")
+        (cfg!(target_arch = "wasm32") || !self.frames.remote_active())
             && v.channel == effectcraft_engine::viewer::Channel::Rgb
             && v.exposure == 0.0
             && self.session.state.region_of_interest.is_none()
@@ -1048,7 +1047,7 @@ impl EffectcraftApp {
     /// options are the same for every frame: loops compute this once).
     pub fn frame_series(&self, comp: ItemId, scale: f64) -> FrameKey {
         let generation = self.session.freeze_preview_revision();
-        let mut content = self.frames.content_of(&self.session.freeze_preview_project(), generation, comp);
+        let mut content = self.frames.content_of_preview(&self.session.freeze_preview_project(), self.session.revision, generation, comp);
         if let Some(epoch) = self.session.freeze_runtime.pixel_epoch(&self.session.project, comp) {
             // Derived cache verification can change pixels without an authoring edit.
             // Keep that in content identity: revision remains the document revision used

@@ -34,6 +34,8 @@ use effectcraft_engine::time::Tick;
 use effectcraft_gpu::{DisplayFrame, Gpu};
 use rayon::prelude::*;
 
+mod opacity_reuse;
+
 /// Comp identities (and the project snapshots behind them) the RAM preview keeps frames of.
 const MAX_KEEPERS: usize = 64;
 
@@ -218,11 +220,9 @@ pub struct RenderSource {
     pub layer_cache: Arc<LayerCache>,
     /// GPU compositor (Mercury GPU Acceleration), if available.
     pub gpu: Option<Gpu>,
-    /// Keep GPU frames on the GPU for the viewer (native egui-wgpu textures). Off on the
-    /// desktop: Show Channel / exposure / region-of-interest drawing read the CPU frame texture,
-    /// so GPU frames are read back (the compositing still runs on the GPU). On in the browser
-    /// while the viewer draws plainly, because there frames can't be read back synchronously
-    /// (`EffectcraftApp::gpu_display`).
+    /// Use the GPU's plain RGB display conversion. Browser workers retain the
+    /// texture; native workers read back RGBA8 to the separate egui device.
+    /// Channel/exposure/ROI/extended views retain the full-float path.
     pub gpu_display: bool,
     /// The persistent disk cache, when enabled.
     pub disk: Option<Arc<DiskCache>>,
@@ -447,9 +447,9 @@ pub struct Frames {
     playback_budget: Arc<Mutex<crate::playback_budget::Budget>>,
     content_keys: ContentKeys,
     gpu_retired: Arc<AtomicBool>,
-    /// [`comp_content`] identities by (revision, comp), with the project that keeps an identity
+    /// [`comp_content`] identities by (revision, preview epoch, comp), with the project that keeps an identity
     /// found by [`Frames::identity`] in another project.
-    identities: Mutex<HashMap<(u64, u64), Identity>>,
+    identities: Mutex<HashMap<(u64, u64, u64), Identity>>,
     /// The last new identity of each comp and its project (see [`Frames::identity`]).
     bases: Mutex<HashMap<u64, (u64, Arc<Project>)>>,
     /// A project snapshot for each identity handed out, with when it was last asked for (see
@@ -541,6 +541,24 @@ pub fn to_color_image(img: &effectcraft_engine::render::Image) -> egui::ColorIma
         })
         .collect();
     egui::ColorImage::new([img.width as usize, img.height as usize], px)
+}
+
+/// Validate a native display readback before constructing egui's image. A bad
+/// size or an allocation failure declines this attempt so the worker retries.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn display_color_image(width: u32, height: u32, bytes: &[u8]) -> Option<egui::ColorImage> {
+    let w = usize::try_from(width).ok()?;
+    let h = usize::try_from(height).ok()?;
+    let count = w.checked_mul(h)?;
+    // Bound input-derived allocations even on adapters with unusually large limits.
+    let byte_count = count.checked_mul(4)?;
+    if w == 0 || h == 0 || byte_count > 1024 * 1024 * 1024 || byte_count != bytes.len() {
+        return None;
+    }
+    let mut pixels = Vec::new();
+    pixels.try_reserve_exact(count).ok()?;
+    pixels.extend(bytes.as_chunks::<4>().0.iter().map(|[r, g, b, a]| egui::Color32::from_rgba_premultiplied(*r, *g, *b, *a)));
+    Some(egui::ColorImage::new([w, h], pixels))
 }
 
 /// The whole factor an image of `size` is averaged down by for a texture: at least `min_k`, and
@@ -748,14 +766,20 @@ impl Frames {
     /// revision). The project is kept while frames of that identity are cached or rendering, so
     /// the comp addresses it hashes can't be reused by other comps meanwhile.
     pub fn content_of(&self, project: &Arc<Project>, revision: u64, comp: ItemId) -> u64 {
-        let known = self.identities.lock().ok().and_then(|m| m.get(&(revision, comp.0)).cloned());
+        self.content_of_preview(project, revision, 0, comp)
+    }
+
+    /// A derived preview snapshot can change without changing the document revision.
+    /// Keep its memoization epoch separate from revisions written into retained frame keys.
+    pub fn content_of_preview(&self, project: &Arc<Project>, revision: u64, preview_epoch: u64, comp: ItemId) -> u64 {
+        let known = self.identities.lock().ok().and_then(|m| m.get(&(revision, preview_epoch, comp.0)).cloned());
         let (id, base) = known.unwrap_or_else(|| {
-            let found = self.identity(project, comp);
+            let found = self.identity(project, revision, comp);
             if let Ok(mut m) = self.identities.lock() {
                 if m.len() > 256 {
                     m.clear();
                 }
-                m.insert((revision, comp.0), found.clone());
+                m.insert((revision, preview_epoch, comp.0), found.clone());
             }
             found
         });
@@ -789,7 +813,7 @@ impl Frames {
     /// only Audio, Lock or Shy switches changed), so toggling those keeps the cached frames
     /// (#103). That identity hashes the addresses of the comps in its project, which is
     /// returned to keep them.
-    fn identity(&self, project: &Arc<Project>, comp: ItemId) -> Identity {
+    fn identity(&self, project: &Arc<Project>, revision: u64, comp: ItemId) -> Identity {
         let plain = comp_content(project, comp);
         let Ok(mut bases) = self.bases.lock() else { return (plain, None) };
         if let Some((base_id, base)) = bases.get(&comp.0)
@@ -800,6 +824,15 @@ impl Frames {
             }) == *base_id
         {
             return (*base_id, Some(base.clone()));
+        }
+        // Only completed frames with a bounded exact snapshot proof can cross an edit.
+        // Their full keys remain distinct; queued/inflight work follows normal cancellation.
+        if let Some((base_id, base)) = bases.get(&comp.0)
+            && *base_id != plain
+            && let Some(proof) = opacity_reuse::Proof::between(base, project, comp)
+            && let Ok(mut cache) = self.cache.lock()
+        {
+            proof.rekey(&mut cache, *base_id, plain, revision, comp);
         }
         if bases.len() > MAX_KEEPERS {
             bases.clear();
@@ -1391,19 +1424,34 @@ impl Worker {
             let auto = if cfg!(target_arch = "wasm32") { None } else { r.frame_auto(a, job.comp, true) };
             if auto.is_none_or(|(p, key)| p.choose(key)) {
                 let t0 = web_time::Instant::now();
-                match g.within_memory(|| g.render_display(&r, job.comp, job.t)) {
-                    Ok(Some(f)) => {
+                match g.within_memory(|| {
+                    let f = g.render_display(&r, job.comp, job.t)?;
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        Some(FrameImage::Gpu(Arc::new(f)))
+                    }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        let bytes = g.read_display(&f)?;
+                        let image = display_color_image(f.width, f.height, &bytes)?;
+                        Some(FrameImage::Cpu(Arc::new(image)))
+                    }
+                }) {
+                    Ok(Some(image)) => {
+                        if g.context().check_health().is_err() {
+                            return self.render_job(job, false);
+                        }
                         if let Some((p, key)) = auto {
-                            // Time the GPU's work, not just its recording.
-                            g.wait();
-                            if g.context().check_health().is_err() {
-                                return self.render_job(job, false);
-                            }
+                            // Native readback has completed; include transfer and
+                            // CPU image construction in AutoPick's measurement.
                             p.record(key, true, t0.elapsed().as_secs_f64() * 1000.0);
                         }
-                        return FrameImage::Gpu(Arc::new(f));
+                        return image;
                     }
                     Ok(None) => {
+                        if g.context().check_health().is_err() {
+                            return self.render_job(job, false);
+                        }
                         if let Some((p, key)) = auto {
                             p.declined(key);
                         }

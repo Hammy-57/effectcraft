@@ -176,11 +176,9 @@ impl<'a> Renderer<'a> {
                         return Some(buf);
                     }
                 }
-                let lt = ctx.source_time(layer);
-                // The proxy is decoded instead, at its own size, and fills the footage's frame.
-                let pf = self.proxy_for(*item).unwrap_or(f);
-                let img = self.footage_frame(ctx, layer, *item, pf, lt)?;
-                Some(self.footage_buf(&img, pf, f.width, f.height))
+                let (item, original, pf, lt) = self.footage_selection(ctx, layer)?;
+                let img = self.footage_frame(ctx, layer, item, pf, lt)?;
+                Some(self.footage_buf(&img, pf, original.width, original.height))
             }
             LayerSource::Text => Some(self.authored(text::render(ctx, layer, self.raster_scale(ctx, layer)))),
             LayerSource::Shape => layer.props.sub("contents").map(|c| self.authored(shapes::render(ctx, layer, c, self.raster_scale(ctx, layer)))),

@@ -22,10 +22,19 @@ pub struct MaskBlur {
     pub samples: usize,
 }
 
+/// Geometry needed to rasterise masks without allocating RGBA source pixels.
+#[derive(Clone, Copy, Debug)]
+pub struct Geometry {
+    pub width: u32,
+    pub height: u32,
+    pub offset: [f64; 2],
+    pub scale: f64,
+}
+
 /// Coverage of one mask in buffer pixels (before mode/opacity/invert). With mask motion blur
 /// (Layer ▸ Mask ▸ Motion Blur: On, or Same As Layer with the layer's switch on) an animated
 /// path is averaged over the comp's shutter.
-fn coverage(ctx: &EvalCtx, layer: &Layer, g: &effectcraft_project::PropGroup, buf: &Buf, blur: MaskBlur) -> Option<Mask> {
+fn coverage(ctx: &EvalCtx, layer: &Layer, g: &effectcraft_project::PropGroup, buf: &Geometry, blur: MaskBlur) -> Option<Mask> {
     let mb = blur.allowed
         && match g.kind {
             GroupKind::Mask { motion_blur, .. } => match motion_blur {
@@ -60,10 +69,10 @@ fn coverage(ctx: &EvalCtx, layer: &Layer, g: &effectcraft_project::PropGroup, bu
     coverage_at(ctx, layer, g, buf)
 }
 
-fn coverage_at(ctx: &EvalCtx, layer: &Layer, g: &effectcraft_project::PropGroup, buf: &Buf) -> Option<Mask> {
+fn coverage_at(ctx: &EvalCtx, layer: &Layer, g: &effectcraft_project::PropGroup, buf: &Geometry) -> Option<Mask> {
     let Value::Path(sp) = ctx.group_value(layer, g, "path")? else { return None };
     let path = effectcraft_path::to_kurbo(&sp);
-    let (w, h) = (buf.img.width, buf.img.height);
+    let (w, h) = (buf.width, buf.height);
     let m = Mat3::translate(vec2(buf.offset[0], buf.offset[1])) * Mat3::scale(vec2(buf.scale, buf.scale));
     let exp = ctx.f(layer, g, "expansion", 0.0);
     let linear = matches!(g.kind, GroupKind::Mask { feather_falloff: FeatherFalloff::Linear, .. });
@@ -159,20 +168,22 @@ pub fn shapes(ctx: &EvalCtx, layer: &Layer) -> Vec<effectcraft_effects::MaskShap
     out
 }
 
-/// Apply the layer's masks to its buffer.
-/// Returns whether any mask was applied.
-pub fn apply(ctx: &EvalCtx, layer: &Layer, buf: &mut Buf, blur: MaskBlur) -> bool {
-    let Some(masks) = layer.masks() else { return false };
+/// Combined layer mask coverage in the supplied geometry.
+/// `None` means there is no applicable closed mask or geometry exceeds the cap.
+pub fn combined(ctx: &EvalCtx, layer: &Layer, buf: &Geometry, blur: MaskBlur) -> Option<Mask> {
+    let masks = layer.masks()?;
     // An open mask (a path the Pen is still drawing) makes no transparency: the layer shows
     // whole until the path is closed (After Effects; effects still use it as a path).
     let closed = |g: &effectcraft_project::PropGroup| matches!(ctx.group_value(layer, g, "path"), Some(Value::Path(sp)) if sp.closed);
     let list: Vec<_> = masks.groups().filter(|g| g.enabled && matches!(g.kind, GroupKind::Mask { mode, .. } if mode != MaskMode::None) && closed(g)).collect();
     if list.is_empty() {
-        return false;
+        return None;
     }
-    // Masks may extend past the source: grow the buffer to cover them when feather/expansion pads.
-    let n = (buf.img.width * buf.img.height) as usize;
-    let first_sub = matches!(list[0].kind, GroupKind::Mask { mode: MaskMode::Subtract, .. });
+    let n = (buf.width as usize).checked_mul(buf.height as usize)?;
+    if n > 268_435_456 {
+        return None;
+    }
+    let first_sub = matches!(list.first()?.kind, GroupKind::Mask { mode: MaskMode::Subtract, .. });
     let mut acc = vec![if first_sub { 1.0f32 } else { 0.0 }; n];
     // The first mask has nothing to combine with. Intersect and Darken would multiply or
     // minimise against that empty coverage and hide the layer; they cover like Add instead.
@@ -203,6 +214,13 @@ pub fn apply(ctx: &EvalCtx, layer: &Layer, buf: &mut Buf, blur: MaskBlur) -> boo
             };
         });
     }
-    buf.img.mul_mask(&acc);
+    Some(Mask { width: buf.width, height: buf.height, data: acc })
+}
+
+/// Apply the layer's masks to its buffer, sharing coverage with resident sources.
+pub fn apply(ctx: &EvalCtx, layer: &Layer, buf: &mut Buf, blur: MaskBlur) -> bool {
+    let geometry = Geometry { width: buf.img.width, height: buf.img.height, offset: buf.offset, scale: buf.scale };
+    let Some(mask) = combined(ctx, layer, &geometry, blur) else { return false };
+    buf.img.mul_mask(&mask.data);
     true
 }

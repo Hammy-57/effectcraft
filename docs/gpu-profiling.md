@@ -126,3 +126,15 @@ on-screen frame-rate measurement. Set `RT5_PROJECT` to a generated project with
 at least 136 valid source frames and `RT5_REPORT` to the output JSON path. Keep
 other GPU work and own builds stopped while timing it. The probe requests urgent
 frames directly; it does not measure sparse neighbor prefetch or UI presentation.
+
+### Native display readback worker probe
+
+The ignored UI library test `native_display_worker_benchmark` compares the old
+float readback with GPU display conversion followed by RGBA8 readback. Set
+`RT_DISPLAY_PROJECT` to a generated project with at least 68 valid frames and
+`RT_DISPLAY_REPORT` to the output JSON. Run in an exclusive native timing window.
+It compares Off/On/On/Off at Full and Half through real viewer workers, checks a
+forced-GPU output frame outside timing, warms Auto at each scale, then records
+60 completion times, readback bytes and Auto's CPU/GPU decisions. It includes
+worker completion and bounded polling, not window presentation. The renderer and
+export precision remain unchanged; this measures final viewer transfer only.

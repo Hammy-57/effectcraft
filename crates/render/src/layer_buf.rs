@@ -96,6 +96,30 @@ impl<'a> Renderer<'a> {
         self.content_cache_key_noted(ctx, layer).0
     }
 
+    /// Processed native footage uses the same dependency key as cached CPU content.
+    /// Bare footage also gets its source-time key, without enabling unsafe effect caching.
+    pub fn resident_footage_key(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(u64, cache::ResidentToken)> {
+        let c = self.cache?;
+        let token = c.resident_token()?;
+        let key = self.content_cache_key(ctx, layer).or_else(|| {
+            if layer.switches.effects && layer.effects().is_some_and(|f| !f.children.is_empty()) {
+                return None;
+            }
+            let LayerSource::Footage { item } = layer.source else { return None };
+            let key = cache::input_key_src(
+                ctx,
+                layer,
+                self.raster_scale(ctx, layer),
+                self.opts.draft,
+                self.mb_on(ctx, layer),
+                0,
+                Some(self.proxy_for(item).is_some() as u64),
+            );
+            self.content_key(ctx, layer, key)
+        })?;
+        Some((key, token))
+    }
+
     /// [`Self::content_cache_key`], and for a precomp layer that was keyed, its id for
     /// [`cache::LayerCache::precomp_note`] (an animated precomp is keyed only now and then, see
     /// [`cache::LayerCache::precomp_try`]).
