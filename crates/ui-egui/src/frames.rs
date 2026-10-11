@@ -194,6 +194,7 @@ impl Cache {
 /// What a render job needs (all cheap clones).
 #[derive(Clone)]
 pub struct RenderSource {
+    pub freeze_feedback: effectcraft_engine::freeze::Feedback,
     pub project: Arc<Project>,
     pub footage: Arc<dyn FootageSource>,
     pub expr: Option<Arc<dyn ExprHost>>,
@@ -221,7 +222,15 @@ fn content_key(keys: &ContentKeys, project: &Project, revision: u64, comp: u64) 
     if let Some(k) = keys.lock().ok().and_then(|m| m.get(&(revision, comp)).copied()) {
         return k;
     }
-    let k = disk_cache::comp_content_key(project, ItemId(comp));
+    let base = disk_cache::comp_content_key(project, ItemId(comp));
+    let k = if let Some(frozen) = effectcraft_engine::freeze::preview_identity(project, ItemId(comp)) {
+        let mut key = disk_cache::Hash128::default();
+        key.write(&base.to_le_bytes());
+        key.write_u64(frozen);
+        key.finish()
+    } else {
+        base
+    };
     if let Ok(mut m) = keys.lock() {
         if m.len() > 256 {
             m.clear();
@@ -251,6 +260,9 @@ fn comp_content_with(project: &Project, comp: ItemId, addr: impl Fn(ItemId, &Arc
     }
     let mut h = std::collections::hash_map::DefaultHasher::new();
     hash_debug(&mut h, &project.settings);
+    if let Some(frozen) = effectcraft_engine::freeze::preview_identity(project, comp) {
+        frozen.hash(&mut h);
+    }
     let mut seen = BTreeSet::new();
     let mut stack = vec![comp];
     let mut expressions = false;
@@ -898,6 +910,8 @@ impl Frames {
             let job = {
                 let Ok(mut q) = self.queue.lock() else { break };
                 let Some(i) = Queue::best(&q.jobs) else { break };
+                // Remote renderers deliberately use originals; a local freeze must not
+                // strand their queue waiting for files unavailable to that worker.
                 let job = q.jobs.swap_remove(i);
                 q.running.insert(job.key);
                 if job.urgent {
@@ -1157,6 +1171,9 @@ impl Worker {
 
     /// The frame on the GPU, kept there for the viewer, if the compositor can do it alone.
     fn render_gpu(&self, job: &Job) -> Option<FrameImage> {
+        if !effectcraft_engine::freeze::Preview::for_comp(&job.src.project, job.comp).is_empty() {
+            return None;
+        }
         if self.gpu_retired.load(Ordering::Acquire) {
             return None;
         }
@@ -1177,9 +1194,11 @@ impl Worker {
 
     /// Render a frame; `gpu: false` keeps it off the GPU compositor.
     fn render_job(&self, job: &Job, gpu: bool) -> FrameImage {
+        let frozen = effectcraft_engine::freeze::Preview::for_comp(&job.src.project, job.comp).with_feedback(&job.src.freeze_feedback);
         let mut r = Renderer::new(&job.src.project, job.src.footage.as_ref(), job.opts);
+        r.freeze = (!frozen.is_empty()).then_some(&frozen);
         r.expr = job.src.expr.as_deref();
-        let gpu_allowed = gpu && !self.gpu_retired.load(Ordering::Acquire);
+        let gpu_allowed = gpu && frozen.is_empty() && !self.gpu_retired.load(Ordering::Acquire);
         // A failed GPU attempt may have populated intermediate entries before its scope
         // reported failure. The CPU retry must compute its own pixels from the snapshot.
         r.cache = gpu_allowed.then_some(job.src.layer_cache.as_ref());
@@ -1353,6 +1372,7 @@ mod tests {
         s.execute("layer.addItem", json!({"item": item.0})).unwrap();
         let footage = Arc::new(Explodes::default());
         let src = RenderSource {
+            freeze_feedback: Default::default(),
             project: s.project.clone(),
             footage: footage.clone(),
             expr: None,
@@ -1414,6 +1434,7 @@ mod tests {
         let cid = ItemId(s.execute("comp.new", json!({"name": "A", "width": 64, "height": 64, "duration": 2})).unwrap()["comp"].as_u64().unwrap());
         s.execute("layer.newSolid", json!({"color": "#ff0000", "width": 32, "height": 32})).unwrap();
         let src = RenderSource {
+            freeze_feedback: Default::default(),
             project: s.project.clone(),
             footage: Arc::new(effectcraft_engine::render::NoFootage),
             expr: None,
@@ -1454,6 +1475,7 @@ mod tests {
         let job = |cid: ItemId, scale: f64, budget: usize| Job {
             key: key(cid.0, 0, 0),
             src: RenderSource {
+                freeze_feedback: Default::default(),
                 project: s.project.clone(),
                 footage: Arc::new(effectcraft_engine::render::NoFootage),
                 expr: None,
@@ -1492,6 +1514,7 @@ mod tests {
         let mut f = Frames::default();
         f.set_remote(Some(Arc::new(Idle)));
         let src = RenderSource {
+            freeze_feedback: Default::default(),
             project: Arc::default(),
             footage: Arc::new(effectcraft_engine::render::NoFootage),
             expr: None,
@@ -1559,6 +1582,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let dc = DiskCache::open(&dir, 1 << 30).unwrap();
         let src = RenderSource {
+            freeze_feedback: Default::default(),
             project: Arc::default(),
             footage: Arc::new(effectcraft_engine::render::NoFootage),
             expr: None,

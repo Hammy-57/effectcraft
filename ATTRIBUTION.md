@@ -9,6 +9,7 @@ iconography, images or other Adobe assets; open licences only; every asset attri
 
 | Asset | Author | Source | Licence |
 |---|---|---|---|
+| `tests/repros/freeze-cycle.ecproj` | EffectCraft contributors | Original synthetic cyclic-composition regression; no media or external artwork | MIT OR Apache-2.0 |
 | `assets/icons/tools-atlas.png` | EffectCraft contributors with OpenAI ImageGen | Original generated toolbar and timeline glyphs; prompt in `assets/icons/tools-atlas-prompt.txt` | MIT OR Apache-2.0 |
 | `assets/fonts/Inter-Regular.ttf` | The Inter Project Authors | https://github.com/rsms/inter | OFL-1.1 (`assets/fonts/OFL-Inter.txt`) |
 | `assets/fonts/Inter-Medium.ttf` | The Inter Project Authors | https://github.com/rsms/inter | OFL-1.1 (`assets/fonts/OFL-Inter.txt`) |

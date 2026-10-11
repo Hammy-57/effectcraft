@@ -1244,6 +1244,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         return;
     };
     let Some(comp) = app.session.project.comp_arc(cid) else { return };
+    let freeze_badges = super::smart_freeze::timeline_badges(app, cid);
     let p = ui.painter().clone();
     let time = app.session.time();
     let fr = comp.frame_rate;
@@ -1860,7 +1861,20 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                         );
                         lp.rect_filled(cell, 0.0, SELECTED_NAME_BG);
                     }
-                    let lpn = lp.with_clip_rect(name_rect.intersect(lp.clip_rect()));
+                    let mut text_rect = name_rect;
+                    if let Some(label) = freeze_badges.get(&layer.id)
+                        && name_rect.width() >= 90.0
+                    {
+                        let badge = Rect::from_min_max(pos2(name_rect.max.x - 46.0, r.min.y + 3.0), pos2(name_rect.max.x, r.max.y - 3.0));
+                        text_rect.max.x = badge.min.x - 4.0;
+                        lp.rect_filled(badge, 3.0, t.accent);
+                        lp.text(badge.center(), Align2::CENTER_CENTER, *label, Tokens::ui(9.0), Color32::WHITE);
+                        app.auto.add(&format!("timeline.layer.{}.freeze", layer.id.0), badge, label);
+                        if ui.interact(badge, egui::Id::new(("freeze-badge", layer.id.0)), Sense::click()).clicked() {
+                            actions.push(("window.panel".into(), json!({"panel":"smartFreeze"})));
+                        }
+                    }
+                    let lpn = lp.with_clip_rect(text_rect.intersect(lp.clip_rect()));
                     lpn.text(pos2(name_rect.min.x, cy), Align2::LEFT_CENTER, display_name(app, layer), Tokens::ui(12.0), name_col);
                 }
                 // Locked layers can't be selected or moved (unlock them with the lock switch).

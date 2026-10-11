@@ -9,6 +9,7 @@
 pub mod build;
 pub mod essential;
 mod finite;
+pub mod freeze;
 pub mod layers;
 pub mod props;
 pub mod render_queue;
@@ -1269,6 +1270,9 @@ pub struct Project {
     /// Render Queue preferences (Notify, storage overflow folders).
     #[serde(default, skip_serializing_if = "render_queue::RenderQueuePrefs::is_default")]
     pub render_prefs: render_queue::RenderQueuePrefs,
+    /// Preview-only Smart Freeze sections; original layers and export remain independent.
+    #[serde(default, skip_serializing_if = "freeze::FreezeState::is_empty")]
+    pub freeze: freeze::FreezeState,
 }
 
 impl Default for Project {
@@ -1281,6 +1285,7 @@ impl Default for Project {
             render_queue: Vec::new(),
             render_templates: Default::default(),
             render_prefs: Default::default(),
+            freeze: Default::default(),
         }
     }
 }
@@ -1345,12 +1350,33 @@ impl Project {
         if outer == inner {
             return true;
         }
-        let Some(c) = self.comp(outer) else { return false };
-        c.layers.iter().any(|l| matches!(l.source, LayerSource::Comp { item } if self.comp_contains(item, inner)))
+        let mut seen = std::collections::BTreeSet::from([outer]);
+        let mut pending = vec![outer];
+        while let Some(id) = pending.pop() {
+            let Some(comp) = self.comp(id) else { continue };
+            for layer in &comp.layers {
+                let LayerSource::Comp { item } = layer.source else { continue };
+                if item == inner {
+                    return true;
+                }
+                if self.comp(item).is_some() && seen.insert(item) {
+                    // This predicate guards both nesting and rendering. Conservatively refuse
+                    // an unreasonably large graph rather than allocating without a bound.
+                    if seen.len() > 100_000 {
+                        return true;
+                    }
+                    pending.push(item);
+                }
+            }
+        }
+        false
     }
     /// Make sure `next_id` exceeds every id in the project (after loading or merging).
     pub fn fix_next_id(&mut self) {
         let mut m = self.next_id;
+        for section in &self.freeze.sections {
+            m = m.max(section.id.saturating_add(1));
+        }
         for (id, it) in &self.items {
             // Saturating: a damaged file's ids must not overflow (the import then refuses it).
             m = m.max(id.0.saturating_add(1));
@@ -1374,6 +1400,7 @@ impl Project {
             kind && a.id == b.id && a.name == b.name && a.label == b.label && a.comment == b.comment && a.parent == b.parent && a.proxy == b.proxy
         };
         self.schema == other.schema
+            && self.freeze == other.freeze
             && self.next_id == other.next_id
             && self.settings == other.settings
             && self.items.len() == other.items.len()

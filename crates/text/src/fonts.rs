@@ -19,6 +19,12 @@ use skrifa::{FontRef, MetadataProvider};
 
 use crate::sfnt::{FaceNames, read_faces, read_faces_bytes};
 
+static REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Cheap invalidation signal for consumers that keep rendered text across document edits.
+pub fn revision() -> u64 {
+    REVISION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Bundled fonts (SIL OFL 1.1; see `assets/fonts/*.attribution` and ATTRIBUTION.md).
 pub static INTER_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/Inter-Regular.ttf");
 pub static INTER_MEDIUM: &[u8] = include_bytes!("../../../assets/fonts/Inter-Medium.ttf");
@@ -153,6 +159,7 @@ pub struct Face {
     pub info: FaceInfo,
     bytes: OnceLock<Option<FaceBytes>>,
     shaper: OnceLock<harfrust::ShaperData>,
+    fingerprint: OnceLock<Option<String>>,
 }
 
 #[derive(Clone)]
@@ -184,6 +191,11 @@ pub struct VMetrics {
 }
 
 impl Face {
+    /// Identity of the actual loaded font bytes (not merely the current file at its path).
+    /// The first call hashes on the caller's thread; subsequent calls are constant-time.
+    pub fn content_hash(&self) -> Option<&str> {
+        self.fingerprint.get_or_init(|| self.bytes().map(effectcraft_segment::sha256::hex)).as_deref()
+    }
     fn bytes(&self) -> Option<&[u8]> {
         self.bytes
             .get_or_init(|| match &self.info.data {
@@ -310,7 +322,8 @@ fn db() -> &'static RwLock<Db> {
 
 fn push(db: &mut Db, info: FaceInfo) -> FaceId {
     let id = db.faces.len();
-    db.faces.push(Arc::new(Face { id, info, bytes: OnceLock::new(), shaper: OnceLock::new() }));
+    db.faces.push(Arc::new(Face { id, info, bytes: OnceLock::new(), shaper: OnceLock::new(), fingerprint: OnceLock::new() }));
+    REVISION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     id
 }
 
@@ -731,7 +744,12 @@ static REQUESTED_CJK_LOCALE: RwLock<Option<String>> = RwLock::new(None);
 pub fn set_cjk_locale(tag: &str) {
     let tag = tag.trim().to_ascii_lowercase();
     let requested = if tag.is_empty() || tag == "c" || tag == "posix" { None } else { Some(tag) };
-    *REQUESTED_CJK_LOCALE.write().unwrap_or_else(|e| e.into_inner()) = requested;
+    let mut current = REQUESTED_CJK_LOCALE.write().unwrap_or_else(|e| e.into_inner());
+    if *current != requested {
+        REVISION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    *current = requested;
+    drop(current);
     // The fallback cache answers per character block and preferred face, so a change of language
     // must drop it.
     fallback_cache().write().unwrap_or_else(|e| e.into_inner()).clear();

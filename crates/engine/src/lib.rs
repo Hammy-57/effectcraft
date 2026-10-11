@@ -352,6 +352,7 @@ pub enum Event {
 }
 
 pub struct Session {
+    pub freeze_runtime: freeze_runtime::Runtime,
     pub project: Arc<Project>,
     pub history: History,
     /// Bumped on every change (edits, undo, redo, open). Replies of `project.summary` and
@@ -556,6 +557,7 @@ impl Default for Session {
             project,
             history: History::default(),
             revision: 0,
+            freeze_runtime: Default::default(),
             client: None,
             cursors: Default::default(),
             claims: Default::default(),
@@ -771,7 +773,9 @@ impl Session {
     }
 
     pub fn bump(&mut self) {
+        self.freeze_runtime.changed();
         self.revision += 1;
+        *self.freeze_runtime.latest_source.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = (self.epoch, self.project.clone());
         self.id_floor = self.id_floor.max(self.project.next_id);
         // Back at the saved state (undo, redo, a history jump or a rolled-back batch).
         if Arc::ptr_eq(&self.project, &self.saved_project) {
@@ -1086,6 +1090,10 @@ impl Session {
         self.roto_job = None;
         self.roto_pending.clear();
         self.drop_tasks();
+        self.freeze_runtime.proofs.clear();
+        self.freeze_runtime.bad_versions.clear();
+        self.freeze_runtime.reasons.clear();
+        self.freeze_runtime.retry_after.clear();
         p.fix_next_id();
         upgrade_effects(&mut p);
         self.project = Arc::new(p);

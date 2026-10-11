@@ -677,6 +677,9 @@ Edit
     [!mac] Scripting & Expressions... | app.settings {"page":"scripting"}
 Composition
   New Composition... | comp.new
+  Smart Freeze
+    Freeze | freeze.freeze
+    Use Originals / Stop Auto | freeze.originals
   ---
   Composition Settings... | comp.settings
   Set Poster Time | comp.setPosterTime
@@ -1185,6 +1188,7 @@ Window
   Paragraph | window.panel {"panel":"paragraph"} | Cmd+7
   Preview | window.panel {"panel":"preview"} | Cmd+3
   Progress | window.panel {"panel":"progress"}
+  Smart Freeze | window.panel {"panel":"smartFreeze"}
   Properties | window.panel {"panel":"properties"}
   Script Console | window.panel {"panel":"scriptConsole"}
   Smoother | window.panel {"panel":"smoother"}

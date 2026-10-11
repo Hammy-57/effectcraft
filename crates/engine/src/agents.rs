@@ -273,6 +273,9 @@ fn comp_name(p: &Project, id: ItemId) -> String {
 
 /// Whether comp `id` differs between two project states (content, name, or deleted).
 fn comp_changed(before: &Project, after: &Project, id: ItemId) -> bool {
+    if !before.freeze.sections.iter().filter(|s| s.target.comp() == id).eq(after.freeze.sections.iter().filter(|s| s.target.comp() == id)) {
+        return true;
+    }
     match (before.comp_arc(id), after.comp_arc(id)) {
         (Some(a), Some(b)) => !(std::sync::Arc::ptr_eq(&a, &b) || a == b) || before.item(id).map(|i| &i.name) != after.item(id).map(|i| &i.name),
         (None, None) => false,

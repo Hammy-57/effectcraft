@@ -1,0 +1,7 @@
+asset:        freeze-cycle.ecproj
+title:        Synthetic cyclic-composition regression
+author:       EffectCraft contributors
+source:       original work
+license:      MIT OR Apache-2.0
+added:        2026-10-11 by hakifx
+notes:        Three empty compositions generated with EffectCraft; two form a malformed source cycle. No media or external artwork.

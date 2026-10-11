@@ -547,7 +547,8 @@ impl EffectcraftApp {
 
     pub fn render_source(&self) -> RenderSource {
         RenderSource {
-            project: self.session.project.clone(),
+            freeze_feedback: self.session.freeze_runtime.feedback.clone(),
+            project: self.session.freeze_preview_project(),
             footage: self.session.footage.clone(),
             expr: self.session.expr.clone(),
             layer_cache: self.session.layer_cache.clone(),
@@ -754,8 +755,8 @@ impl EffectcraftApp {
     /// options are the same for every frame: loops compute this once).
     pub fn frame_series(&self, comp: ItemId, scale: f64) -> FrameKey {
         FrameKey {
-            revision: self.session.revision,
-            content: self.frames.content_of(&self.session.project, self.session.revision, comp),
+            revision: self.session.freeze_preview_revision(),
+            content: self.frames.content_of(&self.session.freeze_preview_project(), self.session.freeze_preview_revision(), comp),
             comp: comp.0,
             frame: 0,
             scale: (scale * 1000.0).round() as u32,
@@ -1520,6 +1521,13 @@ impl EffectcraftApp {
 
     fn frame(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        if self.playback.playing || ctx.input(|i| !i.events.is_empty()) {
+            self.session.freeze_runtime.activity();
+        }
+        self.session.poll_freeze();
+        if self.session.project.freeze.sections.iter().any(|s| s.auto && s.enabled) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
         self.apply_gpu_failure(&ctx);
         self.auto.begin_frame();
         self.frames.set_context(&ctx);

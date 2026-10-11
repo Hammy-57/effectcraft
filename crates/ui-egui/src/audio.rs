@@ -549,6 +549,7 @@ mod tests {
         comp.layers = vec![layer].into();
         let cid = p.add_item("Comp", Label::Sandstone, None, ItemKind::Comp(comp.into()));
         let src = RenderSource {
+            freeze_feedback: Default::default(),
             project: Arc::new(p),
             footage: Arc::new(Slow { delay: Duration::from_secs(2), opened: Mutex::new(false) }),
             expr: None,

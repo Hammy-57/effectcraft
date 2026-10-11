@@ -67,6 +67,8 @@ pub struct Renderer<'a> {
     pub cache: Option<&'a LayerCache>,
     /// Optional per-layer timing sink (`frame --bench` / perf readouts).
     pub profile: Option<&'a std::sync::Mutex<Vec<LayerTiming>>>,
+    /// Accepted preview caches only. None for exports and cache generation.
+    pub freeze: Option<&'a dyn crate::freeze::FreezeSource>,
     /// GPU backend used when [`RenderOpts::backend`] asks for it.
     pub accel: Option<&'a dyn Accelerator>,
     /// Current nesting depth (precomp recursion guard).
@@ -119,6 +121,7 @@ impl<'a> Renderer<'a> {
             opts,
             cache: None,
             profile: None,
+            freeze: None,
             accel: None,
             depth: 0,
             pipe: color::Pipe::of(&project.settings),
@@ -206,6 +209,7 @@ impl<'a> Renderer<'a> {
         // Classic 3D runs composite on the GPU too (M12.7), so Auto sends 3D comps there as well;
         // Auto renders each comp on whichever compositor measured faster ([`AutoPick`]).
         if self.depth == 0
+            && self.freeze.is_none()
             && let Some(a) = self.active_accel()
         {
             let auto = self.frame_auto(a, comp_id, false);
@@ -229,6 +233,46 @@ impl<'a> Renderer<'a> {
             return img;
         }
         self.comp_frame_cpu(comp_id, t)
+    }
+
+    /// Build a preview cache in blending space, before display/output conversion. Call on a
+    /// worker with an immutable, validated snapshot; this never reads other freeze caches.
+    pub fn freeze_frame(&self, comp_id: ItemId, t: Tick) -> Result<Image, String> {
+        self.freeze_selected_frame(comp_id, t, None)
+    }
+
+    /// Isolate a supported 2D section without mutating its scene, expressions or linked
+    /// controls. Unselected layers remain available to the effect and expression hosts.
+    pub fn freeze_selected_frame(&self, comp_id: ItemId, t: Tick, selected: Option<&[effectcraft_project::LayerId]>) -> Result<Image, String> {
+        let comp = self.project.comp(comp_id).ok_or("Smart Freeze composition no longer exists")?;
+        let scale = self.opts.scale;
+        if !scale.is_finite() || scale <= 0.0 || scale > 1.0 || self.opts.roi.is_some() || self.opts.view.is_some() {
+            return Err("Smart Freeze needs a full composition view at a scale between 0 and 1".into());
+        }
+        let w = (f64::from(comp.width) * scale).round().max(1.0) as u32;
+        let h = (f64::from(comp.height) * scale).round().max(1.0) as u32;
+        if u64::from(w).saturating_mul(u64::from(h)) > crate::freeze::MAX_PIXELS as u64 {
+            return Err("Smart Freeze frame exceeds its pixel budget".into());
+        }
+        let plain = Renderer { freeze: None, ..*self };
+        let ctx = plain.ctx(comp_id, comp, t);
+        let mut canvas = Image::new(w, h);
+        if let Some(ids) = selected {
+            if ids.is_empty() || ids.len() > 10_000 || ids.iter().any(|id| comp.layer(*id).is_none()) {
+                return Err("Smart Freeze selection contains missing layers or exceeds its budget".into());
+            }
+            let solo = comp.layers.iter().any(|l| ids.contains(&l.id) && l.switches.solo);
+            let visible: Vec<_> = comp
+                .layers
+                .iter()
+                .rev()
+                .filter(|l| ids.contains(&l.id) && l.has_video() && l.is_active_at(t) && (!solo || l.switches.solo) && (plain.opts.guides || !l.switches.guide))
+                .collect();
+            plain.draw_layers(&ctx, &visible, &mut canvas, true);
+        } else {
+            plain.draw_comp(&ctx, &mut canvas, true);
+        }
+        Ok(canvas)
     }
 
     /// The Auto timing history and key for a top-level frame of `comp` (`None` unless the
@@ -318,10 +362,29 @@ impl<'a> Renderer<'a> {
     /// Draw a comp's layers (bottom to top) into `canvas` (blending space).
     /// `blank`: the canvas is fully transparent (lets the first layer skip re-quantising).
     pub(crate) fn draw_comp(&self, ctx: &EvalCtx<'a>, canvas: &mut Image, mut blank: bool) {
+        if let Some(opts) = self.freeze_options(ctx)
+            && let Some(frame) = self.freeze.and_then(|f| f.frame(ctx.comp_id, &[], ctx.time, &opts))
+            && frame.width == canvas.width
+            && frame.height == canvas.height
+        {
+            canvas.blend_from(&frame, effectcraft_color::BlendMode::Normal, 1.0, 0);
+            return;
+        }
         for (ctx, visible) in self.draw_passes(ctx) {
             self.draw_layers(&ctx, &visible, canvas, blank);
             blank = blank && visible.is_empty();
         }
+    }
+
+    fn freeze_options(&self, ctx: &EvalCtx<'_>) -> Option<RenderOpts> {
+        if self.outer.is_some() || self.opts.view.is_some() {
+            return None;
+        }
+        let roi = if self.top && self.depth == 0 { self.opts.roi } else { None };
+        if roi.is_some_and(|r| !r.iter().all(|v| v.is_finite()) || r[2] <= 0.0 || r[3] <= 0.0 || !roi_inside(r, ctx.comp.width, ctx.comp.height)) {
+            return None;
+        }
+        Some(RenderOpts { roi, ..self.opts })
     }
 
     /// Draw `visible` (bottom to top) into `canvas`.
@@ -329,6 +392,21 @@ impl<'a> Renderer<'a> {
         // Bottom-to-top, with runs of consecutive 3D layers depth-sorted (farthest first).
         let mut i = 0;
         while i < visible.len() {
+            if let Some(opts) = self.freeze_options(ctx)
+                && let (Some(freeze), Some(bottom)) = (self.freeze, visible.get(i))
+                && let Some(ids) = freeze.selection(ctx.comp_id, bottom.id)
+                && !ids.is_empty()
+                && let Some(end) = crate::freeze::selection_end(visible, ids, i)
+                && let Some(frame) = freeze.frame(ctx.comp_id, ids, ctx.time, &opts)
+                && frame.width == canvas.width
+                && frame.height == canvas.height
+            {
+                canvas.blend_from(&frame, effectcraft_color::BlendMode::Normal, 1.0, 0);
+                self.pipe.quantize(canvas);
+                i = end;
+                blank = false;
+                continue;
+            }
             if visible[i].is_3d() {
                 let mut j = i;
                 while j < visible.len() && visible[j].is_3d() {

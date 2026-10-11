@@ -88,6 +88,7 @@ impl RemoteFrames for FakeWorker {
 
 fn source(s: &Session) -> RenderSource {
     RenderSource {
+        freeze_feedback: Default::default(),
         project: s.project.clone(),
         footage: s.footage.clone(),
         expr: s.expr.clone(),

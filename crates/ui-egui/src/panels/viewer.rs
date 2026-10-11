@@ -465,11 +465,11 @@ fn pooled_texture(
 ) -> Pooled {
     use crate::frames::{FrameImage, FrameKey};
     let Some(c) = app.session.project.comp(comp) else { return Pooled::Rendering };
-    let revision = app.session.revision;
+    let revision = app.session.freeze_preview_revision();
     let frame = c.frame_rate.frame_at(t);
     let key = FrameKey {
         revision,
-        content: app.frames.content_of(&app.session.project, revision, comp),
+        content: app.frames.content_of(&app.session.freeze_preview_project(), revision, comp),
         comp: comp.0,
         frame,
         scale: (opts.scale * 1000.0).round() as u32,

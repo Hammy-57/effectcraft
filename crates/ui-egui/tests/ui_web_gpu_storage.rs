@@ -103,6 +103,7 @@ impl RemoteFrames for GpuWorker {
 
 fn source(s: &Session, gpu: Option<Gpu>) -> RenderSource {
     RenderSource {
+        freeze_feedback: Default::default(),
         project: s.project.clone(),
         footage: s.footage.clone(),
         expr: s.expr.clone(),

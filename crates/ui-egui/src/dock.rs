@@ -45,6 +45,7 @@ pub enum PanelKind {
     MediaBrowser,
     Metadata,
     Progress,
+    SmartFreeze,
     ContentAwareFill,
     /// Window ▸ Create Nulls From Paths (our own panel).
     CreateNullsFromPaths,
@@ -53,7 +54,7 @@ pub enum PanelKind {
 }
 
 impl PanelKind {
-    pub const ALL: [PanelKind; 34] = [
+    pub const ALL: [PanelKind; 35] = [
         PanelKind::Project,
         PanelKind::EffectControls,
         PanelKind::Composition,
@@ -85,6 +86,7 @@ impl PanelKind {
         PanelKind::MediaBrowser,
         PanelKind::Metadata,
         PanelKind::Progress,
+        PanelKind::SmartFreeze,
         PanelKind::ContentAwareFill,
         PanelKind::CreateNullsFromPaths,
         PanelKind::VrCompEditor,
@@ -124,6 +126,7 @@ impl PanelKind {
             PanelKind::MediaBrowser => "Media Browser",
             PanelKind::Metadata => "Metadata",
             PanelKind::Progress => "Progress",
+            PanelKind::SmartFreeze => "Smart Freeze",
             PanelKind::ContentAwareFill => "Content-Aware Fill",
             PanelKind::CreateNullsFromPaths => "Create Nulls From Paths",
             PanelKind::VrCompEditor => "VR Comp Editor",

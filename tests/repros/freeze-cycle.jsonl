@@ -1,0 +1,5 @@
+// Before the fix, comp_contains(Cycle B, Outer) overflowed the stack because B and C reference each other.
+{"start": {"project": "freeze-cycle.ecproj"}}
+{"command": "comp.open", "params": {"comp": "Outer"}}
+{"command": "freeze.freeze", "params": {"mode": "comp", "wait": true}, "expect_error": "cycle"}
+{"expect": {"query": "project.summary"}}
