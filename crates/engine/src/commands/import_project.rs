@@ -19,7 +19,7 @@ pub(crate) fn is_project_path(path: &str) -> bool {
 }
 
 /// Read a project file (JSON or its XML copy), as File ▸ Open does.
-fn read_project(services: &dyn crate::Services, path: &str) -> Result<(Project, Option<String>)> {
+pub(super) fn read_project(services: &dyn crate::Services, path: &str) -> Result<(Project, Option<String>)> {
     let bytes = services.read_file(path).map_err(|e| EngineError::Other(format!("cannot read {path}: {e}")))?;
     let text = String::from_utf8(bytes).map_err(|_| bad(C, format!("{path} is not a text project file")))?;
     let text = if crate::xml_project::is_xml(&text) { crate::xml_project::from_xml(&text).map_err(EngineError::Other)? } else { text };
@@ -63,7 +63,7 @@ pub(super) fn resolve_footage(s: &Session, project: &mut Project, dir: &std::pat
 }
 
 /// The comps no other comp of `project` nests: the ones to open or place.
-fn root_comps(project: &Project) -> Vec<ItemId> {
+pub(super) fn root_comps(project: &Project) -> Vec<ItemId> {
     let nested: std::collections::HashSet<ItemId> =
         project.comps().flat_map(|(_, c)| c.layers.iter().filter_map(|l| if let LayerSource::Comp { item } = l.source { Some(item) } else { None })).collect();
     project.comps().map(|(id, _)| *id).filter(|id| !nested.contains(id)).collect()

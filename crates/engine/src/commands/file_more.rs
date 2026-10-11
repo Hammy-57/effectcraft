@@ -238,7 +238,7 @@ fn new_comp_from_selection(s: &mut Session, p: &Value) -> Result<Value> {
 // ---------------------------------------------------------------- dependencies
 
 /// Items used (transitively) by `roots`.
-fn used_items(proj: &Project, roots: &[ItemId]) -> BTreeSet<ItemId> {
+pub(crate) fn used_items(proj: &Project, roots: &[ItemId]) -> BTreeSet<ItemId> {
     let mut seen = BTreeSet::new();
     let mut stack: Vec<ItemId> = roots.to_vec();
     while let Some(i) = stack.pop() {

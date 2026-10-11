@@ -65,8 +65,26 @@ fn save_preset(s: &mut Session, p: &Value) -> Result<Value> {
     if props.is_empty() && effects.is_empty() {
         return Err(bad("anim.savePreset", "select properties or effects to save"));
     }
-    // Key times are stored relative to the earliest key so the preset applies at the CTI.
-    let first = props.iter().flat_map(|(_, _, pr)| pr.keys.iter().map(|k| k.time)).min().unwrap_or(Tick::ZERO);
+    // Key times are stored relative to the earliest key (of the properties and of the saved
+    // effects alike) so the preset applies at the CTI.
+    let mut effects = effects;
+    let mut fx_first: Option<Tick> = None;
+    for (_, g) in &effects {
+        let mut first_in = |pr: &Property| {
+            if let Some(t) = pr.keys.iter().map(|k| k.time).min() {
+                fx_first = Some(fx_first.map_or(t, |f| f.min(t)));
+            }
+        };
+        g.walk("", &mut |_, pr| first_in(pr));
+    }
+    let first = props.iter().flat_map(|(_, _, pr)| pr.keys.iter().map(|k| k.time)).chain(fx_first).min().unwrap_or(Tick::ZERO);
+    for (_, g) in &mut effects {
+        g.walk_mut(&mut |pr| {
+            for k in &mut pr.keys {
+                k.time -= first;
+            }
+        });
+    }
     let props_json: Vec<Value> = props
         .iter()
         .map(|(_, mp, pr)| {
@@ -140,6 +158,11 @@ fn apply_preset(s: &mut Session, p: &Value) -> Result<Value> {
                 for g in &effects {
                     let mut g = g.clone();
                     g.reassign_uids(&mut next);
+                    g.walk_mut(&mut |pr| {
+                        for k in &mut pr.keys {
+                            k.time += lt;
+                        }
+                    });
                     next += 1;
                     fx.children.push(Node::Group(g));
                     applied += 1;
