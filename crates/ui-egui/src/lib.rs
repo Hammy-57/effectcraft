@@ -1310,6 +1310,7 @@ impl EffectcraftApp {
 
     pub fn stop(&mut self) {
         let was = std::mem::replace(&mut self.playback.playing, false);
+        self.frames.set_playhead(None);
         self.audio = None;
         self.playback.caching = false;
         if !was {
@@ -1404,6 +1405,7 @@ impl EffectcraftApp {
             let last = fr.frame_at(c.duration).saturating_sub(1).max(0);
             let nearby = self.scrub_preview.neighbors(cur, last);
             let series = self.frame_series(cid, scale);
+            self.frames.set_playhead(None);
             self.frames.protect_frames(series, std::iter::once(cur).chain(nearby.iter().copied()));
             let spare = self.frames_parallelism().saturating_sub(1).min(2).min(self.frames_that_fit(&c, scale).clamp(0, 2) as usize);
             if !self.frames.urgent_pending() && self.editing(now).is_none() {
@@ -1433,8 +1435,12 @@ impl EffectcraftApp {
             self.frames_parallelism().saturating_sub(1).min(2) as i64
         };
         let ahead = ahead.min(self.frames_that_fit(&c, scale));
-        let mut queued = self.frames.inflight();
         let series = self.frame_series(cid, scale);
+        // The preview's position orders prefetch and eviction (#595); set before counting the
+        // frames in flight, as it drops queued frames the preview no longer reaches.
+        let playhead = plan.filter(|p| p.video).map(|p| frames::Playhead { series, cur, start: p.start, end: p.end, step: p.step, looping: p.looping });
+        self.frames.set_playhead(playhead);
+        let mut queued = self.frames.inflight();
         // In-flight renders far ahead may finish after the near frames. Keep their completion
         // from evicting the very frames playback needs next (#595).
         self.frames.protect_frames(
@@ -1488,7 +1494,10 @@ impl EffectcraftApp {
             return;
         }
         let step = plan.map_or(1, |p| p.step);
-        for k in 0..ahead * 3 {
+        // Never further ahead than the RAM preview holds: those frames would be the first to
+        // go, or evict the ones the preview shows first (#595).
+        let window = (ahead * 3).min(self.frames_that_fit(&c, scale) - 1);
+        for k in 0..window {
             if queued >= ahead as usize || !video {
                 break;
             }
