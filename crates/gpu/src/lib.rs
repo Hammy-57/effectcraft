@@ -561,3 +561,6 @@ pub fn yuv_transport_enabled() -> bool {
         true
     }
 }
+
+#[cfg(test)]
+mod tests_collapsed_resident;

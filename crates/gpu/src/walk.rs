@@ -90,9 +90,13 @@ fn draw_layers<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, visible: &[
         } else {
             match (r.collapsed(ctx, visible[i]), r.collapsed_fx(ctx, visible[i])) {
                 (Some(item), _) => draw_collapsed(e, r, ctx, visible[i], item, canvas)?,
-                (None, Some(item)) => on_cpu(e, canvas, |img| {
-                    r.draw_collapsed_fx(ctx, visible[i], item, img);
-                })?,
+                (None, Some(item)) => {
+                    if draw_collapsed_fx(e, r, ctx, visible[i], item, canvas).is_none() {
+                        on_cpu(e, canvas, |img| {
+                            r.draw_collapsed_fx(ctx, visible[i], item, img);
+                        })?;
+                    }
+                }
                 (None, None) => draw_layer(e, r, ctx, visible[i], canvas)?,
             }
             i += 1;
@@ -213,6 +217,36 @@ fn draw_collapsed<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, layer: &
     let mut iso = e.zeros(canvas.width, canvas.height);
     draw_comp(e, &sub, &nctx, &mut iso)?;
     composite_iso(e, r, ctx, layer, iso, canvas, opacity)
+}
+
+/// Collapsed 2D contents are already placed in comp space before the parent
+/// effect stack. Keep that isolation resident; unsupported work keeps CPU fallback.
+fn draw_collapsed_fx<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, layer: &'a Layer, item: ItemId, canvas: &mut GpuImage) -> Option<()> {
+    let opacity = r.layer_opacity(ctx, layer);
+    if opacity <= 0.0 {
+        return Some(());
+    }
+    let Some((sub, nctx)) = r.collapse_into(ctx, layer, item, 1.0) else {
+        return Some(());
+    };
+    let mut iso = e.zeros(canvas.width, canvas.height);
+    // collapse_into propagates the parent transform and motion-blur time chain.
+    draw_comp(e, &sub, &nctx, &mut iso)?;
+    let pipe = r.pipe();
+    if let Some(c) = pipe.from_blend() {
+        iso = ops::convert(e, &iso, &c);
+    }
+    let mut fx = crate::effects::GpuFx::new(e, iso, r.collapsed_effect_offset(), r.opts.scale, pipe.levels);
+    r.run_effects_on(ctx, layer, true, &mut fx);
+    let (mut done, _, _) = fx.finish()?;
+    if let Some(c) = pipe.to_blend() {
+        done = ops::convert(e, &done, &c);
+    }
+    // Match draw_collapsed_fx: an effect that changes the canvas extent draws nothing.
+    if (done.width, done.height) != (canvas.width, canvas.height) {
+        return Some(());
+    }
+    composite_iso(e, r, ctx, layer, done, canvas, opacity)
 }
 
 fn draw_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut GpuImage) -> Option<()> {
