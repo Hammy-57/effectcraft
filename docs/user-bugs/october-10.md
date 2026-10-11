@@ -56,3 +56,11 @@ It now resolves the current checkout at build-script runtime. Fresh generated cr
 
 Windows presentation-device recreation remains separate work; the owner explicitly deferred its
 hardware verification. No additional full CI or ordinary app/release build was run locally.
+
+The next watchdog (`f7089e29`) exposed a Puppet interaction race: a completed mesh could move a
+Bend pin's scale handle between the displayed press target and drag-threshold hit-testing. The
+unchanged pointer test also failed locally with scale stuck at 100 %. Completed geometry now waits
+until the viewer captures the gesture; live pin values continue updating, and mesh adoption resumes
+during the established drag. Property-panel pointer interactions do not hold the viewer's mesh.
+Five existing Puppet pointer tests and six focused worker/input tests pass, including deterministic
+completion injection before capture and verification that feedback resumes before release.
