@@ -369,6 +369,10 @@ const MAX_PPS: f64 = 4000.0;
 
 /// One `=` / `-` step (and one click on the footer's zoom buttons).
 pub(crate) const ZOOM_STEP: f64 = 1.5;
+/// Holding a zoom button: the repeat starts after this many seconds…
+const ZOOM_HOLD_DELAY: f64 = 0.35;
+/// …and then zooms this many `ZOOM_STEP`s a second, smoothly.
+const ZOOM_HOLD_RATE: f64 = 6.0;
 
 /// Pixels per second that fit `comp` in a time graph `width` points wide.
 pub(crate) fn fit_pps(width: f32, comp: &Comp) -> f64 {
@@ -2791,7 +2795,27 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         let resp = ui.interact(r, egui::Id::new(id), Sense::click()).on_hover_text(crate::i18n::tr(tip));
         icons::paint(&p, Rect::from_center_size(r.center(), vec2(size, size)), icon, if resp.hovered() { t.text } else { t.text_dim });
         app.auto.add(id, r, tip);
-        if resp.clicked() {
+        // One step on press; held past ZOOM_HOLD_DELAY it keeps zooming, ZOOM_HOLD_RATE steps a
+        // second, scaled by the frame time. `hold` keeps (press time, last zoom time) while down.
+        let hold = egui::Id::new(id).with("hold");
+        let now = ui.input(|i| i.time);
+        let held: Option<(f64, f64)> = ui.data(|d| d.get_temp(hold));
+        if resp.is_pointer_button_down_on() {
+            let factor = match held {
+                None => Some(k),
+                Some((start, last)) if now - start >= ZOOM_HOLD_DELAY => Some(k.powf(((now - last) * ZOOM_HOLD_RATE).clamp(0.0, 1.0))),
+                Some(_) => None,
+            };
+            if let Some(f) = factor {
+                set_zoom(&mut app.ui.timeline, &comp, pps * f, fit_pps, cti, cti_px);
+            }
+            let start = held.map_or(now, |(s, _)| s);
+            ui.data_mut(|d| d.insert_temp(hold, (start, now)));
+            ui.ctx().request_repaint();
+        } else if held.is_some() {
+            ui.data_mut(|d| d.remove::<(f64, f64)>(hold));
+        } else if resp.clicked() {
+            // Pressed and released within one frame (scripted clicks): one step.
             set_zoom(&mut app.ui.timeline, &comp, pps * k, fit_pps, cti, cti_px);
         }
     }
