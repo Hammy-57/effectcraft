@@ -1030,16 +1030,29 @@ fn move_keys(s: &mut Session, p: &Value) -> Result<Value> {
 fn delete_keys(s: &mut Session, _: &Value) -> Result<Value> {
     let cid = s.active_comp_id().ok_or(EngineError::NoComp)?;
     let sel = s.state.selected_keys.clone();
+    let t = s.time_of(cid);
     s.edit("Delete Keyframes", None, |proj, st| {
         let comp = proj.comp_mut(cid).ok_or(EngineError::NoComp)?;
+        // As in After Effects, a property that loses its last keyframe keeps the value it had at
+        // the current time (read before any key goes, not from whichever key happens to go last).
+        let mut held = std::collections::HashMap::new();
+        for k in &sel {
+            if let Some(l) = comp.layer(k.layer)
+                && let Some(pr) = l.props.find(k.prop)
+            {
+                held.entry((k.layer, k.prop)).or_insert_with(|| pr.value_at(l.layer_time(t)));
+            }
+        }
         for k in &sel {
             if let Some(pr) = comp.layer_mut(k.layer).and_then(|l| l.props.find_mut(k.prop))
                 && let Some(i) = key_at(&pr.keys, k.time)
             {
-                if pr.keys.len() == 1 {
-                    pr.value = pr.keys[0].value.clone();
-                }
                 pr.keys.remove(i);
+                if pr.keys.is_empty()
+                    && let Some(v) = held.remove(&(k.layer, k.prop))
+                {
+                    pr.value = v;
+                }
             }
         }
         st.selected_keys.clear();
