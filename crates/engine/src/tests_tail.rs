@@ -420,3 +420,13 @@ fn camera_focus_commands_undo_and_serde() {
     assert!(s.execute("camera.linkFocusToLayer", json!({})).is_err());
     assert!(s.execute("camera.linkFocusToPoi", json!({})).is_ok());
 }
+
+/// Go to Work Area Start / End have After Effects' default keys (Shift+Home / Shift+End).
+#[test]
+fn work_area_navigation_has_after_effects_default_keys() {
+    let s = Session::default();
+    for (id, key) in [("time.workAreaStart", "Shift+Home"), ("time.workAreaEnd", "Shift+End")] {
+        let b = s.shortcuts().find(id).unwrap_or_else(|| panic!("{id} is bindable"));
+        assert_eq!(b.defaults, [key.to_string()], "{id}");
+    }
+}
