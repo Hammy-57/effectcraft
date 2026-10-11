@@ -80,7 +80,8 @@ const READ_ONLY: &[&str] = &[
     "get_layout",
 ];
 /// Tools that write files (or keep session-side frames) without changing the project.
-const WRITES_FILES: &[&str] = &["save_project", "render_frame", "render_preview", "render_frames", "screenshot", "render_snapshot", "render_compare", "analyze_audio"];
+const WRITES_FILES: &[&str] =
+    &["save_project", "render_frame", "render_preview", "render_frames", "screenshot", "render_snapshot", "render_compare", "analyze_audio"];
 
 /// Older tool names kept callable but left out of `tools/list` (`mcp --all-tools` lists them):
 /// (alias, canonical tool). The canonical one takes every argument the alias does, except
