@@ -218,6 +218,123 @@ pub enum FillRule {
     EvenOdd,
 }
 
+/// How far past the mask device coordinates may reach before a path is clipped first: tiny-skia's
+/// edges are 16.16 fixed point and anti-aliasing scales them by 4, so far-away points (a huge
+/// scale, an SVG with coordinates of 1e30) overflow and trip its assertions.
+const SAFE_REACH: f64 = 4096.0;
+
+enum Extent {
+    /// Every point is near the mask: rasterise as is.
+    Safe,
+    /// Some point is far away: clip to the mask first.
+    Huge,
+    /// Not finite: nothing to draw.
+    Unusable,
+}
+
+fn device_extent(path: &BezPath, m: kurbo::Affine, w: u32, h: u32) -> Extent {
+    let (w, h) = (f64::from(w), f64::from(h));
+    let mut huge = false;
+    for el in path.elements() {
+        let pts: &[Point] = match el {
+            PathEl::MoveTo(p) | PathEl::LineTo(p) => std::slice::from_ref(p),
+            PathEl::QuadTo(a, p) => &[*a, *p],
+            PathEl::CurveTo(a, b, p) => &[*a, *b, *p],
+            PathEl::ClosePath => &[],
+        };
+        for p in pts {
+            let d = m * *p;
+            if !(d.x.is_finite() && d.y.is_finite()) {
+                return Extent::Unusable;
+            }
+            huge |= d.x < -SAFE_REACH || d.y < -SAFE_REACH || d.x > w + SAFE_REACH || d.y > h + SAFE_REACH;
+        }
+    }
+    if huge { Extent::Huge } else { Extent::Safe }
+}
+
+/// `path` (device space) flattened and clipped to a little more than the `w × h` mask, one closed
+/// polygon per subpath (Sutherland–Hodgman against a rectangle keeps every winding number inside
+/// it, so both fill rules give the same coverage there).
+fn clip_to_rect(path: &BezPath, w: u32, h: u32) -> BezPath {
+    let (x0, y0, x1, y1) = (-2.0, -2.0, f64::from(w) + 2.0, f64::from(h) + 2.0);
+    let mut polys: Vec<Vec<Point>> = vec![];
+    kurbo::flatten(path, 0.05, |el| match el {
+        PathEl::MoveTo(p) => polys.push(vec![p]),
+        PathEl::LineTo(p) => match polys.last_mut() {
+            Some(poly) => poly.push(p),
+            None => polys.push(vec![p]),
+        },
+        _ => {}
+    });
+    let mut out = BezPath::new();
+    for poly in polys {
+        let mut pts = poly;
+        // Keep the inside of each edge in turn: left, right, top, bottom.
+        for edge in [Edge::Left(x0), Edge::Right(x1), Edge::Top(y0), Edge::Bottom(y1)] {
+            let Some(&last) = pts.last() else { break };
+            let mut next = Vec::with_capacity(pts.len() + 2);
+            let mut a = last;
+            for &b in &pts {
+                match (edge.inside(a), edge.inside(b)) {
+                    (true, true) => next.push(b),
+                    (true, false) => next.push(edge.cross(a, b)),
+                    (false, true) => {
+                        next.push(edge.cross(a, b));
+                        next.push(b);
+                    }
+                    (false, false) => {}
+                }
+                a = b;
+            }
+            pts = next;
+        }
+        let mut it = pts.into_iter();
+        if let Some(first) = it.next() {
+            out.move_to(first);
+            for p in it {
+                out.line_to(p);
+            }
+            out.close_path();
+        }
+    }
+    out
+}
+
+/// One side of the clip rectangle.
+#[derive(Clone, Copy)]
+enum Edge {
+    Left(f64),
+    Right(f64),
+    Top(f64),
+    Bottom(f64),
+}
+
+impl Edge {
+    fn inside(self, p: Point) -> bool {
+        match self {
+            Edge::Left(x) => p.x >= x,
+            Edge::Right(x) => p.x <= x,
+            Edge::Top(y) => p.y >= y,
+            Edge::Bottom(y) => p.y <= y,
+        }
+    }
+
+    /// Where segment `a`–`b` (one end on each side) crosses this edge.
+    fn cross(self, a: Point, b: Point) -> Point {
+        match self {
+            Edge::Left(x) | Edge::Right(x) => {
+                let t = if b.x == a.x { 0.0 } else { (x - a.x) / (b.x - a.x) };
+                Point::new(x, a.y + (b.y - a.y) * t)
+            }
+            Edge::Top(y) | Edge::Bottom(y) => {
+                let t = if b.y == a.y { 0.0 } else { (y - a.y) / (b.y - a.y) };
+                Point::new(a.x + (b.x - a.x) * t, y)
+            }
+        }
+    }
+}
+
 /// Anti-aliased coverage of `paths` (in local space) transformed by `m` into a `w × h` mask.
 pub fn fill_coverage(paths: &[BezPath], m: &Mat3, w: u32, h: u32, rule: FillRule) -> Mask {
     let mut out = Mask::new(w, h, 0.0);
@@ -226,12 +343,25 @@ pub fn fill_coverage(paths: &[BezPath], m: &Mat3, w: u32, h: u32, rule: FillRule
     for p in paths {
         all.extend(p.elements().iter().copied());
     }
-    let Some(sp) = to_skia(&all) else { return out };
     let fr = match rule {
         FillRule::NonZero => tiny_skia::FillRule::Winding,
         FillRule::EvenOdd => tiny_skia::FillRule::EvenOdd,
     };
-    mask.fill_path(&sp, fr, true, skia_transform(m));
+    let a = &m.0;
+    let to_device = kurbo::Affine::new([a[0][0], a[1][0], a[0][1], a[1][1], a[0][2], a[1][2]]);
+    match device_extent(&all, to_device, w, h) {
+        Extent::Unusable => return out,
+        Extent::Safe => {
+            let Some(sp) = to_skia(&all) else { return out };
+            mask.fill_path(&sp, fr, true, skia_transform(m));
+        }
+        Extent::Huge => {
+            // Clip in device space first: the result inside the mask is the same.
+            let clipped = clip_to_rect(&(to_device * all), w, h);
+            let Some(sp) = to_skia(&clipped) else { return out };
+            mask.fill_path(&sp, fr, true, tiny_skia::Transform::identity());
+        }
+    }
     for (o, &v) in out.data.iter_mut().zip(mask.data()) {
         *o = v as f32 / 255.0;
     }
@@ -352,6 +482,46 @@ pub fn transform(paths: &[BezPath], m: &Mat3) -> Vec<BezPath> {
 
 #[cfg(test)]
 mod tests {
+    /// Fuzzing found an SVG whose huge coordinates overflowed tiny-skia's fixed-point edges and
+    /// tripped its assertions. Far-away paths are now clipped to the mask first, with the same
+    /// coverage inside it.
+    #[test]
+    fn huge_coordinates_are_clipped_not_overflowed() {
+        use kurbo::Shape as _;
+        let id = Mat3::default();
+        // A rectangle reaching 1e9 px past a 64 × 64 mask covers it all, like a mask-sized one.
+        let huge = kurbo::Rect::new(-1e9, -1e9, 1e9, 1e9).to_path(0.1);
+        let small = kurbo::Rect::new(-10.0, -10.0, 74.0, 74.0).to_path(0.1);
+        for rule in [FillRule::NonZero, FillRule::EvenOdd] {
+            let a = fill_coverage(std::slice::from_ref(&huge), &id, 64, 64, rule);
+            let b = fill_coverage(std::slice::from_ref(&small), &id, 64, 64, rule);
+            assert_eq!(a.data, b.data);
+        }
+        // A triangle with one far corner: the same coverage inside the mask as drawn without
+        // clipping where tiny-skia copes (a corner 4000 px away), within anti-aliasing rounding.
+        let tri = |far: f64| {
+            let mut p = BezPath::new();
+            p.move_to((8.0, 8.0));
+            p.line_to((56.0, 8.0));
+            p.line_to((8.0 + far, 8.0 + far));
+            p.close_path();
+            p
+        };
+        let near = fill_coverage(&[tri(3000.0)], &id, 64, 64, FillRule::NonZero);
+        let clipped = clip_to_rect(&tri(3000.0), 64, 64);
+        let via_clip = fill_coverage(&[clipped], &id, 64, 64, FillRule::NonZero);
+        let worst = near.data.iter().zip(&via_clip.data).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(worst < 0.02, "{worst}");
+        // Scaled by 1e12, non-finite: no panic.
+        let mut big = Mat3::default();
+        big.0[0][0] = 1e12;
+        big.0[1][1] = 1e12;
+        let _ = fill_coverage(&[tri(30.0)], &big, 64, 64, FillRule::EvenOdd);
+        let mut nan = Mat3::default();
+        nan.0[0][2] = f64::NAN;
+        assert!(fill_coverage(&[tri(30.0)], &nan, 64, 64, FillRule::NonZero).data.iter().all(|v| *v == 0.0));
+    }
+
     use super::*;
 
     #[test]

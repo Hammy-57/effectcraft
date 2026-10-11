@@ -114,6 +114,36 @@ Dev and test builds carry line tables only (`debug = "line-tables-only"`, depend
 backtraces keep file and line, links are smaller. `CARGO_PROFILE_DEV_DEBUG=true` brings full debug
 info back for the workspace crates when you need a debugger.
 
+## Golden frames from repro scripts
+
+`tests/repros/*.jsonl` replay in `effectcraft-host`'s `repros` test; a `golden` line renders a frame
+and compares it with a committed PNG (PSNR ≥ 40 dB by default). `cargo xtask repros` runs them, plus
+the gitignored `plan/repros/` where users' own projects go (they can't be committed) and any
+`--dir DIR`; `--bless` writes the goldens after a change meant to alter a render. How to turn a
+user's file into one: [tests/repros/README.md](../tests/repros/README.md).
+
+## Fuzzing
+
+`fuzz/` holds cargo-fuzz targets for every input EffectCraft doesn't control: `project_open`
+(`.ecproj` JSON and XML, loaded and rendered), `aep_ir` (the py-aep import document),
+`lottie_import`, `svg_parse`, `psd_parse`, `pdf_parse` (PDF / AI / EPS), `interchange_import` (FCP7
+XML, FCPXML, OTIO, EDL), `expr_eval`, `media_probe` (stills, video and audio, probed and decoded)
+and `engine_command` (commands with fuzzed parameters on the demo project, as agents send them).
+The crate is outside the workspace, so ordinary builds don't compile it; its targets never touch
+the disk, the network or other processes.
+
+```sh
+rustup toolchain install nightly && cargo install cargo-fuzz   # once
+cargo xtask fuzz --seeds                                       # write the seed corpus
+cargo xtask fuzz --seconds 300                                 # every target, 5 minutes each
+cargo xtask fuzz expr_eval media_probe --seconds 3600 --jobs 4
+```
+
+A crash, a hang over 10 s or more than 4 GB of memory stops the run and leaves the input in
+`fuzz/artifacts/<target>/`. Fix it in the crate that crashed with a regression test there (AGENTS.md
+"Never crash"), then check `cargo +nightly fuzz run <target> <artifact>` passes. Only the
+`seed-*` files of `fuzz/corpus/` are committed.
+
 ## Looking at the interface without a window
 
 ```sh
@@ -172,3 +202,10 @@ date, load average, scenario, settings, metrics); `--compare OLD.jsonl` prints t
 the latest matching runs there, `--compare OLD --with NEW` compares two files without rendering.
 The table notes the 1-minute load average: on a busy machine wall time is noise, so compare
 peak memory and instructions retired, and rerun when the load differs a lot.
+
+`--fail-over PCT` (with `--compare`) turns the comparison into a check: it exits 1 when any
+matched run got more than PCT % worse in CPU time, peak memory, max RSS or instructions retired,
+listing each one. Wall time is never gated (it follows the load). Keep a baseline from `main`
+(`cp target/bench/results.jsonl bench-main.jsonl`) and run
+`cargo xtask bench --quick --compare bench-main.jsonl --fail-over 10` before landing performance
+work.

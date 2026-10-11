@@ -961,3 +961,15 @@ before.
 - The desktop app's control server and the windowless host (`effectcraft-cli serve`) share one
   control-channel implementation: the host now also rejects junk lines, bounds line length and
   answers repeated `requestId`s from the reply cache, and both use the same wait-for-job replies.
+
+## Update: relinking moved footage, golden repros, fuzzing (10 October)
+
+- Project: relinking moved footage. `footage.relink {item, path}` relinks one item and the other
+  missing items that moved with it (one undo step), as Replace Footage on a missing item now does;
+  `footage.missing` lists them; the
+  footage check after open finds files that moved along with the project's folder. Windows and
+  macOS paths relink in either direction.
+- Repro scripts take `golden` frames (`cargo xtask repros [--bless]`), so a user's file can become a
+  render regression check; `cargo xtask fuzz` runs ten fuzz targets (project files, AEP import,
+  Lottie, SVG, PSD, PDF, timelines, expressions, media, engine commands); `cargo xtask bench
+  --fail-over PCT` fails on resource regressions.

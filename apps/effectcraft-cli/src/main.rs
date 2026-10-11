@@ -129,9 +129,11 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
   script FILE.jsx [F.ecproj] | --eval CODE run JavaScript with the After Effects-style object model
                                            (app.project, comps, layers, properties…); prints writeLn
                                            output and the result; errors exit 1 with file:line:col
-  replay SCRIPT.jsonl [--keep-going]       replay a repro script headless (journal.export, crash repros):
+  replay SCRIPT.jsonl [--keep-going] [--bless]
+                                           replay a repro script headless (journal.export, crash repros):
                                            per-step ok/error and the first failure; exits 1 when a step
-                                           fails, an expectation is not met or a command panics
+                                           fails, an expectation is not met or a command panics;
+                                           --bless writes `golden` frames instead of comparing them
   mcp [--autosave] [--bridge [PORT] | --ui] MCP server (JSON-RPC over stdio); --autosave preserves unsaved work
                                            (headless or --ui; a bridged app owns its auto-saves);
                                            --bridge without a port uses EFFECTCRAFT_CONTROL_PORT, else 9877;
@@ -238,6 +240,7 @@ const FLAGS: &[&str] = &[
     "--all-tools",
     "--ui",
     "--keep-going",
+    "--bless",
 ];
 
 struct Args {
@@ -561,7 +564,8 @@ fn replay_cmd(args: &Args, json_out: bool) -> Result<(), Failure> {
     }
     let script = std::fs::read_to_string(path).map_err(|e| Failure::Error(format!("cannot read {file}: {e}")))?;
     let mut s = session(args)?;
-    let opts = replay::Options { keep_going: args.flag("--keep-going"), base_dir: path.parent().map(std::path::Path::to_path_buf) };
+    let opts =
+        replay::Options { keep_going: args.flag("--keep-going"), base_dir: path.parent().map(std::path::Path::to_path_buf), bless: args.flag("--bless") };
     let report = replay::run(&mut s, &script, &opts);
     if json_out {
         emit(&serde_json::to_value(&report).unwrap_or_else(|e| json!({"error": e.to_string()})), true);

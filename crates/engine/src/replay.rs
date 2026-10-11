@@ -13,6 +13,7 @@
 //! {"command": "comp.new", "params": {...}, "expect_error"?: true | "substring"}
 //! {"expect": {"query": "prop.get", "params": {...}, "pointer"?: "/value", "equals"?: ...}}
 //! {"expect_no_error": true}
+//! {"golden": {"file": "goldens/x.png", "comp"?: id, "time"?: s, "max_side"?: px, "transparent"?: bool, "min_psnr"?: dB}}
 //! ```
 //!
 //! A command must succeed unless it says `expect_error` (then it must fail, with that text in
@@ -20,7 +21,11 @@
 //! but tolerated; crash repros say so, since after the fix the crashing step may fail cleanly).
 //! A panic always fails. `expect` runs a command (normally a query) and compares the value at
 //! the JSON `pointer` of its result with `equals` (numbers within 1e-6); `expect_no_error`
-//! checks that the previous command succeeded. Other keys (`version`, `app`, `note`, `crash`…)
+//! checks that the previous command succeeded. `golden` renders a frame (`comp` / `time` default to
+//! the active comp and its current time) and compares it with the PNG `file` (relative to the
+//! script): it passes at `min_psnr` dB or better (default [`GOLDEN_MIN_PSNR`]); with
+//! [`Options::bless`] the render is written to `file` instead, which is how a golden is made or
+//! updated after an intended change. Other keys (`version`, `app`, `note`, `crash`…)
 //! are information for people. Relative `project` paths are relative to the script.
 //!
 //! Privacy: a repro holds command ids and their parameters only, never project or media file
@@ -48,6 +53,9 @@ pub const REPRO_DIR: &str = "Repros";
 const KEEP_CRASH_REPROS: usize = 20;
 /// Commands that replace the whole project: an export starts at the last one.
 const PROJECT_STARTS: &[&str] = &["file.newProject", "file.open", "file.openDemoProject"];
+/// A `golden` step passes at this PSNR (dB) or better unless it says otherwise: invisible
+/// rounding differences pass, a moved edge or a changed colour doesn't.
+pub const GOLDEN_MIN_PSNR: f64 = 40.0;
 /// Error and value texts in reports are cut to this many characters.
 const MAX_TEXT: usize = 600;
 
@@ -233,6 +241,12 @@ enum Step {
         equals: Option<Value>,
     },
     ExpectNoError,
+    Golden {
+        file: String,
+        /// `comp`, `time`, `max_side`, `transparent`.
+        render: Value,
+        min_psnr: f64,
+    },
     /// A line that isn't a valid step (reported as a failure).
     Invalid(String),
 }
@@ -255,6 +269,25 @@ fn parse_start(v: &Value) -> std::result::Result<Start, String> {
         },
         _ => Err("`start` must be \"new\", \"demo\" or {\"project\": path}".into()),
     }
+}
+
+fn parse_golden(g: &Value) -> std::result::Result<Step, String> {
+    let o = g.as_object().ok_or("`golden` must be an object with a `file`")?;
+    let file = o.get("file").and_then(Value::as_str).filter(|f| !f.trim().is_empty()).ok_or("`golden` needs a `file` (a PNG path, relative to the script)")?;
+    if let Some(k) = o.keys().find(|k| !["file", "comp", "time", "max_side", "transparent", "min_psnr"].contains(&k.as_str())) {
+        return Err(format!("`golden`: unexpected `{k}`"));
+    }
+    let min_psnr = match o.get("min_psnr") {
+        None | Some(Value::Null) => GOLDEN_MIN_PSNR,
+        Some(v) => v.as_f64().filter(|d| d.is_finite() && (0.0..=1000.0).contains(d)).ok_or("`golden.min_psnr` must be a number of dB from 0 to 1000")?,
+    };
+    let mut render = Map::new();
+    for k in ["comp", "time", "max_side", "transparent"] {
+        if let Some(v) = o.get(k) {
+            render.insert(k.into(), v.clone());
+        }
+    }
+    Ok(Step::Golden { file: file.to_string(), render: Value::Object(render), min_psnr })
 }
 
 /// One line → a step (`None`: a blank or comment line).
@@ -298,6 +331,8 @@ fn parse_line(text: &str, first: bool, allow_errors: &mut bool) -> Option<Step> 
         }
     } else if o.get("expect_no_error").and_then(Value::as_bool) == Some(true) {
         Ok(Step::ExpectNoError)
+    } else if let Some(g) = o.get("golden") {
+        parse_golden(g)
     } else if o.len() == 1 && o.contains_key("comment") {
         return None;
     } else {
@@ -313,8 +348,10 @@ fn parse_line(text: &str, first: bool, allow_errors: &mut bool) -> Option<Step> 
 pub struct Options {
     /// Keep running after a failed step (default: stop at the first failure).
     pub keep_going: bool,
-    /// Folder relative `start.project` paths are resolved against (the script's).
+    /// Folder relative `start.project` and `golden.file` paths are resolved against (the script's).
     pub base_dir: Option<PathBuf>,
+    /// `golden` steps write their render to `file` instead of comparing with it.
+    pub bless: bool,
 }
 
 /// What happened to one line.
@@ -322,7 +359,7 @@ pub struct Options {
 pub struct StepReport {
     /// 1-based line number (0: the implicit start).
     pub line: usize,
-    /// `start`, `command`, `expect`, `expect_no_error` or `invalid`.
+    /// `start`, `command`, `expect`, `expect_no_error`, `golden` or `invalid`.
     pub kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
@@ -372,6 +409,56 @@ fn approx_eq(a: &Value, b: &Value) -> bool {
         (Value::Array(x), Value::Array(y)) => x.len() == y.len() && x.iter().zip(y).all(|(a, b)| approx_eq(a, b)),
         (Value::Object(x), Value::Object(y)) => x.len() == y.len() && x.iter().all(|(k, a)| y.get(k).is_some_and(|b| approx_eq(a, b))),
         _ => a == b,
+    }
+}
+
+/// Render the frame a `golden` step names and compare it with (or, blessing, write it to) `file`.
+fn golden(s: &mut Session, file: &str, render: &Value, min_psnr: f64, opts: &Options) -> Result<Value> {
+    use effectcraft_raster::compare::{self as cmp, CompareOpts, Rgba8};
+    let path = match &opts.base_dir {
+        Some(b) if Path::new(file).is_relative() => b.join(file),
+        _ => PathBuf::from(file),
+    };
+    let shown = path.display().to_string();
+    let cid = crate::commands::comp_id(s, render)?;
+    let t = match render.get("time") {
+        None | Some(Value::Null) => s.state.times.get(&cid).copied().unwrap_or(effectcraft_time::Tick::ZERO),
+        Some(v) => effectcraft_time::Tick::from_seconds_f64(
+            v.as_f64().filter(|t| t.is_finite()).ok_or_else(|| EngineError::Other("`golden.time` must be a number of seconds".into()))?,
+        ),
+    };
+    let max_side = match render.get("max_side") {
+        None | Some(Value::Null) => 0,
+        Some(v) => {
+            v.as_u64().and_then(|m| u32::try_from(m).ok()).ok_or_else(|| EngineError::Other("`golden.max_side` must be a whole number of pixels".into()))?
+        }
+    };
+    let transparent = render.get("transparent").and_then(Value::as_bool).unwrap_or(false);
+    let (w, h, rgba) = s.render_rgba8_alpha(cid, t, max_side, transparent)?;
+    if opts.bless {
+        let png = crate::commands::encode_png(&rgba, w, h).map_err(|e| EngineError::Other(format!("cannot encode {shown}: {e}")))?;
+        s.services.store_file(&shown, &png).map_err(|e| EngineError::Other(format!("cannot write {shown}: {e}")))?;
+        return Ok(json!({"blessed": shown}));
+    }
+    let bytes = s.services.read_file(&shown).map_err(|e| EngineError::Other(format!("no golden frame at {shown} ({e}); run with --bless to make it")))?;
+    let (gw, gh, gold) =
+        crate::commands::render_compare::decode_image(&bytes).map_err(|e| EngineError::Other(format!("{shown} is not a readable PNG: {e}")))?;
+    if (gw, gh) != (w, h) {
+        return Err(EngineError::Other(format!("the frame is {w}x{h}, the golden {shown} is {gw}x{gh}")));
+    }
+    let err = |e: cmp::CompareError| EngineError::Other(e.to_string());
+    let st = cmp::compare(&Rgba8::new(w, h, &rgba).map_err(err)?, &Rgba8::new(gw, gh, &gold).map_err(err)?, &CompareOpts::default()).map_err(err)?;
+    if st.pass(Some(min_psnr)) {
+        Ok(json!({"psnr_db": st.psnr_db}))
+    } else {
+        Err(EngineError::Other(format!(
+            "the frame differs from {shown}: PSNR {:.2} dB (needs {min_psnr}), mean {:.3} / max {:.0} levels, {:.2}% of pixels changed{}",
+            st.psnr_db,
+            st.mean_abs,
+            st.max_abs,
+            st.changed_pct,
+            st.diff_bounds.map(|[x, y, w, h]| format!(" in [{x}, {y}, {w}, {h}]")).unwrap_or_default()
+        )))
     }
 }
 
@@ -509,6 +596,19 @@ pub fn run(s: &mut Session, script: &str, opts: &Options) -> Report {
                             _ => sr.ok = !panicked,
                         }
                     }
+                }
+            }
+            Step::Golden { file, render, min_psnr } => {
+                sr.kind = "golden";
+                sr.command = Some(file.clone());
+                let before = guard::caught();
+                let r = guard::guarded("replay of a golden frame", || golden(s, &file, &render, min_psnr, opts));
+                sr.panicked = guard::caught() != before;
+                if let Err(e) = r {
+                    sr.ok = false;
+                    sr.error = Some(cut(&format!("{}{e}", if sr.panicked { "panicked: " } else { "" })));
+                } else {
+                    sr.ok = !sr.panicked;
                 }
             }
             Step::ExpectNoError => {
@@ -689,5 +789,38 @@ mod tests {
         s.execute("file.runScript", json!({"steps": [{"command": "layer.newNull"}]})).unwrap();
         let ids: Vec<&str> = s.journal.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(ids, ["comp.new", "layer.newNull", "layer.newNull", "file.runScript"]);
+    }
+    #[test]
+    fn golden_frames_are_blessed_then_compared() {
+        let dir = std::env::temp_dir().join(format!("ec-golden-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let script = |color: &str| {
+            format!(
+                "{{\"start\": \"new\"}}\n{{\"command\": \"comp.new\", \"params\": {{\"width\": 64, \"height\": 36, \"frameRate\": 30, \"duration\": 1}}}}\n{{\"command\": \"layer.newSolid\", \"params\": {{\"color\": \"{color}\"}}}}\n{{\"golden\": {{\"file\": \"g/solid.png\", \"time\": 0}}}}\n"
+            )
+        };
+        let opts = |bless| Options { base_dir: Some(dir.clone()), bless, ..Options::default() };
+        // No golden yet: the failure says how to make one.
+        let r = run(&mut Session::new(), &script("#ff0000"), &opts(false));
+        assert!(!r.ok && r.first_failure.as_ref().and_then(|f| f.error.as_deref()).is_some_and(|e| e.contains("--bless")), "{r:?}");
+        // Blessing writes it (making the folder), then the same render matches.
+        let r = run(&mut Session::new(), &script("#ff0000"), &opts(true));
+        assert!(r.ok, "{r:?}");
+        assert!(dir.join("g/solid.png").is_file());
+        let r = run(&mut Session::new(), &script("#ff0000"), &opts(false));
+        assert!(r.ok, "{r:?}");
+        assert_eq!(r.steps.last().map(|s| s.kind), Some("golden"));
+        // A different render fails and says by how much.
+        let r = run(&mut Session::new(), &script("#0000ff"), &opts(false));
+        let e = r.first_failure.and_then(|f| f.error).unwrap_or_default();
+        assert!(!r.ok && !r.panicked && e.contains("PSNR"), "{e}");
+        // Malformed golden lines are failures, not crashes.
+        for bad in
+            ["{\"golden\": 1}", "{\"golden\": {}}", "{\"golden\": {\"file\": \"x.png\", \"min_psnr\": -1}}", "{\"golden\": {\"file\": \"x.png\", \"what\": 1}}"]
+        {
+            let r = run(&mut Session::new(), bad, &opts(false));
+            assert!(!r.ok && !r.panicked, "{bad}: {r:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -894,14 +894,32 @@ fn replace_footage(s: &mut Session, p: &Value) -> Result<Value> {
         f.width = previous.width;
         f.height = previous.height;
     }
+    // Replacing a missing file relinks the other missing files that moved with it (as After Effects
+    // does when you locate one).
+    let moved = match s.project.item(item).map(|it| &it.kind) {
+        Some(ItemKind::Footage(previous)) if previous.missing || !s.services.exists(&previous.path) => {
+            super::relink_moved::moved_with(s, item, &previous.path, &path)
+        }
+        _ => vec![],
+    };
+    let relinked: Vec<u64> = moved.iter().map(|(id, _)| id.0).collect();
     s.edit("Replace Footage", None, |proj, _| {
         let it = proj.item_mut(item).ok_or_else(|| bad("file.replaceFootage", "no such item"))?;
         it.name = name;
         it.kind = ItemKind::Footage(f);
         retarget_layers(proj, item, |_| LayerSource::Footage { item });
+        for (id, nf) in moved {
+            if let Some(it) = proj.item_mut(id) {
+                it.kind = ItemKind::Footage(nf);
+            }
+        }
         Ok(())
     })?;
-    Ok(Value::Null)
+    if relinked.is_empty() {
+        return Ok(Value::Null);
+    }
+    s.toast(format!("Also relinked {} other missing footage item(s)", relinked.len()));
+    Ok(json!({"relinked": relinked}))
 }
 
 /// Point every layer using `item` at a new source kind.

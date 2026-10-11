@@ -77,3 +77,26 @@ mean or maximum channel error without committing proprietary renders.
 Mixed interpolation sides, non-unit durations, temporal automatic/continuous Bezier, spatial speeds,
 time remapping, expressions, actual rendered motion and other effects need separate corpus cases.
 The initial probe makes no claim about those features.
+
+# Effect fidelity
+
+`examples/effects-fidelity.jsx` builds one original scene per case (a Gradient Ramp background and a
+rotated Checkerboard solid, no footage or text, so fonts and media can't differ) and applies one
+effect, at its defaults or with the parameters the case names, on an adjustment layer (or on the
+checkerboard layer for effects that need its alpha). It uses only the After Effects scripting
+object model, so the same file runs in After Effects through AEsync and in EffectCraft through
+`effectcraft-cli script`; each case writes its frame at 0.5 s with `CompItem.saveFrameToPng`.
+
+```sh
+node examples/check-ae-effects.mjs --aesync /path/to/aesync/server/dist/cli.js [--only gaussian-blur-10,twirl-90] [--min-psnr 30]
+node examples/check-ae-effects.mjs --ec-only     # EffectCraft's side alone, to check the scenes build
+```
+
+The driver compares each pair with `effectcraft-cli compare` and writes `docs/fidelity/effects.json`
+(PSNR, SSIM, mean and maximum difference per case; a case passes at `--min-psnr`, default 30 dB).
+Frames and diff heatmaps stay in gitignored `plan/aftereffects/ref/effects/`. Run it in a scratch
+project: it adds and removes comps and solids.
+
+Not measured yet: no After Effects run has been made with this harness, so there are no effect
+scores. The 23 cases cover blurs, glow, colour corrections, distortions, noise, a wipe and a drop
+shadow; add a case to `CASES` in the scene file to measure another effect.

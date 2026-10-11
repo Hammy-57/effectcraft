@@ -31,8 +31,19 @@ pub fn pages(file: &File) -> Vec<Page> {
     let mut out = vec![];
     let Some(cat) = file.catalog() else { return out };
     let Some(root) = file.get_dict(cat, "Pages") else { return out };
-    fn walk(file: &File, node: &Dict, inherited: (Option<Dict>, Option<Vec<f64>>, Option<Vec<f64>>, i32), out: &mut Vec<Page>, depth: usize) {
-        if depth > 32 || out.len() > 10_000 {
+    /// Page tree nodes visited at most (a node listed several times in `Kids`, or in a loop, would
+    /// otherwise be walked once per path to it: exponential in the depth).
+    const MAX_VISITS: usize = 50_000;
+    fn walk(
+        file: &File,
+        node: &Dict,
+        inherited: (Option<Dict>, Option<Vec<f64>>, Option<Vec<f64>>, i32),
+        out: &mut Vec<Page>,
+        depth: usize,
+        visits: &mut usize,
+    ) {
+        *visits += 1;
+        if depth > 32 || out.len() > 10_000 || *visits > MAX_VISITS {
             return;
         }
         let res = file.get_dict(node, "Resources").cloned().or(inherited.0);
@@ -43,7 +54,7 @@ pub fn pages(file: &File) -> Vec<Page> {
             Some(kids) if file.get(node, "Type").and_then(Obj::name) != Some("Page") => {
                 for k in kids {
                     if let Some(d) = file.resolve(k).dict() {
-                        walk(file, d, (res.clone(), media.clone(), crop.clone(), rot), out, depth + 1);
+                        walk(file, d, (res.clone(), media.clone(), crop.clone(), rot), out, depth + 1, visits);
                     }
                 }
             }
@@ -54,7 +65,7 @@ pub fn pages(file: &File) -> Vec<Page> {
             }
         }
     }
-    walk(file, root, (None, None, None, 0), &mut out, 0);
+    walk(file, root, (None, None, None, 0), &mut out, 0, &mut 0);
     out
 }
 
