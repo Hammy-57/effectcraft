@@ -18,10 +18,12 @@
 //! options), and a job first looks there: frames survive restarts and project reopenings. The
 //! timeline shows disk-only frames as a blue cache bar.
 //!
-//! With Mercury GPU Acceleration (a [`Gpu`] on egui-wgpu's device and the project's renderer set
-//! to the GPU) frames stay on the GPU: the compositor writes an RGBA8 texture that the viewer
-//! registers with egui-wgpu and draws directly; pixels are read back only when something needs
-//! them (Info panel, eyedroppers, histograms).
+//! With Mercury GPU Acceleration (a [`Gpu`] and the project's renderer set to the GPU) the
+//! compositor writes an RGBA8 texture. In the browser, on egui-wgpu's device, frames stay on the
+//! GPU: the viewer registers that texture with egui-wgpu and draws it directly. Natively the
+//! compositor has a device of its own (frame workers must not submit to the window surface's
+//! device, see `compositor_gpu`), so the texture comes back as RGBA8 bytes; a worker does not
+//! wait for them but goes on to its next frame, and the frame lands later (`landing`).
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,6 +36,8 @@ use effectcraft_engine::time::Tick;
 use effectcraft_gpu::{DisplayFrame, Gpu};
 use rayon::prelude::*;
 
+#[cfg(not(target_arch = "wasm32"))]
+mod landing;
 mod property_reuse;
 
 /// Comp identities (and the project snapshots behind them) the RAM preview keeps frames of.
@@ -509,6 +513,9 @@ pub struct Frames {
     /// Where frames render instead of the UI thread (wasm32), and how many it is rendering.
     remote: Option<Arc<dyn RemoteFrames>>,
     remote_busy: Arc<Mutex<usize>>,
+    /// GPU frames whose readback is in flight (see [`landing`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    landing: Arc<landing::Landing>,
     /// The cache bar's frames, remembered while nothing they depend on changes (the bar is drawn
     /// every UI frame).
     bar: Mutex<CacheBar>,
@@ -563,6 +570,8 @@ impl Default for Frames {
             keepers: Mutex::default(),
             remote: None,
             remote_busy: Arc::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            landing: Arc::default(),
             bar: Mutex::default(),
         }
     }
@@ -1145,6 +1154,8 @@ impl Frames {
             gpu_retired: self.gpu_retired.clone(),
             #[cfg(not(target_arch = "wasm32"))]
             pool: self.pool.clone(),
+            #[cfg(not(target_arch = "wasm32"))]
+            landing: self.landing.clone(),
         }
     }
 
@@ -1295,6 +1306,42 @@ struct Worker {
     /// The pool frames render on (`None`: rayon's global pool).
     #[cfg(not(target_arch = "wasm32"))]
     pool: Option<Arc<rayon::ThreadPool>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    landing: Arc<landing::Landing>,
+}
+
+/// What finishing a frame needs besides its pixels (see [`Worker::publish`]).
+#[derive(Clone)]
+struct Tail {
+    /// When its job started.
+    t0: web_time::Instant,
+    /// When its render started (playback budget samples).
+    service_start: web_time::Instant,
+    ticket: Option<crate::playback_budget::Ticket>,
+    /// The disk cache and the frame's key there.
+    disk: Option<(Arc<DiskCache>, u128)>,
+}
+
+/// What [`Worker::render_job`] did with a frame.
+enum Rendered {
+    Image(FrameImage),
+    /// Rendered on the GPU, its readback in flight: the landing thread finishes the job (native).
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    Landing,
+}
+
+/// A GPU frame whose readback is in flight: what [`Worker::landed`] finishes it with.
+#[cfg(not(target_arch = "wasm32"))]
+struct GpuFlight {
+    job: Job,
+    tail: Tail,
+    gpu: Gpu,
+    /// Backend::Auto's history key, when Auto chose the GPU.
+    auto: Option<effectcraft_engine::render::AutoKey>,
+    /// When the GPU attempt started (Auto's measurement).
+    t0: web_time::Instant,
+    width: u32,
+    height: u32,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1319,10 +1366,15 @@ impl Worker {
     #[cfg(not(target_arch = "wasm32"))]
     fn spawn_next(&self) {
         let w = self.clone();
-        let job = move || w.drain();
+        self.spawn(move || w.drain());
+    }
+
+    /// Run `task` on the frame pool.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn spawn(&self, task: impl FnOnce() + Send + 'static) {
         match &self.pool {
-            Some(pool) => pool.spawn(job),
-            None => rayon::spawn(job),
+            Some(pool) => pool.spawn(task),
+            None => rayon::spawn(task),
         }
     }
 
@@ -1378,11 +1430,13 @@ impl Worker {
         let from_disk = disk.as_ref().and_then(|(dc, k)| dc.get_frame(*k));
         let disk_hit = from_disk.is_some();
         let ticket = if job.disk_only { None } else { self.playback_budget.lock().unwrap_or_else(std::sync::PoisonError::into_inner).ticket(job.key) };
-        let service_start = web_time::Instant::now();
+        let tail = Tail { t0, service_start: web_time::Instant::now(), ticket, disk };
         let ci = match from_disk {
             Some(f) => FrameImage::Cpu(Arc::new(egui::ColorImage::from_rgba_premultiplied([f.width as usize, f.height as usize], &f.rgba))),
-            None => match self.render_guarded(&job) {
-                Some(ci) => ci,
+            None => match self.render_guarded(&job, &tail) {
+                Some(Rendered::Image(ci)) => ci,
+                // On its way back from the GPU: the landing thread publishes it.
+                Some(Rendered::Landing) => return true,
                 None => {
                     // Not "in progress" forever; not asked for again until the project changes.
                     self.give_up(job.key, job.urgent);
@@ -1390,32 +1444,38 @@ impl Worker {
                 }
             },
         };
-        if !disk_hit
-            && !(ci.is_gpu() && self.gpu_retired.load(Ordering::Acquire))
-            && let Some(ticket) = ticket
+        self.publish(&job, ci, &tail, disk_hit);
+        true
+    }
+
+    /// A frame is done: sample its render time for the playback budget, store it (RAM and / or
+    /// disk) and release its job.
+    fn publish(&self, job: &Job, ci: FrameImage, tail: &Tail, disk_hit: bool) {
+        if !(disk_hit || ci.is_gpu() && self.gpu_retired.load(Ordering::Acquire))
+            && let Some(ticket) = tail.ticket.clone()
         {
             self.playback_budget.lock().unwrap_or_else(std::sync::PoisonError::into_inner).record(
                 ticket,
-                service_start.elapsed().as_secs_f64() * 1000.0,
+                tail.service_start.elapsed().as_secs_f64() * 1000.0,
                 ci.is_gpu(),
             );
         }
-        let render_time = t0.elapsed();
+        let render_time = tail.t0.elapsed();
         if job.disk_only {
             // Straight to the disk cache, whatever it cost (else it would be asked for again).
-            if let (Some((dc, k)), FrameImage::Cpu(img)) = (&disk, &ci) {
+            if let (Some((dc, k)), FrameImage::Cpu(img)) = (&tail.disk, &ci) {
                 dc.put_frame(*k, img.size[0] as u32, img.size[1] as u32, ColorBytes(img.clone()));
             }
             self.release(job.key, false);
-            return true;
+            return;
         }
         // Publish the shared frame and wake the viewer first; the disk cache's writer thread
         // compresses and writes the same snapshot.
-        self.finish(&job, ci.clone(), t0);
-        let backlog = queue.lock().map(|q| q.jobs.iter().filter(|j| !j.urgent && !j.disk_only).count()).unwrap_or(0);
+        self.finish(job, ci.clone(), tail.t0);
+        let backlog = self.queue.lock().map(|q| q.jobs.iter().filter(|j| !j.urgent && !j.disk_only).count()).unwrap_or(0);
         if !disk_hit
             && keep_on_disk(render_time, job.urgent, backlog)
-            && let (Some((dc, k)), FrameImage::Cpu(img)) = (&disk, &ci)
+            && let (Some((dc, k)), FrameImage::Cpu(img)) = (&tail.disk, &ci)
         {
             // Hands over a reference to the frame (no copy, no compression here).
             dc.put_frame(*k, img.size[0] as u32, img.size[1] as u32, ColorBytes(img.clone()));
@@ -1423,7 +1483,6 @@ impl Worker {
                 ctx.request_repaint();
             }
         }
-        true
     }
 
     /// Store a finished frame and release its job.
@@ -1486,12 +1545,110 @@ impl Worker {
 
     /// [`Worker::render_job`], again on the CPU if it panicked (the panic hook has logged it);
     /// `None` if that panicked too.
-    fn render_guarded(&self, job: &Job) -> Option<FrameImage> {
-        let attempt = |gpu: bool| std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.render_job(job, gpu))).ok();
+    fn render_guarded(&self, job: &Job, tail: &Tail) -> Option<Rendered> {
+        let attempt = |gpu: bool| std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.render_job(job, gpu, gpu.then_some(tail)))).ok();
         attempt(true).or_else(|| {
             log::error!("a frame render panicked (frame {})", job.key.frame);
             job.src.gpu.as_ref().and_then(|_| attempt(false))
         })
+    }
+
+    /// Hand a GPU frame to the landing thread: its readback starts and `job` is finished with the
+    /// bytes when they arrive ([`Worker::landed`]). `None` when it does not fit in flight (the
+    /// caller reads it back itself).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn begin_landing(
+        &self,
+        gpu: &Gpu,
+        frame: &DisplayFrame,
+        job: &Job,
+        tail: &Tail,
+        auto: Option<effectcraft_engine::render::AutoKey>,
+        t0: web_time::Instant,
+    ) -> Option<u64> {
+        // Counted before it can land (and uncount itself).
+        self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner).landing += 1;
+        let w = self.clone();
+        let flight = GpuFlight { job: job.clone(), tail: tail.clone(), gpu: gpu.clone(), auto, t0, width: frame.width, height: frame.height };
+        match self.landing.begin(gpu, frame, Box::new(move |bytes| w.landed(flight, bytes))) {
+            Ok(id) => Some(id),
+            Err(_) => {
+                self.landing_done();
+                None
+            }
+        }
+    }
+
+    /// A frame left the landing thread's hands.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn landing_done(&self) {
+        let mut q = self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        q.landing = q.landing.saturating_sub(1);
+    }
+
+    /// Take a frame back from the landing thread after its attempt failed: whether this worker
+    /// finishes the job (`false`: the frame already landed, and its landing finishes it).
+    fn unland(&self, flight: Option<u64>) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(id) = flight {
+            if !self.landing.cancel(id) {
+                return false;
+            }
+            self.landing_done();
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = flight;
+        true
+    }
+
+    /// A GPU frame's readback arrived (on the landing thread): finish its job as the blocking
+    /// readback did. A failed readback renders the frame on the CPU, on a frame worker.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn landed(&self, flight: GpuFlight, bytes: Option<Vec<u8>>) {
+        self.landing_done();
+        let GpuFlight { job, tail, gpu, auto, t0, width, height } = flight;
+        if let Some(image) = bytes.and_then(|b| display_color_image(width, height, &b))
+            && gpu.context().check_health().is_ok()
+        {
+            if let (Some(key), Some(p)) = (auto, effectcraft_engine::render::Accelerator::auto_pick(&gpu)) {
+                // Readback and CPU image construction included, as before.
+                p.record(key, true, t0.elapsed().as_secs_f64() * 1000.0);
+            }
+            self.publish(&job, FrameImage::Cpu(Arc::new(image)), &tail, false);
+            return;
+        }
+        let w = self.clone();
+        self.spawn(move || {
+            let attempt = |f: &dyn Fn() -> Rendered| std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).ok();
+            match attempt(&|| w.display_fallback(&job, &gpu, auto)).or_else(|| attempt(&|| w.render_job(&job, false, None))) {
+                Some(Rendered::Image(ci)) => w.publish(&job, ci, &tail, false),
+                _ => w.give_up(job.key, job.urgent),
+            }
+        });
+    }
+
+    /// A GPU frame whose readback failed, rendered as [`Worker::render_job`] renders one then:
+    /// from scratch on the CPU when the context is retired, else on the CPU compositor (Auto
+    /// counts the GPU as declined).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn display_fallback(&self, job: &Job, g: &Gpu, auto: Option<effectcraft_engine::render::AutoKey>) -> Rendered {
+        if g.context().check_health().is_err() {
+            return self.render_job(job, false, None);
+        }
+        let pick = effectcraft_engine::render::Accelerator::auto_pick(g);
+        if let (Some(key), Some(p)) = (auto, pick) {
+            p.declined(key);
+        }
+        let mut r = Renderer::new(&job.src.project, job.src.footage.as_ref(), job.opts);
+        r.expr = job.src.expr.as_deref();
+        r.cache = Some(&job.src.layer_cache);
+        r.accel = Some(g as &dyn effectcraft_engine::render::Accelerator);
+        let t0 = web_time::Instant::now();
+        let img = to_color_image(&r.comp_frame_cpu(job.comp, job.t));
+        if let (Some(key), Some(p)) = (auto, pick) {
+            p.record(key, false, t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        Rendered::Image(FrameImage::Cpu(Arc::new(img)))
     }
 
     /// A failed scoped attempt retries on CPU. Retired contexts cannot recover by reducing
@@ -1530,8 +1687,9 @@ impl Worker {
         }
     }
 
-    /// Render a frame; `gpu: false` keeps it off the GPU compositor.
-    fn render_job(&self, job: &Job, gpu: bool) -> FrameImage {
+    /// Render a frame; `gpu: false` keeps it off the GPU compositor. With `tail`, a native GPU
+    /// frame can come back through the landing thread ([`Rendered::Landing`]).
+    fn render_job(&self, job: &Job, gpu: bool, tail: Option<&Tail>) -> Rendered {
         let frozen = effectcraft_engine::freeze::Preview::for_comp(&job.src.project, job.comp).with_feedback(&job.src.freeze_feedback);
         let mut r = Renderer::new(&job.src.project, job.src.footage.as_ref(), job.opts);
         r.freeze = (!frozen.is_empty()).then_some(&frozen);
@@ -1554,22 +1712,38 @@ impl Worker {
             let auto = if cfg!(target_arch = "wasm32") { None } else { r.frame_auto(a, job.comp, true) };
             if auto.is_none_or(|(p, key)| p.choose(key)) {
                 let t0 = web_time::Instant::now();
+                // The frame's flight on the landing thread, once handed over.
+                let mut flight = None;
                 match g.within_memory(|| {
                     let f = g.render_display(&r, job.comp, job.t)?;
                     #[cfg(target_arch = "wasm32")]
                     {
-                        Some(FrameImage::Gpu(Arc::new(f)))
+                        let _ = (&mut flight, tail);
+                        Some(Rendered::Image(FrameImage::Gpu(Arc::new(f))))
                     }
                     #[cfg(not(target_arch = "wasm32"))]
                     {
+                        // Don't wait for the pixels: the landing thread finishes the frame.
+                        if let Some(tail) = tail {
+                            flight = self.begin_landing(g, &f, job, tail, auto.map(|(_, key)| key), t0);
+                            if flight.is_some() {
+                                return Some(Rendered::Landing);
+                            }
+                        }
                         let bytes = g.read_display(&f)?;
                         let image = display_color_image(f.width, f.height, &bytes)?;
-                        Some(FrameImage::Cpu(Arc::new(image)))
+                        Some(Rendered::Image(FrameImage::Cpu(Arc::new(image))))
                     }
                 }) {
+                    Ok(Some(Rendered::Landing)) => {
+                        if g.context().check_health().is_err() && self.unland(flight) {
+                            return self.render_job(job, false, None);
+                        }
+                        return Rendered::Landing;
+                    }
                     Ok(Some(image)) => {
                         if g.context().check_health().is_err() {
-                            return self.render_job(job, false);
+                            return self.render_job(job, false, None);
                         }
                         if let Some((p, key)) = auto {
                             // Native readback has completed; include transfer and
@@ -1580,15 +1754,18 @@ impl Worker {
                     }
                     Ok(None) => {
                         if g.context().check_health().is_err() {
-                            return self.render_job(job, false);
+                            return self.render_job(job, false, None);
                         }
                         if let Some((p, key)) = auto {
                             p.declined(key);
                         }
                     }
                     Err(e) => {
+                        if !self.unland(flight) {
+                            return Rendered::Landing;
+                        }
                         self.gpu_attempt_failed(g, &e);
-                        return self.render_job(job, false);
+                        return self.render_job(job, false, None);
                     }
                 }
             }
@@ -1597,22 +1774,23 @@ impl Worker {
             if let Some((p, key)) = auto {
                 p.record(key, false, t0.elapsed().as_secs_f64() * 1000.0);
             }
-            return FrameImage::Cpu(Arc::new(img));
+            return Rendered::Image(FrameImage::Cpu(Arc::new(img)));
         }
         if let Some(g) = gpu {
             // The GPU composites and the frame is read back.
             return match g.within_memory(|| r.comp_frame(job.comp, job.t)) {
-                Ok(img) => FrameImage::Cpu(Arc::new(to_color_image(&img))),
+                Ok(img) => Rendered::Image(FrameImage::Cpu(Arc::new(to_color_image(&img)))),
                 Err(e) => {
                     self.gpu_attempt_failed(g, &e);
-                    self.render_job(job, false)
+                    self.render_job(job, false, None)
                 }
             };
         }
-        FrameImage::Cpu(Arc::new(to_color_image(&r.comp_frame(job.comp, job.t))))
+        Rendered::Image(FrameImage::Cpu(Arc::new(to_color_image(&r.comp_frame(job.comp, job.t)))))
     }
 }
 
+#[derive(Clone)]
 struct Job {
     key: FrameKey,
     src: RenderSource,
@@ -1636,6 +1814,10 @@ struct Queue {
     /// Spawns that returned because their job had to wait for memory: each finishing frame
     /// starts one again.
     parked: usize,
+    /// Running jobs whose GPU frame is on its way back ([`landing`]): rendered, they hold no
+    /// working memory and don't count against [`max_running`] (the landing thread bounds them by
+    /// their readback bytes).
+    landing: usize,
     /// The playing preview, if any: its prefetch renders nearest first.
     playhead: Option<Playhead>,
 }
@@ -1643,7 +1825,8 @@ struct Queue {
 impl Queue {
     fn can_start(&self, job: &Job) -> bool {
         let limit = max_running(job);
-        if job.urgent { self.urgent_running == 0 && self.running.len() <= limit } else { self.running.len() < limit }
+        let rendering = self.running.len().saturating_sub(self.landing);
+        if job.urgent { self.urgent_running == 0 && rendering <= limit } else { rendering < limit }
     }
 
     /// The job that matters most: urgent first (newest), then prefetch: while a preview plays,
@@ -1904,6 +2087,92 @@ mod tests {
         assert_eq!(max_running(&job(uhd, 0.5, gib)), 8, "Half resolution renders HD-sized frames");
         assert_eq!(max_running(&job(uhd, 1.0, 64 << 20)), 1);
         assert_eq!(max_running(&job(ItemId(9999), 1.0, gib)), gib, "no comp: nothing to bound");
+    }
+
+    /// RT7b: a native GPU frame is not waited for by its worker; it lands with exactly the bytes
+    /// of the blocking readback. While a frame is in flight, it counts as running for its key
+    /// (asked for again, it isn't rendered twice) but not against the working-memory limit, and
+    /// a newer revision still drops the queued frames of an older one.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn gpu_frames_land_with_the_blocking_bytes_and_stale_queued_frames_are_dropped() {
+        use effectcraft_engine::Session;
+        use effectcraft_engine::render::{Accelerator, Backend};
+        use serde_json::json;
+        let Some(gpu) = Gpu::headless() else { return };
+        let mut s = Session::default();
+        let cid = ItemId(s.execute("comp.new", json!({"name": "A", "width": 64, "height": 48, "duration": 2})).unwrap()["comp"].as_u64().unwrap());
+        s.execute("layer.newSolid", json!({"color": "#3080ff", "width": 40, "height": 30})).unwrap();
+        let src = RenderSource {
+            freeze_feedback: Default::default(),
+            project: s.project.clone(),
+            footage: Arc::new(effectcraft_engine::render::NoFootage),
+            expr: None,
+            layer_cache: Arc::new(LayerCache::new(1 << 30)),
+            gpu: Some(gpu.clone()),
+            gpu_display: true,
+            disk: None,
+        };
+        let opts = RenderOpts { backend: Backend::Gpu, ..Default::default() };
+        // The oracle: the blocking readback the workers used to wait for.
+        let blocking = || {
+            let mut r = Renderer::new(&src.project, src.footage.as_ref(), opts);
+            r.cache = Some(&src.layer_cache);
+            r.accel = Some(&gpu as &dyn Accelerator);
+            let f = gpu.render_display(&r, cid, Tick::ZERO).expect("GPU display frame");
+            let bytes = gpu.read_display(&f).expect("blocking readback");
+            (display_color_image(f.width, f.height, &bytes).unwrap(), bytes, f)
+        };
+        let (expected, bytes, frame) = blocking();
+        let f = Frames::default();
+        let settle = |f: &Frames| {
+            for _ in 0..3000 {
+                if f.inflight() == 0 {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            panic!("frames did not finish");
+        };
+        let content = f.content_of(&s.project, s.revision, cid);
+        let key = FrameKey { revision: s.revision, content, comp: cid.0, ..key(0, 0, 0) };
+        f.request_urgent(&src, key, cid, Tick::ZERO, opts);
+        settle(&f);
+        let Some(FrameImage::Cpu(got)) = f.get(&key) else { panic!("the landed frame is cached as pixels") };
+        assert_eq!(got.size, expected.size);
+        assert_eq!(got.pixels, expected.pixels, "byte-identical to the blocking readback");
+        assert_eq!(f.landing.landed(), 1, "it came back through the landing thread");
+        assert_eq!(f.queue.lock().unwrap().landing, 0);
+
+        // A frame in flight and a queued frame, both of this revision.
+        let job = |k: FrameKey| Job { key: k, src: src.clone(), comp: cid, t: Tick::ZERO, opts, urgent: false, disk_only: false, seq: 0 };
+        let (flying, stale) = (FrameKey { frame: 1, ..key }, FrameKey { frame: 2, ..key });
+        {
+            let mut q = f.queue.lock().unwrap();
+            q.running.insert(flying);
+            q.landing = 1;
+            let tiny = Job { src: RenderSource { layer_cache: Arc::new(LayerCache::new(1)), ..src.clone() }, ..job(stale) };
+            assert_eq!(max_running(&tiny), 1);
+            assert!(q.can_start(&tiny), "a frame in flight holds no working memory");
+            q.jobs.push(job(stale));
+        }
+        f.inflight.lock().unwrap().extend([flying, stale]);
+        f.request(&src, flying, cid, Tick::ZERO, opts);
+        assert_eq!(f.queue.lock().unwrap().jobs.len(), 1, "not queued twice while in flight");
+        let newer = FrameKey { revision: s.revision + 1, frame: 3, ..key };
+        f.request(&src, newer, cid, Tick::ZERO, opts);
+        assert!(!f.inflight.lock().unwrap().contains(&stale), "the older revision's queued frame is dropped");
+        assert!(f.inflight.lock().unwrap().contains(&flying), "the frame in flight is not");
+        // Its readback lands.
+        let now = web_time::Instant::now();
+        let tail = Tail { t0: now, service_start: now, ticket: None, disk: None };
+        let flight = GpuFlight { job: job(flying), tail, gpu: gpu.clone(), auto: None, t0: now, width: frame.width, height: frame.height };
+        f.worker().landed(flight, Some(bytes));
+        settle(&f);
+        assert!(matches!(f.get(&flying), Some(FrameImage::Cpu(img)) if img.pixels == expected.pixels));
+        assert!(f.is_cached(&newer) && !f.is_cached(&stale));
+        assert_eq!(f.queue.lock().unwrap().landing, 0);
+        assert!(f.queue.lock().unwrap().running.is_empty());
     }
 
     /// #647: a viewer frame can jump past busy prefetch, but a drag cannot start an
