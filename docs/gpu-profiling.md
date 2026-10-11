@@ -114,3 +114,15 @@ next 60 requested-frame availability times. Native Auto compositor selection,
 readback and the bounded polling delay are included. This is a serial worker
 availability measurement, not window presentation or a playback-fps guarantee.
 All raw timings, chosen scales and the first reduction frame are retained.
+
+### Progressive scrub deadline probe (RT5)
+
+The opt-in `progressive_scrub_deadlines` UI library test sends 60 timeline
+positions at 33 ms intervals, forward then backward, through real native viewer
+workers. It compares Off/Adaptive/Adaptive/Off, warms both scales equally, and
+records how many current frames finish before the next input, completion latency,
+and final full-resolution refinement. This is a worker-deadline probe, not an
+on-screen frame-rate measurement. Set `RT5_PROJECT` to a generated project with
+at least 136 valid source frames and `RT5_REPORT` to the output JSON path. Keep
+other GPU work and own builds stopped while timing it. The probe requests urgent
+frames directly; it does not measure sparse neighbor prefetch or UI presentation.

@@ -305,6 +305,7 @@ pub struct EffectcraftApp {
     events_sent: (f64, u64, Vec<effectcraft_engine::project::LayerId>),
     next_token: u64,
     pub(crate) last_ui_time: f64,
+    pub(crate) scrub_preview: crate::scrub_preview::ScrubPreview,
     /// When the user last did something (input or an edit): Cache Frames When Idle waits for
     /// a second of quiet. (time, project revision then)
     last_activity: (f64, u64),
@@ -420,6 +421,7 @@ impl EffectcraftApp {
             control_events: None,
             events_sent: (f64::NEG_INFINITY, 0, vec![]),
             next_token: 1,
+            scrub_preview: Default::default(),
             last_ui_time: 0.0,
             last_activity: (0.0, 0),
             last_edit: (0.0, 0),
@@ -926,6 +928,51 @@ impl EffectcraftApp {
         self.viewer_image.clone()
     }
 
+    fn scrub_enabled(&self) -> bool {
+        !self.playback.playing
+            && self.ui.viewer.res == state::Resolution::Auto
+            && self.session.state.viewer.fast_previews == effectcraft_engine::commands::viewer_cmds::FastPreviews::AdaptiveResolution
+            && !self.ui.viewer.interacting
+            && !self.ui.viewer.property_interacting
+            && !self.frames.remote_active()
+    }
+
+    fn scrubbing(&self) -> bool {
+        self.scrub_enabled()
+            && self
+                .session
+                .active_comp_id()
+                .zip(self.session.active_comp())
+                .is_some_and(|(id, c)| self.scrub_preview.active(id.0, self.session.revision, c.frame_rate.frame_at(self.session.time())))
+    }
+
+    pub(crate) fn record_scrub(&mut self, now: f64) {
+        if let (Some(id), Some(c)) = (self.session.active_comp_id(), self.session.active_comp()) {
+            self.scrub_preview.observe(id.0, self.session.revision, c.frame_rate.frame_at(self.session.time()), now);
+        }
+    }
+
+    pub(crate) fn frame_for_viewer(&self, key: &FrameKey, zoom: f32, ppp: f32) -> Option<(FrameKey, frames::FrameImage)> {
+        if let Some(img) = self.frames.get(key) {
+            return Some((*key, img));
+        }
+        // Prefer exact current content, even coarse, to an older edited frame.
+        if self.scrub_enabled() && self.scrub_preview.matches(key.comp, self.session.revision, key.frame) {
+            let full = self.ui.viewer.res.scale(zoom, ppp);
+            let coarse = full.min((full * 0.25).max(self.session.prefs.adaptive_limit()));
+            let k = self.frame_key(ItemId(key.comp), key.frame, coarse);
+            if k.scale < key.scale
+                && k.content == key.content
+                && k.view == key.view
+                && key.revision == self.session.revision
+                && let Some(img) = self.frames.get(&k)
+            {
+                return Some((k, img));
+            }
+        }
+        self.frames.get_for_viewer(key, self.viewer_shown.as_ref().map(|(_, s)| s))
+    }
+
     /// The render scale used by the viewer right now.
     pub fn viewer_scale(&self, zoom: f32, ppp: f32) -> f64 {
         // The preview's Resolution (when not Auto) while it plays.
@@ -969,6 +1016,9 @@ impl EffectcraftApp {
         });
         if self.frames.adapt_playback(config) {
             return half;
+        }
+        if self.scrubbing() {
+            return full.min((full * 0.25).max(self.session.prefs.adaptive_limit()));
         }
         // Fast Previews ▸ Adaptive Resolution / Fast Draft: lower resolution while dragging.
         let (_, k) = self.session.state.viewer.fast_previews.render(self.ui.viewer.interacting || self.ui.viewer.property_interacting);
@@ -1264,6 +1314,22 @@ impl EffectcraftApp {
         let video = plan.is_none_or(|p| p.video);
         // Prefetch ahead.
         let cur = fr.frame_at(self.session.time());
+        if self.scrubbing() {
+            let last = fr.frame_at(c.duration).saturating_sub(1).max(0);
+            let nearby = self.scrub_preview.neighbors(cur, last);
+            let series = self.frame_series(cid, scale);
+            self.frames.protect_frames(series, std::iter::once(cur).chain(nearby.iter().copied()));
+            let spare = self.frames_parallelism().saturating_sub(1).min(2).min(self.frames_that_fit(&c, scale).clamp(0, 2) as usize);
+            if !self.frames.urgent_pending() && self.editing(now).is_none() {
+                for f in nearby.into_iter().take(spare) {
+                    if self.frames.inflight() >= spare {
+                        break;
+                    }
+                    self.request_frame(cid, f, scale);
+                }
+            }
+            return;
+        }
         // While paused (scrubbing, editing) the viewer's frame comes first: prefetch only a few
         // frames, only once it is done, and not while edits keep coming (a layer dragged in the
         // viewer): those frames would be stale at the next step and would hold the CPU and GPU
@@ -1771,6 +1837,10 @@ impl EffectcraftApp {
 
     fn frame(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        self.scrub_preview.tick(ctx.input(|i| i.time), self.session.active_comp_id().map(|id| id.0), self.session.revision);
+        if let Some(wait) = self.scrub_preview.remaining() {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait));
+        }
         self.apply_gpu_failure(&ctx);
         self.run_dialog_answers();
         self.auto.begin_frame();
