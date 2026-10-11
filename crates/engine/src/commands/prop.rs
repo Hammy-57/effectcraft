@@ -25,11 +25,7 @@ pub(crate) fn prop_ref(s: &Session, p: &Value, cmd: &str) -> Result<(ItemId, Lay
     let path = str_p(p, "path").ok_or_else(|| bad(cmd, "missing `path` (e.g. transform/position) or `prop` uid"))?;
     let pr = layer.props.prop(path).ok_or_else(|| {
         let group = layer.props.group(path).or_else(|| path.trim().strip_prefix('@')?.parse().ok().and_then(|uid| layer.props.find_group(uid)));
-        if group.is_some() {
-            bad(cmd, format!("`{path}` is a property group; use layer.tree (MCP: get_layer) to inspect its children, then select a leaf property"))
-        } else {
-            bad(cmd, missing_prop(&layer.props, path))
-        }
+        if let Some(g) = group { bad(cmd, group_message(path, g)) } else { bad(cmd, missing_prop(&layer.props, path)) }
     })?;
     Ok((cid, lid, pr.uid))
 }
@@ -80,6 +76,15 @@ pub(crate) fn missing_prop(root: &PropGroup, path: &str) -> String {
     }
     let kids: Vec<String> = (0..g.children.len()).map(|i| super::query::segment(g, i)).collect();
     format!("`{path}` is a group, not a property; its children: {}", crate::suggest::capped_list(kids.iter().map(String::as_str), 30))
+}
+
+/// Why a group path names no property: what to do instead (#263) and the group's children.
+fn group_message(path: &str, g: &PropGroup) -> String {
+    let kids: Vec<String> = (0..g.children.len()).map(|i| super::query::segment(g, i)).collect();
+    format!(
+        "`{path}` is a group, not a property (it is a property group); use layer.tree (MCP: get_layer) to inspect its children, then select a leaf property. Its children: {}",
+        crate::suggest::capped_list(kids.iter().map(String::as_str), 30)
+    )
 }
 
 /// Number list for messages: `5, 5, 5`.
