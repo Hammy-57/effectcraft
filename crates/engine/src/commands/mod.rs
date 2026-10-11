@@ -228,7 +228,6 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(lint_cmds::specs());
         v.extend(motion_cmds::specs());
 
-
         v.extend(crate::agents::specs());
         v
     })

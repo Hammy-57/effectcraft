@@ -1355,8 +1355,8 @@ mod tests_key_time;
 mod tests_lint;
 
 #[cfg(test)]
-mod tests_motion;
-#[cfg(test)]
 mod tests_agent_cursor;
 #[cfg(test)]
 mod tests_claims;
+#[cfg(test)]
+mod tests_motion;
