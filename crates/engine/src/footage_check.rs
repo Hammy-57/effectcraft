@@ -217,7 +217,9 @@ mod tests {
         let mut paths: Vec<String> =
             o.project.items.values().filter_map(|i| if let ItemKind::Footage(f) = &i.kind { Some(f.path.clone()) } else { None }).collect();
         paths.sort();
-        assert_eq!(paths, ["/nonexistent/ec/abs.png", clip.to_str().unwrap(), "media/ec-relative-gone.png"]);
+        // A missing relative file is anchored next to the project too (the fork's resolve_footage).
+        let gone = dir.join("media").join("ec-relative-gone.png");
+        assert_eq!(paths, ["/nonexistent/ec/abs.png", clip.to_str().unwrap(), gone.to_str().unwrap()]);
         assert!(!o.is_dirty(), "finding the files is no edit");
         let r = o.execute("footage.check", json!({"wait": true})).unwrap();
         assert_eq!(r["missing"], 2);
