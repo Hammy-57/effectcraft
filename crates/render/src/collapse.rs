@@ -143,7 +143,8 @@ impl<'a> Renderer<'a> {
         if let Some(slot) = slot {
             *slot = Some(link);
         }
-        Some((Renderer { depth: self.depth + 1, outer, opacity_mul: opacity, collapse3d: Some(c3), through, through_lost, ..*self }, nctx))
+        let out_comp = self.out_comp.or(Some((ctx.comp.width, ctx.comp.height)));
+        Some((Renderer { depth: self.depth + 1, outer, opacity_mul: opacity, collapse3d: Some(c3), through, through_lost, out_comp, ..*self }, nctx))
     }
 
     pub(crate) fn opacity_mul(&self) -> f32 {

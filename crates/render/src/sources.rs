@@ -27,7 +27,8 @@ impl<'a> Renderer<'a> {
     /// Rasterisation scale of a layer's source: the output scale, or — for text layers, which are
     /// always continuously rasterised, and Continuously Rasterize shape layers and vector footage —
     /// the output scale times the layer's on-screen scale (quarter-octave steps, rounded up, so
-    /// vector content is drawn at its final size and stays sharp when scaled up).
+    /// vector content is drawn at its final size and stays sharp when scaled up). The buffer
+    /// stays within about 16 million pixels, or 1.25× the output's pixels for larger outputs.
     pub fn raster_scale(&self, ctx: &EvalCtx, layer: &Layer) -> f64 {
         let s = self.opts.scale;
         let continuous = match layer.source {
@@ -54,6 +55,7 @@ impl<'a> Renderer<'a> {
         // The step is rounded up past rounding noise only: an unscaled layer whose position isn't
         // a whole number maps the unit vectors to lengths a hair over 1, which must stay 1 (#390:
         // rounded up to 2^¼, unscaled text was drawn larger and resampled, softer).
+        let onscreen = k;
         let mut k = 2f64.powf((k.log2() * 4.0 - 1e-6).ceil() / 4.0).clamp(1.0 / 16.0, 64.0);
         // Keep the buffer within about 16 million pixels. The cap is never under 1: a step that
         // doesn't enlarge needs no measuring (a text layout or shape walk per call).
@@ -63,9 +65,27 @@ impl<'a> Renderer<'a> {
         let measure = k > 1.0;
         if measure && let Some(b) = content_bounds(ctx, layer) {
             let area = ((b[2] - b[0]) * (b[3] - b[1])).max(1.0) * s * s;
-            k = k.min((16.0e6 / area).sqrt().max(1.0));
+            let capped = k.min((16.0e6 / area).sqrt().max(1.0));
+            // Outputs past 16 Mpx (8K renders) raise the cap to their own size and a quarter for
+            // effect growth, so a layer filling the frame is not drawn softer than on-screen.
+            // Only steps the 16 Mpx cap held below the on-screen scale move (sharper).
+            let (cw, ch) = self.out_comp.unwrap_or((ctx.comp.width, ctx.comp.height));
+            let cap = cw as f64 * ch as f64 * s * s * 1.25;
+            #[cfg(test)]
+            let cap = if tests::FIXED_CAP.with(std::cell::Cell::get) { 0.0 } else { cap };
+            k = if capped < onscreen && cap > 16.0e6 { self.raised_scale(ctx, layer, s, k.min((cap / area).sqrt())).max(capped) } else { capped };
         }
         s * k
+    }
+
+    /// A raised rasterisation step (see [`Self::raster_scale`]) kept within the rasterisers'
+    /// 16384-pixel buffer sides, which would cut the content off: 0 when no step fits.
+    fn raised_scale(&self, ctx: &EvalCtx, layer: &Layer, s: f64, k: f64) -> f64 {
+        let side = |k: f64| crate::placement::drawn_buf_at(ctx, layer, s * k).map(|(w, h, ..)| w.max(h));
+        // At scale 1 a side is ⌈extent⌉ + 4 pixels: the extent is at most that minus 4.
+        let Some(unit) = side(1.0 / s).filter(|w| *w < 16384) else { return 0.0 };
+        let k = if unit > 4 { k.min(16379.0 / (unit - 4) as f64 / s) } else { k };
+        if side(k).is_some_and(|w| w < 16384) { k } else { 0.0 }
     }
 
     /// The renderer drawing precomp layer `layer`'s nested comp `item`, and the scale of the
@@ -205,7 +225,9 @@ mod tests {
     use std::cell::Cell;
 
     use effectcraft_color::Label;
+    use effectcraft_geom::vec2;
     use effectcraft_keyframe::{TextDoc, Value};
+    use effectcraft_project::Layer;
     use effectcraft_project::build::{self, Ids};
     use effectcraft_project::{Comp, ItemKind, LayerSource, Project};
     use effectcraft_time::{FrameRate, Tick};
@@ -215,6 +237,9 @@ mod tests {
     thread_local! {
         /// Measure the content for every continuous layer (the path before the shortcut).
         pub(super) static ALWAYS_MEASURE: Cell<bool> = const { Cell::new(false) };
+        /// Cap every buffer at 16 Mpx whatever the output size (the path before output-relative
+        /// caps).
+        pub(super) static FIXED_CAP: Cell<bool> = const { Cell::new(false) };
     }
 
     /// The rasterisation scale of text and Continuously Rasterize shape layers, scaled from tiny
@@ -265,6 +290,141 @@ mod tests {
             }
         }
         assert!(capped >= 8 && small > 8, "capped {capped}, not enlarged {small}");
+    }
+
+    /// A text and a Continuously Rasterize shape layer at `scale` % (and rotated) in `comp`.
+    fn enlarged(p: &mut Project, comp: &Comp, scale: f64, rot: f64) -> [Layer; 2] {
+        let mut t = build::layer(p, comp, "Text", LayerSource::Text, (comp.width, comp.height), None);
+        let doc = TextDoc { text: "Wide text line".into(), size: 60.0, ..Default::default() };
+        t.props.prop_mut("text/sourceText").unwrap().value = Value::Text(Box::new(doc));
+        let mut s = build::layer(p, comp, "Shape", LayerSource::Shape, (comp.width, comp.height), None);
+        let mut next = p.next_id;
+        let mut ids = Ids(&mut next);
+        let star = build::shape_star(&mut ids, true, 5.0, [0.0, 0.0], 150.0, 60.0);
+        let fill = build::shape_fill(&mut ids, [0.9, 0.2, 0.1, 1.0]);
+        let g = build::shape_group(&mut ids, "Star", vec![star, fill]);
+        p.next_id = next;
+        s.props.sub_mut("contents").unwrap().children.push(g.into());
+        s.switches.collapse = true;
+        for l in [&mut t, &mut s] {
+            l.props.prop_mut("transform/scale").unwrap().value = Value::Vec3([scale, scale * 0.8, 100.0]);
+            l.props.prop_mut("transform/rotation").unwrap().value = Value::Scalar(rot);
+            l.props.prop_mut("transform/position").unwrap().value = Value::Vec3([960.4, 540.7, 0.0]);
+        }
+        [t, s]
+    }
+
+    /// The scale a layer is seen at (output pixels per layer unit over the output scale) and
+    /// its content's area in layer units.
+    fn onscreen(ctx: &EvalCtx, l: &effectcraft_project::Layer, outer: Option<effectcraft_geom::Mat3>) -> (f64, f64) {
+        let m = outer.map_or(ctx.layer_to_comp(l).0, |o| o * ctx.layer_to_comp(l).0);
+        let a = l.transform().map(|tr| ctx.v3(l, tr, "anchor", [0.0; 3])).unwrap_or([0.0; 3]);
+        let (p0, px, py) = (m.apply(vec2(a[0], a[1])), m.apply(vec2(a[0] + 1.0, a[1])), m.apply(vec2(a[0], a[1] + 1.0)));
+        let k = ((px.x - p0.x).hypot(px.y - p0.y)).max((py.x - p0.x).hypot(py.y - p0.y));
+        let b = crate::content_bounds(ctx, l).unwrap();
+        (k, (b[2] - b[0]) * (b[3] - b[1]))
+    }
+
+    /// The rasterisation cap grows with outputs past 16 Mpx: at every output size and layer scale
+    /// the step equals the fixed 16 Mpx cap's bit for bit, except where that cap held the layer
+    /// below the scale it is seen at, and there it is at least that scale (a sharper frame where
+    /// main was softer than on-screen) within 1.25× the output's pixels, or as far as the
+    /// rasterisers' 16384-pixel sides allow. Collapsed precomp layers measure the frame they are
+    /// drawn into.
+    #[test]
+    fn raster_scale_cap_grows_with_the_output_only_where_it_softened() {
+        let mut p = Project::default();
+        let comp = Comp::new(1920, 1080, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+        let cid = p.add_item("Comp", Label::Sandstone, None, ItemKind::Comp(comp.clone().into()));
+        let mut layers = vec![];
+        for (i, scale) in [50.0, 100.0, 150.0, 400.0, 900.0, 1300.0, 2000.0, 3000.0, 6000.0, 20000.0].into_iter().enumerate() {
+            layers.extend(enlarged(&mut p, &comp, scale, 7.0 * i as f64));
+        }
+        // The same text, 2000 %, inside a collapsed precomp of a smaller comp.
+        let inner = Comp::new(400, 300, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+        let [nt, _] = enlarged(&mut p, &inner, 2000.0, 0.0);
+        let mut inner = inner;
+        inner.layers = vec![nt].into();
+        let iid = p.add_item("Inner", Label::Sandstone, None, ItemKind::Comp(inner.into()));
+        let mut pre = build::layer(&mut p, &comp, "Inner", LayerSource::Comp { item: iid }, (400, 300), None);
+        pre.switches.collapse = true;
+        layers.push(pre);
+        p.comp_mut(cid).unwrap().layers = layers.into();
+        let c = p.comp(cid).unwrap();
+        let ctx = EvalCtx::new(&p, cid, c, Tick::ZERO);
+        let (mut sharper, mut same) = (0, 0);
+        for out in [0.25, 0.5, 1.0, 2.0, 2.5, 4.0] {
+            let r = Renderer::new(&p, &NoFootage, RenderOpts { scale: out, ..Default::default() });
+            let mut check = |r: &Renderer, ctx: &EvalCtx, l: &effectcraft_project::Layer, what: String| {
+                let new = r.raster_scale(ctx, l);
+                FIXED_CAP.with(|m| m.set(true));
+                let old = r.raster_scale(ctx, l);
+                FIXED_CAP.with(|m| m.set(false));
+                if new.to_bits() == old.to_bits() {
+                    same += 1;
+                    return;
+                }
+                let (k, area) = onscreen(ctx, l, r.outer);
+                let cap = 1920.0 * 1080.0 * out * out * 1.25;
+                assert!(cap > 16.0e6, "{what}: changed at a {out}× output");
+                assert!(old < out * k && new > old, "{what}: {old} → {new} at on-screen {}", out * k);
+                let side = crate::placement::drawn_buf_at(ctx, l, 1.0).map_or(0, |(w, h, ..)| w.max(h)) as f64 - 4.0;
+                let most = (out * k).min((cap / area).sqrt()).min(16379.0 / side);
+                assert!(new >= most * 0.99 * (1.0 - 1e-9), "{what}: {new} softer than {most} (on-screen {})", out * k);
+                assert!(area * new * new <= cap * 1.0001, "{what}: {} px over the {cap} cap", area * new * new);
+                // Within the rasterisers' sides (beyond them the content would be cut off).
+                let (bw, bh, ..) = crate::placement::drawn_buf_at(ctx, l, new).unwrap();
+                assert!(bw < 16384 && bh < 16384, "{what}: {bw}×{bh} buffer");
+                sharper += 1;
+            };
+            for l in c.layers.iter() {
+                match r.collapse_into(&ctx, l, iid, 1.0).filter(|_| l.switches.collapse && matches!(l.source, LayerSource::Comp { .. })) {
+                    Some((sub, nctx)) => {
+                        let nl = nctx.comp.layers.iter().next().unwrap();
+                        check(&sub, &nctx, nl, format!("collapsed text at {out}"));
+                    }
+                    None => check(&r, &ctx, l, format!("{} {:?} at {out}", l.name, l.props.prop("transform/scale").map(|p| &p.value))),
+                }
+            }
+        }
+        assert!(sharper >= 6 && same > 60, "sharper {sharper}, same {same}");
+    }
+
+    /// Timing and memory: a 2000 % text layer and a large Continuously Rasterize shape layer on a
+    /// 1920×1080 comp, rasterised at Full and at an 8K (4×) output.
+    #[test]
+    #[ignore]
+    fn time_enlarged_text_and_shape() {
+        let mut p = Project::default();
+        let comp = Comp::new(1920, 1080, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+        let cid = p.add_item("Comp", Label::Sandstone, None, ItemKind::Comp(comp.clone().into()));
+        let [t, _] = enlarged(&mut p, &comp, 2000.0, 0.0);
+        let [_, s] = enlarged(&mut p, &comp, 1500.0, 0.0);
+        p.comp_mut(cid).unwrap().layers = vec![t, s].into();
+        let c = p.comp(cid).unwrap();
+        let ctx = EvalCtx::new(&p, cid, c, Tick::ZERO);
+        for out in [1.0, 4.0] {
+            for fixed in [true, false] {
+                FIXED_CAP.with(|m| m.set(fixed));
+                let r = Renderer::new(&p, &NoFootage, RenderOpts { scale: out, ..Default::default() });
+                for l in c.layers.iter() {
+                    let t0 = std::time::Instant::now();
+                    let b = r.source(&ctx, l).unwrap();
+                    let (k, _) = onscreen(&ctx, l, None);
+                    eprintln!(
+                        "{} at {out}× (fixed cap {fixed}): scale {:.2} (on-screen {:.2}), buffer {}x{} ({:.0} MB), {:.0} ms",
+                        l.name,
+                        b.scale,
+                        out * k,
+                        b.img.width,
+                        b.img.height,
+                        (b.img.width as f64 * b.img.height as f64 * 16.0) / 1e6,
+                        t0.elapsed().as_secs_f64() * 1e3
+                    );
+                }
+            }
+        }
+        FIXED_CAP.with(|m| m.set(false));
     }
 
     /// Timing: `raster_scale` of an unscaled paragraph text layer, measured or not.

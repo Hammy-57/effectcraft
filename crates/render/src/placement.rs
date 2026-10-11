@@ -364,31 +364,7 @@ impl<'a> Renderer<'a> {
     /// [`crate::shapes::buffer_rect`]): its size, offset and scale; `None` when it draws nothing
     /// or is not known.
     fn drawn_buf(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(u32, u32, [f64; 2], f64)> {
-        let k = self.raster_scale(ctx, layer);
-        if !(k.is_finite() && k > 0.0) {
-            return None;
-        }
-        let (bw, bh, off) = match &layer.source {
-            LayerSource::Shape => crate::shapes::buffer_rect(ctx, layer, layer.props.sub("contents")?, k)?,
-            LayerSource::Text => {
-                // `text::render`'s buffer: every glyph's bounds grown by its stroke and blur.
-                let geom = crate::text::text_geom(ctx, layer)?;
-                let b = geom
-                    .glyphs
-                    .iter()
-                    .filter_map(|g| {
-                        let pad = g.stroke_width + 2.0 + g.xf.blur[0].max(g.xf.blur[1]) * 1.5;
-                        effectcraft_path::bounds(&[g.path()]).map(|b| b.inflate(pad, pad))
-                    })
-                    .reduce(|a, b| a.union(b))?;
-                let b = b.intersect(kurbo::Rect::new(-20000.0, -20000.0, 20000.0, 20000.0));
-                let bw = ((b.width() * k).ceil() as u32 + 4).clamp(1, 16384);
-                let bh = ((b.height() * k).ceil() as u32 + 4).clamp(1, 16384);
-                (bw, bh, [-b.x0 * k + 2.0, -b.y0 * k + 2.0])
-            }
-            _ => return None,
-        };
-        Some((bw, bh, off, k))
+        drawn_buf_at(ctx, layer, self.raster_scale(ctx, layer))
     }
 
     /// Layer-space rectangle of the buffer a text or shape layer's source draws into (see
@@ -414,6 +390,35 @@ impl<'a> Renderer<'a> {
         let out = Window { x: ox, y: oy, w, h }.clip(reach_of(&items));
         Window { x: out.x.saturating_sub(ox), y: out.y.saturating_sub(oy), ..out }
     }
+}
+
+/// The buffer a text or shape layer's source draws into at rasterisation scale `k` (see
+/// [`Renderer::drawn_buf`]).
+pub(crate) fn drawn_buf_at(ctx: &EvalCtx, layer: &Layer, k: f64) -> Option<(u32, u32, [f64; 2], f64)> {
+    if !(k.is_finite() && k > 0.0) {
+        return None;
+    }
+    let (bw, bh, off) = match &layer.source {
+        LayerSource::Shape => crate::shapes::buffer_rect(ctx, layer, layer.props.sub("contents")?, k)?,
+        LayerSource::Text => {
+            // `text::render`'s buffer: every glyph's bounds grown by its stroke and blur.
+            let geom = crate::text::text_geom(ctx, layer)?;
+            let b = geom
+                .glyphs
+                .iter()
+                .filter_map(|g| {
+                    let pad = g.stroke_width + 2.0 + g.xf.blur[0].max(g.xf.blur[1]) * 1.5;
+                    effectcraft_path::bounds(&[g.path()]).map(|b| b.inflate(pad, pad))
+                })
+                .reduce(|a, b| a.union(b))?;
+            let b = b.intersect(kurbo::Rect::new(-20000.0, -20000.0, 20000.0, 20000.0));
+            let bw = ((b.width() * k).ceil() as u32 + 4).clamp(1, 16384);
+            let bh = ((b.height() * k).ceil() as u32 + 4).clamp(1, 16384);
+            (bw, bh, [-b.x0 * k + 2.0, -b.y0 * k + 2.0])
+        }
+        _ => return None,
+    };
+    Some((bw, bh, off, k))
 }
 
 /// What bounds a culled layer's pixels (see [`Renderer::off_canvas`]).

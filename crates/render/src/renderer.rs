@@ -98,6 +98,9 @@ pub struct Renderer<'a> {
     /// reach. Every warp and dissolve keeps the output's coordinates, so the pixels are the
     /// ones the whole canvas would get.
     pub(crate) canvas_origin: [u32; 2],
+    /// The size (comp pixels) of the comp whose frame a collapsed precomp's layers are drawn
+    /// into; `None` draws into this renderer's own comp (see [`Renderer::raster_scale`]).
+    pub(crate) out_comp: Option<(u32, u32)>,
 }
 
 /// Time spent on one layer of one frame (milliseconds).
@@ -136,6 +139,7 @@ impl<'a> Renderer<'a> {
             through: [None; MAX_THROUGH],
             through_lost: false,
             canvas_origin: [0; 2],
+            out_comp: None,
         }
     }
 
@@ -182,6 +186,7 @@ impl<'a> Renderer<'a> {
             through: [None; MAX_THROUGH],
             through_lost: false,
             canvas_origin: [0; 2],
+            out_comp: None,
             ..*self
         }
     }
