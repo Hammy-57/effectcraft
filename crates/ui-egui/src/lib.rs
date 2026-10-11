@@ -1168,7 +1168,10 @@ impl EffectcraftApp {
                 self.stop();
                 return;
             }
-            let target = snap(audio::frame_of_sample(a.clock(), a.rate, fr).clamp(wa, wb));
+            // One clock observation for this decision: a loop wrap between target selection
+            // and scheduling would otherwise turn the next-frame delay into a whole loop.
+            let audible = a.clock();
+            let target = snap(audio::frame_of_sample(audible, a.rate, fr).clamp(wa, wb));
             if !video {
                 self.playback.audio_frame = Some(target);
             } else if self.frames.is_cached(&FrameKey { frame: target, ..series }) {
@@ -1193,7 +1196,7 @@ impl EffectcraftApp {
             // Wake when the audible sample reaches the next frame (not at the display's refresh
             // rate): a 24 fps preview rebuilds the UI 24 times a second, not 120.
             let next = fr.tick_of(target.saturating_add(step.max(1))).seconds();
-            ctx.request_repaint_after(until_next_frame(next - audio::sample_time(a.clock(), a.rate).seconds()));
+            ctx.request_repaint_after(until_next_frame(next - audio::sample_time(audible, a.rate).seconds()));
             return;
         }
         let elapsed = now - self.playback.start_wall;
@@ -1825,6 +1828,69 @@ fn overflows_screen(size: egui::Vec2, monitor: egui::Vec2) -> bool {
 mod playback_pacing_tests {
     use super::{PLAYBACK_MAX_WAIT, until_next_frame};
     use std::time::Duration;
+
+    #[test]
+    fn audio_loop_boundary_schedules_the_next_frame_without_an_extra_pause() {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct WrappingClock(Arc<AtomicUsize>);
+        impl audio::AudioDevice for WrappingClock {
+            fn sample_rate(&self) -> u32 {
+                48_000
+            }
+            fn start(&mut self, _: Arc<audio::AudioFeed>) -> Result<(), String> {
+                Ok(())
+            }
+            fn stop(&mut self) {}
+            fn audible_frames(&self) -> Option<u64> {
+                // Cross a one-second loop between consecutive observations.
+                Some(if self.0.fetch_add(1, Ordering::Relaxed) == 0 { 47_999 } else { 48_000 })
+            }
+        }
+        let mut session = effectcraft_engine::Session::default();
+        let cid = ItemId(session.execute("comp.new", json!({"width": 8, "height": 8, "duration": 1, "frameRate": 30})).unwrap()["comp"].as_u64().unwrap());
+        let mut app = EffectcraftApp::new(session);
+        let observations = Arc::new(AtomicUsize::new(0));
+        app.audio = Some(
+            audio::AudioPlayback::start(
+                Box::new(WrappingClock(observations.clone())),
+                app.render_source(),
+                cid,
+                Tick::ZERO,
+                Tick::ZERO,
+                Tick::from_seconds_f64(1.0),
+                true,
+                48_000,
+            )
+            .unwrap(),
+        );
+        app.playback.playing = true;
+        app.playback.fps = 30.0;
+        app.playback.plan = Some(effectcraft_engine::preview::PreviewPlan {
+            start: 0,
+            end: 29,
+            first: 0,
+            step: 1,
+            fps: 30.0,
+            looping: true,
+            cache_first: false,
+            video: false,
+            audio: true,
+            origin: Tick::ZERO,
+        });
+        let ctx = egui::Context::default();
+        for frame in 0..3 {
+            ctx.run_ui(egui::RawInput { time: Some(frame as f64 / 60.0), ..Default::default() }, |_| {}).textures_delta.clear();
+        }
+        let mut output = ctx.run_ui(egui::RawInput { time: Some(1.0), ..Default::default() }, |ui| app.advance_playback(ui.ctx(), 1.0));
+        output.textures_delta.clear();
+        assert_eq!(app.playback.audio_frame, Some(29));
+        assert!(
+            output.viewport_output.get(&egui::ViewportId::ROOT).unwrap().repaint_delay < Duration::from_millis(10),
+            "the imminent loop must not acquire a 50ms pause"
+        );
+        assert_eq!(observations.load(Ordering::Relaxed), 1);
+    }
 
     #[test]
     fn a_playing_preview_wakes_when_its_next_frame_is_due_not_every_display_refresh() {
