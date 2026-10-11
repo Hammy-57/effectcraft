@@ -89,7 +89,8 @@ existing readback pool does not imply upload pooling.
 Auto resolution with Fast Previews set to Adaptive Resolution can reduce to Half
 of the normal Auto scale when native render-service p95 exceeds the displayed
 frame budget. Each scale discards eight cold renders, then needs eight real
-render completions and two slow samples, with a 10% budget margin. Half is tried
+render completions with at least three quarters missing the budget by 10%.
+This avoids paying for a resolution trial on isolated slow frames. Half is tried
 once and retained only if its p95 is at least 10% faster than the Full reference.
 A slower or inconclusive trial restores Full and locks that choice until the
 playback/content state changes; idle always restores normal Auto. The trial is

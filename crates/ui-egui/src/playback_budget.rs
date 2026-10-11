@@ -125,9 +125,11 @@ impl Budget {
             }
             return;
         }
-        // A 10% margin and two slow observations avoid reacting to a single hitch.
+        // Resolution trials themselves have a cost. Require sustained missed
+        // deadlines (three quarters of the window), not just a few p95 outliers.
         let threshold = config.budget_ms * 1.1;
-        if p95 > threshold && sorted.iter().filter(|ms| **ms > threshold).take(2).count() == 2 {
+        let required = sorted.len().saturating_mul(3).div_ceil(4);
+        if p95 > threshold && sorted.iter().filter(|ms| **ms > threshold).count() >= required {
             self.reduced = true;
             self.trial_reference = Some(p95);
             self.trial_samples = 0;
@@ -177,7 +179,7 @@ mod tests {
         sample(&mut b, c, 100.0, false);
         for _ in 0..100 { assert!(!b.configure(Some(c))); }
         sample(&mut b, c, 100.0, false);
-        assert!(b.configure(Some(c)));
+        assert!(!b.configure(Some(c)));
     }
     #[test]
     fn stale_epochs_series_revisions_and_backend_history_are_rejected() {
@@ -226,6 +228,16 @@ mod tests {
         b.configure(Some(c));
         for _ in 0..WARMUP { sample(&mut b, c, 1000.0, false); }
         for _ in 0..MIN_SAMPLES { sample(&mut b, c, 10.0, false); }
+        assert!(!b.configure(Some(c)));
+    }
+
+    #[test]
+    fn sporadic_missed_deadlines_do_not_pay_for_a_resolution_trial() {
+        let c = config();
+        let mut b = Budget::default();
+        b.configure(Some(c));
+        for _ in 0..WARMUP { sample(&mut b, c, 1000.0, false); }
+        for i in 0..64 { sample(&mut b, c, if matches!(i % 8, 0 | 2 | 3 | 5 | 6) { 60.0 } else { 20.0 }, false); }
         assert!(!b.configure(Some(c)));
     }
 
