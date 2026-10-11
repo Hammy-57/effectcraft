@@ -22,9 +22,9 @@ limited mainly by four things: projects that open only through a converter, beha
 Effects, reliability on platforms other than macOS, and the third-party plug-ins professional
 projects depend on.
 
-The checklist is also internally inconsistent: parity.md's per-area table still shows Interface
-75%, Project 68%, Animation 70% and Paint 0% next to the 99% headline. Some rows are stale; none
-of them have been reconciled.
+The checklist's per-area table used to show Interface 75%, Project 68%, Animation 70% and Paint
+0% next to the 99% headline. Those rows were stale; on 10 October they were replaced by each
+area's known gaps and what has been measured against After Effects (almost nothing yet).
 
 ## By dimension
 
@@ -61,6 +61,13 @@ The most important missing piece: it turns every other estimate here into a meas
   score and a fidelity column in parity.md.
 - Clean room: After Effects output stays local in `plan/aftereffects/ref/` (gitignored). Commit
   only our projects, the harness and the scores, never After Effects frames.
+- Started: keyframe ease (8 cases, all pass, [fidelity/README.md](fidelity/README.md)). Since 10
+  October the effect harness (`examples/check-ae-effects.mjs`, 23 cases: one scene file run by
+  both apps) is ready, but has not been run against After Effects yet; parity.md's area table has
+  a "measured" column that says so.
+- User files as regression checks: repro scripts take `golden` frames (`cargo xtask repros
+  [--bless]`, with users' projects in the gitignored `plan/repros/`), so a fixed bug in a real
+  project stays fixed in the rendered result, not only in a unit test.
 - Done when: every P0 and P1 feature has at least one corpus project, scores are reproducible from
   one command, and parity.md reports breadth and measured fidelity side by side.
 
@@ -147,6 +154,10 @@ The most important missing piece: it turns every other estimate here into a meas
 - Fuzz the inputs we don't control: project files, imported media and documents, expressions,
   scripts, control-channel and MCP requests. Every crash found becomes a regression test
   (AGENTS.md "Never crash").
+- Fuzzing started 10 October: ten cargo-fuzz targets in `fuzz/` (project files, AEP import,
+  Lottie, SVG, PSD, PDF / EPS, timelines, expressions, media probing and decoding, engine commands),
+  run with `cargo xtask fuzz` (docs/testing.md "Fuzzing"). Not yet covered: ExtendScript (its file
+  and process access needs a sandboxed object model first) and the control channel's line parser.
 - Done when: the gate is green on stable and the fuzzers run regularly without new crashes.
 
 ### G4. Open After Effects projects
@@ -159,7 +170,10 @@ The most important missing piece: it turns every other estimate here into a meas
   own renders (median mean-absolute error 0.018); 2 are clearly off (a liquid-glass wave shape, 3D
   lighting). AVIF stills import since 9 October (the 9 projects with AVIF footage no longer render
   it blank; not yet re-measured). Open: a blurred shape-layer highlight, `.aepx`.
-- Also in this area: relative footage paths and relinking when a project moves (parity.md, Project).
+- Relinking (10 October): relinking one missing file relinks the others that moved with it,
+  File ▸ Dependencies ▸ Relink Missing Footage in Folder… searches a folder by name, and a project
+  opened from a new folder finds footage at the same place under it (docs/footage.md). Not yet:
+  a Missing Footage dialog that offers these at open.
 - Done when: projects from a second, independent corpus (not SceneYard) open with their comps,
   layers, keyframes, effects and expressions intact.
 
@@ -172,6 +186,8 @@ The most important missing piece: it turns every other estimate here into a meas
   CPU and wall time per run, with `--compare` against an earlier run (docs/testing.md, "Render
   benchmark").
 - Compare with After Effects on the same machine where possible.
+- `--fail-over PCT` (10 October) makes `--compare` fail when CPU time, peak memory, max RSS or
+  instructions retired regress by more than PCT %; nothing runs it on a schedule yet.
 - Done when: benchmark numbers are tracked over time and regressions fail a check.
 
 ### G6. Media depth

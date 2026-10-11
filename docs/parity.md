@@ -10,8 +10,7 @@ How close EffectCraft is to After Effects 2026, feature by feature, and how much
 > Effects projects open (only through the py-aep converter), or how the app holds up for real
 > users on every platform.
 > Those gaps, and the work that closes them, are in [gaps.md](gaps.md). Don't raise the numbers
-> here without the evidence gaps.md asks for. The per-area table further down has stale rows that
-> have not been reconciled with the headline.
+> here without the evidence gaps.md asks for.
 
 ## Current status (audit at commit `d39c0e8`, 4 October 2026; updated 5 October for M3.9–M4.12)
 
@@ -60,26 +59,33 @@ Earlier audits and the per-milestone update sections are in [parity-log.md](pari
 
 ## By area
 
-| Area | Weighted parity | Remaining (agent-hours) | Biggest gaps |
-|---|---|---|---|
-| Layers | 88% | 4.8 | motion blur of collapsed precomps (their own motion and the parent camera's) and of animated layer content |
-| Output | 97% | 0.8 | HEVC/AV1 export lacks B-frames, multi-reference, SAO/CDEF/restoration and alpha; Opus lacks FEC/DTX (20 ms frames only); no Photoshop sequence output; movie overflow checked only at file creation |
-| Audio | 85% | 0.5 | audio to keyframes |
-| Import | 97% | 0.5 | JPX / JBIG2 images and predefined non-Identity CJK CMaps inside PDF/AI files, Illustrator EPS relying on Adobe procsets, PSD 3D layers |
-| Automation | ≈ 99% | 0.1 | `.jsxbin`; the object model, ScriptUI, Essential Graphics hooks, Watch Folder and the WebAssembly effect plug-in API are in |
-| Shapes | ≈ 80% | 1.5 | Lottie can't carry stroke taper/wave; taper, wave, multi-segment dashes, the pen tool and vertex editing are in |
-| Compositions | ≈ 81% | 3.3 | Mocha-style planar tracks for templates; nested comp markers on the precomp layer bar |
-| Animation | 70% | 9.0 | puppet depth beyond pins, recording, rigging and follow-through; Wiggler/Smoother/Motion Sketch |
-| Text | ≈ 96% | 0.3 | no extruded strokes; variable font axes, OpenType features, vertical text, per-character styles and on-canvas editing are in |
-| Web | 98% | 0.1 | No shared-memory threads inside one engine instance (one engine instance per worker by design; a threaded build needs nightly `build-std`) |
-| 3D | 88% | 5.5 | reflections of other layers (Advanced 3D reflects only the Environment light, #261), multi-view layouts, the Extended Viewer for Advanced 3D comps |
-| Effects | ≈ 85% | 3.0 | GPU versions of the remaining effects (280 on the GPU; Fractal and the analysis / tool effects on the CPU) and the missing controls listed as partial in [effects.md](effects.md) |
-| Interface | 75% | 5.0 | more Learn tutorials and pixel-level fidelity of dialogs |
-| Project | ≈ 68% | 5.5 | OCIO displays beyond the built-in tone map; relative footage paths and relinking when a project moves |
-| Masks & roto | 74% | 5.0 | (audit estimates) Roto Brush 2.0 / 3.0 with a trained model, Refine Edge, mask tracking, Mask Interpolation and variable-width feather are in |
-| Preview | 77% | 2.8 | GPU effects for the audio-driven effects and the stepped particle systems; content-keyed RAM preview frames (an edit drops every comp's), audio scrubbing, more snapshot slots |
-| Tracking | ≈ 96% | 0.3 | face tracking's trained model is an optional download; without it the classical fitter is weak on profile and occluded faces; Rolling Shutter Ripple is approximated |
-| Paint | 0% | 4.0 | Brush, Clone Stamp, Eraser |
+Every catalogued feature in every area exists (89 done, 3 partial, above). This table used to
+give a per-area percentage from an older audit; those numbers had gone stale (Paint read 0% after
+the paint tools landed, Animation 70% after Wiggler, Smoother and Motion Sketch did) and were
+removed on 10 October 2026 rather than guessed again. What it holds now is what is known to be
+missing in each area, and whether anything in it has been measured against After Effects (G1 in
+[gaps.md](gaps.md)): "unmeasured" means nobody has compared it yet, not that it differs.
+
+| Area | Known gaps | Measured against After Effects |
+|---|---|---|
+| Layers | none catalogued | unmeasured |
+| Output | HEVC/AV1 export lacks B-frames, multi-reference, SAO/CDEF/restoration and alpha; Opus lacks FEC/DTX (20 ms frames only); no Photoshop sequence output; movie overflow checked only at file creation | unmeasured |
+| Audio | none catalogued | unmeasured |
+| Import | JPX / JBIG2 images and predefined non-Identity CJK CMaps inside PDF/AI files, Illustrator EPS relying on Adobe procsets, PSD 3D layers; `.aep` only through the py-aep converter, `.aepx` not read | 255 SceneYard templates through py-aep: median mean-absolute error 0.018 against After Effects' renders, 2 clearly off ([gaps.md](gaps.md) G4) |
+| Automation | `.jsxbin`; ExtendScript `#include` / `#target`; Startup and Shutdown script folders | unmeasured |
+| Shapes | Lottie can't carry stroke taper/wave | unmeasured |
+| Compositions | Mocha-style planar tracks for templates | unmeasured |
+| Animation | none catalogued | 8 scalar ease cases (168 samples) match AE 26.3 to 3e-11 degrees ([fidelity/README.md](fidelity/README.md)); spatial paths, auto Bezier, roving, time remapping and expressions unmeasured |
+| Text | no extruded strokes | unmeasured |
+| Web | no shared-memory threads inside one engine instance (one instance per worker by design; a threaded build needs nightly `build-std`) | unmeasured |
+| 3D | reflections of other layers (Advanced 3D reflects only the Environment light, #261), multi-view layouts, the Extended Viewer for Advanced 3D comps | unmeasured |
+| Effects | Fractal and the analysis / tool effects render on the CPU (280 of 306 on the GPU); the controls listed as partial in [effects.md](effects.md) | unmeasured (CPU and GPU agree with each other, which is not the same thing) |
+| Interface | multi-monitor support (#227); accessibility; Japanese panel strings | unmeasured |
+| Project | OCIO displays beyond the built-in tone map | unmeasured |
+| Masks & roto | Roto Brush's model not compared with After Effects | unmeasured |
+| Preview | GPU versions of the audio-driven effects and the stepped particle systems | unmeasured |
+| Tracking | face tracking's trained model is an optional download; without it the classical fitter is weak on profile and occluded faces; Rolling Shutter Ripple is approximated | unmeasured |
+| Paint | none catalogued | unmeasured |
 
 ## Effects still missing
 
