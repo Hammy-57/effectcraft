@@ -30,7 +30,8 @@ Focused engine, host, effects, keyframe, UI and GPU regressions were run; all ch
 scripts replay cleanly. The UI command/widget automation audit passes. Changed crates passed
 all-target Clippy with warnings denied, and the browser target passed `cargo check`. CPU/Metal
 effect comparisons and the six Windows/DX12 checks are separate evidence, not a claim that every
-workflow was tested on every platform. Full workspace CI and a release/app rebuild were not run.
+workflow was tested on every platform. Full workspace CI and an ordinary app/release rebuild were
+not run locally; the later cloud CI result is recorded below.
 
 Private logs, the gradient screenshot and raw AE-generated reference frames stay under ignored
 `plan/user-bugs-validation/` and `plan/aftereffects/ref/user-bugs-658/`; no reference media ships
@@ -73,3 +74,16 @@ latest painted elements; the existing during-paint lookup contract remains uncha
 widgets cannot be clicked through an older snapshot. All 48 viewer tests, six control-channel tests,
 seven time-control tests and the new control geometry regression pass (62 total), with the original
 scale tolerance unchanged.
+
+## Full CI acceptance
+
+The [watchdog on `3f5c7d85`](https://github.com/eliasx45/effectcraft/actions/runs/38102786467)
+completed successfully on 11 October 2026. The lockfile change selected full workspace CI:
+3,168 tests passed, zero failed and 44 were ignored. Formatting (867 files), all-target workspace
+Clippy with warnings denied, dependency layering, attribution (40 assets), and WebAssembly checks
+(34 crates) passed. Both Puppet scale regressions and the current-frame control geometry test
+explicitly passed in this run. The full CI step took 11 minutes 57 seconds.
+
+Native Windows presentation recovery remains a separate, unmerged candidate with hardware
+verification deferred by the owner. Report #580 still needs a reproduction or crash diagnostic;
+#660 remains unresolved without an EffectCraft-specific reproduction, as requested.
