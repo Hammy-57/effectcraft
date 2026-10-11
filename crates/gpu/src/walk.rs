@@ -237,6 +237,9 @@ fn draw_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &
     if let Some(done) = draw_yuv_footage(e, r, ctx, layer, canvas, opacity) {
         return done;
     }
+    if let Some(done) = draw_ordinary_resident(e, r, ctx, layer, canvas, opacity) {
+        return done;
+    }
     let Some(st) = r.styled_layer(ctx, layer) else { return Some(()) };
     if st.plain {
         return composite_layer(e, r, ctx, layer, &st.body, canvas, opacity);
@@ -264,6 +267,97 @@ fn draw_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &
     tmp = place(e, r, ctx, layer, &st.body, &tmp, layer.blend_mode, 1.0, None)?;
     *canvas = ops::channel_mix(e, canvas, &tmp, bl.channels, opacity);
     Some(())
+}
+
+// Profile-only experiment: disable the ordinary resident producer without
+// changing shared ownership or native YUV caching. Read once per process.
+#[cfg(feature = "profile")]
+fn ordinary_resident_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("EFFECTCRAFT_GPU_RESIDENT").map_or(true, |value| value != "0"))
+}
+
+#[cfg(not(feature = "profile"))]
+fn ordinary_resident_enabled() -> bool {
+    true
+}
+
+/// Ordinary plain layers retain layer-space Processed pixels. Styles and precomps
+/// keep their existing paths; keys declined by dependency analysis are not retained.
+fn draw_ordinary_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut GpuImage, opacity: f32) -> Option<Option<()>> {
+    use effectcraft_render::cache::{Claim, GpuStage};
+    if !ordinary_resident_enabled()
+        || !e.can_retain_resident()
+        || styles::active(ctx, layer)
+        || matches!(layer.source, effectcraft_project::LayerSource::Comp { .. })
+    {
+        return None;
+    }
+    let cache = r.cache?;
+    let key = {
+        let _profile = effectcraft_render::profile::span("ordinary_resident_key");
+        r.resident_content_key(ctx, layer)?
+    };
+    let resident = {
+        let _profile = effectcraft_render::profile::span("ordinary_resident_lookup");
+        e.resident(key, GpuStage::Processed)
+    };
+    if let Some(image) = resident {
+        let _profile = effectcraft_render::profile::span("ordinary_resident_hit");
+        return composite_processed(e, r, ctx, layer, canvas, opacity, image);
+    }
+    // Reuse ordinary CPU/disk hits. An image from another device is materialized
+    // through its own guarded callback, never bound to this encoder's device.
+    let intent = cache.disk_intent(key);
+    let mut cpu = cache.get(key);
+    let mut flight = None;
+    if cpu.is_none() {
+        match cache.claim_gpu(key) {
+            Claim::Ready(buf) => cpu = Some(buf),
+            Claim::Owner(guard) => flight = Some(guard),
+            Claim::Render => {
+                // A GPU-only producer wakes the same flight without a CPU cache entry.
+                if let Some(image) = e.resident(key, GpuStage::Processed) {
+                    return composite_processed(e, r, ctx, layer, canvas, opacity, image);
+                }
+                return None;
+            }
+        }
+    }
+    let image = if let Some(buf) = cpu {
+        crate::context::NativeImage { img: e.upload_buf(&buf)?, offset: buf.offset, scale: buf.scale }
+    } else {
+        let _profile = effectcraft_render::profile::span("ordinary_resident_produce");
+        let buf = r.resident_source(ctx, layer)?;
+        let src = e.g.upload_image(&buf.img)?;
+        let mut fx = crate::effects::GpuFx::new(e, src, buf.offset, buf.scale, r.pipe().levels);
+        let origin = r.run_layer_effects_on(ctx, layer, &mut fx);
+        let (img, offset, scale) = fx.finish()?;
+        crate::context::NativeImage { img, offset: [offset[0] - origin[0] * scale, offset[1] - origin[1] * scale], scale }
+    };
+    let result = composite_processed(e, r, ctx, layer, canvas, opacity, image.clone());
+    if result == Some(Some(()))
+        && let Some(flight) = flight
+    {
+        e.keep_resident(key, image, flight, intent);
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn composite_processed(
+    e: &mut Enc,
+    r: &Renderer,
+    ctx: &EvalCtx,
+    layer: &Layer,
+    canvas: &mut GpuImage,
+    opacity: f32,
+    mut image: crate::context::NativeImage,
+) -> Option<Option<()>> {
+    if let Some(conversion) = r.pipe().to_blend() {
+        image.img = ops::convert(e, &image.img, &conversion);
+    }
+    composite_resident(e, r, ctx, layer, canvas, opacity, image)
 }
 
 /// A 2D precomp layer, its nested comp rendered resident on the GPU (`walk::render` one level
@@ -302,7 +396,7 @@ fn draw_yuv_footage(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, can
         r.resident_footage_key(ctx, layer)
     };
     if let Some((key, token)) = cache.as_ref()
-        && let Some(image) = e.g.native_get(&footage.pixels, *key, token, &metadata)
+        && let Some(image) = e.g.native_get(&footage.pixels, *key, token, &metadata, e.owner.as_ref())
     {
         let _profile = effectcraft_render::profile::span("native_cached_place");
         return composite_resident(e, r, ctx, layer, canvas, opacity, image);
@@ -488,7 +582,7 @@ fn place(
     if buf.img.is_empty() || opacity <= 0.0 {
         return Some(target.clone());
     }
-    let src = e.g.upload_buf(buf)?;
+    let src = e.upload_buf(buf)?;
     place_src(e, r, ctx, layer, buf, src, target, mode, opacity, levels)
 }
 

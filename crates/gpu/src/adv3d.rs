@@ -1093,7 +1093,7 @@ pub(crate) const SKY_KERNELS: &[&str] = &["adv_sky"];
 
 /// An Environment Light Background layer drawn over `canvas` (`three_d::compose::draw_sky`).
 pub(crate) fn sky(e: &mut Enc, sky: &effectcraft_render::three_d::SkyDraw, canvas: &GpuImage) -> Option<GpuImage> {
-    let img = e.g.upload_buf(&sky.buf)?;
+    let img = e.upload_buf(&sky.buf)?;
     let f3 = |v: [f64; 3], w: f64| [v[0] as f32, v[1] as f32, v[2] as f32, w as f32];
     let mut p = crate::context::Params::default();
     p.f[0] = f3(sky.fwd, sky.zoom);

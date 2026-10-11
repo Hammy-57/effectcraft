@@ -1557,37 +1557,40 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             draw_blue(a, b);
         }
     }
-    // Ticks + labels.
-    // Label spacing in whole frames (AE: `00:15f`-style seconds:frames labels).
-    let fps_i = fr.as_f64().round().max(1.0) as i64;
-    let half = (fps_i / 2).max(1);
-    let label_frames = [1, 2, 5, 10, half, fps_i, 2 * fps_i, 5 * fps_i, 10 * fps_i, 30 * fps_i, 60 * fps_i]
-        .into_iter()
-        .find(|f| *f as f64 * fd * pps >= 52.0)
-        .unwrap_or(60 * fps_i);
-    let secs_per_label = label_frames as f64 * fd;
-    let first = (tm.start / secs_per_label).floor() * secs_per_label;
-    let mut s = first;
+    // Ticks + labels, in the project's Time Display Style like the current-time readout:
+    // compact After Effects timecode (`00:15f`, `05s`, `01:30s`, `02m`), frame numbers, or
+    // feet + frames. Steps are whole displayed frames, wide enough for the longest label.
+    let st = &app.session.project.settings;
+    let start_frame = fr.frame_at(comp.display_start);
+    let rs = super::timeline_ruler::RulerStyle {
+        style: st.time_display,
+        base: fr.timecode_base(),
+        offset: match st.time_display {
+            effectcraft_engine::project::TimeDisplayStyle::Timecode => start_frame,
+            effectcraft_engine::project::TimeDisplayStyle::Frames => st.frame_start,
+            _ => start_frame.saturating_add(st.frame_start),
+        },
+    };
     let pr = p.with_clip_rect(Rect::from_min_max(pos2(graph_x0, ruler.min.y), pos2(bin.min.x, ruler.max.y)));
-    while s <= tm.t(graph_x1) + secs_per_label {
+    let last_shown = fr.frame_at(comp.duration).saturating_add(rs.offset);
+    let step = rs.pick_step(fd * pps, last_shown, |l| pr.layout_no_wrap(l.to_string(), Tokens::ui(10.0), t.tl_ruler_text).size().x);
+    let f0 = ((tm.start / fd).floor() as i64).saturating_add(rs.offset);
+    let f1 = ((tm.t(graph_x1) / fd).ceil() as i64).saturating_add(rs.offset).saturating_add(step);
+    let mut n = f0.saturating_sub(f0.rem_euclid(step));
+    while n <= f1 {
+        let s = n.saturating_sub(rs.offset) as f64 * fd;
         let x = tm.x(s);
         pr.line_segment([pos2(x, ruler.max.y - 10.0), pos2(x, ruler.max.y)], Stroke::new(1.0, t.tl_ruler_tick));
-        let fno = (s / fd).round() as i64;
-        let label = if fno >= 60 * fps_i * 60 {
-            format!("{}:{:02}:{:02}f", fno / (fps_i * 60), (fno / fps_i) % 60, fno % fps_i)
-        } else {
-            format!("{:02}:{:02}f", fno / fps_i, fno % fps_i)
-        };
         // A label that would run under the marker bin is left out rather than cut to a stray digit.
-        let g = pr.layout_no_wrap(label, Tokens::ui(10.0), t.tl_ruler_text);
+        let g = pr.layout_no_wrap(rs.label(n, step), Tokens::ui(10.0), t.tl_ruler_text);
         if x + 3.0 + g.size().x <= bin.min.x {
             pr.galley(pos2(x + 3.0, ruler.max.y - 16.0 - g.size().y / 2.0), g, t.tl_ruler_text);
         }
         for k in 1..5 {
-            let xx = tm.x(s + secs_per_label * k as f64 / 5.0);
+            let xx = tm.x(s + step as f64 * fd * k as f64 / 5.0);
             pr.line_segment([pos2(xx, ruler.max.y - 4.0), pos2(xx, ruler.max.y)], Stroke::new(1.0, t.tl_ruler_tick.gamma_multiply(0.6)));
         }
-        s += secs_per_label;
+        n = n.saturating_add(step);
     }
     // Scrub in the ruler: the current time jumps to the pointer as soon as the button goes down
     // (After Effects), then follows it.

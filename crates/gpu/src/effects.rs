@@ -125,6 +125,33 @@ impl effectcraft_render::FxTarget for GpuFx<'_, '_> {
         let out = f(Buf { img, offset: b.offset, scale: b.scale });
         self.b = self.e.g.upload_image(&out.img).map(|img| GBuf { img, offset: out.offset, scale: out.scale });
     }
+    fn effect_canvas(&mut self, size: [f64; 2]) {
+        let Some(b) = &self.b else { return };
+        let Some(([width, height], pad)) = effectcraft_render::effect_canvas_extent([b.img.width, b.img.height], b.offset, b.scale, size) else {
+            return;
+        };
+        // Failure keeps the existing whole-layer CPU fallback contract; never submit an
+        // oversized copy or return a partially cleared canvas as a successful result.
+        if !self.e.g.fits(width, height) || self.e.g.check_health().is_err() {
+            self.b = None;
+            return;
+        }
+        let mut out = self.e.image(width, height);
+        if self.e.take_missing() || self.e.g.check_health().is_err() {
+            self.b = None;
+            return;
+        }
+        if b.img.width > 0 && b.img.height > 0 {
+            self.e.copy_into(&b.img, &out, pad[0], pad[1]);
+        }
+        out.levels = b.img.levels;
+        if self.e.take_missing() || self.e.g.check_health().is_err() {
+            self.b = None;
+            return;
+        }
+        self.b = Some(GBuf { img: out, offset: [b.offset[0] + f64::from(pad[0]), b.offset[1] + f64::from(pad[1])], scale: b.scale });
+    }
+
     fn shift(&mut self, d: [f64; 2]) {
         if let Some(b) = &mut self.b {
             b.offset = [b.offset[0] - d[0], b.offset[1] - d[1]];
@@ -132,7 +159,12 @@ impl effectcraft_render::FxTarget for GpuFx<'_, '_> {
     }
 }
 
+#[cfg(test)]
+static EFFECT_CHAIN_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 pub(crate) fn apply_chain(e: &mut Enc, chain: &[FxStep], mut b: GBuf, levels: Option<f32>) -> Option<GBuf> {
+    #[cfg(test)]
+    EFFECT_CHAIN_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     e.take_missing();
     let mut remaining = chain;
     while let Some((step, rest)) = remaining.split_first() {
@@ -602,7 +634,17 @@ mod keep_tests {
         r.accel = Some(g);
         r.cache = Some(&cache);
         let before = g.ctx.transfer_stats();
-        let img = r.comp_frame(s.cid, Tick::ZERO);
+        // Exercise the legacy eager effects_kept contract explicitly. The ordinary
+        // resident producer has separate demand/transfer tests.
+        let img = g
+            .within_memory(|| {
+                let mut enc = crate::context::Enc::with_owner(&g.ctx, cache.gpu_owner());
+                let image = crate::walk::render(&mut enc, &r, s.cid, Tick::ZERO).unwrap();
+                let result = enc.download(&image).unwrap();
+                enc.publish_native();
+                result
+            })
+            .unwrap();
         let after = g.ctx.transfer_stats();
         g.ctx.set_keep_effects(true);
         let d = crate::TransferStats {
@@ -614,6 +656,138 @@ mod keep_tests {
             yuv_bytes: after.yuv_bytes - before.yuv_bytes,
         };
         (img, d)
+    }
+
+    #[test]
+    fn ordinary_resident_transform_and_lazy_cpu_are_stage_exact() {
+        let Some(g) = crate::tests::gpu() else { return };
+        eprintln!("resident proof adapter: {}", g.ctx.name);
+        for depth in [BitDepth::Bpc8, BitDepth::Bpc16, BitDepth::Bpc32] {
+            for linear in [false, true] {
+                for scale in [1.0, 0.5] {
+                    g.ctx.clear_uploads();
+                    let mut s = Scene::new(depth);
+                    s.p.settings.blend_linear = linear;
+                    let mut layer = s.solid([0.72, 0.31, 0.13], 31, 23);
+                    s.effect(&mut layer, "ec.color.levels", &[("gamma", n(1.3))]);
+                    let id = s.push(layer);
+                    let cache = LayerCache::default();
+                    let opts = RenderOpts { backend: Backend::Gpu, scale, ..Default::default() };
+                    {
+                        let mut r = Renderer::new(&s.p, &Pattern, opts);
+                        r.accel = Some(g);
+                        r.cache = Some(&cache);
+                        let before = g.ctx.transfer_stats();
+                        g.within_memory(|| g.render_display(&r, s.cid, Tick::ZERO)).unwrap().unwrap();
+                        let after = g.ctx.transfer_stats();
+                        assert_eq!(after.readbacks, before.readbacks, "cold producer stays resident");
+                        let ctx = r.eval_ctx(s.cid, Tick::ZERO).unwrap();
+                        let layer = ctx.comp.layers.iter().find(|l| l.id == id).unwrap();
+                        let key = r.resident_content_key(&ctx, layer).unwrap();
+                        assert!(
+                            cache.gpu_owner().unwrap().resident(key, effectcraft_render::cache::GpuStage::Processed).is_some(),
+                            "actual ordinary resident route"
+                        );
+                    }
+                    set(s.p.comp_mut(s.cid).unwrap().layers.iter_mut().find(|l| l.id == id).unwrap(), "transform/position", v3(42.0, 27.0));
+                    let mut r = Renderer::new(&s.p, &Pattern, opts);
+                    r.accel = Some(g);
+                    r.cache = Some(&cache);
+                    let before = g.ctx.transfer_stats();
+                    let effect_calls = super::EFFECT_CHAIN_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+                    let display = g.within_memory(|| g.render_display(&r, s.cid, Tick::ZERO)).unwrap().unwrap();
+                    let warm = g.ctx.transfer_stats();
+                    assert_eq!(super::EFFECT_CHAIN_CALLS.load(std::sync::atomic::Ordering::Relaxed), effect_calls, "warm transform effect work");
+                    assert_eq!(warm.uploads, before.uploads, "warm transform uploads {depth:?}/{linear}/{scale}");
+                    assert_eq!(warm.readbacks, before.readbacks, "warm transform readbacks");
+                    let actual = g.read_display(&display).unwrap();
+                    let ctx = r.eval_ctx(s.cid, Tick::ZERO).unwrap();
+                    let layer = ctx.comp.layers.iter().find(|l| l.id == id).unwrap();
+                    let before = g.ctx.transfer_stats();
+                    if linear {
+                        r.styled_layer(&ctx, layer).unwrap();
+                    }
+                    let materialized = r.content_buf(&ctx, layer).unwrap();
+                    let after = g.ctx.transfer_stats();
+                    assert_eq!(after.readbacks - before.readbacks, 1, "one CPU demand readback");
+                    assert!(std::sync::Arc::ptr_eq(&materialized, &r.content_buf(&ctx, layer).unwrap()));
+                    assert_eq!(g.ctx.transfer_stats().readbacks, after.readbacks);
+                    let mut legacy = Renderer::new(&s.p, &Pattern, opts);
+                    legacy.accel = Some(g);
+                    let legacy_ctx = legacy.eval_ctx(s.cid, Tick::ZERO).unwrap();
+                    let legacy_layer = legacy_ctx.comp.layers.iter().find(|l| l.id == id).unwrap();
+                    let expected = legacy.content_buf(&legacy_ctx, legacy_layer).unwrap();
+                    assert_eq!(materialized.offset, expected.offset);
+                    assert_eq!(materialized.scale, expected.scale);
+                    assert_eq!(materialized.img.data, expected.img.data, "Processed fidelity {depth:?}/{linear}/{scale}");
+                    let expected_display = g
+                        .within_memory(|| {
+                            let mut enc = crate::context::Enc::with_owner(&g.ctx, None);
+                            let img = crate::walk::render(&mut enc, &legacy, s.cid, Tick::ZERO).unwrap();
+                            let texture = enc.display(&img);
+                            enc.submit();
+                            crate::DisplayFrame { texture, width: img.width, height: img.height }
+                        })
+                        .unwrap();
+                    assert_eq!(actual, g.read_display(&expected_display).unwrap(), "display fidelity {depth:?}/{linear}/{scale}");
+                    eprintln!(
+                        "resident {depth:?} linear={linear} scale={scale}: warm uploads=0 readbacks=0 effect-chains=0; demand=1; exact Processed/display"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_resident_cpu_boundary_and_denied_retention_stay_correct() {
+        let Some(g) = crate::tests::gpu() else { return };
+        for budget in [16 << 20, 0] {
+            g.ctx.clear_uploads();
+            let mut s = Scene::new(BitDepth::Bpc32);
+            let mut layer = s.footage(40, 30);
+            s.effect(&mut layer, "ec.blur.fastbox", &[("radius", n(3.0))]);
+            s.effect(&mut layer, "ec.generate.fractal", &[]);
+            let id = s.push(layer);
+            let cache = LayerCache::new(budget);
+            let mut r = Renderer::new(&s.p, &Pattern, RenderOpts { backend: Backend::Gpu, ..Default::default() });
+            r.accel = Some(g);
+            r.cache = Some(&cache);
+            let before = g.ctx.transfer_stats();
+            let display = g.within_memory(|| g.render_display(&r, s.cid, Tick::ZERO)).unwrap().unwrap();
+            let cold = g.ctx.transfer_stats();
+            assert!(cold.readbacks > before.readbacks, "real CPU-only effect boundary");
+            let actual = g.read_display(&display).unwrap();
+            let ctx = r.eval_ctx(s.cid, Tick::ZERO).unwrap();
+            let layer = ctx.comp.layers.iter().find(|l| l.id == id).unwrap();
+            let key = r.resident_content_key(&ctx, layer).unwrap();
+            assert_eq!(cache.gpu_owner().unwrap().resident(key, effectcraft_render::cache::GpuStage::Processed).is_some(), budget > 0);
+            let before = g.ctx.transfer_stats();
+            let calls = super::EFFECT_CHAIN_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+            let again = g.within_memory(|| g.render_display(&r, s.cid, Tick::ZERO)).unwrap().unwrap();
+            let warm = g.ctx.transfer_stats();
+            if budget > 0 {
+                assert_eq!(warm.uploads, before.uploads);
+                assert_eq!(warm.readbacks, before.readbacks);
+                assert_eq!(super::EFFECT_CHAIN_CALLS.load(std::sync::atomic::Ordering::Relaxed), calls);
+            } else {
+                assert_eq!(cache.retained_stats().live_bytes, 0);
+                assert!(warm.readbacks > before.readbacks, "denial safely recomputes");
+            }
+            assert_eq!(actual, g.read_display(&again).unwrap());
+            let mut legacy = Renderer::new(&s.p, &Pattern, RenderOpts { backend: Backend::Gpu, ..Default::default() });
+            legacy.accel = Some(g);
+            let expected = g
+                .within_memory(|| {
+                    let mut enc = crate::context::Enc::with_owner(&g.ctx, None);
+                    let img = crate::walk::render(&mut enc, &legacy, s.cid, Tick::ZERO).unwrap();
+                    let texture = enc.display(&img);
+                    enc.submit();
+                    crate::DisplayFrame { texture, width: img.width, height: img.height }
+                })
+                .unwrap();
+            assert_eq!(actual, g.read_display(&expected).unwrap(), "CPU-boundary fidelity, budget {budget}");
+            eprintln!("ordinary CPU boundary/denial: budget={budget}, correct output and bounded retention");
+        }
     }
 
     /// A layer whose effect stack ends in a GPU chain composites from the chain's result: the
@@ -633,5 +807,99 @@ mod keep_tests {
         }
         // Nothing waits for adoption once the frame is done.
         assert_eq!(g.ctx.kept_count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod text_canvas_tests {
+    use super::*;
+    use effectcraft_render::{FxTarget, Image};
+
+    struct Cpu(Buf);
+    impl FxTarget for Cpu {
+        fn gpu(&mut self, _: &[FxStep]) -> bool {
+            false
+        }
+        fn cpu(&mut self, f: &mut dyn FnMut(Buf) -> Buf) {
+            self.0 = f(self.0.clone());
+        }
+        fn shift(&mut self, d: [f64; 2]) {
+            self.0.offset = [self.0.offset[0] - d[0], self.0.offset[1] - d[1]];
+        }
+    }
+
+    fn context() -> Option<crate::context::GpuContext> {
+        crate::tests::hold_gpu_lock();
+        let g = crate::context::GpuContext::headless();
+        assert!(g.is_some() || std::env::var("EFFECTCRAFT_REQUIRE_GPU").as_deref() != Ok("1"), "required GPU unavailable");
+        g
+    }
+
+    #[test]
+    fn resident_text_canvas_matches_cpu_without_transfers() {
+        let Some(g) = context() else { return };
+        let mut pixels = Image::filled(3, 2, [0.25, 0.5, 0.75, 1.0]);
+        pixels.data[1] = [-0.5, 1.5, 0.125, 0.5];
+        for scale in [1.0, 0.5] {
+            for offset in [[-2.25, 1.5], [1.25, -3.75], [0.0; 2]] {
+                let source = Buf { img: pixels.clone(), offset, scale };
+                let mut cpu = Cpu(source.clone());
+                cpu.effect_canvas([20.0, 10.0]);
+                let mut input = g.upload_image(&source.img).unwrap();
+                input.levels = Some(255.0);
+                let mut e = Enc::new(&g);
+                let before = g.transfer_stats();
+                let mut target = GpuFx::new(&mut e, input, offset, scale, Some(255.0));
+                target.effect_canvas([20.0, 10.0]);
+                let (image, actual_offset, actual_scale) = target.finish().unwrap();
+                assert_eq!(g.transfer_stats(), before, "canvas growth stays on the GPU");
+                assert_eq!(actual_offset, cpu.0.offset);
+                assert_eq!(actual_scale, cpu.0.scale);
+                assert_eq!(image.levels, Some(255.0));
+                assert_eq!(e.download(&image).unwrap(), cpu.0.img);
+            }
+        }
+    }
+
+    #[test]
+    fn resident_text_canvas_unchanged_and_hostile_bounds_do_not_transfer() {
+        let Some(g) = context() else { return };
+        let pixels = Image::filled(3, 2, [0.25, 0.5, 0.75, 1.0]);
+        let input = g.upload_image(&pixels).unwrap();
+        let mut e = Enc::new(&g);
+        let before = g.transfer_stats();
+        let mut target = GpuFx::new(&mut e, input, [0.0; 2], 1.0, None);
+        for size in [[3.0, 2.0], [1.0, 1.0], [f64::NAN, 10.0], [10.0, f64::INFINITY], [16000.0; 2]] {
+            target.effect_canvas(size);
+        }
+        let (image, offset, scale) = target.finish().unwrap();
+        assert_eq!(g.transfer_stats(), before);
+        assert_eq!(offset, [0.0; 2]);
+        assert_eq!(scale, 1.0);
+        assert_eq!((image.width, image.height), (3, 2));
+        assert_eq!(e.download(&image).unwrap(), pixels);
+    }
+
+    #[test]
+    fn resident_text_canvas_missing_kernel_requests_cpu_fallback() {
+        let Some(g) = context() else { return };
+        let input = g.upload_image(&Image::filled(3, 2, [0.25, 0.5, 0.75, 1.0])).unwrap();
+        let mut e = Enc::new(&g);
+        let out = e.scratch(3, 2);
+        e.pixels("missing-text-canvas-test-kernel", &Params::default(), &input, None, &out, None);
+        let mut target = GpuFx::new(&mut e, input, [0.0; 2], 1.0, None);
+        target.effect_canvas([20.0, 10.0]);
+        assert!(target.finish().is_none());
+    }
+
+    #[test]
+    fn resident_text_canvas_device_failure_requests_cpu_fallback() {
+        let Some(g) = context() else { return };
+        let input = g.upload_image(&Image::filled(3, 2, [0.25, 0.5, 0.75, 1.0])).unwrap();
+        let mut e = Enc::new(&g);
+        g.device_failure_notifier()("text canvas device failure test".into());
+        let mut target = GpuFx::new(&mut e, input, [0.0; 2], 1.0, None);
+        target.effect_canvas([20.0, 10.0]);
+        assert!(target.finish().is_none());
     }
 }

@@ -57,6 +57,10 @@ pub trait Accelerator: Send + Sync {
     /// [`Self::effects`], keeping the result's image on the accelerator under the returned
     /// ticket (`None` = not kept): the renderer hands the ticket back to [`Self::adopt`] once
     /// the pixels are stored unchanged in a shared buffer, or to [`Self::release`].
+    /// Optional cache ownership; backends without a cache keep their eager CPU contract.
+    fn effects_kept_owned(&self, chain: &[FxStep], buf: &Buf, levels: Option<f32>, _owner: Option<&crate::cache::GpuOwner>) -> Option<(Buf, Option<u64>)> {
+        self.effects_kept(chain, buf, levels)
+    }
     fn effects_kept(&self, chain: &[FxStep], buf: &Buf, levels: Option<f32>) -> Option<(Buf, Option<u64>)> {
         self.effects(chain, buf, levels).map(|b| (b, None))
     }
@@ -121,6 +125,11 @@ pub trait FxTarget {
     fn gpu(&mut self, steps: &[FxStep]) -> bool;
     /// Run one CPU effect: `f` maps the buffer.
     fn cpu(&mut self, f: &mut dyn FnMut(Buf) -> Buf);
+    /// Extend the text effect canvas without resampling existing pixels. Backends may
+    /// retain their resident image; the default preserves the CPU reference behavior.
+    fn effect_canvas(&mut self, size: [f64; 2]) {
+        self.cpu(&mut |buf| crate::fx::text_effect_canvas(buf, size));
+    }
     /// Move the buffer's effect coordinates: subtract `d` (buffer px) from its offset.
     fn shift(&mut self, d: [f64; 2]);
 }
