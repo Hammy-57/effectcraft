@@ -117,6 +117,20 @@ pub struct DisplayFrame {
 }
 
 impl Gpu {
+    /// Compile optional static pipelines through the same single-flight cells used by frames.
+    /// Call from a native startup worker; dynamic effect sequences compile separately.
+    pub fn warm_pipelines(&self) -> Result<(), String> {
+        self.ctx.check_health()?;
+        crate::adv3d::warm(&self.ctx)?;
+        crate::particles::warm(&self.ctx)?;
+        self.ctx.check_health()
+    }
+
+    /// Successfully constructed static pipelines (dynamic sequence specializations excluded).
+    pub fn static_pipeline_count(&self) -> u64 {
+        self.ctx.static_pipeline_count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// On a device of its own (CLI, tests, benchmarks); `None` without a usable adapter.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn headless() -> Option<Gpu> {
@@ -232,7 +246,9 @@ impl Gpu {
         }
         let mut e = Enc::new(&self.ctx);
         let img = walk::render(&mut e, r, comp, t)?;
-        e.download(&img)
+        let image = e.download(&img);
+        self.ctx.check_health().ok()?;
+        image
     }
 
     /// [`Gpu::render`] with deferred readbacks: the frame's readback is keyed by comp, time and
@@ -460,3 +476,5 @@ mod tests_fx_warp;
 mod tests_init;
 #[cfg(test)]
 mod tests_particles;
+#[cfg(test)]
+mod tests_warmup;

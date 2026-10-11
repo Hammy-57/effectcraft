@@ -48,3 +48,25 @@ The benchmark refuses missing GPUs and failed GPU viewer frames rather than sile
 CPU fallback. CPU-only layer work and unsupported individual effects inside the compositor are
 still allowed and visible in CPU spans. Use the existing CPU/GPU oracle suite to check fidelity;
 timings alone do not establish correctness or a performance improvement.
+
+### Pipeline warm-up
+
+The native UI returns its first UI invocation before starting one background
+compositor initialization worker. CPU frames remain available until its result
+is ready; a retired viewer discards a late result. The compositor still uses a
+device separate from the window's surface device. Standard pipelines are built
+by initialization; `Gpu::warm_pipelines` additionally prepares Advanced 3D and
+particle pipelines through the same guarded cells used by rendering.
+
+For paired cold-frame measurements, pass `--rt-warmup` with `--rt-profile`.
+`initializationMs` and `warmupMs` are separate from `coldMs`: this moves work
+before the measured frame, it does not eliminate compilation. The default CLI
+leaves optional pipelines cold. `staticPipelines` excludes runtime-specialized
+colour sequences. The focused warm-up test covers all registered default GPU
+effect configurations and Advanced 3D; it is a compilation/reuse check, not a
+replacement for per-effect pixel oracles.
+
+Explicit disk pipeline caching is deferred: the pinned wgpu API requires
+`unsafe` and supports Vulkan only, while this workspace forbids unsafe and the
+target Mac uses Metal. Upload staging reuse is a separate pending slice; the
+existing readback pool does not imply upload pooling.

@@ -285,6 +285,10 @@ pub struct EffectcraftApp {
     /// The GPU compositor on that device (None: no usable adapter → CPU only).
     pub(crate) gpu: Option<effectcraft_gpu::Gpu>,
     gpu_checked: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    gpu_startup_deferred: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    gpu_startup: Option<gpu_startup::Pending<effectcraft_gpu::Gpu>>,
     gpu_failures: Option<gpu_failure::GpuFailureBridge>,
     gpu_failure_applied: Option<bool>,
     /// Commands from the native menu bar.
@@ -367,6 +371,10 @@ impl EffectcraftApp {
             wgpu: None,
             gpu: None,
             gpu_checked: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            gpu_startup_deferred: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            gpu_startup: None,
             gpu_failures: None,
             gpu_failure_applied: None,
             command_inbox: None,
@@ -593,6 +601,10 @@ impl EffectcraftApp {
         }
         self.gpu_failure_applied = Some(failure.presentation_lost);
         self.gpu_checked = true;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.gpu_startup = None;
+        }
         self.frames.retire_gpu();
         self.session.accel = None;
         self.session.accel_note = Some(format!("GPU preview retired: {}", failure.reason));
@@ -628,20 +640,63 @@ impl EffectcraftApp {
     /// Set up the GPU compositor (once). Desktop frame workers use their own device so their
     /// submissions cannot race egui-wgpu's surface reconfiguration during window moves/resizes.
     /// Without an adapter that runs compute shaders, everything stays on the CPU.
-    pub(crate) fn init_gpu(&mut self, frame: &eframe::Frame) {
+    pub(crate) fn init_gpu(&mut self, frame: &eframe::Frame, ctx: &egui::Context) {
         if self.gpu_checked {
             return;
         }
-        self.gpu_checked = true;
         if self.gpu_failures.as_ref().is_some_and(|bridge| bridge.failure().is_some()) {
+            self.gpu_checked = true;
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                self.gpu_startup = None;
+            }
             return;
         }
-        let Some(rs) = frame.wgpu_render_state() else { return };
-        // Backend validation can panic on shader compilation even when device creation
-        // succeeded. Keep the document and the egui renderer, and use CPU compositing.
-        let gpu = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compositor_gpu(&rs.adapter, rs.device.clone(), rs.queue.clone())));
+        let Some(rs) = frame.wgpu_render_state() else {
+            self.gpu_checked = true;
+            return;
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let gpu = {
+            // Return the first UI update before launching shader compilation.
+            if !self.gpu_startup_deferred {
+                self.gpu_startup_deferred = true;
+                ctx.request_repaint();
+                return;
+            }
+            if let Some(pending) = &self.gpu_startup {
+                let Some(result) = pending.poll() else {
+                    return;
+                };
+                self.gpu_startup = None;
+                result
+            } else {
+                let (adapter, device, queue, wake) = (rs.adapter.clone(), rs.device.clone(), rs.queue.clone(), ctx.clone());
+                match gpu_startup::Pending::start(
+                    move || {
+                        let gpu = compositor_gpu(&adapter, device, queue)?;
+                        gpu.warm_pipelines()?;
+                        Ok(gpu)
+                    },
+                    move || wake.request_repaint(),
+                ) {
+                    Ok(pending) => {
+                        self.gpu_startup = Some(pending);
+                        return;
+                    }
+                    Err(reason) => Err(reason),
+                }
+            }
+        };
+        #[cfg(target_arch = "wasm32")]
+        let gpu = {
+            let _ = ctx;
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compositor_gpu(&rs.adapter, rs.device.clone(), rs.queue.clone())))
+                .unwrap_or_else(|_| Err("GPU compositor setup failed: backend panicked".into()))
+        };
+        self.gpu_checked = true;
         match gpu {
-            Ok(Ok(g)) => {
+            Ok(g) => {
                 if let Some(bridge) = &self.gpu_failures {
                     bridge.forward_to(g.context().device_failure_notifier());
                     if bridge.failure().is_some() {
@@ -654,14 +709,9 @@ impl EffectcraftApp {
                 self.gpu = Some(g);
                 self.wgpu = Some(rs.clone());
             }
-            Ok(Err(e)) => {
-                log::info!("GPU compositor unavailable: {e}");
-                self.session.accel_note = Some(format!("GPU compositor unavailable: {e}"));
-            }
-            Err(e) => {
-                let reason = e.downcast_ref::<String>().map(String::as_str).or_else(|| e.downcast_ref::<&str>().copied()).unwrap_or("backend panicked");
-                log::warn!("GPU compositor setup failed; using CPU compositing: {reason}");
-                self.session.accel_note = Some(format!("GPU compositor setup failed: {reason}"));
+            Err(reason) => {
+                log::info!("GPU compositor unavailable: {reason}");
+                self.session.accel_note = Some(format!("GPU compositor unavailable: {reason}"));
             }
         }
     }
@@ -1757,7 +1807,7 @@ impl eframe::App for EffectcraftApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
-        self.init_gpu(frame);
+        self.init_gpu(frame, ui.ctx());
         if !self.fonts_ready {
             ui.ctx().request_repaint();
             return;

@@ -370,7 +370,8 @@ pub struct GpuContext {
     /// Transparent read-only images by size (see [`Enc::zeros`]).
     zeros: Mutex<HashMap<(u32, u32), GpuImage>>,
     /// Advanced 3D render pipelines (built on first use).
-    pub(crate) adv3d: std::sync::OnceLock<crate::adv3d::Pipes>,
+    pub(crate) adv3d: std::sync::OnceLock<Result<crate::adv3d::Pipes, String>>,
+    pub(crate) static_pipeline_count: std::sync::atomic::AtomicU64,
     /// The adapter can run the Advanced 3D rasteriser (`adv3d::raster_unsupported`); without
     /// it Advanced 3D scenes render on the CPU.
     pub(crate) adv3d_raster: bool,
@@ -654,6 +655,7 @@ impl GpuContext {
         let max_dim = device.limits().max_texture_dimension_2d;
         let integrated = info.device_type == wgpu::DeviceType::IntegratedGpu;
         let (upload_budget, pool_budget, auxiliary_budget) = cache_budgets(UPLOAD_BUDGET, integrated);
+        let static_pipeline_count = std::sync::atomic::AtomicU64::new(pipelines.len() as u64 + 2);
         Ok(GpuContext {
             device,
             queue,
@@ -677,6 +679,7 @@ impl GpuContext {
             transfers: Default::default(),
             zeros: Default::default(),
             adv3d: std::sync::OnceLock::new(),
+            static_pipeline_count,
             adv3d_raster: adv3d_unsupported.is_none(),
             particles: Default::default(),
             particle_states: Default::default(),

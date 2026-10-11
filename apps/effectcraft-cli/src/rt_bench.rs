@@ -20,6 +20,12 @@ pub(super) fn run(s: &Session, args: &Args) -> Result<(), Failure> {
     let init_start = std::time::Instant::now();
     let gpu = effectcraft_gpu::Gpu::try_headless().map_err(Failure::Error)?;
     let initialization_ms = init_start.elapsed().as_secs_f64() * 1000.0;
+    let warmup_start = std::time::Instant::now();
+    let warmup = args.flag("--rt-warmup");
+    if warmup {
+        gpu.warm_pipelines().map_err(Failure::Error)?;
+    }
+    let warmup_ms = if warmup { warmup_start.elapsed().as_secs_f64() * 1000.0 } else { 0.0 };
     let mut project = (*s.project).clone();
     project.settings.gpu_acceleration = true;
     let cid = if args.flag("--adv3d") { adv3d_bench_comp(&mut project) } else { s.active_comp_id() }
@@ -120,7 +126,7 @@ pub(super) fn run(s: &Session, args: &Args) -> Result<(), Failure> {
         .map_err(|e| Failure::Error(e.to_string()))?;
         std::fs::write(path, bytes).map_err(|e| Failure::Error(format!("writing {path}: {e}")))?;
     }
-    let report = json!({"adapter": effectcraft_render::Accelerator::name(&gpu), "initializationMs": initialization_ms, "path": "GPU viewer + completion wait (no window presentation)", "rows": rows});
+    let report = json!({"adapter": effectcraft_render::Accelerator::name(&gpu), "initializationMs": initialization_ms, "warmup": warmup, "warmupMs": warmup_ms, "staticPipelines": gpu.static_pipeline_count(), "path": "GPU viewer + completion wait (no window presentation)", "rows": rows});
     println!("{}", serde_json::to_string(&report).map_err(|e| Failure::Error(e.to_string()))?);
     Ok(())
 }

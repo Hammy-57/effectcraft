@@ -27,8 +27,19 @@ pub(crate) struct Pipes {
     post: Post,
 }
 
-fn pipes(g: &GpuContext) -> &Pipes {
-    g.adv3d.get_or_init(|| Pipes::new(&g.device, g.adv3d_raster))
+fn pipes(g: &GpuContext) -> Result<&Pipes, String> {
+    g.adv3d
+        .get_or_init(|| {
+            let p = crate::context::init_resource(&g.device, "Advanced 3D pipelines", || Pipes::new(&g.device, g.adv3d_raster))?;
+            g.static_pipeline_count.fetch_add(p.post.kernels.len() as u64 + if p.raster.is_some() { 2 } else { 0 }, std::sync::atomic::Ordering::Relaxed);
+            Ok(p)
+        })
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
+pub(crate) fn warm(g: &GpuContext) -> Result<(), String> {
+    pipes(g).map(|_| ())
 }
 
 const COLOR: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
@@ -433,7 +444,7 @@ fn raster_into(e: &mut Enc, s: &Scene) -> Option<(wgpu::Texture, wgpu::Texture)>
     if bufs.iter().zip(expected_sizes).any(|(bytes, expected)| bytes.len() as u64 != expected) {
         return None;
     }
-    let p = pipes(g);
+    let p = pipes(g).ok()?;
     let Some((bgl, opaque, transparent)) = &p.raster else { return None };
     let dev = &g.device;
     let vb: Vec<u8> = s
@@ -753,7 +764,14 @@ fn params(u0: [u32; 4], f0: [f32; 4]) -> Vec<u8> {
 
 fn dispatch(e: &mut Enc, kernel: &str, u0: [u32; 4], f0: [f32; 4], b: Binds, groups: (u32, u32)) {
     let g = e.g;
-    let post = &pipes(g).post;
+    let pipes = match pipes(g) {
+        Ok(p) => p,
+        Err(reason) => {
+            g.device_failure_notifier()(reason);
+            return;
+        }
+    };
+    let post = &pipes.post;
     let Some((_, pipe)) = post.kernels.iter().find(|(k, _)| *k == kernel) else { return };
     let ub = g.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: &params(u0, f0), usage: wgpu::BufferUsages::UNIFORM });
     let mut entries = vec![
