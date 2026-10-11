@@ -69,12 +69,12 @@ fn unquantised_buffers_are_not_packed() {
     assert!(PackedBuf::pack(&buf(img)).is_none());
 }
 
-/// Over budget, quantised entries are packed (counted at their packed size) instead of evicted,
-/// and come back bit-identical; float entries are untouched (evicted least recently used).
+/// With reserved output headroom, quantised entries pack losslessly. External
+/// full-buffer pins remain charged even after their indexed entries are evicted.
 #[test]
 fn cache_packs_under_pressure_and_counts_packed_bytes() {
     let f32_bytes = 64 * 64 * 16;
-    let cache = LayerCache::new(4 * f32_bytes);
+    let cache = LayerCache::new(19 * f32_bytes / 4);
     let mut kept = vec![];
     for i in 0..6u64 {
         let mut img = noise(64, 64, i as u32);
@@ -85,14 +85,17 @@ fn cache_packs_under_pressure_and_counts_packed_bytes() {
     }
     let st = cache.stats();
     assert_eq!(st.entries, 6, "nothing evicted");
-    // The fifth insert went over budget: the four oldest were packed to u8.
-    assert_eq!(st.bytes, 4 * f32_bytes / 4 + 2 * f32_bytes, "packed entries count at their packed size");
+    assert!(st.bytes < 6 * f32_bytes, "packing saved storage");
+    assert_eq!(cache.retained_stats().live_bytes, st.bytes);
+    assert!(cache.retained_stats().live_bytes <= cache.budget());
+    // A hot unpack is retained when both the packed source and result fit.
+    cache.set_budget(8 * f32_bytes);
     let back = cache.get(0).unwrap_or_else(|| panic!("entry 0"));
     assert_eq!(bits(&back), kept[0]);
     // A hit unpacks the entry for good: the next hit shares the same buffer.
     let again = cache.get(0).unwrap_or_else(|| panic!("entry 0"));
     assert!(Arc::ptr_eq(&back, &again));
-    assert_eq!(cache.stats().bytes, 3 * f32_bytes / 4 + 3 * f32_bytes);
+    assert_eq!(cache.stats().bytes, st.bytes + 3 * f32_bytes / 4);
     for (i, want) in kept.iter().enumerate() {
         assert_eq!(&bits(&cache.get(i as u64).unwrap_or_else(|| panic!("entry {i}"))), want, "entry {i}");
     }
@@ -106,8 +109,12 @@ fn cache_packs_under_pressure_and_counts_packed_bytes() {
     let st = cache.stats();
     assert_eq!(st.bytes, st.entries * f32_bytes);
     assert!(st.entries < 6, "evicted, not packed");
-    let last = cache.get(5).unwrap_or_else(|| panic!("newest kept"));
-    assert!(Arc::ptr_eq(&last, &bufs[5]));
+    assert!(cache.get(5).is_none(), "externally pinned older allocations deny new retention");
+    assert_eq!(cache.retained_stats().live_bytes, 4 * f32_bytes);
+    drop(bufs);
+    let fresh = Arc::new(buf(noise(64, 64, 200)));
+    keep(&cache, 6, fresh.clone());
+    assert!(Arc::ptr_eq(&cache.get(6).unwrap(), &fresh));
 }
 
 /// The renderer's own buffers: an 8 bpc layer's cached content packs and unpacks exactly.
@@ -155,4 +162,25 @@ fn linear_blend_hits_skip_the_working_space_copy() {
     assert_eq!(a.data, b.data);
     let uncached = crate::Renderer::new(&p, &crate::NoFootage, crate::RenderOpts::default()).comp_frame(cid, Tick::ZERO);
     assert_eq!(a.data, uncached.data);
+}
+
+
+#[test]
+fn packed_output_reservation_covers_odd_sized_sixteen_bit_pixels() {
+    let image = Image::filled(4099, 1, [1.0 / 32768.0, 0.0, 0.0, 1.0]);
+    let b = buf(image);
+    let p = PackedBuf::pack(&b).unwrap();
+    assert_eq!(p.bytes(), 4099 * 8, "these pixels require the 16-bit attempt");
+    assert_eq!(p.capacity_bytes(), Some(4099 * 8), "one requested output allocation");
+    assert_eq!(bits(&p.unpack()), bits(&b));
+}
+
+#[test]
+fn late_invalid_pixel_discards_partial_packed_output() {
+    let mut image = Image::filled(4099, 1, [1.0 / 32768.0, 0.0, 0.0, 1.0]);
+    image.data.last_mut().unwrap()[0] = -0.0;
+    let b = buf(image);
+    let original = bits(&b);
+    assert!(PackedBuf::pack(&b).is_none());
+    assert_eq!(bits(&b), original);
 }

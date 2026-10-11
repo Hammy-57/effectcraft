@@ -104,8 +104,8 @@ struct Entry {
 }
 
 /// How an entry keeps its pixels. Entries go in as `f32` buffers (a hit shares the `Arc`, and
-/// the GPU compositor keeps their textures while it lives); only when the cache is over budget
-/// are the least recently used ones packed (lossless, see [`crate::packed`]) before anything
+/// the GPU compositor keeps their textures while it lives); under admission pressure
+/// the least recently used ones are packed (lossless, see [`crate::packed`]) before anything
 /// is evicted, and a hit on a packed entry unpacks it back to `f32`.
 enum Stored {
     Full(Arc<Buf>),
@@ -113,6 +113,7 @@ enum Stored {
 }
 
 struct Inner {
+    physical: crate::retained::RetainedBudget,
     map: HashMap<u64, Entry>,
     bytes: usize,
     budget: usize,
@@ -168,7 +169,8 @@ impl Doorkeeper {
     }
 }
 
-/// Hit/miss counters and memory use (for perf readouts and tests).
+/// Hit/miss counters and logical indexed bytes (aliases counted per key).
+/// See LayerCache::retained_stats for unique allocated CPU bytes, including caller pins.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CacheStats {
     pub entries: usize,
@@ -184,11 +186,13 @@ impl Default for LayerCache {
 }
 
 impl LayerCache {
-    /// A cache holding at most `budget` bytes of pixels.
+    /// A cache retaining at most `budget` CPU pixel bytes. Existing callers may
+    /// pin retired storage above a subsequently reduced budget; new admission stops.
     pub fn new(budget: usize) -> LayerCache {
         LayerCache {
             resident_lifetime: Mutex::new(Arc::new(())),
             inner: Mutex::new(Inner {
+                physical: crate::retained::RetainedBudget::new(budget, crate::retained::MAX_RECORDS),
                 map: HashMap::new(),
                 bytes: 0,
                 budget,
@@ -294,10 +298,13 @@ impl LayerCache {
             g.missed_at.insert(key, web_time::Instant::now());
         }
         // Disk cache: a hit comes back into memory.
+        let token = self.resident_token();
         let (dc, dk) = self.disk_key(key)?;
         let buf = dc.get_layer(dk)?;
         // (Stored on disk: it was worth keeping.)
-        self.insert_mem(key, buf.clone(), true);
+        if let Some(token) = token {
+            self.insert_mem(key, buf.clone(), true, &token);
+        }
         Some(buf)
     }
 
@@ -338,9 +345,7 @@ impl LayerCache {
     }
 
     fn insert_with(&self, key: u64, buf: Arc<Buf>, once: bool) {
-        if self.gated() {
-            return;
-        }
+        let Some(token) = self.resident_token() else { return };
         let (started, again) = match self.inner.lock() {
             Ok(mut g) => {
                 let g = &mut *g;
@@ -359,37 +364,50 @@ impl LayerCache {
             }
         }
         if again || !once {
-            self.insert_mem(key, buf, again);
+            self.insert_mem(key, buf, again, &token);
         }
     }
 
     /// Keep `buf` under `key`: in the cache proper when `admit`, else on probation (see the
     /// module docs).
-    fn insert_mem(&self, key: u64, buf: Arc<Buf>, admit: bool) {
-        let bytes = buf.img.data.len() * std::mem::size_of::<effectcraft_raster::Px>();
-        {
-            let Ok(mut g) = self.inner.lock() else { return };
-            if bytes > g.budget / 4 {
+    fn insert_mem(&self, key: u64, buf: Arc<Buf>, admit: bool, token: &ResidentToken) {
+        let Some(bytes) = buf.img.data.capacity().checked_mul(std::mem::size_of::<effectcraft_raster::Px>()) else { return };
+        let extra = {
+            let Ok(g) = self.inner.lock() else { return };
+            if !token.valid() || bytes > g.budget / 4 {
                 return;
             }
-            g.clock += 1;
-            g.inserts += 1;
-            let now = g.clock;
-            // An entry already admitted stays admitted.
-            let probation = !admit && g.map.get(&key).is_none_or(|e| e.probation);
-            if let Some(old) = g.map.insert(key, Entry { buf: Stored::Full(buf), bytes, last_use: now, unpackable: false, probation }) {
-                g.bytes -= old.bytes;
-                if old.probation {
-                    g.probation_bytes = g.probation_bytes.saturating_sub(old.bytes);
-                }
-            }
-            g.bytes += bytes;
-            if probation {
-                g.probation_bytes += bytes;
-                trim_probation(&mut g, Some(key));
+            if g.physical.tracks_cpu(&buf) { 0 } else { bytes }
+        };
+        self.relieve_for(extra, token);
+        let Ok(mut g) = self.inner.lock() else { return };
+        if !token.valid() || bytes > g.budget / 4 {
+            return;
+        }
+        if !g.map.contains_key(&key)
+            && g.map.len() >= crate::retained::MAX_RECORDS
+            && let Some(oldest) = g.map.iter().min_by_key(|(_, e)| e.last_use).map(|(k, _)| *k)
+        {
+            remove(&mut g, oldest);
+        }
+        if g.map.try_reserve(1).is_err() || g.physical.track_cpu(&buf).is_err() {
+            return;
+        }
+        g.clock = g.clock.saturating_add(1);
+        g.inserts = g.inserts.saturating_add(1);
+        let now = g.clock;
+        let probation = !admit && g.map.get(&key).is_none_or(|e| e.probation);
+        if let Some(old) = g.map.insert(key, Entry { buf: Stored::Full(buf), bytes, last_use: now, unpackable: false, probation }) {
+            g.bytes = g.bytes.saturating_sub(old.bytes);
+            if old.probation {
+                g.probation_bytes = g.probation_bytes.saturating_sub(old.bytes);
             }
         }
-        self.relieve();
+        g.bytes = g.bytes.saturating_add(bytes);
+        if probation {
+            g.probation_bytes = g.probation_bytes.saturating_add(bytes);
+            trim_probation(&mut g, Some(key));
+        }
     }
 
     /// Bytes of first renders kept on probation, at most (the newest is kept whatever its size,
@@ -418,73 +436,103 @@ impl LayerCache {
     /// A packed entry's pixels as `f32`: unpacked (outside the lock) and kept unpacked, as it is
     /// in use again.
     fn unpacked(&self, key: u64, p: &Arc<PackedBuf>) -> Arc<Buf> {
+        let token = self.resident_token();
         let buf = Arc::new(p.unpack());
-        let bytes = buf.img.data.len() * std::mem::size_of::<effectcraft_raster::Px>();
-        {
-            let Ok(mut g) = self.inner.lock() else { return buf };
-            let Some(e) = g.map.get_mut(&key) else { return buf };
-            match &e.buf {
-                // Another thread unpacked it first: share its buffer.
-                Stored::Full(b) => return b.clone(),
-                Stored::Packed(q) if !Arc::ptr_eq(p, q) => return buf,
-                Stored::Packed(_) => {}
-            }
-            let old = std::mem::replace(&mut e.bytes, bytes);
-            e.buf = Stored::Full(buf.clone());
-            g.bytes = g.bytes.saturating_sub(old) + bytes;
+        let Some(bytes) = buf.img.data.capacity().checked_mul(std::mem::size_of::<effectcraft_raster::Px>()) else { return buf };
+        let Ok(mut g) = self.inner.lock() else { return buf };
+        if !token.is_some_and(|t| t.valid()) {
+            return buf;
         }
-        self.relieve();
+        let Some(e) = g.map.get(&key) else { return buf };
+        match &e.buf {
+            Stored::Full(b) => return b.clone(),
+            Stored::Packed(q) if !Arc::ptr_eq(p, q) => return buf,
+            Stored::Packed(_) => {}
+        }
+        // Keep the packed source on denial; this caller still receives valid pixels.
+        if g.physical.track_cpu(&buf).is_err() {
+            return buf;
+        }
+        let Some(e) = g.map.get_mut(&key) else { return buf };
+        let old = std::mem::replace(&mut e.bytes, bytes);
+        e.buf = Stored::Full(buf.clone());
+        g.bytes = g.bytes.saturating_sub(old).saturating_add(bytes);
         buf
     }
 
-    /// Over budget: pack the least recently used `f32` entries (outside the lock), then evict
-    /// least recently used entries down to 3/4 of the budget if that wasn't enough.
-    fn relieve(&self) {
-        let picked: Vec<(u64, Arc<Buf>)> = {
-            let Ok(mut g) = self.inner.lock() else { return };
-            if g.bytes <= g.budget {
-                return;
-            }
-            let excess = g.bytes - g.budget / 4 * 3;
-            let mut by_age: Vec<(u64, u64)> =
-                g.map.iter().filter(|(_, e)| matches!(e.buf, Stored::Full(_)) && !e.unpackable && !e.probation).map(|(k, e)| (e.last_use, *k)).collect();
-            by_age.sort_unstable();
-            // Packing saves at least half (16 bpc).
-            let mut saved = 0;
-            let mut picked = vec![];
-            for (_, k) in by_age {
-                if saved >= excess {
-                    break;
+    /// Make room for an exact incoming allocation. Packing runs outside the cache
+    /// lock and requires headroom for its pending output; otherwise evict or decline.
+    /// The cache owns recency; its ledger only tracks weak physical allocations.
+    fn relieve_for(&self, extra: usize, token: &ResidentToken) {
+        loop {
+            let picked = {
+                let Ok(mut g) = self.inner.lock() else { return };
+                if !token.valid() {
+                    return;
                 }
-                if let Some(e) = g.map.get_mut(&k)
-                    && let Stored::Full(b) = &e.buf
-                {
-                    saved += e.bytes / 2;
-                    picked.push((k, b.clone()));
-                    // Not picked again by a concurrent call while this one packs it.
+                let stats = g.physical.stats();
+                if stats.live_bytes.saturating_add(stats.pending_bytes).saturating_add(extra) <= g.budget {
+                    return;
+                }
+                let candidate = g
+                    .map
+                    .iter()
+                    .filter(|(_, e)| matches!(e.buf, Stored::Full(_)) && !e.unpackable && !e.probation)
+                    .min_by_key(|(_, e)| e.last_use)
+                    .map(|(k, _)| *k);
+                let Some(k) = candidate else { break };
+                let Some(e) = g.map.get(&k) else { break };
+                let Stored::Full(b) = &e.buf else { break };
+                let Some(max_bytes) = b.img.data.len().checked_mul(8) else { break };
+                let Ok(reservation) = g.physical.reserve(max_bytes) else { break };
+                let b = b.clone();
+                if let Some(e) = g.map.get_mut(&k) {
                     e.unpackable = true;
                 }
+                (k, b, reservation)
+            };
+            let (key, full, reservation) = picked;
+            let packed = PackedBuf::pack(&full).map(Arc::new);
+            if let Some(packed) = packed {
+                self.publish_packed(key, &full, packed, reservation, token);
             }
-            picked
-        };
-        let packed: Vec<_> = picked.into_iter().map(|(k, b)| (k, PackedBuf::pack(&b), b)).collect();
+            // `full` drops before the next sweep, releasing its charge unless a caller pins it.
+        }
+        self.evict_for(extra, token);
+    }
+
+    fn evict_for(&self, extra: usize, token: &ResidentToken) {
         let Ok(mut g) = self.inner.lock() else { return };
-        for (k, p, b) in packed {
-            let Some(e) = g.map.get_mut(&k) else { continue };
-            if !matches!(&e.buf, Stored::Full(cur) if Arc::ptr_eq(cur, &b)) {
-                continue;
-            }
-            let Some(p) = p else { continue };
-            let bytes = p.bytes();
-            let old = std::mem::replace(&mut e.bytes, bytes);
-            e.buf = Stored::Packed(Arc::new(p));
-            e.unpackable = false;
-            g.bytes = g.bytes.saturating_sub(old) + bytes;
+        if !token.valid() {
+            return;
         }
-        if g.bytes > g.budget {
-            let target = g.budget / 4 * 3;
-            evict_lru(&mut g, target);
+        let target = g.budget.saturating_sub(extra);
+        evict_lru(&mut g, target);
+    }
+
+    fn publish_packed(&self, key: u64, full: &Arc<Buf>, packed: Arc<PackedBuf>, reservation: crate::retained::Reservation, token: &ResidentToken) {
+        let Ok(mut g) = self.inner.lock() else { return };
+        if !token.valid() {
+            return;
         }
+        if !g.map.get(&key).is_some_and(|e| matches!(&e.buf, Stored::Full(b) if Arc::ptr_eq(b, full))) {
+            return;
+        }
+        let Some(bytes) = packed.capacity_bytes() else { return };
+        if reservation.commit_packed(&packed).is_err() {
+            return;
+        }
+        let Some(e) = g.map.get_mut(&key) else { return };
+        let old = std::mem::replace(&mut e.bytes, bytes);
+        e.buf = Stored::Packed(packed);
+        e.unpackable = false;
+        g.bytes = g.bytes.saturating_sub(old).saturating_add(bytes);
+    }
+
+    /// Physical CPU allocation accounting, including retired caller pins and pending packing.
+    /// GPU upload/native caches are not enrolled yet.
+    pub fn retained_stats(&self) -> crate::retained::RetainedStats {
+        self.inner.lock().map(|g| g.physical.stats()).unwrap_or_default()
     }
 
     /// Capture a cache lifetime for bounded accelerator content reuse.
@@ -506,7 +554,9 @@ impl LayerCache {
     pub fn set_budget(&self, budget: usize) {
         let Ok(mut g) = self.inner.lock() else { return };
         g.budget = budget;
-        if g.bytes > budget {
+        g.physical.set_budget(budget);
+        let stats = g.physical.stats();
+        if stats.live_bytes.saturating_add(stats.pending_bytes) > budget {
             evict_lru(&mut g, budget);
         }
     }
@@ -515,6 +565,7 @@ impl LayerCache {
         *self.resident_lifetime.lock().unwrap_or_else(PoisonError::into_inner) = Arc::new(());
         if let Ok(mut g) = self.inner.lock() {
             g.map.clear();
+            g.physical.retire();
             g.bytes = 0;
             g.probation_bytes = 0;
             g.seen.clear();
@@ -687,7 +738,8 @@ fn evict_lru(g: &mut Inner, target: usize) {
     let mut by_age: Vec<(u64, u64)> = g.map.iter().map(|(k, e)| (e.last_use, *k)).collect();
     by_age.sort_unstable();
     for (_, k) in by_age {
-        if g.bytes <= target {
+        let stats = g.physical.stats();
+        if stats.live_bytes.saturating_add(stats.pending_bytes) <= target {
             break;
         }
         remove(g, k);
@@ -1436,4 +1488,146 @@ pub fn derive(key: u64, i: u64) -> u64 {
     let mut h = KeyHasher(key);
     i.hash(&mut h);
     h.finish()
+}
+
+#[cfg(test)]
+mod retained_tests {
+    use super::*;
+    fn pixels() -> Arc<Buf> {
+        Arc::new(Buf { img: effectcraft_raster::Image::new(8, 8), offset: [0.0; 2], scale: 1.0 })
+    }
+    fn keep(c: &LayerCache, key: u64, b: &Arc<Buf>) {
+        c.insert(key, b.clone());
+        c.insert(key, b.clone());
+    }
+    fn packed(c: &LayerCache, key: u64) -> bool {
+        c.inner.lock().unwrap().map.get(&key).is_some_and(|e| matches!(e.buf, Stored::Packed(_)))
+    }
+
+    #[test]
+    fn aliases_share_physical_charge_and_clear_keeps_callers_pinned() {
+        let c = LayerCache::new(8192);
+        let b = pixels();
+        keep(&c, 1, &b);
+        keep(&c, 2, &b);
+        assert_eq!(c.retained_stats().live_bytes, 1024);
+        assert_eq!(c.stats().entries, 2);
+        let hit = c.get(1).unwrap();
+        c.clear();
+        assert_eq!(c.stats().entries, 0);
+        assert_eq!(c.retained_stats().live_bytes, 1024);
+        drop(b);
+        drop(hit);
+        assert_eq!(c.retained_stats().live_bytes, 0);
+    }
+
+    #[test]
+    fn pinned_shrink_denies_admission_and_preserves_fallback() {
+        let c = LayerCache::new(8192);
+        let b = pixels();
+        keep(&c, 1, &b);
+        c.set_budget(512);
+        assert_eq!(c.retained_stats().debt_bytes, 512);
+        let fresh = pixels();
+        c.insert(2, fresh.clone());
+        assert_eq!(fresh.img.data.len(), 64);
+        assert_eq!(c.stats().entries, 0);
+        assert_eq!(c.retained_stats().live_bytes, 1024);
+        drop(b);
+        assert_eq!(c.retained_stats().live_bytes, 0);
+    }
+
+    #[test]
+    fn denied_unpack_keeps_packed_source() {
+        let c = LayerCache::new(8192);
+        let b = pixels();
+        keep(&c, 1, &b);
+        let token = c.resident_token().unwrap();
+        let reservation = c.inner.lock().unwrap().physical.reserve(512).unwrap();
+        let p = Arc::new(PackedBuf::pack(&b).unwrap());
+        c.publish_packed(1, &b, p, reservation, &token);
+        drop(b);
+        assert!(packed(&c, 1));
+        c.set_budget(1024);
+        let back = c.get(1).unwrap();
+        assert_eq!(back.img.data.len(), 64);
+        assert!(packed(&c, 1), "packed 256 + full 1024 cannot both be retained");
+        assert_eq!(c.retained_stats().live_bytes, 256);
+        let again = c.get(1).unwrap();
+        assert_eq!(again.img.data, back.img.data);
+        assert!(!Arc::ptr_eq(&back, &again));
+    }
+
+    #[test]
+    fn clear_during_packing_cannot_replace_new_entry() {
+        let c = LayerCache::new(8192);
+        let b = pixels();
+        keep(&c, 1, &b);
+        let token = c.resident_token().unwrap();
+        let reservation = c.inner.lock().unwrap().physical.reserve(512).unwrap();
+        let p = Arc::new(PackedBuf::pack(&b).unwrap());
+        c.clear();
+        let fresh = pixels();
+        keep(&c, 1, &fresh);
+        c.publish_packed(1, &b, p, reservation, &token);
+        assert!(!packed(&c, 1));
+        assert!(Arc::ptr_eq(&c.get(1).unwrap(), &fresh));
+        assert_eq!(c.retained_stats().pending_bytes, 0);
+    }
+
+    #[test]
+    fn packing_charges_both_copies_while_original_is_pinned() {
+        let c = LayerCache::new(8192);
+        let b = pixels();
+        keep(&c, 1, &b);
+        let token = c.resident_token().unwrap();
+        let reservation = c.inner.lock().unwrap().physical.reserve(512).unwrap();
+        c.publish_packed(1, &b, Arc::new(PackedBuf::pack(&b).unwrap()), reservation, &token);
+        assert_eq!(c.retained_stats().live_bytes, 1280);
+        drop(b);
+        assert_eq!(c.retained_stats().live_bytes, 256);
+    }
+    #[test]
+    fn no_packing_headroom_evicts_without_overshoot() {
+        let c = LayerCache::new(4096);
+        for key in 0..4 {
+            keep(&c, key, &pixels());
+        }
+        assert_eq!(c.retained_stats().live_bytes, 4096);
+        keep(&c, 4, &pixels());
+        assert!(c.get(0).is_none());
+        assert!(c.get(4).is_some());
+        assert_eq!(c.retained_stats().live_bytes, 4096);
+        assert_eq!(c.retained_stats().pending_bytes, 0);
+        assert!(!packed(&c, 1));
+    }
+
+    #[test]
+    fn gate_during_packing_rejects_publication_and_releases_reservation() {
+        let c = LayerCache::new(8192);
+        let b = pixels();
+        keep(&c, 1, &b);
+        let token = c.resident_token().unwrap();
+        let reservation = c.inner.lock().unwrap().physical.reserve(512).unwrap();
+        let p = Arc::new(PackedBuf::pack(&b).unwrap());
+        c.set_gate(Some(Arc::new(std::sync::atomic::AtomicBool::new(true))));
+        c.publish_packed(1, &b, p, reservation, &token);
+        assert!(!packed(&c, 1));
+        assert_eq!(c.retained_stats().pending_bytes, 0);
+        assert!(Arc::ptr_eq(&c.get(1).unwrap(), &b));
+    }
+    #[test]
+    fn stale_relief_cannot_evict_new_generation() {
+        let c = LayerCache::new(8192);
+        let old = c.resident_token().unwrap();
+        c.clear();
+        let fresh = pixels();
+        keep(&c, 1, &fresh);
+        // Simulate clear after the packing loop released its lock, before final eviction.
+        c.evict_for(8192, &old);
+        assert!(Arc::ptr_eq(&c.get(1).unwrap(), &fresh));
+        // An old producer also carries its original token into the start of relief.
+        c.relieve_for(8192, &old);
+        assert!(Arc::ptr_eq(&c.get(1).unwrap(), &fresh));
+    }
 }

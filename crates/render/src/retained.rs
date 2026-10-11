@@ -1,12 +1,15 @@
-//! Foundation for retained-content accounting; not yet wired into LayerCache.
+//! Retained CPU allocation accounting used by LayerCache.
 //!
 //! CPU buffers keep their existing Arc API. Weak records continue charging evicted
 //! allocations held by callers, until a bounded sweep observes their last drop.
-//! This does not account for uncached caller allocations or GPU storage yet.
+//! LayerCache keeps sole strong ownership; its weak-only tracking uses cache
+//! recency, not the standalone ownership helpers below. Uncached caller allocations
+//! and GPU storage are not enrolled yet.
 //! Only concrete CPU Buf records are supported: retiring them drops CPU vectors
 //! under the mutex. Before adding GPU or callback-bearing payloads, move resource
 //! destruction outside this mutex; no backend work or callbacks belong here.
 use effectcraft_effects::Buf;
+use crate::packed::PackedBuf;
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 /// Hard ceiling bounds weak metadata and every sweep, even for hostile preferences.
@@ -34,12 +37,26 @@ pub struct RetainedStats {
     pub pending_bytes: usize,
     pub records: usize,
     pub pending_records: usize,
+    /// Records directly owned by this ledger; LayerCache-owned weak records are
+    /// included in `records` instead.
     pub retained_records: usize,
     pub debt_bytes: usize,
 }
 
+enum CpuWeak {
+    Full(Weak<Buf>),
+    Packed(Weak<PackedBuf>),
+}
+impl CpuWeak {
+    fn alive(&self) -> bool {
+        match self { Self::Full(b) => b.strong_count() > 0, Self::Packed(b) => b.strong_count() > 0 }
+    }
+    fn is_full(&self, buf: &Arc<Buf>) -> bool {
+        matches!(self, Self::Full(b) if b.ptr_eq(&Arc::downgrade(buf)))
+    }
+}
 struct CpuRecord {
-    weak: Weak<Buf>,
+    weak: CpuWeak,
     retained: Option<Arc<Buf>>,
     bytes: usize,
 }
@@ -54,7 +71,7 @@ struct State {
 }
 impl State {
     fn sweep(&mut self) {
-        self.records.retain(|r| r.weak.strong_count() > 0);
+        self.records.retain(|r| r.weak.alive());
         self.bytes = self.records.iter().fold(0usize, |sum, r| sum.saturating_add(r.bytes));
     }
     fn fits(&self, bytes: usize, count: usize) -> bool {
@@ -70,15 +87,15 @@ impl State {
         }
     }
 
-    fn retain_cpu(&mut self, buf: &Arc<Buf>, bytes: usize) -> Result<(), AdmissionError> {
+    fn retain_cpu(&mut self, buf: &Arc<Buf>, bytes: usize, own: bool) -> Result<(), AdmissionError> {
         if bytes > self.budget || self.cap == 0 { return Err(AdmissionError::Capacity); }
         self.sweep();
-        if let Some(i) = self.records.iter().position(|r| r.weak.ptr_eq(&Arc::downgrade(buf))) {
+        if let Some(i) = self.records.iter().position(|r| r.weak.is_full(buf)) {
             if !self.fits(0, 0) {
                 return Err(AdmissionError::Capacity);
             }
             let mut r = self.records.remove(i);
-            r.retained = Some(buf.clone());
+            if own { r.retained = Some(buf.clone()); }
             self.records.push(r);
             return Ok(());
         }
@@ -88,7 +105,7 @@ impl State {
         }
         self.records.try_reserve_exact(1).map_err(|_| AdmissionError::Allocation)?;
         self.bytes = self.bytes.checked_add(bytes).ok_or(AdmissionError::Overflow)?;
-        self.records.push(CpuRecord { weak: Arc::downgrade(buf), retained: Some(buf.clone()), bytes });
+        self.records.push(CpuRecord { weak: CpuWeak::Full(Arc::downgrade(buf)), retained: own.then(|| buf.clone()), bytes });
         Ok(())
     }
 
@@ -137,7 +154,17 @@ impl RetainedBudget {
     pub fn retain_cpu(&self, buf: &Arc<Buf>) -> Result<(), AdmissionError> {
         let bytes = cpu_bytes(buf)?;
         let mut s = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        s.retain_cpu(buf, bytes)
+        s.retain_cpu(buf, bytes, true)
+    }
+
+    /// Account for a LayerCache-owned allocation without a second strong owner.
+    pub(crate) fn track_cpu(&self, buf: &Arc<Buf>) -> Result<(), AdmissionError> {
+        let bytes = cpu_bytes(buf)?;
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).retain_cpu(buf, bytes, false)
+    }
+
+    pub(crate) fn tracks_cpu(&self, buf: &Arc<Buf>) -> bool {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).records.iter().any(|r| r.weak.is_full(buf))
     }
 
     /// Shrink immediately retires least-recently retained owners; callers may pin debt.
@@ -194,8 +221,26 @@ impl Reservation {
         if !Arc::ptr_eq(&self.epoch, &s.epoch) {
             return Err(AdmissionError::Retired);
         }
-        s.retain_cpu(buf, bytes)
+        s.retain_cpu(buf, bytes, true)
     }
+    /// Publish a reserved packed allocation; LayerCache keeps the sole strong owner.
+    pub(crate) fn commit_packed(mut self, buf: &Arc<PackedBuf>) -> Result<(), AdmissionError> {
+        let bytes = buf.capacity_bytes().ok_or(AdmissionError::Overflow)?;
+        if bytes > self.bytes { return Err(AdmissionError::TooSmall); }
+        let mut s = self.owner.0.lock().unwrap_or_else(PoisonError::into_inner);
+        s.pending_bytes = s.pending_bytes.saturating_sub(self.bytes);
+        s.pending_records = s.pending_records.saturating_sub(1);
+        self.active = false;
+        if !Arc::ptr_eq(&self.epoch, &s.epoch) { return Err(AdmissionError::Retired); }
+        s.sweep();
+        if s.records.iter().any(|r| matches!(&r.weak, CpuWeak::Packed(p) if p.ptr_eq(&Arc::downgrade(buf)))) { return Ok(()); }
+        if !s.fits(bytes, 1) { return Err(AdmissionError::Capacity); }
+        s.records.try_reserve_exact(1).map_err(|_| AdmissionError::Allocation)?;
+        s.bytes = s.bytes.checked_add(bytes).ok_or(AdmissionError::Overflow)?;
+        s.records.push(CpuRecord { weak: CpuWeak::Packed(Arc::downgrade(buf)), retained: None, bytes });
+        Ok(())
+    }
+
 }
 impl Drop for Reservation {
     fn drop(&mut self) {

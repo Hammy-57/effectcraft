@@ -45,14 +45,21 @@ fn level(v: f32, levels: f32, inv: f32) -> Option<u32> {
     ((k as f32 * inv).to_bits() == v.to_bits()).then_some(k)
 }
 
-fn pack_with<T: Send>(data: &[Px], levels: f32, conv: impl Fn(u32) -> T + Sync + Send) -> Option<Vec<[T; 4]>> {
+// One pixel allocation per attempt: collecting Option<Vec<_>> in parallel can
+// retain per-worker chunks while allocating a second final vector. That peak would
+// exceed the cache's pending packed-output reservation. Task/allocator overhead is
+// not pixel storage; final actual vector capacity is checked again on publication.
+fn pack_with<T: Copy + Default + Send>(data: &[Px], levels: f32, conv: impl Fn(u32) -> T + Sync + Send) -> Option<Vec<[T; 4]>> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(data.len()).ok()?;
+    out.resize(data.len(), [T::default(); 4]);
     let inv = 1.0 / levels;
-    data.par_iter()
-        .map(|p| {
-            let k = [level(p[0], levels, inv)?, level(p[1], levels, inv)?, level(p[2], levels, inv)?, level(p[3], levels, inv)?];
-            Some(k.map(&conv))
-        })
-        .collect()
+    out.par_iter_mut().zip(data.par_iter()).try_for_each(|(dst, p)| {
+        let k = [level(p[0], levels, inv)?, level(p[1], levels, inv)?, level(p[2], levels, inv)?, level(p[3], levels, inv)?];
+        *dst = k.map(&conv);
+        Some(())
+    })?;
+    Some(out)
 }
 
 impl PackedBuf {
@@ -79,7 +86,16 @@ impl PackedBuf {
         Buf { img: Image { width: self.width, height: self.height, data }, offset: self.offset, scale: self.scale }
     }
 
+    /// Allocated pixel bytes, including spare vector capacity.
+    pub(crate) fn capacity_bytes(&self) -> Option<usize> {
+        match &self.data {
+            Packed::U8(d) => d.capacity().checked_mul(4),
+            Packed::U16(d) => d.capacity().checked_mul(8),
+        }
+    }
+
     /// Bytes of pixel storage.
+    #[cfg(test)]
     pub(crate) fn bytes(&self) -> usize {
         match &self.data {
             Packed::U8(d) => d.len() * 4,
