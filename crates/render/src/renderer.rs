@@ -414,6 +414,8 @@ impl<'a> Renderer<'a> {
 
     /// Draw `visible` (bottom to top) into `canvas`.
     fn draw_layers(&self, ctx: &EvalCtx<'a>, visible: &[&'a Layer], canvas: &mut Image, mut blank: bool) {
+        // The layers' content on every core first (`prepass`); the walk then finds it cached.
+        self.prefetch_cpu(ctx, visible, (canvas.width, canvas.height));
         // Bottom-to-top, with runs of consecutive 3D layers depth-sorted (farthest first).
         let mut i = 0;
         while i < visible.len() {

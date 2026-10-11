@@ -552,3 +552,49 @@ fn character_blur_by_planes_equals_the_image_blur() {
         }
     }
 }
+
+/// Text drawn in parallel (patches rasterised on every core in batches, blitted over bands of
+/// rows) is bit-identical to the serial draw: overlapping glyphs (negative tracking) with
+/// strokes, under Normal (opaque fills joined into runs) and an order-dependent inter-character
+/// mode, with part-opaque and blurred characters, in one batch and in many small ones.
+#[test]
+fn parallel_glyph_drawing_matches_serial() {
+    let (mut p, cid, comp) = setup(900, 300);
+    let mut d = doc("Waves AVA fflt\nOverlap 0123", 90.0);
+    d.tracking = -160.0;
+    d.apply_stroke = true;
+    d.stroke_width = 5.0;
+    d.stroke = [0.1, 0.2, 0.9, 1.0];
+    d.fill = [0.9, 0.5, 0.1, 1.0];
+    let l = text_layer(&mut p, &comp, d);
+    p.comp_mut(cid).unwrap().layers.push(l);
+    let c = ctx(&p, cid, 0.0);
+    let l = &p.comp(cid).unwrap().layers[0];
+    let bits = |i: &Image| i.data.iter().flat_map(|px| px.map(f32::to_bits)).collect::<Vec<_>>();
+    for case in 0..3 {
+        let mut geom = text_geom(&c, l).unwrap();
+        match case {
+            1 => geom.blend = BlendMode::Multiply,
+            2 => {
+                geom.blend = BlendMode::Add;
+                for (i, g) in geom.glyphs.iter_mut().enumerate() {
+                    g.xf.opacity = if i % 2 == 0 { 60.0 } else { 100.0 };
+                    g.xf.blur = if i % 3 == 0 { [3.0, 1.0] } else { [0.0; 2] };
+                }
+            }
+            _ => {}
+        }
+        let s = 1.5;
+        let base = Mat3::translate(vec2(30.0, 160.0)) * Mat3::scale(vec2(s, s));
+        let draw = |par: Par| {
+            let mut img = Image::new(1500, 420);
+            draw_glyphs_with(&geom, &mut img, &base, s, None, par);
+            img
+        };
+        let serial = draw(Par::Serial);
+        assert!(serial.data.iter().filter(|px| px[3] > 0.5).count() > 10_000, "case {case}: the text shows");
+        for par in [Par::Auto, Par::Batches(1 << 30), Par::Batches(4000)] {
+            assert!(bits(&draw(par)) == bits(&serial), "case {case} {par:?}");
+        }
+    }
+}
