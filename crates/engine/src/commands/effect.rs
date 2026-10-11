@@ -399,7 +399,8 @@ fn reset(s: &mut Session, p: &Value) -> Result<Value> {
     s.edit(&format!("Reset {name}"), None, |proj, _| {
         let g = layer_mut(proj, cid, lid)?.props.find_group_mut(uid).ok_or_else(|| bad("effect.reset", "gone"))?;
         for ps in &spec.params {
-            if let Some(pr) = g.get_mut(ps.id) {
+            // (`group/param` ids live in twirl-down groups.)
+            if let Some(pr) = g.prop_mut(ps.id) {
                 pr.set_value_at(lt, effectcraft_effects::default_value(ps, size));
             }
         }
@@ -440,10 +441,20 @@ fn list(_: &mut Session, p: &Value) -> Result<Value> {
 /// An effect parameter for `effect.list`: id, name, default, plus the valid `range` of a slider
 /// (values outside are clamped) and the `options` of a popup (set by 0-based index or name).
 fn param_json(p: &effectcraft_effects::ParamSpec) -> Value {
-    let mut o = json!({"id": p.id, "name": p.name, "default": p.default.to_json()});
+    let mut o = json!({"id": p.id, "name": p.name, "type": p.default.kind_name(), "default": p.default.to_json()});
     match &p.ui {
-        effectcraft_project::ParamUi::Slider { min, max, .. } => o["range"] = json!([min, max]),
-        effectcraft_project::ParamUi::Popup { options } => o["options"] = json!(options),
+        effectcraft_project::ParamUi::Slider { min, max, slider_min, slider_max, decimals } => {
+            o["range"] = json!([min, max]);
+            o["min"] = json!(min);
+            o["max"] = json!(max);
+            o["sliderMin"] = json!(slider_min);
+            o["sliderMax"] = json!(slider_max);
+            o["decimals"] = json!(decimals);
+        }
+        effectcraft_project::ParamUi::Popup { options } => {
+            // Engine/MCP popup values are zero-based; JSX exposes one-based values.
+            o["options"] = json!(options.iter().enumerate().map(|(value, label)| json!({"value": value, "label": label})).collect::<Vec<_>>());
+        }
         _ => {}
     }
     o
@@ -508,7 +519,7 @@ pub fn specs() -> Vec<CommandSpec> {
         crate::query!(
             "effect.list",
             "List Effects",
-            "{filter?, brief?: bool (only id + name)} → [{id, name, category, gpu, float, params: [{id, name, default, range?: [min, max], options?: [popup names]}]}]",
+            "{filter?, brief?: bool (only id + name)} → [{id, name, category, gpu, float, params: [{id, name, type, default, range?: [min, max], min?, max?, sliderMin?, sliderMax?, decimals?, options?: [{value, label}]}]}]; popup indices are zero-based (JSX uses one-based values)",
             list
         ),
         crate::query!(
@@ -533,4 +544,37 @@ pub fn specs() -> Vec<CommandSpec> {
             plugins_load
         ),
     ]
+}
+
+#[cfg(test)]
+mod list_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn effect_list_exposes_popup_labels_and_numeric_slider_limits() {
+        let mut s = Session::default();
+        let menus = s.execute("effect.list", json!({"filter": "ec.control.dropdown"})).unwrap();
+        assert_eq!(menus.as_array().map(Vec::len), Some(1));
+        let menu = &menus[0]["params"][0];
+        assert_eq!(menu["type"], "enum");
+        assert_eq!(menu["default"], 0);
+        assert_eq!(
+            menu["options"],
+            json!([
+                {"value": 0, "label": "Item 1"},
+                {"value": 1, "label": "Item 2"},
+                {"value": 2, "label": "Item 3"}
+            ])
+        );
+        let sliders = s.execute("effect.list", json!({"filter": "ec.control.slider"})).unwrap();
+        assert_eq!(sliders.as_array().map(Vec::len), Some(1));
+        let slider = &sliders[0]["params"][0];
+        assert_eq!(slider["type"], "scalar");
+        assert_eq!(slider["min"], -1_000_000.0);
+        assert_eq!(slider["max"], 1_000_000.0);
+        assert_eq!(slider["sliderMin"], 0.0);
+        assert_eq!(slider["sliderMax"], 100.0);
+        assert_eq!(slider["decimals"], 2);
+        assert!(slider["options"].is_null());
+    }
 }

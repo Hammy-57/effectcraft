@@ -17,8 +17,14 @@ fn every_test_file_is_a_module() {
     assert!(missing.is_empty(), "not compiled: declare each in tests/export/main.rs (`#[path = \"../x.rs\"] mod x;`): {missing:?}");
 }
 
+#[path = "../audio_sample_positions.rs"]
+mod audio_sample_positions;
 #[path = "../hevc_av1_roundtrip.rs"]
 mod hevc_av1_roundtrip;
+#[path = "../mov_audio_sample_positions.rs"]
+mod mov_audio_sample_positions;
+#[path = "../native_audio_sample_positions.rs"]
+mod native_audio_sample_positions;
 #[path = "../opus_roundtrip.rs"]
 mod opus_roundtrip;
 #[path = "../output_modules.rs"]

@@ -5,7 +5,6 @@ use std::sync::{Arc, Mutex, Weak};
 
 use effectcraft_effects::Buf;
 use effectcraft_raster::Image;
-use wgpu::util::DeviceExt;
 
 /// Compute entry points in `kernels.wgsl` (one pipeline each).
 const ENTRIES: &[&str] = &[
@@ -18,21 +17,17 @@ const ENTRIES: &[&str] = &[
     "quantize",
     "convert",
     "half",
-    "box_h",
-    "box_v",
-    "directional",
-    "glow_bright",
-    "glow_combine",
-    "glow_ab",
-    "shadow_make",
-    "shadow_combine",
-    "pointwise",
     "adjust_mix",
     "bokeh_boost",
     "bokeh_prefix",
     "bokeh_gather",
     "fill",
 ];
+
+/// Effect entry points in `kernels.wgsl`. Like the `fx_*` kernels, one that fails to build
+/// (a driver's shader compiler rejecting it, #613) leaves its effects to the CPU instead of
+/// turning the whole compositor off.
+const EFFECT_ENTRIES: &[&str] = &["box_h", "box_v", "directional", "glow_bright", "glow_combine", "glow_ab", "shadow_make", "shadow_combine", "pointwise"];
 
 /// Entry points that also bind group 1 (four read-only storage buffers; see
 /// [`Enc::dispatch_ext`]).
@@ -324,6 +319,8 @@ pub struct GpuContext {
     bgl: wgpu::BindGroupLayout,
     bgl_ext: wgpu::BindGroupLayout,
     pipelines: HashMap<&'static str, wgpu::ComputePipeline>,
+    /// Effect kernels that failed to build, and why (their effects render on the CPU).
+    unavailable: Vec<(&'static str, String)>,
     display_bgl: wgpu::BindGroupLayout,
     display: wgpu::ComputePipeline,
     /// The display texture's next mip level from the one above (`display.wgsl` `mip`).
@@ -410,7 +407,34 @@ fn init_resource<T>(_device: &wgpu::Device, _label: &str, create: impl FnOnce() 
     Ok(create())
 }
 
+/// A buffer holding `contents` (padded to 4 bytes), written through the queue. Unlike
+/// `DeviceExt::create_buffer_init`, which maps the buffer at creation and panics when the
+/// allocation failed (a driver reports it as an internal error, not out-of-memory: Adreno's
+/// `ERROR_INITIALIZATION_FAILED`, #591), a failed allocation only yields an invalid buffer and
+/// an error for the caller's error scope.
+pub(crate) fn buffer_init(device: &wgpu::Device, queue: &wgpu::Queue, label: Option<&str>, contents: &[u8], usage: wgpu::BufferUsages) -> wgpu::Buffer {
+    let align = wgpu::COPY_BUFFER_ALIGNMENT as usize;
+    let padded = contents.len().div_ceil(align).saturating_mul(align);
+    let buffer =
+        device.create_buffer(&wgpu::BufferDescriptor { label, size: padded as u64, usage: usage | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+    if padded > 0 {
+        if padded == contents.len() {
+            queue.write_buffer(&buffer, 0, contents);
+        } else {
+            let mut data = contents.to_vec();
+            data.resize(padded, 0);
+            queue.write_buffer(&buffer, 0, &data);
+        }
+    }
+    buffer
+}
+
 impl GpuContext {
+    /// [`buffer_init`] on this context's device.
+    pub(crate) fn buffer_init(&self, label: Option<&str>, contents: &[u8], usage: wgpu::BufferUsages) -> wgpu::Buffer {
+        buffer_init(&self.device, &self.queue, label, contents, usage)
+    }
+
     /// Build on an existing device (the desktop app shares egui-wgpu's). `Err` when the
     /// adapter cannot run the compositor (no compute shaders, e.g. WebGL2; no float storage
     /// textures) or the device was created with limits below what its pipelines bind.
@@ -534,7 +558,29 @@ impl GpuContext {
                 immediate_size: 0,
             })
         })?;
-        let pipelines = ENTRIES
+        let build = |e: &'static str, layout: &wgpu::PipelineLayout| {
+            init_resource(&device, e, || {
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(e),
+                    layout: Some(layout),
+                    module: &module,
+                    entry_point: Some(e),
+                    compilation_options: Default::default(),
+                    cache: None,
+                })
+            })
+        };
+        // The compositor's own kernels are required; an effect kernel that doesn't build is
+        // left out, and its effects render on the CPU (see `Enc::take_missing`).
+        let mut pipelines = ENTRIES
+            .iter()
+            .chain(crate::adv3d::SKY_KERNELS)
+            .map(|e| (e, &layout))
+            .chain(EXT_ENTRIES.iter().map(|e| (e, &layout_ext)))
+            .map(|(e, layout)| Ok((*e, build(e, layout)?)))
+            .collect::<Result<HashMap<_, _>, String>>()?;
+        let mut unavailable = vec![];
+        for e in EFFECT_ENTRIES
             .iter()
             .chain(crate::fx_color::KERNELS)
             .chain(crate::fx_distort::KERNELS)
@@ -556,23 +602,17 @@ impl GpuContext {
             .chain(crate::fx_time::KERNELS)
             .chain(crate::fx_pixel2::KERNELS)
             .chain(crate::fx_gen2::KERNELS)
-            .chain(crate::adv3d::SKY_KERNELS)
-            .map(|e| (e, &layout))
-            .chain(EXT_ENTRIES.iter().map(|e| (e, &layout_ext)))
-            .map(|(e, layout)| {
-                let p = init_resource(&device, e, || {
-                    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                        label: Some(e),
-                        layout: Some(layout),
-                        module: &module,
-                        entry_point: Some(e),
-                        compilation_options: Default::default(),
-                        cache: None,
-                    })
-                })?;
-                Ok((*e, p))
-            })
-            .collect::<Result<HashMap<_, _>, String>>()?;
+        {
+            match build(e, &layout) {
+                Ok(p) => {
+                    pipelines.insert(*e, p);
+                }
+                Err(why) => {
+                    log::warn!("gpu {name}: kernel {e} unavailable, its effects render on the CPU: {why}");
+                    unavailable.push((*e, why));
+                }
+            }
+        }
         let dmodule = init_resource(&device, "display shader module", || {
             device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("effectcraft display"),
@@ -618,9 +658,8 @@ impl GpuContext {
                 view_formats: &[],
             })
         })?;
-        let dummy_buf = init_resource(&device, "dummy storage buffer", || {
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("dummy"), contents: &[0u8; 16], usage: wgpu::BufferUsages::STORAGE })
-        })?;
+        let dummy_buf =
+            init_resource(&device, "dummy storage buffer", || buffer_init(&device, &queue, Some("dummy"), &[0u8; 16], wgpu::BufferUsages::STORAGE))?;
         let dummy_tex = init_resource(&device, "dummy texture view", || dummy.create_view(&Default::default()))?;
         let dummy = GpuImage { texture: dummy, width: 1, height: 1, view: dummy_tex, _lease: None, levels: None };
         let align = u64::from(device.limits().min_uniform_buffer_offset_alignment.max(1));
@@ -636,6 +675,7 @@ impl GpuContext {
             bgl,
             bgl_ext,
             pipelines,
+            unavailable,
             display_bgl,
             display,
             display_mip,
@@ -858,6 +898,18 @@ impl GpuContext {
 
     /// Readbacks (GPU → CPU) are possible: waited for natively, or deferred (a browser
     /// worker, [`crate::deferred`]). Impossible on the browser's main thread.
+    /// Effect kernels the device couldn't build, with why: their effects render on the CPU.
+    pub fn unavailable_kernels(&self) -> &[(&'static str, String)] {
+        &self.unavailable
+    }
+
+    /// Leave kernel `entry` out, as if it had failed to build (tests of the CPU fallback).
+    #[cfg(test)]
+    pub(crate) fn drop_kernel(&mut self, entry: &'static str) {
+        self.pipelines.remove(entry);
+        self.unavailable.push((entry, "dropped by a test".into()));
+    }
+
     pub fn can_readback(&self) -> bool {
         self.readbacks.check().is_ok() && (self.can_wait() || self.deferred.is_some())
     }
@@ -1026,6 +1078,8 @@ pub(crate) struct Enc<'g> {
     submitted: Option<wgpu::SubmissionIndex>,
     /// This encoder's uniform ring (see [`Enc::dispatch_ext`]).
     ring: Option<wgpu::Buffer>,
+    /// A dispatch named a kernel the device doesn't have (see [`Enc::take_missing`]).
+    missing: bool,
 }
 
 impl Drop for Enc<'_> {
@@ -1047,7 +1101,13 @@ impl Drop for Enc<'_> {
 
 impl<'g> Enc<'g> {
     pub fn new(g: &'g GpuContext) -> Enc<'g> {
-        Enc { g, enc: None, pending: 0, submitted: None, ring: None }
+        Enc { g, enc: None, pending: 0, submitted: None, ring: None, missing: false }
+    }
+
+    /// Whether a dispatch since the last call named a kernel the device doesn't have (one
+    /// that failed to build): its output is wrong, and the effect must render on the CPU.
+    pub(crate) fn take_missing(&mut self) -> bool {
+        std::mem::take(&mut self.missing)
     }
 
     pub(crate) fn encoder(&mut self) -> &mut wgpu::CommandEncoder {
@@ -1139,7 +1199,10 @@ impl<'g> Enc<'g> {
     ) {
         let g = self.g;
         let Some(pipe) = g.pipelines.get(entry) else {
-            log::error!("gpu: no kernel {entry}");
+            if !g.unavailable.iter().any(|(e, _)| *e == entry) {
+                log::error!("gpu: no kernel {entry}");
+            }
+            self.missing = true;
             return;
         };
         // Each dispatch until the next submit gets its own block of the encoder's uniform ring.
@@ -1434,7 +1497,7 @@ impl<'g> Enc<'g> {
         while bytes.len() < 16 || !bytes.len().is_multiple_of(4) {
             bytes.push(0);
         }
-        self.g.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("data"), contents: &bytes, usage: wgpu::BufferUsages::STORAGE })
+        self.g.buffer_init(Some("data"), &bytes, wgpu::BufferUsages::STORAGE)
     }
 
     /// Convert to the viewer's premultiplied RGBA8 texture (egui-wgpu's native texture format),

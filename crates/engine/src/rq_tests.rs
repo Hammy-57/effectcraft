@@ -165,3 +165,43 @@ fn without_exporter() {
     assert_eq!(f["formats"].as_array().unwrap().len(), 12);
     assert_eq!(f["formats"][0]["available"], false);
 }
+
+#[test]
+fn queue_add_accepts_render_settings_templates_without_output_module_namesakes() {
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name":"C","width":64,"height":64,"duration":1})).unwrap();
+    let all = s.execute("renderQueue.templates", json!({})).unwrap();
+    let names = all["renderSettings"].as_array().unwrap();
+    assert!(!names.is_empty());
+    for row in names {
+        let name = row["name"].as_str().unwrap();
+        let expected = s.project.render_templates.render_settings(name).unwrap();
+        s.execute("renderQueue.add", json!({"comp":"C","template":name})).unwrap();
+        assert_eq!(s.project.render_queue.last().unwrap().settings, expected);
+    }
+    let count = s.project.render_queue.len();
+    assert!(s.execute("renderQueue.add", json!({"comp":"C","template":"Unknown Settings"})).is_err());
+    assert_eq!(s.project.render_queue.len(), count);
+}
+
+#[test]
+fn locked_resize_uses_height_for_height_only_output_module_updates() {
+    for change in [json!({"resizeHeight": 32}), json!({"resize": {"height": 32, "lockAspect": true}})] {
+        let mut s = Session::default();
+        s.execute("comp.new", json!({"name":"Square","width":64,"height":64,"frameRate":10,"duration":1})).unwrap();
+        s.execute("renderQueue.add", json!({})).unwrap();
+        s.execute("renderQueue.setOutputModule", json!({"resize": {"width": 64, "lockAspect": true}})).unwrap();
+        s.execute("renderQueue.setOutputModule", change).unwrap();
+        let item = &s.project.render_queue[0];
+        let comp = s.project.comp(item.comp).unwrap();
+        assert_eq!(item.output.output_size(comp, &item.settings), (32, 32));
+        assert_eq!(item.output.resize.height, 32);
+    }
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name":"Square","width":64,"height":64,"duration":1})).unwrap();
+    s.execute("renderQueue.add", json!({})).unwrap();
+    s.execute("renderQueue.setOutputModule", json!({"resize": {"width": 32, "height": 54, "lockAspect": true}})).unwrap();
+    let item = &s.project.render_queue[0];
+    let comp = s.project.comp(item.comp).unwrap();
+    assert_eq!(item.output.output_size(comp, &item.settings), (32, 32), "explicit width retains precedence");
+}

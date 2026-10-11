@@ -183,7 +183,7 @@ fn output_menu(it: &RenderQueueItem, available: &[OutputFormat], templates: &Ren
             }
             v.push(("-".into(), Value::Null));
             for kbps in [24u32, 32, 64, 96, 128, 192, 256] {
-                v.push((mark(o.opus_bitrate_kbps == kbps, &format!("Opus Bitrate: {kbps} kbps")), json!({"audioBitrate": kbps})));
+                v.push((mark(o.opus_bitrate_kbps == kbps, &tr_args("Opus Bitrate: {} kbps", &[&kbps])), json!({"audioBitrate": kbps})));
             }
             for (a, k) in [(OpusApplication::Audio, "audio"), (OpusApplication::Voip, "voice")] {
                 v.push((mark(o.opus_application == a, &tr_args("Opus Tuning: {}", &[&(a.label())])), json!({"opusApplication": k})));

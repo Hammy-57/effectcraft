@@ -283,6 +283,42 @@ impl<'a> Renderer<'a> {
         target.shift(d);
     }
 
+    /// [`Renderer::run_effects_on`] for a (non-adjustment) layer's own pixels: `target` holds
+    /// them in effect space (as [`Renderer::layer_input`] hands them out) and the result stays
+    /// there. Returns the effect-space origin in layer coordinates (rebase by its negation).
+    pub fn run_layer_effects_on(&self, ctx: &EvalCtx, layer: &Layer, target: &mut dyn FxTarget) -> [f64; 2] {
+        let origin = fx_origin(ctx, layer, false);
+        self.run_effect_stack(ctx, layer, false, usize::MAX, None, origin, target);
+        origin
+    }
+
+    /// A precomp layer's nested comp for an accelerator to render resident (no CPU render and
+    /// upload of the nested frame): the renderer one level down, the comp, its time and the
+    /// buffer scale, exactly as [`Renderer::source`]'s comp branch would render it. `None`
+    /// when that branch does more (composition proxy, Essential Properties overrides, frame
+    /// blending, recursion, motion-blur sub-frames) or draws nothing (outside the nested comp's
+    /// span): use the CPU path.
+    pub fn precomp_source(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(Renderer<'a>, ItemId, Tick, f64)> {
+        let effectcraft_project::LayerSource::Comp { item } = layer.source else { return None };
+        if layer.switches.adjustment || self.project.comp_contains(item, ctx.comp_id) {
+            return None;
+        }
+        let nc = self.project.comp(item)?;
+        let lt = ctx.nested_time(layer);
+        if self.content_times(ctx, layer).is_some() {
+            return None;
+        }
+        if !nc.covers(lt)
+            || self.proxy_for(item).is_some()
+            || !crate::essential_overrides(ctx, layer).is_empty()
+            || crate::footage::frame_blend_mode(ctx, layer) != effectcraft_project::FrameBlend::Off
+        {
+            return None;
+        }
+        let (sub, bs) = self.precomp_renderer(layer, item);
+        Some((sub, item, lt, bs))
+    }
+
     /// An adjustment layer's footprint (its source with masks applied, layer space): where
     /// its effects show. `None` = the layer changes nothing.
     pub fn adjustment_footprint(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Arc<Buf>> {

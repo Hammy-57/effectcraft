@@ -161,8 +161,11 @@ pub fn probe_bytes(path: &str, bytes: Arc<[u8]>) -> Result<Footage> {
         return probe_model(path, &bytes, &|_| None);
     }
     if let Ok(fmt) = image::guess_format(&bytes) {
-        if fmt == image::ImageFormat::Gif {
-            return crate::gif::probe(path, &bytes);
+        // An animated GIF is a movie; one with a single frame is a still.
+        if fmt == image::ImageFormat::Gif
+            && let Some(f) = crate::gif_anim::probe(path, &bytes)
+        {
+            return Ok(f);
         }
         return probe_still_bytes(path, &bytes, fmt);
     }
@@ -251,6 +254,11 @@ pub(crate) fn still_footage(path: &str, w: u32, h: u32, fmt: image::ImageFormat,
 
 fn probe_still_bytes(path: &str, bytes: &[u8], fmt: image::ImageFormat) -> Result<Footage> {
     use image::ImageDecoder;
+    if fmt == image::ImageFormat::OpenExr
+        && let Some(why) = crate::exr_channels::unsupported_compression(bytes)
+    {
+        return Err(MediaError::Decode(format!("{path}: {why}")));
+    }
     let reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), fmt);
     let (w, h, has_alpha) = match reader.into_decoder() {
         Ok(dec) => (dec.dimensions().0, dec.dimensions().1, dec.color_type().has_alpha()),

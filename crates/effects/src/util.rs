@@ -465,6 +465,17 @@ pub fn fit_layer(ctx: &crate::EffectCtx, b: &crate::Buf, other: &crate::LayerPix
     })
 }
 
+/// Resample a buffer into another buffer's pixel grid without stretching its layer space.
+/// Used to composite the pre-effect image after earlier effects expand or shift the bounds.
+pub fn fit_buffer(source: &crate::Buf, width: u32, height: u32, offset: [f64; 2], scale: f64) -> Image {
+    let inv = 1.0 / scale.max(1e-9);
+    gen_image(width, height, |x, y| {
+        let sx = (x as f64 + 0.5 - offset[0]) * inv * source.scale + source.offset[0];
+        let sy = (y as f64 + 0.5 - offset[1]) * inv * source.scale + source.offset[1];
+        source.img.sample_bilinear(sx, sy)
+    })
+}
+
 /// The layer chosen in layer parameter `id` fitted to `b` (see [`fit_layer`]), or a copy of
 /// `b`'s own pixels when none is chosen / available (After Effects' "self" behaviour).
 pub fn layer_or_self(ctx: &crate::EffectCtx, b: &crate::Buf, id: &str, masks_and_effects: bool, stretch: bool) -> Image {

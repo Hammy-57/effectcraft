@@ -23,6 +23,8 @@ mod determinism;
 mod exr_layers;
 #[path = "../figma_import.rs"]
 mod figma_import;
+#[path = "../footage_reload.rs"]
+mod footage_reload;
 #[path = "../plugins.rs"]
 mod plugins;
 #[path = "../relative_media.rs"]

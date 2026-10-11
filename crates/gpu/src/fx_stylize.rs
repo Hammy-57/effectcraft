@@ -485,6 +485,9 @@ fn ripple_pulse(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
 }
 
 fn power_pin(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
+    if ctx.params.b("unstretch") {
+        return None; // Unstretch (reverse pinning) renders on the CPU (catalog CPU_ONLY_CONTROLS).
+    }
     let persp = (ctx.params.f("perspective") / 100.0).clamp(0.0, 1.0);
     let (lw, lh) = (ctx.layer_size[0].max(1.0), ctx.layer_size[1].max(1.0));
     let ex = [ctx.params.f("expandTop"), ctx.params.f("expandLeft"), ctx.params.f("expandRight"), ctx.params.f("expandBottom")];

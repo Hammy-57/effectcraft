@@ -13,6 +13,9 @@ pub(crate) fn handlers() -> &'static [Handler] {
         Handler::ui_prefix("window.panel.", legacy_panel),
         Handler::ui_prefix("window.workspace.", legacy_workspace),
         Handler::ui("window.maximizePanel", panel_op),
+        // A UI-only command (not in the engine's menus): run as its frontend command.
+        Handler::ui("window.maximizeApp", maximize_app),
+        Handler::frontend("window.maximizeApp", maximize_app),
         Handler::ui("window.dockPanel", panel_op),
         Handler::ui("window.floatPanel", panel_op),
         Handler::ui("window.closePanel", panel_op),
@@ -34,6 +37,13 @@ pub(crate) fn handlers() -> &'static [Handler] {
         Handler::frontend("window.assignWorkspaceShortcut", assign_workspace_shortcut),
     ];
     H
+}
+
+/// Ctrl+\ / Cmd+\, as in After Effects (#336): `{maximized}`, the window's new state.
+fn maximize_app(_app: &mut EffectcraftApp, ctx: &egui::Context, _id: &str, _p: Value) -> Result<Value, String> {
+    let maximized = !ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(maximized));
+    Ok(json!({"maximized": maximized}))
 }
 
 fn legacy_panel(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, _params: Value) -> Result<Value, String> {
@@ -191,6 +201,7 @@ fn save_workspace(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, _p:
     let name = app.ui.workspace.clone();
     app.ui.saved_workspaces.insert(name.clone(), app.ui.dock.clone());
     app.ui.saved_floating.insert(name.clone(), app.ui.floating.clone());
+    app.store_saved_workspaces();
     Ok(json!({"workspace": name}))
 }
 
@@ -208,6 +219,7 @@ fn save_workspace_as(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, 
     app.ui.saved_workspaces.insert(name.clone(), app.ui.dock.clone());
     app.ui.saved_floating.insert(name.clone(), app.ui.floating.clone());
     app.ui.workspace = name.clone();
+    app.store_saved_workspaces();
     Ok(json!({"workspace": name}))
 }
 
@@ -233,6 +245,7 @@ fn edit_workspaces(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, p:
         if app.ui.saved_workspaces.remove(&name).is_none() && !builtin {
             return Err(format!("no workspace `{name}`"));
         }
+        app.store_saved_workspaces();
         if app.ui.workspace == name {
             app.set_workspace("Default");
         }
@@ -250,6 +263,7 @@ fn edit_workspaces(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, p:
         if app.ui.workspace == name {
             app.ui.workspace = new.to_string();
         }
+        app.store_saved_workspaces();
         return Ok(json!({"renamed": new}));
     }
     Ok(json!({"workspaces": app.workspace_names()}))

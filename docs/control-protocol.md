@@ -222,3 +222,20 @@ Editor transform box, timeline Alt-drag scaling).
 
 The MCP server's bridge mode (`effectcraft-cli mcp --bridge 9877`) is a thin client of this protocol;
 see [agents.md](agents.md).
+
+Keyframe command times (`prop.set`, `prop.addKey`, `keys.set`, `keys.select`) default to layer
+seconds. Set `timeBase: "comp"` for comp seconds; `keys.set.newTime` and every
+`keys.select.keys[].time` use the same input base. Omitted `prop.set` or `prop.addKey` times use
+the target comp's CTI. Supplied write times snap to its nearest comp frame before conversion
+to stored layer time, including on stretched or reversed layers. Existing `keys.set` neighbor
+constraints and roving adjustment can change the final stored time.
+
+Explicit bases add `layerTime` and `compTime` to unsplit `prop.set` and `prop.addKey` replies,
+alongside `value` or `count`. Separated Position `prop.set` keeps an array of per-axis replies.
+Explicit `keys.select` replies contain `count` and `keys[]`, with timing on each key in the
+resulting selection. Key metadata's `time` remains layer seconds regardless of the input base.
+Without `timeBase`, these three commands retain their existing JSON value/count replies,
+including outside the layer's `[in, out)` range. Timing metadata carries outside-range warnings;
+`keys.set` and `prop.get.keys[]` report both bases and warnings without an explicit base too.
+`prop.get.time` is comp seconds. For these commands, `path` or `prop` identifies a property, not a group.
+Set a layer's offset with `layer.timing {layer, start}` (comp seconds).

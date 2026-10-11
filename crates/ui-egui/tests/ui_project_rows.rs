@@ -148,6 +148,32 @@ fn footage_context_menu_interprets_the_footage() {
     assert_eq!(h.state().dialog, Some(Dialog::Form), "the Interpret Footage dialog opened");
 }
 
+/// #360: the row menu's New Comp from Selection works on the whole selection, as File ▸ New
+/// Comp from Selection does: with several items selected it asks how in After Effects' New
+/// Composition from Selection dialog, and Multiple Compositions makes one per item.
+#[test]
+fn context_menu_new_comp_from_selection_uses_the_selection() {
+    let (mut h, _, comp, solid) = harness();
+    h.state_mut().session.state.project_selection = vec![comp, solid];
+    h.run_steps(2);
+    let at = center(&h, &format!("project.item.{}.name", solid.0));
+    h.input_mut().events.push(Event::PointerMoved(at));
+    h.step();
+    for pressed in [true, false] {
+        h.input_mut().events.push(Event::PointerButton { pos: at, button: egui::PointerButton::Secondary, pressed, modifiers: Modifiers::NONE });
+        h.step();
+    }
+    h.run_steps(2);
+    assert_eq!(h.state().session.state.project_selection, vec![comp, solid], "the selection stays");
+    let item = h.query_by_label_contains("New Comp from Selection").expect("in the menu").rect();
+    click_at(&mut h, item.center());
+    assert_eq!(h.state().dialog, Some(Dialog::Form));
+    assert!(h.state().auto.find("form.field.single").is_some(), "the New Composition from Selection dialog");
+    let comps = h.state().session.project.comps().count();
+    h.state_mut().session.execute_checked("file.newCompFromSelection", json!({"single": false})).unwrap();
+    assert_eq!(h.state().session.project.comps().count(), comps + 2, "one per item");
+}
+
 /// Dragging from the Project panel's empty area draws a selection box that selects the rows it
 /// touches; a click there deselects (#203).
 #[test]

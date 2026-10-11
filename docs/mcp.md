@@ -16,6 +16,19 @@ session is in the server's process, so a transport can also run code on it
 (`ControlTransport::on_session`, run on the UI thread between frames): `mcp --ui --autosave`
 checkpoints the project that way, like headless `--autosave` ([agents.md](agents.md)).
 
+## Confining file access
+
+`--automation-read-root DIR` and `--automation-write-root DIR` (each repeatable, as in
+PhotoCraft) confine what the agent can reach: files are read only under a read or write root and
+written only under a write root; with no write root nothing is written. Every engine command
+(`execute_command`, `command_run`, each `batch` step) is checked before it runs: its file
+parameters must be absolute paths inside the roots (symbolic links resolved, no `..`), and so must
+any other absolute path in its parameters. Save, Increment and Save and rendering the Render
+Queue are checked against the files they write (the open project's, the queued outputs). Scripts
+(`run_script`, `file.runScript`…), Execute File, Reveal in Finder, `$N` references to file paths
+in a batch, and the bridge's UI-driving tools (`ui_click`, `ui_key`, `ui_type`, `ui_drag`,
+`ui_set`, `script_ui`, `control`) are refused while confined. Without the flags nothing changes.
+
 The server provides the same core conventions as FilmCraft #28:
 
 | Tool | Arguments | Result |
@@ -59,7 +72,10 @@ larger `count`s are capped and reported (`requested`, `note`).
 
 Unknown top-level tool argument keys return JSON-RPC `-32602` naming the key, the closest accepted
 one (`command_run {"command": …}` → "did you mean `id`?") and the accepted arguments. EffectCraft already rejects unknown engine command parameters; that behaviour is
-preserved. Tool failures (including escaped panics) return `isError: true`. Malformed JSON
+preserved. Tool failures (including escaped panics) return `isError: true`, and so does any JSON
+result with a `failed` count above zero (a `command_batch` / `batch` with a failed step, a
+render whose queue items did not all finish), even though the other steps or items succeeded:
+read `results` / `items` for the details. Malformed JSON
 returns `-32700` with a null id and the session keeps serving. The MCP backend owns its session
 without a mutex; the engine's render-job mutexes already recover poisoned locks.
 
@@ -215,7 +231,8 @@ block, start their engine job with `wait: false`, watch it through `jobs.list` (
 
 The job works on a snapshot of the project (or writes its results when it ends, as in the app),
 so other requests are served while it runs, including edits. Another long call, a script, and
-everything sent after them wait in line until the job ends, then run in order. This works
+everything sent after them wait in line until the job ends, then run in order; a second render
+is refused at once instead (see "Requests during a render"). This works
 headless and bridged (`--bridge`: the app runs the job; the server polls it).
 
 **Scripts.** Headless `run_script` runs on a worker thread that owns the session meanwhile, so
@@ -230,3 +247,17 @@ Bridged scripts honour `timeout` (in the app) but can't be cancelled.
 Batch tools (`batch`, `command_batch`), single-frame tools, other synchronous commands
 (`render.saveCurrentPreview`, `file.importAep`, `layer.autoTrace`, imports without `background`)
 and every call with `wait: false` stay synchronous: no progress, no cancellation.
+
+### Requests during a render
+
+A render job owns a snapshot of the project taken when it started. While it runs:
+
+- Every way of starting a second render is refused with `isError: true`: a blocking
+  `renderQueue.render`, one with `wait: false`, or one inside a batch.
+- Other commands, including edits, run normally and change the project. They do not affect the
+  running job, which keeps rendering its snapshot; to render an edit, render again after the
+  job ends. Queue items are matched by id when the job reports their status, so an item removed
+  mid-render is left out of the reply and counted in `failed`.
+
+`renderQueue.render {"wait": false}` returns the ids being rendered at once; poll
+`renderQueue.list` for status and stop it with `renderQueue.stop`.

@@ -54,7 +54,7 @@ const RUN: [&str; 5] = ["shot_0001.png", "shot_0002.png", "shot_0004.png", "shot
 fn one_picked_numbered_file_imports_its_run_as_one_sequence() {
     let dir = folder(&RUN);
     let mut s = session();
-    let r = s.execute("file.import", json!({"paths": [at(&dir, "shot_0002.png")]})).unwrap();
+    let r = s.execute("file.import", json!({"paths": [at(&dir, "shot_0002.png")], "sequence": true})).unwrap();
     assert_eq!(r["items"].as_array().unwrap().len(), 1, "{r}");
     let (name, f) = footage(&s, &r["items"][0]);
     assert_eq!(name, "shot_[0001-0005].png");
@@ -75,17 +75,37 @@ fn picking_every_frame_imports_one_sequence() {
     let dir = folder(&RUN);
     let mut s = session();
     let all: Vec<String> = RUN[..4].iter().map(|n| at(&dir, n)).collect();
-    let r = s.execute("file.import", json!({"paths": all, "frameRate": 24})).unwrap();
+    let r = s.execute("file.import", json!({"paths": all, "sequence": true, "frameRate": 24})).unwrap();
     assert_eq!(r["items"].as_array().unwrap().len(), 1, "{r}");
     let (_, f) = footage(&s, &r["items"][0]);
     assert_eq!(f.sequence.len(), 4);
     // `frameRate` sets the sequence's rate on import.
     assert_eq!((f.frame_rate, f.duration), (FrameRate::FPS_24, FrameRate::FPS_24.tick_of(5)));
     // A picked range is just that range.
-    let r = s.execute("file.import", json!({"paths": [at(&dir, "shot_0004.png"), at(&dir, "shot_0005.png")]})).unwrap();
+    let r = s.execute("file.import", json!({"paths": [at(&dir, "shot_0004.png"), at(&dir, "shot_0005.png")], "sequence": true})).unwrap();
     let (name, f) = footage(&s, &r["items"][0]);
     assert_eq!((name.as_str(), f.sequence.len()), ("shot_[0004-0005].png", 2));
-    assert!(s.execute("file.import", json!({"paths": all, "frameRate": 0})).is_err());
+    assert!(s.execute("file.import", json!({"paths": all, "sequence": true, "frameRate": 0})).is_err());
+}
+
+/// #431: without the Sequence option, picked or dropped numbered stills import as stills (one
+/// item each), as in After Effects; a dropped folder still makes its runs sequences.
+#[test]
+fn numbered_stills_import_as_stills_by_default() {
+    let dir = folder(&RUN);
+    let mut s = session();
+    let r = s.execute("file.import", json!({"paths": [at(&dir, "shot_0002.png")], "drag": true})).unwrap();
+    let (name, f) = footage(&s, &r["items"][0]);
+    assert_eq!((name.as_str(), f.kind), ("shot_0002.png", FootageKind::Still));
+    let r = s.execute("file.import", json!({"paths": [at(&dir, "shot_0001.png"), at(&dir, "shot_0004.png")], "drag": true})).unwrap();
+    assert_eq!(r["items"].as_array().unwrap().len(), 2, "{r}");
+    let r = s.execute("file.import", json!({"paths": [dir.clone()], "drag": true})).unwrap();
+    let (name, f) = footage(&s, &r["items"][0]);
+    assert_eq!((name.as_str(), f.kind), ("shot_[0001-0005].png", FootageKind::Sequence));
+    // Scripts and agents naming one frame without `sequence` still get its run.
+    let r = s.execute("file.import", json!({"paths": [at(&dir, "shot_0003.png")]})).unwrap();
+    let (_, f) = footage(&s, &r["items"][0]);
+    assert_eq!(f.kind, FootageKind::Sequence);
 }
 
 #[test]
@@ -127,7 +147,7 @@ fn force_alphabetical_order_takes_every_image_of_the_type() {
 fn interpret_footage_start_timecode_relabels_source_time() {
     let dir = folder(&RUN);
     let mut s = session();
-    let item = s.execute("file.import", json!({"paths": [at(&dir, "shot_0001.png")]})).unwrap()["items"][0].clone();
+    let item = s.execute("file.import", json!({"paths": [at(&dir, "shot_0001.png")], "sequence": true})).unwrap()["items"][0].clone();
     s.execute("comp.new", json!({"name": "Main", "width": 64, "height": 32, "frameRate": 30, "duration": 10})).unwrap();
     let layer = s.execute("layer.addItem", json!({"item": item})).unwrap()["layer"].as_u64().unwrap();
     let out = |s: &Session| s.active_comp().unwrap().layer(effectcraft_project::LayerId(layer)).unwrap().out_point;

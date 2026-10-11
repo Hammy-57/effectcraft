@@ -616,12 +616,10 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 actions.push(("layer.addItem".into(), json!({"item": id.0})));
                 ui.close();
             }
+            // File ▸ New Comp from Selection on the selection (the right-clicked row joins it
+            // above): several items ask how in its dialog, as in After Effects (#360).
             if ui.button(crate::i18n::tr("New Comp from Selection")).clicked() {
-                if let Some((w, h)) = it.dimensions() {
-                    let d = it.duration().map(|d| d.seconds()).unwrap_or(10.0);
-                    actions.push(("comp.new".into(), json!({"name": format!("{} Comp", it.name), "width": w, "height": h, "duration": d})));
-                    actions.push(("layer.addItem".into(), json!({"item": id.0})));
-                }
+                actions.push(("file.newCompFromSelection".into(), json!({})));
                 ui.close();
             }
             ui.separator();

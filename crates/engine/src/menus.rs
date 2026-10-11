@@ -555,6 +555,7 @@ File
     Find Missing Effects | file.findMissing {"what":"effects"}
     Find Missing Fonts | file.findMissing {"what":"fonts"}
     Find Missing Footage | file.findMissing {"what":"footage"}
+    Relink Missing Footage... | file.relinkFootage
   Watch Folder... | file.watchFolder
   ---
   Scripts

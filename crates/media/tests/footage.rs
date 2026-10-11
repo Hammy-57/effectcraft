@@ -239,6 +239,33 @@ fn h264_mp4_probe_and_frames() {
     assert!(pool.stats().bytes <= pool.stats().frames * (1920 * 1080 * 3 / 2 + 64), "{:?}", pool.stats());
 }
 
+/// A reduced-resolution render's movie frames are converted at its size: they match resampling
+/// the full frames (testsrc2's saturated colours clip, where the two differ most), and are cached
+/// per size.
+#[test]
+fn h264_frames_at_reduced_sizes() {
+    let Some(p) = h264_mp4() else { return };
+    let f = probe(&p).expect("probe");
+    let pool = MediaPool::new();
+    for (n, (w, h)) in [(0i64, (960, 540)), (1, (640, 360)), (2, (480, 270)), (30, (323, 182))] {
+        let t = t_of(f.frame_rate, n);
+        let scale = w as f64 / f.width as f64;
+        let preview = pool.preview_frame(ItemId(1), &f, t, f.width, f.height, scale).expect("frame");
+        assert!(preview.preview, "resampled by the pool");
+        let sized = preview.px.image().expect("float pixels").clone();
+        let full = pool.frame(ItemId(1), &f, t).expect("frame");
+        assert_eq!((sized.width, sized.height), (w, h));
+        let db = psnr(&sized, &effectcraft_raster::resample(&full, w, h));
+        eprintln!("h264 frame {n} at {w}×{h}: {db:.2} dB against the resampled full frame");
+        // Converting at half size averages before the YUV→RGB clip, so saturated pixels differ
+        // slightly; how much depends on the encoder that made the fixture (50 dB with x264 from
+        // ffmpeg 6.1, above 55 with newer ones), all well past visible.
+        assert!(db > 45.0, "frame {n} at {w}×{h}: {db:.2} dB");
+        let again = pool.preview_frame(ItemId(1), &f, t, f.width, f.height, scale).expect("frame");
+        assert!(Arc::ptr_eq(&preview.px, &again.px), "cached");
+    }
+}
+
 #[test]
 fn h264_audio_samples() {
     let Some(p) = h264_mp4() else { return };
