@@ -357,6 +357,8 @@ pub struct Session {
     pub history: History,
     pub revision: u64,
     pub saved_revision: u64,
+    /// Bumped whenever another project replaces this one ([`Session::replace_project`]).
+    pub epoch: u64,
     /// The project as last opened or saved: the project is unmodified while it is this very
     /// snapshot, so undoing back to the saved state clears the modified mark.
     pub saved_project: Arc<Project>,
@@ -519,6 +521,7 @@ impl Default for Session {
             history: History::default(),
             revision: 0,
             saved_revision: 0,
+            epoch: 0,
             path: None,
             state: EditorState { snapping: true, view_layout: 1, ..Default::default() },
             services: Arc::new(FsServices),
@@ -982,6 +985,7 @@ impl Session {
         self.drop_tasks();
         p.fix_next_id();
         upgrade_effects(&mut p);
+        self.epoch = self.epoch.wrapping_add(1);
         self.project = Arc::new(p);
         self.history = History::default();
         self.state = EditorState { snapping: true, view_layout: 1, ..Default::default() };
