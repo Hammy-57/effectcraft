@@ -330,6 +330,11 @@ impl<'a> Renderer<'a> {
         Some((sub, item, lt, bs))
     }
 
+    /// The exact CPU mask coverage, without allocating a source RGBA image.
+    pub fn source_mask(&self, ctx: &EvalCtx, layer: &Layer, geometry: &masks::Geometry) -> Option<effectcraft_raster::Mask> {
+        masks::combined(ctx, layer, geometry, self.mask_blur(ctx, layer))
+    }
+
     /// An adjustment layer's footprint (its source with masks applied, layer space): where
     /// its effects show. `None` = the layer changes nothing.
     pub fn adjustment_footprint(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Arc<Buf>> {

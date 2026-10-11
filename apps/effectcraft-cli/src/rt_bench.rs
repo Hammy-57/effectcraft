@@ -13,6 +13,7 @@ pub(super) fn run(s: &Session, args: &Args) -> Result<(), Failure> {
     if !(1..=600).contains(&n) {
         return Err(Failure::Error("--n must be in 1..=600".into()));
     }
+    let drag = args.flag("--rt-drag");
     let start = args.num("--time")?.unwrap_or(0.0);
     if !start.is_finite() || start < 0.0 {
         return Err(Failure::Error("--time must be finite and nonnegative".into()));
@@ -69,7 +70,32 @@ pub(super) fn run(s: &Session, args: &Args) -> Result<(), Failure> {
         r.expr = s.expr.as_deref();
         let base_frame = comp.frame_rate.frame_at(Tick::from_seconds_f64(start));
         let render = |offset: i64| -> Result<(), Failure> {
-            gpu.render_display(&r, cid, comp.frame_rate.tick_of(base_frame.saturating_add(offset)))
+            // A drag changes only one transform at fixed composition time. Clone the
+            // project snapshot just as an edit does; preserve the shared layer cache.
+            let mut edited;
+            let mut edited_renderer;
+            let renderer = if drag {
+                edited = project.clone();
+                let layer = edited.comp_mut(cid).and_then(|c| c.layers.first_mut()).ok_or_else(|| Failure::Error("drag benchmark needs a layer".into()))?;
+                let position = layer.props.prop_mut("transform/position").ok_or_else(|| Failure::Error("drag benchmark layer has no position".into()))?;
+                let effectcraft_engine::keyframe::Value::Vec3(mut value) = position.value.clone() else {
+                    return Err(Failure::Error("drag benchmark position is not Vec3".into()));
+                };
+                if let Some(x) = value.first_mut() {
+                    *x += (offset % 20) as f64;
+                }
+                position.value = effectcraft_engine::keyframe::Value::Vec3(value);
+                position.keys.clear();
+                edited_renderer = Renderer::new(&edited, s.footage.as_ref(), RenderOpts { scale, backend: Backend::Gpu, ..Default::default() });
+                edited_renderer.cache = Some(&cache);
+                edited_renderer.accel = Some(&gpu);
+                edited_renderer.expr = s.expr.as_deref();
+                &edited_renderer
+            } else {
+                &r
+            };
+            let frame = if drag { base_frame } else { base_frame.saturating_add(offset) };
+            gpu.render_display(renderer, cid, comp.frame_rate.tick_of(frame))
                 .ok_or_else(|| Failure::Error("GPU viewer frame failed; refusing CPU fallback benchmark".into()))?;
             let _wait = profile::span("gpu_completion_wait");
             gpu.wait();
@@ -80,6 +106,7 @@ pub(super) fn run(s: &Session, args: &Args) -> Result<(), Failure> {
         render(0)?;
         let cold_ms = cold_start.elapsed().as_secs_f64() * 1000.0;
         let before = gpu.context().transfer_stats();
+        let pool_before = gpu.context().pool_stats();
         let mut samples = Vec::with_capacity(n);
         for i in 0..n {
             let now = std::time::Instant::now();
@@ -87,6 +114,7 @@ pub(super) fn run(s: &Session, args: &Args) -> Result<(), Failure> {
             samples.push(now.elapsed().as_secs_f64() * 1000.0);
         }
         let after = gpu.context().transfer_stats();
+        let pool_after = gpu.context().pool_stats();
         samples.sort_by(f64::total_cmp);
         // Instrument one additional moving frame, outside the latency sample population.
         profile::start();
@@ -102,7 +130,7 @@ pub(super) fn run(s: &Session, args: &Args) -> Result<(), Failure> {
         let gpu_window_ms = events.iter().filter(|e| e.cat == "gpu").map(|e| e.ts + e.dur).fold(0.0, f64::max) / 1000.0;
         let p50 = percentile(&samples, 50);
         let p95 = percentile(&samples, 95);
-        note!("{name} {label}: cold={cold_ms:.2} ms, p50={p50:.2} ms, p95={p95:.2} ms ({n} consecutive GPU viewer frames)");
+        note!("{name} {label}: cold={cold_ms:.2} ms, p50={p50:.2} ms, p95={p95:.2} ms ({n} GPU viewer frames; transform drag={drag})");
         for (stage, (calls, ms)) in &stages {
             note!("  {stage}: {ms:.3} ms, {calls} calls (diagnostic frame, inclusive)");
         }
@@ -110,10 +138,13 @@ pub(super) fn run(s: &Session, args: &Args) -> Result<(), Failure> {
         if !timestamps {
             note!("  GPU timestamps unavailable on this adapter/device");
         }
-        rows.push(json!({"comp": name, "resolution": label, "frames": n, "coldMs": cold_ms, "p50Ms": p50, "p95Ms": p95,
+        rows.push(json!({"comp": name, "resolution": label, "frames": n, "transformDrag": drag, "coldMs": cold_ms, "p50Ms": p50, "p95Ms": p95,
             "samplesMs": samples, "bitDepth": format!("{:?}", project.settings.bit_depth), "stagesInclusiveMs": stages, "droppedTraceEvents": dropped,
-            "timestampQueries": timestamps, "gpuDiagnosticWindowMs": gpu_window_ms, "uploads": after.uploads.saturating_sub(before.uploads),
+            "yuvConversions": after.yuv_conversions.saturating_sub(before.yuv_conversions),
+            "yuvInputBytes": after.yuv_bytes.saturating_sub(before.yuv_bytes), "timestampQueries": timestamps, "gpuDiagnosticWindowMs": gpu_window_ms, "uploads": after.uploads.saturating_sub(before.uploads),
             "uploadBytes": after.upload_bytes.saturating_sub(before.upload_bytes),
+            "poolHits": pool_after.0.saturating_sub(pool_before.0),
+            "poolMisses": pool_after.1.saturating_sub(pool_before.1),
             "readbackBytes": after.readback_bytes.saturating_sub(before.readback_bytes)}));
         trace.extend(events.into_iter().map(|mut e| {
             e.tid = format!("{label}:{}", e.tid);
@@ -126,7 +157,7 @@ pub(super) fn run(s: &Session, args: &Args) -> Result<(), Failure> {
         .map_err(|e| Failure::Error(e.to_string()))?;
         std::fs::write(path, bytes).map_err(|e| Failure::Error(format!("writing {path}: {e}")))?;
     }
-    let report = json!({"adapter": effectcraft_render::Accelerator::name(&gpu), "initializationMs": initialization_ms, "colorFusion": effectcraft_gpu::color_fusion_enabled(), "warmup": warmup, "warmupMs": warmup_ms, "staticPipelines": gpu.static_pipeline_count(), "path": "GPU viewer + completion wait (no window presentation)", "rows": rows});
+    let report = json!({"adapter": effectcraft_render::Accelerator::name(&gpu), "initializationMs": initialization_ms, "colorFusion": effectcraft_gpu::color_fusion_enabled(), "yuvTransport": effectcraft_gpu::yuv_transport_enabled(), "warmup": warmup, "warmupMs": warmup_ms, "staticPipelines": gpu.static_pipeline_count(), "path": "GPU viewer + completion wait (no window presentation)", "rows": rows});
     println!("{}", serde_json::to_string(&report).map_err(|e| Failure::Error(e.to_string()))?);
     Ok(())
 }
@@ -141,5 +172,163 @@ mod tests {
         assert_eq!(percentile(&values, 95), 19.0);
         assert_eq!(percentile(&[42.0], 95), 42.0);
         assert_eq!(percentile(&[], 95), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod yuv_tests {
+    /// Native generated clips stay local, like the profiling fixtures. Run with
+    /// EFFECTCRAFT_YUV_ORACLE_CLIP and --ignored; no licensed media is embedded.
+    #[test]
+    #[ignore = "requires a local generated video and native GPU"]
+    fn decoded_native_yuv_matches_media_rows_full_and_half() {
+        use effectcraft_engine::project::{BitDepth, Comp, ItemKind, LayerSource, Project, build};
+        use effectcraft_engine::time::{FrameRate, Tick};
+        use effectcraft_render::{Backend, FootageSource, RenderOpts, Renderer};
+        let path = std::env::var("EFFECTCRAFT_YUV_ORACLE_CLIP").expect("set generated clip path");
+        let footage = effectcraft_media::probe(&path).expect("probe generated clip");
+        let pool = effectcraft_media::MediaPool::new();
+        let gpu = effectcraft_gpu::Gpu::try_headless().expect("native GPU required");
+        assert!(effectcraft_gpu::yuv_transport_enabled());
+        for depth in [BitDepth::Bpc8, BitDepth::Bpc32] {
+            let mut project = Project::default();
+            project.settings.bit_depth = depth;
+            let comp = Comp::new(footage.width, footage.height, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+            let cid = project.add_item("YUV oracle", effectcraft_engine::color::Label::Sandstone, None, ItemKind::Comp(comp.clone().into()));
+            let fid = project.add_item("generated video", effectcraft_engine::color::Label::Lavender, None, ItemKind::Footage(footage.clone()));
+            let layer = build::layer(&mut project, &comp, "footage", LayerSource::Footage { item: fid }, (footage.width, footage.height), None);
+            project.comp_mut(cid).unwrap().layers.push(layer);
+            let frame = pool.frame_pixels(fid, &footage, Tick::ZERO).expect("actual decoded frame");
+            let native = frame.yuv().expect("actual decoder keeps planar samples");
+            native.validate().expect("valid native planes");
+            for scale in [1.0, 0.5, 0.25] {
+                let opts = RenderOpts { backend: Backend::Cpu, scale, ..Default::default() };
+                let cpu = Renderer::new(&project, &pool, opts).comp_frame_cpu(cid, Tick::ZERO);
+                let mut renderer = Renderer::new(&project, &pool, RenderOpts { backend: Backend::Gpu, ..opts });
+                renderer.accel = Some(&gpu);
+                let before = gpu.context().transfer_stats();
+                let actual = gpu.within_memory(|| gpu.render(&renderer, cid, Tick::ZERO)).expect("guarded GPU work").expect("GPU frame");
+                let after = gpu.context().transfer_stats();
+                assert_eq!(after.readbacks - before.readbacks, 1, "only final frame readback");
+                assert_eq!(after.yuv_conversions - before.yuv_conversions, 1, "native plane path used");
+                assert!(after.upload_bytes - before.upload_bytes <= native.validate().unwrap() as u64, "no expanded RGBA upload");
+                let tolerance = if depth == BitDepth::Bpc8 { 1.0 / 255.0 + 1e-6 } else { 1e-3 };
+                let mut maximum = 0.0f32;
+                assert_eq!(cpu.data.len(), actual.data.len());
+                for (i, (expected, actual)) in cpu.data.iter().zip(&actual.data).enumerate() {
+                    for (a, b) in expected.iter().zip(actual) {
+                        maximum = maximum.max((a - b).abs());
+                        assert!(b.is_finite() && (a - b).abs() <= tolerance, "{path} {depth:?} scale{scale} pixel{i}: {expected:?} != {actual:?}");
+                    }
+                }
+                eprintln!("actual media oracle {path} {depth:?} scale{scale}: max{maximum}, upload{} bytes", after.upload_bytes - before.upload_bytes);
+            }
+        }
+    }
+    #[test]
+    #[ignore = "requires a local generated footage benchmark project and native GPU"]
+    fn decoded_native_yuv_original_effect_chain_matches_cpu() {
+        use effectcraft_engine::project::{BitDepth, Project};
+        use effectcraft_engine::time::Tick;
+        use effectcraft_render::{Backend, RenderOpts, Renderer};
+        let path = std::env::var("EFFECTCRAFT_YUV_ORACLE_PROJECT").expect("set frozen project path");
+        let mut project = Project::from_json(&std::fs::read_to_string(&path).expect("read project")).expect("project");
+        let cid = *project.items.iter().find(|(_, i)| i.name == "footage-4k").expect("footage-4k comp").0;
+        struct CpuPlanes<'a>(&'a effectcraft_media::MediaPool);
+        struct HiddenFrame(effectcraft_render::SharedFrame);
+        impl effectcraft_render::FramePixels for HiddenFrame {
+            fn size(&self) -> (u32, u32) {
+                self.0.size()
+            }
+            fn rows(&self, y: usize, out: &mut [[f32; 4]]) {
+                self.0.rows(y, out);
+            }
+        }
+        impl effectcraft_render::FootageSource for CpuPlanes<'_> {
+            fn frame(
+                &self,
+                i: effectcraft_engine::project::ItemId,
+                f: &effectcraft_engine::project::Footage,
+                t: Tick,
+            ) -> Option<std::sync::Arc<effectcraft_render::Image>> {
+                self.0.frame(i, f, t)
+            }
+            fn frame_pixels(
+                &self,
+                i: effectcraft_engine::project::ItemId,
+                f: &effectcraft_engine::project::Footage,
+                t: Tick,
+            ) -> Option<effectcraft_render::SharedFrame> {
+                self.0.frame_pixels(i, f, t).map(|p| std::sync::Arc::new(HiddenFrame(p)) as effectcraft_render::SharedFrame)
+            }
+            fn preview_frame(
+                &self,
+                i: effectcraft_engine::project::ItemId,
+                f: &effectcraft_engine::project::Footage,
+                t: Tick,
+                w: u32,
+                h: u32,
+                scale: f64,
+            ) -> Option<effectcraft_render::FootageFrame> {
+                self.0
+                    .preview_frame(i, f, t, w, h, scale)
+                    .map(|p| effectcraft_render::FootageFrame { px: std::sync::Arc::new(HiddenFrame(p.px)), preview: p.preview })
+            }
+        }
+        let pool = effectcraft_media::MediaPool::new();
+        let gpu = effectcraft_gpu::Gpu::try_headless().expect("native GPU required");
+        let mut failed_cases = 0;
+        for depth in [BitDepth::Bpc8, BitDepth::Bpc32] {
+            for scale in [1.0, 0.5, 0.25, 0.37] {
+                project.settings.bit_depth = depth;
+                let opts = RenderOpts { backend: Backend::Cpu, scale, ..Default::default() };
+                let time = Tick::from_seconds_f64(0.5);
+                let cpu = Renderer::new(&project, &pool, opts).comp_frame_cpu(cid, time);
+                let mut renderer = Renderer::new(&project, &pool, RenderOpts { backend: Backend::Gpu, ..opts });
+                renderer.accel = Some(&gpu);
+                let before = gpu.context().transfer_stats();
+                let actual = gpu.within_memory(|| gpu.render(&renderer, cid, time)).expect("guarded GPU").expect("GPU frame");
+                let after = gpu.context().transfer_stats();
+                let hidden = CpuPlanes(&pool);
+                let mut baseline_renderer = Renderer::new(&project, &hidden, RenderOpts { backend: Backend::Gpu, ..opts });
+                baseline_renderer.accel = Some(&gpu);
+                let baseline = gpu.within_memory(|| gpu.render(&baseline_renderer, cid, time)).expect("guarded baseline").expect("baseline frame");
+                if effectcraft_gpu::yuv_transport_enabled() && scale != 0.37 {
+                    assert!(after.yuv_conversions > before.yuv_conversions, "native footage path used");
+                    assert_eq!(after.readbacks - before.readbacks, 1, "only final frame readback");
+                } else {
+                    assert_eq!(after.yuv_conversions - before.yuv_conversions, 0);
+                }
+                assert_eq!(cpu.data.len(), actual.data.len());
+                let tolerance = if depth == BitDepth::Bpc8 { 1.0 / 255.0 + 1e-6 } else { 1e-3 };
+                let mut maximum = 0.0f32;
+                let mut over = 0usize;
+                let mut changed = 0usize;
+                let mut pair_max = 0.0f32;
+                let mut new_material = 0usize;
+                let mut worsened_material = 0usize;
+                for ((a, b), old) in cpu.data.iter().zip(&actual.data).zip(&baseline.data) {
+                    for ((aa, bb), oo) in a.iter().zip(b).zip(old) {
+                        let error = (aa - bb).abs() / aa.abs().max(1.0);
+                        maximum = maximum.max(error);
+                        over += usize::from(!bb.is_finite() || error > tolerance);
+                        changed += usize::from(bb.to_bits() != oo.to_bits());
+                        let pair_error = (bb - oo).abs() / oo.abs().max(1.0);
+                        pair_max = pair_max.max(pair_error);
+                        assert!(pair_error <= tolerance, "native versus existing GPU tolerance");
+                        assert!(bb.is_finite() && oo.is_finite());
+                        let old_error = (aa - oo).abs() / aa.abs().max(1.0);
+                        new_material += usize::from(error > tolerance && old_error <= tolerance);
+                        worsened_material += usize::from(error > tolerance && error > old_error + 1e-6);
+                    }
+                }
+                failed_cases += usize::from(new_material != 0 || worsened_material != 0 || (depth == BitDepth::Bpc32 && over != 0));
+                eprintln!(
+                    "original effect chain {path} {depth:?} scale{scale}: max{maximum}, over{over}, changed{changed}, pairMax{pair_max}, new{new_material}, worse{worsened_material}, upload{} bytes",
+                    after.upload_bytes - before.upload_bytes
+                );
+            }
+        }
+        assert_eq!(failed_cases, 0, "transport adds no material CPU-oracle errors; float output remains strict");
     }
 }

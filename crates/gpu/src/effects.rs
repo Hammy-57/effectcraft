@@ -610,6 +610,8 @@ mod keep_tests {
             upload_bytes: after.upload_bytes - before.upload_bytes,
             readbacks: after.readbacks - before.readbacks,
             readback_bytes: after.readback_bytes - before.readback_bytes,
+            yuv_conversions: after.yuv_conversions - before.yuv_conversions,
+            yuv_bytes: after.yuv_bytes - before.yuv_bytes,
         };
         (img, d)
     }

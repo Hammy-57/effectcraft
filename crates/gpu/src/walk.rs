@@ -234,6 +234,9 @@ fn draw_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &
     if let Some(done) = draw_precomp(e, r, ctx, layer, canvas, opacity) {
         return done;
     }
+    if let Some(done) = draw_yuv_footage(e, r, ctx, layer, canvas, opacity) {
+        return done;
+    }
     let Some(st) = r.styled_layer(ctx, layer) else { return Some(()) };
     if st.plain {
         return composite_layer(e, r, ctx, layer, &st.body, canvas, opacity);
@@ -278,9 +281,64 @@ fn draw_precomp(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas:
     // A nested comp the GPU can't take (nested too deep, over the texture limit, content it
     // declines) goes back to the CPU path for this layer only; only a device failure fails the
     // frame.
-    let Some(mut src) = render(e, &sub, item, lt) else {
+    let Some(src) = render(e, &sub, item, lt) else {
         return if e.g.check_health().is_ok() { None } else { Some(None) };
     };
+    finish_resident(e, r, ctx, layer, canvas, opacity, src, bs)
+}
+
+fn draw_yuv_footage(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut GpuImage, opacity: f32) -> Option<Option<()>> {
+    if !crate::yuv_transport_enabled() || e.g.yuv.is_none() || styles::active(ctx, layer) {
+        return None;
+    }
+    let footage = {
+        let _profile = effectcraft_render::profile::span("native_source_lookup");
+        r.native_footage(ctx, layer)?
+    };
+    let view = footage.pixels.yuv()?;
+    let metadata = crate::yuv::metadata(view);
+    let cache = {
+        let _profile = effectcraft_render::profile::span("native_content_key");
+        r.resident_footage_key(ctx, layer)
+    };
+    if let Some((key, token)) = cache.as_ref()
+        && let Some(image) = e.g.native_get(&footage.pixels, *key, token, &metadata)
+    {
+        let _profile = effectcraft_render::profile::span("native_cached_place");
+        return composite_resident(e, r, ctx, layer, canvas, opacity, image);
+    }
+    let mut src = crate::yuv::decode(e, view)?;
+    if let Some((w, h)) = footage.preview {
+        if !e.g.fits(w, h) {
+            return None;
+        }
+        let matrix = effectcraft_geom::Mat3::scale(effectcraft_geom::vec2(w as f64 / src.width as f64, h as f64 / src.height as f64));
+        src = ops::warp(e, &e.zeros(w, h), &src, &matrix, effectcraft_raster::Sampling::Bilinear, BlendMode::Normal, 1.0, 0, None);
+    }
+    if let Some(c) = footage.conversion {
+        src = ops::convert(e, &src, &c);
+    }
+    let geometry = effectcraft_render::masks::Geometry { width: src.width, height: src.height, offset: [0.0; 2], scale: footage.scale };
+    if let Some(mask) = r.source_mask(ctx, layer, &geometry) {
+        src = crate::yuv::mask(e, &src, &mask)?;
+    }
+    let image = prepare_resident(e, r, ctx, layer, src, footage.scale)?;
+    let result = composite_resident(e, r, ctx, layer, canvas, opacity, image.clone());
+    if result == Some(Some(()))
+        && let Some((key, token)) = cache
+    {
+        e.keep_native(footage.pixels, key, token, metadata, image);
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut GpuImage, opacity: f32, src: GpuImage, bs: f64) -> Option<Option<()>> {
+    let image = prepare_resident(e, r, ctx, layer, src, bs)?;
+    composite_resident(e, r, ctx, layer, canvas, opacity, image)
+}
+
+fn prepare_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, mut src: GpuImage, bs: f64) -> Option<crate::context::NativeImage> {
     let pipe = r.pipe();
     // `masked_source` quantises a non-solid source to the project's depth.
     if let Some(l) = pipe.levels {
@@ -291,17 +349,32 @@ fn draw_precomp(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas:
         let o = ctx.effect_bounds(layer).1;
         let mut fx = crate::effects::GpuFx::new(e, src, [o[0] * bs, o[1] * bs], bs, pipe.levels);
         r.run_layer_effects_on(ctx, layer, &mut fx);
-        let Some((img, off, sc)) = fx.finish() else { return Some(None) };
+        let (img, off, sc) = fx.finish()?;
         (img, [off[0] - o[0] * sc, off[1] - o[1] * sc], sc)
     } else {
         (src, [0.0; 2], bs)
     };
-    if img.width == 0 || img.height == 0 {
-        return Some(Some(()));
-    }
     if let Some(c) = pipe.to_blend() {
         img = ops::convert(e, &img, &c);
     }
+    Some(crate::context::NativeImage { img, offset, scale })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn composite_resident(
+    e: &mut Enc,
+    r: &Renderer,
+    ctx: &EvalCtx,
+    layer: &Layer,
+    canvas: &mut GpuImage,
+    opacity: f32,
+    image: crate::context::NativeImage,
+) -> Option<Option<()>> {
+    let crate::context::NativeImage { img, offset, scale } = image;
+    if img.width == 0 || img.height == 0 {
+        return Some(Some(()));
+    }
+    let pipe = r.pipe();
     let shape = Buf { img: Image { width: img.width, height: img.height, data: Vec::new() }, offset, scale };
     if r.track_matte(ctx, layer).is_some() || layer.preserve_transparency {
         let Some(iso) = place_src(e, r, ctx, layer, &shape, img, &e.zeros(canvas.width, canvas.height), BlendMode::Normal, 1.0, None) else {

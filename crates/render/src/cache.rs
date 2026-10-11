@@ -62,6 +62,7 @@ mod dependencies;
 /// buffers that were slow to render are written there (keys salted per project, see
 /// [`LayerCache::set_disk`]).
 pub struct LayerCache {
+    resident_lifetime: Mutex<Arc<()>>,
     inner: Mutex<Inner>,
     disk: Mutex<Option<(Arc<crate::disk_cache::DiskCache>, u64)>>,
     /// Another persistent store when there is no disk cache (the browser's, [`PrefetchStore`]).
@@ -72,6 +73,22 @@ pub struct LayerCache {
     inflight: Mutex<HashMap<u64, Arc<Flight>>>,
     /// Precomp layers' consecutive key misses (see [`LayerCache::precomp_try`]).
     streaks: Mutex<HashMap<u64, u32>>,
+}
+
+/// Weak lifetime of accelerator content associated with a layer cache. Clearing
+/// or dropping the cache invalidates previously captured tokens, including late inserts.
+#[derive(Clone)]
+pub struct ResidentToken {
+    lifetime: Weak<()>,
+    gate: Option<Weak<std::sync::atomic::AtomicBool>>,
+}
+impl ResidentToken {
+    pub fn identity(&self) -> usize {
+        self.lifetime.as_ptr() as usize
+    }
+    pub fn valid(&self) -> bool {
+        self.lifetime.strong_count() > 0 && self.gate.as_ref().is_none_or(|g| g.upgrade().is_some_and(|g| !g.load(std::sync::atomic::Ordering::Relaxed)))
+    }
 }
 
 struct Entry {
@@ -170,6 +187,7 @@ impl LayerCache {
     /// A cache holding at most `budget` bytes of pixels.
     pub fn new(budget: usize) -> LayerCache {
         LayerCache {
+            resident_lifetime: Mutex::new(Arc::new(())),
             inner: Mutex::new(Inner {
                 map: HashMap::new(),
                 bytes: 0,
@@ -198,9 +216,16 @@ impl LayerCache {
     /// buffers from placeholders; the accelerator raises the gate from its first missing
     /// readback to the end of the pass, so none of them is kept (in memory or on disk).
     pub fn set_gate(&self, gate: Option<Arc<std::sync::atomic::AtomicBool>>) {
-        if let Ok(mut g) = self.gate.lock() {
-            *g = gate;
+        let mut g = self.gate.lock().unwrap_or_else(PoisonError::into_inner);
+        let same = match (&*g, &gate) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same {
+            *self.resident_lifetime.lock().unwrap_or_else(PoisonError::into_inner) = Arc::new(());
         }
+        *g = gate;
     }
 
     fn gated(&self) -> bool {
@@ -462,6 +487,16 @@ impl LayerCache {
         }
     }
 
+    /// Capture a cache lifetime for bounded accelerator content reuse.
+    pub fn resident_token(&self) -> Option<ResidentToken> {
+        if self.gated() {
+            return None;
+        }
+        let lifetime = Arc::downgrade(&*self.resident_lifetime.lock().ok()?);
+        let gate = self.gate.lock().ok()?.as_ref().map(Arc::downgrade);
+        Some(ResidentToken { lifetime, gate })
+    }
+
     /// The memory budget in bytes.
     pub fn budget(&self) -> usize {
         self.inner.lock().map(|g| g.budget).unwrap_or(0)
@@ -477,6 +512,7 @@ impl LayerCache {
     }
 
     pub fn clear(&self) {
+        *self.resident_lifetime.lock().unwrap_or_else(PoisonError::into_inner) = Arc::new(());
         if let Ok(mut g) = self.inner.lock() {
             g.map.clear();
             g.bytes = 0;
