@@ -45,6 +45,9 @@ pub const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
 /// Uploaded layer buffers kept on the GPU (bytes), at most (see [`GpuContext::set_cache_budget`]).
 const UPLOAD_BUDGET: usize = 1536 << 20;
 
+/// Effect chain results awaiting adoption (see [`GpuContext::keep`]), at most.
+const MAX_KEPT: usize = 16;
+
 /// Working textures kept for reuse once their last image is dropped (bytes), at most.
 const POOL_BUDGET: usize = 768 << 20;
 
@@ -292,6 +295,12 @@ struct Uploads {
     clock: u64,
     /// Byte budget (`None`: [`UPLOAD_BUDGET`]).
     budget: Option<usize>,
+    /// Effect chain results awaiting [`GpuContext::adopt`] by the layer buffer that stores
+    /// their pixels (ticket, image), oldest first.
+    kept: Vec<(u64, GpuImage)>,
+    next_ticket: u64,
+    /// Effect chain results are not kept (tests compare against the re-upload).
+    keep_off: bool,
 }
 
 impl Uploads {
@@ -304,13 +313,30 @@ impl Uploads {
             self.bytes = self.map.values().map(|e| e.bytes).sum();
         }
         let budget = self.budget.unwrap_or(UPLOAD_BUDGET);
-        while self.bytes > budget {
+        // Kept effect results awaiting adoption count against the same budget.
+        self.trim_kept(0);
+        let kept = self.kept.iter().map(|(_, img)| img_bytes(img)).fold(0, usize::saturating_add);
+        while self.bytes.saturating_add(kept) > budget {
             let Some(k) = self.map.iter().min_by_key(|(_, e)| e.last_use).map(|(k, _)| *k) else { break };
             if let Some(e) = self.map.remove(&k) {
                 self.bytes = self.bytes.saturating_sub(e.bytes);
             }
         }
     }
+
+    /// Drop the oldest kept effect results until they and `extra` more bytes fit the budget.
+    fn trim_kept(&mut self, extra: usize) {
+        let budget = self.budget.unwrap_or(UPLOAD_BUDGET);
+        let mut kept = self.kept.iter().map(|(_, img)| img_bytes(img)).fold(extra, usize::saturating_add);
+        while kept > budget && !self.kept.is_empty() {
+            kept = kept.saturating_sub(img_bytes(&self.kept.remove(0).1));
+        }
+    }
+}
+
+/// Bytes of an RGBA f32 image.
+fn img_bytes(img: &GpuImage) -> usize {
+    (img.width as usize).saturating_mul(img.height as usize).saturating_mul(16)
 }
 
 /// The device and everything compiled for it.
@@ -956,16 +982,79 @@ impl GpuContext {
             }
         }
         let img = self.upload_image(&buf.img)?;
+        self.register(buf, img.clone());
+        Some(img)
+    }
+
+    /// Serve `buf` from `img` (its pixels) while `buf` lives (see [`Self::upload_buf`]).
+    fn register(&self, buf: &Arc<Buf>, img: GpuImage) {
+        let key = Arc::as_ptr(buf) as usize;
         if let Ok(mut u) = self.uploads.lock() {
             let bytes = buf.img.data.len() * 16;
             let now = u.clock;
-            if let Some(old) = u.map.insert(key, Upload { buf: Arc::downgrade(buf), img: img.clone(), bytes, last_use: now }) {
-                u.bytes -= old.bytes;
+            if let Some(old) = u.map.insert(key, Upload { buf: Arc::downgrade(buf), img, bytes, last_use: now }) {
+                u.bytes = u.bytes.saturating_sub(old.bytes);
             }
             u.bytes += bytes;
             u.trim();
         }
-        Some(img)
+    }
+
+    /// Keep an effect chain's result (what was read back) for [`Self::adopt`]: the ticket, or
+    /// `None` when not kept.
+    pub(crate) fn keep(&self, img: GpuImage) -> Option<u64> {
+        let mut u = self.uploads.lock().ok()?;
+        // Kept results count against the upload budget they are adopted into (#591).
+        let bytes = img_bytes(&img);
+        if u.keep_off || bytes > u.budget.unwrap_or(UPLOAD_BUDGET) {
+            return None;
+        }
+        u.trim_kept(bytes);
+        u.next_ticket = u.next_ticket.wrapping_add(1);
+        let t = u.next_ticket;
+        // Tickets are adopted or released right after their chain (the renderer's `Kept`
+        // guard); the cap only bounds a stray one.
+        if u.kept.len() >= MAX_KEPT {
+            u.kept.remove(0);
+        }
+        u.kept.push((t, img));
+        u.trim();
+        Some(t)
+    }
+
+    /// `buf` stores kept result `ticket`'s pixels: [`Self::upload_buf`] serves it from that
+    /// image while `buf` lives, within the upload budget.
+    pub(crate) fn adopt(&self, ticket: u64, buf: &Arc<Buf>) {
+        let Some(img) = self.take_kept(ticket) else { return };
+        if (img.width, img.height) == (buf.img.width, buf.img.height) && !buf.img.is_empty() {
+            self.register(buf, img);
+        }
+    }
+
+    /// Forget kept result `ticket`.
+    pub(crate) fn release(&self, ticket: u64) {
+        let _ = self.take_kept(ticket);
+    }
+
+    fn take_kept(&self, ticket: u64) -> Option<GpuImage> {
+        let mut u = self.uploads.lock().ok()?;
+        let i = u.kept.iter().position(|(t, _)| *t == ticket)?;
+        Some(u.kept.remove(i).1)
+    }
+
+    /// Kept effect results not adopted or released yet (tests).
+    #[cfg(test)]
+    pub(crate) fn kept_count(&self) -> usize {
+        self.uploads.lock().map(|u| u.kept.len()).unwrap_or_default()
+    }
+
+    /// Stop (or resume) keeping effect chain results: composited layers then upload again.
+    #[cfg(test)]
+    pub(crate) fn set_keep_effects(&self, on: bool) {
+        if let Ok(mut u) = self.uploads.lock() {
+            u.keep_off = !on;
+            u.kept.clear();
+        }
     }
 
     /// Size the GPU-side caches after the layer cache's memory budget (Memory & CPU settings,
@@ -1008,6 +1097,7 @@ impl GpuContext {
     pub fn clear_uploads(&self) {
         if let Ok(mut u) = self.uploads.lock() {
             u.map.clear();
+            u.kept.clear();
             u.bytes = 0;
         }
         if let Ok(mut p) = self.pool.lock() {
@@ -1560,6 +1650,39 @@ mod upload_budget_tests {
         assert_eq!(pool.bytes, 0);
         assert_eq!(pool.released_bytes, 0);
         assert!(pool.free.is_empty());
+    }
+
+    /// Kept effect results awaiting adoption count against the upload budget: an oversized
+    /// one is not kept, older ones and uploads make room, and a lower budget drops them.
+    #[test]
+    fn kept_effect_results_count_against_the_upload_budget() {
+        crate::tests::hold_gpu_lock();
+        let context = GpuContext::headless();
+        assert!(context.is_some() || !std::env::var("EFFECTCRAFT_REQUIRE_GPU").is_ok_and(|v| v == "1"), "required GPU unavailable");
+        let Some(g) = context else { return };
+        let one = 8 * 8 * 16;
+        g.set_cache_budget(2 * one);
+        assert!(g.keep(g.image(16, 16)).is_none(), "larger than the budget");
+        let buf = Arc::new(Buf { img: Image::new(8, 8), offset: [0.0; 2], scale: 1.0 });
+        assert!(g.upload_buf(&buf).is_some());
+        let a = g.keep(g.image(8, 8)).unwrap();
+        assert_eq!((g.kept_count(), g.upload_stats()), (1, (1, one)));
+        let b = g.keep(g.image(8, 8)).unwrap();
+        assert_eq!((g.kept_count(), g.upload_stats()), (2, (0, 0)), "the upload makes room");
+        let _c = g.keep(g.image(8, 8)).unwrap();
+        assert_eq!(g.kept_count(), 2, "the oldest kept result makes room");
+        g.adopt(a, &buf);
+        assert_eq!(g.upload_stats(), (0, 0), "the dropped ticket adopts nothing");
+        g.set_cache_budget(one);
+        assert_eq!(g.kept_count(), 1);
+        g.adopt(b, &buf);
+        assert_eq!(g.upload_stats(), (0, 0));
+        g.set_cache_budget(0);
+        assert_eq!(g.kept_count(), 0);
+        g.set_cache_budget(UPLOAD_BUDGET);
+        let _d = g.keep(g.image(8, 8)).unwrap();
+        g.clear_uploads();
+        assert_eq!(g.kept_count(), 0);
     }
 
     #[test]

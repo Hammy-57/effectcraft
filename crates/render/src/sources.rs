@@ -55,8 +55,13 @@ impl<'a> Renderer<'a> {
         // a whole number maps the unit vectors to lengths a hair over 1, which must stay 1 (#390:
         // rounded up to 2^¼, unscaled text was drawn larger and resampled, softer).
         let mut k = 2f64.powf((k.log2() * 4.0 - 1e-6).ceil() / 4.0).clamp(1.0 / 16.0, 64.0);
-        // Keep the buffer within about 16 million pixels.
-        if let Some(b) = content_bounds(ctx, layer) {
+        // Keep the buffer within about 16 million pixels. The cap is never under 1: a step that
+        // doesn't enlarge needs no measuring (a text layout or shape walk per call).
+        #[cfg(test)]
+        let measure = k > 1.0 || tests::ALWAYS_MEASURE.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let measure = k > 1.0;
+        if measure && let Some(b) = content_bounds(ctx, layer) {
             let area = ((b[2] - b[0]) * (b[3] - b[1])).max(1.0) * s * s;
             k = k.min((16.0e6 / area).sqrt().max(1.0));
         }
@@ -193,4 +198,98 @@ pub fn content_bounds(ctx: &EvalCtx, layer: &effectcraft_project::Layer) -> Opti
 /// A mask/shape path as a kurbo path (for drawing overlays).
 pub fn kurbo_path(sp: &effectcraft_keyframe::ShapePath) -> kurbo::BezPath {
     effectcraft_path::to_kurbo(sp)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use effectcraft_color::Label;
+    use effectcraft_keyframe::{TextDoc, Value};
+    use effectcraft_project::build::{self, Ids};
+    use effectcraft_project::{Comp, ItemKind, LayerSource, Project};
+    use effectcraft_time::{FrameRate, Tick};
+
+    use crate::{EvalCtx, NoFootage, RenderOpts, Renderer};
+
+    thread_local! {
+        /// Measure the content for every continuous layer (the path before the shortcut).
+        pub(super) static ALWAYS_MEASURE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// The rasterisation scale of text and Continuously Rasterize shape layers, scaled from tiny
+    /// to beyond the 16 Mpx cap, at several output scales: the same without measuring content
+    /// that isn't enlarged as with measuring every layer.
+    #[test]
+    fn raster_scale_skips_measuring_only_where_the_cap_cannot_bind() {
+        let mut p = Project::default();
+        let comp = Comp::new(400, 300, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+        let cid = p.add_item("Comp", Label::Sandstone, None, ItemKind::Comp(comp.clone().into()));
+        let mut layers = vec![];
+        let scales = [3.0, 50.0, 99.9, 100.0, 100.0001, 120.0, 400.0, 3000.0, 20000.0];
+        for (i, scale) in scales.into_iter().enumerate() {
+            let mut t = build::layer(&mut p, &comp, "Text", LayerSource::Text, (400, 300), None);
+            let doc = TextDoc { text: "Wide text line".into(), size: 60.0, ..Default::default() };
+            t.props.prop_mut("text/sourceText").unwrap().value = Value::Text(Box::new(doc));
+            let mut s = build::layer(&mut p, &comp, "Shape", LayerSource::Shape, (400, 300), None);
+            let mut next = p.next_id;
+            let mut ids = Ids(&mut next);
+            let star = build::shape_star(&mut ids, true, 5.0, [0.0, 0.0], 150.0, 60.0);
+            let fill = build::shape_fill(&mut ids, [0.9, 0.2, 0.1, 1.0]);
+            let g = build::shape_group(&mut ids, "Star", vec![star, fill]);
+            p.next_id = next;
+            s.props.sub_mut("contents").unwrap().children.push(g.into());
+            s.switches.collapse = true;
+            for l in [&mut t, &mut s] {
+                l.props.prop_mut("transform/scale").unwrap().value = Value::Vec3([scale, scale * 0.7, 100.0]);
+                l.props.prop_mut("transform/rotation").unwrap().value = Value::Scalar(13.0 * i as f64);
+                l.props.prop_mut("transform/position").unwrap().value = Value::Vec3([123.4, 56.7, 0.0]);
+            }
+            layers.extend([t, s]);
+        }
+        p.comp_mut(cid).unwrap().layers = layers.into();
+        let c = p.comp(cid).unwrap();
+        let (mut capped, mut small) = (0, 0);
+        for out in [1.0, 0.5, 0.25, 2.0] {
+            let r = Renderer::new(&p, &NoFootage, RenderOpts { scale: out, ..Default::default() });
+            let ctx = EvalCtx::new(&p, cid, c, Tick::ZERO);
+            for (i, l) in c.layers.iter().enumerate() {
+                let fast = r.raster_scale(&ctx, l);
+                ALWAYS_MEASURE.with(|m| m.set(true));
+                let measured = r.raster_scale(&ctx, l);
+                ALWAYS_MEASURE.with(|m| m.set(false));
+                assert_eq!(fast.to_bits(), measured.to_bits(), "{} at output scale {out}", l.name);
+                // Unclamped, 3000 % and more would step to the 64× limit: the cap held them down.
+                capped += (scales[i / 2] >= 3000.0 && fast < out * 32.0) as usize;
+                small += (fast <= out) as usize;
+            }
+        }
+        assert!(capped >= 8 && small > 8, "capped {capped}, not enlarged {small}");
+    }
+
+    /// Timing: `raster_scale` of an unscaled paragraph text layer, measured or not.
+    #[test]
+    #[ignore]
+    fn time_raster_scale() {
+        let mut p = Project::default();
+        let comp = Comp::new(1920, 1080, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+        let cid = p.add_item("Comp", Label::Sandstone, None, ItemKind::Comp(comp.clone().into()));
+        let mut t = build::layer(&mut p, &comp, "Text", LayerSource::Text, (1920, 1080), None);
+        let doc = TextDoc { text: "The quick brown fox jumps over the lazy dog. ".repeat(6), size: 40.0, ..Default::default() };
+        t.props.prop_mut("text/sourceText").unwrap().value = Value::Text(Box::new(doc));
+        p.comp_mut(cid).unwrap().layers = vec![t].into();
+        let c = p.comp(cid).unwrap();
+        let r = Renderer::new(&p, &NoFootage, RenderOpts::default());
+        let ctx = EvalCtx::new(&p, cid, c, Tick::ZERO);
+        let l = c.layers.iter().next().unwrap();
+        for always in [true, false, true, false] {
+            ALWAYS_MEASURE.with(|m| m.set(always));
+            let t0 = std::time::Instant::now();
+            for _ in 0..100 {
+                std::hint::black_box(r.raster_scale(&ctx, l));
+            }
+            eprintln!("measure {always}: {:.1} us per call", t0.elapsed().as_secs_f64() * 1e4);
+        }
+        ALWAYS_MEASURE.with(|m| m.set(false));
+    }
 }

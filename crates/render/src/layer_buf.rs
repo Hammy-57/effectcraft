@@ -147,7 +147,15 @@ impl<'a> Renderer<'a> {
             }
         }
         let buf = self.masked_source(ctx, layer)?;
-        let buf = Arc::new(self.apply_effects_timed(ctx, layer, buf, false, usize::MAX, timing.map(|t| &mut t.effects)));
+        let (buf, kept) = self.apply_effects_kept(ctx, layer, buf, false, usize::MAX, timing.map(|t| &mut t.effects));
+        let buf = Arc::new(buf);
+        // The accelerator composites this buffer from the effects' result on the device (no
+        // second upload), unless it blends a converted copy (linear blending).
+        if let Some(k) = kept
+            && self.pipe.to_blend().is_none()
+        {
+            k.adopt(&buf);
+        }
         if let (Some(c), Some(k)) = (self.cache, key) {
             if once {
                 c.insert_once(k, buf.clone());
