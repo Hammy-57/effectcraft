@@ -16,6 +16,7 @@ pub mod mask_interp;
 pub mod paint;
 pub mod panels_cmds;
 pub mod puppet;
+pub mod relink_moved;
 pub mod render_compare;
 pub mod roto_cmds;
 pub mod round_corners;
@@ -28,6 +29,7 @@ pub mod viewer_cmds;
 #[cfg(test)]
 pub(crate) use app_more::report_text as report_text_for_tests;
 pub(crate) use app_more::view_command;
+pub(crate) use comp_more::encode_png;
 #[cfg(test)]
 pub(crate) use keys_more::amplitudes as amplitudes_for_tests;
 #[cfg(test)]

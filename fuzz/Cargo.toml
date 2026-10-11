@@ -1,0 +1,103 @@
+# Fuzz targets for the inputs EffectCraft doesn't control (gaps.md G3, AGENTS.md "Never crash").
+# Outside the workspace (its own `[workspace]`), so normal builds and CI don't compile it.
+# Run with `cargo xtask fuzz` (docs/testing.md "Fuzzing"); needs nightly and cargo-fuzz.
+[package]
+name = "effectcraft-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+effectcraft-project = { path = "../crates/project" }
+effectcraft-engine = { path = "../crates/engine" }
+effectcraft-aep = { path = "../crates/aep" }
+effectcraft-lottie = { path = "../crates/lottie" }
+effectcraft-svg = { path = "../crates/svg" }
+effectcraft-psd = { path = "../crates/psd" }
+effectcraft-pdf = { path = "../crates/pdf" }
+effectcraft-interchange = { path = "../crates/interchange" }
+effectcraft-expr = { path = "../crates/expr" }
+effectcraft-media = { path = "../crates/media" }
+effectcraft-time = { path = "../crates/time" }
+
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "project_open"
+path = "fuzz_targets/project_open.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "aep_ir"
+path = "fuzz_targets/aep_ir.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lottie_import"
+path = "fuzz_targets/lottie_import.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "svg_parse"
+path = "fuzz_targets/svg_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "psd_parse"
+path = "fuzz_targets/psd_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pdf_parse"
+path = "fuzz_targets/pdf_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "interchange_import"
+path = "fuzz_targets/interchange_import.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "expr_eval"
+path = "fuzz_targets/expr_eval.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "media_probe"
+path = "fuzz_targets/media_probe.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "engine_command"
+path = "fuzz_targets/engine_command.rs"
+test = false
+doc = false
+bench = false

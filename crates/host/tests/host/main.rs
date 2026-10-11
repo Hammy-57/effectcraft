@@ -29,6 +29,8 @@ mod footage_reload;
 mod plugins;
 #[path = "../relative_media.rs"]
 mod relative_media;
+#[path = "../relink.rs"]
+mod relink;
 #[path = "../repros.rs"]
 mod repros;
 #[path = "../timeline_interop.rs"]

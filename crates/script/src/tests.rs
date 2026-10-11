@@ -837,3 +837,20 @@ fn import_options_sequence_picks_one_still_or_the_run() {
     assert_eq!(kind_of(&s, "shot_[0001-0003].png"), FootageKind::Sequence);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn save_frame_to_png_writes_the_frame() {
+    let mut s = session();
+    let out = std::env::temp_dir().join(format!("ec-script-frame-{}.png", std::process::id()));
+    let _ = std::fs::remove_file(&out);
+    let code = format!(
+        "var c = app.project.items.addComp(\"F\", 32, 18, 1, 1, 30); c.layers.addSolid([1, 0, 0], \"R\", 32, 18, 1); c.saveFrameToPng(0.5, new File({:?})); 1",
+        out.to_string_lossy()
+    );
+    ok(&mut s, &code);
+    let png = std::fs::read(&out).expect("the PNG was written");
+    assert!(png.starts_with(b"\x89PNG"), "not a PNG");
+    let o = run_code(&mut s, "app.project.item(1).saveFrameToPng(0)", "test.jsx");
+    assert!(o.error.is_some(), "a missing file is an error");
+    let _ = std::fs::remove_file(&out);
+}
