@@ -637,6 +637,19 @@ impl EffectcraftApp {
         v
     }
 
+    /// The Tools bar's workspace switcher, left to right: After Effects' bar workspaces
+    /// ([`dock::WORKSPACE_BAR`]), then the saved ones (a new one is added as it is saved), then
+    /// the current workspace ([`UiState::workspace`]) if it is none of these (one
+    /// chosen from the » menu or Window ▸ Workspace), so the current one is always in the bar.
+    pub fn workspace_bar(&self) -> Vec<String> {
+        let mut v: Vec<String> = dock::WORKSPACE_BAR.iter().map(|s| s.to_string()).collect();
+        v.extend(self.saved_workspace_names());
+        if !self.ui.workspace.is_empty() && !v.contains(&self.ui.workspace) {
+            v.push(self.ui.workspace.clone());
+        }
+        v
+    }
+
     /// The workspaces the user saved under a new name (built-ins whose changes were saved are
     /// not repeated), in name order.
     pub fn saved_workspace_names(&self) -> Vec<String> {

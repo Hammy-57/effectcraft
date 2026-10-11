@@ -234,29 +234,41 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     if mresp.clicked() {
         widgets::open_popup(ui, egui::Id::new("ws-pop"));
     }
-    let names: Vec<String> = crate::dock::WORKSPACES.iter().map(|s| s.to_string()).collect();
-    if let Some(i) = widgets::popup_menu(
-        ui,
-        egui::Id::new("ws-pop"),
-        more.left_bottom() - vec2(140.0, 0.0),
-        &names,
-        crate::dock::WORKSPACES.iter().position(|w| *w == app.ui.workspace),
-    ) {
-        app.set_workspace(crate::dock::WORKSPACES[i]);
+    // The » list: every workspace (built-in, then saved), the current one checked.
+    if widgets::popup_is_open(ui, egui::Id::new("ws-pop")) {
+        let names = app.workspace_names();
+        let current = names.iter().position(|w| *w == app.ui.workspace);
+        if let Some(name) = widgets::popup_menu(ui, egui::Id::new("ws-pop"), more.left_bottom() - vec2(140.0, 0.0), &names, current).and_then(|i| names.get(i)) {
+            app.set_workspace(name);
+        }
     }
     rx = more.min.x - 6.0;
-    // After Effects 2026's workspace bar order (right to left here): Default, Review, Learn,
-    // Small Screen, Standard.
-    let shown = ["Standard", "Small Screen", "Learn", "Review", "Default"];
-    for name in shown {
-        let g = p.layout_no_wrap(name.to_string(), Tokens::ui(12.0), t.text);
-        let w = g.size().x + 16.0;
-        let r = Rect::from_min_max(pos2(rx - w, cy - 13.0), pos2(rx, cy + 13.0));
-        if r.min.x < x + 120.0 {
+    // The bar (After Effects 2026's: Default, Review, Learn, Small Screen, Standard, then saved
+    // workspaces), from the right while there is room. The current workspace always keeps its
+    // place, in blue and underlined, even when the others don't all fit (in a window too narrow
+    // for it as well, the » list's check mark shows it).
+    let bar: Vec<(String, std::sync::Arc<egui::Galley>)> =
+        app.workspace_bar().into_iter().map(|name| (name.clone(), p.layout_no_wrap(name, Tokens::ui(12.0), t.text))).collect();
+    let width = |g: &egui::Galley| g.size().x + 16.0 + 2.0;
+    let room = rx - (x + 120.0);
+    let current = bar.iter().find(|(n, _)| *n == app.ui.workspace).map_or(0.0, |(_, g)| width(g));
+    let mut left = room - current;
+    let mut shown = vec![false; bar.len()];
+    for (i, (name, g)) in bar.iter().enumerate().rev() {
+        if *name == app.ui.workspace {
+            shown[i] = left >= 0.0;
+        } else if width(g) <= left {
+            left -= width(g);
+            shown[i] = true;
+        } else {
             break;
         }
+    }
+    for ((name, g), _) in bar.into_iter().zip(shown).rev().filter(|(_, s)| *s) {
+        let w = g.size().x + 16.0;
+        let r = Rect::from_min_max(pos2(rx - w, cy - 13.0), pos2(rx, cy + 13.0));
         let active = app.ui.workspace == name;
-        let resp = ui.interact(r, egui::Id::new(("ws", name)), Sense::click());
+        let resp = ui.interact(r, egui::Id::new(("ws", &name)), Sense::click());
         let col = if active {
             t.hot_text
         } else if resp.hovered() {
@@ -268,9 +280,9 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         if active {
             p.line_segment([pos2(r.min.x + 8.0, r.max.y - 3.0), pos2(r.max.x - 8.0, r.max.y - 3.0)], Stroke::new(2.0, t.hot_text));
         }
-        app.auto.add(&format!("header.workspace.{name}"), r, name);
+        app.auto.add(&format!("header.workspace.{name}"), r, &name);
         if resp.clicked() {
-            app.set_workspace(name);
+            app.set_workspace(&name);
         }
         rx = r.min.x - 2.0;
     }

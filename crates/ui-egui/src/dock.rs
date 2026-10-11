@@ -313,6 +313,11 @@ pub const WORKSPACES: &[&str] = &[
     "Undocked Panels",
 ];
 
+/// The built-in workspaces in the Tools bar's workspace switcher, left to right (After Effects
+/// 2026's bar); the rest are in its » menu. Saved workspaces follow them
+/// ([`crate::EffectcraftApp::workspace_bar`]).
+pub const WORKSPACE_BAR: &[&str] = &["Default", "Review", "Learn", "Small Screen", "Standard"];
+
 /// The floating panels a workspace starts with (Undocked Panels), in points for a window of
 /// about 1680×1020 (they are kept inside the window when drawn).
 pub fn workspace_floating(name: &str) -> Vec<Floating> {

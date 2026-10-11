@@ -200,6 +200,78 @@ fn saved_workspace_is_listed_in_the_workspace_menu() {
     assert_eq!(h.state().ui.dock, saved, "its layout came back");
 }
 
+/// The workspaces in the Tools bar's switcher and the one shown selected there (blue text,
+/// underlined).
+fn workspace_bar(h: &Harness<'_, EffectcraftApp>) -> (Vec<String>, Vec<String>) {
+    fn underlines(s: &egui::Shape, hot: egui::Color32, out: &mut Vec<Pos2>) {
+        match s {
+            egui::Shape::LineSegment { points, stroke } if stroke.color == hot && stroke.width == 2.0 => out.push(points[0].lerp(points[1], 0.5)),
+            egui::Shape::Vec(v) => v.iter().for_each(|s| underlines(s, hot, out)),
+            _ => {}
+        }
+    }
+    let mut lines = vec![];
+    h.output().shapes.iter().for_each(|c| underlines(&c.shape, h.state().tokens.hot_text, &mut lines));
+    let bar = h.state().auto.query_current("header.workspace.");
+    let rect = |e: &effectcraft_ui_egui::automation::Element| egui::Rect::from_min_size(pos2(e.rect[0], e.rect[1]), egui::vec2(e.rect[2], e.rect[3]));
+    let selected = bar.iter().filter(|e| lines.iter().any(|p| rect(e).contains(*p))).map(|e| e.label.clone()).collect();
+    let mut bar: Vec<_> = bar.into_iter().collect();
+    bar.sort_by(|a, b| a.rect[0].total_cmp(&b.rect[0]));
+    (bar.into_iter().map(|e| e.label.clone()).collect(), selected)
+}
+
+/// The Tools bar's workspace switcher shows the current workspace (the one Window ▸ Workspace
+/// checks), selected: a workspace saved with Save as New Workspace joins the bar and the » list
+/// as the current one (it was missing from both, and nothing in the bar was selected); one
+/// chosen from the » list or Window ▸ Workspace that isn't in the bar is put there, even in a
+/// narrow window; renaming or deleting it in Edit Workspaces updates the bar.
+#[test]
+fn workspace_bar_shows_the_current_workspace() {
+    use effectcraft_ui_egui::menus::invoke;
+    let mut h = harness();
+    let ctx = h.ctx.clone();
+    let after_effects = ["Default", "Review", "Learn", "Small Screen", "Standard"].map(String::from).to_vec();
+    assert_eq!(workspace_bar(&h), (after_effects.clone(), vec!["Default".to_string()]));
+    invoke(h.state_mut(), &ctx, "window.saveWorkspaceAs", json!({"name": "Wide monitor"})).unwrap();
+    h.run_steps(3);
+    let (bar, selected) = workspace_bar(&h);
+    assert_eq!(bar, [&after_effects[..], &["Wide monitor".to_string()]].concat());
+    assert_eq!(selected, ["Wide monitor"]);
+    // The » list has it too, checked.
+    click(&mut h, "header.workspaces");
+    use egui_kittest::kittest::NodeT;
+    let entry = h.get_by_label("Wide monitor");
+    assert_eq!(entry.accesskit_node().toggled(), Some(egui::accesskit::Toggled::True), "checked in the » list");
+    // A workspace from the » list that isn't in the bar shows there, selected.
+    let animation = h.query_all_by_label("Animation").find(|n| n.accesskit_node().toggled().is_some()).expect("Animation in the » list").rect().center();
+    click_at(&mut h, animation);
+    assert_eq!(h.state().ui.workspace, "Animation");
+    assert_eq!(workspace_bar(&h).1, ["Animation"]);
+    assert_eq!(workspace_bar(&h).0.last().map(String::as_str), Some("Animation"));
+    // The bar's own tab and Window ▸ Workspace switch it too.
+    click(&mut h, "header.workspace.Wide monitor");
+    assert_eq!((h.state().ui.workspace.as_str(), workspace_bar(&h).1), ("Wide monitor", vec!["Wide monitor".to_string()]));
+    invoke(h.state_mut(), &ctx, "window.workspace", json!({"name": "Essential Graphics"})).unwrap();
+    h.run_steps(3);
+    assert_eq!(workspace_bar(&h).1, ["Essential Graphics"]);
+    assert!(!workspace_bar(&h).0.contains(&"Animation".to_string()), "a workspace left from the » list leaves the bar");
+    // In a narrower window the others give way, not the current one.
+    h.set_size(egui::vec2(1300.0, 1000.0));
+    h.run_steps(3);
+    let (bar, selected) = workspace_bar(&h);
+    assert!(bar.len() < after_effects.len() + 2, "the window is narrow enough to leave some out: {bar:?}");
+    assert_eq!(selected, ["Essential Graphics"]);
+    h.set_size(egui::vec2(1600.0, 1000.0));
+    // Edit Workspaces: renaming the current one renames its tab; deleting it goes to Default.
+    invoke(h.state_mut(), &ctx, "window.workspace", json!({"name": "Wide monitor"})).unwrap();
+    invoke(h.state_mut(), &ctx, "window.editWorkspaces", json!({"name": "Wide monitor", "rename": "Edit Bay"})).unwrap();
+    h.run_steps(3);
+    assert_eq!(workspace_bar(&h), ([&after_effects[..], &["Edit Bay".to_string()]].concat(), vec!["Edit Bay".to_string()]));
+    invoke(h.state_mut(), &ctx, "window.editWorkspaces", json!({"name": "Edit Bay", "delete": true})).unwrap();
+    h.run_steps(3);
+    assert_eq!(workspace_bar(&h), (after_effects, vec!["Default".to_string()]));
+}
+
 /// Edit ▸ Label shows each label's colour before its name (#290), and choosing one labels the
 /// selected layer.
 #[test]
