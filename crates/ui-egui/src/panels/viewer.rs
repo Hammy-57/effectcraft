@@ -679,6 +679,15 @@ pub(crate) fn checker(p: &egui::Painter, r: Rect) {
     }
 }
 
+/// Keep asynchronously completed geometry from moving a pressed handle before the gesture
+/// crosses its drag threshold. Once captured, the gesture owns its anchor and meshes stay live.
+fn hold_puppet_overlay(ctx: &egui::Context) -> bool {
+    let Some(response) = ctx.read_response(egui::Id::new("viewer-interact")) else { return false };
+    let owns_pointer = response.is_pointer_button_down_on() || response.clicked_by(egui::PointerButton::Primary);
+    let captured = ctx.data(|d| d.get_temp::<Gesture>(egui::Id::new("viewer-gesture")).is_some());
+    owns_pointer && (ctx.input(|i| i.pointer.primary_pressed()) || !captured)
+}
+
 pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let t = app.tokens;
     let ctx = ui.ctx().clone();
@@ -1066,10 +1075,11 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     // tools work on).
     let mut puppet_layers: Vec<(&Layer, super::puppet_tool::Overlay)> = vec![];
     if app.ui.tool.puppet_kind().is_some() {
+        let hold_mesh = hold_puppet_overlay(&ctx);
         let sel_props: Vec<u64> = app.session.state.selected_props.iter().map(|(_, u)| *u).collect();
         for lid in &selected {
             if let Some(l) = comp.layer(*lid)
-                && let Some(ov) = super::puppet_tool::overlay(app, &ctx, cid, l, time)
+                && let Some(ov) = super::puppet_tool::overlay(app, &ctx, cid, l, time, hold_mesh)
             {
                 let hover = ui.input(|i| i.pointer.hover_pos());
                 pin_hits.extend(super::puppet_tool::draw(&painter, &map, &ectx, l, &ov, app.session.state.puppet.show_mesh, &sel_props, hover));
@@ -2264,5 +2274,48 @@ fn show_frame(app: &mut EffectcraftApp, ctx: &egui::Context, key: crate::frames:
             // Pixels are read back on demand (viewer_pixels).
             app.viewer_image = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod puppet_input_tests {
+    use super::*;
+
+    #[test]
+    fn mesh_adoption_waits_for_capture_but_not_for_drag_release() {
+        let ctx = egui::Context::default();
+        let area = Rect::from_min_max(pos2(0.0, 0.0), pos2(200.0, 200.0));
+        let point = pos2(40.0, 40.0);
+        let button = |pressed| egui::Event::PointerButton { pos: point, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        let frame = |events| {
+            let mut hold = false;
+            let mut out = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
+                // Match the viewer: read the current input response before declaring its widget.
+                hold = hold_puppet_overlay(&ctx);
+                let _ = ui.interact(area, egui::Id::new("viewer-interact"), Sense::click_and_drag());
+                let _ = ui.interact(Rect::from_min_max(pos2(250.0, 0.0), pos2(350.0, 200.0)), egui::Id::new("properties"), Sense::click_and_drag());
+            });
+            out.textures_delta.clear();
+            hold
+        };
+        assert!(!frame(vec![]));
+        assert!(frame(vec![egui::Event::PointerMoved(point), button(true)]), "press uses presented geometry");
+        assert!(frame(vec![]), "the pointer has not crossed the drag threshold yet");
+        let gesture_id = egui::Id::new("viewer-gesture");
+        ctx.data_mut(|d| d.insert_temp(gesture_id, Gesture::PuppetScale { layer: LayerId(1), pin: 2, center: point, start: 9.0, scale: 1.0 }));
+        assert!(!frame(vec![egui::Event::PointerMoved(point + vec2(10.0, 0.0))]), "captured drag keeps mesh feedback live");
+        assert!(!frame(vec![button(false)]), "captured release uses the gesture's stored anchor");
+        ctx.data_mut(|d| d.remove::<Gesture>(gesture_id));
+        assert!(frame(vec![button(true)]));
+        assert!(frame(vec![button(false)]), "a click still needs the original hit on release");
+        assert!(!frame(vec![]), "idle adopts the completed geometry");
+        let property = pos2(300.0, 40.0);
+        assert!(
+            !frame(vec![
+                egui::Event::PointerMoved(property),
+                egui::Event::PointerButton { pos: property, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }
+            ]),
+            "a numeric property drag outside the viewer keeps mesh feedback live"
+        );
     }
 }
