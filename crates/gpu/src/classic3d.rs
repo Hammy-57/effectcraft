@@ -140,7 +140,7 @@ pub(crate) fn draw_run(e: &mut Enc, run: &Run3d, canvas: &GpuImage) -> Option<Gp
     // here when the plane has it.
     let mut texs: Vec<(GpuImage, [f64; 2])> = Vec::with_capacity(run.planes.len());
     for p in &run.planes {
-        let up = e.g.upload_buf(&p.buf)?;
+        let up = e.upload_buf(&p.buf)?;
         match &p.dof {
             Some(d) => {
                 let pad = d.pad as f64;

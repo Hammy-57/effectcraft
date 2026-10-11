@@ -132,7 +132,12 @@ impl effectcraft_render::FxTarget for GpuFx<'_, '_> {
     }
 }
 
+#[cfg(test)]
+static EFFECT_CHAIN_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 pub(crate) fn apply_chain(e: &mut Enc, chain: &[FxStep], mut b: GBuf, levels: Option<f32>) -> Option<GBuf> {
+    #[cfg(test)]
+    EFFECT_CHAIN_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     e.take_missing();
     let mut remaining = chain;
     while let Some((step, rest)) = remaining.split_first() {
@@ -602,7 +607,17 @@ mod keep_tests {
         r.accel = Some(g);
         r.cache = Some(&cache);
         let before = g.ctx.transfer_stats();
-        let img = r.comp_frame(s.cid, Tick::ZERO);
+        // Exercise the legacy eager effects_kept contract explicitly. The ordinary
+        // resident producer has separate demand/transfer tests.
+        let img = g
+            .within_memory(|| {
+                let mut enc = crate::context::Enc::with_owner(&g.ctx, cache.gpu_owner());
+                let image = crate::walk::render(&mut enc, &r, s.cid, Tick::ZERO).unwrap();
+                let result = enc.download(&image).unwrap();
+                enc.publish_native();
+                result
+            })
+            .unwrap();
         let after = g.ctx.transfer_stats();
         g.ctx.set_keep_effects(true);
         let d = crate::TransferStats {
@@ -614,6 +629,138 @@ mod keep_tests {
             yuv_bytes: after.yuv_bytes - before.yuv_bytes,
         };
         (img, d)
+    }
+
+    #[test]
+    fn ordinary_resident_transform_and_lazy_cpu_are_stage_exact() {
+        let Some(g) = crate::tests::gpu() else { return };
+        eprintln!("resident proof adapter: {}", g.ctx.name);
+        for depth in [BitDepth::Bpc8, BitDepth::Bpc16, BitDepth::Bpc32] {
+            for linear in [false, true] {
+                for scale in [1.0, 0.5] {
+                    g.ctx.clear_uploads();
+                    let mut s = Scene::new(depth);
+                    s.p.settings.blend_linear = linear;
+                    let mut layer = s.solid([0.72, 0.31, 0.13], 31, 23);
+                    s.effect(&mut layer, "ec.color.levels", &[("gamma", n(1.3))]);
+                    let id = s.push(layer);
+                    let cache = LayerCache::default();
+                    let opts = RenderOpts { backend: Backend::Gpu, scale, ..Default::default() };
+                    {
+                        let mut r = Renderer::new(&s.p, &Pattern, opts);
+                        r.accel = Some(g);
+                        r.cache = Some(&cache);
+                        let before = g.ctx.transfer_stats();
+                        g.within_memory(|| g.render_display(&r, s.cid, Tick::ZERO)).unwrap().unwrap();
+                        let after = g.ctx.transfer_stats();
+                        assert_eq!(after.readbacks, before.readbacks, "cold producer stays resident");
+                        let ctx = r.eval_ctx(s.cid, Tick::ZERO).unwrap();
+                        let layer = ctx.comp.layers.iter().find(|l| l.id == id).unwrap();
+                        let key = r.resident_content_key(&ctx, layer).unwrap();
+                        assert!(
+                            cache.gpu_owner().unwrap().resident(key, effectcraft_render::cache::GpuStage::Processed).is_some(),
+                            "actual ordinary resident route"
+                        );
+                    }
+                    set(s.p.comp_mut(s.cid).unwrap().layers.iter_mut().find(|l| l.id == id).unwrap(), "transform/position", v3(42.0, 27.0));
+                    let mut r = Renderer::new(&s.p, &Pattern, opts);
+                    r.accel = Some(g);
+                    r.cache = Some(&cache);
+                    let before = g.ctx.transfer_stats();
+                    let effect_calls = super::EFFECT_CHAIN_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+                    let display = g.within_memory(|| g.render_display(&r, s.cid, Tick::ZERO)).unwrap().unwrap();
+                    let warm = g.ctx.transfer_stats();
+                    assert_eq!(super::EFFECT_CHAIN_CALLS.load(std::sync::atomic::Ordering::Relaxed), effect_calls, "warm transform effect work");
+                    assert_eq!(warm.uploads, before.uploads, "warm transform uploads {depth:?}/{linear}/{scale}");
+                    assert_eq!(warm.readbacks, before.readbacks, "warm transform readbacks");
+                    let actual = g.read_display(&display).unwrap();
+                    let ctx = r.eval_ctx(s.cid, Tick::ZERO).unwrap();
+                    let layer = ctx.comp.layers.iter().find(|l| l.id == id).unwrap();
+                    let before = g.ctx.transfer_stats();
+                    if linear {
+                        r.styled_layer(&ctx, layer).unwrap();
+                    }
+                    let materialized = r.content_buf(&ctx, layer).unwrap();
+                    let after = g.ctx.transfer_stats();
+                    assert_eq!(after.readbacks - before.readbacks, 1, "one CPU demand readback");
+                    assert!(std::sync::Arc::ptr_eq(&materialized, &r.content_buf(&ctx, layer).unwrap()));
+                    assert_eq!(g.ctx.transfer_stats().readbacks, after.readbacks);
+                    let mut legacy = Renderer::new(&s.p, &Pattern, opts);
+                    legacy.accel = Some(g);
+                    let legacy_ctx = legacy.eval_ctx(s.cid, Tick::ZERO).unwrap();
+                    let legacy_layer = legacy_ctx.comp.layers.iter().find(|l| l.id == id).unwrap();
+                    let expected = legacy.content_buf(&legacy_ctx, legacy_layer).unwrap();
+                    assert_eq!(materialized.offset, expected.offset);
+                    assert_eq!(materialized.scale, expected.scale);
+                    assert_eq!(materialized.img.data, expected.img.data, "Processed fidelity {depth:?}/{linear}/{scale}");
+                    let expected_display = g
+                        .within_memory(|| {
+                            let mut enc = crate::context::Enc::with_owner(&g.ctx, None);
+                            let img = crate::walk::render(&mut enc, &legacy, s.cid, Tick::ZERO).unwrap();
+                            let texture = enc.display(&img);
+                            enc.submit();
+                            crate::DisplayFrame { texture, width: img.width, height: img.height }
+                        })
+                        .unwrap();
+                    assert_eq!(actual, g.read_display(&expected_display).unwrap(), "display fidelity {depth:?}/{linear}/{scale}");
+                    eprintln!(
+                        "resident {depth:?} linear={linear} scale={scale}: warm uploads=0 readbacks=0 effect-chains=0; demand=1; exact Processed/display"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_resident_cpu_boundary_and_denied_retention_stay_correct() {
+        let Some(g) = crate::tests::gpu() else { return };
+        for budget in [16 << 20, 0] {
+            g.ctx.clear_uploads();
+            let mut s = Scene::new(BitDepth::Bpc32);
+            let mut layer = s.footage(40, 30);
+            s.effect(&mut layer, "ec.blur.fastbox", &[("radius", n(3.0))]);
+            s.effect(&mut layer, "ec.generate.fractal", &[]);
+            let id = s.push(layer);
+            let cache = LayerCache::new(budget);
+            let mut r = Renderer::new(&s.p, &Pattern, RenderOpts { backend: Backend::Gpu, ..Default::default() });
+            r.accel = Some(g);
+            r.cache = Some(&cache);
+            let before = g.ctx.transfer_stats();
+            let display = g.within_memory(|| g.render_display(&r, s.cid, Tick::ZERO)).unwrap().unwrap();
+            let cold = g.ctx.transfer_stats();
+            assert!(cold.readbacks > before.readbacks, "real CPU-only effect boundary");
+            let actual = g.read_display(&display).unwrap();
+            let ctx = r.eval_ctx(s.cid, Tick::ZERO).unwrap();
+            let layer = ctx.comp.layers.iter().find(|l| l.id == id).unwrap();
+            let key = r.resident_content_key(&ctx, layer).unwrap();
+            assert_eq!(cache.gpu_owner().unwrap().resident(key, effectcraft_render::cache::GpuStage::Processed).is_some(), budget > 0);
+            let before = g.ctx.transfer_stats();
+            let calls = super::EFFECT_CHAIN_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+            let again = g.within_memory(|| g.render_display(&r, s.cid, Tick::ZERO)).unwrap().unwrap();
+            let warm = g.ctx.transfer_stats();
+            if budget > 0 {
+                assert_eq!(warm.uploads, before.uploads);
+                assert_eq!(warm.readbacks, before.readbacks);
+                assert_eq!(super::EFFECT_CHAIN_CALLS.load(std::sync::atomic::Ordering::Relaxed), calls);
+            } else {
+                assert_eq!(cache.retained_stats().live_bytes, 0);
+                assert!(warm.readbacks > before.readbacks, "denial safely recomputes");
+            }
+            assert_eq!(actual, g.read_display(&again).unwrap());
+            let mut legacy = Renderer::new(&s.p, &Pattern, RenderOpts { backend: Backend::Gpu, ..Default::default() });
+            legacy.accel = Some(g);
+            let expected = g
+                .within_memory(|| {
+                    let mut enc = crate::context::Enc::with_owner(&g.ctx, None);
+                    let img = crate::walk::render(&mut enc, &legacy, s.cid, Tick::ZERO).unwrap();
+                    let texture = enc.display(&img);
+                    enc.submit();
+                    crate::DisplayFrame { texture, width: img.width, height: img.height }
+                })
+                .unwrap();
+            assert_eq!(actual, g.read_display(&expected).unwrap(), "CPU-boundary fidelity, budget {budget}");
+            eprintln!("ordinary CPU boundary/denial: budget={budget}, correct output and bounded retention");
+        }
     }
 
     /// A layer whose effect stack ends in a GPU chain composites from the chain's result: the

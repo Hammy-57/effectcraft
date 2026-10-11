@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 use effectcraft_effects::Buf;
 use effectcraft_raster::Image;
+use effectcraft_render::cache::{GpuOwner, GpuPending, GpuSlot, GpuStage};
 
 /// Compute entry points in `kernels.wgsl` (one pipeline each).
 const ENTRIES: &[&str] = &[
@@ -63,13 +64,21 @@ pub struct GpuImage {
     /// Already clamped and quantised to this many levels (8/16 bpc), so quantising again is a
     /// no-op (see `ops::quantize`).
     pub(crate) levels: Option<f32>,
+    // Last field: resource handles/lease are dropped before the accounting pin.
+    pub(crate) allocation: Option<Arc<effectcraft_render::allocation::GpuAllocation>>,
 }
 
 impl GpuImage {
     /// An image on a texture of its own (not pooled).
     pub fn new(texture: wgpu::Texture, width: u32, height: u32) -> GpuImage {
+        Self::in_generation(texture, width, height, effectcraft_render::allocation::GpuGeneration::default())
+    }
+    fn in_generation(texture: wgpu::Texture, width: u32, height: u32, generation: effectcraft_render::allocation::GpuGeneration) -> GpuImage {
+        let allocation = (texture.format() == FORMAT && texture.mip_level_count() == 1 && texture.sample_count() == 1 && texture.depth_or_array_layers() == 1)
+            .then(|| effectcraft_render::allocation::GpuAllocation::rgba_f32(texture.width(), texture.height(), generation))
+            .flatten();
         let view = texture.create_view(&Default::default());
-        GpuImage { texture, width, height, view, _lease: None, levels: None }
+        GpuImage { allocation, texture, width, height, view, _lease: None, levels: None }
     }
 }
 
@@ -215,6 +224,22 @@ impl Pool {
         }
     }
 
+    /// A last CPU lease released within the sole open encoder can be reused by
+    /// later commands in that encoder. Separate encoders retain the submit barrier.
+    fn take_for_encoder(&mut self, w: u32, h: u32, encoder: Option<u64>) -> Option<wgpu::Texture> {
+        if let Some(id) = encoder.filter(|id| *id != 0)
+            && self.open.len() == 1
+            && self.open.contains(&id)
+            && let Some(index) = self.released.iter().position(|(texture, owner)| *owner == id && texture.width() == w && texture.height() == h)
+        {
+            let (texture, _) = self.released.swap_remove(index);
+            self.released_bytes = self.released_bytes.saturating_sub(tex_bytes(&texture));
+            self.hits = self.hits.saturating_add(1);
+            return Some(texture);
+        }
+        self.take(w, h)
+    }
+
     fn take(&mut self, w: u32, h: u32) -> Option<wgpu::Texture> {
         let t = self.free.get_mut(&(w, h)).and_then(Vec::pop);
         if self.free.get(&(w, h)).is_some_and(Vec::is_empty) {
@@ -314,92 +339,99 @@ impl Params {
     }
 }
 
+#[derive(Clone)]
+struct SlotRef {
+    owner: GpuOwner,
+    slot: Weak<GpuSlot>,
+    epoch: Weak<()>,
+}
+impl SlotRef {
+    fn release(self) {
+        self.owner.release(&self.slot);
+    }
+    fn get<T: Clone + 'static>(&self, generation: &effectcraft_render::allocation::GpuGeneration, stage: GpuStage) -> Option<T> {
+        self.owner.get(&self.slot, generation, stage)?.payload::<T>().cloned()
+    }
+    fn alive(&self) -> bool {
+        self.owner.valid() && self.epoch.strong_count() > 0 && self.slot.strong_count() > 0
+    }
+}
+#[derive(Clone)]
 struct Upload {
     buf: Weak<Buf>,
-    img: GpuImage,
-    bytes: usize,
-    last_use: u64,
+    slot: SlotRef,
 }
-
 #[derive(Clone)]
 pub(crate) struct NativeImage {
     pub img: GpuImage,
     pub offset: [f64; 2],
     pub scale: f64,
 }
+#[derive(Clone)]
 struct NativeUpload {
     owner: Weak<dyn effectcraft_render::footage::FramePixels>,
     token: effectcraft_render::cache::ResidentToken,
     metadata: Vec<u64>,
-    image: NativeImage,
-    bytes: usize,
-    last_use: u64,
+    slot: SlotRef,
 }
-
 #[derive(Default)]
 struct Uploads {
-    map: HashMap<usize, Upload>,
+    map: HashMap<(usize, usize), Upload>,
     native: HashMap<(usize, usize, u64), NativeUpload>,
-    bytes: usize,
-    clock: u64,
-    /// Byte budget (`None`: [`UPLOAD_BUDGET`]).
+    /// Per-device ceiling; the LayerCache owns the authoritative shared budget.
     budget: Option<usize>,
-    /// Effect chain results awaiting [`GpuContext::adopt`] by the layer buffer that stores
-    /// their pixels (ticket, image), oldest first.
-    kept: Vec<(u64, GpuImage)>,
+    kept: Vec<(u64, SlotRef)>,
+    resident: Vec<SlotRef>,
     next_ticket: u64,
-    /// Effect chain results are not kept (tests compare against the re-upload).
     keep_off: bool,
+    epoch: Arc<()>,
 }
-
 impl Uploads {
-    /// Drop textures whose layer buffer is gone (evicted from the layer cache, an older frame's),
-    /// then the least recently used over budget.
-    fn trim(&mut self) {
-        self.map.retain(|_, e| e.buf.strong_count() > 0);
-        self.native.retain(|_, e| e.owner.strong_count() > 0 && e.token.valid());
-        self.bytes = self.map.values().map(|e| e.bytes).chain(self.native.values().map(|e| e.bytes)).fold(0, usize::saturating_add);
-        // Pixel bytes alone do not bound metadata for many tiny decoded frames.
-        while self.native.len() > 1024 {
-            let Some(key) = self.native.iter().min_by_key(|(_, e)| e.last_use).map(|(k, _)| *k) else { break };
-            if let Some(old) = self.native.remove(&key) {
-                self.bytes = self.bytes.saturating_sub(old.bytes);
-            }
+    /// Only weak metadata leaves this lock. Release its owner slot afterwards.
+    fn stale(&mut self) -> Option<SlotRef> {
+        if let Some(k) = self.map.iter().find(|(_, e)| e.buf.strong_count() == 0 || !e.slot.alive()).map(|(k, _)| *k) {
+            return self.map.remove(&k).map(|e| e.slot);
         }
-        let budget = self.budget.unwrap_or(UPLOAD_BUDGET);
-        // Kept effect results awaiting adoption count against the same budget.
-        self.trim_kept(0);
-        let kept = self.kept.iter().map(|(_, img)| img_bytes(img)).fold(0, usize::saturating_add);
-        while self.bytes.saturating_add(kept) > budget {
-            let plain = self.map.iter().min_by_key(|(_, e)| e.last_use).map(|(k, e)| (*k, e.last_use));
-            let native = self.native.iter().min_by_key(|(_, e)| e.last_use).map(|(k, e)| (*k, e.last_use));
-            let bytes = match (plain, native) {
-                (Some((k, a)), Some((_, b))) if a <= b => self.map.remove(&k).map(|e| e.bytes),
-                (_, Some((k, _))) => self.native.remove(&k).map(|e| e.bytes),
-                (Some((k, _)), None) => self.map.remove(&k).map(|e| e.bytes),
-                (None, None) => break,
-            };
-            self.bytes = self.bytes.saturating_sub(bytes.unwrap_or(0));
+        if let Some(k) = self.native.iter().find(|(_, e)| e.owner.strong_count() == 0 || !e.token.valid() || !e.slot.alive()).map(|(k, _)| *k) {
+            return self.native.remove(&k).map(|e| e.slot);
         }
-    }
-
-    /// Drop the oldest kept effect results until they and `extra` more bytes fit the budget.
-    fn trim_kept(&mut self, extra: usize) {
-        let budget = self.budget.unwrap_or(UPLOAD_BUDGET);
-        let mut kept = self.kept.iter().map(|(_, img)| img_bytes(img)).fold(extra, usize::saturating_add);
-        while kept > budget && !self.kept.is_empty() {
-            kept = kept.saturating_sub(img_bytes(&self.kept.remove(0).1));
+        if let Some(i) = self.kept.iter().position(|(_, e)| !e.alive()) {
+            return Some(self.kept.remove(i).1);
         }
+        if let Some(i) = self.resident.iter().position(|e| !e.alive()) {
+            return Some(self.resident.remove(i));
+        }
+        None
     }
 }
 
-/// Bytes of an RGBA f32 image.
-fn img_bytes(img: &GpuImage) -> usize {
-    (img.width as usize).saturating_mul(img.height as usize).saturating_mul(16)
+/// Drain weak indexes and release every scoped owner after the index lock.
+fn clear_retained(uploads: &Mutex<Uploads>) {
+    let old = if let Ok(mut u) = uploads.lock() {
+        u.epoch = Arc::new(());
+        Some((std::mem::take(&mut u.map), std::mem::take(&mut u.native), std::mem::take(&mut u.kept), std::mem::take(&mut u.resident)))
+    } else {
+        None
+    };
+    if let Some((map, native, kept, resident)) = old {
+        for (_, e) in map {
+            e.slot.release();
+        }
+        for (_, e) in native {
+            e.slot.release();
+        }
+        for e in resident {
+            e.release();
+        }
+        for (_, e) in kept {
+            e.release();
+        }
+    }
 }
 
 /// The device and everything compiled for it.
 pub struct GpuContext {
+    generation: effectcraft_render::allocation::GpuGeneration,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub(crate) name: String,
@@ -424,7 +456,7 @@ pub struct GpuContext {
     uniform_stride: u64,
     /// Uniform rings no [`Enc`] holds (reused: see [`Enc::dispatch_ext`]).
     uniforms: Mutex<Vec<wgpu::Buffer>>,
-    uploads: Mutex<Uploads>,
+    uploads: Arc<Mutex<Uploads>>,
     pool: Arc<Mutex<Pool>>,
     /// CPU ↔ GPU traffic (diagnostics: `bench --gpu`).
     pub(crate) transfers: Transfers,
@@ -754,7 +786,9 @@ impl GpuContext {
         let dummy_buf =
             init_resource(&device, "dummy storage buffer", || buffer_init(&device, &queue, Some("dummy"), &[0u8; 16], wgpu::BufferUsages::STORAGE))?;
         let dummy_tex = init_resource(&device, "dummy texture view", || dummy.create_view(&Default::default()))?;
-        let dummy = GpuImage { texture: dummy, width: 1, height: 1, view: dummy_tex, _lease: None, levels: None };
+        let generation = effectcraft_render::allocation::GpuGeneration::default();
+        let allocation = effectcraft_render::allocation::GpuAllocation::rgba_f32(1, 1, generation.clone());
+        let dummy = GpuImage { allocation, texture: dummy, width: 1, height: 1, view: dummy_tex, _lease: None, levels: None };
         let align = u64::from(device.limits().min_uniform_buffer_offset_alignment.max(1));
         let uniform_stride = PARAMS_SIZE.div_ceil(align).saturating_mul(align);
         let max_dim = device.limits().max_texture_dimension_2d;
@@ -769,6 +803,7 @@ impl GpuContext {
         };
         let static_pipeline_count = std::sync::atomic::AtomicU64::new(pipelines.len() as u64 + 2 + if yuv.is_some() { 2 } else { 0 });
         Ok(GpuContext {
+            generation,
             device,
             queue,
             name,
@@ -786,7 +821,7 @@ impl GpuContext {
             dummy_buf,
             uniform_stride,
             uniforms: Default::default(),
-            uploads: Mutex::new(Uploads { budget: Some(upload_budget), ..Default::default() }),
+            uploads: Arc::new(Mutex::new(Uploads { budget: Some(upload_budget), ..Default::default() })),
             pool: Arc::new(Mutex::new(Pool { budget: Some(pool_budget), ..Default::default() })),
             integrated,
             auxiliary_budget: std::sync::atomic::AtomicU64::new(auxiliary_budget),
@@ -807,7 +842,12 @@ impl GpuContext {
     /// A successful check is not a guarantee against faults after it returns.
     /// Shared-device hosts must forward their device failures through the notifier.
     pub fn check_health(&self) -> Result<(), String> {
-        self.readbacks.check()
+        let result = self.readbacks.check();
+        if result.is_err() {
+            self.generation.retire();
+            clear_retained(&self.uploads);
+        }
+        result
     }
 
     /// A notification hook for the owner of a shared device's error/loss handlers.
@@ -818,7 +858,16 @@ impl GpuContext {
     /// Shared-device construction does not automatically subscribe to device faults:
     /// without host forwarding, readbacks rely on poll errors and their deadlines.
     pub fn device_failure_notifier(&self) -> impl Fn(String) + Send + Sync + 'static {
-        crate::readback::failure_notifier(&self.readbacks)
+        let notify = crate::readback::failure_notifier(&self.readbacks);
+        let uploads = Arc::downgrade(&self.uploads);
+        let generation = self.generation.clone();
+        move |message| {
+            generation.retire();
+            notify(message);
+            if let Some(uploads) = uploads.upgrade() {
+                clear_retained(&uploads);
+            }
+        }
     }
 
     /// All device polling routes through this failure bridge.
@@ -1035,7 +1084,7 @@ impl GpuContext {
 
     /// A new (zeroed) texture of its own (not pooled).
     pub(crate) fn image(&self, w: u32, h: u32) -> GpuImage {
-        GpuImage::new(self.texture(w, h), w, h)
+        GpuImage::in_generation(self.texture(w, h), w, h, self.generation.clone())
     }
 
     fn texture(&self, w: u32, h: u32) -> wgpu::Texture {
@@ -1053,14 +1102,21 @@ impl GpuContext {
 
     /// A pooled working texture: (image, reused). A reused texture holds old pixels; a new
     /// one is zeroed.
-    fn pooled(&self, w: u32, h: u32) -> (GpuImage, bool) {
+    fn pooled_for_encoder(&self, w: u32, h: u32, encoder: Option<u64>) -> (GpuImage, bool) {
+        #[cfg(feature = "profile")]
+        let encoder = {
+            static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *ENABLED.get_or_init(|| std::env::var("EFFECTCRAFT_ENCODER_REUSE").as_deref() != Ok("0")) { encoder } else { None }
+        };
+
         let (w, h) = (w.max(1), h.max(1));
-        let reused = self.pool.lock().ok().and_then(|mut p| p.take(w, h));
+        let reused = self.pool.lock().ok().and_then(|mut p| p.take_for_encoder(w, h, encoder));
         let was_reused = reused.is_some();
         let texture = reused.unwrap_or_else(|| self.texture(w, h));
         let lease = Arc::new(Lease { texture: texture.clone(), pool: Arc::downgrade(&self.pool) });
         let view = texture.create_view(&Default::default());
-        (GpuImage { texture, width: w, height: h, view, _lease: Some(lease), levels: None }, was_reused)
+        let allocation = effectcraft_render::allocation::GpuAllocation::rgba_f32(w, h, self.generation.clone());
+        (GpuImage { allocation, texture, width: w, height: h, view, _lease: Some(lease), levels: None }, was_reused)
     }
 
     /// Uploads and readbacks so far (images; uploads of cached layers count once).
@@ -1101,91 +1157,150 @@ impl GpuContext {
 
     /// Upload a (layer cache) buffer, reusing the texture while the same `Arc` is alive: static
     /// layers upload once, not every frame.
-    pub(crate) fn upload_buf(&self, buf: &Arc<Buf>) -> Option<GpuImage> {
-        let key = Arc::as_ptr(buf) as usize;
-        if let Ok(mut u) = self.uploads.lock() {
-            u.clock += 1;
-            let now = u.clock;
-            if let Some(e) = u.map.get_mut(&key)
-                && e.buf.upgrade().is_some_and(|b| Arc::ptr_eq(&b, buf))
+    fn upload_epoch(&self) -> Weak<()> {
+        self.uploads.lock().map(|u| Arc::downgrade(&u.epoch)).unwrap_or_default()
+    }
+    fn prune_uploads(&self) {
+        loop {
+            let stale = self.uploads.lock().ok().and_then(|mut u| u.stale());
+            let Some(stale) = stale else { break };
+            stale.release();
+        }
+    }
+    fn retained_cap(&self) -> usize {
+        self.uploads.lock().map(|u| u.budget.unwrap_or(UPLOAD_BUDGET)).unwrap_or(0)
+    }
+    fn upload_buf_owned(&self, buf: &Arc<Buf>, owner: Option<&GpuOwner>) -> Option<GpuImage> {
+        let epoch = self.upload_epoch();
+        self.prune_uploads();
+        if let Some(owner) = owner {
+            let key = (owner.identity(), Arc::as_ptr(buf) as usize);
+            let entry = self.uploads.lock().ok().and_then(|u| u.map.get(&key).cloned());
+            if let Some(entry) = entry
+                && entry.buf.ptr_eq(&Arc::downgrade(buf))
+                && let Some(img) = entry.slot.get(&self.generation, GpuStage::CpuMirror)
             {
-                e.last_use = now;
-                return Some(e.img.clone());
+                return Some(img);
             }
         }
         let img = self.upload_image(&buf.img)?;
-        self.register(buf, img.clone());
+        if let Some(owner) = owner {
+            self.register(buf, img.clone(), owner, &epoch);
+        }
         Some(img)
     }
-
-    /// Serve `buf` from `img` (its pixels) while `buf` lives (see [`Self::upload_buf`]).
-    fn register(&self, buf: &Arc<Buf>, img: GpuImage) {
-        let key = Arc::as_ptr(buf) as usize;
-        if let Ok(mut u) = self.uploads.lock() {
-            let bytes = buf.img.data.len() * 16;
-            let now = u.clock;
-            if let Some(old) = u.map.insert(key, Upload { buf: Arc::downgrade(buf), img, bytes, last_use: now }) {
-                u.bytes = u.bytes.saturating_sub(old.bytes);
+    fn register(&self, buf: &Arc<Buf>, img: GpuImage, owner: &GpuOwner, epoch: &Weak<()>) {
+        let Some(allocation) = img.allocation.clone() else { return };
+        if !allocation.generation().same(&self.generation) {
+            return;
+        }
+        let Ok(pending) = owner.prepare(Arc::new(img), allocation, GpuStage::CpuMirror, self.retained_cap()) else { return };
+        let Ok(slot) = pending.publish() else { return };
+        let entry = SlotRef { owner: owner.clone(), slot, epoch: epoch.clone() };
+        let key = (owner.identity(), Arc::as_ptr(buf) as usize);
+        let old = {
+            let mut u = match self.uploads.lock() {
+                Ok(u) => u,
+                Err(poison) => {
+                    drop(poison);
+                    entry.release();
+                    return;
+                }
+            };
+            if !self.generation.valid()
+                || !self.generation.within_cap()
+                || epoch.strong_count() == 0
+                || u.map.len() >= effectcraft_render::retained::MAX_RECORDS
+                || u.map.try_reserve(1).is_err()
+            {
+                drop(u);
+                entry.release();
+                return;
             }
-            u.bytes += bytes;
-            u.trim();
+            u.map.insert(key, Upload { buf: Arc::downgrade(buf), slot: entry }).map(|e| e.slot)
+        };
+        if let Some(old) = old {
+            old.release();
         }
     }
-
-    /// Keep an effect chain's result (what was read back) for [`Self::adopt`]: the ticket, or
-    /// `None` when not kept.
-    pub(crate) fn keep(&self, img: GpuImage) -> Option<u64> {
-        let mut u = self.uploads.lock().ok()?;
-        // Kept results count against the upload budget they are adopted into (#591).
-        let bytes = img_bytes(&img);
-        if u.keep_off || bytes > u.budget.unwrap_or(UPLOAD_BUDGET) {
+    fn keep_owned(&self, img: GpuImage, owner: Option<&GpuOwner>, epoch: &Weak<()>) -> Option<u64> {
+        let owner = owner?;
+        self.prune_uploads();
+        if self.uploads.lock().ok()?.keep_off {
             return None;
         }
-        u.trim_kept(bytes);
-        u.next_ticket = u.next_ticket.wrapping_add(1);
-        let t = u.next_ticket;
-        // Tickets are adopted or released right after their chain (the renderer's `Kept`
-        // guard); the cap only bounds a stray one.
-        if u.kept.len() >= MAX_KEPT {
-            u.kept.remove(0);
+        let allocation = img.allocation.clone()?;
+        if !allocation.generation().same(&self.generation) {
+            return None;
         }
-        u.kept.push((t, img));
-        u.trim();
-        Some(t)
+        let slot = owner.prepare(Arc::new(img), allocation, GpuStage::Processed, self.retained_cap()).ok()?.publish().ok()?;
+        let entry = SlotRef { owner: owner.clone(), slot, epoch: epoch.clone() };
+        let result = {
+            let mut u = match self.uploads.lock() {
+                Ok(u) => u,
+                Err(poison) => {
+                    drop(poison);
+                    entry.release();
+                    return None;
+                }
+            };
+            if !self.generation.valid()
+                || !self.generation.within_cap()
+                || epoch.strong_count() == 0
+                || u.keep_off
+                || u.kept.len() >= MAX_KEPT
+                || u.kept.try_reserve(1).is_err()
+            {
+                drop(u);
+                entry.release();
+                return None;
+            }
+            let Some(ticket) = u.next_ticket.checked_add(1) else {
+                drop(u);
+                entry.release();
+                return None;
+            };
+            u.next_ticket = ticket;
+            u.kept.push((ticket, entry));
+            ticket
+        };
+        Some(result)
     }
-
-    /// `buf` stores kept result `ticket`'s pixels: [`Self::upload_buf`] serves it from that
-    /// image while `buf` lives, within the upload budget.
     pub(crate) fn adopt(&self, ticket: u64, buf: &Arc<Buf>) {
-        let Some(img) = self.take_kept(ticket) else { return };
-        if (img.width, img.height) == (buf.img.width, buf.img.height) && !buf.img.is_empty() {
-            self.register(buf, img);
+        let Some(entry) = self.take_kept(ticket) else { return };
+        if let Some(img) = entry.get::<GpuImage>(&self.generation, GpuStage::Processed)
+            && (img.width, img.height) == (buf.img.width, buf.img.height)
+            && !buf.img.is_empty()
+        {
+            self.register(buf, img, &entry.owner, &entry.epoch);
+        }
+        entry.release();
+    }
+    pub(crate) fn release(&self, ticket: u64) {
+        if let Some(entry) = self.take_kept(ticket) {
+            entry.release();
         }
     }
-
-    /// Forget kept result `ticket`.
-    pub(crate) fn release(&self, ticket: u64) {
-        let _ = self.take_kept(ticket);
-    }
-
-    fn take_kept(&self, ticket: u64) -> Option<GpuImage> {
+    fn take_kept(&self, ticket: u64) -> Option<SlotRef> {
         let mut u = self.uploads.lock().ok()?;
         let i = u.kept.iter().position(|(t, _)| *t == ticket)?;
         Some(u.kept.remove(i).1)
     }
-
-    /// Kept effect results not adopted or released yet (tests).
     #[cfg(test)]
     pub(crate) fn kept_count(&self) -> usize {
+        self.prune_uploads();
         self.uploads.lock().map(|u| u.kept.len()).unwrap_or_default()
     }
-
-    /// Stop (or resume) keeping effect chain results: composited layers then upload again.
     #[cfg(test)]
     pub(crate) fn set_keep_effects(&self, on: bool) {
-        if let Ok(mut u) = self.uploads.lock() {
+        let old = if let Ok(mut u) = self.uploads.lock() {
             u.keep_off = !on;
-            u.kept.clear();
+            std::mem::take(&mut u.kept)
+        } else {
+            Vec::new()
+        };
+        for (_, entry) in old {
+            entry.release();
         }
     }
 
@@ -1201,8 +1316,25 @@ impl GpuContext {
         self.auxiliary_budget.store(auxiliary, std::sync::atomic::Ordering::Relaxed);
         if let Ok(mut u) = self.uploads.lock() {
             u.budget = Some(upload);
-            u.trim();
+            self.generation.set_cap(upload);
         }
+        let owners = self
+            .uploads
+            .lock()
+            .map(|u| {
+                u.map
+                    .values()
+                    .map(|e| e.slot.owner.clone())
+                    .chain(u.native.values().map(|e| e.slot.owner.clone()))
+                    .chain(u.kept.iter().map(|(_, e)| e.owner.clone()))
+                    .chain(u.resident.iter().map(|e| e.owner.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for owner in owners {
+            owner.enforce_device_cap(&self.generation, upload);
+        }
+        self.prune_uploads();
         if let Ok(mut p) = self.pool.lock() {
             p.set_budget(pool);
         }
@@ -1226,73 +1358,94 @@ impl GpuContext {
         key: u64,
         token: &effectcraft_render::cache::ResidentToken,
         metadata: &[u64],
+        cache: Option<&GpuOwner>,
     ) -> Option<NativeImage> {
+        let cache = cache?;
         let _profile = effectcraft_render::profile::span("native_cache_lookup");
-        if !token.valid() || self.check_health().is_err() {
+        if !token.valid() || token.identity() != cache.identity() || self.check_health().is_err() {
             return None;
         }
-        let mut u = self.uploads.lock().ok()?;
-        u.trim();
-        u.clock = u.clock.wrapping_add(1);
-        let now = u.clock;
+        self.prune_uploads();
         let k = (Arc::as_ptr(owner) as *const () as usize, token.identity(), key);
-        let e = u.native.get_mut(&k)?;
-        if e.metadata != metadata || !Arc::ptr_eq(&e.owner.upgrade()?, owner) {
+        let entry = self.uploads.lock().ok()?.native.get(&k).cloned()?;
+        if entry.metadata != metadata || !entry.owner.ptr_eq(&Arc::downgrade(owner)) {
             return None;
         }
-        e.last_use = now;
-        Some(e.image.clone())
+        entry.slot.get(&self.generation, GpuStage::Blend)
     }
-
-    pub(crate) fn native_keep(
-        &self,
-        owner: &effectcraft_render::footage::SharedFrame,
-        key: u64,
-        token: effectcraft_render::cache::ResidentToken,
-        metadata: Vec<u64>,
-        image: NativeImage,
-    ) {
-        if !token.valid() || self.check_health().is_err() {
+    fn native_keep(&self, entry: PendingNative) {
+        if !entry.token.valid() || entry.epoch.strong_count() == 0 || self.check_health().is_err() {
             return;
         }
-        let Ok(mut u) = self.uploads.lock() else { return };
-        let bytes = img_bytes(&image.img);
-        if bytes > u.budget.unwrap_or(UPLOAD_BUDGET) {
-            return;
+        let Ok(slot) = entry.pending.publish() else { return };
+        let retained = SlotRef { owner: entry.cache, slot, epoch: entry.epoch.clone() };
+        let k = (Arc::as_ptr(&entry.owner) as *const () as usize, entry.token.identity(), entry.key);
+        let old = {
+            let mut u = match self.uploads.lock() {
+                Ok(u) => u,
+                Err(poison) => {
+                    drop(poison);
+                    retained.release();
+                    return;
+                }
+            };
+            if !self.generation.valid()
+                || !self.generation.within_cap()
+                || entry.epoch.strong_count() == 0
+                || u.native.len() >= 1024
+                || u.native.try_reserve(1).is_err()
+            {
+                drop(u);
+                retained.release();
+                return;
+            }
+            u.native
+                .insert(k, NativeUpload { owner: Arc::downgrade(&entry.owner), token: entry.token, metadata: entry.metadata, slot: retained })
+                .map(|e| e.slot)
+        };
+        if let Some(old) = old {
+            old.release();
         }
-        u.clock = u.clock.wrapping_add(1);
-        let last_use = u.clock;
-        let k = (Arc::as_ptr(owner) as *const () as usize, token.identity(), key);
-        let entry = NativeUpload { owner: Arc::downgrade(owner), token, metadata, image, bytes, last_use };
-        if let Some(old) = u.native.insert(k, entry) {
-            u.bytes = u.bytes.saturating_sub(old.bytes);
-        }
-        u.bytes = u.bytes.saturating_add(bytes);
-        u.trim();
     }
-
-    /// Uploaded layer textures kept: (count, bytes) (diagnostics, tests).
+    /// Live indexed uploads. The authoritative physical accounting is the layer owner.
     pub fn upload_stats(&self) -> (usize, usize) {
-        self.uploads.lock().map(|u| (u.map.len().saturating_add(u.native.len()), u.bytes)).unwrap_or_default()
-    }
-
-    /// Forget uploaded layer textures.
-    pub fn clear_uploads(&self) {
-        if let Ok(mut u) = self.uploads.lock() {
-            u.map.clear();
-            u.native.clear();
-            u.kept.clear();
-            u.bytes = 0;
+        self.prune_uploads();
+        let entries = self
+            .uploads
+            .lock()
+            .map(|u| u.map.values().map(|e| e.slot.clone()).chain(u.native.values().map(|e| e.slot.clone())).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let mut identities = BTreeSet::new();
+        let mut bytes = 0usize;
+        let mut count = 0usize;
+        for entry in entries {
+            let slot = entry.slot.upgrade();
+            if let Some(slot) = slot {
+                count += 1;
+                if identities.insert(Arc::as_ptr(slot.allocation()) as usize) {
+                    bytes = bytes.saturating_add(slot.allocation().bytes());
+                }
+            }
         }
+        (count, bytes)
+    }
+    /// Healthy clear invalidates pending native publication without retiring the device.
+    pub fn clear_uploads(&self) {
+        clear_retained(&self.uploads);
         if let Ok(mut p) = self.pool.lock() {
             p.clear();
         }
-        if let Ok(mut s) = self.staging.lock() {
-            s.clear();
-        }
-        if let Ok(mut z) = self.zeros.lock() {
-            z.clear();
-        }
+        let old = self.staging.lock().ok().map(|mut s| std::mem::take(&mut *s));
+        drop(old);
+        let old = self.zeros.lock().ok().map(|mut z| std::mem::take(&mut *z));
+        drop(old);
+    }
+}
+
+impl Drop for GpuContext {
+    fn drop(&mut self) {
+        self.generation.retire();
+        clear_retained(&self.uploads);
     }
 }
 
@@ -1310,11 +1463,34 @@ struct PendingNative {
     key: u64,
     token: effectcraft_render::cache::ResidentToken,
     metadata: Vec<u64>,
-    image: NativeImage,
+    cache: GpuOwner,
+    pending: GpuPending,
+    epoch: Weak<()>,
+}
+
+struct LazyReadback(Weak<GpuContext>);
+impl effectcraft_render::cache::ResidentReadback for LazyReadback {
+    fn readback(&self, slot: &GpuSlot) -> Option<Buf> {
+        let ctx = self.0.upgrade()?;
+        if slot.stage() != GpuStage::Processed || !slot.allocation().generation().same(&ctx.generation) {
+            return None;
+        }
+        let image = slot.payload::<NativeImage>()?;
+        crate::Gpu::within_context(&ctx, || {
+            let mut enc = Enc::new(&ctx);
+            Some(Buf { img: enc.download(&image.img)?, offset: image.offset, scale: image.scale })
+        })
+        .ok()
+        .flatten()
+    }
 }
 
 pub(crate) struct Enc<'g> {
+    epoch: Weak<()>,
+    pub(crate) owner: Option<GpuOwner>,
     native_pending: Vec<PendingNative>,
+    resident_pending: Vec<(GpuPending, effectcraft_render::cache::FlightGuard)>,
+    readback: Option<Arc<dyn effectcraft_render::cache::ResidentReadback>>,
     #[cfg(feature = "profile")]
     pub(crate) timestamps: Option<crate::timestamps::Batch>,
     pub g: &'g GpuContext,
@@ -1348,8 +1524,43 @@ impl Drop for Enc<'_> {
 
 impl<'g> Enc<'g> {
     pub fn new(g: &'g GpuContext) -> Enc<'g> {
+        Self::with_owner(g, None)
+    }
+    pub fn with_resident(g: &'g Arc<GpuContext>, owner: Option<GpuOwner>) -> Enc<'g> {
+        let mut enc = Self::with_owner(g, owner);
+        enc.readback = Some(Arc::new(LazyReadback(Arc::downgrade(g))));
+        enc
+    }
+    pub(crate) fn can_retain_resident(&self) -> bool {
+        self.readback.is_some() && self.owner.as_ref().is_some_and(GpuOwner::valid) && self.g.deferred.is_none()
+    }
+    pub(crate) fn resident(&self, key: u64, stage: GpuStage) -> Option<NativeImage> {
+        self.owner.as_ref()?.resident_in(key, stage, Some(&self.g.generation))?.payload::<NativeImage>().cloned()
+    }
+    pub(crate) fn keep_resident(
+        &mut self,
+        key: u64,
+        image: NativeImage,
+        flight: effectcraft_render::cache::FlightGuard,
+        intent: Option<effectcraft_render::disk_cache::LayerWriteIntent>,
+    ) {
+        let Some(owner) = self.owner.as_ref() else { return };
+        if self.g.deferred.is_some() || self.resident_pending.len() >= 256 || self.epoch.strong_count() == 0 {
+            return;
+        }
+        let Some(allocation) = image.img.allocation.clone() else { return };
+        let Ok(pending) = owner.prepare(Arc::new(image), allocation, GpuStage::Processed, self.g.retained_cap()) else { return };
+        if self.resident_pending.try_reserve(1).is_ok() {
+            self.resident_pending.push((pending.with_content(key, self.readback.clone()).with_persistence(intent), flight));
+        }
+    }
+    pub fn with_owner(g: &'g GpuContext, owner: Option<GpuOwner>) -> Enc<'g> {
         Enc {
+            epoch: g.upload_epoch(),
+            owner,
             native_pending: Vec::new(),
+            resident_pending: Vec::new(),
+            readback: None,
             g,
             enc: None,
             pending: 0,
@@ -1380,7 +1591,9 @@ impl<'g> Enc<'g> {
 
     /// A new zeroed image (pooled; a reused texture is cleared by a kernel).
     pub fn image(&mut self, w: u32, h: u32) -> GpuImage {
-        let (img, reused) = self.g.pooled(w, h);
+        self.encoder();
+        let owner = self.enc.as_ref().map(|(_, id)| *id);
+        let (img, reused) = self.g.pooled_for_encoder(w, h, owner);
         if reused {
             self.fill(&img, 0.0);
         }
@@ -1390,7 +1603,9 @@ impl<'g> Enc<'g> {
     /// A new image for a kernel that writes every pixel of it (pooled; contents undefined).
     /// Under test it starts out as NaNs, so a kernel that skips pixels fails the CPU oracle.
     pub fn scratch(&mut self, w: u32, h: u32) -> GpuImage {
-        let (img, _) = self.g.pooled(w, h);
+        self.encoder();
+        let owner = self.enc.as_ref().map(|(_, id)| *id);
+        let (img, _) = self.g.pooled_for_encoder(w, h, owner);
         if cfg!(test) {
             self.fill(&img, f32::NAN);
         }
@@ -1611,23 +1826,62 @@ impl<'g> Enc<'g> {
         metadata: Vec<u64>,
         image: NativeImage,
     ) {
-        // Deferred CPU-effect placeholders must never become persistent native pixels.
-        let budget = self.g.uploads.lock().map(|u| u.budget.unwrap_or(UPLOAD_BUDGET)).unwrap_or(0);
-        let retained = self.native_pending.iter().map(|p| img_bytes(&p.image.img)).fold(img_bytes(&image.img), usize::saturating_add);
-        if self.g.deferred.is_none() && self.native_pending.len() < 256 && retained <= budget {
-            self.native_pending.push(PendingNative { owner, key, token, metadata, image });
+        let Some(cache) = self.owner.as_ref() else { return };
+        if self.g.deferred.is_some() || self.native_pending.len() >= 256 || token.identity() != cache.identity() {
+            return;
+        }
+        let Some(allocation) = image.img.allocation.clone() else { return };
+        if !allocation.generation().same(&self.g.generation) {
+            return;
+        }
+        let epoch = self.epoch.clone();
+        let Ok(pending) = cache.prepare(Arc::new(image), allocation, GpuStage::Blend, self.g.retained_cap()) else { return };
+        if self.native_pending.try_reserve(1).is_ok() {
+            self.native_pending.push(PendingNative { owner, key, token, metadata, cache: cache.clone(), pending, epoch });
         }
     }
-
-    /// Publish only after the top-level render successfully submits/reads back.
     pub(crate) fn publish_native(&mut self) {
         if self.g.check_health().is_err() {
             self.native_pending.clear();
+            self.resident_pending.clear();
             return;
         }
-        for entry in self.native_pending.drain(..) {
-            self.g.native_keep(&entry.owner, entry.key, entry.token, entry.metadata, entry.image);
+        for (pending, _flight) in self.resident_pending.drain(..) {
+            if self.epoch.strong_count() == 0 {
+                continue;
+            }
+            let Some(owner) = self.owner.as_ref() else { continue };
+            let Ok(slot) = pending.publish() else { continue };
+            let entry = SlotRef { owner: owner.clone(), slot, epoch: self.epoch.clone() };
+            let mut u = match self.g.uploads.lock() {
+                Ok(u) => u,
+                Err(poison) => {
+                    drop(poison);
+                    entry.release();
+                    continue;
+                }
+            };
+            if self.epoch.strong_count() == 0
+                || !self.g.generation.valid()
+                || !self.g.generation.within_cap()
+                || u.resident.len() >= 4096
+                || u.resident.try_reserve(1).is_err()
+            {
+                drop(u);
+                entry.release();
+                continue;
+            }
+            u.resident.push(entry);
         }
+        for entry in self.native_pending.drain(..) {
+            self.g.native_keep(entry);
+        }
+    }
+    pub(crate) fn upload_buf(&self, buf: &Arc<Buf>) -> Option<GpuImage> {
+        self.g.upload_buf_owned(buf, self.owner.as_ref())
+    }
+    pub(crate) fn keep(&self, img: GpuImage) -> Option<u64> {
+        self.g.keep_owned(img, self.owner.as_ref(), &self.epoch)
     }
 
     /// Submit recorded work.
@@ -1904,6 +2158,73 @@ mod upload_budget_tests {
     use super::*;
 
     #[test]
+    fn pool_encoder_local_reuse_keeps_cross_encoder_barrier() {
+        let Some(g) = crate::tests::gpu() else { return };
+        let mut pool = Pool::default();
+        let first = pool.open();
+        pool.release(g.ctx.texture(8, 8));
+        assert!(pool.take_for_encoder(8, 8, None).is_none());
+        let second = pool.open();
+        assert!(pool.take_for_encoder(8, 8, Some(first)).is_none());
+        assert!(pool.take_for_encoder(8, 8, Some(second)).is_none());
+        pool.close(second);
+        assert!(pool.take_for_encoder(8, 8, Some(first)).is_some());
+        assert_eq!(pool.released_bytes, 0);
+        pool.release(g.ctx.texture(8, 8));
+        pool.clear();
+        assert!(pool.take_for_encoder(8, 8, Some(first)).is_none(), "purged releases cannot reappear");
+    }
+
+    #[test]
+    fn pool_encoder_local_reuse_preserves_prior_reads() {
+        crate::tests::hold_gpu_lock();
+        let g = GpuContext::headless();
+        assert!(g.is_some() || std::env::var("EFFECTCRAFT_REQUIRE_GPU").as_deref() != Ok("1"));
+        let Some(g) = g else { return };
+        let mut e = Enc::new(&g);
+        let source = e.image(8, 8);
+        e.fill(&source, 0.25);
+        let saved = e.scratch(8, 8);
+        e.copy_into(&source, &saved, 0, 0);
+        drop(source);
+        let before = g.pool_stats();
+        let reused = e.scratch(8, 8);
+        assert_eq!(g.pool_stats().0, before.0 + 1, "reuse before submit");
+        e.fill(&reused, 0.75);
+        let prior = e.download(&saved).unwrap();
+        let later = e.download(&reused).unwrap();
+        assert!(prior.data.iter().flatten().all(|v| *v == 0.25));
+        assert!(later.data.iter().flatten().all(|v| *v == 0.75));
+    }
+
+    #[test]
+    fn pool_encoder_local_reuse_reverse_submission_and_rollover() {
+        crate::tests::hold_gpu_lock();
+        let g = GpuContext::headless();
+        assert!(g.is_some() || std::env::var("EFFECTCRAFT_REQUIRE_GPU").as_deref() != Ok("1"));
+        let Some(g) = g else { return };
+        let mut first = Enc::new(&g);
+        let source = first.image(8, 8);
+        first.fill(&source, 0.25);
+        first.submit();
+        let saved = first.scratch(8, 8);
+        first.copy_into(&source, &saved, 0, 0);
+        drop(source);
+        let mut second = Enc::new(&g);
+        let other = second.scratch(8, 8);
+        second.fill(&other, 0.75);
+        second.submit();
+        assert!(first.download(&saved).unwrap().data.iter().flatten().all(|v| *v == 0.25), "later encoder submitted first cannot overwrite pending input");
+        let mut current = saved;
+        for _ in 0..260 {
+            let next = first.scratch(8, 8);
+            first.copy_into(&current, &next, 0, 0);
+            current = next;
+        }
+        assert!(first.download(&current).unwrap().data.iter().flatten().all(|v| *v == 0.25), "ring rollover preserves reads");
+    }
+
+    #[test]
     fn pool_size_transition_reuses_small_textures_without_touching_pending() {
         let Some(g) = crate::tests::gpu() else { return };
         let mut pool = Pool::default();
@@ -1957,16 +2278,18 @@ mod upload_budget_tests {
         let context = GpuContext::headless();
         assert!(context.is_some() || !std::env::var("EFFECTCRAFT_REQUIRE_GPU").is_ok_and(|v| v == "1"), "required GPU unavailable");
         let Some(g) = context else { return };
+        let cache = effectcraft_render::LayerCache::new(UPLOAD_BUDGET);
+        let owner = cache.gpu_owner().unwrap();
         let one = 8 * 8 * 16;
         g.set_cache_budget(2 * one);
-        assert!(g.keep(g.image(16, 16)).is_none(), "larger than the budget");
+        assert!(g.keep_owned(g.image(16, 16), Some(&owner), &g.upload_epoch()).is_none(), "larger than the budget");
         let buf = Arc::new(Buf { img: Image::new(8, 8), offset: [0.0; 2], scale: 1.0 });
-        assert!(g.upload_buf(&buf).is_some());
-        let a = g.keep(g.image(8, 8)).unwrap();
+        assert!(g.upload_buf_owned(&buf, Some(&owner)).is_some());
+        let a = g.keep_owned(g.image(8, 8), Some(&owner), &g.upload_epoch()).unwrap();
         assert_eq!((g.kept_count(), g.upload_stats()), (1, (1, one)));
-        let b = g.keep(g.image(8, 8)).unwrap();
+        let b = g.keep_owned(g.image(8, 8), Some(&owner), &g.upload_epoch()).unwrap();
         assert_eq!((g.kept_count(), g.upload_stats()), (2, (0, 0)), "the upload makes room");
-        let _c = g.keep(g.image(8, 8)).unwrap();
+        let _c = g.keep_owned(g.image(8, 8), Some(&owner), &g.upload_epoch()).unwrap();
         assert_eq!(g.kept_count(), 2, "the oldest kept result makes room");
         g.adopt(a, &buf);
         assert_eq!(g.upload_stats(), (0, 0), "the dropped ticket adopts nothing");
@@ -1977,7 +2300,7 @@ mod upload_budget_tests {
         g.set_cache_budget(0);
         assert_eq!(g.kept_count(), 0);
         g.set_cache_budget(UPLOAD_BUDGET);
-        let _d = g.keep(g.image(8, 8)).unwrap();
+        let _d = g.keep_owned(g.image(8, 8), Some(&owner), &g.upload_epoch()).unwrap();
         g.clear_uploads();
         assert_eq!(g.kept_count(), 0);
     }
@@ -2078,22 +2401,144 @@ mod upload_budget_tests {
     #[test]
     fn dead_uploads_are_purged_and_budget_follows_prefs() {
         crate::tests::hold_gpu_lock();
-        let Some(g) = GpuContext::headless() else { return };
+        let context = GpuContext::headless();
+        assert!(context.is_some() || !std::env::var("EFFECTCRAFT_REQUIRE_GPU").is_ok_and(|v| v == "1"), "required GPU unavailable");
+        let Some(g) = context else { return };
+        eprintln!("retained upload adapter {}", g.name);
+        let cache = effectcraft_render::LayerCache::new(UPLOAD_BUDGET);
+        let owner = cache.gpu_owner().unwrap();
         let a = buf(8);
         let b = buf(16);
-        assert!(g.upload_buf(&a).is_some() && g.upload_buf(&b).is_some());
+        assert!(g.upload_buf_owned(&a, Some(&owner)).is_some() && g.upload_buf_owned(&b, Some(&owner)).is_some());
         assert_eq!(g.upload_stats(), (2, (8 + 16) * 8 * 16));
         drop(a);
         let c = buf(4);
-        assert!(g.upload_buf(&c).is_some());
+        assert!(g.upload_buf_owned(&c, Some(&owner)).is_some());
         assert_eq!(g.upload_stats(), (2, (16 + 4) * 8 * 16), "a's texture dropped");
         // A budget below b + c keeps the most recently used.
         g.set_cache_budget(4 * 8 * 16 + 100);
         assert_eq!(g.upload_stats(), (1, 4 * 8 * 16));
         // Re-uploading the same live buffer is a hit.
         let ups = g.transfer_stats().uploads;
-        assert!(g.upload_buf(&c).is_some());
+        assert!(g.upload_buf_owned(&c, Some(&owner)).is_some());
         assert_eq!(g.transfer_stats().uploads, ups);
         drop(b);
+    }
+    #[test]
+    fn retained_indexes_drop_outside_lock_and_fan_out_to_two_owners() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Probe {
+            index: Weak<Mutex<Uploads>>,
+            cache: Weak<effectcraft_render::LayerCache>,
+            drops: Arc<AtomicUsize>,
+        }
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                if let Some(index) = self.index.upgrade() {
+                    assert!(index.try_lock().is_ok(), "index lock held during backend drop");
+                }
+                if let Some(cache) = self.cache.upgrade() {
+                    let _ = cache.retained_stats();
+                }
+                self.drops.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let index = Arc::new(Mutex::new(Uploads::default()));
+        let generation = effectcraft_render::allocation::GpuGeneration::default();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let a = Arc::new(effectcraft_render::LayerCache::new(64));
+        let b = Arc::new(effectcraft_render::LayerCache::new(64));
+        let pixel = Arc::new(Buf { img: Image::new(1, 1), offset: [0.0; 2], scale: 1.0 });
+        for (key, cache) in [(1, &a), (2, &b)] {
+            cache.insert(key, pixel.clone());
+            let owner = cache.gpu_owner().unwrap();
+            let payload = Arc::new(Probe { index: Arc::downgrade(&index), cache: Arc::downgrade(cache), drops: drops.clone() });
+            let allocation = effectcraft_render::allocation::GpuAllocation::rgba_f32(1, 1, generation.clone()).unwrap();
+            let slot = owner.prepare(payload, allocation, GpuStage::CpuMirror, 64).unwrap().publish().unwrap();
+            let mut u = index.lock().unwrap();
+            let epoch = Arc::downgrade(&u.epoch);
+            u.map.insert((owner.identity(), key as usize), Upload { buf: Arc::downgrade(&pixel), slot: SlotRef { owner, slot, epoch } });
+        }
+        generation.retire();
+        clear_retained(&index);
+        assert_eq!(drops.load(Ordering::Relaxed), 2);
+        assert!(a.get(1).is_some() && b.get(2).is_some());
+        assert_eq!(a.retained_stats().live_bytes, 16);
+        assert_eq!(b.retained_stats().live_bytes, 16);
+    }
+    #[test]
+    fn ordinary_resident_device_failure_rejects_readback_and_preserves_materialized_cpu() {
+        crate::tests::hold_gpu_lock();
+        let context = GpuContext::headless();
+        assert!(context.is_some() || !std::env::var("EFFECTCRAFT_REQUIRE_GPU").is_ok_and(|v| v == "1"), "required GPU unavailable");
+        let Some(context) = context else { return };
+        let gpu = crate::Gpu::from_context(context);
+        eprintln!("ordinary failure adapter {}", gpu.ctx.name);
+        let mut scene = crate::tests::Scene::new(effectcraft_project::BitDepth::Bpc32);
+        let layer = scene.solid([0.3, 0.5, 0.7], 20, 15);
+        let id = scene.push(layer);
+        let cache = effectcraft_render::LayerCache::default();
+        let mut renderer = effectcraft_render::Renderer::new(
+            &scene.p,
+            &crate::tests::Pattern,
+            effectcraft_render::RenderOpts { backend: effectcraft_render::Backend::Gpu, ..Default::default() },
+        );
+        renderer.accel = Some(&gpu);
+        renderer.cache = Some(&cache);
+        gpu.within_memory(|| gpu.render_display(&renderer, scene.cid, effectcraft_time::Tick::ZERO)).unwrap().unwrap();
+        let ctx = renderer.eval_ctx(scene.cid, effectcraft_time::Tick::ZERO).unwrap();
+        let layer = ctx.comp.layers.iter().find(|l| l.id == id).unwrap();
+        let key = renderer.resident_content_key(&ctx, layer).unwrap();
+        let slot = cache.gpu_owner().unwrap().resident(key, GpuStage::Processed).unwrap();
+        let cpu = cache.get(key).unwrap();
+        let before = gpu.ctx.transfer_stats();
+        gpu.ctx.device_failure_notifier()("synthetic ordinary-resident device failure".into());
+        assert!(effectcraft_render::cache::ResidentReadback::readback(&LazyReadback(Arc::downgrade(&gpu.ctx)), &slot).is_none());
+        assert_eq!(gpu.ctx.transfer_stats().readbacks, before.readbacks, "failed device performs no readback allocation/map");
+        assert!(Arc::ptr_eq(&cpu, &cache.get(key).unwrap()));
+        assert!(cache.gpu_owner().unwrap().resident(key, GpuStage::Processed).is_none());
+        assert!(gpu.render_display(&renderer, scene.cid, effectcraft_time::Tick::ZERO).is_none());
+        let fallback = renderer.comp_frame(scene.cid, effectcraft_time::Tick::ZERO);
+        let oracle =
+            effectcraft_render::Renderer::new(&scene.p, &crate::tests::Pattern, Default::default()).comp_frame_cpu(scene.cid, effectcraft_time::Tick::ZERO);
+        assert_eq!(fallback, oracle, "public renderer falls back to the exact CPU frame after device failure");
+        assert_eq!(gpu.ctx.transfer_stats().readbacks, before.readbacks, "fallback does not retry failed-device readback");
+        drop(slot);
+        assert_eq!(cache.retained_stats().live_bytes, cpu.img.data.capacity() * std::mem::size_of::<[f32; 4]>());
+    }
+
+    #[test]
+    fn retained_gpu_identity_clear_and_device_failure_preserve_cpu() {
+        crate::tests::hold_gpu_lock();
+        let context = GpuContext::headless();
+        assert!(context.is_some() || !std::env::var("EFFECTCRAFT_REQUIRE_GPU").is_ok_and(|v| v == "1"), "required GPU unavailable");
+        let Some(g) = context else { return };
+        eprintln!("retained ownership adapter {}", g.name);
+        let a = effectcraft_render::LayerCache::new(256);
+        let b = effectcraft_render::LayerCache::new(256);
+        let ao = a.gpu_owner().unwrap();
+        let bo = b.gpu_owner().unwrap();
+        let pixels = Arc::new(Buf { img: Image::new(1, 1), offset: [0.0; 2], scale: 1.0 });
+        a.insert(1, pixels.clone());
+        b.insert(2, pixels.clone());
+        let first = g.upload_buf_owned(&pixels, Some(&ao)).unwrap();
+        let uploads = g.transfer_stats().uploads;
+        let alias = g.upload_buf_owned(&pixels, Some(&ao)).unwrap();
+        assert!(Arc::ptr_eq(first.allocation.as_ref().unwrap(), alias.allocation.as_ref().unwrap()));
+        assert_eq!(g.transfer_stats().uploads, uploads);
+        assert_eq!(g.image(0, 0).allocation.as_ref().unwrap().bytes(), 16);
+        assert_eq!(GpuImage::new(g.texture(2, 2), 100, 100).allocation.as_ref().unwrap().bytes(), 64);
+        drop(first);
+        drop(alias);
+        g.clear_uploads();
+        assert_eq!(g.upload_stats(), (0, 0));
+        assert!(g.upload_buf_owned(&pixels, Some(&ao)).is_some());
+        assert!(g.upload_buf_owned(&pixels, Some(&bo)).is_some());
+        assert_eq!(g.upload_stats(), (2, 32));
+        g.device_failure_notifier()("synthetic retained ownership device failure".to_owned());
+        assert!(g.check_health().is_err());
+        assert_eq!(g.upload_stats(), (0, 0));
+        assert!(a.get(1).is_some() && b.get(2).is_some());
+        assert_eq!((a.retained_stats().live_bytes, b.retained_stats().live_bytes), (16, 16));
     }
 }

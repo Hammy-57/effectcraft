@@ -216,7 +216,7 @@ impl Gpu {
     pub fn render_display(&self, r: &Renderer, comp: ItemId, t: Tick) -> Option<DisplayFrame> {
         let _profile = effectcraft_render::profile::span("display_prepare");
         self.ctx.check_health().map_err(|e| log::error!("gpu display: {e}")).ok()?;
-        let mut e = Enc::new(&self.ctx);
+        let mut e = Enc::with_resident(&self.ctx, r.cache.and_then(effectcraft_render::cache::LayerCache::gpu_owner));
         let img = walk::render(&mut e, r, comp, t)?;
         let texture = e.display(&img);
         e.submit();
@@ -252,7 +252,7 @@ impl Gpu {
         if let Some(d) = self.ctx.deferred.clone() {
             return self.render_deferred(&d, r, comp, t);
         }
-        let mut e = Enc::new(&self.ctx);
+        let mut e = Enc::with_resident(&self.ctx, r.cache.and_then(effectcraft_render::cache::LayerCache::gpu_owner));
         let img = walk::render(&mut e, r, comp, t)?;
         let image = e.download(&img);
         self.ctx.check_health().ok()?;
@@ -286,7 +286,7 @@ impl Gpu {
             deferred::Lookup::Absent => {}
         }
         let misses = d.misses();
-        let mut e = Enc::new(&self.ctx);
+        let mut e = Enc::with_resident(&self.ctx, r.cache.and_then(effectcraft_render::cache::LayerCache::gpu_owner));
         let img = walk::render(&mut e, r, comp, t)?;
         if d.misses() != misses {
             // Layer steps are still in flight: this pass's canvas is not the frame.
@@ -306,18 +306,21 @@ impl Gpu {
     /// Browser callers use the host/owned-device failure bridge and bounded readbacks instead
     /// of blocking their event loop on an error-scope future.
     pub fn within_memory<T>(&self, f: impl FnOnce() -> T) -> Result<T, String> {
-        self.ctx.check_health()?;
+        Self::within_context(&self.ctx, f)
+    }
+    pub(crate) fn within_context<T>(ctx: &GpuContext, f: impl FnOnce() -> T) -> Result<T, String> {
+        ctx.check_health()?;
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let scope = self.ctx.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-            let internal = self.ctx.device.push_error_scope(wgpu::ErrorFilter::Internal);
+            let scope = ctx.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+            let internal = ctx.device.push_error_scope(wgpu::ErrorFilter::Internal);
             // Some allocation failures (Adreno's ERROR_INITIALIZATION_FAILED) surface as
             // internal errors or mapped-at-creation panics, not OutOfMemory (#591).
             let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
             let error = pollster::block_on(internal.pop()).or(pollster::block_on(scope.pop()));
             let result = match (error, out) {
                 (Some(error), _) => Err(error.to_string()),
-                (None, Ok(out)) => self.ctx.check_health().map(|()| out),
+                (None, Ok(out)) => ctx.check_health().map(|()| out),
                 (None, Err(payload)) => {
                     let reason = payload
                         .downcast_ref::<String>()
@@ -328,14 +331,14 @@ impl Gpu {
                 }
             };
             if result.is_err() {
-                self.ctx.clear_uploads();
+                ctx.clear_uploads();
             }
             result
         }
         #[cfg(target_arch = "wasm32")]
         {
             let out = f();
-            self.ctx.check_health().map(|()| out)
+            ctx.check_health().map(|()| out)
         }
     }
 
@@ -390,9 +393,19 @@ impl Accelerator for Gpu {
     }
 
     fn effects_kept(&self, chain: &[FxStep], buf: &Buf, levels: Option<f32>) -> Option<(Buf, Option<u64>)> {
+        self.effects(chain, buf, levels).map(|b| (b, None))
+    }
+    fn effects_kept_owned(
+        &self,
+        chain: &[FxStep],
+        buf: &Buf,
+        levels: Option<f32>,
+        owner: Option<&effectcraft_render::cache::GpuOwner>,
+    ) -> Option<(Buf, Option<u64>)> {
         self.ctx.check_health().ok()?;
-        let (b, img) = effects::run_chain(&mut Enc::new(&self.ctx), chain, buf, levels)?;
-        Some((b, img.and_then(|img| self.ctx.keep(img))))
+        let mut e = Enc::with_owner(&self.ctx, owner.cloned());
+        let (b, img) = effects::run_chain(&mut e, chain, buf, levels)?;
+        Some((b, img.and_then(|img| e.keep(img))))
     }
 
     fn adopt(&self, ticket: u64, buf: &Arc<Buf>) {

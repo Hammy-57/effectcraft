@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 
 use effectcraft_effects::Buf;
 use effectcraft_raster::Image;
@@ -220,6 +220,7 @@ pub type FrameBytes = Box<dyn AsRef<[u8]> + Send>;
 enum Job {
     /// An encoded payload.
     Write(Kind, u128, Vec<u8>),
+    GuardedLayer(u128, Vec<u8>, WriteGuard),
     /// A frame to encode on the writer thread (key, width, height, 8-bit premultiplied RGBA).
     Frame(u128, u32, u32, FrameBytes),
 }
@@ -230,6 +231,7 @@ impl Job {
     fn bytes(&self) -> usize {
         match self {
             Job::Write(_, _, p) => p.len(),
+            Job::GuardedLayer(_, p, _) => p.capacity(),
             Job::Frame(_, _, _, rgba) => (**rgba).as_ref().len(),
         }
     }
@@ -251,6 +253,10 @@ impl Queue {
 }
 
 pub struct DiskCache {
+    publication: Mutex<(Arc<()>, bool)>,
+    purge: Mutex<()>,
+    #[cfg(test)]
+    before_publish: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     dir: PathBuf,
     index: Mutex<DiskIndex>,
     max_bytes: AtomicU64,
@@ -265,6 +271,43 @@ pub struct DiskCache {
     min_layer_ms: AtomicU64,
     /// See [`Self::generation`].
     generation: AtomicU64,
+}
+
+#[derive(Clone)]
+struct WriteGuard {
+    binding: crate::cache::StorageToken,
+    purge: Weak<()>,
+}
+/// Captured native disk destination for a later CPU demand. It never owns CPU pixels.
+pub struct LayerWriteIntent {
+    disk: Arc<DiskCache>,
+    key: u128,
+    guard: WriteGuard,
+    started: web_time::Instant,
+    producer_ms: u128,
+}
+impl LayerWriteIntent {
+    pub(crate) fn produced(mut self) -> Self {
+        self.producer_ms = self.started.elapsed().as_millis();
+        self
+    }
+    pub(crate) fn put(&self, buf: &Buf) {
+        if self.producer_ms < u128::from(self.disk.min_layer_ms())
+            || !self.guard.binding.valid()
+            || !self.disk.valid_guard(&self.guard)
+            || self.disk.contains(Kind::Layer, self.key)
+            || self.disk.queue_full()
+        {
+            return;
+        }
+        // Encode from borrowed pixels. Only compressed bytes enter the bounded queue;
+        // a denied CPU admission never creates a hidden strong Arc<Buf> here.
+        let payload = encode_layer(buf);
+        if !self.guard.binding.valid() || !self.disk.valid_guard(&self.guard) {
+            return;
+        }
+        self.disk.enqueue(Job::GuardedLayer(self.key, payload, self.guard.clone()));
+    }
 }
 
 /// FNV-1a 128-bit (content keys).
@@ -327,6 +370,10 @@ impl DiskCache {
         std::fs::create_dir_all(&dir)?;
         let dc = Arc::new(DiskCache {
             dir,
+            publication: Mutex::new((Arc::new(()), false)),
+            purge: Mutex::new(()),
+            #[cfg(test)]
+            before_publish: Mutex::new(None),
             index: Mutex::new(DiskIndex::default()),
             max_bytes: AtomicU64::new(max_bytes),
             hits: AtomicU64::new(0),
@@ -348,6 +395,23 @@ impl DiskCache {
             std::thread::Builder::new().name("ec-disk-cache".into()).spawn(move || writer(weak, q))?;
         }
         Ok(dc)
+    }
+
+    pub(crate) fn layer_intent(self: &Arc<Self>, key: u128, binding: crate::cache::StorageToken) -> Option<LayerWriteIntent> {
+        let publication = self.publication.lock().ok()?;
+        if publication.1 {
+            return None;
+        }
+        Some(LayerWriteIntent {
+            disk: self.clone(),
+            key,
+            guard: WriteGuard { binding, purge: Arc::downgrade(&publication.0) },
+            started: web_time::Instant::now(),
+            producer_ms: 0,
+        })
+    }
+    fn valid_guard(&self, guard: &WriteGuard) -> bool {
+        self.publication.lock().is_ok_and(|p| !p.1 && Weak::ptr_eq(&guard.purge, &Arc::downgrade(&p.0)))
     }
 
     pub fn folder(&self) -> &Path {
@@ -448,7 +512,15 @@ impl DiskCache {
 
     /// Delete every entry (Edit ▸ Purge ▸ All Disk Cache / Empty Disk Cache).
     pub fn clear(&self) {
+        let Ok(_purge) = self.purge.lock() else { return };
+        {
+            let Ok(mut publication) = self.publication.lock() else { return };
+            publication.0 = Arc::new(());
+            publication.1 = true;
+        }
+        // Never hold the final-publication barrier while waiting for the writer.
         self.flush();
+        let Ok(mut publication) = self.publication.lock() else { return };
         if let Ok(mut g) = self.index.lock() {
             g.clear();
         }
@@ -456,6 +528,7 @@ impl DiskCache {
         for kind in [Kind::Frame, Kind::Layer] {
             let _ = std::fs::remove_dir_all(self.dir.join(kind.dir()));
         }
+        publication.1 = false;
     }
 
     /// Wait until queued writes are on disk.
@@ -525,11 +598,12 @@ impl DiskCache {
             let (m, cv) = &*self.queue;
             let Ok(mut q) = m.lock() else { return };
             let bytes = job.bytes();
-            if q.full(bytes) {
+            if q.full(bytes) || (matches!(&job, Job::GuardedLayer(..)) && bytes > QUEUE_BYTES) || q.jobs.try_reserve(1).is_err() {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
                 return;
             }
-            q.bytes += bytes;
+            let Some(total) = q.bytes.checked_add(bytes) else { return };
+            q.bytes = total;
             q.jobs.push_back(job);
             cv.notify_all();
         }
@@ -539,6 +613,7 @@ impl DiskCache {
     fn run(&self, job: Job) {
         match job {
             Job::Write(kind, key, payload) => self.write_now(kind, key, &payload),
+            Job::GuardedLayer(key, payload, guard) => self.write_guarded(Kind::Layer, key, &payload, Some(&guard)),
             Job::Frame(key, w, h, rgba) => {
                 // Queued twice, or written by another instance meanwhile: skip the compression.
                 if !self.contains(Kind::Frame, key) {
@@ -550,6 +625,9 @@ impl DiskCache {
 
     /// Write an entry now (atomic rename), then evict down to the limit.
     fn write_now(&self, kind: Kind, key: u128, payload: &[u8]) {
+        self.write_guarded(kind, key, payload, None);
+    }
+    fn write_guarded(&self, kind: Kind, key: u128, payload: &[u8], guard: Option<&WriteGuard>) {
         if self.contains(kind, key) {
             return;
         }
@@ -565,15 +643,37 @@ impl DiskCache {
             let _ = std::fs::remove_file(&tmp);
             return;
         }
-        if std::fs::rename(&tmp, &path).is_err() {
+        #[cfg(test)]
+        {
+            let hook = self.before_publish.lock().ok().and_then(|mut h| h.take());
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        let publish = || {
+            let Ok(publication) = self.publication.lock() else { return false };
+            if publication.1 || guard.is_some_and(|g| !Weak::ptr_eq(&g.purge, &Arc::downgrade(&publication.0))) {
+                return false;
+            }
+            if std::fs::rename(&tmp, &path).is_err() {
+                return false;
+            }
+            self.writes.fetch_add(1, Ordering::Relaxed);
+            if let Ok(mut g) = self.index.lock() {
+                g.insert(kind, key, data.len() as u64);
+            }
+            self.changed();
+            true
+        };
+        // Lock order is binding -> disk publication -> index. No owner or queue lock.
+        let published = match guard {
+            Some(g) => g.binding.with_valid(publish).unwrap_or(false),
+            None => publish(),
+        };
+        if !published {
             let _ = std::fs::remove_file(&tmp);
             return;
         }
-        self.writes.fetch_add(1, Ordering::Relaxed);
-        if let Ok(mut g) = self.index.lock() {
-            g.insert(kind, key, data.len() as u64);
-        }
-        self.changed();
         self.evict();
     }
 
@@ -1084,6 +1184,131 @@ mod tests {
             *p = [v, v * 0.5, 1.0 - v, if i % 7 == 0 { 0.0 } else { 1.0 }];
         }
         Buf { img, offset: [1.5, -2.25], scale: 0.5 }
+    }
+
+    #[test]
+    fn captured_layer_intent_rejects_binding_cycles_replacement_clear_and_purge() {
+        let dir = tmpdir("captured-intent");
+        let disk = DiskCache::open(&dir, 1 << 20).unwrap();
+        disk.set_min_layer_ms(0);
+        let cache = crate::cache::LayerCache::new(1024);
+        cache.set_disk(Some((disk.clone(), 7)));
+        let pixels = buf(3, 3, 2);
+        let old = cache.disk_intent(11).unwrap();
+        cache.set_disk_salt(8);
+        cache.set_disk_salt(7);
+        old.put(&pixels);
+        disk.flush();
+        assert_eq!(disk.stats().entries, 0);
+        let old = cache.disk_intent(11).unwrap();
+        cache.set_disk(None);
+        cache.set_disk(Some((disk.clone(), 7)));
+        old.put(&pixels);
+        disk.flush();
+        assert_eq!(disk.stats().entries, 0);
+        let old = cache.disk_intent(11).unwrap();
+        cache.set_gate(Some(Arc::new(std::sync::atomic::AtomicBool::new(false))));
+        old.put(&pixels);
+        disk.flush();
+        assert_eq!(disk.stats().entries, 0);
+        let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        cache.set_gate(Some(gate.clone()));
+        let gated = cache.disk_intent(11).unwrap();
+        gate.store(true, Ordering::Relaxed);
+        gated.put(&pixels);
+        disk.flush();
+        assert_eq!(disk.stats().entries, 0);
+        gate.store(false, Ordering::Relaxed);
+        let old = cache.disk_intent(11).unwrap();
+        cache.clear();
+        old.put(&pixels);
+        disk.flush();
+        assert_eq!(disk.stats().entries, 0);
+        let old = cache.disk_intent(11).unwrap();
+        disk.clear();
+        old.put(&pixels);
+        disk.flush();
+        assert_eq!(disk.stats().entries, 0);
+        let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        cache.set_gate(Some(gate.clone()));
+        let fresh = cache.disk_intent(11).unwrap();
+        cache.set_gate(Some(gate)); // unchanged identity is not cancellation
+        cache.set_disk(Some((disk.clone(), 7)));
+        cache.set_disk_salt(7);
+        fresh.put(&pixels);
+        disk.flush();
+        assert_eq!(disk.get_layer((7_u128 << 64) | 11).unwrap().img.data, pixels.img.data);
+        disk.clear();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn captured_layer_jobs_revalidate_after_encoding_and_before_rename() {
+        let dir = tmpdir("captured-final-publish");
+        let disk = DiskCache::open(&dir, 1 << 20).unwrap();
+        disk.set_min_layer_ms(0);
+        let cache = crate::cache::LayerCache::new(1024);
+        cache.set_disk(Some((disk.clone(), 9)));
+        let pixels = buf(4, 3, 2);
+        for purge in [false, true] {
+            let (entered, entered_rx) = std::sync::mpsc::channel();
+            let (release, release_rx) = std::sync::mpsc::channel();
+            *disk.before_publish.lock().unwrap() = Some(Box::new(move || {
+                entered.send(()).unwrap();
+                release_rx.recv().unwrap();
+            }));
+            let old = cache.disk_intent(12).unwrap();
+            old.put(&pixels);
+            entered_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+            // A second queued job must also be rejected by a purge.
+            cache.disk_intent(13).unwrap().put(&pixels);
+            let clear = if purge {
+                let dc = disk.clone();
+                let worker = std::thread::spawn(move || dc.clear());
+                let start = std::time::Instant::now();
+                while !disk.publication.lock().unwrap().1 {
+                    assert!(start.elapsed() < std::time::Duration::from_secs(2));
+                    std::thread::yield_now();
+                }
+                Some(worker)
+            } else {
+                cache.set_disk_salt(10);
+                cache.set_disk_salt(9);
+                None
+            };
+            release.send(()).unwrap();
+            if let Some(worker) = clear {
+                worker.join().unwrap();
+            }
+            disk.flush();
+            assert_eq!(disk.stats().entries, 0);
+            assert!(!disk.path(Kind::Layer, (9_u128 << 64) | 12).exists());
+            assert!(!disk.path(Kind::Layer, (9_u128 << 64) | 13).exists());
+        }
+        cache.disk_intent(14).unwrap().put(&pixels);
+        disk.flush();
+        assert!(disk.get_layer((9_u128 << 64) | 14).is_some());
+        disk.clear();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn guarded_queue_counts_compressed_allocation_capacity() {
+        let dir = tmpdir("captured-capacity");
+        let disk = DiskCache::open(&dir, 1 << 20).unwrap();
+        disk.set_min_layer_ms(0);
+        let cache = crate::cache::LayerCache::new(1024);
+        cache.set_disk(Some((disk.clone(), 0)));
+        let intent = cache.disk_intent(1).unwrap();
+        let mut payload = Vec::with_capacity(128);
+        payload.push(1);
+        let capacity = payload.capacity();
+        let job = Job::GuardedLayer(1, payload, intent.guard);
+        assert_eq!(job.bytes(), capacity);
+        drop(job);
+        disk.clear();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// The write queue is bounded by bytes as well as by count; one oversized write still goes

@@ -97,6 +97,17 @@ impl<'a> Renderer<'a> {
     }
 
     /// Processed native footage uses the same dependency key as cached CPU content.
+    /// Exact Processed key used by ordinary CPU content consumers.
+    pub fn resident_content_key(&self, ctx: &EvalCtx, layer: &Layer) -> Option<u64> {
+        self.content_cache_key(ctx, layer)
+    }
+    /// Source and masks rebased into effect space, exactly as the CPU content producer.
+    pub fn resident_source(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Buf> {
+        let mut buf = self.masked_source(ctx, layer)?;
+        buf.rebase(crate::fx::fx_origin(ctx, layer, false));
+        Some(buf)
+    }
+
     /// Bare footage also gets its source-time key, without enabling unsafe effect caching.
     pub fn resident_footage_key(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(u64, cache::ResidentToken)> {
         let c = self.cache?;
@@ -286,6 +297,35 @@ impl<'a> Renderer<'a> {
     fn plain_blend(&self, ctx: &EvalCtx, layer: &Layer, mut timing: Option<&mut LayerTiming>) -> Option<StyledLayer> {
         let (ckey, noted) = self.content_cache_key_noted(ctx, layer);
         let key = ckey.map(|k| cache::derive(k, 0x1ea7));
+        // A resident Processed result is an actual CPU demand here. Reuse it in
+        // working space, then convert forward; a Blend texture is never inverted.
+        if let (Some(c), Some(ck), Some(bk)) = (self.cache, ckey, key) {
+            let token = c.resident_token();
+            let intent = c.disk_intent(bk);
+            let cpu = c.peek(ck);
+            if cpu.is_some() || c.gpu_owner().and_then(|owner| owner.resident(ck, cache::GpuStage::Processed)).is_some() {
+                if let Some(body) = c.get(bk) {
+                    if let Some(t) = timing.as_deref_mut() {
+                        t.cached = true;
+                    }
+                    return Some(StyledLayer { passes: vec![], content: body.clone(), body, key: ckey, ckey, plain: true });
+                }
+                if let Some(content) = cpu.or_else(|| c.get(ck)) {
+                    let mut converted = (*content).clone();
+                    if let Some(conversion) = self.pipe.to_blend() {
+                        color::convert(&mut converted.img, &conversion);
+                    }
+                    let body = Arc::new(converted);
+                    if let Some(token) = token {
+                        c.insert_captured(bk, &body, &token, intent);
+                    }
+                    if let Some(t) = timing.as_deref_mut() {
+                        t.cached = true;
+                    }
+                    return Some(StyledLayer { passes: vec![], content: body.clone(), body, key: ckey, ckey, plain: true });
+                }
+            }
+        }
         let mut _flight = None;
         if let Some(c) = self.cache {
             let hit = match key {
