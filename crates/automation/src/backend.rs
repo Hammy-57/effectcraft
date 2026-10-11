@@ -103,9 +103,9 @@ impl Backend {
     pub fn render_view(&mut self, mut params: Value) -> Result<(Vec<u8>, Value)> {
         let max_side = params.get("max_side").and_then(Value::as_u64).unwrap_or(0).min(u32::MAX as u64) as u32;
         params["base64"] = json!(true);
-        let mut r = match self {
-            Backend::Headless(_) => self.exec("render.frame", params)?,
-            Backend::Bridge(b) => b.call("render.frame", params)?,
+        let mut r = match &mut self.target {
+            Target::Bridge(b) => b.call("render.frame", params)?,
+            Target::Headless(_) => self.exec("render.frame", params)?,
         };
         let raw = crate::tools::take_png(&mut r, "render.frame")?;
         // (an older app may ignore `max_side`)
