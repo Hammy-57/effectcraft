@@ -1,0 +1,1 @@
+posterizeTime(12); random(100)
