@@ -378,6 +378,7 @@ fn file_dialog(app: &mut EffectcraftApp, id: &str, params: &Value) -> Option<Res
         OpenProject,
         Save(&'static str),
         Open(&'static [&'static str]),
+        Folder,
     }
     let (key, ask) = match id {
         "file.import" | "file.importMultiple" => ("paths", Ask::Import),
@@ -403,6 +404,7 @@ fn file_dialog(app: &mut EffectcraftApp, id: &str, params: &Value) -> Option<Res
         "effect.plugins.load" if params.get("folder").is_none() => ("path", Ask::Open(&["wasm", "wat"])),
         "file.replaceFootage" => ("path", Ask::Import),
         "file.collectFiles" => ("folder", Ask::Save("Collected Files")),
+        "footage.relinkFolder" => ("folder", Ask::Folder),
         "file.saveCopyAsXml" => ("path", Ask::Save("Untitled Project.ecprojx")),
         "keys.rpfCameraImport" => ("path", Ask::Open(&["json", "csv", "txt"])),
         "essential.exportTemplate" => ("path", Ask::Save("Template.ectemplate")),
@@ -439,6 +441,10 @@ fn file_dialog(app: &mut EffectcraftApp, id: &str, params: &Value) -> Option<Res
         Ask::Open(exts) => {
             let Some(f) = app.hooks.pick_files.as_ref() else { return Some(Err("no file dialog available (pass `path`)".into())) };
             f(exts).first().map(|s| json!(s))
+        }
+        Ask::Folder => {
+            let Some(f) = app.hooks.pick_folder.as_ref() else { return Some(Err("no folder dialog available (pass `folder`)".into())) };
+            f().map(|s| json!(s))
         }
         Ask::Save(default) => {
             let Some(picked) = app.hooks.save_dialog(default) else { return Some(Err("no file dialog available (pass `path`)".into())) };

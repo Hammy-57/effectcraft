@@ -25,6 +25,8 @@ mod exr_layers;
 mod figma_import;
 #[path = "../plugins.rs"]
 mod plugins;
+#[path = "../relink.rs"]
+mod relink;
 #[path = "../repros.rs"]
 mod repros;
 #[path = "../timeline_interop.rs"]

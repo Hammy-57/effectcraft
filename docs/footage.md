@@ -91,5 +91,14 @@ vectors, positions and IDs are never the picture. EXtractoR reads every other la
 - **File ▸ Replace Footage ▸ File…** (Ctrl+H) points the item at another file. Pick a numbered
   file to replace it with that file's whole sequence (`file.replaceFootage {"path": …,
   "sequence": false}` for one frame).
+- **Relinking moved files.** `footage.relink {"item": id, "path": …}` points a missing item at
+  its file's new location, keeping its interpretation, and relinks every other missing item that
+  was in the same place relative to it (the whole folder moved, a drive was renamed, a project
+  made on Windows opened on macOS). **File ▸ Dependencies ▸ Relink Missing Footage in Folder…**
+  (`footage.relinkFolder {"folder": …, "depth": 3}`) looks for each missing file by name in a
+  folder and its subfolders. Both are one undo step; `footage.missing` lists what is still missing.
+- **A project moved with its footage** finds it again on open: the footage check that runs after
+  File ▸ Open tries each missing file at the same place under the project's new folder, without
+  marking the project modified.
 - **File ▸ Reload Footage** (Ctrl+Alt+L) reads the files again. A sequence picks up frames
   added to its folder (a render still in progress) and keeps its interpretation.
