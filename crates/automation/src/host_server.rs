@@ -110,10 +110,10 @@ pub fn serve(config: HostConfig, make: Box<dyn FnOnce() -> Result<Session, Strin
                     continue;
                 }
                 open.fetch_add(1, Ordering::SeqCst);
-                let (tx, open, clients) = (tx.clone(), Arc::clone(&open), Arc::clone(&clients));
+                let (conn_tx, conn_open, conn_clients) = (tx.clone(), Arc::clone(&open), Arc::clone(&clients));
                 let spawned = std::thread::Builder::new().name("ec-host-conn".into()).spawn(move || {
-                    connection(stream, &tx, &clients);
-                    open.fetch_sub(1, Ordering::SeqCst);
+                    connection(stream, &conn_tx, &conn_clients);
+                    conn_open.fetch_sub(1, Ordering::SeqCst);
                 });
                 if spawned.is_err() {
                     open.fetch_sub(1, Ordering::SeqCst);
