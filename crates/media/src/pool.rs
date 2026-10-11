@@ -232,6 +232,17 @@ const MAX_AHEAD: i64 = 32;
 const AHEAD_SHARE: usize = 4;
 /// At most this many movies are decoded ahead at once.
 const MAX_RUNNERS: usize = 4;
+/// Frames a decode-ahead runner of footage with this codec decodes at once: up to 4 (half the
+/// cores) for intra-only codecs, whose frames decode independently (FilmCraft decodes them
+/// outside its decoder lock); 1 for long-GOP codecs, which decode in order.
+fn ahead_batch(codec: &str) -> usize {
+    let c = codec.to_ascii_lowercase();
+    if !["prores", "dnxh", "motion jpeg", "mjpeg"].iter().any(|n| c.contains(n)) {
+        return 1;
+    }
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    (cores / 2).clamp(1, 4)
+}
 /// A rayon worker waits for a frame being decoded elsewhere while decoding progresses, and decodes
 /// it itself after this long without progress (see [`Inner::pixels_at`]).
 const STALL: std::time::Duration = std::time::Duration::from_secs(1);
@@ -1043,8 +1054,9 @@ impl Inner {
         false
     }
 
-    /// One step of runner `id` of `path`: decode its next frame (skipping frames cached or being
-    /// decoded already). `false` when the runner is done (window decoded, stopped or replaced).
+    /// One step of runner `id` of `path`: decode its next frames (skipping frames cached or being
+    /// decoded already), [`ahead_batch`] of them at once for intra-only codecs, then cache them
+    /// in frame order. `false` when the runner is done (window decoded, stopped or replaced).
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     fn run_ahead(&self, path: &Arc<str>, id: u64) -> bool {
         let mut c = lock(&self.cache);
@@ -1055,41 +1067,70 @@ impl Inner {
             self.done.notify_all();
             return false;
         }
-        let raw = a.next;
-        a.next = a.next.saturating_add(1);
         let (footage, preview) = (a.footage.clone(), a.preview);
+        let batch = ahead_batch(&footage.codec);
         let rate = footage.frame_rate;
-        let t = rate.tick_of(raw) + Tick(rate.frame_duration().0 / 2);
-        let loc = Self::locate_for(&footage, t, preview);
-        if c.lru.map.contains_key(&loc.key) || c.inflight.contains_key(&loc.key) {
+        // (frame index, where it comes from) of the frames this step decodes
+        let mut todo: Vec<(i64, Loc)> = Vec::with_capacity(batch);
+        while todo.len() < batch {
+            let Some(a) = c.ahead.get_mut(path) else { break };
+            if a.next >= a.until {
+                break;
+            }
+            let raw = a.next;
+            a.next = a.next.saturating_add(1);
+            let t = rate.tick_of(raw) + Tick(rate.frame_duration().0 / 2);
+            let loc = Self::locate_for(&footage, t, preview);
+            if c.lru.map.contains_key(&loc.key) || c.inflight.contains_key(&loc.key) || todo.iter().any(|(_, l)| l.key == loc.key) {
+                continue;
+            }
+            todo.push((raw, loc));
+        }
+        if todo.is_empty() {
             return true;
         }
-        c.inflight.insert(loc.key.clone(), std::thread::current().id());
+        let me = std::thread::current().id();
+        for (_, loc) in &todo {
+            c.inflight.insert(loc.key.clone(), me);
+        }
         drop(c);
-        let guard = Inflight { inner: self, key: loc.key.clone() };
+        let guards: Vec<Inflight> = todo.iter().map(|(_, loc)| Inflight { inner: self, key: loc.key.clone() }).collect();
+        let decode_all = || -> Vec<Result<Pixels>> {
+            match todo.len() {
+                1 => todo.iter().map(|(_, loc)| self.decode(loc, &footage, false)).collect(),
+                _ => {
+                    use rayon::prelude::*;
+                    todo.par_iter().map(|(_, loc)| self.decode(loc, &footage, false)).collect()
+                }
+            }
+        };
         let decoded = match self.ahead_pool.get().and_then(Option::as_ref) {
-            Some(pool) => pool.install(|| self.decode(&loc, &footage, false)),
-            None => self.decode(&loc, &footage, false),
+            Some(pool) => pool.install(decode_all),
+            None => decode_all(),
         };
         let mut c = lock(&self.cache);
-        match decoded {
-            Ok(px) => {
-                let bytes = px.bytes();
-                c.lru.insert(loc.key, px, self.budget());
-                if let Some(a) = c.ahead.get_mut(path).filter(|a| a.runner == Some(id)) {
-                    a.frame_bytes = bytes;
+        // in frame order, up to the first frame that failed (as decoding one at a time would)
+        for ((raw, loc), px) in todo.into_iter().zip(decoded) {
+            match px {
+                Ok(px) => {
+                    let bytes = px.bytes();
+                    c.lru.insert(loc.key, px, self.budget());
+                    if let Some(a) = c.ahead.get_mut(path).filter(|a| a.runner == Some(id)) {
+                        a.frame_bytes = bytes;
+                    }
+                    self.prefetched.fetch_add(1, Ordering::Relaxed);
                 }
-                self.prefetched.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(e) => {
-                log::debug!("media: decode-ahead of {path} at frame {raw}: {e}");
-                if let Some(a) = c.ahead.get_mut(path).filter(|a| a.runner == Some(id)) {
-                    a.until = a.next;
+                Err(e) => {
+                    log::debug!("media: decode-ahead of {path} at frame {raw}: {e}");
+                    if let Some(a) = c.ahead.get_mut(path).filter(|a| a.runner == Some(id)) {
+                        a.until = a.next;
+                    }
+                    break;
                 }
             }
         }
         drop(c);
-        drop(guard);
+        drop(guards);
         true
     }
 
@@ -1500,6 +1541,75 @@ mod tests {
         pool.audio_samples(&footage, Tick::ZERO, 1024, 48_000);
         assert!(lock(&pool.inner.conforming).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An intra-only (ProRes) movie of `n` frames, each a different gradient.
+    fn prores_movie(w: u32, h: u32, n: u32) -> Vec<u8> {
+        use filmcraft_isobmff::{Brand, FourCc, Mp4Writer, SampleEntry, TrackConfig, WriteSample, WriterOptions};
+        use filmcraft_prores::{ChromaFormat, Encoder, Frame, Profile};
+        let mut enc = Encoder::new(Profile::Standard, w, h);
+        let mut mux = Mp4Writer::new(std::io::Cursor::new(Vec::new()), WriterOptions::new(Brand::Mov)).unwrap();
+        let vt = mux.add_track(TrackConfig::new(SampleEntry::prores(FourCc(*b"apcn"), w as u16, h as u16), 24)).unwrap();
+        for i in 0..n {
+            let mut fr = Frame::new(w, h, ChromaFormat::Yuv422, 10, false);
+            for (k, y) in fr.y.iter_mut().enumerate() {
+                *y = 64 + ((k as u32 % w) * 7 + (k as u32 / w) * 3 + i * 40) as u16 % 876;
+            }
+            for (k, c) in fr.cb.iter_mut().enumerate() {
+                *c = 64 + (k as u32 * 5 + i * 60) as u16 % 896;
+            }
+            let data = enc.encode(&fr).unwrap();
+            mux.write_sample(vt, WriteSample { data: &data, duration: 1, composition_offset: 0, is_sync: true }).unwrap();
+        }
+        mux.finish().unwrap().into_inner()
+    }
+
+    /// Decode-ahead of an intra-only movie decodes several frames at once and caches them in
+    /// frame order, with the same pixels as decoding each frame on its own.
+    #[test]
+    fn intra_decode_ahead_matches_serial_decode() {
+        let n = 24;
+        let bytes: Arc<[u8]> = prores_movie(64, 48, n).into();
+        let path = "/mem/intra.mov";
+        let footage = crate::probe::probe_bytes(path, bytes.clone()).unwrap();
+        assert!(footage.codec.contains("ProRes"), "{}", footage.codec);
+        assert_eq!(ahead_batch(&footage.codec), (std::thread::available_parallelism().map_or(1, |n| n.get()) / 2).clamp(1, 4));
+        assert_eq!(ahead_batch("H.264 High"), 1);
+        let at = |i: u32| footage.frame_rate.tick_of(i64::from(i)) + Tick(footage.frame_rate.frame_duration().0 / 2);
+
+        // serial: every frame decoded on its own, no decode-ahead
+        let serial = MediaPool::new();
+        serial.set_read_ahead(false);
+        serial.add_bytes(path, bytes.clone());
+        let want: Vec<Arc<Image>> = (0..n).map(|i| serial.inner.frame_at(&footage, at(i), true).unwrap()).collect();
+        assert!(want.windows(2).all(|p| p[0].data != p[1].data), "the frames differ");
+
+        // two reads in order start the decode-ahead of the frames after them
+        let pool = MediaPool::new();
+        pool.add_bytes(path, bytes);
+        for i in 0..2 {
+            assert_eq!(pool.inner.frame_at(&footage, at(i), true).unwrap().data, want[i as usize].data);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let c = lock(&pool.inner.cache);
+            if c.ahead.get(path).is_some_and(|a| a.runner.is_none()) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "decode-ahead finishes");
+            drop(pool.inner.done.wait_timeout(c, std::time::Duration::from_millis(20)));
+        }
+        let ahead = pool.stats().prefetched;
+        assert!(ahead >= 16, "decoded ahead: {ahead}");
+        // cached in frame order (each newer than the one before), and identical to serial decode
+        let c = lock(&pool.inner.cache);
+        let stamps: Vec<u64> =
+            (2..2 + ahead as u32).map(|i| c.lru.map.get(&Key { frame: i64::from(i), ..Inner::locate(&footage, at(i)).key }).unwrap().stamp).collect();
+        assert!(stamps.windows(2).all(|p| p[0] < p[1]), "in frame order: {stamps:?}");
+        drop(c);
+        for i in 2..n {
+            assert_eq!(pool.inner.frame_at(&footage, at(i), true).unwrap().data, want[i as usize].data, "frame {i}");
+        }
     }
 
     #[test]
