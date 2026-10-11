@@ -45,7 +45,7 @@
 //! rendered again after the frame that first rendered it finished (scrubbing back, playing
 //! again), when the doorkeeper admits it.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, PoisonError, RwLock, Weak};
 
@@ -161,8 +161,106 @@ struct Inner {
     frame_bytes: usize,
     /// Frames begun so far ([`LayerCache::begin_frame`]).
     frames: u64,
-    /// The frames being rendered (their numbers, see [`FrameMark`]).
-    active: std::collections::BTreeSet<u64>,
+    /// The frames being rendered (their numbers, see [`FrameMark`]), each with the clock when
+    /// the frame before it began: entries used since then are the working set of playback
+    /// (see [`evict_one`]).
+    active: std::collections::BTreeMap<u64, u64>,
+    /// The clock when the latest frame began.
+    last_begin: u64,
+    /// Eviction order (see [`evict_one`]): `(last_use, key)` of every CPU entry, of the CPU
+    /// entries on probation, and of every GPU slot. `last_use` stamps are unique (the clock
+    /// advances on every touch), so these mirror the maps exactly; a stale pair is dropped
+    /// where it is met.
+    cpu_lru: BTreeSet<(u64, u64)>,
+    probation_lru: BTreeSet<(u64, u64)>,
+    gpu_lru: BTreeSet<(u64, usize)>,
+    /// GPU slots by content key ([`GpuOwner::resident`] lookups without a scan).
+    gpu_content: HashMap<u64, Vec<usize>>,
+}
+
+impl Inner {
+    fn index_cpu(&mut self, key: u64, last_use: u64, probation: bool) {
+        self.cpu_lru.insert((last_use, key));
+        if probation {
+            self.probation_lru.insert((last_use, key));
+        }
+    }
+
+    fn unindex_cpu(&mut self, key: u64, last_use: u64) {
+        self.cpu_lru.remove(&(last_use, key));
+        self.probation_lru.remove(&(last_use, key));
+    }
+
+    /// Keep GPU slot `id` (replacing one with the same id, which is returned).
+    fn gpu_insert(&mut self, id: usize, entry: gpu::GpuEntry) -> Option<gpu::GpuEntry> {
+        let old = self.gpu_remove(id);
+        self.gpu_lru.insert((entry.last_use, id));
+        if let Some(content) = entry.slot.content() {
+            self.gpu_content.entry(content).or_default().push(id);
+        }
+        self.gpu.insert(id, entry);
+        old
+    }
+
+    fn gpu_remove(&mut self, id: usize) -> Option<gpu::GpuEntry> {
+        let e = self.gpu.remove(&id)?;
+        self.gpu_lru.remove(&(e.last_use, id));
+        if let Some(content) = e.slot.content()
+            && let Some(ids) = self.gpu_content.get_mut(&content)
+        {
+            ids.retain(|i| *i != id);
+            if ids.is_empty() {
+                self.gpu_content.remove(&content);
+            }
+        }
+        Some(e)
+    }
+
+    fn gpu_touch(&mut self, id: usize, now: u64) {
+        let Some(e) = self.gpu.get_mut(&id) else { return };
+        let old = std::mem::replace(&mut e.last_use, now);
+        self.gpu_lru.remove(&(old, id));
+        self.gpu_lru.insert((now, id));
+    }
+
+    fn gpu_take_all(&mut self) -> HashMap<usize, gpu::GpuEntry> {
+        self.gpu_lru.clear();
+        self.gpu_content.clear();
+        std::mem::take(&mut self.gpu)
+    }
+
+    /// Entries used after this clock belong to the frames being rendered or the frame before
+    /// them (see [`evict_one`]).
+    fn working_since(&self) -> Option<u64> {
+        self.active.values().next().copied()
+    }
+
+    /// The least recently used CPU entry, dropping stale order pairs on the way.
+    fn oldest_cpu(&mut self, probation: bool) -> Option<(u64, u64)> {
+        loop {
+            let order = if probation { &self.probation_lru } else { &self.cpu_lru };
+            let (age, key) = *order.first()?;
+            if self.map.get(&key).is_some_and(|e| e.last_use == age && (!probation || e.probation)) {
+                return Some((age, key));
+            }
+            if probation {
+                self.probation_lru.remove(&(age, key));
+            } else {
+                self.cpu_lru.remove(&(age, key));
+            }
+        }
+    }
+
+    /// The least recently used GPU slot, dropping stale order pairs on the way.
+    fn oldest_gpu(&mut self) -> Option<(u64, usize)> {
+        loop {
+            let (age, id) = *self.gpu_lru.first()?;
+            if self.gpu.get(&id).is_some_and(|e| e.last_use == age) {
+                return Some((age, id));
+            }
+            self.gpu_lru.remove(&(age, id));
+        }
+    }
 }
 
 /// Keys per doorkeeper generation: two generations are kept, so the last 16–32k rendered keys
@@ -206,6 +304,8 @@ pub struct CacheStats {
     pub bytes: usize,
     pub hits: u64,
     pub misses: u64,
+    /// GPU slots the cache owns (CPU mirrors, Processed and Blend textures).
+    pub gpu_entries: usize,
 }
 
 impl Default for LayerCache {
@@ -236,7 +336,12 @@ impl LayerCache {
                 seen: Doorkeeper::default(),
                 frame_bytes: 0,
                 frames: 0,
-                active: std::collections::BTreeSet::new(),
+                active: std::collections::BTreeMap::new(),
+                last_begin: 0,
+                cpu_lru: BTreeSet::new(),
+                probation_lru: BTreeSet::new(),
+                gpu_lru: BTreeSet::new(),
+                gpu_content: HashMap::new(),
             })),
             disk: Mutex::new(None),
             store: Mutex::new(None),
@@ -444,7 +549,7 @@ impl LayerCache {
         g.clock += 1;
         let now = g.clock;
         let e = g.map.get_mut(&key)?;
-        e.last_use = now;
+        let old = std::mem::replace(&mut e.last_use, now);
         let stored = match &e.buf {
             Stored::Full(b) => Ok(b.clone()),
             Stored::Packed(p) => Err(p.clone()),
@@ -454,6 +559,8 @@ impl LayerCache {
         if let Some(b) = admitted {
             g.probation_bytes = g.probation_bytes.saturating_sub(b);
         }
+        g.unindex_cpu(key, old);
+        g.index_cpu(key, now, false);
         g.hits += 1;
         drop(g);
         Some(match stored {
@@ -490,7 +597,7 @@ impl LayerCache {
                 let seen = g.seen.saw(key, g.frames);
                 // (A buffer of one frame is seen again later when every frame rendering then
                 // has finished.)
-                let again = if once { seen.is_some_and(|f| g.active.first().is_none_or(|oldest| *oldest > f)) } else { seen.is_some() };
+                let again = if once { seen.is_some_and(|f| g.active.keys().next().is_none_or(|oldest| *oldest > f)) } else { seen.is_some() };
                 (g.missed_at.remove(&key), again)
             }
             Err(_) => return,
@@ -539,7 +646,9 @@ impl LayerCache {
             if old.probation {
                 g.probation_bytes = g.probation_bytes.saturating_sub(old.bytes);
             }
+            g.unindex_cpu(key, old.last_use);
         }
+        g.index_cpu(key, now, probation);
         g.bytes = g.bytes.saturating_add(bytes);
         if probation {
             g.probation_bytes = g.probation_bytes.saturating_add(bytes);
@@ -562,7 +671,9 @@ impl LayerCache {
         let Ok(mut g) = self.inner.lock() else { return FrameMark { cache: self, frame: None } };
         g.frames = g.frames.wrapping_add(1);
         let frame = g.frames;
-        g.active.insert(frame);
+        let now = g.clock;
+        let since = std::mem::replace(&mut g.last_begin, now);
+        g.active.insert(frame, since);
         if g.frame_bytes != bytes {
             g.frame_bytes = bytes;
             trim_probation(&mut g, None);
@@ -611,12 +722,8 @@ impl LayerCache {
                 if stats.live_bytes.saturating_add(stats.pending_bytes).saturating_add(extra) <= g.budget {
                     return;
                 }
-                let candidate = g
-                    .map
-                    .iter()
-                    .filter(|(_, e)| matches!(e.buf, Stored::Full(_)) && !e.unpackable && !e.probation)
-                    .min_by_key(|(_, e)| e.last_use)
-                    .map(|(k, _)| *k);
+                let candidate =
+                    g.cpu_lru.iter().map(|(_, k)| *k).find(|k| g.map.get(k).is_some_and(|e| matches!(e.buf, Stored::Full(_)) && !e.unpackable && !e.probation));
                 let Some(k) = candidate else { break };
                 let Some(e) = g.map.get(&k) else { break };
                 let Stored::Full(b) = &e.buf else { break };
@@ -697,8 +804,10 @@ impl LayerCache {
         *epoch = Arc::new(());
         *self.resident_lifetime.lock().unwrap_or_else(PoisonError::into_inner) = Arc::new(());
         let retired = if let Ok(mut g) = self.inner.lock() {
-            let retired = std::mem::take(&mut g.gpu);
+            let retired = g.gpu_take_all();
             g.map.clear();
+            g.cpu_lru.clear();
+            g.probation_lru.clear();
             g.physical.retire();
             g.bytes = 0;
             g.probation_bytes = 0;
@@ -716,7 +825,10 @@ impl LayerCache {
     }
 
     pub fn stats(&self) -> CacheStats {
-        self.inner.lock().map(|g| CacheStats { entries: g.map.len(), bytes: g.bytes, hits: g.hits, misses: g.misses }).unwrap_or_default()
+        self.inner
+            .lock()
+            .map(|g| CacheStats { entries: g.map.len(), bytes: g.bytes, hits: g.hits, misses: g.misses, gpu_entries: g.gpu.len() })
+            .unwrap_or_default()
     }
 
     /// Buffers inserted so far (each a render, or a disk read): tests count renders with it.
@@ -807,7 +919,7 @@ impl LayerCache {
 }
 
 /// A top-level frame being rendered ([`LayerCache::begin_frame`]): ends when dropped.
-pub(crate) struct FrameMark<'c> {
+pub struct FrameMark<'c> {
     cache: &'c LayerCache,
     frame: Option<u64>,
 }
@@ -903,28 +1015,54 @@ impl Drop for FlightGuard {
     }
 }
 
-/// Return backend payloads to the caller for disposal after unlocking.
-fn evict_one(g: &mut Inner) -> (bool, Option<Arc<GpuSlot>>) {
-    let cpu = g.map.iter().min_by_key(|(_, e)| e.last_use).map(|(k, e)| (*k, e.last_use));
-    let gpu = g.gpu.iter().min_by_key(|(_, e)| e.last_use).map(|(k, e)| (*k, e.last_use));
-    if let Some((key, age)) = cpu
-        && gpu.is_none_or(|(_, other)| age <= other)
-    {
+/// Evict one entry; a GPU payload is returned to the caller for disposal after unlocking.
+/// First renders still on probation go first (oldest first): they were used once, and a
+/// frame touching more keys than the cache holds must not push out the admitted entries that
+/// the next frame reuses (a key rendered again is admitted by the doorkeeper). Then the least
+/// recently used entry, CPU or GPU. O(log n): the order is kept, not searched.
+///
+/// `protect` (making room for a new entry): an admitted entry used by the frames being
+/// rendered, or by the frame before them, is not evicted; the new entry is declined instead.
+/// When a frame needs more than the budget, least recently used eviction is the worst policy
+/// for playback: each frame evicts exactly what the next one needs first, so nothing ever
+/// hits. Declining keeps a stable part of the working set, which hits on every frame. (Only
+/// the current frame's would not do: its early misses would evict what the previous frame
+/// used and this one needs later, alternating.) After a cut, the old content goes a frame
+/// later.
+fn evict_one(g: &mut Inner, protect: bool) -> (bool, Option<Arc<GpuSlot>>) {
+    if let Some((_, key)) = g.oldest_cpu(true) {
         remove(g, key);
         return (true, None);
     }
-    if let Some((key, _)) = gpu {
-        return (true, g.gpu.remove(&key).map(|e| e.slot));
+    let since = if protect { g.working_since() } else { None };
+    let cpu = g.oldest_cpu(false);
+    let gpu = g.oldest_gpu();
+    let (age, cpu_first) = match (cpu, gpu) {
+        (Some((a, _)), Some((b, _))) => (a.min(b), a <= b),
+        (Some((a, _)), None) => (a, true),
+        (None, Some((b, _))) => (b, false),
+        (None, None) => return (false, None),
+    };
+    if since.is_some_and(|since| age > since) {
+        return (false, None);
     }
-    (false, None)
+    match (cpu_first, cpu, gpu) {
+        (true, Some((_, key)), _) => {
+            remove(g, key);
+            (true, None)
+        }
+        (false, _, Some((_, id))) => (true, g.gpu_remove(id).map(|e| e.slot)),
+        _ => (false, None),
+    }
 }
 
 fn remove(g: &mut Inner, key: u64) {
     if let Some(e) = g.map.remove(&key) {
-        g.bytes -= e.bytes;
+        g.bytes = g.bytes.saturating_sub(e.bytes);
         if e.probation {
             g.probation_bytes = g.probation_bytes.saturating_sub(e.bytes);
         }
+        g.unindex_cpu(key, e.last_use);
     }
 }
 
@@ -945,13 +1083,20 @@ fn trim_probation(g: &mut Inner, newest: Option<u64>) {
     if g.probation_bytes <= window {
         return;
     }
-    let mut by_age: Vec<(u64, u64)> = g.map.iter().filter(|(k, e)| e.probation && Some(**k) != newest).map(|(k, e)| (e.last_use, *k)).collect();
-    by_age.sort_unstable();
-    for (_, k) in by_age {
-        if g.probation_bytes <= window {
-            break;
+    // Oldest first, in the kept order (no scan of the whole map).
+    let mut skipped = None;
+    while g.probation_bytes > window {
+        let Some((age, k)) = g.oldest_cpu(true) else { break };
+        if Some(k) == newest {
+            // Set aside while the older ones go, then put back.
+            g.probation_lru.remove(&(age, k));
+            skipped = Some((age, k));
+            continue;
         }
         remove(g, k);
+    }
+    if let Some(pair) = skipped {
+        g.probation_lru.insert(pair);
     }
 }
 

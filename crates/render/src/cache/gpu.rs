@@ -57,6 +57,9 @@ impl GpuSlot {
     pub fn stage(&self) -> GpuStage {
         self.stage
     }
+    pub(super) fn content(&self) -> Option<u64> {
+        self.content
+    }
 }
 pub(super) struct GpuEntry {
     pub(super) slot: Arc<GpuSlot>,
@@ -140,8 +143,10 @@ impl GpuOwner {
             if !self.valid() {
                 return None;
             }
-            g.gpu
-                .values()
+            g.gpu_content
+                .get(&key)?
+                .iter()
+                .filter_map(|id| g.gpu.get(id))
                 .find(|e| {
                     e.slot.content == Some(key)
                         && e.slot.stage == stage
@@ -170,9 +175,7 @@ impl GpuOwner {
         }
         g.clock = g.clock.saturating_add(1);
         let now = g.clock;
-        if let Some(e) = g.gpu.get_mut(&id) {
-            e.last_use = now;
-        }
+        g.gpu_touch(id, now);
         Some(slot)
     }
 
@@ -189,7 +192,7 @@ impl GpuOwner {
         let Some(inner) = self.inner.upgrade() else { return };
         let retired = {
             let Ok(mut g) = inner.lock() else { return };
-            g.gpu.remove(&(weak.as_ptr() as usize)).map(|e| e.slot)
+            g.gpu_remove(weak.as_ptr() as usize).map(|e| e.slot)
         };
         drop(retired);
     }
@@ -202,7 +205,7 @@ impl GpuOwner {
             let retired = {
                 let Ok(mut g) = inner.lock() else { return };
                 let key = g.gpu.iter().find(|(_, e)| e.slot.allocation.generation().same(generation)).map(|(k, _)| *k);
-                key.and_then(|k| g.gpu.remove(&k)).map(|e| e.slot)
+                key.and_then(|k| g.gpu_remove(k)).map(|e| e.slot)
             };
             if retired.is_none() {
                 break;
@@ -251,7 +254,9 @@ impl GpuPending {
         g.clock = g.clock.saturating_add(1);
         let now = g.clock;
         let weak = Arc::downgrade(&self.slot);
-        g.gpu.insert(Arc::as_ptr(&self.slot) as usize, GpuEntry { slot: self.slot, last_use: now });
+        let old = g.gpu_insert(Arc::as_ptr(&self.slot) as usize, GpuEntry { slot: self.slot, last_use: now });
+        drop(g);
+        drop(old);
         Ok(weak)
     }
 }
@@ -272,6 +277,8 @@ pub(super) fn relieve(inner: &Arc<Mutex<Inner>>, token: Option<&ResidentToken>, 
             if bytes_fit && device_fit && count_fit {
                 return;
             }
+            // Making room for a new entry keeps the current frames' working set (see `evict_one`).
+            let protect = token.is_some() && (extra > 0 || slot);
             if bytes_fit
                 && count_fit
                 && let Some((generation, _)) = device
@@ -279,13 +286,19 @@ pub(super) fn relieve(inner: &Arc<Mutex<Inner>>, token: Option<&ResidentToken>, 
                 // A device ceiling cannot be relieved by discarding CPU pixels or
                 // allocations from another context. Preserve those useful entries
                 // when a pinned allocation prevents admission on this device.
-                let key = g.gpu.iter().filter(|(_, e)| e.slot.allocation.generation().same(generation)).min_by_key(|(_, e)| e.last_use).map(|(key, _)| *key);
+                let since = if protect { g.working_since() } else { None };
+                let key = g
+                    .gpu_lru
+                    .iter()
+                    .find(|(_, id)| g.gpu.get(id).is_some_and(|e| e.slot.allocation.generation().same(generation)))
+                    .filter(|(age, _)| since.is_none_or(|since| *age <= since))
+                    .map(|(_, id)| *id);
                 match key {
-                    Some(key) => (true, g.gpu.remove(&key).map(|e| e.slot)),
+                    Some(key) => (true, g.gpu_remove(key).map(|e| e.slot)),
                     None => (false, None),
                 }
             } else {
-                super::evict_one(&mut g)
+                super::evict_one(&mut g, protect)
             }
         };
         drop(retired);

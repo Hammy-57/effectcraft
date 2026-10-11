@@ -230,6 +230,8 @@ impl Gpu {
     pub fn render_display(&self, r: &Renderer, comp: ItemId, t: Tick) -> Option<DisplayFrame> {
         let _profile = effectcraft_render::profile::span("display_prepare");
         self.ctx.check_health().map_err(|e| log::error!("gpu display: {e}")).ok()?;
+        // Declared before the encoder: the frame lasts until its resident outputs are published.
+        let _frame = r.frame_mark(comp);
         let mut e = Enc::with_resident(&self.ctx, r.cache.and_then(effectcraft_render::cache::LayerCache::gpu_owner));
         let img = walk::render(&mut e, r, comp, t)?;
         let texture = e.display(&img);
@@ -543,6 +545,8 @@ mod tests_fx_warp;
 mod tests_init;
 #[cfg(test)]
 mod tests_particles;
+#[cfg(test)]
+mod tests_precomp_resident;
 #[cfg(test)]
 mod tests_warmup;
 

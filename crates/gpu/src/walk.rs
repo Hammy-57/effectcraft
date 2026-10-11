@@ -282,6 +282,19 @@ fn ordinary_resident_enabled() -> bool {
     true
 }
 
+// Profile-only experiment: `EFFECTCRAFT_RT_DISABLE_PRECOMP_RESIDENT=1` composites every
+// precomp again each frame (the behaviour before static precomps were retained).
+#[cfg(feature = "profile")]
+fn precomp_resident_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("EFFECTCRAFT_RT_DISABLE_PRECOMP_RESIDENT").map_or(true, |value| value != "1"))
+}
+
+#[cfg(not(feature = "profile"))]
+fn precomp_resident_enabled() -> bool {
+    true
+}
+
 /// Ordinary plain layers retain layer-space Processed pixels. Styles and precomps
 /// keep their existing paths; keys declined by dependency analysis are not retained.
 fn draw_ordinary_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut GpuImage, opacity: f32) -> Option<Option<()>> {
@@ -376,7 +389,11 @@ fn draw_precomp(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas:
     if layer.masks().is_some_and(|m| !m.children.is_empty()) || styles::active(ctx, layer) {
         return None;
     }
-    let (sub, item, lt, bs) = r.precomp_source(ctx, layer)?;
+    let source = r.precomp_source(ctx, layer)?;
+    if let Some(done) = draw_cached_precomp(e, r, ctx, layer, canvas, opacity, &source) {
+        return Some(done);
+    }
+    let (sub, item, lt, bs) = source;
     // A nested comp the GPU can't take (nested too deep, over the texture limit, content it
     // declines) goes back to the CPU path for this layer only; only a device failure fails the
     // frame.
@@ -384,6 +401,68 @@ fn draw_precomp(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas:
         return if e.g.check_health().is_ok() { None } else { Some(None) };
     };
     finish_resident(e, r, ctx, layer, canvas, opacity, src, bs)
+}
+
+/// Reuse completed layer-space precomp pixels, never the parent placement or blend.
+/// `None` preserves the existing uncached precomp/CPU fallback.
+fn draw_cached_precomp(
+    e: &mut Enc,
+    r: &Renderer,
+    ctx: &EvalCtx,
+    layer: &Layer,
+    canvas: &mut GpuImage,
+    opacity: f32,
+    source: &(Renderer<'_>, ItemId, Tick, f64),
+) -> Option<Option<()>> {
+    use effectcraft_render::cache::{Claim, GpuStage};
+    if !precomp_resident_enabled() || !e.can_retain_resident() {
+        return None;
+    }
+    let cache = r.cache?;
+    let (key, noted) = {
+        let _profile = effectcraft_render::profile::span("precomp_resident_key");
+        r.resident_precomp_key(ctx, layer)?
+    };
+    if let Some(image) = e.resident(key, GpuStage::Processed) {
+        let _profile = effectcraft_render::profile::span("precomp_resident_hit");
+        r.resident_precomp_note(noted, true);
+        return composite_processed(e, r, ctx, layer, canvas, opacity, image);
+    }
+    let intent = cache.disk_intent(key);
+    let mut cpu = cache.get(key);
+    let mut flight = None;
+    if cpu.is_none() {
+        match cache.claim_gpu(key) {
+            Claim::Ready(buf) => cpu = Some(buf),
+            Claim::Owner(guard) => flight = Some(guard),
+            Claim::Render => {
+                if let Some(image) = e.resident(key, GpuStage::Processed) {
+                    r.resident_precomp_note(noted, true);
+                    return composite_processed(e, r, ctx, layer, canvas, opacity, image);
+                }
+                r.resident_precomp_note(noted, false);
+                return None;
+            }
+        }
+    }
+    r.resident_precomp_note(noted, cpu.is_some());
+    let image = if let Some(buf) = cpu {
+        crate::context::NativeImage { img: e.upload_buf(&buf)?, offset: buf.offset, scale: buf.scale }
+    } else {
+        let _profile = effectcraft_render::profile::span("precomp_resident_produce");
+        let (sub, item, lt, bs) = source;
+        let Some(src) = render(e, sub, *item, *lt) else {
+            return if e.g.check_health().is_ok() { None } else { Some(None) };
+        };
+        prepare_processed(e, r, ctx, layer, src, *bs)?
+    };
+    let result = composite_processed(e, r, ctx, layer, canvas, opacity, image.clone());
+    if result == Some(Some(()))
+        && let Some(flight) = flight
+    {
+        e.keep_resident(key, image, flight, intent);
+    }
+    result
 }
 
 fn draw_yuv_footage(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut GpuImage, opacity: f32) -> Option<Option<()>> {
@@ -437,13 +516,23 @@ fn finish_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canv
     composite_resident(e, r, ctx, layer, canvas, opacity, image)
 }
 
-fn prepare_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, mut src: GpuImage, bs: f64) -> Option<crate::context::NativeImage> {
+fn prepare_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, src: GpuImage, bs: f64) -> Option<crate::context::NativeImage> {
+    // Native YUV entries retain their historical blending-space representation.
+    let mut image = prepare_processed(e, r, ctx, layer, src, bs)?;
+    if let Some(c) = r.pipe().to_blend() {
+        image.img = ops::convert(e, &image.img, &c);
+    }
+    Some(image)
+}
+
+/// Processed slots also serve lazy CPU consumers, so they must precede to_blend.
+fn prepare_processed(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, mut src: GpuImage, bs: f64) -> Option<crate::context::NativeImage> {
     let pipe = r.pipe();
     // `masked_source` quantises a non-solid source to the project's depth.
     if let Some(l) = pipe.levels {
         src = ops::quantize(e, &src, l);
     }
-    let (mut img, offset, scale) = if layer.switches.effects && layer.effects().is_some_and(|f| !f.children.is_empty()) {
+    let (img, offset, scale) = if layer.switches.effects && layer.effects().is_some_and(|f| !f.children.is_empty()) {
         // Effects run in effect space (0.7.0): from the layer bounds' corner.
         let o = ctx.effect_bounds(layer).1;
         let mut fx = crate::effects::GpuFx::new(e, src, [o[0] * bs, o[1] * bs], bs, pipe.levels);
@@ -453,9 +542,6 @@ fn prepare_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, mut
     } else {
         (src, [0.0; 2], bs)
     };
-    if let Some(c) = pipe.to_blend() {
-        img = ops::convert(e, &img, &c);
-    }
     Some(crate::context::NativeImage { img, offset, scale })
 }
 

@@ -1479,6 +1479,7 @@ impl effectcraft_render::cache::ResidentReadback for LazyReadback {
             return None;
         }
         let image = slot.payload::<NativeImage>()?;
+        let _profile = effectcraft_render::profile::span("processed_readback");
         crate::Gpu::within_context(&ctx, || {
             let mut enc = Enc::new(&ctx);
             Some(Buf { img: enc.download(&image.img)?, offset: image.offset, scale: image.scale })

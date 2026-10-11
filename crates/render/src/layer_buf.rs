@@ -107,6 +107,24 @@ impl<'a> Renderer<'a> {
         cache::content_animated(ctx.comp, layer)
     }
 
+    /// A static precomp's Processed key and the existing key-attempt bookkeeping id.
+    /// Animated nested content keeps its current transient rendering policy. Accelerators
+    /// must still apply `precomp_source` eligibility before using this key.
+    pub fn resident_precomp_key(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(u64, u64)> {
+        if !matches!(layer.source, LayerSource::Comp { .. }) || self.freeze.is_some() || self.precomp_varies(ctx, layer) {
+            return None;
+        }
+        let (key, noted) = self.content_cache_key_noted(ctx, layer);
+        Some((key?, noted?))
+    }
+
+    /// Report a static precomp lookup through the same miss backoff used by CPU content.
+    pub fn resident_precomp_note(&self, id: u64, hit: bool) {
+        if let Some(cache) = self.cache {
+            cache.precomp_note(id, hit);
+        }
+    }
+
     /// Source and masks rebased into effect space, exactly as the CPU content producer.
     pub fn resident_source(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Buf> {
         let mut buf = self.masked_source(ctx, layer)?;

@@ -112,15 +112,18 @@ pub(super) fn run(s: &Session, args: &Args) -> Result<(), Failure> {
         // sorted samples hide.
         let mut frames = Vec::with_capacity(n);
         for i in 0..n {
-            let (t0, p0) = (gpu.context().transfer_stats(), gpu.context().pool_stats());
+            let (t0, p0, c0) = (gpu.context().transfer_stats(), gpu.context().pool_stats(), cache.stats());
             let now = std::time::Instant::now();
             render(i.saturating_add(1) as i64)?;
             let ms = now.elapsed().as_secs_f64() * 1000.0;
             let (t1, p1) = (gpu.context().transfer_stats(), gpu.context().pool_stats());
+            let (c1, held) = (cache.stats(), cache.retained_stats());
             samples.push(ms);
             frames.push(json!({"offset": i.saturating_add(1), "ms": ms, "uploads": t1.uploads.saturating_sub(t0.uploads),
                 "uploadBytes": t1.upload_bytes.saturating_sub(t0.upload_bytes), "readbackBytes": t1.readback_bytes.saturating_sub(t0.readback_bytes),
-                "poolMisses": p1.1.saturating_sub(p0.1)}));
+                "poolMisses": p1.1.saturating_sub(p0.1), "cacheCpuEntries": c1.entries, "cacheGpuEntries": c1.gpu_entries,
+                "cacheHits": c1.hits.saturating_sub(c0.hits), "cacheMisses": c1.misses.saturating_sub(c0.misses),
+                "retainedBytes": held.live_bytes, "retainedDebtBytes": held.debt_bytes, "retainedRecords": held.records}));
         }
         let after = gpu.context().transfer_stats();
         let pool_after = gpu.context().pool_stats();

@@ -410,3 +410,109 @@ fn probation_window_follows_the_frame() {
     drop(cache.begin_frame(100, 80));
     assert_eq!(cache.window(), 16 << 20, "small frames: the floor");
 }
+
+fn tiny(side: u32) -> Arc<effectcraft_effects::Buf> {
+    Arc::new(effectcraft_effects::Buf { img: Image::filled(side, side, [0.5; 4]), offset: [0.0; 2], scale: 1.0 })
+}
+
+/// One frame's keys against the cache: hits, and a render (insert) for each miss.
+fn play(cache: &LayerCache, keys: std::ops::Range<u64>, side: u32) -> usize {
+    let _frame = cache.begin_frame(64, 64);
+    let mut hits = 0;
+    for k in keys {
+        if cache.get(k).is_some() {
+            hits += 1;
+        } else {
+            cache.insert(k, tiny(side));
+        }
+    }
+    hits
+}
+
+/// Under count pressure first renders on probation are evicted before admitted entries:
+/// a burst of one-shot keys (an animated layer, a busy frame) leaves what was admitted.
+#[test]
+fn eviction_drops_probation_entries_before_admitted_ones() {
+    let cache = LayerCache::default();
+    let admitted = (crate::retained::MAX_RECORDS - 64) as u64;
+    for k in 0..admitted {
+        cache.insert(k, tiny(1));
+        assert!(cache.get(k).is_some(), "admitted on its hit");
+    }
+    assert_eq!(cache.admission().0, admitted as usize);
+    // Far more one-shot keys than free record slots.
+    for k in 0..1000 {
+        cache.insert(1_000_000 + k, tiny(1));
+    }
+    assert_eq!(cache.admission().0, admitted as usize, "no admitted entry was evicted");
+    assert!((0..admitted).all(|k| cache.get(k).is_some()));
+    assert!(cache.get(1_000_000).is_none(), "the oldest one-shot entry went first");
+    assert!(cache.get(1_000_999).is_some(), "the newest one-shot entry is kept");
+}
+
+/// A frame touching more keys than the cache holds (records): least recently used eviction
+/// would evict, during each frame, exactly what is used next, so nothing ever hit. The frame's
+/// working set is kept instead, and a stable part of it hits on every frame.
+#[test]
+fn frames_over_the_record_cap_keep_static_hits() {
+    let cache = LayerCache::default();
+    let keys = 0..6000u64;
+    assert_eq!(play(&cache, keys.clone(), 1), 0);
+    let mut last = 0;
+    for f in 1..6 {
+        last = play(&cache, keys.clone(), 1);
+        if f >= 3 {
+            assert!(last >= crate::retained::MAX_RECORDS - 64, "frame {f}: {last} hits");
+        }
+    }
+    let again = play(&cache, keys.clone(), 1);
+    assert_eq!(again, last, "stable from frame to frame");
+}
+
+/// The same with bytes: a frame needing twice the budget keeps about half of it hitting.
+#[test]
+fn frames_over_the_byte_budget_keep_static_hits() {
+    // 64×64 RGBA f32 = 64 KiB per buffer; 400 buffers = 25 MiB against a 12 MiB budget.
+    let cache = LayerCache::new(12 << 20);
+    let keys = 0..400u64;
+    play(&cache, keys.clone(), 64);
+    let mut hits = Vec::new();
+    for _ in 0..5 {
+        hits.push(play(&cache, keys.clone(), 64));
+    }
+    let last = *hits.last().unwrap_or(&0);
+    assert!(last >= 120, "{hits:?}: a stable part of the frame hits");
+    assert_eq!(hits[hits.len() - 2], last, "{hits:?}: stable");
+    assert!(cache.retained_stats().live_bytes <= 12 << 20);
+}
+
+/// Outside a frame (no working set to keep) eviction stays least recently used, and shrinking
+/// the budget still evicts what is in use.
+#[test]
+fn shrinking_the_budget_evicts_even_the_working_set() {
+    let cache = LayerCache::new(12 << 20);
+    let _frame = cache.begin_frame(64, 64);
+    for k in 0..100 {
+        cache.insert(k, tiny(64));
+        assert!(cache.get(k).is_some());
+    }
+    let before = cache.retained_stats().live_bytes;
+    assert!(before > 4 << 20);
+    cache.set_budget(4 << 20);
+    assert!(cache.retained_stats().live_bytes <= 4 << 20, "{before} -> {:?}", cache.retained_stats());
+    assert!(cache.get(99).is_some(), "the most recent survive");
+    assert!(cache.get(0).is_none(), "the least recent go");
+}
+
+/// After a cut the old shot's entries stop being kept: the new shot is admitted from its
+/// second frame and hits from its third.
+#[test]
+fn after_a_cut_the_new_shot_takes_the_budget() {
+    let cache = LayerCache::new(12 << 20);
+    for _ in 0..3 {
+        play(&cache, 0..400, 64);
+    }
+    let hits: Vec<usize> = (0..4).map(|_| play(&cache, 10_000..10_150, 64)).collect();
+    assert_eq!(hits[0], 0);
+    assert_eq!(hits[2..], [150, 150], "{hits:?}");
+}

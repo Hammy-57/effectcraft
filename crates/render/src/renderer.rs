@@ -303,6 +303,12 @@ impl<'a> Renderer<'a> {
         Some((a.auto_pick()?, AutoKey::new(comp, self.opts.scale, display)))
     }
 
+    /// [`Self::begin_frame`] for an accelerator drawing a top-level frame itself (the GPU
+    /// viewer's display path): the layer cache keeps that frame's working set while it lives.
+    pub fn frame_mark(&self, comp_id: ItemId) -> Option<crate::cache::FrameMark<'a>> {
+        self.begin_frame(comp_id)
+    }
+
     /// Tell the layer cache a top-level frame starts (it lasts while the mark lives, see
     /// [`crate::cache::LayerCache::begin_frame`]).
     fn begin_frame(&self, comp_id: ItemId) -> Option<crate::cache::FrameMark<'a>> {
