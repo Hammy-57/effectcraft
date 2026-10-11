@@ -494,6 +494,8 @@ mod tests_3d;
 #[cfg(test)]
 mod tests_adjust;
 #[cfg(test)]
+mod tests_shape_clip;
+#[cfg(test)]
 mod tests_adv3d;
 #[cfg(test)]
 mod tests_deferred;

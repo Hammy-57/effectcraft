@@ -1,7 +1,8 @@
 //! Processed layer buffers: source → masks → effects → layer styles, served from and
 //! stored in the layer cache.
 
-use crate::{EvalCtx, LayerTiming, Renderer, cache, color, masks, source_size, styles};
+use crate::placement::Window;
+use crate::{EvalCtx, LayerTiming, Renderer, cache, clip, color, masks, source_size, styles};
 use effectcraft_color::BlendMode;
 use effectcraft_effects::Buf;
 use effectcraft_keyframe::Value;
@@ -9,12 +10,18 @@ use effectcraft_project::{Comp, Layer, LayerSource, Node, PropGroup};
 use std::sync::Arc;
 
 impl<'a> Renderer<'a> {
-    /// Source → masks, clamped/quantised to the project depth.
-    fn masked_source(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Buf> {
+    /// Source → masks, clamped/quantised to the project depth. `clip`: only that window of a
+    /// shape layer's buffer (see [`Self::shape_clip`]).
+    fn masked_source(&self, ctx: &EvalCtx, layer: &Layer, clip: Option<Window>) -> Option<Buf> {
         let _profile = crate::profile::span("layer_raster");
-        let mut buf = match self.content_times(ctx, layer) {
-            Some(times) => self.blurred_source(ctx, layer, &times)?,
-            None => self.source(ctx, layer)?,
+        let mut buf = match (self.content_times(ctx, layer), clip, &layer.source) {
+            (Some(times), ..) => self.blurred_source(ctx, layer, &times)?,
+            (None, Some(w), LayerSource::Shape) => {
+                let contents = layer.props.sub("contents")?;
+                let k = self.raster_scale(ctx, layer);
+                self.authored(crate::shapes::render_window(ctx, layer, contents, k, Some([w.x, w.y, w.w, w.h])))
+            }
+            (None, ..) => self.source(ctx, layer)?,
         };
         // A solid is filled with a quantised colour: only masks can take it off the grid.
         let solid = matches!(layer.source, LayerSource::Solid { .. });
@@ -101,9 +108,17 @@ impl<'a> Renderer<'a> {
     pub fn resident_content_key(&self, ctx: &EvalCtx, layer: &Layer) -> Option<u64> {
         self.content_cache_key(ctx, layer)
     }
-    /// Source and masks rebased into effect space, exactly as the CPU content producer.
-    pub fn resident_source(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Buf> {
-        let mut buf = self.masked_source(ctx, layer)?;
+    /// [`Self::resident_content_key`] and the window of the layer's buffer that key stands for
+    /// (for [`Self::resident_source`]): decided together, once.
+    pub fn resident_content(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(u64, ContentClip)> {
+        let (key, _, clip) = self.content_cache_key_noted(ctx, layer);
+        Some((key?, ContentClip(clip)))
+    }
+
+    /// Source and masks rebased into effect space, exactly as the CPU content producer, in the
+    /// window `clip` that came with the layer's key ([`Self::resident_content`]).
+    pub fn resident_source(&self, ctx: &EvalCtx, layer: &Layer, clip: ContentClip) -> Option<Buf> {
+        let mut buf = self.masked_source(ctx, layer, clip.0)?;
         buf.rebase(crate::fx::fx_origin(ctx, layer, false));
         Some(buf)
     }
@@ -134,13 +149,16 @@ impl<'a> Renderer<'a> {
     /// [`Self::content_cache_key`], and for a precomp layer that was keyed, its id for
     /// [`cache::LayerCache::precomp_note`] (an animated precomp is keyed only now and then, see
     /// [`cache::LayerCache::precomp_try`]).
-    fn content_cache_key_noted(&self, ctx: &EvalCtx, layer: &Layer) -> (Option<u64>, Option<u64>) {
-        let Some(c) = self.cache else { return (None, None) };
+    ///
+    /// A shape layer drawn clipped (see [`Self::shape_clip`]) has the window in its key, and
+    /// the window is returned too.
+    fn content_cache_key_noted(&self, ctx: &EvalCtx, layer: &Layer) -> (Option<u64>, Option<u64>, Option<Window>) {
+        let Some(c) = self.cache else { return (None, None, self.shape_clip(ctx, layer, None)) };
         let (src, noted) = match layer.source {
             LayerSource::Comp { .. } => {
                 let id = cache::derive(cache::derive(ctx.comp_id.0, layer.id.0), self.depth as u64);
                 if !c.precomp_try(id) {
-                    return (None, None);
+                    return (None, None, None);
                 }
                 (self.precomp_key(ctx, layer), Some(id))
             }
@@ -149,11 +167,17 @@ impl<'a> Renderer<'a> {
             _ => (None, None),
         };
         let key = cache::layer_key_src(ctx, layer, self.raster_scale(ctx, layer), self.opts.draft, self.mb_on(ctx, layer), src);
-        (self.content_key(ctx, layer, key), noted)
+        let key = self.content_key(ctx, layer, key);
+        let clip = self.shape_clip(ctx, layer, key);
+        let key = match clip {
+            Some(w) => key.map(|k| clip::clipped_key(k, w)),
+            None => key,
+        };
+        (key, noted, clip)
     }
 
     fn content_buf_timed(&self, ctx: &EvalCtx, layer: &Layer, mut timing: Option<&mut LayerTiming>) -> Option<(Arc<Buf>, Option<u64>)> {
-        let (key, noted) = self.content_cache_key_noted(ctx, layer);
+        let (key, noted, clip) = self.content_cache_key_noted(ctx, layer);
         // An animated precomp's buffer isn't kept for other uses in its frame (see
         // [`cache::LayerCache::insert_once`]): no use waiting for another thread's render of it.
         let once = key.is_some() && noted.is_some() && self.precomp_varies(ctx, layer);
@@ -181,7 +205,7 @@ impl<'a> Renderer<'a> {
                 return Some((b, key));
             }
         }
-        let buf = self.masked_source(ctx, layer)?;
+        let buf = self.masked_source(ctx, layer, clip)?;
         let (buf, kept) = self.apply_effects_kept(ctx, layer, buf, false, usize::MAX, timing.map(|t| &mut t.effects));
         let buf = Arc::new(buf);
         // The accelerator composites this buffer from the effects' result on the device (no
@@ -220,7 +244,7 @@ impl<'a> Renderer<'a> {
         {
             return Some(b);
         }
-        let mut buf = self.masked_source(ctx, layer)?;
+        let mut buf = self.masked_source(ctx, layer, None)?;
         let origin = ctx.effect_bounds(layer).1;
         buf.rebase(origin);
         if effects > 0 {
@@ -295,7 +319,7 @@ impl<'a> Renderer<'a> {
     /// and cached in the blending space alone (no working-space copy cloned and kept next to
     /// it). The same pixels as [`Self::content_buf_timed`] then [`Self::to_blend`].
     fn plain_blend(&self, ctx: &EvalCtx, layer: &Layer, mut timing: Option<&mut LayerTiming>) -> Option<StyledLayer> {
-        let (ckey, noted) = self.content_cache_key_noted(ctx, layer);
+        let (ckey, noted, clip) = self.content_cache_key_noted(ctx, layer);
         let key = ckey.map(|k| cache::derive(k, 0x1ea7));
         // A resident Processed result is an actual CPU demand here. Reuse it in
         // working space, then convert forward; a Blend texture is never inverted.
@@ -349,7 +373,7 @@ impl<'a> Renderer<'a> {
                 return Some(StyledLayer { passes: vec![], content: b.clone(), body: b, key: ckey, ckey, plain: true });
             }
         }
-        let buf = self.masked_source(ctx, layer)?;
+        let buf = self.masked_source(ctx, layer, clip)?;
         let mut buf = self.apply_effects_timed(ctx, layer, buf, false, usize::MAX, timing.map(|t| &mut t.effects));
         if let Some(c) = self.pipe.to_blend() {
             color::convert(&mut buf.img, &c);
@@ -398,7 +422,7 @@ impl<'a> Renderer<'a> {
 /// than compositing it: a track matte naming it, an effect's layer parameter (Displacement Map,
 /// Set Matte…) or an expression's `sampleImage`? Errs towards yes: a wrong yes only keeps a
 /// copy in the layer cache, a wrong no only re-renders the layer for that reader.
-fn working_read(comp: &Comp, layer: &Layer) -> bool {
+pub(crate) fn working_read(comp: &Comp, layer: &Layer) -> bool {
     comp.layers.iter().any(|l| {
         l.track_matte.as_ref().is_some_and(|m| m.layer == layer.id)
             || l.effects().is_some_and(names_a_layer)
@@ -421,6 +445,11 @@ fn samples_pixels(g: &PropGroup) -> bool {
         Node::Group(sub) => samples_pixels(sub),
     })
 }
+
+/// The window of a layer's buffer its content key stands for (see [`Renderer::resident_content`]):
+/// the whole buffer, or the part of a shape layer's that can show (see `clip.rs`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ContentClip(Option<Window>);
 
 /// A layer ready to composite (see [`Renderer::styled_layer`]).
 pub struct StyledLayer {

@@ -294,9 +294,9 @@ fn draw_ordinary_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Laye
         return None;
     }
     let cache = r.cache?;
-    let key = {
+    let (key, clip) = {
         let _profile = effectcraft_render::profile::span("ordinary_resident_key");
-        r.resident_content_key(ctx, layer)?
+        r.resident_content(ctx, layer)?
     };
     let resident = {
         let _profile = effectcraft_render::profile::span("ordinary_resident_lookup");
@@ -328,7 +328,7 @@ fn draw_ordinary_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Laye
         crate::context::NativeImage { img: e.upload_buf(&buf)?, offset: buf.offset, scale: buf.scale }
     } else {
         let _profile = effectcraft_render::profile::span("ordinary_resident_produce");
-        let buf = r.resident_source(ctx, layer)?;
+        let buf = r.resident_source(ctx, layer, clip)?;
         let src = e.g.upload_image(&buf.img)?;
         let mut fx = crate::effects::GpuFx::new(e, src, buf.offset, buf.scale, r.pipe().levels);
         let origin = r.run_layer_effects_on(ctx, layer, &mut fx);

@@ -77,7 +77,16 @@ pub struct LayerCache {
     inflight: Arc<Mutex<HashMap<u64, Arc<Flight>>>>,
     /// Precomp layers' consecutive key misses (see [`LayerCache::precomp_try`]).
     streaks: Mutex<HashMap<u64, u32>>,
+    /// Shape layers' whole raster buffers by content key (see [`LayerCache::shape_rect`]).
+    shape_rects: Mutex<HashMap<u64, Option<ShapeRect>>>,
+    /// Shape layers' last content key, when it was seen and for how many times since it held
+    /// (see [`LayerCache::content_held`]).
+    shape_keys: Mutex<HashMap<u64, (u64, effectcraft_time::Tick, u32)>>,
 }
+
+/// A shape layer's whole raster buffer: width, height and offset (see
+/// [`crate::shapes::buffer_rect`]).
+pub(crate) type ShapeRect = (u32, u32, [f64; 2]);
 
 /// Weak lifetime of accelerator content associated with a layer cache. Clearing
 /// or dropping the cache invalidates previously captured tokens, including late inserts.
@@ -243,6 +252,8 @@ impl LayerCache {
             gate: Mutex::new(None),
             inflight: Arc::new(Mutex::new(HashMap::new())),
             streaks: Mutex::new(HashMap::new()),
+            shape_rects: Mutex::new(HashMap::new()),
+            shape_keys: Mutex::new(HashMap::new()),
         }
     }
 
@@ -784,6 +795,42 @@ impl LayerCache {
             m.insert(id, n.saturating_add(1));
         }
         attempt
+    }
+
+    /// The whole raster buffer of the shape layer whose content key is `key` (which fixes it),
+    /// measured by `measure` once (a walk of the layer's shapes; see [`crate::clip`]).
+    pub(crate) fn shape_rect(&self, key: u64, measure: impl FnOnce() -> Option<ShapeRect>) -> Option<ShapeRect> {
+        if let Ok(m) = self.shape_rects.lock()
+            && let Some(r) = m.get(&key)
+        {
+            return *r;
+        }
+        let r = measure();
+        if let Ok(mut m) = self.shape_rects.lock() {
+            if m.len() > 4096 {
+                m.clear();
+            }
+            m.insert(key, r);
+        }
+        r
+    }
+
+    /// Whether layer `id`'s content key `key` (at time `t`) has held over the last two times it
+    /// was asked at: static content (only its transform may change), which is better kept whole in
+    /// the cache than clipped to where it shows (see [`crate::clip`]). Asking again at the same time
+    /// (another instance of a precomp) counts once.
+    pub(crate) fn content_held(&self, id: u64, key: u64, t: effectcraft_time::Tick) -> bool {
+        let Ok(mut m) = self.shape_keys.lock() else { return false };
+        if m.len() > 4096 && !m.contains_key(&id) {
+            m.clear();
+        }
+        let e = m.entry(id).or_insert((key, t, 0));
+        if e.0 != key {
+            *e = (key, t, 0);
+        } else if e.1 != t {
+            *e = (key, t, e.2.saturating_add(1));
+        }
+        e.2 >= 2
     }
 
     /// The outcome of keying precomp layer `id` (see [`Self::precomp_try`]).

@@ -451,7 +451,11 @@ struct PxRect {
 
 /// Composite `cov`-weighted colour (`color_at(x, y)` in buffer pixels, straight alpha) into the
 /// `r` sub-rectangle of a premultiplied image (`cov` is `r.w × r.h`).
-fn paint(img: &mut Image, r: PxRect, cov: &Mask, opacity: f32, blend: BlendMode, color_at: impl Fn(usize, usize) -> [f32; 4] + Sync) {
+///
+/// `origin` is the buffer's top-left pixel in the layer's whole buffer (a window of it, see
+/// [`render_window`]): the dissolve noise follows the whole buffer's pixels.
+#[allow(clippy::too_many_arguments)]
+fn paint(img: &mut Image, origin: [u32; 2], r: PxRect, cov: &Mask, opacity: f32, blend: BlendMode, color_at: impl Fn(usize, usize) -> [f32; 4] + Sync) {
     let iw = img.width as usize;
     let (x0, y0, rw) = (r.x0 as usize, r.y0 as usize, r.w as usize);
     let row = |y: usize, out: &mut [[f32; 4]], crow: &[f32]| {
@@ -471,7 +475,8 @@ fn paint(img: &mut Image, r: PxRect, cov: &Mask, opacity: f32, blend: BlendMode,
                 *px = [src[0] + px[0] * k, src[1] + px[1] * k, src[2] + px[2] * k, a + px[3] * k];
             } else {
                 // Deterministic per-pixel noise for the dissolve modes.
-                let h = ((x as u32).wrapping_mul(73_856_093) ^ (y as u32).wrapping_mul(19_349_663)).wrapping_mul(2_654_435_761);
+                let (nx, ny) = ((x as u32).wrapping_add(origin[0]), (y as u32).wrapping_add(origin[1]));
+                let h = (nx.wrapping_mul(73_856_093) ^ ny.wrapping_mul(19_349_663)).wrapping_mul(2_654_435_761);
                 *px = blend_pixel(blend, *px, src, (h >> 8) as f32 / (1u32 << 24) as f32);
             }
         }
@@ -565,6 +570,14 @@ pub fn buffer_rect(ctx: &EvalCtx, layer: &Layer, contents: &PropGroup, s: f64) -
 /// Each draw rasterises and composites only its own pixel rectangle; coverage masks of
 /// consecutive draws are rasterised in parallel, then composited in stacking order.
 pub fn render(ctx: &EvalCtx, layer: &Layer, contents: &PropGroup, s: f64) -> Buf {
+    render_window(ctx, layer, contents, s, None)
+}
+
+/// [`render`], only the window `[x, y, w, h]` of the buffer it makes (whole pixels of that
+/// buffer, clamped to it; at least one pixel): the same pixels there, in a buffer whose offset is
+/// the whole buffer's moved by whole pixels, so it lands exactly where those pixels would. `None`
+/// renders the whole buffer.
+pub fn render_window(ctx: &EvalCtx, layer: &Layer, contents: &PropGroup, s: f64, window: Option<[u32; 4]>) -> Buf {
     let mut arena = Vec::new();
     let (draws, _) = collect(ctx, layer, contents, &mut arena);
     // Bottom-most draw first.
@@ -580,6 +593,15 @@ pub fn render(ctx: &EvalCtx, layer: &Layer, contents: &PropGroup, s: f64) -> Buf
         .collect();
     let Some(b) = resolved.iter().map(|r| r.2).reduce(|a, b| a.union(b)) else { return Buf { img: Image::new(1, 1), offset: [0.0, 0.0], scale: s } };
     let (w, h, offset) = extent(b, s);
+    // The window: whole pixels of the whole buffer, at least one.
+    let (origin, w, h, offset) = match window {
+        Some([x, y, ww, wh]) => {
+            let (x, y) = (x.min(w - 1), y.min(h - 1));
+            let (ww, wh) = (ww.clamp(1, w - x), wh.clamp(1, h - y));
+            ([x, y], ww, wh, [offset[0] - x as f64, offset[1] - y as f64])
+        }
+        None => ([0, 0], w, h, offset),
+    };
     let m = Mat3::translate(vec2(offset[0], offset[1])) * Mat3::scale(vec2(s, s));
     let px_rect = |r: kurbo::Rect| -> Option<PxRect> {
         let x0 = (r.x0 * s + offset[0]).floor().max(0.0);
@@ -602,11 +624,11 @@ pub fn render(ctx: &EvalCtx, layer: &Layer, contents: &PropGroup, s: f64) -> Buf
         let covs: Vec<Mask> = jobs[i..j].par_iter().map(|(d, paths, r)| draw_coverage(d, paths, &m, *r)).collect();
         for ((d, _, r), cov) in jobs[i..j].iter().zip(&covs) {
             match &d.paint {
-                Paint::Fill { color, .. } | Paint::Stroke { color, .. } => paint(&mut img, *r, cov, d.opacity, d.blend, |_, _| *color),
+                Paint::Fill { color, .. } | Paint::Stroke { color, .. } => paint(&mut img, origin, *r, cov, d.opacity, d.blend, |_, _| *color),
                 Paint::Gradient { g, radial, start, end, highlight, .. } => {
                     let to_local = (m * d.xf).inverse().unwrap_or(Mat3::IDENTITY);
                     let ramp = GradientRamp::new(*radial, *start, *end, *highlight);
-                    paint(&mut img, *r, cov, d.opacity, d.blend, |x, y| {
+                    paint(&mut img, origin, *r, cov, d.opacity, d.blend, |x, y| {
                         let p = to_local.apply(vec2(x as f64 + 0.5, y as f64 + 0.5));
                         g.sample(ramp.t(p.x, p.y))
                     });
