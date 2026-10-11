@@ -418,6 +418,10 @@ fn import_doc(next: &mut Project, bytes: &[u8], source_dir: &str, resolve_media:
                         comp.background[i] = v.as_f64().unwrap_or(0.0).clamp(0.0, 1.0) as f32;
                     }
                 }
+                // The comp's Frame Blending switch when the IR has it; otherwise off (the default).
+                if let Some(v) = field(item, &["frame_blending"]).and_then(Json::as_bool) {
+                    comp.enable_frame_blending = v;
+                }
                 ItemKind::Comp(Arc::new(comp))
             }
             "footage" => {

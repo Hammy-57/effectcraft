@@ -2044,6 +2044,11 @@ fn draw_rigs(app: &mut EffectcraftApp, painter: &egui::Painter, map: &ViewerMap,
     };
     for l in ectx.comp.layers.iter().filter(|l| (l.is_camera() || l.is_light()) && l.is_active_at(ectx.time)) {
         let sel = selected.contains(&l.id);
+        // Looking through the active camera, an unselected camera or light draws nothing (its
+        // wireframe would sit over the picture); custom views show them all, to find and pick them.
+        if through_active && !sel {
+            continue;
+        }
         let col = app.tokens.label(l.label).gamma_multiply(if sel { 1.0 } else { 0.6 });
         let stroke = Stroke::new(if sel { 1.5 } else { 1.0 }, col);
         let (eye, fwd, down) = three_d::camera::layer_frame(ectx, l);

@@ -416,7 +416,8 @@ pub struct Comp {
     pub hide_shy: bool,
     #[serde(default = "yes")]
     pub enable_motion_blur: bool,
-    #[serde(default = "yes")]
+    /// Off by default, as in After Effects (layers' Frame Blend switches do nothing until on).
+    #[serde(default)]
     pub enable_frame_blending: bool,
     #[serde(default)]
     pub draft_3d: bool,
@@ -476,7 +477,7 @@ impl Comp {
             renderer: Renderer::Classic3D,
             hide_shy: false,
             enable_motion_blur: true,
-            enable_frame_blending: true,
+            enable_frame_blending: false,
             draft_3d: false,
             preserve_frame_rate: false,
             preserve_resolution: false,
