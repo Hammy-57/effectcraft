@@ -49,6 +49,7 @@ mod proxy;
 pub mod puppet;
 mod query;
 mod relink;
+pub(crate) mod relink_moved;
 mod render_queue;
 pub(crate) mod rig3d;
 pub mod roto_cmds;
@@ -171,6 +172,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(key_transform::specs());
         v.extend(file_more::specs());
         v.extend(relink::specs());
+        v.extend(relink_moved::specs());
         v.extend(lottie::specs());
         v.extend(timeline::specs());
         v.extend(comp_more::specs());
