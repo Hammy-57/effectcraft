@@ -1218,7 +1218,11 @@ impl EffectcraftApp {
             ctx.request_repaint();
         }
         if !self.playback.playing {
-            self.cache_when_idle(ctx, &c, &series, now, (wa, wb));
+            // Idle caching covers the Preview panel's range, as in After Effects: Play Around
+            // Current Time caches the pre-roll before the playhead too, not just the work area.
+            let preset = self.session.prefs.preview.get(self.session.prefs.preview.current);
+            let range = effectcraft_engine::preview::plan(preset, &c, self.session.time());
+            self.cache_when_idle(ctx, &c, &series, now, (range.start, range.end));
             return;
         }
         let snap = |f: i64| wa + (f - wa).div_euclid(step) * step;
@@ -1328,7 +1332,7 @@ impl EffectcraftApp {
     }
 
     /// Composition ▸ Preview ▸ Cache Frames When Idle: after a second without input or edits,
-    /// render the work area's frames (from the current time on, then from its start) in the
+    /// render the preview range's frames (from the current time on, then from its start) in the
     /// background, a few at a time, until it is cached or the RAM preview budget is full.
     fn cache_when_idle(&mut self, ctx: &egui::Context, comp: &effectcraft_engine::project::Comp, series: &FrameKey, now: f64, (wa, wb): (i64, i64)) {
         let active = ctx.input(|i| !i.events.is_empty() || i.pointer.any_down() || i.pointer.is_moving());
