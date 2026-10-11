@@ -590,6 +590,11 @@ pub fn base64(data: &[u8]) -> String {
 
 pub fn inspect(app: &EffectcraftApp, ctx: &egui::Context) -> Value {
     let size = ctx.content_rect().size();
+    let now = ctx.input(|i| i.time);
+    let frame = app.session.active_comp_id().and_then(|id| app.session.project.comp_arc(id)).map(|c| c.frame_rate.frame_at(app.session.time()));
+    // Existing playback bookkeeping can be stale during a stall and does not measure scanout.
+    // Expose observation age and timeline position so control clients can detect advancement.
+    let last_shown = app.playback.shown_at.back().copied();
     json!({
         "window": [size.x, size.y],
         "pixelsPerPoint": ctx.pixels_per_point(),
@@ -598,6 +603,22 @@ pub fn inspect(app: &EffectcraftApp, ctx: &egui::Context) -> Value {
         "playing": app.playback.playing,
         "playback": {"achievedFps":app.playback.achieved_fps(),"realTime":app.playback.real_time(),
             "shown":app.playback.shown,"caching":app.playback.caching,"waiting":app.playback.waiting,"targetFps":app.playback.fps},
+        "preview": {
+            "time": app.session.time().seconds(),
+            "frame": frame,
+            "playing": app.playback.playing,
+            "shown": app.playback.shown,
+            "achievedFpsDiagnostic": app.playback.achieved_fps(),
+            "realTimeDiagnostic": app.playback.real_time(),
+            "caching": app.playback.caching,
+            "waiting": app.playback.waiting,
+            "targetFps": app.playback.fps,
+            "resolutionStep": app.playback.res,
+            "frameStep": app.playback.plan.map_or(1, |p| p.step),
+            "observationTimeSeconds": now,
+            "lastShownTimeSeconds": last_shown,
+            "lastShownAgeSeconds": last_shown.map(|t| (now - t).max(0.0)),
+        },
         "time": app.session.time().seconds(),
         "activeComp": app.session.state.active_comp.map(|i| i.0),
         "selectedLayers": app.session.state.selected_layers.iter().map(|c| c.0).collect::<Vec<_>>(),

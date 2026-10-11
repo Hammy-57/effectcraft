@@ -138,7 +138,7 @@ unsubscribes.
 
 | Method | Params | Result |
 |---|---|---|
-| `ui.inspect` | `{}` | Window size, pixels per point, UI fps, serialized `UiState`, playback (`achievedFps`, `targetFps`, `realTime`, `shown`, `caching`, `waiting`), time, active comp, selection, open dialog, last render ms. Playback FPS is distinct from UI FPS. |
+| `ui.inspect` | `{}` | Window size, pixels per point, UI fps, serialized `UiState`, playback (`achievedFps`, `targetFps`, `realTime`, `shown`, `caching`, `waiting`), time, active comp, selection, open dialog, last render ms. Read-only `preview` diagnostics are described below. |
 | `ui.elements` | `{prefix?}` | `[{id, label, rect: [x, y, w, h], window?}]`: the widgets from the most recently completed paint pass, in points. ID-based input uses that same snapshot, without falling back to widgets removed since an older frame. On the desktop an undocked panel group is an OS window of its own: its widgets carry `window` (the group's id) and their rect is in that window's coordinates. |
 | `ui.set` | `{tool?, workspace?, theme?, focused?, viewer?, timeline?, menuBar?, home?}` | `viewer: {zoom (null = fit), res: Full\|Half\|Third\|Quarter\|Auto, pan: [x,y], grid, rulers, safeMargins, transparencyGrid}`; `timeline: {pps (null = fit), start, graphEditor, showModes, openLayers: [ids], openGroups: [uids]}`. |
 | `ui.panel.show` / `ui.panel.close` | `{panel}` | Panels: `Project`, `Composition`, `Timeline`, `EffectControls`, `EffectsPresets`, `Info`, `Preview`, `Character`, `Paragraph`, `Align` and others. |
@@ -148,6 +148,27 @@ unsubscribes.
 | `ui.focus` | `{}` | Activates the window and takes keyboard focus. Agents normally avoid this, because the app is started without stealing focus. |
 | `ui.figmaPair` | `{client}` | The one-time Figma pairing prompt the app's Figma bridge shows (**Connect Figma?**, automation ids `figmaPair.allow` / `figmaPair.deny`). The reply waits for the answer: `{allowed}` (a 120 s timeout counts as Deny). |
 | `app.quit` | `{force?}` | Closes the app. A modified project shows the Save / Don't Save / Cancel prompt first (automation ids `dialog.unsaved.save`, `dialog.unsaved.dontSave`, `dialog.unsaved.cancel`) unless `force: true`. |
+
+
+### Preview diagnostics
+
+`ui.inspect.preview` exposes playback observations without changing playback:
+
+| Field | Meaning |
+|---|---|
+| `time`, `frame` | Current timeline time in seconds and frame number at the active composition's frame rate; `frame` is null without an active composition. These are timeline positions, not proof of physical presentation. |
+| `playing`, `caching`, `waiting` | Current playback state, cache-before-playback state, and whether playback is waiting for a frame. |
+| `shown` | Existing playback frame-advance counter. It does not count every fallback advance or physical display refresh. |
+| `achievedFpsDiagnostic`, `realTimeDiagnostic` | Existing playback-rate estimate and target-rate comparison. They are distinct from top-level UI redraw `fps` and do not measure display scanout. They can be null when stopped, caching, or before enough observations. |
+| `targetFps`, `frameStep` | Requested playback rate and preview plan frame step (1 without a plan). The real-time comparison accounts for the planned frame step. |
+| `resolutionStep` | Playback resolution override in pixel steps; null means use the viewer's selection, available in serialized `ui.viewer`. |
+| `observationTimeSeconds` | Current egui clock time in seconds; use differences within this app session, not as a wall-clock timestamp. |
+| `lastShownTimeSeconds`, `lastShownAgeSeconds` | Last recorded playback frame-advance time on the same clock and its nonnegative age at inspection; both are null before an observation. |
+
+The rate window is pruned only when another frame advance is recorded, so the diagnostic rate can
+remain stale during a stall. Inspect its age and `waiting`, and sample `time`/`frame` over known
+playback loop ranges to observe timeline progress. Neither these samples nor `shown` establish
+physical presentation FPS. The existing `playback` object remains available for compatibility.
 
 ## Input
 
