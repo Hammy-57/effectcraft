@@ -259,6 +259,30 @@ fn cache_frames_when_idle_fills_the_work_area() {
 }
 
 #[test]
+fn cache_frames_when_idle_follows_play_around_current_time() {
+    let mut h = harness();
+    let cid = h.state().session.active_comp_id().unwrap();
+    // The work area is the first 2 s; the preview range is a second either side of 5 s.
+    invoke(&mut h, "comp.workArea", json!({"start": 0.0, "end": 2.0}));
+    let s = &mut h.state_mut().session;
+    s.execute("playback.settings.set", json!({"range": "aroundCurrentTime", "preRoll": 1.0, "postRoll": 1.0})).unwrap();
+    s.execute("time.set", json!({"time": 5.0})).unwrap();
+    invoke(&mut h, "playback.cacheWhenIdle", json!({"value": true}));
+    let range: Vec<i64> = (96..=144).collect();
+    let mut cached = Vec::new();
+    for _ in 0..4000 {
+        h.step();
+        cached = h.state().frames.cached_frames(&h.state().shown_series(cid));
+        if range.iter().all(|f| cached.binary_search(f).is_ok()) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert!(range.iter().all(|f| cached.binary_search(f).is_ok()), "the pre- and post-roll are cached: {cached:?}");
+    assert!(cached.binary_search(&10).is_err(), "the work area outside the range is not: {cached:?}");
+}
+
+#[test]
 fn cache_frames_when_idle_survives_an_inverted_work_area() {
     let mut h = harness();
     // Start set past the end: an empty work area (it panicked in `clamp` / `rem_euclid`).

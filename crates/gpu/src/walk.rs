@@ -78,7 +78,10 @@ fn draw_comp<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, canvas: &mut 
 
 fn draw_layers<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, visible: &[&'a Layer], canvas: &mut GpuImage) -> Option<()> {
     let levels = r.pipe().levels;
-    let mut i = 0;
+    // Layers hidden under an opaque cover are never drawn (`cull`), so they aren't produced either.
+    let mut i = crate::cull::first_drawn(r, ctx, visible, (canvas.width, canvas.height));
+    // The layers' content on every core first (`prepass`); dropped with what the walk didn't take.
+    let _prefetched = crate::prepass::run(e, r, ctx, visible.get(i..).unwrap_or(&[]), canvas, ordinary_resident_enabled());
     while i < visible.len() {
         if visible[i].is_3d() {
             let mut j = i;
@@ -203,7 +206,7 @@ fn draw_split(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, split: &effectcraft_rend
 
 fn draw_collapsed<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, layer: &Layer, item: ItemId, canvas: &mut GpuImage) -> Option<()> {
     let opacity = r.layer_opacity(ctx, layer);
-    if opacity <= 0.0 {
+    if opacity <= 0.0 || crate::cull::skip_matte(r, ctx, layer) {
         return Some(());
     }
     let matte = r.track_matte(ctx, layer).is_some();
@@ -223,7 +226,7 @@ fn draw_collapsed<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, layer: &
 /// effect stack. Keep that isolation resident; unsupported work keeps CPU fallback.
 fn draw_collapsed_fx<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, layer: &'a Layer, item: ItemId, canvas: &mut GpuImage) -> Option<()> {
     let opacity = r.layer_opacity(ctx, layer);
-    if opacity <= 0.0 {
+    if opacity <= 0.0 || crate::cull::skip_matte(r, ctx, layer) {
         return Some(());
     }
     let Some((sub, nctx)) = r.collapse_into(ctx, layer, item, 1.0) else {
@@ -262,7 +265,7 @@ fn draw_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &
         return Some(());
     }
     let opacity = r.layer_opacity(ctx, layer);
-    if opacity <= 0.0 {
+    if opacity <= 0.0 || crate::cull::skip_layer(r, ctx, layer, (canvas.width, canvas.height)) {
         return Some(());
     }
     if let Some(done) = draw_precomp(e, r, ctx, layer, canvas, opacity) {
@@ -375,7 +378,7 @@ fn draw_ordinary_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Laye
         crate::context::NativeImage { img: e.upload_buf(&buf)?, offset: buf.offset, scale: buf.scale }
     } else {
         let _profile = effectcraft_render::profile::span("ordinary_resident_produce");
-        let buf = r.resident_source(ctx, layer, clip)?;
+        let buf = crate::prepass::resident_source(r, ctx, layer, key, clip)?;
         let src = e.g.upload_image(&buf.img)?;
         let mut fx = crate::effects::GpuFx::new(e, src, buf.offset, buf.scale, r.pipe().levels);
         let origin = r.run_layer_effects_on(ctx, layer, &mut fx);
@@ -431,7 +434,7 @@ fn draw_precomp(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas:
     // A nested comp the GPU can't take (nested too deep, over the texture limit, content it
     // declines) goes back to the CPU path for this layer only; only a device failure fails the
     // frame.
-    let Some(src) = render(e, &sub, item, lt) else {
+    let Some(src) = crate::cull::nested(e, ctx, &sub, item, lt) else {
         return if e.g.check_health().is_ok() { None } else { Some(None) };
     };
     finish_resident(e, r, ctx, layer, canvas, opacity, src, bs)
@@ -485,7 +488,7 @@ fn draw_cached_precomp(
     } else {
         let _profile = effectcraft_render::profile::span("precomp_resident_produce");
         let (sub, item, lt, bs) = source;
-        let Some(src) = render(e, sub, *item, *lt) else {
+        let Some(src) = crate::cull::nested(e, ctx, sub, *item, *lt) else {
             return if e.g.check_health().is_ok() { None } else { Some(None) };
         };
         prepare_processed(e, r, ctx, layer, src, *bs)?
@@ -601,7 +604,7 @@ fn composite_resident(
         };
         return Some(composite_iso(e, r, ctx, layer, iso, canvas, opacity));
     }
-    Some(place_src(e, r, ctx, layer, &shape, img, canvas, layer.blend_mode, opacity, pipe.levels).map(|c| *canvas = c))
+    Some(place_src_in(e, r, ctx, layer, &shape, img, canvas, layer.blend_mode, opacity, pipe.levels))
 }
 
 /// Adjustment layer (`Renderer::draw_adjustment`): the effect stack runs on the comp below,
@@ -643,8 +646,7 @@ fn composite_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, buf:
     let matte = r.track_matte(ctx, layer).is_some();
     if !matte && !layer.preserve_transparency {
         // The comp is quantised after the layer (8/16 bpc) in the same pass.
-        *canvas = place(e, r, ctx, layer, buf, canvas, layer.blend_mode, opacity, r.pipe().levels)?;
-        return Some(());
+        return place_in(e, r, ctx, layer, buf, canvas, layer.blend_mode, opacity, r.pipe().levels);
     }
     // Render in isolation, then matte / preserve transparency, then blend.
     let iso = place(e, r, ctx, layer, buf, &e.zeros(canvas.width, canvas.height), BlendMode::Normal, 1.0, None)?;
@@ -704,11 +706,30 @@ fn place(
     opacity: f32,
     levels: Option<f32>,
 ) -> Option<GpuImage> {
+    let mut out = target.clone();
+    place_in(e, r, ctx, layer, buf, &mut out, mode, opacity, levels)?;
+    Some(out)
+}
+
+/// [`place`] onto `target` itself (in place over the layer's bounds when the encoder owns it:
+/// `ops::warp_q_in`).
+#[allow(clippy::too_many_arguments)]
+fn place_in(
+    e: &mut Enc,
+    r: &Renderer,
+    ctx: &EvalCtx,
+    layer: &Layer,
+    buf: &Arc<Buf>,
+    target: &mut GpuImage,
+    mode: BlendMode,
+    opacity: f32,
+    levels: Option<f32>,
+) -> Option<()> {
     if buf.img.is_empty() || opacity <= 0.0 {
-        return Some(target.clone());
+        return Some(());
     }
     let src = e.upload_buf(buf)?;
-    place_src(e, r, ctx, layer, buf, src, target, mode, opacity, levels)
+    place_src_in(e, r, ctx, layer, buf, src, target, mode, opacity, levels)
 }
 
 /// [`place`] of a GPU image `src` shaped like `buf`.
@@ -725,11 +746,32 @@ fn place_src(
     opacity: f32,
     levels: Option<f32>,
 ) -> Option<GpuImage> {
+    let mut out = target.clone();
+    place_src_in(e, r, ctx, layer, buf, src, &mut out, mode, opacity, levels)?;
+    Some(out)
+}
+
+/// [`place_src`] onto `target` itself (see [`place_in`]).
+#[allow(clippy::too_many_arguments)]
+fn place_src_in(
+    e: &mut Enc,
+    r: &Renderer,
+    ctx: &EvalCtx,
+    layer: &Layer,
+    buf: &Buf,
+    src: GpuImage,
+    target: &mut GpuImage,
+    mode: BlendMode,
+    opacity: f32,
+    levels: Option<f32>,
+) -> Option<()> {
     let pl = r.placement(ctx, layer, buf);
     if let [m] = pl.matrices.as_slice() {
-        return Some(ops::warp_q(e, target, &src, m, pl.sampling, mode, opacity, pl.seed, None, levels));
+        ops::warp_q_in(e, target, &src, m, pl.sampling, mode, opacity, pl.seed, None, levels);
+        return Some(());
     }
     let k = 1.0 / pl.matrices.len() as f32;
     let acc = ops::warp_accumulate(e, &e.zeros(target.width, target.height), &src, &pl.matrices, pl.sampling, k);
-    Some(ops::blend_full(e, target, &acc, mode, opacity, pl.seed, levels))
+    *target = ops::blend_full(e, target, &acc, mode, opacity, pl.seed, levels);
+    Some(())
 }

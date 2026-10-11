@@ -739,10 +739,21 @@ fn reset(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn select_prop(s: &mut Session, p: &Value) -> Result<Value> {
-    let (_, lid) = layer_p(s, p, "prop.select")?;
+    let (cid, lid) = layer_p(s, p, "prop.select")?;
     let uid = match p.get("prop").and_then(Value::as_u64) {
         Some(u) => u,
-        None => prop_ref(s, p, "prop.select")?.2,
+        // An effect (`effects/#1`, `effects/<name>`) selects as a whole, as clicking its name in
+        // Effect Controls does: what Save Animation Preset and Copy save.
+        None => match prop_ref(s, p, "prop.select") {
+            Ok(r) => r.2,
+            Err(e) => {
+                let effect = s.project.comp(cid).and_then(|c| c.layer(lid)).and_then(|l| {
+                    let g = l.props.group(str_p(p, "path")?)?;
+                    matches!(g.kind, GroupKind::Effect { .. }).then_some(g.uid)
+                });
+                effect.ok_or(e)?
+            }
+        },
     };
     let add = b_p(p, "add").unwrap_or(false);
     if !add {
