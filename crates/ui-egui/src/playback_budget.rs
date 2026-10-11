@@ -154,8 +154,12 @@ mod tests {
         let c = config();
         let mut b = Budget::default();
         assert!(!b.configure(Some(c)));
-        for _ in 0..WARMUP { sample(&mut b, c, 50.0, true); }
-        for _ in 0..7 { sample(&mut b, c, 50.0, true); }
+        for _ in 0..WARMUP {
+            sample(&mut b, c, 50.0, true);
+        }
+        for _ in 0..7 {
+            sample(&mut b, c, 50.0, true);
+        }
         assert!(!b.configure(Some(c)));
         sample(&mut b, c, 50.0, true);
         assert!(b.configure(Some(c)));
@@ -174,10 +178,16 @@ mod tests {
         let c = config();
         let mut b = Budget::default();
         b.configure(Some(c));
-        for ms in [f64::NAN, f64::INFINITY, -1.0, 0.0] { sample(&mut b, c, ms, false); }
-        for _ in 0..31 { sample(&mut b, c, 10.0, false); }
+        for ms in [f64::NAN, f64::INFINITY, -1.0, 0.0] {
+            sample(&mut b, c, ms, false);
+        }
+        for _ in 0..31 {
+            sample(&mut b, c, 10.0, false);
+        }
         sample(&mut b, c, 100.0, false);
-        for _ in 0..100 { assert!(!b.configure(Some(c))); }
+        for _ in 0..100 {
+            assert!(!b.configure(Some(c)));
+        }
         sample(&mut b, c, 100.0, false);
         assert!(!b.configure(Some(c)));
     }
@@ -193,8 +203,12 @@ mod tests {
         assert!(b.samples.is_empty());
         assert!(b.ticket(FrameKey { revision: 2, ..c.full }).is_none());
         assert!(b.ticket(FrameKey { content: 2, ..c.full }).is_none());
-        for _ in 0..WARMUP { sample(&mut b, c, 10.0, false); }
-        for _ in 0..7 { sample(&mut b, c, 100.0, false); }
+        for _ in 0..WARMUP {
+            sample(&mut b, c, 10.0, false);
+        }
+        for _ in 0..7 {
+            sample(&mut b, c, 100.0, false);
+        }
         sample(&mut b, c, 10.0, true);
         assert!(b.samples.is_empty());
         assert!(!b.configure(Some(c)));
@@ -207,18 +221,24 @@ mod tests {
         let c = config();
         let mut b = Budget::default();
         b.configure(Some(c));
-        for _ in 0..WARMUP + MIN_SAMPLES { sample(&mut b, c, 50.0, false); }
+        for _ in 0..WARMUP + MIN_SAMPLES {
+            sample(&mut b, c, 50.0, false);
+        }
         assert!(b.configure(Some(c)));
         for _ in 0..WARMUP + MIN_SAMPLES {
             let ticket = b.ticket(c.half).unwrap();
             b.record(ticket, 80.0, false);
         }
         assert!(!b.configure(Some(c)));
-        for _ in 0..100 { sample(&mut b, c, 1000.0, false); }
+        for _ in 0..100 {
+            sample(&mut b, c, 1000.0, false);
+        }
         assert!(!b.configure(Some(c)));
         b.configure(None);
         b.configure(Some(c));
-        for _ in 0..WARMUP + MIN_SAMPLES { sample(&mut b, c, 50.0, false); }
+        for _ in 0..WARMUP + MIN_SAMPLES {
+            sample(&mut b, c, 50.0, false);
+        }
         assert!(b.configure(Some(c)));
     }
     #[test]
@@ -226,8 +246,12 @@ mod tests {
         let c = config();
         let mut b = Budget::default();
         b.configure(Some(c));
-        for _ in 0..WARMUP { sample(&mut b, c, 1000.0, false); }
-        for _ in 0..MIN_SAMPLES { sample(&mut b, c, 10.0, false); }
+        for _ in 0..WARMUP {
+            sample(&mut b, c, 1000.0, false);
+        }
+        for _ in 0..MIN_SAMPLES {
+            sample(&mut b, c, 10.0, false);
+        }
         assert!(!b.configure(Some(c)));
     }
 
@@ -236,8 +260,12 @@ mod tests {
         let c = config();
         let mut b = Budget::default();
         b.configure(Some(c));
-        for _ in 0..WARMUP { sample(&mut b, c, 1000.0, false); }
-        for i in 0..64 { sample(&mut b, c, if matches!(i % 8, 0 | 2 | 3 | 5 | 6) { 60.0 } else { 20.0 }, false); }
+        for _ in 0..WARMUP {
+            sample(&mut b, c, 1000.0, false);
+        }
+        for i in 0..64 {
+            sample(&mut b, c, if matches!(i % 8, 0 | 2 | 3 | 5 | 6) { 60.0 } else { 20.0 }, false);
+        }
         assert!(!b.configure(Some(c)));
     }
 
@@ -246,7 +274,9 @@ mod tests {
         let c = config();
         let mut b = Budget::default();
         b.configure(Some(c));
-        for _ in 0..WARMUP + MIN_SAMPLES { sample(&mut b, c, 50.0, false); }
+        for _ in 0..WARMUP + MIN_SAMPLES {
+            sample(&mut b, c, 50.0, false);
+        }
         let late = b.ticket(c.half).unwrap();
         for i in 0..65 {
             let ticket = b.ticket(c.half).unwrap();
@@ -256,5 +286,4 @@ mod tests {
         b.record(late, 1.0, false);
         assert!(b.samples.is_empty());
     }
-
 }

@@ -619,7 +619,9 @@ impl Frames {
     #[cfg(test)]
     pub(crate) fn playback_sample(&self, key: FrameKey, ms: f64) {
         let mut budget = self.playback_budget.lock().unwrap();
-        if let Some(ticket) = budget.ticket(key) { budget.record(ticket, ms, false); }
+        if let Some(ticket) = budget.ticket(key) {
+            budget.record(ticket, ms, false);
+        }
     }
 
     pub(crate) fn adapt_playback(&self, config: Option<crate::playback_budget::Config>) -> bool {
@@ -1185,11 +1187,15 @@ impl Worker {
                 }
             },
         };
-        if !disk_hit && !(ci.is_gpu() && self.gpu_retired.load(Ordering::Acquire))
+        if !disk_hit
+            && !(ci.is_gpu() && self.gpu_retired.load(Ordering::Acquire))
             && let Some(ticket) = ticket
         {
-            self.playback_budget.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-                .record(ticket, service_start.elapsed().as_secs_f64() * 1000.0, ci.is_gpu());
+            self.playback_budget.lock().unwrap_or_else(std::sync::PoisonError::into_inner).record(
+                ticket,
+                service_start.elapsed().as_secs_f64() * 1000.0,
+                ci.is_gpu(),
+            );
         }
         let render_time = t0.elapsed();
         // Publish the shared frame and wake the viewer first; the disk cache's writer thread

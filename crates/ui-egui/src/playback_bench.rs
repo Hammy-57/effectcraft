@@ -18,7 +18,9 @@ fn adaptive_playback_frame_availability() {
     let mut runs = Vec::new();
     for adaptive in [false, true, true, false] {
         gpu.context().clear_uploads();
-        if let Some(pick) = gpu.auto_pick() { pick.reset(); }
+        if let Some(pick) = gpu.auto_pick() {
+            pick.reset();
+        }
         let mut session = effectcraft_host::session();
         session.replace_project(project.clone(), None);
         session.open_comp(cid);
@@ -35,7 +37,9 @@ fn adaptive_playback_frame_availability() {
         let mut first_reduction = None;
         for frame in 0..108 {
             let scale = app.viewer_scale(1.0, 1.0);
-            if scale < 1.0 && first_reduction.is_none() { first_reduction = Some(frame); }
+            if scale < 1.0 && first_reduction.is_none() {
+                first_reduction = Some(frame);
+            }
             let key = app.frame_key(cid, frame, scale);
             let start = Instant::now();
             app.request_frame_urgent(cid, frame, scale);
@@ -46,7 +50,9 @@ fn adaptive_playback_frame_availability() {
             let image = app.frames.get(&key).expect("viewer frame must finish");
             let comp = app.session.project.comp(cid).unwrap();
             assert_eq!(image.size(), [(comp.width as f64 * scale).round() as usize, (comp.height as f64 * scale).round() as usize]);
-            if let FrameImage::Cpu(image) = image { assert!(!image.pixels.is_empty()); }
+            if let FrameImage::Cpu(image) = image {
+                assert!(!image.pixels.is_empty());
+            }
             samples.push(elapsed_ms);
             scales.push(scale);
         }
@@ -58,12 +64,15 @@ fn adaptive_playback_frame_availability() {
         app.playback.playing = false;
         assert_eq!(app.viewer_scale(1.0, 1.0), 1.0);
         eprintln!("RT5 adaptive={adaptive} first_reduction={first_reduction:?} p50={p50:.2} p95={p95:.2}");
-        let auto_stats: Vec<_> = [1.0, 0.5].into_iter().map(|scale| {
-            let stats = gpu.auto_pick().and_then(|pick| pick.stats(AutoKey::new(cid, scale, false)));
-            serde_json::json!({"scale": scale, "cpuMs": stats.and_then(|s| s.cpu_ms),
+        let auto_stats: Vec<_> = [1.0, 0.5]
+            .into_iter()
+            .map(|scale| {
+                let stats = gpu.auto_pick().and_then(|pick| pick.stats(AutoKey::new(cid, scale, false)));
+                serde_json::json!({"scale": scale, "cpuMs": stats.and_then(|s| s.cpu_ms),
                 "gpuMs": stats.and_then(|s| s.gpu_ms), "cpuFrames": stats.map(|s| s.cpu_frames),
                 "gpuFrames": stats.map(|s| s.gpu_frames)})
-        }).collect();
+            })
+            .collect();
         runs.push(serde_json::json!({"adaptive": adaptive, "firstReductionFrame": first_reduction,
             "p50Ms": p50, "p95Ms": p95, "availabilityMs": samples, "scales": scales, "autoStats": auto_stats}));
     }
