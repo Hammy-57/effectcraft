@@ -413,35 +413,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "effectcraft-aep"
-version = "0.7.0"
-dependencies = [
- "effectcraft-color",
- "effectcraft-effects",
- "effectcraft-keyframe",
- "effectcraft-project",
- "effectcraft-time",
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "effectcraft-buildgen"
-version = "0.7.0"
-
-[[package]]
 name = "effectcraft-color"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "effectcraft-effects"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
- "effectcraft-buildgen",
  "effectcraft-color",
  "effectcraft-geom",
  "effectcraft-keyframe",
@@ -457,10 +438,8 @@ dependencies = [
 
 [[package]]
 name = "effectcraft-engine"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
- "effectcraft-aep",
- "effectcraft-buildgen",
  "effectcraft-color",
  "effectcraft-effects",
  "effectcraft-geom",
@@ -480,7 +459,6 @@ dependencies = [
  "effectcraft-time",
  "effectcraft-track",
  "exr",
- "gif",
  "image",
  "kurbo",
  "log",
@@ -493,7 +471,7 @@ dependencies = [
 
 [[package]]
 name = "effectcraft-expr"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "boa_engine",
  "effectcraft-geom",
@@ -509,7 +487,6 @@ dependencies = [
 name = "effectcraft-fuzz"
 version = "0.0.0"
 dependencies = [
- "effectcraft-aep",
  "effectcraft-engine",
  "effectcraft-expr",
  "effectcraft-interchange",
@@ -526,14 +503,14 @@ dependencies = [
 
 [[package]]
 name = "effectcraft-geom"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "effectcraft-interchange"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "effectcraft-color",
  "effectcraft-keyframe",
@@ -552,7 +529,7 @@ dependencies = [
 
 [[package]]
 name = "effectcraft-keyframe"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "effectcraft-color",
  "effectcraft-geom",
@@ -563,7 +540,7 @@ dependencies = [
 
 [[package]]
 name = "effectcraft-lottie"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "effectcraft-color",
  "effectcraft-effects",
@@ -579,7 +556,7 @@ dependencies = [
 
 [[package]]
 name = "effectcraft-media"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "effectcraft-model",
  "effectcraft-pdf",
@@ -590,23 +567,22 @@ dependencies = [
  "effectcraft-svg",
  "effectcraft-time",
  "exr",
- "filmcraft-av1",
  "filmcraft-codecs",
  "filmcraft-color",
  "filmcraft-frame",
  "filmcraft-media",
  "filmcraft-time",
+ "gif",
  "image",
  "log",
  "rayon",
  "serde_json",
- "symphonia",
  "thiserror",
 ]
 
 [[package]]
 name = "effectcraft-model"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "effectcraft-geom",
  "image",
@@ -617,7 +593,7 @@ dependencies = [
 
 [[package]]
 name = "effectcraft-path"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "effectcraft-geom",
  "effectcraft-keyframe",
@@ -629,7 +605,7 @@ dependencies = [
 
 [[package]]
 name = "effectcraft-pdf"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "effectcraft-svg",
  "effectcraft-text",
@@ -641,7 +617,7 @@ dependencies = [
 
 [[package]]
 name = "effectcraft-project"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "effectcraft-color",
  "effectcraft-geom",
@@ -654,14 +630,14 @@ dependencies = [
 
 [[package]]
 name = "effectcraft-psd"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "miniz_oxide 0.8.9",
 ]
 
 [[package]]
 name = "effectcraft-raster"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "effectcraft-color",
  "effectcraft-geom",
@@ -670,9 +646,8 @@ dependencies = [
 
 [[package]]
 name = "effectcraft-render"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
- "effectcraft-buildgen",
  "effectcraft-color",
  "effectcraft-effects",
  "effectcraft-geom",
@@ -693,7 +668,7 @@ dependencies = [
 
 [[package]]
 name = "effectcraft-segment"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "miniz_oxide 0.8.9",
  "ndarray",
@@ -702,7 +677,7 @@ dependencies = [
 
 [[package]]
 name = "effectcraft-svg"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "effectcraft-geom",
  "effectcraft-path",
@@ -714,10 +689,9 @@ dependencies = [
 
 [[package]]
 name = "effectcraft-text"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "effectcraft-keyframe",
- "effectcraft-segment",
  "harfrust",
  "kurbo",
  "skrifa",
@@ -727,14 +701,14 @@ dependencies = [
 
 [[package]]
 name = "effectcraft-time"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "effectcraft-track"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "effectcraft-raster",
  "effectcraft-segment",

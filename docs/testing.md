@@ -50,7 +50,7 @@ layer cache.
 ## Fuzzing
 
 `fuzz/` holds cargo-fuzz targets for every input EffectCraft doesn't control: `project_open`
-(`.ecproj` JSON and XML, loaded and rendered), `aep_ir` (the py-aep import document),
+(`.ecproj` JSON and XML, loaded and rendered),
 `lottie_import`, `svg_parse`, `psd_parse`, `pdf_parse` (PDF / AI / EPS), `interchange_import` (FCP7
 XML, FCPXML, OTIO, EDL), `expr_eval`, `media_probe` (stills, video and audio, probed and decoded)
 and `engine_command` (commands with fuzzed parameters on the demo project, as agents send them).

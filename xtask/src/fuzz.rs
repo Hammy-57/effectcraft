@@ -14,7 +14,7 @@ use std::path::Path;
 use std::process::Command;
 
 pub const TARGETS: &[&str] =
-    &["project_open", "aep_ir", "lottie_import", "svg_parse", "psd_parse", "pdf_parse", "interchange_import", "expr_eval", "media_probe", "engine_command"];
+    &["project_open", "lottie_import", "svg_parse", "psd_parse", "pdf_parse", "interchange_import", "expr_eval", "media_probe", "engine_command"];
 
 pub fn run(root: &Path, args: &[String]) -> Result<(), String> {
     let dir = root.join("fuzz");

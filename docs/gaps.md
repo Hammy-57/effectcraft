@@ -201,7 +201,7 @@ Issues #41–#47 (all from the Linux AppImage 0.1.1, 5 October): panning the vie
   (AGENTS.md "Never crash").
 - Run the gate on every pull request in CI (gap 4): today no workflow runs the tests on PRs.
 - Fix the open crash reports first (gap 3).
-- Fuzzing started 10 October: ten cargo-fuzz targets in `fuzz/` (project files, AEP import,
+- Fuzzing started 10 October: nine cargo-fuzz targets in `fuzz/` (project files,
   Lottie, SVG, PSD, PDF / EPS, timelines, expressions, media probing and decoding, engine commands),
   run with `cargo xtask fuzz` (docs/testing.md "Fuzzing"). The first minute per target found
   four problems: a PDF page tree listing itself hung the import (fixed, visit budget); an SVG with

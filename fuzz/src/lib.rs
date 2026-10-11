@@ -69,19 +69,12 @@ pub fn project_open(data: &[u8]) {
         t
     };
     let Ok(p) = Project::from_json(t) else { return };
-    let meta = effectcraft_project::file_meta(t);
     let mut s = sandboxed_session();
-    s.replace_project_with(p, None, meta.open_comps.as_ref());
+    s.replace_project(p, None);
     // Render the first comp's first frame small: the loaded values must be usable, not only parsed.
     if let Some(cid) = s.project.comps().map(|(id, _)| *id).next() {
         let _ = s.render_rgba8_alpha(cid, Tick::ZERO, 64, false);
     }
-}
-
-/// After Effects import document (what py-aep's exporter writes) → project.
-pub fn aep_ir(data: &[u8]) {
-    let mut p = Project::default();
-    let _ = effectcraft_aep::import_ir_into(&mut p, data.get(..data.len().min(MAX_INPUT)).unwrap_or_default(), "", &mut |_| None);
 }
 
 /// Lottie JSON or `.lottie` → project.
@@ -219,7 +212,7 @@ pub fn engine_command(data: &[u8]) {
         return;
     }
     let mut s = sandboxed_session();
-    s.replace_project_with(effectcraft_engine::demo::demo_project(), None, None);
+    s.replace_project(effectcraft_engine::demo::demo_project(), None);
     for line in data.get(..data.len().min(64 << 10)).unwrap_or_default().split(|&b| b == b'\n').take(16) {
         let Some((&pick, json)) = line.split_first() else { continue };
         let id = ids[usize::from(pick) % ids.len()];
