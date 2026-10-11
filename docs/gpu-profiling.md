@@ -83,3 +83,34 @@ Explicit disk pipeline caching is deferred: the pinned wgpu API requires
 `unsafe` and supports Vulkan only, while this workspace forbids unsafe and the
 target Mac uses Metal. Upload staging reuse is a separate pending slice; the
 existing readback pool does not imply upload pooling.
+
+### Adaptive playback availability (RT5)
+
+Auto resolution with Fast Previews set to Adaptive Resolution can reduce to Half
+of the normal Auto scale when native render-service p95 exceeds the displayed
+frame budget. Each scale discards eight cold renders, then needs eight real
+render completions with at least three quarters missing the budget by 10%.
+This avoids paying for a resolution trial on isolated slow frames. Half is tried
+once and retained only if its p95 is at least 10% faster than the Full reference.
+A slower or inconclusive trial restores Full and locks that choice until the
+playback/content state changes; idle always restores normal Auto. The trial is
+bounded to 64 actual completions even if the rendering path keeps changing. Explicit resolution overrides,
+cache-before-playback, other Fast Previews modes and remote workers keep their
+existing behavior. Cache hits and obsolete completions do not train the budget.
+
+The opt-in UI library benchmark exercises actual native viewer workers against
+RT0's generated mograph project, without building or opening the application:
+
+```sh
+RT5_PROJECT=/absolute/path/to/target/bench/gpu/mograph-1080.ecproj \
+RT5_REPORT=/absolute/path/to/rt5-paired.json \
+CARGO_BUILD_JOBS=4 nice -n 10 cargo test -p effectcraft-ui-egui --lib \
+  adaptive_playback_frame_availability -- --ignored --nocapture --test-threads=1
+```
+
+Run in an exclusive GPU timing window. It runs Off/Adaptive/Adaptive/Off,
+records the first 48 adaptation frames separately and reports p50/p95 of the
+next 60 requested-frame availability times. Native Auto compositor selection,
+readback and the bounded polling delay are included. This is a serial worker
+availability measurement, not window presentation or a playback-fps guarantee.
+All raw timings, chosen scales and the first reduction frame are retained.
