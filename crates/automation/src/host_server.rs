@@ -45,7 +45,11 @@ pub struct HostConfig {
 }
 
 enum Msg {
-    Request { method: String, params: Value, reply: Sender<Value> },
+    Request {
+        method: String,
+        params: Value,
+        reply: Sender<Value>,
+    },
     /// A connection closed: release the claims of the clients no other open connection uses.
     Closed(Vec<String>),
 }
@@ -98,7 +102,11 @@ pub fn serve(config: HostConfig, make: Box<dyn FnOnce() -> Result<Session, Strin
                 let _ = stream.set_nonblocking(false);
                 if open.load(Ordering::SeqCst) >= MAX_CONNECTIONS {
                     let mut s = stream;
-                    let _ = writeln!(s, "{}", json!({"id": null, "ok": false, "error": format!("the host serves at most {MAX_CONNECTIONS} connections; closing the connection")}));
+                    let _ = writeln!(
+                        s,
+                        "{}",
+                        json!({"id": null, "ok": false, "error": format!("the host serves at most {MAX_CONNECTIONS} connections; closing the connection")})
+                    );
                     continue;
                 }
                 open.fetch_add(1, Ordering::SeqCst);

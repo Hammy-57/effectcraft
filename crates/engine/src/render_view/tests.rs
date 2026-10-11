@@ -251,7 +251,8 @@ fn contact_sheet_writes_png_and_gif() {
 fn renders_run_as_quiet_background_tasks() {
     let mut s = session();
     s.execute("time.set", json!({"time": 1})).unwrap();
-    for (cmd, p) in [("render.frame", json!({"base64": true, "max_side": 160})), ("render.contactSheet", json!({"count": 2, "base64": true, "max_side": 200}))] {
+    for (cmd, p) in [("render.frame", json!({"base64": true, "max_side": 160})), ("render.contactSheet", json!({"count": 2, "base64": true, "max_side": 200}))]
+    {
         let blocking = s.execute(cmd, p.clone()).unwrap();
         let mut bg = p.clone();
         bg["wait"] = json!(false);
