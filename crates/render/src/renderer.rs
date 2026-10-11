@@ -93,6 +93,11 @@ pub struct Renderer<'a> {
     pub(crate) through: [Option<Through<'a>>; MAX_THROUGH],
     /// More collapsed levels than [`MAX_THROUGH`]: their motion is not blurred.
     pub(crate) through_lost: bool,
+    /// The canvas this renderer draws into is the window of the output at this origin (output
+    /// pixels): a collapsed precomp drawn into a temporary that covers only what its layers
+    /// reach. Every warp and dissolve keeps the output's coordinates, so the pixels are the
+    /// ones the whole canvas would get.
+    pub(crate) canvas_origin: [u32; 2],
 }
 
 /// Time spent on one layer of one frame (milliseconds).
@@ -130,6 +135,7 @@ impl<'a> Renderer<'a> {
             top: true,
             through: [None; MAX_THROUGH],
             through_lost: false,
+            canvas_origin: [0; 2],
         }
     }
 
@@ -175,6 +181,7 @@ impl<'a> Renderer<'a> {
             top: false,
             through: [None; MAX_THROUGH],
             through_lost: false,
+            canvas_origin: [0; 2],
             ..*self
         }
     }

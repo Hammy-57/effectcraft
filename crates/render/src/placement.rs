@@ -105,7 +105,10 @@ impl<'a> Renderer<'a> {
         let c = [(0.0, 0.0), (w, 0.0), (0.0, h), (w, h)].map(|(x, y)| m.apply(vec2(x, y)));
         let (x0, x1) = (c.iter().map(|p| p.x).fold(f64::INFINITY, f64::min), c.iter().map(|p| p.x).fold(f64::NEG_INFINITY, f64::max));
         let (y0, y1) = (c.iter().map(|p| p.y).fold(f64::INFINITY, f64::min), c.iter().map(|p| p.y).fold(f64::NEG_INFINITY, f64::max));
-        color::PxRect::covering(x0, y0, x1, y1, 3.0).map_or(Region::Full, Region::Rect)
+        let [ox, oy] = self.canvas_origin;
+        color::PxRect::covering(x0, y0, x1, y1, 3.0).map_or(Region::Full, |r| {
+            Region::Rect(color::PxRect { x0: r.x0.saturating_sub(ox), y0: r.y0.saturating_sub(oy), x1: r.x1.saturating_sub(ox), y1: r.y1.saturating_sub(oy) })
+        })
     }
 
     /// How a processed layer buffer lands in the output: one buffer → output matrix, or one per
@@ -138,7 +141,8 @@ impl<'a> Renderer<'a> {
     }
 
     /// [`Self::place_memo`] into `target`, the window of the canvas at `origin` (see
-    /// [`Self::reach`]): exactly the canvas's pixels there.
+    /// [`Self::reach`]): exactly the canvas's pixels there (the canvas itself being the window of
+    /// the output at [`Renderer::canvas_origin`]).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn place_at(
         &self,
@@ -152,6 +156,7 @@ impl<'a> Renderer<'a> {
         mo: &MotionMemo,
     ) {
         let pl = self.placement_memo(ctx, layer, buf, mo);
+        let origin = [origin[0].saturating_add(self.canvas_origin[0]), origin[1].saturating_add(self.canvas_origin[1])];
         let opts = WarpOpts { sampling: pl.sampling, opacity, mode, seed: pl.seed, clip: None };
         // One minification chain for every sub-sample (built only when the layer is shrunk).
         let mips = MipChain::new(&buf.img);
@@ -190,38 +195,49 @@ impl<'a> Renderer<'a> {
         if tests::NO_CULL.with(std::cell::Cell::get) {
             return false;
         }
+        let [ox, oy] = self.canvas_origin.map(f64::from);
+        let canvas = Rect::new(ox, oy, ox + w as f64, oy + h as f64);
+        let Some(rects) = self.drawn_rects(ctx, layer, mo, Some(canvas)) else { return false };
+        let outside = |r: &Rect| {
+            let r = r.inflate(4.0);
+            // NaN bounds (a degenerate transform) never count as outside.
+            let out = r.x1 < canvas.x0 || r.y1 < canvas.y0 || r.x0 > canvas.x1 || r.y0 > canvas.y1;
+            out && [r.x0, r.y0, r.x1, r.y1].iter().all(|v| !v.is_nan())
+        };
+        rects.iter().all(outside)
+    }
+
+    /// Output pixels a 2D layer can draw, before its source is rendered (see
+    /// [`Self::off_canvas`]): every pixel it changes lies within 4 pixels of one of these
+    /// rectangles. `None` when that is not known up front. With `canvas` (the output pixels being
+    /// drawn), text and shape layers whose anchor point lies on it are not measured (`None`).
+    pub(crate) fn drawn_rects(&self, ctx: &EvalCtx, layer: &Layer, mo: &MotionMemo, canvas: Option<Rect>) -> Option<Vec<Rect>> {
         let source = match &layer.source {
             LayerSource::Solid { .. } | LayerSource::Comp { .. } => Bounded::Rect,
             LayerSource::Footage { item } if matches!(self.project.item(*item).map(|i| &i.kind), Some(ItemKind::Footage(f)) if !crate::is_vector_footage(f)) => {
                 Bounded::Rect
             }
             LayerSource::Text | LayerSource::Shape => Bounded::Drawn,
-            _ => return false,
+            _ => return None,
         };
         if layer.is_3d() || layer.blend_mode.is_stencil() {
-            return false;
+            return None;
         }
         let s = self.opts.scale;
         let m = self.out_matrix() * Mat3::scale(vec2(s, s)) * mo.still(|| self.comp_matrix(ctx, layer));
         if !m.is_affine() {
-            return false;
+            return None;
         }
         let fx = layer.effects().is_some_and(|g| !g.children.is_empty());
         let styled = styles::active(ctx, layer);
         let blurred = self.blurred(ctx, layer);
-        let outside = |r: Rect| {
-            let r = r.inflate(4.0);
-            // NaN bounds (a degenerate transform) never count as outside.
-            let out = r.x1 < 0.0 || r.y1 < 0.0 || r.x0 > w as f64 || r.y0 > h as f64;
-            out && [r.x0, r.y0, r.x1, r.y1].iter().all(|v| !v.is_nan())
-        };
         // Layer-space rectangle of the source buffer, the smallest scale (buffer pixels per
         // layer unit) it can be drawn at, and the buffer exactly when it is known.
         let (r, scale, exact) = match source {
             Bounded::Rect => {
                 let (sw, sh) = source_size(self.project, layer);
                 if sw == 0 || sh == 0 {
-                    return false;
+                    return None;
                 }
                 // Footage and comp proxies keep their own pixels (any scale).
                 let (scale, exact) = match &layer.source {
@@ -243,13 +259,15 @@ impl<'a> Renderer<'a> {
             Bounded::Drawn => {
                 // Measuring text or shapes costs a layout: only for layers whose anchor point is
                 // off the canvas (most visible layers draw around it).
-                let a = layer.transform().map(|tr| ctx.v3(layer, tr, "anchor", [0.0; 3])).unwrap_or([0.0; 3]);
-                let p = m.apply(vec2(a[0], a[1]));
-                if !(p.x < 0.0 || p.y < 0.0 || p.x > w as f64 || p.y > h as f64) {
-                    return false;
+                if let Some(c) = canvas {
+                    let a = layer.transform().map(|tr| ctx.v3(layer, tr, "anchor", [0.0; 3])).unwrap_or([0.0; 3]);
+                    let p = m.apply(vec2(a[0], a[1]));
+                    if !(p.x < c.x0 || p.y < c.y0 || p.x > c.x1 || p.y > c.y1) {
+                        return None;
+                    }
                 }
-                let Some((bw, bh, off, k)) = self.drawn_buf(ctx, layer) else { return false };
-                let Some(r) = buf_rect(bw, bh, off, k) else { return false };
+                let (bw, bh, off, k) = self.drawn_buf(ctx, layer)?;
+                let r = buf_rect(bw, bh, off, k)?;
                 (r, Some(k), Some(([bw, bh], off, k)))
             }
         };
@@ -258,7 +276,7 @@ impl<'a> Renderer<'a> {
             // content that moves within the shutter is drawn at several times, a larger buffer).
             let still = !fx || self.fx_growth(ctx, layer, s) == Some(0.0);
             let moves = matches!(source, Bounded::Drawn) && self.content_times(ctx, layer).is_some();
-            let Some(([bw, bh], off, k)) = exact.filter(|_| still && !styled && !moves) else { return false };
+            let ([bw, bh], off, k) = exact.filter(|_| still && !styled && !moves)?;
             // The buffer as the draw places it: in and out of effect space (see
             // `apply_effects_timed`), the same float steps.
             let origin = crate::fx::fx_origin(ctx, layer, false);
@@ -267,25 +285,23 @@ impl<'a> Renderer<'a> {
             buf.rebase([-origin[0], -origin[1]]);
             let pl = self.placement_memo(ctx, layer, &buf, mo);
             let whole = Rect::new(0.0, 0.0, bw as f64, bh as f64);
-            return pl.matrices.iter().all(|m| m.is_affine() && outside(m.map_rect(&whole)));
+            return pl.matrices.iter().map(|m| m.is_affine().then(|| m.map_rect(&whole))).collect();
         }
         let mut grow = 0.0;
         if fx || styled {
-            let Some(scale) = scale.filter(|k| k.is_finite() && *k > 0.0) else { return false };
+            let scale = scale.filter(|k| k.is_finite() && *k > 0.0)?;
             if fx {
-                let Some(g) = self.fx_growth(ctx, layer, scale) else { return false };
-                grow += g;
+                grow += self.fx_growth(ctx, layer, scale)?;
             }
             if styled {
                 // `styles::render` pads by its reach plus two pixels, rounded up.
-                let Some(g) = styles::growth(ctx, layer) else { return false };
-                grow += g + 3.0 / scale;
+                grow += styles::growth(ctx, layer)? + 3.0 / scale;
             }
             if !(grow.is_finite() && grow >= 0.0) {
-                return false;
+                return None;
             }
         }
-        outside(m.map_rect(&r.inflate(grow)))
+        Some(vec![m.map_rect(&r.inflate(grow))])
     }
 
     /// Layer units the layer's effect stack can grow its buffer by on every side (each effect's
@@ -387,14 +403,16 @@ impl<'a> Renderer<'a> {
     /// transformed bounds over every motion-blur sub-sample. Callers that clear or tint outside
     /// the layer (stencil modes) need the whole canvas instead.
     pub(crate) fn reach(&self, ctx: &EvalCtx, layer: &Layer, bufs: &[&Buf], mo: &MotionMemo, (w, h): (u32, u32)) -> Window {
-        let whole = Window { x: 0, y: 0, w, h };
         #[cfg(test)]
         if crate::tests_footprint::full_windows() {
-            return whole;
+            return Window { x: 0, y: 0, w, h };
         }
         let pls: Vec<Placement> = bufs.iter().map(|b| self.placement_memo(ctx, layer, b, mo)).collect();
         let items: Vec<(&Placement, &Buf)> = pls.iter().zip(bufs.iter().copied()).collect();
-        whole.clip(reach_of(&items))
+        // Clipped in output pixels, then moved into the canvas (whole pixels, no rounding).
+        let [ox, oy] = self.canvas_origin;
+        let out = Window { x: ox, y: oy, w, h }.clip(reach_of(&items));
+        Window { x: out.x.saturating_sub(ox), y: out.y.saturating_sub(oy), ..out }
     }
 }
 
