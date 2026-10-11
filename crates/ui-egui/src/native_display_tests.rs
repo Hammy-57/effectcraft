@@ -47,6 +47,32 @@ fn native_display_rejects_bad_lengths_without_allocating() {
     assert_eq!(image.pixels[0].to_array(), [32, 64, 96, 128]);
 }
 
+// Headless Linux can select GL even though the compositor deliberately does not
+// support it. Skip only that explicit capability rejection; initialization failures
+// on supported backends must still fail this regression test.
+fn supported_test_gpu<T>(result: Result<T, String>, required: bool) -> Result<Option<T>, String> {
+    match result {
+        Ok(gpu) => Ok(Some(gpu)),
+        Err(error) if !required && error.ends_with(" (Gl): the GPU compositor needs DirectX 12, Vulkan, Metal or WebGPU") => {
+            eprintln!("native display test skipped: {error}");
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[test]
+fn native_display_backend_skip_preserves_supported_failures() {
+    let gl = "llvmpipe (LLVM 20.1.2, 256 bits) (Gl): the GPU compositor needs DirectX 12, Vulkan, Metal or WebGPU";
+    assert_eq!(supported_test_gpu::<()>(Err(gl.into()), false), Ok(None));
+    assert_eq!(supported_test_gpu::<()>(Err(gl.into()), true), Err(gl.into()));
+    for error in ["Metal: device allocation failed", "Vulkan: shader validation failed", "no GPU adapter", "unrecognized backend failure"] {
+        assert_eq!(supported_test_gpu::<()>(Err(error.into()), false), Err(error.into()));
+    }
+    assert_eq!(supported_test_gpu(Ok(7), false), Ok(Some(7)));
+    assert_eq!(supported_test_gpu(Ok(7), true), Ok(Some(7)));
+}
+
 #[test]
 fn native_display_bridge_matches_float_readback_and_survives_retirement() {
     struct Pixels(Arc<Image>);
@@ -55,7 +81,9 @@ fn native_display_bridge_matches_float_readback_and_survives_retirement() {
             Some(self.0.clone())
         }
     }
-    let gpu = effectcraft_gpu::Gpu::try_headless().unwrap();
+    let required = std::env::var("EFFECTCRAFT_REQUIRE_GPU").as_deref() == Ok("1");
+    let Some(gpu) = supported_test_gpu(effectcraft_gpu::Gpu::try_headless(), required).unwrap() else { return };
+    eprintln!("native display test adapter: {}", effectcraft_engine::render::Accelerator::name(&gpu));
     gpu.warm_pipelines().unwrap();
     let mut s = Session::default();
     s.execute("comp.new", json!({"width":64,"height":32,"duration":3})).unwrap();
