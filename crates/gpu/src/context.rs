@@ -1548,6 +1548,8 @@ pub(crate) struct Enc<'g> {
     pub(crate) mips: crate::mips::Local,
     /// A dispatch named a kernel the device doesn't have (see [`Enc::take_missing`]).
     missing: bool,
+    /// Nested comp frames shared by identical precomp instances of this frame (`cull`).
+    pub(crate) shared: crate::cull::Shared,
 }
 
 impl Drop for Enc<'_> {
@@ -1618,6 +1620,7 @@ impl<'g> Enc<'g> {
             reuse: true,
             mips: Default::default(),
             missing: false,
+            shared: Default::default(),
             #[cfg(feature = "profile")]
             timestamps: None,
         }

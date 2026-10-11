@@ -57,6 +57,7 @@ mod adv3d;
 mod bokeh;
 mod classic3d;
 mod context;
+mod cull;
 pub mod deferred;
 mod effects;
 mod fusion;
@@ -601,6 +602,9 @@ pub fn yuv_transport_enabled() -> bool {
 
 #[cfg(test)]
 mod tests_cache_policy;
+
+#[cfg(test)]
+mod tests_cull;
 
 #[cfg(test)]
 mod tests_collapsed_resident;
