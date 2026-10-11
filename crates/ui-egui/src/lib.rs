@@ -29,6 +29,7 @@ mod pointer_wrap;
 pub mod prefs_live;
 pub mod state;
 pub mod theme;
+mod thumb_lru;
 pub mod widgets;
 mod workspace_state;
 
