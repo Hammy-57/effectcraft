@@ -57,6 +57,11 @@ fn export_layers(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let saved: Vec<Value> =
         comp.layers.iter().enumerate().filter(|(_, l)| ids.contains(&l.id)).map(|(i, l)| json!({"index": i + 1, "id": l.id.0, "name": l.name})).collect();
+    // The time the saved layers span (comp seconds), for a library preview.
+    let chosen = || comp.layers.iter().filter(|l| ids.contains(&l.id));
+    let start = chosen().map(|l| l.in_point).min().unwrap_or(Tick::ZERO).seconds();
+    let end = chosen().map(|l| l.out_point).max().unwrap_or(Tick::ZERO).seconds();
+    let frame_rate = comp.frame_rate.as_f64();
     let comp_name = s.project.item(cid).map(|i| i.name.clone()).unwrap_or_default();
     let mut sub: Project = (*s.project).clone();
     if let Some(c) = sub.comp_mut(cid) {
@@ -65,7 +70,10 @@ fn export_layers(s: &mut Session, p: &Value) -> Result<Value> {
     }
     keep_only(&mut sub, &[cid]);
     let bytes = write_project(s, C, &path, &sub)?;
-    Ok(json!({"path": path, "comp": comp_name, "layers": saved, "included": keep.len(), "items": sub.items.len(), "bytes": bytes}))
+    Ok(json!({
+        "path": path, "comp": comp_name, "layers": saved, "included": keep.len(), "items": sub.items.len(), "bytes": bytes,
+        "start": start, "end": end, "frameRate": frame_rate,
+    }))
 }
 
 fn export_comp(s: &mut Session, p: &Value) -> Result<Value> {
@@ -73,10 +81,12 @@ fn export_comp(s: &mut Session, p: &Value) -> Result<Value> {
     let path = str_p(p, "path").ok_or_else(|| bad(C, "missing `path` (.ecproj)"))?.to_string();
     let cid = comp_id(s, p)?;
     let comp_name = s.project.item(cid).map(|i| i.name.clone()).unwrap_or_default();
+    let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
+    let (start, end, frame_rate) = (comp.work_area.0.seconds(), comp.work_area.1.seconds(), comp.frame_rate.as_f64());
     let mut sub: Project = (*s.project).clone();
     keep_only(&mut sub, &[cid]);
     let bytes = write_project(s, C, &path, &sub)?;
-    Ok(json!({"path": path, "comp": comp_name, "items": sub.items.len(), "bytes": bytes}))
+    Ok(json!({"path": path, "comp": comp_name, "items": sub.items.len(), "bytes": bytes, "start": start, "end": end, "frameRate": frame_rate}))
 }
 
 fn import_layers(s: &mut Session, p: &Value) -> Result<Value> {
@@ -144,7 +154,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Export Layers",
             [],
             None,
-            "{path (.ecproj), comp?, layers?} — writes the selected layers (with the parents and track mattes they need, and the items they use) to a small project; the open project is unchanged. Returns {path, comp, layers: [{index, id, name}], included, items, bytes}",
+            "{path (.ecproj), comp?, layers?} — writes the selected layers (with the parents and track mattes they need, and the items they use) to a small project; the open project is unchanged. Returns {path, comp, layers: [{index, id, name}], included, items, bytes, start, end (s, the selected layers' span), frameRate}",
             has_comp,
             export_layers
         ),
@@ -153,7 +163,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Export Composition",
             [],
             None,
-            "{path (.ecproj), comp?} — writes the comp and everything it uses to a small project; the open project is unchanged",
+            "{path (.ecproj), comp?} — writes the comp and everything it uses to a small project; the open project is unchanged. Returns {path, comp, items, bytes, start, end (s, the work area), frameRate}",
             has_comp,
             export_comp
         ),
