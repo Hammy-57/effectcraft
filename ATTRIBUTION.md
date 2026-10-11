@@ -9,6 +9,18 @@ iconography, images or other Adobe assets; open licences only; every asset attri
 
 | Asset | Author | Source | Licence |
 |---|---|---|---|
+| `fuzz/corpus/svg_parse/seed-basic-shapes.svg` | EffectCraft contributors | Original synthetic seed from `fuzz/examples/seeds.rs` | MIT OR Apache-2.0 |
+| `fuzz/corpus/media_probe/seed-basic-shapes.svg` | EffectCraft contributors | Original synthetic seed from `fuzz/examples/seeds.rs` | MIT OR Apache-2.0 |
+| `fuzz/corpus/svg_parse/seed-paths-gradients.svg` | EffectCraft contributors | Original synthetic seed from `fuzz/examples/seeds.rs` | MIT OR Apache-2.0 |
+| `fuzz/corpus/media_probe/seed-paths-gradients.svg` | EffectCraft contributors | Original synthetic seed from `fuzz/examples/seeds.rs` | MIT OR Apache-2.0 |
+| `fuzz/corpus/media_probe/seed-icon.png` | EffectCraft contributors (drawing by the project owner in ArtCraft) | Original EffectCraft app icon copied by `fuzz/examples/seeds.rs` (selector-prefixed) | MIT OR Apache-2.0 |
+| `fuzz/corpus/pdf_parse/seed-min.pdf` | EffectCraft contributors | Original synthetic seed from `fuzz/examples/seeds.rs` | MIT OR Apache-2.0 |
+| `fuzz/corpus/pdf_parse/seed-min.eps` | EffectCraft contributors | Original synthetic seed from `fuzz/examples/seeds.rs` | MIT OR Apache-2.0 |
+| `fuzz/corpus/psd_parse/seed-header-only.psd` | EffectCraft contributors | Original synthetic seed from `fuzz/examples/seeds.rs` | MIT OR Apache-2.0 |
+| `fuzz/corpus/media_probe/seed-tone.wav` | EffectCraft contributors | Original synthetic seed from `fuzz/examples/seeds.rs` | MIT OR Apache-2.0 |
+| `tests/repros/goldens/compositing-basics-0.png` | EffectCraft contributors | Original EffectCraft render of `tests/repros/golden-compositing-basics.jsonl` (Golden compositing regression frame at 0 seconds) | MIT OR Apache-2.0 |
+| `tests/repros/goldens/compositing-basics-0_5.png` | EffectCraft contributors | Original EffectCraft render of `tests/repros/golden-compositing-basics.jsonl` (Golden compositing regression frame at 0.5 seconds) | MIT OR Apache-2.0 |
+| `tests/repros/goldens/compositing-basics-1_5.png` | EffectCraft contributors | Original EffectCraft render of `tests/repros/golden-compositing-basics.jsonl` (Golden compositing regression frame at 1.5 seconds) | MIT OR Apache-2.0 |
 | `tests/repros/freeze-cycle.ecproj` | EffectCraft contributors | Original synthetic cyclic-composition regression; no media or external artwork | MIT OR Apache-2.0 |
 | `assets/icons/tools-atlas.png` | EffectCraft contributors with OpenAI ImageGen | Original generated toolbar and timeline glyphs; prompt in `assets/icons/tools-atlas-prompt.txt` | MIT OR Apache-2.0 |
 | `assets/fonts/Inter-Regular.ttf` | The Inter Project Authors | https://github.com/rsms/inter | OFL-1.1 (`assets/fonts/OFL-Inter.txt`) |

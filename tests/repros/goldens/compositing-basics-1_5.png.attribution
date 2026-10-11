@@ -1,0 +1,8 @@
+asset:        compositing-basics-1_5.png
+title:        Golden compositing regression frame at 1.5 seconds
+author:       EffectCraft contributors
+source:       original work
+license:      MIT OR Apache-2.0
+license-file: LICENSE-MIT, LICENSE-APACHE
+added:        2026-10-11 by EffectCraft contributors (attribution repair)
+notes:        Rendered by EffectCraft from tests/repros/golden-compositing-basics.jsonl at 1.5 seconds using the replay golden/--bless mechanism. Introduced with the script in 2cca8bba, whose checks record blessing and comparison. Original solids, masks, blend modes, matte, blur and parented motion; no external media or artwork.
