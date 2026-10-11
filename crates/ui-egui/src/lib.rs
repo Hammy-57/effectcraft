@@ -1467,9 +1467,11 @@ impl EffectcraftApp {
                 ctx.request_repaint();
                 return;
             }
-            let order: Vec<i64> = (0..n).filter_map(|k| p.frame_after(p.first, k)).collect();
-            for f in order {
-                if self.frames.is_cached(&FrameKey { frame: f, ..series }) {
+            // One look at the cache per repaint, not a lock per frame of the range (each
+            // finished frame repaints: that was quadratic in the range).
+            let cached = self.frames.cached_frames(&series);
+            for f in (0..n).filter_map(|k| p.frame_after(p.first, k)) {
+                if cached.binary_search(&f).is_ok() {
                     continue;
                 }
                 all = false;
@@ -1715,9 +1717,10 @@ impl EffectcraftApp {
         let mut queued = self.frames.inflight();
         let scale = series.scale as f64 / 1000.0;
         let mut pending = false;
+        let cached = self.frames.cached_frames(series);
         for k in 0..fit {
             let f = wa + (cur - wa + k).rem_euclid(n);
-            if self.frames.is_cached(&FrameKey { frame: f, ..*series }) {
+            if cached.binary_search(&f).is_ok() {
                 continue;
             }
             pending = true;
