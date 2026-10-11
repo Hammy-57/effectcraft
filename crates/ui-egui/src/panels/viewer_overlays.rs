@@ -286,7 +286,8 @@ pub(crate) fn edit_motion_key(app: &mut EffectcraftApp, h: KeyHit, delete: bool)
         if delete {
             app.session.execute("keys.delete", json!({}))
         } else {
-            app.session.execute("keys.interpolation", json!({"spatial": if h.curved { "linear" } else { "bezier" }}))
+            // Convert Vertex: a curved key becomes Linear, a corner Auto Bezier (as in After Effects).
+            app.session.execute("keys.interpolation", json!({"spatial": if h.curved { "linear" } else { "autoBezier" }}))
         }
     });
     if let Err(e) = result {
