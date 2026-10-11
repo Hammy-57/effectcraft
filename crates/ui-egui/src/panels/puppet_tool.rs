@@ -175,7 +175,7 @@ fn with_live_pins(overlay: &Overlay, params: &effectcraft_engine::effects::Param
 
 /// The first overlay is exact. Later native poses solve asynchronously, coalescing drag edits;
 /// wasm keeps the synchronous path because there is no native worker pool.
-pub fn overlay(app: &mut EffectcraftApp, ctx: &egui::Context, cid: ItemId, layer: &Layer, t: Tick) -> Option<Overlay> {
+pub fn overlay(app: &mut EffectcraftApp, ctx: &egui::Context, cid: ItemId, layer: &Layer, t: Tick, _hold_geometry: bool) -> Option<Overlay> {
     let fx = layer.effects()?.groups().find(|g| puppet::is_puppet(g))?;
     let key = OverlayKey { epoch: app.session.epoch, revision: app.session.revision, comp: cid.0, layer: layer.id.0, time: t.0 };
     let id = egui::Id::new(("puppet-overlay", cid.0, layer.id.0));
@@ -188,7 +188,9 @@ pub fn overlay(app: &mut EffectcraftApp, ctx: &egui::Context, cid: ItemId, layer
         let mut cached = cached;
         let worker_id = id.with("worker");
         let mailbox = ctx.data_mut(|d| d.get_temp_mut_or_default::<Arc<Mutex<Mailbox>>>(worker_id).clone());
-        let completed = mailbox.lock().unwrap_or_else(std::sync::PoisonError::into_inner).completed.take();
+        // Hit-test the deformation the user pressed until the viewer captures a gesture.
+        // Live pin properties still update, and the completed mesh remains ready for capture.
+        let completed = if _hold_geometry { None } else { mailbox.lock().unwrap_or_else(std::sync::PoisonError::into_inner).completed.take() };
         match completed {
             Some(Ok(done)) if done.key.same_layer(key) => {
                 ctx.data_mut(|d| d.insert_temp(id, done.clone()));
@@ -410,6 +412,62 @@ mod async_tests {
     }
 
     #[test]
+    fn completed_mesh_preserves_pressed_handle_until_capture_then_advances() {
+        let mut session = Session::default();
+        let cid = ItemId(session.execute("comp.new", json!({"width": 64, "height": 64, "duration": 1})).unwrap()["comp"].as_u64().unwrap());
+        let lid = LayerId(session.execute("layer.newSolid", json!({"width": 48, "height": 48, "color": "#ff0000"})).unwrap()["layer"].as_u64().unwrap());
+        session.execute("puppet.addPin", json!({"layer": lid.0, "position": [4, 4]})).unwrap();
+        let bend = session.execute("puppet.addPin", json!({"layer": lid.0, "kind": "bend", "position": [24, 24]})).unwrap()["pin"].as_u64().unwrap();
+        let mut app = EffectcraftApp::new(session);
+        let ctx = egui::Context::default();
+        let layer = app.session.project.comp(cid).unwrap().layer(lid).unwrap().clone();
+        let initial = overlay(&mut app, &ctx, cid, &layer, Tick::ZERO, false).unwrap();
+        app.session.execute("puppet.setPin", json!({"layer": lid.0, "pin": bend, "rotation": 90})).unwrap();
+        let layer = app.session.project.comp(cid).unwrap().layer(lid).unwrap().clone();
+        let effect = layer.effects().unwrap().groups().find(|g| puppet::is_puppet(g)).unwrap().uid;
+        let (_, params) = effectcraft_engine::commands::puppet::puppet_eval(&app.session, cid, lid, effect, Tick::ZERO).unwrap();
+        let presented = with_live_pins(&initial, &params);
+        // Deterministic worker completion: the solved mesh carries the Bend handle elsewhere
+        // exactly between its presented frame and the press. No timing or sleeps involved.
+        let mut completed = presented.clone();
+        for (_, _, vertices, _) in Arc::make_mut(&mut completed) {
+            for vertex in vertices {
+                vertex[0] += 100.0;
+            }
+        }
+        let key = OverlayKey { epoch: app.session.epoch, revision: app.session.revision, comp: cid.0, layer: lid.0, time: 0 };
+        let mailbox =
+            Arc::new(Mutex::new(Mailbox { requested: Some(key), completed: Some(Ok(Cached { key, overlay: completed.clone() })), ..Default::default() }));
+        ctx.data_mut(|d| d.insert_temp(egui::Id::new(("puppet-overlay", cid.0, lid.0)).with("worker"), mailbox.clone()));
+        let project = app.session.project.clone();
+        let comp = project.comp(cid).unwrap();
+        let eval = EvalCtx { project: &project, comp_id: cid, comp, time: Tick::ZERO, expr: None, footage: None };
+        let map = ViewerMap { origin: egui::Pos2::ZERO, zoom: 1.0, comp: [64.0, 64.0], area: egui::Rect::EVERYTHING };
+        let hits = |ov: &Overlay| {
+            let mut hits = vec![];
+            let mut out = ctx.run_ui(Default::default(), |ui| {
+                hits = draw(ui.painter(), &map, &eval, &layer, ov, false, &[], None);
+            });
+            out.textures_delta.clear();
+            hits
+        };
+        let shown_hits = hits(&presented);
+        let press = shown_hits.iter().find(|p| p.pin == bend).unwrap().handle.unwrap();
+        assert!(matches!(hit(&shown_hits, press), Some((h, PinPart::Scale)) if h.pin == bend));
+        assert!(hit(&hits(&completed), press).is_none(), "adopting the completion now would lose the intended scale handle");
+        for _ in 0..2 {
+            // press and movement below the drag threshold
+            let held = overlay(&mut app, &ctx, cid, &layer, Tick::ZERO, true).unwrap();
+            let held_hits = hits(&held);
+            assert!(matches!(hit(&held_hits, press), Some((h, PinPart::Scale)) if h.pin == bend));
+            assert_eq!(held_hits.iter().find(|p| p.pin == bend).unwrap().rotation, 90.0, "live pin values are not frozen");
+            assert!(mailbox.lock().unwrap().completed.is_some(), "completion stays available");
+        }
+        let advanced = overlay(&mut app, &ctx, cid, &layer, Tick::ZERO, false).unwrap();
+        assert_eq!(*advanced, *completed, "captured gesture restores live mesh feedback before release");
+    }
+
+    #[test]
     fn pins_follow_edits_while_mesh_worker_is_busy_then_finish_exactly() {
         let mut session = Session::default();
         let cid = ItemId(session.execute("comp.new", json!({"width": 64, "height": 64, "duration": 1})).unwrap()["comp"].as_u64().unwrap());
@@ -419,21 +477,21 @@ mod async_tests {
         let mut app = EffectcraftApp::new(session);
         let ctx = egui::Context::default();
         let layer = app.session.project.comp(cid).unwrap().layer(lid).unwrap().clone();
-        let first = overlay(&mut app, &ctx, cid, &layer, Tick::ZERO).unwrap();
+        let first = overlay(&mut app, &ctx, cid, &layer, Tick::ZERO, false).unwrap();
         let id = egui::Id::new(("puppet-overlay", cid.0, lid.0));
         let mailbox = Arc::new(Mutex::new(Mailbox { running: true, ..Default::default() }));
         ctx.data_mut(|d| d.insert_temp(id.with("worker"), mailbox.clone()));
         app.session.execute("puppet.movePin", json!({"layer": lid.0, "pin": pin, "position": [58, 30]})).unwrap();
         let layer = app.session.project.comp(cid).unwrap().layer(lid).unwrap().clone();
         let began = std::time::Instant::now();
-        let live = overlay(&mut app, &ctx, cid, &layer, Tick::ZERO).unwrap();
+        let live = overlay(&mut app, &ctx, cid, &layer, Tick::ZERO, false).unwrap();
         eprintln!("busy-worker live overlay update: {:.3} ms", began.elapsed().as_secs_f64() * 1000.0);
         let moved = live.iter().flat_map(|(_, _, _, pins)| pins).find(|p| p.uid == pin).unwrap();
         assert_eq!(moved.position, [58.0, 30.0], "pin drawing and hits use the latest edit without waiting");
         assert_eq!(live[0].2, first[0].2, "last completed geometry stays until replacement is ready");
         assert!(mailbox.lock().unwrap().pending.is_some(), "the new deformation was queued");
         run_mailbox(&mailbox, &ctx, compute_overlay);
-        let done = overlay(&mut app, &ctx, cid, &layer, Tick::ZERO).unwrap();
+        let done = overlay(&mut app, &ctx, cid, &layer, Tick::ZERO, false).unwrap();
         let effect = layer.effects().unwrap().groups().find(|g| puppet::is_puppet(g)).unwrap().uid;
         let (buf, params) = effectcraft_engine::commands::puppet::puppet_eval(&app.session, cid, lid, effect, Tick::ZERO).unwrap();
         assert_eq!(*done, puppet::overlay(&buf, &params), "settled overlay is the exact final solve");
@@ -442,7 +500,7 @@ mod async_tests {
         let old = ctx.data(|d| d.get_temp::<Cached>(id)).unwrap();
         app.session.replace_project((*app.session.project).clone(), None);
         let layer = app.session.project.comp(cid).unwrap().layer(lid).unwrap().clone();
-        assert!(!overlay(&mut app, &ctx, cid, &layer, Tick::ZERO).unwrap().is_empty());
+        assert!(!overlay(&mut app, &ctx, cid, &layer, Tick::ZERO, false).unwrap().is_empty());
         {
             let mut worker = mailbox.lock().unwrap();
             worker.running = true;
@@ -450,6 +508,6 @@ mod async_tests {
         }
         app.session.execute("puppet.movePin", json!({"layer": lid.0, "pin": pin, "position": [55, 32]})).unwrap();
         let layer = app.session.project.comp(cid).unwrap().layer(lid).unwrap().clone();
-        assert!(!overlay(&mut app, &ctx, cid, &layer, Tick::ZERO).unwrap().is_empty(), "late completion from a replaced document is discarded");
+        assert!(!overlay(&mut app, &ctx, cid, &layer, Tick::ZERO, false).unwrap().is_empty(), "late completion from a replaced document is discarded");
     }
 }
