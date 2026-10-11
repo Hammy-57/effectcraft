@@ -226,6 +226,11 @@ pub(crate) fn box_radii(sigma: f64, n: usize) -> Vec<usize> {
 
 /// Horizontal passes with radii `rx`, then vertical passes with radii `ry` (raster::blur).
 pub(crate) fn box_passes(e: &mut Enc, img: &GpuImage, rx: &[usize], ry: &[usize], repeat: bool) -> GpuImage {
+    box_passes_with(e, "box_h", img, rx, ry, repeat)
+}
+
+/// [`box_passes`] with the horizontal passes run by kernel `h` (the tests' reference kernel).
+pub(crate) fn box_passes_with(e: &mut Enc, h: &str, img: &GpuImage, rx: &[usize], ry: &[usize], repeat: bool) -> GpuImage {
     let mut cur = img.clone();
     let passes = rx.iter().map(|&r| (false, r)).chain(ry.iter().map(|&r| (true, r))).filter(|p| p.1 > 0);
     for (vertical, r) in passes {
@@ -234,7 +239,7 @@ pub(crate) fn box_passes(e: &mut Enc, img: &GpuImage, rx: &[usize], ry: &[usize]
         let mut p = Params::default();
         p.u[0] = [r as u32, repeat as u32, block, 0];
         let out = e.scratch(cur.width, cur.height);
-        e.dispatch(if vertical { "box_v" } else { "box_h" }, &p, &cur, None, &out, None, (lines.div_ceil(64), n.div_ceil(block)));
+        e.dispatch(if vertical { "box_v" } else { h }, &p, &cur, None, &out, None, (lines.div_ceil(64), n.div_ceil(block)));
         cur = out;
     }
     cur

@@ -29,6 +29,9 @@ const ENTRIES: &[&str] = &[
 /// turning the whole compositor off.
 const EFFECT_ENTRIES: &[&str] = &["box_h", "box_v", "directional", "glow_bright", "glow_combine", "shadow_make", "shadow_combine", "pointwise"];
 
+/// Reference kernels the tests compare against (`box_h_serial`: `box_h` as it was).
+const TEST_ENTRIES: &[&str] = if cfg!(test) { &["box_h_serial"] } else { &[] };
+
 /// Entry points that also bind group 1 (four read-only storage buffers; see
 /// [`Enc::dispatch_ext`]).
 const EXT_ENTRIES: &[&str] = &["classic3d"];
@@ -502,6 +505,7 @@ impl GpuContext {
         let mut unavailable = vec![];
         for e in EFFECT_ENTRIES
             .iter()
+            .chain(TEST_ENTRIES)
             .chain(crate::fx_color::KERNELS)
             .chain(crate::fx_distort::KERNELS)
             .chain(crate::fx_generate::KERNELS)
