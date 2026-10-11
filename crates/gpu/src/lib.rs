@@ -260,6 +260,33 @@ impl Gpu {
         Enc::new(&self.ctx).read_texture_async(&f.texture, f.width, f.height, 4, done);
     }
 
+    /// [`Gpu::read_display_async`] for a native frame worker that goes on to other work instead
+    /// of waiting: `done` gets exactly [`Gpu::read_display`]'s bytes, or `None` on failure,
+    /// exactly once (possibly before this returns), from whichever thread polls the device after
+    /// the copy finished. Returns the submission that copies the frame, for
+    /// [`Gpu::wait_submission`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn read_display_start(&self, f: &DisplayFrame, done: impl FnOnce(Option<Vec<u8>>) + Send + 'static) -> Option<wgpu::SubmissionIndex> {
+        if let Err(e) = self.ctx.check_health() {
+            log::error!("gpu display readback: {e}");
+            crate::readback::reject(done, e);
+            return None;
+        }
+        self.ctx.transfers.count(false, (f.width as usize).saturating_mul(f.height as usize).saturating_mul(4));
+        let mut e = Enc::new(&self.ctx);
+        e.read_texture_async(&f.texture, f.width, f.height, 4, done);
+        e.last_submission()
+    }
+
+    /// Wait until `submission` has finished on the GPU, running the callbacks of the readbacks it
+    /// completed. Bounded by the readback deadline, whose expiry retires the context as a
+    /// blocking readback's does.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn wait_submission(&self, submission: &wgpu::SubmissionIndex) -> Result<(), String> {
+        let wait = wgpu::PollType::Wait { submission_index: Some(submission.clone()), timeout: Some(crate::readback::TIMEOUT) };
+        self.ctx.poll_readbacks(wait).map(|_| ())
+    }
+
     /// Render a frame on the GPU and read it back (`None` = not handled).
     pub fn render(&self, r: &Renderer, comp: ItemId, t: Tick) -> Option<Image> {
         self.ctx.check_health().ok()?;

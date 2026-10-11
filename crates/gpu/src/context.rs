@@ -2155,6 +2155,11 @@ impl<'g> Enc<'g> {
         let _ = self.g.poll_readbacks(wgpu::PollType::Poll);
     }
 
+    /// This encoder's latest submission (the one a readback it started copies in).
+    pub(crate) fn last_submission(&self) -> Option<wgpu::SubmissionIndex> {
+        self.submitted.clone()
+    }
+
     /// A deferred readback of `img` (RGBA f32) under `key` (see [`crate::deferred`]): the bytes
     /// once they arrived (`Some(None)`: the readback failed), else `None` after starting the
     /// copy if needed and marking the pass missed.
