@@ -82,21 +82,15 @@ fn program(steps: &[FxStep]) -> Option<(Vec<u32>, Vec<f32>)> {
     }
     Some((ids, data))
 }
-fn source(ids: &[u32]) -> String {
+fn source(ids: &[u32]) -> Option<String> {
+    if !(2..=MAX_STEPS).contains(&ids.len()) {
+        return None;
+    }
     let mut src = [include_str!("shaders/common.wgsl"), include_str!("shaders/kernels.wgsl")].concat();
     src.push_str(
         r#"
-fn colour_params(base: u32) -> Params {
-    var q: Params;
-    for (var i = 0u; i < 4u; i++) {
-        let b = base + i * 4u;
-        q.u[i] = vec4<u32>(vec4<f32>(data[b], data[b+1u], data[b+2u], data[b+3u]));
-    }
-    for (var i = 0u; i < 12u; i++) {
-        let b = base + 16u + i * 4u;
-        q.f[i] = vec4<f32>(data[b], data[b+1u], data[b+2u], data[b+3u]);
-    }
-    return q;
+fn colour_f4(base: u32) -> vec4<f32> {
+    return vec4<f32>(data[base], data[base+1u], data[base+2u], data[base+3u]);
 }
 @compute @workgroup_size(16,16)
 fn colour_chain(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -106,11 +100,24 @@ fn colour_chain(@builtin(global_invocation_id) gid: vec3<u32>) {
     var px = textureLoad(src, p, 0);
 "#,
     );
+    // Emit compact effect-specific calls. Passing the full Params array through
+    // the generic switch was much slower on Metal; keep specialization explicit.
     for (i, id) in ids.iter().enumerate() {
-        src.push_str(&format!("    {{ var q = colour_params({}u); q.u[0].x = {id}u; px = pointwise_px(px, q, p, gid); if (P.f[0].x > 0.0) {{ px = quantize_px(px, P.f[0].x, P.f[0].y); }} }}\n", i * WORDS));
+        let base = i * WORDS;
+        let f0 = base + 16;
+        let f1 = base + 20;
+        let f2 = base + 24;
+        let call = match id {
+            1 => format!("colour_tint(px, colour_f4({f0}u).xyz, colour_f4({f1}u).xyz, data[{f2}u])"),
+            4 => format!("colour_levels(px, vec2<u32>(colour_f4({base}u).yz), colour_f4({f0}u), data[{f1}u])"),
+            5 => format!("colour_exposure(px, u32(data[{}u]), colour_f4({f0}u).xyz, colour_f4({f1}u).xyz, colour_f4({f2}u).xyz)", base + 1),
+            8 => format!("colour_curves(px, colour_f4({f0}u), data[{f1}u])"),
+            _ => return None,
+        };
+        src.push_str(&format!("    px = {call}; if (P.f[0].x > 0.0) {{ px = quantize_px(px, P.f[0].x, P.f[0].y); }}\n"));
     }
     src.push_str("    textureStore(out, p, px);\n}\n");
-    src
+    Some(src)
 }
 impl Pipelines {
     fn get(&self, g: &GpuContext, ids: &[u32]) -> Option<wgpu::ComputePipeline> {
@@ -123,9 +130,9 @@ impl Pipelines {
             return None;
         }
         let compile = || -> Result<wgpu::ComputePipeline, String> {
+            let source = source(ids).ok_or_else(|| "unsupported colour fusion opcode".to_string())?;
             let module = init_resource(&g.device, "colour chain module", || {
-                g.device
-                    .create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("colour chain"), source: wgpu::ShaderSource::Wgsl(source(ids).into()) })
+                g.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("colour chain"), source: wgpu::ShaderSource::Wgsl(source.into()) })
             })?;
             let layout = init_resource(&g.device, "colour chain layout", || {
                 g.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -210,6 +217,9 @@ mod tests {
     }
     #[test]
     fn colour_fusion_program_bounds_and_boundaries() {
+        assert!(source(&[4, 999]).is_none());
+        assert!(source(&[]).is_none());
+        assert!(source(&[1; MAX_STEPS + 1]).is_none());
         let p = params();
         let s = steps(&p);
         assert_eq!(program(&s).unwrap().0, vec![4, 8, 1, 5]);

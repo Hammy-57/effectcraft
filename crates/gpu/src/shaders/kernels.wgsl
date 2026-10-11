@@ -629,21 +629,101 @@ fn pointwise(@builtin(global_invocation_id) gid: vec3<u32>) {
     textureStore(out, p, pointwise_px(textureLoad(src, p, 0), P, p, gid));
 }
 
+fn colour_tint(input: vec4<f32>, black: vec3<f32>, white: vec3<f32>, amount: f32) -> vec4<f32> {
+    var px = input;
+    let a = px.w;
+    if (a > 0.0) {
+        let c = straight(px);
+        let l = clamp(luminance(c), 0.0, 1.0);
+        let blk = black;
+        let wht = white;
+        let t = blk + (wht - blk) * l;
+        px = vec4<f32>(mix3(c, t, amount) * a, a);
+    }
+    return px;
+}
+
+fn colour_levels(input: vec4<f32>, flags: vec2<u32>, input_range: vec4<f32>, output_white: f32) -> vec4<f32> {
+    var px = input;
+    let a = px.w;
+    if (a > 0.0) {
+        let c = straight(px);
+        let ib = input_range.x;
+        let iw = input_range.y;
+        let g = input_range.z;
+        let ob = input_range.w;
+        let ow = output_white;
+        var o = vec3<f32>(0.0);
+        for (var i = 0; i < 3; i++) {
+            var t = (c[i] - ib) / max(iw - ib, 1e-6);
+            if (flags.x != 0u) {
+                t = max(t, 0.0);
+            }
+            if (flags.y != 0u) {
+                t = min(t, 1.0);
+            }
+            t = powz(max(t, 0.0), 1.0 / g);
+            o[i] = ob + (ow - ob) * t;
+        }
+        px = vec4<f32>(o * a, a);
+    }
+    return px;
+}
+
+fn colour_exposure(input: vec4<f32>, linear: u32, gain: vec3<f32>, offset: vec3<f32>, gamma: vec3<f32>) -> vec4<f32> {
+    var px = input;
+    let a = px.w;
+    if (a > 0.0) {
+        let c = straight(px);
+        var o = vec3<f32>(0.0);
+        for (var i = 0; i < 3; i++) {
+            // Per-channel gain, offset, gamma; negative values are mirrored.
+            if (linear != 0u) {
+                let x = c[i] * gain[i] + offset[i];
+                o[i] = sign(x) * powz(abs(x), 1.0 / gamma[i]);
+            } else {
+                let lin = srgb_to_linear(max(c[i], 0.0));
+                let x = lin * gain[i] + offset[i];
+                o[i] = sign(x) * linear_to_srgb(powz(abs(x), 1.0 / gamma[i]));
+            }
+        }
+        px = vec4<f32>(o * a, a);
+    }
+    return px;
+}
+
+fn colour_curves(input: vec4<f32>, offsets: vec4<f32>, alpha_offset: f32) -> vec4<f32> {
+    var px = input;
+    let a = px.w;
+    // effects::color2::map_ca: transparent pixels only change through the alpha curve.
+    if (a <= 0.0 && px.x == 0.0 && px.y == 0.0 && px.z == 0.0) {
+        let na = curve_eval(alpha_offset, 0.0);
+        if (na > 0.0) {
+            px = vec4<f32>(0.0, 0.0, 0.0, clamp(na, 0.0, 1.0));
+        }
+    } else {
+        var c = vec3<f32>(0.0);
+        var aa = max(a, 0.0);
+        if (a > 1e-6) {
+            c = px.xyz / a;
+            aa = a;
+        }
+        var o = vec3<f32>(0.0);
+        for (var i = 0; i < 3; i++) {
+            o[i] = curve_eval(offsets[i + 1], curve_eval(offsets.x, c[i]));
+        }
+        let na = clamp(curve_eval(alpha_offset, aa), 0.0, 1.0);
+        px = vec4<f32>(o * na, na);
+    }
+    return px;
+}
+
 fn pointwise_px(input: vec4<f32>, params: Params, p: vec2<i32>, gid: vec3<u32>) -> vec4<f32> {
     var px = input;
     let a = px.w;
     let op = params.u[0].x;
     switch op {
-        case 1u: {
-            if (a > 0.0) {
-                let c = straight(px);
-                let l = clamp(luminance(c), 0.0, 1.0);
-                let blk = params.f[0].xyz;
-                let wht = params.f[1].xyz;
-                let t = blk + (wht - blk) * l;
-                px = vec4<f32>(mix3(c, t, params.f[2].x) * a, a);
-            }
-        }
+        case 1u: { px = colour_tint(px, params.f[0].xyz, params.f[1].xyz, params.f[2].x); }
         case 2u: {
             if (a > 0.0) {
                 let c = straight(px);
@@ -710,47 +790,8 @@ fn pointwise_px(input: vec4<f32>, params: Params, p: vec2<i32>, gid: vec3<u32>) 
                 px = vec4<f32>(hsl_to_rgb(h, s, l) * a, a);
             }
         }
-        case 4u: {
-            if (a > 0.0) {
-                let c = straight(px);
-                let ib = params.f[0].x;
-                let iw = params.f[0].y;
-                let g = params.f[0].z;
-                let ob = params.f[0].w;
-                let ow = params.f[1].x;
-                var o = vec3<f32>(0.0);
-                for (var i = 0; i < 3; i++) {
-                    var t = (c[i] - ib) / max(iw - ib, 1e-6);
-                    if (params.u[0].y != 0u) {
-                        t = max(t, 0.0);
-                    }
-                    if (params.u[0].z != 0u) {
-                        t = min(t, 1.0);
-                    }
-                    t = powz(max(t, 0.0), 1.0 / g);
-                    o[i] = ob + (ow - ob) * t;
-                }
-                px = vec4<f32>(o * a, a);
-            }
-        }
-        case 5u: {
-            if (a > 0.0) {
-                let c = straight(px);
-                var o = vec3<f32>(0.0);
-                for (var i = 0; i < 3; i++) {
-                    // Per-channel gain, offset, gamma; negative values are mirrored.
-                    if (params.u[0].y != 0u) {
-                        let x = c[i] * params.f[0][i] + params.f[1][i];
-                        o[i] = sign(x) * powz(abs(x), 1.0 / params.f[2][i]);
-                    } else {
-                        let lin = srgb_to_linear(max(c[i], 0.0));
-                        let x = lin * params.f[0][i] + params.f[1][i];
-                        o[i] = sign(x) * linear_to_srgb(powz(abs(x), 1.0 / params.f[2][i]));
-                    }
-                }
-                px = vec4<f32>(o * a, a);
-            }
-        }
+        case 4u: { px = colour_levels(px, params.u[0].yz, params.f[0], params.f[1].x); }
+        case 5u: { px = colour_exposure(px, params.u[0].y, params.f[0].xyz, params.f[1].xyz, params.f[2].xyz); }
         case 6u: {
             let ch = params.u[0].y;
             let blend = params.f[0].x;
@@ -790,28 +831,7 @@ fn pointwise_px(input: vec4<f32>, params: Params, p: vec2<i32>, gid: vec3<u32>) 
             }
             px = vec4<f32>(rgb, alpha);
         }
-        case 8u: {
-            // effects::color2::map_ca: transparent pixels only change through the alpha curve.
-            if (a <= 0.0 && px.x == 0.0 && px.y == 0.0 && px.z == 0.0) {
-                let na = curve_eval(params.f[1].x, 0.0);
-                if (na > 0.0) {
-                    px = vec4<f32>(0.0, 0.0, 0.0, clamp(na, 0.0, 1.0));
-                }
-            } else {
-                var c = vec3<f32>(0.0);
-                var aa = max(a, 0.0);
-                if (a > 1e-6) {
-                    c = px.xyz / a;
-                    aa = a;
-                }
-                var o = vec3<f32>(0.0);
-                for (var i = 0; i < 3; i++) {
-                    o[i] = curve_eval(params.f[0][i + 1], curve_eval(params.f[0].x, c[i]));
-                }
-                let na = clamp(curve_eval(params.f[1].x, aa), 0.0, 1.0);
-                px = vec4<f32>(o * na, na);
-            }
-        }
+        case 8u: { px = colour_curves(px, params.f[0], params.f[1].x); }
         case 9u: {
             let s = params.f[0].xy;
             let e = params.f[0].zw;
