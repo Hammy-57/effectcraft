@@ -60,6 +60,7 @@ mod context;
 pub mod deferred;
 mod effects;
 mod fusion;
+mod mips;
 mod warmup;
 pub use warmup::WarmupReport;
 /// Whether per-pixel effect fusion is enabled (profiling builds support an A/B override).
@@ -576,3 +577,6 @@ mod tests_collapsed_resident;
 
 #[cfg(test)]
 mod tests_motion_blur_accum;
+
+#[cfg(test)]
+mod tests_dispatch;

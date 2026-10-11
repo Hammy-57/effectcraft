@@ -85,8 +85,32 @@ impl GpuImage {
 
 /// Hands a pooled texture back to its [`Pool`] when the last [`GpuImage`] holding it drops.
 struct Lease {
-    texture: wgpu::Texture,
+    pooled: Pooled,
     pool: Weak<Mutex<Pool>>,
+}
+
+/// A pooled working texture with its default view, made once with the texture and reused with
+/// it (a view per dispatch's scratch image costs CPU time; the pixels are the texture's).
+#[derive(Clone)]
+pub(crate) struct Pooled {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+}
+
+impl From<wgpu::Texture> for Pooled {
+    fn from(texture: wgpu::Texture) -> Pooled {
+        let view = texture.create_view(&Default::default());
+        Pooled { texture, view }
+    }
+}
+
+impl Pooled {
+    fn bytes(&self) -> usize {
+        tex_bytes(&self.texture)
+    }
+    fn size(&self) -> (u32, u32) {
+        (self.texture.width(), self.texture.height())
+    }
 }
 
 impl std::fmt::Debug for Lease {
@@ -100,7 +124,7 @@ impl Drop for Lease {
         if let Some(pool) = self.pool.upgrade()
             && let Ok(mut p) = pool.lock()
         {
-            p.release(self.texture.clone());
+            p.release(self.pooled.clone());
         }
     }
 }
@@ -114,9 +138,9 @@ impl Drop for Lease {
 /// it was released has been submitted (or dropped).
 #[derive(Default)]
 pub(crate) struct Pool {
-    free: HashMap<(u32, u32), Vec<wgpu::Texture>>,
+    free: HashMap<(u32, u32), Vec<Pooled>>,
     /// (texture, newest encoder open at its release).
-    released: Vec<(wgpu::Texture, u64)>,
+    released: Vec<(Pooled, u64)>,
     released_bytes: usize,
     /// Encoders with recorded, unsubmitted work.
     open: BTreeSet<u64>,
@@ -183,10 +207,11 @@ fn tex_bytes(t: &wgpu::Texture) -> usize {
 }
 
 impl Pool {
-    fn release(&mut self, t: wgpu::Texture) {
+    fn release(&mut self, t: impl Into<Pooled>) {
+        let t = t.into();
         match self.open.last() {
             Some(&newest) => {
-                let bytes = tex_bytes(&t);
+                let bytes = t.bytes();
                 if self.bytes.saturating_add(self.released_bytes).saturating_add(bytes) <= self.budget.unwrap_or(POOL_BUDGET) {
                     self.released.push((t, newest));
                     self.released_bytes += bytes;
@@ -197,13 +222,13 @@ impl Pool {
         }
     }
 
-    fn make_free(&mut self, t: wgpu::Texture) {
-        let b = tex_bytes(&t);
+    fn make_free(&mut self, t: Pooled) {
+        let b = t.bytes();
         if self.bytes.saturating_add(self.released_bytes).saturating_add(b) > self.budget.unwrap_or(POOL_BUDGET) {
             return;
         }
         self.bytes += b;
-        self.free.entry((t.width(), t.height())).or_default().push(t);
+        self.free.entry(t.size()).or_default().push(t);
     }
 
     fn open(&mut self) -> u64 {
@@ -221,7 +246,7 @@ impl Pool {
         }
         let (ready, wait): (Vec<_>, Vec<_>) = std::mem::take(&mut self.released).into_iter().partition(|(_, w)| *w < oldest);
         self.released = wait;
-        self.released_bytes = self.released.iter().map(|(t, _)| tex_bytes(t)).sum();
+        self.released_bytes = self.released.iter().map(|(t, _)| t.bytes()).sum();
         for (t, _) in ready {
             self.make_free(t);
         }
@@ -229,28 +254,28 @@ impl Pool {
 
     /// A last CPU lease released within the sole open encoder can be reused by
     /// later commands in that encoder. Separate encoders retain the submit barrier.
-    fn take_for_encoder(&mut self, w: u32, h: u32, encoder: Option<u64>) -> Option<wgpu::Texture> {
+    fn take_for_encoder(&mut self, w: u32, h: u32, encoder: Option<u64>) -> Option<Pooled> {
         if let Some(id) = encoder.filter(|id| *id != 0)
             && self.open.len() == 1
             && self.open.contains(&id)
-            && let Some(index) = self.released.iter().position(|(texture, owner)| *owner == id && texture.width() == w && texture.height() == h)
+            && let Some(index) = self.released.iter().position(|(texture, owner)| *owner == id && texture.size() == (w, h))
         {
             let (texture, _) = self.released.swap_remove(index);
-            self.released_bytes = self.released_bytes.saturating_sub(tex_bytes(&texture));
+            self.released_bytes = self.released_bytes.saturating_sub(texture.bytes());
             self.hits = self.hits.saturating_add(1);
             return Some(texture);
         }
         self.take(w, h)
     }
 
-    fn take(&mut self, w: u32, h: u32) -> Option<wgpu::Texture> {
+    fn take(&mut self, w: u32, h: u32) -> Option<Pooled> {
         let t = self.free.get_mut(&(w, h)).and_then(Vec::pop);
         if self.free.get(&(w, h)).is_some_and(Vec::is_empty) {
             self.free.remove(&(w, h));
         }
         match &t {
             Some(t) => {
-                self.bytes -= tex_bytes(t);
+                self.bytes -= t.bytes();
                 self.hits += 1;
             }
             None => {
@@ -273,7 +298,7 @@ impl Pool {
                             break;
                         };
                         if let Some(texture) = self.free.get_mut(&key).and_then(Vec::pop) {
-                            self.bytes = self.bytes.saturating_sub(tex_bytes(&texture));
+                            self.bytes = self.bytes.saturating_sub(texture.bytes());
                         }
                         if self.free.get(&key).is_some_and(Vec::is_empty) {
                             self.free.remove(&key);
@@ -297,12 +322,12 @@ impl Pool {
         self.budget = Some(budget);
         while self.bytes.saturating_add(self.released_bytes) > budget {
             let Some((texture, _)) = self.released.pop() else { break };
-            self.released_bytes = self.released_bytes.saturating_sub(tex_bytes(&texture));
+            self.released_bytes = self.released_bytes.saturating_sub(texture.bytes());
         }
         for list in self.free.values_mut() {
             while self.bytes > budget {
                 let Some(t) = list.pop() else { break };
-                self.bytes = self.bytes.saturating_sub(tex_bytes(&t));
+                self.bytes = self.bytes.saturating_sub(t.bytes());
             }
         }
         self.free.retain(|_, l| !l.is_empty());
@@ -326,17 +351,12 @@ pub(crate) struct Params {
 }
 
 impl Params {
-    fn bytes(&self) -> Vec<u8> {
-        let mut v = Vec::with_capacity(256);
-        for r in &self.u {
-            for x in r {
-                v.extend_from_slice(&x.to_le_bytes());
-            }
-        }
-        for r in &self.f {
-            for x in r {
-                v.extend_from_slice(&x.to_le_bytes());
-            }
+    /// The block as uploaded (little-endian `u` then `f`), on the stack: no allocation per dispatch.
+    fn bytes(&self) -> [u8; PARAMS_SIZE as usize] {
+        let mut v = [0u8; PARAMS_SIZE as usize];
+        let words = self.u.iter().flatten().copied().chain(self.f.iter().flatten().map(|x| x.to_bits()));
+        for (dst, x) in v.chunks_exact_mut(4).zip(words) {
+            dst.copy_from_slice(&x.to_le_bytes());
         }
         v
     }
@@ -434,7 +454,7 @@ fn clear_retained(uploads: &Mutex<Uploads>) {
 
 /// The device and everything compiled for it.
 pub struct GpuContext {
-    generation: effectcraft_render::allocation::GpuGeneration,
+    pub(crate) generation: effectcraft_render::allocation::GpuGeneration,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub(crate) name: String,
@@ -460,6 +480,8 @@ pub struct GpuContext {
     /// Uniform rings no [`Enc`] holds (reused: see [`Enc::dispatch_ext`]).
     uniforms: Mutex<Vec<wgpu::Buffer>>,
     uploads: Arc<Mutex<Uploads>>,
+    /// Minification chains kept with retained images (see [`crate::mips`]).
+    pub(crate) mips: crate::mips::Mips,
     pool: Arc<Mutex<Pool>>,
     /// CPU ↔ GPU traffic (diagnostics: `bench --gpu`).
     pub(crate) transfers: Transfers,
@@ -825,6 +847,7 @@ impl GpuContext {
             uniform_stride,
             uniforms: Default::default(),
             uploads: Arc::new(Mutex::new(Uploads { budget: Some(upload_budget), ..Default::default() })),
+            mips: Default::default(),
             pool: Arc::new(Mutex::new(Pool { budget: Some(pool_budget), ..Default::default() })),
             integrated,
             auxiliary_budget: std::sync::atomic::AtomicU64::new(auxiliary_budget),
@@ -1115,9 +1138,9 @@ impl GpuContext {
         let (w, h) = (w.max(1), h.max(1));
         let reused = self.pool.lock().ok().and_then(|mut p| p.take_for_encoder(w, h, encoder));
         let was_reused = reused.is_some();
-        let texture = reused.unwrap_or_else(|| self.texture(w, h));
-        let lease = Arc::new(Lease { texture: texture.clone(), pool: Arc::downgrade(&self.pool) });
-        let view = texture.create_view(&Default::default());
+        let pooled = reused.unwrap_or_else(|| Pooled::from(self.texture(w, h)));
+        let (texture, view) = (pooled.texture.clone(), pooled.view.clone());
+        let lease = Arc::new(Lease { pooled, pool: Arc::downgrade(&self.pool) });
         let allocation = effectcraft_render::allocation::GpuAllocation::rgba_f32(w, h, self.generation.clone());
         (GpuImage { allocation, texture, width: w, height: h, view, _lease: Some(lease), levels: None }, was_reused)
     }
@@ -1170,7 +1193,7 @@ impl GpuContext {
             stale.release();
         }
     }
-    fn retained_cap(&self) -> usize {
+    pub(crate) fn retained_cap(&self) -> usize {
         self.uploads.lock().map(|u| u.budget.unwrap_or(UPLOAD_BUDGET)).unwrap_or(0)
     }
     fn upload_buf_owned(&self, buf: &Arc<Buf>, owner: Option<&GpuOwner>) -> Option<GpuImage> {
@@ -1197,6 +1220,7 @@ impl GpuContext {
         if !allocation.generation().same(&self.generation) {
             return;
         }
+        self.mips.seal(&img);
         let Ok(pending) = owner.prepare(Arc::new(img), allocation, GpuStage::CpuMirror, self.retained_cap()) else { return };
         let Ok(slot) = pending.publish() else { return };
         let entry = SlotRef { owner: owner.clone(), slot, epoch: epoch.clone() };
@@ -1436,6 +1460,7 @@ impl GpuContext {
     /// Healthy clear invalidates pending native publication without retiring the device.
     pub fn clear_uploads(&self) {
         clear_retained(&self.uploads);
+        self.mips.clear();
         if let Ok(mut p) = self.pool.lock() {
             p.clear();
         }
@@ -1450,6 +1475,7 @@ impl Drop for GpuContext {
     fn drop(&mut self) {
         self.generation.retire();
         clear_retained(&self.uploads);
+        self.mips.clear();
     }
 }
 
@@ -1506,12 +1532,22 @@ pub(crate) struct Enc<'g> {
     submitted: Option<wgpu::SubmissionIndex>,
     /// This encoder's uniform ring (see [`Enc::dispatch_ext`]).
     ring: Option<wgpu::Buffer>,
+    /// The compute pass consecutive dispatches record into, and whether later dispatches may
+    /// join it (see [`Enc::compute_pass`]).
+    pass: Option<(wgpu::ComputePass<'static>, bool)>,
+    /// Batch dispatches into one compute pass and reuse minification chains (tests compare
+    /// against one pass per dispatch and chains rebuilt every time).
+    pub(crate) reuse: bool,
+    /// Minification levels this encoder built (see [`crate::mips`]).
+    pub(crate) mips: crate::mips::Local,
     /// A dispatch named a kernel the device doesn't have (see [`Enc::take_missing`]).
     missing: bool,
 }
 
 impl Drop for Enc<'_> {
     fn drop(&mut self) {
+        // End the pass before the encoder it records into goes.
+        self.pass = None;
         // Unsubmitted work is discarded, so nothing recorded will read pooled textures.
         if let Some((_, id)) = self.enc.take()
             && let Ok(mut p) = self.g.pool.lock()
@@ -1554,6 +1590,7 @@ impl<'g> Enc<'g> {
             return;
         }
         let Some(allocation) = image.img.allocation.clone() else { return };
+        self.g.mips.seal(&image.img);
         let Ok(pending) = owner.prepare(Arc::new(image), allocation, GpuStage::Processed, self.g.retained_cap()) else { return };
         if self.resident_pending.try_reserve(1).is_ok() {
             self.resident_pending.push((pending.with_content(key, self.readback.clone()).with_persistence(intent), flight));
@@ -1571,6 +1608,9 @@ impl<'g> Enc<'g> {
             pending: 0,
             submitted: None,
             ring: None,
+            pass: None,
+            reuse: true,
+            mips: Default::default(),
             missing: false,
             #[cfg(feature = "profile")]
             timestamps: None,
@@ -1583,7 +1623,16 @@ impl<'g> Enc<'g> {
         std::mem::take(&mut self.missing)
     }
 
+    /// The command encoder, for anything but a dispatch: ends the open compute pass first, so
+    /// copies, clears and other passes record after the dispatches before them.
     pub(crate) fn encoder(&mut self) -> &mut wgpu::CommandEncoder {
+        self.pass = None;
+        self.open_encoder()
+    }
+
+    /// The command encoder, leaving an open compute pass open (only to start the encoder: it
+    /// must not record into an encoder with a pass open).
+    fn open_encoder(&mut self) -> &mut wgpu::CommandEncoder {
         let g = self.g;
         &mut self
             .enc
@@ -1596,7 +1645,7 @@ impl<'g> Enc<'g> {
 
     /// A new zeroed image (pooled; a reused texture is cleared by a kernel).
     pub fn image(&mut self, w: u32, h: u32) -> GpuImage {
-        self.encoder();
+        self.open_encoder();
         let owner = self.enc.as_ref().map(|(_, id)| *id);
         let (img, reused) = self.g.pooled_for_encoder(w, h, owner);
         if reused {
@@ -1608,7 +1657,7 @@ impl<'g> Enc<'g> {
     /// A new image for a kernel that writes every pixel of it (pooled; contents undefined).
     /// Under test it starts out as NaNs, so a kernel that skips pixels fails the CPU oracle.
     pub fn scratch(&mut self, w: u32, h: u32) -> GpuImage {
-        self.encoder();
+        self.open_encoder();
         let owner = self.enc.as_ref().map(|(_, id)| *id);
         let (img, _) = self.g.pooled_for_encoder(w, h, owner);
         if cfg!(test) {
@@ -1749,9 +1798,8 @@ impl<'g> Enc<'g> {
         let timestamp_writes = batch.as_mut().and_then(|b| b.mark(entry));
         #[cfg(not(feature = "profile"))]
         let timestamp_writes = None;
-        let enc = self.encoder();
         {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(entry), timestamp_writes });
+            let pass = self.compute_pass(entry, timestamp_writes);
             pass.set_pipeline(pipe);
             pass.set_bind_group(0, &bg, &[]);
             if let Some(b) = &bg_ext {
@@ -1759,6 +1807,7 @@ impl<'g> Enc<'g> {
             }
             pass.dispatch_workgroups(groups.0.max(1), groups.1.max(1), 1);
         }
+        self.end_unshared_pass();
         #[cfg(feature = "profile")]
         {
             self.timestamps = batch;
@@ -1779,11 +1828,12 @@ impl<'g> Enc<'g> {
         #[cfg(not(feature = "profile"))]
         let timestamp_writes = None;
         {
-            let mut pass = self.encoder().begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(entry), timestamp_writes });
+            let pass = self.compute_pass(entry, timestamp_writes);
             pass.set_pipeline(pipe);
             pass.set_bind_group(0, bg, &[]);
             pass.dispatch_workgroups(size.0.div_ceil(16), size.1.div_ceil(16), 1);
         }
+        self.end_unshared_pass();
         #[cfg(feature = "profile")]
         {
             self.timestamps = batch;
@@ -1791,6 +1841,33 @@ impl<'g> Enc<'g> {
         self.pending += 1;
         if self.pending >= 256 {
             self.submit();
+        }
+    }
+
+    /// The compute pass to record a dispatch into. Consecutive dispatches share one pass (a pass
+    /// costs a backend encoder: a Metal compute encoder each); WebGPU makes every dispatch in a
+    /// compute pass its own usage scope, so wgpu orders each dispatch after the writes of the ones
+    /// before it, exactly as across passes. Anything else recorded on the encoder ends the pass
+    /// first ([`Enc::encoder`]), so the recorded order is unchanged. A timed dispatch (profiling)
+    /// gets a pass of its own.
+    fn compute_pass(&mut self, entry: &str, timestamp_writes: Option<wgpu::ComputePassTimestampWrites<'_>>) -> &mut wgpu::ComputePass<'static> {
+        let share = self.reuse && timestamp_writes.is_none();
+        let pass = match self.pass.take() {
+            Some((pass, true)) if share => pass,
+            open => {
+                drop(open);
+                let label = if share { "effectcraft" } else { entry };
+                self.open_encoder().begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(label), timestamp_writes }).forget_lifetime()
+            }
+        };
+        &mut self.pass.insert((pass, share)).0
+    }
+
+    /// End a pass no later dispatch may join (a timed one, or without [`Enc::reuse`]) right after
+    /// its dispatch, as before passes were shared.
+    fn end_unshared_pass(&mut self) {
+        if self.pass.as_ref().is_some_and(|(_, shared)| !shared) {
+            self.pass = None;
         }
     }
 
@@ -1845,6 +1922,7 @@ impl<'g> Enc<'g> {
             return;
         }
         let epoch = self.epoch.clone();
+        self.g.mips.seal(&image.img);
         let Ok(pending) = cache.prepare(Arc::new(image), allocation, GpuStage::Blend, self.g.retained_cap()) else { return };
         if self.native_pending.try_reserve(1).is_ok() {
             self.native_pending.push(PendingNative { owner, key, token, metadata, cache: cache.clone(), pending, epoch });
@@ -1886,6 +1964,7 @@ impl<'g> Enc<'g> {
         for entry in self.native_pending.drain(..) {
             self.g.native_keep(entry);
         }
+        crate::mips::publish(self);
     }
     pub(crate) fn upload_buf(&self, buf: &Arc<Buf>) -> Option<GpuImage> {
         self.g.upload_buf_owned(buf, self.owner.as_ref())
@@ -1894,8 +1973,14 @@ impl<'g> Enc<'g> {
         self.g.keep_owned(img, self.owner.as_ref(), &self.epoch)
     }
 
+    /// Whether everything recorded so far has been submitted.
+    pub(crate) fn submitted_all(&self) -> bool {
+        self.enc.is_none()
+    }
+
     /// Submit recorded work.
     pub fn submit(&mut self) {
+        self.pass = None;
         #[allow(unused_mut)]
         if let Some((mut enc, id)) = self.enc.take() {
             #[cfg(feature = "profile")]
