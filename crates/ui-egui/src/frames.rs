@@ -536,7 +536,9 @@ pub(crate) fn display_color_image(width: u32, height: u32, bytes: &[u8]) -> Opti
     let w = usize::try_from(width).ok()?;
     let h = usize::try_from(height).ok()?;
     let count = w.checked_mul(h)?;
-    if w == 0 || h == 0 || count.checked_mul(4)? != bytes.len() {
+    // Bound input-derived allocations even on adapters with unusually large limits.
+    let byte_count = count.checked_mul(4)?;
+    if w == 0 || h == 0 || byte_count > 1024 * 1024 * 1024 || byte_count != bytes.len() {
         return None;
     }
     let mut pixels = Vec::new();
