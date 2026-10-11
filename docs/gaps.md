@@ -156,7 +156,14 @@ The most important missing piece: it turns every other estimate here into a meas
   (AGENTS.md "Never crash").
 - Fuzzing started 10 October: ten cargo-fuzz targets in `fuzz/` (project files, AEP import,
   Lottie, SVG, PSD, PDF / EPS, timelines, expressions, media probing and decoding, engine commands),
-  run with `cargo xtask fuzz` (docs/testing.md "Fuzzing"). Not yet covered: ExtendScript (its file
+  run with `cargo xtask fuzz` (docs/testing.md "Fuzzing"). The first minute per target found
+  four problems: a PDF page tree listing itself hung the import (fixed, visit budget); an SVG with
+  huge coordinates overflowed tiny-skia's fixed-point rasteriser (fixed, far-away paths are
+  clipped first); an FCPXML `file://` URL with a multi-byte character after `file://` panics in
+  FilmCraft's `filmcraft_interchange::common::file_url_to_path` (slices a `str` at byte 9; open,
+  to fix in FilmCraft; the app's last-resort guard turns it into an import error); and boa leaks
+  a little memory per thrown exception in an expression (not ours; `expr_eval` runs without leak
+  detection). Not yet covered: ExtendScript (its file
   and process access needs a sandboxed object model first) and the control channel's line parser.
 - Done when: the gate is green on stable and the fuzzers run regularly without new crashes.
 
