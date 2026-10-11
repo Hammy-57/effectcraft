@@ -103,6 +103,11 @@ pub struct Renderer<'a> {
     /// The size (comp pixels) of the comp whose frame a collapsed precomp's layers are drawn
     /// into; `None` draws into this renderer's own comp (see [`Renderer::raster_scale`]).
     pub(crate) out_comp: Option<(u32, u32)>,
+    /// The Layer panel's zoom (layer pixels → screen pixels): Continuously Rasterize layers
+    /// (vector footage, text, shapes) are drawn at it instead of at their size in the comp, so
+    /// they stay sharp when the panel magnifies them. `None` everywhere else; nested renders
+    /// don't inherit it.
+    pub layer_view: Option<f64>,
 }
 
 /// Time spent on one layer of one frame (milliseconds).
@@ -143,6 +148,7 @@ impl<'a> Renderer<'a> {
             through_lost: false,
             canvas_origin: [0; 2],
             out_comp: None,
+            layer_view: None,
         }
     }
 
@@ -190,6 +196,7 @@ impl<'a> Renderer<'a> {
             through_lost: false,
             canvas_origin: [0; 2],
             out_comp: None,
+            layer_view: None,
             ..*self
         }
     }

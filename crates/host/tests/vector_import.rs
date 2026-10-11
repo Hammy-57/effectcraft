@@ -522,3 +522,94 @@ fn shapes_from_vector_layer_keeps_images_as_footage_layers() {
         assert!((0..3).all(|k| (a[k] - b[k]).abs() < 0.05), "({x}, {y}): {a:?} vs {b:?}");
     }
 }
+
+/// A 24 × 24 pt PDF icon: a white 12 × 12 square in the middle, edges on whole pixels.
+fn icon_pdf() -> Vec<u8> {
+    let content = "1 1 1 rg 6 6 12 12 re f\n";
+    effectcraft_pdf::write::pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".into(), None),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(), None),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 24 24] /Contents 4 0 R >>".into(), None),
+            (4, "<< >>".into(), Some(content.as_bytes().to_vec())),
+        ],
+        1,
+    )
+}
+
+/// Pixels of row `y` caught mid-edge (red neither about 0 nor about 1): about 2 for each sharp
+/// edge, about the scale for each edge of native pixels enlarged.
+fn edge_width(img: &Image, y: i64) -> usize {
+    (0..i64::from(img.width)).filter(|&x| (0.05..0.95).contains(&img.get(x, y)[0])).count()
+}
+
+/// Vector footage with Continuously Rasterize stays sharp at 2000 %, directly and through a
+/// collapsed precomp, and in the Layer panel at its zoom; with the switch off it is its native
+/// pixels enlarged (blurry), as in After Effects. The footage has no codec name, like the Motion
+/// Library's Figma PDFs converted from After Effects projects: it was drawn blurry at any scale.
+#[test]
+fn pdf_footage_continuously_rasterizes_sharp_through_collapsed_precomps() {
+    use effectcraft_engine::render::{EvalCtx, Renderer};
+    use effectcraft_project::ItemKind;
+    let path = tmp("icon.pdf");
+    std::fs::write(&path, icon_pdf()).unwrap();
+    let mut s = effectcraft_host::session();
+    let item = s.execute_checked("file.import", json!({"paths": [path]})).unwrap()["items"][0].as_u64().unwrap();
+    if let Some(ItemKind::Footage(f)) = std::sync::Arc::make_mut(&mut s.project).item_mut(ItemId(item)).map(|i| &mut i.kind) {
+        f.codec.clear();
+    }
+    let t = effectcraft_time::Tick::ZERO;
+    s.execute("comp.new", json!({"name": "Icon", "width": 24, "height": 24, "frameRate": 30, "duration": 1})).unwrap();
+    let icon = s.active_comp_id().unwrap();
+    let inner = s.execute_checked("layer.addItem", json!({"item": item})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("comp.new", json!({"name": "Main", "width": 480, "height": 480, "frameRate": 30, "duration": 1})).unwrap();
+    let main = s.active_comp_id().unwrap();
+    let direct = s.execute_checked("layer.addItem", json!({"item": item})).unwrap()["layer"].as_u64().unwrap();
+    let pre = s.execute_checked("layer.addItem", json!({"item": icon.0})).unwrap()["layer"].as_u64().unwrap();
+    for l in [direct, pre] {
+        s.execute("prop.set", json!({"layer": l, "path": "transform/scale", "value": [2000, 2000]})).unwrap();
+    }
+    let switch = |s: &mut effectcraft_engine::Session, l: u64, on: bool| {
+        s.execute("comp.open", json!({"comp": if l == inner { icon.0 } else { main.0 }})).unwrap();
+        s.execute("layer.setSwitch", json!({"layers": [l], "switch": "collapse", "value": on})).unwrap();
+        s.execute("comp.open", json!({"comp": main.0})).unwrap();
+    };
+    let width = |s: &mut effectcraft_engine::Session, shown: u64| {
+        let hidden = if shown == direct { pre } else { direct };
+        s.execute("layer.setSwitch", json!({"layers": [hidden], "switch": "video", "value": false})).unwrap();
+        s.execute("layer.setSwitch", json!({"layers": [shown], "switch": "video", "value": true})).unwrap();
+        let img = s.render(main, t, RenderOpts::default());
+        assert!(img.get(240, 240)[0] > 0.95, "the square fills the middle");
+        edge_width(&img, 240)
+    };
+    // The footage layer straight in Main.
+    let soft = width(&mut s, direct);
+    switch(&mut s, direct, true);
+    let sharp = width(&mut s, direct);
+    assert!(soft >= 16, "switch off: native pixels enlarged ({soft} px of edge)");
+    assert!(sharp <= 4, "Continuously Rasterize: sharp at 2000 % ({sharp} px of edge)");
+    // Through the precomp: sharp only when both switches are on (AE: the precomp layer's
+    // Collapse Transformations hands its scale down to the vector layer inside).
+    switch(&mut s, inner, true);
+    let collapsed_off = width(&mut s, pre);
+    switch(&mut s, pre, true);
+    let collapsed = width(&mut s, pre);
+    assert!(collapsed_off >= 16, "precomp not collapsed: its 24 × 24 frame enlarged ({collapsed_off})");
+    assert!(collapsed <= 4, "collapsed precomp: the PDF inside drawn at 2000 % ({collapsed})");
+    switch(&mut s, inner, false);
+    let inner_off = width(&mut s, pre);
+    assert!(inner_off >= 16, "inner layer's switch off: native pixels ({inner_off})");
+    // The Layer panel at 16× zoom draws the layer's source at that zoom.
+    switch(&mut s, inner, true);
+    let comp = s.project.comp(icon).unwrap().clone();
+    let layer = comp.layers.iter().find(|l| l.id.0 == inner).unwrap().clone();
+    let ctx = EvalCtx { project: &s.project, comp_id: icon, comp: &comp, time: t, expr: None, footage: None };
+    let mut r = Renderer::new(&s.project, &*s.footage, RenderOpts::default());
+    r.layer_view = Some(16.0);
+    let buf = r.layer_input(&ctx, &layer, 0).unwrap();
+    assert_eq!(buf.scale, 16.0);
+    let y = (buf.offset[1] + 12.0 * buf.scale) as i64;
+    assert!(buf.img.get((buf.offset[0] + 12.0 * buf.scale) as i64, y)[0] > 0.95);
+    let panel = edge_width(&buf.img, y);
+    assert!(panel <= 4, "Layer panel at 16×: sharp ({panel} px of edge)");
+}

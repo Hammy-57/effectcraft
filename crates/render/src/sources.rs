@@ -29,6 +29,8 @@ impl<'a> Renderer<'a> {
     /// the output scale times the layer's on-screen scale (quarter-octave steps, rounded up, so
     /// vector content is drawn at its final size and stays sharp when scaled up). The buffer
     /// stays within about 16 million pixels, or 1.25× the output's pixels for larger outputs.
+    ///
+    /// In the Layer panel ([`Renderer::layer_view`]) the on-screen scale is the panel's zoom.
     pub fn raster_scale(&self, ctx: &EvalCtx, layer: &Layer) -> f64 {
         let s = self.opts.scale;
         let continuous = match layer.source {
@@ -42,13 +44,18 @@ impl<'a> Renderer<'a> {
         if !continuous {
             return s;
         }
-        let (l2c, _) = ctx.layer_to_comp(layer);
-        let m = self.outer.map_or(l2c, |o| o * l2c);
-        let a = layer.transform().map(|tr| ctx.v3(layer, tr, "anchor", [0.0; 3])).unwrap_or([0.0; 3]);
-        let p0 = m.apply(vec2(a[0], a[1]));
-        let px = m.apply(vec2(a[0] + 1.0, a[1]));
-        let py = m.apply(vec2(a[0], a[1] + 1.0));
-        let k = ((px.x - p0.x).hypot(px.y - p0.y)).max((py.x - p0.x).hypot(py.y - p0.y));
+        let (s, k) = match self.layer_view {
+            Some(zoom) => (1.0, zoom),
+            None => {
+                let (l2c, _) = ctx.layer_to_comp(layer);
+                let m = self.outer.map_or(l2c, |o| o * l2c);
+                let a = layer.transform().map(|tr| ctx.v3(layer, tr, "anchor", [0.0; 3])).unwrap_or([0.0; 3]);
+                let p0 = m.apply(vec2(a[0], a[1]));
+                let px = m.apply(vec2(a[0] + 1.0, a[1]));
+                let py = m.apply(vec2(a[0], a[1] + 1.0));
+                (s, ((px.x - p0.x).hypot(px.y - p0.y)).max((py.x - p0.x).hypot(py.y - p0.y)))
+            }
+        };
         if !k.is_finite() || k <= 1e-6 {
             return s;
         }

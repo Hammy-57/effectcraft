@@ -46,6 +46,9 @@ struct Key {
     crop: Option<[u64; 4]>,
     /// The preview size a frame is resampled to (reduced-resolution previews).
     preview: Option<[u32; 2]>,
+    /// Vector footage drawn at this scale (its bits; 0 = decoded at the native size): one entry
+    /// per Continuously Rasterize scale step.
+    raster: u64,
 }
 
 /// A layer drawn at reduced resolution: its nominal size `w`×`h` at render scale `s` (< 0.75).
@@ -235,7 +238,7 @@ const STALL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Whether `a` and `b` key frames of the same stream (all but the frame index match).
 fn same_stream(a: &Key, b: &Key) -> bool {
-    a.path == b.path && a.interp == b.interp && a.matte == b.matte && a.crop == b.crop && a.preview == b.preview
+    a.path == b.path && a.interp == b.interp && a.matte == b.matte && a.crop == b.crop && a.preview == b.preview && a.raster == b.raster
 }
 
 /// A movie/audio source by path, opened by the first caller while the others wait for it
@@ -844,7 +847,7 @@ impl Inner {
         let interp = alpha | (u8::from(footage.preserve_rgb) << 2);
         let matte = if footage.alpha == AlphaMode::Premultiplied { footage.premul_color.map(f32::to_bits) } else { [0; 3] };
         let crop = footage.layer.as_ref().and_then(|l| l.crop_bounds).map(|b| b.map(f64::to_bits));
-        let key = |path: &str, frame| Key { path: path.into(), frame, interp, matte, crop, preview: None };
+        let key = |path: &str, frame| Key { path: path.into(), frame, interp, matte, crop, preview: None, raster: 0 };
         match footage.kind {
             FootageKind::Sequence if !footage.sequence.is_empty() => {
                 let i = Self::frame_index(footage.frame_rate, t, footage.sequence_frames(), footage.loop_count);
@@ -1240,8 +1243,21 @@ impl FootageSource for MediaPool {
         if footage.missing || !effectcraft_render::is_vector_footage(footage) {
             return None;
         }
+        if !(scale.is_finite() && scale > 0.0) {
+            return None;
+        }
+        // Cached per scale (the renderer asks in quarter-octave steps), with the decoded frames:
+        // the same budget, and `forget` drops them when the file changes.
+        let key = Key { raster: scale.to_bits(), ..Inner::locate(footage, Tick::ZERO).key };
+        if let Some(px) = lock(&self.inner.cache).lru.get(&key) {
+            self.inner.hits.fetch_add(1, Ordering::Relaxed);
+            return Some(px.image());
+        }
+        self.inner.misses.fetch_add(1, Ordering::Relaxed);
         let bytes = self.inner.read(&footage.path).ok()?;
-        crate::layered::rasterize_vector(&footage.path, &bytes, footage.layer.as_ref(), footage.page, scale).map(Arc::new)
+        let img = Arc::new(crate::layered::rasterize_vector(&footage.path, &bytes, footage.layer.as_ref(), footage.page, scale)?);
+        lock(&self.inner.cache).lru.insert(key, Pixels::Float(img.clone()), self.inner.budget());
+        Some(img)
     }
 
     fn aux(&self, _item: ItemId, footage: &Footage, t: Tick) -> Option<Arc<effectcraft_raster::AuxChannels>> {
@@ -1514,7 +1530,7 @@ mod tests {
     fn lru_respects_budget() {
         let mut c = Lru::default();
         let img = || Pixels::Float(Arc::new(Image::new(16, 16))); // 4 KiB + overhead
-        let k = |i| Key { path: "a".into(), frame: i, interp: 0, matte: [0; 3], crop: None, preview: None };
+        let k = |i| Key { path: "a".into(), frame: i, interp: 0, matte: [0; 3], crop: None, preview: None, raster: 0 };
         let budget = 3 * (4096 + 64);
         for i in 0..10 {
             c.insert(k(i), img(), budget);

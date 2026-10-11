@@ -30,11 +30,11 @@ struct Drag {
     started: f64,
 }
 
-/// Cached texture of the rendered layer: (revision, layer, time, view, scale) → texture and the
+/// Cached texture of the rendered layer: (revision, layer, time, view, scale, zoom) → texture and the
 /// layer-space rectangle it covers.
 #[derive(Clone)]
 struct Tex {
-    key: (u64, u64, i64, usize, u32),
+    key: (u64, u64, i64, usize, u32, u64),
     tex: egui::TextureHandle,
     /// Layer-space rect of the image `[x0, y0, x1, y1]`.
     rect: [f64; 4],
@@ -134,7 +134,10 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     } else {
         0.25
     };
-    let key = (app.session.revision, layer.id.0, time.0, view, (scale * 1000.0) as u32);
+    // Continuously Rasterize layers (vector footage, text, shapes) are drawn at the panel's own
+    // zoom, in quarter-octave steps, so a magnified PDF or SVG stays sharp, as in After Effects.
+    let layer_zoom = 2f64.powf(((zoom * ppp).max(1e-6).log2() * 4.0).ceil() / 4.0);
+    let key = (app.session.revision, layer.id.0, time.0, view, (scale * 1000.0) as u32, (layer_zoom * 1000.0) as u64);
     let cached: Option<Tex> = ctx.data(|d| d.get_temp(tex_id()));
     let tex = match cached {
         Some(c) if c.key == key => Some(c),
@@ -143,6 +146,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             let mut r = Renderer::new(&app.session.project, &*app.session.footage, RenderOpts { scale, ..Default::default() });
             r.expr = app.session.expr.as_deref();
             r.cache = Some(&app.session.layer_cache);
+            r.layer_view = Some(layer_zoom);
             r.layer_input(&ectx, &layer, view).map(|buf| {
                 let img = crate::frames::to_color_image(&buf.img);
                 let x0 = -buf.offset[0] / buf.scale;

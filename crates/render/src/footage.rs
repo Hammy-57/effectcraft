@@ -191,9 +191,19 @@ pub trait FootageSource: Send + Sync {
     }
 }
 
-/// Footage that can be rasterised at any scale (SVG).
+/// Footage that can be rasterised at any scale (SVG, PDF, AI, EPS). Footage without a codec name
+/// (converted from an After Effects project, never probed) is judged by its file extension: the
+/// Motion Library's Figma PDFs came in that way and were drawn at their native size, blurry at
+/// any Continuously Rasterize scale.
 pub fn is_vector_footage(f: &Footage) -> bool {
-    matches!(f.codec.as_str(), "SVG" | "PDF" | "AI" | "EPS")
+    match f.codec.as_str() {
+        "SVG" | "PDF" | "AI" | "EPS" => true,
+        "" => std::path::Path::new(&f.path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| ["svg", "pdf", "ai", "eps"].iter().any(|v| e.eq_ignore_ascii_case(v))),
+        _ => false,
+    }
 }
 
 /// No footage available (renders footage layers as transparent).

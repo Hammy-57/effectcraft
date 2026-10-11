@@ -64,7 +64,10 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         let ppp = ctx.pixels_per_point();
         let fs = ((fit.x / f.width.max(1) as f32).min(fit.y / f.height.max(1) as f32) * ppp).max(1e-6);
         let k = ((1.0 / fs).floor() as usize).max(1);
-        let key = FrameKey { item: view.item.0, frame, footage: footage_fingerprint(&ctx, &project, view.item.0, f), k };
+        // Magnified vector footage (SVG, PDF, AI, EPS) is drawn at the panel's size, in
+        // quarter-octave steps, so it stays sharp instead of showing its native pixels enlarged.
+        let raster = if fs > 1.0 && effectcraft_engine::render::is_vector_footage(f) { (f64::from(fs).log2() * 4.0).ceil().clamp(0.0, 24.0) as u32 } else { 0 };
+        let key = FrameKey { item: view.item.0, frame, footage: footage_fingerprint(&ctx, &project, view.item.0, f), k, raster };
         let tex = frame_texture(app, &ctx, key, view.time);
         if let Some((tex, [w, h])) = tex {
             let s = (fit.x / w as f32).min(fit.y / h as f32).max(0.01);
@@ -158,13 +161,15 @@ fn fitted_area(area: Rect) -> egui::Vec2 {
 }
 
 /// What the panel's texture shows: an item's frame, decoded from the footage as interpreted
-/// (`footage`, a fingerprint), averaged down by `k`.
+/// (`footage`, a fingerprint), averaged down by `k`, or vector footage drawn at 2^(`raster`/4)
+/// its size (`raster` > 0).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct FrameKey {
     item: u64,
     frame: i64,
     footage: u64,
     k: usize,
+    raster: u32,
 }
 
 /// A frame's pixels, averaged down, and its size in the file (`None`: not decodable).
@@ -205,6 +210,12 @@ fn footage_fingerprint(ctx: &egui::Context, project: &Arc<effectcraft_engine::pr
 
 /// Decode frame `key` of footage `f` at `time` and average it down by `key.k`.
 fn decode_frame(source: &dyn FootageSource, item: ItemId, f: &Footage, time: Tick, key: FrameKey) -> FramePixels {
+    if key.raster > 0
+        && let Some(img) = source.vector_frame(item, f, 2f64.powf(f64::from(key.raster) / 4.0))
+    {
+        let ci = egui::ColorImage::from_rgba_unmultiplied([img.width as usize, img.height as usize], &img.to_rgba8());
+        return Some((ci, [f.width.max(1), f.height.max(1)]));
+    }
     let img = source.frame(item, f, time)?;
     let ci = egui::ColorImage::from_rgba_unmultiplied([img.width as usize, img.height as usize], &img.to_rgba8());
     Some((crate::frames::fit_texture_by(ci, usize::MAX, key.k), [img.width, img.height]))
