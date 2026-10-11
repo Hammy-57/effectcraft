@@ -125,6 +125,11 @@ pub trait FxTarget {
     fn gpu(&mut self, steps: &[FxStep]) -> bool;
     /// Run one CPU effect: `f` maps the buffer.
     fn cpu(&mut self, f: &mut dyn FnMut(Buf) -> Buf);
+    /// Extend the text effect canvas without resampling existing pixels. Backends may
+    /// retain their resident image; the default preserves the CPU reference behavior.
+    fn effect_canvas(&mut self, size: [f64; 2]) {
+        self.cpu(&mut |buf| crate::fx::text_effect_canvas(buf, size));
+    }
     /// Move the buffer's effect coordinates: subtract `d` (buffer px) from its offset.
     fn shift(&mut self, d: [f64; 2]);
 }
