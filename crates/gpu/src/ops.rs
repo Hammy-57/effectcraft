@@ -72,14 +72,9 @@ pub fn warp_q(
     let mut img = src.clone();
     let mut inv = inv0;
     if scale < 0.5 && m.is_affine() {
-        let mut s = scale * 2.0;
-        let mut f = 0.5;
-        img = half(e, src);
-        while s < 0.5 && img.width > 1 && img.height > 1 {
-            img = half(e, &img);
-            f *= 0.5;
-            s *= 2.0;
-        }
+        // Halved until the remaining scale is ≥ ½; a retained image keeps its levels (`mips`).
+        let (level, f) = crate::mips::minify(e, src, scale);
+        img = level;
         inv = Mat3::scale(vec2(f, f)) * inv;
     }
     let bounds = m.map_rect(&Rect::from_size(src.width as f64, src.height as f64)).inflate(1.0).round_out();
