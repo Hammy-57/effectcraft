@@ -216,6 +216,67 @@ pub(crate) fn pack_dynamic(img: image::DynamicImage, op: AlphaOp) -> std::result
     }
 }
 
+/// A FilmCraft frame for a render that shows it at `w` × `h`, at most half its size each way:
+/// what `resample(&frame_to_image(f, op), w, h)` makes, converting a quarter of the pixels.
+/// Opaque 4:2:0 Y'CbCr is box-filtered to half size before conversion (each 2×2 block of luma,
+/// and the [1 6 1]/8 neighbourhood of its chroma sample: the mean of the upsampled chroma its
+/// pixels get), then resampled the rest of the way. Conversion is linear until it clips, so
+/// this is the RGB box filter `resample` starts with, except in blocks where some colours clip.
+/// `None` for other frames.
+pub(crate) fn frame_to_image_scaled(f: &VideoFrame, w: u32, h: u32) -> Option<Image> {
+    let (fw, fh) = (f.width as usize, f.height as usize);
+    if w == 0 || h == 0 || fw % 2 != 0 || fh % 2 != 0 || (w as usize).saturating_mul(2) > fw || (h as usize).saturating_mul(2) > fh {
+        return None;
+    }
+    let half = match &f.data {
+        PixelData::Yuv8 { planes, chroma: Chroma::C420, alpha: None } => {
+            half_420(fw, fh, [&planes[0][..], &planes[1][..], &planes[2][..]], &Yuv::new(f.color.matrix, f.color.range, 8))?
+        }
+        PixelData::Yuv16 { planes, chroma: Chroma::C420, bits, alpha: None } => {
+            half_420(fw, fh, [&planes[0][..], &planes[1][..], &planes[2][..]], &Yuv::new(f.color.matrix, f.color.range, *bits))?
+        }
+        _ => return None,
+    };
+    Some(if (half.width, half.height) == (w, h) { half } else { effectcraft_raster::resample(&half, w, h) })
+}
+
+/// An opaque 4:2:0 frame of even size `w` × `h` converted at half that size (see
+/// [`frame_to_image_scaled`]); `None` when the planes are too short.
+fn half_420<T: Sample>(w: usize, h: usize, [luma, cb, cr]: [&[T]; 3], k: &Yuv) -> Option<Image> {
+    /// Row `r` of a plane `n` samples wide (empty past its end).
+    fn row_of<T>(p: &[T], r: usize, n: usize) -> &[T] {
+        p.get(r.saturating_mul(n)..(r + 1).saturating_mul(n)).unwrap_or_default()
+    }
+    let (cw, ch) = (w / 2, h / 2);
+    if luma.len() < w.checked_mul(h)? || cb.len() < cw * ch || cr.len() < cw * ch {
+        return None;
+    }
+    let mut img = Image::new(cw as u32, ch as u32);
+    img.data.par_chunks_mut(cw).enumerate().for_each_init(
+        // Chroma rows with their edge samples repeated on both ends, for the horizontal [1 6 1].
+        || (vec![0f32; cw + 2], vec![0f32; cw + 2]),
+        |(uc, vc), (cy, row)| {
+            // The chroma rows above and below weigh 1/8, as `centred` upsampling averages out.
+            let rows = [cy.saturating_sub(1), cy, (cy + 1).min(ch - 1)];
+            for (dst, plane) in [(&mut *uc, cb), (&mut *vc, cr)] {
+                let [above, at, below] = rows.map(|r| row_of(plane, r, cw));
+                for (d, ((a, b), c)) in dst[1..=cw].iter_mut().zip(above.iter().zip(at).zip(below)) {
+                    *d = ((a.f() + c.f()) * 0.125 + b.f() * 0.75 - k.c_off) * k.c_scale;
+                }
+                (dst[0], dst[cw + 1]) = (dst[1], dst[cw]);
+            }
+            let (top, bottom) = (row_of(luma, 2 * cy, w), row_of(luma, 2 * cy + 1, w));
+            let pixels = top.as_chunks::<2>().0.iter().zip(bottom.as_chunks::<2>().0.iter()).zip(uc.windows(3).zip(vc.windows(3)));
+            for (o, ((a, b), (u, v))) in row.iter_mut().zip(pixels) {
+                let (u, v) = ((u[0] + u[2]) * 0.125 + u[1] * 0.75, (v[0] + v[2]) * 0.125 + v[1] * 0.75);
+                let yy = ((a[0].f() + a[1].f() + b[0].f() + b[1].f()) * 0.25 - k.y_off) * k.y_scale;
+                *o = [(yy + k.cr_r * v).clamp(0.0, 1.0), (yy - k.cr_g * v - k.cb_g * u).clamp(0.0, 1.0), (yy + k.cb_b * u).clamp(0.0, 1.0), 1.0];
+            }
+        },
+    );
+    Some(img)
+}
+
 /// 0..255 → 0..1.
 static U8: [f32; 256] = {
     let mut t = [0f32; 256];
@@ -452,6 +513,47 @@ mod tests {
         assert!(img.data.iter().all(|p| (p[0] - 1.0).abs() < 1e-5 && (p[1] - 1.0).abs() < 1e-5 && p[3] == 1.0));
         let img = frame_to_image(&yuv_frame(126, 128, 128, filmcraft_color::ColorInfo::REC709), op);
         assert!((img.data[0][0] - 110.0 / 219.0).abs() < 1e-5);
+    }
+
+    /// A smooth opaque 4:2:0 frame whose colours never clip.
+    fn smooth_420(w: usize, h: usize) -> VideoFrame {
+        let plane = |w: usize, h: usize, base: f32, amp: f32, fx: f32, fy: f32| -> Arc<Vec<u8>> {
+            Arc::new((0..w * h).map(|i| (base + amp * ((i % w) as f32 * fx + (i / w) as f32 * fy).sin()) as u8).collect())
+        };
+        VideoFrame {
+            width: w as u32,
+            height: h as u32,
+            data: PixelData::Yuv8 {
+                planes: [plane(w, h, 125.0, 45.0, 0.31, 0.17), plane(w / 2, h / 2, 128.0, 10.0, 0.4, -0.3), plane(w / 2, h / 2, 128.0, 10.0, -0.2, 0.5)],
+                chroma: Chroma::C420,
+                alpha: None,
+            },
+            color: filmcraft_color::ColorInfo::REC709,
+            par: (1, 1),
+            pts: filmcraft_time::Tick::ZERO,
+        }
+    }
+
+    #[test]
+    fn scaled_conversion_matches_resampling_the_converted_frame() {
+        let f = smooth_420(96, 64);
+        let full = frame_to_image(&f, AlphaOp::new(AlphaMode::Straight, [0.0; 3]));
+        for (w, h) in [(48, 32), (32, 21), (24, 16), (13, 9)] {
+            let scaled = frame_to_image_scaled(&f, w, h).expect("4:2:0, at most half size");
+            let want = effectcraft_raster::resample(&full, w, h);
+            assert_eq!((scaled.width, scaled.height), (w, h));
+            let worst = scaled.data.iter().zip(&want.data).flat_map(|(a, b)| (0..4).map(move |c| (a[c] - b[c]).abs())).fold(0.0f32, f32::max);
+            assert!(worst < 1e-5, "{w}×{h}: {worst}");
+        }
+        // More than half the size, odd sizes, other chroma layouts: convert the full frame.
+        assert!(frame_to_image_scaled(&f, 49, 32).is_none());
+        assert!(frame_to_image_scaled(&smooth_420(95, 64), 40, 30).is_none());
+        assert!(frame_to_image_scaled(&yuv_frame(100, 128, 128, filmcraft_color::ColorInfo::REC709), 2, 1).is_some());
+        let mut f444 = smooth_420(96, 64);
+        if let PixelData::Yuv8 { chroma, .. } = &mut f444.data {
+            *chroma = Chroma::C444;
+        }
+        assert!(frame_to_image_scaled(&f444, 48, 32).is_none());
     }
 
     #[test]
@@ -745,6 +847,11 @@ mod tests {
                 keep.push(frame_to_image(&f, op));
             }
             eprintln!("convert into fresh memory {:?}", t.elapsed() / 20);
+            let t = std::time::Instant::now();
+            for _ in 0..20 {
+                std::hint::black_box(frame_to_image_scaled(&f, 640, 360));
+            }
+            eprintln!("convert at a third {:?}", t.elapsed() / 20);
         }
     }
 }

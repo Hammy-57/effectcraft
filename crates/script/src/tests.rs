@@ -362,6 +362,47 @@ fn security_gate_for_files() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// #590: a script can't give itself file and network access (or turn off the warning before
+/// executing files) by changing Settings ▸ Scripting & Expressions; the user still can.
+#[test]
+fn scripts_cant_change_what_scripts_may_do() {
+    let mut s = session();
+    let attempts = [
+        "app.run('prefs.set', {key: 'scripting.allowScriptsWriteFiles', value: true})",
+        "app.run('prefs.set', {values: {'scripting.warnExecutingFiles': false}})",
+        "app.run('prefs.set', {key: 'scripting', value: {allowScriptsWriteFiles: true}})",
+        "app.run('engine.batch', {steps: [{command: 'prefs.set', params: {key: 'scripting.enableJsDebugger', value: true}}]})",
+    ];
+    for code in attempts {
+        let o = run_code(&mut s, code, "grant.jsx");
+        let e = o.error.unwrap_or_else(|| panic!("`{code}` was allowed"));
+        assert!(e.message.contains("Scripts can't change what scripts are allowed to do"), "{code}: {e:?}");
+        let sc = &s.prefs.scripting;
+        assert!(!sc.allow_scripts_write_files && sc.warn_executing_files && !sc.enable_js_debugger, "{code}");
+    }
+    assert!(run_code(&mut s, "new Socket()", "net.jsx").error.is_some());
+    // Other settings, and the expression editor's, are still the script's to change.
+    ok(&mut s, "app.run('prefs.set', {values: {'general.undoLevels': 40, 'scripting.editorFontSize': 16}})");
+    assert_eq!((s.prefs.general.undo_levels, s.prefs.scripting.editor_font_size), (40, 16));
+    // The user grants access; a script's Reset Settings doesn't take it back or change it.
+    s.execute("prefs.set", json!({"key": "scripting.allowScriptsWriteFiles", "value": true})).unwrap();
+    ok(&mut s, "app.run('prefs.reset', {})");
+    assert!(s.prefs.scripting.allow_scripts_write_files);
+    assert_eq!(s.prefs.general.undo_levels, effectcraft_engine::prefs::Prefs::default().general.undo_levels);
+    // A command script file is a script too.
+    let dir = std::env::temp_dir().join(format!("ec-script-grant-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("grant.json");
+    std::fs::write(&f, r#"[{"command": "prefs.set", "params": {"key": "scripting.allowScriptsWriteFiles", "value": false}}]"#).unwrap();
+    let e = s.execute("file.runScript", json!({"path": f.to_string_lossy()})).unwrap_err().to_string();
+    assert!(e.contains("Scripts can't change"), "{e}");
+    assert!(s.prefs.scripting.allow_scripts_write_files);
+    // The user (UI, CLI, control channel) can take it back.
+    s.execute("prefs.set", json!({"key": "scripting.allowScriptsWriteFiles", "value": false})).unwrap();
+    assert!(!s.prefs.scripting.allow_scripts_write_files);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn engine_entry_points() {
     let mut s = session();
@@ -630,4 +671,169 @@ fn ae_compat_substr_repeater_gradient_and_dash_match_names() {
     let v = |m: &str| dashes.get(m).map(|p| p.value.clone());
     assert_eq!((v("dash"), v("gap"), v("dash2"), v("offset")), (Some(KV::Scalar(12.0)), Some(KV::Scalar(6.0)), Some(KV::Scalar(3.0)), Some(KV::Scalar(5.0))));
     assert!(dashes.get("dash3").is_none(), "only the pairs asked for");
+}
+
+#[test]
+fn text_document_baseline_flags_reflect_pending_edits_and_applied_value() {
+    let mut s = session();
+    let o = ok(
+        &mut s,
+        r#"
+        var comp = app.project.items.addComp("Baseline", 64, 64, 1, 1, 24);
+        var src = comp.layers.addText("AB").text.sourceText;
+        var doc = src.value;
+        doc.superscript = true;
+        var pendingSuper = [doc.superscript, doc.subscript];
+        doc.text = doc.superscript ? "super" : "normal";
+        src.setValue(doc);
+        var appliedSuper = [src.value.text, src.value.superscript, src.value.subscript];
+        doc = src.value;
+        doc.subscript = true;
+        var pendingSub = [doc.superscript, doc.subscript];
+        src.setValue(doc);
+        var appliedSub = [src.value.superscript, src.value.subscript];
+        doc = src.value;
+        doc.subscript = false;
+        var cleared = [doc.superscript, doc.subscript];
+        src.setValue(doc);
+        var appliedClear = [src.value.superscript, src.value.subscript];
+        doc = src.value;
+        doc.superscript = true;
+        doc.superscript = false;
+        var repeatClear = [doc.superscript, doc.subscript];
+        [pendingSuper, appliedSuper, pendingSub, appliedSub, cleared, appliedClear, repeatClear];
+        "#,
+    );
+    assert_eq!(o.result, json!([[true, false], ["super", true, false], [false, true], [false, true], [false, false], [false, false], [false, false]]));
+}
+
+#[test]
+fn setting_item_selected_false_preserves_other_project_items() {
+    let mut s = session();
+    let o = ok(
+        &mut s,
+        r#"
+        var target = app.project.items.addFolder("Target");
+        var keep = app.project.items.addFolder("Keep");
+        app.run("project.select", {items: []});
+        keep.selected = true;
+        target.selected = true;
+        var states = [[target.selected, keep.selected]];
+        target.selected = false;
+        states.push([target.selected, keep.selected]);
+        target.selected = false; // idempotent: never remove Keep
+        states.push([target.selected, keep.selected]);
+        target.selected = true;
+        states.push([target.selected, keep.selected]);
+        app.project.selection.map(function (item) { return item.name; }).join(",")
+          + "|" + JSON.stringify(states);
+        "#,
+    );
+    assert_eq!(o.result, json!("Keep,Target|[[true,true],[false,true],[false,true],[true,true]]"));
+}
+
+#[test]
+fn add_solid_keeps_the_requested_pixel_aspect() {
+    let mut s = session();
+    let o = ok(
+        &mut s,
+        r#"
+        var c = app.project.items.addComp("PA", 64, 32, 1, 1, 10);
+        var square = c.layers.addSolid([1, 0, 0], "Square", 16, 16, 1);
+        var wide = c.layers.addSolid([0, 1, 0], "Wide", 16, 16, 2);
+        var inherited = c.layers.addSolid([0, 0, 1], "Inherited", 16, 16);
+        [c.pixelAspect, square.source.pixelAspect, wide.source.pixelAspect, inherited.source.pixelAspect,
+         wide.source.width, wide.source.height]
+        "#,
+    );
+    assert_eq!(o.result, json!([1, 1, 2, 1, 16, 16]));
+    let bad = run_code(&mut s, r#"app.project.items.addComp("Q", 8, 8, 1, 1, 10).layers.addSolid([1, 1, 1], "Bad", 8, 8, 0)"#, "bad.jsx");
+    assert!(bad.error.is_some_and(|e| e.message.contains("pixelAspect")));
+}
+
+#[test]
+fn property_selected_false_preserves_other_property_and_key_selections() {
+    let mut s = session();
+    let out = ok(
+        &mut s,
+        r#"
+        var c = app.project.items.addComp("Selection", 64, 64, 1, 1, 10);
+        c.openInViewer();
+        var layer = c.layers.addSolid([1, 0, 0], "Layer", 8, 8, 1);
+        var opacity = layer.transform.opacity;
+        var rotation = layer.transform.rotation;
+        rotation.setValueAtTime(0, 0);
+        rotation.setValueAtTime(0.5, 45);
+        app.run("edit.deselectAll", {});
+        rotation.selected = true;
+        opacity.selected = true;
+        var states = [[opacity.selected, rotation.selected]];
+        opacity.selected = false;
+        states.push([opacity.selected, rotation.selected]);
+        opacity.selected = false;
+        states.push([opacity.selected, rotation.selected]);
+        opacity.selected = true;
+        states.push([opacity.selected, rotation.selected]);
+        [states, rotation.selectedKeys.length, c.selectedProperties.length];
+        "#,
+    );
+    assert_eq!(out.result, json!([[[true, true], [false, true], [false, true], [true, true]], 2, 2]));
+}
+
+#[test]
+fn group_selected_false_deselects_masks_and_effects() {
+    let mut s = session();
+    let out = ok(
+        &mut s,
+        r#"
+        var c = app.project.items.addComp("Groups", 64, 64, 1, 1, 10);
+        c.openInViewer();
+        var l = c.layers.addSolid([1, 0, 0], "Layer", 64, 64, 1);
+        var m = l.property("ADBE Mask Parade").addProperty("ADBE Mask Atom");
+        var fx = l.property("ADBE Effect Parade").addProperty("Gaussian Blur");
+        app.run("edit.deselectAll", {});
+        m.selected = true;
+        fx.selected = true;
+        var states = [[m.selected, fx.selected]];
+        m.selected = false;
+        states.push([m.selected, fx.selected]);
+        fx.selected = false;
+        states.push([m.selected, fx.selected]);
+        states;
+        "#,
+    );
+    assert_eq!(out.result, json!([[true, true], [false, true], [false, false]]));
+}
+
+/// Probes every file as a 64x32 still (the media layer's single-file probe).
+struct Stills;
+impl effectcraft_engine::Importer for Stills {
+    fn probe(&self, path: &str) -> Result<effectcraft_engine::project::Footage, String> {
+        use effectcraft_engine::project::{Footage, FootageKind};
+        Ok(Footage { path: path.into(), kind: FootageKind::Still, width: 64, height: 32, has_video: true, codec: "PNG".into(), ..Default::default() })
+    }
+}
+
+/// `importFile(new ImportOptions(file))` imports just the picked file unless `sequence` is set (#475).
+#[test]
+fn import_options_sequence_picks_one_still_or_the_run() {
+    use effectcraft_engine::project::{FootageKind, ItemKind};
+    let dir = std::env::temp_dir().join(format!("ec-script-seq-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for n in ["shot_0001.png", "shot_0002.png", "shot_0003.png"] {
+        std::fs::write(dir.join(n), b"").unwrap();
+    }
+    let pick = dir.join("shot_0002.png").to_string_lossy().replace('\\', "/");
+    let mut s = session();
+    s.importer = Some(Arc::new(Stills));
+    let kind_of = |s: &Session, name: &str| {
+        let it = s.project.items.values().find(|i| i.name == name).unwrap_or_else(|| panic!("no item {name}"));
+        let ItemKind::Footage(f) = &it.kind else { panic!("footage") };
+        f.kind
+    };
+    ok(&mut s, &format!("var io = new ImportOptions(new File('{pick}')); app.project.importFile(io);"));
+    assert_eq!(kind_of(&s, "shot_0002.png"), FootageKind::Still);
+    ok(&mut s, &format!("var io = new ImportOptions(new File('{pick}')); io.sequence = true; app.project.importFile(io);"));
+    assert_eq!(kind_of(&s, "shot_[0001-0003].png"), FootageKind::Sequence);
+    let _ = std::fs::remove_dir_all(&dir);
 }

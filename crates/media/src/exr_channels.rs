@@ -18,12 +18,35 @@ fn is_depth(name: &str) -> bool {
     last.eq_ignore_ascii_case("z") || name.to_ascii_lowercase().contains("depth")
 }
 
+/// Full plane name of a channel in a part: `part.channel`, except that Blender 5 writes one part
+/// per pass whose channels already carry the full name (part `ViewLayer.Depth` holds
+/// `ViewLayer.Depth.Z`), which is kept as is instead of doubling the prefix.
+fn channel_name(part: Option<&str>, channel: &str) -> String {
+    match part {
+        Some(p) if channel.strip_prefix(p).is_some_and(|rest| rest.starts_with('.')) => channel.to_string(),
+        Some(p) => format!("{p}.{channel}"),
+        None => channel.to_string(),
+    }
+}
+
 /// Parse a Cryptomatte manifest (`{"name": "hexhash", …}`).
 pub fn parse_manifest(json: &str) -> Vec<(String, u32)> {
     let Ok(serde_json::Value::Object(m)) = serde_json::from_str::<serde_json::Value>(json) else { return vec![] };
     let mut v: Vec<(String, u32)> = m.iter().filter_map(|(k, h)| Some((k.clone(), u32::from_str_radix(h.as_str()?.trim(), 16).ok()?))).collect();
     v.sort();
     v
+}
+
+/// Why an OpenEXR file's pixels can't be decoded when its headers name a compression this build
+/// can't decompress (HTJ2K, OpenEXR 3.4's High-Throughput JPEG 2000): the decoders only said
+/// "no non-deep rgb channels" or showed a transparent frame (#482). `None` for other files.
+pub fn unsupported_compression(bytes: &[u8]) -> Option<&'static str> {
+    use exr::compression::Compression;
+    let meta = exr::meta::MetaData::read_from_buffered(std::io::Cursor::new(bytes), false).ok()?;
+    meta.headers
+        .iter()
+        .any(|h| matches!(h.compression, Compression::HTJ2K32 | Compression::HTJ2K256))
+        .then_some("OpenEXR HTJ2K compression isn't supported yet: re-save the file with ZIP, PIZ or DWAA compression")
 }
 
 /// Read all channels of an EXR file's bytes. `None` when it is not a readable EXR.
@@ -59,10 +82,7 @@ pub fn read_exr_channels(bytes: &[u8]) -> Option<AuxChannels> {
         let pos = layer.attributes.layer_position;
         let (ox, oy) = (pos.0 as i64 - dw.position.0 as i64, pos.1 as i64 - dw.position.1 as i64);
         for ch in layer.channel_data.list.iter() {
-            let name = match &prefix {
-                Some(p) => format!("{p}.{}", ch.name),
-                None => ch.name.to_string(),
-            };
+            let name = channel_name(prefix.as_deref(), &ch.name.to_string());
             let fill = if is_depth(&name) { BACKGROUND_DEPTH } else { 0.0 };
             let mut plane = vec![fill; w * h];
             let vals: Vec<f32> = ch.sample_data.values_as_f32().collect();
@@ -141,9 +161,20 @@ fn picture_layer<'a>(aux: &AuxChannels, layers: &[&'a str]) -> Option<&'a str> {
 /// that is not a data pass (never Cryptomatte, depth or normals, #412), else the first channel
 /// as grey. Linear, straight RGBA as the file stores it. `None` when it is not a readable EXR.
 pub fn layered_image(bytes: &[u8]) -> Option<image::DynamicImage> {
-    let aux = read_exr_channels(bytes)?;
+    picture_of(&read_exr_channels(bytes)?)
+}
+
+/// [`layered_image`] of the EXR at `path` from the channel cache, so the picture and EXtractoR /
+/// Cryptomatte share one decode of the file (#474).
+pub(crate) fn cached_layered_image(path: &str, bytes: Arc<[u8]>) -> Option<image::DynamicImage> {
+    let aux = cached(path, || Some(bytes))?;
+    picture_of(&aux)
+}
+
+/// The picture of decoded channels (see [`layered_image`]).
+fn picture_of(aux: &AuxChannels) -> Option<image::DynamicImage> {
     let layers = aux.layers();
-    let colour = picture_layer(&aux, &layers)?;
+    let colour = picture_layer(aux, &layers)?;
     let names = aux.layer_rgba(colour);
     // A layer without R, G and B channels shows its first channel as grey.
     let first = aux.names().into_iter().find(|n| split_channel(n).0 == colour).unwrap_or_default();
@@ -166,10 +197,21 @@ pub fn layered_image(bytes: &[u8]) -> Option<image::DynamicImage> {
 
 type Cache = Mutex<Vec<(String, Option<Arc<AuxChannels>>)>>;
 
+fn cache() -> &'static Cache {
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Drop the cached channels of `path` (the file changed on disk).
+pub(crate) fn forget(path: &str) {
+    if let Ok(mut c) = cache().lock() {
+        c.retain(|(p, _)| p != path);
+    }
+}
+
 /// Read (and cache, a few files) the channels of the EXR at `path` via `read`.
 pub(crate) fn cached(path: &str, read: impl FnOnce() -> Option<Arc<[u8]>>) -> Option<Arc<AuxChannels>> {
-    static CACHE: OnceLock<Cache> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    let cache = cache();
     if let Some(v) = cache.lock().ok().and_then(|c| c.iter().find(|(p, _)| p == path).map(|(_, v)| v.clone())) {
         return v;
     }
@@ -223,6 +265,27 @@ mod tests {
     /// #295: a multi-layer EXR whose colour is only in named layers (`diffuse.R`, as Blender and
     /// Nuke write them) failed to import ("does not contain non-deep rgb channels"); it now
     /// shows its colour layer and keeps every channel for EXtractoR.
+    /// #474: the picture and EXtractoR / Cryptomatte share one decode of a multi-layer file:
+    /// after the frame is decoded, the aux channels come from the cache without reading the file.
+    #[test]
+    fn picture_and_aux_channels_share_one_decode() {
+        use exr::prelude::*;
+        let (w, h) = (2usize, 2usize);
+        let ch = |n: &str, v: f32| AnyChannel::new(n, FlatSamples::F32(vec![v; w * h]));
+        let channels = AnyChannels::sort(vec![ch("Image.R", 0.5), ch("Image.G", 0.5), ch("Image.B", 0.5), ch("GlossDir.R", 0.25)].into());
+        let image = Image::from_layer(Layer::new((w, h), LayerAttributes::default(), Encoding::FAST_LOSSLESS, channels));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image.write().to_buffered(&mut bytes).unwrap();
+        let b: Arc<[u8]> = bytes.into_inner().into();
+        let path = "/474-shared-decode.exr";
+        let pool = crate::MediaPool::new();
+        pool.add_bytes(path, b.clone());
+        let f = crate::probe_bytes(path, b).unwrap();
+        pool.frame_at(&f, effectcraft_time::Tick::ZERO).unwrap();
+        let aux = cached(path, || panic!("the frame's decode is reused, the file is not read again")).unwrap();
+        assert_eq!(aux.get("GlossDir.R").and_then(|p| p.first()).copied(), Some(0.25));
+    }
+
     #[test]
     fn layered_exr_without_an_unnamed_rgb_layer_imports() {
         use exr::prelude::*;
@@ -242,6 +305,37 @@ mod tests {
         let aux = read_exr_channels(&b).unwrap();
         assert_eq!(aux.layers(), ["depth", "diffuse"]);
         assert_eq!(aux.layer_rgba("diffuse"), ["diffuse.R", "diffuse.G", "diffuse.B", ""].map(String::from));
+    }
+
+    /// #481: Blender 5 writes one part per pass, its channels keeping the full pass name
+    /// (`ViewLayer.Depth.Z` in part `ViewLayer.Depth`); the name was doubled and the depth and
+    /// Cryptomatte ranks were not found.
+    #[test]
+    fn part_name_is_not_doubled_when_channels_carry_it() {
+        assert_eq!(channel_name(Some("ViewLayer.Depth"), "ViewLayer.Depth.Z"), "ViewLayer.Depth.Z");
+        assert_eq!(channel_name(Some("depth"), "Z"), "depth.Z");
+        assert_eq!(channel_name(Some("depth"), "depthZ"), "depth.depthZ");
+        assert_eq!(channel_name(None, "R"), "R");
+        assert_eq!(channel_name(None, "ViewLayer.Depth.Z"), "ViewLayer.Depth.Z");
+    }
+
+    #[test]
+    fn blender5_multipart_file_keeps_pass_names() {
+        use exr::prelude::*;
+        let (w, h) = (2usize, 2usize);
+        let part = |name: &str, chans: &[&str], v: f32| {
+            let list: Vec<AnyChannel<FlatSamples>> = chans.iter().map(|c| AnyChannel::new(*c, FlatSamples::F32(vec![v; w * h]))).collect();
+            Layer::new((w, h), LayerAttributes::named(name), Encoding::FAST_LOSSLESS, AnyChannels::sort(list.into()))
+        };
+        let layers =
+            vec![part("ViewLayer.Depth", &["ViewLayer.Depth.Z"], 4.0), part("ViewLayer.Combined", &["ViewLayer.Combined.R", "ViewLayer.Combined.G"], 0.5)];
+        let image = Image::from_layers(ImageAttributes::with_size((w, h)), layers);
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image.write().to_buffered(&mut bytes).unwrap();
+        let aux = read_exr_channels(bytes.get_ref()).unwrap();
+        assert_eq!(aux.get("ViewLayer.Depth.Z").unwrap(), [4.0; 4].as_slice());
+        assert!(aux.get("ViewLayer.Depth.ViewLayer.Depth.Z").is_none());
+        assert!(aux.get("ViewLayer.Combined.R").is_some());
     }
 
     /// Straight RGBA of [`layered_image`] at pixel 0 for a file of single-value channels.

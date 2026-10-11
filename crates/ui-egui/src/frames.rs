@@ -681,6 +681,42 @@ impl Frames {
         Some(img)
     }
 
+    /// Prefer the exact requested frame. While an edit renders, advance to the newest completed
+    /// revision of the same comp, time, scale, view and render options instead of freezing on the
+    /// image from before the drag. Input may arrive before the viewer draws on every UI frame,
+    /// so even a fast worker cannot always finish the *latest* revision in time.
+    ///
+    /// Never move backwards when workers finish out of order, and never substitute another time
+    /// or view while scrubbing or switching comps. The exact content lookup above also means an
+    /// undo can immediately reuse an old cache entry, regardless of its original revision.
+    pub fn get_for_viewer(&self, wanted: &FrameKey, shown: Option<&FrameKey>) -> Option<(FrameKey, FrameImage)> {
+        if let Some(img) = self.get(wanted) {
+            return Some((*wanted, img));
+        }
+        let shown = shown?;
+        if shown.comp != wanted.comp || shown.frame != wanted.frame || shown.view != wanted.view || shown.revision >= wanted.revision {
+            return None;
+        }
+        let mut c = self.cache.lock().ok()?;
+        let newest = c
+            .map
+            .keys()
+            .filter(|k| {
+                k.revision > shown.revision
+                    && k.revision < wanted.revision
+                    && k.comp == wanted.comp
+                    && k.frame == wanted.frame
+                    && k.scale == wanted.scale
+                    && k.view == wanted.view
+                    && k.opts == wanted.opts
+            })
+            .max_by_key(|k| k.revision)
+            .copied()?;
+        let img = c.map.get(&newest).cloned()?;
+        c.touch(&newest);
+        Some((newest, img))
+    }
+
     /// The [`comp_content`] identity of `comp` in `project` at `revision` (taken once per
     /// revision). The project is kept while frames of that identity are cached or rendering, so
     /// the comp addresses it hashes can't be reused by other comps meanwhile.
@@ -840,6 +876,12 @@ impl Frames {
         if let Ok(mut f) = self.failed.lock() {
             f.clear();
         }
+        // Disk keys hash the footage files' size and time, but are remembered per revision; a
+        // file reloaded from disk without a new revision (a re-rendered image sequence) must be
+        // keyed again, or the disk cache serves the frames from before.
+        if let Ok(mut k) = self.content_keys.lock() {
+            k.clear();
+        }
     }
 
     /// The render of `key` panicked at its revision (it is not asked for again until then).
@@ -878,8 +920,9 @@ impl Frames {
             // Only the newest viewer frame is urgent. The comp's earlier viewer frames that
             // haven't started are dropped (scrubbing: rendering every frame the pointer passed
             // would hold the workers the frame under it needs); frames already rendering finish
-            // into the cache, and the viewer shows its last frame until the new one is in
-            // (#284). Other comps' viewer frames become prefetch.
+            // into the cache. During edits the viewer advances through compatible completed
+            // revisions; scrubbing holds its last frame until the requested time is in (#284).
+            // Other comps' viewer frames become prefetch.
             q.jobs.retain(|j| {
                 let superseded = j.urgent && j.key != key && j.key.comp == key.comp;
                 if superseded {
@@ -1765,6 +1808,53 @@ mod tests {
         // A later revision with the same content finds the frame (an edit elsewhere, an undo).
         assert!(f.is_cached(&FrameKey { revision: 99, ..key(1, 0, 0) }));
         assert!(!f.is_cached(&key(3, 0, 0)));
+    }
+
+    #[test]
+    fn live_edits_present_the_newest_completed_revision_without_going_backwards() {
+        let f = Frames::default();
+        let shown = key(1, 0, 0);
+        let newest = key(3, 0, 0);
+        let wanted = key(5, 0, 0);
+        insert(&f, shown);
+        insert(&f, newest);
+        insert(&f, key(2, 0, 0)); // Older worker finishes after the newer one.
+        let displayed = f.get_for_viewer(&wanted, Some(&shown)).unwrap().0;
+        assert_eq!(displayed, newest);
+        assert!(f.get_for_viewer(&wanted, Some(&displayed)).is_none(), "never replay an older completion");
+        insert(&f, wanted);
+        assert_eq!(f.get_for_viewer(&wanted, Some(&displayed)).unwrap().0, wanted, "settle on the exact final edit");
+        // Undo reuses the content of an earlier revision immediately.
+        let undo = FrameKey { revision: 6, ..shown };
+        let reused = f.get_for_viewer(&undo, Some(&wanted)).unwrap().0;
+        assert_eq!(reused.content, shown.content);
+        assert_eq!(reused.revision, undo.revision);
+    }
+
+    #[test]
+    fn live_edits_do_not_substitute_other_times_views_or_render_settings() {
+        let f = Frames::default();
+        let shown = key(1, 0, 0);
+        let wanted = key(3, 0, 0);
+        let done = key(2, 0, 0);
+        for mismatch in [
+            FrameKey { comp: 9, ..done },
+            FrameKey { frame: 1, ..done },
+            FrameKey { scale: 500, ..done },
+            FrameKey { view: 1, ..done },
+            FrameKey { opts: 1, ..done },
+            FrameKey { revision: 4, ..done },
+        ] {
+            f.clear();
+            insert(&f, mismatch);
+            assert!(f.get_for_viewer(&wanted, Some(&shown)).is_none(), "wrong candidate: {mismatch:?}");
+        }
+        f.clear();
+        insert(&f, done);
+        assert!(f.get_for_viewer(&wanted, None).is_none(), "no stale content on opening a viewer");
+        assert!(f.get_for_viewer(&wanted, Some(&FrameKey { comp: 9, ..shown })).is_none());
+        assert!(f.get_for_viewer(&wanted, Some(&FrameKey { frame: 1, ..shown })).is_none());
+        assert!(f.get_for_viewer(&wanted, Some(&FrameKey { view: 1, ..shown })).is_none());
     }
 
     #[test]

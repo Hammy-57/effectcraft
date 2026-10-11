@@ -1,7 +1,6 @@
 //! Composition menu, part two: crop to region of interest / layer bounds, Save Frame As ▸ File,
 //! Responsive Design — Time.
 
-use effectcraft_keyframe::Value as KV;
 use effectcraft_project::Marker;
 use effectcraft_time::Tick;
 use serde_json::{Value, json};
@@ -24,14 +23,8 @@ fn crop(s: &mut Session, cid: effectcraft_project::ItemId, r: [f64; 4], label: &
         c.width = w;
         c.height = h;
         for l in c.layers.iter_mut_where(|l| l.parent.is_none()) {
-            let Some(pos) = l.transform_mut().and_then(|tr| tr.get_mut("position")) else { continue };
-            let mv = |v: &KV| {
-                let a = v.as_vec3();
-                KV::Vec3([a[0] - x, a[1] - y, a[2]])
-            };
-            pos.value = mv(&pos.value);
-            for k in &mut pos.keys {
-                k.value = mv(&k.value);
+            if let Some(tr) = l.transform_mut() {
+                super::layer::offset_position(tr, -x, -y);
             }
         }
         for g in &mut c.guides {

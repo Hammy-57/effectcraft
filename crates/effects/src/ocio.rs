@@ -1427,7 +1427,7 @@ pub fn specs() -> Vec<EffectSpec> {
             cc,
             vec![
                 p("config", "Configuration", Value::Enum(0), popup(CONFIGS)),
-                p("configFile", "Config File (.ocio)", Value::Str(String::new()), ParamUi::Text),
+                p("configFile", "Config File (.ocio)", Value::Str(String::new()), crate::file_ui(&["ocio"])),
                 space_param("source", "Source", lin709),
                 p("sourceName", "Source (config name)", Value::Str(String::new()), ParamUi::Text),
                 space_param("destination", "Destination", srgb),
@@ -1442,7 +1442,7 @@ pub fn specs() -> Vec<EffectSpec> {
             cc,
             vec![
                 p("config", "Configuration", Value::Enum(0), popup(CONFIGS)),
-                p("configFile", "Config File (.ocio)", Value::Str(String::new()), ParamUi::Text),
+                p("configFile", "Config File (.ocio)", Value::Str(String::new()), crate::file_ui(&["ocio"])),
                 space_param("source", "Input Color Space", lin709),
                 p("sourceName", "Source (config name)", Value::Str(String::new()), ParamUi::Text),
                 p("display", "Display Device", Value::Enum(0), popup(&DISPLAYS.iter().map(|d| d.0).collect::<Vec<_>>())),
@@ -1459,7 +1459,7 @@ pub fn specs() -> Vec<EffectSpec> {
             "OCIO File Transform",
             cc,
             vec![
-                p("file", "File", Value::Str(String::new()), ParamUi::Text),
+                p("file", "File", Value::Str(String::new()), crate::file_ui(&["cube", "3dl", "csp", "cc", "ccc", "cdl", "spi1d", "spi3d", "spimtx"])),
                 p("cccId", "CCC ID", Value::Str(String::new()), ParamUi::Text),
                 p("interpolation", "Interpolation", Value::Enum(3), popup(&["Nearest", "Linear", "Tetrahedral", "Best"])),
                 direction(),

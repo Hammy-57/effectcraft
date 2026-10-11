@@ -196,7 +196,10 @@ impl<'a> Renderer<'a> {
                 }
             });
         }
-        canvas.blend_from_at([0, 0], &iso, win.origin(), layer.blend_mode, opacity, layer.id.0 as u32);
+        // Dissolve noise follows the output's pixels (the canvas is its window at the origin).
+        let [ox, oy] = self.canvas_origin;
+        let at = [win.x.saturating_add(ox), win.y.saturating_add(oy)];
+        canvas.blend_from_at(self.canvas_origin, &iso, at, layer.blend_mode, opacity, layer.id.0 as u32);
         pool::recycle(iso);
     }
 

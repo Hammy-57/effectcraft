@@ -133,16 +133,27 @@ impl effectcraft_render::FxTarget for GpuFx<'_, '_> {
 }
 
 pub(crate) fn apply_chain(e: &mut Enc, chain: &[FxStep], mut b: GBuf, levels: Option<f32>) -> Option<GBuf> {
+    e.take_missing();
     let mut remaining = chain;
     while let Some((step, rest)) = remaining.split_first() {
         if let Some((image, count)) = crate::fusion::apply(e, remaining, &b.img, levels) {
+            if e.take_missing() {
+                return None;
+            }
             b.img = image;
             remaining = remaining.get(count..)?;
             continue;
         }
         b = apply(e, step.spec.id, &step.ctx, b)?;
+        // A kernel the device could not build keeps the whole chain on the CPU.
+        if e.take_missing() {
+            return None;
+        }
         if let Some(l) = levels {
             b.img = ops::quantize(e, &b.img, l);
+        }
+        if e.take_missing() {
+            return None;
         }
         remaining = rest;
     }

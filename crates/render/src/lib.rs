@@ -11,6 +11,7 @@
 // Every `src/*.rs` file is a module (`tests*.rs` under `#[cfg(test)]`), declared by build.rs (docs/architecture.md,
 // "Self-registering modules"); declare one here only for another visibility or a submodule folder.
 include!(concat!(env!("OUT_DIR"), "/modules.rs"));
+pub mod cache;
 pub mod shapes;
 pub mod text;
 

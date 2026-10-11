@@ -163,20 +163,24 @@ fn velocity_dialog_values_per_dimension_and_continuous() {
     undo_redo_roundtrip(&mut s, after, |s| assert_eq!(prop(s, l, "transform/scale").keys[1].in_interp, Interp::Linear));
 }
 
-/// Spatial Bezier on a straight two-key path gives both keys handles a third of the way along it
-/// (they had none), so the path can be pulled into a curve; the motion stays the same (#290).
+/// Spatial Bezier keeps the handles a key has and gives a straight linear path handles a third of
+/// the way along it (they had none), so the path can be pulled into a curve; the motion stays the
+/// same (#290). Auto-Bezier keys keep their tangents, a sixth of the way to the neighbour here.
 #[test]
 fn spatial_bezier_gives_a_straight_path_handles() {
     let (mut s, l) = setup();
     animate(&mut s, l, "transform/position", &[(0.0, json!([0, 0])), (2.0, json!([300, 0]))]);
     let mid = prop(&s, l, "transform/position").value_at(effectcraft_time::Tick::from_seconds_f64(0.7)).as_vec3();
     select_prop_keys(&mut s, l, "transform/position");
-    s.execute("keys.interpolation", json!({"spatial": "bezier"})).unwrap();
-    let p = prop(&s, l, "transform/position");
-    assert!(p.keys.iter().all(|k| !k.spatial_auto));
-    assert_eq!((p.keys[0].spatial_out, p.keys[1].spatial_in), ([100.0, 0.0, 0.0], [-100.0, 0.0, 0.0]));
-    let now = p.value_at(effectcraft_time::Tick::from_seconds_f64(0.7)).as_vec3();
-    assert!((now[0] - mid[0]).abs() < 0.01 && now[1].abs() < 1e-9, "{mid:?} → {now:?}");
+    for (from, handle) in [("autoBezier", 50.0), ("linear", 100.0)] {
+        s.execute("keys.interpolation", json!({"spatial": from})).unwrap();
+        s.execute("keys.interpolation", json!({"spatial": "bezier"})).unwrap();
+        let p = prop(&s, l, "transform/position");
+        assert!(p.keys.iter().all(|k| !k.spatial_auto));
+        assert_eq!((p.keys[0].spatial_out, p.keys[1].spatial_in), ([handle, 0.0, 0.0], [-handle, 0.0, 0.0]), "from {from}");
+        let now = p.value_at(effectcraft_time::Tick::from_seconds_f64(0.7)).as_vec3();
+        assert!((now[0] - mid[0]).abs() < 0.01 && now[1].abs() < 1e-9, "from {from}: {mid:?} → {now:?}");
+    }
 }
 
 #[test]
@@ -240,6 +244,25 @@ fn graph_editor_key_and_handle_edits() {
     assert!((k.out_ease[0].influence - 0.6).abs() < 1e-9);
     s.execute("edit.undo", json!({})).unwrap();
     assert_eq!(prop(&s, l, "transform/opacity").keys[0].out_interp, Interp::Linear);
+}
+
+#[test]
+fn convert_expression_to_keyframes_on_a_reversed_layer_keeps_values() {
+    let (mut s, l) = setup();
+    // These tests run without an expression host, so the conversion bakes the keyed ramp under the expression.
+    animate(&mut s, l, "transform/rotation", &[(0.0, json!(0)), (3.0, json!(30))]);
+    s.execute("prop.setExpression", json!({"layer": l, "path": "transform/rotation", "expression": "value"})).unwrap();
+    s.execute("layer.timeReverse", json!({"layers": [l]})).unwrap();
+    let at = |t: f64| json!({"layer": l, "path": "transform/rotation", "time": t});
+    let sample = |s: &mut Session| [0.5, 1.0, 2.0].map(|t| s.execute("prop.get", at(t)).unwrap()["value"].as_f64().unwrap());
+    let before = sample(&mut s);
+    assert!(before[0] > before[1] && before[1] > before[2], "{before:?}");
+    s.execute("prop.convertExpressionToKeyframes", json!({"layer": l, "path": "transform/rotation"})).unwrap();
+    let keys = prop(&s, l, "transform/rotation").keys;
+    assert!(keys.len() > 1);
+    assert!(keys.windows(2).all(|w| w[0].time < w[1].time));
+    let after = sample(&mut s);
+    assert!(before.iter().zip(after).all(|(b, a)| (b - a).abs() < 1e-6), "{before:?} -> {after:?}");
 }
 
 #[test]
@@ -323,6 +346,22 @@ fn alt_click_stopwatch_toggles_a_self_reference_expression() {
 }
 
 #[test]
+fn add_expression_without_path_uses_the_selected_property() {
+    let (mut s, l) = setup();
+    // Nothing selected: the same hint as Add Property to Essential Graphics.
+    let err = s.execute("prop.setExpression", json!({})).unwrap_err().to_string();
+    assert!(err.contains("select a property in the timeline"), "{err}");
+    assert!(prop(&s, l, "transform/opacity").expr.is_none());
+    // Animation > Add Expression sends no parameters.
+    s.execute("prop.select", json!({"layer": l, "path": "transform/opacity"})).unwrap();
+    s.execute("prop.setExpression", json!({})).unwrap();
+    assert_eq!(prop(&s, l, "transform/opacity").expr.unwrap().text, "transform.opacity");
+    // One undo step removes it.
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(prop(&s, l, "transform/opacity").expr.is_none());
+}
+
+#[test]
 fn layer_comp_and_key_times_stay_frame_aligned() {
     let aligned = |fr: effectcraft_time::FrameRate, t: effectcraft_time::Tick| fr.snap(t) == t;
     // The demo project: every comp duration, layer in/out/start and key time is on a frame.
@@ -373,6 +412,36 @@ fn time_set_snaps_to_the_nearest_frame_and_ae_timecode() {
     let fr = s.active_comp().unwrap().frame_rate;
     assert_eq!(effectcraft_time::format_timecode_ae(75, fr, false), "0:00:02:15");
     assert_eq!(effectcraft_time::format_timecode_ae(75, fr, true), "0;00;02;15");
+}
+
+#[test]
+fn time_set_keeps_the_frame_shown_in_the_current_time_field() {
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "Example", "width": 64, "height": 64, "frameRate": 30, "duration": 0.6, "startTimecode": "0:00:00:05"})).unwrap();
+    let r = s.execute("time.set", json!({"frame": 0})).unwrap();
+    assert_eq!(r["display"], "0:00:00:05");
+    let r = s.execute("time.set", json!({"timecode": "0:00:00:05"})).unwrap();
+    assert_eq!((r["frame"].as_i64(), r["time"].as_f64()), (Some(0), Some(0.0)));
+
+    s.execute("file.projectSettings", json!({"timeDisplay": "frames"})).unwrap();
+    std::sync::Arc::make_mut(&mut s.project).settings.frame_start = 1;
+    let r = s.execute("time.set", json!({"frame": 12})).unwrap();
+    assert_eq!(r["display"], "00013");
+    let r = s.execute("time.set", json!({"timecode": "00013"})).unwrap();
+    assert_eq!((r["frame"].as_i64(), r["time"].as_f64()), (Some(12), Some(0.4)));
+    let r = s.execute("time.set", json!({"timecode": "+1"})).unwrap();
+    assert_eq!(r["frame"], 13);
+}
+
+/// Frames display style: typed digits are a frame count, so 00100 is frame 100, not 1 s (#530).
+#[test]
+fn time_set_reads_frames_style_digits_as_a_frame_count() {
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "Long", "width": 64, "height": 64, "frameRate": 30, "duration": 10})).unwrap();
+    s.execute("file.projectSettings", json!({"timeDisplay": "frames"})).unwrap();
+    let r = s.execute("time.set", json!({"timecode": "00100"})).unwrap();
+    assert_eq!(r["frame"], 100);
+    assert_eq!(r["display"], "00100");
 }
 
 #[test]
@@ -794,4 +863,52 @@ fn timing_deltas_trim_each_layer_within_its_limits() {
     let fd = 1.0 / 30.0;
     let t = times(&s);
     assert!((t[0].0 - (2.0 - fd)).abs() < 1e-9 && (t[1].0 - 3.0).abs() < 1e-9, "{t:?}");
+}
+
+/// #355, #491: with several layers selected, the stopwatch, the keyframe button and value edits
+/// (`selected: true`, as the panels send them) apply to every selected layer in one undo step; a
+/// scrub (`offset`) moves each layer by the same amount, a typed value sets them all.
+#[test]
+fn property_edits_apply_to_every_selected_layer() {
+    let (mut s, a) = setup();
+    let b = s.execute("layer.newSolid", json!({"color": "#ff0000", "width": 50, "height": 50})).unwrap()["layer"].as_u64().unwrap();
+    let c = s.execute("layer.newSolid", json!({"color": "#00ff00", "width": 50, "height": 50})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("prop.set", json!({"layer": b, "path": "transform/position", "value": [10, 20]})).unwrap();
+    s.execute("layer.select", json!({"layers": [a, b]})).unwrap();
+    let pos = |s: &Session, l: u64| prop(s, l, "transform/position").value_at(effectcraft_time::Tick::ZERO).components();
+    let uid = prop(&s, a, "transform/position").uid;
+
+    // Stopwatch on all selected layers, one undo step; the unselected layer is untouched.
+    let undo = s.history.undo.len();
+    s.execute("prop.toggleAnimation", json!({"layer": a, "prop": uid, "selected": true})).unwrap();
+    assert!(prop(&s, a, "transform/position").is_animated() && prop(&s, b, "transform/position").is_animated());
+    assert!(!prop(&s, c, "transform/position").is_animated());
+    assert_eq!(s.history.undo.len(), undo + 1);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(!prop(&s, a, "transform/position").is_animated() && !prop(&s, b, "transform/position").is_animated());
+
+    // A scrub moves both by the same change (merged into one step while it continues).
+    let (pa, pb) = (pos(&s, a), pos(&s, b));
+    for k in 1..=3 {
+        let v = [pa[0] + 5.0 * k as f64, pa[1]];
+        s.execute("prop.set", json!({"layer": a, "prop": uid, "value": v, "selected": true, "offset": true, "merge": "scrub-1"})).unwrap();
+    }
+    assert_eq!(pos(&s, a)[..2], [pa[0] + 15.0, pa[1]]);
+    assert_eq!(pos(&s, b)[..2], [pb[0] + 15.0, pb[1]]);
+    assert_eq!(s.history.undo.len(), undo + 1, "one undo step for the scrub");
+    // A typed value sets them all.
+    s.execute("prop.set", json!({"layer": a, "path": "transform/opacity", "value": 40, "selected": true})).unwrap();
+    assert_eq!(prop(&s, b, "transform/opacity").value.as_f64(), 40.0);
+    assert_eq!(prop(&s, c, "transform/opacity").value.as_f64(), 100.0);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(prop(&s, a, "transform/opacity").value.as_f64(), 100.0);
+    assert_eq!(prop(&s, b, "transform/opacity").value.as_f64(), 100.0);
+
+    // The keyframe button adds a key on each selected layer.
+    s.execute("prop.toggleKey", json!({"layer": a, "path": "transform/scale", "selected": true})).unwrap();
+    assert_eq!(prop(&s, a, "transform/scale").keys.len(), 1);
+    assert_eq!(prop(&s, b, "transform/scale").keys.len(), 1);
+    // Without `selected` only the given layer changes.
+    s.execute("prop.set", json!({"layer": a, "path": "transform/rotation", "value": 30})).unwrap();
+    assert_eq!(prop(&s, b, "transform/rotation").value.as_f64(), 0.0);
 }

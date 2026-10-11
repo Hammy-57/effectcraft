@@ -116,6 +116,13 @@ pub enum Icon {
     Globe,
     Code,
     Sparkle,
+    // appearance modes
+    /// Sync with System: a display on a stand.
+    Monitor,
+    /// Light: a disc with eight rays.
+    Sun,
+    /// Dark: a crescent.
+    Moon,
 }
 
 pub struct Pen16<'a> {
@@ -695,6 +702,24 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
         }
         Sparkle => {
             pen.fill(&[(8.0, 1.5), (9.4, 6.6), (14.5, 8.0), (9.4, 9.4), (8.0, 14.5), (6.6, 9.4), (1.5, 8.0), (6.6, 6.6)]);
+        }
+        Monitor => {
+            pen.rrect(1.8, 2.5, 14.2, 11.0, 1.2);
+            pen.line(&[(8.0, 11.0), (8.0, 13.8)]);
+            pen.line(&[(5.0, 13.8), (11.0, 13.8)]);
+        }
+        Sun => {
+            pen.circle(8.0, 8.0, 2.8);
+            for i in 0..8 {
+                let a = std::f32::consts::FRAC_PI_4 * i as f32;
+                let (c, s) = (a.cos(), a.sin());
+                pen.line(&[(8.0 + 4.6 * c, 8.0 + 4.6 * s), (8.0 + 6.4 * c, 8.0 + 6.4 * s)]);
+            }
+        }
+        Moon => {
+            // The outer edge of a disc, and the inner edge of the disc that eclipses it.
+            pen.arc(8.0, 8.0, 5.8, -20.0, 250.0);
+            pen.arc(10.6, 2.4, 4.6, 52.0, 178.0);
         }
         PenAdd | PenDelete => {
             // A small pen nib with a plus or minus beside it.

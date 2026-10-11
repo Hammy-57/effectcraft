@@ -432,3 +432,108 @@ fn a_graph_editor_marquee_highlights_keys_while_the_button_is_down() {
     release(&mut h, over, Default::default());
     assert_eq!(h.state().session.state.selected_keys.len(), 1);
 }
+
+/// #457: on a Timeline narrower than the Graph Editor's whole button row, the buttons that don't
+/// fit go to a "»" menu at the end of the bar instead of being cut off; each stays reachable and
+/// works from there.
+#[test]
+fn graph_editor_buttons_that_do_not_fit_move_to_the_more_menu() {
+    let (mut h, _, _) = harness();
+    h.set_size(egui::vec2(1280.0, 800.0));
+    h.state_mut().ui.timeline.graph_editor = true;
+    h.run_steps(4);
+    let ids = [
+        "autoSelectGraphType",
+        "valueGraph",
+        "speedGraph",
+        "showSelected",
+        "autoZoom",
+        "fit",
+        "fitSelection",
+        "snap",
+        "reference",
+        "transformBox",
+        "separateDimensions",
+        "interpolationHold",
+        "interpolationLinear",
+        "interpolationAuto",
+        "easyEaseEasy",
+        "easyEaseInEase",
+        "easyEaseOutEase",
+    ];
+    let graph = h.state().auto.find("timeline.graph").expect("the Graph Editor is shown").rect;
+    let right = graph[0] + graph[2];
+    let shown: Vec<&str> = ids.iter().copied().filter(|id| h.state().auto.find(&format!("timeline.graph.{id}")).is_some()).collect();
+    for id in &shown {
+        let r = h.state().auto.find(&format!("timeline.graph.{id}")).unwrap().rect;
+        assert!(r[0] + r[2] <= right, "{id} is drawn past the bar's right edge");
+    }
+    let more = h.state().auto.find("timeline.graph.more").expect("the buttons that don't fit are in a menu").rect;
+    assert!(more[0] + more[2] <= right);
+    let p = pos2(more[0] + more[2] / 2.0, more[1] + more[3] / 2.0);
+    let click = |h: &mut Harness<'_, EffectcraftApp>, p: Pos2| {
+        h.input_mut().events.push(Event::PointerMoved(p));
+        h.input_mut().events.push(Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+        h.step();
+        h.input_mut().events.push(Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+        h.run_steps(3);
+    };
+    click(&mut h, p);
+    let hidden: Vec<&str> = ids.iter().copied().filter(|id| h.state().auto.find(&format!("timeline.graph.more.{id}")).is_some()).collect();
+    assert_eq!(shown.len() + hidden.len(), ids.len(), "every button is on the bar or in the menu: {shown:?} + {hidden:?}");
+    assert!(hidden.contains(&"transformBox"), "{hidden:?}");
+    let before = h.state().ui.timeline.graph_transform_box;
+    let item = h.state().auto.find("timeline.graph.more.transformBox").unwrap().rect;
+    click(&mut h, pos2(item[0] + item[2] / 2.0, item[1] + item[3] / 2.0));
+    assert_eq!(h.state().ui.timeline.graph_transform_box, !before, "the menu item runs the button");
+}
+
+/// #355, #491: with three layers selected the Properties panel heads "(3) Selected Objects"; its
+/// stopwatch animates Position on all three (one undo step) and scrubbing X moves all three by
+/// the same amount.
+#[test]
+fn properties_panel_edits_every_selected_layer() {
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "Three", "width": 320, "height": 180, "frameRate": 30, "duration": 4})).unwrap();
+    let mut ids = vec![];
+    for (i, c) in ["#e04020", "#20e040", "#2040e0"].iter().enumerate() {
+        let l = s.execute("layer.newSolid", json!({"color": c, "width": 40, "height": 40})).unwrap()["layer"].as_u64().unwrap();
+        s.execute("prop.set", json!({"layer": l, "path": "transform/position", "value": [60.0 + 80.0 * i as f64, 90.0]})).unwrap();
+        ids.push(l);
+    }
+    s.execute("layer.select", json!({"layers": ids})).unwrap();
+    let first = s.state.selected_layers[0];
+    let uid = s.active_comp().unwrap().layer(first).unwrap().props.prop("transform/position").unwrap().uid;
+    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).build_eframe(|_| EffectcraftApp::new(s));
+    h.state_mut().show_panel(effectcraft_ui_egui::dock::PanelKind::Properties);
+    h.run_steps(4);
+    assert_eq!(h.state().auto.find("properties.selectedObjects").map(|e| e.label.clone()), Some("(3) Selected Objects".into()));
+    let pos = |h: &Harness<'_, EffectcraftApp>, l: u64| {
+        h.state().session.active_comp().unwrap().layer(LayerId(l)).unwrap().props.prop("transform/position").unwrap().clone()
+    };
+    let at = |h: &Harness<'_, EffectcraftApp>, id: &str| {
+        let e = h.state().auto.find(id).unwrap_or_else(|| panic!("no {id}"));
+        pos2(e.rect[0] + e.rect[2] / 2.0, e.rect[1] + e.rect[3] / 2.0)
+    };
+    let sw = at(&h, &format!("properties.prop.{uid}.stopwatch"));
+    h.input_mut().events.push(Event::PointerMoved(sw));
+    h.step();
+    h.input_mut().events.push(Event::PointerButton { pos: sw, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+    h.step();
+    h.input_mut().events.push(Event::PointerButton { pos: sw, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+    h.run_steps(3);
+    assert!(ids.iter().all(|l| pos(&h, *l).is_animated()), "every selected layer's stopwatch");
+    h.state_mut().session.execute("edit.undo", json!({})).unwrap();
+    h.run_steps(2);
+    assert!(ids.iter().all(|l| !pos(&h, *l).is_animated()), "one undo step");
+    // Scrub X: each layer moves by the same amount.
+    let before: Vec<f64> = ids.iter().map(|l| pos(&h, *l).value.components()[0]).collect();
+    let x = at(&h, &format!("properties.prop.{uid}.value.0"));
+    drag(&mut h, x, x + egui::vec2(30.0, 0.0), Default::default());
+    let after: Vec<f64> = ids.iter().map(|l| pos(&h, *l).value.components()[0]).collect();
+    let d = after[0] - before[0];
+    assert!(d.abs() > 1.0, "the scrub moved X: {before:?} → {after:?}");
+    for (a, b) in after.iter().zip(&before) {
+        assert!((a - b - d).abs() < 1e-6, "same change on every layer: {before:?} → {after:?}");
+    }
+}

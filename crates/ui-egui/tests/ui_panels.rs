@@ -35,6 +35,17 @@ fn click(h: &mut Harness<'_, EffectcraftApp>, id: &str) {
     h.run_steps(2);
 }
 
+/// #581: the header's Discord pill fits its label with even padding (it was a fixed 104 px with
+/// the text at its left).
+#[test]
+fn discord_pill_fits_its_label() {
+    let h = harness();
+    let e = h.state().auto.find("header.discord").expect("the Discord pill").clone();
+    let text = h.ctx.fonts_mut(|f| f.layout_no_wrap("Discord".into(), effectcraft_ui_egui::theme::Tokens::semibold(12.0), egui::Color32::WHITE).size().x);
+    // Padding 10, the 14 px icon, a 6 px gap, the text, padding 12.
+    assert!((e.rect[2] - (text + 42.0)).abs() < 0.5, "{} for a {text} px label", e.rect[2]);
+}
+
 #[test]
 fn window_menu_opens_the_new_panels() {
     let mut h = harness();
@@ -115,6 +126,42 @@ fn click_at(h: &mut Harness<'_, EffectcraftApp>, p: Pos2) {
 fn hover(h: &mut Harness<'_, EffectcraftApp>, p: Pos2) {
     h.input_mut().events.push(Event::PointerMoved(p));
     h.run_steps(3);
+}
+
+/// Issue #320: saved workspaces last between sessions (they were only kept in memory): a new
+/// app on the same settings store lists them and brings their layout back; renamed and deleted
+/// ones stay that way.
+#[test]
+fn saved_workspaces_persist_across_sessions() {
+    use effectcraft_engine::config::{ConfigStore, MemoryConfig};
+    use effectcraft_ui_egui::menus::invoke;
+    let store = std::sync::Arc::new(MemoryConfig::default());
+    let launch = || {
+        let s = Session { config: Some(store.clone()), ..Default::default() };
+        let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).build_eframe(|_| EffectcraftApp::new(s));
+        h.run_steps(2);
+        h
+    };
+    let mut h = launch();
+    let ctx = h.ctx.clone();
+    invoke(h.state_mut(), &ctx, "window.workspace", json!({"name": "Minimal"})).unwrap();
+    invoke(h.state_mut(), &ctx, "window.saveWorkspaceAs", json!({"name": "My Layout"})).unwrap();
+    invoke(h.state_mut(), &ctx, "window.saveWorkspaceAs", json!({"name": "Scratch"})).unwrap();
+    let saved = h.state().ui.dock.clone();
+    drop(h);
+    let mut h = launch();
+    assert_eq!(h.state().saved_workspace_names(), ["My Layout", "Scratch"]);
+    assert_eq!(h.state().ui.workspace, "Default");
+    let ctx = h.ctx.clone();
+    invoke(h.state_mut(), &ctx, "window.workspace", json!({"name": "My Layout"})).unwrap();
+    assert_eq!(h.state().ui.dock, saved);
+    invoke(h.state_mut(), &ctx, "window.editWorkspaces", json!({"name": "Scratch", "delete": true})).unwrap();
+    invoke(h.state_mut(), &ctx, "window.editWorkspaces", json!({"name": "My Layout", "rename": "Edit Bay"})).unwrap();
+    drop(h);
+    assert_eq!(launch().state().saved_workspace_names(), ["Edit Bay"]);
+    // A damaged file is ignored.
+    store.write(effectcraft_ui_egui::WORKSPACES_FILE, "{not json").unwrap();
+    assert!(launch().state().saved_workspace_names().is_empty());
 }
 
 /// Issue #191: a workspace saved with Save as New Workspace is listed in Window ▸ Workspace
@@ -270,4 +317,48 @@ fn panels_snapshot() {
         let img = h.render().expect("render");
         img.save(format!("{dir}/{panel}{scope}.png")).unwrap();
     }
+}
+
+/// Drag the automation element `id` horizontally by `dx` points.
+fn drag_x(h: &mut Harness<'_, EffectcraftApp>, id: &str, dx: f32) {
+    let e = h.state().auto.find(id).unwrap_or_else(|| panic!("no {id}")).clone();
+    let from: Pos2 = pos2(e.rect[0] + e.rect[2] / 2.0, e.rect[1] + e.rect[3] / 2.0);
+    h.input_mut().events.push(Event::PointerMoved(from));
+    h.step();
+    h.input_mut().events.push(Event::PointerButton { pos: from, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+    h.step();
+    for k in 1..=10 {
+        h.input_mut().events.push(Event::PointerMoved(from + egui::vec2(dx * k as f32 / 10.0, 0.0)));
+        h.step();
+    }
+    let to = from + egui::vec2(dx, 0.0);
+    h.input_mut().events.push(Event::PointerButton { pos: to, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+    h.run_steps(3);
+}
+
+/// #338: an Essential Graphics Scale control keeps After Effects' Constrain Proportions link, on
+/// by default: dragging X scales Y with it; unlinked, X moves alone.
+#[test]
+fn essential_graphics_scale_keeps_constrain_proportions() {
+    let mut h = harness();
+    let layer = h.state().session.active_comp().unwrap().layers[0].id.0;
+    h.state_mut().session.execute("prop.set", json!({"layer": layer, "path": "transform/scale", "value": [100.0, 50.0]})).unwrap();
+    let c =
+        h.state_mut().session.execute("essential.addProperty", json!({"layer": layer, "path": "transform/scale"})).unwrap()["controls"][0].as_u64().unwrap();
+    open(&mut h, "essentialGraphics");
+    let value = format!("essential.control.{c}.value");
+    let scale = |h: &Harness<'_, EffectcraftApp>| {
+        let comp = h.state().session.active_comp().unwrap();
+        let l = comp.layers.iter().find(|l| l.id.0 == layer).unwrap();
+        l.props.prop("transform/scale").unwrap().value.components()
+    };
+    assert!(h.state().auto.find(&format!("{value}.link")).is_some(), "the chain link is drawn");
+    drag_x(&mut h, &format!("{value}.0"), 40.0);
+    let linked = scale(&h);
+    assert!(linked[0] > 100.0, "{linked:?}");
+    assert!((linked[1] / linked[0] - 0.5).abs() < 1e-6, "Y follows X in proportion: {linked:?}");
+    click(&mut h, &format!("{value}.link"));
+    drag_x(&mut h, &format!("{value}.0"), 40.0);
+    let unlinked = scale(&h);
+    assert!(unlinked[0] > linked[0] && unlinked[1] == linked[1], "unlinked, X moves alone: {unlinked:?}");
 }

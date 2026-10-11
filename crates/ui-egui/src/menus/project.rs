@@ -6,8 +6,26 @@ use super::dispatch::Handler;
 use crate::EffectcraftApp;
 
 pub(crate) fn handlers() -> &'static [Handler] {
-    const H: &[Handler] = &[Handler::ui("project.column", column)];
+    const H: &[Handler] = &[
+        Handler::ui("project.column", column),
+        Handler::ui("project.deleteWithoutConfirmation", delete_without_confirmation),
+        // Run by id (control channel, MCP): the Project panel's selection, whatever has focus.
+        Handler::frontend("project.deleteWithoutConfirmation", delete_confirmed),
+    ];
     H
+}
+
+/// Shift+Delete deletes the Project panel's selection without asking; it does nothing in the
+/// other panels.
+fn delete_without_confirmation(app: &mut EffectcraftApp, ctx: &egui::Context, _id: &str, _params: Value) -> Result<Value, String> {
+    if app.ui.focused != crate::dock::PanelKind::Project {
+        return Ok(Value::Null);
+    }
+    crate::panels::delete_items::delete_confirmed(app, ctx, json!({}))
+}
+
+fn delete_confirmed(app: &mut EffectcraftApp, ctx: &egui::Context, _id: &str, _params: Value) -> Result<Value, String> {
+    crate::panels::delete_items::delete_confirmed(app, ctx, json!({}))
 }
 
 fn column(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, params: Value) -> Result<Value, String> {

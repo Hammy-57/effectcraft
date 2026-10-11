@@ -38,7 +38,24 @@ pub fn parse_display_time(s: &Session, comp: &Comp, text: &str, current: i64) ->
             let start = fr.frame_at(comp.display_start) + st.frame_start;
             effectcraft_time::parse_feet_frames(text, pf, current + start).map(|f| f - start).map_err(|e| e.0)
         }
-        None => effectcraft_time::parse_timecode(text, fr, fr.supports_drop_frame(), current).map_err(|e| e.0),
+        None => {
+            let parsed = effectcraft_time::parse_timecode(text, fr, fr.supports_drop_frame(), current).map_err(|e| e.0)?;
+            let relative = text.trim().starts_with('+') || text.trim().starts_with('-');
+            if relative {
+                Ok(parsed)
+            } else if st.time_display == TimeDisplayStyle::Frames
+                && let Ok(frame) = text.trim().parse::<i64>()
+            {
+                // Displayed digits are a plain frame count (00100 is frame 100, not 1 s) plus
+                // Start Numbering Frames At.
+                Ok(frame.saturating_sub(st.frame_start))
+            } else if st.time_display == TimeDisplayStyle::Frames {
+                Ok(parsed.saturating_sub(st.frame_start))
+            } else {
+                // Displayed timecode includes the composition Start Timecode offset.
+                Ok(parsed.saturating_sub(fr.frame_at(comp.display_start)))
+            }
+        }
     }
 }
 
