@@ -895,15 +895,63 @@ fn runs(geom: &TextGeom) -> Vec<(Vec<usize>, bool)> {
     out
 }
 
+/// One pass (or run) of [`draw_glyphs`], ready to rasterise: the glyph it is painted like, its
+/// outlines and their matrix into the target, the target rect it covers and its blur.
+struct GlyphJob<'g> {
+    g: &'g PlacedGlyph,
+    stroke: bool,
+    paths: Cow<'g, [BezPath]>,
+    m: Mat3,
+    rect: [i64; 4],
+    blur: [f64; 2],
+}
+
+impl GlyphJob<'_> {
+    fn raster(&self) -> Image {
+        raster_pass(self.g, self.stroke, &self.paths, &self.m, self.rect, self.blur)
+    }
+
+    fn area(&self) -> u64 {
+        ((self.rect[2] - self.rect[0]).max(0) as u64).saturating_mul((self.rect[3] - self.rect[1]).max(0) as u64)
+    }
+}
+
+/// Below this many patch pixels a text layer is drawn on one thread.
+const PARALLEL_PX: u64 = 1 << 16;
+/// At most this many patch pixels are rasterised ahead of their blit (memory).
+const BATCH_PX: u64 = 1 << 22;
+
+/// How [`draw_glyphs_with`] draws.
+#[derive(Clone, Copy, Debug)]
+enum Par {
+    /// In parallel when the patches hold [`PARALLEL_PX`] pixels or more.
+    Auto,
+    /// One patch after another on this thread.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Serial,
+    /// In parallel, rasterising at most this many patch pixels ahead of their blit.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Batches(u64),
+}
+
 /// Draw glyphs (paths mapped by `to_px` from layer space into `img`).
 fn draw_glyphs(geom: &TextGeom, img: &mut Image, to_px: &Mat3, s: f64, only: Option<usize>) {
+    draw_glyphs_with(geom, img, to_px, s, only, Par::Auto);
+}
+
+/// [`draw_glyphs`]. In parallel, batches of patches are rasterised on every core (each on its
+/// own, as serially), then blitted in parallel over bands of rows, each band applying every
+/// patch in drawing order: every pixel gets the same blends in the same order, so the pixels are
+/// the serial ones.
+fn draw_glyphs_with(geom: &TextGeom, img: &mut Image, to_px: &Mat3, s: f64, only: Option<usize>, par: Par) {
     let (w, h) = (img.width as i64, img.height as i64);
     let runs = match only {
         Some(o) => passes(geom).into_iter().filter(|(gi, _)| *gi == o && geom.glyphs[*gi].xf.opacity > 0.0).map(|(gi, st)| (vec![gi], st)).collect(),
         None => runs(geom),
     };
+    let mut jobs = Vec::with_capacity(runs.len());
     for (run, stroke) in runs {
-        let Some(g) = run.first().map(|&gi| &geom.glyphs[gi]) else { continue };
+        let Some(g) = run.first().and_then(|&gi| geom.glyphs.get(gi)) else { continue };
         // One glyph is drawn from its own outline; a run from its glyphs' outlines in layer
         // space, all wound the same way so overlaps add up instead of cancelling (NonZero).
         let local = Cow::Borrowed(std::slice::from_ref(&g.local));
@@ -912,7 +960,7 @@ fn draw_glyphs(geom: &TextGeom, img: &mut Image, to_px: &Mat3, s: f64, only: Opt
             (None, [_]) => (local, *to_px * g.m2()),
             (None, _) => {
                 let wound = |p: BezPath| if kurbo::Shape::area(&p) < 0.0 { p.reverse_subpaths() } else { p };
-                (Cow::Owned(run.iter().map(|&gi| wound(geom.glyphs[gi].path())).collect()), *to_px)
+                (Cow::Owned(run.iter().filter_map(|&gi| geom.glyphs.get(gi)).map(|g| wound(g.path())).collect()), *to_px)
             }
         };
         let Some(b) = effectcraft_path::bounds(&paths) else { continue };
@@ -928,9 +976,72 @@ fn draw_glyphs(geom: &TextGeom, img: &mut Image, to_px: &Mat3, s: f64, only: Opt
         if rect[2] <= rect[0] || rect[3] <= rect[1] {
             continue;
         }
-        let patch = raster_pass(g, stroke, &paths, &m, rect, blur);
-        blit(img, &patch, [rect[0], rect[1]], if only.is_some() { BlendMode::Normal } else { geom.blend });
+        jobs.push(GlyphJob { g, stroke, paths, m, rect, blur });
     }
+    let mode = if only.is_some() { BlendMode::Normal } else { geom.blend };
+    let batch_px = match par {
+        Par::Auto if jobs.iter().map(GlyphJob::area).fold(0u64, u64::saturating_add) >= PARALLEL_PX => BATCH_PX,
+        Par::Batches(px) => px,
+        Par::Auto | Par::Serial => 0,
+    };
+    if batch_px == 0 {
+        for job in &jobs {
+            blit(img, &job.raster(), [job.rect[0], job.rect[1]], mode);
+        }
+        return;
+    }
+    use rayon::prelude::*;
+    let mut rest = jobs.as_slice();
+    while !rest.is_empty() {
+        // The next batch: jobs until their patches hold `batch_px` pixels (at least one).
+        let mut n = 0;
+        let mut px = 0u64;
+        while let Some(job) = rest.get(n) {
+            if n > 0 && px.saturating_add(job.area()) > batch_px {
+                break;
+            }
+            px = px.saturating_add(job.area());
+            n += 1;
+        }
+        let (batch, more) = rest.split_at(n.min(rest.len()));
+        rest = more;
+        let patches: Vec<(Image, [i64; 2])> = batch.par_iter().map(|job| (job.raster(), [job.rect[0], job.rect[1]])).collect();
+        blit_rows(img, &patches, mode);
+    }
+}
+
+/// [`blit`] of every patch in order, in parallel over bands of `dst`'s rows: each pixel gets the
+/// patches covering it in the same order as by one [`blit`] after another.
+fn blit_rows(dst: &mut Image, patches: &[(Image, [i64; 2])], mode: BlendMode) {
+    use rayon::prelude::*;
+    const BAND: usize = 8;
+    let w = dst.width as usize;
+    if w == 0 || patches.is_empty() {
+        return;
+    }
+    dst.data.par_chunks_mut(w.saturating_mul(BAND)).enumerate().for_each(|(bi, band)| {
+        let y0 = bi.saturating_mul(BAND) as i64;
+        let y1 = y0 + (band.len() / w) as i64;
+        for (src, at) in patches {
+            let sw = src.width as i64;
+            for y in (y0 - at[1]).max(0)..(y1 - at[1]).min(src.height as i64) {
+                let row = (y + at[1] - y0) * w as i64;
+                for x in 0..sw {
+                    let tx = x + at[0];
+                    if tx < 0 || tx >= w as i64 {
+                        continue;
+                    }
+                    let Some(&s) = src.data.get((y * sw + x) as usize) else { continue };
+                    if s[3] <= 0.0 && s[0] == 0.0 && s[1] == 0.0 && s[2] == 0.0 {
+                        continue;
+                    }
+                    if let Some(d) = band.get_mut((row + tx) as usize) {
+                        *d = effectcraft_color::blend_pixel(mode, *d, s, 0.5);
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// Render a text layer into a layer-space buffer at scale `s`.
@@ -959,24 +1070,28 @@ pub fn render(ctx: &EvalCtx, layer: &Layer, s: f64) -> Buf {
 /// Per-character 3D: each character as its own plane — (buffer in character space, character
 /// space → layer space matrix).
 pub fn per_char_planes(ctx: &EvalCtx, layer: &Layer, s: f64) -> Vec<(Buf, Mat4)> {
+    use rayon::prelude::*;
     let Some(geom) = text_geom(ctx, layer) else { return vec![] };
-    let mut out = Vec::with_capacity(geom.glyphs.len());
-    for (gi, g) in geom.glyphs.iter().enumerate() {
-        if g.xf.opacity <= 0.0 {
-            continue;
-        }
-        let Some(b) = effectcraft_path::bounds(std::slice::from_ref(&g.local)) else { continue };
-        let pad = g.stroke_width + 2.0 + g.xf.blur[0].max(g.xf.blur[1]) * 1.5;
-        let b = b.inflate(pad, pad);
-        let w = ((b.width() * s).ceil() as u32 + 4).clamp(1, 4096);
-        let h = ((b.height() * s).ceil() as u32 + 4).clamp(1, 4096);
-        let offset = [-b.x0 * s + 2.0, -b.y0 * s + 2.0];
-        let mut img = Image::new(w, h);
-        let base = Mat3::translate(vec2(offset[0], offset[1])) * Mat3::scale(vec2(s, s));
-        draw_glyphs(&geom, &mut img, &base, s, Some(gi));
-        out.push((Buf { img, offset, scale: s }, g.m));
-    }
-    out
+    // Each character is drawn into its own buffer: in parallel, collected in order.
+    geom.glyphs
+        .par_iter()
+        .enumerate()
+        .filter_map(|(gi, g)| {
+            if g.xf.opacity <= 0.0 {
+                return None;
+            }
+            let b = effectcraft_path::bounds(std::slice::from_ref(&g.local))?;
+            let pad = g.stroke_width + 2.0 + g.xf.blur[0].max(g.xf.blur[1]) * 1.5;
+            let b = b.inflate(pad, pad);
+            let w = ((b.width() * s).ceil() as u32 + 4).clamp(1, 4096);
+            let h = ((b.height() * s).ceil() as u32 + 4).clamp(1, 4096);
+            let offset = [-b.x0 * s + 2.0, -b.y0 * s + 2.0];
+            let mut img = Image::new(w, h);
+            let base = Mat3::translate(vec2(offset[0], offset[1])) * Mat3::scale(vec2(s, s));
+            draw_glyphs(&geom, &mut img, &base, s, Some(gi));
+            Some((Buf { img, offset, scale: s }, g.m))
+        })
+        .collect()
 }
 
 #[cfg(test)]

@@ -78,6 +78,8 @@ fn draw_comp<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, canvas: &mut 
 
 fn draw_layers<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, visible: &[&'a Layer], canvas: &mut GpuImage) -> Option<()> {
     let levels = r.pipe().levels;
+    // The layers' content on every core first (`prepass`); dropped with what the walk didn't take.
+    let _prefetched = crate::prepass::run(e, r, ctx, visible, canvas, ordinary_resident_enabled());
     let mut i = 0;
     while i < visible.len() {
         if visible[i].is_3d() {
@@ -375,7 +377,7 @@ fn draw_ordinary_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Laye
         crate::context::NativeImage { img: e.upload_buf(&buf)?, offset: buf.offset, scale: buf.scale }
     } else {
         let _profile = effectcraft_render::profile::span("ordinary_resident_produce");
-        let buf = r.resident_source(ctx, layer, clip)?;
+        let buf = crate::prepass::resident_source(r, ctx, layer, key, clip)?;
         let src = e.g.upload_image(&buf.img)?;
         let mut fx = crate::effects::GpuFx::new(e, src, buf.offset, buf.scale, r.pipe().levels);
         let origin = r.run_layer_effects_on(ctx, layer, &mut fx);

@@ -88,6 +88,7 @@ mod fx_vr;
 mod fx_warp;
 mod ops;
 mod particles;
+mod prepass;
 mod readback;
 #[cfg(feature = "profile")]
 mod timestamps;
