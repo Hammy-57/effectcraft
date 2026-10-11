@@ -161,7 +161,7 @@ fn many(n: usize) -> (Project, effectcraft_project::ItemId, Vec<LayerId>) {
         layers.push(l);
     }
     let ids = layers.iter().map(|l| l.id).collect();
-    p.comp_mut(cid).unwrap().layers = layers.into();
+    p.comp_mut(cid).unwrap().layers = layers;
     (p, cid, ids)
 }
 

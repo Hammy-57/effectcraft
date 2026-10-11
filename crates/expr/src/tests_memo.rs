@@ -47,7 +47,7 @@ pub(crate) fn rig(n: usize) -> (Project, ItemId) {
             Some(Expression { text: "thisComp.layer(\"Ctrl\").effect(\"Slider Control\")(\"Slider\") * index + time".into(), enabled: true });
         layers.push(l);
     }
-    p.comp_mut(cid).unwrap().layers = layers.into();
+    p.comp_mut(cid).unwrap().layers = layers;
     (p, cid)
 }
 
