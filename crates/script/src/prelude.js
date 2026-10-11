@@ -1380,6 +1380,13 @@ CompItem.prototype.constructor = CompItem;
   var P = CompItem.prototype;
   function def(name, get, set) { Object.defineProperty(P, name, { get: get, set: set }); }
   P.__settings = function (o) { o.comp = this.__id; __call("comp.settings", o); };
+  // Writes the frame at `time` (comp seconds) as a PNG, as After Effects' CompItem.saveFrameToPng
+  // does (there it's asynchronous; here the file is written when the call returns).
+  P.saveFrameToPng = function (time, file) {
+    var path = __str(file);
+    if (!path) throw __err("saveFrameToPng needs a file");
+    __call("render.frame", { comp: this.__id, time: __num(time, "time"), path: path });
+  };
   def("typeName", function () { return "Composition"; });
   def("layers", function () { return new LayerCollection(this.__id); });
   def("numLayers", function () { return this.__info().layers.length; });

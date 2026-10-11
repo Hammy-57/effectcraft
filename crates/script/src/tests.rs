@@ -631,3 +631,20 @@ fn ae_compat_substr_repeater_gradient_and_dash_match_names() {
     assert_eq!((v("dash"), v("gap"), v("dash2"), v("offset")), (Some(KV::Scalar(12.0)), Some(KV::Scalar(6.0)), Some(KV::Scalar(3.0)), Some(KV::Scalar(5.0))));
     assert!(dashes.get("dash3").is_none(), "only the pairs asked for");
 }
+
+#[test]
+fn save_frame_to_png_writes_the_frame() {
+    let mut s = session();
+    let out = std::env::temp_dir().join(format!("ec-script-frame-{}.png", std::process::id()));
+    let _ = std::fs::remove_file(&out);
+    let code = format!(
+        "var c = app.project.items.addComp(\"F\", 32, 18, 1, 1, 30); c.layers.addSolid([1, 0, 0], \"R\", 32, 18, 1); c.saveFrameToPng(0.5, new File({:?})); 1",
+        out.to_string_lossy()
+    );
+    ok(&mut s, &code);
+    let png = std::fs::read(&out).expect("the PNG was written");
+    assert!(png.starts_with(b"\x89PNG"), "not a PNG");
+    let o = run_code(&mut s, "app.project.item(1).saveFrameToPng(0)", "test.jsx");
+    assert!(o.error.is_some(), "a missing file is an error");
+    let _ = std::fs::remove_file(&out);
+}
