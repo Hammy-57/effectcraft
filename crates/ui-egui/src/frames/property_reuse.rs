@@ -1,7 +1,7 @@
 //! A bounded proof for completed RAM frames after one supported property edit.
 //! Unknown temporal/dependency contexts keep the ordinary full-comp invalidation.
 use super::{Cache, FrameKey, comp_content_with};
-use effectcraft_engine::project::{AutoOrient, Comp, FrameBlend, ItemId, ItemKind, LayerSource, Node, Project, Property, Renderer};
+use effectcraft_engine::project::{AutoOrient, Comp, FrameBlend, GroupKind, ItemId, ItemKind, LayerSource, MaskMotionBlur, Node, Project, Property, Renderer};
 use effectcraft_engine::render::EvalCtx;
 use effectcraft_keyframe::Value;
 use std::io::{self, Write};
@@ -79,16 +79,25 @@ fn bounded_simple(comp: &Comp) -> bool {
 
 const PATHS: [&str; 5] = ["transform/opacity", "transform/position", "transform/scale", "transform/anchor", "transform/rotation"];
 
-fn finite(value: &Value, vector: bool) -> bool {
-    match value {
-        Value::Scalar(v) if !vector => v.is_finite(),
-        Value::Vec3(v) if vector => v.iter().all(|x| x.is_finite()),
-        _ => false,
-    }
+#[derive(Clone, Copy)]
+enum ValueKind {
+    Scalar,
+    Vec2,
+    Vec3,
 }
-fn supported(p: &Property, path: &str) -> bool {
-    let vector = matches!(path, "transform/position" | "transform/scale" | "transform/anchor");
-    finite(&p.value, vector) && p.keys.iter().all(|k| finite(&k.value, vector))
+
+impl ValueKind {
+    fn finite(self, value: &Value) -> bool {
+        match (self, value) {
+            (Self::Scalar, Value::Scalar(v)) => v.is_finite(),
+            (Self::Vec2, Value::Vec2(v)) => v.iter().all(|x| x.is_finite()),
+            (Self::Vec3, Value::Vec3(v)) => v.iter().all(|x| x.is_finite()),
+            _ => false,
+        }
+    }
+    fn supported(self, p: &Property) -> bool {
+        self.finite(&p.value) && p.keys.iter().all(|k| self.finite(&k.value))
+    }
 }
 
 pub(super) struct Proof<'a> {
@@ -97,7 +106,8 @@ pub(super) struct Proof<'a> {
     old_comp: &'a Comp,
     new_comp: &'a Comp,
     layer: usize,
-    path: &'static str,
+    path: String,
+    kind: ValueKind,
 }
 
 impl<'a> Proof<'a> {
@@ -124,17 +134,48 @@ impl<'a> Proof<'a> {
         let mut selected = None;
         for path in PATHS {
             let (Some(old), Some(new)) = (old_layer.props.prop(path), new_layer.props.prop(path)) else { continue };
-            if old != new && selected.replace(path).is_some() {
+            let kind = if matches!(path, "transform/position" | "transform/scale" | "transform/anchor") { ValueKind::Vec3 } else { ValueKind::Scalar };
+            if old != new && selected.replace((path.to_owned(), kind)).is_some() {
                 return None;
             }
         }
-        let path = selected?;
-        let old = old_layer.props.prop(path)?;
-        let new = new_layer.props.prop(path)?;
-        if !supported(old, path) || !supported(new, path) {
+        // Direct mask properties only. Index-qualified paths distinguish masks even
+        // in malformed trees with repeated names or uids; normalization below proves
+        // that the entire remaining tree (including mask interpretation) is unchanged.
+        if let Some(masks) = old_layer.masks() {
+            let root = old_layer.props.children.iter().position(|n| n.as_group().is_some_and(|g| std::ptr::eq(g, masks)))?.checked_add(1)?;
+            for (index, node) in masks.children.iter().enumerate() {
+                let Node::Group(mask) = node else { continue };
+                let GroupKind::Mask { motion_blur, .. } = mask.kind else { continue };
+                let ordinal = index.checked_add(1)?;
+                for (name, kind) in [("opacity", ValueKind::Scalar), ("feather", ValueKind::Vec2), ("expansion", ValueKind::Scalar)] {
+                    let Some(property) = mask.children.iter().position(|n| n.as_prop().is_some_and(|p| p.match_id == name)) else { continue };
+                    let property = property.checked_add(1)?;
+                    let path = format!("#{root}/#{ordinal}/#{property}");
+                    let (Some(old), Some(new)) = (old_layer.props.prop(&path), new_layer.props.prop(&path)) else { continue };
+                    if old == new {
+                        continue;
+                    }
+                    // Forced mask blur samples feather/expansion at shutter times
+                    // when the path is animated, independently of the layer switch.
+                    // Reject it even when currently inactive: frame options can vary.
+                    // Opacity is applied after coverage, at the main context time.
+                    if name != "opacity" && motion_blur == MaskMotionBlur::On {
+                        return None;
+                    }
+                    if selected.replace((path, kind)).is_some() {
+                        return None;
+                    }
+                }
+            }
+        }
+        let (path, kind) = selected?;
+        let old = old_layer.props.prop(&path)?;
+        let new = new_layer.props.prop(&path)?;
+        if !kind.supported(old) || !kind.supported(new) {
             return None;
         }
-        if path != "transform/opacity" {
+        if path.starts_with("transform/") && path != "transform/opacity" {
             // Along-path orientation samples neighboring times. Separated position
             // and compound edits need a different proof; keep full invalidation.
             let tr = old_layer.transform()?;
@@ -150,7 +191,7 @@ impl<'a> Proof<'a> {
             return None;
         }
         let mut normalized = new_comp.clone();
-        *normalized.layers.get_mut(layer)?.props.prop_mut(path)? = old.clone();
+        *normalized.layers.get_mut(layer)?.props.prop_mut(&path)? = old.clone();
         if &normalized != old_comp {
             return None;
         }
@@ -169,7 +210,7 @@ impl<'a> Proof<'a> {
         {
             return None;
         }
-        Some(Self { before, after, old_comp, new_comp, layer, path })
+        Some(Self { before, after, old_comp, new_comp, layer, path, kind })
     }
 
     fn unchanged(&self, comp: ItemId, frame: i64) -> bool {
@@ -183,10 +224,9 @@ impl<'a> Proof<'a> {
             let (a, b) = (a.opacity(old), b.opacity(new));
             return a.is_finite() && b.is_finite() && a == b;
         }
-        let (Some(old_prop), Some(new_prop)) = (old.props.prop(self.path), new.props.prop(self.path)) else { return false };
+        let (Some(old_prop), Some(new_prop)) = (old.props.prop(&self.path), new.props.prop(&self.path)) else { return false };
         let (a, b) = (a.value(old, old_prop), b.value(new, new_prop));
-        let vector = self.path != "transform/rotation";
-        finite(&a, vector) && finite(&b, vector) && a == b
+        self.kind.finite(&a) && self.kind.finite(&b) && a == b
     }
 
     pub(super) fn rekey(&self, cache: &mut Cache, old: u64, new: u64, revision: u64, comp: ItemId) {
