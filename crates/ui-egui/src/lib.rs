@@ -1695,7 +1695,14 @@ impl EffectcraftApp {
     /// render the work area's frames (from the current time on, then from its start) in the
     /// background, a few at a time, until it is cached or the RAM preview budget is full.
     fn cache_when_idle(&mut self, ctx: &egui::Context, comp: &effectcraft_engine::project::Comp, series: &FrameKey, now: f64, (wa, wb): (i64, i64)) {
-        let active = ctx.input(|i| !i.events.is_empty() || i.pointer.any_down() || i.pointer.is_moving());
+        // Moving the pointer over the window isn't activity (After Effects keeps caching):
+        // clicks, keys, wheel and drags are.
+        let active = ctx.input(|i| {
+            i.pointer.any_down()
+                || i.events
+                    .iter()
+                    .any(|e| !matches!(e, egui::Event::PointerMoved(_) | egui::Event::MouseMoved(_) | egui::Event::PointerGone | egui::Event::WindowFocused(_)))
+        });
         if active || self.last_activity.1 != self.session.revision {
             self.last_activity = (now, self.session.revision);
         }
