@@ -103,6 +103,11 @@ impl Mips {
         self.chains.lock().is_ok_and(|chains| chains.get(&k).is_some_and(|c| c.source.ptr_eq(&Arc::downgrade(a))))
     }
 
+    /// Whether `img` (any clone of it) is sealed, so it must never be drawn on in place.
+    pub(crate) fn is_sealed(&self, img: &GpuImage) -> bool {
+        key(img).is_some_and(|(k, a)| self.sealed(k, a))
+    }
+
     /// Published level `n` of a sealed image, while its slot is retained.
     fn level(&self, k: usize, a: &Arc<GpuAllocation>, n: usize, generation: &effectcraft_render::allocation::GpuGeneration) -> Option<GpuImage> {
         let (owner, slot) = {

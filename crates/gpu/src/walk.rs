@@ -601,7 +601,7 @@ fn composite_resident(
         };
         return Some(composite_iso(e, r, ctx, layer, iso, canvas, opacity));
     }
-    Some(place_src(e, r, ctx, layer, &shape, img, canvas, layer.blend_mode, opacity, pipe.levels).map(|c| *canvas = c))
+    Some(place_src_in(e, r, ctx, layer, &shape, img, canvas, layer.blend_mode, opacity, pipe.levels))
 }
 
 /// Adjustment layer (`Renderer::draw_adjustment`): the effect stack runs on the comp below,
@@ -643,8 +643,7 @@ fn composite_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, buf:
     let matte = r.track_matte(ctx, layer).is_some();
     if !matte && !layer.preserve_transparency {
         // The comp is quantised after the layer (8/16 bpc) in the same pass.
-        *canvas = place(e, r, ctx, layer, buf, canvas, layer.blend_mode, opacity, r.pipe().levels)?;
-        return Some(());
+        return place_in(e, r, ctx, layer, buf, canvas, layer.blend_mode, opacity, r.pipe().levels);
     }
     // Render in isolation, then matte / preserve transparency, then blend.
     let iso = place(e, r, ctx, layer, buf, &e.zeros(canvas.width, canvas.height), BlendMode::Normal, 1.0, None)?;
@@ -704,11 +703,30 @@ fn place(
     opacity: f32,
     levels: Option<f32>,
 ) -> Option<GpuImage> {
+    let mut out = target.clone();
+    place_in(e, r, ctx, layer, buf, &mut out, mode, opacity, levels)?;
+    Some(out)
+}
+
+/// [`place`] onto `target` itself (in place over the layer's bounds when the encoder owns it:
+/// `ops::warp_q_in`).
+#[allow(clippy::too_many_arguments)]
+fn place_in(
+    e: &mut Enc,
+    r: &Renderer,
+    ctx: &EvalCtx,
+    layer: &Layer,
+    buf: &Arc<Buf>,
+    target: &mut GpuImage,
+    mode: BlendMode,
+    opacity: f32,
+    levels: Option<f32>,
+) -> Option<()> {
     if buf.img.is_empty() || opacity <= 0.0 {
-        return Some(target.clone());
+        return Some(());
     }
     let src = e.upload_buf(buf)?;
-    place_src(e, r, ctx, layer, buf, src, target, mode, opacity, levels)
+    place_src_in(e, r, ctx, layer, buf, src, target, mode, opacity, levels)
 }
 
 /// [`place`] of a GPU image `src` shaped like `buf`.
@@ -725,11 +743,32 @@ fn place_src(
     opacity: f32,
     levels: Option<f32>,
 ) -> Option<GpuImage> {
+    let mut out = target.clone();
+    place_src_in(e, r, ctx, layer, buf, src, &mut out, mode, opacity, levels)?;
+    Some(out)
+}
+
+/// [`place_src`] onto `target` itself (see [`place_in`]).
+#[allow(clippy::too_many_arguments)]
+fn place_src_in(
+    e: &mut Enc,
+    r: &Renderer,
+    ctx: &EvalCtx,
+    layer: &Layer,
+    buf: &Buf,
+    src: GpuImage,
+    target: &mut GpuImage,
+    mode: BlendMode,
+    opacity: f32,
+    levels: Option<f32>,
+) -> Option<()> {
     let pl = r.placement(ctx, layer, buf);
     if let [m] = pl.matrices.as_slice() {
-        return Some(ops::warp_q(e, target, &src, m, pl.sampling, mode, opacity, pl.seed, None, levels));
+        ops::warp_q_in(e, target, &src, m, pl.sampling, mode, opacity, pl.seed, None, levels);
+        return Some(());
     }
     let k = 1.0 / pl.matrices.len() as f32;
     let acc = ops::warp_accumulate(e, &e.zeros(target.width, target.height), &src, &pl.matrices, pl.sampling, k);
-    Some(ops::blend_full(e, target, &acc, mode, opacity, pl.seed, levels))
+    *target = ops::blend_full(e, target, &acc, mode, opacity, pl.seed, levels);
+    Some(())
 }

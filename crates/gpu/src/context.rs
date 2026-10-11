@@ -29,7 +29,9 @@ const ENTRIES: &[&str] = &[
 /// Effect entry points in `kernels.wgsl`. Like the `fx_*` kernels, one that fails to build
 /// (a driver's shader compiler rejecting it, #613) leaves its effects to the CPU instead of
 /// turning the whole compositor off.
-const EFFECT_ENTRIES: &[&str] = &["box_h", "box_v", "directional", "glow_bright", "glow_combine", "glow_ab", "shadow_make", "shadow_combine", "pointwise"];
+/// (`warp_blend_at` too: without it, layers composite through the full-canvas `warp_blend`.)
+const EFFECT_ENTRIES: &[&str] =
+    &["box_h", "box_v", "directional", "glow_bright", "glow_combine", "glow_ab", "shadow_make", "shadow_combine", "pointwise", "warp_blend_at"];
 
 /// Entry points that also bind group 1 (four read-only storage buffers; see
 /// [`Enc::dispatch_ext`]).
@@ -51,7 +53,8 @@ const POOL_BUDGET: usize = 768 << 20;
 /// Small auxiliary caches must be bounded across sizes, not independently per size.
 const AUX_CACHE_BUDGET: u64 = 64 << 20;
 
-/// A GPU image: premultiplied RGBA f32 in a texture (cheap to clone; immutable once written).
+/// A GPU image: premultiplied RGBA f32 in a texture (cheap to clone; immutable once written,
+/// except that an image no one else can see may be drawn on in place: see [`Enc::owns`]).
 /// Working images come from the context's texture pool and go back to it when the last clone
 /// is dropped.
 #[derive(Clone, Debug)]
@@ -87,6 +90,8 @@ impl GpuImage {
 struct Lease {
     pooled: Pooled,
     pool: Weak<Mutex<Pool>>,
+    /// The command encoder the texture was taken for (see [`Enc::owns`]).
+    encoder: Option<u64>,
 }
 
 /// A pooled working texture with its default view, made once with the texture and reused with
@@ -1129,6 +1134,7 @@ impl GpuContext {
     /// A pooled working texture: (image, reused). A reused texture holds old pixels; a new
     /// one is zeroed.
     fn pooled_for_encoder(&self, w: u32, h: u32, encoder: Option<u64>) -> (GpuImage, bool) {
+        let made_for = encoder;
         #[cfg(feature = "profile")]
         let encoder = {
             static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1140,7 +1146,7 @@ impl GpuContext {
         let was_reused = reused.is_some();
         let pooled = reused.unwrap_or_else(|| Pooled::from(self.texture(w, h)));
         let (texture, view) = (pooled.texture.clone(), pooled.view.clone());
-        let lease = Arc::new(Lease { pooled, pool: Arc::downgrade(&self.pool) });
+        let lease = Arc::new(Lease { pooled, pool: Arc::downgrade(&self.pool), encoder: made_for });
         let allocation = effectcraft_render::allocation::GpuAllocation::rgba_f32(w, h, self.generation.clone());
         (GpuImage { allocation, texture, width: w, height: h, view, _lease: Some(lease), levels: None }, was_reused)
     }
@@ -1869,6 +1875,20 @@ impl<'g> Enc<'g> {
         if self.pass.as_ref().is_some_and(|(_, shared)| !shared) {
             self.pass = None;
         }
+    }
+
+    /// Whether `img` may be drawn on in place by this encoder's next commands instead of
+    /// copied into a new image: its pooled texture was taken for the command encoder still
+    /// recording (so every earlier reader of it is recorded before, or submitted with, that
+    /// encoder) and no other image holds it (the caller's `&mut` is the only handle; raw
+    /// texture handles are only borrowed while recording). Images from other encoders, shared
+    /// ones (`zeros`, caches, clones), sealed ones (their kept mip levels would go stale) and
+    /// unpooled ones are never owned.
+    pub(crate) fn owns(&self, img: &GpuImage) -> bool {
+        let Some((_, id)) = &self.enc else { return false };
+        *id != 0
+            && img._lease.as_ref().is_some_and(|l| l.encoder == Some(*id) && Arc::strong_count(l) == 1 && Arc::weak_count(l) == 0)
+            && !self.g.mips.is_sealed(img)
     }
 
     /// Whether the kernel `entry` built on this device.
