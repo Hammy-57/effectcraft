@@ -7,13 +7,16 @@ use crate::frames::FrameKey;
 
 const WINDOW: usize = 32;
 const MIN_SAMPLES: usize = 8;
+// AutoPick warms three frames per compositor. Discard eight actual renders
+// at each new scale so cold uploads and compositor exploration do not decide.
+const WARMUP: usize = 8;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Config {
     pub full: FrameKey,
     pub half: FrameKey,
     pub budget_ms: f64,
-    pub backend: usize,
+    pub gpu_context: usize,
 }
 
 impl Config {
@@ -22,7 +25,7 @@ impl Config {
             && self.full.revision == other.full.revision
             && self.half.same_series(&other.half)
             && self.budget_ms == other.budget_ms
-            && self.backend == other.backend
+            && self.gpu_context == other.gpu_context
     }
 }
 
@@ -34,13 +37,17 @@ pub(crate) struct Budget {
     config: Option<Config>,
     epoch: Arc<()>,
     samples: VecDeque<f64>,
-    backend: Option<bool>,
+    residency: Option<bool>,
     reduced: bool,
+    trial_reference: Option<f64>,
+    locked_full: bool,
+    warmup: usize,
+    trial_samples: usize,
 }
 
 impl Budget {
-    /// A reduction lasts for this playback/content epoch. Do not oscillate on
-    /// cheap Half frames or on RAM-only playback; idle always restores Full.
+    /// Trial Half once per playback/content epoch. Keep it only when measured
+    /// faster; do not oscillate on cache hits. Idle always restores Full.
     pub fn configure(&mut self, config: Option<Config>) -> bool {
         let config = config.filter(|c| c.budget_ms.is_finite() && c.budget_ms > 0.0 && c.half.scale < c.full.scale);
         let unchanged = match (&self.config, &config) {
@@ -51,6 +58,9 @@ impl Budget {
         if !unchanged {
             self.config = config;
             self.reduced = false;
+            self.trial_reference = None;
+            self.locked_full = false;
+            self.trial_samples = 0;
             self.reset_samples();
         }
         self.reduced
@@ -59,7 +69,8 @@ impl Budget {
     fn reset_samples(&mut self) {
         self.epoch = Arc::new(());
         self.samples.clear();
-        self.backend = None;
+        self.residency = None;
+        self.warmup = WARMUP;
     }
 
     pub fn ticket(&self, key: FrameKey) -> Option<Ticket> {
@@ -68,20 +79,35 @@ impl Budget {
         (key.same_series(&expected) && key.revision == expected.revision).then(|| Ticket(self.epoch.clone()))
     }
 
-    pub fn record(&mut self, ticket: Ticket, ms: f64, gpu: bool) {
+    pub fn record(&mut self, ticket: Ticket, ms: f64, resident: bool) {
         if !Arc::ptr_eq(&ticket.0, &self.epoch) || !ms.is_finite() || ms <= 0.0 {
             return;
         }
         let Some(config) = self.config else { return };
-        if self.backend.is_some_and(|old| old != gpu) {
-            self.samples.clear();
+        if self.trial_reference.is_some() {
+            self.trial_samples = self.trial_samples.saturating_add(1);
+            if self.trial_samples > 64 {
+                self.reduced = false;
+                self.locked_full = true;
+                self.trial_reference = None;
+                self.reset_samples();
+                return;
+            }
         }
-        self.backend = Some(gpu);
+        if self.residency.is_some_and(|old| old != resident) {
+            self.samples.clear();
+            self.warmup = WARMUP;
+        }
+        self.residency = Some(resident);
+        if self.warmup > 0 {
+            self.warmup = self.warmup.saturating_sub(1);
+            return;
+        }
         if self.samples.len() >= WINDOW {
             self.samples.pop_front();
         }
         self.samples.push_back(ms);
-        if self.reduced || self.samples.len() < MIN_SAMPLES {
+        if self.locked_full || (self.reduced && self.trial_reference.is_none()) || self.samples.len() < MIN_SAMPLES {
             return;
         }
         let mut sorted: Vec<_> = self.samples.iter().copied().collect();
@@ -89,10 +115,22 @@ impl Budget {
         // Nearest-rank p95. The bounded length makes these operations safe.
         let rank = sorted.len().saturating_mul(95).div_ceil(100).saturating_sub(1);
         let p95 = sorted.get(rank).copied().unwrap_or(0.0);
+        if let Some(reference) = self.trial_reference.take() {
+            // Fewer pixels are not necessarily faster: Auto may choose different
+            // compositors at each scale. Keep Half only with a clear measured win.
+            if p95 >= reference * 0.9 {
+                self.reduced = false;
+                self.locked_full = true;
+                self.reset_samples();
+            }
+            return;
+        }
         // A 10% margin and two slow observations avoid reacting to a single hitch.
         let threshold = config.budget_ms * 1.1;
         if p95 > threshold && sorted.iter().filter(|ms| **ms > threshold).take(2).count() == 2 {
             self.reduced = true;
+            self.trial_reference = Some(p95);
+            self.trial_samples = 0;
             self.reset_samples();
         }
     }
@@ -103,7 +141,7 @@ mod tests {
     use super::*;
     fn config() -> Config {
         let full = FrameKey { revision: 1, content: 1, comp: 1, frame: 0, scale: 1000, view: 0, opts: 1 };
-        Config { full, half: FrameKey { scale: 500, opts: 2, ..full }, budget_ms: 1000.0 / 30.0, backend: 0 }
+        Config { full, half: FrameKey { scale: 500, opts: 2, ..full }, budget_ms: 1000.0 / 30.0, gpu_context: 0 }
     }
     fn sample(b: &mut Budget, c: Config, ms: f64, gpu: bool) {
         let t = b.ticket(c.full).unwrap();
@@ -114,6 +152,7 @@ mod tests {
         let c = config();
         let mut b = Budget::default();
         assert!(!b.configure(Some(c)));
+        for _ in 0..WARMUP { sample(&mut b, c, 50.0, true); }
         for _ in 0..7 { sample(&mut b, c, 50.0, true); }
         assert!(!b.configure(Some(c)));
         sample(&mut b, c, 50.0, true);
@@ -152,12 +191,58 @@ mod tests {
         assert!(b.samples.is_empty());
         assert!(b.ticket(FrameKey { revision: 2, ..c.full }).is_none());
         assert!(b.ticket(FrameKey { content: 2, ..c.full }).is_none());
+        for _ in 0..WARMUP { sample(&mut b, c, 10.0, false); }
         for _ in 0..7 { sample(&mut b, c, 100.0, false); }
         sample(&mut b, c, 10.0, true);
-        assert_eq!(b.samples.len(), 1);
+        assert!(b.samples.is_empty());
         assert!(!b.configure(Some(c)));
         let changed = Config { full: FrameKey { content: 2, ..c.full }, ..c };
         assert!(!b.configure(Some(changed)));
         assert!(b.samples.is_empty());
     }
+    #[test]
+    fn slower_half_trial_restores_full_without_repeated_trials() {
+        let c = config();
+        let mut b = Budget::default();
+        b.configure(Some(c));
+        for _ in 0..WARMUP + MIN_SAMPLES { sample(&mut b, c, 50.0, false); }
+        assert!(b.configure(Some(c)));
+        for _ in 0..WARMUP + MIN_SAMPLES {
+            let ticket = b.ticket(c.half).unwrap();
+            b.record(ticket, 80.0, false);
+        }
+        assert!(!b.configure(Some(c)));
+        for _ in 0..100 { sample(&mut b, c, 1000.0, false); }
+        assert!(!b.configure(Some(c)));
+        b.configure(None);
+        b.configure(Some(c));
+        for _ in 0..WARMUP + MIN_SAMPLES { sample(&mut b, c, 50.0, false); }
+        assert!(b.configure(Some(c)));
+    }
+    #[test]
+    fn cold_compositor_trials_do_not_choose_resolution() {
+        let c = config();
+        let mut b = Budget::default();
+        b.configure(Some(c));
+        for _ in 0..WARMUP { sample(&mut b, c, 1000.0, false); }
+        for _ in 0..MIN_SAMPLES { sample(&mut b, c, 10.0, false); }
+        assert!(!b.configure(Some(c)));
+    }
+
+    #[test]
+    fn unstable_trial_is_bounded_and_old_half_completion_cannot_retrain_full() {
+        let c = config();
+        let mut b = Budget::default();
+        b.configure(Some(c));
+        for _ in 0..WARMUP + MIN_SAMPLES { sample(&mut b, c, 50.0, false); }
+        let late = b.ticket(c.half).unwrap();
+        for i in 0..65 {
+            let ticket = b.ticket(c.half).unwrap();
+            b.record(ticket, 80.0, i % 2 == 0);
+        }
+        assert!(!b.configure(Some(c)));
+        b.record(late, 1.0, false);
+        assert!(b.samples.is_empty());
+    }
+
 }

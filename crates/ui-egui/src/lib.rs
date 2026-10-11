@@ -789,8 +789,8 @@ impl EffectcraftApp {
         // play back, and frames cached by a preview stay on screen when it stops.
         let full = self.ui.viewer.res.scale(zoom, ppp);
         // Native Auto playback uses actual render service p95, never cache hits.
-        // A reduction stays latched until idle/content change rather than
-        // oscillating when Half frames are cheaper than Full frames.
+        // Try a lower scale once; retain it only when its measured p95 improves.
+        // This avoids oscillation and restores Full when fewer pixels are slower.
         let adaptive = self.playback.playing
             && !self.playback.caching
             && self.ui.viewer.res == state::Resolution::Auto
@@ -807,7 +807,7 @@ impl EffectcraftApp {
                 full: self.frame_series(comp, full),
                 half: self.frame_series(comp, half),
                 budget_ms: 1000.0 * step / self.playback.fps,
-                backend: self.gpu.as_ref().map_or(0, |g| std::ptr::from_ref(g.context()) as usize),
+                gpu_context: self.gpu.as_ref().map_or(0, |g| std::ptr::from_ref(g.context()) as usize),
             }
         });
         if self.frames.adapt_playback(config) {
@@ -2082,7 +2082,7 @@ mod playback_budget_tests {
     fn slow(app: &EffectcraftApp) {
         let full = app.viewer_scale(1.0, 1.0);
         let key = app.frame_series(app.session.active_comp_id().unwrap(), full);
-        for _ in 0..8 {
+        for _ in 0..16 {
             app.frames.playback_sample(key, 80.0);
         }
     }

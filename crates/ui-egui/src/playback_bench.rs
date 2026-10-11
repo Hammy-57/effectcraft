@@ -7,6 +7,7 @@ fn adaptive_playback_frame_availability() {
     use crate::{EffectcraftApp, frames::FrameImage, state::Resolution};
     use effectcraft_engine::commands::viewer_cmds::FastPreviews;
     use effectcraft_engine::project::{ItemKind, Project};
+    use effectcraft_engine::render::{Accelerator, auto::AutoKey};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     let path = std::env::var("RT5_PROJECT").unwrap();
@@ -17,6 +18,7 @@ fn adaptive_playback_frame_availability() {
     let mut runs = Vec::new();
     for adaptive in [false, true, true, false] {
         gpu.context().clear_uploads();
+        if let Some(pick) = gpu.auto_pick() { pick.reset(); }
         let mut session = effectcraft_host::session();
         session.replace_project(project.clone(), None);
         session.open_comp(cid);
@@ -31,7 +33,7 @@ fn adaptive_playback_frame_availability() {
         let mut samples = Vec::new();
         let mut scales = Vec::new();
         let mut first_reduction = None;
-        for frame in 0..76 {
+        for frame in 0..108 {
             let scale = app.viewer_scale(1.0, 1.0);
             if scale < 1.0 && first_reduction.is_none() { first_reduction = Some(frame); }
             let key = app.frame_key(cid, frame, scale);
@@ -48,7 +50,7 @@ fn adaptive_playback_frame_availability() {
             samples.push(elapsed_ms);
             scales.push(scale);
         }
-        let mut steady = samples.iter().skip(16).copied().collect::<Vec<_>>();
+        let mut steady = samples.iter().skip(48).copied().collect::<Vec<_>>();
         steady.sort_by(f64::total_cmp);
         let p50 = steady.get(29).copied().unwrap();
         let p95 = steady.get(56).copied().unwrap();
@@ -56,8 +58,14 @@ fn adaptive_playback_frame_availability() {
         app.playback.playing = false;
         assert_eq!(app.viewer_scale(1.0, 1.0), 1.0);
         eprintln!("RT5 adaptive={adaptive} first_reduction={first_reduction:?} p50={p50:.2} p95={p95:.2}");
+        let auto_stats: Vec<_> = [1.0, 0.5].into_iter().map(|scale| {
+            let stats = gpu.auto_pick().and_then(|pick| pick.stats(AutoKey::new(cid, scale, false)));
+            serde_json::json!({"scale": scale, "cpuMs": stats.and_then(|s| s.cpu_ms),
+                "gpuMs": stats.and_then(|s| s.gpu_ms), "cpuFrames": stats.map(|s| s.cpu_frames),
+                "gpuFrames": stats.map(|s| s.gpu_frames)})
+        }).collect();
         runs.push(serde_json::json!({"adaptive": adaptive, "firstReductionFrame": first_reduction,
-            "p50Ms": p50, "p95Ms": p95, "availabilityMs": samples, "scales": scales}));
+            "p50Ms": p50, "p95Ms": p95, "availabilityMs": samples, "scales": scales, "autoStats": auto_stats}));
     }
     let output = std::env::var("RT5_REPORT").unwrap();
     std::fs::write(output, serde_json::to_vec_pretty(&runs).unwrap()).unwrap();
