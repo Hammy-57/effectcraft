@@ -29,9 +29,23 @@ const ENTRIES: &[&str] = &[
 /// Effect entry points in `kernels.wgsl`. Like the `fx_*` kernels, one that fails to build
 /// (a driver's shader compiler rejecting it, #613) leaves its effects to the CPU instead of
 /// turning the whole compositor off.
-/// (`warp_blend_at` too: without it, layers composite through the full-canvas `warp_blend`.)
-const EFFECT_ENTRIES: &[&str] =
-    &["box_h", "box_v", "directional", "glow_bright", "glow_combine", "glow_ab", "shadow_make", "shadow_combine", "pointwise", "warp_blend_at"];
+/// (The in-place `*_at` passes too: without one, its full-canvas pass runs instead.)
+const EFFECT_ENTRIES: &[&str] = &[
+    "box_h",
+    "box_v",
+    "directional",
+    "glow_bright",
+    "glow_combine",
+    "glow_ab",
+    "shadow_make",
+    "shadow_combine",
+    "pointwise",
+    "warp_blend_at",
+    "warp_accum_at",
+    "blend_full_at",
+    "matte_at",
+    "channel_mix_at",
+];
 
 /// Reference kernels the tests compare against (`box_h_serial`: `box_h` as it was).
 const TEST_ENTRIES: &[&str] = if cfg!(test) { &["box_h_serial"] } else { &[] };

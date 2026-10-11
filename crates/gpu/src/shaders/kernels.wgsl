@@ -109,15 +109,32 @@ fn warp_accum(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (x >= dims.x || y >= dims.y) {
         return;
     }
+    textureStore(out, vec2<i32>(x, y), warp_accum_px(x, y, textureLoad(aux, vec2<i32>(x, y), 0)));
+}
+
+// `warp_accum` in place over u[1] = (x0, y0, x1, y1) (as `warp_blend_at`).
+@compute @workgroup_size(16, 16)
+fn warp_accum_at(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dims = out_dims();
+    let o = P.u[1];
+    let x = i32(o.x + gid.x);
+    let y = i32(o.y + gid.y);
+    if (x >= i32(o.z) || y >= i32(o.w) || x >= dims.x || y >= dims.y) {
+        return;
+    }
+    textureStore(out, vec2<i32>(x, y), warp_accum_px(x, y, textureLoad(aux, vec2<i32>(gid.xy), 0)));
+}
+
+// One `warp_accum` pixel: the sum at (x, y) over the canvas pixel `d0`.
+fn warp_accum_px(x: i32, y: i32, d0: vec4<f32>) -> vec4<f32> {
     let sampling = P.u[0].x;
     let count = P.u[0].y;
     let k = P.f[0].x;
-    var d = textureLoad(aux, vec2<i32>(x, y), 0);
+    var d = d0;
     let fx = f32(x) + 0.5;
     let fy = f32(y) + 0.5;
     if (fx < P.f[0].y || fy < P.f[0].z || fx > P.f[0].w || fy > P.f[1].x) {
-        textureStore(out, vec2<i32>(x, y), d);
-        return;
+        return d;
     }
     let sz = vec2<f32>(textureDimensions(src));
     for (var i = 0u; i < count; i = i + 1u) {
@@ -140,7 +157,7 @@ fn warp_accum(@builtin(global_invocation_id) gid: vec3<u32>) {
             d = d + s * k;
         }
     }
-    textureStore(out, vec2<i32>(x, y), d);
+    return d;
 }
 
 // Blend `src` (same size) onto `aux` (Image::blend_from).
@@ -152,20 +169,36 @@ fn blend_full(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (p.x >= dims.x || p.y >= dims.y) {
         return;
     }
+    store_q(p, blend_full_px(p, textureLoad(aux, p, 0)), P.f[0].y, P.f[0].z);
+}
+
+// `blend_full` in place over u[1] = (x0, y0, x1, y1): `out` is the canvas, `aux` that
+// rectangle of it (as `warp_blend_at`), `src` the layer.
+@compute @workgroup_size(16, 16)
+fn blend_full_at(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dims = out_dims();
+    let o = P.u[1];
+    let p = vec2<i32>(i32(o.x + gid.x), i32(o.y + gid.y));
+    if (p.x >= i32(o.z) || p.y >= i32(o.w) || p.x >= dims.x || p.y >= dims.y) {
+        return;
+    }
+    store_q(p, blend_full_px(p, textureLoad(aux, vec2<i32>(gid.xy), 0)), P.f[0].y, P.f[0].z);
+}
+
+// One `blend_full` pixel: `src` at `p` blended over the canvas pixel `d` (before quantising).
+fn blend_full_px(p: vec2<i32>, d: vec4<f32>) -> vec4<f32> {
     let mode = P.u[0].x;
-    let d = textureLoad(aux, p, 0);
     var s = textureLoad(src, p, 0);
     if (P.u[0].y != 0u) { s = s * d.w; }
     if (s.w <= 0.0 && !is_stencil(mode)) {
-        store_q(p, d, P.f[0].y, P.f[0].z);
-        return;
+        return d;
     }
     s = s * P.f[0].x;
     var n = 0.5;
     if (mode == 1u || mode == 2u) {
-        n = hash_noise(gid.x, gid.y, P.u[0].z);
+        n = hash_noise(u32(p.x), u32(p.y), P.u[0].z);
     }
-    store_q(p, blend_pixel(mode, d, s, n), P.f[0].y, P.f[0].z);
+    return blend_pixel(mode, d, s, n);
 }
 
 // Track matte: `src` × matte factor of `aux`. u[0].x = 0 alpha, 1 alpha inverted, 2 luma,
@@ -177,6 +210,24 @@ fn matte(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (p.x >= dims.x || p.y >= dims.y) {
         return;
     }
+    textureStore(out, p, matte_px(p, textureLoad(src, p, 0)));
+}
+
+// `matte` in place over u[1] = (x0, y0, x1, y1): `out` is the layer, `src` that rectangle of
+// it, `aux` the matte.
+@compute @workgroup_size(16, 16)
+fn matte_at(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dims = out_dims();
+    let o = P.u[1];
+    let p = vec2<i32>(i32(o.x + gid.x), i32(o.y + gid.y));
+    if (p.x >= i32(o.z) || p.y >= i32(o.w) || p.x >= dims.x || p.y >= dims.y) {
+        return;
+    }
+    textureStore(out, p, matte_px(p, textureLoad(src, vec2<i32>(gid.xy), 0)));
+}
+
+// One `matte` pixel: the layer pixel `s` × the matte factor at `p`.
+fn matte_px(p: vec2<i32>, s: vec4<f32>) -> vec4<f32> {
     let q = textureLoad(aux, p, 0);
     var k: f32;
     switch P.u[0].x {
@@ -186,7 +237,7 @@ fn matte(@builtin(global_invocation_id) gid: vec3<u32>) {
         default: { k = 1.0 - luminance(q.xyz); }
     }
     k = clamp(k, 0.0, 1.0);
-    textureStore(out, p, textureLoad(src, p, 0) * k);
+    return s * k;
 }
 
 // Preserve Transparency: `src` × alpha of `aux`.
@@ -221,7 +272,24 @@ fn channel_mix(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (p.x >= dims.x || p.y >= dims.y) {
         return;
     }
-    let c = textureLoad(src, p, 0);
+    textureStore(out, p, channel_mix_px(p, textureLoad(src, p, 0)));
+}
+
+// `channel_mix` in place over u[1] = (x0, y0, x1, y1): `out` is the canvas, `src` that
+// rectangle of it, `aux` the styled layer's result.
+@compute @workgroup_size(16, 16)
+fn channel_mix_at(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dims = out_dims();
+    let o = P.u[1];
+    let p = vec2<i32>(i32(o.x + gid.x), i32(o.y + gid.y));
+    if (p.x >= i32(o.z) || p.y >= i32(o.w) || p.x >= dims.x || p.y >= dims.y) {
+        return;
+    }
+    textureStore(out, p, channel_mix_px(p, textureLoad(src, vec2<i32>(gid.xy), 0)));
+}
+
+// One `channel_mix` pixel: the canvas pixel `c` moved toward `aux` at `p`.
+fn channel_mix_px(p: vec2<i32>, c: vec4<f32>) -> vec4<f32> {
     let t = textureLoad(aux, p, 0);
     let op = P.f[0].x;
     var v = t;
@@ -234,7 +302,7 @@ fn channel_mix(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (P.u[0].z == 0u) {
         v.z = c.z;
     }
-    textureStore(out, p, c + (v - c) * op);
+    return c + (v - c) * op;
 }
 
 // 8/16 bpc: clamp premultiplied pixels to 0..1 (colour ≤ alpha) and round. f[0].x = levels.
