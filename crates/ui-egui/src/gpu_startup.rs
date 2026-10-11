@@ -44,7 +44,9 @@ pub(crate) struct Latest<K> {
     declined: Option<K>,
 }
 impl<K> Default for Latest<K> {
-    fn default() -> Self { Self { pending: None, started: None, declined: None } }
+    fn default() -> Self {
+        Self { pending: None, started: None, declined: None }
+    }
 }
 impl<K: Eq> Latest<K> {
     pub(crate) fn completed(key: Option<K>) -> Self {
@@ -53,15 +55,23 @@ impl<K: Eq> Latest<K> {
     pub(crate) fn needs(&mut self, key: &K) -> bool {
         if let Some(pending) = &self.pending {
             let Some(result) = pending.poll() else { return false };
-            if let Err(error) = result { log::warn!("GPU project warmup: {error}"); }
+            if let Err(error) = result {
+                log::warn!("GPU project warmup: {error}");
+            }
             self.pending = None;
         }
         self.started.as_ref() != Some(key) && self.declined.as_ref() != Some(key)
     }
     pub(crate) fn request(&mut self, key: K, work: impl FnOnce() -> Result<(), String> + Send + 'static, wake: impl FnOnce() + Send + 'static) {
-        if !self.needs(&key) { return; }
+        if !self.needs(&key) {
+            return;
+        }
         match Pending::start(work, wake) {
-            Ok(pending) => { self.started = Some(key); self.declined = None; self.pending = Some(pending); }
+            Ok(pending) => {
+                self.started = Some(key);
+                self.declined = None;
+                self.pending = Some(pending);
+            }
             Err(error) => {
                 // Avoid retrying a failed thread spawn every UI frame; a new revision retries.
                 self.declined = Some(key);
@@ -90,12 +100,28 @@ mod tests {
         let mut latest = Latest::default();
         let (release, wait) = mpsc::channel();
         let (finished, finished_rx) = mpsc::channel();
-        latest.request(1, move || { wait.recv().unwrap(); Ok(()) }, move || finished.send(()).unwrap());
-        for key in 2..10 { latest.request(key, || panic!("obsolete worker spawned"), || {}); }
+        latest.request(
+            1,
+            move || {
+                wait.recv().unwrap();
+                Ok(())
+            },
+            move || finished.send(()).unwrap(),
+        );
+        for key in 2..10 {
+            latest.request(key, || panic!("obsolete worker spawned"), || {});
+        }
         release.send(()).unwrap();
         finished_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
         let (started, started_rx) = mpsc::channel();
-        latest.request(10, move || { started.send(()).unwrap(); Ok(()) }, || {});
+        latest.request(
+            10,
+            move || {
+                started.send(()).unwrap();
+                Ok(())
+            },
+            || {},
+        );
         started_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
         assert_eq!(latest.started, Some(10));
     }

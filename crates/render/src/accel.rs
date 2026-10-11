@@ -141,7 +141,9 @@ impl<'a> Renderer<'a> {
     /// so a planning pass declines them rather than evaluating a different host.
     pub fn effect_plan_safe(layer: &Layer, max_nodes: usize) -> bool {
         fn walk(group: &effectcraft_project::PropGroup, left: &mut usize, depth: usize) -> bool {
-            if depth > 32 || group.children.len() > *left { return false; }
+            if depth > 32 || group.children.len() > *left {
+                return false;
+            }
             *left -= group.children.len();
             group.children.iter().all(|node| match node {
                 effectcraft_project::Node::Prop(p) => !p.has_expression(),
@@ -157,12 +159,17 @@ impl<'a> Renderer<'a> {
     pub fn visit_gpu_effect_runs(&self, ctx: &EvalCtx, layer: &Layer, max_effects: usize, visitor: &mut dyn FnMut(&[FxStep])) -> bool {
         let limit = max_effects.min(256);
         if ctx.expr.is_some()
-            || !Self::effect_plan_safe(layer, 4096) || layer.effects().is_some_and(|g| g.groups().take(limit.saturating_add(1)).count() > limit) {
+            || !Self::effect_plan_safe(layer, 4096)
+            || layer.effects().is_some_and(|g| g.groups().take(limit.saturating_add(1)).count() > limit)
+        {
             return false;
         }
         struct Plan<'v>(&'v mut dyn FnMut(&[FxStep]));
         impl FxTarget for Plan<'_> {
-            fn gpu(&mut self, steps: &[FxStep]) -> bool { (self.0)(steps); true }
+            fn gpu(&mut self, steps: &[FxStep]) -> bool {
+                (self.0)(steps);
+                true
+            }
             fn cpu(&mut self, _: &mut dyn FnMut(Buf) -> Buf) {}
             fn shift(&mut self, _: [f64; 2]) {}
         }
