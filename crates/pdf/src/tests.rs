@@ -1020,3 +1020,19 @@ fn multiple_pages_and_calculator_shadings() {
     assert!(img.get(5, 25)[0] < 0.1 && img.get(95, 25)[0] > 0.9, "{:?} {:?}", img.get(5, 25), img.get(95, 25));
     assert_eq!(parse_page(&bytes, 2), Err(Error::PageOutOfRange(2)));
 }
+
+/// Fuzzing found a page tree whose node lists itself several times in `Kids`: walked once per
+/// path to it, 3^32 visits hung the import. The walk now has a visit budget.
+#[test]
+fn a_page_tree_that_lists_itself_doesnt_hang() {
+    let objs: Objs = vec![
+        (1, "<< /Type /Catalog /Pages 2 0 R >>".into(), None),
+        // No page under it, so the page cap never stops the walk.
+        (2, "<< /Type /Pages /Kids [2 0 R 2 0 R 2 0 R] /Count 1 >>".into(), None),
+    ];
+    let bytes = pdf(&objs, 1);
+    let t = std::time::Instant::now();
+    assert_eq!(page_count(&bytes), 0);
+    assert!(parse(&bytes).is_err());
+    assert!(t.elapsed().as_secs() < 5, "took {:?}", t.elapsed());
+}
