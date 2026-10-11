@@ -13,6 +13,7 @@ include!(concat!(env!("OUT_DIR"), "/modules.rs"));
 // By hand: submodules in `i18n/`.
 pub mod i18n;
 // By hand: UI command area files in `menus/` (`AREAS`, see menus.rs).
+pub mod frames;
 mod local_assets;
 pub mod menus;
 // By hand: behind a feature.

@@ -34,6 +34,8 @@ use effectcraft_engine::time::Tick;
 use effectcraft_gpu::{DisplayFrame, Gpu};
 use rayon::prelude::*;
 
+mod opacity_reuse;
+
 /// Comp identities (and the project snapshots behind them) the RAM preview keeps frames of.
 const MAX_KEEPERS: usize = 64;
 
@@ -754,7 +756,7 @@ impl Frames {
     pub fn content_of(&self, project: &Arc<Project>, revision: u64, comp: ItemId) -> u64 {
         let known = self.identities.lock().ok().and_then(|m| m.get(&(revision, comp.0)).cloned());
         let (id, base) = known.unwrap_or_else(|| {
-            let found = self.identity(project, comp);
+            let found = self.identity(project, revision, comp);
             if let Ok(mut m) = self.identities.lock() {
                 if m.len() > 256 {
                     m.clear();
@@ -793,7 +795,7 @@ impl Frames {
     /// only Audio, Lock or Shy switches changed), so toggling those keeps the cached frames
     /// (#103). That identity hashes the addresses of the comps in its project, which is
     /// returned to keep them.
-    fn identity(&self, project: &Arc<Project>, comp: ItemId) -> Identity {
+    fn identity(&self, project: &Arc<Project>, revision: u64, comp: ItemId) -> Identity {
         let plain = comp_content(project, comp);
         let Ok(mut bases) = self.bases.lock() else { return (plain, None) };
         if let Some((base_id, base)) = bases.get(&comp.0)
@@ -804,6 +806,15 @@ impl Frames {
             }) == *base_id
         {
             return (*base_id, Some(base.clone()));
+        }
+        // Only completed frames with a bounded exact snapshot proof can cross an edit.
+        // Their full keys remain distinct; queued/inflight work follows normal cancellation.
+        if let Some((base_id, base)) = bases.get(&comp.0)
+            && *base_id != plain
+            && let Some(proof) = opacity_reuse::Proof::between(base, project, comp)
+            && let Ok(mut cache) = self.cache.lock()
+        {
+            proof.rekey(&mut cache, *base_id, plain, revision, comp);
         }
         if bases.len() > MAX_KEEPERS {
             bases.clear();
