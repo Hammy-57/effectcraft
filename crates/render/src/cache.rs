@@ -62,9 +62,10 @@ mod dependencies;
 /// buffers that were slow to render are written there (keys salted per project, see
 /// [`LayerCache::set_disk`]).
 mod gpu;
-pub use gpu::{GpuOwner, GpuPending, GpuSlot, GpuStage};
+pub use gpu::{GpuOwner, GpuPending, GpuSlot, GpuStage, ResidentReadback};
 
 pub struct LayerCache {
+    storage_epoch: Arc<Mutex<Arc<()>>>,
     resident_lifetime: Mutex<Arc<()>>,
     inner: Arc<Mutex<Inner>>,
     disk: Mutex<Option<(Arc<crate::disk_cache::DiskCache>, u64)>>,
@@ -73,7 +74,7 @@ pub struct LayerCache {
     /// While set, inserts are dropped (see [`LayerCache::set_gate`]).
     gate: Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>,
     /// Keys being rendered right now, by whom (see [`LayerCache::claim`]).
-    inflight: Mutex<HashMap<u64, Arc<Flight>>>,
+    inflight: Arc<Mutex<HashMap<u64, Arc<Flight>>>>,
     /// Precomp layers' consecutive key misses (see [`LayerCache::precomp_try`]).
     streaks: Mutex<HashMap<u64, u32>>,
 }
@@ -91,6 +92,30 @@ impl ResidentToken {
     }
     pub fn valid(&self) -> bool {
         self.lifetime.strong_count() > 0 && self.gate.as_ref().is_none_or(|g| g.upgrade().is_some_and(|g| !g.load(std::sync::atomic::Ordering::Relaxed)))
+    }
+}
+
+/// A captured storage binding. Only native file publication runs inside this barrier.
+#[derive(Clone)]
+pub(crate) struct StorageToken {
+    gate: Option<Weak<std::sync::atomic::AtomicBool>>,
+    state: Weak<Mutex<Arc<()>>>,
+    epoch: Weak<()>,
+}
+impl StorageToken {
+    pub(crate) fn with_valid<T>(&self, f: impl FnOnce() -> T) -> Option<T> {
+        let state = self.state.upgrade()?;
+        let epoch = state.lock().ok()?;
+        if self.gate.as_ref().is_some_and(|g| g.upgrade().is_none_or(|g| g.load(std::sync::atomic::Ordering::Relaxed))) {
+            return None;
+        }
+        if !Weak::ptr_eq(&self.epoch, &Arc::downgrade(&epoch)) {
+            return None;
+        }
+        Some(f())
+    }
+    pub(crate) fn valid(&self) -> bool {
+        self.with_valid(|| ()).is_some()
     }
 }
 
@@ -194,6 +219,7 @@ impl LayerCache {
     /// pin retired storage above a subsequently reduced budget; new admission stops.
     pub fn new(budget: usize) -> LayerCache {
         LayerCache {
+            storage_epoch: Arc::new(Mutex::new(Arc::new(()))),
             resident_lifetime: Mutex::new(Arc::new(())),
             inner: Arc::new(Mutex::new(Inner {
                 gpu: HashMap::new(),
@@ -215,7 +241,7 @@ impl LayerCache {
             disk: Mutex::new(None),
             store: Mutex::new(None),
             gate: Mutex::new(None),
-            inflight: Mutex::new(HashMap::new()),
+            inflight: Arc::new(Mutex::new(HashMap::new())),
             streaks: Mutex::new(HashMap::new()),
         }
     }
@@ -225,6 +251,7 @@ impl LayerCache {
     /// buffers from placeholders; the accelerator raises the gate from its first missing
     /// readback to the end of the pass, so none of them is kept (in memory or on disk).
     pub fn set_gate(&self, gate: Option<Arc<std::sync::atomic::AtomicBool>>) {
+        let mut storage_epoch = self.storage_epoch.lock().unwrap_or_else(PoisonError::into_inner);
         let mut g = self.gate.lock().unwrap_or_else(PoisonError::into_inner);
         let same = match (&*g, &gate) {
             (Some(a), Some(b)) => Arc::ptr_eq(a, b),
@@ -232,6 +259,7 @@ impl LayerCache {
             _ => false,
         };
         if !same {
+            *storage_epoch = Arc::new(());
             *self.resident_lifetime.lock().unwrap_or_else(PoisonError::into_inner) = Arc::new(());
         }
         *g = gate;
@@ -244,16 +272,31 @@ impl LayerCache {
     /// Attach (or detach) the disk cache. `salt` separates projects and footage versions (see
     /// `footage_salt`); keys on disk are `(salt, key)`.
     pub fn set_disk(&self, disk: Option<(Arc<crate::disk_cache::DiskCache>, u64)>) {
-        if let Ok(mut d) = self.disk.lock() {
-            *d = disk;
-        }
+        let old = {
+            let Ok(mut epoch) = self.storage_epoch.lock() else { return };
+            let Ok(mut current) = self.disk.lock() else { return };
+            let same = match (&*current, &disk) {
+                (None, None) => true,
+                (Some((a, x)), Some((b, y))) => x == y && Arc::ptr_eq(a, b),
+                _ => false,
+            };
+            if same {
+                return;
+            }
+            *epoch = Arc::new(());
+            std::mem::replace(&mut *current, disk)
+        };
+        drop(old);
     }
 
     /// Change the disk salt (after footage changed) keeping the attached disk cache.
     pub fn set_disk_salt(&self, salt: u64) {
+        let Ok(mut epoch) = self.storage_epoch.lock() else { return };
         if let Ok(mut d) = self.disk.lock()
             && let Some((_, s)) = d.as_mut()
+            && *s != salt
         {
+            *epoch = Arc::new(());
             *s = salt;
         }
     }
@@ -266,18 +309,46 @@ impl LayerCache {
     /// Origin Private File System through a [`PrefetchStore`]); `salt` as in
     /// [`LayerCache::set_disk`].
     pub fn set_store(&self, store: Option<(Arc<dyn LayerStore>, u64)>) {
-        if let Ok(mut s) = self.store.lock() {
-            *s = store;
-        }
+        let old = {
+            let Ok(mut epoch) = self.storage_epoch.lock() else { return };
+            let Ok(mut current) = self.store.lock() else { return };
+            let same = match (&*current, &store) {
+                (None, None) => true,
+                (Some((a, x)), Some((b, y))) => x == y && Arc::ptr_eq(a, b),
+                _ => false,
+            };
+            if same {
+                return;
+            }
+            *epoch = Arc::new(());
+            std::mem::replace(&mut *current, store)
+        };
+        drop(old);
     }
 
     /// Change the store's salt (a new project or footage), keeping the store.
     pub fn set_store_salt(&self, salt: u64) {
+        let Ok(mut epoch) = self.storage_epoch.lock() else { return };
         if let Ok(mut d) = self.store.lock()
             && let Some((_, s)) = d.as_mut()
+            && *s != salt
         {
+            *epoch = Arc::new(());
             *s = salt;
         }
+    }
+
+    /// Capture at producer start. Legacy/browser stores decline lazy writes until
+    /// their transport can enforce cancellation at final publication.
+    pub fn disk_intent(&self, key: u64) -> Option<crate::disk_cache::LayerWriteIntent> {
+        let epoch = self.storage_epoch.lock().ok()?;
+        let (disk, salt) = self.disk.lock().ok()?.as_ref()?.clone();
+        let binding = StorageToken {
+            gate: self.gate.lock().ok()?.as_ref().map(Arc::downgrade),
+            state: Arc::downgrade(&self.storage_epoch),
+            epoch: Arc::downgrade(&epoch),
+        };
+        disk.layer_intent(((salt as u128) << 64) | key as u128, binding)
     }
 
     fn disk_key(&self, key: u64) -> Option<(Arc<dyn LayerStore>, u128)> {
@@ -302,6 +373,9 @@ impl LayerCache {
             }
             g.missed_at.insert(key, web_time::Instant::now());
         }
+        if let Some(buf) = self.materialize_resident(key) {
+            return Some(buf);
+        }
         // Disk cache: a hit comes back into memory.
         let token = self.resident_token();
         let (dc, dk) = self.disk_key(key)?;
@@ -309,6 +383,56 @@ impl LayerCache {
         // (Stored on disk: it was worth keeping.)
         if let Some(token) = token {
             self.insert_mem(key, buf.clone(), true, &token);
+        }
+        Some(buf)
+    }
+
+    /// A derived CPU representation produced from captured content, never a fresh
+    /// token/salt at completion. Disk work remains outside the cache owner lock.
+    pub(crate) fn insert_captured(&self, key: u64, buf: &Arc<Buf>, token: &ResidentToken, intent: Option<crate::disk_cache::LayerWriteIntent>) {
+        if !token.valid() {
+            return;
+        }
+        self.insert_mem(key, buf.clone(), true, token);
+        if token.valid()
+            && let Some(intent) = intent
+        {
+            intent.produced().put(buf);
+        }
+    }
+
+    /// CPU demand for Processed pixels. Readback is single-flight and never runs under a lock.
+    /// Native disk writes use the producer's captured binding and purge identity;
+    /// legacy stores without guarded publication remain memory-only.
+    fn materialize_resident(&self, key: u64) -> Option<Arc<Buf>> {
+        self.materialize_resident_inner(key, true)
+    }
+    fn materialize_resident_inner(&self, key: u64, wait: bool) -> Option<Arc<Buf>> {
+        let owner = self.gpu_owner()?;
+        let slot = owner.resident(key, GpuStage::Processed)?;
+        if let Some(buf) = slot.ready() {
+            return Some(buf);
+        }
+        // Do not recursively materialize after a failed competing flight. The
+        // outer CPU claim performs at most one demand attempt.
+        let _flight = match self.claim_inner(key, false, wait) {
+            Claim::Ready(buf) => return Some(buf),
+            Claim::Owner(guard) => guard,
+            Claim::Render => return self.peek(key).or_else(|| slot.ready()),
+        };
+        if let Some(buf) = self.peek(key) {
+            return Some(buf);
+        }
+        if !owner.valid() || !slot.allocation().generation().valid() {
+            return None;
+        }
+        let buf = Arc::new(slot.materialize()?);
+        // Admission uses the producer's captured lifetime. A late result cannot resurrect
+        // a cleared cache. The caller may still use successfully read transient pixels.
+        if owner.valid() && slot.allocation().generation().valid() {
+            self.insert_mem(key, buf.clone(), true, owner.token());
+            slot.handoff(&buf);
+            slot.persist(&buf);
         }
         Some(buf)
     }
@@ -528,8 +652,8 @@ impl LayerCache {
         g.bytes = g.bytes.saturating_sub(old).saturating_add(bytes);
     }
 
-    /// Physical CPU allocation accounting, including retired caller pins and pending packing.
-    /// GPU upload/native caches are not enrolled yet.
+    /// Physical retained CPU/GPU accounting, including caller pins and pending reservations.
+    /// Texture-pool scratch and the disk writer queue retain their separate bounded allowances.
     pub fn retained_stats(&self) -> crate::retained::RetainedStats {
         self.inner.lock().map(|g| g.physical.stats()).unwrap_or_default()
     }
@@ -560,6 +684,8 @@ impl LayerCache {
     }
 
     pub fn clear(&self) {
+        let mut epoch = self.storage_epoch.lock().unwrap_or_else(PoisonError::into_inner);
+        *epoch = Arc::new(());
         *self.resident_lifetime.lock().unwrap_or_else(PoisonError::into_inner) = Arc::new(());
         let retired = if let Ok(mut g) = self.inner.lock() {
             let retired = std::mem::take(&mut g.gpu);
@@ -572,6 +698,7 @@ impl LayerCache {
         } else {
             None
         };
+        drop(epoch);
         drop(retired);
     }
 
@@ -609,24 +736,34 @@ impl LayerCache {
     /// A waiter on a rayon worker waits at most [`WAIT_POOL`]: rayon may run a frame that waits
     /// here on top of a stolen piece of the very render it waits for (a join inside it), which
     /// would never finish; the timeout turns that into a duplicate render, as before.
-    pub(crate) fn claim(&self, key: u64) -> Claim<'_> {
+    pub fn claim(&self, key: u64) -> Claim {
+        self.claim_inner(key, true, true)
+    }
+    /// A GPU consumer retries its own exact-device resident lookup after a wake.
+    pub fn claim_gpu(&self, key: u64) -> Claim {
+        self.claim_inner(key, false, true)
+    }
+    fn claim_inner(&self, key: u64, cpu_demand: bool, wait: bool) -> Claim {
         let me = std::thread::current().id();
         let flight = {
             let mut m = self.inflight.lock().unwrap_or_else(PoisonError::into_inner);
             match m.get(&key) {
-                Some(f) if f.owner == me => return Claim::Render,
+                Some(f) if f.owner == me || !wait => return Claim::Render,
                 Some(f) => f.clone(),
                 None => {
+                    if m.len() >= 4096 || m.try_reserve(1).is_err() {
+                        return Claim::Render;
+                    }
                     let f = Arc::new(Flight { owner: me, done: Mutex::new(false), cv: Condvar::new() });
                     m.insert(key, f.clone());
-                    return Claim::Owner(FlightGuard { cache: self, key, flight: f });
+                    return Claim::Owner(FlightGuard { inflight: Arc::downgrade(&self.inflight), key, flight: f });
                 }
             }
         };
         if !flight.wait() {
             return Claim::Render;
         }
-        match self.peek(key) {
+        match self.peek(key).or_else(|| cpu_demand.then(|| self.materialize_resident_inner(key, false)).flatten()) {
             Some(b) => Claim::Ready(b),
             None => Claim::Render,
         }
@@ -710,10 +847,10 @@ impl Flight {
 }
 
 /// The outcome of [`LayerCache::claim`].
-pub(crate) enum Claim<'c> {
+pub enum Claim {
     /// Render the buffer and insert it; dropping the guard (after the insert, or on failure)
     /// wakes the waiters.
-    Owner(#[allow(dead_code)] FlightGuard<'c>),
+    Owner(#[allow(dead_code)] FlightGuard),
     /// Another thread rendered it.
     Ready(Arc<Buf>),
     /// Render it without waking anyone.
@@ -721,18 +858,20 @@ pub(crate) enum Claim<'c> {
 }
 
 /// Ends a [`LayerCache::claim`] when dropped (also when the render panics).
-pub(crate) struct FlightGuard<'c> {
-    cache: &'c LayerCache,
+pub struct FlightGuard {
+    inflight: Weak<Mutex<HashMap<u64, Arc<Flight>>>>,
     key: u64,
     flight: Arc<Flight>,
 }
 
-impl Drop for FlightGuard<'_> {
+impl Drop for FlightGuard {
     fn drop(&mut self) {
         {
-            let mut m = self.cache.inflight.lock().unwrap_or_else(PoisonError::into_inner);
-            if m.get(&self.key).is_some_and(|f| Arc::ptr_eq(f, &self.flight)) {
-                m.remove(&self.key);
+            if let Some(inflight) = self.inflight.upgrade() {
+                let mut m = inflight.lock().unwrap_or_else(PoisonError::into_inner);
+                if m.get(&self.key).is_some_and(|f| Arc::ptr_eq(f, &self.flight)) {
+                    m.remove(&self.key);
+                }
             }
         }
         *self.flight.done.lock().unwrap_or_else(PoisonError::into_inner) = true;

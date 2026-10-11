@@ -2,6 +2,7 @@
 use super::{Inner, ResidentToken};
 use crate::allocation::{GpuAllocation, GpuGeneration};
 use crate::retained::{AdmissionError, MAX_RECORDS, Reservation};
+use effectcraft_effects::Buf;
 use std::any::Any;
 use std::sync::{Arc, Mutex, Weak};
 
@@ -13,12 +14,40 @@ pub enum GpuStage {
     Blend,
 }
 
+/// Backend readback must contain allocation and mapping failures. Called without cache locks.
+pub trait ResidentReadback: Send + Sync {
+    fn readback(&self, slot: &GpuSlot) -> Option<Buf>;
+}
+
 pub struct GpuSlot {
     payload: Arc<dyn Any + Send + Sync>,
     allocation: Arc<GpuAllocation>,
     stage: GpuStage,
+    persistence: Option<crate::disk_cache::LayerWriteIntent>,
+    ready: Mutex<Weak<Buf>>,
+    content: Option<u64>,
+    readback: Option<Arc<dyn ResidentReadback>>,
 }
 impl GpuSlot {
+    pub(super) fn persist(&self, buf: &Buf) {
+        if let Some(intent) = &self.persistence {
+            intent.put(buf);
+        }
+    }
+    pub(super) fn ready(&self) -> Option<Arc<Buf>> {
+        self.ready.lock().ok()?.upgrade()
+    }
+    pub(super) fn handoff(&self, buf: &Arc<Buf>) {
+        if let Ok(mut ready) = self.ready.lock() {
+            *ready = Arc::downgrade(buf);
+        }
+    }
+    pub(super) fn materialize(&self) -> Option<Buf> {
+        if self.stage != GpuStage::Processed || !self.allocation.generation().valid() {
+            return None;
+        }
+        self.readback.as_ref()?.readback(self)
+    }
     pub fn payload<T: Any>(&self) -> Option<&T> {
         self.payload.downcast_ref()
     }
@@ -43,6 +72,9 @@ pub struct GpuOwner {
 impl GpuOwner {
     pub(super) fn new(inner: Weak<Mutex<Inner>>, token: ResidentToken) -> Self {
         Self { inner, token }
+    }
+    pub(super) fn token(&self) -> &ResidentToken {
+        &self.token
     }
     pub fn identity(&self) -> usize {
         self.token.identity()
@@ -88,7 +120,38 @@ impl GpuOwner {
             g.physical.reserve_gpu(&allocation)?
         };
         let device = allocation.generation().reserve(&allocation, device_cap)?;
-        Ok(GpuPending { device, claim, owner: self.clone(), reservation, slot: Arc::new(GpuSlot { payload, allocation, stage }) })
+        Ok(GpuPending {
+            device,
+            claim,
+            owner: self.clone(),
+            reservation,
+            slot: Arc::new(GpuSlot { payload, allocation, stage, persistence: None, ready: Mutex::new(Weak::new()), content: None, readback: None }),
+        })
+    }
+
+    /// Exact content stage lookup. The bounded owner map remains the only strong store.
+    pub fn resident(&self, key: u64, stage: GpuStage) -> Option<Arc<GpuSlot>> {
+        self.resident_in(key, stage, None)
+    }
+    pub fn resident_in(&self, key: u64, stage: GpuStage, generation: Option<&GpuGeneration>) -> Option<Arc<GpuSlot>> {
+        let weak = {
+            let inner = self.inner.upgrade()?;
+            let g = inner.lock().ok()?;
+            if !self.valid() {
+                return None;
+            }
+            g.gpu
+                .values()
+                .find(|e| {
+                    e.slot.content == Some(key)
+                        && e.slot.stage == stage
+                        && e.slot.allocation.generation().valid()
+                        && generation.is_none_or(|g| e.slot.allocation.generation().same(g))
+                })
+                .map(|e| Arc::downgrade(&e.slot))?
+        };
+        let slot = weak.upgrade()?;
+        self.get(&weak, slot.allocation.generation(), stage)
     }
 
     pub fn get(&self, weak: &Weak<GpuSlot>, generation: &GpuGeneration, stage: GpuStage) -> Option<Arc<GpuSlot>> {
@@ -158,6 +221,21 @@ pub struct GpuPending {
     slot: Arc<GpuSlot>,
 }
 impl GpuPending {
+    pub fn with_persistence(mut self, intent: Option<crate::disk_cache::LayerWriteIntent>) -> Self {
+        if let Some(slot) = Arc::get_mut(&mut self.slot) {
+            slot.persistence = intent.map(crate::disk_cache::LayerWriteIntent::produced);
+        }
+        self
+    }
+    /// Attach the exact processed-content key before publication. Blend slots never materialize.
+    pub fn with_content(mut self, key: u64, readback: Option<Arc<dyn ResidentReadback>>) -> Self {
+        if let Some(slot) = Arc::get_mut(&mut self.slot) {
+            slot.content = Some(key);
+            slot.readback = readback;
+        }
+        self
+    }
+
     pub fn publish(self) -> Result<Weak<GpuSlot>, AdmissionError> {
         let inner = self.owner.inner.upgrade().ok_or(AdmissionError::Retired)?;
         let mut g = inner.lock().map_err(|_| AdmissionError::Retired)?;
@@ -226,6 +304,214 @@ mod tests {
     }
     fn probe(cache: &LayerCache, drops: &Arc<AtomicUsize>) -> Arc<dyn Any + Send + Sync> {
         Arc::new(Probe { inner: Arc::downgrade(&cache.inner), drops: drops.clone() })
+    }
+    struct Readback {
+        cache: Weak<LayerCache>,
+        calls: AtomicUsize,
+        fail: bool,
+        clear: bool,
+    }
+    impl ResidentReadback for Readback {
+        fn readback(&self, _: &GpuSlot) -> Option<Buf> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let c = self.cache.upgrade().unwrap();
+            assert!(c.inner.try_lock().is_ok(), "no owner lock during readback");
+            assert!(c.inflight.try_lock().is_ok(), "no flight lock during readback");
+            assert!(c.get(99).is_none(), "same-thread recursion must fall back");
+            if self.clear {
+                c.clear();
+            }
+            if self.fail {
+                return None;
+            }
+            Some(Buf { img: effectcraft_raster::Image::new(1, 1), offset: [3.0, 4.0], scale: 0.5 })
+        }
+    }
+    fn lazy(c: &Arc<LayerCache>, stage: GpuStage, readback: Arc<dyn ResidentReadback>) {
+        let g = GpuGeneration::default();
+        c.gpu_owner().unwrap().prepare(Arc::new(()), allocation(&g), stage, 1024).unwrap().with_content(99, Some(readback)).publish().unwrap();
+    }
+    #[test]
+    fn lazy_processed_is_demand_driven_reentrant_and_reuses_cpu() {
+        let c = Arc::new(LayerCache::new(1024));
+        let read = Arc::new(Readback { cache: Arc::downgrade(&c), calls: AtomicUsize::new(0), fail: false, clear: false });
+        lazy(&c, GpuStage::Processed, read.clone());
+        assert_eq!(read.calls.load(Ordering::Relaxed), 0);
+        let b = c.get(99).unwrap();
+        assert_eq!(b.offset, [3.0, 4.0]);
+        assert_eq!(b.scale, 0.5);
+        assert!(Arc::ptr_eq(&b, &c.get(99).unwrap()));
+        assert_eq!(read.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(c.retained_stats().live_bytes, 32);
+    }
+    #[test]
+    fn lazy_failure_releases_flight_and_blend_never_materializes() {
+        let c = Arc::new(LayerCache::new(1024));
+        let read = Arc::new(Readback { cache: Arc::downgrade(&c), calls: AtomicUsize::new(0), fail: true, clear: false });
+        lazy(&c, GpuStage::Processed, read.clone());
+        assert!(c.get(99).is_none());
+        assert!(c.get(99).is_none());
+        assert_eq!(read.calls.load(Ordering::Relaxed), 2);
+        assert!(c.inflight.lock().unwrap().is_empty());
+        c.clear();
+        lazy(&c, GpuStage::Blend, read.clone());
+        assert!(c.get(99).is_none());
+        assert_eq!(read.calls.load(Ordering::Relaxed), 2);
+    }
+    #[test]
+    fn lazy_clear_during_readback_cannot_republish() {
+        let c = Arc::new(LayerCache::new(1024));
+        let read = Arc::new(Readback { cache: Arc::downgrade(&c), calls: AtomicUsize::new(0), fail: false, clear: true });
+        lazy(&c, GpuStage::Processed, read);
+        let transient = c.get(99).unwrap();
+        assert_eq!(transient.offset, [3.0, 4.0]);
+        assert!(c.get(99).is_none());
+        assert_eq!(c.retained_stats().live_bytes, 0);
+    }
+    #[test]
+    fn lazy_weak_handoff_survives_cpu_admission_denial() {
+        let c = Arc::new(LayerCache::new(32));
+        let read = Arc::new(Readback { cache: Arc::downgrade(&c), calls: AtomicUsize::new(0), fail: false, clear: false });
+        lazy(&c, GpuStage::Processed, read.clone());
+        let first = c.get(99).unwrap();
+        assert!(c.peek(99).is_none(), "CPU exceeds quarter-budget admission limit");
+        let second = c.get(99).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(read.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(c.retained_stats().live_bytes, 16, "handoff is weak; CPU caller-only transient is not retained");
+        drop(first);
+        drop(second);
+        assert!(c.get(99).is_some());
+        assert_eq!(read.calls.load(Ordering::Relaxed), 2);
+    }
+    #[test]
+    fn resident_lookup_selects_exact_device_generation() {
+        let c = LayerCache::new(1024);
+        let owner = c.gpu_owner().unwrap();
+        let a = GpuGeneration::default();
+        let b = GpuGeneration::default();
+        for (generation, value) in [(&a, 1_u32), (&b, 2_u32)] {
+            owner.prepare(Arc::new(value), allocation(generation), GpuStage::Processed, 1024).unwrap().with_content(99, None).publish().unwrap();
+        }
+        assert_eq!(owner.resident_in(99, GpuStage::Processed, Some(&a)).unwrap().payload::<u32>(), Some(&1));
+        assert_eq!(owner.resident_in(99, GpuStage::Processed, Some(&b)).unwrap().payload::<u32>(), Some(&2));
+        assert!(owner.resident_in(99, GpuStage::Blend, Some(&b)).is_none());
+    }
+    #[test]
+    fn lazy_disk_write_is_demand_only_and_purge_cancels_denied_cpu_result() {
+        struct DiskRead {
+            read: Readback,
+            disk: Arc<crate::disk_cache::DiskCache>,
+            purge: bool,
+        }
+        impl ResidentReadback for DiskRead {
+            fn readback(&self, slot: &GpuSlot) -> Option<Buf> {
+                if self.purge {
+                    self.disk.clear();
+                }
+                self.read.readback(slot)
+            }
+        }
+        for purge in [false, true] {
+            let dir = std::env::temp_dir().join(format!("rt1-lazy-disk-{}-{purge}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let disk = crate::disk_cache::DiskCache::open(&dir, 1 << 20).unwrap();
+            disk.set_min_layer_ms(0);
+            let c = Arc::new(LayerCache::new(32));
+            c.set_disk(Some((disk.clone(), 17)));
+            let intent = c.disk_intent(99).unwrap();
+            let read = Arc::new(DiskRead {
+                read: Readback { cache: Arc::downgrade(&c), calls: AtomicUsize::new(0), fail: false, clear: false },
+                disk: disk.clone(),
+                purge,
+            });
+            let generation = GpuGeneration::default();
+            c.gpu_owner()
+                .unwrap()
+                .prepare(Arc::new(()), allocation(&generation), GpuStage::Processed, 1024)
+                .unwrap()
+                .with_content(99, Some(read.clone()))
+                .with_persistence(Some(intent))
+                .publish()
+                .unwrap();
+            disk.flush();
+            assert_eq!(read.read.calls.load(Ordering::Relaxed), 0);
+            assert_eq!(disk.stats().writes, 0, "GPU retention does not populate disk");
+            let result = c.get(99).unwrap();
+            disk.flush();
+            assert!(c.peek(99).is_none(), "CPU admission denied");
+            assert_eq!(Arc::strong_count(&result), 1, "disk queue never owns pixels");
+            assert_eq!(disk.stats().writes, u64::from(!purge));
+            let saved = disk.get_layer((17_u128 << 64) | 99);
+            assert_eq!(saved.is_some(), !purge);
+            if let Some(saved) = saved {
+                assert_eq!(saved.img.data, result.img.data);
+                assert_eq!(saved.offset, result.offset);
+            }
+            c.clear();
+            disk.clear();
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn lazy_postwake_competing_failed_flights_never_wait_again() {
+        let c = Arc::new(LayerCache::new(1024));
+        let read = Arc::new(Readback { cache: Arc::downgrade(&c), calls: AtomicUsize::new(0), fail: true, clear: false });
+        lazy(&c, GpuStage::Processed, read.clone());
+        // Model an adversarial producer winning the key immediately after every
+        // wake. Post-wake acquisition must return while that producer still holds
+        // its guard, without starting a fresh 2/30-second wait or recursive call.
+        for _ in 0..16 {
+            let guard = match c.claim_gpu(99) {
+                super::super::Claim::Owner(g) => g,
+                _ => panic!("owner"),
+            };
+            let (done, done_rx) = std::sync::mpsc::channel();
+            let other = c.clone();
+            let waiter = std::thread::spawn(move || {
+                let result = other.materialize_resident_inner(99, false);
+                done.send(result.is_none()).unwrap();
+            });
+            assert!(done_rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap());
+            drop(guard); // failed producer wakes all waiters
+            waiter.join().unwrap();
+        }
+        assert_eq!(read.calls.load(Ordering::Relaxed), 0);
+        assert!(c.get(99).is_none());
+        assert_eq!(read.calls.load(Ordering::Relaxed), 1);
+        assert!(c.inflight.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn lazy_concurrent_cpu_demand_coalesces() {
+        struct Blocking {
+            entered: std::sync::mpsc::Sender<()>,
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+            calls: AtomicUsize,
+        }
+        impl ResidentReadback for Blocking {
+            fn readback(&self, _: &GpuSlot) -> Option<Buf> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                self.entered.send(()).unwrap();
+                self.release.lock().unwrap().recv().unwrap();
+                Some(Buf { img: effectcraft_raster::Image::new(1, 1), offset: [0.0; 2], scale: 1.0 })
+            }
+        }
+        let c = Arc::new(LayerCache::new(1024));
+        let (entered, entered_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let read = Arc::new(Blocking { entered, release: Mutex::new(release_rx), calls: AtomicUsize::new(0) });
+        lazy(&c, GpuStage::Processed, read.clone());
+        let a = c.clone();
+        let first = std::thread::spawn(move || a.get(99).unwrap());
+        entered_rx.recv().unwrap();
+        let b = c.clone();
+        let second = std::thread::spawn(move || b.get(99).unwrap());
+        release.send(()).unwrap();
+        let first = first.join().unwrap();
+        let second = second.join().unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(read.calls.load(Ordering::Relaxed), 1);
     }
     #[test]
     fn gpu_alias_pins_and_clear_drop_after_unlock() {

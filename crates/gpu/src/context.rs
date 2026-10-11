@@ -365,6 +365,7 @@ struct Uploads {
     /// Per-device ceiling; the LayerCache owns the authoritative shared budget.
     budget: Option<usize>,
     kept: Vec<(u64, SlotRef)>,
+    resident: Vec<SlotRef>,
     next_ticket: u64,
     keep_off: bool,
     epoch: Arc<()>,
@@ -381,6 +382,9 @@ impl Uploads {
         if let Some(i) = self.kept.iter().position(|(_, e)| !e.alive()) {
             return Some(self.kept.remove(i).1);
         }
+        if let Some(i) = self.resident.iter().position(|e| !e.alive()) {
+            return Some(self.resident.remove(i));
+        }
         None
     }
 }
@@ -389,16 +393,19 @@ impl Uploads {
 fn clear_retained(uploads: &Mutex<Uploads>) {
     let old = if let Ok(mut u) = uploads.lock() {
         u.epoch = Arc::new(());
-        Some((std::mem::take(&mut u.map), std::mem::take(&mut u.native), std::mem::take(&mut u.kept)))
+        Some((std::mem::take(&mut u.map), std::mem::take(&mut u.native), std::mem::take(&mut u.kept), std::mem::take(&mut u.resident)))
     } else {
         None
     };
-    if let Some((map, native, kept)) = old {
+    if let Some((map, native, kept, resident)) = old {
         for (_, e) in map {
             e.slot.release();
         }
         for (_, e) in native {
             e.slot.release();
+        }
+        for e in resident {
+            e.release();
         }
         for (_, e) in kept {
             e.release();
@@ -1298,6 +1305,7 @@ impl GpuContext {
                     .map(|e| e.slot.owner.clone())
                     .chain(u.native.values().map(|e| e.slot.owner.clone()))
                     .chain(u.kept.iter().map(|(_, e)| e.owner.clone()))
+                    .chain(u.resident.iter().map(|e| e.owner.clone()))
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
@@ -1438,10 +1446,29 @@ struct PendingNative {
     epoch: Weak<()>,
 }
 
+struct LazyReadback(Weak<GpuContext>);
+impl effectcraft_render::cache::ResidentReadback for LazyReadback {
+    fn readback(&self, slot: &GpuSlot) -> Option<Buf> {
+        let ctx = self.0.upgrade()?;
+        if slot.stage() != GpuStage::Processed || !slot.allocation().generation().same(&ctx.generation) {
+            return None;
+        }
+        let image = slot.payload::<NativeImage>()?;
+        crate::Gpu::within_context(&ctx, || {
+            let mut enc = Enc::new(&ctx);
+            Some(Buf { img: enc.download(&image.img)?, offset: image.offset, scale: image.scale })
+        })
+        .ok()
+        .flatten()
+    }
+}
+
 pub(crate) struct Enc<'g> {
     epoch: Weak<()>,
     pub(crate) owner: Option<GpuOwner>,
     native_pending: Vec<PendingNative>,
+    resident_pending: Vec<(GpuPending, effectcraft_render::cache::FlightGuard)>,
+    readback: Option<Arc<dyn effectcraft_render::cache::ResidentReadback>>,
     #[cfg(feature = "profile")]
     pub(crate) timestamps: Option<crate::timestamps::Batch>,
     pub g: &'g GpuContext,
@@ -1477,11 +1504,41 @@ impl<'g> Enc<'g> {
     pub fn new(g: &'g GpuContext) -> Enc<'g> {
         Self::with_owner(g, None)
     }
+    pub fn with_resident(g: &'g Arc<GpuContext>, owner: Option<GpuOwner>) -> Enc<'g> {
+        let mut enc = Self::with_owner(g, owner);
+        enc.readback = Some(Arc::new(LazyReadback(Arc::downgrade(g))));
+        enc
+    }
+    pub(crate) fn can_retain_resident(&self) -> bool {
+        self.readback.is_some() && self.owner.as_ref().is_some_and(GpuOwner::valid) && self.g.deferred.is_none()
+    }
+    pub(crate) fn resident(&self, key: u64, stage: GpuStage) -> Option<NativeImage> {
+        self.owner.as_ref()?.resident_in(key, stage, Some(&self.g.generation))?.payload::<NativeImage>().cloned()
+    }
+    pub(crate) fn keep_resident(
+        &mut self,
+        key: u64,
+        image: NativeImage,
+        flight: effectcraft_render::cache::FlightGuard,
+        intent: Option<effectcraft_render::disk_cache::LayerWriteIntent>,
+    ) {
+        let Some(owner) = self.owner.as_ref() else { return };
+        if self.g.deferred.is_some() || self.resident_pending.len() >= 256 || self.epoch.strong_count() == 0 {
+            return;
+        }
+        let Some(allocation) = image.img.allocation.clone() else { return };
+        let Ok(pending) = owner.prepare(Arc::new(image), allocation, GpuStage::Processed, self.g.retained_cap()) else { return };
+        if self.resident_pending.try_reserve(1).is_ok() {
+            self.resident_pending.push((pending.with_content(key, self.readback.clone()).with_persistence(intent), flight));
+        }
+    }
     pub fn with_owner(g: &'g GpuContext, owner: Option<GpuOwner>) -> Enc<'g> {
         Enc {
             epoch: g.upload_epoch(),
             owner,
             native_pending: Vec::new(),
+            resident_pending: Vec::new(),
+            readback: None,
             g,
             enc: None,
             pending: 0,
@@ -1760,7 +1817,35 @@ impl<'g> Enc<'g> {
     pub(crate) fn publish_native(&mut self) {
         if self.g.check_health().is_err() {
             self.native_pending.clear();
+            self.resident_pending.clear();
             return;
+        }
+        for (pending, _flight) in self.resident_pending.drain(..) {
+            if self.epoch.strong_count() == 0 {
+                continue;
+            }
+            let Some(owner) = self.owner.as_ref() else { continue };
+            let Ok(slot) = pending.publish() else { continue };
+            let entry = SlotRef { owner: owner.clone(), slot, epoch: self.epoch.clone() };
+            let mut u = match self.g.uploads.lock() {
+                Ok(u) => u,
+                Err(poison) => {
+                    drop(poison);
+                    entry.release();
+                    continue;
+                }
+            };
+            if self.epoch.strong_count() == 0
+                || !self.g.generation.valid()
+                || !self.g.generation.within_cap()
+                || u.resident.len() >= 4096
+                || u.resident.try_reserve(1).is_err()
+            {
+                drop(u);
+                entry.release();
+                continue;
+            }
+            u.resident.push(entry);
         }
         for entry in self.native_pending.drain(..) {
             self.g.native_keep(entry);
@@ -2288,6 +2373,42 @@ mod upload_budget_tests {
         assert_eq!(a.retained_stats().live_bytes, 16);
         assert_eq!(b.retained_stats().live_bytes, 16);
     }
+    #[test]
+    fn ordinary_resident_device_failure_rejects_readback_and_preserves_materialized_cpu() {
+        crate::tests::hold_gpu_lock();
+        let context = GpuContext::headless();
+        assert!(context.is_some() || !std::env::var("EFFECTCRAFT_REQUIRE_GPU").is_ok_and(|v| v == "1"), "required GPU unavailable");
+        let Some(context) = context else { return };
+        let gpu = crate::Gpu::from_context(context);
+        eprintln!("ordinary failure adapter {}", gpu.ctx.name);
+        let mut scene = crate::tests::Scene::new(effectcraft_project::BitDepth::Bpc32);
+        let layer = scene.solid([0.3, 0.5, 0.7], 20, 15);
+        let id = scene.push(layer);
+        let cache = effectcraft_render::LayerCache::default();
+        let mut renderer = effectcraft_render::Renderer::new(
+            &scene.p,
+            &crate::tests::Pattern,
+            effectcraft_render::RenderOpts { backend: effectcraft_render::Backend::Gpu, ..Default::default() },
+        );
+        renderer.accel = Some(&gpu);
+        renderer.cache = Some(&cache);
+        gpu.within_memory(|| gpu.render_display(&renderer, scene.cid, effectcraft_time::Tick::ZERO)).unwrap().unwrap();
+        let ctx = renderer.eval_ctx(scene.cid, effectcraft_time::Tick::ZERO).unwrap();
+        let layer = ctx.comp.layers.iter().find(|l| l.id == id).unwrap();
+        let key = renderer.resident_content_key(&ctx, layer).unwrap();
+        let slot = cache.gpu_owner().unwrap().resident(key, GpuStage::Processed).unwrap();
+        let cpu = cache.get(key).unwrap();
+        let before = gpu.ctx.transfer_stats();
+        gpu.ctx.device_failure_notifier()("synthetic ordinary-resident device failure".into());
+        assert!(effectcraft_render::cache::ResidentReadback::readback(&LazyReadback(Arc::downgrade(&gpu.ctx)), &slot).is_none());
+        assert_eq!(gpu.ctx.transfer_stats().readbacks, before.readbacks, "failed device performs no readback allocation/map");
+        assert!(Arc::ptr_eq(&cpu, &cache.get(key).unwrap()));
+        assert!(cache.gpu_owner().unwrap().resident(key, GpuStage::Processed).is_none());
+        assert!(gpu.render_display(&renderer, scene.cid, effectcraft_time::Tick::ZERO).is_none());
+        drop(slot);
+        assert_eq!(cache.retained_stats().live_bytes, cpu.img.data.capacity() * std::mem::size_of::<[f32; 4]>());
+    }
+
     #[test]
     fn retained_gpu_identity_clear_and_device_failure_preserve_cpu() {
         crate::tests::hold_gpu_lock();
