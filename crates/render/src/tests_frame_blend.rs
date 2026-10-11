@@ -60,7 +60,8 @@ impl FootageSource for Frames {
 fn setup(mode: FrameBlend, size: (u32, u32)) -> (Project, ItemId) {
     let mut p = Project::default();
     p.settings.bit_depth = BitDepth::Bpc32;
-    let comp = Comp::new(size.0, size.1, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+    let mut comp = Comp::new(size.0, size.1, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+    comp.enable_frame_blending = true;
     let cid = p.add_item("Comp", Label::Sandstone, None, ItemKind::Comp(comp.clone().into()));
     let f = Footage {
         path: "clip.mov".into(),
@@ -150,7 +151,8 @@ fn time_stretched_precomp_frame_mixes() {
         vec![Keyframe::new(Tick::ZERO, Value::Vec3([10.0, 10.0, 0.0])), Keyframe::new(Tick::from_seconds_f64(1.0), Value::Vec3([310.0, 10.0, 0.0]))];
     inner.layers.push(l);
     let iid = p.add_item("Inner", Label::Sandstone, None, ItemKind::Comp(inner.into()));
-    let outer = Comp::new(400, 20, FrameRate::FPS_30, Tick::from_seconds_f64(4.0));
+    let mut outer = Comp::new(400, 20, FrameRate::FPS_30, Tick::from_seconds_f64(4.0));
+    outer.enable_frame_blending = true;
     let cid = p.add_item("Outer", Label::Sandstone, None, ItemKind::Comp(outer.clone().into()));
     let mut pre = build::layer(&mut p, &outer, "Inner", LayerSource::Comp { item: iid }, (400, 20), None);
     pre.stretch = 200.0;

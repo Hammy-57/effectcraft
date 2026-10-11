@@ -38,7 +38,20 @@ fn viewer_registers_3d_controls() {
     for want in ["viewer.view3d", "viewer.renderer3d"] {
         assert!(ids.iter().any(|i| i == want), "missing {want}");
     }
-    assert!(ids.iter().any(|i| i.starts_with("viewer.light.")), "light wireframe registered");
+    // Through the active camera, unselected lights and cameras draw no wireframe.
+    h.state_mut().session.execute("layer.select", json!({"layers": []})).unwrap();
+    settle(&mut h);
+    h.step();
+    let ids: Vec<String> = h.state().auto.elements.iter().map(|e| e.id.clone()).collect();
+    assert!(!ids.iter().any(|i| i.starts_with("viewer.light.") || i.starts_with("viewer.camera.")), "no rig wireframes with nothing selected");
+    // A selected light shows.
+    let light = h.state().session.active_comp().and_then(|c| c.layers.iter().find(|l| l.is_light()).map(|l| l.id.0)).expect("the showcase has a light");
+    h.state_mut().session.execute("layer.select", json!({"layers": [light]})).unwrap();
+    settle(&mut h);
+    h.step();
+    let ids: Vec<String> = h.state().auto.previous.iter().chain(h.state().auto.elements.iter()).map(|e| e.id.clone()).collect();
+    assert!(ids.iter().any(|i| i == &format!("viewer.light.{light}")), "selected light wireframe registered");
+    h.state_mut().session.execute("layer.select", json!({"layers": []})).unwrap();
     // In a custom view the active camera is drawn as a wireframe too.
     h.state_mut().session.execute("view.3d.custom1", json!({})).unwrap();
     settle(&mut h);

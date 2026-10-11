@@ -2080,7 +2080,21 @@ impl EffectcraftApp {
             }
             self.command_inbox = Some(rx);
         }
-        let tab_had_widget_focus = ctx.egui_wants_keyboard_input();
+        // Tab moves between fields only while typing in one; anywhere else plain Tab is the
+        // Composition Mini-Flowchart, as in After Effects (Shift+Tab walks keyboard focus). Taken
+        // from egui before any widget runs: its focus move would focus the first control in this
+        // very pass, and that control would swallow the Tab.
+        let tab_had_widget_focus = ctx.text_edit_focused();
+        let plain_tab =
+            ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Key { key: egui::Key::Tab, pressed: true, modifiers, .. } if !modifiers.any())));
+        if plain_tab && !tab_had_widget_focus {
+            ctx.memory_mut(|m| {
+                m.move_focus(egui::FocusDirection::None);
+                if let Some(id) = m.focused() {
+                    m.surrender_focus(id);
+                }
+            });
+        }
         menus::handle_shortcuts(self, &ctx);
         if !ctx.input(|i| i.pointer.primary_down()) {
             self.ui.viewer.property_interacting = false;

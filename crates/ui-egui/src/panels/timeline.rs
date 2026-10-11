@@ -1956,6 +1956,17 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                         }
                     }
                     layer_context_menu(&body, layer, &mut actions);
+                    // Double-click the bar: a precomp opens, footage and solids open in the Layer
+                    // panel (as double-clicking the layer's name, and in After Effects).
+                    if body.double_clicked() {
+                        match &layer.source {
+                            LayerSource::Comp { item } => actions.push(("comp.open".into(), json!({"comp": item.0}))),
+                            LayerSource::Footage { .. } | LayerSource::Solid { .. } => {
+                                actions.push(("layer.openLayer".into(), json!({"layer": layer.id.0})));
+                            }
+                            _ => {}
+                        }
+                    }
                     let drag_key = format!("bar-{}", layer.id.0);
                     for (resp, kind) in [(&body, "move"), (&lin, "in"), (&lout, "out")] {
                         if resp.dragged() {
@@ -2545,24 +2556,50 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     if outline_empty.clicked() && !ui.input(|i| i.modifiers.shift || i.modifiers.command) {
         actions.push(("layer.select".into(), json!({"layers": []})));
     }
-    if let (Some(start), Some(end)) = (ctx.input(|i| i.pointer.press_origin()), outline_empty.interact_pointer_pos())
-        && outline_empty.dragged()
-    {
-        let box_rect = Rect::from_two_pos(start, end).intersect(outline_rect);
-        crate::widgets::marquee(&lp, box_rect, &t);
-        ctx.data_mut(|d| d.insert_temp(egui::Id::new("tl-layer-box"), box_rect));
-    }
-    if outline_empty.drag_stopped()
-        && let Some(box_rect) = ctx.data(|d| d.get_temp::<Rect>(egui::Id::new("tl-layer-box")))
-    {
-        ctx.data_mut(|d| d.remove::<Rect>(egui::Id::new("tl-layer-box")));
-        let layers: Vec<u64> = hit_rows
+    // Layer marquee: the layers it touches are selected while it is dragged, as in After Effects
+    // (Shift/Cmd adds them to the selection the drag started from).
+    let box_id = egui::Id::new("tl-layer-box");
+    let base_id = egui::Id::new("tl-layer-box-base");
+    let live_box = match (ctx.input(|i| i.pointer.press_origin()), outline_empty.interact_pointer_pos()) {
+        (Some(start), Some(end)) if outline_empty.dragged() => Some(Rect::from_two_pos(start, end).intersect(outline_rect)),
+        _ if outline_empty.drag_stopped() => ctx.data(|d| d.get_temp::<Rect>(box_id)),
+        _ => None,
+    };
+    if let Some(box_rect) = live_box {
+        if outline_empty.dragged() {
+            crate::widgets::marquee(&lp, box_rect, &t);
+            ctx.data_mut(|d| d.insert_temp(box_id, box_rect));
+        }
+        let add = ui.input(|i| i.modifiers.shift || i.modifiers.command);
+        let base: Vec<u64> = match ctx.data(|d| d.get_temp::<Vec<u64>>(base_id)) {
+            Some(b) => b,
+            None => {
+                let b: Vec<u64> = selected.iter().map(|l| l.0).collect();
+                ctx.data_mut(|d| d.insert_temp(base_id, b.clone()));
+                b
+            }
+        };
+        let in_box = hit_rows
             .iter()
             .filter(|(r, row)| matches!(row.kind, RowKind::Layer) && r.intersects(box_rect))
             .filter(|(_, row)| comp.layer(row.layer).is_some_and(|l| !l.switches.locked))
-            .map(|(_, row)| row.layer.0)
-            .collect();
-        actions.push(("layer.select".into(), json!({"layers": layers, "add": ui.input(|i| i.modifiers.shift || i.modifiers.command)})));
+            .map(|(_, row)| row.layer.0);
+        let mut layers: Vec<u64> = if add { base } else { vec![] };
+        for id in in_box {
+            if !layers.contains(&id) {
+                layers.push(id);
+            }
+        }
+        let current: Vec<u64> = selected.iter().map(|l| l.0).collect();
+        if layers != current {
+            actions.push(("layer.select".into(), json!({"layers": layers})));
+        }
+        if outline_empty.drag_stopped() {
+            ctx.data_mut(|d| {
+                d.remove::<Rect>(box_id);
+                d.remove::<Vec<u64>>(base_id);
+            });
+        }
     }
     // Pick whips: a line follows the pointer; releasing over a row links to it (an expression's
     // or a property's, also over a property in Effect Controls).

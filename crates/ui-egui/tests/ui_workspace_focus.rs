@@ -122,20 +122,22 @@ fn tab_and_shift_tab_traverse_toolbar_and_space_activates_only_focused_tool() {
     app.ui.show_menu_bar = false;
     let mut h = Harness::builder().with_size(vec2(1400.0, 900.0)).build_eframe(move |_| app);
     h.run_steps(3);
-    for _ in 0..8 {
-        key(&mut h, Key::Tab, Modifiers::NONE);
-        if h.ctx.memory(|m| m.focused()) == Some(Id::new(("tool-slot", 0usize))) {
+    // Plain Tab is the Composition Mini-Flowchart (as in After Effects): it moves no focus.
+    key(&mut h, Key::Tab, Modifiers::NONE);
+    assert_eq!(h.ctx.memory(|m| m.focused()), None, "plain Tab must not start keyboard traversal");
+    assert!(h.state().ui.mini_flowchart.is_some(), "plain Tab opens the Composition Mini-Flowchart");
+    h.state_mut().ui.mini_flowchart = None;
+    // Shift+Tab walks keyboard focus (backwards) through the controls.
+    for _ in 0..400 {
+        key(&mut h, Key::Tab, Modifiers::SHIFT);
+        if h.ctx.memory(|m| m.focused()) == Some(Id::new(("tool-slot", 2usize))) {
             break;
         }
     }
-    assert_eq!(h.ctx.memory(|m| m.focused()), Some(Id::new(("tool-slot", 0usize))));
-    key(&mut h, Key::Tab, Modifiers::NONE);
-    assert_eq!(h.ctx.memory(|m| m.focused()), Some(Id::new(("tool-slot", 1usize))));
-    assert_eq!(h.state().ui.tool, Tool::Selection, "focus movement alone must not select a tool");
-    key(&mut h, Key::Tab, Modifiers::NONE);
     assert_eq!(h.ctx.memory(|m| m.focused()), Some(Id::new(("tool-slot", 2usize))));
     key(&mut h, Key::Tab, Modifiers::SHIFT);
     assert_eq!(h.ctx.memory(|m| m.focused()), Some(Id::new(("tool-slot", 1usize))));
+    assert_eq!(h.state().ui.tool, Tool::Selection, "focus movement alone must not select a tool");
     key(&mut h, Key::Space, Modifiers::NONE);
     assert_eq!(h.state().ui.tool, Tool::Hand);
     assert!(!h.state().playback.playing, "Space activates the focused widget, not preview playback");
@@ -174,15 +176,15 @@ fn tab_traversal_activates_an_inactive_dock_tab_without_editing_the_project() {
     let before = h.state().ui.dock.clone();
     let target = Id::new(("tab", "aaa".to_string(), 1usize));
     let mut tabs = 0;
-    for _ in 0..80 {
-        key(&mut h, Key::Tab, Modifiers::NONE);
+    for _ in 0..400 {
+        key(&mut h, Key::Tab, Modifiers::SHIFT);
         tabs += 1;
         if h.ctx.memory(|m| m.focused()) == Some(target) {
             break;
         }
     }
     assert_eq!(h.ctx.memory(|m| m.focused()), Some(target));
-    println!("Tab presses from no focus to Effect Controls: {tabs}");
+    println!("Shift+Tab presses from no focus to Effect Controls: {tabs}");
     assert_eq!(h.state().ui.dock, before, "traversal alone must not activate a tab");
     key(&mut h, Key::Space, Modifiers::NONE);
     let mut activated = before;

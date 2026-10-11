@@ -851,7 +851,10 @@ fn handle_shortcuts_impl(app: &mut EffectcraftApp, ctx: &egui::Context, tab_only
     }
     // While a menu or popup list is open, keys go to it, not to the app (Space must not start a
     // preview behind the menu, #279).
-    if ctx.egui_wants_keyboard_input() || crate::widgets::any_menu_open(ctx) {
+    // (Tab only gives way to typing: a focused button or checkbox doesn't keep it from opening
+    // the Mini-Flowchart.)
+    let keyboard_taken = if tab_only { ctx.text_edit_focused() } else { ctx.egui_wants_keyboard_input() };
+    if keyboard_taken || crate::widgets::any_menu_open(ctx) {
         return;
     }
     // Text editing in the viewer takes the clipboard events itself.

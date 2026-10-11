@@ -187,3 +187,19 @@ fn double_clicking_an_effect_in_the_timeline_opens_effect_controls() {
     assert_eq!(st.selected_props.iter().map(|(l, u)| (l.0, *u)).collect::<Vec<_>>(), vec![(red, uid)], "with the effect selected");
     assert!(!h.state().ui.timeline.open_groups.contains(&uid), "the effect did not twirl open");
 }
+
+/// Double-clicking a precomp layer's bar in the time graph opens the precomp, as double-clicking
+/// its name does (After Effects allows both).
+#[test]
+fn double_clicking_a_precomp_bar_opens_the_precomp() {
+    let (mut h, _, main) = harness();
+    let red = layer_id(&h, "Red");
+    let r = try_invoke(&mut h, "layer.precompose", json!({"layers": [red], "name": "Inner", "mode": "move", "open": false}));
+    h.run_steps(3);
+    let inner = r["comp"].as_u64().expect("precompose returns the new comp");
+    let pre = r["layer"].as_u64().expect("and its layer");
+    assert_eq!(h.state().session.active_comp_id().map(|c| c.0), Some(main), "still in Main");
+    let bar = rect(&h, &format!("timeline.layer.{pre}.bar"));
+    click_n(&mut h, bar.center(), 2);
+    assert_eq!(h.state().session.active_comp_id().map(|c| c.0), Some(inner), "the precomp opened");
+}
