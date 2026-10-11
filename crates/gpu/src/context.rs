@@ -410,7 +410,7 @@ impl Params {
     fn bytes(&self) -> [u8; PARAMS_SIZE as usize] {
         let mut v = [0u8; PARAMS_SIZE as usize];
         let words = self.u.iter().flatten().copied().chain(self.f.iter().flatten().map(|x| x.to_bits()));
-        for (dst, x) in v.chunks_exact_mut(4).zip(words) {
+        for (dst, x) in v.as_chunks_mut::<4>().0.iter_mut().zip(words) {
             dst.copy_from_slice(&x.to_le_bytes());
         }
         v
