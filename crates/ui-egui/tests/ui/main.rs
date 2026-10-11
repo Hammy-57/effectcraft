@@ -29,6 +29,8 @@ fn every_test_file_is_a_module() {
 
 #[path = "../render_queue_snapshot.rs"]
 mod render_queue_snapshot;
+#[path = "../shared_docking_ui.rs"]
+mod shared_docking_ui;
 #[path = "../ui_3d.rs"]
 mod ui_3d;
 #[path = "../ui_agent_audit.rs"]
@@ -47,6 +49,8 @@ mod ui_camera_tracker;
 mod ui_color_hex;
 #[path = "../ui_control_channel.rs"]
 mod ui_control_channel;
+#[path = "../ui_dock_resize.rs"]
+mod ui_dock_resize;
 #[path = "../ui_drag_drop.rs"]
 mod ui_drag_drop;
 #[path = "../ui_effect_controls.rs"]
@@ -147,5 +151,9 @@ mod ui_web_job_gpu;
 mod ui_web_offload;
 #[path = "../ui_workflow_selection.rs"]
 mod ui_workflow_selection;
+#[path = "../ui_workspace_focus.rs"]
+mod ui_workspace_focus;
+#[path = "../viewer_geometry.rs"]
+mod viewer_geometry;
 #[path = "../viewer_passive_display.rs"]
 mod viewer_passive_display;

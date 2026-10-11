@@ -244,6 +244,13 @@ impl<'a> Renderer<'a> {
         Some(r)
     }
 
+    /// Offset of a collapsed isolated canvas in output-pixel coordinates, shared
+    /// by CPU and native effect producers. Its geometry is already in comp space.
+    pub fn collapsed_effect_offset(&self) -> [f64; 2] {
+        let [ox, oy] = self.canvas_origin.map(f64::from);
+        self.roi_offset().map(|(x, y, _, _)| [-x - ox, -y - oy]).unwrap_or([-ox, -oy])
+    }
+
     /// Draw a collapsed precomp layer with effects ([`Self::collapsed_fx`]): the nested layers
     /// are drawn collapsed into an isolated frame, the precomp layer's effects run on it in comp
     /// space (as for an adjustment layer) and it takes the layer's matte, mode and opacity.
@@ -256,8 +263,7 @@ impl<'a> Renderer<'a> {
         let mut iso = pool::zeroed(canvas.width, canvas.height);
         with_transform_memo(self.project, || sub.draw_comp(&nctx, &mut iso, true));
         // Buffer pixel 0 is the output's pixel at the canvas origin.
-        let [ox, oy] = self.canvas_origin.map(f64::from);
-        let offset = self.roi_offset().map(|(x, y, _, _)| [-x - ox, -y - oy]).unwrap_or([-ox, -oy]);
+        let offset = self.collapsed_effect_offset();
         let mut buf = Buf { img: iso, offset, scale: self.opts.scale };
         // Effects run in the working space, not the linear blending space.
         if let Some(c) = self.pipe.from_blend() {

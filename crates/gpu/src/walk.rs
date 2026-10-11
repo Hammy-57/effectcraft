@@ -90,9 +90,13 @@ fn draw_layers<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, visible: &[
         } else {
             match (r.collapsed(ctx, visible[i]), r.collapsed_fx(ctx, visible[i])) {
                 (Some(item), _) => draw_collapsed(e, r, ctx, visible[i], item, canvas)?,
-                (None, Some(item)) => on_cpu(e, canvas, |img| {
-                    r.draw_collapsed_fx(ctx, visible[i], item, img);
-                })?,
+                (None, Some(item)) => {
+                    if draw_collapsed_fx(e, r, ctx, visible[i], item, canvas).is_none() {
+                        on_cpu(e, canvas, |img| {
+                            r.draw_collapsed_fx(ctx, visible[i], item, img);
+                        })?;
+                    }
+                }
                 (None, None) => draw_layer(e, r, ctx, visible[i], canvas)?,
             }
             i += 1;
@@ -215,6 +219,36 @@ fn draw_collapsed<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, layer: &
     composite_iso(e, r, ctx, layer, iso, canvas, opacity)
 }
 
+/// Collapsed 2D contents are already placed in comp space before the parent
+/// effect stack. Keep that isolation resident; unsupported work keeps CPU fallback.
+fn draw_collapsed_fx<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, layer: &'a Layer, item: ItemId, canvas: &mut GpuImage) -> Option<()> {
+    let opacity = r.layer_opacity(ctx, layer);
+    if opacity <= 0.0 {
+        return Some(());
+    }
+    let Some((sub, nctx)) = r.collapse_into(ctx, layer, item, 1.0) else {
+        return Some(());
+    };
+    let mut iso = e.zeros(canvas.width, canvas.height);
+    // collapse_into propagates the parent transform and motion-blur time chain.
+    draw_comp(e, &sub, &nctx, &mut iso)?;
+    let pipe = r.pipe();
+    if let Some(c) = pipe.from_blend() {
+        iso = ops::convert(e, &iso, &c);
+    }
+    let mut fx = crate::effects::GpuFx::new(e, iso, r.collapsed_effect_offset(), r.opts.scale, pipe.levels);
+    r.run_effects_on(ctx, layer, true, &mut fx);
+    let (mut done, _, _) = fx.finish()?;
+    if let Some(c) = pipe.to_blend() {
+        done = ops::convert(e, &done, &c);
+    }
+    // Match draw_collapsed_fx: an effect that changes the canvas extent draws nothing.
+    if (done.width, done.height) != (canvas.width, canvas.height) {
+        return Some(());
+    }
+    composite_iso(e, r, ctx, layer, done, canvas, opacity)
+}
+
 fn draw_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut GpuImage) -> Option<()> {
     if layer.switches.adjustment {
         if draw_adjustment(e, r, ctx, layer, canvas).is_some() {
@@ -307,9 +341,9 @@ fn draw_ordinary_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Laye
         return None;
     }
     let cache = r.cache?;
-    let key = {
+    let (key, clip) = {
         let _profile = effectcraft_render::profile::span("ordinary_resident_key");
-        r.resident_content_key(ctx, layer)?
+        r.resident_content(ctx, layer)?
     };
     let resident = {
         let _profile = effectcraft_render::profile::span("ordinary_resident_lookup");
@@ -341,7 +375,7 @@ fn draw_ordinary_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Laye
         crate::context::NativeImage { img: e.upload_buf(&buf)?, offset: buf.offset, scale: buf.scale }
     } else {
         let _profile = effectcraft_render::profile::span("ordinary_resident_produce");
-        let buf = r.resident_source(ctx, layer)?;
+        let buf = r.resident_source(ctx, layer, clip)?;
         let src = e.g.upload_image(&buf.img)?;
         let mut fx = crate::effects::GpuFx::new(e, src, buf.offset, buf.scale, r.pipe().levels);
         let origin = r.run_layer_effects_on(ctx, layer, &mut fx);
@@ -695,10 +729,7 @@ fn place_src(
     if let [m] = pl.matrices.as_slice() {
         return Some(ops::warp_q(e, target, &src, m, pl.sampling, mode, opacity, pl.seed, None, levels));
     }
-    let mut acc = e.zeros(target.width, target.height);
     let k = 1.0 / pl.matrices.len() as f32;
-    for m in &pl.matrices {
-        acc = ops::warp(e, &acc, &src, m, pl.sampling, BlendMode::Normal, 1.0, 0, Some(k));
-    }
+    let acc = ops::warp_accumulate(e, &e.zeros(target.width, target.height), &src, &pl.matrices, pl.sampling, k);
     Some(ops::blend_full(e, target, &acc, mode, opacity, pl.seed, levels))
 }

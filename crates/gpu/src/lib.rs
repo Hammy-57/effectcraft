@@ -548,6 +548,8 @@ mod tests_particles;
 #[cfg(test)]
 mod tests_precomp_resident;
 #[cfg(test)]
+mod tests_shape_clip;
+#[cfg(test)]
 mod tests_warmup;
 
 mod yuv;
@@ -568,3 +570,9 @@ pub fn yuv_transport_enabled() -> bool {
 
 #[cfg(test)]
 mod tests_cache_policy;
+
+#[cfg(test)]
+mod tests_collapsed_resident;
+
+#[cfg(test)]
+mod tests_motion_blur_accum;

@@ -194,7 +194,7 @@ impl<'a> Renderer<'a> {
     }
 
     /// Authored colours into the working space (linear working spaces).
-    fn authored(&self, mut buf: Buf) -> Buf {
+    pub(crate) fn authored(&self, mut buf: Buf) -> Buf {
         if let Some(c) = self.pipe.authored_in() {
             color::convert(&mut buf.img, &c);
         }

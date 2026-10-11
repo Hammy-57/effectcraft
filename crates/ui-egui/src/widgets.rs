@@ -260,7 +260,15 @@ pub fn icon_button_local(ui: &mut Ui, rect: Rect, icon: Icon, local: Option<&str
     if !local.is_some_and(|name| crate::local_assets::paint(ui.painter(), inner, name, col)) {
         icons::paint(ui.painter(), inner, icon, col);
     }
+    focus_outline(ui, &resp, t);
     resp
+}
+
+/// Keep keyboard focus visible on custom-painted controls, including their active state.
+pub fn focus_outline(ui: &Ui, response: &Response, t: &Tokens) {
+    if response.has_focus() {
+        ui.painter().rect_stroke(response.rect.shrink(1.0), 4.0, Stroke::new(2.0, t.text), StrokeKind::Inside);
+    }
 }
 
 /// One line of `text` at `pos` (placed by `align`), cut short with "…" past `max_w` points so it

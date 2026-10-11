@@ -855,7 +855,7 @@ fn fit_preview(lines: &[Vec<[f32; 2]>], room: Rect, baseline: f32) -> Option<(f3
         .flatten()
         .filter(|p| p[0].is_finite() && p[1].is_finite())
         .fold(Rect::NOTHING, |b, p| b.union(Rect::from_min_max(pos2(p[0], p[1]), pos2(p[0], p[1]))));
-    if !(b.min.x <= b.max.x && b.min.y <= b.max.y) || !room.is_positive() {
+    if !(b.min.x <= b.max.x && b.min.y <= b.max.y && room.is_positive()) {
         return None;
     }
     let k = (room.width() / b.width().max(1e-3)).min(room.height() / b.height().max(1e-3)).min(1.0);

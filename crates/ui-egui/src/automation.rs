@@ -14,6 +14,9 @@ pub struct Element {
     /// `rect` is then in that window's coordinates. Absent for the main window.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window: Option<u64>,
+    /// The egui widget that receives keyboard input for this element ([`Registry::add_response`]).
+    #[serde(skip)]
+    pub(crate) response_id: Option<egui::Id>,
 }
 
 #[derive(Default)]
@@ -40,11 +43,19 @@ impl Registry {
                 e.label.push_str(label);
                 e.rect = rect;
                 e.window = window;
+                e.response_id = None;
                 e
             }
-            None => Element { id: id.to_string(), label: label.to_string(), rect, window },
+            None => Element { id: id.to_string(), label: label.to_string(), rect, window, response_id: None },
         };
         self.elements.push(e);
+    }
+    /// Bind an automation name to the widget that actually receives keyboard input.
+    pub fn add_response(&mut self, id: &str, response: &egui::Response, label: &str) {
+        self.add(id, response.rect, label);
+        if let Some(element) = self.elements.last_mut() {
+            element.response_id = Some(response.id);
+        }
     }
     pub fn begin_frame(&mut self) {
         let mut recycled = std::mem::replace(&mut self.previous, std::mem::take(&mut self.elements));

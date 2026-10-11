@@ -159,6 +159,7 @@ options: --project F.ecproj | --demo | --empty   --save | --save-as F   --bridge
 /// Options that take a value.
 const VALUED: &[&str] = &[
     "--trace",
+    "--profile-offset",
     "--n",
     "--profile-offset",
     "--play",

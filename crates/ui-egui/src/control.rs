@@ -595,6 +595,21 @@ pub fn inspect(app: &EffectcraftApp, ctx: &egui::Context) -> Value {
     // Existing playback bookkeeping can be stale during a stall and does not measure scanout.
     // Expose observation age and timeline position so control clients can detect advancement.
     let last_shown = app.playback.shown_at.back().copied();
+    let keyboard_focus = ctx.memory(|m| m.focused()).map(|id| {
+        let response = ctx.read_response(id);
+        let rect = response.as_ref().map(|r| [r.rect.min.x, r.rect.min.y, r.rect.width(), r.rect.height()]);
+        // The registry names screen elements independently of egui's internal ids. Report
+        // exact rectangle matches rather than guessing which enclosing panel owns focus.
+        let candidates: Vec<&str> = app
+            .auto
+            .elements
+            .iter()
+            .filter(|e| rect.is_some_and(|r| e.rect.iter().zip(r).all(|(a, b)| (*a - b).abs() < 0.01)))
+            .map(|e| e.id.as_str())
+            .collect();
+        let automation_id = app.auto.elements.iter().chain(app.auto.previous.iter()).find(|e| e.response_id == Some(id)).map(|e| e.id.as_str());
+        json!({"id": format!("{:016x}", id.value()), "rect": rect, "automationId": automation_id, "registryCandidates": candidates})
+    });
     json!({
         "window": [size.x, size.y],
         "pixelsPerPoint": ctx.pixels_per_point(),
@@ -624,6 +639,9 @@ pub fn inspect(app: &EffectcraftApp, ctx: &egui::Context) -> Value {
         "selectedLayers": app.session.state.selected_layers.iter().map(|c| c.0).collect::<Vec<_>>(),
         "selectedKeys": app.session.state.selected_keys.len(),
         "elements": app.auto.elements.len(),
+        "keyboardFocus": keyboard_focus,
+        "windowFocused": ctx.input(|i| i.focused),
+        "workspaceStorageError": app.workspace_store.error,
         "dialog": app.dialog.map(|d| format!("{d:?}")),
         "renderMs": app.frames.last_ms.lock().map(|v| *v).unwrap_or(0.0),
     })

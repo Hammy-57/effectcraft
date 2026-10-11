@@ -78,6 +78,53 @@ fn warp_blend(@builtin(global_invocation_id) gid: vec3<u32>) {
     store_q(vec2<i32>(x, y), blend_pixel(mode, d, s, n), P.f[3].z, P.f[3].w);
 }
 
+// Motion-blur sub-samples of one source in one pass: `aux` plus each sample's warp of `src`
+// times the weight, summed in sample order exactly as consecutive `warp_blend` accumulate
+// passes would (the same per-sample bounds and source-range tests).
+// u[0] = (sampling, sample count); f[0] = (weight, union bounds x0, y0, x1), f[1].x = union y1;
+// data: per sample 16 floats = inverse rows r0, r1, r2 (xyz_) and bounds (x0, y0, x1, y1).
+@compute @workgroup_size(16, 16)
+fn warp_accum(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dims = out_dims();
+    let x = i32(gid.x);
+    let y = i32(gid.y);
+    if (x >= dims.x || y >= dims.y) {
+        return;
+    }
+    let sampling = P.u[0].x;
+    let count = P.u[0].y;
+    let k = P.f[0].x;
+    var d = textureLoad(aux, vec2<i32>(x, y), 0);
+    let fx = f32(x) + 0.5;
+    let fy = f32(y) + 0.5;
+    if (fx < P.f[0].y || fy < P.f[0].z || fx > P.f[0].w || fy > P.f[1].x) {
+        textureStore(out, vec2<i32>(x, y), d);
+        return;
+    }
+    let sz = vec2<f32>(textureDimensions(src));
+    for (var i = 0u; i < count; i = i + 1u) {
+        let o = i * 16u;
+        if (fx < data[o + 12u] || fy < data[o + 13u] || fx > data[o + 14u] || fy > data[o + 15u]) {
+            continue;
+        }
+        var px = data[o] * fx + data[o + 1u] * fy + data[o + 2u];
+        var py = data[o + 4u] * fx + data[o + 5u] * fy + data[o + 6u];
+        let w = data[o + 8u] * fx + data[o + 9u] * fy + data[o + 10u];
+        if (w != 1.0 && w != 0.0) {
+            px = px / w;
+            py = py / w;
+        }
+        if (px < -1.0 || py < -1.0 || px > sz.x + 1.0 || py > sz.y + 1.0) {
+            continue;
+        }
+        let s = sample(src, sampling, px, py);
+        if (s.w > 0.0) {
+            d = d + s * k;
+        }
+    }
+    textureStore(out, vec2<i32>(x, y), d);
+}
+
 // Blend `src` (same size) onto `aux` (Image::blend_from).
 // u[0] = (mode, _, seed); f[0].x = opacity
 @compute @workgroup_size(16, 16)

@@ -17,6 +17,7 @@ const PINNED_INVOKE: &[&str] = &[
     "anim.reveal",
     "file.close",
     "window.maximizePanel",
+    "window.dockAction",
     "window.dockPanel",
     "window.floatPanel",
     "window.closePanel",
@@ -168,7 +169,7 @@ fn handles_exactly_the_pinned_ids() {
         want.sort();
         assert_eq!(got, want, "{stage:?}: the handled ids changed; update PINNED_* only for a deliberate change");
     }
-    assert_eq!(PINNED_INVOKE.len() + PINNED_FRONTEND.len(), 127);
+    assert_eq!(PINNED_INVOKE.len() + PINNED_FRONTEND.len(), 128);
 }
 
 #[test]

@@ -151,7 +151,7 @@ fn saved_workspaces_persist_across_sessions() {
     drop(h);
     let mut h = launch();
     assert_eq!(h.state().saved_workspace_names(), ["My Layout", "Scratch"]);
-    assert_eq!(h.state().ui.workspace, "Default");
+    assert_eq!(h.state().ui.workspace, "Scratch");
     let ctx = h.ctx.clone();
     invoke(h.state_mut(), &ctx, "window.workspace", json!({"name": "My Layout"})).unwrap();
     assert_eq!(h.state().ui.dock, saved);

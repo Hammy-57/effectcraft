@@ -12,6 +12,7 @@
 // "Self-registering modules"); declare one here only for another visibility or a submodule folder.
 include!(concat!(env!("OUT_DIR"), "/modules.rs"));
 pub mod cache;
+mod clip;
 pub mod shapes;
 pub mod text;
 pub mod yuv;
@@ -30,6 +31,7 @@ pub use accel::{Accelerator, Backend, FxStep, FxTarget};
 pub use adjustment::adjustment_crop;
 pub use auto::{AutoKey, AutoPick};
 pub use cache::{CacheStats, LayerCache, LayerStore, PrefetchStore};
+pub use clip::set_shape_clip;
 pub use effectcraft_raster::Image;
 pub use eval::{EvalCtx, ExprHost, effect_bounds, source_size};
 pub use footage::{
@@ -38,7 +40,7 @@ pub use footage::{
 };
 pub(crate) use fx::comp_scene;
 pub use fx::effect_canvas_extent;
-pub use layer_buf::StyledLayer;
+pub use layer_buf::{ContentClip, StyledLayer};
 pub use motion_blur::adaptive_samples;
 pub use placement::Placement;
 pub use renderer::{LayerTiming, RenderOpts, Renderer, extended_region, render_frame, roi_inside};

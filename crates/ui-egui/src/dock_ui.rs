@@ -10,12 +10,18 @@ use egui::{Color32, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2, pos2, vec2};
 
 use crate::dock::{self, DockAction, DockNode, Group, Layout, PanelKind, Zone};
 use crate::{EffectcraftApp, panels};
+use craft_ui::docking::{Action, Placement};
 
 pub(crate) fn drag_id() -> egui::Id {
     egui::Id::new("dock-tab-drag")
 }
 
 impl EffectcraftApp {
+    pub(crate) fn dock_command(&mut self, ctx: &egui::Context, action: Action<PanelKind>) -> Result<(), String> {
+        let value = serde_json::to_value(action).map_err(|error| error.to_string())?;
+        crate::menus::invoke(self, ctx, "window.dockAction", serde_json::json!({"action": value})).map(|_| ())
+    }
+
     /// Tab labels that name what the panel shows, as After Effects does: "Composition Intro",
     /// "Effect Controls Title", "Properties: Title" (the Timeline's tabs are its comps, see
     /// [`Self::tab_docs`]).
@@ -111,6 +117,10 @@ impl EffectcraftApp {
 
     /// Edit the full layout (docked tree + floating groups) with a [`Layout`] operation.
     pub fn edit_layout(&mut self, f: impl FnOnce(&mut Layout) -> bool) -> bool {
+        let Ok(shared) = crate::dock_shared::encode(&self.ui.dock, &self.ui.floating) else { return false };
+        if shared.validate().is_err() {
+            return false;
+        }
         let mut l = Layout { root: self.ui.dock.clone(), floating: self.ui.floating.clone() };
         if !f(&mut l) {
             return false;
@@ -125,6 +135,10 @@ impl EffectcraftApp {
 
     /// Close a panel wherever it is (docked or floating).
     pub fn close_panel(&mut self, p: PanelKind) {
+        // Commit the layout first: rejected closes must not release viewer or script state.
+        if !self.edit_layout(|layout| layout.apply(Action::Close { panel: p }).is_ok()) {
+            return;
+        }
         // Closing a ScriptUI panel closes its script window (its script's onClose runs).
         if let PanelKind::ScriptPanel(id) = p
             && self.session.script_ui.window(id).is_some()
@@ -132,8 +146,6 @@ impl EffectcraftApp {
         {
             self.ui.status = e.to_string();
         }
-        self.ui.dock.close(p);
-        self.edit_layout(|l| l.unfloat(p));
         panels::viewers::on_close(self, p);
         if self.ui.maximized == Some(p) {
             self.ui.maximized = None;
@@ -273,7 +285,8 @@ impl EffectcraftApp {
             None => std::mem::replace(&mut self.ui.dock, DockNode::Tabs { panels: vec![], active: 0, small: false }),
         };
         let mut groups = Vec::new();
-        dock::layout(ui, &mut dock, body, &t, "", &mut groups, &mut self.auto);
+        let mut layout_actions = Vec::new();
+        dock::layout_with_actions(ui, &mut dock, body, &t, "", &mut groups, &mut self.auto, &mut layout_actions);
         let mut actions = Vec::new();
         let titles = self.tab_titles();
         let decos = self.tab_decos();
@@ -312,7 +325,21 @@ impl EffectcraftApp {
         let origin = crate::float_windows::main_origin(&ctx).filter(|_| crate::float_windows::enabled(&ctx));
         let mut closed = vec![];
         self.os_windows.begin_frame(&ctx);
-        for i in 0..self.ui.floating.len() {
+        // In paint order (groups floating over the dock): the last one is on top for tab drops.
+        let layers = ctx.memory(|memory| memory.layer_ids().collect::<Vec<_>>());
+        let mut floating_order: Vec<_> = (0..self.ui.floating.len()).collect();
+        floating_order.sort_by_key(|index| {
+            self.ui
+                .floating
+                .get(*index)
+                .and_then(|group| group.panels.first())
+                .and_then(|panel| {
+                    let id = egui::Id::new(("floating-panel", panel.id()));
+                    layers.iter().position(|layer| layer.id == id)
+                })
+                .unwrap_or(usize::MAX)
+        });
+        for i in floating_order {
             let shown = match origin {
                 Some(o) => self.floating_os_window(&ctx, i, o, &info, &mut actions, &mut closed),
                 None => self.floating_window(&ctx, i, &info, &mut actions),
@@ -330,17 +357,16 @@ impl EffectcraftApp {
                 self.ui.status = e;
             }
         }
+        for action in layout_actions {
+            let _ = self.dock_command(&ctx, action);
+        }
         for a in actions {
             match a {
                 DockAction::Activate(p) => {
-                    if !self.ui.dock.activate(p)
-                        && let Some(f) = self.ui.floating.iter_mut().find(|f| f.panels.contains(&p))
-                    {
-                        f.active = f.panels.iter().position(|x| *x == p).unwrap_or(0);
-                    }
+                    let _ = self.dock_command(&ctx, Action::Activate { panel: p });
                 }
                 DockAction::ToggleStacked(p) => {
-                    self.ui.dock.toggle_stacked(p);
+                    let _ = self.dock_command(&ctx, Action::SetStackOpen { panel: p, open: !self.ui.dock.is_visible(p) });
                 }
                 DockAction::Focus(p) => {
                     self.ui.focused = p;
@@ -349,7 +375,9 @@ impl EffectcraftApp {
                         panels::viewers::activate(self, &ctx, id);
                     }
                 }
-                DockAction::Close(p) => self.close_panel(p),
+                DockAction::Close(p) => {
+                    let _ = self.dock_command(&ctx, Action::Close { panel: p });
+                }
                 DockAction::PanelMenu(p, pos) => panels::panel_menu::open(&ctx, p, self.shown_doc(p), pos),
                 DockAction::TabMenu(p, doc, pos) => panels::panel_menu::open(&ctx, p, doc, pos),
                 DockAction::BeginDrag(p) => {
@@ -363,11 +391,7 @@ impl EffectcraftApp {
                 }
                 // The Timeline's comp tabs: show that comp / close its Timeline.
                 DockAction::ActivateDoc(p, id) => {
-                    if !self.ui.dock.activate(p)
-                        && let Some(f) = self.ui.floating.iter_mut().find(|f| f.panels.contains(&p))
-                    {
-                        f.active = f.panels.iter().position(|x| *x == p).unwrap_or(0);
-                    }
+                    let _ = self.dock_command(&ctx, Action::Activate { panel: p });
                     if self.session.state.active_comp.map(|c| c.0) != Some(id) {
                         let _ = crate::menus::invoke(self, &ctx, "comp.open", serde_json::json!({"comp": id}));
                     }
@@ -433,8 +457,9 @@ impl EffectcraftApp {
             }
             // Resize from the corner.
             let grip = Rect::from_min_max(r.max - vec2(14.0, 14.0), r.max);
-            let rs = ui.interact(grip, id.with("resize"), Sense::drag());
-            self.auto.add(&format!("panel.float.{i}.resize"), grip, "Resize floating panel");
+            let rs = ui.interact(grip, id.with("resize"), Sense::click_and_drag());
+            rs.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, rs.enabled(), crate::i18n::tr("Resize floating panel")));
+            self.auto.add_response(&format!("panel.float.{i}.resize"), &rs, "Resize floating panel");
             for k in 0..3 {
                 let o = 4.0 + k as f32 * 4.0;
                 ui.painter().line_segment([pos2(r.max.x - o, r.max.y - 2.0), pos2(r.max.x - 2.0, r.max.y - o)], Stroke::new(1.0, t.text_faint));
@@ -442,13 +467,17 @@ impl EffectcraftApp {
             if rs.hovered() || rs.dragged() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNwSe);
             }
-            if rs.dragged() {
-                nr = Rect::from_min_size(nr.min, (nr.size() + rs.drag_delta()).max(vec2(160.0, 100.0)));
+            let delta = floating_resize_delta(ui, &rs);
+            if rs.has_focus() {
+                ui.painter().rect_stroke(grip, 2.0, Stroke::new(1.5, t.focus), StrokeKind::Inside);
+            }
+            if delta != egui::Vec2::ZERO {
+                nr = Rect::from_min_size(nr.min, (nr.size() + delta).max(vec2(160.0, 100.0)));
             }
             if nr != r
-                && let Some(fl) = self.ui.floating.get_mut(i)
+                && let Some(panel) = f.panels.first().copied()
             {
-                fl.rect = [nr.min.x, nr.min.y, nr.width(), nr.height()];
+                let _ = self.dock_command(ctx, Action::MoveFloating { panel, rect: [nr.min.x, nr.min.y, nr.width(), nr.height()] });
             }
             group = Some((g, c.tabs));
         });
@@ -469,6 +498,17 @@ impl EffectcraftApp {
             return;
         };
         let t = self.tokens;
+        // Escape, a lost button release (or window focus) or the panel closing meanwhile
+        // cancels the drag. (A drag from an undocked OS window is fed by that window.)
+        let canceled = ctx.input(|i| i.key_pressed(egui::Key::Escape))
+            || (self.os_windows.drag_from.is_none() && ctx.input(|i| !i.focused || (!i.pointer.primary_down() && !i.pointer.any_released())));
+        if canceled || !(self.ui.dock.contains(p) || self.ui.floating.iter().any(|group| group.panels.contains(&p))) {
+            ctx.data_mut(|d| d.remove::<PanelKind>(drag_id()));
+            self.os_windows.drag_from = None;
+            self.os_windows.drag_feed = None;
+            self.os_windows.drag_overlay = None;
+            return;
+        }
         // The pointer (main-window points): a drag that started in an undocked OS window is
         // followed by that window, which has the pointer until the button is released.
         let (pos, released, float_drop) = match self.os_windows.drag_from {
@@ -515,11 +555,16 @@ impl EffectcraftApp {
             self.os_windows.drag_feed = None;
             self.os_windows.drag_overlay = None;
             let ok = match target.plan {
-                Some(DropPlan::Tab { anchor, before }) => self.edit_layout(|l| l.insert_tab(p, anchor, before)),
-                Some(DropPlan::Side { anchor, zone }) => self.edit_layout(|l| l.dock(p, anchor, zone)),
+                // One shared docking transaction each (tab order, edge splits, floating).
+                Some(DropPlan::Tab { anchor, before }) => {
+                    self.dock_command(ctx, Action::Move { panel: p, anchor, placement: Placement::Tab { before } }).is_ok()
+                }
+                Some(DropPlan::Side { anchor, zone }) => {
+                    self.dock_command(ctx, Action::Move { panel: p, anchor, placement: Placement::Split(zone.shared()) }).is_ok()
+                }
                 None if float_drop || !target.over_group => {
                     let r = [pos.x - 40.0, pos.y - 12.0, 420.0, 320.0];
-                    self.edit_layout(|l| l.float(p, r))
+                    self.dock_command(ctx, Action::Float { panel: p, rect: r }).is_ok()
                 }
                 None => false,
             };
@@ -555,7 +600,8 @@ fn drop_target(
     tab_rects: &[(String, Vec<(PanelKind, Rect)>)],
     t: &crate::theme::Tokens,
 ) -> DropTarget {
-    let float = floats.iter().position(|g| g.rect.contains(pos));
+    // The floating groups are in paint order: the topmost one under the pointer takes it.
+    let float = floats.iter().rposition(|g| g.rect.contains(pos));
     let target = match float.and_then(|i| floats.get(i)) {
         Some(g) => Some((g, true)),
         None => groups.iter().find(|g| g.rect.contains(pos)).map(|g| (g, false)),
@@ -666,6 +712,32 @@ fn insertion_mark(painter: &egui::Painter, x: f32, strip: Rect, col: Color32) {
 pub fn default_float_rect(screen: Rect) -> [f32; 4] {
     let c = screen.center();
     [c.x - 210.0, c.y - 160.0, 420.0, 320.0]
+}
+
+/// A corner is a two-axis resize control; focused arrows belong to it and Tab moves on.
+fn floating_resize_delta(ui: &mut egui::Ui, response: &egui::Response) -> egui::Vec2 {
+    if response.drag_started() {
+        response.request_focus();
+    }
+    let mut delta = if response.dragged() { response.drag_delta() } else { egui::Vec2::ZERO };
+    if response.has_focus() {
+        ui.memory_mut(|memory| {
+            memory.set_focus_lock_filter(response.id, egui::EventFilter { horizontal_arrows: true, vertical_arrows: true, ..Default::default() })
+        });
+        ui.input_mut(|input| {
+            for (key, amount) in [
+                (egui::Key::ArrowLeft, vec2(-8.0, 0.0)),
+                (egui::Key::ArrowRight, vec2(8.0, 0.0)),
+                (egui::Key::ArrowUp, vec2(0.0, -8.0)),
+                (egui::Key::ArrowDown, vec2(0.0, 8.0)),
+            ] {
+                if input.consume_key(egui::Modifiers::NONE, key) {
+                    delta += amount;
+                }
+            }
+        });
+    }
+    if response.enabled() { delta } else { egui::Vec2::ZERO }
 }
 
 #[cfg(test)]
