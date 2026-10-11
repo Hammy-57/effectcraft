@@ -2489,6 +2489,10 @@ fn automation_roots_confine_file_access() {
     denied(&mut s, "save_project", json!({"path": "relative.ecproj"}));
     denied(&mut s, "save_project", json!({"path": p(&write, "../elsewhere/up.ecproj")}));
     denied(&mut s, "execute_command", json!({"command": "comp.saveFrameAs", "params": {"path": p(&outside, "f.png")}}));
+    // The checking commands' outputs are writes too, even into a read root or relative.
+    denied(&mut s, "execute_command", json!({"command": "render.contactSheet", "params": {"gif": p(&read, "sheet.gif")}}));
+    denied(&mut s, "execute_command", json!({"command": "audio.analyze", "params": {"path": "wave.png"}}));
+    denied(&mut s, "execute_command", json!({"command": "help.exportRepro", "params": {"path": p(&read, "repro.jsonl")}}));
     // Any other absolute path a command is given.
     denied(&mut s, "execute_command", json!({"command": "renderQueue.add", "params": {"output": p(&outside, "movie.mp4")}}));
     // A batch step.
