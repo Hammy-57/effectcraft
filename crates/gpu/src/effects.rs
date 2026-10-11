@@ -125,6 +125,33 @@ impl effectcraft_render::FxTarget for GpuFx<'_, '_> {
         let out = f(Buf { img, offset: b.offset, scale: b.scale });
         self.b = self.e.g.upload_image(&out.img).map(|img| GBuf { img, offset: out.offset, scale: out.scale });
     }
+    fn effect_canvas(&mut self, size: [f64; 2]) {
+        let Some(b) = &self.b else { return };
+        let Some(([width, height], pad)) = effectcraft_render::effect_canvas_extent([b.img.width, b.img.height], b.offset, b.scale, size) else {
+            return;
+        };
+        // Failure keeps the existing whole-layer CPU fallback contract; never submit an
+        // oversized copy or return a partially cleared canvas as a successful result.
+        if !self.e.g.fits(width, height) || self.e.g.check_health().is_err() {
+            self.b = None;
+            return;
+        }
+        let mut out = self.e.image(width, height);
+        if self.e.take_missing() || self.e.g.check_health().is_err() {
+            self.b = None;
+            return;
+        }
+        if b.img.width > 0 && b.img.height > 0 {
+            self.e.copy_into(&b.img, &out, pad[0], pad[1]);
+        }
+        out.levels = b.img.levels;
+        if self.e.take_missing() || self.e.g.check_health().is_err() {
+            self.b = None;
+            return;
+        }
+        self.b = Some(GBuf { img: out, offset: [b.offset[0] + f64::from(pad[0]), b.offset[1] + f64::from(pad[1])], scale: b.scale });
+    }
+
     fn shift(&mut self, d: [f64; 2]) {
         if let Some(b) = &mut self.b {
             b.offset = [b.offset[0] - d[0], b.offset[1] - d[1]];
@@ -780,5 +807,99 @@ mod keep_tests {
         }
         // Nothing waits for adoption once the frame is done.
         assert_eq!(g.ctx.kept_count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod text_canvas_tests {
+    use super::*;
+    use effectcraft_render::{FxTarget, Image};
+
+    struct Cpu(Buf);
+    impl FxTarget for Cpu {
+        fn gpu(&mut self, _: &[FxStep]) -> bool {
+            false
+        }
+        fn cpu(&mut self, f: &mut dyn FnMut(Buf) -> Buf) {
+            self.0 = f(self.0.clone());
+        }
+        fn shift(&mut self, d: [f64; 2]) {
+            self.0.offset = [self.0.offset[0] - d[0], self.0.offset[1] - d[1]];
+        }
+    }
+
+    fn context() -> Option<crate::context::GpuContext> {
+        crate::tests::hold_gpu_lock();
+        let g = crate::context::GpuContext::headless();
+        assert!(g.is_some() || std::env::var("EFFECTCRAFT_REQUIRE_GPU").as_deref() != Ok("1"), "required GPU unavailable");
+        g
+    }
+
+    #[test]
+    fn resident_text_canvas_matches_cpu_without_transfers() {
+        let Some(g) = context() else { return };
+        let mut pixels = Image::filled(3, 2, [0.25, 0.5, 0.75, 1.0]);
+        pixels.data[1] = [-0.5, 1.5, 0.125, 0.5];
+        for scale in [1.0, 0.5] {
+            for offset in [[-2.25, 1.5], [1.25, -3.75], [0.0; 2]] {
+                let source = Buf { img: pixels.clone(), offset, scale };
+                let mut cpu = Cpu(source.clone());
+                cpu.effect_canvas([20.0, 10.0]);
+                let mut input = g.upload_image(&source.img).unwrap();
+                input.levels = Some(255.0);
+                let mut e = Enc::new(&g);
+                let before = g.transfer_stats();
+                let mut target = GpuFx::new(&mut e, input, offset, scale, Some(255.0));
+                target.effect_canvas([20.0, 10.0]);
+                let (image, actual_offset, actual_scale) = target.finish().unwrap();
+                assert_eq!(g.transfer_stats(), before, "canvas growth stays on the GPU");
+                assert_eq!(actual_offset, cpu.0.offset);
+                assert_eq!(actual_scale, cpu.0.scale);
+                assert_eq!(image.levels, Some(255.0));
+                assert_eq!(e.download(&image).unwrap(), cpu.0.img);
+            }
+        }
+    }
+
+    #[test]
+    fn resident_text_canvas_unchanged_and_hostile_bounds_do_not_transfer() {
+        let Some(g) = context() else { return };
+        let pixels = Image::filled(3, 2, [0.25, 0.5, 0.75, 1.0]);
+        let input = g.upload_image(&pixels).unwrap();
+        let mut e = Enc::new(&g);
+        let before = g.transfer_stats();
+        let mut target = GpuFx::new(&mut e, input, [0.0; 2], 1.0, None);
+        for size in [[3.0, 2.0], [1.0, 1.0], [f64::NAN, 10.0], [10.0, f64::INFINITY], [16000.0; 2]] {
+            target.effect_canvas(size);
+        }
+        let (image, offset, scale) = target.finish().unwrap();
+        assert_eq!(g.transfer_stats(), before);
+        assert_eq!(offset, [0.0; 2]);
+        assert_eq!(scale, 1.0);
+        assert_eq!((image.width, image.height), (3, 2));
+        assert_eq!(e.download(&image).unwrap(), pixels);
+    }
+
+    #[test]
+    fn resident_text_canvas_missing_kernel_requests_cpu_fallback() {
+        let Some(g) = context() else { return };
+        let input = g.upload_image(&Image::filled(3, 2, [0.25, 0.5, 0.75, 1.0])).unwrap();
+        let mut e = Enc::new(&g);
+        let out = e.scratch(3, 2);
+        e.pixels("missing-text-canvas-test-kernel", &Params::default(), &input, None, &out, None);
+        let mut target = GpuFx::new(&mut e, input, [0.0; 2], 1.0, None);
+        target.effect_canvas([20.0, 10.0]);
+        assert!(target.finish().is_none());
+    }
+
+    #[test]
+    fn resident_text_canvas_device_failure_requests_cpu_fallback() {
+        let Some(g) = context() else { return };
+        let input = g.upload_image(&Image::filled(3, 2, [0.25, 0.5, 0.75, 1.0])).unwrap();
+        let mut e = Enc::new(&g);
+        g.device_failure_notifier()("text canvas device failure test".into());
+        let mut target = GpuFx::new(&mut e, input, [0.0; 2], 1.0, None);
+        target.effect_canvas([20.0, 10.0]);
+        assert!(target.finish().is_none());
     }
 }
