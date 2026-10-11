@@ -44,7 +44,9 @@ impl Pipelines {
         let module = init_resource(device, "YUV shader", || {
             device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("native YUV"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("yuv.wgsl").into()),
+                source: wgpu::ShaderSource::Wgsl(
+                    format!("{}\n{}\n{}", include_str!("ieee_add.wgsl"), include_str!("ieee_mul.wgsl"), include_str!("yuv.wgsl")).into(),
+                ),
             })
         })?;
         let entry = |binding, ty| wgpu::BindGroupLayoutEntry { binding, visibility: wgpu::ShaderStages::COMPUTE, ty, count: None };
@@ -645,6 +647,7 @@ mod tests {
                 ctx.yuv = None;
             } else {
                 ctx.drop_kernel("box_h");
+                ctx.drop_kernel("box_delta");
             }
             let g = crate::Gpu::from_context(ctx);
             for depth in [BitDepth::Bpc8, BitDepth::Bpc32] {
