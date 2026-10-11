@@ -966,6 +966,7 @@ something an agent can replay and a regression test becomes a data file.
 {"command": "comp.settings", "params": {"frameRate": 0}, "expect_error": "frameRate"}
 {"expect": {"query": "comp.info", "pointer": "/frameRate", "equals": 30}}
 {"expect_no_error": true}
+{"golden": {"file": "goldens/main-1s.png", "time": 1, "min_psnr": 40}}
 ```
 
 - `start`: the project to begin with (default `new`). A relative `project` path is relative to the
@@ -977,6 +978,10 @@ something an agent can replay and a regression test becomes a data file.
   and compare the value at the JSON `pointer` of its result with `equals` (numbers within 1e-6).
   Without `equals` it only checks that the query succeeds.
 - `expect_no_error`: the previous command succeeded.
+- `golden`: render a frame (`comp` and `time` default to the active comp and its current time;
+  `max_side`, `transparent` as in `render.frame`) and compare it with the PNG `file` (relative to
+  the script); it passes at `min_psnr` dB or better (default 40). `effectcraft-cli replay --bless`
+  (or `cargo xtask repros --bless`) writes the frames instead, to make or update the goldens.
 
 Where scripts come from:
 

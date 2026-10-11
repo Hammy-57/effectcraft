@@ -1,0 +1,30 @@
+// Golden frames for everyday compositing: blend modes, a track matte, a feathered mask, an effect,
+// parenting and eased keyframes, sampled at the start, middle and end of the move. A change that
+// alters any of these renders fails here with the PSNR and where the pixels moved. After an
+// intended change: `cargo xtask repros --bless`, look at tests/repros/goldens/, commit.
+{"start": "new"}
+{"command": "comp.new", "params": {"name": "Golden", "width": 160, "height": 90, "frameRate": 30, "duration": 2}}
+{"command": "layer.newSolid", "params": {"name": "BG", "color": "#203040"}}
+{"command": "layer.newSolid", "params": {"name": "Warm", "color": "#e08020", "width": 80, "height": 50}}
+{"command": "prop.set", "params": {"layer": "Warm", "path": "transform/position", "value": [60, 45, 0]}}
+{"command": "layer.setBlendMode", "params": {"layers": ["Warm"], "mode": "Screen"}}
+{"command": "layer.newSolid", "params": {"name": "Cool", "color": "#2080e0", "width": 80, "height": 50}}
+{"command": "prop.set", "params": {"layer": "Cool", "path": "transform/position", "value": [100, 45, 0]}}
+{"command": "layer.setBlendMode", "params": {"layers": ["Cool"], "mode": "Multiply"}}
+{"command": "mask.new", "params": {"layer": "Cool", "vertices": [[10, 5], [70, 5], [70, 45], [10, 45]], "closed": true}}
+{"command": "prop.set", "params": {"layer": "Cool", "path": "masks/#1/feather", "value": [6, 6]}}
+{"command": "layer.newSolid", "params": {"name": "Fill", "color": "#40e080", "width": 160, "height": 90}}
+{"command": "layer.newSolid", "params": {"name": "Matte", "color": "#ffffff", "width": 40, "height": 40}}
+{"command": "prop.set", "params": {"layer": "Matte", "path": "transform/rotation", "value": 30}}
+{"command": "layer.setTrackMatte", "params": {"layer": "Fill", "matte": "Matte", "kind": "alpha"}}
+{"command": "layer.newNull", "params": {"name": "Rig"}}
+{"command": "layer.setParent", "params": {"layers": ["Matte"], "parent": "Rig"}}
+{"command": "prop.addKey", "params": {"layer": "Rig", "path": "transform/position", "time": 0, "value": [30, 30, 0]}}
+{"command": "prop.addKey", "params": {"layer": "Rig", "path": "transform/position", "time": 1.5, "value": [130, 60, 0]}}
+{"command": "keys.selectAll", "params": {"layer": "Rig"}}
+{"command": "keys.easyEase", "params": {}}
+{"command": "effect.apply", "params": {"layers": ["Warm"], "effect": "Gaussian Blur"}}
+{"command": "prop.set", "params": {"layer": "Warm", "path": "effects/#1/blurriness", "value": 4}}
+{"golden": {"file": "goldens/compositing-basics-0.png", "time": 0}}
+{"golden": {"file": "goldens/compositing-basics-0_5.png", "time": 0.5}}
+{"golden": {"file": "goldens/compositing-basics-1_5.png", "time": 1.5}}
