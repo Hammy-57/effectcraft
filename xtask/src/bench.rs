@@ -30,6 +30,9 @@ Run it under `nice -n 10` on a busy machine; the table notes the load average of
   --regen               regenerate the footage media (otherwise reused when present)
   --compare OLD.jsonl   print the % change of this run against the latest matching runs in OLD
   --with NEW.jsonl      with --compare: compare two result files, without rendering
+  --fail-over PCT       with --compare: exit 1 when a matched run got more than PCT % worse in
+                        CPU time, peak memory, max RSS or instructions retired (wall time is
+                        left out: it follows the machine's load)
 
 Scenarios: demo (the built-in demo comp), layers (1080p, 100 solid/text/shape layers with Gaussian
 Blur, Glow, Levels, Curves, Drop Shadow and keyframes), precomps (static and animated precomps
@@ -52,6 +55,7 @@ struct Opts {
     regen: bool,
     compare: Option<PathBuf>,
     with: Option<PathBuf>,
+    fail_over: Option<f64>,
 }
 
 fn parse_opts(args: &[String]) -> Result<Opts, String> {
@@ -71,6 +75,9 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             "--regen" => o.regen = true,
             "--compare" => o.compare = Some(PathBuf::from(val("--compare")?)),
             "--with" => o.with = Some(PathBuf::from(val("--with")?)),
+            "--fail-over" => {
+                o.fail_over = Some(val("--fail-over")?.parse::<f64>().ok().filter(|p| p.is_finite() && *p >= 0.0).ok_or("--fail-over: a percentage expected")?)
+            }
             other => return Err(format!("unknown option `{other}`\n\n{HELP}")),
         }
     }
@@ -79,6 +86,9 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
     }
     if o.with.is_some() && o.compare.is_none() {
         return Err("--with needs --compare OLD.jsonl".into());
+    }
+    if o.fail_over.is_some() && o.compare.is_none() {
+        return Err("--fail-over needs --compare OLD.jsonl".into());
     }
     if o.frames == Some(0) {
         return Err("--frames must be at least 1".into());
@@ -93,9 +103,9 @@ pub fn run(root: &Path, args: &[String]) -> Result<(), String> {
     }
     let o = parse_opts(args)?;
     if let (Some(old), Some(new)) = (&o.compare, &o.with) {
-        let (old, new) = (read_jsonl(old)?, read_jsonl(new)?);
-        print!("{}", compare_table(&latest_per_key(&old), &latest_per_key(&new)));
-        return Ok(());
+        let (old, new) = (latest_per_key(&read_jsonl(old)?), latest_per_key(&read_jsonl(new)?));
+        print!("{}", compare_table(&old, &new));
+        return check_regressions(&old, &new, o.fail_over);
     }
     let dir = root.join("target").join("bench");
     std::fs::create_dir_all(dir.join("projects")).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -134,8 +144,9 @@ pub fn run(root: &Path, args: &[String]) -> Result<(), String> {
     print!("{}", table(&rows, timer));
     println!("appended {} runs to {}", rows.len(), results_path.display());
     if let Some(old) = &o.compare {
-        let old = read_jsonl(old)?;
-        print!("{}", compare_table(&latest_per_key(&old), &latest_per_key(&rows)));
+        let (old, new) = (latest_per_key(&read_jsonl(old)?), latest_per_key(&rows));
+        print!("{}", compare_table(&old, &new));
+        return check_regressions(&old, &new, o.fail_over);
     }
     Ok(())
 }
@@ -827,6 +838,34 @@ fn fmt_pct(p: Option<f64>) -> String {
 const COMPARED: &[(&str, &str)] =
     &[("wall_s", "wall"), ("cpu_s", "cpu"), ("peak_footprint_bytes", "peak"), ("max_rss_bytes", "maxRSS"), ("instructions", "instr")];
 
+/// Metrics `--fail-over` checks: the ones that don't swing with the machine's load.
+const GATED: &[&str] = &["cpu_s", "peak_footprint_bytes", "max_rss_bytes", "instructions"];
+
+/// Every matched run and metric that got more than `limit` % worse.
+fn regressions(old: &BTreeMap<String, Value>, new: &BTreeMap<String, Value>, limit: f64) -> Vec<String> {
+    let mut out = vec![];
+    for (k, n) in new {
+        let Some(o) = old.get(k) else { continue };
+        for field in GATED {
+            if let Some(p) = pct(o["metrics"][field].as_f64(), n["metrics"][field].as_f64()).filter(|p| *p > limit) {
+                out.push(format!("{} {}: {field} {}", n["scenario"].as_str().unwrap_or("?"), n["run"].as_str().unwrap_or("?"), fmt_pct(Some(p))));
+            }
+        }
+    }
+    out
+}
+
+fn check_regressions(old: &BTreeMap<String, Value>, new: &BTreeMap<String, Value>, limit: Option<f64>) -> Result<(), String> {
+    let Some(limit) = limit else { return Ok(()) };
+    let bad = regressions(old, new, limit);
+    if bad.is_empty() {
+        println!("no run got more than {limit}% worse");
+        Ok(())
+    } else {
+        Err(format!("{} regressions over {limit}%:\n  {}", bad.len(), bad.join("\n  ")))
+    }
+}
+
 fn compare_table(old: &BTreeMap<String, Value>, new: &BTreeMap<String, Value>) -> String {
     let mut s = String::from("\n% change against the earlier run (negative = better; instructions retired are the least load-sensitive)\n");
     s.push_str(&format!("{:<22} {:<6} {:>6}", "scenario", "run", "frames"));
@@ -939,6 +978,33 @@ mod tests {
         assert_eq!(line.matches("-20.0%").count(), 2, "{line}");
         assert!(!t.contains("demo"), "unmatched runs are left out: {t}");
         assert!(compare_table(&BTreeMap::new(), &new).contains("no matching runs"));
+    }
+
+    #[test]
+    fn fail_over_flags_resource_regressions_but_not_wall_time() {
+        let old = latest_per_key(&[row("layers", "full", 10.0, Some(1000), true), row("demo", "half", 1.0, Some(1000), true)]);
+        // Twice the wall time (and so CPU) on layers; 5% more peak on demo.
+        let new = latest_per_key(&[row("layers", "full", 20.0, Some(1000), true), row("demo", "half", 1.0, Some(1050), true)]);
+        let bad = regressions(&old, &new, 10.0);
+        assert_eq!(bad, ["layers full: cpu_s +100.0%"]);
+        assert_eq!(regressions(&old, &new, 3.0).len(), 2);
+        assert!(check_regressions(&old, &new, None).is_ok());
+        assert!(check_regressions(&old, &new, Some(150.0)).is_ok());
+        assert!(check_regressions(&old, &new, Some(10.0)).is_err_and(|e| e.contains("cpu_s")));
+        // Wall time alone never fails the check.
+        let mut slower = new.clone();
+        for v in slower.values_mut() {
+            v["metrics"]["cpu_s"] = json!(2.0);
+            v["metrics"]["wall_s"] = json!(500.0);
+        }
+        let mut base = old.clone();
+        for v in base.values_mut() {
+            v["metrics"]["cpu_s"] = json!(2.0);
+            v["metrics"]["peak_footprint_bytes"] = json!(1050);
+        }
+        assert!(regressions(&base, &slower, 1.0).is_empty());
+        assert!(parse_opts(&["--fail-over".into(), "5".into()]).is_err(), "needs --compare");
+        assert!(parse_opts(&["--compare".into(), "a".into(), "--fail-over".into(), "x".into()]).is_err());
     }
 
     #[test]
