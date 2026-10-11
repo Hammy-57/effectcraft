@@ -1992,7 +1992,7 @@ mod tests {
         // Re-docking anywhere when nothing near is left.
         one.root.add_anywhere(Tracker);
         assert_eq!(one.root.group_of(Tracker), Some((vec![Project, Info, Tracker], 2)));
-}
+    }
 
     /// Ported from #630 (Ni-zav): the reporter's reproduction on the Minimal workspace.
     #[test]
@@ -2057,8 +2057,7 @@ mod tests {
     #[test]
     fn removing_earlier_inactive_floating_tab_keeps_the_shown_panel() {
         use PanelKind::*;
-        let mut layout =
-            Layout { root: tabs(&[Composition], 0), floating: vec![Floating::new(vec![Properties, Align, EffectsPresets], 1, [0.0; 4])] };
+        let mut layout = Layout { root: tabs(&[Composition], 0), floating: vec![Floating::new(vec![Properties, Align, EffectsPresets], 1, [0.0; 4])] };
         assert!(layout.unfloat(Properties));
         let f = &layout.floating[0];
         assert_eq!(f.panels.get(f.active), Some(&Align));
@@ -2071,8 +2070,7 @@ mod tests {
         for (active, closed, shown) in
             [(0, Properties, Align), (1, Align, EffectsPresets), (2, EffectsPresets, Align), (usize::MAX, Properties, EffectsPresets)]
         {
-            let mut layout =
-                Layout { root: tabs(&[Composition], 0), floating: vec![Floating::new(vec![Properties, Align, EffectsPresets], active, [0.0; 4])] };
+            let mut layout = Layout { root: tabs(&[Composition], 0), floating: vec![Floating::new(vec![Properties, Align, EffectsPresets], active, [0.0; 4])] };
             assert!(layout.unfloat(closed));
             let f = &layout.floating[0];
             assert_eq!(f.panels.get(f.active), Some(&shown));

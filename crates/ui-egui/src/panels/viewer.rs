@@ -1286,7 +1286,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             Tool::PanCamera => egui::CursorIcon::Move,
             Tool::Dolly => egui::CursorIcon::ResizeVertical,
             t if t.is_pen() => {
-                let over_path = ov::segment_at(&paths, &map, hp, 5.0).is_some() || motion_segment.is_some() || ov::motion_frame_at(&motion_frames, &key_hits, hp).is_some();
+                let over_path =
+                    ov::segment_at(&paths, &map, hp, 5.0).is_some() || motion_segment.is_some() || ov::motion_frame_at(&motion_frames, &key_hits, hp).is_some();
                 pen_cursor(&ctx, hp, pen_cursor_icon(t, over_path));
                 egui::CursorIcon::None
             }

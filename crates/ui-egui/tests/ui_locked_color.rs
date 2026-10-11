@@ -43,9 +43,11 @@ fn locked_center(h: &mut Harness<'_, EffectcraftApp>, images: &Images, want: [u8
     let id = egui::Id::new("viewer-locked");
     let mut last = None;
     for _ in 0..400 {
-        let texture = h
-            .ctx
-            .data(|d| d.get_temp::<(effectcraft_ui_egui::frames::FrameKey, egui::TextureHandle)>(id).map(|(_, t)| t).or_else(|| d.get_temp::<(u64, egui::TextureHandle)>(id).map(|(_, t)| t)));
+        let texture = h.ctx.data(|d| {
+            d.get_temp::<(effectcraft_ui_egui::frames::FrameKey, egui::TextureHandle)>(id)
+                .map(|(_, t)| t)
+                .or_else(|| d.get_temp::<(u64, egui::TextureHandle)>(id).map(|(_, t)| t))
+        });
         if let Some(texture) = texture {
             let images = images.borrow();
             if let Some(image) = images.get(&texture.id()) {
