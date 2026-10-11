@@ -855,7 +855,7 @@ impl Inner {
         let raw = footage.frame_rate.frame_at(t);
         let mut c = lock(&self.cache);
         // a movie read in order: decode the next frames ahead
-        if playback && loc.media_t.is_some() && self.read_ahead.load(Ordering::Relaxed) {
+        if playback && loc.media_t.is_some() && !footage.codec.eq_ignore_ascii_case("gif") && self.read_ahead.load(Ordering::Relaxed) {
             self.schedule(&mut c, footage, preview, &loc.key, raw);
         }
         let me = std::thread::current().id();
@@ -1092,6 +1092,14 @@ impl Inner {
                     Err(e) => crate::exr_channels::layered_image(&bytes).ok_or_else(|| MediaError::Decode(format!("{path}: {e}")))?,
                 };
                 drop(bytes);
+                Ok(match pack_dynamic(img, op) {
+                    Ok(img) => float(img),
+                    Err(packed) => Pixels::Packed(Arc::new(packed)),
+                })
+            }
+            Some(mt) if footage.codec.eq_ignore_ascii_case("gif") => {
+                let bytes = self.read(path)?;
+                let img = crate::gif::frame(&bytes, mt)?;
                 Ok(match pack_dynamic(img, op) {
                     Ok(img) => float(img),
                     Err(packed) => Pixels::Packed(Arc::new(packed)),

@@ -1047,8 +1047,18 @@ impl EffectcraftApp {
             // background renders cannot be preempted by the priority queue.
             self.frames_parallelism().saturating_sub(1).min(2) as i64
         };
+        let ahead = ahead.min(self.frames_that_fit(&c, scale));
         let mut queued = self.frames.inflight();
         let series = self.frame_series(cid, scale);
+        // In-flight renders far ahead may finish after the near frames. Keep their completion
+        // from evicting the very frames playback needs next (#595).
+        self.frames.protect_frames(
+            series,
+            (0..ahead.max(2)).filter_map(|k| match plan {
+                Some(p) => p.frame_after(cur, k),
+                None => Some(wa + (cur.saturating_sub(wa).saturating_add(k)).rem_euclid(wb.saturating_sub(wa).saturating_add(1).max(1))),
+            }),
+        );
         if self.playback.caching
             && let Some(p) = plan
         {
@@ -1158,7 +1168,10 @@ impl EffectcraftApp {
                 self.stop();
                 return;
             }
-            let target = snap(audio::frame_of_sample(a.clock(), a.rate, fr).clamp(wa, wb));
+            // One clock observation for this decision: a loop wrap between target selection
+            // and scheduling would otherwise turn the next-frame delay into a whole loop.
+            let audible = a.clock();
+            let target = snap(audio::frame_of_sample(audible, a.rate, fr).clamp(wa, wb));
             if !video {
                 self.playback.audio_frame = Some(target);
             } else if self.frames.is_cached(&FrameKey { frame: target, ..series }) {
@@ -1183,7 +1196,7 @@ impl EffectcraftApp {
             // Wake when the audible sample reaches the next frame (not at the display's refresh
             // rate): a 24 fps preview rebuilds the UI 24 times a second, not 120.
             let next = fr.tick_of(target.saturating_add(step.max(1))).seconds();
-            ctx.request_repaint_after(until_next_frame(next - audio::sample_time(a.clock(), a.rate).seconds()));
+            ctx.request_repaint_after(until_next_frame(next - audio::sample_time(audible, a.rate).seconds()));
             return;
         }
         let elapsed = now - self.playback.start_wall;
@@ -1513,7 +1526,12 @@ impl EffectcraftApp {
                         self.ui.status = e;
                     }
                 }
-                effectcraft_engine::Event::PurgeCaches => self.frames.clear(),
+                effectcraft_engine::Event::PurgeCaches => {
+                    self.frames.clear();
+                    if let Some(gpu) = &self.gpu {
+                        gpu.context().clear_uploads();
+                    }
+                }
             }
         }
     }
@@ -1812,6 +1830,69 @@ mod playback_pacing_tests {
     use std::time::Duration;
 
     #[test]
+    fn audio_loop_boundary_schedules_the_next_frame_without_an_extra_pause() {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct WrappingClock(Arc<AtomicUsize>);
+        impl audio::AudioDevice for WrappingClock {
+            fn sample_rate(&self) -> u32 {
+                48_000
+            }
+            fn start(&mut self, _: Arc<audio::AudioFeed>) -> Result<(), String> {
+                Ok(())
+            }
+            fn stop(&mut self) {}
+            fn audible_frames(&self) -> Option<u64> {
+                // Cross a one-second loop between consecutive observations.
+                Some(if self.0.fetch_add(1, Ordering::Relaxed) == 0 { 47_999 } else { 48_000 })
+            }
+        }
+        let mut session = effectcraft_engine::Session::default();
+        let cid = ItemId(session.execute("comp.new", json!({"width": 8, "height": 8, "duration": 1, "frameRate": 30})).unwrap()["comp"].as_u64().unwrap());
+        let mut app = EffectcraftApp::new(session);
+        let observations = Arc::new(AtomicUsize::new(0));
+        app.audio = Some(
+            audio::AudioPlayback::start(
+                Box::new(WrappingClock(observations.clone())),
+                app.render_source(),
+                cid,
+                Tick::ZERO,
+                Tick::ZERO,
+                Tick::from_seconds_f64(1.0),
+                true,
+                48_000,
+            )
+            .unwrap(),
+        );
+        app.playback.playing = true;
+        app.playback.fps = 30.0;
+        app.playback.plan = Some(effectcraft_engine::preview::PreviewPlan {
+            start: 0,
+            end: 29,
+            first: 0,
+            step: 1,
+            fps: 30.0,
+            looping: true,
+            cache_first: false,
+            video: false,
+            audio: true,
+            origin: Tick::ZERO,
+        });
+        let ctx = egui::Context::default();
+        for frame in 0..3 {
+            ctx.run_ui(egui::RawInput { time: Some(frame as f64 / 60.0), ..Default::default() }, |_| {}).textures_delta.clear();
+        }
+        let mut output = ctx.run_ui(egui::RawInput { time: Some(1.0), ..Default::default() }, |ui| app.advance_playback(ui.ctx(), 1.0));
+        output.textures_delta.clear();
+        assert_eq!(app.playback.audio_frame, Some(29));
+        assert!(
+            output.viewport_output.get(&egui::ViewportId::ROOT).unwrap().repaint_delay < Duration::from_millis(10),
+            "the imminent loop must not acquire a 50ms pause"
+        );
+        assert_eq!(observations.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn a_playing_preview_wakes_when_its_next_frame_is_due_not_every_display_refresh() {
         // 24 fps: the next frame is due in 41.7 ms, so no UI frame before then (not 120 Hz).
         let d = until_next_frame(1.0 / 24.0);
@@ -1844,6 +1925,34 @@ mod fit_window_tests {
 #[cfg(test)]
 mod gpu_failure_tests {
     use super::*;
+
+    #[test]
+    fn purge_and_project_replacement_release_gpu_uploads() {
+        let Some(gpu) = effectcraft_gpu::Gpu::headless() else {
+            assert!(std::env::var_os("EFFECTCRAFT_REQUIRE_GPU").is_none(), "GPU required for upload purge test");
+            eprintln!("no GPU adapter: skipping upload purge test");
+            return;
+        };
+        let mut app = EffectcraftApp::new(Session::default());
+        app.gpu = Some(gpu.clone());
+        let ctx = egui::Context::default();
+        for replace in [false, true] {
+            app.session.execute("comp.new", json!({"width": 64, "height": 64, "duration": 1})).unwrap();
+            app.session.execute("layer.newText", json!({"text": "A", "size": 24, "position": [8, 32]})).unwrap();
+            app.handle_events(&ctx);
+            let mut renderer = effectcraft_engine::render::Renderer::new(&app.session.project, app.session.footage.as_ref(), Default::default());
+            renderer.cache = Some(&app.session.layer_cache);
+            assert!(gpu.render_display(&renderer, app.session.active_comp_id().unwrap(), Tick::ZERO).is_some());
+            assert!(gpu.context().upload_stats().0 > 0);
+            if replace {
+                app.session.replace_project(Default::default(), None);
+            } else {
+                app.session.execute("edit.purge", json!({"what": "memory"})).unwrap();
+            }
+            app.handle_events(&ctx);
+            assert_eq!(gpu.context().upload_stats(), (0, 0));
+        }
+    }
 
     #[test]
     fn host_failure_preserves_document_undo_and_cpu_pixels_and_detaches_late_readbacks() {

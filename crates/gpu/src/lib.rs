@@ -268,8 +268,8 @@ impl Gpu {
         }
     }
 
-    /// Run work in a native thread-local out-of-memory scope. A failed result is discarded
-    /// and cached allocations are released; callers can retry with a fresh CPU renderer.
+    /// Contain native allocation failures (out-of-memory, internal errors and unwinds).
+    /// A failed result is discarded and caches released; callers can retry on the CPU.
     /// Browser callers use the host/owned-device failure bridge and bounded readbacks instead
     /// of blocking their event loop on an error-scope future.
     pub fn within_memory<T>(&self, f: impl FnOnce() -> T) -> Result<T, String> {
@@ -277,14 +277,27 @@ impl Gpu {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let scope = self.ctx.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-            let out = f();
-            match pollster::block_on(scope.pop()) {
-                Some(e) => {
-                    self.ctx.clear_uploads();
-                    Err(e.to_string())
+            let internal = self.ctx.device.push_error_scope(wgpu::ErrorFilter::Internal);
+            // Some allocation failures (Adreno's ERROR_INITIALIZATION_FAILED) surface as
+            // internal errors or mapped-at-creation panics, not OutOfMemory (#591).
+            let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+            let error = pollster::block_on(internal.pop()).or(pollster::block_on(scope.pop()));
+            let result = match (error, out) {
+                (Some(error), _) => Err(error.to_string()),
+                (None, Ok(out)) => self.ctx.check_health().map(|()| out),
+                (None, Err(payload)) => {
+                    let reason = payload
+                        .downcast_ref::<String>()
+                        .map(String::as_str)
+                        .or_else(|| payload.downcast_ref::<&str>().copied())
+                        .unwrap_or("native backend panicked");
+                    Err(format!("GPU rendering: {reason}"))
                 }
-                None => self.ctx.check_health().map(|()| out),
+            };
+            if result.is_err() {
+                self.ctx.clear_uploads();
             }
+            result
         }
         #[cfg(target_arch = "wasm32")]
         {

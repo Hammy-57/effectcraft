@@ -1090,6 +1090,10 @@ impl Session {
         upgrade_effects(&mut p);
         self.project = Arc::new(p);
         self.release_unused_footage();
+        // The old document's rendered layers and host GPU caches must not survive reopening
+        // a project (#591). Notify before restoring tabs, including the early-return path.
+        self.layer_cache.clear();
+        self.events.push(Event::PurgeCaches);
         self.history = History::default();
         self.id_floor = 0;
         self.state = EditorState { snapping: true, view_layout: 1, ..Default::default() };

@@ -25,6 +25,8 @@ mod exr_layers;
 mod figma_import;
 #[path = "../plugins.rs"]
 mod plugins;
+#[path = "../relative_media.rs"]
+mod relative_media;
 #[path = "../relink.rs"]
 mod relink;
 #[path = "../repros.rs"]

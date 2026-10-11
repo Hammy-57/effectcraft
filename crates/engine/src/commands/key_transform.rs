@@ -146,8 +146,25 @@ fn spatial_tangents(s: &mut Session, p: &Value) -> Result<Value> {
     })
 }
 
+fn insert_spatial(s: &mut Session, p: &Value) -> Result<Value> {
+    let (cid, lid, uid) = prop_ref(s, p, "keys.insertSpatial")?;
+    let seconds = f_p(p, "time").filter(|t| t.is_finite()).ok_or_else(|| bad("keys.insertSpatial", "missing finite `time` (layer s)"))?;
+    let time = Tick::from_seconds_f64(seconds);
+    s.edit("Insert Motion Path Vertex", None, |proj, st| {
+        let layer = super::layer_mut(proj, cid, lid)?;
+        let pr = layer.props.find_mut(uid).ok_or_else(|| bad("keys.insertSpatial", "no property"))?;
+        if !pr.spatial || pr.has_expression() {
+            return Err(bad("keys.insertSpatial", "requires a spatial property without an enabled expression"));
+        }
+        pr.keys = effectcraft_keyframe::insert_spatial(&pr.keys, time).map_err(|reason| bad("keys.insertSpatial", reason))?;
+        st.selected_keys = vec![KeyRef { layer: lid, prop: uid, time }];
+        Ok(json!({"time":time.seconds()}))
+    })
+}
+
 pub fn specs() -> Vec<CommandSpec> {
     vec![
+        cmd!("keys.insertSpatial", "Insert Motion Path Vertex", [], None, "{layer?, path|prop, time (layer s)}", has_comp, insert_spatial),
         cmd!(
             "keys.transform",
             "Transform Keyframes",

@@ -769,3 +769,14 @@ fn within_memory_returns_the_work_when_there_is_room() {
     let img = g.within_memory(|| g.ctx.image(64, 32)).expect("room for a 64×32 texture");
     assert_eq!((img.width, img.height), (64, 32));
 }
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn within_memory_contains_native_allocation_unwind_and_drains_scopes() {
+    let Some(g) = gpu() else { return };
+    let outer = g.device().push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let error = g.within_memory(|| panic!("synthetic mapped-at-creation allocation failure")).unwrap_err();
+    assert!(error.contains("mapped-at-creation"));
+    assert!(pollster::block_on(outer.pop()).is_none(), "the caller's scope remains usable");
+    assert_eq!(g.within_memory(|| 42).unwrap(), 42);
+}
