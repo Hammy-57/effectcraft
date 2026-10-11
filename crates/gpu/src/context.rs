@@ -767,13 +767,17 @@ impl GpuContext {
                 immediate_size: 0,
             })
         })?;
+        // Metal compiles with fast math, which reassociates the staged `box_h`'s running sums
+        // differently from the serial kernel's (a few ulps apart), so Metal keeps the serial one.
+        let metal = info.backend == wgpu::Backend::Metal;
         let build = |e: &'static str, layout: &wgpu::PipelineLayout| {
+            let entry = if metal && e == "box_h" { "box_h_serial" } else { e };
             init_resource(&device, e, || {
                 device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: Some(e),
                     layout: Some(layout),
                     module: &module,
-                    entry_point: Some(e),
+                    entry_point: Some(entry),
                     compilation_options: Default::default(),
                     cache: None,
                 })
