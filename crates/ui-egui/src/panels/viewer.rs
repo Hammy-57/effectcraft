@@ -551,11 +551,15 @@ fn pooled_texture(
 ) -> Pooled {
     use crate::frames::{FrameImage, FrameKey};
     let Some(c) = app.session.project.comp(comp) else { return Pooled::Rendering };
-    let revision = app.session.freeze_preview_revision();
+    // The document revision, as the main viewer and playback use (`frame_series`): the frame
+    // queue drops jobs of older revisions, and the freeze preview's counter (which counts loaded
+    // font faces) is far larger, so every request here dropped their queued prefetch. The
+    // freeze epoch keys the content instead.
+    let revision = app.session.revision;
     let frame = c.frame_rate.frame_at(t);
     let key = FrameKey {
         revision,
-        content: app.frames.content_of(&app.session.freeze_preview_project(), revision, comp),
+        content: app.frames.content_of_preview(&app.session.freeze_preview_project(), revision, app.session.freeze_preview_revision(), comp),
         comp: comp.0,
         frame,
         scale: (opts.scale * 1000.0).round() as u32,
@@ -2621,6 +2625,44 @@ mod tests {
         // above (negative y) instead, and the front corners stay where they were.
         assert!(crossing.iter().all(|p| p[0].is_finite() && p[1].is_finite() && p[1] < 34.0), "{crossing:?}");
         assert!(project_clipped(&m, &box_corners([-50.0, -400.0, 50.0, -200.0])).is_empty(), "wholly behind");
+    }
+
+    /// An extra view's frame (split 3D views, the locked viewer) keyed its jobs by the freeze
+    /// preview's counter, a different counter from the main viewer's: each request dropped the
+    /// other's queued frames as "older revisions", so prefetch never built up.
+    #[test]
+    fn extra_view_frames_do_not_drop_the_main_viewers_prefetch() {
+        use crate::frames::{RemoteDone, RemoteFrames, RemoteJob};
+        use serde_json::json;
+        /// Starts nothing, so every request stays queued.
+        struct Idle;
+        impl RemoteFrames for Idle {
+            fn slots(&self) -> usize {
+                0
+            }
+            fn start(&self, _: RemoteJob, _: RemoteDone) {}
+        }
+        let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+        app.session.execute("comp.new", json!({"width": 16, "height": 16, "duration": 2})).unwrap();
+        app.session.execute("layer.newSolid", json!({"color": "#ff0000", "width": 16, "height": 16})).unwrap();
+        app.frames.set_remote(Some(std::sync::Arc::new(Idle)));
+        // Frames go through the frame workers (not the GPU display path) with an exposure.
+        app.session.state.viewer.exposure = 0.5;
+        assert!(!app.render_source().gpu_display);
+        // That counter also counts every font face loaded: far ahead of the document's.
+        app.session.freeze_runtime.generation = 500;
+        let cid = app.session.active_comp_id().unwrap();
+        let ctx = egui::Context::default();
+        let opts = app.frame_opts(cid, 1.0);
+        let extra = |app: &EffectcraftApp, frame: i64| {
+            let t = app.session.project.comp(cid).unwrap().frame_rate.tick_of(frame);
+            pooled_texture(app, &ctx, egui::Id::new("extra"), "extra", cid, t, opts, 7, None);
+        };
+        extra(&app, 0);
+        app.request_frame(cid, 5, 1.0);
+        app.request_frame(cid, 6, 1.0);
+        extra(&app, 1);
+        assert_eq!(app.frames.inflight(), 4, "every frame asked for stays queued");
     }
 
     #[test]

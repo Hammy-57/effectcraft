@@ -2837,7 +2837,9 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         let hold = egui::Id::new(id).with("hold");
         let now = ui.input(|i| i.time);
         let held: Option<(f64, f64)> = ui.data(|d| d.get_temp(hold));
-        if resp.is_pointer_button_down_on() {
+        // egui stops treating a long press as a potential click (~0.8 s), so a hold that has
+        // started continues for as long as the primary button stays down.
+        if resp.is_pointer_button_down_on() || (held.is_some() && ui.input(|i| i.pointer.primary_down())) {
             let factor = match held {
                 None => Some(k),
                 Some((start, last)) if now - start >= ZOOM_HOLD_DELAY => Some(k.powf(((now - last) * ZOOM_HOLD_RATE).clamp(0.0, 1.0))),

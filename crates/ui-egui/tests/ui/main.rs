@@ -69,6 +69,8 @@ mod ui_fx_editors;
 mod ui_gpu;
 #[path = "../ui_graph_fit.rs"]
 mod ui_graph_fit;
+#[path = "../ui_graph_handles.rs"]
+mod ui_graph_handles;
 #[path = "../ui_inline_edit.rs"]
 mod ui_inline_edit;
 #[path = "../ui_keyframes.rs"]

@@ -107,6 +107,38 @@ impl FrameKey {
     }
 }
 
+/// Where a playing preview is and what it plays next (see [`Frames::set_playhead`]): prefetch
+/// renders the frames it reaches first before later ones, and eviction keeps them over frames it
+/// reaches later or not at all (#595).
+#[derive(Clone, Copy, Debug)]
+pub struct Playhead {
+    /// The frame series that plays ([`FrameKey::same_series`]; its `frame` is ignored).
+    pub series: FrameKey,
+    /// The frame on screen.
+    pub cur: i64,
+    /// The preview's range, skip step and looping (as in its `PreviewPlan`).
+    pub start: i64,
+    pub end: i64,
+    pub step: i64,
+    pub looping: bool,
+}
+
+impl Playhead {
+    /// How many frames the preview shows before it reaches `k` (0: on screen); `None` for
+    /// frames it doesn't reach (other series, outside the range, behind it without looping).
+    pub fn ahead(&self, k: &FrameKey) -> Option<i64> {
+        if !k.same_series(&self.series) || k.frame < self.start || k.frame > self.end {
+            return None;
+        }
+        let step = self.step.max(1);
+        if k.frame >= self.cur {
+            return Some(k.frame.saturating_sub(self.cur) / step);
+        }
+        // Looping: through the end of the range and around from its start.
+        self.looping.then(|| (self.end.saturating_sub(self.cur) / step).saturating_add(1).saturating_add(k.frame.saturating_sub(self.start) / step))
+    }
+}
+
 impl PartialEq for FrameKey {
     fn eq(&self, o: &FrameKey) -> bool {
         self.id() == o.id()
@@ -125,6 +157,8 @@ struct Cache {
     map: HashMap<FrameKey, FrameImage>,
     order: VecDeque<FrameKey>,
     protected: HashMap<FrameKey, usize>,
+    /// The playing preview, if any: eviction spares the frames it shows next.
+    playhead: Option<Playhead>,
     bytes: usize,
     /// Bytes of GPU frames (also counted in `bytes`).
     gpu_bytes: usize,
@@ -193,8 +227,25 @@ impl Cache {
         }
         self.order.retain(|k| !gone.contains(&k.content));
     }
+    /// The frame to evict next. While a preview plays: the least recently shown of the frames
+    /// it doesn't reach, then the one it reaches last. Least-recently-used alone evicted the
+    /// frames cached ahead (rendered or shown a while ago) to keep the ones just shown, so a
+    /// looping preview longer than the cache re-rendered every frame on every loop and played
+    /// into gaps that prefetch kept refilling (#595). Otherwise the least recently shown, the
+    /// protected window ([`Frames::protect_frames`]) last.
     fn eviction_index(&self, gpu_only: bool) -> Option<usize> {
         let eligible = |k: &FrameKey| !gpu_only || self.map.get(k).is_some_and(FrameImage::is_gpu);
+        if let Some(p) = &self.playhead {
+            let mut farthest: Option<(i64, usize)> = None;
+            for (i, k) in self.order.iter().enumerate().filter(|(_, k)| eligible(k)) {
+                match p.ahead(k) {
+                    None => return Some(i),
+                    Some(d) if farthest.is_none_or(|(f, _)| d > f) => farthest = Some((d, i)),
+                    Some(_) => {}
+                }
+            }
+            return farthest.map(|(_, i)| i);
+        }
         self.order.iter().position(|k| eligible(k) && !self.protected.contains_key(k)).or_else(|| {
             // If the window itself does not fit, sacrifice its furthest frame, not the playhead.
             self.order.iter().enumerate().filter(|(_, k)| eligible(k)).max_by_key(|(_, k)| self.protected.get(*k).copied().unwrap_or(0)).map(|(i, _)| i)
@@ -486,7 +537,7 @@ impl Default for Frames {
         #[cfg(not(target_arch = "wasm32"))]
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 16);
         Frames {
-            cache: Arc::new(Mutex::new(Cache { map: HashMap::new(), order: VecDeque::new(), protected: HashMap::new(), bytes: 0, gpu_bytes: 0, budget: 3 << 30, gpu_budget: GPU_BUDGET, generation: 0 })),
+            cache: Arc::new(Mutex::new(Cache { map: HashMap::new(), order: VecDeque::new(), protected: HashMap::new(), playhead: None, bytes: 0, gpu_bytes: 0, budget: 3 << 30, gpu_budget: GPU_BUDGET, generation: 0 })),
             inflight: Arc::new(Mutex::new(HashSet::new())),
             failed: Failed::default(),
             queue: Arc::new(Mutex::new(Queue::default())),
@@ -878,26 +929,32 @@ impl Frames {
             return vec![];
         }
         let oh = opts_hash(opts);
-        // Remembered until the frames in RAM or on disk, the project or the series change (the
-        // remote disk cache gets its frames with the RAM cache's).
+        // The frames on disk, remembered until the disk cache, the project or the series change,
+        // then without the frames in RAM. Scanning every frame of the comp again whenever a frame
+        // came or went in RAM (every finished frame of a RAM preview) cost the UI thread a few
+        // milliseconds per repaint on long comps. The remote disk cache has no generation of its
+        // own: it gets its frames with the RAM cache's.
         let series = FrameKey { frame: 0, ..*base };
-        let ram_generation = self.cache.lock().map(|c| c.generation).unwrap_or(0);
-        let k = [base.revision, frames as u64, oh, ram_generation, src.disk.as_ref().map_or(0, |dc| dc.generation())];
+        let generation = match &src.disk {
+            Some(dc) => dc.generation(),
+            None => self.cache.lock().map(|c| c.generation).unwrap_or(0),
+        };
+        let k = [base.revision, frames as u64, oh, generation, u64::from(src.disk.is_some())];
+        let ram = self.cached_frames(base);
+        let in_ram = |f: &i64| ram.binary_search(f).is_ok();
         if let Ok(bar) = self.bar.lock()
             && let Some((_, _, v)) = bar.disk.iter().find(|(s, g, _)| *s == series && *g == k)
         {
-            return v.clone();
+            return v.iter().copied().filter(|f| !in_ram(f)).collect();
         }
-        let ram: HashSet<i64> = self.cached_frames(base).into_iter().collect();
         let v: Vec<i64> = (0..frames.clamp(0, 100_000))
-            .filter(|f| !ram.contains(f))
             .filter(|f| contains(frame_disk_key(&self.content_keys, &src.project, &FrameKey { frame: *f, ..*base }, oh)))
             .collect();
         if let Ok(mut bar) = self.bar.lock() {
             bar.disk.retain(|(s, ..)| *s != series);
             remember(&mut bar.disk, series, k, &v);
         }
-        v
+        v.into_iter().filter(|f| !in_ram(f)).collect()
     }
 
     /// Change the RAM preview cache budget (Settings ▸ Memory & CPU), evicting the oldest
@@ -916,6 +973,26 @@ impl Frames {
             cache.protected.clear();
             cache.protected.extend(frames.into_iter().enumerate().map(|(rank, frame)| (FrameKey { frame, ..base }, rank)));
         }
+    }
+
+    /// The playing preview's position (`None` when no preview plays): eviction spares the
+    /// frames it shows next, prefetch renders the frames it reaches first, and queued prefetch
+    /// frames of its series it no longer reaches are dropped (#595).
+    pub fn set_playhead(&self, playhead: Option<Playhead>) {
+        if let Ok(mut c) = self.cache.lock() {
+            c.playhead = playhead;
+        }
+        let Ok(mut q) = self.queue.lock() else { return };
+        q.playhead = playhead;
+        let Some(p) = playhead else { return };
+        let Ok(mut inf) = self.inflight.lock() else { return };
+        q.jobs.retain(|j| {
+            let gone = !j.urgent && j.key.same_series(&p.series) && p.ahead(&j.key).is_none();
+            if gone {
+                inf.remove(&j.key);
+            }
+            !gone
+        });
     }
 
     pub fn budget(&self) -> usize {
@@ -1112,7 +1189,7 @@ impl Frames {
             }
             let job = {
                 let Ok(mut q) = self.queue.lock() else { break };
-                let Some(i) = Queue::best(&q.jobs) else { break };
+                let Some(i) = q.best() else { break };
                 // Remote renderers deliberately use originals; a local freeze must not
                 // strand their queue waiting for files unavailable to that worker.
                 let job = q.jobs.swap_remove(i);
@@ -1274,7 +1351,7 @@ impl Worker {
         let Worker { queue, content_keys, .. } = self;
         let job = {
             let Ok(mut q) = queue.lock() else { return false };
-            let Some(i) = Queue::best(&q.jobs) else { return false };
+            let Some(i) = q.best() else { return false };
             let j = &q.jobs[i];
             // Keep one viewer slot beyond the prefetch budget, but never nest another viewer
             // render inside it. Rayon can run queued jobs inside a parallel render: unlimited
@@ -1559,6 +1636,8 @@ struct Queue {
     /// Spawns that returned because their job had to wait for memory: each finishing frame
     /// starts one again.
     parked: usize,
+    /// The playing preview, if any: its prefetch renders nearest first.
+    playhead: Option<Playhead>,
 }
 
 impl Queue {
@@ -1567,10 +1646,20 @@ impl Queue {
         if job.urgent { self.urgent_running == 0 && self.running.len() <= limit } else { self.running.len() < limit }
     }
 
-    /// The job that matters most: urgent first (newest), then prefetch in request order, then
-    /// disk-only frames in request order.
-    fn best(jobs: &[Job]) -> Option<usize> {
-        jobs.iter().enumerate().max_by_key(|(_, j)| (j.urgent, !j.disk_only, if j.urgent { j.seq as i64 } else { -(j.seq as i64) })).map(|(i, _)| i)
+    /// The job that matters most: urgent first (newest), then prefetch: while a preview plays,
+    /// the frame it reaches first, then the rest in request order; disk-only frames last. In
+    /// request order alone, a frame asked for again after an eviction (right ahead of the
+    /// playhead) waited behind every frame further ahead (#595).
+    fn best(&self) -> Option<usize> {
+        let p = self.playhead.as_ref();
+        self.jobs
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, j)| {
+                let near = if j.urgent || j.disk_only { None } else { p.and_then(|p| p.ahead(&j.key)) };
+                (j.urgent, !j.disk_only, near.is_some(), near.map_or(0, |d| d.saturating_neg()), if j.urgent { j.seq as i64 } else { -(j.seq as i64) })
+            })
+            .map(|(i, _)| i)
     }
 }
 
@@ -2017,6 +2106,130 @@ mod tests {
         assert!(f.is_cached(&key(1, 200, 0)), "protection follows the playhead");
     }
 
+    fn playhead(cur: i64, looping: bool) -> Playhead {
+        Playhead { series: key(1, 0, 0), cur, start: 0, end: 99, step: 1, looping }
+    }
+
+    /// #595: a playing preview's cache is full. The frames just ahead of the playhead were
+    /// rendered before the ones just shown, so least-recently-used eviction took them first and
+    /// the preview played into a gap. Frames the preview no longer reaches go first, then the
+    /// ones it reaches last.
+    #[test]
+    fn a_full_cache_keeps_the_frames_just_ahead_of_the_playhead() {
+        let f = Frames::default();
+        f.set_budget(4 * 16);
+        // Prefetch rendered 11..=13, then 10 was shown (the most recently used).
+        for i in [11, 12, 13, 10] {
+            insert(&f, key(1, i, 0));
+        }
+        let cached = |f: &Frames| f.cached_frames(&key(1, 0, 0));
+        // Playback protects only its nearest frames (the in-flight window).
+        f.protect_frames(key(1, 0, 0), [10, 11]);
+        f.set_playhead(Some(playhead(10, false)));
+        // The next frame rendered is the one the preview reaches last: the frames just ahead stay.
+        insert(&f, key(1, 14, 0));
+        assert_eq!(cached(&f), [10, 11, 12, 13]);
+        // Without looping, a frame behind the playhead goes before any frame ahead of it.
+        f.set_playhead(Some(playhead(12, false)));
+        insert(&f, key(1, 14, 0));
+        assert_eq!(cached(&f), [10, 12, 13, 14]);
+        // Looping, the frame just behind is the one reached last.
+        f.set_playhead(Some(playhead(13, true)));
+        insert(&f, key(1, 0, 0));
+        assert_eq!(cached(&f), [0, 10, 13, 14]);
+        // Other series go before any frame the preview reaches.
+        insert(&f, key(2, 5, 0));
+        insert(&f, key(1, 15, 0));
+        assert_eq!(cached(&f), [0, 13, 14, 15]);
+        assert!(!f.is_cached(&key(2, 5, 0)));
+        // Stopped: least recently shown first again (and the protected window still counts).
+        f.set_playhead(None);
+        f.protect_frames(key(1, 0, 0), [13]);
+        insert(&f, key(1, 50, 0));
+        assert_eq!(cached(&f), [0, 13, 15, 50]);
+    }
+
+    /// #595: a looping preview longer than the RAM preview. Least-recently-used eviction threw
+    /// out the frames cached ahead (shown a whole loop ago) to keep the ones just shown, so every
+    /// frame rendered again on every loop and the workers never went idle. Keeping the frames
+    /// reached first renders only what doesn't fit.
+    #[test]
+    fn a_looping_preview_longer_than_the_cache_renders_only_what_does_not_fit() {
+        let (n, fit, window) = (20_i64, 8_usize, 3_i64);
+        let f = Frames::default();
+        f.set_budget(fit * 16);
+        let mut renders = 0;
+        let mut stalls = 0;
+        for lap in 0..4 {
+            if lap == 1 {
+                (renders, stalls) = (0, 0);
+            }
+            for cur in 0..n {
+                f.protect_frames(key(1, 0, 0), (0..2).map(|k| (cur + k) % n));
+                f.set_playhead(Some(Playhead { series: key(1, 0, 0), cur, start: 0, end: n - 1, step: 1, looping: true }));
+                if !f.is_cached(&key(1, cur, 0)) {
+                    stalls += 1;
+                    renders += 1;
+                    insert(&f, key(1, cur, 0));
+                }
+                assert!(f.get(&key(1, cur, 0)).is_some());
+                for k in 1..=window {
+                    let next = key(1, (cur + k) % n, 0);
+                    if !f.is_cached(&next) {
+                        renders += 1;
+                        insert(&f, next);
+                    }
+                }
+            }
+        }
+        // Three laps after the first: the frames that don't fit next to the prefetch window
+        // each (n - fit + window + 1), not all n (least-recently-used: 60).
+        assert!(renders <= 3 * (n - fit as i64 + window + 1), "{renders} renders in 3 laps of {n} frames with {fit} cached");
+        assert_eq!(stalls, 0, "the frames just ahead are always there");
+    }
+
+    /// #595: prefetch renders the frames the preview reaches first, whatever order they were
+    /// asked for in (a frame evicted and asked for again waited behind every frame further
+    /// ahead); queued frames the preview no longer reaches are dropped and not left in flight;
+    /// disk-only frames still come last.
+    #[test]
+    fn prefetch_renders_the_frames_the_playhead_reaches_first() {
+        struct Idle;
+        impl RemoteFrames for Idle {
+            fn slots(&self) -> usize {
+                0
+            }
+            fn start(&self, _: RemoteJob, _: RemoteDone) {}
+        }
+        let mut f = Frames::default();
+        f.set_remote(Some(Arc::new(Idle)));
+        let src = RenderSource {
+            freeze_feedback: Default::default(),
+            project: Arc::default(),
+            footage: Arc::new(effectcraft_engine::render::NoFootage),
+            expr: None,
+            layer_cache: Arc::default(),
+            gpu: None,
+            gpu_display: false,
+            disk: None,
+        };
+        for frame in [40, 30, 20, 5, 12, 11] {
+            f.request(&src, key(1, frame, 0), ItemId(1), Tick::ZERO, RenderOpts::default());
+        }
+        f.request(&src, FrameKey { comp: 2, ..key(1, 1, 0) }, ItemId(2), Tick::ZERO, RenderOpts::default());
+        f.queue.lock().unwrap().jobs.iter_mut().filter(|j| j.key.frame == 40).for_each(|j| j.disk_only = true);
+        f.set_playhead(Some(playhead(10, false)));
+        let mut order = vec![];
+        loop {
+            let mut q = f.queue.lock().unwrap();
+            let Some(i) = q.best() else { break };
+            let j = q.jobs.swap_remove(i);
+            order.push((j.key.comp, j.key.frame));
+        }
+        assert_eq!(order, [(1, 11), (1, 12), (1, 20), (1, 30), (2, 1), (1, 40)]);
+        assert_eq!(f.inflight(), 6, "frame 5, behind the playhead, is no longer in flight");
+    }
+
     /// The cache bar's frame lists are remembered, and follow frames coming and going.
     #[test]
     fn cache_bar_follows_the_cache() {
@@ -2051,6 +2264,14 @@ mod tests {
         assert_eq!(f.disk_frames(&src, &key(1, 0, 0), 5, &opts), vec![2]);
         insert(&f, key(1, 2, 0));
         assert!(f.disk_frames(&src, &key(1, 0, 0), 5, &opts).is_empty());
+        // Frames coming and going in RAM (each finished frame of a RAM preview) don't scan the
+        // disk cache again: the remembered disk frames are filtered. Mark frame 4 as remembered
+        // on disk to tell a rescan from the memo.
+        f.bar.lock().unwrap().disk.iter_mut().for_each(|(_, _, v)| v.push(4));
+        f.cache.lock().unwrap().remove(&key(1, 2, 0));
+        assert_eq!(f.disk_frames(&src, &key(1, 0, 0), 5, &opts), vec![2, 4], "remembered, not scanned again");
+        dc.put_frame_now(frame_disk_key(&f.content_keys, &src.project, &key(1, 3, 0), opts_hash(&opts)), 1, 1, &[0, 0, 0, 255]);
+        assert_eq!(f.disk_frames(&src, &key(1, 0, 0), 5, &opts), vec![2, 3], "a disk change scans again");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
