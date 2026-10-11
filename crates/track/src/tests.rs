@@ -209,9 +209,8 @@ fn backward_and_whole_pixel() {
     }
 }
 
-/// 1080p, one point: tracking cost per frame (frames are generated outside the timing).
-#[test]
-fn performance_1080p_single_point() {
+/// Shared 1080p accuracy fixture; return tracking seconds per frame, excluding frame generation.
+fn track_1080p_single_point() -> f64 {
     let w = 1920;
     let h = 1080;
     // A cheap textured frame (the full synthetic renderer is slow at 1080p in debug builds).
@@ -236,8 +235,21 @@ fn performance_1080p_single_point() {
         last = tr.step(&Frame::new(f))[0];
     }
     let per = t0.elapsed().as_secs_f64() / 5.0;
-    eprintln!("1080p single-point track: {:.2} ms/frame ({:.0} fps)", per * 1e3, 1.0 / per);
     assert!(dist(last.center, [c0[0] + 2.3 * 5.0, c0[1] + 1.1 * 5.0]) < 0.25, "{:?}", last.center);
+    per
+}
+
+#[test]
+fn accuracy_1080p_single_point() {
+    track_1080p_single_point();
+}
+
+/// Wall time is meaningful only without competing tests or builds (see docs/testing.md).
+#[test]
+#[ignore = "isolated performance budget: run with --profile ci --ignored --test-threads=1"]
+fn performance_1080p_single_point() {
+    let per = track_1080p_single_point();
+    eprintln!("1080p single-point track: {:.2} ms/frame ({:.0} fps)", per * 1e3, 1.0 / per);
     assert!(per < 0.1, "{per} s per frame");
 }
 
