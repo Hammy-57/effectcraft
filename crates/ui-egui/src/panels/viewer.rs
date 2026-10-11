@@ -867,7 +867,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     // The frame on screen. While a drag or a property scrub is rendering, the exact key changes
     // with every edit and its render is still in flight; the newest completed revision of the
     // same frame keeps the picture following the pointer instead of freezing until it stops.
-    if let Some((k, img)) = app.frames.get_for_viewer(&key, app.viewer_shown.as_ref().map(|(_, s)| s)) {
+    if let Some((k, img)) = app.frame_for_viewer(&key, zoom, ppp) {
         let stale = app.viewer_shown.as_ref().is_none_or(|(_, s)| *s != k);
         // A CPU frame goes up again when the magnification calls for another factor.
         let minify = minify_factor(app.session.prefs.viewer_zoom_smooth(), scale, (zoom * ppp) as f64);
@@ -1286,7 +1286,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             Tool::PanCamera => egui::CursorIcon::Move,
             Tool::Dolly => egui::CursorIcon::ResizeVertical,
             t if t.is_pen() => {
-                let over_path = ov::segment_at(&paths, &map, hp, 5.0).is_some() || motion_segment.is_some() || ov::motion_frame_at(&motion_frames, &key_hits, hp).is_some();
+                let over_path =
+                    ov::segment_at(&paths, &map, hp, 5.0).is_some() || motion_segment.is_some() || ov::motion_frame_at(&motion_frames, &key_hits, hp).is_some();
                 pen_cursor(&ctx, hp, pen_cursor_icon(t, over_path));
                 egui::CursorIcon::None
             }
