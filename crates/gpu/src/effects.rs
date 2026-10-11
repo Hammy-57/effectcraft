@@ -232,6 +232,7 @@ fn apply(e: &mut Enc, id: &str, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
         _ if crate::fx_time::IDS.contains(&id) => crate::fx_time::apply(e, id, ctx, b),
         _ if crate::fx_pixel2::IDS.contains(&id) => crate::fx_pixel2::apply(e, id, ctx, b),
         _ if crate::fx_gen2::IDS.contains(&id) => crate::fx_gen2::apply(e, id, ctx, b),
+        _ if crate::fx_deepglow::IDS.contains(&id) => crate::fx_deepglow::apply(e, id, ctx, b),
         _ => pointwise(e, id, ctx, b),
     }
 }
