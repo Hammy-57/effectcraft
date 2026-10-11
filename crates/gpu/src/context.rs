@@ -128,9 +128,11 @@ pub(crate) struct Pool {
     misses: u64,
 }
 
-/// Shared-memory adapters retain fewer duplicate pixels: CPU caches already hold the sources.
+/// Processed pixels can be GPU-only. CPU mirrors, resident pixels and pending
+/// outputs already share the layer owner's physical budget; retain them up to
+/// that budget on either adapter type, with the device's existing hard ceiling.
 fn cache_budgets(layer_cache: usize, integrated: bool) -> (usize, usize, u64) {
-    let upload_cap = if integrated { 256 << 20 } else { UPLOAD_BUDGET };
+    let upload_cap = UPLOAD_BUDGET;
     let pool_cap = if integrated { 128 << 20 } else { POOL_BUDGET };
     // Keep room for one 1080p RGBA-f32 buffer even on shared memory.
     let auxiliary_cap = if integrated { 32 << 20 } else { AUX_CACHE_BUDGET };
@@ -1306,10 +1308,11 @@ impl GpuContext {
 
     /// Size the GPU-side caches after the layer cache's memory budget (Memory & CPU settings,
     /// after RAM Reserved for Other Applications): uploaded layer textures mirror cached layer
-    /// buffers, so they get at most the same budget (capped at [`UPLOAD_BUDGET`]), and free
-    /// working textures half of it (capped at [`POOL_BUDGET`]). On unified memory (Apple
-    /// silicon, Adreno) CPU/GPU caches share RAM, so retained uploads and working textures
-    /// are further capped at 256/128 MiB. Auxiliary staging and zero-image caches each get
+    /// buffers while Processed entries remain GPU-only until CPU demand. Both allocations
+    /// of a CPU mirror count against the owner's shared physical budget, as do pending
+    /// GPU outputs. Retention follows that budget (capped at [`UPLOAD_BUDGET`]); free working
+    /// textures get half (capped at [`POOL_BUDGET`], or 128 MiB on unified memory).
+    /// Auxiliary staging and zero-image caches each get
     /// 1/16 of the layer budget, capped at 32 MiB integrated or 64 MiB discrete.
     pub fn set_cache_budget(&self, layer_cache: usize) {
         let (upload, pool, auxiliary) = cache_budgets(layer_cache, self.integrated);
@@ -2305,11 +2308,44 @@ mod upload_budget_tests {
         assert_eq!(g.kept_count(), 0);
     }
 
+    /// Accounting-only payload: no large texture or CPU pixel allocation is made.
     #[test]
-    fn shared_memory_cache_budgets_follow_preferences_and_have_lower_caps() {
+    fn integrated_processed_retention_above_old_ceiling_stays_shared_budget_bounded() {
+        use effectcraft_render::allocation::{GpuAllocation, GpuGeneration};
+        use effectcraft_render::retained::AdmissionError;
+        let budget = 1 << 30;
+        let (cap, _, _) = cache_budgets(budget, true);
+        let generation = GpuGeneration::default();
+        generation.set_cap(cap);
+        let allocation = GpuAllocation::rgba_f32(4097, 4096, generation.clone()).unwrap();
+        let bytes = allocation.bytes();
+        assert!(bytes > 256 << 20);
+        let cache = effectcraft_render::LayerCache::new(budget);
+        let owner = cache.gpu_owner().unwrap();
+        let pending = owner.prepare(Arc::new(()), allocation.clone(), GpuStage::Processed, cap).unwrap();
+        assert_eq!(cache.retained_stats().pending_bytes, bytes);
+        assert_eq!(cache.retained_stats().live_bytes, 0);
+        let slot = pending.publish().unwrap();
+        assert!(owner.get(&slot, &generation, GpuStage::Processed).is_some());
+        assert_eq!(cache.retained_stats().live_bytes, bytes);
+        assert_eq!(cache.retained_stats().pending_bytes, 0);
+        owner.set_device_cap(&generation, 256 << 20);
+        assert!(owner.get(&slot, &generation, GpuStage::Processed).is_none());
+        drop(allocation);
+        assert_eq!(cache.retained_stats().live_bytes, 0);
+        let small = effectcraft_render::LayerCache::new(256 << 20);
+        let generation = GpuGeneration::default();
+        let allocation = GpuAllocation::rgba_f32(4097, 4096, generation).unwrap();
+        assert!(matches!(small.gpu_owner().unwrap().prepare(Arc::new(()), allocation, GpuStage::Processed, cap), Err(AdmissionError::Capacity)));
+        assert_eq!(small.retained_stats().pending_bytes, 0);
+    }
+
+    #[test]
+    fn shared_memory_retention_uses_shared_budget_and_scratch_keeps_lower_caps() {
         assert_eq!(cache_budgets(0, true), (0, 0, 0));
         assert_eq!(cache_budgets(64 << 20, true), (64 << 20, 32 << 20, 4 << 20));
-        assert_eq!(cache_budgets(usize::MAX, true), (256 << 20, 128 << 20, 32 << 20));
+        assert_eq!(cache_budgets(1 << 30, true), (1 << 30, 128 << 20, 32 << 20));
+        assert_eq!(cache_budgets(usize::MAX, true), (UPLOAD_BUDGET, 128 << 20, 32 << 20));
         assert_eq!(cache_budgets(usize::MAX, false), (UPLOAD_BUDGET, POOL_BUDGET, AUX_CACHE_BUDGET));
     }
 

@@ -101,6 +101,12 @@ impl<'a> Renderer<'a> {
     pub fn resident_content_key(&self, ctx: &EvalCtx, layer: &Layer) -> Option<u64> {
         self.content_cache_key(ctx, layer)
     }
+    /// Time-varying source pixels are transient; transform-only animation still
+    /// reuses layer-space pixels. Uses the CPU cache's dependency classification.
+    pub fn resident_content_animated(&self, ctx: &EvalCtx, layer: &Layer) -> bool {
+        cache::content_animated(ctx.comp, layer)
+    }
+
     /// Source and masks rebased into effect space, exactly as the CPU content producer.
     pub fn resident_source(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Buf> {
         let mut buf = self.masked_source(ctx, layer)?;

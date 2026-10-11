@@ -272,7 +272,21 @@ pub(super) fn relieve(inner: &Arc<Mutex<Inner>>, token: Option<&ResidentToken>, 
             if bytes_fit && device_fit && count_fit {
                 return;
             }
-            super::evict_one(&mut g)
+            if bytes_fit
+                && count_fit
+                && let Some((generation, _)) = device
+            {
+                // A device ceiling cannot be relieved by discarding CPU pixels or
+                // allocations from another context. Preserve those useful entries
+                // when a pinned allocation prevents admission on this device.
+                let key = g.gpu.iter().filter(|(_, e)| e.slot.allocation.generation().same(generation)).min_by_key(|(_, e)| e.last_use).map(|(key, _)| *key);
+                match key {
+                    Some(key) => (true, g.gpu.remove(&key).map(|e| e.slot)),
+                    None => (false, None),
+                }
+            } else {
+                super::evict_one(&mut g)
+            }
         };
         drop(retired);
         if !progress {
@@ -331,6 +345,23 @@ mod tests {
         let g = GpuGeneration::default();
         c.gpu_owner().unwrap().prepare(Arc::new(()), allocation(&g), stage, 1024).unwrap().with_content(99, Some(readback)).publish().unwrap();
     }
+    #[test]
+    fn device_only_pressure_preserves_cpu_and_other_generation_entries() {
+        let c = LayerCache::new(1024);
+        let cpu = Arc::new(Buf { img: effectcraft_raster::Image::new(1, 1), offset: [0.0; 2], scale: 1.0 });
+        c.insert(7, cpu);
+        let owner = c.gpu_owner().unwrap();
+        let other = GpuGeneration::default();
+        let other_slot = owner.prepare(Arc::new(()), allocation(&other), GpuStage::Blend, 1024).unwrap().publish().unwrap();
+        let generation = GpuGeneration::default();
+        let pinned = allocation(&generation);
+        owner.prepare(Arc::new(()), pinned.clone(), GpuStage::Blend, 16).unwrap().publish().unwrap();
+        assert!(matches!(owner.prepare(Arc::new(()), allocation(&generation), GpuStage::Blend, 16), Err(AdmissionError::Capacity)));
+        assert!(c.get(7).is_some(), "evicting CPU pixels cannot relieve a device-only ceiling");
+        assert!(owner.get(&other_slot, &other, GpuStage::Blend).is_some(), "another device's pixels cannot relieve this device ceiling");
+        drop(pinned);
+    }
+
     #[test]
     fn lazy_processed_is_demand_driven_reentrant_and_reuses_cpu() {
         let c = Arc::new(LayerCache::new(1024));

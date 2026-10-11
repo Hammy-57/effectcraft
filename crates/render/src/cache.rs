@@ -466,6 +466,15 @@ impl LayerCache {
         self.insert_with(key, buf, false);
     }
 
+    /// Admit animated GPU content only after this exact key was produced before.
+    /// Successful productions share the bounded CPU doorkeeper. Occurrences, not
+    /// frame numbers, also cover direct native display calls and same-frame reuse.
+    pub fn admit_repeated_gpu_content(&self, key: u64) -> bool {
+        let Ok(mut g) = self.inner.lock() else { return false };
+        let frame = g.frames;
+        g.seen.saw(key, frame).is_some()
+    }
+
     /// [`Self::insert`] for a buffer whose key changes every frame (an animated precomp): kept
     /// only when it is rendered again after the frame that first rendered it (see the module
     /// docs).

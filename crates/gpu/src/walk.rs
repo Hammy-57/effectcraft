@@ -339,6 +339,11 @@ fn draw_ordinary_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Laye
     if result == Some(Some(()))
         && let Some(flight) = flight
     {
+        // Unique animated versions are transient. Held values and repeated visits
+        // can reuse their exact key after the bounded doorkeeper sees it twice.
+        if r.resident_content_animated(ctx, layer) && !cache.admit_repeated_gpu_content(key) {
+            return result;
+        }
         e.keep_resident(key, image, flight, intent);
     }
     result
