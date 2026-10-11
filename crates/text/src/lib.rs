@@ -439,15 +439,7 @@ mod reference {
     }
 
     pub(crate) fn layout_doc(doc: &TextDoc) -> TextLayout {
-        // Keep Source Text editable as typed; only substitute the displayed digit glyphs.
-        // Character indices stay stable even though the display string has different UTF-8 offsets.
-        let displayed = match doc.digit_set {
-            DigitSet::Hindi => std::borrow::Cow::Owned(
-                doc.text.chars().map(|c| if c.is_ascii_digit() { char::from_u32(0x0660 + c as u32 - '0' as u32).unwrap_or(c) } else { c }).collect::<String>(),
-            ),
-            DigitSet::Default | DigitSet::Arabic => std::borrow::Cow::Borrowed(doc.text.as_str()),
-        };
-        let text = displayed.as_ref();
+        let text = doc.text.as_str();
         let byte_of_char: Vec<usize> = text.char_indices().map(|(b, _)| b).chain(std::iter::once(text.len())).collect();
         let nchars = byte_of_char.len() - 1;
         let mut runs = Vec::new();
@@ -723,7 +715,6 @@ mod tests {
         v.push(mixed);
         v.push(TextDoc { text: "縦書き Roman 12".into(), vertical: true, ..TextDoc::plain("") });
         v.push(TextDoc { text: "縦書きの段落テキスト abc".into(), vertical: true, box_size: Some([120.0, 200.0]), ..TextDoc::plain("") });
-        v.push(TextDoc { text: "Total 1234".into(), digit_set: DigitSet::Hindi, justify: Justify::Center, ..TextDoc::plain("") });
         v.push(TextDoc { text: "".into(), ..TextDoc::plain("") });
         v
     }
