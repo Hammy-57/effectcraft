@@ -219,11 +219,9 @@ pub struct RenderSource {
     pub layer_cache: Arc<LayerCache>,
     /// GPU compositor (Mercury GPU Acceleration), if available.
     pub gpu: Option<Gpu>,
-    /// Keep GPU frames on the GPU for the viewer (native egui-wgpu textures). Off on the
-    /// desktop: Show Channel / exposure / region-of-interest drawing read the CPU frame texture,
-    /// so GPU frames are read back (the compositing still runs on the GPU). On in the browser
-    /// while the viewer draws plainly, because there frames can't be read back synchronously
-    /// (`EffectcraftApp::gpu_display`).
+    /// Use the GPU's plain RGB display conversion. Browser workers retain the
+    /// texture; native workers read back RGBA8 to the separate egui device.
+    /// Channel/exposure/ROI/extended views retain the full-float path.
     pub gpu_display: bool,
     /// The persistent disk cache, when enabled.
     pub disk: Option<Arc<DiskCache>>,
@@ -531,6 +529,24 @@ pub fn to_color_image(img: &effectcraft_engine::render::Image) -> egui::ColorIma
         })
         .collect();
     egui::ColorImage::new([img.width as usize, img.height as usize], px)
+}
+
+/// Validate a native display readback before constructing egui's image. A bad
+/// size or an allocation failure declines this attempt so the worker retries.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn display_color_image(width: u32, height: u32, bytes: &[u8]) -> Option<egui::ColorImage> {
+    let w = usize::try_from(width).ok()?;
+    let h = usize::try_from(height).ok()?;
+    let count = w.checked_mul(h)?;
+    // Bound input-derived allocations even on adapters with unusually large limits.
+    let byte_count = count.checked_mul(4)?;
+    if w == 0 || h == 0 || byte_count > 1024 * 1024 * 1024 || byte_count != bytes.len() {
+        return None;
+    }
+    let mut pixels = Vec::new();
+    pixels.try_reserve_exact(count).ok()?;
+    pixels.extend(bytes.as_chunks::<4>().0.iter().map(|[r, g, b, a]| egui::Color32::from_rgba_premultiplied(*r, *g, *b, *a)));
+    Some(egui::ColorImage::new([w, h], pixels))
 }
 
 /// The whole factor an image of `size` is averaged down by for a texture: at least `min_k`, and
@@ -1383,19 +1399,34 @@ impl Worker {
             let auto = if cfg!(target_arch = "wasm32") { None } else { r.frame_auto(a, job.comp, true) };
             if auto.is_none_or(|(p, key)| p.choose(key)) {
                 let t0 = web_time::Instant::now();
-                match g.within_memory(|| g.render_display(&r, job.comp, job.t)) {
-                    Ok(Some(f)) => {
+                match g.within_memory(|| {
+                    let f = g.render_display(&r, job.comp, job.t)?;
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        Some(FrameImage::Gpu(Arc::new(f)))
+                    }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        let bytes = g.read_display(&f)?;
+                        let image = display_color_image(f.width, f.height, &bytes)?;
+                        Some(FrameImage::Cpu(Arc::new(image)))
+                    }
+                }) {
+                    Ok(Some(image)) => {
+                        if g.context().check_health().is_err() {
+                            return self.render_job(job, false);
+                        }
                         if let Some((p, key)) = auto {
-                            // Time the GPU's work, not just its recording.
-                            g.wait();
-                            if g.context().check_health().is_err() {
-                                return self.render_job(job, false);
-                            }
+                            // Native readback has completed; include transfer and
+                            // CPU image construction in AutoPick's measurement.
                             p.record(key, true, t0.elapsed().as_secs_f64() * 1000.0);
                         }
-                        return FrameImage::Gpu(Arc::new(f));
+                        return image;
                     }
                     Ok(None) => {
+                        if g.context().check_health().is_err() {
+                            return self.render_job(job, false);
+                        }
                         if let Some((p, key)) = auto {
                             p.declined(key);
                         }

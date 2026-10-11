@@ -686,13 +686,11 @@ impl EffectcraftApp {
         }
     }
 
-    /// Keep GPU-composited viewer frames on the GPU (drawn from their texture). The browser can't
-    /// read frames back (its thread can't wait for the GPU), so there the viewer shows GPU frames
-    /// directly whenever it draws them plainly (RGB, no exposure, no region of interest); the
-    /// desktop reads them back (see [`frames::RenderSource::gpu_display`]).
+    /// Prepare plain viewer pixels on the compositor. The browser keeps its
+    /// texture; native workers read back RGBA8 for the separate egui device.
     fn gpu_display(&self) -> bool {
         let v = &self.session.state.viewer;
-        cfg!(target_arch = "wasm32")
+        (cfg!(target_arch = "wasm32") || !self.frames.remote_active())
             && v.channel == effectcraft_engine::viewer::Channel::Rgb
             && v.exposure == 0.0
             && self.session.state.region_of_interest.is_none()
