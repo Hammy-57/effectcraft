@@ -406,7 +406,7 @@ pub(crate) fn init_resource<T>(device: &wgpu::Device, label: &str, create: impl 
 /// Browser scope completion is asynchronous. Preserve the existing browser constructor;
 /// never block its event loop or introduce a guard across an asynchronous boundary here.
 #[cfg(target_arch = "wasm32")]
-fn init_resource<T>(_device: &wgpu::Device, _label: &str, create: impl FnOnce() -> T) -> Result<T, String> {
+pub(crate) fn init_resource<T>(_device: &wgpu::Device, _label: &str, create: impl FnOnce() -> T) -> Result<T, String> {
     Ok(create())
 }
 
@@ -840,7 +840,12 @@ impl GpuContext {
             ..wgpu::Limits::default()
         };
         let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor { label: Some("effectcraft gpu"), required_limits, ..Default::default() })
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("effectcraft gpu"),
+                required_limits,
+                required_features: profile_features(adapter.features()),
+                ..Default::default()
+            })
             .await
             .map_err(|e| format!("no device: {e}"))?;
         let context = GpuContext::new(adapter, device, queue)?;
@@ -921,6 +926,7 @@ impl GpuContext {
 
     /// Upload a CPU image (`None` when it does not fit the device).
     pub fn upload_image(&self, img: &Image) -> Option<GpuImage> {
+        let _profile = effectcraft_render::profile::span("upload");
         if !self.fits(img.width, img.height) {
             return None;
         }
@@ -1016,8 +1022,18 @@ impl GpuContext {
     }
 }
 
+fn profile_features(available: wgpu::Features) -> wgpu::Features {
+    if cfg!(feature = "profile") {
+        available & (wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS)
+    } else {
+        wgpu::Features::empty()
+    }
+}
+
 /// Records GPU work for one render (a command encoder submitted at readback or the end).
 pub(crate) struct Enc<'g> {
+    #[cfg(feature = "profile")]
+    pub(crate) timestamps: Option<crate::timestamps::Batch>,
     pub g: &'g GpuContext,
     /// The open command encoder and its id in the texture pool.
     enc: Option<(wgpu::CommandEncoder, u64)>,
@@ -1047,7 +1063,15 @@ impl Drop for Enc<'_> {
 
 impl<'g> Enc<'g> {
     pub fn new(g: &'g GpuContext) -> Enc<'g> {
-        Enc { g, enc: None, pending: 0, submitted: None, ring: None }
+        Enc {
+            g,
+            enc: None,
+            pending: 0,
+            submitted: None,
+            ring: None,
+            #[cfg(feature = "profile")]
+            timestamps: None,
+        }
     }
 
     pub(crate) fn encoder(&mut self) -> &mut wgpu::CommandEncoder {
@@ -1186,15 +1210,25 @@ impl<'g> Enc<'g> {
                 ],
             })
         });
+        #[cfg(feature = "profile")]
+        let mut batch = self.timestamps.take().or_else(|| crate::timestamps::Batch::new(g));
+        #[cfg(feature = "profile")]
+        let timestamp_writes = batch.as_mut().and_then(|b| b.mark(entry));
+        #[cfg(not(feature = "profile"))]
+        let timestamp_writes = None;
         let enc = self.encoder();
         {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(entry), timestamp_writes: None });
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(entry), timestamp_writes });
             pass.set_pipeline(pipe);
             pass.set_bind_group(0, &bg, &[]);
             if let Some(b) = &bg_ext {
                 pass.set_bind_group(1, b, &[]);
             }
             pass.dispatch_workgroups(groups.0.max(1), groups.1.max(1), 1);
+        }
+        #[cfg(feature = "profile")]
+        {
+            self.timestamps = batch;
         }
         self.pending += 1;
         // Keep command buffers (and the transient textures they hold) bounded.
@@ -1234,8 +1268,15 @@ impl<'g> Enc<'g> {
 
     /// Submit recorded work.
     pub fn submit(&mut self) {
-        if let Some((enc, id)) = self.enc.take() {
+        #[allow(unused_mut)]
+        if let Some((mut enc, id)) = self.enc.take() {
+            #[cfg(feature = "profile")]
+            let timing = self.timestamps.take().and_then(|b| b.resolve(self.g, &mut enc));
             self.submitted = Some(self.g.queue.submit([enc.finish()]));
+            #[cfg(feature = "profile")]
+            if let Some(timing) = timing {
+                timing.map(self.g.queue.get_timestamp_period());
+            }
             if let Ok(mut p) = self.g.pool.lock() {
                 p.close(id);
             }
@@ -1280,6 +1321,7 @@ impl<'g> Enc<'g> {
     /// [`Enc::read_texture`] row by row (`w × bpp` bytes each, top to bottom) through a reused
     /// staging buffer: `row` reads each straight from the mapped buffer.
     fn read_rows(&mut self, texture: &wgpu::Texture, w: u32, h: u32, bpp: u32, row: impl FnMut(&[u8])) -> Option<()> {
+        let _profile = effectcraft_render::profile::span("readback");
         if !self.g.can_wait() {
             return None;
         }
@@ -1458,8 +1500,15 @@ impl<'g> Enc<'g> {
         for l in 1..levels {
             steps.push((&g.display_mip, level(l - 1), level(l), (img.width >> l).max(1), (img.height >> l).max(1)));
         }
+        #[cfg(feature = "profile")]
+        let mut batch = self.timestamps.take().or_else(|| crate::timestamps::Batch::new(g));
         let enc = self.encoder();
-        for (pipeline, src, dst, w, h) in &steps {
+        for (step, (pipeline, src, dst, w, h)) in steps.iter().enumerate() {
+            let entry = if step == 0 { "display" } else { "display_mip" };
+            #[cfg(feature = "profile")]
+            let timestamp_writes = batch.as_mut().and_then(|b| b.mark(entry));
+            #[cfg(not(feature = "profile"))]
+            let timestamp_writes = None;
             let bg = g.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
                 layout: &g.display_bgl,
@@ -1468,10 +1517,14 @@ impl<'g> Enc<'g> {
                     wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(dst) },
                 ],
             });
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("display"), timestamp_writes: None });
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(entry), timestamp_writes });
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(w.div_ceil(16), h.div_ceil(16), 1);
+        }
+        #[cfg(feature = "profile")]
+        {
+            self.timestamps = batch;
         }
         tex
     }

@@ -50,6 +50,7 @@ impl<'a> EvalCtx<'a> {
     }
     /// Value of a property at the context time (keyframes, then expression).
     pub fn value(&self, layer: &Layer, prop: &Property) -> Value {
+        let _profile = crate::profile::span("evaluation");
         // Separated Position reads as the combination of X/Y/Z Position.
         if prop.match_id == "position"
             && let Some(tr) = layer.transform()
@@ -65,6 +66,7 @@ impl<'a> EvalCtx<'a> {
         if prop.has_expression()
             && let Some(h) = self.expr
         {
+            let _expression = crate::profile::span("expressions");
             return h.eval(self, layer, prop, &v).unwrap_or(v);
         }
         v
