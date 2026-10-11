@@ -13,7 +13,7 @@ bugs plus the broken Gradient Edit and empty-timeline drop workflows. In-place p
 | #652 missing media in the app | Ordinary project opening now anchors relative footage, sequence and proxy paths to the project folder. A generated H.264/WAV project opened with app-style background checks renders both picture and audio and exports an MP4 containing both streams (`relative_media`). The reporter's actual project was not supplied. |
 | #660 Windows black strip/click offset | **Left unresolved at the owner's request.** The supplied screenshot is VectorCraft; no EffectCraft reproduction was provided. See [investigation](windows-titlebar-660.md). |
 | #647 drag CPU/memory growth | Urgent viewer renders no longer bypass admission limits and nest without bound. Auxiliary Puppet renders share one additional permit across layers. Queue/admission tests and `viewer-drag-memory.jsonl` cover the mechanism; the replay's native-viewer requirement is explicit. |
-| #595 playback cache gaps and third-resolution indicators | Near-playhead frames are protected from speculative eviction, lookahead respects capacity, and scale hashing uses the same precision as the cache bar. Queue, eviction and one-third-resolution regressions pass. Smooth playback on the reporter's Linux/Wayland machine was not measured. |
+| #595 playback cache gaps and third-resolution indicators | Near-playhead frames are protected from speculative eviction, lookahead respects capacity, and scale hashing uses the same precision as the cache bar. Native audio now interpolates the audible sample cursor between device callbacks, holds through underrun silence, and waits for the final buffer to play. Playback samples that cursor once per scheduling decision, avoiding an extra pause at loop boundaries. Queue, eviction, scale and audio regressions pass. Smooth playback on the reporter's Linux/Wayland machine was not measured. |
 | #586 Puppet drag lag | Later poses solve off the UI thread; one running/latest pose is kept, pin handles stay current, stale project results are rejected, and failures release admission. Shared deformation results also avoid duplicate solves. Initial mesh selection and the wasm path remain synchronous. Synthetic solver measurements are not a native-screen frame-rate claim. |
 | #637 precomp double-click | Existing navigation is verified by real pointer regressions in both the Timeline and Composition viewer; each opens the nested comp's own tab. No speculative navigation change was needed. |
 | #570 viewer Cmd/Ctrl +/- | Focused Composition viewers accept these aliases while preserving explicit shortcut bindings and text editing. `command_plus_minus_zoom_the_focused_composition` passes. |
@@ -35,3 +35,24 @@ workflow was tested on every platform. Full workspace CI and a release/app rebui
 Private logs, the gradient screenshot and raw AE-generated reference frames stay under ignored
 `plan/user-bugs-validation/` and `plan/aftereffects/ref/user-bugs-658/`; no reference media ships
 with these changes. The test logs retain the initial failures and their successful reruns.
+
+## Follow-up verification, 11 October
+
+Fourteen focused playback tests passed: six native audio-clock tests, six UI audio tests and two
+playback-pacing tests. The deterministic clock tests cover 29.97/30 fps, 44.1/48 kHz, 2048/4096-sample
+buffers, future callback timestamps, underruns and restart. They do not measure a physical audio
+device's timestamp accuracy. The reporter's reference recording shows audio-enabled preview, but
+does not reveal the device buffer size or establish audio timing as its sole cause.
+
+The watchdog on `d51f0cf1` passed all-target Clippy but failed the unchanged tracking wall-clock
+test amid parallel tests (153.49 ms/frame against 100 ms). Normal tests now retain its 0.25-pixel
+accuracy assertion; the original 100 ms budget remains an explicit isolated benchmark. Both focused
+checks passed locally (2.98 ms/frame for that benchmark), and tracking Clippy passed. See
+[the benchmark command](../testing.md#single-point-tracking-budget).
+
+Warm build reuse also exposed a contributor-credit lookup that embedded a deleted worktree's path.
+It now resolves the current checkout at build-script runtime. Fresh generated credits matched all
+27 contributor entries and 656 commits in the repository data. App/UI all-target Clippy passed.
+
+Windows presentation-device recreation remains separate work; the owner explicitly deferred its
+hardware verification. No additional full CI or ordinary app/release build was run locally.
