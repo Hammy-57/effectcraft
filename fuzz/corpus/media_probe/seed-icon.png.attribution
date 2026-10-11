@@ -1,0 +1,8 @@
+asset:        seed-icon.png
+title:        Media fuzz seed: EffectCraft app icon
+author:       EffectCraft contributors (drawing by the project owner in ArtCraft)
+source:       original work
+license:      MIT OR Apache-2.0
+license-file: assets/app-icon/LICENSE.txt
+added:        2026-10-11 by EffectCraft contributors (attribution repair)
+notes:        Copied by fuzz/examples/seeds.rs (fb8e8bd4) from assets/app-icon/hicolor/16x16/apps/ai.storyteller.effectcraft.png; prefix byte 0 selects PNG in the media fuzz harness. Original icon rendered from effectcraft.svg by packaging/icons.sh; underlying artwork is unchanged.

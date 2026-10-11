@@ -1,0 +1,35 @@
+# Fork-only paths: never sent to storytold/effectcraft (read by queue-pr.sh and sync-gap.sh).
+#
+# A plain line is a path glob relative to the repo root; `*` also matches `/` (git pathspec and
+# shell `case` rules), so `docs/fork/*` covers the whole folder. Changes to these paths are dropped
+# from queued PR branches.
+#
+# A `hunk:` line names a file that is shared with upstream but carries fork-only sections. Those
+# can't be dropped by path: queue-pr.sh warns when a queued change touches the file, and the agent
+# removes the fork-only hunks by hand (`--body-file` can explain what was left out).
+
+# Fork tooling and its docs
+docs/fork/*
+scripts/fork/*
+.github/workflows/watchdog.yml
+# Agent lanes / claims on the owner's machine (cargo xtask agents); its `mod agents` wiring and the
+# `Agents` subcommand in xtask/src/main.rs are hunk-level, see below.
+xtask/src/agents.rs
+
+# Owner-local After Effects icons (~/Library/Application Support/EffectCraft/owner-assets, AGENTS.md §1.9)
+crates/ui-egui/src/local_assets.rs
+crates/ui-egui/tests/ui_local_assets.rs
+
+# Maintainer-local plan (already gitignored)
+plan/*
+
+hunk: Cargo.toml                        the [profile.local] and [profile.local.package.*] sections (scripts/fork/app.sh)
+hunk: CLAUDE.md                         step 5 (the eliasx45 fork paragraph) and every line naming docs/fork, lanes or `cargo xtask agents`
+hunk: AGENTS.md                         §1.9 owner-local Adobe icons exception and its §2 "Sole exception" note
+hunk: .mcp.json                         local entries (effectcraft-ui, the scripts/mcp.sh wrappers)
+hunk: xtask/src/main.rs                 the `mod agents;` line and the `Agents` subcommand
+hunk: crates/ui-egui/src/lib.rs         `mod local_assets;`; every `crate::local_assets::` call (icons, widgets, viewer, timeline, graph, text panels) is fork-only too: queue-pr.sh flags it
+hunk: crates/ui-egui/tests/ui/main.rs   the `ui_local_assets` module line
+# Motion Library: its panel and content live outside this repo (After Effects integrations). The
+# generic, default-off `library.*` engine commands (crates/engine/src/commands/library.rs,
+# docs/libraries.md) MAY go upstream; anything that points them at the Motion Library may not.
