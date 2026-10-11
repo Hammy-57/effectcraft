@@ -138,7 +138,7 @@ unsubscribes.
 
 | Method | Params | Result |
 |---|---|---|
-| `ui.inspect` | `{}` | Window size, pixels per point, fps, serialized `UiState`, playback, time, active comp, selection, open dialog, last render ms. |
+| `ui.inspect` | `{}` | Window size, pixels per point, UI fps, serialized `UiState`, playback (`achievedFps`, `targetFps`, `realTime`, `shown`, `caching`, `waiting`), time, active comp, selection, open dialog, last render ms. Playback FPS is distinct from UI FPS. |
 | `ui.elements` | `{prefix?}` | `[{id, label, rect: [x, y, w, h], window?}]`: the widgets from the most recently completed paint pass, in points. ID-based input uses that same snapshot, without falling back to widgets removed since an older frame. On the desktop an undocked panel group is an OS window of its own: its widgets carry `window` (the group's id) and their rect is in that window's coordinates. |
 | `ui.set` | `{tool?, workspace?, theme?, focused?, viewer?, timeline?, menuBar?, home?}` | `viewer: {zoom (null = fit), res: Full\|Half\|Third\|Quarter\|Auto, pan: [x,y], grid, rulers, safeMargins, transparencyGrid}`; `timeline: {pps (null = fit), start, graphEditor, showModes, openLayers: [ids], openGroups: [uids]}`. |
 | `ui.panel.show` / `ui.panel.close` | `{panel}` | Panels: `Project`, `Composition`, `Timeline`, `EffectControls`, `EffectsPresets`, `Info`, `Preview`, `Character`, `Paragraph`, `Align` and others. |

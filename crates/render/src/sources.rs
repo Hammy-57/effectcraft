@@ -139,7 +139,8 @@ impl<'a> Renderer<'a> {
                 let tmp = if ov.is_empty() { None } else { effectcraft_project::essential::with_overrides(self.project, *item, &ov) };
                 let (base, bs) = self.precomp_renderer(layer, *item);
                 let sub = match &tmp {
-                    Some(p) => Renderer { project: p, ..base },
+                    // A source cache was made without this instance's property overrides.
+                    Some(p) => Renderer { project: p, freeze: None, ..base },
                     None => base,
                 };
                 // The nested frames share their layers' transforms (parents evaluated once).

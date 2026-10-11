@@ -107,6 +107,8 @@ mod ui_scriptui;
 mod ui_scrolling;
 #[path = "../ui_settings_info.rs"]
 mod ui_settings_info;
+#[path = "../ui_smart_freeze.rs"]
+mod ui_smart_freeze;
 #[path = "../ui_solo_small_tabs.rs"]
 mod ui_solo_small_tabs;
 #[path = "../ui_source_icons.rs"]

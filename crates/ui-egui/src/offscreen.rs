@@ -189,6 +189,9 @@ fn build(opts: OffscreenOptions, session: Session, renderer: WgpuTestRenderer) -
     let ppp = if opts.pixels_per_point.is_finite() { opts.pixels_per_point.clamp(0.5, 4.0) } else { 2.0 };
     let h = Harness::builder()
         .with_size(egui::vec2(opts.size[0], opts.size[1]))
+        // Ui::step supplies wall time. Extra frames for queued input must not advance a
+        // synthetic clock, especially while a background job makes us poll rapidly.
+        .with_step_dt(0.0)
         .with_pixels_per_point(ppp)
         .renderer(renderer)
         .build_eframe(move |_cc| EffectcraftApp::new(session).with_control(rx));
@@ -253,7 +256,7 @@ impl Ui {
     fn step(&mut self) {
         let now = self.clock.elapsed().as_secs_f64();
         let last = self.h.ctx.input(|i| i.time);
-        self.h.input_mut().time = Some(now.max(last + 1e-3));
+        self.h.input_mut().time = Some(now.max(last));
         for e in self.h.state_mut().take_synthetic_input() {
             self.h.event(e);
         }

@@ -371,6 +371,7 @@ mod async_tests {
         OverlayJob {
             key: OverlayKey { epoch, revision, comp: 1, layer: 2, time: 0 },
             source: crate::frames::RenderSource {
+                freeze_feedback: Default::default(),
                 project: Arc::default(),
                 footage: Arc::new(effectcraft_engine::render::NoFootage),
                 expr: None,

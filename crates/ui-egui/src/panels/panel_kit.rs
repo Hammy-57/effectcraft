@@ -25,8 +25,8 @@ pub fn checkbox(app: &mut EffectcraftApp, ui: &mut egui::Ui, at: egui::Pos2, aut
     let r = Rect::from_min_size(at, vec2(16.0, 16.0));
     let clicked = widgets::checkbox(ui, r, on, &t, egui::Id::new(("kit-cb", auto))).clicked();
     ui.painter().text(pos2(r.max.x + 6.0, r.center().y), Align2::LEFT_CENTER, text, Tokens::ui(12.0), t.text);
-    let full = Rect::from_min_size(at, vec2(22.0 + text.len() as f32 * 6.5, 16.0));
-    app.auto.add(auto, full, text);
+    // The painted label is not interactive; automation must click the checkbox itself.
+    app.auto.add(auto, r, text);
     if clicked { !on } else { on }
 }
 

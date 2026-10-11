@@ -42,6 +42,8 @@ fn scrub_resolution_respects_overrides_and_refines_on_quiet() {
 #[test]
 fn late_coarse_frame_can_refine_without_replacing_ready_full_or_other_content() {
     use std::time::{Duration, Instant};
+    // A loaded font database must not replace the document's frame-key revision.
+    let _ = effectcraft_engine::text::fonts::resolve("Inter", "Regular");
     let mut app = app();
     let id = motion(&mut app);
     let coarse = app.viewer_scale(1.0, 1.0);

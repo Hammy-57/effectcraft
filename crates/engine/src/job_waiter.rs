@@ -13,6 +13,7 @@ use crate::Session;
 
 /// A `wait: true` engine command (or `jobs.wait`) whose job runs in the background.
 pub struct JobWaiter {
+    known_jobs: std::sync::Mutex<Vec<String>>,
     pub command: String,
     pub params: Value,
     /// The command's own result (with `wait: false`).
@@ -50,7 +51,14 @@ pub fn start(s: &mut Session, id: &str, params: Value) -> Result<Started, String
         let jobs = task_ids(s);
         if !jobs.is_empty() {
             let log_len = s.offload_log.len();
-            return Ok(Started::Waiting(JobWaiter { command: id.to_string(), params, result: json!({}), jobs, log_len }));
+            return Ok(Started::Waiting(JobWaiter {
+                known_jobs: std::sync::Mutex::new(jobs.clone()),
+                command: id.to_string(),
+                params,
+                result: json!({}),
+                jobs,
+                log_len,
+            }));
         }
     }
     if !waits(id, &params) {
@@ -67,13 +75,36 @@ pub fn start(s: &mut Session, id: &str, params: Value) -> Result<Started, String
     if jobs.is_empty() {
         return Ok(Started::Done(result));
     }
-    Ok(Started::Waiting(JobWaiter { command: id.to_string(), params, result, jobs, log_len }))
+    Ok(Started::Waiting(JobWaiter { known_jobs: std::sync::Mutex::new(jobs.clone()), command: id.to_string(), params, result, jobs, log_len }))
 }
 
 impl JobWaiter {
+    /// A staged task can publish `nextJob`; latch that child before the old log entry ages
+    /// out so `wait: true` means full completion, not merely a draft becoming available.
+    fn follow_jobs(&self, s: &Session) -> Vec<String> {
+        let mut known = self.known_jobs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut index = 0usize;
+        while index < known.len() && known.len() < self.jobs.len().saturating_add(64) {
+            let next = known
+                .get(index)
+                .and_then(|id| s.job_log.iter().find(|j| &j.id == id))
+                .and_then(|j| j.result.get("nextJob"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if let Some(next) = next
+                && next.starts_with("task:")
+                && !known.contains(&next)
+            {
+                known.push(next);
+            }
+            index += 1;
+        }
+        known.clone()
+    }
     /// Whether its jobs are still running.
     pub fn pending(&self, s: &Session) -> bool {
-        s.jobs().iter().any(|j| self.jobs.contains(&j.id))
+        let known = self.follow_jobs(s);
+        s.jobs().iter().any(|j| known.contains(&j.id))
     }
 
     /// The reply (`{ok, result}` / `{ok: false, error}`): what the blocking command would have
@@ -81,6 +112,7 @@ impl JobWaiter {
     /// job's error.
     pub fn finish(self, s: &mut Session) -> Value {
         s.poll_render();
+        let known = self.follow_jobs(s);
         if self.command == "jobs.wait" {
             return json!({"ok": true, "result": {"finished": s.job_log}});
         }
@@ -90,13 +122,18 @@ impl JobWaiter {
         }
         // A generic task (desktop): the blocking command returned its result, or failed with its
         // message.
-        let mut tasks: Vec<&mut crate::jobs::JobRecord> = s.job_log.iter_mut().filter(|r| self.jobs.contains(&r.id)).collect();
+        let mut tasks: Vec<&mut crate::jobs::JobRecord> = s.job_log.iter_mut().filter(|r| known.contains(&r.id)).collect();
         if let Some(r) = tasks.iter().find(|r| r.status != "done") {
             return json!({"ok": false, "error": if r.message.is_empty() { r.status.clone() } else { r.message.clone() }});
         }
-        if let [task] = tasks.as_mut_slice() {
+        if self.jobs.len() == 1
+            && let Some(task) = tasks.iter_mut().find(|t| Some(&t.id) == known.last())
+        {
             // Taken, not copied: a render's PNG shouldn't stay in the job log.
             return json!({"ok": true, "result": std::mem::take(&mut task.result)});
+        }
+        if self.command.starts_with("freeze.") && !known.is_empty() && tasks.is_empty() {
+            return json!({"ok":false,"error":"Freeze job result expired; inspect freeze.list for the current state"});
         }
         let mut r = self.result;
         if r.get("running").is_some() {

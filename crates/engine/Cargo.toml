@@ -42,3 +42,10 @@ image = { workspace = true }
 gif = { workspace = true }
 web-time = { workspace = true }
 exr = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# Safe shell API boundary; never use the crate's Unix mount enumeration.
+trash = { version = "5.2.9", default-features = false, features = ["coinit_apartmentthreaded"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+time = { version = "0.3.55", features = ["local-offset"] }

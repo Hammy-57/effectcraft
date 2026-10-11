@@ -228,6 +228,10 @@ pub(crate) fn submenu(app: &EffectcraftApp, source: &str, shown: String) -> Stri
 /// Chinese After Effects documentation and the catalogs the sibling Craft apps ship; see the
 /// pull request for the rows taken from #321.
 const SIMPLIFIED_CHINESE: &[(&str, &str, &str)] = &[
+    ("", "Smart Freeze", "Smart Freeze"),
+    ("window.panel", "Smart Freeze", "Smart Freeze"),
+    ("freeze.freeze", "Freeze", "冻结"),
+    ("freeze.originals", "Use Originals / Stop Auto", "使用原始内容 / 停止自动冻结"),
     ("", "EffectCraft", "EffectCraft"),
     ("app.about", "About EffectCraft...", "关于 EffectCraft..."),
     ("", "Settings...", "设置..."),
@@ -856,6 +860,10 @@ const SIMPLIFIED_CHINESE: &[(&str, &str, &str)] = &[
 /// entry per fixed menu row of the engine's menu tree, mirroring `SIMPLIFIED_CHINESE` in the
 /// vocabulary the sibling Craft apps' zh-hant catalogs use.
 const TRADITIONAL_CHINESE: &[(&str, &str, &str)] = &[
+    ("", "Smart Freeze", "Smart Freeze"),
+    ("window.panel", "Smart Freeze", "Smart Freeze"),
+    ("freeze.freeze", "Freeze", "凍結"),
+    ("freeze.originals", "Use Originals / Stop Auto", "使用原始內容 / 停止自動凍結"),
     ("", "EffectCraft", "EffectCraft"),
     ("app.about", "About EffectCraft...", "關於 EffectCraft..."),
     ("", "Settings...", "設定..."),
@@ -1481,6 +1489,10 @@ const TRADITIONAL_CHINESE: &[(&str, &str, &str)] = &[
 ];
 
 const JAPANESE: &[(&str, &str, &str)] = &[
+    ("", "Smart Freeze", "Smart Freeze"),
+    ("window.panel", "Smart Freeze", "Smart Freeze"),
+    ("freeze.freeze", "Freeze", "フリーズ"),
+    ("freeze.originals", "Use Originals / Stop Auto", "オリジナルを使用 / 自動フリーズを停止"),
     ("", "EffectCraft", "EffectCraft"),
     ("app.about", "About EffectCraft...", "EffectCraftについて..."),
     ("", "Settings...", "設定..."),
@@ -2109,6 +2121,10 @@ const JAPANESE: &[(&str, &str, &str)] = &[
 /// Ukrainian motion-graphics vocabulary. Product names and technical identifiers stay verbatim.
 /// The (command, source) keys match the other catalogs; no proprietary localization was used.
 const UKRAINIAN: &[(&str, &str, &str)] = &[
+    ("", "Smart Freeze", "Smart Freeze"),
+    ("window.panel", "Smart Freeze", "Smart Freeze"),
+    ("freeze.freeze", "Freeze", "Заморозити"),
+    ("freeze.originals", "Use Originals / Stop Auto", "Використати оригінали / Вимкнути авто"),
     ("", "EffectCraft", "EffectCraft"),
     ("app.about", "About EffectCraft...", "Про EffectCraft..."),
     ("", "Settings...", "Налаштування..."),
@@ -2738,6 +2754,10 @@ const UKRAINIAN: &[(&str, &str, &str)] = &[
 /// Wording follows Adobe's Spanish After Effects documentation (helpx.adobe.com/es) where it
 /// names the feature, and macOS Spanish for the app menu.
 const SPANISH: &[(&str, &str, &str)] = &[
+    ("", "Smart Freeze", "Smart Freeze"),
+    ("window.panel", "Smart Freeze", "Smart Freeze"),
+    ("freeze.freeze", "Freeze", "Congelar"),
+    ("freeze.originals", "Use Originals / Stop Auto", "Usar originales / Detener modo automático"),
     ("", "EffectCraft", "EffectCraft"),
     ("app.about", "About EffectCraft...", "Acerca de EffectCraft..."),
     ("", "Settings...", "Ajustes..."),
@@ -3365,6 +3385,10 @@ const SPANISH: &[(&str, &str, &str)] = &[
 /// Brazilian Portuguese: the same (command, English label) keys as `JAPANESE`, one entry
 /// per fixed menu row of the engine's menu tree.
 const PORTUGUESE: &[(&str, &str, &str)] = &[
+    ("", "Smart Freeze", "Smart Freeze"),
+    ("window.panel", "Smart Freeze", "Smart Freeze"),
+    ("freeze.freeze", "Freeze", "Congelar"),
+    ("freeze.originals", "Use Originals / Stop Auto", "Usar originais / Parar modo automático"),
     ("", "EffectCraft", "EffectCraft"),
     ("app.about", "About EffectCraft...", "Sobre o EffectCraft..."),
     ("", "Settings...", "Configurações..."),

@@ -60,11 +60,23 @@ fn viewer_draws_gpu_frames_that_match_the_cpu() {
         .wgpu_setup(same_adapter(adapter))
         .build_eframe(|_| EffectcraftApp::new(s));
     settle(&mut h);
+    // The initial CPU frame can finish before asynchronous compositor warm-up. Wait
+    // for the adapter itself rather than mistaking that first frame for GPU readiness.
+    if !gl {
+        for _ in 0..600 {
+            if h.state().gpu_adapter().is_some() {
+                break;
+            }
+            h.step();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        settle(&mut h);
+    }
     if gl && h.state().gpu_adapter().is_none() {
         eprintln!("egui-wgpu's GL device has WebGL2 limits: the viewer stays on the CPU, skipping");
         return;
     }
-    assert!(h.state().gpu_adapter().is_some(), "GPU compositor on egui-wgpu's device");
+    assert!(h.state().gpu_adapter().is_some(), "GPU compositor initialized");
     eprintln!("viewer compositor adapter: {:?}", h.state().gpu_adapter());
     let gpu_px = h.state_mut().viewer_pixels().expect("read back the GPU frame");
     let gpu_shot = h.render().expect("render");

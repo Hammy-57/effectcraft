@@ -677,6 +677,7 @@ mod tests {
     #[derive(Default)]
     struct Counted {
         asked: std::sync::Mutex<std::collections::BTreeMap<u32, u32>>,
+        completed: std::sync::atomic::AtomicUsize,
         gate: Option<(std::sync::mpsc::Sender<()>, std::sync::Mutex<std::sync::mpsc::Receiver<()>>)>,
         gated: std::sync::atomic::AtomicBool,
     }
@@ -704,6 +705,7 @@ mod tests {
                     img.set(x, y, [v, 1.0 - v, (f as f32 / 12.0).min(1.0), 1.0]);
                 }
             }
+            self.completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Some(std::sync::Arc::new(img))
         }
     }
@@ -808,6 +810,9 @@ mod tests {
         s.execute("renderQueue.render", json!({"wait": false})).unwrap();
         wait.recv_timeout(std::time::Duration::from_secs(120)).unwrap();
         s.execute("renderQueue.stop", json!({})).unwrap();
+        // Parallel workers may already have requested every frame while one remains
+        // blocked. Confirm unfinished rendering, not the number of requests queued.
+        assert!(footage.completed.load(std::sync::atomic::Ordering::SeqCst) < 12, "the render stopped mid-way");
         go.send(()).unwrap();
         let t0 = std::time::Instant::now();
         while s.is_rendering() {
@@ -816,7 +821,6 @@ mod tests {
         }
         s.poll_render();
         assert_eq!(s.project.render_queue[0].status.label(), "User Stopped");
-        assert!(footage.asked.lock().unwrap().len() < 12, "the render stopped mid-way");
         assert!(files(&dir).is_empty(), "stopped modules left files: {:?}", files(&dir).keys());
     }
 

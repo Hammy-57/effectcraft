@@ -596,6 +596,8 @@ pub fn inspect(app: &EffectcraftApp, ctx: &egui::Context) -> Value {
         "fps": app.fps,
         "ui": app.ui,
         "playing": app.playback.playing,
+        "playback": {"achievedFps":app.playback.achieved_fps(),"realTime":app.playback.real_time(),
+            "shown":app.playback.shown,"caching":app.playback.caching,"waiting":app.playback.waiting,"targetFps":app.playback.fps},
         "time": app.session.time().seconds(),
         "activeComp": app.session.state.active_comp.map(|i| i.0),
         "selectedLayers": app.session.state.selected_layers.iter().map(|c| c.0).collect::<Vec<_>>(),

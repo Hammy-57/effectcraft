@@ -102,6 +102,11 @@ pub(super) struct Proof<'a> {
 
 impl<'a> Proof<'a> {
     pub(super) fn between(before: &'a Project, after: &'a Project, id: ItemId) -> Option<Self> {
+        // Freeze previews can mask authoring edits and carry an independent verification
+        // epoch. Their pixels cannot be proven from opacity properties alone.
+        if [before, after].iter().any(|p| p.freeze.sections.iter().any(|s| s.enabled && s.target.comp() == id)) {
+            return None;
+        }
         let old_comp = before.comp(id)?;
         let new_comp = after.comp(id)?;
         if !bounded_simple(old_comp) || !bounded_simple(new_comp) || old_comp.layers.len() != new_comp.layers.len() {
@@ -265,14 +270,14 @@ mod tests {
         let (before, id) = scene();
         let after = edit(&before, id, 1);
         let frames = Frames::default();
-        let old = frames.content_of(&before, 1, id);
+        let old = frames.content_of_preview(&before, 1, 101, id);
         let late = key(old, 1, id, 90);
         let inside = key(old, 1, id, 30);
         fill(&frames, late);
         fill(&frames, inside);
         frames.cache.lock().unwrap().protected.insert(late, 0);
         let bytes = frames.cache.lock().unwrap().bytes;
-        let new = frames.content_of(&after, 2, id);
+        let new = frames.content_of_preview(&after, 2, 202, id);
         assert_ne!(old, new);
         let moved = FrameKey { content: new, revision: 2, ..late };
         assert!(frames.is_cached(&moved));
@@ -298,6 +303,29 @@ mod tests {
         drop(before);
         drop(after);
         assert_eq!(frames.keepers.lock().unwrap().1.len(), 2);
+    }
+
+    #[test]
+    fn active_freeze_sections_require_their_own_pixel_proof() {
+        let (mut before, id) = scene();
+        Arc::make_mut(&mut before).freeze.sections.push(effectcraft_engine::project::freeze::Section {
+            id: 99,
+            name: "Frozen scene".into(),
+            target: effectcraft_engine::project::freeze::Target::Comp { comp: id },
+            start: Tick::ZERO,
+            end: Tick::from_seconds_f64(4.0),
+            follow_comp_range: true,
+            enabled: true,
+            auto: false,
+            quick_draft: false,
+            cache: None,
+            previous: vec![],
+        });
+        let after = edit(&before, id, 1);
+        assert!(Proof::between(&before, &after, id).is_none());
+        Arc::make_mut(&mut before).freeze.sections[0].enabled = false;
+        let after = edit(&before, id, 1);
+        assert!(Proof::between(&before, &after, id).is_some(), "live originals keep ordinary opacity-frame retention");
     }
 
     #[test]

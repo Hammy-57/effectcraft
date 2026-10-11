@@ -676,7 +676,8 @@ impl EffectcraftApp {
 
     pub fn render_source(&self) -> RenderSource {
         RenderSource {
-            project: self.session.project.clone(),
+            freeze_feedback: self.session.freeze_runtime.feedback.clone(),
+            project: self.session.freeze_preview_project(),
             footage: self.session.footage.clone(),
             expr: self.session.expr.clone(),
             layer_cache: self.session.layer_cache.clone(),
@@ -1045,9 +1046,20 @@ impl EffectcraftApp {
     /// The key of frame 0 of `comp`'s viewer frames at `scale` (the content, view and render
     /// options are the same for every frame: loops compute this once).
     pub fn frame_series(&self, comp: ItemId, scale: f64) -> FrameKey {
+        let generation = self.session.freeze_preview_revision();
+        let mut content = self.frames.content_of_preview(&self.session.freeze_preview_project(), self.session.revision, generation, comp);
+        if let Some(epoch) = self.session.freeze_runtime.pixel_epoch(&self.session.project, comp) {
+            // Derived cache verification can change pixels without an authoring edit.
+            // Keep that in content identity: revision remains the document revision used
+            // by progressive scrubbing and playback's stale-completion checks.
+            use std::hash::{Hash, Hasher};
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            (content, epoch).hash(&mut hash);
+            content = hash.finish();
+        }
         FrameKey {
             revision: self.session.revision,
-            content: self.frames.content_of(&self.session.project, self.session.revision, comp),
+            content,
             comp: comp.0,
             frame: 0,
             scale: (scale * 1000.0).round() as u32,
@@ -1846,6 +1858,13 @@ impl EffectcraftApp {
 
     fn frame(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        if self.playback.playing || ctx.input(|i| !i.events.is_empty()) {
+            self.session.freeze_runtime.activity();
+        }
+        self.session.poll_freeze();
+        if self.session.project.freeze.sections.iter().any(|s| s.auto && s.enabled) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
         self.scrub_preview.tick(ctx.input(|i| i.time), self.session.active_comp_id().map(|id| id.0), self.session.revision);
         if let Some(wait) = self.scrub_preview.remaining() {
             ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait));

@@ -225,6 +225,7 @@ impl Session {
         any |= self.poll_warp(false);
         any |= self.poll_roto(false);
         any |= self.poll_camera(false);
+        self.poll_freeze();
         any
     }
 
@@ -346,6 +347,11 @@ impl Session {
             t.ctl.cancel.store(true, Ordering::Relaxed);
         }
         for mut t in std::mem::take(&mut self.tasks) {
+            // Freeze jobs own immutable snapshots and private cache output. A slow media
+            // stat must not block opening another project; cancelled results are discarded.
+            if matches!(t.kind, "smartFreeze" | "freezeCheck" | "freezeStorage") {
+                continue;
+            }
             if let Some(th) = t.thread.take() {
                 let _ = th.join();
             }
