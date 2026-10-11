@@ -50,6 +50,10 @@ const MAX_KEPT: usize = 16;
 /// Working textures kept for reuse once their last image is dropped (bytes), at most.
 const POOL_BUDGET: usize = 768 << 20;
 
+/// Free upload textures of integer samples (packed layer codes, video planes, masks) kept for
+/// reuse (bytes), at most (see [`GpuContext::plane_texture`]).
+const PLANE_BUDGET: usize = 128 << 20;
+
 /// Small auxiliary caches must be bounded across sizes, not independently per size.
 const AUX_CACHE_BUDGET: u64 = 64 << 20;
 
@@ -205,6 +209,35 @@ impl Transfers {
         n.fetch_add(1, Relaxed);
         b.fetch_add(bytes as u64, Relaxed);
     }
+}
+
+/// Levels of the 8 and 16 bpc grids (`effectcraft_render::packed`: 255 and After Effects' 32768).
+const LEVELS_8: f32 = 255.0;
+const LEVELS_16: f32 = 32768.0;
+
+/// `data` as integer codes `k` with `k as f32 * (1.0 / levels)` bitwise equal to each value, the
+/// layer cache's lossless packing (`effectcraft_render::packed`), or `None` when a value is off
+/// that grid, out of range, negative zero or NaN (or the codes can't be allocated).
+fn pack_codes<T: Copy + Default + Send>(data: &[[f32; 4]], levels: f32, conv: impl Fn(u32) -> T + Sync + Send) -> Option<Vec<[T; 4]>> {
+    use rayon::prelude::*;
+    let inv = 1.0 / levels;
+    let level = |v: f32| -> Option<T> {
+        if !(0.0..=1.0).contains(&v) {
+            return None;
+        }
+        let k = (v * levels + 0.5) as u32;
+        ((k as f32 * inv).to_bits() == v.to_bits()).then(|| conv(k))
+    };
+    let mut out = Vec::new();
+    out.try_reserve_exact(data.len()).ok()?;
+    out.resize(data.len(), [T::default(); 4]);
+    out.par_chunks_mut(4096).zip(data.par_chunks(4096)).try_for_each(|(dst, src)| {
+        for (d, p) in dst.iter_mut().zip(src) {
+            *d = [level(p[0])?, level(p[1])?, level(p[2])?, level(p[3])?];
+        }
+        Some(())
+    })?;
+    Some(out)
 }
 
 fn tex_bytes(t: &wgpu::Texture) -> usize {
@@ -492,6 +525,9 @@ pub struct GpuContext {
     pub(crate) transfers: Transfers,
     /// Readback staging buffers by size.
     staging: Mutex<HashMap<u64, Vec<wgpu::Buffer>>>,
+    /// Free upload textures of integer samples by size and format (see
+    /// [`GpuContext::plane_texture`]).
+    planes: Mutex<HashMap<(u32, u32, wgpu::TextureFormat), Vec<wgpu::Texture>>>,
     /// Transparent read-only images by size (see [`Enc::zeros`]).
     zeros: Mutex<HashMap<(u32, u32), GpuImage>>,
     /// Advanced 3D render pipelines (built on first use).
@@ -831,7 +867,7 @@ impl GpuContext {
                 None
             }
         };
-        let static_pipeline_count = std::sync::atomic::AtomicU64::new(pipelines.len() as u64 + 2 + if yuv.is_some() { 2 } else { 0 });
+        let static_pipeline_count = std::sync::atomic::AtomicU64::new(pipelines.len() as u64 + 2 + if yuv.is_some() { 3 } else { 0 });
         Ok(GpuContext {
             generation,
             device,
@@ -857,6 +893,7 @@ impl GpuContext {
             integrated,
             auxiliary_budget: std::sync::atomic::AtomicU64::new(auxiliary_budget),
             staging: Default::default(),
+            planes: Default::default(),
             transfers: Default::default(),
             zeros: Default::default(),
             adv3d: std::sync::OnceLock::new(),
@@ -1170,14 +1207,61 @@ impl GpuContext {
         self.pool.lock().map(|p| (p.hits, p.misses)).unwrap_or_default()
     }
 
-    /// Upload a CPU image (`None` when it does not fit the device).
+    /// A `COPY_DST | TEXTURE_BINDING` texture for uploaded samples: a free one of this size and
+    /// format when there is one (its old samples are overwritten by the upload), else a new one.
+    /// Hand it to [`Enc::stage`] once a dispatch reads it, so it is reused only after that
+    /// dispatch is submitted (an earlier `write_texture` would otherwise overwrite it first).
+    pub(crate) fn plane_texture(&self, w: u32, h: u32, format: wgpu::TextureFormat, label: &'static str) -> wgpu::Texture {
+        let key = (w.max(1), h.max(1), format);
+        if let Some(t) = self.planes.lock().ok().and_then(|mut p| p.get_mut(&key).and_then(Vec::pop)) {
+            return t;
+        }
+        self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d { width: key.0, height: key.1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })
+    }
+
+    /// Plane textures whose every reader has been submitted (or discarded) are free again.
+    fn free_planes(&self, textures: Vec<wgpu::Texture>) {
+        if textures.is_empty() || self.check_health().is_err() {
+            return;
+        }
+        let bytes = |t: &wgpu::Texture| {
+            (t.width() as usize).saturating_mul(t.height() as usize).saturating_mul(t.format().block_copy_size(None).unwrap_or(16) as usize)
+        };
+        let Ok(mut p) = self.planes.lock() else { return };
+        let mut held = p.values().flatten().map(bytes).fold(0usize, usize::saturating_add);
+        for t in textures {
+            let b = bytes(&t);
+            if held.saturating_add(b) > PLANE_BUDGET {
+                continue;
+            }
+            held = held.saturating_add(b);
+            p.entry((t.width(), t.height(), t.format())).or_default().push(t);
+        }
+    }
+
+    /// Upload a CPU image (`None` when it does not fit the device). An image on the 8 or 16 bpc
+    /// grid (every layer buffer of an 8/16 bpc project) goes up as its integer codes, a quarter
+    /// or half of the bytes, and is expanded on the GPU to the identical floats.
     pub fn upload_image(&self, img: &Image) -> Option<GpuImage> {
         let _profile = effectcraft_render::profile::span("upload");
         if !self.fits(img.width, img.height) {
             return None;
         }
+        // A free pooled texture: every encoder that could read its old pixels is submitted.
+        let (g, _) = self.pooled_for_encoder(img.width, img.height, None);
+        if self.upload_packed(img, &g) {
+            return Some(g);
+        }
         self.transfers.count(true, img.data.len() * 16);
-        let g = self.image(img.width, img.height);
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo { texture: &g.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
             bytemuck::cast_slice(&img.data),
@@ -1185,6 +1269,60 @@ impl GpuContext {
             wgpu::Extent3d { width: img.width, height: img.height, depth_or_array_layers: 1 },
         );
         Some(g)
+    }
+
+    /// [`GpuContext::upload_image`] of an image on the 8 or 16 bpc grid into `out` (`false`: off
+    /// the grid, or no kernel; nothing was written).
+    fn upload_packed(&self, img: &Image, out: &GpuImage) -> bool {
+        if self.yuv.is_none() || img.width == 0 || img.height == 0 {
+            return false;
+        }
+        if let Some(codes) = pack_codes(&img.data, LEVELS_8, |k| k as u8) {
+            return self.upload_codes(out, wgpu::TextureFormat::Rgba8Uint, bytemuck::cast_slice(&codes), 4, LEVELS_8);
+        }
+        if cfg!(target_endian = "little")
+            && let Some(codes) = pack_codes(&img.data, LEVELS_16, |k| k as u16)
+        {
+            return self.upload_codes(out, wgpu::TextureFormat::Rgba16Uint, bytemuck::cast_slice(&codes), 8, LEVELS_16);
+        }
+        false
+    }
+
+    /// Upload integer codes (`bpp` bytes per pixel, `out`'s size) and expand them into `out`:
+    /// each channel `k` becomes `k as f32 * (1.0 / levels)`, rounded as on the CPU.
+    fn upload_codes(&self, out: &GpuImage, format: wgpu::TextureFormat, bytes: &[u8], bpp: u32, levels: f32) -> bool {
+        let Some(p) = self.yuv.as_ref() else { return false };
+        let (w, h) = (out.width, out.height);
+        let Some(row) = w.checked_mul(bpp) else { return false };
+        if (row as usize).checked_mul(h as usize) != Some(bytes.len()) {
+            return false;
+        }
+        let texture = self.plane_texture(w, h, format, "packed upload");
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            bytes,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(h) },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        self.transfers.count(true, bytes.len());
+        let scale = [(1.0 / levels).to_bits(), 0, 0, 0];
+        let uniform = self.buffer_init(Some("unpack scale"), bytemuck::cast_slice(&scale), wgpu::BufferUsages::UNIFORM);
+        let view = texture.create_view(&Default::default());
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("packed upload"),
+            layout: &p.unpack_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&out.view) },
+                wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&view) },
+                wgpu::BindGroupEntry { binding: 9, resource: uniform.as_entire_binding() },
+            ],
+        });
+        // Submitted now: `out` is written before any later submission reads it.
+        let mut e = Enc::new(self);
+        e.custom_pixels("upload_unpack", &p.unpack, &bg, (w, h));
+        e.stage(texture);
+        e.submit();
+        true
     }
 
     /// Upload a (layer cache) buffer, reusing the texture while the same `Arc` is alive: static
@@ -1472,6 +1610,8 @@ impl GpuContext {
         }
         let old = self.staging.lock().ok().map(|mut s| std::mem::take(&mut *s));
         drop(old);
+        let old = self.planes.lock().ok().map(|mut s| std::mem::take(&mut *s));
+        drop(old);
         let old = self.zeros.lock().ok().map(|mut z| std::mem::take(&mut *z));
         drop(old);
     }
@@ -1550,6 +1690,8 @@ pub(crate) struct Enc<'g> {
     missing: bool,
     /// Nested comp frames shared by identical precomp instances of this frame (`cull`).
     pub(crate) shared: crate::cull::Shared,
+    /// Upload textures read by recorded dispatches, free again once submitted ([`Enc::stage`]).
+    planes: Vec<wgpu::Texture>,
 }
 
 impl Drop for Enc<'_> {
@@ -1562,6 +1704,7 @@ impl Drop for Enc<'_> {
         {
             p.close(id);
         }
+        self.g.free_planes(std::mem::take(&mut self.planes));
         if let Some(ring) = self.ring.take()
             && let Ok(mut u) = self.g.uniforms.lock()
             && u.len() < RINGS_KEPT
@@ -1621,6 +1764,7 @@ impl<'g> Enc<'g> {
             mips: Default::default(),
             missing: false,
             shared: Default::default(),
+            planes: Vec::new(),
             #[cfg(feature = "profile")]
             timestamps: None,
         }
@@ -2017,7 +2161,16 @@ impl<'g> Enc<'g> {
                 p.close(id);
             }
         }
+        self.g.free_planes(std::mem::take(&mut self.planes));
         self.pending = 0;
+    }
+
+    /// Hand back a [`GpuContext::plane_texture`] read by dispatches recorded so far: it is
+    /// reused once they are submitted (or this encoder is dropped).
+    pub(crate) fn stage(&mut self, texture: wgpu::Texture) {
+        if self.planes.try_reserve(1).is_ok() {
+            self.planes.push(texture);
+        }
     }
 
     /// Read an image back to the CPU (submits and waits). `None` where readback is impossible.
@@ -2516,6 +2669,81 @@ mod upload_budget_tests {
         assert_eq!(bytemuck::cast_slice::<_, u8>(&down.data), bytemuck::cast_slice::<_, u8>(&img.data));
         let bytes = e.read_texture(&up.texture, w, h, 16).unwrap();
         assert_eq!(bytes, bytemuck::cast_slice::<_, u8>(&img.data));
+    }
+
+    /// Packed 8/16 bpc uploads expand on the GPU to exactly the floats the CPU unpack makes
+    /// (`k as f32 * (1.0 / levels)`), edge codes included, and match the f32 upload bit for
+    /// bit; images on the grid take the packed path, others the f32 one; upload textures are
+    /// pooled.
+    #[test]
+    fn packed_uploads_match_f32_uploads() {
+        crate::tests::hold_gpu_lock();
+        let context = GpuContext::headless();
+        assert!(context.is_some() || !std::env::var("EFFECTCRAFT_REQUIRE_GPU").is_ok_and(|v| v == "1"), "required GPU unavailable");
+        let Some(g) = context else { return };
+        let (w, h) = (37u32, 19u32);
+        let n = (w * h) as usize;
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut rand = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let f32_upload = |data: &[[f32; 4]]| {
+            let img = Image { width: w, height: h, data: data.to_vec() };
+            let out = g.image(w, h);
+            g.queue.write_texture(
+                wgpu::TexelCopyTextureInfo { texture: &out.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                bytemuck::cast_slice(&img.data),
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 16), rows_per_image: Some(h) },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+            Enc::new(&g).download(&out).unwrap().data
+        };
+        let bits = |d: &[[f32; 4]]| d.iter().flatten().map(|v| v.to_bits()).collect::<Vec<u32>>();
+        for (levels, edges, max) in [(LEVELS_8, vec![0u32, 255], 255u32), (LEVELS_16, vec![0, 255, 32768, 65535], 65535)] {
+            let mut codes: Vec<[u32; 4]> = (0..n).map(|_| [0; 4].map(|_: u32| (rand() % (u64::from(max) + 1)) as u32)).collect();
+            for (i, e) in edges.iter().enumerate() {
+                codes[i] = [*e; 4];
+                codes[n - 1 - i] = [*e, 0, max, *e];
+            }
+            let inv = 1.0 / levels;
+            let floats: Vec<[f32; 4]> = codes.iter().map(|c| c.map(|k| k as f32 * inv)).collect();
+            let out = g.image(w, h);
+            let ok = if levels == LEVELS_8 {
+                let c: Vec<[u8; 4]> = codes.iter().map(|c| c.map(|k| k as u8)).collect();
+                g.upload_codes(&out, wgpu::TextureFormat::Rgba8Uint, bytemuck::cast_slice(&c), 4, levels)
+            } else {
+                let c: Vec<[u16; 4]> = codes.iter().map(|c| c.map(|k| k as u16)).collect();
+                g.upload_codes(&out, wgpu::TextureFormat::Rgba16Uint, bytemuck::cast_slice(&c), 8, levels)
+            };
+            assert!(ok);
+            let packed = Enc::new(&g).download(&out).unwrap().data;
+            assert_eq!(bits(&packed), bits(&floats), "{levels} levels: GPU expansion differs from the CPU unpack");
+            assert_eq!(bits(&packed), bits(&f32_upload(&floats)), "{levels} levels: packed upload differs from the f32 upload");
+
+            // Through `upload_image`: in-range grid images go up packed.
+            let grid: Vec<[f32; 4]> = floats.iter().map(|p| p.map(|v| v.min(1.0))).collect();
+            let before = g.transfer_stats().upload_bytes;
+            let up = g.upload_image(&Image { width: w, height: h, data: grid.clone() }).unwrap();
+            let bpp = if levels == LEVELS_8 { 4 } else { 8 };
+            assert_eq!(g.transfer_stats().upload_bytes - before, (n * bpp) as u64, "{levels} levels: not uploaded packed");
+            assert_eq!(bits(&Enc::new(&g).download(&up).unwrap().data), bits(&grid));
+        }
+        // Off the grid (32 bpc): the f32 path, unchanged.
+        let off: Vec<[f32; 4]> = (0..n).map(|i| [i as f32 * 0.001, -0.25, 1.5, f32::from_bits(rand() as u32 & 0x3f7f_ffff)]).collect();
+        let before = g.transfer_stats().upload_bytes;
+        let up = g.upload_image(&Image { width: w, height: h, data: off.clone() }).unwrap();
+        assert_eq!(g.transfer_stats().upload_bytes - before, (n * 16) as u64);
+        assert_eq!(bits(&Enc::new(&g).download(&up).unwrap().data), bits(&off));
+        // The code textures went back to the pool, one per format, and are reused.
+        let free = |f| g.planes.lock().unwrap().get(&(w, h, f)).map_or(0, Vec::len);
+        assert_eq!((free(wgpu::TextureFormat::Rgba8Uint), free(wgpu::TextureFormat::Rgba16Uint)), (1, 1));
+        let grid: Vec<[f32; 4]> = (0..n).map(|i| [(i % 256) as f32 * (1.0 / LEVELS_8); 4]).collect();
+        let up = g.upload_image(&Image { width: w, height: h, data: grid.clone() }).unwrap();
+        assert_eq!(free(wgpu::TextureFormat::Rgba8Uint), 1);
+        assert_eq!(bits(&Enc::new(&g).download(&up).unwrap().data), bits(&grid));
     }
 
     /// Every dispatch reads its own uniform ring slot, also across the automatic submit after
