@@ -93,6 +93,8 @@ mod ui_preview_align;
 mod ui_project_delete;
 #[path = "../ui_project_rows.rs"]
 mod ui_project_rows;
+#[path = "../ui_properties.rs"]
+mod ui_properties;
 #[path = "../ui_ram_preview.rs"]
 mod ui_ram_preview;
 #[path = "../ui_render_queue.rs"]

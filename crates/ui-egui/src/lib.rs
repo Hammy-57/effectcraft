@@ -330,6 +330,10 @@ pub struct EffectcraftApp {
     /// The GPU compositor on that device (None: no usable adapter → CPU only).
     pub(crate) gpu: Option<effectcraft_gpu::Gpu>,
     gpu_checked: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    gpu_startup_deferred: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    gpu_startup: Option<gpu_startup::Pending<effectcraft_gpu::Gpu>>,
     gpu_failures: Option<gpu_failure::GpuFailureBridge>,
     gpu_failure_applied: Option<bool>,
     /// The graphics device was lost and the window is closing (see `close_after_device_loss`);
@@ -429,6 +433,10 @@ impl EffectcraftApp {
             wgpu: None,
             gpu: None,
             gpu_checked: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            gpu_startup_deferred: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            gpu_startup: None,
             gpu_failures: None,
             gpu_failure_applied: None,
             device_lost_close: None,
@@ -714,6 +722,10 @@ impl EffectcraftApp {
         }
         self.gpu_failure_applied = Some(failure.presentation_lost);
         self.gpu_checked = true;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.gpu_startup = None;
+        }
         self.frames.retire_gpu();
         self.session.accel = None;
         self.session.accel_note = Some(format!("GPU preview retired: {}", failure.reason));
@@ -776,15 +788,22 @@ impl EffectcraftApp {
     /// Set up the GPU compositor (once). Desktop frame workers use their own device so their
     /// submissions cannot race egui-wgpu's surface reconfiguration during window moves/resizes.
     /// Without an adapter that runs compute shaders, everything stays on the CPU.
-    pub(crate) fn init_gpu(&mut self, frame: &eframe::Frame) {
+    pub(crate) fn init_gpu(&mut self, frame: &eframe::Frame, ctx: &egui::Context) {
         if self.gpu_checked {
             return;
         }
-        self.gpu_checked = true;
         if self.gpu_failures.as_ref().is_some_and(|bridge| bridge.failure().is_some()) {
+            self.gpu_checked = true;
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                self.gpu_startup = None;
+            }
             return;
         }
-        let Some(rs) = frame.wgpu_render_state() else { return };
+        let Some(rs) = frame.wgpu_render_state() else {
+            self.gpu_checked = true;
+            return;
+        };
         // Help ▸ System Compatibility Report names the adapter and backend the window got.
         let info = rs.adapter.get_info();
         self.session.window_adapter = Some(format!(
@@ -794,11 +813,47 @@ impl EffectcraftApp {
             info.device_type,
             if info.driver.is_empty() { String::new() } else { format!(", {} {}", info.driver, info.driver_info) }
         ));
-        // Backend validation can panic on shader compilation even when device creation
-        // succeeded. Keep the document and the egui renderer, and use CPU compositing.
-        let gpu = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compositor_gpu(&rs.adapter, rs.device.clone(), rs.queue.clone())));
+        #[cfg(not(target_arch = "wasm32"))]
+        let gpu = {
+            // Return the first UI update before launching shader compilation.
+            if !self.gpu_startup_deferred {
+                self.gpu_startup_deferred = true;
+                ctx.request_repaint();
+                return;
+            }
+            if let Some(pending) = &self.gpu_startup {
+                let Some(result) = pending.poll() else {
+                    return;
+                };
+                self.gpu_startup = None;
+                result
+            } else {
+                let (adapter, device, queue, wake) = (rs.adapter.clone(), rs.device.clone(), rs.queue.clone(), ctx.clone());
+                match gpu_startup::Pending::start(
+                    move || {
+                        let gpu = compositor_gpu(&adapter, device, queue)?;
+                        gpu.warm_pipelines()?;
+                        Ok(gpu)
+                    },
+                    move || wake.request_repaint(),
+                ) {
+                    Ok(pending) => {
+                        self.gpu_startup = Some(pending);
+                        return;
+                    }
+                    Err(reason) => Err(reason),
+                }
+            }
+        };
+        #[cfg(target_arch = "wasm32")]
+        let gpu = {
+            let _ = ctx;
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compositor_gpu(&rs.adapter, rs.device.clone(), rs.queue.clone())))
+                .unwrap_or_else(|_| Err("GPU compositor setup failed: backend panicked".into()))
+        };
+        self.gpu_checked = true;
         match gpu {
-            Ok(Ok(g)) => {
+            Ok(g) => {
                 if let Some(bridge) = &self.gpu_failures {
                     bridge.forward_to(g.context().device_failure_notifier());
                     if bridge.failure().is_some() {
@@ -811,14 +866,9 @@ impl EffectcraftApp {
                 self.gpu = Some(g);
                 self.wgpu = Some(rs.clone());
             }
-            Ok(Err(e)) => {
-                log::info!("GPU compositor unavailable: {e}");
-                self.session.accel_note = Some(format!("GPU compositor unavailable: {e}"));
-            }
-            Err(e) => {
-                let reason = e.downcast_ref::<String>().map(String::as_str).or_else(|| e.downcast_ref::<&str>().copied()).unwrap_or("backend panicked");
-                log::warn!("GPU compositor setup failed; using CPU compositing: {reason}");
-                self.session.accel_note = Some(format!("GPU compositor setup failed: {reason}"));
+            Err(reason) => {
+                log::info!("GPU compositor unavailable: {reason}");
+                self.session.accel_note = Some(format!("GPU compositor unavailable: {reason}"));
             }
         }
     }
@@ -1325,7 +1375,10 @@ impl EffectcraftApp {
                 self.stop();
                 return;
             }
-            let target = snap(audio::frame_of_sample(a.clock(), a.rate, fr).clamp(wa, wb));
+            // One clock observation for this decision: a loop wrap between target selection
+            // and scheduling would otherwise turn the next-frame delay into a whole loop.
+            let audible = a.clock();
+            let target = snap(audio::frame_of_sample(audible, a.rate, fr).clamp(wa, wb));
             if !video {
                 self.playback.audio_frame = Some(target);
             } else if self.frames.is_cached(&FrameKey { frame: target, ..series }) {
@@ -1350,7 +1403,7 @@ impl EffectcraftApp {
             // Wake when the audible sample reaches the next frame (not at the display's refresh
             // rate): a 24 fps preview rebuilds the UI 24 times a second, not 120.
             let next = fr.tick_of(target.saturating_add(step.max(1))).seconds();
-            ctx.request_repaint_after(until_next_frame(next - audio::sample_time(a.clock(), a.rate).seconds()));
+            ctx.request_repaint_after(until_next_frame(next - audio::sample_time(audible, a.rate).seconds()));
             return;
         }
         let elapsed = now - self.playback.start_wall;
@@ -1953,7 +2006,7 @@ impl eframe::App for EffectcraftApp {
             self.close_after_device_loss(ui.ctx());
             return;
         }
-        self.init_gpu(frame);
+        self.init_gpu(frame, ui.ctx());
         if !self.fonts_ready {
             ui.ctx().request_repaint();
             return;
@@ -2026,6 +2079,69 @@ fn overflows_screen(size: egui::Vec2, monitor: egui::Vec2) -> bool {
 mod playback_pacing_tests {
     use super::{PLAYBACK_MAX_WAIT, until_next_frame};
     use std::time::Duration;
+
+    #[test]
+    fn audio_loop_boundary_schedules_the_next_frame_without_an_extra_pause() {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct WrappingClock(Arc<AtomicUsize>);
+        impl audio::AudioDevice for WrappingClock {
+            fn sample_rate(&self) -> u32 {
+                48_000
+            }
+            fn start(&mut self, _: Arc<audio::AudioFeed>) -> Result<(), String> {
+                Ok(())
+            }
+            fn stop(&mut self) {}
+            fn audible_frames(&self) -> Option<u64> {
+                // Cross a one-second loop between consecutive observations.
+                Some(if self.0.fetch_add(1, Ordering::Relaxed) == 0 { 47_999 } else { 48_000 })
+            }
+        }
+        let mut session = effectcraft_engine::Session::default();
+        let cid = ItemId(session.execute("comp.new", json!({"width": 8, "height": 8, "duration": 1, "frameRate": 30})).unwrap()["comp"].as_u64().unwrap());
+        let mut app = EffectcraftApp::new(session);
+        let observations = Arc::new(AtomicUsize::new(0));
+        app.audio = Some(
+            audio::AudioPlayback::start(
+                Box::new(WrappingClock(observations.clone())),
+                app.render_source(),
+                cid,
+                Tick::ZERO,
+                Tick::ZERO,
+                Tick::from_seconds_f64(1.0),
+                true,
+                48_000,
+            )
+            .unwrap(),
+        );
+        app.playback.playing = true;
+        app.playback.fps = 30.0;
+        app.playback.plan = Some(effectcraft_engine::preview::PreviewPlan {
+            start: 0,
+            end: 29,
+            first: 0,
+            step: 1,
+            fps: 30.0,
+            looping: true,
+            cache_first: false,
+            video: false,
+            audio: true,
+            origin: Tick::ZERO,
+        });
+        let ctx = egui::Context::default();
+        for frame in 0..3 {
+            ctx.run_ui(egui::RawInput { time: Some(frame as f64 / 60.0), ..Default::default() }, |_| {}).textures_delta.clear();
+        }
+        let mut output = ctx.run_ui(egui::RawInput { time: Some(1.0), ..Default::default() }, |ui| app.advance_playback(ui.ctx(), 1.0));
+        output.textures_delta.clear();
+        assert_eq!(app.playback.audio_frame, Some(29));
+        assert!(
+            output.viewport_output.get(&egui::ViewportId::ROOT).unwrap().repaint_delay < Duration::from_millis(10),
+            "the imminent loop must not acquire a 50ms pause"
+        );
+        assert_eq!(observations.load(Ordering::Relaxed), 1);
+    }
 
     #[test]
     fn a_playing_preview_wakes_when_its_next_frame_is_due_not_every_display_refresh() {

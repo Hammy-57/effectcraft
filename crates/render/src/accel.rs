@@ -54,6 +54,17 @@ pub trait Accelerator: Send + Sync {
     /// Run a chain of supported effects on `buf`, clamping and quantising to `levels` after
     /// every effect when set (8/16 bpc). `None` = not handled.
     fn effects(&self, chain: &[FxStep], buf: &Buf, levels: Option<f32>) -> Option<Buf>;
+    /// [`Self::effects`], keeping the result's image on the accelerator under the returned
+    /// ticket (`None` = not kept): the renderer hands the ticket back to [`Self::adopt`] once
+    /// the pixels are stored unchanged in a shared buffer, or to [`Self::release`].
+    fn effects_kept(&self, chain: &[FxStep], buf: &Buf, levels: Option<f32>) -> Option<(Buf, Option<u64>)> {
+        self.effects(chain, buf, levels).map(|b| (b, None))
+    }
+    /// `buf` holds kept result `ticket`'s pixels: its compositor may draw `buf` from the kept
+    /// image (while `buf` lives) instead of uploading it again.
+    fn adopt(&self, _ticket: u64, _buf: &Arc<Buf>) {}
+    /// Forget kept result `ticket`.
+    fn release(&self, _ticket: u64) {}
     /// Rasterise and shade an Advanced 3D scene at its raster size (depth buffer, PBR, image
     /// based light, shadow maps), with the CPU rasteriser's semantics
     /// ([`three_d::adv::raster::render`]). `None` = not handled (the CPU renders it).

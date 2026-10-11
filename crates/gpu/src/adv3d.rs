@@ -26,8 +26,19 @@ pub(crate) struct Pipes {
     post: Post,
 }
 
-fn pipes(g: &GpuContext) -> &Pipes {
-    g.adv3d.get_or_init(|| Pipes::new(&g.device, g.adv3d_raster))
+fn pipes(g: &GpuContext) -> Result<&Pipes, String> {
+    g.adv3d
+        .get_or_init(|| {
+            let p = crate::context::init_resource(&g.device, "Advanced 3D pipelines", || Pipes::new(&g.device, g.adv3d_raster))?;
+            g.static_pipeline_count.fetch_add(p.post.kernels.len() as u64 + if p.raster.is_some() { 2 } else { 0 }, std::sync::atomic::Ordering::Relaxed);
+            Ok(p)
+        })
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
+pub(crate) fn warm(g: &GpuContext) -> Result<(), String> {
+    pipes(g).map(|_| ())
 }
 
 const COLOR: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
@@ -432,7 +443,7 @@ fn raster_into(e: &mut Enc, s: &Scene) -> Option<(wgpu::Texture, wgpu::Texture)>
     if bufs.iter().zip(expected_sizes).any(|(bytes, expected)| bytes.len() as u64 != expected) {
         return None;
     }
-    let p = pipes(g);
+    let p = pipes(g).ok()?;
     let Some((bgl, opaque, transparent)) = &p.raster else { return None };
     let dev = &g.device;
     let vb: Vec<u8> = s
@@ -474,6 +485,16 @@ fn raster_into(e: &mut Enc, s: &Scene) -> Option<(wgpu::Texture, wgpu::Texture)>
     let zout = tex(DEPTH_OUT, rt);
     let depth = tex(DEPTH, wgpu::TextureUsages::RENDER_ATTACHMENT);
     let (cv, zv, dv) = (color.create_view(&Default::default()), zout.create_view(&Default::default()), depth.create_view(&Default::default()));
+    #[cfg(feature = "profile")]
+    let mut batch = e.timestamps.take().or_else(|| crate::timestamps::Batch::new(g));
+    #[cfg(feature = "profile")]
+    let timestamp_writes = batch.as_mut().and_then(|b| b.mark("adv3d_raster")).map(|t| wgpu::RenderPassTimestampWrites {
+        query_set: t.query_set,
+        beginning_of_pass_write_index: t.beginning_of_pass_write_index,
+        end_of_pass_write_index: t.end_of_pass_write_index,
+    });
+    #[cfg(not(feature = "profile"))]
+    let timestamp_writes = None;
     let enc = e.encoder();
     {
         let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -497,7 +518,7 @@ fn raster_into(e: &mut Enc, s: &Scene) -> Option<(wgpu::Texture, wgpu::Texture)>
                 depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Store }),
                 stencil_ops: None,
             }),
-            timestamp_writes: None,
+            timestamp_writes,
             occlusion_query_set: None,
             multiview_mask: None,
         });
@@ -512,6 +533,10 @@ fn raster_into(e: &mut Enc, s: &Scene) -> Option<(wgpu::Texture, wgpu::Texture)>
             pass.set_pipeline(transparent);
             pass.draw_indexed(s.opaque_count..n, 0, 0..1);
         }
+    }
+    #[cfg(feature = "profile")]
+    {
+        e.timestamps = batch;
     }
     Some((color, zout))
 }
@@ -735,7 +760,14 @@ fn params(u0: [u32; 4], f0: [f32; 4]) -> Vec<u8> {
 
 fn dispatch(e: &mut Enc, kernel: &str, u0: [u32; 4], f0: [f32; 4], b: Binds, groups: (u32, u32)) {
     let g = e.g;
-    let post = &pipes(g).post;
+    let pipes = match pipes(g) {
+        Ok(p) => p,
+        Err(reason) => {
+            g.device_failure_notifier()(reason);
+            return;
+        }
+    };
+    let post = &pipes.post;
     let Some((_, pipe)) = post.kernels.iter().find(|(k, _)| *k == kernel) else { return };
     let ub = g.buffer_init(None, &params(u0, f0), wgpu::BufferUsages::UNIFORM);
     let mut entries = vec![
@@ -748,11 +780,22 @@ fn dispatch(e: &mut Enc, kernel: &str, u0: [u32; 4], f0: [f32; 4], b: Binds, gro
     }
     entries.push(wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(b.out.unwrap_or(&post.dummy_out)) });
     let bg = g.device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some(kernel), layout: &post.bgl, entries: &entries });
+    #[cfg(feature = "profile")]
+    let mut batch = e.timestamps.take().or_else(|| crate::timestamps::Batch::new(g));
+    #[cfg(feature = "profile")]
+    let timestamp_writes = batch.as_mut().and_then(|b| b.mark(kernel));
+    #[cfg(not(feature = "profile"))]
+    let timestamp_writes = None;
     let enc = e.encoder();
-    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(kernel), timestamp_writes: None });
+    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(kernel), timestamp_writes });
     pass.set_pipeline(pipe);
     pass.set_bind_group(0, &bg, &[]);
     pass.dispatch_workgroups(groups.0.max(1), groups.1.max(1), 1);
+    drop(pass);
+    #[cfg(feature = "profile")]
+    {
+        e.timestamps = batch;
+    }
 }
 
 fn pixel_groups(w: u32, h: u32) -> (u32, u32) {

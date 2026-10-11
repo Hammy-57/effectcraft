@@ -82,6 +82,8 @@ mod fx_warp;
 mod ops;
 mod particles;
 mod readback;
+#[cfg(feature = "profile")]
+mod timestamps;
 mod walk;
 
 use std::sync::Arc;
@@ -117,6 +119,20 @@ pub struct DisplayFrame {
 }
 
 impl Gpu {
+    /// Compile optional static pipelines through the same single-flight cells used by frames.
+    /// Call from a native startup worker; dynamic effect sequences compile separately.
+    pub fn warm_pipelines(&self) -> Result<(), String> {
+        self.ctx.check_health()?;
+        crate::adv3d::warm(&self.ctx)?;
+        crate::particles::warm(&self.ctx)?;
+        self.ctx.check_health()
+    }
+
+    /// Successfully constructed static pipelines (dynamic sequence specializations excluded).
+    pub fn static_pipeline_count(&self) -> u64 {
+        self.ctx.static_pipeline_count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// On a device of its own (CLI, tests, benchmarks); `None` without a usable adapter.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn headless() -> Option<Gpu> {
@@ -193,6 +209,7 @@ impl Gpu {
     /// Render a top-level comp frame and leave it on the GPU as a display texture (no
     /// readback unless a CPU fallback step needs one). `None` = render on the CPU.
     pub fn render_display(&self, r: &Renderer, comp: ItemId, t: Tick) -> Option<DisplayFrame> {
+        let _profile = effectcraft_render::profile::span("display_prepare");
         self.ctx.check_health().map_err(|e| log::error!("gpu display: {e}")).ok()?;
         let mut e = Enc::new(&self.ctx);
         let img = walk::render(&mut e, r, comp, t)?;
@@ -231,7 +248,9 @@ impl Gpu {
         }
         let mut e = Enc::new(&self.ctx);
         let img = walk::render(&mut e, r, comp, t)?;
-        e.download(&img)
+        let image = e.download(&img);
+        self.ctx.check_health().ok()?;
+        image
     }
 
     /// [`Gpu::render`] with deferred readbacks: the frame's readback is keyed by comp, time and
@@ -358,7 +377,21 @@ impl Accelerator for Gpu {
 
     fn effects(&self, chain: &[FxStep], buf: &Buf, levels: Option<f32>) -> Option<Buf> {
         self.ctx.check_health().ok()?;
-        effects::run_chain(&mut Enc::new(&self.ctx), chain, buf, levels)
+        effects::run_chain(&mut Enc::new(&self.ctx), chain, buf, levels).map(|(b, _)| b)
+    }
+
+    fn effects_kept(&self, chain: &[FxStep], buf: &Buf, levels: Option<f32>) -> Option<(Buf, Option<u64>)> {
+        self.ctx.check_health().ok()?;
+        let (b, img) = effects::run_chain(&mut Enc::new(&self.ctx), chain, buf, levels)?;
+        Some((b, img.and_then(|img| self.ctx.keep(img))))
+    }
+
+    fn adopt(&self, ticket: u64, buf: &Arc<Buf>) {
+        self.ctx.adopt(ticket, buf);
+    }
+
+    fn release(&self, ticket: u64) {
+        self.ctx.release(ticket);
     }
 
     fn raster_3d(&self, scene: &effectcraft_render::three_d::adv::Scene) -> Option<effectcraft_render::three_d::adv::Target> {
@@ -474,3 +507,5 @@ mod tests_fx_warp;
 mod tests_init;
 #[cfg(test)]
 mod tests_particles;
+#[cfg(test)]
+mod tests_warmup;

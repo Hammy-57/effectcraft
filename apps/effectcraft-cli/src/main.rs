@@ -156,6 +156,7 @@ options: --project F.ecproj | --demo | --empty   --save | --save-as F   --bridge
 
 /// Options that take a value.
 const VALUED: &[&str] = &[
+    "--trace",
     "--n",
     "--play",
     "--layers",
@@ -215,6 +216,8 @@ const VALUED: &[&str] = &[
 
 /// Options without a value. Any other `--option` is a usage error.
 const FLAGS: &[&str] = &[
+    "--rt-profile",
+    "--rt-warmup",
     "--json",
     "--save",
     "--demo",
@@ -1100,6 +1103,9 @@ fn list_commands_cmd(args: &Args, json_out: bool) -> Result<(), Failure> {
 
 /// `bench`: time one frame N times without the layer cache (per-layer and per-effect breakdown),
 /// and optionally `--play N` consecutive frames with and without the cache.
+#[cfg(feature = "profile")]
+mod rt_bench;
+
 fn bench_cmd(args: &Args) -> Result<(), Failure> {
     if args.flag("--ops") {
         return bench_ops(args);
@@ -1112,6 +1118,12 @@ fn bench_cmd(args: &Args) -> Result<(), Failure> {
     .map_err(|e| Failure::Error(e.to_string()))?;
     if let Some(c) = args.opt("--comp") {
         s.execute("comp.open", json!({"comp": c})).map_err(|e| Failure::Error(e.to_string()))?;
+    }
+    if args.flag("--rt-profile") {
+        #[cfg(feature = "profile")]
+        return rt_bench::run(&s, args);
+        #[cfg(not(feature = "profile"))]
+        return Err(Failure::Error("--rt-profile requires a CLI built with --features profile".into()));
     }
     if args.flag("--gpu") {
         return bench_gpu(&s, args);

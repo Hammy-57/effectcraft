@@ -1095,6 +1095,7 @@ impl Inner {
     ///
     /// `detached`: a movie not open already is opened for this frame only (thumbnails).
     fn decode(&self, loc: &Loc, footage: &Footage, detached: bool) -> Result<Pixels> {
+        let _profile = effectcraft_render::profile::span("decode");
         // A reduced-resolution preview: the full frame (cached, or decoded and not kept)
         // resampled exactly as the renderer resamples it.
         if let (Some(p), Some([rw, rh])) = (loc.preview, loc.key.preview) {

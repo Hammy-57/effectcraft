@@ -9,6 +9,10 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+profile = ["effectcraft-render/profile"]
+
 [dependencies]
 effectcraft-time = { workspace = true }
 effectcraft-geom = { workspace = true }

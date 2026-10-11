@@ -64,6 +64,7 @@ const ROWS: usize = 8;
 /// Convert a FilmCraft frame to an [`Image`], reusing `buf`'s allocation when it is large enough
 /// (every pixel is overwritten, so a recycled frame's contents do not matter).
 pub(crate) fn frame_to_image_in(f: &VideoFrame, op: AlphaOp, mut buf: Vec<Px>) -> Image {
+    let _profile = effectcraft_render::profile::span("yuv_to_rgb");
     let (w, h) = (f.width as usize, f.height as usize);
     if buf.len() != w * h {
         buf = vec![[0.0; 4]; w * h];
@@ -79,6 +80,7 @@ pub(crate) fn frame_to_image_in(f: &VideoFrame, op: AlphaOp, mut buf: Vec<Px>) -
 /// Rows `y0..` of `f` (as many whole rows as `out` holds) as compositor pixels: the pixels of
 /// [`frame_to_image`], a band at a time.
 pub(crate) fn frame_rows(f: &VideoFrame, op: AlphaOp, y0: usize, out: &mut [Px]) {
+    let _profile = effectcraft_render::profile::span("pixel_conversion_rows");
     let (w, h) = (f.width as usize, f.height as usize);
     if w == 0 {
         return;

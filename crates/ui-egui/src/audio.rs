@@ -8,8 +8,9 @@
 //! pushes it into an [`AudioFeed`]; the device callback pulls from the feed.
 //!
 //! **A/V sync:** while audio plays, the audio clock drives playback. The clock is the number of
-//! sample frames the device has actually consumed (underruns do not advance it) minus the
-//! device's output latency, mapped through the work-area loop ([`clock_sample`]); the viewer
+//! real sample frames audible at the device (native playback timestamps interpolate within
+//! submitted buffers; other hosts use consumed minus latency), mapped through the work-area
+//! loop ([`clock_sample`]). Underrun silence does not advance it; the viewer
 //! shows the comp frame at that sample ([`frame_of_sample`]), dropping video frames rather
 //! than drifting.
 //!
@@ -39,6 +40,12 @@ pub trait AudioDevice: Send {
     /// Output latency in sample frames (device buffering), for A/V sync.
     fn latency_frames(&self) -> u64 {
         0
+    }
+    /// Real sample frames audible now, before composition looping. Native devices can use
+    /// playback timestamps to interpolate within submitted buffers instead of stepping once
+    /// per callback. `None` keeps the consumed-minus-latency clock for other hosts.
+    fn audible_frames(&self) -> Option<u64> {
+        None
     }
     /// Called every UI frame while playing: devices without an audio thread of their own (Web
     /// Audio) move queued samples to the output here.
@@ -89,9 +96,11 @@ impl AudioFeed {
                 pk[i & 1] = pk[i & 1].max(s.abs());
             }
             real = n;
+            // Publish consumption before an empty queue becomes visible to finished(): the
+            // last hardware buffer must not be mistaken for already drained audio.
+            self.consumed.fetch_add((real / 2) as u64, Ordering::Relaxed);
         }
         out[real..].iter_mut().for_each(|o| *o = 0.0);
-        self.consumed.fetch_add((real / 2) as u64, Ordering::Relaxed);
         for (c, v) in pk.into_iter().enumerate() {
             // Rust 1.99 renamed `fetch_update` to `try_update`; keep the old name while the
             // workspace supports Rust 1.95 (`rust-version`).
@@ -268,11 +277,16 @@ impl AudioPlayback {
 
     /// The comp sample index audible now.
     pub fn clock(&self) -> i64 {
-        clock_sample(&self.span, self.feed.consumed(), self.device.latency_frames())
+        match self.device.audible_frames() {
+            Some(played) => clock_sample(&self.span, played, 0),
+            None => clock_sample(&self.span, self.feed.consumed(), self.device.latency_frames()),
+        }
     }
 
     pub fn finished(&self) -> bool {
-        self.feed.finished()
+        // Consumed means submitted to the device, not heard. Let its final real samples drain
+        // before stopping a non-looping preview (and cutting the hardware stream).
+        self.feed.finished() && self.device.audible_frames().is_none_or(|played| played >= self.feed.consumed())
     }
 
     pub fn stop(&mut self) {
@@ -457,6 +471,42 @@ impl Meter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_audible_cursor_drives_preview_and_final_buffer_drain() {
+        struct Timestamped(Arc<AtomicU64>);
+        impl AudioDevice for Timestamped {
+            fn sample_rate(&self) -> u32 {
+                48_000
+            }
+            fn start(&mut self, _: Arc<AudioFeed>) -> Result<(), String> {
+                Ok(())
+            }
+            fn stop(&mut self) {}
+            fn audible_frames(&self) -> Option<u64> {
+                Some(self.0.load(Ordering::Relaxed))
+            }
+        }
+        let heard = Arc::new(AtomicU64::new(1600));
+        let feed = Arc::new(AudioFeed::default());
+        feed.consumed.store(4096, Ordering::Relaxed);
+        feed.finished.store(true, Ordering::Relaxed);
+        let mut playback = AudioPlayback {
+            feed,
+            device: Box::new(Timestamped(heard.clone())),
+            stop: Arc::new(AtomicBool::new(false)),
+            thread: None,
+            feeder: None,
+            rate: 48_000,
+            span: PlaySpan { start: 96_000, wa: 48_000, wb: 144_000, looping: false },
+        };
+        assert_eq!(playback.clock(), 97_600, "submitted samples do not jump the audible cursor");
+        assert!(!playback.finished(), "the final hardware buffer is still playing");
+        heard.store(4096, Ordering::Relaxed);
+        assert!(playback.finished());
+        playback.span = PlaySpan { start: 0, wa: 0, wb: 3200, looping: true };
+        assert_eq!(playback.clock(), 896, "sample interpolation still uses the existing loop mapping");
+    }
 
     #[test]
     fn clock_follows_consumed_frames_and_loops() {

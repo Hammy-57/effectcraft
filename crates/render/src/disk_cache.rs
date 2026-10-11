@@ -16,7 +16,9 @@
 //! * Safe concurrent access: writes go to a unique temporary file that is renamed into place
 //!   (atomic on every desktop OS), so readers in this or another process never see a partial
 //!   entry; a missing or damaged file is just a miss. Writes run on a background thread with a
-//!   bounded queue (a full queue drops the write rather than stalling rendering).
+//!   bounded queue (a full queue drops the write rather than stalling rendering). Frames are
+//!   queued uncompressed (shared with the caller, no copy) and compressed on that thread, so a
+//!   frame worker spends no time on them.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -32,9 +34,9 @@ const MAGIC: &[u8; 4] = b"ECDC";
 /// Pending writes before new ones are dropped.
 #[cfg(not(target_arch = "wasm32"))]
 const QUEUE_LIMIT: usize = 64;
-/// Bytes of pending (compressed) writes before new ones are dropped: a 4K `f32` layer can
-/// compress to tens of MB, so 64 of them could hold gigabytes. A single larger write still
-/// goes when nothing else is pending.
+/// Bytes of pending writes before new ones are dropped (compressed layer payloads, uncompressed
+/// frames): a 4K `f32` layer can compress to tens of MB, so 64 of them could hold gigabytes. A
+/// single larger write still goes when nothing else is pending.
 #[cfg(not(target_arch = "wasm32"))]
 const QUEUE_BYTES: usize = 256 << 20;
 
@@ -210,9 +212,27 @@ impl LayerPrefetch {
     }
 }
 
+/// Frame pixels handed to [`DiskCache::put_frame`]: owned or shared with the caller (an `Arc`
+/// of the RAM cache's frame), so queueing a frame copies nothing.
+pub type FrameBytes = Box<dyn AsRef<[u8]> + Send>;
+
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 enum Job {
+    /// An encoded payload.
     Write(Kind, u128, Vec<u8>),
+    /// A frame to encode on the writer thread (key, width, height, 8-bit premultiplied RGBA).
+    Frame(u128, u32, u32, FrameBytes),
+}
+
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+impl Job {
+    /// Bytes the job counts against [`QUEUE_BYTES`] while queued.
+    fn bytes(&self) -> usize {
+        match self {
+            Job::Write(_, _, p) => p.len(),
+            Job::Frame(_, _, _, rgba) => (**rgba).as_ref().len(),
+        }
+    }
 }
 
 struct Queue {
@@ -495,22 +515,36 @@ impl DiskCache {
         self.changed();
     }
 
-    fn enqueue(&self, kind: Kind, key: u128, payload: Vec<u8>) {
+    fn enqueue(&self, job: Job) {
         #[cfg(target_arch = "wasm32")]
         {
-            self.write_now(kind, key, &payload);
+            self.run(job);
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
             let (m, cv) = &*self.queue;
             let Ok(mut q) = m.lock() else { return };
-            if q.full(payload.len()) {
+            let bytes = job.bytes();
+            if q.full(bytes) {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
                 return;
             }
-            q.bytes += payload.len();
-            q.jobs.push_back(Job::Write(kind, key, payload));
+            q.bytes += bytes;
+            q.jobs.push_back(job);
             cv.notify_all();
+        }
+    }
+
+    /// Carry out a queued write (on the writer thread).
+    fn run(&self, job: Job) {
+        match job {
+            Job::Write(kind, key, payload) => self.write_now(kind, key, &payload),
+            Job::Frame(key, w, h, rgba) => {
+                // Queued twice, or written by another instance meanwhile: skip the compression.
+                if !self.contains(Kind::Frame, key) {
+                    self.write_now(Kind::Frame, key, &encode_frame(w, h, (*rgba).as_ref()));
+                }
+            }
         }
     }
 
@@ -566,12 +600,15 @@ impl DiskCache {
         decode_frame(&p)
     }
 
-    /// Queue a frame for writing (8-bit premultiplied RGBA, `width * height * 4` bytes).
-    pub fn put_frame(&self, key: u128, width: u32, height: u32, rgba: &[u8]) {
-        if self.contains(Kind::Frame, key) || rgba.len() != width as usize * height as usize * 4 {
+    /// Queue a frame for writing (8-bit premultiplied RGBA, `width * height * 4` bytes). The
+    /// pixels are taken as they are (pass an `Arc`-backed wrapper to share them without a copy)
+    /// and compressed on the writer thread: the caller returns at once.
+    pub fn put_frame(&self, key: u128, width: u32, height: u32, rgba: impl AsRef<[u8]> + Send + 'static) {
+        let n = rgba.as_ref().len();
+        if self.contains(Kind::Frame, key) || Some(n) != (width as usize).checked_mul(height as usize).and_then(|p| p.checked_mul(4)) {
             return;
         }
-        self.enqueue(Kind::Frame, key, encode_frame(width, height, rgba));
+        self.enqueue(Job::Frame(key, width, height, Box::new(rgba)));
     }
 
     pub fn get_layer(&self, key: u128) -> Option<Buf> {
@@ -584,7 +621,7 @@ impl DiskCache {
         if self.contains(Kind::Layer, key) || self.queue_full() {
             return;
         }
-        self.enqueue(Kind::Layer, key, encode_layer(buf));
+        self.enqueue(Job::Write(Kind::Layer, key, encode_layer(buf)));
     }
 
     /// The write queue has no room (checked before encoding a layer, which costs a pass over
@@ -621,8 +658,7 @@ fn writer(dc: std::sync::Weak<DiskCache>, q: Arc<(Mutex<Queue>, Condvar)>) {
             let Ok(mut g) = m.lock() else { return };
             loop {
                 if let Some(j) = g.jobs.pop_front() {
-                    let Job::Write(_, _, p) = &j;
-                    g.bytes = g.bytes.saturating_sub(p.len());
+                    g.bytes = g.bytes.saturating_sub(j.bytes());
                     g.busy = true;
                     break j;
                 }
@@ -636,9 +672,7 @@ fn writer(dc: std::sync::Weak<DiskCache>, q: Arc<(Mutex<Queue>, Condvar)>) {
             }
         };
         let Some(cache) = dc.upgrade() else { return };
-        match job {
-            Job::Write(kind, key, payload) => cache.write_now(kind, key, &payload),
-        }
+        cache.run(job);
         drop(cache);
         if let Ok(mut g) = m.lock() {
             g.busy = false;
@@ -1070,6 +1104,41 @@ mod tests {
         assert!(q.full(0), "count limit");
     }
 
+    /// A queued frame counts its uncompressed bytes against the byte budget.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn queued_frames_count_uncompressed_bytes() {
+        let job = Job::Frame(1, 64, 32, Box::new(vec![0u8; 64 * 32 * 4]));
+        assert_eq!(job.bytes(), 64 * 32 * 4);
+        assert_eq!(Job::Write(Kind::Layer, 1, vec![0; 10]).bytes(), 10);
+    }
+
+    /// Frames shared with the caller (an `Arc`, as the viewer's frame cache hands them over) are
+    /// compressed on the writer thread and read back exactly; a wrong size is not queued.
+    #[test]
+    fn shared_frames_are_written_by_the_writer() {
+        struct Shared(Arc<Vec<u8>>);
+        impl AsRef<[u8]> for Shared {
+            fn as_ref(&self) -> &[u8] {
+                &self.0
+            }
+        }
+        let dir = tmpdir("shared");
+        let dc = DiskCache::open(&dir, 1 << 30).unwrap();
+        let rgba: Arc<Vec<u8>> = Arc::new((0..64 * 48 * 4).map(|i| (i * 7 % 253) as u8).collect());
+        dc.put_frame(3, 64, 48, Shared(rgba.clone()));
+        dc.put_frame(4, 64, 47, Shared(rgba.clone()));
+        dc.flush();
+        assert_eq!(dc.get_frame(3).unwrap(), Frame8 { width: 64, height: 48, rgba: (*rgba).clone() });
+        assert!(dc.get_frame(4).is_none());
+        assert_eq!(Arc::strong_count(&rgba), 1, "the writer released the frame");
+        // Already on disk: not queued again.
+        dc.put_frame(3, 64, 48, Shared(rgba.clone()));
+        dc.flush();
+        assert_eq!(dc.stats().writes, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A comp with two solid layers.
     fn keyed_project() -> (effectcraft_project::Project, effectcraft_project::ItemId) {
         use effectcraft_project::*;
@@ -1179,7 +1248,7 @@ mod tests {
         assert_eq!(back.img, b.img);
         assert_eq!((back.offset, back.scale), (b.offset, b.scale));
         let rgba: Vec<u8> = (0..20 * 10 * 4).map(|i| (i % 251) as u8).collect();
-        dc.put_frame(7, 20, 10, &rgba);
+        dc.put_frame(7, 20, 10, rgba.clone());
         dc.flush();
         assert_eq!(dc.get_frame(7).unwrap().rgba, rgba);
         let st = dc.stats();
