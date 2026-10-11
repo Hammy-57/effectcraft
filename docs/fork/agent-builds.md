@@ -84,7 +84,11 @@ untouched), cherry-picks the commits with `-x`, drops the fork-only paths in
 
 - **Title:** upstream's style, `fix(scope): …`, `perf(scope): …`, `feat(scope): …` (for example
   `fix(render-queue): honor height-only locked resize edits`), not the fork's task ids.
-- **One topic per PR.** Several commits of one task are one PR; two unrelated fixes are two.
+- **One theme per PR, and not too small** (Elias, 11 October 2026: no flood of tiny PRs). A PR
+  covers one area and one theme, aiming for about 1,500–4,000 changed lines. One small fix on its
+  own is too small: if a queued branch with the same theme has no PR yet, add your commits to it
+  with `--update` instead of queueing a new slug, and widen its title and body to match. Two
+  unrelated areas are still two PRs.
 - **Body:** What / Why / How tested. Pass `--body-file` when you can; without it the body is built
   from the commit messages, with a "How tested" placeholder listing their test notes.
 - **Builds on fork work that isn't upstream yet:** a cherry-pick that conflicts stops with nothing
