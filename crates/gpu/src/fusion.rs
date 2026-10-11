@@ -9,7 +9,19 @@ const MAX_PROGRAMS: usize = 32;
 const WORDS: usize = 64;
 const MAX_DATA: usize = 1 << 20;
 #[derive(Default)]
-pub(crate) struct Pipelines(Mutex<HashMap<Vec<u32>, Option<wgpu::ComputePipeline>>>);
+pub(crate) struct Pipelines {
+    cache: Mutex<HashMap<Vec<u32>, Option<wgpu::ComputePipeline>>>,
+    created: std::sync::atomic::AtomicU64,
+    attempted: std::sync::atomic::AtomicU64,
+}
+impl Pipelines {
+    pub(crate) fn attempted(&self) -> u64 {
+        self.attempted.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub(crate) fn created(&self) -> u64 {
+        self.created.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
 
 pub(crate) fn enabled() -> bool {
     #[cfg(feature = "profile")]
@@ -121,7 +133,7 @@ fn colour_chain(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 impl Pipelines {
     fn get(&self, g: &GpuContext, ids: &[u32]) -> Option<wgpu::ComputePipeline> {
-        let mut cache = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(p) = cache.get(ids) {
             return p.clone();
         }
@@ -129,6 +141,8 @@ impl Pipelines {
         if cache.len() >= MAX_PROGRAMS {
             return None;
         }
+        // Includes source/module/layout preparation, not just the backend API call.
+        self.attempted.store(self.attempted().saturating_add(1), std::sync::atomic::Ordering::Relaxed);
         let compile = || -> Result<wgpu::ComputePipeline, String> {
             let source = source(ids).ok_or_else(|| "unsupported colour fusion opcode".to_string())?;
             let module = init_resource(&g.device, "colour chain module", || {
@@ -153,9 +167,35 @@ impl Pipelines {
             })
         };
         let result = compile().map_err(|error| log::warn!("GPU colour fusion unavailable; using separate passes: {error}")).ok();
+        if result.is_some() {
+            // Compilation is serialized by the cache mutex; readers only load this counter.
+            self.created.store(self.created().saturating_add(1), std::sync::atomic::Ordering::Relaxed);
+        }
         cache.insert(ids.to_vec(), result.clone());
         result
     }
+}
+
+/// Prepare the same prefixes used by apply_chain; failed program construction or
+/// compilation advances one effect, allowing a later eligible suffix.
+pub(crate) fn warm(g: &GpuContext, steps: &[FxStep]) -> (usize, usize) {
+    if !enabled() {
+        return (0, steps.len());
+    }
+    let mut remaining = steps;
+    let (mut ready, mut declined) = (0, 0);
+    while let Some((_, rest)) = remaining.split_first() {
+        if let Some((ids, _)) = program(remaining)
+            && g.fusion.get(g, &ids).is_some()
+        {
+            ready += 1;
+            remaining = remaining.get(ids.len()..).unwrap_or_default();
+        } else {
+            declined += 1;
+            remaining = rest;
+        }
+    }
+    (ready, declined)
 }
 
 pub(crate) fn apply(e: &mut Enc, steps: &[FxStep], input: &GpuImage, levels: Option<f32>) -> Option<(GpuImage, usize)> {
@@ -216,6 +256,18 @@ mod tests {
         }
     }
     #[test]
+    fn creation_count_survives_cache_retirement() {
+        let pipelines = Pipelines::default();
+        pipelines.created.store(33, std::sync::atomic::Ordering::Relaxed);
+        let mut cache = pipelines.cache.lock().unwrap();
+        for i in 0..MAX_PROGRAMS {
+            cache.insert(vec![i as u32], None);
+        }
+        assert_eq!(pipelines.created(), 33);
+        cache.clear();
+        assert_eq!(pipelines.created(), 33, "retiring entries must not erase historical creations");
+    }
+    #[test]
     fn colour_fusion_program_bounds_and_boundaries() {
         assert!(source(&[4, 999]).is_none());
         assert!(source(&[]).is_none());
@@ -234,6 +286,11 @@ mod tests {
         let mut channels = params();
         channels[0].values.insert("redGamma".into(), Value::Scalar(1.5));
         assert!(program(&steps(&channels)).is_none(), "channel Levels remains its exact separate kernel");
+        assert_eq!(program(&steps(&channels)[1..]).unwrap().0, vec![8, 1, 5], "rejected prefix leaves a compilable suffix");
+        let long: Vec<_> = p.iter().cycle().take(68).cloned().collect();
+        let long_steps = steps(&long);
+        assert_eq!(program(&long_steps[32..]).unwrap().0.len(), 32);
+        assert_eq!(program(&long_steps[64..]).unwrap().0.len(), 4);
     }
     #[test]
     fn colour_fusion_matches_cpu_and_separate_passes() {

@@ -128,6 +128,40 @@ pub trait FxTarget {
 /// Hooks for accelerated compositors (`effectcraft-gpu`): the pieces of the CPU walk they reuse
 /// or fall back to. The CPU compositor itself is [`Renderer::comp_frame_cpu`].
 impl<'a> Renderer<'a> {
+    /// Conservative source-free preflight guard. Expressions can call sampleImage,
+    /// so a planning pass declines them rather than evaluating a different host.
+    pub fn effect_plan_safe(layer: &Layer, max_nodes: usize) -> bool {
+        fn walk(group: &effectcraft_project::PropGroup, left: &mut usize, depth: usize) -> bool {
+            if depth > 32 || group.children.len() > *left { return false; }
+            *left -= group.children.len();
+            group.children.iter().all(|node| match node {
+                effectcraft_project::Node::Prop(p) => !p.has_expression(),
+                effectcraft_project::Node::Group(g) => walk(g, left, depth + 1),
+            })
+        }
+        walk(&layer.props, &mut max_nodes.min(4096), 0)
+    }
+
+    /// Visit evaluated GPU runs without executing pixel closures. The effect limit
+    /// is checked before run_effect_stack collects its stack or parameters.
+    /// Bounds use project metadata; expression-bearing layers are declined.
+    pub fn visit_gpu_effect_runs(&self, ctx: &EvalCtx, layer: &Layer, max_effects: usize, visitor: &mut dyn FnMut(&[FxStep])) -> bool {
+        let limit = max_effects.min(256);
+        if ctx.expr.is_some()
+            || !Self::effect_plan_safe(layer, 4096) || layer.effects().is_some_and(|g| g.groups().take(limit.saturating_add(1)).count() > limit) {
+            return false;
+        }
+        struct Plan<'v>(&'v mut dyn FnMut(&[FxStep]));
+        impl FxTarget for Plan<'_> {
+            fn gpu(&mut self, steps: &[FxStep]) -> bool { (self.0)(steps); true }
+            fn cpu(&mut self, _: &mut dyn FnMut(Buf) -> Buf) {}
+            fn shift(&mut self, _: [f64; 2]) {}
+        }
+        let adjustment = layer.switches.adjustment;
+        self.run_effect_stack(ctx, layer, adjustment, limit, None, fx_origin(ctx, layer, adjustment), &mut Plan(visitor));
+        true
+    }
+
     /// The project's colour pipeline.
     pub fn pipe(&self) -> color::Pipe {
         self.pipe

@@ -60,6 +60,8 @@ mod context;
 pub mod deferred;
 mod effects;
 mod fusion;
+mod warmup;
+pub use warmup::WarmupReport;
 /// Whether per-pixel effect fusion is enabled (profiling builds support an A/B override).
 pub fn color_fusion_enabled() -> bool {
     fusion::enabled()
@@ -136,6 +138,18 @@ impl Gpu {
     /// Successfully constructed static pipelines (dynamic sequence specializations excluded).
     pub fn static_pipeline_count(&self) -> u64 {
         self.ctx.static_pipeline_count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Dynamic sequence compilation attempts, including source/module/layout preparation.
+    /// Cached failures and capacity denials do not start another attempt.
+    pub fn fusion_compile_attempts(&self) -> u64 {
+        self.ctx.fusion.attempted()
+    }
+
+    /// Successfully created pipelines, including dynamic effect-sequence specializations.
+    /// Failed compilations are excluded; cached failures never count as a created pipeline.
+    pub fn pipeline_count(&self) -> u64 {
+        self.static_pipeline_count().saturating_add(self.ctx.fusion.created())
     }
 
     /// On a device of its own (CLI, tests, benchmarks); `None` without a usable adapter.

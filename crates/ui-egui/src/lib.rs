@@ -339,6 +339,10 @@ pub struct EffectcraftApp {
     gpu_startup_deferred: bool,
     #[cfg(not(target_arch = "wasm32"))]
     gpu_startup: Option<gpu_startup::Pending<effectcraft_gpu::Gpu>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    gpu_prewarm: gpu_startup::Latest<(u64, effectcraft_project::ItemId)>,
+    #[cfg(not(target_arch = "wasm32"))]
+    gpu_startup_key: Option<(u64, effectcraft_project::ItemId)>,
     gpu_failures: Option<gpu_failure::GpuFailureBridge>,
     gpu_failure_applied: Option<bool>,
     /// The graphics device was lost and the window is closing (see `close_after_device_loss`);
@@ -443,6 +447,10 @@ impl EffectcraftApp {
             gpu_startup_deferred: false,
             #[cfg(not(target_arch = "wasm32"))]
             gpu_startup: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            gpu_prewarm: Default::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            gpu_startup_key: None,
             gpu_failures: None,
             gpu_failure_applied: None,
             device_lost_close: None,
@@ -802,6 +810,8 @@ impl EffectcraftApp {
     /// Without an adapter that runs compute shaders, everything stays on the CPU.
     pub(crate) fn init_gpu(&mut self, frame: &eframe::Frame, ctx: &egui::Context) {
         if self.gpu_checked {
+            #[cfg(not(target_arch = "wasm32"))]
+            self.prewarm_gpu_project(ctx);
             return;
         }
         if self.gpu_failures.as_ref().is_some_and(|bridge| bridge.failure().is_some()) {
@@ -841,10 +851,17 @@ impl EffectcraftApp {
                 result
             } else {
                 let (adapter, device, queue, wake) = (rs.adapter.clone(), rs.device.clone(), rs.queue.clone(), ctx.clone());
+                let project = self.session.freeze_preview_project();
+                let comp = self.session.active_comp_id();
+                self.gpu_startup_key = comp.map(|comp| (self.session.revision, comp));
+                let time = self.session.time();
                 match gpu_startup::Pending::start(
                     move || {
                         let gpu = compositor_gpu(&adapter, device, queue)?;
                         gpu.warm_pipelines()?;
+                        if let Some(comp) = comp {
+                            log::debug!("GPU startup project warmup: {:?}", gpu.warm_project(&project, comp, time));
+                        }
                         Ok(gpu)
                     },
                     move || wake.request_repaint(),
@@ -876,6 +893,10 @@ impl EffectcraftApp {
                 g.context().set_cache_budget(self.session.prefs.cache_budgets(self.session.sys_memory).layer);
                 self.session.accel = Some(Arc::new(g.clone()));
                 self.gpu = Some(g);
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    self.gpu_prewarm = gpu_startup::Latest::completed(self.gpu_startup_key.take());
+                }
                 self.wgpu = Some(rs.clone());
             }
             Err(reason) => {
@@ -883,6 +904,33 @@ impl EffectcraftApp {
                 self.session.accel_note = Some(format!("GPU compositor unavailable: {reason}"));
             }
         }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn prewarm_gpu_project(&mut self, ctx: &egui::Context) {
+        if self.gpu_failures.as_ref().is_some_and(|bridge| bridge.failure().is_some()) {
+            return;
+        }
+        let (Some(gpu), Some(comp)) = (self.gpu.clone(), self.session.active_comp_id()) else { return };
+        if gpu.context().check_health().is_err() {
+            return;
+        }
+        // One captured time per revision/composition, not every future animation sequence.
+        let key = (self.session.revision, comp);
+        if !self.gpu_prewarm.needs(&key) {
+            return;
+        }
+        let project = self.session.freeze_preview_project();
+        let time = self.session.time();
+        let wake = ctx.clone();
+        self.gpu_prewarm.request(
+            key,
+            move || {
+                log::debug!("GPU project warmup: {:?}", gpu.warm_project(&project, comp, time));
+                Ok(())
+            },
+            move || wake.request_repaint(),
+        );
     }
 
     /// The viewer shows a frame composited on the GPU (drawn from its wgpu texture).
