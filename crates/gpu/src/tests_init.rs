@@ -140,6 +140,10 @@ fn initialization_unwind_drains_all_scopes_before_the_next_operation() {
 /// seconds and then failing (#243). Skips where there is no OpenGL adapter.
 #[test]
 fn opengl_adapters_get_cpu_compositing_at_once() {
+    // Builds without wgpu's GL backend (macOS) have no OpenGL adapter to require.
+    if !wgpu::Instance::enabled_backend_features().contains(wgpu::Backends::GL) {
+        return;
+    }
     let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
     desc.backends = wgpu::Backends::GL;
     let Some((adapter, device, queue)) = native_device(desc, false) else { return };
