@@ -965,6 +965,42 @@ impl Frames {
         self.queue.lock().map(|q| q.urgent_running > 0 || q.jobs.iter().any(|j| j.urgent)).unwrap_or(false)
     }
 
+    /// Queue a frame for the disk cache only (Cache Frames When Idle once the RAM preview is
+    /// full): rendered after every other frame and written to disk without going through RAM.
+    /// Returns whether it was queued: not without a disk cache, when the frame is in RAM, on
+    /// disk, queued or failed, or while the disk cache's writer has no room for it (the
+    /// caller tries again later).
+    pub fn request_to_disk(&self, src: &RenderSource, key: FrameKey, comp: ItemId, t: Tick, opts: RenderOpts) -> bool {
+        let Some(dc) = &src.disk else { return false };
+        if self.is_cached(&key) || self.failed(&key) {
+            return false;
+        }
+        if dc.contains(disk_cache::Kind::Frame, frame_disk_key(&self.content_keys, &src.project, &key, opts_hash(&opts))) {
+            return false;
+        }
+        let (w, h) = src.project.comp(comp).map_or((0, 0), |c| (c.width, c.height));
+        let s = opts.scale.clamp(0.01, 4.0);
+        let bytes = ((w as f64 * s).ceil() * (h as f64 * s).ceil() * 4.0) as usize;
+        if !dc.has_room(bytes) {
+            return false;
+        }
+        let Ok(mut q) = self.queue.lock() else { return false };
+        let Ok(mut inf) = self.inflight.lock() else { return false };
+        if !inf.insert(key) {
+            return false;
+        }
+        q.seq += 1;
+        let seq = q.seq;
+        q.jobs.push(Job { key, src: src.clone(), comp, t, opts, urgent: false, disk_only: true, seq });
+        drop(inf);
+        drop(q);
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.remote.is_none() {
+            self.worker().spawn_next();
+        }
+        true
+    }
+
     fn request_with(&self, src: &RenderSource, key: FrameKey, comp: ItemId, t: Tick, opts: RenderOpts, urgent: bool) {
         if self.is_cached(&key) || self.failed(&key) {
             return;
@@ -996,11 +1032,15 @@ impl Frames {
             }
         }
         if !inf.insert(key) {
+            // Queued for the disk only: now wanted in RAM too.
+            if let Some(j) = q.jobs.iter_mut().find(|j| j.key == key) {
+                j.disk_only = false;
+            }
             return;
         }
         q.seq += 1;
         let seq = q.seq;
-        q.jobs.push(Job { key, src: src.clone(), comp, t, opts, urgent, seq });
+        q.jobs.push(Job { key, src: src.clone(), comp, t, opts, urgent, disk_only: false, seq });
         drop(inf);
         drop(q);
         #[cfg(not(target_arch = "wasm32"))]
@@ -1253,9 +1293,14 @@ impl Worker {
         };
         let t0 = web_time::Instant::now();
         let disk = job.src.disk.as_ref().map(|dc| (dc.clone(), frame_disk_key(content_keys, &job.src.project, &job.key, opts_hash(&job.opts))));
+        if job.disk_only && disk.as_ref().is_none_or(|(dc, k)| dc.contains(disk_cache::Kind::Frame, *k)) {
+            // Already on disk (or no disk cache any more): nothing to do.
+            self.release(job.key, false);
+            return true;
+        }
         let from_disk = disk.as_ref().and_then(|(dc, k)| dc.get_frame(*k));
         let disk_hit = from_disk.is_some();
-        let ticket = self.playback_budget.lock().unwrap_or_else(std::sync::PoisonError::into_inner).ticket(job.key);
+        let ticket = if job.disk_only { None } else { self.playback_budget.lock().unwrap_or_else(std::sync::PoisonError::into_inner).ticket(job.key) };
         let service_start = web_time::Instant::now();
         let ci = match from_disk {
             Some(f) => FrameImage::Cpu(Arc::new(egui::ColorImage::from_rgba_premultiplied([f.width as usize, f.height as usize], &f.rgba))),
@@ -1279,10 +1324,18 @@ impl Worker {
             );
         }
         let render_time = t0.elapsed();
+        if job.disk_only {
+            // Straight to the disk cache, whatever it cost (else it would be asked for again).
+            if let (Some((dc, k)), FrameImage::Cpu(img)) = (&disk, &ci) {
+                dc.put_frame(*k, img.size[0] as u32, img.size[1] as u32, ColorBytes(img.clone()));
+            }
+            self.release(job.key, false);
+            return true;
+        }
         // Publish the shared frame and wake the viewer first; the disk cache's writer thread
         // compresses and writes the same snapshot.
         self.finish(&job, ci.clone(), t0);
-        let backlog = queue.lock().map(|q| q.jobs.iter().filter(|j| !j.urgent).count()).unwrap_or(0);
+        let backlog = queue.lock().map(|q| q.jobs.iter().filter(|j| !j.urgent && !j.disk_only).count()).unwrap_or(0);
         if !disk_hit
             && keep_on_disk(render_time, job.urgent, backlog)
             && let (Some((dc, k)), FrameImage::Cpu(img)) = (&disk, &ci)
@@ -1490,6 +1543,10 @@ struct Job {
     t: Tick,
     opts: RenderOpts,
     urgent: bool,
+    /// Rendered for the disk cache only (Cache Frames When Idle past the RAM preview budget):
+    /// written to disk, never put in RAM (where it would evict the cached frames), and
+    /// rendered after every viewer and prefetch frame.
+    disk_only: bool,
     seq: u64,
 }
 
@@ -1510,9 +1567,10 @@ impl Queue {
         if job.urgent { self.urgent_running == 0 && self.running.len() <= limit } else { self.running.len() < limit }
     }
 
-    /// The job that matters most: urgent first (newest), then prefetch in request order.
+    /// The job that matters most: urgent first (newest), then prefetch in request order, then
+    /// disk-only frames in request order.
     fn best(jobs: &[Job]) -> Option<usize> {
-        jobs.iter().enumerate().max_by_key(|(_, j)| (j.urgent, if j.urgent { j.seq as i64 } else { -(j.seq as i64) })).map(|(i, _)| i)
+        jobs.iter().enumerate().max_by_key(|(_, j)| (j.urgent, !j.disk_only, if j.urgent { j.seq as i64 } else { -(j.seq as i64) })).map(|(i, _)| i)
     }
 }
 
@@ -1748,6 +1806,7 @@ mod tests {
             t: Tick::ZERO,
             opts: RenderOpts { scale, ..Default::default() },
             urgent: false,
+            disk_only: false,
             seq: 0,
         };
         let gib = 1 << 30;
@@ -1779,7 +1838,7 @@ mod tests {
         let mut q = f.queue.lock().unwrap();
         q.running.insert(old);
         q.urgent_running = 1;
-        q.jobs.push(Job { key: latest, src, comp: ItemId(1), t: Tick::ZERO, opts: RenderOpts::default(), urgent: true, seq: 2 });
+        q.jobs.push(Job { key: latest, src, comp: ItemId(1), t: Tick::ZERO, opts: RenderOpts::default(), urgent: true, disk_only: false, seq: 2 });
         assert!(!q.can_start(&q.jobs[0]), "one urgent render is already in progress");
         drop(q);
         assert!(!worker.run_next(), "obsolete render must finish before allocating another frame");
@@ -1992,6 +2051,55 @@ mod tests {
         assert_eq!(f.disk_frames(&src, &key(1, 0, 0), 5, &opts), vec![2]);
         insert(&f, key(1, 2, 0));
         assert!(f.disk_frames(&src, &key(1, 0, 0), 5, &opts).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Cache Frames When Idle past the RAM preview: disk-only frames land in the disk cache
+    /// (the blue bar) without entering RAM, where they would evict the cached frames; a frame
+    /// already on disk isn't queued again, and asking for a queued one in RAM upgrades it.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn disk_only_frames_go_to_disk_not_ram() {
+        use effectcraft_engine::Session;
+        use serde_json::json;
+        let mut s = Session::default();
+        let cid = ItemId(s.execute("comp.new", json!({"name": "A", "width": 32, "height": 32, "duration": 2})).unwrap()["comp"].as_u64().unwrap());
+        s.execute("layer.newSolid", json!({"color": "#00ff00", "width": 16, "height": 16})).unwrap();
+        let dir = std::env::temp_dir().join(format!("effectcraft-disk-only-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dc = DiskCache::open(&dir, 1 << 30).unwrap();
+        let src = RenderSource {
+            freeze_feedback: Default::default(),
+            project: s.project.clone(),
+            footage: Arc::new(effectcraft_engine::render::NoFootage),
+            expr: None,
+            layer_cache: Arc::new(LayerCache::new(64 << 20)),
+            gpu: None,
+            gpu_display: false,
+            disk: Some(dc.clone()),
+        };
+        let f = Frames::default();
+        let content = f.content_of(&s.project, s.revision, cid);
+        let k = |frame: i64| FrameKey { revision: s.revision, content, comp: cid.0, ..key(0, frame, 0) };
+        let opts = RenderOpts::default();
+        assert!(f.request_to_disk(&src, k(3), cid, Tick::ZERO, opts));
+        for _ in 0..500 {
+            if f.inflight() == 0 && f.disk_frames(&src, &k(0), 10, &opts) == vec![3] {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(f.disk_frames(&src, &k(0), 10, &opts), vec![3], "written to disk");
+        assert!(!f.is_cached(&k(3)), "not put in RAM");
+        assert!(!f.request_to_disk(&src, k(3), cid, Tick::ZERO, opts), "already on disk");
+        // A queued disk-only job asked for by the viewer comes to RAM.
+        {
+            let mut q = f.queue.lock().unwrap();
+            f.inflight.lock().unwrap().insert(k(5));
+            q.jobs.push(Job { key: k(5), src: src.clone(), comp: cid, t: Tick::ZERO, opts, urgent: false, disk_only: true, seq: 1 });
+        }
+        f.request(&src, k(5), cid, Tick::ZERO, opts);
+        assert!(f.queue.lock().unwrap().jobs.iter().all(|j| !j.disk_only), "upgraded to a RAM frame");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

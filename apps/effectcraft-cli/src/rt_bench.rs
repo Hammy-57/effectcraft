@@ -108,17 +108,28 @@ pub(super) fn run(s: &Session, args: &Args) -> Result<(), Failure> {
         let before = gpu.context().transfer_stats();
         let pool_before = gpu.context().pool_stats();
         let mut samples = Vec::with_capacity(n);
+        // Per frame in playback order: slow stretches start at cuts in the comp, which the
+        // sorted samples hide.
+        let mut frames = Vec::with_capacity(n);
         for i in 0..n {
+            let (t0, p0) = (gpu.context().transfer_stats(), gpu.context().pool_stats());
             let now = std::time::Instant::now();
             render(i.saturating_add(1) as i64)?;
-            samples.push(now.elapsed().as_secs_f64() * 1000.0);
+            let ms = now.elapsed().as_secs_f64() * 1000.0;
+            let (t1, p1) = (gpu.context().transfer_stats(), gpu.context().pool_stats());
+            samples.push(ms);
+            frames.push(json!({"offset": i.saturating_add(1), "ms": ms, "uploads": t1.uploads.saturating_sub(t0.uploads),
+                "uploadBytes": t1.upload_bytes.saturating_sub(t0.upload_bytes), "readbackBytes": t1.readback_bytes.saturating_sub(t0.readback_bytes),
+                "poolMisses": p1.1.saturating_sub(p0.1)}));
         }
         let after = gpu.context().transfer_stats();
         let pool_after = gpu.context().pool_stats();
         samples.sort_by(f64::total_cmp);
-        // Instrument one additional moving frame, outside the latency sample population.
+        // Instrument one additional moving frame, outside the latency sample population
+        // (`--profile-offset K` instruments offset K instead, e.g. one inside a slow stretch).
+        let profiled = args.opt("--profile-offset").and_then(|v| v.parse::<i64>().ok()).unwrap_or(n.saturating_add(1) as i64);
         profile::start();
-        let result = render(n.saturating_add(1) as i64);
+        let result = render(profiled);
         let (events, dropped) = profile::finish();
         result?;
         let mut stages: BTreeMap<String, (usize, f64)> = BTreeMap::new();
@@ -139,7 +150,7 @@ pub(super) fn run(s: &Session, args: &Args) -> Result<(), Failure> {
             note!("  GPU timestamps unavailable on this adapter/device");
         }
         rows.push(json!({"comp": name, "resolution": label, "frames": n, "transformDrag": drag, "coldMs": cold_ms, "p50Ms": p50, "p95Ms": p95,
-            "samplesMs": samples, "bitDepth": format!("{:?}", project.settings.bit_depth), "stagesInclusiveMs": stages, "droppedTraceEvents": dropped,
+            "samplesMs": samples, "framesInOrder": frames, "bitDepth": format!("{:?}", project.settings.bit_depth), "stagesInclusiveMs": stages, "profiledOffset": profiled, "droppedTraceEvents": dropped,
             "yuvConversions": after.yuv_conversions.saturating_sub(before.yuv_conversions),
             "yuvInputBytes": after.yuv_bytes.saturating_sub(before.yuv_bytes), "timestampQueries": timestamps, "gpuDiagnosticWindowMs": gpu_window_ms, "uploads": after.uploads.saturating_sub(before.uploads),
             "uploadBytes": after.upload_bytes.saturating_sub(before.upload_bytes),
