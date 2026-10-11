@@ -385,6 +385,8 @@ fn motion_blur_smears_moving_meshes() {
     let hard = partial(&sharp, 60);
     assert!(hard <= 4, "no blur without the switch: {hard}");
     p.comp_mut(cid).unwrap().layers[0].switches.motion_blur = true;
+    // New comps start with Motion Blur off (G2); this test is about the blur itself.
+    p.comp_mut(cid).unwrap().enable_motion_blur = true;
     let blurred = render(&p, cid);
     let smear = partial(&blurred, 60);
     // A 180° shutter smears over half a frame of motion (≈ 30 px).
