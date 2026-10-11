@@ -1508,6 +1508,8 @@ pub(crate) struct Enc<'g> {
     ring: Option<wgpu::Buffer>,
     /// A dispatch named a kernel the device doesn't have (see [`Enc::take_missing`]).
     missing: bool,
+    /// Nested comp frames shared by identical precomp instances of this frame (`cull`).
+    pub(crate) shared: crate::cull::Shared,
 }
 
 impl Drop for Enc<'_> {
@@ -1572,6 +1574,7 @@ impl<'g> Enc<'g> {
             submitted: None,
             ring: None,
             missing: false,
+            shared: Default::default(),
             #[cfg(feature = "profile")]
             timestamps: None,
         }

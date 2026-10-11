@@ -78,7 +78,7 @@ fn draw_comp<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, canvas: &mut 
 
 fn draw_layers<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, visible: &[&'a Layer], canvas: &mut GpuImage) -> Option<()> {
     let levels = r.pipe().levels;
-    let mut i = 0;
+    let mut i = crate::cull::first_drawn(r, ctx, visible, (canvas.width, canvas.height));
     while i < visible.len() {
         if visible[i].is_3d() {
             let mut j = i;
@@ -203,7 +203,7 @@ fn draw_split(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, split: &effectcraft_rend
 
 fn draw_collapsed<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, layer: &Layer, item: ItemId, canvas: &mut GpuImage) -> Option<()> {
     let opacity = r.layer_opacity(ctx, layer);
-    if opacity <= 0.0 {
+    if opacity <= 0.0 || crate::cull::skip_matte(r, ctx, layer) {
         return Some(());
     }
     let matte = r.track_matte(ctx, layer).is_some();
@@ -223,7 +223,7 @@ fn draw_collapsed<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, layer: &
 /// effect stack. Keep that isolation resident; unsupported work keeps CPU fallback.
 fn draw_collapsed_fx<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, layer: &'a Layer, item: ItemId, canvas: &mut GpuImage) -> Option<()> {
     let opacity = r.layer_opacity(ctx, layer);
-    if opacity <= 0.0 {
+    if opacity <= 0.0 || crate::cull::skip_matte(r, ctx, layer) {
         return Some(());
     }
     let Some((sub, nctx)) = r.collapse_into(ctx, layer, item, 1.0) else {
@@ -262,7 +262,7 @@ fn draw_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &
         return Some(());
     }
     let opacity = r.layer_opacity(ctx, layer);
-    if opacity <= 0.0 {
+    if opacity <= 0.0 || crate::cull::skip_layer(r, ctx, layer, (canvas.width, canvas.height)) {
         return Some(());
     }
     if let Some(done) = draw_precomp(e, r, ctx, layer, canvas, opacity) {
@@ -431,7 +431,7 @@ fn draw_precomp(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas:
     // A nested comp the GPU can't take (nested too deep, over the texture limit, content it
     // declines) goes back to the CPU path for this layer only; only a device failure fails the
     // frame.
-    let Some(src) = render(e, &sub, item, lt) else {
+    let Some(src) = crate::cull::nested(e, ctx, &sub, item, lt) else {
         return if e.g.check_health().is_ok() { None } else { Some(None) };
     };
     finish_resident(e, r, ctx, layer, canvas, opacity, src, bs)
@@ -485,7 +485,7 @@ fn draw_cached_precomp(
     } else {
         let _profile = effectcraft_render::profile::span("precomp_resident_produce");
         let (sub, item, lt, bs) = source;
-        let Some(src) = render(e, sub, *item, *lt) else {
+        let Some(src) = crate::cull::nested(e, ctx, sub, *item, *lt) else {
             return if e.g.check_health().is_ok() { None } else { Some(None) };
         };
         prepare_processed(e, r, ctx, layer, src, *bs)?
