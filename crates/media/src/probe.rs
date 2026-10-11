@@ -54,7 +54,7 @@ pub fn probe(path: impl AsRef<Path>) -> Result<Footage> {
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 fn is_still(path: &str, head: &[u8]) -> bool {
     let ext = ext_of(Path::new(path));
-    crate::STILL_EXTENSIONS.contains(&ext.as_str()) || crate::layered::claims(path, head) || crate::avif::sniff(head) || image::guess_format(head).is_ok()
+    crate::STILL_EXTENSIONS.contains(&ext.as_str()) || crate::layered::claims(path, head) || image::guess_format(head).is_ok()
 }
 
 /// A standalone MP3 / FLAC / Ogg / AIFF file described from its headers and packet framing,
