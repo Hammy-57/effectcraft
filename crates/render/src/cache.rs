@@ -1379,12 +1379,31 @@ pub(crate) fn hash_values(h: &mut KeyHasher, ctx: &EvalCtx, layer: &Layer, g: &P
     }
 }
 
-/// Does any property of `g` have keyframes or an expression?
+/// Does any property of `g` have keyframes or an expression (other than a literal constant)?
 fn has_animation(g: &PropGroup) -> bool {
     g.children.iter().any(|c| match c {
-        Node::Prop(p) => !p.keys.is_empty() || p.has_expression(),
+        Node::Prop(p) => !p.keys.is_empty() || live_expression(p),
         Node::Group(sub) => has_animation(sub),
     })
+}
+
+/// An expression that can give different values: not a plain number or array of numbers
+/// (`0.5`, `[100, 50]`), whose value the hashed structure (the expression text) fixes.
+fn live_expression(p: &effectcraft_project::Property) -> bool {
+    p.has_expression() && !p.expr.as_ref().is_some_and(|e| literal_constant(&e.text))
+}
+
+fn literal_constant(text: &str) -> bool {
+    let s = text.trim();
+    let s = s.strip_suffix(';').unwrap_or(s).trim();
+    let number = |x: &str| {
+        let x = x.trim();
+        !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit() || b"+-.eE".contains(&b)) && x.parse::<f64>().is_ok()
+    };
+    match s.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+        Some(items) => items.split(',').all(number),
+        None => number(s),
+    }
 }
 
 // ------------------------------------------------------------------------------ key memo
@@ -1667,9 +1686,11 @@ fn reads_other_times(layer: &Layer) -> bool {
         })
 }
 
+/// Does any property of `g` have an expression (other than a literal constant, which reads
+/// nothing)?
 fn has_expression(g: &PropGroup) -> bool {
     g.children.iter().any(|c| match c {
-        Node::Prop(p) => p.has_expression(),
+        Node::Prop(p) => live_expression(p),
         Node::Group(sub) => has_expression(sub),
     })
 }
@@ -1994,5 +2015,18 @@ mod retained_tests {
         // An old producer also carries its original token into the start of relief.
         c.relieve_for(8192, &old);
         assert!(Arc::ptr_eq(&c.get(1).unwrap(), &fresh));
+    }
+}
+
+#[cfg(test)]
+mod tests_literal {
+    #[test]
+    fn literal_constant_expressions() {
+        for s in ["0.5", " 50; ", "-1e3", "[100, 50]", "[1,2,3];"] {
+            assert!(super::literal_constant(s), "{s}");
+        }
+        for s in ["time", "50 + time", "[]", "[1, time]", "wiggle(2, 5)", "Infinity", "NaN", "", "1 2"] {
+            assert!(!super::literal_constant(s), "{s}");
+        }
     }
 }

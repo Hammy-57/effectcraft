@@ -122,12 +122,76 @@ fn static_precomp_key_changes_and_animated_fallback() {
     let child = scene.p.comp_mut(nested).unwrap().layers.get_mut(0).unwrap();
     let opacity = child.props.prop_mut("transform/opacity").unwrap();
     opacity.keys = vec![Keyframe::new(Tick::ZERO, n(50.)), Keyframe::new(Tick::from_seconds_f64(1.), n(60.))];
-    assert!(get(&scene, 1.).is_none(), "animated precomps retain their transient policy");
+    let at = |scene: &Scene, time| {
+        let mut r = Renderer::new(&scene.p, &Pattern, RenderOpts::default());
+        r.cache = Some(&cache);
+        let k = key(&r, scene.cid, id, time);
+        let ctx = r.eval_ctx(scene.cid, time).unwrap();
+        (k, r.resident_precomp_animated(&ctx, ctx.comp.layers.iter().find(|l| l.id == id).unwrap()))
+    };
+    let (k0, animated) = at(&scene, Tick::ZERO);
+    assert!(animated, "keyframed nested content is admitted only on repeat");
+    assert_ne!(k0.unwrap(), at(&scene, Tick::from_seconds_f64(0.5)).0.unwrap(), "animated values change the key");
     let child = scene.p.comp_mut(nested).unwrap().layers.get_mut(0).unwrap();
     let opacity = child.props.prop_mut("transform/opacity").unwrap();
     opacity.keys.clear();
     opacity.expr = Some(effectcraft_project::Expression { text: "50".into(), enabled: true });
-    assert!(get(&scene, 1.).is_none(), "expressions stay conservative");
+    let (k, animated) = at(&scene, Tick::ZERO);
+    assert!(!animated, "a literal expression is static");
+    assert_eq!(k, at(&scene, Tick::from_seconds_f64(0.5)).0);
+    let child = scene.p.comp_mut(nested).unwrap().layers.get_mut(0).unwrap();
+    child.props.prop_mut("transform/opacity").unwrap().expr = Some(effectcraft_project::Expression { text: "50 + time".into(), enabled: true });
+    assert!(at(&scene, Tick::ZERO).1, "a live expression animates");
+}
+
+/// Held values (Hold keys, a literal expression) keep a nested comp's key: the GPU walk reuses
+/// its Processed pixels once the key repeats, identical to rendering every frame.
+#[test]
+fn held_precomp_values_reuse_resident_pixels() {
+    let g = crate::tests::gpu();
+    assert!(g.is_some() || !std::env::var("EFFECTCRAFT_REQUIRE_GPU").is_ok_and(|v| v == "1"), "required GPU unavailable");
+    let Some(g) = g else { return };
+    for expression in [false, true] {
+        g.ctx.clear_uploads();
+        let (mut scene, nested, id) = scene(BitDepth::Bpc16, false);
+        let child = scene.p.comp_mut(nested).unwrap().layers.get_mut(0).unwrap();
+        let opacity = child.props.prop_mut("transform/opacity").unwrap();
+        if expression {
+            opacity.expr = Some(effectcraft_project::Expression { text: "[60]".into(), enabled: true });
+        } else {
+            opacity.keys = vec![Keyframe::new(Tick::ZERO, n(60.)).hold(), Keyframe::new(Tick::from_seconds_f64(1.), n(90.)).hold()];
+        }
+        let cache = LayerCache::default();
+        let opts = RenderOpts { backend: Backend::Gpu, ..Default::default() };
+        let mut r = Renderer::new(&scene.p, &Pattern, opts);
+        r.accel = Some(g);
+        r.cache = Some(&cache);
+        let mut uncached = Renderer::new(&scene.p, &Pattern, opts);
+        uncached.accel = Some(g);
+        let k = key(&r, scene.cid, id, Tick::ZERO).unwrap();
+        let resident = || cache.gpu_owner().unwrap().resident(k, GpuStage::Processed);
+        let mut kept = None;
+        for frame in 0..6 {
+            let at = FrameRate::FPS_30.tick_of(frame);
+            assert_eq!(key(&r, scene.cid, id, at), Some(k), "held values keep the key");
+            let actual = g.within_memory(|| g.render_display(&r, scene.cid, at)).unwrap().unwrap();
+            let expected = g.within_memory(|| g.render_display(&uncached, scene.cid, at)).unwrap().unwrap();
+            assert_eq!(g.read_display(&actual).unwrap(), g.read_display(&expected).unwrap(), "retention keeps pixels identical");
+            // Hold keys animate: the doorkeeper admits the second production. A literal is static.
+            match (frame, resident()) {
+                (0, r) if !expression => assert!(r.is_none(), "first sight of an animated key stays transient"),
+                (_, None) => panic!("held precomp is retained (frame {frame})"),
+                (_, Some(t)) => match &kept {
+                    None => kept = Some(t),
+                    Some(first) => assert!(std::sync::Arc::ptr_eq(first, &t), "later held frames reuse the retained pixels, not a new composite"),
+                },
+            }
+        }
+        let later = Tick::from_seconds_f64(1.);
+        if !expression {
+            assert_ne!(key(&r, scene.cid, id, later), Some(k), "the next hold changes the key");
+        }
+    }
 }
 
 #[test]

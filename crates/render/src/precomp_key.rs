@@ -191,8 +191,8 @@ impl<'a> Renderer<'a> {
         let info = comp_info(arc);
         let nc: &Comp = arc;
         // Motion blur evaluates transforms (masks, shapes, text, the layers of collapsed precomps)
-        // within the shutter.
-        let blur = self.opts.motion_blur && tree_has(self.project, id, false, self.depth);
+        // within the shutter: the time counts only when something in the tree moves.
+        let blur = self.opts.motion_blur && tree_has(self.project, id, false, self.depth) && tree_varies(self.project, id, self.depth);
         if (info.other_times || blur) && info.expressions {
             return None;
         }

@@ -497,6 +497,14 @@ fn draw_cached_precomp(
     if result == Some(Some(()))
         && let Some(flight) = flight
     {
+        // An animated precomp's key follows its values: kept once they hold (the key repeats),
+        // and tried again next frame (not backed off as a miss).
+        if r.resident_precomp_animated(ctx, layer) {
+            if !cache.admit_repeated_gpu_content(key) {
+                return result;
+            }
+            r.resident_precomp_note(noted, true);
+        }
         e.keep_resident(key, image, flight, intent);
     }
     result
