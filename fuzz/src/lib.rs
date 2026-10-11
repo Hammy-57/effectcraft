@@ -174,8 +174,30 @@ pub fn media_probe(data: &[u8]) {
 
 /// Command families that only edit the project in memory (no files, processes or downloads).
 const SAFE_PREFIXES: &[&str] = &[
-    "layer.", "keys.", "comp.", "camera.", "time.", "prop.", "mask.", "project.", "effect.", "text.", "path.", "paint.", "anim.", "warp.",
-    "puppet.", "shape.", "material.", "markers.", "expr.", "liquify.", "item.", "essential.", "edit.", "view.",
+    "layer.",
+    "keys.",
+    "comp.",
+    "camera.",
+    "time.",
+    "prop.",
+    "mask.",
+    "project.",
+    "effect.",
+    "text.",
+    "path.",
+    "paint.",
+    "anim.",
+    "warp.",
+    "puppet.",
+    "shape.",
+    "material.",
+    "markers.",
+    "expr.",
+    "liquify.",
+    "item.",
+    "essential.",
+    "edit.",
+    "view.",
 ];
 
 fn safe_commands() -> &'static [&'static str] {

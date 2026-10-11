@@ -56,7 +56,11 @@ fn main() {
     }
 
     put("pdf_parse", "min.pdf", b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 100 100]/Contents 4 0 R>>endobj\n4 0 obj<</Length 35>>stream\n1 0 0 rg 10 10 80 80 re f 0 0 1 RG\nendstream endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n");
-    put("pdf_parse", "min.eps", b"%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 100 100\nnewpath 10 10 moveto 90 10 lineto 50 90 lineto closepath 0 0 1 setrgbcolor fill\nshowpage\n");
+    put(
+        "pdf_parse",
+        "min.eps",
+        b"%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 100 100\nnewpath 10 10 moveto 90 10 lineto 50 90 lineto closepath 0 0 1 setrgbcolor fill\nshowpage\n",
+    );
 
     put(
         "interchange_import",
