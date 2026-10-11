@@ -547,6 +547,9 @@ impl Default for Frames {
             cache: Arc::new(Mutex::new(Cache { map: HashMap::new(), order: VecDeque::new(), protected: HashMap::new(), playhead: None, bytes: 0, gpu_bytes: 0, budget: 3 << 30, gpu_budget: GPU_BUDGET, generation: 0 })),
             inflight: Arc::new(Mutex::new(HashSet::new())),
             failed: Failed::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            queue: Arc::new(Mutex::new(Queue { threads, ..Queue::default() })),
+            #[cfg(target_arch = "wasm32")]
             queue: Arc::new(Mutex::new(Queue::default())),
             #[cfg(not(target_arch = "wasm32"))]
             // A panicking job would abort the whole process (rayon's default for `spawn`): log it
@@ -581,11 +584,42 @@ impl Default for Frames {
 /// comp canvas, layer buffers, matte / adjustment temporaries), and together they stay within
 /// the layer cache's memory budget (Memory & CPU settings): a 4K comp (~530 MB a frame) renders
 /// two frames at once on the default 1 GB, an HD comp eight. At least one.
-fn max_running(job: &Job) -> usize {
+///
+/// A frame the GPU composites keeps those working frames in video memory, not RAM: it may also
+/// run as many as fit in [`gpu_working_budget`], up to `threads` (the frame pool's size).
+fn max_running(job: &Job, threads: usize) -> usize {
     let (w, h) = job.src.project.comp(job.comp).map_or((0, 0), |c| (c.width, c.height));
     let s = job.opts.scale.clamp(0.01, 4.0);
     let frame = ((w as f64 * s).ceil() * (h as f64 * s).ceil() * 16.0 * 4.0).max(1.0);
-    ((job.src.layer_cache.budget() as f64 / frame) as usize).max(1)
+    let cpu = ((job.src.layer_cache.budget() as f64 / frame) as usize).max(1);
+    match job.src.gpu.as_ref().filter(|g| composites_on_gpu(job, g)) {
+        Some(g) => cpu.max(((gpu_working_budget(g) as f64 / frame) as usize).min(threads)),
+        None => cpu,
+    }
+}
+
+/// Video memory the GPU frames rendering at once may take. wgpu can't tell how much video memory
+/// there is; the largest buffer the device allows follows it (Metal's is a fraction of the unified
+/// RAM), between 1 and 4 GiB.
+fn gpu_working_budget(g: &Gpu) -> u64 {
+    g.device().limits().max_buffer_size.clamp(1 << 30, 4 << 30)
+}
+
+/// `job` will composite on the GPU (see [`Worker::render_job`]): the backend allows it and Auto
+/// has not measured the CPU as faster for this comp (frozen previews and a retired device still
+/// fall back to the CPU, within the larger limit).
+fn composites_on_gpu(job: &Job, g: &Gpu) -> bool {
+    use effectcraft_engine::render::{Accelerator, AutoKey, AutoPick, Backend};
+    match job.opts.backend {
+        Backend::Cpu => false,
+        Backend::Gpu => true,
+        Backend::Auto if !job.src.project.settings.gpu_acceleration => false,
+        Backend::Auto => {
+            let stats =
+                job.opts.roi.is_none().then(|| g.auto_pick()).flatten().and_then(|p| p.stats(AutoKey::new(job.comp, job.opts.scale, job.src.gpu_display)));
+            stats.is_none_or(|s| !(s.declined || matches!((s.gpu_ms, s.cpu_ms), (Some(g), Some(c)) if c < g * AutoPick::MARGIN)))
+        }
+    }
 }
 
 /// Premultiplied f32 → egui premultiplied Color32 (alpha kept, so the viewer can show the
@@ -1820,11 +1854,13 @@ struct Queue {
     landing: usize,
     /// The playing preview, if any: its prefetch renders nearest first.
     playhead: Option<Playhead>,
+    /// Threads of the frame pool: GPU frames never run more at once.
+    threads: usize,
 }
 
 impl Queue {
     fn can_start(&self, job: &Job) -> bool {
-        let limit = max_running(job);
+        let limit = max_running(job, self.threads);
         let rendering = self.running.len().saturating_sub(self.landing);
         if job.urgent { self.urgent_running == 0 && rendering <= limit } else { rendering < limit }
     }
@@ -2082,11 +2118,70 @@ mod tests {
             seq: 0,
         };
         let gib = 1 << 30;
-        assert_eq!(max_running(&job(uhd, 1.0, gib)), 2);
-        assert_eq!(max_running(&job(hd, 1.0, gib)), 8);
-        assert_eq!(max_running(&job(uhd, 0.5, gib)), 8, "Half resolution renders HD-sized frames");
-        assert_eq!(max_running(&job(uhd, 1.0, 64 << 20)), 1);
-        assert_eq!(max_running(&job(ItemId(9999), 1.0, gib)), gib, "no comp: nothing to bound");
+        assert_eq!(max_running(&job(uhd, 1.0, gib), 16), 2);
+        assert_eq!(max_running(&job(hd, 1.0, gib), 16), 8);
+        assert_eq!(max_running(&job(uhd, 0.5, gib), 16), 8, "Half resolution renders HD-sized frames");
+        assert_eq!(max_running(&job(uhd, 1.0, 64 << 20), 16), 1);
+        assert_eq!(max_running(&job(ItemId(9999), 1.0, gib), 16), gib, "no comp: nothing to bound");
+    }
+
+    /// RT8g: at 4K Full a GPU frame keeps its working frames in video memory, so playback
+    /// renders more than the two at once the RAM budget allows (never more than the pool's
+    /// threads); CPU frames keep that cap, and the reserved viewer slot (#647) stays one frame.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn gpu_frames_at_4k_run_beyond_the_ram_cap() {
+        use effectcraft_engine::Session;
+        use effectcraft_engine::render::Backend;
+        use serde_json::json;
+        let Some(gpu) = Gpu::headless() else {
+            assert!(std::env::var("EFFECTCRAFT_REQUIRE_GPU").as_deref() != Ok("1"), "GPU required");
+            return;
+        };
+        let mut s = Session::default();
+        let uhd = ItemId(s.execute("comp.new", json!({"name": "C", "width": 3840, "height": 2160, "duration": 1})).unwrap()["comp"].as_u64().unwrap());
+        let job = |n: i64, backend: Backend| Job {
+            key: key(uhd.0, n, 0),
+            src: RenderSource {
+                freeze_feedback: Default::default(),
+                project: s.project.clone(),
+                footage: Arc::new(effectcraft_engine::render::NoFootage),
+                expr: None,
+                layer_cache: Arc::new(LayerCache::new(1 << 30)),
+                gpu: Some(gpu.clone()),
+                gpu_display: true,
+                disk: None,
+            },
+            comp: uhd,
+            t: Tick::ZERO,
+            opts: RenderOpts { backend, ..Default::default() },
+            urgent: false,
+            disk_only: false,
+            seq: 0,
+        };
+        // Admitted one by one, as the pool's threads pick them up.
+        let admitted = |backend: Backend| {
+            let mut q = Queue { threads: 8, ..Queue::default() };
+            for n in 0..16 {
+                let j = job(n, backend);
+                if !q.can_start(&j) {
+                    let viewer = Job { urgent: true, ..job(99, backend) };
+                    assert!(q.can_start(&viewer), "the viewer keeps its reserved slot");
+                    q.running.insert(viewer.key);
+                    q.urgent_running = 1;
+                    assert!(!q.can_start(&Job { key: key(uhd.0, 100, 0), ..viewer }), "and only one");
+                    return n;
+                }
+                q.running.insert(j.key);
+            }
+            16
+        };
+        let gpu_frames = admitted(Backend::Gpu);
+        let budget = gpu_working_budget(&gpu);
+        eprintln!("4K Full: {gpu_frames} GPU frames at once ({} MiB of video memory)", budget >> 20);
+        assert!(gpu_frames > 2, "the GPU admits more than the RAM cap ({gpu_frames})");
+        assert!(gpu_frames <= 8, "never more than the pool's threads");
+        assert_eq!(admitted(Backend::Cpu), 2, "the CPU keeps today's cap");
     }
 
     /// RT7b: a native GPU frame is not waited for by its worker; it lands with exactly the bytes
@@ -2152,7 +2247,7 @@ mod tests {
             q.running.insert(flying);
             q.landing = 1;
             let tiny = Job { src: RenderSource { layer_cache: Arc::new(LayerCache::new(1)), ..src.clone() }, ..job(stale) };
-            assert_eq!(max_running(&tiny), 1);
+            assert_eq!(max_running(&tiny, 1), 1);
             assert!(q.can_start(&tiny), "a frame in flight holds no working memory");
             q.jobs.push(job(stale));
         }
