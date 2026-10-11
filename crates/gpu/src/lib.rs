@@ -327,7 +327,21 @@ impl Accelerator for Gpu {
 
     fn effects(&self, chain: &[FxStep], buf: &Buf, levels: Option<f32>) -> Option<Buf> {
         self.ctx.check_health().ok()?;
-        effects::run_chain(&mut Enc::new(&self.ctx), chain, buf, levels)
+        effects::run_chain(&mut Enc::new(&self.ctx), chain, buf, levels).map(|(b, _)| b)
+    }
+
+    fn effects_kept(&self, chain: &[FxStep], buf: &Buf, levels: Option<f32>) -> Option<(Buf, Option<u64>)> {
+        self.ctx.check_health().ok()?;
+        let (b, img) = effects::run_chain(&mut Enc::new(&self.ctx), chain, buf, levels)?;
+        Some((b, img.and_then(|img| self.ctx.keep(img))))
+    }
+
+    fn adopt(&self, ticket: u64, buf: &Arc<Buf>) {
+        self.ctx.adopt(ticket, buf);
+    }
+
+    fn release(&self, ticket: u64) {
+        self.ctx.release(ticket);
     }
 
     fn raster_3d(&self, scene: &effectcraft_render::three_d::adv::Scene) -> Option<effectcraft_render::three_d::adv::Target> {

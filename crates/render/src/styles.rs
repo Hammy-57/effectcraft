@@ -103,6 +103,20 @@ pub fn active(ctx: &EvalCtx, layer: &Layer) -> bool {
     g.groups().any(|s| s.enabled && s.match_id != st::BLENDING) || blending(ctx, layer) != Blending::default()
 }
 
+/// Layer-space margin the layer's styles reach beyond its content ([`render`] pads the content
+/// by it, in buffer pixels rounded up, plus two); 0 when the styled path is off. `None` when an
+/// exterior pass uses a stencil mode (it changes the comp outside the layer).
+pub(crate) fn growth(ctx: &EvalCtx, layer: &Layer) -> Option<f64> {
+    if !active(ctx, layer) {
+        return Some(0.0);
+    }
+    if pass_modes(ctx, layer).iter().any(|m| m.is_stencil()) {
+        return None;
+    }
+    let g = group(layer)?;
+    Some(reach(&evaluate(ctx, layer, g))).filter(|r| r.is_finite())
+}
+
 /// Blend modes of the exterior passes [`render`] produces (Drop Shadow, then Outer Glow).
 pub fn pass_modes(ctx: &EvalCtx, layer: &Layer) -> Vec<BlendMode> {
     let Some(g) = group(layer) else { return vec![] };
