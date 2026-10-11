@@ -813,8 +813,19 @@ impl Drop for FrameMark<'_> {
 }
 
 /// How long a waiter on a rayon worker waits for another thread's render (see
-/// [`LayerCache::claim`]).
-const WAIT_POOL: std::time::Duration = std::time::Duration::from_secs(2);
+/// [`LayerCache::claim`]). Short: when rayon has run the waiting frame on top of a stolen piece
+/// of the render it waits for, the wait can never succeed, and the thread does nothing else
+/// meanwhile. At 2 s, several of these in a row stopped RAM preview for seconds at a time in
+/// precomp-heavy comps; a duplicate render costs less.
+const WAIT_POOL: std::time::Duration = std::time::Duration::from_millis(250);
+/// Waits that ran out of time (process-wide; see [`wait_timeouts`]).
+static WAIT_TIMEOUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many waits for another thread's layer render have timed out (each one rendered the
+/// layer again instead): a diagnostic for preview stalls.
+pub fn wait_timeouts() -> u64 {
+    WAIT_TIMEOUTS.load(std::sync::atomic::Ordering::Relaxed)
+}
 /// How long any other thread waits.
 const WAIT_OTHER: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -836,7 +847,11 @@ impl Flight {
         let start = web_time::Instant::now();
         let mut done = self.done.lock().unwrap_or_else(PoisonError::into_inner);
         while !*done {
-            let Some(left) = limit.checked_sub(start.elapsed()) else { return false };
+            let Some(left) = limit.checked_sub(start.elapsed()) else {
+                let n = WAIT_TIMEOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                log::debug!("layer cache: waited {limit:?} for another thread's render, rendering it again ({n} so far)");
+                return false;
+            };
             done = match self.cv.wait_timeout(done, left) {
                 Ok((g, _)) => g,
                 Err(e) => e.into_inner().0,

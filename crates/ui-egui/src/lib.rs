@@ -1695,7 +1695,14 @@ impl EffectcraftApp {
     /// render the work area's frames (from the current time on, then from its start) in the
     /// background, a few at a time, until it is cached or the RAM preview budget is full.
     fn cache_when_idle(&mut self, ctx: &egui::Context, comp: &effectcraft_engine::project::Comp, series: &FrameKey, now: f64, (wa, wb): (i64, i64)) {
-        let active = ctx.input(|i| !i.events.is_empty() || i.pointer.any_down() || i.pointer.is_moving());
+        // Moving the pointer over the window isn't activity (After Effects keeps caching):
+        // clicks, keys, wheel and drags are.
+        let active = ctx.input(|i| {
+            i.pointer.any_down()
+                || i.events
+                    .iter()
+                    .any(|e| !matches!(e, egui::Event::PointerMoved(_) | egui::Event::MouseMoved(_) | egui::Event::PointerGone | egui::Event::WindowFocused(_)))
+        });
         if active || self.last_activity.1 != self.session.revision {
             self.last_activity = (now, self.session.revision);
         }
@@ -1730,9 +1737,56 @@ impl EffectcraftApp {
             self.request_frame(ItemId(series.comp), f, scale);
             queued += 1;
         }
+        // The RAM preview is full: keep going into the disk cache (the blue bar), as After
+        // Effects does, without evicting the frames in RAM. Paced by the disk writer's queue.
+        if !pending && fit < n {
+            pending = self.cache_to_disk(comp, series, (wa, n), cur, fit, slots, queued);
+        }
         if pending {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
+    }
+
+    /// [`Self::cache_when_idle`] past the RAM preview budget: queue the work area's next frames
+    /// (from the `fit`th after `cur` on) that are neither in RAM nor on disk as disk-only
+    /// renders, while fewer than `slots` frames are rendering. Returns whether any remain.
+    fn cache_to_disk(
+        &self,
+        comp: &effectcraft_engine::project::Comp,
+        series: &FrameKey,
+        (wa, n): (i64, i64),
+        cur: i64,
+        fit: i64,
+        slots: usize,
+        mut queued: usize,
+    ) -> bool {
+        let Some(dc) = self.session.disk_cache.clone() else { return false };
+        let cid = ItemId(series.comp);
+        let scale = series.scale as f64 / 1000.0;
+        let frame_bytes = ((comp.width as f64 * scale).ceil() * (comp.height as f64 * scale).ceil() * 4.0) as usize;
+        if !dc.has_room(frame_bytes) {
+            // The writer is still busy with earlier frames: look again shortly.
+            return true;
+        }
+        let src = self.render_source();
+        let opts = self.frame_opts(cid, scale);
+        let total = comp.frame_rate.frame_at(comp.duration);
+        let on_disk = self.frames.disk_frames(&src, series, total, &opts);
+        let mut pending = false;
+        for k in fit..n {
+            let f = wa + (cur - wa + k).rem_euclid(n);
+            if on_disk.binary_search(&f).is_ok() || self.frames.is_cached(&FrameKey { frame: f, ..*series }) {
+                continue;
+            }
+            if queued >= slots {
+                return true;
+            }
+            if self.frames.request_to_disk(&src, self.frame_key(cid, f, scale), cid, comp.frame_rate.tick_of(f), opts) {
+                queued += 1;
+                pending = true;
+            }
+        }
+        pending || queued > 0
     }
 
     /// How many viewer frames of `comp` at `scale` the RAM preview budget holds (90 % of it,

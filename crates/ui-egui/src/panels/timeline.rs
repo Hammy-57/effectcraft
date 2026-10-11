@@ -297,9 +297,9 @@ struct Row {
     kind: RowKind,
 }
 
-pub use super::timeline_columns::{COLUMNS, column_visible, set_column};
 #[cfg(test)]
 use super::timeline_columns::column_at;
+pub use super::timeline_columns::{COLUMNS, column_visible, set_column};
 use super::timeline_columns::{Cols, SW, Vis, cols};
 
 /// Snap a time to the nearest candidate within `tolerance` (all seconds); Shift-dragging the
