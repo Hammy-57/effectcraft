@@ -528,6 +528,8 @@ mod tests_adjust;
 #[cfg(test)]
 mod tests_adv3d;
 #[cfg(test)]
+mod tests_box;
+#[cfg(test)]
 mod tests_deferred;
 #[cfg(test)]
 mod tests_deferred_jobs;

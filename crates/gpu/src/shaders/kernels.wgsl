@@ -371,10 +371,79 @@ fn box_pass(gid: vec3<u32>, horizontal: bool) {
     }
 }
 
+// The horizontal pass as `box_pass` runs it, one thread per row (the reference for `box_h`).
+@compute @workgroup_size(64, 1)
+fn box_h_serial(@builtin(global_invocation_id) gid: vec3<u32>) {
+    box_pass(gid, true);
+}
+
+// `box_h`'s staging tiles: 8 columns of the workgroup's 64 rows (column-major), for the
+// window's leading edge and its trailing edge (2r + 1 pixels behind).
+var<workgroup> box_lead: array<vec4<f32>, 512>;
+var<workgroup> box_trail: array<vec4<f32>, 512>;
+
+// `box_pass` along rows with the reads staged through workgroup memory: the 64 threads load
+// 8-pixel runs of their rows together (adjacent threads, adjacent pixels) instead of each
+// reading its own row a pixel at a time. Each thread then sums exactly as `box_pass` does (the
+// same values in the same order), so the output is bit-identical to `box_h_serial`.
 // u[0] = (radius, repeat edges, block); dispatched over (line, block).
 @compute @workgroup_size(64, 1)
-fn box_h(@builtin(global_invocation_id) gid: vec3<u32>) {
-    box_pass(gid, true);
+fn box_h(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg: vec3<u32>) {
+    let dims = out_dims();
+    let r = i32(P.u[0].x);
+    let repeat = P.u[0].y != 0u;
+    let block = i32(P.u[0].z);
+    let n = dims.x;
+    let line = i32(gid.x);
+    let b0 = i32(wg.y) * block;
+    if (b0 >= n) {
+        return;
+    }
+    let b1 = min(b0 + block, n);
+    let norm = 1.0 / f32(2 * r + 1);
+    // The leading edge runs over [b0 - r, b1 - 1 + r]: the first 2r + 1 pixels are the
+    // starting sum, each later one moves the window by a pixel.
+    let first = b0 - r;
+    let last = b1 - 1 + r;
+    let start = b0 + r;
+    var acc = vec4<f32>(0.0);
+    for (var c0 = first; c0 <= last; c0 += 8) {
+        let trail = c0 + 7 > start;
+        workgroupBarrier();
+        for (var k = 0u; k < 8u; k++) {
+            let i = k * 64u + t;
+            let row = i / 8u;
+            let col = i % 8u;
+            let y = i32(wg.x * 64u + row);
+            var a = vec4<f32>(0.0);
+            var s = vec4<f32>(0.0);
+            if (y < dims.y) {
+                a = line_get(true, y, c0 + i32(col), n, repeat);
+                if (trail) {
+                    s = line_get(true, y, c0 + i32(col) - 2 * r - 1, n, repeat);
+                }
+            }
+            box_lead[col * 64u + row] = a;
+            box_trail[col * 64u + row] = s;
+        }
+        workgroupBarrier();
+        for (var k = 0; k < 8; k++) {
+            let p = c0 + k;
+            if (p > last) {
+                break;
+            }
+            let add = box_lead[u32(k) * 64u + t];
+            if (p <= start) {
+                acc += add;
+            } else {
+                let sub = box_trail[u32(k) * 64u + t];
+                acc += add - sub;
+            }
+            if (p >= start && line < dims.y) {
+                textureStore(out, vec2<i32>(p - r, line), acc * norm);
+            }
+        }
+    }
 }
 
 @compute @workgroup_size(64, 1)
