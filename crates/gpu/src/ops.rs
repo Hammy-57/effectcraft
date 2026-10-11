@@ -108,8 +108,22 @@ pub fn warp_q(
 /// `Image::blend_from`: blend `src` (same size) onto `dst`, clamping and quantising the result
 /// to `levels` when set (see [`warp_q`]).
 pub fn blend_full(e: &mut Enc, dst: &GpuImage, src: &GpuImage, mode: BlendMode, opacity: f32, seed: u32, levels: Option<f32>) -> GpuImage {
+    blend_full_preserve(e, dst, src, mode, opacity, seed, levels, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn blend_full_preserve(
+    e: &mut Enc,
+    dst: &GpuImage,
+    src: &GpuImage,
+    mode: BlendMode,
+    opacity: f32,
+    seed: u32,
+    levels: Option<f32>,
+    preserve: bool,
+) -> GpuImage {
     let mut p = Params::default();
-    p.u[0] = [mode_id(mode), 0, seed, 0];
+    p.u[0] = [mode_id(mode), preserve as u32, seed, 0];
     p.f[0] = [opacity, levels.unwrap_or(0.0), levels.map_or(0.0, |v| 1.0 / v), 0.0];
     let mut out = e.scratch(dst.width, dst.height);
     e.pixels("blend_full", &p, src, Some(dst), &out, None);
@@ -128,13 +142,6 @@ pub fn matte(e: &mut Enc, iso: &GpuImage, matte: &GpuImage, kind: MatteKind) -> 
     };
     let out = e.scratch(iso.width, iso.height);
     e.pixels("matte", &p, iso, Some(matte), &out, None);
-    out
-}
-
-/// Preserve Transparency: multiply by the alpha below.
-pub fn preserve(e: &mut Enc, iso: &GpuImage, canvas: &GpuImage) -> GpuImage {
-    let out = e.scratch(iso.width, iso.height);
-    e.pixels("preserve", &Params::default(), iso, Some(canvas), &out, None);
     out
 }
 

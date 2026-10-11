@@ -16,6 +16,8 @@
 //!     [--profile main|main10] [--level auto|4.1] [--rate-control bitrate|quality] [--video-quality 1-100]
 //!     [--keyint FRAMES] [--webm-codec vp9|av1] [--audio-bitrate KBPS] [--opus-app audio|voice]
 //!     (a relative --out is relative to the working directory; --queue outputs follow the project's own settings)
+//! effectcraft-cli render --template T.ectemplate [--values V.json] --out FILE
+//! effectcraft-cli render-frame --template T.ectemplate [--values V.json] [--time S] [--out F.png]
 //! effectcraft-cli render F.ecproj --queue                    render the project's Render Queue
 //! effectcraft-cli compare A.png B.png [--threshold L] [--min-psnr DB] [--max-side PX] [--diff D.png]
 //!     compare two images (goldens, After Effects references): metrics; exit 1 when they differ
@@ -49,6 +51,7 @@ use std::io::Write;
 mod figma_bridge;
 #[cfg(feature = "ui")]
 mod offscreen_ui;
+mod template;
 
 use effectcraft_automation::tools::{self, Reply};
 use effectcraft_automation::{Backend, McpServer};
@@ -116,6 +119,7 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
   compare A.png B.png [--threshold L] [--min-psnr DB] [--max-side PX] [--amplify K] [--diff D.png]
                                            compare two PNG/JPEG images (max/mean abs diff, PSNR, SSIM, changed
                                            pixels; --diff writes a heatmap); exit 1 when they don't pass
+  render/render-frame --template T.ectemplate [--values V.json]   render one template instance
   bench [--comp C] [--time S] [--scale K] [--n N] [--play N] [--gpu [--adv3d]]   per-layer/effect render timings;
                                            --play N renders N consecutive frames with/without the layer cache;
                                            --gpu compares CPU and GPU ms/frame for every comp at Full and Half
@@ -136,6 +140,9 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
                                            --all-tools also lists the older tool aliases;
                                            --client NAME (or EFFECTCRAFT_CLIENT) runs every tool call as
                                            that agent: its own selection, comp and time, comp claims
+      [--automation-read-root DIR] [--automation-write-root DIR]
+                                           confine the agent's file access: reads under a read or write root,
+                                           writes under a write root (each repeatable); scripts are refused
   serve [F.ecproj | --demo] [--control PORT] [--gpu]
                                            a windowless host: one project that several agents work on at
                                            once over the control channel (join with mcp --bridge PORT or
@@ -181,6 +188,8 @@ const VALUED: &[&str] = &[
     "--ui-size",
     "--ui-scale",
     // render
+    "--template",
+    "--values",
     "--format",
     "--start",
     "--end",
@@ -200,6 +209,9 @@ const VALUED: &[&str] = &[
     "--webm-codec",
     "--audio-bitrate",
     "--opus-app",
+    // mcp
+    "--automation-read-root",
+    "--automation-write-root",
 ];
 
 /// Options without a value. Any other `--option` is a usage error.
@@ -276,6 +288,10 @@ impl Args {
     }
     fn flag(&self, k: &str) -> bool {
         self.opts.iter().any(|(o, _)| o == k)
+    }
+    /// Every value of a repeatable option, in order.
+    fn opts(&self, k: &str) -> Vec<&str> {
+        self.opts.iter().filter(|(o, _)| o == k).filter_map(|(_, v)| v.as_deref()).collect()
     }
     fn opt(&self, k: &str) -> Option<&str> {
         self.opts.iter().rev().find(|(o, _)| o == k).and_then(|(_, v)| v.as_deref())
@@ -611,6 +627,7 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
     } else if args.opt("--ui-size").is_some() || args.opt("--ui-scale").is_some() {
         return usage_err("--ui-size and --ui-scale need --ui");
     }
+    template::validate(cmd, args)?;
     match cmd {
         "render" => render(args, json_out)?,
         "figma-bridge" => {
@@ -752,7 +769,13 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
             emit(&with_saved(v, saved), json_out);
         }
         "render-frame" | "frame" => {
-            let mut b = backend(args, true)?;
+            let mut b = if args.opt("--template").is_some() {
+                let mut s = session(args)?;
+                template::prepare(&mut s, args)?;
+                Backend::headless(s)
+            } else {
+                backend(args, true)?
+            };
             let comp = args.opt("--comp").and_then(reference);
             let mut time = args.num("--time")?;
             let mut max_side = args.num("--max-side")?.map(|m| m as u32).unwrap_or(0);
@@ -794,7 +817,12 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
             {
                 effectcraft_engine::hosts::announce(&dir, "mcp", None);
             }
-            let b = backend(args, false)?;
+            let mut b = backend(args, false)?;
+            let (read, write) = (args.opts("--automation-read-root"), args.opts("--automation-write-root"));
+            if !read.is_empty() || !write.is_empty() {
+                let roots = |r: Vec<&str>| r.into_iter().map(std::path::PathBuf::from).collect::<Vec<_>>();
+                b.confine(effectcraft_automation::confine::Confinement::new(&roots(read), &roots(write))?);
+            }
             // --client NAME (or EFFECTCRAFT_CLIENT): every tool call runs as that agent (its own
             // selection, active comp and time; comp claims).
             let client = args.opt("--client").map(str::to_string).or_else(|| std::env::var("EFFECTCRAFT_CLIENT").ok()).filter(|c| !c.is_empty());
@@ -919,15 +947,19 @@ fn from_cwd(path: &str) -> Result<String, Failure> {
 /// `render`: queue `--comp` (or the active comp) with the given settings unless `--queue`, then
 /// render the queue with a progress line on stderr. Fails if any item fails.
 fn render(args: &Args, json_out: bool) -> Result<(), Failure> {
-    use effectcraft_engine::project::render_queue::RenderStatus;
+    use effectcraft_engine::project::render_queue::{OutputFormat, RenderStatus};
     if args.opt("--bridge").is_some() {
         return usage_err("render runs headless; use `exec renderQueue.add` / `renderQueue.render` with --bridge");
     }
     let mut s = session(args)?;
-    match &args.project {
-        Some(p) => s.execute("file.open", json!({"path": p})).map_err(|e| Failure::Error(e.to_string()))?,
-        None => s.execute("file.openDemoProject", json!({})).map_err(|e| Failure::Error(e.to_string()))?,
-    };
+    if args.opt("--template").is_some() {
+        template::prepare(&mut s, args)?;
+    } else {
+        match &args.project {
+            Some(p) => s.execute("file.open", json!({"path": p})).map_err(|e| Failure::Error(e.to_string()))?,
+            None => s.execute("file.openDemoProject", json!({})).map_err(|e| Failure::Error(e.to_string()))?,
+        };
+    }
     let err = |e: effectcraft_engine::EngineError| Failure::Error(e.to_string());
     if !args.flag("--queue") {
         let Some(out) = args.opt("--out") else { return usage_err("render: --out FILE is required (or --queue)") };
@@ -966,6 +998,11 @@ fn render(args: &Args, json_out: bool) -> Result<(), Failure> {
         }
         if let Some(v) = args.num("--bitrate")? {
             p["bitrate"] = json!(v);
+            // VP9 WebM encodes by quality unless told to target the bitrate (#440).
+            // The format parser decides what is WebM, so its aliases (`vp9`, `webmvp9opus`) count.
+            if p["format"].as_str().and_then(OutputFormat::from_name) == Some(OutputFormat::WebM) {
+                p["webmBitrate"] = json!(true);
+            }
         }
         for (flag, key) in [
             ("--profile", "profile"),

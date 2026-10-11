@@ -517,6 +517,20 @@ fn draw_bounds(d: &Draw, paths: &[BezPath]) -> Option<kurbo::Rect> {
     Some(b.inflate(grow, grow))
 }
 
+/// Local-space visual bounds of a draw, as After Effects' layer bounds (`sourceRectAtTime` with
+/// extents): the path bounds, plus half the stroke width for strokes. No anti-aliasing or miter
+/// padding, so snapping and Align put edges exactly together (#352).
+fn visual_bounds(d: &Draw, paths: &[BezPath]) -> Option<kurbo::Rect> {
+    let b = effectcraft_path::bounds(paths)?;
+    let stroke = match &d.paint {
+        Paint::Stroke { style, .. } => Some(style),
+        Paint::Gradient { stroke: Some(style), .. } => Some(style),
+        _ => None,
+    };
+    let grow = stroke.map_or(0.0, |style| style.width * 0.5 * d.xf.mean_scale());
+    Some(if grow.is_finite() && grow > 0.0 { b.inflate(grow, grow) } else { b })
+}
+
 /// Maximum number of coverage pixels rasterised concurrently (bounds peak memory).
 const BATCH_PIXELS: usize = 8 << 20;
 
@@ -661,16 +675,16 @@ pub fn stroke_region(paths: &[BezPath], style: &StrokeStyle) -> Option<BezPath> 
     (!r.elements().is_empty()).then_some(r)
 }
 
-/// Layer-space bounds of a shape layer's painted contents (strokes included), without
-/// rasterising.
+/// Layer-space visual bounds of a shape layer's painted contents (half the stroke width
+/// included, no anti-aliasing padding), without rasterising.
 pub fn content_bounds(ctx: &EvalCtx, layer: &Layer, contents: &PropGroup) -> Option<kurbo::Rect> {
     let mut arena = Vec::new();
     let (draws, _) = collect(ctx, layer, contents, &mut arena);
     draws
         .iter()
         .filter_map(|d| {
-            let paths: Vec<BezPath> = d.slots.iter().map(|&i| arena[i].clone()).filter(|p| !p.elements().is_empty()).collect();
-            draw_bounds(d, &paths)
+            let paths: Vec<BezPath> = d.slots.iter().filter_map(|&i| arena.get(i).cloned()).filter(|p| !p.elements().is_empty()).collect();
+            visual_bounds(d, &paths)
         })
         .reduce(|a, b| a.union(b))
 }

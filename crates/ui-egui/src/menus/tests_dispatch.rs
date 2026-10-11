@@ -70,6 +70,9 @@ const PINNED_INVOKE: &[&str] = &[
     "keys.velocity",
     "keys.interpolation",
     "layer.timeStretch",
+    "window.maximizeApp",
+    "view.theme.toggle",
+    "project.deleteWithoutConfirmation",
 ];
 
 /// The ids `menus::frontend` handled (frontend events of engine commands), in the old match order.
@@ -132,6 +135,8 @@ const PINNED_FRONTEND: &[&str] = &[
     "effect.manage",
     "anim.browsePresets",
     "timeline.revealProps",
+    "window.maximizeApp",
+    "project.deleteWithoutConfirmation",
 ];
 
 fn pinned(stage: Stage) -> &'static [&'static str] {

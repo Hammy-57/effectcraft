@@ -28,7 +28,9 @@ fn ok_json(args: &[&str]) -> Value {
 fn tmp(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("ec-cli-test-{}", std::process::id()));
     std::fs::create_dir_all(&d).unwrap();
-    d.join(name)
+    // macOS's `/var` is a symlink to `/private/var`: a child process resolves its working
+    // directory through `current_dir()`, which is canonical, so compare canonical paths.
+    std::fs::canonicalize(&d).unwrap_or(d).join(name)
 }
 
 #[test]
@@ -441,7 +443,9 @@ fn mcp_autosave_survives_kill_and_restart_without_touching_desktop_settings() {
     assert_eq!(manifest["ended"], false);
     let mut restarted = McpChild::start(&config, true);
     let init = restarted.rpc("initialize", json!({}));
-    assert!(init["instructions"].as_str().unwrap().contains(path));
+    // The instructions carry the auto-save state as JSON, where a Windows path's backslashes
+    // are escaped.
+    assert!(init["instructions"].as_str().unwrap().contains(&Value::from(path).to_string()));
     assert_eq!(init["_meta"]["effectcraftAutoSave"]["previousSessions"][0]["autosave"], path);
     restarted.tool("open_project", json!({"path":path}));
     let comp = restarted.tool("get_comp", json!({"comp":"Survives restart"}));
@@ -603,4 +607,34 @@ fn opening_a_hosted_project_takes_it_over() {
     assert!(exited.join().unwrap().unwrap().success(), "the host stopped cleanly");
     assert!(serde_json::to_string(&*s.project).unwrap().contains("Agent's unsaved work"), "the agent's work came along");
     assert!(effectcraft_engine::hosts::list().iter().all(|h| h["kind"] != "host"), "the host left the host list");
+}
+
+/// `render --bitrate` (#440) targets the bitrate in VP9 WebM.
+#[test]
+fn render_bitrate_applies_to_vp9_webm() {
+    let root = tmp("webm-bitrate");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let project = root.join("x.ecproj");
+    let p = project.to_str().unwrap();
+    ok_json(&[
+        "run",
+        "comp.new",
+        r##"{"name":"T","width":320,"height":180,"duration":1}"##,
+        "layer.newSolid",
+        r##"{"width":320,"height":180}"##,
+        "effect.apply",
+        r##"{"layer":"#1","effect":"ec.noise.fractal"}"##,
+        "--empty",
+        "--save-as",
+        p,
+    ]);
+    let size = |kbps: &str| {
+        let out = root.join(format!("b{kbps}.webm"));
+        ok_json(&["render", "--project", p, "--start", "0", "--end", "0.5", "--bitrate", kbps, "--out", out.to_str().unwrap()]);
+        std::fs::metadata(&out).unwrap().len()
+    };
+    let (low, high) = (size("100"), size("8000"));
+    assert!(high > low, "100 kbps: {low} bytes, 8000 kbps: {high} bytes");
+    let _ = std::fs::remove_dir_all(&root);
 }

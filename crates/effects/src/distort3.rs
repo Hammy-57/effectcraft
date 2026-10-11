@@ -182,8 +182,9 @@ fn cc_power_pin(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let (x0, y0) = (-ex[1] / 100.0 * lw, -ex[0] / 100.0 * lh);
     let (x1, y1) = (lw + ex[2] / 100.0 * lw, lh + ex[3] / 100.0 * lh);
     let corners_layer = [ctx.params.v2("topLeft"), ctx.params.v2("topRight"), ctx.params.v2("bottomRight"), ctx.params.v2("bottomLeft")];
-    // Grow the buffer to hold the pinned quad.
-    if !ctx.adjustment {
+    let unstretch = ctx.params.b("unstretch");
+    // Grow the buffer to hold the pinned quad (Unstretch writes inside the layer rectangle, so it needs no room).
+    if !ctx.adjustment && !unstretch {
         let mut need = 0.0f64;
         for c in &corners_layer {
             let (px, py) = b.to_px(*c);
@@ -198,7 +199,8 @@ fn cc_power_pin(ctx: &EffectCtx, mut b: Buf) -> Buf {
         vec2(p.0, p.1)
     });
     let persp = (ctx.params.f("perspective") / 100.0).clamp(0.0, 1.0);
-    let Some(inv) = Mat3::square_to_quad(q).inverse() else { return b };
+    let fwd = Mat3::square_to_quad(q);
+    let Some(inv) = fwd.inverse() else { return b };
     let src = b.img.clone();
     let (sc, off) = (b.scale, b.offset);
     let bil = move |u: f64, v: f64| -> (f64, f64) {
@@ -208,6 +210,17 @@ fn cc_power_pin(ctx: &EffectCtx, mut b: Buf) -> Buf {
     };
     b.img = crate::util::gen_image(src.width, src.height, |x, y| {
         let (px, py) = (x as f64 + 0.5, y as f64 + 0.5);
+        if unstretch {
+            // Reverse pinning: the layer rectangle is the target, and the pinned quad is the region that fills it.
+            let u = ((px - off[0]) / sc - x0) / (x1 - x0);
+            let v = ((py - off[1]) / sc - y0) / (y1 - y0);
+            if !(-1e-9..=1.0 + 1e-9).contains(&u) || !(-1e-9..=1.0 + 1e-9).contains(&v) {
+                return [0.0; 4];
+            }
+            let m = fwd.apply(vec2(u, v));
+            let (bx, by) = bil(u, v);
+            return src.sample_bilinear(bx + (m.x - bx) * persp, by + (m.y - by) * persp);
+        }
         let m = inv.apply(vec2(px, py));
         let (mut u, mut v) = (m.x, m.y);
         if persp < 1.0 {
@@ -1216,6 +1229,23 @@ mod tests {
         assert_eq!(o.img.get(3, 10)[3], 0.0);
         let px = o.img.get(15, 10);
         assert!((px[0] - 0.5).abs() < 0.1, "{px:?}");
+    }
+
+    #[test]
+    fn power_pin_unstretch_expands_pinned_region() {
+        let im = crate::util::gen_image(24, 16, |_, _| [1.0, 0.0, 0.0, 1.0]);
+        let inset = [("topLeft", pt(6.0, 4.0)), ("topRight", pt(18.0, 4.0)), ("bottomRight", pt(18.0, 12.0)), ("bottomLeft", pt(6.0, 12.0))];
+        let opaque = |o: &Buf| o.img.data.iter().filter(|p| p[3] > 0.99).count();
+        let off = run("ec.distort.ccpowerpin", &inset, im.clone(), &[]);
+        assert_eq!(opaque(&off), 96);
+        let mut set = inset.to_vec();
+        set.push(("unstretch", Value::Bool(true)));
+        let on = run("ec.distort.ccpowerpin", &set, im.clone(), &[]);
+        assert_eq!(opaque(&on), 24 * 16);
+        assert!(on.img.get(0, 0)[3] > 0.99);
+        // Default corners are the identity either way.
+        let id = run("ec.distort.ccpowerpin", &[("unstretch", Value::Bool(true))], im.clone(), &[]);
+        assert!(maxd(&id.img, &im) < 1e-4);
     }
 
     #[test]

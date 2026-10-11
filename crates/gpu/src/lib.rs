@@ -59,6 +59,11 @@ mod classic3d;
 mod context;
 pub mod deferred;
 mod effects;
+mod fusion;
+/// Whether per-pixel effect fusion is enabled (profiling builds support an A/B override).
+pub fn color_fusion_enabled() -> bool {
+    fusion::enabled()
+}
 mod fx_color;
 mod fx_depth;
 mod fx_distort;
@@ -104,6 +109,8 @@ pub struct Gpu {
     ctx: Arc<GpuContext>,
     /// Backend::Auto's per-comp CPU / GPU timings.
     auto: Arc<effectcraft_render::AutoPick>,
+    /// (comp, reason) pairs already warned about when the GPU declined a frame.
+    declined: Arc<std::sync::Mutex<std::collections::HashSet<(u64, String)>>>,
 }
 
 /// A viewer frame left on the GPU: premultiplied RGBA8 (`wgpu::TextureFormat::Rgba8Unorm`) with
@@ -155,7 +162,7 @@ impl Gpu {
     }
 
     pub fn from_context(ctx: GpuContext) -> Gpu {
-        Gpu { ctx: Arc::new(ctx), auto: Default::default() }
+        Gpu { ctx: Arc::new(ctx), auto: Default::default(), declined: Default::default() }
     }
 
     /// A device of its own without blocking, with deferred readbacks (a browser worker, see
@@ -287,8 +294,11 @@ impl Gpu {
         }
     }
 
-    /// Contain native allocation failures (out-of-memory, internal errors and unwinds).
-    /// A failed result is discarded and caches released; callers can retry on the CPU.
+    /// Contain native allocation failures (out-of-memory, internal errors and unwinds) in
+    /// thread-local error scopes. A failed result is discarded and cached allocations are
+    /// released; callers can retry with a fresh CPU renderer. Some drivers report a failed
+    /// allocation as an internal error rather than out-of-memory (Adreno's
+    /// `ERROR_INITIALIZATION_FAILED`, #591), so both count.
     /// Browser callers use the host/owned-device failure bridge and bounded readbacks instead
     /// of blocking their event loop on an error-scope future.
     pub fn within_memory<T>(&self, f: impl FnOnce() -> T) -> Result<T, String> {
@@ -325,6 +335,18 @@ impl Gpu {
         }
     }
 
+    /// Why a frame was not rendered (best effort: device health, else size / support).
+    fn decline_reason(&self) -> String {
+        match self.ctx.check_health() {
+            Err(e) => format!("device failure / out of memory: {e}"),
+            Ok(()) if !self.ctx.can_readback() => "no GPU readback is available here".into(),
+            Ok(()) => format!(
+                "the GPU compositor did not handle the frame (a region of interest, unsupported content, a frame over the {} px texture limit, or an allocation failed)",
+                self.ctx.max_dim
+            ),
+        }
+    }
+
     /// Wait for submitted GPU work with the readback deadline (benchmarks).
     pub fn wait(&self) {
         let _ = self.ctx.poll_readbacks(wgpu::PollType::Wait { submission_index: None, timeout: Some(crate::readback::TIMEOUT) });
@@ -337,7 +359,21 @@ impl Accelerator for Gpu {
     }
 
     fn comp_frame(&self, r: &Renderer, comp: ItemId, t: Tick) -> Option<Image> {
-        self.render(r, comp, t)
+        let img = self.render(r, comp, t);
+        if img.is_none() {
+            // The caller renders the frame on the CPU; say so and why, or an export that falls
+            // back frame after frame is only mysteriously slow. Once per comp and reason as a
+            // warning (the log keeps only the last few hundred, for the System Report), then at
+            // debug level.
+            let reason = self.decline_reason();
+            let first = self.declined.lock().map(|mut seen| seen.len() < 256 && seen.insert((comp.0, reason.clone()))).unwrap_or(false);
+            if first {
+                log::warn!(target: "effectcraft_gpu", "GPU declined the frame at {:.3} s, the CPU renders it: {reason}", t.seconds());
+            } else {
+                log::debug!(target: "effectcraft_gpu", "GPU declined the frame at {:.3} s: {reason}", t.seconds());
+            }
+        }
+        img
     }
 
     fn supports_effect(&self, id: &str) -> bool {

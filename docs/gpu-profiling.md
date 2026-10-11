@@ -49,6 +49,19 @@ CPU fallback. CPU-only layer work and unsupported individual effects inside the 
 still allowed and visible in CPU spans. Use the existing CPU/GPU oracle suite to check fidelity;
 timings alone do not establish correctness or a performance improvement.
 
+### Colour fusion
+
+Colour fusion (RT2b): profiling builds accept `EFFECTCRAFT_PROFILE_FUSION=0` to
+run consecutive colour effects as separate passes; the report records `colorFusion`.
+Use the same binary and inputs in alternating off/on/on/off runs. Default builds
+always enable fusion. Levels (RGB controls), Curves, Tint and Exposure share exact
+pointwise shader arithmetic, preserving premultiplication and quantization after
+each effect. Channel-specific Levels and unsupported effects remain boundaries.
+Generated pipelines are cached by operation sequence (parameters stay dynamic),
+with at most 32 cached sequences and 32 operations per pass. Full caches or failed
+compilation use the existing separate-pass path. Opacity and Preserve Transparency
+apply within compositing; the latter no longer needs its own pass.
+
 ### Pipeline warm-up
 
 The native UI returns its first UI invocation before starting one background

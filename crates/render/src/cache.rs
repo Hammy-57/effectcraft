@@ -1,8 +1,9 @@
 //! Layer render cache.
 //!
 //! The processed pixels of a layer (source → masks → effects, in layer space) depend only on the
-//! layer's own non-transform properties, its source item and the render options — not on its
-//! transform, opacity, blend mode or anything below it. [`LayerCache`] keeps those buffers keyed
+//! layer's non-transform properties, its source item, selected-layer dependencies and the render
+//! options. Its own transform is normally applied later; referenced layers' transforms can
+//! affect their sampled pixels. [`LayerCache`] keeps those buffers keyed
 //! by a content hash of exactly those inputs, *evaluated at the frame time*, so:
 //!
 //! * a static layer (or one whose only animation is in Transform) renders once and is reused on
@@ -53,6 +54,8 @@ use effectcraft_project::{Comp, FootageKind, ItemKind, Layer, LayerSource, Node,
 
 use crate::eval::EvalCtx;
 use crate::packed::PackedBuf;
+
+mod dependencies;
 
 /// Thread-safe, memory-budgeted cache of processed layer buffers, optionally backed by the
 /// persistent [`DiskCache`](crate::disk_cache::DiskCache): a memory miss reads the disk, and
@@ -1239,6 +1242,9 @@ fn key_with(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool, f
 fn key_any(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool, footage: bool, effects: Option<usize>, src: Option<u64>) -> Option<u64> {
     let info = layer_info(ctx.comp, layer);
     let mut h = KeyHasher(0xcbf2_9ce4_8422_2325);
+    ctx.comp.frame_rate.as_f64().to_bits().hash(&mut h);
+    ctx.comp.enable_frame_blending.hash(&mut h);
+    dependencies::hash(&mut h, ctx, layer, effects)?;
     match &layer.source {
         LayerSource::Solid { item } => {
             let it = ctx.project.item(*item)?;

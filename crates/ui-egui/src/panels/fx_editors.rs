@@ -581,7 +581,7 @@ fn colorama_wheel(
             t.text_dim,
         );
         let mut rgb = [col[0], col[1], col[2]];
-        if crate::header::color_popup(ui, pop, sr.left_bottom(), &mut rgb) {
+        if crate::widgets::color_popup(ui, pop, sr.left_bottom(), &mut rgb) {
             let mut st = pal.stops.clone();
             st[sel].1 = [rgb[0], rgb[1], rgb[2], col[3]];
             new_stops = Some(st);

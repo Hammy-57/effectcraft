@@ -422,11 +422,12 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     };
     match app.session.execute(cmd, params) {
         Err(e) => app.ui.status = e.to_string(),
-        Ok(_) => {
+        Ok(applied) => {
             if let Apply::Effect(id) = &apply {
                 push_recent(&mut app.ui.effects_recent, id);
                 app.show_panel(crate::dock::PanelKind::EffectControls);
                 app.ui.focused = crate::dock::PanelKind::EffectsPresets;
+                crate::panels::effect_controls::choose_files_after_apply(app, &applied);
             }
         }
     }

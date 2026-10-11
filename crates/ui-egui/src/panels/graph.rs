@@ -14,8 +14,8 @@ use egui::{Align2, Color32, Pos2, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
 use serde_json::json;
 
 use super::timeline::TMap;
-use crate::EffectcraftApp;
 use crate::theme::Tokens;
+use crate::{EffectcraftApp, widgets};
 
 type Actions = Vec<(String, serde_json::Value)>;
 
@@ -202,7 +202,80 @@ fn curves<'a>(app: &EffectcraftApp, ctx: &egui::Context, comp: &'a Comp, ectx: &
     out
 }
 
-fn text_button(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, x: &mut f32, y: f32, label: &str, on: bool, id: &str, tip: &str) -> bool {
+/// The Graph Editor's button bar, laid out left to right. Buttons that would run past the right
+/// edge (a Timeline narrower than the whole row, #457) go to the "»" menu at its end instead of
+/// being clipped, so every one stays reachable.
+struct ButtonBar {
+    x: f32,
+    /// Where the next button must end to stay on the bar (the "»" button's room is kept free).
+    limit: f32,
+    /// Buttons moved to the "»" menu: (automation id, label, on, tooltip).
+    hidden: Vec<(String, String, bool, String)>,
+    /// The id picked from the "»" menu last frame, run by its button this frame.
+    chosen: Option<String>,
+}
+
+/// The "»" menu's popup and the id it picked (read by the next frame's buttons).
+const MORE_POPUP: &str = "graph-more";
+
+impl ButtonBar {
+    const MORE_W: f32 = 24.0;
+
+    fn new(ctx: &egui::Context, bar: Rect) -> Self {
+        let chosen = ctx.data_mut(|d| d.remove_temp::<String>(egui::Id::new(MORE_POPUP).with("chosen")));
+        ButtonBar { x: bar.min.x + 8.0, limit: bar.max.x - 8.0 - Self::MORE_W - 4.0, hidden: Vec::new(), chosen }
+    }
+
+    /// The "»" button and its menu, when buttons did not fit.
+    fn more(&mut self, app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, bar: Rect) {
+        if self.hidden.is_empty() {
+            return;
+        }
+        let t = app.tokens;
+        let r = Rect::from_min_size(pos2(bar.max.x - 8.0 - Self::MORE_W, bar.center().y - 9.0), vec2(Self::MORE_W, 18.0));
+        let pid = egui::Id::new(MORE_POPUP);
+        let resp = ui.interact(r, pid.with("button"), Sense::click()).on_hover_text(crate::i18n::tr("More"));
+        p.rect_filled(r, 3.0, if resp.hovered() { t.hover } else { Color32::from_rgb(0x2c, 0x2c, 0x2c) });
+        p.text(r.center(), Align2::CENTER_CENTER, "»", Tokens::ui(12.0), t.text);
+        app.auto.add("timeline.graph.more", r, "More");
+        if resp.clicked() {
+            let open = widgets::popup_is_open(ui, pid);
+            ui.data_mut(|d| d.insert_temp(pid.with("open"), !open));
+        }
+        if !widgets::popup_is_open(ui, pid) {
+            return;
+        }
+        let rows = self.hidden.len();
+        let pos = r.left_top() - vec2(0.0, rows as f32 * 22.0 + 18.0);
+        let chosen = widgets::popup_list(ui, pid, pos, r, rows, 0, |ui| {
+            let mut chosen = None;
+            for (id, label, on, tip) in &self.hidden {
+                let item = ui.selectable_label(*on, label.as_str()).on_hover_text(tip.as_str());
+                app.auto.add(&format!("timeline.graph.more.{id}"), item.rect, tip);
+                if item.clicked() {
+                    chosen = Some(id.clone());
+                }
+            }
+            chosen
+        });
+        if let Some(id) = chosen {
+            ui.data_mut(|d| d.insert_temp(pid.with("chosen"), id));
+            ui.ctx().request_repaint();
+        }
+    }
+}
+
+fn text_button(
+    app: &mut EffectcraftApp,
+    ui: &mut egui::Ui,
+    p: &egui::Painter,
+    bar: &mut ButtonBar,
+    y: f32,
+    label: &str,
+    on: bool,
+    id: &str,
+    tip: &str,
+) -> bool {
     let t = app.tokens;
     let name = match label {
         "Fit" => "graph-fit",
@@ -218,7 +291,12 @@ fn text_button(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, x
     };
     let icon = if name.is_empty() { None } else { crate::local_assets::icon(ui.ctx(), name) };
     let w = if icon.is_some() { 24.0 } else { p.layout_no_wrap(label.to_string(), Tokens::ui(11.0), t.text).size().x + 14.0 };
-    let r = Rect::from_min_size(pos2(*x, y - 9.0), vec2(w, 18.0));
+    // Once one button overflows, the rest follow it into the menu (they keep their order).
+    if !bar.hidden.is_empty() || bar.x + w > bar.limit {
+        bar.hidden.push((id.to_string(), label.to_string(), on, tip.to_string()));
+        return bar.chosen.as_deref() == Some(id);
+    }
+    let r = Rect::from_min_size(pos2(bar.x, y - 9.0), vec2(w, 18.0));
     let resp = ui.interact(r, egui::Id::new(("graph-btn", id)), Sense::click()).on_hover_text(tip);
     p.rect_filled(
         r,
@@ -238,7 +316,7 @@ fn text_button(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, x
         p.text(r.center(), Align2::CENTER_CENTER, label, Tokens::ui(11.0), color);
     }
     app.auto.add(&format!("timeline.graph.{id}"), r, tip);
-    *x += w + 4.0;
+    bar.x += w + 4.0;
     resp.clicked()
 }
 
@@ -537,14 +615,14 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
     p.rect_filled(bar, 0.0, t.panel_bg);
     p.line_segment([bar.left_top(), bar.right_top()], Stroke::new(1.0, t.separator));
     let y = bar.center().y;
-    let mut x = bar.min.x + 8.0;
+    let mut buttons = ButtonBar::new(&ctx, bar);
     let tl = &app.ui.timeline;
     let (auto_type, show_sel, auto_on) = (tl.graph_mode == "auto", tl.graph_show_selected, tl.graph_auto_zoom);
     if text_button(
         app,
         ui,
         p,
-        &mut x,
+        &mut buttons,
         y,
         "Auto",
         auto_type,
@@ -554,44 +632,44 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
         set_graph_type(app, if auto_type { if speed { "speed" } else { "value" } } else { "auto" });
     }
     // Choosing a graph type turns Auto-Select off, as in After Effects.
-    if text_button(app, ui, p, &mut x, y, "Value", !speed, "valueGraph", "Edit Value Graph") {
+    if text_button(app, ui, p, &mut buttons, y, "Value", !speed, "valueGraph", "Edit Value Graph") {
         set_graph_type(app, "value");
     }
-    if text_button(app, ui, p, &mut x, y, "Speed", speed, "speedGraph", "Edit Speed Graph") {
+    if text_button(app, ui, p, &mut buttons, y, "Speed", speed, "speedGraph", "Edit Speed Graph") {
         set_graph_type(app, "speed");
     }
-    x += 6.0;
-    if text_button(app, ui, p, &mut x, y, "Selected", show_sel, "showSelected", "Show Selected Properties (else all animated properties)") {
+    buttons.x += 6.0;
+    if text_button(app, ui, p, &mut buttons, y, "Selected", show_sel, "showSelected", "Show Selected Properties (else all animated properties)") {
         app.ui.timeline.graph_show_selected = !show_sel;
     }
-    if text_button(app, ui, p, &mut x, y, "Auto-zoom", auto_on, "autoZoom", "Auto-zoom graph height") {
+    if text_button(app, ui, p, &mut buttons, y, "Auto-zoom", auto_on, "autoZoom", "Auto-zoom graph height") {
         app.ui.timeline.graph_auto_zoom = !auto_on;
     }
-    if text_button(app, ui, p, &mut x, y, "Fit", false, "fit", "Fit all graphs to view") {
+    if text_button(app, ui, p, &mut buttons, y, "Fit", false, "fit", "Fit all graphs to view") {
         fit_all(app);
     }
-    if text_button(app, ui, p, &mut x, y, "Fit Selection", false, "fitSelection", "Fit selection to view") {
+    if text_button(app, ui, p, &mut buttons, y, "Fit Selection", false, "fitSelection", "Fit selection to view") {
         fit_selection(app, &cs, ectx, speed, plot);
     }
-    x += 6.0;
+    buttons.x += 6.0;
     let (snap, reference, tbox) = (app.ui.timeline.graph_snap, app.ui.timeline.graph_reference, app.ui.timeline.graph_transform_box);
-    if text_button(app, ui, p, &mut x, y, "Snap", snap, "snap", "Snap (key drags snap to the current time and other keys)") {
+    if text_button(app, ui, p, &mut buttons, y, "Snap", snap, "snap", "Snap (key drags snap to the current time and other keys)") {
         app.ui.timeline.graph_snap = !snap;
     }
-    if text_button(app, ui, p, &mut x, y, "Reference", reference, "reference", "Show Reference Graph") {
+    if text_button(app, ui, p, &mut buttons, y, "Reference", reference, "reference", "Show Reference Graph") {
         app.ui.timeline.graph_reference = !reference;
     }
-    if text_button(app, ui, p, &mut x, y, "Transform Box", tbox, "transformBox", "Show Transform Box when multiple keys are selected") {
+    if text_button(app, ui, p, &mut buttons, y, "Transform Box", tbox, "transformBox", "Show Transform Box when multiple keys are selected") {
         app.ui.timeline.graph_transform_box = !tbox;
     }
-    x += 6.0;
+    buttons.x += 6.0;
     let pos_sel = app.session.state.selected_props.iter().find_map(|(l, u)| super::timeline::is_position(comp.layer(*l)?, *u).then_some(l.0));
-    if text_button(app, ui, p, &mut x, y, "Separate Dimensions", false, "separateDimensions", "Separate Dimensions (Position)")
+    if text_button(app, ui, p, &mut buttons, y, "Separate Dimensions", false, "separateDimensions", "Separate Dimensions (Position)")
         && let Some(l) = pos_sel.or(app.session.state.selected_layers.first().map(|l| l.0))
     {
         actions.push(("prop.separateDimensions".into(), json!({"layer": l})));
     }
-    x += 6.0;
+    buttons.x += 6.0;
     for (label, cmd, params, tip) in [
         ("Hold", "keys.interpolation", json!({"interpolation": "hold"}), "Convert selected keyframes to Hold"),
         ("Linear", "keys.interpolation", json!({"interpolation": "linear"}), "Convert selected keyframes to Linear"),
@@ -601,10 +679,11 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
         ("Ease Out", "keys.easyEaseOut", json!({}), "Easy Ease Out (Ctrl+Shift+F9)"),
     ] {
         let id = cmd.trim_start_matches("keys.").to_string() + label.split_whitespace().next().unwrap_or("");
-        if text_button(app, ui, p, &mut x, y, label, false, &id, tip) {
+        if text_button(app, ui, p, &mut buttons, y, label, false, &id, tip) {
             actions.push((cmd.into(), params));
         }
     }
+    buttons.more(app, ui, p, bar);
 }
 
 /// Show graph type `mode` and remember it (Preferences `graphType`): the Graph Editor opens on
