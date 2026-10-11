@@ -90,6 +90,7 @@ fn blend_full(@builtin(global_invocation_id) gid: vec3<u32>) {
     let mode = P.u[0].x;
     let d = textureLoad(aux, p, 0);
     var s = textureLoad(src, p, 0);
+    if (P.u[0].y != 0u) { s = s * d.w; }
     if (s.w <= 0.0 && !is_stencil(mode)) {
         store_q(p, d, P.f[0].y, P.f[0].z);
         return;
@@ -625,29 +626,33 @@ fn pointwise(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (p.x >= dims.x || p.y >= dims.y) {
         return;
     }
-    var px = textureLoad(src, p, 0);
+    textureStore(out, p, pointwise_px(textureLoad(src, p, 0), P, p, gid));
+}
+
+fn pointwise_px(input: vec4<f32>, params: Params, p: vec2<i32>, gid: vec3<u32>) -> vec4<f32> {
+    var px = input;
     let a = px.w;
-    let op = P.u[0].x;
+    let op = params.u[0].x;
     switch op {
         case 1u: {
             if (a > 0.0) {
                 let c = straight(px);
                 let l = clamp(luminance(c), 0.0, 1.0);
-                let blk = P.f[0].xyz;
-                let wht = P.f[1].xyz;
+                let blk = params.f[0].xyz;
+                let wht = params.f[1].xyz;
                 let t = blk + (wht - blk) * l;
-                px = vec4<f32>(mix3(c, t, P.f[2].x) * a, a);
+                px = vec4<f32>(mix3(c, t, params.f[2].x) * a, a);
             }
         }
         case 2u: {
             if (a > 0.0) {
                 let c = straight(px);
-                let br = P.f[0].x;
-                let k = P.f[0].y;
-                let ct = P.f[0].z;
-                if (P.u[0].y == 1u) {
+                let br = params.f[0].x;
+                let k = params.f[0].y;
+                let ct = params.f[0].z;
+                if (params.u[0].y == 1u) {
                     px = vec4<f32>(max((c + br - 0.5) * k + 0.5, vec3<f32>(0.0)) * a, a);
-                } else if (P.u[0].y == 2u) {
+                } else if (params.u[0].y == 2u) {
                     // Brightness & Contrast tone curves (effects crate bc_modern).
                     var o = c;
                     let pb = exp2(-br);
@@ -673,19 +678,19 @@ fn pointwise(@builtin(global_invocation_id) gid: vec3<u32>) {
                 var h = hsl.x;
                 var s = hsl.y;
                 var l = hsl.z;
-                if (P.u[0].y != 0u) {
-                    let cl = P.f[1].z;
+                if (params.u[0].y != 0u) {
+                    let cl = params.f[1].z;
                     var k = l;
                     if (cl > 0.0) {
                         k = 1.0 - l;
                     }
-                    h = P.f[1].x;
-                    s = P.f[1].y;
+                    h = params.f[1].x;
+                    s = params.f[1].y;
                     l = clamp(l + cl * k, 0.0, 1.0);
                 } else {
-                    let hue = P.f[0].x;
-                    let sat = P.f[0].y;
-                    let light = P.f[0].z;
+                    let hue = params.f[0].x;
+                    let sat = params.f[0].y;
+                    let light = params.f[0].z;
                     var s2: f32;
                     if (sat >= 0.0) {
                         s2 = s + (1.0 - s) * sat * min(s, 1.0);
@@ -708,18 +713,18 @@ fn pointwise(@builtin(global_invocation_id) gid: vec3<u32>) {
         case 4u: {
             if (a > 0.0) {
                 let c = straight(px);
-                let ib = P.f[0].x;
-                let iw = P.f[0].y;
-                let g = P.f[0].z;
-                let ob = P.f[0].w;
-                let ow = P.f[1].x;
+                let ib = params.f[0].x;
+                let iw = params.f[0].y;
+                let g = params.f[0].z;
+                let ob = params.f[0].w;
+                let ow = params.f[1].x;
                 var o = vec3<f32>(0.0);
                 for (var i = 0; i < 3; i++) {
                     var t = (c[i] - ib) / max(iw - ib, 1e-6);
-                    if (P.u[0].y != 0u) {
+                    if (params.u[0].y != 0u) {
                         t = max(t, 0.0);
                     }
-                    if (P.u[0].z != 0u) {
+                    if (params.u[0].z != 0u) {
                         t = min(t, 1.0);
                     }
                     t = powz(max(t, 0.0), 1.0 / g);
@@ -734,21 +739,21 @@ fn pointwise(@builtin(global_invocation_id) gid: vec3<u32>) {
                 var o = vec3<f32>(0.0);
                 for (var i = 0; i < 3; i++) {
                     // Per-channel gain, offset, gamma; negative values are mirrored.
-                    if (P.u[0].y != 0u) {
-                        let x = c[i] * P.f[0][i] + P.f[1][i];
-                        o[i] = sign(x) * powz(abs(x), 1.0 / P.f[2][i]);
+                    if (params.u[0].y != 0u) {
+                        let x = c[i] * params.f[0][i] + params.f[1][i];
+                        o[i] = sign(x) * powz(abs(x), 1.0 / params.f[2][i]);
                     } else {
                         let lin = srgb_to_linear(max(c[i], 0.0));
-                        let x = lin * P.f[0][i] + P.f[1][i];
-                        o[i] = sign(x) * linear_to_srgb(powz(abs(x), 1.0 / P.f[2][i]));
+                        let x = lin * params.f[0][i] + params.f[1][i];
+                        o[i] = sign(x) * linear_to_srgb(powz(abs(x), 1.0 / params.f[2][i]));
                     }
                 }
                 px = vec4<f32>(o * a, a);
             }
         }
         case 6u: {
-            let ch = P.u[0].y;
-            let blend = P.f[0].x;
+            let ch = params.u[0].y;
+            let blend = params.f[0].x;
             if (ch == 4u) {
                 let na = 1.0 - a;
                 var k = 0.0;
@@ -770,9 +775,9 @@ fn pointwise(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
         }
         case 7u: {
-            let c = P.f[0];
-            let invert = P.u[0].y != 0u;
-            let opacity = P.f[1].x;
+            let c = params.f[0];
+            let invert = params.u[0].y != 0u;
+            let opacity = params.f[1].x;
             var fa = px.w;
             if (invert) {
                 fa = 1.0 - px.w;
@@ -788,7 +793,7 @@ fn pointwise(@builtin(global_invocation_id) gid: vec3<u32>) {
         case 8u: {
             // effects::color2::map_ca: transparent pixels only change through the alpha curve.
             if (a <= 0.0 && px.x == 0.0 && px.y == 0.0 && px.z == 0.0) {
-                let na = curve_eval(P.f[1].x, 0.0);
+                let na = curve_eval(params.f[1].x, 0.0);
                 if (na > 0.0) {
                     px = vec4<f32>(0.0, 0.0, 0.0, clamp(na, 0.0, 1.0));
                 }
@@ -801,50 +806,50 @@ fn pointwise(@builtin(global_invocation_id) gid: vec3<u32>) {
                 }
                 var o = vec3<f32>(0.0);
                 for (var i = 0; i < 3; i++) {
-                    o[i] = curve_eval(P.f[0][i + 1], curve_eval(P.f[0].x, c[i]));
+                    o[i] = curve_eval(params.f[0][i + 1], curve_eval(params.f[0].x, c[i]));
                 }
-                let na = clamp(curve_eval(P.f[1].x, aa), 0.0, 1.0);
+                let na = clamp(curve_eval(params.f[1].x, aa), 0.0, 1.0);
                 px = vec4<f32>(o * na, na);
             }
         }
         case 9u: {
-            let s = P.f[0].xy;
-            let e = P.f[0].zw;
+            let s = params.f[0].xy;
+            let e = params.f[0].zw;
             let d = e - s;
             let pc = vec3<f32>(f32(p.x) + 0.5, f32(p.y) + 0.5, 1.0);
-            let v = vec2<f32>(dot(P.f[4].xyz, pc), dot(P.f[5].xyz, pc)) - s;
-            let len2 = P.f[3].x;
+            let v = vec2<f32>(dot(params.f[4].xyz, pc), dot(params.f[5].xyz, pc)) - s;
+            let len2 = params.f[3].x;
             var t: f32;
-            if (P.u[0].y != 0u) {
+            if (params.u[0].y != 0u) {
                 t = sqrt((v.x * v.x + v.y * v.y) / len2);
             } else {
                 t = (v.x * d.x + v.y * d.y) / len2;
             }
-            let scatter = P.f[3].y;
+            let scatter = params.f[3].y;
             if (scatter > 0.0) {
-                t += (hash_noise(gid.x, gid.y, P.u[0].z) - 0.5) * scatter;
+                t += (hash_noise(gid.x, gid.y, params.u[0].z) - 0.5) * scatter;
             }
             t = clamp(t, 0.0, 1.0);
-            let c0 = P.f[1].xyz;
-            let c1 = P.f[2].xyz;
-            px = put(px, c0 + (c1 - c0) * t, px.w, P.f[3].z);
+            let c0 = params.f[1].xyz;
+            let c1 = params.f[2].xyz;
+            px = put(px, c0 + (c1 - c0) * t, px.w, params.f[3].z);
         }
         case 10u: {
-            let contrast = P.f[0].x;
-            let brightness = P.f[0].y;
-            let scale = P.f[0].z;
-            let scale_y = P.f[2].w;
-            let infl = P.f[3].x;
-            let fmul = P.f[3].y;
-            let frac = P.f[0].w;
-            let ox = P.f[1].x;
-            let oy = P.f[1].y;
-            let sr = P.f[1].z;
-            let cr = P.f[1].w;
-            let evo = P.f[2].x;
-            let kind = P.u[0].y;
-            let n_oct = P.u[0].z;
-            let seed = P.u[0].w;
+            let contrast = params.f[0].x;
+            let brightness = params.f[0].y;
+            let scale = params.f[0].z;
+            let scale_y = params.f[2].w;
+            let infl = params.f[3].x;
+            let fmul = params.f[3].y;
+            let frac = params.f[0].w;
+            let ox = params.f[1].x;
+            let oy = params.f[1].y;
+            let sr = params.f[1].z;
+            let cr = params.f[1].w;
+            let evo = params.f[2].x;
+            let kind = params.u[0].y;
+            let n_oct = params.u[0].z;
+            let seed = params.u[0].w;
             let dx = f32(p.x) + 0.5 - ox;
             let dy = f32(p.y) + 0.5 - oy;
             let u = (dx * cr + dy * sr) / scale;
@@ -873,7 +878,7 @@ fn pointwise(@builtin(global_invocation_id) gid: vec3<u32>) {
             var val = sum / max(norm, 1e-6);
             val = (val - 0.5) * contrast + 0.5 + brightness;
             // Overflow: Clip, Soft Clamp, Wrap Back, Allow HDR Results.
-            let ov = P.u[1].y;
+            let ov = params.u[1].y;
             if (ov == 0u) {
                 val = clamp(val, 0.0, 1.0);
             } else if (ov == 1u) {
@@ -882,21 +887,21 @@ fn pointwise(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let t = val - 2.0 * floor(val / 2.0);
                 val = select(t, 2.0 - t, t > 1.0);
             }
-            if (P.u[1].x != 0u) {
+            if (params.u[1].x != 0u) {
                 val = 1.0 - val;
             }
-            let op = P.f[2].z;
-            if (P.u[1].z == 1u) {
+            let op = params.f[2].z;
+            if (params.u[1].z == 1u) {
                 // Normal: the noise over the layer at Opacity, then Blend With Original.
                 let over = vec4<f32>(vec3<f32>(val) * op, op) + px * (1.0 - op);
-                px = px * P.f[2].y + over * (1.0 - P.f[2].y);
+                px = px * params.f[2].y + over * (1.0 - params.f[2].y);
             } else {
-                px = put(px, vec3<f32>(val), op, P.f[2].y);
+                px = put(px, vec3<f32>(val), op, params.f[2].y);
             }
         }
         default: {}
     }
-    textureStore(out, p, px);
+    return px;
 }
 
 // Adjustment layer finish (Renderer::draw_adjustment): canvas `src` moves toward the adjusted

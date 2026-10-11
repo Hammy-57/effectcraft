@@ -342,10 +342,7 @@ fn composite_iso_with(
         };
         iso = ops::matte(e, &iso, &mimg, kind);
     }
-    if layer.preserve_transparency {
-        iso = ops::preserve(e, &iso, canvas);
-    }
-    *canvas = ops::blend_full(e, canvas, &iso, layer.blend_mode, opacity, layer.id.0 as u32, levels);
+    *canvas = ops::blend_full_preserve(e, canvas, &iso, layer.blend_mode, opacity, layer.id.0 as u32, levels, layer.preserve_transparency);
     Some(())
 }
 

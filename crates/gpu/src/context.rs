@@ -347,8 +347,9 @@ pub struct GpuContext {
     pub(crate) max_dim: u32,
     integrated: bool,
     auxiliary_budget: std::sync::atomic::AtomicU64,
-    bgl: wgpu::BindGroupLayout,
+    pub(crate) bgl: wgpu::BindGroupLayout,
     bgl_ext: wgpu::BindGroupLayout,
+    pub(crate) fusion: crate::fusion::Pipelines,
     pipelines: HashMap<&'static str, wgpu::ComputePipeline>,
     display_bgl: wgpu::BindGroupLayout,
     display: wgpu::ComputePipeline,
@@ -662,6 +663,7 @@ impl GpuContext {
             bgl,
             bgl_ext,
             pipelines,
+            fusion: Default::default(),
             display_bgl,
             display,
             display_mip,
@@ -1256,6 +1258,23 @@ impl<'g> Enc<'g> {
             log::error!("gpu: no kernel {entry}");
             return;
         };
+        self.dispatch_pipeline(entry, pipe, p, src, aux, out, data, groups, ext);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dispatch_pipeline(
+        &mut self,
+        entry: &str,
+        pipe: &wgpu::ComputePipeline,
+        p: &Params,
+        src: &GpuImage,
+        aux: Option<&GpuImage>,
+        out: &GpuImage,
+        data: Option<&wgpu::Buffer>,
+        groups: (u32, u32),
+        ext: Option<[&wgpu::Buffer; 4]>,
+    ) {
+        let g = self.g;
         // Each dispatch until the next submit gets its own block of the encoder's uniform ring.
         // `write_buffer` lands before the next submission's commands and after earlier
         // submissions', so a ring is reused (after a submit, or by a later encoder) safely.

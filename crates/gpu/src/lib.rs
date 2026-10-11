@@ -59,6 +59,11 @@ mod classic3d;
 mod context;
 pub mod deferred;
 mod effects;
+mod fusion;
+/// Whether per-pixel effect fusion is enabled (profiling builds support an A/B override).
+pub fn color_fusion_enabled() -> bool {
+    fusion::enabled()
+}
 mod fx_color;
 mod fx_depth;
 mod fx_distort;

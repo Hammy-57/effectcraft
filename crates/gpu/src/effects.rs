@@ -66,12 +66,7 @@ pub(crate) fn run_chain(e: &mut Enc, chain: &[FxStep], buf: &Buf, levels: Option
     }
     let misses = deferred.as_ref().map(|d| d.misses());
     let mut b = GBuf { img: e.g.upload_image(&buf.img)?, offset: buf.offset, scale: buf.scale };
-    for step in chain {
-        b = apply(e, step.spec.id, &step.ctx, b)?;
-        if let Some(l) = levels {
-            b.img = ops::quantize(e, &b.img, l);
-        }
-    }
+    b = apply_chain(e, chain, b, levels)?;
     if let (Some(d), Some(k)) = (&deferred, key) {
         // Data the kernels fetched through the effect host missed meanwhile: not genuine.
         if Some(d.misses()) != misses {
@@ -118,14 +113,8 @@ impl<'e, 'g> GpuFx<'e, 'g> {
 impl effectcraft_render::FxTarget for GpuFx<'_, '_> {
     fn gpu(&mut self, steps: &[FxStep]) -> bool {
         let Some(b) = &self.b else { return false };
-        let mut cur = GBuf { img: b.img.clone(), offset: b.offset, scale: b.scale };
-        for step in steps {
-            let Some(next) = apply(self.e, step.spec.id, &step.ctx, cur) else { return false };
-            cur = next;
-            if let Some(l) = self.levels {
-                cur.img = ops::quantize(self.e, &cur.img, l);
-            }
-        }
+        let cur = GBuf { img: b.img.clone(), offset: b.offset, scale: b.scale };
+        let Some(cur) = apply_chain(self.e, steps, cur, self.levels) else { return false };
         self.b = Some(cur);
         true
     }
@@ -141,6 +130,23 @@ impl effectcraft_render::FxTarget for GpuFx<'_, '_> {
             b.offset = [b.offset[0] - d[0], b.offset[1] - d[1]];
         }
     }
+}
+
+pub(crate) fn apply_chain(e: &mut Enc, chain: &[FxStep], mut b: GBuf, levels: Option<f32>) -> Option<GBuf> {
+    let mut remaining = chain;
+    while let Some((step, rest)) = remaining.split_first() {
+        if let Some((image, count)) = crate::fusion::apply(e, remaining, &b.img, levels) {
+            b.img = image;
+            remaining = remaining.get(count..)?;
+            continue;
+        }
+        b = apply(e, step.spec.id, &step.ctx, b)?;
+        if let Some(l) = levels {
+            b.img = ops::quantize(e, &b.img, l);
+        }
+        remaining = rest;
+    }
+    Some(b)
 }
 
 fn apply(e: &mut Enc, id: &str, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
@@ -416,7 +422,7 @@ fn rgb(c: [f32; 4]) -> [f32; 4] {
     [c[0], c[1], c[2], 0.0]
 }
 
-fn pointwise(e: &mut Enc, id: &str, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
+pub(crate) fn pointwise_params(id: &str, ctx: &EffectCtx, offset: [f64; 2], scale: f64) -> Option<Params> {
     let f = |k: &str| ctx.params.f(k);
     let mut p = Params::default();
     match id {
@@ -490,7 +496,7 @@ fn pointwise(e: &mut Enc, id: &str, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
             p.f[1][0] = f("opacity") as f32 / 100.0;
         }
         "ec.generate.gradientramp" => {
-            let (m, s, en) = effectcraft_effects::gradient_ramp_space(ctx, b.offset, b.scale);
+            let (m, s, en) = effectcraft_effects::gradient_ramp_space(ctx, offset, scale);
             let (dx, dy) = (en.0 - s.0, en.1 - s.1);
             let len2 = (dx * dx + dy * dy).max(1e-9);
             p.u[0] = [9, (ctx.params.e("shape") == 1) as u32, ctx.seed, 0];
@@ -521,19 +527,25 @@ fn pointwise(e: &mut Enc, id: &str, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
             }
             let octaves = f("complexity").clamp(1.0, 20.0);
             let (sr, cr) = (f("transform/rotation") as f32).to_radians().sin_cos();
-            let (ox, oy) = b.to_px(pr.v2("transform/offset"));
+            let point = pr.v2("transform/offset");
+            let (ox, oy) = (point[0] * scale + offset[0], point[1] * scale + offset[1]);
             let s = f("transform/scale");
             let (sw, sh) = if pr.b("transform/uniformScaling") { (s, s) } else { (f("transform/scaleWidth"), f("transform/scaleHeight")) };
             let sub = (f("subSettings/subScaling") / 100.0).clamp(0.1, 1.0);
             p.u[0] = [10, kind, octaves.ceil() as u32, f("evolutionOptions/seed") as u32 ^ 0x51ed];
             p.u[1] = [pr.b("invert") as u32, pr.e("overflow"), mode, 0];
-            p.f[0] = [f("contrast") as f32 / 100.0, f("brightness") as f32 / 100.0, (sw * b.scale).max(1.0) as f32, (octaves - octaves.floor()) as f32];
+            p.f[0] = [f("contrast") as f32 / 100.0, f("brightness") as f32 / 100.0, (sw * scale).max(1.0) as f32, (octaves - octaves.floor()) as f32];
             p.f[1] = [ox as f32, oy as f32, sr, cr];
-            p.f[2] = [f("evolution") as f32 / 360.0, f("blend") as f32 / 100.0, (f("opacity") as f32 / 100.0).clamp(0.0, 1.0), (sh * b.scale).max(1.0) as f32];
+            p.f[2] = [f("evolution") as f32 / 360.0, f("blend") as f32 / 100.0, (f("opacity") as f32 / 100.0).clamp(0.0, 1.0), (sh * scale).max(1.0) as f32];
             p.f[3] = [(f("subSettings/subInfluence") as f32 / 100.0).clamp(0.0, 1.0), 1.0 / sub as f32, 0.0, 0.0];
         }
         _ => return None,
     }
+    Some(p)
+}
+
+fn pointwise(e: &mut Enc, id: &str, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
+    let p = pointwise_params(id, ctx, b.offset, b.scale)?;
     let out = e.scratch(b.img.width, b.img.height);
     e.pixels("pointwise", &p, &b.img, None, &out, None);
     Some(GBuf { img: out, ..b })
