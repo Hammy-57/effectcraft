@@ -1541,7 +1541,12 @@ impl EffectcraftApp {
                         self.ui.status = e;
                     }
                 }
-                effectcraft_engine::Event::PurgeCaches => self.frames.clear(),
+                effectcraft_engine::Event::PurgeCaches => {
+                    self.frames.clear();
+                    if let Some(gpu) = &self.gpu {
+                        gpu.context().clear_uploads();
+                    }
+                }
             }
         }
     }
