@@ -216,7 +216,7 @@ impl Gpu {
     pub fn render_display(&self, r: &Renderer, comp: ItemId, t: Tick) -> Option<DisplayFrame> {
         let _profile = effectcraft_render::profile::span("display_prepare");
         self.ctx.check_health().map_err(|e| log::error!("gpu display: {e}")).ok()?;
-        let mut e = Enc::new(&self.ctx);
+        let mut e = Enc::with_owner(&self.ctx, r.cache.and_then(effectcraft_render::cache::LayerCache::gpu_owner));
         let img = walk::render(&mut e, r, comp, t)?;
         let texture = e.display(&img);
         e.submit();
@@ -252,7 +252,7 @@ impl Gpu {
         if let Some(d) = self.ctx.deferred.clone() {
             return self.render_deferred(&d, r, comp, t);
         }
-        let mut e = Enc::new(&self.ctx);
+        let mut e = Enc::with_owner(&self.ctx, r.cache.and_then(effectcraft_render::cache::LayerCache::gpu_owner));
         let img = walk::render(&mut e, r, comp, t)?;
         let image = e.download(&img);
         self.ctx.check_health().ok()?;
@@ -286,7 +286,7 @@ impl Gpu {
             deferred::Lookup::Absent => {}
         }
         let misses = d.misses();
-        let mut e = Enc::new(&self.ctx);
+        let mut e = Enc::with_owner(&self.ctx, r.cache.and_then(effectcraft_render::cache::LayerCache::gpu_owner));
         let img = walk::render(&mut e, r, comp, t)?;
         if d.misses() != misses {
             // Layer steps are still in flight: this pass's canvas is not the frame.
@@ -390,9 +390,19 @@ impl Accelerator for Gpu {
     }
 
     fn effects_kept(&self, chain: &[FxStep], buf: &Buf, levels: Option<f32>) -> Option<(Buf, Option<u64>)> {
+        self.effects(chain, buf, levels).map(|b| (b, None))
+    }
+    fn effects_kept_owned(
+        &self,
+        chain: &[FxStep],
+        buf: &Buf,
+        levels: Option<f32>,
+        owner: Option<&effectcraft_render::cache::GpuOwner>,
+    ) -> Option<(Buf, Option<u64>)> {
         self.ctx.check_health().ok()?;
-        let (b, img) = effects::run_chain(&mut Enc::new(&self.ctx), chain, buf, levels)?;
-        Some((b, img.and_then(|img| self.ctx.keep(img))))
+        let mut e = Enc::with_owner(&self.ctx, owner.cloned());
+        let (b, img) = effects::run_chain(&mut e, chain, buf, levels)?;
+        Some((b, img.and_then(|img| e.keep(img))))
     }
 
     fn adopt(&self, ticket: u64, buf: &Arc<Buf>) {

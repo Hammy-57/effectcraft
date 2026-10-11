@@ -57,6 +57,10 @@ pub trait Accelerator: Send + Sync {
     /// [`Self::effects`], keeping the result's image on the accelerator under the returned
     /// ticket (`None` = not kept): the renderer hands the ticket back to [`Self::adopt`] once
     /// the pixels are stored unchanged in a shared buffer, or to [`Self::release`].
+    /// Optional cache ownership; backends without a cache keep their eager CPU contract.
+    fn effects_kept_owned(&self, chain: &[FxStep], buf: &Buf, levels: Option<f32>, _owner: Option<&crate::cache::GpuOwner>) -> Option<(Buf, Option<u64>)> {
+        self.effects_kept(chain, buf, levels)
+    }
     fn effects_kept(&self, chain: &[FxStep], buf: &Buf, levels: Option<f32>) -> Option<(Buf, Option<u64>)> {
         self.effects(chain, buf, levels).map(|b| (b, None))
     }

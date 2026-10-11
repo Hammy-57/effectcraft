@@ -28,6 +28,8 @@ pub enum AdmissionError {
     Retired,
     /// Actual pixels exceed the reserved byte count.
     TooSmall,
+    /// This GPU allocation belongs to another live accounting owner.
+    ForeignOwner,
 }
 
 /// Snapshot includes pending reservations and externally pinned retired buffers.
@@ -46,10 +48,11 @@ pub struct RetainedStats {
 enum CpuWeak {
     Full(Weak<Buf>),
     Packed(Weak<PackedBuf>),
+    Gpu(Weak<crate::allocation::GpuAllocation>),
 }
 impl CpuWeak {
     fn alive(&self) -> bool {
-        match self { Self::Full(b) => b.strong_count() > 0, Self::Packed(b) => b.strong_count() > 0 }
+        match self { Self::Full(b) => b.strong_count() > 0, Self::Packed(b) => b.strong_count() > 0, Self::Gpu(b) => b.strong_count() > 0 }
     }
     fn is_full(&self, buf: &Arc<Buf>) -> bool {
         matches!(self, Self::Full(b) if b.ptr_eq(&Arc::downgrade(buf)))
@@ -65,9 +68,11 @@ struct State {
     bytes: usize,
     pending_bytes: usize,
     pending_records: usize,
+    gpu_pending: Vec<(Weak<crate::allocation::GpuAllocation>, usize, usize)>,
     budget: usize,
     cap: usize,
     epoch: Arc<()>,
+    identity: Arc<()>,
 }
 impl State {
     fn sweep(&mut self) {
@@ -117,13 +122,14 @@ pub struct RetainedBudget(Arc<Mutex<State>>);
 impl RetainedBudget {
     pub fn new(bytes: usize, records: usize) -> Self {
         Self(Arc::new(Mutex::new(State {
-            records: Vec::new(),
+            gpu_pending: Vec::new(),            records: Vec::new(),
             bytes: 0,
             pending_bytes: 0,
             pending_records: 0,
             budget: bytes,
             cap: records.min(MAX_RECORDS),
             epoch: Arc::new(()),
+            identity: Arc::new(()),
         })))
     }
 
@@ -144,7 +150,7 @@ impl RetainedBudget {
         s.records.try_reserve_exact(pending_records).map_err(|_| AdmissionError::Allocation)?;
         s.pending_bytes = pending_bytes;
         s.pending_records = pending_records;
-        Ok(Reservation { owner: self.clone(), bytes, epoch: s.epoch.clone(), active: true })
+        Ok(Reservation { owner: self.clone(), bytes, epoch: s.epoch.clone(), active: true, gpu: None })
     }
 
     /// Retain existing CPU pixels, deduplicating Arc aliases and touching recency.
@@ -165,6 +171,46 @@ impl RetainedBudget {
 
     pub(crate) fn tracks_cpu(&self, buf: &Arc<Buf>) -> bool {
         self.0.lock().unwrap_or_else(PoisonError::into_inner).records.iter().any(|r| r.weak.is_full(buf))
+    }
+
+    pub(crate) fn reserve_gpu(&self, allocation: &Arc<crate::allocation::GpuAllocation>) -> Result<Reservation, AdmissionError> {
+        let mut s = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        s.sweep();
+        let weak = Arc::downgrade(allocation);
+        let pending = s.gpu_pending.iter().position(|(a,_,_)| a.ptr_eq(&weak));
+        let live = s.records.iter().any(|r| matches!(&r.weak, CpuWeak::Gpu(a) if a.ptr_eq(&weak)));
+        let extra = if live || pending.is_some() { 0 } else { allocation.bytes() };
+        if !s.fits(extra, 1) { return Err(AdmissionError::Capacity); }
+        let pending_records = s.pending_records.checked_add(1).ok_or(AdmissionError::Overflow)?;
+        let pending_bytes = s.pending_bytes.checked_add(extra).ok_or(AdmissionError::Overflow)?;
+        s.records.try_reserve_exact(pending_records).map_err(|_| AdmissionError::Allocation)?;
+        if let Some(i) = pending {
+            let (_,_,count) = s.gpu_pending.get_mut(i).ok_or(AdmissionError::Retired)?;
+            *count = count.checked_add(1).ok_or(AdmissionError::Overflow)?;
+        } else {
+            s.gpu_pending.try_reserve(1).map_err(|_| AdmissionError::Allocation)?;
+            s.gpu_pending.push((weak,extra,1));
+        }
+        s.pending_records = pending_records; s.pending_bytes = pending_bytes;
+        Ok(Reservation { owner: self.clone(), bytes: allocation.bytes(), epoch: s.epoch.clone(), active: true, gpu: Some(allocation.clone()) })
+    }
+    pub(crate) fn claim_gpu(&self, allocation: &Arc<crate::allocation::GpuAllocation>) -> Result<crate::allocation::AllocationClaim, AdmissionError> {
+        let s = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        allocation.claim(&s.identity).ok_or(AdmissionError::ForeignOwner)
+    }
+    pub(crate) fn tracks_gpu(&self, allocation: &Arc<crate::allocation::GpuAllocation>) -> bool {
+        let s = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let weak = Arc::downgrade(allocation);
+        s.records.iter().any(|r| matches!(&r.weak, CpuWeak::Gpu(a) if a.ptr_eq(&weak))) || s.gpu_pending.iter().any(|(a,_,_)| a.ptr_eq(&weak))
+    }
+
+    pub(crate) fn gpu_bytes(&self, generation: &crate::allocation::GpuGeneration) -> usize {
+        let mut s = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        s.sweep();
+        s.records.iter().filter_map(|r| match &r.weak {
+            CpuWeak::Gpu(a) => a.upgrade().filter(|a| a.generation().same(generation)).map(|_| r.bytes),
+            _ => None,
+        }).fold(0, usize::saturating_add)
     }
 
     /// Shrink immediately retires least-recently retained owners; callers may pin debt.
@@ -203,6 +249,7 @@ fn cpu_bytes(buf: &Buf) -> Result<usize, AdmissionError> {
 
 /// One pending allocation slot; committing validates actual CPU bytes and retirement.
 pub struct Reservation {
+    gpu: Option<Arc<crate::allocation::GpuAllocation>>,
     owner: RetainedBudget,
     bytes: usize,
     epoch: Arc<()>,
@@ -217,6 +264,7 @@ impl Reservation {
         let mut s = self.owner.0.lock().unwrap_or_else(PoisonError::into_inner);
         s.pending_bytes = s.pending_bytes.saturating_sub(self.bytes);
         s.pending_records = s.pending_records.saturating_sub(1);
+        release_gpu_pending(&mut s, self.gpu.as_ref());
         self.active = false;
         if !Arc::ptr_eq(&self.epoch, &s.epoch) {
             return Err(AdmissionError::Retired);
@@ -230,6 +278,7 @@ impl Reservation {
         let mut s = self.owner.0.lock().unwrap_or_else(PoisonError::into_inner);
         s.pending_bytes = s.pending_bytes.saturating_sub(self.bytes);
         s.pending_records = s.pending_records.saturating_sub(1);
+        release_gpu_pending(&mut s, self.gpu.as_ref());
         self.active = false;
         if !Arc::ptr_eq(&self.epoch, &s.epoch) { return Err(AdmissionError::Retired); }
         s.sweep();
@@ -241,12 +290,47 @@ impl Reservation {
         Ok(())
     }
 
+    pub(crate) fn commit_gpu(mut self, allocation: &Arc<crate::allocation::GpuAllocation>, _cap: usize) -> Result<(), AdmissionError> {
+        let mut s = self.owner.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if !Arc::ptr_eq(&self.epoch, &s.epoch) { return Err(AdmissionError::Retired); }
+        s.sweep();
+        let weak = Arc::downgrade(allocation);
+        if !s.records.iter().any(|r| matches!(&r.weak, CpuWeak::Gpu(a) if a.ptr_eq(&weak))) {
+            let bytes = allocation.bytes();
+            if bytes > self.bytes { return Err(AdmissionError::TooSmall); }
+            let charged = s.gpu_pending.iter().find(|(a,_,_)| a.ptr_eq(&weak)).map(|(_,b,_)| *b).unwrap_or(0);
+            if !s.fits(bytes.saturating_sub(charged), 0) { return Err(AdmissionError::Capacity); }
+            s.records.try_reserve_exact(1).map_err(|_| AdmissionError::Allocation)?;
+            if !allocation.accepts(&s.identity) { return Err(AdmissionError::ForeignOwner); }
+            let total = s.bytes.checked_add(bytes).ok_or(AdmissionError::Overflow)?;
+            if let Some((_,b,_)) = s.gpu_pending.iter_mut().find(|(a,_,_)| a.ptr_eq(&weak)) { *b = 0; }
+            s.pending_bytes = s.pending_bytes.saturating_sub(charged);
+            s.bytes = total;
+            s.records.push(CpuRecord { weak: CpuWeak::Gpu(weak), retained: None, bytes });
+        }
+        release_gpu_pending(&mut s, self.gpu.as_ref());
+        s.pending_records = s.pending_records.saturating_sub(1);
+        self.active = false;
+        Ok(())
+    }
+
+}
+fn release_gpu_pending(s: &mut State, allocation: Option<&Arc<crate::allocation::GpuAllocation>>) {
+    let Some(allocation) = allocation else { return };
+    if let Some(i) = s.gpu_pending.iter().position(|(a,_,_)| a.ptr_eq(&Arc::downgrade(allocation))) {
+        if let Some((_,_,count)) = s.gpu_pending.get_mut(i) { *count = count.saturating_sub(1); }
+        if s.gpu_pending.get(i).is_some_and(|(_,_,count)| *count == 0) {
+            let (_,bytes,_) = s.gpu_pending.remove(i);
+            s.pending_bytes = s.pending_bytes.saturating_sub(bytes);
+        }
+    }
 }
 impl Drop for Reservation {
     fn drop(&mut self) {
         if self.active {
             let mut s = self.owner.0.lock().unwrap_or_else(PoisonError::into_inner);
-            s.pending_bytes = s.pending_bytes.saturating_sub(self.bytes);
+            if self.gpu.is_some() { release_gpu_pending(&mut s, self.gpu.as_ref()); }
+            else { s.pending_bytes = s.pending_bytes.saturating_sub(self.bytes); }
             s.pending_records = s.pending_records.saturating_sub(1);
         }
     }

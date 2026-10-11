@@ -302,7 +302,7 @@ fn draw_yuv_footage(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, can
         r.resident_footage_key(ctx, layer)
     };
     if let Some((key, token)) = cache.as_ref()
-        && let Some(image) = e.g.native_get(&footage.pixels, *key, token, &metadata)
+        && let Some(image) = e.g.native_get(&footage.pixels, *key, token, &metadata, e.owner.as_ref())
     {
         let _profile = effectcraft_render::profile::span("native_cached_place");
         return composite_resident(e, r, ctx, layer, canvas, opacity, image);
@@ -488,7 +488,7 @@ fn place(
     if buf.img.is_empty() || opacity <= 0.0 {
         return Some(target.clone());
     }
-    let src = e.g.upload_buf(buf)?;
+    let src = e.upload_buf(buf)?;
     place_src(e, r, ctx, layer, buf, src, target, mode, opacity, levels)
 }
 

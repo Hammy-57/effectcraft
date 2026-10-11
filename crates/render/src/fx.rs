@@ -195,6 +195,7 @@ impl Drop for Kept<'_> {
 
 /// The CPU effect target (GPU chains go through [`Accelerator::effects`]: upload, readback).
 struct CpuFx<'a> {
+    owner: Option<crate::cache::GpuOwner>,
     accel: Option<&'a dyn Accelerator>,
     levels: Option<f32>,
     buf: Option<Buf>,
@@ -205,7 +206,7 @@ struct CpuFx<'a> {
 impl FxTarget for CpuFx<'_> {
     fn gpu(&mut self, steps: &[FxStep]) -> bool {
         let (Some(a), Some(b)) = (self.accel, &self.buf) else { return false };
-        match a.effects_kept(steps, b, self.levels) {
+        match a.effects_kept_owned(steps, b, self.levels, self.owner.as_ref()) {
             Some((out, ticket)) => {
                 self.buf = Some(out);
                 self.kept = ticket.map(|t| Kept { accel: a, ticket: Some(t) });
@@ -265,7 +266,7 @@ impl<'a> Renderer<'a> {
     ) -> (Buf, Option<Kept<'a>>) {
         let origin = fx_origin(ctx, layer, adjustment);
         buf.rebase(origin);
-        let mut t = CpuFx { accel: self.active_accel(), levels: self.pipe.levels, buf: Some(buf), kept: None };
+        let mut t = CpuFx { owner: self.cache.and_then(crate::cache::LayerCache::gpu_owner), accel: self.active_accel(), levels: self.pipe.levels, buf: Some(buf), kept: None };
         self.run_effect_stack(ctx, layer, adjustment, limit, timing, origin, &mut t);
         let mut out = t.buf.take().unwrap_or_else(|| Buf { img: Image::new(1, 1), offset: [0.0; 2], scale: self.opts.scale });
         out.rebase([-origin[0], -origin[1]]);
@@ -285,7 +286,7 @@ impl<'a> Renderer<'a> {
         timing: Option<&mut Vec<(String, f64)>>,
         origin: [f64; 2],
     ) -> Buf {
-        let mut t = CpuFx { accel: self.active_accel(), levels: self.pipe.levels, buf: Some(buf), kept: None };
+        let mut t = CpuFx { owner: self.cache.and_then(crate::cache::LayerCache::gpu_owner), accel: self.active_accel(), levels: self.pipe.levels, buf: Some(buf), kept: None };
         self.run_effect_stack(ctx, layer, adjustment, limit, timing, origin, &mut t);
         t.buf.unwrap_or_else(|| Buf { img: Image::new(1, 1), offset: [0.0; 2], scale: self.opts.scale })
     }

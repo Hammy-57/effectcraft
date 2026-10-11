@@ -61,9 +61,12 @@ mod dependencies;
 /// persistent [`DiskCache`](crate::disk_cache::DiskCache): a memory miss reads the disk, and
 /// buffers that were slow to render are written there (keys salted per project, see
 /// [`LayerCache::set_disk`]).
+mod gpu;
+pub use gpu::{GpuOwner, GpuPending, GpuSlot, GpuStage};
+
 pub struct LayerCache {
     resident_lifetime: Mutex<Arc<()>>,
-    inner: Mutex<Inner>,
+    inner: Arc<Mutex<Inner>>,
     disk: Mutex<Option<(Arc<crate::disk_cache::DiskCache>, u64)>>,
     /// Another persistent store when there is no disk cache (the browser's, [`PrefetchStore`]).
     store: Mutex<Option<(Arc<dyn LayerStore>, u64)>>,
@@ -113,6 +116,7 @@ enum Stored {
 }
 
 struct Inner {
+    gpu: HashMap<usize, gpu::GpuEntry>,
     physical: crate::retained::RetainedBudget,
     map: HashMap<u64, Entry>,
     bytes: usize,
@@ -170,7 +174,7 @@ impl Doorkeeper {
 }
 
 /// Hit/miss counters and logical indexed bytes (aliases counted per key).
-/// See LayerCache::retained_stats for unique allocated CPU bytes, including caller pins.
+/// See LayerCache::retained_stats for unique allocated CPU/GPU bytes, including caller pins.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CacheStats {
     pub entries: usize,
@@ -186,12 +190,13 @@ impl Default for LayerCache {
 }
 
 impl LayerCache {
-    /// A cache retaining at most `budget` CPU pixel bytes. Existing callers may
+    /// A cache retaining at most `budget` CPU and GPU pixel bytes. Existing callers may
     /// pin retired storage above a subsequently reduced budget; new admission stops.
     pub fn new(budget: usize) -> LayerCache {
         LayerCache {
             resident_lifetime: Mutex::new(Arc::new(())),
-            inner: Mutex::new(Inner {
+            inner: Arc::new(Mutex::new(Inner {
+                gpu: HashMap::new(),
                 physical: crate::retained::RetainedBudget::new(budget, crate::retained::MAX_RECORDS),
                 map: HashMap::new(),
                 bytes: 0,
@@ -206,7 +211,7 @@ impl LayerCache {
                 frame_bytes: 0,
                 frames: 0,
                 active: std::collections::BTreeSet::new(),
-            }),
+            })),
             disk: Mutex::new(None),
             store: Mutex::new(None),
             gate: Mutex::new(None),
@@ -380,15 +385,14 @@ impl LayerCache {
             if g.physical.tracks_cpu(&buf) { 0 } else { bytes }
         };
         self.relieve_for(extra, token);
+        let needs_slot = self.inner.lock().map(|g| !g.map.contains_key(&key)).unwrap_or(false);
+        gpu::relieve(&self.inner, Some(token), extra, None, needs_slot);
         let Ok(mut g) = self.inner.lock() else { return };
         if !token.valid() || bytes > g.budget / 4 {
             return;
         }
-        if !g.map.contains_key(&key)
-            && g.map.len() >= crate::retained::MAX_RECORDS
-            && let Some(oldest) = g.map.iter().min_by_key(|(_, e)| e.last_use).map(|(k, _)| *k)
-        {
-            remove(&mut g, oldest);
+        if !g.map.contains_key(&key) && g.map.len().saturating_add(g.gpu.len()) >= crate::retained::MAX_RECORDS {
+            return;
         }
         if g.map.try_reserve(1).is_err() || g.physical.track_cpu(&buf).is_err() {
             return;
@@ -502,12 +506,7 @@ impl LayerCache {
     }
 
     fn evict_for(&self, extra: usize, token: &ResidentToken) {
-        let Ok(mut g) = self.inner.lock() else { return };
-        if !token.valid() {
-            return;
-        }
-        let target = g.budget.saturating_sub(extra);
-        evict_lru(&mut g, target);
+        gpu::relieve(&self.inner, Some(token), extra, None, false);
     }
 
     fn publish_packed(&self, key: u64, full: &Arc<Buf>, packed: Arc<PackedBuf>, reservation: crate::retained::Reservation, token: &ResidentToken) {
@@ -552,24 +551,32 @@ impl LayerCache {
 
     /// Change the memory budget (evicts least-recently used entries when shrinking).
     pub fn set_budget(&self, budget: usize) {
-        let Ok(mut g) = self.inner.lock() else { return };
-        g.budget = budget;
-        g.physical.set_budget(budget);
-        let stats = g.physical.stats();
-        if stats.live_bytes.saturating_add(stats.pending_bytes) > budget {
-            evict_lru(&mut g, budget);
+        {
+            let Ok(mut g) = self.inner.lock() else { return };
+            g.budget = budget;
+            g.physical.set_budget(budget);
         }
+        gpu::relieve(&self.inner, None, 0, None, false);
     }
 
     pub fn clear(&self) {
         *self.resident_lifetime.lock().unwrap_or_else(PoisonError::into_inner) = Arc::new(());
-        if let Ok(mut g) = self.inner.lock() {
+        let retired = if let Ok(mut g) = self.inner.lock() {
+            let retired = std::mem::take(&mut g.gpu);
             g.map.clear();
             g.physical.retire();
             g.bytes = 0;
             g.probation_bytes = 0;
             g.seen.clear();
-        }
+            Some(retired)
+        } else {
+            None
+        };
+        drop(retired);
+    }
+
+    pub fn gpu_owner(&self) -> Option<GpuOwner> {
+        self.resident_token().map(|token| GpuOwner::new(Arc::downgrade(&self.inner), token))
     }
 
     pub fn stats(&self) -> CacheStats {
@@ -733,17 +740,20 @@ impl Drop for FlightGuard<'_> {
     }
 }
 
-/// Evict least recently used entries until at most `target` bytes are kept.
-fn evict_lru(g: &mut Inner, target: usize) {
-    let mut by_age: Vec<(u64, u64)> = g.map.iter().map(|(k, e)| (e.last_use, *k)).collect();
-    by_age.sort_unstable();
-    for (_, k) in by_age {
-        let stats = g.physical.stats();
-        if stats.live_bytes.saturating_add(stats.pending_bytes) <= target {
-            break;
-        }
-        remove(g, k);
+/// Return backend payloads to the caller for disposal after unlocking.
+fn evict_one(g: &mut Inner) -> (bool, Option<Arc<GpuSlot>>) {
+    let cpu = g.map.iter().min_by_key(|(_, e)| e.last_use).map(|(k, e)| (*k, e.last_use));
+    let gpu = g.gpu.iter().min_by_key(|(_, e)| e.last_use).map(|(k, e)| (*k, e.last_use));
+    if let Some((key, age)) = cpu
+        && gpu.is_none_or(|(_, other)| age <= other)
+    {
+        remove(g, key);
+        return (true, None);
     }
+    if let Some((key, _)) = gpu {
+        return (true, g.gpu.remove(&key).map(|e| e.slot));
+    }
+    (false, None)
 }
 
 fn remove(g: &mut Inner, key: u64) {
