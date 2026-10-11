@@ -1065,9 +1065,8 @@ impl EffectcraftApp {
         // Auto follows the zoom alike while playing and paused, so frames cached while scrubbing
         // play back, and frames cached by a preview stay on screen when it stops.
         let full = self.ui.viewer.res.scale(zoom, ppp);
-        // Native Auto playback uses actual render service p95, never cache hits.
-        // Try a lower scale once; retain it only when its measured p95 improves.
-        // This avoids oscillation and restores Full when fewer pixels are slower.
+        // Native Auto playback measures actual render service times, never cache hits, and
+        // ladders Full → Half → Quarter while frames miss their deadline (see playback_budget).
         let adaptive = self.playback.playing
             && !self.playback.caching
             && self.ui.viewer.res == state::Resolution::Auto
@@ -1078,17 +1077,21 @@ impl EffectcraftApp {
             && self.playback.fps.is_finite()
             && self.playback.fps > 0.0;
         let half = full.min((full * 0.5).max(self.session.prefs.adaptive_limit()));
+        let quarter = full.min((full * 0.25).max(self.session.prefs.adaptive_limit()));
         let config = self.session.active_comp_id().filter(|_| adaptive).map(|comp| {
             let step = self.playback.plan.map_or(1, |p| p.step).max(1) as f64;
             crate::playback_budget::Config {
                 full: self.frame_series(comp, full),
                 half: self.frame_series(comp, half),
+                quarter: self.frame_series(comp, quarter),
                 budget_ms: 1000.0 * step / self.playback.fps,
                 gpu_context: self.gpu.as_ref().map_or(0, |g| std::ptr::from_ref(g.context()) as usize),
             }
         });
-        if self.frames.adapt_playback(config) {
-            return half;
+        match self.frames.adapt_playback(config) {
+            0 => {}
+            1 => return half,
+            _ => return quarter,
         }
         if self.scrubbing() {
             return full.min((full * 0.25).max(self.session.prefs.adaptive_limit()));
@@ -2571,18 +2574,25 @@ mod playback_budget_tests {
         app.playback.fps = 30.0;
         app
     }
-    fn slow(app: &EffectcraftApp) {
-        let full = app.viewer_scale(1.0, 1.0);
-        let key = app.frame_series(app.session.active_comp_id().unwrap(), full);
+    fn render(app: &EffectcraftApp, ms: f64) {
+        let scale = app.viewer_scale(1.0, 1.0);
+        let key = app.frame_series(app.session.active_comp_id().unwrap(), scale);
         for _ in 0..16 {
-            app.frames.playback_sample(key, 80.0);
+            app.frames.playback_sample(key, ms);
         }
+    }
+    fn slow(app: &EffectcraftApp) {
+        render(app, 80.0);
     }
     #[test]
     fn playback_budget_preserves_explicit_choices_and_idle_resolution() {
         let mut app = app();
         slow(&app);
         assert_eq!(app.viewer_scale(1.0, 1.0), 0.5);
+        // Half still misses the deadline: Quarter, shown as "(Quarter)" by the popup.
+        render(&app, 40.0);
+        assert_eq!(app.viewer_scale(1.0, 1.0), 0.25);
+        assert_eq!(crate::panels::viewer_tools::resolution_label(state::Resolution::Auto, 0.25), "(Quarter)");
         app.playback.playing = false;
         assert_eq!(app.viewer_scale(1.0, 1.0), 1.0);
         app.playback.playing = true;

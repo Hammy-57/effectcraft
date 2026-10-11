@@ -714,7 +714,7 @@ impl Frames {
         }
     }
 
-    pub(crate) fn adapt_playback(&self, config: Option<crate::playback_budget::Config>) -> bool {
+    pub(crate) fn adapt_playback(&self, config: Option<crate::playback_budget::Config>) -> usize {
         self.playback_budget.lock().unwrap_or_else(std::sync::PoisonError::into_inner).configure(config)
     }
 
