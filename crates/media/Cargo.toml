@@ -34,5 +34,7 @@ thiserror = { workspace = true }
 log = { workspace = true }
 
 [dev-dependencies]
+filmcraft-prores = { workspace = true }
+filmcraft-isobmff = { workspace = true }
 effectcraft-color = { workspace = true }
 effectcraft-av1enc = { workspace = true }
