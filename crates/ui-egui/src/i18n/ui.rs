@@ -2051,6 +2051,7 @@ mod tests {
         ("panels/templates.rs", include_str!("../panels/templates.rs")),
         ("panels/text_panels.rs", include_str!("../panels/text_panels.rs")),
         ("panels/timeline.rs", include_str!("../panels/timeline.rs")),
+        ("panels/timeline_columns.rs", include_str!("../panels/timeline_columns.rs")),
         ("panels/tracker.rs", include_str!("../panels/tracker.rs")),
         ("panels/unsaved.rs", include_str!("../panels/unsaved.rs")),
         ("panels/viewer.rs", include_str!("../panels/viewer.rs")),

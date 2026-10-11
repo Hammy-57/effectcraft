@@ -396,6 +396,9 @@ pub struct EffectcraftApp {
     pub(crate) template_thumbs: std::collections::HashMap<String, Option<egui::TextureHandle>>,
     /// Home ▸ Templates: the gallery, and the user template files it was listed from.
     pub(crate) template_list: Option<(Vec<String>, Vec<effectcraft_engine::templates::TemplateInfo>)>,
+    /// The Timeline column layout last kept in the settings store (see
+    /// [`panels::timeline_columns::store_layout`]).
+    pub(crate) timeline_layout_saved: Option<panels::timeline_columns::ColumnLayout>,
 }
 
 /// The saved workspaces in the settings store ([`effectcraft_engine::config::ConfigStore`]).
@@ -483,9 +486,17 @@ impl EffectcraftApp {
             window_title: String::new(),
             template_thumbs: Default::default(),
             template_list: None,
+            timeline_layout_saved: None,
         }
         .with_ui_commands()
         .with_saved_workspaces()
+        .with_timeline_layout()
+    }
+
+    /// The Timeline column layout (columns shown, order, widths, splitter) of the last session.
+    fn with_timeline_layout(mut self) -> Self {
+        panels::timeline_columns::load_layout(&mut self);
+        self
     }
 
     /// The workspaces saved in an earlier session (Window ▸ Workspace ▸ Save as New Workspace,
@@ -2009,6 +2020,7 @@ impl EffectcraftApp {
         }
         self.tick_autosave(&ctx);
         prefs_live::frame(self, &ctx);
+        panels::timeline_columns::store_layout(self, &ctx);
         if let Some(rx) = self.command_inbox.take() {
             while let Ok(id) = rx.try_recv() {
                 if let Err(e) = menus::invoke(self, &ctx, &id, json!({})) {

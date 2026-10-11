@@ -105,6 +105,7 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     uic!("timeline.revealAdd.levels", "Add Audio Levels to Revealed Properties", [], Some("Shift+L")),
     uic!("timeline.revealAdd.animated", "Add Animated Properties to Revealed Properties", [], Some("Shift+U")),
     uic!("timeline.column", "Show/Hide Timeline Column", [], None),
+    uic!("timeline.columnLayout", "Timeline Column Layout", [], None),
     uic!("timeline.sourceName", "Source Name / Layer Name", [], None),
     uic!("timeline.search", "Search Timeline", [], None),
     uic!("flowchart.options", "Flowchart Options", [], None),

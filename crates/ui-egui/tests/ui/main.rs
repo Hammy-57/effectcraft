@@ -121,6 +121,8 @@ mod ui_tail;
 mod ui_text_edit;
 #[path = "../ui_time_zoom_controls.rs"]
 mod ui_time_zoom_controls;
+#[path = "../ui_timeline_columns.rs"]
+mod ui_timeline_columns;
 #[path = "../ui_timeline_shapes.rs"]
 mod ui_timeline_shapes;
 #[path = "../ui_timeline_switches.rs"]

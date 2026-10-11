@@ -362,8 +362,10 @@ pub struct TimelineState {
     pub start: f64,
     pub pps: Option<f64>,
     pub scroll_y: f32,
-    /// Left column area width.
-    pub columns_w: f32,
+    /// The layer outline's width (the splitter between it and the time graph), or `None` to
+    /// fit the visible columns.
+    #[serde(default)]
+    pub outline_w: Option<f32>,
     /// Horizontal scroll of the outline columns (pixels) when they are wider than the pane.
     #[serde(default)]
     pub outline_scroll: f32,
@@ -424,6 +426,14 @@ pub struct TimelineState {
     /// The name column shows Source Name instead of Layer Name (click its header).
     #[serde(default)]
     pub source_name: bool,
+    /// The columns' left-to-right order (drag a column header), by id; empty (or missing ids)
+    /// means After Effects' default order (`panels::timeline::COLUMNS`).
+    #[serde(default)]
+    pub column_order: Vec<String>,
+    /// Widths of the resizable columns dragged to a new size (drag the divider right of a
+    /// column header), by id; the others keep their default width.
+    #[serde(default)]
+    pub column_widths: BTreeMap<String, f32>,
 }
 
 pub fn default_tl_columns() -> BTreeSet<String> {
@@ -443,7 +453,7 @@ impl Default for TimelineState {
             start: 0.0,
             pps: None,
             scroll_y: 0.0,
-            columns_w: 560.0,
+            outline_w: None,
             outline_scroll: 0.0,
             show_modes: false,
             graph_editor: false,
@@ -465,6 +475,8 @@ impl Default for TimelineState {
             unlinked: BTreeSet::new(),
             columns: default_tl_columns(),
             source_name: false,
+            column_order: Vec::new(),
+            column_widths: BTreeMap::new(),
         }
     }
 }

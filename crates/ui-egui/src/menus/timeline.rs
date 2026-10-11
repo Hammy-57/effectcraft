@@ -19,6 +19,7 @@ pub(crate) fn handlers() -> &'static [Handler] {
         Handler::ui("timeline.zoomFit", zoom_fit),
         Handler::ui("timeline.zoomFrameToggle", zoom_frame_toggle),
         Handler::ui("timeline.column", column),
+        Handler::ui("timeline.columnLayout", column_layout),
         Handler::ui("timeline.sourceName", source_name),
         Handler::ui("timeline.search", search),
         Handler::ui("timeline.graphEditor", graph_editor),
@@ -191,13 +192,33 @@ fn zoom_frame_toggle(app: &mut EffectcraftApp, ctx: &egui::Context, _id: &str, _
     Ok(Value::Null)
 }
 
+/// `timeline.column {column, visible?, width?, before?}`: show or hide a column (toggles when
+/// nothing else is given), resize it, or move it before another column (`before: null`: to the
+/// right end). Returns the layout ([`crate::panels::timeline_columns::describe`]).
 fn column(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, params: Value) -> Result<Value, String> {
+    use crate::panels::timeline_columns as tc;
     let col = params.get("column").and_then(Value::as_str).ok_or("timeline.column: need `column`")?;
-    let on = params.get("visible").and_then(Value::as_bool).unwrap_or(!crate::panels::timeline::column_visible(&app.ui.timeline, col));
-    crate::panels::timeline::set_column(&mut app.ui.timeline, col, on)?;
-    let shown: Vec<&str> =
-        crate::panels::timeline::COLUMNS.iter().map(|c| c.0).filter(|c| crate::panels::timeline::column_visible(&app.ui.timeline, c)).collect();
-    Ok(json!({"columns": shown}))
+    let tl = &mut app.ui.timeline;
+    let width = params.get("width");
+    let before = params.get("before");
+    if let Some(w) = width {
+        tc::set_column_width(tl, col, w.as_f64().ok_or("timeline.column: `width` must be a number")? as f32)?;
+    }
+    if let Some(b) = before {
+        tc::move_column(tl, col, b.as_str())?;
+    }
+    let visible = params.get("visible").and_then(Value::as_bool);
+    if visible.is_some() || (width.is_none() && before.is_none()) {
+        let on = visible.unwrap_or(!tc::column_visible(tl, col));
+        tc::set_column(tl, col, on)?;
+    }
+    Ok(tc::describe(tl))
+}
+
+/// `timeline.columnLayout {reset?, outlineWidth?}`: read or reset the column layout, or place the
+/// outline / time graph splitter (`outlineWidth: null` fits the outline to its columns).
+fn column_layout(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, params: Value) -> Result<Value, String> {
+    crate::panels::timeline_columns::layout_command(app, &params)
 }
 
 fn source_name(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, params: Value) -> Result<Value, String> {
@@ -218,7 +239,7 @@ fn graph_editor(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, _para
 }
 
 fn switches_modes(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, _params: Value) -> Result<Value, String> {
-    app.ui.timeline.show_modes = !app.ui.timeline.show_modes;
+    crate::panels::timeline_columns::toggle_switches_modes(&mut app.ui.timeline);
     Ok(Value::Null)
 }
 

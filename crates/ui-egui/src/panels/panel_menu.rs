@@ -141,11 +141,12 @@ fn panel_items(app: &EffectcraftApp, panel: PanelKind) -> Vec<Entry> {
     match panel {
         PanelKind::Timeline => {
             let tl = &app.ui.timeline;
-            let columns = crate::panels::timeline::COLUMNS
+            let columns = crate::panels::timeline_columns::COLUMNS_MENU
                 .iter()
-                .filter(|(id, _)| *id != "name")
-                .map(|(id, label)| {
+                .filter(|id| **id != "name")
+                .map(|id| {
                     let on = crate::panels::timeline::column_visible(tl, id);
+                    let label = crate::panels::timeline_columns::column_label(tl, id);
                     check(&format!("column.{id}"), tr(label), "timeline.column", json!({"column": id, "visible": !on}), true, on)
                 })
                 .collect();

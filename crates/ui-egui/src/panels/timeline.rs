@@ -297,187 +297,10 @@ struct Row {
     kind: RowKind,
 }
 
-const AV_W: f32 = 76.0;
-const LABEL_W: f32 = 20.0;
-const NUM_W: f32 = 26.0;
-const SW: f32 = 19.0;
-
-/// The Timeline's columns in After Effects' order: (id, header label). Right-click a column
-/// header to show or hide them; the name column is always shown.
-pub const COLUMNS: [(&str, &str); 13] = [
-    ("av", "A/V Features"),
-    ("keys", "Keys"),
-    ("label", "Label"),
-    ("num", "#"),
-    ("name", "Layer Name"),
-    ("comment", "Comment"),
-    ("switches", "Switches"),
-    ("modes", "Modes"),
-    ("parent", "Parent & Link"),
-    ("in", "In"),
-    ("out", "Out"),
-    ("duration", "Duration"),
-    ("stretch", "Stretch"),
-];
-
-/// Is a column shown?
-pub fn column_visible(tl: &crate::state::TimelineState, id: &str) -> bool {
-    match id {
-        "name" => true,
-        "modes" => tl.show_modes,
-        _ => tl.columns.contains(id),
-    }
-}
-
-/// Show or hide a column (`modes` is the Switches/Modes toggle, F4).
-pub fn set_column(tl: &mut crate::state::TimelineState, id: &str, on: bool) -> Result<(), String> {
-    match id {
-        "name" if on => Ok(()),
-        "name" => Err("the name column can't be hidden".into()),
-        "modes" => {
-            tl.show_modes = on;
-            Ok(())
-        }
-        _ if COLUMNS.iter().any(|c| c.0 == id) => {
-            if on {
-                tl.columns.insert(id.to_string());
-            } else {
-                tl.columns.remove(id);
-            }
-            Ok(())
-        }
-        _ => Err(format!("unknown column `{id}` (one of: {})", COLUMNS.map(|c| c.0).join(", "))),
-    }
-}
-
-const KEYS_W: f32 = 56.0;
-const COMMENT_W: f32 = 120.0;
-const TIME_W: f32 = 72.0;
-const STRETCH_W: f32 = 60.0;
-const PARENT_W: f32 = 116.0;
-const MODES_W: f32 = 92.0 + 112.0;
-
-#[derive(Clone, Copy, Default)]
-struct Vis {
-    av: bool,
-    keys: bool,
-    label: bool,
-    num: bool,
-    comment: bool,
-    switches: bool,
-    modes: bool,
-    parent: bool,
-    in_: bool,
-    out: bool,
-    duration: bool,
-    stretch: bool,
-}
-
-impl Vis {
-    fn of(tl: &crate::state::TimelineState) -> Vis {
-        let v = |id| column_visible(tl, id);
-        Vis {
-            av: v("av"),
-            keys: v("keys"),
-            label: v("label"),
-            num: v("num"),
-            comment: v("comment"),
-            switches: v("switches"),
-            modes: v("modes"),
-            parent: v("parent"),
-            in_: v("in"),
-            out: v("out"),
-            duration: v("duration"),
-            stretch: v("stretch"),
-        }
-    }
-    /// Width of every visible column but the name.
-    fn fixed(&self) -> f32 {
-        let w = |on: bool, w: f32| if on { w } else { 0.0 };
-        w(self.av, AV_W)
-            + w(self.keys, KEYS_W)
-            + w(self.label, LABEL_W)
-            + w(self.num, NUM_W)
-            + w(self.comment, COMMENT_W)
-            + w(self.switches, SW * 8.0 + 6.0)
-            + w(self.modes, MODES_W)
-            + w(self.parent, PARENT_W)
-            + w(self.in_, TIME_W)
-            + w(self.out, TIME_W)
-            + w(self.duration, TIME_W)
-            + w(self.stretch, STRETCH_W)
-    }
-}
-
-struct Cols {
-    vis: Vis,
-    av: f32,
-    keys: f32,
-    label: f32,
-    num: f32,
-    name: f32,
-    /// End of the name column.
-    name_end: f32,
-    comment: f32,
-    switches: f32,
-    mode: f32,
-    trkmat: f32,
-    parent: f32,
-    in_: f32,
-    out: f32,
-    duration: f32,
-    stretch: f32,
-    end: f32,
-}
-
-fn cols(x0: f32, width: f32, vis: Vis) -> Cols {
-    let name_w = (width - vis.fixed()).max(120.0);
-    let mut x = x0;
-    let mut next = |on: bool, w: f32| {
-        let at = x;
-        if on {
-            x += w;
-        }
-        at
-    };
-    let av = next(vis.av, AV_W);
-    let keys = next(vis.keys, KEYS_W);
-    let label = next(vis.label, LABEL_W);
-    let num = next(vis.num, NUM_W);
-    let name = next(true, name_w);
-    let comment = next(vis.comment, COMMENT_W);
-    let switches = next(vis.switches, SW * 8.0 + 6.0);
-    let mode = next(vis.modes, 92.0);
-    let trkmat = next(vis.modes, 112.0);
-    let parent = next(vis.parent, PARENT_W);
-    let in_ = next(vis.in_, TIME_W);
-    let out = next(vis.out, TIME_W);
-    let duration = next(vis.duration, TIME_W);
-    let stretch = next(vis.stretch, STRETCH_W);
-    let end = next(true, 0.0);
-    Cols { vis, av, keys, label, num, name, name_end: name + name_w, comment, switches, mode, trkmat, parent, in_, out, duration, stretch, end }
-}
-
-/// Which column a header x position falls in.
-fn column_at(cw: &Cols, x: f32) -> Option<&'static str> {
-    let v = cw.vis;
-    let spans = [
-        ("av", v.av, cw.av, cw.av + AV_W),
-        ("keys", v.keys, cw.keys, cw.keys + KEYS_W),
-        ("label", v.label, cw.label, cw.label + LABEL_W),
-        ("num", v.num, cw.num, cw.num + NUM_W),
-        ("name", true, cw.name, cw.name_end),
-        ("comment", v.comment, cw.comment, cw.comment + COMMENT_W),
-        ("switches", v.switches, cw.switches, cw.switches + SW * 8.0 + 6.0),
-        ("modes", v.modes, cw.mode, cw.mode + MODES_W),
-        ("parent", v.parent, cw.parent, cw.parent + PARENT_W),
-        ("in", v.in_, cw.in_, cw.in_ + TIME_W),
-        ("out", v.out, cw.out, cw.out + TIME_W),
-        ("duration", v.duration, cw.duration, cw.duration + TIME_W),
-        ("stretch", v.stretch, cw.stretch, cw.stretch + STRETCH_W),
-    ];
-    spans.into_iter().find(|(_, on, a, b)| *on && x >= *a && x < *b).map(|s| s.0)
-}
+pub use super::timeline_columns::{COLUMNS, column_visible, set_column};
+#[cfg(test)]
+use super::timeline_columns::column_at;
+use super::timeline_columns::{Cols, SW, Vis, cols};
 
 /// Snap a time to the nearest candidate within `tolerance` (all seconds); Shift-dragging the
 /// current-time indicator snaps to keyframes, layer in/out points, markers and the work area.
@@ -1303,14 +1126,19 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let colhdr_h = 22.0;
     let footer_h = 24.0;
     let vis = Vis::of(&app.ui.timeline);
-    let left_w = (vis.fixed() + 190.0).clamp(420.0, (rect.width() * 0.72).max(420.0));
+    // The outline is as wide as its columns (up to most of the panel) until the splitter
+    // between it and the time graph is dragged.
+    let natural_w = super::timeline_columns::natural_width(&app.ui.timeline);
+    let left_w = match app.ui.timeline.outline_w {
+        Some(w) => super::timeline_columns::clamp_outline(w, rect.width()),
+        None => natural_w.clamp(420.0, (rect.width() * 0.72).max(420.0)),
+    };
     // Columns wider than the pane scroll horizontally (Shift+wheel / trackpad over the outline,
-    // or the scroll bar above the footer); the name column keeps its minimum width.
-    let natural_w = vis.fixed() + 190.0;
+    // or the scroll bar above the footer).
     let overflow = (natural_w - left_w).max(0.0);
     app.ui.timeline.outline_scroll = app.ui.timeline.outline_scroll.clamp(0.0, overflow);
     let oscroll = app.ui.timeline.outline_scroll;
-    let cw = cols(rect.min.x - oscroll, left_w + overflow, vis);
+    let cw = cols(rect.min.x - oscroll, &app.ui.timeline);
     let graph_x0 = rect.min.x + left_w + 1.0;
     let graph_x1 = rect.max.x - GUTTER_W;
     ctx.data_mut(|d| d.insert_temp(egui::Id::new("timeline-graph-area"), (graph_x0, graph_x1 - graph_x0)));
@@ -1377,7 +1205,10 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             ctx.data_mut(|d| d.insert_temp(egui::Id::new("tl-tc-edit"), buf));
         }
     }
-    let sr = Rect::from_min_size(pos2(tc_rect.max.x + 14.0, top + 12.0), vec2((left_w - 420.0).clamp(120.0, 220.0), 22.0));
+    // The search field narrows before it would run under the comp switches right of it.
+    let switches_x0 = rect.min.x + left_w - 10.0 - 6.0 * 28.0 + 4.0;
+    let search_w = (left_w - 420.0).clamp(120.0, 220.0).min(switches_x0 - 4.0 - (tc_rect.max.x + 14.0)).max(60.0);
+    let sr = Rect::from_min_size(pos2(tc_rect.max.x + 14.0, top + 12.0), vec2(search_w, 22.0));
     let mut search = app.ui.timeline.search.clone();
     widgets::search_field(ui, sr, &mut search, "Search", &t);
     app.ui.timeline.search = search;
@@ -1392,6 +1223,12 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         (Icon::Flowchart, false, "flowchart", "Composition Mini-Flowchart"),
     ] {
         let r = Rect::from_min_size(pos2(bx - 24.0, top + 11.0), vec2(24.0, 24.0));
+        bx -= 28.0;
+        // A very narrow outline (the splitter dragged left) keeps the search field and drops
+        // the switches that no longer fit beside it.
+        if r.min.x < sr.max.x + 4.0 {
+            continue;
+        }
         let resp = widgets::icon_button(ui, r, icon, on, &t, egui::Id::new(("tl-sw", id))).on_hover_text(tip);
         app.auto.add(&format!("timeline.switch.{id}"), r, tip);
         if resp.clicked() {
@@ -1403,7 +1240,6 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 }
             }
         }
-        bx -= 28.0;
     }
 
     // ---- ruler (right).
@@ -1652,110 +1488,12 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         }
     }
 
-    // ---- column headers (right-click: show/hide columns; click the name header: Source/Layer Name).
+    // ---- column headers (drag a divider to resize, a header to reorder; right-click: Hide This,
+    // Columns; click the name header: Source/Layer Name).
     let ch = Rect::from_min_max(pos2(rect.min.x, top + header_h), pos2(rect.max.x, top + header_h + colhdr_h));
     p.rect_filled(Rect::from_min_max(ch.min, pos2(graph_x0 - 1.0, ch.max.y)), 0.0, t.panel_bg);
     p.line_segment([pos2(rect.min.x, ch.max.y), pos2(rect.max.x, ch.max.y)], Stroke::new(1.0, t.separator));
-    let hy = ch.center().y;
-    // Column headers scroll with the outline and never spill into the time ruler.
-    let hp = p.with_clip_rect(Rect::from_min_max(ch.min, pos2(graph_x0 - 1.0, ch.max.y)));
-    let hic = |icon: Icon, x: f32| icons::paint(&hp, Rect::from_center_size(pos2(x, hy), vec2(12.0, 12.0)), icon, t.text_dim);
-    let htext = |x: f32, s: &str| hp.text(pos2(x, hy), Align2::LEFT_CENTER, s, Tokens::ui(11.0), t.text_dim);
-    if vis.av {
-        hic(Icon::Eye, cw.av + 10.0);
-        hic(Icon::Speaker, cw.av + 28.0);
-        hic(Icon::Solo, cw.av + 46.0);
-        hic(Icon::Lock, cw.av + 64.0);
-    }
-    if vis.keys {
-        htext(cw.keys + 6.0, "Keys");
-    }
-    if vis.label {
-        icons::paint(&hp, Rect::from_center_size(pos2(cw.label + 10.0, hy), vec2(10.0, 10.0)), Icon::Keyframe, t.text_dim);
-    }
-    if vis.num {
-        htext(cw.num + 6.0, "#");
-    }
-    let name_hdr = if app.ui.timeline.source_name { "Source Name" } else { "Layer Name" };
-    htext(cw.name + 22.0, name_hdr);
-    if vis.comment {
-        htext(cw.comment + 6.0, "Comment");
-    }
-    if vis.switches {
-        for (i, icon) in
-            [Icon::Shy, Icon::Collapse, Icon::Quality, Icon::Fx, Icon::FrameBlend, Icon::MotionBlur, Icon::Adjustment, Icon::Cube].into_iter().enumerate()
-        {
-            hic(icon, cw.switches + SW * i as f32 + SW / 2.0);
-        }
-    }
-    if vis.modes {
-        htext(cw.mode + 4.0, "Mode");
-        htext(cw.mode + 74.0, "T");
-        htext(cw.trkmat + 4.0, "Track Matte");
-    }
-    if vis.parent {
-        icons::paint(&hp, Rect::from_center_size(pos2(cw.parent + 10.0, hy), vec2(12.0, 12.0)), Icon::PickWhip, t.text_dim);
-        htext(cw.parent + 20.0, "Parent & Link");
-    }
-    for (on, x, s) in [(vis.in_, cw.in_, "In"), (vis.out, cw.out, "Out"), (vis.duration, cw.duration, "Duration"), (vis.stretch, cw.stretch, "Stretch")] {
-        if on {
-            htext(x + 6.0, s);
-        }
-    }
-    let hdr_rect = Rect::from_min_max(ch.min, pos2(graph_x0 - 1.0, ch.max.y));
-    let hresp = ui.interact(hdr_rect, egui::Id::new("tl-colhdr"), Sense::click());
-    app.auto.add("timeline.header", hdr_rect, "Columns (right-click)");
-    for (id, label) in COLUMNS {
-        if let Some(x0) = match id {
-            "av" => vis.av.then_some((cw.av, AV_W)),
-            "keys" => vis.keys.then_some((cw.keys, KEYS_W)),
-            "label" => vis.label.then_some((cw.label, LABEL_W)),
-            "num" => vis.num.then_some((cw.num, NUM_W)),
-            "name" => Some((cw.name, cw.name_end - cw.name)),
-            "comment" => vis.comment.then_some((cw.comment, COMMENT_W)),
-            "switches" => vis.switches.then_some((cw.switches, SW * 8.0 + 6.0)),
-            "modes" => vis.modes.then_some((cw.mode, MODES_W)),
-            "parent" => vis.parent.then_some((cw.parent, PARENT_W)),
-            "in" => vis.in_.then_some((cw.in_, TIME_W)),
-            "out" => vis.out.then_some((cw.out, TIME_W)),
-            "duration" => vis.duration.then_some((cw.duration, TIME_W)),
-            _ => vis.stretch.then_some((cw.stretch, STRETCH_W)),
-        } {
-            app.auto.add(&format!("timeline.header.{id}"), Rect::from_min_size(pos2(x0.0, ch.min.y), vec2(x0.1, colhdr_h)), label);
-        }
-    }
-    if hresp.clicked()
-        && let Some(pt) = hresp.interact_pointer_pos()
-        && column_at(&cw, pt.x) == Some("name")
-    {
-        app.ui.timeline.source_name = !app.ui.timeline.source_name;
-    }
-    if hresp.secondary_clicked() {
-        let under = hresp.interact_pointer_pos().and_then(|pt| column_at(&cw, pt.x));
-        ctx.data_mut(|d| d.insert_temp(egui::Id::new("tl-colhdr-under"), under.unwrap_or("")));
-    }
-    hresp.context_menu(|ui| {
-        let under: &str = ctx.data(|d| d.get_temp(egui::Id::new("tl-colhdr-under"))).unwrap_or("");
-        if !under.is_empty() && under != "name" && ui.button(crate::i18n::tr("Hide This")).clicked() {
-            actions.push(("timeline.column".into(), json!({"column": under, "visible": false})));
-            ui.close();
-        }
-        ui.menu_button(crate::i18n::tr("Columns"), |ui| {
-            for (id, label) in COLUMNS {
-                let label = if id == "name" { if app.ui.timeline.source_name { "Source Name" } else { "Layer Name" } } else { label };
-                let on = column_visible(&app.ui.timeline, id);
-                if ui.add_enabled(id != "name", egui::Button::new(label).selected(on)).clicked() {
-                    actions.push(("timeline.column".into(), json!({"column": id, "visible": !on})));
-                    ui.close();
-                }
-            }
-        });
-        if ui.button(if app.ui.timeline.source_name { crate::i18n::tr("Show Layer Name") } else { crate::i18n::tr("Show Source Name") }).clicked() {
-            actions.push(("timeline.sourceName".into(), json!({})));
-            ui.close();
-        }
-    });
-    let _ = cw.end;
+    super::timeline_columns::header(app, ui, &p, &cw, Rect::from_min_max(ch.min, pos2(graph_x0 - 1.0, ch.max.y)), &mut actions);
 
     // ---- rows.
     let rows = with_expr_rows(build_rows(app, &comp), &comp, &app.ui.timeline, &ctx);
@@ -1893,7 +1631,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 layer_cells(app, ui, &lp, &cw, &comp, layer, r, cy, &mut actions);
                 // Row click → select; double-click → rename; drag → reorder. Registered before the
                 // twirl and the name field so those sit on top and get their clicks.
-                let row_x0 = if vis.num { cw.num } else { cw.name + 16.0 };
+                let row_x0 = if vis.num && cw.num < cw.name { cw.num } else { cw.name + 16.0 };
                 let row_resp = ui.interact(
                     Rect::from_min_max(pos2(row_x0, r.min.y), pos2(cw.name_end, r.max.y)),
                     egui::Id::new(("row", layer.id.0)),
@@ -1956,8 +1694,11 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                             actions.push(("window.panel".into(), json!({"panel":"smartFreeze"})));
                         }
                     }
+                    // A name longer than its column ends in "…" (resize the column to see more).
                     let lpn = lp.with_clip_rect(text_rect.intersect(lp.clip_rect()));
-                    lpn.text(pos2(name_rect.min.x, cy), Align2::LEFT_CENTER, display_name(app, layer), Tokens::ui(12.0), name_col);
+                    let dn = display_name(app, layer);
+                    let shown = widgets::text_fit(&lpn, pos2(name_rect.min.x, cy), Align2::LEFT_CENTER, &dn, Tokens::ui(12.0), text_rect.width(), name_col);
+                    app.auto.add(&format!("timeline.layer.{}.name", layer.id.0), shown, &dn);
                 }
                 // Locked layers can't be selected or moved (unlock them with the lock switch).
                 let locked = layer.switches.locked;
@@ -2092,7 +1833,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                         "Parent pick whip",
                         crate::i18n::tr("Parent pick whip: drag onto a layer"),
                     );
-                    let pr_rect = Rect::from_min_size(pos2(cw.parent + 20.0, cy - 9.0), vec2(94.0, 18.0));
+                    let pr_rect = Rect::from_min_size(pos2(cw.parent + 20.0, cy - 9.0), vec2((cw.parent_w - 22.0).max(20.0), 18.0));
                     let plabel = layer.parent.and_then(|p| comp.layer(p)).map(|l| format!("{}. {}", idx_of(l.id), l.name)).unwrap_or_else(|| "None".into());
                     let presp = widgets::dropdown(ui, pr_rect, &plabel, &t, egui::Id::new(("parent", layer.id.0)));
                     app.auto.add(&format!("timeline.layer.{}.parent", layer.id.0), pr_rect, "Parent");
@@ -2267,7 +2008,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     }
                     app.auto.add(&format!("timeline.group.{uid}.twirl"), tw, name);
                 }
-                if let Some(en) = fx {
+                if let Some(en) = fx.as_ref().filter(|_| vis.switches) {
                     let fr_ = Rect::from_center_size(pos2(cw.switches + SW * 3.0 + SW / 2.0, cy), vec2(16.0, 16.0));
                     if widgets::icon_toggle(ui, fr_, Icon::Fx, *en, &t, egui::Id::new(("gfx", uid)), Sense::click()).clicked() {
                         actions.push(("effect.toggle".into(), json!({"layer": layer.id.0, "effect": uid})));
@@ -2284,10 +2025,10 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     app.auto.add(&format!("timeline.group.{uid}.eye"), er, name);
                 }
                 lp.text(pos2(indent + 10.0, cy), Align2::LEFT_CENTER, name, Tokens::ui(12.0), t.text);
-                text_anim_popups(app, ui, &lp, layer, *uid, cw.switches, cy, &mut actions);
-                shape_add_popup(app, ui, &lp, layer, *uid, cw.switches, cy, &mut actions);
+                text_anim_popups(app, ui, &lp, layer, *uid, cw.vx, cy, &mut actions);
+                shape_add_popup(app, ui, &lp, layer, *uid, cw.vx, cy, &mut actions);
                 if *uid == GEOM_BIT | layer.id.0 {
-                    let lr = lp.text(pos2(cw.switches + 6.0, cy), Align2::LEFT_CENTER, crate::i18n::tr("Change Renderer…"), Tokens::ui(11.5), t.accent);
+                    let lr = lp.text(pos2(cw.vx + 6.0, cy), Align2::LEFT_CENTER, crate::i18n::tr("Change Renderer…"), Tokens::ui(11.5), t.accent);
                     let resp = ui
                         .interact(lr, egui::Id::new(("tl-change-renderer", layer.id.0)), Sense::click())
                         .on_hover_text(crate::i18n::tr("Composition Settings ▸ 3D Renderer"));
@@ -2299,13 +2040,13 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                         ui_actions.push(UiAct::ChangeRenderer);
                     }
                 }
-                dash_buttons(app, ui, &lp, layer, *uid, cw.switches, cy, &mut actions);
-                direction_button(app, ui, &lp, layer, *uid, cw.switches, cy, &mut actions);
+                dash_buttons(app, ui, &lp, layer, *uid, cw.vx, cy, &mut actions);
+                direction_button(app, ui, &lp, layer, *uid, cw.vx, cy, &mut actions);
                 // Mask mode + inverted inline.
                 if let Some(g) = layer.props.find_group(*uid)
                     && let GroupKind::Mask { mode, inverted, .. } = g.kind
                 {
-                    let mr = Rect::from_min_size(pos2(cw.switches + 4.0, cy - 9.0), vec2(80.0, 18.0));
+                    let mr = Rect::from_min_size(pos2(cw.vx + 4.0, cy - 9.0), vec2(80.0, 18.0));
                     let pop = egui::Id::new(("maskmode", uid));
                     if widgets::dropdown(ui, mr, mode.label(), &t, egui::Id::new(("mm", uid))).clicked() {
                         widgets::open_popup(ui, pop);
@@ -2320,7 +2061,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     }
                     lp.text(pos2(ir.max.x + 4.0, cy), Align2::LEFT_CENTER, crate::i18n::tr("Inverted"), Tokens::ui(11.0), t.text_dim);
                 }
-                let gr_rect = Rect::from_min_max(pos2(indent + 8.0, r.min.y), pos2(cw.switches, r.max.y));
+                let gr_rect = Rect::from_min_max(pos2(indent + 8.0, r.min.y), pos2(cw.vx.max(indent + 28.0), r.max.y));
                 let gr = ui.interact(gr_rect, egui::Id::new(("grow", uid)), Sense::click());
                 app.auto.add(&format!("timeline.group.{uid}.name"), gr_rect, name);
                 if gr.clicked() && uid & (WAVE_BIT | GEOM_BIT) == 0 {
@@ -2366,7 +2107,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 lp.text(pos2(indent + 12.0, cy), Align2::LEFT_CENTER, crate::i18n::tr("Expression:"), Tokens::ui(11.5), t.text_dim);
                 lp.text(pos2(indent + 82.0, cy), Align2::LEFT_CENTER, &prop.name, Tokens::ui(11.5), t.text);
                 // "=" enable switch and the property pick whip (AE's expression controls).
-                let en_r = Rect::from_center_size(pos2(cw.switches + 10.0, cy), vec2(16.0, 16.0));
+                let en_r = Rect::from_center_size(pos2(cw.vx + 10.0, cy), vec2(16.0, 16.0));
                 let en = ui.interact(en_r, egui::Id::new(("expr-en", uid)), Sense::click()).on_hover_text(crate::i18n::tr("Enable Expression"));
                 lp.rect_stroke(en_r.shrink(1.0), 2.0, Stroke::new(1.0, t.separator), StrokeKind::Inside);
                 let expr_col = t.expr_text;
@@ -2385,7 +2126,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     app,
                     ui,
                     &lp,
-                    Rect::from_center_size(pos2(cw.switches + 30.0, cy), vec2(15.0, 15.0)),
+                    Rect::from_center_size(pos2(cw.vx + 30.0, cy), vec2(15.0, 15.0)),
                     (WHIP_EXPR, layer.id.0, *uid),
                     &format!("timeline.prop.{uid}.pickWhip"),
                     "Expression pick whip",
@@ -2414,12 +2155,12 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 if let Some(check) = app.session.expr_check
                     && let Err(e) = check(&ex.text)
                 {
-                    let wr = Rect::from_center_size(pos2(cw.switches + 50.0, cy), vec2(14.0, 14.0));
+                    let wr = Rect::from_center_size(pos2(cw.vx + 50.0, cy), vec2(14.0, 14.0));
                     lp.text(wr.center(), Align2::CENTER_CENTER, "⚠", Tokens::ui(12.0), Color32::from_rgb(0xf0, 0xa0, 0x30));
                     let _ = ui.interact(wr, egui::Id::new(("expr-err", uid)), Sense::hover()).on_hover_text(e);
                 }
                 // ⓕ: the Expression Language menu inserts at the cursor.
-                let lang_r = Rect::from_center_size(pos2(cw.switches + 70.0, cy), vec2(16.0, 16.0));
+                let lang_r = Rect::from_center_size(pos2(cw.vx + 70.0, cy), vec2(16.0, 16.0));
                 let lang = ui.interact(lang_r, egui::Id::new(("expr-lang", uid)), Sense::click()).on_hover_text(crate::i18n::tr("Expression Language Menu"));
                 lp.circle_stroke(lang_r.center(), 6.5, Stroke::new(1.0, if lang.hovered() { t.text } else { t.text_dim }));
                 lp.text(lang_r.center(), Align2::CENTER_CENTER, "f", Tokens::semibold(10.0), if lang.hovered() { t.text } else { t.text_dim });
@@ -2574,7 +2315,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 let base = if is_tr_rot && prop.name == "Rotation" && layer.is_3d() { "Z Rotation".to_string() } else { prop.name.clone() };
                 let pname = if prop.has_expression() { format!("{base}  =") } else { base };
                 lp.text(pos2(name_x, cy), Align2::LEFT_CENTER, &pname, Tokens::ui(12.0), if prop.has_expression() { t.expr_text } else { t.text });
-                let name_rect = Rect::from_min_max(pos2(name_x, r.min.y), pos2(cw.switches - 2.0, r.max.y));
+                let name_rect = Rect::from_min_max(pos2(name_x, r.min.y), pos2((cw.vx - 2.0).max(name_x + 20.0), r.max.y));
                 let name_resp = ui.interact(name_rect, egui::Id::new(("pname", uid)), Sense::click_and_drag());
                 app.auto.add(&format!("timeline.prop.{uid}.name"), name_rect, &prop.name);
                 if name_resp.drag_started() {
@@ -2591,7 +2332,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 name_resp.context_menu(|ui| prop_menu(ui, &mut app.auto, cid, layer, prop, &mut actions));
                 // Value editors.
                 let value = ectx.value(layer, prop);
-                let vx = (cw.switches + 4.0).max(name_x + 120.0);
+                let vx = (cw.vx + 4.0).max(name_x + 120.0);
                 let dims = value_editor(app, ui, &lp, layer, prop, &value, pos2(vx, cy), &mut actions);
                 if !dims.is_empty() {
                     dim_hits.push((*uid, dims));
@@ -3013,7 +2754,9 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         let track = Rect::from_min_max(pos2(rect.max.x - 6.0, rows_rect.min.y + 1.0), pos2(rect.max.x - 2.0, rows_rect.max.y - 1.0));
         app.ui.timeline.scroll_y = widgets::scroll_bar(ui, &mut app.auto, "timeline.scroll", track, app.ui.timeline.scroll_y, max_scroll, &t);
     }
-    let tgl = Rect::from_min_size(pos2(footer.min.x + 10.0, footer.min.y + 3.0), vec2(150.0, 18.0));
+    // The pane buttons, then Toggle Switches / Modes (F4), as in After Effects' lower-left corner.
+    let tx = super::timeline_columns::pane_buttons(app, ui, &p, footer);
+    let tgl = Rect::from_min_size(pos2(tx, footer.min.y + 3.0), vec2(150.0, 18.0));
     let tresp = ui.interact(tgl, egui::Id::new("tl-toggle-modes"), Sense::click());
     p.text(
         tgl.left_center(),
@@ -3024,7 +2767,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     );
     app.auto.add("timeline.toggleSwitchesModes", tgl, "Toggle Switches / Modes");
     if tresp.clicked() {
-        app.ui.timeline.show_modes = !app.ui.timeline.show_modes;
+        super::timeline_columns::toggle_switches_modes(&mut app.ui.timeline);
     }
     let ms = app.frames.last_ms.lock().map(|v| *v).unwrap_or(0.0);
     p.text(
@@ -3194,6 +2937,9 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             }
         }
     }
+    // The outline / time graph splitter, registered last so it wins over the rows beside it.
+    ui.set_clip_rect(full_clip);
+    super::timeline_columns::splitter(app, ui, graph_x0 - 1.0, top, rect.max.y - footer_h, left_w, rect.width());
     if ui.input(|i| i.pointer.primary_down()) && actions.iter().any(|(id, _)| id == "prop.set") {
         app.ui.viewer.property_interacting = true;
         ctx.request_repaint();
@@ -3227,7 +2973,7 @@ fn layer_cells(
     let ctx = ui.ctx().clone();
     let lid = layer.id.0;
     if cw.vis.comment {
-        let cr = Rect::from_min_max(pos2(cw.comment + 4.0, r.min.y + 1.0), pos2(cw.comment + COMMENT_W - 4.0, r.max.y - 1.0));
+        let cr = Rect::from_min_max(pos2(cw.comment + 4.0, r.min.y + 1.0), pos2(cw.comment + cw.comment_w - 4.0, r.max.y - 1.0));
         let edit_id = egui::Id::new("tl-comment-edit");
         let editing: Option<(u64, String)> = ctx.data(|d| d.get_temp(edit_id));
         app.auto.add(&format!("timeline.layer.{lid}.comment"), cr, &layer.comment);
@@ -3253,15 +2999,15 @@ fn layer_cells(
     }
     let fd = comp.frame_duration().seconds();
     let cells = [
-        (cw.vis.in_, cw.in_, "in", layer.in_point.seconds()),
-        (cw.vis.out, cw.out, "out", layer.out_point.seconds()),
-        (cw.vis.duration, cw.duration, "duration", (layer.out_point - layer.in_point).seconds()),
+        (cw.vis.in_, cw.in_, cw.in_w, "in", layer.in_point.seconds()),
+        (cw.vis.out, cw.out, cw.out_w, "out", layer.out_point.seconds()),
+        (cw.vis.duration, cw.duration, cw.duration_w, "duration", (layer.out_point - layer.in_point).seconds()),
     ];
-    for (on, x, kind, secs) in cells {
+    for (on, x, w, kind, secs) in cells {
         if !on {
             continue;
         }
-        let cr = Rect::from_min_max(pos2(x + 2.0, r.min.y + 1.0), pos2(x + TIME_W - 2.0, r.max.y - 1.0));
+        let cr = Rect::from_min_max(pos2(x + 2.0, r.min.y + 1.0), pos2(x + w - 2.0, r.max.y - 1.0));
         let tc = crate::panels::timecode(&app.session, comp, Tick::from_seconds_f64(secs) - if kind == "duration" { comp.display_start } else { Tick(0) });
         let resp = ui.interact(cr, egui::Id::new(("tl-cell", kind, lid)), Sense::drag()).on_hover_text(crate::i18n::tr("Drag to change"));
         lp.text(pos2(cr.min.x + 4.0, cy), Align2::LEFT_CENTER, &tc, Tokens::mono(11.0), if resp.hovered() || resp.dragged() { t.hot_text } else { t.timecode });
@@ -3292,8 +3038,9 @@ fn layer_cells(
         }
     }
     if cw.vis.stretch {
-        let cr = Rect::from_min_max(pos2(cw.stretch + 2.0, r.min.y + 1.0), pos2(cw.stretch + STRETCH_W - 2.0, r.max.y - 1.0));
-        let label = format!("{:.1}%", layer.stretch * 100.0);
+        let cr = Rect::from_min_max(pos2(cw.stretch + 2.0, r.min.y + 1.0), pos2(cw.stretch + cw.stretch_w - 2.0, r.max.y - 1.0));
+        // `stretch` is already a percentage (100 = normal speed).
+        let label = format!("{:.1}%", layer.stretch);
         let resp = ui.interact(cr, egui::Id::new(("tl-stretch", lid)), Sense::click()).on_hover_text(crate::i18n::tr("Time Stretch…"));
         lp.text(pos2(cr.min.x + 4.0, cy), Align2::LEFT_CENTER, &label, Tokens::ui(11.5), if resp.hovered() { t.hot_text } else { t.text });
         app.auto.add(&format!("timeline.layer.{lid}.stretch"), cr, &label);
@@ -3922,8 +3669,7 @@ mod tests {
         assert!(tl.show_modes && column_visible(tl, "comment") && !column_visible(tl, "label"));
         assert!(set_column(tl, "name", false).is_err());
         assert!(set_column(tl, "bogus", true).is_err());
-        let vis = Vis::of(tl);
-        let cw = cols(0.0, 1400.0, vis);
+        let cw = cols(0.0, tl);
         // Hidden columns take no room; visible ones are in After Effects' order.
         assert_eq!(cw.keys, cw.label);
         assert_eq!(cw.label, cw.num);

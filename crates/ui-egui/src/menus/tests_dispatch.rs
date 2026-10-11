@@ -45,6 +45,7 @@ const PINNED_INVOKE: &[&str] = &[
     "timeline.zoomFit",
     "timeline.zoomFrameToggle",
     "timeline.column",
+    "timeline.columnLayout",
     "project.column",
     "timeline.sourceName",
     "flowchart.options",
@@ -167,7 +168,7 @@ fn handles_exactly_the_pinned_ids() {
         want.sort();
         assert_eq!(got, want, "{stage:?}: the handled ids changed; update PINNED_* only for a deliberate change");
     }
-    assert_eq!(PINNED_INVOKE.len() + PINNED_FRONTEND.len(), 126);
+    assert_eq!(PINNED_INVOKE.len() + PINNED_FRONTEND.len(), 127);
 }
 
 #[test]
