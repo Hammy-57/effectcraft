@@ -114,15 +114,22 @@ impl<'a> Renderer<'a> {
         cache::content_animated(ctx.comp, layer)
     }
 
-    /// A static precomp's Processed key and the existing key-attempt bookkeeping id.
-    /// Animated nested content keeps its current transient rendering policy. Accelerators
-    /// must still apply `precomp_source` eligibility before using this key.
+    /// A precomp's Processed key (by the nested comp's values, so an animated precomp holding
+    /// its values keeps its key) and the existing key-attempt bookkeeping id. Accelerators must
+    /// still apply `precomp_source` eligibility before using this key, and admit animated
+    /// content ([`Self::resident_precomp_animated`]) only once its key repeats.
     pub fn resident_precomp_key(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(u64, u64)> {
-        if !matches!(layer.source, LayerSource::Comp { .. }) || self.freeze.is_some() || self.precomp_varies(ctx, layer) {
+        if !matches!(layer.source, LayerSource::Comp { .. }) || self.freeze.is_some() {
             return None;
         }
         let (key, noted, _) = self.content_cache_key_noted(ctx, layer);
         Some((key?, noted?))
+    }
+
+    /// Whether a precomp's pixels may change from frame to frame (its key then changes with
+    /// its values): retained only when the same key comes back.
+    pub fn resident_precomp_animated(&self, ctx: &EvalCtx, layer: &Layer) -> bool {
+        self.precomp_varies(ctx, layer)
     }
 
     /// Report a static precomp lookup through the same miss backoff used by CPU content.
