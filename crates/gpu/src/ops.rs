@@ -1,6 +1,6 @@
 //! Compositing primitives: each mirrors a CPU operation in `effectcraft-raster` /
-//! `effectcraft-render` and returns a new image (GPU images are immutable; only [`warp_q_in`]
-//! draws on a canvas in place, one no one else can see).
+//! `effectcraft-render` and returns a new image (GPU images are immutable; only the `*_in`
+//! forms draw on a canvas in place, one no one else can see).
 
 use effectcraft_color::{BlendMode, Conversion};
 use effectcraft_geom::{Mat3, Rect, vec2};
@@ -20,6 +20,47 @@ fn sampling_id(s: Sampling) -> u32 {
         Sampling::Bilinear => 1,
         Sampling::Bicubic => 2,
     }
+}
+
+/// A rectangle `[x0, y0, x1, y1)` of canvas pixels (empty when `x0 >= x1` or `y0 >= y1`).
+pub(crate) type Bounds = [u32; 4];
+
+/// The canvas pixels a warp of a `src`-sized image by `m` can reach: outside them a warp pass
+/// leaves the canvas as it is (`warp_blend_px`, `warp_accum_px`).
+pub(crate) fn warp_bounds(dst: &GpuImage, src: &GpuImage, m: &Mat3) -> Bounds {
+    let bounds = m.map_rect(&Rect::from_size(src.width as f64, src.height as f64)).inflate(1.0).round_out();
+    let area = bounds.intersect(&Rect::from_size(dst.width as f64, dst.height as f64));
+    if area.is_empty() {
+        return [0; 4];
+    }
+    [area.x0.max(0.0) as u32, area.y0.max(0.0) as u32, area.x1.min(dst.width as f64) as u32, area.y1.min(dst.height as f64) as u32]
+}
+
+/// The smallest rectangle holding `a` and `b`.
+pub(crate) fn union(a: Bounds, b: Bounds) -> Bounds {
+    let empty = |r: Bounds| r[0] >= r[2] || r[1] >= r[3];
+    match (empty(a), empty(b)) {
+        (true, _) => b,
+        (_, true) => a,
+        _ => [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])],
+    }
+}
+
+/// The copy of the rectangle `b` of the canvas `dst` that the in-place pass `entry` (a `*_at`
+/// kernel: `dst` is its output, the copy its input, as a pass can't read and write one
+/// texture) reads, with the pass's workgroups; `None` when the full-canvas pass must run
+/// instead: `dst` isn't this encoder's own ([`Enc::owns`]), the kernel didn't build, or `b`
+/// covers half the canvas or more (cheaper as one full pass: in place, `b` is copied out, then
+/// read and written again). The caller checks that the full pass leaves the pixels outside
+/// `b` as they are.
+fn at(e: &mut Enc, dst: &GpuImage, [x0, y0, x1, y1]: Bounds, entry: &str) -> Option<(GpuImage, (u32, u32))> {
+    let (w, h) = (x1.saturating_sub(x0), y1.saturating_sub(y0));
+    let area = u64::from(w).saturating_mul(u64::from(h));
+    let canvas = u64::from(dst.width).saturating_mul(u64::from(dst.height));
+    if w == 0 || h == 0 || area.saturating_mul(2) >= canvas || x1 > dst.width || y1 > dst.height || !e.owns(dst) || !e.has_kernel(entry) {
+        return None;
+    }
+    Some((e.crop(dst, x0, y0, w, h), (w.div_ceil(16), h.div_ceil(16))))
 }
 
 fn rows(m: &Mat3) -> [[f32; 4]; 3] {
@@ -120,13 +161,10 @@ fn warp_onto(
         img = level;
         inv = Mat3::scale(vec2(f, f)) * inv;
     }
-    let bounds = m.map_rect(&Rect::from_size(src.width as f64, src.height as f64)).inflate(1.0).round_out();
-    let area = bounds.intersect(&Rect::from_size(dst.width as f64, dst.height as f64));
-    if area.is_empty() {
+    let [x0, y0, x1, y1] = warp_bounds(dst, src, m);
+    if x0 >= x1 || y0 >= y1 {
         return Some(dst.clone());
     }
-    let (x0, x1) = (area.x0.max(0.0) as u32, area.x1.min(dst.width as f64) as u32);
-    let (y0, y1) = (area.y0.max(0.0) as u32, area.y1.min(dst.height as f64) as u32);
     let mut p = Params::default();
     let clear = matches!(mode, BlendMode::StencilAlpha | BlendMode::StencilLuma);
     let flags = u32::from(accumulate.is_some()) | if clear && accumulate.is_none() { 2 } else { 0 };
@@ -153,20 +191,16 @@ fn warp_onto(
 /// canvas not already quantised to `levels` is quantised outside them too, and a layer
 /// covering half the canvas or more is cheaper as one full pass (in place, its bounds are
 /// copied out, then read and written again).
-fn warp_in_place(e: &mut Enc, dst: &GpuImage, img: &GpuImage, p: &Params, [x0, y0, x1, y1]: [u32; 4], levels: Option<f32>) -> bool {
-    let (w, h) = (x1.saturating_sub(x0), y1.saturating_sub(y0));
-    let area = u64::from(w).saturating_mul(u64::from(h));
-    let canvas = u64::from(dst.width).saturating_mul(u64::from(dst.height));
+fn warp_in_place(e: &mut Enc, dst: &GpuImage, img: &GpuImage, p: &Params, b: Bounds, levels: Option<f32>) -> bool {
     // Quantising is idempotent (see `quantize`): a canvas quantised to `levels` stays as it is.
     let outside_unchanged = p.u[0][3] & 2 == 0 && (levels.is_none() || dst.levels == levels);
-    if !outside_unchanged || w == 0 || h == 0 || area.saturating_mul(2) >= canvas || x1 > dst.width || y1 > dst.height || !e.has_kernel("warp_blend_at") {
+    if !outside_unchanged {
         return false;
     }
-    // The kernel can't read and write one texture in a pass: it reads the bounds from a copy.
-    let under = e.crop(dst, x0, y0, w, h);
+    let Some((under, groups)) = at(e, dst, b, "warp_blend_at") else { return false };
     let mut q = *p;
-    q.u[1] = [x0, y0, x1, y1];
-    e.dispatch("warp_blend_at", &q, img, Some(&under), dst, None, (w.div_ceil(16), h.div_ceil(16)));
+    q.u[1] = b;
+    e.dispatch("warp_blend_at", &q, img, Some(&under), dst, None, groups);
     true
 }
 
@@ -175,9 +209,24 @@ fn warp_in_place(e: &mut Enc, dst: &GpuImage, img: &GpuImage, p: &Params, [x0, y
 /// minification level of `src` is built once and shared by the samples that use it, consecutive
 /// samples at the same level sum in one `warp_accum` pass (one write of the canvas instead of one
 /// per sample), and samples that land entirely off `dst` (which add exactly nothing) are skipped.
+#[cfg(test)]
 pub fn warp_accumulate(e: &mut Enc, dst: &GpuImage, src: &GpuImage, matrices: &[Mat3], sampling: Sampling, weight: f32) -> GpuImage {
+    let mut acc = dst.clone();
+    warp_accumulate_in(e, &mut acc, src, matrices, sampling, weight);
+    acc
+}
+
+/// `warp_accumulate` onto `dst` itself: each run summed in place over its samples' bounds
+/// (`warp_accum_at`, the same per-pixel sums; `warp_accum` writes the pixels outside them back
+/// unchanged) when this encoder owns `dst` (see [`warp_q_in`]). Returns the samples' bounds:
+/// outside them `dst` is as it was.
+pub(crate) fn warp_accumulate_in(e: &mut Enc, dst: &mut GpuImage, src: &GpuImage, matrices: &[Mat3], sampling: Sampling, weight: f32) -> Bounds {
+    let reach = matrices.iter().fold([0; 4], |u, m| union(u, warp_bounds(dst, src, m)));
     if src.width == 0 || src.height == 0 || !e.has_kernel("warp_accum") {
-        return matrices.iter().fold(dst.clone(), |acc, m| warp(e, &acc, src, m, sampling, BlendMode::Normal, 1.0, 0, Some(weight)));
+        for m in matrices {
+            warp_q_in(e, dst, src, m, sampling, BlendMode::Normal, 1.0, 0, Some(weight), None);
+        }
+        return reach;
     }
     // Minification chain shared by the samples (level i = `src` halved i times).
     let mut mips: Vec<GpuImage> = vec![src.clone()];
@@ -207,17 +256,11 @@ pub fn warp_accumulate(e: &mut Enc, dst: &GpuImage, src: &GpuImage, matrices: &[
             }
             inv = Mat3::scale(vec2(f, f)) * inv;
         }
-        let bounds = m.map_rect(&Rect::from_size(src.width as f64, src.height as f64)).inflate(1.0).round_out();
-        let area = bounds.intersect(&Rect::from_size(dst.width as f64, dst.height as f64));
-        if area.is_empty() {
+        let b = warp_bounds(dst, src, m);
+        if b[0] >= b[2] || b[1] >= b[3] {
             continue;
         }
-        let b = [
-            area.x0.max(0.0) as u32 as f32,
-            area.y0.max(0.0) as u32 as f32,
-            area.x1.min(dst.width as f64) as u32 as f32,
-            area.y1.min(dst.height as f64) as u32 as f32,
-        ];
+        let b = b.map(|v| v as f32);
         let r = rows(&inv);
         let sample = [r[0], r[1], r[2], b];
         match runs.last_mut() {
@@ -228,7 +271,6 @@ pub fn warp_accumulate(e: &mut Enc, dst: &GpuImage, src: &GpuImage, matrices: &[
             _ => runs.push((level, sample.iter().flatten().copied().collect(), b)),
         }
     }
-    let mut acc = dst.clone();
     for (level, data, u) in &runs {
         let Some(img) = mips.get(*level) else { continue };
         let mut p = Params::default();
@@ -236,19 +278,29 @@ pub fn warp_accumulate(e: &mut Enc, dst: &GpuImage, src: &GpuImage, matrices: &[
         p.f[0] = [weight, u[0], u[1], u[2]];
         p.f[1][0] = u[3];
         let buf = e.data(data);
+        // The run's bounds are whole pixels (`warp_bounds`).
+        let b = u.map(|v| v as u32);
+        if let Some((under, groups)) = at(e, dst, b, "warp_accum_at") {
+            p.u[1] = b;
+            e.dispatch("warp_accum_at", &p, img, Some(&under), dst, Some(&buf), groups);
+            dst.levels = None;
+            continue;
+        }
         let out = e.scratch(dst.width, dst.height);
-        e.pixels("warp_accum", &p, img, Some(&acc), &out, Some(&buf));
-        acc = out;
+        e.pixels("warp_accum", &p, img, Some(dst), &out, Some(&buf));
+        *dst = out;
     }
-    acc
+    reach
 }
 
 /// `Image::blend_from`: blend `src` (same size) onto `dst`, clamping and quantising the result
 /// to `levels` when set (see [`warp_q`]).
+#[cfg(test)]
 pub fn blend_full(e: &mut Enc, dst: &GpuImage, src: &GpuImage, mode: BlendMode, opacity: f32, seed: u32, levels: Option<f32>) -> GpuImage {
     blend_full_preserve(e, dst, src, mode, opacity, seed, levels, false)
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn blend_full_preserve(
     e: &mut Enc,
@@ -260,17 +312,61 @@ pub(crate) fn blend_full_preserve(
     levels: Option<f32>,
     preserve: bool,
 ) -> GpuImage {
-    let mut p = Params::default();
-    p.u[0] = [mode_id(mode), preserve as u32, seed, 0];
-    p.f[0] = [opacity, levels.unwrap_or(0.0), levels.map_or(0.0, |v| 1.0 / v), 0.0];
-    let mut out = e.scratch(dst.width, dst.height);
-    e.pixels("blend_full", &p, src, Some(dst), &out, None);
-    out.levels = levels;
+    let mut out = dst.clone();
+    blend_full_in(e, &mut out, src, mode, opacity, seed, levels, preserve, None);
     out
 }
 
+/// `Image::blend_from` (`blend_full`, Preserve Transparency with `preserve`) onto `dst` itself: in place over `b` (`blend_full_at`, the same
+/// per-pixel blend and quantisation) when this encoder owns `dst` and `src` is transparent
+/// outside `b` (the caller's promise, e.g. a layer drawn on zeros inside [`warp_bounds`]).
+/// There the full pass stores the canvas pixel back, quantised to `levels`, so in place is
+/// exact unless the mode is a stencil (which blends even transparent pixels) or the canvas
+/// isn't already quantised to `levels` (as [`warp_q_in`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn blend_full_in(
+    e: &mut Enc,
+    dst: &mut GpuImage,
+    src: &GpuImage,
+    mode: BlendMode,
+    opacity: f32,
+    seed: u32,
+    levels: Option<f32>,
+    preserve: bool,
+    b: Option<Bounds>,
+) {
+    let mut p = Params::default();
+    p.u[0] = [mode_id(mode), preserve as u32, seed, 0];
+    p.f[0] = [opacity, levels.unwrap_or(0.0), levels.map_or(0.0, |v| 1.0 / v), 0.0];
+    // `is_stencil` in the kernels.
+    let stencil = (32..=35).contains(&mode_id(mode));
+    if let Some(b) = b.filter(|_| !stencil && (levels.is_none() || dst.levels == levels))
+        && let Some((under, groups)) = at(e, dst, b, "blend_full_at")
+    {
+        p.u[1] = b;
+        e.dispatch("blend_full_at", &p, src, Some(&under), dst, None, groups);
+        dst.levels = levels;
+        return;
+    }
+    let mut out = e.scratch(dst.width, dst.height);
+    e.pixels("blend_full", &p, src, Some(dst), &out, None);
+    out.levels = levels;
+    *dst = out;
+}
+
 /// Multiply an isolated layer by its track matte.
+#[cfg(test)]
 pub fn matte(e: &mut Enc, iso: &GpuImage, matte: &GpuImage, kind: MatteKind) -> GpuImage {
+    let mut out = iso.clone();
+    matte_in(e, &mut out, matte, kind, None);
+    out
+}
+
+/// Multiply an isolated layer by its track matte (`matte`), onto `iso` itself: in place over `b` (`matte_at`, the same per-pixel factor) when
+/// this encoder owns `iso` and `iso` is transparent outside `b`. There the full pass writes
+/// 0 × a factor clamped to 0..1, transparent again (a zero of either sign, which
+/// [`blend_full_in`] skips alike), so the composite that follows is exact.
+pub(crate) fn matte_in(e: &mut Enc, iso: &mut GpuImage, matte: &GpuImage, kind: MatteKind, b: Option<Bounds>) {
     let mut p = Params::default();
     p.u[0][0] = match kind {
         MatteKind::Alpha => 0,
@@ -278,9 +374,17 @@ pub fn matte(e: &mut Enc, iso: &GpuImage, matte: &GpuImage, kind: MatteKind) -> 
         MatteKind::Luma => 2,
         MatteKind::LumaInverted => 3,
     };
+    if let Some(b) = b
+        && let Some((under, groups)) = at(e, iso, b, "matte_at")
+    {
+        p.u[1] = b;
+        e.dispatch("matte_at", &p, &under, Some(matte), iso, None, groups);
+        iso.levels = None;
+        return;
+    }
     let out = e.scratch(iso.width, iso.height);
     e.pixels("matte", &p, iso, Some(matte), &out, None);
-    out
+    *iso = out;
 }
 
 /// Knockout: clear what lies below the layer's content.
@@ -291,13 +395,31 @@ pub fn knockout(e: &mut Enc, canvas: &GpuImage, shape: &GpuImage) -> GpuImage {
 }
 
 /// Styled-layer finish: move `canvas` toward `tmp` by `opacity` on the enabled channels.
+#[cfg(test)]
 pub fn channel_mix(e: &mut Enc, canvas: &GpuImage, tmp: &GpuImage, channels: [bool; 3], opacity: f32) -> GpuImage {
+    let mut out = canvas.clone();
+    channel_mix_in(e, &mut out, tmp, channels, opacity, None);
+    out
+}
+
+/// The styled-layer finish (`channel_mix`) onto `canvas` itself: in place over `b` (`channel_mix_at`, the same
+/// per-pixel mix) when this encoder owns `canvas` and `tmp` equals it outside `b`. There the
+/// full pass writes c + (c − c) × opacity = c (a −0 comes back as +0, an equal value).
+pub(crate) fn channel_mix_in(e: &mut Enc, canvas: &mut GpuImage, tmp: &GpuImage, channels: [bool; 3], opacity: f32, b: Option<Bounds>) {
     let mut p = Params::default();
     p.u[0] = [channels[0] as u32, channels[1] as u32, channels[2] as u32, 0];
     p.f[0][0] = opacity;
+    if let Some(b) = b
+        && let Some((under, groups)) = at(e, canvas, b, "channel_mix_at")
+    {
+        p.u[1] = b;
+        e.dispatch("channel_mix_at", &p, &under, Some(tmp), canvas, None, groups);
+        canvas.levels = None;
+        return;
+    }
     let out = e.scratch(canvas.width, canvas.height);
     e.pixels("channel_mix", &p, canvas, Some(tmp), &out, None);
-    out
+    *canvas = out;
 }
 
 /// Adjustment layer finish: move `canvas` toward `adjusted` by `matte`'s alpha × `opacity`.

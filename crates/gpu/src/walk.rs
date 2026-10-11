@@ -15,7 +15,7 @@ use effectcraft_render::{EvalCtx, Renderer, styles};
 use effectcraft_time::Tick;
 
 use crate::context::{Enc, GpuImage};
-use crate::ops;
+use crate::ops::{self, Bounds};
 
 /// Render a comp frame into a GPU image (the canvas in the output space, as
 /// `Renderer::comp_frame_cpu` returns it). `None` when something cannot run here (the caller
@@ -199,7 +199,7 @@ fn draw_split(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, split: &effectcraft_rend
             Some(m) => Some(m?),
             None => None,
         };
-        composite_iso_with(e, r, ctx, split.layer(i), iso, &mut cv, 1.0, matte3d, None)?;
+        composite_iso_with(e, r, ctx, split.layer(i), iso, &mut cv, 1.0, matte3d, None, None)?;
     }
     Some(cv)
 }
@@ -219,7 +219,7 @@ fn draw_collapsed<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, layer: &
     let Some((sub, nctx)) = r.collapse_into(ctx, layer, item, 1.0) else { return Some(()) };
     let mut iso = e.zeros(canvas.width, canvas.height);
     draw_comp(e, &sub, &nctx, &mut iso)?;
-    composite_iso(e, r, ctx, layer, iso, canvas, opacity)
+    composite_iso(e, r, ctx, layer, iso, canvas, opacity, None)
 }
 
 /// Collapsed 2D contents are already placed in comp space before the parent
@@ -249,7 +249,7 @@ fn draw_collapsed_fx<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, layer
     if (done.width, done.height) != (canvas.width, canvas.height) {
         return Some(());
     }
-    composite_iso(e, r, ctx, layer, done, canvas, opacity)
+    composite_iso(e, r, ctx, layer, done, canvas, opacity, None)
 }
 
 fn draw_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut GpuImage) -> Option<()> {
@@ -285,24 +285,28 @@ fn draw_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &
     // fades the whole stack; knockout and channel switches as on the CPU.
     let bl = styles::blending(ctx, layer);
     let (w, h) = (canvas.width, canvas.height);
+    // The passes draw in place once they have their own canvas; `reach` is what they changed.
+    let mut reach = [0; 4];
     if r.track_matte(ctx, layer).is_some() || layer.preserve_transparency {
         let mut iso = e.zeros(w, h);
         for (b, m) in &st.passes {
-            iso = place(e, r, ctx, layer, b, &iso, *m, 1.0, None)?;
+            reach = ops::union(reach, place_in(e, r, ctx, layer, b, &mut iso, *m, 1.0, None)?);
         }
-        iso = place(e, r, ctx, layer, &st.body, &iso, BlendMode::Normal, 1.0, None)?;
-        return composite_iso(e, r, ctx, layer, iso, canvas, opacity);
+        reach = ops::union(reach, place_in(e, r, ctx, layer, &st.body, &mut iso, BlendMode::Normal, 1.0, None)?);
+        return composite_iso(e, r, ctx, layer, iso, canvas, opacity, Some(reach));
     }
     let mut tmp = canvas.clone();
     if bl.knockout > 0 {
-        let k = place(e, r, ctx, layer, &st.content, &e.zeros(w, h), BlendMode::Normal, 1.0, None)?;
+        let mut k = e.zeros(w, h);
+        // Knockout keeps the canvas (× 1) where `k` is transparent.
+        reach = place_in(e, r, ctx, layer, &st.content, &mut k, BlendMode::Normal, 1.0, None)?;
         tmp = ops::knockout(e, &tmp, &k);
     }
     for (b, m) in &st.passes {
-        tmp = place(e, r, ctx, layer, b, &tmp, *m, 1.0, None)?;
+        reach = ops::union(reach, place_in(e, r, ctx, layer, b, &mut tmp, *m, 1.0, None)?);
     }
-    tmp = place(e, r, ctx, layer, &st.body, &tmp, layer.blend_mode, 1.0, None)?;
-    *canvas = ops::channel_mix(e, canvas, &tmp, bl.channels, opacity);
+    reach = ops::union(reach, place_in(e, r, ctx, layer, &st.body, &mut tmp, layer.blend_mode, 1.0, None)?);
+    ops::channel_mix_in(e, canvas, &tmp, bl.channels, opacity, Some(reach));
     Some(())
 }
 
@@ -599,12 +603,13 @@ fn composite_resident(
     let pipe = r.pipe();
     let shape = Buf { img: Image { width: img.width, height: img.height, data: Vec::new() }, offset, scale };
     if r.track_matte(ctx, layer).is_some() || layer.preserve_transparency {
-        let Some(iso) = place_src(e, r, ctx, layer, &shape, img, &e.zeros(canvas.width, canvas.height), BlendMode::Normal, 1.0, None) else {
+        let mut iso = e.zeros(canvas.width, canvas.height);
+        let Some(reach) = place_src_in(e, r, ctx, layer, &shape, img, &mut iso, BlendMode::Normal, 1.0, None) else {
             return Some(None);
         };
-        return Some(composite_iso(e, r, ctx, layer, iso, canvas, opacity));
+        return Some(composite_iso(e, r, ctx, layer, iso, canvas, opacity, Some(reach)));
     }
-    Some(place_src_in(e, r, ctx, layer, &shape, img, canvas, layer.blend_mode, opacity, pipe.levels))
+    Some(place_src_in(e, r, ctx, layer, &shape, img, canvas, layer.blend_mode, opacity, pipe.levels).map(|_| ()))
 }
 
 /// Adjustment layer (`Renderer::draw_adjustment`): the effect stack runs on the comp below,
@@ -646,20 +651,33 @@ fn composite_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, buf:
     let matte = r.track_matte(ctx, layer).is_some();
     if !matte && !layer.preserve_transparency {
         // The comp is quantised after the layer (8/16 bpc) in the same pass.
-        return place_in(e, r, ctx, layer, buf, canvas, layer.blend_mode, opacity, r.pipe().levels);
+        return place_in(e, r, ctx, layer, buf, canvas, layer.blend_mode, opacity, r.pipe().levels).map(|_| ());
     }
     // Render in isolation, then matte / preserve transparency, then blend.
-    let iso = place(e, r, ctx, layer, buf, &e.zeros(canvas.width, canvas.height), BlendMode::Normal, 1.0, None)?;
-    composite_iso(e, r, ctx, layer, iso, canvas, opacity)
+    let mut iso = e.zeros(canvas.width, canvas.height);
+    let reach = place_in(e, r, ctx, layer, buf, &mut iso, BlendMode::Normal, 1.0, None)?;
+    composite_iso(e, r, ctx, layer, iso, canvas, opacity, Some(reach))
 }
 
 /// Track matte / Preserve Transparency on an isolated layer render, then blend.
-fn composite_iso(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, iso: GpuImage, canvas: &mut GpuImage, opacity: f32) -> Option<()> {
-    composite_iso_with(e, r, ctx, layer, iso, canvas, opacity, None, r.pipe().levels)
+#[allow(clippy::too_many_arguments)]
+fn composite_iso(
+    e: &mut Enc,
+    r: &Renderer,
+    ctx: &EvalCtx,
+    layer: &Layer,
+    iso: GpuImage,
+    canvas: &mut GpuImage,
+    opacity: f32,
+    reach: Option<Bounds>,
+) -> Option<()> {
+    composite_iso_with(e, r, ctx, layer, iso, canvas, opacity, None, r.pipe().levels, reach)
 }
 
 /// `Renderer::composite_iso_with`: the matte from `matte_img` when given (a 3D matte drawn
 /// through the camera), else the matte layer placed in 2D; the blend quantised to `levels`.
+/// With `reach` (`iso` is transparent outside it), the matte and the blend run in place over
+/// it (`ops::matte_in`, `ops::blend_full_in`).
 #[allow(clippy::too_many_arguments)]
 fn composite_iso_with(
     e: &mut Enc,
@@ -671,6 +689,7 @@ fn composite_iso_with(
     opacity: f32,
     matte_img: Option<GpuImage>,
     levels: Option<f32>,
+    reach: Option<Bounds>,
 ) -> Option<()> {
     if let Some((m, kind)) = r.track_matte(ctx, layer) {
         let mimg = match matte_img.filter(|i| (i.width, i.height) == (canvas.width, canvas.height)) {
@@ -686,9 +705,9 @@ fn composite_iso_with(
                 mimg
             }
         };
-        iso = ops::matte(e, &iso, &mimg, kind);
+        ops::matte_in(e, &mut iso, &mimg, kind, reach);
     }
-    *canvas = ops::blend_full_preserve(e, canvas, &iso, layer.blend_mode, opacity, layer.id.0 as u32, levels, layer.preserve_transparency);
+    ops::blend_full_in(e, canvas, &iso, layer.blend_mode, opacity, layer.id.0 as u32, levels, layer.preserve_transparency, reach);
     Some(())
 }
 
@@ -712,7 +731,8 @@ fn place(
 }
 
 /// [`place`] onto `target` itself (in place over the layer's bounds when the encoder owns it:
-/// `ops::warp_q_in`).
+/// `ops::warp_q_in`). Returns the pixels it may have changed: outside them `target` is as it
+/// was.
 #[allow(clippy::too_many_arguments)]
 fn place_in(
     e: &mut Enc,
@@ -724,34 +744,15 @@ fn place_in(
     mode: BlendMode,
     opacity: f32,
     levels: Option<f32>,
-) -> Option<()> {
+) -> Option<Bounds> {
     if buf.img.is_empty() || opacity <= 0.0 {
-        return Some(());
+        return Some([0; 4]);
     }
     let src = e.upload_buf(buf)?;
     place_src_in(e, r, ctx, layer, buf, src, target, mode, opacity, levels)
 }
 
-/// [`place`] of a GPU image `src` shaped like `buf`.
-#[allow(clippy::too_many_arguments)]
-fn place_src(
-    e: &mut Enc,
-    r: &Renderer,
-    ctx: &EvalCtx,
-    layer: &Layer,
-    buf: &Buf,
-    src: GpuImage,
-    target: &GpuImage,
-    mode: BlendMode,
-    opacity: f32,
-    levels: Option<f32>,
-) -> Option<GpuImage> {
-    let mut out = target.clone();
-    place_src_in(e, r, ctx, layer, buf, src, &mut out, mode, opacity, levels)?;
-    Some(out)
-}
-
-/// [`place_src`] onto `target` itself (see [`place_in`]).
+/// [`place_in`] of a GPU image `src` shaped like `buf`.
 #[allow(clippy::too_many_arguments)]
 fn place_src_in(
     e: &mut Enc,
@@ -764,14 +765,21 @@ fn place_src_in(
     mode: BlendMode,
     opacity: f32,
     levels: Option<f32>,
-) -> Option<()> {
+) -> Option<Bounds> {
     let pl = r.placement(ctx, layer, buf);
+    // A stencil or silhouette mode changes the canvas outside the layer too, and so does
+    // quantising a canvas not yet quantised to `levels`.
+    let all = (32..=35).contains(&ops::mode_id(mode)) || (levels.is_some() && target.levels != levels);
+    let everything = [0, 0, target.width, target.height];
     if let [m] = pl.matrices.as_slice() {
+        let reach = ops::warp_bounds(target, &src, m);
         ops::warp_q_in(e, target, &src, m, pl.sampling, mode, opacity, pl.seed, None, levels);
-        return Some(());
+        return Some(if all { everything } else { reach });
     }
+    // Motion blur: the sub-samples summed in place on their own canvas, then blended.
     let k = 1.0 / pl.matrices.len() as f32;
-    let acc = ops::warp_accumulate(e, &e.zeros(target.width, target.height), &src, &pl.matrices, pl.sampling, k);
-    *target = ops::blend_full(e, target, &acc, mode, opacity, pl.seed, levels);
-    Some(())
+    let mut acc = e.zeros(target.width, target.height);
+    let reach = ops::warp_accumulate_in(e, &mut acc, &src, &pl.matrices, pl.sampling, k);
+    ops::blend_full_in(e, target, &acc, mode, opacity, pl.seed, levels, false, Some(reach));
+    Some(if all { everything } else { reach })
 }
