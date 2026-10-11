@@ -1322,6 +1322,6 @@ mod tests_panels;
 mod tests_roto;
 
 #[cfg(test)]
-mod tests_key_time;
-#[cfg(test)]
 mod tests_import_project;
+#[cfg(test)]
+mod tests_key_time;
