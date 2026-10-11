@@ -565,10 +565,15 @@ fn rayon_workers_wait_for_an_in_flight_frame() {
     let f = probe(&p).expect("probe");
     let pool = MediaPool::new();
     let workers = rayon::ThreadPoolBuilder::new().num_threads(10).build().expect("pool");
+    // Read frame 39 first, so the shared decode of frame 40 is one step of an open decoder: a
+    // decode from the keyframe can outlast the workers' stall timeout when the machine is busy
+    // (the full suite), and then they decode private copies.
+    pool.frame_at(&f, t_of(f.frame_rate, 39)).expect("frame 39");
+    let before = pool.stats();
     let t = t_of(f.frame_rate, 40);
     let frames: Vec<Arc<Image>> = workers.install(|| (0..10).into_par_iter().with_max_len(1).map(|_| pool.frame_at(&f, t).expect("frame")).collect());
     let st = pool.stats();
-    assert_eq!((st.misses, st.hits), (1, 9), "{st:?}");
+    assert_eq!((st.misses - before.misses, st.hits - before.hits), (1, 9), "{st:?}");
     assert!(frames.iter().all(|img| img.data == frames[0].data));
     let db = psnr(&frames[0], &reference_frame(&p, 40));
     assert!(db > 35.0, "frame 40: {db:.2} dB");

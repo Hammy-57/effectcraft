@@ -1051,13 +1051,14 @@ fn named_layers(ctx: &EvalCtx, layer: &Layer, g: &PropGroup, out: &mut Vec<u64>)
 /// layer's structure, animated values and source at the context time, and the layers its own
 /// effects name. `None` when one can't be keyed here (a precomp, an effect reading the comp
 /// scene, too deep).
-fn hash_layer_refs(h: &mut KeyHasher, ctx: &EvalCtx, layer: &Layer, reads_other_times: bool, depth: usize) -> Option<()> {
+fn hash_layer_refs(h: &mut KeyHasher, ctx: &EvalCtx, layer: &Layer, reads_other_times: bool, depth: usize, limit: Option<usize>) -> Option<()> {
     if depth > 4 {
         return None;
     }
     let Some(fx) = layer.effects() else { return Some(()) };
     let mut ids = vec![];
-    for g in fx.groups().filter(|g| g.enabled) {
+    // A layer's input runs only its first `limit` effects: later ones' layers don't change it.
+    for g in fx.groups().take(limit.unwrap_or(usize::MAX)).filter(|g| g.enabled) {
         named_layers(ctx, layer, g, &mut ids);
     }
     for id in ids {
@@ -1083,14 +1084,15 @@ fn hash_layer_refs(h: &mut KeyHasher, ctx: &EvalCtx, layer: &Layer, reads_other_
                 hash_debug(h, &it.proxy);
                 ctx.source_time(o).0.hash(h);
             }
-            LayerSource::Comp { .. } => return None,
+            // The nested comp's layers are hashed by `dependencies::hash` (in every key).
+            LayerSource::Comp { .. } => {}
             _ => {}
         }
         if oi.time_dependent || oi.reads_other_times || oi.paint || reads_other_times {
             ctx.time.0.hash(h);
         }
         if o.switches.effects && oi.layer_refs {
-            hash_layer_refs(h, ctx, o, reads_other_times || oi.reads_other_times, depth + 1)?;
+            hash_layer_refs(h, ctx, o, reads_other_times || oi.reads_other_times, depth + 1, None)?;
         }
     }
     Some(())
@@ -1361,7 +1363,7 @@ fn key_any(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool, fo
     }
     // Effects that read other layers (layer parameters) see their pixels.
     if info.layer_refs {
-        hash_layer_refs(&mut h, ctx, layer, info.reads_other_times, 0)?;
+        hash_layer_refs(&mut h, ctx, layer, info.reads_other_times, 0, effects)?;
     }
     Some(h.finish())
 }

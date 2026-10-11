@@ -115,6 +115,9 @@ fn fade_scale_and_rotate() {
 fn exit_move_and_offscreen() {
     let mut s = comp();
     let l = solid(&mut s, "Box", 40, 40);
+    // Straight motion paths: with After Effects' auto-Bezier tangents ((next - previous) / 6)
+    // the path between the two equal keys at 1 s and 3 s would loop instead of holding.
+    s.prefs.general.default_spatial_linear = true;
     // Moves up within the frame 0–1 s, then leaves through the right edge 3–4 s and stays out.
     key(&mut s, l, "transform/position", 0.0, json!([160.0, 120.0]));
     key(&mut s, l, "transform/position", 1.0, json!([160.0, 60.0]));

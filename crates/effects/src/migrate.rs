@@ -269,6 +269,7 @@ fn refresh_is_no_op(pr: &Property, ps: &ParamSpec, spec: &EffectSpec) -> bool {
         // Equal option lists: no value is remapped.
         (ParamUi::Popup { .. }, ParamUi::Popup { .. }) => pr.ui == ps.ui,
         (_, ParamUi::Hidden) => pr.ui == ParamUi::Hidden,
+        (ParamUi::Hidden | ParamUi::Text, ParamUi::File { .. }) => false,
         (a, b) if std::mem::discriminant(a) == std::mem::discriminant(b) || is_numeric_ui(a) && is_numeric_ui(b) => pr.ui == ps.ui,
         _ => true,
     }

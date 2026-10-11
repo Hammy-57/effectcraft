@@ -44,7 +44,7 @@ pub use color2::{Curve, auto_correct_settings, color_link_mode, color_link_sampl
 pub use color3::OffsetCurve;
 pub use distort::{BULGE_STRENGTH, transform_effect_matrix, transform_extent, transform_shutter, twirl_radius, wave_warp_cycles};
 pub use distort2::{MAGNIFY_MODES, bezier_grid, parse_mesh};
-pub use distort3::{RESHAPE_POINTS, ReshapeSetup, SmearSetup, reshape_setup, smear_setup, warp_inverse_map};
+pub use distort3::{RESHAPE_POINTS, ReshapeSetup, SmearSetup, cc_smear_pad, reshape_setup, smear_setup, warp_inverse_map};
 pub use distort4::liquify_mesh;
 use effectcraft_keyframe::Value;
 use effectcraft_project::build::Ids;

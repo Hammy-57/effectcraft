@@ -37,11 +37,30 @@ fn invoke(h: &mut Harness<'_, EffectcraftApp>, command: &str, params: Value) {
     h.run_steps(3);
 }
 
-fn locked_center(h: &Harness<'_, EffectcraftApp>, images: &Images) -> [u8; 4] {
-    let (_, texture) = h.ctx.data(|d| d.get_temp::<(u64, egui::TextureHandle)>(egui::Id::new("viewer-locked"))).unwrap();
-    let images = images.borrow();
-    let image = images.get(&texture.id()).unwrap();
-    image.pixels[(image.size[1] / 2) * image.size[0] + image.size[0] / 2].to_array()
+/// The locked viewer's centre pixel once it shows `want` (it renders in the frame pool, off the
+/// UI thread, so a new frame takes a few steps); the last one shown otherwise.
+fn locked_center(h: &mut Harness<'_, EffectcraftApp>, images: &Images, want: [u8; 4]) -> Option<[u8; 4]> {
+    let id = egui::Id::new("viewer-locked");
+    let mut last = None;
+    for _ in 0..400 {
+        let texture = h.ctx.data(|d| {
+            d.get_temp::<(effectcraft_ui_egui::frames::FrameKey, egui::TextureHandle)>(id)
+                .map(|(_, t)| t)
+                .or_else(|| d.get_temp::<(u64, egui::TextureHandle)>(id).map(|(_, t)| t))
+        });
+        if let Some(texture) = texture {
+            let images = images.borrow();
+            if let Some(image) = images.get(&texture.id()) {
+                last = Some(image.pixels[(image.size[1] / 2) * image.size[0] + image.size[0] / 2].to_array());
+            }
+        }
+        if last == Some(want) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        h.step();
+    }
+    last
 }
 
 fn expected_center(h: &mut Harness<'_, EffectcraftApp>) -> [u8; 4] {
@@ -67,15 +86,15 @@ fn locked_viewer_follows_display_profile_and_simulation() {
     h.run_steps(3);
     invoke(&mut h, "view.splitLockedViewer", json!({}));
     let first = expected_center(&mut h);
-    assert_eq!(locked_center(&h, &images), first);
+    assert_eq!(locked_center(&mut h, &images, first), Some(first));
 
     invoke(&mut h, "prefs.set", json!({"key": "previews.displayProfile", "value": "p3"}));
     let after_display = expected_center(&mut h);
     assert_ne!(after_display, first);
-    assert_eq!(locked_center(&h, &images), after_display);
+    assert_eq!(locked_center(&mut h, &images, after_display), Some(after_display));
 
     invoke(&mut h, "view.simulateOutput", json!({"profile": "rec709", "preserveRgb": true}));
     let after_sim = expected_center(&mut h);
     assert_ne!(after_sim, after_display);
-    assert_eq!(locked_center(&h, &images), after_sim);
+    assert_eq!(locked_center(&mut h, &images, after_sim), Some(after_sim));
 }

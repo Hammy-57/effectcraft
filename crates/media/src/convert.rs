@@ -223,6 +223,7 @@ pub(crate) fn pack_dynamic(img: image::DynamicImage, op: AlphaOp) -> std::result
 /// pixels get), then resampled the rest of the way. Conversion is linear until it clips, so
 /// this is the RGB box filter `resample` starts with, except in blocks where some colours clip.
 /// `None` for other frames.
+#[cfg(test)]
 pub(crate) fn frame_to_image_scaled(f: &VideoFrame, w: u32, h: u32) -> Option<Image> {
     let (fw, fh) = (f.width as usize, f.height as usize);
     if w == 0 || h == 0 || fw % 2 != 0 || fh % 2 != 0 || (w as usize).saturating_mul(2) > fw || (h as usize).saturating_mul(2) > fh {
@@ -242,6 +243,7 @@ pub(crate) fn frame_to_image_scaled(f: &VideoFrame, w: u32, h: u32) -> Option<Im
 
 /// An opaque 4:2:0 frame of even size `w` × `h` converted at half that size (see
 /// [`frame_to_image_scaled`]); `None` when the planes are too short.
+#[cfg(test)]
 fn half_420<T: Sample>(w: usize, h: usize, [luma, cb, cr]: [&[T]; 3], k: &Yuv) -> Option<Image> {
     /// Row `r` of a plane `n` samples wide (empty past its end).
     fn row_of<T>(p: &[T], r: usize, n: usize) -> &[T] {
@@ -266,7 +268,7 @@ fn half_420<T: Sample>(w: usize, h: usize, [luma, cb, cr]: [&[T]; 3], k: &Yuv) -
                 (dst[0], dst[cw + 1]) = (dst[1], dst[cw]);
             }
             let (top, bottom) = (row_of(luma, 2 * cy, w), row_of(luma, 2 * cy + 1, w));
-            let pixels = top.as_chunks::<2>().0.iter().zip(bottom.as_chunks::<2>().0.iter()).zip(uc.windows(3).zip(vc.windows(3)));
+            let pixels = top.as_chunks::<2>().0.iter().zip(bottom.as_chunks::<2>().0).zip(uc.windows(3).zip(vc.windows(3)));
             for (o, ((a, b), (u, v))) in row.iter_mut().zip(pixels) {
                 let (u, v) = ((u[0] + u[2]) * 0.125 + u[1] * 0.75, (v[0] + v[2]) * 0.125 + v[1] * 0.75);
                 let yy = ((a[0].f() + a[1].f() + b[0].f() + b[1].f()) * 0.25 - k.y_off) * k.y_scale;
