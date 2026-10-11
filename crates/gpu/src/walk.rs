@@ -294,8 +294,15 @@ fn draw_ordinary_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Laye
         return None;
     }
     let cache = r.cache?;
-    let key = r.resident_content_key(ctx, layer)?;
-    if let Some(image) = e.resident(key, GpuStage::Processed) {
+    let key = {
+        let _profile = effectcraft_render::profile::span("ordinary_resident_key");
+        r.resident_content_key(ctx, layer)?
+    };
+    let resident = {
+        let _profile = effectcraft_render::profile::span("ordinary_resident_lookup");
+        e.resident(key, GpuStage::Processed)
+    };
+    if let Some(image) = resident {
         let _profile = effectcraft_render::profile::span("ordinary_resident_hit");
         return composite_processed(e, r, ctx, layer, canvas, opacity, image);
     }

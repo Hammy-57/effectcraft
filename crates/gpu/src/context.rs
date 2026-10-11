@@ -224,6 +224,22 @@ impl Pool {
         }
     }
 
+    /// A last CPU lease released within the sole open encoder can be reused by
+    /// later commands in that encoder. Separate encoders retain the submit barrier.
+    fn take_for_encoder(&mut self, w: u32, h: u32, encoder: Option<u64>) -> Option<wgpu::Texture> {
+        if let Some(id) = encoder.filter(|id| *id != 0)
+            && self.open.len() == 1
+            && self.open.contains(&id)
+            && let Some(index) = self.released.iter().position(|(texture, owner)| *owner == id && texture.width() == w && texture.height() == h)
+        {
+            let (texture, _) = self.released.swap_remove(index);
+            self.released_bytes = self.released_bytes.saturating_sub(tex_bytes(&texture));
+            self.hits = self.hits.saturating_add(1);
+            return Some(texture);
+        }
+        self.take(w, h)
+    }
+
     fn take(&mut self, w: u32, h: u32) -> Option<wgpu::Texture> {
         let t = self.free.get_mut(&(w, h)).and_then(Vec::pop);
         if self.free.get(&(w, h)).is_some_and(Vec::is_empty) {
@@ -1086,9 +1102,15 @@ impl GpuContext {
 
     /// A pooled working texture: (image, reused). A reused texture holds old pixels; a new
     /// one is zeroed.
-    fn pooled(&self, w: u32, h: u32) -> (GpuImage, bool) {
+    fn pooled_for_encoder(&self, w: u32, h: u32, encoder: Option<u64>) -> (GpuImage, bool) {
+        #[cfg(feature = "profile")]
+        let encoder = {
+            static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *ENABLED.get_or_init(|| std::env::var("EFFECTCRAFT_ENCODER_REUSE").as_deref() != Ok("0")) { encoder } else { None }
+        };
+
         let (w, h) = (w.max(1), h.max(1));
-        let reused = self.pool.lock().ok().and_then(|mut p| p.take(w, h));
+        let reused = self.pool.lock().ok().and_then(|mut p| p.take_for_encoder(w, h, encoder));
         let was_reused = reused.is_some();
         let texture = reused.unwrap_or_else(|| self.texture(w, h));
         let lease = Arc::new(Lease { texture: texture.clone(), pool: Arc::downgrade(&self.pool) });
@@ -1569,7 +1591,9 @@ impl<'g> Enc<'g> {
 
     /// A new zeroed image (pooled; a reused texture is cleared by a kernel).
     pub fn image(&mut self, w: u32, h: u32) -> GpuImage {
-        let (img, reused) = self.g.pooled(w, h);
+        self.encoder();
+        let owner = self.enc.as_ref().map(|(_, id)| *id);
+        let (img, reused) = self.g.pooled_for_encoder(w, h, owner);
         if reused {
             self.fill(&img, 0.0);
         }
@@ -1579,7 +1603,9 @@ impl<'g> Enc<'g> {
     /// A new image for a kernel that writes every pixel of it (pooled; contents undefined).
     /// Under test it starts out as NaNs, so a kernel that skips pixels fails the CPU oracle.
     pub fn scratch(&mut self, w: u32, h: u32) -> GpuImage {
-        let (img, _) = self.g.pooled(w, h);
+        self.encoder();
+        let owner = self.enc.as_ref().map(|(_, id)| *id);
+        let (img, _) = self.g.pooled_for_encoder(w, h, owner);
         if cfg!(test) {
             self.fill(&img, f32::NAN);
         }
@@ -2130,6 +2156,73 @@ pub(crate) fn mip_levels(w: u32, h: u32) -> u32 {
 #[cfg(test)]
 mod upload_budget_tests {
     use super::*;
+
+    #[test]
+    fn pool_encoder_local_reuse_keeps_cross_encoder_barrier() {
+        let Some(g) = crate::tests::gpu() else { return };
+        let mut pool = Pool::default();
+        let first = pool.open();
+        pool.release(g.ctx.texture(8, 8));
+        assert!(pool.take_for_encoder(8, 8, None).is_none());
+        let second = pool.open();
+        assert!(pool.take_for_encoder(8, 8, Some(first)).is_none());
+        assert!(pool.take_for_encoder(8, 8, Some(second)).is_none());
+        pool.close(second);
+        assert!(pool.take_for_encoder(8, 8, Some(first)).is_some());
+        assert_eq!(pool.released_bytes, 0);
+        pool.release(g.ctx.texture(8, 8));
+        pool.clear();
+        assert!(pool.take_for_encoder(8, 8, Some(first)).is_none(), "purged releases cannot reappear");
+    }
+
+    #[test]
+    fn pool_encoder_local_reuse_preserves_prior_reads() {
+        crate::tests::hold_gpu_lock();
+        let g = GpuContext::headless();
+        assert!(g.is_some() || std::env::var("EFFECTCRAFT_REQUIRE_GPU").as_deref() != Ok("1"));
+        let Some(g) = g else { return };
+        let mut e = Enc::new(&g);
+        let source = e.image(8, 8);
+        e.fill(&source, 0.25);
+        let saved = e.scratch(8, 8);
+        e.copy_into(&source, &saved, 0, 0);
+        drop(source);
+        let before = g.pool_stats();
+        let reused = e.scratch(8, 8);
+        assert_eq!(g.pool_stats().0, before.0 + 1, "reuse before submit");
+        e.fill(&reused, 0.75);
+        let prior = e.download(&saved).unwrap();
+        let later = e.download(&reused).unwrap();
+        assert!(prior.data.iter().flatten().all(|v| *v == 0.25));
+        assert!(later.data.iter().flatten().all(|v| *v == 0.75));
+    }
+
+    #[test]
+    fn pool_encoder_local_reuse_reverse_submission_and_rollover() {
+        crate::tests::hold_gpu_lock();
+        let g = GpuContext::headless();
+        assert!(g.is_some() || std::env::var("EFFECTCRAFT_REQUIRE_GPU").as_deref() != Ok("1"));
+        let Some(g) = g else { return };
+        let mut first = Enc::new(&g);
+        let source = first.image(8, 8);
+        first.fill(&source, 0.25);
+        first.submit();
+        let saved = first.scratch(8, 8);
+        first.copy_into(&source, &saved, 0, 0);
+        drop(source);
+        let mut second = Enc::new(&g);
+        let other = second.scratch(8, 8);
+        second.fill(&other, 0.75);
+        second.submit();
+        assert!(first.download(&saved).unwrap().data.iter().flatten().all(|v| *v == 0.25), "later encoder submitted first cannot overwrite pending input");
+        let mut current = saved;
+        for _ in 0..260 {
+            let next = first.scratch(8, 8);
+            first.copy_into(&current, &next, 0, 0);
+            current = next;
+        }
+        assert!(first.download(&current).unwrap().data.iter().flatten().all(|v| *v == 0.25), "ring rollover preserves reads");
+    }
 
     #[test]
     fn pool_size_transition_reuses_small_textures_without_touching_pending() {
