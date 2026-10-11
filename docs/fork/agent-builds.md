@@ -37,7 +37,8 @@ and your focused tests. Report exactly what you ran.
 3. Merge into `main`, **push `main`** (the nightly cloud run only sees what's on GitHub), then
    `cargo xtask agents release <slug>` (a lane goes back to `main` with its build folder kept warm).
    Outside a lane: delete your worktree, branch and `target/agent-<name>`.
-4. Stop there. **Don't build the app or the release CLI after merging**, and don't ask another
+4. Queue it for upstream: `scripts/fork/queue-pr.sh` (see "Sharing with upstream" below).
+5. Stop there. **Don't build the app or the release CLI after merging**, and don't ask another
    session to: see "Building the app" below.
 
 **CI only when Elias says so.** No agent runs `cargo xtask ci` or `ci --affected` on its own,
@@ -50,8 +51,8 @@ weren't run. Every night at 01:00 UTC (02:00 Mac time) a cloud routine ("EffectC
 community PRs") does the heavy part. At 01:40 Mac time a LaunchAgent
 (`scripts/fork/push-main.sh`, log `~/Library/Logs/EffectCraft push-main.log`) pushes `main` first
 in case a merge wasn't pushed: fast-forward only, never other branches. The routine then it merges upstream, runs those tests and the full CI, fixes
-main until green, opens or updates focused PRs to storytold for finished work, and leaves a
-morning summary.
+main until green, keeps the queued upstream branches current (below), and leaves a morning
+summary.
 
 **The watchdog** (`.github/workflows/watchdog.yml`, set up at Elias's request) runs `cargo xtask ci
 --affected` on a free GitHub-hosted Linux runner after every push to `main`. It never blocks a push.
@@ -63,6 +64,49 @@ red, fixing it comes before new work.
 aren't rustfmt-formatted is refused (`scripts/fork/hooks/`, about a second; installed once with
 `git config core.hooksPath scripts/fork/hooks`, shared by every worktree). Run `cargo xtask fmt`
 and commit again. On 10 October 2026, four of the watchdog's red runs were only formatting.
+
+## Sharing with upstream (queue at landing)
+
+Finished work goes to storytold/effectcraft when it lands, not in a nightly catch-up (on 10 October
+2026 alone, 289 commits landed): every agent that lands shareable work on `main` also queues it as
+an upstream PR branch, right after pushing `main`.
+
+```sh
+scripts/fork/queue-pr.sh <topic-slug> --title "fix(viewer): …" [--depends upstream/<other>] \
+    [--body-file what-why-tested.md] [--update] [--no-check] [--no-push] [--allow-leaks] <commit-or-range>...
+```
+
+It builds `upstream/<topic-slug>` from `upstream/main` in a temporary worktree (your checkout is
+untouched), cherry-picks the commits with `-x`, drops the fork-only paths in
+`scripts/fork/upstream-exclude.txt`, runs `rustfmt --check` and `cargo check` on the affected crates
+(`CARGO_BUILD_JOBS=4`, `target/agent-upstream`), pushes the branch to origin and writes
+`queue/<topic-slug>.md` (title, branch, depends, then the PR body) on origin's `pr-queue` branch.
+
+- **Title:** upstream's style, `fix(scope): …`, `perf(scope): …`, `feat(scope): …` (for example
+  `fix(render-queue): honor height-only locked resize edits`), not the fork's task ids.
+- **One topic per PR.** Several commits of one task are one PR; two unrelated fixes are two.
+- **Body:** What / Why / How tested. Pass `--body-file` when you can; without it the body is built
+  from the commit messages, with a "How tested" placeholder listing their test notes.
+- **Builds on fork work that isn't upstream yet:** a cherry-pick that conflicts stops with nothing
+  left behind and names the commit. Queue the prerequisite first, then pass
+  `--depends upstream/<prerequisite>`: the branch then starts from that branch, so the cherry-pick
+  applies. The opener opens a dependent PR only once its prerequisite is merged on storytold; the
+  nightly then merges `upstream/main` into the dependent branch so its diff shrinks to its own
+  commits.
+- **More commits for a queued topic:** `--update` adds them to the branch (never a force push).
+- **Fork-only hunks** in shared files (`Cargo.toml`'s `[profile.local]`, `CLAUDE.md` step 5,
+  `AGENTS.md` §1.9, `.mcp.json`, `local_assets` calls; the `hunk:` lines of the exclude list) can't
+  be dropped by path: the script warns, and stops when added lines name fork-only things. Land them
+  as their own commits, so the rest can be queued alone.
+- **Exempt:** fork-only material (the exclude list: this folder, `scripts/fork/`, the watchdog,
+  lanes, owner-local icons, the Motion Library) and half-done work. Half-done work is queued when
+  it's finished.
+- **The gap:** `scripts/fork/sync-gap.sh` prints the shareable commits and lines not yet queued or
+  upstream, and the task ids with the most (`--json`; the nightly uses `--fail-if-growing <file>`).
+
+**Who opens the PRs.** A task on the Mac reads `pr-queue` and opens the queued PRs on storytold as
+Elias; the cloud routine can't (it has no permission to open PRs on storytold as Elias). Agents never
+run `gh pr create` against storytold themselves.
 
 ## Lanes: warm build folders
 
