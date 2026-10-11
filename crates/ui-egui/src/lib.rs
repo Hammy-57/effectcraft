@@ -65,6 +65,10 @@ const EDIT_QUIET: f64 = 0.3;
 /// preview, a frame that finished rendering without waking the UI).
 const PLAYBACK_MAX_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// The longest a preview with sound holds its first frame while the frames ahead render (see
+/// [`Playback::preroll`]), in seconds.
+const PREROLL_MAX: f64 = 2.0;
+
 /// The repaint delay for a playing preview whose next frame is due in `secs`: the UI rebuilds
 /// at the preview's frame rate instead of the display's refresh rate. A hair late rather than
 /// early (an early wake changes nothing and needs another), never a sub-millisecond spin.
@@ -239,6 +243,12 @@ pub struct Playback {
     /// fits in the RAM preview) is cached, so it never plays over skipped frames (#103), or
     /// sooner once the silent preview keeps real time with the frames ahead cached (#208).
     pub audio_held: bool,
+    /// Pre-roll (UI seconds it may last until): a preview with sound holds its first frame
+    /// while the frames ahead render, then starts picture and sound together at that frame.
+    /// Playing the first frames silently instead meant the sound joined late and the start of
+    /// the preview was never heard. Past the deadline (frames too slow to get ahead) the held
+    /// sound falls back to [`Self::audio_held`]'s silent playback.
+    pub preroll: Option<f64>,
     /// When the last frames were shown (seconds, the last second's worth): the achieved rate.
     pub shown_at: std::collections::VecDeque<f64>,
 }
@@ -1183,11 +1193,13 @@ impl EffectcraftApp {
             restore_max,
             audio_frame: (!plan.video).then_some(plan.first),
             audio_held: false,
+            preroll: None,
             shown_at: Default::default(),
         };
         if !self.playback.caching {
             if plan.video {
                 self.playback.audio_held = self.audio_plays();
+                self.playback.preroll = self.playback.audio_held.then_some(now + PREROLL_MAX);
             } else {
                 self.start_audio(fr.tick_of(plan.first));
             }
@@ -1468,14 +1480,34 @@ impl EffectcraftApp {
         // Held sound starts once the frames ahead are cached (see `Playback::audio_held`): the
         // prefetch window when the silent preview keeps real time, else the rest of the preview.
         let fit = self.frames_that_fit(&c, scale);
+        // Pre-roll: the frames ahead are enough to start (the held first frame can't show
+        // whether rendering keeps up).
+        let preroll = self.playback.preroll.is_some_and(|until| now < until);
+        if !preroll {
+            self.playback.preroll = None;
+        }
         if self.playback.audio_held
             && let Some(p) = plan
-            && ((self.playback.keeps_up(now) && self.cached_ahead(&p, &series, cur, ahead.min(fit))) || self.cached_ahead(&p, &series, cur, fit))
+            && (((preroll || self.playback.keeps_up(now)) && self.cached_ahead(&p, &series, cur, ahead.min(fit))) || self.cached_ahead(&p, &series, cur, fit))
         {
             self.playback.audio_held = false;
+            self.playback.preroll = None;
+            self.playback.waiting = false;
             self.playback.start_wall = now;
             self.playback.start_frame = cur;
             self.start_audio(fr.tick_of(cur));
+        }
+        if preroll && self.playback.audio_held && video {
+            // Hold the first frame (rendering ahead) rather than play it without its sound.
+            self.playback.waiting = true;
+            self.playback.start_wall = now;
+            self.playback.start_frame = cur;
+            if !self.frames.is_cached(&FrameKey { frame: cur, ..series }) {
+                self.request_frame_urgent(cid, cur, scale);
+            }
+            // Each finished frame wakes the UI (`Frames::release`); this is only the fallback.
+            ctx.request_repaint_after(PLAYBACK_MAX_WAIT);
+            return;
         }
         // Audio clock drives playback: show the frame under the audible sample.
         if let Some(a) = &self.audio {

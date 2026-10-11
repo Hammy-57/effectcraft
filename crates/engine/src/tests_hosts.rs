@@ -40,6 +40,38 @@ fn saving_over_a_file_changed_elsewhere_is_refused() {
 #[cfg(unix)]
 #[test]
 fn hosts_list_names_where_a_project_is_open() {
+    // Every Session save updates the process-global host registry. A lock in this
+    // module cannot exclude unrelated file tests, so exercise the real registry
+    // in a child running only this test.
+    const CHILD: &str = "EFFECTCRAFT_HOST_LIST_TEST_COMPLETION";
+    let Some(completion) = std::env::var_os(CHILD) else {
+        let completion = std::env::temp_dir().join(format!("ec-host-list-complete-{}", std::process::id()));
+        let _ = std::fs::remove_file(&completion);
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests_hosts::hosts_list_names_where_a_project_is_open", "--nocapture"])
+            .env(CHILD, &completion)
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(20)),
+                result => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("isolated host-list test timed out or could not be polled: {result:?}");
+                }
+            }
+        };
+        let completed = std::fs::read(&completion).ok();
+        let _ = std::fs::remove_file(&completion);
+        assert!(status.success(), "isolated host-list test failed: {status}");
+        // An incorrect --exact name runs zero tests successfully; require proof
+        // that this child's assertions actually completed.
+        assert_eq!(completed.as_deref(), Some(b"passed".as_slice()));
+        return;
+    };
     let config = std::env::temp_dir().join(format!("ec-hosts-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&config);
     let hosts = config.join(crate::hosts::HOSTS_FOLDER);
@@ -74,4 +106,5 @@ fn hosts_list_names_where_a_project_is_open() {
     assert!(!hosts.join(format!("{}.json", std::process::id())).exists());
     crate::hosts::reset();
     let _ = std::fs::remove_dir_all(config);
+    std::fs::write(completion, b"passed").unwrap();
 }

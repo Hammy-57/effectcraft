@@ -113,9 +113,9 @@ fn cmd_dragging_the_current_time_scrubs_and_an_idle_scrub_closes() {
     assert!(h.state().scrub.is_none() && fake.0.lock().unwrap().1, "closed and stopped");
 }
 
-/// A preview with audio waits for frames like a silent one (#103): while the frames ahead aren't
-/// cached, every frame shows as it renders, silently; the sound starts once the rest of the
-/// preview is cached, and a frame that isn't cached stops it instead of being skipped.
+/// A preview with audio waits for frames like a silent one (#103): it never skips a frame; the
+/// sound starts once the frames ahead are cached, and a frame that isn't cached stops it instead
+/// of being skipped.
 #[test]
 fn preview_with_audio_shows_every_frame_and_sounds_once_cached() {
     let fake = Fake::default();
@@ -153,7 +153,8 @@ fn preview_with_audio_shows_every_frame_and_sounds_once_cached() {
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
     assert!(h.state().audio.is_some() && fake.0.lock().unwrap().0.is_some(), "the sound started once the frames ahead were cached");
-    assert!(shown > 0, "frames played silently first");
+    let started = h.state().audio.as_ref().unwrap().span.start;
+    assert_eq!(started, frame(&h) * 1600, "the sound starts at the frame on screen ({shown} shown before it)");
     // A frame that isn't cached stops the sound rather than being skipped. (Frames render fast
     // enough here to be cached again before the check: keep them out of the cache.)
     h.state().frames.set_budget(0);
@@ -191,4 +192,69 @@ fn preview_with_audio_sounds_once_rendering_keeps_up() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     assert!(h.state().audio.is_some() && fake.0.lock().unwrap().0.is_some(), "the sound started within 2 s, at frame {last} of 900");
+}
+
+/// Pressing play on a comp with sound (Elias's "10-10 MAIN": the first half second was silent):
+/// the preview holds its first frame while the frames ahead render and then starts picture and
+/// sound together there, instead of playing the first frames silently and starting the sound
+/// at whatever frame playback had reached. From the start of the comp and from later on.
+#[test]
+fn preview_with_audio_sounds_from_its_first_frame() {
+    for start in [0i64, 15] {
+        let fake = Fake::default();
+        let (app, cid) = setup_long(true, &fake, 30.0);
+        // Short input steps: the pre-roll has many steps to cache the frames ahead in, however
+        // loaded the machine is.
+        let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).with_step_dt(1.0 / 1000.0).build_eframe(|_| app);
+        h.state_mut().session.set_time(Tick::from_units(start, 30));
+        h.run_steps(2);
+        let frame = |h: &Harness<'_, EffectcraftApp>| {
+            let app = h.state();
+            app.session.project.comp(cid).unwrap().frame_rate.frame_at(app.session.time())
+        };
+        let now = h.ctx.input(|i| i.time);
+        h.state_mut().play(now);
+        assert!(h.state().playback.preroll.is_some() && h.state().audio.is_none(), "nothing is cached: pre-roll");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while h.state().audio.is_none() && std::time::Instant::now() < deadline {
+            h.step();
+            assert_eq!(frame(&h), start, "no frame plays before its sound");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let app = h.state();
+        let audio = app.audio.as_ref().expect("the sound started");
+        assert!(app.playback.preroll.is_none() && !app.playback.audio_held);
+        // 30 fps at 48 kHz: 1600 samples a frame. The first sample the device plays is the start.
+        assert_eq!(audio.span.start, start * 1600, "the sound starts at the first frame");
+        assert_eq!(audio.clock(), start * 1600, "the clock holds the first frame until sound plays");
+        assert_eq!(frame(&h), start);
+        let feed = fake.0.lock().unwrap().0.clone().expect("the output opened");
+        while feed.queued_frames() < 1024 {
+            assert!(std::time::Instant::now() < deadline, "the feeder never delivered");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let mut out = vec![0.0f32; 2048];
+        feed.pull(&mut out);
+        assert!(out[..64].iter().any(|v| v.abs() > 0.01), "the tone sounds from the first samples");
+    }
+}
+
+/// Frames too slow to get ahead (none fit in the RAM preview) don't hold the first frame for
+/// ever: past the pre-roll the preview plays silently as before.
+#[test]
+fn preroll_gives_up_when_frames_cannot_cache() {
+    let fake = Fake::default();
+    let (app, _) = setup_long(true, &fake, 30.0);
+    let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).with_step_dt(1.0 / 30.0).build_eframe(|_| app);
+    h.run_steps(2);
+    h.state().frames.set_budget(0);
+    h.state().frames.clear();
+    let now = h.ctx.input(|i| i.time);
+    h.state_mut().play(now);
+    assert!(h.state().playback.preroll.is_some());
+    // A little over the two-second pre-roll.
+    for _ in 0..70 {
+        h.step();
+    }
+    assert!(h.state().playback.preroll.is_none() && h.state().playback.audio_held && h.state().playback.playing);
 }
