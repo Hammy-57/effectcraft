@@ -939,11 +939,37 @@ impl EffectcraftApp {
                 4 => state::Resolution::Quarter,
                 n => state::Resolution::Custom(n.min(40) as u8),
             };
+            self.frames.adapt_playback(None);
             return r.scale(zoom, ppp);
         }
         // Auto follows the zoom alike while playing and paused, so frames cached while scrubbing
         // play back, and frames cached by a preview stay on screen when it stops.
         let full = self.ui.viewer.res.scale(zoom, ppp);
+        // Native Auto playback uses actual render service p95, never cache hits.
+        // Try a lower scale once; retain it only when its measured p95 improves.
+        // This avoids oscillation and restores Full when fewer pixels are slower.
+        let adaptive = self.playback.playing
+            && !self.playback.caching
+            && self.ui.viewer.res == state::Resolution::Auto
+            && self.session.state.viewer.fast_previews == effectcraft_engine::commands::viewer_cmds::FastPreviews::AdaptiveResolution
+            && !self.ui.viewer.interacting
+            && !self.ui.viewer.property_interacting
+            && !self.frames.remote_active()
+            && self.playback.fps.is_finite()
+            && self.playback.fps > 0.0;
+        let half = full.min((full * 0.5).max(self.session.prefs.adaptive_limit()));
+        let config = self.session.active_comp_id().filter(|_| adaptive).map(|comp| {
+            let step = self.playback.plan.map_or(1, |p| p.step).max(1) as f64;
+            crate::playback_budget::Config {
+                full: self.frame_series(comp, full),
+                half: self.frame_series(comp, half),
+                budget_ms: 1000.0 * step / self.playback.fps,
+                gpu_context: self.gpu.as_ref().map_or(0, |g| std::ptr::from_ref(g.context()) as usize),
+            }
+        });
+        if self.frames.adapt_playback(config) {
+            return half;
+        }
         // Fast Previews ▸ Adaptive Resolution / Fast Draft: lower resolution while dragging.
         let (_, k) = self.session.state.viewer.fast_previews.render(self.ui.viewer.interacting || self.ui.viewer.property_interacting);
         if k < 1.0 && self.ui.viewer.res == state::Resolution::Auto {
@@ -2237,6 +2263,81 @@ mod gpu_failure_tests {
         assert!(app.session.project.comp(comp).unwrap().layers.is_empty());
         app.session.execute("edit.redo", json!({})).unwrap();
         assert_eq!(app.session.render(comp, Tick::ZERO, RenderOpts::default()).data, before.data);
+    }
+}
+
+#[cfg(test)]
+mod playback_budget_tests {
+    use super::*;
+    use effectcraft_engine::commands::viewer_cmds::FastPreviews;
+
+    fn app() -> EffectcraftApp {
+        let mut app = EffectcraftApp::new(Session::default());
+        app.session.execute("comp.new", json!({"width": 64, "height": 64, "duration": 2})).unwrap();
+        app.ui.viewer.res = state::Resolution::Auto;
+        app.session.state.viewer.fast_previews = FastPreviews::AdaptiveResolution;
+        app.playback.playing = true;
+        app.playback.fps = 30.0;
+        app
+    }
+    fn slow(app: &EffectcraftApp) {
+        let full = app.viewer_scale(1.0, 1.0);
+        let key = app.frame_series(app.session.active_comp_id().unwrap(), full);
+        for _ in 0..16 {
+            app.frames.playback_sample(key, 80.0);
+        }
+    }
+    #[test]
+    fn playback_budget_preserves_explicit_choices_and_idle_resolution() {
+        let mut app = app();
+        slow(&app);
+        assert_eq!(app.viewer_scale(1.0, 1.0), 0.5);
+        app.playback.playing = false;
+        assert_eq!(app.viewer_scale(1.0, 1.0), 1.0);
+        app.playback.playing = true;
+        for res in [state::Resolution::Full, state::Resolution::Half, state::Resolution::Quarter] {
+            app.ui.viewer.res = res;
+            slow(&app);
+            assert_eq!(app.viewer_scale(1.0, 1.0), res.scale(1.0, 1.0));
+        }
+        app.ui.viewer.res = state::Resolution::Auto;
+        app.playback.res = Some(1);
+        slow(&app);
+        assert_eq!(app.viewer_scale(1.0, 1.0), 1.0);
+        app.playback.res = None;
+        for mode in [FastPreviews::Off, FastPreviews::Draft, FastPreviews::FastDraft, FastPreviews::Wireframe] {
+            app.session.state.viewer.fast_previews = mode;
+            slow(&app);
+            assert_eq!(app.viewer_scale(1.0, 1.0), 1.0);
+        }
+    }
+    #[test]
+    fn playback_budget_ignores_precache_bad_rates_and_respects_frame_skip() {
+        let mut app = app();
+        app.playback.caching = true;
+        slow(&app);
+        assert_eq!(app.viewer_scale(1.0, 1.0), 1.0);
+        app.playback.caching = false;
+        for fps in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            app.playback.fps = fps;
+            slow(&app);
+            assert_eq!(app.viewer_scale(1.0, 1.0), 1.0);
+        }
+        app.playback.fps = 30.0;
+        app.playback.plan = Some(effectcraft_engine::preview::PreviewPlan {
+            start: 0,
+            end: 59,
+            first: 0,
+            step: 3,
+            fps: 30.0,
+            looping: true,
+            cache_first: false,
+            video: true,
+            audio: false,
+            origin: Tick::ZERO,
+        });
+        slow(&app); // 80ms fits within the 100ms displayed-frame budget.
+        assert_eq!(app.viewer_scale(1.0, 1.0), 1.0);
     }
 }
 

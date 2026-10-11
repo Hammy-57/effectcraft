@@ -432,6 +432,7 @@ pub struct Frames {
     ctx: Option<egui::Context>,
     /// Render time of the last viewer (urgent) frame in ms, for the Info panel / perf readout.
     pub last_ms: Arc<Mutex<f64>>,
+    playback_budget: Arc<Mutex<crate::playback_budget::Budget>>,
     content_keys: ContentKeys,
     gpu_retired: Arc<AtomicBool>,
     /// [`comp_content`] identities by (revision, comp), with the project that keeps an identity
@@ -491,6 +492,7 @@ impl Default for Frames {
             background_running: Arc::default(),
             ctx: None,
             last_ms: Arc::new(Mutex::new(0.0)),
+            playback_budget: Arc::default(),
             content_keys: Arc::default(),
             gpu_retired: Arc::default(),
             identities: Mutex::default(),
@@ -614,11 +616,24 @@ pub fn load_fitted(ctx: &egui::Context, name: impl Into<String>, img: egui::Colo
 }
 
 impl Frames {
+    #[cfg(test)]
+    pub(crate) fn playback_sample(&self, key: FrameKey, ms: f64) {
+        let mut budget = self.playback_budget.lock().unwrap();
+        if let Some(ticket) = budget.ticket(key) {
+            budget.record(ticket, ms, false);
+        }
+    }
+
+    pub(crate) fn adapt_playback(&self, config: Option<crate::playback_budget::Config>) -> bool {
+        self.playback_budget.lock().unwrap_or_else(std::sync::PoisonError::into_inner).configure(config)
+    }
+
     /// Retire only GPU preview state; documents, CPU frames and running job leases survive.
     /// Publication checks the same latch while holding the cache lock, so a late GPU frame
     /// cannot restore an invalid texture after this removal.
     pub fn retire_gpu(&self) {
         self.gpu_retired.store(true, Ordering::Release);
+        self.adapt_playback(None);
         if let Ok(mut cache) = self.cache.lock() {
             let keys: Vec<_> = cache.map.iter().filter_map(|(key, image)| image.is_gpu().then_some(*key)).collect();
             for key in keys {
@@ -863,6 +878,7 @@ impl Frames {
     }
 
     pub fn clear(&self) {
+        self.adapt_playback(None);
         if let Some(r) = &self.remote {
             r.purge();
         }
@@ -962,6 +978,7 @@ impl Frames {
             failed: self.failed.clone(),
             ctx: self.ctx.clone(),
             last: self.last_ms.clone(),
+            playback_budget: self.playback_budget.clone(),
             content_keys: self.content_keys.clone(),
             gpu_retired: self.gpu_retired.clone(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -1108,6 +1125,7 @@ struct Worker {
     failed: Failed,
     ctx: Option<egui::Context>,
     last: Arc<Mutex<f64>>,
+    playback_budget: Arc<Mutex<crate::playback_budget::Budget>>,
     content_keys: ContentKeys,
     gpu_retired: Arc<AtomicBool>,
     /// The pool frames render on (`None`: rayon's global pool).
@@ -1156,6 +1174,8 @@ impl Worker {
         let disk = job.src.disk.as_ref().map(|dc| (dc.clone(), frame_disk_key(content_keys, &job.src.project, &job.key, opts_hash(&job.opts))));
         let from_disk = disk.as_ref().and_then(|(dc, k)| dc.get_frame(*k));
         let disk_hit = from_disk.is_some();
+        let ticket = self.playback_budget.lock().unwrap_or_else(std::sync::PoisonError::into_inner).ticket(job.key);
+        let service_start = web_time::Instant::now();
         let ci = match from_disk {
             Some(f) => FrameImage::Cpu(Arc::new(egui::ColorImage::from_rgba_premultiplied([f.width as usize, f.height as usize], &f.rgba))),
             None => match self.render_guarded(&job) {
@@ -1167,6 +1187,16 @@ impl Worker {
                 }
             },
         };
+        if !disk_hit
+            && !(ci.is_gpu() && self.gpu_retired.load(Ordering::Acquire))
+            && let Some(ticket) = ticket
+        {
+            self.playback_budget.lock().unwrap_or_else(std::sync::PoisonError::into_inner).record(
+                ticket,
+                service_start.elapsed().as_secs_f64() * 1000.0,
+                ci.is_gpu(),
+            );
+        }
         let render_time = t0.elapsed();
         // Publish the shared frame and wake the viewer first; the disk cache's writer thread
         // compresses and writes the same snapshot.
