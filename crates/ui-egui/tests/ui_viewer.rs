@@ -28,7 +28,9 @@ fn harness() -> Harness<'static, EffectcraftApp> {
 }
 
 fn rect(h: &Harness<'_, EffectcraftApp>, id: &str) -> Rect {
-    let e = h.state().auto.find(id).unwrap_or_else(|| panic!("no {id}"));
+    // Harness steps have completed painting: use the geometry actually shown, not Registry's
+    // during-paint lookup (an async puppet solve can move a handle this frame).
+    let e = h.state().auto.find_current(id).unwrap_or_else(|| panic!("no current {id}"));
     Rect::from_min_size(pos2(e.rect[0], e.rect[1]), vec2(e.rect[2], e.rect[3]))
 }
 
@@ -885,6 +887,30 @@ fn puppet_bend_pin_rotates_by_its_ring_and_scales_by_its_square() {
     drag(&mut h, square, center + (square - center) * 2.0);
     let sc = pin_value(&h, id, bend, "scale");
     assert!((sc - 200.0).abs() < 2.0, "scale {sc}");
+}
+
+#[test]
+fn puppet_scale_uses_current_handles_when_previous_registry_geometry_lags() {
+    let (mut h, id, bend) = puppet_harness();
+    let pin_id = format!("viewer.puppetPin.{bend}");
+    let scale_id = format!("{pin_id}.scale");
+    let ring_id = format!("{pin_id}.rotate");
+    // Model an async completion adopted on the last idle frame: the previous registry still
+    // describes another mesh pose. A two-pixel lag stays hittable, but changes the scale ratio
+    // if the test uses those old coordinates rather than the handles currently on screen.
+    let mut shifted = 0;
+    for element in &mut h.state_mut().auto.previous {
+        if element.id == pin_id || element.id == scale_id || element.id == ring_id {
+            element.rect[0] += 2.0;
+            shifted += 1;
+        }
+    }
+    assert_eq!(shifted, 3, "the stale snapshot contains the pin and both handles");
+    let center = rect(&h, &pin_id).center();
+    let square = rect(&h, &scale_id).center();
+    drag(&mut h, square, center + (square - center) * 2.0);
+    let scale = pin_value(&h, id, bend, "scale");
+    assert!((scale - 200.0).abs() < 2.0, "scale {scale}");
 }
 
 #[test]

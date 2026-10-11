@@ -573,12 +573,12 @@ pub fn zoom(app: &mut EffectcraftApp, ctx: &egui::Context, k: f64) {
 
 /// Screen point of a layer bar (centre, or at a comp time).
 pub fn locate(app: &EffectcraftApp, layer: u64, time: Option<f64>) -> Option<(f32, f32)> {
-    let e = app.auto.find(&format!("timeline.layer.{layer}.bar"))?;
+    let e = app.auto.find_current(&format!("timeline.layer.{layer}.bar"))?;
     let y = e.rect[1] + e.rect[3] / 2.0;
     match time {
         Some(t) => {
             // The ruler element's label carries "start,pps".
-            let tm = app.auto.find("timeline.ruler")?;
+            let tm = app.auto.find_current("timeline.ruler")?;
             let (start, pps) = tm.label.split_once(',').and_then(|(a, b)| Some((a.parse::<f64>().ok()?, b.parse::<f64>().ok()?)))?;
             Some((tm.rect[0] + 6.0 + ((t - start) * pps) as f32, y))
         }
