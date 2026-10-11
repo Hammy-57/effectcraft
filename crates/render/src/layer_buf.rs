@@ -11,6 +11,7 @@ use std::sync::Arc;
 impl<'a> Renderer<'a> {
     /// Source → masks, clamped/quantised to the project depth.
     fn masked_source(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Buf> {
+        let _profile = crate::profile::span("layer_raster");
         let mut buf = match self.content_times(ctx, layer) {
             Some(times) => self.blurred_source(ctx, layer, &times)?,
             None => self.source(ctx, layer)?,

@@ -12,6 +12,10 @@ workspace = true
 [build-dependencies]
 effectcraft-buildgen = { workspace = true }
 
+[features]
+default = []
+profile = []
+
 [dependencies]
 effectcraft-time = { workspace = true }
 effectcraft-geom = { workspace = true }

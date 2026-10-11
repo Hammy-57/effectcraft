@@ -82,6 +82,8 @@ mod fx_warp;
 mod ops;
 mod particles;
 mod readback;
+#[cfg(feature = "profile")]
+mod timestamps;
 mod walk;
 
 use std::sync::Arc;
@@ -191,6 +193,7 @@ impl Gpu {
     /// Render a top-level comp frame and leave it on the GPU as a display texture (no
     /// readback unless a CPU fallback step needs one). `None` = render on the CPU.
     pub fn render_display(&self, r: &Renderer, comp: ItemId, t: Tick) -> Option<DisplayFrame> {
+        let _profile = effectcraft_render::profile::span("display_prepare");
         self.ctx.check_health().map_err(|e| log::error!("gpu display: {e}")).ok()?;
         let mut e = Enc::new(&self.ctx);
         let img = walk::render(&mut e, r, comp, t)?;
