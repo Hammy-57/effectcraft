@@ -10,6 +10,7 @@ use effectcraft_render::cache::{GpuOwner, GpuPending, GpuSlot, GpuStage};
 /// Compute entry points in `kernels.wgsl` (one pipeline each).
 const ENTRIES: &[&str] = &[
     "warp_blend",
+    "warp_accum",
     "blend_full",
     "matte",
     "preserve",
@@ -1787,6 +1788,11 @@ impl<'g> Enc<'g> {
         if self.pending >= 256 {
             self.submit();
         }
+    }
+
+    /// Whether the kernel `entry` built on this device.
+    pub(crate) fn has_kernel(&self, entry: &str) -> bool {
+        self.g.pipelines.contains_key(entry)
     }
 
     /// Per-pixel kernel over `out`'s size (16×16 workgroups).

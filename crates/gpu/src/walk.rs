@@ -638,10 +638,7 @@ fn place_src(
     if let [m] = pl.matrices.as_slice() {
         return Some(ops::warp_q(e, target, &src, m, pl.sampling, mode, opacity, pl.seed, None, levels));
     }
-    let mut acc = e.zeros(target.width, target.height);
     let k = 1.0 / pl.matrices.len() as f32;
-    for m in &pl.matrices {
-        acc = ops::warp(e, &acc, &src, m, pl.sampling, BlendMode::Normal, 1.0, 0, Some(k));
-    }
+    let acc = ops::warp_accumulate(e, &e.zeros(target.width, target.height), &src, &pl.matrices, pl.sampling, k);
     Some(ops::blend_full(e, target, &acc, mode, opacity, pl.seed, levels))
 }
