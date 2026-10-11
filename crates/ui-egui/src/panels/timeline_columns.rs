@@ -652,7 +652,8 @@ impl ColumnLayout {
 
     /// Apply a saved layout; unknown columns and unusable widths are dropped.
     pub fn apply(&self, tl: &mut TimelineState) {
-        tl.columns = self.columns.iter().filter(|c| c.as_str() != "name" && c.as_str() != "modes" && COLUMNS.iter().any(|k| k.0 == c.as_str())).cloned().collect();
+        tl.columns =
+            self.columns.iter().filter(|c| c.as_str() != "name" && c.as_str() != "modes" && COLUMNS.iter().any(|k| k.0 == c.as_str())).cloned().collect();
         tl.show_modes = self.show_modes;
         tl.source_name = self.source_name;
         tl.column_order = self.order.iter().filter(|c| COLUMNS.iter().any(|k| k.0 == c.as_str())).cloned().collect();

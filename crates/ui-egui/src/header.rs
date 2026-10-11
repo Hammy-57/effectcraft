@@ -238,7 +238,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     if widgets::popup_is_open(ui, egui::Id::new("ws-pop")) {
         let names = app.workspace_names();
         let current = names.iter().position(|w| *w == app.ui.workspace);
-        if let Some(name) = widgets::popup_menu(ui, egui::Id::new("ws-pop"), more.left_bottom() - vec2(140.0, 0.0), &names, current).and_then(|i| names.get(i)) {
+        if let Some(name) = widgets::popup_menu(ui, egui::Id::new("ws-pop"), more.left_bottom() - vec2(140.0, 0.0), &names, current).and_then(|i| names.get(i))
+        {
             app.set_workspace(name);
         }
     }

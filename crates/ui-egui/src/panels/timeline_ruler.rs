@@ -74,7 +74,10 @@ impl RulerStyle {
             if px < 28.0 {
                 continue;
             }
-            let widest = [last, last.saturating_sub(step), step.saturating_mul(3)].iter().map(|n| width(&self.label(n.saturating_sub(n.rem_euclid(step)), step))).fold(0.0f32, f32::max);
+            let widest = [last, last.saturating_sub(step), step.saturating_mul(3)]
+                .iter()
+                .map(|n| width(&self.label(n.saturating_sub(n.rem_euclid(step)), step)))
+                .fold(0.0f32, f32::max);
             if px >= f64::from(widest) + 14.0 {
                 return step;
             }

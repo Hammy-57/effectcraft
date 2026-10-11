@@ -1539,7 +1539,13 @@ pub fn draw_group_chrome(ui: &mut egui::Ui, g: &Group, t: &Tokens, reg: &mut cra
         scroll.shown = shown;
         if ui.rect_contains_pointer(strip) {
             let (d, shift) = ui.input(|i| (i.smooth_scroll_delta, i.modifiers.shift));
-            let delta = if d.x != 0.0 { d.x } else if shift { d.y } else { 0.0 };
+            let delta = if d.x != 0.0 {
+                d.x
+            } else if shift {
+                d.y
+            } else {
+                0.0
+            };
             if delta != 0.0 {
                 scroll.wheel += delta;
                 let max_start = tab_scroll_max(&widths, gap, room);
