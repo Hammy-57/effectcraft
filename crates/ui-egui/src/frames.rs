@@ -929,26 +929,32 @@ impl Frames {
             return vec![];
         }
         let oh = opts_hash(opts);
-        // Remembered until the frames in RAM or on disk, the project or the series change (the
-        // remote disk cache gets its frames with the RAM cache's).
+        // The frames on disk, remembered until the disk cache, the project or the series change,
+        // then without the frames in RAM. Scanning every frame of the comp again whenever a frame
+        // came or went in RAM (every finished frame of a RAM preview) cost the UI thread a few
+        // milliseconds per repaint on long comps. The remote disk cache has no generation of its
+        // own: it gets its frames with the RAM cache's.
         let series = FrameKey { frame: 0, ..*base };
-        let ram_generation = self.cache.lock().map(|c| c.generation).unwrap_or(0);
-        let k = [base.revision, frames as u64, oh, ram_generation, src.disk.as_ref().map_or(0, |dc| dc.generation())];
+        let generation = match &src.disk {
+            Some(dc) => dc.generation(),
+            None => self.cache.lock().map(|c| c.generation).unwrap_or(0),
+        };
+        let k = [base.revision, frames as u64, oh, generation, u64::from(src.disk.is_some())];
+        let ram = self.cached_frames(base);
+        let in_ram = |f: &i64| ram.binary_search(f).is_ok();
         if let Ok(bar) = self.bar.lock()
             && let Some((_, _, v)) = bar.disk.iter().find(|(s, g, _)| *s == series && *g == k)
         {
-            return v.clone();
+            return v.iter().copied().filter(|f| !in_ram(f)).collect();
         }
-        let ram: HashSet<i64> = self.cached_frames(base).into_iter().collect();
         let v: Vec<i64> = (0..frames.clamp(0, 100_000))
-            .filter(|f| !ram.contains(f))
             .filter(|f| contains(frame_disk_key(&self.content_keys, &src.project, &FrameKey { frame: *f, ..*base }, oh)))
             .collect();
         if let Ok(mut bar) = self.bar.lock() {
             bar.disk.retain(|(s, ..)| *s != series);
             remember(&mut bar.disk, series, k, &v);
         }
-        v
+        v.into_iter().filter(|f| !in_ram(f)).collect()
     }
 
     /// Change the RAM preview cache budget (Settings ▸ Memory & CPU), evicting the oldest
@@ -2258,6 +2264,14 @@ mod tests {
         assert_eq!(f.disk_frames(&src, &key(1, 0, 0), 5, &opts), vec![2]);
         insert(&f, key(1, 2, 0));
         assert!(f.disk_frames(&src, &key(1, 0, 0), 5, &opts).is_empty());
+        // Frames coming and going in RAM (each finished frame of a RAM preview) don't scan the
+        // disk cache again: the remembered disk frames are filtered. Mark frame 4 as remembered
+        // on disk to tell a rescan from the memo.
+        f.bar.lock().unwrap().disk.iter_mut().for_each(|(_, _, v)| v.push(4));
+        f.cache.lock().unwrap().remove(&key(1, 2, 0));
+        assert_eq!(f.disk_frames(&src, &key(1, 0, 0), 5, &opts), vec![2, 4], "remembered, not scanned again");
+        dc.put_frame_now(frame_disk_key(&f.content_keys, &src.project, &key(1, 3, 0), opts_hash(&opts)), 1, 1, &[0, 0, 0, 255]);
+        assert_eq!(f.disk_frames(&src, &key(1, 0, 0), 5, &opts), vec![2, 3], "a disk change scans again");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
