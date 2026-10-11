@@ -1,0 +1,9 @@
+{"schema_version":1,"source":{"path":"x.aep"},"project":{"bits_per_channel":8},"items":[
+{"id":0,"kind":"folder","name":"Root"},
+{"id":2,"kind":"comp","name":"Main","width":320,"height":180,"duration":2,"frame_rate":30,"layers":[
+ {"id":10,"index":1,"kind":"solid","name":"Red","color":[1,0,0],"properties":[
+  {"kind":"group","match_name":"ADBE Transform Group","children":[
+   {"kind":"property","match_name":"ADBE Position","value":[160,90,0],"keyframes":[{"time":0,"value":[0,0,0]},{"time":1,"value":[320,180,0]}]},
+   {"kind":"property","match_name":"ADBE Opacity","value":50,"expression":"wiggle(2, 10)","expression_enabled":true}]},
+  {"kind":"group","match_name":"ADBE Effect Parade","children":[
+   {"kind":"group","match_name":"ADBE Gaussian Blur 2","children":[{"kind":"property","match_name":"ADBE Gaussian Blur 2-0001","value":12}]}]}]}]}]}

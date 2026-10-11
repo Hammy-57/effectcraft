@@ -26,7 +26,9 @@ mod agent_exam;
 mod agents;
 mod bench;
 mod fmt;
+mod fuzz;
 mod ico;
+mod repros;
 mod version;
 
 use std::process::{Command, ExitCode};
@@ -444,6 +446,8 @@ fn main() -> ExitCode {
         "agent-exam" => agent_exam::run(&root(), &std::env::args().skip(2).collect::<Vec<_>>()),
         "web" => web(&std::env::args().skip(2).collect::<Vec<_>>()),
         "bench" => bench::run(&root(), &std::env::args().skip(2).collect::<Vec<_>>()),
+        "fuzz" => fuzz::run(&root(), &std::env::args().skip(2).collect::<Vec<_>>()),
+        "repros" => repros::run(&root(), &std::env::args().skip(2).collect::<Vec<_>>()),
         "ico" => {
             let rest: Vec<String> = std::env::args().skip(2).collect();
             ico::run(&rest.iter().map(String::as_str).collect::<Vec<_>>())
@@ -452,7 +456,7 @@ fn main() -> ExitCode {
             let rest: Vec<String> = std::env::args().skip(2).collect();
             version::run(&root(), &rest.iter().map(String::as_str).collect::<Vec<_>>())
         }
-        _ => Err("usage: cargo xtask <layers|assets|wasm|web [--dev] [--serve PORT]|ico OUT.ico IN.png…|version [set X.Y.Z]|fmt [--check]|ci [--affected [--base REV] [--dry-run]]|bench [--bin CLI] [--quick] [--project F --comp C] [--compare OLD.jsonl] (--help)|agents <status|claim|release|gc>|agent-exam <--list|--validate|--check P.ecproj --task T|--run [--tasks a,b] [--out DIR] [--minutes N] [--max-tool-calls N] [--model M]>>".into()),
+        _ => Err("usage: cargo xtask <layers|assets|wasm|web [--dev] [--serve PORT]|ico OUT.ico IN.png…|version [set X.Y.Z]|fmt [--check]|ci [--affected [--base REV] [--dry-run]]|repros [--bless] [--dir DIR]|fuzz [--list|--seeds|TARGET… --seconds N]|bench [--bin CLI] [--quick] [--project F --comp C] [--compare OLD.jsonl] (--help)|agents <status|claim|release|gc>|agent-exam <--list|--validate|--check P.ecproj --task T|--run [--tasks a,b] [--out DIR] [--minutes N] [--max-tool-calls N] [--model M]>>".into()),
     };
     match r {
         Ok(()) => ExitCode::SUCCESS,
