@@ -70,3 +70,30 @@ Explicit disk pipeline caching is deferred: the pinned wgpu API requires
 `unsafe` and supports Vulkan only, while this workspace forbids unsafe and the
 target Mac uses Metal. Upload staging reuse is a separate pending slice; the
 existing readback pool does not imply upload pooling.
+
+### Adaptive playback availability (RT5)
+
+Auto resolution with Fast Previews set to Adaptive Resolution can reduce to Half
+of the normal Auto scale when native render-service p95 exceeds the displayed
+frame budget. The bounded window needs eight real render completions and two
+slow samples, with a 10% margin. The reduction stays for that playback/content
+state; idle restores the normal Auto scale. Explicit resolution overrides,
+cache-before-playback, other Fast Previews modes and remote workers keep their
+existing behavior. Cache hits and obsolete completions do not train the budget.
+
+The opt-in UI library benchmark exercises actual native viewer workers against
+RT0's generated mograph project, without building or opening the application:
+
+```sh
+RT5_PROJECT=/absolute/path/to/target/bench/gpu/mograph-1080.ecproj \
+RT5_REPORT=/absolute/path/to/rt5-paired.json \
+CARGO_BUILD_JOBS=4 nice -n 10 cargo test -p effectcraft-ui-egui --lib \
+  adaptive_playback_frame_availability -- --ignored --nocapture --test-threads=1
+```
+
+Run in an exclusive GPU timing window. It runs Off/Adaptive/Adaptive/Off,
+records the first 16 adaptation frames separately and reports p50/p95 of the
+next 60 requested-frame availability times. Native Auto compositor selection,
+readback and the bounded polling delay are included. This is a serial worker
+availability measurement, not window presentation or a playback-fps guarantee.
+All raw timings, chosen scales and the first reduction frame are retained.
