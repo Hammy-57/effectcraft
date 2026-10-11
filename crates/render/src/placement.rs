@@ -309,6 +309,18 @@ impl<'a> Renderer<'a> {
     /// effect's growth is not known (it may resize the buffer, move it, or read other layers'
     /// pixels into it). The effects the stack skips (disabled, unknown, audio) add nothing.
     pub(crate) fn fx_growth(&self, ctx: &EvalCtx, layer: &Layer, scale: f64) -> Option<f64> {
+        self.fx_pad(ctx, layer, scale, false)
+    }
+
+    /// Layer units around a pixel that the layer's effect stack reads to make it (what
+    /// [`Self::fx_growth`] grows by, also where Repeat Edge Pixels keeps the buffer's size), `None`
+    /// when not known.
+    pub(crate) fn fx_reach(&self, ctx: &EvalCtx, layer: &Layer, scale: f64) -> Option<f64> {
+        self.fx_pad(ctx, layer, scale, true)
+    }
+
+    /// [`Self::fx_growth`] (`reach` false) or [`Self::fx_reach`] (`reach` true).
+    fn fx_pad(&self, ctx: &EvalCtx, layer: &Layer, scale: f64, reach: bool) -> Option<f64> {
         let Some(fx) = layer.effects().filter(|_| layer.switches.effects) else { return Some(0.0) };
         // Blur sizes of a layer whose effects run in comp space are in comp pixels.
         let c = crate::fx::fx_comp_space(ctx, layer).map_or([1.0; 2], |m| EffectEnv { comp_space: Some([m.0[0], m.0[1]]), ..Default::default() }.comp_px());
@@ -326,12 +338,12 @@ impl<'a> Renderer<'a> {
             grow += match spec.id {
                 "ec.blur.gaussian" => {
                     let sigma = effectcraft_effects::gaussian_sigma(p.f("blurriness"));
-                    if sigma <= 0.0 || p.b("repeatEdge") { 0.0 } else { 3.0 * sigma * c + px }
+                    if sigma <= 0.0 || (p.b("repeatEdge") && !reach) { 0.0 } else { 3.0 * sigma * c + px }
                 }
                 "ec.blur.fastbox" => {
                     let r = p.f("radius").max(0.0);
                     let it = p.f("iterations").round().clamp(1.0, 50.0);
-                    if r <= 0.0 || p.b("repeatEdge") { 0.0 } else { (r * c + 0.5 * px) * it + px }
+                    if r <= 0.0 || (p.b("repeatEdge") && !reach) { 0.0 } else { (r * c + 0.5 * px) * it + px }
                 }
                 "ec.blur.directional" => {
                     let len = p.f("length");

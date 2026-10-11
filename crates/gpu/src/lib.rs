@@ -494,6 +494,8 @@ mod tests_3d;
 #[cfg(test)]
 mod tests_adjust;
 #[cfg(test)]
+mod tests_shape_clip;
+#[cfg(test)]
 mod tests_adv3d;
 #[cfg(test)]
 mod tests_deferred;
@@ -561,3 +563,9 @@ pub fn yuv_transport_enabled() -> bool {
         true
     }
 }
+
+#[cfg(test)]
+mod tests_collapsed_resident;
+
+#[cfg(test)]
+mod tests_motion_blur_accum;

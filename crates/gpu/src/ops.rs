@@ -105,6 +105,79 @@ pub fn warp_q(
     out
 }
 
+/// Motion-blur sub-samples: `dst` plus `src` warped by each of `matrices` times `weight`, summed
+/// in order. The same sums as one [`warp`] accumulate pass per matrix, in far fewer passes: each
+/// minification level of `src` is built once and shared by the samples that use it, consecutive
+/// samples at the same level sum in one `warp_accum` pass (one write of the canvas instead of one
+/// per sample), and samples that land entirely off `dst` (which add exactly nothing) are skipped.
+pub fn warp_accumulate(e: &mut Enc, dst: &GpuImage, src: &GpuImage, matrices: &[Mat3], sampling: Sampling, weight: f32) -> GpuImage {
+    if src.width == 0 || src.height == 0 || !e.has_kernel("warp_accum") {
+        return matrices.iter().fold(dst.clone(), |acc, m| warp(e, &acc, src, m, sampling, BlendMode::Normal, 1.0, 0, Some(weight)));
+    }
+    // Minification chain shared by the samples (level i = `src` halved i times).
+    let mut mips: Vec<GpuImage> = vec![src.clone()];
+    // Runs of consecutive samples at the same level: (level, per-sample data, union bounds).
+    let mut runs: Vec<(usize, Vec<f32>, [f32; 4])> = Vec::new();
+    for m in matrices {
+        let Some(inv0) = m.inverse() else { continue };
+        // As `warp_q`: a pre-filtered level so sampling doesn't alias.
+        let scale = m.mean_scale();
+        let (mut level, mut inv) = (0usize, inv0);
+        if scale < 0.5 && m.is_affine() {
+            let (mut s, mut f) = (scale * 2.0, 0.5);
+            level = 1;
+            loop {
+                while mips.len() <= level {
+                    let Some(prev) = mips.last() else { break };
+                    let next = half(e, prev);
+                    mips.push(next);
+                }
+                let Some(img) = mips.get(level) else { break };
+                if !(s < 0.5 && img.width > 1 && img.height > 1) {
+                    break;
+                }
+                level += 1;
+                f *= 0.5;
+                s *= 2.0;
+            }
+            inv = Mat3::scale(vec2(f, f)) * inv;
+        }
+        let bounds = m.map_rect(&Rect::from_size(src.width as f64, src.height as f64)).inflate(1.0).round_out();
+        let area = bounds.intersect(&Rect::from_size(dst.width as f64, dst.height as f64));
+        if area.is_empty() {
+            continue;
+        }
+        let b = [
+            area.x0.max(0.0) as u32 as f32,
+            area.y0.max(0.0) as u32 as f32,
+            area.x1.min(dst.width as f64) as u32 as f32,
+            area.y1.min(dst.height as f64) as u32 as f32,
+        ];
+        let r = rows(&inv);
+        let sample = [r[0], r[1], r[2], b];
+        match runs.last_mut() {
+            Some((l, data, u)) if *l == level => {
+                data.extend(sample.iter().flatten());
+                *u = [u[0].min(b[0]), u[1].min(b[1]), u[2].max(b[2]), u[3].max(b[3])];
+            }
+            _ => runs.push((level, sample.iter().flatten().copied().collect(), b)),
+        }
+    }
+    let mut acc = dst.clone();
+    for (level, data, u) in &runs {
+        let Some(img) = mips.get(*level) else { continue };
+        let mut p = Params::default();
+        p.u[0] = [sampling_id(sampling), (data.len() / 16) as u32, 0, 0];
+        p.f[0] = [weight, u[0], u[1], u[2]];
+        p.f[1][0] = u[3];
+        let buf = e.data(data);
+        let out = e.scratch(dst.width, dst.height);
+        e.pixels("warp_accum", &p, img, Some(&acc), &out, Some(&buf));
+        acc = out;
+    }
+    acc
+}
+
 /// `Image::blend_from`: blend `src` (same size) onto `dst`, clamping and quantising the result
 /// to `levels` when set (see [`warp_q`]).
 pub fn blend_full(e: &mut Enc, dst: &GpuImage, src: &GpuImage, mode: BlendMode, opacity: f32, seed: u32, levels: Option<f32>) -> GpuImage {

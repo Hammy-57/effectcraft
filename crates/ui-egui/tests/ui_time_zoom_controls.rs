@@ -220,3 +220,42 @@ fn command_plus_minus_zoom_the_focused_composition() {
     h.step();
     assert_eq!(h.state().ui.viewer.zoom, Some(1.5), "viewer aliases are local to the composition panel");
 }
+
+/// Holding a zoom button keeps zooming (one step on press, then repeating after a short delay)
+/// and stops on release.
+#[test]
+fn holding_a_zoom_button_keeps_zooming() {
+    for (id, zoom_in) in [("timeline.zoomInButton", true), ("timeline.zoomOutButton", false)] {
+        let mut h = harness(false);
+        if !zoom_in {
+            // Start zoomed in, so there is room to zoom out.
+            for _ in 0..4 {
+                send(&mut h, "ui.key", json!({"key": "="}));
+            }
+        }
+        let (_, start) = view(&h);
+        let r = h.state().auto.find(id).unwrap_or_else(|| panic!("no {id}")).rect;
+        let pos = egui::pos2(r[0] + r[2] / 2.0, r[1] + r[3] / 2.0);
+        h.event(egui::Event::PointerMoved(pos));
+        h.step();
+        h.event(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE });
+        h.step();
+        let (_, pressed) = view(&h);
+        // kittest advances 0.25 s a frame: past the delay, about one more step a frame.
+        h.run_steps(4);
+        let (_, held) = view(&h);
+        h.event(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE });
+        h.run_steps(3);
+        let (_, released) = view(&h);
+        h.run_steps(4);
+        let (_, after) = view(&h);
+        if zoom_in {
+            assert!(pressed < start * 0.9, "{id}: one step on press: {start} -> {pressed}");
+            assert!(held < pressed / 2.0, "{id}: keeps zooming in while held: {pressed} -> {held}");
+        } else {
+            assert!(pressed > start * 1.1, "{id}: one step on press: {start} -> {pressed}");
+            assert!(held > pressed * 2.0 || held >= 9.9, "{id}: keeps zooming out while held: {pressed} -> {held}");
+        }
+        assert!((after - released).abs() < 1e-9, "{id}: stops on release: {released} -> {after}");
+    }
+}
