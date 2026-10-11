@@ -655,6 +655,7 @@ impl GpuContext {
             include_str!("shaders/fx_time.wgsl"),
             include_str!("shaders/fx_pixel2.wgsl"),
             include_str!("shaders/fx_gen2.wgsl"),
+            include_str!("shaders/fx_deepglow.wgsl"),
             include_str!("shaders/sky.wgsl"),
         ]
         .concat();
@@ -757,6 +758,7 @@ impl GpuContext {
             .chain(crate::fx_time::KERNELS)
             .chain(crate::fx_pixel2::KERNELS)
             .chain(crate::fx_gen2::KERNELS)
+            .chain(crate::fx_deepglow::KERNELS)
         {
             match build(e, &layout) {
                 Ok(p) => {

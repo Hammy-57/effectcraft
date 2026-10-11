@@ -5,7 +5,7 @@
 
 EffectCraft ships 316 effects with 3190 parameters in total, grouped into the same categories as the Effects & Presets panel. Every effect is our own implementation, written from public behaviour descriptions and standard image-processing literature. Parameter names, order, popup options, units, defaults and ranges follow the reference application so that projects, expressions and muscle memory carry over.
 
-- **GPU**: 280 effects also run on the GPU compositor with identical results.
+- **GPU**: 281 effects also run on the GPU compositor with identical results.
 - **32**: 316 effects process 32-bit float (HDR, overbright) pixels without clamping.
 - **Status**: 304 implemented in full, 12 partial (what is missing is listed).
 
@@ -360,7 +360,7 @@ Effects are addressed by id (`ec.<category>.<name>`) or display name in commands
 | CC Vignette | `ec.stylize.ccvignette` | 4 | GPU | 32 | Implemented |
 | Cartoon | `ec.stylize.cartoon` | 12 | GPU | 32 | Implemented |
 | Color Emboss | `ec.stylize.coloremboss` | 4 | GPU | 32 | Implemented |
-| Deep Glow (Native) | `ec.stylize.deepglow` | 27 |  | 32 | Partial: Approximate falloff, tint, chromatic aberration and downsampling; edge modes and masking are not fully matched |
+| Deep Glow (Native) | `ec.stylize.deepglow` | 27 | GPU | 32 | Partial: Approximate falloff, tint, chromatic aberration and downsampling; edge modes and masking are not fully matched |
 | Emboss | `ec.stylize.emboss` | 4 | GPU | 32 | Implemented |
 | Find Edges | `ec.stylize.findedges` | 2 | GPU | 32 | Implemented |
 | Glow | `ec.stylize.glow` | 14 | GPU | 32 | Implemented |

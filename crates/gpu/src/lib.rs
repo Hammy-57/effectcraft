@@ -22,7 +22,7 @@
 //! GPU effects ([`effectcraft_effects::GPU_EFFECTS`]) run as compute kernels with the CPU
 //! effect's exact steps (padding, box-blur radii, parameter conversions); chains of them are
 //! uploaded and read back once. Each family lives in its own module with its own WGSL file
-//! (`fx_color`, `fx_depth`, `fx_distort`, `fx_extra`, `fx_gen2`, `fx_generate`, `fx_key`,
+//! (`fx_color`, `fx_deepglow`, `fx_depth`, `fx_distort`, `fx_extra`, `fx_gen2`, `fx_generate`, `fx_key`,
 //! `fx_light`, `fx_lut`, `fx_noise`, `fx_particles`, `fx_pixel2`, `fx_sim`, `fx_stylize`,
 //! `fx_text`, `fx_time`, `fx_tone`, `fx_transition`, `fx_vr`, `fx_warp`); settings a kernel
 //! cannot match fall back to the CPU (`catalog::gpu_supported`, or `None` from the family's
@@ -69,6 +69,7 @@ pub fn color_fusion_enabled() -> bool {
     fusion::enabled()
 }
 mod fx_color;
+mod fx_deepglow;
 mod fx_depth;
 mod fx_distort;
 mod fx_extra;
@@ -533,6 +534,8 @@ mod tests_deferred;
 mod tests_deferred_jobs;
 #[cfg(test)]
 mod tests_fx_color;
+#[cfg(test)]
+mod tests_fx_deepglow;
 #[cfg(test)]
 mod tests_fx_depth;
 #[cfg(test)]

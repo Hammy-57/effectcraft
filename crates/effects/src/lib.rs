@@ -1079,6 +1079,8 @@ pub const GPU_EFFECTS: &[&str] = &[
     "ec.generate.audiowaveform",
     "ec.obsolete.basictext",
     "ec.obsolete.pathtext",
+    // effectcraft-gpu fx_deepglow
+    "ec.stylize.deepglow",
 ];
 
 /// Effects that can read [`EffectHost::comp_scene`] (the comp camera or the first comp light):
