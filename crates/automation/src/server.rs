@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use crate::autosave::AutoSave;
 use crate::notify::Notifier;
 use crate::prompts;
-use crate::resources::{self, Target, UriError};
+use crate::resources::{self, UriError};
 use crate::tools::{self, Reply};
 use crate::{Backend, Error, base64};
 
@@ -283,9 +283,12 @@ impl McpServer {
                 Ok(json!({
                     "protocolVersion": version,
                     "capabilities": {"tools": {"listChanged": false}, "resources": {"listChanged": false, "subscribe": true}, "prompts": {"listChanged": false}, "logging": {}},
-                    "serverInfo": {"name": "effectcraft", "title": format!("EffectCraft ({mode})"), "version": env!("CARGO_PKG_VERSION")},
+                    "serverInfo": {"name": "effectcraft", "title": format!("EffectCraft ({mode})"), "version": env!("CARGO_PKG_VERSION"), "build": effectcraft_engine::build_info::build()},
+                    "cliBuild": effectcraft_engine::build_info::build(),
+                    "processInstance": effectcraft_engine::build_info::process_instance(),
+                    "protocolFeatures": effectcraft_engine::build_info::protocol_features(),
                     "instructions": instructions,
-                    "_meta": {"effectcraftAutoSave": self.autosave_info()},
+                    "_meta": {"effectcraftAutoSave": self.autosave_info(), "effectcraftBuild": effectcraft_engine::build_info::build()},
                 }))
             }
             "ping" => Ok(json!({})),
@@ -361,8 +364,8 @@ impl McpServer {
                     Ok(Reply::Json(v)) => Ok(json!({"contents": [{"uri": uri, "mimeType": "application/json", "text": json_text(&v)}]})),
                     Ok(Reply::Image { png, .. }) => Ok(json!({"contents": [{"uri": uri, "mimeType": "image/png", "blob": base64::encode(&png)}]})),
                     // A templated comp, layer or command that doesn't exist is "not found".
-                    Err(Error::BadArgs(e) | Error::App(e)) if !matches!(target, Target::Document | Target::Commands) => Err((RESOURCE_NOT_FOUND, e)),
-                    Err(Error::Engine(e)) if !matches!(target, Target::Document | Target::Commands) => Err((RESOURCE_NOT_FOUND, e.to_string())),
+                    Err(Error::BadArgs(e) | Error::App(e)) if !target.is_document_or_catalog() => Err((RESOURCE_NOT_FOUND, e)),
+                    Err(Error::Engine(e)) if !target.is_document_or_catalog() => Err((RESOURCE_NOT_FOUND, e.to_string())),
                     Err(e) => Err((INTERNAL_ERROR, e.to_string())),
                 }
             }
@@ -571,10 +574,12 @@ pub(crate) fn guarded_run(backend: &mut Backend, name: &str, args: &Value) -> Re
         o.remove("client");
     }
     let outer = client.map(|c| backend.set_client(c));
+    let outer_revision = backend.set_expected_revision(None);
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tools::run(backend, name, &args))).unwrap_or_else(|p| {
         let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_else(|| "panic".into());
         Err(Error::Other(format!("internal error: {msg}")))
     });
+    backend.set_expected_revision(outer_revision);
     if let Some(outer) = outer {
         backend.set_client(outer);
     }
@@ -753,5 +758,37 @@ mod result_tests {
         }
         assert_eq!(serde_json::from_str::<Value>(&json_text(&deep)).unwrap(), deep);
         assert_eq!(json_text(&deep).len(), deep.to_string().len());
+    }
+}
+
+#[cfg(test)]
+mod build_identity_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    struct OfflineApp(Arc<AtomicUsize>);
+
+    impl crate::ControlTransport for OfflineApp {
+        fn call(&mut self, _: &str, _: Value) -> crate::Result<Value> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Err(Error::Other("app unavailable".into()))
+        }
+    }
+
+    #[test]
+    fn initialize_describes_cli_build_without_contacting_the_app() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let backend = Backend::transport(OfflineApp(requests.clone()));
+        let mut server = McpServer::new(backend);
+        let reply = server.handle(&json!({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{"protocolVersion":"2025-06-18"}})).unwrap();
+        assert!(reply.get("error").is_none(), "{reply}");
+        let result = &reply["result"];
+        assert_eq!(result["cliBuild"], effectcraft_engine::build_info::build());
+        assert_eq!(result["serverInfo"]["build"], result["cliBuild"]);
+        assert_eq!(result["processInstance"], json!(effectcraft_engine::build_info::process_instance()));
+        assert_eq!(result["protocolFeatures"]["sessionIdentity"], true);
+        assert_eq!(requests.load(Ordering::Relaxed), 0, "initialize must work with an offline app");
     }
 }

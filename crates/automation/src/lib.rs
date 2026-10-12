@@ -24,11 +24,13 @@ pub mod bridge;
 mod compact;
 pub mod confine;
 pub mod control_wire;
+mod host_join;
 pub mod host_server;
 mod long_job;
 mod notify;
 mod prompts;
 pub mod resources;
+mod result_store;
 pub mod server;
 pub mod tools;
 

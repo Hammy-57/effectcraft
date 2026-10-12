@@ -43,8 +43,12 @@ fn project_lifecycle() {
     // Branching history: undo 5, make a different edit, then jump back to the old branch's tip.
     qa.tool("undo", json!({"steps": 5}));
     qa.tool("set_property", json!({"layer": box_id.clone(), "path": "transform/opacity", "value": 25}));
-    let h = qa.tool("history", json!({}));
-    let nodes = h.as_array().unwrap_or_else(|| h["states"].as_array().expect("history list"));
+    let mut h = qa.tool("history", json!({}));
+    let mut nodes = h.as_array().unwrap_or_else(|| h["states"].as_array().expect("history list")).clone();
+    while let Some(offset) = h["next_offset"].as_u64() {
+        h = qa.tool("get_result", json!({"result_id":h["result_id"],"pointer":"/states","mode":"page","offset":offset}));
+        nodes.extend(h["states"].as_array().expect("history page").iter().cloned());
+    }
     let branch_tip = nodes.iter().filter(|n| n["depth"].as_u64().unwrap_or(0) > 0).max_by_key(|n| n["index"].as_u64()).expect("a branch").clone();
     qa.tool("history", json!({"goto": branch_tip["id"].clone()}));
     let pos = qa.tool("get_property", json!({"layer": box_id.clone(), "path": "transform/position"}))["value"].clone();
