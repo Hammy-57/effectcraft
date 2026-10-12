@@ -321,6 +321,23 @@ fn add_effect(p: &mut Project, l: &mut effectcraft_project::Layer, id: &str, siz
     l.props.sub_mut("effects").unwrap().children.push(g.into());
 }
 
+/// #329: a render whose footage reads were called off keeps nothing in the layer cache: a layer
+/// made from a frame that came back empty (an effect's layer parameter) would be reused by the
+/// next render of that time.
+#[test]
+fn a_called_off_render_keeps_nothing_in_the_layer_cache() {
+    let (p, cid) = cache_scene();
+    let t = Tick::from_seconds_f64(0.5);
+    let cache = crate::LayerCache::default();
+    let off = crate::CancellableFootage { inner: &crate::NoFootage, cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)) };
+    let mut r = crate::Renderer::new(&p, &off, crate::RenderOpts::default());
+    r.cache = Some(&cache);
+    r.comp_frame(cid, t);
+    assert_eq!(cache.stats().entries, 0, "a called-off render kept layers");
+    render_cached(&p, cid, t, Some(&cache));
+    assert!(cache.stats().entries > 0, "a render that runs to the end keeps its layers");
+}
+
 /// A comp with a static effected solid, an animated-trim shape, a moving text layer with a blur.
 fn cache_scene() -> (Project, ItemId) {
     let (mut p, cid, comp) = setup();

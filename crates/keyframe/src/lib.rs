@@ -491,7 +491,9 @@ impl SpatialSeg {
     /// The curve parameter at arc length `s` (table lookup refined by Newton's method).
     fn parameter_at_length(&self, s: f64) -> f64 {
         let len = self.length();
-        if len <= 0.0 {
+        // Huge coordinates overflow the arc length to infinity or NaN; `clamp` panics on a NaN
+        // bound, so such a path evaluates at its start instead of crashing (#880).
+        if !(len > 0.0 && len.is_finite()) {
             return 0.0;
         }
         let s = s.clamp(0.0, len);
@@ -936,7 +938,7 @@ mod tests {
         }
         fn at_length(&self, s: f64) -> [f64; 3] {
             let len = self.length();
-            if len <= 0.0 {
+            if !(len > 0.0 && len.is_finite()) {
                 return self.p[0];
             }
             let s = s.clamp(0.0, len);
@@ -1201,6 +1203,31 @@ mod tests {
         let speeds: Vec<f64> = (1..400).map(|i| speed(&keys, s(i as f64 * 0.005), true)).collect();
         for v in &speeds {
             assert!((v - len / 2.0).abs() < 1e-3 * len, "speed {v} vs {}", len / 2.0);
+        }
+    }
+
+    /// #880: scrubbing a curved spatial path with huge values overflowed the arc length to NaN,
+    /// which got past `len <= 0.0` and made `clamp(0.0, NaN)` panic.
+    #[test]
+    fn spatial_path_with_huge_values_does_not_panic() {
+        for big in [1e300, f64::MAX, 1e200] {
+            let mut a = Keyframe::new(s(0.0), Value::Vec2([0.0, -big]));
+            let mut b = Keyframe::new(s(1.0), Value::Vec2([big, 0.0]));
+            let mut c = Keyframe::new(s(2.0), Value::Vec2([-big, big]));
+            a.spatial_auto = false;
+            b.spatial_auto = false;
+            a.spatial_out = [big, big, 0.0];
+            b.spatial_in = [-big, big, 0.0];
+            for k in [&mut a, &mut b, &mut c] {
+                k.in_interp = Interp::Bezier;
+                k.out_interp = Interp::Bezier;
+            }
+            let keys = vec![a, b, c];
+            for i in 0..=40 {
+                let t = s(i as f64 * 0.05);
+                let _ = evaluate(&keys, t, true);
+                let _ = speed(&keys, t, true);
+            }
         }
     }
 

@@ -155,12 +155,28 @@ fn preview_with_audio_shows_every_frame_and_sounds_once_cached() {
     assert!(h.state().audio.is_some() && fake.0.lock().unwrap().0.is_some(), "the sound started once the frames ahead were cached");
     let started = h.state().audio.as_ref().unwrap().span.start;
     assert_eq!(started, frame(&h) * 1600, "the sound starts at the frame on screen ({shown} shown before it)");
-    // A frame that isn't cached stops the sound rather than being skipped. (Frames render fast
+    // A frame that isn't cached holds the sound rather than being skipped. (Frames render fast
     // enough here to be cached again before the check: keep them out of the cache.)
+    let budget = h.state().frames.budget();
     h.state().frames.set_budget(0);
     h.state().frames.clear();
     h.step();
-    assert!(h.state().audio.is_none() && h.state().playback.audio_held && h.state().playback.playing);
+    let held = |h: &Harness<'_, EffectcraftApp>| h.state().audio.as_ref().is_some_and(|a| a.held());
+    assert!(held(&h) && h.state().playback.audio_held && h.state().playback.playing);
+    // The device stays open while it holds (reopening it at every uncached frame stuttered),
+    // and the sound plays on from the frame on screen once the frames ahead are cached again.
+    let feed = fake.0.lock().unwrap().0.clone().expect("the output opened");
+    h.state().frames.set_budget(budget);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while held(&h) && std::time::Instant::now() < deadline {
+        h.step();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let resumed = h.state().audio.as_ref().expect("the output is still open");
+    assert!(!resumed.held(), "the sound resumed");
+    assert!(!fake.0.lock().unwrap().1, "the device was never stopped");
+    assert!(Arc::ptr_eq(&feed, fake.0.lock().unwrap().0.as_ref().unwrap()), "nor opened again");
+    assert_eq!(resumed.span.start, frame(&h) * 1600, "in sync with the frame on screen");
 }
 
 /// A preview whose frames render in real time sounds without waiting for the whole work area to
