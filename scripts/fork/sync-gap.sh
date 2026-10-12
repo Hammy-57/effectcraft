@@ -43,15 +43,21 @@ trap 'rm -rf "$tmp"' EXIT
 
 # Commits upstream already has (same patch): "-" lines of git cherry.
 git cherry "$up" "$fork" | sed -n 's/^- //p' | sort > "$tmp/upstream"
-# Commits already queued: -x trailers on the branches the queue files name.
+# Commits already queued or in an open PR: -x trailers on every upstream/* branch on origin (a
+# queue file goes away once its PR is opened, but the branch, and its PR, stay) and on the
+# branches the queue files name.
 : > "$tmp/queued"
+branches=$(git for-each-ref --format='%(refname:lstrip=3)' 'refs/remotes/origin/upstream/')
 if git rev-parse --verify --quiet refs/remotes/origin/pr-queue >/dev/null; then
     for f in $(git ls-tree --name-only origin/pr-queue queue/ 2>/dev/null); do
-        b=$(git show "origin/pr-queue:$f" | sed -n '2s/^branch: //p')
-        git rev-parse --verify --quiet "refs/remotes/origin/$b" >/dev/null || continue
-        git log --format=%B "$up..origin/$b" | sed -n 's/^(cherry picked from commit \([0-9a-f]*\))$/\1/p' >> "$tmp/queued"
+        branches="$branches
+$(git show "origin/pr-queue:$f" | sed -n '2s/^branch: //p')"
     done
 fi
+for b in $(printf '%s\n' "$branches" | sort -u); do
+    git rev-parse --verify --quiet "refs/remotes/origin/$b" >/dev/null || continue
+    git log --format=%B "$up..origin/$b" | sed -n 's/^(cherry picked from commit \([0-9a-f]*\))$/\1/p' >> "$tmp/queued"
+done
 sort -u -o "$tmp/queued" "$tmp/queued"
 
 # One pass: per commit, its sha, subject and line count on shareable paths.
