@@ -276,3 +276,45 @@ fn save_stable_snapshot(h: &mut Harness<'_, EffectcraftApp>, path: &str, width: 
         assert_eq!(times, ["0 ms"], "cached rendering must preserve the deterministic timing input");
     }
 }
+
+/// #882: at 100 % the frame sits on the physical pixel grid (a fractional pan or panel size
+/// no longer puts each frame pixel across two screen pixels) and magnifies without blurring.
+#[test]
+fn frame_at_100_percent_is_on_the_pixel_grid_and_not_filtered() {
+    for scale in [1.0_f32, 2.0] {
+        let mut h = harness_at_scale(437.0, ThemeKind::Dark, scale);
+        h.state_mut().ui.viewer.zoom = Some(1.0 / scale);
+        h.state_mut().ui.viewer.pan = [0.37, -0.81];
+        h.run_steps(3);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while h.state().frames.urgent_pending() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        h.run_steps(3);
+        // The frame: the textured mesh of the comp's size (640 x 360 pixels).
+        let mesh = h
+            .output()
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                Shape::Mesh(m)
+                    if m.texture_id != egui::TextureId::default() && {
+                        let r = m.calc_bounds();
+                        (r.width() * scale - 640.0).abs() < 0.5 && (r.height() * scale - 360.0).abs() < 0.5
+                    } =>
+                {
+                    Some(m.clone())
+                }
+                _ => None,
+            })
+            .expect("the frame is painted");
+        let tex = mesh.texture_id;
+        for v in &mesh.vertices {
+            for c in [v.pos.x * scale, v.pos.y * scale] {
+                assert!((c - c.round()).abs() < 1e-3, "frame corner {:?} is off the pixel grid at {scale}x", v.pos);
+            }
+        }
+        let opts = h.ctx.tex_manager().read().meta(tex).map(|m| m.options).expect("texture meta");
+        assert_eq!(opts.magnification, egui::TextureFilter::Nearest, "magnified frames show whole pixels");
+    }
+}
