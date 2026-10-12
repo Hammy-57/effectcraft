@@ -543,7 +543,10 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
         let (uid, d) = (c.prop.uid, c.dim);
         for k in &c.keys {
             let kp = pos2(tm.x(k.t), ymap(k.v));
-            if !plot.expand(6.0).contains(kp) {
+            // A key above or below the visible range (a speed spike) keeps its handles: they are
+            // pinned inside the plot so they can still be grabbed. Only keys off its time span
+            // (or unplottable) have none.
+            if !(plot.min.x - 6.0..=plot.max.x + 6.0).contains(&kp.x) || !kp.y.is_finite() {
                 continue;
             }
             for h in &k.handles {
