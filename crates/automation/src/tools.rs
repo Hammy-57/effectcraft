@@ -29,7 +29,40 @@ pub struct ToolDef {
 impl ToolDef {
     /// The JSON Schema of the tool's arguments.
     pub fn input_schema(&self) -> Value {
-        (self.schema)()
+        let mut schema = (self.schema)();
+        if let Some(props) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+            for (key, value) in [
+                ("full", full_s("reply")),
+                ("offset", offset_s()),
+                ("limit", limit_s("items or bytes", 100)),
+                ("max_chars", max_chars_s()),
+                (
+                    "expectRevision",
+                    json!({"type":"integer","minimum":0,"description":"Refuse if the project changed since this revision. Required for continuation of live inspection pages; saved get_result snapshots do not need it."}),
+                ),
+            ] {
+                if key == "expectRevision"
+                    && !(READ_ONLY.contains(&self.name)
+                        || [
+                            "set_property",
+                            "add_keyframe",
+                            "add_effect",
+                            "run_script",
+                            "command_run",
+                            "execute_command",
+                            "batch",
+                            "command_batch",
+                            "open_project",
+                            "save_project",
+                        ]
+                        .contains(&self.name))
+                {
+                    continue;
+                }
+                props.entry(key).or_insert(value);
+            }
+        }
+        schema
     }
     /// The MCP `Tool` object, with a title and annotations (docs/mcp.md).
     pub fn descriptor(&self) -> Value {
@@ -80,6 +113,7 @@ const READ_ONLY: &[&str] = &[
     "get_layer",
     "get_property",
     "get_field",
+    "get_result",
     "list_effects",
     "list_fonts",
     "get_state",
@@ -283,7 +317,62 @@ pub fn run(b: &mut Backend, name: &str, args: &Value) -> Result<Reply> {
         return Err(Error::BadArgs(format!("`{name}` is not available while file access is confined (--automation-read-root/--automation-write-root)")));
     }
     let empty = json!({});
-    (t.run)(b, if args.is_null() { &empty } else { args })
+    let args = if args.is_null() { &empty } else { args };
+    // Validate delivery options before a script/edit can run.
+    let delivery_budget = crate::compact::budget(args)?;
+    let output_page = crate::compact::Page::from_args(args, 100)?;
+    let expected = match get(args, "expectRevision") {
+        Some(value) => Some(value.as_u64().ok_or_else(|| Error::BadArgs("expectRevision must be a non-negative integer".into()))?),
+        None => None,
+    };
+    if ["get_comp", "get_layer", "get_property", "get_project", "doc_inspect", "get_field"].contains(&name) && output_page.offset > 0 && expected.is_none() {
+        return Err(Error::BadArgs("live page continuation requires expectRevision from the first reply; or use a retained get_result snapshot".into()));
+    }
+    // Generic output options must not leak into raw UI/control arguments.
+    let native = (t.schema)();
+    let mut run_args = args.clone();
+    for key in ["full", "offset", "limit", "max_chars", "expectRevision"] {
+        if native["properties"].get(key).is_none() {
+            // Convenience edit functions consume expectRevision for their root transaction.
+            if key == "expectRevision" {
+                continue;
+            }
+            if let Some(o) = run_args.as_object_mut() {
+                o.remove(key);
+            }
+        }
+    }
+    let outer = b.set_expected_revision(expected);
+    let result = (t.run)(b, &run_args);
+    b.set_expected_revision(outer);
+    let mut reply = match result {
+        Ok(reply) => reply,
+        Err(error) => {
+            let text = error.to_string();
+            if text.len() <= delivery_budget || (get(args, "full").and_then(Value::as_bool) == Some(true) && !crate::compact::Page::requested(args)) {
+                return Err(error);
+            }
+            Reply::Json(json!({"ok":false,"error":text,"outcome":"failed_or_unknown","operation_completed":!matches!(error,Error::Bridge(_))}))
+        }
+    };
+    let writes = match name {
+        "command_run" | "execute_command" => get(args, "id")
+            .or_else(|| get(args, "command"))
+            .and_then(Value::as_str)
+            .and_then(effectcraft_engine::commands::find)
+            .is_some_and(|c| c.journal || c.id.starts_with("edit.") || c.id == "engine.batch"),
+        _ => !READ_ONLY.contains(&name),
+    };
+    if writes
+        && let Reply::Json(value) = &mut reply
+        && value.is_object()
+    {
+        match b.observed_context() {
+            Ok(context) => value["observedContext"] = context,
+            Err(e) => value["contextWarning"] = json!(format!("operation already finished; could not observe current session: {e}; inspect before retrying")),
+        }
+    }
+    b.finish_reply(name, args, reply)
 }
 
 // ------------------------------------------------------------------ schema fragments
@@ -412,7 +501,7 @@ fn add_effect(b: &mut Backend, a: &Value) -> Result<Reply> {
     let (layer, effect, comp) = (need(a, "layer")?, need(a, "effect")?, get(a, "comp"));
     let count = |t: &Value| effects_group(t).and_then(|g| g.get("children")).and_then(Value::as_array).map_or(0, Vec::len);
     let before = b.exec("layer.tree", obj(&[("layer", Some(layer)), ("comp", comp)]))?;
-    let index = count(&before) + 1;
+    let index = count(&before).saturating_add(1);
     let mut p = obj(&[("effect", Some(effect)), ("comp", comp)]);
     p["layers"] = json!([layer]);
     let mut steps = vec![json!({"command": "effect.apply", "params": p})];
@@ -431,15 +520,23 @@ fn add_effect(b: &mut Backend, a: &Value) -> Result<Reply> {
     let name = effect.as_str().map(|e| effectcraft_engine::effects::lookup(e).map_or(e, |s| s.name));
     let label = name.map(|n| json!(format!("Apply {n}")));
     let keys: Vec<&String> = get(a, "values").and_then(Value::as_object).map(|v| v.keys().collect()).unwrap_or_default();
-    let done = b.exec("engine.batch", obj(&[("steps", Some(&json!(steps))), ("label", label.as_ref())])).map_err(|e| add_effect_error(e, &keys))?;
+    steps.push(json!({"command": "layer.tree", "params": {"layer": before["id"], "comp": before["comp"]}}));
+    let done = b
+        .exec("engine.batch", obj(&[("steps", Some(&json!(steps))), ("label", label.as_ref()), ("expectRevision", before.get("revision"))]))
+        .map_err(|e| add_effect_error(e, &keys))?;
     let warnings: Vec<Value> = done["results"].as_array().map(|r| r.iter().flat_map(warnings_of).collect()).unwrap_or_default();
-    let tree = b.exec("layer.tree", obj(&[("layer", Some(layer)), ("comp", comp)]))?;
+    let tree = done
+        .get("results")
+        .and_then(Value::as_array)
+        .and_then(|r| r.last())
+        .cloned()
+        .ok_or_else(|| Error::App("effect was applied but final inspection is missing; inspect before retrying".into()))?;
     let inst = effects_group(&tree).and_then(|g| g.get("children")).and_then(Value::as_array).and_then(|c| c.get(index - 1)).cloned();
     let mut params = vec![];
     if let Some(i) = &inst {
         flatten(i, &mut params);
     }
-    let mut out = json!({"layer": tree["id"], "index": index, "path": prefix, "name": inst.as_ref().map(|i| i["name"].clone()), "set": set, "params": params});
+    let mut out = json!({"comp": tree["comp"], "revision": tree["revision"], "applied": true, "rolled_back": false, "layer": tree["id"], "index": index, "path": prefix, "name": inst.as_ref().map(|i| i["name"].clone()), "set": set, "params": params});
     if !warnings.is_empty() {
         out["warnings"] = json!(warnings);
     }
@@ -452,7 +549,10 @@ fn add_effect_error(e: Error, keys: &[&String]) -> Error {
     let msg = e.to_string();
     let Some((head, rest)) = msg.strip_prefix("step ").and_then(|m| m.split_once("): ")) else { return e };
     let Some(n) = head.split_whitespace().next().and_then(|n| n.parse::<usize>().ok()) else { return e };
-    let rest = rest.strip_suffix("; the batch was rolled back (nothing changed)").map_or(rest.to_string(), |r| format!("{r} (nothing was applied)"));
+    let rest = rest
+        .strip_suffix("; the batch was rolled back (nothing changed)")
+        .or_else(|| rest.strip_suffix("; the batch was rolled back"))
+        .map_or(rest.to_string(), |r| format!("{r} (nothing was applied)"));
     let inner = ["prop.set", "effect.apply"].iter().find_map(|c| rest.strip_prefix(&format!("invalid parameters for `{c}`: "))).unwrap_or(&rest).to_string();
     match n.checked_sub(2).and_then(|i| keys.get(i)) {
         Some(k) => Error::BadArgs(format!("values.{k}: {inner}")),
@@ -483,7 +583,9 @@ fn effects_group(tree: &Value) -> Option<&Value> {
 fn get_state(b: &mut Backend, _: &Value) -> Result<Reply> {
     let state = b.exec("editor.state", json!({}))?;
     let caps = b.exec("app.capabilities", json!({}))?;
-    json_reply(json!({"state": state, "app": caps}))
+    json_reply(
+        json!({"state": state, "app": caps, "cliBuild": effectcraft_engine::build_info::build(), "protocolFeatures": effectcraft_engine::build_info::protocol_features()}),
+    )
 }
 
 fn run_script(b: &mut Backend, a: &Value) -> Result<Reply> {
@@ -565,7 +667,7 @@ fn get_field(b: &mut Backend, a: &Value) -> Result<Reply> {
     if matches!(source, "get_layer" | "get_property") && get(a, "time").is_none() {
         return Err(Error::BadArgs("get_field requires the original reply's explicit comp `time` to keep chunks stable".into()));
     }
-    let mut raw = match source {
+    let raw = match source {
         "get_comp" => b.exec("comp.info", obj(&[("comp", get(a, "comp"))]))?,
         "get_property" => b.exec(
             "prop.get",
@@ -586,17 +688,57 @@ fn get_field(b: &mut Backend, a: &Value) -> Result<Reply> {
         "get_project" => b.exec("project.summary", json!({}))?,
         "doc_inspect" => {
             let project = b.exec("project.summary", json!({}))?;
-            let comp = if project["activeComp"].is_null() { Value::Null } else { b.exec("comp.info", json!({"comp": project["activeComp"]}))? };
+            let comp_id = get(a, "comp").cloned().unwrap_or_else(|| project["activeComp"].clone());
+            if get(a, "pointer").and_then(Value::as_str).is_some_and(|p| p.is_empty() || p.starts_with("/activeComp")) && get(a, "comp").is_none() {
+                return Err(Error::BadArgs("doc_inspect field recovery requires the original activeComp id in `comp`".into()));
+            }
+            let comp = if comp_id.is_null() { Value::Null } else { b.exec("comp.info", json!({"comp": comp_id}))? };
             json!({"revision": project["revision"], "project": project, "activeComp": comp})
         }
         _ => return Err(Error::BadArgs("`source` must be get_comp, get_layer, get_property, get_project or doc_inspect".into())),
     };
     // The field helper adds read identity to its bounded chunk response.
     if raw.get("revision").is_none() {
-        raw["revision"] = b.exec("editor.state", json!({}))?["revision"].clone();
+        return Err(Error::App("this app build does not expose inspection revisions; update/reconnect it before fetching fields".into()));
     }
     let pointer = need(a, "pointer")?.as_str().ok_or_else(|| Error::BadArgs("`pointer` must be a JSON pointer string".into()))?;
     json_reply(crate::compact::field_chunk(&raw, pointer, a)?)
+}
+
+fn get_result(b: &mut Backend, a: &Value) -> Result<Reply> {
+    json_reply(b.saved_result(a)?)
+}
+
+/// Atomic engine failures are known rollbacks; transport errors remain outcome-unknown.
+fn atomic_edit(b: &mut Backend, a: &Value, label: &str, steps: Vec<Value>) -> Result<Value> {
+    let mut params = json!({"steps": steps, "label": label, "atomic": true});
+    if let Some(revision) = get(a, "expectRevision") {
+        params["expectRevision"] = revision.clone();
+    }
+    match b.exec("engine.batch", params) {
+        Ok(done) => Ok(done),
+        Err(e) if e.to_string().contains("the batch was rolled back") => {
+            Ok(json!({"ok": false, "error": e.to_string(), "applied": false, "rolled_back": true, "outcome": "rolled_back"}))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn mutation_reply(done: &Value) -> Result<Value> {
+    let mut out = done
+        .get("results")
+        .and_then(Value::as_array)
+        .and_then(|r| r.last())
+        .cloned()
+        .ok_or_else(|| Error::App("atomic edit returned no inspection; inspect the document before retrying".into()))?;
+    let warnings: Vec<Value> = done.get("results").and_then(Value::as_array).into_iter().flatten().flat_map(warnings_of).collect();
+    out["applied"] = json!(true);
+    out["rolled_back"] = json!(false);
+    out["outcome"] = json!("applied");
+    if !warnings.is_empty() {
+        out["warnings"] = json!(warnings);
+    }
+    Ok(out)
 }
 
 fn set_property(b: &mut Backend, a: &Value) -> Result<Reply> {
@@ -605,98 +747,140 @@ fn set_property(b: &mut Backend, a: &Value) -> Result<Reply> {
     if value.is_none() && expr.is_none() {
         return Err(Error::BadArgs("give `value` and/or `expression`".into()));
     }
-    let base = [("layer", Some(layer)), ("path", Some(path)), ("comp", comp)];
-    let mut warnings = vec![];
-    let mut written_time = None;
-    if let Some(v) = value {
-        let mut p = obj(&base);
-        p["value"] = v.clone();
-        let r = match time {
-            Some(t) => {
-                p["time"] = t.clone();
-                // Ask the engine for the actual snapped times; do not recompute them here.
-                p["timeBase"] = get(a, "timeBase").cloned().unwrap_or(json!("layer"));
-                let applied = b.exec("prop.addKey", p)?;
-                written_time = Some(applied.clone());
-                applied
+    if expr.is_some_and(|v| !v.is_string()) {
+        return Err(Error::BadArgs("`expression` must be a string; nothing was applied".into()));
+    }
+    reject_omitted_value(value)?;
+    let inspect = obj(&[("layer", Some(layer)), ("path", Some(path)), ("comp", comp)]);
+    let mut steps = vec![json!({"command": "prop.get", "params": inspect})];
+    let base = json!({"comp": "$1.comp", "layer": "$1.layer", "prop": "$1.uid"});
+    let mut timed_step = None;
+    if let Some(value) = value {
+        let mut p = base.clone();
+        p["value"] = value.clone();
+        let command = if let Some(time) = time {
+            if !time.as_f64().is_some_and(f64::is_finite) {
+                return Err(Error::BadArgs("`time` must be finite seconds; nothing was applied".into()));
             }
-            None => b.exec("prop.set", p)?,
+            p["time"] = time.clone();
+            p["timeBase"] = get(a, "timeBase").cloned().unwrap_or(json!("layer"));
+            timed_step = Some(steps.len() + 1);
+            "prop.addKey"
+        } else {
+            "prop.set"
         };
-        warnings = warnings_of(&r);
+        steps.push(json!({"command": command, "params": p}));
     }
-    if let Some(e) = expr {
-        let mut p = obj(&base);
-        p["expression"] = e.clone();
-        b.exec("prop.setExpression", p)?;
+    if let Some(expression) = expr {
+        let mut p = base.clone();
+        p["expression"] = expression.clone();
+        steps.push(json!({"command": "prop.setExpression", "params": p}));
     }
-    let read_time = written_time.as_ref().and_then(|v| v.get("compTime")).or(time);
-    let mut r = b.exec("prop.get", obj(&[("layer", Some(layer)), ("path", Some(path)), ("comp", comp), ("time", read_time)]))?;
-    if let Some(timing) = written_time {
-        r["requestedTime"] = time.cloned().unwrap_or(Value::Null);
-        r["layerTime"] = timing["layerTime"].clone();
-        r["compTime"] = timing["compTime"].clone();
-        r["appliedValue"] = r["value"].clone();
+    let mut read = base;
+    if let Some(step) = timed_step {
+        read["time"] = json!(format!("${step}.compTime"));
+    } else if let Some(time) = time {
+        read["time"] = time.clone();
+    }
+    steps.push(json!({"command": "prop.get", "params": read}));
+    let done = atomic_edit(b, a, "Set Property", steps)?;
+    if done.get("ok") == Some(&Value::Bool(false)) {
+        return json_reply(done);
+    }
+    let mut out = mutation_reply(&done)?;
+    if let Some(step) = timed_step {
+        let timing = done
+            .get("results")
+            .and_then(Value::as_array)
+            .and_then(|r| r.get(step - 1))
+            .ok_or_else(|| Error::App("atomic edit returned no timing receipt; inspect before retrying".into()))?;
+        out["requestedTime"] = time.cloned().unwrap_or(Value::Null);
+        out["layerTime"] = timing["layerTime"].clone();
+        out["compTime"] = timing["compTime"].clone();
+        out["appliedValue"] = out["value"].clone();
         if let Some(w) = timing.get("warning") {
-            warnings.push(w.clone());
+            out["timingWarning"] = w.clone();
         }
     }
-    if !warnings.is_empty() {
-        r["warnings"] = json!(warnings);
+    json_reply(out)
+}
+
+fn reject_omitted_value(value: Option<&Value>) -> Result<()> {
+    fn omitted(v: &Value, depth: usize) -> bool {
+        if depth > 64 {
+            return true;
+        }
+        match v {
+            Value::Object(o) => o.get("$omitted").and_then(Value::as_bool) == Some(true) || o.values().any(|v| omitted(v, depth + 1)),
+            Value::Array(a) => a.iter().any(|v| omitted(v, depth + 1)),
+            _ => false,
+        }
     }
-    json_reply(r)
+    if value.is_some_and(|v| omitted(v, 0)) {
+        return Err(Error::BadArgs("value is omitted or too deeply nested; fetch exact data before editing; nothing was applied".into()));
+    }
+    Ok(())
 }
 
 fn add_keyframe(b: &mut Backend, a: &Value) -> Result<Reply> {
     let (layer, path, comp) = (need(a, "layer")?, need(a, "path")?, get(a, "comp"));
-    let keys: Vec<Value> = match get(a, "keys") {
-        Some(Value::Array(k)) => k.clone(),
+    let keys = match get(a, "keys") {
+        Some(Value::Array(k)) if k.len() <= 1_000 => k.clone(),
+        Some(Value::Array(_)) => return Err(Error::BadArgs("at most 1000 keys per atomic edit".into())),
         Some(_) => return Err(Error::BadArgs("`keys` must be an array of {time, value?}".into())),
         None => vec![obj(&[("time", Some(need(a, "time")?)), ("value", get(a, "value"))])],
     };
     if keys.is_empty() {
         return Err(Error::BadArgs("no keys".into()));
     }
-    let base = [("layer", Some(layer)), ("path", Some(path)), ("comp", comp)];
-    let mut warnings = vec![];
-    for (i, k) in keys.iter().enumerate() {
-        let mut p = obj(&base);
-        p["time"] = get(k, "time").ok_or_else(|| Error::BadArgs(format!("keys[{i}]: missing `time`; each key is {{time, value?}}, got {k}")))?.clone();
-        if let Some(v) = get(k, "value") {
-            p["value"] = v.clone();
+    for (i, key) in keys.iter().enumerate() {
+        if !key.get("time").and_then(Value::as_f64).is_some_and(f64::is_finite) {
+            return Err(Error::BadArgs(format!("keys[{i}]: missing or invalid `time`; nothing was applied")));
         }
-        if let Some(tb) = get(a, "timeBase") {
-            p["timeBase"] = tb.clone();
-        }
-        warnings.extend(warnings_of(&b.exec("prop.addKey", p)?));
+        reject_omitted_value(key.get("value"))?;
     }
-    let with_warnings = |mut r: Value| {
-        if !warnings.is_empty() {
-            r["warnings"] = json!(warnings);
-        }
-        r
+    let interpolation = match get(a, "interpolation") {
+        Some(Value::String(value)) => Some(value.to_ascii_lowercase()),
+        Some(_) => return Err(Error::BadArgs("interpolation must be a string; nothing was applied".into())),
+        None => None,
     };
-    let info = b.exec("prop.get", obj(&base))?;
-    if let Some(interp) = get(a, "interpolation").and_then(Value::as_str) {
-        // Key selection works on the active comp.
-        if let Some(c) = comp {
-            b.exec("comp.open", json!({"comp": c}))?;
-        }
-        let sel: Vec<Value> = keys.iter().map(|k| json!({"layer": info["layer"], "prop": info["uid"], "time": k["time"]})).collect();
-        let mut select = json!({"keys": sel});
-        if let Some(tb) = get(a, "timeBase") {
-            select["timeBase"] = tb.clone();
-        }
-        b.exec("keys.select", select)?;
-        match interp.to_ascii_lowercase().as_str() {
-            "easyease" | "ease" => b.exec("keys.easyEase", json!({}))?,
-            "easyeasein" => b.exec("keys.easyEase", json!({"which": "in"}))?,
-            "easyeaseout" => b.exec("keys.easyEase", json!({"which": "out"}))?,
-            i @ ("linear" | "bezier" | "hold") => b.exec("keys.interpolation", json!({"interpolation": i}))?,
-            other => return Err(Error::BadArgs(format!("unknown interpolation `{other}` (linear, bezier, hold, easyEase, easyEaseIn, easyEaseOut)"))),
-        };
-        return json_reply(with_warnings(b.exec("prop.get", obj(&base))?));
+    if interpolation.as_deref().is_some_and(|i| !["linear", "bezier", "hold", "easyease", "ease", "easyeasein", "easyeaseout"].contains(&i)) {
+        return Err(Error::BadArgs("unknown interpolation; nothing was applied".into()));
     }
-    json_reply(with_warnings(info))
+    let mut steps = vec![json!({"command": "prop.get", "params": obj(&[("layer", Some(layer)), ("path", Some(path)), ("comp", comp)])})];
+    let base = json!({"comp": "$1.comp", "layer": "$1.layer", "prop": "$1.uid"});
+    let mut selection = vec![];
+    let mut last_step = 1;
+    for key in &keys {
+        let mut p = base.clone();
+        p["time"] = key["time"].clone();
+        p["timeBase"] = get(a, "timeBase").cloned().unwrap_or(json!("layer"));
+        if let Some(value) = get(key, "value") {
+            p["value"] = value.clone();
+        }
+        last_step = steps.len() + 1;
+        steps.push(json!({"command": "prop.addKey", "params": p}));
+        selection.push(json!({"layer": "$1.layer", "prop": "$1.uid", "time": format!("${last_step}.layerTime")}));
+    }
+    if let Some(interpolation) = interpolation {
+        steps.push(json!({"command": "comp.open", "params": {"comp": "$1.comp"}}));
+        steps.push(json!({"command": "keys.select", "params": {"keys": selection, "timeBase": "layer"}}));
+        let (command, params) = match interpolation.as_str() {
+            "easyease" | "ease" => ("keys.easyEase", json!({})),
+            "easyeasein" => ("keys.easyEase", json!({"which": "in"})),
+            "easyeaseout" => ("keys.easyEase", json!({"which": "out"})),
+            other => ("keys.interpolation", json!({"interpolation": other})),
+        };
+        steps.push(json!({"command": command, "params": params}));
+    }
+    let mut read = base;
+    read["time"] = json!(format!("${last_step}.compTime"));
+    steps.push(json!({"command": "prop.get", "params": read}));
+    let done = atomic_edit(b, a, "Add Keyframes", steps)?;
+    if done.get("ok") == Some(&Value::Bool(false)) {
+        return json_reply(done);
+    }
+    json_reply(mutation_reply(&done)?)
 }
 
 /// The render arguments shared by render_frame / render_preview / render_frames.
@@ -803,16 +987,56 @@ fn frame_source_s() -> Value {
 }
 
 fn open_project(b: &mut Backend, a: &Value) -> Result<Reply> {
-    if let Some(p) = get(a, "path") {
-        b.exec("file.open", json!({"path": p}))?;
+    let opened = if let Some(path) = get(a, "path") {
+        b.exec("file.open", json!({"path": path}))?
     } else if get(a, "demo").and_then(Value::as_bool) == Some(true) {
-        b.exec("file.openDemoProject", json!({}))?;
+        b.exec("file.openDemoProject", json!({}))?
     } else if get(a, "new").and_then(Value::as_bool) == Some(true) {
-        b.exec("file.newProject", json!({}))?;
+        b.exec("file.newProject", json!({}))?
     } else {
         return Err(Error::BadArgs("give `path` (.ecproj), `demo: true` or `new: true`".into()));
+    };
+    // The precondition guarded opening, not the deliberately new document revision.
+    b.set_expected_revision(None);
+    let mut project = match opened.get("project") {
+        Some(p) => p.clone(),
+        None => b.exec("project.summary", json!({}))?,
+    };
+    let mut warnings = vec![];
+    for key in ["repaired", "savedBy", "handover", "openElsewhere"] {
+        if let Some(value) = opened.get(key) {
+            project[key] = value.clone();
+        }
     }
-    get_project(b, &json!({}))
+    if opened.get("repaired").and_then(Value::as_array).is_some_and(|a| !a.is_empty()) {
+        warnings.push(json!({"kind":"repairs", "details":opened["repaired"]}));
+    }
+    if opened.get("openElsewhere").and_then(Value::as_array).is_some_and(|a| !a.is_empty()) {
+        warnings.push(json!({"kind":"openElsewhere", "hosts":opened["openElsewhere"]}));
+    }
+    if let Some(version) = opened.get("savedBy").and_then(Value::as_str)
+        && effectcraft_engine::project::is_newer_version(version, effectcraft_engine::project::APP_VERSION)
+    {
+        warnings.push(json!({"kind":"newerVersion", "savedBy":version, "message":"Settings this build does not understand may be lost on save."}));
+    }
+    if get(a, "path").is_some() {
+        // The existing headless notifier already waits for this check; surface it in-band too.
+        let mut params = json!({"wait": true});
+        if let Some(revision) = project.get("revision") {
+            params["expectRevision"] = revision.clone();
+        }
+        match b.exec("footage.check", params) {
+            Ok(check) => {
+                if check.get("missing").and_then(Value::as_u64).is_some_and(|n| n>0) { warnings.push(json!({"kind":"missingMedia","details":check})); }
+                project["mediaCheck"] = check;
+            }
+            Err(error) => warnings.push(json!({"kind":"mediaCheckUnavailable","message":error.to_string(),"messageDetail":"The project opened; media completeness has not been verified."})),
+        }
+    }
+    if !warnings.is_empty() {
+        project["warnings"] = json!(warnings);
+    }
+    json_reply(project)
 }
 
 /// `hosts`: where projects are open; `join` switches this server to one of them (a running app or
@@ -820,30 +1044,7 @@ fn open_project(b: &mut Backend, a: &Value) -> Result<Reply> {
 fn hosts(b: &mut Backend, a: &Value) -> Result<Reply> {
     let list = b.exec("hosts.list", json!({}))?;
     let Some(join) = get(a, "join") else { return json_reply(list) };
-    let hosts = list["hosts"].as_array().cloned().unwrap_or_default();
-    let port = match join {
-        Value::Number(n) => n.as_u64().and_then(|p| u16::try_from(p).ok()).ok_or_else(|| Error::BadArgs(format!("`join`: {n} is not a port")))?,
-        Value::String(project) => {
-            let wanted = std::fs::canonicalize(project).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| project.clone());
-            let name = std::path::Path::new(project).file_name().map(|n| n.to_string_lossy().into_owned());
-            let found = hosts.iter().find(|h| h["project"].as_str() == Some(wanted.as_str())).or_else(|| {
-                hosts.iter().find(|h| {
-                    name.as_deref()
-                        .is_some_and(|n| h["project"].as_str().and_then(|p| std::path::Path::new(p).file_name()).is_some_and(|f| f.to_string_lossy() == n))
-                })
-            });
-            let h =
-                found.ok_or_else(|| Error::BadArgs(format!("no running EffectCraft has {project} open (see `hosts`); open it with open_project instead")))?;
-            h["port"].as_u64().and_then(|p| u16::try_from(p).ok()).ok_or_else(|| {
-                Error::BadArgs(format!(
-                    "{project} is open in {} {}, which agents can't join (no control port)",
-                    h["kind"].as_str().unwrap_or("a process"),
-                    h["pid"]
-                ))
-            })?
-        }
-        other => return Err(Error::BadArgs(format!("`join` is a port or a project path, not {other}"))),
-    };
+    let port = crate::host_join::select_port(&list, join)?;
     // Leaving a headless project: never drop unsaved work.
     if let Some(s) = b.session()
         && s.is_dirty()
@@ -853,18 +1054,29 @@ fn hosts(b: &mut Backend, a: &Value) -> Result<Reply> {
     let mut next = Backend::bridge(&port.to_string())?;
     next.set_client(Some(b.client().map(str::to_string).unwrap_or_else(|| format!("mcp-{}", std::process::id()))));
     let summary = next.exec("project.summary", json!({}))?;
+    next.set_expected_revision(summary.get("revision").and_then(Value::as_u64));
+    let state = next.exec("editor.state", json!({}))?;
+    next.set_expected_revision(None);
+    crate::host_join::verify_connected_path(join, &state)?;
     let client = next.client().map(str::to_string);
+    let mut identity_source = state.clone();
+    identity_source["path"] = state["projectPath"].clone();
     *b = next;
-    json_reply(json!({"joined": port, "client": client, "project": summary}))
+    let context = crate::host_join::identity(Some(port), &json!({"kind": b.mode()}), &identity_source, client.as_deref());
+    json_reply(json!({"joined": port, "client": client, "project": summary, "context": context}))
 }
 
 fn save_project(b: &mut Backend, a: &Value) -> Result<Reply> {
-    match get(a, "path") {
-        Some(p) => b.exec("file.saveAs", json!({"path": p}))?,
+    let saved = match get(a, "path") {
+        Some(path) => b.exec("file.saveAs", json!({"path":path}))?,
         None => b.exec("file.save", json!({}))?,
     };
-    let s = b.exec("project.summary", json!({}))?;
-    json_reply(json!({"path": s["path"], "dirty": s["dirty"]}))
+    b.set_expected_revision(None);
+    if saved.get("dirty").is_some() {
+        return json_reply(saved);
+    }
+    let summary = b.exec("project.summary", json!({}))?;
+    json_reply(json!({"path":saved["path"],"dirty":summary["dirty"],"revision":summary["revision"]}))
 }
 
 fn history(b: &mut Backend, a: &Value, id: &str) -> Result<Reply> {
@@ -911,6 +1123,7 @@ fn history_tool(b: &mut Backend, a: &Value) -> Result<Reply> {
             v => json!({"index": v}),
         };
         b.exec("edit.history.goto", p)?;
+        b.set_expected_revision(None);
     }
     json_reply(b.exec("edit.history.list", json!({}))?)
 }
@@ -1175,6 +1388,18 @@ static TOOLS: &[ToolDef] = &[
             )
         },
         run: get_property,
+    },
+    ToolDef {
+        name: "get_result",
+        description: "Read an immutable retained tool result without rerunning its action. Use result_id/result_mode/result_pointer from the reply; mode page returns array rows and mode json returns exact JSON text chunks. Handles expire on eviction or session end; never retry a mutation just to recover expired output.",
+        bridge_only: false,
+        schema: || {
+            schema(
+                json!({"result_id":{"type":"string"},"pointer":{"type":"string"},"mode":{"type":"string","enum":["page","json"]},"offset":offset_s(),"limit":limit_s("items or bytes",100),"max_chars":max_chars_s()}),
+                &["result_id"],
+            )
+        },
+        run: get_result,
     },
     ToolDef {
         name: "get_field",
@@ -1716,7 +1941,10 @@ static TOOLS: &[ToolDef] = &[
 fn doc_inspect(b: &mut Backend, a: &Value) -> Result<Reply> {
     let mut project = b.exec("project.summary", json!({}))?;
     let revision = project["revision"].clone();
-    let comp_id = project["activeComp"].clone();
+    let comp_id = project.get("activeComp").cloned().ok_or_else(|| Error::App("project.summary omitted activeComp; inspection is incomplete".into()))?;
+    if !comp_id.is_null() && !comp_id.is_u64() {
+        return Err(Error::App("project.summary returned an invalid activeComp; inspection is incomplete".into()));
+    }
     let unbounded = get(a, "full").and_then(Value::as_bool) == Some(true) && !crate::compact::Page::requested(a);
     let mut comp_args = a.clone();
     let budget = crate::compact::budget(a)?;
@@ -1765,25 +1993,25 @@ fn prefix_field_pointers(value: &mut Value, prefix: &str, depth: usize) {
 }
 
 fn command_batch(b: &mut Backend, a: &Value) -> Result<Reply> {
-    let steps = need(a, "steps")?.as_array().ok_or_else(|| Error::BadArgs("steps must be an array".into()))?;
-    let stop = get(a, "stop_on_error").and_then(Value::as_bool).unwrap_or(true);
-    let mut results = Vec::new();
-    let (mut completed, mut failed) = (0, 0);
-    for step in steps {
-        match execute_command(b, step) {
-            Ok(Reply::Json(result)) => {
-                completed += 1;
-                results.push(json!({"ok": true, "result": result}));
-            }
-            Ok(Reply::Image { .. }) => return Err(Error::Other("unexpected command image".into())),
-            Err(e) => {
-                failed += 1;
-                results.push(json!({"ok": false, "error": e.to_string()}));
-                if stop {
-                    break;
-                }
-            }
+    let input = need(a, "steps")?.as_array().ok_or_else(|| Error::BadArgs("steps must be an array".into()))?;
+    if input.len() > 1024 {
+        return Err(Error::BadArgs("at most 1024 commands per call".into()));
+    }
+    let mut steps = Vec::with_capacity(input.len());
+    for step in input {
+        let command =
+            get(step, "command").or_else(|| get(step, "id")).and_then(Value::as_str).ok_or_else(|| Error::BadArgs("each step needs id or command".into()))?;
+        steps.push(json!({"command":command,"params":params_of(get(step,"params"))?}));
+    }
+    let done = b.exec(
+        "engine.batch",
+        json!({"steps":steps,"atomic":false,"stopOnError":get(a,"stop_on_error").and_then(Value::as_bool).unwrap_or(true),"groupUndo":false}),
+    )?;
+    let mut out = json!({"completed":done["completed"],"failed":done["failed"],"results":done["executionResults"]});
+    for key in ["appliedSteps", "files", "fileCoverage", "untrackedEffectsPossible", "rolledBack", "failedStep"] {
+        if let Some(v) = done.get(key) {
+            out[key] = v.clone();
         }
     }
-    json_reply(json!({"completed": completed, "failed": failed, "results": results}))
+    json_reply(out)
 }
