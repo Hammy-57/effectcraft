@@ -65,6 +65,7 @@ pub mod shape_stroke;
 pub mod shape_tool;
 mod stubs;
 mod styles;
+mod target_refs;
 mod text_anim;
 pub mod text_edit;
 mod three_d;
