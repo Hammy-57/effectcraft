@@ -52,6 +52,26 @@ fn effect_active(g: &PropGroup, layer: effectcraft_engine::project::LayerId, sel
     selected.iter().any(|(l, uid)| *l == layer && contains(g, *uid, 0))
 }
 
+/// Uids of the layer's effects that are selected in Effect Controls.
+fn selected_effects(app: &EffectcraftApp, layer: &Layer) -> Vec<u64> {
+    let Some(fx) = layer.effects() else { return vec![] };
+    fx.groups()
+        .filter(|g| matches!(g.kind, GroupKind::Effect { .. }) && app.session.state.selected_props.iter().any(|(l, u)| *l == layer.id && *u == g.uid))
+        .map(|g| g.uid)
+        .collect()
+}
+
+/// Select All with Effect Controls focused: every effect on the selected layer.
+pub fn select_all_effects(app: &mut EffectcraftApp) {
+    let Some(layer) = selected_layer(app) else { return };
+    let Some(fx) = layer.effects() else { return };
+    let uids: Vec<(effectcraft_engine::project::LayerId, u64)> =
+        fx.groups().filter(|g| matches!(g.kind, GroupKind::Effect { .. })).map(|g| (layer.id, g.uid)).collect();
+    if !uids.is_empty() {
+        app.session.state.selected_props = uids;
+    }
+}
+
 fn selected_layer(app: &EffectcraftApp) -> Option<std::sync::Arc<Layer>> {
     let comp = app.session.active_comp()?;
     let id = app.session.state.selected_layers.first()?;
@@ -1104,10 +1124,15 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         app.auto.add(&format!("effectControls.effect.{}.fx", g.uid), fxr, &g.name);
         let tw = Rect::from_center_size(pos2(r.min.x + 32.0, r.center().y), vec2(12.0, 12.0));
         if widgets::twirl(ui, tw, open, egui::Id::new(("ec-tw", g.uid)), &t).clicked() {
-            if open {
-                app.ui.fx_closed.insert(g.uid);
-            } else {
-                app.ui.fx_closed.remove(&g.uid);
+            // On a selected effect the chevron twirls every selected effect, as a layer's does in
+            // the timeline.
+            let targets = if selected { selected_effects(app, &layer) } else { vec![g.uid] };
+            for uid in targets {
+                if open {
+                    app.ui.fx_closed.insert(uid);
+                } else {
+                    app.ui.fx_closed.remove(&uid);
+                }
             }
         }
         app.auto.add(&format!("effectControls.effect.{}.twirl", g.uid), tw, &g.name);

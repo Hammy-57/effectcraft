@@ -35,8 +35,9 @@ struct Handle {
     /// Comp seconds / graph value of the handle end.
     t: f64,
     v: f64,
-    /// Original speed (sign is kept when dragging in the speed graph).
-    speed: f64,
+    /// The value falls through this side: the speed graph shows the speed's magnitude, and a
+    /// drag there keeps this sign.
+    negative: bool,
     /// Segment duration (layer seconds) the influence is relative to.
     dur: f64,
 }
@@ -183,7 +184,18 @@ fn curves<'a>(app: &EffectcraftApp, ctx: &egui::Context, comp: &'a Comp, ectx: &
                     let (hv, show) = if speed { (e.speed.abs(), true) } else { (k.value.components().get(d).copied().unwrap_or(0.0) + e.speed * dt, !spatial) };
                     let bezier = if out_side { k.out_interp == Interp::Bezier } else { k.in_interp == Interp::Bezier };
                     if ks && show && (bezier || speed) {
-                        handles.push(Handle { out: out_side, t: kt + dt, v: hv, speed: e.speed, dur });
+                        // A side at speed 0 has no sign of its own: it takes the direction its
+                        // segment moves, so pulling it up speeds the value the way it is going
+                        // rather than reversing it (a falling value would stop and turn back).
+                        let negative = if e.speed != 0.0 {
+                            e.speed < 0.0
+                        } else {
+                            let at = |kk: &effectcraft_engine::keyframe::Keyframe| kk.value.components().get(ed).copied().unwrap_or(0.0);
+                            let other = pr.keys.get(j).map_or(at(k), at);
+                            let (a, b) = if out_side { (at(k), other) } else { (other, at(k)) };
+                            !pr.spatial && b < a
+                        };
+                        handles.push(Handle { out: out_side, t: kt + dt, v: hv, negative, dur });
                     }
                 }
                 let v = if speed {
@@ -571,7 +583,7 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
                                     out: h2.out,
                                     key: (k2.t, k2.v),
                                     end: (h2.t, h2.v),
-                                    negative: h2.speed < 0.0,
+                                    negative: h2.negative,
                                     dur: h2.dur,
                                 })
                             })

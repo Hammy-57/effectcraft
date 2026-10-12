@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex};
 
 use effectcraft_engine::project::{Comp, ItemId, ItemKind, LayerSource, Node, Project, PropGroup};
 use effectcraft_engine::render::disk_cache::{self, DiskCache};
-use effectcraft_engine::render::{ExprHost, FootageSource, LayerCache, RenderOpts, Renderer};
+use effectcraft_engine::render::{CancellableFootage, ExprHost, FootageSource, LayerCache, RenderOpts, Renderer};
 use effectcraft_engine::time::Tick;
 use effectcraft_gpu::{DisplayFrame, Gpu};
 use rayon::prelude::*;
@@ -1128,6 +1128,21 @@ impl Frames {
         });
     }
 
+    /// The frames of `series` in flight, after dropping the queued prefetch of the same comp's
+    /// other series: the playback ladder's old rung would otherwise hold the queue (A4).
+    pub fn focus_series(&self, series: &FrameKey) -> usize {
+        if let (Ok(mut q), Ok(mut inf)) = (self.queue.lock(), self.inflight.lock()) {
+            q.jobs.retain(|j| {
+                let gone = !j.urgent && !j.disk_only && j.key.comp == series.comp && !j.key.same_series(series);
+                if gone {
+                    inf.remove(&j.key);
+                }
+                !gone
+            });
+        }
+        self.inflight.lock().map(|s| s.iter().filter(|k| k.same_series(series)).count()).unwrap_or(0)
+    }
+
     pub fn budget(&self) -> usize {
         self.cache.lock().map(|c| c.budget).unwrap_or(0)
     }
@@ -1205,7 +1220,20 @@ impl Frames {
         q.seq += 1;
         let seq = q.seq;
         let epoch = self.epoch.load(Ordering::Acquire);
-        q.jobs.push(Job { key, src: src.clone(), comp, t, opts, urgent: false, disk_only: true, seq, epoch, on_gpu: None, retry: None });
+        q.jobs.push(Job {
+            key,
+            src: src.clone(),
+            comp,
+            t,
+            opts,
+            urgent: false,
+            disk_only: true,
+            seq,
+            epoch,
+            on_gpu: None,
+            retry: None,
+            cancel: Arc::default(),
+        });
         drop(inf);
         drop(q);
         #[cfg(not(target_arch = "wasm32"))]
@@ -1244,6 +1272,15 @@ impl Frames {
             for j in q.jobs.iter_mut() {
                 j.urgent = j.key == key;
             }
+            // The comp's viewer frames of other times that are rendering are called off too: a
+            // movie seeking for each of them held the decoder the frame under the pointer
+            // waited for, so it came seconds after the pointer stopped (#329). Another revision
+            // of the same frame (a live edit) finishes, as the viewer shows it meanwhile.
+            for (k, cancel) in &q.urgent_cancels {
+                if k.comp == key.comp && k.frame != key.frame {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            }
         }
         if !inf.insert(key) {
             // Queued for the disk only: now wanted in RAM too.
@@ -1255,7 +1292,7 @@ impl Frames {
         q.seq += 1;
         let seq = q.seq;
         let epoch = self.epoch.load(Ordering::Acquire);
-        q.jobs.push(Job { key, src: src.clone(), comp, t, opts, urgent, disk_only: false, seq, epoch, on_gpu: None, retry: None });
+        q.jobs.push(Job { key, src: src.clone(), comp, t, opts, urgent, disk_only: false, seq, epoch, on_gpu: None, retry: None, cancel: Arc::default() });
         drop(inf);
         drop(q);
         #[cfg(not(target_arch = "wasm32"))]
@@ -1556,6 +1593,7 @@ impl Worker {
             q.running.insert(job.key);
             if job.urgent {
                 q.urgent_running += 1;
+                q.urgent_cancels.push((job.key, job.cancel.clone()));
             }
             job
         };
@@ -1578,9 +1616,15 @@ impl Worker {
         let ci = match from_disk {
             Some(f) => FrameImage::Cpu(Arc::new(egui::ColorImage::from_rgba_premultiplied([f.width as usize, f.height as usize], &f.rgba))),
             None => match self.render_guarded(&job, &tail) {
-                Some(Rendered::Image(ci)) => ci,
                 // On its way back from the GPU: the landing thread publishes it.
                 Some(Rendered::Landing) => return true,
+                // Called off (frames it read may be missing): not cached, and the viewer asks
+                // for it again if it still wants it.
+                _ if job.called_off() => {
+                    self.release(job.key, job.urgent);
+                    return true;
+                }
+                Some(Rendered::Image(ci)) => ci,
                 None => {
                     // Not "in progress" forever; not asked for again until the project changes.
                     self.give_up(job.key, job.urgent);
@@ -1675,6 +1719,9 @@ impl Worker {
             if urgent {
                 q.urgent_running = q.urgent_running.saturating_sub(1);
             }
+            if let Some(i) = q.urgent_cancels.iter().position(|(k, _)| *k == key) {
+                q.urgent_cancels.swap_remove(i);
+            }
             // A job that waited for memory starts now (one per finished frame).
             if q.parked > 0 && !q.jobs.is_empty() {
                 q.parked -= 1;
@@ -1698,9 +1745,17 @@ impl Worker {
     /// that started before Purge Caches, or a GPU frame whose landing failed. It keeps its key
     /// in flight, so asking for it meanwhile doesn't render it twice.
     fn requeue(&self, mut job: Job) {
+        if job.called_off() {
+            // The viewer no longer waits for it (#329).
+            self.release(job.key, job.urgent);
+            return;
+        }
         {
             let Ok(mut q) = self.queue.lock() else { return };
             q.running.remove(&job.key);
+            if let Some(i) = q.urgent_cancels.iter().position(|(k, _)| *k == job.key) {
+                q.urgent_cancels.swap_remove(i);
+            }
             if job.urgent {
                 q.urgent_running = q.urgent_running.saturating_sub(1);
                 // Only the newest viewer frame is urgent.
@@ -1721,6 +1776,7 @@ impl Worker {
         let Retry { gpu, auto, tail } = retry;
         let attempt = |f: &dyn Fn() -> Rendered| std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).ok();
         match attempt(&|| self.display_fallback(&job, &gpu, auto)).or_else(|| attempt(&|| self.render_job(&job, false, None))) {
+            _ if job.called_off() => self.release(job.key, job.urgent),
             Some(Rendered::Image(ci)) => self.publish(&job, ci, &tail, false, std::time::Duration::ZERO),
             _ => self.give_up(job.key, job.urgent),
         }
@@ -1854,7 +1910,8 @@ impl Worker {
             return None;
         }
         let g = job.src.gpu.as_ref()?;
-        let mut r = Renderer::new(&job.src.project, job.src.footage.as_ref(), job.opts);
+        let footage = job.footage();
+        let mut r = Renderer::new(&job.src.project, &footage, job.opts);
         r.expr = job.src.expr.as_deref();
         r.cache = Some(&job.src.layer_cache);
         r.accel = Some(g as &dyn effectcraft_engine::render::Accelerator);
@@ -1872,7 +1929,8 @@ impl Worker {
     /// frame can come back through the landing thread ([`Rendered::Landing`]).
     fn render_job(&self, job: &Job, gpu: bool, tail: Option<&Tail>) -> Rendered {
         let frozen = effectcraft_engine::freeze::Preview::for_comp(&job.src.project, job.comp).with_feedback(&job.src.freeze_feedback);
-        let mut r = Renderer::new(&job.src.project, job.src.footage.as_ref(), job.opts);
+        let footage = job.footage();
+        let mut r = Renderer::new(&job.src.project, &footage, job.opts);
         r.freeze = (!frozen.is_empty()).then_some(&frozen);
         r.expr = job.src.expr.as_deref();
         let gpu_allowed = gpu && frozen.is_empty() && !self.gpu_retired.load(Ordering::Acquire);
@@ -1943,6 +2001,10 @@ impl Worker {
                         if g.context().check_health().is_err() {
                             return self.render_job(job, false, None);
                         }
+                        // called off (#329): not a frame the GPU declined, and not worth a CPU render
+                        if job.called_off() {
+                            return Rendered::Image(FrameImage::Cpu(Arc::default()));
+                        }
                         if let Some((p, key)) = auto {
                             p.declined(key);
                         }
@@ -1999,6 +2061,20 @@ struct Job {
     /// A GPU frame whose landing failed, waiting in the queue to render again on the CPU
     /// ([`Worker::landed`]).
     retry: Option<Box<Retry>>,
+    /// Set when the viewer no longer waits for this frame (see [`Frames::request_urgent`]).
+    cancel: Arc<AtomicBool>,
+}
+
+impl Job {
+    /// The footage this job's render reads, called off with the job.
+    fn footage(&self) -> CancellableFootage<'_> {
+        CancellableFootage { inner: self.src.footage.as_ref(), cancel: self.cancel.clone() }
+    }
+
+    /// The viewer no longer waits for this frame.
+    fn called_off(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
 }
 
 /// What a GPU frame whose landing failed renders again with ([`Worker::render_retry`]).
@@ -2015,6 +2091,8 @@ struct Queue {
     jobs: Vec<Job>,
     running: HashSet<FrameKey>,
     urgent_running: usize,
+    /// The running viewer (urgent) frames and how to call them off.
+    urgent_cancels: Vec<(FrameKey, Arc<AtomicBool>)>,
     seq: u64,
     /// Spawns that returned because their job had to wait for memory: each finishing frame
     /// starts one again.
@@ -2290,6 +2368,7 @@ mod tests {
                 epoch: 0,
                 on_gpu: Some(true),
                 retry: None,
+                cancel: Arc::default(),
             })
             .collect();
         {
@@ -2355,6 +2434,7 @@ mod tests {
             epoch: 0,
             on_gpu: None,
             retry: None,
+            cancel: Arc::default(),
         };
         let cap = |j: &Job, retired: bool| max_running(&Job { on_gpu: Some(gpu_pick(j, retired)), ..j.clone() }, 8);
         let gpu_cap = cap(&job(Backend::Gpu), false);
@@ -2532,6 +2612,7 @@ mod tests {
             epoch: 0,
             on_gpu: None,
             retry: None,
+            cancel: Arc::default(),
         };
         let gib = 1 << 30;
         assert_eq!(max_running(&job(uhd, 1.0, gib), 16), 2);
@@ -2577,6 +2658,7 @@ mod tests {
             epoch: 0,
             on_gpu: None,
             retry: None,
+            cancel: Arc::default(),
         };
         // Admitted one by one, as the pool's threads pick them up.
         let admitted = |backend: Backend| {
@@ -2723,6 +2805,7 @@ mod tests {
             epoch: 0,
             on_gpu: None,
             retry: None,
+            cancel: Arc::default(),
         };
         let (flying, stale) = (FrameKey { frame: 1, ..key }, FrameKey { frame: 2, ..key });
         {
@@ -2786,6 +2869,7 @@ mod tests {
             epoch: 0,
             on_gpu: None,
             retry: None,
+            cancel: Arc::default(),
         });
         assert!(!q.can_start(&q.jobs[0]), "one urgent render is already in progress");
         drop(q);
@@ -2871,6 +2955,95 @@ mod tests {
         assert_eq!(f.inflight(), 0, "every queued frame rendered");
         assert!(footage.calls.load(Ordering::SeqCst) >= frames as usize);
         assert_eq!(footage.deepest.load(Ordering::SeqCst), 1, "renders nested on a waiting thread");
+    }
+
+    /// #329: scrubbing a long movie, the viewer frame of every step the pointer passed started
+    /// rendering and seeked the movie's decoder in turn; the frame under the pointer waited for
+    /// all of them. A newer viewer frame of another time calls off the one rendering, which is
+    /// not cached (its footage may be missing).
+    #[test]
+    fn a_newer_viewer_frame_calls_off_the_one_rendering() {
+        use effectcraft_engine::Session;
+        use effectcraft_engine::project::{Footage, FootageKind};
+        use effectcraft_engine::render::Image;
+        use effectcraft_engine::time::FrameRate;
+        use serde_json::json;
+        use std::cell::RefCell;
+        thread_local! {
+            static CANCEL: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
+        }
+        /// A movie whose first frames take a long seek, which a called-off read gives up.
+        #[derive(Default)]
+        struct Seeking {
+            seeking: AtomicBool,
+            called_off: AtomicBool,
+        }
+        impl FootageSource for Seeking {
+            fn cancellable(&self, cancel: &Arc<AtomicBool>, f: &mut dyn FnMut()) {
+                let prev = CANCEL.replace(Some(cancel.clone()));
+                f();
+                CANCEL.set(prev);
+            }
+            fn frame(&self, _: ItemId, _: &Footage, t: Tick) -> Option<Arc<Image>> {
+                if t < Tick::from_seconds_f64(0.25) {
+                    self.seeking.store(true, Ordering::SeqCst);
+                    for _ in 0..1000 {
+                        if CANCEL.with_borrow(|c| c.as_ref().is_some_and(|c| c.load(Ordering::SeqCst))) {
+                            self.called_off.store(true, Ordering::SeqCst);
+                            return None;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                }
+                Some(Arc::new(Image::new(4, 4)))
+            }
+        }
+        let mut s = Session::default();
+        let cid = ItemId(s.execute("comp.new", json!({"name": "A", "width": 8, "height": 8, "duration": 10})).unwrap()["comp"].as_u64().unwrap());
+        let clip = Footage {
+            kind: FootageKind::Video,
+            width: 4,
+            height: 4,
+            has_video: true,
+            frame_rate: FrameRate::FPS_30,
+            duration: Tick::from_seconds_f64(10.0),
+            ..Default::default()
+        };
+        let item = Arc::make_mut(&mut s.project).add_item("clip.mov", Default::default(), None, ItemKind::Footage(clip));
+        s.execute("layer.addItem", json!({"item": item.0})).unwrap();
+        let footage = Arc::new(Seeking::default());
+        let src = RenderSource {
+            freeze_feedback: Default::default(),
+            project: s.project.clone(),
+            footage: footage.clone(),
+            expr: None,
+            layer_cache: Arc::default(),
+            gpu: None,
+            gpu_display: false,
+            disk: None,
+        };
+        let f = Frames::default();
+        let content = f.content_of(&s.project, s.revision, cid);
+        let key = |frame| FrameKey { revision: s.revision, content, comp: cid.0, frame, scale: 1000, view: 0, opts: 0 };
+        f.request_urgent(&src, key(0), cid, Tick::ZERO, RenderOpts::default());
+        for _ in 0..1000 {
+            if footage.seeking.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(footage.seeking.load(Ordering::SeqCst), "the first frame's render reached the footage");
+        f.request_urgent(&src, key(150), cid, FrameRate::FPS_30.tick_of(150), RenderOpts::default());
+        for _ in 0..1000 {
+            if f.inflight() == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(footage.called_off.load(Ordering::SeqCst), "the superseded frame's seek ran on");
+        assert!(f.is_cached(&key(150)), "the newest frame rendered");
+        assert!(!f.is_cached(&key(0)), "a called-off frame is not cached");
+        assert_eq!(f.inflight(), 0, "released");
     }
 
     /// #284: scrubbing asks for a viewer frame at every step; a newer one drops the comp's viewer
@@ -3188,6 +3361,7 @@ mod tests {
                 epoch: 0,
                 on_gpu: None,
                 retry: None,
+                cancel: Arc::default(),
             });
         }
         f.request(&src, k(5), cid, Tick::ZERO, opts);

@@ -86,9 +86,8 @@ impl DirectorySource {
         let home = std::env::var_os("HOME").map(PathBuf::from);
         if cfg!(target_os = "macos") {
             dirs.extend(["/System/Library/Fonts", "/Library/Fonts"].map(PathBuf::from));
-            if let Some(h) = &home {
-                dirs.push(h.join("Library/Fonts"));
-            }
+            let user = std::env::var_os("USER").or_else(|| std::env::var_os("LOGNAME"));
+            dirs.extend(mac_user_font_dirs(home.as_deref().map(|h| h.as_os_str()), user.as_deref()));
         } else if cfg!(windows) {
             let win = std::env::var_os("WINDIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("C:\\Windows"));
             dirs.push(win.join("Fonts"));
@@ -105,6 +104,22 @@ impl DirectorySource {
         dirs.extend(extra_dirs(std::env::var_os("EFFECTCRAFT_FONT_DIRS").as_deref()));
         Self { dirs }
     }
+}
+
+/// The per-user font folders on macOS: `$HOME/Library/Fonts` and the login account's own
+/// `/Users/<user>/Library/Fonts`. macOS registers the account's fonts whatever `HOME` says, so a
+/// CLI or agent started with a redirected `HOME` must still see them; otherwise a font installed
+/// for the user (SF Pro Display, say) falls back to Inter headless and every text measurement
+/// (`sourceRectAtTime`, layout, renders) differs from the app's.
+fn mac_user_font_dirs(home: Option<&std::ffi::OsStr>, user: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = home.filter(|h| !h.is_empty()).map(|h| PathBuf::from(h).join("Library/Fonts")).into_iter().collect();
+    if let Some(u) = user.filter(|u| !u.is_empty() && !u.to_string_lossy().contains('/')) {
+        let account = PathBuf::from("/Users").join(u).join("Library/Fonts");
+        if !out.contains(&account) {
+            out.push(account);
+        }
+    }
+    out
 }
 
 /// Extra font folders from `EFFECTCRAFT_FONT_DIRS` (a path list, `:`-separated, `;` on Windows), so a
@@ -991,6 +1006,21 @@ mod tests {
         let v = std::env::join_paths(["/a/fonts", "/b/more"]).unwrap_or_default();
         assert_eq!(extra_dirs(Some(&v)), vec![PathBuf::from("/a/fonts"), PathBuf::from("/b/more")]);
         assert!(extra_dirs(Some(std::ffi::OsStr::new(""))).is_empty());
+    }
+
+    #[test]
+    fn mac_user_fonts_include_the_login_account_when_home_is_redirected() {
+        let os = |s: &'static str| Some(std::ffi::OsStr::new(s));
+        let lib = |s: &str| PathBuf::from(s).join("Library/Fonts");
+        // An agent shell with HOME pointed elsewhere still sees the account's installed fonts.
+        assert_eq!(mac_user_font_dirs(os("/tmp/agent-home"), os("elias")), vec![lib("/tmp/agent-home"), lib("/Users/elias")]);
+        // The normal case lists the folder once.
+        assert_eq!(mac_user_font_dirs(os("/Users/elias"), os("elias")), vec![lib("/Users/elias")]);
+        assert_eq!(mac_user_font_dirs(None, os("elias")), vec![lib("/Users/elias")]);
+        assert_eq!(mac_user_font_dirs(os("/Users/elias"), None), vec![lib("/Users/elias")]);
+        // Empty or path-like user names add nothing.
+        assert_eq!(mac_user_font_dirs(os(""), os("")), Vec::<PathBuf>::new());
+        assert_eq!(mac_user_font_dirs(None, os("../root")), Vec::<PathBuf>::new());
     }
 
     #[test]

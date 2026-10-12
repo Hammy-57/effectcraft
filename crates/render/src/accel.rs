@@ -398,7 +398,7 @@ impl<'a> Renderer<'a> {
         let mut foot = self.source(ctx, layer)?;
         let _ = masks::apply(ctx, layer, &mut foot, self.mask_blur(ctx, layer));
         let foot = Arc::new(foot);
-        if let (Some(c), Some(k)) = (self.cache, key) {
+        if let (Some(c), Some(k)) = (self.cache_to_keep(), key) {
             c.insert(k, foot.clone());
         }
         Some(foot)

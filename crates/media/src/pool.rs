@@ -393,6 +393,10 @@ struct Inner {
     /// audio is read from the decoder instead of trying again on every read.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     conform_failed: Mutex<HashSet<std::path::PathBuf>>,
+    /// Movies that failed to open or decode: path to (a readable reason, whether it is a decoder
+    /// problem rather than an I/O one; see [`FootageSource::problem`]). The first failure of a
+    /// file is logged, later ones are not (#886).
+    problems: Mutex<HashMap<Arc<str>, (String, bool)>>,
 }
 
 /// Decodes footage for the renderer: stills, image sequences and movies (FilmCraft codecs), plus
@@ -469,6 +473,7 @@ impl MediaPool {
                 ahead_pool: OnceLock::new(),
                 conforming: Mutex::default(),
                 conform_failed: Mutex::default(),
+                problems: Mutex::default(),
             }),
         }
     }
@@ -518,6 +523,7 @@ impl MediaPool {
     pub fn clear(&self) {
         self.clear_frames();
         lock(&self.inner.sources).map.clear();
+        lock(&self.inner.problems).clear();
     }
 
     /// Movie and audio files open now.
@@ -542,6 +548,7 @@ impl MediaPool {
         lock(&self.inner.models).remove(path);
         lock(&self.inner.psds).remove(path);
         lock(&self.inner.gifs).remove(path);
+        lock(&self.inner.problems).remove(path);
         let mut c = lock(&self.inner.cache);
         let keys: Vec<Key> = c.lru.map.keys().filter(|k| &*k.path == path).cloned().collect();
         for k in keys {
@@ -797,7 +804,7 @@ impl Inner {
                         Some(s)
                     }
                     Err(e) => {
-                        log::warn!("media: cannot open {path}: {e}");
+                        self.note_problem(path, "", &e);
                         None
                     }
                 }
@@ -814,6 +821,23 @@ impl Inner {
             sources.trim(path);
         }
         src
+    }
+
+    /// Remember why the movie at `path` shows no picture (`codec` is the footage's, when known)
+    /// and log it the first time: a decoder problem replaces an I/O one (a file that can't be
+    /// opened reads as "cannot open" on every frame after the first, more telling, error).
+    fn note_problem(&self, path: &Arc<str>, codec: &str, e: &MediaError) {
+        let decoder = !matches!(e, MediaError::Io(_) | MediaError::Cancelled);
+        if matches!(e, MediaError::Cancelled) {
+            return;
+        }
+        let mut p = lock(&self.problems);
+        if p.get(path).is_some_and(|(_, d)| *d || !decoder) {
+            return;
+        }
+        let reason = if decoder { describe_problem(codec, e) } else { e.to_string() };
+        log::warn!("media: {path}: {reason}");
+        p.insert(path.clone(), (reason, decoder));
     }
 
     /// The source of `path` when it is open already.
@@ -1002,7 +1026,9 @@ impl Inner {
         });
         let jump = raw < a.next.saturating_sub(SEQ_SLACK) || raw >= a.until;
         if !same_stream(&a.stream, key) || a.footage != *footage || a.preview != preview || a.runner.is_none() || jump {
-            // another stream of the file, a stopped runner or a jump: start over after this frame
+            // another stream of the file, a stopped runner or a jump: start over after this frame,
+            // with a window from here (keeping the old far end after a backward jump or a loop
+            // wrap decoded the whole clip past the window and the memory budget)
             if !same_stream(&a.stream, key) {
                 a.frame_bytes = estimate;
             }
@@ -1010,6 +1036,7 @@ impl Inner {
             a.preview = preview;
             a.stream = Key { frame: 0, ..key.clone() };
             a.next = raw.saturating_add(1);
+            a.until = until;
         }
         a.until = a.until.max(until).min(total);
         if a.runner.is_some() || a.next >= a.until || running >= MAX_RUNNERS {
@@ -1269,6 +1296,16 @@ impl FootageSource for MediaPool {
     fn cache_budget(&self) -> Option<usize> {
         Some(self.budget())
     }
+    /// A movie's decoder gives up on a seek (before it, and between samples while it decodes
+    /// forward from the keyframe) once `cancel` is set: a scrub's superseded frames no longer
+    /// hold the decoder the frame under the pointer waits for (#329).
+    fn cancellable(&self, cancel: &Arc<AtomicBool>, f: &mut dyn FnMut()) {
+        // (a panic in `f` leaves no stale flag on this thread for its later reads)
+        let r = filmcraft_media::cancel::with_cancel(cancel, || std::panic::catch_unwind(std::panic::AssertUnwindSafe(&mut *f)));
+        if let Err(p) = r {
+            std::panic::resume_unwind(p);
+        }
+    }
     fn frame(&self, _item: ItemId, footage: &Footage, t: Tick) -> Option<Arc<Image>> {
         self.pixels(footage, t, None).map(|px| px.image())
     }
@@ -1278,6 +1315,13 @@ impl FootageSource for MediaPool {
     fn preview_frame(&self, _item: ItemId, footage: &Footage, t: Tick, w: u32, h: u32, scale: f64) -> Option<FootageFrame> {
         let px = self.pixels(footage, t, Some(Preview { w, h, s: scale }))?;
         Some(FootageFrame { preview: matches!(px, Pixels::Preview(_)), px: px.shared() })
+    }
+
+    fn problem(&self, footage: &Footage) -> Option<String> {
+        if footage.missing || footage.kind != FootageKind::Video {
+            return None;
+        }
+        lock(&self.inner.problems).get(footage.path.as_str()).filter(|(_, decoder)| *decoder).map(|(why, _)| why.clone())
     }
 
     fn vector_frame(&self, _item: ItemId, footage: &Footage, scale: f64) -> Option<Arc<Image>> {
@@ -1349,6 +1393,13 @@ impl MediaPool {
         }
         match Inner::pixels_at(&self.inner, footage, t, true, preview) {
             Ok(px) => Some(px),
+            // nobody wants the frame any more (`cancellable`): not an error
+            Err(MediaError::Cancelled) => None,
+            // a movie's failure is logged once per file (#886), a still's each time it is read
+            Err(e) if footage.kind == FootageKind::Video => {
+                self.inner.note_problem(&Arc::from(footage.path.as_str()), &footage.codec, &e);
+                None
+            }
             Err(e) => {
                 log::warn!("media: frame of {} at {:?}: {e}", footage.path, t);
                 None
@@ -1374,6 +1425,23 @@ fn read_stereo(src: &SharedSource, s0: i64, frames: usize, rate: u32) -> std::re
         *o1 = *b;
     }
     Ok(out)
+}
+
+/// The one-line reason a movie shows no picture: its `codec` (the probe's, e.g. "H.264 (High
+/// 4:2:2)") and what the decoder said, without the error wrappers it passed through.
+fn describe_problem(codec: &str, e: &MediaError) -> String {
+    let s = match e {
+        MediaError::Io(s) | MediaError::Unsupported(s) | MediaError::Decode(s) => s.as_str(),
+        MediaError::Cancelled => "cancelled",
+    };
+    let mut detail = s;
+    let mut unsupported = matches!(e, MediaError::Unsupported(_));
+    while let Some(rest) = ["decode error: ", "unsupported media: ", "unsupported: ", "I/O error: "].iter().find_map(|p| detail.strip_prefix(p)) {
+        unsupported |= detail.starts_with("unsupported");
+        detail = rest;
+    }
+    let what = if codec.is_empty() { "This video" } else { codec };
+    if unsupported { format!("{what} isn't supported by the built-in decoder: {detail}") } else { format!("{what} can't be decoded: {detail}") }
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -1610,6 +1678,31 @@ mod tests {
         for i in 2..n {
             assert_eq!(pool.inner.frame_at(&footage, at(i), true).unwrap().data, want[i as usize].data, "frame {i}");
         }
+    }
+
+    /// A6: after a backward jump (or a loop wrap) the decode-ahead window starts over from the
+    /// new position: it kept its old far end, so the runner decoded everything in between (the
+    /// whole clip on a wrap), past [`MAX_AHEAD`] and the memory budget.
+    #[test]
+    fn decode_ahead_window_shrinks_after_a_backward_jump() {
+        let n = 160;
+        let bytes: Arc<[u8]> = prores_movie(16, 16, n).into();
+        let path = "/mem/jump.mov";
+        let footage = crate::probe::probe_bytes(path, bytes.clone()).unwrap();
+        let at = |i: u32| footage.frame_rate.tick_of(i64::from(i)) + Tick(footage.frame_rate.frame_duration().0 / 2);
+        let pool = MediaPool::new();
+        pool.add_bytes(path, bytes);
+        let until = |pool: &MediaPool| lock(&pool.inner.cache).ahead.get(path).map(|a| a.until);
+        for i in [120, 121] {
+            pool.inner.frame_at(&footage, at(i), true).unwrap();
+        }
+        assert!(until(&pool).is_some_and(|u| u > 121), "decoding ahead of frame 121: {:?}", until(&pool));
+        // a loop wrap / backward jump to the start, then reading on in order
+        for i in [2, 3] {
+            pool.inner.frame_at(&footage, at(i), true).unwrap();
+        }
+        let u = until(&pool).unwrap();
+        assert!(u <= 4 + MAX_AHEAD, "the window ends at {u}, not near frame 3");
     }
 
     #[test]

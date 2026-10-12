@@ -126,6 +126,37 @@ fn prefetch_waits_while_edits_keep_coming() {
     assert!(h.state().frames.cached_frames(&series).len() > 1, "prefetch resumed");
 }
 
+/// Paused on a comp whose frames take seconds, nothing renders ahead: a background frame can't be
+/// stopped, so the frame the user moved to next waited behind it (a "wall" of a few seconds).
+/// Fast frames still prefetch.
+#[test]
+fn slow_frames_stop_paused_prefetch() {
+    let mut s = Session::default();
+    let c = s.execute("comp.new", json!({"name": "Slow", "width": 64, "height": 36, "duration": 2})).unwrap()["comp"].as_u64().unwrap();
+    s.execute("layer.newSolid", json!({"color": "#3080ff"})).unwrap();
+    let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(|_| EffectcraftApp::new(s));
+    settle(&mut h);
+    let series = h.state().shown_series(ItemId(c));
+    h.state().frames.clear();
+    // Every frame takes 2 s (set before each UI frame, as the fast test render replaces it).
+    let slow_step = |h: &mut Harness<'_, EffectcraftApp>, ms: f64| {
+        if let Ok(mut v) = h.state().frames.last_ms.lock() {
+            *v = ms;
+        }
+        h.step();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    for _ in 0..60 {
+        slow_step(&mut h, 2000.0);
+    }
+    assert_eq!(h.state().frames.cached_frames(&series), vec![0], "only the frame on screen");
+    for _ in 0..20 {
+        slow_step(&mut h, 5.0);
+    }
+    settle(&mut h);
+    assert!(h.state().frames.cached_frames(&series).len() > 1, "fast frames prefetch again");
+}
+
 /// #595: at Third (and other resolutions that aren't a whole number of thousandths) the cache
 /// bars find the rendered frames. The series they count was rebuilt from the frame key's scale
 /// (333 → 0.333), whose render options hashed apart from the frames rendered at 0.3333….
