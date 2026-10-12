@@ -326,7 +326,11 @@ impl std::io::Write for JsonWindow {
 /// Exact JSON-text chunks for `get_field`. Offsets and totals are UTF-8 byte positions.
 /// The caller reruns the source query (with a revision guard) before resolving `pointer`.
 pub(crate) fn field_chunk(source: &Value, pointer: &str, a: &Value) -> Result<Value> {
-    let max_chars = budget(a)?;
+    field_chunk_with_budget(source, pointer, a, budget(a)?)
+}
+
+/// Internal callers reserve space for their own identity/status metadata.
+pub(crate) fn field_chunk_with_budget(source: &Value, pointer: &str, a: &Value, max_chars: usize) -> Result<Value> {
     let page = Page::from_args(a, DEFAULT_MAX_CHARS / 2)?;
     if string_len(pointer, max_chars).is_none() {
         return Err(Error::BadArgs("`max_chars` cannot fit the JSON pointer; fetch an ancestor field instead".into()));
@@ -552,6 +556,50 @@ pub(crate) fn flat_reply(r: &mut Value, props: Vec<Value>, a: &Value) -> Result<
     let page = Page::from_args(a, FLAT_LIMIT)?;
     put_page(r, "properties", props, page, "total", budget(a)?)?;
     Ok(())
+}
+
+/// Borrow first, clone only values proven small enough for the reply budget.
+pub(crate) fn bounded_from_ref(value: &Value, pointer: &str, cap: usize) -> Result<Value> {
+    fn fit(value: &Value, pointer: &str, cap: usize, depth: usize) -> Result<Value> {
+        if json_len(value, cap, depth).is_some() {
+            return Ok(value.clone());
+        }
+        let replacement = omitted(pointer);
+        let replacement_len = json_len(&replacement, cap, 0).ok_or_else(|| Error::BadArgs("reply budget cannot fit a field reference".into()))?;
+        if depth < MAX_DEPTH
+            && let Value::Object(fields) = value
+        {
+            let mut fixed = 2usize;
+            for (i, key) in fields.keys().enumerate() {
+                let Some(len) = string_len(key, cap) else {
+                    return Ok(replacement);
+                };
+                fixed = fixed.saturating_add(len).saturating_add(1 + usize::from(i > 0));
+            }
+            let share = cap.saturating_sub(fixed).checked_div(fields.len()).unwrap_or(0);
+            if share >= replacement_len {
+                let mut out = Map::new();
+                for (key, child) in fields {
+                    let Ok(child) = fit(child, &child_pointer(pointer, key), share, depth + 1) else {
+                        return Ok(replacement);
+                    };
+                    out.insert(key.clone(), child);
+                }
+                return Ok(Value::Object(out));
+            }
+        }
+        Ok(replacement)
+    }
+    fit(value, pointer, cap, 0)
+}
+
+/// Bounded depth for retained source JSON; property groups add array/object nesting.
+pub(crate) fn source_json_len(value: &Value) -> Result<usize> {
+    json_len_with_depth(value, usize::MAX, 0, MAX_FIELD_DEPTH).ok_or_else(|| Error::BadArgs("result exceeds the supported JSON depth or byte count".into()))
+}
+
+pub(crate) fn fits_budget(value: &Value, cap: usize) -> bool {
+    json_len(value, cap, 0).is_some()
 }
 
 #[cfg(test)]

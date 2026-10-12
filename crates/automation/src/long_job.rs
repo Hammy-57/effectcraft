@@ -160,6 +160,11 @@ pub fn long_call(bridge: bool, msg: &Value) -> Option<LongCall> {
     Some(LongCall { id: id.clone(), tool: name.to_string(), args, token, modern: crate::server::is_modern(p), what })
 }
 
+/// Explicit engine client overrides the tool default, matching Backend::with_client.
+fn command_client(call: &LongCall) -> Option<&Value> {
+    call.args.pointer("/params/client").filter(|value| !value.is_null()).or_else(|| call.args.get("client"))
+}
+
 /// The server's input: stdin lines (read on their own thread) and the requests waiting in line.
 pub(crate) struct Inbox {
     rx: Receiver<Option<String>>,
@@ -317,16 +322,75 @@ struct Poll {
 }
 
 impl McpServer {
-    fn exec_json(&mut self, command: &str, params: Value) -> Result<Value> {
-        match self.guarded("command_run", &json!({"id": command, "params": params}))? {
+    /// A poll is scoped to the starting caller, but must not reuse its pre-edit revision.
+    fn exec_json(&mut self, call: &LongCall, command: &str, mut params: Value) -> Result<Value> {
+        if let Some(fields) = params.as_object_mut() {
+            fields.remove("expectRevision");
+        }
+        let mut args = json!({"id": command, "params": params, "full": true});
+        if let Some(client) = command_client(call) {
+            args["client"] = client.clone();
+        }
+        match self.guarded("command_run", &args)? {
             Reply::Json(v) => Ok(v),
             Reply::Image { .. } => Err(Error::Other("unexpected image".into())),
         }
     }
 
+    /// The original arguments carry the one precondition, checked at the actual start.
+    fn start_json(&mut self, call: &LongCall, command: &str, params: Value) -> Result<Value> {
+        let mut args = call.args.clone();
+        if let Some(fields) = args.as_object_mut() {
+            for field in ["command", "offset", "limit", "max_chars", "request_id", "requestId"] {
+                fields.remove(field);
+            }
+        }
+        args["id"] = json!(command);
+        args["params"] = params;
+        args["full"] = json!(true);
+        if let Some(client) = command_client(call) {
+            args["client"] = client.clone();
+        }
+        match self.guarded("command_run", &args)? {
+            Reply::Json(v) => Ok(v),
+            Reply::Image { .. } => Err(Error::Other("unexpected image".into())),
+        }
+    }
+
+    fn completed_context(&mut self, call: &LongCall) -> Result<Value> {
+        let client = command_client(call).and_then(Value::as_str).map(|client| (!client.is_empty()).then(|| client.to_string()));
+        let backend = self.backend();
+        let previous = client.map(|client| backend.set_client(client));
+        let context = backend.observed_context();
+        if let Some(previous) = previous {
+            backend.set_client(previous);
+        }
+        context
+    }
+
     /// Reply to `call` with `r` (the same post-processing as any tool call).
-    fn reply(&mut self, call: &LongCall, r: Result<Reply>, out: &mut impl Write) -> std::io::Result<()> {
+    fn reply(&mut self, call: &LongCall, mut r: Result<Reply>, out: &mut impl Write) -> std::io::Result<()> {
+        if matches!(call.what, What::Command { .. })
+            && let Ok(Reply::Json(value)) = &mut r
+            && let Some(fields) = value.as_object_mut()
+        {
+            match self.completed_context(call) {
+                Ok(context) => {
+                    fields.insert("observedContext".into(), context);
+                }
+                Err(error) => {
+                    if let Some(context) = fields.remove("observedContext") {
+                        fields.insert("contextAtStart".into(), context);
+                    }
+                    fields.insert(
+                        "contextWarning".into(),
+                        json!(format!("operation already finished; could not observe final session: {error}; inspect before retrying")),
+                    );
+                }
+            }
+        }
         let structured = call.modern || self.structured(&json!({}));
+        let r = r.and_then(|reply| self.backend().finish_reply(&call.tool, &call.args, reply));
         let mut result = self.finish_call(&call.tool, r, structured);
         if call.modern {
             result["resultType"] = json!("complete");
@@ -336,7 +400,11 @@ impl McpServer {
     }
 
     /// Run a long call to its end or cancellation, handling the other input meanwhile.
-    pub(crate) fn run_long(&mut self, call: LongCall, inbox: &mut Inbox, out: &mut impl Write) -> std::io::Result<()> {
+    pub(crate) fn run_long(&mut self, mut call: LongCall, inbox: &mut Inbox, out: &mut impl Write) -> std::io::Result<()> {
+        // Pin an inherited cursor before interleaved requests can change backend defaults.
+        if call.args.get("client").is_none_or(Value::is_null) {
+            call.args["client"] = json!(self.backend().client().unwrap_or(""));
+        }
         match &call.what {
             What::Script => self.run_script(&call, inbox, out),
             What::Command { spec, params } => self.run_job(&call, spec, params.clone(), inbox, out),
@@ -344,17 +412,31 @@ impl McpServer {
     }
 
     fn run_job(&mut self, call: &LongCall, spec: &Spec, mut params: Value, inbox: &mut Inbox, out: &mut impl Write) -> std::io::Result<()> {
+        if let Err(error) = crate::compact::budget(&call.args).and_then(|_| crate::compact::Page::from_args(&call.args, 100)) {
+            return self.reply(call, Err(error), out);
+        }
         let bridge = self.backend().is_bridge();
         // The comp the command acts on (the status query names it: the active comp may change).
         let comp = match spec.finish {
-            Finish::Status(_) => self.exec_json("comp.info", params.get("comp").map(|c| json!({"comp": c})).unwrap_or(json!({}))).ok().map(|c| c["id"].clone()),
+            Finish::Status(_) => {
+                self.exec_json(call, "comp.info", params.get("comp").map(|c| json!({"comp": c})).unwrap_or(json!({}))).ok().map(|c| c["id"].clone())
+            }
             _ => None,
         };
         let start = match spec.job {
-            Job::Tasks => Ok(json!({})),
+            Job::Tasks => {
+                let mut check = json!({});
+                if let Some(revision) = params.get("expectRevision") {
+                    check["expectRevision"] = revision.clone();
+                }
+                if let Some(client) = params.get("client") {
+                    check["client"] = client.clone();
+                }
+                self.start_json(call, "jobs.list", check)
+            }
             _ => {
                 params["wait"] = json!(false);
-                self.exec_json(spec.command, params)
+                self.start_json(call, spec.command, params)
             }
         };
         let start = match start {
@@ -373,7 +455,7 @@ impl McpServer {
         let mut cancelled = false;
         let mut failure = None;
         loop {
-            let poll = match self.poll_job(spec.job, &ids, &items, &mut meter, &mut seen_tasks) {
+            let poll = match self.poll_job(call, spec.job, &ids, &items, &mut meter, &mut seen_tasks) {
                 Ok(p) => p,
                 Err(e) => {
                     failure = Some(e);
@@ -395,7 +477,7 @@ impl McpServer {
                     }
                     let cancel: Vec<String> = if matches!(spec.job, Job::Render) { vec!["render".into()] } else { ids.clone() };
                     for job in cancel {
-                        let _ = self.exec_json("jobs.cancel", json!({"job": job}));
+                        let _ = self.exec_json(call, "jobs.cancel", json!({"job": job}));
                     }
                 }
                 Seen::Cancel | Seen::Done => {}
@@ -424,13 +506,13 @@ impl McpServer {
     }
 
     /// Where the watched jobs stand (headless: after bringing every job up to date).
-    fn poll_job(&mut self, job: Job, ids: &[String], items: &[u64], meter: &mut Meter, seen_tasks: &mut Vec<String>) -> Result<Poll> {
+    fn poll_job(&mut self, call: &LongCall, job: Job, ids: &[String], items: &[u64], meter: &mut Meter, seen_tasks: &mut Vec<String>) -> Result<Poll> {
         if let Some(s) = self.backend().session() {
             s.poll_background();
             s.drain_events();
         }
         if let Job::Render = job {
-            let list = self.exec_json("renderQueue.list", json!({}))?;
+            let list = self.exec_json(call, "renderQueue.list", json!({}))?;
             let st = &list["progress"];
             let rendering = list["rendering"].as_bool().unwrap_or(false);
             let progress = st.as_object().filter(|_| rendering).map(|_| {
@@ -444,7 +526,7 @@ impl McpServer {
             });
             return Ok(Poll { running: rendering, progress });
         }
-        let list = self.exec_json("jobs.list", json!({}))?;
+        let list = self.exec_json(call, "jobs.list", json!({}))?;
         let running: Vec<&Value> = list["running"].as_array().map(|a| a.iter().filter(|j| j["running"] == true).collect()).unwrap_or_default();
         if let Job::Tasks = job {
             // jobs.wait: every task, counted as one unit each
@@ -498,7 +580,7 @@ impl McpServer {
         }
         match spec.finish {
             Finish::Render => {
-                let list = self.exec_json("renderQueue.list", json!({}))?;
+                let list = self.exec_json(call, "renderQueue.list", json!({}))?;
                 let mine: Vec<Value> = list["items"]
                     .as_array()
                     .cloned()
@@ -523,7 +605,7 @@ impl McpServer {
                 if let Some(c) = comp.filter(|c| !c.is_null()) {
                     p["comp"] = c;
                 }
-                let status = self.exec_json(query, p)?;
+                let status = self.exec_json(call, query, p)?;
                 let mut v = start.clone();
                 if let (Some(o), Some(st)) = (v.as_object_mut(), status.as_object()) {
                     for (k, x) in o.iter_mut() {
@@ -537,7 +619,7 @@ impl McpServer {
             }
             Finish::Task => {
                 let Some(job) = start["job"].as_str() else { return Ok(start.clone()) };
-                let list = self.exec_json("jobs.list", json!({}))?;
+                let list = self.exec_json(call, "jobs.list", json!({}))?;
                 let rec = list["finished"].as_array().and_then(|a| a.iter().rev().find(|r| r["id"] == job)).cloned();
                 match rec {
                     Some(r) if r["status"] == "done" => Ok(r["result"].clone()),
@@ -548,7 +630,7 @@ impl McpServer {
                     None => Err(Error::Other(format!("{job} ended without a result (it was stopped)"))),
                 }
             }
-            Finish::Rerun => self.exec_json(spec.command, call.args.get("params").cloned().unwrap_or(json!({}))),
+            Finish::Rerun => self.exec_json(call, spec.command, call.args.get("params").cloned().unwrap_or(json!({}))),
         }
     }
 
@@ -599,4 +681,154 @@ impl McpServer {
 #[cfg(test)]
 pub(crate) fn spec_commands() -> Vec<&'static str> {
     SPECS.iter().map(|s| s.command).collect()
+}
+
+#[cfg(test)]
+mod context_tests {
+    use std::sync::Mutex;
+
+    use super::*;
+    use crate::{Backend, ControlTransport};
+
+    struct State {
+        revision: u64,
+        started: bool,
+        finished: bool,
+        fail_final_context: bool,
+        calls: Vec<(String, Value)>,
+    }
+
+    struct FakeTransport(Arc<Mutex<State>>);
+
+    impl ControlTransport for FakeTransport {
+        fn call(&mut self, method: &str, params: Value) -> Result<Value> {
+            assert_eq!(method, "engine.execute");
+            let command = params["command"].as_str().unwrap();
+            let args = params["params"].clone();
+            let mut state = self.0.lock().unwrap();
+            state.calls.push((command.to_string(), args.clone()));
+            if let Some(expected) = args["expectRevision"].as_u64()
+                && expected != state.revision
+            {
+                return Err(Error::App("document changed; read it again".into()));
+            }
+            match command {
+                "track.analyze" => {
+                    assert_eq!(args["wait"], false);
+                    state.started = true;
+                    state.revision += 1;
+                    Ok(json!({"running":true,"job":"track","layer":5,"answer":42}))
+                }
+                "jobs.list" => {
+                    if state.started && !state.finished {
+                        state.finished = true;
+                        state.revision += 1; // The worker applies its result after the start.
+                    }
+                    Ok(json!({"running":[],"finished":[]}))
+                }
+                "editor.state" if state.fail_final_context && state.finished => Err(Error::Bridge("context unavailable".into())),
+                "editor.state" => {
+                    Ok(json!({"revision":state.revision,"projectPath":null,"processInstance":"test-process","sessionId":"test-session","projectEpoch":3}))
+                }
+                "project.summary" => Ok(json!({"revision":state.revision,"activeComp":null})),
+                "jobs.cancel" => Ok(json!({"cancelled":true})),
+                _ => Ok(json!({})),
+            }
+        }
+    }
+
+    fn fixture(extra: Value) -> (McpServer, LongCall, Arc<Mutex<State>>) {
+        let state = Arc::new(Mutex::new(State { revision: 10, started: false, finished: false, fail_final_context: false, calls: vec![] }));
+        let mut backend = Backend::transport(FakeTransport(state.clone()));
+        backend.set_client(Some("server-default".into()));
+        let mut server = McpServer::new(backend);
+        // Disable unrelated post-call expression inspection so transport assertions cover the job.
+        server.handle(&json!({"jsonrpc":"2.0","id":1,"method":"logging/setLevel","params":{"level":"error"}}));
+        let mut args = json!({"id":"track.analyze","params":{"wait":true},"client":"job-agent","expectRevision":10});
+        args.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        let call = long_call(true, &json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"command_run","arguments":args}})).unwrap();
+        (server, call, state)
+    }
+
+    fn run(server: &mut McpServer, call: LongCall) -> Value {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        drop(sender);
+        let mut inbox = Inbox::new(receiver);
+        let mut output = Vec::new();
+        server.run_long(call, &mut inbox, &mut output).unwrap();
+        let text = String::from_utf8(output).unwrap();
+        let replies: Vec<Value> = text.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        replies.into_iter().find(|reply| reply["id"] == 7).unwrap()["result"].clone()
+    }
+
+    fn data(reply: &Value) -> Value {
+        serde_json::from_str(reply["content"][0]["text"].as_str().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn stale_preconditions_and_invalid_delivery_options_do_not_start_jobs() {
+        let (mut server, call, state) = fixture(json!({"expectRevision":9}));
+        let reply = run(&mut server, call);
+        assert_eq!(reply["isError"], true);
+        assert!(!state.lock().unwrap().started);
+        assert_eq!(server.backend().client(), Some("server-default"));
+        for invalid in [json!({"max_chars":100}), json!({"limit":0}), json!({"offset":-1})] {
+            let (mut server, call, state) = fixture(invalid);
+            let reply = run(&mut server, call);
+            assert_eq!(reply["isError"], true);
+            let state = state.lock().unwrap();
+            assert!(!state.started);
+            assert!(state.calls.is_empty(), "delivery validation precedes even job queries: {:?}", state.calls);
+        }
+    }
+
+    #[test]
+    fn client_is_scoped_and_revision_is_checked_only_at_start() {
+        let (mut server, call, state) = fixture(json!({}));
+        let reply = run(&mut server, call);
+        assert_eq!(reply["isError"], false, "{reply}");
+        let out = data(&reply);
+        assert_eq!(out["running"], false);
+        assert_eq!(out["answer"], 42);
+        assert_eq!(out["observedContext"]["revision"], 12);
+        assert_eq!(out["observedContext"]["client"], "job-agent");
+        assert_eq!(out["observedContext"]["observedAfter"], true);
+        assert_eq!(server.backend().client(), Some("server-default"));
+        let state = state.lock().unwrap();
+        assert!(state.started && state.finished);
+        assert_eq!(state.calls.iter().filter(|(command, _)| command == "track.analyze").count(), 1);
+        for (command, params) in &state.calls {
+            assert_eq!(params["client"], "job-agent", "{command}: {params}");
+            assert_eq!(params.get("expectRevision"), (command == "track.analyze").then_some(&json!(10)), "{command}: {params}");
+        }
+    }
+
+    #[test]
+    fn cancellation_and_nested_engine_client_keep_the_starting_cursor() {
+        let (mut server, call, state) = fixture(json!({"params":{"wait":true,"client":"engine-agent"}}));
+        server.exec_json(&call, "jobs.cancel", json!({"job":"track"})).unwrap();
+        assert_eq!(state.lock().unwrap().calls[0].1["client"], "engine-agent");
+        assert_eq!(server.backend().client(), Some("server-default"));
+        let reply = run(&mut server, call);
+        assert_eq!(reply["isError"], false);
+        assert_eq!(data(&reply)["observedContext"]["client"], "engine-agent");
+        for (_, params) in &state.lock().unwrap().calls {
+            assert_eq!(params["client"], "engine-agent");
+        }
+    }
+
+    #[test]
+    fn final_context_failure_keeps_job_outcome_and_labels_start_context() {
+        let (mut server, call, state) = fixture(json!({}));
+        state.lock().unwrap().fail_final_context = true;
+        let reply = run(&mut server, call);
+        assert_eq!(reply["isError"], false, "{reply}");
+        let out = data(&reply);
+        assert_eq!(out["running"], false);
+        assert_eq!(out["answer"], 42);
+        assert!(out.get("observedContext").is_none());
+        assert_eq!(out["contextAtStart"]["revision"], 11);
+        assert!(out["contextWarning"].as_str().unwrap().contains("operation already finished"));
+        assert_eq!(server.backend().client(), Some("server-default"));
+    }
 }

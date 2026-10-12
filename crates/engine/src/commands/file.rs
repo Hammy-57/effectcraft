@@ -84,7 +84,7 @@ pub(crate) fn open(s: &mut Session, p: &Value) -> Result<Value> {
     if s.check_footage_on_open {
         crate::footage_check::start(s, None, false)?;
     }
-    let mut out = json!({"path": path, "savedBy": saved_by, "repaired": repaired});
+    let mut out = json!({"path": path, "savedBy": saved_by, "repaired": repaired, "project": super::query::summary(s, &json!({}))?});
     if let Some(h) = handover {
         out["handover"] = json!(h);
     }
@@ -123,7 +123,7 @@ fn save_to(s: &mut Session, path: &str, force: bool) -> Result<Value> {
     s.mark_saved();
     s.note_project_path(path);
     s.toast(format!("Saved {path}"));
-    Ok(json!({"path": path, "bytes": json.len()}))
+    Ok(json!({"path": path, "bytes": json.len(), "dirty": s.is_dirty(), "revision": s.revision, "sessionId": s.session_id, "projectEpoch": s.epoch}))
 }
 
 fn save(s: &mut Session, p: &Value) -> Result<Value> {

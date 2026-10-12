@@ -389,6 +389,8 @@ pub struct Session {
     pub claims: agents::Claims,
     /// Bumped whenever another project replaces this one ([`Session::replace_project`]).
     pub epoch: u64,
+    /// Identity of this in-memory session, stable across project replacement.
+    pub session_id: String,
     /// The highest `next_id` any state has reached: ids stay unique across undo / redo, so an
     /// id an agent saw is never handed to a different object later.
     pub id_floor: u64,
@@ -598,6 +600,7 @@ impl Default for Session {
             cursors: Default::default(),
             claims: Default::default(),
             epoch: 0,
+            session_id: build_info::next_session_id(),
             id_floor: 0,
             saved_revision: 0,
             path: None,

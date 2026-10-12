@@ -54,7 +54,29 @@ impl Qa {
     /// Call a tool that answers JSON; panics with the tool's message if it fails.
     pub fn tool(&mut self, name: &str, args: Value) -> Value {
         match self.try_tool(name, args.clone()) {
-            Ok(c) => serde_json::from_str(c[0]["text"].as_str().expect("text content")).expect("JSON text"),
+            Ok(c) => {
+                let value: Value = serde_json::from_str(c[0]["text"].as_str().expect("text content")).expect("JSON text");
+                // These scenarios assert complete structures. Follow the retained snapshot rather
+                // than mistaking the first bounded page for all history/templates/project items.
+                let Some(id) = value.get("result_id").and_then(Value::as_str).filter(|_| name != "get_result") else {
+                    return value;
+                };
+                let mut text = String::new();
+                let mut offset = 0u64;
+                loop {
+                    let chunks = self.try_tool("get_result", json!({"result_id":id,"mode":"json","pointer":"","offset":offset})).expect("retained result");
+                    let chunk: Value = serde_json::from_str(chunks[0]["text"].as_str().unwrap()).unwrap();
+                    text.push_str(chunk["text"].as_str().expect("exact JSON chunk"));
+                    match chunk["next_offset"].as_u64() {
+                        Some(next) => {
+                            assert!(next > offset && next <= chunk["total"].as_u64().unwrap());
+                            offset = next;
+                        }
+                        None => break,
+                    }
+                }
+                serde_json::from_str(&text).expect("complete retained JSON")
+            }
             Err(e) => panic!("{name} {args}: {e}"),
         }
     }

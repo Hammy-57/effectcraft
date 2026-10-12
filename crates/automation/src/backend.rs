@@ -25,6 +25,9 @@ pub struct Backend {
     client: Option<String>,
     /// File access confined to folders (`--automation-read-root` / `--automation-write-root`).
     confinement: Option<Confinement>,
+    expected_revision: Option<u64>,
+    results: crate::result_store::ResultStore,
+    port: Option<u16>,
 }
 
 enum Kind {
@@ -46,17 +49,55 @@ pub struct Frame {
 
 impl Backend {
     pub fn headless(session: Session) -> Self {
-        Backend { kind: Kind::Headless(Box::new(session)), client: None, confinement: None }
+        Backend { kind: Kind::Headless(Box::new(session)), client: None, confinement: None, expected_revision: None, results: Default::default(), port: None }
     }
 
     /// Bridge to the app's control channel at `addr` (`9877` or `127.0.0.1:9877`).
     pub fn bridge(addr: &str) -> Result<Self> {
-        Ok(Backend { kind: Kind::Bridge(Box::new(BridgeClient::new(addr)?)), client: None, confinement: None })
+        Ok(Backend {
+            kind: Kind::Bridge(Box::new(BridgeClient::new(addr)?)),
+            client: None,
+            confinement: None,
+            expected_revision: None,
+            results: Default::default(),
+            port: addr.rsplit(':').next().and_then(|p| p.parse().ok()),
+        })
     }
 
     /// Drive an app through any control transport (e.g. an offscreen UI in this process).
     pub fn transport(t: impl ControlTransport + 'static) -> Self {
-        Backend { kind: Kind::Bridge(Box::new(t)), client: None, confinement: None }
+        Backend { kind: Kind::Bridge(Box::new(t)), client: None, confinement: None, expected_revision: None, results: Default::default(), port: None }
+    }
+
+    /// Guard every engine call of a convenience tool. Atomic edits put all writes in one call.
+    pub(crate) fn set_expected_revision(&mut self, revision: Option<u64>) -> Option<u64> {
+        std::mem::replace(&mut self.expected_revision, revision)
+    }
+
+    pub(crate) fn finish_reply(&mut self, name: &str, args: &Value, reply: crate::tools::Reply) -> Result<crate::tools::Reply> {
+        let client = match args.get("client").and_then(Value::as_str) {
+            Some("") => None,
+            Some(client) => Some(client.to_string()),
+            None => self.client.clone(),
+        };
+        match reply {
+            crate::tools::Reply::Json(value) => self.results.finish(name, args, value, client.as_deref()).map(crate::tools::Reply::Json),
+            crate::tools::Reply::Image { png, info } => Ok(crate::tools::Reply::Image { png, info: self.results.finish(name, args, info, client.as_deref())? }),
+        }
+    }
+
+    pub(crate) fn saved_result(&self, args: &Value) -> Result<Value> {
+        self.results.fetch(args, self.client.as_deref())
+    }
+
+    /// A clearly labelled observation after a write, not a substitute for its own receipt.
+    pub(crate) fn observed_context(&mut self) -> Result<Value> {
+        let state = self.exec("editor.state", json!({}))?;
+        let mut summary = state.clone();
+        summary["path"] = state["projectPath"].clone();
+        let mut context = crate::host_join::identity(self.port, &json!({"kind": self.mode()}), &summary, self.client());
+        context["observedAfter"] = json!(true);
+        Ok(context)
     }
 
     /// Confine the files the commands run here may read and write ([`Confinement`]).
@@ -148,7 +189,13 @@ impl Backend {
 
     /// Run an engine command by id (checked against the [`Confinement`], if any).
     pub fn exec(&mut self, id: &str, params: Value) -> Result<Value> {
-        let params = self.with_client(if params.is_null() { json!({}) } else { params });
+        let mut params = self.with_client(if params.is_null() { json!({}) } else { params });
+        if let Some(revision) = self.expected_revision {
+            if params.get("expectRevision").is_some_and(|v| !v.is_null() && v.as_u64() != Some(revision)) {
+                return Err(Error::BadArgs("conflicting expectRevision values; nothing was applied".into()));
+            }
+            params["expectRevision"] = json!(revision);
+        }
         if let Some(c) = self.confinement.clone() {
             let lookup = match c.check_command(id, &params)? {
                 Some(crate::confine::Lookup::ProjectFile) => Some((crate::confine::Lookup::ProjectFile, self.run("project.summary", json!({}))?)),

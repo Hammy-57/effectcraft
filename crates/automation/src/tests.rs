@@ -744,7 +744,7 @@ fn every_engine_command_is_reachable_over_mcp() {
     for want in ["command_list", "describe_command", "command_run", "add_effect", "list_effects", "get_state", "render_preview", "get_layer", "set_property"] {
         assert!(names.contains(&want), "{want}");
     }
-    let listed = call_json(&mut s, "command_list", json!({"schemas": true}));
+    let listed = call_json(&mut s, "command_list", json!({"schemas": true,"full":true}));
     let listed: std::collections::HashMap<&str, &Value> = listed.as_array().unwrap().iter().map(|c| (c["id"].as_str().unwrap(), c)).collect();
     let specs = effectcraft_engine::command_specs();
     assert_eq!(listed.len(), specs.len());
@@ -815,7 +815,7 @@ fn add_effect_is_one_undo_step_and_all_or_nothing() {
 #[test]
 fn list_fonts_lists_families_with_styles() {
     let mut s = server();
-    let all = call_json(&mut s, "list_fonts", json!({}));
+    let all = call_json(&mut s, "list_fonts", json!({"full":true}));
     let fams = all["families"].as_array().unwrap();
     assert!(fams.iter().any(|f| f["family"] == "Inter" && f["origin"] == "bundled"), "{all}");
     // The query filters by substring: the bundled JetBrains Mono, and any installed family whose
@@ -877,6 +877,10 @@ fn agents_doc_tools_table_is_current() {
         let args = rest.split("}`").next().unwrap_or_default();
         let schema = t.input_schema();
         for prop in schema["properties"].as_object().into_iter().flat_map(|p| p.keys()) {
+            // These common options are documented once above the table.
+            if ["full", "offset", "limit", "max_chars", "expectRevision"].contains(&prop.as_str()) {
+                continue;
+            }
             if !args.split(|c: char| !(c.is_alphanumeric() || c == '_')).any(|w| w == prop) {
                 missing.push(format!("{}: argument `{prop}`", t.name));
             }
@@ -895,8 +899,12 @@ fn autosave_checkpoints_batch_and_partially_failed_tools() {
     ]);
     let reply = s.handle(&msgs).unwrap();
     assert_eq!(reply.as_array().unwrap().len(), 2);
-    let (_, failed) = call(&mut s, "add_keyframe", json!({"layer":"#1","path":"transform/opacity","keys":[{"time":0,"value":37}],"interpolation":"invalid"}));
-    assert!(failed, "the key was added, then the interpolation failed");
+    let (_, failed) = call(
+        &mut s,
+        "command_batch",
+        json!({"steps":[{"id":"prop.addKey","params":{"layer":"#1","path":"transform/opacity","time":0,"value":37}},{"id":"invalid.command"}]}),
+    );
+    assert!(failed, "a non-atomic command sequence keeps its successful first step");
     let status = autosave_status(&mut s);
     let mut recovered = server();
     call_json(&mut recovered, "open_project", json!({"path":status["latestPath"]}));
@@ -925,7 +933,7 @@ fn autosave_isolation_also_applies_to_engine_autosaves_and_preference_changes() 
     call_json(
         &mut s,
         "batch",
-        json!({"steps":[
+        json!({"atomic":false,"steps":[
             {"command":"prefs.set","params":{"values":{"autoSave.location":"custom","autoSave.folder":desktop.to_string_lossy()}}},
             {"command":"file.autoSave","params":{}}
         ]}),
@@ -996,10 +1004,10 @@ fn resources_match_tools_and_recover_after_parse_error() {
     let list = rpc(&mut s, 2, "resources/list", json!({}));
     for (uri, tool) in [("effectcraft://document", "doc_inspect"), ("effectcraft://commands", "command_list")] {
         assert!(list["resources"].as_array().unwrap().iter().any(|r| r["uri"] == uri));
-        let r = rpc(&mut s, 3, "resources/read", json!({"uri":uri}));
+        let r = rpc(&mut s, 3, "resources/read", json!({"uri":format!("{uri}?full=true")}));
         assert_eq!(r["contents"][0]["mimeType"], "application/json");
         let value: Value = serde_json::from_str(r["contents"][0]["text"].as_str().unwrap()).unwrap();
-        assert_eq!(value, call_json(&mut s, tool, json!({})));
+        assert_eq!(value, call_json(&mut s, tool, json!({"full":true})));
     }
 }
 
@@ -1559,7 +1567,16 @@ fn resource_templates_read_and_reject_bad_uris() {
     rpc(&mut s, 1, "initialize", json!({"protocolVersion": "2025-06-18"}));
     let t = rpc(&mut s, 2, "resources/templates/list", json!({}));
     let uris: Vec<&str> = t["resourceTemplates"].as_array().unwrap().iter().map(|t| t["uriTemplate"].as_str().unwrap()).collect();
-    assert_eq!(uris, ["effectcraft://comp/{comp}", "effectcraft://layer/{comp}/{layer}", "effectcraft://frame/{comp}/{time}", "effectcraft://command/{id}"]);
+    assert_eq!(
+        uris,
+        [
+            "effectcraft://comp/{comp}",
+            "effectcraft://layer/{comp}/{layer}",
+            "effectcraft://frame/{comp}/{time}",
+            "effectcraft://command/{id}",
+            "effectcraft://result/{result_id}{?pointer,mode,offset,limit,max_chars}"
+        ]
+    );
     assert!(t["resourceTemplates"][0]["title"].is_string());
 
     call_json(&mut s, "command_run", json!({"id": "comp.new", "params": {"name": "Main / Ünïcode", "width": 64, "height": 32, "duration": 2}}));
@@ -2313,10 +2330,10 @@ fn warnings_hints_and_brief_listings() {
     assert!(r["error"]["message"].as_str().unwrap().contains("did you mean `id`?"), "{r}");
 
     // Brief listings: ids and labels / names only.
-    let full = call(&mut s, "command_list", json!({})).0[0]["text"].as_str().unwrap().len();
-    let brief = call(&mut s, "command_list", json!({"brief": true})).0[0]["text"].as_str().unwrap().len();
+    let full = call(&mut s, "command_list", json!({"full":true})).0[0]["text"].as_str().unwrap().len();
+    let brief = call(&mut s, "command_list", json!({"brief": true,"full":true})).0[0]["text"].as_str().unwrap().len();
     assert!(brief * 3 < full, "{brief} vs {full}");
-    let fx = call_json(&mut s, "list_effects", json!({"brief": true}));
+    let fx = call_json(&mut s, "list_effects", json!({"brief": true,"full":true}));
     assert!(fx.as_array().unwrap().iter().all(|e| e.as_object().unwrap().len() == 2), "{fx}");
 }
 
@@ -2410,7 +2427,7 @@ fn hosts_tool_lists_and_joins_a_running_app() {
     assert_eq!(clean.backend().mode(), "bridge");
     assert_eq!(clean.backend().client(), Some(me.as_str()));
     let (c, err) = call(&mut clean, "hosts", json!({"join": "/nowhere/Nope.ecproj"}));
-    assert!(err && c[0]["text"].as_str().unwrap().contains("no running EffectCraft"), "{c:?}");
+    assert!(err && c[0]["text"].as_str().unwrap().contains("candidates"), "{c:?}");
 }
 
 /// A windowless host: two agents join one in-memory project, each claims and edits its own comp,
@@ -2582,11 +2599,11 @@ fn get_comp_is_compact_and_says_when_it_is_cut() {
     assert_eq!(p1["truncated"]["next_offset"], 50);
     assert_eq!(p1["truncated"]["total"], 110);
     assert!(p1["truncated"]["hint"].as_str().unwrap().contains("offset=50"));
-    let p3 = call_json(&mut s, "get_comp", json!({"offset": 100, "limit": 50}));
+    let p3 = call_json(&mut s, "get_comp", json!({"offset": 100, "limit": 50, "expectRevision": compact["revision"]}));
     assert_eq!((p3["returned"].clone(), p3["next_offset"].clone()), (json!(10), Value::Null));
     assert_eq!(p3["layers"][0]["index"], 101);
     assert!(p3.get("truncated").is_none());
-    let past = call_json(&mut s, "get_comp", json!({"offset": 500}));
+    let past = call_json(&mut s, "get_comp", json!({"offset": 500, "expectRevision": compact["revision"]}));
     assert_eq!((past["returned"].clone(), past["next_offset"].clone()), (json!(0), Value::Null));
     // Paged full rows.
     let pf = call_json(&mut s, "get_comp", json!({"full": true, "limit": 2}));
@@ -2644,7 +2661,7 @@ fn get_property_pages_keyframes_and_get_layer_pages_the_flat_list() {
     let k = &p["keys"][1];
     assert!(k.get("layerTime").is_none() && k.get("compTime").is_none() && k.get("in").is_none(), "{k}");
     assert_eq!(k["value"][0], 1.0 / 3.0, "values stay exact: {k}");
-    let last = call_json(&mut s, "get_property", json!({"layer": "#1", "path": "transform/position", "offset": 200}));
+    let last = call_json(&mut s, "get_property", json!({"layer": "#1", "path": "transform/position", "offset": 200, "expectRevision": p["revision"]}));
     assert_eq!((last["returned"].clone(), last["next_offset"].clone()), (json!(57), Value::Null));
     assert!(last.get("truncated").is_none());
     // `full: true`: every key, every field.
@@ -2658,7 +2675,7 @@ fn get_property_pages_keyframes_and_get_layer_pages_the_flat_list() {
     assert!(total > 5, "{flat}");
     assert_eq!((flat["returned"].clone(), flat["next_offset"].clone()), (json!(5), json!(5)));
     assert_eq!(flat["truncated"]["total"], total);
-    let rest = call_json(&mut s, "get_layer", json!({"layer": "#1", "flat": true, "offset": 5, "max_chars": 100000}));
+    let rest = call_json(&mut s, "get_layer", json!({"layer": "#1", "flat": true, "offset": 5, "max_chars": 100000, "expectRevision": flat["revision"]}));
     assert_eq!(rest["returned"].as_u64().unwrap() + 5, total);
     assert_eq!(rest["next_offset"], Value::Null);
     // The tree with 257 keys is big: it says how to get a smaller reply.
@@ -2700,10 +2717,11 @@ fn set_property_confirms_the_written_comp_time_in_both_bases() {
 #[test]
 fn bounded_pages_cover_every_layer_and_exact_field_chunks_round_trip() {
     let mut s = big_comp(110);
+    let revision = call_json(&mut s, "get_state", json!({}))["state"]["revision"].clone();
     let mut offset = 0u64;
     let mut ids = std::collections::BTreeSet::new();
     loop {
-        let (content, error) = call(&mut s, "get_comp", json!({"offset": offset}));
+        let (content, error) = call(&mut s, "get_comp", json!({"offset": offset,"expectRevision":revision}));
         assert!(!error, "{content:?}");
         let text = content[0]["text"].as_str().unwrap();
         assert!(text.len() <= 7000, "{}", text.len());
@@ -2734,7 +2752,7 @@ fn bounded_pages_cover_every_layer_and_exact_field_chunks_round_trip() {
         let page = call_json(
             &mut s,
             "get_field",
-            json!({"source": "get_property", "layer": layer, "comp": small["comp"], "time": small["time"], "path": "text/sourceText", "pointer": omitted["pointer"], "offset": offset}),
+            json!({"source": "get_property", "layer": layer, "comp": small["comp"], "time": small["time"], "path": "text/sourceText", "pointer": omitted["pointer"], "offset": offset,"expectRevision":small["revision"]}),
         );
         assert!(page.to_string().len() <= 7000);
         exact.push_str(page["text"].as_str().unwrap());
@@ -2764,4 +2782,178 @@ fn compact_key_values_can_be_written_back_without_rounding() {
         let written = call_json(&mut s, "set_property", json!({"layer":"#1","path":"transform/rotation","time":k["time"],"value":k["value"]}));
         assert_eq!(written["appliedValue"], k["value"]);
     }
+}
+
+#[test]
+fn keyframe_edits_are_atomic_and_have_one_undo_step() {
+    let mut s = big_comp(1);
+    let before = call_json(&mut s, "get_project", json!({"full":true}));
+    for args in [
+        json!({"keys":[{"time":1,"value":20},{"value":80}]}),
+        json!({"keys":[{"time":1,"value":20},{"time":2,"value":"bad"}]}),
+        json!({"keys":[{"time":1,"value":20}],"interpolation":"wrong"}),
+    ] {
+        let mut a = args;
+        a["layer"] = json!("#1");
+        a["path"] = json!("transform/opacity");
+        let (content, error) = call(&mut s, "add_keyframe", a);
+        assert!(error, "{content:?}");
+        let prop = call_json(&mut s, "get_property", json!({"layer":"#1","path":"transform/opacity"}));
+        assert_eq!(prop["keyCount"], 0);
+        assert_eq!(call_json(&mut s, "get_project", json!({"full":true}))["undo"], before["undo"]);
+    }
+    let out = call_json(
+        &mut s,
+        "add_keyframe",
+        json!({"layer":"#1","path":"transform/opacity","keys":[{"time":1.011,"value":20},{"time":2.011,"value":80}],"interpolation":"hold"}),
+    );
+    assert_eq!(out["applied"], true);
+    assert_eq!(out["rolled_back"], false);
+    assert!(out["keys"].as_array().unwrap().iter().all(|k| k["out"] == "Hold"));
+    let after = call_json(&mut s, "get_project", json!({"full":true}));
+    assert_eq!(after["undo"].as_array().unwrap().len(), before["undo"].as_array().unwrap().len() + 1);
+    call_json(&mut s, "undo", json!({}));
+    assert_eq!(call_json(&mut s, "get_property", json!({"layer":"#1","path":"transform/opacity"}))["keyCount"], 0);
+}
+
+#[test]
+fn revision_guards_reject_stale_writes_and_live_page_continuation() {
+    let mut s = big_comp(3);
+    let page = call_json(&mut s, "get_comp", json!({"limit":1}));
+    call_json(&mut s, "set_property", json!({"layer":"#1","path":"transform/opacity","value":40}));
+    for (name, args) in [
+        ("set_property", json!({"layer":"#1","path":"transform/opacity","value":80,"expectRevision":page["revision"]})),
+        ("add_keyframe", json!({"layer":"#1","path":"transform/opacity","time":1,"value":80,"expectRevision":page["revision"]})),
+        ("add_effect", json!({"layer":"#1","effect":"Gaussian Blur","expectRevision":page["revision"]})),
+        ("get_comp", json!({"offset":1,"limit":1,"expectRevision":page["revision"]})),
+        ("get_comp", json!({"offset":1,"limit":1})),
+    ] {
+        let (content, error) = call(&mut s, name, args);
+        assert!(error, "{name}: {content:?}");
+    }
+    let prop = call_json(&mut s, "get_property", json!({"layer":"#1","path":"transform/opacity"}));
+    assert_eq!(prop["value"], 40.0);
+    assert_eq!(prop["keyCount"], 0);
+    let new = call_json(&mut s, "get_comp", json!({"limit":1}));
+    assert_eq!(call_json(&mut s, "get_comp", json!({"offset":1,"limit":1,"expectRevision":new["revision"]}))["returned"], 1);
+}
+
+#[test]
+fn inspection_transport_errors_are_not_empty_compositions() {
+    struct BrokenComp;
+    impl crate::ControlTransport for BrokenComp {
+        fn call(&mut self, _: &str, params: Value) -> crate::Result<Value> {
+            match params["command"].as_str() {
+                Some("project.summary") => Ok(json!({"activeComp":1,"revision":2,"items":[]})),
+                Some("comp.info") => Err(crate::Error::Bridge("deliberately dropped read".into())),
+                _ => Ok(json!({})),
+            }
+        }
+    }
+    let mut s = McpServer::new(Backend::transport(BrokenComp));
+    let (content, error) = call(&mut s, "doc_inspect", json!({}));
+    assert!(error && content[0]["text"].as_str().unwrap().contains("dropped read"));
+    let mut empty = server();
+    assert!(call_json(&mut empty, "doc_inspect", json!({}))["activeComp"].is_null());
+}
+
+#[test]
+fn open_project_preserves_provenance_and_missing_media_warning() {
+    struct Opened;
+    impl crate::ControlTransport for Opened {
+        fn call(&mut self, _: &str, p: Value) -> crate::Result<Value> {
+            Ok(match p["command"].as_str() {
+                Some("file.open") => {
+                    json!({"path":"/project.ecproj","repaired":["fixed width"],"savedBy":"999.0.0","handover":"saved previous host","openElsewhere":[{"pid":99}],"project":{"path":"/project.ecproj","revision":7,"activeComp":1,"items":[]}})
+                }
+                Some("footage.check") => json!({"missing":2,"checked":2}),
+                _ => json!({"revision":7}),
+            })
+        }
+    }
+    let mut s = McpServer::new(Backend::transport(Opened));
+    let result = call_json(&mut s, "open_project", json!({"path":"/project.ecproj"}));
+    assert_eq!(result["repaired"], json!(["fixed width"]));
+    assert_eq!(result["savedBy"], "999.0.0");
+    assert_eq!(result["handover"], "saved previous host");
+    assert_eq!(result["openElsewhere"][0]["pid"], 99);
+    let kinds: Vec<_> = result["warnings"].as_array().unwrap().iter().map(|w| w["kind"].as_str().unwrap()).collect();
+    for kind in ["repairs", "newerVersion", "missingMedia", "openElsewhere"] {
+        assert!(kinds.contains(&kind));
+    }
+}
+
+#[test]
+fn retained_script_output_is_recovered_without_running_the_script_again() {
+    let mut session = Session::default();
+    effectcraft_script::install(&mut session);
+    let mut s = McpServer::new(Backend::headless(session));
+    let result = call_json(&mut s, "run_script", json!({"code":"app.project.items.addComp('Only once',64,64,1,1,30); 'x'.repeat(24000)"}));
+    assert!(result.to_string().len() <= 7000);
+    assert!(result["result_id"].is_string());
+    let mut exact = String::new();
+    let mut offset = 0;
+    loop {
+        let page = call_json(&mut s, "get_result", json!({"result_id":result["result_id"],"pointer":"/result","mode":"json","offset":offset}));
+        assert!(page.to_string().len() <= 7000);
+        exact.push_str(page["text"].as_str().unwrap());
+        match page["next_offset"].as_u64() {
+            Some(next) => {
+                assert!(next > offset);
+                offset = next;
+            }
+            None => break,
+        }
+    }
+    assert_eq!(serde_json::from_str::<String>(&exact).unwrap(), "x".repeat(24000));
+    let project = call_json(&mut s, "get_project", json!({"full":true}));
+    assert_eq!(project["items"].as_array().unwrap().iter().filter(|item| item["type"] == "Composition").count(), 1);
+}
+
+#[test]
+fn stale_host_discovery_does_not_replace_the_current_backend() {
+    struct Discovery {
+        port: u16,
+        path: String,
+    }
+    impl crate::ControlTransport for Discovery {
+        fn mode(&self) -> &'static str {
+            "discovery"
+        }
+        fn call(&mut self, _: &str, p: Value) -> crate::Result<Value> {
+            match p["command"].as_str() {
+                Some("hosts.list") => Ok(json!({"hosts":[{"port":self.port,"project":self.path}]})),
+                Some("project.summary") => Ok(json!({"revision":0,"activeComp":null,"path":null,"items":[]})),
+                Some("expr.errors") => Ok(json!([])),
+                other => Err(crate::Error::App(format!("unsupported discovery query: {other:?}"))),
+            }
+        }
+    }
+    let dir = autosave_test_dir("stale-host");
+    let path = dir.join("expected.ecproj");
+    std::fs::write(&path, "{}").unwrap();
+    let port = fake_app(); // Its live session does not have expected.ecproj open.
+    let mut s = McpServer::new(Backend::transport(Discovery { port, path: path.to_string_lossy().into_owned() }));
+    let (content, error) = call(&mut s, "hosts", json!({"join":path}));
+    assert!(error, "{content:?}");
+    assert_eq!(s.backend().mode(), "discovery", "a stale discovery record must not switch sessions");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn oversized_errors_keep_failure_status_and_a_bounded_recovery_handle() {
+    struct LongError;
+    impl crate::ControlTransport for LongError {
+        fn call(&mut self, _: &str, _: Value) -> crate::Result<Value> {
+            Err(crate::Error::App("bad input ".repeat(5000)))
+        }
+    }
+    let mut s = McpServer::new(Backend::transport(LongError));
+    let (content, error) = call(&mut s, "get_comp", json!({}));
+    assert!(error);
+    let text = content[0]["text"].as_str().unwrap();
+    assert!(text.len() <= 7000);
+    let value: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(value["ok"], false);
+    assert!(value["result_id"].is_string());
 }
