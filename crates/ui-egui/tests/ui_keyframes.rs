@@ -299,6 +299,29 @@ fn a_graph_handle_drag_moves_the_handles_of_every_selected_key() {
     assert!((handle(&h, 0).x - k0.x - px_per_s * 0.2).abs() < 2.0, "key 0's handle moved on screen");
 }
 
+/// A handle at speed 0 (Easy Ease) dragged up in the speed graph speeds the value the way its
+/// segment goes: on a falling segment the speed is negative. It came out positive, so the value
+/// overshot, stopped and turned back just before the key.
+#[test]
+fn a_zero_speed_handle_dragged_in_the_speed_graph_keeps_its_segments_direction() {
+    let (mut h, id, uid) = harness();
+    let s = &mut h.state_mut().session;
+    s.execute("prop.addKey", json!({"layer": id.0, "path": "transform/opacity", "time": 2.0, "value": 0.0})).unwrap();
+    s.execute("prop.select", json!({"layer": id.0, "prop": uid})).unwrap();
+    s.execute("keys.selectAll", json!({})).unwrap();
+    s.execute("keys.easyEase", json!({})).unwrap();
+    h.state_mut().ui.timeline.graph_editor = true;
+    h.state_mut().ui.timeline.graph_mode = "speed".into();
+    h.run_steps(4);
+    let e = h.state().auto.find(&format!("timeline.graph.handle.{uid}.0.1.out")).expect("key 1's out handle").clone();
+    let p = pos2(e.rect[0] + e.rect[2] / 2.0, e.rect[1] + e.rect[3] / 2.0);
+    drag(&mut h, p, p - egui::vec2(0.0, 60.0), Default::default());
+    let keys = h.state().session.active_comp().unwrap().layer(id).unwrap().props.prop("transform/opacity").unwrap().keys.clone();
+    let out = |i: usize| keys[i].out_ease.first().map_or(0.0, |e| e.speed);
+    assert!(out(1) < 0.0, "100 → 0 falls: {}", out(1));
+    assert!(out(0) > 0.0, "0 → 100 rises: {}", out(0));
+}
+
 /// Whether the key mark `id` was drawn selected in the last frame (its automation label says so).
 fn drawn_selected(h: &Harness<'_, EffectcraftApp>, id: &str) -> bool {
     let a = &h.state().auto;

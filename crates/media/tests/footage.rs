@@ -860,3 +860,105 @@ fn thumbnails_leave_no_frames_or_files_behind() {
         assert_eq!(pool.open_files(), 0, "{}: no file kept open", p.display());
     }
 }
+
+/// #329: a frame read that is called off (a scrub has moved on) gives up before the decoder
+/// seeks and decodes forward from the keyframe, so it no longer holds the decoder the newest
+/// frame waits for; the frame decodes as usual when it is wanted again.
+#[test]
+fn a_called_off_read_does_not_decode() {
+    use std::sync::atomic::AtomicBool;
+    let Some(p) = h264_mp4() else { return };
+    let f = probe(&p).expect("probe");
+    let pool = MediaPool::new();
+    let t = f.frame_rate.tick_of(45) + Tick(f.frame_rate.frame_duration().0 / 2);
+    let off = Arc::new(AtomicBool::new(true));
+    let mut got = None;
+    pool.cancellable(&off, &mut || got = Some(pool.frame(ItemId(1), &f, t)));
+    assert!(got.expect("ran").is_none(), "a called-off read decoded its frame");
+    assert_eq!(pool.stats().frames, 0, "nothing cached for it");
+    let on = Arc::new(AtomicBool::new(false));
+    let mut got = None;
+    pool.cancellable(&on, &mut || got = pool.frame(ItemId(1), &f, t));
+    let img = got.expect("decoded once wanted again");
+    assert_eq!((img.width, img.height), (1920, 1080));
+}
+
+/// #886: H.264 High 4:2:2 10-bit: the software decoder lacks it; the pool says why, once, and
+/// the footage reports it (not a black frame without a word).
+#[test]
+fn an_unsupported_stream_reports_why_it_shows_no_picture() {
+    let Some(p) = ffmpeg_fixture(
+        "h264_high422_10bit.mp4",
+        &["-f", "lavfi", "-i", "testsrc=size=320x180:rate=24:duration=1", "-c:v", "libx264", "-profile:v", "high422", "-pix_fmt", "yuv422p10le"],
+    ) else {
+        return;
+    };
+    let f = probe(&p).expect("probe");
+    let pool = MediaPool::new();
+    assert_eq!(pool.problem(&f), None, "nothing is wrong before a frame was asked for");
+    if pool.frame(ItemId(1), &f, Tick::ZERO).is_some() {
+        // a decoder that handles 4:2:2 (FilmCraft's, or a hardware one): no notice
+        assert_eq!(pool.problem(&f), None);
+        return;
+    }
+    let why = pool.problem(&f).expect("a failed frame leaves a reason");
+    assert!(why.contains("4:2:2"), "names the stream: {why}");
+    assert!(why.contains("isn't supported"), "says it is unsupported: {why}");
+    assert!(!why.contains("decode error"), "no error wrappers: {why}");
+    // it stays for the other frames, and is dropped when the file is forgotten
+    assert!(pool.frame(ItemId(1), &f, Tick::from_seconds_f64(0.5)).is_none());
+    assert_eq!(pool.problem(&f).as_deref(), Some(why.as_str()));
+    pool.forget(&f.path);
+    assert_eq!(pool.problem(&f), None);
+}
+
+/// #719: an image sequence of lossy WebP frames with alpha decodes every frame once, with its
+/// alpha, and plays from the cache after that (no endless re-caching); it caches at a speed
+/// comparable to the same frames as PNG (the WebP decoder itself is slower).
+#[test]
+fn webp_alpha_sequence_decodes_once_and_plays_from_the_cache() {
+    use rayon::prelude::*;
+    if !have_ffmpeg() {
+        return;
+    }
+    let n = 24;
+    let dir = fixtures().join(format!("webp-seq-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let src = "testsrc2=size=640x360:rate=24:duration=1,format=yuva420p,geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='if(lt(X,W/2),255,X/W*255)'";
+    for (ext, codec) in [("webp", ["-c:v", "libwebp", "-pix_fmt", "yuva420p"]), ("png", ["-c:v", "png", "-pix_fmt", "rgba"])] {
+        let st = Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", src, "-frames:v", &n.to_string()])
+            .args(codec)
+            .arg(dir.join(format!("f_%03d.{ext}")))
+            .status()
+            .expect("ffmpeg");
+        assert!(st.success(), "ffmpeg {ext}");
+    }
+    let mut times = vec![];
+    for ext in ["webp", "png"] {
+        let first = dir.join(format!("f_001.{ext}"));
+        let mut f = probe(&first).expect("probe");
+        f.kind = FootageKind::Sequence;
+        f.sequence = (1..=n).map(|i| dir.join(format!("f_{i:03}.{ext}")).to_string_lossy().to_string()).collect();
+        f.sync_sequence_duration();
+        let pool = MediaPool::new();
+        let t0 = Instant::now();
+        let frames: Vec<Arc<Image>> = (0..n as i64).into_par_iter().map(|i| pool.frame(ItemId(1), &f, t_of(f.frame_rate, i)).expect("frame")).collect();
+        times.push(t0.elapsed());
+        for (i, img) in frames.iter().enumerate() {
+            assert_eq!((img.width, img.height), (640, 360), "{ext} frame {i}");
+            assert!(img.data.iter().any(|p| p[3] < 0.5) && img.data.iter().any(|p| p[3] > 0.99), "{ext} frame {i}: its alpha");
+        }
+        let decoded = pool.stats().misses;
+        assert_eq!(decoded, n as u64, "{ext}: each frame decoded once");
+        // played again: every frame from the cache
+        for i in 0..n as i64 {
+            assert!(pool.frame(ItemId(1), &f, t_of(f.frame_rate, i)).is_some());
+        }
+        assert_eq!(pool.stats().misses, decoded, "{ext}: the second pass decodes nothing");
+        assert_eq!(pool.stats().frames, n as usize, "{ext}: every frame stays cached");
+    }
+    eprintln!("#719: {n} frames 640x360 with alpha: WebP {:?}, PNG {:?}", times[0], times[1]);
+    assert!(times[0] < times[1] * 20 + std::time::Duration::from_secs(2), "WebP caches in reasonable time: {times:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -65,6 +65,8 @@ pub fn hit(hits: &[PinHit], p: Pos2) -> Option<(PinHit, PinPart)> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct OverlayKey {
     epoch: u64,
+    /// What the solve reads: the layer's input key (source, masks and the effects before the
+    /// Puppet effect) and the Puppet parameters ([`solve_stamp`]).
     revision: u64,
     comp: u64,
     layer: u64,
@@ -180,11 +182,38 @@ fn with_live_pins(overlay: &Overlay, params: &effectcraft_engine::effects::Param
     )
 }
 
+/// A stamp of what a layer's Puppet solve reads: its input's cache key and the evaluated
+/// parameters. Keyed by the document revision instead, every selected Puppet layer solved again
+/// on every edit of any layer, and the layers took turns on the one background permit, so a
+/// pin drag waited for the other layers' identical solves (#834, #586). Without an input key
+/// (a precomp source) it falls back to the document revision.
+fn solve_stamp(app: &EffectcraftApp, eval: &EvalCtx, layer: &Layer, index: usize, params: &effectcraft_engine::effects::Params) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    match effectcraft_engine::render::cache::input_key(eval, layer, 1.0, false, false, index) {
+        Some(k) => (0u8, k).hash(&mut h),
+        None => (1u8, app.session.revision).hash(&mut h),
+    }
+    let mut values: Vec<_> = params.values.iter().collect();
+    values.sort_by(|a, b| a.0.cmp(b.0));
+    for (k, v) in values {
+        k.hash(&mut h);
+        format!("{v:?}").hash(&mut h);
+    }
+    h.finish()
+}
+
 /// The first overlay is exact. Later native poses solve asynchronously, coalescing drag edits;
 /// wasm keeps the synchronous path because there is no native worker pool.
 pub fn overlay(app: &mut EffectcraftApp, ctx: &egui::Context, cid: ItemId, layer: &Layer, t: Tick, _hold_geometry: bool) -> Option<Overlay> {
-    let fx = layer.effects()?.groups().find(|g| puppet::is_puppet(g))?;
-    let key = OverlayKey { epoch: app.session.epoch, revision: app.session.revision, comp: cid.0, layer: layer.id.0, time: t.0 };
+    let effects = layer.effects()?;
+    let index = effects.groups().position(puppet::is_puppet)?;
+    let fx = effects.groups().nth(index)?;
+    let comp = app.session.project.comp(cid)?;
+    let eval = EvalCtx { project: &app.session.project, comp_id: cid, comp, time: t, expr: app.session.expr.as_deref(), footage: None };
+    let params = effectcraft_engine::effects::flatten_params(fx, &mut |p| eval.value(layer, p));
+    let revision = solve_stamp(app, &eval, layer, index, &params);
+    let key = OverlayKey { epoch: app.session.epoch, revision, comp: cid.0, layer: layer.id.0, time: t.0 };
     let id = egui::Id::new(("puppet-overlay", cid.0, layer.id.0));
     let cached = ctx.data(|d| d.get_temp::<Cached>(id)).filter(|c| c.key.same_layer(key));
     if cached.as_ref().is_some_and(|c| c.key == key) {
@@ -220,9 +249,6 @@ pub fn overlay(app: &mut EffectcraftApp, ctx: &egui::Context, cid: ItemId, layer
                 mailbox.lock().unwrap_or_else(std::sync::PoisonError::into_inner).not_admitted();
             }
         }
-        let comp = app.session.project.comp(cid)?;
-        let eval = EvalCtx { project: &app.session.project, comp_id: cid, comp, time: t, expr: app.session.expr.as_deref(), footage: None };
-        let params = effectcraft_engine::effects::flatten_params(fx, &mut |p| eval.value(layer, p));
         return cached.map(|c| with_live_pins(&c.overlay, &params));
     }
     let (buf, params) = effectcraft_engine::commands::puppet::puppet_eval(&app.session, cid, layer.id, fx.uid, t)?;
@@ -535,5 +561,44 @@ mod async_tests {
         app.session.execute("puppet.movePin", json!({"layer": lid.0, "pin": pin, "position": [55, 32]})).unwrap();
         let layer = app.session.project.comp(cid).unwrap().layer(lid).unwrap().clone();
         assert!(!overlay(&mut app, &ctx, cid, &layer, Tick::ZERO, false).unwrap().is_empty(), "late completion from a replaced document is discarded");
+    }
+
+    /// #834 / #586: dragging a pin on one Puppet layer re-solved every other selected Puppet
+    /// layer on each edit (the overlays were keyed by the document revision), and those solves
+    /// took turns with the dragged layer's on the one background permit.
+    #[test]
+    fn editing_one_puppet_layer_leaves_the_others_solved() {
+        let mut session = Session::default();
+        let cid = ItemId(session.execute("comp.new", json!({"width": 64, "height": 64, "duration": 1})).unwrap()["comp"].as_u64().unwrap());
+        let mut layers = vec![];
+        for color in ["#ff0000", "#00ff00"] {
+            let lid = LayerId(session.execute("layer.newSolid", json!({"width": 48, "height": 48, "color": color})).unwrap()["layer"].as_u64().unwrap());
+            session.execute("puppet.addPin", json!({"layer": lid.0, "position": [4, 4]})).unwrap();
+            let pin = session.execute("puppet.addPin", json!({"layer": lid.0, "position": [40, 40]})).unwrap()["pin"].as_u64().unwrap();
+            layers.push((lid, pin));
+        }
+        let mut app = EffectcraftApp::new(session);
+        let ctx = egui::Context::default();
+        let layer = |app: &EffectcraftApp, lid: LayerId| app.session.project.comp(cid).unwrap().layer(lid).unwrap().clone();
+        let (dragged, pin) = layers[0];
+        let (other, _) = layers[1];
+        let l = layer(&app, other);
+        let before = overlay(&mut app, &ctx, cid, &l, Tick::ZERO, false).unwrap();
+        let l = layer(&app, dragged);
+        overlay(&mut app, &ctx, cid, &l, Tick::ZERO, false).unwrap();
+        for x in [50.0, 52.0, 54.0] {
+            app.session.execute("puppet.movePin", json!({"layer": dragged.0, "pin": pin, "position": [x, 30.0]})).unwrap();
+            let l = layer(&app, other);
+            let after = overlay(&mut app, &ctx, cid, &l, Tick::ZERO, false).unwrap();
+            assert!(Arc::ptr_eq(&before, &after), "the untouched layer keeps its solved overlay");
+            let worker = ctx.data(|d| d.get_temp::<Arc<Mutex<Mailbox>>>(egui::Id::new(("puppet-overlay", cid.0, other.0)).with("worker")));
+            assert!(worker.is_none_or(|w| w.lock().unwrap().pending.is_none()), "no solve queued for it");
+        }
+        // Its own edits still solve again.
+        let (_, own) = layers[1];
+        app.session.execute("puppet.movePin", json!({"layer": other.0, "pin": own, "position": [20.0, 20.0]})).unwrap();
+        let l = layer(&app, other);
+        let moved = overlay(&mut app, &ctx, cid, &l, Tick::ZERO, false).unwrap();
+        assert!(!Arc::ptr_eq(&before, &moved));
     }
 }

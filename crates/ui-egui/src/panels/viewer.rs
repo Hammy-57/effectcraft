@@ -509,16 +509,6 @@ fn parent_inverse(ctx: &EvalCtx, layer: &Layer) -> Mat3 {
     }
 }
 
-/// A frame for an extra view: see [`pooled_texture`].
-enum Pooled {
-    /// Its texture, or the last one while the frame renders (`None` before the first).
-    Shown(Option<egui::TextureHandle>),
-    /// Rendering, nothing to show yet.
-    Rendering,
-    /// Frames stay on the GPU here (the browser's viewer): render it on the UI thread.
-    OnUiThread,
-}
-
 fn view_key(text: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -536,7 +526,8 @@ fn display_color(dc: &effectcraft_engine::viewer::DisplayColor, img: &mut egui::
 /// The texture of an extra view (split 3D views, the locked viewer): frame `t` of `comp`
 /// rendered with `opts` by the frame workers, off the UI thread (it used to render there on
 /// every frame of playback), then uploaded (through `dc`) into the texture kept under `id`.
-/// Until a new frame is in, the last texture stays up. `view` tells views apart.
+/// Until a new frame is in, the last texture stays up (`None` before the first). `view` tells
+/// views apart.
 #[allow(clippy::too_many_arguments)]
 fn pooled_texture(
     app: &EffectcraftApp,
@@ -548,9 +539,9 @@ fn pooled_texture(
     opts: effectcraft_engine::render::RenderOpts,
     view: u64,
     dc: Option<effectcraft_engine::viewer::DisplayColor>,
-) -> Pooled {
-    use crate::frames::{FrameImage, FrameKey};
-    let Some(c) = app.session.project.comp(comp) else { return Pooled::Rendering };
+) -> Option<egui::TextureHandle> {
+    use crate::frames::{FrameImage, FrameKey, RenderSource};
+    let c = app.session.project.comp(comp)?;
     // The document revision, as the main viewer and playback use (`frame_series`): the frame
     // queue drops jobs of older revisions, and the freeze preview's counter (which counts loaded
     // font faces) is far larger, so every request here dropped their queued prefetch. The
@@ -570,12 +561,12 @@ fn pooled_texture(
     if let Some((k, tex)) = &cached
         && *k == key
     {
-        return Pooled::Shown(Some(tex.clone()));
+        return Some(tex.clone());
     }
-    let src = app.render_source();
-    if src.gpu_display {
-        return Pooled::OnUiThread;
-    }
+    // Always CPU pixels: a GPU display frame (`gpu_display`, the default state) is a texture for
+    // the main viewer's native slot. These views used to render on the UI thread in that state,
+    // one synchronous frame per view on every frame of playback.
+    let src = RenderSource { gpu_display: false, ..app.render_source() };
     app.frames.request(&src, key, comp, c.frame_rate.tick_of(frame), opts);
     match app.frames.get(&key) {
         Some(FrameImage::Cpu(img)) => {
@@ -585,13 +576,9 @@ fn pooled_texture(
             }
             let tex = crate::frames::load_fitted(ctx, name, ci, egui::TextureOptions::LINEAR);
             ctx.data_mut(|d| d.insert_temp(id, (key, tex.clone())));
-            Pooled::Shown(Some(tex))
+            Some(tex)
         }
-        Some(FrameImage::Gpu(_)) => Pooled::OnUiThread,
-        None => match cached {
-            Some((_, tex)) => Pooled::Shown(Some(tex)),
-            None => Pooled::Rendering,
-        },
+        Some(FrameImage::Gpu(_)) | None => cached.map(|(_, tex)| tex),
     }
 }
 
@@ -640,29 +627,7 @@ fn aux_views(
         let id = egui::Id::new(("viewer-aux", i));
         let opts = effectcraft_engine::render::RenderOpts { scale, view: comp.has_3d().then_some(cam), draft: true, ..Default::default() };
         let view = view_key(&format!("{cam:?}"));
-        let tex = match pooled_texture(app, &ctx, id, &format!("viewer-aux-{i}"), cid, t, opts, view, None) {
-            Pooled::Shown(tex) => tex,
-            Pooled::Rendering => None,
-            Pooled::OnUiThread => {
-                let key = {
-                    use std::hash::{Hash, Hasher};
-                    let mut h = std::collections::hash_map::DefaultHasher::new();
-                    (app.session.revision, cid.0, t.0, i, scale.to_bits(), format!("{cam:?}")).hash(&mut h);
-                    h.finish()
-                };
-                let cached: Option<(u64, egui::TextureHandle)> = ctx.data(|d| d.get_temp(id));
-                Some(match cached {
-                    Some((k, tex)) if k == key => tex,
-                    _ => {
-                        let img = app.session.render(cid, t, opts);
-                        let tex =
-                            crate::frames::load_fitted(&ctx, format!("viewer-aux-{i}"), crate::frames::to_color_image(&img), egui::TextureOptions::LINEAR);
-                        ctx.data_mut(|d| d.insert_temp(id, (key, tex.clone())));
-                        tex
-                    }
-                })
-            }
-        };
+        let tex = pooled_texture(app, &ctx, id, &format!("viewer-aux-{i}"), cid, t, opts, view, None);
         let b = comp.background;
         p.rect_filled(cr, 0.0, Color32::from_rgb((b[0] * 255.0) as u8, (b[1] * 255.0) as u8, (b[2] * 255.0) as u8));
         if let Some(tex) = tex {
@@ -709,32 +674,7 @@ fn locked_pane(app: &mut EffectcraftApp, ui: &mut egui::Ui, full: Rect, bg: Colo
     let opts = effectcraft_engine::render::RenderOpts { scale, view: cam, ..Default::default() };
     // The display conversion is applied on upload: part of the texture's key, not the frame's.
     let view = view_key(&dc_key);
-    let tex = match pooled_texture(app, &ctx, id, "viewer-locked", lv.comp, t, opts, view, dc.clone()) {
-        Pooled::Shown(tex) => tex,
-        Pooled::Rendering => None,
-        Pooled::OnUiThread => {
-            let key = {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                (app.session.revision, lv.comp.0, t.0, scale.to_bits(), &dc_key).hash(&mut h);
-                h.finish()
-            };
-            let cached: Option<(u64, egui::TextureHandle)> = ctx.data(|d| d.get_temp(id));
-            Some(match cached {
-                Some((k, tex)) if k == key => tex,
-                _ => {
-                    let img = app.session.render(lv.comp, t, opts);
-                    let mut ci = crate::frames::to_color_image(&img);
-                    if let Some(dc) = &dc {
-                        display_color(dc, &mut ci);
-                    }
-                    let tex = crate::frames::load_fitted(&ctx, "viewer-locked", ci, egui::TextureOptions::LINEAR);
-                    ctx.data_mut(|d| d.insert_temp(id, (key, tex.clone())));
-                    tex
-                }
-            })
-        }
-    };
+    let tex = pooled_texture(app, &ctx, id, "viewer-locked", lv.comp, t, opts, view, dc);
     let b = comp.background;
     p.rect_filled(cr, 0.0, Color32::from_rgb((b[0] * 255.0) as u8, (b[1] * 255.0) as u8, (b[2] * 255.0) as u8));
     if let Some(tex) = tex {
@@ -847,7 +787,9 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     ctx.data_mut(|d| d.insert_temp(egui::Id::new("viewer-fit"), fit));
     let zoom = app.ui.viewer.zoom.unwrap_or(fit);
     let center = area.center() + vec2(app.ui.viewer.pan[0], app.ui.viewer.pan[1]);
-    let origin = center - vec2(cw * zoom / 2.0, ch * zoom / 2.0);
+    // On the physical pixel grid: at 100 % each frame pixel lands on one screen pixel instead of
+    // straddling two and blurring (#882).
+    let origin = snap_to_pixels(center - vec2(cw * zoom / 2.0, ch * zoom / 2.0), ctx.pixels_per_point());
     let map = ViewerMap { origin, zoom, comp: [cw, ch], area };
     ctx.data_mut(|d| d.insert_temp(map_id(), map));
     let comp_rect = Rect::from_min_size(origin, vec2(cw * zoom, ch * zoom));
@@ -1161,6 +1103,30 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         painter.rect_filled(r, 3.0, Color32::from_rgba_unmultiplied(0x1d, 0x4f, 0x9c, 0xe0));
         painter.galley(pos2(r.center().x - galley.size().x / 2.0, r.center().y - galley.size().y / 2.0), galley, Color32::WHITE);
         app.auto.add("viewer.warpBanner", r, &text);
+    }
+
+    // Footage that can't be decoded (no decoder for its codec / profile): say why on the layer
+    // instead of leaving a black picture (#886).
+    let mut notices = 0;
+    for layer in comp.layers.iter().filter(|l| l.is_active_at(time) && l.switches.video) {
+        let effectcraft_engine::project::LayerSource::Footage { item } = &layer.source else { continue };
+        let Some(effectcraft_engine::project::ItemKind::Footage(f)) = app.session.project.item(*item).map(|i| &i.kind) else { continue };
+        let Some(why) = app.session.footage.problem(f) else { continue };
+        if notices >= 3 {
+            break;
+        }
+        let (m, _) = l2c(&ectx, layer);
+        let (w, h) = effectcraft_engine::render::source_size(&app.session.project, layer);
+        let c = m.apply(effectcraft_engine::geom::vec2(w as f64 / 2.0, h as f64 / 2.0));
+        let at = map.to_screen([c.x, c.y]);
+        let text = format!("{}: {}", layer.name, why);
+        let galley = painter.layout(text.clone(), Tokens::medium(12.0), Color32::WHITE, (map.area.width() - 40.0).clamp(80.0, 420.0));
+        let r = Rect::from_center_size(at + vec2(0.0, notices as f32 * 4.0), galley.size() + vec2(24.0, 16.0)).intersect(map.area);
+        painter.rect_filled(r, 3.0, Color32::from_rgba_unmultiplied(0x4a, 0x1a, 0x14, 0xe6));
+        painter.rect_stroke(r, 3.0, Stroke::new(1.0, t.warning), StrokeKind::Inside);
+        painter.galley(pos2(r.min.x + 12.0, r.center().y - galley.size().y / 2.0), galley, Color32::WHITE);
+        app.auto.add(&format!("viewer.footageProblem.{}", layer.id.0), r, &text);
+        notices += 1;
     }
 
     // Free transform box of a path (double-click a path with the Selection tool).
@@ -2498,21 +2464,32 @@ pub(crate) fn styled_line(painter: &egui::Painter, pts: [Pos2; 2], stroke: Strok
     }
 }
 
-/// Texture filtering for Viewer Zoom Quality: More Accurate = bilinear, Faster = nearest.
+/// `p` on the physical pixel grid of a display with `ppp` pixels per point.
+pub(crate) fn snap_to_pixels(p: Pos2, ppp: f32) -> Pos2 {
+    if !(ppp.is_finite() && ppp > 0.0) {
+        return p;
+    }
+    pos2((p.x * ppp).round() / ppp, (p.y * ppp).round() / ppp)
+}
+
+/// Texture filtering for Viewer Zoom Quality: More Accurate = bilinear when the frame is shown
+/// smaller than its pixels, Faster = nearest. Magnified (100 % and above, or a lower resolution)
+/// both show whole pixels, as After Effects does: bilinear blurred them (#882).
 pub(crate) fn zoom_texture_options(smooth: bool) -> egui::TextureOptions {
-    if smooth { egui::TextureOptions::LINEAR } else { egui::TextureOptions::NEAREST }
+    if smooth { egui::TextureOptions { magnification: egui::TextureFilter::Nearest, ..egui::TextureOptions::LINEAR } } else { egui::TextureOptions::NEAREST }
 }
 
 /// The sampler GPU frames (mipmapped display textures) are drawn with: More Accurate filters
 /// bilinearly within and between mip levels, so a frame shown below 100 % is averaged instead of
-/// skipping pixels (#417); Faster takes the nearest pixel of the full-size frame.
+/// skipping pixels (#417); Faster takes the nearest pixel of the full-size frame. Magnified, both
+/// take the nearest pixel (#882).
 pub(crate) fn zoom_sampler(smooth: bool) -> eframe::wgpu::SamplerDescriptor<'static> {
     use eframe::wgpu::{FilterMode, MipmapFilterMode, SamplerDescriptor};
     let label = Some("viewer frame");
     if smooth {
         SamplerDescriptor {
             label,
-            mag_filter: FilterMode::Linear,
+            mag_filter: FilterMode::Nearest,
             min_filter: FilterMode::Linear,
             mipmap_filter: MipmapFilterMode::Linear,
             ..Default::default()
@@ -2667,6 +2644,34 @@ mod tests {
         app.request_frame(cid, 6, 1.0);
         extra(&app, 1);
         assert_eq!(app.frames.inflight(), 4, "every frame asked for stays queued");
+    }
+
+    /// In the default viewer state (`gpu_display`) split views and the locked viewer rendered
+    /// their frames synchronously on the UI thread, every frame of playback. They now go
+    /// through the frame workers as CPU pixels and show once rendered.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn extra_views_render_on_the_frame_workers_in_the_default_state() {
+        use serde_json::json;
+        let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+        app.session.execute("comp.new", json!({"width": 16, "height": 16, "duration": 2})).unwrap();
+        app.session.execute("layer.newSolid", json!({"color": "#ff0000", "width": 16, "height": 16})).unwrap();
+        assert!(app.render_source().gpu_display, "the default state");
+        let cid = app.session.active_comp_id().unwrap();
+        let ctx = egui::Context::default();
+        let opts = app.frame_opts(cid, 1.0);
+        let t = app.session.project.comp(cid).unwrap().frame_rate.tick_of(3);
+        let id = egui::Id::new("extra");
+        assert!(pooled_texture(&app, &ctx, id, "extra", cid, t, opts, 7, None).is_none(), "not rendered on this thread");
+        let start = std::time::Instant::now();
+        let tex = loop {
+            if let Some(tex) = pooled_texture(&app, &ctx, id, "extra", cid, t, opts, 7, None) {
+                break tex;
+            }
+            assert!(start.elapsed() < std::time::Duration::from_secs(30), "the frame workers never delivered");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert_eq!(tex.size(), [16, 16]);
     }
 
     #[test]

@@ -54,6 +54,17 @@ impl Batch {
         self.names.push(name.into());
         Some(wgpu::ComputePassTimestampWrites { query_set: &self.query, beginning_of_pass_write_index: Some(index), end_of_pass_write_index: Some(index + 1) })
     }
+    /// Two query indices for timestamps written on the encoder around `name`'s commands
+    /// (copies, the whole command buffer): (query set, first index; the second is first + 1).
+    pub(crate) fn reserve(&mut self, name: &str) -> Option<(wgpu::QuerySet, u32)> {
+        let index = u32::try_from(self.names.len()).ok()?.checked_mul(2)?;
+        if index.checked_add(1)? >= QUERIES || self.names.try_reserve(1).is_err() {
+            effectcraft_render::profile::lost(self.generation);
+            return None;
+        }
+        self.names.push(name.into());
+        Some((self.query.clone(), index))
+    }
     pub(crate) fn resolve(self, g: &GpuContext, enc: &mut wgpu::CommandEncoder) -> Option<Pending> {
         let count = u32::try_from(self.names.len()).ok()?.checked_mul(2)?;
         if count == 0 {

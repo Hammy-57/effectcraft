@@ -84,6 +84,10 @@ fn compositor_shares_the_window_device_only_with_a_traffic_light() {
 /// [`EffectcraftApp::editing`]).
 const EDIT_QUIET: f64 = 0.3;
 
+/// A frame slower than this (ms) stops paused prefetch: a running background frame can't be
+/// preempted, so the next frame you move to would share the CPU and GPU with it for that long.
+const PAUSED_PREFETCH_MAX_MS: f64 = 250.0;
+
 /// The longest a playing preview waits for its next UI frame (the meters, the end of the
 /// preview, a frame that finished rendering without waking the UI).
 const PLAYBACK_MAX_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
@@ -1551,6 +1555,9 @@ impl EffectcraftApp {
             0
         } else if let Some(wait) = self.editing(now) {
             ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait));
+            0
+        } else if self.frames.last_ms.lock().is_ok_and(|ms| *ms > PAUSED_PREFETCH_MAX_MS) {
+            // Slow frames: rendering ahead held up the frame the user moved to by seconds.
             0
         } else {
             // Keep workers available for a newly edited viewer frame. Running obsolete

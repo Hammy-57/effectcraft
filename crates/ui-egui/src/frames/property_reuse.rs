@@ -231,25 +231,16 @@ impl<'a> Proof<'a> {
 
     pub(super) fn rekey(&self, cache: &mut Cache, old: u64, new: u64, revision: u64, comp: ItemId) {
         // Bound work, including scanning. Partial retention is always safe.
-        let keys: Vec<_> = cache
-            .order
-            .iter()
-            .enumerate()
-            .rev()
-            .take(MAX_FRAMES)
-            .filter(|(_, k)| k.content == old && k.comp == comp.0 && self.unchanged(comp, k.frame))
-            .map(|(index, k)| (index, *k))
-            .collect();
-        for (index, previous) in keys {
+        let keys: Vec<_> =
+            cache.order.iter().rev().take(MAX_FRAMES).filter(|k| k.content == old && k.comp == comp.0 && self.unchanged(comp, k.frame)).copied().collect();
+        for previous in keys {
             let current = FrameKey { content: new, revision, ..previous };
             if cache.map.contains_key(&current) {
                 continue;
             }
             if let Some(image) = cache.map.remove(&previous) {
                 cache.map.insert(current, image);
-                if let Some(position) = cache.order.get_mut(index) {
-                    *position = current;
-                }
+                cache.order.rename(&previous, current);
                 if let Some(rank) = cache.protected.remove(&previous) {
                     cache.protected.insert(current, rank);
                 }
