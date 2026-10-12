@@ -13,6 +13,7 @@
 pub mod agents;
 pub mod audio_analysis;
 pub mod autosave;
+pub mod build_info;
 pub mod camera_track;
 pub mod commands;
 pub mod config;
