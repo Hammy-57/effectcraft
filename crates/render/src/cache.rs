@@ -1367,6 +1367,128 @@ pub(crate) fn hash_debug(h: &mut KeyHasher, v: &impl std::fmt::Debug) {
     Hasher::write_u8(h, 0xff);
 }
 
+/// Paths of an image sequence a key formats, at most (see [`FootageKey`]).
+const SEQUENCE_SAMPLES: usize = 17;
+
+/// Footage settings as a key formats them ([`hash_debug`]): every field, except that an image
+/// sequence's file list counts by its length and a sample of its paths (the first, the last and
+/// evenly spaced ones between) instead of every path: a 17k-frame sequence would print about a
+/// megabyte per key, for every key, every frame. (The files' identity is the disk cache's
+/// salt.) The fields are listed exhaustively, so a new one can't be left out of keys.
+pub(crate) struct FootageKey<'a>(pub(crate) &'a effectcraft_project::Footage);
+
+impl std::fmt::Debug for FootageKey<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let effectcraft_project::Footage {
+            path,
+            kind,
+            width,
+            height,
+            pixel_aspect,
+            frame_rate,
+            native_rate,
+            duration,
+            has_video,
+            has_audio,
+            alpha,
+            premul_color,
+            loop_count,
+            codec,
+            missing,
+            sequence,
+            color_profile,
+            layer,
+            fields,
+            invert_alpha,
+            linear_light,
+            preserve_rgb,
+            data,
+            page,
+            alphabetical,
+            start_timecode,
+        } = self.0;
+        f.debug_struct("Footage")
+            .field("path", path)
+            .field("kind", kind)
+            .field("width", width)
+            .field("height", height)
+            .field("pixel_aspect", pixel_aspect)
+            .field("frame_rate", frame_rate)
+            .field("native_rate", native_rate)
+            .field("duration", duration)
+            .field("has_video", has_video)
+            .field("has_audio", has_audio)
+            .field("alpha", alpha)
+            .field("premul_color", premul_color)
+            .field("loop_count", loop_count)
+            .field("codec", codec)
+            .field("missing", missing)
+            .field("sequence", &SequenceSample(sequence))
+            .field("color_profile", color_profile)
+            .field("layer", layer)
+            .field("fields", fields)
+            .field("invert_alpha", invert_alpha)
+            .field("linear_light", linear_light)
+            .field("preserve_rgb", preserve_rgb)
+            .field("data", data)
+            .field("page", page)
+            .field("alphabetical", alphabetical)
+            .field("start_timecode", start_timecode)
+            .finish()
+    }
+}
+
+/// An image sequence's length and sampled paths (see [`FootageKey`]).
+struct SequenceSample<'a>(&'a [String]);
+
+impl std::fmt::Debug for SequenceSample<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let n = self.0.len();
+        write!(f, "{n}")?;
+        let mut list = f.debug_list();
+        if n <= SEQUENCE_SAMPLES {
+            list.entries(self.0);
+        } else {
+            let last = n - 1;
+            let gaps = (SEQUENCE_SAMPLES - 1) as u128;
+            for i in 0..SEQUENCE_SAMPLES {
+                let at = (last as u128).saturating_mul(i as u128) / gaps;
+                if let Some(p) = usize::try_from(at).ok().and_then(|at| self.0.get(at)) {
+                    list.entry(p);
+                }
+            }
+        }
+        list.finish()
+    }
+}
+
+/// An item's proxy as a key formats it (its footage through [`FootageKey`]).
+pub(crate) struct ProxyKey<'a>(pub(crate) &'a Option<Box<effectcraft_project::Proxy>>);
+
+impl std::fmt::Debug for ProxyKey<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            None => f.write_str("None"),
+            Some(p) => {
+                let effectcraft_project::Proxy { footage, enabled } = &**p;
+                f.debug_struct("Proxy").field("footage", &FootageKey(footage)).field("enabled", enabled).finish()
+            }
+        }
+    }
+}
+
+/// An item's kind as a key formats it (footage through [`FootageKey`]).
+pub(crate) struct KindKey<'a>(pub(crate) &'a ItemKind);
+
+impl std::fmt::Debug for KindKey<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            ItemKind::Footage(footage) => f.debug_tuple("Footage").field(&FootageKey(footage)).finish(),
+            other => other.fmt(f),
+        }
+    }
+}
+
 /// A [`KeyHasher`] starting from `seed`.
 pub(crate) fn hasher(seed: u64) -> KeyHasher {
     KeyHasher(seed)
@@ -1602,8 +1724,8 @@ fn hash_layer_refs(h: &mut KeyHasher, ctx: &EvalCtx, layer: &Layer, reads_other_
             LayerSource::Solid { item } => hash_debug(h, &ctx.project.item(*item).map(|i| &i.kind)),
             LayerSource::Footage { item } | LayerSource::Model { item } => {
                 let it = ctx.project.item(*item)?;
-                hash_debug(h, &it.kind);
-                hash_debug(h, &it.proxy);
+                hash_debug(h, &KindKey(&it.kind));
+                hash_debug(h, &ProxyKey(&it.proxy));
                 ctx.source_time(o).0.hash(h);
             }
             // The nested comp's layers are hashed by `dependencies::hash` (in every key).
@@ -1786,9 +1908,9 @@ fn key_any(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool, fo
             if !footage && (src.is_none() || !(still || info.masks_or_effects)) {
                 return None;
             }
-            hash_debug(&mut h, f);
+            hash_debug(&mut h, &FootageKey(f));
             // A proxy (and its Use Proxy switch) changes the pixels.
-            hash_debug(&mut h, &it.proxy);
+            hash_debug(&mut h, &ProxyKey(&it.proxy));
             item.hash(&mut h);
             if !still {
                 ctx.source_time(layer).0.hash(&mut h);
