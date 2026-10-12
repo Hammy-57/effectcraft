@@ -860,3 +860,25 @@ fn thumbnails_leave_no_frames_or_files_behind() {
         assert_eq!(pool.open_files(), 0, "{}: no file kept open", p.display());
     }
 }
+
+/// #329: a frame read that is called off (a scrub has moved on) gives up before the decoder
+/// seeks and decodes forward from the keyframe, so it no longer holds the decoder the newest
+/// frame waits for; the frame decodes as usual when it is wanted again.
+#[test]
+fn a_called_off_read_does_not_decode() {
+    use std::sync::atomic::AtomicBool;
+    let Some(p) = h264_mp4() else { return };
+    let f = probe(&p).expect("probe");
+    let pool = MediaPool::new();
+    let t = f.frame_rate.tick_of(45) + Tick(f.frame_rate.frame_duration().0 / 2);
+    let off = Arc::new(AtomicBool::new(true));
+    let mut got = None;
+    pool.cancellable(&off, &mut || got = Some(pool.frame(ItemId(1), &f, t)));
+    assert!(got.expect("ran").is_none(), "a called-off read decoded its frame");
+    assert_eq!(pool.stats().frames, 0, "nothing cached for it");
+    let on = Arc::new(AtomicBool::new(false));
+    let mut got = None;
+    pool.cancellable(&on, &mut || got = pool.frame(ItemId(1), &f, t));
+    let img = got.expect("decoded once wanted again");
+    assert_eq!((img.width, img.height), (1920, 1080));
+}

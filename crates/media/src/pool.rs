@@ -1272,6 +1272,16 @@ impl FootageSource for MediaPool {
     fn cache_budget(&self) -> Option<usize> {
         Some(self.budget())
     }
+    /// A movie's decoder gives up on a seek (before it, and between samples while it decodes
+    /// forward from the keyframe) once `cancel` is set: a scrub's superseded frames no longer
+    /// hold the decoder the frame under the pointer waits for (#329).
+    fn cancellable(&self, cancel: &Arc<AtomicBool>, f: &mut dyn FnMut()) {
+        // (a panic in `f` leaves no stale flag on this thread for its later reads)
+        let r = filmcraft_media::cancel::with_cancel(cancel, || std::panic::catch_unwind(std::panic::AssertUnwindSafe(&mut *f)));
+        if let Err(p) = r {
+            std::panic::resume_unwind(p);
+        }
+    }
     fn frame(&self, _item: ItemId, footage: &Footage, t: Tick) -> Option<Arc<Image>> {
         self.pixels(footage, t, None).map(|px| px.image())
     }
@@ -1352,6 +1362,8 @@ impl MediaPool {
         }
         match Inner::pixels_at(&self.inner, footage, t, true, preview) {
             Ok(px) => Some(px),
+            // nobody wants the frame any more (`cancellable`): not an error
+            Err(MediaError::Cancelled) => None,
             Err(e) => {
                 log::warn!("media: frame of {} at {:?}: {e}", footage.path, t);
                 None
