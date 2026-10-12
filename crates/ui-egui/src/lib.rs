@@ -251,6 +251,9 @@ pub struct Playback {
     pub preroll: Option<f64>,
     /// When the last frames were shown (seconds, the last second's worth): the achieved rate.
     pub shown_at: std::collections::VecDeque<f64>,
+    /// When playback last looked at the clock (UI seconds, [`Self::observe`]): a hold since
+    /// the last frame counts against the achieved rate.
+    pub observed: f64,
 }
 
 impl Playback {
@@ -263,11 +266,23 @@ impl Playback {
         }
     }
 
+    /// Playback looked at the clock at `now`: frames shown more than a second ago no longer
+    /// count, so the rate readout does not freeze at its last value while playback holds.
+    pub fn observe(&mut self, now: f64) {
+        self.observed = now;
+        while self.shown_at.front().is_some_and(|t| now - t > 1.0) {
+            self.shown_at.pop_front();
+        }
+    }
+
     /// Frames per second shown over the last second while the preview plays (`None` before two
-    /// frames were shown, while caching, or stopped).
+    /// frames were shown, while caching, or stopped). A hold longer than a frame and a half
+    /// since the last frame shown counts up to [`Self::observe`]'s time.
     pub fn achieved_fps(&self) -> Option<f64> {
-        let (a, b) = (self.shown_at.front()?, self.shown_at.back()?);
-        (self.playing && !self.caching && self.shown_at.len() > 1 && b > a).then(|| (self.shown_at.len() - 1) as f64 / (b - a))
+        let (a, b) = (*self.shown_at.front()?, *self.shown_at.back()?);
+        let frame = self.plan.map_or(1, |p| p.step).max(1) as f64 / self.fps.max(1.0);
+        let end = if self.observed - b > 1.5 * frame { self.observed } else { b };
+        (self.playing && !self.caching && self.shown_at.len() > 1 && b > a).then(|| (self.shown_at.len() - 1) as f64 / (end - a))
     }
 
     /// The preview keeps up with its frame rate (within 5 %; previews that skip frames count
@@ -1279,7 +1294,7 @@ impl EffectcraftApp {
     /// Start audio preview from comp time `t` when [`Self::audio_plays`] and an output device
     /// opens.
     fn start_audio(&mut self, t: Tick) {
-        self.audio = None;
+        let held = self.audio.take();
         self.meter.clipped = [false; 2];
         let (Some(pl), Some(cid)) = (self.playback.plan, self.session.active_comp_id()) else { return };
         let Some(c) = self.session.project.comp_arc(cid).filter(|_| self.audio_plays()) else { return };
@@ -1589,7 +1604,7 @@ impl EffectcraftApp {
             return;
         }
         // Audio clock drives playback: show the frame under the audible sample.
-        if let Some(a) = &self.audio {
+        if let Some(a) = self.audio.as_ref().filter(|a| !a.held()) {
             if a.finished() {
                 if video {
                     self.session.set_time(fr.tick_of(wb));
