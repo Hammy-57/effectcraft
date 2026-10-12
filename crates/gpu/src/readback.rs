@@ -1,4 +1,9 @@
 //! Bounded, exactly-once readback completion, independent of GPU callbacks.
+//!
+//! Readbacks finish in submission order, so a readback queued behind many GPU frames waits for
+//! all of them. Its deadline therefore runs from the later of its start and the last time a
+//! readback started before it completed ([`Ticket::complete`]): a deep but moving queue never
+//! times out, while a GPU that stops completing anything is still retired after [`TIMEOUT`].
 // Browser callbacks stay on their worker thread. The workspace's wgpu feature still
 // requires Send callbacks on non-atomic wasm, and ParticleSim requires Send + Sync.
 use std::collections::BTreeMap;
@@ -47,6 +52,11 @@ impl Signal {
 #[derive(Default)]
 pub(crate) struct Readbacks(Mutex<State>, Arc<Signal>);
 pub(crate) struct Ticket {
+    owner: Weak<Readbacks>,
+    id: u64,
+}
+/// Reads a pending readback's current deadline (a [`Ticket`] moves into its map callback).
+pub(crate) struct Watch {
     owner: Weak<Readbacks>,
     id: u64,
 }
@@ -241,12 +251,34 @@ impl Ticket {
     pub(crate) fn active(&self) -> bool {
         self.owner.upgrade().is_some_and(|me| me.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).pending.contains_key(&self.id))
     }
+    pub(crate) fn watch(&self) -> Watch {
+        Watch { owner: self.owner.clone(), id: self.id }
+    }
     pub(crate) fn complete(self, result: Result<Vec<u8>, Error>) {
         let Some(me) = self.owner.upgrade() else { return };
-        let entry = me.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).pending.remove(&self.id);
+        let entry = {
+            let mut s = me.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let entry = s.pending.remove(&self.id);
+            if entry.is_some() {
+                // The GPU made progress: the readbacks queued behind this one get a full
+                // deadline from now (see the module docs).
+                let floor = web_time::Instant::now() + TIMEOUT;
+                for later in s.pending.range_mut(self.id..).map(|(_, e)| e) {
+                    later.deadline = later.deadline.max(floor);
+                }
+            }
+            entry
+        };
         if let Some(entry) = entry {
             notify(entry.done, result);
         }
+    }
+}
+impl Watch {
+    /// The readback's deadline, `None` once it has settled.
+    pub(crate) fn deadline(&self) -> Option<web_time::Instant> {
+        let me = self.owner.upgrade()?;
+        me.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).pending.get(&self.id).map(|e| e.deadline)
     }
 }
 
@@ -500,6 +532,63 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(me.check().is_err());
     }
+    /// A1: readbacks queued behind many GPU frames wait for all of them. While the queue keeps
+    /// completing, each one's deadline restarts, so a deep healthy queue never retires the GPU;
+    /// once nothing completes for the whole timeout, it still does.
+    #[test]
+    fn a_deep_queue_that_keeps_completing_never_times_out_but_a_hang_does() {
+        let me = Arc::new(Readbacks::default());
+        let failed = Arc::new(AtomicUsize::new(0));
+        let mut tickets: Vec<Ticket> = (0..40)
+            .map(|_| {
+                let f = failed.clone();
+                me.start(move |r| {
+                    if r.is_err() {
+                        f.fetch_add(1, Ordering::SeqCst);
+                    }
+                })
+                .unwrap()
+            })
+            .collect();
+        for ticket in tickets.drain(..30) {
+            // Everything still queued has waited (nearly) its whole original deadline.
+            let now = web_time::Instant::now();
+            for e in me.0.lock().unwrap().pending.values_mut() {
+                e.deadline = e.deadline.min(now + Duration::from_millis(1));
+            }
+            let watch = ticket.watch();
+            assert!(watch.deadline().is_some());
+            ticket.complete(Ok(vec![]));
+            assert!(watch.deadline().is_none(), "settled");
+            // The next frame takes a while; the queue behind it was already past its deadline.
+            me.expire(now + Duration::from_millis(500));
+        }
+        assert!(me.check().is_ok(), "a deep queue that keeps completing is healthy");
+        assert_eq!(failed.load(Ordering::SeqCst), 0);
+        // The GPU stops completing: the rest time out after one full deadline.
+        let last = web_time::Instant::now();
+        me.expire(last + TIMEOUT - Duration::from_millis(50));
+        assert!(me.check().is_ok());
+        me.expire(last + TIMEOUT + Duration::from_secs(1));
+        assert!(me.check().is_err(), "a real hang still retires the context");
+        assert_eq!(failed.load(Ordering::SeqCst), 10);
+        assert!(tickets.iter().all(|t| !t.active()));
+    }
+
+    /// A readback that never completes is not saved by later ones completing around it.
+    #[test]
+    fn later_completions_do_not_extend_an_earlier_lost_readback() {
+        let me = Arc::new(Readbacks::default());
+        let lost = me.start(|r| assert!(r.is_err())).unwrap();
+        let deadline = lost.watch().deadline().unwrap();
+        let later = me.start(|r| assert!(r.is_ok())).unwrap();
+        later.complete(Ok(vec![]));
+        assert_eq!(lost.watch().deadline(), Some(deadline), "unchanged");
+        me.expire(deadline);
+        assert!(me.check().is_err());
+        assert!(!lost.active());
+    }
+
     #[test]
     fn cancellation_drains_all_and_new_context_is_independent() {
         let old = Arc::new(Readbacks::default());

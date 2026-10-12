@@ -282,12 +282,12 @@ impl Gpu {
     }
 
     /// Wait until `submission` has finished on the GPU, running the callbacks of the readbacks it
-    /// completed. Bounded by the readback deadline, whose expiry retires the context as a
-    /// blocking readback's does.
+    /// completed, or for at most the readback deadline. Running out of time is not a failure (the
+    /// work ahead of it may be a deep queue that keeps completing): the readback deadlines retire
+    /// the context when the GPU stops completing work.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn wait_submission(&self, submission: &wgpu::SubmissionIndex) -> Result<(), String> {
-        let wait = wgpu::PollType::Wait { submission_index: Some(submission.clone()), timeout: Some(crate::readback::TIMEOUT) };
-        self.ctx.poll_readbacks(wait).map(|_| ())
+        self.ctx.wait_for(Some(submission.clone()), crate::readback::TIMEOUT).map(|_| ())
     }
 
     /// Render a frame on the GPU and read it back (`None` = not handled).

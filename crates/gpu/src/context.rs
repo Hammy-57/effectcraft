@@ -990,6 +990,25 @@ impl GpuContext {
         }
     }
 
+    /// Wait up to `timeout` for `submission` (all submitted work when `None`): `Ok(false)` while
+    /// it is still running. Unlike [`Self::poll_readbacks`], running out of time does not retire
+    /// the context: a deep queue of frames that keeps completing is not a hang. The readback
+    /// deadlines, which restart whenever an earlier readback completes, decide that.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn wait_for(&self, submission: Option<wgpu::SubmissionIndex>, timeout: std::time::Duration) -> Result<bool, String> {
+        self.readbacks.check()?;
+        match self.device.poll(wgpu::PollType::Wait { submission_index: submission, timeout: Some(timeout) }) {
+            Ok(_) => Ok(true),
+            Err(wgpu::PollError::Timeout) => Ok(false),
+            Err(e) => {
+                let error = format!("GPU readback poll: {e}");
+                self.readbacks.retire(error.clone());
+                log::error!("{error}");
+                Err(error)
+            }
+        }
+    }
+
     /// All device polling routes through this failure bridge.
     pub(crate) fn poll_readbacks(&self, kind: wgpu::PollType) -> Result<wgpu::PollStatus, String> {
         self.readbacks.check()?;
@@ -1056,7 +1075,6 @@ impl GpuContext {
         submission: Option<wgpu::SubmissionIndex>,
         read: impl FnOnce(&[u8]) -> Result<T, String>,
     ) -> Result<T, String> {
-        let deadline = std::time::Instant::now() + crate::readback::TIMEOUT;
         let (tx, rx) = std::sync::mpsc::channel();
         let unmap = buffer.clone();
         let ticket = self.readbacks.start(move |r| {
@@ -1065,6 +1083,7 @@ impl GpuContext {
                 unmap.unmap();
             }
         })?;
+        let watch = ticket.watch();
         if ticket.active() {
             let b = buffer.clone();
             buffer.map_async(wgpu::MapMode::Read, .., move |r| {
@@ -1084,15 +1103,20 @@ impl GpuContext {
         }
         loop {
             self.readbacks.check()?;
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            // The deadline restarts whenever a readback queued ahead of this one completes, so
+            // waiting behind a deep queue of frames is not a timeout (`None`: settled already).
+            let deadline = watch.deadline();
+            let remaining = deadline.map_or(std::time::Duration::from_millis(1), |d| d.saturating_duration_since(std::time::Instant::now()));
             if remaining.is_zero() {
                 let error = "GPU readback receive timed out; context retired".to_string();
                 self.readbacks.retire(error.clone());
                 return Err(error);
             }
-            // Block until the GPU is done (bounded by the deadline: a timeout retires the
-            // context) rather than polling and sleeping, which adds latency to every readback.
-            self.poll_readbacks(wgpu::PollType::Wait { submission_index: submission.clone(), timeout: Some(remaining) })?;
+            // Block until the GPU is done rather than polling and sleeping, which adds latency to
+            // every readback; in slices, so the deadline above can move on.
+            if deadline.is_some() {
+                self.wait_for(submission.clone(), remaining.min(std::time::Duration::from_millis(250)))?;
+            }
             // The callback may be running on another thread that polled the same device.
             match rx.recv_timeout(remaining.min(std::time::Duration::from_millis(1))) {
                 Ok(result) => {
