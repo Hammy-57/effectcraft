@@ -7,19 +7,29 @@
 //! [`crate::cache`]), each animated property's value at the nested time (expressions included,
 //! so one reading another comp is keyed by what it reads), which layers are active, the items
 //! they show (footage by source time unless it is a still), nested precomps recursively, and the
-//! renderer state that reaches nested comps (scale, quality, switches, proxies, depth). The time
-//! itself counts when something reads the clock or other times (time effects, Wiggle, paint
-//! spans, motion blur, Auto-Orient along a path); a comp where such a reader meets an expression
-//! (which may read other comps at those times, out of the key's sight) is not keyed.
+//! renderer state that reaches nested comps (scale, quality, switches, proxies, depth).
+//!
+//! Each layer's structure counts by what reads it ([`Mode`]): a layer drawn from its values at
+//! the frame time alone (`pointwise`, not motion blurred) without its keyframes, as the animated
+//! values at the frame time decide, so a keyframe edit changes the key only where it changes a
+//! value; a motion-blurred layer (and its parents, and the camera and lights of a blurred 3D
+//! layer) with the keyframes its shutter's times read; a layer that reads other times (time
+//! effects, Wiggle, paint spans, Auto-Orient along a path, frame blending, time remapping), and
+//! every layer of a comp sampled at other times from above or by a layer that reads other layers
+//! at other times, with every keyframe. The time counts when a layer is read at other times, and
+//! such a layer's expressions must read nothing but their own value and the time
+//! ([`crate::cache::free::self_contained`]): one that may read other layers or comps at those
+//! times, out of the key's sight, leaves the comp unkeyed.
 
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, LazyLock, RwLock};
 
 use effectcraft_project::essential::{self, EgKind, Override};
-use effectcraft_project::{AutoOrient, Comp, FootageKind, FrameBlend, ItemId, ItemKind, Layer, LayerSource, Layers, Project};
+use effectcraft_project::{AutoOrient, Comp, FootageKind, FrameBlend, ItemId, ItemKind, Layer, LayerId, LayerSource, Layers, Project};
 use effectcraft_time::Tick;
 
-use crate::cache::{FootageKey, Memo, ProxyKey, hash_debug, hash_values, hasher, layer_info_arc};
+use crate::cache::{FootageKey, LayerInfo, Memo, ProxyKey, hash_debug, hash_values, hasher, layer_info_arc};
 use crate::footage::frame_blend_mode;
 use crate::sources::essential_overrides;
 use crate::{EvalCtx, RenderOpts, Renderer};
@@ -29,8 +39,17 @@ const MAX_DEPTH: usize = 16;
 
 /// What a comp's key needs that changes only when the comp does (memoised per shared comp).
 struct CompInfo {
-    /// The comp's settings and every layer, hashed.
-    structure: u64,
+    /// The comp's settings, hashed.
+    settings: u64,
+    /// Every layer's structure (see [`LayerInfo`]), in order.
+    layers: Vec<LayerInfo>,
+    /// Each layer's index by id (for parent chains).
+    index: HashMap<LayerId, usize>,
+    /// A layer that reads other times also reads other layers (a layer parameter, which effects
+    /// may read at other times, an effect reading the comp's scene, paint's Clone strokes): every
+    /// layer is read at other times. (An adjustment layer's effects read the layers below at the
+    /// frame time alone: `EffectHost::self_at` has nothing for them.)
+    spread: bool,
     /// Layers with keyframes or expressions: their values are hashed per frame.
     animated: Vec<usize>,
     /// Layers showing an item (footage, solid, precomp, model).
@@ -42,8 +61,6 @@ struct CompInfo {
     /// A layer reads the clock or other times by itself (time effects, Wiggle, paint, Auto-Orient
     /// along a path).
     other_times: bool,
-    /// A layer has its Motion Blur switch on.
-    motion_blur: bool,
 }
 
 impl CompInfo {
@@ -52,10 +69,22 @@ impl CompInfo {
         let mut settings = c.clone();
         settings.layers = Layers::new();
         hash_debug(&mut h, &settings);
-        let mut info = CompInfo { structure: 0, animated: vec![], sources: vec![], nested: vec![], expressions: false, other_times: false, motion_blur: false };
+        let mut info = CompInfo {
+            settings: h.finish(),
+            layers: vec![],
+            index: HashMap::new(),
+            spread: false,
+            animated: vec![],
+            sources: vec![],
+            nested: vec![],
+            expressions: false,
+            other_times: false,
+        };
         for (i, l) in c.layers.arcs().iter().enumerate() {
             let li = layer_info_arc(l);
-            li.whole.hash(&mut h);
+            info.layers.push(li);
+            info.index.insert(l.id, i);
+            info.spread |= !li.pointwise && (li.layer_refs || li.reads_comp_scene || li.paint);
             if li.animated {
                 info.animated.push(i);
             }
@@ -67,9 +96,7 @@ impl CompInfo {
             }
             info.expressions |= li.expressions;
             info.other_times |= li.time_dependent || li.reads_other_times || li.paint || l.auto_orient == AutoOrient::AlongPath;
-            info.motion_blur |= l.switches.motion_blur;
         }
-        info.structure = h.finish();
         info
     }
 }
@@ -95,16 +122,14 @@ fn comp_arc(project: &Project, id: ItemId) -> Option<&Arc<Comp>> {
     }
 }
 
-/// Does comp `id` or a comp nested in it have an expression (`expressions`), or a motion-blurred
-/// layer (Motion Blur switch on in a comp with Enable Motion Blur on)?
-fn tree_has(project: &Project, id: ItemId, expressions: bool, depth: usize) -> bool {
+/// Does comp `id` or a comp nested in it have an expression?
+fn tree_has_expressions(project: &Project, id: ItemId, depth: usize) -> bool {
     if depth > MAX_DEPTH {
         return true;
     }
     let Some(arc) = comp_arc(project, id) else { return false };
     let info = comp_info(arc);
-    let here = if expressions { info.expressions } else { arc.enable_motion_blur && info.motion_blur };
-    here || info.nested.iter().any(|n| tree_has(project, *n, expressions, depth + 1))
+    info.expressions || info.nested.iter().any(|n| tree_has_expressions(project, *n, depth + 1))
 }
 
 /// Does comp `id` change from frame to frame: a layer animates or reads the clock in it or a
@@ -137,7 +162,18 @@ impl<'a> Renderer<'a> {
     /// The key of what precomp layer `layer` shows at the context time (its nested comp as
     /// [`Self::source`] draws it), or `None` when it can't be keyed (see the module docs).
     pub(crate) fn precomp_key(&self, ctx: &EvalCtx, layer: &Layer) -> Option<u64> {
+        self.precomp_key_in(ctx, layer, true)
+    }
+
+    /// [`Self::precomp_key`]; `free`: nothing above samples the nested comp at other times, so
+    /// its key may leave keyframes out (see the module docs).
+    fn precomp_key_in(&self, ctx: &EvalCtx, layer: &Layer, free: bool) -> Option<u64> {
         let LayerSource::Comp { item } = layer.source else { return None };
+        // The layer itself samples its nested comp at other times (time effects, frame
+        // blending, time remapping), or draws its layers at the shutter's times (collapsed with
+        // motion blur; a precomp that isn't collapsed is drawn once and its buffer moved).
+        let collapsed_blur = layer.switches.collapse && self.opts.motion_blur && ctx.comp.enable_motion_blur;
+        let free = free && crate::cache::layer_info(ctx.comp, layer).pointwise && !collapsed_blur;
         let mut h = hasher(0x2545_f491_4f6c_dd1d);
         // Nothing is drawn (the comp contains this one, or the time is outside it).
         if self.project.comp_contains(item, ctx.comp_id) {
@@ -165,16 +201,16 @@ impl<'a> Renderer<'a> {
         bs.to_bits().hash(&mut h);
         let ov = essential_overrides(ctx, layer);
         let key = if ov.is_empty() {
-            sub.comp_key(item, lt)?
+            sub.comp_key_in(item, lt, free)?
         } else {
             hash_debug(&mut h, &ov);
             if plain_overrides(self.project, item, nc, &ov) {
                 // The instance's values are in `ov`: no copy of the project.
-                sub.comp_key(item, lt)?
+                sub.comp_key_in(item, lt, free)?
             } else {
                 match essential::with_overrides(self.project, item, &ov) {
-                    Some(p) => Renderer { project: &p, ..sub }.comp_key(item, lt)?,
-                    None => sub.comp_key(item, lt)?,
+                    Some(p) => Renderer { project: &p, ..sub }.comp_key_in(item, lt, free)?,
+                    None => sub.comp_key_in(item, lt, free)?,
                 }
             }
         };
@@ -182,35 +218,62 @@ impl<'a> Renderer<'a> {
         Some(h.finish())
     }
 
-    /// The content key of comp `id` drawn by this renderer at `t` (see the module docs).
+    /// The content key of comp `id` drawn by this renderer at `t` (see the module docs):
+    /// keyframes left out where that is safe.
     pub(crate) fn comp_key(&self, id: ItemId, t: Tick) -> Option<u64> {
+        self.comp_key_in(id, t, true)
+    }
+
+    /// [`Self::comp_key`]; `free`: nothing above samples this comp at other times.
+    pub(crate) fn comp_key_in(&self, id: ItemId, t: Tick, free: bool) -> Option<u64> {
         if self.depth > MAX_DEPTH {
             return None;
         }
         let arc = comp_arc(self.project, id)?;
         let info = comp_info(arc);
         let nc: &Comp = arc;
-        // Motion blur evaluates transforms (masks, shapes, text, the layers of collapsed precomps)
-        // within the shutter: the time counts only when something in the tree moves.
-        let blur = self.opts.motion_blur && tree_has(self.project, id, false, self.depth) && tree_varies(self.project, id, self.depth);
-        if (info.other_times || blur) && info.expressions {
-            return None;
-        }
+        let ctx = self.ctx(id, nc, t);
+        let (modes, sampled) = self.modes(&ctx, &info, free);
+        let strict = !free || info.spread;
         let mut h = hasher(0x9ae1_6a3b_2f90_404f);
-        info.structure.hash(&mut h);
+        info.settings.hash(&mut h);
+        // Layers read at other times than the frame's: their expressions must read nothing else.
+        let mut timed = false;
+        for (i, ((l, li), mode)) in nc.layers.iter().zip(&info.layers).zip(&modes).enumerate() {
+            let lights = matches!(l.source, LayerSource::Camera | LayerSource::Light { .. });
+            let contained = match mode {
+                Mode::Free => true,
+                _ if strict || lights => li.contained,
+                Mode::Window(..) => li.contained_sampled,
+                Mode::Whole => li.contained_inner && (!sampled.get(i).copied().unwrap_or(true) || li.contained_sampled),
+            };
+            if li.expressions && !contained {
+                return None;
+            }
+            timed |= *mode != Mode::Free;
+            hash_debug(&mut h, mode);
+            match mode {
+                Mode::Free => li.free.hash(&mut h),
+                Mode::Whole => li.whole.hash(&mut h),
+                Mode::Window(t0, t1) => {
+                    li.free.hash(&mut h);
+                    let (a, b) = (l.layer_time(*t0), l.layer_time(*t1));
+                    crate::cache::free::hash_window(&mut h, &l.props, a.min(b), a.max(b));
+                }
+            }
+        }
         id.hash(&mut h);
         hash_debug(&mut h, &self.project.settings);
         hash_debug(&mut h, &RenderOpts { view: None, roi: None, ..self.opts });
         hash_debug(&mut h, &self.inherited);
         self.depth.hash(&mut h);
         self.active_accel().is_some().hash(&mut h);
-        if info.other_times || blur {
+        if timed {
             t.0.hash(&mut h);
         }
         for l in nc.layers.iter() {
             l.is_active_at(t).hash(&mut h);
         }
-        let ctx = self.ctx(id, nc, t);
         for &i in &info.animated {
             let l = nc.layers.get(i)?;
             hash_values(&mut h, &ctx, l, &l.props);
@@ -234,11 +297,99 @@ impl<'a> Renderer<'a> {
                     }
                 }
                 LayerSource::Solid { item } => hash_debug(&mut h, &self.project.item(*item).map(|i| &i.kind)),
-                LayerSource::Comp { .. } => self.precomp_key(&ctx, l)?.hash(&mut h),
+                LayerSource::Comp { .. } => self.precomp_key_in(&ctx, l, modes.get(i).is_some_and(|m| *m != Mode::Whole))?.hash(&mut h),
                 _ => {}
             }
         }
         Some(h.finish())
+    }
+}
+
+/// How a layer's structure counts in its comp's key (see the module docs).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Mode {
+    /// Drawn from its values at the frame time alone: structure without keyframes.
+    Free,
+    /// Drawn at the times of a motion-blur shutter within these comp times: structure without
+    /// keyframes, plus the keyframes those times read.
+    Window(Tick, Tick),
+    /// Read at other times: every keyframe.
+    Whole,
+}
+
+impl Mode {
+    /// The stricter of two modes.
+    fn max(self, other: Mode) -> Mode {
+        match (self, other) {
+            (Mode::Whole, _) | (_, Mode::Whole) => Mode::Whole,
+            (Mode::Window(a, b), Mode::Window(c, d)) => Mode::Window(a.min(c), b.max(d)),
+            (Mode::Window(a, b), Mode::Free) | (Mode::Free, Mode::Window(a, b)) => Mode::Window(a, b),
+            (Mode::Free, Mode::Free) => Mode::Free,
+        }
+    }
+}
+
+impl Renderer<'_> {
+    /// Each layer's [`Mode`] in the comp `ctx` draws at its time, and whether motion blur reads
+    /// its transform at the shutter's times. `free`: nothing above samples this comp at other
+    /// times.
+    fn modes(&self, ctx: &EvalCtx, info: &CompInfo, free: bool) -> (Vec<Mode>, Vec<bool>) {
+        let nc = ctx.comp;
+        let n = info.layers.len();
+        if !free || info.spread {
+            return (vec![Mode::Whole; n], vec![true; n]);
+        }
+        // The shutter's comp times, a frame wider on each side (see `motion_blur::Shutter`).
+        let fd = nc.frame_duration().0 as f64;
+        let (phase, angle) = (nc.shutter_phase / 360.0, nc.shutter_angle / 360.0);
+        let (lo, hi) = (phase.min(phase + angle) - 1.0, phase.max(phase + angle) + 1.0);
+        let at = |x: f64| Tick(ctx.time.0.saturating_add((x * fd) as i64));
+        // Inside collapsed precomps the shutter is the outermost comp's, its times mapped down:
+        // every keyframe counts.
+        let collapsed = self.through.first().is_some_and(Option::is_some);
+        let window = if collapsed || !lo.is_finite() || !hi.is_finite() { Mode::Whole } else { Mode::Window(at(lo), at(hi)) };
+        let mut sampled: Vec<bool> = nc.layers.iter().map(|l| self.blurred(ctx, l)).collect();
+        let mut modes: Vec<Mode> = info
+            .layers
+            .iter()
+            .zip(&sampled)
+            .map(|(li, blurred)| {
+                if !li.pointwise {
+                    Mode::Whole
+                } else if *blurred {
+                    window
+                } else {
+                    Mode::Free
+                }
+            })
+            .collect();
+        // A blurred 3D layer moves against the camera and lights at the shutter's times.
+        if nc.layers.iter().zip(&sampled).any(|(l, b)| *b && l.switches.three_d) {
+            for ((l, m), b) in nc.layers.iter().zip(modes.iter_mut()).zip(sampled.iter_mut()) {
+                if matches!(l.source, LayerSource::Camera | LayerSource::Light { .. }) {
+                    *m = m.max(window);
+                    *b = true;
+                }
+            }
+        }
+        // Parents' transforms are read at their sampled children's times.
+        for i in 0..n {
+            if !sampled.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            let mut parent = nc.layers.get(i).and_then(|l| l.parent);
+            for _ in 0..n {
+                let Some(j) = parent.and_then(|p| info.index.get(&p).copied()) else { break };
+                if let Some(m) = modes.get_mut(j) {
+                    *m = m.max(window);
+                }
+                if let Some(b) = sampled.get_mut(j) {
+                    *b = true;
+                }
+                parent = nc.layers.get(j).and_then(|l| l.parent);
+            }
+        }
+        (modes, sampled)
     }
 }
 
@@ -247,5 +398,5 @@ impl<'a> Renderer<'a> {
 /// overridden property).
 fn plain_overrides(project: &Project, item: ItemId, nc: &Comp, ov: &[Override]) -> bool {
     let media = nc.essential.as_ref().is_some_and(|eg| ov.iter().any(|o| eg.resolve(o.control).is_some_and(|c| matches!(c.kind, EgKind::Media { .. }))));
-    !media && !tree_has(project, item, true, 0)
+    !media && !tree_has_expressions(project, item, 0)
 }

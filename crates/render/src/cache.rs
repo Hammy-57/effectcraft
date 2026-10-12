@@ -56,6 +56,7 @@ use crate::eval::EvalCtx;
 use crate::packed::PackedBuf;
 
 mod dependencies;
+pub(crate) mod free;
 
 /// Thread-safe, memory-budgeted cache of processed layer buffers, optionally backed by the
 /// persistent [`DiskCache`](crate::disk_cache::DiskCache): a memory miss reads the disk, and
@@ -1594,6 +1595,11 @@ pub(crate) struct LayerInfo {
     styles: u64,
     /// Every field of the layer, every property included (a precomp's nested layers).
     pub(crate) whole: u64,
+    /// [`Self::whole`] without keyframes: for keys that hash the animated values at the frame
+    /// time instead (see [`free`]).
+    pub(crate) free: u64,
+    /// The layer is drawn from its values at the frame time alone ([`free::pointwise`]).
+    pub(crate) pointwise: bool,
     /// A content group has keyframes or expressions.
     content_animated: bool,
     styles_animated: bool,
@@ -1605,12 +1611,19 @@ pub(crate) struct LayerInfo {
     content_expressions: bool,
     pub(crate) time_dependent: bool,
     pub(crate) reads_other_times: bool,
-    reads_comp_scene: bool,
+    pub(crate) reads_comp_scene: bool,
+    /// Every live expression reads only its property's value and the time
+    /// ([`free::contained`]).
+    pub(crate) contained: bool,
+    /// [`Self::contained`] for what motion blur reads at other times ([`free::sampled_contained`]).
+    pub(crate) contained_sampled: bool,
+    /// [`Self::contained`] for what a layer's own other times read ([`free::inner_contained`]).
+    pub(crate) contained_inner: bool,
     /// Enabled paint strokes (their Duration spans show and hide them).
     pub(crate) paint: bool,
     masks_or_effects: bool,
     /// An enabled effect has a layer parameter naming a layer (Displacement Map, Set Matte…).
-    layer_refs: bool,
+    pub(crate) layer_refs: bool,
 }
 
 impl LayerInfo {
@@ -1642,21 +1655,30 @@ impl LayerInfo {
         });
         let mut whole = KeyHasher(0x7c15_9e37_79b9_7f4a);
         hash_debug(&mut whole, layer);
+        let mut free_whole = KeyHasher(0x9e37_7c15_7f4a_79b9);
+        free::hash_layer(&mut free_whole, layer);
         let fx = layer.switches.effects.then(|| layer.effects()).flatten();
+        let (time_dependent, reads_other_times) = (time_dependent(layer), reads_other_times(layer));
+        let paint = fx.is_some_and(|fx| fx.groups().any(|g| g.enabled && effectcraft_effects::paint::is_paint(g)));
         LayerInfo {
             head: head.finish(),
             content: content.finish(),
             styles: styles.finish(),
             whole: whole.finish(),
+            free: free_whole.finish(),
+            pointwise: free::pointwise(layer, time_dependent, reads_other_times, paint),
             content_animated,
             styles_animated,
             animated: has_animation(&layer.props),
             expressions: has_expression(&layer.props),
             content_expressions,
-            time_dependent: time_dependent(layer),
-            reads_other_times: reads_other_times(layer),
+            time_dependent,
+            reads_other_times,
             reads_comp_scene: reads_comp_scene(layer),
-            paint: fx.is_some_and(|fx| fx.groups().any(|g| g.enabled && effectcraft_effects::paint::is_paint(g))),
+            contained: free::contained(&layer.props),
+            contained_sampled: free::sampled_contained(layer),
+            contained_inner: free::inner_contained(layer),
+            paint,
             masks_or_effects: layer.masks().is_some_and(|m| !m.children.is_empty()) || layer.effects().is_some_and(|fx| !fx.children.is_empty()),
             layer_refs: fx.is_some_and(|fx| fx.groups().any(|g| g.enabled && names_layers(g))),
         }

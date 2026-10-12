@@ -36,6 +36,7 @@ use effectcraft_engine::time::Tick;
 use effectcraft_gpu::{DisplayFrame, Gpu};
 use rayon::prelude::*;
 
+mod fingerprint;
 #[cfg(not(target_arch = "wasm32"))]
 mod landing;
 mod property_reuse;
@@ -233,6 +234,9 @@ struct Cache {
     gpu_budget: usize,
     /// Changes whenever a frame comes or goes (see [`Frames::disk_frames`]).
     generation: u64,
+    /// Frame fingerprints ([`fingerprint`]): what each cached frame shows, and the frame
+    /// that shows it.
+    prints: fingerprint::Prints,
 }
 
 impl Cache {
@@ -275,18 +279,43 @@ impl Cache {
             self.generation = self.generation.wrapping_add(1);
             self.forget(&i);
         }
+        self.prints.remove(k);
     }
     /// Shown again: last in line for eviction.
     fn touch(&mut self, k: &FrameKey) {
         self.order.touch(k);
     }
-    /// Drop every frame of the identities in `gone`.
+    /// Drop every frame of the identities in `gone`. A frame with a fingerprint stays, under an
+    /// identity no project is given (the address of a comp its identity hashed may be reused
+    /// once the snapshot that held it is gone): undo and redo can still find it by what it shows
+    /// ([`fingerprint`]).
     fn drop_contents(&mut self, gone: &HashSet<u64>) {
         let keys: Vec<FrameKey> = self.map.keys().filter(|k| gone.contains(&k.content)).copied().collect();
+        let mut moved = HashMap::new();
         for k in &keys {
-            self.remove(k);
+            let orphan = FrameKey { content: fingerprint::orphan(k.content), ..*k };
+            if self.prints.has(k)
+                && !gone.contains(&orphan.content)
+                && !self.map.contains_key(&orphan)
+                && let Some(img) = self.map.remove(k)
+            {
+                self.map.insert(orphan, img);
+                if let Some(rank) = self.protected.remove(k) {
+                    self.protected.insert(orphan, rank);
+                }
+                self.prints.rename(k, orphan);
+                moved.insert(*k, orphan);
+            } else {
+                self.remove(k);
+            }
         }
-        self.order.retain(|k| !gone.contains(&k.content));
+        if !moved.is_empty() {
+            self.generation = self.generation.wrapping_add(1);
+            for (k, o) in &moved {
+                self.order.rename(k, *o);
+            }
+        }
+        self.order.retain(|k| !gone.contains(&k.content) && self.map.contains_key(k));
     }
     /// The frame to evict next. While a preview plays: the least recently shown of the frames
     /// it doesn't reach, then the one it reaches last. Least-recently-used alone evicted the
@@ -580,6 +609,9 @@ pub struct Frames {
     /// The cache bar's frames, remembered while nothing they depend on changes (the bar is drawn
     /// every UI frame).
     bar: Mutex<CacheBar>,
+    /// Sweeps that take over the frames an edit didn't change ([`fingerprint`]).
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    sweeps: fingerprint::Sweeps,
 }
 
 /// See [`Frames::cached_frames`] and [`Frames::disk_frames`]: (series with frame 0, what else
@@ -605,7 +637,7 @@ impl Default for Frames {
         #[cfg(not(target_arch = "wasm32"))]
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 16);
         Frames {
-            cache: Arc::new(Mutex::new(Cache { map: HashMap::new(), order: Order::default(), protected: HashMap::new(), playhead: None, bytes: 0, gpu_bytes: 0, budget: 3 << 30, gpu_budget: GPU_BUDGET, generation: 0 })),
+            cache: Arc::new(Mutex::new(Cache { map: HashMap::new(), order: Order::default(), protected: HashMap::new(), playhead: None, bytes: 0, gpu_bytes: 0, budget: 3 << 30, gpu_budget: GPU_BUDGET, generation: 0, prints: fingerprint::Prints::default() })),
             inflight: Arc::new(Mutex::new(HashSet::new())),
             failed: Failed::default(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -638,6 +670,7 @@ impl Default for Frames {
             #[cfg(not(target_arch = "wasm32"))]
             landing: Arc::default(),
             bar: Mutex::default(),
+            sweeps: fingerprint::Sweeps::default(),
         }
     }
 }
@@ -1157,6 +1190,7 @@ impl Frames {
         }
         if let Ok(mut c) = self.cache.lock() {
             c.map.clear();
+            c.prints = fingerprint::Prints::default();
             c.generation = c.generation.wrapping_add(1);
             c.order.clear();
             c.bytes = 0;
@@ -1233,6 +1267,7 @@ impl Frames {
             on_gpu: None,
             retry: None,
             cancel: Arc::default(),
+            print: None,
         });
         drop(inf);
         drop(q);
@@ -1247,6 +1282,9 @@ impl Frames {
         if self.is_cached(&key) || self.failed(&key) {
             return;
         }
+        // After an edit, the frames it didn't change are found again by their fingerprints.
+        #[cfg(not(target_arch = "wasm32"))]
+        self.sweep(src, key, comp, opts);
         let Ok(mut q) = self.queue.lock() else { return };
         let Ok(mut inf) = self.inflight.lock() else { return };
         // Jobs for an older project revision can never be shown: drop them.
@@ -1292,7 +1330,21 @@ impl Frames {
         q.seq += 1;
         let seq = q.seq;
         let epoch = self.epoch.load(Ordering::Acquire);
-        q.jobs.push(Job { key, src: src.clone(), comp, t, opts, urgent, disk_only: false, seq, epoch, on_gpu: None, retry: None, cancel: Arc::default() });
+        q.jobs.push(Job {
+            key,
+            src: src.clone(),
+            comp,
+            t,
+            opts,
+            urgent,
+            disk_only: false,
+            seq,
+            epoch,
+            on_gpu: None,
+            retry: None,
+            cancel: Arc::default(),
+            print: None,
+        });
         drop(inf);
         drop(q);
         #[cfg(not(target_arch = "wasm32"))]
@@ -1602,6 +1654,15 @@ impl Worker {
             self.render_retry(job, *retry);
             return true;
         }
+        if !job.disk_only {
+            // A cached frame with the same fingerprint (one the last edit didn't change, the
+            // state an undo returns to) is shown instead of rendering the frame again.
+            job.print = fingerprint::of(&job.src, job.comp, job.t, job.opts);
+            if self.cache.lock().is_ok_and(|mut c| c.map.contains_key(&job.key) || job.print.is_some_and(|p| c.adopt(job.key, p))) {
+                self.release(job.key, job.urgent);
+                return true;
+            }
+        }
         let t0 = web_time::Instant::now();
         let disk = job.src.disk.as_ref().map(|dc| (dc.clone(), frame_disk_key(content_keys, &job.src.project, &job.key, opts_hash(&job.opts))));
         if job.disk_only && disk.as_ref().is_none_or(|(dc, k)| dc.contains(disk_cache::Kind::Frame, *k)) {
@@ -1682,10 +1743,15 @@ impl Worker {
 
     /// Store a finished frame and release its job.
     fn finish(&self, job: &Job, img: FrameImage, t0: web_time::Instant) {
-        self.finish_key(job.key, job.urgent, img, t0);
+        self.finish_print(job.key, job.urgent, img, t0, job.print);
     }
 
     fn finish_key(&self, key: FrameKey, urgent: bool, img: FrameImage, t0: web_time::Instant) {
+        self.finish_print(key, urgent, img, t0, None);
+    }
+
+    /// [`Self::finish_key`] with the frame's fingerprint, if it has one.
+    fn finish_print(&self, key: FrameKey, urgent: bool, img: FrameImage, t0: web_time::Instant, print: Option<u64>) {
         if urgent && let Ok(mut l) = self.last.lock() {
             *l = t0.elapsed().as_secs_f64() * 1000.0;
         }
@@ -1693,6 +1759,11 @@ impl Worker {
             && (!img.is_gpu() || !self.gpu_retired.load(Ordering::Acquire))
         {
             c.insert(key, img);
+            if let Some(p) = print
+                && c.map.contains_key(&key)
+            {
+                c.prints.stamp(key, p);
+            }
         }
         self.release(key, urgent);
     }
@@ -2063,6 +2134,8 @@ struct Job {
     retry: Option<Box<Retry>>,
     /// Set when the viewer no longer waits for this frame (see [`Frames::request_urgent`]).
     cancel: Arc<AtomicBool>,
+    /// The frame's fingerprint, once its worker took it ([`fingerprint`]).
+    print: Option<u64>,
 }
 
 impl Job {
@@ -2369,6 +2442,7 @@ mod tests {
                 on_gpu: Some(true),
                 retry: None,
                 cancel: Arc::default(),
+                print: None,
             })
             .collect();
         {
@@ -2435,6 +2509,7 @@ mod tests {
             on_gpu: None,
             retry: None,
             cancel: Arc::default(),
+            print: None,
         };
         let cap = |j: &Job, retired: bool| max_running(&Job { on_gpu: Some(gpu_pick(j, retired)), ..j.clone() }, 8);
         let gpu_cap = cap(&job(Backend::Gpu), false);
@@ -2613,6 +2688,7 @@ mod tests {
             on_gpu: None,
             retry: None,
             cancel: Arc::default(),
+            print: None,
         };
         let gib = 1 << 30;
         assert_eq!(max_running(&job(uhd, 1.0, gib), 16), 2);
@@ -2659,6 +2735,7 @@ mod tests {
             on_gpu: None,
             retry: None,
             cancel: Arc::default(),
+            print: None,
         };
         // Admitted one by one, as the pool's threads pick them up.
         let admitted = |backend: Backend| {
@@ -2806,6 +2883,7 @@ mod tests {
             on_gpu: None,
             retry: None,
             cancel: Arc::default(),
+            print: None,
         };
         let (flying, stale) = (FrameKey { frame: 1, ..key }, FrameKey { frame: 2, ..key });
         {
@@ -2870,6 +2948,7 @@ mod tests {
             on_gpu: None,
             retry: None,
             cancel: Arc::default(),
+            print: None,
         });
         assert!(!q.can_start(&q.jobs[0]), "one urgent render is already in progress");
         drop(q);
@@ -3362,6 +3441,7 @@ mod tests {
                 on_gpu: None,
                 retry: None,
                 cancel: Arc::default(),
+                print: None,
             });
         }
         f.request(&src, k(5), cid, Tick::ZERO, opts);

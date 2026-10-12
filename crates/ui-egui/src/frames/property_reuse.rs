@@ -244,6 +244,7 @@ impl<'a> Proof<'a> {
                 if let Some(rank) = cache.protected.remove(&previous) {
                     cache.protected.insert(current, rank);
                 }
+                cache.prints.rename(&previous, current);
                 cache.generation = cache.generation.wrapping_add(1);
             }
         }
