@@ -1091,6 +1091,7 @@ impl EffectcraftApp {
                 quarter: self.frame_series(comp, quarter),
                 budget_ms: 1000.0 * step / self.playback.fps,
                 gpu_context: self.gpu.as_ref().map_or(0, |g| std::ptr::from_ref(g.context()) as usize),
+                parallel: self.frames_parallelism(),
             }
         });
         match self.frames.adapt_playback(config) {

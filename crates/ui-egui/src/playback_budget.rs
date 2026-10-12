@@ -5,6 +5,13 @@
 //! rung, so a slow cut is caught a few frames in; eight renders that would fit the budget
 //! comfortably at the rung above step back up. A rung that is not measurably faster than
 //! the one above it is abandoned and becomes the floor for the rest of the epoch.
+//!
+//! Frames render in parallel, so a render is judged by its share of the throughput, not
+//! by its own length: its service time divided by the renders of the rung in flight when
+//! it finished. Eight frames of 200 ms each in parallel deliver one frame every 25 ms,
+//! which keeps up with 30 fps. Stepping up assumes the rung above fills the whole pool
+//! (`Config::parallel`); a step up that is undone soon after falls back to the measured
+//! parallelism for the rest of the epoch, so the ladder does not oscillate.
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -25,6 +32,8 @@ const VERIFY: usize = 4;
 /// fits within `UP_HEADROOM` of the budget.
 const UP: usize = 8;
 const UP_HEADROOM: f64 = 0.75;
+/// A step down within this many renders of a step up marks the step up as optimistic.
+const BOUNCE: usize = 32;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Config {
@@ -33,6 +42,8 @@ pub(crate) struct Config {
     pub quarter: FrameKey,
     pub budget_ms: f64,
     pub gpu_context: usize,
+    /// Frames the render pool runs at once (at least 1).
+    pub parallel: usize,
 }
 
 impl Config {
@@ -66,7 +77,8 @@ pub(crate) struct Ticket(Arc<()>);
 pub(crate) struct Budget {
     config: Option<Config>,
     epoch: Arc<()>,
-    samples: VecDeque<f64>,
+    /// Per render: (its share of the throughput, its service time over the pool size).
+    samples: VecDeque<(f64, f64)>,
     residency: Option<bool>,
     /// The rung in use: 0 Full, 1 Half, 2 Quarter.
     level: usize,
@@ -76,6 +88,10 @@ pub(crate) struct Budget {
     trial_reference: Option<f64>,
     warmup: usize,
     trial_samples: usize,
+    /// Renders since the last step up (`usize::MAX`: none this epoch).
+    since_up: usize,
+    /// A step up was undone soon after: step up only on measured throughput.
+    bounced: bool,
 }
 
 fn median(samples: impl Iterator<Item = f64>) -> f64 {
@@ -94,8 +110,15 @@ impl Budget {
             (None, None) => true,
             _ => false,
         };
-        if !unchanged {
+        if unchanged {
+            // The pool size is no reason to start over; follow it.
+            if let (Some(a), Some(b)) = (&mut self.config, config) {
+                a.parallel = b.parallel;
+            }
+        } else {
             self.config = config;
+            self.since_up = usize::MAX;
+            self.bounced = false;
             self.level = 0;
             self.floor = config.map_or(0, |c| c.bottom());
             self.trial_reference = None;
@@ -113,6 +136,12 @@ impl Budget {
     }
 
     fn step(&mut self, level: usize) {
+        if level < self.level {
+            self.since_up = 0;
+        } else if level > self.level {
+            self.bounced |= self.since_up < BOUNCE;
+            self.since_up = usize::MAX;
+        }
         self.level = level;
         self.trial_samples = 0;
         self.reset_samples(STEP_WARMUP);
@@ -123,11 +152,23 @@ impl Budget {
         (key.same_series(&expected) && key.revision == expected.revision).then(|| Ticket(self.epoch.clone()))
     }
 
+    /// A render of this epoch finished after `ms` of service. The caller still holds one
+    /// more clone of `ticket` (the job's own), so the tickets alive besides `self.epoch` and
+    /// `ticket` are the renders of this rung in flight, this one included.
     pub fn record(&mut self, ticket: Ticket, ms: f64, resident: bool) {
         if !Arc::ptr_eq(&ticket.0, &self.epoch) || !ms.is_finite() || ms <= 0.0 {
             return;
         }
+        let in_flight = Arc::strong_count(&self.epoch).saturating_sub(2).max(1);
+        drop(ticket);
+        self.record_parallel(ms, in_flight, resident);
+    }
+
+    fn record_parallel(&mut self, ms: f64, in_flight: usize, resident: bool) {
         let Some(config) = self.config else { return };
+        self.since_up = self.since_up.saturating_add(1);
+        let share = ms / in_flight.max(1) as f64;
+        let pooled = ms / in_flight.max(config.parallel).max(1) as f64;
         if self.trial_reference.is_some() {
             self.trial_samples = self.trial_samples.saturating_add(1);
             if self.trial_samples > 64 {
@@ -150,8 +191,9 @@ impl Budget {
         if self.samples.len() >= WINDOW {
             self.samples.pop_front();
         }
-        self.samples.push_back(ms);
+        self.samples.push_back((share, pooled));
         let n = self.samples.len();
+        let shares = |k: usize| self.samples.iter().skip(n.saturating_sub(k)).map(|s| s.0);
         if let Some(reference) = self.trial_reference {
             if n < VERIFY {
                 return;
@@ -159,16 +201,15 @@ impl Budget {
             self.trial_reference = None;
             // Fewer pixels are not necessarily faster: Auto may choose different compositors
             // at each scale. Keep the lower rung only with a clear measured win.
-            if median(self.samples.iter().copied()) >= reference * 0.9 {
+            if median(self.samples.iter().map(|s| s.0)) >= reference * 0.9 {
                 self.floor = self.level.saturating_sub(1);
                 self.step(self.floor);
                 return;
             }
         }
         let threshold = config.budget_ms * 1.1;
-        let recent = self.samples.iter().skip(n.saturating_sub(DOWN));
-        if self.level < self.floor && n >= DOWN && recent.filter(|ms| **ms > threshold).count() >= SLOW_OF {
-            let reference = median(self.samples.iter().skip(n.saturating_sub(DOWN)).copied());
+        if self.level < self.floor && n >= DOWN && shares(DOWN).filter(|ms| *ms > threshold).count() >= SLOW_OF {
+            let reference = median(shares(DOWN));
             self.step(self.level.saturating_add(1));
             self.trial_reference = Some(reference);
             return;
@@ -177,7 +218,9 @@ impl Budget {
             // Cost grows with the pixel count: predict the rung above from this one.
             let above = config.rung(self.level.saturating_sub(1)).scale as f64;
             let here = config.rung(self.level).scale.max(1) as f64;
-            let predicted = median(self.samples.iter().skip(n.saturating_sub(UP)).copied()) * (above / here).powi(2);
+            let recent = self.samples.iter().skip(n.saturating_sub(UP));
+            let cost = if self.bounced { median(recent.map(|s| s.0)) } else { median(recent.map(|s| s.1)) };
+            let predicted = cost * (above / here).powi(2);
             if predicted <= config.budget_ms * UP_HEADROOM {
                 self.step(self.level.saturating_sub(1));
             }
@@ -196,6 +239,7 @@ mod tests {
             quarter: FrameKey { scale: 250, opts: 3, ..full },
             budget_ms: 1000.0 / 30.0,
             gpu_context: 0,
+            parallel: 1,
         }
     }
     /// Record a render at the rung in use (`false` when no ticket is issued for it).
@@ -397,6 +441,58 @@ mod tests {
         for i in 0..64 {
             sample(&mut b, c, if i % 2 == 0 { 60.0 } else { 20.0 }, false);
         }
+        assert_eq!(b.configure(Some(c)), 0);
+    }
+
+    /// Keep `n` renders of the rung in use in flight and finish them one at a time, as the
+    /// pool does in steady state (the job keeps its own ticket while it is recorded).
+    fn parallel(b: &mut Budget, key: FrameKey, n: usize, ms: f64, renders: usize) {
+        let mut flight: VecDeque<Ticket> = (0..n).filter_map(|_| b.ticket(key)).collect();
+        for _ in 0..renders {
+            let Some(t) = flight.pop_front() else { return };
+            b.record(t.clone(), ms, false);
+            drop(t);
+            flight.extend(b.ticket(key));
+        }
+    }
+
+    /// A5: eight frames of 200 ms each in parallel deliver a frame every 25 ms, which keeps
+    /// up with 30 fps: no step down. The same renders one at a time, or eight of 400 ms, miss.
+    #[test]
+    fn parallel_renders_that_keep_up_stay_at_full() {
+        let c = Config { parallel: 8, ..config() };
+        let mut b = Budget::default();
+        b.configure(Some(c));
+        parallel(&mut b, c.full, 8, 200.0, WARMUP + 200);
+        assert_eq!(b.configure(Some(c)), 0);
+        parallel(&mut b, c.full, 8, 400.0, DOWN);
+        assert_eq!(b.configure(Some(c)), 1, "genuinely slow throughput still steps down");
+        b.configure(None);
+        b.configure(Some(c));
+        parallel(&mut b, c.full, 1, 200.0, WARMUP + DOWN);
+        assert_eq!(b.configure(Some(c)), 1, "one frame at a time is slow");
+    }
+
+    /// A5: Half delivering on demand (few renders in flight) steps back up when the pool
+    /// would carry Full; a step up that is undone right away is not tried again on that
+    /// estimate.
+    #[test]
+    fn half_steps_back_up_when_the_pool_carries_full_and_does_not_oscillate() {
+        let c = Config { parallel: 8, ..config() };
+        let mut b = Budget::default();
+        b.configure(Some(c));
+        parallel(&mut b, c.full, 8, 600.0, WARMUP + DOWN);
+        assert_eq!(b.configure(Some(c)), 1);
+        // The cut ends: Half renders 30 ms each, one at a time (on demand).
+        parallel(&mut b, c.half, 1, 30.0, STEP_WARMUP + UP);
+        assert_eq!(b.configure(Some(c)), 0, "Full fits the pool: 4 × 30 / 8 = 15 ms ≤ 25 ms");
+        // But Full turns out slow again: down, and the optimistic estimate is not used again.
+        parallel(&mut b, c.full, 8, 400.0, STEP_WARMUP + DOWN);
+        assert_eq!(b.configure(Some(c)), 1);
+        parallel(&mut b, c.half, 1, 30.0, STEP_WARMUP + 200);
+        assert_eq!(b.configure(Some(c)), 1);
+        // A genuinely light stretch still steps up on measured throughput.
+        parallel(&mut b, c.half, 1, 5.0, UP);
         assert_eq!(b.configure(Some(c)), 0);
     }
 
