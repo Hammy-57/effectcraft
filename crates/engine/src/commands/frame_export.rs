@@ -35,7 +35,7 @@ fn render_with(s: &Session, project: &Project, comp: ItemId, t: Tick, scale: f64
         draft_shadows: s.prefs.three_d.realtime_shadows,
         ..Default::default()
     };
-    let mut r = Renderer::new(project, s.footage.as_ref(), opts);
+    let mut r = Renderer::new(project, effectcraft_render::exact_footage(s.footage.as_ref()), opts);
     r.expr = s.expr.as_deref();
     r.accel = s.accel.as_deref();
     r.comp_frame(comp, t)

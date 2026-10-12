@@ -24,6 +24,8 @@ effectcraft-engine = { workspace = true }
 effectcraft-host = { workspace = true }
 effectcraft-automation = { workspace = true }
 effectcraft-ui-egui = { workspace = true }
+# Fork-only: hardware ProRes decoding for previews (docs/adr/0001-platform-ffi.md).
+effectcraft-platform = { workspace = true }
 effectcraft-render = { workspace = true }
 effectcraft-gpu = { workspace = true }
 effectcraft-time = { workspace = true }

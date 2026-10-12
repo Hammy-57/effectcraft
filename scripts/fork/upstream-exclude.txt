@@ -23,11 +23,18 @@ crates/ui-egui/tests/ui_local_assets.rs
 # Maintainer-local plan (already gitignored)
 plan/*
 
-hunk: Cargo.toml                        the [profile.local] and [profile.local.package.*] sections (scripts/fork/app.sh)
+# Hardware ProRes decoding for previews (owner decision 2026-10-12: `unsafe` OS FFI, fork-only)
+crates/platform/*
+docs/adr/0001-platform-ffi.md
+
+hunk: Cargo.toml                        the [profile.local] and [profile.local.package.*] sections (scripts/fork/app.sh); the effectcraft-platform workspace dependency and dev profile
+hunk: Cargo.lock                        the effectcraft-platform and objc2-core-media / objc2-core-video / objc2-video-toolbox entries
+hunk: apps/effectcraft/Cargo.toml       the effectcraft-platform dependency (and its `register()` call in apps/effectcraft/src)
+hunk: apps/effectcraft-cli/Cargo.toml   the effectcraft-platform dependency (and its `register()` call in apps/effectcraft-cli/src)
 hunk: CLAUDE.md                         step 5 (the eliasx45 fork paragraph) and every line naming docs/fork, lanes or `cargo xtask agents`
 hunk: AGENTS.md                         §1.9 owner-local Adobe icons exception and its §2 "Sole exception" note
 hunk: .mcp.json                         local entries (effectcraft-ui, the scripts/mcp.sh wrappers)
-hunk: xtask/src/main.rs                 the `mod agents;` line and the `Agents` subcommand
+hunk: xtask/src/main.rs                 the `mod agents;` line, the `Agents` subcommand and the ("platform", 5) layer entry
 hunk: crates/ui-egui/src/lib.rs         `mod local_assets;`; every `crate::local_assets::` call (icons, widgets, viewer, timeline, graph, text panels) is fork-only too: queue-pr.sh flags it
 hunk: crates/ui-egui/tests/ui/main.rs   the `ui_local_assets` module line
 # Motion Library: its panel and content live outside this repo (After Effects integrations). The

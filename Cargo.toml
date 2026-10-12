@@ -46,6 +46,7 @@ effectcraft-hevcenc = { path = "crates/hevcenc" }
 effectcraft-av1enc = { path = "crates/av1enc" }
 effectcraft-plugin = { path = "crates/plugin" }
 effectcraft-buildgen = { path = "crates/buildgen" }
+effectcraft-platform = { path = "crates/platform" }
 
 # foundation
 thiserror = "2"
@@ -74,7 +75,7 @@ exr = "1.74"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 # media codecs + containers: FilmCraft's pure-Rust crates, pinned to a revision (plan/adr/0001).
-# Only `crates/media`, `crates/export` and `crates/interchange` may depend on these.
+# Only `crates/media`, `crates/export`, `crates/interchange` and (fork-only) `crates/platform` may depend on these.
 # Header-only probing of standalone audio files (the same build FilmCraft decodes them with; MPL-2.0).
 symphonia = { version = "0.5.5", default-features = false, features = ["aac", "mp1", "mp2", "mp3", "flac", "alac", "pcm", "wav", "ogg", "vorbis", "isomp4"] }
 filmcraft-codecs = { git = "https://github.com/storytold/filmcraft", rev = "2c5ba7a72619935f0481f99d59409e0d1844b234" }
@@ -165,6 +166,9 @@ opt-level = 3
 opt-level = 3
 
 [profile.dev.package.effectcraft-path]
+opt-level = 3
+
+[profile.dev.package.effectcraft-platform]
 opt-level = 3
 
 [profile.dev.package.effectcraft-media]
