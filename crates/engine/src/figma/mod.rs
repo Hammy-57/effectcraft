@@ -83,13 +83,30 @@ fn set_token(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(d) = path.parent() {
         std::fs::create_dir_all(d).map_err(|e| EngineError::Other(format!("cannot create {}: {e}", d.display())))?;
     }
-    std::fs::write(&path, token).map_err(|e| EngineError::Other(format!("cannot store the token: {e}")))?;
+    write_private(&path, token.as_bytes()).map_err(|e| EngineError::Other(format!("cannot store the token: {e}")))?;
+    Ok(json!({"stored": true}))
+}
+
+/// Write a secret (the Figma token, the Figma bridge's pairing code) to `path`, readable only by
+/// the user: on unix a new file is created with mode 0600 (never briefly readable by others) and
+/// an existing one is narrowed to 0600 before the secret goes in.
+pub fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        o.mode(0o600);
+    }
+    let mut f = o.open(path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
-    Ok(json!({"stored": true}))
+    f.write_all(bytes)?;
+    f.flush()
 }
 
 fn status(s: &mut Session, p: &Value) -> Result<Value> {

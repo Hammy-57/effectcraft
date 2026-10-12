@@ -57,9 +57,15 @@ why, and notes about anything approximated.
 To use another port, change it in `manifest.json` (`devAllowedDomains`) and in `ui.html`
 (`BRIDGE`), then start the bridge with `--port`.
 
-The bridge accepts requests only from the plug-in (origin `null`), figma.com or non-browser clients,
-and only with the pairing code. It writes the payload to a temporary file and runs
-`file.importFigma {payloadPath}` in the app.
+The bridge listens on 127.0.0.1 only, accepts requests only on the loopback host name (no DNS
+rebinding) and only from the plug-in (origin `null`), figma.com or non-browser clients, and imports
+only with the pairing code. Any sandboxed page shares the plug-in's `null` origin, so the code is
+the real protection: it is 12 characters from the operating system's secure random generator
+(`--code` needs at least 8), and after 5 wrong codes in a row the bridge refuses codes for a minute.
+The code file in the settings folder (`figma-bridge-code`) is created readable only by you. One
+transfer can be up to 64 MB (embedded image renders count); send a very large selection in several
+parts. The bridge writes the payload to a temporary file and runs `file.importFigma {payloadPath}`
+in the app.
 
 ## What transfers natively
 
