@@ -315,6 +315,15 @@ pub fn run(b: &mut Backend, name: &str, args: &Value) -> Result<Reply> {
 fn schema(props: Value, required: &[&str]) -> Value {
     json!({"type": "object", "properties": props, "required": required, "additionalProperties": false})
 }
+fn offset_s() -> Value {
+    json!({"type": "integer", "minimum": 0, "description": "Paging: index of the first item to return (default 0). Use the reply's `next_offset` to continue."})
+}
+fn limit_s(what: &str, default: usize) -> Value {
+    json!({"type": "integer", "minimum": 1, "description": format!("Paging: at most this many {what} (default {default}). A cut list says so in `truncated` and `next_offset`.")})
+}
+fn full_s(what: &str) -> Value {
+    json!({"type": "boolean", "description": format!("true: {what} with every field (the long form) instead of the compact default.")})
+}
 fn comp_s() -> Value {
     json!({"type": ["integer", "string"], "description": "Composition item id or name; omit for the active comp."})
 }
@@ -511,7 +520,8 @@ fn get_project(b: &mut Backend, _: &Value) -> Result<Reply> {
 }
 
 fn get_comp(b: &mut Backend, a: &Value) -> Result<Reply> {
-    json_reply(b.exec("comp.info", obj(&[("comp", get(a, "comp"))]))?)
+    let info = b.exec("comp.info", obj(&[("comp", get(a, "comp"))]))?;
+    json_reply(crate::compact::comp_reply(info, a)?)
 }
 
 /// Flatten a `layer.tree` property tree into `[{path, type, value, keys?, expression?}]`.
@@ -542,14 +552,16 @@ fn get_layer(b: &mut Backend, a: &Value) -> Result<Reply> {
     if get(a, "flat").and_then(Value::as_bool) == Some(true) {
         let mut props = vec![];
         flatten(&r["properties"], &mut props);
-        r["properties"] = json!(props);
+        crate::compact::flat_reply(&mut r, props, a)?;
+    } else {
+        crate::compact::tree_hint(&mut r);
     }
     json_reply(r)
 }
 
 fn get_property(b: &mut Backend, a: &Value) -> Result<Reply> {
     let p = obj(&[("layer", Some(need(a, "layer")?)), ("path", Some(need(a, "path")?)), ("comp", get(a, "comp")), ("time", get(a, "time"))]);
-    json_reply(b.exec("prop.get", p)?)
+    json_reply(crate::compact::property_reply(b.exec("prop.get", p)?, a)?)
 }
 
 fn set_property(b: &mut Backend, a: &Value) -> Result<Reply> {
@@ -1077,14 +1089,16 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "get_comp",
-        description: "A composition: id, name, size, frame rate, duration, work area, background and its layers top to bottom (id, index, name, type, in/out/start seconds, blend mode, parent, track matte, switches). Layer ids feed get_layer, get_property/set_property and commands.",
+        description: "A composition: id, name, size, frame rate, duration, work area, background, `layerCount` and its layers top to bottom as compact rows {index, id, name, type, in, out} plus only what isn't the default: start (s, when ≠ 0), stretch (≠ 100), parent, trackMatte, blendMode (≠ Normal), switches (tags of the differing ones: hidden, 3d, solo, locked, shy, adjustment, motion_blur, guide, collapse, fx_off, audio_off, quality:…, sampling:…, frame_blend:…). Paged: up to `limit` layers (default 200) from `offset`; `next_offset` is null when every layer was returned, otherwise `truncated` says how to get the rest. `full: true` returns every field of every layer (label, all switches; long). Layer ids feed get_layer, get_property/set_property and commands.",
         bridge_only: false,
-        schema: || schema(json!({"comp": comp_s()}), &[]),
+        schema: || {
+            schema(json!({"comp": comp_s(), "full": full_s("layers"), "offset": offset_s(), "limit": limit_s("layers", crate::compact::COMP_LIMIT)}), &[])
+        },
         run: get_comp,
     },
     ToolDef {
         name: "get_layer",
-        description: "A layer's property tree (transform, masks, effects, text, shape contents, ...): leaf properties have a `path` usable with get_property/set_property/add_keyframe, plus uid, match id, name, type, value at `time`, keyframes and expression. Groups contain children; inspect them here, then select a leaf path. `flat: true` returns just a list of {path, type, value, keys, expression} (compact).",
+        description: "A layer's property tree (transform, masks, effects, text, shape contents, ...): leaf properties have a `path` usable with get_property/set_property/add_keyframe, plus uid, match id, name, type, value at `time`, keyframes and expression. Groups contain children; inspect them here, then select a leaf path. `flat: true` returns just a list of {path, type, value, keys (count), expression} (compact), paged: up to `limit` (default 150) from `offset`, with `total`, `returned` and `next_offset` (null when done; `truncated` when cut). A big tree carries a `hint` to use flat paging, `depth` or get_property instead.",
         bridge_only: false,
         schema: || {
             schema(
@@ -1092,7 +1106,8 @@ static TOOLS: &[ToolDef] = &[
                     "layer": layer_s(), "comp": comp_s(),
                     "time": {"type": "number", "description": "Comp time in seconds for values (default: current time)."},
                     "depth": {"type": "integer", "description": "Group depth to expand (default all)."},
-                    "flat": {"type": "boolean", "description": "Return a flat list of properties instead of the tree."}
+                    "flat": {"type": "boolean", "description": "Return a flat list of properties instead of the tree."},
+                    "offset": offset_s(), "limit": limit_s("properties (flat: true)", crate::compact::FLAT_LIMIT)
                 }),
                 &["layer"],
             )
@@ -1101,11 +1116,11 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "get_property",
-        description: "Read one property: type, value at `time` (comp seconds; default the current time), whether it is animated, its keyframes (time, value, in/out interpolation) and expression.",
+        description: "Read one property: type, value at `time` (comp seconds; default the current time), whether it is animated, its expression and its keyframes, compact: {time (layer s), value (rounded to 4 decimals), compTime (only when it differs), in/out (only when not Linear)}. Keyframes are paged: `keyCount` total, up to `limit` (default 100) from `offset`, `next_offset` null when done (`truncated` when cut). `full: true` gives every key field (layerTime, compTime, in/out always).",
         bridge_only: false,
         schema: || {
             schema(
-                json!({"layer": layer_s(), "path": path_s(), "comp": comp_s(), "time": {"type": "number", "description": "Comp time in seconds."}}),
+                json!({"layer": layer_s(), "path": path_s(), "comp": comp_s(), "time": {"type": "number", "description": "Comp time in seconds."}, "full": full_s("keyframes"), "offset": offset_s(), "limit": limit_s("keyframes", crate::compact::KEY_LIMIT)}),
                 &["layer", "path"],
             )
         },
@@ -1619,16 +1634,19 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "doc_inspect",
-        description: "Inspect the project overview and active composition (null when no composition is active).",
+        description: "Inspect the project overview and active composition (null when no composition is active), its layers as compact, paged rows like get_comp (`full`, `offset`, `limit` work the same).",
         bridge_only: false,
-        schema: || schema(json!({}), &[]),
+        schema: || schema(json!({"full": full_s("active comp layers"), "offset": offset_s(), "limit": limit_s("layers", crate::compact::COMP_LIMIT)}), &[]),
         run: doc_inspect,
     },
 ];
 
-fn doc_inspect(b: &mut Backend, _: &Value) -> Result<Reply> {
+fn doc_inspect(b: &mut Backend, a: &Value) -> Result<Reply> {
     let project = b.exec("project.summary", json!({}))?;
-    let comp = b.exec("comp.info", json!({})).ok();
+    let comp = match b.exec("comp.info", json!({})) {
+        Ok(info) => Some(crate::compact::comp_reply(info, a)?),
+        Err(_) => None,
+    };
     json_reply(json!({"project": project, "activeComp": comp}))
 }
 
