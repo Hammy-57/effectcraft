@@ -10,6 +10,8 @@
 // Every `src/*.rs` file is a module, declared by build.rs (docs/architecture.md,
 // "Self-registering modules"); declare one here only for another visibility or a submodule folder.
 include!(concat!(env!("OUT_DIR"), "/modules.rs"));
+// By hand: private (as upstream declares them).
+mod expression_diagnostics;
 // By hand: submodules in `i18n/`.
 pub mod i18n;
 // By hand: UI command area files in `menus/` (`AREAS`, see menus.rs).
@@ -150,6 +152,8 @@ pub enum Dialog {
     UnsavedChanges,
     /// Delete Project items that compositions use? (`panels::delete_items`).
     DeleteItems,
+    /// A gradient property's Gradient Editor (`panels::gradient_editor`, `prop.editGradient`).
+    GradientEditor,
 }
 
 /// The desktop's light or dark appearance where egui cannot see it (Wayland compositors that send
@@ -418,6 +422,7 @@ pub struct EffectcraftApp {
     /// Audio panel VU meters.
     pub meter: audio::Meter,
     /// Waveform peak summaries per footage item (see `panels::waveform`).
+    pub(crate) expression_diagnostics: expression_diagnostics::Diagnostics,
     pub(crate) waveforms: panels::waveform::Cache,
     /// Last reveal shortcut and when (double-press shortcuts such as LL).
     pub(crate) last_reveal: Option<(String, f64)>,
@@ -523,6 +528,7 @@ impl EffectcraftApp {
             audio: None,
             scrub: None,
             meter: Default::default(),
+            expression_diagnostics: Default::default(),
             waveforms: Default::default(),
             last_reveal: None,
             applied_prefs: None,
@@ -694,6 +700,25 @@ impl EffectcraftApp {
     /// not repeated), in name order.
     pub fn saved_workspace_names(&self) -> Vec<String> {
         self.ui.saved_workspaces.keys().filter(|k| !dock::WORKSPACES.contains(&k.as_str())).cloned().collect()
+    }
+
+    /// The open Gradient Editor's draft (`panels::gradient_editor`): what OK would set.
+    pub fn gradient_draft(&self) -> &panels::gradient_editor::Draft {
+        &self.dialog_state.gradient
+    }
+
+    /// The open Gradient Editor's draft, to edit (tests and automation; the editor's own fields
+    /// do the same).
+    pub fn gradient_draft_mut(&mut self) -> &mut panels::gradient_editor::Draft {
+        &mut self.dialog_state.gradient
+    }
+
+    /// Feed this frame's share of the queued synthetic input (control channel `ui.click`,
+    /// `ui.drag`…) into `raw_input`. Pointer events go one per frame so egui sees press → moves
+    /// → release as a real gesture.
+    pub fn feed_synthetic(&mut self, raw_input: &mut egui::RawInput) {
+        let n = synthetic_batch(&self.synthetic);
+        raw_input.events.extend(self.synthetic.drain(..n));
     }
 
     /// Show panel `p` (opening it in its usual place if it is closed), bring it to the front and
@@ -1111,9 +1136,14 @@ impl EffectcraftApp {
         self.viewer_image.clone()
     }
 
+    /// The viewer's Resolution: the active composition's (saved with the project).
+    pub fn viewer_res(&self) -> state::Resolution {
+        self.session.active_comp().map(|c| c.resolution).unwrap_or_default()
+    }
+
     fn scrub_enabled(&self) -> bool {
         !self.playback.playing
-            && self.ui.viewer.res == state::Resolution::Auto
+            && self.viewer_res().is_auto()
             && self.session.state.viewer.fast_previews == effectcraft_engine::commands::viewer_cmds::FastPreviews::AdaptiveResolution
             && !self.ui.viewer.interacting
             && !self.ui.viewer.property_interacting
@@ -1141,7 +1171,7 @@ impl EffectcraftApp {
         }
         // Prefer exact current content, even coarse, to an older edited frame.
         if self.scrub_enabled() && self.scrub_preview.matches(key.comp, self.session.revision, key.frame) {
-            let full = self.ui.viewer.res.scale(zoom, ppp);
+            let full = self.viewer_res().scale(zoom, ppp);
             let coarse = full.min((full * 0.25).max(self.session.prefs.adaptive_limit()));
             let k = self.frame_key(ItemId(key.comp), key.frame, coarse);
             if k.scale < key.scale
@@ -1162,24 +1192,19 @@ impl EffectcraftApp {
         if self.playback.playing
             && let Some(f) = self.playback.res
         {
-            let r = match f {
-                1 => state::Resolution::Full,
-                2 => state::Resolution::Half,
-                3 => state::Resolution::Third,
-                4 => state::Resolution::Quarter,
-                n => state::Resolution::Custom(n.min(40) as u8),
-            };
+            let r = state::Resolution::from_factor(f.into());
             self.frames.adapt_playback(None);
             return r.scale(zoom, ppp);
         }
         // Auto follows the zoom alike while playing and paused, so frames cached while scrubbing
         // play back, and frames cached by a preview stay on screen when it stops.
-        let full = self.ui.viewer.res.scale(zoom, ppp);
+        let res = self.viewer_res();
+        let full = res.scale(zoom, ppp);
         // Native Auto playback measures actual render service times, never cache hits, and
         // ladders Full → Half → Quarter while frames miss their deadline (see playback_budget).
         let adaptive = self.playback.playing
             && !self.playback.caching
-            && self.ui.viewer.res == state::Resolution::Auto
+            && res.is_auto()
             && self.session.state.viewer.fast_previews == effectcraft_engine::commands::viewer_cmds::FastPreviews::AdaptiveResolution
             && !self.ui.viewer.interacting
             && !self.ui.viewer.property_interacting
@@ -1209,7 +1234,7 @@ impl EffectcraftApp {
         }
         // Fast Previews ▸ Adaptive Resolution / Fast Draft: lower resolution while dragging.
         let (_, k) = self.session.state.viewer.fast_previews.render(self.ui.viewer.interacting || self.ui.viewer.property_interacting);
-        if k < 1.0 && self.ui.viewer.res == state::Resolution::Auto {
+        if k < 1.0 && res.is_auto() {
             return full.min((full * 0.5).max(self.session.prefs.adaptive_limit()));
         }
         full
@@ -1628,8 +1653,8 @@ impl EffectcraftApp {
             return;
         }
         let step = plan.map_or(1, |p| p.step);
-        // Never further ahead than the RAM preview holds: those frames would be the first to
-        // go, or evict the ones the preview shows first (#595).
+        // Never further ahead than the RAM preview holds: those frames would evict the ones the
+        // preview shows first, or be evicted before it gets there (#595).
         let window = (ahead * 3).min(self.frames_that_fit(&c, scale) - 1);
         for k in 0..window {
             if queued >= ahead as usize || !video {
@@ -2142,6 +2167,11 @@ impl EffectcraftApp {
                         gpu.context().clear_uploads();
                     }
                 }
+                effectcraft_engine::Event::CopyImage { width, height, rgba } => {
+                    if let Err(e) = copy_image(ctx, width, height, &rgba) {
+                        self.ui.status = e;
+                    }
+                }
             }
         }
     }
@@ -2196,6 +2226,7 @@ impl EffectcraftApp {
             self.session.poll_camera(true);
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
+        self.run_script_tasks(&ctx);
         self.apply_prefs(&ctx);
         self.handle_events(&ctx);
         panels::unsaved::on_close_requested(self, &ctx);
@@ -2324,6 +2355,24 @@ impl EffectcraftApp {
 }
 
 impl EffectcraftApp {
+    /// Scripts' `app.scheduleTask` tasks that are due (repeating ones keep a ScriptUI panel
+    /// fresh): errors as a toast, the last line printed in the status bar, and a repaint when
+    /// the next one is due.
+    fn run_script_tasks(&mut self, ctx: &egui::Context) {
+        if self.session.script_ui.task_hosts.is_empty() {
+            return;
+        }
+        let Some(r) = effectcraft_engine::scriptui::ScriptUi::run_tasks(&mut self.session) else { return };
+        if let Some(msg) = r["errors"].as_array().and_then(|e| e.first()).and_then(|e| e["message"].as_str()) {
+            self.toast = Some((format!("Scheduled script task: {msg}"), ctx.input(|i| i.time)));
+        } else if let Some(line) = r["output"].as_array().and_then(|o| o.last()).and_then(|l| l.as_str()) {
+            self.ui.status = line.to_string();
+        }
+        if let Some(next) = r["next"].as_u64() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(next));
+        }
+    }
+
     /// Auto-save a dirty project when the interval has passed (Settings ▸ Project ▸ Auto-Save).
     fn tick_autosave(&mut self, ctx: &egui::Context) {
         let now = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
@@ -2399,10 +2448,7 @@ impl eframe::App for EffectcraftApp {
 
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         let injected = !self.synthetic.is_empty();
-        if injected {
-            let n = synthetic_batch(&self.synthetic);
-            raw_input.events.extend(self.synthetic.drain(..n));
-        }
+        self.feed_synthetic(raw_input);
         if pointer_wrap::prepare_input(ctx, raw_input, injected) {
             self.session.history.merge_key = None;
         }
@@ -2506,6 +2552,18 @@ pub(crate) fn synthetic_batch(queue: &[egui::Event]) -> usize {
 /// Advance playback with the viewer's scale (called by the viewer panel each frame).
 pub(crate) fn tick_playback(app: &mut EffectcraftApp, ctx: &egui::Context, scale: f64) {
     app.advance_playback(ctx, scale);
+}
+
+/// Put `width` × `height` straight-alpha RGBA8 pixels on the system clipboard (Composition ▸ Copy
+/// Frame to Clipboard). The pixel count is checked first: egui's image constructor panics on a
+/// size that doesn't match its buffer.
+fn copy_image(ctx: &egui::Context, width: u32, height: u32, rgba: &[u8]) -> Result<(), String> {
+    let (w, h) = (width as usize, height as usize);
+    if w == 0 || h == 0 || w.checked_mul(h).and_then(|n| n.checked_mul(4)) != Some(rgba.len()) {
+        return Err(format!("cannot copy a malformed {width}×{height} image to the clipboard"));
+    }
+    ctx.copy_image(egui::ColorImage::from_rgba_unmultiplied([w, h], rgba));
+    Ok(())
 }
 
 /// Maximize a first window that doesn't fit the screen, which fits it to the space beside the
@@ -2626,6 +2684,55 @@ mod fit_window_tests {
 }
 
 #[cfg(test)]
+mod copy_frame_tests {
+    use super::*;
+
+    fn copied(output: &egui::FullOutput) -> Vec<&egui::ColorImage> {
+        output
+            .platform_output
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                egui::OutputCommand::CopyImage(image) => Some(image),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Composition ▸ Copy Frame to Clipboard puts the rendered frame on the system clipboard.
+    #[test]
+    fn copy_frame_puts_the_frame_on_the_clipboard() {
+        let mut session = Session::default();
+        session.execute("comp.new", json!({"name": "Copy", "width": 8, "height": 6, "duration": 1})).unwrap();
+        session.execute("layer.newSolid", json!({"color": "#ff0000"})).unwrap();
+        let mut app = EffectcraftApp::new(session);
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            crate::menus::invoke(&mut app, ui.ctx(), "comp.copyFrame", json!({})).unwrap();
+            app.handle_events(ui.ctx());
+        });
+        output.textures_delta.clear();
+        let images = copied(&output);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].size, [8, 6]);
+        assert!(images[0].pixels.iter().all(|p| *p == egui::Color32::from_rgb(255, 0, 0)));
+    }
+
+    /// A malformed image never reaches egui's panicking constructor.
+    #[test]
+    fn a_malformed_image_is_an_error_not_a_crash() {
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            assert!(copy_image(ui.ctx(), 4, 4, &[0; 10]).is_err());
+            assert!(copy_image(ui.ctx(), 0, 4, &[]).is_err());
+            assert!(copy_image(ui.ctx(), u32::MAX, u32::MAX, &[0; 4]).is_err());
+        });
+        output.textures_delta.clear();
+        assert!(copied(&output).is_empty());
+    }
+}
+
+#[cfg(test)]
 mod gpu_failure_tests {
     use super::*;
 
@@ -2703,7 +2810,8 @@ mod playback_budget_tests {
     fn app() -> EffectcraftApp {
         let mut app = EffectcraftApp::new(Session::default());
         app.session.execute("comp.new", json!({"width": 64, "height": 64, "duration": 2})).unwrap();
-        app.ui.viewer.res = state::Resolution::Auto;
+        let comp = app.session.active_comp_id().unwrap();
+        app.session.set_resolution(comp, state::Resolution::Auto).unwrap();
         app.session.state.viewer.fast_previews = FastPreviews::AdaptiveResolution;
         app.playback.playing = true;
         app.playback.fps = 30.0;
@@ -2732,11 +2840,11 @@ mod playback_budget_tests {
         assert_eq!(app.viewer_scale(1.0, 1.0), 1.0);
         app.playback.playing = true;
         for res in [state::Resolution::Full, state::Resolution::Half, state::Resolution::Quarter] {
-            app.ui.viewer.res = res;
+            app.session.set_resolution(app.session.active_comp_id().unwrap(), res).unwrap();
             slow(&app);
             assert_eq!(app.viewer_scale(1.0, 1.0), res.scale(1.0, 1.0));
         }
-        app.ui.viewer.res = state::Resolution::Auto;
+        app.session.set_resolution(app.session.active_comp_id().unwrap(), state::Resolution::Auto).unwrap();
         app.playback.res = Some(1);
         slow(&app);
         assert_eq!(app.viewer_scale(1.0, 1.0), 1.0);

@@ -25,7 +25,7 @@
 //! device, see `compositor_gpu`), so the texture comes back as RGBA8 bytes; a worker does not
 //! wait for them but goes on to its next frame, and the frame lands later (`landing`).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -380,6 +380,13 @@ type Identity = (u64, Option<Arc<Project>>);
 /// Content keys of (project revision, comp), computed once per revision.
 type ContentKeys = Arc<Mutex<HashMap<(u64, u64), u128>>>;
 
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Default)]
+struct ContentKeyJobs {
+    running: bool,
+    pending: VecDeque<(Arc<Project>, u64, u64)>,
+}
+
 fn content_key(keys: &ContentKeys, project: &Project, revision: u64, comp: u64) -> u128 {
     if let Some(k) = keys.lock().ok().and_then(|m| m.get(&(revision, comp)).copied()) {
         return k;
@@ -591,6 +598,8 @@ pub struct Frames {
     pub last_ms: Arc<Mutex<f64>>,
     playback_budget: Arc<Mutex<crate::playback_budget::Budget>>,
     content_keys: ContentKeys,
+    #[cfg(not(target_arch = "wasm32"))]
+    content_key_jobs: Arc<Mutex<ContentKeyJobs>>,
     gpu_retired: Arc<AtomicBool>,
     /// Bumped by [`Frames::clear`]: frames asked for before are dropped when they finish.
     epoch: Arc<AtomicU64>,
@@ -665,6 +674,8 @@ impl Default for Frames {
             last_ms: Arc::new(Mutex::new(0.0)),
             playback_budget: Arc::default(),
             content_keys: Arc::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            content_key_jobs: Arc::default(),
             gpu_retired: Arc::default(),
             epoch: Arc::default(),
             identities: Mutex::default(),
@@ -1120,7 +1131,8 @@ impl Frames {
     }
 
     /// Frames of the series of `base` in the disk cache but not in RAM — the blue cache bar.
-    /// `opts` are the viewer's render options (part of the disk key).
+    /// `opts` are the viewer's render options (part of the disk key). Native queries return
+    /// no blue frames until the content key is ready; hashing never blocks timeline painting.
     pub fn disk_frames(&self, src: &RenderSource, base: &FrameKey, frames: i64, opts: &RenderOpts) -> Vec<i64> {
         let remote = self.remote.as_ref().filter(|r| r.disk());
         let contains = |k: u128| match (&src.disk, remote) {
@@ -1150,14 +1162,64 @@ impl Frames {
         {
             return v.iter().copied().filter(|f| !in_ram(f)).collect();
         }
-        let v: Vec<i64> = (0..frames.clamp(0, 100_000))
-            .filter(|f| contains(frame_disk_key(&self.content_keys, &src.project, &FrameKey { frame: *f, ..*base }, oh)))
-            .collect();
+        // Native: hashing the comp never blocks timeline painting; until its key is ready a worker
+        // computes it and there are no blue frames (nothing remembered).
+        #[cfg(not(target_arch = "wasm32"))]
+        let content = {
+            let known = self.content_keys.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&(base.revision, base.comp)).copied();
+            let Some(content) = known else {
+                self.request_content_key(src.project.clone(), base.revision, base.comp);
+                return vec![];
+            };
+            content
+        };
+        #[cfg(target_arch = "wasm32")]
+        let content = content_key(&self.content_keys, &src.project, base.revision, base.comp);
+        let v: Vec<i64> = (0..frames.clamp(0, 100_000)).filter(|f| contains(disk_cache::frame_key(content, *f, base.scale, base.view ^ oh))).collect();
         if let Ok(mut bar) = self.bar.lock() {
             bar.disk.retain(|(s, ..)| *s != series);
             remember(&mut bar.disk, series, k, &v);
         }
         v.into_iter().filter(|f| !in_ram(f)).collect()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn request_content_key(&self, project: Arc<Project>, revision: u64, comp: u64) {
+        let mut jobs = self.content_key_jobs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Coalesce rapid edits. One worker hashes at most one revision at a time; retained
+        // snapshots are bounded even with multiple timelines open.
+        jobs.pending.retain(|(_, _, c)| *c != comp);
+        if jobs.pending.len() >= 8 {
+            jobs.pending.pop_front();
+        }
+        jobs.pending.push_back((project, revision, comp));
+        if jobs.running {
+            return;
+        }
+        jobs.running = true;
+        drop(jobs);
+        let (jobs, keys, ctx) = (self.content_key_jobs.clone(), self.content_keys.clone(), self.ctx.clone());
+        let work = move || loop {
+            let next = {
+                let mut jobs = jobs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let next = jobs.pending.pop_back();
+                if next.is_none() {
+                    jobs.running = false;
+                }
+                next
+            };
+            let Some((project, revision, comp)) = next else { return };
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| content_key(&keys, &project, revision, comp))).is_err() {
+                log::error!("could not compute a preview disk-cache key; the cache indicator will retry");
+            }
+            if let Some(ctx) = &ctx {
+                ctx.request_repaint();
+            }
+        };
+        match &self.pool {
+            Some(pool) => pool.spawn(work),
+            None => rayon::spawn(work),
+        }
     }
 
     /// Change the RAM preview cache budget (Settings ▸ Memory & CPU), evicting the oldest
@@ -1851,6 +1913,9 @@ impl Worker {
             q.running.remove(&key);
             if urgent {
                 q.urgent_running = q.urgent_running.saturating_sub(1);
+                if let Some(i) = q.urgent_cancels.iter().position(|(k, _)| *k == key) {
+                    q.urgent_cancels.swap_remove(i);
+                }
             }
             if let Some(i) = q.urgent_cancels.iter().position(|(k, _)| *k == key) {
                 q.urgent_cancels.swap_remove(i);
@@ -2315,6 +2380,68 @@ mod tests {
         assert!(frames.try_spawn_background(move || done.send(()).unwrap()));
         rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
         idle();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn disk_indicator_does_not_hash_on_ui_thread_and_coalesces_edits() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+        struct Disk(u128);
+        impl RemoteFrames for Disk {
+            fn slots(&self) -> usize {
+                1
+            }
+            fn disk(&self) -> bool {
+                true
+            }
+            fn disk_contains(&self, key: u128) -> bool {
+                self.0 == key
+            }
+            fn start(&self, _: RemoteJob, done: RemoteDone) {
+                done(Err("test has no renderer".into()));
+            }
+        }
+        let mut s = effectcraft_engine::Session::default();
+        s.execute("comp.new", serde_json::json!({"width":32,"height":18,"duration":1})).unwrap();
+        let cid = s.active_comp_id().unwrap();
+        let opts = RenderOpts::default();
+        let stored = disk_cache::frame_key(disk_cache::comp_content_key(&s.project, cid), 2, 1000, opts_hash(&opts));
+        let mut frames = Frames { pool: Some(Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap())), ..Default::default() };
+        frames.set_remote(Some(Arc::new(Disk(stored))));
+        let (entered, started) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        frames.pool.as_ref().unwrap().spawn(move || {
+            entered.send(()).unwrap();
+            wait.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        started.recv_timeout(Duration::from_secs(3)).unwrap();
+        let src = RenderSource {
+            freeze_feedback: Default::default(),
+            project: s.project.clone(),
+            footage: s.footage.clone(),
+            expr: None,
+            layer_cache: Arc::default(),
+            gpu: None,
+            gpu_display: false,
+            disk: None,
+        };
+        let mut base = key(1, 0, 0);
+        base.comp = cid.0;
+        for revision in 1..50 {
+            base.revision = revision;
+            assert!(frames.disk_frames(&src, &base, 30, &opts).is_empty());
+        }
+        assert!(frames.content_keys.lock().unwrap().is_empty(), "painting computed a content hash while the worker was blocked");
+        assert_eq!(frames.content_key_jobs.lock().unwrap().pending.len(), 1);
+        release.send(()).unwrap();
+        let until = Instant::now() + Duration::from_secs(3);
+        while !frames.content_keys.lock().unwrap().contains_key(&(base.revision, base.comp)) {
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(frames.disk_frames(&src, &base, 30, &opts), vec![2], "the blue indicator must return once its key is ready");
+        assert_eq!(frames.content_keys.lock().unwrap().len(), 1, "superseded revisions were hashed");
     }
 
     /// Frames larger than the texture limit are averaged down by a whole factor (#201: an

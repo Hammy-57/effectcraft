@@ -45,10 +45,16 @@ mod ui_azerty_shortcuts;
 mod ui_blank_context_menus;
 #[path = "../ui_camera_tracker.rs"]
 mod ui_camera_tracker;
+#[path = "../ui_character_eyedropper.rs"]
+mod ui_character_eyedropper;
 #[path = "../ui_color_hex.rs"]
 mod ui_color_hex;
+#[path = "../ui_comp_presets.rs"]
+mod ui_comp_presets;
 #[path = "../ui_control_channel.rs"]
 mod ui_control_channel;
+#[path = "../ui_control_modifiers.rs"]
+mod ui_control_modifiers;
 #[path = "../ui_dock_resize.rs"]
 mod ui_dock_resize;
 #[path = "../ui_drag_drop.rs"]
@@ -61,12 +67,20 @@ mod ui_fingerprints;
 mod ui_float_windows;
 #[path = "../ui_font_search.rs"]
 mod ui_font_search;
+#[path = "../ui_frame_step.rs"]
+mod ui_frame_step;
 #[path = "../ui_fx_console.rs"]
 mod ui_fx_console;
 #[path = "../ui_fx_editors.rs"]
 mod ui_fx_editors;
 #[path = "../ui_gpu.rs"]
 mod ui_gpu;
+#[path = "../ui_gradient_editor.rs"]
+mod ui_gradient_editor;
+#[path = "../ui_gradient_handles.rs"]
+mod ui_gradient_handles;
+#[path = "../ui_gradient_value.rs"]
+mod ui_gradient_value;
 #[path = "../ui_graph_fit.rs"]
 mod ui_graph_fit;
 #[path = "../ui_graph_handles.rs"]
@@ -77,6 +91,8 @@ mod ui_inline_edit;
 mod ui_keyframes;
 #[path = "../ui_large_project.rs"]
 mod ui_large_project;
+#[path = "../ui_layer_panel_zoom.rs"]
+mod ui_layer_panel_zoom;
 #[path = "../ui_live_preview.rs"]
 mod ui_live_preview;
 #[path = "../ui_local_assets.rs"]
@@ -89,6 +105,8 @@ mod ui_menus;
 mod ui_panel_focus;
 #[path = "../ui_panel_menu.rs"]
 mod ui_panel_menu;
+#[path = "../ui_panel_windows.rs"]
+mod ui_panel_windows;
 #[path = "../ui_panels.rs"]
 mod ui_panels;
 #[path = "../ui_parameter_spacing.rs"]
@@ -97,6 +115,8 @@ mod ui_parameter_spacing;
 mod ui_preview_align;
 #[path = "../ui_project_delete.rs"]
 mod ui_project_delete;
+#[path = "../ui_project_keyboard.rs"]
+mod ui_project_keyboard;
 #[path = "../ui_project_rows.rs"]
 mod ui_project_rows;
 #[path = "../ui_properties.rs"]
@@ -125,6 +145,8 @@ mod ui_tabs;
 mod ui_tail;
 #[path = "../ui_text_edit.rs"]
 mod ui_text_edit;
+#[path = "../ui_theme_favorites.rs"]
+mod ui_theme_favorites;
 #[path = "../ui_time_zoom_controls.rs"]
 mod ui_time_zoom_controls;
 #[path = "../ui_timeline_columns.rs"]
@@ -137,6 +159,8 @@ mod ui_timeline_switches;
 mod ui_timeline_trim;
 #[path = "../ui_timeline_zoom.rs"]
 mod ui_timeline_zoom;
+#[path = "../ui_toolbar_gradient.rs"]
+mod ui_toolbar_gradient;
 #[path = "../ui_tracker.rs"]
 mod ui_tracker;
 #[path = "../ui_unreadable_footage.rs"]

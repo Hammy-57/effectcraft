@@ -29,7 +29,6 @@ const PINNED_INVOKE: &[&str] = &[
     "window.smallTabs",
     "window.panelMenu",
     "markers.dialog",
-    "view.res.auto",
     "view.theme.*",
     "playback.ramPreview",
     "playback.preview.shiftSpacebar",
@@ -73,6 +72,7 @@ const PINNED_INVOKE: &[&str] = &[
     "keys.interpolation",
     "layer.timeStretch",
     "window.maximizeApp",
+    "window.panelWindow",
     "view.theme.toggle",
     "project.deleteWithoutConfirmation",
 ];
@@ -80,6 +80,7 @@ const PINNED_INVOKE: &[&str] = &[
 /// The ids `menus::frontend` handled (frontend events of engine commands), in the old match order.
 const PINNED_FRONTEND: &[&str] = &[
     "app.about",
+    "prop.editGradient",
     "playback.scrubAudio",
     "view.newViewer",
     "window.scriptPanel",
@@ -101,10 +102,6 @@ const PINNED_FRONTEND: &[&str] = &[
     "playback.audio",
     "view.zoomIn",
     "view.zoomOut",
-    "view.res.full",
-    "view.res.half",
-    "view.res.third",
-    "view.res.quarter",
     "view.res.custom",
     "view.rulers",
     "view.guides",
@@ -169,7 +166,7 @@ fn handles_exactly_the_pinned_ids() {
         want.sort();
         assert_eq!(got, want, "{stage:?}: the handled ids changed; update PINNED_* only for a deliberate change");
     }
-    assert_eq!(PINNED_INVOKE.len() + PINNED_FRONTEND.len(), 128);
+    assert_eq!(PINNED_INVOKE.len() + PINNED_FRONTEND.len(), 125);
 }
 
 #[test]

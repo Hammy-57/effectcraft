@@ -1339,6 +1339,12 @@ impl GpuContext {
         self.unavailable.push((entry, "dropped by a test".into()));
     }
 
+    /// Bytes of readback staging buffers kept for reuse (tests).
+    #[cfg(test)]
+    pub(crate) fn staging_bytes(&self) -> u64 {
+        self.staging.lock().map(|s| s.iter().map(|(k, v)| k * v.len() as u64).sum()).unwrap_or(0)
+    }
+
     pub fn can_readback(&self) -> bool {
         self.readbacks.check().is_ok() && (self.can_wait() || self.deferred.is_some())
     }

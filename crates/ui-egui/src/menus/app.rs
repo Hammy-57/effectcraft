@@ -19,6 +19,8 @@ pub(crate) fn handlers() -> &'static [Handler] {
         Handler::ui("app.solidSettings", solid_settings),
         Handler::ui("layer.newSolid", solid_settings),
         Handler::frontend("app.about", about),
+        // A gradient property's "Edit Gradient…" (the Timeline's value): the Gradient Editor.
+        Handler::frontend("prop.editGradient", edit_gradient),
         Handler::frontend("app.settings", settings),
         Handler::frontend("app.gpuInfo", gpu_info),
         Handler::frontend("app.hide", hide),
@@ -76,13 +78,17 @@ fn settings(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, p: Value)
     Ok(Value::Null)
 }
 
+fn edit_gradient(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, p: Value) -> Result<Value, String> {
+    crate::panels::gradient_editor::open(app, &p)
+}
+
 fn gpu_info(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, _p: Value) -> Result<Value, String> {
-    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     crate::panels::dialogs::info(
         app,
         "GPU Information",
         &format!(
-            "Compositing: CPU, {threads} threads (pure Rust, rayon).\nDisplay: egui on wgpu.\nLayer cache: {} MB  •  Preview cache: {} MB.",
+            "{}Layer cache: {} MB  •  Preview cache: {} MB.",
+            effectcraft_engine::sysinfo::gpu_summary(&app.session),
             app.session.layer_cache.budget() >> 20,
             app.frames.budget() >> 20
         ),

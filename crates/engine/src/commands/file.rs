@@ -48,7 +48,8 @@ pub(crate) fn open(s: &mut Session, p: &Value) -> Result<Value> {
     let text = String::from_utf8(bytes).map_err(|_| EngineError::Other("not a text project file".into()))?;
     // XML copies (File ▸ Save a Copy As XML…) open like the JSON project.
     let text = if crate::xml_project::is_xml(&text) { crate::xml_project::from_xml(&text).map_err(EngineError::Other)? } else { text };
-    let mut proj = Project::from_json(&text).map_err(|e| EngineError::Other(format!("{path} is not a project EffectCraft can open: {e}")))?;
+    let (mut proj, repaired) =
+        Project::from_json_repaired(&text).map_err(|e| EngineError::Other(format!("{path} is not a project EffectCraft can open: {e}")))?;
     let dir = std::path::Path::new(path).parent().unwrap_or_else(|| std::path::Path::new("."));
     super::import_project::resolve_footage(s, &mut proj, dir, false);
     // The comps open when it was saved reopen, in their tabs, at their times (as in After
@@ -56,6 +57,13 @@ pub(crate) fn open(s: &mut Session, p: &Value) -> Result<Value> {
     let meta = effectcraft_project::file_meta(&text);
     s.replace_project_with(proj, Some(path.to_string()), meta.open_comps.as_ref());
     s.note_project_path(path);
+    // Values past the limits (a corrupt or hostile file) were brought within them (#788).
+    if !repaired.is_empty() {
+        let more = repaired.len().saturating_sub(3);
+        let shown = repaired.iter().take(3).cloned().collect::<Vec<_>>().join("; ");
+        let more = if more > 0 { format!(" and {more} more") } else { String::new() };
+        s.toast(format!("This project had values outside EffectCraft's limits, corrected when it opened: {shown}{more}."));
+    }
     // The save guard compares against the file as opened; other processes with it open are named.
     crate::hosts::remember(path);
     crate::hosts::set_project(Some(path));
@@ -76,7 +84,7 @@ pub(crate) fn open(s: &mut Session, p: &Value) -> Result<Value> {
     if s.check_footage_on_open {
         crate::footage_check::start(s, None, false)?;
     }
-    let mut out = json!({"path": path, "savedBy": saved_by});
+    let mut out = json!({"path": path, "savedBy": saved_by, "repaired": repaired});
     if let Some(h) = handover {
         out["handover"] = json!(h);
     }

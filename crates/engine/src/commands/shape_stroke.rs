@@ -281,11 +281,16 @@ pub fn first_paint(layer: &Layer, lt: Tick) -> (Option<[f64; 4]>, Option<[f64; 4
 /// toolbar's swatch shows for a selected shape layer): None when it is switched off or there is
 /// none, Solid Color for a Fill / Stroke, Linear or Radial for a Gradient Fill / Stroke.
 pub fn first_kinds(layer: &Layer) -> (PaintKind, PaintKind) {
+    first_paint_kinds(layer, Tick::ZERO)
+}
+
+/// [`first_kinds`] with an animated Gradient Type read at layer time `lt`.
+pub fn first_paint_kinds(layer: &Layer, lt: Tick) -> (PaintKind, PaintKind) {
     let (mut fill, mut stroke) = (None, None);
     let kind = |g: &PropGroup| match g.match_id.as_str() {
         _ if !g.enabled => PaintKind::None,
         "fill" | "stroke" => PaintKind::Solid,
-        _ if g.get("type").is_some_and(|t| t.value == KV::Enum(1)) => PaintKind::Radial,
+        _ if g.get("type").is_some_and(|t| t.value_at(lt).as_enum() == 1) => PaintKind::Radial,
         _ => PaintKind::Linear,
     };
     if let Some(c) = layer.props.sub("contents") {
@@ -579,8 +584,9 @@ fn fill_stroke(s: &mut Session, p: &Value) -> Result<Value> {
         })?;
     }
     let l = shapes.first().and_then(|id| s.project.comp(cid)?.layer(*id)).ok_or(EngineError::NoComp)?;
-    let (fill, stroke, width) = first_paint(l, l.layer_time(s.time()));
-    let (fill_type, stroke_type) = first_kinds(l);
+    let lt = l.layer_time(s.time());
+    let (fill, stroke, width) = first_paint(l, lt);
+    let (fill_type, stroke_type) = first_paint_kinds(l, lt);
     Ok(json!({"fill": fill, "stroke": stroke, "strokeWidth": width, "fillType": fill_type.id(), "strokeType": stroke_type.id()}))
 }
 

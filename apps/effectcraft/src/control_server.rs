@@ -42,6 +42,7 @@ pub struct Started {
 pub fn start(port: u16, ctx: egui::Context, tx: Sender<ControlRequest>) -> Result<Started, String> {
     let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|e| bind_error(port, &e))?;
     let port = listener.local_addr().map(|a| a.port()).unwrap_or(port);
+    log::info!("control server listening on 127.0.0.1:{port}");
     let events = ControlEvents::default();
     let shared = Shared { tx, ctx, events: events.clone(), replies: Arc::default(), clients: Arc::default(), timeout: REQUEST_TIMEOUT };
     std::thread::spawn(move || accept_loop(listener, shared));

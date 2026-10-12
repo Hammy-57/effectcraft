@@ -30,7 +30,7 @@ fn progressive_scrub_deadlines() {
         session.disk_cache = None;
         let mut app = EffectcraftApp::new(session);
         app.gpu = Some(gpu.clone());
-        app.ui.viewer.res = Resolution::Auto;
+        app.session.set_resolution(app.session.active_comp_id().unwrap(), Resolution::Auto).unwrap();
         app.session.state.viewer.fast_previews = if adaptive { FastPreviews::AdaptiveResolution } else { FastPreviews::Off };
         let coarse = 0.25f64.max(app.session.prefs.adaptive_limit()).min(1.0);
         // Warm AutoPick at both scales equally, outside the measured cursor range.

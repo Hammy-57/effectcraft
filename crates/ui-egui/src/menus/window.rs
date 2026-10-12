@@ -29,6 +29,9 @@ pub(crate) fn handlers() -> &'static [Handler] {
         Handler::ui("window.soloPanels", panel_op),
         Handler::ui("window.smallTabs", panel_op),
         Handler::ui("window.panelMenu", panel_op),
+        // Multiple monitors: {panel, window?: bool} moves a panel into its own native window (or
+        // back into the main window; no `window` toggles).
+        Handler::ui("window.panelWindow", panel_window),
         // Window ▸ <ScriptUI panel>: dock (or bring forward) the panel the script built.
         Handler::frontend("window.scriptPanel", script_panel),
         Handler::frontend("window.panel", panel),
@@ -304,4 +307,19 @@ fn assign_workspace_shortcut(app: &mut EffectcraftApp, ctx: &egui::Context, _id:
     let mut q = p.clone();
     q["workspace"] = json!(app.ui.workspace);
     super::run_engine(app, ctx, "window.assignWorkspaceShortcut", q)
+}
+
+fn panel_window(app: &mut EffectcraftApp, ctx: &egui::Context, _id: &str, params: Value) -> Result<Value, String> {
+    // A panel name ("Info", "Effect Controls") or its serialized form ({"Viewer": 2}).
+    let value = params.get("panel").ok_or("panelWindow: need `panel`")?;
+    let panel = match value.as_str() {
+        Some(name) => PanelKind::from_name(name).ok_or(format!("unknown panel `{name}`"))?,
+        None => serde_json::from_value::<PanelKind>(value.clone()).map_err(|_| "panelWindow: unknown `panel`".to_string())?,
+    };
+    let window = match params.get("window") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(value.as_bool().ok_or("panelWindow: `window` must be true or false")?),
+    };
+    let window = app.set_panel_window(ctx, panel, window)?;
+    Ok(json!({"window": window}))
 }

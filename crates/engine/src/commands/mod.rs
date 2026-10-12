@@ -31,6 +31,8 @@ pub(crate) use app_more::report_text as report_text_for_tests;
 pub(crate) use app_more::view_command;
 pub(crate) use comp_more::encode_png;
 #[cfg(test)]
+pub(crate) use file::open as open_for_tests;
+#[cfg(test)]
 pub(crate) use keys_more::amplitudes as amplitudes_for_tests;
 #[cfg(test)]
 pub(crate) use mask::split_segment as split_segment_for_tests;
@@ -54,6 +56,8 @@ pub struct CommandSpec {
     pub menu: &'static [&'static str],
     /// Default shortcut (egui-style names, `Cmd` = ⌘ on macOS / Ctrl elsewhere).
     pub shortcut: Option<&'static str>,
+    /// Further default shortcuts (the menus and tooltips show `shortcut`).
+    pub alt_shortcuts: &'static [&'static str],
     /// Parameter description for agents and the MCP schema.
     pub params: &'static str,
     pub enabled: Enabled,
@@ -64,8 +68,22 @@ pub struct CommandSpec {
 
 #[macro_export]
 macro_rules! cmd {
+    // Several default shortcuts: `["PageDown", "Cmd+ArrowRight"]`.
+    ($id:literal, $label:literal, [$($m:literal),*], [$sc:literal, $($alt:literal),+], $params:literal, $en:expr, $run:expr) => {
+        $crate::commands::CommandSpec { alt_shortcuts: &[$($alt),+], ..$crate::cmd!($id, $label, [$($m),*], Some($sc), $params, $en, $run) }
+    };
     ($id:literal, $label:literal, [$($m:literal),*], $sc:expr, $params:literal, $en:expr, $run:expr) => {
-        $crate::commands::CommandSpec { id: $id, label: $label, menu: &[$($m),*], shortcut: $sc, params: $params, enabled: $en, run: $run, journal: true }
+        $crate::commands::CommandSpec {
+            id: $id,
+            label: $label,
+            menu: &[$($m),*],
+            shortcut: $sc,
+            alt_shortcuts: &[],
+            params: $params,
+            enabled: $en,
+            run: $run,
+            journal: true,
+        }
     };
 }
 #[macro_export]
@@ -76,6 +94,7 @@ macro_rules! query {
             label: $label,
             menu: &[],
             shortcut: None,
+            alt_shortcuts: &[],
             params: $params,
             enabled: $crate::commands::always,
             run: $run,
@@ -192,6 +211,11 @@ pub(crate) fn proxy_set(s: &mut Session, item: ItemId, footage: effectcraft_proj
 /// (id, name) of the text animation presets.
 pub fn text_preset_list() -> Vec<(String, String)> {
     text_anim::preset_names()
+}
+
+/// (id, name, category) of the built-in animation presets (Transitions…).
+pub fn builtin_preset_list() -> Vec<(String, String, String)> {
+    anim_presets::preset_names()
 }
 
 pub fn find(id: &str) -> Option<&'static CommandSpec> {
@@ -447,18 +471,35 @@ pub(crate) fn merge_p(p: &Value) -> Option<&str> {
     str_p(p, "merge")
 }
 
-/// `comp`: item id or name; default the active comp.
+/// `comp`: item id or name (an all-digit string that names no comp is taken as an id, as MCP
+/// clients often send numbers as strings); default the active comp.
 pub(crate) fn comp_id(s: &Session, p: &Value) -> Result<ItemId> {
     let missing = |v: &Value| EngineError::NoSuchComp(v.to_string());
     match p.get("comp") {
         Some(v @ Value::Number(n)) => n.as_u64().map(ItemId).filter(|id| s.project.comp(*id).is_some()).ok_or_else(|| missing(v)),
-        Some(v @ Value::String(name)) => s.project.items.values().find(|i| &i.name == name && i.as_comp().is_some()).map(|i| i.id).ok_or_else(|| missing(v)),
+        Some(v @ Value::String(name)) => s
+            .project
+            .items
+            .values()
+            .find(|i| &i.name == name && i.as_comp().is_some())
+            .map(|i| i.id)
+            .or_else(|| digits_id(name).map(ItemId).filter(|id| s.project.comp(*id).is_some()))
+            .ok_or_else(|| missing(v)),
         _ => s.active_comp_id().ok_or(EngineError::NoComp),
     }
 }
 
+/// An all-ASCII-digit string as a number (`"98"` -> 98); anything else (names, `#n`, signs) is `None`.
+fn digits_id(s: &str) -> Option<u64> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
+}
+
 /// Resolve a layer reference: id (a number, never a stack position: an unknown id is `None`
-/// rather than silently another layer), `"#n"` (1-based stack position) or name.
+/// rather than silently another layer), `"#n"` (1-based stack position) or name. An all-digit
+/// string that names no layer is resolved as the id it spells.
 pub(crate) fn resolve_layer(comp: &Comp, v: &Value) -> Option<LayerId> {
     match v {
         Value::Number(n) => {
@@ -469,7 +510,7 @@ pub(crate) fn resolve_layer(comp: &Comp, v: &Value) -> Option<LayerId> {
             if let Some(i) = s.strip_prefix('#').and_then(|i| i.parse::<usize>().ok()) {
                 return comp.layers.get(i.checked_sub(1)?).map(|l| l.id);
             }
-            comp.layers.iter().find(|l| &l.name == s).map(|l| l.id)
+            comp.layers.iter().find(|l| &l.name == s).map(|l| l.id).or_else(|| digits_id(s).and_then(|id| resolve_layer(comp, &Value::from(id))))
         }
         _ => None,
     }

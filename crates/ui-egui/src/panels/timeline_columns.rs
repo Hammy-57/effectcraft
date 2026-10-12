@@ -501,7 +501,7 @@ pub(super) fn header(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Pain
         let under = hresp.interact_pointer_pos().and_then(|pt| column_at(cw, pt.x));
         ctx.data_mut(|d| d.insert_temp(egui::Id::new("tl-colhdr-under"), under.unwrap_or("")));
     }
-    hresp.context_menu(|ui| {
+    crate::widgets::context_menu(&hresp, |ui| {
         let under: &str = ctx.data(|d| d.get_temp(egui::Id::new("tl-colhdr-under"))).unwrap_or("");
         if !under.is_empty() && under != "name" && ui.button(crate::i18n::tr("Hide This")).clicked() {
             actions.push(("timeline.column".into(), json!({"column": under, "visible": false})));

@@ -24,18 +24,17 @@ pub fn essential_overrides(ctx: &EvalCtx, layer: &Layer) -> Vec<effectcraft_proj
 }
 
 impl<'a> Renderer<'a> {
-    /// Rasterisation scale of a layer's source: the output scale, or — for text layers, which are
-    /// always continuously rasterised, and Continuously Rasterize shape layers and vector footage —
-    /// the output scale times the layer's on-screen scale (quarter-octave steps, rounded up, so
-    /// vector content is drawn at its final size and stays sharp when scaled up). The buffer
+    /// Rasterisation scale of a layer's source: the output scale, or — for text and shape layers,
+    /// which are always continuously rasterised (#390, #751), and Continuously Rasterize vector
+    /// footage — the output scale times the layer's on-screen scale (quarter-octave steps, rounded
+    /// up, so vector content is drawn at its final size and stays sharp when scaled up). The buffer
     /// stays within about 16 million pixels, or 1.25× the output's pixels for larger outputs.
     ///
     /// In the Layer panel ([`Renderer::layer_view`]) the on-screen scale is the panel's zoom.
     pub fn raster_scale(&self, ctx: &EvalCtx, layer: &Layer) -> f64 {
         let s = self.opts.scale;
         let continuous = match layer.source {
-            LayerSource::Text => true,
-            LayerSource::Shape => layer.switches.collapse,
+            LayerSource::Text | LayerSource::Shape => true,
             LayerSource::Footage { item } => {
                 layer.switches.collapse && matches!(self.project.item(item).map(|i| &i.kind), Some(ItemKind::Footage(f)) if is_vector_footage(f))
             }
@@ -137,7 +136,7 @@ impl<'a> Renderer<'a> {
                 if let Some(pf) = self.proxy_for(*item)
                     && let Some(nc) = self.project.comp(*item)
                 {
-                    let img = self.footage.frame(*item, pf, lt)?;
+                    let img = self.footage.frame_with(*item, pf, lt, None, self.pipe.float_encoding())?;
                     return Some(self.footage_buf(&img, pf, nc.width, nc.height));
                 }
                 // Essential Properties overrides render the nested comp with this instance's

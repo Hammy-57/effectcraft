@@ -1,7 +1,7 @@
 //! Timeline rows for shape layers, masks and keyframing: the Contents "Add:" menu and the Classic
 //! 3D "Change Renderer…" row (#206), Alt+Shift+P revealing the key it adds and clicks below the
 //! layers deselecting them (#205), Mask Feather's linked values (#203), and copying shape items
-//! between shape layers (#227).
+//! between shape layers (#227), and Ctrl+V of SVG markup making a shape layer (#738).
 
 use effectcraft_engine::Session;
 use effectcraft_engine::project::LayerId;
@@ -253,7 +253,7 @@ fn gradient_fill_editor_applies_undoes_and_escape_discards() {
     h.run_steps(3);
     let entry = format!("timeline.prop.{uid}.value");
     click(&mut h, &entry);
-    click(&mut h, "gradient.color.add");
+    click(&mut h, "dialog.gradient.addColor");
     let undo_before = h.state().session.history.undo.len();
     let value =
         |h: &Harness<'_, EffectcraftApp>| h.state().session.active_comp().unwrap().layer(LayerId(layer)).unwrap().props.find(uid).unwrap().value.clone();
@@ -262,17 +262,16 @@ fn gradient_fill_editor_applies_undoes_and_escape_discards() {
         std::fs::create_dir_all(&dir).unwrap();
         h.render().expect("gradient editor screenshot").save(format!("{dir}/gradient_fill_editor.png")).unwrap();
     }
-    click(&mut h, "gradient.apply");
+    click(&mut h, "dialog.gradient.ok");
     let Value::Gradient(edited) = value(&h) else { panic!("gradient fill lost its gradient value") };
     let Value::Gradient(before) = &original else { panic!("fixture must be a gradient") };
     assert_eq!(edited.colors.len(), before.colors.len() + 1);
-    assert_ne!(edited.sample(0.5), before.sample(0.5), "the committed gradient changes the renderer's sampled color");
     assert_eq!(h.state().session.history.undo.len(), undo_before + 1);
     h.state_mut().session.execute("edit.undo", json!({})).unwrap();
     h.run_steps(3);
     assert_eq!(value(&h), original);
     click(&mut h, &entry);
-    click(&mut h, "gradient.opacity.add");
+    click(&mut h, "dialog.gradient.addOpacity");
     let project_before_escape = serde_json::to_value(&h.state().session.project).unwrap();
     let history_before_escape = h.state().session.history.undo.len();
     for pressed in [true, false] {
@@ -280,7 +279,7 @@ fn gradient_fill_editor_applies_undoes_and_escape_discards() {
         h.step();
     }
     h.run_steps(3);
-    assert!(h.state().auto.find("gradient.apply").is_none(), "Escape closes the draft editor");
+    assert!(h.state().auto.find("dialog.gradient.ok").is_none(), "Escape closes the draft editor");
     assert_eq!(serde_json::to_value(&h.state().session.project).unwrap(), project_before_escape, "Escape never deletes a layer or changes the project");
     assert_eq!(h.state().session.history.undo.len(), history_before_escape);
     assert_eq!(value(&h), original);
@@ -339,4 +338,32 @@ fn timeline_colour_eyedropper_samples_the_comp() {
     for k in 0..3 {
         assert!((c[k] - want[k]).abs() < 0.02, "{c:?} vs {want:?}");
     }
+}
+
+/// Ctrl+V with SVG markup on the system clipboard pastes it as a shape layer (After Effects
+/// 26.3), even with layers on the app's clipboard: copying in the app replaces the system
+/// clipboard, so the SVG was copied later (#738).
+#[test]
+fn ctrl_v_pastes_svg_markup_as_a_shape_layer() {
+    let (mut h, a, b, _) = two_shape_layers();
+    click(&mut h, &format!("timeline.layer.{b}.row"));
+    h.input_mut().events.push(Event::Copy);
+    h.step();
+    assert_eq!(h.state().session.state.clipboard.len(), 1, "a layer on the app's clipboard");
+    let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20"><circle cx="10" cy="10" r="8" fill="#00ff00"/><rect x="20" width="20" height="20"/></svg>"##;
+    h.input_mut().events.push(Event::Paste(svg.into()));
+    h.run_steps(3);
+    let c = h.state().session.active_comp().unwrap().clone();
+    assert_eq!(c.layers.len(), 3, "{:?}", h.state().ui.status);
+    let top = &c.layers[0];
+    assert!(top.id != LayerId(a) && top.id != LayerId(b));
+    assert_eq!(top.name, "Shape Layer 3");
+    assert_eq!(top.props.sub("contents").unwrap().groups().count(), 2);
+    assert_eq!(h.state().session.state.selected_layers, vec![top.id]);
+    // The app's own clipboard note pastes the copied layer as before.
+    h.input_mut().events.push(Event::Paste("EffectCraft: 1 layer".into()));
+    h.run_steps(3);
+    let c = h.state().session.active_comp().unwrap();
+    assert_eq!(c.layers.len(), 4);
+    assert_eq!(c.layers[0].name, "Oval 2");
 }

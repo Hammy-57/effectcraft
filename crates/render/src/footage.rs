@@ -127,6 +127,21 @@ pub fn exact_footage(footage: &dyn FootageSource) -> &dyn FootageSource {
     footage.exact().unwrap_or(footage)
 }
 
+/// How a [`FootageSource`] hands over float footage (OpenEXR, float TIFF), whose values are
+/// linear light: encoded with a curve, as the compositor takes footage, or as stored. Other
+/// footage is decoded the same way whatever it says. Interpret Footage ▸ Preserve RGB always
+/// reads the values as stored.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum FloatCurve {
+    /// The sRGB curve (managed projects, and Working Gamma 2.2).
+    #[default]
+    Srgb,
+    /// A pure 2.4 power curve (no working space, Working Gamma 2.4).
+    Gamma24,
+    /// The linear values as stored (Interpret As Linear Light encodes them afterwards).
+    Linear,
+}
+
 /// Supplies decoded footage frames (implemented by the media layer).
 pub trait FootageSource: Send + Sync {
     /// The frame of `item` at source time `t`, straight from the file (any size).
@@ -142,6 +157,29 @@ pub trait FootageSource: Send + Sync {
     fn preview_frame(&self, item: ItemId, footage: &Footage, t: Tick, w: u32, h: u32, scale: f64) -> Option<FootageFrame> {
         let _ = (w, h, scale);
         self.frame_pixels(item, footage, t).map(|px| FootageFrame { px, preview: false })
+    }
+    /// [`Self::frame`] with float footage handed over as `float` says ([`Self::frame`] uses
+    /// [`FloatCurve::Srgb`]). `size` is the size a reduced-resolution render shows the frame at,
+    /// a hint sources may ignore (the renderer resamples). Sources without float footage can
+    /// leave the default, which ignores `float`.
+    fn frame_with(&self, item: ItemId, footage: &Footage, t: Tick, size: Option<(u32, u32)>, float: FloatCurve) -> Option<Arc<Image>> {
+        let _ = (size, float);
+        self.frame(item, footage, t)
+    }
+    /// [`Self::frame_pixels`] with float footage handed over as `float` says.
+    fn frame_pixels_with(&self, item: ItemId, footage: &Footage, t: Tick, float: FloatCurve) -> Option<SharedFrame> {
+        match float {
+            FloatCurve::Srgb => self.frame_pixels(item, footage, t),
+            _ => self.frame_with(item, footage, t, None, float).map(|img| img as SharedFrame),
+        }
+    }
+    /// [`Self::preview_frame`] with float footage handed over as `float` says.
+    #[allow(clippy::too_many_arguments)]
+    fn preview_frame_with(&self, item: ItemId, footage: &Footage, t: Tick, w: u32, h: u32, scale: f64, float: FloatCurve) -> Option<FootageFrame> {
+        match float {
+            FloatCurve::Srgb => self.preview_frame(item, footage, t, w, h, scale),
+            _ => self.frame_pixels_with(item, footage, t, float).map(|px| FootageFrame { px, preview: false }),
+        }
     }
     /// `frames` interleaved stereo sample frames of `item`'s audio from source time `t` at
     /// `rate` Hz (`None` when unavailable). The first sample is `t.to_units_floor(rate)`;
@@ -256,6 +294,15 @@ impl FootageSource for CancellableFootage<'_> {
     }
     fn preview_frame(&self, item: ItemId, footage: &Footage, t: Tick, w: u32, h: u32, scale: f64) -> Option<FootageFrame> {
         self.read(|| self.inner.preview_frame(item, footage, t, w, h, scale))
+    }
+    fn frame_with(&self, item: ItemId, footage: &Footage, t: Tick, size: Option<(u32, u32)>, float: FloatCurve) -> Option<Arc<Image>> {
+        self.read(|| self.inner.frame_with(item, footage, t, size, float))
+    }
+    fn frame_pixels_with(&self, item: ItemId, footage: &Footage, t: Tick, float: FloatCurve) -> Option<SharedFrame> {
+        self.read(|| self.inner.frame_pixels_with(item, footage, t, float))
+    }
+    fn preview_frame_with(&self, item: ItemId, footage: &Footage, t: Tick, w: u32, h: u32, scale: f64, float: FloatCurve) -> Option<FootageFrame> {
+        self.read(|| self.inner.preview_frame_with(item, footage, t, w, h, scale, float))
     }
     fn audio(&self, item: ItemId, footage: &Footage, t: Tick, frames: usize, rate: u32) -> Option<Vec<f32>> {
         self.inner.audio(item, footage, t, frames, rate)
@@ -377,7 +424,7 @@ impl<'a> Renderer<'a> {
         if conversion.is_some() && self.pipe.levels.is_some() {
             return None;
         }
-        let pixels = self.footage.frame_pixels(item, footage, time)?;
+        let pixels = self.footage.frame_pixels_with(item, footage, time, self.pipe.float_curve(footage))?;
         let view = pixels.yuv()?;
         view.validate().ok()?;
         if pixels.size() != (view.width, view.height) {
@@ -442,7 +489,7 @@ impl<'a> Renderer<'a> {
         if f.fields != effectcraft_project::FieldOrder::Off && matches!(f.kind, FootageKind::Video | FootageKind::Sequence) {
             let field_rate = FrameRate::new(f.frame_rate.num * 2, f.frame_rate.den);
             let i = field_rate.frame_at(t).max(0);
-            let img = self.footage.frame(item, f, f.frame_rate.tick_of(i / 2))?;
+            let img = self.footage.frame_with(item, f, f.frame_rate.tick_of(i / 2), None, self.pipe.float_curve(f))?;
             let dominant_upper = f.fields == effectcraft_project::FieldOrder::UpperFirst;
             // Upper field = even lines (0, 2, …).
             let parity = if (i % 2 == 0) == dominant_upper { 0 } else { 1 };
@@ -455,14 +502,15 @@ impl<'a> Renderer<'a> {
         if let Some(img) = self.blended_frame(ctx, layer, item, f, t) {
             return Some(full(img));
         }
+        let float = self.pipe.float_curve(f);
         // The layer's nominal size: the proxy fills the footage's frame.
         let nominal = match self.project.item(item).map(|it| &it.kind) {
             Some(ItemKind::Footage(orig)) => Some((orig.width, orig.height)),
             _ => None,
         };
         match nominal {
-            Some((w, h)) if self.opts.scale < 0.75 => self.footage.preview_frame(item, f, t, w, h, self.opts.scale),
-            _ => self.footage.frame_pixels(item, f, t).map(|px| FootageFrame { px, preview: false }),
+            Some((w, h)) if self.opts.scale < 0.75 => self.footage.preview_frame_with(item, f, t, w, h, self.opts.scale, float),
+            _ => self.footage.frame_pixels_with(item, f, t, float).map(|px| FootageFrame { px, preview: false }),
         }
     }
 
@@ -470,12 +518,13 @@ impl<'a> Renderer<'a> {
         if let Some(img) = self.blended_frame(ctx, layer, item, f, t) {
             return Some(img);
         }
-        self.footage.frame(item, f, t)
+        self.footage.frame_with(item, f, t, None, self.pipe.float_curve(f))
     }
 
     /// The frame-blended footage frame at `t` (`None` when frame blending doesn't apply there).
     fn blended_frame(&self, ctx: &EvalCtx, layer: &Layer, item: ItemId, f: &Footage, t: Tick) -> Option<Arc<Image>> {
         let mode = frame_blend_mode(ctx, layer);
+        let float = self.pipe.float_curve(f);
         if mode != FrameBlend::Off && matches!(f.kind, FootageKind::Video | FootageKind::Sequence) {
             let (i, w) = frame_position(t, f.frame_rate);
             if w > 1e-6 {
@@ -483,7 +532,7 @@ impl<'a> Renderer<'a> {
                 let key = self.cache.map(|_| {
                     use std::hash::{Hash, Hasher};
                     let mut h = std::collections::hash_map::DefaultHasher::new();
-                    (0x00f8_a3e5_u64, item, i, (w as f32).to_bits(), mode as u8, f.frame_rate.num, f.frame_rate.den, &f.path).hash(&mut h);
+                    (0x00f8_a3e5_u64, item, i, (w as f32).to_bits(), mode as u8, f.frame_rate.num, f.frame_rate.den, &f.path, float).hash(&mut h);
                     h.finish()
                 });
                 if let (Some(c), Some(k)) = (self.cache, key)
@@ -491,8 +540,8 @@ impl<'a> Renderer<'a> {
                 {
                     return Some(Arc::new(b.img.clone()));
                 }
-                let a = self.footage.frame(item, f, f.frame_rate.tick_of(i));
-                let b = self.footage.frame(item, f, f.frame_rate.tick_of(i + 1));
+                let a = self.footage.frame_with(item, f, f.frame_rate.tick_of(i), None, float);
+                let b = self.footage.frame_with(item, f, f.frame_rate.tick_of(i + 1), None, float);
                 if let (Some(a), Some(b)) = (a, b) {
                     let img = blend_frames(mode, &a, &b, w as f32);
                     if let (Some(c), Some(k)) = (self.cache_to_keep(), key) {

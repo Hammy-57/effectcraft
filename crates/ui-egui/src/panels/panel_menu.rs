@@ -99,6 +99,12 @@ pub fn entries(app: &EffectcraftApp, panel: PanelKind, doc: Option<u64>) -> Vec<
     if floating {
         v.push(item("dockPanel", tr("Dock Panel"), "window.dockPanel", p.clone(), true));
     }
+    // Multiple monitors (#486): a native window of its own, which can go on another screen.
+    if cfg!(not(target_arch = "wasm32")) {
+        let windowed = app.in_panel_window(panel);
+        let label = if windowed { tr("Move Panel to Main Window") } else { tr("Move Panel to New Window") };
+        v.push(item("panelWindow", label, "window.panelWindow", json!({"panel": panel.id(), "window": !windowed}), true));
+    }
     v.push(item("closeOtherPanels", tr("Close Other Panels in Group"), "window.closeOtherPanels", with_doc, group.len() > 1 || comp_tabs > 1));
     v.push(Entry::Sub {
         key: "groupSettings".into(),

@@ -6,7 +6,7 @@ use serde_json::json;
 fn app() -> EffectcraftApp {
     let mut app = EffectcraftApp::new(Session::default());
     app.session.execute("comp.new", json!({"width":64,"height":64,"duration":3})).unwrap();
-    app.ui.viewer.res = Resolution::Auto;
+    app.session.set_resolution(app.session.active_comp_id().unwrap(), Resolution::Auto).unwrap();
     app.session.state.viewer.fast_previews = FastPreviews::AdaptiveResolution;
     app
 }
@@ -27,16 +27,16 @@ fn scrub_resolution_respects_overrides_and_refines_on_quiet() {
     let coarse = 0.25f64.max(app.session.prefs.adaptive_limit()).min(1.0);
     assert_eq!(app.viewer_scale(1.0, 1.0), coarse);
     for resolution in [Resolution::Full, Resolution::Half, Resolution::Quarter] {
-        app.ui.viewer.res = resolution;
+        app.session.set_resolution(app.session.active_comp_id().unwrap(), resolution).unwrap();
         assert_eq!(app.viewer_scale(1.0, 1.0), resolution.scale(1.0, 1.0));
     }
-    app.ui.viewer.res = Resolution::Auto;
+    app.session.set_resolution(app.session.active_comp_id().unwrap(), Resolution::Auto).unwrap();
     app.session.state.viewer.fast_previews = FastPreviews::Off;
     assert_eq!(app.viewer_scale(1.0, 1.0), 1.0);
     app.session.state.viewer.fast_previews = FastPreviews::AdaptiveResolution;
     app.scrub_preview.tick(1.20, Some(id.0), app.session.revision);
     assert_eq!(app.viewer_scale(1.0, 1.0), 1.0);
-    assert_eq!(app.ui.viewer.res, Resolution::Auto);
+    assert_eq!(app.viewer_res(), Resolution::Auto);
 }
 
 #[test]

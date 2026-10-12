@@ -47,7 +47,6 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     uic!("playback.stop", "Stop", [], None),
     uic!("view.fit", "Fit", [], Some("Shift+/")),
     uic!("view.actualSize", "100%", [], Some("/")),
-    uic!("view.res.auto", "Resolution: Auto", [], None),
     uic!("viewer.nudge.up", "Move Selected Layers Up 1 Pixel at Current Magnification", [], Some("ArrowUp")),
     uic!("viewer.nudge.down", "Move Selected Layers Down 1 Pixel at Current Magnification", [], Some("ArrowDown")),
     uic!("viewer.nudge.left", "Move Selected Layers Left 1 Pixel at Current Magnification", [], Some("ArrowLeft")),
@@ -150,6 +149,7 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     uic!("window.smallTabs", "Small Tabs", [], None),
     uic!("window.panelMenu", "Panel Menu", [], None),
     uic!("project.column", "Show/Hide Project Column", [], None),
+    uic!("window.panelWindow", "Move Panel to New Window", [], None),
 ];
 
 pub fn panel_command_id(p: PanelKind) -> String {
@@ -176,6 +176,12 @@ pub(crate) fn no_params(p: &Value) -> bool {
 
 /// Execute a UI or engine command by id.
 pub fn invoke(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: Value) -> Result<Value, String> {
+    // Layer ▸ New ▸ Text (menu, shortcut, context menus) puts an insertion point in the centre of
+    // the comp, as After Effects does, so typing goes into Source Text rather than running
+    // shortcuts (#866). `engine.execute` keeps the headless default.
+    if id == "layer.newText" && no_params(&params) {
+        return run_engine(app, ctx, id, json!({"text": "", "edit": true}));
+    }
     if no_params(&params) && app.ui.focused == PanelKind::Project {
         match id {
             "edit.duplicate" => return run_engine(app, ctx, "project.duplicate", json!({})),
@@ -197,6 +203,15 @@ pub fn invoke(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: V
     if id == "edit.selectAll" && no_params(&params) && app.ui.focused == PanelKind::EffectControls {
         crate::panels::effect_controls::select_all_effects(app);
         return Ok(json!({}));
+    }
+    // Edit ▸ Paste with SVG markup on the system clipboard pastes it as a shape layer (After
+    // Effects 26.3). Copying in the app replaces the system clipboard with a note naming what
+    // was copied, so SVG there was copied after anything copied in the app.
+    if id == "edit.paste" && no_params(&params) && app.session.state.text_edit.is_none() {
+        let text = ctx.data_mut(|d| d.remove_temp::<String>(system_paste_id())).or_else(|| app.hooks.clipboard_text.as_ref().and_then(|f| f()));
+        if let Some(svg) = text.filter(|t| effectcraft_engine::vector::is_svg_text(t)) {
+            return run_engine(app, ctx, "edit.pasteSvg", json!({"svg": svg}));
+        }
     }
     // Clear follows panel focus, including the Edit menu and keyboard shortcut.
     if id == "edit.clear" && params.as_object().is_some_and(|p| p.is_empty()) && app.ui.focused == PanelKind::Project {
@@ -418,7 +433,7 @@ fn file_dialog(app: &mut EffectcraftApp, id: &str, params: &Value) -> Option<Res
         "keys.rpfCameraImport" => ("path", Ask::Open(&["json", "csv", "txt"])),
         "essential.exportTemplate" => ("path", Ask::Save("Template.ectemplate")),
         "essential.importTemplate" => ("path", Ask::Open(&["ectemplate"])),
-        "file.setProxy" => ("path", Ask::Open(&["mp4", "mov", "m4v", "mkv", "webm", "png", "jpg", "jpeg", "gif", "webp", "tif", "tiff", "bmp", "exr"])),
+        "file.setProxy" => ("path", Ask::Open(&["mp4", "mov", "m4v", "mkv", "webm", "mxf", "png", "jpg", "jpeg", "gif", "webp", "tif", "tiff", "bmp", "exr"])),
         _ => return None,
     };
     if params.get(key).is_some()
@@ -430,8 +445,8 @@ fn file_dialog(app: &mut EffectcraftApp, id: &str, params: &Value) -> Option<Res
         return None;
     }
     const MEDIA: &[&str] = &[
-        "mp4", "mov", "m4v", "mkv", "webm", "png", "jpg", "jpeg", "gif", "webp", "avif", "tif", "tiff", "bmp", "exr", "wav", "aif", "aiff", "mp3", "flac",
-        "ogg", "opus", "svg", "pdf", "ai", "eps", "psd", "psb", "gltf", "glb", "obj", "json", "csv", "tsv",
+        "mp4", "mov", "m4v", "mkv", "webm", "mxf", "png", "jpg", "jpeg", "gif", "webp", "avif", "tif", "tiff", "bmp", "exr", "dpx", "cin", "wav", "aif",
+        "aiff", "mp3", "flac", "ogg", "opus", "svg", "pdf", "ai", "eps", "psd", "psb", "tga", "hdr", "gltf", "glb", "obj", "stl", "fbx", "json", "csv", "tsv",
     ];
     // A host whose modal dialogs would run a nested event loop inside this frame (macOS: a
     // drag over the window then re-entered winit's event handler and aborted, #511) shows the
@@ -569,6 +584,18 @@ pub(crate) fn entry_shortcut(app: &EffectcraftApp, e: &MenuEntry) -> Option<Stri
     app.session.shortcuts().shortcut_of(&e.command, &e.params).map(str::to_string)
 }
 
+/// Whether panel `p` is on screen: the front tab of a floating window, or of a docked group
+/// (an open frame in a stack) that a maximized panel does not cover.
+pub(crate) fn panel_shown(app: &EffectcraftApp, p: PanelKind) -> bool {
+    if app.ui.floating.iter().any(|f| f.panels.get(f.active) == Some(&p)) {
+        return true;
+    }
+    match app.ui.maximized.filter(|m| app.ui.dock.contains(*m)) {
+        Some(m) => m == p,
+        None => app.ui.dock.is_visible(p),
+    }
+}
+
 /// Check-mark state of frontend toggles (engine state is answered by the engine).
 pub(crate) fn entry_checked(app: &EffectcraftApp, e: &MenuEntry) -> Option<bool> {
     let v = &app.ui.viewer;
@@ -583,10 +610,9 @@ pub(crate) fn entry_checked(app: &EffectcraftApp, e: &MenuEntry) -> Option<bool>
         "view.layerControls" => Some(v.show_layer_controls),
         "playback.cacheWhenIdle" => Some(app.ui.cache_when_idle),
         "playback.audio" => Some(app.session.prefs.preview.active().include_audio),
-        "view.res.full" | "view.res.half" | "view.res.third" | "view.res.quarter" => {
-            Some(v.res.label().eq_ignore_ascii_case(e.command.trim_start_matches("view.res.")))
-        }
         "window.workspace" => Some(pstr("name").is_some_and(|n| n == app.ui.workspace)),
+        // The Tools panel is the header toolbar: always on screen.
+        "window.panel" => Some(pstr("panel").is_some_and(|n| n.eq_ignore_ascii_case("tools") || PanelKind::from_name(n).is_some_and(|p| panel_shown(app, p)))),
         "view.panelBackground" if e.params.get("pick").is_none() => {
             let cur = match v.pasteboard {
                 None => "mediumGray",
@@ -757,8 +783,8 @@ pub fn bindings(session: &effectcraft_engine::Session) -> Vec<Binding> {
         if sc.starts_with("Physical+") {
             continue;
         }
-        // Off macOS `Cmd` is Ctrl, so a Ctrl+Cmd shortcut (Enter Full Screen's Ctrl+Cmd+F) would
-        // steal the plain Cmd one (Find's Cmd+F): such macOS-only shortcuts aren't bound there.
+        // Off macOS `Cmd` is Ctrl, so a custom Ctrl+Cmd shortcut would
+        // steal the plain Cmd one: such macOS-only shortcuts aren't bound there.
         if !cfg!(target_os = "macos") && sc.split('+').any(|p| p == "Ctrl") && sc.split('+').any(|p| p == "Cmd") {
             continue;
         }
@@ -781,6 +807,11 @@ fn mods_match(want: egui::Modifiers, got: egui::Modifiers) -> bool {
 
 /// Set (egui temp data) from a plain Spacebar press until its release while a tap would still
 /// run the Spacebar shortcut.
+/// The system clipboard's text of this frame's paste event, for the Edit ▸ Paste it runs.
+fn system_paste_id() -> egui::Id {
+    egui::Id::new("menus-system-paste")
+}
+
 fn space_tap_id() -> egui::Id {
     egui::Id::new("spacebar-tap")
 }
@@ -826,7 +857,8 @@ fn handle_shortcuts_impl(app: &mut EffectcraftApp, ctx: &egui::Context, tab_only
     let start = modifiers_at_start(ctx);
     // Dialog cancellation owns Escape even when a text field has keyboard focus.
     if !tab_only && app.dialog.is_some() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-        if crate::panels::shortcut_editor::recording(app) || egui::Popup::is_any_open(ctx) {
+        // A popup or colour picker takes Escape first (the picker goes back to its original colour).
+        if crate::panels::shortcut_editor::recording(app) || egui::Popup::is_any_open(ctx) || crate::color_picker::open_recently(ctx) {
             return;
         }
         ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
@@ -864,6 +896,9 @@ fn handle_shortcuts_impl(app: &mut EffectcraftApp, ctx: &egui::Context, tab_only
     // Text editing in the viewer takes the clipboard events itself.
     let clipboard = app.session.state.text_edit.is_none();
     let project = app.ui.focused == PanelKind::Project;
+    // The paste event's text: Edit ▸ Paste pastes SVG markup as a shape layer.
+    let pasted =
+        if clipboard { ctx.input(|i| i.events.iter().rev().find_map(|e| if let egui::Event::Paste(t) = e { Some(t.clone()) } else { None })) } else { None };
     let mut events: Vec<(egui::Key, egui::Modifiers, bool, Option<egui::Key>)> = ctx.input(|i| {
         // The windowing layer turns Ctrl+C / Ctrl+X / Ctrl+V into clipboard events instead of
         // key presses: map them back to the keys (with the modifiers held) so Edit ▸ Copy, Cut,
@@ -1013,9 +1048,15 @@ fn handle_shortcuts_impl(app: &mut EffectcraftApp, ctx: &egui::Context, tab_only
             app.session.shortcuts().find(&key).is_none_or(|b| b.scope != app.ui.focused.id())
         }) {
             let (id, params) = (id.clone(), if params.is_null() { json!({}) } else { params.clone() });
+            if id == "edit.paste"
+                && let Some(t) = &pasted
+            {
+                ctx.data_mut(|d| d.insert_temp(system_paste_id(), t.clone()));
+            }
             if let Err(e) = invoke(app, ctx, &id, params) {
                 app.ui.status = e;
             }
+            ctx.data_mut(|d| d.remove_temp::<String>(system_paste_id()));
         }
     }
 }
@@ -1027,7 +1068,7 @@ pub fn menu_bar(app: &mut EffectcraftApp, ui: &mut egui::Ui) {
     let mut nav = crate::menu_keys::Nav::default();
     ui.horizontal_centered(|ui| {
         ui.add_space(6.0);
-        egui::MenuBar::new().ui(ui, |ui| {
+        egui::MenuBar::new().config(egui::containers::menu::MenuConfig::new().style(crate::widgets::menu_style)).ui(ui, |ui| {
             for node in effectcraft_engine::menus::menu_bar() {
                 if let MenuNode::Submenu { label, children } = node {
                     let r = ui.menu_button(crate::i18n::label(app, "", label), |ui| {
@@ -1189,9 +1230,37 @@ fn menu_entry(app: &EffectcraftApp, ui: &mut egui::Ui, e: &MenuEntry) -> egui::R
     ui.add_enabled(enabled, b)
 }
 
+/// View ▸ Zoom In / Zoom Out: the next standard magnification (as a share of screen pixels, so
+/// 100 % is one comp pixel per screen pixel at any display scaling) above or below `cur`, which is
+/// in points per comp pixel like the result (#882).
+pub(crate) fn zoom_step(cur: f32, ppp: f32, zoom_in: bool) -> f32 {
+    const STEPS: [f32; 16] = [0.015, 0.03, 0.0625, 0.125, 0.25, 0.333, 0.5, 0.66, 1.0, 1.5, 2.0, 3.0, 4.0, 8.0, 16.0, 32.0];
+    let ppp = if ppp.is_finite() && ppp > 0.0 { ppp } else { 1.0 };
+    let shown = cur * ppp;
+    let next = if zoom_in {
+        STEPS.iter().copied().find(|s| *s > shown + 1e-3).unwrap_or(32.0)
+    } else {
+        STEPS.iter().rev().copied().find(|s| *s < shown - 1e-3).unwrap_or(0.015)
+    };
+    next / ppp
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #882: at 125 % / 150 % display scaling Zoom In reaches 100 % (one comp pixel per screen
+    /// pixel), not 100 % in points (125 % / 150 % on screen).
+    #[test]
+    fn zoom_steps_land_on_whole_screen_magnifications() {
+        for ppp in [1.0f32, 1.25, 1.5, 2.0] {
+            let at_100 = zoom_step(0.7 / ppp, ppp, true);
+            assert!((at_100 * ppp - 1.0).abs() < 1e-6, "ppp {ppp}: {}", at_100 * ppp);
+            assert!((zoom_step(at_100, ppp, true) * ppp - 1.5).abs() < 1e-6);
+            assert!((zoom_step(at_100, ppp, false) * ppp - 0.66).abs() < 1e-6);
+        }
+        assert!(zoom_step(1.0, 0.0, true).is_finite());
+    }
 
     #[test]
     fn shortcut_passes_share_frame_start_modifiers() {
@@ -1225,6 +1294,18 @@ mod tests {
             if let Some(sc) = &e.shortcut {
                 assert!(parse_shortcut(sc).is_some() || sc == "Num*", "{} ({sc})", e.label);
             }
+        }
+    }
+
+    #[test]
+    fn full_screen_default_is_platform_specific() {
+        let app = EffectcraftApp::new(effectcraft_engine::Session::default());
+        let full_screen = app.session.shortcuts().shortcut_of("view.fullScreen", &Value::Null);
+        if cfg!(target_os = "macos") {
+            assert_eq!(full_screen, Some("Ctrl+Cmd+F"));
+        } else {
+            assert_eq!(full_screen, None);
+            assert_eq!(app.session.shortcuts().shortcut_of("window.maximizeApp", &Value::Null), Some("Cmd+\\"));
         }
     }
 

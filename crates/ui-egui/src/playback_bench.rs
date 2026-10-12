@@ -28,7 +28,7 @@ fn adaptive_playback_frame_availability() {
         session.disk_cache = None;
         let mut app = EffectcraftApp::new(session);
         app.gpu = Some(gpu.clone());
-        app.ui.viewer.res = Resolution::Auto;
+        app.session.set_resolution(app.session.active_comp_id().unwrap(), Resolution::Auto).unwrap();
         app.session.state.viewer.fast_previews = if adaptive { FastPreviews::AdaptiveResolution } else { FastPreviews::Off };
         app.playback.playing = true;
         app.playback.fps = 30.0;
@@ -60,7 +60,7 @@ fn adaptive_playback_frame_availability() {
         steady.sort_by(f64::total_cmp);
         let p50 = steady.get(29).copied().unwrap();
         let p95 = steady.get(56).copied().unwrap();
-        assert_eq!(app.ui.viewer.res, Resolution::Auto);
+        assert_eq!(app.viewer_res(), Resolution::Auto);
         app.playback.playing = false;
         assert_eq!(app.viewer_scale(1.0, 1.0), 1.0);
         eprintln!("RT5 adaptive={adaptive} first_reduction={first_reduction:?} p50={p50:.2} p95={p95:.2}");

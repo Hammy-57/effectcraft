@@ -122,3 +122,9 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: PanelKind, rect: Rec
         PanelKind::VrCompEditor => path_vr_panels::vr_editor(app, ui, rect),
     }
 }
+
+/// The panel menu in a panel's own native window (Move Panel to New Window): the fork's
+/// [`panel_menu`] draws a menu opened for that window there (see [`panel_menu::open_in`]).
+pub fn panel_menu_popup(app: &mut EffectcraftApp, ui: &mut egui::Ui) {
+    panel_menu::show(app, ui);
+}

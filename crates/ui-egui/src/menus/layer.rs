@@ -33,6 +33,11 @@ fn style_options(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, p: V
 
 fn open_layer(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, p: Value) -> Result<Value, String> {
     let id = p.get("layer").and_then(Value::as_u64).or_else(|| app.session.state.selected_layers.first().map(|l| l.0));
+    // Another layer opens at Fit.
+    if id != app.ui.layer_panel {
+        app.ui.layer_zoom = None;
+        app.ui.layer_pan = [0.0, 0.0];
+    }
     app.ui.layer_panel = id;
     app.ui.layer_view = None;
     app.show_panel(PanelKind::Layer);

@@ -181,7 +181,7 @@ fn run<T: SizedSample + FromSample<f32>>(
             let delay = ts.playback.duration_since(&ts.callback).unwrap_or_default();
             clock.lock().unwrap_or_else(std::sync::PoisonError::into_inner).record(now, delay, first, real, rate);
         },
-        |e| eprintln!("effectcraft: audio output: {e}"),
+        |e| log::warn!("audio output: {e}"),
         None,
     )
     .map_err(|e| e.to_string())
@@ -253,7 +253,7 @@ impl AudioDevice for CpalOut {
                     return;
                 }
                 if let Err(e) = stream.play() {
-                    eprintln!("effectcraft: audio output: {e}");
+                    log::warn!("audio output: {e}");
                     return;
                 }
                 let _ = stop_rx.recv();

@@ -43,6 +43,13 @@ pub(crate) fn claims(path: &str, head: &[u8]) -> bool {
     effectcraft_psd::is_psd(head) || is_svg(path, head) || effectcraft_pdf::sniff(head).is_some()
 }
 
+/// Whether `bytes` (the first 64 KiB suffice) are a Photoshop or vector file [`probe`] handles.
+/// (Unused on this fork, whose probe uses [`claims`]; kept as upstream has it.)
+#[allow(dead_code)]
+pub(crate) fn sniff(path: &str, bytes: &[u8]) -> bool {
+    effectcraft_psd::is_psd(bytes) || is_svg(path, bytes) || is_pdf_like(path, bytes)
+}
+
 /// Parse a Photoshop document (sharing `bytes`: the parser keeps the file to read layers from).
 pub(crate) fn parse_psd(path: &str, bytes: &Arc<[u8]>) -> Result<effectcraft_psd::Psd> {
     effectcraft_psd::Psd::parse(bytes.clone()).map_err(|e| MediaError::Decode(format!("{path}: {e}")))
@@ -87,7 +94,7 @@ pub(crate) fn decode_psd(path: &str, psd: &effectcraft_psd::Psd, footage: &Foota
             let inner = effectcraft_psd::Psd::parse(Arc::<[u8]>::from(data)).map_err(|e| MediaError::Decode(format!("{path} (smart object): {e}")))?;
             inner.composite().map_err(|e| MediaError::Decode(format!("{path} (smart object): {e}")))?
         } else {
-            let img = image::load_from_memory(data).map_err(|e| MediaError::Decode(format!("{path} (smart object): {e}")))?;
+            let img = crate::probe::load_oriented(data, None).map_err(|e| MediaError::Decode(format!("{path} (smart object): {e}")))?;
             let rgba = img.to_rgba32f();
             effectcraft_psd::Pixels { width: rgba.width(), height: rgba.height(), data: rgba.pixels().map(|p| p.0).collect() }
         };

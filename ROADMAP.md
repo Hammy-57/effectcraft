@@ -97,7 +97,7 @@ UI strings translated out of ≈ 3,900 (detail: [localization-parity.md](docs/lo
 | Korean | none | 0% |
 | Vietnamese | none | 0% |
 
-Also shipped: Traditional Chinese (partial, 28%) and Ukrainian (partial, 26%). No language has had
+Also shipped: Traditional Chinese (partial, 28%) and Ukrainian (partial, 29%). No language has had
 native-speaker review.
 
 ## Upcoming
@@ -117,6 +117,13 @@ Come tell us what matters most to you on [Discord](https://discord.gg/artcraft).
 
 ## Progress log
 
+- 2026-10-11: Ukrainian panels caught up with the Chinese catalogs. The 95 rows the panel
+  catalog gained since 9 October are translated: the Home screen (recent files, their Kind and
+  Opened columns, the empty and no-match states), the viewer's toolbar tooltips, magnification,
+  resolution, grid, channel and Fast Previews popups, the Appearance settings, the solid dialog
+  and the project, import, export and colour-management forms. `uk` now carries 495 of the 496
+  panel rows — `RGB` reads the same in Ukrainian, so it falls back to the English source by
+  design — alongside its 618/618 menus.
 - 2026-10-10: Full parity re-measure against After Effects 2026 26.5 (installed bundle, 26.2–26.5
   release notes, repository counts): breadth ≈ 91%, ready ≈ 45%, stage alpha. Progress docs
   follow the shared standard: `docs/parity.md` became `docs/target-app-parity.md`; new

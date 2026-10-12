@@ -12,7 +12,6 @@ use crate::state::Resolution;
 pub(crate) fn handlers() -> &'static [Handler] {
     const H: &[Handler] = &[
         Handler::ui_prefix("viewer.nudge.", nudge_cmd),
-        Handler::ui("view.res.auto", res_auto),
         Handler::ui("view.theme.toggle", theme_toggle),
         Handler::ui_prefix("view.theme.", theme),
         Handler::ui("view.fit", fit),
@@ -24,10 +23,8 @@ pub(crate) fn handlers() -> &'static [Handler] {
         Handler::frontend("view.newViewer", new_viewer),
         Handler::frontend("view.zoomIn", zoom),
         Handler::frontend("view.zoomOut", zoom),
-        Handler::frontend("view.res.full", res),
-        Handler::frontend("view.res.half", res),
-        Handler::frontend("view.res.third", res),
-        Handler::frontend("view.res.quarter", res),
+        // View ▸ Resolution ▸ Full…Quarter are engine commands (each comp keeps its Resolution);
+        // Custom without a factor comes here for its dialog.
         Handler::frontend("view.res.custom", res_custom),
         Handler::frontend("view.rulers", rulers),
         Handler::frontend("view.guides", guides),
@@ -75,11 +72,6 @@ fn nudge(app: &mut EffectcraftApp, ctx: &egui::Context, dir: &str) -> Result<Val
     run_engine(app, ctx, "layer.nudge", json!({"x": x * k, "y": y * k}))
 }
 
-fn res_auto(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, _params: Value) -> Result<Value, String> {
-    app.ui.viewer.res = Resolution::Auto;
-    Ok(Value::Null)
-}
-
 /// View ▸ Next Appearance Mode: Dark ↔ Light.
 fn theme_toggle(app: &mut EffectcraftApp, ctx: &egui::Context, _id: &str, _params: Value) -> Result<Value, String> {
     app.cycle_appearance(ctx);
@@ -93,13 +85,26 @@ fn theme(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, _params: Value
     Ok(Value::Null)
 }
 
+/// View ▸ Fit: the focused Layer panel has its own magnification; otherwise the Composition
+/// viewer.
 fn fit(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, _params: Value) -> Result<Value, String> {
+    if app.ui.focused == PanelKind::Layer {
+        app.ui.layer_zoom = None;
+        app.ui.layer_pan = [0.0, 0.0];
+        return Ok(Value::Null);
+    }
     app.ui.viewer.zoom = None;
+    app.ui.viewer.fit_up_to_100 = false;
     app.ui.viewer.pan = [0.0, 0.0];
     Ok(Value::Null)
 }
 
 fn actual_size(app: &mut EffectcraftApp, ctx: &egui::Context, _id: &str, _params: Value) -> Result<Value, String> {
+    if app.ui.focused == PanelKind::Layer {
+        app.ui.layer_zoom = Some(1.0 / ctx.pixels_per_point());
+        app.ui.layer_pan = [0.0, 0.0];
+        return Ok(Value::Null);
+    }
     app.ui.viewer.zoom = Some(1.0 / ctx.pixels_per_point());
     app.ui.viewer.pan = [0.0, 0.0];
     Ok(Value::Null)
@@ -131,49 +136,37 @@ fn new_viewer(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, _p: Val
     Ok(json!({"viewer": crate::panels::viewers::new_viewer(app)}))
 }
 
+/// Zoom In / Zoom Out act on the focused viewer: the Layer panel when it has focus, else the
+/// Composition viewer.
 fn zoom(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, _p: Value) -> Result<Value, String> {
+    if app.ui.focused == PanelKind::Layer {
+        let cur = app.ui.layer_zoom.unwrap_or_else(|| crate::panels::layer_panel::last_fit(ctx));
+        // The Layer panel zooms in points (pixels-per-point 1).
+        let next = super::zoom_step(cur, 1.0, id == "view.zoomIn");
+        app.ui.layer_zoom = Some(next);
+        return Ok(json!({"zoom": next, "panel": "layer"}));
+    }
+    let ppp = ctx.pixels_per_point();
     let v = &mut app.ui.viewer;
     let cur = v.zoom.unwrap_or_else(|| crate::panels::viewer::last_fit(ctx));
-    const STEPS: [f32; 16] = [0.015, 0.03, 0.0625, 0.125, 0.25, 0.333, 0.5, 0.66, 1.0, 1.5, 2.0, 3.0, 4.0, 8.0, 16.0, 32.0];
-    let next = if id == "view.zoomIn" {
-        STEPS.iter().copied().find(|s| *s > cur + 1e-3).unwrap_or(32.0)
-    } else {
-        STEPS.iter().rev().copied().find(|s| *s < cur - 1e-3).unwrap_or(0.015)
-    };
+    let next = super::zoom_step(cur, ppp, id == "view.zoomIn");
     v.zoom = Some(next);
     Ok(json!({"zoom": next}))
 }
 
-fn res(app: &mut EffectcraftApp, _ctx: &egui::Context, id: &str, _p: Value) -> Result<Value, String> {
-    let v = &mut app.ui.viewer;
-    let r = id.trim_start_matches("view.res.");
-    v.res = Resolution::ALL.into_iter().find(|x| x.label().eq_ignore_ascii_case(r)).ok_or("unknown resolution")?;
-    Ok(Value::Null)
-}
-
-fn res_custom(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, p: Value) -> Result<Value, String> {
-    let v = &mut app.ui.viewer;
-    match p.get("factor").and_then(Value::as_u64) {
-        Some(n) => {
-            v.res = match n.clamp(1, 40) {
-                1 => Resolution::Full,
-                n => Resolution::Custom(n as u8),
-            };
-        }
-        None => {
-            let cur = match v.res {
-                Resolution::Custom(n) => n as f64,
-                _ => 2.0,
-            };
-            crate::panels::dialogs::form(
-                app,
-                "Custom Resolution",
-                "view.res.custom",
-                json!({}),
-                vec![crate::panels::dialogs::Field::num("factor", "Render every n-th pixel", cur)],
-            );
-        }
-    }
+/// View ▸ Resolution ▸ Custom without a factor (the engine sets the comp's resolution).
+fn res_custom(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, _p: Value) -> Result<Value, String> {
+    let cur = match app.viewer_res() {
+        Resolution::Custom(n) => f64::from(n),
+        _ => 2.0,
+    };
+    crate::panels::dialogs::form(
+        app,
+        "Custom Resolution",
+        "view.res.custom",
+        json!({}),
+        vec![crate::panels::dialogs::Field::num("factor", "Render every n-th pixel", cur)],
+    );
     Ok(Value::Null)
 }
 

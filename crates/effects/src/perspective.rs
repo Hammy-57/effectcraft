@@ -669,6 +669,31 @@ mod tests {
     }
 
     #[test]
+    fn cylinder_axis_rotations_affect_geometry_and_texture() {
+        let img = Image::filled(100, 100, [0.5, 0.5, 0.5, 1.0]);
+        let default = run("ec.perspective.cccylinder", &img, &[]).img;
+        let x_tilt = run("ec.perspective.cccylinder", &img, &[("rotationX", num(70.0))]).img;
+        // Tilting the finite cylinder shortens its vertical projection.
+        assert!(default.get(50, 10)[3] > 0.99);
+        assert_eq!(x_tilt.get(50, 10)[3], 0.0);
+        assert!(x_tilt.get(50, 50)[3] > 0.99);
+        let z_roll = run("ec.perspective.cccylinder", &img, &[("rotationZ", num(90.0))]).img;
+        // A quarter turn moves the side wall from vertical to horizontal.
+        assert_eq!(default.get(5, 50)[3], 0.0);
+        assert!(z_roll.get(5, 50)[3] > 0.99);
+
+        let mut striped = Image::filled(100, 100, [0.0, 0.0, 0.0, 1.0]);
+        for y in 0..100 {
+            for x in 0..100 {
+                striped.set(x, y, [x as f32 / 100.0, 0.2, 0.3, 1.0]);
+            }
+        }
+        let baseline = run("ec.perspective.cccylinder", &striped, &[]).img;
+        let spun = run("ec.perspective.cccylinder", &striped, &[("rotationY", num(90.0))]).img;
+        assert!((baseline.get(50, 50)[0] - spun.get(50, 50)[0]).abs() > 0.05);
+    }
+
+    #[test]
     fn spotlight_darkens_outside_cone() {
         let img = Image::filled(80, 80, [1.0, 1.0, 1.0, 1.0]);
         let out =

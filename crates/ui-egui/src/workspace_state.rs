@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use effectcraft_engine::config::ConfigStore;
 use serde::{Deserialize, Serialize};
 
-use crate::dock::{DockNode, Floating, PanelKind, SplitSize};
+use crate::dock::{DockNode, Floating, PanelKind, PanelWindow, SplitSize};
 use crate::state::UiState;
 
 const FILE: &str = "workspaces.json";
@@ -28,6 +28,9 @@ struct Snapshot {
     maximized: Option<PanelKind>,
     saved_workspaces: BTreeMap<String, DockNode>,
     saved_floating: BTreeMap<String, Vec<Floating>>,
+    /// Floating groups in their own native window (absent from files of earlier versions).
+    #[serde(default)]
+    panel_windows: Vec<PanelWindow>,
 }
 
 impl Snapshot {
@@ -41,6 +44,7 @@ impl Snapshot {
             maximized: ui.maximized,
             saved_workspaces: ui.saved_workspaces.clone(),
             saved_floating: ui.saved_floating.clone(),
+            panel_windows: ui.panel_windows.clone(),
         }
     }
 
@@ -52,6 +56,14 @@ impl Snapshot {
         ui.maximized = self.maximized;
         ui.saved_workspaces = self.saved_workspaces;
         ui.saved_floating = self.saved_floating;
+        // A window is only kept for a panel that still floats, and only where a window can be.
+        let floating = |panel: PanelKind| ui.floating.iter().any(|group| group.panels.contains(&panel));
+        ui.panel_windows = self
+            .panel_windows
+            .into_iter()
+            .filter(|window| floating(window.panel))
+            .map(|window| PanelWindow { panel: window.panel, rect: PanelWindow::sanitized(window.rect) })
+            .collect();
         // Reserve restored viewer slots without restoring any project-specific composition
         // links. New Viewer allocates from this map, including after switching named layouts.
         let mut panels = Vec::new();
@@ -89,7 +101,7 @@ impl Snapshot {
             PanelKind::Viewer(id) => (1..=MAX_VIEWER_ID).contains(&id),
             _ => true,
         };
-        if !panel_ok(self.focused) || self.maximized.is_some_and(|panel| !panel_ok(panel)) {
+        if !panel_ok(self.focused) || self.maximized.is_some_and(|panel| !panel_ok(panel)) || self.panel_windows.iter().any(|w| !panel_ok(w.panel)) {
             return Err("workspace viewer ID is outside the supported range 1–65535".into());
         }
         let mut nodes = 0usize;
@@ -133,6 +145,9 @@ impl Snapshot {
                     }
                 }
             }
+        }
+        if self.panel_windows.len() > MAX_PANELS || self.panel_windows.iter().any(|w| !w.rect.iter().all(|v| v.is_finite())) {
+            return Err("invalid workspace panel windows".into());
         }
         for groups in std::iter::once(&self.floating).chain(self.saved_floating.values()) {
             if groups.len() > MAX_PANELS {
@@ -229,6 +244,7 @@ impl WorkspaceStore {
             || self.saved.maximized != ui.maximized
             || self.saved.saved_workspaces != ui.saved_workspaces
             || self.saved.saved_floating != ui.saved_floating
+            || self.saved.panel_windows != ui.panel_windows
     }
 
     pub(crate) fn save(&mut self, config: Option<&dyn ConfigStore>, ui: &UiState) -> Result<bool, String> {
