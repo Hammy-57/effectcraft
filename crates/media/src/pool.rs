@@ -1002,7 +1002,9 @@ impl Inner {
         });
         let jump = raw < a.next.saturating_sub(SEQ_SLACK) || raw >= a.until;
         if !same_stream(&a.stream, key) || a.footage != *footage || a.preview != preview || a.runner.is_none() || jump {
-            // another stream of the file, a stopped runner or a jump: start over after this frame
+            // another stream of the file, a stopped runner or a jump: start over after this frame,
+            // with a window from here (keeping the old far end after a backward jump or a loop
+            // wrap decoded the whole clip past the window and the memory budget)
             if !same_stream(&a.stream, key) {
                 a.frame_bytes = estimate;
             }
@@ -1010,6 +1012,7 @@ impl Inner {
             a.preview = preview;
             a.stream = Key { frame: 0, ..key.clone() };
             a.next = raw.saturating_add(1);
+            a.until = until;
         }
         a.until = a.until.max(until).min(total);
         if a.runner.is_some() || a.next >= a.until || running >= MAX_RUNNERS {
@@ -1610,6 +1613,31 @@ mod tests {
         for i in 2..n {
             assert_eq!(pool.inner.frame_at(&footage, at(i), true).unwrap().data, want[i as usize].data, "frame {i}");
         }
+    }
+
+    /// A6: after a backward jump (or a loop wrap) the decode-ahead window starts over from the
+    /// new position: it kept its old far end, so the runner decoded everything in between (the
+    /// whole clip on a wrap), past [`MAX_AHEAD`] and the memory budget.
+    #[test]
+    fn decode_ahead_window_shrinks_after_a_backward_jump() {
+        let n = 160;
+        let bytes: Arc<[u8]> = prores_movie(16, 16, n).into();
+        let path = "/mem/jump.mov";
+        let footage = crate::probe::probe_bytes(path, bytes.clone()).unwrap();
+        let at = |i: u32| footage.frame_rate.tick_of(i64::from(i)) + Tick(footage.frame_rate.frame_duration().0 / 2);
+        let pool = MediaPool::new();
+        pool.add_bytes(path, bytes);
+        let until = |pool: &MediaPool| lock(&pool.inner.cache).ahead.get(path).map(|a| a.until);
+        for i in [120, 121] {
+            pool.inner.frame_at(&footage, at(i), true).unwrap();
+        }
+        assert!(until(&pool).is_some_and(|u| u > 121), "decoding ahead of frame 121: {:?}", until(&pool));
+        // a loop wrap / backward jump to the start, then reading on in order
+        for i in [2, 3] {
+            pool.inner.frame_at(&footage, at(i), true).unwrap();
+        }
+        let u = until(&pool).unwrap();
+        assert!(u <= 4 + MAX_AHEAD, "the window ends at {u}, not near frame 3");
     }
 
     #[test]
