@@ -1258,3 +1258,127 @@ fn automation_roots_confine_file_access() {
     assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 1, "only the unconfined save");
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// A comp with `n` solids, built through the tools (`Big`, 1920×1080).
+fn big_comp(n: usize) -> McpServer {
+    let mut s = server();
+    rpc(&mut s, 1, "initialize", json!({"protocolVersion": "2025-06-18"}));
+    call_json(&mut s, "command_run", json!({"id": "comp.new", "params": {"name": "Big", "width": 1920, "height": 1080, "duration": 10}}));
+    for i in 0..n {
+        call_json(&mut s, "command_run", json!({"id": "layer.newSolid", "params": {"name": format!("Lower third background {i}"), "color": "#336699"}}));
+    }
+    s
+}
+
+#[test]
+fn get_comp_is_compact_and_says_when_it_is_cut() {
+    let mut s = big_comp(110);
+    let full = call_json(&mut s, "get_comp", json!({"full": true}));
+    let compact = call_json(&mut s, "get_comp", json!({}));
+    let (fl, cl) = (full.to_string().len(), compact.to_string().len());
+    eprintln!("110 layers: full {fl} chars, compact {cl} chars ({} per layer)", cl / 110);
+    // Every layer comes back in one call, small: ~130 characters a row at most.
+    assert_eq!((compact["layerCount"].clone(), compact["returned"].clone(), compact["next_offset"].clone()), (json!(110), json!(110), Value::Null));
+    assert!(compact.get("truncated").is_none(), "nothing cut");
+    assert!(cl < 110 * 130, "{cl} chars");
+    assert!(fl > 3 * cl, "compact is several times smaller: {fl} vs {cl}");
+    // Defaults are omitted: a fresh solid is just index, id, name, type, in, out.
+    let row = &compact["layers"][0];
+    let keys: Vec<&str> = row.as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(keys, ["id", "in", "index", "name", "out", "type"], "{row}");
+    assert_eq!(row["id"], full["layers"][0]["id"]);
+    assert!(compact["compact"].is_string(), "the reply says what compact rows leave out");
+
+    // `full: true` is the engine's comp.info unchanged.
+    assert_eq!(full["layers"].as_array().unwrap().len(), 110);
+    assert!(full.get("layerCount").is_none() && full["layers"][0]["switches"].is_object());
+
+    // Paging: a cut list says so in-band, with the offset to continue from.
+    let p1 = call_json(&mut s, "get_comp", json!({"limit": 50}));
+    assert_eq!((p1["returned"].clone(), p1["next_offset"].clone(), p1["layerCount"].clone()), (json!(50), json!(50), json!(110)));
+    assert_eq!(p1["truncated"]["next_offset"], 50);
+    assert_eq!(p1["truncated"]["total"], 110);
+    assert!(p1["truncated"]["hint"].as_str().unwrap().contains("offset=50"));
+    let p3 = call_json(&mut s, "get_comp", json!({"offset": 100, "limit": 50}));
+    assert_eq!((p3["returned"].clone(), p3["next_offset"].clone()), (json!(10), Value::Null));
+    assert_eq!(p3["layers"][0]["index"], 101);
+    assert!(p3.get("truncated").is_none());
+    let past = call_json(&mut s, "get_comp", json!({"offset": 500}));
+    assert_eq!((past["returned"].clone(), past["next_offset"].clone()), (json!(0), Value::Null));
+    // Paged full rows.
+    let pf = call_json(&mut s, "get_comp", json!({"full": true, "limit": 2}));
+    assert_eq!((pf["layers"].as_array().unwrap().len(), pf["next_offset"].clone()), (2, json!(2)));
+    assert!(pf["layers"][0]["switches"].is_object());
+    // Bad paging arguments are errors, not crashes.
+    for bad in [json!({"limit": 0}), json!({"offset": -1}), json!({"limit": "many"}), json!({"offset": 1.5})] {
+        assert!(call(&mut s, "get_comp", bad.clone()).1, "{bad}");
+    }
+    // doc_inspect's active comp is compact too.
+    let doc = call_json(&mut s, "doc_inspect", json!({}));
+    assert_eq!(doc["activeComp"]["layerCount"], 110);
+    assert_eq!(doc["activeComp"]["layers"][0], compact["layers"][0]);
+}
+
+#[test]
+fn compact_rows_list_only_what_differs() {
+    let mut s = big_comp(3);
+    let run = |s: &mut McpServer, id: &str, params: Value| call_json(s, "command_run", json!({"id": id, "params": params}));
+    run(&mut s, "layer.setSwitch", json!({"layers": ["#1"], "switch": "threeD", "value": true}));
+    run(&mut s, "layer.setSwitch", json!({"layers": ["#1"], "switch": "video", "value": false}));
+    run(&mut s, "layer.setSwitch", json!({"layers": ["#1"], "switch": "quality", "value": false}));
+    run(&mut s, "layer.setBlendMode", json!({"layers": ["#1"], "mode": "Multiply"}));
+    let parent = call_json(&mut s, "get_comp", json!({}))["layers"][2]["id"].clone();
+    run(&mut s, "layer.setParent", json!({"layers": ["#1"], "parent": parent}));
+    run(&mut s, "layer.timing", json!({"layer": "#2", "start": 1.0}));
+    let c = call_json(&mut s, "get_comp", json!({}));
+    let row = &c["layers"][0];
+    assert_eq!(row["switches"], json!(["hidden", "3d", "quality:Draft"]), "{row}");
+    assert_eq!(row["blendMode"], "Multiply");
+    assert_eq!(row["parent"], parent);
+    assert!(row.get("start").is_none() && row.get("label").is_none(), "{row}");
+    assert!((c["layers"][1]["start"].as_f64().unwrap() - 1.0).abs() < 0.01, "{c}");
+    assert!(c["layers"][2].get("switches").is_none() && c["layers"][2].get("blendMode").is_none());
+    assert!(row.to_string().len() <= 200, "a busy row stays short: {row}");
+
+    // Every engine switch is known (a new one would show as `key:value` until it is added).
+    let full = call_json(&mut s, "get_comp", json!({"full": true}));
+    let mut keys: Vec<&str> = full["layers"][0]["switches"].as_object().unwrap().keys().map(String::as_str).collect();
+    let mut known = crate::compact::known_switches();
+    keys.sort_unstable();
+    known.sort_unstable();
+    assert_eq!(keys, known);
+}
+
+#[test]
+fn get_property_pages_keyframes_and_get_layer_pages_the_flat_list() {
+    let mut s = big_comp(1);
+    let keys: Vec<Value> = (0..257).map(|i| json!({"time": f64::from(i) / 30.0, "value": [f64::from(i) / 3.0, 540.0]})).collect();
+    call_json(&mut s, "add_keyframe", json!({"layer": "#1", "path": "transform/position", "keys": keys}));
+    let p = call_json(&mut s, "get_property", json!({"layer": "#1", "path": "transform/position"}));
+    assert_eq!((p["keyCount"].clone(), p["returned"].clone(), p["next_offset"].clone()), (json!(257), json!(100), json!(100)));
+    assert_eq!(p["truncated"]["next_offset"], 100);
+    assert!(p.to_string().len() < 8_000, "a page fits a capped client: {}", p.to_string().len());
+    let k = &p["keys"][1];
+    assert!(k.get("layerTime").is_none() && k.get("compTime").is_none() && k.get("in").is_none(), "{k}");
+    assert_eq!(k["value"][0], 0.3333, "values rounded: {k}");
+    let last = call_json(&mut s, "get_property", json!({"layer": "#1", "path": "transform/position", "offset": 200}));
+    assert_eq!((last["returned"].clone(), last["next_offset"].clone()), (json!(57), Value::Null));
+    assert!(last.get("truncated").is_none());
+    // `full: true`: every key, every field.
+    let full = call_json(&mut s, "get_property", json!({"layer": "#1", "path": "transform/position", "full": true}));
+    assert_eq!(full["keys"].as_array().unwrap().len(), 257);
+    assert!(full["keys"][1]["layerTime"].is_number() && full["keys"][1]["in"].is_string());
+    assert!(full.get("keyCount").is_none());
+
+    let flat = call_json(&mut s, "get_layer", json!({"layer": "#1", "flat": true, "limit": 5}));
+    let total = flat["total"].as_u64().unwrap();
+    assert!(total > 5, "{flat}");
+    assert_eq!((flat["returned"].clone(), flat["next_offset"].clone()), (json!(5), json!(5)));
+    assert_eq!(flat["truncated"]["total"], total);
+    let rest = call_json(&mut s, "get_layer", json!({"layer": "#1", "flat": true, "offset": 5}));
+    assert_eq!(rest["returned"].as_u64().unwrap() + 5, total);
+    assert_eq!(rest["next_offset"], Value::Null);
+    // The tree with 257 keys is big: it says how to get a smaller reply.
+    let tree = call_json(&mut s, "get_layer", json!({"layer": "#1"}));
+    assert!(tree["hint"].as_str().unwrap().contains("flat: true"), "{}", tree.to_string().len());
+}
