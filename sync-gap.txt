@@ -1,0 +1,3 @@
+347
+# history (date pending-commits note), newest last; line 1 is what sync-gap.sh --fail-if-growing reads
+2026-10-12 347 first record (after counting open-PR branches as shared)
