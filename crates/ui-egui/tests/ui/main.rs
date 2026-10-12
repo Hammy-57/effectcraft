@@ -139,6 +139,8 @@ mod ui_timeline_trim;
 mod ui_timeline_zoom;
 #[path = "../ui_tracker.rs"]
 mod ui_tracker;
+#[path = "../ui_unreadable_footage.rs"]
+mod ui_unreadable_footage;
 #[path = "../ui_viewer.rs"]
 mod ui_viewer;
 #[path = "../ui_viewers.rs"]

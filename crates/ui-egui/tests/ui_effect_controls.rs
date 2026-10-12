@@ -656,3 +656,32 @@ fn file_and_text_parameters_have_widgets() {
     assert_eq!(v, KV::Str("left*".into()));
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn select_all_and_the_chevron_act_on_every_selected_effect() {
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "Main", "width": 320, "height": 180, "frameRate": 30, "duration": 4})).unwrap();
+    let a = s.execute("layer.newSolid", json!({"name": "A", "color": "#406080"})).unwrap()["layer"].as_u64().unwrap();
+    let mut fx = |name: &str| s.execute("effect.apply", json!({"layers": [a], "effect": name})).unwrap()["effects"][0].as_u64().unwrap();
+    let (e1, e2, e3) = (fx("Fill"), fx("Invert"), fx("Tint"));
+    s.state.selected_layers = vec![LayerId(a)];
+    s.state.selected_props.clear();
+    let mut app = EffectcraftApp::new(s);
+    app.show_panel(PanelKind::EffectControls);
+    app.ui.focused = PanelKind::EffectControls;
+    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).build_eframe(|_| app);
+    h.run_steps(3);
+    // Cmd+A with Effect Controls focused selects every effect of the layer.
+    let ctx = h.ctx.clone();
+    effectcraft_ui_egui::menus::invoke(h.state_mut(), &ctx, "edit.selectAll", json!({})).unwrap();
+    h.run_steps(3);
+    let sel: Vec<u64> = h.state().session.state.selected_props.iter().map(|(_, u)| *u).collect();
+    assert_eq!(sel, vec![e1, e2, e3]);
+    // The chevron of one selected effect closes them all, and opens them all again.
+    let tw = rect_of(&h, &format!("effectControls.effect.{e2}.twirl")).center();
+    click(&mut h, tw);
+    assert!([e1, e2, e3].iter().all(|u| h.state().ui.fx_closed.contains(u)));
+    let tw = rect_of(&h, &format!("effectControls.effect.{e2}.twirl")).center();
+    click(&mut h, tw);
+    assert!([e1, e2, e3].iter().all(|u| !h.state().ui.fx_closed.contains(u)));
+}

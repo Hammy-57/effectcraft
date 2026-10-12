@@ -62,7 +62,7 @@ impl<'a> Renderer<'a> {
         let mut nb = (*b).clone();
         color::convert(&mut nb.img, &c);
         let nb = Arc::new(nb);
-        if let (Some(cache), Some(k)) = (self.cache, key) {
+        if let (Some(cache), Some(k)) = (self.cache_to_keep(), key) {
             cache.insert(k, nb.clone());
         }
         nb
@@ -80,7 +80,7 @@ impl<'a> Renderer<'a> {
             return Some((b, key));
         }
         let flat = Arc::new(styles::Styled { passes: st.passes.iter().map(|(b, m)| ((**b).clone(), *m)).collect(), body: (*st.body).clone() }.flatten());
-        if let (Some(c), Some(k)) = (self.cache, key) {
+        if let (Some(c), Some(k)) = (self.cache_to_keep(), key) {
             c.insert(k, flat.clone());
         }
         Some((flat, key))
@@ -246,7 +246,7 @@ impl<'a> Renderer<'a> {
         {
             k.adopt(&buf);
         }
-        if let (Some(c), Some(k)) = (self.cache, key) {
+        if let (Some(c), Some(k)) = (self.cache_to_keep(), key) {
             if once {
                 c.insert_once(k, buf.clone());
             } else {
@@ -282,7 +282,7 @@ impl<'a> Renderer<'a> {
             buf = self.effect_space_stack(ctx, layer, buf, false, effects, None, origin);
         }
         let buf = Arc::new(buf);
-        if let (Some(c), Some(k)) = (self.cache, key) {
+        if let (Some(c), Some(k)) = (self.cache_to_keep(), key) {
             c.insert(k, buf.clone());
         }
         Some(buf)
@@ -314,7 +314,7 @@ impl<'a> Renderer<'a> {
         }
         let body = Arc::new(st.body);
         let passes: Vec<_> = st.passes.into_iter().map(|(b, m)| (Arc::new(b), m)).collect();
-        if let (Some(c), Some(k)) = (self.cache, key) {
+        if let (Some(c), Some(k)) = (self.cache_to_keep(), key) {
             c.insert(k, body.clone());
             for (i, (b, _)) in passes.iter().enumerate() {
                 c.insert(cache::derive(k, i as u64 + 1), b.clone());
@@ -410,7 +410,7 @@ impl<'a> Renderer<'a> {
             color::convert(&mut buf.img, &c);
         }
         let buf = Arc::new(buf);
-        if let (Some(c), Some(k)) = (self.cache, key) {
+        if let (Some(c), Some(k)) = (self.cache_to_keep(), key) {
             c.insert(k, buf.clone());
         }
         // (`_flight`, dropped here, wakes the threads waiting for this buffer.)

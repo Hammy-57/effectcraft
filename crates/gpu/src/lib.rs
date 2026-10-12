@@ -245,6 +245,10 @@ impl Gpu {
         // Reject failures observed during rendering/submission before publishing the frame.
         // A later device fault still requires the presentation host's lifecycle handling.
         self.ctx.check_health().map_err(|e| log::error!("gpu display: {e}")).ok()?;
+        // footage reads called off (#329): frames may be missing, so nothing is kept
+        if r.footage.called_off() {
+            return None;
+        }
         e.publish_native();
         Some(DisplayFrame { texture, width: img.width, height: img.height })
     }
@@ -305,6 +309,10 @@ impl Gpu {
         let img = walk::render(&mut e, r, comp, t)?;
         let image = e.download(&img);
         self.ctx.check_health().ok()?;
+        // footage reads called off (#329): frames may be missing, so nothing is kept
+        if r.footage.called_off() {
+            return None;
+        }
         if image.is_some() {
             e.publish_native();
         }
