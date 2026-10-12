@@ -149,3 +149,58 @@ fn auto_pick_follows_changing_costs() {
     assert!(pick.stats(AutoKey::new(ItemId(7), 1.0, true)).is_none());
     assert!(pick.stats(AutoKey::new(ItemId(7), 0.5, false)).is_none());
 }
+
+/// Frames rendered on the CPU in `n` frames of `key` with these per-frame costs.
+fn cpu_frames(pick: &AutoPick, key: AutoKey, n: usize, gpu_ms: f64, cpu_ms: f64) -> usize {
+    (0..n)
+        .filter(|_| {
+            let g = pick.choose(key);
+            pick.record(key, g, if g { gpu_ms } else { cpu_ms });
+            !g
+        })
+        .count()
+}
+
+#[test]
+fn auto_pick_probes_the_cpu_rarely_while_the_gpu_is_clearly_faster() {
+    // Each CPU frame in a GPU-resident comp reads back the device's layers (a hitch): while
+    // the GPU stays clearly faster, the CPU is re-measured less and less often.
+    let pick = AutoPick::default();
+    let key = AutoKey::new(ItemId(3), 1.0, true);
+    let n = 20 * AutoPick::REPROBE as usize;
+    let clear = cpu_frames(&pick, key, n, 1.0, 10.0);
+    // Warm-up (3) and probes 48, 96, 192, 384, 384… frames apart.
+    assert!(clear <= AutoPick::WARMUP as usize + 5, "{clear} CPU frames in {n}");
+    assert!(pick.stats(key).unwrap().reprobe > AutoPick::REPROBE);
+    // A close race keeps the usual cadence.
+    let close = AutoKey::new(ItemId(4), 1.0, true);
+    let probes = cpu_frames(&pick, close, n, 1.0, 1.5);
+    assert!(probes >= AutoPick::WARMUP as usize + 18, "{probes} CPU frames in {n}");
+    // When the CPU becomes faster, a probe finds it within the longest interval.
+    let mut flipped = 0;
+    for _ in 0..(2 * AutoPick::MAX_REPROBE as usize) {
+        let g = pick.choose(key);
+        pick.record(key, g, if g { 10.0 } else { 1.0 });
+        if !g {
+            flipped += 1;
+        }
+    }
+    assert!(flipped > AutoPick::MAX_REPROBE as usize, "stayed on the slower GPU ({flipped} CPU frames)");
+}
+
+#[test]
+fn auto_pick_skips_cpu_warm_up_at_another_resolution_of_a_gpu_comp() {
+    let pick = AutoPick::default();
+    let full = AutoKey::new(ItemId(5), 1.0, true);
+    cpu_frames(&pick, full, 20, 1.0, 10.0);
+    // Adaptive resolution steps to Half: no CPU warm-up frames there.
+    let half = AutoKey::new(ItemId(5), 0.5, true);
+    assert_eq!(cpu_frames(&pick, half, AutoPick::REPROBE as usize, 0.5, 5.0), 0);
+    // The first re-probe measures the CPU there; the history is its own.
+    assert_eq!(cpu_frames(&pick, half, 2 * AutoPick::REPROBE as usize, 0.5, 5.0), 1);
+    let s = pick.stats(half).unwrap();
+    assert_eq!(s.cpu_ms, Some(5.0));
+    // Another comp, or a close race, still warms both sides up.
+    let other = AutoKey::new(ItemId(6), 0.5, true);
+    assert_eq!(cpu_frames(&pick, other, 6, 0.5, 5.0), AutoPick::WARMUP as usize);
+}

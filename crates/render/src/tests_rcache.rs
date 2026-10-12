@@ -516,3 +516,95 @@ fn after_a_cut_the_new_shot_takes_the_budget() {
     assert_eq!(hits[0], 0);
     assert_eq!(hits[2..], [150, 150], "{hits:?}");
 }
+
+/// A key formats an image sequence's length and a sample of its paths, not every path (a
+/// 17k-frame sequence printed about a megabyte per key), and still changes with the sequence.
+#[test]
+fn image_sequence_keys_follow_the_sequence_without_formatting_every_path() {
+    let mut p = project();
+    let (cid, c) = comp(&mut p, "C");
+    let n = 20_000;
+    let seq: Vec<String> = (0..n).map(|i| format!("/shots/a/frame_{i:05}.png")).collect();
+    let f = Footage {
+        path: seq[0].clone(),
+        kind: FootageKind::Sequence,
+        width: 40,
+        height: 30,
+        pixel_aspect: 1.0,
+        has_video: true,
+        loop_count: 1,
+        duration: s(600.0),
+        sequence: seq,
+        ..Default::default()
+    };
+    assert!(format!("{:?}", crate::cache::FootageKey(&f)).len() < 4096);
+    let fid = p.add_item("Seq", Label::Aqua, None, ItemKind::Footage(f));
+    let mut l = build::layer(&mut p, &c, "Seq", LayerSource::Footage { item: fid }, (40, 30), None);
+    blur(&mut p, &mut l, 4.0);
+    p.comp_mut(cid).unwrap().layers.push(l);
+    let key = |p: &Project| {
+        let c = p.comp(cid).unwrap();
+        let ctx = EvalCtx::new(p, cid, c, s(0.5));
+        crate::cache::input_key(&ctx, &c.layers[0], 1.0, false, false, 1).unwrap()
+    };
+    let base = key(&p);
+    assert_eq!(base, key(&p), "an unchanged sequence keeps its key");
+    let middle = (n - 1) * 8 / 16;
+    let changes: Vec<(&str, Box<dyn Fn(&mut Footage)>)> = vec![
+        ("first path", Box::new(|f| f.sequence[0] = "/shots/b/frame_00000.png".into())),
+        ("last path", Box::new(move |f| f.sequence[n - 1] = "/shots/b/last.png".into())),
+        ("a sampled path", Box::new(move |f| f.sequence[middle] = "/shots/b/middle.png".into())),
+        ("length", Box::new(|f| drop(f.sequence.pop()))),
+        ("another field", Box::new(|f| f.invert_alpha = true)),
+        ("the main path", Box::new(|f| f.path = "/shots/b/frame_00000.png".into())),
+    ];
+    for (what, change) in changes {
+        let mut q = p.clone();
+        if let ItemKind::Footage(f) = &mut q.item_mut(fid).unwrap().kind {
+            change(f);
+        }
+        assert_ne!(key(&q), base, "changing the {what} changes the key");
+    }
+    // A proxy that is a sequence counts too.
+    let mut q = p.clone();
+    let proxy = Footage { kind: FootageKind::Sequence, sequence: vec!["/proxy/0.png".into(), "/proxy/1.png".into()], ..Default::default() };
+    q.item_mut(fid).unwrap().proxy = Some(Box::new(effectcraft_project::Proxy { footage: proxy.clone(), enabled: true }));
+    let with_proxy = key(&q);
+    assert_ne!(with_proxy, base, "a proxy changes the key");
+    if let Some(p) = q.item_mut(fid).unwrap().proxy.as_mut() {
+        p.footage.sequence[1] = "/proxy/other.png".into();
+    }
+    assert_ne!(key(&q), with_proxy, "the proxy's sequence changes the key");
+}
+
+/// Counts its evaluations, returning a fixed value.
+struct Counting(AtomicUsize, f64);
+impl ExprHost for Counting {
+    fn eval(&self, _: &EvalCtx, _: &Layer, _: &Property, _: &Value) -> Result<Value, String> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(Value::Scalar(self.1))
+    }
+}
+
+/// With linear blending a layer's key is computed once per frame (it was computed for the
+/// blending-space lookup and again for the render on a miss, running its expressions twice).
+#[test]
+fn linear_blending_keys_a_layer_once_per_frame() {
+    let mut p = project();
+    let (cid, c) = comp(&mut p, "C");
+    let mut l = solid(&mut p, &c, [1.0, 0.0, 0.0]);
+    blur(&mut p, &mut l, 2.0);
+    l.props.prop_mut("effects/#1/blurriness").unwrap().expr = Some(Expression { text: "time * 4".into(), enabled: true });
+    p.comp_mut(cid).unwrap().layers.push(l);
+    // Evaluations of the expression in a first (missing) cached frame.
+    let evaluations = |p: &Project| {
+        let host = Counting(AtomicUsize::new(0), 3.0);
+        let cache = LayerCache::default();
+        let img = frame(p, cid, 0.5, &NoFootage, Some(&host), Some(&cache));
+        assert_same(&img, &frame(p, cid, 0.5, &NoFootage, Some(&host), None), "cached render");
+        host.0.load(Ordering::SeqCst)
+    };
+    let gamma = evaluations(&p);
+    p.settings.blend_linear = true;
+    assert_eq!(evaluations(&p), gamma, "linear blending keys the layer once, as gamma blending does");
+}

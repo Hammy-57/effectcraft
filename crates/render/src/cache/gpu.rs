@@ -64,6 +64,8 @@ impl GpuSlot {
 pub(super) struct GpuEntry {
     pub(super) slot: Arc<GpuSlot>,
     pub(super) last_use: u64,
+    /// Published and not used since: evicted before admitted entries (see `evict_one`).
+    pub(super) probation: bool,
 }
 
 /// A weak per-operation capability. Never install one globally in a shared backend.
@@ -254,7 +256,7 @@ impl GpuPending {
         g.clock = g.clock.saturating_add(1);
         let now = g.clock;
         let weak = Arc::downgrade(&self.slot);
-        let old = g.gpu_insert(Arc::as_ptr(&self.slot) as usize, GpuEntry { slot: self.slot, last_use: now });
+        let old = g.gpu_insert(Arc::as_ptr(&self.slot) as usize, GpuEntry { slot: self.slot, last_use: now, probation: true });
         drop(g);
         drop(old);
         Ok(weak)
@@ -287,11 +289,15 @@ pub(super) fn relieve(inner: &Arc<Mutex<Inner>>, token: Option<&ResidentToken>, 
                 // allocations from another context. Preserve those useful entries
                 // when a pinned allocation prevents admission on this device.
                 let since = if protect { g.working_since() } else { None };
+                let on =
+                    |id: &usize, probation: bool| g.gpu.get(id).is_some_and(|e| (!probation || e.probation) && e.slot.allocation.generation().same(generation));
+                // Slots on probation first (see `evict_one`), then the least recently used.
                 let key = g
-                    .gpu_lru
+                    .gpu_probation_lru
                     .iter()
-                    .find(|(_, id)| g.gpu.get(id).is_some_and(|e| e.slot.allocation.generation().same(generation)))
+                    .find(|(_, id)| on(id, true))
                     .filter(|(age, _)| since.is_none_or(|since| *age <= since))
+                    .or_else(|| g.gpu_lru.iter().find(|(_, id)| on(id, false)).filter(|(age, _)| since.is_none_or(|since| *age <= since)))
                     .map(|(_, id)| *id);
                 match key {
                     Some(key) => (true, g.gpu_remove(key).map(|e| e.slot)),
@@ -358,6 +364,48 @@ mod tests {
         let g = GpuGeneration::default();
         c.gpu_owner().unwrap().prepare(Arc::new(()), allocation(&g), stage, 1024).unwrap().with_content(99, Some(readback)).publish().unwrap();
     }
+    #[test]
+    fn one_use_slots_cannot_evict_established_ones() {
+        // Room for four 16-byte slots. Two layers are used on two frames (admitted), then a
+        // run of one-use results (a moving video's frames) is published and never used again:
+        // they evict each other, never the established layers (the 4:29 cut, A8).
+        let c = LayerCache::new(64);
+        let owner = c.gpu_owner().unwrap();
+        let g = GpuGeneration::default();
+        let publish = || owner.prepare(Arc::new(()), allocation(&g), GpuStage::Blend, 1024).unwrap().publish().unwrap();
+        let stable = [publish(), publish()];
+        assert_eq!(c.gpu_admission(), (0, 2), "first publications are on probation");
+        for s in &stable {
+            assert!(owner.get(s, &g, GpuStage::Blend).is_some());
+        }
+        assert_eq!(c.gpu_admission(), (2, 0), "used again: admitted");
+        let mut last = None;
+        for _ in 0..32 {
+            last = Some(publish());
+        }
+        for s in &stable {
+            assert!(owner.get(s, &g, GpuStage::Blend).is_some(), "a one-use slot evicted an established one");
+        }
+        assert!(last.is_some_and(|l| owner.get(&l, &g, GpuStage::Blend).is_some()), "the newest one-use slot is kept");
+        assert_eq!(c.gpu_admission(), (3, 1));
+        assert_eq!(c.retained_stats().live_bytes, 64);
+    }
+
+    #[test]
+    fn device_ceiling_evicts_one_use_slots_first() {
+        let c = LayerCache::new(1 << 20);
+        let owner = c.gpu_owner().unwrap();
+        let g = GpuGeneration::default();
+        let publish = || owner.prepare(Arc::new(()), allocation(&g), GpuStage::Blend, 48).unwrap().publish().unwrap();
+        let stable = publish();
+        assert!(owner.get(&stable, &g, GpuStage::Blend).is_some());
+        for _ in 0..8 {
+            publish();
+        }
+        assert!(owner.get(&stable, &g, GpuStage::Blend).is_some(), "the device ceiling evicted an established slot first");
+        assert_eq!(c.stats().gpu_entries, 3);
+    }
+
     #[test]
     fn device_only_pressure_preserves_cpu_and_other_generation_entries() {
         let c = LayerCache::new(1024);

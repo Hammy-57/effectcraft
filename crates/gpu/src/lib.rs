@@ -99,7 +99,9 @@ mod walk;
 
 use std::sync::Arc;
 
-pub use context::{GpuContext, GpuImage, TransferStats};
+#[cfg(feature = "profile")]
+pub use context::take_pool_miss_sites;
+pub use context::{AllocStats, GpuContext, GpuImage, TransferStats};
 use effectcraft_effects::Buf;
 use effectcraft_project::ItemId;
 use effectcraft_raster::Image;
@@ -243,6 +245,10 @@ impl Gpu {
         // Reject failures observed during rendering/submission before publishing the frame.
         // A later device fault still requires the presentation host's lifecycle handling.
         self.ctx.check_health().map_err(|e| log::error!("gpu display: {e}")).ok()?;
+        // footage reads called off (#329): frames may be missing, so nothing is kept
+        if r.footage.called_off() {
+            return None;
+        }
         e.publish_native();
         Some(DisplayFrame { texture, width: img.width, height: img.height })
     }
@@ -282,12 +288,12 @@ impl Gpu {
     }
 
     /// Wait until `submission` has finished on the GPU, running the callbacks of the readbacks it
-    /// completed. Bounded by the readback deadline, whose expiry retires the context as a
-    /// blocking readback's does.
+    /// completed, or for at most the readback deadline. Running out of time is not a failure (the
+    /// work ahead of it may be a deep queue that keeps completing): the readback deadlines retire
+    /// the context when the GPU stops completing work.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn wait_submission(&self, submission: &wgpu::SubmissionIndex) -> Result<(), String> {
-        let wait = wgpu::PollType::Wait { submission_index: Some(submission.clone()), timeout: Some(crate::readback::TIMEOUT) };
-        self.ctx.poll_readbacks(wait).map(|_| ())
+        self.ctx.wait_for(Some(submission.clone()), crate::readback::TIMEOUT).map(|_| ())
     }
 
     /// Render a frame on the GPU and read it back (`None` = not handled).
@@ -303,6 +309,10 @@ impl Gpu {
         let img = walk::render(&mut e, r, comp, t)?;
         let image = e.download(&img);
         self.ctx.check_health().ok()?;
+        // footage reads called off (#329): frames may be missing, so nothing is kept
+        if r.footage.called_off() {
+            return None;
+        }
         if image.is_some() {
             e.publish_native();
         }

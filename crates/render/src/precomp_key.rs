@@ -19,7 +19,7 @@ use effectcraft_project::essential::{self, EgKind, Override};
 use effectcraft_project::{AutoOrient, Comp, FootageKind, FrameBlend, ItemId, ItemKind, Layer, LayerSource, Layers, Project};
 use effectcraft_time::Tick;
 
-use crate::cache::{Memo, hash_debug, hash_values, hasher, layer_info_arc};
+use crate::cache::{FootageKey, Memo, ProxyKey, hash_debug, hash_values, hasher, layer_info_arc};
 use crate::footage::frame_blend_mode;
 use crate::sources::essential_overrides;
 use crate::{EvalCtx, RenderOpts, Renderer};
@@ -152,7 +152,7 @@ impl<'a> Renderer<'a> {
         }
         if let Some(pf) = self.proxy_for(item) {
             2u8.hash(&mut h);
-            hash_debug(&mut h, pf);
+            hash_debug(&mut h, &FootageKey(pf));
             lt.0.hash(&mut h);
             return Some(h.finish());
         }
@@ -222,8 +222,8 @@ impl<'a> Renderer<'a> {
                     let it = self.project.item(*item);
                     match it.map(|it| (&it.kind, &it.proxy)) {
                         Some((ItemKind::Footage(f), proxy)) => {
-                            hash_debug(&mut h, f);
-                            hash_debug(&mut h, proxy);
+                            hash_debug(&mut h, &FootageKey(f));
+                            hash_debug(&mut h, &ProxyKey(proxy));
                             let used = self.proxy_for(*item);
                             used.is_some().hash(&mut h);
                             if used.unwrap_or(f).kind != FootageKind::Still {

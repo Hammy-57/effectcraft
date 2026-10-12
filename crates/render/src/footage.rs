@@ -8,6 +8,7 @@ use effectcraft_raster::Px;
 use effectcraft_time::{FrameRate, TICKS_PER_SECOND, Tick};
 use rayon::prelude::*;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// A decoded footage frame as its source keeps it, turned into compositor pixels a band of rows
 /// at a time: float frames are copied, compact ones (a decoder's 8-bit Y'CbCr samples) are
@@ -205,6 +206,106 @@ pub trait FootageSource: Send + Sync {
     fn vector_frame(&self, _item: ItemId, _footage: &Footage, _scale: f64) -> Option<Arc<Image>> {
         None
     }
+    /// Run `f`, which reads frames from this source, as work that can be called off: once
+    /// `cancel` is set, long decodes it starts (a movie seeking back to a keyframe and decoding
+    /// forward) stop early and their frames come back `None`. Sources that can't stop a decode
+    /// just run `f`. See [`CancellableFootage`].
+    fn cancellable(&self, _cancel: &Arc<AtomicBool>, f: &mut dyn FnMut()) {
+        f()
+    }
+    /// Reads through this source have been called off: frames may have come back `None` that
+    /// exist, so what was made from them must not be kept.
+    fn called_off(&self) -> bool {
+        false
+    }
+    /// Why `footage` shows no picture although its file is there: a read of it failed because
+    /// no decoder handles its codec, profile, chroma format or bit depth, or the stream is damaged
+    /// (e.g. "H.264 (High 4:2:2) isn't supported by the built-in decoder: ..."). `None` while it
+    /// decodes, and for sources that don't track failures. Stays set until the file is forgotten.
+    fn problem(&self, _footage: &Footage) -> Option<String> {
+        None
+    }
+}
+
+/// A render's view of a [`FootageSource`] whose frame reads can be called off with `cancel`
+/// (a viewer frame nobody waits for any more, #329). Every read goes through
+/// [`FootageSource::cancellable`] on its own, so reads made for this render on another thread
+/// (a parallel loop) answer to this render's flag, and reads for other renders never do.
+pub struct CancellableFootage<'a> {
+    pub inner: &'a dyn FootageSource,
+    pub cancel: Arc<AtomicBool>,
+}
+
+impl CancellableFootage<'_> {
+    fn read<R>(&self, f: impl FnOnce() -> Option<R>) -> Option<R> {
+        if self.cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        let (mut f, mut out) = (Some(f), None);
+        self.inner.cancellable(&self.cancel, &mut || out = f.take().and_then(|f| f()));
+        out
+    }
+}
+
+impl FootageSource for CancellableFootage<'_> {
+    fn frame(&self, item: ItemId, footage: &Footage, t: Tick) -> Option<Arc<Image>> {
+        self.read(|| self.inner.frame(item, footage, t))
+    }
+    fn frame_pixels(&self, item: ItemId, footage: &Footage, t: Tick) -> Option<SharedFrame> {
+        self.read(|| self.inner.frame_pixels(item, footage, t))
+    }
+    fn preview_frame(&self, item: ItemId, footage: &Footage, t: Tick, w: u32, h: u32, scale: f64) -> Option<FootageFrame> {
+        self.read(|| self.inner.preview_frame(item, footage, t, w, h, scale))
+    }
+    fn audio(&self, item: ItemId, footage: &Footage, t: Tick, frames: usize, rate: u32) -> Option<Vec<f32>> {
+        self.inner.audio(item, footage, t, frames, rate)
+    }
+    fn aux(&self, item: ItemId, footage: &Footage, t: Tick) -> Option<Arc<effectcraft_raster::AuxChannels>> {
+        self.inner.aux(item, footage, t)
+    }
+    fn model(&self, item: ItemId, footage: &Footage) -> Option<Arc<effectcraft_model::Model>> {
+        self.inner.model(item, footage)
+    }
+    fn set_cache_budget(&self, bytes: usize) {
+        self.inner.set_cache_budget(bytes)
+    }
+    fn purge(&self) {
+        self.inner.purge()
+    }
+    fn forget(&self, path: &str) {
+        self.inner.forget(path)
+    }
+    fn thumbnail(&self, footage: &Footage, max_side: u32) -> Option<Image> {
+        self.inner.thumbnail(footage, max_side)
+    }
+    fn retain_files(&self, keep: &dyn Fn(&str) -> bool) {
+        self.inner.retain_files(keep)
+    }
+    fn set_conform_folder(&self, folder: Option<std::path::PathBuf>) {
+        self.inner.set_conform_folder(folder)
+    }
+    fn set_hardware_decoding(&self, on: bool) {
+        self.inner.set_hardware_decoding(on)
+    }
+    fn exact(&self) -> Option<&dyn FootageSource> {
+        // (the exact view reads without this wrapper's cancellation: final renders finish)
+        Some(exact_footage(self.inner))
+    }
+    fn cache_budget(&self) -> Option<usize> {
+        self.inner.cache_budget()
+    }
+    fn vector_frame(&self, item: ItemId, footage: &Footage, scale: f64) -> Option<Arc<Image>> {
+        self.inner.vector_frame(item, footage, scale)
+    }
+    fn cancellable(&self, cancel: &Arc<AtomicBool>, f: &mut dyn FnMut()) {
+        self.inner.cancellable(cancel, f)
+    }
+    fn called_off(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed) || self.inner.called_off()
+    }
+    fn problem(&self, footage: &Footage) -> Option<String> {
+        self.inner.problem(footage)
+    }
 }
 
 /// Footage that can be rasterised at any scale (SVG, PDF, AI, EPS). Footage without a codec name
@@ -394,7 +495,7 @@ impl<'a> Renderer<'a> {
                 let b = self.footage.frame(item, f, f.frame_rate.tick_of(i + 1));
                 if let (Some(a), Some(b)) = (a, b) {
                     let img = blend_frames(mode, &a, &b, w as f32);
-                    if let (Some(c), Some(k)) = (self.cache, key) {
+                    if let (Some(c), Some(k)) = (self.cache_to_keep(), key) {
                         c.insert(k, Arc::new(Buf { img: img.clone(), offset: [0.0; 2], scale: 1.0 }));
                     }
                     return Some(Arc::new(img));

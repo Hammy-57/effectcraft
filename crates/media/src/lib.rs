@@ -38,6 +38,9 @@ pub enum MediaError {
     Unsupported(String),
     #[error("decode error: {0}")]
     Decode(String),
+    /// The read was called off before it finished (see [`effectcraft_render::FootageSource::cancellable`]).
+    #[error("cancelled")]
+    Cancelled,
 }
 
 pub type Result<T> = std::result::Result<T, MediaError>;
@@ -48,6 +51,7 @@ impl From<filmcraft_media::MediaError> for MediaError {
         match e {
             F::Unsupported(s) => MediaError::Unsupported(s),
             F::Io(s) | F::Offline(s) => MediaError::Io(s),
+            F::Cancelled => MediaError::Cancelled,
             other => MediaError::Decode(other.to_string()),
         }
     }

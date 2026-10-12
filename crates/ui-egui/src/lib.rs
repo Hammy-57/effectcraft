@@ -61,6 +61,10 @@ fn compositor_does_not_share_the_window_surface_device() {
 /// [`EffectcraftApp::editing`]).
 const EDIT_QUIET: f64 = 0.3;
 
+/// A frame slower than this (ms) stops paused prefetch: a running background frame can't be
+/// preempted, so the next frame you move to would share the CPU and GPU with it for that long.
+const PAUSED_PREFETCH_MAX_MS: f64 = 250.0;
+
 /// The longest a playing preview waits for its next UI frame (the meters, the end of the
 /// preview, a frame that finished rendering without waking the UI).
 const PLAYBACK_MAX_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
@@ -251,6 +255,9 @@ pub struct Playback {
     pub preroll: Option<f64>,
     /// When the last frames were shown (seconds, the last second's worth): the achieved rate.
     pub shown_at: std::collections::VecDeque<f64>,
+    /// When playback last looked at the clock (UI seconds, [`Self::observe`]): a hold since
+    /// the last frame counts against the achieved rate.
+    pub observed: f64,
 }
 
 impl Playback {
@@ -263,11 +270,23 @@ impl Playback {
         }
     }
 
+    /// Playback looked at the clock at `now`: frames shown more than a second ago no longer
+    /// count, so the rate readout does not freeze at its last value while playback holds.
+    pub fn observe(&mut self, now: f64) {
+        self.observed = now;
+        while self.shown_at.front().is_some_and(|t| now - t > 1.0) {
+            self.shown_at.pop_front();
+        }
+    }
+
     /// Frames per second shown over the last second while the preview plays (`None` before two
-    /// frames were shown, while caching, or stopped).
+    /// frames were shown, while caching, or stopped). A hold longer than a frame and a half
+    /// since the last frame shown counts up to [`Self::observe`]'s time.
     pub fn achieved_fps(&self) -> Option<f64> {
-        let (a, b) = (self.shown_at.front()?, self.shown_at.back()?);
-        (self.playing && !self.caching && self.shown_at.len() > 1 && b > a).then(|| (self.shown_at.len() - 1) as f64 / (b - a))
+        let (a, b) = (*self.shown_at.front()?, *self.shown_at.back()?);
+        let frame = self.plan.map_or(1, |p| p.step).max(1) as f64 / self.fps.max(1.0);
+        let end = if self.observed - b > 1.5 * frame { self.observed } else { b };
+        (self.playing && !self.caching && self.shown_at.len() > 1 && b > a).then(|| (self.shown_at.len() - 1) as f64 / (end - a))
     }
 
     /// The preview keeps up with its frame rate (within 5 %; previews that skip frames count
@@ -1091,6 +1110,7 @@ impl EffectcraftApp {
                 quarter: self.frame_series(comp, quarter),
                 budget_ms: 1000.0 * step / self.playback.fps,
                 gpu_context: self.gpu.as_ref().map_or(0, |g| std::ptr::from_ref(g.context()) as usize),
+                parallel: self.frames_parallelism(),
             }
         });
         match self.frames.adapt_playback(config) {
@@ -1256,6 +1276,7 @@ impl EffectcraftApp {
             audio_held: false,
             preroll: None,
             shown_at: Default::default(),
+            observed: now,
         };
         if !self.playback.caching {
             if plan.video {
@@ -1278,14 +1299,23 @@ impl EffectcraftApp {
     /// Start audio preview from comp time `t` when [`Self::audio_plays`] and an output device
     /// opens.
     fn start_audio(&mut self, t: Tick) {
-        self.audio = None;
+        let held = self.audio.take();
         self.meter.clipped = [false; 2];
         let (Some(pl), Some(cid)) = (self.playback.plan, self.session.active_comp_id()) else { return };
         let Some(c) = self.session.project.comp_arc(cid).filter(|_| self.audio_plays()) else { return };
+        let fr = c.frame_rate;
+        // Held while rendering caught up (same preview): play on, without reopening the device.
+        if let Some(mut a) = held.filter(|a| {
+            let span = audio::PlaySpan::new(t, fr.tick_of(pl.start), fr.tick_of(pl.end + 1), pl.looping, a.rate);
+            a.held() && a.comp == cid && (a.span.wa, a.span.wb, a.span.looping) == (span.wa, span.wb, span.looping)
+        }) {
+            a.resume(t);
+            self.audio = Some(a);
+            return;
+        }
         let out = audio::AudioOutput::from_prefs(&self.session.prefs);
         let Some(dev) = self.hooks.audio_device.as_ref().and_then(|f| f(&out)) else { return };
         let mix = self.session.prefs.audio.preview_sample_rate;
-        let fr = c.frame_rate;
         match audio::AudioPlayback::start(dev, self.render_source(), cid, t, fr.tick_of(pl.start), fr.tick_of(pl.end + 1), pl.looping, mix) {
             Ok(a) => self.audio = Some(a),
             Err(e) => log::warn!("audio preview: {e}"),
@@ -1399,6 +1429,9 @@ impl EffectcraftApp {
         let Some(cid) = self.session.active_comp_id() else { return };
         let Some(c) = self.session.project.comp_arc(cid) else { return };
         let now = ctx.input(|i| i.time);
+        if self.playback.playing {
+            self.playback.observe(now);
+        }
         let fr = c.frame_rate;
         let plan = self.playback.plan.filter(|_| self.playback.playing);
         let (wa, wb) = match plan {
@@ -1437,6 +1470,9 @@ impl EffectcraftApp {
         } else if let Some(wait) = self.editing(now) {
             ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait));
             0
+        } else if self.frames.last_ms.lock().is_ok_and(|ms| *ms > PAUSED_PREFETCH_MAX_MS) {
+            // Slow frames: rendering ahead held up the frame the user moved to by seconds.
+            0
         } else {
             // Keep workers available for a newly edited viewer frame. Running obsolete
             // background renders cannot be preempted by the priority queue.
@@ -1448,7 +1484,9 @@ impl EffectcraftApp {
         // frames in flight, as it drops queued frames the preview no longer reaches.
         let playhead = plan.filter(|p| p.video).map(|p| frames::Playhead { series, cur, start: p.start, end: p.end, step: p.step, looping: p.looping });
         self.frames.set_playhead(playhead);
-        let mut queued = self.frames.inflight();
+        // Playing, only this series counts: a ladder rung change leaves the old rung's prefetch
+        // queued, which held playback at every Full ↔ Half switch (A4).
+        let mut queued = if playhead.is_some() { self.frames.focus_series(&series) } else { self.frames.inflight() };
         // In-flight renders far ahead may finish after the near frames. Keep their completion
         // from evicting the very frames playback needs next (#595).
         self.frames.protect_frames(
@@ -1586,7 +1624,7 @@ impl EffectcraftApp {
             return;
         }
         // Audio clock drives playback: show the frame under the audible sample.
-        if let Some(a) = &self.audio {
+        if let Some(a) = self.audio.as_ref().filter(|a| !a.held()) {
             if a.finished() {
                 if video {
                     self.session.set_time(fr.tick_of(wb));
@@ -1609,9 +1647,12 @@ impl EffectcraftApp {
                     self.playback.frame_shown(now);
                 }
             } else {
-                // Rendering can't keep up: rather than skip frames, the sound stops and every
-                // frame shows as it renders until the frames ahead are cached again.
-                self.audio = None;
+                // Rendering can't keep up: rather than skip frames, the sound holds (the device
+                // stays open) and every frame shows as it renders until the frames ahead are
+                // cached again.
+                if let Some(a) = &mut self.audio {
+                    a.hold();
+                }
                 self.playback.audio_held = true;
                 self.playback.waiting = true;
                 // The rate measured before the stall no longer says it keeps up.
@@ -2620,6 +2661,35 @@ mod playback_budget_tests {
             assert_eq!(app.viewer_scale(1.0, 1.0), 1.0);
         }
     }
+    /// A4: after a ladder rung change the old rung's queued prefetch no longer counts as the
+    /// new rung's frames in flight (it held playback at every Full ↔ Half switch): it is dropped.
+    #[test]
+    fn a_rung_change_drops_the_old_rungs_queued_prefetch() {
+        /// Starts nothing, so every request stays queued.
+        struct Idle;
+        impl frames::RemoteFrames for Idle {
+            fn slots(&self) -> usize {
+                0
+            }
+            fn start(&self, _: frames::RemoteJob, _: frames::RemoteDone) {}
+        }
+        let mut app = app();
+        app.frames.set_remote(Some(Arc::new(Idle)));
+        let comp = app.session.active_comp_id().unwrap();
+        let (full, half) = (app.frame_series(comp, 1.0), app.frame_series(comp, 0.5));
+        let src = app.render_source();
+        for frame in 0..8 {
+            app.frames.request(&src, FrameKey { frame, ..full }, comp, Tick::ZERO, RenderOpts::default());
+        }
+        app.frames.request_urgent(&src, FrameKey { frame: 9, ..full }, comp, Tick::ZERO, RenderOpts::default());
+        assert_eq!(app.frames.inflight(), 9);
+        assert_eq!(app.frames.focus_series(&half), 0, "the old rung's frames are not the new rung's");
+        assert_eq!(app.frames.inflight(), 1, "its queued prefetch is gone; the viewer's frame stays");
+        app.frames.request(&src, FrameKey { frame: 0, ..half }, comp, Tick::ZERO, RenderOpts::default());
+        assert_eq!(app.frames.focus_series(&half), 1);
+        assert_eq!(app.frames.focus_series(&full), 1, "the urgent frame counts for its own series");
+    }
+
     #[test]
     fn playback_budget_ignores_precache_bad_rates_and_respects_frame_skip() {
         let mut app = app();
