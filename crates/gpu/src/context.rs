@@ -182,12 +182,34 @@ pub(crate) struct Pool {
 /// Processed pixels can be GPU-only. CPU mirrors, resident pixels and pending
 /// outputs already share the layer owner's physical budget; retain them up to
 /// that budget on either adapter type, with the device's existing hard ceiling.
-fn cache_budgets(layer_cache: usize, integrated: bool) -> (usize, usize, u64) {
+///
+/// `system_memory` is the machine's physical RAM in bytes (0: unknown). Integrated GPUs share
+/// it, so their working-texture pool scales with it: 128 MiB below 16 GiB (weak iGPUs, small
+/// laptops), rising linearly to [`POOL_BUDGET`] at 32 GiB and more (Apple Silicon with plenty of
+/// unified memory, where a 128 MiB pool misses on most layer sizes).
+fn cache_budgets(layer_cache: usize, integrated: bool, system_memory: u64) -> (usize, usize, u64) {
     let upload_cap = UPLOAD_BUDGET;
-    let pool_cap = if integrated { 128 << 20 } else { POOL_BUDGET };
+    let pool_cap = if integrated { unified_pool_cap(system_memory) } else { POOL_BUDGET };
     // Keep room for one 1080p RGBA-f32 buffer even on shared memory.
     let auxiliary_cap = if integrated { 32 << 20 } else { AUX_CACHE_BUDGET };
     (layer_cache.min(upload_cap), (layer_cache / 2).min(pool_cap), ((layer_cache / 16) as u64).min(auxiliary_cap))
+}
+
+/// The working-texture pool's cap on an integrated GPU with `system_memory` bytes of RAM (see
+/// [`cache_budgets`]).
+fn unified_pool_cap(system_memory: u64) -> usize {
+    const SMALL: u64 = 128 << 20;
+    const LOW: u64 = 16 << 30;
+    const HIGH: u64 = 32 << 30;
+    let full = POOL_BUDGET as u64;
+    let cap = if system_memory < LOW {
+        SMALL
+    } else if system_memory >= HIGH {
+        full
+    } else {
+        SMALL + (full - SMALL) * ((system_memory - LOW) >> 20) / ((HIGH - LOW) >> 20)
+    };
+    usize::try_from(cap).unwrap_or(POOL_BUDGET)
 }
 
 /// Counts of uploads (CPU → GPU) and readbacks (GPU → CPU).
@@ -515,6 +537,10 @@ pub struct GpuContext {
     pub(crate) name: String,
     pub(crate) max_dim: u32,
     integrated: bool,
+    /// Physical RAM in bytes (0: unknown; see [`GpuContext::set_system_memory`]).
+    system_memory: std::sync::atomic::AtomicU64,
+    /// The layer cache budget last given to [`GpuContext::set_cache_budget`].
+    layer_budget: std::sync::atomic::AtomicUsize,
     auxiliary_budget: std::sync::atomic::AtomicU64,
     pub(crate) bgl: wgpu::BindGroupLayout,
     bgl_ext: wgpu::BindGroupLayout,
@@ -883,7 +909,7 @@ impl GpuContext {
         let uniform_stride = PARAMS_SIZE.div_ceil(align).saturating_mul(align);
         let max_dim = device.limits().max_texture_dimension_2d;
         let integrated = info.device_type == wgpu::DeviceType::IntegratedGpu;
-        let (upload_budget, pool_budget, auxiliary_budget) = cache_budgets(UPLOAD_BUDGET, integrated);
+        let (upload_budget, pool_budget, auxiliary_budget) = cache_budgets(UPLOAD_BUDGET, integrated, 0);
         let yuv = match crate::yuv::Pipelines::new(adapter, &device) {
             Ok(p) => Some(p),
             Err(reason) => {
@@ -915,6 +941,8 @@ impl GpuContext {
             mips: Default::default(),
             pool: Arc::new(Mutex::new(Pool { budget: Some(pool_budget), ..Default::default() })),
             integrated,
+            system_memory: std::sync::atomic::AtomicU64::new(0),
+            layer_budget: std::sync::atomic::AtomicUsize::new(UPLOAD_BUDGET),
             auxiliary_budget: std::sync::atomic::AtomicU64::new(auxiliary_budget),
             staging: Default::default(),
             planes: Default::default(),
@@ -1499,16 +1527,29 @@ impl GpuContext {
         }
     }
 
+    /// The machine's physical RAM in bytes (0: unknown), which an integrated GPU shares: with
+    /// enough of it the working-texture pool may grow (see [`GpuContext::set_cache_budget`]).
+    /// Cheap when unchanged.
+    pub fn set_system_memory(&self, total: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.system_memory.swap(total, Relaxed) != total {
+            self.set_cache_budget(self.layer_budget.load(Relaxed));
+        }
+    }
+
     /// Size the GPU-side caches after the layer cache's memory budget (Memory & CPU settings,
     /// after RAM Reserved for Other Applications): uploaded layer textures mirror cached layer
     /// buffers while Processed entries remain GPU-only until CPU demand. Both allocations
     /// of a CPU mirror count against the owner's shared physical budget, as do pending
     /// GPU outputs. Retention follows that budget (capped at [`UPLOAD_BUDGET`]); free working
-    /// textures get half (capped at [`POOL_BUDGET`], or 128 MiB on unified memory).
+    /// textures get half (capped at [`POOL_BUDGET`]; on unified memory 128 MiB, more with
+    /// 16 GiB of RAM or more, see [`GpuContext::set_system_memory`]).
     /// Auxiliary staging and zero-image caches each get
     /// 1/16 of the layer budget, capped at 32 MiB integrated or 64 MiB discrete.
     pub fn set_cache_budget(&self, layer_cache: usize) {
-        let (upload, pool, auxiliary) = cache_budgets(layer_cache, self.integrated);
+        use std::sync::atomic::Ordering::Relaxed;
+        self.layer_budget.store(layer_cache, Relaxed);
+        let (upload, pool, auxiliary) = cache_budgets(layer_cache, self.integrated, self.system_memory.load(Relaxed));
         self.auxiliary_budget.store(auxiliary, std::sync::atomic::Ordering::Relaxed);
         if let Ok(mut u) = self.uploads.lock() {
             u.budget = Some(upload);
@@ -2616,7 +2657,7 @@ mod upload_budget_tests {
         use effectcraft_render::allocation::{GpuAllocation, GpuGeneration};
         use effectcraft_render::retained::AdmissionError;
         let budget = 1 << 30;
-        let (cap, _, _) = cache_budgets(budget, true);
+        let (cap, _, _) = cache_budgets(budget, true, 0);
         let generation = GpuGeneration::default();
         generation.set_cap(cap);
         let allocation = GpuAllocation::rgba_f32(4097, 4096, generation.clone()).unwrap();
@@ -2644,11 +2685,31 @@ mod upload_budget_tests {
 
     #[test]
     fn shared_memory_retention_uses_shared_budget_and_scratch_keeps_lower_caps() {
-        assert_eq!(cache_budgets(0, true), (0, 0, 0));
-        assert_eq!(cache_budgets(64 << 20, true), (64 << 20, 32 << 20, 4 << 20));
-        assert_eq!(cache_budgets(1 << 30, true), (1 << 30, 128 << 20, 32 << 20));
-        assert_eq!(cache_budgets(usize::MAX, true), (UPLOAD_BUDGET, 128 << 20, 32 << 20));
-        assert_eq!(cache_budgets(usize::MAX, false), (UPLOAD_BUDGET, POOL_BUDGET, AUX_CACHE_BUDGET));
+        assert_eq!(cache_budgets(0, true, 0), (0, 0, 0));
+        assert_eq!(cache_budgets(64 << 20, true, 0), (64 << 20, 32 << 20, 4 << 20));
+        assert_eq!(cache_budgets(1 << 30, true, 0), (1 << 30, 128 << 20, 32 << 20));
+        assert_eq!(cache_budgets(usize::MAX, true, 0), (UPLOAD_BUDGET, 128 << 20, 32 << 20));
+        assert_eq!(cache_budgets(usize::MAX, false, 0), (UPLOAD_BUDGET, POOL_BUDGET, AUX_CACHE_BUDGET));
+    }
+
+    /// RT9a: unified memory with plenty of RAM gets the discrete pool; small or unknown RAM
+    /// (weak iGPUs) keeps 128 MiB; the layer budget still bounds it.
+    #[test]
+    fn unified_memory_pool_cap_scales_with_ram() {
+        const GIB: u64 = 1 << 30;
+        let pool = |layer: usize, integrated: bool, ram: u64| cache_budgets(layer, integrated, ram).1;
+        assert_eq!(pool(usize::MAX, true, 0), 128 << 20);
+        assert_eq!(pool(usize::MAX, true, 8 * GIB), 128 << 20);
+        assert_eq!(pool(usize::MAX, true, 16 * GIB - 1), 128 << 20);
+        assert_eq!(pool(usize::MAX, true, 16 * GIB), 128 << 20);
+        assert_eq!(pool(usize::MAX, true, 24 * GIB), 448 << 20);
+        assert_eq!(pool(usize::MAX, true, 32 * GIB), POOL_BUDGET);
+        assert_eq!(pool(usize::MAX, true, 64 * GIB), POOL_BUDGET);
+        assert_eq!(pool(usize::MAX, true, u64::MAX), POOL_BUDGET);
+        assert_eq!(pool(1 << 30, true, 64 * GIB), 512 << 20);
+        assert_eq!(pool(usize::MAX, false, 8 * GIB), POOL_BUDGET);
+        // Scratch caches keep their unified-memory caps.
+        assert_eq!(cache_budgets(usize::MAX, true, 64 * GIB).2, 32 << 20);
     }
 
     #[test]
