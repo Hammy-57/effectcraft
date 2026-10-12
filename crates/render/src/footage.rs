@@ -202,6 +202,13 @@ pub trait FootageSource: Send + Sync {
     fn called_off(&self) -> bool {
         false
     }
+    /// Why `footage` shows no picture although its file is there: a read of it failed because
+    /// no decoder handles its codec, profile, chroma format or bit depth, or the stream is damaged
+    /// (e.g. "H.264 (High 4:2:2) isn't supported by the built-in decoder: ..."). `None` while it
+    /// decodes, and for sources that don't track failures. Stays set until the file is forgotten.
+    fn problem(&self, _footage: &Footage) -> Option<String> {
+        None
+    }
 }
 
 /// A render's view of a [`FootageSource`] whose frame reads can be called off with `cancel`
@@ -272,6 +279,9 @@ impl FootageSource for CancellableFootage<'_> {
     }
     fn called_off(&self) -> bool {
         self.cancel.load(Ordering::Relaxed) || self.inner.called_off()
+    }
+    fn problem(&self, footage: &Footage) -> Option<String> {
+        self.inner.problem(footage)
     }
 }
 

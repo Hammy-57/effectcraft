@@ -882,3 +882,32 @@ fn a_called_off_read_does_not_decode() {
     let img = got.expect("decoded once wanted again");
     assert_eq!((img.width, img.height), (1920, 1080));
 }
+
+/// #886: H.264 High 4:2:2 10-bit: the software decoder lacks it; the pool says why, once, and
+/// the footage reports it (not a black frame without a word).
+#[test]
+fn an_unsupported_stream_reports_why_it_shows_no_picture() {
+    let Some(p) = ffmpeg_fixture(
+        "h264_high422_10bit.mp4",
+        &["-f", "lavfi", "-i", "testsrc=size=320x180:rate=24:duration=1", "-c:v", "libx264", "-profile:v", "high422", "-pix_fmt", "yuv422p10le"],
+    ) else {
+        return;
+    };
+    let f = probe(&p).expect("probe");
+    let pool = MediaPool::new();
+    assert_eq!(pool.problem(&f), None, "nothing is wrong before a frame was asked for");
+    if pool.frame(ItemId(1), &f, Tick::ZERO).is_some() {
+        // a decoder that handles 4:2:2 (FilmCraft's, or a hardware one): no notice
+        assert_eq!(pool.problem(&f), None);
+        return;
+    }
+    let why = pool.problem(&f).expect("a failed frame leaves a reason");
+    assert!(why.contains("4:2:2"), "names the stream: {why}");
+    assert!(why.contains("isn't supported"), "says it is unsupported: {why}");
+    assert!(!why.contains("decode error"), "no error wrappers: {why}");
+    // it stays for the other frames, and is dropped when the file is forgotten
+    assert!(pool.frame(ItemId(1), &f, Tick::from_seconds_f64(0.5)).is_none());
+    assert_eq!(pool.problem(&f).as_deref(), Some(why.as_str()));
+    pool.forget(&f.path);
+    assert_eq!(pool.problem(&f), None);
+}

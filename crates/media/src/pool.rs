@@ -393,6 +393,10 @@ struct Inner {
     /// audio is read from the decoder instead of trying again on every read.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     conform_failed: Mutex<HashSet<std::path::PathBuf>>,
+    /// Movies that failed to open or decode: path to (a readable reason, whether it is a decoder
+    /// problem rather than an I/O one; see [`FootageSource::problem`]). The first failure of a
+    /// file is logged, later ones are not (#886).
+    problems: Mutex<HashMap<Arc<str>, (String, bool)>>,
 }
 
 /// Decodes footage for the renderer: stills, image sequences and movies (FilmCraft codecs), plus
@@ -469,6 +473,7 @@ impl MediaPool {
                 ahead_pool: OnceLock::new(),
                 conforming: Mutex::default(),
                 conform_failed: Mutex::default(),
+                problems: Mutex::default(),
             }),
         }
     }
@@ -518,6 +523,7 @@ impl MediaPool {
     pub fn clear(&self) {
         self.clear_frames();
         lock(&self.inner.sources).map.clear();
+        lock(&self.inner.problems).clear();
     }
 
     /// Movie and audio files open now.
@@ -542,6 +548,7 @@ impl MediaPool {
         lock(&self.inner.models).remove(path);
         lock(&self.inner.psds).remove(path);
         lock(&self.inner.gifs).remove(path);
+        lock(&self.inner.problems).remove(path);
         let mut c = lock(&self.inner.cache);
         let keys: Vec<Key> = c.lru.map.keys().filter(|k| &*k.path == path).cloned().collect();
         for k in keys {
@@ -797,7 +804,7 @@ impl Inner {
                         Some(s)
                     }
                     Err(e) => {
-                        log::warn!("media: cannot open {path}: {e}");
+                        self.note_problem(path, "", &e);
                         None
                     }
                 }
@@ -814,6 +821,23 @@ impl Inner {
             sources.trim(path);
         }
         src
+    }
+
+    /// Remember why the movie at `path` shows no picture (`codec` is the footage's, when known)
+    /// and log it the first time: a decoder problem replaces an I/O one (a file that can't be
+    /// opened reads as "cannot open" on every frame after the first, more telling, error).
+    fn note_problem(&self, path: &Arc<str>, codec: &str, e: &MediaError) {
+        let decoder = !matches!(e, MediaError::Io(_) | MediaError::Cancelled);
+        if matches!(e, MediaError::Cancelled) {
+            return;
+        }
+        let mut p = lock(&self.problems);
+        if p.get(path).is_some_and(|(_, d)| *d || !decoder) {
+            return;
+        }
+        let reason = if decoder { describe_problem(codec, e) } else { e.to_string() };
+        log::warn!("media: {path}: {reason}");
+        p.insert(path.clone(), (reason, decoder));
     }
 
     /// The source of `path` when it is open already.
@@ -1293,6 +1317,13 @@ impl FootageSource for MediaPool {
         Some(FootageFrame { preview: matches!(px, Pixels::Preview(_)), px: px.shared() })
     }
 
+    fn problem(&self, footage: &Footage) -> Option<String> {
+        if footage.missing || footage.kind != FootageKind::Video {
+            return None;
+        }
+        lock(&self.inner.problems).get(footage.path.as_str()).filter(|(_, decoder)| *decoder).map(|(why, _)| why.clone())
+    }
+
     fn vector_frame(&self, _item: ItemId, footage: &Footage, scale: f64) -> Option<Arc<Image>> {
         if footage.missing || !effectcraft_render::is_vector_footage(footage) {
             return None;
@@ -1364,6 +1395,11 @@ impl MediaPool {
             Ok(px) => Some(px),
             // nobody wants the frame any more (`cancellable`): not an error
             Err(MediaError::Cancelled) => None,
+            // a movie's failure is logged once per file (#886), a still's each time it is read
+            Err(e) if footage.kind == FootageKind::Video => {
+                self.inner.note_problem(&Arc::from(footage.path.as_str()), &footage.codec, &e);
+                None
+            }
             Err(e) => {
                 log::warn!("media: frame of {} at {:?}: {e}", footage.path, t);
                 None
@@ -1389,6 +1425,23 @@ fn read_stereo(src: &SharedSource, s0: i64, frames: usize, rate: u32) -> std::re
         *o1 = *b;
     }
     Ok(out)
+}
+
+/// The one-line reason a movie shows no picture: its `codec` (the probe's, e.g. "H.264 (High
+/// 4:2:2)") and what the decoder said, without the error wrappers it passed through.
+fn describe_problem(codec: &str, e: &MediaError) -> String {
+    let s = match e {
+        MediaError::Io(s) | MediaError::Unsupported(s) | MediaError::Decode(s) => s.as_str(),
+        MediaError::Cancelled => "cancelled",
+    };
+    let mut detail = s;
+    let mut unsupported = matches!(e, MediaError::Unsupported(_));
+    while let Some(rest) = ["decode error: ", "unsupported media: ", "unsupported: ", "I/O error: "].iter().find_map(|p| detail.strip_prefix(p)) {
+        unsupported |= detail.starts_with("unsupported");
+        detail = rest;
+    }
+    let what = if codec.is_empty() { "This video" } else { codec };
+    if unsupported { format!("{what} isn't supported by the built-in decoder: {detail}") } else { format!("{what} can't be decoded: {detail}") }
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
