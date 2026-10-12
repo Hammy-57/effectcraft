@@ -200,7 +200,10 @@ fn video_preview(app: &mut EffectcraftApp, ctx: &egui::Context) {
     }
 
     let mut closed = false;
-    ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("effectcraft-video-preview"), builder, |vctx, _| {
+    let vid = egui::ViewportId::from_hash_of("effectcraft-video-preview");
+    // RT10e: its window's surface is configured inside this call.
+    let _red = crate::zero_copy::hold_for_new_viewport(app, ctx, vid);
+    ctx.show_viewport_immediate(vid, builder, |vctx, _| {
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(Color32::BLACK)).show(vctx, |ui| {
             let area = ui.max_rect();
             if let Some(t) = &tex {

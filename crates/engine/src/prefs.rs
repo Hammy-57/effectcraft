@@ -166,6 +166,10 @@ page!(Previews {
     show_gpu_info: bool = false,
     /// The monitor's colour space for View ▸ Use Display Color Management: `srgb` or `p3`.
     display_profile: String = "srgb".into(),
+    /// RT10e: draw GPU-composited viewer frames straight from their textures, with no copy to
+    /// the CPU and back (the GPU compositor shares the window's graphics device). Off: frames are
+    /// read back as before (the compositor gets a device of its own at the next launch).
+    zero_copy_display: bool = true,
 });
 
 page!(Appearance {
@@ -1180,6 +1184,8 @@ pub fn pages() -> Vec<Page> {
                 s("previews.fastPreviews", "Fast Previews (Draft 3D, Faster Effects)", B, true),
                 s("previews.zoomQuality", "Viewer Zoom Quality", Kind::Choice(&[("Faster", "faster"), ("More Accurate", "moreAccurate")]), true),
                 s("previews.displayProfile", "Display Color Space", Kind::Choice(&[("sRGB", "srgb"), ("Display P3", "p3")]), true),
+                s("previews.zeroCopyDisplay", "Show GPU Frames Without Copying", B, true),
+                Note("Off: viewer frames are copied to the CPU and back, and the GPU compositor gets a graphics device of its own at the next launch."),
                 Button { label: "GPU Information...", command: "app.gpuInfo", params: "{}" },
             ],
         },
