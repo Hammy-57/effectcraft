@@ -1272,6 +1272,7 @@ impl EffectcraftApp {
             audio_held: false,
             preroll: None,
             shown_at: Default::default(),
+            observed: now,
         };
         if !self.playback.caching {
             if plan.video {
@@ -1298,10 +1299,19 @@ impl EffectcraftApp {
         self.meter.clipped = [false; 2];
         let (Some(pl), Some(cid)) = (self.playback.plan, self.session.active_comp_id()) else { return };
         let Some(c) = self.session.project.comp_arc(cid).filter(|_| self.audio_plays()) else { return };
+        let fr = c.frame_rate;
+        // Held while rendering caught up (same preview): play on, without reopening the device.
+        if let Some(mut a) = held.filter(|a| {
+            let span = audio::PlaySpan::new(t, fr.tick_of(pl.start), fr.tick_of(pl.end + 1), pl.looping, a.rate);
+            a.held() && a.comp == cid && (a.span.wa, a.span.wb, a.span.looping) == (span.wa, span.wb, span.looping)
+        }) {
+            a.resume(t);
+            self.audio = Some(a);
+            return;
+        }
         let out = audio::AudioOutput::from_prefs(&self.session.prefs);
         let Some(dev) = self.hooks.audio_device.as_ref().and_then(|f| f(&out)) else { return };
         let mix = self.session.prefs.audio.preview_sample_rate;
-        let fr = c.frame_rate;
         match audio::AudioPlayback::start(dev, self.render_source(), cid, t, fr.tick_of(pl.start), fr.tick_of(pl.end + 1), pl.looping, mix) {
             Ok(a) => self.audio = Some(a),
             Err(e) => log::warn!("audio preview: {e}"),
@@ -1415,6 +1425,9 @@ impl EffectcraftApp {
         let Some(cid) = self.session.active_comp_id() else { return };
         let Some(c) = self.session.project.comp_arc(cid) else { return };
         let now = ctx.input(|i| i.time);
+        if self.playback.playing {
+            self.playback.observe(now);
+        }
         let fr = c.frame_rate;
         let plan = self.playback.plan.filter(|_| self.playback.playing);
         let (wa, wb) = match plan {
@@ -1627,9 +1640,12 @@ impl EffectcraftApp {
                     self.playback.frame_shown(now);
                 }
             } else {
-                // Rendering can't keep up: rather than skip frames, the sound stops and every
-                // frame shows as it renders until the frames ahead are cached again.
-                self.audio = None;
+                // Rendering can't keep up: rather than skip frames, the sound holds (the device
+                // stays open) and every frame shows as it renders until the frames ahead are
+                // cached again.
+                if let Some(a) = &mut self.audio {
+                    a.hold();
+                }
                 self.playback.audio_held = true;
                 self.playback.waiting = true;
                 // The rate measured before the stall no longer says it keeps up.

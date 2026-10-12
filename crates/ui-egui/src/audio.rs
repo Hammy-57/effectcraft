@@ -82,6 +82,11 @@ pub struct AudioFeed {
     peak: [AtomicU32; 2],
     /// The feeder reached the end of a non-looping span.
     finished: AtomicBool,
+    /// Bumped (under the queue lock) when playback holds or moves: blocks mixed for the old
+    /// position are not queued ([`AudioFeed::push_at`]).
+    epoch: AtomicU64,
+    /// Playback is held: the feeder mixes nothing and the device plays silence.
+    held: AtomicBool,
 }
 
 impl AudioFeed {
@@ -119,6 +124,26 @@ impl AudioFeed {
     pub fn push(&self, samples: &[f32]) {
         if let Ok(mut q) = self.queue.lock() {
             q.extend(samples.iter().copied());
+        }
+    }
+
+    /// Queue `samples` mixed at feed epoch `epoch`, unless playback held or moved since.
+    fn push_at(&self, epoch: u64, samples: &[f32]) -> bool {
+        let Ok(mut q) = self.queue.lock() else { return false };
+        if self.epoch.load(Ordering::Acquire) != epoch {
+            return false;
+        }
+        q.extend(samples.iter().copied());
+        true
+    }
+
+    /// Drop what is queued and start a new epoch (held or not).
+    fn restart(&self, held: bool) {
+        if let Ok(mut q) = self.queue.lock() {
+            q.clear();
+            self.held.store(held, Ordering::Release);
+            self.finished.store(false, Ordering::Relaxed);
+            self.epoch.fetch_add(1, Ordering::AcqRel);
         }
     }
 
@@ -191,8 +216,14 @@ pub struct AudioPlayback {
     thread: Option<JoinHandle<()>>,
     /// wasm32 (no threads): what the feeder thread would own, run by [`AudioPlayback::pump`].
     feeder: Option<(RenderSource, ItemId, i64, u32, AudioStream)>,
+    /// Native: where the feeder thread continues after a hold ([`AudioPlayback::resume`]).
+    seek: Arc<Mutex<Option<i64>>>,
+    pub comp: ItemId,
     pub rate: u32,
     pub span: PlaySpan,
+    /// Device frames consumed before the span (re)started at `span.start`: the clock counts
+    /// from there.
+    base: u64,
 }
 
 /// Audio kept queued ahead of the device: ~200 ms (a feeder thread tops it up continuously);
@@ -229,8 +260,11 @@ impl AudioPlayback {
                 stop,
                 thread: None,
                 feeder: Some((src, comp, span.start, mix, AudioStream::default())),
+                seek: Arc::default(),
+                comp,
                 rate,
                 span,
+                base: 0,
             };
             p.device.start(feed)?;
             p.pump();
@@ -240,17 +274,23 @@ impl AudioPlayback {
         // first time opens it (a FLAC or MP3 file decodes whole), which froze the UI for as long
         // as that took (#408). The device plays silence until the first block arrives, and the
         // clock doesn't count it.
+        let seek: Arc<Mutex<Option<i64>>> = Arc::default();
         let thread = {
-            let (feed, stop) = (feed.clone(), stop.clone());
+            let (feed, stop, seek) = (feed.clone(), stop.clone(), seek.clone());
             std::thread::Builder::new()
                 .name("ec-audio-feed".into())
                 .spawn(move || {
                     let mut cursor = span.start;
                     let target = queue_target(rate);
                     // Keeps layer audio effects running from block to block (no pre-roll per block).
-                    let stream = AudioStream::default();
+                    let mut stream = AudioStream::default();
                     while !stop.load(Ordering::Relaxed) {
-                        if feed.queued_frames() < target && !feed.finished.load(Ordering::Relaxed) {
+                        if let Some(to) = seek.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
+                            // Resumed elsewhere: effect chains start over there.
+                            cursor = to;
+                            stream = AudioStream::default();
+                        }
+                        if !feed.held.load(Ordering::Acquire) && feed.queued_frames() < target && !feed.finished.load(Ordering::Relaxed) {
                             cursor = feed_block(&src, comp, &feed, &span, cursor, rate, mix, &stream);
                         } else {
                             std::thread::sleep(std::time::Duration::from_millis(4));
@@ -260,7 +300,35 @@ impl AudioPlayback {
                 .map_err(|e| e.to_string())?
         };
         device.start(feed.clone())?;
-        Ok(AudioPlayback { feed, device, stop, thread: Some(thread), feeder: None, rate, span })
+        Ok(AudioPlayback { feed, device, stop, thread: Some(thread), feeder: None, seek, comp, rate, span, base: 0 })
+    }
+
+    /// Rendering fell behind: silence, keeping the device open (reopening it on the UI thread
+    /// stuttered at every uncached frame). The clock stops; [`Self::resume`] goes on.
+    pub fn hold(&mut self) {
+        self.feed.restart(true);
+    }
+
+    pub fn held(&self) -> bool {
+        self.feed.held.load(Ordering::Acquire)
+    }
+
+    /// Play on from comp time `t` after [`Self::hold`]: the clock reads `t` until the device
+    /// plays the first new sample.
+    pub fn resume(&mut self, t: Tick) {
+        let start = t.to_units_floor(self.rate as i64);
+        // Outside the work area (cannot happen while it plays): from its start.
+        let start = if start >= self.span.wb || start < self.span.wa { self.span.wa } else { start };
+        self.span.start = start;
+        if let Some((_, _, cursor, _, stream)) = &mut self.feeder {
+            *cursor = start;
+            *stream = AudioStream::default();
+        }
+        *self.seek.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(start);
+        // Everything handed to the device so far (the last buffers before the hold may still
+        // be playing) belongs to the old position.
+        self.base = self.feed.consumed();
+        self.feed.restart(false);
     }
 
     /// Every UI frame while playing: on wasm32 mix ahead into the feed (what the feeder thread
@@ -268,7 +336,7 @@ impl AudioPlayback {
     pub fn pump(&mut self) {
         if let Some((src, comp, cursor, mix, stream)) = &mut self.feeder {
             let target = queue_target(self.rate);
-            while self.feed.queued_frames() < target && !self.feed.finished.load(Ordering::Relaxed) {
+            while !self.feed.held.load(Ordering::Acquire) && self.feed.queued_frames() < target && !self.feed.finished.load(Ordering::Relaxed) {
                 *cursor = feed_block(src, *comp, &self.feed, &self.span, *cursor, self.rate, *mix, stream);
             }
         }
@@ -278,8 +346,8 @@ impl AudioPlayback {
     /// The comp sample index audible now.
     pub fn clock(&self) -> i64 {
         match self.device.audible_frames() {
-            Some(played) => clock_sample(&self.span, played, 0),
-            None => clock_sample(&self.span, self.feed.consumed(), self.device.latency_frames()),
+            Some(played) => clock_sample(&self.span, played.saturating_sub(self.base), 0),
+            None => clock_sample(&self.span, self.feed.consumed().saturating_sub(self.base), self.device.latency_frames()),
         }
     }
 
@@ -317,7 +385,12 @@ fn feed_block(src: &RenderSource, comp: ItemId, feed: &AudioFeed, span: &PlaySpa
         cursor = span.wa;
     }
     let n = ((span.wb - cursor) as usize).min(BLOCK);
-    feed.push(&mix_block(src, comp, sample_time(cursor, rate), n, rate, mix, Some(stream)));
+    let epoch = feed.epoch.load(Ordering::Acquire);
+    let block = mix_block(src, comp, sample_time(cursor, rate), n, rate, mix, Some(stream));
+    if !feed.push_at(epoch, &block) {
+        // Held or moved while mixing: the next block starts where playback resumes.
+        return cursor;
+    }
     cursor + n as i64
 }
 
@@ -522,8 +595,11 @@ mod tests {
             stop: Arc::new(AtomicBool::new(false)),
             thread: None,
             feeder: None,
+            seek: Arc::default(),
+            comp: ItemId(1),
             rate: 48_000,
             span: PlaySpan { start: 96_000, wa: 48_000, wb: 144_000, looping: false },
+            base: 0,
         };
         assert_eq!(playback.clock(), 97_600, "submitted samples do not jump the audible cursor");
         assert!(!playback.finished(), "the final hardware buffer is still playing");
@@ -531,6 +607,86 @@ mod tests {
         assert!(playback.finished());
         playback.span = PlaySpan { start: 0, wa: 0, wb: 3200, looping: true };
         assert_eq!(playback.clock(), 896, "sample interpolation still uses the existing loop mapping");
+    }
+
+    /// B: a stall holds the sound instead of closing the device; resuming plays on from the
+    /// frame on screen, the clock counting from there, and a block mixed for the old position
+    /// while it held is never queued.
+    #[test]
+    fn hold_and_resume_keep_the_device_and_restart_the_clock() {
+        struct Open(Arc<AtomicBool>);
+        impl AudioDevice for Open {
+            fn sample_rate(&self) -> u32 {
+                48_000
+            }
+            fn start(&mut self, _: Arc<AudioFeed>) -> Result<(), String> {
+                Ok(())
+            }
+            fn stop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let stopped = Arc::new(AtomicBool::new(false));
+        let mut p = AudioPlayback {
+            feed: Arc::new(AudioFeed::default()),
+            device: Box::new(Open(stopped.clone())),
+            stop: Arc::new(AtomicBool::new(false)),
+            thread: None,
+            feeder: None,
+            seek: Arc::default(),
+            comp: ItemId(1),
+            rate: 48_000,
+            span: PlaySpan { start: 0, wa: 0, wb: 480_000, looping: true },
+            base: 0,
+        };
+        p.feed.push(&[0.5; 9600]);
+        let mut out = vec![0.0f32; 9600];
+        p.feed.pull(&mut out);
+        assert_eq!(p.clock(), 4800);
+        p.feed.push(&[0.5; 2000]);
+        let epoch = p.feed.epoch.load(Ordering::Acquire);
+        p.hold();
+        assert!(p.held() && p.feed.queued_frames() == 0, "what was queued for later is dropped");
+        assert!(!p.feed.push_at(epoch, &[0.5; 2]), "a block mixed before the hold is not queued");
+        p.feed.pull(&mut out);
+        assert!(out.iter().all(|v| *v == 0.0), "silence while held");
+        assert_eq!(p.feed.consumed(), 4800, "silence does not count");
+        p.resume(Tick::from_seconds_f64(2.0));
+        assert!(!p.held() && !stopped.load(Ordering::Relaxed), "the device stayed open");
+        assert_eq!(*p.seek.lock().unwrap(), Some(96_000), "the feeder goes on from the frame on screen");
+        assert_eq!(p.clock(), 96_000, "the clock holds there until new sound plays");
+        assert!(p.feed.push_at(p.feed.epoch.load(Ordering::Acquire), &[0.5; 3200]));
+        p.feed.pull(&mut out[..3200]);
+        assert_eq!(p.clock(), 96_000 + 1600);
+        // Resuming outside the work area starts at its beginning.
+        p.hold();
+        p.resume(Tick::from_seconds_f64(60.0));
+        assert_eq!(p.clock(), 0);
+    }
+
+    /// #335: a mix at 48 kHz resampled to a 44.1 kHz device block by block. Each block began
+    /// on the 48 kHz sample at or before its start, up to a sample early: a jump at every block
+    /// boundary, heard as crackle. Resampling a ramp (the time of each sample) must give each
+    /// output sample's own time, across block joins.
+    #[test]
+    fn resampled_blocks_join_without_a_jump() {
+        let (rate, mix) = (44_100u32, 48_000u32);
+        let ramp = |at: Tick, frames: usize, r: u32| {
+            let s0 = at.to_units_floor(r as i64);
+            (0..frames).flat_map(|i| [(s0 + i as i64) as f32 / r as f32; 2]).collect::<Vec<f32>>()
+        };
+        let mut cursor = 44_100 * 3 + 17;
+        for _ in 0..8 {
+            let out = resampled(ramp, sample_time(cursor, rate), BLOCK, rate, mix);
+            assert_eq!(out.len(), BLOCK * 2);
+            for (i, v) in out.chunks(2).enumerate() {
+                let want = (cursor + i as i64) as f64 / rate as f64;
+                assert!((v[0] as f64 - want).abs() < 2e-6, "sample {} of the block at {cursor}: {} vs {want}", i, v[0]);
+            }
+            cursor += BLOCK as i64;
+        }
+        // The same rate passes straight through.
+        assert_eq!(resampled(ramp, sample_time(5, rate), 3, rate, rate), ramp(sample_time(5, rate), 3, rate));
     }
 
     #[test]
@@ -647,31 +803,6 @@ mod tests {
         playback.feed.pull(&mut out);
         assert_eq!(out, [0.5; 8]);
         playback.stop();
-    }
-
-    /// #335: a mix at 48 kHz resampled to a 44.1 kHz device block by block. Each block began
-    /// on the 48 kHz sample at or before its start, up to a sample early: a jump at every block
-    /// boundary, heard as crackle. Resampling a ramp (the time of each sample) must give each
-    /// output sample's own time, across block joins.
-    #[test]
-    fn resampled_blocks_join_without_a_jump() {
-        let (rate, mix) = (44_100u32, 48_000u32);
-        let ramp = |at: Tick, frames: usize, r: u32| {
-            let s0 = at.to_units_floor(r as i64);
-            (0..frames).flat_map(|i| [(s0 + i as i64) as f32 / r as f32; 2]).collect::<Vec<f32>>()
-        };
-        let mut cursor = 44_100 * 3 + 17;
-        for _ in 0..8 {
-            let out = resampled(ramp, sample_time(cursor, rate), BLOCK, rate, mix);
-            assert_eq!(out.len(), BLOCK * 2);
-            for (i, v) in out.chunks(2).enumerate() {
-                let want = (cursor + i as i64) as f64 / rate as f64;
-                assert!((v[0] as f64 - want).abs() < 2e-6, "sample {} of the block at {cursor}: {} vs {want}", i, v[0]);
-            }
-            cursor += BLOCK as i64;
-        }
-        // The same rate passes straight through.
-        assert_eq!(resampled(ramp, sample_time(5, rate), 3, rate, rate), ramp(sample_time(5, rate), 3, rate));
     }
 
     #[test]
