@@ -160,6 +160,7 @@ options: --project F.ecproj | --demo | --empty   --save | --save-as F   --bridge
 const VALUED: &[&str] = &[
     "--trace",
     "--profile-offset",
+    "--rt-inflight",
     "--n",
     "--profile-offset",
     "--play",

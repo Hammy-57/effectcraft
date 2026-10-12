@@ -1869,6 +1869,36 @@ pub(crate) struct Enc<'g> {
     pub(crate) shared: crate::cull::Shared,
     /// Upload textures read by recorded dispatches, free again once submitted ([`Enc::stage`]).
     planes: Vec<wgpu::Texture>,
+    /// Pool ids of the command encoders this `Enc` submitted (newest last, at most
+    /// [`SUBMITTED_KEPT`]): their images may still be drawn on in place ([`Enc::owns`]).
+    submitted_ids: Vec<u64>,
+    /// When the open command encoder recorded its first command (see [`Enc::submit_early`]).
+    opened: Option<std::time::Instant>,
+}
+
+/// Submitted encoder ids an [`Enc`] remembers for [`Enc::owns`] (older ones lose in-place).
+const SUBMITTED_KEPT: usize = 64;
+
+/// Dispatches after which an open command encoder is submitted so the GPU starts on them while
+/// the walk records the rest (RT10c), and the shorter count for an encoder open for longer than
+/// [`SUBMIT_AFTER`].
+const SUBMIT_EVERY: usize = 64;
+const SUBMIT_EVERY_SLOW: usize = 8;
+const SUBMIT_AFTER: std::time::Duration = std::time::Duration::from_millis(4);
+
+/// The early-submit cadence: (submit early at all, also by age). Profiling builds:
+/// `EFFECTCRAFT_RT_SUBMIT=off` keeps the old one submit per frame (or 256 dispatches) and
+/// `=count` submits by dispatch count only, for A/B measurement.
+fn early_submit() -> (bool, bool) {
+    if !cfg!(feature = "profile") {
+        return (true, true);
+    }
+    static ON: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("EFFECTCRAFT_RT_SUBMIT").as_deref() {
+        Ok("off") => (false, false),
+        Ok("count") => (true, false),
+        _ => (true, true),
+    })
 }
 
 impl Drop for Enc<'_> {
@@ -1942,6 +1972,8 @@ impl<'g> Enc<'g> {
             missing: false,
             shared: Default::default(),
             planes: Vec::new(),
+            submitted_ids: Vec::new(),
+            opened: None,
             #[cfg(feature = "profile")]
             timestamps: None,
         }
@@ -1971,6 +2003,20 @@ impl<'g> Enc<'g> {
                 (g.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("effectcraft") }), id)
             })
             .0
+    }
+
+    /// Submit what is recorded once enough dispatches wait (or fewer, recorded over a longer
+    /// time), so the GPU works through them while the CPU records the rest of the frame instead
+    /// of starting only at its end. Called after each dispatch.
+    fn submit_early(&mut self) {
+        let (on, by_age) = early_submit();
+        if !on || self.pending == 0 {
+            return;
+        }
+        let slow = by_age && self.pending >= SUBMIT_EVERY_SLOW && self.opened.is_some_and(|t| t.elapsed() >= SUBMIT_AFTER);
+        if self.pending >= SUBMIT_EVERY || slow {
+            self.submit();
+        }
     }
 
     /// A new zeroed image (pooled; a reused texture is cleared by a kernel).
@@ -2080,12 +2126,13 @@ impl<'g> Enc<'g> {
         ext: Option<[&wgpu::Buffer; 4]>,
     ) {
         let g = self.g;
-        // Each dispatch until the next submit gets its own block of the encoder's uniform ring.
-        // `write_buffer` lands before the next submission's commands and after earlier
-        // submissions', so a ring is reused (after a submit, or by a later encoder) safely.
         if self.pending >= RING_SLOTS {
             self.submit();
         }
+        let record = effectcraft_render::profile::span("dispatch_record");
+        // Each dispatch until the next submit gets its own block of the encoder's uniform ring.
+        // `write_buffer` lands before the next submission's commands and after earlier
+        // submissions', so a ring is reused (after a submit, or by a later encoder) safely.
         let offset = (self.pending as u64).saturating_mul(g.uniform_stride);
         let ring = self.ring.get_or_insert_with(|| {
             g.uniforms.lock().ok().and_then(|mut u| u.pop()).unwrap_or_else(|| {
@@ -2144,11 +2191,17 @@ impl<'g> Enc<'g> {
         {
             self.timestamps = batch;
         }
+        #[allow(clippy::drop_non_drop)] // A unit span without the `profile` feature.
+        drop(record);
+        if self.pending == 0 {
+            self.opened = Some(std::time::Instant::now());
+        }
         self.pending += 1;
         // Keep command buffers (and the transient textures they hold) bounded.
         if self.pending >= 256 {
             self.submit();
         }
+        self.submit_early();
     }
 
     /// Dispatch a dedicated texture layout while retaining profiling and batch bounds.
@@ -2170,10 +2223,14 @@ impl<'g> Enc<'g> {
         {
             self.timestamps = batch;
         }
+        if self.pending == 0 {
+            self.opened = Some(std::time::Instant::now());
+        }
         self.pending += 1;
         if self.pending >= 256 {
             self.submit();
         }
+        self.submit_early();
     }
 
     /// The compute pass to record a dispatch into. Consecutive dispatches share one pass (a pass
@@ -2205,16 +2262,16 @@ impl<'g> Enc<'g> {
 
     /// Whether `img` may be drawn on in place by this encoder's next commands instead of
     /// copied into a new image: its pooled texture was taken for the command encoder still
-    /// recording (so every earlier reader of it is recorded before, or submitted with, that
-    /// encoder) and no other image holds it (the caller's `&mut` is the only handle; raw
+    /// recording, or for one this `Enc` already submitted (so every earlier reader of it is
+    /// recorded before, or submitted no later than, the commands that draw on it: one queue
+    /// runs submissions in order) and no other image holds it (the caller's `&mut` is the only handle; raw
     /// texture handles are only borrowed while recording). Images from other encoders, shared
     /// ones (`zeros`, caches, clones), sealed ones (their kept mip levels would go stale) and
     /// unpooled ones are never owned.
     pub(crate) fn owns(&self, img: &GpuImage) -> bool {
-        let Some((_, id)) = &self.enc else { return false };
-        *id != 0
-            && img._lease.as_ref().is_some_and(|l| l.encoder == Some(*id) && Arc::strong_count(l) == 1 && Arc::weak_count(l) == 0)
-            && !self.g.mips.is_sealed(img)
+        let current = self.enc.as_ref().map(|(_, id)| *id).filter(|id| *id != 0);
+        let mine = |e: Option<u64>| e.is_some_and(|e| e != 0 && (Some(e) == current || self.submitted_ids.contains(&e)));
+        img._lease.as_ref().is_some_and(|l| mine(l.encoder) && Arc::strong_count(l) == 1 && Arc::weak_count(l) == 0) && !self.g.mips.is_sealed(img)
     }
 
     /// Whether the kernel `entry` built on this device.
@@ -2373,6 +2430,7 @@ impl<'g> Enc<'g> {
         self.pass = None;
         #[allow(unused_mut)]
         if let Some((mut enc, id)) = self.enc.take() {
+            let _profile = effectcraft_render::profile::span("submit");
             #[cfg(feature = "profile")]
             let timing = self.timestamps.take().and_then(|b| b.resolve(self.g, &mut enc));
             self.submitted = Some(self.g.queue.submit([enc.finish()]));
@@ -2383,9 +2441,16 @@ impl<'g> Enc<'g> {
             if let Ok(mut p) = self.g.pool.lock() {
                 p.close(id);
             }
+            if id != 0 {
+                if self.submitted_ids.len() >= SUBMITTED_KEPT {
+                    self.submitted_ids.remove(0);
+                }
+                self.submitted_ids.push(id);
+            }
         }
         self.g.free_planes(std::mem::take(&mut self.planes));
         self.pending = 0;
+        self.opened = None;
     }
 
     /// Hand back a [`GpuContext::plane_texture`] read by dispatches recorded so far: it is

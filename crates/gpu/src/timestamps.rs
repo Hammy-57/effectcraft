@@ -1,4 +1,5 @@
-//! Opt-in per-encoder timestamp batches. At most eight batches may be in flight.
+//! Opt-in per-encoder timestamp batches. At most 64 batches may be in flight (a frame submits
+//! several command buffers: RT10c).
 //! No timestamps are requested or allocated in ordinary builds.
 use crate::context::GpuContext;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -25,7 +26,7 @@ impl Batch {
         }
         let mut count = IN_FLIGHT.load(Ordering::Relaxed);
         loop {
-            if count >= 8 {
+            if count >= 64 {
                 effectcraft_render::profile::lost(generation);
                 return None;
             }

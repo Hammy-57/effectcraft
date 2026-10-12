@@ -55,7 +55,15 @@ pub(super) fn run(s: &Session, args: &Args) -> Result<(), Failure> {
     if !fps.is_finite() || fps <= 0.0 {
         return Err(Failure::Error("invalid benchmark frame rate".into()));
     }
-    let last_frame = comp.frame_rate.frame_at(Tick::from_seconds_f64(start)).saturating_add(n.saturating_add(1) as i64);
+    // `--rt-inflight K`: after the latency frames, render n more with K frames in flight on K
+    // threads, as the app's frame workers do, and report throughput (RT10c).
+    let inflight =
+        args.opt("--rt-inflight").map(str::parse::<usize>).transpose().map_err(|_| Failure::Error("--rt-inflight must be an integer".into()))?.unwrap_or(0);
+    if inflight > 16 {
+        return Err(Failure::Error("--rt-inflight must be at most 16".into()));
+    }
+    let span = if inflight > 0 { n.saturating_mul(2).saturating_add(2) } else { n.saturating_add(1) };
+    let last_frame = comp.frame_rate.frame_at(Tick::from_seconds_f64(start)).saturating_add(span as i64);
     if comp.frame_rate.tick_of(last_frame) >= comp.duration {
         return Err(Failure::Error("benchmark extends beyond the comp; reduce --n or --time".into()));
     }
@@ -132,6 +140,45 @@ pub(super) fn run(s: &Session, args: &Args) -> Result<(), Failure> {
                 "cacheHits": c1.hits.saturating_sub(c0.hits), "cacheMisses": c1.misses.saturating_sub(c0.misses),
                 "retainedBytes": held.live_bytes, "retainedDebtBytes": held.debt_bytes, "retainedRecords": held.records}));
         }
+        // Throughput with several frames in flight (frames after the profiled one).
+        let mut throughput = serde_json::Value::Null;
+        if inflight > 0 {
+            let (p0, a0) = (gpu.context().pool_stats(), gpu.context().alloc_stats());
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let failed = std::sync::atomic::AtomicBool::new(false);
+            let first = n.saturating_add(2);
+            let begin = std::time::Instant::now();
+            std::thread::scope(|scope| {
+                for _ in 0..inflight {
+                    scope.spawn(|| {
+                        let mut r = Renderer::new(&project, s.footage.as_ref(), RenderOpts { scale, backend: Backend::Gpu, ..Default::default() });
+                        r.cache = Some(&cache);
+                        r.accel = Some(&gpu);
+                        r.expr = s.expr.as_deref();
+                        loop {
+                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if i >= n || failed.load(std::sync::atomic::Ordering::Relaxed) {
+                                break;
+                            }
+                            let frame = base_frame.saturating_add(first.saturating_add(i) as i64);
+                            match gpu.render_display(&r, cid, comp.frame_rate.tick_of(frame)) {
+                                Some(_) => gpu.wait(),
+                                None => failed.store(true, std::sync::atomic::Ordering::Relaxed),
+                            }
+                        }
+                    });
+                }
+            });
+            if failed.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(Failure::Error("GPU viewer frame failed in flight; refusing CPU fallback benchmark".into()));
+            }
+            let seconds = begin.elapsed().as_secs_f64();
+            let (p1, a1) = (gpu.context().pool_stats(), gpu.context().alloc_stats());
+            let per = |v: u64| v as f64 / n as f64;
+            throughput = json!({"inflight": inflight, "frames": n, "seconds": seconds, "fps": n as f64 / seconds.max(1e-9),
+                "poolMissesPerFrame": per(p1.1.saturating_sub(p0.1)), "allocBytesPerFrame": per(a1.bytes.saturating_sub(a0.bytes))});
+            note!("{name} {label}: {inflight} in flight: {:.2} fps", n as f64 / seconds.max(1e-9));
+        }
         let after = gpu.context().transfer_stats();
         let pool_after = gpu.context().pool_stats();
         let alloc_after = gpu.context().alloc_stats();
@@ -179,7 +226,7 @@ pub(super) fn run(s: &Session, args: &Args) -> Result<(), Failure> {
             "yuvConversions": after.yuv_conversions.saturating_sub(before.yuv_conversions),
             "yuvInputBytes": after.yuv_bytes.saturating_sub(before.yuv_bytes), "timestampQueries": timestamps, "gpuDiagnosticWindowMs": gpu_window_ms,
             "gpuPassWindowMs": gpu_pass_window_ms, "gpuPassSumMs": gpu_pass_sum_ms, "gpuAllWindowMs": gpu_all_window_ms, "gpuCopyMs": copy_ms,
-            "allocations": alloc_after.allocations.saturating_sub(alloc_before.allocations), "allocBytes": alloc_after.bytes.saturating_sub(alloc_before.bytes), "poolMissSites": miss_sites, "uploads": after.uploads.saturating_sub(before.uploads),
+            "allocations": alloc_after.allocations.saturating_sub(alloc_before.allocations), "allocBytes": alloc_after.bytes.saturating_sub(alloc_before.bytes), "poolMissSites": miss_sites, "throughput": throughput, "uploads": after.uploads.saturating_sub(before.uploads),
             "uploadBytes": after.upload_bytes.saturating_sub(before.upload_bytes),
             "poolHits": pool_after.0.saturating_sub(pool_before.0),
             "poolMisses": pool_after.1.saturating_sub(pool_before.1),

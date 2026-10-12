@@ -212,3 +212,42 @@ fn in_place_mattes_blends_and_motion_blur_match_full_passes() {
     let start = e.download(&bg).unwrap();
     assert!(tests::diff(&start, &e.download(&full).unwrap(), 1e-3).over > 200, "the layers draw");
 }
+
+/// A frame long enough to be submitted in several command buffers (RT10c submits every few
+/// dozen dispatches so the GPU starts while the walk records the rest): the canvas stays the
+/// encoder's own across those submits, so layers keep drawing in place, bit for bit as full
+/// passes; an image another `Enc` or a clone holds is never owned.
+#[test]
+fn in_place_layers_survive_early_submits() {
+    let Some(g) = tests::gpu() else {
+        assert!(std::env::var_os("EFFECTCRAFT_REQUIRE_GPU").is_none());
+        return;
+    };
+    let (w, h) = (160, 120);
+    let bg = g.ctx.upload_image(&tests::pattern(3, w, h)).unwrap();
+    let layer = g.ctx.upload_image(&tests::pattern(7, 40, 30)).unwrap();
+    let mut e = Enc::new(&g.ctx);
+    let mut full = bg.clone();
+    let mut canvas = own(&mut e, &bg);
+    for i in 0..150 {
+        let (x, y) = (20.0 + f64::from(i % 13) * 9.0, 15.0 + f64::from(i % 7) * 13.0);
+        let m = at(x, y, f64::from(i) * 7.0, 0.6 + f64::from(i % 5) * 0.1);
+        let mode = [Normal, Multiply, Screen, Add][(i % 4) as usize];
+        assert!(e.owns(&canvas), "step {i}: the canvas is the encoder's own across submits");
+        full = ops::warp_q(&mut e, &full, &layer, &m, Bilinear, mode, 0.7, 5, None, None);
+        let before = canvas.texture.clone();
+        ops::warp_q_in(&mut e, &mut canvas, &layer, &m, Bilinear, mode, 0.7, 5, None, None);
+        assert!(canvas.texture == before, "step {i}: drawn in place");
+    }
+    same_bits(&mut e, "150 layers over several submits", &full, &canvas);
+    // Never owned: an image of another encoder, or one with a second handle.
+    let mut other = Enc::new(&g.ctx);
+    assert!(!other.owns(&canvas));
+    let theirs = other.scratch(8, 8);
+    other.submit();
+    assert!(!e.owns(&theirs));
+    let shared = canvas.clone();
+    assert!(!e.owns(&canvas));
+    drop(shared);
+    assert!(e.owns(&canvas));
+}

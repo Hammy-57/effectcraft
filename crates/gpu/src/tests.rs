@@ -286,6 +286,26 @@ fn all_blend_modes_at_every_bit_depth() {
     }
 }
 
+/// Enough layers that a frame is submitted in several command buffers (RT10c early submits):
+/// the CPU oracle still holds at 8 and 32 bpc.
+#[test]
+fn many_layers_over_several_submits_match_the_cpu() {
+    for depth in [BitDepth::Bpc8, BitDepth::Bpc32] {
+        let mut s = Scene::new(depth);
+        let bg = s.footage(97, 61);
+        s.push(bg);
+        for i in 0..90u32 {
+            let mut l = s.solid([(i % 7) as f32 / 7.0, (i % 5) as f32 / 5.0, (i % 3) as f32 / 3.0], 9, 7);
+            set(&mut l, "transform/position", v3(f64::from(i * 13 % 97), f64::from(i * 7 % 61)));
+            set(&mut l, "transform/rotation", Value::Scalar(f64::from(i) * 11.0));
+            set(&mut l, "transform/opacity", Value::Scalar(40.0 + f64::from(i % 6) * 10.0));
+            l.blend_mode = [BlendMode::Normal, BlendMode::Multiply, BlendMode::Screen, BlendMode::Add][(i % 4) as usize];
+            s.push(l);
+        }
+        check(&format!("90 layers {depth:?}"), compare_at(&s, opts(), Tick::ZERO), 0.0);
+    }
+}
+
 #[test]
 fn transforms_sampling_and_resolution() {
     for depth in [BitDepth::Bpc8, BitDepth::Bpc32] {
