@@ -507,7 +507,11 @@ fn maybe_save(b: &mut Backend, args: &Args) -> Result<Option<String>, Failure> {
     Ok(r.get("path").and_then(Value::as_str).map(str::to_string).or_else(|| args.opt("--save-as").map(str::to_string)))
 }
 
-fn tool(b: &mut Backend, name: &str, a: Value) -> Result<Value, Failure> {
+fn tool(b: &mut Backend, name: &str, mut a: Value) -> Result<Value, Failure> {
+    // A one-shot process cannot serve retained-result handles after it exits. Keep stdout
+    // complete (callers can redirect it); only the persistent MCP server pages its responses.
+    let fields = a.as_object_mut().ok_or_else(|| Failure::Error("tool arguments must be an object".into()))?;
+    fields.insert("full".into(), json!(true));
     match tools::run(b, name, &a)? {
         Reply::Json(v) => Ok(v),
         Reply::Image { info, .. } => Ok(info),
@@ -1574,6 +1578,19 @@ fn bench_gpu(s: &Session, args: &Args) -> Result<(), Failure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_shot_tool_keeps_complete_output_after_process_exit() {
+        let mut b = Backend::headless(effectcraft_engine::Session::default());
+        b.exec("comp.new", json!({"name":"Large"})).unwrap();
+        for _ in 0..110 {
+            b.exec("layer.newSolid", json!({})).unwrap();
+        }
+        let read = tool(&mut b, "get_comp", json!({})).ok().expect("CLI read");
+        assert_eq!(read["layers"].as_array().unwrap().len(), 110);
+        assert!(read.get("result_id").is_none());
+        assert!(read.get("next_offset").is_none());
+    }
 
     fn parse(args: &[&str]) -> Result<Args, String> {
         Args::parse(args.iter().map(|a| a.to_string()).collect())
