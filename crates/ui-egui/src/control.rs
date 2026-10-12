@@ -501,7 +501,7 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
                 _ => app.toggle_play(now),
             }
             ok(
-                json!({"playing": app.playback.playing, "time": app.session.time().seconds(), "audio": app.audio.is_some(), "levelsDb": app.meter.level_db, "peaksDb": app.meter.peak_db}),
+                json!({"playing": app.playback.playing, "time": app.session.time().seconds(), "audio": app.audio.as_ref().is_some_and(|a| !a.held()), "levelsDb": app.meter.level_db, "peaksDb": app.meter.peak_db}),
             )
         }
         "ui.screenshot" => {

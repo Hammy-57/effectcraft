@@ -1038,6 +1038,21 @@ impl Frames {
         });
     }
 
+    /// The frames of `series` in flight, after dropping the queued prefetch of the same comp's
+    /// other series: the playback ladder's old rung would otherwise hold the queue (A4).
+    pub fn focus_series(&self, series: &FrameKey) -> usize {
+        if let (Ok(mut q), Ok(mut inf)) = (self.queue.lock(), self.inflight.lock()) {
+            q.jobs.retain(|j| {
+                let gone = !j.urgent && !j.disk_only && j.key.comp == series.comp && !j.key.same_series(series);
+                if gone {
+                    inf.remove(&j.key);
+                }
+                !gone
+            });
+        }
+        self.inflight.lock().map(|s| s.iter().filter(|k| k.same_series(series)).count()).unwrap_or(0)
+    }
+
     pub fn budget(&self) -> usize {
         self.cache.lock().map(|c| c.budget).unwrap_or(0)
     }
