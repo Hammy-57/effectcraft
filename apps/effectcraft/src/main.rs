@@ -96,6 +96,9 @@ fn main() -> eframe::Result {
     // Help ▸ Enable Logging writes through this logger; warnings feed the compatibility report.
     effectcraft_engine::logging::install();
     effectcraft_engine::logging::install_panic_hook();
+    // Hardware ProRes decoding for previews (macOS media engines; Settings ▸ Previews ▸ Hardware
+    // ProRes Decoding). Exports always decode exactly.
+    log::info!("hardware ProRes decoding: {:?}", effectcraft_platform::register());
     let Some(Args { control_port, files, demo, home }) = parse_args(std::env::args().skip(1), std::env::var("EFFECTCRAFT_CONTROL_PORT").ok()) else {
         println!("effectcraft {}", env!("CARGO_PKG_VERSION"));
         return Ok(());

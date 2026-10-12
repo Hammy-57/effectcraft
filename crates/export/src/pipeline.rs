@@ -97,7 +97,7 @@ impl WarmKey {
             settings: RenderSettings { time_span: TimeSpan::LengthOfComp, ..job.settings.clone() },
             nested_switches: job.nested_switches,
             budget: job.options.memory_budget.unwrap_or(crate::DEFAULT_MEMORY_BUDGET),
-            footage: job.footage as *const dyn effectcraft_render::FootageSource as *const () as usize,
+            footage: job.source() as *const dyn effectcraft_render::FootageSource as *const () as usize,
             expr: job.expr.map(|e| e as *const dyn effectcraft_render::ExprHost as *const () as usize),
             accel: job.accel.map(|a| a as *const dyn effectcraft_render::Accelerator as *const () as usize),
         }
@@ -216,7 +216,7 @@ impl<'a> Cx<'a> {
             draft_shadows: true,
             proxy: s.proxy_use,
         };
-        let mut r = Renderer::new(&self.project, self.job.footage, opts);
+        let mut r = Renderer::new(&self.project, self.job.source(), opts);
         r.expr = self.job.expr;
         r.accel = self.job.accel;
         r.cache = Some(&self.cache);

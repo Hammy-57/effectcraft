@@ -18,6 +18,8 @@ effectcraft-host = { workspace = true }
 # The Figma bridge (the plug-in's local HTTP endpoint), run in-process.
 effectcraft-automation = { workspace = true }
 effectcraft-ui-egui = { workspace = true }
+# Fork-only: hardware ProRes decoding for previews (docs/adr/0001-platform-ffi.md).
+effectcraft-platform = { workspace = true }
 egui = { workspace = true }
 # `links`: links (Help menu, Discord, Settings) open in the system browser.
 eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit", "links", "wayland", "x11"] }

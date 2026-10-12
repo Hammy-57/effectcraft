@@ -96,6 +96,9 @@ Commands (CLI, MCP, control channel):
 - `previews.showInternalWireframes`: outlines of the layers inside a selected collapsed precomp
 - `previews.zoomQuality`: Faster = nearest-neighbour viewer scaling, More Accurate = bilinear
 - `previews.displayProfile`: the monitor's colour space for View ▸ Use Display Color Management
+- `previews.hardwareProResDecoding` (fork-only; on by default on macOS): previews decode Apple ProRes
+  footage on the Mac's media engines through VideoToolbox (visually identical, not bit-exact);
+  renders and exports always use the exact pure-Rust decoder (docs/adr/0001-platform-ffi.md)
 - `appearance.useLabelColorForTabs`: Composition / Timeline tabs show the comp's label colour,
   Effect Controls / Properties the layer's
 - `appearance.cycleMaskColors`: new masks cycle through the mask colours (off: all the first)

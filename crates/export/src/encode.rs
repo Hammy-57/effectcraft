@@ -217,7 +217,7 @@ fn deinterleave(buf: &[f32], channels: usize) -> Vec<Vec<f32>> {
 /// The comp's audio over `n` samples from `start`, interleaved with the module's channel count
 /// (mono = the average of left and right).
 pub(crate) fn mix(cx: &Cx, start: effectcraft_time::Tick, n: usize, sr: u32) -> Vec<f32> {
-    let st = effectcraft_render::audio::mix_comp(&cx.project, cx.footage, cx.expr, cx.comp, start, n, sr);
+    let st = effectcraft_render::audio::mix_comp(&cx.project, cx.source(), cx.expr, cx.comp, start, n, sr);
     if cx.output.audio_channels == 1 { st.as_chunks::<2>().0.iter().map(|p| (p[0] + p[1]) * 0.5).collect() } else { st }
 }
 

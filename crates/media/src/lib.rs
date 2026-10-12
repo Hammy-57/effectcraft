@@ -19,6 +19,7 @@ mod avif;
 mod convert;
 pub mod exr_channels;
 mod gif_anim;
+pub mod hw;
 mod layered;
 mod open;
 pub use layered::vector_doc;

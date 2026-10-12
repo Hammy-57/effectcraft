@@ -109,6 +109,14 @@ pub struct JobOptions<'a> {
     pub memory_budget: Option<usize>,
 }
 
+impl<'a> Job<'a> {
+    /// The footage the job renders from: the source's exact view ([`FootageSource::exact`]),
+    /// never frames a preview decoded on a hardware decoder.
+    pub fn source(&self) -> &'a dyn FootageSource {
+        self.footage.exact().unwrap_or(self.footage)
+    }
+}
+
 /// [`JobOptions::memory_budget`] when the caller sets none.
 pub const DEFAULT_MEMORY_BUDGET: usize = 1 << 30;
 
