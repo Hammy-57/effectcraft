@@ -2514,7 +2514,9 @@ mod gpu_failure_tests {
             let mut renderer = effectcraft_engine::render::Renderer::new(&app.session.project, app.session.footage.as_ref(), Default::default());
             renderer.cache = Some(&app.session.layer_cache);
             assert!(gpu.render_display(&renderer, app.session.active_comp_id().unwrap(), Tick::ZERO).is_some());
-            assert!(gpu.context().upload_stats().0 > 0);
+            // Since RT1 (194ada22) an ordinary layer stays resident through the layer cache's
+            // retained ledger instead of the upload cache: either one holds the frame's content.
+            assert!(gpu.context().upload_stats().0 > 0 || app.session.layer_cache.retained_stats().live_bytes > 0);
             if replace {
                 app.session.replace_project(Default::default(), None);
             } else {
@@ -2522,6 +2524,7 @@ mod gpu_failure_tests {
             }
             app.handle_events(&ctx);
             assert_eq!(gpu.context().upload_stats(), (0, 0));
+            assert_eq!(app.session.layer_cache.retained_stats().live_bytes, 0);
         }
     }
 
