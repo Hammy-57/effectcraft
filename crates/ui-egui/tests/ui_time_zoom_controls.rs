@@ -55,7 +55,8 @@ fn send(h: &mut Harness<'_, EffectcraftApp>, method: &str, params: Value) {
 /// Visible span (start, seconds shown) from the ruler's automation label ("start,pps"); the
 /// time graph ends 18 px before the ruler and maps time from 6 px in.
 fn view(h: &Harness<'_, EffectcraftApp>) -> (f64, f64) {
-    let e = h.state().auto.find("timeline.ruler").expect("ruler");
+    // The latest frame's ruler (`find` would prefer the frame before).
+    let e = h.state().auto.find_current("timeline.ruler").expect("ruler");
     let (start, pps) = e.label.split_once(',').map(|(a, b)| (a.parse::<f64>().unwrap(), b.parse::<f64>().unwrap())).unwrap();
     (start, (e.rect[2] - 24.0) as f64 / pps)
 }
@@ -239,6 +240,9 @@ fn holding_a_zoom_button_keeps_zooming() {
         h.event(egui::Event::PointerMoved(pos));
         h.step();
         h.event(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE });
+        h.step();
+        // The ruler is laid out before the footer's buttons, so it shows the press on the next
+        // frame (still inside ZOOM_HOLD_DELAY: only the press's one step).
         h.step();
         let (_, pressed) = view(&h);
         // kittest advances 0.25 s a frame: past the delay, about one more step a frame.
