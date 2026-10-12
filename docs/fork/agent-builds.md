@@ -94,7 +94,7 @@ untouched), cherry-picks the commits with `-x`, drops the fork-only paths in
 - **Builds on fork work that isn't upstream yet:** a cherry-pick that conflicts stops with nothing
   left behind and names the commit. Queue the prerequisite first, then pass
   `--depends upstream/<prerequisite>`: the branch then starts from that branch, so the cherry-pick
-  applies. The opener opens a dependent PR only once its prerequisite is merged on storytold; the
+  applies. Open a dependent PR only once its prerequisite is merged on storytold; the
   nightly then merges `upstream/main` into the dependent branch so its diff shrinks to its own
   commits.
 - **More commits for a queued topic:** `--update` adds them to the branch (never a force push).
@@ -108,9 +108,12 @@ untouched), cherry-picks the commits with `-x`, drops the fork-only paths in
 - **The gap:** `scripts/fork/sync-gap.sh` prints the shareable commits and lines not yet queued or
   upstream, and the task ids with the most (`--json`; the nightly uses `--fail-if-growing <file>`).
 
-**Who opens the PRs.** A task on the Mac reads `pr-queue` and opens the queued PRs on storytold as
-Elias; the cloud routine can't (it has no permission to open PRs on storytold as Elias). Agents never
-run `gh pr create` against storytold themselves.
+**Who opens the PRs.** Nothing opens them automatically: there is no opener task on the Mac. A
+session on the Mac opens them by hand when Elias asks (`gh pr create --repo storytold/effectcraft
+--head eliasx45:upstream/<slug> --title <title> --body <queue file minus its first 4 lines>`), then
+deletes the opened `queue/*.md` files on `pr-queue` (commit `queue: opened storytold #…`). The cloud
+routine can't (it has no permission to open PRs on storytold as Elias). Agents never open PRs on
+storytold unless Elias asks in that session.
 
 ## Lanes: warm build folders
 
