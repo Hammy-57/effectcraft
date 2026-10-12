@@ -1465,7 +1465,16 @@ impl EffectcraftApp {
         while let Ok(req) = rx.try_recv() {
             reqs.push((req, now + 3.0));
         }
-        for (req, deadline) in reqs {
+        // Agents sharing the app take turns (one request per client before anyone's next), and a
+        // frame runs at most CONTROL_FRAME_BUDGET of requests so the window keeps drawing; the
+        // rest run on the next frame.
+        let started = web_time::Instant::now();
+        for (req, deadline) in control::fair_order(reqs) {
+            if started.elapsed() > control::CONTROL_FRAME_BUDGET {
+                self.deferred.push((req, deadline));
+                ctx.request_repaint();
+                continue;
+            }
             // The transport gave up on it (timed out) and told the client it didn't run.
             if !req.state.start() {
                 continue;
@@ -1546,10 +1555,10 @@ impl EffectcraftApp {
         self.session.poll_offload();
         let waiters = std::mem::take(&mut self.job_waiters);
         for (w, reply) in waiters {
-            if w.pending(self) {
+            if w.pending(&self.session) {
                 self.job_waiters.push((w, reply));
             } else {
-                let v = w.finish(self);
+                let v = w.finish(&mut self.session);
                 let _ = reply.send(v);
             }
         }

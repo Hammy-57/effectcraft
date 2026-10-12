@@ -85,12 +85,18 @@ and transport errors also flush outstanding changes. Queries do not rotate the s
 A failed checkpoint adds a warning to the tool reply; the edit remains in memory and the next
 call retries. Use `save_project {path}` to a writable location before disconnecting if warned.
 
+Recovery stays small on disk: a checkpoint of 8 MB or more is written at most every 30 seconds
+(the change waits, `autosave.pending` says so, and the session's end always writes it), each
+session keeps the Auto-Save setting's maximum number of versions, saving the project normally (or
+undoing back to the saved state) removes the session's recovery files, and a new session removes
+the folders of finished, saved sessions and of any session untouched for 30 days.
+
 Each server has its own folder under `<config directory>/EffectCraft Auto-Save/MCP/` (or
 `<custom Auto-Save folder>/MCP/`). The maximum-version setting applies within that folder.
 `--autosave` enables these checkpoints regardless of the desktop's Auto-Save toggle and interval;
 it reads settings without writing desktop preferences, shortcuts or crash-recovery state.
-`EFFECTCRAFT_CONFIG_DIR` overrides the platform config directory. Session folders are retained
-for recovery; remove old folders once their work is saved elsewhere.
+`EFFECTCRAFT_CONFIG_DIR` overrides the platform config directory. Unsaved sessions' folders are
+kept for recovery (up to 30 days).
 
 `initialize` instructions and `_meta.effectcraftAutoSave` list the current folder and up to five
 previous dirty sessions; `doc_inspect`'s `project.autosave` also reports the latest checkpoint and errors.
@@ -129,14 +135,17 @@ See [MCP conventions](mcp.md) for core tools, resources, strict arguments, and p
 | `render_snapshot {name, comp?, time?, max_side?, transparent?}` | Render a frame and keep it in the session under `name` (16 kept, oldest dropped; the same name replaces). |
 | `render_compare {a, b, threshold?, min_psnr?, max_side?, region?, amplify?, diff_path?, inline?}` | Compare two frames. `a` and `b` are each a snapshot name (or `{snapshot}`), `{path}` (a PNG/JPEG golden or After Effects reference) or `{comp?, time?, transparent?}` (render now; `{}` = active comp at the CTI). Returns `{width, height, max_abs, mean_abs, alpha_max_abs, psnr_db, ssim, changed_pixels, changed_pct, pass, diffBounds}` and, when something changed, the diff heatmap as an image. `region: [x, y, w, h]` compares one rectangle. See [Verify your change](#verify-your-change-snapshot--edit--compare). |
 | `get_layout {comp?, time?, layers?, pixels?, overlaps?}` | Where layers are on screen at a time, without rendering (`layer.bounds`): `visible` (and `why` not), comp-space `bounds` [x,y,w,h], `corners`, `center`, `anchorInComp`, `onScreen` (0-1) and the layer-space `source` rect, after parenting and (3D) the active camera. `pixels` adds the drawn pixels' bounds (effects included); `overlaps` lists overlapping visible layers. |
+| `get_motion {comp?, layer? \| layers?, start?, end?, step?}` | How layers move over a time range, without rendering (`comp.motion` / `layer.motion`): per layer `segments` (enter, exit, move, hold, scale, rotate, fade-in, fade-out with times, from / to, direction, edge), `offscreen` intervals and a one-sentence `summary`, plus `overlaps` between drawn layers. See [Motion summary](#motion-summary). |
 | `analyze_audio {comp?, start?, end?, layer?, silence_db?, min_silence?, true_peak?, waveform?, width?, height?, path?}` | Measure the audio mix (`audio.analyze`): peak / true peak dBFS, RMS, integrated LUFS (BS.1770), clipped samples, silent ranges, per-channel stats; `waveform` returns a waveform image. No audio gives `hasAudio: false`. |
+| `lint_frame {comp?, time?, start?, end?, step?, rules?, min_text_px?, min_contrast?}` | Design lint (`render.lint`): plain-language design problems at one time or over a range, each with a fix hint: text too small or low-contrast, outside title / action safe, cut off, overlapping text, layers switched on but not seen, keyframes just off the music's beat. Returns `{clean, counts, problems: [{rule, severity, layer, layerName, time, until, message, other?}]}`. See [Design lint](#design-lint). |
 | `open_project {path \| demo \| new}` / `save_project {path?}` | Open and save files. |
+| `hosts {join?}` | Where projects are open (each running EffectCraft, its port and project); `join` (a port or a project path) switches this server onto that host as your own `client`, so several agents work in one project. Refused while your own project has unsaved changes. |
 | `undo {steps?}` / `redo {steps?}` | History. |
 | `history {goto?}` | The branching undo history (History panel): every state with its index, id, label, branch depth and whether it's current; `goto` (an index or id) jumps to any state, on any branch, without losing the others. |
 | `script_ui {action?, window?, widget?, value?, result?}` | Drive ScriptUI windows that scripts opened: `list` (default) the open windows, `get` a window's control tree, `click` a button / checkbox / radio button, `set` text, a slider or a list item, `close` a window (`result`: what a dialog's `show()` returns, default 2 = Cancel). |
 | `batch {steps: [{command, params}], label?, atomic?}` | Several commands in one call and one undo step (`engine.batch`); `"$N.key"` in a param is step N's result (`"$1.layer"`). A failing step rolls the batch back and names the step. |
 | *(UI: `--ui` or `--bridge`)* `screenshot {panel?, id?, max_side?, path?}`, `ui_inspect`, `ui_elements {prefix?}`, `ui_click`, `ui_drag`, `ui_key`, `ui_type`, `ui_set`, `control {method, params}` | Look at and operate the app window (offscreen with `--ui`, the live one with `--bridge`). |
-| *(hidden aliases)* `list_commands {filter?, enabled_only?, schemas?}`, `execute_command {command \| id, params?}`, `get_project`, `render_frame {comp? \| item?, layer?, time?, max_side?, region?, overlays?, path?, inline?, transparent?}` | Older names of `command_list`, `command_run`, `doc_inspect` (its `project`) and `render_preview`. Callable, but not in `tools/list` unless the server runs with `mcp --all-tools`. |
+| *(hidden aliases)* `list_commands {filter?, enabled_only?, schemas?, brief?}`, `execute_command {command \| id, params?}`, `get_project`, `render_frame {comp? \| item?, layer?, time?, max_side?, region?, overlays?, path?, inline?, transparent?}` | Older names of `command_list`, `command_run`, `doc_inspect` (its `project`) and `render_preview`. Callable, but not in `tools/list` unless the server runs with `mcp --all-tools`. |
 
 Layers are referenced by id (from `get_comp`), `"#n"` (1-based index from the top) or name. Comps are
 referenced by id or name, and default to the active comp. An id may also be sent as a string (`"98"`):
@@ -198,6 +207,76 @@ warnings}` (`prop.addKey`: `{keys, warnings}`), `set_property`, `add_keyframe` a
 `warnings` array, and `batch` gathers them as `step N (id): …`. Read them: a clamped Levels value
 renders very differently from what you meant.
 
+### Several agents at once
+
+Pass `client` on every request (`"client": "agentA"`) when you share the app with the user or other
+agents. Over MCP, every tool takes it as an argument (`set_property {"layer": 2, …, "client":
+"agentA"}`; the engine commands the tool runs carry it, and renders default to your time), or start
+the server as `effectcraft-cli mcp --client agentA` (or set `EFFECTCRAFT_CLIENT`) so every call runs
+as you; a call's own `client` wins. A bridged MCP server (`mcp --bridge`) given no name names itself
+at `initialize`: the MCP client's name and the server's process id (`claude-code-4821`, also in the
+`initialize` instructions and `get_state`), so an agent sharing the app never moves the user's view
+by accident. Pass `"client": ""` on a call that should act as the user, for example to open a comp
+in their viewer. Headless and `--ui` servers keep running as the user (the agent is alone there).
+Two things follow:
+
+- **Your own cursor.** Selection (layers, properties, keys, mask vertices, Project items), active comp
+  and current time are yours: `layer.select`, `time.set`, `comp.new` / `comp.open` and every command
+  that acts on "the selected layers" or "the active comp" use your copy, never the user's or another
+  agent's. Your first request starts from a copy of the user's cursor. A comp you create or open gets a
+  tab, but the user's viewer stays on what they are looking at. `editor.state` with your `client` is
+  your view; without one it is the user's, plus `clients` (each agent's active comp, time and selected
+  layers) and `claims`. At most 64 cursors are kept (the least recently used goes); requests without
+  `client` behave exactly as before.
+- **Claims.** `comp.claim {comp, ttl?}` reserves a comp for you (`ttl` seconds, default 300, at most
+  24 h; claim again to renew). While it holds, another client's command that would change the comp (its
+  layers, properties or name) or delete it is refused, changing nothing: `composition "Main" is claimed
+  by agentA (expires in 4m 12s); claim it after they release it, or work on another comp`. That includes
+  an `edit.undo` that would reach into it. The owner and the user (no `client`) edit as always; the
+  user never needs a claim. `comp.release {comp?}` releases one claim or, without `comp`, all of yours;
+  `comp.claims` lists them (`{comp, name, client, expiresIn, ttl}`). Claims expire on their own, are
+  dropped when another project is opened, and the control channel releases a client's claims when the
+  last connection that used that `client` closes (keep one connection open, as the MCP bridge does).
+  Without `client`, `comp.release` needs `force: true` (the user overriding a claim).
+
+### Undo with several people in one project
+
+`edit.undo` undoes the caller's own latest step: the user's (no `client`) or the agent's. When
+someone else made the last step, only what the caller's step changed is reverted, as a new step
+(`{undone, selective: true}`), so the user's ⌘Z never removes an agent's work and an agent's undo
+never removes the user's. Inside a comp it works layer by layer: an agent adding or changing other
+layers of the same comp doesn't get in the way. It's refused, changing nothing, when someone changed
+the same thing since (the same layer, a comp's settings or layer order the step changed, a footage
+item, a folder, the project settings); the error names who and what. Pressing it again goes on to
+the caller's step before (an own-step undo isn't itself undone next). The user's
+`edit.undo {any: true}` undoes the last step whoever made it, and the History panel still jumps to
+any state.
+
+### Which project is open where (hosts) and the save guard
+
+One process holds one project. Every EffectCraft that holds one (the desktop app, a headless or
+`--ui` MCP server) is listed in `<config directory>/Hosts/` with its kind, control port and open
+project; `command_run hosts.list` returns the live ones (`{hosts: [{pid, kind, port, project, me}]}`).
+To work on a project that is already open, join that host (the MCP `hosts {join: <port or
+project>}` tool, or start with `--bridge <port>`; you keep your own `client`) instead of opening a
+copy: `file.open` of a project another host has open succeeds but
+warns, and its reply lists them in `openElsewhere`.
+
+With the desktop app closed, a **windowless host** keeps one project in memory for several agents:
+`effectcraft-cli serve Project.ecproj [--control PORT]` prints its port; agents join it like the app
+(`effectcraft-cli mcp --bridge PORT`, or the MCP `hosts {join}` tool) and work on their own comps with
+their own `client` and `comp.claim`. Commands that wait for a job (renders, analyses, `jobs.wait`)
+reply when it ends without holding up the other agents; unsaved work is checkpointed (big projects
+at most every 30 s); `host.release {path?}` saves the project and stops the host. Opening that project in the
+desktop app does this by itself (a handover: the app asks the host to save and stop, waits, then
+opens the saved file; the reply's `handover` says so), and the host's agents find the project in
+the app with the MCP `hosts` tool. `ui.*` methods need the app.
+
+Two copies of one file overwrite each other when saved, so saving is guarded: `file.save` /
+`file.saveAs` over a file that changed on disk since this process opened or saved it (another
+app, an agent's CLI, a script) is refused, naming the ways out: save under a new name
+(`file.saveAs`), reload theirs (`file.revert`), or `force: true` to overwrite.
+
 ### A typical session
 
 1. `command_run {"id":"comp.new","params":{"name":"Intro","width":1920,"height":1080,"frameRate":30,"duration":4}}`
@@ -243,6 +322,52 @@ refactor that should change nothing gives `pass: true` with `psnr_db: "inf"`.
   `render.compare` (`diff_inline: true` returns the heatmap as base64 `diff_png`).
 - For goldens and fidelity checks from the shell: `effectcraft-cli compare a.png b.png` (see [CLI](#cli)).
 
+### Design lint
+
+`lint_frame` (engine command `render.lint`) checks a comp the way a designer would glance at it
+and lists what is wrong, in words an agent can act on. Run it before calling a design done:
+`lint_frame {}` checks the current frame, `lint_frame {"start":0,"end":5}` samples every 0.5 s
+(`step`) plus each layer's in point and keyframe time (at most 120 samples, else `truncated: true`).
+
+```json
+{"comp": 1, "compName": "Main", "times": [0.0, 0.5, 1.0], "truncated": false, "clean": false,
+ "counts": {"error": 1, "warning": 1, "info": 0}, "rules": ["text-too-small", "…"],
+ "problems": [{"rule": "low-contrast", "severity": "error", "layer": 3, "layerName": "Title",
+               "time": 0.0, "until": 1.0, "message": "“Title”'s text colour #8a8a8a on its background (about #808080 under the text) has a contrast ratio of 1.14:1, below 3.0:1: make the text lighter or darker, change what is behind it, or add a stroke or shadow."}],
+ "notes": ["off-beat skipped: the comp has no audible layers"]}
+```
+
+- **Reading it.** `clean` is true when there are no errors or warnings (info doesn't count).
+  The same problem at several sample times is one entry from `time` to `until` (comp seconds; the
+  worst occurrence's severity and message). `layer` is the stable layer id; pair rules add
+  `other` / `otherName`. Problems come errors first, then by time. `rules: [...]` runs only some.
+- `text-too-small`: the smallest drawn character's font size on screen (its em size through the
+  layer's scale, parents, text animators and the camera; cap height is about 70 % of it) is under
+  `min_text_px` (default comp height / 30: 36 px at 1080p) → warning; under half → error.
+- `low-contrast`: the WCAG contrast ratio of the text colour (blended by the layer's opacity)
+  against the mean colour under the text's box, measured on a small render of the comp without
+  its text layers, is under `min_contrast` (default 3:1) → warning; under two thirds of it (2:1)
+  → error. The message gives both colours and the ratio.
+- `outside-title-safe` (text, warning) / `outside-action-safe` (other layers, info): part of the
+  layer is outside the title-safe / action-safe box (Settings ▸ Grids & Guides: 10 % / 5 % per
+  side by default). The message says by how many pixels on which side.
+- `cut-off`: part (not all) of the layer is outside the frame: warning for text, info otherwise.
+  Layers covering the whole frame (backgrounds) are never cut off or outside a safe area.
+- `text-overlap`: two visible text layers' boxes overlap by more than 2 % of the smaller one
+  (warning; `layer` is the upper one).
+- `hidden-visible` (info): switched on and inside its in/out range, yet nothing shows: opacity 0,
+  entirely outside the frame, or entirely covered by an opaque layer above (`other`; a solid, or
+  footage whose alpha is ignored, at 100 % in Normal mode without masks or effects).
+- `off-beat` (warning, only when the comp has audio): a key moment (a Transform or Opacity
+  keyframe, or an in point after 0) within half a beat of a beat that misses it by more than one
+  frame; the message names the beat to move it to. Beats come from the comp's audio mix (onset
+  envelope, tempo by autocorrelation, beats by dynamic programming); with a single `time` only the
+  key moments on that frame are checked. Without audio, or without a clear beat, a `notes` entry
+  says it was skipped.
+
+Geometry is the `get_layout` geometry (track-matte sources and adjustment layers are skipped);
+only `low-contrast` renders, at most 480 px on the long side, once per sample time that shows text.
+
 ### Cookbook
 
 Short recipes; every step is one tool call.
@@ -263,6 +388,7 @@ Short recipes; every step is one tool call.
 | Check a detail | `render_preview {"region":[800,400,320,180],"max_side":0}` (full resolution crop of a big comp) |
 | Prove what an edit changed | `render_snapshot {"name":"before"}` → edit → `render_compare {"a":"before","b":{}}` (metrics + diff heatmap) |
 | Is the title centred and on screen? | `get_layout {"layers":["Title"],"time":2}` → compare `center` with half the comp size, `onScreen` should be 1; `get_layout {"overlaps":true}` for collisions |
+| Does the animation read right? | `get_motion {}` → each layer's `summary` ("Logo flies in from the left 0–1s, holds 1–4s, fades out 4–5s."), `segments` for exact times, `overlaps` for collisions over time |
 | Check the soundtrack | `analyze_audio {}` → `integratedLufs` (streaming targets about -14), `truePeakDbtp` under -1, `clippedSamples` 0, `silences`; `analyze_audio {"waveform":true}` to see it |
 | Undo a mistake | `undo {}`, or `history {}` then `history {"goto": n}` |
 | Missing media after opening | `command_run footage.check {"wait":true}` → `{checked, missing, probed}`; then `file.findMissing {"what":"footage"}` |
@@ -270,6 +396,47 @@ Short recipes; every step is one tool call.
 
 The desktop app checks footage in the background after every open (a "Checking footage" job in
 the Progress panel, `jobs.list`); headless sessions run `footage.check` when they want it.
+
+### Motion summary
+
+Agents can't watch a video. `get_motion` (engine `comp.motion {comp?, layers?, start?, end?,
+step?}`, or `layer.motion {comp?, layer, start?, end?, step?}` for one layer) describes how layers
+move in text, from the same comp-space content boxes as `get_layout` plus each layer's opacity,
+scale and rotation; nothing is rendered, so it is cheap.
+
+```json
+{"comp": 1, "compName": "Intro", "start": 0, "end": 5, "step": 0.0417, "truncated": false,
+ "layers": [{"layer": 2, "name": "Logo", "inPoint": 0, "outPoint": 5,
+   "segments": [{"kind": "enter", "start": 0, "end": 1, "from": [-60, 90], "to": [160, 90], "direction": "right", "edge": "left"},
+                {"kind": "hold", "start": 1, "end": 4, "from": [160, 90], "to": [160, 90]},
+                {"kind": "fade-out", "start": 4, "end": 5, "from": 100, "to": 0}],
+   "offscreen": [{"start": 0, "end": 0.125}],
+   "summary": "Logo flies in from the left 0–1s, holds 1–4s, fades out 4–5s."}],
+ "overlaps": [{"a": 3, "b": 4, "aName": "A", "bName": "B", "start": 0.75, "end": 1.29, "maxFraction": 1}]}
+```
+
+- **Range and sampling.** Default the whole comp (0 to its duration, not the work area), one
+  sample per frame, or coarser for long comps so a layer gets at most 600 samples. Each layer is
+  also sampled at its in and out points and at every Transform keyframe of it and its parents
+  inside the range, so segment boundaries land on keys. Layers × samples is capped at 20 000:
+  past that the range is cut short, `end` says where it stopped and `truncated` is true (with
+  `notes`). Times are comp seconds.
+- **Segments.** `move`: the content centre travels at least 0.5% of the comp diagonal; `from` /
+  `to` are centres in comp pixels and `direction` the 8-way direction (`left`, `up-right`…); a
+  turn of more than 50° starts a new segment. `enter` / `exit`: a move during which the share of
+  the layer inside the frame rises / falls by at least 25%, with the frame `edge` it comes from /
+  leaves by; a move that does both (flies across) is split into enter, move and exit where it is
+  most on screen. A layer that just appears on screen at its in point is not an enter.
+  `scale` (average X/Y scale %), `rotate` (degrees, positive is clockwise), `fade-in` /
+  `fade-out` (opacity 0–100) are the layer's own Transform values changing by at least 1. `hold`:
+  nothing of the above for at least 0.25 s (and three samples); smaller jitter counts as holding.
+  Kinds overlap in time when a layer moves and fades at once.
+- **`offscreen`**: while the layer is on (in to out point), intervals where none of its box is
+  inside the frame. **`overlaps`**: pairs of drawn layers whose on-screen boxes overlap by more
+  than 5% of the smaller one, sampled on the grid, merged into intervals with the largest
+  fraction; layers covering the whole frame (backgrounds) are left out.
+- Cameras, lights, nulls, hidden (Video off) and content-less layers are listed with no segments
+  and a `summary` saying why.
 
 ### Pitfalls
 
@@ -750,6 +917,24 @@ not read or written.
 `<comp>` is an id or name, or `-` for the active comp. `<value>` is JSON (`50`, `[960,540]`,
 `"#ff0000"`) or a bare string.
 
+## Agent exam
+
+`evals/agent/` holds about twenty motion-design tasks (lower third, title card in the safe areas,
+logo fly-in, easing, parenting, precomp, shape layer, blur and glow, masks, track matte, fixing
+layout problems, retiming and renaming, a 9:16 reframe, a contrast fix) that an agent performs
+through the MCP server, each scored by deterministic checks. `cargo xtask agent-exam --run` builds
+each starting project, runs Claude Code headless against `effectcraft-cli mcp`, and writes
+`report.json` / `report.md` (pass rate, minutes, tool calls, failures with reasons); it is meant
+for a nightly cloud job. `--check P.ecproj --task ID` scores one saved project, `--list` and
+`--validate` are cheap.
+
+The checker is the engine query `exam.check {task | checks, base?}` → `{passed, score, total,
+passedCount, results: [{id, desc, pass, reason, actual}]}`. A check runs one read-only query
+(`comp.info`, `prop.get`, `layer.bounds`, `render.lint`, `comp.motion`…; commands that edit or
+write files are refused) and tests its JSON result with JSON Pointers and ops (`eq`, `approx`,
+`contains`, `any`, …), or uses a shorthand (`prop`, `layerCount`, `comp`, `lint`, `motion`,
+`compare`). Agents can run it on their own work too. Format: [evals/agent/README.md](../evals/agent/README.md).
+
 ## Repro scripts
 
 Every command the app runs (menus, panels, shortcuts, agents, scripts) goes into the session's
@@ -810,7 +995,7 @@ without one (a hover, a half-finished drag) is not in it.
 steps that matter, with an `expect_error` or `expect` line where the fix changed the outcome,
 dropped into [`tests/repros/`](../tests/repros). `crates/host/tests/repros.rs` replays every
 `*.jsonl` there and fails on any panic or unmet expectation
-(`cargo nextest run -p effectcraft-host --test repros`).
+(`cargo nextest run -p effectcraft-host --test host repros::`).
 
 ## Seeing the UI
 

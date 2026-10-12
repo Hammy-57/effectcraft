@@ -105,3 +105,122 @@ fn screenshots_are_capped_and_compressed() {
     let (_, fw, fh) = control::shrink(rgba, w, h, 0);
     assert_eq!((fw, fh), (w, h));
 }
+
+/// Run frames until `reply` arrives (at most 30 s: the job runs on another thread, and a loaded
+/// machine can take a while to schedule it).
+fn wait_reply(h: &mut Harness<'_, EffectcraftApp>, reply: &std::sync::mpsc::Receiver<Value>) -> Option<Value> {
+    let t0 = std::time::Instant::now();
+    while t0.elapsed() < std::time::Duration::from_secs(30) {
+        if let Ok(v) = reply.try_recv() {
+            return Some(v);
+        }
+        h.run_steps(1);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    None
+}
+
+/// A session whose project has one footage item (its file is missing), so `footage.check` runs a
+/// background task (with no footage it returns at once, without a job).
+fn session_with_footage() -> Session {
+    use effectcraft_project::{Footage, ItemKind};
+    let mut s = Session::default();
+    let f = Footage { path: "/nonexistent/ec/control-channel.png".into(), width: 64, height: 36, has_video: true, ..Default::default() };
+    std::sync::Arc::make_mut(&mut s.project).add_item("Gone", Default::default(), None, ItemKind::Footage(f));
+    s
+}
+
+/// Multi-agent fairness: on desktop a `wait: true` job command no longer blocks the UI thread
+/// (and with it every other client's requests). It starts the job, the reply waits for it, and
+/// the reply is what the blocking command returns. `jobs.wait` waits the same way.
+#[test]
+fn waiting_job_commands_reply_when_the_job_ends_without_blocking() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut h = Harness::builder().with_size(egui::vec2(1280.0, 800.0)).build_eframe(|_| EffectcraftApp::new(session_with_footage()).with_control(rx));
+    h.run_steps(2);
+    let run = |h: &mut Harness<'_, EffectcraftApp>, command: &str, params: Value| {
+        let (req, reply) = ControlRequest::new("engine.execute", json!({"command": command, "params": params}));
+        tx.send(req).unwrap();
+        h.run_steps(1);
+        reply
+    };
+    run(&mut h, "comp.new", json!({"name": "Main", "width": 64, "height": 36})).recv().unwrap();
+    run(&mut h, "layer.newSolid", json!({"name": "S", "width": 8, "height": 8})).recv().unwrap();
+    let mut blocking = session_with_footage();
+    blocking.execute_checked("comp.new", json!({"name": "Main", "width": 64, "height": 36})).unwrap();
+    blocking.execute_checked("layer.newSolid", json!({"name": "S", "width": 8, "height": 8})).unwrap();
+    let expected = blocking.execute_checked("footage.check", json!({"wait": true})).unwrap();
+    assert_eq!(expected["checked"], 1, "{expected}");
+
+    let waiting = run(&mut h, "footage.check", json!({"wait": true}));
+    // Another client's request is answered while the job runs (or right after it).
+    let other = run(&mut h, "comp.new", json!({"name": "Meanwhile"}));
+    let reply = wait_reply(&mut h, &waiting).expect("the waiting command replied once its job ended");
+    assert_eq!(reply, json!({"ok": true, "result": expected}));
+    assert_eq!(other.recv().unwrap()["ok"], true);
+    assert!(h.state().session.jobs().is_empty());
+
+    // jobs.wait with a task running replies when it is done, with the finished jobs.
+    run(&mut h, "footage.check", json!({})).recv().unwrap();
+    let waited = run(&mut h, "jobs.wait", json!({}));
+    let finished = wait_reply(&mut h, &waited).expect("jobs.wait replied");
+    assert_eq!(finished["ok"], true, "{finished}");
+    assert!(finished["result"]["finished"].as_array().is_some_and(|a| a.iter().any(|j| j["kind"] == "footageCheck")), "{finished}");
+}
+
+/// Renders through the control channel (the `render.frame` method and the engine commands, as a
+/// bridged agent sends them) run off the UI thread on desktop and reply with what the blocking
+/// render returns; a request sent meanwhile is answered too.
+#[test]
+fn renders_reply_without_blocking_the_ui_thread() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut h = Harness::builder().with_size(egui::vec2(1280.0, 800.0)).build_eframe(|_| EffectcraftApp::new(Session::default()).with_control(rx));
+    h.run_steps(2);
+    let send = |method: &str, params: Value| {
+        let (req, reply) = ControlRequest::new(method, params);
+        tx.send(req).unwrap();
+        reply
+    };
+    let wait = |h: &mut Harness<'_, EffectcraftApp>, reply: &std::sync::mpsc::Receiver<Value>| {
+        for _ in 0..400 {
+            if let Ok(v) = reply.try_recv() {
+                return v;
+            }
+            h.run_steps(1);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("no reply");
+    };
+    let r = send("engine.execute", json!({"command": "comp.new", "params": {"name": "Main", "width": 64, "height": 36}}));
+    wait(&mut h, &r);
+    let r = send("engine.execute", json!({"command": "layer.newSolid", "params": {"color": "#ff0000", "width": 16, "height": 16}}));
+    wait(&mut h, &r);
+    let expected = {
+        let mut s = Session::default();
+        s.execute_checked("comp.new", json!({"name": "Main", "width": 64, "height": 36})).unwrap();
+        s.execute_checked("layer.newSolid", json!({"color": "#ff0000", "width": 16, "height": 16})).unwrap();
+        s.execute_checked("render.frame", json!({"base64": true})).unwrap()
+    };
+    let by_command = send("engine.execute", json!({"command": "render.frame", "params": {"base64": true}}));
+    let by_method = send("render.frame", json!({"base64": true}));
+    let meanwhile = send("engine.execute", json!({"command": "comp.new", "params": {"name": "Meanwhile"}}));
+    assert_eq!(wait(&mut h, &by_command), json!({"ok": true, "result": expected}));
+    assert_eq!(wait(&mut h, &by_method), json!({"ok": true, "result": expected}));
+    assert_eq!(wait(&mut h, &meanwhile)["ok"], true);
+    assert!(h.state().session.job_log.iter().all(|r| r.result.is_null()), "rendered PNGs don't stay in the job log");
+}
+
+/// Agents sharing the app take turns: each client's first request runs before anyone's second.
+#[test]
+fn control_requests_take_turns_by_client() {
+    let req = |client: &str, n: u32| {
+        let mut p = json!({"command": "comp.new", "params": {"name": format!("{client}{n}")}});
+        if !client.is_empty() {
+            p["params"]["client"] = json!(client);
+        }
+        (ControlRequest::new("engine.execute", p).0, n)
+    };
+    let reqs = vec![req("a", 1), req("a", 2), req("a", 3), req("b", 1), req("", 1), req("b", 2)];
+    let order: Vec<String> = control::fair_order(reqs).iter().map(|(r, _)| r.params["params"]["name"].as_str().unwrap().to_string()).collect();
+    assert_eq!(order, ["a1", "b1", "1", "a2", "b2", "a3"]);
+}

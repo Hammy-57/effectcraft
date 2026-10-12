@@ -50,6 +50,8 @@ const READS: &[(&str, &[&str])] = &[
     ("file.importMultiple", &["paths"]),
     ("file.importRecent", &["path"]),
     ("file.importLottie", &["path"]),
+    ("file.importProject", &["path"]),
+    ("library.addFolder", &["path"]),
     ("file.importTimeline", &["path"]),
     ("file.replaceFootage", &["path"]),
     ("file.relinkFootage", &["folder"]),
@@ -84,6 +86,12 @@ const WRITES: &[(&str, &[&str])] = &[
     ("essential.exportTemplate", &["path"]),
     ("shortcuts.export", &["path"]),
     ("renderQueue.add", &["output", "path"]),
+    ("render.contactSheet", &["path", "gif"]),
+    ("render.compare", &["diff_path"]),
+    ("render.frame", &["path"]),
+    ("audio.analyze", &["path"]),
+    ("journal.export", &["path"]),
+    ("help.exportRepro", &["path"]),
 ];
 
 /// Commands that write where they are not told: the project's file, the Render Queue's outputs.

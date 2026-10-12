@@ -72,7 +72,7 @@ static PROMPTS: &[PromptDef] = &[
                  2. A bar: command_run layer.newShape (or layer.newSolid sized to the bar), placed in the lower-left third inside the title-safe area. Two text layers with command_run layer.newText: the name (larger, bold) and the title (smaller), left-aligned over the bar.\n\
                  3. Parent the texts to the bar (command_run layer.setParent; see describe_command) or animate them together: slide in from the left with add_keyframe on transform/position (timeBase:\"comp\", interpolation easyEase) over about 0.5 s, hold, then slide out before the end of the comp. Stagger the title a few frames after the name.\n\
                  4. {TIMES}\n\
-                 5. {CHECK} Check the slide-in, the held frame and the slide-out.\n\
+                 5. {CHECK} Check the slide-in, the held frame and the slide-out (get_motion describes them in words: enter, hold, exit, with times).\n\
                  6. Report the layer ids and key times.",
                 name = a.or("name", ""),
                 title = a.or("title", ""),
@@ -136,7 +136,7 @@ static PROMPTS: &[PromptDef] = &[
                  2. get_layer {{\"layer\", \"flat\": true}} lists every property `path` (transform/position, transform/scale, transform/rotation, transform/opacity, effects/#n/...) and its current value.\n\
                  3. Key it with add_keyframe {{\"layer\", \"path\", \"keys\": [{{\"time\", \"value\"}}, ...], \"interpolation\", \"timeBase\":\"comp\"}} (easyEase for natural motion, hold for cuts). Use set_property {{\"expression\"}} for procedural motion (wiggle(freq, amp), loopOut(), time*n).\n\
                  4. {TIMES}\n\
-                 5. {CHECK} Render the start, the middle and the end of the motion.\n\
+                 5. {CHECK} Render the start, the middle and the end of the motion; get_motion summarises it in words.\n\
                  6. Summarise the keys and expressions you set.",
                 layer = a.or("layer", ""),
                 motion = a.or("motion", ""),

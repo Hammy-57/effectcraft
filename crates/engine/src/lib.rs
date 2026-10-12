@@ -10,26 +10,32 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod agents;
 pub mod audio_analysis;
 pub mod autosave;
 pub mod camera_track;
 pub mod commands;
 pub mod config;
 pub mod demo;
+pub mod exam;
 pub mod footage_check;
 pub mod footage_reload;
 pub mod guard;
 pub mod history;
+pub mod hosts;
+pub mod job_waiter;
 pub mod jobs;
 pub mod layout;
 pub mod learn;
 pub mod links;
+pub mod lint;
 pub mod logging;
 pub mod mask_track;
 pub mod media_browser;
 pub mod media_cache;
 pub mod menus;
 pub mod models;
+pub mod motion;
 pub mod offload;
 pub mod perf;
 pub mod prefs;
@@ -41,6 +47,7 @@ pub mod render_view;
 pub mod replay;
 pub mod roto;
 pub mod scriptui;
+pub mod selective_undo;
 pub mod sequence;
 mod session_settings;
 pub mod shortcuts;
@@ -376,6 +383,13 @@ pub struct Session {
     /// `None` = the user). Undo steps remember it, and `edit.undo` with a `client` only undoes
     /// that client's own last step.
     pub client: Option<String>,
+    /// The clients' own cursors (selection, active comp, current time), swapped into
+    /// [`Session::state`] while one of their commands runs (see [`agents`]).
+    pub cursors: agents::Cursors,
+    /// Compositions claimed by clients (`comp.claim`): other clients' edits to them are refused.
+    pub claims: agents::Claims,
+    /// Bumped whenever another project replaces this one ([`Session::replace_project`]).
+    pub epoch: u64,
     /// The highest `next_id` any state has reached: ids stay unique across undo / redo, so an
     /// id an agent saw is never handed to a different object later.
     pub id_floor: u64,
@@ -578,6 +592,9 @@ impl Default for Session {
             history: History::default(),
             revision: 0,
             client: None,
+            cursors: Default::default(),
+            claims: Default::default(),
+            epoch: 0,
             id_floor: 0,
             saved_revision: 0,
             path: None,
@@ -654,7 +671,9 @@ impl Session {
     /// `expectRevision` (refuse with an error, changing nothing, when the document's
     /// [`Session::revision`] is another) and `client` (who runs it: the undo step it makes is
     /// tagged with it, and `edit.undo` only undoes that client's own last step). Nested commands
-    /// (batch steps, scripts) inherit the caller's client.
+    /// (batch steps, scripts) inherit the caller's client. A client works on its own cursor
+    /// (selection, active comp, time) and can't change compositions other clients claimed (see
+    /// [`agents`]).
     pub fn execute(&mut self, id: &str, mut params: Value) -> Result<Value> {
         let (expect, client) = match params.as_object_mut() {
             Some(o) => (o.remove("expectRevision"), o.remove("client")),
@@ -671,11 +690,11 @@ impl Session {
             None | Some(Value::Null) => None,
             Some(c) => return Err(commands::bad(id, format!("`client` must be a non-empty string, got {c}"))),
         };
-        let Some(client) = client else { return self.execute_inner(id, params) };
-        let outer = self.client.replace(client);
-        let r = self.execute_inner(id, params);
-        self.client = outer;
-        r
+        match client {
+            // Already running as this client (a nested step): its cursor is in place.
+            Some(c) if self.client.as_deref() != Some(c.as_str()) => agents::run_as(self, c, |s| s.execute_inner(id, params)),
+            _ => self.execute_inner(id, params),
+        }
     }
 
     fn execute_inner(&mut self, id: &str, params: Value) -> Result<Value> {
@@ -759,6 +778,10 @@ impl Session {
         effectcraft_project::styles::sync_global_light(&before, &mut p);
         // Essential Properties of precomp layers follow their comps' Essential Graphics.
         effectcraft_project::essential::sync_project(&before, &mut p);
+        // Another client's claimed composition stays as it is (checked before analyses are queued again).
+        if let Some(e) = self.claim_conflict(&before, &p) {
+            return Err(e);
+        }
         // Warp Stabilizer analyses made from other frames are cleared (and queued again).
         for w in warp::invalidate(&before, &mut p) {
             if !self.warp_pending.contains(&w) {
@@ -1151,6 +1174,10 @@ impl Session {
         self.history = History::default();
         self.id_floor = 0;
         self.state = EditorState { snapping: true, view_layout: 1, ..Default::default() };
+        // Cursors and claims point into the old project.
+        self.cursors.clear();
+        self.claims.clear();
+        self.epoch = self.epoch.wrapping_add(1);
         self.path = path;
         self.bump();
         self.mark_saved();
@@ -1241,6 +1268,8 @@ mod tests_fuzz_open;
 mod tests_key_metadata_order;
 #[cfg(test)]
 mod tests_keylight;
+#[cfg(test)]
+mod tests_library;
 #[cfg(test)]
 mod tests_limits;
 #[cfg(test)]
@@ -1407,4 +1436,20 @@ mod tests_panels;
 mod tests_roto;
 
 #[cfg(test)]
+mod tests_exam;
+#[cfg(test)]
+mod tests_import_project;
+#[cfg(test)]
 mod tests_key_time;
+#[cfg(test)]
+mod tests_lint;
+
+#[cfg(test)]
+mod tests_agent_cursor;
+#[cfg(test)]
+mod tests_claims;
+#[cfg(test)]
+mod tests_motion;
+
+#[cfg(test)]
+mod tests_hosts;

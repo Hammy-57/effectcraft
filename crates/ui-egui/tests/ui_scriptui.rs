@@ -173,6 +173,7 @@ fn history_panel_jumps_between_branches() {
 /// onDraw fills of concave paths and real images (drawImage, image controls), rendered.
 #[test]
 fn on_draw_concave_fills_and_images_render() {
+    let _gpu = crate::gpu_lock();
     let dir = std::env::temp_dir().join(format!("effectcraft-scriptui-img-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let png = dir.join("green.png");

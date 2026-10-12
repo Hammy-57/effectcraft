@@ -1,0 +1,120 @@
+{
+  "id": "fade-out",
+  "title": "Fade a title out",
+  "prompt": "In the comp \"Main\" (1920×1080, 30 fps, 4 s), fade the text layer \"Title\" out over the last second: fully opaque until 3 s, fully transparent at 4 s.",
+  "setup": [
+    {
+      "command": "comp.new",
+      "params": {
+        "name": "Main",
+        "width": 1920,
+        "height": 1080,
+        "frameRate": 30,
+        "duration": 4
+      }
+    },
+    {
+      "command": "layer.newText",
+      "params": {
+        "text": "The End",
+        "size": 120,
+        "position": [
+          960,
+          560
+        ],
+        "fill": "#FFFFFF",
+        "name": "Title"
+      }
+    }
+  ],
+  "limits": {
+    "minutes": 5,
+    "toolCalls": 20
+  },
+  "checks": [
+    {
+      "id": "opaque",
+      "desc": "100% opacity at 2.9 s",
+      "prop": {
+        "comp": "Main",
+        "layer": "Title",
+        "path": "transform/opacity",
+        "time": 2.9
+      },
+      "op": "approx",
+      "value": 100,
+      "tol": 0.5
+    },
+    {
+      "id": "half",
+      "desc": "partly faded at 3.5 s",
+      "prop": {
+        "comp": "Main",
+        "layer": "Title",
+        "path": "transform/opacity",
+        "time": 3.5
+      },
+      "op": "lt",
+      "value": 90
+    },
+    {
+      "id": "half2",
+      "desc": "not yet gone at 3.5 s",
+      "prop": {
+        "comp": "Main",
+        "layer": "Title",
+        "path": "transform/opacity",
+        "time": 3.5
+      },
+      "op": "gt",
+      "value": 10
+    },
+    {
+      "id": "gone",
+      "desc": "0% opacity at 4 s",
+      "prop": {
+        "comp": "Main",
+        "layer": "Title",
+        "path": "transform/opacity",
+        "time": 4
+      },
+      "op": "approx",
+      "value": 0,
+      "tol": 1
+    },
+    {
+      "id": "motion",
+      "desc": "a fade-out from 3 to 4 s",
+      "motion": {
+        "comp": "Main"
+      },
+      "layer": "Title",
+      "segment": {
+        "kind": "fade-out",
+        "startApprox": 3,
+        "endApprox": 4,
+        "tol": 0.2
+      }
+    }
+  ],
+  "solution": [
+    {
+      "command": "prop.addKey",
+      "params": {
+        "layer": "Title",
+        "path": "transform/opacity",
+        "time": 3,
+        "value": 100
+      }
+    },
+    {
+      "command": "prop.addKey",
+      "params": {
+        "layer": "Title",
+        "path": "transform/opacity",
+        "time": 4,
+        "value": 0
+      }
+    }
+  ]
+}

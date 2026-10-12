@@ -137,83 +137,44 @@ pub enum Outcome {
     AwaitJobs(JobWaiter),
 }
 
-/// A `wait: true` engine command whose job was sent to the session's offload (the browser's
-/// Web Workers) instead of blocking the UI thread: the reply goes out when the job ends.
-pub struct JobWaiter {
-    pub command: String,
-    pub params: Value,
-    /// The command's own result (with `wait: false`).
-    pub result: Value,
-    /// Ids of the jobs it started (`jobs.list` ids: `render`, `track`, `roto`…).
-    pub jobs: Vec<String>,
-    /// Length of [`effectcraft_engine::Session::offload_log`] when it started.
-    pub log_len: usize,
-}
+/// A `wait: true` engine command (or `jobs.wait`) whose job runs in the background instead of
+/// blocking the UI thread (shared with the windowless host).
+pub use effectcraft_engine::job_waiter::JobWaiter;
 
-/// Commands that block with `wait` (and its default).
-fn waits(command: &str, params: &Value) -> bool {
-    let default = command == "renderQueue.render";
-    params.get("wait").and_then(Value::as_bool).unwrap_or(default)
-}
+/// The most time one frame spends running control requests (the rest wait for the next frame).
+pub const CONTROL_FRAME_BUDGET: std::time::Duration = std::time::Duration::from_millis(50);
 
-/// Run an engine command. A waiting command (`wait: true`) whose job the session offloads
-/// runs with `wait: false` instead, and the reply waits for the job ([`Outcome::AwaitJobs`]),
-/// so the browser's UI keeps drawing while it runs.
-fn execute_engine(app: &mut EffectcraftApp, id: &str, params: Value) -> Result<Outcome, String> {
-    if !app.session.offloads() || !waits(id, &params) {
-        return app.session.execute_checked(id, params).map(ok).map_err(|e| e.to_string());
-    }
-    let before: Vec<String> = app.session.jobs().into_iter().map(|j| j.id).collect();
-    let log_len = app.session.offload_log.len();
-    let mut p = params.clone();
-    p["wait"] = json!(false);
-    let result = app.session.execute_checked(id, p).map_err(|e| e.to_string())?;
-    let jobs: Vec<String> = app.session.jobs().into_iter().map(|j| j.id).filter(|j| !before.contains(j)).collect();
-    if jobs.is_empty() {
-        return Ok(ok(result));
-    }
-    Ok(Outcome::AwaitJobs(JobWaiter { command: id.to_string(), params, result, jobs, log_len }))
-}
-
-impl JobWaiter {
-    /// Whether its jobs are still running.
-    pub fn pending(&self, app: &EffectcraftApp) -> bool {
-        app.session.jobs().iter().any(|j| self.jobs.contains(&j.id))
-    }
-
-    /// The reply: what the blocking command would have returned (`running: false`, the final
-    /// progress, render items and analysis status), or the job's error.
-    pub fn finish(self, app: &mut EffectcraftApp) -> Value {
-        let s = &mut app.session;
-        s.poll_render();
-        let errors: Vec<String> = s.offload_log.iter().skip(self.log_len).filter_map(|(_, e)| e.clone()).collect();
-        if let Some(e) = errors.first() {
-            return json!({"ok": false, "error": e});
+/// Requests in turns by client (`engine.execute`'s `client`; the user and UI requests count as
+/// one): each client's first request, then each one's second, and so on, in arrival order.
+pub fn fair_order<T>(reqs: Vec<(ControlRequest, T)>) -> Vec<(ControlRequest, T)> {
+    let client = |r: &ControlRequest| r.params.get("params").and_then(|p| p.get("client")).and_then(Value::as_str).unwrap_or_default().to_string();
+    let mut queues: Vec<(String, std::collections::VecDeque<(ControlRequest, T)>)> = vec![];
+    for r in reqs {
+        let c = client(&r.0);
+        match queues.iter_mut().find(|(k, _)| *k == c) {
+            Some((_, q)) => q.push_back(r),
+            None => queues.push((c, std::collections::VecDeque::from([r]))),
         }
-        let mut r = self.result;
-        if r.get("running").is_some() {
-            r["running"] = json!(false);
-        }
-        if self.command == "renderQueue.render" {
-            let ids: Vec<Value> = r["items"].as_array().map(|a| a.iter().map(|i| i["id"].clone()).collect()).unwrap_or_default();
-            if let Ok(list) = s.execute("renderQueue.list", json!({})) {
-                r["items"] =
-                    json!(list["items"].as_array().map(|a| a.iter().filter(|i| ids.contains(&i["id"])).cloned().collect::<Vec<_>>()).unwrap_or_default());
+    }
+    let mut out = vec![];
+    while queues.iter().any(|(_, q)| !q.is_empty()) {
+        for (_, q) in queues.iter_mut() {
+            if let Some(r) = q.pop_front() {
+                out.push(r);
             }
-            r["rendering"] = json!(s.is_rendering());
         }
-        let prefix = self.command.split('.').next().unwrap_or("");
-        if matches!(prefix, "warp" | "camera" | "roto")
-            && r.get("layer").is_some()
-            && let Ok(st) = s.execute(&format!("{prefix}.status"), json!({"layer": r["layer"], "effect": r["effect"]}))
-        {
-            r["status"] = st;
-        }
-        if r.get("progress").is_some() {
-            r["progress"] = Value::Null;
-        }
-        json!({"ok": true, "result": r})
     }
+    out
+}
+
+/// Run an engine command. A waiting command (`wait: true`) runs with `wait: false` instead, and
+/// the reply waits for the job it started ([`Outcome::AwaitJobs`]), so the UI keeps drawing and
+/// other clients' requests run while it works. `jobs.wait` likewise waits for the running tasks.
+fn execute_engine(app: &mut EffectcraftApp, id: &str, params: Value) -> Result<Outcome, String> {
+    Ok(match effectcraft_engine::job_waiter::start(&mut app.session, id, params)? {
+        effectcraft_engine::job_waiter::Started::Done(v) => ok(v),
+        effectcraft_engine::job_waiter::Started::Waiting(w) => Outcome::AwaitJobs(w),
+    })
 }
 
 fn ok(v: Value) -> Outcome {
@@ -525,6 +486,11 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
             Outcome::Screenshot { path: s("path").map(str::to_string), crop, max_side }
         }
         "app.revision" => ok(json!({"revision": app.session.revision})),
+        // Desktop: rendered off the UI thread like the engine command (the reply waits for it).
+        "render.frame" if !cfg!(target_arch = "wasm32") => match execute_engine(app, "render.frame", p.clone()) {
+            Ok(o) => o,
+            Err(e) => err(e),
+        },
         "render.frame" => render_frame(app, p),
         "ui.resize" => {
             let w = p.get("width").and_then(Value::as_f64).unwrap_or(1600.0) as f32;

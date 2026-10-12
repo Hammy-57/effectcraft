@@ -1240,6 +1240,7 @@ fn file_dialog(app: &mut EffectcraftApp, id: &str, params: &Value) -> Option<Res
         "file.exportLottie" => ("path", Ask::Save("Animation.json")),
         "file.importLottie" => ("path", Ask::Open(&["json", "lottie"])),
         "file.importTimeline" => ("path", Ask::Open(&["xml", "fcpxml", "otio", "edl", "aaf", "omf"])),
+        "file.importProject" => ("path", Ask::Open(&["ecproj", "ecprojx"])),
         "render.saveCurrentPreview" => ("path", Ask::Save("Preview.mp4")),
         "file.runScript" if params.get("name").is_none() => ("path", Ask::Open(&["jsx", "js", "jsonl", "json", "txt"])),
         "file.installScript" | "file.installScriptUIPanel" => ("path", Ask::Open(&["jsx", "js"])),
@@ -1378,7 +1379,10 @@ pub fn menus() -> Vec<&'static str> {
 
 pub(crate) fn entry_label(app: &EffectcraftApp, e: &MenuEntry) -> String {
     let shown = match e.command.as_str() {
-        "edit.undo" => app.session.history.undo.last().map(|u| format!("Undo {}", u.0)).unwrap_or_else(|| "Can't Undo".into()),
+        // The step ⌘Z undoes: the user's own latest (agents' later steps stay).
+        "edit.undo" => {
+            effectcraft_engine::selective_undo::own_undo_label(&app.session, None).map(|l| format!("Undo {l}")).unwrap_or_else(|| "Can't Undo".into())
+        }
         "edit.redo" => app.session.history.redo.last().map(|u| format!("Redo {}", u.0)).unwrap_or_else(|| "Can't Redo".into()),
         // Window ▸ Layer: the layer open in the Layer panel.
         "window.panel" if e.params.get("panel").and_then(Value::as_str) == Some("layer") => {

@@ -1,0 +1,290 @@
+{
+  "id": "lower-third",
+  "title": "Lower third with a sliding bar",
+  "prompt": "In the comp \"Main\" (1920×1080, 30 fps, 5 s), build a lower third: a shape layer named \"Bar\" (a dark rectangle, 800×120 px), a text layer named \"Name\" reading \"Ada Lovelace\" and a text layer named \"Role\" reading \"Mathematician\", with the two texts on the bar. All three must sit in the lower part of the frame (their centres below y = 720) and inside the title-safe area once in place (from 0.6 s on). The title-safe area is the frame inset by 10% on each side (x 192–1728, y 108–972 in a 1920×1080 comp). The Bar slides in from off-screen left: completely off-screen at 0 s, in its final place at 0.6 s. Keep the text readable: good contrast, and characters at least 36 px tall on screen (1/30 of the frame height, what render.lint checks).",
+  "setup": [
+    {
+      "command": "comp.new",
+      "params": {
+        "name": "Main",
+        "width": 1920,
+        "height": 1080,
+        "frameRate": 30,
+        "duration": 5
+      }
+    }
+  ],
+  "limits": {
+    "minutes": 10,
+    "toolCalls": 40
+  },
+  "checks": [
+    {
+      "id": "bar",
+      "desc": "a shape layer named Bar",
+      "query": "comp.info",
+      "params": {
+        "comp": "Main"
+      },
+      "expect": [
+        {
+          "path": "/layers",
+          "op": "contains",
+          "value": {
+            "name": "Bar",
+            "type": "Shape"
+          }
+        }
+      ]
+    },
+    {
+      "id": "name-text",
+      "desc": "Name reads Ada Lovelace",
+      "prop": {
+        "comp": "Main",
+        "layer": "Name",
+        "path": "text/sourceText"
+      },
+      "op": "eq",
+      "value": "Ada Lovelace"
+    },
+    {
+      "id": "role-text",
+      "desc": "Role reads Mathematician",
+      "prop": {
+        "comp": "Main",
+        "layer": "Role",
+        "path": "text/sourceText"
+      },
+      "op": "eq",
+      "value": "Mathematician"
+    },
+    {
+      "id": "safe",
+      "desc": "Bar, Name and Role inside title-safe at 2 s",
+      "query": "layer.bounds",
+      "params": {
+        "comp": "Main",
+        "layers": [
+          "Bar",
+          "Name",
+          "Role"
+        ],
+        "time": 2
+      },
+      "expect": [
+        {
+          "path": "/layers",
+          "op": "len",
+          "value": 3
+        },
+        {
+          "path": "/layers",
+          "op": "all",
+          "value": [
+            {
+              "path": "/visible",
+              "op": "eq",
+              "value": true
+            },
+            {
+              "path": "/corners",
+              "op": "all",
+              "value": [
+                {
+                  "path": "/0",
+                  "op": "gte",
+                  "value": 192
+                },
+                {
+                  "path": "/0",
+                  "op": "lte",
+                  "value": 1728
+                },
+                {
+                  "path": "/1",
+                  "op": "gte",
+                  "value": 108
+                },
+                {
+                  "path": "/1",
+                  "op": "lte",
+                  "value": 972
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "lower",
+      "desc": "all three centred below y = 720 at 2 s",
+      "query": "layer.bounds",
+      "params": {
+        "comp": "Main",
+        "layers": [
+          "Bar",
+          "Name",
+          "Role"
+        ],
+        "time": 2
+      },
+      "expect": [
+        {
+          "path": "/layers",
+          "op": "all",
+          "value": {
+            "path": "/center/1",
+            "op": "gt",
+            "value": 720
+          }
+        }
+      ]
+    },
+    {
+      "id": "bar-offscreen",
+      "desc": "Bar is off-screen at 0 s",
+      "query": "layer.bounds",
+      "params": {
+        "comp": "Main",
+        "layers": [
+          "Bar"
+        ],
+        "time": 0
+      },
+      "select": {
+        "array": "/layers",
+        "index": 0
+      },
+      "expect": [
+        {
+          "path": "/onScreen",
+          "op": "lte",
+          "value": 0.01
+        },
+        {
+          "path": "/center/0",
+          "op": "lt",
+          "value": 960
+        }
+      ]
+    },
+    {
+      "id": "bar-in",
+      "desc": "Bar fully on screen at 0.6 s",
+      "query": "layer.bounds",
+      "params": {
+        "comp": "Main",
+        "layers": [
+          "Bar"
+        ],
+        "time": 0.6
+      },
+      "select": {
+        "array": "/layers",
+        "index": 0
+      },
+      "expect": [
+        {
+          "path": "/onScreen",
+          "op": "gte",
+          "value": 0.99
+        }
+      ]
+    },
+    {
+      "id": "bar-enters",
+      "desc": "Bar enters from the left between 0 and 0.6 s",
+      "motion": {
+        "comp": "Main"
+      },
+      "layer": "Bar",
+      "segment": {
+        "kind": "enter",
+        "edge": "left",
+        "startApprox": 0,
+        "endApprox": 0.6,
+        "tol": 0.15
+      }
+    },
+    {
+      "id": "clean",
+      "desc": "render.lint finds no errors or warnings at 2 s",
+      "lint": {
+        "comp": "Main",
+        "time": 2
+      }
+    }
+  ],
+  "solution": [
+    {
+      "command": "layer.newShape",
+      "params": {
+        "name": "Bar",
+        "kind": "rect",
+        "size": [
+          800,
+          120
+        ],
+        "fill": "#1A1F2E",
+        "position": [
+          600,
+          860
+        ]
+      }
+    },
+    {
+      "command": "prop.addKey",
+      "params": {
+        "layer": "Bar",
+        "path": "transform/position",
+        "time": 0,
+        "value": [
+          -420,
+          860,
+          0
+        ]
+      }
+    },
+    {
+      "command": "prop.addKey",
+      "params": {
+        "layer": "Bar",
+        "path": "transform/position",
+        "time": 0.6,
+        "value": [
+          600,
+          860,
+          0
+        ]
+      }
+    },
+    {
+      "command": "layer.newText",
+      "params": {
+        "text": "Ada Lovelace",
+        "size": 56,
+        "position": [
+          600,
+          850
+        ],
+        "fill": "#FFFFFF",
+        "name": "Name"
+      }
+    },
+    {
+      "command": "layer.newText",
+      "params": {
+        "text": "Mathematician",
+        "size": 40,
+        "position": [
+          600,
+          900
+        ],
+        "fill": "#DDE6FF",
+        "name": "Role"
+      }
+    }
+  ]
+}

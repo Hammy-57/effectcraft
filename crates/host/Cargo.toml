@@ -5,6 +5,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+# The integration tests are one binary (tests/host/main.rs declares every tests/*.rs): one link
+# instead of one per file. `cargo test -p effectcraft-host --test host repros::`
+autotests = false
+
+[[test]]
+name = "host"
+path = "tests/host/main.rs"
 
 [lints]
 workspace = true

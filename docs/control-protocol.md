@@ -22,7 +22,15 @@ window's status bar and on stderr: give each app its own port, and point its MCP
 - **Reply:** `{"id": 1, "ok": true, "result": ...}` or `{"id": 1, "ok": false, "error": "message"}`.
 - Requests run on the UI thread between frames. Input methods (`ui.click`, `ui.key` and similar)
   reply after the synthetic input has been processed. Methods that need an element that isn't drawn
-  yet are retried for a few frames. A request times out after 60 s. If the app hadn't started it
+  yet are retried for a few frames. A command that waits for a background job (`wait: true` on
+  `renderQueue.render`, the analyses, `footage.check`, Content-Aware Fill, Scene Edit Detection;
+  `jobs.wait`, `render.frame` / `render.contactSheet`, which render on a copy of the project, and
+  `file.importProject`, which reads the file in the background)
+  starts the job and replies when it ends, with the same result as the blocking
+  command: the UI keeps drawing and other connections' requests run meanwhile. A request times
+  out after 60 s. Clients sharing the app take turns: each `client`'s first request runs before
+  anyone's second, and one frame runs at most 50 ms of requests (the rest run on the next frame),
+  so the window keeps drawing. If the app hadn't started it
   by then, it is cancelled and never runs: the reply has `"notRun": true` and says it is safe to
   retry. If it had started, the reply says it may still complete.
 - **Only requests are read:** every line must be a JSON object with a string `method` (blank lines are
@@ -30,7 +38,7 @@ window's status bar and on stderr: give each app its own port, and point its MCP
   invalid UTF-8, a line longer than 4 MiB) gets one error reply ending in "closing the connection", and
   the server closes the connection, so nothing sent after it runs. An HTTP request (for example a web
   page's cross-origin `fetch` to `127.0.0.1:<port>`) therefore can't smuggle a command in its body: its
-  request line is rejected first. At most 16 connections are served at once; further ones get an error
+  request line is rejected first. At most 32 connections are served at once; further ones get an error
   line and are closed. The port has no authentication, so only enable it while you use it.
 
 Quick test:
@@ -66,7 +74,15 @@ one rectangle; `diffBounds` boxes the changed pixels or is null; metrics and siz
 Analysis queries (see [mcp.md](mcp.md#analysis-tools)):
 `layer.bounds {comp?, time?, layers?, pixels?, overlaps?}` (layer geometry in comp space) and
 `audio.analyze {comp?, start?, end?, layer?, waveform?, path?}` (peak, RMS, LUFS, clipping and
-silences of the mix).
+silences of the mix). Agent exam: `exam.check {task? | checks?, base?}` scores the
+project against an exam task's checks (each runs one read-only query and tests its result) →
+`{passed, score, total, passedCount, results: [{id, desc, pass, reason, actual}]}`
+([evals/agent/README.md](../evals/agent/README.md)). Design lint: `render.lint {comp?, time? | start?, end?, step?, rules?, minTextPx?, minContrast?}`
+→ `{comp, compName, times, truncated, clean, counts {error, warning, info}, problems: [{rule, severity,
+layer, layerName, time, until, message, other?}], notes}` (rules and how to read it: [agents.md](agents.md#design-lint)). Motion summaries: `comp.motion {comp?, layers?, start?, end?, step?}` /
+`layer.motion {comp?, layer, start?, end?, step?}` → per layer `segments` (enter, exit, move,
+hold, scale, rotate, fade-in, fade-out), `offscreen` intervals and a `summary` sentence, plus
+`overlaps` ([agents.md](agents.md#motion-summary)).
 
 `project.summary` and `editor.state` include the document `revision` (bumped on every change, undo and
 redo included). Every command's `params` also accepts `expectRevision` (the command doesn't run and
@@ -77,6 +93,31 @@ A number always names an id (layer, effect, mask…), never a position; use `"#n
 
 Every engine command is reachable through `engine.execute`, and every interactive widget of every
 panel registers an element id; both are enforced by `crates/ui-egui/tests/ui_agent_audit.rs`.
+
+### Clients: cursors and claims
+
+A request whose params carry `client` runs on that client's own cursor: active comp, current times,
+selected layers / properties / keys / mask vertices / Project items, the current track and on-canvas
+text editing (`Session::execute` swaps it in for the command and the user's back afterwards; batch and
+script steps inherit it). A new client starts from a copy of the user's cursor; at most 64 are kept
+(least recently used dropped). Open comp tabs, clipboards and tool and viewer options stay shared; a
+client opening a comp adds its tab but sends no `OpenComp` to the UI. `editor.state` returns the
+caller's view and adds `client` (when given), `clients` (`[{client, active_comp, time, selected_layers}]`,
+most recent first) and `claims`.
+
+| Command | Params | Result |
+|---|---|---|
+| `comp.claim` | `{comp?, ttl?}` + `client` (required) | `{comp, name, client, ttl, renewed, warnings?}`; `ttl` seconds, default 300, capped at 86400; the owner re-claiming renews; another client's live claim is an error naming it |
+| `comp.release` | `{comp?, force?}` | `{released: [{comp, name, client}]}`; with `client`: that comp (only if you own it) or all your claims; without `client` only with `force: true` (anyone's, one comp or all) |
+| `comp.claims` | `{}` | `{claims: [{comp, name, client, expiresIn, ttl}]}` |
+
+While a claim is live, a command from another client that changes the claimed comp (layers, properties,
+name) or deletes it fails with `composition "<name>" is claimed by <owner> (expires in 4m 12s); …` and
+changes nothing; edits are checked in `Session::edit`, and anything else (undo, redo, history jumps)
+by comparing the comp before and after the command. Requests without `client` are never refused.
+Expired claims are dropped when next checked; opening another project drops all claims and cursors.
+The TCP control server counts the open connections per `client` and runs `comp.release {client}` when
+the last one closes.
 
 ## Change events
 

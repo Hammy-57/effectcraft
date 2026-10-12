@@ -18,12 +18,16 @@ use crate::{BridgeClient, ControlTransport, Error, Result, base64, encode_png, r
 const SESSION_WAIT: Duration = Duration::from_secs(600);
 
 pub struct Backend {
-    target: Target,
+    kind: Kind,
+    /// Who the agent is (`mcp --client NAME`, or a tool call's `client` argument): every engine
+    /// command it runs carries this `client`, so it gets its own selection, active comp and time
+    /// and can claim comps (docs/agents.md, "Several agents at once"). `None` = the user's cursor.
+    client: Option<String>,
     /// File access confined to folders (`--automation-read-root` / `--automation-write-root`).
     confinement: Option<Confinement>,
 }
 
-enum Target {
+enum Kind {
     /// An in-process session (no window): engine commands, inspection and rendering.
     Headless(Box<Session>),
     /// An app reached through its control channel (a running desktop app, or the offscreen UI of
@@ -42,12 +46,17 @@ pub struct Frame {
 
 impl Backend {
     pub fn headless(session: Session) -> Self {
-        Backend { target: Target::Headless(Box::new(session)), confinement: None }
+        Backend { kind: Kind::Headless(Box::new(session)), client: None, confinement: None }
     }
 
     /// Bridge to the app's control channel at `addr` (`9877` or `127.0.0.1:9877`).
     pub fn bridge(addr: &str) -> Result<Self> {
-        Ok(Backend { target: Target::Bridge(Box::new(BridgeClient::new(addr)?)), confinement: None })
+        Ok(Backend { kind: Kind::Bridge(Box::new(BridgeClient::new(addr)?)), client: None, confinement: None })
+    }
+
+    /// Drive an app through any control transport (e.g. an offscreen UI in this process).
+    pub fn transport(t: impl ControlTransport + 'static) -> Self {
+        Backend { kind: Kind::Bridge(Box::new(t)), client: None, confinement: None }
     }
 
     /// Confine the files the commands run here may read and write ([`Confinement`]).
@@ -59,37 +68,50 @@ impl Backend {
         self.confinement.as_ref()
     }
 
-    /// Drive an app through any control transport (e.g. an offscreen UI in this process).
-    pub fn transport(t: impl ControlTransport + 'static) -> Self {
-        Backend { target: Target::Bridge(Box::new(t)), confinement: None }
+    /// The agent's name that engine commands run under (see [`Backend`]'s `client`).
+    pub fn client(&self) -> Option<&str> {
+        self.client.as_deref()
+    }
+
+    /// Run engine commands as `client` (`None`: as the user). Returns the previous client.
+    pub fn set_client(&mut self, client: Option<String>) -> Option<String> {
+        std::mem::replace(&mut self.client, client.filter(|c| !c.is_empty()))
+    }
+
+    /// `params` with this backend's `client` added (unless the call names its own).
+    fn with_client(&self, mut params: Value) -> Value {
+        if let (Some(c), Some(o)) = (&self.client, params.as_object_mut()) {
+            o.entry("client").or_insert_with(|| json!(c));
+        }
+        params
     }
 
     /// Whether tools reach an app with a UI (bridge-only tools such as `screenshot` and `ui_*` work).
     pub fn is_bridge(&self) -> bool {
-        matches!(self.target, Target::Bridge(_))
+        matches!(self.kind, Kind::Bridge(_))
     }
 
     /// `headless`, or the transport's mode (`bridge`, `headless-ui`).
     pub fn mode(&self) -> &'static str {
-        match &self.target {
-            Target::Headless(_) => "headless",
-            Target::Bridge(t) => t.mode(),
+        match &self.kind {
+            Kind::Headless(_) => "headless",
+            Kind::Bridge(t) => t.mode(),
         }
     }
 
     pub fn session(&mut self) -> Option<&mut Session> {
-        match &mut self.target {
-            Target::Headless(s) => Some(s),
-            Target::Bridge(_) => None,
+        match &mut self.kind {
+            Kind::Headless(s) => Some(s),
+            Kind::Bridge(_) => None,
         }
     }
 
     /// The session's preferences when it is in this process: headless, or an app in this process
     /// (`mcp --ui`). `None` for an app in another process.
     pub fn session_prefs(&self) -> Option<Prefs> {
-        match &self.target {
-            Target::Headless(s) => Some(s.prefs.clone()),
-            Target::Bridge(t) => t.session_prefs(),
+        match &self.kind {
+            Kind::Headless(s) => Some(s.prefs.clone()),
+            Kind::Bridge(t) => t.session_prefs(),
         }
     }
 
@@ -97,19 +119,19 @@ impl Backend {
     /// an app in this process without waiting ([`ControlTransport::on_session`]). `None` when the
     /// session is in another process.
     pub fn queue_on_session(&mut self, job: SessionJob) -> Option<Result<()>> {
-        match &mut self.target {
-            Target::Headless(s) => {
+        match &mut self.kind {
+            Kind::Headless(s) => {
                 job(s);
                 Some(Ok(()))
             }
-            Target::Bridge(t) => t.on_session(job),
+            Kind::Bridge(t) => t.on_session(job),
         }
     }
 
     /// Run `f` on the session in this process and wait for its result (see
     /// [`Backend::queue_on_session`]). `None` when the session is in another process.
     pub fn with_session<R: Send + 'static>(&mut self, f: impl FnOnce(&mut Session) -> R + Send + 'static) -> Option<Result<R>> {
-        if let Target::Headless(s) = &mut self.target {
+        if let Kind::Headless(s) = &mut self.kind {
             return Some(Ok(f(s)));
         }
         let (tx, rx) = mpsc::channel();
@@ -126,7 +148,7 @@ impl Backend {
 
     /// Run an engine command by id (checked against the [`Confinement`], if any).
     pub fn exec(&mut self, id: &str, params: Value) -> Result<Value> {
-        let params = if params.is_null() { json!({}) } else { params };
+        let params = self.with_client(if params.is_null() { json!({}) } else { params });
         if let Some(c) = self.confinement.clone() {
             let lookup = match c.check_command(id, &params)? {
                 Some(crate::confine::Lookup::ProjectFile) => Some((crate::confine::Lookup::ProjectFile, self.run("project.summary", json!({}))?)),
@@ -141,8 +163,8 @@ impl Backend {
     }
 
     fn run(&mut self, id: &str, params: Value) -> Result<Value> {
-        match &mut self.target {
-            Target::Headless(s) => {
+        match &mut self.kind {
+            Kind::Headless(s) => {
                 let r = s.execute_checked(id, params);
                 // Toasts (user-facing warnings) stay for the MCP log; other events are dropped.
                 s.events.retain(|e| matches!(e, effectcraft_engine::Event::Toast { .. }));
@@ -150,15 +172,15 @@ impl Backend {
                 s.events.drain(..excess);
                 Ok(r?)
             }
-            Target::Bridge(b) => b.call("engine.execute", json!({"command": id, "params": params})),
+            Kind::Bridge(b) => b.call("engine.execute", json!({"command": id, "params": params})),
         }
     }
 
     /// Call a raw control-channel method (bridge only).
     pub fn control(&mut self, method: &str, params: Value) -> Result<Value> {
-        match &mut self.target {
-            Target::Bridge(b) => b.call(method, if params.is_null() { json!({}) } else { params }),
-            Target::Headless(_) => Err(Error::BadArgs(NEED_BRIDGE.into())),
+        match &mut self.kind {
+            Kind::Bridge(b) => b.call(method, if params.is_null() { json!({}) } else { params }),
+            Kind::Headless(_) => Err(Error::BadArgs(NEED_BRIDGE.into())),
         }
     }
 
@@ -168,9 +190,11 @@ impl Backend {
     pub fn render_view(&mut self, mut params: Value) -> Result<(Vec<u8>, Value)> {
         let max_side = params.get("max_side").and_then(Value::as_u64).unwrap_or(0).min(u32::MAX as u64) as u32;
         params["base64"] = json!(true);
-        let mut r = match &mut self.target {
-            Target::Bridge(b) => b.call("render.frame", params)?,
-            Target::Headless(_) => self.exec("render.frame", params)?,
+        // An agent with a `client` renders at its own time and comp: through the engine command,
+        // which runs on that client's cursor (the control method uses the user's).
+        let mut r = match (&mut self.kind, self.client.is_some()) {
+            (Kind::Bridge(b), false) => b.call("render.frame", params)?,
+            _ => self.exec("render.frame", params)?,
         };
         let raw = crate::tools::take_png(&mut r, "render.frame")?;
         // (an older app may ignore `max_side`)
@@ -195,15 +219,15 @@ impl Backend {
     /// [`Backend::render`]; `transparent` keeps the frame's alpha instead of compositing it over
     /// the comp's background colour.
     pub fn render_with(&mut self, comp: Option<&Value>, time: Option<f64>, max_side: u32, transparent: bool) -> Result<Frame> {
-        match &mut self.target {
-            Target::Headless(s) => {
+        match &mut self.kind {
+            Kind::Headless(s) => {
                 let cid = s.resolve_comp(comp).map_err(|_| no_comp(comp))?;
                 let t = time.map(Tick::from_seconds_f64).unwrap_or_else(|| s.time());
                 let (w, h, rgba) = s.render_rgba8_alpha(cid, t, max_side, transparent)?;
                 let png = encode_png(w, h, rgba, max_side)?;
                 Ok(Frame { png, comp: json!(cid.0), time: t.seconds(), width: w, height: h })
             }
-            Target::Bridge(b) => {
+            Kind::Bridge(b) => {
                 let mut p = json!({"max_side": max_side, "base64": true});
                 if transparent {
                     p["transparent"] = json!(true);

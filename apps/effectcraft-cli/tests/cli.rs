@@ -484,7 +484,13 @@ fn mcp_autosave_is_opt_in_and_rejects_invalid_combinations() {
     let mut client = McpChild::start(&config, false);
     client.tool("execute_command", json!({"command":"comp.new","params":{"name":"Ephemeral"}}));
     client.eof();
-    assert!(std::fs::read_dir(&config).unwrap().next().is_none());
+    // No auto-save without --autosave. The only trace is the host list folder (AN8: a headless
+    // MCP server announces itself in <config>/Hosts while it runs), and its entry is gone.
+    let left: Vec<PathBuf> = std::fs::read_dir(&config).unwrap().map(|e| e.unwrap().path()).collect();
+    assert!(left.iter().all(|p| p.file_name() == Some(std::ffi::OsStr::new(effectcraft_engine::hosts::HOSTS_FOLDER))), "{left:?}");
+    for hosts in &left {
+        assert!(std::fs::read_dir(hosts).unwrap().next().is_none(), "the host entry is withdrawn at EOF");
+    }
     for args in [["mcp", "--autosave", "--bridge", "1"].as_slice(), ["info", "--autosave"].as_slice()] {
         let out = bin().args(args).env("EFFECTCRAFT_CONFIG_DIR", &config).output().unwrap();
         assert_eq!(out.status.code(), Some(2));
@@ -555,4 +561,52 @@ fn replay_reports_steps_and_the_first_failure() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("failed at line 3 (comp.info)"));
     // The start line picks the project.
     assert_eq!(bin().args(["replay", bad.to_str().unwrap(), "--demo"]).output().unwrap().status.code(), Some(2));
+}
+
+/// Handover with two real processes: a windowless host (`serve`) has a project open with an
+/// agent's unsaved work in it. Opening that project in another process asks the host to save and
+/// stop, waits until it has, and opens the saved file, the agent's work included.
+#[cfg(unix)]
+#[test]
+fn opening_a_hosted_project_takes_it_over() {
+    /// Stops the host if the test fails before the handover does.
+    struct Kill(u32);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = Command::new("kill").arg(self.0.to_string()).status();
+        }
+    }
+    let config = tmp("handover-config");
+    let _ = std::fs::remove_dir_all(&config);
+    let project = tmp("handover.ecproj");
+    let _ = std::fs::remove_file(&project);
+    let mut host =
+        bin().args(["serve", "--demo", "--control", "0"]).env("EFFECTCRAFT_CONFIG_DIR", &config).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    let _kill = Kill(host.id());
+    let mut line = String::new();
+    BufReader::new(host.stdout.take().unwrap()).read_line(&mut line).unwrap();
+    let port: u16 =
+        line.split("127.0.0.1:").nth(1).and_then(|r| r.split_whitespace().next()).and_then(|p| p.parse().ok()).unwrap_or_else(|| panic!("no port in {line:?}"));
+    let call = |command: &str, params: Value| {
+        effectcraft_automation::host_server::request(port, "engine.execute", json!({"command": command, "params": params})).unwrap()
+    };
+    let r = call("file.saveAs", json!({"path": project}));
+    assert_eq!(r["ok"], true, "{r}");
+    let r = call("layer.newSolid", json!({"name": "Agent's unsaved work", "color": "#00ff00", "client": "agentA"}));
+    assert_eq!(r["ok"], true, "{r}");
+
+    // This process is "the app": it sees the host in the host list and opens the same file.
+    effectcraft_engine::hosts::init(&config);
+    let canonical = std::fs::canonicalize(&project).unwrap().to_string_lossy().into_owned();
+    let hosts = effectcraft_engine::hosts::list();
+    assert!(hosts.iter().any(|h| h["kind"] == "host" && h["project"] == canonical.as_str()), "{hosts:?}");
+    // Reap the host when it exits (a zombie child would still count as running).
+    let exited = std::thread::spawn(move || host.wait());
+    let mut s = effectcraft_host::session();
+    let opened = s.execute("file.open", json!({"path": project})).unwrap();
+    assert!(opened["handover"].as_str().unwrap_or_default().contains("took the project over"), "{opened}");
+    assert!(opened.get("openElsewhere").is_none(), "no second copy: {opened}");
+    assert!(exited.join().unwrap().unwrap().success(), "the host stopped cleanly");
+    assert!(serde_json::to_string(&*s.project).unwrap().contains("Agent's unsaved work"), "the agent's work came along");
+    assert!(effectcraft_engine::hosts::list().iter().all(|h| h["kind"] != "host"), "the host left the host list");
 }

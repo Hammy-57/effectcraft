@@ -39,6 +39,11 @@ fn demo(s: &mut Session, _: &Value) -> Result<Value> {
 
 pub(crate) fn open(s: &mut Session, p: &Value) -> Result<Value> {
     let path = str_p(p, "path").ok_or_else(|| bad("file.open", "missing `path`"))?;
+    // A windowless host holding it saves it and stops first (a handover, not a second copy).
+    let handover = crate::hosts::take_over(path);
+    if let Some(h) = &handover {
+        s.toast(h.clone());
+    }
     let bytes = s.services.read_file(path).map_err(|e| EngineError::Other(format!("cannot read {path}: {e}")))?;
     let text = String::from_utf8(bytes).map_err(|_| EngineError::Other("not a text project file".into()))?;
     // XML copies (File ▸ Save a Copy As XML…) open like the JSON project.
@@ -56,6 +61,13 @@ pub(crate) fn open(s: &mut Session, p: &Value) -> Result<Value> {
         let more = if more > 0 { format!(" and {more} more") } else { String::new() };
         s.toast(format!("This project had values outside EffectCraft's limits, corrected when it opened: {shown}{more}."));
     }
+    // The save guard compares against the file as opened; other processes with it open are named.
+    crate::hosts::remember(path);
+    crate::hosts::set_project(Some(path));
+    let elsewhere = crate::hosts::others_with(path);
+    if let Some(w) = crate::hosts::open_elsewhere_warning(path, &elsewhere) {
+        s.toast(w);
+    }
     // Written by a newer EffectCraft: what this version doesn't know would be lost on saving.
     let saved_by = effectcraft_project::saved_by(&text);
     if let Some(v) = saved_by.as_deref().filter(|v| effectcraft_project::is_newer_version(v, effectcraft_project::APP_VERSION)) {
@@ -69,7 +81,14 @@ pub(crate) fn open(s: &mut Session, p: &Value) -> Result<Value> {
     if s.check_footage_on_open {
         crate::footage_check::start(s, None, false)?;
     }
-    Ok(json!({"path": path, "savedBy": saved_by, "repaired": repaired}))
+    let mut out = json!({"path": path, "savedBy": saved_by, "repaired": repaired});
+    if let Some(h) = handover {
+        out["handover"] = json!(h);
+    }
+    if !elsewhere.is_empty() {
+        out["openElsewhere"] = json!(elsewhere);
+    }
+    Ok(out)
 }
 
 /// Footage saved with a relative path (imported by the CLI or an agent as `clip.mp4`, or written
@@ -102,9 +121,16 @@ pub(crate) fn file_text(s: &Session, path: &str) -> Result<String> {
     if crate::xml_project::is_xml_path(path) { crate::xml_project::to_xml(&json).map_err(EngineError::Other) } else { Ok(json) }
 }
 
-fn save_to(s: &mut Session, path: &str) -> Result<Value> {
+/// Save to `path`; refused when the file changed on disk since this process opened or saved it
+/// (someone else's work), unless `force` ([`crate::hosts`]).
+fn save_to(s: &mut Session, path: &str, force: bool) -> Result<Value> {
+    if !force {
+        crate::hosts::check_unchanged(path)?;
+    }
     let json = file_text(s, path)?;
     s.services.write_file(path, json.as_bytes()).map_err(|e| EngineError::Other(format!("cannot write {path}: {e}")))?;
+    crate::hosts::remember(path);
+    crate::hosts::set_project(Some(path));
     s.path = Some(path.to_string());
     s.mark_saved();
     s.note_project_path(path);
@@ -114,19 +140,19 @@ fn save_to(s: &mut Session, path: &str) -> Result<Value> {
 
 fn save(s: &mut Session, p: &Value) -> Result<Value> {
     let path = str_p(p, "path").map(str::to_string).or_else(|| s.path.clone()).ok_or_else(|| bad("file.save", "no path: use file.saveAs {path}"))?;
-    save_to(s, &path)
+    save_to(s, &path, b_p(p, "force").unwrap_or(false))
 }
 
 fn save_as(s: &mut Session, p: &Value) -> Result<Value> {
     let path = str_p(p, "path").ok_or_else(|| bad("file.saveAs", "missing `path`"))?;
-    save_to(s, path)
+    save_to(s, path, b_p(p, "force").unwrap_or(false))
 }
 
 fn increment_save(s: &mut Session, _: &Value) -> Result<Value> {
     let cur = s.path.clone().ok_or_else(|| bad("file.incrementAndSave", "save the project first"))?;
     // After Effects: `Intro.aep` → `Intro 2.aep` → `Intro 3.aep`.
     let next = crate::autosave::increment_path(&cur, |p| s.file_ops().is_file(std::path::Path::new(p)));
-    save_to(s, &next)
+    save_to(s, &next, false)
 }
 
 fn revert(s: &mut Session, _: &Value) -> Result<Value> {
@@ -245,6 +271,8 @@ struct PendingImport {
     comps: Vec<u64>,
     items: Vec<u64>,
     errors: Vec<String>,
+    /// EffectCraft projects merged in (`file.importProject` results); never added to a comp.
+    projects: Vec<Value>,
 }
 
 /// Everything probing a file needs, apart from the session (it can run on a background thread).
@@ -370,10 +398,18 @@ fn prepare_import(s: &mut Session, p: &Value) -> Result<PendingImport> {
             _ => return Err(bad("file.import", "page: a page number from 1")),
         },
     };
-    let mut paths = paths;
     let mut comps = vec![];
     let mut items = vec![];
     let mut errors = vec![];
+    // EffectCraft projects import as projects, as After Effects imports an .aep.
+    let (project_paths, mut paths): (Vec<String>, Vec<String>) = paths.into_iter().partition(|x| super::import_project::is_project_path(x));
+    let mut projects = vec![];
+    for path in project_paths {
+        match s.execute("file.importProject", json!({"path": path})) {
+            Ok(r) => projects.push(r),
+            Err(e) => errors.push(format!("{path}: {e}")),
+        }
+    }
     if let Some(retain) = retain {
         let mut rest = vec![];
         for path in paths {
@@ -424,13 +460,13 @@ fn prepare_import(s: &mut Session, p: &Value) -> Result<PendingImport> {
         page,
         psd_layer: p.get("layer").cloned(),
     };
-    Ok(PendingImport { sources, prober, comps, items, errors })
+    Ok(PendingImport { sources, prober, comps, items, errors, projects })
 }
 
 /// The last part of an import: add the probed files to the project (one undo step) and select
 /// everything the import made, so the Project panel shows it.
 fn add_footage(s: &mut Session, pending: PendingImport, probed: Vec<std::result::Result<Probed, String>>) -> Result<Value> {
-    let PendingImport { comps, mut items, mut errors, .. } = pending;
+    let PendingImport { comps, mut items, mut errors, projects, .. } = pending;
     let mut found = vec![];
     let mut warnings = vec![];
     for r in probed {
@@ -482,7 +518,11 @@ fn add_footage(s: &mut Session, pending: PendingImport, probed: Vec<std::result:
     if let Some(first) = asked.first() {
         s.events.push(crate::Event::Frontend { command: "file.interpretFootage".into(), params: json!({"item": first, "reason": "unlabeledAlpha"}) });
     }
-    Ok(json!({"items": items, "comps": comps, "errors": errors, "warnings": warnings, "unlabeledAlpha": asked}))
+    let mut out = json!({"items": items, "comps": comps, "errors": errors, "warnings": warnings, "unlabeledAlpha": asked});
+    if !projects.is_empty() {
+        out["projects"] = Value::Array(projects);
+    }
+    Ok(out)
 }
 
 /// Whether a file format states how its alpha is stored (PNG, GIF, WebP and PSD are straight by
@@ -711,8 +751,8 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("file.newProject", "New Project", ["File", "New"], Some("Cmd+Alt+N"), "{}", always, new_project),
         cmd!("file.openDemoProject", "Open Demo Project", ["Help"], None, "{}", always, demo),
         cmd!("file.open", "Open Project...", ["File"], Some("Cmd+O"), "{path}", always, open),
-        cmd!("file.save", "Save", ["File"], Some("Cmd+S"), "{path?}", always, save),
-        cmd!("file.saveAs", "Save As...", ["File", "Save As"], Some("Cmd+Shift+S"), "{path}", always, save_as),
+        cmd!("file.save", "Save", ["File"], Some("Cmd+S"), "{path?, force? (overwrite a file changed on disk since it was opened)}", always, save),
+        cmd!("file.saveAs", "Save As...", ["File", "Save As"], Some("Cmd+Shift+S"), "{path, force?}", always, save_as),
         cmd!("file.incrementAndSave", "Increment and Save", ["File"], Some("Cmd+Alt+Shift+S"), "{}", has_path, increment_save),
         cmd!("file.revert", "Revert", ["File"], None, "{}", has_path, revert),
         cmd!(

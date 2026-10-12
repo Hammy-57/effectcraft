@@ -1,0 +1,111 @@
+{
+  "id": "fix-contrast",
+  "title": "Fix low contrast",
+  "prompt": "In the comp \"Main\", the dark text layer \"Headline\" is hard to read on the dark shape layer \"Card\" behind it. Fix the contrast by changing Card's fill colour to a light colour (red, green and blue each at least 80%), leaving the text and its colour as they are.",
+  "setup": [
+    {
+      "command": "comp.new",
+      "params": {
+        "name": "Main",
+        "width": 1920,
+        "height": 1080,
+        "frameRate": 30,
+        "duration": 5
+      }
+    },
+    {
+      "command": "layer.newShape",
+      "params": {
+        "name": "Card",
+        "kind": "rect",
+        "size": [
+          1400,
+          400
+        ],
+        "fill": "#2A2A2A",
+        "position": [
+          960,
+          540
+        ]
+      }
+    },
+    {
+      "command": "layer.newText",
+      "params": {
+        "text": "Read me",
+        "size": 120,
+        "position": [
+          960,
+          580
+        ],
+        "fill": "#3A3A3A",
+        "name": "Headline"
+      }
+    }
+  ],
+  "limits": {
+    "minutes": 5,
+    "toolCalls": 25
+  },
+  "checks": [
+    {
+      "id": "card-light",
+      "desc": "Card's fill is light",
+      "prop": {
+        "comp": "Main",
+        "layer": "Card",
+        "path": "contents/group/contents/fill/color"
+      },
+      "op": "all",
+      "value": {
+        "op": "gte",
+        "value": 0.8
+      }
+    },
+    {
+      "id": "text",
+      "desc": "the text is unchanged",
+      "prop": {
+        "comp": "Main",
+        "layer": "Headline",
+        "path": "text/sourceText"
+      },
+      "op": "eq",
+      "value": "Read me"
+    },
+    {
+      "layerCount": {
+        "comp": "Main"
+      },
+      "id": "count",
+      "desc": "still two layers",
+      "op": "eq",
+      "value": 2
+    },
+    {
+      "id": "contrast",
+      "desc": "render.lint finds no contrast problem",
+      "lint": {
+        "comp": "Main",
+        "rules": [
+          "low-contrast"
+        ]
+      }
+    }
+  ],
+  "solution": [
+    {
+      "command": "prop.set",
+      "params": {
+        "layer": "Card",
+        "path": "contents/group/contents/fill/color",
+        "value": [
+          0.95,
+          0.95,
+          0.95,
+          1
+        ]
+      }
+    }
+  ]
+}

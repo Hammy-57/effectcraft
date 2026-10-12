@@ -151,7 +151,7 @@ pub(crate) fn entry(app: &EffectcraftApp, e: &MenuEntry, shown: String) -> Strin
         _ => return shown,
     };
     match e.command.as_str() {
-        "edit.undo" => app.session.history.undo.last().map(|u| format!("{undo} {}", u.0)).unwrap_or_else(|| no_undo.into()),
+        "edit.undo" => effectcraft_engine::selective_undo::own_undo_label(&app.session, None).map(|l| format!("{undo} {l}")).unwrap_or_else(|| no_undo.into()),
         "edit.redo" => app.session.history.redo.last().map(|u| format!("{redo} {}", u.0)).unwrap_or_else(|| no_redo.into()),
         "window.panel" => {
             let prefix = format!("{}: ", e.label);
@@ -303,6 +303,7 @@ const SIMPLIFIED_CHINESE: &[(&str, &str, &str)] = &[
     ("file.import", "File...", "文件..."),
     ("file.importMultiple", "Multiple Files...", "多个文件..."),
     ("file.importTimeline", "Adobe Premiere Pro Project...", "Adobe Premiere Pro 项目..."),
+    ("file.importProject", "EffectCraft Project...", "EffectCraft 项目..."),
     ("file.importPlaceholder", "Placeholder...", "占位符..."),
     ("file.importSolid", "Solid...", "纯色..."),
     ("file.importLottie", "Lottie...", "Lottie..."),
@@ -933,6 +934,7 @@ const TRADITIONAL_CHINESE: &[(&str, &str, &str)] = &[
     ("file.import", "File...", "檔案..."),
     ("file.importMultiple", "Multiple Files...", "多個檔案..."),
     ("file.importTimeline", "Adobe Premiere Pro Project...", "Adobe Premiere Pro 專案..."),
+    ("file.importProject", "EffectCraft Project...", "EffectCraft 專案..."),
     ("file.importPlaceholder", "Placeholder...", "預留位置..."),
     ("file.importSolid", "Solid...", "純色..."),
     ("file.importLottie", "Lottie...", "Lottie..."),
@@ -1563,6 +1565,7 @@ const JAPANESE: &[(&str, &str, &str)] = &[
     ("file.importPlaceholder", "Placeholder...", "プレースホルダー..."),
     ("file.importSolid", "Solid...", "平面..."),
     ("file.importLottie", "Lottie...", "Lottie..."),
+    ("file.importProject", "EffectCraft Project...", "EffectCraftプロジェクト..."),
     ("file.importVanishingPoint", "Vanishing Point (.vpe)...", "Vanishing Point (.vpe)..."),
     ("essential.importTemplate", "Essential Graphics Template...", "エッセンシャルグラフィックステンプレート..."),
     ("", "Import Recent Footage", "最近使用したフッテージを読み込み"),
@@ -2190,6 +2193,7 @@ const UKRAINIAN: &[(&str, &str, &str)] = &[
     ("file.import", "File...", "Файл..."),
     ("file.importMultiple", "Multiple Files...", "Кілька файлів..."),
     ("file.importTimeline", "Adobe Premiere Pro Project...", "Проєкт Adobe Premiere Pro..."),
+    ("file.importProject", "EffectCraft Project...", "Проєкт EffectCraft..."),
     ("file.importPlaceholder", "Placeholder...", "Заповнювач..."),
     ("file.importSolid", "Solid...", "Суцільний колір..."),
     ("file.importLottie", "Lottie...", "Lottie..."),

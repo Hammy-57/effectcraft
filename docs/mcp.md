@@ -106,7 +106,7 @@ result as `structuredContent` as well as the JSON text block older clients read.
 object: an array result is `{"items": [...]}`, a scalar `{"value": v}`, and an image reply carries
 its metadata (`comp`, `time`, `width`, `height`, `path?`). Tools with a stable shape declare it as
 `outputSchema` in `tools/list`: `get_state`, `doc_inspect`, `render_preview`, `render_frames`,
-`render_snapshot`, `render_compare`, `get_layout`, `analyze_audio`, `undo`, `redo`, `history`,
+`render_snapshot`, `render_compare`, `get_layout`, `get_motion`, `lint_frame`, `analyze_audio`, `undo`, `redo`, `history`,
 `command_batch`, `batch` and `save_project`. Earlier revisions see neither field.
 Long renders (below) reply with text only.
 
@@ -144,6 +144,8 @@ Each wraps an engine command, so the CLI, scripts (`app.run`) and the control ch
 | Tool | Command | Result |
 | --- | --- | --- |
 | `get_layout` | `layer.bounds` | Per layer: `visible` + `why`, comp-space `bounds`, `corners`, `center`, `anchorInComp`, `onScreen`, `source`; optional `pixelBounds` and `overlaps` |
+| `lint_frame` | `render.lint` | Design problems at a time or over a range (`clean`, `counts`, `problems` with rule, severity, layer, time..until and a fix hint); rules in [agents.md](agents.md#design-lint) |
+| `get_motion` | `comp.motion` / `layer.motion` | Per layer over a time range: `segments` (enter, exit, move, hold, scale, rotate, fade-in, fade-out), `offscreen` intervals, a `summary` sentence; `overlaps` between drawn layers ([agents.md](agents.md#motion-summary)) |
 | `analyze_audio` | `audio.analyze` | Peak, true peak, RMS, integrated LUFS, clipped samples, silences, channels; optional waveform |
 
 - **Geometry** is `sourceRectAtTime` through the transform, parents and, for 3D layers, the
@@ -186,6 +188,25 @@ with `logger: "effectcraft"` and `data: {message, …}`:
 In bridge mode only the expression check applies; the app shows its own toasts and footage
 checks.
 
+## Retries
+
+A `tools/call` with `params._meta.requestId` (or a `request_id` argument, which is removed before
+argument checking) is idempotent: the same id again returns the first result without running the
+tool (last 128 ids). Bridge calls also send a `requestId` on the control channel, so the bridge's
+reconnect-and-resend never runs a command twice.
+
+## Several agents (`client`)
+
+Every tool takes an optional `client` argument, the agent's name (a string of at most 128 bytes;
+`""` runs that call as the user). The engine commands the call runs carry it, so the agent works on its own selection, active
+comp and current time (render tools default to that time) and can reserve comps with
+`command_run comp.claim`; another agent's edit to a claimed comp is a tool error naming the owner.
+`effectcraft-cli mcp --client NAME` (or `EFFECTCRAFT_CLIENT`) runs every call as `NAME`; a call's own
+`client` overrides it. Without either, a bridged server (`--bridge`) names itself at `initialize`
+(`<clientInfo.name>-<pid>`, e.g. `claude-code-4821`), and headless and `--ui` servers act on the
+user's cursor. Details:
+[agents.md](agents.md#several-agents-at-once).
+
 ## Prompts
 
 `prompts/list` and `prompts/get` serve workflow recipes. Each one is a single user message that spells
@@ -201,18 +222,6 @@ out the tool flow (canonical tool names, the layer-time versus comp-time pitfall
 
 Argument values are strings. A missing required argument, an unknown argument or prompt, or a
 non-string value returns `-32602`.
-
-## Change notifications and retries
-
-The server advertises `resources.subscribe`. After `resources/subscribe {uri:
-"effectcraft://document"}`, every tool call that changed the project revision is followed by
-`notifications/resources/updated {uri}` (bridge mode reads the app's revision after each call,
-so edits made in the window are reported with the next call). `resources/unsubscribe` stops it.
-
-A `tools/call` with `params._meta.requestId` (or a `request_id` argument, which is removed before
-argument checking) is idempotent: the same id again returns the first result without running the
-tool (last 128 ids). Bridge calls also send a `requestId` on the control channel, so the bridge's
-reconnect-and-resend never runs a command twice.
 
 ## Progress and cancellation
 
@@ -254,7 +263,7 @@ sort comparator) that never calls the object model is only stopped by the loop-i
 Bridged scripts honour `timeout` (in the app) but can't be cancelled.
 
 Batch tools (`batch`, `command_batch`), single-frame tools, other synchronous commands
-(`render.saveCurrentPreview`, `file.importAep`, `layer.autoTrace`, imports without `background`)
+(`render.saveCurrentPreview`, `layer.autoTrace`, imports without `background`)
 and every call with `wait: false` stay synchronous: no progress, no cancellation.
 
 ### Requests during a render

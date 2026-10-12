@@ -1,0 +1,227 @@
+{
+  "id": "reframe-vertical",
+  "title": "Reframe 16:9 to 9:16",
+  "prompt": "Reframe the comp \"Promo\" (now 1920×1080) for vertical video: make it 1080×1920 (keep the name), make the solid \"BG\" cover the whole new frame, and place the text layer \"Title\" and the solid \"Logo\" fully inside the title-safe area of the new frame (10% margins: x 108–972, y 192–1728). Keep all three layers.",
+  "setup": [
+    {
+      "command": "comp.new",
+      "params": {
+        "name": "Promo",
+        "width": 1920,
+        "height": 1080,
+        "frameRate": 30,
+        "duration": 5
+      }
+    },
+    {
+      "command": "layer.newSolid",
+      "params": {
+        "name": "BG",
+        "color": "#222244"
+      }
+    },
+    {
+      "command": "layer.newText",
+      "params": {
+        "text": "BIG NEWS",
+        "size": 120,
+        "position": [
+          960,
+          560
+        ],
+        "fill": "#FFFFFF",
+        "name": "Title"
+      }
+    },
+    {
+      "command": "layer.newSolid",
+      "params": {
+        "name": "Logo",
+        "color": "#FFCC00",
+        "width": 200,
+        "height": 200
+      }
+    },
+    {
+      "command": "prop.set",
+      "params": {
+        "layer": "Logo",
+        "path": "transform/position",
+        "value": [
+          1600,
+          800,
+          0
+        ]
+      }
+    }
+  ],
+  "limits": {
+    "minutes": 10,
+    "toolCalls": 40
+  },
+  "checks": [
+    {
+      "id": "size",
+      "desc": "Promo is 1080 × 1920",
+      "comp": {
+        "name": "Promo"
+      },
+      "width": 1080,
+      "height": 1920
+    },
+    {
+      "layerCount": {
+        "comp": "Promo"
+      },
+      "id": "count",
+      "desc": "three layers",
+      "op": "eq",
+      "value": 3
+    },
+    {
+      "id": "bg-covers",
+      "desc": "BG covers the frame",
+      "query": "layer.bounds",
+      "params": {
+        "comp": "Promo",
+        "layers": [
+          "BG"
+        ]
+      },
+      "select": {
+        "array": "/layers",
+        "index": 0
+      },
+      "expect": [
+        {
+          "path": "/bounds/0",
+          "op": "lte",
+          "value": 0
+        },
+        {
+          "path": "/bounds/1",
+          "op": "lte",
+          "value": 0
+        },
+        {
+          "path": "/corners",
+          "op": "any",
+          "value": [
+            {
+              "path": "/0",
+              "op": "gte",
+              "value": 1080
+            },
+            {
+              "path": "/1",
+              "op": "gte",
+              "value": 1920
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "safe",
+      "desc": "Title and Logo inside the vertical title-safe area",
+      "query": "layer.bounds",
+      "params": {
+        "comp": "Promo",
+        "layers": [
+          "Title",
+          "Logo"
+        ]
+      },
+      "expect": [
+        {
+          "path": "/layers",
+          "op": "len",
+          "value": 2
+        },
+        {
+          "path": "/layers",
+          "op": "all",
+          "value": [
+            {
+              "path": "/visible",
+              "op": "eq",
+              "value": true
+            },
+            {
+              "path": "/corners",
+              "op": "all",
+              "value": [
+                {
+                  "path": "/0",
+                  "op": "gte",
+                  "value": 108
+                },
+                {
+                  "path": "/0",
+                  "op": "lte",
+                  "value": 972
+                },
+                {
+                  "path": "/1",
+                  "op": "gte",
+                  "value": 192
+                },
+                {
+                  "path": "/1",
+                  "op": "lte",
+                  "value": 1728
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "readable",
+      "desc": "render.lint finds no tiny or low-contrast text",
+      "lint": {
+        "comp": "Promo",
+        "rules": [
+          "text-too-small",
+          "low-contrast"
+        ]
+      }
+    }
+  ],
+  "solution": [
+    {
+      "command": "comp.settings",
+      "params": {
+        "comp": "Promo",
+        "width": 1080,
+        "height": 1920,
+        "anchor": 4
+      }
+    },
+    {
+      "command": "prop.set",
+      "params": {
+        "layer": "BG",
+        "path": "transform/scale",
+        "value": [
+          180,
+          180,
+          100
+        ]
+      }
+    },
+    {
+      "command": "prop.set",
+      "params": {
+        "layer": "Logo",
+        "path": "transform/position",
+        "value": [
+          540,
+          1500,
+          0
+        ]
+      }
+    }
+  ]
+}

@@ -19,6 +19,7 @@ mod create;
 mod edit;
 mod effect;
 pub mod essential;
+pub(crate) mod exam_cmds;
 pub mod expr_tools;
 mod file;
 pub(crate) mod file_more;
@@ -27,6 +28,8 @@ pub mod footage_panel;
 pub(crate) mod frame_export;
 mod frontend;
 mod help;
+pub(crate) mod hosts;
+mod import_project;
 mod journal;
 mod key_labels;
 mod key_transform;
@@ -35,13 +38,16 @@ mod layer;
 mod layer_menu;
 mod layer_time;
 mod layout_cmds;
+mod library;
 pub(crate) mod link;
+mod lint_cmds;
 mod liquify;
 mod lottie;
 pub mod markers;
 mod mask;
 pub mod mask_interp;
 pub(crate) mod model3d;
+mod motion_cmds;
 pub mod paint;
 pub mod panels_cmds;
 pub(crate) mod path_nulls;
@@ -241,6 +247,14 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(crate::preview::specs());
         v.extend(render_compare::specs());
         v.extend(crate::render_view::specs());
+        v.extend(import_project::specs());
+        v.extend(library::specs());
+        v.extend(exam_cmds::specs());
+        v.extend(lint_cmds::specs());
+        v.extend(motion_cmds::specs());
+
+        v.extend(crate::agents::specs());
+        v.extend(hosts::specs());
         v
     })
 }

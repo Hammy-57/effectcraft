@@ -56,7 +56,8 @@ impl ToolDef {
         let Some(m) = args.as_object() else { return Some("arguments must be an object".into()) };
         let schema = self.input_schema();
         let props = schema.get("properties")?.as_object()?;
-        let bad = m.keys().find(|k| !props.contains_key(*k))?;
+        // `client` (who the agent is) goes with every tool: see `server::guarded_run`.
+        let bad = m.keys().find(|k| k.as_str() != "client" && !props.contains_key(*k))?;
         let accepted: Vec<&str> = props.keys().map(String::as_str).collect();
         // `command` ↔ `id` is the usual mix-up between the command tools; else the closest name.
         let hint = match bad.as_str() {
@@ -85,6 +86,8 @@ const READ_ONLY: &[&str] = &[
     "ui_inspect",
     "ui_elements",
     "get_layout",
+    "lint_frame",
+    "get_motion",
 ];
 /// Tools that write files (or keep session-side frames) without changing the project.
 const WRITES_FILES: &[&str] =
@@ -213,6 +216,49 @@ pub fn output_schema(name: &str) -> Option<Value> {
         ),
         "batch" => object(json!({"steps": int, "results": {"type": "array"}}), &["steps", "results"]),
         "save_project" => object(json!({"path": {"type": ["string", "null"]}, "dirty": {"type": "boolean"}}), &["path", "dirty"]),
+        "lint_frame" => {
+            let problem = object(
+                json!({
+                    "rule": {"type": "string", "enum": effectcraft_engine::lint::RULES},
+                    "severity": {"type": "string", "enum": ["error", "warning", "info"]},
+                    "layer": int, "layerName": {"type": "string"},
+                    "time": {"type": "number", "description": "First sample time it occurs at (comp seconds)."},
+                    "until": {"type": "number", "description": "Last sample time it occurs at (comp seconds)."},
+                    "message": {"type": "string"},
+                    "other": {"type": "integer", "description": "The second layer of a pair (text-overlap, the cover of hidden-visible)."},
+                    "otherName": {"type": "string"}
+                }),
+                &["rule", "severity", "layer", "layerName", "time", "until", "message"],
+            );
+            object(
+                json!({
+                    "comp": int, "compName": {"type": "string"},
+                    "times": {"type": "array", "items": {"type": "number"}}, "truncated": {"type": "boolean"},
+                    "clean": {"type": "boolean", "description": "No errors or warnings (info doesn't count)."},
+                    "counts": object(json!({"error": int, "warning": int, "info": int}), &["error", "warning", "info"]),
+                    "rules": {"type": "array", "items": {"type": "string"}},
+                    "problems": {"type": "array", "items": problem},
+                    "notes": {"type": "array", "items": {"type": "string"}}
+                }),
+                &["comp", "compName", "times", "truncated", "clean", "counts", "problems"],
+            )
+        }
+        "get_motion" => {
+            let num = json!({"type": "number"});
+            let seg = object(
+                json!({"kind": {"type": "string", "enum": ["enter", "exit", "move", "hold", "scale", "rotate", "fade-in", "fade-out"]}, "start": num, "end": num, "from": {}, "to": {}, "direction": {"type": "string"}, "edge": {"type": "string"}}),
+                &["kind", "start", "end"],
+            );
+            let span = object(json!({"start": num, "end": num}), &["start", "end"]);
+            object(
+                json!({
+                    "comp": int, "compName": {"type": "string"}, "start": num, "end": num, "step": num, "truncated": {"type": "boolean"},
+                    "layers": {"type": "array", "items": object(json!({"layer": int, "name": {"type": "string"}, "inPoint": num, "outPoint": num, "segments": {"type": "array", "items": seg}, "offscreen": {"type": "array", "items": span}, "summary": {"type": "string"}}), &["layer", "name", "segments", "offscreen", "summary"])},
+                    "overlaps": {"type": "array", "items": object(json!({"a": int, "b": int, "aName": {"type": "string"}, "bName": {"type": "string"}, "start": num, "end": num, "maxFraction": num}), &["a", "b", "start", "end", "maxFraction"])}
+                }),
+                &["comp", "start", "end", "step", "truncated", "layers", "overlaps"],
+            )
+        }
         _ => return None,
     })
 }
@@ -769,6 +815,49 @@ fn open_project(b: &mut Backend, a: &Value) -> Result<Reply> {
     get_project(b, &json!({}))
 }
 
+/// `hosts`: where projects are open; `join` switches this server to one of them (a running app or
+/// another host with a control port), keeping the agent's name so it works on its own cursor.
+fn hosts(b: &mut Backend, a: &Value) -> Result<Reply> {
+    let list = b.exec("hosts.list", json!({}))?;
+    let Some(join) = get(a, "join") else { return json_reply(list) };
+    let hosts = list["hosts"].as_array().cloned().unwrap_or_default();
+    let port = match join {
+        Value::Number(n) => n.as_u64().and_then(|p| u16::try_from(p).ok()).ok_or_else(|| Error::BadArgs(format!("`join`: {n} is not a port")))?,
+        Value::String(project) => {
+            let wanted = std::fs::canonicalize(project).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| project.clone());
+            let name = std::path::Path::new(project).file_name().map(|n| n.to_string_lossy().into_owned());
+            let found = hosts.iter().find(|h| h["project"].as_str() == Some(wanted.as_str())).or_else(|| {
+                hosts.iter().find(|h| {
+                    name.as_deref()
+                        .is_some_and(|n| h["project"].as_str().and_then(|p| std::path::Path::new(p).file_name()).is_some_and(|f| f.to_string_lossy() == n))
+                })
+            });
+            let h =
+                found.ok_or_else(|| Error::BadArgs(format!("no running EffectCraft has {project} open (see `hosts`); open it with open_project instead")))?;
+            h["port"].as_u64().and_then(|p| u16::try_from(p).ok()).ok_or_else(|| {
+                Error::BadArgs(format!(
+                    "{project} is open in {} {}, which agents can't join (no control port)",
+                    h["kind"].as_str().unwrap_or("a process"),
+                    h["pid"]
+                ))
+            })?
+        }
+        other => return Err(Error::BadArgs(format!("`join` is a port or a project path, not {other}"))),
+    };
+    // Leaving a headless project: never drop unsaved work.
+    if let Some(s) = b.session()
+        && s.is_dirty()
+    {
+        return Err(Error::BadArgs("this server's project has unsaved changes: save_project first, then join".into()));
+    }
+    let mut next = Backend::bridge(&port.to_string())?;
+    next.set_client(Some(b.client().map(str::to_string).unwrap_or_else(|| format!("mcp-{}", std::process::id()))));
+    let summary = next.exec("project.summary", json!({}))?;
+    let client = next.client().map(str::to_string);
+    *b = next;
+    json_reply(json!({"joined": port, "client": client, "project": summary}))
+}
+
 fn save_project(b: &mut Backend, a: &Value) -> Result<Reply> {
     match get(a, "path") {
         Some(p) => b.exec("file.saveAs", json!({"path": p}))?,
@@ -846,6 +935,43 @@ fn get_layout(b: &mut Backend, a: &Value) -> Result<Reply> {
     let p =
         obj(&[("comp", get(a, "comp")), ("time", get(a, "time")), ("layers", layers.as_ref()), ("pixels", get(a, "pixels")), ("overlaps", get(a, "overlaps"))]);
     json_reply(b.exec("layer.bounds", p)?)
+}
+
+fn lint_frame(b: &mut Backend, a: &Value) -> Result<Reply> {
+    let rules = match get(a, "rules") {
+        Some(Value::String(r)) => Some(json!([r])),
+        other => other.cloned(),
+    };
+    let p = obj(&[
+        ("comp", get(a, "comp")),
+        ("time", get(a, "time")),
+        ("start", get(a, "start")),
+        ("end", get(a, "end")),
+        ("step", get(a, "step")),
+        ("rules", rules.as_ref()),
+        ("minTextPx", get(a, "min_text_px")),
+        ("minContrast", get(a, "min_contrast")),
+    ]);
+    json_reply(b.exec("render.lint", p)?)
+}
+
+fn get_motion(b: &mut Backend, a: &Value) -> Result<Reply> {
+    let range = [("comp", get(a, "comp")), ("start", get(a, "start")), ("end", get(a, "end")), ("step", get(a, "step"))];
+    if let Some(l) = get(a, "layer") {
+        let mut p = obj(&range);
+        p["layer"] = l.clone();
+        return json_reply(b.exec("layer.motion", p)?);
+    }
+    let layers = match get(a, "layers") {
+        Some(Value::Array(v)) => Some(json!(v)),
+        Some(v) => Some(json!([v])),
+        None => None,
+    };
+    let mut p = obj(&range);
+    if let Some(l) = layers {
+        p["layers"] = l;
+    }
+    json_reply(b.exec("comp.motion", p)?)
 }
 
 fn analyze_audio(b: &mut Backend, a: &Value) -> Result<Reply> {
@@ -1239,6 +1365,27 @@ static TOOLS: &[ToolDef] = &[
         run: get_layout,
     },
     ToolDef {
+        name: "lint_frame",
+        description: "Design lint (render.lint): plain-language design problems in a comp at one time (`time`, default the current time) or over `start`..`end` (sampled every `step` s plus in points and keyframes, at most 120 samples). Rules: text-too-small (on-screen font size under min_text_px, default comp height / 30), low-contrast (WCAG ratio of text against what is under it under min_contrast, default 3:1), outside-title-safe (text), outside-action-safe, cut-off (partly outside the frame), text-overlap, hidden-visible (switched on but off-screen, transparent or covered), off-beat (keyframes and in points just missing the audio's beat). Returns {clean, counts, problems: [{rule, severity, layer, layerName, time, until, message, other?}]}; each message says what to fix. Run it before calling a design done.",
+        bridge_only: false,
+        schema: || {
+            schema(
+                json!({
+                    "comp": comp_s(),
+                    "time": {"type": "number", "description": "One comp time in seconds (default: current time). Use start/end for a range instead."},
+                    "start": {"type": "number", "description": "Range start, comp seconds (default 0 when end is given)."},
+                    "end": {"type": "number", "description": "Range end, comp seconds (default the comp's duration when start is given)."},
+                    "step": {"type": "number", "description": "Seconds between range samples (default 0.5)."},
+                    "rules": {"type": "array", "items": {"type": "string", "enum": effectcraft_engine::lint::RULES}, "description": "Only these rules (default all)."},
+                    "min_text_px": {"type": "number", "description": "Smallest legible font size on screen, comp pixels (default comp height / 30)."},
+                    "min_contrast": {"type": "number", "description": "Smallest acceptable WCAG contrast ratio (default 3)."}
+                }),
+                &[],
+            )
+        },
+        run: lint_frame,
+    },
+    ToolDef {
         name: "analyze_audio",
         description: "Measure the comp's audio mix (what preview and export play) over [start, end) seconds (audio.analyze): peakDbfs, truePeakDbtp (4x oversampled), rmsDbfs, integratedLufs (ITU-R BS.1770, gated), momentary / short-term max LUFS, clippedSamples, silent ranges (below silence_db for at least min_silence s) and per-channel stats; null levels mean silence. `layer` measures one layer alone. `waveform: true` returns a waveform image (left channel on top, red where it clips). A comp without audio returns hasAudio: false.",
         bridge_only: false,
@@ -1261,6 +1408,25 @@ static TOOLS: &[ToolDef] = &[
             )
         },
         run: analyze_audio,
+    },
+    ToolDef {
+        name: "get_motion",
+        description: "How layers move over a time range, in words and numbers, without rendering (comp.motion / layer.motion): samples each layer's comp-space content box, opacity, scale and rotation (default the whole comp, every frame or coarser so a layer gets at most 600 samples; keyframe times are always sampled) and returns per layer `segments` {kind: enter|exit|move|hold|scale|rotate|fade-in|fade-out, start, end, from, to, direction (move/enter/exit: left, up-right...), edge (enter/exit: the frame edge)}, `offscreen` intervals and a one-sentence `summary` (\"Logo flies in from the left 0–1s, holds 1–4s, fades out 4–5s.\"), plus `overlaps` {a, b, start, end, maxFraction} between drawn layers (full-frame backgrounds left out). Times are comp seconds. Use it to check an animation's timing and choreography; render_frames shows the frames.",
+        bridge_only: false,
+        schema: || {
+            schema(
+                json!({
+                    "comp": comp_s(),
+                    "layer": layer_s(),
+                    "layers": {"type": "array", "items": layer_s(), "description": "Layers to describe (default every layer of the comp); `layer` describes one."},
+                    "start": {"type": "number", "description": "Start, comp seconds (default 0)."},
+                    "end": {"type": "number", "description": "End, comp seconds (default the comp's duration)."},
+                    "step": {"type": "number", "description": "Sampling step in seconds (default one frame, coarser for comps over ~10 s so a layer gets at most 600 samples)."}
+                }),
+                &[],
+            )
+        },
+        run: get_motion,
     },
     ToolDef {
         name: "render_frames",
@@ -1290,6 +1456,15 @@ static TOOLS: &[ToolDef] = &[
             )
         },
         run: render_frames,
+    },
+    ToolDef {
+        name: "hosts",
+        description: "Where projects are open: every running EffectCraft (the desktop app, headless servers) with its control port and project. `join` (a port, or the path of a project one of them has open) switches this server onto that host, as your own `client`, so you work in the same project as the user and other agents instead of on a copy (claim your comp with command_run comp.claim). Refused while this server's own project has unsaved changes.",
+        bridge_only: false,
+        schema: || {
+            schema(json!({"join": {"type": ["integer", "string"], "description": "A host's control port, or the path of a project a host has open."}}), &[])
+        },
+        run: hosts,
     },
     ToolDef {
         name: "open_project",

@@ -383,7 +383,7 @@ fn settings_buttons_stay_in_view_at_200_percent() {
 }
 
 /// Headless look at the panels (wgpu offscreen; needs a GPU adapter). Run with
-/// `PANELS_SNAPSHOT=/abs/dir cargo test -p effectcraft-ui-egui --test ui_panels -- --ignored`.
+/// `PANELS_SNAPSHOT=/abs/dir cargo test -p effectcraft-ui-egui --test ui ui_panels:: -- --ignored`.
 #[test]
 #[ignore]
 fn panels_snapshot() {

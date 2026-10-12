@@ -1394,10 +1394,11 @@ impl Project {
     pub fn fix_next_id(&mut self) {
         let mut m = self.next_id;
         for (id, it) in &self.items {
-            m = m.max(id.0 + 1);
+            // Saturating: a damaged file's ids must not overflow (the import then refuses it).
+            m = m.max(id.0.saturating_add(1));
             if let ItemKind::Comp(c) = &it.kind {
                 for l in &c.layers {
-                    m = m.max(l.id.0 + 1).max(l.props.max_uid() + 1);
+                    m = m.max(l.id.0.saturating_add(1)).max(l.props.max_uid().saturating_add(1));
                 }
             }
         }

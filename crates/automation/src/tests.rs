@@ -345,6 +345,68 @@ fn autosave_errors_preserve_tool_success_retry_and_fail_shutdown() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// Big checkpoints are throttled (a 1 GB project must not be rewritten after every agent edit):
+/// the change waits, `pending` says so, and the session's end writes it.
+#[test]
+fn autosave_throttles_big_checkpoints_and_flushes_at_the_end() {
+    let dir = autosave_test_dir("throttle");
+    let mut s = server().with_autosave(&dir).unwrap();
+    s.throttle_autosave(1, std::time::Duration::from_secs(3600));
+    call_json(&mut s, "execute_command", json!({"command": "comp.new", "params": {"name": "First"}}));
+    let path = autosave_status(&mut s)["latestPath"].as_str().unwrap().to_string();
+    call_json(&mut s, "execute_command", json!({"command": "comp.new", "params": {"name": "Second"}}));
+    assert!(!std::fs::read_to_string(&path).unwrap().contains("Second"), "throttled: not written yet");
+    assert_eq!(autosave_status(&mut s)["pending"], true);
+    s.serve(&b""[..], Vec::new()).unwrap();
+    let latest = s.backend().session().unwrap().autosave.last_path.clone().unwrap();
+    assert!(std::fs::read_to_string(latest).unwrap().contains("Second"), "the end of the session flushes the pending change");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Recovery copies clean themselves up: saving the project normally empties the session's folder,
+/// and a session that ends saved leaves nothing behind.
+#[test]
+fn autosave_folder_is_removed_once_the_project_is_saved() {
+    let dir = autosave_test_dir("cleanup");
+    let mut s = server().with_autosave(&dir).unwrap();
+    call_json(&mut s, "execute_command", json!({"command": "comp.new", "params": {"name": "Saved later"}}));
+    let status = autosave_status(&mut s);
+    let folder = std::path::PathBuf::from(status["folder"].as_str().unwrap());
+    assert!(std::path::Path::new(status["latestPath"].as_str().unwrap()).is_file());
+    call_json(&mut s, "save_project", json!({"path": dir.join("Saved.ecproj")}));
+    assert!(!folder.exists(), "saved normally: the recovery copies are gone");
+    assert_eq!(autosave_status(&mut s)["latestPath"], Value::Null);
+    // A later change checkpoints again into a recreated folder.
+    call_json(&mut s, "execute_command", json!({"command": "comp.new", "params": {"name": "After save"}}));
+    assert!(std::fs::read_to_string(autosave_status(&mut s)["latestPath"].as_str().unwrap()).unwrap().contains("After save"));
+    call_json(&mut s, "save_project", json!({}));
+    s.serve(&b""[..], Vec::new()).unwrap();
+    assert!(!folder.exists());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A new session prunes folders of finished, saved sessions and any folder untouched for 30 days;
+/// recent unsaved work and folders it didn't make stay.
+#[test]
+fn autosave_prunes_finished_and_abandoned_sessions() {
+    let dir = autosave_test_dir("prune");
+    let base = dir.join(effectcraft_engine::autosave::AUTOSAVE_FOLDER).join("MCP");
+    let session = |name: &str, record: Value| {
+        let f = base.join(name);
+        std::fs::create_dir_all(&f).unwrap();
+        std::fs::write(f.join("session.json"), record.to_string()).unwrap();
+        f
+    };
+    let saved = session("1-100-0", json!({"dirty": false, "ended": true}));
+    let unsaved = session("2-200-0", json!({"dirty": true, "ended": false, "autosave": null}));
+    let other = session("notes", json!({"dirty": false, "ended": true}));
+    let _s = server().with_autosave(&dir).unwrap();
+    assert!(!saved.exists() && unsaved.exists() && other.exists());
+    crate::autosave::prune(&base, std::time::SystemTime::now() + crate::autosave::ABANDONED_AFTER);
+    assert!(!unsaved.exists() && other.exists(), "untouched for 30 days: removed; foreign folders kept");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn autosave_keeps_sessions_and_desktop_recovery_separate() {
     let dir = autosave_test_dir("isolated");
@@ -381,16 +443,17 @@ fn autosave_marks_saved_or_undone_work_clean_without_losing_its_path() {
     let mut s = server().with_autosave(&dir).unwrap();
     call_json(&mut s, "execute_command", json!({"command": "comp.new", "params": {"name": "Undo me"}}));
     let status = autosave_status(&mut s);
-    let folder = std::path::Path::new(status["folder"].as_str().unwrap());
+    let folder = std::path::PathBuf::from(status["folder"].as_str().unwrap());
+    // Undone back to the saved state: nothing is unsaved, so the recovery copies go.
     call_json(&mut s, "undo", json!({}));
-    let manifest: Value = serde_json::from_str(&std::fs::read_to_string(folder.join("session.json")).unwrap()).unwrap();
-    assert_eq!(manifest["dirty"], false);
+    assert!(!folder.exists());
+    assert_eq!(autosave_status(&mut s)["latestPath"], Value::Null);
+    // Redone: unsaved again, checkpointed again.
     call_json(&mut s, "redo", json!({}));
-    let path = autosave_status(&mut s)["latestPath"].clone();
+    let path = autosave_status(&mut s)["latestPath"].as_str().unwrap().to_string();
+    assert!(std::fs::read_to_string(&path).unwrap().contains("Undo me"));
     call_json(&mut s, "save_project", json!({"path": dir.join("Saved.ecproj")}));
-    assert_eq!(autosave_status(&mut s)["latestPath"], path, "save resets the engine bookkeeping but the server remembers the recovery file");
-    let manifest: Value = serde_json::from_str(&std::fs::read_to_string(folder.join("session.json")).unwrap()).unwrap();
-    assert_eq!(manifest["dirty"], false);
+    assert_eq!(autosave_status(&mut s)["latestPath"], Value::Null, "saved normally: no recovery file is kept");
     let mut next = server().with_autosave(&dir).unwrap();
     assert!(autosave_status(&mut next)["previousSessions"].as_array().unwrap().is_empty());
     std::fs::remove_dir_all(dir).unwrap();
@@ -546,7 +609,14 @@ fn bridge_forwards_to_control_channel() {
     call_json(&mut s, "execute_command", json!({"command": "comp.new", "params": {"name": "B", "width": 64, "height": 64}}));
     assert_eq!(call_json(&mut s, "get_comp", json!({}))["name"], "B");
 
+    // Bridged agents run under their own name from `initialize` on (AN4), and a named agent
+    // renders through the engine command on its own cursor (the app's session: comp B).
+    assert!(s.backend().client().is_some());
     let (c, err) = call(&mut s, "render_frame", json!({}));
+    assert!(!err, "{c:?}");
+    assert_eq!(png_size(&base64::decode(c[0]["data"].as_str().unwrap()).unwrap()), Some((64, 64)));
+    // As the user (`"client": ""`), the render goes to the app's own `render.frame` method.
+    let (c, err) = call(&mut s, "render_frame", json!({"client": ""}));
     assert!(!err, "{c:?}");
     assert_eq!(png_size(&base64::decode(c[0]["data"].as_str().unwrap()).unwrap()), Some((4, 2)));
 
@@ -1281,6 +1351,10 @@ fn automation_roots_confine_file_access() {
     denied(&mut s, "save_project", json!({"path": "relative.ecproj"}));
     denied(&mut s, "save_project", json!({"path": p(&write, "../elsewhere/up.ecproj")}));
     denied(&mut s, "execute_command", json!({"command": "comp.saveFrameAs", "params": {"path": p(&outside, "f.png")}}));
+    // The checking commands' outputs are writes too, even into a read root or relative.
+    denied(&mut s, "execute_command", json!({"command": "render.contactSheet", "params": {"gif": p(&read, "sheet.gif")}}));
+    denied(&mut s, "execute_command", json!({"command": "audio.analyze", "params": {"path": "wave.png"}}));
+    denied(&mut s, "execute_command", json!({"command": "help.exportRepro", "params": {"path": p(&read, "repro.jsonl")}}));
     // Any other absolute path a command is given.
     denied(&mut s, "execute_command", json!({"command": "renderQueue.add", "params": {"output": p(&outside, "movie.mp4")}}));
     // A batch step.
@@ -2472,4 +2546,201 @@ fn warnings_hints_and_brief_listings() {
     assert!(brief * 3 < full, "{brief} vs {full}");
     let fx = call_json(&mut s, "list_effects", json!({"brief": true}));
     assert!(fx.as_array().unwrap().iter().all(|e| e.as_object().unwrap().len() == 2), "{fx}");
+}
+
+/// `lint_frame`: design problems as structured JSON, headless and bridged.
+#[test]
+fn lint_frame_reports_design_problems() {
+    for bridge in [false, true] {
+        let mut s = if bridge { McpServer::new(Backend::bridge(&fake_app().to_string()).unwrap()) } else { server() };
+        call_json(&mut s, "command_run", json!({"id": "comp.new", "params": {"width": 320, "height": 180, "frameRate": 25, "duration": 2}}));
+        let l = call_json(&mut s, "command_run", json!({"id": "layer.newSolid", "params": {"width": 40, "height": 40}}))["layer"].clone();
+        call_json(&mut s, "set_property", json!({"layer": l, "path": "transform/position", "value": [0, 90]}));
+        let r = call_json(&mut s, "lint_frame", json!({"time": 0, "rules": ["cut-off"]}));
+        assert_eq!(r["problems"].as_array().unwrap().len(), 1, "{r}");
+        let p = &r["problems"][0];
+        assert_eq!((p["rule"].as_str(), p["severity"].as_str(), &p["layer"]), (Some("cut-off"), Some("info"), &l), "{r}");
+        assert_eq!(r["clean"], true);
+        assert_eq!(r["counts"], json!({"error": 0, "warning": 0, "info": 1}));
+        // A range and snake_case thresholds; bad rules are tool errors.
+        let r = call_json(&mut s, "lint_frame", json!({"start": 0, "end": 1, "step": 0.5, "min_text_px": 10, "rules": "cut-off"}));
+        assert_eq!(r["times"], json!([0.0, 0.5, 1.0]), "{r}");
+        assert_eq!((r["problems"][0]["time"].as_f64(), r["problems"][0]["until"].as_f64()), (Some(0.0), Some(1.0)), "{r}");
+        let (c, err) = call(&mut s, "lint_frame", json!({"rules": ["nope"]}));
+        assert!(err && c[0]["text"].as_str().unwrap().contains("unknown rule"), "{c:?}");
+    }
+}
+
+/// `get_motion`: a motion summary of keyframed layers, headless and bridged.
+#[test]
+fn get_motion_describes_layer_motion() {
+    for bridge in [false, true] {
+        let mut s = if bridge { McpServer::new(Backend::bridge(&fake_app().to_string()).unwrap()) } else { server() };
+        call_json(&mut s, "command_run", json!({"id": "comp.new", "params": {"width": 320, "height": 180, "frameRate": 24, "duration": 2}}));
+        let l = call_json(&mut s, "command_run", json!({"id": "layer.newSolid", "params": {"name": "Logo", "width": 80, "height": 44}}))["layer"].clone();
+        call_json(
+            &mut s,
+            "add_keyframe",
+            json!({"layer": l, "path": "transform/position", "keys": [{"time": 0, "value": [-60, 90]}, {"time": 1, "value": [160, 90]}]}),
+        );
+        let r = call_json(&mut s, "get_motion", json!({}));
+        assert_eq!(r["truncated"], false, "{r}");
+        let m = &r["layers"][0];
+        assert_eq!(m["segments"][0]["kind"], "enter", "{r}");
+        assert_eq!(m["segments"][0]["edge"], "left");
+        assert!(m["summary"].as_str().unwrap().contains("from the left"), "{r}");
+        // `layer` routes to layer.motion; bad references are tool errors.
+        let r = call_json(&mut s, "get_motion", json!({"layer": "Logo", "start": 0.5}));
+        assert_eq!((r["layers"].as_array().unwrap().len(), r["start"].clone()), (1, json!(0.5)));
+        let (c, err) = call(&mut s, "get_motion", json!({"layers": ["Nope"]}));
+        assert!(err && c[0]["text"].as_str().unwrap().contains("no layer"), "{c:?}");
+    }
+    assert!(crate::tools::output_schema("get_motion").is_some());
+}
+
+/// Every tool takes the agent's name as `client` (or the server runs as `mcp --client NAME`): the
+/// engine commands it runs carry it, so each agent has its own selection, comp and time, renders
+/// at its own time, and other agents' typed-tool edits to a comp it claimed are refused.
+#[test]
+fn tools_run_as_the_calling_client() {
+    for bridge in [false, true] {
+        let mut s = if bridge { McpServer::new(Backend::bridge(&fake_app().to_string()).unwrap()) } else { server() };
+        call_json(&mut s, "command_run", json!({"id": "comp.new", "params": {"name": "Main", "width": 64, "height": 36, "frameRate": 24, "duration": 2}}));
+        let a = call_json(&mut s, "command_run", json!({"id": "layer.newSolid", "params": {"name": "A", "width": 8, "height": 8}}))["layer"].clone();
+        let b = call_json(&mut s, "command_run", json!({"id": "layer.newSolid", "params": {"name": "B", "width": 8, "height": 8}}))["layer"].clone();
+        call_json(&mut s, "command_run", json!({"id": "layer.select", "params": {"layers": [a]}, "client": "agentA"}));
+        call_json(&mut s, "command_run", json!({"id": "layer.select", "params": {"layers": [b]}, "client": "agentB"}));
+        let st = call_json(&mut s, "get_state", json!({"client": "agentA"}));
+        assert_eq!((st["state"]["client"].clone(), st["state"]["selected_layers"].clone()), (json!("agentA"), json!([a])), "bridge {bridge}: {st}");
+        assert_eq!(call_json(&mut s, "get_state", json!({"client": "agentB"}))["state"]["selected_layers"], json!([b]));
+        // A selection edit lands on the calling agent's own layer.
+        call_json(&mut s, "command_run", json!({"id": "prop.set", "params": {"path": "transform/opacity", "value": 10}, "client": "agentA"}));
+        let opacity = |s: &mut McpServer, l: &Value| call_json(s, "get_property", json!({"layer": l, "path": "transform/opacity"}))["value"].clone();
+        assert_eq!((opacity(&mut s, &a), opacity(&mut s, &b)), (json!(10.0), json!(100.0)), "bridge {bridge}");
+        // Renders default to the agent's own time (bridged too: through the engine command).
+        call_json(&mut s, "command_run", json!({"id": "time.set", "params": {"time": 1}, "client": "agentA"}));
+        let (c, err) = call(&mut s, "render_preview", json!({"client": "agentA", "max_side": 16}));
+        assert!(!err, "{c:?}");
+        let meta = c.iter().find(|x| x["type"] == "text").map(|x| serde_json::from_str::<Value>(x["text"].as_str().unwrap()).unwrap()).unwrap();
+        assert_eq!(meta["time"], json!(1.0), "bridge {bridge}: {meta}");
+        // A claim refuses the other agent's typed-tool edit, never the user's.
+        call_json(&mut s, "command_run", json!({"id": "comp.claim", "params": {"comp": "Main"}, "client": "agentA"}));
+        let (c, err) = call(&mut s, "set_property", json!({"layer": b, "path": "transform/opacity", "value": 50, "client": "agentB"}));
+        assert!(err && c[0]["text"].as_str().unwrap().contains("claimed by agentA"), "bridge {bridge}: {c:?}");
+        call_json(&mut s, "set_property", json!({"layer": b, "path": "transform/opacity", "value": 50}));
+        call_json(&mut s, "set_property", json!({"layer": a, "path": "transform/opacity", "value": 20, "client": "agentA"}));
+        let (c, err) = call(&mut s, "get_state", json!({"client": 5}));
+        assert!(err && c[0]["text"].as_str().unwrap().contains("`client`"), "{c:?}");
+    }
+    // `mcp --client NAME`: every call runs as that agent; the user's cursor stays as it was.
+    let mut s = server().with_client(Some("agentC".into()));
+    call_json(&mut s, "command_run", json!({"id": "comp.new", "params": {"name": "Theirs", "width": 64, "height": 36}}));
+    assert_eq!(call_json(&mut s, "get_state", json!({}))["state"]["client"], "agentC");
+    assert_eq!(s.backend().session().unwrap().state.active_comp, None, "the user's view didn't move");
+    assert_eq!(s.backend().client(), Some("agentC"));
+}
+
+/// Bridged to an app, an agent that gave no name runs as `<MCP client name>-<pid>` from
+/// `initialize` on, so it never moves the user's selection; `"client": ""` runs one call as the
+/// user. Headless servers (the agent is alone) and named servers keep their client.
+#[test]
+fn bridged_agents_get_a_name_by_default() {
+    let init = json!({"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "Claude Code", "version": "1"}});
+    let mut s = McpServer::new(Backend::bridge(&fake_app().to_string()).unwrap());
+    rpc(&mut s, 1, "initialize", init.clone());
+    let me = format!("claude-code-{}", std::process::id());
+    assert_eq!(s.backend().client(), Some(me.as_str()));
+    call_json(&mut s, "command_run", json!({"id": "comp.new", "params": {"name": "Main", "width": 64, "height": 36}}));
+    let a = call_json(&mut s, "command_run", json!({"id": "layer.newSolid", "params": {"name": "A", "width": 8, "height": 8}}))["layer"].clone();
+    call_json(&mut s, "command_run", json!({"id": "layer.select", "params": {"layers": [a]}}));
+    let mine = call_json(&mut s, "get_state", json!({}));
+    assert_eq!((mine["state"]["client"].clone(), mine["state"]["selected_layers"].clone()), (json!(me), json!([a])), "{mine}");
+    let user = call_json(&mut s, "get_state", json!({"client": ""}));
+    assert!(user["state"]["client"].is_null() && user["state"]["selected_layers"] != json!([a]), "the user's selection didn't move: {user}");
+    assert_eq!(s.backend().client(), Some(me.as_str()), "a per-call client is restored after the call");
+
+    let mut named = McpServer::new(Backend::bridge(&fake_app().to_string()).unwrap()).with_client(Some("agentC".into()));
+    rpc(&mut named, 1, "initialize", init.clone());
+    assert_eq!(named.backend().client(), Some("agentC"));
+    let mut alone = server();
+    rpc(&mut alone, 1, "initialize", json!({"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "!!!", "version": "1"}}));
+    assert_eq!(alone.backend().client(), None);
+    assert_eq!(crate::server::default_client(&json!({"clientInfo": {"name": "!!!"}})), format!("agent-{}", std::process::id()));
+}
+
+/// An agent hops between projects: `hosts` lists where projects are open, `join` (a port or a
+/// project path) switches the server onto that host as a named agent, and leaving unsaved
+/// headless work is refused.
+#[test]
+fn hosts_tool_lists_and_joins_a_running_app() {
+    let mut s = server();
+    let listed = call_json(&mut s, "hosts", json!({}));
+    assert!(listed["hosts"].is_array(), "{listed}");
+    call_json(&mut s, "execute_command", json!({"command": "comp.new", "params": {"name": "Unsaved"}}));
+    let port = fake_app();
+    let (c, err) = call(&mut s, "hosts", json!({"join": port}));
+    assert!(err && c[0]["text"].as_str().unwrap().contains("unsaved"), "{c:?}");
+    let mut clean = server();
+    let joined = call_json(&mut clean, "hosts", json!({"join": port}));
+    assert_eq!(joined["joined"], port);
+    let me = format!("mcp-{}", std::process::id());
+    assert_eq!(joined["client"], json!(me));
+    assert_eq!(clean.backend().mode(), "bridge");
+    assert_eq!(clean.backend().client(), Some(me.as_str()));
+    let (c, err) = call(&mut clean, "hosts", json!({"join": "/nowhere/Nope.ecproj"}));
+    assert!(err && c[0]["text"].as_str().unwrap().contains("no running EffectCraft"), "{c:?}");
+}
+
+/// A windowless host: two agents join one in-memory project, each claims and edits its own comp,
+/// renders reply without blocking the other agent, and `host.release` saves the project and stops
+/// the host (in the host list while it runs).
+#[test]
+fn windowless_host_serves_several_agents_one_project() {
+    use crate::host_server::{HostConfig, request, serve};
+    let dir = autosave_test_dir("host");
+    let (port_tx, port_rx) = std::sync::mpsc::channel();
+    let config = HostConfig { port: 0, config_dir: Some(dir.clone()) };
+    let host = std::thread::spawn(move || serve(config, Box::new(|| Ok(Session::default())), move |p| port_tx.send(p).unwrap()));
+    let port = port_rx.recv().unwrap();
+    // Each agent keeps its connection open, as an MCP bridge does: a client's claims are released
+    // when its last connection closes.
+    let connect = || {
+        let c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(std::time::Duration::from_secs(60))).unwrap();
+        std::cell::RefCell::new((std::io::BufReader::new(c.try_clone().unwrap()), c))
+    };
+    let conns = [("agentA", connect()), ("agentB", connect())];
+    let exec = |client: &str, command: &str, params: Value| {
+        use std::io::{BufRead, Write};
+        let mut p = params;
+        p["client"] = json!(client);
+        let mut conn = conns.iter().find(|(c, _)| *c == client).unwrap().1.borrow_mut();
+        writeln!(conn.1, "{}", json!({"id": 1, "method": "engine.execute", "params": {"command": command, "params": p}})).unwrap();
+        let mut line = String::new();
+        conn.0.read_line(&mut line).unwrap();
+        serde_json::from_str::<Value>(&line).unwrap()
+    };
+    let a = exec("agentA", "comp.new", json!({"name": "A", "width": 64, "height": 36}));
+    let b = exec("agentB", "comp.new", json!({"name": "B", "width": 64, "height": 36}));
+    assert_eq!((a["ok"].clone(), b["ok"].clone()), (json!(true), json!(true)), "{a} {b}");
+    assert_eq!(exec("agentA", "comp.claim", json!({"comp": "A"}))["ok"], true);
+    assert_eq!(exec("agentA", "layer.newSolid", json!({"comp": "A", "width": 8, "height": 8}))["ok"], true);
+    let refused = exec("agentB", "layer.newSolid", json!({"comp": "A", "width": 8, "height": 8}));
+    assert!(refused["error"].as_str().unwrap_or("").contains("claimed by agentA"), "{refused}");
+    let frame = exec("agentB", "render.frame", json!({"comp": "B", "base64": true, "max_side": 16}));
+    assert_eq!(frame["ok"], true, "{frame}");
+    assert!(frame["result"]["png"].is_string());
+    let info = request(port, "host.info", json!({})).unwrap();
+    assert_eq!(info["result"]["dirty"], true);
+    assert!(request(port, "ui.click", json!({})).unwrap()["error"].as_str().unwrap().contains("desktop app"));
+    let listed = exec("agentA", "hosts.list", json!({}));
+    assert!(listed["result"]["hosts"].as_array().unwrap().iter().any(|h| h["port"] == port && h["kind"] == "host"), "{listed}");
+    let saved = dir.join("Shared.ecproj");
+    let r = request(port, "host.release", json!({"path": saved.to_string_lossy()})).unwrap();
+    assert_eq!(r["result"]["released"], true, "{r}");
+    host.join().unwrap().unwrap();
+    let text = std::fs::read_to_string(&saved).unwrap();
+    assert!(text.contains("\"A\"") && text.contains("\"B\""), "both agents' comps are in the saved project");
+    assert!(!dir.join(effectcraft_engine::hosts::HOSTS_FOLDER).join(format!("{}.json", std::process::id())).exists(), "left the host list");
+    std::fs::remove_dir_all(dir).unwrap();
 }
