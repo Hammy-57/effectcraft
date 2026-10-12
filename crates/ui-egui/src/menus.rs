@@ -794,6 +794,11 @@ pub fn bindings(session: &effectcraft_engine::Session) -> Vec<Binding> {
             {
                 v.push((m, alias, b.command.clone(), b.params.clone()));
             }
+            // ISO keyboards (AZERTY, QWERTZ, UK…) report the key left of 1, After Effects'
+            // `~` key, as IntlBackslash, so a backtick shortcut answers it too.
+            if k == egui::Key::Backtick {
+                v.push((m, egui::Key::IntlBackslash, b.command.clone(), b.params.clone()));
+            }
             v.push((m, k, b.command.clone(), b.params.clone()));
         }
     }
