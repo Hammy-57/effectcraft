@@ -177,6 +177,9 @@ pub(crate) struct Pool {
     /// Working textures reused / newly allocated (diagnostics, tests).
     hits: u64,
     misses: u64,
+    /// When each free size was last released or reused (a counter, see [`Pool::evict_stalest`]).
+    last_used: HashMap<(u32, u32), u64>,
+    tick: u64,
 }
 
 /// Processed pixels can be GPU-only. CPU mirrors, resident pixels and pending
@@ -326,12 +329,53 @@ fn tex_bytes(t: &wgpu::Texture) -> usize {
 }
 
 impl Pool {
+    fn budget(&self) -> usize {
+        self.budget.unwrap_or(POOL_BUDGET)
+    }
+
+    /// Whether `bytes` more would exceed the budget.
+    fn over(&self, bytes: usize) -> bool {
+        self.bytes.saturating_add(self.released_bytes).saturating_add(bytes) > self.budget()
+    }
+
+    /// Make room for a released texture of `bytes` by dropping free textures of the sizes
+    /// used longest ago (never of size `keep`, the incoming one's). A full pool used to drop
+    /// the incoming texture instead, keeping stale sizes: at Full resolution a frame's working
+    /// set outgrew the budget and every frame allocated its canvases anew (RT10b).
+    fn make_room(&mut self, bytes: usize, keep: (u32, u32)) {
+        if bytes > self.budget() {
+            return;
+        }
+        while self.over(bytes) && self.evict_stalest(keep) {}
+    }
+
+    /// Drop one free texture of the stalest size other than `keep`; `false` when there is none.
+    fn evict_stalest(&mut self, keep: (u32, u32)) -> bool {
+        let Some(key) = self.free.keys().filter(|k| **k != keep).min_by_key(|k| self.last_used.get(k).copied().unwrap_or(0)).copied() else {
+            return false;
+        };
+        if let Some(t) = self.free.get_mut(&key).and_then(Vec::pop) {
+            self.bytes = self.bytes.saturating_sub(t.bytes());
+        }
+        if self.free.get(&key).is_some_and(Vec::is_empty) {
+            self.free.remove(&key);
+            self.last_used.remove(&key);
+        }
+        true
+    }
+
+    fn touch(&mut self, key: (u32, u32)) {
+        self.tick = self.tick.saturating_add(1);
+        self.last_used.insert(key, self.tick);
+    }
+
     fn release(&mut self, t: impl Into<Pooled>) {
         let t = t.into();
         match self.open.last() {
             Some(&newest) => {
                 let bytes = t.bytes();
-                if self.bytes.saturating_add(self.released_bytes).saturating_add(bytes) <= self.budget.unwrap_or(POOL_BUDGET) {
+                self.make_room(bytes, t.size());
+                if !self.over(bytes) {
                     self.released.push((t, newest));
                     self.released_bytes += bytes;
                 }
@@ -343,10 +387,12 @@ impl Pool {
 
     fn make_free(&mut self, t: Pooled) {
         let b = t.bytes();
-        if self.bytes.saturating_add(self.released_bytes).saturating_add(b) > self.budget.unwrap_or(POOL_BUDGET) {
+        self.make_room(b, t.size());
+        if self.over(b) {
             return;
         }
         self.bytes += b;
+        self.touch(t.size());
         self.free.entry(t.size()).or_default().push(t);
     }
 
@@ -391,6 +437,9 @@ impl Pool {
         let t = self.free.get_mut(&(w, h)).and_then(Vec::pop);
         if self.free.get(&(w, h)).is_some_and(Vec::is_empty) {
             self.free.remove(&(w, h));
+            self.last_used.remove(&(w, h));
+        } else if t.is_some() {
+            self.touch((w, h));
         }
         match &t {
             Some(t) => {
@@ -421,6 +470,7 @@ impl Pool {
                         }
                         if self.free.get(&key).is_some_and(Vec::is_empty) {
                             self.free.remove(&key);
+                            self.last_used.remove(&key);
                         }
                     }
                 }
@@ -431,6 +481,7 @@ impl Pool {
 
     fn clear(&mut self) {
         self.free.clear();
+        self.last_used.clear();
         self.released.clear();
         self.released_bytes = 0;
         self.bytes = 0;
@@ -450,6 +501,8 @@ impl Pool {
             }
         }
         self.free.retain(|_, l| !l.is_empty());
+        let free = &self.free;
+        self.last_used.retain(|k, _| free.contains_key(k));
     }
 }
 
@@ -2716,6 +2769,30 @@ mod upload_budget_tests {
         assert!(pool.take(6, 4).is_none());
         assert_eq!(pool.bytes, 3 * 4 * 4 * 16, "collective pressure preserves useful smaller sizes");
         assert_eq!(pool.free.get(&(4, 4)).map(Vec::len), Some(3));
+    }
+
+    /// A full pool makes room for a released texture by dropping the size used longest ago,
+    /// instead of dropping the released one (RT10b: Full frames re-allocated their canvases).
+    #[test]
+    fn full_pool_evicts_the_stalest_size_for_a_released_texture() {
+        let Some(g) = crate::tests::gpu() else { return };
+        let mut pool = Pool::default();
+        pool.set_budget(2 * 8 * 8 * 16);
+        pool.release(g.ctx.texture(4, 4));
+        pool.release(g.ctx.texture(2, 2));
+        pool.release(g.ctx.texture(8, 8));
+        // 4×4 is the stalest once 2×2 is reused and released again.
+        let t = pool.take(2, 2);
+        assert!(t.is_some());
+        pool.release(t.into_iter().next().map(|p| p.texture).unwrap());
+        pool.release(g.ctx.texture(8, 8));
+        assert_eq!(pool.free.get(&(8, 8)).map(Vec::len), Some(2), "the released texture is kept");
+        assert!(!pool.free.contains_key(&(4, 4)), "the stalest size made room");
+        assert!(pool.bytes <= 2 * 8 * 8 * 16);
+        // An oversized texture never empties the pool.
+        pool.release(g.ctx.texture(16, 16));
+        assert_eq!(pool.free.get(&(8, 8)).map(Vec::len), Some(2));
+        assert!(!pool.free.contains_key(&(16, 16)));
     }
 
     #[test]
