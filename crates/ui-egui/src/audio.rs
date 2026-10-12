@@ -298,13 +298,33 @@ fn feed_block(src: &RenderSource, comp: ItemId, feed: &AudioFeed, span: &PlaySpa
 /// `n` stereo frames of `comp`'s mix from comp time `t` at the device `rate`, mixed at `mix` Hz
 /// (resampled when they differ).
 fn mix_block(src: &RenderSource, comp: ItemId, t: Tick, n: usize, rate: u32, mix: u32) -> Vec<f32> {
-    let render =
-        |frames: usize, at: u32| effectcraft_engine::render::audio::mix_comp(&src.project, src.footage.as_ref(), src.expr.as_deref(), comp, t, frames, at);
+    resampled(
+        |at: Tick, frames: usize, r: u32| {
+            effectcraft_engine::render::audio::mix_comp(&src.project, src.footage.as_ref(), src.expr.as_deref(), comp, at, frames, r)
+        },
+        t,
+        n,
+        rate,
+        mix,
+    )
+}
+
+/// `n` frames at `rate` from comp time `t` of a mix rendered by `render(start, frames, rate)` at
+/// `mix` Hz. `t` mostly falls between two samples at the mix rate: the block is interpolated
+/// from the sample before it at that phase, so consecutive blocks join without a jump. Starting
+/// each block on that sample instead shifted every block by up to a sample, a click every
+/// block (#335: 44.1 kHz devices crackled).
+fn resampled(render: impl Fn(Tick, usize, u32) -> Vec<f32>, t: Tick, n: usize, rate: u32, mix: u32) -> Vec<f32> {
     if mix == rate {
-        return render(n, rate);
+        return render(t, n, rate);
     }
-    let m = (n as u64 * mix as u64).div_ceil(rate as u64) as usize + 1;
-    resample_stereo(&render(m, mix), mix, rate, n)
+    let tps = i128::from(effectcraft_engine::time::TICKS_PER_SECOND);
+    let pos = i128::from(t.0).saturating_mul(i128::from(mix));
+    let first = i64::try_from(pos.div_euclid(tps)).unwrap_or(0);
+    let phase = pos.rem_euclid(tps) as f64 / tps as f64;
+    let step = mix as f64 / rate.max(1) as f64;
+    let m = (phase + n as f64 * step).ceil() as usize + 2;
+    resample_stereo_at(&render(Tick::from_units(first, mix as i64), m, mix), mix, rate, n, phase)
 }
 
 /// Audio scrubbing: an open output that plays a short, faded snippet of the comp's mix each time
@@ -369,20 +389,26 @@ impl Drop for AudioScrub {
 
 /// Linear resampling of interleaved stereo from `from` Hz to `n` frames at `to` Hz.
 pub fn resample_stereo(src: &[f32], from: u32, to: u32, n: usize) -> Vec<f32> {
+    resample_stereo_at(src, from, to, n, 0.0)
+}
+
+/// [`resample_stereo`] from `phase` (0..1) of a source frame past the first.
+fn resample_stereo_at(src: &[f32], from: u32, to: u32, n: usize, phase: f64) -> Vec<f32> {
     let frames = src.len() / 2;
     let mut out = Vec::with_capacity(n * 2);
     if frames == 0 {
         out.resize(n * 2, 0.0);
         return out;
     }
-    let step = from as f64 / to as f64;
+    let step = from as f64 / to.max(1) as f64;
     for i in 0..n {
-        let x = i as f64 * step;
+        let x = phase + i as f64 * step;
         let a = (x.floor() as usize).min(frames - 1);
         let b = (a + 1).min(frames - 1);
         let f = (x - a as f64) as f32;
         for c in 0..2 {
-            out.push(src[a * 2 + c] * (1.0 - f) + src[b * 2 + c] * f);
+            let at = |k: usize| src.get(k * 2 + c).copied().unwrap_or(0.0);
+            out.push(at(a) * (1.0 - f) + at(b) * f);
         }
     }
     out
@@ -557,6 +583,31 @@ mod tests {
         playback.feed.pull(&mut out);
         assert_eq!(out, [0.5; 8]);
         playback.stop();
+    }
+
+    /// #335: a mix at 48 kHz resampled to a 44.1 kHz device block by block. Each block began
+    /// on the 48 kHz sample at or before its start, up to a sample early: a jump at every block
+    /// boundary, heard as crackle. Resampling a ramp (the time of each sample) must give each
+    /// output sample's own time, across block joins.
+    #[test]
+    fn resampled_blocks_join_without_a_jump() {
+        let (rate, mix) = (44_100u32, 48_000u32);
+        let ramp = |at: Tick, frames: usize, r: u32| {
+            let s0 = at.to_units_floor(r as i64);
+            (0..frames).flat_map(|i| [(s0 + i as i64) as f32 / r as f32; 2]).collect::<Vec<f32>>()
+        };
+        let mut cursor = 44_100 * 3 + 17;
+        for _ in 0..8 {
+            let out = resampled(ramp, sample_time(cursor, rate), BLOCK, rate, mix);
+            assert_eq!(out.len(), BLOCK * 2);
+            for (i, v) in out.chunks(2).enumerate() {
+                let want = (cursor + i as i64) as f64 / rate as f64;
+                assert!((v[0] as f64 - want).abs() < 2e-6, "sample {} of the block at {cursor}: {} vs {want}", i, v[0]);
+            }
+            cursor += BLOCK as i64;
+        }
+        // The same rate passes straight through.
+        assert_eq!(resampled(ramp, sample_time(5, rate), 3, rate, rate), ramp(sample_time(5, rate), 3, rate));
     }
 
     #[test]
