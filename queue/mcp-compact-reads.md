@@ -1,6 +1,6 @@
 title: fix(mcp): make agent inspection and edit feedback exact and bounded
 branch: upstream/mcp-compact-reads
-depends: upstream/agents-control-robustness
+depends: upstream/agents-own-undo
 
 ## What
 Editing agents now receive exact, size-bounded inspection data and accurate edit/error confirmations. A timed property write reports the actual snapped comp and layer times instead of reading back at the wrong clock; script failures set MCP isError while preserving output and partial-edit details.
@@ -27,4 +27,4 @@ With four build jobs and a shared warm target:
 
 No full CI, application build, release CLI build or live-project edits were performed. This updates the existing compact-read topic; follow-up transactional/retry/session work is separate.
 
-The upstream topic also merges its queued `agents-control-robustness` prerequisite. Its port preserves upstream's manual command registry and scheduled-task behavior. The exact port passed `cargo check -p effectcraft-automation -p effectcraft-engine --all-targets` and formatting checks; the runtime test counts above were measured on the fork implementation.
+The upstream topic merges its queued `agents-own-undo` prerequisite, which includes `agents-control-robustness` and adds per-agent cursors/claims, host discovery/handover and the shared control wire needed by the dependent transactional/retry/session follow-up. The merge preserves wave1's exact inspection and clock guidance, upstream's project-repair reporting, scheduled-task behavior and manual command registry. Compatibility fixes retain upstream's alternate-shortcut fields and register its existing tests in the consolidated test binaries. The exact merged port passed `cargo check -p effectcraft-automation -p effectcraft-engine --all-targets` and formatting checks; the runtime test counts above were measured on the fork implementation.
