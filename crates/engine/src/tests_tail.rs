@@ -160,6 +160,8 @@ fn mask_motion_blur_ramps_across_the_motion() {
     let mut s = comp(200, 200);
     let (l, m) = masked_solid(&mut s);
     s.execute("comp.settings", json!({"shutterAngle": 360, "shutterPhase": 0})).unwrap();
+    // New comps start with Motion Blur off (G2); this test is about the blur itself.
+    s.execute("comp.setSwitch", json!({"switch": "motionBlur", "value": true})).unwrap();
     s.execute("layer.mask.motionBlur", json!({"layer": l, "mode": "on"})).unwrap();
     s.execute("prop.addKey", json!({"layer": l, "path": "masks/#1/path", "time": 0.0})).unwrap();
     s.execute("time.set", json!({"time": 1.0})).unwrap();
@@ -182,6 +184,8 @@ fn adaptive_sample_limit_drives_layer_samples() {
     assert_eq!(effectcraft_render::adaptive_samples(400.0, 16, 9999), 256);
     let mut s = comp(400, 100);
     s.execute("comp.settings", json!({"shutterAngle": 360, "shutterPhase": 0})).unwrap();
+    // New comps start with Motion Blur off (G2); this test is about the blur itself.
+    s.execute("comp.setSwitch", json!({"switch": "motionBlur", "value": true})).unwrap();
     let l = s.execute("layer.newSolid", json!({"color": "#ffffff", "width": 20, "height": 20})).unwrap()["layer"].as_u64().unwrap();
     s.execute("layer.setSwitch", json!({"layers": [l], "switch": "motionBlur", "value": true})).unwrap();
     // 100 px per frame (keys 3 frames apart, 300 px).

@@ -148,6 +148,8 @@ fn mask_motion_blur_feather_falloff_and_hide_locked() {
     assert!(matches!(mask_kind(&s, l), GroupKind::Mask { motion_blur: MaskMotionBlur::On, .. }));
     assert!(s.execute("layer.mask.motionBlur", json!({"layer": l, "mode": "sometimes"})).is_err());
     // Mask motion blur blurs an animated mask path.
+    // New comps start with Motion Blur off (G2); this test is about the blur itself.
+    s.execute("comp.setSwitch", json!({"switch": "motionBlur", "value": true})).unwrap();
     s.execute("layer.mask.set", json!({"layer": l, "field": "feather", "value": 0})).unwrap();
     let still = s.render_rgba8(cid, Tick::from_seconds_f64(0.5), 0).unwrap();
     s.execute("prop.addKey", json!({"layer": l, "path": "masks/#1/path", "time": 0.0})).unwrap();
