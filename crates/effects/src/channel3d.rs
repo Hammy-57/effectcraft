@@ -393,8 +393,10 @@ fn cryptomatte(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let display = ctx.params.e("display");
     let matte_only = ctx.params.b("matteOnly");
     let src = b.img.clone();
+    // The rank channels are looked up once, not by name for every pixel (#473).
+    let planes = a.crypto_planes(&layer);
     b.img.data.par_iter_mut().enumerate().for_each(|(i, px)| {
-        let ranks = idx[i].map(|k| a.crypto_ranks(&layer, k)).unwrap_or_default();
+        let ranks: Vec<(f32, f32)> = idx[i].map(|k| effectcraft_raster::channels3d::crypto_ranks_at(&planes, k).collect()).unwrap_or_default();
         let m: f32 = ranks.iter().filter(|(id, c)| *c > 0.0 && sel.contains(&id.to_bits())).map(|(_, c)| *c).sum::<f32>().clamp(0.0, 1.0);
         if matte_only {
             *px = [m, m, m, m];
