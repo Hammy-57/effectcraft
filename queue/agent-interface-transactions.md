@@ -11,6 +11,7 @@ Agent edits now apply with explicit transaction, revision and session boundaries
 - Retain bounded completion receipts for oversized control replies, never evict in-flight entries, and refuse uncertain mutation replay after a process/session change. Replay protection is limited to retained cache lifetime.
 - Join one exact canonical project host, verify its live path before switching, and expose session/build identity. Legacy relative host paths remain explicitly unresolved.
 - Bound other large tool outputs and retain immutable results for get_result/resources retrieval, including private streamed spill storage. Failures and waiting/running state survive output handling; a retention failure never authorizes rerunning an edit.
+- Declare retained-result and delivery-failure shapes in tool output schemas; validate real omitted-field replies against those schemas.
 - Expose engine/app and MCP build provenance and scoped protocol features. Preserve complete output for one-shot CLI callers, which cannot page a handle after process exit.
 
 ## Why
@@ -18,7 +19,7 @@ Agents must not treat an error as proof that nothing happened, a partial list as
 
 ## Validation
 Fork implementation:
-- cargo test -p effectcraft-automation --lib: 159 passed
+- cargo test -p effectcraft-automation --lib: 161 passed
 - cargo test -p effectcraft-automation --test qa: 8 passed; QA follows retained snapshots when asserting complete history/template structures
 - cargo test -p effectcraft-engine --lib commands::batch: 13 passed
 - cargo test -p effectcraft-engine --lib build_info::tests: 4 passed
@@ -27,7 +28,7 @@ Fork implementation:
 - cargo test -p effectcraft-cli --no-default-features --bin effectcraft-cli one_shot_tool_keeps_complete_output_after_process_exit: 1 passed
 - cargo clippy -p effectcraft-cli --no-default-features --all-targets -- -D warnings: passed
 - Final cargo check on automation, engine and CLI (no default CLI UI feature): passed
-- Exact upstream port: cargo check on automation, engine and CLI --no-default-features --all-targets: passed. Runtime test counts above belong to the fork implementation.
+- Exact upstream port: cargo check on automation, engine and CLI --no-default-features --all-targets: passed. Final schema follow-up: automation --all-targets check passed. Runtime test counts above belong to the fork implementation.
 
 The upstream port is checked separately against the queued dependency. No full local CI, application build, release CLI build or live-project edits.
 
