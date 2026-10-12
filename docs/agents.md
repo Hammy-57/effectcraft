@@ -116,6 +116,10 @@ may be absent from the last checkpoint.
 
 See [MCP conventions](mcp.md) for core tools, resources, strict arguments, and progress/cancellation of long calls (renders, analyses with `wait: true`, `jobs.wait`, scripts).
 
+Common output options on every tool: `full` (unbounded compatibility), `offset`, `limit`, and
+`max_chars`. Engine-backed reads and edits also accept `expectRevision`; live page continuation
+requires it. Retained `get_result` snapshots do not rerun edits or need a live revision.
+
 ### Tools
 
 | Tool | What it does |
@@ -128,6 +132,7 @@ See [MCP conventions](mcp.md) for core tools, resources, strict arguments, and p
 | `run_script {code, name?, timeout?}` | Run JavaScript with the After Effects-style scripting object model (`app.project`, `comp.layers.addText(…)`, `layer.property("ADBE Transform Group").property("ADBE Position").setValueAtTime(…)`…). Returns `{ok, result, output, error: {message, line, column}}`; edits are undoable. Stops after `timeout` seconds (default 300, `0` = none) or on `notifications/cancelled`. |
 | `doc_inspect` / `get_comp {comp?, full?, offset?, limit?, max_chars?}` | Project overview (items, active comp, time, selection, undo stack) with the active composition; one comp's settings, `layerCount` and layers. Layers are compact rows (index, id, name, type, in, out, plus only non-defaults: start, stretch, parent, trackMatte, blendMode, switch tags such as `hidden`, `3d`, `solo`), paged (default 200 a call; `next_offset` null when done, `truncated` when cut). `full: true` gives every field (`comp.info`). |
 | `get_layer {layer, comp?, time?, depth?, flat?, full?, offset?, limit?, max_chars?}` | A layer's property tree (`depth` limits how many group levels expand). Every node has a `path`. `flat: true` lists the leaves, paged (default 150; `total`, `returned`, `next_offset`); a big tree carries a `hint`. |
+| `get_result {result_id, pointer?, mode?, offset?, limit?, max_chars?}` | Recover an immutable retained result by array page or exact JSON chunks, without rerunning its operation. |
 | `get_field {source, pointer, comp?, layer?, path?, time?, depth?, flat?, offset?, limit?, max_chars?}` | Exact JSON field chunks for an omitted inspection field. Pin comp/time from the original reply; concatenate `text` via byte `next_offset`, then parse JSON. |
 | `get_property {layer, path, comp?, time?, full?, offset?, limit?, max_chars?}` | A leaf property's value at a time, keyframes and expression. Keyframes are compact (`in`/`out` omitted when Linear, exact values) and paged (default 100; `keyCount`, `next_offset`); `full: true` for every key field. Group paths (for example `geometryOptions`) contain children: inspect them with `get_layer`, then query a leaf such as `geometryOptions/extrusionDepth`. |
 | `set_property {layer, path, value?, time?, timeBase?, expression?, comp?}` | Sets a static value. With `time` it sets a keyframe (`timeBase: "comp"` for comp seconds); with `expression` it sets an expression. |

@@ -306,3 +306,50 @@ reports `requestedTime`, actual snapped `layerTime` / `compTime`, and `appliedVa
 back at that comp time. Script failures set MCP `isError: true` while preserving error details,
 output and partial-edit information. Ambiguous name aliases are errors with candidate IDs;
 use numeric IDs, canonical property paths or `@uid` to address a specific object.
+
+## Transactions, revisions and retained output
+
+`set_property` and `add_keyframe` execute their edits and readback in one atomic engine batch;
+`add_keyframe` validates the request first and creates one undo step. Successful replies say
+`applied: true` and `rolled_back: false`; a known rollback says `ok: false`, `applied: false`,
+`rolled_back: true`. A transport error is not proof of rollback: inspect before retrying.
+
+Pass `expectRevision` from an inspection to a convenience edit or command tool. Live read
+continuations (`offset > 0`) require that revision; a changed project is an error. Field
+retrieval also pins the original composition and time. `command_batch` uses a single engine
+call with non-atomic step receipts, preserving its separate undo steps and `stop_on_error`
+behavior. Atomic `batch` preflights every step against an explicit allowlist; use
+`describe_command`'s `atomicBatchSupported` to discover eligibility. Saves, exports, project
+replacement and unclassified external actions cannot run in an atomic batch. Non-atomic
+receipts identify successful steps and returned file paths. `fileCoverage` and
+`untrackedEffectsPossible` explicitly say when those paths cannot account for every external
+side effect, especially a writer that failed after partially writing.
+
+Every tool accepts common output options `full`, `offset`, `limit`, and `max_chars`. Large
+catalogues, project items/history, script and batch results are retained once and return a
+`result_id`, `result_mode`, `result_pointer`, and continuation metadata. Call `get_result`
+with those fields to page the immutable snapshot; it never reruns the original operation.
+In `mode: "json"`, concatenate `text` chunks then parse JSON. Results are scoped to the
+backend and client, retained in a bounded FIFO (32 entries, 64 MiB memory, 256 MiB private
+spill files), and expire on eviction or session end. Large spilled results use root JSON
+chunks, not arbitrary nested field lookup. An expired handle is an explicit error, not a
+reason to repeat a mutation. A delivery failure reports `operation_completed` and source
+status separately and explicitly warns not to rerun the operation.
+
+JSON resource URIs accept `offset`, `limit`, `max_chars`, `full`, and `expectRevision`.
+`effectcraft://result/{result_id}?pointer=...&mode=page|json&offset=...` reads retained results.
+
+`open_project` preserves `repaired`, `savedBy`, `handover`, `openElsewhere`, a media check and
+structured warnings. A clean load, a repaired load and an incomplete media check are distinct.
+`doc_inspect` propagates failed composition reads rather than inventing an empty composition.
+`hosts {join: path}` requires one exact canonical-path match; basename matches return
+candidates. Numeric ports explicitly select a host. Write replies may carry `observedContext`
+labelled `observedAfter: true`: it describes the session observed after the operation, while
+the edit's own comp/layer/revision fields identify its actual readback snapshot.
+
+Initialization reports the MCP executable's `cliBuild` and protocol features without waiting
+for a live app. `get_state` reports `cliBuild` separately from the app's build and features.
+Build metadata includes commit, dirty status, build ID, target and profile. Session identity
+includes `processInstance`, `sessionId`, and `projectEpoch`; wasm explicitly reports native
+process identity as unavailable. Source changes do not update an already-running executable:
+reconnect/relaunch through the normal application workflow to pick up a new build.

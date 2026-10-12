@@ -34,7 +34,7 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!(v))
 }
 
-fn summary(s: &mut Session, _: &Value) -> Result<Value> {
+pub(crate) fn summary(s: &mut Session, _: &Value) -> Result<Value> {
     let items: Vec<Value> = s
         .project
         .items
@@ -61,9 +61,8 @@ fn summary(s: &mut Session, _: &Value) -> Result<Value> {
             o
         })
         .collect();
-    Ok(json!({
+    let mut out = json!({
         "path": s.path,
-        "revision": s.revision,
         "dirty": s.is_dirty(),
         // Changes with every project edit (also undo/redo), never for queries: a cheap "has
         // anything changed" check for agents (MCP resource subscriptions).
@@ -75,7 +74,9 @@ fn summary(s: &mut Session, _: &Value) -> Result<Value> {
         "time": s.time().seconds(),
         "selectedLayers": s.state.selected_layers.iter().map(|l| l.0).collect::<Vec<_>>(),
         "undo": s.history.undo.iter().map(|u| u.0.clone()).collect::<Vec<_>>(),
-    }))
+    });
+    crate::build_info::session_identity(s, &mut out);
+    Ok(out)
 }
 
 fn layer_json(l: &Layer, idx: usize) -> Value {
@@ -241,6 +242,7 @@ fn describe(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({
         "id": c.id, "label": c.label, "menu": c.menu, "shortcut": c.shortcut, "params": c.params,
         "schema": super::params_schema(c), "undoable": c.journal, "enabled": en.is_ok(), "why": en.err(),
+        "atomicBatchSupported": super::batch_policy::atomic_supported(c.id),
     }))
 }
 
@@ -248,8 +250,10 @@ fn describe(s: &mut Session, p: &Value) -> Result<Value> {
 fn capabilities(s: &mut Session, _: &Value) -> Result<Value> {
     let fx = effectcraft_effects::registry();
     let formats: Vec<Value> = s.exporter.as_ref().map(|e| e.formats().iter().map(|f| json!(format!("{f:?}"))).collect()).unwrap_or_default();
-    Ok(json!({
+    let mut out = json!({
         "version": env!("CARGO_PKG_VERSION"),
+        "build": crate::build_info::build(),
+        "protocolFeatures": crate::build_info::engine_protocol_features(),
         "commands": super::command_specs().len(),
         "effects": {"total": fx.len(), "gpu": fx.iter().filter(|e| e.gpu).count(), "float": fx.iter().filter(|e| e.float).count()},
         "export": formats,
@@ -262,7 +266,9 @@ fn capabilities(s: &mut Session, _: &Value) -> Result<Value> {
             "summary": PARITY,
             "doc": "docs/target-app-parity.md",
         },
-    }))
+    });
+    crate::build_info::session_identity(s, &mut out);
+    Ok(out)
 }
 
 /// The headline of `docs/target-app-parity.md` (kept in sync by hand at each re-measure).
@@ -272,7 +278,20 @@ fn state(s: &mut Session, _: &Value) -> Result<Value> {
     let mut v = serde_json::to_value(&s.state).unwrap_or_default();
     if let Some(o) = v.as_object_mut() {
         o.insert("revision".into(), json!(s.revision));
+        // Resolve in the host process; a remote agent's working directory may differ.
+        let project_path = s
+            .path
+            .as_deref()
+            .filter(|path| !path.is_empty())
+            .and_then(|path| std::path::absolute(path).ok())
+            .map(|path| std::fs::canonicalize(&path).unwrap_or(path).to_string_lossy().into_owned());
+        o.insert("projectPath".into(), json!(project_path));
         crate::agents::state_extras(s, o);
+    }
+    crate::build_info::session_identity(s, &mut v);
+    if let Some(o) = v.as_object_mut() {
+        o.insert("build".into(), crate::build_info::build());
+        o.insert("protocolFeatures".into(), crate::build_info::engine_protocol_features());
     }
     Ok(v)
 }
@@ -327,6 +346,38 @@ mod inspection_tests {
             }
         }
         panic!("missing inspection path {path}");
+    }
+
+    #[test]
+    fn command_description_reports_atomic_batch_support() {
+        let mut s = Session::default();
+        for (command, supported) in [("prop.get", true), ("layer.newShape", true), ("file.save", false), ("file.runScript", false)] {
+            let info = s.execute("command.describe", json!({"command": command})).unwrap();
+            assert_eq!(info["atomicBatchSupported"], supported, "{command}: {info}");
+        }
+    }
+
+    #[test]
+    fn editor_state_resolves_relative_project_paths_in_the_host() {
+        let mut s = Session { path: Some("Cargo.toml".into()), ..Default::default() };
+        let original = s.path.clone();
+        let result = s.execute("editor.state", json!({})).unwrap();
+        assert!(std::path::Path::new(result["projectPath"].as_str().unwrap()).is_absolute());
+        assert_eq!(result["projectPath"], json!(std::fs::canonicalize("Cargo.toml").unwrap().to_string_lossy()));
+        assert_eq!(s.path, original);
+        assert_eq!(s.revision, 0);
+    }
+
+    #[test]
+    fn editor_state_keeps_unsaved_paths_null_and_missing_paths_absolute() {
+        let mut s = Session::default();
+        assert!(s.execute("editor.state", json!({})).unwrap()["projectPath"].is_null());
+        let name = format!("not-on-disk-host-relative-{}.ecproj", std::process::id());
+        s.path = Some(name.clone());
+        let result = s.execute("editor.state", json!({})).unwrap();
+        assert_eq!(result["projectPath"], json!(std::path::absolute(&name).unwrap().to_string_lossy()));
+        assert_eq!(s.path.as_deref(), Some(name.as_str()));
+        assert_eq!(s.revision, 0);
     }
 
     #[test]
