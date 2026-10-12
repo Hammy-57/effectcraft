@@ -409,7 +409,7 @@ fn ci() -> Result<(), String> {
     let cargo = env!("CARGO");
     run(Command::new(cargo).args(["fmt", "--check"]))?;
     run(Command::new(cargo).args(["clippy", "--workspace", "--all-targets", "--profile", "ci", "--", "-D", "warnings"]))?;
-    run(Command::new(cargo).args(["test", "--workspace", "--profile", "ci"]))?;
+    run(Command::new(cargo).args(["test", "--workspace", "--profile", "ci", "--no-fail-fast"]))?;
     layers()?;
     assets()?;
     wasm()
