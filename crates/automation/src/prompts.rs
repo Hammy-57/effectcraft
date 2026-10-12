@@ -30,7 +30,7 @@ impl Args {
 }
 
 /// The time pitfall every animation recipe repeats.
-const TIMES: &str = "Times are seconds. get_property, render_preview and comp commands use comp time; add_keyframe and set_property with `time` use layer time, which equals comp time only for a layer that starts at 0 and isn't stretched. Otherwise subtract the layer's `start` (from get_comp) from the comp time before keying.";
+const TIMES: &str = r##"Times are seconds. Prefer `timeBase:"comp"` on every add_keyframe and timed set_property call, so `time` uses the Timeline clock, just like get_property and render_preview. Example: set_property {"layer":"#1","path":"transform/opacity","time":3.01,"timeBase":"comp","value":75}. Multiple keys: add_keyframe {"layer":"#1","path":"transform/rotation","keys":[{"time":3.01,"value":0},{"time":4.01,"value":90}],"timeBase":"comp","interpolation":"hold"}. Key writes snap to the nearest comp frame; read returned `compTime`/`layerTime` for the applied time. If layer time is needed explicitly, layerTime = (snappedCompTime - start) * 100 / stretch, and compTime = start + layerTime * stretch / 100 (`start` defaults to 0, `stretch` to 100 when absent from get_comp). Negative stretch reverses the clock; zero or non-finite stretch is invalid. Let the tool convert and snap instead of doing this arithmetic yourself."##;
 
 const CHECK: &str = "Look at the result with render_preview at the important times (comp time) before you finish, and fix what you see; one image is worth many property reads.";
 
@@ -48,7 +48,7 @@ static PROMPTS: &[PromptDef] = &[
                 "Build an animated title card in EffectCraft that reads \"{text}\". Style: {style}.\n\n\
                  1. doc_inspect to see the project. If no composition is active, command_run comp.new {{\"name\":\"Title Card\",\"width\":1920,\"height\":1080,\"frameRate\":30,\"duration\":5}}.\n\
                  2. Background: command_run layer.newSolid {{\"color\":\"#...\"}} (or keep the comp background). Title: command_run layer.newText {{\"text\":..., \"size\":..., \"fill\":...}}; it returns {{\"layer\": id}}. Pick a fitting font with list_fonts and apply it with command_run layer.setText {{\"layer\", \"font\", \"style\"}}.\n\
-                 3. Animate it in over about 0.8 s: add_keyframe on transform/opacity and transform/scale or transform/position with `keys` and interpolation easyEase. Add effects that suit the style with add_effect (e.g. Glow, Drop Shadow, Gaussian Blur) and key their values with add_keyframe on the returned `effects/#n/...` paths.\n\
+                 3. Animate it in over about 0.8 s: add_keyframe on transform/opacity and transform/scale or transform/position with `keys`, `timeBase:\"comp\"` and interpolation easyEase. Add effects that suit the style with add_effect (e.g. Glow, Drop Shadow, Gaussian Blur) and key their values with add_keyframe (`timeBase:\"comp\"`) on the returned `effects/#n/...` paths.\n\
                  4. {TIMES}\n\
                  5. {CHECK} Check legibility, centring and the title-safe area at 0 s, mid-animation and the settled frame.\n\
                  6. Report the layer ids you created. Use undo or history to back out mistakes; save_project {{\"path\"}} only if asked.",
@@ -70,7 +70,7 @@ static PROMPTS: &[PromptDef] = &[
                 "Build an animated lower third in EffectCraft for \"{name}\" — \"{title}\".\n\n\
                  1. doc_inspect; use the active composition (create one with command_run comp.new if there is none) and note its size, frame rate and duration with get_comp.\n\
                  2. A bar: command_run layer.newShape (or layer.newSolid sized to the bar), placed in the lower-left third inside the title-safe area. Two text layers with command_run layer.newText: the name (larger, bold) and the title (smaller), left-aligned over the bar.\n\
-                 3. Parent the texts to the bar (command_run layer.setParent; see describe_command) or animate them together: slide in from the left with add_keyframe on transform/position (interpolation easyEase) over about 0.5 s, hold, then slide out before the end of the comp. Stagger the title a few frames after the name.\n\
+                 3. Parent the texts to the bar (command_run layer.setParent; see describe_command) or animate them together: slide in from the left with add_keyframe on transform/position (timeBase:\"comp\", interpolation easyEase) over about 0.5 s, hold, then slide out before the end of the comp. Stagger the title a few frames after the name.\n\
                  4. {TIMES}\n\
                  5. {CHECK} Check the slide-in, the held frame and the slide-out (get_motion describes them in words: enter, hold, exit, with times).\n\
                  6. Report the layer ids and key times.",
@@ -90,8 +90,8 @@ static PROMPTS: &[PromptDef] = &[
                  run_script {{\"code\"}} runs JavaScript with an After Effects-style object model: app.project, items.addComp, comp.layers.addSolid/addText/addShape/addNull, layer.property(\"ADBE Transform Group\").property(\"ADBE Position\").setValueAtTime(t, v) (comp time, as in After Effects), Effects.addProperty(match name), expressions, markers and renderQueue. It returns {{ok, result, output, error: {{message, line, column}}}}. app.run(id, params) calls any engine command (see command_list / describe_command).\n\n\
                  1. Read the script. Note what can't work headless: file access outside the project folder, `$.evalFile` of files you don't have, and dialogs. ScriptUI windows it opens stay open; drive them with script_ui (list, get, click, set, close).\n\
                  2. Wrap the edits in app.beginUndoGroup(\"...\") / app.endUndoGroup() so one undo removes them.\n\
-                 3. run_script. On an error, read error.line / error.column, undo any partial edits, fix the code and run it again.\n\
-                 4. Verify with doc_inspect and get_comp, then render_preview the comps it built. {CHECK}\n\n\
+                 3. run_script. On an error (`isError:true`), inspect error.line / error.column and output. A stopped script rolls back an open undo group and keeps edits outside it; inspect the project before deciding what to undo, fix the code and run it again.\n\
+                 4. Verify with doc_inspect and get_comp, then render_preview the comps it built. {TIMES} {CHECK}\n\n\
                  Script:\n```javascript\n{script}\n```",
                 script = a.or("script", ""),
             )
@@ -115,7 +115,7 @@ static PROMPTS: &[PromptDef] = &[
                  2. render_compare {{\"a\": {{\"path\": \"{reference}\"}}, \"b\": {{\"comp\", \"time\"}}, \"min_psnr\": 35}} renders the frame now and compares it with the reference: max/mean difference, PSNR, SSIM, changed pixels, `pass`, and a diff heat map image (red -> yellow -> white by size of difference) showing where they differ. Use render_preview {{\"comp\", \"time\"}} to look at the frame itself.\n\
                  3. To measure a fix, keep the current frame with render_snapshot {{\"name\": \"before\"}} and compare later frames with it as well as with the reference.\n\
                  4. Classify each difference: position or scale, colour or levels, blur or glow, text, missing layer, or timing. Render ±1 frame before blaming a property: a time offset is the usual cause. {TIMES}\n\
-                 5. Fix with set_property, add_keyframe or add_effect (get_layer {{\"layer\", \"flat\": true}} lists the property paths), re-render and compare again until it matches.\n\
+                 5. Fix with set_property or add_keyframe (`timeBase:\"comp\"` for timed writes), or add_effect (get_layer {{\"layer\", \"flat\": true}} lists the property paths), re-render and compare again until it matches.\n\
                  6. Report what differed, what you changed and the final comparison.",
                 reference = a.or("reference_path", ""),
             )
@@ -134,7 +134,7 @@ static PROMPTS: &[PromptDef] = &[
                 "Animate layer {layer} in the active composition: {motion}.\n\n\
                  1. get_comp: find the layer (its id, `start`, in/out points and stretch) and the comp's frame rate and duration.\n\
                  2. get_layer {{\"layer\", \"flat\": true}} lists every property `path` (transform/position, transform/scale, transform/rotation, transform/opacity, effects/#n/...) and its current value.\n\
-                 3. Key it with add_keyframe {{\"layer\", \"path\", \"keys\": [{{\"time\", \"value\"}}, ...], \"interpolation\"}} (easyEase for natural motion, hold for cuts). Use set_property {{\"expression\"}} for procedural motion (wiggle(freq, amp), loopOut(), time*n).\n\
+                 3. Key it with add_keyframe {{\"layer\", \"path\", \"keys\": [{{\"time\", \"value\"}}, ...], \"interpolation\", \"timeBase\":\"comp\"}} (easyEase for natural motion, hold for cuts). Use set_property {{\"expression\"}} for procedural motion (wiggle(freq, amp), loopOut(), time*n).\n\
                  4. {TIMES}\n\
                  5. {CHECK} Render the start, the middle and the end of the motion; get_motion summarises it in words.\n\
                  6. Summarise the keys and expressions you set.",
@@ -187,4 +187,64 @@ pub fn get(name: &str, args: Option<&Value>) -> Result<Value, String> {
         "description": p.description,
         "messages": [{"role": "user", "content": {"type": "text", "text": (p.text)(&given)}}],
     }))
+}
+
+#[cfg(test)]
+mod time_recipe_tests {
+    use super::*;
+    use crate::{Backend, Session, tools};
+
+    fn call(backend: &mut Backend, name: &str, args: Value) -> Value {
+        match tools::run(backend, name, &args).unwrap() {
+            tools::Reply::Json(value) => value,
+            _ => panic!("{name} did not return JSON"),
+        }
+    }
+
+    fn example(tool: &str) -> Value {
+        let marker = format!("{tool} {{");
+        let start = TIMES.find(&marker).unwrap() + tool.len() + 1;
+        serde_json::Deserializer::from_str(&TIMES[start..]).into_iter::<Value>().next().unwrap().unwrap()
+    }
+
+    #[test]
+    fn every_recipe_prefers_the_comp_clock_and_documents_stretch_and_snapping() {
+        for recipe in PROMPTS {
+            let text = (recipe.text)(&Args(Map::new()));
+            assert!(text.contains("timeBase:\"comp\""), "{}", recipe.name);
+            assert!(text.contains("(snappedCompTime - start) * 100 / stretch"), "{}", recipe.name);
+            assert!(text.contains("Negative stretch"), "{}", recipe.name);
+            assert!(text.contains("nearest comp frame"), "{}", recipe.name);
+            assert!(!text.contains("Otherwise subtract"), "{}", recipe.name);
+        }
+    }
+
+    #[test]
+    fn documented_tool_examples_land_on_comp_frames_for_offset_stretched_and_reversed_layers() {
+        for stretch in [100.0, 200.0, 50.0, -100.0, -50.0] {
+            let start = if stretch > 0.0 { 2.0 } else { 4.0 };
+            let mut backend = Backend::headless(Session::default());
+            call(&mut backend, "command_run", json!({"id":"comp.new","params":{"name":"Recipe","frameRate":30,"duration":10}}));
+            call(&mut backend, "command_run", json!({"id":"layer.newSolid"}));
+            call(&mut backend, "command_run", json!({"id":"layer.timeStretch","params":{"layer":"#1","percent":stretch}}));
+            call(&mut backend, "command_run", json!({"id":"layer.timing","params":{"layer":"#1","start":start,"in":0,"out":10}}));
+            let written = call(&mut backend, "set_property", example("set_property"));
+            assert_eq!(written["requestedTime"], 3.01);
+            assert!((written["compTime"].as_f64().unwrap() - 3.0).abs() < 1e-8, "{written}");
+            assert!((written["layerTime"].as_f64().unwrap() - (3.0 - start) * 100.0 / stretch).abs() < 1e-8, "{written}");
+            assert_eq!(written["appliedValue"], 75.0);
+            let read = call(&mut backend, "get_property", json!({"layer":"#1","path":"transform/opacity","time":3.0}));
+            assert_eq!(read["value"], 75.0);
+            let written = call(&mut backend, "add_keyframe", example("add_keyframe"));
+            let keys = written["keys"].as_array().unwrap();
+            assert_eq!(keys.len(), 2, "{written}");
+            for (comp_time, value) in [(3.0, 0.0), (4.0, 90.0)] {
+                let key = keys.iter().find(|key| (key["value"].as_f64().unwrap() - value).abs() < 1e-8).unwrap();
+                assert!((key["time"].as_f64().unwrap() - (comp_time - start) * 100.0 / stretch).abs() < 1e-8, "{key}");
+                assert_eq!(key["out"], "Hold");
+                let read = call(&mut backend, "get_property", json!({"layer":"#1","path":"transform/rotation","time":comp_time}));
+                assert_eq!(read["value"], value);
+            }
+        }
+    }
 }

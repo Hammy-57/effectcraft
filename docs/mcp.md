@@ -281,3 +281,28 @@ A render job owns a snapshot of the project taken when it started. While it runs
 
 `renderQueue.render {"wait": false}` returns the ids being rendered at once; poll
 `renderQueue.list` for status and stop it with `renderQueue.stop`.
+
+## Reliable inspection and key writes
+
+Compact composition, keyframe and flat property pages retain exact numbers and fit a
+7,000-byte serialized JSON budget by default (`max_chars`, 1,024–1,000,000). `limit` is an upper
+bound, not a promise: continue from `next_offset` until null and reconcile `returned` against
+`total`. The JSON text puts completeness metadata before the list. `full: true` without a
+paging/budget argument is an explicit unbounded compatibility escape hatch.
+
+An oversized field is an object with `$omitted: true`, `editable: false`, `pointer` and
+`fetch: "get_field"`. It is not the field's value. Call `get_field` with `source` set to the
+original inspection tool, the same target/time/flat arguments, and that pointer. Concatenate
+its `text` chunks using byte `next_offset` and parse the combined JSON to recover the exact
+value. Do not write an omission marker back to a property.
+
+Inspectors identify the composition, revision, comp time and `timeBase: "comp"`. `value` and
+`rawValue` are pre-expression values; `evaluatedValue` (and the legacy `evaluated`) is the
+expression result, with `expressionError` when evaluation fails. `uid`, `enabled`, and
+`effectiveEnabled` distinguish stable identity and disabled ancestor groups.
+
+Prefer `timeBase: "comp"` when keying at a Timeline time. A timed `set_property` response
+reports `requestedTime`, actual snapped `layerTime` / `compTime`, and `appliedValue`, and reads
+back at that comp time. Script failures set MCP `isError: true` while preserving error details,
+output and partial-edit information. Ambiguous name aliases are errors with candidate IDs;
+use numeric IDs, canonical property paths or `@uid` to address a specific object.
