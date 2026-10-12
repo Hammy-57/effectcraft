@@ -629,6 +629,9 @@ pub struct GpuContext {
     pub(crate) generation: effectcraft_render::allocation::GpuGeneration,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
+    /// RT10e: the window's traffic light, when this device is the window's (its submissions
+    /// then pause while a surface reconfigures; see [`crate::traffic_light`]).
+    light: std::sync::OnceLock<Arc<crate::TrafficLight>>,
     pub(crate) name: String,
     pub(crate) max_dim: u32,
     integrated: bool,
@@ -1017,6 +1020,7 @@ impl GpuContext {
             generation,
             device,
             queue,
+            light: std::sync::OnceLock::new(),
             name,
             max_dim,
             bgl,
@@ -1065,6 +1069,34 @@ impl GpuContext {
         result
     }
 
+    /// RT10e: submit through `light` from now on (the device is a window's, whose surface
+    /// configuration must not overlap a submission). Once; `false` when a light is already set.
+    pub fn set_traffic_light(&self, light: Arc<crate::TrafficLight>) -> bool {
+        self.light.set(light).is_ok()
+    }
+
+    /// The traffic light the compositor submits through, if any.
+    pub fn traffic_light(&self) -> Option<&Arc<crate::TrafficLight>> {
+        self.light.get()
+    }
+
+    /// Every compositor submission: through the traffic light when there is one.
+    pub(crate) fn submit(&self, commands: wgpu::CommandBuffer) -> wgpu::SubmissionIndex {
+        match self.light.get() {
+            Some(light) => light.pass(|| self.queue.submit([commands])),
+            None => self.queue.submit([commands]),
+        }
+    }
+
+    /// A submission with no work (through the traffic light): it completes once everything
+    /// submitted before it has, so its index fences the work so far.
+    pub fn fence(&self) -> wgpu::SubmissionIndex {
+        match self.light.get() {
+            Some(light) => light.pass(|| self.queue.submit([])),
+            None => self.queue.submit([]),
+        }
+    }
+
     /// A notification hook for the owner of a shared device's error/loss handlers.
     /// Invoke it with diagnostic context when the host observes a device failure.
     /// It retires this context and settles pending readbacks without replacing any
@@ -1081,6 +1113,25 @@ impl GpuContext {
             notify(message);
             if let Some(uploads) = uploads.upgrade() {
                 clear_retained(&uploads);
+            }
+        }
+    }
+
+    /// Wait up to `timeout` for `submission` (all submitted work when `None`): `Ok(false)` while
+    /// it is still running. Unlike [`Self::poll_readbacks`], running out of time does not retire
+    /// the context: a deep queue of frames that keeps completing is not a hang. The readback
+    /// deadlines, which restart whenever an earlier readback completes, decide that.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn wait_for(&self, submission: Option<wgpu::SubmissionIndex>, timeout: std::time::Duration) -> Result<bool, String> {
+        self.readbacks.check()?;
+        match self.device.poll(wgpu::PollType::Wait { submission_index: submission, timeout: Some(timeout) }) {
+            Ok(_) => Ok(true),
+            Err(wgpu::PollError::Timeout) => Ok(false),
+            Err(e) => {
+                let error = format!("GPU readback poll: {e}");
+                self.readbacks.retire(error.clone());
+                log::error!("{error}");
+                Err(error)
             }
         }
     }
@@ -1151,7 +1202,6 @@ impl GpuContext {
         submission: Option<wgpu::SubmissionIndex>,
         read: impl FnOnce(&[u8]) -> Result<T, String>,
     ) -> Result<T, String> {
-        let deadline = std::time::Instant::now() + crate::readback::TIMEOUT;
         let (tx, rx) = std::sync::mpsc::channel();
         let unmap = buffer.clone();
         let ticket = self.readbacks.start(move |r| {
@@ -1160,6 +1210,7 @@ impl GpuContext {
                 unmap.unmap();
             }
         })?;
+        let watch = ticket.watch();
         if ticket.active() {
             let b = buffer.clone();
             buffer.map_async(wgpu::MapMode::Read, .., move |r| {
@@ -1179,15 +1230,20 @@ impl GpuContext {
         }
         loop {
             self.readbacks.check()?;
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            // The deadline restarts whenever a readback queued ahead of this one completes, so
+            // waiting behind a deep queue of frames is not a timeout (`None`: settled already).
+            let deadline = watch.deadline();
+            let remaining = deadline.map_or(std::time::Duration::from_millis(1), |d| d.saturating_duration_since(std::time::Instant::now()));
             if remaining.is_zero() {
                 let error = "GPU readback receive timed out; context retired".to_string();
                 self.readbacks.retire(error.clone());
                 return Err(error);
             }
-            // Block until the GPU is done (bounded by the deadline: a timeout retires the
-            // context) rather than polling and sleeping, which adds latency to every readback.
-            self.poll_readbacks(wgpu::PollType::Wait { submission_index: submission.clone(), timeout: Some(remaining) })?;
+            // Block until the GPU is done rather than polling and sleeping, which adds latency to
+            // every readback; in slices, so the deadline above can move on.
+            if deadline.is_some() {
+                self.wait_for(submission.clone(), remaining.min(std::time::Duration::from_millis(250)))?;
+            }
             // The callback may be running on another thread that polled the same device.
             match rx.recv_timeout(remaining.min(std::time::Duration::from_millis(1))) {
                 Ok(result) => {
@@ -2433,7 +2489,7 @@ impl<'g> Enc<'g> {
             let _profile = effectcraft_render::profile::span("submit");
             #[cfg(feature = "profile")]
             let timing = self.timestamps.take().and_then(|b| b.resolve(self.g, &mut enc));
-            self.submitted = Some(self.g.queue.submit([enc.finish()]));
+            self.submitted = Some(self.g.submit(enc.finish()));
             #[cfg(feature = "profile")]
             if let Some(timing) = timing {
                 timing.map(self.g.queue.get_timestamp_period());

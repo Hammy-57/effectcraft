@@ -25,8 +25,8 @@
 //! device, see `compositor_gpu`), so the texture comes back as RGBA8 bytes; a worker does not
 //! wait for them but goes on to its next frame, and the frame lands later (`landing`).
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use effectcraft_engine::project::{Comp, ItemId, ItemKind, LayerSource, Node, Project, PropGroup};
@@ -39,6 +39,8 @@ use rayon::prelude::*;
 #[cfg(not(target_arch = "wasm32"))]
 mod landing;
 mod property_reuse;
+#[cfg(not(target_arch = "wasm32"))]
+mod resident;
 
 /// Comp identities (and the project snapshots behind them) the RAM preview keeps frames of.
 const MAX_KEEPERS: usize = 64;
@@ -46,7 +48,7 @@ const MAX_KEEPERS: usize = 64;
 /// GPU frames kept for RAM preview (bytes of video memory) at first. wgpu can't tell how much
 /// video memory there is: each time the device runs out, the budget halves (to
 /// [`MIN_GPU_BUDGET`]) and the frame renders on the CPU (#106).
-const GPU_BUDGET: usize = 1 << 30;
+pub(crate) const GPU_BUDGET: usize = 1 << 30;
 const MIN_GPU_BUDGET: usize = 64 << 20;
 
 /// A rendered viewer frame: CPU pixels or a GPU texture.
@@ -157,9 +159,71 @@ impl std::hash::Hash for FrameKey {
     }
 }
 
+/// The cached frames from least to most recently shown: moving one to the end ([`Order::touch`])
+/// is O(log n), not a scan of every frame (a 4K preview of a long comp keeps thousands).
+#[derive(Default)]
+struct Order {
+    next: u64,
+    by_age: BTreeMap<u64, FrameKey>,
+    age: HashMap<FrameKey, u64>,
+}
+
+impl Order {
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.by_age.len()
+    }
+    /// Least recently shown first.
+    fn iter(&self) -> impl DoubleEndedIterator<Item = &FrameKey> {
+        self.by_age.values()
+    }
+    /// `k` becomes the most recently shown (added if new).
+    fn push_back(&mut self, k: FrameKey) {
+        self.remove(&k);
+        self.next = self.next.wrapping_add(1);
+        self.by_age.insert(self.next, k);
+        self.age.insert(k, self.next);
+    }
+    /// Shown again: last in line (no-op when `k` is not cached).
+    fn touch(&mut self, k: &FrameKey) {
+        if let Some(a) = self.age.remove(k)
+            && let Some(k) = self.by_age.remove(&a)
+        {
+            self.push_back(k);
+        }
+    }
+    fn remove(&mut self, k: &FrameKey) -> bool {
+        match self.age.remove(k) {
+            Some(a) => self.by_age.remove(&a).is_some(),
+            None => false,
+        }
+    }
+    /// `old` is known as `new` from now on, in the same place.
+    fn rename(&mut self, old: &FrameKey, new: FrameKey) {
+        if let Some(a) = self.age.remove(old) {
+            self.by_age.insert(a, new);
+            self.age.insert(new, a);
+        }
+    }
+    fn retain(&mut self, mut keep: impl FnMut(&FrameKey) -> bool) {
+        let Order { by_age, age, .. } = self;
+        by_age.retain(|_, k| {
+            let kept = keep(k);
+            if !kept {
+                age.remove(k);
+            }
+            kept
+        });
+    }
+    fn clear(&mut self) {
+        self.by_age.clear();
+        self.age.clear();
+    }
+}
+
 struct Cache {
     map: HashMap<FrameKey, FrameImage>,
-    order: VecDeque<FrameKey>,
+    order: Order,
     protected: HashMap<FrameKey, usize>,
     /// The playing preview, if any: eviction spares the frames it shows next.
     playhead: Option<Playhead>,
@@ -192,10 +256,9 @@ impl Cache {
     /// Video memory: drop the oldest GPU frames past their own budget.
     fn evict_gpu(&mut self) {
         while self.gpu_bytes > self.gpu_budget {
-            let Some(i) = self.eviction_index(true) else { break };
-            if let Some(old) = self.order.remove(i) {
-                self.remove(&old);
-            }
+            let Some(old) = self.eviction_candidate(true) else { break };
+            self.order.remove(&old);
+            self.remove(&old);
         }
     }
     /// The GPU ran out of memory: keep half as many GPU frames from now on.
@@ -217,11 +280,7 @@ impl Cache {
     }
     /// Shown again: last in line for eviction.
     fn touch(&mut self, k: &FrameKey) {
-        if let Some(i) = self.order.iter().rposition(|o| o == k)
-            && let Some(k) = self.order.remove(i)
-        {
-            self.order.push_back(k);
-        }
+        self.order.touch(k);
     }
     /// Drop every frame of the identities in `gone`.
     fn drop_contents(&mut self, gone: &HashSet<u64>) {
@@ -237,29 +296,31 @@ impl Cache {
     /// looping preview longer than the cache re-rendered every frame on every loop and played
     /// into gaps that prefetch kept refilling (#595). Otherwise the least recently shown, the
     /// protected window ([`Frames::protect_frames`]) last.
-    fn eviction_index(&self, gpu_only: bool) -> Option<usize> {
+    fn eviction_candidate(&self, gpu_only: bool) -> Option<FrameKey> {
         let eligible = |k: &FrameKey| !gpu_only || self.map.get(k).is_some_and(FrameImage::is_gpu);
         if let Some(p) = &self.playhead {
-            let mut farthest: Option<(i64, usize)> = None;
-            for (i, k) in self.order.iter().enumerate().filter(|(_, k)| eligible(k)) {
+            let mut farthest: Option<(i64, FrameKey)> = None;
+            for k in self.order.iter().filter(|k| eligible(k)) {
                 match p.ahead(k) {
-                    None => return Some(i),
-                    Some(d) if farthest.is_none_or(|(f, _)| d > f) => farthest = Some((d, i)),
+                    None => return Some(*k),
+                    Some(d) if farthest.is_none_or(|(f, _)| d > f) => farthest = Some((d, *k)),
                     Some(_) => {}
                 }
             }
-            return farthest.map(|(_, i)| i);
+            return farthest.map(|(_, k)| k);
         }
-        self.order.iter().position(|k| eligible(k) && !self.protected.contains_key(k)).or_else(|| {
+        self.order.iter().find(|k| eligible(k) && !self.protected.contains_key(k)).copied().or_else(|| {
             // If the window itself does not fit, sacrifice its furthest frame, not the playhead.
-            self.order.iter().enumerate().filter(|(_, k)| eligible(k)).max_by_key(|(_, k)| self.protected.get(*k).copied().unwrap_or(0)).map(|(i, _)| i)
+            self.order.iter().filter(|k| eligible(k)).max_by_key(|k| self.protected.get(*k).copied().unwrap_or(0)).copied()
         })
     }
 
     fn evict_to_budget(&mut self) {
         while self.bytes > self.budget {
-            let Some(i) = self.eviction_index(false) else { break };
-            let Some(old) = self.order.remove(i) else { break };
+            let Some(old) = self.eviction_candidate(false) else { break };
+            if !self.order.remove(&old) {
+                break;
+            }
             self.remove(&old);
         }
     }
@@ -502,6 +563,8 @@ pub struct Frames {
     playback_budget: Arc<Mutex<crate::playback_budget::Budget>>,
     content_keys: ContentKeys,
     gpu_retired: Arc<AtomicBool>,
+    /// Bumped by [`Frames::clear`]: frames asked for before are dropped when they finish.
+    epoch: Arc<AtomicU64>,
     /// [`comp_content`] identities by (revision, preview epoch, comp), with the project that keeps an identity
     /// found by [`Frames::identity`] in another project.
     identities: Mutex<HashMap<(u64, u64, u64), Identity>>,
@@ -516,6 +579,9 @@ pub struct Frames {
     /// GPU frames whose readback is in flight (see [`landing`]).
     #[cfg(not(target_arch = "wasm32"))]
     landing: Arc<landing::Landing>,
+    /// GPU frames shown as textures, without a readback (see [`resident`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    resident: Arc<resident::Resident>,
     /// The cache bar's frames, remembered while nothing they depend on changes (the bar is drawn
     /// every UI frame).
     bar: Mutex<CacheBar>,
@@ -544,7 +610,7 @@ impl Default for Frames {
         #[cfg(not(target_arch = "wasm32"))]
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 16);
         Frames {
-            cache: Arc::new(Mutex::new(Cache { map: HashMap::new(), order: VecDeque::new(), protected: HashMap::new(), playhead: None, bytes: 0, gpu_bytes: 0, budget: 3 << 30, gpu_budget: GPU_BUDGET, generation: 0 })),
+            cache: Arc::new(Mutex::new(Cache { map: HashMap::new(), order: Order::default(), protected: HashMap::new(), playhead: None, bytes: 0, gpu_bytes: 0, budget: 3 << 30, gpu_budget: GPU_BUDGET, generation: 0 })),
             inflight: Arc::new(Mutex::new(HashSet::new())),
             failed: Failed::default(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -568,6 +634,7 @@ impl Default for Frames {
             playback_budget: Arc::default(),
             content_keys: Arc::default(),
             gpu_retired: Arc::default(),
+            epoch: Arc::default(),
             identities: Mutex::default(),
             bases: Mutex::default(),
             keepers: Mutex::default(),
@@ -575,6 +642,8 @@ impl Default for Frames {
             remote_busy: Arc::default(),
             #[cfg(not(target_arch = "wasm32"))]
             landing: Arc::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            resident: Arc::default(),
             bar: Mutex::default(),
         }
     }
@@ -592,7 +661,8 @@ fn max_running(job: &Job, threads: usize) -> usize {
     let s = job.opts.scale.clamp(0.01, 4.0);
     let frame = ((w as f64 * s).ceil() * (h as f64 * s).ceil() * 16.0 * 4.0).max(1.0);
     let cpu = ((job.src.layer_cache.budget() as f64 / frame) as usize).max(1);
-    match job.src.gpu.as_ref().filter(|g| composites_on_gpu(job, g)) {
+    let on_gpu = |g: &Gpu| job.on_gpu.unwrap_or_else(|| composites_on_gpu(job, g));
+    match job.src.gpu.as_ref().filter(|g| on_gpu(g)) {
         Some(g) => cpu.max(((gpu_working_budget(g) as f64 / frame) as usize).min(threads)),
         None => cpu,
     }
@@ -605,9 +675,36 @@ fn gpu_working_budget(g: &Gpu) -> u64 {
     g.device().limits().max_buffer_size.clamp(1 << 30, 4 << 30)
 }
 
-/// `job` will composite on the GPU (see [`Worker::render_job`]): the backend allows it and Auto
-/// has not measured the CPU as faster for this comp (frozen previews and a retired device still
-/// fall back to the CPU, within the larger limit).
+/// Whether `job` composites on the GPU: the decision [`Worker::render_job`] follows, taken once
+/// when the job may first start, so the right concurrency cap applies to it ([`max_running`]).
+/// Frozen previews, a retired device, a failed landing's retry and the frames Auto puts on the
+/// CPU (measured faster there, or its periodic re-measurement) composite on the CPU and get the
+/// CPU's cap (A3). Auto's choice counts frames, so it is taken here and only here.
+fn gpu_pick(job: &Job, retired: bool) -> bool {
+    use effectcraft_engine::render::{Accelerator, AutoKey, Backend};
+    let Some(g) = job.src.gpu.as_ref() else { return false };
+    if retired || job.retry.is_some() {
+        return false;
+    }
+    if !job.src.project.freeze.sections.is_empty() && !effectcraft_engine::freeze::Preview::for_comp(&job.src.project, job.comp).is_empty() {
+        return false;
+    }
+    match job.opts.backend {
+        Backend::Auto if job.src.project.settings.gpu_acceleration && job.src.gpu_display => {
+            // As `Renderer::frame_auto`: no Auto history with a region of interest, nor in the
+            // browser (it always composites on the GPU there).
+            if cfg!(target_arch = "wasm32") || job.opts.roi.is_some() {
+                return true;
+            }
+            g.auto_pick().is_none_or(|p| p.choose(AutoKey::new(job.comp, job.opts.scale, true)))
+        }
+        // The full-float path (`Renderer::comp_frame`) takes Auto's choice itself: estimated.
+        _ => composites_on_gpu(job, g),
+    }
+}
+
+/// `job` will composite on the GPU, as far as can be told without taking Auto's choice: the
+/// backend allows it and Auto has not measured the CPU as faster for this comp.
 fn composites_on_gpu(job: &Job, g: &Gpu) -> bool {
     use effectcraft_engine::render::{Accelerator, AutoKey, AutoPick, Backend};
     match job.opts.backend {
@@ -757,6 +854,8 @@ impl Frames {
     /// cannot restore an invalid texture after this removal.
     pub fn retire_gpu(&self) {
         self.gpu_retired.store(true, Ordering::Release);
+        #[cfg(not(target_arch = "wasm32"))]
+        self.resident.set(false);
         self.adapt_playback(None);
         if let Ok(mut cache) = self.cache.lock() {
             let keys: Vec<_> = cache.map.iter().filter_map(|(key, image)| image.is_gpu().then_some(*key)).collect();
@@ -768,6 +867,34 @@ impl Frames {
         }
         if let Some(ctx) = &self.ctx {
             ctx.request_repaint();
+        }
+    }
+
+    /// RT10e: a new GPU compositor replaces a retired one (the shared-device compositor's
+    /// fallback to one on a device of its own): GPU frames are kept again.
+    pub fn revive_gpu(&self) {
+        self.gpu_retired.store(false, Ordering::Release);
+    }
+
+    /// RT10e: show GPU viewer frames straight from their textures (`true`, the compositor shares
+    /// egui's device) or read them back as now (`false`). See [`resident`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn set_resident(&self, on: bool) {
+        self.resident.set(on);
+    }
+
+    /// Viewer frames handed over as textures without a readback so far (RT10e).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn resident_frames(&self) -> u64 {
+        self.resident.shown.load(Ordering::Relaxed)
+    }
+
+    /// Bytes of GPU frames to keep at most: on unified memory the RAM preview budget (video
+    /// memory is RAM there), else [`GPU_BUDGET`].
+    pub fn set_gpu_budget(&self, bytes: usize) {
+        if let Ok(mut c) = self.cache.lock() {
+            c.gpu_budget = bytes.max(MIN_GPU_BUDGET);
+            c.evict_gpu();
         }
     }
 
@@ -1057,7 +1184,10 @@ impl Frames {
         self.cache.lock().map(|c| c.budget).unwrap_or(0)
     }
 
+    /// Purge Caches: forget every frame, and the frames rendering or landing now too (they are
+    /// dropped when they finish, see [`Job::epoch`]): their pixels may be from before.
     pub fn clear(&self) {
+        self.epoch.fetch_add(1, Ordering::AcqRel);
         self.adapt_playback(None);
         if let Some(r) = &self.remote {
             r.purge();
@@ -1126,7 +1256,21 @@ impl Frames {
         }
         q.seq += 1;
         let seq = q.seq;
-        q.jobs.push(Job { key, src: src.clone(), comp, t, opts, urgent: false, disk_only: true, seq, cancel: Arc::default() });
+        let epoch = self.epoch.load(Ordering::Acquire);
+        q.jobs.push(Job {
+            key,
+            src: src.clone(),
+            comp,
+            t,
+            opts,
+            urgent: false,
+            disk_only: true,
+            seq,
+            epoch,
+            on_gpu: None,
+            retry: None,
+            cancel: Arc::default(),
+        });
         drop(inf);
         drop(q);
         #[cfg(not(target_arch = "wasm32"))]
@@ -1184,7 +1328,8 @@ impl Frames {
         }
         q.seq += 1;
         let seq = q.seq;
-        q.jobs.push(Job { key, src: src.clone(), comp, t, opts, urgent, disk_only: false, seq, cancel: Arc::default() });
+        let epoch = self.epoch.load(Ordering::Acquire);
+        q.jobs.push(Job { key, src: src.clone(), comp, t, opts, urgent, disk_only: false, seq, epoch, on_gpu: None, retry: None, cancel: Arc::default() });
         drop(inf);
         drop(q);
         #[cfg(not(target_arch = "wasm32"))]
@@ -1210,10 +1355,13 @@ impl Frames {
             playback_budget: self.playback_budget.clone(),
             content_keys: self.content_keys.clone(),
             gpu_retired: self.gpu_retired.clone(),
+            epoch: self.epoch.clone(),
             #[cfg(not(target_arch = "wasm32"))]
             pool: self.pool.clone(),
             #[cfg(not(target_arch = "wasm32"))]
             landing: self.landing.clone(),
+            #[cfg(not(target_arch = "wasm32"))]
+            resident: self.resident.clone(),
         }
     }
 
@@ -1261,7 +1409,8 @@ impl Frames {
                 let Some(i) = q.best() else { break };
                 // Remote renderers deliberately use originals; a local freeze must not
                 // strand their queue waiting for files unavailable to that worker.
-                let job = q.jobs.swap_remove(i);
+                let mut job = q.jobs.swap_remove(i);
+                job.epoch = self.epoch.load(Ordering::Acquire);
                 q.running.insert(job.key);
                 if job.urgent {
                     q.urgent_running += 1;
@@ -1361,11 +1510,14 @@ struct Worker {
     playback_budget: Arc<Mutex<crate::playback_budget::Budget>>,
     content_keys: ContentKeys,
     gpu_retired: Arc<AtomicBool>,
+    epoch: Arc<AtomicU64>,
     /// The pool frames render on (`None`: rayon's global pool).
     #[cfg(not(target_arch = "wasm32"))]
     pool: Option<Arc<rayon::ThreadPool>>,
     #[cfg(not(target_arch = "wasm32"))]
     landing: Arc<landing::Landing>,
+    #[cfg(not(target_arch = "wasm32"))]
+    resident: Arc<resident::Resident>,
 }
 
 /// What finishing a frame needs besides its pixels (see [`Worker::publish`]).
@@ -1459,9 +1611,15 @@ impl Worker {
     /// the job has to wait for memory (a finishing frame starts it, see [`Worker::release`]).
     fn run_next(&self) -> bool {
         let Worker { queue, content_keys, .. } = self;
-        let job = {
+        #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+        let mut job = {
             let Ok(mut q) = queue.lock() else { return false };
             let Some(i) = q.best() else { return false };
+            let retired = self.gpu_retired.load(Ordering::Acquire);
+            let Some(j) = q.jobs.get_mut(i) else { return false };
+            if j.on_gpu.is_none() || (retired && j.on_gpu == Some(true)) {
+                j.on_gpu = Some(gpu_pick(j, retired));
+            }
             let j = &q.jobs[i];
             // Keep one viewer slot beyond the prefetch budget, but never nest another viewer
             // render inside it. Rayon can run queued jobs inside a parallel render: unlimited
@@ -1471,7 +1629,8 @@ impl Worker {
                 q.parked += 1;
                 return false;
             }
-            let job = q.jobs.swap_remove(i);
+            let mut job = q.jobs.swap_remove(i);
+            job.epoch = self.epoch.load(Ordering::Acquire);
             q.running.insert(job.key);
             if job.urgent {
                 q.urgent_running += 1;
@@ -1479,6 +1638,11 @@ impl Worker {
             }
             job
         };
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(retry) = job.retry.take() {
+            self.render_retry(job, *retry);
+            return true;
+        }
         let t0 = web_time::Instant::now();
         let disk = job.src.disk.as_ref().map(|dc| (dc.clone(), frame_disk_key(content_keys, &job.src.project, &job.key, opts_hash(&job.opts))));
         if job.disk_only && disk.as_ref().is_none_or(|(dc, k)| dc.contains(disk_cache::Kind::Frame, *k)) {
@@ -1517,6 +1681,12 @@ impl Worker {
     /// disk) and release its job. `queued`: time a GPU frame waited behind other frames in
     /// flight on the landing thread, left out of its render time (RT9b).
     fn publish(&self, job: &Job, ci: FrameImage, tail: &Tail, disk_hit: bool, queued: std::time::Duration) {
+        if job.epoch != self.epoch.load(Ordering::Acquire) {
+            // Started before Purge Caches: its pixels may be from before (a footage file
+            // reloaded from disk). Rendered again instead, as the viewer would ask.
+            self.requeue(Job { retry: None, ..job.clone() });
+            return;
+        }
         if !(disk_hit || ci.is_gpu() && self.gpu_retired.load(Ordering::Acquire))
             && let Some(ticket) = tail.ticket.clone()
         {
@@ -1541,14 +1711,35 @@ impl Worker {
         let backlog = self.queue.lock().map(|q| q.jobs.iter().filter(|j| !j.urgent && !j.disk_only).count()).unwrap_or(0);
         if !disk_hit
             && keep_on_disk(render_time, job.urgent, backlog)
-            && let (Some((dc, k)), FrameImage::Cpu(img)) = (&tail.disk, &ci)
+            && let Some((dc, k)) = &tail.disk
         {
-            // Hands over a reference to the frame (no copy, no compression here).
-            dc.put_frame(*k, img.size[0] as u32, img.size[1] as u32, ColorBytes(img.clone()));
+            match &ci {
+                // Hands over a reference to the frame (no copy, no compression here).
+                FrameImage::Cpu(img) => dc.put_frame(*k, img.size[0] as u32, img.size[1] as u32, ColorBytes(img.clone())),
+                // A frame shown from its texture (RT10e) is read back for the disk cache only.
+                #[cfg(not(target_arch = "wasm32"))]
+                FrameImage::Gpu(f) => self.read_back_for_disk(&job.src, f, dc.clone(), *k),
+                #[cfg(target_arch = "wasm32")]
+                FrameImage::Gpu(_) => {}
+            }
             if let Some(ctx) = &self.ctx {
                 ctx.request_repaint();
             }
         }
+    }
+
+    /// RT10e: read a resident frame back on the landing thread and put it in the disk cache
+    /// (skipped when too many readbacks are in flight: the frame just isn't cached on disk).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn read_back_for_disk(&self, src: &RenderSource, f: &Arc<DisplayFrame>, dc: Arc<DiskCache>, k: u128) {
+        let Some(gpu) = &src.gpu else { return };
+        let (w, h) = (f.width, f.height);
+        let land: landing::Land = Box::new(move |bytes, _| {
+            if let Some(img) = bytes.and_then(|b| display_color_image(w, h, &b)) {
+                dc.put_frame(k, w, h, ColorBytes(Arc::new(img)));
+            }
+        });
+        let _ = self.landing.begin(gpu, f, land);
     }
 
     /// Store a finished frame and release its job.
@@ -1612,6 +1803,47 @@ impl Worker {
         }
     }
 
+    /// A running job goes back into the queue (and renders again when its turn comes): a frame
+    /// that started before Purge Caches, or a GPU frame whose landing failed. It keeps its key
+    /// in flight, so asking for it meanwhile doesn't render it twice.
+    fn requeue(&self, mut job: Job) {
+        if job.called_off() {
+            // The viewer no longer waits for it (#329).
+            self.release(job.key, job.urgent);
+            return;
+        }
+        {
+            let Ok(mut q) = self.queue.lock() else { return };
+            q.running.remove(&job.key);
+            if let Some(i) = q.urgent_cancels.iter().position(|(k, _)| *k == job.key) {
+                q.urgent_cancels.swap_remove(i);
+            }
+            if job.urgent {
+                q.urgent_running = q.urgent_running.saturating_sub(1);
+                // Only the newest viewer frame is urgent.
+                if q.jobs.iter().any(|j| j.urgent) {
+                    job.urgent = false;
+                }
+            }
+            q.jobs.push(job);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        self.spawn_next();
+    }
+
+    /// A GPU frame whose landing failed, rendered again on the CPU when the queue admits it:
+    /// within the CPU's cap like any other CPU frame, never on top of it (A2).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn render_retry(&self, job: Job, retry: Retry) {
+        let Retry { gpu, auto, tail } = retry;
+        let attempt = |f: &dyn Fn() -> Rendered| std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).ok();
+        match attempt(&|| self.display_fallback(&job, &gpu, auto)).or_else(|| attempt(&|| self.render_job(&job, false, None))) {
+            _ if job.called_off() => self.release(job.key, job.urgent),
+            Some(Rendered::Image(ci)) => self.publish(&job, ci, &tail, false, std::time::Duration::ZERO),
+            _ => self.give_up(job.key, job.urgent),
+        }
+    }
+
     /// [`Worker::render_job`], again on the CPU if it panicked (the panic hook has logged it);
     /// `None` if that panicked too.
     fn render_guarded(&self, job: &Job, tail: &Tail) -> Option<Rendered> {
@@ -1671,7 +1903,7 @@ impl Worker {
     }
 
     /// A GPU frame's readback arrived (on the landing thread): finish its job as the blocking
-    /// readback did. A failed readback renders the frame on the CPU, on a frame worker.
+    /// readback did. A failed readback renders the frame on the CPU ([`Worker::render_retry`]).
     /// `queued`: how long it waited behind other frames in flight, which its timings leave out:
     /// with several frames in flight they would add up the queue, not this frame's cost.
     #[cfg(not(target_arch = "wasm32"))]
@@ -1688,14 +1920,10 @@ impl Worker {
             self.publish(&job, FrameImage::Cpu(Arc::new(image)), &tail, false, queued);
             return;
         }
-        let w = self.clone();
-        self.spawn(move || {
-            let attempt = |f: &dyn Fn() -> Rendered| std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).ok();
-            match attempt(&|| w.display_fallback(&job, &gpu, auto)).or_else(|| attempt(&|| w.render_job(&job, false, None))) {
-                Some(Rendered::Image(ci)) => w.publish(&job, ci, &tail, false, std::time::Duration::ZERO),
-                _ => w.give_up(job.key, job.urgent),
-            }
-        });
+        // Back in the queue, on the CPU: rendered within the CPU's cap (and one per pool thread,
+        // #647) like every other frame. Spawned straight away, every failed flight (up to
+        // `landing::MAX_FLIGHTS` when the GPU is retired) rendered at once (A2).
+        self.requeue(Job { on_gpu: Some(false), retry: Some(Box::new(Retry { gpu, auto, tail })), ..job });
     }
 
     /// A GPU frame whose readback failed, rendered as [`Worker::render_job`] renders one then:
@@ -1769,8 +1997,12 @@ impl Worker {
         r.expr = job.src.expr.as_deref();
         let gpu_allowed = gpu && frozen.is_empty() && !self.gpu_retired.load(Ordering::Acquire);
         // A failed GPU attempt may have populated intermediate entries before its scope
-        // reported failure. The CPU retry must compute its own pixels from the snapshot.
-        r.cache = gpu_allowed.then_some(job.src.layer_cache.as_ref());
+        // reported failure. The CPU retry (`gpu: false`) must compute its own pixels from the
+        // snapshot. Every other CPU frame keeps the layer cache, also once the GPU is retired
+        // (the app clears the cache then): before, the preview had none for the rest of the
+        // session. Frozen previews keep none: layer cache keys don't know the freeze, so a
+        // frozen precomp's pixels would be cached as its original's.
+        r.cache = (gpu && frozen.is_empty()).then_some(job.src.layer_cache.as_ref());
         let gpu = job.src.gpu.as_ref().filter(|_| gpu_allowed);
         r.accel = gpu.map(|g| g as &dyn effectcraft_engine::render::Accelerator);
         // The GPU leaves the frame in a texture for the viewer; otherwise (Software Only, no
@@ -1783,10 +2015,15 @@ impl Worker {
             // The browser cannot wait for the GPU to time it (and its CPU path is slow): always
             // the GPU there.
             let auto = if cfg!(target_arch = "wasm32") { None } else { r.frame_auto(a, job.comp, true) };
-            if auto.is_none_or(|(p, key)| p.choose(key)) {
+            // Taken when the job was admitted ([`gpu_pick`]); a job that never went through the
+            // queue chooses now.
+            if job.on_gpu.unwrap_or_else(|| auto.is_none_or(|(p, key)| p.choose(key))) {
                 let t0 = web_time::Instant::now();
                 // The frame's flight on the landing thread, once handed over.
                 let mut flight = None;
+                // RT10e: the frame stays a texture egui draws (the compositor is on its device).
+                #[cfg(not(target_arch = "wasm32"))]
+                let resident = self.resident.on() && !job.disk_only;
                 match g.within_memory(|| {
                     let f = g.render_display(&r, job.comp, job.t)?;
                     #[cfg(target_arch = "wasm32")]
@@ -1796,6 +2033,9 @@ impl Worker {
                     }
                     #[cfg(not(target_arch = "wasm32"))]
                     {
+                        if resident {
+                            return Some(Rendered::Image(FrameImage::Gpu(Arc::new(f))));
+                        }
                         // Don't wait for the pixels: the landing thread finishes the frame.
                         if let Some(tail) = tail {
                             flight = self.begin_landing(g, &f, job, tail, auto.map(|(_, key)| key), t0);
@@ -1817,6 +2057,15 @@ impl Worker {
                     Ok(Some(image)) => {
                         if g.context().check_health().is_err() {
                             return self.render_job(job, false, None);
+                        }
+                        #[cfg(not(target_arch = "wasm32"))]
+                        if resident {
+                            // Auto's GPU time is recorded when the GPU has finished the frame.
+                            if let Err(e) = self.resident.admit(g, auto.map(|(_, key)| key), t0) {
+                                log::warn!("a GPU viewer frame did not finish ({e}); it renders on the CPU");
+                                return self.render_job(job, false, None);
+                            }
+                            return image;
                         }
                         if let Some((p, key)) = auto {
                             // Native readback has completed; include transfer and
@@ -1880,6 +2129,15 @@ struct Job {
     /// rendered after every viewer and prefetch frame.
     disk_only: bool,
     seq: u64,
+    /// The [`Frames::clear`] generation it started rendering in: a frame of an older one is not
+    /// published but renders again (Purge Caches, A7).
+    epoch: u64,
+    /// Whether it composites on the GPU, decided once when it may first start ([`gpu_pick`]):
+    /// the GPU's concurrency cap or the CPU's applies to it, and [`Worker::render_job`] follows it.
+    on_gpu: Option<bool>,
+    /// A GPU frame whose landing failed, waiting in the queue to render again on the CPU
+    /// ([`Worker::landed`]).
+    retry: Option<Box<Retry>>,
     /// Set when the viewer no longer waits for this frame (see [`Frames::request_urgent`]).
     cancel: Arc<AtomicBool>,
 }
@@ -1894,6 +2152,15 @@ impl Job {
     fn called_off(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
     }
+}
+
+/// What a GPU frame whose landing failed renders again with ([`Worker::render_retry`]).
+#[derive(Clone)]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+struct Retry {
+    gpu: Gpu,
+    auto: Option<effectcraft_engine::render::AutoKey>,
+    tail: Tail,
 }
 
 #[derive(Default)]
@@ -2019,6 +2286,250 @@ mod tests {
         assert!(frames.is_cached(&next), "CPU retry can still publish");
         assert_eq!(frames.inflight(), 0);
         assert!(frames.queue.lock().unwrap().running.is_empty());
+    }
+
+    /// A comp drawing one footage layer from `footage` (a `w`×`h` still).
+    fn footage_comp(w: u32, h: u32) -> (effectcraft_engine::Session, ItemId) {
+        use effectcraft_engine::Session;
+        use effectcraft_engine::project::{Footage, FootageKind};
+        use serde_json::json;
+        let mut s = Session::default();
+        let cid = ItemId(s.execute("comp.new", json!({"name": "A", "width": w, "height": h, "duration": 2})).unwrap()["comp"].as_u64().unwrap());
+        let clip = Footage { kind: FootageKind::Still, width: w, height: h, has_video: true, ..Default::default() };
+        let item = Arc::make_mut(&mut s.project).add_item("clip.png", Default::default(), None, ItemKind::Footage(clip));
+        s.execute("layer.addItem", json!({"item": item.0})).unwrap();
+        (s, cid)
+    }
+
+    fn wait_idle(f: &Frames) {
+        for _ in 0..3000 {
+            if f.inflight() == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(f.inflight(), 0, "every frame finished");
+    }
+
+    /// A7: a frame rendering when the caches are purged is not published with its old pixels
+    /// (a footage file reloaded from disk); it renders again, and the new pixels are cached.
+    #[test]
+    fn a_frame_rendering_through_purge_caches_renders_again() {
+        use effectcraft_engine::project::Footage;
+        use effectcraft_engine::render::Image;
+        use std::sync::atomic::AtomicUsize;
+        struct Gated {
+            calls: AtomicUsize,
+            started: Mutex<std::sync::mpsc::Sender<()>>,
+            gate: Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl FootageSource for Gated {
+            fn frame(&self, _: ItemId, _: &Footage, _: Tick) -> Option<Arc<Image>> {
+                let first = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
+                if first {
+                    let _ = self.started.lock().unwrap().send(());
+                    let _ = self.gate.lock().unwrap().recv();
+                    return Some(Arc::new(Image::filled(8, 8, [1.0, 0.0, 0.0, 1.0])));
+                }
+                Some(Arc::new(Image::filled(8, 8, [0.0, 0.0, 1.0, 1.0])))
+            }
+        }
+        let (s, cid) = footage_comp(8, 8);
+        let (started, started_rx) = std::sync::mpsc::channel();
+        let (open, gate) = std::sync::mpsc::channel();
+        let footage = Arc::new(Gated { calls: AtomicUsize::new(0), started: Mutex::new(started), gate: Mutex::new(gate) });
+        let src = RenderSource {
+            freeze_feedback: Default::default(),
+            project: s.project.clone(),
+            footage: footage.clone(),
+            expr: None,
+            // No room to keep the layer: this tests the frame cache (the app purges the layer
+            // cache itself).
+            layer_cache: Arc::new(LayerCache::new(0)),
+            gpu: None,
+            gpu_display: false,
+            disk: None,
+        };
+        let f = Frames::default();
+        let key = FrameKey { revision: s.revision, content: f.content_of(&s.project, s.revision, cid), comp: cid.0, ..key(0, 0, 0) };
+        f.request_urgent(&src, key, cid, Tick::ZERO, RenderOpts::default());
+        started_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        f.clear();
+        open.send(()).unwrap();
+        wait_idle(&f);
+        assert_eq!(footage.calls.load(Ordering::SeqCst), 2, "rendered again after the purge");
+        let Some(FrameImage::Cpu(img)) = f.get(&key) else { panic!("the frame is cached") };
+        let [r, _, b, _] = img.pixels[0].to_array();
+        assert!(b > r, "with the pixels from after the purge ({r}, {b})");
+    }
+
+    /// The frames of a long playback are found in O(log n) when shown again, and the cache still
+    /// evicts least recently shown first.
+    #[test]
+    fn touch_moves_a_frame_to_the_back_of_the_eviction_order() {
+        let mut o = Order::default();
+        for i in 0..5 {
+            o.push_back(key(1, i, 0));
+        }
+        o.touch(&key(1, 1, 0));
+        o.touch(&key(9, 9, 0));
+        let frames: Vec<i64> = o.iter().map(|k| k.frame).collect();
+        assert_eq!(frames, [0, 2, 3, 4, 1]);
+        assert!(o.remove(&key(1, 3, 0)));
+        assert!(!o.remove(&key(1, 3, 0)));
+        o.rename(&key(1, 2, 0), key(2, 2, 0));
+        o.retain(|k| k.frame != 4);
+        let keys: Vec<(u64, i64)> = o.iter().map(|k| (k.content, k.frame)).collect();
+        assert_eq!(keys, [(1, 0), (2, 2), (1, 1)]);
+        assert_eq!(o.len(), 3);
+        assert_eq!(o.age.len(), 3);
+    }
+
+    /// A2: GPU frames whose landing fails (the GPU retired with many in flight) render again
+    /// on the CPU through the queue, within the CPU's cap, not all at once on top of it.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn failed_landings_render_on_the_cpu_within_its_cap() {
+        use effectcraft_engine::project::Footage;
+        use effectcraft_engine::render::{Backend, Image};
+        use std::sync::atomic::AtomicUsize;
+        let Some(gpu) = Gpu::headless() else {
+            assert!(std::env::var("EFFECTCRAFT_REQUIRE_GPU").as_deref() != Ok("1"), "GPU required");
+            return;
+        };
+        #[derive(Default)]
+        struct Counting {
+            active: AtomicUsize,
+            peak: AtomicUsize,
+            calls: AtomicUsize,
+        }
+        impl FootageSource for Counting {
+            fn frame(&self, _: ItemId, _: &Footage, _: Tick) -> Option<Arc<Image>> {
+                let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(now, Ordering::SeqCst);
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                self.active.fetch_sub(1, Ordering::SeqCst);
+                Some(Arc::new(Image::filled(64, 48, [0.2, 0.4, 0.6, 1.0])))
+            }
+        }
+        let (s, cid) = footage_comp(64, 48);
+        let footage = Arc::new(Counting::default());
+        // Room for two of these frames at once on the CPU.
+        let frame_bytes = 64 * 48 * 16 * 4;
+        let src = RenderSource {
+            freeze_feedback: Default::default(),
+            project: s.project.clone(),
+            footage: footage.clone(),
+            expr: None,
+            layer_cache: Arc::new(LayerCache::new(2 * frame_bytes)),
+            gpu: Some(gpu.clone()),
+            gpu_display: true,
+            disk: None,
+        };
+        let f = Frames::default();
+        let w = f.worker();
+        let content = f.content_of(&s.project, s.revision, cid);
+        let opts = RenderOpts { backend: Backend::Gpu, ..Default::default() };
+        // Twelve GPU frames in flight (rendered, landing).
+        let jobs: Vec<Job> = (0..12)
+            .map(|i| Job {
+                key: FrameKey { revision: s.revision, content, comp: cid.0, ..key(0, i, 0) },
+                src: src.clone(),
+                comp: cid,
+                t: Tick::from_seconds_f64(i as f64 / 30.0),
+                opts,
+                urgent: false,
+                disk_only: false,
+                seq: i as u64,
+                epoch: 0,
+                on_gpu: Some(true),
+                retry: None,
+                cancel: Arc::default(),
+            })
+            .collect();
+        {
+            let mut q = f.queue.lock().unwrap();
+            let mut inf = f.inflight.lock().unwrap();
+            for j in &jobs {
+                q.running.insert(j.key);
+                inf.insert(j.key);
+                q.landing += 1;
+            }
+        }
+        assert!(f.queue.lock().unwrap().threads > 2, "the pool could run more than the cap");
+        // The device fails: every flight comes back without pixels.
+        (gpu.context().device_failure_notifier())("synthetic device loss".into());
+        f.retire_gpu();
+        let now = web_time::Instant::now();
+        for job in jobs.iter().cloned() {
+            let tail = Tail { t0: now, service_start: now, ticket: None, disk: None };
+            w.landed(GpuFlight { job, tail, gpu: gpu.clone(), auto: None, t0: now, width: 64, height: 48 }, None, std::time::Duration::ZERO);
+        }
+        wait_idle(&f);
+        assert!(jobs.iter().all(|j| f.is_cached(&j.key)), "every frame rendered on the CPU");
+        assert!(footage.calls.load(Ordering::SeqCst) >= jobs.len());
+        let peak = footage.peak.load(Ordering::SeqCst);
+        assert!(peak <= 2, "{peak} CPU frames at once, over the cap of 2");
+        let q = f.queue.lock().unwrap();
+        assert_eq!((q.running.len(), q.landing, q.jobs.len()), (0, 0, 0));
+    }
+
+    /// A3: the GPU's larger concurrency cap applies only to frames that composite on the GPU:
+    /// a retired device, a failed landing's retry and the frames Auto puts on the CPU (here its
+    /// warm-up measuring the CPU side) get the CPU's cap, as `render_job` renders them.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn cpu_bound_frames_get_the_cpu_cap() {
+        use effectcraft_engine::Session;
+        use effectcraft_engine::render::{Accelerator, AutoKey, Backend};
+        use serde_json::json;
+        let Some(gpu) = Gpu::headless() else {
+            assert!(std::env::var("EFFECTCRAFT_REQUIRE_GPU").as_deref() != Ok("1"), "GPU required");
+            return;
+        };
+        let mut s = Session::default();
+        let uhd = ItemId(s.execute("comp.new", json!({"name": "C", "width": 3840, "height": 2160, "duration": 1})).unwrap()["comp"].as_u64().unwrap());
+        let job = |backend: Backend| Job {
+            key: key(uhd.0, 0, 0),
+            src: RenderSource {
+                freeze_feedback: Default::default(),
+                project: s.project.clone(),
+                footage: Arc::new(effectcraft_engine::render::NoFootage),
+                expr: None,
+                layer_cache: Arc::new(LayerCache::new(1 << 30)),
+                gpu: Some(gpu.clone()),
+                gpu_display: true,
+                disk: None,
+            },
+            comp: uhd,
+            t: Tick::ZERO,
+            opts: RenderOpts { backend, ..Default::default() },
+            urgent: false,
+            disk_only: false,
+            seq: 0,
+            epoch: 0,
+            on_gpu: None,
+            retry: None,
+            cancel: Arc::default(),
+        };
+        let cap = |j: &Job, retired: bool| max_running(&Job { on_gpu: Some(gpu_pick(j, retired)), ..j.clone() }, 8);
+        let gpu_cap = cap(&job(Backend::Gpu), false);
+        assert!(gpu_cap > 2, "GPU frames run beyond the RAM cap ({gpu_cap})");
+        assert_eq!(cap(&job(Backend::Gpu), true), 2, "a retired GPU: the CPU renders, at the CPU's cap");
+        let now = web_time::Instant::now();
+        let retry = Retry { gpu: gpu.clone(), auto: None, tail: Tail { t0: now, service_start: now, ticket: None, disk: None } };
+        assert_eq!(cap(&Job { retry: Some(Box::new(retry)), ..job(Backend::Gpu) }, false), 2, "a failed landing's CPU retry");
+        assert_eq!(cap(&job(Backend::Cpu), false), 2);
+        // Auto measures both sides first: after a GPU frame, the next goes to the CPU.
+        let mut auto = job(Backend::Auto);
+        Arc::make_mut(&mut auto.src.project).settings.gpu_acceleration = true;
+        let picks = gpu.auto_pick().unwrap();
+        let k = AutoKey::new(uhd, 1.0, true);
+        assert!(gpu_pick(&auto, false), "Auto starts on the GPU");
+        picks.record(k, true, 10.0);
+        assert!(!gpu_pick(&auto, false), "then measures the CPU");
+        assert_eq!(cap(&auto, false), 2, "and that frame gets the CPU's cap");
     }
 
     fn key(content: u64, frame: i64, opts: u64) -> FrameKey {
@@ -2175,6 +2686,9 @@ mod tests {
             urgent: false,
             disk_only: false,
             seq: 0,
+            epoch: 0,
+            on_gpu: None,
+            retry: None,
             cancel: Arc::default(),
         };
         let gib = 1 << 30;
@@ -2218,6 +2732,9 @@ mod tests {
             urgent: false,
             disk_only: false,
             seq: 0,
+            epoch: 0,
+            on_gpu: None,
+            retry: None,
             cancel: Arc::default(),
         };
         // Admitted one by one, as the pool's threads pick them up.
@@ -2353,8 +2870,20 @@ mod tests {
         assert_eq!(f.queue.lock().unwrap().landing, 0);
 
         // A frame in flight and a queued frame, both of this revision.
-        let job =
-            |k: FrameKey| Job { key: k, src: src.clone(), comp: cid, t: Tick::ZERO, opts, urgent: false, disk_only: false, seq: 0, cancel: Arc::default() };
+        let job = |k: FrameKey| Job {
+            key: k,
+            src: src.clone(),
+            comp: cid,
+            t: Tick::ZERO,
+            opts,
+            urgent: false,
+            disk_only: false,
+            seq: 0,
+            epoch: 0,
+            on_gpu: None,
+            retry: None,
+            cancel: Arc::default(),
+        };
         let (flying, stale) = (FrameKey { frame: 1, ..key }, FrameKey { frame: 2, ..key });
         {
             let mut q = f.queue.lock().unwrap();
@@ -2414,6 +2943,9 @@ mod tests {
             urgent: true,
             disk_only: false,
             seq: 2,
+            epoch: 0,
+            on_gpu: None,
+            retry: None,
             cancel: Arc::default(),
         });
         assert!(!q.can_start(&q.jobs[0]), "one urgent render is already in progress");
@@ -2894,7 +3426,20 @@ mod tests {
         {
             let mut q = f.queue.lock().unwrap();
             f.inflight.lock().unwrap().insert(k(5));
-            q.jobs.push(Job { key: k(5), src: src.clone(), comp: cid, t: Tick::ZERO, opts, urgent: false, disk_only: true, seq: 1, cancel: Arc::default() });
+            q.jobs.push(Job {
+                key: k(5),
+                src: src.clone(),
+                comp: cid,
+                t: Tick::ZERO,
+                opts,
+                urgent: false,
+                disk_only: true,
+                seq: 1,
+                epoch: 0,
+                on_gpu: None,
+                retry: None,
+                cancel: Arc::default(),
+            });
         }
         f.request(&src, k(5), cid, Tick::ZERO, opts);
         assert!(f.queue.lock().unwrap().jobs.iter().all(|j| !j.disk_only), "upgraded to a RAM frame");

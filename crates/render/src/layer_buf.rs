@@ -9,6 +9,10 @@ use effectcraft_keyframe::Value;
 use effectcraft_project::{Comp, Layer, LayerSource, Node, PropGroup};
 use std::sync::Arc;
 
+/// A layer's content key, its precomp bookkeeping id and its shape clip window (see
+/// `Renderer::content_cache_key_noted`).
+type ContentKey = (Option<u64>, Option<u64>, Option<Window>);
+
 impl<'a> Renderer<'a> {
     /// Source → masks, clamped/quantised to the project depth. `clip`: only that window of a
     /// shape layer's buffer (see [`Self::shape_clip`]).
@@ -95,7 +99,7 @@ impl<'a> Renderer<'a> {
 
     /// Layer pixels after source → masks → effects (no layer styles).
     pub fn content_buf(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Arc<Buf>> {
-        self.content_buf_timed(ctx, layer, None).map(|(b, _)| b)
+        self.content_buf_timed(ctx, layer, None, None).map(|(b, _)| b)
     }
 
     /// The layer cache key of a layer's content (`None` without a cache or for uncached layers).
@@ -183,7 +187,7 @@ impl<'a> Renderer<'a> {
     ///
     /// A shape layer drawn clipped (see [`Self::shape_clip`]) has the window in its key, and
     /// the window is returned too.
-    fn content_cache_key_noted(&self, ctx: &EvalCtx, layer: &Layer) -> (Option<u64>, Option<u64>, Option<Window>) {
+    fn content_cache_key_noted(&self, ctx: &EvalCtx, layer: &Layer) -> ContentKey {
         let Some(c) = self.cache else { return (None, None, self.shape_clip(ctx, layer, None)) };
         let (src, noted) = match layer.source {
             LayerSource::Comp { .. } => {
@@ -207,8 +211,10 @@ impl<'a> Renderer<'a> {
         (key, noted, clip)
     }
 
-    fn content_buf_timed(&self, ctx: &EvalCtx, layer: &Layer, mut timing: Option<&mut LayerTiming>) -> Option<(Arc<Buf>, Option<u64>)> {
-        let (key, noted, clip) = self.content_cache_key_noted(ctx, layer);
+    /// `keyed`: [`Self::content_cache_key_noted`] when the caller has it already (a key is
+    /// computed once per layer and frame: keying a precomp counts towards its miss streak).
+    fn content_buf_timed(&self, ctx: &EvalCtx, layer: &Layer, mut timing: Option<&mut LayerTiming>, keyed: Option<ContentKey>) -> Option<(Arc<Buf>, Option<u64>)> {
+        let (key, noted, clip) = keyed.unwrap_or_else(|| self.content_cache_key_noted(ctx, layer));
         // An animated precomp's buffer isn't kept for other uses in its frame (see
         // [`cache::LayerCache::insert_once`]): no use waiting for another thread's render of it.
         let once = key.is_some() && noted.is_some() && self.precomp_varies(ctx, layer);
@@ -289,8 +295,13 @@ impl<'a> Renderer<'a> {
     }
 
     /// The layer with its styles: exterior passes and body (cached per pass).
-    pub(crate) fn styled(&self, ctx: &EvalCtx, layer: &Layer, mut timing: Option<&mut LayerTiming>) -> Option<StyledLayer> {
-        let (content, ckey) = self.content_buf_timed(ctx, layer, timing.as_deref_mut())?;
+    pub(crate) fn styled(&self, ctx: &EvalCtx, layer: &Layer, timing: Option<&mut LayerTiming>) -> Option<StyledLayer> {
+        self.styled_keyed(ctx, layer, timing, None)
+    }
+
+    /// [`Self::styled`] with the content key already computed (see [`Self::content_buf_timed`]).
+    fn styled_keyed(&self, ctx: &EvalCtx, layer: &Layer, mut timing: Option<&mut LayerTiming>, keyed: Option<ContentKey>) -> Option<StyledLayer> {
+        let (content, ckey) = self.content_buf_timed(ctx, layer, timing.as_deref_mut(), keyed)?;
         if !styles::active(ctx, layer) {
             return Some(StyledLayer { passes: vec![], body: content.clone(), content, key: ckey, ckey, plain: true });
         }
@@ -328,16 +339,18 @@ impl<'a> Renderer<'a> {
     /// were converted from aren't touched, so they go cold in the layer cache (packed or evicted
     /// under pressure) instead of being kept hot next to their converted copies.
     pub(crate) fn styled_blend(&self, ctx: &EvalCtx, layer: &Layer, mut timing: Option<&mut LayerTiming>) -> Option<StyledLayer> {
-        if let Some(st) = self.styled_blend_cached(ctx, layer) {
+        // The content key, computed once for the lookups below (only linear blending has them).
+        let keyed = (self.cache.is_some() && self.pipe.to_blend().is_some()).then(|| self.content_cache_key_noted(ctx, layer));
+        if let Some(st) = keyed.and_then(|(ckey, _, _)| self.styled_blend_cached(ctx, layer, ckey?)) {
             if let Some(t) = timing.as_deref_mut() {
                 t.cached = true;
             }
             return Some(st);
         }
         if self.blend_only(ctx, layer) {
-            return self.plain_blend(ctx, layer, timing);
+            return self.plain_blend(ctx, layer, timing, keyed);
         }
-        self.styled(ctx, layer, timing).map(|st| self.styled_to_blend(st))
+        self.styled_keyed(ctx, layer, timing, keyed).map(|st| self.styled_to_blend(st))
     }
 
     /// With linear blending, is `layer` a plain layer (no Layer Styles) whose working-space
@@ -349,8 +362,8 @@ impl<'a> Renderer<'a> {
     /// [`Self::styled_blend`] of a [`Self::blend_only`] layer: its content is converted in place
     /// and cached in the blending space alone (no working-space copy cloned and kept next to
     /// it). The same pixels as [`Self::content_buf_timed`] then [`Self::to_blend`].
-    fn plain_blend(&self, ctx: &EvalCtx, layer: &Layer, mut timing: Option<&mut LayerTiming>) -> Option<StyledLayer> {
-        let (ckey, noted, clip) = self.content_cache_key_noted(ctx, layer);
+    fn plain_blend(&self, ctx: &EvalCtx, layer: &Layer, mut timing: Option<&mut LayerTiming>, keyed: Option<ContentKey>) -> Option<StyledLayer> {
+        let (ckey, noted, clip) = keyed.unwrap_or_else(|| self.content_cache_key_noted(ctx, layer));
         let key = ckey.map(|k| cache::derive(k, 0x1ea7));
         // A resident Processed result is an actual CPU demand here. Reuse it in
         // working space, then convert forward; a Blend texture is never inverted.
@@ -417,10 +430,9 @@ impl<'a> Renderer<'a> {
         Some(StyledLayer { passes: vec![], content: buf.clone(), body: buf, key: ckey, ckey, plain: true })
     }
 
-    fn styled_blend_cached(&self, ctx: &EvalCtx, layer: &Layer) -> Option<StyledLayer> {
+    fn styled_blend_cached(&self, ctx: &EvalCtx, layer: &Layer, ckey: u64) -> Option<StyledLayer> {
         let c = self.cache?;
         self.pipe.to_blend()?;
-        let ckey = self.content_cache_key(ctx, layer)?;
         let blend = |k: u64| c.peek(cache::derive(k, 0x1ea7));
         if !styles::active(ctx, layer) {
             let body = blend(ckey)?;

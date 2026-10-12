@@ -197,7 +197,7 @@ pub(crate) fn simulate(g: &GpuContext, req: &SimRequest) -> Option<Vec<SimPartic
         pass.dispatch_workgroups(n.div_ceil(64), 1, 1);
     }
     enc.copy_buffer_to_buffer(&next, 0, &read, 0, size);
-    g.queue.submit([enc.finish()]);
+    g.submit(enc.finish());
     if let (Some(d), Some(k)) = (&deferred, key) {
         let row = usize::try_from(size).ok()?;
         let done = d.start(k, n, 1, [0.0; 2], 1.0);

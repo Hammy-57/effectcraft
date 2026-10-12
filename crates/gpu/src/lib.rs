@@ -95,6 +95,7 @@ mod prepass;
 mod readback;
 #[cfg(feature = "profile")]
 mod timestamps;
+pub mod traffic_light;
 mod walk;
 
 use std::sync::Arc;
@@ -107,6 +108,7 @@ use effectcraft_project::ItemId;
 use effectcraft_raster::Image;
 use effectcraft_render::{Accelerator, FxStep, Renderer};
 use effectcraft_time::Tick;
+pub use traffic_light::TrafficLight;
 pub use wgpu;
 
 use crate::context::Enc;
@@ -288,12 +290,12 @@ impl Gpu {
     }
 
     /// Wait until `submission` has finished on the GPU, running the callbacks of the readbacks it
-    /// completed. Bounded by the readback deadline, whose expiry retires the context as a
-    /// blocking readback's does.
+    /// completed, or for at most the readback deadline. Running out of time is not a failure (the
+    /// work ahead of it may be a deep queue that keeps completing): the readback deadlines retire
+    /// the context when the GPU stops completing work.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn wait_submission(&self, submission: &wgpu::SubmissionIndex) -> Result<(), String> {
-        let wait = wgpu::PollType::Wait { submission_index: Some(submission.clone()), timeout: Some(crate::readback::TIMEOUT) };
-        self.ctx.poll_readbacks(wait).map(|_| ())
+        self.ctx.wait_for(Some(submission.clone()), crate::readback::TIMEOUT).map(|_| ())
     }
 
     /// Render a frame on the GPU and read it back (`None` = not handled).
@@ -596,6 +598,8 @@ mod tests_particles;
 mod tests_precomp_resident;
 #[cfg(test)]
 mod tests_shape_clip;
+#[cfg(test)]
+mod tests_traffic_light;
 #[cfg(test)]
 mod tests_warmup;
 

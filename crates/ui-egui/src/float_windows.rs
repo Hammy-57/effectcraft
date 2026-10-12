@@ -315,6 +315,8 @@ impl EffectcraftApp {
                 ctx.send_viewport_cmd_to(vid, egui::ViewportCommand::Focus);
             }
         }
+        // RT10e: its window's surface is configured inside this call.
+        let _red = crate::zero_copy::hold_for_new_viewport(self, ctx, vid);
         let out = ctx.show_viewport_immediate(vid, builder, |ui, _| {
             self.auto.window = Some(f.id);
             let out = self.os_window_ui(ui, i, &f, active, info);

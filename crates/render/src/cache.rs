@@ -183,6 +183,9 @@ struct Inner {
     cpu_lru: BTreeSet<(u64, u64)>,
     probation_lru: BTreeSet<(u64, u64)>,
     gpu_lru: BTreeSet<(u64, usize)>,
+    /// `(last_use, id)` of the GPU slots on probation (published, not used since; see
+    /// [`evict_one`]).
+    gpu_probation_lru: BTreeSet<(u64, usize)>,
     /// GPU slots by content key ([`GpuOwner::resident`] lookups without a scan).
     gpu_content: HashMap<u64, Vec<usize>>,
 }
@@ -204,6 +207,9 @@ impl Inner {
     fn gpu_insert(&mut self, id: usize, entry: gpu::GpuEntry) -> Option<gpu::GpuEntry> {
         let old = self.gpu_remove(id);
         self.gpu_lru.insert((entry.last_use, id));
+        if entry.probation {
+            self.gpu_probation_lru.insert((entry.last_use, id));
+        }
         if let Some(content) = entry.slot.content() {
             self.gpu_content.entry(content).or_default().push(id);
         }
@@ -214,6 +220,7 @@ impl Inner {
     fn gpu_remove(&mut self, id: usize) -> Option<gpu::GpuEntry> {
         let e = self.gpu.remove(&id)?;
         self.gpu_lru.remove(&(e.last_use, id));
+        self.gpu_probation_lru.remove(&(e.last_use, id));
         if let Some(content) = e.slot.content()
             && let Some(ids) = self.gpu_content.get_mut(&content)
         {
@@ -228,12 +235,16 @@ impl Inner {
     fn gpu_touch(&mut self, id: usize, now: u64) {
         let Some(e) = self.gpu.get_mut(&id) else { return };
         let old = std::mem::replace(&mut e.last_use, now);
+        // Used again: admitted.
+        e.probation = false;
         self.gpu_lru.remove(&(old, id));
+        self.gpu_probation_lru.remove(&(old, id));
         self.gpu_lru.insert((now, id));
     }
 
     fn gpu_take_all(&mut self) -> HashMap<usize, gpu::GpuEntry> {
         self.gpu_lru.clear();
+        self.gpu_probation_lru.clear();
         self.gpu_content.clear();
         std::mem::take(&mut self.gpu)
     }
@@ -268,6 +279,17 @@ impl Inner {
                 return Some((age, id));
             }
             self.gpu_lru.remove(&(age, id));
+        }
+    }
+
+    /// The least recently published GPU slot still on probation, dropping stale pairs.
+    fn oldest_gpu_probation(&mut self) -> Option<(u64, usize)> {
+        loop {
+            let (age, id) = *self.gpu_probation_lru.first()?;
+            if self.gpu.get(&id).is_some_and(|e| e.last_use == age && e.probation) {
+                return Some((age, id));
+            }
+            self.gpu_probation_lru.remove(&(age, id));
         }
     }
 }
@@ -349,6 +371,7 @@ impl LayerCache {
                 last_begin: 0,
                 cpu_lru: BTreeSet::new(),
                 probation_lru: BTreeSet::new(),
+                gpu_probation_lru: BTreeSet::new(),
                 gpu_lru: BTreeSet::new(),
                 gpu_content: HashMap::new(),
             })),
@@ -866,6 +889,18 @@ impl LayerCache {
             .unwrap_or_default()
     }
 
+    /// (GPU slots admitted, GPU slots on probation): tests check GPU admission.
+    #[cfg(test)]
+    pub(crate) fn gpu_admission(&self) -> (usize, usize) {
+        self.inner
+            .lock()
+            .map(|g| {
+                let probation = g.gpu.values().filter(|e| e.probation).count();
+                (g.gpu.len() - probation, probation)
+            })
+            .unwrap_or_default()
+    }
+
     /// After a miss on `key`: render it ([`Claim::Owner`], whose drop wakes the waiters), take
     /// the buffer another thread just rendered under it ([`Claim::Ready`]), or render it anyway
     /// ([`Claim::Render`]: this thread is already rendering it further up its stack, or the
@@ -1071,8 +1106,12 @@ impl Drop for FlightGuard {
 /// Evict one entry; a GPU payload is returned to the caller for disposal after unlocking.
 /// First renders still on probation go first (oldest first): they were used once, and a
 /// frame touching more keys than the cache holds must not push out the admitted entries that
-/// the next frame reuses (a key rendered again is admitted by the doorkeeper). Then the least
-/// recently used entry, CPU or GPU. O(log n): the order is kept, not searched.
+/// the next frame reuses (a key rendered again is admitted by the doorkeeper). GPU slots not
+/// used since they were published (a moving video's frame, a texture of a buffer rendered for
+/// one frame) go next, once the frames being rendered and the one before them are done with
+/// them: a run of such one-use full-frame results must not push out the stable layers the
+/// next shot shows (the 4:29 cut, #A8). Then the least recently used entry, CPU or GPU.
+/// O(log n): the order is kept, not searched.
 ///
 /// `protect` (making room for a new entry): an admitted entry used by the frames being
 /// rendered, or by the frame before them, is not evicted; the new entry is declined instead.
@@ -1088,6 +1127,11 @@ fn evict_one(g: &mut Inner, protect: bool) -> (bool, Option<Arc<GpuSlot>>) {
         return (true, None);
     }
     let since = if protect { g.working_since() } else { None };
+    if let Some((age, id)) = g.oldest_gpu_probation()
+        && since.is_none_or(|since| age <= since)
+    {
+        return (true, g.gpu_remove(id).map(|e| e.slot));
+    }
     let cpu = g.oldest_cpu(false);
     let gpu = g.oldest_gpu();
     let (age, cpu_first) = match (cpu, gpu) {
@@ -1321,6 +1365,128 @@ pub(crate) fn hash_debug(h: &mut KeyHasher, v: &impl std::fmt::Debug) {
     use std::fmt::Write;
     let _ = write!(h, "{v:?}");
     Hasher::write_u8(h, 0xff);
+}
+
+/// Paths of an image sequence a key formats, at most (see [`FootageKey`]).
+const SEQUENCE_SAMPLES: usize = 17;
+
+/// Footage settings as a key formats them ([`hash_debug`]): every field, except that an image
+/// sequence's file list counts by its length and a sample of its paths (the first, the last and
+/// evenly spaced ones between) instead of every path: a 17k-frame sequence would print about a
+/// megabyte per key, for every key, every frame. (The files' identity is the disk cache's
+/// salt.) The fields are listed exhaustively, so a new one can't be left out of keys.
+pub(crate) struct FootageKey<'a>(pub(crate) &'a effectcraft_project::Footage);
+
+impl std::fmt::Debug for FootageKey<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let effectcraft_project::Footage {
+            path,
+            kind,
+            width,
+            height,
+            pixel_aspect,
+            frame_rate,
+            native_rate,
+            duration,
+            has_video,
+            has_audio,
+            alpha,
+            premul_color,
+            loop_count,
+            codec,
+            missing,
+            sequence,
+            color_profile,
+            layer,
+            fields,
+            invert_alpha,
+            linear_light,
+            preserve_rgb,
+            data,
+            page,
+            alphabetical,
+            start_timecode,
+        } = self.0;
+        f.debug_struct("Footage")
+            .field("path", path)
+            .field("kind", kind)
+            .field("width", width)
+            .field("height", height)
+            .field("pixel_aspect", pixel_aspect)
+            .field("frame_rate", frame_rate)
+            .field("native_rate", native_rate)
+            .field("duration", duration)
+            .field("has_video", has_video)
+            .field("has_audio", has_audio)
+            .field("alpha", alpha)
+            .field("premul_color", premul_color)
+            .field("loop_count", loop_count)
+            .field("codec", codec)
+            .field("missing", missing)
+            .field("sequence", &SequenceSample(sequence))
+            .field("color_profile", color_profile)
+            .field("layer", layer)
+            .field("fields", fields)
+            .field("invert_alpha", invert_alpha)
+            .field("linear_light", linear_light)
+            .field("preserve_rgb", preserve_rgb)
+            .field("data", data)
+            .field("page", page)
+            .field("alphabetical", alphabetical)
+            .field("start_timecode", start_timecode)
+            .finish()
+    }
+}
+
+/// An image sequence's length and sampled paths (see [`FootageKey`]).
+struct SequenceSample<'a>(&'a [String]);
+
+impl std::fmt::Debug for SequenceSample<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let n = self.0.len();
+        write!(f, "{n}")?;
+        let mut list = f.debug_list();
+        if n <= SEQUENCE_SAMPLES {
+            list.entries(self.0);
+        } else {
+            let last = n - 1;
+            let gaps = (SEQUENCE_SAMPLES - 1) as u128;
+            for i in 0..SEQUENCE_SAMPLES {
+                let at = (last as u128).saturating_mul(i as u128) / gaps;
+                if let Some(p) = usize::try_from(at).ok().and_then(|at| self.0.get(at)) {
+                    list.entry(p);
+                }
+            }
+        }
+        list.finish()
+    }
+}
+
+/// An item's proxy as a key formats it (its footage through [`FootageKey`]).
+pub(crate) struct ProxyKey<'a>(pub(crate) &'a Option<Box<effectcraft_project::Proxy>>);
+
+impl std::fmt::Debug for ProxyKey<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            None => f.write_str("None"),
+            Some(p) => {
+                let effectcraft_project::Proxy { footage, enabled } = &**p;
+                f.debug_struct("Proxy").field("footage", &FootageKey(footage)).field("enabled", enabled).finish()
+            }
+        }
+    }
+}
+
+/// An item's kind as a key formats it (footage through [`FootageKey`]).
+pub(crate) struct KindKey<'a>(pub(crate) &'a ItemKind);
+
+impl std::fmt::Debug for KindKey<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            ItemKind::Footage(footage) => f.debug_tuple("Footage").field(&FootageKey(footage)).finish(),
+            other => other.fmt(f),
+        }
+    }
 }
 
 /// A [`KeyHasher`] starting from `seed`.
@@ -1558,8 +1724,8 @@ fn hash_layer_refs(h: &mut KeyHasher, ctx: &EvalCtx, layer: &Layer, reads_other_
             LayerSource::Solid { item } => hash_debug(h, &ctx.project.item(*item).map(|i| &i.kind)),
             LayerSource::Footage { item } | LayerSource::Model { item } => {
                 let it = ctx.project.item(*item)?;
-                hash_debug(h, &it.kind);
-                hash_debug(h, &it.proxy);
+                hash_debug(h, &KindKey(&it.kind));
+                hash_debug(h, &ProxyKey(&it.proxy));
                 ctx.source_time(o).0.hash(h);
             }
             // The nested comp's layers are hashed by `dependencies::hash` (in every key).
@@ -1742,9 +1908,9 @@ fn key_any(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool, fo
             if !footage && (src.is_none() || !(still || info.masks_or_effects)) {
                 return None;
             }
-            hash_debug(&mut h, f);
+            hash_debug(&mut h, &FootageKey(f));
             // A proxy (and its Use Proxy switch) changes the pixels.
-            hash_debug(&mut h, &it.proxy);
+            hash_debug(&mut h, &ProxyKey(&it.proxy));
             item.hash(&mut h);
             if !still {
                 ctx.source_time(layer).0.hash(&mut h);
