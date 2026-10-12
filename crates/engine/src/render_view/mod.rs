@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 pub use overlay::{LayerGeom, Overlays, overlay_layers};
 pub use sheet::MAX_CELLS;
 
-use crate::commands::{CommandSpec, b_p, bad, comp_id, resolve_layer, str_p};
+use crate::commands::{CommandSpec, b_p, bad, checked_layer_ref, comp_id, str_p};
 use crate::{EngineError, Result, Session, query};
 
 /// Longest output side a single render may ask for (`max_side`); larger values are clamped.
@@ -64,12 +64,20 @@ pub struct View {
 }
 
 /// `item` (id or name) → id.
-fn item_ref(s: &Session, v: &Value) -> Option<ItemId> {
+fn item_ref(s: &Session, v: &Value, cmd: &str) -> Result<ItemId> {
+    if let Some(name) = v.as_str() {
+        let candidates: Vec<_> =
+            s.project.items.values().filter(|i| i.name == name).map(|i| json!({"id": i.id.0, "name": i.name, "parent": i.parent.map(|p| p.0)})).collect();
+        if candidates.len() > 1 {
+            return Err(bad(cmd, format!("ambiguous project item name {name:?}; candidates: {}; use a numeric item id", Value::Array(candidates))));
+        }
+    }
     match v {
         Value::Number(n) => n.as_u64().map(ItemId).filter(|i| s.project.item(*i).is_some()),
         Value::String(name) => s.project.find_by_name(name).map(|i| i.id),
         _ => None,
     }
+    .ok_or_else(|| bad(cmd, format!("no project item {v} (see project.summary)")))
 }
 
 fn present<'a>(p: &'a Value, k: &str) -> Option<&'a Value> {
@@ -116,7 +124,7 @@ pub fn request(s: &Session, p: &Value, cmd: &str) -> Result<ViewRequest> {
             if present(p, "comp").is_some() {
                 return Err(bad(cmd, "give `comp` or `item`, not both"));
             }
-            let id = item_ref(s, v).ok_or_else(|| bad(cmd, format!("no project item {v} (see project.summary)")))?;
+            let id = item_ref(s, v, cmd)?;
             match s.project.item(id).map(|i| &i.kind) {
                 Some(ItemKind::Comp(_)) => Target::Comp(id),
                 Some(ItemKind::Footage(f)) if f.has_video && !matches!(f.kind, FootageKind::Audio | FootageKind::Data | FootageKind::Model) => Target::Item(id),
@@ -131,7 +139,10 @@ pub fn request(s: &Session, p: &Value, cmd: &str) -> Result<ViewRequest> {
         (None, _) => None,
         (Some(v), Target::Comp(cid)) => {
             let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
-            Some(resolve_layer(comp, v).ok_or_else(|| bad(cmd, format!("no layer {v} in this comp (use an id, \"#n\" or a name from comp.info)")))?)
+            Some(
+                checked_layer_ref(comp, cid, v, cmd)?
+                    .ok_or_else(|| bad(cmd, format!("no layer {v} in this comp (use an id, \"#n\" or a name from comp.info)")))?,
+            )
         }
         (Some(_), Target::Item(_)) => return Err(bad(cmd, "`layer` needs a composition, not a footage item")),
     };

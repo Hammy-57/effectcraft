@@ -234,6 +234,12 @@ fn expression_syntax_errors_reach_the_reply() {
     assert!(r["expressionError"].as_str().unwrap().contains("nope is not defined"), "{r}");
     let r = call_json(&mut s, "set_property", at("60"));
     assert_eq!((&r["evaluated"], r.get("expressionError")), (&json!(60.0), None), "{r}");
+    let flat = call_json(&mut s, "get_layer", json!({"layer": "S", "flat": true}));
+    let rotation = flat["properties"].as_array().unwrap().iter().find(|p| p["path"] == "transform/rotation").unwrap();
+    assert_eq!(rotation["uid"], r["uid"]);
+    assert_eq!(rotation["rawValue"], 30.0);
+    assert_eq!(rotation["evaluatedValue"], 60.0);
+    assert_eq!(rotation["effectiveEnabled"], true);
 }
 
 #[test]
@@ -672,7 +678,9 @@ fn run_script_round_trip() {
     let p = call_json(&mut s, "get_project", json!({}));
     assert!(p.to_string().contains("Scripted"), "{p}");
     // Errors come back with their line.
-    let r = call_json(&mut s, "run_script", json!({"code": "var a = 1;\nundefinedFn();", "name": "bad.jsx"}));
+    let (content, error) = call(&mut s, "run_script", json!({"code": "var a = 1;\nundefinedFn();", "name": "bad.jsx"}));
+    assert!(error);
+    let r: Value = serde_json::from_str(content[0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(r["ok"], json!(false));
     assert_eq!(r["error"]["line"], json!(2));
     assert_eq!(r["error"]["file"], json!("bad.jsx"));
@@ -713,7 +721,7 @@ fn round_corners_over_mcp() {
     assert!(d["schema"]["properties"]["roundness"].is_object(), "{d}");
     let r = run(&mut s, "layer.roundCorners", json!({"layer": id, "roundness": 16}));
     assert_eq!(r["converted"], json!([id]), "{r}");
-    let l = call_json(&mut s, "get_layer", json!({"layer": id}));
+    let l = call_json(&mut s, "get_layer", json!({"layer": id, "full": true}));
     assert!(l.to_string().contains("Roundness"), "{l}");
     let p = call_json(&mut s, "get_property", json!({"layer": id, "path": "contents/group/contents/rect/roundness"}));
     assert_eq!(p["value"], 16.0, "{p}");
@@ -2247,22 +2255,23 @@ fn script_timeout_rolls_back_an_open_undo_group() {
     effectcraft_script::install(&mut sess);
     let mut s = McpServer::new(Backend::headless(sess));
     let started = std::time::Instant::now();
-    let r = call_json(
+    let (content, error) = call(
         &mut s,
         "run_script",
         json!({"code": "app.beginUndoGroup('Build'); app.project.items.addComp('Doomed', 64, 64, 1, 1, 25); while (true) {}", "timeout": 0.3}),
     );
+    assert!(error);
+    let r: Value = serde_json::from_str(content[0]["text"].as_str().unwrap()).unwrap();
     assert!(started.elapsed() < std::time::Duration::from_secs(3), "timeout took {:?}", started.elapsed());
     assert_eq!(r["ok"], false, "{r}");
     assert!(r["error"]["message"].as_str().unwrap().contains("time limit"), "{r}");
     assert!(r["output"].as_str().unwrap().contains("rolled back"), "{r}");
     assert!(!call_json(&mut s, "get_project", json!({})).to_string().contains("Doomed"));
     // an endless loop calling the object model, outside an undo group
-    let r = call_json(
-        &mut s,
-        "run_script",
-        json!({"code": "app.project.items.addComp('Kept', 64, 64, 1, 1, 25); for (;;) { app.project.numItems; }", "timeout": 0.3}),
-    );
+    let (content, error) =
+        call(&mut s, "run_script", json!({"code": "app.project.items.addComp('Kept', 64, 64, 1, 1, 25); for (;;) { app.project.numItems; }", "timeout": 0.3}));
+    assert!(error);
+    let r: Value = serde_json::from_str(content[0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(r["ok"], false, "{r}");
     assert!(r["output"].as_str().unwrap().contains("kept"), "{r}");
     assert!(call_json(&mut s, "get_project", json!({})).to_string().contains("Kept"));
@@ -2548,10 +2557,10 @@ fn big_comp(n: usize) -> McpServer {
 fn get_comp_is_compact_and_says_when_it_is_cut() {
     let mut s = big_comp(110);
     let full = call_json(&mut s, "get_comp", json!({"full": true}));
-    let compact = call_json(&mut s, "get_comp", json!({}));
+    let compact = call_json(&mut s, "get_comp", json!({"max_chars": 100000}));
     let (fl, cl) = (full.to_string().len(), compact.to_string().len());
     eprintln!("110 layers: full {fl} chars, compact {cl} chars ({} per layer)", cl / 110);
-    // Every layer comes back in one call, small: ~130 characters a row at most.
+    // A larger requested budget can return all rows; default-budget traversal is tested below.
     assert_eq!((compact["layerCount"].clone(), compact["returned"].clone(), compact["next_offset"].clone()), (json!(110), json!(110), Value::Null));
     assert!(compact.get("truncated").is_none(), "nothing cut");
     assert!(cl < 110 * 130, "{cl} chars");
@@ -2588,7 +2597,7 @@ fn get_comp_is_compact_and_says_when_it_is_cut() {
         assert!(call(&mut s, "get_comp", bad.clone()).1, "{bad}");
     }
     // doc_inspect's active comp is compact too.
-    let doc = call_json(&mut s, "doc_inspect", json!({}));
+    let doc = call_json(&mut s, "doc_inspect", json!({"max_chars": 100000}));
     assert_eq!(doc["activeComp"]["layerCount"], 110);
     assert_eq!(doc["activeComp"]["layers"][0], compact["layers"][0]);
 }
@@ -2628,13 +2637,13 @@ fn get_property_pages_keyframes_and_get_layer_pages_the_flat_list() {
     let mut s = big_comp(1);
     let keys: Vec<Value> = (0..257).map(|i| json!({"time": f64::from(i) / 30.0, "value": [f64::from(i) / 3.0, 540.0]})).collect();
     call_json(&mut s, "add_keyframe", json!({"layer": "#1", "path": "transform/position", "keys": keys}));
-    let p = call_json(&mut s, "get_property", json!({"layer": "#1", "path": "transform/position"}));
+    let p = call_json(&mut s, "get_property", json!({"layer": "#1", "path": "transform/position", "max_chars": 100000}));
     assert_eq!((p["keyCount"].clone(), p["returned"].clone(), p["next_offset"].clone()), (json!(257), json!(100), json!(100)));
     assert_eq!(p["truncated"]["next_offset"], 100);
-    assert!(p.to_string().len() < 8_000, "a page fits a capped client: {}", p.to_string().len());
+    assert!(p.to_string().len() < 100_000);
     let k = &p["keys"][1];
     assert!(k.get("layerTime").is_none() && k.get("compTime").is_none() && k.get("in").is_none(), "{k}");
-    assert_eq!(k["value"][0], 0.3333, "values rounded: {k}");
+    assert_eq!(k["value"][0], 1.0 / 3.0, "values stay exact: {k}");
     let last = call_json(&mut s, "get_property", json!({"layer": "#1", "path": "transform/position", "offset": 200}));
     assert_eq!((last["returned"].clone(), last["next_offset"].clone()), (json!(57), Value::Null));
     assert!(last.get("truncated").is_none());
@@ -2649,10 +2658,110 @@ fn get_property_pages_keyframes_and_get_layer_pages_the_flat_list() {
     assert!(total > 5, "{flat}");
     assert_eq!((flat["returned"].clone(), flat["next_offset"].clone()), (json!(5), json!(5)));
     assert_eq!(flat["truncated"]["total"], total);
-    let rest = call_json(&mut s, "get_layer", json!({"layer": "#1", "flat": true, "offset": 5}));
+    let rest = call_json(&mut s, "get_layer", json!({"layer": "#1", "flat": true, "offset": 5, "max_chars": 100000}));
     assert_eq!(rest["returned"].as_u64().unwrap() + 5, total);
     assert_eq!(rest["next_offset"], Value::Null);
     // The tree with 257 keys is big: it says how to get a smaller reply.
     let tree = call_json(&mut s, "get_layer", json!({"layer": "#1"}));
-    assert!(tree["hint"].as_str().unwrap().contains("flat: true"), "{}", tree.to_string().len());
+    assert!(tree.to_string().len() <= 7000);
+    assert!(tree.to_string().contains("get_field"), "large fields have a recovery route");
+}
+
+#[test]
+fn set_property_confirms_the_written_comp_time_in_both_bases() {
+    use effectcraft_engine::project::LayerId;
+    for stretch in [100.0, 200.0, -100.0] {
+        for base in [None, Some("layer"), Some("comp")] {
+            let mut session = Session::default();
+            session.execute("comp.new", json!({"duration": 30, "frameRate": 30})).unwrap();
+            let lid = session.execute("layer.newSolid", json!({})).unwrap()["layer"].as_u64().unwrap();
+            session.execute("layer.timing", json!({"layer": lid, "start": 10, "in": 0, "out": 30})).unwrap();
+            let cid = session.active_comp_id().unwrap();
+            std::sync::Arc::make_mut(&mut session.project).comp_mut(cid).unwrap().layer_mut(LayerId(lid)).unwrap().stretch = stretch;
+            let mut s = McpServer::new(Backend::headless(session));
+            call_json(&mut s, "set_property", json!({"layer": lid, "path": "transform/opacity", "value": 20, "time": 0}));
+            let requested_comp = 12.011;
+            let requested = if base == Some("comp") { requested_comp } else { (requested_comp - 10.0) * 100.0 / stretch };
+            let mut args = json!({"layer": lid, "path": "transform/opacity", "value": 80, "time": requested});
+            if let Some(base) = base {
+                args["timeBase"] = json!(base);
+            }
+            let got = call_json(&mut s, "set_property", args);
+            assert_eq!(got["requestedTime"], requested);
+            assert!((got["compTime"].as_f64().unwrap() - 12.0).abs() < 1e-8, "{stretch} {base:?}: {got}");
+            assert!((got["layerTime"].as_f64().unwrap() - 2.0 * 100.0 / stretch).abs() < 1e-8, "{got}");
+            assert_eq!(got["time"], got["compTime"]);
+            assert_eq!(got["value"], 80.0);
+            assert_eq!(got["appliedValue"], 80.0);
+        }
+    }
+}
+
+#[test]
+fn bounded_pages_cover_every_layer_and_exact_field_chunks_round_trip() {
+    let mut s = big_comp(110);
+    let mut offset = 0u64;
+    let mut ids = std::collections::BTreeSet::new();
+    loop {
+        let (content, error) = call(&mut s, "get_comp", json!({"offset": offset}));
+        assert!(!error, "{content:?}");
+        let text = content[0]["text"].as_str().unwrap();
+        assert!(text.len() <= 7000, "{}", text.len());
+        assert!(text.find("\"returned\"").unwrap() < text.find("\"layers\":").unwrap());
+        let page: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(page["total"], 110);
+        for row in page["layers"].as_array().unwrap() {
+            assert!(ids.insert(row["id"].as_u64().unwrap()));
+        }
+        match page["next_offset"].as_u64() {
+            Some(next) => {
+                assert!(next > offset);
+                offset = next;
+            }
+            None => break,
+        }
+    }
+    assert_eq!(ids.len(), 110);
+    let text = "A 🌱 \" ".repeat(2500);
+    let layer = call_json(&mut s, "command_run", json!({"id": "layer.newText", "params": {"text": text}}))["layer"].clone();
+    let small = call_json(&mut s, "get_property", json!({"layer": layer, "path": "text/sourceText"}));
+    assert!(small.to_string().len() <= 7000);
+    let omitted = &small["value"];
+    assert_eq!(omitted["$omitted"], true, "{small}");
+    let mut offset = 0;
+    let mut exact = String::new();
+    loop {
+        let page = call_json(
+            &mut s,
+            "get_field",
+            json!({"source": "get_property", "layer": layer, "comp": small["comp"], "time": small["time"], "path": "text/sourceText", "pointer": omitted["pointer"], "offset": offset}),
+        );
+        assert!(page.to_string().len() <= 7000);
+        exact.push_str(page["text"].as_str().unwrap());
+        match page["next_offset"].as_u64() {
+            Some(next) => {
+                assert!(next > offset);
+                offset = next;
+            }
+            None => break,
+        }
+    }
+    let full = call_json(&mut s, "get_property", json!({"layer": layer, "path": "text/sourceText", "full": true}));
+    assert_eq!(serde_json::from_str::<Value>(&exact).unwrap(), full["value"]);
+}
+
+#[test]
+fn compact_key_values_can_be_written_back_without_rounding() {
+    let mut s = big_comp(1);
+    call_json(
+        &mut s,
+        "add_keyframe",
+        json!({"layer": "#1", "path": "transform/rotation", "keys": [{"time": 1,"value": 0.00001},{"time": 2,"value": 0.00002}]}),
+    );
+    let read = call_json(&mut s, "get_property", json!({"layer":"#1","path":"transform/rotation"}));
+    assert_ne!(read["keys"][0]["value"], read["keys"][1]["value"]);
+    for k in read["keys"].as_array().unwrap() {
+        let written = call_json(&mut s, "set_property", json!({"layer":"#1","path":"transform/rotation","time":k["time"],"value":k["value"]}));
+        assert_eq!(written["appliedValue"], k["value"]);
+    }
 }

@@ -544,30 +544,17 @@ fn get(s: &mut Session, p: &Value) -> Result<Value> {
     let raw = pr.value_at(l.layer_time(t));
     let mut out = json!({
         "layer": lid.0, "uid": pr.uid, "match": pr.match_id, "name": pr.name, "type": pr.value.kind_name(),
-        "time": t.seconds(), "value": raw.to_json(), "animated": !pr.keys.is_empty(),
+        "comp": cid.0, "revision": s.revision, "timeBase": "comp",
+        "time": t.seconds(), "value": raw.to_json(), "rawValue": raw.to_json(), "animated": !pr.keys.is_empty(),
+        "expressionEnabled": pr.expr.as_ref().is_some_and(|e| e.enabled),
         "keys": keys, "expression": pr.expr.as_ref().map(|e| e.text.clone()),
     });
-    // With an expression, `value` is the keyframed (pre-expression) value; also report what the
-    // expression makes of it (what renders), or why it fails. A disabled one renders `value`; one
-    // disabled by its syntax error (prop.setExpression) reports that error.
-    if let Some(e) = pr.expr.as_ref().filter(|e| !e.enabled && !e.text.trim().is_empty()) {
-        out["evaluated"] = raw.to_json();
-        if let Some(err) = s.expr_check.and_then(|check| check(&e.text).err()) {
-            out["expressionError"] = json!(err);
-        }
-    } else if pr.has_expression()
-        && let (Some(h), Some(comp)) = (s.expr.as_deref(), s.project.comp(cid))
-    {
-        let mut ctx = crate::render::EvalCtx::new(&s.project, cid, comp, t);
-        ctx.expr = Some(h);
-        match h.eval(&ctx, l, pr, &raw) {
-            Ok(v) => out["evaluated"] = v.to_json(),
-            Err(e) => {
-                out["evaluated"] = raw.to_json();
-                out["expressionError"] = json!(e);
-            }
-        }
-    }
+    out["enabled"] = json!(true);
+    out["effectiveEnabled"] = json!(super::query::property_effective_enabled(&l.props, pr.uid).unwrap_or(false));
+    let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
+    let mut ctx = crate::render::EvalCtx::new(&s.project, cid, comp, t);
+    ctx.expr = s.expr.as_deref();
+    super::query::expression_readback(s, &ctx, l, pr, &mut out);
     Ok(out)
 }
 

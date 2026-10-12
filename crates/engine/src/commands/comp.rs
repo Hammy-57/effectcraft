@@ -1,7 +1,7 @@
 //! Composition menu.
 
 use effectcraft_color::Label;
-use effectcraft_project::{Comp, ItemId, ItemKind, Marker, limits};
+use effectcraft_project::{Comp, ItemKind, Marker, limits};
 use effectcraft_time::{FrameRate, Tick};
 use serde_json::{Value, json};
 
@@ -144,8 +144,7 @@ fn settings(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn open(s: &mut Session, p: &Value) -> Result<Value> {
     let id = match p.get("comp").or(p.get("item")) {
-        Some(Value::Number(n)) => ItemId(n.as_u64().unwrap_or(0)),
-        Some(Value::String(name)) => s.project.items.values().find(|i| &i.name == name && i.as_comp().is_some()).map(|i| i.id).ok_or(EngineError::NoComp)?,
+        Some(v) if !v.is_null() => comp_id(s, &json!({"comp": v}))?,
         _ => *s.state.project_selection.iter().find(|i| s.project.comp(**i).is_some()).ok_or_else(|| bad("comp.open", "missing `comp`"))?,
     };
     if s.project.comp(id).is_none() {
