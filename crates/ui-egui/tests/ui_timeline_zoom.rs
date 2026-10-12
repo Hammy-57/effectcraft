@@ -404,3 +404,36 @@ fn the_timeline_follows_the_cti_past_its_edges() {
     let (s4, e4) = visible(&h);
     assert!(s4 > s3 && cti >= s4 && cti <= e4, "paged from {s3}..{e3} to {s4}..{e4} for the CTI at {cti}");
 }
+
+/// #714 profiling: per-frame UI cost of scrubbing and zooming a long comp with 500 layers.
+#[test]
+#[ignore = "profiling"]
+fn profile_long_comp_scrub_and_zoom() {
+    use effectcraft_engine::perf::{LargeSpec, large_project};
+    let mut s = Session::default();
+    let spec =
+        LargeSpec { comps: 4, main_layers: 500, comp_layers: 3, footage: 30, sequence_frames: 12, nest_depth: 2, expression_every: 5, ..Default::default() };
+    s.replace_project(large_project(&spec), None);
+    let cid = s.active_comp_id().unwrap();
+    s.execute("comp.settings", json!({"comp": cid.0, "duration": 7200})).ok();
+    eprintln!("duration {:?}", s.project.comp(cid).map(|c| c.duration.seconds()));
+    let app = EffectcraftApp::new(s);
+    let mut h = Harness::builder().with_size(vec2(1600.0, 1000.0)).build_eframe(|_| app);
+    h.run_steps(5);
+    let time = |h: &mut Harness<'_, EffectcraftApp>, label: &str, f: &dyn Fn(&mut EffectcraftApp, usize)| {
+        let mut ms = vec![];
+        for i in 0..30 {
+            f(h.state_mut(), i);
+            let t0 = std::time::Instant::now();
+            h.step();
+            ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        eprintln!("{label}: median {:.2} ms, max {:.2} ms", ms[15], ms[29]);
+    };
+    let rows = h.state().auto.previous.iter().filter(|e| e.id.starts_with("timeline.layer.") && e.id.ends_with(".bar")).count();
+    eprintln!("timeline layer bars drawn: {rows}");
+    time(&mut h, "idle", &|_, _| {});
+    time(&mut h, "scrub", &|a, i| a.session.set_time(effectcraft_engine::time::Tick::from_seconds_f64(i as f64 * 37.0)));
+    time(&mut h, "zoom", &|a, i| a.ui.timeline.pps = Some(0.5 + i as f64 * 3.0));
+}

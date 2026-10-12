@@ -277,20 +277,23 @@ fn cryptomatte(e: &mut Enc, ctx: &EffectCtx, b: GBuf, a: &AuxChannels) -> Option
     let manifest = a.manifests.iter().find(|(l, _)| *l == layer).map(|(_, m)| m.as_slice());
     let sel = effectcraft_effects::selection_hashes(pr.s("selection"), manifest);
     // Per aux pixel: coverage-weighted ID colours (RGB) and the selection's coverage (A).
+    // The rank channels are looked up once, not by name for every pixel (#473).
+    use rayon::prelude::*;
     let n = (a.width * a.height) as usize;
+    let planes = a.crypto_planes(&layer);
     let mut img = Image::new(a.width, a.height);
-    for (i, px) in img.data.iter_mut().enumerate().take(n) {
-        let ranks = a.crypto_ranks(&layer, i);
-        let m: f32 = ranks.iter().filter(|(id, c)| *c > 0.0 && sel.contains(&id.to_bits())).map(|(_, c)| *c).sum::<f32>().clamp(0.0, 1.0);
+    img.data.par_iter_mut().enumerate().take(n).for_each(|(i, px)| {
+        let ranks = || effectcraft_raster::channels3d::crypto_ranks_at(&planes, i);
+        let m: f32 = ranks().filter(|(id, c)| *c > 0.0 && sel.contains(&id.to_bits())).map(|(_, c)| c).sum::<f32>().clamp(0.0, 1.0);
         let mut c = [0.0f32; 3];
-        for (id, cov) in &ranks {
-            let k = effectcraft_effects::id_color(*id);
+        for (id, cov) in ranks() {
+            let k = effectcraft_effects::id_color(id);
             for j in 0..3 {
                 c[j] += k[j] * cov;
             }
         }
         *px = [c[0], c[1], c[2], m];
-    }
+    });
     let tex = e.g.upload_image(&img)?;
     let plane = lookup(e, &b, a, &tex, [0.5, 0.5], [0.0; 4]);
     let mut p = op(7);
