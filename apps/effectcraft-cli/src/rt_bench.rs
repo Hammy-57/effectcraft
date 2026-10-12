@@ -109,26 +109,37 @@ pub(super) fn run(s: &Session, args: &Args) -> Result<(), Failure> {
         let cold_ms = cold_start.elapsed().as_secs_f64() * 1000.0;
         let before = gpu.context().transfer_stats();
         let pool_before = gpu.context().pool_stats();
+        let alloc_before = gpu.context().alloc_stats();
+        let _ = effectcraft_gpu::take_pool_miss_sites();
         let mut samples = Vec::with_capacity(n);
         // Per frame in playback order: slow stretches start at cuts in the comp, which the
         // sorted samples hide.
         let mut frames = Vec::with_capacity(n);
         for i in 0..n {
             let (t0, p0, c0) = (gpu.context().transfer_stats(), gpu.context().pool_stats(), cache.stats());
+            let a0 = gpu.context().alloc_stats();
             let now = std::time::Instant::now();
             render(i.saturating_add(1) as i64)?;
             let ms = now.elapsed().as_secs_f64() * 1000.0;
             let (t1, p1) = (gpu.context().transfer_stats(), gpu.context().pool_stats());
+            let a1 = gpu.context().alloc_stats();
             let (c1, held) = (cache.stats(), cache.retained_stats());
             samples.push(ms);
             frames.push(json!({"offset": i.saturating_add(1), "ms": ms, "uploads": t1.uploads.saturating_sub(t0.uploads),
                 "uploadBytes": t1.upload_bytes.saturating_sub(t0.upload_bytes), "readbackBytes": t1.readback_bytes.saturating_sub(t0.readback_bytes),
-                "poolMisses": p1.1.saturating_sub(p0.1), "cacheCpuEntries": c1.entries, "cacheGpuEntries": c1.gpu_entries,
+                "poolMisses": p1.1.saturating_sub(p0.1), "allocations": a1.allocations.saturating_sub(a0.allocations),
+                "allocBytes": a1.bytes.saturating_sub(a0.bytes), "cacheCpuEntries": c1.entries, "cacheGpuEntries": c1.gpu_entries,
                 "cacheHits": c1.hits.saturating_sub(c0.hits), "cacheMisses": c1.misses.saturating_sub(c0.misses),
                 "retainedBytes": held.live_bytes, "retainedDebtBytes": held.debt_bytes, "retainedRecords": held.records}));
         }
         let after = gpu.context().transfer_stats();
         let pool_after = gpu.context().pool_stats();
+        let alloc_after = gpu.context().alloc_stats();
+        let miss_sites: Vec<_> = effectcraft_gpu::take_pool_miss_sites()
+            .into_iter()
+            .take(40)
+            .map(|(site, w, h, count)| json!({"site": site, "width": w, "height": h, "count": count}))
+            .collect();
         samples.sort_by(f64::total_cmp);
         // Instrument one additional moving frame, outside the latency sample population
         // (`--profile-offset K` instruments offset K instead, e.g. one inside a slow stretch).
@@ -143,7 +154,16 @@ pub(super) fn run(s: &Session, args: &Args) -> Result<(), Failure> {
             entry.0 += 1;
             entry.1 += event.dur / 1000.0;
         }
-        let gpu_window_ms = events.iter().filter(|e| e.cat == "gpu").map(|e| e.ts + e.dur).fold(0.0, f64::max) / 1000.0;
+        // Compute passes only (as before RT10a); copies (timed where the device can write
+        // timestamps between encoder commands) are reported on their own.
+        let encoder_stamp = |name: &str| matches!(name, "copy" | "readback_copy");
+        let pass_events = || events.iter().filter(|e| e.cat == "gpu" && !encoder_stamp(&e.name));
+        let pass_start = pass_events().map(|e| e.ts).fold(f64::INFINITY, f64::min);
+        let gpu_window_ms = pass_events().map(|e| e.ts + e.dur).fold(0.0, f64::max) / 1000.0;
+        let gpu_pass_window_ms = if pass_start.is_finite() { gpu_window_ms - pass_start / 1000.0 } else { 0.0 };
+        let gpu_pass_sum_ms = pass_events().map(|e| e.dur).sum::<f64>() / 1000.0;
+        let gpu_all_window_ms = events.iter().filter(|e| e.cat == "gpu").map(|e| e.ts + e.dur).fold(0.0, f64::max) / 1000.0;
+        let copy_ms = events.iter().filter(|e| e.cat == "gpu" && matches!(e.name.as_str(), "copy" | "readback_copy")).map(|e| e.dur).sum::<f64>() / 1000.0;
         let p50 = percentile(&samples, 50);
         let p95 = percentile(&samples, 95);
         note!("{name} {label}: cold={cold_ms:.2} ms, p50={p50:.2} ms, p95={p95:.2} ms ({n} GPU viewer frames; transform drag={drag})");
@@ -157,7 +177,9 @@ pub(super) fn run(s: &Session, args: &Args) -> Result<(), Failure> {
         rows.push(json!({"comp": name, "resolution": label, "frames": n, "transformDrag": drag, "coldMs": cold_ms, "p50Ms": p50, "p95Ms": p95,
             "samplesMs": samples, "framesInOrder": frames, "bitDepth": format!("{:?}", project.settings.bit_depth), "stagesInclusiveMs": stages, "profiledOffset": profiled, "droppedTraceEvents": dropped,
             "yuvConversions": after.yuv_conversions.saturating_sub(before.yuv_conversions),
-            "yuvInputBytes": after.yuv_bytes.saturating_sub(before.yuv_bytes), "timestampQueries": timestamps, "gpuDiagnosticWindowMs": gpu_window_ms, "uploads": after.uploads.saturating_sub(before.uploads),
+            "yuvInputBytes": after.yuv_bytes.saturating_sub(before.yuv_bytes), "timestampQueries": timestamps, "gpuDiagnosticWindowMs": gpu_window_ms,
+            "gpuPassWindowMs": gpu_pass_window_ms, "gpuPassSumMs": gpu_pass_sum_ms, "gpuAllWindowMs": gpu_all_window_ms, "gpuCopyMs": copy_ms,
+            "allocations": alloc_after.allocations.saturating_sub(alloc_before.allocations), "allocBytes": alloc_after.bytes.saturating_sub(alloc_before.bytes), "poolMissSites": miss_sites, "uploads": after.uploads.saturating_sub(before.uploads),
             "uploadBytes": after.upload_bytes.saturating_sub(before.upload_bytes),
             "poolHits": pool_after.0.saturating_sub(pool_before.0),
             "poolMisses": pool_after.1.saturating_sub(pool_before.1),
