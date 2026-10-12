@@ -1478,23 +1478,24 @@ impl Worker {
                 }
             },
         };
-        self.publish(&job, ci, &tail, disk_hit);
+        self.publish(&job, ci, &tail, disk_hit, std::time::Duration::ZERO);
         true
     }
 
     /// A frame is done: sample its render time for the playback budget, store it (RAM and / or
-    /// disk) and release its job.
-    fn publish(&self, job: &Job, ci: FrameImage, tail: &Tail, disk_hit: bool) {
+    /// disk) and release its job. `queued`: time a GPU frame waited behind other frames in
+    /// flight on the landing thread, left out of its render time (RT9b).
+    fn publish(&self, job: &Job, ci: FrameImage, tail: &Tail, disk_hit: bool, queued: std::time::Duration) {
         if !(disk_hit || ci.is_gpu() && self.gpu_retired.load(Ordering::Acquire))
             && let Some(ticket) = tail.ticket.clone()
         {
             self.playback_budget.lock().unwrap_or_else(std::sync::PoisonError::into_inner).record(
                 ticket,
-                tail.service_start.elapsed().as_secs_f64() * 1000.0,
+                tail.service_start.elapsed().saturating_sub(queued).as_secs_f64() * 1000.0,
                 ci.is_gpu(),
             );
         }
-        let render_time = tail.t0.elapsed();
+        let render_time = tail.t0.elapsed().saturating_sub(queued);
         if job.disk_only {
             // Straight to the disk cache, whatever it cost (else it would be asked for again).
             if let (Some((dc, k)), FrameImage::Cpu(img)) = (&tail.disk, &ci) {
@@ -1604,7 +1605,7 @@ impl Worker {
         self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner).landing += 1;
         let w = self.clone();
         let flight = GpuFlight { job: job.clone(), tail: tail.clone(), gpu: gpu.clone(), auto, t0, width: frame.width, height: frame.height };
-        match self.landing.begin(gpu, frame, Box::new(move |bytes| w.landed(flight, bytes))) {
+        match self.landing.begin(gpu, frame, Box::new(move |bytes, queued| w.landed(flight, bytes, queued))) {
             Ok(id) => Some(id),
             Err(_) => {
                 self.landing_done();
@@ -1637,25 +1638,27 @@ impl Worker {
 
     /// A GPU frame's readback arrived (on the landing thread): finish its job as the blocking
     /// readback did. A failed readback renders the frame on the CPU, on a frame worker.
+    /// `queued`: how long it waited behind other frames in flight, which its timings leave out:
+    /// with several frames in flight they would add up the queue, not this frame's cost.
     #[cfg(not(target_arch = "wasm32"))]
-    fn landed(&self, flight: GpuFlight, bytes: Option<Vec<u8>>) {
+    fn landed(&self, flight: GpuFlight, bytes: Option<Vec<u8>>, queued: std::time::Duration) {
         self.landing_done();
         let GpuFlight { job, tail, gpu, auto, t0, width, height } = flight;
         if let Some(image) = bytes.and_then(|b| display_color_image(width, height, &b))
             && gpu.context().check_health().is_ok()
         {
             if let (Some(key), Some(p)) = (auto, effectcraft_engine::render::Accelerator::auto_pick(&gpu)) {
-                // Readback and CPU image construction included, as before.
-                p.record(key, true, t0.elapsed().as_secs_f64() * 1000.0);
+                // Its readback and CPU image construction included, the queue ahead of it not.
+                p.record(key, true, t0.elapsed().saturating_sub(queued).as_secs_f64() * 1000.0);
             }
-            self.publish(&job, FrameImage::Cpu(Arc::new(image)), &tail, false);
+            self.publish(&job, FrameImage::Cpu(Arc::new(image)), &tail, false, queued);
             return;
         }
         let w = self.clone();
         self.spawn(move || {
             let attempt = |f: &dyn Fn() -> Rendered| std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).ok();
             match attempt(&|| w.display_fallback(&job, &gpu, auto)).or_else(|| attempt(&|| w.render_job(&job, false, None))) {
-                Some(Rendered::Image(ci)) => w.publish(&job, ci, &tail, false),
+                Some(Rendered::Image(ci)) => w.publish(&job, ci, &tail, false, std::time::Duration::ZERO),
                 _ => w.give_up(job.key, job.urgent),
             }
         });
@@ -2189,6 +2192,58 @@ mod tests {
     /// (asked for again, it isn't rendered twice) but not against the working-memory limit, and
     /// a newer revision still drops the queued frames of an older one.
     #[cfg(not(target_arch = "wasm32"))]
+    /// RT9b: with several GPU frames in flight, each frame's timing leaves out the wait behind
+    /// the frames ahead of it: it stays near one frame's cost, not the sum of the queue.
+    #[test]
+    fn landed_frames_are_timed_without_the_queue_ahead_of_them() {
+        use effectcraft_engine::Session;
+        use effectcraft_engine::render::{Accelerator, Backend};
+        use serde_json::json;
+        use std::time::Duration;
+        let Some(gpu) = Gpu::headless() else { return };
+        let mut s = Session::default();
+        let cid = ItemId(s.execute("comp.new", json!({"name": "A", "width": 64, "height": 48, "duration": 2})).unwrap()["comp"].as_u64().unwrap());
+        s.execute("layer.newSolid", json!({"color": "#3080ff", "width": 40, "height": 30})).unwrap();
+        let mut r = Renderer::new(&s.project, &effectcraft_engine::render::NoFootage, RenderOpts { backend: Backend::Gpu, ..Default::default() });
+        r.accel = Some(&gpu as &dyn Accelerator);
+        let frame = gpu.render_display(&r, cid, Tick::ZERO).expect("GPU display frame");
+        // Each frame's own landing cost; the first frame waits until all four are in flight.
+        const COST: Duration = Duration::from_millis(100);
+        const N: usize = 4;
+        let landing = Arc::new(landing::Landing::default());
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let gate = Arc::new(Mutex::new(Some(gate_rx)));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        for k in 0..N {
+            let (gate, done) = (gate.clone(), done_tx.clone());
+            let begun = web_time::Instant::now();
+            let land: landing::Land = Box::new(move |bytes, queued| {
+                if let Some(rx) = gate.lock().unwrap().take() {
+                    rx.recv().unwrap();
+                }
+                std::thread::sleep(COST);
+                done.send((k, bytes.is_some(), begun.elapsed(), queued)).unwrap();
+            });
+            assert!(landing.begin(&gpu, &frame, land).is_ok(), "frame {k} in flight");
+        }
+        gate_tx.send(()).unwrap();
+        let mut got: Vec<_> = (0..N).map(|_| done_rx.recv_timeout(Duration::from_secs(60)).expect("landed")).collect();
+        got.sort_by_key(|g| g.0);
+        for &(k, ok, total, queued) in &got {
+            assert!(ok, "frame {k} read back");
+            assert!(queued <= total);
+            if k == 0 {
+                continue;
+            }
+            // It waited for every frame ahead of it to land...
+            assert!(queued >= COST * k as u32, "frame {k}: queued {queued:?}");
+            // ...which its own time leaves out.
+            let own = total - queued;
+            assert!(own < COST * 2, "frame {k}: own {own:?} of {total:?}");
+        }
+        assert!(got[N - 1].2 >= COST * N as u32, "the last frame's wall time is the whole queue");
+    }
+
     #[test]
     fn gpu_frames_land_with_the_blocking_bytes_and_stale_queued_frames_are_dropped() {
         use effectcraft_engine::Session;
@@ -2262,7 +2317,7 @@ mod tests {
         let now = web_time::Instant::now();
         let tail = Tail { t0: now, service_start: now, ticket: None, disk: None };
         let flight = GpuFlight { job: job(flying), tail, gpu: gpu.clone(), auto: None, t0: now, width: frame.width, height: frame.height };
-        f.worker().landed(flight, Some(bytes));
+        f.worker().landed(flight, Some(bytes), std::time::Duration::ZERO);
         settle(&f);
         assert!(matches!(f.get(&flying), Some(FrameImage::Cpu(img)) if img.pixels == expected.pixels));
         assert!(f.is_cached(&newer) && !f.is_cached(&stale));

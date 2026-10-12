@@ -16,11 +16,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use web_time::Instant;
+
 use effectcraft_gpu::wgpu::SubmissionIndex;
 use effectcraft_gpu::{DisplayFrame, Gpu};
 
-/// Finishes a frame with its premultiplied RGBA8 bytes (`None`: the readback failed).
-pub(super) type Land = Box<dyn FnOnce(Option<Vec<u8>>) + Send>;
+/// Finishes a frame with its premultiplied RGBA8 bytes (`None`: the readback failed) and the
+/// time it spent queued behind other frames in flight since [`Landing::begin`] (see
+/// [`State::free_at`]): not its own cost, so its timings leave it out.
+pub(super) type Land = Box<dyn FnOnce(Option<Vec<u8>>, Duration) + Send>;
 
 /// Readback bytes in flight at most: each frame holds a mapped staging buffer (host-visible
 /// memory) and then its bytes until it lands. 32 HD frames, 7 UHD ones.
@@ -52,16 +56,22 @@ struct State {
     bytes: usize,
     /// The landing thread is running.
     thread: bool,
+    /// When the landing thread finished its last frame. Readbacks complete in submission order
+    /// and land one at a time, so a frame begun before then waited for the frames ahead of it
+    /// until then; its own readback (and landing) starts at the later of the two.
+    free_at: Option<Instant>,
 }
 
 struct Flight {
     land: Land,
     bytes: usize,
     gpu: Gpu,
+    /// When its readback was handed over.
+    begun: Instant,
 }
 
 enum Step {
-    Land(Land, Option<Vec<u8>>),
+    Land(Land, Option<Vec<u8>>, Duration),
     Wait(Gpu, SubmissionIndex),
     Poll(Gpu),
 }
@@ -90,7 +100,7 @@ impl Landing {
             }
             s.next = s.next.wrapping_add(1);
             let id = s.next;
-            s.flights.insert(id, Flight { land, bytes, gpu: gpu.clone() });
+            s.flights.insert(id, Flight { land, bytes, gpu: gpu.clone(), begun: Instant::now() });
             s.bytes = s.bytes.saturating_add(bytes);
             id
         };
@@ -166,7 +176,8 @@ impl Landing {
                     if let Some((id, bytes)) = s.arrived.pop_front() {
                         if let Some(f) = s.flights.remove(&id) {
                             s.bytes = s.bytes.saturating_sub(f.bytes);
-                            break Step::Land(f.land, bytes);
+                            let queued = s.free_at.map_or(Duration::ZERO, |t| t.saturating_duration_since(f.begun));
+                            break Step::Land(f.land, bytes, queued);
                         }
                         continue;
                     }
@@ -190,11 +201,12 @@ impl Landing {
                 }
             };
             match step {
-                Step::Land(land, bytes) => {
+                Step::Land(land, bytes, queued) => {
                     self.landed.fetch_add(1, Ordering::Relaxed);
-                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| land(bytes))).is_err() {
+                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| land(bytes, queued))).is_err() {
                         log::error!("finishing a GPU frame panicked; that frame was skipped");
                     }
+                    self.lock().free_at = Some(Instant::now());
                 }
                 Step::Wait(gpu, submission) => {
                     // A failure (or the deadline) retires the context, which settles every
