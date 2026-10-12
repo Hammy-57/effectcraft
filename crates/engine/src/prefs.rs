@@ -737,7 +737,10 @@ impl Prefs {
     }
 
     /// The Memory & CPU cache budgets in effect: the configured layer / footage / preview
-    /// budgets, scaled down so together they leave **RAM Reserved for Other Applications** free,
+    /// budgets (on a machine with at least [`LARGE_MEMORY`], the layer and preview caches at
+    /// their defaults grow with its memory: an eighth and a quarter of it, up to 16 and 32 GB, so
+    /// the layers and frames an edit doesn't change stay cached across the timeline), scaled
+    /// down so together they leave **RAM Reserved for Other Applications** free,
     /// and halved while the system is low on memory when **Reduce Cache Size When System Is Low
     /// on Memory** is on. `mem` = the system's memory (`None` = unknown: configured budgets).
     /// In the browser the layer and footage caches also stay within [`WEB_LAYER_CACHE`] and
@@ -751,6 +754,14 @@ impl Prefs {
         let (mut l, mut m, mut p) = (self.layer_cache_bytes() as u64, self.media_cache_bytes() as u64, self.preview_cache_bytes() as u64);
         if web {
             (l, m) = (l.min(WEB_LAYER_CACHE), m.min(WEB_MEDIA_CACHE));
+        } else if let Some(total) = mem.map(|m| m.total).filter(|t| *t >= LARGE_MEMORY) {
+            let defaults = Memory::default();
+            if self.memory.layer_cache_mb == defaults.layer_cache_mb {
+                l = l.max((total / 8).min(16 << 30));
+            }
+            if self.memory.preview_cache_mb == defaults.preview_cache_mb {
+                p = p.max((total / 4).min(32 << 30));
+            }
         }
         let floor = 64u64 << 20;
         let mut capped = false;
@@ -901,6 +912,11 @@ fn push_mru(list: &mut Vec<String>, v: &str, max: usize) {
 /// up to 384 MB per open movie): with the desktop's 1 GB defaults, eight stacked 1080p clips ran
 /// the page out of memory a few seconds into playback.
 pub const WEB_LAYER_CACHE: u64 = 512 << 20;
+
+/// Memory from which the layer and preview caches at their defaults grow with the machine's
+/// (see [`Prefs::cache_budgets`]): a 32 GB machine and up (a 64 GB unified-memory Mac keeps 8 GB
+/// of processed layers and 16 GB of RAM preview frames instead of 1 and 3).
+pub const LARGE_MEMORY: u64 = 32 << 30;
 
 /// The most the footage frame cache holds in the browser (see [`WEB_LAYER_CACHE`]).
 pub const WEB_MEDIA_CACHE: u64 = 256 << 20;
