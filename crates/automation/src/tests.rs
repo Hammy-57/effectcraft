@@ -2092,7 +2092,7 @@ fn logging_levels_filter_warnings() {
     let _ = std::fs::remove_file(path);
 }
 
-/// A minimal JSON Schema check (type, required, properties, items): enough for outputSchema.
+/// A minimal output-schema check: type, anyOf, const, required, properties and items.
 fn validate(schema: &Value, v: &Value, at: &str) -> Result<(), String> {
     if let Some(t) = schema.get("type") {
         let types: Vec<&str> = match t {
@@ -2113,6 +2113,16 @@ fn validate(schema: &Value, v: &Value, at: &str) -> Result<(), String> {
         if !ok {
             return Err(format!("{at}: {v} is not {t}"));
         }
+    }
+    if let Some(variants) = schema.get("anyOf").and_then(Value::as_array)
+        && !variants.iter().any(|variant| validate(variant, v, at).is_ok())
+    {
+        return Err(format!("{at}: does not match any anyOf variant"));
+    }
+    if let Some(expected) = schema.get("const")
+        && v != expected
+    {
+        return Err(format!("{at}: expected constant {expected}, got {v}"));
     }
     for r in schema.get("required").and_then(Value::as_array).into_iter().flatten() {
         if v.get(r.as_str().unwrap()).is_none() {
@@ -2198,6 +2208,58 @@ fn structured_content_is_version_gated_and_matches_output_schemas() {
     }
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(png);
+}
+
+/// Strict MCP clients validate bounded replies against the schema advertised in tools/list.
+#[test]
+fn bounded_structured_layout_matches_its_advertised_output_schema() {
+    let mut s = server();
+    rpc(&mut s, 1, "initialize", json!({"protocolVersion": "2025-06-18"}));
+    let tools = rpc(&mut s, 2, "tools/list", json!({}))["tools"].as_array().unwrap().clone();
+    let schema = &tools.iter().find(|tool| tool["name"] == "get_layout").unwrap()["outputSchema"];
+    assert_eq!(schema["type"], "object");
+    assert!(schema.get("properties").is_none(), "legacy restrictions must stay inside their variant");
+    call_json(&mut s, "command_run", json!({"id": "comp.new", "params": {"name": "Schema", "width": 400, "height": 300}}));
+    let layer = call_json(
+        &mut s,
+        "command_run",
+        json!({"id": "layer.newSolid", "params": {"name": "Large layer name ".repeat(5000), "width": 100, "height": 50}}),
+    )["layer"]
+        .clone();
+    let reply = rpc(&mut s, 3, "tools/call", json!({"name": "get_layout", "arguments": {"layers": [layer]}}));
+    assert_eq!(reply["isError"], false, "{reply}");
+    let structured = &reply["structuredContent"];
+    assert!(structured["result_id"].is_string(), "{structured}");
+    assert_eq!(structured["layers"][0]["name"]["$omitted"], true, "{structured}");
+    assert_eq!(structured["layers"][0]["name"]["fetch"], "get_result");
+    assert!(structured.to_string().len() <= 7000);
+    assert!(validate(&schema["anyOf"][0], structured, "legacy layout").is_err(), "regression must exercise the formerly invalid legacy shape");
+    validate(schema, structured, "retained layout").unwrap();
+}
+
+#[test]
+fn retained_and_retention_failure_output_schema_variants_are_explicit() {
+    let mut store = crate::result_store::ResultStore::default();
+    let mut deep = json!(1);
+    for _ in 0..200 {
+        deep = json!({"child": deep});
+    }
+    let failure = store.finish("get_layout", &json!({}), json!({"ok": true, "waiting": true, "layers": deep}), None).unwrap();
+    assert_eq!(failure["operation_completed"], false);
+    assert_eq!(failure["result_retained"], false);
+    let reply = crate::server::call_result_with(Ok(crate::tools::Reply::Json(failure)), true);
+    assert_eq!(reply["isError"], true);
+    for tool in crate::tools::catalogue() {
+        if let Some(schema) = crate::tools::output_schema(tool.name) {
+            validate(&schema, &reply["structuredContent"], tool.name).unwrap();
+            validate(&schema, &json!({"result_id": "opaque", "header": {"$omitted": true}}), tool.name).unwrap();
+        }
+    }
+    let schema = crate::tools::output_schema("command_batch").unwrap();
+    assert!(validate(&schema, &json!({"results": [{"$omitted": true}]}), "missing retained id").is_err());
+    assert!(validate(&schema, &json!({"result_id": 3}), "wrong retained id type").is_err());
+    assert!(validate(&schema, &json!({"result_retained": true, "operation_completed": false}), "not a retention failure").is_err());
+    assert!(validate(&schema, &json!({"result_retained": false, "operation_completed": "false"}), "wrong completion type").is_err());
 }
 
 /// AG5: render_snapshot → edit → render_compare, with the heatmap inline only when it shows something.
