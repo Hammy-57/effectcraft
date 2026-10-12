@@ -6,8 +6,10 @@ use crate::EvalCtx;
 use effectcraft_project::{ItemId, ItemKind, Layer, LayerId, LayerSource, Node, PropGroup};
 use std::hash::Hash;
 
-pub(super) fn hash(h: &mut KeyHasher, ctx: &EvalCtx, layer: &Layer, effects: Option<usize>) -> Option<()> {
-    let mut deps = Dependencies { h, path: vec![(ctx.comp_id, layer.id)], remaining: 1024, other_times: super::reads_other_times(layer) };
+/// `free`: the owner is drawn from its values at the frame time alone, so a layer it reads at
+/// that time is keyed by its values there, not its keyframes (see [`super::free`]).
+pub(super) fn hash(h: &mut KeyHasher, ctx: &EvalCtx, layer: &Layer, effects: Option<usize>, free: bool) -> Option<()> {
+    let mut deps = Dependencies { h, path: vec![(ctx.comp_id, layer.id)], remaining: 1024, other_times: super::reads_other_times(layer), free };
     deps.effects(ctx, layer, effects)
 }
 
@@ -16,6 +18,8 @@ struct Dependencies<'a> {
     path: Vec<(ItemId, LayerId)>,
     remaining: usize,
     other_times: bool,
+    /// Layers read at the frame time only are keyed by their values there (see [`hash`]).
+    free: bool,
 }
 
 impl Dependencies<'_> {
@@ -74,8 +78,13 @@ impl Dependencies<'_> {
         }
         self.path.push(id);
         // Include transforms/parents as well as pixels: selected-layer anchors and
-        // continuously rasterized sources can depend on them.
-        hash_debug(self.h, layer);
+        // continuously rasterized sources can depend on them. Read at the frame time only (and
+        // not a precomp, whose nested comp may read other times), its values there decide.
+        let info = super::layer_info(ctx.comp, layer);
+        let blurred = layer.switches.motion_blur && ctx.comp.enable_motion_blur;
+        let free = self.free && !self.other_times && info.pointwise && !blurred && !matches!(layer.source, LayerSource::Comp { .. });
+        free.hash(self.h);
+        (if free { info.free } else { info.whole }).hash(self.h);
         hash_values(self.h, ctx, layer, &layer.props);
         hash_debug(self.h, &ctx.world_matrix(layer));
         if super::time_dependent(layer) {
@@ -92,9 +101,12 @@ impl Dependencies<'_> {
                             let time = ctx.source_time(layer);
                             time.0.hash(self.h);
                             let nested = EvalCtx::new(ctx.project, item, comp, time);
+                            // A nested comp may read its layers at other times (motion blur).
+                            let free = std::mem::replace(&mut self.free, false);
                             for child in &comp.layers {
                                 self.layer(&nested, child)?;
                             }
+                            self.free = free;
                         }
                         _ => {}
                     }

@@ -352,6 +352,129 @@ fn self_contained_expressions() {
     }
 }
 
+// ------------------------------------------------------------------------------ layer cache keys
+
+/// The layer cache key of the first layer at `t` (as `Renderer::content_cache_key` asks it).
+fn layer_key_at(p: &Project, cid: ItemId, t: Tick) -> Option<u64> {
+    let c = p.comp(cid).unwrap();
+    let l = c.layers.get(0).unwrap();
+    crate::cache::layer_key(&EvalCtx::new(p, cid, c, t), l, 1.0, false, false)
+}
+
+/// A keyframe edit on an effect keeps the layer's cached pixels at the frames whose values it
+/// doesn't change (its key there is unchanged), and those pixels equal a fresh render.
+#[test]
+fn an_effect_keyframe_edit_keeps_the_layer_keys_outside_its_span() {
+    let (mut p, cid) = scene();
+    let mut l = p.comp(cid).unwrap().layers.get(0).unwrap().clone();
+    effect(&mut p, &mut l, "ec.blur.gaussian");
+    l.props.prop_mut("effects/#1/blurriness").unwrap().keys = keys(&[0.0, 2.0, 4.0], |i| Value::Scalar(2.0 + 4.0 * i as f64));
+    *p.comp_mut(cid).unwrap().layers.get_mut(0).unwrap() = l;
+    let q = edit(&p, cid, |l| l.props.prop_mut("effects/#1/blurriness").unwrap().keys[2].value = Value::Scalar(1.0));
+    let fps = p.comp(cid).unwrap().frame_rate;
+    let kept: Vec<i64> =
+        frames().filter(|f| layer_key_at(&p, cid, fps.tick_of(*f)).is_some_and(|k| Some(k) == layer_key_at(&q, cid, fps.tick_of(*f)))).collect();
+    assert_eq!(kept, (0..=60).step_by(5).collect::<Vec<_>>());
+    // Through the cache: frames rendered before the edit, then after it from the same cache,
+    // equal fresh renders.
+    let cache = crate::LayerCache::default();
+    for f in frames() {
+        let mut r = renderer(&p, None);
+        r.cache = Some(&cache);
+        r.comp_frame(cid, fps.tick_of(f));
+    }
+    for f in frames() {
+        let mut r = renderer(&q, None);
+        r.cache = Some(&cache);
+        let cached = r.comp_frame(cid, fps.tick_of(f));
+        assert!(cached.data == renderer(&q, None).comp_frame(cid, fps.tick_of(f)).data, "frame {f}");
+    }
+}
+
+/// Motion blur keeps the keyframes in a layer's key (its content is drawn at the shutter's
+/// times): every key changes.
+#[test]
+fn a_motion_blurred_layer_keeps_its_keyframes_in_its_key() {
+    let (mut p, cid) = scene();
+    let mut l = p.comp(cid).unwrap().layers.get(0).unwrap().clone();
+    effect(&mut p, &mut l, "ec.blur.gaussian");
+    l.props.prop_mut("effects/#1/blurriness").unwrap().keys = keys(&[0.0, 2.0, 4.0], |i| Value::Scalar(2.0 + 4.0 * i as f64));
+    *p.comp_mut(cid).unwrap().layers.get_mut(0).unwrap() = l;
+    let q = edit(&p, cid, |l| l.props.prop_mut("effects/#1/blurriness").unwrap().keys[2].value = Value::Scalar(1.0));
+    let c = p.comp(cid).unwrap();
+    let key = |p: &Project, t: Tick| {
+        let c = p.comp(cid).unwrap();
+        crate::cache::layer_key(&EvalCtx::new(p, cid, c, t), c.layers.get(0).unwrap(), 1.0, false, true)
+    };
+    let t = c.frame_rate.tick_of(0);
+    assert_ne!(key(&p, t), key(&q, t), "blurred: the keyframes count");
+}
+
+/// Measure on a real project (`EC_PRINTS_PROJECT=…/project.ecproj`): for each layer of every
+/// comp with a keyframed content property (masks, effects, text, shapes), edit its middle
+/// keyframe and count the frames (up to 600 spread over the comp) whose layer cache key stays
+/// (before this change: none, as the key hashed the keyframes).
+#[test]
+#[ignore = "needs a local project file; prints counts"]
+fn real_project_layer_keys_kept_after_one_keyframe_edit() {
+    use effectcraft_project::PropGroup;
+    let Ok(path) = std::env::var("EC_PRINTS_PROJECT") else { return };
+    let p = Project::from_json(&std::fs::read_to_string(path).unwrap()).unwrap();
+    fn first_keyed(g: &mut PropGroup) -> Option<&mut effectcraft_project::Property> {
+        for c in &mut g.children {
+            match c {
+                Node::Prop(p) if p.keys.len() >= 3 && matches!(p.keys[p.keys.len() / 2].value, Value::Scalar(_) | Value::Vec2(_) | Value::Vec3(_)) => {
+                    return Some(p);
+                }
+                Node::Prop(_) => {}
+                Node::Group(sub) if sub.match_id != "transform" => {
+                    if let Some(p) = first_keyed(sub) {
+                        return Some(p);
+                    }
+                }
+                Node::Group(_) => {}
+            }
+        }
+        None
+    }
+    let (mut edits, mut kept_total, mut keyed_total) = (0usize, 0usize, 0usize);
+    let comps: Vec<(ItemId, Comp)> =
+        p.items.iter().filter_map(|(id, i)| if let ItemKind::Comp(c) = &i.kind { Some((*id, Comp::clone(c))) } else { None }).collect();
+    for (cid, comp) in comps {
+        let fps = comp.frame_rate;
+        let total = fps.frame_at(comp.duration).max(1);
+        let n = total.min(600);
+        let times: Vec<Tick> = (0..n).map(|i| fps.tick_of(i * total / n)).collect();
+        for i in 0..comp.layers.len() {
+            let mut q = p.clone();
+            let c = q.comp_mut(cid).unwrap();
+            let Some(prop) = first_keyed(&mut c.layers.get_mut(i).unwrap().props) else { continue };
+            let k = prop.keys.len() / 2;
+            prop.keys[k].value = match &prop.keys[k].value {
+                Value::Scalar(v) => Value::Scalar(v * 0.5 + 1.0),
+                Value::Vec2(v) => Value::Vec2([v[0] + 7.0, v[1] - 3.0]),
+                Value::Vec3(v) => Value::Vec3([v[0] + 7.0, v[1] - 3.0, v[2]]),
+                v => v.clone(),
+            };
+            let key = |p: &Project, t: Tick| {
+                let c = p.comp(cid).unwrap();
+                crate::cache::layer_key(&EvalCtx::new(p, cid, c, t), c.layers.get(i).unwrap(), 1.0, false, false)
+            };
+            let before: Vec<Option<u64>> = times.iter().map(|t| key(&p, *t)).collect();
+            let keyed = before.iter().filter(|k| k.is_some()).count();
+            if keyed == 0 {
+                continue;
+            }
+            let kept = times.iter().zip(&before).filter(|(t, b)| b.is_some() && key(&q, **t) == **b).count();
+            eprintln!("{:?} layer {i} {:?}: key kept at {kept}/{keyed} keyed frames", p.item(cid).unwrap().name, comp.layers.get(i).unwrap().name);
+            edits += 1;
+            kept_total += kept;
+            keyed_total += keyed;
+        }
+    }
+    eprintln!("{edits} content keyframe edits: {:.1} % of layer keys kept ({kept_total}/{keyed_total})", 100.0 * kept_total as f64 / keyed_total.max(1) as f64);
+}
+
 /// An expression engine whose every expression reads the first layer's opacity a second later
 /// (`thisComp.layer(1).transform.opacity.valueAtTime(time + 1)`).
 struct ReadsAhead;

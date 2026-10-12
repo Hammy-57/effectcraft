@@ -1595,8 +1595,10 @@ pub(crate) struct LayerInfo {
     styles: u64,
     /// Every field of the layer, every property included (a precomp's nested layers).
     pub(crate) whole: u64,
-    /// [`Self::whole`] without keyframes: for keys that hash the animated values at the frame
-    /// time instead (see [`free`]).
+    /// [`Self::content`], [`Self::styles`] and [`Self::whole`] without keyframes: for keys
+    /// that hash the animated values at the frame time instead (see [`free`]).
+    content_free: u64,
+    styles_free: u64,
     pub(crate) free: u64,
     /// The layer is drawn from its values at the frame time alone ([`free::pointwise`]).
     pub(crate) pointwise: bool,
@@ -1634,6 +1636,7 @@ impl LayerInfo {
         // (Audio, Lock and Shy don't change pixels.)
         hash_debug(&mut head, &layer.switches.pixels());
         let mut content = KeyHasher(0xcbf2_9ce4_8422_2325);
+        let mut content_free = KeyHasher(0x2325_cbf2_9ce4_8422);
         let (mut content_animated, mut content_expressions) = (false, false);
         for c in &layer.props.children {
             if let Node::Group(g) = c {
@@ -1647,10 +1650,13 @@ impl LayerInfo {
                 content_animated |= has_animation(g);
             }
             hash_debug(&mut content, c);
+            free::hash_node(&mut content_free, c);
         }
         let mut styles = KeyHasher(0x9e37_79b9_7f4a_7c15);
+        let mut styles_free = KeyHasher(0x79b9_7f4a_7c15_9e37);
         let styles_animated = layer.layer_styles().is_some_and(|g| {
             hash_debug(&mut styles, g);
+            free::hash_node(&mut styles_free, &Node::Group(g.clone()));
             has_animation(g)
         });
         let mut whole = KeyHasher(0x7c15_9e37_79b9_7f4a);
@@ -1665,6 +1671,8 @@ impl LayerInfo {
             content: content.finish(),
             styles: styles.finish(),
             whole: whole.finish(),
+            content_free: content_free.finish(),
+            styles_free: styles_free.finish(),
             free: free_whole.finish(),
             pointwise: free::pointwise(layer, time_dependent, reads_other_times, paint),
             content_animated,
@@ -1717,7 +1725,8 @@ fn named_layers(ctx: &EvalCtx, layer: &Layer, g: &PropGroup, out: &mut Vec<u64>)
 /// layer's structure, animated values and source at the context time, and the layers its own
 /// effects name. `None` when one can't be keyed here (a precomp, an effect reading the comp
 /// scene, too deep).
-fn hash_layer_refs(h: &mut KeyHasher, ctx: &EvalCtx, layer: &Layer, reads_other_times: bool, depth: usize, limit: Option<usize>) -> Option<()> {
+#[allow(clippy::too_many_arguments)]
+fn hash_layer_refs(h: &mut KeyHasher, ctx: &EvalCtx, layer: &Layer, reads_other_times: bool, free: bool, depth: usize, limit: Option<usize>) -> Option<()> {
     if depth > 4 {
         return None;
     }
@@ -1738,7 +1747,10 @@ fn hash_layer_refs(h: &mut KeyHasher, ctx: &EvalCtx, layer: &Layer, reads_other_
         if oi.reads_comp_scene || (reads_other_times && oi.expressions) {
             return None;
         }
-        oi.whole.hash(h);
+        // Read at the frame time only: its values there, not its keyframes.
+        let free = free && !reads_other_times && oi.pointwise && !(o.switches.motion_blur && ctx.comp.enable_motion_blur);
+        free.hash(h);
+        (if free { oi.free } else { oi.whole }).hash(h);
         if oi.animated {
             hash_values(h, ctx, o, &o.props);
         }
@@ -1758,7 +1770,7 @@ fn hash_layer_refs(h: &mut KeyHasher, ctx: &EvalCtx, layer: &Layer, reads_other_
             ctx.time.0.hash(h);
         }
         if o.switches.effects && oi.layer_refs {
-            hash_layer_refs(h, ctx, o, reads_other_times || oi.reads_other_times, depth + 1, None)?;
+            hash_layer_refs(h, ctx, o, reads_other_times || oi.reads_other_times, free, depth + 1, None)?;
         }
     }
     Some(())
@@ -1912,9 +1924,12 @@ fn key_with(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool, f
 fn key_any(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool, footage: bool, effects: Option<usize>, src: Option<u64>) -> Option<u64> {
     let info = layer_info(ctx.comp, layer);
     let mut h = KeyHasher(0xcbf2_9ce4_8422_2325);
+    // Drawn from its values at the frame time alone: the structure leaves the keyframes out
+    // (see [`free`]), so a keyframe edit keeps the key where it doesn't change a value.
+    let free = info.pointwise && !blur;
     ctx.comp.frame_rate.as_f64().to_bits().hash(&mut h);
     ctx.comp.enable_frame_blending.hash(&mut h);
-    dependencies::hash(&mut h, ctx, layer, effects)?;
+    dependencies::hash(&mut h, ctx, layer, effects, free)?;
     match &layer.source {
         LayerSource::Solid { item } => {
             let it = ctx.project.item(*item)?;
@@ -1965,7 +1980,8 @@ fn key_any(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool, fo
     match effects {
         // Static structure (memoised), then the values of what's animated.
         None => {
-            info.content.hash(&mut h);
+            free.hash(&mut h);
+            (if free { info.content_free } else { info.content }).hash(&mut h);
             if info.content_animated {
                 for c in &layer.props.children {
                     if let Node::Group(g) = c
@@ -2031,7 +2047,7 @@ fn key_any(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool, fo
     }
     // Effects that read other layers (layer parameters) see their pixels.
     if info.layer_refs {
-        hash_layer_refs(&mut h, ctx, layer, info.reads_other_times, 0, effects)?;
+        hash_layer_refs(&mut h, ctx, layer, info.reads_other_times, free, 0, effects)?;
     }
     Some(h.finish())
 }
@@ -2055,7 +2071,11 @@ pub fn styles_key(ctx: &EvalCtx, layer: &Layer, content_key: u64) -> u64 {
     let mut h = KeyHasher(content_key ^ 0x9e37_79b9_7f4a_7c15);
     if let Some(g) = layer.layer_styles() {
         let info = layer_info(ctx.comp, layer);
-        info.styles.hash(&mut h);
+        // Styles draw at the frame time (a blurred layer's styled buffer is drawn once and
+        // moved, see `content_key`).
+        let free = info.pointwise && !(layer.switches.motion_blur && ctx.comp.enable_motion_blur);
+        free.hash(&mut h);
+        (if free { info.styles_free } else { info.styles }).hash(&mut h);
         if info.styles_animated {
             hash_values(&mut h, ctx, layer, g);
         }

@@ -32,14 +32,33 @@ pub(super) fn has_keys(g: &PropGroup) -> bool {
 /// keyframes): the key hashes the value at the frame time instead.
 fn strip(g: &mut PropGroup) {
     for c in &mut g.children {
-        match c {
-            Node::Prop(p) if !p.keys.is_empty() => {
-                p.keys = Vec::new();
-                p.value = Value::Scalar(0.0);
-            }
-            Node::Prop(_) => {}
-            Node::Group(g) => strip(g),
+        strip_node(c);
+    }
+}
+
+fn strip_node(n: &mut Node) {
+    match n {
+        Node::Prop(p) if !p.keys.is_empty() => {
+            p.keys = Vec::new();
+            p.value = Value::Scalar(0.0);
         }
+        Node::Prop(_) => {}
+        Node::Group(g) => strip(g),
+    }
+}
+
+/// Hash `n` as [`hash_debug`] does, without its keyframes (see [`strip`]).
+pub(super) fn hash_node(h: &mut KeyHasher, n: &Node) {
+    let keyed = match n {
+        Node::Prop(p) => !p.keys.is_empty(),
+        Node::Group(g) => has_keys(g),
+    };
+    if keyed {
+        let mut n = n.clone();
+        strip_node(&mut n);
+        hash_debug(h, &n);
+    } else {
+        hash_debug(h, n);
     }
 }
 
