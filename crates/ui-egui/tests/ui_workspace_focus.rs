@@ -127,6 +127,8 @@ fn tab_and_shift_tab_traverse_toolbar_and_space_activates_only_focused_tool() {
     assert_eq!(h.ctx.memory(|m| m.focused()), None, "plain Tab must not start keyboard traversal");
     assert!(h.state().ui.mini_flowchart.is_some(), "plain Tab opens the Composition Mini-Flowchart");
     h.state_mut().ui.mini_flowchart = None;
+    // Let the closed popup leave egui's focus order (and the AccessKit tree) before traversal.
+    h.run_steps(2);
     // Shift+Tab walks keyboard focus (backwards) through the controls.
     for _ in 0..400 {
         key(&mut h, Key::Tab, Modifiers::SHIFT);
@@ -268,11 +270,22 @@ fn control_root_divider_drag_after_toolbar_and_dock_tab_keyboard_activation() {
     assert_eq!(d.h.state().ui.focused, PanelKind::Timeline);
     assert!(d.h.state().ui.mini_flowchart.is_none());
     d.ok("ui.click", json!({"id":"tools.Selection"}), true);
-    for _ in 0..5 {
-        d.ok("ui.key", json!({"key":"Tab"}), true);
-        assert!(d.h.state().ui.mini_flowchart.is_none(), "Tab entering or traversing widgets must not also invoke the Timeline mini-flowchart shortcut");
+    // Plain Tab is the Composition Mini-Flowchart (as in After Effects, since 2406e747); Shift+Tab
+    // walks keyboard focus.
+    d.ok("ui.key", json!({"key":"Tab"}), true);
+    assert!(d.h.state().ui.mini_flowchart.is_some(), "plain Tab opens the Composition Mini-Flowchart");
+    assert_eq!(d.h.ctx.memory(|memory| memory.focused()), None, "plain Tab must not start keyboard traversal");
+    d.h.state_mut().ui.mini_flowchart = None;
+    d.frames(2, true);
+    let hand = Id::new(("tool-slot", 1usize));
+    for _ in 0..400 {
+        d.ok("ui.key", json!({"key":"Tab","shift":true}), true);
+        assert!(d.h.state().ui.mini_flowchart.is_none(), "Shift+Tab traversing widgets must not also invoke the Timeline mini-flowchart shortcut");
+        if d.h.ctx.memory(|memory| memory.focused()) == Some(hand) {
+            break;
+        }
     }
-    d.ok("ui.key", json!({"key":"Tab","shift":true}), true);
+    assert_eq!(d.h.ctx.memory(|memory| memory.focused()), Some(hand));
     d.ok("ui.key", json!({"key":"Space"}), true);
     assert_eq!(d.h.state().ui.tool, Tool::Hand);
     d.ok("ui.key", json!({"key":"Tab","shift":true}), true);
@@ -283,15 +296,15 @@ fn control_root_divider_drag_after_toolbar_and_dock_tab_keyboard_activation() {
     // The toolbar can grow as upstream adds controls. Traverse to the actual response
     // identity rather than assuming a fixed number of focus stops.
     let target = Id::new(("tab", "aaa".to_string(), 1usize));
-    for tabs in 1..=100 {
-        d.ok("ui.key", json!({"key":"Tab"}), true);
+    for tabs in 1..=400 {
+        d.ok("ui.key", json!({"key":"Tab","shift":true}), true);
         assert!(d.h.state().ui.mini_flowchart.is_none(), "dock-tab traversal must not open a foreground popup");
         if d.h.ctx.memory(|memory| memory.focused()) == Some(target) {
-            println!("control Tab presses to Effect Controls: {tabs}");
+            println!("control Shift+Tab presses to Effect Controls: {tabs}");
             break;
         }
     }
-    assert_eq!(d.h.ctx.memory(|memory| memory.focused()), Some(target), "Effect Controls must remain reachable by control-channel Tab traversal");
+    assert_eq!(d.h.ctx.memory(|memory| memory.focused()), Some(target), "Effect Controls must remain reachable by control-channel Shift+Tab traversal");
     d.ok("ui.key", json!({"key":"Space"}), true);
     assert_eq!(d.h.state().ui.focused, PanelKind::EffectControls);
     d.ok("ui.key", json!({"key":"Tab","shift":true}), true);
@@ -306,7 +319,7 @@ fn control_root_divider_drag_after_toolbar_and_dock_tab_keyboard_activation() {
     assert!(Arc::ptr_eq(&d.h.state().session.project, &project));
     assert!(!d.h.state().playback.playing);
     for _ in 0..160 {
-        d.ok("ui.key", json!({"key":"Tab"}), true);
+        d.ok("ui.key", json!({"key":"Tab","shift":true}), true);
         assert!(d.h.state().ui.mini_flowchart.is_none(), "wrapping widget traversal must not dispatch the application Tab binding");
     }
 }
