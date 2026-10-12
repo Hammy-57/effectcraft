@@ -787,7 +787,9 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     ctx.data_mut(|d| d.insert_temp(egui::Id::new("viewer-fit"), fit));
     let zoom = app.ui.viewer.zoom.unwrap_or(fit);
     let center = area.center() + vec2(app.ui.viewer.pan[0], app.ui.viewer.pan[1]);
-    let origin = center - vec2(cw * zoom / 2.0, ch * zoom / 2.0);
+    // On the physical pixel grid: at 100 % each frame pixel lands on one screen pixel instead of
+    // straddling two and blurring (#882).
+    let origin = snap_to_pixels(center - vec2(cw * zoom / 2.0, ch * zoom / 2.0), ctx.pixels_per_point());
     let map = ViewerMap { origin, zoom, comp: [cw, ch], area };
     ctx.data_mut(|d| d.insert_temp(map_id(), map));
     let comp_rect = Rect::from_min_size(origin, vec2(cw * zoom, ch * zoom));
@@ -2434,21 +2436,32 @@ pub(crate) fn styled_line(painter: &egui::Painter, pts: [Pos2; 2], stroke: Strok
     }
 }
 
-/// Texture filtering for Viewer Zoom Quality: More Accurate = bilinear, Faster = nearest.
+/// `p` on the physical pixel grid of a display with `ppp` pixels per point.
+pub(crate) fn snap_to_pixels(p: Pos2, ppp: f32) -> Pos2 {
+    if !(ppp.is_finite() && ppp > 0.0) {
+        return p;
+    }
+    pos2((p.x * ppp).round() / ppp, (p.y * ppp).round() / ppp)
+}
+
+/// Texture filtering for Viewer Zoom Quality: More Accurate = bilinear when the frame is shown
+/// smaller than its pixels, Faster = nearest. Magnified (100 % and above, or a lower resolution)
+/// both show whole pixels, as After Effects does: bilinear blurred them (#882).
 pub(crate) fn zoom_texture_options(smooth: bool) -> egui::TextureOptions {
-    if smooth { egui::TextureOptions::LINEAR } else { egui::TextureOptions::NEAREST }
+    if smooth { egui::TextureOptions { magnification: egui::TextureFilter::Nearest, ..egui::TextureOptions::LINEAR } } else { egui::TextureOptions::NEAREST }
 }
 
 /// The sampler GPU frames (mipmapped display textures) are drawn with: More Accurate filters
 /// bilinearly within and between mip levels, so a frame shown below 100 % is averaged instead of
-/// skipping pixels (#417); Faster takes the nearest pixel of the full-size frame.
+/// skipping pixels (#417); Faster takes the nearest pixel of the full-size frame. Magnified, both
+/// take the nearest pixel (#882).
 pub(crate) fn zoom_sampler(smooth: bool) -> eframe::wgpu::SamplerDescriptor<'static> {
     use eframe::wgpu::{FilterMode, MipmapFilterMode, SamplerDescriptor};
     let label = Some("viewer frame");
     if smooth {
         SamplerDescriptor {
             label,
-            mag_filter: FilterMode::Linear,
+            mag_filter: FilterMode::Nearest,
             min_filter: FilterMode::Linear,
             mipmap_filter: MipmapFilterMode::Linear,
             ..Default::default()
