@@ -78,6 +78,7 @@ const READ_ONLY: &[&str] = &[
     "get_comp",
     "get_layer",
     "get_property",
+    "get_field",
     "list_effects",
     "list_fonts",
     "get_state",
@@ -250,6 +251,9 @@ fn offset_s() -> Value {
 fn limit_s(what: &str, default: usize) -> Value {
     json!({"type": "integer", "minimum": 1, "description": format!("Paging: at most this many {what} (default {default}). A cut list says so in `truncated` and `next_offset`.")})
 }
+fn max_chars_s() -> Value {
+    json!({"type": "integer", "minimum": 1024, "description": "Maximum serialized reply size (default 7000). Large fields return an explicit get_field pointer; fetch their exact JSON in chunks before editing."})
+}
 fn full_s(what: &str) -> Value {
     json!({"type": "boolean", "description": format!("true: {what} with every field (the long form) instead of the compact default.")})
 }
@@ -413,7 +417,13 @@ fn add_effect_error(e: Error, keys: &[&String]) -> Error {
 /// The `warnings` of a command result (prop.set / prop.addKey report clamped or coerced values).
 fn warnings_of(v: &Value) -> Vec<Value> {
     match v {
-        Value::Object(o) => o.get("warnings").and_then(Value::as_array).cloned().unwrap_or_default(),
+        Value::Object(o) => {
+            let mut warnings = o.get("warnings").and_then(Value::as_array).cloned().unwrap_or_default();
+            if let Some(count) = o.get("count") {
+                warnings.extend(warnings_of(count));
+            }
+            warnings
+        }
         Value::Array(a) => a.iter().flat_map(warnings_of).collect(),
         _ => vec![],
     }
@@ -457,13 +467,20 @@ fn get_comp(b: &mut Backend, a: &Value) -> Result<Reply> {
 fn flatten(node: &Value, out: &mut Vec<Value>) {
     // A group cut off by `depth` stays visible (instead of vanishing from the flat list).
     if node.get("truncated").and_then(Value::as_bool) == Some(true) {
-        out.push(json!({"path": node["path"], "type": "group", "name": node["name"], "truncated": true}));
+        out.push(json!({"path": node["path"], "uid": node["uid"], "type": "group", "name": node["name"], "enabled": node["enabled"], "effectiveEnabled": node["effectiveEnabled"], "truncated": true}));
         return;
     }
     match node.get("children").and_then(Value::as_array) {
         Some(ch) => ch.iter().for_each(|c| flatten(c, out)),
         None => {
             let mut o = json!({"path": node["path"], "type": node["type"], "value": node["value"]});
+            for key in
+                ["uid", "enabled", "effectiveEnabled", "rawValue", "evaluatedValue", "expressionEnabled", "expressionEffectiveEnabled", "expressionError"]
+            {
+                if let Some(value) = node.get(key) {
+                    o[key] = value.clone();
+                }
+            }
             if let Some(k) = node.get("keys").and_then(Value::as_array) {
                 o["keys"] = json!(k.len());
             }
@@ -483,7 +500,7 @@ fn get_layer(b: &mut Backend, a: &Value) -> Result<Reply> {
         flatten(&r["properties"], &mut props);
         crate::compact::flat_reply(&mut r, props, a)?;
     } else {
-        crate::compact::tree_hint(&mut r);
+        r = crate::compact::bounded_reply(r, a)?;
     }
     json_reply(r)
 }
@@ -491,6 +508,49 @@ fn get_layer(b: &mut Backend, a: &Value) -> Result<Reply> {
 fn get_property(b: &mut Backend, a: &Value) -> Result<Reply> {
     let p = obj(&[("layer", Some(need(a, "layer")?)), ("path", Some(need(a, "path")?)), ("comp", get(a, "comp")), ("time", get(a, "time"))]);
     json_reply(crate::compact::property_reply(b.exec("prop.get", p)?, a)?)
+}
+
+/// Fetch the exact JSON of one omitted field. Never execute a mutation to recover its output.
+fn get_field(b: &mut Backend, a: &Value) -> Result<Reply> {
+    let source = need(a, "source")?.as_str().ok_or_else(|| Error::BadArgs("`source` must name an inspection tool".into()))?;
+    if matches!(source, "get_comp" | "get_layer" | "get_property") && get(a, "comp").is_none() {
+        return Err(Error::BadArgs("get_field requires the original reply's explicit `comp` id".into()));
+    }
+    if matches!(source, "get_layer" | "get_property") && get(a, "time").is_none() {
+        return Err(Error::BadArgs("get_field requires the original reply's explicit comp `time` to keep chunks stable".into()));
+    }
+    let mut raw = match source {
+        "get_comp" => b.exec("comp.info", obj(&[("comp", get(a, "comp"))]))?,
+        "get_property" => b.exec(
+            "prop.get",
+            obj(&[("comp", get(a, "comp")), ("layer", Some(need(a, "layer")?)), ("path", Some(need(a, "path")?)), ("time", get(a, "time"))]),
+        )?,
+        "get_layer" => {
+            let mut r = b.exec(
+                "layer.tree",
+                obj(&[("comp", get(a, "comp")), ("layer", Some(need(a, "layer")?)), ("time", get(a, "time")), ("depth", get(a, "depth"))]),
+            )?;
+            if get(a, "flat").and_then(Value::as_bool) == Some(true) {
+                let mut props = vec![];
+                flatten(&r["properties"], &mut props);
+                r["properties"] = json!(props);
+            }
+            r
+        }
+        "get_project" => b.exec("project.summary", json!({}))?,
+        "doc_inspect" => {
+            let project = b.exec("project.summary", json!({}))?;
+            let comp = if project["activeComp"].is_null() { Value::Null } else { b.exec("comp.info", json!({"comp": project["activeComp"]}))? };
+            json!({"revision": project["revision"], "project": project, "activeComp": comp})
+        }
+        _ => return Err(Error::BadArgs("`source` must be get_comp, get_layer, get_property, get_project or doc_inspect".into())),
+    };
+    // The field helper adds read identity to its bounded chunk response.
+    if raw.get("revision").is_none() {
+        raw["revision"] = b.exec("editor.state", json!({}))?["revision"].clone();
+    }
+    let pointer = need(a, "pointer")?.as_str().ok_or_else(|| Error::BadArgs("`pointer` must be a JSON pointer string".into()))?;
+    json_reply(crate::compact::field_chunk(&raw, pointer, a)?)
 }
 
 fn set_property(b: &mut Backend, a: &Value) -> Result<Reply> {
@@ -501,16 +561,18 @@ fn set_property(b: &mut Backend, a: &Value) -> Result<Reply> {
     }
     let base = [("layer", Some(layer)), ("path", Some(path)), ("comp", comp)];
     let mut warnings = vec![];
+    let mut written_time = None;
     if let Some(v) = value {
         let mut p = obj(&base);
         p["value"] = v.clone();
         let r = match time {
             Some(t) => {
                 p["time"] = t.clone();
-                if let Some(tb) = get(a, "timeBase") {
-                    p["timeBase"] = tb.clone();
-                }
-                b.exec("prop.addKey", p)?
+                // Ask the engine for the actual snapped times; do not recompute them here.
+                p["timeBase"] = get(a, "timeBase").cloned().unwrap_or(json!("layer"));
+                let applied = b.exec("prop.addKey", p)?;
+                written_time = Some(applied.clone());
+                applied
             }
             None => b.exec("prop.set", p)?,
         };
@@ -521,7 +583,17 @@ fn set_property(b: &mut Backend, a: &Value) -> Result<Reply> {
         p["expression"] = e.clone();
         b.exec("prop.setExpression", p)?;
     }
-    let mut r = b.exec("prop.get", obj(&[("layer", Some(layer)), ("path", Some(path)), ("comp", comp), ("time", time)]))?;
+    let read_time = written_time.as_ref().and_then(|v| v.get("compTime")).or(time);
+    let mut r = b.exec("prop.get", obj(&[("layer", Some(layer)), ("path", Some(path)), ("comp", comp), ("time", read_time)]))?;
+    if let Some(timing) = written_time {
+        r["requestedTime"] = time.cloned().unwrap_or(Value::Null);
+        r["layerTime"] = timing["layerTime"].clone();
+        r["compTime"] = timing["compTime"].clone();
+        r["appliedValue"] = r["value"].clone();
+        if let Some(w) = timing.get("warning") {
+            warnings.push(w.clone());
+        }
+    }
     if !warnings.is_empty() {
         r["warnings"] = json!(warnings);
     }
@@ -941,13 +1013,16 @@ static TOOLS: &[ToolDef] = &[
         description: "A composition: id, name, size, frame rate, duration, work area, background, `layerCount` and its layers top to bottom as compact rows {index, id, name, type, in, out} plus only what isn't the default: start (s, when ≠ 0), stretch (≠ 100), parent, trackMatte, blendMode (≠ Normal), switches (tags of the differing ones: hidden, 3d, solo, locked, shy, adjustment, motion_blur, guide, collapse, fx_off, audio_off, quality:…, sampling:…, frame_blend:…). Paged: up to `limit` layers (default 200) from `offset`; `next_offset` is null when every layer was returned, otherwise `truncated` says how to get the rest. `full: true` returns every field of every layer (label, all switches; long). Layer ids feed get_layer, get_property/set_property and commands.",
         bridge_only: false,
         schema: || {
-            schema(json!({"comp": comp_s(), "full": full_s("layers"), "offset": offset_s(), "limit": limit_s("layers", crate::compact::COMP_LIMIT)}), &[])
+            schema(
+                json!({"comp": comp_s(), "full": full_s("layers"), "max_chars": max_chars_s(), "offset": offset_s(), "limit": limit_s("layers", crate::compact::COMP_LIMIT)}),
+                &[],
+            )
         },
         run: get_comp,
     },
     ToolDef {
         name: "get_layer",
-        description: "A layer's property tree (transform, masks, effects, text, shape contents, ...): leaf properties have a `path` usable with get_property/set_property/add_keyframe, plus uid, match id, name, type, value at `time`, keyframes and expression. Groups contain children; inspect them here, then select a leaf path. `flat: true` returns just a list of {path, type, value, keys (count), expression} (compact), paged: up to `limit` (default 150) from `offset`, with `total`, `returned` and `next_offset` (null when done; `truncated` when cut). A big tree carries a `hint` to use flat paging, `depth` or get_property instead.",
+        description: "A layer's property tree at the target comp time, with comp/revision/timeBase. value/rawValue are pre-expression; evaluatedValue is the expression result (expressionError reports fallback), and effectiveEnabled includes ancestor switches. Leaf properties have a `path` usable with get_property/set_property/add_keyframe, plus uid, match id, name, type, value at `time`, keyframes and expression. Groups contain children; inspect them here, then select a leaf path. `flat: true` returns just a list of {path, type, value, keys (count), expression} (compact), paged: up to `limit` (default 150) from `offset`, with `total`, `returned` and `next_offset` (null when done; `truncated` when cut). Replies fit `max_chars` (default 7000); oversized fields are explicit non-editable placeholders with a get_field pointer.",
         bridge_only: false,
         schema: || {
             schema(
@@ -956,7 +1031,7 @@ static TOOLS: &[ToolDef] = &[
                     "time": {"type": "number", "description": "Comp time in seconds for values (default: current time)."},
                     "depth": {"type": "integer", "description": "Group depth to expand (default all)."},
                     "flat": {"type": "boolean", "description": "Return a flat list of properties instead of the tree."},
-                    "offset": offset_s(), "limit": limit_s("properties (flat: true)", crate::compact::FLAT_LIMIT)
+                    "full": full_s("properties"), "max_chars": max_chars_s(), "offset": offset_s(), "limit": limit_s("properties (flat: true)", crate::compact::FLAT_LIMIT)
                 }),
                 &["layer"],
             )
@@ -965,19 +1040,36 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "get_property",
-        description: "Read one property: type, value at `time` (comp seconds; default the current time), whether it is animated, its expression and its keyframes, compact: {time (layer s), value (rounded to 4 decimals), compTime (only when it differs), in/out (only when not Linear)}. Keyframes are paged: `keyCount` total, up to `limit` (default 100) from `offset`, `next_offset` null when done (`truncated` when cut). `full: true` gives every key field (layerTime, compTime, in/out always).",
+        description: "Read one property at target comp time with comp/revision/timeBase: value/rawValue are pre-expression; evaluatedValue is the expression result (expressionError reports fallback). Includes uid, effectiveEnabled, whether it is animated, its expression and its keyframes, compact: {time (layer s), value (exact), compTime (only when it differs), in/out (only when not Linear)}. Keyframes are paged: `keyCount` total, up to `limit` (default 100) from `offset`, `next_offset` null when done (`truncated` when cut). `full: true` gives every key field (layerTime, compTime, in/out always).",
         bridge_only: false,
         schema: || {
             schema(
-                json!({"layer": layer_s(), "path": path_s(), "comp": comp_s(), "time": {"type": "number", "description": "Comp time in seconds."}, "full": full_s("keyframes"), "offset": offset_s(), "limit": limit_s("keyframes", crate::compact::KEY_LIMIT)}),
+                json!({"layer": layer_s(), "path": path_s(), "comp": comp_s(), "time": {"type": "number", "description": "Comp time in seconds."}, "full": full_s("keyframes"), "max_chars": max_chars_s(), "offset": offset_s(), "limit": limit_s("keyframes", crate::compact::KEY_LIMIT)}),
                 &["layer", "path"],
             )
         },
         run: get_property,
     },
     ToolDef {
+        name: "get_field",
+        description: "Recover an oversized inspection field exactly. Repeat the original read arguments and pin comp/time to the original reply, set source to its tool name, copy the placeholder pointer, and page offset/limit through JSON text. Concatenate text chunks then parse JSON; placeholders are never editable values. offset/next_offset count UTF-8 bytes.",
+        bridge_only: false,
+        schema: || {
+            schema(
+                json!({
+                    "source": {"type": "string", "enum": ["get_comp", "get_layer", "get_property", "get_project", "doc_inspect"]},
+                    "comp": comp_s(), "layer": layer_s(), "path": path_s(), "time": {"type": "number"}, "flat": {"type": "boolean"}, "depth": {"type": "integer"},
+                    "pointer": {"type": "string", "description": "JSON pointer from the omitted field."},
+                    "offset": offset_s(), "limit": limit_s("JSON bytes", 4096), "max_chars": max_chars_s()
+                }),
+                &["source", "pointer"],
+            )
+        },
+        run: get_field,
+    },
+    ToolDef {
         name: "set_property",
-        description: "Set a property. Without `time`: sets the static value (or a key at the current time if already animated). With `time`: adds/replaces a keyframe there, turning the stopwatch on. `expression` sets an After Effects-style JS expression (\"\" removes it). Returns the property as get_property does, plus `warnings` when the value was clamped to its valid range or reshaped (a number filling a vector, missing components set to 0). Popup properties take an option index (0-based) or name. Examples: {\"layer\":3,\"path\":\"transform/opacity\",\"value\":50}; {\"layer\":\"Title\",\"path\":\"transform/position\",\"value\":[200,540],\"time\":0}; {\"layer\":3,\"path\":\"transform/rotation\",\"expression\":\"time*90\"}.",
+        description: "Set a property. Without `time`: sets the static value (or a key at the current time if already animated). With `time`: adds/replaces a keyframe there, turning the stopwatch on. `expression` sets an After Effects-style JS expression (\"\" removes it). Timed writes confirm requestedTime, actual snapped layerTime/compTime and appliedValue, read at that compTime. Returns the property as get_property does, plus `warnings` when the value was clamped to its valid range or reshaped (a number filling a vector, missing components set to 0). Popup properties take an option index (0-based) or name. Examples: {\"layer\":3,\"path\":\"transform/opacity\",\"value\":50}; {\"layer\":\"Title\",\"path\":\"transform/position\",\"value\":[200,540],\"time\":0}; {\"layer\":3,\"path\":\"transform/rotation\",\"expression\":\"time*90\"}.",
         bridge_only: false,
         schema: || {
             schema(
@@ -1436,18 +1528,65 @@ static TOOLS: &[ToolDef] = &[
         name: "doc_inspect",
         description: "Inspect the project overview and active composition (null when no composition is active), its layers as compact, paged rows like get_comp (`full`, `offset`, `limit` work the same).",
         bridge_only: false,
-        schema: || schema(json!({"full": full_s("active comp layers"), "offset": offset_s(), "limit": limit_s("layers", crate::compact::COMP_LIMIT)}), &[]),
+        schema: || {
+            schema(
+                json!({"full": full_s("active comp layers"), "max_chars": max_chars_s(), "offset": offset_s(), "limit": limit_s("layers", crate::compact::COMP_LIMIT)}),
+                &[],
+            )
+        },
         run: doc_inspect,
     },
 ];
 
 fn doc_inspect(b: &mut Backend, a: &Value) -> Result<Reply> {
-    let project = b.exec("project.summary", json!({}))?;
-    let comp = match b.exec("comp.info", json!({})) {
-        Ok(info) => Some(crate::compact::comp_reply(info, a)?),
-        Err(_) => None,
-    };
-    json_reply(json!({"project": project, "activeComp": comp}))
+    let mut project = b.exec("project.summary", json!({}))?;
+    let revision = project["revision"].clone();
+    let comp_id = project["activeComp"].clone();
+    let unbounded = get(a, "full").and_then(Value::as_bool) == Some(true) && !crate::compact::Page::requested(a);
+    let mut comp_args = a.clone();
+    let budget = crate::compact::budget(a)?;
+    if !unbounded {
+        if budget < 3072 {
+            return Err(Error::BadArgs("doc_inspect needs max_chars >= 3072; use get_comp/get_project for smaller replies".into()));
+        }
+        let project_budget = budget / 3;
+        project = crate::compact::bounded_reply(project, &json!({"max_chars": project_budget}))?;
+        prefix_field_pointers(&mut project, "/project", 0);
+        comp_args["max_chars"] = json!(budget.saturating_sub(project_budget).saturating_sub(512));
+    }
+    let mut comp = if comp_id.is_null() { Value::Null } else { crate::compact::comp_reply(b.exec("comp.info", json!({"comp": comp_id}))?, &comp_args)? };
+    prefix_field_pointers(&mut comp, "/activeComp", 0);
+    let out = json!({"revision": revision, "project": project, "activeComp": comp});
+    // Never replace a selected page after recording its returned/next_offset metadata.
+    if !unbounded && out.to_string().len() > budget {
+        return Err(Error::BadArgs("doc_inspect metadata exceeds max_chars; increase it or inspect get_project/get_comp separately".into()));
+    }
+    json_reply(out)
+}
+
+fn prefix_field_pointers(value: &mut Value, prefix: &str, depth: usize) {
+    if depth >= 64 {
+        return;
+    }
+    match value {
+        Value::Object(o) => {
+            if o.get("$omitted").and_then(Value::as_bool) == Some(true) {
+                if let Some(pointer) = o.get("pointer").and_then(Value::as_str) {
+                    o.insert("pointer".into(), json!(format!("{prefix}{pointer}")));
+                }
+            } else {
+                for child in o.values_mut() {
+                    prefix_field_pointers(child, prefix, depth + 1);
+                }
+            }
+        }
+        Value::Array(a) => {
+            for child in a {
+                prefix_field_pointers(child, prefix, depth + 1);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn command_batch(b: &mut Backend, a: &Value) -> Result<Reply> {

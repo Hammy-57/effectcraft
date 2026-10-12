@@ -1,6 +1,6 @@
 //! Read-only queries for agents (not journaled).
 
-use effectcraft_project::{GroupKind, ItemKind, Layer, Node, PropGroup};
+use effectcraft_project::{GroupKind, ItemKind, Layer, Node, PropGroup, Property, Uid};
 use serde_json::{Value, json};
 
 use super::{CommandSpec, b_p, comp_id, layer_p, str_p};
@@ -93,7 +93,8 @@ fn comp_info(s: &mut Session, p: &Value) -> Result<Value> {
     let c = s.project.comp(cid).ok_or(EngineError::NoComp)?;
     let name = s.project.item(cid).map(|i| i.name.clone()).unwrap_or_default();
     Ok(json!({
-        "id": cid.0, "name": name, "width": c.width, "height": c.height, "frameRate": c.frame_rate.as_f64(), "duration": c.duration.seconds(),
+        "id": cid.0, "comp": cid.0, "revision": s.revision, "time": s.time_of(cid).seconds(), "timeBase": "comp",
+        "name": name, "width": c.width, "height": c.height, "frameRate": c.frame_rate.as_f64(), "duration": c.duration.seconds(),
         "workArea": [c.work_area.0.seconds(), c.work_area.1.seconds()], "background": c.background,
         "preserveFrameRate": c.preserve_frame_rate, "preserveResolution": c.preserve_resolution,
         "resolution": c.resolution.label(), "resolutionFactor": c.resolution.factor(),
@@ -114,52 +115,104 @@ pub(crate) fn segment(g: &PropGroup, i: usize) -> String {
     if n == 1 { m.to_string() } else { format!("{m}#{n}") }
 }
 
-fn group_json(g: &PropGroup, path: &str, l: &Layer, t: effectcraft_time::Tick, depth: usize, max_depth: usize) -> Value {
-    let children: Vec<Value> = if depth >= max_depth {
-        vec![]
-    } else {
-        g.children
-            .iter()
-            .enumerate()
-            .map(|(i, c)| {
-                let seg = segment(g, i);
-                let cpath = if path.is_empty() { seg } else { format!("{path}/{seg}") };
-                match c {
-                    Node::Prop(p) => {
-                        let mut o = json!({"path": cpath, "uid": p.uid, "match": p.match_id, "name": p.name, "type": p.value.kind_name(), "value": p.value_at(l.layer_time(t)).to_json()});
-                        if !p.keys.is_empty() {
-                            o["keys"] = json!(
-                                p.keys
-                                    .iter()
-                                    .map(|k| json!({"time": k.time.seconds(), "value": k.value.to_json(), "in": k.in_interp.label(), "out": k.out_interp.label()}))
-                                    .collect::<Vec<_>>()
-                            );
-                        }
-                        if let Some(e) = &p.expr {
-                            o["expression"] = json!(e.text);
-                        }
-                        o
+const MAX_TREE_DEPTH: usize = 64;
+
+/// Local group switches accumulate down to leaves; a property has no switch of its own.
+pub(crate) fn property_effective_enabled(root: &PropGroup, uid: Uid) -> Option<bool> {
+    fn find(g: &PropGroup, uid: Uid, parent_enabled: bool, depth: usize) -> Option<bool> {
+        let enabled = parent_enabled && g.enabled;
+        for child in &g.children {
+            match child {
+                Node::Prop(p) if p.uid == uid => return Some(enabled),
+                Node::Group(child) if depth < MAX_TREE_DEPTH => {
+                    if let Some(found) = find(child, uid, enabled, depth + 1) {
+                        return Some(found);
                     }
-                    Node::Group(g) => group_json(g, &cpath, l, t, depth + 1, max_depth),
                 }
-            })
-            .collect()
+                _ => {}
+            }
+        }
+        None
+    }
+    find(root, uid, true, 0)
+}
+
+/// Shared with prop.get: keep the raw sample and report expression fallback/errors explicitly.
+pub(crate) fn expression_readback(s: &Session, ctx: &crate::render::EvalCtx<'_>, l: &Layer, pr: &Property, out: &mut Value) {
+    let raw = pr.value_at(l.layer_time(ctx.time));
+    out["rawValue"] = raw.to_json();
+    let Some(e) = &pr.expr else { return };
+    out["expression"] = json!(e.text);
+    out["expressionEnabled"] = json!(e.enabled);
+    out["expressionEffectiveEnabled"] = json!(pr.has_expression() && out.get("effectiveEnabled").and_then(Value::as_bool).unwrap_or(true));
+    let mut evaluated = raw.clone();
+    if pr.has_expression() {
+        match ctx.expr {
+            Some(host) => match host.eval(ctx, l, pr, &raw) {
+                Ok(value) => evaluated = value,
+                Err(error) => out["expressionError"] = json!(error),
+            },
+            None => out["expressionError"] = json!("expression engine unavailable"),
+        }
+    } else if !e.enabled
+        && !e.text.trim().is_empty()
+        && let Some(error) = s.expr_check.and_then(|check| check(&e.text).err())
+    {
+        out["expressionError"] = json!(error);
+    }
+    out["evaluated"] = evaluated.to_json();
+    out["evaluatedValue"] = evaluated.to_json();
+}
+
+fn group_json(s: &Session, ctx: &crate::render::EvalCtx<'_>, l: &Layer, max_depth: usize) -> Value {
+    fn group(g: &PropGroup, path: &str, depth: usize, parent_enabled: bool, sample: &impl Fn(&Property, &str, bool) -> Value, max_depth: usize) -> Value {
+        let effective_enabled = parent_enabled && g.enabled;
+        let children: Vec<Value> = if depth >= max_depth {
+            vec![]
+        } else {
+            g.children
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    let seg = segment(g, i);
+                    let cpath = if path.is_empty() { seg } else { format!("{path}/{seg}") };
+                    match c {
+                        Node::Prop(p) => sample(p, &cpath, effective_enabled),
+                        Node::Group(g) => group(g, &cpath, depth + 1, effective_enabled, sample, max_depth),
+                    }
+                })
+                .collect()
+        };
+        let mut o = json!({"path": path, "uid": g.uid, "match": g.match_id, "name": g.name, "enabled": g.enabled, "effectiveEnabled": effective_enabled, "children": children});
+        if depth >= max_depth && !g.children.is_empty() {
+            o["truncated"] = json!(true);
+        }
+        match &g.kind {
+            GroupKind::Mask { mode, inverted, .. } => {
+                o["mask"] = json!({"mode": mode.label(), "inverted": inverted});
+            }
+            GroupKind::Effect { effect } => {
+                o["effect"] = json!(effect);
+            }
+            _ => {}
+        }
+        o
+    }
+    let sample = |p: &Property, path: &str, effective_enabled: bool| {
+        let mut o = json!({"path": path, "uid": p.uid, "match": p.match_id, "name": p.name, "type": p.value.kind_name(),
+            "value": p.value_at(l.layer_time(ctx.time)).to_json(), "enabled": true, "effectiveEnabled": effective_enabled});
+        if !p.keys.is_empty() {
+            o["keys"] = json!(
+                p.keys
+                    .iter()
+                    .map(|k| json!({"time": k.time.seconds(), "value": k.value.to_json(), "in": k.in_interp.label(), "out": k.out_interp.label()}))
+                    .collect::<Vec<_>>()
+            );
+        }
+        expression_readback(s, ctx, l, p, &mut o);
+        o
     };
-    let mut o = json!({"path": path, "uid": g.uid, "match": g.match_id, "name": g.name, "enabled": g.enabled, "children": children});
-    if depth >= max_depth && !g.children.is_empty() {
-        // Not expanded at this `depth`: ask again with a larger one (or for this group's layer).
-        o["truncated"] = json!(true);
-    }
-    match &g.kind {
-        GroupKind::Mask { mode, inverted, .. } => {
-            o["mask"] = json!({"mode": mode.label(), "inverted": inverted});
-        }
-        GroupKind::Effect { effect } => {
-            o["effect"] = json!(effect);
-        }
-        _ => {}
-    }
-    o
+    group(&l.props, "", 0, true, &sample, max_depth)
 }
 
 fn layer_tree(s: &mut Session, p: &Value) -> Result<Value> {
@@ -167,11 +220,16 @@ fn layer_tree(s: &mut Session, p: &Value) -> Result<Value> {
     let c = s.project.comp(cid).ok_or(EngineError::NoComp)?;
     let idx = c.index_of(lid).unwrap_or(0);
     let l = c.layer(lid).ok_or(EngineError::NoComp)?;
-    let depth = p.get("depth").and_then(Value::as_u64).unwrap_or(16) as usize;
-    let t = p.get("time").and_then(Value::as_f64).map(effectcraft_time::Tick::from_seconds_f64).unwrap_or_else(|| s.time());
+    let depth = p.get("depth").and_then(Value::as_u64).unwrap_or(16).min(MAX_TREE_DEPTH as u64) as usize;
+    let t = p.get("time").and_then(Value::as_f64).map(effectcraft_time::Tick::from_seconds_f64).unwrap_or_else(|| s.time_of(cid));
+    let mut ctx = crate::render::EvalCtx::new(&s.project, cid, c, t);
+    ctx.expr = s.expr.as_deref();
     let mut o = layer_json(l, idx);
+    o["comp"] = json!(cid.0);
+    o["revision"] = json!(s.revision);
     o["time"] = json!(t.seconds());
-    o["properties"] = group_json(&l.props, "", l, t, 0, depth);
+    o["timeBase"] = json!("comp");
+    o["properties"] = group_json(s, &ctx, l, depth);
     Ok(o)
 }
 
@@ -233,4 +291,154 @@ pub fn specs() -> Vec<CommandSpec> {
         query!("layer.tree", "Layer Property Tree", "{layer?, comp?, depth?, time? (comp s)} → nodes with `path`", layer_tree),
         query!("editor.state", "Editor State", "{}", state),
     ]
+}
+
+#[cfg(test)]
+mod inspection_tests {
+    use std::sync::Arc;
+
+    use effectcraft_keyframe::{Keyframe, Value as KValue};
+    use effectcraft_project::{Expression, ItemId, LayerId};
+    use effectcraft_time::Tick;
+
+    use super::*;
+
+    fn fixture() -> (Session, ItemId, LayerId) {
+        let mut s = Session::default();
+        let comp = s.execute("comp.new", json!({"name": "Target", "duration": 10})).unwrap()["comp"].as_u64().unwrap();
+        let layer = s.execute("layer.newSolid", json!({"name": "Subject"})).unwrap()["layer"].as_u64().unwrap();
+        (s, ItemId(comp), LayerId(layer))
+    }
+
+    fn node<'a>(tree: &'a Value, path: &str) -> &'a Value {
+        let mut stack = vec![&tree["properties"]];
+        while let Some(n) = stack.pop() {
+            if n["path"] == path {
+                return n;
+            }
+            if let Some(children) = n["children"].as_array() {
+                stack.extend(children);
+            }
+        }
+        panic!("missing inspection path {path}");
+    }
+
+    #[test]
+    fn target_comp_time_and_explicit_time_are_echoed_with_revision() {
+        let (mut s, cid, lid) = fixture();
+        let layer = Arc::make_mut(&mut s.project).comp_mut(cid).unwrap().layer_mut(lid).unwrap();
+        layer.start_time = Tick::from_seconds_f64(1.0);
+        layer.stretch = 200.0;
+        layer.props.prop_mut("transform/opacity").unwrap().keys =
+            vec![Keyframe::new(Tick::ZERO, KValue::Scalar(10.0)), Keyframe::new(Tick::from_seconds_f64(1.0), KValue::Scalar(30.0))];
+        s.state.times.insert(cid, Tick::from_seconds_f64(3.0));
+        let active = s.execute("comp.new", json!({"name": "Active", "duration": 10})).unwrap()["comp"].as_u64().unwrap();
+        s.state.times.insert(ItemId(active), Tick::from_seconds_f64(8.0));
+        let revision = s.revision;
+        let tree = s.execute("layer.tree", json!({"comp": cid.0, "layer": lid.0})).unwrap();
+        assert_eq!(tree["comp"], cid.0);
+        assert_eq!(tree["revision"], revision);
+        assert_eq!(tree["time"], 3.0);
+        assert_eq!(tree["timeBase"], "comp");
+        assert_eq!(node(&tree, "transform/opacity")["value"], 30.0);
+        assert_eq!(node(&tree, "transform/opacity")["rawValue"], 30.0);
+        let info = s.execute("comp.info", json!({"comp": cid.0})).unwrap();
+        assert_eq!(info["comp"], cid.0);
+        assert_eq!(info["time"], 3.0);
+        assert_eq!(info["revision"], revision);
+        assert_eq!(info["timeBase"], "comp");
+        let tree = s.execute("layer.tree", json!({"comp": cid.0, "layer": lid.0, "time": 1.0})).unwrap();
+        assert_eq!(tree["time"], 1.0);
+        assert_eq!(node(&tree, "transform/opacity")["value"], 10.0);
+        assert_eq!(s.revision, revision, "inspection cannot edit the project");
+    }
+
+    struct ExpressionProbe;
+
+    impl crate::render::ExprHost for ExpressionProbe {
+        fn eval(&self, ctx: &crate::render::EvalCtx<'_>, _: &Layer, pr: &Property, raw: &KValue) -> std::result::Result<KValue, String> {
+            if pr.expr.as_ref().is_some_and(|e| e.text == "error") {
+                Err("expression failed".into())
+            } else {
+                Ok(KValue::Scalar(raw.as_f64() + ctx.time.seconds()))
+            }
+        }
+    }
+
+    #[test]
+    fn expressions_keep_raw_values_and_report_enabled_disabled_and_error_samples() {
+        let (mut s, cid, lid) = fixture();
+        s.expr = Some(Arc::new(ExpressionProbe));
+        s.expr_check = Some(|text| if text == "syntax" { Err("syntax error".into()) } else { Ok(()) });
+        s.state.times.insert(cid, Tick::from_seconds_f64(2.0));
+        let uid = s.project.comp(cid).unwrap().layer(lid).unwrap().props.prop("transform/opacity").unwrap().uid;
+        for (text, enabled, expected, error) in [
+            ("time", true, 12.0, None),
+            ("time", false, 10.0, None),
+            ("error", true, 10.0, Some("expression failed")),
+            ("syntax", false, 10.0, Some("syntax error")),
+            ("", true, 10.0, None),
+        ] {
+            let pr = Arc::make_mut(&mut s.project).comp_mut(cid).unwrap().layer_mut(lid).unwrap().props.find_mut(uid).unwrap();
+            pr.value = KValue::Scalar(10.0);
+            pr.expr = Some(Expression { text: text.into(), enabled });
+            let tree = s.execute("layer.tree", json!({"comp": cid.0, "layer": lid.0})).unwrap();
+            let sample = node(&tree, "transform/opacity");
+            assert_eq!(sample["uid"], uid);
+            assert_eq!(sample["value"], 10.0);
+            assert_eq!(sample["rawValue"], 10.0);
+            assert_eq!(sample["evaluated"], expected);
+            assert_eq!(sample["evaluatedValue"], expected);
+            assert_eq!(sample["expression"], text);
+            assert_eq!(sample["expressionEnabled"], enabled);
+            assert_eq!(sample["expressionEffectiveEnabled"], enabled && !text.is_empty());
+            assert_eq!(sample.get("expressionError").and_then(Value::as_str), error);
+            let read = s.execute("prop.get", json!({"comp": cid.0, "layer": lid.0, "prop": uid})).unwrap();
+            assert_eq!(sample["value"], read["value"]);
+            // The legacy property read already reports evaluated samples for nonempty expressions.
+            if !text.is_empty() {
+                assert_eq!(sample["evaluated"], read["evaluated"]);
+            }
+        }
+        s.expr = None;
+        Arc::make_mut(&mut s.project).comp_mut(cid).unwrap().layer_mut(lid).unwrap().props.find_mut(uid).unwrap().expr =
+            Some(Expression { text: "time".into(), enabled: true });
+        let tree = s.execute("layer.tree", json!({"comp": cid.0, "layer": lid.0})).unwrap();
+        let sample = node(&tree, "transform/opacity");
+        assert_eq!(sample["evaluatedValue"], 10.0);
+        assert_eq!(sample["expressionError"], "expression engine unavailable");
+    }
+
+    #[test]
+    fn disabled_effect_parents_preserve_local_switches_uids_and_expression_state() {
+        let (mut s, cid, lid) = fixture();
+        s.expr = Some(Arc::new(ExpressionProbe));
+        let mut pr = Property::new(90_003, "amount", "Amount", KValue::Scalar(4.0));
+        pr.expr = Some(Expression { text: "time".into(), enabled: true });
+        let mut effect = PropGroup::new(90_002, "sample.effect", "Sample Effect").with(pr);
+        effect.kind = GroupKind::Effect { effect: "sample.effect".into() };
+        let mut disabled = PropGroup::new(90_001, "disabled", "Disabled parent").with(effect);
+        disabled.enabled = false;
+        disabled.kind = GroupKind::Effect { effect: "sample.parent".into() };
+        Arc::make_mut(&mut s.project).comp_mut(cid).unwrap().layer_mut(lid).unwrap().props.children.push(Node::Group(disabled));
+        let tree = s.execute("layer.tree", json!({"comp": cid.0, "layer": lid.0})).unwrap();
+        let parent = node(&tree, "disabled");
+        assert_eq!(parent["uid"], 90_001);
+        assert_eq!(parent["enabled"], false);
+        assert_eq!(parent["effectiveEnabled"], false);
+        let effect = node(&tree, "disabled/#1");
+        assert_eq!(effect["uid"], 90_002);
+        assert_eq!(effect["enabled"], true);
+        assert_eq!(effect["effectiveEnabled"], false);
+        let sample = node(&tree, "disabled/#1/amount");
+        assert_eq!(sample["uid"], 90_003);
+        assert_eq!(sample["enabled"], true);
+        assert_eq!(sample["effectiveEnabled"], false);
+        assert_eq!(sample["expressionEnabled"], true);
+        assert_eq!(sample["expressionEffectiveEnabled"], false);
+        assert_eq!(sample["evaluatedValue"], 4.0);
+        let props = &s.project.comp(cid).unwrap().layer(lid).unwrap().props;
+        assert_eq!(property_effective_enabled(props, 90_003), Some(false));
+        assert_eq!(property_effective_enabled(props, u64::MAX), None);
+    }
 }

@@ -21,7 +21,7 @@ use crate::{Backend, Error, base64};
 /// Protocol revisions we speak, newest first. We answer with the client's if we know it.
 pub const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 
-const INSTRUCTIONS: &str = "EffectCraft is an After Effects-class motion graphics compositor. Everything is an engine command: command_list discovers ids and params (describe_command shows one in full), command_run {id, params} runs them (undoable; command_batch runs several in order, batch as one undo step). Typical flow: command_run comp.new -> command_run layer.newText / layer.newSolid (returns the layer id) -> set_property / add_keyframe / add_effect -> render_preview to look at the result. Inspect with doc_inspect, get_comp and get_layer (every property node carries its `path`, e.g. `transform/position`, `effects/#1/blurriness`). Times are seconds: keyframe times (add_keyframe, set_property with `time`) are layer time, render_preview and get_property use comp time. Resources and resource templates (effectcraft://document, comp/{comp}, layer/{comp}/{layer}, frame/{comp}/{time}, command/{id}) and workflow prompts are available too. With a UI (bridge mode `--bridge <port>` to a running app, or `--ui` for the app offscreen) screenshot and the ui_* tools show and operate it.";
+const INSTRUCTIONS: &str = "EffectCraft is an After Effects-class motion graphics compositor. Everything is an engine command: command_list discovers ids and params (describe_command shows one in full), command_run {id, params} runs them (undoable; command_batch runs several in order, batch as one undo step). Typical flow: command_run comp.new -> command_run layer.newText / layer.newSolid (returns the layer id) -> set_property / add_keyframe / add_effect -> render_preview to look at the result. Inspect with doc_inspect, get_comp and get_layer (every property node carries its `path`, e.g. `transform/position`, `effects/#1/blurriness`). Times are seconds: use timeBase:\"comp\" for add_keyframe and set_property with `time` so keys use the Timeline clock; the default is layer time. Writes snap to comp frames; use returned compTime/layerTime for the applied time. render_preview and get_property use comp time. Resources and resource templates (effectcraft://document, comp/{comp}, layer/{comp}/{layer}, frame/{comp}/{time}, command/{id}) and workflow prompts are available too. With a UI (bridge mode `--bridge <port>` to a running app, or `--ui` for the app offscreen) screenshot and the ui_* tools show and operate it.";
 
 // JSON-RPC error codes.
 const PARSE_ERROR: i64 = -32700;
@@ -334,7 +334,7 @@ impl McpServer {
                 let target = resources::parse(uri).map_err(uri_error)?;
                 let (tool, args) = target.tool();
                 match self.guarded(tool, &args) {
-                    Ok(Reply::Json(v)) => Ok(json!({"contents": [{"uri": uri, "mimeType": "application/json", "text": v.to_string()}]})),
+                    Ok(Reply::Json(v)) => Ok(json!({"contents": [{"uri": uri, "mimeType": "application/json", "text": json_text(&v)}]})),
                     Ok(Reply::Image { png, .. }) => Ok(json!({"contents": [{"uri": uri, "mimeType": "image/png", "blob": base64::encode(&png)}]})),
                     // A templated comp, layer or command that doesn't exist is "not found".
                     Err(Error::BadArgs(e) | Error::App(e)) if !matches!(target, Target::Document | Target::Commands) => Err((RESOURCE_NOT_FOUND, e)),
@@ -368,6 +368,78 @@ fn take_request_id(params: &Value, args: &mut Value) -> Option<String> {
     key(params.pointer("/_meta/requestId").cloned()).or(from_args)
 }
 
+/// Keep completeness and continuation information visible before large payloads. This only
+/// changes object key order (including nested comps); structured data and parsed meaning stay identical.
+pub(crate) fn json_text(value: &Value) -> String {
+    const HEADER_KEYS: &[&str] = &[
+        "ok",
+        "error",
+        "failed",
+        "truncated",
+        "offset",
+        "limit",
+        "total",
+        "returned",
+        "next_offset",
+        "max_chars",
+        "compact",
+        "complete",
+        "omitted",
+        "omitted_fields",
+        "$omitted",
+        "editable",
+        "pointer",
+        "fetch",
+        "comp",
+        "revision",
+        "time",
+        "timeBase",
+        "layer",
+        "path",
+    ];
+    fn append(value: &Value, text: &mut String, depth: usize) {
+        // Inspection trees are depth-bounded; cap this extra ordering walk too. Deeper legacy
+        // payloads keep their ordinary serde representation, without losing any fields.
+        if depth >= 64 {
+            text.push_str(&value.to_string());
+            return;
+        }
+        match value {
+            Value::Object(object) => {
+                let headers = HEADER_KEYS.iter().filter_map(|key| object.get(*key).map(|value| (*key, value)));
+                let fields =
+                    object.iter().filter(|(key, value)| !HEADER_KEYS.contains(&key.as_str()) && !value.is_array()).map(|(key, value)| (key.as_str(), value));
+                let lists =
+                    object.iter().filter(|(key, value)| !HEADER_KEYS.contains(&key.as_str()) && value.is_array()).map(|(key, value)| (key.as_str(), value));
+                text.push('{');
+                for (index, (key, value)) in headers.chain(fields).chain(lists).enumerate() {
+                    if index > 0 {
+                        text.push(',');
+                    }
+                    text.push_str(&Value::String(key.into()).to_string());
+                    text.push(':');
+                    append(value, text, depth + 1);
+                }
+                text.push('}');
+            }
+            Value::Array(values) => {
+                text.push('[');
+                for (index, value) in values.iter().enumerate() {
+                    if index > 0 {
+                        text.push(',');
+                    }
+                    append(value, text, depth + 1);
+                }
+                text.push(']');
+            }
+            _ => text.push_str(&value.to_string()),
+        }
+    }
+    let mut text = String::new();
+    append(value, &mut text, 0);
+    text
+}
+
 /// A `tools/call` result: tool failures are reported in-band (`isError`) so the model can react.
 pub fn call_result(r: Result<Reply, Error>) -> Value {
     call_result_with(r, false)
@@ -378,14 +450,16 @@ pub fn call_result(r: Result<Reply, Error>) -> Value {
 pub fn call_result_with(r: Result<Reply, Error>, structured: bool) -> Value {
     let (mut result, data) = match r {
         Ok(Reply::Json(v)) => {
-            let failed = v.get("failed").and_then(Value::as_u64).is_some_and(|n| n > 0);
-            (json!({"content": [{"type": "text", "text": v.to_string()}], "isError": failed}), Some(v))
+            let failed = v.get("ok") == Some(&Value::Bool(false))
+                || v.get("error").is_some_and(|error| !error.is_null())
+                || v.get("failed").and_then(Value::as_u64).is_some_and(|n| n > 0);
+            (json!({"content": [{"type": "text", "text": json_text(&v)}], "isError": failed}), Some(v))
         }
         Ok(Reply::Image { png, info }) => (
             json!({
                 "content": [
                     {"type": "image", "data": base64::encode(&png), "mimeType": "image/png"},
-                    {"type": "text", "text": info.to_string()},
+                    {"type": "text", "text": json_text(&info)},
                 ],
                 "isError": false,
             }),
@@ -493,4 +567,125 @@ pub(crate) fn modern_result_fields(method: &str, params: &Value, result: &mut Va
 
 fn error(id: Value, code: i64, message: &str) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
+}
+
+#[cfg(test)]
+mod result_tests {
+    use super::*;
+
+    fn text_json(result: &Value) -> Value {
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap()
+    }
+
+    fn script_server() -> McpServer {
+        let mut session = crate::Session::default();
+        effectcraft_script::install(&mut session);
+        let mut server = McpServer::new(Backend::headless(session));
+        server.handle(&json!({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{"protocolVersion":"2025-06-18"}}));
+        server
+    }
+
+    fn call(server: &mut McpServer, name: &str, arguments: Value) -> Value {
+        server.handle(&json!({"jsonrpc":"2.0", "id":2, "method":"tools/call", "params":{"name":name, "arguments":arguments}})).unwrap()["result"].clone()
+    }
+
+    #[test]
+    fn json_failure_signals_preserve_the_entire_payload() {
+        for payload in [
+            json!({"ok":false,"error":null,"output":"before failure","partial":{"comp":7}}),
+            json!({"ok":true,"error":{"message":"failure"},"output":"details"}),
+            json!({"failed":1,"results":[{"ok":true},{"ok":false}]}),
+        ] {
+            for structured in [false, true] {
+                let result = call_result_with(Ok(Reply::Json(payload.clone())), structured);
+                assert_eq!(result["isError"], true, "{result}");
+                assert_eq!(text_json(&result), payload);
+                if structured {
+                    assert_eq!(result["structuredContent"], tools::structured(payload.clone()));
+                }
+            }
+        }
+        for payload in [json!({"ok":true,"error":null}), json!({"failed":0}), json!({"value":false})] {
+            assert_eq!(call_result(Ok(Reply::Json(payload)))["isError"], false);
+        }
+    }
+
+    #[test]
+    fn thrown_script_error_and_prior_output_reach_mcp() {
+        let mut server = script_server();
+        let result = call(&mut server, "run_script", json!({"code":"$.writeln('before throw'); throw new Error('broken recipe');"}));
+        assert_eq!(result["isError"], true, "{result}");
+        let data = text_json(&result);
+        assert_eq!(data["ok"], false);
+        assert!(data["error"]["message"].as_str().unwrap().contains("broken recipe"), "{data}");
+        assert!(data["output"].as_str().unwrap().contains("before throw"), "{data}");
+        assert_eq!(result["structuredContent"], tools::structured(data));
+    }
+
+    #[test]
+    fn stopped_script_reports_rollback_and_kept_partial_edits() {
+        let mut server = script_server();
+        for (group, name, kept) in [("app.beginUndoGroup('Build');", "RolledBack", false), ("", "KeptPartial", true)] {
+            let code = format!("{group} app.project.items.addComp('{name}', 64, 64, 1, 1, 25); $.writeln('before timeout'); while (true) {{}}");
+            let started = std::time::Instant::now();
+            let result = call(&mut server, "run_script", json!({"code":code,"timeout":0.3}));
+            assert!(started.elapsed() < std::time::Duration::from_secs(3));
+            assert_eq!(result["isError"], true, "{result}");
+            let data = text_json(&result);
+            assert_eq!(data["ok"], false);
+            assert!(data["error"]["message"].as_str().unwrap().contains("time limit"), "{data}");
+            let output = data["output"].as_str().unwrap();
+            assert!(output.contains("before timeout"), "{data}");
+            assert!(output.contains(if kept { "kept" } else { "rolled back" }), "{data}");
+            assert_eq!(result["structuredContent"], tools::structured(data));
+            let project = call(&mut server, "get_project", json!({}));
+            assert_eq!(text_json(&project).to_string().contains(name), kept, "{project}");
+        }
+        let result = call(&mut server, "run_script", json!({"code":"1 + 1"}));
+        assert_eq!(result["isError"], false);
+        assert_eq!(text_json(&result)["result"], 2);
+    }
+
+    #[test]
+    fn model_text_has_paging_headers_before_long_lists_without_changing_json() {
+        let value = json!({"commands":["x".repeat(8000)], "next_offset":1, "truncated":true, "total":2, "offset":0,
+            "returned":1, "max_chars":7000, "revision":17, "timeBase":"comp", "name":"quoted \" and 🧪", "a\"key":true});
+        let text = json_text(&value);
+        let list = text.find("\"commands\":").unwrap();
+        for key in ["next_offset", "truncated", "total", "offset", "returned", "max_chars", "revision", "timeBase"] {
+            assert!(text.find(&format!("\"{key}\":")).unwrap() < list, "{key}");
+        }
+        assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), value);
+        assert_eq!(text.len(), value.to_string().len());
+        assert_eq!(text_json(&call_result(Ok(Reply::Json(value.clone())))), value);
+        let image = call_result(Ok(Reply::Image { png: vec![], info: value.clone() }));
+        assert_eq!(serde_json::from_str::<Value>(image["content"][1]["text"].as_str().unwrap()).unwrap(), value);
+        for scalar in [json!(null), json!([1, 2]), json!("escaped\ntext"), json!({})] {
+            assert_eq!(serde_json::from_str::<Value>(&json_text(&scalar)).unwrap(), scalar);
+        }
+    }
+
+    #[test]
+    fn nested_doc_inspect_comp_headers_precede_layers() {
+        let value = json!({"revision":17, "project":{"name":"Doc"}, "activeComp":{
+            "comp":9, "revision":17, "total":110, "returned":1, "next_offset":1, "truncated":{"field":"layers"},
+            "layers":[{"name":"🧪".repeat(2000),"properties":{"keys":[1,2],"total":2,"returned":2,"next_offset":null}}]
+        }});
+        let text = json_text(&value);
+        let comp = &text[text.find("\"activeComp\":{").unwrap()..];
+        let layers = comp.find("\"layers\":[").unwrap();
+        for key in ["comp", "revision", "total", "returned", "next_offset", "truncated"] {
+            assert!(comp.find(&format!("\"{key}\":")).unwrap() < layers, "{key}");
+        }
+        let properties = &comp[comp.find("\"properties\":{").unwrap()..];
+        assert!(properties.find("\"returned\":").unwrap() < properties.find("\"keys\":[").unwrap());
+        assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), value);
+        assert_eq!(text.len(), value.to_string().len());
+        let mut deep = json!({"keys":[1,2],"total":2});
+        for _ in 0..70 {
+            deep = json!({"child":deep});
+        }
+        assert_eq!(serde_json::from_str::<Value>(&json_text(&deep)).unwrap(), deep);
+        assert_eq!(json_text(&deep).len(), deep.to_string().len());
+    }
 }
