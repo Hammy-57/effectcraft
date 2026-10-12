@@ -1,17 +1,30 @@
-title: feat(mcp): compact, paged read tools for big comps
+title: fix(mcp): make agent inspection and edit feedback exact and bounded
 branch: upstream/mcp-compact-reads
-depends: none
+depends: upstream/agents-control-robustness
 
 ## What
-The MCP read tools answer compactly and page long lists:
-- `get_comp` / `doc_inspect`: `layerCount` + compact layer rows (`index, id, name, type, in, out` plus only non-defaults: `start`, `stretch`, `parent`, `trackMatte`, `blendMode`, switch tags such as `hidden`, `3d`, `solo`, `quality:Draft`), paged with `offset`/`limit` (default 200), `returned`, `next_offset`.
-- `get_property`: compact keyframes (interpolation omitted when Linear, values rounded to 4 decimals), paged (default 100, `keyCount`).
-- `get_layer {flat: true}`: paged (default 150, `total`); a big tree carries a `hint`.
-- A cut list says so in-band: `truncated: {returned, total, next_offset, hint}`.
-- `full: true` keeps the old long shape (engine `comp.info` / `prop.get` are unchanged).
+Editing agents now receive exact, size-bounded inspection data and accurate edit/error confirmations. A timed property write reports the actual snapped comp and layer times instead of reading back at the wrong clock; script failures set MCP isError while preserving output and partial-edit details.
+
+- Reject ambiguous composition, layer, effect/group and display-name property targets before mutation, with candidate IDs and context. Numeric IDs, @uid, explicit occurrences and canonical property paths remain available.
+- Inspect the targeted composition's time consistently. Expose raw and evaluated values, expression errors, stable property UIDs and effective enabled state.
+- Preserve exact numeric values in compact rows. Bound default JSON pages to 7,000 serialized bytes, place completeness metadata before nested lists, and recover oversized fields through exact streamed get_field chunks. full:true remains an explicit unbounded compatibility route.
+- Prefer comp-time animation recipes and document stretching, reversal and frame snapping.
+- Include the owner's explicitly requested display-name credit.
 
 ## Why
-`get_comp` on a 110-layer comp was ~47–62k characters because each layer repeated its default switches, blend mode, stretch and label. Clients that cap a tool result at 8k characters saw 5 of 110 layers and took that for the whole comp. Compact: ~100 characters a layer (110 layers: 10.8k vs 47.3k).
+Large responses can be clipped before an agent sees all layers or keyframes. Separately, misleading success, target or time information causes an agent to edit the wrong object or “repair” an already-correct key. These changes make the information used for the next edit explicit and testable.
 
 ## How tested
-`cargo test -p effectcraft-automation --lib` (91 passed, 3 new: compact rows / omitted defaults / paging + next_offset / full unchanged / keyframe and flat paging) and `--test qa` (8 passed); `cargo clippy -p effectcraft-automation --all-targets -D warnings`.
+With four build jobs and a shared warm target:
+- cargo check -p effectcraft-automation -p effectcraft-engine --all-targets
+- cargo test -p effectcraft-automation --lib: 113 passed
+- cargo test -p effectcraft-automation --test qa: 8 passed
+- cargo test -p effectcraft-engine --lib commands::target_refs::tests: 10 passed
+- cargo test -p effectcraft-engine --lib commands::query::inspection_tests: 3 passed
+- cargo test -p effectcraft-engine --lib tests_key_time: 7 passed
+- cargo clippy -p effectcraft-automation -p effectcraft-engine --all-targets -- -D warnings
+- Post-integration cargo check on both touched crates.
+
+No full CI, application build, release CLI build or live-project edits were performed. This updates the existing compact-read topic; follow-up transactional/retry/session work is separate.
+
+The upstream topic also merges its queued `agents-control-robustness` prerequisite. Its port preserves upstream's manual command registry and scheduled-task behavior. The exact port passed `cargo check -p effectcraft-automation -p effectcraft-engine --all-targets` and formatting checks; the runtime test counts above were measured on the fork implementation.
