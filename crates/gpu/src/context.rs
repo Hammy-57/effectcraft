@@ -212,6 +212,30 @@ fn unified_pool_cap(system_memory: u64) -> usize {
     usize::try_from(cap).unwrap_or(POOL_BUDGET)
 }
 
+/// Profiling builds: `EFFECTCRAFT_RT_POOL_MB` overrides the working-texture pool's budget
+/// (measuring how much a larger pool saves; see [`GpuContext::set_cache_budget`]).
+fn pool_budget_override() -> Option<usize> {
+    if !cfg!(feature = "profile") {
+        return None;
+    }
+    static MB: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    MB.get_or_init(|| std::env::var("EFFECTCRAFT_RT_POOL_MB").ok()?.parse::<usize>().ok()?.checked_mul(1 << 20)).to_owned()
+}
+
+/// Where working textures missed the pool (profiling builds): (call site, width, height) →
+/// count, drained by [`take_pool_miss_sites`].
+#[cfg(feature = "profile")]
+static MISS_SITES: Mutex<std::collections::BTreeMap<(String, u32, u32), u64>> = Mutex::new(std::collections::BTreeMap::new());
+
+/// Pool misses by call site and size since the last call (profiling builds), most first.
+#[cfg(feature = "profile")]
+pub fn take_pool_miss_sites() -> Vec<(String, u32, u32, u64)> {
+    let map = std::mem::take(&mut *MISS_SITES.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+    let mut v: Vec<_> = map.into_iter().map(|((site, w, h), n)| (site, w, h, n)).collect();
+    v.sort_by_key(|e| std::cmp::Reverse(e.3));
+    v
+}
+
 /// Counts of uploads (CPU → GPU) and readbacks (GPU → CPU).
 #[derive(Default)]
 pub(crate) struct Transfers {
@@ -221,6 +245,18 @@ pub(crate) struct Transfers {
     down_bytes: std::sync::atomic::AtomicU64,
     yuv_conversions: std::sync::atomic::AtomicU64,
     yuv_bytes: std::sync::atomic::AtomicU64,
+    /// GPU allocations (textures and buffers made, not reused) and their bytes.
+    made: std::sync::atomic::AtomicU64,
+    made_bytes: std::sync::atomic::AtomicU64,
+}
+
+/// A snapshot of [`GpuContext::alloc_stats`]: GPU textures and buffers newly allocated (not
+/// reused from a pool) so far, and their bytes. A fresh allocation costs CPU time to make and,
+/// on first use, GPU time to clear and map its pages.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AllocStats {
+    pub allocations: u64,
+    pub bytes: u64,
 }
 
 /// A snapshot of [`GpuContext::transfer_stats`].
@@ -240,6 +276,12 @@ impl Transfers {
         use std::sync::atomic::Ordering::Relaxed;
         self.yuv_conversions.fetch_add(1, Relaxed);
         self.yuv_bytes.fetch_add(bytes as u64, Relaxed);
+    }
+
+    pub(crate) fn count_made(&self, bytes: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.made.fetch_add(1, Relaxed);
+        self.made_bytes.fetch_add(bytes, Relaxed);
     }
 
     pub(crate) fn count(&self, up: bool, bytes: usize) {
@@ -1208,6 +1250,7 @@ impl GpuContext {
     }
 
     fn texture(&self, w: u32, h: u32) -> wgpu::Texture {
+        self.transfers.count_made(u64::from(w.max(1)).saturating_mul(u64::from(h.max(1))).saturating_mul(16));
         self.device.create_texture(&wgpu::TextureDescriptor {
             label: None,
             size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
@@ -1222,6 +1265,7 @@ impl GpuContext {
 
     /// A pooled working texture: (image, reused). A reused texture holds old pixels; a new
     /// one is zeroed.
+    #[track_caller]
     fn pooled_for_encoder(&self, w: u32, h: u32, encoder: Option<u64>) -> (GpuImage, bool) {
         let made_for = encoder;
         #[cfg(feature = "profile")]
@@ -1233,6 +1277,12 @@ impl GpuContext {
         let (w, h) = (w.max(1), h.max(1));
         let reused = self.pool.lock().ok().and_then(|mut p| p.take_for_encoder(w, h, encoder));
         let was_reused = reused.is_some();
+        #[cfg(feature = "profile")]
+        if !was_reused {
+            let at = std::panic::Location::caller();
+            let site = format!("{}:{}", at.file().rsplit('/').next().unwrap_or(at.file()), at.line());
+            *MISS_SITES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry((site, w, h)).or_default() += 1;
+        }
         let pooled = reused.unwrap_or_else(|| Pooled::from(self.texture(w, h)));
         let (texture, view) = (pooled.texture.clone(), pooled.view.clone());
         let lease = Arc::new(Lease { pooled, pool: Arc::downgrade(&self.pool), encoder: made_for });
@@ -1254,6 +1304,12 @@ impl GpuContext {
         }
     }
 
+    /// GPU allocations so far (see [`AllocStats`]).
+    pub fn alloc_stats(&self) -> AllocStats {
+        use std::sync::atomic::Ordering::Relaxed;
+        AllocStats { allocations: self.transfers.made.load(Relaxed), bytes: self.transfers.made_bytes.load(Relaxed) }
+    }
+
     /// Texture pool counters: (working textures reused, newly allocated).
     pub fn pool_stats(&self) -> (u64, u64) {
         self.pool.lock().map(|p| (p.hits, p.misses)).unwrap_or_default()
@@ -1268,6 +1324,8 @@ impl GpuContext {
         if let Some(t) = self.planes.lock().ok().and_then(|mut p| p.get_mut(&key).and_then(Vec::pop)) {
             return t;
         }
+        let bpp = format.block_copy_size(None).unwrap_or(16);
+        self.transfers.count_made(u64::from(key.0).saturating_mul(u64::from(key.1)).saturating_mul(u64::from(bpp)));
         self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some(label),
             size: wgpu::Extent3d { width: key.0, height: key.1, depth_or_array_layers: 1 },
@@ -1550,6 +1608,7 @@ impl GpuContext {
         use std::sync::atomic::Ordering::Relaxed;
         self.layer_budget.store(layer_cache, Relaxed);
         let (upload, pool, auxiliary) = cache_budgets(layer_cache, self.integrated, self.system_memory.load(Relaxed));
+        let pool = pool_budget_override().unwrap_or(pool);
         self.auxiliary_budget.store(auxiliary, std::sync::atomic::Ordering::Relaxed);
         if let Ok(mut u) = self.uploads.lock() {
             u.budget = Some(upload);
@@ -1862,6 +1921,7 @@ impl<'g> Enc<'g> {
     }
 
     /// A new zeroed image (pooled; a reused texture is cleared by a kernel).
+    #[track_caller]
     pub fn image(&mut self, w: u32, h: u32) -> GpuImage {
         self.open_encoder();
         let owner = self.enc.as_ref().map(|(_, id)| *id);
@@ -1874,6 +1934,7 @@ impl<'g> Enc<'g> {
 
     /// A new image for a kernel that writes every pixel of it (pooled; contents undefined).
     /// Under test it starts out as NaNs, so a kernel that skips pixels fails the CPU oracle.
+    #[track_caller]
     pub fn scratch(&mut self, w: u32, h: u32) -> GpuImage {
         self.open_encoder();
         let owner = self.enc.as_ref().map(|(_, id)| *id);
@@ -2116,16 +2177,18 @@ impl<'g> Enc<'g> {
 
     /// Copy `src` into a larger zeroed image at (`x`, `y`) (Buf::pad).
     pub fn copy_into(&mut self, src: &GpuImage, dst: &GpuImage, x: u32, y: u32) {
-        let enc = self.encoder();
-        enc.copy_texture_to_texture(
-            wgpu::TexelCopyTextureInfo { texture: &src.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            wgpu::TexelCopyTextureInfo { texture: &dst.texture, mip_level: 0, origin: wgpu::Origin3d { x, y, z: 0 }, aspect: wgpu::TextureAspect::All },
-            wgpu::Extent3d { width: src.width, height: src.height, depth_or_array_layers: 1 },
-        );
+        self.timed("copy", |enc| {
+            enc.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo { texture: &src.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                wgpu::TexelCopyTextureInfo { texture: &dst.texture, mip_level: 0, origin: wgpu::Origin3d { x, y, z: 0 }, aspect: wgpu::TextureAspect::All },
+                wgpu::Extent3d { width: src.width, height: src.height, depth_or_array_layers: 1 },
+            )
+        });
     }
 
     /// Copy the `w`×`h` region of `src` at (`x`, `y`) into a new image (the caller checks
     /// that it lies inside `src`).
+    #[track_caller]
     pub fn crop(&mut self, src: &GpuImage, x: u32, y: u32, w: u32, h: u32) -> GpuImage {
         let out = self.scratch(w, h);
         self.copy_region(src, &out, x, y, w, h);
@@ -2134,12 +2197,13 @@ impl<'g> Enc<'g> {
 
     /// Copy the `w` × `h` region of `src` at (`x`, `y`) to the top-left of `out`.
     pub(crate) fn copy_region(&mut self, src: &GpuImage, out: &GpuImage, x: u32, y: u32, w: u32, h: u32) {
-        let enc = self.encoder();
-        enc.copy_texture_to_texture(
-            wgpu::TexelCopyTextureInfo { texture: &src.texture, mip_level: 0, origin: wgpu::Origin3d { x, y, z: 0 }, aspect: wgpu::TextureAspect::All },
-            wgpu::TexelCopyTextureInfo { texture: &out.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-        );
+        self.timed("copy", |enc| {
+            enc.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo { texture: &src.texture, mip_level: 0, origin: wgpu::Origin3d { x, y, z: 0 }, aspect: wgpu::TextureAspect::All },
+                wgpu::TexelCopyTextureInfo { texture: &out.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            )
+        });
     }
 
     pub(crate) fn keep_native(
@@ -2213,6 +2277,42 @@ impl<'g> Enc<'g> {
     /// Whether everything recorded so far has been submitted.
     pub(crate) fn submitted_all(&self) -> bool {
         self.enc.is_none()
+    }
+
+    /// Profiling: two timestamp query indices for commands recorded on the encoder itself
+    /// (`None` unless the device can write timestamps between encoder commands: not Apple
+    /// silicon, whose Metal counters sample only at pass boundaries).
+    #[cfg(feature = "profile")]
+    fn reserve_stamp(&mut self, name: &str) -> Option<(wgpu::QuerySet, u32)> {
+        if !self.g.device.features().contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS) {
+            return None;
+        }
+        let mut batch = self.timestamps.take().or_else(|| crate::timestamps::Batch::new(self.g));
+        let mark = batch.as_mut().and_then(|b| b.reserve(name));
+        self.timestamps = batch;
+        mark
+    }
+
+    /// Record `f` on the encoder (copies, clears), timed as `name` in profiling builds.
+    fn timed<R>(&mut self, name: &str, f: impl FnOnce(&mut wgpu::CommandEncoder) -> R) -> R {
+        #[cfg(feature = "profile")]
+        let mark = {
+            self.encoder();
+            self.reserve_stamp(name)
+        };
+        #[cfg(not(feature = "profile"))]
+        let _ = name;
+        let enc = self.encoder();
+        #[cfg(feature = "profile")]
+        if let Some((q, i)) = &mark {
+            enc.write_timestamp(q, *i);
+        }
+        let r = f(enc);
+        #[cfg(feature = "profile")]
+        if let Some((q, i)) = &mark {
+            enc.write_timestamp(q, i + 1);
+        }
+        r
     }
 
     /// Submit recorded work.
@@ -2300,6 +2400,7 @@ impl<'g> Enc<'g> {
                 buf
             })
             .unwrap_or_else(|| {
+                self.g.transfers.count_made(size);
                 self.g.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("readback"),
                     size,
@@ -2307,11 +2408,16 @@ impl<'g> Enc<'g> {
                     mapped_at_creation: false,
                 })
             });
-        self.encoder().copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo { texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            wgpu::TexelCopyBufferInfo { buffer: &buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(padded), rows_per_image: Some(h) } },
-            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-        );
+        self.timed("readback_copy", |enc| {
+            enc.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo { texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &buf,
+                    layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(padded), rows_per_image: Some(h) },
+                },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            )
+        });
         self.submit();
         self.read_staging(&buf, layout.row as usize, padded as usize, h as usize, row).map_err(|e| log::error!("gpu texture readback: {e}")).ok()?;
         // Resized layers used to retain two buffers for every size ever read back (#591).
@@ -2448,6 +2554,7 @@ impl<'g> Enc<'g> {
     pub fn display(&mut self, img: &GpuImage) -> wgpu::Texture {
         let g = self.g;
         let levels = mip_levels(img.width, img.height);
+        g.transfers.count_made(u64::from(img.width).saturating_mul(u64::from(img.height)).saturating_mul(4).saturating_mul(4) / 3);
         let tex = g.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("viewer frame"),
             size: wgpu::Extent3d { width: img.width, height: img.height, depth_or_array_layers: 1 },
@@ -2502,6 +2609,24 @@ pub(crate) fn mip_levels(w: u32, h: u32) -> u32 {
 #[cfg(test)]
 mod upload_budget_tests {
     use super::*;
+
+    #[test]
+    fn alloc_stats_count_new_textures_not_reused_ones() {
+        let Some(g) = crate::tests::gpu() else { return };
+        let ctx = &g.ctx;
+        let before = ctx.alloc_stats();
+        let mut e = Enc::new(ctx);
+        // A size no other test uses: the first is new, the second reuses it after submit.
+        drop(e.scratch(37, 23));
+        e.submit();
+        let mid = ctx.alloc_stats();
+        drop(e.scratch(37, 23));
+        e.submit();
+        let after = ctx.alloc_stats();
+        assert!(mid.allocations > before.allocations && mid.bytes >= before.bytes + 37 * 23 * 16);
+        // Other tests may allocate concurrently, but never fewer than nothing.
+        assert!(after.allocations >= mid.allocations);
+    }
 
     #[test]
     fn pool_encoder_local_reuse_keeps_cross_encoder_barrier() {
