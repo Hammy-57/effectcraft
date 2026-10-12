@@ -93,6 +93,11 @@ impl AuxChannels {
 
 /// A channel name's layer and channel: `diffuse.R` → (`diffuse`, `R`), `ViewLayer.Combined.R`
 /// → (`ViewLayer.Combined`, `R`), `Z` → (`""`, `Z`).
+/// The rank pairs (id, coverage) at aux pixel `i` of [`AuxChannels::crypto_planes`].
+pub fn crypto_ranks_at<'a>(planes: &'a [(&'a [f32], &'a [f32])], i: usize) -> impl Iterator<Item = (f32, f32)> + 'a {
+    planes.iter().filter_map(move |(id, cov)| Some((*id.get(i)?, *cov.get(i)?)))
+}
+
 pub fn split_channel(name: &str) -> (&str, &str) {
     name.rsplit_once('.').unwrap_or(("", name))
 }
@@ -122,6 +127,13 @@ impl AuxChannels {
 
     /// Rank pairs (id, coverage) of Cryptomatte layer `layer` at aux pixel index `i`.
     pub fn crypto_ranks(&self, layer: &str, i: usize) -> Vec<(f32, f32)> {
+        crypto_ranks_at(&self.crypto_planes(layer), i).collect()
+    }
+
+    /// The (id, coverage) channel pairs of Cryptomatte layer `layer`, rank order: look them up
+    /// once and read pixels with [`crypto_ranks_at`]. Looking the channels up by name for every
+    /// pixel took seconds per frame (#473).
+    pub fn crypto_planes(&self, layer: &str) -> Vec<(&[f32], &[f32])> {
         let mut out = vec![];
         for k in 0.. {
             let (r, g, b, a) = (
@@ -131,9 +143,9 @@ impl AuxChannels {
                 self.get(&format!("{layer}{k:02}.A")),
             );
             let (Some(r), Some(g)) = (r, g) else { break };
-            out.push((r[i], g[i]));
+            out.push((r, g));
             if let (Some(b), Some(a)) = (b, a) {
-                out.push((b[i], a[i]));
+                out.push((b, a));
             }
         }
         out
