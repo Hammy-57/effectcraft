@@ -911,3 +911,54 @@ fn an_unsupported_stream_reports_why_it_shows_no_picture() {
     pool.forget(&f.path);
     assert_eq!(pool.problem(&f), None);
 }
+
+/// #719: an image sequence of lossy WebP frames with alpha decodes every frame once, with its
+/// alpha, and plays from the cache after that (no endless re-caching); it caches at a speed
+/// comparable to the same frames as PNG (the WebP decoder itself is slower).
+#[test]
+fn webp_alpha_sequence_decodes_once_and_plays_from_the_cache() {
+    use rayon::prelude::*;
+    if !have_ffmpeg() {
+        return;
+    }
+    let n = 24;
+    let dir = fixtures().join(format!("webp-seq-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let src = "testsrc2=size=640x360:rate=24:duration=1,format=yuva420p,geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='if(lt(X,W/2),255,X/W*255)'";
+    for (ext, codec) in [("webp", ["-c:v", "libwebp", "-pix_fmt", "yuva420p"]), ("png", ["-c:v", "png", "-pix_fmt", "rgba"])] {
+        let st = Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", src, "-frames:v", &n.to_string()])
+            .args(codec)
+            .arg(dir.join(format!("f_%03d.{ext}")))
+            .status()
+            .expect("ffmpeg");
+        assert!(st.success(), "ffmpeg {ext}");
+    }
+    let mut times = vec![];
+    for ext in ["webp", "png"] {
+        let first = dir.join(format!("f_001.{ext}"));
+        let mut f = probe(&first).expect("probe");
+        f.kind = FootageKind::Sequence;
+        f.sequence = (1..=n).map(|i| dir.join(format!("f_{i:03}.{ext}")).to_string_lossy().to_string()).collect();
+        f.sync_sequence_duration();
+        let pool = MediaPool::new();
+        let t0 = Instant::now();
+        let frames: Vec<Arc<Image>> = (0..n as i64).into_par_iter().map(|i| pool.frame(ItemId(1), &f, t_of(f.frame_rate, i)).expect("frame")).collect();
+        times.push(t0.elapsed());
+        for (i, img) in frames.iter().enumerate() {
+            assert_eq!((img.width, img.height), (640, 360), "{ext} frame {i}");
+            assert!(img.data.iter().any(|p| p[3] < 0.5) && img.data.iter().any(|p| p[3] > 0.99), "{ext} frame {i}: its alpha");
+        }
+        let decoded = pool.stats().misses;
+        assert_eq!(decoded, n as u64, "{ext}: each frame decoded once");
+        // played again: every frame from the cache
+        for i in 0..n as i64 {
+            assert!(pool.frame(ItemId(1), &f, t_of(f.frame_rate, i)).is_some());
+        }
+        assert_eq!(pool.stats().misses, decoded, "{ext}: the second pass decodes nothing");
+        assert_eq!(pool.stats().frames, n as usize, "{ext}: every frame stays cached");
+    }
+    eprintln!("#719: {n} frames 640x360 with alpha: WebP {:?}, PNG {:?}", times[0], times[1]);
+    assert!(times[0] < times[1] * 20 + std::time::Duration::from_secs(2), "WebP caches in reasonable time: {times:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
