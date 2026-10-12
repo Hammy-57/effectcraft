@@ -138,8 +138,7 @@ fn batch(s: &mut Session, p: &Value) -> Result<Value> {
     let steps = preflight(steps, atomic, &empty)?;
     let (project, history, state) = (s.project.clone(), s.history.clone(), s.state.clone());
     let (events, journal, learn) = (s.events.clone(), s.journal.clone(), s.learn.clone());
-    let (warp_pending, camera_pending, roto_pending, analyses_checked) =
-        (s.warp_pending.clone(), s.camera_pending.clone(), s.roto_pending.clone(), s.analyses_checked.clone());
+    let (warp_pending, camera_pending, roto_pending) = (s.warp_pending.clone(), s.camera_pending.clone(), s.roto_pending.clone());
     let mut results: Vec<Option<Value>> = Vec::with_capacity(steps.len());
     let mut receipts = Vec::with_capacity(steps.len());
     let mut execution_results = Vec::with_capacity(steps.len());
@@ -168,7 +167,6 @@ fn batch(s: &mut Session, p: &Value) -> Result<Value> {
                     s.warp_pending = warp_pending;
                     s.camera_pending = camera_pending;
                     s.roto_pending = roto_pending;
-                    s.analyses_checked = analyses_checked;
                     s.sanitize_state();
                     s.bump();
                     return Err(EngineError::Other(format!("step {} ({}): {e}; the batch was rolled back", i + 1, step.id)));

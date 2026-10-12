@@ -11,6 +11,7 @@ pub(crate) mod app_more;
 mod audio_cmds;
 mod autotrace;
 mod batch;
+mod batch_policy;
 mod camera_cmds;
 mod comp;
 pub(crate) mod comp_more;
