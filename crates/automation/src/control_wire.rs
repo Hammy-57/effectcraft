@@ -27,9 +27,10 @@ pub const MAX_LINE: usize = 4 * 1024 * 1024;
 pub const MAX_CONNECTIONS: usize = 32;
 /// `requestId`s remembered (with their replies) for retries.
 const REPLY_CACHE: usize = 128;
-/// Larger replies (rendered frames, inspections) aren't kept: a retry runs again, which is
-/// harmless for the reads that return them.
+/// Larger replies leave a bounded completion receipt: retrying never reruns their command.
 const MAX_CACHED_REPLY: usize = 256 * 1024;
+/// Empty or longer identifiers are refused before a request can run.
+pub const MAX_REQUEST_ID: usize = 256;
 /// Distinct `client` names one connection is tracked for.
 const MAX_CLIENTS_PER_CONNECTION: usize = 64;
 
@@ -124,16 +125,23 @@ pub enum Lookup {
     Hit(Value),
     Running,
     Miss,
+    Rejected(&'static str),
 }
 
 impl ReplyCache {
     /// Look `id` up; a new id is recorded as running.
     pub fn begin(&mut self, id: &str) -> Lookup {
+        if id.is_empty() || id.len() > MAX_REQUEST_ID {
+            return Lookup::Rejected("`requestId` must contain 1 to 256 UTF-8 bytes");
+        }
         if let Some((_, r)) = self.entries.iter().find(|(k, _)| k == id) {
             return r.clone().map_or(Lookup::Running, Lookup::Hit);
         }
-        while self.entries.len() >= REPLY_CACHE {
-            self.entries.pop_front();
+        if self.entries.len() >= REPLY_CACHE {
+            let Some(completed) = self.entries.iter().position(|(_, reply)| reply.is_some()) else {
+                return Lookup::Rejected("control reply cache is full of running requests; no command was run; retry later");
+            };
+            self.entries.remove(completed);
         }
         self.entries.push_back((id.to_string(), None));
         Lookup::Miss
@@ -141,7 +149,7 @@ impl ReplyCache {
 
     /// Store `id`'s reply, or forget the id (`None`: it didn't run, so a retry may run it).
     pub fn finish(&mut self, id: &str, reply: Option<Value>) {
-        let reply = reply.filter(|r| r.to_string().len() <= MAX_CACHED_REPLY);
+        let reply = reply.map(|r| if cacheable(&r) { r } else { completion_receipt(id, &r) });
         let at = self.entries.iter().position(|(k, _)| k == id);
         match (at, reply) {
             (Some(i), Some(r)) => {
@@ -157,6 +165,50 @@ impl ReplyCache {
     }
 }
 
+/// Count serialized bytes without allocating a second, possibly enormous response.
+fn cacheable(reply: &Value) -> bool {
+    struct Budget(usize);
+    impl Write for Budget {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > self.0 {
+                return Err(std::io::Error::other("reply exceeds cache budget"));
+            }
+            self.0 -= bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    serde_json::to_writer(Budget(MAX_CACHED_REPLY), reply).is_ok()
+}
+
+/// This is an unavailable-payload receipt, never a substitute for the original result.
+fn completion_receipt(id: &str, reply: &Value) -> Value {
+    let original_ok = reply.get("ok").and_then(Value::as_bool);
+    let result_ok = reply.pointer("/result/ok").and_then(Value::as_bool);
+    let waiting = reply.pointer("/result/waiting").and_then(Value::as_bool);
+    let failed = reply.pointer("/result/failed").and_then(Value::as_u64);
+    let result_error = reply.pointer("/result/error").filter(|e| !e.is_null());
+    let outcome = match original_ok {
+        Some(true) if result_ok == Some(false) || failed.is_some_and(|n| n > 0) || result_error.is_some() => "failure",
+        Some(true) if waiting == Some(true) => "waiting",
+        Some(true) => "success",
+        Some(false) => "error",
+        None => "unknown",
+    };
+    let error = reply.get("error").filter(|e| !e.is_null()).or(result_error);
+    let error_text = error.and_then(|e| e.as_str().or_else(|| e.get("message").and_then(Value::as_str)));
+    let error_detail = error_text.map(|text| text.chars().take(256).collect::<String>());
+    json!({
+        "ok": false, "replyUnavailable": true, "requestId": id,
+        "completed": if waiting == Some(true) { Some(false) } else if original_ok == Some(true) { Some(true) } else { None },
+        "outcome": outcome, "originalOk": original_ok, "resultOk": result_ok, "failed": failed, "waiting": waiting,
+        "originalError": error_detail,
+        "error": format!("request `{id}` already ran and returned an oversized reply (outcome: {outcome}, original ok: {original_ok:?}); the payload is not retained. Do not repeat the mutation; inspect the project or its saved output. This receipt prevents replay only while its requestId remains in this process's cache")
+    })
+}
+
 /// Answer a request with a `requestId` from `cache`, or run it: `run` returns the reply and
 /// whether it ran (a reply for a request that never ran isn't kept, so a retry runs it). `None`:
 /// the server is gone.
@@ -167,6 +219,7 @@ pub fn once(cache: &Mutex<ReplyCache>, request_id: Option<&str>, run: impl FnOnc
         Lookup::Running => {
             return Some(json!({"ok": false, "error": format!("request `{rid}` is still running; retry later with the same requestId to get its reply")}));
         }
+        Lookup::Rejected(error) => return Some(json!({"ok": false, "notRun": true, "error": error})),
         Lookup::Miss => {}
     }
     let r = run();
@@ -238,9 +291,12 @@ fn parse_line(bytes: &[u8]) -> Line {
         return Line::Reject("not a control request (missing string `method`); closing the connection".into());
     };
     let request_id = match obj.get("requestId") {
-        Some(Value::String(s)) => Some(s.clone()),
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if !s.is_empty() && s.len() <= MAX_REQUEST_ID => Some(s.clone()),
         Some(Value::Number(n)) => Some(n.to_string()),
-        _ => None,
+        Some(_) => {
+            return Line::Reject(format!("`requestId` must be a non-empty string of at most {MAX_REQUEST_ID} UTF-8 bytes or a number; closing the connection"));
+        }
     };
     Line::Request {
         id: obj.get("id").cloned().unwrap_or(Value::Null),
@@ -412,7 +468,7 @@ mod tests {
     }
 
     #[test]
-    fn a_retry_after_a_cancelled_timeout_runs() {
+    fn retries_keep_oversized_completion_and_release_only_requests_that_did_not_run() {
         let mut cache = ReplyCache::default();
         assert!(matches!(cache.begin("a"), Lookup::Miss));
         assert!(matches!(cache.begin("a"), Lookup::Running));
@@ -420,16 +476,84 @@ mod tests {
         assert!(matches!(cache.begin("a"), Lookup::Miss));
         cache.finish("a", Some(json!({"ok": true})));
         assert!(matches!(cache.begin("a"), Lookup::Hit(_)));
-        // Big replies are not kept.
         assert!(matches!(cache.begin("big"), Lookup::Miss));
-        cache.finish("big", Some(json!({"png": "x".repeat(MAX_CACHED_REPLY)})));
-        assert!(matches!(cache.begin("big"), Lookup::Miss));
-        // Bounded: the oldest ids are forgotten.
+        cache.finish("big", Some(json!({"ok":true,"result":{"png": "x".repeat(MAX_CACHED_REPLY)}})));
+        let Lookup::Hit(receipt) = cache.begin("big") else { panic!("completion receipt missing") };
+        assert_eq!(receipt["replyUnavailable"], true);
+        assert_eq!(receipt["completed"], true);
+        assert_eq!(receipt["originalOk"], true);
+        assert_eq!(receipt["outcome"], "success");
+        assert!(receipt.to_string().len() < 2048);
+        let calls = AtomicUsize::new(0);
+        let cache = Mutex::new(cache);
+        for _ in 0..2 {
+            let result = once(&cache, Some("big"), || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Some((json!({"ok":true}), true))
+            })
+            .unwrap();
+            assert_eq!(result, receipt);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn oversized_receipts_preserve_script_failure_and_bounded_error_details() {
+        let mut cache = ReplyCache::default();
+        cache.begin("script");
+        cache.finish("script", Some(json!({"ok":true,"result":{"ok":false,"error":{"message":"broken"},"output":"x".repeat(MAX_CACHED_REPLY)}})));
+        let Lookup::Hit(receipt) = cache.begin("script") else { panic!("completion receipt missing") };
+        assert_eq!(receipt["completed"], true);
+        assert_eq!(receipt["outcome"], "failure");
+        assert_eq!(receipt["resultOk"], false);
+        assert_eq!(receipt["originalError"], "broken");
+        cache.begin("error");
+        cache.finish("error", Some(json!({"ok":false,"error":"🤖".repeat(MAX_CACHED_REPLY)})));
+        let Lookup::Hit(receipt) = cache.begin("error") else { panic!("completion receipt missing") };
+        assert_eq!(receipt["originalOk"], false);
+        assert_eq!(receipt["completed"], Value::Null, "an error reply need not prove execution completed");
+        assert!(receipt.to_string().len() < 2048);
+    }
+
+    #[test]
+    fn running_entries_are_not_evicted_and_saturation_rejects_before_execution() {
+        let cache = Mutex::new(ReplyCache::default());
+        for i in 0..REPLY_CACHE {
+            assert!(matches!(lock(&cache).begin(&i.to_string()), Lookup::Miss));
+        }
+        assert!(matches!(lock(&cache).begin("0"), Lookup::Running));
+        let mut ran = false;
+        let rejection = once(&cache, Some("overflow"), || {
+            ran = true;
+            Some((json!({"ok":true}), true))
+        })
+        .unwrap();
+        assert!(!ran);
+        assert_eq!(rejection["notRun"], true);
+        assert!(matches!(lock(&cache).begin("0"), Lookup::Running));
+        lock(&cache).finish("1", Some(json!({"ok":true})));
+        assert!(matches!(lock(&cache).begin("new"), Lookup::Miss));
+        assert!(matches!(lock(&cache).begin("0"), Lookup::Running));
+        assert_eq!(lock(&cache).entries.len(), REPLY_CACHE);
+    }
+
+    #[test]
+    fn finished_entries_can_age_out_and_request_ids_are_bounded() {
+        let mut cache = ReplyCache::default();
         for i in 0..REPLY_CACHE {
             cache.begin(&i.to_string());
+            cache.finish(&i.to_string(), Some(json!({"ok":true})));
         }
-        assert_eq!(cache.entries.len(), REPLY_CACHE);
-        assert!(matches!(cache.begin("a"), Lookup::Miss));
+        assert!(matches!(cache.begin("new"), Lookup::Miss));
+        assert!(matches!(cache.begin("0"), Lookup::Miss), "finished receipts have finite retention");
+        assert!(matches!(cache.begin(""), Lookup::Rejected(_)));
+        assert!(matches!(cache.begin(&"x".repeat(MAX_REQUEST_ID + 1)), Lookup::Rejected(_)));
+        for id in [json!("x".repeat(MAX_REQUEST_ID + 1)), json!(""), json!({"bad":true})] {
+            let input = format!("{}\n", json!({"method":"a","requestId":id}));
+            let (replies, calls) = run(input.as_bytes());
+            assert!(calls.is_empty());
+            assert_eq!(replies[0]["ok"], false);
+        }
     }
 
     #[test]
