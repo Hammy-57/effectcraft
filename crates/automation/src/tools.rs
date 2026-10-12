@@ -174,7 +174,7 @@ const UNCONFINED_ONLY: &[&str] = &["control", "ui_click", "ui_drag", "ui_key", "
 pub fn output_schema(name: &str) -> Option<Value> {
     let object = |props: Value, required: &[&str]| json!({"type": "object", "properties": props, "required": required});
     let int = json!({"type": "integer"});
-    Some(match name {
+    let legacy = match name {
         "get_state" => object(json!({"state": {"type": "object"}, "app": {"type": "object"}}), &["state", "app"]),
         "doc_inspect" => object(json!({"project": {"type": "object"}, "activeComp": {"type": ["object", "null"]}}), &["project", "activeComp"]),
         "render_preview" | "render_frame" => object(
@@ -294,7 +294,19 @@ pub fn output_schema(name: &str) -> Option<Value> {
             )
         }
         _ => return None,
-    })
+    };
+    // Bounds may replace any payload field. Apply the legacy contract only to its own variant.
+    Some(json!({
+        "type": "object",
+        "anyOf": [
+            legacy,
+            object(json!({"result_id": {"type": "string"}}), &["result_id"]),
+            object(json!({
+                "result_retained": {"type": "boolean", "const": false},
+                "operation_completed": {"type": "boolean"}
+            }), &["result_retained", "operation_completed"])
+        ]
+    }))
 }
 
 /// A JSON result as MCP `structuredContent`, which must be an object: arrays become
