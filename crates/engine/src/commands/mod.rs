@@ -95,6 +95,8 @@ use serde_json::Value;
 
 use crate::{EngineError, Result, Session};
 
+pub(crate) use target_refs::{checked_layer_ref, validate_target_refs};
+
 pub type Run = fn(&mut Session, &Value) -> Result<Value>;
 pub type Enabled = fn(&Session) -> std::result::Result<(), String>;
 
@@ -516,14 +518,18 @@ pub(crate) fn comp_id(s: &Session, p: &Value) -> Result<ItemId> {
     let missing = |v: &Value| EngineError::NoSuchComp(v.to_string());
     match p.get("comp") {
         Some(v @ Value::Number(n)) => n.as_u64().map(ItemId).filter(|id| s.project.comp(*id).is_some()).ok_or_else(|| missing(v)),
-        Some(v @ Value::String(name)) => s
-            .project
-            .items
-            .values()
-            .find(|i| &i.name == name && i.as_comp().is_some())
-            .map(|i| i.id)
-            .or_else(|| digits_id(name).map(ItemId).filter(|id| s.project.comp(*id).is_some()))
-            .ok_or_else(|| missing(v)),
+        Some(v @ Value::String(name)) => {
+            let candidates: Vec<_> = s.project.items.values().filter(|i| &i.name == name && i.as_comp().is_some()).collect();
+            if candidates.len() > 1 {
+                let candidates: Vec<_> =
+                    candidates.iter().map(|i| serde_json::json!({"id": i.id.0, "name": i.name, "parent": i.parent.map(|p| p.0)})).collect();
+                return Err(bad(
+                    "comp",
+                    format!("ambiguous composition name {name:?}; candidates: {}; use a numeric composition id", Value::Array(candidates)),
+                ));
+            }
+            candidates.first().map(|i| i.id).or_else(|| digits_id(name).map(ItemId).filter(|id| s.project.comp(*id).is_some())).ok_or_else(|| missing(v))
+        }
         _ => s.active_comp_id().ok_or(EngineError::NoComp),
     }
 }
@@ -549,7 +555,12 @@ pub(crate) fn resolve_layer(comp: &Comp, v: &Value) -> Option<LayerId> {
             if let Some(i) = s.strip_prefix('#').and_then(|i| i.parse::<usize>().ok()) {
                 return comp.layers.get(i.checked_sub(1)?).map(|l| l.id);
             }
-            comp.layers.iter().find(|l| &l.name == s).map(|l| l.id).or_else(|| digits_id(s).and_then(|id| resolve_layer(comp, &Value::from(id))))
+            let mut named = comp.layers.iter().filter(|l| &l.name == s);
+            let first = named.next();
+            if named.next().is_some() {
+                return None;
+            }
+            first.map(|l| l.id).or_else(|| digits_id(s).and_then(|id| resolve_layer(comp, &Value::from(id))))
         }
         _ => None,
     }
@@ -570,7 +581,14 @@ pub(crate) fn pick_group<'a>(mut groups: impl Iterator<Item = &'a PropGroup>, v:
         }
         Value::String(s) => match s.strip_prefix('#').and_then(|i| i.parse::<usize>().ok()) {
             Some(i) => groups.nth(i.checked_sub(1)?),
-            None => groups.find(|g| &g.name == s || g.match_id == *s),
+            None => {
+                if let Some(uid) = s.strip_prefix('@').and_then(|u| u.parse::<u64>().ok()) {
+                    return groups.find(|g| g.uid == uid);
+                }
+                let mut named = groups.filter(|g| &g.name == s || g.match_id == *s);
+                let first = named.next()?;
+                named.next().is_none().then_some(first)
+            }
         },
         _ => None,
     }
@@ -581,7 +599,7 @@ pub(crate) fn layer_p(s: &Session, p: &Value, cmd: &str) -> Result<(ItemId, Laye
     let cid = comp_id(s, p)?;
     let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
     if let Some(v) = p.get("layer") {
-        return resolve_layer(comp, v).map(|l| (cid, l)).ok_or_else(|| bad(cmd, no_layer(v)));
+        return checked_layer_ref(comp, cid, v, cmd)?.map(|l| (cid, l)).ok_or_else(|| bad(cmd, no_layer(v)));
     }
     s.state
         .selected_layers
@@ -597,7 +615,7 @@ pub(crate) fn layers_p(s: &Session, p: &Value) -> Result<(ItemId, Vec<LayerId>)>
     let cid = comp_id(s, p)?;
     let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
     // Explicit references that match no layer are an error (agents otherwise get a silent no-op).
-    let resolve = |v: &Value| resolve_layer(comp, v).ok_or_else(|| EngineError::Other(no_layer(v)));
+    let resolve = |v: &Value| checked_layer_ref(comp, cid, v, "layers")?.ok_or_else(|| EngineError::Other(no_layer(v)));
     if let Some(Value::Array(a)) = p.get("layers") {
         return Ok((cid, a.iter().map(resolve).collect::<Result<_>>()?));
     }

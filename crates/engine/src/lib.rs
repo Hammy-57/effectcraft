@@ -680,6 +680,7 @@ impl Session {
 
     fn execute_inner(&mut self, id: &str, params: Value) -> Result<Value> {
         let spec = commands::find(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
+        let resolved = commands::validate_target_refs(self, id, &params)?;
         if let Err(why) = (spec.enabled)(self) {
             // Explicit targets (agents, scripts) don't need a UI selection.
             let explicit = (["layer", "layers", "prop", "keys"].iter().any(|k| params.get(k).is_some()) && commands::has_comp(self).is_ok())
@@ -695,7 +696,13 @@ impl Session {
         let nesting = replay::Nesting::enter(spec.journal);
         let caught = guard::caught();
         let r = guard::guarded(&format!("command `{id}`"), || (spec.run)(self, &params));
-        let r = replay::after_command(self, id, &params, &nesting, caught, r)?;
+        let mut r = replay::after_command(self, id, &params, &nesting, caught, r)?;
+        if spec.journal
+            && resolved.as_object().is_some_and(|o| !o.is_empty())
+            && let Some(reply) = r.as_object_mut()
+        {
+            reply.insert("resolved".into(), resolved);
+        }
         self.learn_observe(id, &params);
         // Commands run by a journaled command (a script's steps) replay with it, not again.
         if spec.journal && !nesting.inside_journaled() {
