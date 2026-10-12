@@ -152,6 +152,12 @@ impl<'a> Renderer<'a> {
         }
     }
 
+    /// The layer cache to keep this render's buffers in: none once its footage reads were
+    /// called off, as they may have come back empty ([`FootageSource::called_off`], #329).
+    pub fn cache_to_keep(&self) -> Option<&'a LayerCache> {
+        self.cache.filter(|_| !self.footage.called_off())
+    }
+
     /// A layer's Quality switch, limited by the precomp layers above it when
     /// [`RenderOpts::nested_switches`] is on.
     pub fn quality(&self, layer: &Layer) -> Quality {

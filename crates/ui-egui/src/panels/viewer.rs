@@ -1101,6 +1101,30 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         app.auto.add("viewer.warpBanner", r, &text);
     }
 
+    // Footage that can't be decoded (no decoder for its codec / profile): say why on the layer
+    // instead of leaving a black picture (#886).
+    let mut notices = 0;
+    for layer in comp.layers.iter().filter(|l| l.is_active_at(time) && l.switches.video) {
+        let effectcraft_engine::project::LayerSource::Footage { item } = &layer.source else { continue };
+        let Some(effectcraft_engine::project::ItemKind::Footage(f)) = app.session.project.item(*item).map(|i| &i.kind) else { continue };
+        let Some(why) = app.session.footage.problem(f) else { continue };
+        if notices >= 3 {
+            break;
+        }
+        let (m, _) = l2c(&ectx, layer);
+        let (w, h) = effectcraft_engine::render::source_size(&app.session.project, layer);
+        let c = m.apply(effectcraft_engine::geom::vec2(w as f64 / 2.0, h as f64 / 2.0));
+        let at = map.to_screen([c.x, c.y]);
+        let text = format!("{}: {}", layer.name, why);
+        let galley = painter.layout(text.clone(), Tokens::medium(12.0), Color32::WHITE, (map.area.width() - 40.0).clamp(80.0, 420.0));
+        let r = Rect::from_center_size(at + vec2(0.0, notices as f32 * 4.0), galley.size() + vec2(24.0, 16.0)).intersect(map.area);
+        painter.rect_filled(r, 3.0, Color32::from_rgba_unmultiplied(0x4a, 0x1a, 0x14, 0xe6));
+        painter.rect_stroke(r, 3.0, Stroke::new(1.0, t.warning), StrokeKind::Inside);
+        painter.galley(pos2(r.min.x + 12.0, r.center().y - galley.size().y / 2.0), galley, Color32::WHITE);
+        app.auto.add(&format!("viewer.footageProblem.{}", layer.id.0), r, &text);
+        notices += 1;
+    }
+
     // Free transform box of a path (double-click a path with the Selection tool).
     let ft = ov::draw_free_transform(app, &ctx, &painter, &map, &paths);
 
