@@ -230,6 +230,18 @@ fn achieved_frame_rate_and_real_time() {
     }
     assert_eq!(slow.real_time(), Some(false));
     assert_eq!(slow.shown_at.len(), 13, "only the last second counts");
+    // Playback holds half a second after a real-time second: the frames of the last second
+    // (12 shown from 0.5 s to 1 s) over that second, instead of freezing at 24.
+    p.observe(1.5);
+    let held = p.achieved_fps().unwrap();
+    assert!((held - 12.0).abs() < 1e-9, "{held}");
+    assert_eq!(p.real_time(), Some(false));
+    // Within a frame and a half of the last frame, the frames' own span counts.
+    p.observe(1.04);
+    assert!((p.achieved_fps().unwrap() - 24.0).abs() < 1e-9);
+    // A hold over a second has no frames to measure.
+    p.observe(3.0);
+    assert_eq!(p.achieved_fps(), None);
 }
 
 #[test]
