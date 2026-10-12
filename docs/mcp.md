@@ -36,7 +36,7 @@ The server provides the same core conventions as FilmCraft #28:
 | `command_list` | `filter?`, `enabled_only?`, `schemas?`, `brief?` (ids + labels only) | Command catalog |
 | `command_run` | `id`, `params?` | Engine command result |
 | `command_batch` | `steps: [{id, params?}]`, `stop_on_error?` | `completed`, `failed`, per-step `results` |
-| `doc_inspect` | none | Project overview and active composition |
+| `doc_inspect` | `full?`, `offset?`, `limit?` | Project overview and active composition (layers compact and paged, as `get_comp`) |
 | `render_preview` | `comp?` / `item?`, `layer?`, `time?`, `max_side?`, `region?`, `overlays?`, `path?`, `inline?`, `transparent?` | PNG and frame information |
 | `render_frames` | `times?` / `count?`, `start?`, `end?`, `cols?`, `max_side?`, `labels?`, `gif?`, `path?`, `inline?` and the render arguments | One labelled contact-sheet PNG and `{times, frames, cols, rows, cell}` |
 
@@ -46,6 +46,26 @@ image files or frames rendered now, returning the metrics and `diffBounds` (box 
 JSON and, when something changed, the diff heatmap as image content (longest side 768; `diff_path` writes it full size). Both are
 annotated like file writers (not read-only, not destructive, idempotent): they never change the
 project. See [agents.md](agents.md#verify-your-change-snapshot--edit--compare).
+
+### Compact, paged reads
+
+Clients often cap a tool result (8k characters is common), so the read tools answer compactly and
+page long lists. `get_comp` (and `doc_inspect`'s active comp) gives `layerCount` and each layer as a
+row of `index`, `id`, `name`, `type`, `in`, `out` plus only what isn't the default: `start` (≠ 0),
+`stretch` (≠ 100), `parent`, `trackMatte`, `blendMode` (≠ Normal) and `switches` tags (`hidden`,
+`3d`, `solo`, `locked`, `shy`, `adjustment`, `quality:Draft`, …), about 100 characters a layer:
+
+```json
+{"blendMode":"Multiply","id":52,"in":0.0,"index":1,"name":"Lower third","out":10.01,"parent":4,"switches":["hidden","3d"],"type":"Solid"}
+```
+
+Lists are paged with `offset` / `limit` (defaults: 200 layers, 100 keyframes for `get_property`,
+150 properties for `get_layer {flat: true}`). Every paged reply carries its total (`layerCount`,
+`keyCount`, `total`), `returned` and `next_offset` (null when nothing follows); a cut list also
+carries `truncated: {returned, total, next_offset, hint}`. `get_property` keys are
+`{time, value, compTime?, in?, out?}` (interpolation omitted when Linear, values rounded to 4
+decimals). A `get_layer` tree over 8,000 characters carries a `hint` to use the flat list.
+`full: true` (on `get_comp`, `doc_inspect`, `get_property`) returns the long form unchanged.
 
 `command_batch` stops at the first error by default; false continues. Each edit has its
 own undo step. The existing `batch` tool retains its atomic undo grouping and result references.
