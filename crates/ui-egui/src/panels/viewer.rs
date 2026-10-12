@@ -509,16 +509,6 @@ fn parent_inverse(ctx: &EvalCtx, layer: &Layer) -> Mat3 {
     }
 }
 
-/// A frame for an extra view: see [`pooled_texture`].
-enum Pooled {
-    /// Its texture, or the last one while the frame renders (`None` before the first).
-    Shown(Option<egui::TextureHandle>),
-    /// Rendering, nothing to show yet.
-    Rendering,
-    /// Frames stay on the GPU here (the browser's viewer): render it on the UI thread.
-    OnUiThread,
-}
-
 fn view_key(text: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -536,7 +526,8 @@ fn display_color(dc: &effectcraft_engine::viewer::DisplayColor, img: &mut egui::
 /// The texture of an extra view (split 3D views, the locked viewer): frame `t` of `comp`
 /// rendered with `opts` by the frame workers, off the UI thread (it used to render there on
 /// every frame of playback), then uploaded (through `dc`) into the texture kept under `id`.
-/// Until a new frame is in, the last texture stays up. `view` tells views apart.
+/// Until a new frame is in, the last texture stays up (`None` before the first). `view` tells
+/// views apart.
 #[allow(clippy::too_many_arguments)]
 fn pooled_texture(
     app: &EffectcraftApp,
@@ -548,9 +539,9 @@ fn pooled_texture(
     opts: effectcraft_engine::render::RenderOpts,
     view: u64,
     dc: Option<effectcraft_engine::viewer::DisplayColor>,
-) -> Pooled {
-    use crate::frames::{FrameImage, FrameKey};
-    let Some(c) = app.session.project.comp(comp) else { return Pooled::Rendering };
+) -> Option<egui::TextureHandle> {
+    use crate::frames::{FrameImage, FrameKey, RenderSource};
+    let c = app.session.project.comp(comp)?;
     // The document revision, as the main viewer and playback use (`frame_series`): the frame
     // queue drops jobs of older revisions, and the freeze preview's counter (which counts loaded
     // font faces) is far larger, so every request here dropped their queued prefetch. The
@@ -570,12 +561,12 @@ fn pooled_texture(
     if let Some((k, tex)) = &cached
         && *k == key
     {
-        return Pooled::Shown(Some(tex.clone()));
+        return Some(tex.clone());
     }
-    let src = app.render_source();
-    if src.gpu_display {
-        return Pooled::OnUiThread;
-    }
+    // Always CPU pixels: a GPU display frame (`gpu_display`, the default state) is a texture for
+    // the main viewer's native slot. These views used to render on the UI thread in that state,
+    // one synchronous frame per view on every frame of playback.
+    let src = RenderSource { gpu_display: false, ..app.render_source() };
     app.frames.request(&src, key, comp, c.frame_rate.tick_of(frame), opts);
     match app.frames.get(&key) {
         Some(FrameImage::Cpu(img)) => {
@@ -585,13 +576,9 @@ fn pooled_texture(
             }
             let tex = crate::frames::load_fitted(ctx, name, ci, egui::TextureOptions::LINEAR);
             ctx.data_mut(|d| d.insert_temp(id, (key, tex.clone())));
-            Pooled::Shown(Some(tex))
+            Some(tex)
         }
-        Some(FrameImage::Gpu(_)) => Pooled::OnUiThread,
-        None => match cached {
-            Some((_, tex)) => Pooled::Shown(Some(tex)),
-            None => Pooled::Rendering,
-        },
+        Some(FrameImage::Gpu(_)) | None => cached.map(|(_, tex)| tex),
     }
 }
 
@@ -640,29 +627,7 @@ fn aux_views(
         let id = egui::Id::new(("viewer-aux", i));
         let opts = effectcraft_engine::render::RenderOpts { scale, view: comp.has_3d().then_some(cam), draft: true, ..Default::default() };
         let view = view_key(&format!("{cam:?}"));
-        let tex = match pooled_texture(app, &ctx, id, &format!("viewer-aux-{i}"), cid, t, opts, view, None) {
-            Pooled::Shown(tex) => tex,
-            Pooled::Rendering => None,
-            Pooled::OnUiThread => {
-                let key = {
-                    use std::hash::{Hash, Hasher};
-                    let mut h = std::collections::hash_map::DefaultHasher::new();
-                    (app.session.revision, cid.0, t.0, i, scale.to_bits(), format!("{cam:?}")).hash(&mut h);
-                    h.finish()
-                };
-                let cached: Option<(u64, egui::TextureHandle)> = ctx.data(|d| d.get_temp(id));
-                Some(match cached {
-                    Some((k, tex)) if k == key => tex,
-                    _ => {
-                        let img = app.session.render(cid, t, opts);
-                        let tex =
-                            crate::frames::load_fitted(&ctx, format!("viewer-aux-{i}"), crate::frames::to_color_image(&img), egui::TextureOptions::LINEAR);
-                        ctx.data_mut(|d| d.insert_temp(id, (key, tex.clone())));
-                        tex
-                    }
-                })
-            }
-        };
+        let tex = pooled_texture(app, &ctx, id, &format!("viewer-aux-{i}"), cid, t, opts, view, None);
         let b = comp.background;
         p.rect_filled(cr, 0.0, Color32::from_rgb((b[0] * 255.0) as u8, (b[1] * 255.0) as u8, (b[2] * 255.0) as u8));
         if let Some(tex) = tex {
@@ -709,32 +674,7 @@ fn locked_pane(app: &mut EffectcraftApp, ui: &mut egui::Ui, full: Rect, bg: Colo
     let opts = effectcraft_engine::render::RenderOpts { scale, view: cam, ..Default::default() };
     // The display conversion is applied on upload: part of the texture's key, not the frame's.
     let view = view_key(&dc_key);
-    let tex = match pooled_texture(app, &ctx, id, "viewer-locked", lv.comp, t, opts, view, dc.clone()) {
-        Pooled::Shown(tex) => tex,
-        Pooled::Rendering => None,
-        Pooled::OnUiThread => {
-            let key = {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                (app.session.revision, lv.comp.0, t.0, scale.to_bits(), &dc_key).hash(&mut h);
-                h.finish()
-            };
-            let cached: Option<(u64, egui::TextureHandle)> = ctx.data(|d| d.get_temp(id));
-            Some(match cached {
-                Some((k, tex)) if k == key => tex,
-                _ => {
-                    let img = app.session.render(lv.comp, t, opts);
-                    let mut ci = crate::frames::to_color_image(&img);
-                    if let Some(dc) = &dc {
-                        display_color(dc, &mut ci);
-                    }
-                    let tex = crate::frames::load_fitted(&ctx, "viewer-locked", ci, egui::TextureOptions::LINEAR);
-                    ctx.data_mut(|d| d.insert_temp(id, (key, tex.clone())));
-                    tex
-                }
-            })
-        }
-    };
+    let tex = pooled_texture(app, &ctx, id, "viewer-locked", lv.comp, t, opts, view, dc);
     let b = comp.background;
     p.rect_filled(cr, 0.0, Color32::from_rgb((b[0] * 255.0) as u8, (b[1] * 255.0) as u8, (b[2] * 255.0) as u8));
     if let Some(tex) = tex {
@@ -2663,6 +2603,34 @@ mod tests {
         app.request_frame(cid, 6, 1.0);
         extra(&app, 1);
         assert_eq!(app.frames.inflight(), 4, "every frame asked for stays queued");
+    }
+
+    /// In the default viewer state (`gpu_display`) split views and the locked viewer rendered
+    /// their frames synchronously on the UI thread, every frame of playback. They now go
+    /// through the frame workers as CPU pixels and show once rendered.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn extra_views_render_on_the_frame_workers_in_the_default_state() {
+        use serde_json::json;
+        let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+        app.session.execute("comp.new", json!({"width": 16, "height": 16, "duration": 2})).unwrap();
+        app.session.execute("layer.newSolid", json!({"color": "#ff0000", "width": 16, "height": 16})).unwrap();
+        assert!(app.render_source().gpu_display, "the default state");
+        let cid = app.session.active_comp_id().unwrap();
+        let ctx = egui::Context::default();
+        let opts = app.frame_opts(cid, 1.0);
+        let t = app.session.project.comp(cid).unwrap().frame_rate.tick_of(3);
+        let id = egui::Id::new("extra");
+        assert!(pooled_texture(&app, &ctx, id, "extra", cid, t, opts, 7, None).is_none(), "not rendered on this thread");
+        let start = std::time::Instant::now();
+        let tex = loop {
+            if let Some(tex) = pooled_texture(&app, &ctx, id, "extra", cid, t, opts, 7, None) {
+                break tex;
+            }
+            assert!(start.elapsed() < std::time::Duration::from_secs(30), "the frame workers never delivered");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert_eq!(tex.size(), [16, 16]);
     }
 
     #[test]
