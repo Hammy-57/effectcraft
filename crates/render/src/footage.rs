@@ -119,6 +119,13 @@ fn convert_px(p: &mut Px, c: &effectcraft_color::Conversion) {
     *p = [o[0] * a, o[1] * a, o[2] * a, a];
 }
 
+/// The exact view of `footage` ([`FootageSource::exact`]): for final renders (exports through
+/// `effectcraft_export::Job::source`, Save Frame As), which must not depend on whether previews
+/// decode on a hardware decoder. (Such renders must not share a layer cache with previews.)
+pub fn exact_footage(footage: &dyn FootageSource) -> &dyn FootageSource {
+    footage.exact().unwrap_or(footage)
+}
+
 /// Supplies decoded footage frames (implemented by the media layer).
 pub trait FootageSource: Send + Sync {
     /// The frame of `item` at source time `t`, straight from the file (any size).
@@ -180,6 +187,15 @@ pub trait FootageSource: Send + Sync {
     /// Settings ▸ Disk ▸ Conformed Audio Folder: where decoded audio is kept between reads
     /// (`None` = off); sources that don't decode audio ignore it.
     fn set_conform_folder(&self, _folder: Option<std::path::PathBuf>) {}
+    /// Settings ▸ Previews ▸ Hardware ProRes Decoding: let previews decode footage on a hardware
+    /// decoder (visually identical, not bit-exact). Sources without one ignore it.
+    fn set_hardware_decoding(&self, _on: bool) {}
+    /// The view of this source that decodes exactly (never on a hardware decoder): what exports
+    /// and other final renders read. `None`: this source is exact already. A source returns the
+    /// same view every time (jobs compare footage sources by address).
+    fn exact(&self) -> Option<&dyn FootageSource> {
+        None
+    }
     /// The decoded-frame cache budget in bytes, if the source has a cache.
     fn cache_budget(&self) -> Option<usize> {
         None

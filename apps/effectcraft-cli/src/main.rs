@@ -123,6 +123,7 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
   bench [--comp C] [--time S] [--scale K] [--n N] [--play N] [--gpu [--adv3d]]   per-layer/effect render timings;
                                            --play N renders N consecutive frames with/without the layer cache;
                                            --gpu compares CPU and GPU ms/frame for every comp at Full and Half
+                                           --hw-prores: ProRes footage decodes on the hardware decoder (macOS)
   bench --ops [--small] [--layers N] [--comps N] [--footage N]
                                            everyday operations on a large generated project: startup, open,
                                            save, auto-save, edits + undo/redo, timeline, Project panel
@@ -221,6 +222,7 @@ const VALUED: &[&str] = &[
 /// Options without a value. Any other `--option` is a usage error.
 const FLAGS: &[&str] = &[
     "--rt-profile",
+    "--hw-prores",
     "--rt-drag",
     "--rt-warmup",
     "--json",
@@ -347,6 +349,9 @@ fn main() {
     if args.pos.is_empty() {
         fail_usage("missing subcommand");
     }
+    // Hardware ProRes decoding for previews (the app's Settings ▸ Previews ▸ Hardware ProRes
+    // Decoding; a CLI session turns it on with `bench --hw-prores`). Exports always decode exactly.
+    let _ = effectcraft_platform::register();
     let cmd = args.pos.remove(0);
     match run(&cmd, &args, json_out) {
         Ok(()) if stdout_broken() => std::process::exit(1),
@@ -1125,6 +1130,10 @@ fn bench_cmd(args: &Args) -> Result<(), Failure> {
     .map_err(|e| Failure::Error(e.to_string()))?;
     if let Some(c) = args.opt("--comp") {
         s.execute("comp.open", json!({"comp": c})).map_err(|e| Failure::Error(e.to_string()))?;
+    }
+    // Preview reads of ProRes footage decode on the hardware decoder (as the app's default).
+    if args.flag("--hw-prores") {
+        s.footage.set_hardware_decoding(true);
     }
     if args.flag("--rt-profile") {
         #[cfg(feature = "profile")]

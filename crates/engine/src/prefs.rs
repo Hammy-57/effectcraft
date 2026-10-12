@@ -166,6 +166,10 @@ page!(Previews {
     show_gpu_info: bool = false,
     /// The monitor's colour space for View ▸ Use Display Color Management: `srgb` or `p3`.
     display_profile: String = "srgb".into(),
+    /// Previews decode Apple ProRes footage on the system's hardware decoder where one is
+    /// registered (macOS media engines): visually identical, not bit-exact. Renders and exports
+    /// always decode exactly.
+    hardware_pro_res_decoding: bool = cfg!(target_os = "macos"),
 });
 
 page!(Appearance {
@@ -1180,6 +1184,8 @@ pub fn pages() -> Vec<Page> {
                 s("previews.fastPreviews", "Fast Previews (Draft 3D, Faster Effects)", B, true),
                 s("previews.zoomQuality", "Viewer Zoom Quality", Kind::Choice(&[("Faster", "faster"), ("More Accurate", "moreAccurate")]), true),
                 s("previews.displayProfile", "Display Color Space", Kind::Choice(&[("sRGB", "srgb"), ("Display P3", "p3")]), true),
+                s("previews.hardwareProResDecoding", "Hardware ProRes Decoding", B, true),
+                Note("Previews decode Apple ProRes footage on the Mac's media engines (visually identical, not bit-exact). Renders and exports always decode exactly."),
                 Button { label: "GPU Information...", command: "app.gpuInfo", params: "{}" },
             ],
         },

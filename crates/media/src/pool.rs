@@ -49,6 +49,9 @@ struct Key {
     /// Vector footage drawn at this scale (its bits; 0 = decoded at the native size): one entry
     /// per Continuously Rasterize scale step.
     raster: u64,
+    /// Decoded by a hardware decoder (previews only, see [`crate::hw`]): not the exact pixels an
+    /// export must read.
+    hw: bool,
 }
 
 /// A layer drawn at reduced resolution: its nominal size `w`×`h` at render scale `s` (< 0.75).
@@ -249,7 +252,7 @@ const STALL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Whether `a` and `b` key frames of the same stream (all but the frame index match).
 fn same_stream(a: &Key, b: &Key) -> bool {
-    a.path == b.path && a.interp == b.interp && a.matte == b.matte && a.crop == b.crop && a.preview == b.preview && a.raster == b.raster
+    a.path == b.path && a.interp == b.interp && a.matte == b.matte && a.crop == b.crop && a.preview == b.preview && a.raster == b.raster && a.hw == b.hw
 }
 
 /// A movie/audio source by path, opened by the first caller while the others wait for it
@@ -270,20 +273,24 @@ struct SourceEntry {
     held: usize,
 }
 
+/// An open source: its path, and whether its video may decode on a hardware decoder (previews:
+/// a source keeps decoded frames and decoders of its own, which an export must not read).
+type SourceKey = (Arc<str>, bool);
+
 /// Open movie/audio files by path, least recently used closed first beyond [`MAX_SOURCES`] or
 /// [`SOURCE_BUDGET`].
 #[derive(Default)]
 struct Sources {
-    map: HashMap<Arc<str>, SourceEntry>,
+    map: HashMap<SourceKey, SourceEntry>,
     clock: u64,
 }
 
 impl Sources {
     /// The slot of `path` (created empty), marked as just used.
-    fn slot(&mut self, path: &Arc<str>) -> SourceSlot {
+    fn slot(&mut self, path: &Arc<str>, hw: bool) -> SourceSlot {
         self.clock += 1;
         let clock = self.clock;
-        let e = self.map.entry(path.clone()).or_insert_with(|| SourceEntry { slot: SourceSlot::default(), stamp: clock, held: 0 });
+        let e = self.map.entry((path.clone(), hw)).or_insert_with(|| SourceEntry { slot: SourceSlot::default(), stamp: clock, held: 0 });
         e.stamp = clock;
         e.slot.clone()
     }
@@ -300,7 +307,7 @@ impl Sources {
             if self.map.len() <= MAX_SOURCES && held <= SOURCE_BUDGET {
                 return;
             }
-            let oldest = self.map.iter().filter(|(p, e)| &***p != keep && Self::idle(e)).min_by_key(|(_, e)| e.stamp).map(|(p, _)| p.clone());
+            let oldest = self.map.iter().filter(|(p, e)| &*p.0 != keep && Self::idle(e)).min_by_key(|(_, e)| e.stamp).map(|(p, _)| p.clone());
             let Some(p) = oldest else { return };
             self.map.remove(&p);
         }
@@ -376,6 +383,9 @@ struct Inner {
     done: Condvar,
     budget: AtomicU64,
     read_ahead: AtomicBool,
+    /// Settings ▸ Previews ▸ Hardware ProRes Decoding: preview reads of ProRes footage may use a
+    /// registered hardware decoder (off by default; the exact view never does).
+    hardware: AtomicBool,
     hits: AtomicU64,
     misses: AtomicU64,
     prefetched: AtomicU64,
@@ -406,9 +416,19 @@ struct Inner {
 ///   budget, so decoding overlaps with the callers' use of the current frames and they find the
 ///   next ones cached.
 /// - Concurrent requests for the same frame decode it once: the others wait for it.
+///
+/// Hardware decoding (Settings ▸ Previews ▸ Hardware ProRes Decoding, [`crate::hw`]) is for
+/// previews only: [`MediaPool::exact`] is a view of the same pool that always decodes exactly,
+/// and exports read footage through it ([`FootageSource::exact`]). Frames, open sources and
+/// decode-aheads are kept apart by that choice, so the exact view never sees a hardware frame.
 #[derive(Clone)]
 pub struct MediaPool {
     inner: Arc<Inner>,
+    /// This view never uses hardware decoders.
+    exact: bool,
+    /// The exact view of the same pool (`None` on the exact view itself). One per pool, so jobs
+    /// that compare footage sources by address see the same one.
+    twin: Option<Arc<MediaPool>>,
 }
 
 impl Default for MediaPool {
@@ -450,27 +470,50 @@ impl MediaPool {
 
     /// A pool whose frame cache holds at most `bytes` of decoded frames.
     pub fn with_budget(bytes: usize) -> Self {
-        Self {
-            inner: Arc::new(Inner {
-                sources: Mutex::default(),
-                files: Mutex::default(),
-                models: Mutex::default(),
-                psds: Mutex::default(),
-                gifs: Mutex::default(),
-                cache: Mutex::default(),
-                done: Condvar::new(),
-                budget: AtomicU64::new(bytes as u64),
-                read_ahead: AtomicBool::new(cfg!(not(target_arch = "wasm32"))),
-                hits: AtomicU64::new(0),
-                misses: AtomicU64::new(0),
-                prefetched: AtomicU64::new(0),
-                opened: AtomicU64::new(0),
-                conform: Mutex::default(),
-                ahead_pool: OnceLock::new(),
-                conforming: Mutex::default(),
-                conform_failed: Mutex::default(),
-            }),
-        }
+        let inner = Arc::new(Inner {
+            sources: Mutex::default(),
+            files: Mutex::default(),
+            models: Mutex::default(),
+            psds: Mutex::default(),
+            gifs: Mutex::default(),
+            cache: Mutex::default(),
+            done: Condvar::new(),
+            budget: AtomicU64::new(bytes as u64),
+            read_ahead: AtomicBool::new(cfg!(not(target_arch = "wasm32"))),
+            hardware: AtomicBool::new(false),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            prefetched: AtomicU64::new(0),
+            opened: AtomicU64::new(0),
+            conform: Mutex::default(),
+            ahead_pool: OnceLock::new(),
+            conforming: Mutex::default(),
+            conform_failed: Mutex::default(),
+        });
+        let twin = Some(Arc::new(Self { inner: inner.clone(), exact: true, twin: None }));
+        Self { inner, exact: false, twin }
+    }
+
+    /// Settings ▸ Previews ▸ Hardware ProRes Decoding: let this pool's preview reads of ProRes
+    /// footage use a registered hardware decoder ([`crate::hw`]). Off by default; the
+    /// [`MediaPool::exact`] view never does.
+    pub fn set_hardware_decoding(&self, on: bool) {
+        self.inner.hardware.store(on, Ordering::Relaxed);
+    }
+
+    /// The view of this pool that always decodes exactly (exports, final renders): the same
+    /// cache and files, never a hardware-decoded frame.
+    pub fn exact(&self) -> &MediaPool {
+        self.twin.as_deref().unwrap_or(self)
+    }
+
+    /// Whether this view decodes `footage` on a hardware decoder.
+    fn hw_for(&self, footage: &Footage) -> bool {
+        !self.exact
+            && footage.kind == FootageKind::Video
+            && self.inner.hardware.load(Ordering::Relaxed)
+            && crate::hw::available()
+            && crate::hw::takes_codec(&footage.codec)
     }
 
     pub fn budget(&self) -> usize {
@@ -528,7 +571,9 @@ impl MediaPool {
     /// Forget every file `keep` doesn't name: close its decoder, drop its parsed model and its
     /// cached frames (after footage is removed from the project, or another project is opened).
     pub fn retain_files(&self, keep: &dyn Fn(&str) -> bool) {
-        let gone: Vec<Arc<str>> = lock(&self.inner.sources).map.keys().filter(|p| !keep(p)).cloned().collect();
+        let mut gone: Vec<Arc<str>> = lock(&self.inner.sources).map.keys().filter(|p| !keep(&p.0)).map(|p| p.0.clone()).collect();
+        gone.sort();
+        gone.dedup();
         for p in &gone {
             self.forget(p);
         }
@@ -538,7 +583,7 @@ impl MediaPool {
 
     /// Forget a file (after it changed on disk, or to retry a file that failed to open).
     pub fn forget(&self, path: &str) {
-        lock(&self.inner.sources).map.remove(path);
+        lock(&self.inner.sources).map.retain(|k, _| &*k.0 != path);
         lock(&self.inner.models).remove(path);
         lock(&self.inner.psds).remove(path);
         lock(&self.inner.gifs).remove(path);
@@ -561,7 +606,7 @@ impl MediaPool {
 
     /// Decode (or fetch from cache) the frame of `footage` at source time `t`.
     pub fn frame_at(&self, footage: &Footage, t: Tick) -> Result<Arc<Image>> {
-        Inner::frame_at(&self.inner, footage, t, true)
+        Ok(Inner::pixels_at(&self.inner, footage, t, true, None, self.hw_for(footage))?.image())
     }
 
     /// Settings ▸ Disk ▸ Conformed Audio Folder: write each footage file's decoded audio there
@@ -694,7 +739,7 @@ impl MediaPool {
     /// [`MediaPool::decode_audio`], failing when the source can't be opened or read.
     fn try_decode_audio(&self, footage: &Footage, start: Tick, frames: usize, rate: u32) -> std::result::Result<Vec<f32>, String> {
         let path: Arc<str> = footage.path.as_str().into();
-        let src = self.inner.source(&path).ok_or("the file can't be opened")?;
+        let src = self.inner.source(&path, false).ok_or("the file can't be opened")?;
         let s0 = start.to_units_floor(rate as i64);
         let native = src.info().audio.as_ref().map_or(rate, |a| a.sample_rate);
         if native == 0 || rate == 0 || native == rate {
@@ -784,8 +829,8 @@ impl Inner {
     /// preview's frame workers, audio feeder, conform and waveform threads each decoded a long
     /// FLAC in full at once (#408). Containers are read through the file (index now, samples on
     /// demand), not held in memory.
-    fn source(&self, path: &Arc<str>) -> Option<SharedSource> {
-        let slot = lock(&self.sources).slot(path);
+    fn source(&self, path: &Arc<str>, hw: bool) -> Option<SharedSource> {
+        let slot = lock(&self.sources).slot(path, hw);
         let mut held = None;
         let src = slot
             .get_or_init(|| {
@@ -805,7 +850,7 @@ impl Inner {
             .clone();
         if let Some(h) = held {
             let mut sources = lock(&self.sources);
-            if let Some(e) = sources.map.get_mut(path)
+            if let Some(e) = sources.map.get_mut(&(path.clone(), hw))
                 && Arc::ptr_eq(&e.slot, &slot)
             {
                 e.held = h;
@@ -817,8 +862,8 @@ impl Inner {
     }
 
     /// The source of `path` when it is open already.
-    fn open_source(&self, path: &str) -> Option<SharedSource> {
-        lock(&self.sources).map.get(path).and_then(|e| e.slot.get().cloned().flatten())
+    fn open_source(&self, path: &Arc<str>, hw: bool) -> Option<SharedSource> {
+        lock(&self.sources).map.get(&(path.clone(), hw)).and_then(|e| e.slot.get().cloned().flatten())
     }
 
     /// The decoded frames of the animated GIF at `path`. The first caller decodes it, outside the
@@ -858,7 +903,7 @@ impl Inner {
         let interp = alpha | (u8::from(footage.preserve_rgb) << 2);
         let matte = if footage.alpha == AlphaMode::Premultiplied { footage.premul_color.map(f32::to_bits) } else { [0; 3] };
         let crop = footage.layer.as_ref().and_then(|l| l.crop_bounds).map(|b| b.map(f64::to_bits));
-        let key = |path: &str, frame| Key { path: path.into(), frame, interp, matte, crop, preview: None, raster: 0 };
+        let key = |path: &str, frame| Key { path: path.into(), frame, interp, matte, crop, preview: None, raster: 0, hw: false };
         match footage.kind {
             FootageKind::Sequence if !footage.sequence.is_empty() => {
                 let i = Self::frame_index(footage.frame_rate, t, footage.sequence_frames(), footage.loop_count);
@@ -890,14 +935,16 @@ impl Inner {
         }
     }
 
+    #[cfg(test)]
     fn frame_at(self: &Arc<Self>, footage: &Footage, t: Tick, playback: bool) -> Result<Arc<Image>> {
-        Ok(self.pixels_at(footage, t, playback, None)?.image())
+        Ok(self.pixels_at(footage, t, playback, None, false)?.image())
     }
 
     /// Where the frame of `footage` at `t` comes from, resampled for `preview` when the footage's
-    /// frames are larger than the preview needs.
-    fn locate_for(footage: &Footage, t: Tick, preview: Option<Preview>) -> Loc {
+    /// frames are larger than the preview needs, decoded on a hardware decoder when `hw`.
+    fn locate_for(footage: &Footage, t: Tick, preview: Option<Preview>, hw: bool) -> Loc {
         let mut loc = Self::locate(footage, t);
+        loc.key.hw = hw && loc.media_t.is_some();
         if let Some(p) = preview
             && let Some((w, h)) = preview_size(footage.width, p.w, p.h, p.s)
         {
@@ -908,12 +955,12 @@ impl Inner {
     }
 
     /// The cached (or newly decoded) pixels of `footage` at source time `t` (resampled for
-    /// `preview`).
-    fn pixels_at(self: &Arc<Self>, footage: &Footage, t: Tick, playback: bool, preview: Option<Preview>) -> Result<Pixels> {
+    /// `preview`; on a hardware decoder when `hw`).
+    fn pixels_at(self: &Arc<Self>, footage: &Footage, t: Tick, playback: bool, preview: Option<Preview>, hw: bool) -> Result<Pixels> {
         if !footage.has_video {
             return Err(MediaError::Unsupported(format!("{}: no video", footage.path)));
         }
-        let loc = Self::locate_for(footage, t, preview);
+        let loc = Self::locate_for(footage, t, preview, hw);
         let raw = footage.frame_rate.frame_at(t);
         let mut c = lock(&self.cache);
         // a movie read in order: decode the next frames ahead
@@ -1070,7 +1117,7 @@ impl Inner {
             self.done.notify_all();
             return false;
         }
-        let (footage, preview) = (a.footage.clone(), a.preview);
+        let (footage, preview, hw) = (a.footage.clone(), a.preview, a.stream.hw);
         let batch = ahead_batch(&footage.codec);
         let rate = footage.frame_rate;
         // (frame index, where it comes from) of the frames this step decodes
@@ -1083,7 +1130,7 @@ impl Inner {
             let raw = a.next;
             a.next = a.next.saturating_add(1);
             let t = rate.tick_of(raw) + Tick(rate.frame_duration().0 / 2);
-            let loc = Self::locate_for(&footage, t, preview);
+            let loc = Self::locate_for(&footage, t, preview, hw);
             if c.lru.map.contains_key(&loc.key) || c.inflight.contains_key(&loc.key) || todo.iter().any(|(_, l)| l.key == loc.key) {
                 continue;
             }
@@ -1155,7 +1202,7 @@ impl Inner {
                 // quarter-pixel 4:2:0 conversion differs where colours clip).
                 None => match base.media_t.filter(|_| !gif_anim::is_gif(footage)) {
                     Some(mt) => {
-                        let frame = self.video_frame(&base.key.path, mt, detached)?;
+                        let frame = self.video_frame(&base.key.path, base.key.hw, mt, detached)?;
                         Pixels::Packed(Arc::new(Packed::Video { frame, op: AlphaOp::of(footage) }))
                     }
                     None => self.decode(&base, footage, detached)?,
@@ -1219,18 +1266,23 @@ impl Inner {
                 })
             }
             Some(mt) => {
-                let frame = self.video_frame(path, mt, detached)?;
+                let frame = self.video_frame(path, loc.key.hw, mt, detached)?;
                 Ok(Pixels::Packed(Arc::new(Packed::Video { frame, op })))
             }
         }
     }
 
-    /// The decoded movie frame of `path` at media time `mt`. `detached`: a movie not open already
-    /// is opened for this frame only.
-    fn video_frame(&self, path: &Arc<str>, mt: Tick, detached: bool) -> Result<Arc<filmcraft_frame::VideoFrame>> {
+    /// The decoded movie frame of `path` at media time `mt`, from the source that may decode on
+    /// a hardware decoder (`hw`, previews) or the one that decodes exactly. `detached`: a movie
+    /// not open already is opened for this frame only.
+    fn video_frame(&self, path: &Arc<str>, hw: bool, mt: Tick, detached: bool) -> Result<Arc<filmcraft_frame::VideoFrame>> {
+        // Every decoder FilmCraft creates for this read (the source's first, its spare decoders
+        // for parallel intra frames, a private one for a nested request) is made on this thread
+        // inside this scope: the hardware factory declines outside a preview read.
+        let _hw = crate::hw::scope(hw);
         let src = match detached {
-            false => self.source(path),
-            true => self.open_source(path).or_else(|| {
+            false => self.source(path, hw),
+            true => self.open_source(path, hw).or_else(|| {
                 let mem = lock(&self.files).get(&**path).cloned();
                 crate::open::open_source(path, mem).ok().map(|(s, _)| s)
             }),
@@ -1271,6 +1323,12 @@ impl FootageSource for MediaPool {
     }
     fn cache_budget(&self) -> Option<usize> {
         Some(self.budget())
+    }
+    fn set_hardware_decoding(&self, on: bool) {
+        MediaPool::set_hardware_decoding(self, on);
+    }
+    fn exact(&self) -> Option<&dyn FootageSource> {
+        self.twin.as_deref().map(|t| t as &dyn FootageSource)
     }
     fn frame(&self, _item: ItemId, footage: &Footage, t: Tick) -> Option<Arc<Image>> {
         self.pixels(footage, t, None).map(|px| px.image())
@@ -1350,7 +1408,7 @@ impl MediaPool {
         if footage.missing {
             return None;
         }
-        match Inner::pixels_at(&self.inner, footage, t, true, preview) {
+        match Inner::pixels_at(&self.inner, footage, t, true, preview, self.hw_for(footage)) {
             Ok(px) => Some(px),
             Err(e) => {
                 log::warn!("media: frame of {} at {:?}: {e}", footage.path, t);
@@ -1452,14 +1510,15 @@ mod tests {
             assert!(pool.audio_samples(f, Tick::ZERO, 16, 48_000).iter().all(|v| (*v - 0.25).abs() < 1e-3));
         }
         assert_eq!(pool.open_files(), MAX_SOURCES);
-        assert!(lock(&pool.inner.sources).map.contains_key(files[MAX_SOURCES + 5].path.as_str()), "the newest stays open");
-        assert!(!lock(&pool.inner.sources).map.contains_key(files[0].path.as_str()), "the oldest was closed");
+        let key = |i: usize| (Arc::<str>::from(files[i].path.as_str()), false);
+        assert!(lock(&pool.inner.sources).map.contains_key(&key(MAX_SOURCES + 5)), "the newest stays open");
+        assert!(!lock(&pool.inner.sources).map.contains_key(&key(0)), "the oldest was closed");
         // Reopened on demand.
         assert!(pool.audio_samples(&files[0], Tick::ZERO, 16, 48_000).iter().all(|v| (*v - 0.25).abs() < 1e-3));
         pool.retain_files(&|p| p == files[1].path || p == files[2].path || p == files[0].path);
         assert!(pool.open_files() <= 3);
         // A source in use isn't closed by a purge.
-        let busy = pool.inner.source(&Arc::from(files[0].path.as_str()));
+        let busy = pool.inner.source(&Arc::from(files[0].path.as_str()), false);
         FootageSource::purge(&pool);
         assert_eq!(pool.open_files(), 1);
         drop(busy);
@@ -1668,7 +1727,7 @@ mod tests {
     fn lru_respects_budget() {
         let mut c = Lru::default();
         let img = || Pixels::Float(Arc::new(Image::new(16, 16))); // 4 KiB + overhead
-        let k = |i| Key { path: "a".into(), frame: i, interp: 0, matte: [0; 3], crop: None, preview: None, raster: 0 };
+        let k = |i| Key { path: "a".into(), frame: i, interp: 0, matte: [0; 3], crop: None, preview: None, raster: 0, hw: false };
         let budget = 3 * (4096 + 64);
         for i in 0..10 {
             c.insert(k(i), img(), budget);
