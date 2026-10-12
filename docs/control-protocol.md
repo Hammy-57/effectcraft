@@ -15,10 +15,25 @@ window's status bar and on stderr: give each app its own port, and point its MCP
 - **Transport:** TCP on `127.0.0.1` only, one JSON object per line in each direction. Connections are
   persistent; requests on one connection are answered in order.
 - **Request:** `{"id": 1, "method": "engine.execute", "params": {...}}` (`id` is echoed back, `params`
-  defaults to `{}`). An optional top-level `"requestId": "<unique string>"` makes retries safe: a
-  request whose `requestId` was already seen (on any connection, last 128 ids) gets the first reply
-  again and doesn't run twice; while the first is still running the retry gets an error saying so.
-  Replies larger than 256 KiB (frames, inspections) aren't kept, so such a retry runs again.
+  defaults to `{}`). An optional top-level `"requestId": "<unique string>"` identifies a retry.
+  String ids must contain 1–256 UTF-8 bytes (numeric ids are also accepted). While its id remains
+  in the server's in-memory cache (128 entries shared across connections), a repeated request
+  gets its first reply without running again. Running entries are never evicted; a cache full of
+  running requests rejects a new id with `notRun: true`. Completed entries, including the receipts
+  below, can age out as new requests arrive. This is finite, process-local replay protection;
+  it does not guarantee exactly-once execution after cache eviction or an app restart.
+  Replies larger than 256 KiB leave a bounded receipt instead of their payload. Retrying returns
+  `ok: false, replyUnavailable: true`, the `requestId`, `originalOk`, `resultOk`, `outcome` and
+  bounded `originalError` details. `completed: true` means the original control reply reported
+  completion, `completed: false` records a script still waiting in a modal dialog, and
+  `completed: null` means an error reply did not prove execution had finished. The receipt tells the caller to inspect the project or saved output; it never reruns the request.
+- **Bridge reconnects:** each TCP connection reads `app.capabilities` first to learn the host's
+  `processInstance` and `sessionId`. A bridge that lost a reply resends the same `requestId` at
+  most once, and only to the same known process/session. It refuses to replay an uncertain write
+  if either identity changed or the host does not expose identity. Older hosts can still receive
+  fresh calls; harmless inspection reads may be retried when identity is unavailable. Timeouts,
+  malformed replies and mismatched reply ids are not automatically retried. Inspect the project
+  before making a new mutation after an uncertain failure.
 - **Reply:** `{"id": 1, "ok": true, "result": ...}` or `{"id": 1, "ok": false, "error": "message"}`.
 - Requests run on the UI thread between frames. Input methods (`ui.click`, `ui.key` and similar)
   reply after the synthetic input has been processed. Methods that need an element that isn't drawn
