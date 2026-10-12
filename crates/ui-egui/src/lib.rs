@@ -1448,7 +1448,9 @@ impl EffectcraftApp {
         // frames in flight, as it drops queued frames the preview no longer reaches.
         let playhead = plan.filter(|p| p.video).map(|p| frames::Playhead { series, cur, start: p.start, end: p.end, step: p.step, looping: p.looping });
         self.frames.set_playhead(playhead);
-        let mut queued = self.frames.inflight();
+        // Playing, only this series counts: a ladder rung change leaves the old rung's prefetch
+        // queued, which held playback at every Full ↔ Half switch (A4).
+        let mut queued = if playhead.is_some() { self.frames.focus_series(&series) } else { self.frames.inflight() };
         // In-flight renders far ahead may finish after the near frames. Keep their completion
         // from evicting the very frames playback needs next (#595).
         self.frames.protect_frames(
@@ -2620,6 +2622,35 @@ mod playback_budget_tests {
             assert_eq!(app.viewer_scale(1.0, 1.0), 1.0);
         }
     }
+    /// A4: after a ladder rung change the old rung's queued prefetch no longer counts as the
+    /// new rung's frames in flight (it held playback at every Full ↔ Half switch): it is dropped.
+    #[test]
+    fn a_rung_change_drops_the_old_rungs_queued_prefetch() {
+        /// Starts nothing, so every request stays queued.
+        struct Idle;
+        impl frames::RemoteFrames for Idle {
+            fn slots(&self) -> usize {
+                0
+            }
+            fn start(&self, _: frames::RemoteJob, _: frames::RemoteDone) {}
+        }
+        let mut app = app();
+        app.frames.set_remote(Some(Arc::new(Idle)));
+        let comp = app.session.active_comp_id().unwrap();
+        let (full, half) = (app.frame_series(comp, 1.0), app.frame_series(comp, 0.5));
+        let src = app.render_source();
+        for frame in 0..8 {
+            app.frames.request(&src, FrameKey { frame, ..full }, comp, Tick::ZERO, RenderOpts::default());
+        }
+        app.frames.request_urgent(&src, FrameKey { frame: 9, ..full }, comp, Tick::ZERO, RenderOpts::default());
+        assert_eq!(app.frames.inflight(), 9);
+        assert_eq!(app.frames.focus_series(&half), 0, "the old rung's frames are not the new rung's");
+        assert_eq!(app.frames.inflight(), 1, "its queued prefetch is gone; the viewer's frame stays");
+        app.frames.request(&src, FrameKey { frame: 0, ..half }, comp, Tick::ZERO, RenderOpts::default());
+        assert_eq!(app.frames.focus_series(&half), 1);
+        assert_eq!(app.frames.focus_series(&full), 1, "the urgent frame counts for its own series");
+    }
+
     #[test]
     fn playback_budget_ignores_precache_bad_rates_and_respects_frame_skip() {
         let mut app = app();
