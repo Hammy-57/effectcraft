@@ -60,7 +60,21 @@ fn at(e: &mut Enc, dst: &GpuImage, [x0, y0, x1, y1]: Bounds, entry: &str) -> Opt
     if w == 0 || h == 0 || area.saturating_mul(2) >= canvas || x1 > dst.width || y1 > dst.height || !e.owns(dst) || !e.has_kernel(entry) {
         return None;
     }
-    Some((e.crop(dst, x0, y0, w, h), (w.div_ceil(16), h.div_ceil(16))))
+    // The copy goes into a texture rounded up to a size bucket: layer bounds change size from
+    // frame to frame, and the pool only reuses a texture of the very same size. The `*_at`
+    // kernels read only its top-left w × h.
+    let under = e.scratch(size_bucket(w, dst.width), size_bucket(h, dst.height));
+    e.copy_region(dst, &under, x0, y0, w, h);
+    Some((under, (w.div_ceil(16), h.div_ceil(16))))
+}
+
+/// `n` rounded up to 64 or more, then to the next 2^k or 1.5 · 2^k (at most `cap`, the canvas
+/// side, unless `n` is larger).
+fn size_bucket(n: u32, cap: u32) -> u32 {
+    let n64 = n.max(64);
+    let p = n64.checked_next_power_of_two().unwrap_or(n64);
+    let b = if p / 4 * 3 >= n64 { p / 4 * 3 } else { p };
+    b.min(cap).max(n)
 }
 
 fn rows(m: &Mat3) -> [[f32; 4]; 3] {
