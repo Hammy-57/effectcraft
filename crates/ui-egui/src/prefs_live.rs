@@ -125,6 +125,9 @@ fn memory_watch(app: &mut EffectcraftApp, ctx: &egui::Context) {
     // The first frame only records the time: tests and short runs don't query the system.
     if last.is_some() {
         app.session.memory_tick();
+        if let (Some(g), Some(m)) = (&app.gpu, app.session.sys_memory) {
+            g.context().set_system_memory(m.total);
+        }
     }
 }
 

@@ -20,6 +20,8 @@ pub(super) fn run(s: &Session, args: &Args) -> Result<(), Failure> {
     }
     let init_start = std::time::Instant::now();
     let gpu = effectcraft_gpu::Gpu::try_headless().map_err(Failure::Error)?;
+    // As the app: unified memory sizes its texture pool by RAM.
+    gpu.context().set_system_memory(effectcraft_engine::sysinfo::memory().map_or(0, |m| m.total));
     let initialization_ms = init_start.elapsed().as_secs_f64() * 1000.0;
     let warmup_start = std::time::Instant::now();
     let warmup = args.flag("--rt-warmup");

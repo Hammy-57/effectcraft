@@ -873,6 +873,11 @@ impl EffectcraftApp {
                 match gpu_startup::Pending::start(
                     move || {
                         let gpu = compositor_gpu(&adapter, device, queue)?;
+                        // Unified memory sizes its texture pool by RAM (RT9a). Off the UI thread;
+                        // not on Windows, where reading it starts PowerShell (the memory watch
+                        // passes it on there).
+                        #[cfg(not(target_os = "windows"))]
+                        gpu.context().set_system_memory(effectcraft_engine::sysinfo::memory().map_or(0, |m| m.total));
                         gpu.warm_pipelines()?;
                         if let Some(comp) = comp {
                             log::debug!("GPU startup project warmup: {:?}", gpu.warm_project(&project, comp, time));
