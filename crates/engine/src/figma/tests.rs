@@ -273,6 +273,30 @@ fn token_is_never_journaled_and_status_reports_source() {
 }
 
 #[test]
+fn secrets_are_written_readable_only_by_the_user() {
+    let dir = std::env::temp_dir().join(format!("ec-figma-private-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("figma-token");
+    super::write_private(&path, b"figd_one").unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "figd_one");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        // An existing file with wider permissions is narrowed.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    super::write_private(&path, b"two").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "two");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn hostile_payloads_are_errors_not_crashes() {
     let mut s = session_with_comp();
     for bad in [json!(null), json!("x"), json!({"nodes": "x"}), json!({"nodes": []}), json!({"nodes": {"1:2": null}}), json!({})] {

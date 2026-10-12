@@ -70,7 +70,13 @@ fn port(env: Option<String>) -> u16 {
 /// `effectcraft-cli figma-bridge`) is reported and skipped.
 pub fn start(tx: Sender<ControlRequest>, ctx: egui::Context) {
     let port = port(std::env::var("EFFECTCRAFT_FIGMA_BRIDGE_PORT").ok());
-    let code = figma_bridge::pairing_code(effectcraft_host::config_dir().as_deref(), None);
+    let code = match figma_bridge::pairing_code(effectcraft_host::config_dir().as_deref(), None) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("effectcraft: Figma bridge not started: {e}");
+            return;
+        }
+    };
     match figma_bridge::spawn(Arc::new(AppHost { tx, ctx }), code, port) {
         Ok(p) => eprintln!("effectcraft: Figma bridge listening on 127.0.0.1:{p}"),
         Err(e) => eprintln!("effectcraft: Figma bridge not started: {e}"),

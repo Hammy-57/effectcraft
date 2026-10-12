@@ -1192,6 +1192,7 @@ dependencies = [
  "effectcraft-engine",
  "effectcraft-host",
  "effectcraft-script",
+ "getrandom 0.3.4",
  "image",
  "serde_json",
  "thiserror 2.0.21",

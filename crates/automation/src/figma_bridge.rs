@@ -18,8 +18,11 @@
 //! DNS rebinding); browsers may call it only from the plug-in iframe (origin `null`) or figma.com;
 //! and every import needs the pairing code. The code is handed out by `/pair` only after the
 //! person allows it in EffectCraft (one prompt at a time, with a cool-down after Deny), or is
-//! read from the settings folder / printed by the CLI. The code is kept in the settings folder,
-//! readable only by the user, so it survives restarts and both hosts share it.
+//! read from the settings folder / printed by the CLI. Origin `null` is any sandboxed iframe, not
+//! only the plug-in, so the code is the real protection: 12 characters from the OS's CSPRNG (60
+//! bits), and after 5 wrong codes in a row the bridge refuses codes for a minute (429). Request
+//! bodies are capped at 64 MB. The code is kept in the settings folder, created readable only by
+//! the user, so it survives restarts and both hosts share it.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -33,8 +36,13 @@ use serde_json::{Value, json};
 /// The port the plug-in's manifest allows.
 pub const DEFAULT_PORT: u16 = 7789;
 const MAX_HEAD: usize = 32 * 1024;
-const MAX_BODY: usize = 512 * 1024 * 1024;
+/// The largest import the bridge accepts. Big selections with many embedded images (PDF + PNG,
+/// base64) can reach tens of megabytes; send those in parts (integrations/figma/README.md).
+pub const MAX_BODY: usize = 64 * 1024 * 1024;
 const MAX_CONNECTIONS: usize = 8;
+/// After this many wrong pairing codes in a row, the bridge refuses codes for [`LOCKOUT`].
+const MAX_WRONG_CODES: u32 = 5;
+const LOCKOUT: Duration = Duration::from_secs(60);
 /// The pairing code's file in the settings folder.
 pub const CODE_FILE: &str = "figma-bridge-code";
 /// After a Deny, further pairing requests are refused for this long.
@@ -63,49 +71,62 @@ pub trait FigmaHost: Send + Sync + 'static {
     fn pair(&self, client: &str) -> Pairing;
 }
 
-/// A pairing code: 12 characters from an unambiguous alphabet, seeded by the OS (through
-/// `RandomState`).
-pub fn new_code() -> String {
-    use std::hash::{BuildHasher, Hasher};
-    const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-    let mut out = String::new();
-    for i in 0..12u64 {
-        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-        h.write_u64(i);
-        h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
-        let n = usize::try_from(h.finish() % ALPHABET.len() as u64).unwrap_or(0);
-        out.push(ALPHABET.get(n).copied().map(char::from).unwrap_or('A'));
+/// The pairing code's alphabet: no 0/O, 1/I.
+pub const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+/// The pairing code's length: 12 characters of 5 bits, 60 bits.
+pub const CODE_LEN: usize = 12;
+
+/// A pairing code: [`CODE_LEN`] characters from [`CODE_ALPHABET`], drawn from the OS's
+/// cryptographic random number generator (rejection sampling, so every character is equally
+/// likely). Errors only when the OS has no random source.
+pub fn new_code() -> Result<String, String> {
+    let n = CODE_ALPHABET.len();
+    // The largest multiple of the alphabet size that fits in a byte: bytes at or above it are
+    // dropped (with 32 letters none are, but the code stays right if the alphabet changes).
+    let limit = 256 - 256 % n;
+    let mut out = String::with_capacity(CODE_LEN);
+    let mut buf = [0u8; 32];
+    for _ in 0..64 {
+        getrandom::fill(&mut buf).map_err(|e| format!("no secure random source for the pairing code ({e})"))?;
+        for b in buf {
+            if out.len() == CODE_LEN {
+                return Ok(out);
+            }
+            if usize::from(b) < limit
+                && let Some(c) = CODE_ALPHABET.get(usize::from(b) % n)
+            {
+                out.push(char::from(*c));
+            }
+        }
     }
-    out
+    if out.len() == CODE_LEN { Ok(out) } else { Err("the random source kept failing".into()) }
 }
 
 /// `explicit`, else the code stored in `dir`, else a new one (stored in `dir` when there is one,
-/// readable only by the user).
-pub fn pairing_code(dir: Option<&Path>, explicit: Option<&str>) -> String {
+/// readable only by the user: created with mode 0600 on unix).
+pub fn pairing_code(dir: Option<&Path>, explicit: Option<&str>) -> Result<String, String> {
     if let Some(c) = explicit.map(str::trim).filter(|c| !c.is_empty()) {
-        return c.to_string();
+        if c.len() < 8 {
+            return Err("the pairing code needs at least 8 characters".into());
+        }
+        return Ok(c.to_string());
     }
     let path = dir.map(|d| d.join(CODE_FILE));
     if let Some(p) = &path
         && let Ok(c) = std::fs::read_to_string(p)
         && c.trim().len() >= 8
     {
-        return c.trim().to_string();
+        return Ok(c.trim().to_string());
     }
-    let code = new_code();
+    let code = new_code()?;
     if let Some(p) = &path {
         if let Some(d) = p.parent() {
             let _ = std::fs::create_dir_all(d);
         }
-        if std::fs::write(p, &code).is_ok() {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600));
-            }
-        }
+        // Not stored: the code still works until the host quits.
+        let _ = effectcraft_engine::figma::write_private(p, code.as_bytes());
     }
-    code
+    Ok(code)
 }
 
 struct Request {
@@ -120,6 +141,8 @@ impl Request {
         self.headers.iter().find(|(h, _)| h.eq_ignore_ascii_case(k)).map(|(_, v)| v.as_str())
     }
 }
+
+const TOO_LARGE: &str = "payload too large";
 
 fn read_request(stream: impl Read) -> Result<Request, String> {
     let mut r = BufReader::new(stream);
@@ -147,7 +170,7 @@ fn read_request(stream: impl Read) -> Result<Request, String> {
     let headers: Vec<(String, String)> = lines.filter_map(|l| l.split_once(':')).map(|(k, v)| (k.trim().to_string(), v.trim().to_string())).collect();
     let len: usize = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("content-length")).and_then(|(_, v)| v.parse().ok()).unwrap_or(0);
     if len > MAX_BODY {
-        return Err("payload too large".into());
+        return Err(format!("{TOO_LARGE} (the bridge takes up to {} MB; send fewer layers at once)", MAX_BODY >> 20));
     }
     let mut body = Vec::new();
     r.take(len as u64).read_to_end(&mut body).map_err(|e| e.to_string())?;
@@ -202,6 +225,25 @@ struct Gate {
     denied_at: Option<Instant>,
 }
 
+/// Wrong pairing codes: after [`MAX_WRONG_CODES`] in a row, codes are refused for a while (any
+/// sandboxed page can reach the bridge with origin `null`, so the code must not be guessable).
+#[derive(Default)]
+struct Guesses {
+    wrong: u32,
+    locked_until: Option<Instant>,
+}
+
+/// What a request's `X-EffectCraft-Code` says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Auth {
+    /// No code (or an empty one).
+    None,
+    Paired,
+    Wrong,
+    /// Too many wrong codes: not checked.
+    Locked,
+}
+
 /// One bridge: a host, its pairing code and port.
 pub struct Bridge {
     host: Arc<dyn FigmaHost>,
@@ -210,6 +252,8 @@ pub struct Bridge {
     /// One transfer at a time.
     lock: Mutex<()>,
     gate: Mutex<Gate>,
+    guesses: Mutex<Guesses>,
+    lockout: Duration,
 }
 
 /// A reply: HTTP status and JSON body.
@@ -217,27 +261,53 @@ type Reply = (&'static str, Value);
 
 impl Bridge {
     pub fn new(host: Arc<dyn FigmaHost>, code: String, port: u16) -> Self {
-        Self { host, code, port, lock: Mutex::new(()), gate: Mutex::new(Gate::default()) }
+        Self { host, code, port, lock: Mutex::new(()), gate: Mutex::new(Gate::default()), guesses: Mutex::new(Guesses::default()), lockout: LOCKOUT }
     }
 
-    fn paired(&self, req: &Request) -> bool {
-        req.header("x-effectcraft-code").is_some_and(|c| same_code(c.trim(), &self.code))
+    /// Check the request's pairing code, counting wrong ones: the [`MAX_WRONG_CODES`]th wrong
+    /// code in a row locks codes out for `lockout`; a right one resets the count.
+    fn auth(&self, req: &Request) -> Auth {
+        let Some(c) = req.header("x-effectcraft-code").map(str::trim).filter(|c| !c.is_empty()) else {
+            return Auth::None;
+        };
+        let mut g = self.guesses.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(t) = g.locked_until {
+            if Instant::now() < t {
+                return Auth::Locked;
+            }
+            *g = Guesses::default();
+        }
+        if same_code(c, &self.code) {
+            g.wrong = 0;
+            return Auth::Paired;
+        }
+        g.wrong = g.wrong.saturating_add(1);
+        if g.wrong >= MAX_WRONG_CODES {
+            g.locked_until = Instant::now().checked_add(self.lockout);
+        }
+        Auth::Wrong
     }
 
-    fn status(&self, req: &Request) -> Value {
+    fn locked() -> Reply {
+        ("429 Too Many Requests", json!({"ok": false, "error": "too many wrong pairing codes; try again in a minute"}))
+    }
+
+    fn status(&self, auth: Auth) -> Value {
         json!({
             "ok": true,
             "bridge": env!("CARGO_PKG_VERSION"),
             "host": self.host.name(),
             "pairing": self.host.name() == "app",
-            "paired": self.paired(req),
+            "paired": auth == Auth::Paired,
             "effectcraft": self.host.status(),
         })
     }
 
-    fn pair(&self, req: &Request) -> Reply {
-        if self.paired(req) {
-            return ("200 OK", json!({"ok": true, "code": self.code}));
+    fn pair(&self, req: &Request, auth: Auth) -> Reply {
+        match auth {
+            Auth::Paired => return ("200 OK", json!({"ok": true, "code": self.code})),
+            Auth::Locked => return Self::locked(),
+            Auth::None | Auth::Wrong => {}
         }
         let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
         let client: String = body
@@ -278,9 +348,13 @@ impl Bridge {
         }
     }
 
-    fn import(&self, req: &Request) -> Reply {
-        if !self.paired(req) {
-            return ("401 Unauthorized", json!({"ok": false, "error": "not paired with EffectCraft (wrong or missing pairing code)"}));
+    fn import(&self, req: &Request, auth: Auth) -> Reply {
+        match auth {
+            Auth::Paired => {}
+            Auth::Locked => return Self::locked(),
+            Auth::None | Auth::Wrong => {
+                return ("401 Unauthorized", json!({"ok": false, "error": "not paired with EffectCraft (wrong or missing pairing code)"}));
+            }
         }
         if !req.header("content-type").is_some_and(|c| c.starts_with("application/json") || c.starts_with("text/plain")) {
             return ("415 Unsupported Media Type", json!({"ok": false, "error": "send JSON"}));
@@ -316,9 +390,9 @@ impl Bridge {
         let path = req.path.split('?').next().unwrap_or("");
         match (req.method.as_str(), path) {
             ("OPTIONS", _) => ("204 No Content", json!({})),
-            ("GET", "/status") => ("200 OK", self.status(req)),
-            ("POST", "/pair") => self.pair(req),
-            ("POST", "/import") => self.import(req),
+            ("GET", "/status") => ("200 OK", self.status(self.auth(req))),
+            ("POST", "/pair") => self.pair(req, self.auth(req)),
+            ("POST", "/import") => self.import(req, self.auth(req)),
             _ => ("404 Not Found", json!({"ok": false, "error": "GET /status, POST /pair or POST /import"})),
         }
     }
@@ -328,7 +402,8 @@ impl Bridge {
         let req = match stream.try_clone().map_err(|e| e.to_string()).and_then(read_request) {
             Ok(r) => r,
             Err(e) => {
-                respond(&stream, "400 Bad Request", None, &json!({"ok": false, "error": e}));
+                let status = if e.starts_with(TOO_LARGE) { "413 Payload Too Large" } else { "400 Bad Request" };
+                respond(&stream, status, None, &json!({"ok": false, "error": e}));
                 return;
             }
         };
@@ -471,9 +546,71 @@ mod tests {
         assert!(host_ok(None, 7789) && host_ok(Some("127.0.0.1:7789"), 7789) && host_ok(Some("localhost:7789"), 7789) && host_ok(Some("[::1]:7789"), 7789));
         assert!(!host_ok(Some("evil.example:7789"), 7789) && !host_ok(Some("127.0.0.1:9877"), 7789) && !host_ok(Some("localhost"), 7789));
         assert!(same_code("ABC", "ABC") && !same_code("ABC", "ABD") && !same_code("AB", "ABC"));
-        let c = new_code();
+        let c = new_code().unwrap();
         assert_eq!(c.len(), 12);
-        assert_ne!(c, new_code());
+        assert_ne!(c, new_code().unwrap());
+    }
+
+    #[test]
+    fn codes_use_the_whole_alphabet_and_nothing_else() {
+        let mut seen = [0usize; 256];
+        for _ in 0..400 {
+            let c = new_code().unwrap();
+            assert_eq!(c.len(), CODE_LEN);
+            for b in c.bytes() {
+                assert!(CODE_ALPHABET.contains(&b), "{c}");
+                seen[usize::from(b)] += 1;
+            }
+        }
+        // 4,800 draws over 32 letters: about 150 each; a biased or stuck generator shows.
+        for &a in CODE_ALPHABET {
+            let n = seen[usize::from(a)];
+            assert!((60..300).contains(&n), "{} drawn {n} times", char::from(a));
+        }
+    }
+
+    #[test]
+    fn wrong_codes_lock_out_then_recover() {
+        let (mut b, fake) = bridge(Pairing::Allowed);
+        b.lockout = Duration::from_millis(300);
+        let body = r#"{"payload":{"nodes":[]}}"#;
+        let import = |b: &Bridge, code: &str| b.route(&req("POST", "/import", &[PLUGIN, HOST, JSON, ("X-EffectCraft-Code", code)], body)).0;
+        // A right code resets the count.
+        for _ in 0..4 {
+            assert!(import(&b, "WRONG1234567").starts_with("401"));
+        }
+        assert!(import(&b, "CODE12345678").starts_with("200"));
+        for _ in 0..4 {
+            assert!(import(&b, "WRONG1234567").starts_with("401"));
+        }
+        // The fifth wrong one in a row locks codes out, even the right one, and /pair too.
+        assert!(import(&b, "WRONG1234567").starts_with("401"));
+        assert!(import(&b, "CODE12345678").starts_with("429"));
+        assert!(import(&b, "WRONG1234567").starts_with("429"));
+        let (st, r) = b.route(&req("POST", "/pair", &[PLUGIN, HOST, ("X-EffectCraft-Code", "CODE12345678")], ""));
+        assert!(st.starts_with("429") && r.get("code").is_none(), "{st} {r}");
+        let (_, r) = b.route(&req("GET", "/status", &[PLUGIN, HOST, ("X-EffectCraft-Code", "CODE12345678")], ""));
+        assert_eq!(r["paired"], false);
+        assert_eq!(fake.imported.lock().unwrap().len(), 1);
+        assert_eq!(fake.asked.load(Ordering::SeqCst), 0);
+        std::thread::sleep(Duration::from_millis(350));
+        assert!(import(&b, "CODE12345678").starts_with("200"));
+        // No code at all isn't a guess.
+        for _ in 0..10 {
+            let (st, _) = b.route(&req("GET", "/status", &[PLUGIN, HOST], ""));
+            assert!(st.starts_with("200"));
+        }
+        assert!(import(&b, "CODE12345678").starts_with("200"));
+    }
+
+    #[test]
+    fn oversized_bodies_are_refused_before_reading() {
+        let head = format!("POST /import HTTP/1.1\r\nHost: 127.0.0.1:7789\r\nContent-Length: {}\r\n\r\n{{}}", MAX_BODY + 1);
+        let e = read_request(head.as_bytes()).err().unwrap();
+        assert!(e.starts_with(TOO_LARGE), "{e}");
+        let ok = "POST /import HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}";
+        assert_eq!(read_request(ok.as_bytes()).unwrap().body, b"{}");
+        const { assert!(MAX_BODY <= 64 * 1024 * 1024) };
     }
 
     #[test]
@@ -547,10 +684,16 @@ mod tests {
 
     #[test]
     fn pairing_code_is_stored_and_reused() {
-        let dir = std::env::temp_dir().join(format!("ec-figma-code-{}", new_code()));
-        let a = pairing_code(Some(&dir), None);
-        assert_eq!(pairing_code(Some(&dir), None), a);
-        assert_eq!(pairing_code(Some(&dir), Some(" MINE ")), "MINE");
+        let dir = std::env::temp_dir().join(format!("ec-figma-code-{}", new_code().unwrap()));
+        let a = pairing_code(Some(&dir), None).unwrap();
+        assert_eq!(pairing_code(Some(&dir), None).unwrap(), a);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(std::fs::metadata(dir.join(CODE_FILE)).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        assert_eq!(pairing_code(Some(&dir), Some(" MINE-CODE ")).unwrap(), "MINE-CODE");
+        assert!(pairing_code(Some(&dir), Some("SHORT")).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

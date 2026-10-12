@@ -19,7 +19,7 @@ pub fn serve(cfg: Config) -> Result<(), String> {
     let listener = figma_bridge::bind(cfg.port)?;
     // Validate the control address up front (loopback only).
     BridgeClient::new(&cfg.control).map_err(|e| e.to_string())?;
-    let code = figma_bridge::pairing_code(effectcraft_host::config_dir().as_deref(), cfg.code.as_deref());
+    let code = figma_bridge::pairing_code(effectcraft_host::config_dir().as_deref(), cfg.code.as_deref())?;
     eprintln!("EffectCraft Figma bridge on http://127.0.0.1:{} → EffectCraft control channel {}", cfg.port, cfg.control);
     eprintln!("Pairing code (paste it into the Figma plug-in once): {code}");
     let bridge = Arc::new(Bridge::new(Arc::new(ControlHost { control: cfg.control }), code, cfg.port));

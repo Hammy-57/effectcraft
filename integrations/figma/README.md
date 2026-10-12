@@ -71,7 +71,11 @@ why, and notes about anything approximated.
 The bridge listens on 127.0.0.1 only, accepts browser requests only from the plug-in (origin
 `null`) or figma.com on the loopback host name, and imports only with the pairing code, which it
 hands out only after you click Allow (one prompt at a time; after Deny it waits a few seconds).
-The code is stored in the EffectCraft settings folder (`figma-bridge-code`).
+Any sandboxed page shares the plug-in's `null` origin, so the code is the real protection: it is
+12 characters from the operating system's secure random generator, and after 5 wrong codes in a
+row the bridge refuses codes for a minute. The code is stored in the EffectCraft settings folder
+(`figma-bridge-code`, created readable only by you). One transfer can be up to 64 MB (embedded
+image renders count); send a very large selection in several parts.
 
 **Without the app's bridge** (the setting off, or a headless setup), run
 `effectcraft-cli figma-bridge` (`--port 7789`, `--control 9877`, `--code CODE`): it forwards to the

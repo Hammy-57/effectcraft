@@ -108,6 +108,22 @@ fn check_token(t: &str) -> Result<&str, String> {
     Ok(t)
 }
 
+/// curl's options for a GET of `url` (they go before `-o FILE -K - URL`). HTTPS only, except
+/// plain HTTP to a loopback test server. A request that carries the token never follows
+/// redirects: curl would send the `X-Figma-Token` header on to the redirect target, and Figma's
+/// API doesn't redirect. Token-less downloads (pre-signed image links) follow redirects, over
+/// HTTPS only.
+fn curl_args(url: &str, with_token: bool, max_bytes: u64) -> Vec<String> {
+    let proto = if loopback(url) { "=https,http" } else { "=https" };
+    let mut a: Vec<String> = vec!["-sS".into(), "--proto".into(), proto.into()];
+    if !with_token {
+        a.extend(["-L".into(), "--max-redirs".into(), "5".into(), "--proto-redir".into(), proto.into()]);
+    }
+    a.extend(["--connect-timeout".into(), "15".into(), "--max-time".into(), "120".into(), "--max-filesize".into(), max_bytes.to_string()]);
+    a.extend(["-w".into(), "%{http_code}".into()]);
+    a
+}
+
 /// GET `url` with curl; `token` goes in an `X-Figma-Token` header via stdin. Returns the body
 /// of a 2xx reply, else an error with Figma's message.
 fn curl(url: &str, token: Option<&str>, max_bytes: u64) -> Result<Vec<u8>, String> {
@@ -117,9 +133,8 @@ fn curl(url: &str, token: Option<&str>, max_bytes: u64) -> Result<Vec<u8>, Strin
         web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
     ));
     let mut cmd = Command::new("curl");
-    cmd.args(["-sS", "-L", "--proto", "=https,http", "--connect-timeout", "15", "--max-time", "120", "--max-filesize"])
-        .arg(max_bytes.to_string())
-        .args(["-w", "%{http_code}", "-o"])
+    cmd.args(curl_args(url, token.is_some(), max_bytes))
+        .arg("-o")
         .arg(&tmp)
         .args(["-K", "-"])
         .arg(url)
@@ -220,4 +235,24 @@ pub fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_requests_never_follow_redirects() {
+        let a = curl_args("https://api.figma.com/v1/files/KEY/nodes?ids=1%3A2", true, 1 << 20);
+        assert!(!a.iter().any(|x| x == "-L" || x == "--location" || x == "--location-trusted"), "{a:?}");
+        assert!(a.windows(2).any(|w| w[0] == "--proto" && w[1] == "=https"), "{a:?}");
+        // The token-less image download may follow redirects, HTTPS only.
+        let a = curl_args("https://s3-alpha.figma.com/img/x.png", false, 1 << 20);
+        assert!(a.iter().any(|x| x == "-L"), "{a:?}");
+        assert!(a.windows(2).any(|w| w[0] == "--proto-redir" && w[1] == "=https"), "{a:?}");
+        // Plain HTTP only for a loopback test server.
+        let a = curl_args("http://127.0.0.1:8080/v1/images/KEY", true, 1 << 20);
+        assert!(a.windows(2).any(|w| w[0] == "--proto" && w[1] == "=https,http"), "{a:?}");
+        assert!(!a.iter().any(|x| x == "-L"), "{a:?}");
+    }
 }
