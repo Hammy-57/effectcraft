@@ -35,5 +35,6 @@ thiserror = { workspace = true }
 log = { workspace = true }
 rayon = { workspace = true }
 image = { workspace = true }
+gif = { workspace = true }
 web-time = { workspace = true }
 exr = { workspace = true }

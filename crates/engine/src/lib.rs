@@ -10,6 +10,7 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod audio_analysis;
 pub mod autosave;
 pub mod camera_track;
 pub mod commands;
@@ -20,6 +21,7 @@ pub mod footage_reload;
 pub mod guard;
 pub mod history;
 pub mod jobs;
+pub mod layout;
 pub mod learn;
 pub mod links;
 pub mod logging;
@@ -35,12 +37,15 @@ pub mod preview;
 pub mod psd_import;
 pub mod remote;
 pub mod render_queue;
+pub mod render_view;
+pub mod replay;
 pub mod roto;
 pub mod scriptui;
 pub mod sequence;
 mod session_settings;
 pub mod shortcuts;
 pub mod storage;
+pub mod suggest;
 pub mod sysinfo;
 pub mod templates;
 pub mod tracking;
@@ -75,7 +80,7 @@ pub use render_queue::{ExportJob, ExportResult, Exporter, JobState};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
-    #[error("unknown command `{0}`")]
+    #[error("unknown command `{0}`{hint}", hint = suggest::command_hint(.0))]
     UnknownCommand(String),
     #[error("command `{0}` is not available right now: {1}")]
     Disabled(String, String),
@@ -364,7 +369,16 @@ pub enum Event {
 pub struct Session {
     pub project: Arc<Project>,
     pub history: History,
+    /// Bumped on every change (edits, undo, redo, open). Replies of `project.summary` and
+    /// `editor.state` carry it; an `expectRevision` execute parameter refuses to run on another.
     pub revision: u64,
+    /// Who is executing the current command (an agent's or script's `client` execute parameter;
+    /// `None` = the user). Undo steps remember it, and `edit.undo` with a `client` only undoes
+    /// that client's own last step.
+    pub client: Option<String>,
+    /// The highest `next_id` any state has reached: ids stay unique across undo / redo, so an
+    /// id an agent saw is never handed to a different object later.
+    pub id_floor: u64,
     pub saved_revision: u64,
     /// The project as last opened or saved: the project is unmodified while it is this very
     /// snapshot, so undoing back to the saved state clears the modified mark.
@@ -443,9 +457,14 @@ pub struct Session {
     pub autosave_folder_override: Option<std::path::PathBuf>,
     /// The viewer snapshot (Take Snapshot / Show Snapshot).
     pub snapshot: Option<viewer::Snapshot>,
+    /// Named rendered frames for `render.compare` (`render.snapshot`; bounded, oldest dropped).
+    pub frame_snapshots: commands::render_compare::FrameSnapshots,
     /// The JavaScript scripting engine (set by the host that links `effectcraft-script`):
     /// `script.run`, File ▸ Scripts ▸ Run Script File… (`.jsx`/`.js`) and the Script Console.
     pub script: Option<ScriptRunner>,
+    /// Stops the script that runs next (set by `script.run {timeout}` and by hosts that cancel
+    /// scripts, e.g. MCP `notifications/cancelled`); see [`ScriptInterrupt`].
+    pub script_interrupt: Option<ScriptInterrupt>,
     /// Loads WebAssembly effect plug-ins (set by the host that links `effectcraft-plugin` with
     /// its runtime): `effect.plugins.load`.
     pub plugin_loader: Option<PluginLoader>,
@@ -511,6 +530,37 @@ pub struct ScriptRequest<'a> {
     pub console: bool,
 }
 
+/// Stops a running script from outside: a cancel flag another thread sets and/or a deadline. The
+/// scripting runtime checks it between batches of bytecode and in every object-model call, and
+/// then ends the script with an error that `try`/`catch` can't intercept.
+#[derive(Clone, Debug, Default)]
+pub struct ScriptInterrupt {
+    pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// When the time limit runs out (with the limit in seconds, for the message).
+    pub deadline: Option<(web_time::Instant, f64)>,
+}
+
+impl ScriptInterrupt {
+    /// A time limit of `seconds` from now (`None` for no limit, or a limit that is not a
+    /// positive finite number).
+    pub fn with_limit(mut self, seconds: Option<f64>) -> Self {
+        self.deadline = seconds
+            .filter(|s| s.is_finite() && *s > 0.0)
+            .and_then(|s| Some((web_time::Instant::now().checked_add(std::time::Duration::try_from_secs_f64(s).ok()?)?, s)));
+        self
+    }
+    /// Why the script must stop now, if it must.
+    pub fn stopped(&self) -> Option<String> {
+        if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Some("the script was cancelled".into());
+        }
+        match self.deadline {
+            Some((at, s)) if web_time::Instant::now() >= at => Some(format!("the script ran longer than its time limit ({s} s)")),
+            _ => None,
+        }
+    }
+}
+
 /// Runs a script against the session and reports `{ok, result, output, error: {message, line,
 /// column, file} | null}`.
 pub type ScriptRunner = fn(&mut Session, &ScriptRequest) -> Value;
@@ -527,6 +577,8 @@ impl Default for Session {
             project,
             history: History::default(),
             revision: 0,
+            client: None,
+            id_floor: 0,
             saved_revision: 0,
             path: None,
             state: EditorState { snapping: true, view_layout: 1, ..Default::default() },
@@ -565,7 +617,9 @@ impl Default for Session {
             autosave: autosave::AutoSaveState::default(),
             autosave_folder_override: None,
             snapshot: None,
+            frame_snapshots: Default::default(),
             script: None,
+            script_interrupt: None,
             plugin_loader: None,
             script_ui: scriptui::ScriptUi::default(),
             sys_memory: None,
@@ -595,7 +649,36 @@ impl Session {
     }
 
     /// Run a command by id.
-    pub fn execute(&mut self, id: &str, params: Value) -> Result<Value> {
+    ///
+    /// Two execute parameters apply to every command (and are removed before it runs):
+    /// `expectRevision` (refuse with an error, changing nothing, when the document's
+    /// [`Session::revision`] is another) and `client` (who runs it: the undo step it makes is
+    /// tagged with it, and `edit.undo` only undoes that client's own last step). Nested commands
+    /// (batch steps, scripts) inherit the caller's client.
+    pub fn execute(&mut self, id: &str, mut params: Value) -> Result<Value> {
+        let (expect, client) = match params.as_object_mut() {
+            Some(o) => (o.remove("expectRevision"), o.remove("client")),
+            None => (None, None),
+        };
+        if let Some(e) = expect.filter(|e| !e.is_null()) {
+            let want = e.as_u64().ok_or_else(|| commands::bad(id, format!("`expectRevision` must be a revision number, got {e}")))?;
+            if want != self.revision {
+                return Err(EngineError::Other(format!("document changed (revision {}, expected {want}); read it again and retry", self.revision)));
+            }
+        }
+        let client = match client {
+            Some(Value::String(c)) if !c.is_empty() => Some(c),
+            None | Some(Value::Null) => None,
+            Some(c) => return Err(commands::bad(id, format!("`client` must be a non-empty string, got {c}"))),
+        };
+        let Some(client) = client else { return self.execute_inner(id, params) };
+        let outer = self.client.replace(client);
+        let r = self.execute_inner(id, params);
+        self.client = outer;
+        r
+    }
+
+    fn execute_inner(&mut self, id: &str, params: Value) -> Result<Value> {
         let spec = commands::find(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
         if let Err(why) = (spec.enabled)(self) {
             // Explicit targets (agents, scripts) don't need a UI selection.
@@ -607,10 +690,15 @@ impl Session {
                 return Err(EngineError::Disabled(id.to_string(), why));
             }
         }
-        // Last-resort guard: a panicking command reports an error instead of crashing the app.
-        let r = guard::guarded(&format!("command `{id}`"), || (spec.run)(self, &params))?;
+        // Last-resort guard: a panicking command reports an error instead of crashing the app
+        // (and saves a repro of the steps that led there, see `replay::after_command`).
+        let nesting = replay::Nesting::enter(spec.journal);
+        let caught = guard::caught();
+        let r = guard::guarded(&format!("command `{id}`"), || (spec.run)(self, &params));
+        let r = replay::after_command(self, id, &params, &nesting, caught, r)?;
         self.learn_observe(id, &params);
-        if spec.journal {
+        // Commands run by a journaled command (a script's steps) replay with it, not again.
+        if spec.journal && !nesting.inside_journaled() {
             self.journal.push((id.to_string(), params));
             if self.journal.len() > 10_000 {
                 self.journal.drain(..1000);
@@ -651,8 +739,15 @@ impl Session {
     pub fn edit<T>(&mut self, label: &str, merge: Option<&str>, f: impl FnOnce(&mut Project, &mut EditorState) -> Result<T>) -> Result<T> {
         let before = self.project.clone();
         let mut p = (*self.project).clone();
+        // Ids continue from the highest ever handed out, also after undo.
+        let floor = p.next_id.max(self.id_floor);
+        p.next_id = floor;
         let mut st = self.state.clone();
         let r = f(&mut p, &mut st)?;
+        if p.next_id == floor {
+            // Nothing allocated: keep the state's own counter (no spurious change).
+            p.next_id = before.next_id;
+        }
         // Layer styles: one Global Light per comp, whichever layer edited it.
         effectcraft_project::styles::sync_global_light(&before, &mut p);
         // Essential Properties of precomp layers follow their comps' Essential Graphics.
@@ -680,7 +775,8 @@ impl Session {
             self.state = st;
             return Ok(r);
         }
-        let same = merge.is_some() && merge.map(str::to_string) == self.history.merge_key;
+        // A continuous gesture folds into one step, unless another client made the last step.
+        let same = merge.is_some() && merge.map(str::to_string) == self.history.merge_key && self.history.author(&before) == self.client.as_deref();
         if !same {
             // Undone steps aren't lost: they stay in the History panel as a branch.
             let levels = self.prefs.general.undo_levels.max(1) as usize;
@@ -690,6 +786,7 @@ impl Session {
         }
         self.history.merge_key = merge.map(str::to_string);
         self.project = Arc::new(p);
+        self.history.set_author(&self.project, self.client.clone());
         self.state = st;
         self.bump();
         Ok(r)
@@ -697,6 +794,7 @@ impl Session {
 
     pub fn bump(&mut self) {
         self.revision += 1;
+        self.id_floor = self.id_floor.max(self.project.next_id);
         // Back at the saved state (undo, redo, a history jump or a rolled-back batch).
         if Arc::ptr_eq(&self.project, &self.saved_project) {
             self.saved_revision = self.revision;
@@ -1044,6 +1142,7 @@ impl Session {
         upgrade_effects(&mut p);
         self.project = Arc::new(p);
         self.history = History::default();
+        self.id_floor = 0;
         self.state = EditorState { snapping: true, view_layout: 1, ..Default::default() };
         self.path = path;
         self.bump();
@@ -1286,7 +1385,11 @@ pub fn font_menu(prefs: &prefs::Prefs) -> Vec<FontRow> {
     out
 }
 #[cfg(test)]
+mod tests_audio_analysis;
+#[cfg(test)]
 mod tests_history;
+#[cfg(test)]
+mod tests_layout;
 #[cfg(test)]
 mod tests_models;
 #[cfg(test)]

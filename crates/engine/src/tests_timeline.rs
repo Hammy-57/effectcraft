@@ -317,7 +317,7 @@ fn pen_tool_draws_edits_and_closes_a_mask() {
     // Animated mask paths get a key at the current time.
     s.execute("prop.toggleAnimation", json!({"layer": l, "path": "masks/#1/path"})).unwrap();
     s.execute("time.set", json!({"time": 1.0})).unwrap();
-    s.execute("mask.setVertex", json!({"layer": l, "mask": 1, "index": 0, "point": [0, 0]})).unwrap();
+    s.execute("mask.setVertex", json!({"layer": l, "mask": "#1", "index": 0, "point": [0, 0]})).unwrap();
     assert_eq!(prop(&s, l, "masks/#1/path").keys.len(), 2);
     // Mode / feather / opacity / expansion through the timeline commands.
     s.execute("layer.setMask", json!({"layer": l, "mask": m, "mode": "Subtract", "inverted": true})).unwrap();

@@ -204,3 +204,10 @@ opt-level = 3
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# `cargo xtask ci` builds clippy and tests with this profile. Tests don't need shipping-grade LTO:
+# thin LTO + one codegen unit across ~69 test binaries made the gate ~1.5 h while the tests run in ~75 s.
+[profile.ci]
+inherits = "release"
+lto = false
+codegen-units = 16

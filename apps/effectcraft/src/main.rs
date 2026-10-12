@@ -269,8 +269,19 @@ fn main() -> eframe::Result {
             }
             if let Some(port) = control_port {
                 disable_app_nap();
-                let rx = control_server::start(port, cc.egui_ctx.clone());
-                app = app.with_control(rx);
+                match control_server::start(port, cc.egui_ctx.clone()) {
+                    Ok(started) => {
+                        eprintln!("effectcraft: control server listening on 127.0.0.1:{}", started.port);
+                        app = app.with_control(started.requests).with_control_events(started.events);
+                    }
+                    // Another app (often a second EffectCraft) holds the port: say so in the
+                    // window, or an agent's `--bridge` silently drives the other app.
+                    Err(e) => {
+                        eprintln!("effectcraft: {e}");
+                        log::error!("{e}");
+                        app.ui.status = e;
+                    }
+                }
             }
             log::info!("app created; the window shows after its first frame");
             Ok(Box::new(Desktop {

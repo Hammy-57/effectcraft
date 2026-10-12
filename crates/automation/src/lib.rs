@@ -7,6 +7,8 @@
 //! * [`Backend`]: where tools run. **Headless** owns an in-process [`Session`] (no window);
 //!   **bridge** forwards to a running desktop app over its JSON-lines control channel
 //!   (`effectcraft --control 9877`, `docs/control-protocol.md`), adding screenshots and UI input.
+//!   Any [`ControlTransport`] can stand in for that channel: `effectcraft-cli mcp --ui` runs the
+//!   full app offscreen in-process and serves the same requests with no window.
 //! * [`tools`]: the tool catalogue (names, descriptions, JSON schemas) and their implementations,
 //!   shared by the MCP server and `effectcraft-cli`'s one-shot subcommands.
 //!
@@ -22,11 +24,14 @@ pub mod bridge;
 mod compact;
 pub mod confine;
 mod long_job;
+mod notify;
+mod prompts;
+pub mod resources;
 pub mod server;
 pub mod tools;
 
 pub use backend::{Backend, Frame};
-pub use bridge::BridgeClient;
+pub use bridge::{BridgeClient, ControlTransport, SessionJob};
 pub use effectcraft_engine::Session;
 pub use server::McpServer;
 

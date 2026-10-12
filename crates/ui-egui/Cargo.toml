@@ -9,6 +9,11 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+## The full app offscreen (`offscreen::OffscreenUi`: egui_kittest + wgpu, no window), used by
+## `effectcraft-cli mcp --ui`.
+offscreen = ["dep:egui_kittest"]
+
 [dependencies]
 craft-ui = { workspace = true }
 effectcraft-time = { workspace = true }
@@ -30,13 +35,16 @@ rayon = { workspace = true }
 web-time = { workspace = true }
 kurbo = { workspace = true }
 image = { workspace = true }
+egui_kittest = { workspace = true, features = ["eframe", "wgpu"], optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+pollster = { workspace = true }
 sys-locale = { workspace = true }
 
 [dev-dependencies]
+# Examples (`snapshot`) and tests use the offscreen app.
+effectcraft-ui-egui = { path = ".", features = ["offscreen"] }
 egui_kittest = { workspace = true, features = ["eframe", "wgpu"] }
-pollster = "0.4"
 effectcraft-host = { workspace = true }
 exr = { workspace = true }
 

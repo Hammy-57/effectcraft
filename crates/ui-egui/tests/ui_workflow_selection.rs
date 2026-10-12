@@ -321,6 +321,34 @@ fn style_cancel_restores_checkpoint_with_bounded_history_and_reopened_scrub() {
 }
 
 #[test]
+fn style_cancel_keeps_edits_another_driver_made_meanwhile() {
+    let mut h = harness();
+    let id = h.state().session.active_comp().unwrap().layers[0].id;
+    h.state_mut().session.execute("layer.select", json!({"layers":[id.0]})).unwrap();
+    h.state_mut().session.execute("layer.style.dropShadow", json!({})).unwrap();
+    let ctx = h.ctx.clone();
+    effectcraft_ui_egui::menus::invoke(h.state_mut(), &ctx, "layer.style.options", json!({"style":"dropShadow"})).unwrap();
+    let distance = |h: &Harness<'_, EffectcraftApp>| {
+        let l = h.state().session.active_comp().unwrap().layer(id).unwrap().clone();
+        l.props.prop("layerStyles/dropShadow/distance").unwrap().value.as_f64()
+    };
+    let before = distance(&h);
+    // A style change in the dialog, then an agent adds a layer while it's open.
+    h.state_mut().session.execute("prop.set", json!({"layer":id.0,"path":"layerStyles/dropShadow/distance","value":25,"merge":"same-style-control"})).unwrap();
+    let agent =
+        h.state_mut().session.execute("layer.newSolid", json!({"name":"Agent's","color":"#00ff00","client":"agent"})).unwrap()["layer"].as_u64().unwrap();
+    effectcraft_ui_egui::panels::layer_styles_dialog::finish(h.state_mut(), false);
+    let comp = h.state().session.active_comp().unwrap();
+    assert!(comp.layer(LayerId(agent)).is_some(), "Cancel keeps the agent's layer");
+    assert_eq!(distance(&h), before, "Cancel reverts the dialog's style change");
+    // The agent's step is still in the history, under the dialog's revert.
+    let labels: Vec<String> = h.state().session.history.undo.iter().map(|u| u.0.clone()).collect();
+    assert_eq!(labels.last().map(String::as_str), Some("Cancel Layer Style"), "{labels:?}");
+    h.state_mut().session.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(distance(&h), 25.0);
+}
+
+#[test]
 fn project_edit_commands_do_not_target_timeline_layers() {
     let mut h = harness();
     let comp = h.state().session.active_comp_id().unwrap();

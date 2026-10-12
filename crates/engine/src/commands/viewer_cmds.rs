@@ -504,8 +504,8 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("view.takeSnapshot", "Take Snapshot", [], Some("Shift+F5"), "{comp?, scale?: 0.05..1}", has_comp, take_snapshot),
         cmd!("view.showSnapshot", "Show Snapshot", [], None, "{value?}", has_snapshot, show_snapshot),
         cmd!("view.fastPreviewMode", "Fast Previews", [], None, "{mode: off|adaptive|draft|fastDraft|wireframe}", always, fast_previews),
-        cmd!("view.moveGuide", "Move Guide", [], None, "{comp?, index, position (comp px), merge?}", has_comp, move_guide),
-        cmd!("view.removeGuide", "Remove Guide", [], None, "{comp?, index}", has_comp, remove_guide),
+        cmd!("view.moveGuide", "Move Guide", [], None, "{comp?, index (0-based guide), position (comp px), merge?}", has_comp, move_guide),
+        cmd!("view.removeGuide", "Remove Guide", [], None, "{comp?, index (0-based guide)}", has_comp, remove_guide),
         cmd!(
             "shape.newPath",
             "Pen Tool (Shape Path)",

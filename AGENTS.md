@@ -31,6 +31,8 @@ building on top of it. Full standard: [craftrules `standards/never-crash.md`](ht
   `catch_unwind` boundary that turns an escaped panic into an error and keeps the document. It is a
   safety net, not a substitute for the rules above; keep `panic = "unwind"`.
 - **Prove it:** every crash fix comes with a small synthetic regression test that panicked before the fix.
+  Crash fix regression test = drop a `.jsonl` in `tests/repros` (the crash repro, trimmed; see
+  [docs/agents.md](docs/agents.md), "Repro scripts").
 
 Tests, benches, fuzz targets and `xtask` may `unwrap()`; `clippy.toml` allows it in tests. Crates that are
 clean carry `#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented,
@@ -104,6 +106,7 @@ reproduce an image (for example, point lists traced from someone else's icon).
 
 See `CLAUDE.md`: pure Rust, dependency layering (`cargo xtask layers`), exact `Tick` time, everything is
 a command, everything is agent-drivable, and the quality gates (`cargo xtask ci`) before every commit.
+Agents: `cargo xtask ci --affected` per change; full `cargo xtask ci` before release ([`docs/testing.md`](docs/testing.md)).
 
 Shared real-file test corpora (Photoshop-authored PSDs, etc.) live in
 [`storytold/photocraft-corpus`](https://github.com/storytold/photocraft-corpus), explained in

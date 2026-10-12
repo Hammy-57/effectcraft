@@ -1,7 +1,8 @@
 //! Properties, keyframes and expressions (Animation menu + timeline/Effect Controls gestures).
 
+use effectcraft_keyframe::Value as KValue;
 use effectcraft_keyframe::{Ease, Interp, Keyframe, easy_ease, key_at, set_key};
-use effectcraft_project::{GroupKind, ItemId, Layer, LayerId, Property, Uid};
+use effectcraft_project::{GroupKind, ItemId, Layer, LayerId, Node, ParamUi, PropGroup, Property, Uid};
 use effectcraft_time::{FrameRate, Tick};
 use serde_json::{Value, json};
 
@@ -24,13 +25,149 @@ pub(crate) fn prop_ref(s: &Session, p: &Value, cmd: &str) -> Result<(ItemId, Lay
     let path = str_p(p, "path").ok_or_else(|| bad(cmd, "missing `path` (e.g. transform/position) or `prop` uid"))?;
     let pr = layer.props.prop(path).ok_or_else(|| {
         let group = layer.props.group(path).or_else(|| path.trim().strip_prefix('@')?.parse().ok().and_then(|uid| layer.props.find_group(uid)));
-        if group.is_some() {
-            bad(cmd, format!("`{path}` is a property group; use layer.tree (MCP: get_layer) to inspect its children, then select a leaf property"))
-        } else {
-            bad(cmd, format!("no property `{path}`"))
-        }
+        if let Some(g) = group { bad(cmd, group_message(path, g)) } else { bad(cmd, missing_prop(&layer.props, path)) }
     })?;
     Ok((cid, lid, pr.uid))
+}
+
+/// Why `path` names no property under `root`: the level that failed, the closest ids there and
+/// the valid ids at that level (so an agent can fix the path without another lookup).
+pub(crate) fn missing_prop(root: &PropGroup, path: &str) -> String {
+    let segs: Vec<&str> = path.split(['/', '.']).filter(|x| !x.is_empty()).collect();
+    if path.trim().starts_with('@') || segs.is_empty() {
+        return format!("no property `{path}` (get_layer / layer.tree lists every path)");
+    }
+    let mut g = root;
+    for (k, seg) in segs.iter().enumerate() {
+        let here = segs.get(..k).unwrap_or_default().join("/");
+        let next = if here.is_empty() { seg.to_string() } else { format!("{here}/{seg}") };
+        match root.node(&next) {
+            Some(Node::Group(sub)) => g = sub,
+            Some(Node::Prop(_)) if k + 1 < segs.len() => return format!("no property `{path}`: `{next}` is a property, not a group"),
+            Some(Node::Prop(_)) => return format!("no property `{path}`"),
+            None => {
+                let ids: Vec<String> = (0..g.children.len())
+                    .map(|i| {
+                        let s = super::query::segment(g, i);
+                        match g.children.get(i) {
+                            Some(c) if s.starts_with('#') => format!("{s} ({})", c.name()),
+                            _ => s,
+                        }
+                    })
+                    .collect();
+                let names = g.children.iter().map(|c| c.name()).chain(g.children.iter().map(|c| c.match_id()));
+                let level = if here.is_empty() { "the layer".to_string() } else { format!("`{here}` ({})", g.name) };
+                if ids.is_empty() {
+                    return format!("no property `{path}`: {level} has no children");
+                }
+                let segs_only: Vec<String> = (0..g.children.len()).map(|i| super::query::segment(g, i)).collect();
+                // Path ids first; display names only when no id is close.
+                let mut hint = crate::suggest::did_you_mean(seg, segs_only.iter().map(String::as_str));
+                if hint.is_empty() {
+                    hint = crate::suggest::did_you_mean(seg, names);
+                }
+                let sep = if hint.is_empty() { "." } else { "" };
+                return format!(
+                    "no property `{path}`: {level} has no `{seg}`{hint}{sep} Valid here: {}",
+                    crate::suggest::capped_list(ids.iter().map(String::as_str), 30)
+                );
+            }
+        }
+    }
+    let kids: Vec<String> = (0..g.children.len()).map(|i| super::query::segment(g, i)).collect();
+    format!("`{path}` is a group, not a property; its children: {}", crate::suggest::capped_list(kids.iter().map(String::as_str), 30))
+}
+
+/// Why a group path names no property: what to do instead (#263) and the group's children.
+fn group_message(path: &str, g: &PropGroup) -> String {
+    let kids: Vec<String> = (0..g.children.len()).map(|i| super::query::segment(g, i)).collect();
+    format!(
+        "`{path}` is a group, not a property (it is a property group); use layer.tree (MCP: get_layer) to inspect its children, then select a leaf property. Its children: {}",
+        crate::suggest::capped_list(kids.iter().map(String::as_str), 30)
+    )
+}
+
+/// Number list for messages: `5, 5, 5`.
+fn fmt_nums(v: &[f64]) -> String {
+    v.iter().map(|x| format!("{x}")).collect::<Vec<_>>().join(", ")
+}
+
+/// Convert JSON for property `pr` (current value `cur`) as prop.set always has: popup names map to
+/// their index, a number fills every component of a vector, missing components are 0, slider values
+/// clamp to the valid range. Returns the value and a warning for each such adjustment, so a caller
+/// is told when what was stored differs from what was asked for.
+pub(crate) fn coerce_for(pr: &Property, cur: &KValue, v: &Value, cmd: &str) -> Result<(KValue, Vec<String>)> {
+    let id = if pr.match_id.is_empty() { pr.name.as_str() } else { pr.match_id.as_str() };
+    let mut warnings = vec![];
+    let options = match &pr.ui {
+        ParamUi::Popup { options } if matches!(cur, KValue::Enum(_) | KValue::Scalar(_)) => Some(options),
+        _ => None,
+    };
+    let choices = |o: &[String]| o.iter().enumerate().map(|(i, n)| format!("{i} = {n}")).collect::<Vec<_>>().join(", ");
+    let mut v = v.clone();
+    if let (Some(o), Some(name)) = (options, v.as_str()) {
+        let Some(i) = o.iter().position(|n| n.eq_ignore_ascii_case(name.trim())) else {
+            return Err(bad(cmd, format!("can't use \"{name}\" for {} (`{id}`); choose one of: {} (index or name)", pr.name, choices(o))));
+        };
+        v = json!(i);
+    }
+    let Some(mut nv) = cur.coerce_json(&v) else {
+        let expected = match (cur, options) {
+            (_, Some(o)) => format!("choose one of: {} (index or name)", choices(o)),
+            (KValue::Scalar(_), _) => "a number".into(),
+            (KValue::Vec2(_), _) => "[x, y] (or one number for both)".into(),
+            (KValue::Vec3(_), _) => "[x, y, z] (or one number for all)".into(),
+            (KValue::Color(_), _) => "\"#rrggbb\" or [r, g, b, a?] in 0–1".into(),
+            (KValue::Bool(_), _) => "true or false".into(),
+            (KValue::Enum(_), _) => "an option index (0-based)".into(),
+            (KValue::Text(_) | KValue::Str(_), _) => "a string".into(),
+            (KValue::Layer(_), _) => "a layer id (or null)".into(),
+            _ => format!("a {} value as get_property returns it", cur.kind_name()),
+        };
+        return Err(bad(cmd, format!("can't use {v} for {} (`{id}`, a {} property); expected {expected}", pr.name, cur.kind_name())));
+    };
+    let dims = cur.dims();
+    match (&v, &nv) {
+        (Value::Number(n), KValue::Vec2(_) | KValue::Vec3(_) | KValue::Color(_)) => {
+            let x = n.as_f64().unwrap_or(0.0);
+            warnings.push(format!("{id}: number {x} expanded to [{}]", fmt_nums(&vec![x; dims])));
+        }
+        (Value::Array(a), KValue::Scalar(_) | KValue::Vec2(_) | KValue::Vec3(_) | KValue::Color(_)) if a.len() != dims => {
+            let color_rgb = matches!(cur, KValue::Color(_)) && a.len() == 3;
+            if a.len() < dims && !color_rgb {
+                warnings.push(format!("{id}: {} value(s) given for {dims} components; the missing ones were set to 0", a.len()));
+            } else if a.len() > dims {
+                warnings.push(format!("{id}: {} values given for {dims} component(s); the extra ones were ignored", a.len()));
+            }
+        }
+        _ => {}
+    }
+    if let ParamUi::Slider { min, max, slider_min, slider_max, .. } = pr.ui
+        && let KValue::Scalar(x) = nv
+    {
+        let c = x.clamp(min, max);
+        if c != x {
+            warnings.push(format!("{id}: {x} is outside the valid range {min} to {max} (slider {slider_min} to {slider_max}); clamped to {c}"));
+        }
+        nv = KValue::Scalar(c);
+    }
+    if let (Some(o), KValue::Enum(i)) = (options, &nv)
+        && *i as usize >= o.len()
+    {
+        warnings.push(format!("{id}: {i} is not an option of {} ({}); choose one of: {}", pr.name, o.len(), choices(o)));
+    }
+    Ok((nv, warnings))
+}
+
+/// A command result with its warnings: just `value` when there are none, else `{key: value, warnings}`.
+fn with_warnings(key: &str, value: Value, warnings: Vec<String>) -> Value {
+    if warnings.is_empty() {
+        return value;
+    }
+    let mut o = serde_json::Map::new();
+    o.insert(key.into(), value);
+    o.insert("warnings".into(), json!(warnings));
+    Value::Object(o)
 }
 
 fn with_prop<T>(
@@ -371,18 +508,14 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let v = p.get("value").ok_or_else(|| bad("prop.set", "missing `value`"))?.clone();
     let at = snapped_key_time(s, cid, lid, p, "prop.set")?;
-    let out = with_prop(s, "Change Property", merge_p(p), cid, lid, uid, |pr, lt| {
+    let (out, warnings) = with_prop(s, "Change Property", merge_p(p), cid, lid, uid, |pr, lt| {
         let cur = pr.value_at(lt);
-        let mut nv = cur.coerce_json(&v).ok_or_else(|| bad("prop.set", format!("can't use {v} for a {} property", cur.kind_name())))?;
-        // Clamp to slider ranges.
-        if let effectcraft_project::ParamUi::Slider { min, max, .. } = pr.ui
-            && let effectcraft_keyframe::Value::Scalar(x) = nv
-        {
-            nv = effectcraft_keyframe::Value::Scalar(x.clamp(min, max));
-        }
+        // Popup names → index, number → vector, slider clamping (each reported as a warning).
+        let (nv, warnings) = coerce_for(pr, &cur, &v, "prop.set")?;
         pr.set_value_at(at.unwrap_or(lt), nv.clone());
-        Ok(nv.to_json())
+        Ok((nv.to_json(), warnings))
     })?;
+    let out = with_warnings("value", out, warnings);
     if p.get("timeBase").is_none() {
         return Ok(out);
     }
@@ -455,20 +588,21 @@ fn add_key(s: &mut Session, p: &Value) -> Result<Value> {
     let (cid, lid, uid) = prop_ref(s, p, "prop.addKey")?;
     let at = snapped_key_time(s, cid, lid, p, "prop.addKey")?;
     let value = p.get("value").cloned();
-    let count = with_prop(s, "Add Keyframe", None, cid, lid, uid, |pr, lt| {
+    let (count, warnings) = with_prop(s, "Add Keyframe", None, cid, lid, uid, |pr, lt| {
         let t = at.unwrap_or(lt);
         let cur = pr.value_at(t);
-        let v = match &value {
-            Some(j) => cur.coerce_json(j).ok_or_else(|| bad("prop.addKey", "bad value"))?,
-            None => cur,
+        let (v, warnings) = match &value {
+            Some(j) => coerce_for(pr, &cur, j, "prop.addKey")?,
+            None => (cur, vec![]),
         };
         let mut k = Keyframe::new(t, v);
         if pr.hold_only {
             k = k.hold();
         }
         set_key(&mut pr.keys, k);
-        Ok(json!(pr.keys.len()))
+        Ok((json!(pr.keys.len()), warnings))
     })?;
+    let count = with_warnings("keys", count, warnings);
     if p.get("timeBase").is_none() {
         return Ok(count);
     }
