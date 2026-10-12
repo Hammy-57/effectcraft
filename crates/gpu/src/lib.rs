@@ -95,6 +95,7 @@ mod prepass;
 mod readback;
 #[cfg(feature = "profile")]
 mod timestamps;
+pub mod traffic_light;
 mod walk;
 
 use std::sync::Arc;
@@ -105,6 +106,7 @@ use effectcraft_project::ItemId;
 use effectcraft_raster::Image;
 use effectcraft_render::{Accelerator, FxStep, Renderer};
 use effectcraft_time::Tick;
+pub use traffic_light::TrafficLight;
 pub use wgpu;
 
 use crate::context::Enc;
@@ -586,6 +588,8 @@ mod tests_particles;
 mod tests_precomp_resident;
 #[cfg(test)]
 mod tests_shape_clip;
+#[cfg(test)]
+mod tests_traffic_light;
 #[cfg(test)]
 mod tests_warmup;
 

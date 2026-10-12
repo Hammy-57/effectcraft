@@ -36,26 +36,49 @@ use theme::Tokens;
 
 const SCREENSHOT_TIMEOUT_S: f64 = 4.0;
 
-fn compositor_gpu(adapter: &eframe::wgpu::Adapter, device: eframe::wgpu::Device, queue: eframe::wgpu::Queue) -> Result<effectcraft_gpu::Gpu, String> {
+/// The GPU compositor for the window's adapter. Natively on a device of its own unless the host
+/// offers egui's (`share`, RT10e: then with the window's traffic light, see [`zero_copy`]).
+fn compositor_gpu(
+    adapter: &eframe::wgpu::Adapter,
+    device: eframe::wgpu::Device,
+    queue: eframe::wgpu::Queue,
+    share: Option<Option<Arc<zero_copy::TrafficLight>>>,
+) -> Result<effectcraft_gpu::Gpu, String> {
     #[cfg(not(target_arch = "wasm32"))]
     {
+        if let Some(light) = share {
+            let gpu = effectcraft_gpu::Gpu::new(adapter, device, queue)?;
+            if let Some(light) = light {
+                gpu.context().set_traffic_light(light);
+            }
+            return Ok(gpu);
+        }
         let _ = (device, queue);
         pollster::block_on(effectcraft_gpu::Gpu::request_on_adapter(adapter))
     }
     #[cfg(target_arch = "wasm32")]
-    effectcraft_gpu::Gpu::new(adapter, device, queue)
+    {
+        let _ = share;
+        effectcraft_gpu::Gpu::new(adapter, device, queue)
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]
 #[test]
-fn compositor_does_not_share_the_window_surface_device() {
+fn compositor_shares_the_window_device_only_with_a_traffic_light() {
     // Surface::configure waits for its device to go idle. Frame workers submitting to that same
-    // device during a window move made wgpu panic with GpuWaitTimeout.
+    // device during a window move made wgpu panic with GpuWaitTimeout: without the host's offer
+    // the compositor gets a device of its own; with it, its submissions go through the light.
     let instance = eframe::wgpu::Instance::default();
     let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return };
     let Ok((device, queue)) = pollster::block_on(adapter.request_device(&Default::default())) else { return };
-    let gpu = compositor_gpu(&adapter, device.clone(), queue).unwrap();
+    let gpu = compositor_gpu(&adapter, device.clone(), queue.clone(), None).unwrap();
     assert_ne!(gpu.device(), &device);
+    assert!(gpu.context().traffic_light().is_none());
+    let light = zero_copy::TrafficLight::new();
+    let shared = compositor_gpu(&adapter, device.clone(), queue, Some(Some(light.clone()))).unwrap();
+    assert_eq!(shared.device(), &device);
+    assert!(shared.context().traffic_light().is_some_and(|l| Arc::ptr_eq(l, &light)));
 }
 /// Seconds without a project change before paused prefetch resumes (see
 /// [`EffectcraftApp::editing`]).
@@ -360,6 +383,8 @@ pub struct EffectcraftApp {
     pub(crate) wgpu: Option<eframe::egui_wgpu::RenderState>,
     /// The GPU compositor on that device (None: no usable adapter → CPU only).
     pub(crate) gpu: Option<effectcraft_gpu::Gpu>,
+    /// RT10e: whether the compositor shares egui's device (frames drawn without a copy).
+    pub(crate) zero_copy: zero_copy::ZeroCopy,
     gpu_checked: bool,
     #[cfg(not(target_arch = "wasm32"))]
     gpu_startup_deferred: bool,
@@ -473,6 +498,7 @@ impl EffectcraftApp {
             viewer_readback: Default::default(),
             wgpu: None,
             gpu: None,
+            zero_copy: Default::default(),
             gpu_checked: false,
             #[cfg(not(target_arch = "wasm32"))]
             gpu_startup_deferred: false,
@@ -564,6 +590,9 @@ impl EffectcraftApp {
         self.ui.viewer.fast_preview = p.previews.fast_previews;
         let budgets = p.cache_budgets(self.session.sys_memory);
         self.frames.set_budget(budgets.preview);
+        if self.zero_copy.active && self.zero_copy.unified {
+            self.frames.set_gpu_budget(budgets.preview);
+        }
         if let Some(g) = &self.gpu {
             g.context().set_cache_budget(budgets.layer);
         }
@@ -742,6 +771,27 @@ impl EffectcraftApp {
         self.fonts_ready
     }
 
+    /// RT10e: let the GPU compositor share egui's wgpu device, so viewer frames are drawn
+    /// straight from their textures (see [`zero_copy`]). A desktop host passes its window's
+    /// traffic light, held red wherever a surface may be configured; a host without a surface
+    /// passes `None`. Call before the first frame.
+    pub fn share_display_device(&mut self, light: Option<Arc<zero_copy::TrafficLight>>) {
+        self.zero_copy.offer(light);
+    }
+
+    /// Viewer frames shown from their GPU textures without a copy so far (RT10e).
+    pub fn zero_copy_frames(&self) -> u64 {
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.frames.resident_frames();
+        #[cfg(target_arch = "wasm32")]
+        0
+    }
+
+    /// The compositor shares egui's device (RT10e).
+    pub fn zero_copy_active(&self) -> bool {
+        self.zero_copy.active
+    }
+
     /// Provide the executable/embedding host's device notifications. The host installs the
     /// handlers once; this frontend never replaces handlers on a borrowed device.
     pub fn set_gpu_failure_bridge(&mut self, bridge: gpu_failure::GpuFailureBridge) {
@@ -792,8 +842,21 @@ impl EffectcraftApp {
         // Old completion closures retain only their detached slot, not the replacement.
         self.viewer_readback = Default::default();
         self.wgpu = None;
+        // RT10e: a compositor on egui's device retired, the window still draws: the next one
+        // gets a device of its own and frames are read back as before.
+        let fallback = self.zero_copy.active && !failure.presentation_lost;
+        if self.zero_copy.active {
+            self.zero_copy.active = false;
+            self.zero_copy.failed = true;
+            self.frames.set_gpu_budget(frames::GPU_BUDGET);
+        }
+        if fallback {
+            self.gpu_checked = false;
+        }
         self.ui.status = if failure.presentation_lost {
             "Graphics device lost. The project is still open; presentation requires restarting the application.".into()
+        } else if fallback {
+            "GPU frames are copied for display again after a GPU error; the GPU preview continues on a device of its own.".into()
         } else {
             "Shared GPU preview disabled; CPU compositing remains available.".into()
         };
@@ -841,10 +904,16 @@ impl EffectcraftApp {
     pub(crate) fn init_gpu(&mut self, frame: &eframe::Frame, ctx: &egui::Context) {
         if self.gpu_checked {
             #[cfg(not(target_arch = "wasm32"))]
-            self.prewarm_gpu_project(ctx);
+            {
+                self.frames.set_resident(self.zero_copy.resident(&self.session.prefs));
+                self.prewarm_gpu_project(ctx);
+            }
             return;
         }
-        if self.gpu_failures.as_ref().is_some_and(|bridge| bridge.failure().is_some()) {
+        // A shared-device compositor's failure leaves the window drawing: its replacement gets a
+        // device of its own (RT10e).
+        let replacing = self.zero_copy.failed && self.gpu_failures.as_ref().is_some_and(|bridge| bridge.failure().is_some_and(|f| !f.presentation_lost));
+        if !replacing && self.gpu_failures.as_ref().is_some_and(|bridge| bridge.failure().is_some()) {
             self.gpu_checked = true;
             #[cfg(not(target_arch = "wasm32"))]
             {
@@ -881,13 +950,14 @@ impl EffectcraftApp {
                 result
             } else {
                 let (adapter, device, queue, wake) = (rs.adapter.clone(), rs.device.clone(), rs.queue.clone(), ctx.clone());
+                let share = self.zero_copy.share(&self.session.prefs);
                 let project = self.session.freeze_preview_project();
                 let comp = self.session.active_comp_id();
                 self.gpu_startup_key = comp.map(|comp| (self.session.revision, comp));
                 let time = self.session.time();
                 match gpu_startup::Pending::start(
                     move || {
-                        let gpu = compositor_gpu(&adapter, device, queue)?;
+                        let gpu = compositor_gpu(&adapter, device, queue, share)?;
                         // Unified memory sizes its texture pool by RAM (RT9a). Off the UI thread;
                         // not on Windows, where reading it starts PowerShell (the memory watch
                         // passes it on there).
@@ -912,16 +982,32 @@ impl EffectcraftApp {
         #[cfg(target_arch = "wasm32")]
         let gpu = {
             let _ = ctx;
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compositor_gpu(&rs.adapter, rs.device.clone(), rs.queue.clone())))
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compositor_gpu(&rs.adapter, rs.device.clone(), rs.queue.clone(), None)))
                 .unwrap_or_else(|_| Err("GPU compositor setup failed: backend panicked".into()))
         };
         self.gpu_checked = true;
         match gpu {
             Ok(g) => {
-                if let Some(bridge) = &self.gpu_failures {
+                // A replacement on a device of its own has its own handlers; the window device's
+                // latched failure is not its.
+                if let Some(bridge) = self.gpu_failures.as_ref().filter(|_| !replacing) {
                     bridge.forward_to(g.context().device_failure_notifier());
                     if bridge.failure().is_some() {
                         return;
+                    }
+                }
+                if replacing {
+                    self.frames.revive_gpu();
+                }
+                // RT10e: frames stay textures when the compositor is on egui's device.
+                self.zero_copy.active = g.device() == &rs.device && !cfg!(target_arch = "wasm32");
+                self.zero_copy.unified = info.device_type == eframe::wgpu::DeviceType::IntegratedGpu;
+                #[cfg(not(target_arch = "wasm32"))]
+                self.frames.set_resident(self.zero_copy.resident(&self.session.prefs));
+                if self.zero_copy.active {
+                    log::info!("GPU viewer frames are drawn without a copy (the compositor shares the window's device)");
+                    if self.zero_copy.unified {
+                        self.frames.set_gpu_budget(self.session.prefs.cache_budgets(self.session.sys_memory).preview);
                     }
                 }
                 log::info!("GPU compositor: {}", effectcraft_engine::render::Accelerator::name(&g));

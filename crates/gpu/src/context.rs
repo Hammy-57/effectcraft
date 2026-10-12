@@ -534,6 +534,9 @@ pub struct GpuContext {
     pub(crate) generation: effectcraft_render::allocation::GpuGeneration,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
+    /// RT10e: the window's traffic light, when this device is the window's (its submissions
+    /// then pause while a surface reconfigures; see [`crate::traffic_light`]).
+    light: std::sync::OnceLock<Arc<crate::TrafficLight>>,
     pub(crate) name: String,
     pub(crate) max_dim: u32,
     integrated: bool,
@@ -922,6 +925,7 @@ impl GpuContext {
             generation,
             device,
             queue,
+            light: std::sync::OnceLock::new(),
             name,
             max_dim,
             bgl,
@@ -968,6 +972,34 @@ impl GpuContext {
             clear_retained(&self.uploads);
         }
         result
+    }
+
+    /// RT10e: submit through `light` from now on (the device is a window's, whose surface
+    /// configuration must not overlap a submission). Once; `false` when a light is already set.
+    pub fn set_traffic_light(&self, light: Arc<crate::TrafficLight>) -> bool {
+        self.light.set(light).is_ok()
+    }
+
+    /// The traffic light the compositor submits through, if any.
+    pub fn traffic_light(&self) -> Option<&Arc<crate::TrafficLight>> {
+        self.light.get()
+    }
+
+    /// Every compositor submission: through the traffic light when there is one.
+    pub(crate) fn submit(&self, commands: wgpu::CommandBuffer) -> wgpu::SubmissionIndex {
+        match self.light.get() {
+            Some(light) => light.pass(|| self.queue.submit([commands])),
+            None => self.queue.submit([commands]),
+        }
+    }
+
+    /// A submission with no work (through the traffic light): it completes once everything
+    /// submitted before it has, so its index fences the work so far.
+    pub fn fence(&self) -> wgpu::SubmissionIndex {
+        match self.light.get() {
+            Some(light) => light.pass(|| self.queue.submit([])),
+            None => self.queue.submit([]),
+        }
     }
 
     /// A notification hook for the owner of a shared device's error/loss handlers.
@@ -2222,7 +2254,7 @@ impl<'g> Enc<'g> {
         if let Some((mut enc, id)) = self.enc.take() {
             #[cfg(feature = "profile")]
             let timing = self.timestamps.take().and_then(|b| b.resolve(self.g, &mut enc));
-            self.submitted = Some(self.g.queue.submit([enc.finish()]));
+            self.submitted = Some(self.g.submit(enc.finish()));
             #[cfg(feature = "profile")]
             if let Some(timing) = timing {
                 timing.map(self.g.queue.get_timestamp_period());

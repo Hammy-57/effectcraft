@@ -880,6 +880,10 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             show_frame(app, &ctx, k, img, minify);
         } else if let Some((_, s)) = app.viewer_shown.as_mut() {
             // The same frame at a later revision (an edit elsewhere, an undo): it shows that one.
+            // A GPU frame's texture key follows, or the viewer stops counting it as shown.
+            if let Some((_, n, _)) = app.viewer_native.as_mut().filter(|(_, n, _)| n == s) {
+                n.revision = k.revision;
+            }
             s.revision = k.revision;
         }
     }

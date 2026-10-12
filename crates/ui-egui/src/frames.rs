@@ -39,6 +39,8 @@ use rayon::prelude::*;
 #[cfg(not(target_arch = "wasm32"))]
 mod landing;
 mod property_reuse;
+#[cfg(not(target_arch = "wasm32"))]
+mod resident;
 
 /// Comp identities (and the project snapshots behind them) the RAM preview keeps frames of.
 const MAX_KEEPERS: usize = 64;
@@ -46,7 +48,7 @@ const MAX_KEEPERS: usize = 64;
 /// GPU frames kept for RAM preview (bytes of video memory) at first. wgpu can't tell how much
 /// video memory there is: each time the device runs out, the budget halves (to
 /// [`MIN_GPU_BUDGET`]) and the frame renders on the CPU (#106).
-const GPU_BUDGET: usize = 1 << 30;
+pub(crate) const GPU_BUDGET: usize = 1 << 30;
 const MIN_GPU_BUDGET: usize = 64 << 20;
 
 /// A rendered viewer frame: CPU pixels or a GPU texture.
@@ -516,6 +518,9 @@ pub struct Frames {
     /// GPU frames whose readback is in flight (see [`landing`]).
     #[cfg(not(target_arch = "wasm32"))]
     landing: Arc<landing::Landing>,
+    /// GPU frames shown as textures, without a readback (see [`resident`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    resident: Arc<resident::Resident>,
     /// The cache bar's frames, remembered while nothing they depend on changes (the bar is drawn
     /// every UI frame).
     bar: Mutex<CacheBar>,
@@ -575,6 +580,8 @@ impl Default for Frames {
             remote_busy: Arc::default(),
             #[cfg(not(target_arch = "wasm32"))]
             landing: Arc::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            resident: Arc::default(),
             bar: Mutex::default(),
         }
     }
@@ -757,6 +764,8 @@ impl Frames {
     /// cannot restore an invalid texture after this removal.
     pub fn retire_gpu(&self) {
         self.gpu_retired.store(true, Ordering::Release);
+        #[cfg(not(target_arch = "wasm32"))]
+        self.resident.set(false);
         self.adapt_playback(None);
         if let Ok(mut cache) = self.cache.lock() {
             let keys: Vec<_> = cache.map.iter().filter_map(|(key, image)| image.is_gpu().then_some(*key)).collect();
@@ -768,6 +777,34 @@ impl Frames {
         }
         if let Some(ctx) = &self.ctx {
             ctx.request_repaint();
+        }
+    }
+
+    /// RT10e: a new GPU compositor replaces a retired one (the shared-device compositor's
+    /// fallback to one on a device of its own): GPU frames are kept again.
+    pub fn revive_gpu(&self) {
+        self.gpu_retired.store(false, Ordering::Release);
+    }
+
+    /// RT10e: show GPU viewer frames straight from their textures (`true`, the compositor shares
+    /// egui's device) or read them back as now (`false`). See [`resident`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn set_resident(&self, on: bool) {
+        self.resident.set(on);
+    }
+
+    /// Viewer frames handed over as textures without a readback so far (RT10e).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn resident_frames(&self) -> u64 {
+        self.resident.shown.load(Ordering::Relaxed)
+    }
+
+    /// Bytes of GPU frames to keep at most: on unified memory the RAM preview budget (video
+    /// memory is RAM there), else [`GPU_BUDGET`].
+    pub fn set_gpu_budget(&self, bytes: usize) {
+        if let Ok(mut c) = self.cache.lock() {
+            c.gpu_budget = bytes.max(MIN_GPU_BUDGET);
+            c.evict_gpu();
         }
     }
 
@@ -1205,6 +1242,8 @@ impl Frames {
             pool: self.pool.clone(),
             #[cfg(not(target_arch = "wasm32"))]
             landing: self.landing.clone(),
+            #[cfg(not(target_arch = "wasm32"))]
+            resident: self.resident.clone(),
         }
     }
 
@@ -1357,6 +1396,8 @@ struct Worker {
     pool: Option<Arc<rayon::ThreadPool>>,
     #[cfg(not(target_arch = "wasm32"))]
     landing: Arc<landing::Landing>,
+    #[cfg(not(target_arch = "wasm32"))]
+    resident: Arc<resident::Resident>,
 }
 
 /// What finishing a frame needs besides its pixels (see [`Worker::publish`]).
@@ -1525,14 +1566,35 @@ impl Worker {
         let backlog = self.queue.lock().map(|q| q.jobs.iter().filter(|j| !j.urgent && !j.disk_only).count()).unwrap_or(0);
         if !disk_hit
             && keep_on_disk(render_time, job.urgent, backlog)
-            && let (Some((dc, k)), FrameImage::Cpu(img)) = (&tail.disk, &ci)
+            && let Some((dc, k)) = &tail.disk
         {
-            // Hands over a reference to the frame (no copy, no compression here).
-            dc.put_frame(*k, img.size[0] as u32, img.size[1] as u32, ColorBytes(img.clone()));
+            match &ci {
+                // Hands over a reference to the frame (no copy, no compression here).
+                FrameImage::Cpu(img) => dc.put_frame(*k, img.size[0] as u32, img.size[1] as u32, ColorBytes(img.clone())),
+                // A frame shown from its texture (RT10e) is read back for the disk cache only.
+                #[cfg(not(target_arch = "wasm32"))]
+                FrameImage::Gpu(f) => self.read_back_for_disk(&job.src, f, dc.clone(), *k),
+                #[cfg(target_arch = "wasm32")]
+                FrameImage::Gpu(_) => {}
+            }
             if let Some(ctx) = &self.ctx {
                 ctx.request_repaint();
             }
         }
+    }
+
+    /// RT10e: read a resident frame back on the landing thread and put it in the disk cache
+    /// (skipped when too many readbacks are in flight: the frame just isn't cached on disk).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn read_back_for_disk(&self, src: &RenderSource, f: &Arc<DisplayFrame>, dc: Arc<DiskCache>, k: u128) {
+        let Some(gpu) = &src.gpu else { return };
+        let (w, h) = (f.width, f.height);
+        let land: landing::Land = Box::new(move |bytes, _| {
+            if let Some(img) = bytes.and_then(|b| display_color_image(w, h, &b)) {
+                dc.put_frame(k, w, h, ColorBytes(Arc::new(img)));
+            }
+        });
+        let _ = self.landing.begin(gpu, f, land);
     }
 
     /// Store a finished frame and release its job.
@@ -1766,6 +1828,9 @@ impl Worker {
                 let t0 = web_time::Instant::now();
                 // The frame's flight on the landing thread, once handed over.
                 let mut flight = None;
+                // RT10e: the frame stays a texture egui draws (the compositor is on its device).
+                #[cfg(not(target_arch = "wasm32"))]
+                let resident = self.resident.on() && !job.disk_only;
                 match g.within_memory(|| {
                     let f = g.render_display(&r, job.comp, job.t)?;
                     #[cfg(target_arch = "wasm32")]
@@ -1775,6 +1840,9 @@ impl Worker {
                     }
                     #[cfg(not(target_arch = "wasm32"))]
                     {
+                        if resident {
+                            return Some(Rendered::Image(FrameImage::Gpu(Arc::new(f))));
+                        }
                         // Don't wait for the pixels: the landing thread finishes the frame.
                         if let Some(tail) = tail {
                             flight = self.begin_landing(g, &f, job, tail, auto.map(|(_, key)| key), t0);
@@ -1796,6 +1864,15 @@ impl Worker {
                     Ok(Some(image)) => {
                         if g.context().check_health().is_err() {
                             return self.render_job(job, false, None);
+                        }
+                        #[cfg(not(target_arch = "wasm32"))]
+                        if resident {
+                            // Auto's GPU time is recorded when the GPU has finished the frame.
+                            if let Err(e) = self.resident.admit(g, auto.map(|(_, key)| key), t0) {
+                                log::warn!("a GPU viewer frame did not finish ({e}); it renders on the CPU");
+                                return self.render_job(job, false, None);
+                            }
+                            return image;
                         }
                         if let Some((p, key)) = auto {
                             // Native readback has completed; include transfer and

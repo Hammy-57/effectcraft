@@ -194,7 +194,15 @@ fn build(opts: OffscreenOptions, session: Session, renderer: WgpuTestRenderer) -
         .with_step_dt(0.0)
         .with_pixels_per_point(ppp)
         .renderer(renderer)
-        .build_eframe(move |_cc| EffectcraftApp::new(session).with_control(rx));
+        .build_eframe(move |_cc| {
+            let mut app = EffectcraftApp::new(session).with_control(rx);
+            // RT10e: `EFFECTCRAFT_ZERO_COPY=1` draws GPU frames from their textures here too
+            // (no window surface, so no traffic light).
+            if crate::zero_copy::env_choice() == Some(true) {
+                app.share_display_device(None);
+            }
+            app
+        });
     let now = Instant::now();
     let mut ui = Ui { h, app, clock: now, last_step: now };
     ui.settle();
