@@ -359,8 +359,9 @@ impl<'a> Renderer<'a> {
                 | "ec.color.brightnesscontrast"
                 | "ec.color.exposure"
                 | "ec.channel.invert" => {
-                    // Text effects that can create alpha fill the expanded effect canvas (#659).
-                    if matches!(layer.source, LayerSource::Text) && crate::fx::text_needs_canvas(spec) {
+                    // Text and shape effects that can create alpha fill the expanded effect
+                    // canvas (#659).
+                    if matches!(layer.source, LayerSource::Text | LayerSource::Shape) && crate::fx::text_needs_canvas(spec) {
                         return None;
                     }
                     0.0

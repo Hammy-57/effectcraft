@@ -369,9 +369,10 @@ impl<'a> Renderer<'a> {
             })
             .filter(|(_, _, s)| !effectcraft_effects::audio_fx::is_audio_effect(s.id))
             .collect();
-        // Text rasterisation is tight to the glyphs. Distortions and tilers need transparent
-        // output pixels beyond that rectangle, on CPU and GPU alike (#659).
-        if matches!(layer.source, LayerSource::Text) && !adjustment && stack.iter().any(|(_, _, spec)| text_needs_canvas(spec)) {
+        // Text and shape rasterisation is tight to the glyphs or the drawn paths. Distortions
+        // and tilers need transparent output pixels beyond that rectangle, on CPU and GPU alike
+        // (#659).
+        if matches!(layer.source, LayerSource::Text | LayerSource::Shape) && !adjustment && stack.iter().any(|(_, _, spec)| text_needs_canvas(spec)) {
             target.effect_canvas(layer_size);
         }
         let accel = self.active_accel();

@@ -875,6 +875,27 @@ fn effects_on_text_reach_past_the_text_bounds() {
     );
 }
 
+/// #659: an effect on a shape layer works over the layer's whole region, not just the drawn
+/// paths' box. Offset wraps the image around the layer: in a buffer as tight as the 40×10 bar,
+/// shifting it 50 px to the right wrapped it back onto itself and nothing moved.
+#[test]
+fn effects_on_shapes_reach_past_the_drawn_bounds() {
+    let (mut p, cid, comp) = setup();
+    let mut l = build::layer(&mut p, &comp, "Shape", LayerSource::Shape, (200, 100), None);
+    let mut next = p.next_id;
+    let mut ids = Ids(&mut next);
+    let rect = build::shape_rect(&mut ids, [40.0, 10.0], [0.0, 0.0], 0.0);
+    let fill = build::shape_fill(&mut ids, [1.0, 0.0, 0.0, 1.0]);
+    let g = build::shape_group(&mut ids, "Bar", vec![rect, fill]);
+    p.next_id = next;
+    l.props.sub_mut("contents").unwrap().children.push(g.into());
+    add_effect_200(&mut p, &mut l, "ec.distort.offset", &[("shift", Value::Vec2([150.0, 50.0]))]);
+    p.comp_mut(cid).unwrap().layers.push(l);
+    let img = render_frame(&p, cid, Tick::ZERO, 1.0);
+    assert!(img.get(150, 50)[0] > 0.9, "the bar moved to x 130..170: {:?}", img.get(150, 50));
+    assert!(img.get(100, 50)[3] < 0.1, "and left the centre: {:?}", img.get(100, 50));
+}
+
 /// #658: CC Smear drags text glyphs beyond the text layer's own bounds. Pixels smeared past
 /// the painted rectangle used to fall off its edge, so the liquid trail never appeared.
 #[test]
