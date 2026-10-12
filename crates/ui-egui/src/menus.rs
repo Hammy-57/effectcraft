@@ -194,6 +194,10 @@ pub fn invoke(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: V
             _ => {}
         }
     }
+    if id == "edit.selectAll" && no_params(&params) && app.ui.focused == PanelKind::EffectControls {
+        crate::panels::effect_controls::select_all_effects(app);
+        return Ok(json!({}));
+    }
     // Clear follows panel focus, including the Edit menu and keyboard shortcut.
     if id == "edit.clear" && params.as_object().is_some_and(|p| p.is_empty()) && app.ui.focused == PanelKind::Project {
         // Through `invoke`, so deleting items that compositions use still asks first (M3.16).
