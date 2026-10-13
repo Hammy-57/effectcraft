@@ -12,8 +12,11 @@
 //! - `ci`: fmt check, clippy -D warnings, tests (`--profile ci`), layers, assets, wasm.
 //! - `ci --affected [--base REV] [--dry-run]`: the same gates for only the crates the change since
 //!   REV (default: the merge-base with `main`) can affect; see `affected.rs` and docs/testing.md.
+//! - `bench [--bin CLI] [--quick] [--compare OLD.jsonl] …`: render benchmark of generated scenarios
+//!   (memory, CPU, wall time) into `target/bench/results.jsonl` (`bench.rs`, docs/testing.md).
 
 mod affected;
+mod bench;
 mod ico;
 mod version;
 
@@ -426,6 +429,7 @@ fn main() -> ExitCode {
             if rest.iter().any(|a| a == "--affected") { affected::run(&root(), &rest) } else { ci() }
         }
         "web" => web(&std::env::args().skip(2).collect::<Vec<_>>()),
+        "bench" => bench::run(&root(), &std::env::args().skip(2).collect::<Vec<_>>()),
         "ico" => {
             let rest: Vec<String> = std::env::args().skip(2).collect();
             ico::run(&rest.iter().map(String::as_str).collect::<Vec<_>>())
@@ -434,7 +438,7 @@ fn main() -> ExitCode {
             let rest: Vec<String> = std::env::args().skip(2).collect();
             version::run(&root(), &rest.iter().map(String::as_str).collect::<Vec<_>>())
         }
-        _ => Err("usage: cargo xtask <layers|assets|wasm|web [--dev] [--serve PORT]|ico OUT.ico IN.png…|version [set X.Y.Z]|ci [--affected [--base REV] [--dry-run]]>".into()),
+        _ => Err("usage: cargo xtask <layers|assets|wasm|web [--dev] [--serve PORT]|ico OUT.ico IN.png…|version [set X.Y.Z]|ci [--affected [--base REV] [--dry-run]]|bench [--bin CLI] [--quick] [--project F --comp C] [--compare OLD.jsonl] (--help)>".into()),
     };
     match r {
         Ok(()) => ExitCode::SUCCESS,
