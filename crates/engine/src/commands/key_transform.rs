@@ -55,9 +55,14 @@ fn transform(s: &mut Session, p: &Value) -> Result<Value> {
     // Default time anchor: the earliest selected key (comp time).
     let first = sel.iter().filter_map(|k| comp.layer(k.layer).map(|l| l.comp_time(k.time))).min().unwrap_or(Tick::ZERO);
     let ta = f_p(p, "timeAnchor").map(Tick::from_seconds_f64).unwrap_or(first);
+    // Keys don't move before the comp start, but one already there (a layer starting earlier)
+    // stays where it is: the anchor of an Alt-drag scale must not jump to 0.
     let map_t = |ct: Tick| -> Tick {
+        if ct == ta && toff == 0.0 {
+            return ct;
+        }
         let x = ta.seconds() + (ct.seconds() - ta.seconds()) * ts + toff;
-        fr.snap_nearest(Tick::from_seconds_f64(x.max(0.0)))
+        fr.snap_nearest(Tick::from_seconds_f64(x.max(ct.seconds().min(0.0))))
     };
     let touch_values = vs != 1.0 || voff != 0.0;
     s.edit("Transform Keyframes", merge, |proj, st| {

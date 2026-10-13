@@ -1364,6 +1364,26 @@ fn transform_drags_apply_their_whole_offset_to_the_keys_they_started_with() {
     assert_eq!(key_times(&s, a), vec![0.1, 1.1, 2.1]);
 }
 
+/// Alt-drag scaling a key group whose first key lies before the comp start (the layer starts
+/// earlier) keeps that key where it is: only the dragged end moves, as in After Effects. Before,
+/// every key was clamped to 0, so the anchor jumped to the comp start.
+#[test]
+fn alt_scale_keeps_a_key_before_the_comp_start() {
+    let mut s = comp();
+    let a = solid(&mut s, "#ff0000");
+    let cid = s.active_comp_id().unwrap();
+    s.edit("start", None, |proj, _| {
+        crate::commands::layer_mut(proj, cid, effectcraft_project::LayerId(a))?.start_time = effectcraft_time::Tick::from_seconds_f64(-1.0);
+        Ok(())
+    })
+    .unwrap();
+    // Layer times 0.5 and 2: comp times -0.5 and 1.
+    opacity_keys(&mut s, a, &[0.5, 2.0]);
+    s.execute("keys.selectAll", json!({"layers": [a]})).unwrap();
+    s.execute("keys.transform", json!({"timeScale": 2.0, "timeAnchor": -0.5, "merge": "key-alt-scale", "fromStart": true})).unwrap();
+    assert_eq!(key_times(&s, a), vec![0.5, 3.5]);
+}
+
 #[test]
 fn select_equal_previous_and_following_keyframes() {
     let mut s = comp();
