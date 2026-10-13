@@ -1,1 +1,0 @@
-thisLayer.transform.position.valueAtTime(time - 0.1)

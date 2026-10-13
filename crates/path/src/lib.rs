@@ -253,20 +253,73 @@ fn device_extent(path: &BezPath, m: kurbo::Affine, w: u32, h: u32) -> Extent {
     if huge { Extent::Huge } else { Extent::Safe }
 }
 
+/// Tolerance of [`flatten_bounded`] in device pixels.
+const FLATTEN_TOLERANCE: f64 = 0.05;
+/// Most line segments one curve flattens into. A curve whose control points are 1e30 px away
+/// would otherwise need ~1e15 segments at [`FLATTEN_TOLERANCE`] (a hang); past the cap the
+/// segments are just longer, which only coarsens parts of the curve far outside the mask.
+const MAX_CURVE_SEGMENTS: usize = 1024;
+
+/// `path` flattened to polylines, one per subpath: each curve uniformly in parameter into as many
+/// segments as Wang's formula needs for [`FLATTEN_TOLERANCE`], at most [`MAX_CURVE_SEGMENTS`], so
+/// the work is linear in the number of path elements whatever the coordinates.
+fn flatten_bounded(path: &BezPath) -> Vec<Vec<Point>> {
+    // Wang's formula: n = sqrt(k · max second difference / tolerance), k = 1/4 (quad), 3/4 (cubic).
+    let segments = |k: f64, dd: f64| -> usize {
+        let n = (k * dd / FLATTEN_TOLERANCE).sqrt().ceil();
+        if n.is_finite() { (n as usize).clamp(1, MAX_CURVE_SEGMENTS) } else { MAX_CURVE_SEGMENTS }
+    };
+    let mut polys: Vec<Vec<Point>> = vec![];
+    let mut last = Point::ZERO;
+    let mut start = Point::ZERO;
+    for el in path.elements() {
+        if !matches!(el, PathEl::MoveTo(_)) && polys.is_empty() {
+            polys.push(vec![last]);
+        }
+        let push = |polys: &mut Vec<Vec<Point>>, p: Point| {
+            if let Some(poly) = polys.last_mut() {
+                poly.push(p);
+            }
+        };
+        match *el {
+            PathEl::MoveTo(p) => {
+                polys.push(vec![p]);
+                (last, start) = (p, p);
+            }
+            PathEl::LineTo(p) => {
+                push(&mut polys, p);
+                last = p;
+            }
+            PathEl::QuadTo(a, p) => {
+                let q = kurbo::QuadBez::new(last, a, p);
+                let n = segments(0.25, (last.to_vec2() - 2.0 * a.to_vec2() + p.to_vec2()).hypot());
+                for i in 1..=n {
+                    push(&mut polys, kurbo::ParamCurve::eval(&q, i as f64 / n as f64));
+                }
+                last = p;
+            }
+            PathEl::CurveTo(a, b, p) => {
+                let c = kurbo::CubicBez::new(last, a, b, p);
+                let d1 = (last.to_vec2() - 2.0 * a.to_vec2() + b.to_vec2()).hypot();
+                let d2 = (a.to_vec2() - 2.0 * b.to_vec2() + p.to_vec2()).hypot();
+                let n = segments(0.75, d1.max(d2));
+                for i in 1..=n {
+                    push(&mut polys, kurbo::ParamCurve::eval(&c, i as f64 / n as f64));
+                }
+                last = p;
+            }
+            PathEl::ClosePath => last = start,
+        }
+    }
+    polys
+}
+
 /// `path` (device space) flattened and clipped to a little more than the `w × h` mask, one closed
 /// polygon per subpath (Sutherland–Hodgman against a rectangle keeps every winding number inside
 /// it, so both fill rules give the same coverage there).
 fn clip_to_rect(path: &BezPath, w: u32, h: u32) -> BezPath {
     let (x0, y0, x1, y1) = (-2.0, -2.0, f64::from(w) + 2.0, f64::from(h) + 2.0);
-    let mut polys: Vec<Vec<Point>> = vec![];
-    kurbo::flatten(path, 0.05, |el| match el {
-        PathEl::MoveTo(p) => polys.push(vec![p]),
-        PathEl::LineTo(p) => match polys.last_mut() {
-            Some(poly) => poly.push(p),
-            None => polys.push(vec![p]),
-        },
-        _ => {}
-    });
+    let polys = flatten_bounded(path);
     let mut out = BezPath::new();
     for poly in polys {
         let mut pts = poly;
@@ -520,6 +573,39 @@ mod tests {
         let mut nan = Mat3::default();
         nan.0[0][2] = f64::NAN;
         assert!(fill_coverage(&[tri(30.0)], &nan, 64, 64, FillRule::NonZero).data.iter().all(|v| *v == 0.0));
+    }
+
+    /// Review on #855: a curve with control points around 1e30 must not flatten into an enormous
+    /// number of segments (a hang). Each curve is capped, and curves near the mask still flatten
+    /// to the usual tolerance.
+    #[test]
+    fn far_away_curves_flatten_to_a_bounded_number_of_segments() {
+        let mut p = BezPath::new();
+        p.move_to((8.0, 8.0));
+        p.curve_to((1e30, -1e30), (-1e30, 1e30), (56.0, 56.0));
+        p.quad_to((1e30, 1e30), (8.0, 56.0));
+        p.close_path();
+        let t = std::time::Instant::now();
+        let polys = flatten_bounded(&p);
+        let n: usize = polys.iter().map(Vec::len).sum();
+        assert!(n <= 2 * MAX_CURVE_SEGMENTS + 1, "{n}");
+        let _ = fill_coverage(&[p], &Mat3::default(), 64, 64, FillRule::NonZero);
+        assert!(t.elapsed() < std::time::Duration::from_secs(5));
+        // A small circle: within tolerance of the true curve, like kurbo's own flattening.
+        let circle = kurbo::Circle::new((32.0, 32.0), 20.0).to_path(1e-3);
+        for poly in flatten_bounded(&circle) {
+            for w in poly.windows(2) {
+                let mid = w[0].midpoint(w[1]);
+                let r = (mid - Point::new(32.0, 32.0)).hypot();
+                assert!((r - 20.0).abs() <= FLATTEN_TOLERANCE + 1e-3, "{r}");
+            }
+        }
+        // The far-away curve clips to a mask-sized polygon without hanging either.
+        let mut far = BezPath::new();
+        far.move_to((8.0, 8.0));
+        far.curve_to((1e30, 8.0), (1e30, 56.0), (8.0, 56.0));
+        far.close_path();
+        let _ = clip_to_rect(&far, 64, 64);
     }
 
     use super::*;

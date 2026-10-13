@@ -1,7 +1,8 @@
 //! `cargo xtask fuzz`: run the fuzz targets in `fuzz/` (gaps.md G3, AGENTS.md "Never crash").
 //!
 //! - `cargo xtask fuzz --list`: the targets.
-//! - `cargo xtask fuzz --seeds`: (re)write the seed corpus `fuzz/corpus/<target>/seed-*`.
+//! - `cargo xtask fuzz --seeds`: (re)write the seed corpus `fuzz/corpus/<target>/seed-*`
+//!   (git-ignored; a run writes it first when a target has no seeds).
 //! - `cargo xtask fuzz [TARGET…] [--seconds N] [--jobs N]`: fuzz each target (default: all) for N
 //!   seconds (default 60) with cargo-fuzz on nightly. A crash stops it and leaves the input in
 //!   `fuzz/artifacts/<target>/`; turn it into a regression test in the crate that crashed, then
@@ -42,6 +43,10 @@ pub fn run(root: &Path, args: &[String]) -> Result<(), String> {
     if targets.is_empty() {
         targets = TARGETS.iter().map(|t| t.to_string()).collect();
     }
+    // The corpus isn't committed: seed it first when a target has no seeds yet.
+    if targets.iter().any(|t| !has_seeds(&dir.join("corpus").join(t))) {
+        seeds(&dir)?;
+    }
     let mut crashed = vec![];
     for t in &targets {
         println!("fuzz: {t} for {seconds} s");
@@ -81,6 +86,11 @@ fn libfuzzer_args(target: &str, seconds: u64, jobs: u32) -> Vec<String> {
         a.push("-detect_leaks=0".into());
     }
     a
+}
+
+/// Whether `corpus` holds any `seed-*` file.
+fn has_seeds(corpus: &Path) -> bool {
+    std::fs::read_dir(corpus).map(|d| d.flatten().any(|e| e.file_name().to_string_lossy().starts_with("seed-"))).unwrap_or(false)
 }
 
 fn seeds(dir: &Path) -> Result<(), String> {

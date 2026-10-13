@@ -1,6 +1,5 @@
 target/
-corpus/*/*
-!corpus/*/seed-*
+corpus/
 artifacts/
 coverage/
 fuzz-*.log

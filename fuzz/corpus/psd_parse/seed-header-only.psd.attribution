@@ -1,8 +1,0 @@
-asset:        seed-header-only.psd
-title:        Synthetic minimal PSD fuzz seed
-author:       EffectCraft contributors
-source:       original work
-license:      MIT OR Apache-2.0
-license-file: LICENSE-MIT, LICENSE-APACHE
-added:        2026-10-11 by EffectCraft contributors (attribution repair)
-notes:        Generated from the original byte literal in fuzz/examples/seeds.rs (introduced in fb8e8bd4, package licence MIT OR Apache-2.0). Synthetic parser input; no external artwork or media.

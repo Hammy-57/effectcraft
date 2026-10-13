@@ -1,8 +1,0 @@
-asset:        seed-basic-shapes.svg
-title:        SVG fuzz seed: basic-shapes.svg
-author:       EffectCraft contributors
-source:       original work
-license:      MIT OR Apache-2.0
-license-file: LICENSE-MIT, LICENSE-APACHE
-added:        2026-10-11 by EffectCraft contributors (attribution repair)
-notes:        Copied by fuzz/examples/seeds.rs (introduced in fb8e8bd4) from crates/svg/tests/fixtures/basic-shapes.svg; byte-for-byte copy. Original authorship and licence are recorded in crates/svg/tests/fixtures/basic-shapes.svg.attribution.
