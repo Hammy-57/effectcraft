@@ -291,22 +291,62 @@ pub(crate) fn motion_key_at(hits: &[KeyHit], pos: Pos2) -> Option<KeyHit> {
     hits.iter().rev().find(|h| h.tangent.is_none() && h.pos.distance(pos) < 6.0).copied()
 }
 
-pub(crate) fn motion_segment_at(segments: &[MotionSegment], pos: Pos2) -> Option<(LayerId, u64, Tick)> {
-    segments
+/// What the Pen slot acts on at a point of a motion path. Decided in one place, so the pointer
+/// shown, a click and a drag always agree (they used to apply their own rules and distances: the
+/// Add pointer showed where a click grabbed a tangent handle lying on the line, or tried to add a
+/// key where there was no free frame).
+#[derive(Clone, Copy)]
+pub(crate) enum PenTarget {
+    /// A keyframe's square: a click deletes it (Alt: converts it), a drag moves it.
+    Key(KeyHit),
+    /// A spatial tangent handle: a drag bends the path.
+    Tangent,
+    /// On the path: the free frame nearest the pointer, where a click adds a keyframe (After
+    /// Effects: a motion path's dots are its frames and keys sit on frames).
+    AddFrame(PathFrame),
+    /// On the path between keys on adjacent frames: no frame to add a key on.
+    PathFull,
+    /// Not on a motion path.
+    None,
+}
+
+/// Pick radius of a key square, of a tangent handle and of the path line, in points.
+const PEN_KEY_R: f32 = 6.0;
+const PEN_TANGENT_R: f32 = 5.0;
+const PEN_PATH_R: f32 = 6.0;
+
+/// The [`PenTarget`] at `pos`: a key square first, then a tangent handle, then the path line.
+pub(crate) fn pen_target(hits: &[KeyHit], segments: &[MotionSegment], frames: &[PathFrame], pos: Pos2) -> PenTarget {
+    let nearest = |tangent: bool, r: f32| {
+        hits.iter().filter(|h| h.tangent.is_some() == tangent && h.pos.distance(pos) < r).min_by(|a, b| a.pos.distance(pos).total_cmp(&b.pos.distance(pos))).copied()
+    };
+    if let Some(k) = nearest(false, PEN_KEY_R) {
+        return PenTarget::Key(k);
+    }
+    if nearest(true, PEN_TANGENT_R).is_some() {
+        return PenTarget::Tangent;
+    }
+    // The nearest displayed sample interval, and how far along it the pointer is.
+    let Some((seg, f)) = segments
         .iter()
-        .rev()
         .filter_map(|s| {
             let delta = s.to - s.from;
             if delta.length_sq() < 0.001 {
                 return None;
             }
             let f = ((pos - s.from).dot(delta) / delta.length_sq()).clamp(0.0, 1.0);
-            let distance = pos.distance(s.from + delta * f);
-            let time = Tick::from_seconds_f64(s.start.seconds() + (s.end.seconds() - s.start.seconds()) * f64::from(f));
-            (distance < 6.0).then_some((distance, s.layer, s.prop, time))
+            let d = pos.distance(s.from + delta * f);
+            (d < PEN_PATH_R).then_some((s, f, d))
         })
-        .min_by(|a, b| a.0.total_cmp(&b.0))
-        .map(|(_, l, p, t)| (l, p, t))
+        .min_by(|a, b| a.2.total_cmp(&b.2))
+        .map(|(s, f, _)| (s, f))
+    else {
+        return PenTarget::None;
+    };
+    let is_key = |t: Tick| hits.iter().any(|h| h.tangent.is_none() && h.layer == seg.layer && h.prop == seg.prop && h.time == t);
+    let frame = |t: Tick| frames.iter().find(|fr| fr.layer == seg.layer && fr.prop == seg.prop && fr.time == t).copied();
+    let order = if f < 0.5 { [seg.start, seg.end] } else { [seg.end, seg.start] };
+    order.into_iter().filter(|t| !is_key(*t)).find_map(frame).map_or(PenTarget::PathFull, PenTarget::AddFrame)
 }
 
 pub(crate) fn edit_motion_key(app: &mut EffectcraftApp, h: KeyHit, delete: bool) {
@@ -759,5 +799,38 @@ mod tests {
         assert_eq!(open_end_at(std::slice::from_ref(&open), &map, egui::pos2(80.0, 80.0), 8.0), None, "far away");
         let closed = info(vec![[10.0, 10.0], [50.0, 10.0], [50.0, 50.0]], true);
         assert_eq!(open_end_at(&[closed], &map, egui::pos2(50.0, 50.0), 8.0), None, "closed path");
+    }
+
+    /// The Pen on a motion path: one decision for the pointer, the click and the drag. A key's
+    /// square wins, then a tangent handle (they lie on the line of a straight path), then the
+    /// line itself, which adds a key on the nearest frame that has none; between keys on
+    /// adjacent frames there is nothing to add.
+    #[test]
+    fn pen_target_picks_key_then_handle_then_free_frame() {
+        let (l, p) = (LayerId(1), 7);
+        let fd = Tick::from_seconds_f64(1.0 / 30.0);
+        let t = |f: i64| Tick(fd.0 * f);
+        let key = |f: i64, x: f32, tangent: Option<bool>| KeyHit {
+            layer: l,
+            prop: p,
+            time: t(f),
+            pos: egui::pos2(x, 100.0),
+            tangent,
+            value: [0.0; 3],
+            p2c: Mat3::IDENTITY,
+            curved: true,
+        };
+        // Keys on frames 0, 3 and 4 (20 pt a frame); frame 0's out handle at x = 12.
+        let hits = vec![key(0, 0.0, None), key(0, 12.0, Some(true)), key(3, 60.0, None), key(4, 80.0, None)];
+        let frames: Vec<PathFrame> = (0..=4).map(|f| PathFrame { layer: l, prop: p, time: t(f), pos: egui::pos2(f as f32 * 20.0, 100.0) }).collect();
+        let segments: Vec<MotionSegment> =
+            (0..4).map(|f| MotionSegment { layer: l, prop: p, from: egui::pos2(f as f32 * 20.0, 100.0), to: egui::pos2(f as f32 * 20.0 + 20.0, 100.0), start: t(f), end: t(f + 1) }).collect();
+        let at = |x: f32, y: f32| pen_target(&hits, &segments, &frames, egui::pos2(x, y));
+        assert!(matches!(at(1.0, 101.0), PenTarget::Key(k) if k.time == t(0)));
+        assert!(matches!(at(13.0, 100.0), PenTarget::Tangent), "the handle on the line");
+        assert!(matches!(at(19.0, 100.0), PenTarget::AddFrame(f) if f.time == t(1)), "past the handle's reach: nearest frame");
+        assert!(matches!(at(37.0, 100.0), PenTarget::AddFrame(f) if f.time == t(2)), "nearest frame");
+        assert!(matches!(at(70.0, 100.0), PenTarget::PathFull), "keys on adjacent frames");
+        assert!(matches!(at(40.0, 120.0), PenTarget::None), "off the path");
     }
 }

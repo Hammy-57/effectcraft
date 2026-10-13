@@ -1366,24 +1366,18 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             let c = map.to_comp(hp);
             [c[0] as f32, c[1] as f32]
         });
-        let motion_key = ov::motion_key_at(&key_hits, hp);
-        let motion_segment = ov::motion_segment_at(&motion_segments, hp);
+        let pen_hit = ov::pen_target(&key_hits, &motion_segments, &motion_frames, hp);
         let cursor_tool = if app.ui.tool == Tool::Pen {
-            if motion_key.is_some() && ctx.input(|i| i.modifiers.alt) {
-                Tool::PenConvert
-            } else if motion_key.is_some() {
-                Tool::PenDelete
-            } else if motion_segment.is_some() {
-                Tool::PenAdd
-            } else {
-                Tool::Pen
+            match pen_hit {
+                ov::PenTarget::Key(_) if ctx.input(|i| i.modifiers.alt) => Tool::PenConvert,
+                ov::PenTarget::Key(_) => Tool::PenDelete,
+                ov::PenTarget::Tangent => Tool::PenConvert,
+                ov::PenTarget::AddFrame(_) => Tool::PenAdd,
+                ov::PenTarget::PathFull | ov::PenTarget::None => Tool::Pen,
             }
         } else {
             app.ui.tool
         };
-        // The Pen slot's pointer: the owner-local After Effects cursor when there is one, else
-        // a painted pen; never both (one pen under the other).
-        let mut pen_native: Option<&str> = None;
         let cursor = match cursor_tool {
             Tool::Hand => egui::CursorIcon::Grab,
             Tool::Zoom => egui::CursorIcon::ZoomIn,
@@ -1392,23 +1386,10 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             Tool::PanCamera => egui::CursorIcon::Move,
             Tool::Dolly => egui::CursorIcon::ResizeVertical,
             t if t.is_pen() => {
-                let over_path =
-                    ov::segment_at(&paths, &map, hp, 5.0).is_some() || motion_segment.is_some() || ov::motion_frame_at(&motion_frames, &key_hits, hp).is_some();
-                let icon = pen_cursor_icon(t, over_path);
-                let name = match icon {
-                    crate::icons::Icon::PenAdd => Some("pen-add"),
-                    crate::icons::Icon::PenDelete => Some("pen-delete"),
-                    crate::icons::Icon::PenConvert => Some("pen-convert"),
-                    crate::icons::Icon::Pen => Some("pen"),
-                    _ => None,
-                };
-                if let Some(name) = name.filter(|n| !app.ui.viewer.roi_draw && crate::local_assets::cursor(&ctx, n, [1, 1])) {
-                    pen_native = Some(name);
-                    egui::CursorIcon::Default
-                } else {
-                    pen_cursor(&ctx, hp, icon);
-                    egui::CursorIcon::None
-                }
+                // (Over a mask or shape path the Pen adds a vertex.)
+                let over_path = ov::segment_at(&paths, &map, hp, 5.0).is_some();
+                pen_cursor(&ctx, hp, pen_cursor_icon(t, over_path));
+                egui::CursorIcon::None
             }
             t if t.is_shape() => egui::CursorIcon::Crosshair,
             _ if app.ui.viewer.roi_draw => egui::CursorIcon::Crosshair,
@@ -1452,7 +1433,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 Tool::Orbit => Some(("orbit", [11, 9])),
                 Tool::PanCamera => Some(("camera-pan", [8, 10])),
                 Tool::Dolly => Some(("dolly", [9, 9])),
-                _ => pen_native.map(|n| (n, [1, 1])),
+                _ => None,
             };
             if let Some((name, hotspot)) = native {
                 crate::local_assets::cursor(&ctx, name, hotspot);
@@ -1483,11 +1464,9 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         && resp.hovered()
         && ui.input(|i| i.pointer.primary_pressed())
         && let Some(pos) = ui.input(|i| i.pointer.press_origin())
-        && ov::motion_key_at(&key_hits, pos).is_none()
-        && ov::motion_segment_at(&motion_segments, pos).is_none()
-        && !key_hits.iter().any(|h| h.tangent.is_some() && h.pos.distance(pos) < 6.0)
+        && matches!(ov::pen_target(&key_hits, &motion_segments, &motion_frames, pos), ov::PenTarget::None)
     {
-        pen_press(app, ui, &ectx, &map, &paths, ov::motion_frame_at(&motion_frames, &key_hits, pos), pos, mods);
+        pen_press(app, ui, &ectx, &map, &paths, None, pos, mods);
     }
     // A pen click (press + release without a drag) ends its tangent gesture on release.
     if ui.input(|i| i.pointer.primary_released())
@@ -1521,7 +1500,12 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                         .map(|inv| Gesture::Overlay(ov::Drag::KeyTangent { layer: h.layer, prop: h.prop, time: h.time, out: true, key: h.value, inv }))
                 })
             }
-            Tool::Selection | Tool::Pen | Tool::PenAdd | Tool::PenConvert if key_hits.iter().any(|h| h.pos.distance(press) < 6.0) => {
+            Tool::Pen | Tool::PenAdd | Tool::PenConvert
+                if matches!(ov::pen_target(&key_hits, &motion_segments, &motion_frames, press), ov::PenTarget::Key(_) | ov::PenTarget::Tangent) =>
+            {
+                ov::begin_key_drag(app, &key_hits, press, map.to_comp(press), mods.shift).map(Gesture::Overlay)
+            }
+            Tool::Selection if key_hits.iter().any(|h| h.pos.distance(press) < 6.0) => {
                 ov::begin_key_drag(app, &key_hits, press, map.to_comp(press), mods.shift).map(Gesture::Overlay)
             }
             Tool::Selection if vt::guide_at(app, &comp, &map, press).is_some() => {
@@ -2002,14 +1986,12 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 app.ui.viewer.pan = [pan.x, pan.y];
             }
             Tool::Type | Tool::TypeVertical => {}
-            Tool::Pen if ov::motion_key_at(&key_hits, pos).is_some() => {
-                if let Some(h) = ov::motion_key_at(&key_hits, pos) {
-                    ov::edit_motion_key(app, h, !mods.alt);
-                }
-            }
-            Tool::Pen | Tool::PenAdd if ov::motion_segment_at(&motion_segments, pos).is_some() && ov::motion_key_at(&key_hits, pos).is_none() => {
-                if let Some(hit) = ov::motion_segment_at(&motion_segments, pos) {
-                    ov::insert_motion_key(app, hit);
+            // On a motion path: what the pointer showed (see `ov::pen_target`).
+            Tool::Pen | Tool::PenAdd if !matches!(ov::pen_target(&key_hits, &motion_segments, &motion_frames, pos), ov::PenTarget::None) => {
+                match ov::pen_target(&key_hits, &motion_segments, &motion_frames, pos) {
+                    ov::PenTarget::Key(h) if app.ui.tool == Tool::Pen => ov::edit_motion_key(app, h, !mods.alt),
+                    ov::PenTarget::AddFrame(f) => ov::insert_motion_key(app, (f.layer, f.prop, f.time)),
+                    _ => {}
                 }
             }
             Tool::PenDelete | Tool::PenConvert if ov::motion_key_at(&key_hits, pos).is_some() => {
@@ -2316,15 +2298,31 @@ fn pen_cursor_icon(tool: Tool, over_path: bool) -> crate::icons::Icon {
 }
 
 /// Paint pen pointer `icon` with its tip at `at`, outlined for any background.
+/// The system pointer is hidden meanwhile: painting it every frame keeps it steady, where a
+/// bitmap cursor is dropped on frames the windowing layer can't register it (an arrow flickered).
 fn pen_cursor(ctx: &egui::Context, at: Pos2, icon: crate::icons::Icon) {
     use crate::icons::Icon;
+    let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("viewer-pen-cursor")));
+    // The owner-local After Effects pointer (32 pt, tip at its top-left corner) when there is one.
+    let native = match icon {
+        Icon::PenAdd => Some("cursor-pen-add"),
+        Icon::PenDelete => Some("cursor-pen-delete"),
+        Icon::PenConvert => Some("cursor-pen-convert"),
+        Icon::Pen => Some("cursor-pen"),
+        _ => None,
+    };
+    let hidpi = if ctx.pixels_per_point() >= 1.5 { "@2x" } else { "" };
+    if let Some(name) = native
+        && crate::local_assets::paint(&painter, Rect::from_min_size(at - vec2(1.0, 1.0), vec2(32.0, 32.0)), &format!("{name}{hidpi}"), Color32::WHITE)
+    {
+        return;
+    }
     // Where each glyph's tip sits in its 16 × 16 box.
     let tip = match icon {
         Icon::PenAdd | Icon::PenDelete | Icon::MaskFeather => vec2(6.0, 2.5),
         Icon::PenConvert => vec2(8.0, 3.5),
         _ => vec2(8.0, 1.8),
     };
-    let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("viewer-pen-cursor")));
     let rect = Rect::from_min_size(at - tip, vec2(16.0, 16.0));
     for d in [vec2(-1.0, 0.0), vec2(1.0, 0.0), vec2(0.0, -1.0), vec2(0.0, 1.0)] {
         crate::icons::paint(&painter, rect.translate(d), icon, Color32::BLACK);
