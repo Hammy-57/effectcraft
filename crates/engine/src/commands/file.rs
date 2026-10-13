@@ -48,9 +48,11 @@ pub(crate) fn open(s: &mut Session, p: &Value) -> Result<Value> {
     let text = String::from_utf8(bytes).map_err(|_| EngineError::Other("not a text project file".into()))?;
     // XML copies (File ▸ Save a Copy As XML…) open like the JSON project.
     let text = if crate::xml_project::is_xml(&text) { crate::xml_project::from_xml(&text).map_err(EngineError::Other)? } else { text };
-    let mut proj = Project::from_json(&text).map_err(|e| EngineError::Other(format!("{path} is not a project EffectCraft can open: {e}")))?;
+    let (mut proj, repaired) =
+        Project::from_json_repaired(&text).map_err(|e| EngineError::Other(format!("{path} is not a project EffectCraft can open: {e}")))?;
     resolve_relative_footage(&mut proj, path, s.services.as_ref());
     s.replace_project(proj, Some(path.to_string()));
+    s.restore_view(&effectcraft_project::saved_view(&text));
     s.note_project_path(path);
     // The save guard compares against the file as opened; other processes with it open are named.
     crate::hosts::remember(path);
@@ -58,6 +60,13 @@ pub(crate) fn open(s: &mut Session, p: &Value) -> Result<Value> {
     let elsewhere = crate::hosts::others_with(path);
     if let Some(w) = crate::hosts::open_elsewhere_warning(path, &elsewhere) {
         s.toast(w);
+    }
+    // Values past the limits (a corrupt or hostile file) were brought within them (#788).
+    if !repaired.is_empty() {
+        let more = repaired.len().saturating_sub(3);
+        let shown = repaired.iter().take(3).cloned().collect::<Vec<_>>().join("; ");
+        let more = if more > 0 { format!(" and {more} more") } else { String::new() };
+        s.toast(format!("This project had values outside EffectCraft's limits, corrected when it opened: {shown}{more}."));
     }
     // Written by a newer EffectCraft: what this version doesn't know would be lost on saving.
     let saved_by = effectcraft_project::saved_by(&text);
@@ -72,7 +81,7 @@ pub(crate) fn open(s: &mut Session, p: &Value) -> Result<Value> {
     if s.check_footage_on_open {
         crate::footage_check::start(s, None, false)?;
     }
-    let mut out = json!({"path": path, "savedBy": saved_by});
+    let mut out = json!({"path": path, "savedBy": saved_by, "repaired": repaired});
     if let Some(h) = handover {
         out["handover"] = json!(h);
     }
@@ -108,7 +117,7 @@ fn resolve_relative_footage(p: &mut Project, project_path: &str, services: &dyn 
 /// project opened from an XML copy saves as XML again). Fails, writing nothing, when the project
 /// wouldn't read back.
 pub(crate) fn file_text(s: &Session, path: &str) -> Result<String> {
-    let json = s.project.to_file_json()?;
+    let json = s.project.to_file_json_with_view(&s.saved_view())?;
     if crate::xml_project::is_xml_path(path) { crate::xml_project::to_xml(&json).map_err(EngineError::Other) } else { Ok(json) }
 }
 
