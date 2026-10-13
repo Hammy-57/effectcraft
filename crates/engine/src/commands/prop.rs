@@ -230,8 +230,20 @@ fn json_numbers(v: &Value) -> Option<Vec<f64>> {
     }
 }
 
+/// The share of a Proportional Scrubbing change (After Effects 26.2, Ctrl+Alt / Cmd+Opt scrub)
+/// that the layer at `index` of `count` selected layers (in selection order) takes: the first
+/// none, the last all of it, the ones between even steps.
+pub(crate) fn proportional_share(index: usize, count: usize) -> f64 {
+    match count.checked_sub(1) {
+        Some(last) if last > 0 => index.min(last) as f64 / last as f64,
+        _ => 1.0,
+    }
+}
+
 /// `prop.set`; with `selected`, also on the other selected layers: the same value, or with
-/// `offset` (a scrub) the same change from each layer's own value. One undo step (with `merge`,
+/// `offset` (a scrub) the same change from each layer's own value. With `offset` and
+/// `proportional` (Proportional Scrubbing) each layer takes [`proportional_share`] of the change
+/// by its place in the selection order, the scrubbed layer too. One undo step (with `merge`,
 /// one that a continuing scrub keeps folding into).
 fn set_selected(s: &mut Session, p: &Value) -> Result<Value> {
     let twins = selected_twins(s, p, "prop.set")?;
@@ -244,16 +256,41 @@ fn set_selected(s: &mut Session, p: &Value) -> Result<Value> {
         (Some(true), Some(n), Some(c)) => Some(n.iter().zip(c.iter().chain(std::iter::repeat(&0.0))).map(|(a, b)| a - b).collect::<Vec<f64>>()),
         _ => None,
     };
+    // Proportional Scrubbing: the edited layer and its twins in selection order.
+    let order: Option<Vec<LayerId>> = (delta.is_some() && b_p(p, "proportional") == Some(true))
+        .then(|| s.state.selected_layers.iter().copied().filter(|o| *o == lid || twins.iter().any(|(t, _)| t == o)).collect());
+    let share = |l: LayerId| order.as_ref().map_or(1.0, |o| o.iter().position(|x| *x == l).map_or(1.0, |i| proportional_share(i, o.len())));
+    let scalar = p.get("value").is_some_and(Value::is_number);
+    // `p` aimed at (layer, prop) with its value moved by `k` × the change.
+    let shifted = |s: &Session, q: &mut Value, olid: LayerId, ouid: Uid, k: f64| {
+        if let Some(d) = &delta
+            && let Some(c) = current_components(s, cid, olid, ouid)
+        {
+            let v: Vec<f64> = c.iter().enumerate().map(|(i, x)| x + k * d.get(i).copied().unwrap_or(0.0)).collect();
+            q["value"] = if scalar { json!(v.first().copied().unwrap_or(0.0)) } else { json!(v) };
+        }
+    };
     let run = |s: &mut Session| -> Result<Value> {
-        let out = set(s, p)?;
-        for (olid, ouid) in twins {
-            let mut q = twin_params(p, olid, ouid);
-            if let Some(d) = &delta
-                && let Some(c) = current_components(s, cid, olid, ouid)
-            {
-                let v: Vec<f64> = c.iter().enumerate().map(|(i, x)| x + d.get(i).copied().unwrap_or(0.0)).collect();
-                q["value"] = if p.get("value").is_some_and(Value::is_number) { json!(v.first().copied().unwrap_or(0.0)) } else { json!(v) };
+        let out = if order.is_some() {
+            let k = share(lid);
+            if k <= 0.0 {
+                // (the first selected layer keeps its value: no key is added to it)
+                current_components(s, cid, lid, uid).map_or(Value::Null, |c| if scalar { json!(c.first().copied().unwrap_or(0.0)) } else { json!(c) })
+            } else {
+                let mut q = p.clone();
+                shifted(s, &mut q, lid, uid, k);
+                set(s, &q)?
             }
+        } else {
+            set(s, p)?
+        };
+        for (olid, ouid) in twins {
+            let k = share(olid);
+            if k <= 0.0 {
+                continue;
+            }
+            let mut q = twin_params(p, olid, ouid);
+            shifted(s, &mut q, olid, ouid, k);
             // (a layer that can't take it, e.g. a clamped or static property, keeps its value)
             let _ = set(s, &q);
         }
@@ -1140,7 +1177,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Set Property Value",
             [],
             None,
-            "{layer?, path|prop, value, time? (layer s by default), timeBase?: layer|comp, merge?, selected? (also the other selected layers), offset? (them by the same change)}",
+            "{layer?, path|prop, value, time? (layer s by default), timeBase?: layer|comp, merge?, selected? (also the other selected layers), offset? (them by the same change), proportional? (with offset: Proportional Scrubbing, each layer by its share in selection order, the first none, the last all)}",
             has_layers,
             set_selected
         ),
