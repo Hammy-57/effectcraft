@@ -1258,3 +1258,26 @@ fn automation_roots_confine_file_access() {
     assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 1, "only the unconfined save");
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// Review on #859: the commands that write files they are given are checked against the write
+/// roots: never outside them, into a read root or to a relative path.
+#[test]
+fn confinement_covers_every_command_that_writes_a_file() {
+    use crate::confine::Confinement;
+    let base = std::env::temp_dir().join(format!("ec-mcp-confine-writes-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let (read, write, outside) = (base.join("in"), base.join("out"), base.join("elsewhere"));
+    for d in [&read, &write, &outside] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let p = |d: &std::path::Path, f: &str| d.join(f).to_string_lossy().into_owned();
+    let c = Confinement::new(std::slice::from_ref(&read), std::slice::from_ref(&write)).unwrap();
+    for (id, key) in [("journal.export", "path"), ("help.exportRepro", "path"), ("file.exportTimeline", "path")] {
+        let with = |path: String| json!({key: path});
+        assert!(c.check_command(id, &with(p(&write, "x.out"))).is_ok(), "{id} into a write root");
+        for bad in [p(&outside, "x.out"), p(&read, "x.out"), "x.out".to_string(), p(&write, "../elsewhere/x.out")] {
+            assert!(c.check_command(id, &with(bad.clone())).is_err(), "{id}: {bad} must be refused");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
