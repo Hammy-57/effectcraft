@@ -13,15 +13,17 @@
 //! (no DNS rebinding). Origins: the plug-in iframe (`null`), figma.com, or none (curl, agents);
 //! browsers on other sites are refused. Origin `null` is any sandboxed iframe, not only the
 //! plug-in, so the pairing code printed at start-up is the real protection: 12 characters from
-//! the OS's CSPRNG (60 bits), and after 5 wrong codes in a row the bridge refuses codes for a
-//! minute (429). Request bodies are capped at 64 MB. The code is kept in the settings folder,
-//! created readable only by the user, so it survives restarts.
+//! the OS's CSPRNG (60 bits, far beyond guessing over HTTP). There is deliberately no lockout
+//! after wrong codes: any page could trigger it and lock the plug-in out. Request bodies are
+//! capped at 64 MB. The code is kept in the settings folder, created readable only by the user,
+//! so it survives restarts. Payloads are written to a per-user folder only the user can read,
+//! under a random name, and deleted after the import.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use effectcraft_automation::BridgeClient;
 use serde_json::{Value, json};
@@ -36,9 +38,9 @@ const CODE_FILE: &str = "figma-bridge-code";
 const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 /// The pairing code's length: 12 characters of 5 bits, 60 bits.
 const CODE_LEN: usize = 12;
-/// After this many wrong pairing codes in a row, the bridge refuses codes for [`LOCKOUT`].
-const MAX_WRONG_CODES: u32 = 5;
-const LOCKOUT: Duration = Duration::from_secs(60);
+/// The shortest pairing code given on the command line (as long as a generated one: with no
+/// lockout, guessing must be hopeless on its own).
+const MIN_CODE_LEN: usize = CODE_LEN;
 const TOO_LARGE: &str = "payload too large";
 
 pub struct Config {
@@ -73,19 +75,19 @@ fn new_code() -> Result<String, String> {
     if out.len() == CODE_LEN { Ok(out) } else { Err("the random source kept failing".into()) }
 }
 
-/// `explicit` (at least 8 characters), else the code stored in `dir`, else a new one (stored in
+/// `explicit` (at least [`MIN_CODE_LEN`] characters), else the code stored in `dir`, else a new one (stored in
 /// `dir` when there is one, created readable only by the user).
 fn pairing_code_in(dir: Option<&std::path::Path>, explicit: Option<&str>) -> Result<String, String> {
     if let Some(c) = explicit.map(str::trim).filter(|c| !c.is_empty()) {
-        if c.len() < 8 {
-            return Err("the pairing code needs at least 8 characters".into());
+        if c.len() < MIN_CODE_LEN {
+            return Err(format!("the pairing code needs at least {MIN_CODE_LEN} characters"));
         }
         return Ok(c.to_string());
     }
     let path = dir.map(|d| d.join(CODE_FILE));
     if let Some(p) = &path
         && let Ok(c) = std::fs::read_to_string(p)
-        && c.trim().len() >= 8
+        && c.trim().len() >= MIN_CODE_LEN
     {
         return Ok(c.trim().to_string());
     }
@@ -191,14 +193,6 @@ fn same_code(a: &str, b: &str) -> bool {
     a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// Wrong pairing codes: after [`MAX_WRONG_CODES`] in a row, codes are refused for a while (any
-/// sandboxed page can reach the bridge with origin `null`, so the code must not be guessable).
-#[derive(Default)]
-struct Guesses {
-    wrong: u32,
-    locked_until: Option<Instant>,
-}
-
 /// What a request's `X-EffectCraft-Code` says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Auth {
@@ -206,8 +200,6 @@ enum Auth {
     None,
     Paired,
     Wrong,
-    /// Too many wrong codes: not checked.
-    Locked,
 }
 
 struct Shared {
@@ -216,37 +208,22 @@ struct Shared {
     port: u16,
     /// One transfer at a time.
     lock: Mutex<()>,
-    guesses: Mutex<Guesses>,
-    lockout: Duration,
 }
 
 impl Shared {
     fn new(control: String, code: String, port: u16) -> Self {
-        Self { control, code, port, lock: Mutex::new(()), guesses: Mutex::new(Guesses::default()), lockout: LOCKOUT }
+        Self { control, code, port, lock: Mutex::new(()) }
     }
 
-    /// Check the request's pairing code, counting wrong ones: the [`MAX_WRONG_CODES`]th wrong
-    /// code in a row locks codes out for `lockout`; a right one resets the count.
+    /// Check the request's pairing code. There is no lockout: any page can reach the bridge
+    /// (a sandboxed iframe has origin `null`), so a lockout would let it lock the plug-in out.
+    /// Guessing a 60-bit code over HTTP is hopeless instead.
     fn auth(&self, req: &Request) -> Auth {
-        let Some(c) = req.header("x-effectcraft-code").map(str::trim).filter(|c| !c.is_empty()) else {
-            return Auth::None;
-        };
-        let mut g = self.guesses.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(t) = g.locked_until {
-            if Instant::now() < t {
-                return Auth::Locked;
-            }
-            *g = Guesses::default();
+        match req.header("x-effectcraft-code").map(str::trim).filter(|c| !c.is_empty()) {
+            None => Auth::None,
+            Some(c) if same_code(c, &self.code) => Auth::Paired,
+            Some(_) => Auth::Wrong,
         }
-        if same_code(c, &self.code) {
-            g.wrong = 0;
-            return Auth::Paired;
-        }
-        g.wrong = g.wrong.saturating_add(1);
-        if g.wrong >= MAX_WRONG_CODES {
-            g.locked_until = Instant::now().checked_add(self.lockout);
-        }
-        Auth::Wrong
     }
 }
 
@@ -270,11 +247,7 @@ fn import(sh: &Shared, req: &Request) -> Result<Value, (String, String)> {
     let body: Value = serde_json::from_slice(&req.body).map_err(|e| ("400 Bad Request".into(), format!("not JSON: {e}")))?;
     let payload =
         body.get("payload").filter(|p| p.is_object() || p.is_array()).ok_or_else(|| ("400 Bad Request".to_string(), "missing `payload`".to_string()))?;
-    let dir = std::env::temp_dir().join("effectcraft-figma-bridge");
-    std::fs::create_dir_all(&dir).map_err(|e| ("500 Internal Server Error".to_string(), format!("cannot create {}: {e}", dir.display())))?;
-    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
-    let file = dir.join(format!("payload-{}-{stamp}.json", std::process::id()));
-    std::fs::write(&file, payload.to_string()).map_err(|e| ("500 Internal Server Error".to_string(), format!("cannot write the payload: {e}")))?;
+    let file = write_payload(&payload.to_string()).map_err(|e| ("500 Internal Server Error".to_string(), format!("cannot write the payload: {e}")))?;
     let mut params = json!({"payloadPath": file.to_string_lossy()});
     for k in ["target", "frameRate", "duration", "scale"] {
         if let Some(v) = body.get(k).filter(|v| !v.is_null()) {
@@ -289,6 +262,59 @@ fn import(sh: &Shared, req: &Request) -> Result<Value, (String, String)> {
     r
 }
 
+/// Write `json` to a new file only this user can read: in a private folder of the settings
+/// folder (else of the temp folder), with a random name, created exclusively (never through a
+/// file or link someone else put there).
+fn write_payload(json: &str) -> std::io::Result<std::path::PathBuf> {
+    let base = effectcraft_host::config_dir().unwrap_or_else(std::env::temp_dir);
+    write_payload_in(&base, json)
+}
+
+fn write_payload_in(base: &std::path::Path, json: &str) -> std::io::Result<std::path::PathBuf> {
+    let dir = base.join(format!("effectcraft-figma-bridge-{}", users_tag()));
+    let mut b = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        b.mode(0o700);
+    }
+    match b.create(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    // An existing folder must be a real one of ours, private.
+    let meta = std::fs::symlink_metadata(&dir)?;
+    if !meta.is_dir() {
+        return Err(std::io::Error::other(format!("{} is not a folder", dir.display())));
+    }
+    // Tighten a loose folder; that fails unless it is ours, and one that is someone else's and
+    // private can't be written to below either.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        if meta.mode() & 0o077 != 0 {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    let code = new_code().map_err(std::io::Error::other)?;
+    let file = dir.join(format!("payload-{code}.json"));
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        o.mode(0o600);
+    }
+    o.open(&file)?.write_all(json.as_bytes())?;
+    Ok(file)
+}
+
+/// A per-user suffix for the payload folder, so users of one machine never share it.
+fn users_tag() -> String {
+    std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_default().chars().filter(char::is_ascii_alphanumeric).take(32).collect()
+}
+
 /// The checks before a request runs: host, origin and the pairing code (None: go ahead).
 fn refuse(sh: &Shared, req: &Request) -> Option<(&'static str, Value)> {
     if !host_ok(req.header("host"), sh.port) {
@@ -301,7 +327,6 @@ fn refuse(sh: &Shared, req: &Request) -> Option<(&'static str, Value)> {
     if (req.method.as_str(), path) == ("POST", "/import") {
         match sh.auth(req) {
             Auth::Paired => {}
-            Auth::Locked => return Some(("429 Too Many Requests", json!({"ok": false, "error": "too many wrong pairing codes; try again in a minute"}))),
             Auth::None | Auth::Wrong => {
                 return Some(("401 Unauthorized", json!({"ok": false, "error": "wrong or missing pairing code (printed by `effectcraft-cli figma-bridge`)"})));
             }
@@ -427,32 +452,44 @@ mod tests {
         assert!(st.starts_with("403"));
     }
 
+    /// Review on #1103: wrong codes never lock the real plug-in out (any page could send them),
+    /// on /import or /status.
     #[test]
-    fn wrong_codes_lock_out_then_recover() {
-        let mut sh = Shared::new("127.0.0.1:9877".into(), "CODE12345678".into(), 7789);
-        sh.lockout = Duration::from_millis(300);
+    fn wrong_codes_never_lock_the_plugin_out() {
+        let sh = Shared::new("127.0.0.1:9877".into(), "CODE12345678".into(), 7789);
         let import = |sh: &Shared, code: &str| refuse(sh, &req("POST", "/import", &[PLUGIN, HOST, ("X-EffectCraft-Code", code)])).map(|(st, _)| st);
-        assert_eq!(import(&sh, "WRONG1234567"), Some("401 Unauthorized"));
         assert_eq!(refuse(&sh, &req("POST", "/import", &[PLUGIN, HOST])).map(|(st, _)| st), Some("401 Unauthorized"));
-        // A right code resets the count.
-        for _ in 0..3 {
+        for _ in 0..100 {
             assert_eq!(import(&sh, "WRONG1234567"), Some("401 Unauthorized"));
+            assert_eq!(sh.auth(&req("GET", "/status", &[PLUGIN, HOST, ("X-EffectCraft-Code", "WRONG1234567")])), Auth::Wrong);
         }
         assert_eq!(import(&sh, "CODE12345678"), None);
-        for _ in 0..4 {
-            assert_eq!(import(&sh, "WRONG1234567"), Some("401 Unauthorized"));
+        assert_eq!(sh.auth(&req("GET", "/status", &[PLUGIN, HOST, ("X-EffectCraft-Code", "CODE12345678")])), Auth::Paired);
+        assert_eq!(sh.auth(&req("GET", "/status", &[PLUGIN, HOST])), Auth::None);
+    }
+
+    /// Payloads go to a private per-user folder, under fresh names, never through an existing
+    /// file.
+    #[test]
+    fn payloads_are_written_privately() {
+        let base = std::env::temp_dir().join(format!("ec-figma-bridge-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let a = write_payload_in(&base, "{}").unwrap();
+        let b = write_payload_in(&base, "{}").unwrap();
+        assert_ne!(a, b);
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "{}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(std::fs::metadata(&a).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(std::fs::metadata(a.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+            // A loose folder is made private again.
+            std::fs::set_permissions(a.parent().unwrap(), std::fs::Permissions::from_mode(0o777)).unwrap();
+            write_payload_in(&base, "{}").unwrap();
+            assert_eq!(std::fs::metadata(a.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
         }
-        // The fifth wrong one in a row locks codes out, even the right one; /status can't probe.
-        assert_eq!(import(&sh, "WRONG1234567"), Some("401 Unauthorized"));
-        assert_eq!(import(&sh, "CODE12345678"), Some("429 Too Many Requests"));
-        assert_eq!(sh.auth(&req("GET", "/status", &[PLUGIN, HOST, ("X-EffectCraft-Code", "CODE12345678")])), Auth::Locked);
-        std::thread::sleep(Duration::from_millis(350));
-        assert_eq!(import(&sh, "CODE12345678"), None);
-        // No code at all isn't a guess.
-        for _ in 0..10 {
-            assert_eq!(sh.auth(&req("GET", "/status", &[PLUGIN, HOST])), Auth::None);
-        }
-        assert_eq!(import(&sh, "CODE12345678"), None);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -475,7 +512,8 @@ mod tests {
             use std::os::unix::fs::PermissionsExt as _;
             assert_eq!(std::fs::metadata(dir.join(CODE_FILE)).unwrap().permissions().mode() & 0o777, 0o600);
         }
-        assert_eq!(pairing_code_in(Some(&dir), Some(" MINE-CODE ")).unwrap(), "MINE-CODE");
+        assert_eq!(pairing_code_in(Some(&dir), Some(" MINE-CODE-123 ")).unwrap(), "MINE-CODE-123");
+        assert!(pairing_code_in(Some(&dir), Some("ELEVEN-CHAR")).is_err());
         assert!(pairing_code_in(Some(&dir), Some("SHORT")).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }

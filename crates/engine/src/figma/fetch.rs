@@ -1,7 +1,7 @@
 //! The Figma REST API (`GET /v1/files/:key/nodes`, `GET /v1/images/:key`) through the system's
 //! `curl`, as model downloads do (`crate::models`): no networking code is linked into
 //! EffectCraft. The personal access token goes to curl on stdin (a `-K -` config), never on
-//! the command line, and only to `api.figma.com` (or a loopback test server).
+//! the command line, and only to `api.figma.com` (or a loopback IP for test servers).
 
 use std::io::Write as _;
 use std::process::{Command, Stdio};
@@ -93,11 +93,29 @@ pub fn check_api_base(base: &str) -> Result<String, String> {
     Err(format!("apiBase must be {API} or a loopback address, not `{base}`"))
 }
 
+/// `http://` to a loopback IP literal (`127.x.x.x`, `[::1]`), with an optional numeric port. The
+/// authority is parsed strictly: user info (`127.0.0.1:80@evil.com`), host names (which could
+/// resolve anywhere) and anything that isn't an IP address are refused, so the token can't be
+/// sent off the machine.
 fn loopback(url: &str) -> bool {
     let Some(rest) = url.strip_prefix("http://") else { return false };
-    let host = rest.split('/').next().unwrap_or("");
-    let host = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
-    matches!(host, "127.0.0.1" | "localhost" | "[::1]")
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let Some(authority) = rest.get(..end) else { return false };
+    if authority.is_empty() || !authority.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | ':' | '[' | ']')) {
+        return false;
+    }
+    let (host, port) = match authority.strip_prefix('[') {
+        Some(v6) => match v6.split_once(']') {
+            Some((h, rest)) => (h, rest),
+            None => return false,
+        },
+        None => match authority.split_once(':') {
+            Some((h, p)) => (h, authority.get(h.len()..).unwrap_or(p)),
+            None => (authority, ""),
+        },
+    };
+    let port_ok = port.is_empty() || port.strip_prefix(':').is_some_and(|p| !p.is_empty() && p.len() <= 5 && p.chars().all(|c| c.is_ascii_digit()));
+    port_ok && host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 fn check_token(t: &str) -> Result<&str, String> {

@@ -54,6 +54,25 @@ fn parses_figma_links() {
     assert!(fetch::check_api_base("http://127.0.0.1:9").is_ok());
     assert!(fetch::check_api_base("https://evil.example").is_err());
     assert!(fetch::check_api_base("http://127.0.0.1.evil.example").is_err());
+    // Review on #1103: user info, host names and malformed authorities never get the token.
+    for bad in [
+        "http://127.0.0.1:80@evil.com",
+        "http://127.0.0.1@evil.com",
+        "http://evil.com#@127.0.0.1",
+        "http://evil.com?@127.0.0.1",
+        "http://localhost:9",
+        "http://127.0.0.1:",
+        "http://127.0.0.1:9x",
+        "http://[::1",
+        "http://::1",
+        "http://127.0.0.1%2e",
+        "http://0x7f.0.0.1",
+    ] {
+        assert!(fetch::check_api_base(bad).is_err(), "{bad}");
+    }
+    for good in ["http://127.0.0.1", "http://127.0.0.1:8080/v1", "http://127.1.2.3:9", "http://[::1]:9", "https://127.0.0.1:9"] {
+        assert!(fetch::check_api_base(good).is_ok(), "{good}");
+    }
     assert_eq!(fetch::base64_decode("iVBORw0KGgo=").unwrap(), b"\x89PNG\r\n\x1a\n");
 }
 

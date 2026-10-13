@@ -61,7 +61,10 @@ The bridge listens on 127.0.0.1 only, accepts requests only on the loopback host
 rebinding) and only from the plug-in (origin `null`), figma.com or non-browser clients, and imports
 only with the pairing code. Any sandboxed page shares the plug-in's `null` origin, so the code is
 the real protection: it is 12 characters from the operating system's secure random generator
-(`--code` needs at least 8), and after 5 wrong codes in a row the bridge refuses codes for a minute.
+(`--code` needs at least 12), far beyond guessing over HTTP. There is no lockout after wrong codes,
+since any page could trigger one and lock the plug-in out. Payloads are written to a per-user
+folder only you can read and deleted after the import; their images must be inline (base64), so a
+payload can't make the app read a local file.
 The code file in the settings folder (`figma-bridge-code`) is created readable only by you. One
 transfer can be up to 64 MB (embedded image renders count); send a very large selection in several
 parts. The bridge writes the payload to a temporary file and runs `file.importFigma {payloadPath}`

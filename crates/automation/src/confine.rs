@@ -40,6 +40,8 @@ const REFUSED: &[&str] = &[
     "layer.openSource",
     "help.revealLogFile",
     "file.autoSave",
+    // Stores a Figma access token in the settings folder.
+    "figma.setToken",
 ];
 
 /// Commands that read files named by these parameters.
@@ -64,6 +66,7 @@ const READS: &[(&str, &[&str])] = &[
     ("effect.plugins.load", &["path", "folder"]),
     ("mediaBrowser.go", &["path"]),
     ("mediaBrowser.addFavorite", &["path"]),
+    ("file.importFigma", &["payloadPath"]),
 ];
 
 /// Commands that write files named by these parameters.
@@ -87,7 +90,8 @@ const WRITES: &[(&str, &[&str])] = &[
 ];
 
 /// Commands that write where they are not told: the project's file, the Render Queue's outputs.
-const IMPLICIT_WRITES: &[&str] = &["file.save", "file.incrementAndSave", "renderQueue.render", "render.preRender"];
+/// (`file.importFigma` writes its rendered images to a folder beside the project's file.)
+const IMPLICIT_WRITES: &[&str] = &["file.save", "file.incrementAndSave", "file.importFigma", "renderQueue.render", "render.preRender"];
 
 /// What must be looked up before an implicitly writing command may run.
 #[derive(Debug, PartialEq, Eq)]
@@ -189,7 +193,8 @@ impl Confinement {
             return Err(Error::BadArgs(format!("`{id}`: give `path` while file access is confined")));
         }
         if IMPLICIT_WRITES.contains(&id) && !(given && id == "file.save") {
-            return Ok(Some(if id == "file.save" || id == "file.incrementAndSave" { Lookup::ProjectFile } else { Lookup::RenderOutputs }));
+            let project = matches!(id, "file.save" | "file.incrementAndSave" | "file.importFigma");
+            return Ok(Some(if project { Lookup::ProjectFile } else { Lookup::RenderOutputs }));
         }
         Ok(None)
     }

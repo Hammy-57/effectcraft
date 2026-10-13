@@ -111,18 +111,16 @@ fn prop(l: &mut Layer, path: &str, v: KV) {
     }
 }
 
-/// Bytes of a payload image: `{path}`, `{png: base64}`, a data URL or a plain path.
-fn payload_png(s: &Session, v: &Value) -> std::result::Result<Vec<u8>, String> {
-    let read = |p: &str| s.services.read_file(p).map_err(|e| format!("cannot read {p}: {e}"));
+/// Bytes of a payload image: `{png: base64}` or a data URL, inline only. A payload can come from
+/// the bridge (any page could post one), so it never names a local file to read.
+fn payload_png(v: &Value) -> std::result::Result<Vec<u8>, String> {
     match v {
         Value::String(x) if x.starts_with("data:") => fetch::base64_decode(x),
-        Value::String(x) => read(x),
-        Value::Object(o) => match (o.get("path").and_then(Value::as_str), o.get("png").or_else(|| o.get("base64")).and_then(Value::as_str)) {
-            (Some(p), _) => read(p),
-            (None, Some(b)) => fetch::base64_decode(b),
-            _ => Err("image entry needs `path` or `png`".into()),
+        Value::Object(o) => match o.get("png").or_else(|| o.get("base64")).and_then(Value::as_str) {
+            Some(b) => fetch::base64_decode(b),
+            None => Err("image entry needs inline `png` (base64); local paths are not read".into()),
         },
-        _ => Err("bad image entry".into()),
+        _ => Err("image entry needs inline `png` (base64) or a data URL; local paths are not read".into()),
     }
 }
 
@@ -132,7 +130,7 @@ fn raster_bytes(s: &Session, plan: &Plan, src: &Source, scale: f64, notes: &mut 
     let mut want = vec![];
     for (i, r) in plan.rasters.iter().enumerate() {
         match src.images.get(&r.node_id) {
-            Some(v) => match payload_png(s, v) {
+            Some(v) => match payload_png(v) {
                 Ok(b) => out[i] = Some(b),
                 Err(e) => notes.push(format!("{}: image not imported ({e})", r.name)),
             },
