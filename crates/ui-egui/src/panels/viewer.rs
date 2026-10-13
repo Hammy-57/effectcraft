@@ -1381,6 +1381,9 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         } else {
             app.ui.tool
         };
+        // The Pen slot's pointer: the owner-local After Effects cursor when there is one, else
+        // a painted pen; never both (one pen under the other).
+        let mut pen_native: Option<&str> = None;
         let cursor = match cursor_tool {
             Tool::Hand => egui::CursorIcon::Grab,
             Tool::Zoom => egui::CursorIcon::ZoomIn,
@@ -1391,8 +1394,21 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             t if t.is_pen() => {
                 let over_path =
                     ov::segment_at(&paths, &map, hp, 5.0).is_some() || motion_segment.is_some() || ov::motion_frame_at(&motion_frames, &key_hits, hp).is_some();
-                pen_cursor(&ctx, hp, pen_cursor_icon(t, over_path));
-                egui::CursorIcon::None
+                let icon = pen_cursor_icon(t, over_path);
+                let name = match icon {
+                    crate::icons::Icon::PenAdd => Some("pen-add"),
+                    crate::icons::Icon::PenDelete => Some("pen-delete"),
+                    crate::icons::Icon::PenConvert => Some("pen-convert"),
+                    crate::icons::Icon::Pen => Some("pen"),
+                    _ => None,
+                };
+                if let Some(name) = name.filter(|n| !app.ui.viewer.roi_draw && crate::local_assets::cursor(&ctx, n, [1, 1])) {
+                    pen_native = Some(name);
+                    egui::CursorIcon::Default
+                } else {
+                    pen_cursor(&ctx, hp, icon);
+                    egui::CursorIcon::None
+                }
             }
             t if t.is_shape() => egui::CursorIcon::Crosshair,
             _ if app.ui.viewer.roi_draw => egui::CursorIcon::Crosshair,
@@ -1436,11 +1452,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 Tool::Orbit => Some(("orbit", [11, 9])),
                 Tool::PanCamera => Some(("camera-pan", [8, 10])),
                 Tool::Dolly => Some(("dolly", [9, 9])),
-                Tool::Pen => Some(("pen", [1, 1])),
-                Tool::PenAdd => Some(("pen-add", [1, 1])),
-                Tool::PenDelete => Some(("pen-delete", [1, 1])),
-                Tool::PenConvert => Some(("pen-convert", [1, 1])),
-                _ => None,
+                _ => pen_native.map(|n| (n, [1, 1])),
             };
             if let Some((name, hotspot)) = native {
                 crate::local_assets::cursor(&ctx, name, hotspot);

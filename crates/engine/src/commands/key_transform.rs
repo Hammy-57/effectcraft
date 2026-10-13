@@ -154,10 +154,32 @@ fn spatial_tangents(s: &mut Session, p: &Value) -> Result<Value> {
 fn insert_spatial(s: &mut Session, p: &Value) -> Result<Value> {
     let (cid, lid, uid) = prop_ref(s, p, "keys.insertSpatial")?;
     let seconds = f_p(p, "time").filter(|t| t.is_finite()).ok_or_else(|| bad("keys.insertSpatial", "missing finite `time` (layer s)"))?;
-    let time = Tick::from_seconds_f64(seconds);
+    let raw = Tick::from_seconds_f64(seconds);
     s.edit("Insert Motion Path Vertex", None, |proj, st| {
+        let fr = proj.comp(cid).ok_or(EngineError::NoComp)?.frame_rate;
         let layer = super::layer_mut(proj, cid, lid)?;
+        let (start, stretch) = (layer.start_time, layer.stretch);
         let pr = layer.props.find_mut(uid).ok_or_else(|| bad("keys.insertSpatial", "no property"))?;
+        // Keys sit on frames, as in After Effects (a motion path's dots are its frames): the
+        // nearest comp frame strictly between the two keys around the click.
+        let to_comp = |lt: Tick| start + Tick((lt.0 as f64 * stretch / 100.0) as i64);
+        let to_layer = |ct: Tick| Tick(((ct - start).0 as f64 * 100.0 / stretch) as i64);
+        let next = pr.keys.partition_point(|k| k.time <= raw);
+        let (lo, hi) = match (next.checked_sub(1).and_then(|i| pr.keys.get(i)), pr.keys.get(next)) {
+            (Some(a), Some(b)) => (to_comp(a.time), to_comp(b.time)),
+            _ => return Err(bad("keys.insertSpatial", "Choose a time strictly between two motion-path keys")),
+        };
+        let near = fr.snap_nearest(to_comp(raw));
+        if near == lo || near == hi {
+            return Err(bad("keys.insertSpatial", "A keyframe already exists at this frame"));
+        }
+        let candidates = [near, fr.snap_nearest(near + fr.frame_duration()), fr.snap_nearest(near - fr.frame_duration())];
+        let ct = candidates
+            .into_iter()
+            .filter(|c| *c > lo && *c < hi)
+            .min_by_key(|c| (c.0 - to_comp(raw).0).abs())
+            .ok_or_else(|| bad("keys.insertSpatial", "no frame between these two keyframes"))?;
+        let time = to_layer(ct);
         if !pr.spatial || pr.has_expression() {
             return Err(bad("keys.insertSpatial", "requires a spatial property without an enabled expression"));
         }

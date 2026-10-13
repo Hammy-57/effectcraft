@@ -66,7 +66,8 @@ pub(crate) fn paint(painter: &Painter, rect: Rect, name: &str, color: Color32) -
     true
 }
 
-pub(crate) fn cursor(ctx: &Context, name: &str, hotspot: [u16; 2]) {
+/// Returns whether the owner-local cursor exists (and was set).
+pub(crate) fn cursor(ctx: &Context, name: &str, hotspot: [u16; 2]) -> bool {
     let scale = if ctx.pixels_per_point() >= 1.5 { 2 } else { 1 };
     let id = egui::Id::new(("local-cursor", name, scale));
     let cached = ctx.data(|d| d.get_temp::<Option<egui::CustomCursorImage>>(id));
@@ -83,7 +84,9 @@ pub(crate) fn cursor(ctx: &Context, name: &str, hotspot: [u16; 2]) {
         ctx.data_mut(|d| d.insert_temp(id, cursor.clone()));
         cursor
     });
+    let found = cursor.is_some();
     if let Some(cursor) = cursor {
         ctx.set_cursor_image(Some(cursor));
     }
+    found
 }

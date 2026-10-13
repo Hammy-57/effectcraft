@@ -576,7 +576,9 @@ fn graph_transform_box_scales_key_times_and_values() {
 }
 
 #[test]
-fn insert_spatial_uses_exact_layer_time_preserves_motion_and_undoes() {
+/// The new key lands on the comp frame nearest the clicked time (After Effects keys sit on
+/// frames; an off-frame key bent the path and its handles, #pen-on-motion-path).
+fn insert_spatial_snaps_to_a_frame_preserves_motion_and_undoes() {
     let mut s = comp();
     let lid = animated_position(&mut s);
     let cid = s.active_comp_id().unwrap();
@@ -588,8 +590,12 @@ fn insert_spatial_uses_exact_layer_time_preserves_motion_and_undoes() {
     s.execute("keys.insertSpatial", json!({"layer":lid,"path":"transform/position","time":exact.seconds()})).unwrap();
     let after = layer(&s, lid).props.prop("transform/position").unwrap().clone();
     assert_eq!(after.keys.len(), 4);
-    assert_eq!(after.keys[1].time, exact);
-    assert_eq!(s.state.selected_keys[0].time, exact);
+    // Comp time 3 + 0.4371 × 2 = 3.8742 s → frame 3.8667 s (30 fps) → layer time 0.4333 s.
+    let fr = s.active_comp().unwrap().frame_rate;
+    let on_frame = Tick((fr.snap_nearest(Tick::from_seconds_f64(3.0 + exact.seconds() * 2.0)) - Tick::from_seconds_f64(3.0)).0 / 2);
+    assert_ne!(on_frame, exact);
+    assert_eq!(after.keys[1].time, on_frame);
+    assert_eq!(s.state.selected_keys[0].time, on_frame);
     for n in 0..=200 {
         let t = Tick::from_seconds_f64(n as f64 / 100.0);
         let a = before.value_at(t).as_vec3();
