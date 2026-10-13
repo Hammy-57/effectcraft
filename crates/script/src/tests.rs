@@ -351,6 +351,11 @@ fn security_gate_for_files() {
     let o = run_code(&mut s, &format!("var f = new File({}); f.open('w'); f.write('x'); f.close();", q(&proj.join("out.txt"))), "gate.jsx");
     assert!(o.error.is_some());
     assert!(!proj.join("out.txt").exists());
+    // A non-atomic batch reaches `prefs.set`: the step fails with the same refusal.
+    let o = ok(&mut s, "app.run('engine.batch', {atomic: false, steps: [{command: 'prefs.set', params: {key: 'scripting.enableJsDebugger', value: true}}]})");
+    assert_eq!(o.result["ok"], json!(false), "{:?}", o.result);
+    assert!(o.result["error"].as_str().is_some_and(|e| e.contains("Scripts can't change what scripts are allowed to do")), "{:?}", o.result);
+    assert!(!s.prefs.scripting.enable_js_debugger);
     assert!(run_code(&mut s, "new Socket()", "net.jsx").error.is_some());
     assert!(run_code(&mut s, "system.callSystem('ls')", "sys.jsx").error.is_some());
     // With the preference on, scripts can write and read anywhere.
@@ -376,7 +381,9 @@ fn scripts_cant_change_what_scripts_may_do() {
     for code in attempts {
         let o = run_code(&mut s, code, "grant.jsx");
         let e = o.error.unwrap_or_else(|| panic!("`{code}` was allowed"));
-        assert!(e.message.contains("Scripts can't change what scripts are allowed to do"), "{code}: {e:?}");
+        // An atomic batch refuses `prefs.set` before any step runs (it can't be rolled back).
+        let refused = ["Scripts can't change what scripts are allowed to do", "is not supported in an atomic batch"];
+        assert!(refused.iter().any(|r| e.message.contains(r)), "{code}: {e:?}");
         let sc = &s.prefs.scripting;
         assert!(!sc.allow_scripts_write_files && sc.warn_executing_files && !sc.enable_js_debugger, "{code}");
     }
