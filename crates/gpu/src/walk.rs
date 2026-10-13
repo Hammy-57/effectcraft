@@ -333,7 +333,7 @@ fn draw_resident_fx(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, can
     if input.img.is_empty() {
         return Some(Some(()));
     }
-    let Some(src) = e.g.upload_buf(&input) else { return Some(None) };
+    let Some(src) = e.upload_buf(&input) else { return Some(None) };
     let pipe = r.pipe();
     // `layer_input` is in effect space: run the stack there, then back to layer space.
     let mut fx = crate::effects::GpuFx::new(e, src, input.offset, input.scale, pipe.levels);
@@ -764,7 +764,7 @@ fn composite_iso_with(
 
 /// `Renderer::apply_track_matte`: `img` (comp-sized) times the layer's track matte, if it has
 /// one; `matte_img` as in [`composite_iso_with`].
-fn track_matte(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, img: GpuImage, matte_img: Option<GpuImage>) -> Option<GpuImage> {
+fn track_matte(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, mut img: GpuImage, matte_img: Option<GpuImage>) -> Option<GpuImage> {
     let Some((m, kind)) = r.track_matte(ctx, layer) else { return Some(img) };
     let mimg = match matte_img.filter(|i| (i.width, i.height) == (img.width, img.height)) {
         Some(i) => i,
@@ -779,7 +779,8 @@ fn track_matte(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, img: Gpu
             mimg
         }
     };
-    Some(ops::matte(e, &img, &mimg, kind))
+    ops::matte_in(e, &mut img, &mimg, kind, None);
+    Some(img)
 }
 
 /// Draw a processed layer buffer onto `target` (transform, motion blur sub-samples), quantising

@@ -1478,7 +1478,7 @@ mod tests {
         run(&mut app, "window.toggleCompTimeline");
         assert_eq!(app.ui.focused, PanelKind::Timeline);
         // Alt+Shift+. / Alt+Shift+,: the tabs of the focused panel's group, wrapping.
-        let group = app.ui.dock.group_of(PanelKind::Timeline).unwrap().to_vec();
+        let group = app.ui.dock.group_of(PanelKind::Timeline).unwrap().0;
         assert!(group.len() > 1, "{group:?}");
         run(&mut app, "window.nextPanel");
         assert_eq!(app.ui.focused, group[(group.iter().position(|p| *p == PanelKind::Timeline).unwrap() + 1) % group.len()]);
