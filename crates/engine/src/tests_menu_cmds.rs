@@ -871,7 +871,7 @@ fn layer_settings_edit_the_solid_or_give_the_layer_its_own() {
     // Affect all off: the duplicate gets its own solid; the original keeps its colour.
     let r = s.execute("layer.settings", json!({"layer": b, "color": "#0000ff", "name": "Blue", "affectAll": false})).unwrap();
     let (bi, bs, bn) = solid_of(&s, b);
-    assert_eq!(r, json!({"layer": b, "solid": bi}));
+    assert_eq!(r, json!({"layer": b, "solid": bi, "resolved": {"comp": s.active_comp_id().unwrap().0, "layer": b}}));
     assert_ne!(bi, solid_of(&s, a).0);
     assert_eq!((bs.color, bn.as_str(), layer(&s, b).name.as_str()), ([0.0, 0.0, 1.0], "Blue", "Blue"));
     assert_eq!(solid_of(&s, a).1.color, [1.0, 0.0, 0.0]);

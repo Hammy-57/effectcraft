@@ -186,7 +186,12 @@ mod tests {
         assert!(m["mask"].as_u64().is_some());
         s.execute_checked("prop.set", json!({"layer": l, "path": format!("{}/feather", m["path"].as_str().unwrap()), "value": [4, 4]})).unwrap();
         let t = s.execute_checked("layer.newText", json!({"text": "Hi"})).unwrap()["layer"].as_u64().unwrap();
-        assert_eq!(s.execute_checked("layer.setText", json!({"layer": t, "text": "Hello"})).unwrap(), json!({"layer": t, "text": "Hello"}));
+        // Explicit targets come back resolved (the comp and layer the command acted on).
+        let comp = s.active_comp_id().unwrap().0;
+        assert_eq!(
+            s.execute_checked("layer.setText", json!({"layer": t, "text": "Hello"})).unwrap(),
+            json!({"layer": t, "text": "Hello", "resolved": {"comp": comp, "layer": t}})
+        );
     }
 
     #[test]
