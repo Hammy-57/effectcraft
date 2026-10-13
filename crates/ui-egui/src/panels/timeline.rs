@@ -1933,7 +1933,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 }
                 // Modes.
                 if app.ui.timeline.show_modes && layer.source.is_av() {
-                    let mr = Rect::from_min_size(pos2(cw.mode + 2.0, cy - 9.0), vec2(80.0, 18.0));
+                    // (Narrower than the cell: the Preserve Transparency box sits right of it.)
+                    let mr = Rect::from_min_size(pos2(cw.mode + 2.0, cy - 9.0), vec2(68.0, 18.0));
                     let mresp = widgets::dropdown(ui, mr, layer.blend_mode.label(), &t, egui::Id::new(("mode", layer.id.0)));
                     app.auto.add(&format!("timeline.layer.{}.mode", layer.id.0), mr, "Mode");
                     let pop = egui::Id::new(("mode-pop", layer.id.0));

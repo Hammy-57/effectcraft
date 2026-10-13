@@ -568,18 +568,34 @@ pub fn popup_menu(ui: &mut Ui, id: egui::Id, pos: egui::Pos2, options: &[String]
     })
 }
 
-/// The open popup list `id` at `pos`, drawn by `body` (`rows` entries and `seps` separators,
-/// for its height): as tall as the window allows, scrolling beyond with a scroll bar (a shape
-/// layer's Add menu has 20 entries, the blend modes 40, the fonts hundreds), and moved up when
-/// it would run past the bottom of the window (the Timeline's menus, #269). Closes when `body`
-/// returns a choice, on Escape, or on a press outside it and outside `anchor` (a control that
-/// toggles the list itself). Returns the choice.
+/// The tallest a popup list gets before it scrolls: about 18 rows, as After Effects' own
+/// drop-down lists, instead of the whole window.
+const POPUP_LIST_MAX_H: f32 = 440.0;
+
+/// The open popup list `id` at `pos` (the bottom left of the control that opened it), drawn by
+/// `body` (`rows` entries and `seps` separators, for its height). It drops down from the control,
+/// at most [`POPUP_LIST_MAX_H`] tall and scrolling beyond with a scroll bar (a shape layer's Add
+/// menu has 20 entries, the blend modes 40, the fonts hundreds); with too little room below it
+/// opens above the control instead, never past the window (the Timeline's menus, #269). Closes
+/// when `body` returns a choice, on Escape, or on a press outside it and outside `anchor` (a
+/// control that toggles the list itself). Returns the choice.
 pub fn popup_list<R>(ui: &mut Ui, id: egui::Id, pos: egui::Pos2, anchor: Rect, rows: usize, seps: usize, body: impl FnOnce(&mut Ui) -> Option<R>) -> Option<R> {
     let screen = ui.ctx().content_rect();
-    let max_h = (screen.height() - 24.0).max(120.0);
     let sp = ui.spacing();
-    let est = (rows as f32 * (sp.interact_size.y + sp.item_spacing.y + 4.0) + seps as f32 * (2.0 * sp.item_spacing.y + 2.0) + 16.0).min(max_h + 12.0);
-    let pos = egui::pos2(pos.x, pos.y.min(screen.bottom() - est).max(screen.top()));
+    let want = rows as f32 * (sp.interact_size.y + sp.item_spacing.y + 4.0) + seps as f32 * (2.0 * sp.item_spacing.y + 2.0) + 16.0;
+    let want = want.min(POPUP_LIST_MAX_H.min(screen.height() - 24.0).max(120.0));
+    // The control's top: the list opens above it when it doesn't fit below.
+    let above_y = if anchor.is_positive() { anchor.min.y } else { pos.y - sp.interact_size.y - 4.0 };
+    let below = screen.bottom() - 8.0 - pos.y;
+    let above = above_y - 8.0 - screen.top();
+    let (top, est) = if want <= below || below >= above {
+        (pos.y, want.min(below.max(120.0)))
+    } else {
+        let h = want.min(above.max(120.0));
+        (above_y - h, h)
+    };
+    let max_h = (est - 12.0).max(80.0);
+    let pos = egui::pos2(pos.x, top.min(screen.bottom() - est).max(screen.top()));
     let mut chosen = None;
     let area = egui::Area::new(id.with("area")).order(egui::Order::Foreground).fixed_pos(pos).show(ui.ctx(), |ui| {
         egui::Frame::popup(ui.style()).show(ui, |ui| {
