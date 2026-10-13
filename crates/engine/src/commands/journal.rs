@@ -24,7 +24,7 @@ fn export_repro(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 const fn spec(id: &'static str, label: &'static str, params: &'static str, run: super::Run) -> CommandSpec {
-    CommandSpec { id, label, menu: &[], shortcut: None, params, enabled: always, run, journal: false }
+    CommandSpec { id, label, menu: &[], shortcut: None, alt_shortcuts: &[], params, enabled: always, run, journal: false }
 }
 
 pub fn specs() -> Vec<CommandSpec> {
