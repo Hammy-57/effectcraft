@@ -51,6 +51,9 @@ pub struct Frame {
     speculate: bool,
     /// What this frame evaluates: an evaluation that needs itself is a cycle.
     pub owner: Option<Owner>,
+    /// A run called `Math.random` or `Date` (however the script reached them): its result can't
+    /// be remembered.
+    pub impure: bool,
 }
 
 /// One expression evaluation: the property (comp, layer, uid), the comp time and the text.
@@ -327,6 +330,35 @@ fn native_noise(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<Js
     Ok(JsValue::from(noise::noise3(num(args, 0, ctx)?, num(args, 1, ctx)?, num(args, 2, ctx)?)))
 }
 
+/// `__impure()`: the running expression read the clock or `Math.random` (see [`IMPURE`]).
+fn native_impure(_: &JsValue, _: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
+    FRAMES.with(|f| {
+        if let Some(fr) = f.borrow_mut().last_mut() {
+            fr.impure = true;
+        }
+    });
+    Ok(JsValue::undefined())
+}
+
+/// Wraps the sources of nondeterminism so any call marks the evaluation impure, by property
+/// access, alias or prototype (`Math["random"]`, `const M = Math; M.random()`,
+/// `Date.prototype.constructor.now()`), not only by spelling. `__impure` is then hidden.
+const IMPURE: &str = r#"(function () {
+  const mark = __impure;
+  const rnd = Math.random;
+  Object.defineProperty(Math, "random", { value: function random() { mark(); return rnd(); }, writable: false, configurable: false });
+  const D = Date;
+  const now = D.now;
+  const P = new Proxy(D, {
+    construct(t, a, n) { mark(); return Reflect.construct(t, a, n === P ? D : n); },
+    apply(t, self, a) { mark(); return Reflect.apply(t, self, a); },
+    get(t, k, r) { return k === "now" ? function now_() { mark(); return now.call(D); } : Reflect.get(t, k, t); },
+  });
+  Object.defineProperty(D.prototype, "constructor", { value: P, writable: false, configurable: false });
+  Object.defineProperty(globalThis, "Date", { value: P, writable: false, configurable: false });
+  delete globalThis.__impure;
+})();"#;
+
 /// `__rnd(layerIndex, uid, userSeed, timeless, time, counter)`.
 fn native_random(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let timeless = arg(args, 3).to_boolean();
@@ -341,16 +373,18 @@ impl Runtime {
         let limits = ctx.runtime_limits_mut();
         limits.set_loop_iteration_limit(LOOP_LIMIT);
         limits.set_recursion_limit(400);
-        let natives: [(JsString, usize, fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>); 4] = [
+        let natives: [(JsString, usize, fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>); 5] = [
             (js_string!("__h"), 6, native_host),
             (js_string!("__wig"), 8, native_wiggle),
             (js_string!("__noise"), 3, native_noise),
             (js_string!("__rnd"), 6, native_random),
+            (js_string!("__impure"), 0, native_impure),
         ];
         for (name, len, f) in natives {
             ctx.register_global_callable(name, len, NativeFunction::from_fn_ptr(f)).map_err(|e| e.to_string())?;
         }
         ctx.eval(Source::from_bytes(PRELUDE)).map_err(|e| format!("expression prelude: {e}"))?;
+        ctx.eval(Source::from_bytes(IMPURE)).map_err(|e| format!("expression prelude: {e}"))?;
         let global = ctx.global_object();
         let func = |name: JsString, ctx: &mut Context| -> Result<JsObject, String> {
             global.get(name, ctx).ok().and_then(|v| v.as_object()).ok_or_else(|| "expression prelude: missing function".to_string())

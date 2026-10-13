@@ -226,7 +226,7 @@ fn evaluate_out(
                     let mut f = f.borrow_mut();
                     let Some(fr) = f.get_mut(depth) else { return (vec![], None) };
                     let used = std::mem::take(&mut fr.used);
-                    let resps = if r.is_ok() && memo::cacheable(text) { fr.take_answers(&used) } else { None };
+                    let resps = if r.is_ok() && !fr.impure && memo::cacheable(text) { fr.take_answers(&used) } else { None };
                     (used, resps)
                 });
                 if let (Ok(out), Some(resps)) = (&r, resps) {

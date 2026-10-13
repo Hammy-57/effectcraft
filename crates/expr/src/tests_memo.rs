@@ -193,3 +193,39 @@ fn impure_scripts_are_not_remembered() {
     assert!(!memo::cacheable("new Date().getSeconds()"));
     assert!(memo::cacheable("random(10)"));
 }
+
+/// `text` as the rotation expression of a layer of [`rig`], evaluated at time 0.
+fn eval_simple(text: &str) -> f64 {
+    let (mut p, cid) = rig(1);
+    layer(&mut p, cid, "L0").props.prop_mut(ROT).unwrap().expr = Some(Expression { text: text.into(), enabled: true });
+    let host = Expressions;
+    let c = p.comp(cid).unwrap();
+    let mut ctx = EvalCtx::new(&p, cid, c, Tick::ZERO);
+    ctx.expr = Some(&host as &dyn ExprHost);
+    let l = c.layer_by_name("L0").unwrap();
+    ctx.value(l, l.props.prop(ROT).unwrap()).as_f64()
+}
+
+/// Review on #856: scripts that reach `Math.random` or `Date` without spelling them are not
+/// remembered either: each evaluation gets a fresh value.
+#[test]
+fn impure_calls_are_caught_however_they_are_spelled() {
+    for (i, text) in [
+        r#"Math["random"]() * 1e9"#,
+        r#"const M = Math; M["ran" + "dom"]() * 1e9"#,
+        r#"globalThis["Da" + "te"]["now"]() + Math["random"]()"#,
+        r#"const D = globalThis["Da" + "te"]; new D().getTime() + Math["random"]()"#,
+        r#"(new (Object.getPrototypeOf(new globalThis["Da" + "te"]()).constructor)()).getTime() + Math["random"]()"#,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert!(memo::cacheable(text), "{i}: the text check alone misses it");
+        let a = eval_simple(text);
+        let b = eval_simple(text);
+        assert_ne!(a, b, "{i}: {text} was remembered");
+    }
+    // Pure scripts are still remembered, and `__impure` isn't reachable.
+    assert_eq!(eval_simple("1 + 2"), eval_simple("1 + 2"));
+    assert_eq!(eval_simple("typeof __impure === 'undefined' ? 1 : 0"), 1.0);
+}

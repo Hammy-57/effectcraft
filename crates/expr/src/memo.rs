@@ -114,7 +114,9 @@ pub fn set_off(v: bool) {
     OFF.with(|o| o.set(v));
 }
 
-/// Whether a script's result may be remembered: it reads nothing but its inputs and answers.
+/// Whether a script's result may be remembered: it reads nothing but its inputs and answers. A
+/// cheap first check by text; a run that reaches `Math.random` or `Date` any other way is caught
+/// as it calls them (`Frame::impure`).
 pub fn cacheable(text: &str) -> bool {
     !off() && !text.contains("Math.random") && !text.contains("Date")
 }
