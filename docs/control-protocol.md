@@ -12,6 +12,9 @@ listens on. A port that is already taken (usually by a second EffectCraft) is re
 window's status bar and on stderr: give each app its own port, and point its MCP bridge at it
 (`effectcraft-cli mcp --bridge` without a port uses `EFFECTCRAFT_CONTROL_PORT`, else 9877).
 
+The port must be a number from 1 to 65535, and `--control` overrides the variable. A bad port or an
+unknown option prints an error and the app exits with status 1 before it opens a window.
+
 - **Transport:** TCP on `127.0.0.1` only, one JSON object per line in each direction. Connections are
   persistent; requests on one connection are answered in order.
 - **Request:** `{"id": 1, "method": "engine.execute", "params": {...}}` (`id` is echoed back, `params`
@@ -204,6 +207,12 @@ errors. Unreadable, invalid or newer files leave the default workspace available
 preserved for the entire session, including after later layout changes. Load and save errors
 appear in the status message and the nullable
 `workspaceStorageError` field; a failed write remains eligible for retry.
+`window.saveWorkspace`, `window.saveWorkspaceAs` and `window.editWorkspaces` (rename, delete)
+write the file immediately. Through `ui.menu.invoke` they return an error when it isn't written
+(a failed write, a file preserved after a failed load, or no configuration store);
+`engine.execute` hands them to the UI and returns `{frontend}` first, so check
+`workspaceStorageError` there. The changed workspaces still apply for the session, and a later
+save retries them.
 
 ## Input
 
@@ -252,7 +261,8 @@ one), `panel.tab.Viewer(<n>)` and `viewers.<n>` (View ▸ New Viewer's other Com
 renames it), `viewer.comp`, `viewer.handle.<layer>.<i>`,
 `timeline.layer.<id>.bar`, `timeline.layer.<id>.nestedMarker.<i>` (a precomp's comp markers), `timeline.layer.<id>.twirl`, `timeline.layer.<id>.row` (click selects,
 Enter or a double-click renames, drag reorders), `timeline.prop.<uid>.stopwatch`,
-`timeline.key.<uid>.<frame>`, `timeline.cti`, `effectControls.prop.<uid>.value` (an angle's
+`timeline.key.<uid>.<frame>` (and `timeline.keyAt.<uid>.<ticks>`, exact in layer-time ticks, for
+keys on subframes), `timeline.cti`, `effectControls.prop.<uid>.value` (an angle's
 revolutions are `timeline.prop.<uid>.revolutions`, `effectControls.prop.<uid>.revolutions` and
 `properties.prop.<uid>.revolutions`), the Properties panel's shape rows
 `properties.shape.<key>[.value[.0|.1]|.stopwatch|.prevKey|.keyKey|.nextKey]` for the first shape group and
@@ -272,11 +282,14 @@ Viewer state that agents drive headless too: `view.snapping`, `view.snappingOpti
 `header.snappingOptions`: After Effects' Snap Edges Extended and Snap to Features in Collapsed
 Compositions and Text Layers), `view.channel {channel, colorized?}`,
 `view.exposure {stops | delta}`, `view.resetExposure`, `view.takeSnapshot`, `view.showSnapshot`,
-`view.fastPreviewMode {mode}`, `view.res.full|half|third|quarter|auto {comp?}` and
+`view.fastPreviewMode {mode}` (one mode each, for shortcuts:
+`view.fastPreviews.off|adaptive|draft|fastDraft|wireframe`, and for the channels
+`view.channel.red|green|blue|alpha|redColorized|greenColorized|blueColorized|rgbStraight`), `view.res.full|half|third|quarter|auto {comp?}` and
 `view.res.custom {factor, comp?}` (the comp's Resolution, saved with the project but no undo
 step; `ui.set {viewer: {res}}` sets the active comp's, and `ui.inspect` reports it as
-`ui.viewer.res`), `view.setRegionOfInterest {rect}`, `view.addGuide`,
-`view.moveGuide`, `view.removeGuide`; editing: `shape.newPath` (Pen on shape layers),
+`ui.viewer.res`), `view.setRegionOfInterest {rect}`, `view.addGuide {percent?}`,
+`view.addPercentGuide`, `view.convertGuides {to: percent|pixels, index?}`,
+`view.moveGuide` (comp pixels, whatever the guide's unit), `view.removeGuide`, `effect.setLabel {layer?, effect, label}`; editing: `shape.newPath` (Pen on shape layers),
 `shape.newShape` (the shape tools: a new group in the selected shape layer, else a new shape layer;
 `roundness` px rounds a rect's corners), `layer.roundCorners {layer?|layers?, roundness?}` (Layer ›
 Create › Round Corners and the Properties panel's Roundness: sets the Roundness of a shape layer's

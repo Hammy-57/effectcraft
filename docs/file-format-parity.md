@@ -1,6 +1,6 @@
 # File format parity
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-10 · **Change:** major (first per-format table, measured against the After Effects 2026 26.5 bundle and this repository's import/export registries) · **Target:** Adobe After Effects 2026
+> **Last reviewed:** 2026-10-12 · **Last updated:** 2026-10-12 · **Change:** minor (closed issue references re-audited against `upstream/main` 470ea7a3) · **Target:** Adobe After Effects 2026
 
 Every format After Effects reads or writes, with EffectCraft's support. After Effects' list comes
 from its installed bundle (26.5.0.89: `Info.plist` `CFBundleDocumentTypes`, `Plug-ins/Format`,
@@ -11,8 +11,8 @@ from its installed bundle (26.5.0.89: `Info.plist` `CFBundleDocumentTypes`, `Plu
 ([architecture.md](architecture.md)).
 
 **Overall ≈ 50%** (estimated, weighted by use): modern delivery and interchange formats are
-strong, but After Effects' own project, template and preset formats, which decide whether
-existing work moves over, are 0%.
+strong. On this fork, `.aep` projects read through the external py-aep converter; `.aepx`,
+Adobe templates and presets remain unsupported, limiting how much existing work moves over.
 
 Fidelity key: **exact** (bit-exact or within a stated tolerance of a reference), **good** (round
 trips and renders, checked by tests, not against After Effects), **partial** (named limitations),
@@ -22,8 +22,8 @@ trips and renders, checked by tests, not against After Effects), **partial** (na
 
 | Format | After Effects | EffectCraft read | Write | Fidelity / notes | Tested by |
 |---|---|---|---|---|---|
-| Project `.aep` | R/W (native) | none | none | Main file format; needs an owner decision on clean-room scope (#190, #248: py-aep as an external converter). Blocks beta | — |
-| XML project `.aepx` | R/W | none | none | Same decision as `.aep` | — |
+| Project `.aep` | R/W (native) | external py-aep converter | none | Partial: owner-approved external MIT parser; 255 SceneYard templates checked on 9 October, no second corpus yet. Python + py-aep are needed only while converting; the converted project/compositor remain native Rust. See `packaging/aep/README.md` | Fork importer/corpus checks; [gaps.md](gaps.md) |
+| XML project `.aepx` | R/W | none | none | No reader yet; the existing converter route covers `.aep` only | — |
 | Templates `.aet` / `.aetx` | R/W | none | none | Own `.ectemplate` (Home ▸ Templates, Save as Template) | `templates.rs` tests |
 | Motion Graphics template `.mogrt` | W (and R in Premiere) | none | none | Own `.ectemplate` Essential Graphics templates; FilmCraft rejects our `.fcgt` export (#611) | `essential.rs` tests |
 | Animation preset `.ffx` | R/W, 621 bundled | none | none | Own JSON `.ecpreset`; `.ffx` is out of clean-room scope (AGENTS.md §2) | `animation.rs` tests |
@@ -32,7 +32,7 @@ trips and renders, checked by tests, not against After Effects), **partial** (na
 | Binary scripts `.jsxbin` | R (run) | none | — | No public specification: out of scope | — |
 | Motion graphics JSON `.mgjson` | R (data) | none | none | Media Browser lists it; import accepts only `.json` / `.csv` / `.tsv` data | — |
 | Captions `.aecap`, graphics `.aegraphic` | R/W | none | none | — | — |
-| Native `.ecproj` | — | yes | yes | Versioned JSON; schema migrations tested; absolute footage paths, no relinking (gap 18) | engine project tests |
+| Native `.ecproj` | — | yes | yes | Versioned JSON; schema migrations tested; footage resolves beside moved projects and missing items can be relinked ([footage.md](footage.md)) | engine project tests |
 
 ## Footage: stills
 
@@ -70,7 +70,7 @@ trips and renders, checked by tests, not against After Effects), **partial** (na
 | BRAW, R3D, ARRIRAW | R (plug-ins / SDKs) | none | none | proprietary SDKs |
 | Variable-frame-rate phone video | R | unverified | — | needs a real-media corpus |
 | WAV, AIFF | R/W | yes | yes (16-bit PCM) | good |
-| MP3, AAC / M4A, FLAC, Ogg, Opus | R | yes | AAC and Opus inside video only | MP3 layer can go silent (#324) |
+| MP3, AAC / M4A, FLAC, Ogg, Opus | R | yes | AAC and Opus inside video only | MP3 silence (#324) is closed |
 
 ## 3D models
 
@@ -90,7 +90,7 @@ trips and renders, checked by tests, not against After Effects), **partial** (na
 | Premiere Pro `.prproj` | R (import) | none | none | Out of clean-room scope pending a decision; we interchange through FCP7 XML, FCPXML, OTIO, EDL, AAF and OMF instead (beyond After Effects) |
 | Lottie JSON / dotLottie | via third-party plug-ins | yes | yes | beyond After Effects; a warnings list names what Lottie can't express |
 | JSON / CSV / TSV data | R | yes (`footage()`, data layers) | — | good |
-| LUTs (`.cube`, `.3dl`, `.csp`, `.spi1d/3d`, CDL) | R | yes (Apply Color LUT, OCIO effects) | — | Apply Color LUT bug (#514) |
+| LUTs (`.cube`, `.3dl`, `.csp`, `.spi1d/3d`, CDL) | R | yes (Apply Color LUT, OCIO effects) | — | Apply Color LUT bug (#514) is closed |
 | OpenColorIO configs | R (OCIO 2.5.1, ACES 2.0 in 26.5) | yes (OCIO v2 subset, Blender configs) | — | partial: no ACES 2.0 output transforms |
 | Fonts (TTF, OTF, TTC, variable) | R | yes | — | good |
 | Mocha shapes | R (Mocha AE) | own documented JSON | — | Mocha's format is not public |
@@ -107,7 +107,7 @@ encoders ([hardware-parity.md](hardware-parity.md)), and rendering safely over a
 
 ## Estimate
 
-**≈ 130–230 h**: `.aep` / `.aepx` import 80–160 h (after the owner decision), wiring TGA / DPX /
+**≈ 130–230 h**: `.aep` / `.aepx` import 80–160 h (broader `.aep` corpus and `.aepx` beyond the existing converter), wiring TGA / DPX /
 HDR / MXF / AVI / DNx import and DPX/TGA output 10–20 h, FBX animation and skinning, USD and Substance 20–40 h,
 relinking 6–12 h, `.mogrt`-compatible templates 15–30 h (partly parallel with the rest).
 
@@ -115,4 +115,6 @@ relinking 6–12 h, `.mogrt`-compatible templates 15–30 h (partly parallel wit
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-12 | minor | #324 and #514 marked closed; upstream `.aep` PRs #251 and #860 noted |
+| 2026-10-13 | minor | Upstream merge retains this fork's external py-aep import and moved-footage relinking |
 | 2026-10-10 | major | First file format parity document, from the After Effects 26.5 bundle and this repository's import/export registries |

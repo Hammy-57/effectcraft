@@ -52,6 +52,10 @@ fn new_comp(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: Val
 }
 
 fn comp_settings(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: Value) -> Result<Value, String> {
+    if let Some(comp) = super::only_comp(&params) {
+        crate::panels::dialogs::open_comp_settings_for(app, comp)?;
+        return Ok(Value::Null);
+    }
     if !no_params(&params) {
         return super::engine(app, ctx, id, params);
     }

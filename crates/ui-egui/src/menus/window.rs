@@ -18,6 +18,10 @@ pub(crate) fn handlers() -> &'static [Handler] {
         Handler::ui("window.dockAction", dock_action),
         // A UI-only command (not in the engine's menus): run as its frontend command.
         Handler::ui("window.maximizeApp", maximize_app),
+        Handler::ui("window.toggleCompTimeline", toggle_comp_timeline),
+        Handler::ui("window.nextPanel", step_panel),
+        Handler::ui("window.previousPanel", step_panel),
+        Handler::ui("window.closeAll", close_all),
         Handler::frontend("window.maximizeApp", maximize_app),
         Handler::ui("window.dockPanel", panel_op),
         Handler::ui("window.floatPanel", panel_op),
@@ -50,6 +54,38 @@ fn maximize_app(_app: &mut EffectcraftApp, ctx: &egui::Context, _id: &str, _p: V
     let maximized = !ctx.input(|i| i.viewport().maximized.unwrap_or(false));
     ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(maximized));
     Ok(json!({"maximized": maximized}))
+}
+
+fn toggle_comp_timeline(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, _p: Value) -> Result<Value, String> {
+    let to = if app.ui.focused == PanelKind::Timeline { crate::panels::viewers::active_panel(app) } else { PanelKind::Timeline };
+    app.show_panel(to);
+    Ok(json!({"focused": to.id()}))
+}
+
+fn step_panel(app: &mut EffectcraftApp, _ctx: &egui::Context, id: &str, _p: Value) -> Result<Value, String> {
+    let focused = app.ui.focused;
+    let group: Vec<PanelKind> = match app.ui.floating.iter().find(|f| f.panels.contains(&focused)) {
+        Some(f) => f.panels.clone(),
+        None => app.ui.dock.group_of(focused).map(<[PanelKind]>::to_vec).unwrap_or_default(),
+    };
+    let Some(i) = group.iter().position(|p| *p == focused) else { return Ok(Value::Null) };
+    let step = if id == "window.nextPanel" { 1 } else { group.len().saturating_sub(1) };
+    if let Some(next) = group.get((i + step) % group.len().max(1)).copied() {
+        app.show_panel(next);
+    }
+    Ok(json!({"focused": app.ui.focused.id()}))
+}
+
+fn close_all(app: &mut EffectcraftApp, ctx: &egui::Context, _id: &str, _p: Value) -> Result<Value, String> {
+    let focused = app.ui.focused;
+    if matches!(focused, PanelKind::Composition | PanelKind::Timeline | PanelKind::Viewer(_)) {
+        for c in app.session.state.open_comps.clone() {
+            super::run_engine(app, ctx, "comp.close", json!({"comp": c.0}))?;
+        }
+    } else {
+        app.close_panel(focused);
+    }
+    Ok(Value::Null)
 }
 
 fn legacy_panel(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, _params: Value) -> Result<Value, String> {
@@ -235,7 +271,7 @@ fn save_workspace(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, _p:
     let name = app.ui.workspace.clone();
     app.ui.saved_workspaces.insert(name.clone(), app.ui.dock.clone());
     app.ui.saved_floating.insert(name.clone(), app.ui.floating.clone());
-    app.store_saved_workspaces();
+    app.store_saved_workspaces()?;
     Ok(json!({"workspace": name}))
 }
 
@@ -253,7 +289,7 @@ fn save_workspace_as(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, 
     app.ui.saved_workspaces.insert(name.clone(), app.ui.dock.clone());
     app.ui.saved_floating.insert(name.clone(), app.ui.floating.clone());
     app.ui.workspace = name.clone();
-    app.store_saved_workspaces();
+    app.store_saved_workspaces()?;
     Ok(json!({"workspace": name}))
 }
 
@@ -279,10 +315,10 @@ fn edit_workspaces(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, p:
         if app.ui.saved_workspaces.remove(&name).is_none() && !builtin {
             return Err(format!("no workspace `{name}`"));
         }
-        app.store_saved_workspaces();
         if app.ui.workspace == name {
             app.set_workspace("Default");
         }
+        app.store_saved_workspaces()?;
         return Ok(json!({"deleted": name}));
     }
     if let Some(new) = p.get("rename").and_then(Value::as_str).map(str::trim).filter(|n| !n.is_empty() && *n != name) {
@@ -297,7 +333,7 @@ fn edit_workspaces(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, p:
         if app.ui.workspace == name {
             app.ui.workspace = new.to_string();
         }
-        app.store_saved_workspaces();
+        app.store_saved_workspaces()?;
         return Ok(json!({"renamed": new}));
     }
     Ok(json!({"workspaces": app.workspace_names()}))

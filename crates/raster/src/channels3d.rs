@@ -151,6 +151,11 @@ impl AuxChannels {
         out
     }
 
+    /// Compatibility name for the rank planes, resolved once per evaluation.
+    pub fn crypto_rank_planes(&self, layer: &str) -> Vec<(&[f32], &[f32])> {
+        self.crypto_planes(layer)
+    }
+
     /// Aux pixel index of a layer-space point (nearest; `None` outside).
     #[inline]
     pub fn index_at(&self, lx: f64, ly: f64) -> Option<usize> {
@@ -248,5 +253,33 @@ mod tests {
         assert_eq!(a.crypto_ranks("CryptoObject", 0), vec![(1.0, 0.5)]);
         assert_eq!(a.index_at(1.5, 0.2), Some(1));
         assert_eq!(a.index_at(2.5, 0.2), None);
+    }
+
+    /// The rank planes come in rank order (00.R/G, 00.B/A, 01.R/G, ...), match lowercase channel
+    /// names as Blender writes them, stop at the first missing rank and agree with
+    /// `crypto_ranks` at every pixel.
+    #[test]
+    fn crypto_rank_planes_resolve_ranks_in_order() {
+        let mut a = AuxChannels::new(2, 1, 1.0);
+        for (n, v) in [
+            ("00.r", [1.0, 2.0]),
+            ("00.g", [0.5, 0.6]),
+            ("00.b", [3.0, 4.0]),
+            ("00.a", [0.25, 0.3]),
+            ("01.R", [5.0, 6.0]),
+            ("01.G", [0.1, 0.2]),
+            ("03.R", [9.0, 9.0]),
+            ("03.G", [1.0, 1.0]),
+        ] {
+            a.channels.push((format!("CryptoMaterial{n}"), v.to_vec()));
+        }
+        let planes = a.crypto_rank_planes("CryptoMaterial");
+        let ids: Vec<f32> = planes.iter().map(|(id, _)| id[1]).collect();
+        assert_eq!(ids, vec![2.0, 4.0, 6.0]);
+        for i in 0..2 {
+            let from_planes: Vec<(f32, f32)> = planes.iter().map(|(id, c)| (id[i], c[i])).collect();
+            assert_eq!(from_planes, a.crypto_ranks("CryptoMaterial", i));
+        }
+        assert!(a.crypto_rank_planes("CryptoObject").is_empty());
     }
 }

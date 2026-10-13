@@ -17,6 +17,9 @@ pub(crate) fn handlers() -> &'static [Handler] {
         Handler::ui("timeline.zoomIn", zoom),
         Handler::ui("timeline.zoomOut", zoom),
         Handler::ui("timeline.zoomFit", zoom_fit),
+        Handler::ui("timeline.scrollToTime", scroll_to),
+        Handler::ui("timeline.scrollToLayer", scroll_to),
+        Handler::ui("timeline.parentColumn", parent_column),
         Handler::ui("timeline.zoomFrameToggle", zoom_frame_toggle),
         Handler::ui("timeline.column", column),
         Handler::ui("timeline.columnLayout", column_layout),
@@ -182,9 +185,20 @@ fn zoom(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, _params: Value)
     Ok(Value::Null)
 }
 
-fn zoom_fit(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, _params: Value) -> Result<Value, String> {
-    app.ui.timeline.pps = None;
+fn zoom_fit(app: &mut EffectcraftApp, ctx: &egui::Context, _id: &str, _params: Value) -> Result<Value, String> {
+    crate::panels::timeline::toggle_fit_zoom(app, ctx);
     Ok(Value::Null)
+}
+
+fn scroll_to(app: &mut EffectcraftApp, _ctx: &egui::Context, id: &str, _params: Value) -> Result<Value, String> {
+    app.ui.timeline.scroll_to = Some(if id == "timeline.scrollToTime" { crate::state::ScrollTo::Time } else { crate::state::ScrollTo::Layer });
+    Ok(Value::Null)
+}
+
+fn parent_column(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, _params: Value) -> Result<Value, String> {
+    let on = !crate::panels::timeline_columns::column_visible(&app.ui.timeline, "parent");
+    crate::panels::timeline_columns::set_column(&mut app.ui.timeline, "parent", on)?;
+    Ok(json!({"parent": on}))
 }
 
 fn zoom_frame_toggle(app: &mut EffectcraftApp, ctx: &egui::Context, _id: &str, _params: Value) -> Result<Value, String> {

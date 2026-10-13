@@ -22,6 +22,7 @@ pub mod fidelity;
 pub mod keylight;
 pub mod migrate;
 pub mod mocha_shape;
+pub mod object_matte;
 pub mod ocio_config;
 pub mod paint;
 pub mod plugin;
@@ -80,7 +81,7 @@ pub use time_fx::{PixelMotion, TimewarpPlan, TwStep, pmb_plan, posterized_time, 
 // effectcraft-gpu fx_tone.
 pub use ocio::color_stabilizer_maps;
 // GPU effects, part B (3D Channel, Immersive Video, colour management, simulation render passes).
-pub use channel3d::{CRYPTO_LAYERS, id_color, selection_hashes};
+pub use channel3d::{CRYPTO_LAYERS, crypto_aux_image, id_color, selection_hashes};
 pub use ocio::{ColorOp, Straight, Tf, color_program};
 pub use sim::{Acc, Blob, Bubble, Post, Shape, Sprite, SpritePlan, Tint, bubble_list, drizzle_drops, mercury_blobs, sprite_plan};
 pub use sim2::{
@@ -802,7 +803,15 @@ pub const PARAM_GROUPS: &[(&str, &str)] = &[
 
 /// Display names of nested parameter groups by match id.
 fn group_name(m: &str) -> &str {
-    warp_stab::GROUPS.iter().chain(roto::GROUPS).chain(keylight::GROUPS).chain(PARAM_GROUPS).find(|(id, _)| *id == m).map(|(_, n)| *n).unwrap_or(m)
+    warp_stab::GROUPS
+        .iter()
+        .chain(roto::GROUPS)
+        .chain(object_matte::GROUPS)
+        .chain(keylight::GROUPS)
+        .chain(PARAM_GROUPS)
+        .find(|(id, _)| *id == m)
+        .map(|(_, n)| *n)
+        .unwrap_or(m)
 }
 
 /// The nested group at `path` (`borders/autoScale`) under `g`, created on first use.
@@ -1179,6 +1188,7 @@ pub const TIME_DEPENDENT: &[&str] = &[
     camera_tracker::ID,
     // Each frame has its own segmentation.
     roto::ID,
+    object_matte::ID,
 ];
 
 /// See [`TIME_DEPENDENT`].

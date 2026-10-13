@@ -185,3 +185,24 @@ mod ui_workspace_focus;
 mod viewer_geometry;
 #[path = "../viewer_passive_display.rs"]
 mod viewer_passive_display;
+
+#[path = "../ui_effect_names.rs"]
+mod ui_effect_names;
+
+#[path = "../ui_form_fit.rs"]
+mod ui_form_fit;
+
+#[path = "../ui_group_rename.rs"]
+mod ui_group_rename;
+
+#[path = "../ui_object_matte.rs"]
+mod ui_object_matte;
+
+#[path = "../ui_presets_folder.rs"]
+mod ui_presets_folder;
+
+#[path = "../ui_quick_offset.rs"]
+mod ui_quick_offset;
+
+#[path = "../ui_video_preview_off.rs"]
+mod ui_video_preview_off;

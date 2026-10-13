@@ -98,6 +98,28 @@ fn a_client_creating_a_comp_keeps_the_users_view() {
 }
 
 #[test]
+fn parked_comp_selections_and_recent_comps_are_per_client() {
+    let (mut s, x, _, z) = setup();
+    let main = s.active_comp_id().unwrap();
+    let other = ItemId(s.execute("comp.new", json!({"name": "Other"})).unwrap()["comp"].as_u64().unwrap());
+    let other_layer = solid(&mut s, "Other layer");
+    s.open_comp(main);
+    let parked = s.state.comp_selections.clone();
+    let recent = s.state.recent_comps.clone();
+    s.execute_checked("layer.select", json!({"layers": [x], "client": "A"})).unwrap();
+    s.execute_checked("comp.open", json!({"comp": other.0, "client": "A"})).unwrap();
+    s.execute_checked("layer.select", json!({"layers": [], "client": "A"})).unwrap();
+    s.execute_checked("comp.open", json!({"comp": main.0, "client": "A"})).unwrap();
+    let agent = s.execute_checked("editor.state", json!({"client": "A"})).unwrap();
+    assert_eq!(agent["selected_layers"], json!([x]));
+    assert_eq!(s.state.selected_layers, vec![LayerId(z)]);
+    assert_eq!(s.state.comp_selections, parked);
+    assert_eq!(s.state.recent_comps, recent);
+    s.open_comp(other);
+    assert_eq!(s.state.selected_layers, vec![LayerId(other_layer)]);
+}
+
+#[test]
 fn without_client_nothing_changes() {
     let (mut s, x, ..) = setup();
     let main = s.active_comp_id().unwrap();

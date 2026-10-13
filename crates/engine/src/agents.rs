@@ -24,7 +24,7 @@ use effectcraft_time::Tick;
 use serde_json::{Value, json};
 
 use crate::commands::{CommandSpec, b_p, bad, comp_id, f_p};
-use crate::{EditorState, EngineError, KeyRef, Result, Session, VertexRef, query};
+use crate::{CompSelection, EditorState, EngineError, KeyRef, Result, Session, VertexRef, query};
 
 /// Client cursors kept at most (the least recently used is dropped).
 pub const MAX_CURSORS: usize = 64;
@@ -43,6 +43,8 @@ pub const MAX_TTL: f64 = 86_400.0;
 #[derive(Clone, Debug, Default)]
 pub struct Cursor {
     pub active_comp: Option<ItemId>,
+    pub recent_comps: Vec<ItemId>,
+    pub comp_selections: BTreeMap<ItemId, CompSelection>,
     pub times: BTreeMap<ItemId, Tick>,
     pub selected_layers: Vec<LayerId>,
     pub selected_props: Vec<(LayerId, Uid)>,
@@ -59,6 +61,8 @@ impl Cursor {
     pub fn of(st: &EditorState) -> Cursor {
         Cursor {
             active_comp: st.active_comp,
+            recent_comps: st.recent_comps.clone(),
+            comp_selections: st.comp_selections.clone(),
             times: st.times.clone(),
             selected_layers: st.selected_layers.clone(),
             selected_props: st.selected_props.clone(),
@@ -75,6 +79,8 @@ impl Cursor {
     pub fn swap(&mut self, st: &mut EditorState) {
         use std::mem::swap;
         swap(&mut self.active_comp, &mut st.active_comp);
+        swap(&mut self.recent_comps, &mut st.recent_comps);
+        swap(&mut self.comp_selections, &mut st.comp_selections);
         swap(&mut self.times, &mut st.times);
         swap(&mut self.selected_layers, &mut st.selected_layers);
         swap(&mut self.selected_props, &mut st.selected_props);

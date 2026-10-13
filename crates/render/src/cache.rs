@@ -1497,8 +1497,10 @@ pub(crate) fn hasher(seed: u64) -> KeyHasher {
 
 /// Time-based layer content: does any part of the source/effects read the clock directly
 /// (rather than through property values)?
-fn time_dependent(layer: &Layer) -> bool {
-    if layer.switches.effects
+/// `effects: false` ignores the effects (a key of the source and masks only).
+fn time_dependent(layer: &Layer, effects: bool) -> bool {
+    if effects
+        && layer.switches.effects
         && let Some(fx) = layer.effects()
     {
         for g in fx.groups() {
@@ -1664,7 +1666,7 @@ impl LayerInfo {
         let mut free_whole = KeyHasher(0x9e37_7c15_7f4a_79b9);
         free::hash_layer(&mut free_whole, layer);
         let fx = layer.switches.effects.then(|| layer.effects()).flatten();
-        let (time_dependent, reads_other_times) = (time_dependent(layer), reads_other_times(layer));
+        let (time_dependent, reads_other_times) = (time_dependent(layer, true), reads_other_times(layer));
         let paint = fx.is_some_and(|fx| fx.groups().any(|g| g.enabled && effectcraft_effects::paint::is_paint(g)));
         LayerInfo {
             head: head.finish(),
@@ -1904,7 +1906,7 @@ fn has_expression(g: &PropGroup) -> bool {
 /// Cache key for an adjustment layer's footprint (its source through its masks, see
 /// `Renderer::adjustment_footprint`): the GPU compositor then uploads it once, not every frame.
 pub fn footprint_key(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool) -> Option<u64> {
-    Some(derive(key_any(ctx, layer, scale, draft, blur, false, None, None)?, 0xf007_9417))
+    Some(derive(key_any(ctx, layer, scale, draft, blur, false, Some(0), None)?, 0xf007_9417))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2027,7 +2029,8 @@ fn key_any(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool, fo
         }
     }
     // Paint strokes appear and disappear with their Duration spans (not property values).
-    if info.paint
+    if effects != Some(0)
+        && info.paint
         && let Some(fx) = layer.effects()
     {
         let lt = layer.layer_time(ctx.time).seconds();
@@ -2035,14 +2038,14 @@ fn key_any(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool, fo
             effectcraft_effects::paint::cache_key(g, lt).0.hash(&mut h);
         }
     }
-    if info.time_dependent {
+    if info.time_dependent && (effects != Some(0) || time_dependent(layer, false)) {
         layer.layer_time(ctx.time).0.hash(&mut h);
         // Effects also see the layer's time mapping.
         layer.start_time.0.hash(&mut h);
         layer.stretch.to_bits().hash(&mut h);
     }
     // Effects that see the comp camera or lights (#397) change when they or the layer move.
-    if info.reads_comp_scene {
+    if effects != Some(0) && info.reads_comp_scene {
         hash_debug(&mut h, &crate::comp_scene(ctx, layer));
     }
     // Effects that read other layers (layer parameters) see their pixels.

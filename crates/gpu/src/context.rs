@@ -61,6 +61,9 @@ pub const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
 /// Uploaded layer buffers kept on the GPU (bytes), at most (see [`GpuContext::set_cache_budget`]).
 const UPLOAD_BUDGET: usize = 1536 << 20;
 
+/// Disable encoder-local reuse for output comparisons. Submit barriers always remain active.
+pub(crate) static TEXTURE_REUSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 /// Effect chain results awaiting adoption (see [`GpuContext::keep`]), at most.
 const MAX_KEPT: usize = 16;
 
@@ -421,6 +424,7 @@ impl Pool {
     /// later commands in that encoder. Separate encoders retain the submit barrier.
     fn take_for_encoder(&mut self, w: u32, h: u32, encoder: Option<u64>) -> Option<Pooled> {
         if let Some(id) = encoder.filter(|id| *id != 0)
+            && TEXTURE_REUSE.load(std::sync::atomic::Ordering::Relaxed)
             && self.open.len() == 1
             && self.open.contains(&id)
             && let Some(index) = self.released.iter().position(|(texture, owner)| *owner == id && texture.size() == (w, h))
@@ -639,6 +643,9 @@ pub struct GpuContext {
     system_memory: std::sync::atomic::AtomicU64,
     /// The layer cache budget last given to [`GpuContext::set_cache_budget`].
     layer_budget: std::sync::atomic::AtomicUsize,
+    /// Explicit upload ceiling; zero follows the owner-derived memory budget.
+    upload_limit: std::sync::atomic::AtomicUsize,
+    upload_full_warned: std::sync::atomic::AtomicBool,
     auxiliary_budget: std::sync::atomic::AtomicU64,
     pub(crate) bgl: wgpu::BindGroupLayout,
     bgl_ext: wgpu::BindGroupLayout,
@@ -1042,6 +1049,8 @@ impl GpuContext {
             integrated,
             system_memory: std::sync::atomic::AtomicU64::new(0),
             layer_budget: std::sync::atomic::AtomicUsize::new(UPLOAD_BUDGET),
+            upload_limit: std::sync::atomic::AtomicUsize::new(0),
+            upload_full_warned: Default::default(),
             auxiliary_budget: std::sync::atomic::AtomicU64::new(auxiliary_budget),
             staging: Default::default(),
             planes: Default::default(),
@@ -1562,6 +1571,20 @@ impl GpuContext {
             stale.release();
         }
     }
+    /// Set an additional upload ceiling while retaining the owner's physical-memory cap.
+    pub fn set_upload_budget(&self, bytes: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.upload_limit.store(bytes.clamp(1 << 20, UPLOAD_BUDGET), Relaxed);
+        self.set_cache_budget(self.layer_budget.load(Relaxed));
+    }
+    pub fn upload_budget(&self) -> usize {
+        self.retained_cap()
+    }
+    fn warn_upload_full(&self) {
+        if !self.upload_full_warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            log::warn!(target: "effectcraft_gpu", "GPU retained upload cache is full ({} MiB allowance); unreused layer textures upload again when needed", self.retained_cap() >> 20);
+        }
+    }
     pub(crate) fn retained_cap(&self) -> usize {
         self.uploads.lock().map(|u| u.budget.unwrap_or(UPLOAD_BUDGET)).unwrap_or(0)
     }
@@ -1590,7 +1613,14 @@ impl GpuContext {
             return;
         }
         self.mips.seal(&img);
-        let Ok(pending) = owner.prepare(Arc::new(img), allocation, GpuStage::CpuMirror, self.retained_cap()) else { return };
+        let pending = match owner.prepare(Arc::new(img), allocation, GpuStage::CpuMirror, self.retained_cap()) {
+            Ok(pending) => pending,
+            Err(effectcraft_render::retained::AdmissionError::Capacity) => {
+                self.warn_upload_full();
+                return;
+            }
+            Err(_) => return,
+        };
         let Ok(slot) = pending.publish() else { return };
         let entry = SlotRef { owner: owner.clone(), slot, epoch: epoch.clone() };
         let key = (owner.identity(), Arc::as_ptr(buf) as usize);
@@ -1723,6 +1753,8 @@ impl GpuContext {
         use std::sync::atomic::Ordering::Relaxed;
         self.layer_budget.store(layer_cache, Relaxed);
         let (upload, pool, auxiliary) = cache_budgets(layer_cache, self.integrated, self.system_memory.load(Relaxed));
+        let limit = self.upload_limit.load(Relaxed);
+        let upload = if limit == 0 { upload } else { upload.min(limit) };
         let pool = pool_budget_override().unwrap_or(pool);
         self.auxiliary_budget.store(auxiliary, std::sync::atomic::Ordering::Relaxed);
         if let Ok(mut u) = self.uploads.lock() {

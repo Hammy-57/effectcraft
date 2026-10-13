@@ -15,6 +15,9 @@ pub(crate) fn handlers() -> &'static [Handler] {
         Handler::ui("view.theme.toggle", theme_toggle),
         Handler::ui_prefix("view.theme.", theme),
         Handler::ui("view.fit", fit),
+        Handler::ui("view.fitUpTo100", fit_up_to_100),
+        Handler::ui("view.nextItem", step_item),
+        Handler::ui("view.previousItem", step_item),
         Handler::ui("view.actualSize", actual_size),
         Handler::ui("view.safeMargins", safe_margins),
         Handler::ui("view.transparencyGrid", transparency_grid),
@@ -62,8 +65,7 @@ fn nudge(app: &mut EffectcraftApp, ctx: &egui::Context, dir: &str) -> Result<Val
         _ => return Err(format!("unknown nudge `{dir}`")),
     };
     let st = &app.session.state;
-    let over = matches!(app.ui.focused, PanelKind::Composition | PanelKind::Viewer(_) | PanelKind::Timeline);
-    if !over || st.selected_layers.is_empty() || st.text_edit.is_some() || !st.selected_vertices.is_empty() {
+    if app.ui.focused == PanelKind::Project || st.selected_layers.is_empty() || st.text_edit.is_some() || !st.selected_vertices.is_empty() {
         return Ok(Value::Null);
     }
     // Screen pixels per comp pixel.
@@ -97,6 +99,21 @@ fn fit(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, _params: Value
     app.ui.viewer.fit_up_to_100 = false;
     app.ui.viewer.pan = [0.0, 0.0];
     Ok(Value::Null)
+}
+
+fn fit_up_to_100(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, _params: Value) -> Result<Value, String> {
+    app.ui.viewer.zoom = None;
+    app.ui.viewer.fit_up_to_100 = true;
+    app.ui.viewer.pan = [0.0, 0.0];
+    Ok(Value::Null)
+}
+
+fn step_item(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, _params: Value) -> Result<Value, String> {
+    let open = app.session.state.open_comps.clone();
+    let Some(i) = app.session.state.active_comp.and_then(|c| open.iter().position(|o| *o == c)) else { return Ok(Value::Null) };
+    let step = if id == "view.nextItem" { 1 } else { open.len().saturating_sub(1) };
+    let Some(next) = open.get((i + step) % open.len().max(1)).copied().filter(|n| Some(*n) != app.session.state.active_comp) else { return Ok(Value::Null) };
+    run_engine(app, ctx, "comp.open", json!({"comp": next.0}))
 }
 
 fn actual_size(app: &mut EffectcraftApp, ctx: &egui::Context, _id: &str, _params: Value) -> Result<Value, String> {

@@ -24,6 +24,19 @@ pub fn essential_overrides(ctx: &EvalCtx, layer: &Layer) -> Vec<effectcraft_proj
 }
 
 impl<'a> Renderer<'a> {
+    /// Whether `layer`'s processed buffer (source → masks → effects) is cached and the same as
+    /// one frame earlier: drawing it from the layer cache (an accelerator uploads it once) beats
+    /// re-running its effects every frame.
+    pub fn layer_is_static(&self, ctx: &EvalCtx, layer: &Layer) -> bool {
+        if self.cache.is_none() {
+            return false;
+        }
+        let (scale, draft, blur) = (self.raster_scale(ctx, layer), self.opts.draft, self.mb_on(ctx, layer));
+        let prev = ctx.time - ctx.comp.frame_rate.frame_duration();
+        let now = crate::cache::layer_key(ctx, layer, scale, draft, blur);
+        now.is_some() && now == crate::cache::layer_key(&ctx.at(prev), layer, scale, draft, blur)
+    }
+
     /// Rasterisation scale of a layer's source: the output scale, or — for text and shape layers,
     /// which are always continuously rasterised (#390, #751), and Continuously Rasterize vector
     /// footage — the output scale times the layer's on-screen scale (quarter-octave steps, rounded

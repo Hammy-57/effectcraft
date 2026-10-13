@@ -138,6 +138,7 @@ fn batch(s: &mut Session, p: &Value) -> Result<Value> {
     let steps = preflight(steps, atomic, &empty)?;
     let (project, history, state) = (s.project.clone(), s.history.clone(), s.state.clone());
     let (events, journal, learn) = (s.events.clone(), s.journal.clone(), s.learn.clone());
+    let key_move = s.key_move.clone();
     let (warp_pending, camera_pending, roto_pending, analyses_checked) =
         (s.warp_pending.clone(), s.camera_pending.clone(), s.roto_pending.clone(), s.analyses_checked.clone());
     let mut results: Vec<Option<Value>> = Vec::with_capacity(steps.len());
@@ -165,6 +166,7 @@ fn batch(s: &mut Session, p: &Value) -> Result<Value> {
                     s.events = events;
                     s.journal = journal;
                     s.learn = learn;
+                    s.key_move = key_move;
                     s.warp_pending = warp_pending;
                     s.camera_pending = camera_pending;
                     s.roto_pending = roto_pending;

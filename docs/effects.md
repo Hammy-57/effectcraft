@@ -3,11 +3,11 @@
 <!-- Generated from the effect registry (crates/effects/src/catalog.rs); do not edit by hand.
      Regenerate: UPDATE_DOCS=1 cargo test -p effectcraft-effects --lib effects_doc_is_current -->
 
-EffectCraft ships 316 effects with 3190 parameters in total, grouped into the same categories as the Effects & Presets panel. Every effect is our own implementation, written from public behaviour descriptions and standard image-processing literature. Parameter names, order, popup options, units, defaults and ranges follow the reference application so that projects, expressions and muscle memory carry over.
+EffectCraft ships 317 effects with 3205 parameters in total, grouped into the same categories as the Effects & Presets panel. Every effect is our own implementation, written from public behaviour descriptions and standard image-processing literature. Parameter names, order, popup options, units, defaults and ranges follow the reference application so that projects, expressions and muscle memory carry over.
 
 - **GPU**: 281 effects also run on the GPU compositor with identical results.
-- **32**: 316 effects process 32-bit float (HDR, overbright) pixels without clamping.
-- **Status**: 304 implemented in full, 12 partial (what is missing is listed).
+- **32**: 317 effects process 32-bit float (HDR, overbright) pixels without clamping.
+- **Status**: 305 implemented in full, 12 partial (what is missing is listed).
 
 Effects are addressed by id (`ec.<category>.<name>`) or display name in commands, scripts and the control channel, and every parameter by its id (`effects/#1/blurriness`).
 
@@ -258,6 +258,7 @@ Effects are addressed by id (`ec.<category>.<name>`) or display name in commands
 |---|---|---:|:-:|:-:|---|
 | Matte Choker | `ec.matte.mattechoker` | 7 | GPU | 32 | Implemented |
 | Mocha shape | `ec.obsolete.mochashape` | 6 |  | 32 | Implemented |
+| Object Matte | `ec.matte.objectmatte` | 13 |  | 32 | Implemented |
 | Refine Hard Matte | `ec.matte.refinehard` | 16 | GPU | 32 | Implemented |
 | Refine Soft Matte | `ec.matte.refinesoft` | 18 | GPU | 32 | Implemented |
 | Roto Brush & Refine Edge | `ec.matte.rotobrush` | 24 |  | 32 | Implemented |

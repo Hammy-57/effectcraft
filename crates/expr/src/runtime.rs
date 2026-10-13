@@ -220,6 +220,7 @@ fn placeholder(req: &Req) -> Resp {
         Req::Child { .. } => Resp::List(vec![s("\u{1}"), Resp::Bool(true), s(""), s(""), n(0.0), n(1.0)]),
         Req::PropInfo { .. } => Resp::List(vec![s(""), n(0.0), s("number"), n(1.0), n(0.0), Resp::Null, Resp::Bool(false), n(1.0), s("")]),
         Req::Keys { .. } => Resp::List(vec![Resp::List(vec![]), Resp::List(vec![])]),
+        Req::SourceInfo { .. } => Resp::List(vec![s("footage"), n(-1.0), s(""), n(100.0), n(100.0), n(1.0), n(1.0 / 30.0), n(1.0)]),
         Req::Value { .. } => n(0.0),
         Req::Xform { .. } => Resp::List(vec![ident(3), ident(3), ident(4), ident(4)]),
         Req::SourceRect { .. } | Req::Sample { .. } => Resp::List(vec![n(0.0); 4]),
@@ -281,6 +282,7 @@ fn native_host(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsV
         },
         14 => Req::Project,
         15 => Req::Keys { comp: id(args, 1, ctx)?, layer: id(args, 2, ctx)?, path: string(args, 3, ctx)? },
+        16 => Req::SourceInfo { comp: id(args, 1, ctx)?, layer: id(args, 2, ctx)? },
         _ => return Err(JsNativeError::typ().with_message("unknown host request").into()),
     };
     let found = FRAMES.with(|f| {

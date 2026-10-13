@@ -36,6 +36,9 @@ const PINNED_INVOKE: &[&str] = &[
     "playback.preview.altNumpad0",
     "playback.stop",
     "view.fit",
+    "view.fitUpTo100",
+    "view.nextItem",
+    "view.previousItem",
     "view.actualSize",
     "view.safeMargins",
     "view.transparencyGrid",
@@ -43,6 +46,9 @@ const PINNED_INVOKE: &[&str] = &[
     "timeline.zoomIn",
     "timeline.zoomOut",
     "timeline.zoomFit",
+    "timeline.scrollToTime",
+    "timeline.scrollToLayer",
+    "timeline.parentColumn",
     "timeline.zoomFrameToggle",
     "timeline.column",
     "timeline.columnLayout",
@@ -72,6 +78,10 @@ const PINNED_INVOKE: &[&str] = &[
     "keys.interpolation",
     "layer.timeStretch",
     "window.maximizeApp",
+    "window.toggleCompTimeline",
+    "window.nextPanel",
+    "window.previousPanel",
+    "window.closeAll",
     "window.panelWindow",
     "view.theme.toggle",
     "project.deleteWithoutConfirmation",
@@ -79,6 +89,7 @@ const PINNED_INVOKE: &[&str] = &[
 
 /// The ids `menus::frontend` handled (frontend events of engine commands), in the old match order.
 const PINNED_FRONTEND: &[&str] = &[
+    "effects.copyPresetsFolderPath",
     "app.about",
     "prop.editGradient",
     "playback.scrubAudio",
@@ -166,7 +177,7 @@ fn handles_exactly_the_pinned_ids() {
         want.sort();
         assert_eq!(got, want, "{stage:?}: the handled ids changed; update PINNED_* only for a deliberate change");
     }
-    assert_eq!(PINNED_INVOKE.len() + PINNED_FRONTEND.len(), 125);
+    assert_eq!(PINNED_INVOKE.len() + PINNED_FRONTEND.len(), 136);
 }
 
 #[test]

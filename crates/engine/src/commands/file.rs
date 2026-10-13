@@ -469,6 +469,11 @@ fn add_footage(s: &mut Session, pending: PendingImport, probed: Vec<std::result:
     let mut asked: Vec<u64> = vec![];
     let made: Vec<ItemId> = comps.iter().map(|c| ItemId(*c)).collect();
     if !found.is_empty() {
+        // The file may have been overwritten since an earlier import or project decoded it (the
+        // media layer keys frames by path): a fresh import reads it again (#1070).
+        for f in &found {
+            s.forget_decoded(&f.footage);
+        }
         s.edit("Import", None, |proj, st| {
             let mut selection = made;
             for f in found {

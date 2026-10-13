@@ -13,6 +13,15 @@ pub(crate) fn handlers() -> &'static [Handler] {
 
 fn tool(app: &mut EffectcraftApp, _ctx: &egui::Context, id: &str, _params: Value) -> Result<Value, String> {
     let t = id.strip_prefix("tool.").unwrap_or(id);
+    if t == "camera" {
+        let tools = [Tool::Orbit, Tool::PanCamera, Tool::Dolly];
+        let next = match tools.iter().position(|x| *x == app.ui.tool) {
+            Some(i) => tools[(i + 1) % tools.len()],
+            None => Tool::Orbit,
+        };
+        app.ui.tool = next;
+        return Ok(json!({"tool": next}));
+    }
     // Slot shortcuts cycle through the slot's tools.
     let slot = match t {
         "shape" => Some(8),

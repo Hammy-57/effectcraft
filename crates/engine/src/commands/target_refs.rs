@@ -130,7 +130,7 @@ fn validate_layer_fields(s: &Session, cmd: &str, p: &Value, cid: ItemId, comp: &
         {
             targets.push(l);
         }
-        if ["roto.", "warp.", "camera."].iter().any(|prefix| cmd.starts_with(prefix)) {
+        if ["roto.", "objectMatte.", "warp.", "camera."].iter().any(|prefix| cmd.starts_with(prefix)) {
             targets.extend(comp.layers.iter().map(|l| l.id));
         }
     }
@@ -320,6 +320,10 @@ mod tests {
         let err = assert_no_edit(&mut s, "effect.toggle", json!({"layer": lid, "effect": "Twin FX"}), "ambiguous group/effect");
         assert!(err.contains("90001") && err.contains("90002") && err.contains(&format!("layer {lid}")));
         assert_no_edit(&mut s, "effect.toggle", json!({"layer": lid, "effect": "duplicate.effect"}), "ambiguous group/effect");
+        assert_no_edit(&mut s, "effect.setLabel", json!({"layer": lid, "effect": "Twin FX", "label": "Red"}), "ambiguous group/effect");
+        s.state.selected_layers.clear();
+        s.state.selected_props.clear();
+        assert_no_edit(&mut s, "objectMatte.unfreeze", json!({"effect": "Twin FX"}), "ambiguous group/effect");
         for value in [json!(90001), json!("@90001"), json!("#1")] {
             s.execute("effect.toggle", json!({"layer": lid, "effect": value})).unwrap();
         }

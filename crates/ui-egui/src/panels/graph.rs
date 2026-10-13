@@ -481,7 +481,10 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
         let (lid, uid, d) = (c.layer.id, c.prop.uid, c.dim);
         for k in &c.keys {
             let kp = pos2(tm.x(k.t), ymap(k.v));
-            if !plot.expand(6.0).contains(kp) {
+            // In the speed graph an end key rises with the handle being dragged; skipping it once it
+            // leaves the plot would drop the handle's widget and end the drag at the top edge.
+            let handle_dragged = || ["in", "out"].iter().any(|side| ctx.is_being_dragged(egui::Id::new(("ghandle", uid, d, k.idx, *side))));
+            if !plot.expand(6.0).contains(kp) && !handle_dragged() {
                 continue;
             }
             let kjson = json!({"layer": lid.0, "prop": uid, "time": k.time.seconds()});

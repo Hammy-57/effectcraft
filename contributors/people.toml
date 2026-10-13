@@ -68,3 +68,16 @@ display_name = "Jason Brashear"
 [people.hakifx]
 display_name = "Elias"
 consent_source = "Explicit owner request in the agent-interface fixes chat, 2026-10-12: Add Elias as my display name."
+[people.nanox333]
+display_name = "nanox333"
+
+[people.Nael-Nathanael]
+sync_github_name = true
+
+[people.dotCooCoo]
+real_name = "Robert Lee"
+sync_github_name = true
+
+[people.moecr7]
+real_name = "Moein Saharkhiz"
+display_name = "onlymoein"
