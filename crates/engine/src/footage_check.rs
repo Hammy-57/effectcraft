@@ -210,7 +210,13 @@ mod tests {
         let mut paths: Vec<String> =
             o.project.items.values().filter_map(|i| if let ItemKind::Footage(f) = &i.kind { Some(f.path.clone()) } else { None }).collect();
         paths.sort();
-        assert_eq!(paths, ["/nonexistent/ec/abs.png", clip.to_str().unwrap(), "media/ec-relative-gone.png"]);
+        // Windows joins the stored "media/..." onto the project's folder and leaves a path with mixed
+        // separators; `Path` equality compares components, so both spellings are the same file.
+        let expected = ["/nonexistent/ec/abs.png", clip.to_str().unwrap(), "media/ec-relative-gone.png"];
+        assert_eq!(paths.len(), expected.len(), "{paths:?}");
+        for (got, want) in paths.iter().zip(expected) {
+            assert_eq!(std::path::Path::new(got), std::path::Path::new(want), "{paths:?}");
+        }
         assert!(!o.is_dirty(), "finding the files is no edit");
         let r = o.execute("footage.check", json!({"wait": true})).unwrap();
         assert_eq!(r["missing"], 2);

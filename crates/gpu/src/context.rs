@@ -43,6 +43,9 @@ const UPLOAD_BUDGET: usize = 1536 << 20;
 /// Working textures kept for reuse once their last image is dropped (bytes).
 const POOL_BUDGET: usize = 768 << 20;
 
+/// Readback staging buffers kept for reuse across sizes (bytes).
+const STAGING_BUDGET: u64 = 256 << 20;
+
 /// A GPU image: premultiplied RGBA f32 in a texture (cheap to clone; immutable once written).
 /// Working images come from the context's texture pool and go back to it when the last clone
 /// is dropped.
@@ -774,6 +777,12 @@ impl GpuContext {
         self.unavailable.push((entry, "dropped by a test".into()));
     }
 
+    /// Bytes of readback staging buffers kept for reuse (tests).
+    #[cfg(test)]
+    pub(crate) fn staging_bytes(&self) -> u64 {
+        self.staging.lock().map(|s| s.iter().map(|(k, v)| k * v.len() as u64).sum()).unwrap_or(0)
+    }
+
     pub fn can_readback(&self) -> bool {
         self.readbacks.check().is_ok() && (self.can_wait() || self.deferred.is_some())
     }
@@ -1153,9 +1162,15 @@ impl<'g> Enc<'g> {
         }
         out.copy_from_slice(&bytes);
         // Keep a few staging buffers per size (frames read back at the same size every time).
+        // Layers whose bounds change every frame read back at a new size each time: drop the
+        // other sizes once over budget, or mapped host memory grows for the whole render (#2081).
         if let Ok(mut s) = self.g.staging.lock() {
+            let held: u64 = s.iter().map(|(k, v)| k.saturating_mul(v.len() as u64)).sum();
+            if held.saturating_add(size) > STAGING_BUDGET {
+                s.retain(|k, _| *k == size);
+            }
             let v = s.entry(size).or_default();
-            if v.len() < 2 && size <= 256 << 20 {
+            if v.len() < 2 && size <= STAGING_BUDGET {
                 v.push(buf);
             }
         }

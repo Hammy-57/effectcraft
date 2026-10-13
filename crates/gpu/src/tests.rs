@@ -839,3 +839,21 @@ fn effects_whose_kernels_failed_render_on_the_cpu() {
         check(&format!("missing kernels {depth:?}"), Some(d), 0.0);
     }
 }
+
+/// A layer whose bounds change every frame reads back at a new size each time: the staging
+/// buffers kept for reuse stay within budget instead of growing for the whole render (#2081).
+#[test]
+fn readback_staging_stays_bounded_across_sizes() {
+    let Some(g) = gpu() else { return };
+    if !g.ctx.can_wait() {
+        return;
+    }
+    let mut e = crate::context::Enc::new(&g.ctx);
+    // 1024 × (256 + i) RGBA f32: ~4 MiB each, ~480 MiB over all sizes.
+    for i in 0..120 {
+        let img = g.ctx.image(1024, 256 + i);
+        assert!(e.download(&img).is_some(), "readback {i}");
+    }
+    let held = g.ctx.staging_bytes();
+    assert!(held <= (256 << 20) + 2 * 1024 * 16 * 376, "staging buffers hold {held} bytes");
+}
