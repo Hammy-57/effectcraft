@@ -4707,6 +4707,15 @@ const RUSSIAN: &[(&str, &str, &str)] = &[
     ("help.appPage", "EffectCraft Home Page", "Главная страница EffectCraft"),
     ("help.github", "EffectCraft on GitHub", "EffectCraft на GitHub"),
     ("file.openDemoProject", "Open Demo Project", "Открыть демонстрационный проект"),
+    // Fork menu entries (Smart Freeze, File ▸ Import, Effect Console, Round Corners).
+    ("", "Smart Freeze", "Smart Freeze"),
+    ("window.panel", "Smart Freeze", "Smart Freeze"),
+    ("freeze.freeze", "Freeze", "Заморозить"),
+    ("freeze.originals", "Use Originals / Stop Auto", "Использовать оригиналы / Остановить авто"),
+    ("file.importAep", "After Effects Project...", "Проект After Effects..."),
+    ("file.importProject", "EffectCraft Project...", "Проект EffectCraft..."),
+    ("app.fxConsole", "Effect Console...", "Консоль эффектов..."),
+    ("layer.roundCorners", "Round Corners", "Скруглить углы"),
 ];
 
 /// French (addition): the same (command, English label) keys as `JAPANESE`, one
@@ -5336,6 +5345,15 @@ const FRENCH: &[(&str, &str, &str)] = &[
     ("help.appPage", "EffectCraft Home Page", "Page d’accueil EffectCraft"),
     ("help.github", "EffectCraft on GitHub", "EffectCraft sur GitHub"),
     ("file.openDemoProject", "Open Demo Project", "Ouvrir le projet de démonstration"),
+    // Fork menu entries (Smart Freeze, File ▸ Import, Effect Console, Round Corners).
+    ("", "Smart Freeze", "Smart Freeze"),
+    ("window.panel", "Smart Freeze", "Smart Freeze"),
+    ("freeze.freeze", "Freeze", "Figer"),
+    ("freeze.originals", "Use Originals / Stop Auto", "Utiliser les originaux / Arrêter le mode auto"),
+    ("file.importAep", "After Effects Project...", "Projet After Effects..."),
+    ("file.importProject", "EffectCraft Project...", "Projet EffectCraft..."),
+    ("app.fxConsole", "Effect Console...", "Console d’effets..."),
+    ("layer.roundCorners", "Round Corners", "Arrondir les angles"),
 ];
 
 /// German (addition): the same (command, English label) keys as `JAPANESE`, one
@@ -5965,6 +5983,15 @@ const GERMAN: &[(&str, &str, &str)] = &[
     ("help.appPage", "EffectCraft Home Page", "EffectCraft-Startseite"),
     ("help.github", "EffectCraft on GitHub", "EffectCraft auf GitHub"),
     ("file.openDemoProject", "Open Demo Project", "Demoprojekt öffnen"),
+    // Fork menu entries (Smart Freeze, File ▸ Import, Effect Console, Round Corners).
+    ("", "Smart Freeze", "Smart Freeze"),
+    ("window.panel", "Smart Freeze", "Smart Freeze"),
+    ("freeze.freeze", "Freeze", "Einfrieren"),
+    ("freeze.originals", "Use Originals / Stop Auto", "Originale verwenden / Automatik stoppen"),
+    ("file.importAep", "After Effects Project...", "After Effects-Projekt..."),
+    ("file.importProject", "EffectCraft Project...", "EffectCraft-Projekt..."),
+    ("app.fxConsole", "Effect Console...", "Effektkonsole..."),
+    ("layer.roundCorners", "Round Corners", "Ecken abrunden"),
 ];
 
 // <<< generated i18n catalogs
@@ -6595,6 +6622,15 @@ const CZECH: &[(&str, &str, &str)] = &[
     ("help.appPage", "EffectCraft Home Page", "Domovská stránka EffectCraft"),
     ("help.github", "EffectCraft on GitHub", "EffectCraft na GitHubu"),
     ("file.openDemoProject", "Open Demo Project", "Otevřít ukázkový projekt"),
+    // Fork menu entries (Smart Freeze, File ▸ Import, Effect Console, Round Corners).
+    ("", "Smart Freeze", "Smart Freeze"),
+    ("window.panel", "Smart Freeze", "Smart Freeze"),
+    ("freeze.freeze", "Freeze", "Zmrazit"),
+    ("freeze.originals", "Use Originals / Stop Auto", "Použít originály / Zastavit automatiku"),
+    ("file.importAep", "After Effects Project...", "Projekt After Effects..."),
+    ("file.importProject", "EffectCraft Project...", "Projekt EffectCraft..."),
+    ("app.fxConsole", "Effect Console...", "Konzole efektů..."),
+    ("layer.roundCorners", "Round Corners", "Zaoblit rohy"),
 ];
 
 #[cfg(test)]

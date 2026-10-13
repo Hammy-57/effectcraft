@@ -805,8 +805,9 @@ mod tests {
         let request = |method, params| ControlRequest::new(method, params).0;
         assert!(matches!(handle(&mut app, &ctx, &request("ui.click", json!({"id": "handle"}))), Outcome::AfterInput));
         let events = app.take_synthetic_input();
-        assert_eq!(events.len(), 3, "new main-window target must not route to the old floating window");
-        assert!(matches!(events.first(), Some(egui::Event::PointerMoved(p)) if *p == current.center()));
+        // Modifiers held, move, press, release, modifiers released.
+        assert_eq!(events.len(), 5, "new main-window target must not route to the old floating window");
+        assert!(matches!(events.get(1), Some(egui::Event::PointerMoved(p)) if *p == current.center()));
         let Outcome::Done(list) = handle(&mut app, &ctx, &request("ui.elements", json!({"prefix": "handle"}))) else { panic!("expected elements") };
         assert_eq!(list["result"][0]["label"], "current");
         assert_eq!(list["result"][0]["rect"], json!([40.0, 60.0, 10.0, 12.0]));
