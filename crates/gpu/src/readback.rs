@@ -512,6 +512,12 @@ mod tests {
         assert_eq!(rx.recv_timeout(Duration::from_secs(2)), Ok(true));
         let signal = me.1.clone();
         drop(me);
+        // The worker holds an upgraded `Arc` while it runs an expiry pass, so the last `Drop`
+        // (which sets `closed`) can land on the worker thread just after ours.
+        let t0 = std::time::Instant::now();
+        while !signal.flags.lock().unwrap().closed && t0.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(signal.flags.lock().unwrap().closed, "the worker is told to exit");
     }
 
