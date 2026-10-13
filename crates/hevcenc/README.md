@@ -15,7 +15,9 @@ no `unsafe`, builds for `wasm32-unknown-unknown`).
 - **Pictures:** one slice per picture, coded as wavefronts (WPP,
   `entropy_coding_sync_enabled_flag`): CTU rows code in parallel on all cores, each row a
   substream starting from the contexts of the row above after its second CTU, with entry points in
-  the slice header. The stream doesn't depend on the number of threads; `IDR_N_LP` every `keyint` pictures (`1` = all intra, `0` =
+  the slice header. The stream doesn't depend on the number of threads, but it isn't the stream
+  earlier versions wrote: WPP changes every picture's bytes (deterministically; about 0.2-1.5 %
+  more bytes at the same PSNR); `IDR_N_LP` every `keyint` pictures (`1` = all intra, `0` =
   only the first), `TRAIL_R` P pictures otherwise, each referencing the previous picture (one
   short-term RPS in the SPS, `num_ref_idx_l0_active` 1, no reordering, pts = dts). Packets are
   length-prefixed (4-byte big-endian) NAL units without parameter sets.

@@ -27,7 +27,9 @@ A small VP9 encoder for WebM export (profile 0, 8-bit 4:2:0, BT.709).
 * **Threads**: up to four tile columns, as many as the width allows (2 from 512 px, 4 from
   1024 px), code in parallel; so do the colour conversion, the reference's quarter-sample phase
   planes, the loop-filter level trials and the chroma loop filter. The tile layout depends on the
-  frame size only, so a frame codes to the same bytes on every machine.
+  frame size only, so a frame codes to the same bytes on every machine. Frames 512 px or wider
+  therefore code to different bytes than before tile columns were added (deterministically, and
+  still decoded bit-exactly); narrower frames are unchanged.
 
 The encoder reconstructs exactly what a decoder reconstructs (inter prediction with the
 decoder's vector clamping and edge-clamped reference fetches, integer inverse transforms, the

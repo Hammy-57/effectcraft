@@ -157,6 +157,10 @@ pub fn encode_picture(
         blk: vec![Blk::default(); (w / 4) * (h / 4)],
     });
     // Rows are handed out in order, so a row only ever waits on rows already being coded.
+    // Blocking on a `Condvar` inside a rayon job is safe only because a row's coding never calls
+    // into rayon: a worker that joined would let its thread steal another row, which could then
+    // wait on the row beneath it on the same stack. Keep `code_row` / `store_row` rayon-free
+    // (the motion search reference, the one parallel step, is built before this call).
     let next = AtomicUsize::new(0);
     let workers = hctb.min(rayon::current_num_threads()).max(1);
     (0..workers).into_par_iter().for_each(|_| {

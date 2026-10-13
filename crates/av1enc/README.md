@@ -34,7 +34,9 @@ reconstruction, so prediction never drifts.
   the CDFs saved for the next frame are tile 0's (`context_update_tile_id` = 0). Every tile but
   the last is preceded by its size in the fewest bytes that fit (`tile_size_bytes_minus_1`).
   Tiles cost compression (about 0.6 % in size for two columns at 1080p, hence the 1024-sample
-  minimum; nothing measurable at 2160p).
+  minimum; nothing measurable at 2160p). Frames that now get more than one tile (3840x2160 and
+  larger) code to different bytes than earlier versions' single tile; frames that stay one tile
+  (1920x1080 and smaller) are unchanged.
 - **Deblocking**: the normative loop filter (7.14) runs on the reconstruction; the frame level
   (the same for both luma directions and both chroma planes, no deltas, sharpness 0) is searched
   per frame for the lowest luma error.
