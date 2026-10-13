@@ -525,7 +525,7 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
             if kresp.drag_started()
                 && let Some(o) = ui.input(|i| i.pointer.press_origin())
             {
-                ctx.data_mut(|dd| dd.insert_temp(key_grab_id(), KeyGrab { press: o, t: k.t }));
+                ctx.data_mut(|dd| dd.insert_temp(key_grab_id(), KeyGrab { press: o, t: k.t, speeds: None }));
             }
             if kresp.dragged()
                 && let Some(pt) = kresp.interact_pointer_pos()
@@ -533,6 +533,36 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
             {
                 ctx.data_mut(|dd| dd.insert_temp(drag_id, true));
                 let (dx, dy) = (pt.x - g.press.x, pt.y - g.press.y);
+                // Speed graph (After Effects): dragging a key up speeds up the motion entering and
+                // leaving it, down slows it, its handles keeping their influence; a drag mostly
+                // along time moves it in time instead (both at once would fight: the speed edit
+                // finds the key by its time).
+                if speed && dy.abs() > dx.abs() {
+                    let speeds = g.speeds.clone().filter(|v| !v.is_empty()).unwrap_or_else(|| {
+                        cs.iter()
+                            .flat_map(|c2| {
+                                c2.keys.iter().filter(|k2| k2.sel).flat_map(move |k2| {
+                                    k2.handles.iter().map(move |h2| HandleGrab {
+                                        layer: c2.layer.id,
+                                        prop: c2.prop.uid,
+                                        dim: c2.editable.then_some(c2.dim),
+                                        time: k2.time,
+                                        out: h2.out,
+                                        key: (k2.t, k2.v),
+                                        end: (h2.t, h2.v),
+                                        negative: h2.negative,
+                                        dur: h2.dur,
+                                    })
+                                })
+                            })
+                            .collect()
+                    });
+                    let dv = vmap(pt.y) - vmap(g.press.y);
+                    for h in &speeds {
+                        actions.push(("keys.setEase".into(), h.ease(h.end.0, h.end.1 + dv, true, "graph-key-speed")));
+                    }
+                    ctx.data_mut(|dd| dd.insert_temp(key_grab_id(), KeyGrab { speeds: Some(speeds), ..g.clone() }));
+                } else {
                 let (time_ok, value_ok) = shift_axes(mods.shift, dx, dy);
                 // Graph Editor ▸ Snap: to the current time and other keys.
                 let others: Vec<f64> = all_key_times.iter().filter(|(u, i, _)| !(*u == uid && *i == k.idx)).map(|x| x.2).collect();
@@ -543,6 +573,7 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
                     params["dim"] = json!(d);
                 }
                 actions.push(("keys.transform".into(), params));
+                }
             }
             if kresp.drag_stopped() {
                 ctx.data_mut(|dd| dd.insert_temp(drag_id, false));
@@ -868,10 +899,13 @@ fn fmt(v: f64, step: f64) -> String {
 }
 
 /// A Graph Editor key drag: where the button went down and the grabbed key's comp time then.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct KeyGrab {
     press: Pos2,
     t: f64,
+    /// Speed graph: the selected keys' handles as the drag found them (taken on its first step
+    /// that shows them: a key selected by the press shows its handles a frame later).
+    speeds: Option<Vec<HandleGrab>>,
 }
 
 fn key_grab_id() -> egui::Id {
