@@ -107,11 +107,16 @@ fn stripes(p: &egui::Painter, r: Rect, label: Color32) {
     }
 }
 
-/// The keys of unlocked layers whose marks fall inside `br` (a key marquee), for `rows`
-/// stacked from `top` (`rh` high each, see [`row_height`]).
+/// Half the size of a key's mark in the time graph (12 × 14 pt).
+const KEY_MARK_HALF: egui::Vec2 = egui::vec2(6.0, 7.0);
+
+/// The keys of unlocked layers whose marks `br` (a key marquee) touches, as in After Effects (not
+/// only those whose centre it covers), for `rows` stacked from `top` (`rh` high each, see
+/// [`row_height`]).
 fn keys_in_box(comp: &Comp, rows: &[Row], top: f32, rh: f32, tm: TMap, br: Rect) -> Vec<effectcraft_engine::KeyRef> {
     let mut keys = vec![];
     let mut y = top;
+    let br = br.expand2(KEY_MARK_HALF);
     for row in rows {
         let cy = y + rh / 2.0;
         y += row_height(row, rh);
