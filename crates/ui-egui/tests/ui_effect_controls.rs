@@ -681,6 +681,8 @@ fn select_all_and_the_chevron_act_on_every_selected_effect() {
     let tw = rect_of(&h, &format!("effectControls.effect.{e2}.twirl")).center();
     click(&mut h, tw);
     assert!([e1, e2, e3].iter().all(|u| h.state().ui.fx_closed.contains(u)));
+    // The effects above close over a few frames: look for the chevron once the layout settles.
+    h.run_steps(30);
     let tw = rect_of(&h, &format!("effectControls.effect.{e2}.twirl")).center();
     click(&mut h, tw);
     assert!([e1, e2, e3].iter().all(|u| !h.state().ui.fx_closed.contains(u)));

@@ -114,7 +114,8 @@ fn context_menu_hides_and_shows_a_column() {
     // Right-click any header ▸ Columns ▸ Parent & Link shows it again.
     let p = rect(&h, "timeline.header.name").center();
     click(&mut h, p, PointerButton::Secondary);
-    h.get_by_label_contains("Columns").hover();
+    // The submenu button (the comp is named "Columns" too, in the Project panel).
+    h.get_by_label("Columns ⏵").hover();
     h.run_steps(3);
     snapshot(&mut h, "columns-menu");
     // The submenu lists After Effects' columns in its order.
