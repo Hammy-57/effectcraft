@@ -17,6 +17,8 @@ fn every_test_file_is_a_module() {
     assert!(missing.is_empty(), "not compiled: declare each in tests/host/main.rs (`#[path = \"../x.rs\"] mod x;`): {missing:?}");
 }
 
+#[path = "../background_presets.rs"]
+mod background_presets;
 #[path = "../determinism.rs"]
 mod determinism;
 #[path = "../exam_tasks.rs"]
