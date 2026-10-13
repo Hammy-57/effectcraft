@@ -82,7 +82,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let mut actions: Actions = vec![];
 
     // Several layers selected: "(3) Selected Objects", as in After Effects. The rows show the
-    // first layer; the stopwatch, keyframe button and value edits apply to all of them (#355).
+    // first layer; the stopwatch, keyframe button, value edits and text attributes apply to all of
+    // them (#355).
     let selected = app.session.state.selected_layers.iter().filter(|id| comp.layer(**id).is_some()).count();
     if selected > 1 {
         let n = selected.to_string();
@@ -180,6 +181,12 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     for (id, params) in actions {
         let params = match &text_target {
             Some(tt) if id == "layer.setText" => tt.params(params),
+            // Font, size, colour and paragraph changes go to every selected text layer.
+            None if id == "layer.setText" => {
+                let mut params = params;
+                params["selected"] = json!(true);
+                params
+            }
             _ => params,
         };
         if let Err(e) = crate::menus::invoke(app, &ctx, &id, params) {

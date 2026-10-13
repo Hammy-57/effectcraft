@@ -22,11 +22,13 @@ pub struct TextTarget {
 }
 
 impl TextTarget {
-    /// `layer.setText` params for this target.
+    /// `layer.setText` params for this target. Outside text editing the change also goes to the
+    /// other selected text layers, as in After Effects.
     pub fn params(&self, mut v: serde_json::Value) -> serde_json::Value {
         v["layer"] = json!(self.layer);
-        if let Some(r) = self.range {
-            v["range"] = json!(r);
+        match self.range {
+            Some(r) => v["range"] = json!(r),
+            None => v["selected"] = json!(true),
         }
         v
     }

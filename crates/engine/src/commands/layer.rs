@@ -128,7 +128,7 @@ fn new_adjustment(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 /// Parameters of `layer.setText` / `layer.newText` that aren't text attributes.
-const NOT_ATTRS: &[&str] = &["layer", "layers", "comp", "merge", "text", "range", "position", "edit"];
+const NOT_ATTRS: &[&str] = &["layer", "layers", "comp", "merge", "text", "range", "position", "edit", "selected"];
 
 /// Apply `layer.setText` keys to `d`: `text` replaces characters `r` (or everything), then each
 /// character / paragraph / document attribute applies to `r` (or everything).
@@ -1368,28 +1368,57 @@ fn set_text(s: &mut Session, p: &Value) -> Result<Value> {
         }
         s.bump();
     }
+    let twins = selected_text_twins(s, p, cid, lid, range.is_some());
     let text = s.edit("Edit Text", merge_p(p), |proj, _| {
-        let l = layer_mut(proj, cid, lid)?;
-        let lt = l.layer_time(t);
-        let pr = l.props.prop_mut("text/sourceText").ok_or_else(|| bad("layer.setText", "not a text layer"))?;
-        let mut doc = match pr.value_at(lt) {
-            KV::Text(d) => *d,
-            KV::Str(t) => TextDoc::plain(&t),
-            _ => TextDoc::default(),
-        };
-        apply_text_params("layer.setText", p, &mut doc, range.clone())?;
-        pr.set_value_at(lt, KV::Text(Box::new(doc.clone())));
-        if let Some(first) = doc.text.lines().next()
-            && str_p(p, "text").is_some()
-            && !first.is_empty()
-            && (l.name.starts_with("Text") || l.name.is_empty())
-        {
-            l.name = first.chars().take(40).collect();
+        for o in &twins {
+            set_text_doc(proj, cid, *o, t, p, None)?;
         }
-        Ok(doc.text.chars().take(200).collect::<String>())
+        set_text_doc(proj, cid, lid, t, p, range.clone())
     })?;
     // What the layer says now (the first 200 characters).
     Ok(json!({"layer": lid.0, "text": text}))
+}
+
+/// With `selected: true` (the Properties, Character and Paragraph panels pass it) and no
+/// character range: every other selected, unlocked text layer of the comp, which gets the same
+/// attributes, as After Effects applies a font or size change to all selected text layers.
+/// Empty when the edited layer isn't selected.
+fn selected_text_twins(s: &Session, p: &Value, cid: ItemId, lid: LayerId, ranged: bool) -> Vec<LayerId> {
+    if b_p(p, "selected") != Some(true) || ranged || !s.state.selected_layers.contains(&lid) {
+        return vec![];
+    }
+    let Some(comp) = s.project.comp(cid) else { return vec![] };
+    s.state
+        .selected_layers
+        .iter()
+        .filter(|o| **o != lid)
+        .filter_map(|o| comp.layer(*o))
+        .filter(|l| !l.switches.locked && matches!(l.source, LayerSource::Text))
+        .map(|l| l.id)
+        .collect()
+}
+
+/// Apply the `layer.setText` params `p` to text layer `lid`'s Source Text at comp time `t`;
+/// returns the first 200 characters it says now.
+fn set_text_doc(proj: &mut Project, cid: ItemId, lid: LayerId, t: Tick, p: &Value, range: Option<std::ops::Range<usize>>) -> Result<String> {
+    let l = layer_mut(proj, cid, lid)?;
+    let lt = l.layer_time(t);
+    let pr = l.props.prop_mut("text/sourceText").ok_or_else(|| bad("layer.setText", "not a text layer"))?;
+    let mut doc = match pr.value_at(lt) {
+        KV::Text(d) => *d,
+        KV::Str(t) => TextDoc::plain(&t),
+        _ => TextDoc::default(),
+    };
+    apply_text_params("layer.setText", p, &mut doc, range)?;
+    pr.set_value_at(lt, KV::Text(Box::new(doc.clone())));
+    if let Some(first) = doc.text.lines().next()
+        && str_p(p, "text").is_some()
+        && !first.is_empty()
+        && (l.name.starts_with("Text") || l.name.is_empty())
+    {
+        l.name = first.chars().take(40).collect();
+    }
+    Ok(doc.text.chars().take(200).collect())
 }
 
 /// Move Position by `(dx, dy)`, including every key. Separated dimensions move X and Y as well
@@ -1731,7 +1760,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Edit Text",
             [],
             None,
-            "{layer?, range?: [start, end] (characters; default all), text?, font?, style?, size?, fill?, stroke?, applyFill?, applyStroke?, strokeWidth?, tracking?, leading?: px|\"auto\", baselineShift? px, hScale? %, vScale? %, tsume? %, fauxBold?, fauxItalic?, allCaps?, smallCaps?, baseline?: normal|superscript|subscript, superscript?, subscript?, kerning?: metrics|optical|number, ligatures?, discretionaryLigatures? (OpenType), contextualAlternates?, stylisticAlternates?, stylisticSets?: [1–20], ss01?, ss02?, ss03?, ss04?, ss05?, ss06?, ss07?, ss08?, ss09?, ss10?, ss11?, ss12?, ss13?, ss14?, ss15?, ss16?, ss17?, ss18?, ss19?, ss20?, swash?, titling?, ordinals?, fractions?, allSmallCaps?, figureStyle?: default|lining|oldStyle, figureWidth?: default|proportional|tabular, figures?, variations?: {tag: value} (variable font axes; null resets), justify?: left|center|right|justifyLeft|justifyCenter|justifyRight|justifyAll, indentLeft?, indentRight?, indentFirst?, spaceBefore?, spaceAfter?, direction?: ltr|rtl, composer?: everyLine|singleLine, hangingPunctuation?, strokeOverFill?, box?: [x,y,w,h]|null (layer space), vertical?} → {layer, text}",
+            "{layer?, selected? (no range: also every other selected text layer), range?: [start, end] (characters; default all), text?, font?, style?, size?, fill?, stroke?, applyFill?, applyStroke?, strokeWidth?, tracking?, leading?: px|\"auto\", baselineShift? px, hScale? %, vScale? %, tsume? %, fauxBold?, fauxItalic?, allCaps?, smallCaps?, baseline?: normal|superscript|subscript, superscript?, subscript?, kerning?: metrics|optical|number, ligatures?, discretionaryLigatures? (OpenType), contextualAlternates?, stylisticAlternates?, stylisticSets?: [1–20], ss01?, ss02?, ss03?, ss04?, ss05?, ss06?, ss07?, ss08?, ss09?, ss10?, ss11?, ss12?, ss13?, ss14?, ss15?, ss16?, ss17?, ss18?, ss19?, ss20?, swash?, titling?, ordinals?, fractions?, allSmallCaps?, figureStyle?: default|lining|oldStyle, figureWidth?: default|proportional|tabular, figures?, variations?: {tag: value} (variable font axes; null resets), justify?: left|center|right|justifyLeft|justifyCenter|justifyRight|justifyAll, indentLeft?, indentRight?, indentFirst?, spaceBefore?, spaceAfter?, direction?: ltr|rtl, composer?: everyLine|singleLine, hangingPunctuation?, strokeOverFill?, box?: [x,y,w,h]|null (layer space), vertical?} → {layer, text}",
             has_layers,
             set_text
         ),

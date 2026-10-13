@@ -508,3 +508,28 @@ fn numeric_string_resolves_as_id() {
     let r = s.execute("layer.tree", json!({"layer": l.to_string(), "comp": cid.0.to_string()})).unwrap();
     assert_eq!(r["id"].as_u64(), Some(l), "{r}");
 }
+
+/// A font or size change from the Properties / Character panel with several text layers selected
+/// reaches all of them in one undo step, as in After Effects; without `selected` only the one.
+#[test]
+fn set_text_selected_applies_to_every_selected_text_layer() {
+    let mut s = comp(640, 360);
+    let ids: Vec<u64> = ["BUT", "F*CK", "THAT"].iter().map(|t| s.execute("layer.newText", json!({"text": t, "size": 40})).unwrap()["layer"].as_u64().unwrap()).collect();
+    let font = |s: &Session, l: u64| {
+        let comp = s.active_comp().unwrap();
+        let layer = comp.layer(LayerId(l)).unwrap();
+        let ectx = crate::render::EvalCtx { project: &s.project, comp_id: s.active_comp_id().unwrap(), comp, time: s.time(), expr: None, footage: None };
+        crate::render::text::source_text(&ectx, layer).unwrap()
+    };
+    s.execute("layer.select", json!({"layers": ids})).unwrap();
+    s.execute("layer.setText", json!({"layer": ids[0], "font": "Helvetica", "size": 96, "selected": true})).unwrap();
+    for l in &ids {
+        assert_eq!(font(&s, *l).font, "Helvetica");
+        assert_eq!(font(&s, *l).size, 96.0);
+    }
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(ids.iter().all(|l| font(&s, *l).size == 40.0));
+    s.execute("layer.setText", json!({"layer": ids[1], "size": 50})).unwrap();
+    assert_eq!(font(&s, ids[1]).size, 50.0);
+    assert_eq!(font(&s, ids[0]).size, 40.0);
+}
