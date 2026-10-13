@@ -8,8 +8,8 @@
 # --depends) in a temporary worktree, cherry-picks the given non-merge commits with -x, drops
 # changes to the paths in scripts/fork/upstream-exclude.txt, checks rustfmt + `cargo check` on the
 # affected crates, pushes the branch to origin and writes queue/<topic-slug>.md on origin's
-# `pr-queue` branch. A session opens queued PRs on storytold by hand when Elias asks; this script never
-# opens a PR. --update adds commits to an existing queued branch (no force push). --no-push does
+# `pr-queue` branch. The Mac task effectcraft-open-queued-prs opens them on storytold (10:00, 18:00); this
+# script never opens a PR. --update adds commits to an existing queued branch (no force push). --no-push does
 # everything locally and prints the queue file instead (for trying it out). Added lines that name
 # fork-only things (docs/fork, owner-assets, profile.local…) stop it unless --allow-leaks.
 # Docs: docs/fork/agent-builds.md, "Sharing with upstream (queue at landing)".
@@ -283,7 +283,7 @@ cat > "$readme" <<'EOF'
 
 Fork-only branch. Each `queue/<topic>.md` is a finished change waiting to become a pull request on
 storytold/effectcraft: line 1 `title:`, line 2 `branch:` (on this fork), line 3 `depends:`, a blank
-line, then the PR body. Written by `scripts/fork/queue-pr.sh`; a Mac session opens the PRs by hand when Elias asks.
+line, then the PR body. Written by `scripts/fork/queue-pr.sh`; the Mac task effectcraft-open-queued-prs opens the PRs at 10:00 and 18:00.
 See docs/fork/agent-builds.md on `main`.
 EOF
 publish_queue() {

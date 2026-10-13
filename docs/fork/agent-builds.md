@@ -108,12 +108,13 @@ untouched), cherry-picks the commits with `-x`, drops the fork-only paths in
 - **The gap:** `scripts/fork/sync-gap.sh` prints the shareable commits and lines not yet queued or
   upstream, and the task ids with the most (`--json`; the nightly uses `--fail-if-growing <file>`).
 
-**Who opens the PRs.** Nothing opens them automatically: there is no opener task on the Mac. A
-session on the Mac opens them by hand when Elias asks (`gh pr create --repo storytold/effectcraft
---head eliasx45:upstream/<slug> --title <title> --body <queue file minus its first 4 lines>`), then
-deletes the opened `queue/*.md` files on `pr-queue` (commit `queue: opened storytold #…`). The cloud
-routine can't (it has no permission to open PRs on storytold as Elias). Agents never open PRs on
-storytold unless Elias asks in that session.
+**Who opens the PRs.** The Mac scheduled task `effectcraft-open-queued-prs` (Claude app, 10:00 and
+18:00; runs when the app is open) opens queued branches as Elias, at most 12 of ours open at once. A
+file whose `depends:` branch has no merged PR waits; once it is merged, the task merges storytold
+`main` into the dependent branch first so its diff shows only its own commits. It then deletes the
+opened `queue/*.md` files on `pr-queue` (commit `queue: opened storytold #…`). The cloud routine
+(02:00 and 14:00) can't open PRs on storytold; it keeps the queue green and fills it. Other agents
+never open PRs on storytold unless Elias asks in that session.
 
 ## Lanes: warm build folders
 
