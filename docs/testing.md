@@ -47,20 +47,6 @@ cargo run --release -p effectcraft-cli -- bench --n 10 --play 30
 prints per-layer and per-effect timings for one frame, and playback timings with and without the
 layer cache.
 
-### Single-point tracking budget
-
-The normal suite keeps the 1080p tracking accuracy check (error below 0.25 pixels). Its wall-clock
-budget runs separately because competing tests and builds can inflate elapsed time without a
-tracking regression. On an otherwise idle machine, run the exact benchmark alone:
-
-```sh
-cargo test -p effectcraft-track --lib --release tests::performance_1080p_single_point -- --exact --ignored --test-threads=1 --nocapture
-```
-
-The original budget remains **below 100 ms/frame**, including tracker initialization and five tracking
-steps but excluding synthetic frame generation. The benchmark also checks the same accuracy fixture.
-`--test-threads=1` isolates test execution within this process; stop competing builds and workloads too.
-
 ## Fuzzing
 
 `fuzz/` holds cargo-fuzz targets for every input EffectCraft doesn't control: `project_open`
