@@ -35,5 +35,7 @@ mod pipelined;
 mod render_settings;
 #[path = "../roundtrip.rs"]
 mod roundtrip;
+#[path = "../uncompressed_mov.rs"]
+mod uncompressed_mov;
 #[path = "../vp9_roundtrip.rs"]
 mod vp9_roundtrip;

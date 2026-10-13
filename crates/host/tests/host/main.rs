@@ -19,12 +19,16 @@ fn every_test_file_is_a_module() {
 
 #[path = "../determinism.rs"]
 mod determinism;
+#[path = "../exam_tasks.rs"]
+mod exam_tasks;
 #[path = "../exr_layers.rs"]
 mod exr_layers;
 #[path = "../figma_import.rs"]
 mod figma_import;
 #[path = "../footage_reload.rs"]
 mod footage_reload;
+#[path = "../gif_animates.rs"]
+mod gif_animates;
 #[path = "../plugins.rs"]
 mod plugins;
 #[path = "../relative_media.rs"]

@@ -454,6 +454,9 @@ fn every_task_is_solvable() {
             .as_array()
             .unwrap()
             .iter()
+            // An expression error is only known with an expression engine, which this crate
+            // lacks (it reports "expression engine unavailable"): host's `exam_tasks` runs those.
+            .filter(|c| c["prop"]["field"] != "expressionError")
             .filter(|c| match missing_query(c) {
                 Some(q) => {
                     skipped.insert(q);
