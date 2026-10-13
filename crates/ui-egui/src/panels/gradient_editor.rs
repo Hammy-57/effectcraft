@@ -95,7 +95,11 @@ impl Draft {
 
     /// The draft as a gradient (the tracks are always in order).
     pub fn gradient(&self) -> Gradient {
-        Gradient { colors: self.colors.iter().map(|s| (s.pos, s.value)).collect(), opacities: self.opacities.iter().map(|s| (s.pos, s.value)).collect(), ..Gradient::default() }
+        Gradient {
+            colors: self.colors.iter().map(|s| (s.pos, s.value)).collect(),
+            opacities: self.opacities.iter().map(|s| (s.pos, s.value)).collect(),
+            ..Gradient::default()
+        }
     }
 
     pub fn len(&self, track: Track) -> usize {
@@ -235,7 +239,8 @@ fn commit(app: &mut EffectcraftApp, ctx: &egui::Context) {
     if g == d.baseline {
         return;
     }
-    let params = json!({"comp": tg.comp, "layer": tg.layer, "prop": tg.prop, "time": tg.time, "timeBase": "comp", "value": Value::Gradient(Box::new(g)).to_json()});
+    let params =
+        json!({"comp": tg.comp, "layer": tg.layer, "prop": tg.prop, "time": tg.time, "timeBase": "comp", "value": Value::Gradient(Box::new(g)).to_json()});
     if let Err(e) = crate::menus::invoke(app, ctx, "prop.set", params) {
         app.ui.status = e;
     }
@@ -435,7 +440,15 @@ mod tests {
     use super::*;
 
     fn draft() -> Draft {
-        Draft::new(&Gradient { colors: vec![(0.0, [1.0, 0.0, 0.0, 1.0]), (1.0, [0.0, 0.0, 1.0, 1.0])], opacities: vec![(0.0, 1.0), (1.0, 0.5)], ..Gradient::default() }, None, vec![])
+        Draft::new(
+            &Gradient {
+                colors: vec![(0.0, [1.0, 0.0, 0.0, 1.0]), (1.0, [0.0, 0.0, 1.0, 1.0])],
+                opacities: vec![(0.0, 1.0), (1.0, 0.5)],
+                ..Gradient::default()
+            },
+            None,
+            vec![],
+        )
     }
 
     /// Dragging the first stop past the second keeps the track in order and the same stop
@@ -443,7 +456,11 @@ mod tests {
     #[test]
     fn stops_stay_in_order_and_selected_while_moving() {
         for track in [Track::Color, Track::Opacity] {
-            let g = Gradient { colors: vec![(0.0, [1.0, 0.0, 0.0, 1.0]), (0.6, [0.0, 0.0, 1.0, 1.0])], opacities: vec![(0.0, 1.0), (0.6, 0.5)], ..Gradient::default() };
+            let g = Gradient {
+                colors: vec![(0.0, [1.0, 0.0, 0.0, 1.0]), (0.6, [0.0, 0.0, 1.0, 1.0])],
+                opacities: vec![(0.0, 1.0), (0.6, 0.5)],
+                ..Gradient::default()
+            };
             let mut d = Draft::new(&g, None, vec![]);
             let first = d.id_at(track, 0).unwrap();
             d.selected = Some((track, first));

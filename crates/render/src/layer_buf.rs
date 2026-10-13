@@ -213,7 +213,13 @@ impl<'a> Renderer<'a> {
 
     /// `keyed`: [`Self::content_cache_key_noted`] when the caller has it already (a key is
     /// computed once per layer and frame: keying a precomp counts towards its miss streak).
-    fn content_buf_timed(&self, ctx: &EvalCtx, layer: &Layer, mut timing: Option<&mut LayerTiming>, keyed: Option<ContentKey>) -> Option<(Arc<Buf>, Option<u64>)> {
+    fn content_buf_timed(
+        &self,
+        ctx: &EvalCtx,
+        layer: &Layer,
+        mut timing: Option<&mut LayerTiming>,
+        keyed: Option<ContentKey>,
+    ) -> Option<(Arc<Buf>, Option<u64>)> {
         let (key, noted, clip) = keyed.unwrap_or_else(|| self.content_cache_key_noted(ctx, layer));
         // An animated precomp's buffer isn't kept for other uses in its frame (see
         // [`cache::LayerCache::insert_once`]): no use waiting for another thread's render of it.
