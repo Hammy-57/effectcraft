@@ -140,8 +140,8 @@ fn fxe_alpha(@builtin(global_invocation_id) gid: vec3<u32>) {
     textureStore(out, p, vec4<f32>(textureLoad(src, p, 0).w, 0.0, 0.0, 0.0));
 }
 
-// Bevel Alpha: src = the layer, aux = its blurred alpha (x). f[0] = (light direction, normal
-// scale k); f[1] = (light colour, intensity).
+// Bevel Alpha: src = the layer, aux = its blurred alpha (x) inside a clear border u[0].x wide.
+// f[0] = (light direction, normal scale k); f[1] = (light colour, intensity).
 @compute @workgroup_size(16, 16)
 fn fxe_bevel_alpha(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = vec2<i32>(gid.xy);
@@ -153,8 +153,9 @@ fn fxe_bevel_alpha(@builtin(global_invocation_id) gid: vec3<u32>) {
         textureStore(out, p, px);
         return;
     }
-    let dx = (tex_get_clamped(aux, p.x + 1, p.y).x - tex_get_clamped(aux, p.x - 1, p.y).x) * 0.5;
-    let dy = (tex_get_clamped(aux, p.x, p.y + 1).x - tex_get_clamped(aux, p.x, p.y - 1).x) * 0.5;
+    let q = p + vec2<i32>(i32(P.u[0].x), i32(P.u[0].x));
+    let dx = (tex_get_clamped(aux, q.x + 1, q.y).x - tex_get_clamped(aux, q.x - 1, q.y).x) * 0.5;
+    let dy = (tex_get_clamped(aux, q.x, q.y + 1).x - tex_get_clamped(aux, q.x, q.y - 1).x) * 0.5;
     let k = P.f[0].w;
     let n = normalize(vec3<f32>(-dx * k, -dy * k, 1.0));
     let l = P.f[0].xyz;

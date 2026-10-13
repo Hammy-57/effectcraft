@@ -150,10 +150,20 @@ fn bevel_alpha(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
     let light = pr.color("lightColor");
     let l = light_dir(pr.f("lightAngle"), 45.0);
     // The alpha plane's Gaussian (util::gauss_plane: box passes, edges repeated); kernels read x.
+    // Outside the layer is transparent, as on the CPU: the alpha sits in a clear border `pad`
+    // wide before the blur, else a layer opaque to its edges (a solid) has no slope and no bevel.
+    let pad = (t * 1.5).ceil().clamp(0.0, 4096.0) as u32 + 2;
+    let (pw, ph) = (b.img.width + 2 * pad, b.img.height + 2 * pad);
+    if !e.g.fits(pw, ph) {
+        return None;
+    }
     let alpha = e.scratch(b.img.width, b.img.height);
     e.pixels("fxe_alpha", &Params::default(), &b.img, None, &alpha, None);
-    let h = gaussian_blur(e, &alpha, t * 0.5, t * 0.5, true);
+    let padded = e.image(pw, ph);
+    e.copy_into(&alpha, &padded, pad, pad);
+    let h = gaussian_blur(e, &padded, t * 0.5, t * 0.5, true);
     let mut p = Params::default();
+    p.u[0] = [pad, 0, 0, 0];
     p.f[0] = f4([l[0], l[1], l[2], t * 1.25]);
     p.f[1] = [light[0], light[1], light[2], inten];
     run(e, "fxe_bevel_alpha", &p, b, Some(&h), None)
