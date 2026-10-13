@@ -408,9 +408,12 @@ fn an_expression_needing_its_own_value_fails_fast() {
 #[test]
 fn fanning_out_reads_stop_at_a_budget() {
     // Two layers reading each other twice at other times: no cycle (the times differ), but
-    // 2^16 evaluations at `MAX_DEPTH`; the evaluation stops after `MAX_RUNS` script runs.
+    // 2^16 evaluations at `MAX_DEPTH`; the evaluation stops after `MAX_RUNS` script runs. The two
+    // reads shift and scale time differently, so no two paths meet at the same time and the
+    // shared result memo can't fold the tree (with `t + a` / `t + b` it collapses to a few
+    // hundred distinct evaluations and finishes, exactly).
     let mut f = fx();
-    let text = |other: &str| format!("var r = thisComp.layer('{other}').transform.rotation; r.valueAtTime(time + 0.001) + r.valueAtTime(time + 0.002)");
+    let text = |other: &str| format!("var r = thisComp.layer('{other}').transform.rotation; r.valueAtTime(time + 0.001) + r.valueAtTime(time * 1.001 + 0.002)");
     f.set_expr(f.a, ROT, &text("B"));
     f.set_expr(f.b, ROT, &text("A"));
     // Take the clock out of the race: on a loaded machine the time budget could otherwise stop
