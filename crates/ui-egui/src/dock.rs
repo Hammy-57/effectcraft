@@ -670,6 +670,37 @@ pub struct Floating {
     pub rect: [f32; 4],
 }
 
+/// A floating group moved out of the main window into its own native window (which can sit on
+/// another monitor): the group holding `panel` shows there.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PanelWindow {
+    pub panel: PanelKind,
+    /// The window's [x, y] outer position and [w, h] inner size, in desktop points.
+    pub rect: [f32; 4],
+}
+
+/// The smallest and largest native panel window, in points.
+pub const PANEL_WINDOW_MIN: [f32; 2] = [160.0, 100.0];
+pub const PANEL_WINDOW_MAX: f32 = 16_384.0;
+/// The farthest a native panel window may sit from the desktop origin, in points.
+pub const PANEL_WINDOW_MAX_POS: f32 = 100_000.0;
+
+impl PanelWindow {
+    /// The rect made safe to hand to the windowing system: finite, with a size within
+    /// [`PANEL_WINDOW_MIN`]..=[`PANEL_WINDOW_MAX`] and a position within
+    /// ±[`PANEL_WINDOW_MAX_POS`] (hostile workspace files and bad monitor reports included).
+    pub fn sanitized(rect: [f32; 4]) -> [f32; 4] {
+        let finite = |v: f32, fallback: f32| if v.is_finite() { v } else { fallback };
+        let [x, y, w, h] = rect;
+        [
+            finite(x, 0.0).clamp(-PANEL_WINDOW_MAX_POS, PANEL_WINDOW_MAX_POS),
+            finite(y, 0.0).clamp(-PANEL_WINDOW_MAX_POS, PANEL_WINDOW_MAX_POS),
+            finite(w, 420.0).clamp(PANEL_WINDOW_MIN[0], PANEL_WINDOW_MAX),
+            finite(h, 320.0).clamp(PANEL_WINDOW_MIN[1], PANEL_WINDOW_MAX),
+        ]
+    }
+}
+
 impl DockNode {
     /// Insert panel `p` relative to the group that holds `anchor`: as a tab next to it
     /// (Center) or in a new group split off to one side. In a stack, the group is `anchor`'s
@@ -1305,10 +1336,13 @@ pub fn draw_group_chrome(ui: &mut egui::Ui, g: &Group, t: &Tokens, reg: &mut cra
             }
         }
     }
-    // clicking anywhere in the panel focuses it
+    // clicking anywhere in the panel focuses it; a press on another of its tabs waits for that
+    // tab's click, which focuses the panel actually chosen (a text edit stays open in Character)
+    let at = ui.input(|i| i.pointer.interact_pos());
     if let Some(p) = active_panel
         && ui.rect_contains_pointer(g.rect)
         && ui.input(|i| i.pointer.any_pressed())
+        && !out.tabs.iter().any(|(q, r)| *q != p && at.is_some_and(|a| r.contains(a)))
     {
         out.actions.push(DockAction::Focus(p));
     }
