@@ -1364,6 +1364,38 @@ fn transform_drags_apply_their_whole_offset_to_the_keys_they_started_with() {
     assert_eq!(key_times(&s, a), vec![0.1, 1.1, 2.1]);
 }
 
+/// Speed graph: dragging a key moves it in time and changes its speed in one edit from where
+/// the drag began (each step the whole offset), so both follow the pointer; a vertical drag
+/// leaves its time alone and a horizontal one its speed.
+#[test]
+fn transform_speed_offset_changes_both_sides_with_the_time_move() {
+    let mut s = comp();
+    let a = solid(&mut s, "#ff0000");
+    opacity_keys(&mut s, a, &[0.0, 1.0, 2.0]);
+    s.execute("keys.select", json!({"keys": [{"layer": a, "path": "transform/opacity", "time": 1.0}]})).unwrap();
+    let speeds = |s: &Session| {
+        let l = layer(s, a);
+        let keys = &l.props.prop("transform/opacity").unwrap().keys;
+        let i = keys.iter().position(|k| k.time.seconds() > 0.5 && k.time.seconds() < 1.5).unwrap();
+        (
+            effectcraft_keyframe::side_ease(keys, i, 0, false, false).unwrap().speed,
+            effectcraft_keyframe::side_ease(keys, i, 0, false, true).unwrap().speed,
+        )
+    };
+    let (in0, out0) = speeds(&s);
+    for k in 1..=10 {
+        let f = k as f64 / 10.0;
+        s.execute("keys.transform", json!({"timeOffset": 0.2 * f, "speedOffset": 30.0 * f, "merge": "graph-key", "fromStart": true})).unwrap();
+    }
+    assert_eq!(key_times(&s, a), vec![0.0, 1.2, 2.0]);
+    let (in1, out1) = speeds(&s);
+    assert!((in1.abs() - (in0.abs() + 30.0)).abs() < 1e-6, "{in0} → {in1}");
+    assert!((out1.abs() - (out0.abs() + 30.0)).abs() < 1e-6, "{out0} → {out1}");
+    s.undo();
+    assert_eq!(key_times(&s, a), vec![0.0, 1.0, 2.0]);
+    assert_eq!(speeds(&s), (in0, out0), "one undo step");
+}
+
 /// Alt-drag scaling a key group whose first key lies before the comp start (the layer starts
 /// earlier) keeps that key where it is: only the dragged end moves, as in After Effects. Before,
 /// every key was clamped to 0, so the anchor jumped to the comp start.

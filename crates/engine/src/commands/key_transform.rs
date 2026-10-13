@@ -2,7 +2,7 @@
 //! (scale / move selected keys in time and value; Alt-drag of a key group in the timeline) and
 //! spatial Bezier tangents dragged on a motion path.
 
-use effectcraft_keyframe::Keyframe;
+use effectcraft_keyframe::{Ease, Interp, Keyframe, side_ease};
 use effectcraft_project::{LayerId, Uid};
 use effectcraft_time::Tick;
 use serde_json::{Value, json};
@@ -65,6 +65,9 @@ fn transform(s: &mut Session, p: &Value) -> Result<Value> {
         fr.snap_nearest(Tick::from_seconds_f64(x.max(ct.seconds().min(0.0))))
     };
     let touch_values = vs != 1.0 || voff != 0.0;
+    // `speedOffset` (speed graph): the speed entering and leaving each key changes by this much
+    // (units/s, faster away from 0), its influence kept, as dragging a key up or down there.
+    let soff = f_p(p, "speedOffset").filter(|v| v.is_finite()).unwrap_or(0.0);
     s.edit("Transform Keyframes", merge, |proj, st| {
         if let Some(b) = base {
             *proj = (*b).clone();
@@ -84,6 +87,9 @@ fn transform(s: &mut Session, p: &Value) -> Result<Value> {
                 if (stretch - 100.0).abs() < 1e-9 { d } else { Tick((d.0 as f64 * 100.0 / stretch) as i64) }
             };
             let Some(pr) = layer.props.find_mut(uid) else { continue };
+            if soff != 0.0 {
+                speed_offset(&mut pr.keys, pr.spatial, &times, soff, dims.as_deref());
+            }
             let (mut moved, mut kept): (Vec<Keyframe>, Vec<Keyframe>) = pr.keys.drain(..).partition(|k| times.contains(&k.time));
             for k in &mut moved {
                 k.time = to_layer(map_t(to_comp(k.time)));
@@ -112,6 +118,51 @@ fn transform(s: &mut Session, p: &Value) -> Result<Value> {
         st.selected_keys = new_sel;
         Ok(json!({"keys": st.selected_keys.len()}))
     })
+}
+
+/// Add `off` to the speed magnitude of both sides of the keys at `times` (the dimensions `dims`,
+/// or all), keeping each side's influence; the sides become Bezier. A side at speed 0 speeds up
+/// the way its segment moves, so pulling it up never reverses the motion.
+fn speed_offset(keys: &mut [Keyframe], spatial: bool, times: &[Tick], off: f64, dims: Option<&[usize]>) {
+    let n_keys = keys.len();
+    let mut updates = vec![];
+    for (i, k) in keys.iter().enumerate().filter(|(_, k)| times.contains(&k.time)) {
+        let n = if spatial { 1 } else { k.value.dims().max(1) };
+        for out in [false, true] {
+            let Some(j) = (if out { i.checked_add(1).filter(|j| *j < n_keys) } else { i.checked_sub(1) }) else { continue };
+            let eases: Vec<Ease> = (0..n)
+                .map(|d| {
+                    let e = side_ease(keys, i, d, spatial, out).unwrap_or_default();
+                    if n > 1 && dims.is_some_and(|x| !x.contains(&d)) {
+                        return e;
+                    }
+                    let dir = if e.speed != 0.0 {
+                        e.speed.signum()
+                    } else if spatial {
+                        1.0
+                    } else {
+                        let at = |kk: &Keyframe| kk.value.components().get(d).copied().unwrap_or(0.0);
+                        let other = keys.get(j).map_or(at(k), at);
+                        let rising = if out { other >= at(k) } else { at(k) >= other };
+                        if rising { 1.0 } else { -1.0 }
+                    };
+                    Ease { speed: dir * (e.speed.abs() + off).max(0.0), influence: e.influence }
+                })
+                .collect();
+            updates.push((i, out, eases));
+        }
+    }
+    for (i, out, eases) in updates {
+        let Some(k) = keys.get_mut(i) else { continue };
+        if out {
+            k.out_ease = eases.into();
+            k.out_interp = Interp::Bezier;
+        } else {
+            k.in_ease = eases.into();
+            k.in_interp = Interp::Bezier;
+        }
+        k.auto_bezier = false;
+    }
 }
 
 /// Spatial tangents of one key of a spatial property (motion path handles), relative to the key
@@ -197,7 +248,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Transform Keyframes",
             [],
             None,
-            "{timeScale?, timeAnchor? (comp s), timeOffset? (s), valueScale?, valueAnchor?, valueOffset?, dim? | dims?: [d…], merge?, fromStart?: bool (with merge: values are the whole transform since the drag started)}",
+            "{timeScale?, timeAnchor? (comp s), timeOffset? (s), speedOffset? (units/s: the speed graph's vertical drag), valueScale?, valueAnchor?, valueOffset?, dim? | dims?: [d…], merge?, fromStart?: bool (with merge: values are the whole transform since the drag started)}",
             has_keys,
             transform
         ),
