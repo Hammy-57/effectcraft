@@ -16,10 +16,13 @@ const PRELUDE: &str = include_str!("prelude.js");
 /// Message of the error thrown when a request isn't answered yet (never shown to users).
 const PENDING: &str = "\u{1}effectcraft: pending host request";
 const MAX_SCRIPTS: usize = 4096;
+/// Loop iterations one script run may make (per function call): a run re-executes once per
+/// property it reads, so this bounds the time of every pass.
+pub const LOOP_LIMIT: u64 = 1_000_000;
+/// The error of an evaluation that ran out of time.
+pub const TIMED_OUT: &str = "Error: expression takes too long to evaluate";
 /// The part of boa's stack-size limit error the runtime recovers from (see [`run`]).
 const STACK_LIMIT: &str = "maximum stack size";
-/// Loop iterations per call frame a script may run.
-const LOOP_LIMIT: u64 = 10_000_000;
 /// Loop iterations per call frame once a run is only collecting misses (see [`native_host`]).
 const SPECULATIVE_LOOP_LIMIT: u64 = 10_000;
 /// Misses one run collects before it stops.
@@ -46,6 +49,18 @@ pub struct Frame {
     run: u32,
     /// Whether a run carries on past a miss (see [`native_host`]).
     speculate: bool,
+    /// What this frame evaluates: an evaluation that needs itself is a cycle.
+    pub owner: Option<Owner>,
+}
+
+/// One expression evaluation: the property (comp, layer, uid), the comp time and the text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Owner {
+    pub comp: u64,
+    pub layer: u64,
+    pub uid: u64,
+    pub time: effectcraft_time::Tick,
+    pub text: String,
 }
 
 impl Frame {
@@ -75,12 +90,20 @@ thread_local! {
     /// Evaluation stack (nested when one expression reads another's value).
     pub static FRAMES: RefCell<Vec<Frame>> = const { RefCell::new(Vec::new()) };
     /// Script runs on this thread (for tests and perf readouts).
-    static RUNS: Cell<u64> = const { Cell::new(0) };
+    static TOTAL_RUNS: Cell<u64> = const { Cell::new(0) };
+    /// Script runs since the outermost evaluation on this thread began (nested ones included).
+    pub static RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Script runs on this thread so far (each evaluation runs its script one or more times).
 pub fn runs() -> u64 {
-    RUNS.with(Cell::get)
+    TOTAL_RUNS.with(Cell::get)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+thread_local! {
+    /// When the outermost evaluation on this thread began.
+    pub static STARTED: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
 }
 
 struct Runtime {
@@ -368,7 +391,7 @@ impl Runtime {
                 fr.used.clear();
             }
         });
-        RUNS.with(|r| r.set(r.get().saturating_add(1)));
+        TOTAL_RUNS.with(|r| r.set(r.get().saturating_add(1)));
         let args = [
             JsValue::from(b.time),
             to_js(b.value, ctx),
@@ -385,7 +408,11 @@ impl Runtime {
         if let Err(e) = self.begin.call(&JsValue::undefined(), &args, ctx) {
             return Run::Done(Err(format_error(&e.to_string(), line_count(text))));
         }
-        let result = script.evaluate(ctx).and_then(|v| self.finish.call(&JsValue::undefined(), &[v], ctx));
+        let result = match evaluate_in_time(&script, ctx) {
+            Some(r) => r.and_then(|v| self.finish.call(&JsValue::undefined(), &[v], ctx)),
+            // Abandoned mid-run: the context is unusable now (see `run`).
+            None => return Run::Done(Err(TIMED_OUT.into())),
+        };
         let pending = FRAMES.with(|f| f.borrow().last().is_some_and(|fr| !fr.misses.is_empty()));
         if pending {
             return Run::Pending;
@@ -394,6 +421,54 @@ impl Runtime {
             Ok(v) => detach(&v, ctx, 0),
             Err(e) => Err(format_error(&e.to_string(), line_count(text))),
         })
+    }
+}
+
+/// Run `script`, giving up (`None`) once the outermost evaluation is out of time
+/// ([`crate::MAX_TIME`]). boa's budgeted evaluation yields every few thousand instructions of
+/// the script and the functions it calls (not inside callbacks of native functions such as
+/// `Array.prototype.map`, which stay bounded by the loop limit per call).
+fn evaluate_in_time(script: &Script, ctx: &mut Context) -> Option<JsResult<JsValue>> {
+    let mut run = std::pin::pin!(script.evaluate_async_with_budget(ctx, 20_000));
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    loop {
+        if let std::task::Poll::Ready(r) = run.as_mut().poll(&mut cx) {
+            return Some(r);
+        }
+        if out_of_time() {
+            return None;
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: this thread's time budget (tests of the run-count budget lift it so that a
+    /// loaded machine cannot reach the clock first).
+    pub static TIME_LIMIT: std::cell::Cell<std::time::Duration> = const { std::cell::Cell::new(crate::MAX_TIME) };
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn max_time() -> std::time::Duration {
+    #[cfg(test)]
+    {
+        TIME_LIMIT.with(|t| t.get())
+    }
+    #[cfg(not(test))]
+    {
+        crate::MAX_TIME
+    }
+}
+
+/// Whether the outermost evaluation on this thread has used up [`crate::MAX_TIME`].
+pub fn out_of_time() -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        STARTED.with(|s| s.get()).is_some_and(|t| t.elapsed() > max_time())
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        false
     }
 }
 
@@ -528,6 +603,13 @@ pub fn run(text: &str, b: &Begin) -> Run {
                 Err(e) => return Run::Done(Err(e.clone())),
             };
             match out {
+                Run::Done(Err(e)) if e == TIMED_OUT => {
+                    // Abandoned mid-run: start the next evaluation on a fresh context.
+                    if let Some(old) = r.take() {
+                        drop(ManuallyDrop::into_inner(old));
+                    }
+                    return Run::Done(Err(e));
+                }
                 Run::Done(Err(e)) if !fresh && e.contains(STACK_LIMIT) => {
                     // Dropped here, mid-thread, where boa's heap is alive (unlike at thread exit).
                     if let Some(old) = r.take() {
@@ -615,6 +697,11 @@ pub fn to_value(out: &Out, current: &Value) -> Result<Value, String> {
         Value::Str(_) => Value::Str(text(out)),
         Value::Path(_) => match out {
             Out::Path { points, ins, outs, closed } => {
+                // A vertex that isn't a number (`[[0, 0], [[1, 2], 0]]`) comes through as NaN, which
+                // the rasterizer must never see.
+                if points.iter().chain(ins).chain(outs).flatten().any(|c| !c.is_finite()) {
+                    return Err("Error: path points must be finite numbers".into());
+                }
                 let n = points.len();
                 let fit = |v: &[[f64; 2]]| {
                     let mut v = v.to_vec();
