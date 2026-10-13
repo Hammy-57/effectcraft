@@ -1085,7 +1085,9 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 // A 3D layer reaching past the camera: the part of its box in front of it.
                 let outline = layer_outline(&ectx, l);
                 if outline.len() > 2 {
-                    painter.add(egui::Shape::closed_line(outline.iter().map(|p| map.to_screen(*p)).collect(), Stroke::new(1.0, col)));
+                    if app.ui.viewer.show_masks {
+                        painter.add(egui::Shape::closed_line(outline.iter().map(|p| map.to_screen(*p)).collect(), Stroke::new(1.0, col)));
+                    }
                     continue;
                 }
                 // Cameras, lights, empty layers: just the anchor.
@@ -1097,8 +1099,13 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 continue;
             };
             let sq: Vec<Pos2> = q.iter().map(|p| map.to_screen(*p)).collect();
-            painter.add(egui::Shape::closed_line(sq.clone(), Stroke::new(1.0, col)));
-            for i in 0..8 {
+            // Toggle Mask and Shape Path Visibility off hides the layer's box and handles too, as
+            // in After Effects (the anchor point and motion path stay).
+            let show_box = app.ui.viewer.show_masks;
+            if show_box {
+                painter.add(egui::Shape::closed_line(sq.clone(), Stroke::new(1.0, col)));
+            }
+            for i in (0..8).filter(|_| show_box) {
                 let hp = if i < 4 { sq[i] } else { sq[i - 4] + (sq[(i - 3) % 4] - sq[i - 4]) * 0.5 };
                 let hr = Rect::from_center_size(hp, vec2(hs, hs));
                 painter.rect_filled(hr, 0.0, col);

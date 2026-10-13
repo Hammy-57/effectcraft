@@ -56,15 +56,28 @@ fn bevel_alpha(ctx: &EffectCtx, mut b: Buf) -> Buf {
     }
     let light = ctx.params.color("lightColor");
     let l = light_dir(ctx.params.f("lightAngle"), 45.0);
-    let a = Plane::alpha(&b.img);
+    // Outside the layer is transparent, as in After Effects: the alpha gets a clear border before
+    // the blur, else a layer opaque to its edges (a solid) has no slope there and no bevel.
+    let pad = (t * 1.5).ceil().clamp(0.0, 4096.0) as usize + 2;
+    let (w, ht) = (b.img.width as usize, b.img.height as usize);
+    let mut a = Plane::new(w + 2 * pad, ht + 2 * pad);
+    for (y, row) in b.img.data.chunks(w.max(1)).enumerate() {
+        let start = (y + pad) * a.w + pad;
+        if let Some(dst) = a.data.get_mut(start..start + row.len()) {
+            for (d, px) in dst.iter_mut().zip(row) {
+                *d = px[3];
+            }
+        }
+    }
     let h = gauss_plane(&a, t * 0.5, t * 0.5);
     let k = t * 1.25;
+    let pad = pad as i64;
     b.img.rows_mut().for_each(|(y, row)| {
         for (x, px) in row.iter_mut().enumerate() {
             if px[3] <= 0.0 {
                 continue;
             }
-            let (xi, yi) = (x as i64, y as i64);
+            let (xi, yi) = (x as i64 + pad, y as i64 + pad);
             let dx = (h.get_clamped(xi + 1, yi) - h.get_clamped(xi - 1, yi)) as f64 * 0.5;
             let dy = (h.get_clamped(xi, yi + 1) - h.get_clamped(xi, yi - 1)) as f64 * 0.5;
             let n = norm3([-dx * k, -dy * k, 1.0]);
@@ -567,6 +580,19 @@ mod tests {
         assert!(right < 0.45, "{right}");
         assert!((out.get(20, 20)[0] - 0.5).abs() < 1e-3);
         assert_eq!(out.get(20, 20)[3], 1.0);
+    }
+
+    /// A layer opaque to its edges (a solid) is bevelled at its bounds: outside it counts as
+    /// transparent. Before, the edges were clamped and Bevel Alpha did nothing on a solid.
+    #[test]
+    fn bevel_alpha_bevels_a_solid_at_its_bounds() {
+        let img = Image::filled(40, 20, [0.5, 0.5, 0.5, 1.0]);
+        let out = run("ec.perspective.bevelalpha", &img, &[("lightAngle", num(-90.0)), ("edgeThickness", num(4.0))]).img;
+        let left = out.get(0, 10)[0];
+        let right = out.get(39, 10)[0];
+        assert!(left > 0.55, "{left}");
+        assert!(right < 0.45, "{right}");
+        assert!((out.get(20, 10)[0] - 0.5).abs() < 1e-3);
     }
 
     #[test]
