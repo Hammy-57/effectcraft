@@ -84,7 +84,17 @@ const WRITES: &[(&str, &[&str])] = &[
     ("essential.exportTemplate", &["path"]),
     ("shortcuts.export", &["path"]),
     ("renderQueue.add", &["output", "path"]),
+    ("file.exportTimeline", &["path"]),
+    ("journal.export", &["path"]),
+    ("help.exportRepro", &["path"]),
+    ("render.frame", &["path"]),
+    ("render.contactSheet", &["path", "gif"]),
+    ("render.compare", &["diff_path"]),
+    ("audio.analyze", &["path"]),
 ];
+
+/// Written commands whose other paths are inputs: `render.compare` reads `a.path` / `b.path`.
+const WRITES_READING_OTHERS: &[&str] = &["render.compare"];
 
 /// Commands that write where they are not told: the project's file, the Render Queue's outputs.
 const IMPLICIT_WRITES: &[&str] = &["file.save", "file.incrementAndSave", "renderQueue.render", "render.preRender"];
@@ -181,8 +191,9 @@ impl Confinement {
         // Any other absolute path the command is given.
         let mut other = vec![];
         absolute_strings(params, named, &mut other);
+        let other_access = if WRITES_READING_OTHERS.contains(&id) { Access::Read } else { access };
         for s in other {
-            self.check(&s, access)?;
+            self.check(&s, other_access)?;
         }
         // An entry of a recent list by index is a path the agent didn't give.
         if matches!(id, "file.openRecent" | "file.importRecent" | "anim.applyRecentPreset") && !given {

@@ -1307,6 +1307,48 @@ fn automation_roots_confine_file_access() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// Review on #859: the commands that write files they are given (journal, repro, timeline
+/// export, render views and comparisons, audio waveforms) are checked against the write roots,
+/// so they can't write outside them, into a read root or to a relative path.
+#[test]
+fn confinement_covers_every_command_that_writes_a_file() {
+    use crate::confine::Confinement;
+    let base = std::env::temp_dir().join(format!("ec-mcp-confine-writes-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let (read, write, outside) = (base.join("in"), base.join("out"), base.join("elsewhere"));
+    for d in [&read, &write, &outside] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let p = |d: &std::path::Path, f: &str| d.join(f).to_string_lossy().into_owned();
+    let c = Confinement::new(std::slice::from_ref(&read), std::slice::from_ref(&write)).unwrap();
+    let writers: [(&str, &str); 8] = [
+        ("journal.export", "path"),
+        ("help.exportRepro", "path"),
+        ("file.exportTimeline", "path"),
+        ("render.frame", "path"),
+        ("render.contactSheet", "path"),
+        ("render.contactSheet", "gif"),
+        ("render.compare", "diff_path"),
+        ("audio.analyze", "path"),
+    ];
+    for (id, key) in writers {
+        let with = |path: String| {
+            let mut params = json!({"a": "before", "b": {}});
+            params[key] = json!(path);
+            params
+        };
+        assert!(c.check_command(id, &with(p(&write, "x.png"))).is_ok(), "{id} {key} into a write root");
+        for bad in [p(&outside, "x.png"), p(&read, "x.png"), "x.png".to_string(), p(&write, "../elsewhere/x.png")] {
+            assert!(c.check_command(id, &with(bad.clone())).is_err(), "{id} {key}: {bad} must be refused");
+        }
+    }
+    // render.compare still reads its inputs from a read root, but not from outside the roots.
+    let compare = |input: String| json!({"a": {"path": input}, "b": {}, "diff_path": p(&write, "d.png")});
+    assert!(c.check_command("render.compare", &compare(p(&read, "ref.png"))).is_ok());
+    assert!(c.check_command("render.compare", &compare(p(&outside, "ref.png"))).is_err());
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// Send a request that must fail; returns the JSON-RPC error code.
 fn rpc_err(s: &mut McpServer, method: &str, params: Value) -> i64 {
     let line = json!({"jsonrpc": "2.0", "id": 7, "method": method, "params": params}).to_string();
