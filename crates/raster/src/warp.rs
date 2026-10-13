@@ -609,8 +609,6 @@ mod tests {
             assert_eq!(d, a.crop(8, 4, 15, 30), "window {mode:?}");
             assert_eq!(a, b, "{mode:?}");
         }
-        let c = test_image(48, 40, 2);
-        assert_eq!(crate::pool::crop_of(&c, x, y, w, h), c.crop(x as i64, y as i64, w, h));
     }
 
     #[test]

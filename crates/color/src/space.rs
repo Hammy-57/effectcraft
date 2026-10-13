@@ -21,8 +21,6 @@
 //! conversions between any two spaces are exact up to `f64` rounding. Transfer functions extend
 //! to over-range and negative values (32 bpc) by mirroring around zero.
 
-use std::sync::OnceLock;
-
 use serde::{Deserialize, Serialize};
 
 /// An RGB colour space.
@@ -163,123 +161,39 @@ fn mirror3(c: [f32; 3], f: impl Fn(f32) -> f32) -> [f32; 3] {
     c.map(|v| f(v.abs()).copysign(v))
 }
 
-/// Intervals of the transfer-curve lookup tables over 0..1.
-const LUT_N: usize = 4096;
-/// The tables serve `LUT_LO <= a < 1`. Below it the power curves bend too sharply for linear
-/// interpolation (encode's slope is unbounded at 0) and the exact curve is used, as above 1.
-const LUT_LO: f32 = 1.0 / 64.0;
-
-static SRGB_DECODE_LUT: OnceLock<Vec<f32>> = OnceLock::new();
-static SRGB_ENCODE_LUT: OnceLock<Vec<f32>> = OnceLock::new();
-static GAMMA24_DECODE_LUT: OnceLock<Vec<f32>> = OnceLock::new();
-static GAMMA24_ENCODE_LUT: OnceLock<Vec<f32>> = OnceLock::new();
-static PQ_DECODE_LUT: OnceLock<Vec<f32>> = OnceLock::new();
-static PQ_ENCODE_LUT: OnceLock<Vec<f32>> = OnceLock::new();
-static HLG_DECODE_LUT: OnceLock<Vec<f32>> = OnceLock::new();
-static HLG_ENCODE_LUT: OnceLock<Vec<f32>> = OnceLock::new();
-
-/// `f` sampled at `i / LUT_N` (in `f64`), built on first use.
-fn lut(cell: &'static OnceLock<Vec<f32>>, f: fn(f64) -> f64) -> &'static [f32] {
-    cell.get_or_init(|| (0..=LUT_N).map(|i| f(i as f64 / LUT_N as f64) as f32).collect())
-}
-
-/// `f(a)` from its table by linear interpolation for `LUT_LO <= a < 1`, else `exact(a)`.
-/// Max error against the exact `f32` curves: see `transfer_luts_are_accurate`.
+// Transfer curves on magnitudes (`a >= 0`, or NaN), exact as before the curve match was
+// hoisted out of the per-channel loop.
 #[inline(always)]
-fn curve_lut(a: f32, cell: &'static OnceLock<Vec<f32>>, f: fn(f64) -> f64, exact: fn(f32) -> f32) -> f32 {
-    if (LUT_LO..1.0).contains(&a) {
-        let s = a * LUT_N as f32;
-        let i = s as usize;
-        let t = lut(cell, f);
-        if let (Some(&y0), Some(&y1)) = (t.get(i), t.get(i + 1)) {
-            return y0 + (y1 - y0) * (s - i as f32);
-        }
-    }
-    exact(a)
-}
-
-fn srgb_decode_f64(v: f64) -> f64 {
-    if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
-}
-fn srgb_encode_f64(v: f64) -> f64 {
-    if v <= 0.003_130_8 { v * 12.92 } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 }
-}
-fn gamma24_decode_f64(v: f64) -> f64 {
-    v.powf(2.4)
-}
-fn gamma24_encode_f64(v: f64) -> f64 {
-    v.powf(1.0 / 2.4)
-}
-fn pq_decode_f64(v: f64) -> f64 {
-    pq_decode(v) * 10_000.0 / PQ_REFERENCE_WHITE
-}
-fn pq_encode_f64(v: f64) -> f64 {
-    pq_encode(v * PQ_REFERENCE_WHITE / 10_000.0)
-}
-fn hlg_decode_f64(v: f64) -> f64 {
-    hlg_decode(v) / HLG_REFERENCE
-}
-fn hlg_encode_f64(v: f64) -> f64 {
-    hlg_encode(v * HLG_REFERENCE)
-}
-fn srgb_decode_exact(v: f32) -> f32 {
-    if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
-}
-fn srgb_encode_exact(v: f32) -> f32 {
-    if v <= 0.003_130_8 { v * 12.92 } else { 1.055 * v.max(0.0).powf(1.0 / 2.4) - 0.055 }
-}
-fn pq_decode_exact(a: f32) -> f32 {
-    pq_decode_f64(a as f64) as f32
-}
-fn pq_encode_exact(a: f32) -> f32 {
-    pq_encode_f64(a as f64) as f32
-}
-fn hlg_decode_exact(a: f32) -> f32 {
-    hlg_decode_f64(a as f64) as f32
-}
-fn hlg_encode_exact(a: f32) -> f32 {
-    hlg_encode_f64(a as f64) as f32
-}
-fn gamma24_decode_exact(a: f32) -> f32 {
-    a.powf(2.4)
-}
-fn gamma24_encode_exact(a: f32) -> f32 {
-    a.powf(1.0 / 2.4)
-}
-
-// Transfer curves on magnitudes (`a >= 0`, or NaN). The sRGB ones also serve negative input
-// (the exact linear segment), for [`crate::srgb_to_linear`] / [`crate::linear_to_srgb`].
-#[inline(always)]
-pub(crate) fn srgb_decode_mag(a: f32) -> f32 {
-    curve_lut(a, &SRGB_DECODE_LUT, srgb_decode_f64, srgb_decode_exact)
+fn srgb_decode_mag(a: f32) -> f32 {
+    crate::srgb_to_linear(a)
 }
 #[inline(always)]
-pub(crate) fn srgb_encode_mag(a: f32) -> f32 {
-    curve_lut(a, &SRGB_ENCODE_LUT, srgb_encode_f64, srgb_encode_exact)
+fn srgb_encode_mag(a: f32) -> f32 {
+    crate::linear_to_srgb(a)
 }
 #[inline(always)]
 fn gamma24_decode_mag(a: f32) -> f32 {
-    curve_lut(a, &GAMMA24_DECODE_LUT, gamma24_decode_f64, gamma24_decode_exact)
+    a.powf(2.4)
 }
 #[inline(always)]
 fn gamma24_encode_mag(a: f32) -> f32 {
-    curve_lut(a, &GAMMA24_ENCODE_LUT, gamma24_encode_f64, gamma24_encode_exact)
+    a.powf(1.0 / 2.4)
 }
 #[inline(always)]
 fn pq_decode_mag(a: f32) -> f32 {
-    curve_lut(a, &PQ_DECODE_LUT, pq_decode_f64, pq_decode_exact)
+    (pq_decode(a as f64) * 10_000.0 / PQ_REFERENCE_WHITE) as f32
 }
 #[inline(always)]
 fn pq_encode_mag(a: f32) -> f32 {
-    curve_lut(a, &PQ_ENCODE_LUT, pq_encode_f64, pq_encode_exact)
+    pq_encode(a as f64 * PQ_REFERENCE_WHITE / 10_000.0) as f32
 }
 #[inline(always)]
 fn hlg_decode_mag(a: f32) -> f32 {
-    curve_lut(a, &HLG_DECODE_LUT, hlg_decode_f64, hlg_decode_exact)
+    (hlg_decode(a as f64) / HLG_REFERENCE) as f32
 }
 #[inline(always)]
 fn hlg_encode_mag(a: f32) -> f32 {
-    curve_lut(a, &HLG_ENCODE_LUT, hlg_encode_f64, hlg_encode_exact)
+    hlg_encode(a as f64 * HLG_REFERENCE) as f32
 }
 
 impl ColorSpace {
@@ -662,37 +576,6 @@ mod tests {
         }
     }
 
-    /// The transfer curves before the lookup tables (exact `f32`), per channel.
-    fn exact_curve(c: Curve, v: f32, decode: bool) -> f32 {
-        let a = v.abs();
-        let r = match (c, decode) {
-            (Curve::Srgb, true) => srgb_decode_exact(a),
-            (Curve::Srgb, false) => srgb_encode_exact(a),
-            (Curve::Gamma24, true) => a.powf(2.4),
-            (Curve::Gamma24, false) => a.powf(1.0 / 2.4),
-            (Curve::Pq, true) => pq_decode_exact(a),
-            (Curve::Pq, false) => pq_encode_exact(a),
-            (Curve::Hlg, true) => hlg_decode_exact(a),
-            (Curve::Hlg, false) => hlg_encode_exact(a),
-            (Curve::Linear, _) => a,
-        };
-        r.copysign(v)
-    }
-
-    /// [`Conversion::apply`] as it was before this change: per channel, exact curves.
-    fn apply_exact(c: &Conversion, mut v: [f32; 3]) -> [f32; 3] {
-        if let Some(s) = c.decode {
-            v = v.map(|x| exact_curve(s.curve(), x, true));
-        }
-        if let Some(m) = &c.matrix {
-            v = [0, 1, 2].map(|i| m[i][0] * v[0] + m[i][1] * v[1] + m[i][2] * v[2]);
-        }
-        if let Some(s) = c.encode {
-            v = v.map(|x| exact_curve(s.curve(), x, false));
-        }
-        v
-    }
-
     /// Rough per-pixel timing of [`Conversion::apply`] against the old path (`cargo test -p
     /// effectcraft-color --release --lib conversion_timing -- --ignored --nocapture`).
     #[test]
@@ -725,65 +608,8 @@ mod tests {
         for (name, conv) in cases {
             let Some(conv) = conv else { continue };
             let new = time(&|c| conv.apply(c));
-            let old = time(&|c| apply_exact(&conv, c));
+            let old = time(&|c| apply_per_channel(&conv, c));
             println!("{name}: new {new:?}/Mpx old {old:?}/Mpx");
-        }
-    }
-
-    #[test]
-    fn conversions_stay_within_a_16_bit_step_of_the_exact_curves() {
-        let vals = probe_values();
-        for a in ColorSpace::ALL {
-            for b in ColorSpace::ALL {
-                for (al, bl) in [(false, false), (true, false), (false, true), (true, true)] {
-                    let Some(conv) = Conversion::new(a, al, b, bl) else { continue };
-                    for w in vals.windows(3) {
-                        let c = [w[0], w[1], w[2]];
-                        if c.iter().any(|v| !v.is_finite() || v.abs() > 1.0) {
-                            continue;
-                        }
-                        let (o, e) = (conv.apply(c), apply_exact(&conv, c));
-                        for i in 0..3 {
-                            let tol = 1e-5 * e[i].abs().max(1.0);
-                            assert!((o[i] - e[i]).abs() < tol, "{a:?}{al}→{b:?}{bl}: {c:?} → {o:?} vs {e:?}");
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn transfer_luts_are_accurate() {
-        let curves: [(&str, fn(f32) -> f32, fn(f32) -> f32); 8] = [
-            ("srgb decode", srgb_decode_mag, srgb_decode_exact),
-            ("srgb encode", srgb_encode_mag, srgb_encode_exact),
-            ("gamma 2.4 decode", gamma24_decode_mag, gamma24_decode_exact),
-            ("gamma 2.4 encode", gamma24_encode_mag, gamma24_encode_exact),
-            ("pq decode", pq_decode_mag, pq_decode_exact),
-            ("pq encode", pq_encode_mag, pq_encode_exact),
-            ("hlg decode", hlg_decode_mag, hlg_decode_exact),
-            ("hlg encode", hlg_encode_mag, hlg_encode_exact),
-        ];
-        for (name, fast, exact) in curves {
-            let mut max = 0.0f32;
-            let mut rel = 0.0f32;
-            // Every 5th f32 from 1/256 to 1, across the table's lower edge.
-            let mut b = (1.0f32 / 256.0).to_bits();
-            while b <= 1.0f32.to_bits() {
-                let a = f32::from_bits(b);
-                max = max.max((fast(a) - exact(a)).abs());
-                rel = rel.max((fast(a) - exact(a)).abs() / exact(a).abs().max(1.0));
-                b += 5;
-            }
-            eprintln!("{name}: max abs error {max:e}, relative to max(1, |exact|) {rel:e}");
-            // An 8-bit step is 3.9e-3, a 16-bit one 1.5e-5. HDR decodes reach 49 (PQ) and 3.8 (HLG)
-            // times reference white, so their error is measured relative to the value above 1.
-            assert!(rel < 1e-5, "{name}: {rel:e}");
-            // Outside the table: the exact curve.
-            for a in [0.0, 1e-6, 0.004, 1.0, 1.5, 40.0] {
-                assert_eq!(fast(a).to_bits(), exact(a).to_bits(), "{name} {a}");
-            }
         }
     }
 }

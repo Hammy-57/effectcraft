@@ -68,16 +68,13 @@ impl Rgba {
     }
 }
 
-/// sRGB electro-optical transfer: encoded → linear. From the 4096-entry table in 1/64..1 (within
-/// 1e-5 of the exact curve), exact elsewhere.
-#[inline]
+/// sRGB electro-optical transfer: encoded → linear.
 pub fn srgb_to_linear(v: f32) -> f32 {
-    space::srgb_decode_mag(v)
+    if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
 }
-/// Linear → sRGB encoded, like [`srgb_to_linear`].
-#[inline]
+/// Linear → sRGB encoded.
 pub fn linear_to_srgb(v: f32) -> f32 {
-    space::srgb_encode_mag(v)
+    if v <= 0.003_130_8 { v * 12.92 } else { 1.055 * v.max(0.0).powf(1.0 / 2.4) - 0.055 }
 }
 
 /// Rec. 709 luma weights (AE's luminance for luma mattes/keys).
