@@ -66,7 +66,7 @@ fn step_panel(app: &mut EffectcraftApp, _ctx: &egui::Context, id: &str, _p: Valu
     let focused = app.ui.focused;
     let group: Vec<PanelKind> = match app.ui.floating.iter().find(|f| f.panels.contains(&focused)) {
         Some(f) => f.panels.clone(),
-        None => app.ui.dock.group_of(focused).map(<[PanelKind]>::to_vec).unwrap_or_default(),
+        None => app.ui.dock.group_of(focused).map(|(panels, _)| panels).unwrap_or_default(),
     };
     let Some(i) = group.iter().position(|p| *p == focused) else { return Ok(Value::Null) };
     let step = if id == "window.nextPanel" { 1 } else { group.len().saturating_sub(1) };

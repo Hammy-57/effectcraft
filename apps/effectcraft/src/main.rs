@@ -646,7 +646,7 @@ mod tests {
         if std::env::var_os("WGPU_VALIDATION_INDIRECT_CALL").is_some() {
             return;
         }
-        let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = super::wgpu_options(None).wgpu_setup else {
+        let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = super::wgpu_options(None, None).wgpu_setup else {
             panic!("the default setup creates its own instance");
         };
         // Intel Metal can't compile the validation's compute shader, and the device is lost.

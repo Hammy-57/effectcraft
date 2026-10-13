@@ -9,7 +9,7 @@ use crate::i18n::tr;
 use effectcraft_engine::keyframe::Value as KV;
 use effectcraft_engine::project::styles::{BLENDING, GROUP, STYLES};
 use effectcraft_engine::project::{ItemId, Layer, LayerId, Node, ParamUi, Project, Property};
-use egui::{Align2, vec2};
+use egui::vec2;
 use serde_json::{Value, json};
 
 use crate::theme::Tokens;

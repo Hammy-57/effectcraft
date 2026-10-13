@@ -147,8 +147,8 @@ fn pasted_effects_preserve_comp_timing_and_eased_values_on_stretched_layers() {
             for key in &mut pr.keys {
                 key.in_interp = Interp::Bezier;
                 key.out_interp = Interp::Bezier;
-                key.in_ease = vec![Ease { speed: 7.0, influence: 0.25 }];
-                key.out_ease = vec![Ease { speed: 3.0, influence: 0.6 }];
+                key.in_ease = vec![Ease { speed: 7.0, influence: 0.25 }].into();
+                key.out_ease = vec![Ease { speed: 3.0, influence: 0.6 }].into();
                 key.label = 4;
             }
             let source = layer(&s, a);
@@ -190,8 +190,8 @@ fn pasted_spatial_effect_keys_preserve_the_eased_path_on_reversed_layers() {
         for key in &mut pr.keys {
             key.in_interp = Interp::Bezier;
             key.out_interp = Interp::Bezier;
-            key.in_ease = vec![Ease { speed: 15.0, influence: 0.25 }];
-            key.out_ease = vec![Ease { speed: 30.0, influence: 0.6 }];
+            key.in_ease = vec![Ease { speed: 15.0, influence: 0.25 }].into();
+            key.out_ease = vec![Ease { speed: 30.0, influence: 0.6 }].into();
             key.spatial_auto = false;
             key.spatial_in = [-10.0, -20.0, 0.0];
             key.spatial_out = [20.0, 5.0, 0.0];
