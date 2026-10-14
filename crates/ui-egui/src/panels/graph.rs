@@ -151,8 +151,15 @@ struct CurveSamples {
     base: Vec<(f64, f64)>,
 }
 
-/// The sampled curves of one graph type: (dependency key, paired result/base points per curve).
-type Samples = (u64, std::sync::Arc<Vec<CurveSamples>>);
+struct SampleCache {
+    key: u64,
+    // Retain the actual owners: copy-on-write edits must allocate new layers, and these
+    // allocations cannot be recycled into a false cache hit while this cache is alive.
+    owners: Vec<std::sync::Arc<Layer>>,
+    curves: Vec<CurveSamples>,
+}
+
+type Samples = std::sync::Arc<SampleCache>;
 
 /// Build the curves for the visible time span. Their samples evaluate every shown property
 /// (expressions too) across the plot, so they are remembered until the project, the shown
@@ -211,11 +218,21 @@ fn curves<'a>(app: &EffectcraftApp, ctx: &egui::Context, comp: &'a Comp, ectx: &
     let sel = &app.session.state.selected_keys;
     let n = ((plot.width() / 2.0) as usize).clamp(2, 2048);
     let props = shown_props(app, comp);
+    let properties: Vec<_> = props
+        .iter()
+        .filter_map(|(lid, uid)| {
+            let owner = comp.layers.arcs().iter().find(|layer| layer.id == *lid)?;
+            Some((owner, owner.props.find(*uid)?))
+        })
+        .collect();
+    // Plain local properties depend only on their owning layer. Expressions may read any
+    // other layer or composition, so retain whole-document invalidation for those graphs.
+    let expression_revision = properties.iter().any(|(layer, prop)| curve_has_expression(layer, prop)).then_some(app.session.revision);
     let compare_expressions = app.ui.timeline.graph_expression_overlay && ectx.expr.is_some() && speed == speed_graph(app, comp);
     let samples_key = {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        (app.session.revision, ectx.comp_id.0, n, &props, compare_expressions, ectx.expr.is_some()).hash(&mut h);
+        (expression_revision, ectx.comp_id.0, n, &props, compare_expressions, ectx.expr.is_some()).hash(&mut h);
         for v in [plot.min.x, plot.max.x, tm.x0] {
             v.to_bits().hash(&mut h);
         }
@@ -223,18 +240,23 @@ fn curves<'a>(app: &EffectcraftApp, ctx: &egui::Context, comp: &'a Comp, ectx: &
         h.finish()
     };
     let samples_id = egui::Id::new(("graph-samples", speed));
-    let cached = ctx.data(|d| d.get_temp::<Samples>(samples_id)).filter(|(k, _)| *k == samples_key).map(|(_, s)| s);
+    let cached = ctx.data(|d| d.get_temp::<Samples>(samples_id)).filter(|cache| {
+        cache.key == samples_key
+            && cache.owners.len() == properties.len()
+            && properties.iter().zip(&cache.owners).all(|((owner, _), cached_owner)| std::sync::Arc::ptr_eq(owner, cached_owner))
+    });
+    let owners = if cached.is_none() { properties.iter().map(|(owner, _)| std::sync::Arc::clone(owner)).collect() } else { Vec::new() };
     let mut sampled: Vec<CurveSamples> = vec![];
     let mut out = vec![];
-    for (pi, (lid, uid)) in props.into_iter().enumerate() {
-        let Some(l) = comp.layer(lid) else { continue };
-        let Some(pr) = l.props.find(uid) else { continue };
+    for (pi, (owner, pr)) in properties.into_iter().enumerate() {
+        let l = owner.as_ref();
+        let (lid, uid) = (l.id, pr.uid);
         let spatial = pr.spatial && matches!(pr.value, Value::Vec2(_) | Value::Vec3(_));
         let dims = if speed && spatial { 1 } else { shown_dims(l, pr) };
         for d in 0..dims {
             let color = if dims > 1 { DIM_COLORS[d % 4] } else { PROP_COLORS[pi % PROP_COLORS.len()] };
-            let ci = sampled.len();
-            let mut points = cached.as_ref().and_then(|c| c.get(ci)).cloned().unwrap_or_default();
+            let ci = out.len();
+            let mut points = cached.as_ref().and_then(|cache| cache.curves.get(ci)).cloned().unwrap_or_default();
             if points.result.is_empty() {
                 let include_base = compare_expressions && curve_has_expression(l, pr);
                 points.result.reserve(n);
@@ -250,7 +272,9 @@ fn curves<'a>(app: &EffectcraftApp, ctx: &egui::Context, comp: &'a Comp, ectx: &
                     }
                 }
             }
-            sampled.push(points.clone());
+            if cached.is_none() {
+                sampled.push(points.clone());
+            }
             let CurveSamples { result: pts, base: base_pts } = points;
             let mut keys = vec![];
             // A pinned aggregate remains a useful readout after separation; only its followers
@@ -296,7 +320,7 @@ fn curves<'a>(app: &EffectcraftApp, ctx: &egui::Context, comp: &'a Comp, ectx: &
         }
     }
     if cached.is_none() {
-        ctx.data_mut(|d| d.insert_temp::<Samples>(samples_id, (samples_key, std::sync::Arc::new(sampled))));
+        ctx.data_mut(|d| d.insert_temp::<Samples>(samples_id, std::sync::Arc::new(SampleCache { key: samples_key, owners, curves: sampled })));
     }
     out
 }
@@ -1490,6 +1514,7 @@ mod tests {
             match prop.expr.as_ref().map(|expression| expression.text.as_str()) {
                 Some("error") => Err("synthetic expression error".into()),
                 Some("identity") => Ok(value.clone()),
+                Some("comp-duration") => Ok(value.with_components(&value.components().iter().map(|v| v + ctx.comp.duration.seconds()).collect::<Vec<_>>())),
                 Some("step") => Ok(super::Value::Scalar(if ctx.time.seconds() < 1.0 { 0.0 } else { 100.0 })),
                 Some("zero") => Ok(value.with_components(&value.components().iter().map(|_| 0.0).collect::<Vec<_>>())),
                 Some("twice") => Ok(value.with_components(&value.components().iter().map(|v| v * 2.0).collect::<Vec<_>>())),
@@ -1502,7 +1527,7 @@ mod tests {
         use super::*;
         let host = std::sync::Arc::new(FakeExpressions::default());
         let mut session = effectcraft_engine::Session { expr: Some(host.clone()), ..Default::default() };
-        session.execute("comp.new", json!({"name": "Expression comparison", "width": 32, "height": 32, "duration": 8})).unwrap();
+        session.execute("comp.new", json!({"name": "Expression comparison", "width": 32, "height": 32, "frameRate": 30, "duration": 8})).unwrap();
         session.execute("layer.newSolid", json!({"name": "Box", "width": 10, "height": 10})).unwrap();
         let layer = session.active_comp().unwrap().layers[0].id;
         for (time, value) in [(0.0, 0.0), (2.0, 20.0)] {
@@ -1524,6 +1549,154 @@ mod tests {
             .into_iter()
             .map(|c| CurveSamples { result: c.pts, base: c.base_pts })
             .collect()
+    }
+
+    fn stored_samples(ctx: &egui::Context, speed: bool) -> super::Samples {
+        ctx.data(|data| data.get_temp::<super::Samples>(egui::Id::new(("graph-samples", speed)))).unwrap()
+    }
+
+    fn plain_cache_app() -> (crate::EffectcraftApp, super::LayerId, u64, super::LayerId) {
+        use super::*;
+        let (mut app, layer, uid, _) = comparison_app("identity");
+        app.session.execute("prop.setExpression", json!({"layer": layer.0, "prop": uid, "expression": "identity", "enabled": false})).unwrap();
+        app.session.execute("layer.newSolid", json!({"name": "Unrelated", "width": 10, "height": 10})).unwrap();
+        let other = app.session.active_comp().unwrap().layers.iter().find(|l| l.name == "Unrelated").unwrap().id;
+        app.session.execute("prop.select", json!({"layer": layer.0, "prop": uid})).unwrap();
+        (app, layer, uid, other)
+    }
+
+    #[test]
+    fn plain_graph_cache_reuses_samples_after_an_unrelated_layer_edit_and_retains_real_owners() {
+        use super::*;
+        let (mut app, layer, _, other) = plain_cache_app();
+        let ctx = egui::Context::default();
+        let first_points = comparison_samples(&app, &ctx, false);
+        let before = stored_samples(&ctx, false);
+        let owner = app.session.active_comp().unwrap().layers.arcs().iter().find(|l| l.id == layer).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&before.owners[0], owner));
+        let revision = app.session.revision;
+        app.session.execute("prop.set", json!({"layer": other.0, "path": "transform/opacity", "value": 31.0})).unwrap();
+        assert!(app.session.revision > revision);
+        let after_points = comparison_samples(&app, &ctx, false);
+        assert!(std::sync::Arc::ptr_eq(&before, &stored_samples(&ctx, false)), "unrelated layers do not resample plain graphs");
+        assert_eq!(after_points[0].result, first_points[0].result);
+    }
+
+    #[test]
+    fn plain_graph_cache_invalidates_for_owner_key_value_stretch_and_dimension_edits() {
+        use super::*;
+        for edit in ["key", "value", "stretch", "3d"] {
+            let (mut app, layer, uid, _) = plain_cache_app();
+            if edit == "3d" {
+                let position = app.session.active_comp().unwrap().layer(layer).unwrap().props.prop("transform/position").unwrap().uid;
+                app.session.execute("prop.select", json!({"layer": layer.0, "prop": position})).unwrap();
+            }
+            let ctx = egui::Context::default();
+            let first_points = comparison_samples(&app, &ctx, false);
+            let before = stored_samples(&ctx, false);
+            match edit {
+                "key" => {
+                    app.session.execute("prop.addKey", json!({"layer": layer.0, "prop": uid, "time": 1.0, "value": 50.0})).unwrap();
+                }
+                "value" => {
+                    app.session.execute("prop.set", json!({"layer": layer.0, "prop": uid, "value": 77.0})).unwrap();
+                }
+                "stretch" => {
+                    app.session.execute("layer.timeStretch", json!({"layers": [layer.0], "percent": 200.0})).unwrap();
+                }
+                _ => {
+                    app.session.execute("layer.setSwitch", json!({"layers": [layer.0], "switch": "threeD", "value": true})).unwrap();
+                }
+            }
+            let after_points = comparison_samples(&app, &ctx, false);
+            assert!(!std::sync::Arc::ptr_eq(&before, &stored_samples(&ctx, false)), "{edit} changes the shown owner");
+            if edit == "3d" {
+                assert_eq!(first_points.len(), 2);
+                assert_eq!(after_points.len(), 3);
+                let warm = comparison_samples(&app, &ctx, false);
+                assert!(warm.iter().zip(&after_points).all(|(a, b)| a.result == b.result), "warm multi-dimensional curves must keep separate point lists");
+            } else {
+                assert_ne!(first_points[0].result, after_points[0].result, "{edit} must change the visible curve");
+            }
+        }
+    }
+
+    #[test]
+    fn separated_follower_edits_invalidate_without_relying_on_session_revision() {
+        use super::*;
+        let (mut app, layer, _, _) = plain_cache_app();
+        app.session.execute("prop.separateDimensions", json!({"layer": layer.0, "value": true})).unwrap();
+        let uid = app.session.active_comp().unwrap().layer(layer).unwrap().props.prop("transform/position").unwrap().uid;
+        app.session.execute("prop.select", json!({"layer": layer.0, "prop": uid})).unwrap();
+        let ctx = egui::Context::default();
+        let initial = comparison_samples(&app, &ctx, false);
+        let before = stored_samples(&ctx, false);
+        let revision = app.session.revision;
+        let cid = app.session.active_comp_id().unwrap();
+        // A source snapshot can change through COW independently of the outer Session cursor.
+        let follower =
+            std::sync::Arc::make_mut(&mut app.session.project).comp_mut(cid).unwrap().layer_mut(layer).unwrap().props.prop_mut("transform/positionX").unwrap();
+        follower.value = Value::Scalar(123.0);
+        let after = comparison_samples(&app, &ctx, false);
+        assert_eq!(app.session.revision, revision);
+        assert!(!std::sync::Arc::ptr_eq(&before, &stored_samples(&ctx, false)));
+        assert_ne!(initial[0].result, after[0].result);
+        assert!(after[0].result.iter().all(|(_, value)| *value == 123.0));
+    }
+
+    #[test]
+    fn enabling_an_expression_restores_global_invalidation_including_separated_followers() {
+        use super::*;
+        for separate in [false, true] {
+            let (mut app, layer, mut uid, _) = plain_cache_app();
+            let path = if separate {
+                app.session.execute("prop.separateDimensions", json!({"layer": layer.0, "value": true})).unwrap();
+                uid = app.session.active_comp().unwrap().layer(layer).unwrap().props.prop("transform/position").unwrap().uid;
+                app.session.execute("prop.select", json!({"layer": layer.0, "prop": uid})).unwrap();
+                "transform/positionX"
+            } else {
+                "transform/rotation"
+            };
+            let ctx = egui::Context::default();
+            comparison_samples(&app, &ctx, false);
+            let plain = stored_samples(&ctx, false);
+            app.session.execute("prop.setExpression", json!({"layer": layer.0, "path": path, "expression": "comp-duration", "enabled": true})).unwrap();
+            let first = comparison_samples(&app, &ctx, false);
+            let expression = stored_samples(&ctx, false);
+            assert!(!std::sync::Arc::ptr_eq(&plain, &expression));
+            app.session.execute("comp.settings", json!({"duration": 16.0})).unwrap();
+            let changed = comparison_samples(&app, &ctx, false);
+            let global_edit = stored_samples(&ctx, false);
+            assert!(expression.owners.iter().zip(&global_edit.owners).all(|(a, b)| std::sync::Arc::ptr_eq(a, b)), "only composition data changed");
+            assert!(!std::sync::Arc::ptr_eq(&expression, &global_edit), "expression can read non-owner state, separate={separate}, prop={uid}");
+            assert!(first[0].result.iter().zip(&changed[0].result).all(|(a, b)| (b.1 - a.1 - 8.0).abs() < 1e-8));
+        }
+    }
+
+    #[test]
+    fn graph_cache_keeps_view_graph_type_and_composition_invalidation() {
+        use super::*;
+        let (mut app, _, _, _) = plain_cache_app();
+        let ctx = egui::Context::default();
+        comparison_samples(&app, &ctx, false);
+        let initial = stored_samples(&ctx, false);
+        let project = app.session.project.clone();
+        let cid = app.session.active_comp_id().unwrap();
+        let comp = project.comp(cid).unwrap();
+        let eval = EvalCtx { expr: app.session.expr.as_deref(), ..EvalCtx::new(&project, cid, comp, Tick::ZERO) };
+        let tm = TMap { x0: 0.0, start: 0.5, pps: 150.0 };
+        let plot = Rect::from_min_size(Pos2::ZERO, vec2(240.0, 200.0));
+        curves(&app, &ctx, comp, &eval, tm, plot, false);
+        let view_changed = stored_samples(&ctx, false);
+        assert!(!std::sync::Arc::ptr_eq(&initial, &view_changed));
+        // Same shared owners/UIDs can appear in snapshots; the composition namespace still matters.
+        let other_comp = EvalCtx { comp_id: effectcraft_engine::project::ItemId(cid.0 + 1), ..eval };
+        curves(&app, &ctx, comp, &other_comp, tm, plot, false);
+        let comp_changed = stored_samples(&ctx, false);
+        assert!(!std::sync::Arc::ptr_eq(&view_changed, &comp_changed));
+        app.ui.timeline.graph_mode = "speed".into();
+        comparison_samples(&app, &ctx, true);
+        assert!(!std::sync::Arc::ptr_eq(&comp_changed, &stored_samples(&ctx, true)));
     }
 
     #[test]
