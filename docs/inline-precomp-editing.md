@@ -19,7 +19,9 @@ Supported inline operations:
 - Rename or move source layers up/down from their context menu; drag their duration bars in time.
 - Toggle animation, add/remove keys, Shift-select multiple keys, move selected keys, and use the
   key's context menu for ease/hold/delete. Delete and Duplicate address the source selection.
-- Open the source composition explicitly from a nested row's context menu for its full editor.
+- Use the full Graph Editor for the focused source selection without switching the viewer: value/speed curves, handles, transform boxes, fit/zoom, interpolation/velocity/value dialogs, pinned sets and keyframe navigation.
+- Copy, cut and paste source layers, keys, properties and shape/effect groups through the normal Edit menu or shortcuts. Internal clipboard contents are shared across compositions; FigCraft rich content and SVG use the existing receiver and target the focused source.
+- Open the source composition explicitly from a nested row's context menu when a separate source viewer is useful.
 
 ## Timing and safety
 
@@ -36,8 +38,7 @@ Evaluation follows the renderer's `EvalCtx::nested_time`: offsets, positive/nega
 remapping, protected time regions and preserved source frame rate use the same source time as the
 viewer. Ordinary instance bars and keys are mapped back onto the parent time ruler. For nonlinear
 remapping/protected-time/preserved-frame-rate chains, the inverse can be ambiguous: inline properties
-and animation switches still operate at the evaluated source time, while bars/key dragging are
-replaced by a source-time label. Open the source timeline for those key-time edits.
+and animation switches still operate at the evaluated source time, while the layer-bar view uses a source-time label instead of ambiguous positions. The inline Graph Editor has its own explicitly labelled source-time ruler, so source curves and keys remain editable even through nonlinear remapping. J/K navigation and source-ruler scrubbing map back to the parent for affine timing; otherwise the parent ruler remains the scrub control. Source graph fit/zoom state is independent of the parent view.
 
 UI expansion is instance-specific and saved with timeline preferences; keyboard focus is temporary.
 The projection caps additional displayed rows at 20,000. Source-layer property expansion is shared
@@ -48,9 +49,7 @@ selection. Clicking a parent row or moving focus to another panel restores norma
 
 ## Remaining limitations and verification
 
-This is an inline timeline editor, not a second source viewer. Spatial path handles, waveform
-inspection, graph-editor curves for nested sources and clipboard commands still require opening
-the source composition. Mixed-source selection/dragging between compositions is not supported.
+This is an inline timeline editor, not a second source viewer. Spatial path handles and waveform inspection still require opening the source composition. Source graph dialogs retain their opening source time and revalidate the instance path and locks before committing. Malformed rich clipboard content reports an error rather than falling through to a stale internal copy. Mixed-source selection/dragging between compositions is not supported.
 The same source used at different times has one shared selection, but each instance displays its
 own evaluated values.
 
@@ -67,3 +66,9 @@ Clippy passed. The focused `wasm32-unknown-unknown` render/engine/UI check also 
 in unchanged GPU/readback, frames, pointer-wrap and zero-copy code. Formatting and diff checks passed.
 Tests were compiled, not executed, under the daytime policy. No full CI, native application rebuild,
 restart, upstream push or PR was performed; native/browser runtime acceptance remains pending.
+
+## Graph and clipboard follow-up (2026-10-14)
+
+The original implementation's graph/clipboard restrictions are removed. UI source scopes reuse the normal menu dispatcher so native-rich/SVG recognition, keyframe dialogs and clipboard feedback follow the same routes as ordinary editing. Document commands continue through `comp.inlineEdit` for atomic history and path validation; a scoped UI guard restores the parent cursor even on an unexpected UI error.
+
+Added synthetic regressions cover repeated-instance copy/cut/paste and undo, source-time key paste with reverse stretch, fake rich clipboard and malformed-data precedence, source graph view isolation, source dialogs and locked/deleted instances, and affine/remapped J/K navigation. Tests are compiled only under the daytime policy; native interaction QA remains pending.

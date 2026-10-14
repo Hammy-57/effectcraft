@@ -55,12 +55,35 @@ pub fn context(s: &Session, root: ItemId, path: &[u64], time: Tick) -> Result<Co
     Ok(result)
 }
 
-fn run(s: &mut Session, p: &Value) -> Result<Value> {
-    let command = str_p(p, "command").ok_or_else(|| bad("comp.inlineEdit", "missing command"))?;
-    // Only local, synchronous edits. No scripts, IO, nested dispatch, dialogs or active-comp changes.
-    if !matches!(
+/// Synchronous source edits supported by the inline cursor (including its graph and clipboard).
+pub fn supported(command: &str) -> bool {
+    matches!(
         command,
-        "edit.clear"
+        "edit.copy"
+            | "edit.cut"
+            | "edit.paste"
+            | "edit.pasteSvg"
+            | "edit.pasteFigCraft"
+            | "edit.copyWithPropertyLinks"
+            | "edit.copyWithRelativePropertyLinks"
+            | "edit.copyExpressionOnly"
+            | "edit.pasteReversedKeyframes"
+            | "edit.selectAll"
+            | "edit.deselectAll"
+            | "keys.copy"
+            | "keys.paste"
+            | "keys.selectAll"
+            | "keys.set"
+            | "keys.setEase"
+            | "keys.transform"
+            | "keys.velocity"
+            | "keys.interpolation"
+            | "keys.toggleTransform"
+            | "keys.setLabel"
+            | "keys.timeReverse"
+            | "prop.separateDimensions"
+            | "prop.graphPin"
+            | "edit.clear"
             | "edit.duplicate"
             | "layer.select"
             | "layer.rename"
@@ -87,7 +110,12 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
             | "keys.easyEase"
             | "keys.easyEaseIn"
             | "keys.easyEaseOut"
-    ) {
+    )
+}
+
+fn run(s: &mut Session, p: &Value) -> Result<Value> {
+    let command = str_p(p, "command").ok_or_else(|| bad("comp.inlineEdit", "missing command"))?;
+    if !supported(command) {
         return Err(bad("comp.inlineEdit", "this command is not supported for inline editing"));
     }
     let root = s.resolve_comp(p.get("root"))?;
@@ -96,14 +124,24 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad("comp.inlineEdit", "instance path is too deep"));
     }
     let path: Vec<u64> = path.iter().map(|v| v.as_u64().ok_or_else(|| bad("comp.inlineEdit", "invalid instance layer id"))).collect::<Result<_>>()?;
-    let context = context(s, root, &path, s.time_of(root))?;
+    let mut context = context(s, root, &path, s.time_of(root))?;
+    if let Some(value) = p.get("sourceTime") {
+        let seconds = value.as_f64().filter(|t| t.is_finite()).ok_or_else(|| bad("comp.inlineEdit", "sourceTime must be finite source-comp seconds"))?;
+        context.time = Tick::from_seconds_f64(seconds);
+    }
     if context.locked {
         return Err(bad("comp.inlineEdit", "a containing precomp layer is locked"));
     }
     let mut params = p.get("params").cloned().unwrap_or_else(|| json!({}));
     let obj = params.as_object_mut().ok_or_else(|| bad("comp.inlineEdit", "params must be an object"))?;
-    if obj.contains_key("client") || obj.contains_key("comp") {
+    if obj.contains_key("client") || obj.get("comp").is_some_and(|comp| comp.as_u64() != Some(context.comp.0)) {
         return Err(bad("comp.inlineEdit", "inline command targets are determined by the instance path"));
+    }
+    if command == "edit.pasteFigCraft" {
+        if obj.get("target").and_then(Value::as_str).is_some_and(|target| !matches!(target, "auto" | "activeComp")) {
+            return Err(bad("comp.inlineEdit", "inline paste must target the source composition"));
+        }
+        obj.insert("target".into(), json!("activeComp"));
     }
     obj.insert("comp".into(), json!(context.comp.0));
     if let Some(Value::String(merge)) = obj.get_mut("merge") {
@@ -182,7 +220,7 @@ pub fn specs() -> Vec<CommandSpec> {
         "Edit Nested Composition Inline",
         [],
         None,
-        "{root? (parent comp), path: [precomp layer ids], command, params?} → execute once in nested source time; preserve parent viewer and per-comp selections",
+        "{root? (parent comp), path: [precomp layer ids], command, params?, sourceTime? (source-comp seconds, e.g. a dialog opened earlier)} → execute once in nested source time; preserve parent viewer and per-comp selections",
         always,
         run
     )]

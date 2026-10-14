@@ -1249,9 +1249,29 @@ pub(crate) fn inline_enabled(app: &EffectcraftApp, id: &str) -> Option<bool> {
     inline::enabled(app, id)
 }
 
-/// Route selection-sensitive menu/keyboard actions to the focused nested source.
-pub(crate) fn inline_target(app: &mut EffectcraftApp, id: &str, params: &serde_json::Value) -> Result<Option<serde_json::Value>, String> {
-    inline::target(app, id, params)
+pub(crate) fn invoke_inline(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: &serde_json::Value) -> Option<Result<serde_json::Value, String>> {
+    inline::invoke(app, ctx, id, params)
+}
+pub(crate) fn inline_engine_target(app: &EffectcraftApp, id: &str, params: &serde_json::Value) -> Option<serde_json::Value> {
+    inline::engine_target(app, id, params)
+}
+pub(crate) fn show_inline_dialog(app: &mut EffectcraftApp, ctx: &egui::Context) -> bool {
+    if app.ui.timeline.inline_dispatch.is_some() {
+        return false;
+    }
+    let Some(scope) = app.ui.timeline.inline_dialog.clone() else { return false };
+    if app.dialog.is_none() {
+        app.ui.timeline.inline_dialog = None;
+        return false;
+    }
+    if let Err(error) = inline::with_scope(app, &scope, |app| super::dialogs::show(app, ctx)) {
+        app.ui.status = error;
+        app.dialog = None;
+    }
+    if app.dialog.is_none() {
+        app.ui.timeline.inline_dialog = None;
+    }
+    true
 }
 
 pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
@@ -1809,7 +1829,9 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         }
         if !crate::widgets::any_menu_open(ui.ctx())
             && !egui::Popup::is_any_open(ui.ctx())
-            && ui.input(|i| i.pointer.any_pressed() && i.pointer.interact_pos().is_some_and(|p| r.intersect(rows_rect).contains(p)))
+            && ui.input(|i| {
+                i.pointer.any_pressed() && i.pointer.interact_pos().is_some_and(|p| r.intersect(rows_rect).contains(p) && (!graph_on || p.x < graph_x0))
+            })
         {
             inline::clear_focus(app);
         }
@@ -2978,7 +3000,12 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         super::graph_tools::alt_scale_update(app, &ctx, &c, tm, &mut actions);
     }
     // Graph editor.
-    if graph_on {
+    let inline_graph = if graph_on { inline::show_graph(app, ui, &gp, Rect::from_min_max(pos2(graph_x0, rows_rect.min.y), rows_rect.max)) } else { None };
+    if graph_on && inline_graph.is_none() {
+        if app.ui.timeline.inline_graph_active.take().is_some() {
+            super::graph::reset_context(&ctx);
+            app.session.history.merge_key = None;
+        }
         super::graph::show(app, ui, &gp, &comp, &ectx, tm, Rect::from_min_max(pos2(graph_x0, rows_rect.min.y), rows_rect.max), &mut actions);
     }
     // A plain click on empty track area (beside a layer's bar, on a property row's empty span or
@@ -3104,7 +3131,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     // CTI.
     let cx = tm.x(time.seconds());
     if cx >= graph_x0 && cx <= rect.max.x {
-        p.line_segment([pos2(cx, ruler.min.y + 12.0), pos2(cx, rows_rect.max.y)], Stroke::new(1.0, t.cti));
+        p.line_segment([pos2(cx, ruler.min.y + 12.0), pos2(cx, if inline_graph.is_some() { ruler.max.y } else { rows_rect.max.y })], Stroke::new(1.0, t.cti));
         let head = vec![
             pos2(cx - 6.0, ruler.min.y + 12.0),
             pos2(cx + 6.0, ruler.min.y + 12.0),
@@ -3154,64 +3181,75 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         Tokens::ui(11.0),
         t.text_faint,
     );
-    // Zoom slider.
-    let zs = Rect::from_min_max(pos2(graph_x0 + 30.0, footer.center().y - 2.0), pos2((graph_x0 + 230.0).min(rect.max.x - 30.0), footer.center().y + 2.0));
-    // Zoom out / zoom in buttons either side of the slider: the `-` / `=` steps. Everything here
-    // zooms around the CTI and sets the one time zoom the layer bars and the Graph Editor share.
-    let cti = time.seconds();
-    let cti_px = (cti - tm.start) * pps;
-    for (icon, size, cx, id, tip, k) in [
-        (Icon::MountainSmall, 14.0, zs.min.x - 14.0, "timeline.zoomOutButton", "Zoom Out (Time)", 1.0 / ZOOM_STEP),
-        (Icon::MountainLarge, 16.0, zs.max.x + 14.0, "timeline.zoomInButton", "Zoom In (Time)", ZOOM_STEP),
-    ] {
-        let r = Rect::from_center_size(pos2(cx, footer.center().y), vec2(20.0, 20.0));
-        let resp = ui.interact(r, egui::Id::new(id), Sense::click()).on_hover_text(crate::i18n::tr(tip));
-        icons::paint(&p, Rect::from_center_size(r.center(), vec2(size, size)), icon, if resp.hovered() { t.text } else { t.text_dim });
-        app.auto.add(id, r, tip);
-        // One step on press; held past ZOOM_HOLD_DELAY it keeps zooming, ZOOM_HOLD_RATE steps a
-        // second, scaled by the frame time. `hold` keeps (press time, last zoom time) while down.
-        let hold = egui::Id::new(id).with("hold");
-        let now = ui.input(|i| i.time);
-        let held: Option<(f64, f64)> = ui.data(|d| d.get_temp(hold));
-        // egui stops treating a long press as a potential click (~0.8 s), so a hold that has
-        // started continues for as long as the primary button stays down.
-        if resp.is_pointer_button_down_on() || (held.is_some() && ui.input(|i| i.pointer.primary_down())) {
-            let factor = match held {
-                None => Some(k),
-                Some((start, last)) if now - start >= ZOOM_HOLD_DELAY => Some(k.powf(((now - last) * ZOOM_HOLD_RATE).clamp(0.0, 1.0))),
-                Some(_) => None,
-            };
-            if let Some(f) = factor {
-                set_zoom(&mut app.ui.timeline, &comp, pps * f, fit_pps, cti, cti_px);
+    {
+        let comp = inline_graph.as_ref().map(|graph| graph.comp.clone()).unwrap_or_else(|| comp.clone());
+        let time = inline_graph.as_ref().map(|graph| graph.time).unwrap_or(time);
+        let tm = inline_graph.as_ref().map(|graph| graph.tm).unwrap_or(tm);
+        let pps = tm.pps;
+        let fit_pps = inline_graph.as_ref().map(|graph| super::timeline::fit_pps(graph_rect.width(), &graph.comp)).unwrap_or(fit_pps);
+        // Zoom slider.
+        let zs = Rect::from_min_max(pos2(graph_x0 + 30.0, footer.center().y - 2.0), pos2((graph_x0 + 230.0).min(rect.max.x - 30.0), footer.center().y + 2.0));
+        // Zoom out / zoom in buttons either side of the slider: the `-` / `=` steps. Everything here
+        // zooms around the CTI and sets the one time zoom the layer bars and the Graph Editor share.
+        let cti = time.seconds();
+        let cti_px = (cti - tm.start) * pps;
+        for (icon, size, cx, id, tip, k) in [
+            (Icon::MountainSmall, 14.0, zs.min.x - 14.0, "timeline.zoomOutButton", "Zoom Out (Time)", 1.0 / ZOOM_STEP),
+            (Icon::MountainLarge, 16.0, zs.max.x + 14.0, "timeline.zoomInButton", "Zoom In (Time)", ZOOM_STEP),
+        ] {
+            let r = Rect::from_center_size(pos2(cx, footer.center().y), vec2(20.0, 20.0));
+            let resp = ui.interact(r, egui::Id::new(id), Sense::click()).on_hover_text(crate::i18n::tr(tip));
+            icons::paint(&p, Rect::from_center_size(r.center(), vec2(size, size)), icon, if resp.hovered() { t.text } else { t.text_dim });
+            app.auto.add(id, r, tip);
+            // One step on press; held past ZOOM_HOLD_DELAY it keeps zooming, ZOOM_HOLD_RATE steps a
+            // second, scaled by the frame time. `hold` keeps (press time, last zoom time) while down.
+            let hold = egui::Id::new(id).with("hold");
+            let now = ui.input(|i| i.time);
+            let held: Option<(f64, f64)> = ui.data(|d| d.get_temp(hold));
+            // egui stops treating a long press as a potential click (~0.8 s), so a hold that has
+            // started continues for as long as the primary button stays down.
+            if resp.is_pointer_button_down_on() || (held.is_some() && ui.input(|i| i.pointer.primary_down())) {
+                let factor = match held {
+                    None => Some(k),
+                    Some((start, last)) if now - start >= ZOOM_HOLD_DELAY => Some(k.powf(((now - last) * ZOOM_HOLD_RATE).clamp(0.0, 1.0))),
+                    Some(_) => None,
+                };
+                if let Some(f) = factor {
+                    set_zoom(&mut app.ui.timeline, &comp, pps * f, fit_pps, cti, cti_px);
+                }
+                let start = held.map_or(now, |(s, _)| s);
+                ui.data_mut(|d| d.insert_temp(hold, (start, now)));
+                ui.ctx().request_repaint();
+            } else if held.is_some() {
+                ui.data_mut(|d| d.remove::<(f64, f64)>(hold));
+            } else if resp.clicked() {
+                // Pressed and released within one frame (scripted clicks): one step.
+                set_zoom(&mut app.ui.timeline, &comp, pps * k, fit_pps, cti, cti_px);
             }
-            let start = held.map_or(now, |(s, _)| s);
-            ui.data_mut(|d| d.insert_temp(hold, (start, now)));
-            ui.ctx().request_repaint();
-        } else if held.is_some() {
-            ui.data_mut(|d| d.remove::<(f64, f64)>(hold));
-        } else if resp.clicked() {
-            // Pressed and released within one frame (scripted clicks): one step.
-            set_zoom(&mut app.ui.timeline, &comp, pps * k, fit_pps, cti, cti_px);
+        }
+        p.rect_filled(zs, 2.0, t.field_bg);
+        let maxpps = MAX_PPS.max(fit_pps * 1.001);
+        let frac = ((pps / fit_pps).ln() / (maxpps / fit_pps).ln()).clamp(0.0, 1.0) as f32;
+        let knob = pos2(zs.min.x + zs.width() * frac, zs.center().y);
+        p.circle_filled(knob, 6.0, t.text);
+        // Drag the knob, or click the track to jump there.
+        let zresp = ui.interact(zs.expand2(vec2(6.0, 8.0)), egui::Id::new("tl-zoom"), Sense::click_and_drag());
+        app.auto.add("timeline.zoomSlider", zs, "Zoom");
+        if (zresp.dragged() || zresp.clicked())
+            && let Some(pt) = zresp.interact_pointer_pos()
+        {
+            let f = ((pt.x - zs.min.x) / zs.width().max(1.0)).clamp(0.0, 1.0) as f64;
+            set_zoom(&mut app.ui.timeline, &comp, fit_pps * (maxpps / fit_pps).powf(f), fit_pps, cti, cti_px);
         }
     }
-    p.rect_filled(zs, 2.0, t.field_bg);
-    let maxpps = MAX_PPS.max(fit_pps * 1.001);
-    let frac = ((pps / fit_pps).ln() / (maxpps / fit_pps).ln()).clamp(0.0, 1.0) as f32;
-    let knob = pos2(zs.min.x + zs.width() * frac, zs.center().y);
-    p.circle_filled(knob, 6.0, t.text);
-    // Drag the knob, or click the track to jump there.
-    let zresp = ui.interact(zs.expand2(vec2(6.0, 8.0)), egui::Id::new("tl-zoom"), Sense::click_and_drag());
-    app.auto.add("timeline.zoomSlider", zs, "Zoom");
-    if (zresp.dragged() || zresp.clicked())
-        && let Some(pt) = zresp.interact_pointer_pos()
-    {
-        let f = ((pt.x - zs.min.x) / zs.width().max(1.0)).clamp(0.0, 1.0) as f64;
-        set_zoom(&mut app.ui.timeline, &comp, fit_pps * (maxpps / fit_pps).powf(f), fit_pps, cti, cti_px);
+    let source_graph_on = inline_graph.is_some();
+    if let Some(layout) = inline_graph {
+        inline::finish_graph(app, layout);
     }
 
     // Composition markers in the ruler; protected regions shade the layer rows.
     let mstrip = Rect::from_min_max(pos2(graph_x0, ruler.max.y - 12.0), pos2(bin.min.x, ruler.max.y));
-    let mrows = rows_rect.intersect(Rect::from_min_max(pos2(graph_x0, rows_rect.min.y), rows_rect.max));
+    let mrows = if source_graph_on { Rect::NOTHING } else { rows_rect.intersect(Rect::from_min_max(pos2(graph_x0, rows_rect.min.y), rows_rect.max)) };
     super::markers_ui::comp_markers(app, ui, &comp, tm, mstrip, mrows);
     super::markers_ui::marker_bin(app, ui, &comp, tm, bin, mstrip);
 

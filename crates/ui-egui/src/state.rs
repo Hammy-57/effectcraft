@@ -344,6 +344,23 @@ pub enum ScrollTo {
     Layer,
 }
 
+#[derive(Clone, Debug)]
+pub struct InlineScope {
+    pub root: u64,
+    pub path: Vec<u64>,
+    /// Dialogs retain the source time at which they opened.
+    pub time: Option<effectcraft_engine::time::Tick>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct InlineGraphView {
+    pub auto_zoom: bool,
+    pub start: f64,
+    pub pps: Option<f64>,
+    pub range: Option<(f64, f64)>,
+    pub before_fit: Option<(f64, f64)>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TimelineState {
     /// Visible span start (seconds) and pixels per second; None = fit comp.
@@ -371,6 +388,14 @@ pub struct TimelineState {
     /// Source instance owning timeline keyboard actions; never persisted across sessions.
     #[serde(skip)]
     pub inline_focus: Option<Vec<u64>>,
+    #[serde(skip)]
+    pub inline_dispatch: Option<InlineScope>,
+    #[serde(skip)]
+    pub inline_dialog: Option<InlineScope>,
+    #[serde(default)]
+    pub inline_graph_views: BTreeMap<u64, InlineGraphView>,
+    #[serde(skip)]
+    pub inline_graph_active: Option<u64>,
     /// Parent selection hidden while a nested source owns timeline editing.
     #[serde(skip)]
     pub inline_parent_selection: Option<effectcraft_engine::CompSelection>,
@@ -480,6 +505,10 @@ impl Default for TimelineState {
             open_layers: BTreeSet::new(),
             inline_precomps: BTreeSet::new(),
             inline_focus: None,
+            inline_dispatch: None,
+            inline_dialog: None,
+            inline_graph_views: BTreeMap::new(),
+            inline_graph_active: None,
             inline_parent_selection: None,
             inline_parent_text_edit: None,
             open_groups: BTreeSet::new(),

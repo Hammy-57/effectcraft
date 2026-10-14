@@ -82,7 +82,7 @@ fn speed_graph(app: &EffectcraftApp, comp: &Comp) -> bool {
     }
 }
 
-fn shown_props(app: &EffectcraftApp, comp: &Comp) -> Vec<(LayerId, u64)> {
+pub(crate) fn shown_props(app: &EffectcraftApp, comp: &Comp) -> Vec<(LayerId, u64)> {
     let st = &app.session.state;
     let numeric = |pr: &Property| !pr.value.components().is_empty() && pr.value.interpolates();
     // A selected keyframe counts as selecting its property and layer (as clicking a key does in
@@ -1654,6 +1654,30 @@ mod tests {
                 assert!(hi < 30.0, "result-only view retains existing fit behavior: {hi}");
             }
         }
+    }
+
+    #[test]
+    fn changing_graph_context_cancels_old_gestures_and_requests_fit() {
+        use super::*;
+        let ctx = egui::Context::default();
+        ctx.set_dragged_id(egui::Id::new("graph-bg"));
+        ctx.data_mut(|d| {
+            d.insert_temp(key_grab_id(), KeyGrab { press: Pos2::ZERO, t: 1.0, v: 2.0, value_per_pixel: 1.0 });
+            d.insert_temp(handle_drag_id(), (Pos2::ZERO, Vec::<HandleGrab>::new(), 1.0, 100.0));
+            d.insert_temp(egui::Id::new("graph-box"), Rect::EVERYTHING);
+            d.insert_temp(egui::Id::new("graph-dragging"), true);
+            d.insert_temp(egui::Id::new("graph-pan"), true);
+        });
+        reset_context(&ctx);
+        assert!(ctx.dragged_id().is_none());
+        ctx.data(|d| {
+            assert_eq!(d.get_temp::<bool>(fit_pending_id()), Some(true));
+            assert!(d.get_temp::<KeyGrab>(key_grab_id()).is_none());
+            assert!(d.get_temp::<HandleDrag>(handle_drag_id()).is_none());
+            assert!(d.get_temp::<Rect>(egui::Id::new("graph-box")).is_none());
+            assert!(d.get_temp::<bool>(egui::Id::new("graph-dragging")).is_none());
+            assert!(d.get_temp::<bool>(egui::Id::new("graph-pan")).is_none());
+        });
     }
 
     #[test]

@@ -906,7 +906,7 @@ pub fn show_form(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
     if ok || enter {
         app.dialog = None;
         let params = f.params();
-        if let Err(e) = app.session.execute(&f.command, params) {
+        if let Err(e) = crate::menus::run_engine(app, ctx, &f.command, params) {
             app.ui.status = e.to_string();
         }
         return;

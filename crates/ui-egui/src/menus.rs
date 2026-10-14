@@ -194,8 +194,8 @@ fn only_comp(p: &Value) -> Option<effectcraft_engine::project::ItemId> {
 
 /// Execute a UI or engine command by id.
 pub fn invoke(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: Value) -> Result<Value, String> {
-    if let Some(nested) = crate::panels::timeline::inline_target(app, id, &params)? {
-        return run_engine(app, ctx, "comp.inlineEdit", nested);
+    if let Some(result) = crate::panels::timeline::invoke_inline(app, ctx, id, &params) {
+        return result;
     }
     if id == "effects.copyPresetsFolderPath" {
         return frontend(app, ctx, id, params);
@@ -377,7 +377,11 @@ fn clipboard_note(s: &effectcraft_engine::Session) -> String {
 pub(crate) fn run_engine(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: Value) -> Result<Value, String> {
     // Events already queued belong to earlier invocations (`engine.execute` defers them).
     let queued = app.session.events.len();
-    let mut r = app.session.execute(id, params).map_err(|e| e.to_string());
+    let mut r = match crate::panels::timeline::inline_engine_target(app, id, &params) {
+        Some(nested) => app.session.execute("comp.inlineEdit", nested),
+        None => app.session.execute(id, params),
+    }
+    .map_err(|e| e.to_string());
     if let Err(e) = &r {
         app.ui.status = e.clone();
     } else if COPY_COMMANDS.contains(&id) && app.session.state.text_edit.is_none() {
