@@ -1691,9 +1691,12 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 let src = h.l2c.apply(gv2(h.vertex[0], h.vertex[1]));
                 Gesture::Vertices { start: map.to_comp(press), src: [src.x, src.y], applied: [0.0; 2], layer: h.layer }
             }),
-            // Active paths own empty-area drags even over full-frame artwork. Alt keeps layer dragging available.
+            // Masks and explicitly selected shape vertices own interior marquees; merely showing a shape path must not block layer movement.
             Tool::Selection
-                if !mods.alt && vertex_hits.iter().any(|h| h.tangent.is_none()) && !handle_hits.iter().any(|(_, _, h, _)| h.distance(press) < HANDLE + 2.0) =>
+                if !mods.alt
+                    && paths.iter().any(|p| p.is_mask || app.session.state.selected_vertices.iter().any(|v| v.layer == p.layer && v.mask == p.uid))
+                    && vertex_hits.iter().any(|h| h.tangent.is_none())
+                    && !handle_hits.iter().any(|(_, _, h, _)| h.distance(press) < HANDLE + 2.0) =>
             {
                 Some(Gesture::Marquee { start: press })
             }

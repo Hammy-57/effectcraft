@@ -5,9 +5,12 @@ it does not add arbitrary render-stage ordering or per-item preview/render modes
 
 ## Mask and shape editing
 
-- With editable path vertices showing, an empty-area Selection-tool drag selects vertices even
-  over a full-frame layer. Shift adds points; an empty non-Shift marquee clears point selection.
-  Alt-drag remains available for moving the layer; vertex and transform-handle hits retain priority.
+- Selecting a shape layer shows its paths without entering vertex-edit mode: dragging its interior
+  moves layer Position, as for other layers. A direct vertex/tangent drag still edits the path.
+- Masks, and shape paths with explicitly selected vertices, keep interior Selection-tool marquees
+  even over full-frame artwork. Blank-area marquees also select visible vertices. Shift adds points;
+  an empty non-Shift marquee clears point selection. Alt-drag remains available for moving the
+  layer; vertex and transform-handle hits retain priority.
 - Arrow/Shift-arrow nudges selected vertices at the current viewer magnification before nudging
   layers. Each nudge is undoable. Multi-path drags convert each selected point's displacement through
   that path's own transform, including 3D perspective; they do not reuse the grabbed path's scale.
@@ -56,7 +59,9 @@ preview window is separate from dedicated video-output hardware support.
 
 Written coverage includes:
 
-- Full-frame marquee and vertex nudge without moving the layer; locked masks have no edit targets.
+- Shape interior drag changes Position with one-step Undo while preserving path geometry; direct
+  vertex drags and explicit vertex marquees preserve layer Position.
+- Full-frame mask marquee and vertex nudge without moving the layer; locked masks have no edit targets.
 - Held edge-drag auto-pan stops on release.
 - Differently scaled layers and a tilted 3D mask move by equal screen distances, even with a stale
   last-painted camera.
@@ -79,3 +84,22 @@ Clippy passed. The focused `wasm32-unknown-unknown` render/engine/UI check also 
 in unchanged GPU/readback, frames, pointer-wrap and zero-copy code. Formatting and diff checks passed.
 Tests were compiled, not executed, under the daytime policy. No full CI, native application rebuild,
 restart, upstream push or PR was performed; native/browser runtime acceptance remains pending.
+
+## Shape interior dragging follow-up — 2026-10-14
+
+The Selection tool distinguishes visible shape paths from explicitly selected shape vertices.
+This prevents a layer selected in the Timeline, including pasted vector artwork, from silently
+entering marquee mode when its interior is dragged. The existing movement command updates
+Position and groups a drag into one Undo step. Vertex/tangent hits, mask marquees and explicit
+shape-vertex marquees keep their existing priority.
+
+Scoped UI all-targets `cargo check` and strict Clippy passed; formatting and diff checks passed.
+The synthetic regression was compiled, not executed, under the fork's daytime policy.
+Native verification used an isolated copy of a local project containing an imported vector layer.
+In the prior application build, an interior drag of 80 × 60 composition pixels left Position
+unchanged. In the updated build, the same drag changed Position by exactly [80, 60, 0],
+left Anchor Point unchanged, and one Undo restored the original Position. Before/after
+screenshots were inspected. A direct vertex drag then moved only the grabbed vertex by [20, 20],
+with other vertices and layer Position unchanged; saved before/after projects verified the geometry.
+Private project data and screenshots remain local, outside commits.
+No parity estimate is raised.
