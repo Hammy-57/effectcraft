@@ -178,7 +178,7 @@ pub fn velocity(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
             params["outSpeed"] = json!(d.out_speed);
             params["outInfluence"] = json!(d.out_inf);
         }
-        if let Err(e) = app.session.execute("keys.velocity", params) {
+        if let Err(e) = crate::menus::run_engine(app, ctx, "keys.velocity", params) {
             app.ui.status = e.to_string();
         }
         cancel = true;
@@ -232,7 +232,7 @@ pub fn interpolation(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) 
             params["roving"] = json!(d.roving == 2);
         }
         if params.as_object().is_some_and(|m| !m.is_empty())
-            && let Err(e) = app.session.execute("keys.interpolation", params)
+            && let Err(e) = crate::menus::run_engine(app, ctx, "keys.interpolation", params)
         {
             app.ui.status = e.to_string();
         }

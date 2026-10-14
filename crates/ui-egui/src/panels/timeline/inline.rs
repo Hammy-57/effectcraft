@@ -114,7 +114,10 @@ pub(super) fn show(
     let Some(layer) = super::super::layer_arc(&comp, n.row.layer) else { return };
     if !crate::widgets::any_menu_open(ui.ctx())
         && !egui::Popup::is_any_open(ui.ctx())
-        && ui.input(|i| i.pointer.any_pressed() && i.pointer.interact_pos().is_some_and(|p| r.intersect(left_clip.union(right_clip)).contains(p)))
+        && ui.input(|i| {
+            i.pointer.any_pressed()
+                && i.pointer.interact_pos().is_some_and(|p| r.intersect(left_clip.union(right_clip)).contains(p) && (!graph_on || p.x < right_clip.min.x))
+        })
     {
         focus(app, n.root, &n.path);
     }
@@ -358,14 +361,8 @@ pub(super) fn show(
         }
         if id == "prop.editGradient" {
             params["comp"] = json!(n.context.comp.0);
-            let previous = app.session.state.times.insert(n.context.comp, n.context.time);
-            let result = super::super::gradient_editor::open(app, &params);
-            if let Some(time) = previous {
-                app.session.state.times.insert(n.context.comp, time);
-            } else {
-                app.session.state.times.remove(&n.context.comp);
-            }
-            if let Err(error) = result {
+            let scope = crate::state::InlineScope { root: n.root.0, path: n.path.clone(), time: Some(n.context.time) };
+            if let Err(error) = with_scope(app, &scope, |app| super::super::gradient_editor::open(app, &params)).and_then(|result| result) {
                 app.ui.status = error;
             }
             continue;
@@ -498,62 +495,280 @@ pub(super) fn clear_focus(app: &mut EffectcraftApp) {
     }
 }
 
-/// Parent selection is parked while inline focus owns edits; unsupported actions never fall through.
-pub(super) fn target(app: &mut EffectcraftApp, id: &str, params: &serde_json::Value) -> Result<Option<serde_json::Value>, String> {
-    let Some(focus) = app.ui.timeline.inline_focus.clone() else { return Ok(None) };
-    if app.ui.focused != crate::dock::PanelKind::Timeline || focus.first().copied() != app.session.active_comp_id().map(|c| c.0) {
-        clear_focus(app);
-        return Ok(None);
-    }
-    if id == "comp.inlineEdit" || ["comp", "layer", "layers", "prop", "keys"].iter().any(|key| params.get(key).is_some()) {
-        return Ok(None);
-    }
-    let Some((&root, path)) = focus.split_first() else { return Ok(None) };
-    let selection_command = matches!(
-        id,
-        "edit.clear"
-            | "edit.duplicate"
-            | "keys.delete"
-            | "keys.easyEase"
-            | "keys.easyEaseIn"
-            | "keys.easyEaseOut"
-            | "keys.toggleHold"
-            | "prop.reset"
-            | "layer.setSwitch"
-    );
-    if selection_command {
-        return Ok(Some(json!({"root":root,"path":path,"command":id,"params":params})));
-    }
-    if matches!(id, "edit.cut" | "edit.copy" | "edit.paste" | "edit.selectAll" | "edit.deselectAll" | "timeline.graphEditor")
-        || ["layer.", "prop.", "keys.", "mask.", "shape.", "anim.", "timeline.reveal", "timeline.trim", "timeline.moveIn", "timeline.moveOut", "viewer.nudge"]
-            .iter()
-            .any(|prefix| id.starts_with(prefix))
-    {
-        return Err("This action needs the source composition open. Use the nested layer's context menu; the parent was not changed.".into());
-    }
-    Ok(None)
-}
-
-pub(super) fn enabled(app: &EffectcraftApp, id: &str) -> Option<bool> {
+/// The focused instance; explicit outer-comp targets must not be captured.
+fn current_scope(app: &EffectcraftApp) -> Option<crate::state::InlineScope> {
     if app.ui.focused != crate::dock::PanelKind::Timeline {
         return None;
     }
     let focus = app.ui.timeline.inline_focus.as_ref()?;
     let (&root, path) = focus.split_first()?;
-    if Some(root) != app.session.active_comp_id().map(|c| c.0) {
+    (Some(root) == app.session.active_comp_id().map(|id| id.0)).then(|| crate::state::InlineScope { root, path: path.to_vec(), time: None })
+}
+
+fn scoped_params(scope: &crate::state::InlineScope, id: &str, params: serde_json::Value) -> serde_json::Value {
+    let mut args = json!({"root":scope.root,"path":scope.path,"command":id,"params":params});
+    if let Some(time) = scope.time {
+        args["sourceTime"] = json!(time.seconds());
+    }
+    args
+}
+
+/// Keep UI dialogs, rich-clipboard dispatch and graph gestures in the same source cursor.
+pub(super) fn with_scope<R>(app: &mut EffectcraftApp, scope: &crate::state::InlineScope, run: impl FnOnce(&mut EffectcraftApp) -> R) -> Result<R, String> {
+    let mut context =
+        inline_comp::context(&app.session, ItemId(scope.root), &scope.path, app.session.time_of(ItemId(scope.root))).map_err(|e| e.to_string())?;
+    if let Some(time) = scope.time {
+        context.time = time;
+    }
+    let previous = app.session.state.active_comp;
+    let old_time = app.session.state.times.get(&context.comp).copied();
+    let track = app.session.state.current_track;
+    let text = app.session.state.text_edit.take();
+    let dispatch = app.ui.timeline.inline_dispatch.replace(scope.clone());
+    let old_dialog = app.dialog;
+    app.session.activate_comp(context.comp);
+    app.session.state.times.insert(context.comp, context.time);
+    let result = effectcraft_engine::guard::guarded("inline source UI", || Ok(run(app))).map_err(|error| error.to_string());
+    if old_dialog.is_none() && app.dialog.is_some() {
+        app.ui.timeline.inline_dialog = Some(crate::state::InlineScope { time: Some(context.time), ..scope.clone() });
+    }
+    match previous {
+        Some(id) => app.session.activate_comp(id),
+        None => app.session.activate_comp_none(),
+    }
+    match old_time {
+        Some(time) => {
+            app.session.state.times.insert(context.comp, time);
+        }
+        None => {
+            app.session.state.times.remove(&context.comp);
+        }
+    }
+    app.session.state.current_track = track;
+    app.session.state.text_edit = text;
+    app.ui.timeline.inline_dispatch = dispatch;
+    result
+}
+
+pub(super) fn invoke(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: &serde_json::Value) -> Option<Result<serde_json::Value, String>> {
+    if app.ui.timeline.inline_dispatch.is_some() || id == "comp.inlineEdit" {
         return None;
     }
-    let context = inline_comp::context(&app.session, ItemId(root), path, app.session.time_of(ItemId(root))).ok()?;
+    let scope = current_scope(app)?;
+    if params.get("comp").is_some() {
+        return None;
+    }
+    if matches!(id, "time.nextKey" | "time.previousKey") {
+        let navigation = (|| {
+            let context = inline_comp::context(&app.session, ItemId(scope.root), &scope.path, app.session.time_of(ItemId(scope.root)))
+                .map_err(|error| error.to_string())?;
+            let Some((offset, scale)) = context.affine else {
+                return Err(tr("Use the parent ruler to scrub a time-remapped instance; source keys remain editable.").into());
+            };
+            let source_time = with_scope(app, &scope, |app| {
+                let mut params = params.clone();
+                if app.ui.timeline.graph_editor
+                    && let Some(comp) = app.session.active_comp_arc()
+                {
+                    params["visible"] = json!(
+                        super::super::graph::shown_props(app, &comp).iter().map(|(layer, prop)| json!({"layer":layer.0,"prop":prop})).collect::<Vec<_>>()
+                    );
+                }
+                crate::menus::invoke(app, ctx, id, params).map(|_| app.session.time())
+            })??;
+            let target = offset + scale * source_time.seconds();
+            if !target.is_finite() {
+                return Err(tr("Invalid nested keyframe time").into());
+            }
+            crate::menus::run_engine(app, ctx, "time.set", json!({"time":target}))
+        })();
+        return Some(navigation);
+    }
+    let source_ui = id.starts_with("timeline.reveal") || id.starts_with("timeline.keyAt") || id == "anim.reveal";
+    let source_graph_zoom =
+        app.ui.timeline.graph_editor && matches!(id, "timeline.zoomIn" | "timeline.zoomOut" | "timeline.zoomFit" | "timeline.zoomFrameToggle");
+    if inline_comp::supported(id) || source_ui || source_graph_zoom {
+        return Some(
+            with_scope(app, &scope, |app| {
+                let view = source_graph_zoom.then(|| take_graph_view(app));
+                if source_graph_zoom {
+                    load_graph_view(app, app.session.active_comp_id().map(|c| c.0).unwrap_or(0));
+                }
+                let result = crate::menus::invoke(app, ctx, id, params.clone());
+                if let Some(view) = view {
+                    store_graph_view(app, app.session.active_comp_id().map(|c| c.0).unwrap_or(0));
+                    put_graph_view(app, view);
+                }
+                result
+            })
+            .and_then(|result| result),
+        );
+    }
+    // Graph mode is a panel preference; opening it leaves the root viewer active.
+    if id == "timeline.graphEditor" {
+        return None;
+    }
+    if ["layer.", "prop.", "keys.", "mask.", "shape.", "anim.", "timeline.trim", "timeline.moveIn", "timeline.moveOut", "viewer.nudge"]
+        .iter()
+        .any(|prefix| id.starts_with(prefix))
+        && ["layer", "layers", "prop", "keys"].iter().all(|key| params.get(key).is_none())
+    {
+        return Some(Err(tr("This action needs the source composition open; the parent was not changed.").into()));
+    }
+    None
+}
+
+pub(super) fn engine_target(app: &EffectcraftApp, id: &str, params: &serde_json::Value) -> Option<serde_json::Value> {
+    let scope = app.ui.timeline.inline_dispatch.as_ref()?;
+    inline_comp::supported(id).then(|| scoped_params(scope, id, params.clone()))
+}
+
+pub(super) fn enabled(app: &EffectcraftApp, id: &str) -> Option<bool> {
+    if app.ui.timeline.inline_dispatch.is_some() {
+        return None;
+    }
+    let scope = current_scope(app)?;
+    let context = inline_comp::context(&app.session, ItemId(scope.root), &scope.path, app.session.time_of(ItemId(scope.root))).ok()?;
     let selection = app.session.state.comp_selections.get(&context.comp).cloned().unwrap_or_default();
+    let st = &app.session.state;
     let selected = match id {
-        "edit.clear" => !selection.layers.is_empty() || !selection.props.is_empty() || !selection.keys.is_empty() || !selection.vertices.is_empty(),
+        "edit.clear" | "edit.copy" | "edit.cut" | "edit.copyWithPropertyLinks" | "edit.copyWithRelativePropertyLinks" | "edit.copyExpressionOnly" => {
+            !selection.layers.is_empty() || !selection.props.is_empty() || !selection.keys.is_empty()
+        }
         "edit.duplicate" | "layer.setSwitch" => !selection.layers.is_empty(),
-        "keys.delete" | "keys.easyEase" | "keys.easyEaseIn" | "keys.easyEaseOut" | "keys.toggleHold" => !selection.keys.is_empty(),
+        "keys.copy" | "keys.delete" | "keys.easyEase" | "keys.easyEaseIn" | "keys.easyEaseOut" | "keys.toggleHold" | "keys.interpolation" | "keys.velocity" => {
+            !selection.keys.is_empty()
+        }
+        "edit.paste" => {
+            !st.clipboard.is_empty()
+                || !st.key_clipboard.is_empty()
+                || !st.value_clipboard.is_empty()
+                || !st.effect_clipboard.is_empty()
+                || !st.contents_clipboard.is_empty()
+                || st.link_clipboard.is_some()
+                || app
+                    .hooks
+                    .clipboard_text
+                    .as_ref()
+                    .and_then(|read| read())
+                    .is_some_and(|text| effectcraft_engine::figma::clipboard::is_clipboard_text(&text) || effectcraft_engine::vector::is_svg_text(&text))
+        }
+        "keys.paste" => !st.key_clipboard.is_empty(),
+        "edit.selectAll" => app.session.project.comp(context.comp).is_some_and(|c| !c.layers.is_empty()),
+        "edit.deselectAll" => !selection.layers.is_empty() || !selection.props.is_empty() || !selection.keys.is_empty(),
         "prop.reset" => !selection.props.is_empty(),
-        "edit.cut" | "edit.copy" | "edit.paste" | "edit.selectAll" | "edit.deselectAll" => false,
         _ => return None,
     };
     Some(selected && !context.locked)
+}
+
+fn take_graph_view(app: &EffectcraftApp) -> crate::state::InlineGraphView {
+    let tl = &app.ui.timeline;
+    crate::state::InlineGraphView { start: tl.start, pps: tl.pps, range: tl.graph_range, before_fit: tl.before_fit, auto_zoom: tl.graph_auto_zoom }
+}
+fn put_graph_view(app: &mut EffectcraftApp, view: crate::state::InlineGraphView) {
+    let tl = &mut app.ui.timeline;
+    tl.start = view.start;
+    tl.pps = view.pps;
+    tl.graph_range = view.range;
+    tl.before_fit = view.before_fit;
+    tl.graph_auto_zoom = view.auto_zoom;
+}
+fn load_graph_view(app: &mut EffectcraftApp, comp: u64) {
+    let view = app.ui.timeline.inline_graph_views.get(&comp).cloned().unwrap_or(crate::state::InlineGraphView { auto_zoom: true, ..Default::default() });
+    put_graph_view(app, view);
+}
+fn store_graph_view(app: &mut EffectcraftApp, comp: u64) {
+    let view = take_graph_view(app);
+    app.ui.timeline.inline_graph_views.insert(comp, view);
+}
+
+pub(super) struct GraphLayout {
+    pub comp: std::sync::Arc<Comp>,
+    pub time: Tick,
+    pub tm: TMap,
+    restore: crate::state::InlineGraphView,
+    source: u64,
+}
+
+pub(super) fn finish_graph(app: &mut EffectcraftApp, layout: GraphLayout) {
+    store_graph_view(app, layout.source);
+    put_graph_view(app, layout.restore);
+}
+
+/// The parent ruler continues to scrub the parent. Source curves have their own labelled
+/// source-time ruler, so reverse stretch/remapping never inverts key edits or mislabels speed.
+pub(super) fn show_graph(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, area: Rect) -> Option<GraphLayout> {
+    let scope = current_scope(app)?;
+    let context = match inline_comp::context(&app.session, ItemId(scope.root), &scope.path, app.session.time_of(ItemId(scope.root))) {
+        Ok(context) => context,
+        Err(error) => {
+            app.ui.status = error.to_string();
+            return None;
+        }
+    };
+    let comp = app.session.project.comp_arc(context.comp)?;
+    let restore = take_graph_view(app);
+    load_graph_view(app, context.comp.0);
+    if app.ui.timeline.inline_graph_active != Some(context.comp.0) {
+        super::super::graph::reset_context(ui.ctx());
+        app.session.history.merge_key = None;
+        app.ui.timeline.inline_graph_active = Some(context.comp.0);
+    }
+    let fit = fit_pps(area.width(), &comp);
+    let tm = TMap { x0: area.min.x, start: app.ui.timeline.start, pps: app.ui.timeline.pps.unwrap_or(fit) };
+    let caption = Rect::from_min_max(area.min, pos2(area.max.x, area.min.y + 22.0));
+    let ruler = Rect::from_min_max(pos2(area.min.x, caption.max.y), pos2(area.max.x, caption.max.y + 20.0));
+    let graph = Rect::from_min_max(pos2(area.min.x, ruler.max.y), area.max);
+    let label = app.session.project.item(context.comp).map(|item| item.name.as_str()).unwrap_or("Source");
+    let title = crate::i18n::tr_args("Source graph: {} · {} s", &[&label, &format!("{:.3}", context.time.seconds())]);
+    p.rect_filled(caption, 0.0, app.tokens.panel_bg);
+    p.text(caption.left_center() + vec2(8.0, 0.0), Align2::LEFT_CENTER, &title, Tokens::ui(11.5), app.tokens.accent);
+    app.auto.add("timeline.inlineGraph.source", caption, &title);
+    p.rect_filled(ruler, 0.0, app.tokens.tl_ruler_bg);
+    for i in 0..=8 {
+        let x = ruler.min.x + ruler.width() * i as f32 / 8.0;
+        let seconds = tm.t(x);
+        p.line_segment([pos2(x, ruler.max.y - 5.0), pos2(x, ruler.max.y)], Stroke::new(1.0, app.tokens.text_faint));
+        p.text(pos2(x + 3.0, ruler.min.y + 8.0), Align2::LEFT_CENTER, format!("{seconds:.2}s"), Tokens::ui(10.0), app.tokens.text_dim);
+    }
+    let response = ui.interact(ruler, egui::Id::new("inline-graph-ruler"), Sense::click_and_drag());
+    app.auto.add("timeline.inlineGraph.ruler", ruler, &format!("{},{}", tm.start, tm.pps));
+    if (response.clicked() || response.dragged())
+        && let Some(pointer) = response.interact_pointer_pos()
+    {
+        if let Some((offset, scale)) = context.affine {
+            let source = comp.frame_rate.snap_nearest(Tick::from_seconds_f64(tm.t(pointer.x)));
+            app.session.set_time(Tick::from_seconds_f64(offset + scale * source.seconds()));
+        } else {
+            app.ui.status = tr("Use the parent ruler to scrub a time-remapped instance; source keys remain editable.").into();
+        }
+    }
+    let result = with_scope(app, &scope, |app| {
+        let project = app.session.project.clone();
+        let expr = app.session.expr.clone();
+        let mut eval = EvalCtx::new(&project, context.comp, &comp, context.time);
+        eval.expr = expr.as_deref();
+        let mut actions = vec![];
+        super::super::graph::show(app, ui, p, &comp, &eval, tm, graph, &mut actions);
+        for (id, params) in actions {
+            if id == "__endMerge" {
+                app.session.history.merge_key = None;
+                continue;
+            }
+            if let Err(error) = crate::menus::invoke(app, ui.ctx(), &id, params) {
+                app.ui.status = error;
+            }
+        }
+    });
+    if let Err(error) = result {
+        app.ui.status = error;
+    }
+    let x = tm.x(context.time.seconds());
+    if x.is_finite() && x >= area.min.x && x <= area.max.x {
+        p.line_segment([pos2(x, ruler.min.y), pos2(x, graph.max.y - 28.0)], Stroke::new(1.0, app.tokens.cti));
+    }
+    Some(GraphLayout { comp, time: context.time, tm, restore, source: context.comp.0 })
 }
 
 #[cfg(test)]
@@ -569,6 +784,186 @@ mod tests {
         let a = s.execute("layer.addItem", json!({"item":child.0})).unwrap()["layer"].as_u64().unwrap();
         let b = s.execute("layer.addItem", json!({"item":child.0})).unwrap()["layer"].as_u64().unwrap();
         (EffectcraftApp::new(s), root, child, leaf, a, b)
+    }
+
+    fn select_source(app: &mut EffectcraftApp, root: ItemId, leaf: u64, instance: u64) {
+        app.ui.focused = crate::dock::PanelKind::Timeline;
+        focus(app, root, &[instance]);
+        app.session.execute("comp.inlineEdit", json!({"root":root.0,"path":[instance],"command":"layer.select","params":{"layers":[leaf]}})).unwrap();
+    }
+
+    #[test]
+    fn inline_layer_copy_cut_paste_updates_shared_source_once_and_preserves_parent() {
+        let (mut app, root, child, leaf, a, b) = fixture();
+        let ctx = egui::Context::default();
+        select_source(&mut app, root, leaf, a);
+        crate::menus::invoke(&mut app, &ctx, "edit.copy", json!({})).unwrap();
+        assert_eq!(app.session.state.clipboard.len(), 1);
+        assert_eq!(app.session.state.clipboard[0].id, LayerId(leaf));
+        focus(&mut app, root, &[b]);
+        let undo = app.session.history.undo.len();
+        crate::menus::invoke(&mut app, &ctx, "edit.paste", json!({})).unwrap();
+        assert_eq!(app.session.history.undo.len(), undo + 1);
+        assert_eq!(app.session.project.comp(child).unwrap().layers.len(), 2);
+        assert_eq!(app.session.project.comp(root).unwrap().layers.len(), 2);
+        assert_eq!(app.session.active_comp_id(), Some(root));
+        let open = app.session.state.open_comps.clone();
+        crate::menus::invoke(&mut app, &ctx, "edit.cut", json!({})).unwrap();
+        assert_eq!(app.session.project.comp(child).unwrap().layers.len(), 1);
+        assert!(app.session.undo());
+        assert_eq!(app.session.project.comp(child).unwrap().layers.len(), 2);
+        assert_eq!(app.session.state.open_comps, open);
+        assert_eq!(app.session.active_comp_id(), Some(root));
+    }
+
+    #[test]
+    fn inline_key_clipboard_uses_instance_source_time_with_reverse_stretch() {
+        let (mut app, root, child, leaf, a, _) = fixture();
+        app.session.execute("prop.addKey", json!({"comp":child.0,"layer":leaf,"path":"transform/opacity","time":1,"value":40})).unwrap();
+        let prop = app.session.project.comp(child).unwrap().layer(LayerId(leaf)).unwrap().props.prop("transform/opacity").unwrap().uid;
+        let instance = std::sync::Arc::make_mut(&mut app.session.project).comp_mut(root).unwrap().layer_mut(LayerId(a)).unwrap();
+        instance.start_time = Tick::from_seconds_f64(10.0);
+        instance.stretch = -200.0;
+        app.session.set_time(Tick::from_seconds_f64(4.0));
+        select_source(&mut app, root, leaf, a);
+        app.session
+            .execute(
+                "comp.inlineEdit",
+                json!({"path":[a],"command":"keys.select","params":{"keys":[{"layer":leaf,"prop":prop,"time":1}],"selectProperties":true}}),
+            )
+            .unwrap();
+        let ctx = egui::Context::default();
+        crate::menus::invoke(&mut app, &ctx, "edit.copy", json!({})).unwrap();
+        assert!(app.session.state.clip_is_keys);
+        crate::menus::invoke(&mut app, &ctx, "edit.paste", json!({})).unwrap();
+        let property = app.session.project.comp(child).unwrap().layer(LayerId(leaf)).unwrap().props.find(prop).unwrap();
+        // Fixture uses 29.97 fps; assert the destination's actual frame-snapped source time.
+        let source = inline_comp::context(&app.session, root, &[a], app.session.time()).unwrap().time;
+        assert!(property.keys.iter().any(|key| (key.time.seconds() - source.seconds()).abs() < 0.02));
+        assert_eq!(app.session.active_comp_id(), Some(root));
+        assert_eq!(app.session.project.comp(root).unwrap().layers.len(), 2);
+    }
+
+    fn rich_clipboard() -> String {
+        json!({"format":"figcraft.clipboard","version":1,"warnings":[],"nodes":[
+            {"id":"frame","type":"FRAME","name":"Card","size":{"x":100,"y":100},"absoluteTransform":[[1,0,0],[0,1,0]],"children":[
+            {"id":"rect","type":"RECTANGLE","name":"Imported","size":{"x":20,"y":20},"absoluteTransform":[[1,0,0],[0,1,0]],"fills":[{"type":"SOLID","color":{"r":1,"g":0,"b":0,"a":1}}]}]}]}).to_string()
+    }
+
+    #[test]
+    fn inline_rich_paste_uses_fake_clipboard_and_never_opens_a_new_composition() {
+        let (mut app, root, child, leaf, a, _) = fixture();
+        select_source(&mut app, root, leaf, a);
+        let ctx = egui::Context::default();
+        let open = app.session.state.open_comps.clone();
+        app.hooks.clipboard_text = Some(Box::new(|| Some(rich_clipboard())));
+        assert_eq!(enabled(&app, "edit.paste"), Some(true));
+        let undo = app.session.history.undo.len();
+        crate::menus::invoke(&mut app, &ctx, "edit.paste", json!({})).unwrap();
+        assert_eq!(app.session.history.undo.len(), undo + 1);
+        assert!(app.session.project.comp(child).unwrap().layers.iter().any(|l| l.name == "Imported"));
+        assert_eq!(app.session.project.comp(root).unwrap().layers.len(), 2);
+        assert_eq!(app.session.state.open_comps, open);
+        assert_eq!(app.session.active_comp_id(), Some(root));
+        crate::menus::invoke(&mut app, &ctx, "edit.copy", json!({})).unwrap();
+        app.hooks.clipboard_text = Some(Box::new(|| Some("{\"format\":\"figcraft.clipboard\",broken".into())));
+        let before = app.session.project.clone();
+        assert!(crate::menus::invoke(&mut app, &ctx, "edit.paste", json!({})).is_err());
+        assert!(app.session.project.same_content(&before));
+    }
+
+    #[test]
+    fn inline_key_navigation_maps_source_keys_back_to_parent_and_refuses_ambiguous_remap() {
+        let (mut app, root, child, leaf, a, _) = fixture();
+        app.session.execute("prop.addKey", json!({"comp":child.0,"layer":leaf,"path":"transform/opacity","time":1,"value":40})).unwrap();
+        app.session.execute("prop.addKey", json!({"comp":child.0,"layer":leaf,"path":"transform/opacity","time":3,"value":80})).unwrap();
+        let instance = std::sync::Arc::make_mut(&mut app.session.project).comp_mut(root).unwrap().layer_mut(LayerId(a)).unwrap();
+        instance.start_time = Tick::from_seconds_f64(1.0);
+        instance.stretch = 200.0;
+        app.session.set_time(Tick::from_seconds_f64(4.0));
+        select_source(&mut app, root, leaf, a);
+        app.ui.timeline.graph_editor = true;
+        let ctx = egui::Context::default();
+        crate::menus::invoke(&mut app, &ctx, "time.nextKey", json!({})).unwrap();
+        assert!((app.session.time().seconds() - 7.0).abs() < 0.05);
+        assert_eq!(app.session.active_comp_id(), Some(root));
+        crate::menus::invoke(&mut app, &ctx, "time.previousKey", json!({})).unwrap();
+        assert!((app.session.time().seconds() - 3.0).abs() < 0.05);
+        app.session.execute("layer.enableTimeRemap", json!({"layers":[a]})).unwrap();
+        let before = app.session.time();
+        assert!(crate::menus::invoke(&mut app, &ctx, "time.nextKey", json!({})).is_err());
+        assert_eq!(app.session.time(), before);
+    }
+
+    #[test]
+    fn source_modal_commit_revalidates_locked_and_deleted_instances() {
+        let (mut app, root, child, leaf, a, _) = fixture();
+        select_source(&mut app, root, leaf, a);
+        let scope = crate::state::InlineScope { root: root.0, path: vec![a], time: Some(Tick::ZERO) };
+        let ctx = egui::Context::default();
+        std::sync::Arc::make_mut(&mut app.session.project).comp_mut(root).unwrap().layer_mut(LayerId(a)).unwrap().switches.locked = true;
+        let before = app.session.project.clone();
+        let result = with_scope(&mut app, &scope, |app| {
+            crate::menus::run_engine(app, &ctx, "prop.set", json!({"comp":child.0,"layer":leaf,"path":"transform/opacity","value":20}))
+        });
+        assert!(result.unwrap().is_err());
+        assert!(app.session.project.same_content(&before));
+        std::sync::Arc::make_mut(&mut app.session.project).comp_mut(root).unwrap().layers.retain(|layer| layer.id != LayerId(a));
+        assert!(with_scope(&mut app, &scope, |_| ()).is_err());
+        assert_eq!(app.session.active_comp_id(), Some(root));
+    }
+
+    #[test]
+    fn inline_graph_dialogs_keep_source_keys_and_source_time_when_parent_scrubs() {
+        let (mut app, root, child, leaf, a, _) = fixture();
+        app.session.execute("prop.addKey", json!({"comp":child.0,"layer":leaf,"path":"transform/opacity","time":1,"value":40})).unwrap();
+        let prop = app.session.project.comp(child).unwrap().layer(LayerId(leaf)).unwrap().props.prop("transform/opacity").unwrap().uid;
+        select_source(&mut app, root, leaf, a);
+        app.session
+            .execute(
+                "comp.inlineEdit",
+                json!({"path":[a],"command":"keys.select","params":{"keys":[{"layer":leaf,"prop":prop,"time":1}],"selectProperties":true}}),
+            )
+            .unwrap();
+        let ctx = egui::Context::default();
+        crate::menus::invoke(&mut app, &ctx, "keys.velocity", json!({})).unwrap();
+        assert_eq!(app.dialog, Some(crate::Dialog::KeyVelocity));
+        let scope = app.ui.timeline.inline_dialog.clone().unwrap();
+        app.session.set_time(Tick::from_seconds_f64(5.0));
+        with_scope(&mut app, &scope, |app| crate::menus::run_engine(app, &ctx, "keys.interpolation", json!({"interpolation":"hold"}))).unwrap().unwrap();
+        let key = &app.session.project.comp(child).unwrap().layer(LayerId(leaf)).unwrap().props.find(prop).unwrap().keys[0];
+        assert_eq!(key.out_interp, Interp::Hold);
+        assert_eq!(app.session.active_comp_id(), Some(root));
+        app.dialog = None;
+        app.ui.timeline.inline_dialog = None;
+        crate::menus::invoke(&mut app, &ctx, "keys.set", json!({"layer":leaf,"prop":prop,"time":1})).unwrap();
+        assert_eq!(app.dialog, Some(crate::Dialog::Form));
+        assert_eq!(app.dialog_state.form.command, "keys.set");
+        assert_eq!(app.session.active_comp_id(), Some(root));
+    }
+
+    #[test]
+    fn graph_source_projection_and_zoom_leave_parent_view_and_cursor_intact() {
+        let (mut app, root, child, leaf, a, _) = fixture();
+        app.session.execute("prop.addKey", json!({"comp":child.0,"layer":leaf,"path":"transform/opacity","time":1,"value":40})).unwrap();
+        select_source(&mut app, root, leaf, a);
+        app.ui.timeline.graph_editor = true;
+        app.ui.timeline.start = 2.0;
+        app.ui.timeline.pps = Some(123.0);
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 400.0));
+            let p = ui.painter().clone();
+            let layout = show_graph(&mut app, ui, &p, rect).unwrap();
+            assert_eq!(layout.comp.layers.len(), 1);
+            assert!(app.auto.find("timeline.inlineGraph.source").is_some());
+            assert!(app.auto.find("timeline.graph").is_some());
+            finish_graph(&mut app, layout);
+        });
+        assert_eq!(app.session.active_comp_id(), Some(root));
+        assert_eq!(app.ui.timeline.start, 2.0);
+        assert_eq!(app.ui.timeline.pps, Some(123.0));
+        assert!(app.ui.timeline.inline_graph_views.contains_key(&child.0));
     }
 
     #[test]
@@ -622,7 +1017,7 @@ mod tests {
         app.ui.timeline.inline_focus = Some(instance_key(root, &[a]));
         app.session.execute("comp.inlineEdit", json!({"path":[a],"command":"layer.select","params":{"layers":[leaf]}})).unwrap();
         let ctx = egui::Context::default();
-        assert!(crate::menus::invoke(&mut app, &ctx, "edit.cut", json!({})).is_err());
+        assert!(crate::menus::invoke(&mut app, &ctx, "layer.precompose", json!({})).is_err());
         assert_eq!(app.session.project.comp(root).unwrap().layers.len(), 2);
         crate::menus::invoke(&mut app, &ctx, "edit.clear", json!({})).unwrap();
         assert_eq!(app.session.project.comp(root).unwrap().layers.len(), 2);

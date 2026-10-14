@@ -235,6 +235,9 @@ pub(crate) fn above_footer(ui: &mut egui::Ui, height: f32, footer: impl FnOnce(&
 }
 
 pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context) {
+    if super::timeline::show_inline_dialog(app, ctx) {
+        return;
+    }
     let Some(d) = app.dialog else { return };
     let t = app.tokens;
     match d {

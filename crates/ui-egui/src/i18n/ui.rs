@@ -87,6 +87,16 @@ pub(crate) fn tr_args(text: &str, args: &[&dyn Display]) -> String {
 
 /// Japanese: the same rows, in the same order, as the Chinese catalogs below (the tests keep the two in step).
 const JAPANESE: &[(&str, &str)] = &[
+    ("Invalid nested keyframe time", "ネストされたキーフレームの時刻が無効です"),
+    ("Source graph: {} · {} s", "ソースのグラフ: {} · {} 秒"),
+    (
+        "Use the parent ruler to scrub a time-remapped instance; source keys remain editable.",
+        "時間をリマップしたインスタンスのスクラブには親のルーラーを使ってください。ソースのキーフレームは編集できます。",
+    ),
+    (
+        "This action needs the source composition open; the parent was not changed.",
+        "この操作にはソースコンポジションを開く必要があります。親は変更されていません。",
+    ),
     ("Clear search and filters", "検索とフィルターをクリア"),
     ("Appearance Settings…", "外観設定…"),
     ("Add to favorites", "お気に入りに追加"),
@@ -638,6 +648,10 @@ const JAPANESE: &[(&str, &str)] = &[
 ];
 
 const SIMPLIFIED_CHINESE: &[(&str, &str)] = &[
+    ("Invalid nested keyframe time", "嵌套关键帧时间无效"),
+    ("Source graph: {} · {} s", "源图表：{} · {} 秒"),
+    ("Use the parent ruler to scrub a time-remapped instance; source keys remain editable.", "请使用父级标尺拖动时间重映射实例；源关键帧仍可编辑。"),
+    ("This action needs the source composition open; the parent was not changed.", "此操作需要打开源合成；父合成未更改。"),
     ("Clear search and filters", "清除搜索和筛选"),
     ("Agents", "智能体"),
     ("Control Channel Port", "控制通道端口"),
@@ -1395,6 +1409,10 @@ const SIMPLIFIED_CHINESE: &[(&str, &str)] = &[
 ];
 
 const TRADITIONAL_CHINESE: &[(&str, &str)] = &[
+    ("Invalid nested keyframe time", "巢狀關鍵影格時間無效"),
+    ("Source graph: {} · {} s", "來源圖表：{} · {} 秒"),
+    ("Use the parent ruler to scrub a time-remapped instance; source keys remain editable.", "請使用父層尺規拖曳時間重新對應實例；來源關鍵影格仍可編輯。"),
+    ("This action needs the source composition open; the parent was not changed.", "此操作需要開啟來源合成；父合成未變更。"),
     ("Clear search and filters", "清除搜尋與篩選"),
     ("Agents", "智慧代理"),
     ("Control Channel Port", "控制通道連接埠"),
@@ -2149,6 +2167,16 @@ const TRADITIONAL_CHINESE: &[(&str, &str)] = &[
 /// Ukrainian (uk): original translations of the same interface rows as the Chinese catalogs.
 /// Technical names, key names and substituted project content keep their original spelling.
 const UKRAINIAN: &[(&str, &str)] = &[
+    ("Invalid nested keyframe time", "Некоректний час вкладеного ключового кадру"),
+    ("Source graph: {} · {} s", "Графік джерела: {} · {} с"),
+    (
+        "Use the parent ruler to scrub a time-remapped instance; source keys remain editable.",
+        "Для переміщення в часі екземпляра зі зміною часу використовуйте шкалу батьківської композиції; ключі джерела можна редагувати.",
+    ),
+    (
+        "This action needs the source composition open; the parent was not changed.",
+        "Для цієї дії потрібно відкрити вихідну композицію; батьківську композицію не змінено.",
+    ),
     ("Clear search and filters", "Очистити пошук і фільтри"),
     ("Appearance Settings…", "Налаштування вигляду…"),
     ("Add to favorites", "Додати до вибраного"),
@@ -2716,6 +2744,16 @@ const UKRAINIAN: &[(&str, &str)] = &[
 
 // Brazilian Portuguese.
 const PORTUGUESE: &[(&str, &str)] = &[
+    ("Invalid nested keyframe time", "Tempo de quadro-chave aninhado inválido"),
+    ("Source graph: {} · {} s", "Gráfico de origem: {} · {} s"),
+    (
+        "Use the parent ruler to scrub a time-remapped instance; source keys remain editable.",
+        "Use a régua da composição principal para percorrer uma instância com tempo remapeado; os quadros-chave de origem continuam editáveis.",
+    ),
+    (
+        "This action needs the source composition open; the parent was not changed.",
+        "Esta ação exige abrir a composição de origem; a composição principal não foi alterada.",
+    ),
     ("Clear search and filters", "Limpar pesquisa e filtros"),
     ("   OK   ", "   OK   "),
     ("  Delete  ", "  Excluir  "),
@@ -3160,6 +3198,16 @@ const PORTUGUESE: &[(&str, &str)] = &[
 
 /// Czech (cs): original translations covering every row in the Chinese panel catalogs.
 const CZECH: &[(&str, &str)] = &[
+    ("Invalid nested keyframe time", "Neplatný čas vnořeného klíčového snímku"),
+    ("Source graph: {} · {} s", "Graf zdroje: {} · {} s"),
+    (
+        "Use the parent ruler to scrub a time-remapped instance; source keys remain editable.",
+        "Instanci s přemapovaným časem posouvejte pomocí pravítka nadřazené kompozice; klíčové snímky zdroje lze stále upravovat.",
+    ),
+    (
+        "This action needs the source composition open; the parent was not changed.",
+        "Tato akce vyžaduje otevřenou zdrojovou kompozici; nadřazená kompozice nebyla změněna.",
+    ),
     ("Clear search and filters", "Vymazat hledání a filtry"),
     ("   OK   ", "   OK   "),
     ("  Delete  ", "  Odstranit  "),
@@ -3707,6 +3755,16 @@ const CZECH: &[(&str, &str)] = &[
 /// order. Terms follow the Spanish menu catalog (composición, material de archivo, cola de procesamiento,
 /// ajuste preestablecido, método abreviado). Written from the English source.
 const SPANISH: &[(&str, &str)] = &[
+    ("Invalid nested keyframe time", "Tiempo de fotograma clave anidado no válido"),
+    ("Source graph: {} · {} s", "Gráfico de origen: {} · {} s"),
+    (
+        "Use the parent ruler to scrub a time-remapped instance; source keys remain editable.",
+        "Usa la regla de la composición principal para recorrer una instancia con tiempo remapeado; los fotogramas clave de origen siguen siendo editables.",
+    ),
+    (
+        "This action needs the source composition open; the parent was not changed.",
+        "Esta acción requiere abrir la composición de origen; la composición principal no se ha modificado.",
+    ),
     ("Clear search and filters", "Borrar búsqueda y filtros"),
     ("Appearance Settings…", "Ajustes de apariencia…"),
     ("Add to favorites", "Añadir a favoritos"),
