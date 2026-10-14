@@ -1191,6 +1191,23 @@ fn fit_pending_id() -> egui::Id {
     egui::Id::new("graph-fit-pending")
 }
 
+/// A graph now targets another composition: no gesture may continue editing the previous one.
+pub(crate) fn reset_context(ctx: &egui::Context) {
+    ctx.stop_dragging();
+    ctx.data_mut(|d| {
+        d.insert_temp(fit_pending_id(), true);
+        d.remove::<KeyGrab>(key_grab_id());
+        d.remove::<HandleDrag>(handle_drag_id());
+        d.remove::<Rect>(egui::Id::new("graph-box"));
+        d.remove::<bool>(egui::Id::new("graph-dragging"));
+        let pan = egui::Id::new("graph-pan");
+        for id in [pan, pan.with("hand"), pan.with("middle")] {
+            d.remove::<bool>(id);
+        }
+    });
+    super::graph_tools::reset_context(ctx);
+}
+
 /// Called every Timeline frame: switching the Graph Editor on (header button, menu, Shift+F3 or
 /// the control channel) frames the graphs on its first frame, when the plot rect is known, as
 /// After Effects does; switching it off puts back the time zoom from before it opened, so the
@@ -1201,8 +1218,8 @@ pub(crate) fn track_open(ctx: &egui::Context, tl: &mut crate::state::TimelineSta
     let zoom_id = egui::Id::new("graph-editor-zoom-before");
     let was = ctx.data(|d| d.get_temp::<bool>(was_id)).unwrap_or(false);
     if on && !was {
+        reset_context(ctx);
         ctx.data_mut(|d| {
-            d.insert_temp(fit_pending_id(), true);
             d.insert_temp(zoom_id, (tl.start, tl.pps));
         });
     } else if was
@@ -1389,6 +1406,30 @@ fn shift_axes(shift: bool, dx: f32, dy: f32) -> (bool, bool) {
 #[cfg(test)]
 mod tests {
     use super::shift_axes;
+
+    #[test]
+    fn changing_graph_context_cancels_old_gestures_and_requests_fit() {
+        use super::*;
+        let ctx = egui::Context::default();
+        ctx.set_dragged_id(egui::Id::new("graph-bg"));
+        ctx.data_mut(|d| {
+            d.insert_temp(key_grab_id(), KeyGrab { press: Pos2::ZERO, t: 1.0, v: 2.0, value_per_pixel: 1.0 });
+            d.insert_temp(handle_drag_id(), (Pos2::ZERO, Vec::<HandleGrab>::new(), 1.0, 100.0));
+            d.insert_temp(egui::Id::new("graph-box"), Rect::EVERYTHING);
+            d.insert_temp(egui::Id::new("graph-dragging"), true);
+            d.insert_temp(egui::Id::new("graph-pan"), true);
+        });
+        reset_context(&ctx);
+        assert!(ctx.dragged_id().is_none());
+        ctx.data(|d| {
+            assert_eq!(d.get_temp::<bool>(fit_pending_id()), Some(true));
+            assert!(d.get_temp::<KeyGrab>(key_grab_id()).is_none());
+            assert!(d.get_temp::<HandleDrag>(handle_drag_id()).is_none());
+            assert!(d.get_temp::<Rect>(egui::Id::new("graph-box")).is_none());
+            assert!(d.get_temp::<bool>(egui::Id::new("graph-dragging")).is_none());
+            assert!(d.get_temp::<bool>(egui::Id::new("graph-pan")).is_none());
+        });
+    }
 
     #[test]
     fn pinned_separated_position_uses_follower_expressions_keys_and_fit_bounds() {
