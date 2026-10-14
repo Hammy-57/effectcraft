@@ -4756,7 +4756,6 @@ const RUSSIAN: &[(&str, &str, &str)] = &[
     ("freeze.freeze", "Freeze", "Заморозить"),
     ("freeze.originals", "Use Originals / Stop Auto", "Использовать оригиналы / Остановить авто"),
     ("file.importAep", "After Effects Project...", "Проект After Effects..."),
-    ("file.importProject", "EffectCraft Project...", "Проект EffectCraft..."),
     ("app.fxConsole", "Effect Console...", "Консоль эффектов..."),
     ("layer.roundCorners", "Round Corners", "Скруглить углы"),
 ];
@@ -5398,7 +5397,6 @@ const FRENCH: &[(&str, &str, &str)] = &[
     ("freeze.freeze", "Freeze", "Figer"),
     ("freeze.originals", "Use Originals / Stop Auto", "Utiliser les originaux / Arrêter le mode auto"),
     ("file.importAep", "After Effects Project...", "Projet After Effects..."),
-    ("file.importProject", "EffectCraft Project...", "Projet EffectCraft..."),
     ("app.fxConsole", "Effect Console...", "Console d’effets..."),
     ("layer.roundCorners", "Round Corners", "Arrondir les angles"),
 ];
@@ -6040,7 +6038,6 @@ const GERMAN: &[(&str, &str, &str)] = &[
     ("freeze.freeze", "Freeze", "Einfrieren"),
     ("freeze.originals", "Use Originals / Stop Auto", "Originale verwenden / Automatik stoppen"),
     ("file.importAep", "After Effects Project...", "After Effects-Projekt..."),
-    ("file.importProject", "EffectCraft Project...", "EffectCraft-Projekt..."),
     ("app.fxConsole", "Effect Console...", "Effektkonsole..."),
     ("layer.roundCorners", "Round Corners", "Ecken abrunden"),
 ];
@@ -6683,7 +6680,6 @@ const CZECH: &[(&str, &str, &str)] = &[
     ("freeze.freeze", "Freeze", "Zmrazit"),
     ("freeze.originals", "Use Originals / Stop Auto", "Použít originály / Zastavit automatiku"),
     ("file.importAep", "After Effects Project...", "Projekt After Effects..."),
-    ("file.importProject", "EffectCraft Project...", "Projekt EffectCraft..."),
     ("app.fxConsole", "Effect Console...", "Konzole efektů..."),
     ("layer.roundCorners", "Round Corners", "Zaoblit rohy"),
 ];

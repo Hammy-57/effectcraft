@@ -1190,7 +1190,7 @@ fn script_stroke_dashes_use_after_effects_match_names() {
             "ADBE Vector Stroke Offset",
             "ADBE Vector Stroke Gap 2",
             "ADBE Vector Stroke Dash 1,ADBE Vector Stroke Gap 1,ADBE Vector Stroke Dash 2,ADBE Vector Stroke Gap 2,ADBE Vector Stroke Offset",
-            "Can not add \"ADBE Vector Stroke Dash 9\" to Dashes"
+            "Can not add \"ADBE Vector Stroke Dash 9\" to Dashes (use ADBE Vector Stroke Dash 1…3, Gap 1…3 or Offset)"
         ])
     );
 }

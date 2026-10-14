@@ -100,7 +100,7 @@ fn decades(start: i64) -> Vec<i64> {
 /// After Effects-style compact ruler timecode: the suffix names the smallest unit shown (frames
 /// `f` when `step` isn't whole seconds, seconds `s`, minutes `m` when it is whole minutes), the
 /// leading field is two digits and zero fields above it are left out (`00:15f`, `05s`, `01:30s`,
-/// `09:36:00f`, `1:00:30s`).
+/// `09:36:00f`, `01:00:30s`).
 pub(crate) fn compact_timecode(n: i64, base: i64, step: i64) -> String {
     let b = base.max(1);
     let (neg, h, m, s, f) = effectcraft_engine::time::frames_to_fields(n, effectcraft_engine::time::FrameRate::new(b, 1), false);

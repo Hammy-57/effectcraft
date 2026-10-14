@@ -569,8 +569,10 @@ fn object_matte_background_job_cancel_and_freeze() {
     // A frozen prompt is refused; Unfreeze computes again.
     assert!(s.execute_checked("objectMatte.apply", json!({"layer": clip.0, "effect": uid, "point": c})).is_err());
     s.execute_checked("objectMatte.unfreeze", json!({"layer": clip.0, "effect": uid})).unwrap();
-    let _ = alpha_at(&s, 4);
-    assert!(status(&mut s)["computed"].as_array().unwrap().iter().any(|f| f == 4));
+    // (Frame 4 was rendered while frozen and its identical picture may come from the frame cache;
+    // frame 5 was not, so rendering it segments again.)
+    let _ = alpha_at(&s, 5);
+    assert!(status(&mut s)["computed"].as_array().unwrap().iter().any(|f| f == 5));
     // Undo brings the frozen mattes back.
     s.execute("edit.undo", json!({})).unwrap();
     assert_eq!(status(&mut s)["frozen"], true);

@@ -1556,10 +1556,10 @@ mod tests {
         let (m, k) = parse_shortcut("Cmd+Alt+Shift+Y").unwrap();
         assert!(find(&app, "layer.newNull").contains(&(m, k)));
         // A UI command rebound in a custom preset.
-        // (Ctrl+Alt+J: off macOS Ctrl+Alt+H is Cmd+Alt+H, Toggle Hold Keyframe's, and wouldn't bind.)
-        app.session.execute("shortcuts.set", json!({"command": "tool.hand", "keys": "Ctrl+Alt+J"})).unwrap();
+        // (Ctrl+Alt+F11: off macOS Ctrl+Alt+H is Cmd+Alt+H, Toggle Hold Keyframe's, and wouldn't bind.)
+        app.session.execute("shortcuts.set", json!({"command": "tool.hand", "keys": "Ctrl+Alt+F11"})).unwrap();
         assert_eq!(app.session.keymaps.active, "Custom");
-        let (m2, k2) = parse_shortcut("Ctrl+Alt+J").unwrap();
+        let (m2, k2) = parse_shortcut("Ctrl+Alt+F11").unwrap();
         assert_eq!(find(&app, "tool.hand"), vec![(m2, k2)]);
         app.session.execute("shortcuts.set", json!({"command": "layer.newNull", "keys": "F6"})).unwrap();
         assert_eq!(find(&app, "layer.newNull"), vec![(egui::Modifiers::NONE, egui::Key::F6)]);
