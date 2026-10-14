@@ -157,6 +157,9 @@ fn convert_to_bezier(s: &mut Session, p: &Value) -> Result<Value> {
     }
     targets.sort_unstable();
     targets.dedup();
+    if targets.len() > 4096 {
+        return Err(bad(c, "shape conversion limit exceeded"));
+    }
     let ctx = effectcraft_render::EvalCtx {
         footage: Some(s.footage.as_ref()),
         expr: s.expr.as_deref(),

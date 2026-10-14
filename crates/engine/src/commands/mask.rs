@@ -245,7 +245,7 @@ fn vertex_groups(s: &Session, p: &Value) -> Result<std::collections::BTreeMap<(u
             let l = v.get("layer").and_then(|x| resolve_layer(comp, x)).ok_or_else(|| bad("mask", "vertex needs `layer`"))?;
             let m = v.get("mask").and_then(Value::as_u64).ok_or_else(|| bad("mask", "vertex needs `mask` uid"))?;
             let i = v.get("index").and_then(Value::as_u64).ok_or_else(|| bad("mask", "vertex needs `index`"))?;
-            g.entry((l.0, m)).or_default().push(i as usize);
+            g.entry((l.0, m)).or_default().push(usize::try_from(i).map_err(|_| bad("mask", "vertex index out of range"))?);
         }
     } else {
         for v in &s.state.selected_vertices {
