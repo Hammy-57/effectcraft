@@ -617,7 +617,12 @@ mod conversion_tests {
             let old = layer.props.find_group(uid).unwrap().clone();
             let ctx = effectcraft_render::EvalCtx::new(&s.project, cid, s.active_comp().unwrap(), s.time());
             let expected = effectcraft_path::from_kurbo(&effectcraft_render::shapes::primitive_path(&ctx, layer, &old).unwrap());
-            s.execute("path.convertToBezier", json!({"layer":lid.0,"prop":uid})).unwrap();
+            if kind == "rect" {
+                s.execute("prop.select", json!({"layer":lid.0,"prop":old.get("size").unwrap().uid})).unwrap();
+                s.execute("path.convertToBezier", json!({})).unwrap();
+            } else {
+                s.execute("path.convertToBezier", json!({"layer":lid.0,"prop":uid})).unwrap();
+            }
             let now = s.active_comp().unwrap().layer(lid).unwrap().props.find_group(uid).unwrap();
             assert_eq!(now.match_id, "path");
             assert_eq!(now.name, old.name);
