@@ -4082,7 +4082,7 @@ mod tests {
         let mut style = RulerStyle { style: TimeDisplayStyle::Timecode, base: 30, offset: 0 };
         assert_eq!(style.label(15, 1), "00:15f");
         assert_eq!(style.label(45, 1), "01:15f");
-        assert_eq!(style.label(30 * 3600 + 31, 1), "1:00:01:01f");
+        assert_eq!(style.label(30 * 3600 + 31, 1), "01:00:01:01f");
         style.style = TimeDisplayStyle::Frames;
         assert_eq!(style.label(0, 1), "0");
         assert_eq!(style.label(45, 1), "45");
