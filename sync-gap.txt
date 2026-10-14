@@ -1,4 +1,5 @@
-383
+111
 # history (date pending-commits note), newest last; line 1 is what sync-gap.sh --fail-if-growing reads
 2026-10-12 347 first record (after counting open-PR branches as shared)
 2026-10-13 383 grew +36 (day's landings; 8 pending commits sit on upstream/* branches as cherry-picks without -x, so they count twice; 7 are tonight's Fix: commits on main)
+2026-10-14 111 fell -272 (43 commits now counted as queued via -x cherry-picks; 154 shareable; top un-queued: G2, AN2, MCP, AN15, RT10e)
