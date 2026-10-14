@@ -2554,7 +2554,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 if graph_switch {
                     let gr = Rect::from_center_size(pos2(indent + 18.0, cy), vec2(14.0, 14.0));
                     icons::paint(&lp, gr, Icon::Graph, if prop.graph_editor { t.hot_text } else { t.text_dim });
-                    let resp = ui.interact(gr, egui::Id::new(("graph-pin", uid)), Sense::click()).on_hover_text("Include in Graph Editor Set");
+                    let resp = ui.interact(gr, egui::Id::new(("graph-pin", uid)), Sense::click()).on_hover_text(crate::i18n::tr("Include in Graph Editor Set"));
                     app.auto.add(&format!("timeline.prop.{uid}.graphPin"), gr, "Include in Graph Editor Set");
                     if resp.clicked() {
                         actions.push(("prop.graphPin".into(), json!({"layer": layer.id.0, "prop": uid})));

@@ -444,6 +444,7 @@ const JAPANESE: &[(&str, &str)] = &[
     ("Select a text layer", "テキストレイヤーを選択してください"),
     ("Select an item in the Project panel", "プロジェクトパネルで項目を選択してください"),
     ("Select animated properties to show them in the Graph Editor", "アニメーションのあるプロパティを選択すると、グラフエディターに表示されます"),
+    ("Include in Graph Editor Set", "グラフエディターセットに含める"),
     (
         "Select the leader pin, then Shift-click the pins that should trail it (hair, cloth, tails)",
         "リーダーピンを選択してから、追従させるピン（髪、布、しっぽなど）をShift+クリック",
@@ -997,6 +998,7 @@ const SIMPLIFIED_CHINESE: &[(&str, &str)] = &[
     ("Select a text layer", "选择文字图层"),
     ("Select an item in the Project panel", "在项目面板中选择一个项"),
     ("Select animated properties to show them in the Graph Editor", "选择已制作动画的属性以在图表编辑器中显示"),
+    ("Include in Graph Editor Set", "加入图表编辑器集"),
     (
         "Select the leader pin, then Shift-click the pins that should trail it (hair, cloth, tails)",
         "先选择引导定位点，再按住 Shift 单击应跟随它的定位点（头发、布料、尾巴）",
@@ -1750,6 +1752,7 @@ const TRADITIONAL_CHINESE: &[(&str, &str)] = &[
     ("Select a text layer", "選取文字圖層"),
     ("Select an item in the Project panel", "在專案面板中選取一個項"),
     ("Select animated properties to show them in the Graph Editor", "選取已制作動畫的屬性以在圖表編輯器中顯示"),
+    ("Include in Graph Editor Set", "加入圖表編輯器集"),
     (
         "Select the leader pin, then Shift-click the pins that should trail it (hair, cloth, tails)",
         "先選取引導釘選點，再按住 Shift 按一下應跟隨它的釘選點（頭發、布料、尾巴）",
@@ -2496,6 +2499,7 @@ const UKRAINIAN: &[(&str, &str)] = &[
     ("Select a text layer", "Виділіть текстовий шар"),
     ("Select an item in the Project panel", "Виділіть елемент на панелі «Проєкт»"),
     ("Select animated properties to show them in the Graph Editor", "Виділіть анімовані властивості, щоб показати їх у редакторі графіків"),
+    ("Include in Graph Editor Set", "Додати до набору редактора графіків"),
     (
         "Select the leader pin, then Shift-click the pins that should trail it (hair, cloth, tails)",
         "Виділіть провідну опорну точку, а потім клацніть із Shift точки, які мають рухатися за нею (волосся, тканина, хвости)",
@@ -3038,6 +3042,7 @@ const PORTUGUESE: &[(&str, &str)] = &[
     ("Select a text layer", "Selecione uma camada de texto"),
     ("Select an item in the Project panel", "Selecione um item no painel Projeto"),
     ("Select animated properties to show them in the Graph Editor", "Selecione propriedades animadas para exibi-las no Editor de gráficos"),
+    ("Include in Graph Editor Set", "Incluir no conjunto do Editor de gráficos"),
     (
         "Select the leader pin, then Shift-click the pins that should trail it (hair, cloth, tails)",
         "Selecione o pino líder e depois Shift+clique nos pinos que devem segui-lo (cabelo, tecido, caudas)",
@@ -3487,6 +3492,7 @@ const CZECH: &[(&str, &str)] = &[
     ("Select a text layer", "Vyberte textovou vrstvu"),
     ("Select an item in the Project panel", "Vyberte položku v panelu Projekt"),
     ("Select animated properties to show them in the Graph Editor", "Vyberte animované vlastnosti pro zobrazení v editoru grafů"),
+    ("Include in Graph Editor Set", "Zahrnout do sady editoru grafů"),
     (
         "Select the leader pin, then Shift-click the pins that should trail it (hair, cloth, tails)",
         "Vyberte řídicí čep a potom se Shiftem klikněte na čepy, které jej mají následovat (vlasy, látka, ocasy)",
@@ -4041,6 +4047,7 @@ const SPANISH: &[(&str, &str)] = &[
     ("Select a text layer", "Selecciona una capa de texto"),
     ("Select an item in the Project panel", "Selecciona un elemento en el panel Proyecto"),
     ("Select animated properties to show them in the Graph Editor", "Selecciona propiedades animadas para mostrarlas en el editor de gráficos"),
+    ("Include in Graph Editor Set", "Incluir en el conjunto del editor de gráficos"),
     (
         "Select the leader pin, then Shift-click the pins that should trail it (hair, cloth, tails)",
         "Selecciona el pin guía y luego haz Mayús+clic en los pines que deben seguirlo (pelo, tela, colas)",
