@@ -141,3 +141,18 @@ fn a_value_graph_handle_on_top_of_its_key_is_grabbable() {
     assert!((k.time.seconds() - t1).abs() < 1e-9, "the key stayed put: {}", k.time.seconds());
     assert!(k.in_ease[0].influence > 0.2, "the in influence followed the handle: {}", k.in_ease[0].influence);
 }
+
+#[test]
+fn auto_height_expands_for_a_handle_drag_beyond_the_plot() {
+    let (mut h, id, uid) = harness("speed");
+    h.state_mut().ui.timeline.graph_auto_zoom = true;
+    h.run_steps(3);
+    let plot = rect(&h, "timeline.graph");
+    let before = h.state().ui.timeline.graph_range.unwrap();
+    let from = rect(&h, &format!("timeline.graph.handle.{uid}.0.1.in")).center();
+    drag(&mut h, from, pos2(from.x, plot.min.y - 80.0));
+    let after = h.state().ui.timeline.graph_range.unwrap();
+    assert!(after.1 > before.1, "range expands: {before:?} → {after:?}");
+    assert!(key1(&h, id).1 > 0.0);
+    assert!(h.state().ui.timeline.graph_auto_zoom);
+}

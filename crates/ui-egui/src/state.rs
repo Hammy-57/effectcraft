@@ -387,6 +387,9 @@ pub struct TimelineState {
     /// Show only the selected properties (else every animated property of the selected layers).
     #[serde(default = "yes")]
     pub graph_show_selected: bool,
+    /// Include saved Graph Editor Set properties, even on unselected layers.
+    #[serde(default)]
+    pub graph_show_set: bool,
     /// Auto-zoom the graph height to the visible curves.
     #[serde(default = "yes")]
     pub graph_auto_zoom: bool,
@@ -465,6 +468,7 @@ impl Default for TimelineState {
             full_groups: BTreeMap::new(),
             graph_mode: auto_graph(),
             graph_show_selected: true,
+            graph_show_set: false,
             graph_auto_zoom: true,
             graph_range: None,
             graph_snap: true,

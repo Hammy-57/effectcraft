@@ -253,7 +253,7 @@ fn k_follows_the_revealed_properties_and_auto_select_picks_the_speed_graph_for_p
     assert_eq!(h.state().ui.timeline.graph_mode, "auto");
     assert!(h.state().auto.find(&format!("timeline.graph.key.{pos}.0.0")).is_some());
     assert!(h.state().auto.find(&format!("timeline.graph.key.{pos}.1.0")).is_none(), "speed graph: one curve");
-    assert!(h.state().auto.find("timeline.graph.autoSelectGraphType").is_some());
+    assert!(h.state().auto.find("timeline.graph.typeOptions").is_some());
     h.state_mut().ui.timeline.graph_mode = "value".into();
     h.run_steps(3);
     assert!(h.state().auto.find(&format!("timeline.graph.key.{pos}.1.0")).is_some(), "value graph: X and Y");
@@ -462,19 +462,17 @@ fn a_graph_editor_marquee_highlights_keys_while_the_button_is_down() {
 #[test]
 fn graph_editor_buttons_that_do_not_fit_move_to_the_more_menu() {
     let (mut h, _, _) = harness();
-    h.set_size(egui::vec2(1280.0, 800.0));
+    h.set_size(egui::vec2(1000.0, 800.0));
+    h.state_mut().ui.timeline.outline_w = Some(740.0);
     h.state_mut().ui.timeline.graph_editor = true;
     h.run_steps(4);
     let ids = [
-        "autoSelectGraphType",
-        "valueGraph",
-        "speedGraph",
-        "showSelected",
+        "typeOptions",
+        "propertyOptions",
         "autoZoom",
         "fit",
         "fitSelection",
         "snap",
-        "reference",
         "transformBox",
         "separateDimensions",
         "interpolationHold",
@@ -625,4 +623,66 @@ fn speed_graph_handle_drags_upward_past_the_top() {
     let long = out_speed(&h);
     // The speed per pixel depends on the graph's fitted scale; only the proportion matters.
     assert!(short > 0.0 && long > 9.0 * short, "40 px up gave {short}, 400 px up gave {long}");
+}
+
+#[test]
+fn option_drag_splits_and_rejoins_speed_handles_with_one_undo_each() {
+    let (mut h, id, uid) = harness();
+    let s = &mut h.state_mut().session;
+    s.execute("prop.addKey", json!({"layer": id.0, "prop": uid, "time": 2.0, "value": 200.0})).unwrap();
+    s.execute("keys.select", json!({"keys": [{"layer": id.0, "prop": uid, "time": 1.0}]})).unwrap();
+    s.execute("keys.setEase", json!({"layer": id.0, "prop": uid, "time": 1.0, "side": "out", "speed": 100.0, "influence": 30.0, "continuous": true})).unwrap();
+    h.state_mut().ui.timeline.graph_editor = true;
+    h.state_mut().ui.timeline.graph_mode = "speed".into();
+    h.run_steps(4);
+    h.state_mut().ui.timeline.graph_auto_zoom = false;
+    h.state_mut().ui.timeline.graph_range = Some((0.0, 300.0));
+    h.run_steps(3);
+    let center = |h: &Harness<'_, EffectcraftApp>| {
+        let r = h.state().auto.find(&format!("timeline.graph.handle.{uid}.0.1.out")).unwrap().rect;
+        pos2(r[0] + r[2] * 0.5, r[1] + r[3] * 0.5)
+    };
+    let key = |h: &Harness<'_, EffectcraftApp>| h.state().session.active_comp().unwrap().layer(id).unwrap().props.find(uid).unwrap().keys[1].clone();
+    let start = center(&h);
+    let undo = h.state().session.history.undo.len();
+    drag(&mut h, start, start - egui::vec2(0.0, 30.0), egui::Modifiers::ALT);
+    assert!(!key(&h).continuous);
+    assert_eq!(key(&h).in_ease[0].speed, 100.0);
+    assert!(key(&h).out_ease[0].speed > 100.0);
+    assert_eq!(h.state().session.history.undo.len(), undo + 1);
+    let start = center(&h);
+    let plot = h.state().auto.find("timeline.graph").unwrap().rect;
+    let delta = ((key(&h).out_ease[0].speed - 100.0) / 300.0) * f64::from(plot[3]);
+    drag(&mut h, start, start + egui::vec2(0.0, delta as f32), egui::Modifiers::ALT);
+    assert!(key(&h).continuous);
+    assert!((key(&h).out_ease[0].speed - 100.0).abs() < 1e-6);
+    assert_eq!(h.state().session.history.undo.len(), undo + 2);
+}
+
+#[test]
+fn graph_value_snapping_can_be_temporarily_disabled() {
+    for disable in [false, true] {
+        let (mut h, id, uid) = harness();
+        h.state_mut().session.execute("keys.select", json!({"keys": [{"layer": id.0, "prop": uid, "time": 0.0}]})).unwrap();
+        h.state_mut().ui.timeline.graph_editor = true;
+        h.run_steps(4);
+        h.state_mut().ui.timeline.graph_auto_zoom = false;
+        h.state_mut().ui.timeline.graph_range = Some((-20.0, 150.0));
+        h.state_mut().ui.timeline.graph_transform_box = false;
+        h.run_steps(3);
+        let center = |index| {
+            let r = h.state().auto.find(&format!("timeline.graph.key.{uid}.0.{index}")).unwrap().rect;
+            pos2(r[0] + r[2] * 0.5, r[1] + r[3] * 0.5)
+        };
+        let (from, other) = (center(0), center(1));
+        drag(&mut h, from, pos2(from.x, other.y + 2.0), if disable { egui::Modifiers::COMMAND } else { egui::Modifiers::SHIFT });
+        let k = &h.state().session.active_comp().unwrap().layer(id).unwrap().props.find(uid).unwrap().keys[0];
+        let value = k.value.components()[0];
+        if disable {
+            assert!((value - 100.0).abs() > 0.1, "Command disables snapping: {value}");
+        } else {
+            assert!((value - 100.0).abs() < 1e-6, "snapped to other key value: {value}");
+        }
+        assert_eq!(k.time.seconds(), 0.0);
+    }
 }

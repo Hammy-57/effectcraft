@@ -46,6 +46,7 @@ pub fn atomic_supported(id: &str) -> bool {
         "keys.toggleTransform",
         "prop.setExpression",
         "prop.reset",
+        "prop.graphPin",
         "prop.select",
         "prop.deselect",
         "prop.renameGroup",

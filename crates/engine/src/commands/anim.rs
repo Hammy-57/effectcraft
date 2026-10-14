@@ -294,6 +294,9 @@ fn set_ease(s: &mut Session, p: &Value) -> Result<Value> {
             k.in_interp = Interp::Bezier;
         }
         k.auto_bezier = false;
+        if let Some(continuous) = p.get("continuous").and_then(Value::as_bool) {
+            k.continuous = continuous;
+        }
         // Continuous Bezier keys keep matching speeds on both sides.
         if k.continuous {
             let src = if out { k.out_ease.clone() } else { k.in_ease.clone() };
@@ -470,7 +473,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Set Keyframe Ease",
             [],
             None,
-            "{layer?, path|prop, time (layer s), side: in|out, dim?, speed?, influence? %, merge?}",
+            "{layer?, path|prop, time (layer s), side: in|out, dim?, speed?, influence? %, continuous?: bool, merge?}",
             has_comp,
             set_ease
         ),

@@ -1673,7 +1673,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             app.ui.timeline.scroll_y = rows.iter().take(i).map(|r| row_height(r, rh)).sum();
         }
     }
-    if ui.rect_contains_pointer(rows_rect) {
+    if ui.rect_contains_pointer(rows_rect) && !(app.ui.timeline.graph_editor && ui.input(|i| i.pointer.hover_pos()).is_some_and(|p| p.x >= graph_x0)) {
         let (dy, dx, zoom) = ui.input(|i| (i.smooth_scroll_delta.y, i.smooth_scroll_delta.x, i.modifiers.alt));
         // Ctrl/Cmd+wheel and a trackpad pinch reach egui as a zoom factor rather than a scroll
         // (#428); like Alt+wheel they zoom time.
@@ -2550,7 +2550,17 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                         actions.push(("prop.toggleAnimation".into(), json!({"layer": layer.id.0, "prop": uid})));
                     }
                 }
-                let name_x = indent + 12.0;
+                let graph_switch = graph_on && !prop.static_only && prop.value.interpolates() && !prop.value.components().is_empty();
+                if graph_switch {
+                    let gr = Rect::from_center_size(pos2(indent + 18.0, cy), vec2(14.0, 14.0));
+                    icons::paint(&lp, gr, Icon::Graph, if prop.graph_editor { t.hot_text } else { t.text_dim });
+                    let resp = ui.interact(gr, egui::Id::new(("graph-pin", uid)), Sense::click()).on_hover_text("Include in Graph Editor Set");
+                    app.auto.add(&format!("timeline.prop.{uid}.graphPin"), gr, "Include in Graph Editor Set");
+                    if resp.clicked() {
+                        actions.push(("prop.graphPin".into(), json!({"layer": layer.id.0, "prop": uid})));
+                    }
+                }
+                let name_x = indent + if graph_switch { 30.0 } else { 12.0 };
                 // 3D layers show Rotation as "Z Rotation" next to X/Y Rotation.
                 let is_tr_rot = layer.transform().and_then(|t| t.get("rotation")).is_some_and(|r| r.uid == prop.uid);
                 let base = if is_tr_rot && prop.name == "Rotation" && layer.is_3d() { "Z Rotation".to_string() } else { prop.name.clone() };
@@ -3140,7 +3150,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
 
     // Spacebar held: the Hand tool. Dragging the ruler or the time graph scrolls it in time when
     // zoomed in (registered last, so it takes the drag from the bars, keys and markers there).
-    if super::space_hand(&ctx) {
+    if super::space_hand(&ctx) && !graph_on {
         let area = Rect::from_min_max(pos2(graph_x0, ruler.min.y), pos2(rect.max.x, rows_rect.max.y));
         let hand = ui.interact(area, egui::Id::new("tl-hand"), Sense::drag());
         app.auto.add("timeline.hand", area, "Hand (hold Spacebar)");
@@ -3699,6 +3709,9 @@ fn prop_menu(
             ui.close();
         }
     };
+    if !prop.static_only && prop.value.interpolates() && !prop.value.components().is_empty() {
+        item(ui, "graphPin", "Include in Graph Editor Set", prop.graph_editor, "prop.graphPin", json!({"layer": l, "prop": uid}));
+    }
     item(ui, "reset", "Reset", false, "prop.reset", json!({"layer": l, "prop": uid}));
     if matches!(prop.value, Value::Scalar(_) | Value::Vec2(_) | Value::Vec3(_)) {
         item(ui, "editValue", "Edit Value…", false, "prop.set", json!({"layer": l, "prop": uid}));
