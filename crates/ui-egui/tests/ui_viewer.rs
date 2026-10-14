@@ -892,9 +892,15 @@ fn graph_editor_transform_box_scales_selected_keys_in_time() {
     s.execute("keys.select", json!({"keys": keys})).unwrap();
     h.state_mut().ui.timeline.graph_editor = true;
     h.run_steps(4);
-    for id in ["timeline.graph.snap", "timeline.graph.reference", "timeline.graph.transformBox", "timeline.graph.transformBox.5"] {
+    for id in ["timeline.graph.snap", "timeline.graph.typeOptions", "timeline.graph.transformBox", "timeline.graph.transformBox.5"] {
         assert!(h.state().auto.find(id).is_some(), "missing {id}");
     }
+    // Reference graphs moved into the graph-type menu; exercise that public route.
+    let type_options = rect(&h, "timeline.graph.typeOptions").center();
+    click(&mut h, type_options);
+    let reference = rect(&h, "timeline.graph.reference").center();
+    click(&mut h, reference);
+    assert!(h.state().ui.timeline.graph_reference);
     // Drag the right edge handle to the right: the keys spread out in time, the first stays.
     let r = rect(&h, "timeline.graph.transformBox.5");
     let k0 = rect(&h, &format!("timeline.graph.key.{uid}.0.0")).center();
@@ -2407,4 +2413,64 @@ fn mask_marquee_selects_vertices() {
     h.run_steps(2);
     let sel = &h.state().session.state.selected_vertices;
     assert_eq!(sel.len(), 2, "shift-marquee adds: {sel:?}");
+}
+
+#[test]
+fn full_frame_mask_marquee_and_arrow_nudge_preserve_the_layer() {
+    let mut h = harness();
+    let plate = layer_id(&h, "Plate");
+    h.state_mut().session.execute("layer.select", json!({"layers":[plate]})).unwrap();
+    let mask =
+        h.state_mut().session.execute("mask.new", json!({"layer":plate,"vertices":[[100,60],[500,60],[500,300],[100,300]],"closed":true})).unwrap()["mask"]
+            .as_u64()
+            .unwrap();
+    h.state_mut().session.execute("mask.selectVertices", json!({"vertices":[]})).unwrap();
+    h.state_mut().ui.tool = Tool::Selection;
+    h.run_steps(2);
+    let transform = position_and_anchor(&h, LayerId(plate));
+    let from = screen(&h, [70.0, 40.0]);
+    let to = screen(&h, [520.0, 90.0]);
+    drag(&mut h, from, to);
+    assert_eq!(h.state().session.state.selected_vertices.len(), 2, "box over full-frame artwork selects vertices");
+    assert_eq!(position_and_anchor(&h, LayerId(plate)), transform);
+    let before = h.state().session.active_comp().unwrap().layer(LayerId(plate)).unwrap().props.find_group(mask).unwrap().get("path").unwrap().value.clone();
+    let ctx = h.ctx.clone();
+    effectcraft_ui_egui::menus::invoke(h.state_mut(), &ctx, "viewer.nudge.right", json!({})).unwrap();
+    let after = &h.state().session.active_comp().unwrap().layer(LayerId(plate)).unwrap().props.find_group(mask).unwrap().get("path").unwrap().value;
+    let (a, b) = (before.as_path().unwrap(), after.as_path().unwrap());
+    assert!(b.vertices[0][0] > a.vertices[0][0] && b.vertices[1][0] > a.vertices[1][0]);
+    assert_eq!(b.vertices[2], a.vertices[2]);
+    assert_eq!(position_and_anchor(&h, LayerId(plate)), transform);
+    h.state_mut().session.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(h.state().session.active_comp().unwrap().layer(LayerId(plate)).unwrap().props.find_group(mask).unwrap().get("path").unwrap().value, before);
+    h.state_mut().session.execute("layer.mask.lock", json!({"layer":plate,"mask":mask,"value":true})).unwrap();
+    h.run_steps(2);
+    assert!(h.state().auto.find_current(&format!("viewer.mask.{mask}.vertex.0")).is_none(), "locked outlines have no editable vertex targets");
+}
+
+#[test]
+fn holding_a_mask_vertex_at_the_edge_keeps_panning_until_release() {
+    let mut h = harness();
+    let plate = layer_id(&h, "Plate");
+    h.state_mut().session.execute("layer.select", json!({"layers":[plate]})).unwrap();
+    h.state_mut().session.execute("mask.new", json!({"layer":plate,"vertices":[[320,180],[380,180],[380,220]],"closed":true})).unwrap();
+    h.state_mut().ui.tool = Tool::Selection;
+    h.state_mut().ui.viewer.zoom = Some(2.0);
+    h.run_steps(2);
+    let from = screen(&h, [320.0, 180.0]);
+    let panel = rect(&h, "panel.Composition");
+    let at = pos2(panel.max.x - 3.0, from.y);
+    h.input_mut().events.push(Event::PointerMoved(from));
+    h.input_mut().events.push(Event::PointerButton { pos: from, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+    h.step();
+    h.input_mut().events.push(Event::PointerMoved(at));
+    h.step();
+    let before = h.state().ui.viewer.pan[0];
+    h.run_steps(5);
+    assert!(h.state().ui.viewer.pan[0] < before, "held pointer continues panning");
+    h.input_mut().events.push(Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+    h.step();
+    let stopped = h.state().ui.viewer.pan;
+    h.run_steps(5);
+    assert_eq!(h.state().ui.viewer.pan, stopped);
 }

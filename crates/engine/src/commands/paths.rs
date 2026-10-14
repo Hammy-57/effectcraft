@@ -82,7 +82,13 @@ fn edit_mask_groups(s: &mut Session, p: &Value, label: &str, f: impl Fn(&mut Pro
     s.edit(label, None, |proj, _| {
         for (lid, uid) in &targets {
             let l = layer_mut(proj, cid, *lid)?;
-            if let Some(g) = l.props.sub_mut("masks").and_then(|m| m.find_group_mut(*uid)) {
+            if l.switches.locked {
+                return Err(bad(label, "layer is locked"));
+            }
+            if let Some(g) = l.props.find_group_mut(*uid) {
+                if super::mask::path_locked(g) {
+                    return Err(bad(label, "mask is locked"));
+                }
                 f(g)?;
             }
         }
@@ -109,11 +115,103 @@ fn roto_bezier(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn convert_to_bezier(s: &mut Session, p: &Value) -> Result<Value> {
-    edit_mask_groups(s, p, "Convert To Bezier Path", |g| {
-        if let GroupKind::Mask { roto_bezier, .. } = &mut g.kind {
-            *roto_bezier = false;
+    let c = "path.convertToBezier";
+    let cid = s.active_comp_id().ok_or(EngineError::NoComp)?;
+    let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
+    let primitive = |g: &PropGroup| matches!(g.match_id.as_str(), "rect" | "ellipse" | "star");
+    let mut targets = Vec::new();
+    if let Some(uid) = p.get("prop").and_then(Value::as_u64) {
+        let (_, lid) = layer_p(s, p, c)?;
+        let group = comp.layer(lid).and_then(|l| l.props.find_group(uid)).ok_or_else(|| bad(c, "no such shape item"))?;
+        if !primitive(group) {
+            return Err(bad(c, "select a Rectangle, Ellipse or Polystar"));
         }
-        Ok(())
+        targets.push((lid, uid));
+    } else if p.get("mask").is_none() {
+        targets.extend(s.state.selected_props.iter().filter_map(|(lid, uid)| {
+            let props = &comp.layer(*lid)?.props;
+            let g = props.find_group(*uid).filter(|g| primitive(g)).or_else(|| props.parent_of(*uid).filter(|g| primitive(g)))?;
+            Some((*lid, g.uid))
+        }));
+        if targets.is_empty() && s.state.selected_vertices.is_empty() {
+            let (_, lids) = super::layers_p(s, p)?;
+            for lid in lids {
+                let Some(contents) = comp.layer(lid).and_then(|l| l.props.sub("contents")) else { continue };
+                let mut pending = vec![(contents, 0usize)];
+                while let Some((g, depth)) = pending.pop() {
+                    if depth > 256 || targets.len() > 4096 {
+                        return Err(bad(c, "shape conversion limit exceeded"));
+                    }
+                    if primitive(g) {
+                        targets.push((lid, g.uid));
+                    }
+                    pending.extend(g.groups().map(|g| (g, depth + 1)));
+                }
+            }
+        }
+    }
+    if targets.is_empty() {
+        return edit_mask_groups(s, p, "Convert To Bezier Path", |g| {
+            if let GroupKind::Mask { roto_bezier, .. } = &mut g.kind {
+                *roto_bezier = false;
+            }
+            Ok(())
+        });
+    }
+    targets.sort_unstable();
+    targets.dedup();
+    if targets.len() > 4096 {
+        return Err(bad(c, "shape conversion limit exceeded"));
+    }
+    let ctx = effectcraft_render::EvalCtx {
+        footage: Some(s.footage.as_ref()),
+        expr: s.expr.as_deref(),
+        ..effectcraft_render::EvalCtx::new(&s.project, cid, comp, s.time())
+    };
+    let mut converted = Vec::new();
+    let snapshot = b_p(p, "snapshot").unwrap_or(false);
+    for (lid, uid) in targets {
+        let layer = comp.layer(lid).ok_or(EngineError::NoComp)?;
+        if layer.switches.locked {
+            return Err(bad(c, "layer is locked"));
+        }
+        let g = layer.props.find_group(uid).ok_or_else(|| bad(c, "shape item vanished"))?;
+        if !snapshot && g.children.iter().filter_map(|n| n.as_prop()).any(|pr| pr.match_id != "direction" && (!pr.keys.is_empty() || pr.expr.is_some())) {
+            return Err(bad(
+                c,
+                "animated or expression-driven geometry: use snapshot:true to explicitly convert only the current frame (undo restores the original)",
+            ));
+        }
+        let path = effectcraft_render::shapes::primitive_path(&ctx, layer, g).ok_or_else(|| bad(c, "not a parametric path"))?;
+        let mut paths = effectcraft_path::from_kurbo(&path);
+        if paths.len() != 1 {
+            return Err(bad(c, "primitive did not produce one editable contour"));
+        }
+        let path = paths.pop().ok_or_else(|| bad(c, "empty primitive"))?;
+        if !path.vertices.iter().chain(&path.in_tangents).chain(&path.out_tangents).flatten().all(|v| v.is_finite()) {
+            return Err(bad(c, "invalid primitive geometry"));
+        }
+        converted.push((lid, uid, path));
+    }
+    s.edit("Convert To Bezier Path", None, |proj, st| {
+        let mut next = proj.next_id;
+        for (lid, uid, path) in &converted {
+            let layer = layer_mut(proj, cid, *lid)?;
+            let g = layer.props.find_group_mut(*uid).ok_or_else(|| bad(c, "shape item vanished"))?;
+            let mut replacement = build::shape_path(&mut Ids(&mut next), path.clone());
+            replacement.uid = g.uid;
+            replacement.name = g.name.clone();
+            replacement.enabled = g.enabled;
+            replacement.label = g.label;
+            if let (Some(old), Some(new)) = (g.get("direction"), replacement.get_mut("direction")) {
+                *new = old.clone();
+            }
+            *g = replacement;
+        }
+        proj.next_id = next;
+        st.selected_props = converted.iter().map(|(l, u, _)| (*l, *u)).collect();
+        st.selected_vertices.clear();
+        Ok(json!({"shapes": converted.len(), "snapshot": snapshot}))
     })
 }
 
@@ -177,7 +275,13 @@ fn set_first_vertex(s: &mut Session, p: &Value) -> Result<Value> {
     let cid = s.active_comp_id().ok_or(EngineError::NoComp)?;
     s.edit("Set First Vertex", None, |proj, st| {
         let l = layer_mut(proj, cid, v.layer)?;
+        if l.switches.locked {
+            return Err(bad("path.setFirstVertex", "layer is locked"));
+        }
         let g = l.props.sub_mut("masks").and_then(|m| m.find_group_mut(v.mask)).ok_or_else(|| bad("path.setFirstVertex", "no such mask"))?;
+        if super::mask::path_locked(g) {
+            return Err(bad("path.setFirstVertex", "mask is locked"));
+        }
         let k = v.index;
         let mut err = None;
         map_path(g, &|sp| {
@@ -236,8 +340,14 @@ fn free_transform(s: &mut Session, p: &Value) -> Result<Value> {
         let mut n = 0;
         for (lid, uid) in &targets {
             let l = layer_mut(proj, cid, *lid)?;
+            if l.switches.locked {
+                return Err(bad("path.freeTransform", "layer is locked"));
+            }
             let lt = l.layer_time(t);
             let Some(g) = l.props.find_group_mut(*uid).filter(|g| super::mask::is_path_group(g)) else { continue };
+            if super::mask::path_locked(g) {
+                return Err(bad("path.freeTransform", "mask is locked"));
+            }
             let roto = is_roto(g);
             let Some(pr) = g.get_mut("path") else { continue };
             let KV::Path(mut sp) = pr.value_at(lt) else { continue };
@@ -449,7 +559,15 @@ fn ungroup_shapes(s: &mut Session, p: &Value) -> Result<Value> {
 pub fn specs() -> Vec<CommandSpec> {
     vec![
         cmd!("path.rotoBezier", "RotoBezier", ["Layer", "Mask and Shape Path"], None, "{layer?, mask?, value?}", has_layers, roto_bezier),
-        cmd!("path.convertToBezier", "Convert To Bezier Path", ["Layer", "Mask and Shape Path"], None, "{layer?, mask?}", has_layers, convert_to_bezier),
+        cmd!(
+            "path.convertToBezier",
+            "Convert To Bezier Path",
+            ["Layer", "Mask and Shape Path"],
+            None,
+            "{layer?, mask?, prop?: primitive uid, snapshot?: true (explicit current-frame conversion of animated geometry)}",
+            has_layers,
+            convert_to_bezier
+        ),
         cmd!("path.groupShapes", "Group Shapes", ["Layer"], Some("Cmd+G"), "{layer?, items?: [uid]}", has_shape_items, group_shapes),
         cmd!("path.ungroupShapes", "Ungroup Shapes", ["Layer"], Some("Cmd+Shift+G"), "{layer?, items?: [group uid]}", has_shape_items, ungroup_shapes),
         cmd!(
@@ -474,4 +592,57 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("layer.mask.featherFalloff", "Feather Falloff", [], None, "{layer?, mask?, mode: smooth|linear}", has_layers, feather_falloff),
         cmd!("layer.mask.hideLocked", "Hide Locked Masks", ["Layer", "Mask"], None, "{value?}", has_comp, hide_locked),
     ]
+}
+
+#[cfg(test)]
+mod conversion_tests {
+    use super::*;
+
+    fn fixture(kind: &str) -> (Session, LayerId, Uid) {
+        let mut s = Session::default();
+        s.execute("comp.new", json!({"width": 320,"height":180})).unwrap();
+        let lid = LayerId(s.execute("layer.newShape", json!({"kind":kind})).unwrap()["layer"].as_u64().unwrap());
+        let layer = s.active_comp().unwrap().layer(lid).unwrap();
+        let g = layer.props.group("contents/group/contents").unwrap().groups().find(|g| matches!(g.match_id.as_str(), "rect" | "ellipse" | "star")).unwrap();
+        let uid = g.uid;
+        (s, lid, uid)
+    }
+
+    #[test]
+    fn primitive_conversion_preserves_geometry_identity_and_undo() {
+        for kind in ["rect", "ellipse", "star"] {
+            let (mut s, lid, uid) = fixture(kind);
+            let cid = s.active_comp_id().unwrap();
+            let layer = s.active_comp().unwrap().layer(lid).unwrap();
+            let old = layer.props.find_group(uid).unwrap().clone();
+            let ctx = effectcraft_render::EvalCtx::new(&s.project, cid, s.active_comp().unwrap(), s.time());
+            let expected = effectcraft_path::from_kurbo(&effectcraft_render::shapes::primitive_path(&ctx, layer, &old).unwrap());
+            if kind == "rect" {
+                s.execute("prop.select", json!({"layer":lid.0,"prop":old.get("size").unwrap().uid})).unwrap();
+                s.execute("path.convertToBezier", json!({})).unwrap();
+            } else {
+                s.execute("path.convertToBezier", json!({"layer":lid.0,"prop":uid})).unwrap();
+            }
+            let now = s.active_comp().unwrap().layer(lid).unwrap().props.find_group(uid).unwrap();
+            assert_eq!(now.match_id, "path");
+            assert_eq!(now.name, old.name);
+            assert_eq!(now.get("path").unwrap().value.as_path(), expected.first());
+            assert_eq!(now.get("direction"), old.get("direction"));
+            s.execute("edit.undo", json!({})).unwrap();
+            assert_eq!(s.active_comp().unwrap().layer(lid).unwrap().props.find_group(uid), Some(&old));
+        }
+    }
+
+    #[test]
+    fn animated_primitive_requires_explicit_snapshot_and_undo_restores_it() {
+        let (mut s, lid, uid) = fixture("rect");
+        let size = s.active_comp().unwrap().layer(lid).unwrap().props.find_group(uid).unwrap().get("size").unwrap().uid;
+        s.execute("prop.setExpression", json!({"layer":lid.0,"prop":size,"expression":"[120,80]"})).unwrap();
+        let before = s.active_comp().unwrap().layer(lid).unwrap().props.find_group(uid).unwrap().clone();
+        assert!(s.execute("path.convertToBezier", json!({"layer":lid.0,"prop":uid})).is_err());
+        assert_eq!(s.active_comp().unwrap().layer(lid).unwrap().props.find_group(uid), Some(&before));
+        s.execute("path.convertToBezier", json!({"layer":lid.0,"prop":uid,"snapshot":true})).unwrap();
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.active_comp().unwrap().layer(lid).unwrap().props.find_group(uid), Some(&before));
+    }
 }

@@ -51,7 +51,7 @@ fn nudge_cmd(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, _params: V
 /// The arrow keys over the Composition panel or the Timeline: move the selected layers 1 pixel
 /// at the viewer's magnification (`up`, `down`, `left`, `right`), 10 with Shift (`up10`…), as
 /// After Effects does, so zoomed in they move by fractions of a comp pixel. Not while typing,
-/// or with mask points selected.
+/// Selected path vertices take precedence over layers.
 fn nudge(app: &mut EffectcraftApp, ctx: &egui::Context, dir: &str) -> Result<Value, String> {
     let (side, n) = match dir.strip_suffix("10") {
         Some(side) => (side, 10.0),
@@ -65,12 +65,15 @@ fn nudge(app: &mut EffectcraftApp, ctx: &egui::Context, dir: &str) -> Result<Val
         _ => return Err(format!("unknown nudge `{dir}`")),
     };
     let st = &app.session.state;
-    if app.ui.focused == PanelKind::Project || st.selected_layers.is_empty() || st.text_edit.is_some() || !st.selected_vertices.is_empty() {
+    if app.ui.focused == PanelKind::Project || st.selected_layers.is_empty() || st.text_edit.is_some() {
         return Ok(Value::Null);
     }
     // Screen pixels per comp pixel.
     let zoom = (app.ui.viewer.zoom.unwrap_or_else(|| crate::panels::viewer::last_fit(ctx)) * ctx.pixels_per_point()) as f64;
     let k = if zoom.is_finite() && zoom > 1e-6 { 1.0 / zoom } else { 1.0 };
+    if !st.selected_vertices.is_empty() {
+        return crate::panels::viewer::move_path_vertices(app, ctx, [x * k, y * k], None);
+    }
     run_engine(app, ctx, "layer.nudge", json!({"x": x * k, "y": y * k}))
 }
 

@@ -165,7 +165,7 @@ pub(crate) fn draw_paths(
     paths: &mut Vec<PathInfo>,
 ) {
     let (m, _) = super::viewer::l2c(ectx, l);
-    let mut list: Vec<(u64, String, ShapePath, Mat3, Color32, bool)> = vec![];
+    let mut list: Vec<(u64, String, ShapePath, Mat3, Color32, bool, bool)> = vec![];
     if let Some(masks) = l.masks() {
         for g in masks.groups() {
             let GroupKind::Mask { color, locked, .. } = g.kind else { continue };
@@ -173,16 +173,19 @@ pub(crate) fn draw_paths(
                 continue;
             }
             let Some(sp) = g.get("path").map(|pr| ectx.value(l, pr)).and_then(|v| v.as_path().cloned()) else { continue };
-            list.push((g.uid, g.name.clone(), sp, m, Color32::from_rgb(color[0], color[1], color[2]), true));
+            list.push((g.uid, g.name.clone(), sp, m, Color32::from_rgb(color[0], color[1], color[2]), true, locked || l.switches.locked));
         }
     }
     for (uid, sp) in effectcraft_engine::viewer::shape_paths(ectx, l) {
         let im = effectcraft_engine::render::shapes::item_matrix(ectx, l, uid).unwrap_or(Mat3::IDENTITY);
         let name = l.props.find_group(uid).map(|g| g.name.clone()).unwrap_or_default();
-        list.push((uid, name, sp, m * im, label_col, false));
+        list.push((uid, name, sp, m * im, label_col, false, l.switches.locked));
     }
-    for (uid, name, sp, pm, mc, is_mask) in list {
+    for (uid, name, sp, pm, mc, is_mask, locked) in list {
         painter.add(egui::Shape::line(flatten(&sp, &pm, map), Stroke::new(1.0, mc)));
+        if locked {
+            continue;
+        }
         let scr = |p: [f64; 2]| {
             let c = pm.apply(gv2(p[0], p[1]));
             map.to_screen([c.x, c.y])

@@ -974,6 +974,14 @@ before.
   Lottie, SVG, PSD, PDF, timelines, expressions, media, engine commands); `cargo xtask bench
   --fail-over PCT` fails on resource regressions.
 
+## Update: 2026-10-14 — mask/shape interactions and panel windows
+
+- Full-frame vertex marquee, arrow nudging, edge auto-pan, per-vertex screen-space movement,
+  mask locks, parametric-to-Bezier conversion and shape visibility controls implemented.
+- Menu-created and ordinary floating panels use one native implementation; old window placement
+  records migrate to floating-group workspace state. Returning to the main window docks the group.
+- Regression tests added; validation status and remaining native checks in
+  [interaction-fixes.md](interaction-fixes.md). No readiness percentage increase.
 
 ## Update: one-time native FigCraft clipboard (14 October 2026)
 
@@ -1010,3 +1018,13 @@ before.
   rejection, identical save/reopen pixels and standalone stroke/shadow bounds passed native QA.
   Text metrics remain warned. Regression tests were compiled but not executed; no full CI was
   run under the fork daytime rules. Parity scores are unchanged.
+## Update: 2026-10-14 — inline precomps and graph controls
+
+- Inline precomp rows edit real source layers/properties/keys with validated instance paths,
+  renderer-aligned timing, source-targeted menus and atomic undo. Nonlinear inverse-time drags,
+  source graphs and clipboard operations require opening the source composition.
+- Graph speed samples expressions and separated Position followers; Fit All frames shown
+  animation. Graph keys expose editing dialogs/context actions; Graph Editor Set Only isolates
+  pinned curves. Existing graph tooltip/Reference-toggle regressions corrected.
+- Implementation notes and honest verification limits: [inline-precomp-editing.md](inline-precomp-editing.md),
+  [graph-editor-interactions.md](graph-editor-interactions.md). Runtime/native acceptance pending.

@@ -33,6 +33,19 @@ struct Snapshot {
     panel_windows: Vec<PanelWindow>,
 }
 
+/// Import legacy menu-created windows into the ordinary floating groups once. Keeping the
+/// serialized field readable preserves old workspaces without maintaining two window systems.
+pub(crate) fn migrate_panel_windows(ui: &mut UiState) {
+    for window in std::mem::take(&mut ui.panel_windows) {
+        let rect = PanelWindow::sanitized(window.rect);
+        for group in ui.floating.iter_mut().chain(ui.saved_floating.get_mut(&ui.workspace).into_iter().flatten()) {
+            if group.panels.contains(&window.panel) {
+                group.screen = Some(rect);
+            }
+        }
+    }
+}
+
 impl Snapshot {
     fn capture(ui: &UiState) -> Self {
         Self {
@@ -64,6 +77,7 @@ impl Snapshot {
             .filter(|window| floating(window.panel))
             .map(|window| PanelWindow { panel: window.panel, rect: PanelWindow::sanitized(window.rect) })
             .collect();
+        migrate_panel_windows(ui);
         // Reserve restored viewer slots without restoring any project-specific composition
         // links. New Viewer allocates from this map, including after switching named layouts.
         let mut panels = Vec::new();

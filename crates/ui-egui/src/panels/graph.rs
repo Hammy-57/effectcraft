@@ -104,7 +104,10 @@ fn shown_props(app: &EffectcraftApp, comp: &Comp) -> Vec<(LayerId, u64)> {
         }
         animated
     };
-    if app.ui.timeline.graph_show_set {
+    if app.ui.timeline.graph_set_only {
+        v.clear();
+    }
+    if app.ui.timeline.graph_show_set || app.ui.timeline.graph_set_only {
         for l in &comp.layers {
             l.props.walk("", &mut |_, pr| {
                 if pr.graph_editor && numeric(pr) && !v.contains(&(l.id, pr.uid)) {
@@ -114,6 +117,25 @@ fn shown_props(app: &EffectcraftApp, comp: &Comp) -> Vec<(LayerId, u64)> {
         }
     }
     v
+}
+
+const POSITION_AXES: [&str; 3] = ["positionX", "positionY", "positionZ"];
+
+/// EvalCtx reads separated Position from its followers, ignoring the original property's keys.
+fn separated_position<'a>(l: &'a Layer, pr: &Property) -> Option<&'a effectcraft_engine::project::PropGroup> {
+    if pr.match_id != "position" {
+        return None;
+    }
+    let tr = l.transform()?;
+    (tr.get("positionX").is_some() && tr.get("position").is_some_and(|position| position.uid == pr.uid)).then_some(tr)
+}
+
+fn curve_has_expression(l: &Layer, pr: &Property) -> bool {
+    if let Some(tr) = separated_position(l, pr) {
+        POSITION_AXES.iter().filter_map(|axis| tr.get(axis)).any(Property::has_expression)
+    } else {
+        pr.has_expression()
+    }
 }
 
 fn shown_dims(l: &Layer, pr: &Property) -> usize {
@@ -131,10 +153,35 @@ type Samples = (u64, std::sync::Arc<Vec<Vec<(f64, f64)>>>);
 /// graph its speed (spatial properties) or velocity.
 fn sample(ectx: &EvalCtx, l: &Layer, pr: &Property, d: usize, speed: bool, ct: f64) -> f64 {
     let tt = Tick::from_seconds_f64(ct);
+    if !ct.is_finite() || !l.stretch.is_finite() || l.stretch.abs() < 1e-9 || tt.0.checked_sub(l.start_time.0).is_none() {
+        return 0.0;
+    }
     if !speed {
         return ectx.at(tt).value(l, pr).components().get(d).copied().unwrap_or(0.0);
     }
     let lt = l.layer_time(tt);
+    if separated_position(l, pr).is_some() || (curve_has_expression(l, pr) && ectx.expr.is_some()) {
+        // Ease handles/velocity dialogs use units per layer second. Evaluate at the matching
+        // comp times so moving, stretching or reversing the layer does not change that unit.
+        const STEP: f64 = 0.0001;
+        let a = lt.seconds() - STEP;
+        let b = lt.seconds() + STEP;
+        let ta = Tick::from_seconds_f64(l.start_time.seconds() + a * l.stretch / 100.0);
+        let tb = Tick::from_seconds_f64(l.start_time.seconds() + b * l.stretch / 100.0);
+        if ta == tb || ta.0.checked_sub(l.start_time.0).is_none() || tb.0.checked_sub(l.start_time.0).is_none() {
+            return 0.0;
+        }
+        // EvalCtx applies the renderer's keyframe fallback for expression errors.
+        let va = ectx.at(ta).value(l, pr).components();
+        let vb = ectx.at(tb).value(l, pr).components();
+        let velocity = |i: usize| (vb.get(i).copied().unwrap_or(0.0) - va.get(i).copied().unwrap_or(0.0)) / (b - a);
+        let v = if pr.spatial && matches!(pr.value, Value::Vec2(_) | Value::Vec3(_)) {
+            (0..shown_dims(l, pr)).fold(0.0_f64, |magnitude, i| magnitude.hypot(velocity(i)))
+        } else {
+            velocity(d).abs()
+        };
+        return if v.is_finite() { v } else { 0.0 };
+    }
     if pr.spatial && matches!(pr.value, Value::Vec2(_) | Value::Vec3(_)) {
         effectcraft_engine::keyframe::speed(&pr.keys, lt, true)
     } else {
@@ -144,7 +191,7 @@ fn sample(ectx: &EvalCtx, l: &Layer, pr: &Property, d: usize, speed: bool, ct: f
 
 fn curves<'a>(app: &EffectcraftApp, ctx: &egui::Context, comp: &'a Comp, ectx: &EvalCtx, tm: TMap, plot: Rect, speed: bool) -> Vec<Curve<'a>> {
     let sel = &app.session.state.selected_keys;
-    let n = ((plot.width() / 2.0) as usize).max(2);
+    let n = ((plot.width() / 2.0) as usize).clamp(2, 2048);
     let props = shown_props(app, comp);
     let samples_key = {
         use std::hash::{Hash, Hasher};
@@ -180,7 +227,10 @@ fn curves<'a>(app: &EffectcraftApp, ctx: &egui::Context, comp: &'a Comp, ectx: &
             }
             sampled.push(pts.clone());
             let mut keys = vec![];
-            for (i, k) in pr.keys.iter().enumerate() {
+            // A pinned aggregate remains a useful readout after separation; only its followers
+            // own editable keys now. Never offer edits to the ignored pre-separation keys.
+            let base_keys = if separated_position(l, pr).is_some() { &[][..] } else { pr.keys.as_slice() };
+            for (i, k) in base_keys.iter().enumerate() {
                 let ks = sel.contains(&KeyRef { layer: lid, prop: uid, time: k.time });
                 let kt = l.comp_time(k.time).seconds();
                 let ed = if spatial { 0 } else { d };
@@ -429,7 +479,7 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
         if cs.iter().any(|c| c.keys.iter().any(|k| k.sel)) {
             fit_selection(app, &cs, ectx, speed, plot);
         } else {
-            fit_all(app);
+            fit_all(app, &cs, ectx, speed, plot);
         }
     }
 
@@ -568,6 +618,12 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
                     value,
                     graph_units(c.prop, speed)
                 ));
+                if speed {
+                    ui.label(crate::i18n::tr("Speed per layer second"));
+                }
+                if curve_has_expression(c.layer, c.prop) {
+                    ui.label(crate::i18n::tr("Expression result; keys and handles edit the underlying animation"));
+                }
             });
         }
     }
@@ -659,6 +715,44 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
                 // selection to it (Shift: takes it out).
                 actions.push(("keys.select".into(), p));
             }
+            if kresp.secondary_clicked() && !k.sel {
+                actions.push(("keys.select".into(), json!({"keys": [kjson.clone()]})));
+            }
+            if kresp.double_clicked() {
+                if speed {
+                    actions.push(("keys.velocity".into(), json!({})));
+                } else if matches!(key.value, Value::Scalar(_) | Value::Vec2(_) | Value::Vec3(_)) {
+                    actions.push(("keys.set".into(), kjson.clone()));
+                } else {
+                    actions.push(("keys.interpolation".into(), json!({})));
+                }
+            }
+            widgets::context_menu(&kresp, |ui| {
+                for (id, label, command, params) in [
+                    ("editValue", "Edit Value…", "keys.set", kjson.clone()),
+                    ("interpolation", "Keyframe Interpolation…", "keys.interpolation", json!({})),
+                    ("velocity", "Keyframe Velocity…", "keys.velocity", json!({})),
+                    ("hold", "Toggle Hold Keyframe", "keys.toggleHold", json!({})),
+                    ("ease", "Easy Ease", "keys.easyEase", json!({})),
+                    ("easeIn", "Easy Ease In", "keys.easyEaseIn", json!({})),
+                    ("easeOut", "Easy Ease Out", "keys.easyEaseOut", json!({})),
+                    ("delete", "Delete Keyframes", "keys.delete", json!({})),
+                ] {
+                    if id == "editValue" && !matches!(key.value, Value::Scalar(_) | Value::Vec2(_) | Value::Vec3(_)) {
+                        continue;
+                    }
+                    let response = ui.button(crate::i18n::tr(label));
+                    app.auto.add(&format!("timeline.graph.keyMenu.{id}"), response.rect, label);
+                    if response.clicked() {
+                        // A context action on a selected key operates on the whole selection.
+                        if !k.sel {
+                            actions.push(("keys.select".into(), json!({"keys": [kjson.clone()]})));
+                        }
+                        actions.push((command.into(), params));
+                        ui.close();
+                    }
+                }
+            });
             // A drag moves every selected key, by how far the pointer went from where the button
             // went down (the key doesn't jump under the pointer); Shift keeps it to the time or
             // the value axis, whichever moved more.
@@ -858,14 +952,25 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
         _ => {}
     }
     let opts = [
-        ("showSelected", "Show Selected Properties", app.ui.timeline.graph_show_selected),
-        ("showAnimated", "Show Animated Properties", !app.ui.timeline.graph_show_selected),
+        ("showSelected", "Show Selected Properties", app.ui.timeline.graph_show_selected && !app.ui.timeline.graph_set_only),
+        ("showAnimated", "Show Animated Properties", !app.ui.timeline.graph_show_selected && !app.ui.timeline.graph_set_only),
         ("showSet", "Show Graph Editor Set", app.ui.timeline.graph_show_set),
+        ("setOnly", "Graph Editor Set Only", app.ui.timeline.graph_set_only),
     ];
     match options_menu(app, ui, p, &mut buttons, y, "propertyOptions", "Properties ▾", &opts) {
-        Some(0) => app.ui.timeline.graph_show_selected = true,
-        Some(1) => app.ui.timeline.graph_show_selected = false,
-        Some(2) => app.ui.timeline.graph_show_set = !app.ui.timeline.graph_show_set,
+        Some(0) => {
+            app.ui.timeline.graph_show_selected = true;
+            app.ui.timeline.graph_set_only = false;
+        }
+        Some(1) => {
+            app.ui.timeline.graph_show_selected = false;
+            app.ui.timeline.graph_set_only = false;
+        }
+        Some(2) => {
+            app.ui.timeline.graph_show_set = !app.ui.timeline.graph_show_set;
+            app.ui.timeline.graph_set_only = false;
+        }
+        Some(3) => app.ui.timeline.graph_set_only = !app.ui.timeline.graph_set_only,
         _ => {}
     }
     buttons.x += 6.0;
@@ -874,7 +979,7 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
         app.ui.timeline.graph_auto_zoom = !auto_on;
     }
     if text_button(app, ui, p, &mut buttons, y, "Fit", false, "fit", "Fit all graphs to view") {
-        fit_all(app);
+        fit_all(app, &cs, ectx, speed, plot);
     }
     if text_button(app, ui, p, &mut buttons, y, "Fit Selection", false, "fitSelection", "Fit selection to view") {
         fit_selection(app, &cs, ectx, speed, plot);
@@ -1076,10 +1181,10 @@ fn set_graph_type(app: &mut EffectcraftApp, mode: &str) {
     }
 }
 
-/// Fit All Graphs to View: the whole comp in time, auto-zoomed values.
-fn fit_all(app: &mut EffectcraftApp) {
+/// Fit shown animation, rather than shrinking a short move into the entire composition.
+fn fit_all(app: &mut EffectcraftApp, cs: &[Curve], ectx: &EvalCtx, speed: bool, plot: Rect) {
+    fit_keys(app, cs, ectx, speed, plot, false);
     app.ui.timeline.graph_auto_zoom = true;
-    app.ui.timeline.pps = None;
 }
 
 fn fit_pending_id() -> egui::Id {
@@ -1112,12 +1217,25 @@ pub(crate) fn track_open(ctx: &egui::Context, tl: &mut crate::state::TimelineSta
 
 /// Zoom time and value to the selected keys (and their handles).
 fn fit_selection(app: &mut EffectcraftApp, cs: &[Curve], ectx: &EvalCtx, speed: bool, plot: Rect) {
+    fit_keys(app, cs, ectx, speed, plot, true);
+}
+
+fn fit_keys(app: &mut EffectcraftApp, cs: &[Curve], ectx: &EvalCtx, speed: bool, plot: Rect, selected_only: bool) {
     let mut t0 = f64::INFINITY;
     let mut t1 = f64::NEG_INFINITY;
     let mut v0 = f64::INFINITY;
     let mut v1 = f64::NEG_INFINITY;
     for c in cs {
-        for k in c.keys.iter().filter(|k| k.sel) {
+        if !selected_only && let Some(tr) = separated_position(c.layer, c.prop) {
+            for key in POSITION_AXES.iter().filter_map(|axis| tr.get(axis)).flat_map(|prop| &prop.keys) {
+                let time = c.layer.start_time.seconds() + key.time.seconds() * c.layer.stretch / 100.0;
+                if time.is_finite() {
+                    t0 = t0.min(time);
+                    t1 = t1.max(time);
+                }
+            }
+        }
+        for k in c.keys.iter().filter(|k| !selected_only || k.sel) {
             for (t, v) in std::iter::once((k.t, k.v)).chain(k.handles.iter().map(|h| (h.t, h.v))) {
                 t0 = t0.min(t);
                 t1 = t1.max(t);
@@ -1126,14 +1244,25 @@ fn fit_selection(app: &mut EffectcraftApp, cs: &[Curve], ectx: &EvalCtx, speed: 
             }
         }
     }
-    if !t0.is_finite() {
+    if !selected_only {
+        // Expressions can animate beyond their base keys; frame their layer's active interval.
+        for c in cs.iter().filter(|c| curve_has_expression(c.layer, c.prop)) {
+            t0 = t0.min(c.layer.in_point.seconds());
+            t1 = t1.max(c.layer.out_point.seconds());
+        }
+    }
+    if !t0.is_finite() || !t1.is_finite() {
+        if !selected_only {
+            app.ui.timeline.start = 0.0;
+            app.ui.timeline.pps = None;
+        }
         return;
     }
     // A lone selected key (one point) also frames its neighbouring keys, so its curve shows
     // instead of a flat sliver a fraction of a frame wide.
     if t1 - t0 < 1e-6 {
         for c in cs {
-            for (i, k) in c.keys.iter().enumerate().filter(|(_, k)| k.sel) {
+            for (i, k) in c.keys.iter().enumerate().filter(|(_, k)| !selected_only || k.sel) {
                 for n in [i.checked_sub(1).and_then(|j| c.keys.get(j)), c.keys.get(i + 1), Some(k)].into_iter().flatten() {
                     t0 = t0.min(n.t);
                     t1 = t1.max(n.t);
@@ -1145,7 +1274,7 @@ fn fit_selection(app: &mut EffectcraftApp, cs: &[Curve], ectx: &EvalCtx, speed: 
     }
     // And the curves between them: an eased speed graph is 0 at both keys and peaks in between
     // (sampled here: the drawn samples only cover the view before the fit).
-    for c in cs.iter().filter(|c| c.keys.iter().any(|k| k.sel)) {
+    for c in cs.iter().filter(|c| !selected_only || c.keys.iter().any(|k| k.sel)) {
         for i in 0..=FIT_SAMPLES {
             let v = sample(ectx, c.layer, c.prop, c.dim, speed, t0 + (t1 - t0) * i as f64 / FIT_SAMPLES as f64);
             if v.is_finite() {
@@ -1260,6 +1389,123 @@ fn shift_axes(shift: bool, dx: f32, dy: f32) -> (bool, bool) {
 #[cfg(test)]
 mod tests {
     use super::shift_axes;
+
+    #[test]
+    fn pinned_separated_position_uses_follower_expressions_keys_and_fit_bounds() {
+        use super::*;
+        let mut s = effectcraft_host::session();
+        s.execute("comp.new", json!({"name": "Separated speed", "duration": 20})).unwrap();
+        s.execute("layer.newSolid", json!({"name": "Box", "width": 10, "height": 10})).unwrap();
+        let cid = s.state.active_comp.unwrap();
+        let lid = s.active_comp().unwrap().layers[0].id;
+        let uid = s.active_comp().unwrap().layer(lid).unwrap().props.prop("transform/position").unwrap().uid;
+        s.execute("prop.addKey", json!({"layer": lid.0, "path": "transform/position", "time": 10.0, "value": [300.0, 200.0, 0.0]})).unwrap();
+        s.execute("prop.graphPin", json!({"layer": lid.0, "prop": uid, "value": true})).unwrap();
+        s.execute("prop.separateDimensions", json!({"layer": lid.0, "value": true})).unwrap();
+        s.execute("prop.setExpression", json!({"layer": lid.0, "path": "transform/positionX", "expression": "time * 30"})).unwrap();
+        let l = std::sync::Arc::make_mut(&mut s.project).comp_mut(cid).unwrap().layer_mut(lid).unwrap();
+        l.in_point = Tick::from_seconds_f64(3.0);
+        l.out_point = Tick::from_seconds_f64(6.0);
+        // Removing follower keys leaves the obsolete combined keys in the document.
+        for axis in POSITION_AXES {
+            l.props.sub_mut("transform").unwrap().get_mut(axis).unwrap().keys.clear();
+        }
+        let mut app = crate::EffectcraftApp::new(s);
+        app.ui.timeline.graph_set_only = true;
+        app.ui.timeline.graph_mode = "speed".into();
+        let plot = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 400.0));
+        for expressions in [true, false] {
+            if !expressions {
+                app.session
+                    .execute("prop.setExpression", json!({"layer": lid.0, "path": "transform/positionX", "expression": "time * 30", "enabled": false}))
+                    .unwrap();
+                for (time, value) in [(4.0, 0.0), (5.0, 100.0)] {
+                    app.session.execute("prop.addKey", json!({"layer": lid.0, "path": "transform/positionX", "time": time, "value": value})).unwrap();
+                }
+                // No expression engine is needed to sample composed follower keyframes.
+                app.session.expr = None;
+            }
+            let project = app.session.project.clone();
+            let expr = app.session.expr.clone();
+            let comp = project.comp(cid).unwrap();
+            let layer = comp.layer(lid).unwrap();
+            let prop = layer.props.find(uid).unwrap();
+            let ctx = EvalCtx { expr: expr.as_deref(), ..EvalCtx::new(&project, cid, comp, Tick::ZERO) };
+            assert_eq!(shown_props(&app, comp), vec![(lid, uid)]);
+            assert_eq!(curve_has_expression(layer, prop), expressions);
+            assert!((sample(&ctx, layer, prop, 0, true, 4.5) - if expressions { 30.0 } else { 100.0 }).abs() < 1e-4);
+            let curves = curves(&app, &egui::Context::default(), comp, &ctx, TMap { x0: 0.0, start: 0.0, pps: 40.0 }, plot, true);
+            assert!(curves.iter().all(|c| c.keys.is_empty()));
+            fit_all(&mut app, &curves, &ctx, true, plot);
+            let span = f64::from(plot.width()) / app.ui.timeline.pps.unwrap();
+            assert!((span - if expressions { 3.75 } else { 1.25 }).abs() < 1e-6);
+            assert!((app.ui.timeline.start - if expressions { 2.7 } else { 3.9 }).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn expression_speed_samples_evaluated_values_and_preserves_layer_time_units() {
+        use super::*;
+        let mut s = effectcraft_host::session();
+        s.execute("comp.new", json!({"name": "Expression speed", "duration": 20})).unwrap();
+        s.execute("layer.newSolid", json!({"name": "Box", "width": 10, "height": 10})).unwrap();
+        let cid = s.state.active_comp.unwrap();
+        let lid = s.active_comp().unwrap().layers[0].id;
+        for (time, value) in [(0.0, 0.0), (10.0, 100.0)] {
+            s.execute("prop.addKey", json!({"layer": lid.0, "path": "transform/rotation", "time": time, "value": value})).unwrap();
+        }
+        for stretch in [100.0_f64, 200.0, -100.0] {
+            for (expression, expected) in [("time * 30", 30.0 * stretch.abs() / 100.0), ("value", 10.0), ("throw new Error('test')", 10.0)] {
+                s.execute("prop.setExpression", json!({"layer": lid.0, "path": "transform/rotation", "expression": expression})).unwrap();
+                let comp = s.active_comp().unwrap();
+                let mut layer = comp.layer(lid).unwrap().clone();
+                layer.stretch = stretch;
+                layer.start_time = Tick::from_seconds_f64(8.0);
+                let prop = layer.props.prop("transform/rotation").unwrap();
+                let ctx = EvalCtx { expr: s.expr.as_deref(), ..EvalCtx::new(&s.project, cid, comp, Tick::ZERO) };
+                let ct = layer.comp_time(Tick::from_seconds_f64(2.0)).seconds();
+                let speed = sample(&ctx, &layer, prop, 0, true, ct);
+                assert!((speed - expected).abs() < 1e-4, "{expression}, stretch {stretch}: {speed} != {expected}");
+            }
+        }
+        s.execute("prop.setExpression", json!({"layer": lid.0, "path": "transform/position", "expression": "[time * 3, time * 4, 0]"})).unwrap();
+        let comp = s.active_comp().unwrap();
+        let layer = comp.layer(lid).unwrap();
+        let ctx = EvalCtx { expr: s.expr.as_deref(), ..EvalCtx::new(&s.project, cid, comp, Tick::ZERO) };
+        let prop = layer.props.prop("transform/position").unwrap();
+        assert!((sample(&ctx, layer, prop, 0, true, 2.0) - 5.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn expression_speed_rejects_nonfinite_results_and_disabled_expressions_use_keys() {
+        use super::*;
+        struct Nonfinite;
+        impl effectcraft_render::ExprHost for Nonfinite {
+            fn eval(&self, _: &EvalCtx, _: &Layer, _: &Property, _: &Value) -> Result<Value, String> {
+                Ok(Value::Scalar(f64::INFINITY))
+            }
+        }
+        let mut s = effectcraft_engine::Session::default();
+        s.execute("comp.new", json!({"name": "Invalid expression", "duration": 10})).unwrap();
+        s.execute("layer.newSolid", json!({"name": "Box", "width": 10, "height": 10})).unwrap();
+        let cid = s.state.active_comp.unwrap();
+        let lid = s.active_comp().unwrap().layers[0].id;
+        for (time, value) in [(0.0, 0.0), (10.0, 100.0)] {
+            s.execute("prop.addKey", json!({"layer": lid.0, "path": "transform/rotation", "time": time, "value": value})).unwrap();
+        }
+        s.execute("prop.setExpression", json!({"layer": lid.0, "path": "transform/rotation", "expression": "Infinity"})).unwrap();
+        let comp = s.active_comp().unwrap();
+        let layer = comp.layer(lid).unwrap();
+        let mut prop = layer.props.prop("transform/rotation").unwrap().clone();
+        let ctx = EvalCtx { expr: Some(&Nonfinite), ..EvalCtx::new(&s.project, cid, comp, Tick::ZERO) };
+        assert_eq!(sample(&ctx, layer, &prop, 0, true, 2.0), 0.0);
+        assert_eq!(sample(&ctx, layer, &prop, 0, true, f64::NAN), 0.0);
+        let mut malformed = layer.clone();
+        malformed.start_time = Tick(i64::MIN);
+        assert_eq!(sample(&ctx, &malformed, &prop, 0, true, 2.0), 0.0);
+        prop.expr.as_mut().unwrap().enabled = false;
+        assert!((sample(&ctx, layer, &prop, 0, true, 2.0) - 10.0).abs() < 1e-4);
+    }
 
     #[test]
     fn zoom_never_collapses_the_value_axis() {

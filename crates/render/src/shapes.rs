@@ -181,6 +181,26 @@ fn used_slots(live: &[usize], draws: &[Draw]) -> Vec<usize> {
     v
 }
 
+/// Evaluated parametric geometry in item space, before Path Direction or group transforms.
+/// Conversion to editable Bezier paths uses the same geometry as rasterization.
+pub fn primitive_path(ctx: &EvalCtx, layer: &Layer, g: &PropGroup) -> Option<BezPath> {
+    Some(match g.match_id.as_str() {
+        "rect" => effectcraft_path::rect(ctx.v2(layer, g, "size", [100.0; 2]), ctx.v2(layer, g, "position", [0.0; 2]), ctx.f(layer, g, "roundness", 0.0)),
+        "ellipse" => effectcraft_path::ellipse(ctx.v2(layer, g, "size", [100.0; 2]), ctx.v2(layer, g, "position", [0.0; 2])),
+        "star" => effectcraft_path::polystar(
+            ctx.e(layer, g, "type") == 0,
+            ctx.f(layer, g, "points", 5.0),
+            ctx.v2(layer, g, "position", [0.0; 2]),
+            ctx.f(layer, g, "rotation", 0.0),
+            ctx.f(layer, g, "innerRadius", 50.0),
+            ctx.f(layer, g, "outerRadius", 100.0),
+            ctx.f(layer, g, "innerRoundness", 0.0),
+            ctx.f(layer, g, "outerRoundness", 0.0),
+        ),
+        _ => return None,
+    })
+}
+
 /// Collect the draws of a contents group and the path slots live at its end (in group space).
 /// `arena` holds every path slot; operators rewrite slots in place.
 fn collect(ctx: &EvalCtx, layer: &Layer, contents: &PropGroup, arena: &mut Vec<BezPath>) -> (Vec<Draw>, Vec<usize>) {
@@ -194,30 +214,10 @@ fn collect(ctx: &EvalCtx, layer: &Layer, contents: &PropGroup, arena: &mut Vec<B
             continue;
         }
         match g.match_id.as_str() {
-            "rect" => {
-                let size = ctx.v2(layer, g, "size", [100.0; 2]);
-                let pos = ctx.v2(layer, g, "position", [0.0; 2]);
-                let p = effectcraft_path::rect(size, pos, ctx.f(layer, g, "roundness", 0.0));
-                push_shape(ctx, layer, g, p, arena, &mut live);
-            }
-            "ellipse" => {
-                let size = ctx.v2(layer, g, "size", [100.0; 2]);
-                let pos = ctx.v2(layer, g, "position", [0.0; 2]);
-                push_shape(ctx, layer, g, effectcraft_path::ellipse(size, pos), arena, &mut live);
-            }
-            "star" => {
-                let star = ctx.e(layer, g, "type") == 0;
-                let p = effectcraft_path::polystar(
-                    star,
-                    ctx.f(layer, g, "points", 5.0),
-                    ctx.v2(layer, g, "position", [0.0; 2]),
-                    ctx.f(layer, g, "rotation", 0.0),
-                    ctx.f(layer, g, "innerRadius", 50.0),
-                    ctx.f(layer, g, "outerRadius", 100.0),
-                    ctx.f(layer, g, "innerRoundness", 0.0),
-                    ctx.f(layer, g, "outerRoundness", 0.0),
-                );
-                push_shape(ctx, layer, g, p, arena, &mut live);
+            "rect" | "ellipse" | "star" => {
+                if let Some(p) = primitive_path(ctx, layer, g) {
+                    push_shape(ctx, layer, g, p, arena, &mut live);
+                }
             }
             "path" => {
                 if let Some(Value::Path(p)) = ctx.group_value(layer, g, "path") {

@@ -37,6 +37,65 @@ impl ViewerMap {
     }
 }
 
+/// Move selected points by a viewer-space displacement, converting separately for each path.
+pub(crate) fn move_path_vertices(app: &mut EffectcraftApp, ctx: &egui::Context, delta: [f64; 2], merge: Option<&str>) -> Result<serde_json::Value, String> {
+    let cid = app.session.active_comp_id().ok_or("no composition")?;
+    let comp = app.session.active_comp().ok_or("no composition")?;
+    let ectx = EvalCtx {
+        footage: Some(app.session.footage.as_ref()),
+        expr: app.session.expr.as_deref(),
+        ..EvalCtx::new(&app.session.project, cid, comp, app.session.time())
+    };
+    let mut paths: std::collections::BTreeMap<_, Vec<usize>> = std::collections::BTreeMap::new();
+    for vertex in &app.session.state.selected_vertices {
+        paths.entry((vertex.layer, vertex.mask)).or_default().push(vertex.index);
+    }
+    let mut deltas = Vec::new();
+    for ((lid, uid), mut indices) in paths {
+        indices.sort_unstable();
+        indices.dedup();
+        let layer = comp.layer(lid).ok_or("selected layer is gone")?;
+        let group = layer.props.find_group(uid).ok_or("selected path is gone")?;
+        let mut matrix = match app.session.view_camera(cid) {
+            Some(camera) if layer.is_3d() => three_d::layer_to_view(&ectx, layer, &camera),
+            _ => ectx.layer_to_comp(layer).0,
+        };
+        if group.match_id == "path" {
+            matrix = matrix * effectcraft_engine::render::shapes::item_matrix(&ectx, layer, uid).ok_or("shape transform unavailable")?;
+        }
+        let inverse = matrix.inverse().ok_or("path transform is singular")?;
+        let value = ectx.group_value(layer, group, "path").ok_or("path value unavailable")?;
+        let path = value.as_path().ok_or("not an editable path")?;
+        for index in indices {
+            let point = path.vertices.get(index).ok_or("selected vertex is gone")?;
+            // A projective 3D path has no single inverse displacement: map each point separately.
+            let screen = matrix.apply(gv2(point[0], point[1]));
+            let moved = inverse.apply(gv2(screen.x + delta[0], screen.y + delta[1]));
+            let d = [moved.x - point[0], moved.y - point[1]];
+            if !d.iter().all(|v| v.is_finite()) {
+                return Err("invalid path displacement".into());
+            }
+            deltas.push(json!({"layer": lid.0, "mask": uid, "index": index, "delta": d}));
+        }
+    }
+    crate::menus::invoke(app, ctx, "mask.moveVertices", json!({"delta": [0, 0], "deltas": deltas, "merge": merge}))
+}
+
+/// Screen points per frame, bounded even after a stalled frame or pointer outside the viewport.
+fn path_edge_pan(area: Rect, at: Pos2, dt: f32) -> egui::Vec2 {
+    if !area.is_finite() || !at.x.is_finite() || !at.y.is_finite() || !dt.is_finite() {
+        return egui::Vec2::ZERO;
+    }
+    let axis = |lo: f32, hi: f32, p: f32| {
+        let zone = 24.0_f32.min((hi - lo).max(0.0) / 2.0);
+        if zone <= 0.0 {
+            return 0.0;
+        }
+        ((lo + zone - p).max(0.0) - (p - (hi - zone)).max(0.0)).clamp(-zone, zone) / zone
+    };
+    vec2(axis(area.min.x, area.max.x, at.x), axis(area.min.y, area.max.y, at.y)) * (600.0 * dt.clamp(0.0, 0.05))
+}
+
 fn map_id() -> egui::Id {
     egui::Id::new("viewer-map")
 }
@@ -123,12 +182,11 @@ enum Gesture {
         start: Pos2,
     },
     /// Dragging selected mask / shape path vertices: press point, the grabbed vertex (comp px,
-    /// it snaps), the comp-space move applied so far and comp → path space.
+    /// it snaps), the comp-space move applied so far.
     Vertices {
         start: [f64; 2],
         src: [f64; 2],
         applied: [f64; 2],
-        inv: Mat3,
         layer: LayerId,
     },
     /// Dragging a vertex's Bezier tangent (both sides symmetric unless Alt breaks them).
@@ -885,6 +943,20 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let fit = if app.ui.viewer.fit_up_to_100 { fit.min(1.0 / ctx.pixels_per_point()) } else { fit };
     ctx.data_mut(|d| d.insert_temp(egui::Id::new("viewer-fit"), fit));
     let zoom = app.ui.viewer.zoom.unwrap_or(fit);
+    let path_drag = ctx.data(|d| {
+        matches!(d.get_temp::<Gesture>(egui::Id::new("viewer-gesture")), Some(Gesture::Vertices { .. } | Gesture::Tangent { .. } | Gesture::Pen { .. }))
+    });
+    if path_drag
+        && ctx.input(|i| i.pointer.primary_down())
+        && let Some(pos) = ctx.pointer_latest_pos()
+    {
+        let d = path_edge_pan(area, pos, ctx.input(|i| i.stable_dt));
+        if d != egui::Vec2::ZERO {
+            app.ui.viewer.pan[0] += d.x;
+            app.ui.viewer.pan[1] += d.y;
+            ctx.request_repaint();
+        }
+    }
     let center = area.center() + vec2(app.ui.viewer.pan[0], app.ui.viewer.pan[1]);
     // On the physical pixel grid, so at 100 % every comp pixel covers exactly one screen pixel
     // instead of being blended with its neighbour (#882).
@@ -1617,14 +1689,14 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     let _ = app.session.execute("mask.selectVertices", json!({"vertices": [me], "add": mods.shift}));
                 }
                 let src = h.l2c.apply(gv2(h.vertex[0], h.vertex[1]));
-                Gesture::Vertices {
-                    start: map.to_comp(press),
-                    src: [src.x, src.y],
-                    applied: [0.0; 2],
-                    inv: h.l2c.inverse().unwrap_or(Mat3::IDENTITY),
-                    layer: h.layer,
-                }
+                Gesture::Vertices { start: map.to_comp(press), src: [src.x, src.y], applied: [0.0; 2], layer: h.layer }
             }),
+            // Active paths own empty-area drags even over full-frame artwork. Alt keeps layer dragging available.
+            Tool::Selection
+                if !mods.alt && vertex_hits.iter().any(|h| h.tangent.is_none()) && !handle_hits.iter().any(|(_, _, h, _)| h.distance(press) < HANDLE + 2.0) =>
+            {
+                Some(Gesture::Marquee { start: press })
+            }
             // Everything starts where the button went down: by the time the pointer has moved
             // far enough to count as a drag it may have left a small handle.
             Tool::Selection => {
@@ -1788,16 +1860,18 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     draw_shape_ghost(&painter, &map, app, &d, &t);
                 }
             }
-            Gesture::Vertices { start, src, applied, inv, layer } => {
+            Gesture::Vertices { start, src, applied, layer } => {
                 // The grabbed vertex snaps (to other layers' vertices and features, guides, grid).
                 let want = [cpt[0] - start[0], cpt[1] - start[1]];
                 let c = vt::snap(app, &ctx, &ectx, &map, &[layer], &[[src[0] + want[0], src[1] + want[1]]], mods);
                 let total = [want[0] + c[0], want[1] + c[1]];
-                let d = inv.apply_vec(gv2(total[0] - applied[0], total[1] - applied[1]));
-                if d.x != 0.0 || d.y != 0.0 {
-                    let _ = app.session.execute("mask.moveVertices", json!({"delta": [d.x, d.y], "merge": merge}));
+                let d = [total[0] - applied[0], total[1] - applied[1]];
+                if (d != [0.0; 2])
+                    && let Err(e) = move_path_vertices(app, &ctx, d, Some(&merge))
+                {
+                    app.ui.status = e;
                 }
-                ui.data_mut(|dd| dd.insert_temp(gid, Gesture::Vertices { start, src, applied: total, inv, layer }));
+                ui.data_mut(|dd| dd.insert_temp(gid, Gesture::Vertices { start, src, applied: total, layer }));
             }
             Gesture::Overlay(d) => match d {
                 ov::Drag::Guide { index, vertical } => {
@@ -1943,7 +2017,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 Gesture::Overlay(ov::Drag::Guide { index, .. }) if !area.contains(pos) || !comp_rect.expand(40.0).contains(pos) => {
                     let _ = app.session.execute("view.removeGuide", json!({"index": index}));
                 }
-                Gesture::Marquee { start } if vertex_hits.iter().any(|h| h.tangent.is_none() && Rect::from_two_pos(start, pos).contains(h.pos)) => {
+                Gesture::Marquee { start } if vertex_hits.iter().any(|h| h.tangent.is_none()) => {
                     // Marquee over path vertices selects them.
                     let r = Rect::from_two_pos(start, pos);
                     let v: Vec<serde_json::Value> = vertex_hits
@@ -3052,5 +3126,87 @@ mod puppet_input_tests {
             ]),
             "a numeric property drag outside the viewer keeps mesh feedback live"
         );
+    }
+}
+
+#[cfg(test)]
+mod path_displacement_tests {
+    use super::*;
+    #[test]
+    fn vertices_on_differently_scaled_layers_move_the_same_comp_distance() {
+        let mut s = effectcraft_engine::Session::default();
+        s.execute("comp.new", json!({"width":640,"height":360})).unwrap();
+        let mut paths = Vec::new();
+        for scale in [100.0, 200.0] {
+            let lid = s.execute("layer.newSolid", json!({"width":100,"height":100})).unwrap()["layer"].as_u64().unwrap();
+            s.execute("prop.set", json!({"layer":lid,"prop":"transform/scale","value":[scale,scale,100.0]})).unwrap();
+            let uid = s.execute("mask.new", json!({"layer":lid,"vertices":[[10,10],[40,10],[40,40]],"closed":true})).unwrap()["mask"].as_u64().unwrap();
+            paths.push((lid, uid, scale));
+        }
+        s.execute("mask.selectVertices", json!({"vertices":paths.iter().map(|(l,u,_)| json!({"layer":l,"mask":u,"index":0})).collect::<Vec<_>>()})).unwrap();
+        let mut app = EffectcraftApp::new(s);
+        move_path_vertices(&mut app, &egui::Context::default(), [10.0, 0.0], None).unwrap();
+        for (lid, uid, scale) in paths {
+            let p = app
+                .session
+                .active_comp()
+                .unwrap()
+                .layer(LayerId(lid))
+                .unwrap()
+                .props
+                .find_group(uid)
+                .unwrap()
+                .get("path")
+                .unwrap()
+                .value
+                .as_path()
+                .unwrap()
+                .vertices[0];
+            assert!(((p[0] - 10.0) * scale / 100.0 - 10.0).abs() < 1e-9);
+        }
+    }
+    #[test]
+    fn tilted_3d_mask_points_keep_equal_screen_displacement() {
+        VIEW_CAM.with(|c| c.set(None));
+        let mut s = effectcraft_engine::Session::default();
+        s.execute("comp.new", json!({"width":640,"height":360})).unwrap();
+        let lid = s.execute("layer.newSolid", json!({"width":400,"height":200})).unwrap()["layer"].as_u64().unwrap();
+        s.execute("layer.setSwitch", json!({"layers":[lid],"switch":"threeD","value":true})).unwrap();
+        s.execute("prop.set", json!({"layer":lid,"prop":"transform/rotationY","value":55})).unwrap();
+        let uid = s.execute("mask.new", json!({"layer":lid,"vertices":[[20,20],[300,20],[300,160]],"closed":true})).unwrap()["mask"].as_u64().unwrap();
+        s.execute("mask.selectVertices", json!({"vertices":[{"layer":lid,"mask":uid,"index":0},{"layer":lid,"mask":uid,"index":1}]})).unwrap();
+        let projected = |s: &effectcraft_engine::Session| {
+            let comp = s.active_comp().unwrap();
+            let layer = comp.layer(LayerId(lid)).unwrap();
+            let ctx = EvalCtx::new(&s.project, s.active_comp_id().unwrap(), comp, s.time());
+            let m = ctx.layer_to_comp(layer).0;
+            assert!(!m.is_affine());
+            layer
+                .props
+                .find_group(uid)
+                .unwrap()
+                .get("path")
+                .unwrap()
+                .value
+                .as_path()
+                .unwrap()
+                .vertices
+                .iter()
+                .map(|p| m.apply(gv2(p[0], p[1])))
+                .collect::<Vec<_>>()
+        };
+        s.execute("view.set3DView", json!({"view":"Top"})).unwrap();
+        let stale = s.view_camera(s.active_comp_id().unwrap());
+        s.execute("view.set3DView", json!({"view":"Active Camera"})).unwrap();
+        VIEW_CAM.with(|c| c.set(stale)); // the keyboard command runs before the new viewer paints
+        let before = projected(&s);
+        let mut app = EffectcraftApp::new(s);
+        move_path_vertices(&mut app, &egui::Context::default(), [10.0, 5.0], None).unwrap();
+        let after = projected(&app.session);
+        for i in 0..2 {
+            assert!((after[i].x - before[i].x - 10.0).abs() < 1e-7 && (after[i].y - before[i].y - 5.0).abs() < 1e-7);
+        }
+        assert_eq!(before[2], after[2]);
+        VIEW_CAM.with(|c| c.set(None));
     }
 }
