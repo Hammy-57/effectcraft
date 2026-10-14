@@ -40,6 +40,8 @@ pub(super) fn expander(app: &mut EffectcraftApp, ui: &mut egui::Ui, root: ItemId
 
 pub(super) fn expand(app: &EffectcraftApp, root: ItemId, rows: Vec<Row>) -> Vec<Row> {
     let mut out = Vec::with_capacity(rows.len());
+    // Repeated instances share row structure within this pass, but keep their own time/path.
+    let mut sources = std::collections::BTreeMap::new();
     let mut i = 0;
     while let Some(row) = rows.get(i) {
         let layer = row.layer;
@@ -47,18 +49,18 @@ pub(super) fn expand(app: &EffectcraftApp, root: ItemId, rows: Vec<Row>) -> Vec<
             out.push(row.clone());
             i += 1;
         }
-        append(app, root, &[layer.0], &mut out);
+        append(app, root, &[layer.0], &mut out, &mut sources);
     }
     out
 }
 
-fn append(app: &EffectcraftApp, root: ItemId, path: &[u64], out: &mut Vec<Row>) {
+fn append(app: &EffectcraftApp, root: ItemId, path: &[u64], out: &mut Vec<Row>, sources: &mut std::collections::BTreeMap<ItemId, std::sync::Arc<Vec<Row>>>) {
     if out.len() >= MAX_ROWS || !app.ui.timeline.inline_precomps.contains(&instance_key(root, path)) {
         return;
     }
     let Ok(context) = inline_comp::context(&app.session, root, path, app.session.time_of(root)) else { return };
     let Some(comp) = app.session.project.comp(context.comp) else { return };
-    let rows = build_rows(app, comp);
+    let rows = sources.entry(context.comp).or_insert_with(|| std::sync::Arc::new(build_rows(app, comp))).clone();
     let mut i = 0;
     while let Some(row) = rows.get(i) {
         if out.len() >= MAX_ROWS {
@@ -82,7 +84,7 @@ fn append(app: &EffectcraftApp, root: ItemId, path: &[u64], out: &mut Vec<Row>) 
         if path.len() < inline_comp::MAX_DEPTH {
             let mut next = path.to_vec();
             next.push(layer.0);
-            append(app, root, &next, out);
+            append(app, root, &next, out, sources);
         }
     }
 }
@@ -784,6 +786,32 @@ mod tests {
         let a = s.execute("layer.addItem", json!({"item":child.0})).unwrap()["layer"].as_u64().unwrap();
         let b = s.execute("layer.addItem", json!({"item":child.0})).unwrap()["layer"].as_u64().unwrap();
         (EffectcraftApp::new(s), root, child, leaf, a, b)
+    }
+
+    #[test]
+    fn repeated_sources_keep_instance_times_and_refresh_expansion_on_each_pass() {
+        let (mut app, root, child, leaf, a, b) = fixture();
+        app.ui.timeline.inline_precomps.extend([instance_key(root, &[a]), instance_key(root, &[b])]);
+        std::sync::Arc::make_mut(&mut app.session.project).comp_mut(root).unwrap().layer_mut(LayerId(b)).unwrap().start_time = Tick::from_seconds_f64(1.0);
+        app.session.set_time(Tick::from_seconds_f64(3.0));
+        let projected = |app: &EffectcraftApp| expand(app, root, build_rows(app, app.session.project.comp(root).unwrap()));
+        let first = projected(&app);
+        let nested: Vec<_> = first.iter().filter_map(|r| if let RowKind::Inline(n) = &r.kind { Some(n) } else { None }).collect();
+        assert_eq!(nested.len(), 2);
+        assert_eq!(nested[0].context.comp, child);
+        assert_eq!(nested[1].context.comp, child);
+        assert!((nested[0].context.time.seconds() - nested[1].context.time.seconds()).abs() > 0.9);
+        assert_ne!(nested[0].path, nested[1].path);
+
+        let transform = app.session.project.comp(child).unwrap().layer(LayerId(leaf)).unwrap().transform().unwrap().uid;
+        app.ui.timeline.open_layers.insert(leaf);
+        app.ui.timeline.open_groups.insert(transform);
+        let open = projected(&app);
+        assert!(open.iter().any(|r| matches!(&r.kind, RowKind::Inline(n) if matches!(n.row.kind, RowKind::Prop { .. }))));
+        app.ui.timeline.open_groups.remove(&transform);
+        let closed = projected(&app);
+        assert!(!closed.iter().any(|r| matches!(&r.kind, RowKind::Inline(n) if matches!(n.row.kind, RowKind::Prop { .. }))));
+        assert_eq!(app.session.active_comp_id(), Some(root));
     }
 
     fn select_source(app: &mut EffectcraftApp, root: ItemId, leaf: u64, instance: u64) {
