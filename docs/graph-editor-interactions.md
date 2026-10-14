@@ -153,3 +153,36 @@ and final-source `cargo clippy -p effectcraft-ui-egui --all-targets -- -D warnin
 between the before/after derivative stencils; re-review found no remaining blocker. The new
 regressions compiled but were not executed under the fork's daytime policy. No live app/reference
 comparison, screenshot verification or performance benchmark was performed for this change.
+
+
+## Narrow invalidation for plain graph samples (2026-10-14)
+
+The measured unrelated-edit workload motivated a targeted cache change: when every shown
+property is free of active expressions, samples depend on the actual owning layer snapshots
+rather than the whole Session revision. The cache retains those `Arc<Layer>` handles from
+`comp.layers.arcs()` and compares them with `Arc::ptr_eq`; it never hashes a borrowed/raw address.
+Copy-on-write edits therefore invalidate the affected owner even if an outer cursor's revision
+did not change. Retention also prevents an allocator from recycling an old owner's address into
+a false hit. Active expressions, including separated Position followers, retain conservative
+whole-Session revision invalidation because they may read any layer or composition.
+
+Shown properties, composition identity, graph type, view geometry, expression-host availability
+and comparison state still participate in validity. On a warm hit, the returned curves clone the
+cached points once; the unused second point-vector copy is gone. Key selection/handle geometry
+is still rebuilt from current state. The sampler/show entry points remain unchanged for A/B
+probe replay.
+
+This deliberately caches at layer granularity: another property edit on the same shown layer
+still invalidates. Each value/speed cache retains its displayed owner layers until replacement
+or context destruction, even while the graph is hidden; duplicate handles do not duplicate
+layer data. Expression hosts are assumed stable while present, as before; replacing one live
+host with another must also change the Session revision.
+
+Five new regressions cover unrelated-edit reuse, real owner retention, key/value/stretch/3D
+changes, separated-follower COW edits without a revision change, enabled expressions and global
+composition dependencies, and view/type/comp changes. Source review found no blocker. Scoped
+`cargo check -p effectcraft-ui-egui --all-targets`, final-source
+`cargo clippy -p effectcraft-ui-egui --all-targets -- -D warnings`, formatting and diff checks
+passed with one compile job. The new regressions compiled but were not executed under daytime
+policy. Parent A/B timing of the candidate remains separate; this note does not claim a measured
+speedup or an input-to-visible latency result.
