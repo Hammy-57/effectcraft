@@ -576,6 +576,10 @@ and bounded to eight comp entries. Results must match the current project, revis
 Disabling Show Expression Error Banner cancels automatic checks. Non-solo layers still receive
 diagnostics, including disabled expressions with syntax errors. The single-threaded web build
 shares the cache and debounce but evaluates one scan on the UI thread after interaction stops.
+Expression results are memoized per thread with their recorded dependency answers revalidated on
+every hit. The memo accounts for owned payloads and reserved table storage within an estimated
+32 MiB budget, allowing up to 65,536 small entries. Budget clears reuse accounted table storage;
+validated hits skip unused metadata preparation. [Measurements and limits](expression-performance.md).
 Each thread keeps one boa context; boa
 leaves values on its stack whenever an exception unwinds through call frames (every pending
 host request does), so a run that hits the stack limit gets a fresh context and is retried once.

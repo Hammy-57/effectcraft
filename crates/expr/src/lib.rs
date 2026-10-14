@@ -188,13 +188,8 @@ fn evaluate_out(
         text_sel,
         selector,
     };
-    // Answer the requests nearly every expression makes up front.
     let mut frame = Frame::new(depth);
     frame.owner = Some(owner);
-    for req in [Req::CompInfo { comp }, Req::LayerInfo { comp, layer: layer.id.0 }, Req::PropInfo { comp, layer: layer.id.0, path: path.clone() }] {
-        let r = resolver.resolve(&req);
-        frame.insert(req, r);
-    }
     FRAMES.with(|f| f.borrow_mut().push(frame));
     let _guard = FrameGuard;
     let key = prefetch::Key::new(text, comp, layer.id.0, prop.uid);
@@ -214,6 +209,12 @@ fn evaluate_out(
             return Ok(out);
         }
     }
+    // Cached results already validated every answer they read. Only a miss needs this setup.
+    answer(
+        &resolver,
+        depth,
+        [Req::CompInfo { comp }, Req::LayerInfo { comp, layer: layer.id.0 }, Req::PropInfo { comp, layer: layer.id.0, path: path.clone() }],
+    );
     // Answer what this expression read last time (pushed first: answers that evaluate other
     // expressions nest exactly as they do when a run asks for them).
     answer(&resolver, depth, prefetch::predicted(&key, now));
@@ -245,7 +246,7 @@ fn evaluate_out(
 }
 
 /// Resolve `reqs` not answered yet into the memo of the frame at `depth`.
-fn answer(resolver: &Resolver, depth: usize, reqs: Vec<Req>) {
+fn answer(resolver: &Resolver, depth: usize, reqs: impl IntoIterator<Item = Req>) {
     for req in reqs {
         if FRAMES.with(|f| f.borrow().get(depth).is_none_or(|fr| fr.has(&req))) {
             continue;

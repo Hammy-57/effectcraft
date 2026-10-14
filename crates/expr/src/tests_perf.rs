@@ -285,3 +285,56 @@ fn shape_source_rect_matches_the_rendered_buffer() {
         assert_eq!(geometric, rendered, "shape {i}");
     }
 }
+
+/// Isolated expression sweep matching a 720-point speed graph (two evaluations per point).
+#[test]
+#[ignore = "explicit expression profiling; no concurrent compiles"]
+fn graph_expression_profile() {
+    use std::hash::{Hash, Hasher};
+    let repeats = std::env::var("EC_PROFILE_REPEATS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(7).clamp(3, 30);
+    for count in [1, 4, 8, 20, 50] {
+        let (p, cid, ids) = many(count);
+        let comp = p.comp(cid).unwrap();
+        let mut elapsed = vec![];
+        let mut runs = vec![];
+        let mut checksum = 0;
+        let mut resets = vec![];
+        let mut growths = vec![];
+        for pass in 0..repeats + 2 {
+            let before = script_runs();
+            let cache_before = crate::memo::footprint();
+            let start = std::time::Instant::now();
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            for id in &ids {
+                let layer = comp.layer(*id).unwrap();
+                let prop = layer.props.prop(ROT).unwrap();
+                for sample in 0..720 {
+                    for delta in [-0.0001, 0.0001] {
+                        let time = sample as f64 * 10.0 / 719.0 + delta;
+                        let ctx = effectcraft_render::EvalCtx::new(&p, cid, comp, Tick::from_seconds_f64(time));
+                        let value = crate::evaluate(&crate::Expressions, &ctx, layer, prop, &prop.value, "Math.sin(time * 3) * 90").unwrap();
+                        value.as_f64().to_bits().hash(&mut hash);
+                    }
+                }
+            }
+            let ms = start.elapsed().as_secs_f64() * 1000.0;
+            let digest = hash.finish();
+            if pass > 0 {
+                assert_eq!(checksum, digest);
+            }
+            checksum = digest;
+            if pass >= 2 {
+                elapsed.push(ms);
+                runs.push(script_runs() - before);
+                let cache_after = crate::memo::footprint();
+                resets.push(cache_after.3 - cache_before.3);
+                growths.push(cache_after.4 - cache_before.4);
+            }
+        }
+        elapsed.sort_by(f64::total_cmp);
+        println!(
+            "EXPR_PROFILE {}",
+            serde_json::json!({"curves":count,"evaluations":count*1440,"p50_ms":elapsed[elapsed.len()/2],"p95_ms":elapsed[(elapsed.len()*95/100).min(elapsed.len()-1)],"raw_ms":elapsed,"script_runs":runs,"resets":resets,"growths":growths,"checksum":checksum,"memo_stats":crate::memo::footprint()})
+        );
+    }
+}

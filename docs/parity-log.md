@@ -1060,3 +1060,17 @@ before.
   behavioral regressions compile but await execution under the daytime policy. Native visual QA
   and input-to-visible-frame acceptance remain pending. No full CI; readiness estimates unchanged.
   Methods and limits: [interaction-performance.md](interaction-performance.md).
+
+
+## Update: 2026-10-14 — expression graph cache capacity
+
+- Measured the 8,192-entry result-memo cliff: a repeated 20-curve speed graph requested 28,800
+  expression evaluations and reran every script. Complete memory accounting now allows that
+  working set within the estimated 32 MiB per-thread budget, reuses table storage on pressure,
+  and skips metadata setup only after recorded dependencies validate.
+- Paired native CPU probes: actual 20-expression graph rebuild p95 319.031→23.970 ms; numeric
+  diagnostic checksums match. Peak probe RSS increases about 30 MiB. Oversized 50-curve sweeps
+  still recompute, with stable table storage. Cold/complex/browser behavior remains unmeasured.
+- Performance probes executed; four new behavioral regressions compile but are deferred under
+  the daytime policy. No full CI; overall readiness estimates unchanged.
+  [Protocol, measurements and limits](expression-performance.md).

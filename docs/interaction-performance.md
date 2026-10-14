@@ -1,5 +1,8 @@
 # Graph and expanded-timeline CPU measurements
 
+Later follow-up: [expression result-cache measurements](expression-performance.md) address the
+20-expression working-set cliff recorded below. The original measurements remain unchanged.
+
 Measured on the owner's M1 Max (10 cores, 64 GiB), 14 October 2026. These are synthetic
 CPU preparation probes, not input-to-visible-frame latency, GPU execution, rendering fidelity,
 production-build performance or an After Effects comparison. The native app was not rebuilt or
