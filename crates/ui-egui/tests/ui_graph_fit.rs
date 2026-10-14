@@ -376,3 +376,56 @@ fn graph_fit_keyless_expression_uses_the_layers_active_interval() {
     let visible_seconds = f64::from(plot[2]) / h.state().ui.timeline.pps.unwrap();
     assert!((3.0..5.0).contains(&visible_seconds));
 }
+
+#[test]
+fn expression_comparison_menu_is_independent_of_the_other_graph_reference() {
+    struct Offset;
+    impl effectcraft_render::ExprHost for Offset {
+        fn eval(
+            &self,
+            _: &effectcraft_render::EvalCtx,
+            _: &effectcraft_engine::project::Layer,
+            _: &effectcraft_engine::project::Property,
+            value: &effectcraft_engine::keyframe::Value,
+        ) -> Result<effectcraft_engine::keyframe::Value, String> {
+            Ok(value.with_components(&value.components().iter().map(|v| v + 200.0).collect::<Vec<_>>()))
+        }
+    }
+    let (mut h, layer, uid) = harness(true);
+    h.state_mut().session.expr = Some(std::sync::Arc::new(Offset));
+    h.state_mut().session.execute("prop.setExpression", json!({"layer": layer, "prop": uid, "expression": "offset"})).unwrap();
+    open_graph(&mut h);
+    let revision = h.state().session.revision;
+    assert!(!h.state().ui.timeline.graph_expression_overlay);
+    assert!(h.state().auto.find("timeline.graph.expressionLegend").is_none());
+    click_graph(&mut h, "timeline.graph.typeOptions", egui::PointerButton::Primary);
+    click_graph(&mut h, "timeline.graph.expressionOverlay", egui::PointerButton::Primary);
+    assert!(h.state().ui.timeline.graph_expression_overlay);
+    assert!(!h.state().ui.timeline.graph_reference);
+    assert!(h.state().auto.find("timeline.graph.expressionLegend").is_some());
+    click_graph(&mut h, "timeline.graph.typeOptions", egui::PointerButton::Primary);
+    click_graph(&mut h, "timeline.graph.reference", egui::PointerButton::Primary);
+    assert!(h.state().ui.timeline.graph_reference);
+    assert!(h.state().ui.timeline.graph_expression_overlay);
+    click_graph(&mut h, "timeline.graph.typeOptions", egui::PointerButton::Primary);
+    click_graph(&mut h, "timeline.graph.expressionOverlay", egui::PointerButton::Primary);
+    assert!(!h.state().ui.timeline.graph_expression_overlay);
+    assert!(h.state().ui.timeline.graph_reference);
+    assert!(h.state().auto.find("timeline.graph.expressionLegend").is_none());
+    assert_eq!(h.state().session.revision, revision, "comparison must not edit the document");
+}
+
+#[test]
+fn expression_comparison_defaults_off_and_roundtrips_without_changing_legacy_reference() {
+    let mut state = effectcraft_ui_egui::state::TimelineState::default();
+    assert!(!state.graph_expression_overlay);
+    state.graph_expression_overlay = true;
+    state.graph_reference = true;
+    let mut saved = serde_json::to_value(&state).unwrap();
+    let roundtrip: effectcraft_ui_egui::state::TimelineState = serde_json::from_value(saved.clone()).unwrap();
+    assert!(roundtrip.graph_expression_overlay && roundtrip.graph_reference);
+    saved.as_object_mut().unwrap().remove("graph_expression_overlay");
+    let legacy: effectcraft_ui_egui::state::TimelineState = serde_json::from_value(saved).unwrap();
+    assert!(!legacy.graph_expression_overlay);
+    assert!(legacy.graph_reference);
+}
