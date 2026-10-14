@@ -63,7 +63,8 @@ fn opening_the_graph_editor_fits_the_selected_key() {
 fn opening_the_graph_editor_with_no_keys_selected_fits_all_graphs() {
     let (mut h, _, uid) = harness(true);
     open_graph(&mut h);
-    assert_eq!(h.state().ui.timeline.pps, None, "the whole comp in time");
+    assert!(h.state().ui.timeline.pps.is_some(), "frame the animation, not the whole comp");
+    assert!(h.state().ui.timeline.start > 7.0 && h.state().ui.timeline.start < 8.0);
     assert_framed(&h, uid, &[0, 1], 300.0, 720.0);
     // Zooming away and toggling the Graph Editor off and on frames it again.
     h.state_mut().ui.timeline.pps = Some(300.0);
@@ -108,7 +109,7 @@ fn opening_the_graph_editor_frames_the_speed_curve_between_eased_keys() {
 fn closing_the_graph_editor_restores_the_time_zoom() {
     let (mut h, _, _) = harness(true);
     open_graph(&mut h);
-    assert_eq!(h.state().ui.timeline.pps, None, "the fit shows the whole comp");
+    assert!(h.state().ui.timeline.pps.is_some(), "fit zooms into the keys");
     let ctx = h.ctx.clone();
     effectcraft_ui_egui::menus::invoke(h.state_mut(), &ctx, "timeline.graphEditor", json!({})).unwrap();
     h.run_steps(2);
@@ -240,4 +241,138 @@ fn auto_height_blocks_manual_value_zoom() {
     h.run_steps(3);
     assert!(h.state().ui.timeline.graph_auto_zoom);
     assert_eq!(h.state().ui.timeline.graph_range, before);
+}
+
+fn click_graph(h: &mut Harness<'_, EffectcraftApp>, id: &str, button: egui::PointerButton) {
+    let r = h.state().auto.find(id).unwrap_or_else(|| panic!("missing {id}")).rect;
+    let pos = egui::pos2(r[0] + r[2] / 2.0, r[1] + r[3] / 2.0);
+    h.event(egui::Event::PointerMoved(pos));
+    h.step();
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton { pos, button, pressed, modifiers: Default::default() });
+        h.step();
+    }
+    h.run_steps(2);
+}
+
+#[test]
+fn graph_set_only_excludes_selected_unpinned_curves_and_can_be_empty() {
+    let (mut h, layer, rotation) = harness(true);
+    h.state_mut().session.execute("prop.addKey", json!({"layer": layer, "path": "transform/opacity", "time": 8.0, "value": 40})).unwrap();
+    let opacity = h.state().session.active_comp().unwrap().layers[0].props.prop("transform/opacity").unwrap().uid;
+    h.state_mut().session.execute("prop.graphPin", json!({"layer": layer, "prop": rotation, "value": true})).unwrap();
+    open_graph(&mut h);
+    assert!(h.state().auto.find(&format!("timeline.graph.key.{opacity}.0.0")).is_some());
+    click_graph(&mut h, "timeline.graph.propertyOptions", egui::PointerButton::Primary);
+    click_graph(&mut h, "timeline.graph.setOnly", egui::PointerButton::Primary);
+    assert!(h.state().ui.timeline.graph_set_only);
+    assert!(h.state().auto.find(&format!("timeline.graph.key.{rotation}.0.0")).is_some());
+    assert!(h.state().auto.find(&format!("timeline.graph.key.{opacity}.0.0")).is_none());
+    h.state_mut().session.execute("prop.graphPin", json!({"layer": layer, "prop": rotation, "value": false})).unwrap();
+    h.run_steps(3);
+    assert!(h.state().auto.find(&format!("timeline.graph.key.{rotation}.0.0")).is_none());
+    click_graph(&mut h, "timeline.graph.propertyOptions", egui::PointerButton::Primary);
+    click_graph(&mut h, "timeline.graph.showAnimated", egui::PointerButton::Primary);
+    assert!(!h.state().ui.timeline.graph_set_only);
+    assert!(h.state().auto.find(&format!("timeline.graph.key.{opacity}.0.0")).is_some());
+}
+
+#[test]
+fn graph_key_context_menu_preserves_selected_group_and_selects_unselected_target() {
+    for group in [false, true] {
+        let (mut h, layer, uid) = harness(true);
+        let keys = if group { vec![8.0, 12.0] } else { vec![12.0] };
+        h.state_mut()
+            .session
+            .execute("keys.select", json!({"keys": keys.iter().map(|time| json!({"layer": layer, "prop": uid, "time": time})).collect::<Vec<_>>()}))
+            .unwrap();
+        open_graph(&mut h);
+        h.state_mut().ui.timeline.graph_transform_box = false;
+        h.run_steps(2);
+        click_graph(&mut h, &format!("timeline.graph.key.{uid}.0.0"), egui::PointerButton::Secondary);
+        let selected = &h.state().session.state.selected_keys;
+        assert_eq!(selected.len(), if group { 2 } else { 1 });
+        assert!(selected.iter().any(|key| key.time.seconds() == 8.0));
+        click_graph(&mut h, "timeline.graph.keyMenu.hold", egui::PointerButton::Primary);
+        let pr = h.state().session.active_comp().unwrap().layers[0].props.find(uid).unwrap();
+        assert_eq!(pr.keys[0].out_interp, effectcraft_engine::keyframe::Interp::Hold);
+        assert_eq!(pr.keys[1].out_interp == effectcraft_engine::keyframe::Interp::Hold, group);
+        assert!(h.state_mut().session.undo());
+        let pr = h.state().session.active_comp().unwrap().layers[0].props.find(uid).unwrap();
+        assert_ne!(pr.keys[0].out_interp, effectcraft_engine::keyframe::Interp::Hold);
+    }
+}
+
+#[test]
+fn graph_keys_open_existing_value_velocity_and_interpolation_dialogs() {
+    for (mode, menu, expected) in [
+        ("value", Some("editValue"), effectcraft_ui_egui::Dialog::Form),
+        ("value", Some("velocity"), effectcraft_ui_egui::Dialog::KeyVelocity),
+        ("value", Some("interpolation"), effectcraft_ui_egui::Dialog::KeyInterpolation),
+        ("value", None, effectcraft_ui_egui::Dialog::Form),
+        ("speed", None, effectcraft_ui_egui::Dialog::KeyVelocity),
+    ] {
+        let (mut h, _, uid) = harness(true);
+        h.state_mut().ui.timeline.graph_mode = mode.into();
+        open_graph(&mut h);
+        let key = format!("timeline.graph.key.{uid}.0.0");
+        if let Some(menu) = menu {
+            click_graph(&mut h, &key, egui::PointerButton::Secondary);
+            click_graph(&mut h, &format!("timeline.graph.keyMenu.{menu}"), egui::PointerButton::Primary);
+        } else {
+            click_graph(&mut h, &key, egui::PointerButton::Primary);
+            click_graph(&mut h, &key, egui::PointerButton::Primary);
+        }
+        assert_eq!(h.state().dialog, Some(expected));
+    }
+}
+
+#[test]
+fn graph_fit_empty_or_static_restores_comp_and_single_key_stays_visible() {
+    let (mut h, layer, uid) = harness(false);
+    open_graph(&mut h);
+    assert_eq!(h.state().ui.timeline.pps, None);
+    assert_eq!(h.state().ui.timeline.start, 0.0);
+    h.state_mut().session.execute("prop.addKey", json!({"layer": layer, "path": "transform/opacity", "time": 9.0, "value": 40})).unwrap();
+    let opacity = h.state().session.active_comp().unwrap().layers[0].props.prop("transform/opacity").unwrap().uid;
+    h.state_mut().session.execute("prop.graphPin", json!({"layer": layer, "prop": opacity, "value": true})).unwrap();
+    h.state_mut().ui.timeline.graph_set_only = true;
+    click_graph(&mut h, "timeline.graph.fit", egui::PointerButton::Primary);
+    assert_framed(&h, opacity, &[0], 40.0, 40.0);
+    assert!(h.state().auto.find(&format!("timeline.graph.key.{uid}.0.0")).is_none());
+    h.state_mut().session.execute("prop.graphPin", json!({"layer": layer, "prop": opacity, "value": false})).unwrap();
+    let scale = h.state().session.active_comp().unwrap().layers[0].props.prop("transform/scale").unwrap().uid;
+    h.state_mut().session.execute("prop.graphPin", json!({"layer": layer, "prop": scale, "value": true})).unwrap();
+    click_graph(&mut h, "timeline.graph.fit", egui::PointerButton::Primary);
+    assert_eq!(h.state().ui.timeline.pps, None);
+    assert!(h.state().ui.timeline.graph_range.unwrap().0.is_finite());
+}
+
+#[test]
+fn graph_set_only_state_roundtrips_and_old_settings_default_off() {
+    let state = effectcraft_ui_egui::state::TimelineState { graph_set_only: true, ..Default::default() };
+    let mut saved = serde_json::to_value(&state).unwrap();
+    let restored: effectcraft_ui_egui::state::TimelineState = serde_json::from_value(saved.clone()).unwrap();
+    assert!(restored.graph_set_only);
+    saved.as_object_mut().unwrap().remove("graph_set_only");
+    let legacy: effectcraft_ui_egui::state::TimelineState = serde_json::from_value(saved).unwrap();
+    assert!(!legacy.graph_set_only);
+}
+
+#[test]
+fn graph_fit_keyless_expression_uses_the_layers_active_interval() {
+    let (mut h, layer, _) = harness(false);
+    let cid = h.state().session.state.active_comp.unwrap();
+    let l = std::sync::Arc::make_mut(&mut h.state_mut().session.project).comp_mut(cid).unwrap().layer_mut(effectcraft_engine::project::LayerId(layer)).unwrap();
+    l.in_point = effectcraft_engine::time::Tick::from_seconds_f64(3.0);
+    l.out_point = effectcraft_engine::time::Tick::from_seconds_f64(6.0);
+    h.state_mut().session.execute("prop.setExpression", json!({"layer": layer, "path": "transform/opacity", "expression": "time * 10"})).unwrap();
+    let uid = h.state().session.active_comp().unwrap().layers[0].props.prop("transform/opacity").unwrap().uid;
+    h.state_mut().session.execute("prop.graphPin", json!({"layer": layer, "prop": uid, "value": true})).unwrap();
+    h.state_mut().ui.timeline.graph_set_only = true;
+    open_graph(&mut h);
+    assert!(h.state().ui.timeline.start > 2.0 && h.state().ui.timeline.start < 3.0);
+    let plot = h.state().auto.find("timeline.graph").unwrap().rect;
+    let visible_seconds = f64::from(plot[2]) / h.state().ui.timeline.pps.unwrap();
+    assert!((3.0..5.0).contains(&visible_seconds));
 }

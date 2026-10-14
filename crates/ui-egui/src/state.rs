@@ -390,6 +390,9 @@ pub struct TimelineState {
     /// Include saved Graph Editor Set properties, even on unselected layers.
     #[serde(default)]
     pub graph_show_set: bool,
+    /// Isolate saved Graph Editor Set properties, ignoring the current selection.
+    #[serde(default)]
+    pub graph_set_only: bool,
     /// Auto-zoom the graph height to the visible curves.
     #[serde(default = "yes")]
     pub graph_auto_zoom: bool,
@@ -469,6 +472,7 @@ impl Default for TimelineState {
             graph_mode: auto_graph(),
             graph_show_selected: true,
             graph_show_set: false,
+            graph_set_only: false,
             graph_auto_zoom: true,
             graph_range: None,
             graph_snap: true,
