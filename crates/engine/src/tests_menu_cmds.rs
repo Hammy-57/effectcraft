@@ -1377,10 +1377,7 @@ fn transform_speed_offset_changes_both_sides_with_the_time_move() {
         let l = layer(s, a);
         let keys = &l.props.prop("transform/opacity").unwrap().keys;
         let i = keys.iter().position(|k| k.time.seconds() > 0.5 && k.time.seconds() < 1.5).unwrap();
-        (
-            effectcraft_keyframe::side_ease(keys, i, 0, false, false).unwrap().speed,
-            effectcraft_keyframe::side_ease(keys, i, 0, false, true).unwrap().speed,
-        )
+        (effectcraft_keyframe::side_ease(keys, i, 0, false, false).unwrap().speed, effectcraft_keyframe::side_ease(keys, i, 0, false, true).unwrap().speed)
     };
     let (in0, out0) = speeds(&s);
     for k in 1..=10 {

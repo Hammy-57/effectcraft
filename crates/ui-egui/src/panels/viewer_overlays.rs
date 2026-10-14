@@ -318,7 +318,10 @@ const PEN_PATH_R: f32 = 6.0;
 /// The [`PenTarget`] at `pos`: a key square first, then a tangent handle, then the path line.
 pub(crate) fn pen_target(hits: &[KeyHit], segments: &[MotionSegment], frames: &[PathFrame], pos: Pos2) -> PenTarget {
     let nearest = |tangent: bool, r: f32| {
-        hits.iter().filter(|h| h.tangent.is_some() == tangent && h.pos.distance(pos) < r).min_by(|a, b| a.pos.distance(pos).total_cmp(&b.pos.distance(pos))).copied()
+        hits.iter()
+            .filter(|h| h.tangent.is_some() == tangent && h.pos.distance(pos) < r)
+            .min_by(|a, b| a.pos.distance(pos).total_cmp(&b.pos.distance(pos)))
+            .copied()
     };
     if let Some(k) = nearest(false, PEN_KEY_R) {
         return PenTarget::Key(k);
@@ -823,8 +826,16 @@ mod tests {
         // Keys on frames 0, 3 and 4 (20 pt a frame); frame 0's out handle at x = 12.
         let hits = vec![key(0, 0.0, None), key(0, 12.0, Some(true)), key(3, 60.0, None), key(4, 80.0, None)];
         let frames: Vec<PathFrame> = (0..=4).map(|f| PathFrame { layer: l, prop: p, time: t(f), pos: egui::pos2(f as f32 * 20.0, 100.0) }).collect();
-        let segments: Vec<MotionSegment> =
-            (0..4).map(|f| MotionSegment { layer: l, prop: p, from: egui::pos2(f as f32 * 20.0, 100.0), to: egui::pos2(f as f32 * 20.0 + 20.0, 100.0), start: t(f), end: t(f + 1) }).collect();
+        let segments: Vec<MotionSegment> = (0..4)
+            .map(|f| MotionSegment {
+                layer: l,
+                prop: p,
+                from: egui::pos2(f as f32 * 20.0, 100.0),
+                to: egui::pos2(f as f32 * 20.0 + 20.0, 100.0),
+                start: t(f),
+                end: t(f + 1),
+            })
+            .collect();
         let at = |x: f32, y: f32| pen_target(&hits, &segments, &frames, egui::pos2(x, y));
         assert!(matches!(at(1.0, 101.0), PenTarget::Key(k) if k.time == t(0)));
         assert!(matches!(at(13.0, 100.0), PenTarget::Tangent), "the handle on the line");
