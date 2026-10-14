@@ -58,6 +58,39 @@ fn parses_figma_links() {
 }
 
 #[test]
+fn linear_gradients_preserve_affine_handles_in_non_square_nodes() {
+    let axis = |paint: Value| {
+        let node = json!({"id":"r","type":"RECTANGLE","size":{"x":200,"y":100},"fills":[paint]});
+        let contents = map::shape_contents(&node).unwrap();
+        let Item::Group { items, .. } = &contents[0] else { panic!("missing shape group") };
+        items
+            .iter()
+            .find_map(|item| match item {
+                Item::GradientFill { radial, start, end, .. } => Some((*radial, *start, *end)),
+                _ => None,
+            })
+            .unwrap()
+    };
+    let mut paint = json!({"type":"GRADIENT_LINEAR","gradientHandlePositions":[{"x":0,"y":0},{"x":1,"y":1},{"x":0,"y":1}],
+        "gradientStops":[{"position":0,"color":{"r":1,"g":0,"b":0}},{"position":1,"color":{"r":0,"g":0,"b":1}}]});
+    assert_eq!(axis(paint.clone()), (false, [0.0, 0.0], [200.0, 0.0]));
+    paint["gradientHandlePositions"] = json!([{"x":0.1,"y":0.2},{"x":0.9,"y":0.8},{"x":0.6,"y":1.2}]);
+    assert_eq!(axis(paint.clone()), (false, [20.0, 20.0], [70.0, -30.0]));
+
+    // An absent, invalid, coincident or collinear width handle keeps the two-point fallback.
+    for third in [Value::Null, json!({"x":"bad","y":1}), json!({"x":0.1,"y":0.2}), json!({"x":0.5,"y":0.5}), json!({"x":1e308,"y":1e308})] {
+        paint["gradientHandlePositions"] = json!([{"x":0.1,"y":0.2},{"x":0.9,"y":0.8}]);
+        if !third.is_null() {
+            paint["gradientHandlePositions"].as_array_mut().unwrap().push(third);
+        }
+        assert_eq!(axis(paint.clone()), (false, [20.0, 20.0], [180.0, 80.0]));
+    }
+    paint["type"] = json!("GRADIENT_RADIAL");
+    paint["gradientHandlePositions"] = json!([{"x":0.1,"y":0.2},{"x":0.9,"y":0.8},{"x":0.6,"y":1.2}]);
+    assert_eq!(axis(paint), (true, [20.0, 20.0], [180.0, 80.0]));
+}
+
+#[test]
 fn card_frame_becomes_a_comp_with_native_layers() {
     let p = plan(&card(), Target::NewComp);
     assert_eq!(p.roots, [0]);
@@ -72,11 +105,13 @@ fn card_frame_becomes_a_comp_with_native_layers() {
     assert_eq!(bg.anchor, [200.0, 260.0]);
     assert!(matches!(group_items(bg), [Item::Rect { size: [400.0, 520.0], roundness: 24.0, .. }, Item::Fill { .. }]));
 
-    // Header: top corners only → an editable path; a linear gradient corner to corner.
+    // Header: top corners only → an editable path; all three affine gradient handles count.
     let h = group_items(layer(c, "Header"));
     let [Item::Path(sp), Item::GradientFill { radial: false, start, end, gradient, .. }] = h else { panic!("{h:?}") };
     assert!(sp.closed && sp.vertices.len() >= 6);
-    assert_eq!((*start, *end), ([0.0, 0.0], [400.0, 180.0]));
+    assert_eq!(*start, [0.0, 0.0]);
+    assert!((end[0] - 48600.0 / 181.0).abs() < 1e-9);
+    assert!((end[1] - 54000.0 / 181.0).abs() < 1e-9);
     assert_eq!(gradient.colors.len(), 2);
 
     // Image fill → rendered image at the node's box.

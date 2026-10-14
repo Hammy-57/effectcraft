@@ -17,6 +17,7 @@
 //! journaled, logged or written into projects.
 
 pub mod build;
+pub mod clipboard;
 pub mod fetch;
 pub mod map;
 
@@ -301,6 +302,8 @@ fn import(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let scale = f_p(p, "scale").filter(|x| x.is_finite() && *x >= 0.5 && *x <= 4.0).unwrap_or(2.0);
     let settings = build::Settings {
+        origin: "Figma",
+        undo_label: "Import from Figma",
         frame_rate: f_p(p, "frameRate").filter(|r| r.is_finite() && *r > 0.0 && *r <= 999.0).unwrap_or(30.0),
         duration: f_p(p, "duration").filter(|d| d.is_finite() && *d > 0.0 && *d <= 86_400.0).unwrap_or(10.0),
         into,
@@ -310,6 +313,7 @@ fn import(s: &mut Session, p: &Value) -> Result<Value> {
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
+        clipboard::spec(),
         CommandSpec {
             id: CMD,
             label: "Figma...",

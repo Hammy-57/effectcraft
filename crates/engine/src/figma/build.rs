@@ -16,6 +16,8 @@ use super::{Source, fetch};
 use crate::{EngineError, Result, Session};
 
 pub struct Settings {
+    pub origin: &'static str,
+    pub undo_label: &'static str,
     pub frame_rate: f64,
     pub duration: f64,
     /// Import into this composition instead of new ones.
@@ -294,7 +296,6 @@ fn make_layer(
         }
     };
     let mut l = build::layer(proj, comp, &pl.name, source, size, ldur);
-    l.comment = format!("Figma {}", pl.figma_id);
     let mut anchor = pl.anchor;
     let mut scale = pl.scale;
     if let PKind::Raster(_) = &pl.kind {
@@ -365,13 +366,13 @@ pub(super) fn run(s: &mut Session, plan: Plan, src: &Source, scale: f64, cfg: &S
     let rate = FrameRate::from_f64(cfg.frame_rate);
     let dur = rate.snap_nearest(Tick::from_seconds_f64(cfg.duration));
     let into = cfg.into;
-    let label = if plan.name.trim().is_empty() { "Figma".to_string() } else { plan.name.clone() };
+    let label = if plan.name.trim().is_empty() { cfg.origin.to_string() } else { plan.name.clone() };
     let raster_items = rasters.clone();
-    let built = s.edit("Import from Figma", None, |proj, st| {
+    let built = s.edit(cfg.undo_label, None, |proj, st| {
         // Precomps and images go in a folder; the new top-level comps stay at the root.
         let nested = plan.comps.len().saturating_sub(plan.roots.len() + usize::from(plan.into_active.is_some()));
-        let folder =
-            (nested > 0 || raster_items.iter().any(Option::is_some)).then(|| proj.add_item(&format!("{label} (Figma)"), Label::Yellow, None, ItemKind::Folder));
+        let folder = (nested > 0 || raster_items.iter().any(Option::is_some))
+            .then(|| proj.add_item(&format!("{label} ({})", cfg.origin), Label::Yellow, None, ItemKind::Folder));
         let mut comp_items: Vec<Option<ItemId>> = vec![None; plan.comps.len()];
         let comp_dims: Vec<(u32, u32)> = plan.comps.iter().map(|c| (c.width, c.height)).collect();
         for (i, pc) in plan.comps.iter().enumerate() {
@@ -394,7 +395,16 @@ pub(super) fn run(s: &mut Session, plan: Plan, src: &Source, scale: f64, cfg: &S
         for (i, pc) in plan.comps.iter().enumerate() {
             let Some(cid) = comp_items.get(i).copied().flatten() else { continue };
             let comp = proj.comp(cid).ok_or(EngineError::NoComp)?.clone();
-            let made: Vec<Option<Layer>> = pc.layers.iter().map(|pl| make_layer(proj, &comp, pl, &comp_items, &comp_dims, &raster_items, dur)).collect();
+            let made: Vec<Option<Layer>> = pc
+                .layers
+                .iter()
+                .map(|pl| {
+                    make_layer(proj, &comp, pl, &comp_items, &comp_dims, &raster_items, dur).map(|mut layer| {
+                        layer.comment = format!("{} {}", cfg.origin, pl.figma_id);
+                        layer
+                    })
+                })
+                .collect();
             let lids: Vec<Option<LayerId>> = made.iter().map(|l| l.as_ref().map(|l| l.id)).collect();
             let mut layers: Vec<Layer> = vec![];
             for (k, l) in made.into_iter().enumerate() {
@@ -447,7 +457,7 @@ pub(super) fn run(s: &mut Session, plan: Plan, src: &Source, scale: f64, cfg: &S
             return Err(e);
         }
     };
-    fold(s, &project, "Import from Figma");
+    fold(s, &project, cfg.undo_label);
     let roots: Vec<u64> = plan.roots.iter().filter_map(|i| comp_items.get(*i).copied().flatten()).map(|c| c.0).collect();
     let precomps: Vec<u64> =
         comp_items.iter().enumerate().filter(|(i, _)| !plan.roots.contains(i) && Some(*i) != plan.into_active).filter_map(|(_, c)| c.map(|c| c.0)).collect();
@@ -460,7 +470,7 @@ pub(super) fn run(s: &mut Session, plan: Plan, src: &Source, scale: f64, cfg: &S
     let (native, _) = plan.counts();
     let images = rasters.iter().filter(|r| r.is_some()).count();
     if images > 0 || native > 0 {
-        s.toast(format!("Imported from Figma: {native} native layer(s), {images} image(s)"));
+        s.toast(format!("Imported from {}: {native} native layer(s), {images} image(s)", cfg.origin));
     }
     Ok(json!({
         "comp": comp,
