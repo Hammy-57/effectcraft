@@ -1522,3 +1522,66 @@ mod tests {
         assert_eq!(shift_axes(true, 5.0, 5.0), (true, false));
     }
 }
+
+#[cfg(test)]
+mod interaction_profile {
+    use super::*;
+    use std::{hint::black_box, time::Instant};
+
+    #[test]
+    #[ignore = "explicit CPU profiling probe; run without concurrent builds"]
+    fn graph_sampling_cost() {
+        let repeats = std::env::var("EC_PROFILE_REPEATS").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(25).clamp(5, 200);
+        for (count, expression) in [(1, false), (20, false), (100, false), (1, true), (20, true)] {
+            let mut session = effectcraft_host::session();
+            session.execute("comp.new", json!({"name":"Synthetic graph probe","duration":10})).unwrap();
+            let mut selected = Vec::new();
+            for i in 0..count {
+                let lid = session.execute("layer.newSolid", json!({"name":format!("Probe {i}"),"width":10,"height":10})).unwrap()["layer"].as_u64().unwrap();
+                for (time, value) in [(0.0, 0.0), (1.0, 90.0)] {
+                    session.execute("prop.addKey", json!({"layer":lid,"path":"transform/rotation","time":time,"value":value})).unwrap();
+                }
+                if expression {
+                    session.execute("prop.setExpression", json!({"layer":lid,"path":"transform/rotation","expression":"Math.sin(time * 3) * 90"})).unwrap();
+                }
+                let uid = session.active_comp().unwrap().layer(LayerId(lid)).unwrap().props.prop("transform/rotation").unwrap().uid;
+                selected.push((LayerId(lid), uid));
+            }
+            let other = session.execute("layer.newSolid", json!({"name":"Unrelated layer","width":10,"height":10})).unwrap()["layer"].as_u64().unwrap();
+            session.state.selected_props = selected;
+            let mut app = EffectcraftApp::new(session);
+            app.ui.timeline.graph_show_selected = true;
+            let ctx = egui::Context::default();
+            let plot = Rect::from_min_size(Pos2::ZERO, vec2(1440.0, 480.0));
+            let tm = TMap { x0: 0.0, start: 0.0, pps: 144.0 };
+            for invalidate in [false, true] {
+                let mut samples = Vec::new();
+                let mut point_count = 0;
+                for i in 0..repeats + 3 {
+                    if invalidate {
+                        app.session.execute("prop.set", json!({"layer":other,"prop":"transform/opacity","value":if i%2==0 {50.0}else{100.0}})).unwrap();
+                    }
+                    let cid = app.session.active_comp_id().unwrap();
+                    let comp = app.session.active_comp().unwrap();
+                    let ectx = EvalCtx { expr: app.session.expr.as_deref(), ..EvalCtx::new(&app.session.project, cid, comp, app.session.time()) };
+                    let t = Instant::now();
+                    let values = curves(&app, &ctx, comp, &ectx, tm, plot, true);
+                    point_count = values.iter().map(|c| c.pts.len()).sum::<usize>();
+                    black_box(&values);
+                    drop(values);
+                    let ms = t.elapsed().as_secs_f64() * 1000.0;
+                    if i >= 3 {
+                        samples.push(ms);
+                    }
+                }
+                samples.sort_by(f64::total_cmp);
+                println!(
+                    "EC_PROFILE {}",
+                    json!({"case":"graph","curves":count,"expressions":expression,"unrelated_edit":invalidate,
+                    "points":point_count,"samples":samples.len(),"p50_ms":samples[samples.len()/2],"p95_ms":samples[(samples.len()*95/100).min(samples.len()-1)],
+                    "raw_ms":samples})
+                );
+            }
+        }
+    }
+}

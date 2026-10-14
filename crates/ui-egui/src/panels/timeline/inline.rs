@@ -682,3 +682,67 @@ mod tests {
         assert_eq!(app.session.project.comp(child).unwrap().layer(LayerId(leaf)).unwrap().props.prop("transform/opacity").unwrap().value.as_f64(), 25.0);
     }
 }
+
+#[cfg(test)]
+mod interaction_profile {
+    use super::*;
+    use std::{hint::black_box, time::Instant};
+
+    #[test]
+    #[ignore = "explicit CPU profiling probe; run without concurrent builds"]
+    fn expanded_row_cost() {
+        let repeats = std::env::var("EC_PROFILE_REPEATS").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(25).clamp(5, 200);
+        for (layers, instances, properties) in [(50, 1, false), (500, 1, false), (500, 20, false), (100, 20, true)] {
+            let mut session = effectcraft_engine::Session::default();
+            let source = ItemId(session.execute("comp.new", json!({"name":"Synthetic source","duration":10})).unwrap()["comp"].as_u64().unwrap());
+            let mut leaves = Vec::new();
+            let mut groups = Vec::new();
+            for i in 0..layers {
+                let lid =
+                    LayerId(session.execute("layer.newSolid", json!({"name":format!("Leaf {i}"),"width":10,"height":10})).unwrap()["layer"].as_u64().unwrap());
+                leaves.push(lid.0);
+                groups.push(session.active_comp().unwrap().layer(lid).unwrap().transform().unwrap().uid);
+            }
+            let root = ItemId(session.execute("comp.new", json!({"name":"Synthetic root","duration":10})).unwrap()["comp"].as_u64().unwrap());
+            let mut paths = Vec::new();
+            for _ in 0..instances {
+                let lid = session.execute("layer.addItem", json!({"item":source.0})).unwrap()["layer"].as_u64().unwrap();
+                paths.push(vec![lid]);
+            }
+            let mut app = EffectcraftApp::new(session);
+            if properties {
+                app.ui.timeline.open_layers.extend(leaves);
+                app.ui.timeline.open_groups.extend(groups);
+            }
+            for expanded in [false, true] {
+                app.ui.timeline.inline_precomps.clear();
+                if expanded {
+                    for path in &paths {
+                        app.ui.timeline.inline_precomps.insert(instance_key(root, path));
+                    }
+                }
+                let mut samples = Vec::new();
+                let mut rows_count = 0;
+                for i in 0..repeats + 3 {
+                    let t = Instant::now();
+                    let rows = build_rows(&app, app.session.project.comp(root).unwrap());
+                    let rows = expand(&app, root, rows);
+                    rows_count = rows.len();
+                    black_box(&rows);
+                    drop(rows);
+                    let ms = t.elapsed().as_secs_f64() * 1000.0;
+                    if i >= 3 {
+                        samples.push(ms);
+                    }
+                }
+                samples.sort_by(f64::total_cmp);
+                println!(
+                    "EC_PROFILE {}",
+                    json!({"case":"inline_rows","source_layers":layers,"instances":instances,"properties":properties,
+                    "expanded":expanded,"rows":rows_count,"samples":samples.len(),"p50_ms":samples[samples.len()/2],
+                    "p95_ms":samples[(samples.len()*95/100).min(samples.len()-1)],"raw_ms":samples})
+                );
+            }
+        }
+    }
+}
