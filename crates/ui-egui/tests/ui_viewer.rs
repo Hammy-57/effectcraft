@@ -892,7 +892,7 @@ fn graph_editor_transform_box_scales_selected_keys_in_time() {
     s.execute("keys.select", json!({"keys": keys})).unwrap();
     h.state_mut().ui.timeline.graph_editor = true;
     h.run_steps(4);
-    for id in ["timeline.graph.snap", "timeline.graph.reference", "timeline.graph.transformBox", "timeline.graph.transformBox.5"] {
+    for id in ["timeline.graph.snap", "timeline.graph.typeOptions", "timeline.graph.transformBox", "timeline.graph.transformBox.5"] {
         assert!(h.state().auto.find(id).is_some(), "missing {id}");
     }
     // Drag the right edge handle to the right: the keys spread out in time, the first stays.

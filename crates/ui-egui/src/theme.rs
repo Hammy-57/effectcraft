@@ -720,6 +720,8 @@ mod script_font_tests {
         let tokens = super::Tokens::for_kind(super::ThemeKind::Dark);
         super::install(&ctx, &tokens, "en");
         super::install(&ctx, &tokens, "zh-hans");
+        // The fallbacks are installed by a worker: lay out only once it has finished.
+        super::wait_for_fallbacks("zh-hans");
         let mut out = ctx.run_ui(egui::RawInput::default(), |_| {});
         out.textures_delta.clear();
         let font = egui::FontId::new(13.0, egui::FontFamily::Proportional);
