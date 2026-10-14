@@ -427,6 +427,16 @@ const SIMPLIFIED_CHINESE: &[Row] = &[
     ("ec.vr.rotatesphere", "VR Rotate Sphere", "VR 旋转球面"),
     ("ec.vr.sharpen", "VR Sharpen", "VR 锐化"),
     ("ec.vr.spheretoplane", "VR Sphere to Plane", "VR 球面到平面"),
+    ("S_Monochrome", "S_Monochrome", "S_单色"),
+    ("S_Gradient", "S_Gradient", "S_渐变"),
+    ("S_Grid", "S_Grid", "S_网格"),
+    ("S_DropShadow", "S_DropShadow", "S_投影"),
+    ("ec.perspective.shadowstudio2", "Shadow Studio 2 (Native)", "Shadow Studio 2（原生）"),
+    ("ec.perspective.shadowstudio3", "Shadow Studio 3 (Native)", "Shadow Studio 3（原生）"),
+    ("ec.stylize.deepglow", "Deep Glow (Native)", "Deep Glow（原生）"),
+    ("S_CartoonPaint", "S_CartoonPaint", "S_卡通绘画"),
+    ("S_Glow", "S_Glow", "S_发光"),
+    ("S_HalfTone", "S_HalfTone", "S_半色调"),
 ];
 /// Traditional Chinese (`zh-hant`): no rows yet. A translator fills one row per effect, ids from
 /// [`SIMPLIFIED_CHINESE`]; a row may repeat the English name, which is what the language draws
