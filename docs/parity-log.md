@@ -1028,3 +1028,17 @@ before.
   pinned curves. Existing graph tooltip/Reference-toggle regressions corrected.
 - Implementation notes and honest verification limits: [inline-precomp-editing.md](inline-precomp-editing.md),
   [graph-editor-interactions.md](graph-editor-interactions.md). Runtime/native acceptance pending.
+
+## Update: 2026-10-14 — shape layer drag routing
+
+- A selected shape layer's visible path overlays no longer turn ordinary interior drags into
+  vertex marquees. Selection-tool drags use the existing Position movement and Undo path.
+- Direct vertex/tangent grabs, full-frame mask marquees and explicitly selected shape-vertex
+  marquees retain their priority. Synthetic coverage checks layer Position, geometry and Undo.
+- An isolated real-project copy reproduced the stalled drag in the prior build; the updated
+  build moved Position by the requested 80 × 60 pixels with unchanged Anchor Point and one-step
+  Undo. A direct vertex drag still changed only the grabbed vertex, leaving layer Position and
+  other vertices unchanged. Screenshots and saved geometry were checked; private inputs remain
+  local. Scoped check/clippy passed;
+  regression execution is deferred under the fork's daytime policy. [Details](interaction-fixes.md).
+  Parity estimates unchanged.
