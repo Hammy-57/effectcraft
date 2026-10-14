@@ -1042,3 +1042,21 @@ before.
   local. Scoped check/clippy passed;
   regression execution is deferred under the fork's daytime policy. [Details](interaction-fixes.md).
   Parity estimates unchanged.
+
+
+## Update: 2026-10-14 — nested graph/clipboard completion and measured CPU work
+
+- Expanded precomps now expose the source Graph Editor, key dialogs and existing internal/rich/SVG
+  clipboard routes, preserving parent viewer/time/zoom and atomic source undo. J/K maps source
+  navigation to the parent when unambiguous; nonlinear scrubbing uses the parent ruler. Modal
+  commits revalidate the instance path and locks. Spatial handles/waveforms still need the source viewer.
+- An opt-in before/after-expression comparison shows dim base and bright evaluated curves,
+  separately from the existing Reference Graph. Both phases participate in fitting; key/handle
+  edits still address underlying animation.
+- Synthetic CPU measurements justified two cache changes: 100 ordinary curves after an unrelated
+  edit improved from 8.539 to 0.117 ms p95, and 14,020 expanded property rows from 4.743 to 1.480 ms.
+  Whole-probe peak RSS stayed about 73 MiB. Expression-heavy resampling remains slow.
+- Native all-targets check, strict Clippy and focused WASM check passed. Performance probes ran;
+  behavioral regressions compile but await execution under the daytime policy. Native visual QA
+  and input-to-visible-frame acceptance remain pending. No full CI; readiness estimates unchanged.
+  Methods and limits: [interaction-performance.md](interaction-performance.md).

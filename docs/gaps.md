@@ -268,6 +268,10 @@ Issues #41–#47 (all from the Linux AppImage 0.1.1, 5 October): panning the vie
 
 ### G5. Performance at real-world scale
 
+14 October follow-up: [synthetic graph/timeline CPU probes](interaction-performance.md) justify
+plain-graph cache reuse across unrelated edits and per-pass repeated-source row sharing. These are
+not live-frame/GPU measurements; expression-heavy resampling remains slow and overall grades stay unchanged.
+
 - Benchmark projects at 1080p and 4K with many layers, heavy effects, long footage and nested
   comps; record preview frame times, RAM preview fill and render times on reference machines.
   Started 10 October 2026: `cargo xtask bench` renders generated 1080p / 4K scenarios (many

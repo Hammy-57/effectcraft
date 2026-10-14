@@ -12,7 +12,8 @@ from scratch in Rust. This page is the one-page summary; the evidence is in
 Interaction fixes (2026-10-14): mask/shape editing, native panel-window consolidation,
 [inline precomp editing](docs/inline-precomp-editing.md) and [graph controls](docs/graph-editor-interactions.md);
 [implementation and validation limits](docs/interaction-fixes.md). Follow-up adds nested source graphs/clipboard
-and opt-in before/after-expression comparison; native acceptance remains pending. Readiness estimates unchanged.
+and opt-in before/after-expression comparison; [synthetic CPU probes](docs/interaction-performance.md)
+justify two small cache changes. Native acceptance remains pending. Readiness estimates unchanged.
 
 ## Headline numbers
 
