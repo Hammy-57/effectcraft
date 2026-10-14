@@ -973,3 +973,25 @@ before.
   render regression check; `cargo xtask fuzz` runs ten fuzz targets (project files, AEP import,
   Lottie, SVG, PSD, PDF, timelines, expressions, media, engine commands); `cargo xtask bench
   --fail-over PCT` fails on resource regressions.
+
+
+## Update: one-time native FigCraft clipboard (14 October 2026)
+
+- `edit.pasteFigCraft` and normal Edit → Paste / Cmd+V accept the versioned FigCraft snapshot,
+  create native editable layers in one undo step, and report unsupported visuals without a
+  raster fallback. Invalid marked payloads do not paste older internal clipboard content;
+  input size, node count and nesting are bounded and asset/file fetch inputs are rejected.
+- Existing destination compositions supply their timing to nested compositions. The shared
+  design mapper retains the deepest supported node, includes stroke/shadow render bounds when
+  making a new selection canvas, and converts three-handle affine linear gradients into native
+  gradient axes. Redo reopens a newly restored composition only when no valid composition is
+  active, preserving existing focus otherwise.
+- Scoped engine/UI compilation and clippy (all targets, warnings denied) and a native build
+  passed. Actual FigCraft UI Copy → OS clipboard → EffectCraft menu Paste and Cmd+V produced
+  nine native layers (three text, six shape), no images. Editing text, one-step undo/redo,
+  independent repeated pastes, malformed-clipboard rejection, save/reopen, nested compositions,
+  destination timing and standalone stroke/shadow bounds passed native runtime checks.
+- The synthetic linear-gradient region differs by at most 1/255 per channel; save/reopen pixels
+  are identical. Text metrics and other documented limitations remain warned. Regression tests
+  were compiled but not executed under the fork's daytime rule; full CI was not run. No general
+  pixel-parity grade is assigned, and this extension does not change After Effects parity scores.
