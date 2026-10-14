@@ -46,9 +46,14 @@ pub(crate) fn move_path_vertices(app: &mut EffectcraftApp, ctx: &egui::Context, 
         expr: app.session.expr.as_deref(),
         ..EvalCtx::new(&app.session.project, cid, comp, app.session.time())
     };
-    let paths: std::collections::BTreeSet<_> = app.session.state.selected_vertices.iter().map(|v| (v.layer, v.mask)).collect();
+    let mut paths: std::collections::BTreeMap<_, Vec<usize>> = std::collections::BTreeMap::new();
+    for vertex in &app.session.state.selected_vertices {
+        paths.entry((vertex.layer, vertex.mask)).or_default().push(vertex.index);
+    }
     let mut deltas = Vec::new();
-    for (lid, uid) in paths {
+    for ((lid, uid), mut indices) in paths {
+        indices.sort_unstable();
+        indices.dedup();
         let layer = comp.layer(lid).ok_or("selected layer is gone")?;
         let group = layer.props.find_group(uid).ok_or("selected path is gone")?;
         let mut matrix = match app.session.view_camera(cid) {
@@ -61,8 +66,8 @@ pub(crate) fn move_path_vertices(app: &mut EffectcraftApp, ctx: &egui::Context, 
         let inverse = matrix.inverse().ok_or("path transform is singular")?;
         let value = ectx.group_value(layer, group, "path").ok_or("path value unavailable")?;
         let path = value.as_path().ok_or("not an editable path")?;
-        for vertex in app.session.state.selected_vertices.iter().filter(|v| v.layer == lid && v.mask == uid) {
-            let point = path.vertices.get(vertex.index).ok_or("selected vertex is gone")?;
+        for index in indices {
+            let point = path.vertices.get(index).ok_or("selected vertex is gone")?;
             // A projective 3D path has no single inverse displacement: map each point separately.
             let screen = matrix.apply(gv2(point[0], point[1]));
             let moved = inverse.apply(gv2(screen.x + delta[0], screen.y + delta[1]));
@@ -70,7 +75,7 @@ pub(crate) fn move_path_vertices(app: &mut EffectcraftApp, ctx: &egui::Context, 
             if !d.iter().all(|v| v.is_finite()) {
                 return Err("invalid path displacement".into());
             }
-            deltas.push(json!({"layer": lid.0, "mask": uid, "index": vertex.index, "delta": d}));
+            deltas.push(json!({"layer": lid.0, "mask": uid, "index": index, "delta": d}));
         }
     }
     crate::menus::invoke(app, ctx, "mask.moveVertices", json!({"delta": [0, 0], "deltas": deltas, "merge": merge}))
