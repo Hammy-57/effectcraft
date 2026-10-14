@@ -87,6 +87,7 @@ pub(crate) fn tr_args(text: &str, args: &[&dyn Display]) -> String {
 
 /// Japanese: the same rows, in the same order, as the Chinese catalogs below (the tests keep the two in step).
 const JAPANESE: &[(&str, &str)] = &[
+    ("Clear search and filters", "検索とフィルターをクリア"),
     ("Appearance Settings…", "外観設定…"),
     ("Add to favorites", "お気に入りに追加"),
     ("Remove from favorites", "お気に入りから削除"),
@@ -637,6 +638,7 @@ const JAPANESE: &[(&str, &str)] = &[
 ];
 
 const SIMPLIFIED_CHINESE: &[(&str, &str)] = &[
+    ("Clear search and filters", "清除搜索和筛选"),
     ("Agents", "智能体"),
     ("Control Channel Port", "控制通道端口"),
     ("Hardware ProRes Decoding", "硬件 ProRes 解码"),
@@ -1393,6 +1395,7 @@ const SIMPLIFIED_CHINESE: &[(&str, &str)] = &[
 ];
 
 const TRADITIONAL_CHINESE: &[(&str, &str)] = &[
+    ("Clear search and filters", "清除搜尋與篩選"),
     ("Agents", "智慧代理"),
     ("Control Channel Port", "控制通道連接埠"),
     ("Hardware ProRes Decoding", "硬體 ProRes 解碼"),
@@ -2146,6 +2149,7 @@ const TRADITIONAL_CHINESE: &[(&str, &str)] = &[
 /// Ukrainian (uk): original translations of the same interface rows as the Chinese catalogs.
 /// Technical names, key names and substituted project content keep their original spelling.
 const UKRAINIAN: &[(&str, &str)] = &[
+    ("Clear search and filters", "Очистити пошук і фільтри"),
     ("Appearance Settings…", "Налаштування вигляду…"),
     ("Add to favorites", "Додати до вибраного"),
     ("Remove from favorites", "Видалити з вибраного"),
@@ -2712,6 +2716,7 @@ const UKRAINIAN: &[(&str, &str)] = &[
 
 // Brazilian Portuguese.
 const PORTUGUESE: &[(&str, &str)] = &[
+    ("Clear search and filters", "Limpar pesquisa e filtros"),
     ("   OK   ", "   OK   "),
     ("  Delete  ", "  Excluir  "),
     (" Open Auto-Save ", " Abrir salvamento automático "),
@@ -3155,6 +3160,7 @@ const PORTUGUESE: &[(&str, &str)] = &[
 
 /// Czech (cs): original translations covering every row in the Chinese panel catalogs.
 const CZECH: &[(&str, &str)] = &[
+    ("Clear search and filters", "Vymazat hledání a filtry"),
     ("   OK   ", "   OK   "),
     ("  Delete  ", "  Odstranit  "),
     (" Open Auto-Save ", " Otevřít automatickou zálohu "),
@@ -3701,6 +3707,7 @@ const CZECH: &[(&str, &str)] = &[
 /// order. Terms follow the Spanish menu catalog (composición, material de archivo, cola de procesamiento,
 /// ajuste preestablecido, método abreviado). Written from the English source.
 const SPANISH: &[(&str, &str)] = &[
+    ("Clear search and filters", "Borrar búsqueda y filtros"),
     ("Appearance Settings…", "Ajustes de apariencia…"),
     ("Add to favorites", "Añadir a favoritos"),
     ("Remove from favorites", "Quitar de favoritos"),

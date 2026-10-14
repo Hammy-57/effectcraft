@@ -318,7 +318,7 @@ pub fn search_field_with_clear(ui: &mut Ui, rect: Rect, text: &mut String, hint:
     let mut response = field(ui, rect, text, hint, t, true, if show_clear { 20.0 } else { 0.0 });
     let clear = show_clear.then(|| {
         let button = Rect::from_center_size(pos2(rect.max.x - 13.0, rect.center().y), vec2(20.0, 20.0));
-        icon_button(ui, button, Icon::Close, false, t, response.id.with("clear")).on_hover_text("Clear search and filters")
+        icon_button(ui, button, Icon::Close, false, t, response.id.with("clear")).on_hover_text(crate::i18n::tr("Clear search and filters"))
     });
     if clear.as_ref().is_some_and(Response::clicked) {
         text.clear();
@@ -340,10 +340,8 @@ fn field(ui: &mut Ui, rect: Rect, text: &mut String, hint: &str, t: &Tokens, sea
     if search {
         icons::paint(ui.painter(), Rect::from_center_size(pos2(rect.min.x + 12.0, rect.center().y), vec2(12.0, 12.0)), Icon::Search, t.text_dim);
     }
-    let inner = Rect::from_min_max(
-        pos2(rect.min.x + if search { 22.0 } else { 9.0 }, rect.min.y + 1.0),
-        pos2(rect.max.x - 8.0 - trailing_width, rect.max.y - 1.0),
-    );
+    let inner =
+        Rect::from_min_max(pos2(rect.min.x + if search { 22.0 } else { 9.0 }, rect.min.y + 1.0), pos2(rect.max.x - 8.0 - trailing_width, rect.max.y - 1.0));
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(inner));
     child.add(
         egui::TextEdit::singleline(text)

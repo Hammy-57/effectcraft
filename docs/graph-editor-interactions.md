@@ -101,3 +101,11 @@ obsolete key handles. Two earlier graph-update cloud regressions were repaired: 
 pin tooltip now uses the UI translation catalog, and the transform-box regression opens the
 current graph-type menu to access Reference. Those runtime tests remain deferred locally;
 compilation/lint checks do not establish that the cloud test suite has passed after the repair.
+
+## Combined integration checks — 2026-10-14
+
+On the integrated interaction branch, the render/engine/UI all-targets native check and strict
+Clippy passed. The focused `wasm32-unknown-unknown` render/engine/UI check also passed, with warnings
+in unchanged GPU/readback, frames, pointer-wrap and zero-copy code. Formatting and diff checks passed.
+Tests were compiled, not executed, under the daytime policy. No full CI, native application rebuild,
+restart, upstream push or PR was performed; native/browser runtime acceptance remains pending.

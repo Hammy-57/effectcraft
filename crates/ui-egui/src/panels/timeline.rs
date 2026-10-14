@@ -2353,7 +2353,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 if layer.props.find_group(*uid).is_some_and(|g| matches!(g.match_id.as_str(), "rect" | "ellipse" | "star")) {
                     let label = crate::i18n::label(app, "path.convertToBezier", "Convert To Bezier Path");
                     widgets::context_menu(&gr, |ui| {
-                        if ui.button(&label).clicked() {
+                        if ui.button(label).clicked() {
                             actions.push(("path.convertToBezier".into(), json!({"layer": layer.id.0, "prop": uid})));
                             ui.close();
                         }

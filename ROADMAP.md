@@ -9,7 +9,8 @@ from scratch in Rust. This page is the one-page summary; the evidence is in
 [docs/target-app-parity.md](docs/target-app-parity.md), the work list in
 [docs/gaps.md](docs/gaps.md), and the plan in [docs/roadmap.md](docs/roadmap.md).
 
-Interaction fixes (2026-10-14): mask/shape editing and native panel-window consolidation;
+Interaction fixes (2026-10-14): mask/shape editing, native panel-window consolidation,
+[inline precomp editing](docs/inline-precomp-editing.md) and [graph controls](docs/graph-editor-interactions.md);
 [implementation and validation limits](docs/interaction-fixes.md). Readiness estimates unchanged.
 
 ## Headline numbers

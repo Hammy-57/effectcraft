@@ -1003,3 +1003,14 @@ before.
   are identical. Text metrics and other documented limitations remain warned. Regression tests
   were compiled but not executed under the fork's daytime rule; full CI was not run. No general
   pixel-parity grade is assigned, and this extension does not change After Effects parity scores.
+
+## Update: 2026-10-14 — inline precomps and graph controls
+
+- Inline precomp rows edit real source layers/properties/keys with validated instance paths,
+  renderer-aligned timing, source-targeted menus and atomic undo. Nonlinear inverse-time drags,
+  source graphs and clipboard operations require opening the source composition.
+- Graph speed samples expressions and separated Position followers; Fit All frames shown
+  animation. Graph keys expose editing dialogs/context actions; Graph Editor Set Only isolates
+  pinned curves. Existing graph tooltip/Reference-toggle regressions corrected.
+- Implementation notes and honest verification limits: [inline-precomp-editing.md](inline-precomp-editing.md),
+  [graph-editor-interactions.md](graph-editor-interactions.md). Runtime/native acceptance pending.

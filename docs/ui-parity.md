@@ -1,6 +1,6 @@
 # UI parity
 
-> **Last reviewed:** 2026-10-12 · **Last updated:** 2026-10-14 · **Change:** minor (closed issue references re-audited against `upstream/main` 470ea7a3) · **Target:** Adobe After Effects 2026
+> **Last reviewed:** 2026-10-12 · **Last updated:** 2026-10-14 · **Change:** minor (mask/shape, panel-window, inline-precomp and graph interaction implementation; runtime acceptance pending) · **Target:** Adobe After Effects 2026
 
 How closely EffectCraft's interaction matches After Effects: tools, handles, snapping, nudging,
 modifier keys, shortcuts, drag behaviour, numeric entry, panels, context menus and feel. Evidence
@@ -41,6 +41,9 @@ enforcement, shape item visibility controls and parametric-to-Bezier conversion.
 expression-driven primitive geometry requires an explicit current-frame snapshot; it is never
 silently discarded. Both panel-window entry points now use the same native floating-group code,
 including shortcut/drag routing and workspace placement. Legacy placements migrate.
+
+Inline precomp editing and the remaining graph controls are also implemented; see
+[inline editing](inline-precomp-editing.md) and [graph interactions](graph-editor-interactions.md).
 
 Details and verification limits: [interaction-fixes.md](interaction-fixes.md). The historical area
 estimates above are not raised until live validation; their old per-feature gap descriptions are
