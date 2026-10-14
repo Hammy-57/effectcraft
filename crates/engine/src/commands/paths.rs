@@ -128,8 +128,11 @@ fn convert_to_bezier(s: &mut Session, p: &Value) -> Result<Value> {
         }
         targets.push((lid, uid));
     } else if p.get("mask").is_none() {
-        targets
-            .extend(s.state.selected_props.iter().copied().filter(|(lid, uid)| comp.layer(*lid).and_then(|l| l.props.find_group(*uid)).is_some_and(primitive)));
+        targets.extend(s.state.selected_props.iter().filter_map(|(lid, uid)| {
+            let props = &comp.layer(*lid)?.props;
+            let g = props.find_group(*uid).filter(|g| primitive(g)).or_else(|| props.parent_of(*uid).filter(|g| primitive(g)))?;
+            Some((*lid, g.uid))
+        }));
         if targets.is_empty() && s.state.selected_vertices.is_empty() {
             let (_, lids) = super::layers_p(s, p)?;
             for lid in lids {
