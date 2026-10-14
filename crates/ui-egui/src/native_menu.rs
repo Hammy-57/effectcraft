@@ -311,6 +311,18 @@ pub fn state_key(app: &EffectcraftApp) -> u64 {
     s.state.selected_props.len().hash(&mut h);
     s.state.project_selection.len().hash(&mut h);
     s.state.selected_vertices.len().hash(&mut h);
+    app.ui.focused.hash(&mut h);
+    app.ui.timeline.inline_focus.hash(&mut h);
+    if app.ui.timeline.inline_focus.is_some() {
+        // Inline selection lives in source-comp cursors while the parent selection is parked.
+        for (comp, selection) in &s.state.comp_selections {
+            comp.0.hash(&mut h);
+            selection.layers.hash(&mut h);
+            selection.props.hash(&mut h);
+            selection.keys.hash(&mut h);
+            selection.vertices.len().hash(&mut h);
+        }
+    }
     s.state.clipboard.len().hash(&mut h);
     s.state.key_clipboard.len().hash(&mut h);
     (s.history.undo.len(), s.history.redo.len()).hash(&mut h);
@@ -447,6 +459,21 @@ mod tests {
         let mut s = effectcraft_engine::Session::default();
         s.execute("file.openDemoProject", json!({})).unwrap();
         EffectcraftApp::new(s)
+    }
+
+    #[test]
+    fn inline_source_selection_invalidates_native_menu_cache() {
+        let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+        app.ui.timeline.inline_focus = Some(vec![1, 2]);
+        let before = state_key(&app);
+        app.session.state.comp_selections.insert(
+            effectcraft_engine::project::ItemId(3),
+            effectcraft_engine::CompSelection { layers: vec![effectcraft_engine::project::LayerId(4)], ..Default::default() },
+        );
+        assert_ne!(state_key(&app), before);
+        let selected = state_key(&app);
+        app.ui.timeline.inline_focus = None;
+        assert_ne!(state_key(&app), selected);
     }
 
     #[test]

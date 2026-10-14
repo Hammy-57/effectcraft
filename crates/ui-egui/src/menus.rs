@@ -194,6 +194,9 @@ fn only_comp(p: &Value) -> Option<effectcraft_engine::project::ItemId> {
 
 /// Execute a UI or engine command by id.
 pub fn invoke(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: Value) -> Result<Value, String> {
+    if let Some(nested) = crate::panels::timeline::inline_target(app, id, &params)? {
+        return run_engine(app, ctx, "comp.inlineEdit", nested);
+    }
     if id == "effects.copyPresetsFolderPath" {
         return frontend(app, ctx, id, params);
     }
@@ -648,6 +651,9 @@ pub(crate) fn entry_checked(app: &EffectcraftApp, e: &MenuEntry) -> Option<bool>
 }
 
 pub(crate) fn entry_enabled(app: &EffectcraftApp, e: &MenuEntry) -> bool {
+    if let Some(enabled) = crate::panels::timeline::inline_enabled(app, &e.command) {
+        return enabled;
+    }
     if e.command == "edit.paste"
         && app.session.state.text_edit.is_none()
         && app.hooks.clipboard_text.as_ref().and_then(|read| read()).is_some_and(|text| effectcraft_engine::figma::clipboard::is_clipboard_text(&text))

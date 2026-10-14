@@ -3,6 +3,7 @@
 // Every `src/panels/*.rs` file is a module, declared by build.rs (docs/architecture.md,
 // "Self-registering modules"); declare one here only for another visibility or a submodule folder.
 include!(concat!(env!("OUT_DIR"), "/panels.rs"));
+pub mod timeline;
 
 use effectcraft_engine::Session;
 use effectcraft_engine::project::Comp;
@@ -82,6 +83,16 @@ pub(crate) fn space_hand(ctx: &egui::Context) -> bool {
 }
 
 pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: PanelKind, rect: Rect) {
+    // Restore the parent cursor before another panel processes the click, never afterward.
+    // Menu clicks are outside panel bodies, so Edit/Animation retain inline source targeting.
+    if p != PanelKind::Timeline
+        && !crate::widgets::any_menu_open(ui.ctx())
+        && !egui::Popup::is_any_open(ui.ctx())
+        && ui.rect_contains_pointer(rect)
+        && ui.input(|i| i.pointer.any_pressed())
+    {
+        timeline::clear_inline_focus(app);
+    }
     match p {
         PanelKind::Composition => viewers::show(app, ui, 0, rect),
         PanelKind::Viewer(n) => viewers::show(app, ui, n, rect),

@@ -365,6 +365,17 @@ pub struct TimelineState {
     pub search: String,
     /// Twirled-open layers and groups (by layer id / group uid).
     pub open_layers: BTreeSet<u64>,
+    /// Expanded precomp instances: root comp id followed by the chain of precomp layer ids.
+    #[serde(default)]
+    pub inline_precomps: BTreeSet<Vec<u64>>,
+    /// Source instance owning timeline keyboard actions; never persisted across sessions.
+    #[serde(skip)]
+    pub inline_focus: Option<Vec<u64>>,
+    /// Parent selection hidden while a nested source owns timeline editing.
+    #[serde(skip)]
+    pub inline_parent_selection: Option<effectcraft_engine::CompSelection>,
+    #[serde(skip)]
+    pub inline_parent_text_edit: Option<effectcraft_engine::commands::text_edit::TextEdit>,
     pub open_groups: BTreeSet<u64>,
     /// The last reveal shortcut's filter (P/S/R/T/A…): what pressing it again toggles or adds to.
     pub reveal: Vec<String>,
@@ -461,6 +472,10 @@ impl Default for TimelineState {
             graph_editor: false,
             search: String::new(),
             open_layers: BTreeSet::new(),
+            inline_precomps: BTreeSet::new(),
+            inline_focus: None,
+            inline_parent_selection: None,
+            inline_parent_text_edit: None,
             open_groups: BTreeSet::new(),
             reveal: vec![],
             layer_reveal: BTreeMap::new(),
