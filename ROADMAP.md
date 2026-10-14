@@ -2,12 +2,15 @@
 
 **Stage: alpha** · next: beta, ~30 points of "ready for real work" and ~350–620 h away
 
-> **Last reviewed:** 2026-10-12 · **Last updated:** 2026-10-12 · **Change:** minor (open-issue count, crash list and localization share re-audited against `upstream/main` 470ea7a3) · **Target:** Adobe After Effects 2026 (26.5.0.89)
+> **Last reviewed:** 2026-10-12 · **Last updated:** 2026-10-14 · **Change:** minor (open-issue count, crash list and localization share re-audited against `upstream/main` 470ea7a3) · **Target:** Adobe After Effects 2026 (26.5.0.89)
 
 EffectCraft aims to do what After Effects does, with the same panels, menus and behaviour, written
 from scratch in Rust. This page is the one-page summary; the evidence is in
 [docs/target-app-parity.md](docs/target-app-parity.md), the work list in
 [docs/gaps.md](docs/gaps.md), and the plan in [docs/roadmap.md](docs/roadmap.md).
+
+Interaction fixes (2026-10-14): mask/shape editing and native panel-window consolidation;
+[implementation and validation limits](docs/interaction-fixes.md). Readiness estimates unchanged.
 
 ## Headline numbers
 

@@ -680,6 +680,7 @@ impl EffectcraftApp {
             self.ui.start_screen = false;
             self.ui.home_learn = false;
         }
+        self.os_windows = Default::default();
         self.ui.workspace = name.to_string();
         self.ui.dock = self.ui.saved_workspaces.get(name).cloned().unwrap_or_else(|| dock::workspace(name));
         self.ui.floating = self.ui.saved_floating.get(name).cloned().unwrap_or_else(|| dock::workspace_floating(name));

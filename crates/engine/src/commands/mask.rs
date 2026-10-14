@@ -5,7 +5,7 @@
 
 use effectcraft_keyframe::{ShapePath, Value as KV};
 use effectcraft_project::build::{self, Ids};
-use effectcraft_project::{Layer, MaskMode, PropGroup, Uid};
+use effectcraft_project::{GroupKind, Layer, MaskMode, PropGroup, Uid};
 use serde_json::{Value, json};
 
 use super::{CommandSpec, b_p, bad, has_comp, has_layers, layer_mut, layer_p, merge_p, resolve_layer, str_p};
@@ -13,7 +13,12 @@ use crate::{EngineError, Result, Session, VertexRef, cmd};
 
 fn pt(v: Option<&Value>) -> Option<[f64; 2]> {
     let a = v?.as_array()?;
-    Some([a.first()?.as_f64()?, a.get(1)?.as_f64()?])
+    let p = [a.first()?.as_f64()?, a.get(1)?.as_f64()?];
+    p.iter().all(|v| v.is_finite() && v.abs() <= 1e15).then_some(p)
+}
+
+pub(crate) fn path_locked(g: &PropGroup) -> bool {
+    matches!(g.kind, GroupKind::Mask { locked: true, .. })
 }
 
 fn pts(v: Option<&Value>) -> Vec<[f64; 2]> {
@@ -129,8 +134,14 @@ fn edit_path_counted<T>(s: &mut Session, p: &Value, label: &str, f: impl FnOnce(
     let preserve = s.prefs.general.preserve_constant_vertex_count;
     s.edit(label, merge_p(p), |proj, _| {
         let l = layer_mut(proj, cid, lid)?;
+        if l.switches.locked {
+            return Err(bad(label, "layer is locked"));
+        }
         let lt = l.layer_time(t);
         let g = path_group(&mut l.props, &key).ok_or_else(|| bad(label, "no such mask or shape path"))?;
+        if path_locked(g) {
+            return Err(bad(label, "mask is locked"));
+        }
         let uid = g.uid;
         let roto = super::paths::is_roto(g);
         let pr = g.get_mut("path").ok_or_else(|| bad(label, "mask has no path"))?;
@@ -241,6 +252,20 @@ fn vertex_groups(s: &Session, p: &Value) -> Result<std::collections::BTreeMap<(u
             g.entry((v.layer.0, v.mask)).or_default().push(v.index);
         }
     }
+    for ((lid, uid), indices) in &mut g {
+        let layer = comp.layer(effectcraft_project::LayerId(*lid)).ok_or_else(|| bad("mask", "no such layer"))?;
+        let group = layer.props.find_group(*uid).filter(|g| is_path_group(g)).ok_or_else(|| bad("mask", "no such editable path"))?;
+        if layer.switches.locked || path_locked(group) {
+            return Err(bad("mask", "layer or mask is locked"));
+        }
+        let path = group.get("path").map(|p| p.value_at(layer.layer_time(s.time()))).ok_or_else(|| bad("mask", "no path"))?;
+        let path = path.as_path().ok_or_else(|| bad("mask", "not a path"))?;
+        if indices.iter().any(|i| *i >= path.vertices.len()) {
+            return Err(bad("mask", "vertex out of range"));
+        }
+        indices.sort_unstable();
+        indices.dedup();
+    }
     Ok(g)
 }
 
@@ -269,14 +294,15 @@ fn has_vertices(s: &Session) -> std::result::Result<(), String> {
     if s.state.selected_vertices.is_empty() { Err("select mask vertices first".into()) } else { Ok(()) }
 }
 
-/// Apply `f` to the selected vertices' paths (each mask once).
-fn edit_vertices(s: &mut Session, p: &Value, label: &str, f: impl Fn(&mut ShapePath, &[usize])) -> Result<Value> {
-    edit_vertices_counted(s, p, label, false, f)
-}
-
-/// [`edit_vertices`]; `removes`: `f` deletes the given vertices (repeated on the other keyframes
+/// Edit each selected path once; `removes`: `f` deletes the given vertices (repeated on the other keyframes
 /// when Preserve Constant Vertex Count is on).
-fn edit_vertices_counted(s: &mut Session, p: &Value, label: &str, removes: bool, f: impl Fn(&mut ShapePath, &[usize])) -> Result<Value> {
+fn edit_vertices_counted(
+    s: &mut Session,
+    p: &Value,
+    label: &str,
+    removes: bool,
+    f: impl Fn(&mut ShapePath, &[usize], (u64, Uid)) -> Result<()>,
+) -> Result<Value> {
     let cid = s.active_comp_id().ok_or(EngineError::NoComp)?;
     let groups = vertex_groups(s, p)?;
     let t = s.time();
@@ -285,12 +311,18 @@ fn edit_vertices_counted(s: &mut Session, p: &Value, label: &str, removes: bool,
         let comp = proj.comp_mut(cid).ok_or(EngineError::NoComp)?;
         for ((l, m), idx) in &groups {
             let Some(layer) = comp.layer_mut(effectcraft_project::LayerId(*l)) else { continue };
+            if layer.switches.locked {
+                return Err(bad(label, "layer is locked"));
+            }
             let lt = layer.layer_time(t);
             let Some(g) = layer.props.find_group_mut(*m).filter(|g| is_path_group(g)) else { continue };
+            if path_locked(g) {
+                return Err(bad(label, "mask is locked"));
+            }
             let roto = super::paths::is_roto(g);
             let Some(pr) = g.get_mut("path") else { continue };
             let KV::Path(mut sp) = pr.value_at(lt) else { continue };
-            f(&mut sp, idx);
+            f(&mut sp, idx, (*l, *m))?;
             if roto {
                 super::paths::roto_smooth(&mut sp);
             }
@@ -305,19 +337,48 @@ fn edit_vertices_counted(s: &mut Session, p: &Value, label: &str, removes: bool,
 }
 
 fn move_vertices(s: &mut Session, p: &Value) -> Result<Value> {
-    let d = pt(p.get("delta")).ok_or_else(|| bad("mask.moveVertices", "missing `delta` [dx,dy] (layer space)"))?;
-    edit_vertices(s, p, "Move Mask Vertices", |sp, idx| {
-        for &i in idx {
-            if let Some(v) = sp.vertices.get_mut(i) {
-                v[0] += d[0];
-                v[1] += d[1];
+    let c = "mask.moveVertices";
+    let d = pt(p.get("delta")).ok_or_else(|| bad(c, "missing finite `delta` [dx,dy] (path space)"))?;
+    // A viewer drag crosses differently transformed shape groups: each path has its own delta.
+    let mut deltas = std::collections::BTreeMap::new();
+    if let Some(value) = p.get("deltas") {
+        let values = value.as_array().ok_or_else(|| bad(c, "`deltas` must be an array"))?;
+        if values.len() > 65_536 {
+            return Err(bad(c, "too many path deltas"));
+        }
+        for v in values {
+            let l = v.get("layer").and_then(Value::as_u64).ok_or_else(|| bad(c, "delta needs layer id"))?;
+            let m = v.get("mask").and_then(Value::as_u64).ok_or_else(|| bad(c, "delta needs path uid"))?;
+            let delta = pt(v.get("delta")).ok_or_else(|| bad(c, "delta must be finite"))?;
+            let index = v.get("index").map(|i| i.as_u64().and_then(|i| usize::try_from(i).ok()).ok_or_else(|| bad(c, "invalid vertex index"))).transpose()?;
+            if deltas.insert((l, m, index), delta).is_some() {
+                return Err(bad(c, "duplicate path delta"));
             }
         }
+        if vertex_groups(s, p)?
+            .iter()
+            .any(|(&(l, m), indices)| indices.iter().any(|i| !deltas.contains_key(&(l, m, None)) && !deltas.contains_key(&(l, m, Some(*i)))))
+        {
+            return Err(bad(c, "missing delta for a selected path"));
+        }
+    }
+    edit_vertices_counted(s, p, "Move Mask Vertices", false, |sp, idx, key| {
+        for &i in idx {
+            let d = deltas.get(&(key.0, key.1, Some(i))).or_else(|| deltas.get(&(key.0, key.1, None))).copied().unwrap_or(d);
+            if let Some(v) = sp.vertices.get_mut(i) {
+                let next = [v[0] + d[0], v[1] + d[1]];
+                if !next.iter().all(|v| v.is_finite() && v.abs() <= 1e15) {
+                    return Err(bad(c, "vertex out of range"));
+                }
+                *v = next;
+            }
+        }
+        Ok(())
     })
 }
 
 fn delete_vertices(s: &mut Session, p: &Value) -> Result<Value> {
-    let n = edit_vertices_counted(s, p, "Delete Mask Vertices", true, |sp, idx| {
+    let n = edit_vertices_counted(s, p, "Delete Mask Vertices", true, |sp, idx, _| {
         let mut idx = idx.to_vec();
         idx.sort_unstable();
         idx.dedup();
@@ -332,6 +393,7 @@ fn delete_vertices(s: &mut Session, p: &Value) -> Result<Value> {
         if sp.vertices.len() < 3 {
             sp.closed = false;
         }
+        Ok(())
     })?;
     s.state.selected_vertices.clear();
     Ok(n)
@@ -653,7 +715,15 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("mask.setVertex", "Set Mask Vertex", [], None, "{layer?, mask, index (0-based vertex), point?, in?, out?, merge?}", has_layers, set_vertex),
         cmd!("mask.setClosed", "Closed", ["Layer", "Mask and Shape Path"], None, "{layer?, mask, closed?}", has_layers, set_closed),
         cmd!("mask.selectVertices", "Select Mask Vertices", [], None, "{vertices: [{layer, mask, index}], add?, toggle?}", has_comp, select_vertices),
-        cmd!("mask.moveVertices", "Move Mask Vertices", [], None, "{vertices?: [{layer, mask, index}], delta: [dx,dy], merge?}", has_vertices, move_vertices),
+        cmd!(
+            "mask.moveVertices",
+            "Move Mask Vertices",
+            [],
+            None,
+            "{vertices?: [{layer, mask, index}], delta: [dx,dy], deltas?: [{layer, mask, index?, delta}], merge?}",
+            has_vertices,
+            move_vertices
+        ),
         cmd!("mask.deleteVertices", "Delete Mask Vertices", [], None, "{vertices?}", has_vertices, delete_vertices),
         cmd!(
             "mask.convertVertex",
@@ -688,4 +758,80 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("mask.remove", "Remove Mask", [], None, "{layer?, mask}", has_layers, |s, p| remove_masks(s, p, false)),
         cmd!("mask.removeAll", "Remove All Masks", [], None, "{layer?}", has_layers, |s, p| remove_masks(s, p, true)),
     ]
+}
+
+#[cfg(test)]
+mod interaction_tests {
+    use super::*;
+    use effectcraft_project::LayerId;
+
+    fn fixture() -> (Session, u64, u64, u64) {
+        let mut s = Session::default();
+        s.execute("comp.new", json!({"width": 640, "height": 360})).unwrap();
+        let l = s.execute("layer.newSolid", json!({"width": 640, "height": 360})).unwrap()["layer"].as_u64().unwrap();
+        let mut add = || s.execute("mask.new", json!({"layer": l, "vertices": [[10,10],[80,10],[80,80]], "closed": true})).unwrap()["mask"].as_u64().unwrap();
+        let a = add();
+        let b = add();
+        s.execute("mask.selectVertices", json!({"vertices": [{"layer":l,"mask":a,"index":0},{"layer":l,"mask":b,"index":0}]})).unwrap();
+        (s, l, a, b)
+    }
+
+    fn point(s: &Session, l: u64, m: u64) -> [f64; 2] {
+        s.active_comp().unwrap().layer(LayerId(l)).unwrap().props.find_group(m).unwrap().get("path").unwrap().value.as_path().unwrap().vertices[0]
+    }
+
+    #[test]
+    fn per_path_displacements_are_one_undo_and_missing_deltas_fail_atomically() {
+        let (mut s, l, a, b) = fixture();
+        let before = s.history.undo.len();
+        s.execute(
+            "mask.moveVertices",
+            json!({"delta":[0,0],"deltas":[
+            {"layer":l,"mask":a,"delta":[10,0]}, {"layer":l,"mask":b,"delta":[5,0]}]}),
+        )
+        .unwrap();
+        assert_eq!(point(&s, l, a), [20.0, 10.0]);
+        assert_eq!(point(&s, l, b), [15.0, 10.0]);
+        assert_eq!(s.history.undo.len(), before + 1);
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(point(&s, l, a), [10.0, 10.0]);
+        assert_eq!(point(&s, l, b), [10.0, 10.0]);
+        assert!(s.execute("mask.moveVertices", json!({"delta":[1,0],"deltas":[{"layer":l,"mask":a,"delta":[1,0]}]})).is_err());
+        assert_eq!(point(&s, l, a), [10.0, 10.0]);
+    }
+
+    #[test]
+    fn locked_mask_rejects_stale_selection_and_direct_vertex_edits() {
+        let (mut s, l, a, b) = fixture();
+        s.execute("layer.mask.lock", json!({"layer":l,"mask":b,"value":true})).unwrap();
+        let before = s.history.undo.len();
+        for (cmd, p) in [
+            ("mask.moveVertices", json!({"delta":[10,0]})),
+            ("mask.deleteVertices", json!({})),
+            ("path.freeTransform", json!({"layer":l,"mask":b,"offset":[10,0]})),
+            ("path.setFirstVertex", json!({"layer":l,"mask":b,"index":1})),
+            ("mask.setVertex", json!({"layer":l,"mask":b,"index":0,"point":[99,99]})),
+            ("mask.insertVertex", json!({"layer":l,"mask":b,"segment":0})),
+            ("mask.selectVertices", json!({"vertices":[{"layer":l,"mask":b,"index":0}]})),
+        ] {
+            assert!(s.execute(cmd, p).is_err(), "{cmd}");
+        }
+        assert_eq!(point(&s, l, a), [10.0, 10.0]);
+        assert_eq!(point(&s, l, b), [10.0, 10.0]);
+        assert_eq!(s.history.undo.len(), before);
+    }
+    #[test]
+    fn per_vertex_displacements_support_perspective_without_moving_other_points() {
+        let (mut s, l, a, _) = fixture();
+        s.execute("mask.selectVertices", json!({"vertices":[{"layer":l,"mask":a,"index":0},{"layer":l,"mask":a,"index":1}]})).unwrap();
+        s.execute(
+            "mask.moveVertices",
+            json!({"delta":[0,0],"deltas":[
+            {"layer":l,"mask":a,"index":0,"delta":[10,0]},
+            {"layer":l,"mask":a,"index":1,"delta":[20,0]}]}),
+        )
+        .unwrap();
+        let path = s.active_comp().unwrap().layer(LayerId(l)).unwrap().props.find_group(a).unwrap().get("path").unwrap().value.as_path().unwrap();
+        assert_eq!(path.vertices, vec![[20.0, 10.0], [100.0, 10.0], [80.0, 80.0]]);
+    }
 }

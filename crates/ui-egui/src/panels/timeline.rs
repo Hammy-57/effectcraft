@@ -590,11 +590,24 @@ fn display_name(app: &EffectcraftApp, l: &Layer) -> String {
 /// The timeline search (After Effects' search field): rows for the properties and groups of a
 /// layer whose names contain `q` (lowercase), each with its enclosing groups. A matching group
 /// brings its whole contents.
+fn shape_item(layer: &Layer, group: &PropGroup) -> bool {
+    group.is_instance()
+        && !matches!(group.match_id.as_str(), "contents" | "transform")
+        && layer.props.sub("contents").is_some_and(|c| c.find_group(group.uid).is_some())
+}
+
+fn group_eye(layer: &Layer, group: &PropGroup) -> Option<bool> {
+    let styles = layer.props.sub(effectcraft_engine::project::styles::GROUP);
+    (shape_item(layer, group)
+        || styles
+            .is_some_and(|s| (s.uid == group.uid || s.groups().any(|g| g.uid == group.uid)) && group.match_id != effectcraft_engine::project::styles::BLENDING))
+    .then_some(group.enabled)
+}
+
 fn search_rows(l: &Layer, q: &str) -> Vec<Row> {
-    fn group_row(l: &Layer, g: &PropGroup, depth: usize, parent: &PropGroup) -> Row {
+    fn group_row(l: &Layer, g: &PropGroup, depth: usize, _parent: &PropGroup) -> Row {
         let fx = matches!(g.kind, GroupKind::Effect { .. }).then_some(g.enabled);
-        let eye =
-            (parent.match_id == effectcraft_engine::project::styles::GROUP && g.match_id != effectcraft_engine::project::styles::BLENDING).then_some(g.enabled);
+        let eye = group_eye(l, g);
         Row { layer: l.id, depth, kind: RowKind::Group { uid: g.uid, name: g.name.clone(), open: true, has_children: !g.children.is_empty(), fx, eye } }
     }
     fn all(l: &Layer, g: &PropGroup, depth: usize, out: &mut Vec<Row>) {
@@ -721,14 +734,7 @@ fn build_rows(app: &EffectcraftApp, comp: &Comp) -> Vec<Row> {
                     rows.push(Row {
                         layer: l.id,
                         depth: 1,
-                        kind: RowKind::Group {
-                            uid: g.uid,
-                            name: g.name.clone(),
-                            open,
-                            has_children: !g.children.is_empty(),
-                            fx: None,
-                            eye: (g.match_id == effectcraft_engine::project::styles::GROUP).then_some(g.enabled),
-                        },
+                        kind: RowKind::Group { uid: g.uid, name: g.name.clone(), open, has_children: !g.children.is_empty(), fx: None, eye: group_eye(l, g) },
                     });
                     if open {
                         push_group(&mut rows, l, g, 2, &tl.open_groups);
@@ -791,7 +797,7 @@ fn reveal_rows(app: &EffectcraftApp, l: &Layer, kinds: &[String], rows: &mut Vec
                     open: tl.open_groups.contains(&g.uid),
                     has_children: true,
                     fx: fx.then_some(g.enabled),
-                    eye: None,
+                    eye: group_eye(l, g),
                 },
             });
             if tl.open_groups.contains(&g.uid) {
@@ -869,7 +875,7 @@ fn reveal_rows(app: &EffectcraftApp, l: &Layer, kinds: &[String], rows: &mut Vec
             rows.push(Row {
                 layer: l.id,
                 depth: 1,
-                kind: RowKind::Group { uid: g.uid, name: g.name.clone(), open, has_children: !g.children.is_empty(), fx: None, eye: None },
+                kind: RowKind::Group { uid: g.uid, name: g.name.clone(), open, has_children: !g.children.is_empty(), fx: None, eye: group_eye(l, g) },
             });
             if open {
                 push_group(rows, l, g, 2, &tl.open_groups);
@@ -919,7 +925,11 @@ fn revealed_rows(
         }
         let o = t.open.contains(&g.uid);
         let fx = matches!(g.kind, GroupKind::Effect { .. }).then_some(g.enabled);
-        rows.push(Row { layer: t.l.id, depth, kind: RowKind::Group { uid: g.uid, name: g.name.clone(), open: o, has_children: true, fx, eye: None } });
+        rows.push(Row {
+            layer: t.l.id,
+            depth,
+            kind: RowKind::Group { uid: g.uid, name: g.name.clone(), open: o, has_children: true, fx, eye: group_eye(t.l, g) },
+        });
         if !o {
             return;
         }
@@ -1026,8 +1036,7 @@ fn push_group(rows: &mut Vec<Row>, l: &Layer, g: &PropGroup, depth: usize, open:
                 let o = open.contains(&sg.uid);
                 let fx = matches!(sg.kind, GroupKind::Effect { .. }).then_some(sg.enabled);
                 // Layer style groups have eye switches (not Blending Options).
-                let eye = (g.match_id == effectcraft_engine::project::styles::GROUP && sg.match_id != effectcraft_engine::project::styles::BLENDING)
-                    .then_some(sg.enabled);
+                let eye = group_eye(l, sg);
                 rows.push(Row {
                     layer: l.id,
                     depth,
@@ -2225,11 +2234,15 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     app.auto.add(&format!("timeline.group.{uid}.fx"), fr_, name);
                 }
                 if let Some(en) = eye {
-                    // Layer style eye switch in the A/V column, like AE.
+                    // Shape items and layer styles share the visibility column.
                     let er = Rect::from_center_size(pos2(cw.av + 10.0, cy), vec2(15.0, 15.0));
                     lp.rect_stroke(er.shrink(1.5), 2.0, Stroke::new(1.0, t.separator), StrokeKind::Inside);
                     if widgets::icon_toggle(ui, er, Icon::Eye, *en, &t, egui::Id::new(("geye", uid)), Sense::click()).clicked() {
-                        actions.push(("layer.style.toggle".into(), json!({"layer": layer.id.0, "style": uid})));
+                        if layer.props.find_group(*uid).is_some_and(|g| shape_item(layer, g)) {
+                            actions.push(("prop.setGroupEnabled".into(), json!({"layer": layer.id.0, "prop": uid, "value": !en})));
+                        } else {
+                            actions.push(("layer.style.toggle".into(), json!({"layer": layer.id.0, "style": uid})));
+                        }
                     }
                     app.auto.add(&format!("timeline.group.{uid}.eye"), er, name);
                 }
@@ -2293,6 +2306,14 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 let gr_rect = Rect::from_min_max(pos2(indent + 8.0, r.min.y), pos2(cw.vx.max(indent + 28.0), r.max.y));
                 let gr = ui.interact(gr_rect, egui::Id::new(("grow", uid)), Sense::click());
                 app.auto.add(&format!("timeline.group.{uid}.name"), gr_rect, name);
+                if layer.props.find_group(*uid).is_some_and(|g| matches!(g.match_id.as_str(), "rect" | "ellipse" | "star")) {
+                    widgets::context_menu(&gr, |ui| {
+                        if ui.button(crate::i18n::tr("Convert To Bezier Path")).clicked() {
+                            actions.push(("path.convertToBezier".into(), json!({"layer": layer.id.0, "prop": uid})));
+                            ui.close();
+                        }
+                    });
+                }
                 if gr.clicked() && uid & (WAVE_BIT | GEOM_BIT) == 0 {
                     actions.push(("prop.select".into(), json!({"layer": layer.id.0, "prop": uid, "selectKeys": false})));
                 }

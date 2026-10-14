@@ -973,3 +973,12 @@ before.
   render regression check; `cargo xtask fuzz` runs ten fuzz targets (project files, AEP import,
   Lottie, SVG, PSD, PDF, timelines, expressions, media, engine commands); `cargo xtask bench
   --fail-over PCT` fails on resource regressions.
+
+## Update: 2026-10-14 — mask/shape interactions and panel windows
+
+- Full-frame vertex marquee, arrow nudging, edge auto-pan, per-vertex screen-space movement,
+  mask locks, parametric-to-Bezier conversion and shape visibility controls implemented.
+- Menu-created and ordinary floating panels use one native implementation; old window placement
+  records migrate to floating-group workspace state. Returning to the main window docks the group.
+- Regression tests added; validation status and remaining native checks in
+  [interaction-fixes.md](interaction-fixes.md). No readiness percentage increase.

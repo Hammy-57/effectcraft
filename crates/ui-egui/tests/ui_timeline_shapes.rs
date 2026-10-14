@@ -383,3 +383,29 @@ fn ctrl_v_pastes_svg_markup_as_a_shape_layer() {
     assert_eq!(c.layers.len(), 4);
     assert_eq!(c.layers[0].name, "Oval 2");
 }
+
+#[test]
+fn shape_item_eye_toggles_nested_fill_and_undoes() {
+    let mut s = session();
+    let lid = s.execute("layer.newShape", json!({"kind":"rect"})).unwrap()["layer"].as_u64().unwrap();
+    let layer = s.active_comp().unwrap().layer(LayerId(lid)).unwrap();
+    let contents = layer.props.sub("contents").unwrap().uid;
+    let group = layer.props.group("contents/group").unwrap().uid;
+    let nested = layer.props.group("contents/group/contents").unwrap().uid;
+    let fill = layer.props.group("contents/group/contents/fill").unwrap().uid;
+    let stroke = layer.props.group("contents/group/contents/stroke").unwrap().uid;
+    let dashes = layer.props.group("contents/group/contents/stroke/dashes").unwrap().uid;
+    let mut h = harness(s);
+    h.state_mut().ui.timeline.open_layers.insert(lid);
+    h.state_mut().ui.timeline.open_groups.extend([contents, group, nested, stroke]);
+    h.run_steps(3);
+    assert!(h.state().auto.find(&format!("timeline.group.{stroke}.eye")).is_some());
+    assert!(h.state().auto.find(&format!("timeline.group.{dashes}.eye")).is_none());
+    click(&mut h, &format!("timeline.group.{fill}.eye"));
+    assert!(!h.state().session.active_comp().unwrap().layer(LayerId(lid)).unwrap().props.find_group(fill).unwrap().enabled);
+    h.state_mut().session.execute("edit.undo", json!({})).unwrap();
+    assert!(h.state().session.active_comp().unwrap().layer(LayerId(lid)).unwrap().props.find_group(fill).unwrap().enabled);
+    h.state_mut().ui.timeline.search = "Fill".into();
+    h.run_steps(3);
+    assert!(h.state().auto.find(&format!("timeline.group.{fill}.eye")).is_some(), "filtered rows keep their eye");
+}
