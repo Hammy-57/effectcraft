@@ -1004,6 +1004,20 @@ before.
   were compiled but not executed under the fork's daytime rule; full CI was not run. No general
   pixel-parity grade is assigned, and this extension does not change After Effects parity scores.
 
+
+## Update: ordinary FigCraft Copy carries native clipboard data (14 October 2026)
+
+- Normal FigCraft Copy/Cmd+C can carry the existing native snapshot in an exact SVG metadata
+  marker; EffectCraft Paste recognizes it while preserving generic SVG and explicit JSON paste.
+  Carrier and decoded sizes are bounded, duplicate/damaged metadata is rejected without
+  fallback, and native SVG geometry `path` strings are accepted only in geometry entries.
+- Scoped engine/UI check and clippy (all targets, warnings denied) and a native build passed.
+  Actual right-click Copy and Cmd+C → EffectCraft Paste/Cmd+V produced ten native layers
+  (three text, seven shapes, including a vector), with no images. Cut/Undo, plain-text copying,
+  the optional explicit action, one-step undo/redo, independent copies, malformed-carrier
+  rejection, identical save/reopen pixels and standalone stroke/shadow bounds passed native QA.
+  Text metrics remain warned. Regression tests were compiled but not executed; no full CI was
+  run under the fork daytime rules. Parity scores are unchanged.
 ## Update: 2026-10-14 — inline precomps and graph controls
 
 - Inline precomp rows edit real source layers/properties/keys with validated instance paths,
