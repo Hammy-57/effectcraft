@@ -892,9 +892,15 @@ fn graph_editor_transform_box_scales_selected_keys_in_time() {
     s.execute("keys.select", json!({"keys": keys})).unwrap();
     h.state_mut().ui.timeline.graph_editor = true;
     h.run_steps(4);
-    for id in ["timeline.graph.snap", "timeline.graph.reference", "timeline.graph.transformBox", "timeline.graph.transformBox.5"] {
+    for id in ["timeline.graph.snap", "timeline.graph.typeOptions", "timeline.graph.transformBox", "timeline.graph.transformBox.5"] {
         assert!(h.state().auto.find(id).is_some(), "missing {id}");
     }
+    // Reference graphs moved into the graph-type menu; exercise that public route.
+    let type_options = rect(&h, "timeline.graph.typeOptions").center();
+    click(&mut h, type_options);
+    let reference = rect(&h, "timeline.graph.reference").center();
+    click(&mut h, reference);
+    assert!(h.state().ui.timeline.graph_reference);
     // Drag the right edge handle to the right: the keys spread out in time, the first stays.
     let r = rect(&h, "timeline.graph.transformBox.5");
     let k0 = rect(&h, &format!("timeline.graph.key.{uid}.0.0")).center();

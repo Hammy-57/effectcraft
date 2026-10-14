@@ -119,6 +119,25 @@ fn shown_props(app: &EffectcraftApp, comp: &Comp) -> Vec<(LayerId, u64)> {
     v
 }
 
+const POSITION_AXES: [&str; 3] = ["positionX", "positionY", "positionZ"];
+
+/// EvalCtx reads separated Position from its followers, ignoring the original property's keys.
+fn separated_position<'a>(l: &'a Layer, pr: &Property) -> Option<&'a effectcraft_engine::project::PropGroup> {
+    if pr.match_id != "position" {
+        return None;
+    }
+    let tr = l.transform()?;
+    (tr.get("positionX").is_some() && tr.get("position").is_some_and(|position| position.uid == pr.uid)).then_some(tr)
+}
+
+fn curve_has_expression(l: &Layer, pr: &Property) -> bool {
+    if let Some(tr) = separated_position(l, pr) {
+        POSITION_AXES.iter().filter_map(|axis| tr.get(axis)).any(Property::has_expression)
+    } else {
+        pr.has_expression()
+    }
+}
+
 fn shown_dims(l: &Layer, pr: &Property) -> usize {
     let n = pr.value.components().len();
     if pr.shown_dims > 0 && !l.is_3d() { (pr.shown_dims as usize).min(n) } else { n.min(4) }
@@ -141,7 +160,7 @@ fn sample(ectx: &EvalCtx, l: &Layer, pr: &Property, d: usize, speed: bool, ct: f
         return ectx.at(tt).value(l, pr).components().get(d).copied().unwrap_or(0.0);
     }
     let lt = l.layer_time(tt);
-    if pr.has_expression() && ectx.expr.is_some() {
+    if separated_position(l, pr).is_some() || (curve_has_expression(l, pr) && ectx.expr.is_some()) {
         // Ease handles/velocity dialogs use units per layer second. Evaluate at the matching
         // comp times so moving, stretching or reversing the layer does not change that unit.
         const STEP: f64 = 0.0001;
@@ -208,7 +227,10 @@ fn curves<'a>(app: &EffectcraftApp, ctx: &egui::Context, comp: &'a Comp, ectx: &
             }
             sampled.push(pts.clone());
             let mut keys = vec![];
-            for (i, k) in pr.keys.iter().enumerate() {
+            // A pinned aggregate remains a useful readout after separation; only its followers
+            // own editable keys now. Never offer edits to the ignored pre-separation keys.
+            let base_keys = if separated_position(l, pr).is_some() { &[][..] } else { pr.keys.as_slice() };
+            for (i, k) in base_keys.iter().enumerate() {
                 let ks = sel.contains(&KeyRef { layer: lid, prop: uid, time: k.time });
                 let kt = l.comp_time(k.time).seconds();
                 let ed = if spatial { 0 } else { d };
@@ -599,7 +621,7 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
                 if speed {
                     ui.label("Speed per layer second");
                 }
-                if c.prop.has_expression() {
+                if curve_has_expression(c.layer, c.prop) {
                     ui.label("Expression result; keys and handles edit the underlying animation");
                 }
             });
@@ -1204,6 +1226,15 @@ fn fit_keys(app: &mut EffectcraftApp, cs: &[Curve], ectx: &EvalCtx, speed: bool,
     let mut v0 = f64::INFINITY;
     let mut v1 = f64::NEG_INFINITY;
     for c in cs {
+        if !selected_only && let Some(tr) = separated_position(c.layer, c.prop) {
+            for key in POSITION_AXES.iter().filter_map(|axis| tr.get(axis)).flat_map(|prop| &prop.keys) {
+                let time = c.layer.start_time.seconds() + key.time.seconds() * c.layer.stretch / 100.0;
+                if time.is_finite() {
+                    t0 = t0.min(time);
+                    t1 = t1.max(time);
+                }
+            }
+        }
         for k in c.keys.iter().filter(|k| !selected_only || k.sel) {
             for (t, v) in std::iter::once((k.t, k.v)).chain(k.handles.iter().map(|h| (h.t, h.v))) {
                 t0 = t0.min(t);
@@ -1215,7 +1246,7 @@ fn fit_keys(app: &mut EffectcraftApp, cs: &[Curve], ectx: &EvalCtx, speed: bool,
     }
     if !selected_only {
         // Expressions can animate beyond their base keys; frame their layer's active interval.
-        for c in cs.iter().filter(|c| c.prop.has_expression()) {
+        for c in cs.iter().filter(|c| curve_has_expression(c.layer, c.prop)) {
             t0 = t0.min(c.layer.in_point.seconds());
             t1 = t1.max(c.layer.out_point.seconds());
         }
@@ -1358,6 +1389,59 @@ fn shift_axes(shift: bool, dx: f32, dy: f32) -> (bool, bool) {
 #[cfg(test)]
 mod tests {
     use super::shift_axes;
+
+    #[test]
+    fn pinned_separated_position_uses_follower_expressions_keys_and_fit_bounds() {
+        use super::*;
+        let mut s = effectcraft_host::session();
+        s.execute("comp.new", json!({"name": "Separated speed", "duration": 20})).unwrap();
+        s.execute("layer.newSolid", json!({"name": "Box", "width": 10, "height": 10})).unwrap();
+        let cid = s.state.active_comp.unwrap();
+        let lid = s.active_comp().unwrap().layers[0].id;
+        let uid = s.active_comp().unwrap().layer(lid).unwrap().props.prop("transform/position").unwrap().uid;
+        s.execute("prop.addKey", json!({"layer": lid.0, "path": "transform/position", "time": 10.0, "value": [300.0, 200.0, 0.0]})).unwrap();
+        s.execute("prop.graphPin", json!({"layer": lid.0, "prop": uid, "value": true})).unwrap();
+        s.execute("prop.separateDimensions", json!({"layer": lid.0, "value": true})).unwrap();
+        s.execute("prop.setExpression", json!({"layer": lid.0, "path": "transform/positionX", "expression": "time * 30"})).unwrap();
+        let l = std::sync::Arc::make_mut(&mut s.project).comp_mut(cid).unwrap().layer_mut(lid).unwrap();
+        l.in_point = Tick::from_seconds_f64(3.0);
+        l.out_point = Tick::from_seconds_f64(6.0);
+        // Removing follower keys leaves the obsolete combined keys in the document.
+        for axis in POSITION_AXES {
+            l.props.sub_mut("transform").unwrap().get_mut(axis).unwrap().keys.clear();
+        }
+        let mut app = crate::EffectcraftApp::new(s);
+        app.ui.timeline.graph_set_only = true;
+        app.ui.timeline.graph_mode = "speed".into();
+        let plot = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 400.0));
+        for expressions in [true, false] {
+            if !expressions {
+                app.session
+                    .execute("prop.setExpression", json!({"layer": lid.0, "path": "transform/positionX", "expression": "time * 30", "enabled": false}))
+                    .unwrap();
+                for (time, value) in [(4.0, 0.0), (5.0, 100.0)] {
+                    app.session.execute("prop.addKey", json!({"layer": lid.0, "path": "transform/positionX", "time": time, "value": value})).unwrap();
+                }
+                // No expression engine is needed to sample composed follower keyframes.
+                app.session.expr = None;
+            }
+            let project = app.session.project.clone();
+            let expr = app.session.expr.clone();
+            let comp = project.comp(cid).unwrap();
+            let layer = comp.layer(lid).unwrap();
+            let prop = layer.props.find(uid).unwrap();
+            let ctx = EvalCtx { expr: expr.as_deref(), ..EvalCtx::new(&project, cid, comp, Tick::ZERO) };
+            assert_eq!(shown_props(&app, comp), vec![(lid, uid)]);
+            assert_eq!(curve_has_expression(layer, prop), expressions);
+            assert!((sample(&ctx, layer, prop, 0, true, 4.5) - if expressions { 30.0 } else { 100.0 }).abs() < 1e-4);
+            let curves = curves(&app, &egui::Context::default(), comp, &ctx, TMap { x0: 0.0, start: 0.0, pps: 40.0 }, plot, true);
+            assert!(curves.iter().all(|c| c.keys.is_empty()));
+            fit_all(&mut app, &curves, &ctx, true, plot);
+            let span = f64::from(plot.width()) / app.ui.timeline.pps.unwrap();
+            assert!((span - if expressions { 3.75 } else { 1.25 }).abs() < 1e-6);
+            assert!((app.ui.timeline.start - if expressions { 2.7 } else { 3.9 }).abs() < 1e-6);
+        }
+    }
 
     #[test]
     fn expression_speed_samples_evaluated_values_and_preserves_layer_time_units() {
