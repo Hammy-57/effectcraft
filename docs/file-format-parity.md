@@ -1,6 +1,6 @@
 # File format parity
 
-> **Last reviewed:** 2026-10-12 · **Last updated:** 2026-10-14 · **Change:** minor (FigCraft clipboard extension; native workflow verified; parity estimate unchanged) · **Target:** Adobe After Effects 2026
+> **Last reviewed:** 2026-10-12 · **Last updated:** 2026-10-14 · **Change:** minor (ordinary FigCraft Copy SVG carrier; native workflow verified; parity estimate unchanged) · **Target:** Adobe After Effects 2026
 
 Every format After Effects reads or writes, with EffectCraft's support. After Effects' list comes
 from its installed bundle (26.5.0.89: `Info.plist` `CFBundleDocumentTypes`, `Plug-ins/Format`,
@@ -89,7 +89,7 @@ trips and renders, checked by tests, not against After Effects), **partial** (na
 |---|---|---|---|---|
 | Premiere Pro `.prproj` | R (import) | none | none | Out of clean-room scope pending a decision; we interchange through FCP7 XML, FCPXML, OTIO, EDL, AAF and OMF instead (beyond After Effects) |
 | Lottie JSON / dotLottie | via third-party plug-ins | yes | yes | beyond After Effects; a warnings list names what Lottie can't express |
-| FigCraft clipboard v1 | — | native editable snapshot | — | [Normal Paste](figcraft-clipboard.md), one undo step; no live link or raster fallback; unsupported visuals are reported, text metrics can differ; native clipboard/edit/undo/save-reopen checks passed; excluded from After Effects parity scoring |
+| FigCraft clipboard v1 | — | native editable snapshot | — | [Normal Copy → Paste](figcraft-clipboard.md) via native metadata in SVG, or explicit JSON; one undo step, no live link or native raster fallback; vector geometry supported, limitations reported; native normal-Copy/clipboard/edit/undo/save-reopen checks passed; excluded from After Effects parity scoring |
 | JSON / CSV / TSV data | R | yes (`footage()`, data layers) | — | good |
 | LUTs (`.cube`, `.3dl`, `.csp`, `.spi1d/3d`, CDL) | R | yes (Apply Color LUT, OCIO effects) | — | Apply Color LUT bug (#514) is closed |
 | OpenColorIO configs | R (OCIO 2.5.1, ACES 2.0 in 26.5) | yes (OCIO v2 subset, Blender configs) | — | partial: no ACES 2.0 output transforms |
@@ -116,6 +116,7 @@ relinking 6–12 h, `.mogrt`-compatible templates 15–30 h (partly parallel wit
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-14 | patch | Ordinary Copy SVG carrier and vector geometry validation; native workflow verified; parity unchanged |
 | 2026-10-14 | minor | Native FigCraft clipboard transfer documented separately from After Effects formats; parity score unchanged; native workflow verified |
 | 2026-10-12 | minor | #324 and #514 marked closed; upstream `.aep` PRs #251 and #860 noted |
 | 2026-10-13 | minor | Upstream merge retains this fork's external py-aep import and moved-footage relinking |

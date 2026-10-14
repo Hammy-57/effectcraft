@@ -1,5 +1,7 @@
 //! One-time, native-only FigCraft clipboard transfer. No network or asset-file access.
 
+use std::borrow::Cow;
+
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -9,10 +11,46 @@ use crate::{Result, Session};
 
 const COMMAND: &str = "edit.pasteFigCraft";
 const MAX_BYTES: usize = 2 * 1024 * 1024;
+const MAX_CARRIER_BYTES: usize = 8 * 1024 * 1024;
+const MAX_ENCODED_BYTES: usize = MAX_BYTES.div_ceil(3) * 4;
+const METADATA_PREFIX: &str = "<metadata id=\"figcraft-clipboard-v1\"";
+const METADATA_START: &str = "<metadata id=\"figcraft-clipboard-v1\">";
 
-/// Recognize the marker even in damaged JSON, so Paste never falls through to an older copy.
+/// Recognize damaged marked content too, so Paste never falls through to SVG or an older copy.
 pub fn is_clipboard_text(text: &str) -> bool {
-    text.trim_start().starts_with('{') && text.contains("\"format\"") && text.contains("\"figcraft.clipboard\"")
+    text.contains(METADATA_PREFIX) || (text.trim_start().starts_with('{') && text.contains("\"format\"") && text.contains("\"figcraft.clipboard\""))
+}
+
+fn payload_json(text: &str) -> Result<Cow<'_, str>> {
+    if !text.contains(METADATA_PREFIX) {
+        return Ok(Cow::Borrowed(text));
+    }
+    if text.len() > MAX_CARRIER_BYTES {
+        return Err(bad(COMMAND, "FigCraft SVG clipboard exceeds 8 MiB"));
+    }
+    if !crate::vector::is_svg_text(text) {
+        return Err(bad(COMMAND, "FigCraft metadata must be inside an SVG clipboard"));
+    }
+    let mut markers = text.match_indices(METADATA_PREFIX);
+    let (index, _) = markers.next().ok_or_else(|| bad(COMMAND, "missing FigCraft clipboard metadata"))?;
+    if markers.next().is_some() {
+        return Err(bad(COMMAND, "duplicate FigCraft clipboard metadata"));
+    }
+    let content = text.get(index..).and_then(|s| s.strip_prefix(METADATA_START)).ok_or_else(|| bad(COMMAND, "malformed FigCraft clipboard metadata"))?;
+    let (encoded, _) = content.split_once("</metadata>").ok_or_else(|| bad(COMMAND, "unterminated FigCraft clipboard metadata"))?;
+    if encoded.len() > MAX_ENCODED_BYTES {
+        return Err(bad(COMMAND, "encoded FigCraft clipboard exceeds the 2 MiB payload limit"));
+    }
+    let bytes = super::fetch::base64_decode(encoded).map_err(|e| bad(COMMAND, format!("invalid FigCraft clipboard base64: {e}")))?;
+    if bytes.len() > MAX_BYTES {
+        return Err(bad(COMMAND, "FigCraft clipboard exceeds 2 MiB"));
+    }
+    // The existing decoder also accepts data URLs and loose padding; this carrier is canonical
+    // standard base64, so damaged encoding cannot silently become a different JSON payload.
+    if effectcraft_track::roto::rle::base64_encode(&bytes) != encoded {
+        return Err(bad(COMMAND, "invalid FigCraft clipboard base64 encoding"));
+    }
+    String::from_utf8(bytes).map(Cow::Owned).map_err(|_| bad(COMMAND, "FigCraft clipboard metadata is not UTF-8"))
 }
 
 // Bound recursion before serde builds a Value; node arrays add two JSON levels per node.
@@ -44,7 +82,7 @@ fn bounded_json(text: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_tree(value: &Value, depth: usize, count: &mut usize) -> Result<()> {
+fn validate_tree(value: &Value, depth: usize, count: &mut usize, geometry_entry: bool) -> Result<()> {
     if depth > 192 {
         return Err(bad(COMMAND, "clipboard JSON nesting exceeds 192 levels"));
     }
@@ -57,16 +95,24 @@ fn validate_tree(value: &Value, depth: usize, count: &mut usize) -> Result<()> {
                 }
             }
             for (key, child) in object {
-                if matches!(key.as_str(), "images" | "pdf" | "png" | "path" | "pdfPath" | "payloadPath" | "payloadPaths" | "url" | "apiBase" | "token" | "$ref")
+                if matches!(key.as_str(), "images" | "pdf" | "png" | "pdfPath" | "payloadPath" | "payloadPaths" | "url" | "apiBase" | "token" | "$ref")
+                    || (key == "path" && !(geometry_entry && child.is_string()))
                 {
                     return Err(bad(COMMAND, format!("external or embedded assets are not supported: `{key}`")));
                 }
-                validate_tree(child, depth + 1, count)?;
+                if matches!(key.as_str(), "fillGeometry" | "strokeGeometry") {
+                    let entries = child.as_array().ok_or_else(|| bad(COMMAND, "path geometry must be an array"))?;
+                    for entry in entries {
+                        validate_tree(entry, depth + 2, count, true)?;
+                    }
+                } else {
+                    validate_tree(child, depth + 1, count, false)?;
+                }
             }
         }
         Value::Array(values) => {
             for child in values {
-                validate_tree(child, depth + 1, count)?;
+                validate_tree(child, depth + 1, count, false)?;
             }
         }
         _ => {}
@@ -94,11 +140,12 @@ fn validate_nodes(nodes: &[Value], depth: usize) -> Result<()> {
 
 fn paste(s: &mut Session, p: &Value) -> Result<Value> {
     let text = str_p(p, "clipboard").ok_or_else(|| bad(COMMAND, "missing `clipboard` JSON text"))?;
+    let text = payload_json(text)?;
     if text.len() > MAX_BYTES {
         return Err(bad(COMMAND, "FigCraft clipboard exceeds 2 MiB"));
     }
-    bounded_json(text)?;
-    let mut decoder = serde_json::Deserializer::from_str(text);
+    bounded_json(&text)?;
+    let mut decoder = serde_json::Deserializer::from_str(&text);
     decoder.disable_recursion_limit();
     let payload = Value::deserialize(&mut decoder).map_err(|e| bad(COMMAND, format!("invalid FigCraft clipboard JSON: {e}")))?;
     decoder.end().map_err(|e| bad(COMMAND, format!("invalid FigCraft clipboard JSON: {e}")))?;
@@ -109,7 +156,7 @@ fn paste(s: &mut Session, p: &Value) -> Result<Value> {
     if payload.get("format").and_then(Value::as_str) != Some("figcraft.clipboard") || payload.get("version").and_then(Value::as_u64) != Some(1) {
         return Err(bad(COMMAND, "expected figcraft.clipboard version 1"));
     }
-    validate_tree(&payload, 0, &mut 0)?;
+    validate_tree(&payload, 0, &mut 0, false)?;
     let nodes =
         payload.get("nodes").and_then(Value::as_array).filter(|a| !a.is_empty()).ok_or_else(|| bad(COMMAND, "clipboard nodes must be a nonempty array"))?;
     validate_nodes(nodes, 0)?;
@@ -191,7 +238,7 @@ pub(super) fn spec() -> CommandSpec {
         menu: &[],
         shortcut: None,
         alt_shortcuts: &[],
-        params: "{clipboard (figcraft.clipboard version 1 JSON text, up to 2 MiB), target?: auto|newComp|activeComp, comp?} → {comp, layers, native, warnings, notes}",
+        params: "{clipboard (FigCraft SVG carrier up to 8 MiB, or version 1 JSON text up to 2 MiB), target?: auto|newComp|activeComp, comp?} → {comp, layers, native, warnings, notes}",
         enabled: always,
         run: paste,
         journal: true,
@@ -214,6 +261,88 @@ mod tests {
 
     fn params(payload: &Value) -> Value {
         json!({"clipboard":payload.to_string()})
+    }
+
+    fn carrier(payload: &Value) -> String {
+        let encoded = effectcraft_track::roto::rle::base64_encode(payload.to_string().as_bytes());
+        format!("<svg xmlns=\"http://www.w3.org/2000/svg\"><path d=\"M0 0L10 10\"/>{METADATA_START}{encoded}</metadata></svg>")
+    }
+
+    #[test]
+    fn normal_copy_svg_metadata_pastes_native_vector_paths() {
+        let node = json!({"id":"vector","type":"VECTOR","name":"Native triangle","size":{"x":20,"y":20},
+            "absoluteTransform":[[1,0,0],[0,1,0]],
+            "fillGeometry":[{"path":"M0 0L20 0L10 20Z","windingRule":"NONZERO"}],
+            "strokeGeometry":[{"path":"M0 0L20 0L10 20Z","windingRule":"NONZERO"}],
+            "fills":[{"type":"SOLID","color":{"r":1,"g":0,"b":0,"a":1}}]});
+        let payload = envelope(vec![node]);
+        for clipboard in [payload.to_string(), carrier(&payload)] {
+            assert!(is_clipboard_text(&clipboard));
+            let mut s = Session::default();
+            let result = s.execute_checked(COMMAND, json!({"clipboard":clipboard})).unwrap();
+            assert_eq!(result["native"], 1);
+            assert_eq!(result["images"], 0);
+            let layer = &s.active_comp().unwrap().layers[0];
+            assert!(matches!(layer.source, LayerSource::Shape));
+            assert_eq!(layer.name, "Native triangle");
+            let mut paths = vec![];
+            layer.props.walk("", &mut |_, prop| {
+                if let Some(path) = prop.value.as_path() {
+                    paths.push(path.clone());
+                }
+            });
+            assert_eq!(paths.len(), 1);
+            assert_eq!(paths[0].vertices, vec![[0.0, 0.0], [20.0, 0.0], [10.0, 20.0]]);
+            assert!(paths[0].closed);
+        }
+        assert!(!is_clipboard_text("<svg><metadata id=\"other\">ordinary SVG</metadata></svg>"));
+    }
+
+    #[test]
+    fn malformed_or_oversized_svg_metadata_changes_nothing() {
+        let payload = envelope(vec![rectangle()]);
+        let valid = carrier(&payload);
+        let duplicate = valid.replace("</svg>", &format!("{METADATA_START}e30=</metadata></svg>"));
+        let bad_base64 = format!("<svg>{METADATA_START}%%%not-base64</metadata></svg>");
+        let bad_padding = format!("<svg>{METADATA_START}e30===</metadata></svg>");
+        let bad_utf8 = format!("<svg>{METADATA_START}/w==</metadata></svg>");
+        let oversized_encoding = format!("<svg>{METADATA_START}{}</metadata></svg>", "A".repeat(MAX_ENCODED_BYTES + 4));
+        let oversized_decoded = format!("<svg>{METADATA_START}{}</metadata></svg>", "A".repeat(MAX_ENCODED_BYTES));
+        let oversized_carrier = format!("<svg>{}{METADATA_START}e30=</metadata></svg>", " ".repeat(MAX_CARRIER_BYTES));
+        for clipboard in [
+            duplicate,
+            bad_base64,
+            bad_padding,
+            bad_utf8,
+            oversized_encoding,
+            oversized_decoded,
+            oversized_carrier,
+            valid.replace("</metadata>", ""),
+            valid.replace(METADATA_START, &format!("{METADATA_PREFIX} extra=\"bad\">")),
+        ] {
+            assert!(is_clipboard_text(&clipboard));
+            let mut s = Session::default();
+            assert!(s.execute_checked(COMMAND, json!({"clipboard":clipboard})).is_err());
+            assert!(s.project.items.is_empty());
+            assert!(s.history.undo.is_empty());
+            assert_eq!(s.revision, 0);
+        }
+    }
+
+    #[test]
+    fn geometry_path_exception_does_not_allow_asset_paths_elsewhere() {
+        for extra in [
+            json!({"path":"/private/asset.svg"}),
+            json!({"fillGeometry":[{"extra":{"path":"/private/asset.svg"}}]}),
+            json!({"fillGeometry":[{"path":{"path":"/private/asset.svg"}}]}),
+            json!({"strokeGeometry":[{"pdfPath":"/private/asset.pdf"}]}),
+        ] {
+            let mut node = rectangle();
+            node.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            let mut s = Session::default();
+            assert!(s.execute_checked(COMMAND, params(&envelope(vec![node]))).is_err());
+            assert!(s.project.items.is_empty());
+        }
     }
 
     #[test]
