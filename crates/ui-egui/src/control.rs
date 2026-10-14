@@ -312,6 +312,18 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
                 if let Some(v) = tl.get("start").and_then(Value::as_f64) {
                     app.ui.timeline.start = v;
                 }
+                if let Some(mode) = tl.get("graphMode").and_then(Value::as_str) {
+                    if !matches!(mode, "auto" | "value" | "speed") {
+                        return err("graphMode must be auto, value or speed");
+                    }
+                    app.ui.timeline.graph_mode = mode.to_owned();
+                }
+                if let Some(value) = tl.get("graphShowSet").and_then(Value::as_bool) {
+                    app.ui.timeline.graph_show_set = value;
+                }
+                if let Some(value) = tl.get("graphAutoZoom").and_then(Value::as_bool) {
+                    app.ui.timeline.graph_auto_zoom = value;
+                }
                 if let Some(v) = tl.get("graphEditor").and_then(Value::as_bool) {
                     app.ui.timeline.graph_editor = v;
                 }

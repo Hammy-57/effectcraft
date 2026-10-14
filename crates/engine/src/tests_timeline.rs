@@ -1222,3 +1222,46 @@ fn relative_trim_moves_every_selected_layer_by_the_same_delta() {
     s.execute("layer.timing", json!({"layers": [a], "inDelta": 0.1})).unwrap();
     assert!(near(io(&s, a).0, -0.9), "{:?}", io(&s, a));
 }
+
+#[test]
+fn graph_set_pin_survives_serialization_and_is_undoable() {
+    let (mut s, layer) = setup();
+    s.execute("prop.graphPin", json!({"layer": layer, "path": "transform/opacity", "value": true})).unwrap();
+    let p = prop(&s, layer, "transform/opacity");
+    assert!(p.graph_editor);
+    let restored: Property = serde_json::from_value(serde_json::to_value(&p).unwrap()).unwrap();
+    assert!(restored.graph_editor);
+    let mut old = serde_json::to_value(&p).unwrap();
+    old.as_object_mut().unwrap().remove("graph_editor");
+    assert!(!serde_json::from_value::<Property>(old).unwrap().graph_editor);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(!prop(&s, layer, "transform/opacity").graph_editor);
+}
+
+#[test]
+fn handle_split_and_join_preserve_the_other_influence_and_undo() {
+    let (mut s, layer) = setup();
+    animate(&mut s, layer, "transform/rotation", &[(0.0, json!(0)), (1.0, json!(90)), (2.0, json!(180))]);
+    s.execute(
+        "keys.setEase",
+        json!({"layer": layer, "path": "transform/rotation", "time": 1.0, "side": "in", "speed": 80, "influence": 40, "continuous": true}),
+    )
+    .unwrap();
+    s.execute(
+        "keys.setEase",
+        json!({"layer": layer, "path": "transform/rotation", "time": 1.0, "side": "out", "speed": 20, "influence": 60, "continuous": false}),
+    )
+    .unwrap();
+    let p = prop(&s, layer, "transform/rotation");
+    assert!(!p.keys[1].continuous);
+    assert_eq!(p.keys[1].in_ease[0].speed, 80.0);
+    assert_eq!(p.keys[1].out_ease[0].speed, 20.0);
+    s.execute("keys.setEase", json!({"layer": layer, "path": "transform/rotation", "time": 1.0, "side": "out", "speed": 80, "continuous": true})).unwrap();
+    let p = prop(&s, layer, "transform/rotation");
+    assert!(p.keys[1].continuous);
+    assert_eq!(p.keys[1].in_ease[0].speed, p.keys[1].out_ease[0].speed);
+    assert!((p.keys[1].in_ease[0].influence - 0.4).abs() < 1e-9);
+    assert!((p.keys[1].out_ease[0].influence - 0.6).abs() < 1e-9);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(!prop(&s, layer, "transform/rotation").keys[1].continuous);
+}

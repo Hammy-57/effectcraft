@@ -14,7 +14,8 @@ use serde_json::{Value, json};
 
 /// The Default workspace (its right column is a stack: Preview and Properties expanded).
 fn harness() -> Harness<'static, EffectcraftApp> {
-    let mut s = Session::default();
+    // Workspaces save to a settings store; give the session an in-memory one.
+    let mut s = Session { config: Some(std::sync::Arc::new(effectcraft_engine::config::MemoryConfig::default())), ..Default::default() };
     s.execute("comp.new", json!({"name": "A", "width": 320, "height": 180, "duration": 4})).unwrap();
     let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).build_eframe(|_| EffectcraftApp::new(s));
     h.run_steps(3);

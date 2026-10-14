@@ -514,7 +514,8 @@ fn numeric_string_resolves_as_id() {
 #[test]
 fn set_text_selected_applies_to_every_selected_text_layer() {
     let mut s = comp(640, 360);
-    let ids: Vec<u64> = ["BUT", "F*CK", "THAT"].iter().map(|t| s.execute("layer.newText", json!({"text": t, "size": 40})).unwrap()["layer"].as_u64().unwrap()).collect();
+    let ids: Vec<u64> =
+        ["BUT", "F*CK", "THAT"].iter().map(|t| s.execute("layer.newText", json!({"text": t, "size": 40})).unwrap()["layer"].as_u64().unwrap()).collect();
     let font = |s: &Session, l: u64| {
         let comp = s.active_comp().unwrap();
         let layer = comp.layer(LayerId(l)).unwrap();

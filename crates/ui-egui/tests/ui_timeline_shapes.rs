@@ -67,8 +67,18 @@ fn shape_contents_add_menu_adds_path_operations() {
     let mut h = harness(s);
     open_layer(&mut h, l);
     click(&mut h, &format!("timeline.group.{contents}.add"));
+    // The list scrolls past about 18 rows: scroll it to the end to reach Trim Paths.
+    let at = h.get_by_label("Rectangle").rect().center();
+    h.input_mut().events.push(Event::PointerMoved(at));
+    h.input_mut().events.push(Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta: egui::vec2(0.0, -1000.0),
+        modifiers: Default::default(),
+        phase: egui::TouchPhase::Move,
+    });
+    h.run_steps(5);
     let entry = h.get_by_label("Trim Paths").rect();
-    assert!(entry.max.y <= 1000.0, "the whole menu fits in the window: {entry:?}");
+    assert!(entry.max.y <= 1000.0, "the entry is inside the window: {entry:?}");
     click_at(&mut h, entry.center());
     let layer = h.state().session.active_comp().unwrap().layer(LayerId(l)).unwrap().clone();
     let items: Vec<&str> = layer.props.sub("contents").unwrap().groups().map(|g| g.match_id.as_str()).collect();

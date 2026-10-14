@@ -455,8 +455,8 @@ pub struct Prefs {
     pub preview: crate::preview::PreviewSettings,
     /// View ▸ Simulate Output ▸ My Custom RGB.
     pub custom_rgb: crate::viewer::CustomRgb,
-    /// The Graph Editor's graph type, as last chosen with its buttons: `speed` (the default),
-    /// `value` or `auto` (Auto-Select Graph Type).
+    /// The Graph Editor's graph type, as last chosen with its buttons: `auto` (the default),
+    /// `value` or `speed`. Explicit saved choices are preserved.
     pub graph_type: String,
     /// Composition Settings presets the user saved, in the order saved.
     #[serde(deserialize_with = "lenient_comp_presets")]
@@ -497,7 +497,7 @@ impl Default for Prefs {
             libraries: vec![],
             preview: crate::preview::PreviewSettings::default(),
             custom_rgb: crate::viewer::CustomRgb::default(),
-            graph_type: "speed".into(),
+            graph_type: "auto".into(),
             comp_presets: vec![],
             extra: Extra::new(),
         }

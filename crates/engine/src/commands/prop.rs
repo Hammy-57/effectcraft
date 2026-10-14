@@ -763,6 +763,18 @@ fn reset(s: &mut Session, p: &Value) -> Result<Value> {
     })
 }
 
+fn graph_pin(s: &mut Session, p: &Value) -> Result<Value> {
+    let (cid, lid, uid) = prop_ref(s, p, "prop.graphPin")?;
+    s.edit("Graph Editor Set", merge_p(p), |proj, _| {
+        let pr = super::layer_mut(proj, cid, lid)?.props.find_mut(uid).ok_or_else(|| bad("prop.graphPin", "no property"))?;
+        if pr.static_only || !pr.value.interpolates() || pr.value.components().is_empty() {
+            return Err(bad("prop.graphPin", "property cannot be graphed"));
+        }
+        pr.graph_editor = p.get("value").and_then(Value::as_bool).unwrap_or(!pr.graph_editor);
+        Ok(json!({"value": pr.graph_editor}))
+    })
+}
+
 fn select_prop(s: &mut Session, p: &Value) -> Result<Value> {
     let (cid, lid) = layer_p(s, p, "prop.select")?;
     let uid = match p.get("prop").and_then(Value::as_u64) {
@@ -1408,6 +1420,7 @@ pub fn specs() -> Vec<CommandSpec> {
             has_layers,
             reset
         ),
+        cmd!("prop.graphPin", "Include Property in Graph Editor Set", [], None, "{layer?, path|prop, value?}", has_comp, graph_pin),
         cmd!("prop.select", "Select Property", [], None, "{layer?, path|prop, add?, selectKeys?}", has_layers, select_prop),
         cmd!("prop.deselect", "Deselect Property", [], None, "{layer?, path|prop}", has_layers, deselect_prop),
         cmd!(

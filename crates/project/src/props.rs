@@ -88,6 +88,9 @@ pub struct Property {
     /// Can't be keyframed (header-like values, e.g. Mask Mode). Shown without a stopwatch.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub static_only: bool,
+    /// Included in the saved Graph Editor Set, independently of selection.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub graph_editor: bool,
 }
 
 fn is_number_ui(ui: &ParamUi) -> bool {
@@ -115,6 +118,7 @@ impl Property {
             two_d_only: false,
             shown_dims: 0,
             static_only: false,
+            graph_editor: false,
         }
     }
     pub fn with_ui(mut self, ui: ParamUi) -> Property {

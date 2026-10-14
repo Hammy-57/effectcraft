@@ -634,6 +634,21 @@ const JAPANESE: &[(&str, &str)] = &[
 ];
 
 const SIMPLIFIED_CHINESE: &[(&str, &str)] = &[
+    ("Agents", "智能体"),
+    ("Control Channel Port", "控制通道端口"),
+    ("Hardware ProRes Decoding", "硬件 ProRes 解码"),
+    ("Let Agents Control EffectCraft (localhost control channel)", "允许智能体控制 EffectCraft（本地主机控制通道）"),
+    ("Let Figma Send Layers (EffectCraft Transfer plug-in, localhost:7789)", "允许 Figma 发送图层（EffectCraft Transfer 插件，localhost:7789）"),
+    (
+        "Off: viewer frames are copied to the CPU and back, and the GPU compositor gets a graphics device of its own at the next launch.",
+        "关闭：查看器帧会复制到 CPU 再复制回来，GPU 合成器将在下次启动时获得自己的图形设备。",
+    ),
+    (
+        "Previews decode ProRes on the Mac's media engines (visually identical, not bit-exact). Renders and exports decode exactly.",
+        "预览使用 Mac 的媒体引擎解码 ProRes（视觉上相同，但并非逐位精确）。渲染和导出则精确解码。",
+    ),
+    ("Show GPU Frames Without Copying", "显示 GPU 帧而不复制"),
+    ("Caching frames…", "正在缓存帧…"),
     ("Appearance Settings…", "外观设置…"),
     ("Add to favorites", "添加到收藏"),
     ("Remove from favorites", "从收藏中移除"),
@@ -1372,6 +1387,21 @@ const SIMPLIFIED_CHINESE: &[(&str, &str)] = &[
 ];
 
 const TRADITIONAL_CHINESE: &[(&str, &str)] = &[
+    ("Agents", "智慧代理"),
+    ("Control Channel Port", "控制通道連接埠"),
+    ("Hardware ProRes Decoding", "硬體 ProRes 解碼"),
+    ("Let Agents Control EffectCraft (localhost control channel)", "允許代理控制 EffectCraft（本機控制通道）"),
+    ("Let Figma Send Layers (EffectCraft Transfer plug-in, localhost:7789)", "允許 Figma 傳送圖層（EffectCraft Transfer 外掛程式，localhost:7789）"),
+    (
+        "Off: viewer frames are copied to the CPU and back, and the GPU compositor gets a graphics device of its own at the next launch.",
+        "關閉：檢視器幀會複製到 CPU 再複製回來，GPU 合成器將在下次啟動時取得自己的圖形裝置。",
+    ),
+    (
+        "Previews decode ProRes on the Mac's media engines (visually identical, not bit-exact). Renders and exports decode exactly.",
+        "預覽使用 Mac 的媒體引擎解碼 ProRes（視覺上相同，但並非逐位元精確）。算繪和匯出則精確解碼。",
+    ),
+    ("Show GPU Frames Without Copying", "顯示 GPU 幀而不複製"),
+    ("Caching frames…", "正在快取幀…"),
     ("Appearance Settings…", "外觀設定…"),
     ("Add to favorites", "加入最愛"),
     ("Remove from favorites", "從最愛移除"),
@@ -3877,7 +3907,6 @@ const SPANISH: &[(&str, &str)] = &[
     ("Magnification ratio popup", "Menú de proporción de ampliación"),
     ("Make Comp Size", "Ajustar al tamaño de la composición"),
     ("Masks", "Máscaras"),
-    ("Maximize Panel", "Maximizar panel"),
     ("Media Replacement", "Sustitución de medios"),
     ("Mesh:", "Malla:"),
     ("Diameter:", "Diámetro:"),
@@ -3987,7 +4016,6 @@ const SPANISH: &[(&str, &str)] = &[
     ("Reset to Default", "Restablecer valores predeterminados"),
     ("Reset to Saved Layout", "Restablecer al diseño guardado"),
     ("Resolution/Down Sample Factor Popup", "Menú emergente de resolución/factor de reducción de muestreo"),
-    ("Restore Panel Size", "Restaurar tamaño del panel"),
     ("Reverse the order", "Invertir el orden"),
     ("Revert All", "Revertir todo"),
     ("Roman Hanging Punctuation", "Puntuación colgante latina"),

@@ -34,6 +34,8 @@ struct BoxDrag {
     /// Where the drag started (comp s, value): the pointer for a move, the handle for a scale.
     /// Every step sends the whole transform since then (`keys.transform {fromStart}`).
     last: [f64; 2],
+    /// Original lower-left bound for snapping a move without accumulating offsets.
+    origin: [f64; 2],
 }
 
 fn box_id() -> egui::Id {
@@ -152,6 +154,7 @@ pub(crate) fn transform_box(
     ui: &mut egui::Ui,
     p: &egui::Painter,
     keys: &[SelKey],
+    snap_keys: &[SelKey],
     tm: TMap,
     ymap: &dyn Fn(f64) -> f32,
     vmap: &dyn Fn(f32) -> f64,
@@ -192,7 +195,7 @@ pub(crate) fn transform_box(
         if resp.drag_started()
             && let Some(o) = ui.input(|i| i.pointer.press_origin())
         {
-            start = Some(BoxDrag { handle: 8, anchor: [0.0; 2], last: data(o) });
+            start = Some(BoxDrag { handle: 8, anchor: [0.0; 2], last: data(o), origin: [b[0], b[1]] });
         }
         resp_any = Some(resp);
     } else {
@@ -208,7 +211,7 @@ pub(crate) fn transform_box(
             app.auto.add(&format!("timeline.graph.transformBox.{i}"), hr, "Transform box handle");
             if resp.drag_started() {
                 let opp = [2, 3, 0, 1, 6, 7, 4, 5][i];
-                start = Some(BoxDrag { handle: i, anchor: corner(opp), last: corner(i) });
+                start = Some(BoxDrag { handle: i, anchor: corner(opp), last: corner(i), origin: [b[0], b[1]] });
             }
             if resp.dragged() || resp.drag_stopped() {
                 resp_any = Some(resp);
@@ -229,7 +232,31 @@ pub(crate) fn transform_box(
     if resp.dragged()
         && let Some(pt) = resp.interact_pointer_pos()
     {
-        let cur = data(pt);
+        let mut cur = data(pt);
+        if app.ui.timeline.graph_snap != ui.input(|i| i.modifiers.command) {
+            let mut times: Vec<f64> = snap_keys.iter().map(|k| k.t).collect();
+            times.push(app.session.time().seconds());
+            if let Some(comp) = app.session.active_comp() {
+                times.extend(comp_snap_times(comp));
+            }
+            let values: Vec<f64> = snap_keys.iter().map(|k| k.v).collect();
+            let offset = if st.handle == 8 { [st.origin[0] - st.last[0], st.origin[1] - st.last[1]] } else { [0.0, 0.0] };
+            let col = Color32::from_rgb(255, 153, 51);
+            if !matches!(st.handle, 4 | 6)
+                && let Some(at) = snap_target(cur[0] + offset[0], &times, 6.0 / tm.pps.max(1e-6))
+            {
+                cur[0] = at - offset[0];
+                p.line_segment([pos2(tm.x(at), p.clip_rect().min.y), pos2(tm.x(at), p.clip_rect().max.y)], Stroke::new(1.0, col));
+            }
+            let tolerance = (vmap(pt.y + 6.0) - vmap(pt.y)).abs();
+            if value_ok
+                && !matches!(st.handle, 5 | 7)
+                && let Some(at) = snap_target(cur[1] + offset[1], &values, tolerance)
+            {
+                cur[1] = at - offset[1];
+                p.line_segment([pos2(p.clip_rect().min.x, ymap(at)), pos2(p.clip_rect().max.x, ymap(at))], Stroke::new(1.0, col));
+            }
+        }
         let mut params = json!({"merge": "graph-box", "fromStart": true});
         if st.handle == 8 {
             params["timeOffset"] = json!(cur[0] - st.last[0]);
@@ -274,24 +301,10 @@ pub(crate) fn transform_box(
     }
 }
 
-/// Graph Editor ▸ Snap: a dragged key time (comp s) snaps to the current time, another key's
-/// time, a layer's in or out point, a comp or layer marker or the work area within 6 points.
-pub(crate) fn snap_time(app: &EffectcraftApp, tm: TMap, t: f64, others: &[f64]) -> f64 {
-    if !app.ui.timeline.graph_snap {
-        return t;
-    }
-    let mut cands = vec![app.session.time().seconds()];
-    cands.extend_from_slice(others);
-    if let Some(c) = app.session.active_comp() {
-        cands.extend(comp_snap_times(c));
-    }
-    snap_px(tm, t, &cands, 6.0)
-}
-
 /// Snap targets of a comp besides keys: work area, markers, and every layer's in / out points
 /// and markers (comp seconds).
 pub fn comp_snap_times(c: &Comp) -> Vec<f64> {
-    let mut v = vec![c.work_area.0.seconds(), c.work_area.1.seconds()];
+    let mut v = vec![0.0, c.duration.seconds(), c.work_area.0.seconds(), c.work_area.1.seconds()];
     v.extend(c.markers.iter().map(|m| m.time.seconds()));
     for l in &c.layers {
         v.push(l.in_point.seconds());
@@ -301,8 +314,17 @@ pub fn comp_snap_times(c: &Comp) -> Vec<f64> {
     v
 }
 
+/// Nearest finite candidate in data units. The optional result also drives snap guides.
+pub(crate) fn snap_target(value: f64, candidates: &[f64], tolerance: f64) -> Option<f64> {
+    if !value.is_finite() || !tolerance.is_finite() || tolerance <= 0.0 {
+        return None;
+    }
+    candidates.iter().copied().filter(|v| v.is_finite() && (v - value).abs() <= tolerance).min_by(|a, b| (a - value).abs().total_cmp(&(b - value).abs()))
+}
+
 /// The candidate nearest `t` within `tol` screen points, else `t`.
-pub(crate) fn snap_px(tm: TMap, t: f64, cands: &[f64], tol: f32) -> f64 {
+#[cfg(test)]
+fn snap_px(tm: TMap, t: f64, cands: &[f64], tol: f32) -> f64 {
     let x = tm.x(t);
     cands.iter().copied().map(|c| (c, (tm.x(c) - x).abs())).filter(|(_, d)| *d < tol).min_by(|a, b| a.1.total_cmp(&b.1)).map(|(c, _)| c).unwrap_or(t)
 }
@@ -310,6 +332,13 @@ pub(crate) fn snap_px(tm: TMap, t: f64, cands: &[f64], tol: f32) -> f64 {
 #[cfg(test)]
 mod snap_tests {
     use super::*;
+
+    #[test]
+    fn snapping_reports_exact_alignment_and_ignores_nonfinite_candidates() {
+        assert_eq!(super::snap_target(100.0, &[f64::NAN, 100.0, 102.0], 3.0), Some(100.0));
+        assert_eq!(super::snap_target(101.0, &[100.0], 0.5), None);
+        assert_eq!(super::snap_target(f64::INFINITY, &[100.0], 3.0), None);
+    }
 
     #[test]
     fn graph_snap_targets_markers_and_layer_ends() {
