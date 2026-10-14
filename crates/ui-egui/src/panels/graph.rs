@@ -619,10 +619,10 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
                     graph_units(c.prop, speed)
                 ));
                 if speed {
-                    ui.label("Speed per layer second");
+                    ui.label(crate::i18n::tr("Speed per layer second"));
                 }
                 if curve_has_expression(c.layer, c.prop) {
-                    ui.label("Expression result; keys and handles edit the underlying animation");
+                    ui.label(crate::i18n::tr("Expression result; keys and handles edit the underlying animation"));
                 }
             });
         }
@@ -741,7 +741,7 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
                     if id == "editValue" && !matches!(key.value, Value::Scalar(_) | Value::Vec2(_) | Value::Vec3(_)) {
                         continue;
                     }
-                    let response = ui.button(label);
+                    let response = ui.button(crate::i18n::tr(label));
                     app.auto.add(&format!("timeline.graph.keyMenu.{id}"), response.rect, label);
                     if response.clicked() {
                         // A context action on a selected key operates on the whole selection.
