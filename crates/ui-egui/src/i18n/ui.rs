@@ -447,6 +447,9 @@ const JAPANESE: &[(&str, &str)] = &[
     ("Select animated properties to show them in the Graph Editor", "アニメーションのあるプロパティを選択すると、グラフエディターに表示されます"),
     ("Include in Graph Editor Set", "グラフエディターセットに含める"),
     ("Speed per layer second", "レイヤー時間1秒あたりの速度"),
+    ("Compare Before/After Expression", "エクスプレッション適用前後を比較"),
+    ("Before expression", "エクスプレッション適用前"),
+    ("After expression", "エクスプレッション適用後"),
     ("Expression result; keys and handles edit the underlying animation", "エクスプレッションの結果。キーフレームとハンドルは元のアニメーションを編集します"),
     (
         "Select the leader pin, then Shift-click the pins that should trail it (hair, cloth, tails)",
@@ -1004,6 +1007,9 @@ const SIMPLIFIED_CHINESE: &[(&str, &str)] = &[
     ("Select animated properties to show them in the Graph Editor", "选择已制作动画的属性以在图表编辑器中显示"),
     ("Include in Graph Editor Set", "加入图表编辑器集"),
     ("Speed per layer second", "每图层秒的速度"),
+    ("Compare Before/After Expression", "比较表达式应用前后"),
+    ("Before expression", "应用表达式之前"),
+    ("After expression", "应用表达式之后"),
     ("Expression result; keys and handles edit the underlying animation", "表达式结果；关键帧和控制柄编辑的是原始动画"),
     (
         "Select the leader pin, then Shift-click the pins that should trail it (hair, cloth, tails)",
@@ -1761,6 +1767,9 @@ const TRADITIONAL_CHINESE: &[(&str, &str)] = &[
     ("Select animated properties to show them in the Graph Editor", "選取已制作動畫的屬性以在圖表編輯器中顯示"),
     ("Include in Graph Editor Set", "加入圖表編輯器集"),
     ("Speed per layer second", "每圖層秒的速度"),
+    ("Compare Before/After Expression", "比較運算式套用前後"),
+    ("Before expression", "套用運算式之前"),
+    ("After expression", "套用運算式之後"),
     ("Expression result; keys and handles edit the underlying animation", "運算式結果；關鍵影格和控制柄編輯的是原始動畫"),
     (
         "Select the leader pin, then Shift-click the pins that should trail it (hair, cloth, tails)",
@@ -2511,6 +2520,9 @@ const UKRAINIAN: &[(&str, &str)] = &[
     ("Select animated properties to show them in the Graph Editor", "Виділіть анімовані властивості, щоб показати їх у редакторі графіків"),
     ("Include in Graph Editor Set", "Додати до набору редактора графіків"),
     ("Speed per layer second", "Швидкість за секунду часу шару"),
+    ("Compare Before/After Expression", "Порівняти до та після виразу"),
+    ("Before expression", "До застосування виразу"),
+    ("After expression", "Після застосування виразу"),
     ("Expression result; keys and handles edit the underlying animation", "Результат виразу; ключові кадри та ручки редагують базову анімацію"),
     (
         "Select the leader pin, then Shift-click the pins that should trail it (hair, cloth, tails)",
@@ -3057,6 +3069,9 @@ const PORTUGUESE: &[(&str, &str)] = &[
     ("Select animated properties to show them in the Graph Editor", "Selecione propriedades animadas para exibi-las no Editor de gráficos"),
     ("Include in Graph Editor Set", "Incluir no conjunto do Editor de gráficos"),
     ("Speed per layer second", "Velocidade por segundo do tempo da camada"),
+    ("Compare Before/After Expression", "Comparar antes e depois da expressão"),
+    ("Before expression", "Antes da expressão"),
+    ("After expression", "Depois da expressão"),
     ("Expression result; keys and handles edit the underlying animation", "Resultado da expressão; os quadros-chave e as alças editam a animação de base"),
     (
         "Select the leader pin, then Shift-click the pins that should trail it (hair, cloth, tails)",
@@ -3510,6 +3525,9 @@ const CZECH: &[(&str, &str)] = &[
     ("Select animated properties to show them in the Graph Editor", "Vyberte animované vlastnosti pro zobrazení v editoru grafů"),
     ("Include in Graph Editor Set", "Zahrnout do sady editoru grafů"),
     ("Speed per layer second", "Rychlost za sekundu času vrstvy"),
+    ("Compare Before/After Expression", "Porovnat před výrazem a po něm"),
+    ("Before expression", "Před výrazem"),
+    ("After expression", "Po výrazu"),
     ("Expression result; keys and handles edit the underlying animation", "Výsledek výrazu; klíčové snímky a táhla upravují původní animaci"),
     (
         "Select the leader pin, then Shift-click the pins that should trail it (hair, cloth, tails)",
@@ -4068,6 +4086,9 @@ const SPANISH: &[(&str, &str)] = &[
     ("Select animated properties to show them in the Graph Editor", "Selecciona propiedades animadas para mostrarlas en el editor de gráficos"),
     ("Include in Graph Editor Set", "Incluir en el conjunto del editor de gráficos"),
     ("Speed per layer second", "Velocidad por segundo de tiempo de capa"),
+    ("Compare Before/After Expression", "Comparar antes y después de la expresión"),
+    ("Before expression", "Antes de la expresión"),
+    ("After expression", "Después de la expresión"),
     (
         "Expression result; keys and handles edit the underlying animation",
         "Resultado de la expresión; los fotogramas clave y los tiradores editan la animación base",

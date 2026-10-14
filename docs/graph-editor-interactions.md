@@ -109,3 +109,47 @@ Clippy passed. The focused `wasm32-unknown-unknown` render/engine/UI check also 
 in unchanged GPU/readback, frames, pointer-wrap and zero-copy code. Formatting and diff checks passed.
 Tests were compiled, not executed, under the daytime policy. No full CI, native application rebuild,
 restart, upstream push or PR was performed; native/browser runtime acceptance remains pending.
+
+
+## Before/after expression comparison (2026-10-14)
+
+Graph type/options > **Compare Before/After Expression** adds a dim base curve behind the bright
+evaluated result, on the same axis. The two-row legend identifies the phases, and hovering either
+curve identifies its phase and value. The option defaults off (including older saved UI state),
+so existing users retain the evaluated-result view until they choose comparison.
+
+This implements the graph comparison described in Adobe's public
+[Editing expressions documentation](https://helpx.adobe.com/after-effects/desktop/work-with-expressions/edit-expressions/edit-expressions.html):
+base animation is dim and the evaluated result is bright. It is independent of **Show Reference
+Graph**, which continues to display the other graph type (value versus speed) on its own scale.
+Composition-viewer motion-path overlays and the Graph Editor expression text editor are outside
+this change; no Adobe application internals or assets were used.
+
+- Base samples evaluate with the expression host omitted. Separated Position still combines its
+  follower values, so comparison works for follower expressions as well as ordinary properties.
+- Disabled expressions do not produce a redundant comparison pair. Expression errors follow the
+  renderer's existing fallback; identical base/result lines naturally overlap. Keys and handles
+  continue to edit base animation; evaluated curves themselves are readouts.
+- Auto-height and Fit include both sample lists when comparison is enabled. Manual zoom is
+  respected. Speed keeps the existing units per layer-second. The centered numerical derivative
+  approximates discontinuities with finite spikes; both phases use the same stencil so identity
+  expressions and error fallbacks do not invent a difference. The graph is not an analytic
+  expression solver.
+- Samples remain bounded to 2,048 points per curve. The cache stores paired lists only when needed
+  and keys them by comparison state and expression-host availability as well as the existing
+  document/view inputs. Warm frames reuse both lists. The opposite-type Reference Graph does not
+  allocate an unused base list. This is a correctness extension, not a measured performance claim.
+- `graph::reset_context` cancels old graph gestures and requests Fit when opening a graph or
+  switching its source composition. The inline graph caller uses the same entry point.
+
+Eight new overlay regressions use a fake expression host for paired values, warm cache reuse,
+host removal, disabled expressions, identity/error speed at smooth segments and Hold jumps,
+separated Position, stretch, discontinuities, base-curve extrema in Fit, independent controls,
+read-only behavior and serialization. A separate regression covers graph-context gesture reset.
+
+Verification for this follow-up: scoped `cargo check -p effectcraft-ui-egui --all-targets` passed,
+and final-source `cargo clippy -p effectcraft-ui-egui --all-targets -- -D warnings`, formatting and
+`git diff --check` passed, with one compile job. Source review caught and corrected a mismatch
+between the before/after derivative stencils; re-review found no remaining blocker. The new
+regressions compiled but were not executed under the fork's daytime policy. No live app/reference
+comparison, screenshot verification or performance benchmark was performed for this change.

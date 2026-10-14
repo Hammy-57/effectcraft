@@ -42,6 +42,14 @@ fn box_id() -> egui::Id {
     egui::Id::new("graph-transform-box")
 }
 
+/// Discard drag origins that belong to a different graph/timeline composition.
+pub(crate) fn reset_context(ctx: &egui::Context) {
+    ctx.data_mut(|d| {
+        d.remove::<BoxDrag>(box_id());
+        d.remove::<AltScale>(alt_id());
+    });
+}
+
 /// The selection a keyframe marquee gives (Timeline and Graph Editor): the keys in the box
 /// alone, added to the current selection with Shift, or toggled in it with Ctrl/Cmd. Keys show
 /// it while the box is dragged, and the release commits the same with [`marquee_params`].

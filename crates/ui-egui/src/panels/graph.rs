@@ -58,6 +58,8 @@ struct Curve<'a> {
     dim: usize,
     color: Color32,
     pts: Vec<(f64, f64)>,
+    /// Unexpressed samples, only populated when expression comparison is enabled.
+    base_pts: Vec<(f64, f64)>,
     keys: Vec<KeyPt>,
     /// Values editable in the value graph (not spatial / combined dimensions).
     editable: bool,
@@ -143,8 +145,14 @@ fn shown_dims(l: &Layer, pr: &Property) -> usize {
     if pr.shown_dims > 0 && !l.is_3d() { (pr.shown_dims as usize).min(n) } else { n.min(4) }
 }
 
-/// The sampled curves of one graph type: (key of what they depend on, points per curve).
-type Samples = (u64, std::sync::Arc<Vec<Vec<(f64, f64)>>>);
+#[derive(Clone, Default)]
+struct CurveSamples {
+    result: Vec<(f64, f64)>,
+    base: Vec<(f64, f64)>,
+}
+
+/// The sampled curves of one graph type: (dependency key, paired result/base points per curve).
+type Samples = (u64, std::sync::Arc<Vec<CurveSamples>>);
 
 /// Build the curves for the visible time span. Their samples evaluate every shown property
 /// (expressions too) across the plot, so they are remembered until the project, the shown
@@ -152,6 +160,16 @@ type Samples = (u64, std::sync::Arc<Vec<Vec<(f64, f64)>>>);
 /// The graph's value of dimension `d` of `pr` at comp time `ct` (s): its value, or in the speed
 /// graph its speed (spatial properties) or velocity.
 fn sample(ectx: &EvalCtx, l: &Layer, pr: &Property, d: usize, speed: bool, ct: f64) -> f64 {
+    sample_with_speed_evaluation(ectx, l, pr, d, speed, ct, false)
+}
+
+fn sample_base(ectx: &EvalCtx, l: &Layer, pr: &Property, d: usize, speed: bool, ct: f64) -> f64 {
+    let base = EvalCtx { expr: None, ..*ectx };
+    // Both phases must use the same derivative stencil, including at Hold jumps and errors.
+    sample_with_speed_evaluation(&base, l, pr, d, speed, ct, true)
+}
+
+fn sample_with_speed_evaluation(ectx: &EvalCtx, l: &Layer, pr: &Property, d: usize, speed: bool, ct: f64, evaluate_speed: bool) -> f64 {
     let tt = Tick::from_seconds_f64(ct);
     if !ct.is_finite() || !l.stretch.is_finite() || l.stretch.abs() < 1e-9 || tt.0.checked_sub(l.start_time.0).is_none() {
         return 0.0;
@@ -160,7 +178,7 @@ fn sample(ectx: &EvalCtx, l: &Layer, pr: &Property, d: usize, speed: bool, ct: f
         return ectx.at(tt).value(l, pr).components().get(d).copied().unwrap_or(0.0);
     }
     let lt = l.layer_time(tt);
-    if separated_position(l, pr).is_some() || (curve_has_expression(l, pr) && ectx.expr.is_some()) {
+    if evaluate_speed || separated_position(l, pr).is_some() || (curve_has_expression(l, pr) && ectx.expr.is_some()) {
         // Ease handles/velocity dialogs use units per layer second. Evaluate at the matching
         // comp times so moving, stretching or reversing the layer does not change that unit.
         const STEP: f64 = 0.0001;
@@ -193,10 +211,11 @@ fn curves<'a>(app: &EffectcraftApp, ctx: &egui::Context, comp: &'a Comp, ectx: &
     let sel = &app.session.state.selected_keys;
     let n = ((plot.width() / 2.0) as usize).clamp(2, 2048);
     let props = shown_props(app, comp);
+    let compare_expressions = app.ui.timeline.graph_expression_overlay && ectx.expr.is_some() && speed == speed_graph(app, comp);
     let samples_key = {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        (app.session.revision, ectx.comp_id.0, n, &props).hash(&mut h);
+        (app.session.revision, ectx.comp_id.0, n, &props, compare_expressions, ectx.expr.is_some()).hash(&mut h);
         for v in [plot.min.x, plot.max.x, tm.x0] {
             v.to_bits().hash(&mut h);
         }
@@ -205,7 +224,7 @@ fn curves<'a>(app: &EffectcraftApp, ctx: &egui::Context, comp: &'a Comp, ectx: &
     };
     let samples_id = egui::Id::new(("graph-samples", speed));
     let cached = ctx.data(|d| d.get_temp::<Samples>(samples_id)).filter(|(k, _)| *k == samples_key).map(|(_, s)| s);
-    let mut sampled: Vec<Vec<(f64, f64)>> = vec![];
+    let mut sampled: Vec<CurveSamples> = vec![];
     let mut out = vec![];
     for (pi, (lid, uid)) in props.into_iter().enumerate() {
         let Some(l) = comp.layer(lid) else { continue };
@@ -215,17 +234,24 @@ fn curves<'a>(app: &EffectcraftApp, ctx: &egui::Context, comp: &'a Comp, ectx: &
         for d in 0..dims {
             let color = if dims > 1 { DIM_COLORS[d % 4] } else { PROP_COLORS[pi % PROP_COLORS.len()] };
             let ci = sampled.len();
-            let mut pts = Vec::with_capacity(n);
-            if let Some(c) = cached.as_ref().and_then(|c| c.get(ci)) {
-                pts.extend_from_slice(c);
+            let mut points = cached.as_ref().and_then(|c| c.get(ci)).cloned().unwrap_or_default();
+            if points.result.is_empty() {
+                let include_base = compare_expressions && curve_has_expression(l, pr);
+                points.result.reserve(n);
+                if include_base {
+                    points.base.reserve(n);
+                }
+                for i in 0..n {
+                    let x = plot.min.x + plot.width() * i as f32 / (n - 1) as f32;
+                    let ct = tm.t(x);
+                    points.result.push((ct, sample(ectx, l, pr, d, speed, ct)));
+                    if include_base {
+                        points.base.push((ct, sample_base(ectx, l, pr, d, speed, ct)));
+                    }
+                }
             }
-            let todo = if pts.is_empty() { n } else { 0 };
-            for i in 0..todo {
-                let x = plot.min.x + plot.width() * i as f32 / (n - 1) as f32;
-                let ct = tm.t(x);
-                pts.push((ct, sample(ectx, l, pr, d, speed, ct)));
-            }
-            sampled.push(pts.clone());
+            sampled.push(points.clone());
+            let CurveSamples { result: pts, base: base_pts } = points;
             let mut keys = vec![];
             // A pinned aggregate remains a useful readout after separation; only its followers
             // own editable keys now. Never offer edits to the ignored pre-separation keys.
@@ -266,7 +292,7 @@ fn curves<'a>(app: &EffectcraftApp, ctx: &egui::Context, comp: &'a Comp, ectx: &
                 };
                 keys.push(KeyPt { idx: i, time: k.time, t: kt, v, sel: ks, handles });
             }
-            out.push(Curve { layer: l, prop: pr, dim: d, color, pts, keys, editable: !spatial });
+            out.push(Curve { layer: l, prop: pr, dim: d, color, pts, base_pts, keys, editable: !spatial });
         }
     }
     if cached.is_none() {
@@ -362,7 +388,7 @@ fn options_menu(
     widgets::popup_list(ui, pid, anchor.left_top() - vec2(0.0, options.len() as f32 * 22.0 + 18.0), anchor, options.len(), 0, |ui| {
         let mut chosen = None;
         for (i, (key, label, on)) in options.iter().enumerate() {
-            let resp = ui.selectable_label(*on, *label);
+            let resp = ui.selectable_label(*on, crate::i18n::tr(label));
             app.auto.add(&format!("timeline.graph.{key}"), resp.rect, label);
             if resp.clicked() {
                 chosen = Some(i);
@@ -486,7 +512,7 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
     // Vertical range: auto-zoom to the curves + handles, or the stored manual range.
     let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
     for c in &cs {
-        for (_, v) in &c.pts {
+        for (_, v) in c.pts.iter().chain(&c.base_pts) {
             lo = lo.min(*v);
             hi = hi.max(*v);
         }
@@ -590,10 +616,20 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
             pc.text(plot.right_top() + vec2(-4.0, 2.0), Align2::RIGHT_TOP, format!("Reference · {unit}"), Tokens::ui(10.0), t.text_dim);
         }
     }
+    // Expression comparison shares the main axis; Reference Graph above keeps its own axis.
+    for c in &cs {
+        if !c.base_pts.is_empty() {
+            let pts: Vec<Pos2> = c.base_pts.iter().map(|(ct, v)| pos2(tm.x(*ct), ymap(*v))).collect();
+            pc.add(egui::Shape::line(pts, Stroke::new(1.5, c.color.gamma_multiply(0.4))));
+        }
+    }
     // Curves.
     for c in &cs {
         let pts: Vec<Pos2> = c.pts.iter().map(|(ct, v)| pos2(tm.x(*ct), ymap(*v))).collect();
         pc.add(egui::Shape::line(pts, Stroke::new(1.5, c.color)));
+    }
+    if cs.iter().any(|c| !c.base_pts.is_empty()) {
+        expression_legend(app, &pc, plot);
     }
     if !navigating
         && !ui.input(|i| i.pointer.any_down())
@@ -601,13 +637,22 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
     {
         let hit = cs
             .iter()
-            .filter_map(|c| {
-                let value = sample(ectx, c.layer, c.prop, c.dim, speed, tm.t(q.x));
-                let distance = (ymap(value) - q.y).abs();
-                (distance < 7.0).then_some((c, value, distance))
+            .flat_map(|c| {
+                [false, true].into_iter().filter_map(move |before| {
+                    if before && c.base_pts.is_empty() {
+                        return None;
+                    }
+                    let value = if before {
+                        sample_base(ectx, c.layer, c.prop, c.dim, speed, tm.t(q.x))
+                    } else {
+                        sample(ectx, c.layer, c.prop, c.dim, speed, tm.t(q.x))
+                    };
+                    let distance = (ymap(value) - q.y).abs();
+                    (distance < 7.0).then_some((c, value, distance, before))
+                })
             })
             .min_by(|a, b| a.2.total_cmp(&b.2));
-        if let Some((c, value, _)) = hit {
+        if let Some((c, value, _, before)) = hit {
             egui::Tooltip::always_open(ctx.clone(), ui.layer_id(), egui::Id::new("graph-curve-tip"), egui::PopupAnchor::Pointer).show(|ui| {
                 ui.label(format!(
                     "{} · {} · {}\n{:.3} s  ·  {:.3} {}",
@@ -621,7 +666,10 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
                 if speed {
                     ui.label(crate::i18n::tr("Speed per layer second"));
                 }
-                if curve_has_expression(c.layer, c.prop) {
+                if before {
+                    ui.label(crate::i18n::tr("Before expression"));
+                } else if curve_has_expression(c.layer, c.prop) {
+                    ui.label(crate::i18n::tr("After expression"));
                     ui.label(crate::i18n::tr("Expression result; keys and handles edit the underlying animation"));
                 }
             });
@@ -943,12 +991,14 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
         ("valueGraph", "Edit Value Graph", mode == "value"),
         ("speedGraph", "Edit Speed Graph", mode == "speed"),
         ("reference", "Show Reference Graph", app.ui.timeline.graph_reference),
+        ("expressionOverlay", "Compare Before/After Expression", app.ui.timeline.graph_expression_overlay),
     ];
     match options_menu(app, ui, p, &mut buttons, y, "typeOptions", label, &opts) {
         Some(0) => set_graph_type(app, "auto"),
         Some(1) => set_graph_type(app, "value"),
         Some(2) => set_graph_type(app, "speed"),
         Some(3) => app.ui.timeline.graph_reference = !app.ui.timeline.graph_reference,
+        Some(4) => app.ui.timeline.graph_expression_overlay = !app.ui.timeline.graph_expression_overlay,
         _ => {}
     }
     let opts = [
@@ -1014,6 +1064,25 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painte
         }
     }
     buttons.more(app, ui, p, bar);
+}
+
+fn expression_legend(app: &mut EffectcraftApp, painter: &egui::Painter, plot: Rect) {
+    let before = crate::i18n::tr("Before expression");
+    let after = crate::i18n::tr("After expression");
+    let font = Tokens::ui(10.0);
+    let left = painter.layout_no_wrap(before.into(), font.clone(), Color32::from_gray(130));
+    let right = painter.layout_no_wrap(after.into(), font, Color32::from_gray(230));
+    let width = left.size().x.max(right.size().x) + 28.0;
+    // Leave the units and reference axis readable even in a narrow dock.
+    let origin = plot.left_top() + vec2(8.0, 20.0);
+    let rect = Rect::from_min_size(origin, vec2(width, 34.0)).intersect(plot);
+    painter.rect_filled(rect, 2.0, Color32::from_black_alpha(180));
+    for (row, (galley, color)) in [(left, Color32::from_gray(130)), (right, Color32::from_gray(230))].into_iter().enumerate() {
+        let at = origin + vec2(4.0, 2.0 + row as f32 * 16.0);
+        painter.line_segment([at + vec2(0.0, 6.0), at + vec2(14.0, 6.0)], Stroke::new(1.5, color));
+        painter.galley(at + vec2(20.0, 0.0), galley, color);
+    }
+    app.auto.add("timeline.graph.expressionLegend", rect, "Before expression / After expression");
 }
 
 fn graph_units(pr: &Property, speed: bool) -> &'static str {
@@ -1191,6 +1260,23 @@ fn fit_pending_id() -> egui::Id {
     egui::Id::new("graph-fit-pending")
 }
 
+/// A graph now targets another composition: no gesture may continue editing the previous one.
+pub(crate) fn reset_context(ctx: &egui::Context) {
+    ctx.stop_dragging();
+    ctx.data_mut(|d| {
+        d.insert_temp(fit_pending_id(), true);
+        d.remove::<KeyGrab>(key_grab_id());
+        d.remove::<HandleDrag>(handle_drag_id());
+        d.remove::<Rect>(egui::Id::new("graph-box"));
+        d.remove::<bool>(egui::Id::new("graph-dragging"));
+        let pan = egui::Id::new("graph-pan");
+        for id in [pan, pan.with("hand"), pan.with("middle")] {
+            d.remove::<bool>(id);
+        }
+    });
+    super::graph_tools::reset_context(ctx);
+}
+
 /// Called every Timeline frame: switching the Graph Editor on (header button, menu, Shift+F3 or
 /// the control channel) frames the graphs on its first frame, when the plot rect is known, as
 /// After Effects does; switching it off puts back the time zoom from before it opened, so the
@@ -1201,8 +1287,8 @@ pub(crate) fn track_open(ctx: &egui::Context, tl: &mut crate::state::TimelineSta
     let zoom_id = egui::Id::new("graph-editor-zoom-before");
     let was = ctx.data(|d| d.get_temp::<bool>(was_id)).unwrap_or(false);
     if on && !was {
+        reset_context(ctx);
         ctx.data_mut(|d| {
-            d.insert_temp(fit_pending_id(), true);
             d.insert_temp(zoom_id, (tl.start, tl.pps));
         });
     } else if was
@@ -1276,10 +1362,14 @@ fn fit_keys(app: &mut EffectcraftApp, cs: &[Curve], ectx: &EvalCtx, speed: bool,
     // (sampled here: the drawn samples only cover the view before the fit).
     for c in cs.iter().filter(|c| !selected_only || c.keys.iter().any(|k| k.sel)) {
         for i in 0..=FIT_SAMPLES {
-            let v = sample(ectx, c.layer, c.prop, c.dim, speed, t0 + (t1 - t0) * i as f64 / FIT_SAMPLES as f64);
-            if v.is_finite() {
-                v0 = v0.min(v);
-                v1 = v1.max(v);
+            let time = t0 + (t1 - t0) * i as f64 / FIT_SAMPLES as f64;
+            let result = sample(ectx, c.layer, c.prop, c.dim, speed, time);
+            let base = if c.base_pts.is_empty() { f64::NAN } else { sample_base(ectx, c.layer, c.prop, c.dim, speed, time) };
+            for v in [result, base] {
+                if v.is_finite() {
+                    v0 = v0.min(v);
+                    v1 = v1.max(v);
+                }
             }
         }
     }
@@ -1389,6 +1479,206 @@ fn shift_axes(shift: bool, dx: f32, dy: f32) -> (bool, bool) {
 #[cfg(test)]
 mod tests {
     use super::shift_axes;
+
+    #[derive(Default)]
+    struct FakeExpressions(std::sync::atomic::AtomicUsize);
+
+    impl effectcraft_render::ExprHost for FakeExpressions {
+        fn eval(&self, ctx: &super::EvalCtx, _: &super::Layer, prop: &super::Property, value: &super::Value) -> Result<super::Value, String> {
+            use std::sync::atomic::Ordering;
+            self.0.fetch_add(1, Ordering::Relaxed);
+            match prop.expr.as_ref().map(|expression| expression.text.as_str()) {
+                Some("error") => Err("synthetic expression error".into()),
+                Some("identity") => Ok(value.clone()),
+                Some("step") => Ok(super::Value::Scalar(if ctx.time.seconds() < 1.0 { 0.0 } else { 100.0 })),
+                Some("zero") => Ok(value.with_components(&value.components().iter().map(|_| 0.0).collect::<Vec<_>>())),
+                Some("twice") => Ok(value.with_components(&value.components().iter().map(|v| v * 2.0).collect::<Vec<_>>())),
+                _ => Ok(value.with_components(&value.components().iter().map(|v| v + 200.0).collect::<Vec<_>>())),
+            }
+        }
+    }
+
+    fn comparison_app(expression: &str) -> (crate::EffectcraftApp, super::LayerId, u64, std::sync::Arc<FakeExpressions>) {
+        use super::*;
+        let host = std::sync::Arc::new(FakeExpressions::default());
+        let mut session = effectcraft_engine::Session { expr: Some(host.clone()), ..Default::default() };
+        session.execute("comp.new", json!({"name": "Expression comparison", "width": 32, "height": 32, "duration": 8})).unwrap();
+        session.execute("layer.newSolid", json!({"name": "Box", "width": 10, "height": 10})).unwrap();
+        let layer = session.active_comp().unwrap().layers[0].id;
+        for (time, value) in [(0.0, 0.0), (2.0, 20.0)] {
+            session.execute("prop.addKey", json!({"layer": layer.0, "path": "transform/rotation", "time": time, "value": value})).unwrap();
+        }
+        let uid = session.active_comp().unwrap().layer(layer).unwrap().props.prop("transform/rotation").unwrap().uid;
+        session.execute("prop.setExpression", json!({"layer": layer.0, "prop": uid, "expression": expression})).unwrap();
+        session.execute("prop.select", json!({"layer": layer.0, "prop": uid})).unwrap();
+        let mut app = crate::EffectcraftApp::new(session);
+        app.ui.timeline.graph_mode = "value".into();
+        (app, layer, uid, host)
+    }
+
+    fn comparison_samples(app: &crate::EffectcraftApp, ctx: &egui::Context, speed: bool) -> Vec<super::CurveSamples> {
+        use super::*;
+        let comp = app.session.active_comp().unwrap();
+        let eval = EvalCtx { expr: app.session.expr.as_deref(), ..EvalCtx::new(&app.session.project, app.session.active_comp_id().unwrap(), comp, Tick::ZERO) };
+        curves(app, ctx, comp, &eval, TMap { x0: 0.0, start: 0.0, pps: 100.0 }, Rect::from_min_size(Pos2::ZERO, vec2(200.0, 200.0)), speed)
+            .into_iter()
+            .map(|c| CurveSamples { result: c.pts, base: c.base_pts })
+            .collect()
+    }
+
+    #[test]
+    fn expression_overlay_pairs_values_and_caches_both_without_extra_expression_calls() {
+        use std::sync::atomic::Ordering;
+        let (mut app, _, _, host) = comparison_app("offset");
+        let ctx = egui::Context::default();
+        let revision = app.session.revision;
+        let without = comparison_samples(&app, &ctx, false);
+        assert!(without[0].base.is_empty());
+        app.ui.timeline.graph_expression_overlay = true;
+        let paired = comparison_samples(&app, &ctx, false);
+        let curve = &paired[0];
+        assert_eq!(curve.result, without[0].result);
+        assert_eq!(curve.base.first().unwrap().1, 0.0);
+        assert_eq!(curve.base.last().unwrap().1, 20.0);
+        assert!(curve.result.iter().zip(&curve.base).all(|(after, before)| (after.1 - before.1 - 200.0).abs() < 1e-8));
+        let calls = host.0.load(Ordering::Relaxed);
+        let warm = comparison_samples(&app, &ctx, false);
+        assert_eq!(warm[0].base, curve.base);
+        assert_eq!(host.0.load(Ordering::Relaxed), calls, "base samples never invoke expressions; warm curves reuse both lists");
+        // Source context can lose its expression host without changing the document revision.
+        app.session.expr = None;
+        let no_host = comparison_samples(&app, &ctx, false);
+        assert!(no_host[0].base.is_empty());
+        assert_eq!(no_host[0].result, curve.base);
+        assert_eq!(app.session.revision, revision);
+    }
+
+    #[test]
+    fn expression_overlay_disabled_and_error_states_use_the_renderers_base_fallback() {
+        use super::*;
+        let (mut app, layer, uid, _) = comparison_app("error");
+        let ctx = egui::Context::default();
+        app.ui.timeline.graph_expression_overlay = true;
+        let error = comparison_samples(&app, &ctx, false);
+        assert_eq!(error[0].result, error[0].base);
+        app.session.execute("prop.setExpression", json!({"layer": layer.0, "prop": uid, "expression": "offset", "enabled": false})).unwrap();
+        let disabled = comparison_samples(&app, &ctx, false);
+        assert!(disabled[0].base.is_empty());
+        assert_eq!(disabled[0].result, error[0].base);
+    }
+
+    #[test]
+    fn expression_overlay_identity_and_error_speed_match_base_at_smooth_segments_and_hold_jumps() {
+        use super::*;
+        for expression in ["identity", "error"] {
+            for hold in [false, true] {
+                let (mut app, layer, uid, _) = comparison_app(expression);
+                if hold {
+                    app.session.execute("keys.select", json!({"keys": [{"layer": layer.0, "prop": uid, "time": 0.0}]})).unwrap();
+                    app.session.execute("keys.interpolation", json!({"interpolation": "hold"})).unwrap();
+                }
+                app.ui.timeline.graph_mode = "speed".into();
+                app.ui.timeline.graph_expression_overlay = true;
+                let curves = comparison_samples(&app, &egui::Context::default(), true);
+                assert!(curves[0].result.iter().zip(&curves[0].base).all(|(after, before)| (after.1 - before.1).abs() < 1e-6), "{expression}, hold={hold}");
+                if hold {
+                    assert!(curves[0].result.last().unwrap().1 > 10_000.0, "both phases show the same jump approximation");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn expression_overlay_compares_separated_position_speed_in_layer_seconds() {
+        use super::*;
+        let (mut app, layer, _, _) = comparison_app("twice");
+        for (time, x) in [(0.0, 0.0), (2.0, 20.0)] {
+            app.session.execute("prop.addKey", json!({"layer": layer.0, "path": "transform/position", "time": time, "value": [x, 0.0, 0.0]})).unwrap();
+        }
+        let uid = app.session.active_comp().unwrap().layer(layer).unwrap().props.prop("transform/position").unwrap().uid;
+        app.session.execute("prop.separateDimensions", json!({"layer": layer.0, "value": true})).unwrap();
+        app.session.execute("prop.setExpression", json!({"layer": layer.0, "path": "transform/positionX", "expression": "twice"})).unwrap();
+        app.session.execute("prop.select", json!({"layer": layer.0, "prop": uid})).unwrap();
+        app.session.execute("layer.timeStretch", json!({"layers": [layer.0], "percent": 200.0})).unwrap();
+        app.ui.timeline.graph_mode = "speed".into();
+        app.ui.timeline.graph_expression_overlay = true;
+        let ctx = egui::Context::default();
+        let curves = comparison_samples(&app, &ctx, true);
+        assert_eq!(curves.len(), 1);
+        assert!((curves[0].base[50].1 - 10.0).abs() < 1e-4);
+        assert!((curves[0].result[50].1 - 20.0).abs() < 1e-4);
+        // Legacy Reference Graph displays the other graph type, without another comparison pair.
+        let reference = comparison_samples(&app, &ctx, false);
+        assert!(reference.iter().all(|c| c.base.is_empty()));
+    }
+
+    #[test]
+    fn expression_overlay_keeps_discontinuities_separate_from_the_smooth_base() {
+        use super::*;
+        let (mut app, layer, uid, _) = comparison_app("step");
+        app.ui.timeline.graph_expression_overlay = true;
+        let curves = comparison_samples(&app, &egui::Context::default(), false);
+        assert!(curves[0].result.iter().all(|(_, value)| *value == 0.0 || *value == 100.0));
+        assert!(curves[0].base.iter().all(|(_, value)| (0.0..=20.0).contains(value)));
+        let comp = app.session.active_comp().unwrap();
+        let l = comp.layer(layer).unwrap();
+        let prop = l.props.find(uid).unwrap();
+        let eval = EvalCtx { expr: app.session.expr.as_deref(), ..EvalCtx::new(&app.session.project, app.session.active_comp_id().unwrap(), comp, Tick::ZERO) };
+        let speed_at_jump = sample(&eval, l, prop, 0, true, 1.0);
+        assert!(speed_at_jump.is_finite() && speed_at_jump > 100_000.0, "a discontinuity remains a finite numerical derivative spike");
+    }
+
+    #[test]
+    fn expression_overlay_fit_includes_base_curve_extrema_even_when_result_is_flat() {
+        use super::*;
+        let (mut app, layer, uid, _) = comparison_app("zero");
+        for (time, side, speed) in [(0.0, "out", 500.0), (2.0, "in", -500.0)] {
+            app.session.execute("keys.setEase", json!({"layer": layer.0, "prop": uid, "time": time, "side": side, "speed": speed, "influence": 50.0})).unwrap();
+        }
+        let project = app.session.project.clone();
+        let expr = app.session.expr.clone();
+        let comp = project.comp(app.session.active_comp_id().unwrap()).unwrap();
+        let eval = EvalCtx { expr: expr.as_deref(), ..EvalCtx::new(&project, app.session.active_comp_id().unwrap(), comp, Tick::ZERO) };
+        let ctx = egui::Context::default();
+        let plot = Rect::from_min_size(Pos2::ZERO, vec2(200.0, 200.0));
+        let tm = TMap { x0: 0.0, start: 0.0, pps: 100.0 };
+        for compare in [false, true] {
+            app.ui.timeline.graph_expression_overlay = compare;
+            let cs = curves(&app, &ctx, comp, &eval, tm, plot, false);
+            fit_all(&mut app, &cs, &eval, false, plot);
+            let (_, hi) = app.ui.timeline.graph_range.unwrap();
+            assert!(hi.is_finite());
+            if compare {
+                assert!(hi > 100.0, "base curve extrema must fit: {hi}");
+            } else {
+                assert!(hi < 30.0, "result-only view retains existing fit behavior: {hi}");
+            }
+        }
+    }
+
+    #[test]
+    fn changing_graph_context_cancels_old_gestures_and_requests_fit() {
+        use super::*;
+        let ctx = egui::Context::default();
+        ctx.set_dragged_id(egui::Id::new("graph-bg"));
+        ctx.data_mut(|d| {
+            d.insert_temp(key_grab_id(), KeyGrab { press: Pos2::ZERO, t: 1.0, v: 2.0, value_per_pixel: 1.0 });
+            d.insert_temp(handle_drag_id(), (Pos2::ZERO, Vec::<HandleGrab>::new(), 1.0, 100.0));
+            d.insert_temp(egui::Id::new("graph-box"), Rect::EVERYTHING);
+            d.insert_temp(egui::Id::new("graph-dragging"), true);
+            d.insert_temp(egui::Id::new("graph-pan"), true);
+        });
+        reset_context(&ctx);
+        assert!(ctx.dragged_id().is_none());
+        ctx.data(|d| {
+            assert_eq!(d.get_temp::<bool>(fit_pending_id()), Some(true));
+            assert!(d.get_temp::<KeyGrab>(key_grab_id()).is_none());
+            assert!(d.get_temp::<HandleDrag>(handle_drag_id()).is_none());
+            assert!(d.get_temp::<Rect>(egui::Id::new("graph-box")).is_none());
+            assert!(d.get_temp::<bool>(egui::Id::new("graph-dragging")).is_none());
+            assert!(d.get_temp::<bool>(egui::Id::new("graph-pan")).is_none());
+        });
+    }
 
     #[test]
     fn pinned_separated_position_uses_follower_expressions_keys_and_fit_bounds() {

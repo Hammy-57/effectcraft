@@ -416,6 +416,9 @@ pub struct TimelineState {
     /// Graph Editor ▸ Show Reference Graph (the other graph type, faint, behind).
     #[serde(default)]
     pub graph_reference: bool,
+    /// Compare the base animation (dim) with the evaluated expression result (bright).
+    #[serde(default)]
+    pub graph_expression_overlay: bool,
     /// Graph Editor ▸ Show Transform Box When Multiple Keys Are Selected.
     #[serde(default = "yes")]
     pub graph_transform_box: bool,
@@ -492,6 +495,7 @@ impl Default for TimelineState {
             graph_range: None,
             graph_snap: true,
             graph_reference: false,
+            graph_expression_overlay: false,
             graph_transform_box: true,
             expr_closed: BTreeSet::new(),
             expr_lines: BTreeMap::new(),
