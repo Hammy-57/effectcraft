@@ -621,13 +621,13 @@ impl Mapper<'_> {
     }
 
     /// Children in paint order, with Figma masks (`isMask`) turned into track mattes for the
-    /// siblings above them.
+    /// siblings above them. `depth` is the child depth; the virtual selection root adds none.
     fn children(&mut self, comp: usize, n: &J, lin: Affine, space: Space, parent: Option<usize>, depth: usize) -> Vec<usize> {
         let mut all = vec![];
         let mut mask: Option<(usize, MatteKind)> = None;
         for c in children(n) {
             let is_mask = c.get("isMask").and_then(J::as_bool).unwrap_or(false) && visible(c);
-            let made = self.node(comp, c, lin, space, parent, depth + 1);
+            let made = self.node(comp, c, lin, space, parent, depth);
             if is_mask {
                 // The mask's own layer: the first renderable one made for it.
                 let m =
@@ -682,7 +682,7 @@ impl Mapper<'_> {
         let w = world(n, Affine::IDENTITY);
         let space = Space { from_world: w.inverse() };
         self.frame_background(comp, n, Affine::IDENTITY);
-        self.children(comp, n, linear(w), space, None, 0);
+        self.children(comp, n, linear(w), space, None, 1);
         if num(n, "opacity").unwrap_or(1.0) < 1.0 || n.get("effects").and_then(J::as_array).is_some_and(|e| e.iter().any(visible)) {
             self.note(format!("{}: the frame's own opacity and effects stay in Figma (it became the composition)", name(n)));
         }
@@ -707,7 +707,7 @@ impl Mapper<'_> {
         let shift = Affine::translate((-bounds.x0, -bounds.y0));
         let inner_space = Space { from_world: shift * inv };
         self.frame_background(inner, n, shift);
-        self.children(inner, n, linear(w), inner_space, None, depth);
+        self.children(inner, n, linear(w), inner_space, None, depth + 1);
         let mut l = PLayer::new(&name(n), &id(n), PKind::Precomp(inner));
         if let Some(note) = Self::place(&mut l, space.from_world * w, [fw, fh]) {
             self.note(note);
@@ -737,7 +737,7 @@ impl Mapper<'_> {
             null.visible = visible(n);
             let Some(ni) = self.push(comp, null) else { return vec![] };
             let mut made = vec![ni];
-            let kids = self.children(comp, n, parent_lin, space, Some(ni), depth);
+            let kids = self.children(comp, n, parent_lin, space, Some(ni), depth + 1);
             if !visible(n)
                 && let Some(cc) = self.plan.comps.get_mut(comp)
             {
@@ -757,7 +757,7 @@ impl Mapper<'_> {
         let bounds = Rect::new(bounds.x0.floor(), bounds.y0.floor(), bounds.x1.ceil(), bounds.y1.ceil());
         let inner = self.new_comp(&name(n), &id(n), bounds.width(), bounds.height());
         let inner_space = Space { from_world: Affine::translate((-bounds.x0, -bounds.y0)) };
-        self.children(inner, n, parent_lin, inner_space, None, depth);
+        self.children(inner, n, parent_lin, inner_space, None, depth + 1);
         let mut l = PLayer::new(&name(n), &id(n), PKind::Precomp(inner));
         let _ = Self::place(&mut l, space.from_world * Affine::translate((bounds.x0, bounds.y0)), [bounds.width(), bounds.height()]);
         self.common(&mut l, n);
@@ -784,6 +784,15 @@ pub fn plan(roots: &[J], opts: &Options) -> Plan {
                     let [w, h] = size_of(r);
                     aabb(world(r, Affine::IDENTITY), Rect::new(0.0, 0.0, w, h))
                 });
+                // A new canvas must include stroke and shadow overflow. Existing-comp paste
+                // keeps centring the geometry, and malformed render bounds cannot shrink it.
+                let b = if matches!(target, Target::NewComp) {
+                    rect_of(r.get("absoluteRenderBounds"))
+                        .filter(|r| r.width() > 0.0 && r.height() > 0.0 && [r.x0, r.y0, r.x1, r.y1, r.width(), r.height()].iter().all(|v| v.is_finite()))
+                        .map_or(b, |render| b.union(render))
+                } else {
+                    b
+                };
                 u = Some(u.map_or(b, |x| x.union(b)));
             }
             let u = u.unwrap_or_default();
@@ -959,7 +968,25 @@ fn gradient(p: &J, size: [f64; 2]) -> Option<(bool, [f64; 2], [f64; 2], Gradient
         let v = h.and_then(|h| h.get(i));
         [v.and_then(|v| num(v, "x")).unwrap_or(d[0]) * size[0], v.and_then(|v| num(v, "y")).unwrap_or(d[1]) * size[1]]
     };
-    let (a, b) = if radial { (pt(0, [0.5, 0.5]), pt(1, [1.0, 0.5])) } else { (pt(0, [0.0, 0.5]), pt(1, [1.0, 0.5])) };
+    let (a, mut b) = if radial { (pt(0, [0.5, 0.5]), pt(1, [1.0, 0.5])) } else { (pt(0, [0.0, 0.5]), pt(1, [1.0, 0.5])) };
+    // Three handles define an affine gradient: the third direction is a constant-colour
+    // axis. A native linear gradient needs the equivalent perpendicular axis in pixels.
+    if !radial
+        && let Some(third) = h.and_then(|h| h.get(2))
+        && let (Some(x), Some(y)) = (num(third, "x"), num(third, "y"))
+    {
+        let v = [x * size[0] - a[0], y * size[1] - a[1]];
+        let normal = [v[1], -v[0]];
+        let denominator = normal[0] * normal[0] + normal[1] * normal[1];
+        let projection = (b[0] - a[0]) * normal[0] + (b[1] - a[1]) * normal[1];
+        if denominator.is_finite() && denominator > 1e-12 && projection.is_finite() && projection.abs() > 1e-12 {
+            let factor = projection / denominator;
+            let end = [a[0] + normal[0] * factor, a[1] + normal[1] * factor];
+            if end.iter().all(|v| v.is_finite()) {
+                b = end;
+            }
+        }
+    }
     let stops: Vec<(f64, [f64; 4])> = p
         .get("gradientStops")
         .and_then(J::as_array)
