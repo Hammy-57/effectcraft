@@ -1559,7 +1559,7 @@ mod interaction_profile {
                 let mut point_count = 0;
                 for i in 0..repeats + 3 {
                     if invalidate {
-                        app.session.execute("prop.set", json!({"layer":other,"prop":"transform/opacity","value":if i%2==0 {50.0}else{100.0}})).unwrap();
+                        app.session.execute("prop.set", json!({"layer":other,"path":"transform/opacity","value":if i%2==0 {50.0}else{100.0}})).unwrap();
                     }
                     let cid = app.session.active_comp_id().unwrap();
                     let comp = app.session.active_comp().unwrap();
