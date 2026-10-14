@@ -1404,7 +1404,18 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let search_w = (left_w - 420.0).clamp(120.0, 220.0).min(switches_x0 - 4.0 - (tc_rect.max.x + 14.0)).max(60.0);
     let sr = Rect::from_min_size(pos2(tc_rect.max.x + 14.0, top + 12.0), vec2(search_w, 22.0));
     let mut search = app.ui.timeline.search.clone();
-    widgets::search_field(ui, sr, &mut search, "Search", &t);
+    let filtered = !app.ui.timeline.reveal.is_empty() || !app.ui.timeline.layer_reveal.is_empty();
+    let (_, clear) = widgets::search_field_with_clear(ui, sr, &mut search, "Search", &t, filtered);
+    if let Some(clear) = clear {
+        app.auto.add("timeline.search.clear", clear.rect, "Clear search and filters");
+        if clear.clicked() {
+            let tl = &mut app.ui.timeline;
+            tl.reveal.clear();
+            tl.layer_reveal.clear();
+            tl.reveal_props.clear();
+            tl.full_groups.clear();
+        }
+    }
     app.ui.timeline.search = search;
     app.auto.add("timeline.search", sr, "Search");
     let mut bx = rect.min.x + left_w - 10.0;
