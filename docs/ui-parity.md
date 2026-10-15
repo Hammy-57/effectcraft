@@ -1,6 +1,6 @@
 # UI parity
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-10 · **Change:** major (first UI parity checklist against After Effects 2026 26.5) · **Target:** Adobe After Effects 2026
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-15 · **Change:** minor (mask and shape marquee routing) · **Target:** Adobe After Effects 2026
 
 How closely EffectCraft's interaction matches After Effects: tools, handles, snapping, nudging,
 modifier keys, shortcuts, drag behaviour, numeric entry, panels, context menus and feel. Evidence
@@ -18,7 +18,7 @@ feel and platform differences, and the 26.x interface changes are not in yet.
 | Menu bar | After Effects' menus, order, submenus and labels; native on macOS; keyboard-operable in-window bar | 95% | 587 entries in `crates/engine/src/menus.rs`; Adobe-service entries omitted by design; `ui_menus` tests (#279) |
 | Panels and workspaces | Every After Effects panel; all standard workspaces; drag-to-dock, tabs, floating panels, maximise | 75% | `ui_tabs`, `ui_panels`; dropping a panel on a stacked panel doesn't make a tab (#302); stacked-panel headers (#301); saved workspaces don't persist (#320); no panels on a second monitor (#486) |
 | Timeline | Switches, modes, parent & link, twirl-downs, reveal shortcuts (U, UU, P, S, R, T, A, E, M, F, Alt+Shift…), pick whips, graph editor, work area, markers | 75% | `ui_keyframes`, `ui_timeline_*`; Graph Editor jitter and hidden buttons (#456, #457); rotation can't go negative by dragging (#569); bulk keyframing (#355); expand precomps in place (#601); Proportional Scrubbing (26.2: Ctrl+Alt / Cmd+Opt scrub of hot text spreads the change over the selected layers by selection order, #770) matched for layers selected as a whole, not yet for individually selected properties |
-| Composition viewer | Selection, handles with direction-aware cursors, rulers, guides, grids, snapping, channels, exposure, region of interest, snapshots, 3D views, Spacebar hand | 70% | `ui_viewer`, `ui_viewers`; Cmd/Ctrl +/− doesn't zoom (#570); inaccurate snapping (#352); anchor point grab on Linux (#492); no 3D transform gizmos (#392, #347); percentage guides (26.5); Copy Frame to Clipboard (26.3) is in the Composition menu and the viewer's context menu |
+| Composition viewer | Selection, handles with direction-aware cursors, rulers, guides, grids, snapping, channels, exposure, region of interest, snapshots, 3D views, Spacebar hand | 70% | `ui_viewer`, `ui_viewers`; full-frame mask and explicit shape-vertex marquees preserve ordinary layer dragging (new regressions compiled, not executed in this pass); Cmd/Ctrl +/− doesn't zoom (#570); inaccurate snapping (#352); anchor point grab on Linux (#492); no 3D transform gizmos (#392, #347); percentage guides (26.5); Copy Frame to Clipboard (26.3) is in the Composition menu and the viewer's context menu |
 | Tools panel | All After Effects tools; long-press flyouts; Tool Creates Shape / Mask; Fill / Stroke options | 80% | #213, #227 fixed; pen and vertex tools on motion paths (#553) |
 | Nudging and modifiers | Arrow nudge (1 px, Shift 10 px), Alt/Option duplicates and slips, Shift constrains | 75% | #290 nudging fixed; Linux multi-layer edits (#491) |
 | Numeric entry | Scrubbable values, typed entry with Tab / Shift+Tab, angle revolutions, Escape cancels, non-finite rejected | 85% | `ui_angles`, `ui_inline_edit` (#93, #141, #361); rename arrows on Linux (#488) |
@@ -44,4 +44,5 @@ Effects running; most of the rest parallelises.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-15 | minor | Full-frame mask and explicit shape-vertex marquees; ordinary shape Position dragging retained |
 | 2026-10-10 | major | First UI parity checklist |
