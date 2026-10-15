@@ -1024,6 +1024,12 @@ fn frame_source_s() -> Value {
 }
 
 fn open_project(b: &mut Backend, a: &Value) -> Result<Reply> {
+    // Replacing the open document: never silently drop another agent's or the user's unsaved
+    // work on this host. `project.summary` (not `b.session()`, which is `None` over a bridge to
+    // another process) reaches the dirty flag whether this server is headless or bridged.
+    if get(a, "discard").and_then(Value::as_bool) != Some(true) && b.exec("project.summary", json!({}))?.get("dirty") == Some(&Value::Bool(true)) {
+        return Err(Error::BadArgs("this host's project has unsaved changes: save_project first, or pass `discard: true` to drop them".into()));
+    }
     let opened = if let Some(path) = get(a, "path") {
         b.exec("file.open", json!({"path": path}))?
     } else if get(a, "demo").and_then(Value::as_bool) == Some(true) {
@@ -1730,10 +1736,13 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "open_project",
-        description: "Open a project: `path` to an .ecproj file, `demo: true` for the built-in demo project, or `new: true` for an empty project. Returns the project overview.",
+        description: "Open a project: `path` to an .ecproj file, `demo: true` for the built-in demo project, or `new: true` for an empty project. Returns the project overview. Refused while this host's current project has unsaved changes, unless `discard: true`.",
         bridge_only: false,
         schema: || {
-            schema(json!({"path": {"type": "string", "description": "Path of an .ecproj file."}, "demo": {"type": "boolean"}, "new": {"type": "boolean"}}), &[])
+            schema(
+                json!({"path": {"type": "string", "description": "Path of an .ecproj file."}, "demo": {"type": "boolean"}, "new": {"type": "boolean"}, "discard": {"type": "boolean", "description": "Drop the current unsaved project instead of refusing."}}),
+                &[],
+            )
         },
         run: open_project,
     },

@@ -2740,7 +2740,7 @@ fn automation_roots_confine_file_access() {
     assert!(queue["items"][0]["outputPath"].as_str().is_some_and(|o| o.starts_with(&*read.to_string_lossy())), "{queue}");
     let msg = denied(&mut s, "execute_command", json!({"command": "renderQueue.render"}));
     assert!(msg.contains("cannot write"), "{msg}");
-    call_json(&mut s, "open_project", json!({"path": p(&write, "saved.ecproj")}));
+    call_json(&mut s, "open_project", json!({"path": p(&write, "saved.ecproj"), "discard": true}));
     call_json(&mut s, "save_project", json!({}));
     // Through a symbolic link out of a root.
     #[cfg(unix)]
@@ -3079,6 +3079,27 @@ fn open_project_preserves_provenance_and_missing_media_warning() {
     for kind in ["repairs", "newerVersion", "missingMedia", "openElsewhere"] {
         assert!(kinds.contains(&kind));
     }
+}
+
+/// `open_project` must never silently drop unsaved work: not a headless server's own session,
+/// and not a shared host it is bridged to (several agents/the desktop app on one running app) —
+/// `b.session()` is `None` over a bridge, so the guard reads `project.summary`'s `dirty` flag
+/// instead, which the fake app's real `Session::execute` keeps accurate (#open_project-dirty).
+#[test]
+fn open_project_refuses_to_discard_unsaved_work() {
+    let mut headless = server();
+    call_json(&mut headless, "execute_command", json!({"command": "comp.new", "params": {"name": "Unsaved"}}));
+    let (c, err) = call(&mut headless, "open_project", json!({"new": true}));
+    assert!(err && c[0]["text"].as_str().unwrap().contains("unsaved changes"), "{c:?}");
+    let reopened = call_json(&mut headless, "open_project", json!({"new": true, "discard": true}));
+    assert_eq!(reopened["dirty"], false);
+
+    let mut bridged = McpServer::new(Backend::bridge(&fake_app().to_string()).unwrap());
+    call_json(&mut bridged, "execute_command", json!({"command": "comp.new", "params": {"name": "Unsaved"}}));
+    let (c, err) = call(&mut bridged, "open_project", json!({"new": true}));
+    assert!(err && c[0]["text"].as_str().unwrap().contains("unsaved changes"), "{c:?}");
+    let reopened = call_json(&mut bridged, "open_project", json!({"new": true, "discard": true}));
+    assert_eq!(reopened["dirty"], false);
 }
 
 #[test]
