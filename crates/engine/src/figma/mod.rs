@@ -203,7 +203,10 @@ fn import(s: &mut Session, p: &Value) -> Result<Value> {
     };
     let plan = map::plan(&src.nodes, &opts);
     if dry {
-        return Ok(plan.summary());
+        let mut summary = plan.summary();
+        let dir = s.figma_assets_dir(&src.label);
+        summary["assetPaths"] = json!(plan.rasters.iter().map(|r| build::raster_path(&dir, r)).collect::<Vec<_>>());
+        return Ok(summary);
     }
     let scale = f_p(p, "scale").filter(|x| x.is_finite() && *x >= 0.5 && *x <= 4.0).unwrap_or(2.0);
     let settings = build::Settings {

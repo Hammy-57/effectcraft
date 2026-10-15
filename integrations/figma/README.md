@@ -26,7 +26,9 @@ effectcraft-cli exec file.importFigma --bridge 9877 \
 - `payload` takes Figma node JSON directly: the REST `GET /v1/files/:key/nodes?geometry=paths` reply, a
   node or an array of nodes. Use `payloadPath` for a JSON file. Images can be included as
   `"images": {"<node id>": {"png": "<base64>"} | {"path": "/file.png"}}`.
-- `dryRun: true` returns the plan (comps, layers, what would be rasterised) and changes nothing.
+- `dryRun: true` returns the plan (comps, layers, what would be rasterised, and `assetPaths` for image files) and changes nothing.
+  Confined agents validate each destination against their write roots, including existing symbolic links, before importing.
+  Older bridge apps that omit these paths must be updated before a confined import can proceed.
 - The token comes from `token`, `FIGMA_TOKEN`, or one stored with
   `effectcraft-cli exec figma.setToken --params '{"token":"figd_…"}'` (kept beside the settings,
   readable only by you). It is never journaled, logged or saved in projects, and it is sent only to
@@ -119,3 +121,5 @@ footage in a `<name> (Figma)` folder.
 - Skewed transforms are placed without the skew (noted). The root frame's own opacity and effects
   stay in Figma when it becomes the composition.
 - Auto-layout, constraints, components and variables aren't kept. Each node arrives as it looks.
+
+REST responses are read through bounded pipes rather than shared temporary files. The system curl configuration is disabled so it cannot override redirect or output handling.

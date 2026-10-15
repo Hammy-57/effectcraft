@@ -3,7 +3,7 @@
 //! EffectCraft. The personal access token goes to curl on stdin (a `-K -` config), never on
 //! the command line, and only to `api.figma.com` (or a loopback IP for test servers).
 
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::process::{Command, Stdio};
 
 pub const API: &str = "https://api.figma.com";
@@ -133,44 +133,54 @@ fn check_token(t: &str) -> Result<&str, String> {
 /// HTTPS only.
 fn curl_args(url: &str, with_token: bool, max_bytes: u64) -> Vec<String> {
     let proto = if loopback(url) { "=https,http" } else { "=https" };
-    let mut a: Vec<String> = vec!["-sS".into(), "--proto".into(), proto.into()];
+    let mut a: Vec<String> = vec!["-q".into(), "-sS".into(), "--proto".into(), proto.into()];
     if !with_token {
         a.extend(["-L".into(), "--max-redirs".into(), "5".into(), "--proto-redir".into(), proto.into()]);
     }
     a.extend(["--connect-timeout".into(), "15".into(), "--max-time".into(), "120".into(), "--max-filesize".into(), max_bytes.to_string()]);
-    a.extend(["-w".into(), "%{http_code}".into()]);
+    a.extend(["-w".into(), "\n%{http_code}".into()]);
     a
 }
 
 /// GET `url` with curl; `token` goes in an `X-Figma-Token` header via stdin. Returns the body
 /// of a 2xx reply, else an error with Figma's message.
 fn curl(url: &str, token: Option<&str>, max_bytes: u64) -> Result<Vec<u8>, String> {
-    let tmp = std::env::temp_dir().join(format!(
-        "effectcraft-figma-{}-{}.part",
-        std::process::id(),
-        web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
-    ));
+    // Validate before spawning, and keep private documents in a bounded pipe, never shared temp files.
+    let cfg = match token {
+        Some(t) => format!("header = \"X-Figma-Token: {}\"\n", check_token(t)?),
+        None => String::new(),
+    };
     let mut cmd = Command::new("curl");
-    cmd.args(curl_args(url, token.is_some(), max_bytes))
-        .arg("-o")
-        .arg(&tmp)
-        .args(["-K", "-"])
-        .arg(url)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.args(curl_args(url, token.is_some(), max_bytes)).args(["-K", "-"]).arg(url).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| format!("talking to Figma needs curl ({e})"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        let cfg = match token {
-            Some(t) => format!("header = \"X-Figma-Token: {}\"\n", check_token(t)?),
-            None => String::new(),
-        };
+    let read = (|| -> Result<Vec<u8>, String> {
+        let mut stdin = child.stdin.take().ok_or("curl: missing input pipe")?;
         stdin.write_all(cfg.as_bytes()).map_err(|e| format!("curl: {e}"))?;
-    }
+        drop(stdin);
+        let stdout = child.stdout.take().ok_or("curl: missing output pipe")?;
+        let mut body = Vec::new();
+        // Four bytes for the status trailer, plus one to detect an oversized response.
+        stdout.take(max_bytes.saturating_add(5)).read_to_end(&mut body).map_err(|e| format!("reading Figma response: {e}"))?;
+        if body.len() as u64 > max_bytes.saturating_add(4) {
+            return Err(format!("Figma response exceeds {max_bytes} bytes"));
+        }
+        Ok(body)
+    })();
+    let mut body = match read {
+        Ok(body) => body,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
+    };
     let out = child.wait_with_output().map_err(|e| format!("curl: {e}"))?;
-    let body = std::fs::read(&tmp).unwrap_or_default();
-    let _ = std::fs::remove_file(&tmp);
-    let code: u32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(0);
+    let trailer = body.len().saturating_sub(4);
+    let code =
+        body.get(trailer..).and_then(|s| s.strip_prefix(b"\n")).and_then(|s| std::str::from_utf8(s).ok()).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+    if code != 0 {
+        body.truncate(trailer);
+    }
     if !out.status.success() || !(200..300).contains(&code) {
         let msg = serde_json::from_slice::<serde_json::Value>(&body)
             .ok()
@@ -256,8 +266,64 @@ mod tests {
     use super::*;
 
     #[test]
+    fn downloads_do_not_require_temporary_storage() {
+        let missing = std::env::temp_dir().join(format!("ec-figma-no-temp-{}", std::process::id())).join("missing");
+        assert!(!missing.exists());
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("{}::downloads_preserve_binary_bodies_and_bound_unknown_lengths", module_path!().split_once("::").unwrap().1),
+                "--nocapture",
+            ])
+            .env("TMPDIR", &missing)
+            .env("TMP", &missing)
+            .env("TEMP", &missing)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("1 passed"), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+        assert!(output.status.success(), "{stdout}");
+    }
+
+    #[test]
+    fn downloads_preserve_binary_bodies_and_bound_unknown_lengths() {
+        use std::io::{BufRead, BufReader};
+        for (status, bytes, limit, expected) in [
+            ("200 OK", b"\0\xff\n200".as_slice(), 6, true),
+            ("200 OK", b"".as_slice(), 0, true),
+            ("200 OK", b"too many bytes".as_slice(), 4, false),
+            ("403 Forbidden", b"denied".as_slice(), 64, false),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/test", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                // No Content-Length: the reader must enforce the cap even with older curl versions.
+                write!(stream, "HTTP/1.1 {status}\r\nConnection: close\r\n\r\n").unwrap();
+                let _ = stream.write_all(bytes);
+            });
+            let result = curl(&url, Some("figd_test"), limit);
+            server.join().unwrap();
+            if expected {
+                assert_eq!(result.unwrap(), bytes);
+            } else {
+                assert!(result.is_err(), "{result:?}");
+            }
+        }
+    }
+
+    #[test]
     fn token_requests_never_follow_redirects() {
         let a = curl_args("https://api.figma.com/v1/files/KEY/nodes?ids=1%3A2", true, 1 << 20);
+        assert_eq!(a.first().map(String::as_str), Some("-q"));
         assert!(!a.iter().any(|x| x == "-L" || x == "--location" || x == "--location-trusted"), "{a:?}");
         assert!(a.windows(2).any(|w| w[0] == "--proto" && w[1] == "=https"), "{a:?}");
         // The token-less image download may follow redirects, HTTPS only.

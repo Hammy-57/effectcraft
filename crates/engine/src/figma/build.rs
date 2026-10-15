@@ -150,7 +150,7 @@ fn payload_png(v: &Value) -> std::result::Result<Vec<u8>, String> {
 }
 
 /// PNG bytes for every planned image, in plan order.
-fn raster_bytes(_s: &Session, plan: &Plan, src: &Source, scale: f64, notes: &mut Vec<String>) -> Vec<Option<Vec<u8>>> {
+fn raster_bytes(plan: &Plan, src: &Source, scale: f64, notes: &mut Vec<String>) -> Vec<Option<Vec<u8>>> {
     let mut out: Vec<Option<Vec<u8>>> = vec![None; plan.rasters.len()];
     let mut want = vec![];
     for (i, r) in plan.rasters.iter().enumerate() {
@@ -189,9 +189,16 @@ fn is_png(b: &[u8]) -> bool {
     b.starts_with(b"\x89PNG\r\n\x1a\n")
 }
 
+/// Shared by dry-run confinement checks and the actual writer.
+pub(super) fn raster_path(dir: &std::path::Path, raster: &super::map::Raster) -> std::path::PathBuf {
+    let safe: String = raster.node_id.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).take(60).collect();
+    let name: String = raster.name.chars().filter(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '_')).take(40).collect();
+    dir.join(format!("{} {safe}.png", name.trim()))
+}
+
 /// Write and import the images; each import is its own step until [`fold`].
 fn import_rasters(s: &mut Session, plan: &Plan, src: &Source, scale: f64, notes: &mut Vec<String>) -> Vec<Option<ItemId>> {
-    let bytes = raster_bytes(s, plan, src, scale, notes);
+    let bytes = raster_bytes(plan, src, scale, notes);
     let dir = s.figma_assets_dir(&src.label);
     let mut items = vec![None; plan.rasters.len()];
     if bytes.iter().all(Option::is_none) {
@@ -207,9 +214,7 @@ fn import_rasters(s: &mut Session, plan: &Plan, src: &Source, scale: f64, notes:
             notes.push(format!("{}: the image is not a PNG, skipped", r.name));
             continue;
         }
-        let safe: String = r.node_id.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).take(60).collect();
-        let nm: String = r.name.chars().filter(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '_')).take(40).collect();
-        let path = dir.join(format!("{} {safe}.png", nm.trim())).to_string_lossy().into_owned();
+        let path = raster_path(&dir, r).to_string_lossy().into_owned();
         if let Err(e) = s.services.write_file(&path, &b) {
             notes.push(format!("{}: cannot write {path} ({e})", r.name));
             continue;
