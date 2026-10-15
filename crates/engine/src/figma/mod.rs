@@ -60,12 +60,16 @@ impl Session {
                 let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Project".into());
                 p.parent().map(|d| d.join(format!("{stem} Figma Assets"))).unwrap_or_else(|| PathBuf::from(format!("{stem} Figma Assets")))
             }
-            None => self
-                .config
-                .as_ref()
-                .and_then(|c| c.dir())
-                .map(|d| d.join("Figma Imports"))
-                .unwrap_or_else(|| std::env::temp_dir().join("EffectCraft Figma Imports")),
+            None => self.config.as_ref().and_then(|c| c.dir()).map(|d| d.join("Figma Imports")).unwrap_or_else(|| {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    PathBuf::from("/Figma Imports")
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    std::env::temp_dir().join("EffectCraft Figma Imports")
+                }
+            }),
         };
         base.join(if safe.is_empty() { "import".into() } else { safe })
     }

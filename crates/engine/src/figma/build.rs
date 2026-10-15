@@ -7,7 +7,7 @@ use std::sync::Arc;
 use effectcraft_color::Label;
 use effectcraft_keyframe::Value as KV;
 use effectcraft_project::build::{self, Ids};
-use effectcraft_project::{Comp, ItemId, ItemKind, Layer, LayerId, LayerSource, MaskMode, Project, PropGroup, TrackMatte};
+use effectcraft_project::{Comp, Footage, ItemId, ItemKind, Layer, LayerId, LayerSource, MaskMode, Project, PropGroup, TrackMatte};
 use effectcraft_time::{FrameRate, Tick};
 use serde_json::{Value, json};
 
@@ -56,15 +56,28 @@ fn items(ids: &mut Ids, items: &[Item]) -> Vec<PropGroup> {
                     set(&mut g, "rule", KV::Enum(u32::from(*even_odd)));
                     g
                 }
-                Item::GradientFill { radial, start, end, gradient, opacity, even_odd } => {
+                Item::GradientFill { radial, kind, width, start, end, gradient, opacity, even_odd } => {
                     let mut g = build::shape_gradient_fill(ids, *radial, *start, *end, gradient.clone());
+                    set(&mut g, "type", KV::Enum(*kind));
+                    if let Some(width) = width {
+                        set(&mut g, "widthPoint", KV::Vec2(*width));
+                        set(&mut g, "affine", KV::Bool(true));
+                    }
                     set(&mut g, "opacity", KV::Scalar(*opacity));
                     set(&mut g, "rule", KV::Enum(u32::from(*even_odd)));
                     g
                 }
                 Item::Stroke(s) => {
                     let mut g = match &s.gradient {
-                        Some((radial, a, b, gr)) => build::shape_gradient_stroke(ids, *radial, *a, *b, gr.clone(), s.width),
+                        Some(gr) => {
+                            let mut g = build::shape_gradient_stroke(ids, gr.kind != 0, gr.start, gr.end, gr.gradient.clone(), s.width);
+                            set(&mut g, "type", KV::Enum(gr.kind));
+                            if let Some(width) = gr.width {
+                                set(&mut g, "widthPoint", KV::Vec2(width));
+                                set(&mut g, "affine", KV::Bool(true));
+                            }
+                            g
+                        }
                         None => build::shape_stroke(ids, [s.color[0], s.color[1], s.color[2], 1.0], s.width),
                     };
                     set(&mut g, "opacity", KV::Scalar(s.opacity));
@@ -92,12 +105,22 @@ fn items(ids: &mut Ids, items: &[Item]) -> Vec<PropGroup> {
 
 fn shadow_style(l: &mut Layer, ids: &mut Ids, comp: &Comp, s: &Shadow) {
     let id = if s.inner { "innerShadow" } else { "dropShadow" };
-    if effectcraft_project::styles::add_style(l, ids, id, &comp.global_light, true).is_none() {
-        return;
-    }
-    let Some(g) = l.props.sub_mut(effectcraft_project::styles::GROUP).and_then(|ls| ls.sub_mut(id)) else { return };
-    // Figma shadows blend normally.
-    set(g, "blendMode", KV::Enum(0));
+    let duplicate = l.props.sub(effectcraft_project::styles::GROUP).is_some_and(|ls| ls.sub(id).is_some());
+    let uid = if duplicate {
+        let Some(mut g) = effectcraft_project::styles::style(ids, id) else { return };
+        let Some(ls) = l.props.sub_mut(effectcraft_project::styles::GROUP) else { return };
+        g.name = format!("{} {}", g.name, ls.groups().filter(|g| g.match_id == id).count() + 1);
+        let uid = g.uid;
+        ls.children.push(g.into());
+        uid
+    } else {
+        let Some(uid) = effectcraft_project::styles::add_style(l, ids, id, &comp.global_light, true) else { return };
+        uid
+    };
+    let Some(g) = l.props.sub_mut(effectcraft_project::styles::GROUP).and_then(|ls| ls.find_group_mut(uid)) else { return };
+    let mode = effectcraft_project::styles::STYLE_BLEND_MODES.iter().position(|(_, mode)| *mode == s.blend).unwrap_or(0) as u32;
+    set(g, "blendMode", KV::Enum(mode));
+    set(g, "knocksOut", KV::Bool(!s.show_behind));
     set(g, "color", KV::Color([s.color[0], s.color[1], s.color[2], 1.0]));
     set(g, "opacity", KV::Scalar(s.opacity.clamp(0.0, 100.0)));
     set(g, "useGlobalLight", KV::Bool(false));
@@ -202,6 +225,46 @@ fn import_rasters(s: &mut Session, plan: &Plan, src: &Source, scale: f64, notes:
     items
 }
 
+#[derive(Clone, Copy)]
+enum Fmt { Png, Jpeg }
+impl Fmt {
+    fn ext(self) -> &'static str { match self { Self::Png => "png", Self::Jpeg => "jpg" } }
+    fn sniff(bytes: &[u8]) -> Option<Self> {
+        if bytes.starts_with(b"\x89PNG\r\n\x1a\n") { Some(Self::Png) }
+        else if bytes.starts_with(b"\xff\xd8\xff") { Some(Self::Jpeg) }
+        else { None }
+    }
+}
+
+/// Validate/importer-probe all clipboard bitmaps before the single project edit.
+fn prepare_bitmaps(s: &Session, plan: &Plan, src: &Source) -> Result<Vec<Option<Footage>>> {
+    let mut prepared = vec![None; plan.rasters.len()];
+    if plan.rasters.iter().all(|raster| !src.images.contains_key(&raster.node_id)) {
+        return Ok(prepared);
+    }
+    let dir = s.figma_assets_dir(&src.label);
+    for (i, raster) in plan.rasters.iter().enumerate() {
+        let Some(entry) = src.images.get(&raster.node_id) else { continue };
+        let encoded = entry.get("base64").and_then(Value::as_str).ok_or_else(|| EngineError::Other("missing validated bitmap bytes".into()))?;
+        let bytes = fetch::base64_decode(encoded).map_err(EngineError::Other)?;
+        let format = Fmt::sniff(&bytes)
+            
+            .ok_or_else(|| EngineError::Other("clipboard bitmap is not PNG or JPEG".into()))?;
+        let importer = s.importer.as_ref().ok_or_else(|| EngineError::Other("media import is not available in this build".into()))?;
+        let path = dir.join(format!("image-{i}.{}", format.ext())).to_string_lossy().into_owned();
+        s.services.store_file(&path, &bytes).map_err(|e| EngineError::Other(format!("cannot store clipboard image: {e}")))?;
+        importer.register(&path, &bytes);
+        let footage = importer.probe(&path).map_err(|e| EngineError::Other(format!("cannot import clipboard image: {e}")))?;
+        if f64::from(footage.width) != raster.width || f64::from(footage.height) != raster.height {
+            return Err(EngineError::Other("imported image dimensions differ from the validated clipboard asset".into()));
+        }
+        if let Some(slot) = prepared.get_mut(i) {
+            *slot = Some(footage);
+        }
+    }
+    Ok(prepared)
+}
+
 /// One layer for a planned layer (transform, contents, styles, effects, masks).
 fn make_layer(
     proj: &mut Project,
@@ -229,7 +292,7 @@ fn make_layer(
     let mut l = build::layer(proj, comp, &pl.name, source, size, ldur);
     let mut anchor = pl.anchor;
     let mut scale = pl.scale;
-    if let PKind::Raster(_) = &pl.kind {
+    if matches!(pl.kind, PKind::Raster(_)) && !pl.original_image {
         // The PNG is the node's box at `scale`×: fit it back to the box.
         let (iw, ih) = (size.0.max(1) as f64, size.1.max(1) as f64);
         anchor = [iw / 2.0, ih / 2.0];
@@ -242,6 +305,7 @@ fn make_layer(
     prop(&mut l, "transform/opacity", KV::Scalar(pl.opacity));
     l.blend_mode = pl.blend;
     l.switches.video = pl.visible && !pl.is_matte;
+    l.switches.collapse = pl.collapse;
     let mut ids = Ids(&mut proj.next_id);
     match &pl.kind {
         PKind::Shape(contents) => {
@@ -287,13 +351,25 @@ fn fold(s: &mut Session, snap: &Arc<Project>, label: &str) {
 pub(super) fn run(s: &mut Session, plan: Plan, src: &Source, scale: f64, cfg: &Settings) -> Result<Value> {
     let (project, history, state) = (s.project.clone(), s.history.clone(), s.state.clone());
     let mut notes = plan.notes.clone();
-    let rasters = import_rasters(s, &plan, src, scale, &mut notes);
+    let prepared = if cfg.origin == "FigCraft" { Some(prepare_bitmaps(s, &plan, src)?) } else { None };
+    let rasters = if prepared.is_some() { vec![None; plan.rasters.len()] } else { import_rasters(s, &plan, src, scale, &mut notes) };
     let rate = FrameRate::from_f64(cfg.frame_rate);
     let dur = rate.snap_nearest(Tick::from_seconds_f64(cfg.duration));
     let into = cfg.into;
     let label = if plan.name.trim().is_empty() { cfg.origin.to_string() } else { plan.name.clone() };
-    let raster_items = rasters.clone();
     let built = s.edit(cfg.undo_label, None, |proj, st| {
+        let mut raster_items = rasters.clone();
+        if let Some(prepared) = &prepared {
+            for (i, entry) in prepared.iter().enumerate() {
+                if let Some(footage) = entry {
+                    let name = plan.rasters.get(i).map(|r| r.name.as_str()).unwrap_or("Image");
+                    let item = proj.add_item(name, Label::Sandstone, None, ItemKind::Footage(footage.clone()));
+                    if let Some(slot) = raster_items.get_mut(i) {
+                        *slot = Some(item);
+                    }
+                }
+            }
+        }
         // Precomps and images go in a folder; the new top-level comps stay at the root.
         let nested = plan.comps.len().saturating_sub(plan.roots.len() + usize::from(plan.into_active.is_some()));
         let folder = (nested > 0 || raster_items.iter().any(Option::is_some))
@@ -369,9 +445,9 @@ pub(super) fn run(s: &mut Session, plan: Plan, src: &Source, scale: f64, cfg: &S
         if plan.into_active.is_some() {
             st.selected_layers = top_layers.clone();
         }
-        Ok((comp_items, top_layers))
+        Ok((comp_items, top_layers, raster_items))
     });
-    let (comp_items, top_layers) = match built {
+    let (comp_items, top_layers, rasters) = match built {
         Ok(v) => v,
         Err(e) => {
             s.project = project;
