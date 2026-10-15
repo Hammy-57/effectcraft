@@ -120,7 +120,11 @@ pub(crate) fn growth(ctx: &EvalCtx, layer: &Layer) -> Option<f64> {
 /// Blend modes of the exterior passes [`render`] produces (Drop Shadow, then Outer Glow).
 pub fn pass_modes(ctx: &EvalCtx, layer: &Layer) -> Vec<BlendMode> {
     let Some(g) = group(layer) else { return vec![] };
-    ["dropShadow", "outerGlow"].iter().filter_map(|id| g.sub(id).filter(|s| s.enabled)).map(|s| style_blend_mode(ctx.e(layer, s, "blendMode"))).collect()
+    g.groups()
+        .filter(|s| s.enabled && s.match_id == "dropShadow")
+        .chain(g.groups().filter(|s| s.enabled && s.match_id == "outerGlow").last())
+        .map(|s| style_blend_mode(ctx.e(layer, s, "blendMode")))
+        .collect()
 }
 
 // ------------------------------------------------------------------------------------------
@@ -201,8 +205,8 @@ struct Stroke {
 
 #[derive(Default)]
 struct Styles {
-    drop: Option<Shadow>,
-    inner_shadow: Option<Shadow>,
+    drop: Vec<Shadow>,
+    inner_shadow: Vec<Shadow>,
     outer_glow: Option<Glow>,
     inner_glow: Option<Glow>,
     bevel: Option<Bevel>,
@@ -249,9 +253,9 @@ fn evaluate(ctx: &EvalCtx, layer: &Layer, g: &PropGroup) -> Styles {
                     knocks_out: !inner && ctx.b(layer, sg, "knocksOut"),
                 };
                 if inner {
-                    s.inner_shadow = Some(sh);
+                    s.inner_shadow.push(sh);
                 } else {
-                    s.drop = Some(sh);
+                    s.drop.push(sh);
                 }
             }
             "outerGlow" | "innerGlow" => {
@@ -333,10 +337,10 @@ fn evaluate(ctx: &EvalCtx, layer: &Layer, g: &PropGroup) -> Styles {
 fn reach(s: &Styles) -> f64 {
     let soft = |size: f64| size * 1.6;
     let mut r: f64 = 0.0;
-    if let Some(d) = &s.drop {
+    for d in &s.drop {
         r = r.max(d.offset[0].abs().max(d.offset[1].abs()) + soft(d.size));
     }
-    if let Some(d) = &s.inner_shadow {
+    for d in &s.inner_shadow {
         r = r.max(d.offset[0].abs().max(d.offset[1].abs()) + soft(d.size));
     }
     if let Some(g) = &s.outer_glow {
@@ -577,7 +581,7 @@ pub fn render(ctx: &EvalCtx, layer: &Layer, content: &Buf, layer_size: [f64; 2])
 
     // ---- exterior passes
     let mut passes = vec![];
-    if let Some(ds) = &styles.drop {
+    for ds in &styles.drop {
         let shape = soft_shape(&alpha, &d, ds.size * s, ds.spread, false);
         let off = [ds.offset[0] * s, ds.offset[1] * s];
         let img = pass_image(w, h, |x, y| {
@@ -652,7 +656,7 @@ pub fn render(ctx: &EvalCtx, layer: &Layer, content: &Buf, layer_size: [f64; 2])
             (c, noisy(a * gl.opacity, gl.noise, x, y, seed ^ 0x3c3c))
         });
     }
-    if let Some(is) = &styles.inner_shadow {
+    for is in &styles.inner_shadow {
         let shape = soft_shape(&alpha, &d, is.size * s, is.spread, true);
         let off = [is.offset[0] * s, is.offset[1] * s];
         blend_clipped(&mut body, &alpha, is.mode, seed, |x, y| {

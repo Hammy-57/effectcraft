@@ -35,6 +35,7 @@ pub fn atomic_supported(id: &str) -> bool {
         "layer.slipForward",
         "layer.arrange",
         "layer.precompose",
+        "layer.replaceSource",
         "layer.addMask",
         "layer.setMask",
         "layer.addShapeItem",

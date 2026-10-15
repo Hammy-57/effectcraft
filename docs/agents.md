@@ -67,10 +67,12 @@ Desktop, Cursor and the like) take the same `command` and `args`.
 - **Bridge** (`["mcp", "--bridge", "9877"]`): drives a running `effectcraft --control 9877`, so you
   see every change live. Bridge mode adds `screenshot` and the `ui_*` tools.
 
-After a broken connection, the bridge retries explicitly read-only control queries once.
-Engine commands, UI edits and unknown methods whose transmission or reply fails report an
-unknown outcome: the app may already have applied them. Inspect the app before explicitly
-retrying. A later call reconnects; timeouts and malformed replies are never automatically resent.
+After a broken connection, the bridge retries explicitly read-only queries once. This fork can
+also resend the same request ID to the same identified process and session: the host's receipt
+cache prevents executing an edit twice. Changed host identity prevents replay; unknown identity
+allows only explicitly read-only queries. Uncertain writes report an unknown outcome because the
+app may already have applied them: inspect the app before explicitly retrying. A later call
+reconnects; timeouts and malformed replies are never automatically resent.
 
 ### From an installed release
 
@@ -121,8 +123,9 @@ kept for recovery (up to 30 days).
 previous dirty sessions; `doc_inspect`'s `project.autosave` also reports the latest checkpoint and errors.
 Recover explicitly with `open_project {"path":"<checkpoint .ecproj>"}`, then
 `save_project {"path":"Recovered.ecproj"}`. Prior sessions may still be running and are never
-opened automatically. Replacing a dirty project with `open_project` or `file.newProject` discards
-it intentionally; save it first. The metadata describes the current project in each session.
+opened automatically. `open_project` (`path`, `demo` or `new`) refuses to replace a dirty project —
+save it first, or pass `discard: true` to drop it intentionally. The metadata describes the
+current project in each session.
 
 Without `--autosave`, headless work is in memory until explicitly saved. The flag is for a
 project in the server's process (headless or `--ui`); a bridged desktop app owns its auto-saves. An edit interrupted before its reply is received
@@ -162,7 +165,7 @@ requires it. Retained `get_result` snapshots do not rerun edits or need a live r
 | `lint_frame {comp?, time?, start?, end?, step?, rules?, min_text_px?, min_contrast?}` | Design lint (`render.lint`): plain-language design problems at one time or over a range, each with a fix hint: text too small or low-contrast, outside title / action safe, cut off, overlapping text, layers switched on but not seen, keyframes just off the music's beat. Returns `{clean, counts, problems: [{rule, severity, layer, layerName, time, until, message, other?}]}`. See [Design lint](#design-lint). |
 | `render_snapshot {name, comp?, time?, max_side?, transparent?}` | Render a frame and keep it in the session under `name` (16 kept, oldest dropped; the same name replaces). |
 | `render_compare {a, b, threshold?, min_psnr?, max_side?, region?, amplify?, diff_path?, inline?}` | Compare two frames. `a` and `b` are each a snapshot name (or `{snapshot}`), `{path}` (a PNG/JPEG golden or After Effects reference) or `{comp?, time?, transparent?}` (render now; `{}` = active comp at the CTI). Returns `{width, height, max_abs, mean_abs, alpha_max_abs, psnr_db, ssim, changed_pixels, changed_pct, pass, diffBounds}` and, when something changed, the diff heatmap as an image. `region: [x, y, w, h]` compares one rectangle. See [Verify your change](#verify-your-change-snapshot--edit--compare). |
-| `open_project {path \| demo \| new}` / `save_project {path?}` | Open and save files. |
+| `open_project {path \| demo \| new, discard?}` / `save_project {path?}` | Open and save files. |
 | `hosts {join?}` | Where projects are open (each running EffectCraft, its port and project); `join` (a port or a project path) switches this server onto that host as your own `client`, so several agents work in one project. Refused while your own project has unsaved changes. |
 | `undo {steps?}` / `redo {steps?}` | History. |
 | `history {goto?}` | The branching undo history (History panel): every state with its index, id, label, branch depth and whether it's current; `goto` (an index or id) jumps to any state, on any branch, without losing the others. |

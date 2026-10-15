@@ -1302,7 +1302,10 @@ AVLayer.prototype.constructor = AVLayer;
   }
   P.sourcePointToComp = function (p) { return pointIn(this, p, true); };
   P.compPointToSource = function (p) { return pointIn(this, p, false); };
-  P.replaceSource = function () { throw __err("replaceSource is not supported yet"); };
+  P.replaceSource = function (source, fixExpressions) {
+    if (!(source instanceof CompItem) && !(source instanceof FootageItem)) throw __err("replaceSource needs a composition or footage item");
+    __call("layer.replaceSource", this.__p1({ item: source.__id, fixExpressions: !!fixExpressions }));
+  };
   P.openInViewer = function () { __call("layer.openLayer", this.__p1()); return null; };
 })();
 

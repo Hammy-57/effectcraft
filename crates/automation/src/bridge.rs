@@ -87,6 +87,7 @@ fn harmless_read(method: &str, params: &Value) -> bool {
         "engine.commands" | "ui.menu.list" | "ui.inspect" | "ui.elements" | "ui.viewer.locate" | "ui.viewer.hit" | "ui.timeline.locate" | "app.revision" => {
             true
         }
+        "ui.playback" => params["action"] == "status",
         "engine.execute" => params.get("command").and_then(Value::as_str).is_some_and(|command| {
             matches!(
                 command,
@@ -183,6 +184,7 @@ impl BridgeClient {
 
     /// Call a control method; returns the reply's `result`, or the app's `error` as [`Error::App`].
     pub fn call(&mut self, method: &str, params: Value) -> Result<Value> {
+        let unknown = |error| Error::Bridge(format!("`{method}` request outcome is unknown: {error}; inspect the app before retrying"));
         let mut last = Error::Bridge("not attempted".into());
         let request_id = format!("{}-{}", self.request_prefix, self.next_id);
         let mut first_instance = None;
@@ -206,7 +208,7 @@ impl BridgeClient {
                 let changed = first_instance.as_ref().zip(conn.instance.as_ref()).is_some_and(|(first, current)| first != current);
                 if !same && (changed || !harmless_read(method, &params)) {
                     return Err(Error::Bridge(format!(
-                        "cannot safely replay request `{request_id}`: the host process/session changed or its identity is unknown. The first attempt may have completed; no request was resent. Inspect the project or saved output before making a new mutation"
+                        "cannot safely replay request `{request_id}`: the outcome is unknown because the host process/session changed or its identity is unknown. The first attempt may have completed; no request was resent. Inspect the project or saved output before making a new mutation"
                     )));
                 }
             }
@@ -218,7 +220,7 @@ impl BridgeClient {
                 }
                 Err(error) => {
                     self.conn = None;
-                    return Err(error);
+                    return Err(if harmless_read(method, &params) { error } else { unknown(error) });
                 }
             }
         }

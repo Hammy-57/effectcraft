@@ -1,6 +1,6 @@
 # File format parity
 
-> **Last reviewed:** 2026-10-12 · **Last updated:** 2026-10-15 · **Change:** minor (portable collection with dependency warnings; runtime acceptance pending; ordinary FigCraft Copy SVG carrier; native workflow verified; parity estimate unchanged) · **Target:** Adobe After Effects 2026
+> **Last reviewed:** 2026-10-12 · **Last updated:** 2026-10-15 · **Change:** minor (FigCraft v2 bitmap/paint transfer verified on 529 private frames; portable collection with dependency warnings; runtime acceptance pending; ordinary FigCraft Copy SVG carrier; native workflow verified; parity estimate unchanged) · **Target:** Adobe After Effects 2026
 
 Every format After Effects reads or writes, with EffectCraft's support. After Effects' list comes
 from its installed bundle (26.5.0.89: `Info.plist` `CFBundleDocumentTypes`, `Plug-ins/Format`,
@@ -89,7 +89,7 @@ trips and renders, checked by tests, not against After Effects), **partial** (na
 |---|---|---|---|---|
 | Premiere Pro `.prproj` | R (import) | none | none | Out of clean-room scope pending a decision; we interchange through FCP7 XML, FCPXML, OTIO, EDL, AAF and OMF instead (beyond After Effects) |
 | Lottie JSON / dotLottie | via third-party plug-ins | yes | yes | beyond After Effects; a warnings list names what Lottie can't express |
-| FigCraft clipboard v1 | — | native editable snapshot | — | [Normal Copy → Paste](figcraft-clipboard.md) via native metadata in SVG, or explicit JSON; one undo step, no live link or native raster fallback; vector geometry supported, limitations reported; native normal-Copy/clipboard/edit/undo/save-reopen checks passed; excluded from After Effects parity scoring |
+| FigCraft clipboard v1/v2 | — | native editable snapshot | — | [Normal Copy → Paste](figcraft-clipboard.md) via native metadata in SVG, or explicit JSON; embedded PNG/JPEG footage, native shapes/text, render bounds, gradients and multiple shadows; one undo step, no live link or flattening; 529 private frames passed native transfer/Undo with zero blank or size-limit failures; limitations reported; excluded from After Effects parity scoring |
 | JSON / CSV / TSV data | R | yes (`footage()`, data layers) | — | good |
 | LUTs (`.cube`, `.3dl`, `.csp`, `.spi1d/3d`, CDL) | R | yes (Apply Color LUT, OCIO effects) | — | Apply Color LUT bug (#514) is closed |
 | OpenColorIO configs | R (OCIO 2.5.1, ACES 2.0 in 26.5) | yes (OCIO v2 subset, Blender configs) | — | partial: no ACES 2.0 output transforms |
@@ -116,6 +116,7 @@ handoff completeness/acceptance (re-measure after the collection fixes), `.mogrt
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-15 | minor | FigCraft v2 bitmap/fidelity transfer verified on 529 private frames; original bitmap bytes and save/reopen checked; parity score unchanged |
 | 2026-10-15 | minor | Portable project collection, explicit unbundled dependencies and failure cleanup; regression coverage added, runtime execution deferred; parity estimates unchanged |
 | 2026-10-14 | patch | Ordinary Copy SVG carrier and vector geometry validation; native workflow verified; parity unchanged |
 | 2026-10-14 | minor | Native FigCraft clipboard transfer documented separately from After Effects formats; parity score unchanged; native workflow verified |

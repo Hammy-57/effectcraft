@@ -1076,6 +1076,20 @@ before.
   [Protocol, measurements and limits](expression-performance.md).
 
 
+## M7: FigCraft bitmap and paint fidelity (15 October 2026)
+
+- Version 2 clipboard snapshots carry bounded original PNG/JPEG assets with native geometry
+  mattes, exact placement and editable children. Images are prepared before a single project edit;
+  malformed assets and importer failure cannot partially change the project. Legacy v1 remains accepted.
+- Root render bounds preserve overflow and clipping. Multiple native shadows, gradient kinds and
+  affine width handles, exported text metrics and device-pixel-aligned text buffers preserve
+  appearance. Eligible pass-through frames use existing collapse transformations safely.
+- Native private-corpus verification: 529/529 transfers and Undo; previous nine size failures and
+  51 blank targets eliminated. Original bitmap bytes verified for 953 stored files; four saved
+  projects reopened with identical rendered pixels. Synthetic gradient/text and bounds checks
+  are detailed in docs/figcraft-clipboard.md. Source fixtures/assets remain local and uncommitted.
+- Scoped all-target check, strict Clippy, WASM and native builds passed. Rust regressions compiled
+  only under daytime policy; full CI was not run. No change to After Effects parity scores.
 ## Update: G4 portable project handoff (15 October 2026)
 
 - Collect Files now copies ordinary footage, sequences and item/composition proxies once per

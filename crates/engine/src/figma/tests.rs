@@ -510,3 +510,108 @@ fn import_from_payload_parts() {
     assert!(e.contains(&id), "{e}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn figcraft_frame_preserves_overflow_and_root_appearance_without_changing_figma_frames() {
+    let node = json!({"figcraft":true,"id":"frame","type":"FRAME","name":"Overflow","size":{"x":100,"y":80},
+        "absoluteTransform":[[1,0,200],[0,1,300]],"absoluteRenderBounds":{"x":180,"y":290,"width":160,"height":110},
+        "opacity":0.5,"clipsContent":false,
+        "effects":[{"type":"DROP_SHADOW","radius":8,"offset":{"x":2,"y":4},"color":{"r":0,"g":0,"b":0,"a":1}}],
+        "children":[{"id":"child","type":"RECTANGLE","name":"Child","size":{"x":120,"y":80},
+            "absoluteTransform":[[1,0,190],[0,1,300]],"absoluteRenderBounds":{"x":180,"y":290,"width":160,"height":110},
+            "fills":[{"type":"SOLID","color":{"r":1,"g":0,"b":0}}]}]});
+    let p = plan(&node, Target::NewComp);
+    let root = &p.comps[p.roots[0]];
+    assert_eq!((root.width, root.height), (160, 110));
+    let wrapper = &root.layers[0];
+    assert_eq!(wrapper.opacity, 50.0);
+    assert_eq!(wrapper.shadows.len(), 1);
+    let PKind::Precomp(inner) = wrapper.kind else { panic!("missing editable frame") };
+    assert_eq!((p.comps[inner].width, p.comps[inner].height), (160, 110));
+    assert_eq!(wrapper.position, [70.0, 50.0]);
+    assert_eq!(wrapper.anchor, [70.0, 50.0]);
+
+    let mut clipped = node.clone();
+    clipped["clipsContent"] = json!(true);
+    clipped["cornerRadius"] = json!(12);
+    let p = plan(&clipped, Target::NewComp);
+    let wrapper = &p.comps[p.roots[0]].layers[0];
+    let PKind::Precomp(inner) = wrapper.kind else { panic!("missing clipping frame") };
+    assert_eq!((p.comps[inner].width, p.comps[inner].height), (100, 80));
+    assert!(!wrapper.masks.is_empty());
+
+    let mut figma = node;
+    figma.as_object_mut().unwrap().remove("figcraft");
+    let p = plan(&figma, Target::NewComp);
+    assert_eq!((p.comps[p.roots[0]].width, p.comps[p.roots[0]].height), (100, 80));
+}
+
+#[test]
+fn figcraft_text_uses_exported_baseline_and_line_advance() {
+    let node = json!({"id":"text","type":"TEXT","characters":"First\nSecond","size":{"x":250,"y":100},
+        "figcraftTextBaseline":27.25,"style":{"fontFamily":"Inter","fontSize":28,"lineHeightPx":34}});
+    let (doc, _) = map::text_doc(&node);
+    let layout = effectcraft_text::layout_doc(&doc);
+    assert_eq!(layout.line_boxes.len(), 2);
+    assert!((layout.line_boxes[0][1] - 27.25).abs() < 1e-5);
+    assert!((layout.line_boxes[1][1] - 61.25).abs() < 1e-5);
+    assert_eq!(doc.text, "First\nSecond");
+}
+
+#[test]
+fn imported_gradients_keep_nonlinear_kind_and_third_handle() {
+    for (ty, kind) in [("GRADIENT_RADIAL", 1), ("GRADIENT_ANGULAR", 2), ("GRADIENT_DIAMOND", 3)] {
+        let node = json!({"id":"paint","type":"RECTANGLE","size":{"x":200,"y":100},
+            "fills":[{"type":ty,"gradientHandlePositions":[{"x":0.5,"y":0.5},{"x":1,"y":0.5},{"x":0.75,"y":1}],
+                "gradientStops":[{"position":0,"color":{"r":1,"g":0,"b":0}},{"position":1,"color":{"r":0,"g":0,"b":1}}]}]});
+        let p = plan(&node, Target::NewComp);
+        let PKind::Shape(items) = &p.comps[0].layers[0].kind else { panic!("not editable") };
+        let Some(Item::GradientFill { kind: k, width, .. }) = items.iter().find(|i| matches!(i, Item::GradientFill { .. })) else { panic!("missing paint") };
+        assert_eq!(*k, kind);
+        assert_eq!(*width, Some([150.0, 100.0]));
+    }
+}
+
+#[test]
+fn multiple_shadow_styles_keep_independent_parameters_and_native_properties() {
+    let node = json!({"id":"glow","type":"RECTANGLE","name":"Glow","size":{"x":20,"y":20},
+        "fills":[{"type":"SOLID","color":{"r":1,"g":1,"b":1}}],
+        "effects":[
+            {"type":"DROP_SHADOW","radius":10,"spread":5,"color":{"r":1,"g":0,"b":0}},
+            {"type":"DROP_SHADOW","radius":40,"blendMode":"SCREEN","showBehind":true,"color":{"r":0,"g":1,"b":0}},
+            {"type":"DROP_SHADOW","visible":false,"radius":200},
+            {"type":"INNER_SHADOW","radius":4,"color":{"r":0,"g":0,"b":1}}]});
+    let p = plan(&node, Target::NewComp);
+    let shadows = &p.comps[0].layers[0].shadows;
+    assert_eq!(shadows.len(), 3);
+    assert_eq!(shadows[0].size, 15.0);
+    assert!((shadows[0].spread - 100.0 / 3.0).abs() < 1e-6);
+    assert_eq!(shadows[1].size, 40.0);
+    assert_eq!(shadows[1].blend, effectcraft_color::BlendMode::Screen);
+    assert!(shadows[1].show_behind);
+    let mut s = Session::new();
+    s.execute_checked("file.importFigma", json!({"payload":node})).unwrap();
+    let layer = &s.active_comp().unwrap().layers[0];
+    let shadows: Vec<_> = layer.props.sub(effectcraft_project::styles::GROUP).unwrap().groups().filter(|g| g.match_id == "dropShadow").collect();
+    assert_eq!(shadows.len(), 2);
+    assert_ne!(shadows[0].uid, shadows[1].uid);
+    assert_eq!(shadows[0].get("size").unwrap().value, KV::Scalar(15.0));
+    assert_eq!(shadows[1].get("size").unwrap().value, KV::Scalar(40.0));
+    assert_eq!(shadows[1].get("knocksOut").unwrap().value, KV::Bool(false));
+}
+
+#[test]
+fn figcraft_only_collapses_unclipped_opaque_effect_free_pass_through_frames() {
+    let node = json!({"figcraft":true,"id":"frame","type":"FRAME","name":"Frame","size":{"x":100,"y":80},
+        "blendMode":"PASS_THROUGH","opacity":1,"clipsContent":false,"children":[]});
+    let p = plan(&node, Target::NewComp);
+    assert!(p.comps[p.roots[0]].layers[0].collapse);
+    for (key, value) in
+        [("blendMode", json!("NORMAL")), ("opacity", json!(0.5)), ("clipsContent", json!(true)), ("effects", json!([{"type":"DROP_SHADOW","radius":5}]))]
+    {
+        let mut changed = node.clone();
+        changed[key] = value;
+        let p = plan(&changed, Target::NewComp);
+        assert!(!p.comps[p.roots[0]].layers[0].collapse, "{key}");
+    }
+}

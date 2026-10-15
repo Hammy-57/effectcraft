@@ -151,7 +151,7 @@ impl Property {
             if self.hold_only {
                 k = k.hold();
             }
-            effectcraft_keyframe::set_key(&mut self.keys, k);
+            effectcraft_keyframe::insert_key_preserving_ease(&mut self.keys, k, self.spatial);
         }
     }
     /// Toggle the stopwatch: on → one key at `t` with the current value; off → keep value at `t`.
@@ -898,5 +898,20 @@ mod node_serde_tests {
             let e = serde_json::from_str::<Node>(s).unwrap_err().to_string();
             assert!(e.contains(want), "{s}: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod ae_behavior_tests {
+    use super::*;
+
+    #[test]
+    fn animated_property_edit_preserves_inserted_bezier_tangent() {
+        let mut p = Property::new(1, "rotation", "Rotation", Value::Scalar(0.0));
+        p.keys = vec![Keyframe::new(Tick::ZERO, Value::Scalar(0.0)).eased(), Keyframe::new(Tick::from_seconds_f64(2.0), Value::Scalar(100.0)).eased()];
+        p.set_value_at(Tick::from_seconds_f64(1.0), Value::Scalar(30.0));
+        assert_eq!(p.keys.len(), 3);
+        assert!((p.keys[1].in_ease[0].speed - 75.0).abs() < 1e-8);
+        assert!((p.keys[1].out_ease[0].speed - 75.0).abs() < 1e-8);
     }
 }

@@ -309,6 +309,41 @@ fn add_item(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"layer": id.0}))
 }
 
+/// Replace only the source: timing, transforms, effects and layer identity stay intact.
+fn replace_source(s: &mut Session, p: &Value) -> Result<Value> {
+    let command = "layer.replaceSource";
+    let (cid, lid) = layer_p(s, p, command)?;
+    if b_p(p, "fixExpressions").unwrap_or(false) {
+        return Err(bad(command, "automatic expression rewriting is unsupported; use fixExpressions:false"));
+    }
+    let item = match p.get("item") {
+        Some(Value::Number(n)) => n.as_u64().map(ItemId),
+        Some(Value::String(name)) => s.project.find_by_name(name).map(|i| i.id),
+        _ => None,
+    }
+    .ok_or_else(|| bad(command, "item must be an existing source id or name"))?;
+    let source = match s.project.item(item).map(|it| &it.kind) {
+        Some(ItemKind::Comp(_)) => LayerSource::Comp { item },
+        Some(ItemKind::Solid(_)) => LayerSource::Solid { item },
+        Some(ItemKind::Footage(f)) if !matches!(f.kind, effectcraft_project::FootageKind::Data | effectcraft_project::FootageKind::Model) => {
+            LayerSource::Footage { item }
+        }
+        _ => return Err(bad(command, "choose a composition, solid or audiovisual footage source")),
+    };
+    if s.project.comp_contains(item, cid) {
+        return Err(bad(command, "a composition can't contain itself"));
+    }
+    let layer = s.project.comp(cid).and_then(|comp| comp.layer(lid)).ok_or(EngineError::NoComp)?;
+    if !matches!(layer.source, LayerSource::Comp { .. } | LayerSource::Solid { .. } | LayerSource::Footage { .. }) {
+        return Err(bad(command, "this layer has no replaceable source"));
+    }
+    s.edit("Replace Layer Source", None, |proj, _| {
+        layer_mut(proj, cid, lid)?.source = source;
+        Ok(())
+    })?;
+    Ok(json!({"layer": lid.0, "item": item.0}))
+}
+
 fn select(s: &mut Session, p: &Value) -> Result<Value> {
     let cid = comp_id(s, p)?;
     let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
@@ -1726,6 +1761,15 @@ pub fn specs() -> Vec<CommandSpec> {
             "{layers?, to: front|forward|backward|back, index? (1-based stack position), above?: layer}",
             has_layers,
             arrange
+        ),
+        cmd!(
+            "layer.replaceSource",
+            "Replace Layer Source",
+            [],
+            None,
+            "{layer?, item: id|name, fixExpressions?: bool (true unsupported)}",
+            has_layers,
+            replace_source
         ),
         cmd!(
             "layer.precompose",

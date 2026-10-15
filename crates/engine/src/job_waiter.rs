@@ -20,7 +20,7 @@ pub struct JobWaiter {
     pub result: Value,
     /// Ids of the jobs it started (`jobs.list` ids: `render`, `track`, `roto`…).
     pub jobs: Vec<String>,
-    /// Absolute completion-log position when it started (including evicted entries).
+    /// Absolute completion-log position when it started, including evicted entries.
     pub log_cursor: usize,
 }
 
@@ -79,11 +79,6 @@ pub fn start(s: &mut Session, id: &str, params: Value) -> Result<Started, String
 }
 
 impl JobWaiter {
-    /// A waiter for `jobs` started by `command`, created when the completion log was at `log_cursor`.
-    pub fn new(command: &str, params: Value, result: Value, jobs: Vec<String>, log_cursor: usize) -> Self {
-        Self { known_jobs: std::sync::Mutex::new(jobs.clone()), command: command.to_string(), params, result, jobs, log_cursor }
-    }
-
     /// A staged task can publish `nextJob`; latch that child before the old log entry ages
     /// out so `wait: true` means full completion, not merely a draft becoming available.
     fn follow_jobs(&self, s: &Session) -> Vec<String> {
@@ -121,13 +116,12 @@ impl JobWaiter {
         if self.command == "jobs.wait" {
             return json!({"ok": true, "result": {"finished": s.job_log}});
         }
-        // Only this command's own jobs count: another analysis may fail in the same frame.
         let error = s
             .offload_log
             .iter()
             .skip(self.log_cursor.saturating_sub(s.offload_log_start))
             .filter(|(kind, _)| self.jobs.iter().any(|id| id == kind.job_id()))
-            .find_map(|(_, e)| e.as_ref());
+            .find_map(|(_, error)| error.as_ref());
         if let Some(e) = error {
             return json!({"ok": false, "error": e});
         }
@@ -169,5 +163,61 @@ impl JobWaiter {
             r["progress"] = Value::Null;
         }
         json!({"ok": true, "result": r})
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    /// Completion errors belong to the waiting command's jobs, including when several
+    /// different analyses complete in the same UI frame.
+    #[test]
+    fn waiting_commands_report_only_their_own_completion_errors() {
+        use crate::offload::JobKind;
+
+        for (kind, job_id) in [
+            (JobKind::Render, "render"),
+            (JobKind::Warp, "warp"),
+            (JobKind::WarpPlan, "warpPlan"),
+            (JobKind::Camera, "camera"),
+            (JobKind::RotoFreeze, "roto"),
+            (JobKind::RotoPropagate, "roto"),
+            (JobKind::Track, "track"),
+            (JobKind::MaskTrack, "maskTrack"),
+            (JobKind::ContentFill, "contentFill"),
+        ] {
+            let other = if kind == JobKind::Track { JobKind::Warp } else { JobKind::Track };
+            let mut session =
+                Session { offload_log: vec![(kind, Some("old error".into())), (other, Some("unrelated failure".into())), (kind, None)], ..Session::default() };
+            let waiter = || JobWaiter {
+                known_jobs: std::sync::Mutex::new(vec![]),
+                command: "analysis".into(),
+                params: json!({}),
+                result: json!({"running": true}),
+                jobs: vec![job_id.into()],
+                log_cursor: 1,
+            };
+            let result = waiter().finish(&mut session);
+            assert_eq!(result, json!({"ok": true, "result": {"running": false}}), "{kind:?}");
+            session.offload_log.push((kind, Some("nothing was applied".into())));
+            let result = waiter().finish(&mut session);
+            assert_eq!(result, json!({"ok": false, "error": "nothing was applied"}), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn waiting_command_sees_its_error_after_the_completion_log_rolls_over() {
+        use crate::offload::JobKind;
+        let mut session = Session { offload_log: vec![(JobKind::Warp, None); 31], offload_log_start: 1, ..Session::default() };
+        session.offload_log.push((JobKind::Track, Some("nothing was applied".into())));
+        let waiter = JobWaiter {
+            known_jobs: std::sync::Mutex::new(vec![]),
+            command: "track.analyze".into(),
+            params: json!({}),
+            result: json!({}),
+            jobs: vec!["track".into()],
+            log_cursor: 32,
+        };
+        assert_eq!(waiter.finish(&mut session), json!({"ok": false, "error": "nothing was applied"}));
     }
 }

@@ -1522,3 +1522,35 @@ fn scripted_levels_alpha_controls_resolve_from_the_effect() {
     );
     assert_eq!(o.result, json!([0.5, 0.5]));
 }
+
+#[test]
+fn replace_source_preserves_layer_and_rejects_cycles() {
+    let mut s = session();
+    let result = ok(
+        &mut s,
+        r#"
+        var a = app.project.items.addComp('A', 640, 360, 1, 5, 30);
+        var b = app.project.items.addComp('B', 640, 360, 1, 5, 30);
+        var c = app.project.items.addComp('C', 640, 360, 1, 5, 30);
+        var layer = a.layers.add(b), id = layer.id;
+        layer.name = 'Keep name'; layer.startTime = 1;
+        layer.transform.position.setValueAtTime(1, [20, 30, 0]);
+        layer.replaceSource(c, false);
+        var good = layer.id === id && layer.source.id === c.id && layer.name === 'Keep name'
+            && layer.startTime === 1 && layer.transform.position.numKeys === 1;
+        __call('edit.undo', {});
+        good = good && layer.source.id === b.id;
+        __call('edit.redo', {});
+        good = good && layer.source.id === c.id;
+        var rejected = 0;
+        try { layer.replaceSource(a, false); } catch(e) { rejected++; }
+        try { layer.replaceSource(b, true); } catch(e) { rejected++; }
+        try { layer.replaceSource(null, false); } catch(e) { rejected++; }
+        layer.replaceSource(b, false);
+        c.layers.add(a);
+        try { layer.replaceSource(c, false); } catch(e) { rejected++; }
+        [good, rejected];
+    "#,
+    );
+    assert_eq!(result.result, json!([true, 4]));
+}
