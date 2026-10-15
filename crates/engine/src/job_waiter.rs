@@ -20,8 +20,8 @@ pub struct JobWaiter {
     pub result: Value,
     /// Ids of the jobs it started (`jobs.list` ids: `render`, `track`, `roto`…).
     pub jobs: Vec<String>,
-    /// Length of [`Session::offload_log`] when it started.
-    pub log_len: usize,
+    /// Absolute completion-log position when it started (including evicted entries).
+    pub log_cursor: usize,
 }
 
 /// What [`start`] did.
@@ -50,14 +50,14 @@ pub fn start(s: &mut Session, id: &str, params: Value) -> Result<Started, String
     if id == "jobs.wait" && !s.offloads() {
         let jobs = task_ids(s);
         if !jobs.is_empty() {
-            let log_len = s.offload_log.len();
+            let log_cursor = s.offload_log_start.saturating_add(s.offload_log.len());
             return Ok(Started::Waiting(JobWaiter {
                 known_jobs: std::sync::Mutex::new(jobs.clone()),
                 command: id.to_string(),
                 params,
                 result: json!({}),
                 jobs,
-                log_len,
+                log_cursor,
             }));
         }
     }
@@ -65,7 +65,7 @@ pub fn start(s: &mut Session, id: &str, params: Value) -> Result<Started, String
         return s.execute_checked(id, params).map(Started::Done).map_err(|e| e.to_string());
     }
     let before: Vec<String> = s.jobs().into_iter().map(|j| j.id).collect();
-    let log_len = s.offload_log.len();
+    let log_cursor = s.offload_log_start.saturating_add(s.offload_log.len());
     let mut p = params.clone();
     if let Some(o) = p.as_object_mut() {
         o.insert("wait".into(), json!(false));
@@ -75,10 +75,15 @@ pub fn start(s: &mut Session, id: &str, params: Value) -> Result<Started, String
     if jobs.is_empty() {
         return Ok(Started::Done(result));
     }
-    Ok(Started::Waiting(JobWaiter { known_jobs: std::sync::Mutex::new(jobs.clone()), command: id.to_string(), params, result, jobs, log_len }))
+    Ok(Started::Waiting(JobWaiter { known_jobs: std::sync::Mutex::new(jobs.clone()), command: id.to_string(), params, result, jobs, log_cursor }))
 }
 
 impl JobWaiter {
+    /// A waiter for `jobs` started by `command`, created when the completion log was at `log_cursor`.
+    pub fn new(command: &str, params: Value, result: Value, jobs: Vec<String>, log_cursor: usize) -> Self {
+        Self { known_jobs: std::sync::Mutex::new(jobs.clone()), command: command.to_string(), params, result, jobs, log_cursor }
+    }
+
     /// A staged task can publish `nextJob`; latch that child before the old log entry ages
     /// out so `wait: true` means full completion, not merely a draft becoming available.
     fn follow_jobs(&self, s: &Session) -> Vec<String> {
@@ -116,8 +121,14 @@ impl JobWaiter {
         if self.command == "jobs.wait" {
             return json!({"ok": true, "result": {"finished": s.job_log}});
         }
-        let errors: Vec<String> = s.offload_log.iter().skip(self.log_len).filter_map(|(_, e)| e.clone()).collect();
-        if let Some(e) = errors.first() {
+        // Only this command's own jobs count: another analysis may fail in the same frame.
+        let error = s
+            .offload_log
+            .iter()
+            .skip(self.log_cursor.saturating_sub(s.offload_log_start))
+            .filter(|(kind, _)| self.jobs.iter().any(|id| id == kind.job_id()))
+            .find_map(|(_, e)| e.as_ref());
+        if let Some(e) = error {
             return json!({"ok": false, "error": e});
         }
         // A generic task (desktop): the blocking command returned its result, or failed with its
