@@ -488,6 +488,13 @@ pub(crate) fn import_items(im: &mut Im, ids: &mut Ids, items: &[Json]) -> Vec<Pr
                 set(im, &mut g, "opacity", j.get("o"), &anim::to_scalar);
                 set(im, &mut g, "start", j.get("s"), &anim::to_vec2);
                 set(im, &mut g, "end", j.get("e"), &anim::to_vec2);
+                // Lottie has no width point: it stays at its default, derived from the start and end.
+                if let (Some(Value::Vec2(start)), Some(Value::Vec2(end))) =
+                    (g.get("start").map(|p| p.value_at(effectcraft_time::Tick::ZERO)), g.get("end").map(|p| p.value_at(effectcraft_time::Tick::ZERO)))
+                    && let Some(width) = g.get_mut("widthPoint")
+                {
+                    width.value = Value::Vec2([start[0] - (end[1] - start[1]), start[1] + (end[0] - start[0])]);
+                }
                 set(im, &mut g, "highlightLength", j.get("h"), &anim::to_scalar);
                 set(im, &mut g, "highlightAngle", j.get("a"), &anim::to_scalar);
                 if let Some(gj) = j.get("g") {
