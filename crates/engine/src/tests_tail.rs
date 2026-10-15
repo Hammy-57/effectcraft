@@ -494,3 +494,13 @@ fn reverse_path_direction_runs_trim_paths_the_other_way() {
     assert!(s.execute("shape.reversePathDirection", json!({"layer": lid, "prop": trim})).is_err());
     assert!(s.execute("shape.reversePathDirection", json!({"layer": lid, "prop": 999_999})).is_err());
 }
+
+/// Go to Work Area Start / End have After Effects' default keys (Shift+Home / Shift+End).
+#[test]
+fn work_area_navigation_has_after_effects_default_keys() {
+    let s = Session::default();
+    for (id, key) in [("time.workAreaStart", "Shift+Home"), ("time.workAreaEnd", "Shift+End")] {
+        let b = s.shortcuts().find(id).unwrap_or_else(|| panic!("{id} is bindable"));
+        assert_eq!(b.defaults, [key.to_string()], "{id}");
+    }
+}
