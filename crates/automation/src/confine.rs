@@ -30,6 +30,8 @@ pub struct Confinement {
 
 /// Commands that run code, act outside the project or open other applications.
 const REFUSED: &[&str] = &[
+    // Bitmap assets can follow a sibling-directory symlink outside the project write root.
+    "edit.pasteFigCraft",
     // Project/proxy dependencies are implicit reads. A destination check alone cannot confine
     // them, and a separate bridge lookup could race another editor changing the document.
     "file.collectFiles",
@@ -100,8 +102,7 @@ const WRITES: &[(&str, &[&str])] = &[
 ];
 
 /// Commands that write where they are not told: the project's file, the Render Queue's outputs.
-/// FigCraft clipboard images persist beside the project.
-const IMPLICIT_WRITES: &[&str] = &["file.save", "file.incrementAndSave", "edit.pasteFigCraft", "renderQueue.render", "render.preRender"];
+const IMPLICIT_WRITES: &[&str] = &["file.save", "file.incrementAndSave", "renderQueue.render", "render.preRender"];
 
 /// What must be looked up before an implicitly writing command may run.
 #[derive(Debug, PartialEq, Eq)]
@@ -203,7 +204,7 @@ impl Confinement {
             return Err(Error::BadArgs(format!("`{id}`: give `path` while file access is confined")));
         }
         if IMPLICIT_WRITES.contains(&id) && !(given && id == "file.save") {
-            let project = matches!(id, "file.save" | "file.incrementAndSave" | "edit.pasteFigCraft");
+            let project = matches!(id, "file.save" | "file.incrementAndSave");
             return Ok(Some(if project { Lookup::ProjectFile } else { Lookup::RenderOutputs }));
         }
         Ok(None)
@@ -311,5 +312,28 @@ mod collection_tests {
                 )
                 .is_err()
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod clipboard_tests {
+    use super::*;
+
+    #[test]
+    fn clipboard_paste_cannot_follow_an_asset_directory_outside_write_roots() {
+        let base = std::env::temp_dir().join(format!("ec-clipboard-confinement-{}", std::process::id()));
+        let (allowed, outside) = (base.join("allowed"), base.join("outside"));
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let assets = allowed.join("Project Figma Assets");
+        std::os::unix::fs::symlink(&outside, &assets).unwrap();
+        let policy = Confinement::new(&[], std::slice::from_ref(&allowed)).unwrap();
+        let project = allowed.join("Project.ecproj");
+        assert!(policy.check_lookup(&Lookup::ProjectFile, &serde_json::json!({"path": project})).is_ok());
+        assert!(policy.check(assets.to_str().unwrap(), Access::Write).is_err());
+        let error = policy.check_command("edit.pasteFigCraft", &serde_json::json!({"clipboard":"{}"})).unwrap_err();
+        assert!(error.to_string().contains("not available while file access is confined"));
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+        std::fs::remove_dir_all(base).unwrap();
     }
 }
