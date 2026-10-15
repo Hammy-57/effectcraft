@@ -2,7 +2,7 @@
 
 **Stage: alpha** · next: beta, ~30 points of "ready for real work" and ~350–620 h away
 
-> **Last reviewed:** 2026-10-12 · **Last updated:** 2026-10-14 · **Change:** minor (mask/shape interaction fixes, native panel windows, graph editing and verified ordinary FigCraft Copy; parity estimates unchanged) · **Target:** Adobe After Effects 2026 (26.5.0.89)
+> **Last reviewed:** 2026-10-12 · **Last updated:** 2026-10-15 · **Change:** minor (FigCraft v2 bitmap/paint transfer verified on 529 private frames; mask/shape interaction fixes, native panel windows, graph editing and verified ordinary FigCraft Copy; parity estimates unchanged) · **Target:** Adobe After Effects 2026 (26.5.0.89)
 
 EffectCraft aims to do what After Effects does, with the same panels, menus and behaviour, written
 from scratch in Rust. This page is the one-page summary; the evidence is in
@@ -169,6 +169,7 @@ Come tell us what matters most to you on [Discord](https://discord.gg/artcraft).
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-15 | minor | FigCraft v2 images, bounds, gradients, shadows and text metrics; 529/529 native transfers and Undo verified, zero blank targets; target-app parity scores unchanged |
 | 2026-10-14 | patch | Ordinary FigCraft Copy SVG carrier and vector-path validation; native workflow verified; parity unchanged |
 | 2026-10-14 | minor | FigCraft native clipboard extension and mapping corrections; native workflow verified; parity scores unchanged |
 | 2026-10-12 | minor | Open-issue count (134 to 216), crash list and localization share (12% to 18%) updated to match docs/gaps.md |

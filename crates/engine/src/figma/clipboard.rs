@@ -1,4 +1,4 @@
-//! One-time, native-only FigCraft clipboard transfer. No network or asset-file access.
+//! One-time FigCraft clipboard transfer. Native layers and bounded embedded bitmap assets; no network reads.
 
 use std::borrow::Cow;
 
@@ -10,8 +10,11 @@ use crate::commands::{CommandSpec, always, bad, str_p};
 use crate::{Result, Session};
 
 const COMMAND: &str = "edit.pasteFigCraft";
-const MAX_BYTES: usize = 2 * 1024 * 1024;
-const MAX_CARRIER_BYTES: usize = 8 * 1024 * 1024;
+#[path = "clipboard_assets.rs"]
+mod assets;
+
+const MAX_BYTES: usize = 64 * 1024 * 1024;
+const MAX_CARRIER_BYTES: usize = 128 * 1024 * 1024;
 const MAX_ENCODED_BYTES: usize = MAX_BYTES.div_ceil(3) * 4;
 const METADATA_PREFIX: &str = "<metadata id=\"figcraft-clipboard-v1\"";
 const METADATA_START: &str = "<metadata id=\"figcraft-clipboard-v1\">";
@@ -26,7 +29,7 @@ fn payload_json(text: &str) -> Result<Cow<'_, str>> {
         return Ok(Cow::Borrowed(text));
     }
     if text.len() > MAX_CARRIER_BYTES {
-        return Err(bad(COMMAND, "FigCraft SVG clipboard exceeds 8 MiB"));
+        return Err(bad(COMMAND, "FigCraft SVG clipboard exceeds 128 MiB"));
     }
     if !crate::vector::is_svg_text(text) {
         return Err(bad(COMMAND, "FigCraft metadata must be inside an SVG clipboard"));
@@ -39,11 +42,11 @@ fn payload_json(text: &str) -> Result<Cow<'_, str>> {
     let content = text.get(index..).and_then(|s| s.strip_prefix(METADATA_START)).ok_or_else(|| bad(COMMAND, "malformed FigCraft clipboard metadata"))?;
     let (encoded, _) = content.split_once("</metadata>").ok_or_else(|| bad(COMMAND, "unterminated FigCraft clipboard metadata"))?;
     if encoded.len() > MAX_ENCODED_BYTES {
-        return Err(bad(COMMAND, "encoded FigCraft clipboard exceeds the 2 MiB payload limit"));
+        return Err(bad(COMMAND, "encoded FigCraft clipboard exceeds the 64 MiB payload limit"));
     }
     let bytes = super::fetch::base64_decode(encoded).map_err(|e| bad(COMMAND, format!("invalid FigCraft clipboard base64: {e}")))?;
     if bytes.len() > MAX_BYTES {
-        return Err(bad(COMMAND, "FigCraft clipboard exceeds 2 MiB"));
+        return Err(bad(COMMAND, "FigCraft clipboard exceeds 64 MiB"));
     }
     // The existing decoder also accepts data URLs and loose padding; this carrier is canonical
     // standard base64, so damaged encoding cannot silently become a different JSON payload.
@@ -142,7 +145,7 @@ fn paste(s: &mut Session, p: &Value) -> Result<Value> {
     let text = str_p(p, "clipboard").ok_or_else(|| bad(COMMAND, "missing `clipboard` JSON text"))?;
     let text = payload_json(text)?;
     if text.len() > MAX_BYTES {
-        return Err(bad(COMMAND, "FigCraft clipboard exceeds 2 MiB"));
+        return Err(bad(COMMAND, "FigCraft clipboard exceeds 64 MiB"));
     }
     bounded_json(&text)?;
     let mut decoder = serde_json::Deserializer::from_str(&text);
@@ -150,16 +153,26 @@ fn paste(s: &mut Session, p: &Value) -> Result<Value> {
     let payload = Value::deserialize(&mut decoder).map_err(|e| bad(COMMAND, format!("invalid FigCraft clipboard JSON: {e}")))?;
     decoder.end().map_err(|e| bad(COMMAND, format!("invalid FigCraft clipboard JSON: {e}")))?;
     let object = payload.as_object().ok_or_else(|| bad(COMMAND, "clipboard must be an object"))?;
-    if object.keys().any(|key| !matches!(key.as_str(), "format" | "version" | "nodes" | "warnings")) {
-        return Err(bad(COMMAND, "clipboard accepts only format, version, nodes and warnings"));
+    if object.keys().any(|key| !matches!(key.as_str(), "format" | "version" | "nodes" | "warnings" | "assets")) {
+        return Err(bad(COMMAND, "clipboard accepts only format, version, nodes, warnings and assets"));
     }
-    if payload.get("format").and_then(Value::as_str) != Some("figcraft.clipboard") || payload.get("version").and_then(Value::as_u64) != Some(1) {
-        return Err(bad(COMMAND, "expected figcraft.clipboard version 1"));
+    if payload.get("format").and_then(Value::as_str) != Some("figcraft.clipboard") || !matches!(payload.get("version").and_then(Value::as_u64), Some(1 | 2)) {
+        return Err(bad(COMMAND, "expected figcraft.clipboard version 1 or 2"));
     }
-    validate_tree(&payload, 0, &mut 0, false)?;
+    if payload.get("version").and_then(Value::as_u64) == Some(1) && payload.get("assets").is_some() {
+        return Err(bad(COMMAND, "embedded assets require clipboard version 2"));
+    }
     let nodes =
         payload.get("nodes").and_then(Value::as_array).filter(|a| !a.is_empty()).ok_or_else(|| bad(COMMAND, "clipboard nodes must be a nonempty array"))?;
+    let mut count = 0;
+    for node in nodes {
+        validate_tree(node, 0, &mut count, false)?;
+    }
     validate_nodes(nodes, 0)?;
+    let mut nodes = nodes.clone();
+    let empty_assets = json!({});
+    let asset_value = if payload.get("version").and_then(Value::as_u64) == Some(2) { Some(payload.get("assets").unwrap_or(&empty_assets)) } else { None };
+    let images = assets::prepare(asset_value, &mut nodes)?;
     let mut warnings = match payload.get("warnings") {
         None => vec![],
         Some(Value::Array(values)) => {
@@ -182,7 +195,10 @@ fn paste(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad(COMMAND, "no composition is open"));
     }
     if all_frames && into.is_none() {
-        for node in nodes {
+        for node in &nodes {
+            if node.get("figcraft").and_then(Value::as_bool) == Some(true) {
+                continue;
+            }
             let name = node.get("name").and_then(Value::as_str).unwrap_or("Frame");
             let rounded = node.get("cornerRadius").and_then(Value::as_f64).is_some_and(|r| r > 0.0)
                 || node.get("rectangleCornerRadii").and_then(Value::as_array).is_some_and(|r| r.iter().any(|v| v.as_f64().is_some_and(|r| r > 0.0)));
@@ -201,7 +217,7 @@ fn paste(s: &mut Session, p: &Value) -> Result<Value> {
         Some(comp) => map::Target::ActiveComp { width: comp.width, height: comp.height },
         None => map::Target::NewComp,
     };
-    let mut plan = map::plan(nodes, &map::Options { target });
+    let mut plan = map::plan(&nodes, &map::Options { target });
     for comp in &mut plan.comps {
         if comp.figma_id.is_empty()
             && let Some(name) = comp.name.strip_suffix(" (Figma)")
@@ -213,13 +229,18 @@ fn paste(s: &mut Session, p: &Value) -> Result<Value> {
         *note = note.replace("stay in Figma (it became the composition)", "are not applied to the new composition");
     }
     warnings.append(&mut plan.notes);
-    warnings.extend(plan.rasters.iter().map(|r| format!("{}: omitted ({}); this paste keeps native editable layers only", r.name, r.reason)));
-    if plan.counts().0 == 0 {
+    warnings.extend(
+        plan.rasters
+            .iter()
+            .filter(|r| !images.contains_key(&r.node_id))
+            .map(|r| format!("{}: omitted ({}); this paste keeps native editable layers only", r.name, r.reason)),
+    );
+    if plan.counts().0 == 0 && !plan.rasters.iter().any(|r| images.contains_key(&r.node_id)) {
         return Err(bad(COMMAND, format!("clipboard has no supported native layers. {}", warnings.join("; "))));
     }
     plan.notes = warnings.clone();
-    // Empty images and no REST source guarantee the shared builder cannot read or fetch assets.
-    let source = Source { nodes: vec![], images: Default::default(), rest: None, label: "FigCraft".into() };
+    // Only generated base64 entries reach the shared builder; caller paths and URLs were rejected.
+    let source = Source { nodes: vec![], images, rest: None, label: format!("FigCraft-{}-{}", s.session_id, s.revision) };
     let (frame_rate, duration) = into.and_then(|id| s.project.comp(id)).map(|comp| (comp.frame_rate.as_f64(), comp.duration.seconds())).unwrap_or((30.0, 10.0));
     let settings = build::Settings { origin: "FigCraft", undo_label: "Paste from FigCraft", frame_rate, duration, into };
     let mut result = build::run(s, plan, &source, 1.0, &settings)?;
@@ -238,7 +259,7 @@ pub(super) fn spec() -> CommandSpec {
         menu: &[],
         shortcut: None,
         alt_shortcuts: &[],
-        params: "{clipboard (FigCraft SVG carrier up to 8 MiB, or version 1 JSON text up to 2 MiB), target?: auto|newComp|activeComp, comp?} → {comp, layers, native, warnings, notes}",
+        params: "{clipboard (FigCraft SVG carrier up to 128 MiB, or version 1/2 JSON text up to 64 MiB), target?: auto|newComp|activeComp, comp?} → {comp, layers, native, warnings, notes}",
         enabled: always,
         run: paste,
         journal: true,
@@ -376,7 +397,7 @@ mod tests {
     fn figcraft_paste_rejects_bad_envelopes_and_asset_inputs_atomically() {
         let mut s = Session::default();
         for payload in [
-            json!({"format":"figcraft.clipboard","version":2,"nodes":[rectangle()]}),
+            json!({"format":"figcraft.clipboard","version":3,"nodes":[rectangle()]}),
             json!({"format":"figcraft.clipboard","version":1,"nodes":[rectangle()],"images":{"rect":{"pdfPath":"/not/read"}}}),
             envelope(vec![json!({"id":"bad","type":"FRAME","children":"wrong"})]),
             envelope(vec![json!({"id":"bad","type":"RECTANGLE","url":"https://invalid.example/"})]),

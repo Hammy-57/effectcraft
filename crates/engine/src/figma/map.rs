@@ -63,6 +63,8 @@ pub enum PKind {
 #[derive(Clone, Debug)]
 pub struct Shadow {
     pub inner: bool,
+    pub blend: BlendMode,
+    pub show_behind: bool,
     pub color: [f64; 3],
     /// 0–100.
     pub opacity: f64,
@@ -99,6 +101,10 @@ pub struct PLayer {
     pub blur: Option<f64>,
     /// Layer masks in layer space (a clipping frame's rounded corners).
     pub masks: Vec<ShapePath>,
+    /// Original bitmap pixels already placed by their paint transform.
+    pub original_image: bool,
+    /// Pass-through frames draw children directly in the containing composition.
+    pub collapse: bool,
 }
 
 impl PLayer {
@@ -120,6 +126,8 @@ impl PLayer {
             shadows: vec![],
             blur: None,
             masks: vec![],
+            original_image: false,
+            collapse: false,
         }
     }
 }
@@ -155,6 +163,8 @@ pub enum Item {
     },
     GradientFill {
         radial: bool,
+        kind: u32,
+        width: Option<[f64; 2]>,
         start: [f64; 2],
         end: [f64; 2],
         gradient: Gradient,
@@ -170,7 +180,7 @@ pub enum Item {
 pub struct Stroke {
     /// Solid colour, or a gradient `(radial, start, end, gradient)`.
     pub color: [f64; 3],
-    pub gradient: Option<(bool, [f64; 2], [f64; 2], Gradient)>,
+    pub gradient: Option<GradientPaint>,
     pub opacity: f64,
     pub width: f64,
     /// 0 butt, 1 round, 2 projecting.
@@ -179,6 +189,15 @@ pub struct Stroke {
     pub join: u32,
     pub miter: f64,
     pub dash: Option<(f64, f64)>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GradientPaint {
+    pub kind: u32,
+    pub start: [f64; 2],
+    pub end: [f64; 2],
+    pub width: Option<[f64; 2]>,
+    pub gradient: Gradient,
 }
 
 /// A node that comes in as a rendered PNG.
@@ -354,7 +373,8 @@ fn children(n: &J) -> Vec<&J> {
 fn rect_of(v: Option<&J>) -> Option<Rect> {
     let v = v?;
     let (x, y, w, h) = (num(v, "x")?, num(v, "y")?, num(v, "width")?, num(v, "height")?);
-    Some(Rect::new(x, y, x + w.max(0.0), y + h.max(0.0)))
+    let rect = Rect::new(x, y, x + w.max(0.0), y + h.max(0.0));
+    [rect.x1, rect.y1, rect.width(), rect.height()].iter().all(|v| v.is_finite()).then_some(rect)
 }
 /// A Figma colour `{r, g, b, a}` (0–1).
 fn rgba(v: Option<&J>) -> [f64; 4] {
@@ -525,15 +545,21 @@ impl Mapper<'_> {
                         self.note(format!("{}: negative shadow spread is not supported (left at 0)", l.name));
                     }
                     let inner = t == "INNER_SHADOW";
-                    if l.shadows.iter().any(|s| s.inner == inner) {
-                        self.note(format!("{}: only the first {} is kept (one per layer style)", l.name, if inner { "inner shadow" } else { "drop shadow" }));
-                        continue;
-                    }
                     let mut angle = oy.atan2(-ox).to_degrees();
                     if ox == 0.0 && oy == 0.0 {
                         angle = 90.0;
                     }
-                    l.shadows.push(Shadow { inner, color: [c[0], c[1], c[2]], opacity: c[3] * 100.0, angle, distance: ox.hypot(oy), size, spread: spread_pct });
+                    l.shadows.push(Shadow {
+                        inner,
+                        blend: blend(e.get("blendMode").and_then(J::as_str)),
+                        show_behind: e.get("showBehind").and_then(J::as_bool).unwrap_or(false),
+                        color: [c[0], c[1], c[2]],
+                        opacity: c[3] * 100.0,
+                        angle,
+                        distance: ox.hypot(oy),
+                        size: size + spread.max(0.0),
+                        spread: spread_pct,
+                    });
                 }
                 "LAYER_BLUR" => l.blur = Some(num(e, "radius").unwrap_or(0.0).max(0.0)),
                 "BACKGROUND_BLUR" => self.note(format!("{}: background blur is not supported (skipped)", l.name)),
@@ -559,6 +585,89 @@ impl Mapper<'_> {
         self.push(comp, l).into_iter().collect()
     }
 
+    /// Original image fills remain footage, clipped by an editable native geometry matte.
+    fn image_paints(&mut self, comp: usize, n: &J, m: Affine) -> Vec<usize> {
+        let mut made = vec![];
+        for (index, paint) in paints(n, "fills").into_iter().enumerate() {
+            let mut geometry = n.clone();
+            geometry["strokes"] = json!([]);
+            geometry["fills"] = json!([if ty(paint) == "IMAGE" { json!({"type":"SOLID", "color":{"r":1,"g":1,"b":1,"a":1}}) } else { paint.clone() }]);
+            let contents = match shape_contents(&geometry) {
+                Ok(contents) => contents,
+                Err(why) => {
+                    self.note(format!("{}: {why}", name(n)));
+                    continue;
+                }
+            };
+            let mut shape = PLayer::new(&format!("{} Fill {}", name(n), index + 1), &id(n), PKind::Shape(contents));
+            let _ = Self::place(&mut shape, m, size_of(n));
+            if ty(paint) != "IMAGE" {
+                made.extend(self.push(comp, shape));
+                continue;
+            }
+            let (Some(reference), Some(transform), Some(dimensions)) =
+                (paint.get("imageRef").and_then(J::as_str), matrix(paint.get("figcraftImageTransform")), paint.get("figcraftImageSize").and_then(J::as_array))
+            else {
+                self.note(format!("{}: image paint has no validated asset or transform", name(n)));
+                continue;
+            };
+            let (Some(iw), Some(ih)) = (dimensions.first().and_then(J::as_f64), dimensions.get(1).and_then(J::as_f64)) else { continue };
+            let raster = self.plan.rasters.iter().position(|r| r.node_id == reference).unwrap_or_else(|| {
+                self.plan.rasters.push(Raster {
+                    node_id: reference.into(),
+                    name: reference.into(),
+                    width: iw,
+                    height: ih,
+                    reason: "original image fill".into(),
+                });
+                self.plan.rasters.len() - 1
+            });
+            shape.name = format!("{} Image Mask {}", name(n), index + 1);
+            shape.is_matte = true;
+            let Some(mask) = self.push(comp, shape) else { continue };
+            let mut image = PLayer::new(&format!("{} Image {}", name(n), index + 1), &id(n), PKind::Raster(raster));
+            if let Some(note) = Self::place(&mut image, m * transform, [iw, ih]) {
+                self.note(note);
+            }
+            image.original_image = true;
+            image.opacity = num(paint, "opacity").unwrap_or(1.0).clamp(0.0, 1.0) * 100.0;
+            image.blend = blend(paint.get("blendMode").and_then(J::as_str));
+            image.matte = Some((mask, MatteKind::Alpha));
+            made.push(mask);
+            made.extend(self.push(comp, image));
+        }
+        if !paints(n, "strokes").is_empty() {
+            if paints(n, "strokes").iter().any(|p| ty(p) == "IMAGE") {
+                self.note(format!("{}: image stroke is not supported; image fills remain editable", name(n)));
+            }
+            let mut strokes = n.clone();
+            strokes["fills"] = json!([]);
+            if let Ok(contents) = shape_contents(&strokes) {
+                let mut layer = PLayer::new(&format!("{} Stroke", name(n)), &id(n), PKind::Shape(contents));
+                let _ = Self::place(&mut layer, m, size_of(n));
+                made.extend(self.push(comp, layer));
+            }
+        }
+        made
+    }
+
+    fn image_node(&mut self, comp: usize, n: &J, w: Affine, space: Space, depth: usize) -> Vec<usize> {
+        let [width, height] = size_of(n);
+        let bounds = aabb(w.inverse(), render_bounds(n, w)).union(Rect::new(0.0, 0.0, width, height));
+        let bounds = Rect::new(bounds.x0.floor(), bounds.y0.floor(), bounds.x1.ceil(), bounds.y1.ceil());
+        let inner = self.new_comp(&name(n), &id(n), bounds.width(), bounds.height());
+        let shift = Affine::translate((-bounds.x0, -bounds.y0));
+        self.image_paints(inner, n, shift);
+        self.children(inner, n, linear(w), Space { from_world: shift * w.inverse() }, None, depth + 1);
+        let mut layer = PLayer::new(&name(n), &id(n), PKind::Precomp(inner));
+        if let Some(note) = Self::place(&mut layer, space.from_world * w, [width, height]) {
+            self.note(note);
+        }
+        layer.anchor = [width / 2.0 - bounds.x0, height / 2.0 - bounds.y0];
+        self.common(&mut layer, n);
+        self.push(comp, layer).into_iter().collect()
+    }
+
     /// Map `n` (with container linear part `parent_lin`) into `comp`. Returns every layer made
     /// (the node's own and, for flattened groups, its descendants').
     fn node(&mut self, comp: usize, n: &J, parent_lin: Affine, space: Space, parent: Option<usize>, depth: usize) -> Vec<usize> {
@@ -577,6 +686,13 @@ impl Mapper<'_> {
         let t = ty(n);
         let made = match t {
             "SLICE" => vec![],
+            _ if has_image_paint(n) && n.get("figcraft").and_then(J::as_bool) == Some(true) => {
+                if matches!(t, "FRAME" | "COMPONENT" | "COMPONENT_SET" | "INSTANCE" | "SECTION") {
+                    self.frame(comp, n, w, space, depth)
+                } else {
+                    self.image_node(comp, n, w, space, depth)
+                }
+            }
             _ if has_image_paint(n) => self.raster(comp, n, w, space, "image fill"),
             "FRAME" | "COMPONENT" | "COMPONENT_SET" | "INSTANCE" | "SECTION" => self.frame(comp, n, w, space, depth),
             "GROUP" => self.group(comp, n, w, parent_lin, space, depth),
@@ -666,6 +782,9 @@ impl Mapper<'_> {
 
     /// A background shape layer for a frame's fills / strokes (node space → comp via `m`).
     fn frame_background(&mut self, comp: usize, n: &J, m: Affine) -> Option<usize> {
+        if has_image_paint(n) && n.get("figcraft").and_then(J::as_bool) == Some(true) {
+            return self.image_paints(comp, n, m).first().copied();
+        }
         if paints(n, "fills").is_empty() && (paints(n, "strokes").is_empty() || num(n, "strokeWeight").unwrap_or(0.0) <= 0.0) {
             return None;
         }
@@ -677,6 +796,15 @@ impl Mapper<'_> {
 
     /// A frame as the root of a new composition (frame size → comp size).
     fn root_frame(&mut self, n: &J) -> usize {
+        if n.get("figcraft").and_then(J::as_bool) == Some(true) {
+            let w = world(n, Affine::IDENTITY);
+            let [fw, fh] = size_of(n);
+            let bounds = render_bounds(n, w).union(aabb(w, Rect::new(0.0, 0.0, fw, fh)));
+            let comp = self.new_comp(&name(n), &id(n), bounds.width(), bounds.height());
+            let space = Space { from_world: Affine::translate((-bounds.x0, -bounds.y0)) };
+            self.frame(comp, n, w, space, 0);
+            return comp;
+        }
         let [fw, fh] = size_of(n);
         let comp = self.new_comp(&name(n), &id(n), fw, fh);
         let w = world(n, Affine::IDENTITY);
@@ -715,6 +843,11 @@ impl Mapper<'_> {
         // Layer space is the precomp's pixels: the frame's centre sits at -bounds.origin + centre.
         l.anchor = [fw / 2.0 - bounds.x0, fh / 2.0 - bounds.y0];
         self.common(&mut l, n);
+        l.collapse = n.get("figcraft").and_then(J::as_bool) == Some(true)
+            && n.get("blendMode").and_then(J::as_str) == Some("PASS_THROUGH")
+            && l.opacity == 100.0
+            && !clips
+            && !n.get("effects").and_then(J::as_array).is_some_and(|effects| effects.iter().any(visible));
         if clips && let Some(r) = corner_radii(n).filter(|r| r.iter().any(|x| *x > 0.0)) {
             l.masks.extend(effectcraft_path::from_kurbo(&rounded_rect([fw, fh], r)));
         }
@@ -769,7 +902,10 @@ impl Mapper<'_> {
 pub fn plan(roots: &[J], opts: &Options) -> Plan {
     let mut plan = Plan { name: roots.first().map(name).unwrap_or_default(), ..Default::default() };
     let mut m = Mapper { plan: &mut plan, nodes: 0 };
-    let frame_like = |n: &J| matches!(ty(n), "FRAME" | "COMPONENT" | "COMPONENT_SET" | "INSTANCE" | "SECTION") && !has_image_paint(n);
+    let frame_like = |n: &J| {
+        matches!(ty(n), "FRAME" | "COMPONENT" | "COMPONENT_SET" | "INSTANCE" | "SECTION")
+            && (!has_image_paint(n) || n.get("figcraft").and_then(J::as_bool) == Some(true))
+    };
     match opts.target {
         Target::NewComp if roots.iter().all(frame_like) => {
             for r in roots {
@@ -957,12 +1093,15 @@ fn geometry(n: &J) -> Result<(Geom, bool), String> {
     }
 }
 
-fn gradient(p: &J, size: [f64; 2]) -> Option<(bool, [f64; 2], [f64; 2], Gradient)> {
-    let radial = match ty(p) {
-        "GRADIENT_LINEAR" => false,
-        "GRADIENT_RADIAL" | "GRADIENT_ANGULAR" | "GRADIENT_DIAMOND" => true,
+fn gradient(p: &J, size: [f64; 2]) -> Option<GradientPaint> {
+    let kind = match ty(p) {
+        "GRADIENT_LINEAR" => 0,
+        "GRADIENT_RADIAL" => 1,
+        "GRADIENT_ANGULAR" => 2,
+        "GRADIENT_DIAMOND" => 3,
         _ => return None,
     };
+    let radial = kind != 0;
     let h = p.get("gradientHandlePositions").and_then(J::as_array);
     let pt = |i: usize, d: [f64; 2]| {
         let v = h.and_then(|h| h.get(i));
@@ -1002,7 +1141,8 @@ fn gradient(p: &J, size: [f64; 2]) -> Option<(bool, [f64; 2], [f64; 2], Gradient
         opacities: stops.iter().map(|(o, c)| (*o, c[3] as f32)).collect(),
         ..Default::default()
     };
-    Some((radial, a, b, g))
+    let width = (radial && h.is_some_and(|h| h.len() >= 3)).then(|| pt(2, [0.5, 1.0]));
+    Some(GradientPaint { kind, start: a, end: b, width, gradient: g })
 }
 
 fn fill_items(n: &J, size: [f64; 2], even_odd: bool) -> Vec<Item> {
@@ -1017,7 +1157,16 @@ fn fill_items(n: &J, size: [f64; 2], even_odd: bool) -> Vec<Item> {
                     let c = rgba(p.get("color"));
                     Some(Item::Fill { color: [c[0], c[1], c[2]], opacity: op * c[3] * 100.0, even_odd })
                 }
-                _ => gradient(p, size).map(|(radial, start, end, gradient)| Item::GradientFill { radial, start, end, gradient, opacity: op * 100.0, even_odd }),
+                _ => gradient(p, size).map(|g| Item::GradientFill {
+                    radial: g.kind != 0,
+                    kind: g.kind,
+                    width: g.width,
+                    start: g.start,
+                    end: g.end,
+                    gradient: g.gradient,
+                    opacity: op * 100.0,
+                    even_odd,
+                }),
             }
         })
         .collect()
@@ -1271,5 +1420,11 @@ pub fn text_doc(n: &J) -> (TextDoc, Vec<String>) {
     }
     doc.box_pos = [bx, by];
     doc.box_size = Some([(w + slack).max(1.0), (h + size * 2.0).max(1.0)]);
+    if let Some(baseline) = num(n, "figcraftTextBaseline") {
+        doc.box_pos[1] = 0.0;
+        if let Some(first) = effectcraft_text::layout_doc(&doc).line_boxes.first() {
+            doc.box_pos[1] = baseline - first[1];
+        }
+    }
     (doc, notes)
 }
