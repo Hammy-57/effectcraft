@@ -1808,6 +1808,9 @@ mod tests {
         for (time, side, speed) in [(0.0, "out", 500.0), (2.0, "in", -500.0)] {
             app.session.execute("keys.setEase", json!({"layer": layer.0, "prop": uid, "time": time, "side": side, "speed": speed, "influence": 50.0})).unwrap();
         }
+        // New keys are selected and a selected key shows its (far out) handles in the fit; this
+        // test is about the curve extrema, so leave the keys unselected.
+        app.session.state.selected_keys.clear();
         let project = app.session.project.clone();
         let expr = app.session.expr.clone();
         let comp = project.comp(app.session.active_comp_id().unwrap()).unwrap();

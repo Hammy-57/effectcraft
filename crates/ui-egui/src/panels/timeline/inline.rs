@@ -889,7 +889,11 @@ mod tests {
         let undo = app.session.history.undo.len();
         crate::menus::invoke(&mut app, &ctx, "edit.paste", json!({})).unwrap();
         assert_eq!(app.session.history.undo.len(), undo + 1);
-        assert!(app.session.project.comp(child).unwrap().layers.iter().any(|l| l.name == "Imported"));
+        // A pasted frame becomes a precomp layer holding the frame's children.
+        let project = &app.session.project;
+        let card = project.comp(child).unwrap().layers.iter().find(|l| l.name == "Card").expect("the pasted frame is a layer of the inline source");
+        let effectcraft_project::LayerSource::Comp { item } = card.source else { panic!("a pasted frame is a precomp layer") };
+        assert!(project.comp(item).unwrap().layers.iter().any(|l| l.name == "Imported"));
         assert_eq!(app.session.project.comp(root).unwrap().layers.len(), 2);
         assert_eq!(app.session.state.open_comps, open);
         assert_eq!(app.session.active_comp_id(), Some(root));
@@ -979,7 +983,7 @@ mod tests {
         app.ui.timeline.start = 2.0;
         app.ui.timeline.pps = Some(123.0);
         let ctx = egui::Context::default();
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
             let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 400.0));
             let p = ui.painter().clone();
             let layout = show_graph(&mut app, ui, &p, rect).unwrap();
@@ -988,6 +992,7 @@ mod tests {
             assert!(app.auto.find("timeline.graph").is_some());
             finish_graph(&mut app, layout);
         });
+        out.textures_delta.clear();
         assert_eq!(app.session.active_comp_id(), Some(root));
         assert_eq!(app.ui.timeline.start, 2.0);
         assert_eq!(app.ui.timeline.pps, Some(123.0));
