@@ -488,17 +488,18 @@ pub(crate) fn import_items(im: &mut Im, ids: &mut Ids, items: &[Json]) -> Vec<Pr
                 set(im, &mut g, "opacity", j.get("o"), &anim::to_scalar);
                 set(im, &mut g, "start", j.get("s"), &anim::to_vec2);
                 set(im, &mut g, "end", j.get("e"), &anim::to_vec2);
-                // The inactive affine handle follows the imported endpoints, just as in the
-                // native builder; it must not retain the placeholder gradient's geometry.
-                let start = g.get("start").map(|p| p.value.as_vec2()).unwrap_or([0.0; 2]);
-                let end = g.get("end").map(|p| p.value.as_vec2()).unwrap_or([100.0, 0.0]);
-                let width_point = [start[0] - (end[1] - start[1]), start[1] + (end[0] - start[0])];
-                if width_point.iter().all(|v| v.is_finite()) {
-                    if let Some(width) = g.get_mut("widthPoint") {
-                        width.value = Value::Vec2(width_point);
+                // Lottie has no width point: derive the inactive handle from its first-frame endpoints.
+                if let (Some(Value::Vec2(start)), Some(Value::Vec2(end))) =
+                    (g.get("start").map(|p| p.value_at(effectcraft_time::Tick::ZERO)), g.get("end").map(|p| p.value_at(effectcraft_time::Tick::ZERO)))
+                {
+                    let width_point = [start[0] - (end[1] - start[1]), start[1] + (end[0] - start[0])];
+                    if width_point.iter().all(|v| v.is_finite()) {
+                        if let Some(width) = g.get_mut("widthPoint") {
+                            width.value = Value::Vec2(width_point);
+                        }
+                    } else {
+                        im.warn("Gradient endpoints overflowed the inactive width handle; its default was kept");
                     }
-                } else {
-                    im.warn("Gradient endpoints overflowed the inactive width handle; its default was kept");
                 }
                 set(im, &mut g, "highlightLength", j.get("h"), &anim::to_scalar);
                 set(im, &mut g, "highlightAngle", j.get("a"), &anim::to_scalar);

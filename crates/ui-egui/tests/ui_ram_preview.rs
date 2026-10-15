@@ -131,30 +131,65 @@ fn prefetch_waits_while_edits_keep_coming() {
 /// Fast frames still prefetch.
 #[test]
 fn slow_frames_stop_paused_prefetch() {
-    let mut s = Session::default();
-    let c = s.execute("comp.new", json!({"name": "Slow", "width": 64, "height": 36, "duration": 2})).unwrap()["comp"].as_u64().unwrap();
-    s.execute("layer.newSolid", json!({"color": "#3080ff"})).unwrap();
+    use effectcraft_engine::project::{Footage, FootageKind, ItemKind};
+    use effectcraft_render::{FootageSource, Image};
+    use effectcraft_time::{FrameRate, Tick};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    struct Delayed(Arc<AtomicBool>);
+    impl FootageSource for Delayed {
+        fn frame(&self, _: ItemId, _: &Footage, _: Tick) -> Option<Arc<Image>> {
+            if self.0.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            Some(Arc::new(Image::filled(64, 36, [0.1, 0.3, 0.8, 1.0])))
+        }
+    }
+    // Use genuinely slow frames instead of racing the worker's timing updates by repeatedly
+    // overwriting last_ms. A late fast frame could previously turn prefetch back on mid-step.
+    let slow = Arc::new(AtomicBool::new(true));
+    let mut s = Session { footage: Arc::new(Delayed(slow.clone())), ..Default::default() };
+    s.prefs.disk.disk_cache_enabled = false;
+    let c = s.execute("comp.new", json!({"name": "Slow", "width": 64, "height": 36, "duration": 2, "frameRate": 30})).unwrap()["comp"].as_u64().unwrap();
+    let project = Arc::make_mut(&mut s.project);
+    project.settings.gpu_acceleration = false;
+    let footage = project.add_item(
+        "Delayed",
+        Default::default(),
+        None,
+        ItemKind::Footage(Footage {
+            kind: FootageKind::Video,
+            path: "preview-test.mov".into(),
+            width: 64,
+            height: 36,
+            frame_rate: FrameRate::FPS_30,
+            duration: Tick::from_seconds_f64(2.0),
+            has_video: true,
+            ..Default::default()
+        }),
+    );
+    s.execute("layer.addItem", json!({"item": footage.0})).unwrap();
     let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(|_| EffectcraftApp::new(s));
     settle(&mut h);
     let series = h.state().shown_series(ItemId(c));
-    h.state().frames.clear();
-    // Every frame takes 2 s (set before each UI frame, as the fast test render replaces it).
-    let slow_step = |h: &mut Harness<'_, EffectcraftApp>, ms: f64| {
-        if let Ok(mut v) = h.state().frames.last_ms.lock() {
-            *v = ms;
-        }
+    for _ in 0..60 {
         h.step();
         std::thread::sleep(std::time::Duration::from_millis(10));
-    };
-    for _ in 0..60 {
-        slow_step(&mut h, 2000.0);
     }
     assert_eq!(h.state().frames.cached_frames(&series), vec![0], "only the frame on screen");
+    slow.store(false, Ordering::Relaxed);
+    // Request an uncached frame so the renderer measures the now-fast source itself.
+    h.state_mut().session.set_time(Tick::from_units(1, 30));
+    settle(&mut h);
     for _ in 0..20 {
-        slow_step(&mut h, 5.0);
+        h.step();
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
     settle(&mut h);
-    assert!(h.state().frames.cached_frames(&series).len() > 1, "fast frames prefetch again");
+    assert!(h.state().frames.cached_frames(&series).iter().any(|f| *f > 1), "fast frames prefetch beyond the requested frame again");
 }
 
 /// #595: at Third (and other resolutions that aren't a whole number of thousandths) the cache

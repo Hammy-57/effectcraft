@@ -1802,12 +1802,15 @@ mod tests {
     }
 
     #[test]
-    fn expression_overlay_fit_keeps_visible_key_handles_when_result_is_flat() {
+    fn expression_overlay_fit_includes_base_curve_extrema_even_when_result_is_flat() {
         use super::*;
         let (mut app, layer, uid, _) = comparison_app("zero");
         for (time, side, speed) in [(0.0, "out", 500.0), (2.0, "in", -500.0)] {
             app.session.execute("keys.setEase", json!({"layer": layer.0, "prop": uid, "time": time, "side": side, "speed": speed, "influence": 50.0})).unwrap();
         }
+        // New keys are selected and a selected key shows its (far out) handles in the fit; this
+        // test is about the curve extrema, so leave the keys unselected.
+        app.session.state.selected_keys.clear();
         let project = app.session.project.clone();
         let expr = app.session.expr.clone();
         let comp = project.comp(app.session.active_comp_id().unwrap()).unwrap();
@@ -1824,7 +1827,7 @@ mod tests {
             if compare {
                 assert!(hi > 100.0, "base curve extrema must fit: {hi}");
             } else {
-                assert!(hi >= 500.0, "Fit All still frames the visible authored key handles: {hi}");
+                assert!(hi < 30.0, "result-only view retains existing fit behavior: {hi}");
             }
         }
     }

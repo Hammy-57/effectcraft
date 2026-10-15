@@ -25,7 +25,7 @@ pub(super) fn expander(app: &mut EffectcraftApp, ui: &mut egui::Ui, root: ItemId
     let key = instance_key(root, &child_path);
     let open = app.ui.timeline.inline_precomps.contains(&key);
     let resp = widgets::twirl(ui, rect, open, egui::Id::new(("inline-precomp", &key)), &app.tokens)
-        .on_hover_text("Expand this composition's layers inline (edits affect every instance)");
+        .on_hover_text(tr("Expand this composition's layers inline (edits affect every instance)"));
     app.auto.add(&format!("timeline.inline.{}.expand", key.iter().map(u64::to_string).collect::<Vec<_>>().join(".")), rect, "Expand nested composition");
     if resp.clicked() {
         if open {
@@ -190,8 +190,8 @@ pub(super) fn show(
                 local.push(("layer.select".into(), json!({"layers":[layer.id.0],"toggle":ui.input(|i|i.modifiers.command || i.modifiers.shift)})));
             }
             response.context_menu(|ui| {
-                ui.label("Shared source layer");
-                if ui.button("Open source composition").clicked() {
+                ui.label(tr("Shared source layer"));
+                if ui.button(tr("Open source composition")).clicked() {
                     local.push(("comp.open".into(), json!({"comp":n.context.comp.0})));
                     ui.close();
                 }
@@ -306,12 +306,12 @@ pub(super) fn show(
                 local.push(("prop.select".into(), json!({"layer":layer.id.0,"prop":uid,"add":ui.input(|i|i.modifiers.shift)})));
             }
             name_response.context_menu(|ui| {
-                if ui.button("Open source composition").clicked() {
+                if ui.button(tr("Open source composition")).clicked() {
                     local.push(("comp.open".into(), json!({"comp":n.context.comp.0})));
                     ui.close();
                 }
                 if !prop.static_only {
-                    ui.label("Expression");
+                    ui.label(tr("Expression"));
                     let buffer = id.with("expression-buffer");
                     let mut text =
                         ui.ctx().data(|d| d.get_temp::<String>(buffer)).unwrap_or_else(|| prop.expr.as_ref().map(|e| e.text.clone()).unwrap_or_default());
@@ -320,7 +320,7 @@ pub(super) fn show(
                     if response.changed() {
                         ui.ctx().data_mut(|d| d.insert_temp(buffer, text.clone()));
                     }
-                    let apply = ui.add_enabled(!locked, egui::Button::new("Apply expression"));
+                    let apply = ui.add_enabled(!locked, egui::Button::new(tr("Apply expression")));
                     app.auto.add(&format!("{prefix}.prop.{uid}.applyExpression"), apply.rect, "Apply expression");
                     if apply.clicked() {
                         local.push(("prop.setExpression".into(), json!({"layer":layer.id.0,"prop":uid,"expression":text})));
@@ -889,11 +889,11 @@ mod tests {
         let undo = app.session.history.undo.len();
         crate::menus::invoke(&mut app, &ctx, "edit.paste", json!({})).unwrap();
         assert_eq!(app.session.history.undo.len(), undo + 1);
-        // Native frame transfer now keeps the Card as an editable precomp instead of
-        // flattening its children. It belongs to the inline source, never a new viewer.
-        let card = app.session.project.comp(child).unwrap().layers.iter().find(|l| l.name == "Card").expect("frame pasted into inline source");
-        let LayerSource::Comp { item } = card.source else { panic!("frame lost its editable composition") };
-        assert!(app.session.project.comp(item).unwrap().layers.iter().any(|l| l.name == "Imported"));
+        // A pasted frame becomes a precomp layer holding the frame's children.
+        let project = &app.session.project;
+        let card = project.comp(child).unwrap().layers.iter().find(|l| l.name == "Card").expect("the pasted frame is a layer of the inline source");
+        let effectcraft_project::LayerSource::Comp { item } = card.source else { panic!("a pasted frame is a precomp layer") };
+        assert!(project.comp(item).unwrap().layers.iter().any(|l| l.name == "Imported"));
         assert_eq!(app.session.project.comp(root).unwrap().layers.len(), 2);
         assert_eq!(app.session.state.open_comps, open);
         assert_eq!(app.session.active_comp_id(), Some(root));
@@ -983,7 +983,7 @@ mod tests {
         app.ui.timeline.start = 2.0;
         app.ui.timeline.pps = Some(123.0);
         let ctx = egui::Context::default();
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
             let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 400.0));
             let p = ui.painter().clone();
             let layout = show_graph(&mut app, ui, &p, rect).unwrap();
@@ -992,6 +992,7 @@ mod tests {
             assert!(app.auto.find("timeline.graph").is_some());
             finish_graph(&mut app, layout);
         });
+        out.textures_delta.clear();
         assert_eq!(app.session.active_comp_id(), Some(root));
         assert_eq!(app.ui.timeline.start, 2.0);
         assert_eq!(app.ui.timeline.pps, Some(123.0));
