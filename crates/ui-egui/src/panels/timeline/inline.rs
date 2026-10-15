@@ -25,7 +25,7 @@ pub(super) fn expander(app: &mut EffectcraftApp, ui: &mut egui::Ui, root: ItemId
     let key = instance_key(root, &child_path);
     let open = app.ui.timeline.inline_precomps.contains(&key);
     let resp = widgets::twirl(ui, rect, open, egui::Id::new(("inline-precomp", &key)), &app.tokens)
-        .on_hover_text("Expand this composition's layers inline (edits affect every instance)");
+        .on_hover_text(tr("Expand this composition's layers inline (edits affect every instance)"));
     app.auto.add(&format!("timeline.inline.{}.expand", key.iter().map(u64::to_string).collect::<Vec<_>>().join(".")), rect, "Expand nested composition");
     if resp.clicked() {
         if open {
@@ -190,8 +190,8 @@ pub(super) fn show(
                 local.push(("layer.select".into(), json!({"layers":[layer.id.0],"toggle":ui.input(|i|i.modifiers.command || i.modifiers.shift)})));
             }
             response.context_menu(|ui| {
-                ui.label("Shared source layer");
-                if ui.button("Open source composition").clicked() {
+                ui.label(tr("Shared source layer"));
+                if ui.button(tr("Open source composition")).clicked() {
                     local.push(("comp.open".into(), json!({"comp":n.context.comp.0})));
                     ui.close();
                 }
@@ -306,12 +306,12 @@ pub(super) fn show(
                 local.push(("prop.select".into(), json!({"layer":layer.id.0,"prop":uid,"add":ui.input(|i|i.modifiers.shift)})));
             }
             name_response.context_menu(|ui| {
-                if ui.button("Open source composition").clicked() {
+                if ui.button(tr("Open source composition")).clicked() {
                     local.push(("comp.open".into(), json!({"comp":n.context.comp.0})));
                     ui.close();
                 }
                 if !prop.static_only {
-                    ui.label("Expression");
+                    ui.label(tr("Expression"));
                     let buffer = id.with("expression-buffer");
                     let mut text =
                         ui.ctx().data(|d| d.get_temp::<String>(buffer)).unwrap_or_else(|| prop.expr.as_ref().map(|e| e.text.clone()).unwrap_or_default());
@@ -320,7 +320,7 @@ pub(super) fn show(
                     if response.changed() {
                         ui.ctx().data_mut(|d| d.insert_temp(buffer, text.clone()));
                     }
-                    let apply = ui.add_enabled(!locked, egui::Button::new("Apply expression"));
+                    let apply = ui.add_enabled(!locked, egui::Button::new(tr("Apply expression")));
                     app.auto.add(&format!("{prefix}.prop.{uid}.applyExpression"), apply.rect, "Apply expression");
                     if apply.clicked() {
                         local.push(("prop.setExpression".into(), json!({"layer":layer.id.0,"prop":uid,"expression":text})));

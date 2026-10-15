@@ -88,6 +88,14 @@ pub(crate) fn tr_args(text: &str, args: &[&dyn Display]) -> String {
 /// Japanese: the same rows, in the same order, as the Chinese catalogs below (the tests keep the two in step).
 const JAPANESE: &[(&str, &str)] = &[
     ("Invalid nested keyframe time", "ネストされたキーフレームの時刻が無効です"),
+    (
+        "Expand this composition's layers inline (edits affect every instance)",
+        "このコンポジションのレイヤーをインラインで展開（編集はすべてのインスタンスに反映されます）",
+    ),
+    ("Shared source layer", "共有ソースレイヤー"),
+    ("Open source composition", "ソースコンポジションを開く"),
+    ("Apply expression", "エクスプレッションを適用"),
+    ("Expression", "エクスプレッション"),
     ("Source graph: {} · {} s", "ソースのグラフ: {} · {} 秒"),
     (
         "Use the parent ruler to scrub a time-remapped instance; source keys remain editable.",
@@ -652,6 +660,11 @@ const JAPANESE: &[(&str, &str)] = &[
 
 const SIMPLIFIED_CHINESE: &[(&str, &str)] = &[
     ("Invalid nested keyframe time", "嵌套关键帧时间无效"),
+    ("Expand this composition's layers inline (edits affect every instance)", "在行内展开此合成的图层（编辑会影响每个实例）"),
+    ("Shared source layer", "共享源图层"),
+    ("Open source composition", "打开源合成"),
+    ("Apply expression", "应用表达式"),
+    ("Expression", "表达式"),
     ("Source graph: {} · {} s", "源图表：{} · {} 秒"),
     ("Use the parent ruler to scrub a time-remapped instance; source keys remain editable.", "请使用父级标尺拖动时间重映射实例；源关键帧仍可编辑。"),
     ("This action needs the source composition open; the parent was not changed.", "此操作需要打开源合成；父合成未更改。"),
@@ -1416,6 +1429,11 @@ const SIMPLIFIED_CHINESE: &[(&str, &str)] = &[
 
 const TRADITIONAL_CHINESE: &[(&str, &str)] = &[
     ("Invalid nested keyframe time", "巢狀關鍵影格時間無效"),
+    ("Expand this composition's layers inline (edits affect every instance)", "在行內展開此合成的圖層（編輯會影響每個實例）"),
+    ("Shared source layer", "共用來源圖層"),
+    ("Open source composition", "開啟來源合成"),
+    ("Apply expression", "套用表達式"),
+    ("Expression", "表達式"),
     ("Source graph: {} · {} s", "來源圖表：{} · {} 秒"),
     ("Use the parent ruler to scrub a time-remapped instance; source keys remain editable.", "請使用父層尺規拖曳時間重新對應實例；來源關鍵影格仍可編輯。"),
     ("This action needs the source composition open; the parent was not changed.", "此操作需要開啟來源合成；父合成未變更。"),
@@ -2177,6 +2195,11 @@ const TRADITIONAL_CHINESE: &[(&str, &str)] = &[
 /// Technical names, key names and substituted project content keep their original spelling.
 const UKRAINIAN: &[(&str, &str)] = &[
     ("Invalid nested keyframe time", "Некоректний час вкладеного ключового кадру"),
+    ("Expand this composition's layers inline (edits affect every instance)", "Розгорнути шари цієї композиції в рядку (зміни впливають на кожен екземпляр)"),
+    ("Shared source layer", "Спільний вихідний шар"),
+    ("Open source composition", "Відкрити вихідну композицію"),
+    ("Apply expression", "Застосувати вираз"),
+    ("Expression", "Вираз"),
     ("Source graph: {} · {} s", "Графік джерела: {} · {} с"),
     (
         "Use the parent ruler to scrub a time-remapped instance; source keys remain editable.",
@@ -2757,6 +2780,14 @@ const UKRAINIAN: &[(&str, &str)] = &[
 // Brazilian Portuguese.
 const PORTUGUESE: &[(&str, &str)] = &[
     ("Invalid nested keyframe time", "Tempo de quadro-chave aninhado inválido"),
+    (
+        "Expand this composition's layers inline (edits affect every instance)",
+        "Expandir as camadas desta composição na linha (as edições afetam todas as instâncias)",
+    ),
+    ("Shared source layer", "Camada de origem compartilhada"),
+    ("Open source composition", "Abrir composição de origem"),
+    ("Apply expression", "Aplicar expressão"),
+    ("Expression", "Expressão"),
     ("Source graph: {} · {} s", "Gráfico de origem: {} · {} s"),
     (
         "Use the parent ruler to scrub a time-remapped instance; source keys remain editable.",
@@ -3214,6 +3245,11 @@ const PORTUGUESE: &[(&str, &str)] = &[
 /// Czech (cs): original translations covering every row in the Chinese panel catalogs.
 const CZECH: &[(&str, &str)] = &[
     ("Invalid nested keyframe time", "Neplatný čas vnořeného klíčového snímku"),
+    ("Expand this composition's layers inline (edits affect every instance)", "Rozbalit vrstvy této kompozice v řádku (úpravy ovlivní každou instanci)"),
+    ("Shared source layer", "Sdílená zdrojová vrstva"),
+    ("Open source composition", "Otevřít zdrojovou kompozici"),
+    ("Apply expression", "Použít výraz"),
+    ("Expression", "Výraz"),
     ("Source graph: {} · {} s", "Graf zdroje: {} · {} s"),
     (
         "Use the parent ruler to scrub a time-remapped instance; source keys remain editable.",
@@ -3774,6 +3810,14 @@ const CZECH: &[(&str, &str)] = &[
 /// ajuste preestablecido, método abreviado). Written from the English source.
 const SPANISH: &[(&str, &str)] = &[
     ("Invalid nested keyframe time", "Tiempo de fotograma clave anidado no válido"),
+    (
+        "Expand this composition's layers inline (edits affect every instance)",
+        "Expandir las capas de esta composición en línea (las ediciones afectan a todas las instancias)",
+    ),
+    ("Shared source layer", "Capa de origen compartida"),
+    ("Open source composition", "Abrir composición de origen"),
+    ("Apply expression", "Aplicar expresión"),
+    ("Expression", "Expresión"),
     ("Source graph: {} · {} s", "Gráfico de origen: {} · {} s"),
     (
         "Use the parent ruler to scrub a time-remapped instance; source keys remain editable.",
