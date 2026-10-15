@@ -47,6 +47,10 @@ decode, 32 MiB encoded-file bytes per image, 16,384 pixels per side, 64M pixels 
 validation limits, not a promise about the application's total memory use. Caller-supplied file
 paths, fragment references and URL fetch inputs remain forbidden.
 
+Automation sessions with file-access confinement reject `edit.pasteFigCraft`: checking only the
+project path cannot safely confine bitmap writes through a sibling asset-directory symlink.
+Ordinary desktop clipboard paste is unaffected.
+
 
 ## Verification (14 October 2026)
 
