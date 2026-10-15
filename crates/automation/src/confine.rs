@@ -30,6 +30,9 @@ pub struct Confinement {
 
 /// Commands that run code, act outside the project or open other applications.
 const REFUSED: &[&str] = &[
+    // Project/proxy dependencies are implicit reads. A destination check alone cannot confine
+    // them, and a separate bridge lookup could race another editor changing the document.
+    "file.collectFiles",
     "script.run",
     "file.runScript",
     "file.installScript",
@@ -282,5 +285,29 @@ fn resolve(p: &Path) -> Option<PathBuf> {
         }
         rest.push(at.file_name()?.to_os_string());
         at = at.parent()?;
+    }
+}
+
+#[cfg(test)]
+mod collection_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn collection_cannot_copy_implicit_sources_outside_read_roots() {
+        let output = std::env::temp_dir().canonicalize().unwrap();
+        let confinement = Confinement::new(&[], std::slice::from_ref(&output)).unwrap();
+        let params = json!({"folder": output.join("collected")});
+        assert!(confinement.check_command("file.collectFiles", &params).is_err());
+        assert!(
+            confinement
+                .check_command(
+                    "engine.batch",
+                    &json!({"steps": [
+                        {"command": "file.collectFiles", "params": params}
+                    ]})
+                )
+                .is_err()
+        );
     }
 }

@@ -402,55 +402,6 @@ fn find_missing(s: &mut Session, p: &Value) -> Result<Value> {
     }
 }
 
-fn collect_files(s: &mut Session, p: &Value) -> Result<Value> {
-    let folder = str_p(p, "folder").ok_or_else(|| bad("file.collectFiles", "missing `folder`"))?.trim_end_matches('/').to_string();
-    // Collect Files makes its folder (and the footage folder inside it).
-    #[cfg(not(target_arch = "wasm32"))]
-    std::fs::create_dir_all(format!("{folder}/(Footage)")).map_err(|e| EngineError::Other(format!("cannot create {folder}: {e}")))?;
-    let mut proj = (*s.project).clone();
-    let mut copied = 0;
-    let mut errors = vec![];
-    let mut used_names = BTreeSet::new();
-    for it in proj.items.values_mut() {
-        let ItemKind::Footage(f) = &mut it.kind else { continue };
-        if f.path.is_empty() {
-            continue;
-        }
-        let files: Vec<String> = if f.sequence.is_empty() { vec![f.path.clone()] } else { f.sequence.clone() };
-        let mut new_paths = vec![];
-        for src in &files {
-            let mut name = std::path::Path::new(src).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "footage".into());
-            let mut k = 2;
-            while !used_names.insert(name.clone()) {
-                name = format!("{k}_{name}");
-                k += 1;
-            }
-            let dst = format!("{folder}/(Footage)/{name}");
-            match s.services.read_file(src).and_then(|bytes| s.services.write_file(&dst, &bytes)) {
-                Ok(()) => copied += 1,
-                Err(e) => errors.push(format!("{src}: {e}")),
-            }
-            new_paths.push(dst);
-        }
-        if f.sequence.is_empty() {
-            f.path = new_paths.remove(0);
-        } else {
-            f.path = new_paths.first().cloned().unwrap_or_default();
-            f.sequence = new_paths;
-        }
-    }
-    let stem = s
-        .path
-        .as_deref()
-        .and_then(|p| std::path::Path::new(p).file_stem())
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "Untitled Project".into());
-    let out = format!("{folder}/{stem}.ecproj");
-    s.services.write_file(&out, proj.to_json().as_bytes()).map_err(|e| EngineError::Other(format!("cannot write {out}: {e}")))?;
-    s.toast(format!("Collected {copied} file(s) into {folder}"));
-    Ok(json!({"project": out, "copied": copied, "errors": errors}))
-}
-
 // ---------------------------------------------------------------- scripts
 
 /// File ▸ Scripts ▸ Run Script File…: `.jsx` / `.js` files run as JavaScript against the After
@@ -1023,7 +974,6 @@ pub fn specs() -> Vec<CommandSpec> {
             has_project_selection,
             new_comp_from_selection
         ),
-        cmd!("file.collectFiles", "Collect Files...", ["File", "Dependencies"], None, "{folder}", has_items, collect_files),
         cmd!("file.consolidateFootage", "Consolidate All Footage", ["File", "Dependencies"], None, "{}", has_items, consolidate),
         cmd!("file.removeUnusedFootage", "Remove Unused Footage", ["File", "Dependencies"], None, "{}", has_items, remove_unused),
         cmd!(

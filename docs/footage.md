@@ -147,3 +147,36 @@ relinking is unavailable.
 Agents: `file.relinkFootage {"folder": "/moved/shots", "dryRun": true, "wait": true}` returns
 a report without edits. Omit `dryRun` to apply unique high-confidence matches. Without `wait`,
 the command returns a cancellable job; `jobs.wait` / `jobs.list` expose its report.
+
+
+## Sharing an editable project
+
+Use **File ▸ Dependencies ▸ Collect Files…**, choose a **new** destination folder, then send
+that whole folder (or zip it). Existing folders, including empty folders and symlinks, are
+refused so collection never overwrites an earlier handoff. The parent folder must exist.
+
+Collection copies ordinary media, all saved image-sequence frames, and proxies attached to
+footage or compositions. Shared source paths are copied once. Separate source folders keep
+same-named assets distinct; ordinary sequence filenames are preserved. The `.ecproj` stores
+relative media paths, which Open and Import resolve against the received project. Embedded
+data footage travels in the project and in a `(Data)` snapshot folder, preserving JSON/CSV/TSV
+formats without requiring its original source file. Smart Freeze
+intent stays editable, but machine-local cache references are removed from the package.
+
+The open document is unchanged. Collection validates the saved project before writing and
+writes the project file only after all media and the report succeed. A failed copy or write
+returns an error and removes the new incomplete folder where possible; cleanup failures are
+reported explicitly. Native media copies stream to disk instead of buffering whole movies.
+
+**Read `Collection Report.json` before handing off.** Fonts are not copied: install the listed
+fonts separately, respecting their licences. External effect files (such as LUTs, OCIO configs
+and Mocha shape files), model sidecars, placeholders and unchanged Render Queue destinations
+are reported. These are requirements to resolve, not a guarantee that every dependency is
+bundled. The completion message and command result explicitly flag dependency warnings.
+Collection is a file handoff, not online collaboration or project-version merging.
+
+Agents: `file.collectFiles {"folder": "/handoffs/new-package"}` returns `project`, `copied`,
+`embedded` (saved data snapshots), `errors` (empty on success), `warnings` and `report`. Any required media-copy failure is a
+command error, not a successful result with missing media. Browser/virtual hosts do not support
+folder collection. Confined automation refuses the command because its implicit project media
+reads cannot yet be checked atomically against the configured read roots.

@@ -1,6 +1,6 @@
 # Parity with After Effects
 
-> **Last reviewed:** 2026-10-12 · **Last updated:** 2026-10-12 · **Change:** minor (issue, catalog and export-format references re-audited against `upstream/main` 470ea7a3; the 10 October re-measure is otherwise unchanged) · **Target:** Adobe After Effects 2026 (26.5.0.89)
+> **Last reviewed:** 2026-10-12 · **Last updated:** 2026-10-12 · **Change:** minor (portable collection with dependency warnings; runtime acceptance pending; issue, catalog and export-format references re-audited against `upstream/main` 470ea7a3; the 10 October re-measure is otherwise unchanged) · **Target:** Adobe After Effects 2026 (26.5.0.89)
 
 Cells hold the current state only; append history to [parity-log.md](parity-log.md).
 
@@ -116,7 +116,7 @@ compositing and effects dominate; audio is light). Hours are to full parity for 
 
 | Area | Weight | Breadth | Ready | Hours | Biggest gaps (details in [gaps.md](gaps.md)) |
 |---|---:|---:|---:|---:|---|
-| Project, footage and import | 8% | 92% | 55% | 25–45 | No relative paths or relinking when a project moves; Media Browser lists AVI, which it can't import (TGA/HDR/DPX/MXF import since #745, #756, #767); #431, #324, #552 and #351 are closed |
+| Project, footage and import | 8% | 92% | 55% | 25–45 | Relative-path media/proxy packages and relinking implemented; unbundled dependency warnings and runtime acceptance remain; Media Browser lists AVI, which it can't import (TGA/HDR/DPX/MXF import since #745, #756, #767); #431, #324, #552 and #351 are closed |
 | Compositions, layers and compositing | 13% | 98% | 60% | 30–55 | 32-bpc blend modes differed from After Effects (#494, closed); expand precomps in place (#601); #527, #510, #513, #539 and #540 are closed |
 | Animation: keyframes, graph editor, motion paths, puppet | 15% | 97% | 55% | 35–60 | Only scalar ease is measured against After Effects (168 samples); puppet lag (#586); #456, #457, #355, #553 and #318 are closed; Proportional Scrubbing (26.2) |
 | Expressions and scripting | 7% | 93% | 65% | 20–40 | `.jsxbin`, Startup/Shutdown folders, script shortcuts (`#include` landed, #759); external editor (#364); see [scripting-parity.md](scripting-parity.md) |
@@ -338,7 +338,7 @@ Earlier audits and the per-milestone update sections are in [parity-log.md](pari
 | 3D | 88% | 5.5 | reflections of other layers (Advanced 3D reflects only the Environment light, #261), multi-view layouts, the Extended Viewer for Advanced 3D comps |
 | Effects | ≈ 85% | 3.0 | GPU versions of the remaining effects (280 on the GPU; Fractal and the analysis / tool effects on the CPU) and the missing controls listed as partial in [effects.md](effects.md) |
 | Interface | 75% | 5.0 | more Learn tutorials and pixel-level fidelity of dialogs |
-| Project | ≈ 68% | 5.5 | OCIO displays beyond the built-in tone map; relative footage paths and relinking when a project moves |
+| Project | ≈ 68% | 5.5 | OCIO displays beyond the built-in tone map; complete dependency packaging beyond footage/proxies and cross-platform handoff acceptance |
 | Masks & roto | 74% | 5.0 | (audit estimates) Roto Brush 2.0 / 3.0 with a trained model, Refine Edge, mask tracking, Mask Interpolation and variable-width feather are in |
 | Preview | 77% | 2.8 | GPU effects for the audio-driven effects and the stepped particle systems; content-keyed RAM preview frames (an edit drops every comp's), audio scrubbing, more snapshot slots |
 | Tracking | ≈ 96% | 0.3 | face tracking's trained model is an optional download; without it the classical fitter is weak on profile and occluded faces; Rolling Shutter Ripple is approximated |
@@ -404,6 +404,7 @@ top of this page and in items 16–18 above.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-15 | minor | Portable project collection, explicit unbundled dependencies and failure cleanup; regression coverage added, runtime execution deferred; parity estimates unchanged |
 | 2026-10-12 | minor | Audited against `upstream/main` 470ea7a3: open crash list, closed-issue references in the area tables, export formats 12 to 13, localization ≈ 12% to ≈ 18%, `#include`, built-in preset count, 12 October repository counts |
 | 2026-10-10 | minor | Readiness-by-audience table: hours to ≈ 95% for each of the three numbers; the full number stays an additive weighted sum (unchanged) |
 | 2026-10-10 | minor | Added mainstream practitioner (≈ 47%) and essentials user (≈ 52%) numbers with weights, discounts and GitHub user evidence; wrote down how the full ready number is built (unchanged at ≈ 45%) |

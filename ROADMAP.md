@@ -2,7 +2,7 @@
 
 **Stage: alpha** · next: beta, ~30 points of "ready for real work" and ~350–620 h away
 
-> **Last reviewed:** 2026-10-12 · **Last updated:** 2026-10-14 · **Change:** minor (mask/shape interaction fixes, native panel windows, graph editing and verified ordinary FigCraft Copy; parity estimates unchanged) · **Target:** Adobe After Effects 2026 (26.5.0.89)
+> **Last reviewed:** 2026-10-12 · **Last updated:** 2026-10-15 · **Change:** minor (portable collection with dependency warnings; runtime acceptance pending; mask/shape interaction fixes, native panel windows, graph editing and verified ordinary FigCraft Copy; parity estimates unchanged) · **Target:** Adobe After Effects 2026 (26.5.0.89)
 
 EffectCraft aims to do what After Effects does, with the same panels, menus and behaviour, written
 from scratch in Rust. This page is the one-page summary; the evidence is in
@@ -124,6 +124,11 @@ Come tell us what matters most to you on [Discord](https://discord.gg/artcraft).
 
 ## Progress log
 
+- 2026-10-15: Collect Files packages media and proxies with relative paths, checked project
+  serialization and failure cleanup; dependency warnings identify unbundled fonts, effect files
+  and model sidecars. Regression cases added; runtime execution deferred under the fork's
+  daytime build policy. Parity estimates unchanged.
+
 - 2026-10-14: Ordinary FigCraft right-click Copy / Cmd+C now carries the native snapshot inside
   its SVG clipboard for EffectCraft Paste; the explicit copy action remains optional. The
   receiver rejects damaged/duplicate metadata and accepts vector geometry paths. Scoped checks
@@ -169,6 +174,7 @@ Come tell us what matters most to you on [Discord](https://discord.gg/artcraft).
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-15 | minor | Portable project collection, explicit unbundled dependencies and failure cleanup; regression coverage added, runtime execution deferred; parity estimates unchanged |
 | 2026-10-14 | patch | Ordinary FigCraft Copy SVG carrier and vector-path validation; native workflow verified; parity unchanged |
 | 2026-10-14 | minor | FigCraft native clipboard extension and mapping corrections; native workflow verified; parity scores unchanged |
 | 2026-10-12 | minor | Open-issue count (134 to 216), crash list and localization share (12% to 18%) updated to match docs/gaps.md |
