@@ -9,7 +9,7 @@
 //! - `ui.inspect`: UI state + summary; `ui.elements {prefix?}`: registered widgets (id, label, rect)
 //! - `ui.set {tool?, workspace?, theme?, focused?, viewer?: {zoom, res, pan, grid, …}, timeline?: {pps, start, graphEditor, showModes}}`
 //! - `ui.panel.show {panel}` / `ui.panel.close {panel}`
-//! - `ui.click {id | x,y, button?, count?, modifiers?}` / `ui.move {x,y}` / `ui.scroll {x,y,dx,dy}`
+//! - `ui.click {id | x,y, button?, count?, modifiers?}` / `ui.move {x,y}` / `ui.scroll {x,y,dx,dy,unit?,pinch?}`
 //! - `ui.drag {from:{id|x,y}, to:{id|x,y}, steps?, modifiers?}`: synthetic press-move-release
 //! - `ui.key {key, command?, shift?, alt?, ctrl?}` / `ui.type {text}`
 //! - `ui.viewer.locate {x, y}`: screen point of a comp pixel; `ui.viewer.hit {x, y}`: comp pixel at a screen point
@@ -443,21 +443,22 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
             };
             let dx = p.get("dx").and_then(Value::as_f64).unwrap_or(0.0) as f32;
             let dy = p.get("dy").and_then(Value::as_f64).unwrap_or(0.0) as f32;
-            let events = vec![
-                egui::Event::PointerMoved(pos),
-                egui::Event::MouseWheel {
-                    unit: egui::MouseWheelUnit::Point,
-                    delta: egui::vec2(dx, dy),
-                    modifiers: modifiers(p),
-                    phase: egui::TouchPhase::Move,
-                },
-                egui::Event::PointerButton {
-                    pos: egui::pos2(-100.0, -100.0),
-                    button: egui::PointerButton::Extra1,
-                    pressed: false,
-                    modifiers: Default::default(),
-                },
-            ];
+            // `unit: "line"` is a mouse wheel (it zooms the viewers); points are a trackpad
+            // scroll (the viewers pan once it moves on both axes) or a pixel-precise wheel. `pinch` is a trackpad pinch's zoom factor.
+            let unit = if p.get("unit").and_then(Value::as_str) == Some("line") { egui::MouseWheelUnit::Line } else { egui::MouseWheelUnit::Point };
+            let mut events = vec![egui::Event::PointerMoved(pos)];
+            if dx != 0.0 || dy != 0.0 {
+                events.push(egui::Event::MouseWheel { unit, delta: egui::vec2(dx, dy), modifiers: modifiers(p), phase: egui::TouchPhase::Move });
+            }
+            if let Some(pinch) = p.get("pinch").and_then(Value::as_f64).map(|z| z as f32).filter(|z| z.is_finite() && *z > 0.0) {
+                events.push(egui::Event::Zoom(pinch));
+            }
+            events.push(egui::Event::PointerButton {
+                pos: egui::pos2(-100.0, -100.0),
+                button: egui::PointerButton::Extra1,
+                pressed: false,
+                modifiers: Default::default(),
+            });
             crate::float_windows::send_pointer(app, ctx, point_window(app, p), events);
             Outcome::AfterInput
         }

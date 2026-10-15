@@ -91,6 +91,10 @@ pub trait Accelerator: Send + Sync {
     fn auto_pick(&self) -> Option<&AutoPick> {
         None
     }
+    /// False after permanent device failure: exports can release their GPU concurrency cap.
+    fn available(&self) -> bool {
+        true
+    }
     /// Deferred readbacks: where a GPU readback cannot be waited for (WebGPU in a browser
     /// worker), a frame renders in *passes*. A readback the accelerator does not have yet is
     /// started, the step returns a cheap placeholder and the pass is marked missed

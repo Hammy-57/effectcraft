@@ -206,3 +206,6 @@ mod ui_quick_offset;
 
 #[path = "../ui_video_preview_off.rs"]
 mod ui_video_preview_off;
+
+#[path = "../ui_viewer_trackpad.rs"]
+mod ui_viewer_trackpad;

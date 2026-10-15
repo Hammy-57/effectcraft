@@ -1127,6 +1127,7 @@ pub fn footage_salt(project: &effectcraft_project::Project) -> u64 {
 #[derive(Clone, Copy)]
 struct LayerKey {
     hash: u128,
+    without_markers: u128,
     expressions: bool,
 }
 
@@ -1162,7 +1163,18 @@ fn layer_key(l: &Arc<effectcraft_project::Layer>) -> LayerKey {
     }
     let mut expressions = false;
     l.props.walk("", &mut |_, p| expressions |= p.expr.is_some());
-    let k = LayerKey { hash: h.finish(), expressions };
+    let hash = h.finish();
+    let without_markers = if l.markers.is_empty() {
+        hash
+    } else {
+        let mut px = (**l).clone();
+        px.switches = px.switches.pixels();
+        px.markers.clear();
+        let mut h = Hash128::default();
+        hash_debug(&mut h, &px);
+        h.finish()
+    };
+    let k = LayerKey { hash, without_markers, expressions };
     if let Ok(mut m) = LAYER_KEYS.lock() {
         if m.map.len() >= m.sweep_at {
             m.map.retain(|_, (w, _)| w.strong_count() > 0);
@@ -1176,19 +1188,20 @@ fn layer_key(l: &Arc<effectcraft_project::Layer>) -> LayerKey {
 /// Hash of a comp's pixel form ([`effectcraft_project::Comp::pixel_form`]): its settings with
 /// Hide Shy Layers off, then each layer's [`LayerKey`] (memoised, so an edit formats only the
 /// layers it changed).
-fn hash_comp(h: &mut Hash128, c: &effectcraft_project::Comp, layers: &[LayerKey]) {
+fn hash_comp(h: &mut Hash128, c: &effectcraft_project::Comp, layers: &[LayerKey], with_markers: bool) {
     let shell = effectcraft_project::Comp { layers: effectcraft_project::Layers::new(), hide_shy: false, ..c.clone() };
-    hash_debug(h, &shell);
+    hash_debug(h, &shell.pixel_form_with(with_markers));
     h.write_u64(layers.len() as u64);
     for k in layers {
-        h.write(&k.hash.to_le_bytes());
+        h.write(&if with_markers { k.hash } else { k.without_markers }.to_le_bytes());
     }
 }
 
 /// Content key of a composition's pixels: project render settings, the comp and everything it
 /// uses (nested comps, footage, solids, their proxies and Use Proxy switches, footage and proxy
 /// files' size and time). With expressions in play (which can read any comp) the whole project
-/// counts. Switches that don't change pixels (Audio, Lock, Shy, Hide Shy Layers) don't count.
+/// counts. Nonvisual switches and plain markers do not count without expressions. Protected
+/// duration markers always count because they retime nested compositions.
 pub fn comp_content_key(project: &effectcraft_project::Project, comp: effectcraft_project::ItemId) -> u128 {
     use effectcraft_project::{ItemKind, LayerSource};
     let mut h = Hash128::default();
@@ -1223,8 +1236,8 @@ pub fn comp_content_key(project: &effectcraft_project::Project, comp: effectcraf
         h.write(it.name.as_bytes());
         match &it.kind {
             ItemKind::Comp(c) => match comp_layers.get(&id) {
-                Some(keys) => hash_comp(&mut h, c, keys),
-                None => hash_comp(&mut h, c, &keys_of(c)),
+                Some(keys) => hash_comp(&mut h, c, keys, expressions),
+                None => hash_comp(&mut h, c, &keys_of(c), expressions),
             },
             k => hash_debug(&mut h, k),
         }

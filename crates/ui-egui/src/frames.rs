@@ -421,18 +421,7 @@ pub fn comp_content(project: &Project, comp: ItemId) -> u64 {
 /// Whether two versions of a comp draw the same pixels. Markers only count when an expression
 /// could read them (`markers_count`).
 fn same_pixels(a: &Comp, b: &Comp, markers_count: bool) -> bool {
-    if markers_count { a.same_pixels(b) } else { a.same_pixels_ignoring_markers(b) }
-}
-
-/// Whether a layer anywhere in the project has an expression, which can read markers.
-fn project_has_expressions(project: &Project) -> bool {
-    fn has_expression(g: &PropGroup) -> bool {
-        g.children.iter().any(|c| match c {
-            Node::Prop(p) => p.expr.is_some(),
-            Node::Group(sub) => has_expression(sub),
-        })
-    }
-    project.items.values().any(|i| matches!(&i.kind, ItemKind::Comp(c) if c.layers.iter().any(|l| has_expression(&l.props))))
+    a.same_pixels_with(b, markers_count)
 }
 
 /// [`comp_content`] with each comp's address given by `addr`.
@@ -1099,7 +1088,7 @@ impl Frames {
         let plain = comp_content(project, comp);
         let Ok(mut bases) = self.bases.lock() else { return (plain, None) };
         // Markers can only change pixels through expressions, which read them.
-        let markers_count = project_has_expressions(project);
+        let markers_count = project.reads_markers();
         if let Some((base_id, base)) = bases.get(&comp.0)
             && *base_id != plain
             && comp_content_with(project, comp, |id, c| match base.item(id).map(|i| &i.kind) {

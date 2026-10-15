@@ -19,7 +19,7 @@ pub(crate) struct FxHost<'r, 'a, 'c> {
     /// whose effects run on the comp below).
     pub(crate) origin: [f64; 2],
     /// Index of the effect being rendered (bounds `self_at` to effects before it).
-    pub(crate) index: std::sync::atomic::AtomicUsize,
+    pub(crate) index: usize,
     /// The stack's input before any effect ran (CC Composite's original).
     pub(crate) original: Option<&'c Buf>,
 }
@@ -111,7 +111,7 @@ impl EffectHost for FxHost<'_, '_, '_> {
         if self.r.depth > MAX_FX_DEPTH || self.layer.switches.adjustment {
             return None;
         }
-        let n = effects.min(self.index.load(std::sync::atomic::Ordering::Relaxed));
+        let n = effects.min(self.index);
         let t = self.layer.comp_time(Tick::from_seconds_f64(layer_time));
         let sub = self.r.nested();
         sub.layer_input(&self.ctx.at(t), self.layer, n).map(|b| (*b).clone())
@@ -141,7 +141,7 @@ impl EffectHost for FxHost<'_, '_, '_> {
     }
 
     fn params_at(&self, layer_time: f64) -> Option<Params> {
-        let i = self.index.load(std::sync::atomic::Ordering::Relaxed);
+        let i = self.index;
         let g = self.layer.effects()?.groups().nth(i)?;
         let ctx = self.ctx.at(self.layer.comp_time(Tick::from_seconds_f64(layer_time)));
         Some(effectcraft_effects::flatten_params(g, &mut |pr| ctx.value(self.layer, pr)))
@@ -341,7 +341,7 @@ impl<'a> Renderer<'a> {
                 buf
             });
         }
-        let host = FxHost { r: self, ctx, layer, origin, index: Default::default(), original: original.as_ref() };
+        let host = FxHost { r: self, ctx, layer, origin, index: 0, original: original.as_ref() };
         let env = EffectEnv {
             masks: &mask_shapes,
             host: Some(&host),
@@ -386,12 +386,21 @@ impl<'a> Renderer<'a> {
             {
                 let run: Vec<_> = stack[k..].iter().take_while(|(_, _, s)| s.gpu && a.supports_effect(s.id)).collect();
                 let params: Vec<Params> = run.iter().map(|(_, g, _)| self.effect_params(ctx, layer, g)).collect();
+                let hosts: Vec<_> = run.iter().map(|(i, _, _)| FxHost { index: *i, ..host }).collect();
                 let steps: Vec<FxStep> = run
                     .iter()
                     .zip(&params)
-                    .map(|((i, g, s), params)| FxStep {
+                    .zip(&hosts)
+                    .map(|(((i, g, s), params), host)| FxStep {
                         spec: s,
-                        ctx: EffectCtx { params, time: lt.seconds(), layer_size, seed: g.uid as u32, adjustment, env: EffectEnv { effect_index: *i, ..env } },
+                        ctx: EffectCtx {
+                            params,
+                            time: lt.seconds(),
+                            layer_size,
+                            seed: g.uid as u32,
+                            adjustment,
+                            env: EffectEnv { host: Some(host), effect_index: *i, ..env },
+                        },
                     })
                     .collect();
                 let t0 = web_time::Instant::now();
@@ -407,8 +416,8 @@ impl<'a> Renderer<'a> {
             }
             k += 1;
             let params = self.effect_params(ctx, layer, g);
-            host.index.store(i, std::sync::atomic::Ordering::Relaxed);
-            let env = EffectEnv { effect_index: i, ..env };
+            let host = FxHost { index: i, ..host };
+            let env = EffectEnv { host: Some(&host), effect_index: i, ..env };
             let ectx = EffectCtx { params: &params, time: lt.seconds(), layer_size, seed: g.uid as u32, adjustment, env };
             let t0 = web_time::Instant::now();
             target.cpu(&mut |buf| {
