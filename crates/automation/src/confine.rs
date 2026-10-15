@@ -91,7 +91,7 @@ const WRITES: &[(&str, &[&str])] = &[
 
 /// Commands that write where they are not told: the project's file, the Render Queue's outputs.
 /// (`file.importFigma` writes its rendered images to a folder beside the project's file.)
-const IMPLICIT_WRITES: &[&str] = &["file.save", "file.incrementAndSave", "file.importFigma", "renderQueue.render", "render.preRender"];
+const IMPLICIT_WRITES: &[&str] = &["file.save", "file.incrementAndSave", "file.importFigma", "edit.pasteFigCraft", "renderQueue.render", "render.preRender"];
 
 /// What must be looked up before an implicitly writing command may run.
 #[derive(Debug, PartialEq, Eq)]
@@ -193,7 +193,7 @@ impl Confinement {
             return Err(Error::BadArgs(format!("`{id}`: give `path` while file access is confined")));
         }
         if IMPLICIT_WRITES.contains(&id) && !(given && id == "file.save") {
-            let project = matches!(id, "file.save" | "file.incrementAndSave" | "file.importFigma");
+            let project = matches!(id, "file.save" | "file.incrementAndSave" | "file.importFigma" | "edit.pasteFigCraft");
             return Ok(Some(if project { Lookup::ProjectFile } else { Lookup::RenderOutputs }));
         }
         Ok(None)

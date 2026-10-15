@@ -1236,6 +1236,9 @@ fn automation_roots_confine_file_access() {
     call_json(&mut s, "open_project", json!({"path": p(&read, "source.ecproj")}));
     denied(&mut s, "save_project", json!({}));
     denied(&mut s, "execute_command", json!({"command": "file.incrementAndSave"}));
+    // Clipboard images also persist beside the project and need write access.
+    let msg = denied(&mut s, "execute_command", json!({"command": "edit.pasteFigCraft", "params": {"clipboard": "{}"}}));
+    assert!(msg.contains("cannot write"), "{msg}");
     // Rendering the queue writes its items' outputs (by default beside the project).
     call_json(&mut s, "execute_command", json!({"command": "renderQueue.add", "params": {"comp": "A"}}));
     let queue = call_json(&mut s, "execute_command", json!({"command": "renderQueue.list"}));
