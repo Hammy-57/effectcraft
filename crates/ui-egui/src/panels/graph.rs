@@ -1857,7 +1857,7 @@ mod tests {
     fn pinned_separated_position_uses_follower_expressions_keys_and_fit_bounds() {
         use super::*;
         let mut s = effectcraft_host::session();
-        s.execute("comp.new", json!({"name": "Separated speed", "duration": 20})).unwrap();
+        s.execute("comp.new", json!({"name": "Separated speed", "frameRate": 25, "duration": 20})).unwrap();
         s.execute("layer.newSolid", json!({"name": "Box", "width": 10, "height": 10})).unwrap();
         let cid = s.state.active_comp.unwrap();
         let lid = s.active_comp().unwrap().layers[0].id;
@@ -1910,7 +1910,7 @@ mod tests {
     fn expression_speed_samples_evaluated_values_and_preserves_layer_time_units() {
         use super::*;
         let mut s = effectcraft_host::session();
-        s.execute("comp.new", json!({"name": "Expression speed", "duration": 20})).unwrap();
+        s.execute("comp.new", json!({"name": "Expression speed", "frameRate": 25, "duration": 20})).unwrap();
         s.execute("layer.newSolid", json!({"name": "Box", "width": 10, "height": 10})).unwrap();
         let cid = s.state.active_comp.unwrap();
         let lid = s.active_comp().unwrap().layers[0].id;
@@ -1949,7 +1949,7 @@ mod tests {
             }
         }
         let mut s = effectcraft_engine::Session::default();
-        s.execute("comp.new", json!({"name": "Invalid expression", "duration": 10})).unwrap();
+        s.execute("comp.new", json!({"name": "Invalid expression", "frameRate": 25, "duration": 10})).unwrap();
         s.execute("layer.newSolid", json!({"name": "Box", "width": 10, "height": 10})).unwrap();
         let cid = s.state.active_comp.unwrap();
         let lid = s.active_comp().unwrap().layers[0].id;

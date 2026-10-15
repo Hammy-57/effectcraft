@@ -1,6 +1,6 @@
 # File format parity
 
-> **Last reviewed:** 2026-10-12 · **Last updated:** 2026-10-15 · **Change:** minor (ordinary FigCraft Copy SVG carrier; native workflow verified; parity estimate unchanged) · **Target:** Adobe After Effects 2026
+> **Last reviewed:** 2026-10-12 · **Last updated:** 2026-10-15 · **Change:** minor (FigCraft v2 bitmap/paint transfer verified on 529 private frames; portable collection with dependency warnings; runtime acceptance pending; ordinary FigCraft Copy SVG carrier; native workflow verified; parity estimate unchanged) · **Target:** Adobe After Effects 2026
 
 Every format After Effects reads or writes, with EffectCraft's support. After Effects' list comes
 from its installed bundle (26.5.0.89: `Info.plist` `CFBundleDocumentTypes`, `Plug-ins/Format`,
@@ -32,7 +32,7 @@ trips and renders, checked by tests, not against After Effects), **partial** (na
 | Binary scripts `.jsxbin` | R (run) | none | — | No public specification: out of scope | — |
 | Motion graphics JSON `.mgjson` | R (data) | none | none | Media Browser lists it; import accepts only `.json` / `.csv` / `.tsv` data | — |
 | Captions `.aecap`, graphics `.aegraphic` | R/W | none | none | — | — |
-| Native `.ecproj` | — | yes | yes | Versioned JSON; schema migrations tested; footage resolves beside moved projects and missing items can be relinked ([footage.md](footage.md)) | engine project tests |
+| Native `.ecproj` | — | yes | yes | Versioned JSON; schema migrations tested; Collect Files saves checked projects with relative media/proxy paths and dependency warnings (runtime acceptance pending); missing items can be relinked ([footage.md](footage.md)) | engine project tests |
 
 ## Footage: stills
 
@@ -110,13 +110,14 @@ encoders ([hardware-parity.md](hardware-parity.md)), and rendering safely over a
 
 **≈ 130–230 h**: `.aep` / `.aepx` import 80–160 h (broader `.aep` corpus and `.aepx` beyond the existing converter), wiring TGA / DPX /
 HDR / MXF / AVI / DNx import and DPX/TGA output 10–20 h, FBX animation and skinning, USD and Substance 20–40 h,
-relinking 6–12 h, `.mogrt`-compatible templates 15–30 h (partly parallel with the rest).
+handoff completeness/acceptance (re-measure after the collection fixes), `.mogrt`-compatible templates 15–30 h (partly parallel with the rest).
 
 ## Revision history
 
 | Date | Change | Summary |
 |---|---|---|
 | 2026-10-15 | minor | FigCraft v2 bitmap/fidelity transfer verified on 529 private frames; original bitmap bytes and save/reopen checked; parity score unchanged |
+| 2026-10-15 | minor | Portable project collection, explicit unbundled dependencies and failure cleanup; regression coverage added, runtime execution deferred; parity estimates unchanged |
 | 2026-10-14 | patch | Ordinary Copy SVG carrier and vector geometry validation; native workflow verified; parity unchanged |
 | 2026-10-14 | minor | Native FigCraft clipboard transfer documented separately from After Effects formats; parity score unchanged; native workflow verified |
 | 2026-10-12 | minor | #324 and #514 marked closed; upstream `.aep` PRs #251 and #860 noted |

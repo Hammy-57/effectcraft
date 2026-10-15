@@ -3142,7 +3142,7 @@ mod path_displacement_tests {
         let mut paths = Vec::new();
         for scale in [100.0, 200.0] {
             let lid = s.execute("layer.newSolid", json!({"width":100,"height":100})).unwrap()["layer"].as_u64().unwrap();
-            s.execute("prop.set", json!({"layer":lid,"prop":"transform/scale","value":[scale,scale,100.0]})).unwrap();
+            s.execute("prop.set", json!({"layer":lid,"path":"transform/scale","value":[scale,scale,100.0]})).unwrap();
             let uid = s.execute("mask.new", json!({"layer":lid,"vertices":[[10,10],[40,10],[40,40]],"closed":true})).unwrap()["mask"].as_u64().unwrap();
             paths.push((lid, uid, scale));
         }
@@ -3175,7 +3175,7 @@ mod path_displacement_tests {
         s.execute("comp.new", json!({"width":640,"height":360})).unwrap();
         let lid = s.execute("layer.newSolid", json!({"width":400,"height":200})).unwrap()["layer"].as_u64().unwrap();
         s.execute("layer.setSwitch", json!({"layers":[lid],"switch":"threeD","value":true})).unwrap();
-        s.execute("prop.set", json!({"layer":lid,"prop":"transform/rotationY","value":55})).unwrap();
+        s.execute("prop.set", json!({"layer":lid,"path":"transform/rotationY","value":55})).unwrap();
         let uid = s.execute("mask.new", json!({"layer":lid,"vertices":[[20,20],[300,20],[300,160]],"closed":true})).unwrap()["mask"].as_u64().unwrap();
         s.execute("mask.selectVertices", json!({"vertices":[{"layer":lid,"mask":uid,"index":0},{"layer":lid,"mask":uid,"index":1}]})).unwrap();
         let projected = |s: &effectcraft_engine::Session| {

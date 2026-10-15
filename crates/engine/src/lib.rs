@@ -68,6 +68,14 @@ pub type Result<T> = std::result::Result<T, EngineError>;
 pub trait Services: Send + Sync {
     fn read_file(&self, path: &str) -> std::io::Result<Vec<u8>>;
     fn write_file(&self, path: &str, data: &[u8]) -> std::io::Result<()>;
+    /// Copy media without requiring a complete movie-sized allocation on native hosts.
+    fn copy_file(&self, source: &str, destination: &str) -> std::io::Result<()> {
+        self.write_file(destination, &self.read_file(source)?)
+    }
+    /// Collection owns a native directory; browser/virtual hosts must not create disk output.
+    fn supports_native_collection(&self) -> bool {
+        false
+    }
     /// Convert an After Effects project to the versioned AEP import document.
     /// Browser hosts and hosts without the optional importer can return Unsupported.
     fn export_aep_ir(&self, _path: &str) -> std::io::Result<Vec<u8>> {
@@ -111,6 +119,12 @@ pub trait Services: Send + Sync {
 /// Native filesystem.
 pub struct FsServices;
 impl Services for FsServices {
+    fn copy_file(&self, source: &str, destination: &str) -> std::io::Result<()> {
+        std::fs::copy(source, destination).map(|_| ())
+    }
+    fn supports_native_collection(&self) -> bool {
+        true
+    }
     fn read_file(&self, path: &str) -> std::io::Result<Vec<u8>> {
         std::fs::read(path)
     }

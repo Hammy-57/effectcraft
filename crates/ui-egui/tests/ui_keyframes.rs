@@ -174,6 +174,10 @@ fn graph_editor_drags_move_every_selected_key_and_shift_keeps_an_axis() {
     // Opened before selecting, so it fits all graphs (the whole comp) rather than the two keys.
     h.state_mut().ui.timeline.graph_editor = true;
     h.run_steps(2);
+    // Fit All frames the keys closely: zoom out to the whole comp so a 0.5 s drag stays in the plot.
+    let ctx = h.ctx.clone();
+    effectcraft_ui_egui::menus::invoke(h.state_mut(), &ctx, "timeline.zoomFit", json!({})).unwrap();
+    h.run_steps(2);
     let s = &mut h.state_mut().session;
     s.execute("prop.select", json!({"layer": id.0, "prop": uid})).unwrap();
     s.execute("keys.selectAll", json!({})).unwrap();

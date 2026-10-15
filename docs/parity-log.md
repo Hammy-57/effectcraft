@@ -1090,3 +1090,18 @@ before.
   are detailed in docs/figcraft-clipboard.md. Source fixtures/assets remain local and uncommitted.
 - Scoped all-target check, strict Clippy, WASM and native builds passed. Rust regressions compiled
   only under daytime policy; full CI was not run. No change to After Effects parity scores.
+## Update: G4 portable project handoff (15 October 2026)
+
+- Collect Files now copies ordinary footage, sequences and item/composition proxies once per
+  source path, saves package-relative paths using the checked serializer and retains editor
+  metadata. New-folder ownership prevents overwrite; a failed copy/write does not publish a
+  completed project and incomplete output is cleaned up. Native copies stream to disk.
+- The package report lists fonts, external effect files, model sidecars, placeholders and Render
+  Queue destination setup. Embedded data stays embedded; local Freeze cache references are
+  dropped from the copy. Source session, history and dirty state are unchanged.
+- Browser/virtual hosts and confined automation explicitly reject folder collection. Confined
+  collection needs atomic checking of implicit source reads before it can be supported.
+- Regression cases cover relocation, proxy/sequence completeness, duplicate filenames, copy and
+  write failures, metadata, invalid serialization, embedded data, warnings and existing output.
+  Tests were added but runtime execution is deferred under the fork's daytime policy; no claim
+  of visual fidelity or cross-platform acceptance is made. Feature percentages are unchanged.
