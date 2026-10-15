@@ -57,7 +57,7 @@ impl std::fmt::Display for CompareError {
         match self {
             CompareError::SizeMismatch { a, b } => write!(f, "size mismatch: a is {}x{}, b is {}x{}", a.0, a.1, b.0, b.1),
             CompareError::BadBuffer { width, height, len } => {
-                write!(f, "{width}x{height} RGBA image needs {} bytes, got {len}", (*width as u64) * (*height as u64) * 4)
+                write!(f, "{width}x{height} RGBA image needs {} bytes, got {len}", u128::from(*width) * u128::from(*height) * 4)
             }
             CompareError::Empty => write!(f, "empty image"),
             CompareError::BadRegion { region: [x, y, w, h], width, height } => {
@@ -519,5 +519,16 @@ mod tests {
         assert_eq!(fit_max_side(1920, 1080, 960), (960, 540));
         assert_eq!(fit_max_side(100, 50, 0), (100, 50));
         assert!(same_aspect((1920, 1080), (960, 540)) && same_aspect((1920, 1080), (853, 480)) && !same_aspect((1920, 1080), (800, 800)));
+    }
+}
+
+#[cfg(test)]
+mod hostile_error_tests {
+    use super::*;
+    #[test]
+    fn extreme_dimensions_can_be_reported_without_overflow() {
+        let error = Rgba8::new(u32::MAX, u32::MAX, &[]).unwrap_err();
+        let bytes = u128::from(u32::MAX) * u128::from(u32::MAX) * 4;
+        assert!(error.to_string().contains(&bytes.to_string()));
     }
 }

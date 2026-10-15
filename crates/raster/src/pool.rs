@@ -64,8 +64,10 @@ pub fn crop_of(img: &Image, x: u32, y: u32, width: u32, height: u32) -> Image {
     let mut out = zeroed(width, height);
     let (sw, w) = (img.width as usize, width as usize);
     out.data.par_chunks_mut(w.max(1)).enumerate().for_each(|(r, row)| {
-        let sy = y as usize + r;
-        let Some(src) = img.data.get(sy * sw..(sy + 1) * sw).and_then(|s| s.get(x as usize..)) else { return };
+        let Some(sy) = (y as usize).checked_add(r).filter(|sy| *sy < img.height as usize) else { return };
+        let Some(start) = sy.checked_mul(sw) else { return };
+        let Some(end) = start.checked_add(sw) else { return };
+        let Some(src) = img.data.get(start..end).and_then(|s| s.get(x as usize..)) else { return };
         for (d, s) in row.iter_mut().zip(src) {
             *d = *s;
         }
@@ -134,5 +136,16 @@ mod tests {
         // Small images aren't pooled.
         recycle(Image::new(8, 8));
         assert!(stats().0 <= MAX_BUFFERS);
+    }
+}
+
+#[cfg(test)]
+mod hostile_crop_tests {
+    use super::*;
+    #[test]
+    fn crop_past_extreme_source_dimensions_is_transparent() {
+        let malformed = Image { width: u32::MAX, height: u32::MAX, data: vec![] };
+        let out = crop_of(&malformed, 0, u32::MAX, 1, 4);
+        assert_eq!(out.data, vec![[0.0; 4]; 4]);
     }
 }
