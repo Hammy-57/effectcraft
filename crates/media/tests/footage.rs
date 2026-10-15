@@ -896,11 +896,10 @@ fn conformed_flac_audio_reads_back_like_the_decoder() {
     let _ = std::fs::remove_dir_all(&folder);
 }
 
-/// Probing reads standalone audio from its headers and packet framing (no decode) and movies
-/// from their index (through the file): it describes them exactly as opening the whole file in
-/// memory does.
+/// File probing describes media exactly as opening the whole file in memory does,
+/// including standalone audio through FilmCraft and indexed movie readers.
 #[test]
-fn header_probe_matches_a_whole_file_probe() {
+fn file_probe_matches_a_whole_file_probe() {
     let Some(flac) = sine_flac(5, 44_100, 2, "s16") else { return };
     let mp3 = ffmpeg_fixture("sine_3s.mp3", &["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100:duration=3", "-c:a", "libmp3lame", "-b:a", "128k"]);
     let mp3_cbr_no_tag = ffmpeg_fixture(

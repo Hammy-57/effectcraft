@@ -229,3 +229,21 @@ fn impure_calls_are_caught_however_they_are_spelled() {
     assert_eq!(eval_simple("1 + 2"), eval_simple("1 + 2"));
     assert_eq!(eval_simple("typeof __impure === 'undefined' ? 1 : 0"), 1.0);
 }
+
+/// Clock-only paths must run again, even when two reads return the same millisecond.
+#[test]
+fn clock_descriptors_and_aliases_are_never_memoized() {
+    memo::set_off(false);
+    for text in [
+        r#"Object.getOwnPropertyDescriptor(globalThis["Da" + "te"], "now").value()"#,
+        r#"Object.getOwnPropertyDescriptors(globalThis["Da" + "te"]).now.value()"#,
+        r#"const D = globalThis["Da" + "te"]; D["now"]()"#,
+        r#"const D = globalThis["Da" + "te"]; new D().getTime()"#,
+    ] {
+        assert!(memo::cacheable(text));
+        assert!(eval_simple(text) > 0.0);
+        let before = script_runs();
+        assert!(eval_simple(text) > 0.0);
+        assert!(script_runs() > before, "clock expression was reused: {text}");
+    }
+}

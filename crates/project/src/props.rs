@@ -255,6 +255,10 @@ pub struct PropGroup {
     /// fx switch for effects, eye for shape groups, etc.
     #[serde(default = "yes")]
     pub enabled: bool,
+    /// An effect's colour label (After Effects 26.5), shown in Effect Controls and the Timeline;
+    /// `None` is unlabelled. Absent in older projects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<effectcraft_color::Label>,
     #[serde(default)]
     pub children: Vec<Node>,
 }
@@ -448,8 +452,14 @@ pub fn parse_path(s: &str) -> Vec<Seg> {
 }
 
 impl PropGroup {
+    /// An instance in an indexed list (effect, mask, shape item, text animator, tracker): these
+    /// can be renamed, removed, duplicated and reordered; fixed groups (Transform…) can't.
+    pub fn is_instance(&self) -> bool {
+        matches!(self.kind, GroupKind::Indexed | GroupKind::Effect { .. } | GroupKind::Mask { .. } | GroupKind::Tracker { .. })
+    }
+
     pub fn new(uid: Uid, match_id: &str, name: &str) -> PropGroup {
-        PropGroup { uid, match_id: match_id.into(), name: name.into(), kind: GroupKind::Plain, enabled: true, children: vec![] }
+        PropGroup { uid, match_id: match_id.into(), name: name.into(), kind: GroupKind::Plain, enabled: true, label: None, children: vec![] }
     }
     pub fn with(mut self, n: impl Into<Node>) -> PropGroup {
         self.children.push(n.into());
@@ -739,6 +749,8 @@ mod node_serde_tests {
         kind: GroupKind,
         #[serde(default = "yes")]
         enabled: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<effectcraft_color::Label>,
         #[serde(default)]
         children: Vec<RefNode>,
     }
@@ -753,6 +765,7 @@ mod node_serde_tests {
                     name: g.name,
                     kind: g.kind,
                     enabled: g.enabled,
+                    label: g.label,
                     children: g.children.into_iter().map(Node::from).collect(),
                 }),
             }
@@ -786,6 +799,7 @@ mod node_serde_tests {
         let mut fx = PropGroup::new(6, "ec.blur.gaussian", "Gaussian Blur");
         fx.kind = GroupKind::Effect { effect: "ec.blur.gaussian".into() };
         fx.enabled = false;
+        fx.label = Some(effectcraft_color::Label::Blue);
         fx.children.push(blur.into());
         let mut root = PropGroup::new(1, "root", "Root");
         root.children.extend([pos.into(), mask.into(), fx.into(), PropGroup::new(7, "empty", "Empty").into()]);

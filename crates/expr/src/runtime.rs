@@ -223,6 +223,7 @@ fn placeholder(req: &Req) -> Resp {
         Req::Child { .. } => Resp::List(vec![s("\u{1}"), Resp::Bool(true), s(""), s(""), n(0.0), n(1.0)]),
         Req::PropInfo { .. } => Resp::List(vec![s(""), n(0.0), s("number"), n(1.0), n(0.0), Resp::Null, Resp::Bool(false), n(1.0), s("")]),
         Req::Keys { .. } => Resp::List(vec![Resp::List(vec![]), Resp::List(vec![])]),
+        Req::SourceInfo { .. } => Resp::List(vec![s("footage"), n(-1.0), s(""), n(100.0), n(100.0), n(1.0), n(1.0 / 30.0), n(1.0)]),
         Req::Value { .. } => n(0.0),
         Req::Xform { .. } => Resp::List(vec![ident(3), ident(3), ident(4), ident(4)]),
         Req::SourceRect { .. } | Req::Sample { .. } => Resp::List(vec![n(0.0); 4]),
@@ -283,7 +284,8 @@ fn native_host(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsV
             t: secs(num(args, 8, ctx)?),
         },
         14 => Req::Project,
-        15 => Req::Keys { comp: id(args, 1, ctx)?, layer: id(args, 2, ctx)?, path: string(args, 3, ctx)? },
+        15 => Req::SourceInfo { comp: id(args, 1, ctx)?, layer: id(args, 2, ctx)? },
+        16 => Req::Keys { comp: id(args, 1, ctx)?, layer: id(args, 2, ctx)?, path: string(args, 3, ctx)? },
         _ => return Err(JsNativeError::typ().with_message("unknown host request").into()),
     };
     let found = FRAMES.with(|f| {
@@ -349,10 +351,10 @@ const IMPURE: &str = r#"(function () {
   Object.defineProperty(Math, "random", { value: function random() { mark(); return rnd(); }, writable: false, configurable: false });
   const D = Date;
   const now = D.now;
+  Object.defineProperty(D, "now", { value: function now_() { mark(); return now.call(D); }, writable: false, configurable: false });
   const P = new Proxy(D, {
     construct(t, a, n) { mark(); return Reflect.construct(t, a, n === P ? D : n); },
     apply(t, self, a) { mark(); return Reflect.apply(t, self, a); },
-    get(t, k, r) { return k === "now" ? function now_() { mark(); return now.call(D); } : Reflect.get(t, k, t); },
   });
   Object.defineProperty(D.prototype, "constructor", { value: P, writable: false, configurable: false });
   Object.defineProperty(globalThis, "Date", { value: P, writable: false, configurable: false });

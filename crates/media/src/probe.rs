@@ -15,8 +15,8 @@ pub const DEFAULT_SEQUENCE_RATE: FrameRate = FrameRate::FPS_30;
 /// Probe one file. Image sequences are made by the engine, which groups numbered stills
 /// (`effectcraft_engine::sequence`) and probes their first frame here.
 ///
-/// Movies are probed from their index (read through the file, not loaded whole) and standalone
-/// compressed audio from its packet headers (not decoded); stills are read whole.
+/// Movies are probed from their index (read through the file, not loaded whole).
+/// Standalone audio uses FilmCraft; stills are read whole.
 pub fn probe(path: impl AsRef<Path>) -> Result<Footage> {
     let path = path.as_ref();
     let p = path.to_string_lossy();
@@ -41,9 +41,6 @@ pub fn probe(path: impl AsRef<Path>) -> Result<Footage> {
                 turn_footage(&mut f, turn);
                 return Ok(f);
             }
-            if let Some(f) = probe_audio_headers(path, &name) {
-                return Ok(f);
-            }
             let bytes = crate::open::read_whole(&*reader).map_err(io)?;
             return probe_bytes(&p, bytes);
         }
@@ -60,65 +57,6 @@ pub fn probe(path: impl AsRef<Path>) -> Result<Footage> {
 fn is_still(path: &str, head: &[u8]) -> bool {
     let ext = ext_of(Path::new(path));
     crate::STILL_EXTENSIONS.contains(&ext.as_str()) || crate::layered::claims(path, head) || image::guess_format(head).is_ok()
-}
-
-/// A standalone MP3 / FLAC / Ogg / AIFF file described from its headers and packet framing,
-/// without decoding it (FilmCraft decodes these whole when they are opened): `None` when the file
-/// isn't one, or doesn't read cleanly (then it is probed by opening it, as before).
-///
-/// The duration is the sum of the packets' durations, which is what decoding them yields: FLAC's
-/// header gives it directly.
-#[cfg(not(target_arch = "wasm32"))]
-fn probe_audio_headers(path: &Path, name: &str) -> Option<Footage> {
-    use symphonia::core::codecs::CODEC_TYPE_FLAC;
-    use symphonia::core::formats::FormatOptions;
-    use symphonia::core::io::MediaSourceStream;
-    use symphonia::core::meta::MetadataOptions;
-    use symphonia::core::probe::Hint;
-    let ext = ext_of(path);
-    if !matches!(ext.as_str(), "mp3" | "mp2" | "flac" | "ogg" | "oga" | "aif" | "aiff" | "aifc") {
-        return None;
-    }
-    let file = std::fs::File::open(path).ok()?;
-    let size = file.metadata().ok()?.len();
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
-    let mut hint = Hint::new();
-    hint.with_extension(&ext);
-    let mut format = symphonia::default::get_probe().format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default()).ok()?.format;
-    let track = format.default_track()?.clone();
-    let rate = track.codec_params.sample_rate?;
-    let frames = match track.codec_params.n_frames {
-        Some(n) if n > 0 && track.codec_params.codec == CODEC_TYPE_FLAC => n,
-        _ => {
-            let mut n = 0u64;
-            loop {
-                match format.next_packet() {
-                    Ok(pkt) if pkt.track_id() == track.id => n = n.saturating_add(pkt.dur),
-                    Ok(_) => {}
-                    Err(symphonia::core::errors::Error::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                    // A damaged stream: open it the usual way (decoding skips what it can't read).
-                    Err(_) => return None,
-                }
-            }
-            n
-        }
-    };
-    let channels = track.codec_params.channels.map(|c| c.count() as u32)?;
-    if frames == 0 || rate == 0 || channels == 0 {
-        return None;
-    }
-    let codec = symphonia::default::get_codecs().get_codec(track.codec_params.codec).map(|d| d.short_name.to_uppercase()).unwrap_or_else(|| ext.to_uppercase());
-    let info = filmcraft_media::MediaInfo {
-        name: name.to_string(),
-        kind: filmcraft_media::MediaKind::AudioOnly,
-        duration: filmcraft_time::Tick::from_units(i64::try_from(frames).ok()?, i64::from(rate)),
-        video: None,
-        audio: Some(filmcraft_media::AudioStreamInfo { sample_rate: rate, channels, codec, bits_per_sample: track.codec_params.bits_per_sample }),
-        container: ext.to_uppercase(),
-        start_timecode: None,
-        file_size: Some(size),
-    };
-    Some(footage_from_info(&path.to_string_lossy(), &info))
 }
 
 /// Probe a 3D model (glTF 2.0 / OBJ / STL / FBX): a [`FootageKind::Model`] item whose duration is its

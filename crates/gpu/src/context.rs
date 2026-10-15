@@ -37,7 +37,7 @@ const EXT_ENTRIES: &[&str] = &["classic3d"];
 /// 8/16 bpc are emulated by clamping and quantising, as on the CPU).
 pub const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
 
-/// Uploaded layer buffers kept on the GPU (bytes), at most (see [`GpuContext::set_cache_budget`]).
+/// Uploaded layer buffers kept on the GPU by default (bytes; [`GpuContext::set_upload_budget`]).
 const UPLOAD_BUDGET: usize = 1536 << 20;
 
 /// Working textures kept for reuse once their last image is dropped (bytes), at most.
@@ -71,6 +71,8 @@ impl GpuImage {
 struct Lease {
     texture: wgpu::Texture,
     pool: Weak<Mutex<Pool>>,
+    /// The [`Enc`] that took it (see [`Pool::owned`]).
+    owner: u64,
 }
 
 impl std::fmt::Debug for Lease {
@@ -84,7 +86,7 @@ impl Drop for Lease {
         if let Some(pool) = self.pool.upgrade()
             && let Ok(mut p) = pool.lock()
         {
-            p.release(self.texture.clone());
+            p.release_owned(self.texture.clone(), self.owner);
         }
     }
 }
@@ -110,7 +112,17 @@ pub(crate) struct Pool {
     /// Working textures reused / newly allocated (diagnostics, tests).
     hits: u64,
     misses: u64,
+    /// Textures released while the [`Enc`] that took them is alive, kept for that `Enc` only.
+    /// Its later commands run after everything it recorded or submitted before (one queue,
+    /// recording order), so it can overwrite them at once instead of allocating a new texture
+    /// for every intermediate of a frame (a 4K frame holds dozens). Other encoders never see a
+    /// working texture of another `Enc` before it is gone.
+    owned: HashMap<u64, HashMap<(u32, u32), Vec<wgpu::Texture>>>,
+    next_owner: u64,
 }
+
+/// In-`Enc` texture reuse ([`Pool::owned`]); tests turn it off to compare.
+pub(crate) static TEXTURE_REUSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// Counts of uploads (CPU → GPU) and readbacks (GPU → CPU).
 #[derive(Default)]
@@ -178,6 +190,37 @@ impl Pool {
         for (t, _) in ready {
             self.make_free(t);
         }
+    }
+
+    fn register(&mut self) -> u64 {
+        self.next_owner += 1;
+        if TEXTURE_REUSE.load(std::sync::atomic::Ordering::Relaxed) {
+            self.owned.insert(self.next_owner, HashMap::new());
+        }
+        self.next_owner
+    }
+
+    /// `Enc` `owner` is gone: its kept textures go through the shared pool.
+    fn unregister(&mut self, owner: u64) {
+        if let Some(m) = self.owned.remove(&owner) {
+            for t in m.into_values().flatten() {
+                self.release(t);
+            }
+        }
+    }
+
+    fn release_owned(&mut self, t: wgpu::Texture, owner: u64) {
+        if let Some(m) = self.owned.get_mut(&owner) {
+            m.entry((t.width(), t.height())).or_default().push(t);
+            return;
+        }
+        self.release(t);
+    }
+
+    fn take_owned(&mut self, owner: u64, w: u32, h: u32) -> Option<wgpu::Texture> {
+        let t = self.owned.get_mut(&owner)?.get_mut(&(w, h))?.pop()?;
+        self.hits += 1;
+        Some(t)
     }
 
     fn take(&mut self, w: u32, h: u32) -> Option<wgpu::Texture> {
@@ -253,19 +296,21 @@ struct Uploads {
 impl Uploads {
     /// Drop textures whose layer buffer is gone (evicted from the layer cache, an older frame's),
     /// then the least recently used over budget.
-    fn trim(&mut self) {
+    fn trim(&mut self, requested: usize) -> bool {
         let before = self.map.len();
         self.map.retain(|_, e| e.buf.strong_count() > 0);
         if self.map.len() != before {
             self.bytes = self.map.values().map(|e| e.bytes).sum();
         }
-        let budget = self.budget.unwrap_or(UPLOAD_BUDGET);
+        let budget = self.budget.unwrap_or(requested).min(requested);
+        let over_budget = self.bytes > budget;
         while self.bytes > budget {
             let Some(k) = self.map.iter().min_by_key(|(_, e)| e.last_use).map(|(k, _)| *k) else { break };
             if let Some(e) = self.map.remove(&k) {
                 self.bytes = self.bytes.saturating_sub(e.bytes);
             }
         }
+        over_budget
     }
 }
 
@@ -288,6 +333,8 @@ pub struct GpuContext {
     dummy_tex: wgpu::TextureView,
     dummy_buf: wgpu::Buffer,
     uploads: Mutex<Uploads>,
+    upload_budget: std::sync::atomic::AtomicUsize,
+    upload_full_warned: std::sync::atomic::AtomicBool,
     pool: Arc<Mutex<Pool>>,
     /// CPU ↔ GPU traffic (diagnostics: `bench --gpu`).
     pub(crate) transfers: Transfers,
@@ -633,6 +680,8 @@ impl GpuContext {
             dummy,
             dummy_buf,
             uploads: Mutex::new(Uploads::default()),
+            upload_budget: std::sync::atomic::AtomicUsize::new(UPLOAD_BUDGET),
+            upload_full_warned: Default::default(),
             pool: Default::default(),
             staging: Default::default(),
             transfers: Default::default(),
@@ -852,13 +901,27 @@ impl GpuContext {
 
     /// A pooled working texture: (image, reused). A reused texture holds old pixels; a new
     /// one is zeroed.
-    fn pooled(&self, w: u32, h: u32) -> (GpuImage, bool) {
+    fn pooled(&self, w: u32, h: u32, owner: u64) -> (GpuImage, bool) {
         let (w, h) = (w.max(1), h.max(1));
-        let reused = self.pool.lock().ok().and_then(|mut p| p.take(w, h));
+        let reused = self.pool.lock().ok().and_then(|mut p| p.take_owned(owner, w, h).or_else(|| p.take(w, h)));
         let was_reused = reused.is_some();
         let texture = reused.unwrap_or_else(|| self.texture(w, h));
-        let lease = Arc::new(Lease { texture: texture.clone(), pool: Arc::downgrade(&self.pool) });
+        let lease = Arc::new(Lease { texture: texture.clone(), pool: Arc::downgrade(&self.pool), owner });
         (GpuImage { texture, width: w, height: h, _lease: Some(lease), levels: None }, was_reused)
+    }
+
+    /// Bytes of uploaded layer textures the context keeps (default 1536 MB). An application that
+    /// knows the device's memory can raise it (static layers of a big frame upload once) or lower
+    /// it (a small GPU); the least recently used textures go first.
+    pub fn set_upload_budget(&self, bytes: usize) {
+        self.upload_budget.store(bytes.max(1 << 20), std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut uploads) = self.uploads.lock() {
+            uploads.trim(self.upload_budget());
+        }
+    }
+
+    pub fn upload_budget(&self) -> usize {
+        self.upload_budget.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Uploads and readbacks so far (images; uploads of cached layers count once).
@@ -916,20 +979,24 @@ impl GpuContext {
                 u.bytes -= old.bytes;
             }
             u.bytes += bytes;
-            u.trim();
+            let requested = self.upload_budget();
+            let budget = u.budget.unwrap_or(requested).min(requested);
+            if u.trim(requested) && !self.upload_full_warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                log::warn!(target: "effectcraft_gpu", "GPU upload cache full ({} MB): evicting layer textures", budget >> 20);
+            }
         }
         Some(img)
     }
 
     /// Size the GPU-side caches after the layer cache's memory budget (Memory & CPU settings,
     /// after RAM Reserved for Other Applications): uploaded layer textures mirror cached layer
-    /// buffers, so they get at most the same budget (capped at [`UPLOAD_BUDGET`]), and free
+    /// buffers, so they get at most the same budget and the configured upload limit, and free
     /// working textures half of it (capped at [`POOL_BUDGET`]). On unified memory (Apple
     /// silicon) both come out of system RAM.
     pub fn set_cache_budget(&self, layer_cache: usize) {
         if let Ok(mut u) = self.uploads.lock() {
-            u.budget = Some(layer_cache.min(UPLOAD_BUDGET));
-            u.trim();
+            u.budget = Some(layer_cache);
+            u.trim(self.upload_budget());
         }
         if let Ok(mut p) = self.pool.lock() {
             p.set_budget((layer_cache / 2).min(POOL_BUDGET));
@@ -964,22 +1031,26 @@ pub(crate) struct Enc<'g> {
     pending: usize,
     /// A dispatch named a kernel the device doesn't have (see [`Enc::take_missing`]).
     missing: bool,
+    /// This `Enc`'s id in the texture pool (textures it may reuse at once).
+    owner: u64,
 }
 
 impl Drop for Enc<'_> {
     fn drop(&mut self) {
         // Unsubmitted work is discarded, so nothing recorded will read pooled textures.
-        if let Some((_, id)) = self.enc.take()
-            && let Ok(mut p) = self.g.pool.lock()
-        {
-            p.close(id);
+        if let Ok(mut p) = self.g.pool.lock() {
+            if let Some((_, id)) = self.enc.take() {
+                p.close(id);
+            }
+            p.unregister(self.owner);
         }
     }
 }
 
 impl<'g> Enc<'g> {
     pub fn new(g: &'g GpuContext) -> Enc<'g> {
-        Enc { g, enc: None, pending: 0, missing: false }
+        let owner = g.pool.lock().map(|mut p| p.register()).unwrap_or(0);
+        Enc { g, enc: None, pending: 0, missing: false, owner }
     }
 
     /// Whether a dispatch since the last call named a kernel the device doesn't have (one
@@ -1001,7 +1072,7 @@ impl<'g> Enc<'g> {
 
     /// A new zeroed image (pooled; a reused texture is cleared by a kernel).
     pub fn image(&mut self, w: u32, h: u32) -> GpuImage {
-        let (img, reused) = self.g.pooled(w, h);
+        let (img, reused) = self.g.pooled(w, h, self.owner);
         if reused {
             self.fill(&img, 0.0);
         }
@@ -1011,7 +1082,7 @@ impl<'g> Enc<'g> {
     /// A new image for a kernel that writes every pixel of it (pooled; contents undefined).
     /// Under test it starts out as NaNs, so a kernel that skips pixels fails the CPU oracle.
     pub fn scratch(&mut self, w: u32, h: u32) -> GpuImage {
-        let (img, _) = self.g.pooled(w, h);
+        let (img, _) = self.g.pooled(w, h, self.owner);
         if cfg!(test) {
             self.fill(&img, f32::NAN);
         }
@@ -1388,5 +1459,16 @@ mod upload_budget_tests {
         assert!(g.upload_buf(&c).is_some());
         assert_eq!(g.transfer_stats().uploads, ups);
         drop(b);
+        // Both independently configured limits apply, including an immediate reduction.
+        g.set_cache_budget(4 << 20);
+        g.set_upload_budget(2 << 20);
+        let large_a = buf(8192);
+        let large_b = buf(8192);
+        assert!(g.upload_buf(&large_a).is_some() && g.upload_buf(&large_b).is_some());
+        assert_eq!(g.upload_stats(), (2, 2 << 20));
+        g.set_upload_budget(1 << 20);
+        assert_eq!(g.upload_stats(), (1, 1 << 20));
+        g.set_cache_budget(512 << 10);
+        assert_eq!(g.upload_stats(), (0, 0));
     }
 }
