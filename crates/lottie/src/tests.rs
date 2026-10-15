@@ -758,3 +758,14 @@ fn extreme_enum_numbers_do_not_overflow() {
     let mut q = Project::default();
     import(&mut q, doc.to_string().as_bytes(), "x", "", &mut |_| None).unwrap();
 }
+
+#[test]
+fn extreme_gradient_endpoints_keep_a_finite_inactive_width_handle() {
+    let mut im = crate::anim::Im { tb: crate::Timebase { rate: FrameRate::FPS_30 }, warnings: Vec::new() };
+    let mut next = 1;
+    let items =
+        crate::shapes::import_items(&mut im, &mut Ids(&mut next), &[json!({"ty":"gf", "t":2, "s":{"a":0,"k":[1e308,-1e308]}, "e":{"a":0,"k":[-1e308,1e308]}})]);
+    let width = items[0].get("widthPoint").unwrap().value.as_vec2();
+    assert!(width.iter().all(|v| v.is_finite()));
+    assert!(im.warnings.iter().any(|w| w.contains("width handle")));
+}

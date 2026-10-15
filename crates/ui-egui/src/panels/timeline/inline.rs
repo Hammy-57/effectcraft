@@ -889,7 +889,11 @@ mod tests {
         let undo = app.session.history.undo.len();
         crate::menus::invoke(&mut app, &ctx, "edit.paste", json!({})).unwrap();
         assert_eq!(app.session.history.undo.len(), undo + 1);
-        assert!(app.session.project.comp(child).unwrap().layers.iter().any(|l| l.name == "Imported"));
+        // Native frame transfer now keeps the Card as an editable precomp instead of
+        // flattening its children. It belongs to the inline source, never a new viewer.
+        let card = app.session.project.comp(child).unwrap().layers.iter().find(|l| l.name == "Card").expect("frame pasted into inline source");
+        let LayerSource::Comp { item } = card.source else { panic!("frame lost its editable composition") };
+        assert!(app.session.project.comp(item).unwrap().layers.iter().any(|l| l.name == "Imported"));
         assert_eq!(app.session.project.comp(root).unwrap().layers.len(), 2);
         assert_eq!(app.session.state.open_comps, open);
         assert_eq!(app.session.active_comp_id(), Some(root));

@@ -425,9 +425,11 @@ pub(crate) fn drawn_buf_at(ctx: &EvalCtx, layer: &Layer, k: f64) -> Option<(u32,
                 })
                 .reduce(|a, b| a.union(b))?;
             let b = b.intersect(kurbo::Rect::new(-20000.0, -20000.0, 20000.0, 20000.0));
-            let bw = ((b.width() * k).ceil() as u32 + 4).clamp(1, 16384);
-            let bh = ((b.height() * k).ceil() as u32 + 4).clamp(1, 16384);
-            (bw, bh, [-b.x0 * k + 2.0, -b.y0 * k + 2.0])
+            // Match text::render's global pixel grid, including its rounded origin.
+            let (x0, y0) = ((b.x0 * k).floor(), (b.y0 * k).floor());
+            let bw = ((b.x1 * k).ceil() - x0 + 4.0).clamp(1.0, 16384.0) as u32;
+            let bh = ((b.y1 * k).ceil() - y0 + 4.0).clamp(1.0, 16384.0) as u32;
+            (bw, bh, [-x0 + 2.0, -y0 + 2.0])
         }
         _ => return None,
     };

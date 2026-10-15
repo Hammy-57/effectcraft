@@ -1802,7 +1802,7 @@ mod tests {
     }
 
     #[test]
-    fn expression_overlay_fit_includes_base_curve_extrema_even_when_result_is_flat() {
+    fn expression_overlay_fit_keeps_visible_key_handles_when_result_is_flat() {
         use super::*;
         let (mut app, layer, uid, _) = comparison_app("zero");
         for (time, side, speed) in [(0.0, "out", 500.0), (2.0, "in", -500.0)] {
@@ -1824,7 +1824,7 @@ mod tests {
             if compare {
                 assert!(hi > 100.0, "base curve extrema must fit: {hi}");
             } else {
-                assert!(hi < 30.0, "result-only view retains existing fit behavior: {hi}");
+                assert!(hi >= 500.0, "Fit All still frames the visible authored key handles: {hi}");
             }
         }
     }

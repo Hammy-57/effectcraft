@@ -4565,18 +4565,22 @@ mod tests {
         set_current("en");
     }
 
-    /// Every row is asked for by a converted panel: a leftover row means the panel went back to its
+    // The inline editor uses translated errors but still has untranslated tooltips. It is a
+    // catalog user, not a fully converted panel: keep usage and complete-translation audits distinct.
+    const PARTIAL_CATALOG_USERS: &[(&str, &str)] = &[("panels/timeline/inline.rs", include_str!("../panels/timeline/inline.rs"))];
+
+    /// Every row is asked for by a panel or a partially converted catalog user: a leftover row means the panel went back to its
     /// English literal. A string a helper draws for the panel (a toolbar tooltip, a popup item, a
     /// checkbox label) is looked up inside that helper, so its English source only appears as a
     /// literal there - `helper_labels_are_translated` keeps those helpers honest.
     #[test]
-    fn every_row_is_used_by_a_converted_panel() {
+    fn every_row_is_used_by_a_panel() {
         for (en, _) in catalogs() {
             let plain = format!("tr({en:?})");
             let formatted = format!("tr_args({en:?}");
             let bare = format!("{en:?}");
             assert!(
-                CONVERTED.iter().any(|(_, src)| src.contains(&plain) || src.contains(&formatted) || src.contains(&bare)),
+                CONVERTED.iter().chain(PARTIAL_CATALOG_USERS).any(|(_, src)| src.contains(&plain) || src.contains(&formatted) || src.contains(&bare)),
                 "{en:?} is in the catalog but no converted panel asks for it"
             );
         }

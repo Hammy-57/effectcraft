@@ -797,12 +797,12 @@ mod keep_tests {
     }
 
     /// A layer whose effect stack ends in a GPU chain composites from the chain's result: the
-    /// same pixels, one upload fewer per such layer (none with linear blending, which
-    /// composites a converted copy).
+    /// same pixels, one upload fewer for the footage chain (none with linear blending).
+    /// The solid is already generated/composited on the GPU, with no second upload to save.
     #[test]
     fn effect_results_composite_without_a_second_upload() {
         let Some(g) = crate::tests::gpu() else { return };
-        for (depth, linear, saved) in [(BitDepth::Bpc32, false, 2), (BitDepth::Bpc8, false, 2), (BitDepth::Bpc16, true, 0)] {
+        for (depth, linear, saved) in [(BitDepth::Bpc32, false, 1), (BitDepth::Bpc8, false, 1), (BitDepth::Bpc16, true, 0)] {
             let s = scene(depth, linear);
             let (old, a) = frame(g, &s, false);
             let (new, b) = frame(g, &s, true);

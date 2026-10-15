@@ -58,6 +58,17 @@ fn unhex(s: &str) -> Vec<u8> {
     (0..s.len() / 2).map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap()).collect()
 }
 
+/// A fixed virtual directory: a user's changing home folder is not a UI regression fixture.
+struct FixtureBrowser(effectcraft_engine::media_browser::VirtualTree);
+impl effectcraft_engine::media_browser::Browser for FixtureBrowser {
+    fn home(&self) -> String {
+        "/Fixtures".into()
+    }
+    fn list(&self, dir: &str, importable_only: bool) -> Result<Vec<effectcraft_engine::media_browser::Entry>, String> {
+        self.0.list(dir, importable_only)
+    }
+}
+
 /// Renders every panel maximized; `None` without a GPU adapter.
 fn render_panels() -> Option<Vec<(String, image::RgbaImage)>> {
     let _gpu = crate::gpu_lock();
@@ -67,6 +78,12 @@ fn render_panels() -> Option<Vec<(String, image::RgbaImage)>> {
     };
     drop(probe);
     let mut s = Session::default();
+    let mut browser = effectcraft_engine::media_browser::VirtualTree::default();
+    for folder in ["Footage", "Images", "Projects"] {
+        browser.add_dir(&format!("/Fixtures/{folder}"));
+    }
+    browser.add_file("/Fixtures/Example.mov", "/Fixtures/Example.mov", 1024, None);
+    s.browser = Some(std::sync::Arc::new(FixtureBrowser(browser)));
     s.execute("comp.new", json!({"name":"UI Review","width":640,"height":360,"duration":4})).unwrap();
     s.execute("layer.newText", json!({"text":"EffectCraft","name":"Title"})).unwrap();
     s.execute("layer.newSolid", json!({"name":"Plate","color":"#406080","width":160,"height":120})).unwrap();

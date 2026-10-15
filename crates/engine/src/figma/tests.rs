@@ -565,7 +565,7 @@ fn imported_gradients_keep_nonlinear_kind_and_third_handle() {
             "fills":[{"type":ty,"gradientHandlePositions":[{"x":0.5,"y":0.5},{"x":1,"y":0.5},{"x":0.75,"y":1}],
                 "gradientStops":[{"position":0,"color":{"r":1,"g":0,"b":0}},{"position":1,"color":{"r":0,"g":0,"b":1}}]}]});
         let p = plan(&node, Target::NewComp);
-        let PKind::Shape(items) = &p.comps[0].layers[0].kind else { panic!("not editable") };
+        let items = group_items(&p.comps[0].layers[0]);
         let Some(Item::GradientFill { kind: k, width, .. }) = items.iter().find(|i| matches!(i, Item::GradientFill { .. })) else { panic!("missing paint") };
         assert_eq!(*k, kind);
         assert_eq!(*width, Some([150.0, 100.0]));
