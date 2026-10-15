@@ -81,7 +81,12 @@ fn zoomed(h: &Harness<'_, EffectcraftApp>, before: f64, cti: f32, zoom_in: bool,
 fn check_controls(graph: bool) {
     let mut h = harness(graph);
     let (_, span) = view(&h);
-    assert!((span - 10.0).abs() < 0.2, "starts at the whole comp: {span}");
+    if graph {
+        // Fit All frames the shown keys (1 s and 8 s) with padding, not the whole comp.
+        assert!((7.0..10.0).contains(&span), "starts framing the keys: {span}");
+    } else {
+        assert!((span - 10.0).abs() < 0.2, "starts at the whole comp: {span}");
+    }
     let cti = x_of(&h, "timeline.cti");
     send(&mut h, "ui.key", json!({"key": "="}));
     let span = zoomed(&h, span, cti, true, "=");
@@ -124,6 +129,8 @@ fn graph_curves_follow_the_time_zoom_and_the_navigator() {
         ks.sort_by(f32::total_cmp);
         ks
     };
+    // The graph opens framing the keys (Fit All); zoom to the whole comp to start from.
+    send(&mut h, "ui.menu.invoke", json!({"command": "timeline.zoomFit"}));
     let ks = key_x(&h);
     assert_eq!(ks.len(), 2, "both Opacity keys in the graph: {ks:?}");
     let cti = x_of(&h, "timeline.cti");

@@ -387,7 +387,7 @@ fn ctrl_v_pastes_svg_markup_as_a_shape_layer() {
 #[test]
 fn shape_item_eye_toggles_nested_fill_and_undoes() {
     let mut s = session();
-    let lid = s.execute("layer.newShape", json!({"kind":"rect"})).unwrap()["layer"].as_u64().unwrap();
+    let lid = s.execute("layer.newShape", json!({"kind":"rect","strokeWidth":2})).unwrap()["layer"].as_u64().unwrap();
     let layer = s.active_comp().unwrap().layer(LayerId(lid)).unwrap();
     let contents = layer.props.sub("contents").unwrap().uid;
     let group = layer.props.group("contents/group").unwrap().uid;
@@ -401,6 +401,9 @@ fn shape_item_eye_toggles_nested_fill_and_undoes() {
     h.run_steps(3);
     assert!(h.state().auto.find(&format!("timeline.group.{stroke}.eye")).is_some());
     assert!(h.state().auto.find(&format!("timeline.group.{dashes}.eye")).is_none());
+    // The open Stroke's many rows push Fill out of the small panel: close it to reach Fill.
+    h.state_mut().ui.timeline.open_groups.remove(&stroke);
+    h.run_steps(3);
     click(&mut h, &format!("timeline.group.{fill}.eye"));
     assert!(!h.state().session.active_comp().unwrap().layer(LayerId(lid)).unwrap().props.find_group(fill).unwrap().enabled);
     h.state_mut().session.execute("edit.undo", json!({})).unwrap();

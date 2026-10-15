@@ -320,10 +320,19 @@ fn graph_keys_open_existing_value_velocity_and_interpolation_dialogs() {
             click_graph(&mut h, &key, egui::PointerButton::Secondary);
             click_graph(&mut h, &format!("timeline.graph.keyMenu.{menu}"), egui::PointerButton::Primary);
         } else {
-            click_graph(&mut h, &key, egui::PointerButton::Primary);
-            click_graph(&mut h, &key, egui::PointerButton::Primary);
+            // Both clicks reach egui in one frame: a double click needs them closer in time
+            // than the harness's frames are apart.
+            let r = h.state().auto.find(&key).unwrap_or_else(|| panic!("missing {key}")).rect;
+            let pos = egui::pos2(r[0] + r[2] / 2.0, r[1] + r[3] / 2.0);
+            h.input_mut().events.push(egui::Event::PointerMoved(pos));
+            h.step();
+            for pressed in [true, false, true, false] {
+                h.input_mut().events.push(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() });
+            }
+            h.step();
+            h.run_steps(3);
         }
-        assert_eq!(h.state().dialog, Some(expected));
+        assert_eq!(h.state().dialog, Some(expected), "{mode} {menu:?}");
     }
 }
 
