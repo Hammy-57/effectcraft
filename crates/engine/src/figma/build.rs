@@ -150,7 +150,7 @@ fn payload_png(v: &Value) -> std::result::Result<Vec<u8>, String> {
 }
 
 /// PNG bytes for every planned image, in plan order.
-fn raster_bytes(s: &Session, plan: &Plan, src: &Source, scale: f64, notes: &mut Vec<String>) -> Vec<Option<Vec<u8>>> {
+fn raster_bytes(_s: &Session, plan: &Plan, src: &Source, scale: f64, notes: &mut Vec<String>) -> Vec<Option<Vec<u8>>> {
     let mut out: Vec<Option<Vec<u8>>> = vec![None; plan.rasters.len()];
     let mut want = vec![];
     for (i, r) in plan.rasters.iter().enumerate() {

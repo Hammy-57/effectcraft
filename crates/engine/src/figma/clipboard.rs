@@ -10,6 +10,18 @@ use crate::commands::{CommandSpec, always, bad, str_p};
 use crate::{Result, Session};
 
 const COMMAND: &str = "edit.pasteFigCraft";
+
+fn paste_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let stamp = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+    #[cfg(not(target_arch = "wasm32"))]
+    let process = std::process::id();
+    #[cfg(target_arch = "wasm32")]
+    let process = 0;
+    format!("{process}-{stamp}-{}", NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
 #[path = "clipboard_assets.rs"]
 mod assets;
 
@@ -240,7 +252,7 @@ fn paste(s: &mut Session, p: &Value) -> Result<Value> {
     }
     plan.notes = warnings.clone();
     // Only generated base64 entries reach the shared builder; caller paths and URLs were rejected.
-    let source = Source { nodes: vec![], images, rest: None, label: format!("FigCraft-{}-{}", s.session_id, s.revision) };
+    let source = Source { nodes: vec![], images, rest: None, label: format!("FigCraft-{}-{}", paste_id(), s.revision) };
     let (frame_rate, duration) = into.and_then(|id| s.project.comp(id)).map(|comp| (comp.frame_rate.as_f64(), comp.duration.seconds())).unwrap_or((30.0, 10.0));
     let settings = build::Settings { origin: "FigCraft", undo_label: "Paste from FigCraft", frame_rate, duration, into };
     let mut result = build::run(s, plan, &source, 1.0, &settings)?;
@@ -270,6 +282,11 @@ pub(super) fn spec() -> CommandSpec {
 mod tests {
     use super::*;
     use effectcraft_project::{ItemId, LayerSource};
+
+    #[test]
+    fn independent_pastes_have_distinct_asset_ids() {
+        assert_ne!(paste_id(), paste_id());
+    }
 
     fn rectangle() -> Value {
         json!({"id":"rect", "type":"RECTANGLE", "name":"Editable rectangle", "size":{"x":40,"y":20},

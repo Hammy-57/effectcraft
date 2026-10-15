@@ -295,7 +295,7 @@ mod command_tests {
         let (assets, node) = super::tests::fixture();
         let payload = json!({"format":"figcraft.clipboard", "version":2,"nodes":[node],"assets":assets});
         let mut session = Session { importer: Some(Arc::new(BitmapImporter)), ..Session::default() };
-        let dir = std::env::temp_dir().join(format!("effectcraft-clipboard-images-{}", session.session_id));
+        let dir = std::env::temp_dir().join(format!("effectcraft-clipboard-images-{}", super::super::paste_id()));
         session.path = Some(dir.join("Project.ecproj").to_string_lossy().into_owned());
         let result = session.execute_checked(COMMAND, json!({"clipboard":payload.to_string()})).unwrap();
         assert_eq!(result["images"], 1);
@@ -367,12 +367,12 @@ mod command_tests {
         session.execute_checked("comp.new", json!({"name":"Existing comp"})).unwrap();
         session.execute_checked("layer.newNull", json!({"name":"Keep selected"})).unwrap();
         session.mark_saved();
-        let dir = std::env::temp_dir().join(format!("effectcraft-clipboard-failure-{}", session.session_id));
+        let dir = std::env::temp_dir().join(format!("effectcraft-clipboard-failure-{}", super::super::paste_id()));
         session.path = Some(dir.join("Project.ecproj").to_string_lossy().into_owned());
         let project = session.project.clone();
         let history = session.history.clone();
         let state = serde_json::to_value(&session.state).unwrap();
-        let counters = (session.revision, session.epoch, session.saved_revision, session.id_floor);
+        let counters = (session.revision, session.saved_revision);
         let events = session.events.clone();
         let journal = session.journal.clone();
         let error = session.execute_checked(COMMAND, json!({"clipboard":payload.to_string()})).unwrap_err().to_string();
@@ -380,7 +380,7 @@ mod command_tests {
         assert_eq!(importer.0.load(Ordering::Relaxed), 2);
         assert!(Arc::ptr_eq(&session.project, &project));
         assert_eq!(serde_json::to_value(&session.state).unwrap(), state);
-        assert_eq!((session.revision, session.epoch, session.saved_revision, session.id_floor), counters);
+        assert_eq!((session.revision, session.saved_revision), counters);
         assert!(!session.is_dirty());
         assert_eq!(session.events, events);
         assert_eq!(session.journal, journal);
