@@ -351,10 +351,10 @@ const IMPURE: &str = r#"(function () {
   Object.defineProperty(Math, "random", { value: function random() { mark(); return rnd(); }, writable: false, configurable: false });
   const D = Date;
   const now = D.now;
+  Object.defineProperty(D, "now", { value: function now_() { mark(); return now.call(D); }, writable: false, configurable: false });
   const P = new Proxy(D, {
     construct(t, a, n) { mark(); return Reflect.construct(t, a, n === P ? D : n); },
     apply(t, self, a) { mark(); return Reflect.apply(t, self, a); },
-    get(t, k, r) { return k === "now" ? function now_() { mark(); return now.call(D); } : Reflect.get(t, k, t); },
   });
   Object.defineProperty(D.prototype, "constructor", { value: P, writable: false, configurable: false });
   Object.defineProperty(globalThis, "Date", { value: P, writable: false, configurable: false });
