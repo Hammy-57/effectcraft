@@ -242,8 +242,13 @@ pub struct Keymaps {
 
 impl Default for Keymaps {
     fn default() -> Self {
-        Keymaps { active: DEFAULT_PRESET.into(), presets: vec![] }
+        Keymaps { active: DEFAULT_PRESET.into(), presets: elias_preset().into_iter().collect() }
     }
+}
+
+/// The owner's portable preset is available on fresh macOS and Windows installations.
+fn elias_preset() -> Option<Preset> {
+    serde_json::from_str(include_str!("elias_shortcuts.json")).ok()
 }
 
 /// A conflict: another command already using the keys in an overlapping scope.
@@ -262,6 +267,11 @@ fn scopes_overlap(a: &str, b: &str) -> bool {
 impl Keymaps {
     pub fn from_json(text: &str) -> Keymaps {
         let mut k: Keymaps = serde_json::from_str(text).unwrap_or_default();
+        if let Some(preset) = elias_preset()
+            && !k.presets.iter().any(|p| p.name == preset.name)
+        {
+            k.presets.push(preset);
+        }
         if !k.presets.iter().any(|p| p.name == k.active) {
             k.active = DEFAULT_PRESET.into();
         }
@@ -469,5 +479,24 @@ impl ShortcutTable {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod elias_tests {
+    use super::*;
+
+    #[test]
+    fn personal_preset_is_portable_and_existing_edits_are_preserved() {
+        let fresh = Keymaps::default();
+        let preset = fresh.presets.iter().find(|p| p.name == "Elias AE").unwrap();
+        assert_eq!(preset.overrides["view.fit"], ["Shift+F"]);
+        for keys in preset.overrides.values() {
+            for key in keys { assert!(normalize(key).is_some(), "{key}"); }
+        }
+        let existing = Keymaps::from_json(r#"{"active":"Elias AE","presets":[{"name":"Elias AE","overrides":{"view.fit":["F12"]}}]}"#);
+        assert_eq!(existing.presets.iter().filter(|p| p.name == "Elias AE").count(), 1);
+        assert_eq!(existing.active_preset().unwrap().overrides["view.fit"], ["F12"]);
+        assert!(Keymaps::from_json(r#"{"active":"EffectCraft Default","presets":[]}"#).names().contains(&"Elias AE".to_string()));
     }
 }

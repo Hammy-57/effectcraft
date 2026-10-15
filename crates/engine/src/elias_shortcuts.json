@@ -1,0 +1,215 @@
+{
+  "name": "Elias AE",
+  "overrides": {
+    "anim.reveal {\"kind\":\"animation\"}": [
+      "Cmd+U"
+    ],
+    "app.keyboardShortcuts": [
+      "Cmd+Alt+K"
+    ],
+    "comp.cropToRegionOfInterest": [
+      "Alt+C"
+    ],
+    "comp.revealInProject": [
+      "Shift+W"
+    ],
+    "edit.deselectAll": [
+      "Shift+4"
+    ],
+    "edit.purge {\"what\":\"memoryAndDisk\"}": [
+      "Cmd+Alt+Shift+W"
+    ],
+    "edit.redo": [
+      "Ctrl+Shift+W",
+      "Cmd+Shift+Z"
+    ],
+    "edit.splitLayer": [
+      "X"
+    ],
+    "edit.undo": [
+      "Ctrl+W",
+      "Cmd+Z"
+    ],
+    "file.close": [],
+    "file.replaceFootage": [
+      "Alt+R"
+    ],
+    "file.revealInFinder": [
+      "Alt+Shift+R"
+    ],
+    "help.docs {\"page\":\"help\"}": [],
+    "keys.easyEase": [
+      "B",
+      "F9"
+    ],
+    "keys.interpolation": [],
+    "keys.nudgeBackward": [
+      "Cmd+-",
+      "Alt+ArrowLeft"
+    ],
+    "keys.nudgeBackward10": [
+      "Cmd+Alt+-",
+      "Alt+Shift+ArrowLeft"
+    ],
+    "keys.nudgeForward": [
+      "Cmd+=",
+      "Alt+ArrowRight"
+    ],
+    "keys.nudgeForward10": [
+      "Cmd+Alt+=",
+      "Alt+Shift+ArrowRight"
+    ],
+    "keys.toggleHold": [],
+    "layer.addTextAnimator {\"properties\":[\"opacity\"]}": [
+      "Shift+O"
+    ],
+    "layer.addTextAnimator {\"properties\":[\"position\"]}": [
+      "Shift+P"
+    ],
+    "layer.centerAnchor": [
+      "F1"
+    ],
+    "layer.mask.set {\"field\":\"feather\"}": [],
+    "layer.newAdjustment": [
+      "2"
+    ],
+    "layer.newCamera": [
+      "Shift+C"
+    ],
+    "layer.newNull": [
+      "1"
+    ],
+    "layer.newSolid": [
+      "Shift+Y"
+    ],
+    "layer.quality {\"quality\":\"best\"}": [],
+    "layer.revealSource": [
+      "Cmd+W"
+    ],
+    "layer.setSwitch {\"switch\":\"lock\"}": [
+      "Shift+3"
+    ],
+    "layer.setSwitch {\"switch\":\"solo\"}": [
+      "Shift+2"
+    ],
+    "layer.setSwitch {\"switch\":\"video\"}": [
+      "Shift+1"
+    ],
+    "layer.setTransform {\"prop\":\"orientation\"}": [],
+    "layer.timeStretch": [
+      "Cmd+Shift+T"
+    ],
+    "layer.transform {\"op\":\"center\"}": [
+      "F2"
+    ],
+    "layer.transform {\"op\":\"fit\"}": [
+      "Cmd+Shift+F",
+      "Cmd+Alt+F"
+    ],
+    "layer.transform {\"op\":\"fitHeight\"}": [
+      "Cmd+Alt+Shift+H"
+    ],
+    "layer.transform {\"op\":\"fitWidth\"}": [
+      "Cmd+Alt+Shift+G"
+    ],
+    "layer.unlockAll": [
+      "Cmd+Alt+Shift+3"
+    ],
+    "path.convertToBezier": [
+      "Cmd+B"
+    ],
+    "render.preRender": [
+      "Cmd+Alt+Shift+R"
+    ],
+    "time.back10": [
+      "Shift+Q"
+    ],
+    "time.forward10": [
+      "Shift+D"
+    ],
+    "time.layerOut": [],
+    "time.nextFrame": [
+      "D"
+    ],
+    "time.nextKey": [
+      "Cmd+ArrowRight",
+      "Alt+="
+    ],
+    "time.previousFrame": [
+      "Q"
+    ],
+    "time.previousKey": [
+      "Cmd+ArrowLeft",
+      "Alt+-"
+    ],
+    "time.workAreaEnd": [
+      "O"
+    ],
+    "timeline.graphEditor": [
+      "Alt+1",
+      "Shift+F3"
+    ],
+    "timeline.keyAt.rotation": [],
+    "timeline.revealAdd.feather": [],
+    "timeline.trimInToTime": [
+      "W",
+      "Alt+["
+    ],
+    "timeline.trimOutToTime": [
+      "C",
+      "Alt+]"
+    ],
+    "timeline.workAreaBegin": [],
+    "timeline.zoomFrameToggle": [],
+    "timeline.zoomIn": [
+      "Physical+="
+    ],
+    "timeline.zoomOut": [
+      "Physical+Minus"
+    ],
+    "tool.brush": [],
+    "tool.dolly": [],
+    "tool.orbit": [],
+    "tool.panCamera": [],
+    "tool.rotate": [],
+    "tool.shape": [],
+    "tool.zoom": [],
+    "view.fit": [
+      "Shift+F"
+    ],
+    "view.layerControls": [
+      "Cmd+Alt+H",
+      "Cmd+Shift+H"
+    ],
+    "view.res.custom": [
+      "Cmd+F3"
+    ],
+    "view.res.full": [
+      "Cmd+F1"
+    ],
+    "view.res.half": [
+      "Cmd+F2"
+    ],
+    "window.maximizePanel": [
+      "IntlBackslash"
+    ],
+    "window.panel {\"panel\":\"effectControls\"}": [
+      "Alt+2"
+    ],
+    "window.panel {\"panel\":\"effectsPresets\"}": [
+      "Alt+3"
+    ],
+    "window.panel {\"panel\":\"paint\"}": [],
+    "window.panel {\"panel\":\"paragraph\"}": [],
+    "window.panel {\"panel\":\"project\"}": [
+      "Alt+`"
+    ],
+    "window.panel {\"panel\":\"properties\"}": [
+      "Alt+Shift+1"
+    ],
+    "window.panel {\"panel\":\"renderQueue\"}": [
+      "Alt+5"
+    ],
+    "window.panel {\"panel\":\"tools\"}": []
+  }
+}
