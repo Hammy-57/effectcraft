@@ -319,10 +319,16 @@ fn collection_keeps_embedded_csv_and_tsv_formats_when_reopened() {
     let dir = Temp::new();
     for (extension, data, format) in [("csv", "name,value\nA,42", "csv"), ("tsv", "name\tvalue\nA\t42", "tsv"), ("tab", "name\tvalue\nA\t42", "tsv")] {
         let mut s = Session::default();
-        let id = add(&mut s, "Data", Footage {
-            path: dir.0.join(format!("missing.{extension}")).to_string_lossy().into_owned(),
-            kind: FootageKind::Data, data: Some(data.into()), ..Default::default()
-        });
+        let id = add(
+            &mut s,
+            "Data",
+            Footage {
+                path: dir.0.join(format!("missing.{extension}")).to_string_lossy().into_owned(),
+                kind: FootageKind::Data,
+                data: Some(data.into()),
+                ..Default::default()
+            },
+        );
         let result = s.execute("file.collectFiles", json!({"folder":dir.0.join(extension)})).unwrap();
         assert_eq!(result["embedded"], 1);
         let mut opened = Session::default();
