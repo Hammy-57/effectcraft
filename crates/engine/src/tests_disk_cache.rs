@@ -136,3 +136,18 @@ fn footage_changes_change_the_salt() {
     assert_ne!(k3, k2);
     assert_ne!(set_proxy(&mut s, false), k3);
 }
+
+#[test]
+fn in_memory_settings_only_use_an_explicit_disk_cache_folder() {
+    crate::tests_roto::hold_roto_cache_test_lock();
+    let mut s = Session { config: Some(std::sync::Arc::new(crate::config::MemoryConfig::default())), ..Default::default() };
+    s.load_settings();
+    assert!(s.disk_cache.is_none(), "in-memory settings must not open the platform cache");
+    s.execute_checked("prefs.set", json!({"key": "general.recentItems", "value": 4})).unwrap();
+    assert!(s.disk_cache.is_none());
+    let dir = folder("memory-config-explicit");
+    s.execute_checked("prefs.set", json!({"key": "disk.diskCacheFolder", "value": dir})).unwrap();
+    assert!(s.disk_cache.is_some(), "an explicit folder still opts in to persistence");
+    drop(s);
+    std::fs::remove_dir_all(dir).unwrap();
+}

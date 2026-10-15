@@ -113,12 +113,12 @@ fn main() {
     put("media_probe", "tone.wav", &with_pick(10, &wav));
     put("psd_parse", "header-only.psd", b"8BPS\x00\x01\x00\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00\x02\x00\x00\x00\x02\x00\x08\x00\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00");
 
-    // Commands: (index byte, params). The index picks among the safe commands (see lib.rs); these
+    // Commands: (two little-endian index bytes, params). The index picks among the safe commands (see lib.rs); these
     // only seed the shape of a line, the fuzzer finds the rest.
     put(
         "engine_command",
         "lines",
-        b"\x00{}\n\x10{\"layers\":[\"#1\"]}\n\x20{\"path\":\"transform/position\",\"value\":[1e308,-1e308,0]}\n\x30{\"time\":-5}\n\x40{\"name\":\"\xc3\xa9\",\"frameRate\":0.0001}\n\x50{\"effect\":\"Gaussian Blur\"}\n",
+        b"\x00\x00{}\n\x10\x00{\"layers\":[\"#1\"]}\n\x20\x00{\"path\":\"transform/position\",\"value\":[1e308,-1e308,0]}\n\x30\x00{\"time\":-5}\n\x40\x00{\"name\":\"\xc3\xa9\",\"frameRate\":0.0001}\n\x50\x00{\"effect\":\"Gaussian Blur\"}\n",
     );
     eprintln!("seeds: written to {}", Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus").display());
 }

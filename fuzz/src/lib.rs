@@ -3,8 +3,10 @@
 //! and must never panic, hang or run out of memory: a crash found here is a bug (AGENTS.md "Never
 //! crash"), fixed with a regression test in the crate that crashed.
 //!
-//! Nothing here touches the disk, the network or other processes: file services deny every
-//! access, and the command target only runs commands that edit the project in memory.
+//! Engine file services deny reads and writes; command fuzzing uses editing families with
+//! no persistent settings or plug-in loader configured. This is not an operating-system sandbox.
+
+mod command_input;
 
 use std::sync::{Arc, OnceLock};
 
@@ -205,7 +207,7 @@ fn safe_commands() -> &'static [&'static str] {
 }
 
 /// Engine commands as agents and the control channel send them: on the demo project, each line
-/// is one command (first byte: which, rest: JSON parameters), checked like the control channel's.
+/// is one command (two little-endian index bytes, then JSON parameters), checked like the control channel's.
 pub fn engine_command(data: &[u8]) {
     let ids = safe_commands();
     if ids.is_empty() {
@@ -214,9 +216,17 @@ pub fn engine_command(data: &[u8]) {
     let mut s = sandboxed_session();
     s.replace_project(effectcraft_engine::demo::demo_project(), None);
     for line in data.get(..data.len().min(64 << 10)).unwrap_or_default().split(|&b| b == b'\n').take(16) {
-        let Some((&pick, json)) = line.split_first() else { continue };
-        let id = ids[usize::from(pick) % ids.len()];
+        let Some((pick, json)) = command_input::parse(line, ids.len()) else { continue };
+        let Some(id) = ids.get(pick) else { continue };
         let params = serde_json::from_slice::<Value>(json).unwrap_or(Value::Object(Default::default()));
         let _ = s.execute_checked(id, params);
+    }
+}
+
+#[cfg(test)]
+mod command_selection_tests {
+    #[test]
+    fn every_registered_command_is_reachable() {
+        assert!(super::command_input::all_reachable(super::safe_commands().len()));
     }
 }

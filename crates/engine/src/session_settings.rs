@@ -100,12 +100,12 @@ impl Session {
 
     /// Apply Settings ▸ Media & Disk Cache ▸ Disk Cache: open (or close) the persistent cache
     /// and attach it to the layer cache. Without a folder setting the platform cache folder is
-    /// used, but only by frontends with a settings store (headless sessions stay off disk).
+    /// used only with a filesystem-backed settings directory (in-memory settings stay off disk).
     pub fn configure_disk_cache(&mut self) {
         use effectcraft_render::disk_cache::{DiskCache, default_folder, footage_salt};
         let d = &self.prefs.disk;
         let folder = if d.disk_cache_folder.trim().is_empty() {
-            (self.config.is_some() && !cfg!(target_arch = "wasm32")).then(default_folder)
+            (self.config.as_ref().and_then(|c| c.dir()).is_some() && !cfg!(target_arch = "wasm32")).then(default_folder)
         } else {
             Some(std::path::PathBuf::from(d.disk_cache_folder.trim()))
         };
@@ -132,6 +132,10 @@ impl Session {
             },
         };
         self.layer_cache.set_disk(Some((dc.clone(), footage_salt(&self.project))));
+        // Roto Brush / Object Matte segmentations persist there too (held weakly: switching the
+        // disk cache off drops it).
+        let store: std::sync::Arc<dyn effectcraft_effects::roto::SegStore> = dc.clone();
+        effectcraft_effects::roto::set_seg_store(Some(std::sync::Arc::downgrade(&store)));
         self.disk_cache = Some(dc);
     }
 
