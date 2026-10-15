@@ -226,13 +226,25 @@ fn import_rasters(s: &mut Session, plan: &Plan, src: &Source, scale: f64, notes:
 }
 
 #[derive(Clone, Copy)]
-enum Fmt { Png, Jpeg }
+enum Fmt {
+    Png,
+    Jpeg,
+}
 impl Fmt {
-    fn ext(self) -> &'static str { match self { Self::Png => "png", Self::Jpeg => "jpg" } }
+    fn ext(self) -> &'static str {
+        match self {
+            Self::Png => "png",
+            Self::Jpeg => "jpg",
+        }
+    }
     fn sniff(bytes: &[u8]) -> Option<Self> {
-        if bytes.starts_with(b"\x89PNG\r\n\x1a\n") { Some(Self::Png) }
-        else if bytes.starts_with(b"\xff\xd8\xff") { Some(Self::Jpeg) }
-        else { None }
+        if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+            Some(Self::Png)
+        } else if bytes.starts_with(b"\xff\xd8\xff") {
+            Some(Self::Jpeg)
+        } else {
+            None
+        }
     }
 }
 
@@ -247,9 +259,7 @@ fn prepare_bitmaps(s: &Session, plan: &Plan, src: &Source) -> Result<Vec<Option<
         let Some(entry) = src.images.get(&raster.node_id) else { continue };
         let encoded = entry.get("base64").and_then(Value::as_str).ok_or_else(|| EngineError::Other("missing validated bitmap bytes".into()))?;
         let bytes = fetch::base64_decode(encoded).map_err(EngineError::Other)?;
-        let format = Fmt::sniff(&bytes)
-            
-            .ok_or_else(|| EngineError::Other("clipboard bitmap is not PNG or JPEG".into()))?;
+        let format = Fmt::sniff(&bytes).ok_or_else(|| EngineError::Other("clipboard bitmap is not PNG or JPEG".into()))?;
         let importer = s.importer.as_ref().ok_or_else(|| EngineError::Other("media import is not available in this build".into()))?;
         let path = dir.join(format!("image-{i}.{}", format.ext())).to_string_lossy().into_owned();
         s.services.store_file(&path, &bytes).map_err(|e| EngineError::Other(format!("cannot store clipboard image: {e}")))?;

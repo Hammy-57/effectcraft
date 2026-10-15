@@ -572,11 +572,7 @@ fn text_buffer_keeps_the_global_pixel_grid_at_integer_placement() {
             for x in 0..direct.width {
                 let sx = x as i64 - shift[0] as i64 + buf.offset[0] as i64;
                 let sy = y as i64 - shift[1] as i64 + buf.offset[1] as i64;
-                let alpha = if sx >= 0 && sy >= 0 && sx < i64::from(buf.img.width) && sy < i64::from(buf.img.height) {
-                    buf.img.get(sx, sy)[3]
-                } else {
-                    0.0
-                };
+                let alpha = if sx >= 0 && sy >= 0 && sx < i64::from(buf.img.width) && sy < i64::from(buf.img.height) { buf.img.get(sx, sy)[3] } else { 0.0 };
                 max_error = max_error.max((direct.get(i64::from(x), i64::from(y))[3] - alpha).abs());
             }
         }

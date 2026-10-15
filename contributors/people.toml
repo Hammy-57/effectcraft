@@ -64,3 +64,7 @@ sync_github_name = true
 
 [people.webdevtodayjason]
 display_name = "Jason Brashear"
+
+[people.hakifx]
+display_name = "Elias"
+consent_source = "Explicit owner request in the FigCraft contribution PR chat, 2026-10-15: Use Elias."
