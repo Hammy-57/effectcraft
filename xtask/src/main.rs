@@ -28,8 +28,8 @@ mod bench;
 mod fmt;
 mod fuzz;
 mod ico;
-mod repros;
 mod pdf_deps;
+mod repros;
 mod version;
 
 use std::process::{Command, ExitCode};
