@@ -492,7 +492,9 @@ mod elias_tests {
         let preset = fresh.presets.iter().find(|p| p.name == "Elias AE").unwrap();
         assert_eq!(preset.overrides["view.fit"], ["Shift+F"]);
         for keys in preset.overrides.values() {
-            for key in keys { assert!(normalize(key).is_some(), "{key}"); }
+            for key in keys {
+                assert!(normalize(key).is_some(), "{key}");
+            }
         }
         let existing = Keymaps::from_json(r#"{"active":"Elias AE","presets":[{"name":"Elias AE","overrides":{"view.fit":["F12"]}}]}"#);
         assert_eq!(existing.presets.iter().filter(|p| p.name == "Elias AE").count(), 1);

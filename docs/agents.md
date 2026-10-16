@@ -1049,7 +1049,7 @@ effectcraft-cli exec file.exportTimeline '{"comp":"Main","path":"Main.xml"}' mai
 effectcraft-cli exec file.exportTimeline '{"comp":"Main","path":"Main.otio","prerender":"none"}' main.ecproj
 ```
 
-`file.importTimeline` returns `{format, folder, comps, allComps, items, missing, warnings}`
+`file.importTimeline` returns `{format, folder, comps, allComps, items, missing, warnings, supportsSourceTimeKeys}`
 (`missing` lists media imported as placeholders). `file.exportTimeline` writes Final Cut Pro XML
 (`.xml`, which Premiere Pro opens with File ▸ Import) unless `format` or the extension says
 `fcpxml`, `otio`, `edl`, `aaf` or `omf`; `prerender` (`unsupported` by default, `all`, `none`) controls which

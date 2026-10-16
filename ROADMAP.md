@@ -1,5 +1,7 @@
 # EffectCraft Roadmap
 
+- DL1: Native FilmCraft handoff protocol and tagged source-time OTIO keyframes preserve trimmed animation while retaining legacy import behavior ([contract](crates/interchange/README.md)). Synthetic regression coverage; parity estimates unchanged.
+
 **Stage: alpha** · next: beta, ~30 points of "ready for real work" and ~350–620 h away
 
 > **Last reviewed:** 2026-10-12 · **Last updated:** 2026-10-15 · **Change:** minor (FigCraft v2 bitmap/paint transfer verified on 529 private frames; portable collection with dependency warnings; runtime acceptance pending; mask/shape interaction fixes, native panel windows, graph editing and verified ordinary FigCraft Copy; parity estimates unchanged) · **Target:** Adobe After Effects 2026 (26.5.0.89)

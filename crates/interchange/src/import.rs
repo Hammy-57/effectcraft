@@ -143,6 +143,7 @@ pub fn import(
     if depth > MAX_DEPTH {
         return Err(Error::TooDeep(MAX_DEPTH));
     }
+    let source_time_keys = format == TimelineFormat::Otio && source_key_times(bytes)?;
     let fc_opts = filmcraft_interchange::ImportOptions {
         base_dir: opts.base_dir.clone(),
         edl_frame_rate: opts.edl_frame_rate.map(|f| {
@@ -158,15 +159,64 @@ pub fn import(
     }
     let folder_name = if opts.name.is_empty() { "Imported Timeline".to_string() } else { opts.name.clone() };
     res.folder = project.add_item(&folder_name, Label::None, None, ItemKind::Folder);
-    let mut im = Importer { src: &imported.project, project, res, items: HashMap::new(), solids: HashMap::new(), solids_folder: None, bins: HashMap::new() };
+    let mut im = Importer {
+        src: &imported.project,
+        project,
+        res,
+        source_time_keys,
+        items: HashMap::new(),
+        solids: HashMap::new(),
+        solids_folder: None,
+        bins: HashMap::new(),
+    };
     im.run(&imported.sequences, probe);
     Ok(im.res)
+}
+
+// Read only the timing tag, skipping the timeline tree instead of allocating a second JSON tree.
+#[derive(Deserialize)]
+struct TimingDocument {
+    metadata: Option<TimingMetadata>,
+}
+#[derive(Deserialize)]
+struct TimingMetadata {
+    filmcraft: Option<FilmcraftTiming>,
+}
+#[derive(Deserialize)]
+struct FilmcraftTiming {
+    keyframe_time_base: Option<KeyTimeBase>,
+}
+struct KeyTimeBase(bool);
+impl<'de> Deserialize<'de> for KeyTimeBase {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct Tag;
+        impl serde::de::Visitor<'_> for Tag {
+            type Value = KeyTimeBase;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("source or clip keyframe time base")
+            }
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> std::result::Result<KeyTimeBase, E> {
+                match value {
+                    "source" => Ok(KeyTimeBase(true)),
+                    "clip" => Ok(KeyTimeBase(false)),
+                    _ => Err(E::custom("unsupported keyframe time base")),
+                }
+            }
+        }
+        deserializer.deserialize_str(Tag)
+    }
+}
+fn source_key_times(bytes: &[u8]) -> Result<bool> {
+    let doc: TimingDocument = serde_json::from_slice(bytes)
+        .map_err(|_| Error::Interchange(filmcraft_interchange::Error::Other("invalid FilmCraft keyframe timing metadata".into())))?;
+    Ok(doc.metadata.and_then(|m| m.filmcraft).and_then(|m| m.keyframe_time_base).is_some_and(|tag| tag.0))
 }
 
 struct Importer<'a> {
     src: &'a fp::Project,
     project: &'a mut Project,
     res: ImportResult,
+    source_time_keys: bool,
     /// Source item → created item (footage, comp).
     items: HashMap<fp::ItemId, ItemId>,
     /// Generator / adjustment solids by (source item, width, height).
@@ -475,8 +525,10 @@ impl Importer<'_> {
         if ti.frame_hold.is_some() || ti.effects.iter().any(|e| e.effect == "time_remap" && e.params.values().any(|p| p.is_animated())) {
             self.time_remap(&mut l, ti);
         }
-        // Keyframe times: clip time → layer time.
-        let to_layer = |l: &Layer, k: filmcraft_time::Tick| l.layer_time(start + tick_in(k));
+        let source_time_keys = self.source_time_keys;
+        let to_layer = |l: &Layer, k: filmcraft_time::Tick| {
+            if source_time_keys { tick_in(k) } else { l.layer_time(start + tick_in(k)) }
+        };
         if audio_track {
             self.audio_levels(&mut l, ti, track, &fades, to_layer);
         } else {

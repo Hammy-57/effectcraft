@@ -537,3 +537,23 @@ fn deeply_nested_documents_error_instead_of_overflowing_the_stack() {
     assert_eq!(super::import::xml_depth(b"<a><!-- <b><b> --><c x='>'/><![CDATA[<d>]]><e></e></a>"), 2);
     assert_eq!(super::import::json_depth(br#"{"a": "[[[{{", "b": [[1], {"c": "\\\"["}]}"#), 3);
 }
+
+#[test]
+fn otio_source_time_keys_do_not_apply_trim_and_speed_twice() {
+    let (doc, main) = edit();
+    let (bytes, _) = fc::export(&doc, main, fc::Format::Otio, &Default::default()).unwrap();
+    let mut timeline: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    timeline["metadata"]["filmcraft"]["keyframe_time_base"] = serde_json::json!("source");
+    let (project, result) = import_doc(&serde_json::to_vec(&timeline).unwrap(), "source.otio", &mut probe);
+    let comp = project.comp(result.comps[0]).unwrap();
+    let fast = comp.layers.iter().find(|layer| (layer.stretch - 50.0).abs() < 0.001).unwrap();
+    let keys = &fast.transform().unwrap().get("position").unwrap().keys;
+    assert_eq!(keys.len(), 2);
+    assert_eq!(keys[0].time, t(0.0));
+    assert_eq!(keys[1].time, t(1.0));
+    timeline["metadata"]["filmcraft"].as_object_mut().unwrap().remove("keyframe_time_base");
+    let (legacy, result) = import_doc(&serde_json::to_vec(&timeline).unwrap(), "legacy.otio", &mut probe);
+    let comp = legacy.comp(result.comps[0]).unwrap();
+    let fast = comp.layers.iter().find(|layer| (layer.stretch - 50.0).abs() < 0.001).unwrap();
+    assert_eq!(fast.transform().unwrap().get("position").unwrap().keys[1].time, fast.layer_time(t(2.0)));
+}

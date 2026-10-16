@@ -512,10 +512,12 @@ fn shortcut_edits_detect_conflicts_and_create_a_custom_preset() {
 fn shortcut_presets_duplicate_rename_delete_export_import() {
     let d = tmp("presets");
     let mut s = Session::default();
+    let mut expected_names = s.keymaps.names();
+    expected_names.extend(["Mine".to_string(), "Mine 2".to_string()]);
     s.execute("shortcuts.preset", json!({"op": "new", "name": "Mine"})).unwrap();
     s.execute("shortcuts.set", json!({"command": "edit.undo", "keys": ["Cmd+Z", "F2"]})).unwrap();
     s.execute("shortcuts.preset", json!({"op": "duplicate", "name": "Mine 2"})).unwrap();
-    assert_eq!(s.keymaps.names(), vec![DEFAULT_PRESET, "Mine", "Mine 2"]);
+    assert_eq!(s.keymaps.names(), expected_names);
     s.execute("shortcuts.preset", json!({"op": "rename", "name": "Mine 2", "newName": "Other"})).unwrap();
     assert!(s.execute("shortcuts.preset", json!({"op": "delete", "name": DEFAULT_PRESET})).is_err());
     let path = d.join("mine.json");
