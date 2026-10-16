@@ -1205,9 +1205,12 @@ mod tests {
         sort_items(&mut rows, "size", true);
         assert_eq!(rows.iter().map(|item| item.name.as_str()).collect::<Vec<_>>(), ["Large", "Small", "Zero", "Missing", "Folder"]);
         std::fs::OpenOptions::new().write(true).open(files.0.join("Small")).unwrap().set_len(30).unwrap();
+        // The app refreshes the file stamps when it regains focus and every few seconds.
+        effectcraft_engine::render::disk_cache::refresh_file_stamps();
         sort_items(&mut rows, "size", false);
         assert_eq!(rows.iter().map(|item| item.name.as_str()).collect::<Vec<_>>(), ["Folder", "Missing", "Zero", "Large", "Small"]);
         std::fs::remove_file(files.0.join("Large")).unwrap();
+        effectcraft_engine::render::disk_cache::refresh_file_stamps();
         sort_items(&mut rows, "size", false);
         assert_eq!(rows.iter().map(|item| item.name.as_str()).collect::<Vec<_>>(), ["Folder", "Large", "Missing", "Zero", "Small"]);
     }

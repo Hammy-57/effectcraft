@@ -267,7 +267,11 @@ fn exec_on_keys(s: &mut Session, id: &str, params: J, targets: &J) -> Result<J, 
     let comp = s.active_comp();
     let exists = |k: &KeyRef| comp.and_then(|c| c.layer(k.layer)).and_then(|l| l.props.find(k.prop)).is_some_and(|pr| pr.keys.iter().any(|x| x.time == k.time));
     s.state.selected_keys = saved.into_iter().filter(exists).collect();
-    leave_comp(s, id, cid, prev);
+    // With no comp active before, none is active after (activation only held the keys' comp).
+    match prev {
+        None => s.activate_comp_none(),
+        Some(_) => leave_comp(s, id, cid, prev),
+    }
     r
 }
 

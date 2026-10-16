@@ -43,3 +43,5 @@ mod repros;
 mod timeline_interop;
 #[path = "../vector_import.rs"]
 mod vector_import;
+#[path = "../webm_metadata.rs"]
+mod webm_metadata;

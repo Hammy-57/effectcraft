@@ -92,7 +92,8 @@ fn probe_audio_headers(path: &Path, name: &str) -> Option<Footage> {
     let track = format.default_track()?.clone();
     let rate = track.codec_params.sample_rate?;
     let frames = match track.codec_params.n_frames {
-        Some(n) if n > 0 && track.codec_params.codec == CODEC_TYPE_FLAC => n,
+        // AIFF's COMM chunk gives the exact frame count too (packet framing rounds it up, #1428).
+        Some(n) if n > 0 && (track.codec_params.codec == CODEC_TYPE_FLAC || matches!(ext.as_str(), "aif" | "aiff" | "aifc")) => n,
         _ => {
             let mut n = 0u64;
             loop {
