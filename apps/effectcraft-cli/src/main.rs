@@ -108,7 +108,7 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
   get <comp> <layer> <path> [--time S]     read a property
   set <comp> <layer> <path> <value> [--time S] [--expression E]
   render-frame [--comp C] [--time S | --frame N] [--max-side PX | --scale K] [--out F.png] [--transparent]
-  render [--comp C] --out FILE [--format F] [--start S] [--end S] [--work-area] [--fps N]
+  render [--comp C] --out FILE [--format F] [--link-output] [--start S] [--end S] [--work-area] [--fps N]
          [--resolution full|half|third|quarter|K] [--quality best|draft] [--channels rgb|rgba]
          [--jpeg-quality N] [--bitrate KBPS] [--prores PROFILE] [--audio auto|on|off]
          [--profile main|main10] [--level auto|4.1] [--rate-control bitrate|quality] [--video-quality N]
@@ -238,6 +238,7 @@ const FLAGS: &[&str] = &[
     "--transparent",
     "--work-area",
     "--queue",
+    "--link-output",
     "--ops",
     "--small",
     "--adv3d",
@@ -982,6 +983,9 @@ fn render(args: &Args, json_out: bool) -> Result<(), Failure> {
         let Some(out) = args.opt("--out") else { return usage_err("render: --out FILE is required (or --queue)") };
         let out = &from_cwd(out)?;
         let mut p = json!({"output": out});
+        if args.flag("--link-output") {
+            p["linkOutput"] = json!(true);
+        }
         // Same resolution as `render-frame`: a number is a comp id, `-` the active comp, else a name.
         if let Some(c) = args.opt("--comp").and_then(reference) {
             p["comp"] = c;

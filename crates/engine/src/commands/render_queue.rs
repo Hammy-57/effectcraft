@@ -517,8 +517,19 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
     let mut it = RenderQueueItem::new(0, cid);
     // New items start from the Movie Default templates (Edit ▸ Templates).
     let templates = s.project.render_templates.clone();
-    it.settings = templates.default_render_settings(TemplateSlot::Movie);
-    it.output = templates.default_output_module(TemplateSlot::Movie);
+    let link_output = match p.get("linkOutput") {
+        None | Some(Value::Bool(false)) => false,
+        Some(Value::Bool(true)) => true,
+        _ => return Err(bad("renderQueue.add", "linkOutput must be a boolean")),
+    };
+    if link_output {
+        // A linked source must not inherit a project's draft/resize/export presets.
+        it.settings.time_span = TimeSpan::LengthOfComp;
+        it.settings.storage_overflow = false;
+    } else {
+        it.settings = templates.default_render_settings(TemplateSlot::Movie);
+        it.output = templates.default_output_module(TemplateSlot::Movie);
+    }
     if let Some(f) = str_p(p, "format") {
         let f = OutputFormat::from_name(f).ok_or_else(|| bad("renderQueue.add", FORMATS))?;
         if f != it.output.format {
@@ -1000,7 +1011,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Add to Render Queue",
             ["Composition"],
             ["Cmd+M", "Cmd+Shift+/"],
-            "{comp?: id|name, template?: Render Settings template, format?: h264|hevc|av1|prores|uncompressed|webm|png|jpeg|tiff|exr|gif|wav|aiff, output?: path|template, log?: errorsOnly|plusSettings|plusPerFrameInfo, quality?: best|draft|1-100 (jpeg, webm), resolution?: full|half|third|quarter|scale, proxyUse?, effects?, solo?, guideLayers?, colorDepth?, frameBlending?, fieldRender?, pulldown?, motionBlur?, timeSpan?: workArea|comp|custom, start?: s, end?: s, duration?: s, frameRate?: fps|null, skipExisting?: bool, storageOverflow?: bool, channels?: rgb|rgba|alpha, color?, bitrate?: kbps, webmBitrate?, keyframeInterval?, proresProfile?, profile?, level?, rateControl?, webmCodec?, audioBitrate?, opusApplication?, crop?, resize?, includeProjectLink?, audio?: auto|on|off, sampleRate?, audioChannels?, audioFormat?, loop?: bool (values as in setRenderSettings / setOutputModule)}",
+            "{comp?: id|name, linkOutput?: bool (ignore saved Movie Default templates), template?: Render Settings template, format?: h264|hevc|av1|prores|uncompressed|webm|png|jpeg|tiff|exr|gif|wav|aiff, output?: path|template, log?: errorsOnly|plusSettings|plusPerFrameInfo, quality?: best|draft|1-100 (jpeg, webm), resolution?: full|half|third|quarter|scale, proxyUse?, effects?, solo?, guideLayers?, colorDepth?, frameBlending?, fieldRender?, pulldown?, motionBlur?, timeSpan?: workArea|comp|custom, start?: s, end?: s, duration?: s, frameRate?: fps|null, skipExisting?: bool, storageOverflow?: bool, channels?: rgb|rgba|alpha, color?, bitrate?: kbps, webmBitrate?, keyframeInterval?, proresProfile?, profile?, level?, rateControl?, webmCodec?, audioBitrate?, opusApplication?, crop?, resize?, includeProjectLink?, audio?: auto|on|off, sampleRate?, audioChannels?, audioFormat?, loop?: bool (values as in setRenderSettings / setOutputModule)}",
             can_add,
             add
         ),

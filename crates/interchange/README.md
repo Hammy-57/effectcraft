@@ -14,5 +14,10 @@ those key times again. Untagged legacy files retain their clip-local time conver
 legacy behavior; `imports_fcp7_xml_fcpxml_and_otio` checks the existing format paths.
 
 The engine's `link.capabilities` command advertises protocol 1, numeric composition IDs and
-source-time keyframe support. `file.importTimeline` reports `supportsSourceTimeKeys: true` alongside
+source-time keyframe support, and neutral render defaults. `file.importTimeline` reports `supportsSourceTimeKeys: true` alongside
 its import result. FilmCraft uses these signals to refuse incompatible renderers safely.
+
+The CLI's `render --link-output` starts from neutral render/output settings instead of a saved
+project's Movie Default templates, disables storage overflow, and retains the caller's explicit
+output options. FilmCraft uses it with full-resolution ProRes 4444, straight alpha, the composition
+frame rate and no audio. Normal render commands still honor project templates.

@@ -209,7 +209,7 @@ fn timeline_formats(_: &mut Session, _: &Value) -> Result<Value> {
 pub fn specs() -> Vec<CommandSpec> {
     vec![
         cmd!("link.capabilities", "Composition Link Capabilities", [], None, "{}", always, |_, _| {
-            Ok(json!({"protocol": 1, "compositionIds": true, "sourceTimeKeys": true}))
+            Ok(json!({"protocol": 1, "compositionIds": true, "sourceTimeKeys": true, "neutralRenderDefaults": true}))
         }),
         cmd!(
             "file.importTimeline",

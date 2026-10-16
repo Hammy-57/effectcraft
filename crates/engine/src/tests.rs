@@ -776,3 +776,46 @@ fn reopening_a_project_restores_its_active_comp() {
         o.insert("openComps".into(), open);
     }
 }
+
+#[test]
+fn link_output_ignores_saved_movie_templates_without_changing_them() {
+    use effectcraft_project::render_queue::{OutputFormat, OutputModule, RenderSettings, TimeSpan};
+    use effectcraft_project::render_templates::TemplateSlot;
+    let mut session = Session::default();
+    let comp = session.execute("comp.new", json!({"width":64,"height":64,"frameRate":24,"duration":1})).unwrap()["comp"].as_u64().unwrap();
+    let templates = &mut std::sync::Arc::make_mut(&mut session.project).render_templates;
+    templates.render_settings.push(RenderSettings {
+        name: "Tiny settings".into(),
+        resolution: 0.25,
+        frame_rate: Some(effectcraft_time::FrameRate::new(12, 1)),
+        ..Default::default()
+    });
+    let mut output = OutputModule::for_format(OutputFormat::ProRes);
+    output.name = "Tiny movie".into();
+    output.resize.enabled = true;
+    output.resize.width = 16;
+    output.resize.height = 16;
+    output.crop.enabled = true;
+    output.crop.left = 8;
+    templates.output_modules.push(output);
+    templates.defaults.render_settings = vec![(TemplateSlot::Movie, "Tiny settings".into())];
+    templates.defaults.output_modules = vec![(TemplateSlot::Movie, "Tiny movie".into())];
+    let original = templates.clone();
+    for invalid in [json!("yes"), json!(null), json!(1)] {
+        let before = session.project.clone();
+        assert!(session.execute("renderQueue.add", json!({"comp":comp,"linkOutput":invalid})).is_err());
+        assert_eq!(session.project, before);
+    }
+    session.execute("renderQueue.add", json!({"comp":comp,"format":"prores"})).unwrap();
+    let normal = session.project.render_queue.last().unwrap();
+    assert!(normal.output.resize.enabled && normal.output.crop.enabled);
+    assert_eq!(normal.settings.resolution, 0.25);
+    session.execute("renderQueue.add", json!({"comp":comp,"format":"prores","linkOutput":true})).unwrap();
+    let linked = session.project.render_queue.last().unwrap();
+    assert!(!linked.output.resize.enabled && !linked.output.crop.enabled);
+    assert_eq!(linked.settings.resolution, 1.0);
+    assert!(linked.settings.frame_rate.is_none());
+    assert_eq!(linked.settings.time_span, TimeSpan::LengthOfComp);
+    assert!(!linked.settings.storage_overflow);
+    assert_eq!(session.project.render_templates, original);
+}
