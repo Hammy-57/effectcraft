@@ -636,6 +636,9 @@ pub struct GpuContext {
     /// RT10e: the window's traffic light, when this device is the window's (its submissions
     /// then pause while a surface reconfigures; see [`crate::traffic_light`]).
     light: std::sync::OnceLock<Arc<crate::TrafficLight>>,
+    /// The device belongs to a `wgpu::Instance` of its own ([`Self::request`],
+    /// [`Self::request_off_window`]), not the window's.
+    own_instance: bool,
     pub(crate) name: String,
     pub(crate) max_dim: u32,
     integrated: bool,
@@ -714,12 +717,27 @@ fn storage_tex_entry(binding: u32, format: wgpu::TextureFormat) -> wgpu::BindGro
     }
 }
 
+/// Logs (target `effectcraft_stall`, debug) a GPU resource that took long to create.
+#[cfg(not(target_arch = "wasm32"))]
+struct SlowLog<'a>(&'a str, web_time::Instant);
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for SlowLog<'_> {
+    fn drop(&mut self) {
+        let took = self.1.elapsed();
+        if took >= std::time::Duration::from_millis(150) {
+            log::debug!(target: "effectcraft_stall", "gpu: creating {} took {:.0} ms on {}", self.0, took.as_secs_f64() * 1000.0, std::thread::current().name().unwrap_or("?"));
+        }
+    }
+}
+
 /// Contain synchronous native initialization errors without replacing the device owner's
 /// handlers. Scopes are thread-local with wgpu's enabled `std` feature. The pinned native
 /// wgpu-core backend returns an immediately-ready future from pop_error_scope, so these
 /// drains do not poll or wait for unrelated submitted GPU work.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn init_resource<T>(device: &wgpu::Device, label: &str, create: impl FnOnce() -> T) -> Result<T, String> {
+    let t0 = web_time::Instant::now();
+    let _slow = SlowLog(label, t0);
     let oom = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
     let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
     let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
@@ -843,6 +861,7 @@ impl GpuContext {
             include_str!("shaders/sky.wgsl"),
         ]
         .concat();
+        let compile_start = web_time::Instant::now();
         let module = init_resource(&device, "kernels shader module", || {
             device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("effectcraft kernels"), source: wgpu::ShaderSource::Wgsl(src.into()) })
         })?;
@@ -959,6 +978,12 @@ impl GpuContext {
                 }
             }
         }
+        log::info!(
+            "gpu {name}: {} compute kernels built in {:.1} s ({} unavailable)",
+            pipelines.len(),
+            compile_start.elapsed().as_secs_f64(),
+            unavailable.len()
+        );
         let dmodule = init_resource(&device, "display shader module", || {
             device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("effectcraft display"),
@@ -1028,6 +1053,7 @@ impl GpuContext {
             device,
             queue,
             light: std::sync::OnceLock::new(),
+            own_instance: false,
             name,
             max_dim,
             bgl,
@@ -1082,6 +1108,13 @@ impl GpuContext {
     /// configuration must not overlap a submission). Once; `false` when a light is already set.
     pub fn set_traffic_light(&self, light: Arc<crate::TrafficLight>) -> bool {
         self.light.set(light).is_ok()
+    }
+
+    /// The device belongs to a `wgpu::Instance` of its own. `wgpu::Device` equality compares
+    /// ids that are only unique within one instance, so such a device can compare equal to the
+    /// window's without being it: never share textures with the window then.
+    pub fn own_instance(&self) -> bool {
+        self.own_instance
     }
 
     /// The traffic light the compositor submits through, if any.
@@ -1301,7 +1334,37 @@ impl GpuContext {
             .request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, ..Default::default() })
             .await
             .map_err(|e| format!("no adapter: {e}"))?;
-        Self::request_on_adapter(&adapter).await
+        let mut context = Self::request_on_adapter(&adapter).await?;
+        context.own_instance = true;
+        Ok(context)
+    }
+
+    /// A device of its own on the best Vulkan, Metal or DirectX 12 adapter, when the window's
+    /// adapter `window` is OpenGL or a CPU device and a better one exists (see
+    /// [`crate::adapter_choice`]); `None` to stay on the window's. Ignores `WGPU_BACKEND`,
+    /// which chose the window's API.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn request_off_window(window: &wgpu::AdapterInfo) -> Option<Result<GpuContext, String>> {
+        use crate::adapter_choice::{pick_compositor_adapter, window_adapter_unfit};
+        if !window_adapter_unfit(window.backend, window.device_type) {
+            return None;
+        }
+        let backends = wgpu::Backends::VULKAN | wgpu::Backends::METAL | wgpu::Backends::DX12;
+        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+        desc.backends = backends;
+        let instance = wgpu::Instance::new(desc);
+        let adapters = instance.enumerate_adapters(backends).await;
+        let kinds: Vec<_> = adapters.iter().map(|a| a.get_info()).map(|i| (i.backend, i.device_type)).collect();
+        let adapter = adapters.get(pick_compositor_adapter((window.backend, window.device_type), &kinds)?)?;
+        Some(
+            Self::request_on_adapter(adapter)
+                .await
+                .map(|mut context| {
+                    context.own_instance = true;
+                    context
+                })
+                .map_err(|e| format!("{} ({:?}): {e}", adapter.get_info().name, adapter.get_info().backend)),
+        )
     }
 
     /// Request a separate device on an existing adapter (the desktop window's adapter).

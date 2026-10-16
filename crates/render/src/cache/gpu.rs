@@ -444,7 +444,7 @@ mod tests {
         assert!(c.get(99).is_none());
         assert!(c.get(99).is_none());
         assert_eq!(read.calls.load(Ordering::Relaxed), 2);
-        assert!(c.inflight.lock().unwrap().is_empty());
+        assert!(c.inflight.lock().unwrap().map.is_empty());
         c.clear();
         lazy(&c, GpuStage::Blend, read.clone());
         assert!(c.get(99).is_none());
@@ -572,7 +572,7 @@ mod tests {
         assert_eq!(read.calls.load(Ordering::Relaxed), 0);
         assert!(c.get(99).is_none());
         assert_eq!(read.calls.load(Ordering::Relaxed), 1);
-        assert!(c.inflight.lock().unwrap().is_empty());
+        assert!(c.inflight.lock().unwrap().map.is_empty());
     }
     #[test]
     fn lazy_concurrent_cpu_demand_coalesces() {

@@ -264,6 +264,9 @@ fn main() -> eframe::Result {
         let _ = session.execute("window.restoreScriptPanels", json!({}));
         let mut app = EffectcraftApp::new(session);
         app.set_gpu_failure_bridge(gpu_failures);
+        if on_gl {
+            app.keep_compositor_on_window_adapter();
+        }
         if let Some(gate) = &app_gate {
             app.share_display_device(Some(gate.light.clone()));
         }
@@ -379,6 +382,8 @@ fn main() -> eframe::Result {
         Err(e) => {
             if on_gl {
                 launch_guard::opengl_failed(effectcraft_host::config_dir().as_deref());
+            } else {
+                launch_guard::window_failed(effectcraft_host::config_dir().as_deref());
             }
             startup_failed(e, !on_gl && cfg!(not(target_os = "macos")));
         }

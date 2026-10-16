@@ -248,8 +248,22 @@ impl<'a> Renderer<'a> {
                 return Some((b, key));
             }
         }
+        let t0 = web_time::Instant::now();
         let buf = self.masked_source(ctx, layer, clip)?;
+        let t1 = web_time::Instant::now();
         let (buf, kept) = self.apply_effects_kept(ctx, layer, buf, false, usize::MAX, timing.map(|t| &mut t.effects));
+        if t0.elapsed() >= std::time::Duration::from_millis(400) {
+            log::debug!(
+                target: "effectcraft_stall",
+                "layer {:?} at {:.3}: source {:.0} ms, effects {:.0} ms (key {}, {})",
+                layer.name,
+                ctx.time.seconds(),
+                (t1 - t0).as_secs_f64() * 1000.0,
+                t1.elapsed().as_secs_f64() * 1000.0,
+                key.is_some(),
+                if _flight.is_some() { "owner" } else { "unclaimed" }
+            );
+        }
         let buf = Arc::new(buf);
         // The accelerator composites this buffer from the effects' result on the device (no
         // second upload), unless it blends a converted copy (linear blending).

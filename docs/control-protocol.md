@@ -189,6 +189,14 @@ remain stale during a stall. Inspect its age and `waiting`, and sample `time`/`f
 playback loop ranges to observe timeline progress. Neither these samples nor `shown` establish
 physical presentation FPS. The existing `playback` object remains available for compatibility.
 
+`ui.inspect.renderQueue` shows what the preview's frame renderer is doing: `queued` (and the first
+`queuedFrames`), the frames `running`, `landing` (GPU frames whose readback is in flight),
+`parked` (jobs waiting for memory), `urgentRunning`, `inflight` (queued or rendering) and
+`layerCacheWaitTimeouts` (process-wide count of frame threads that gave up waiting for another
+thread's layer render). A frame stuck in `running` while playback waits, with the CPU idle, is a
+stall; run with `RUST_LOG=warn,effectcraft=info,effectcraft_stall=debug` to log every slow frame,
+decode, wait and GPU pipeline creation (over 150 ms) with its thread.
+
 `keyboardFocus` is `null` when no egui widget has keyboard focus. Otherwise it contains the
 actual widget `id` (hexadecimal), its `rect: [x, y, w, h]` when available, an `automationId`
 when the widget registered its response identity, and `registryCandidates` containing exact

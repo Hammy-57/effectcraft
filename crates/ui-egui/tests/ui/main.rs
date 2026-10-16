@@ -111,6 +111,8 @@ mod ui_panel_windows;
 mod ui_panels;
 #[path = "../ui_parameter_spacing.rs"]
 mod ui_parameter_spacing;
+#[path = "../ui_playback_cache_edge.rs"]
+mod ui_playback_cache_edge;
 #[path = "../ui_preview_align.rs"]
 mod ui_preview_align;
 #[path = "../ui_project_delete.rs"]
