@@ -1525,6 +1525,7 @@ impl EffectcraftApp {
         }
     }
 
+    #[track_caller]
     pub fn stop(&mut self) {
         let was = std::mem::replace(&mut self.playback.playing, false);
         self.frames.set_playhead(None);
@@ -1533,6 +1534,8 @@ impl EffectcraftApp {
         if !was {
             return;
         }
+        // Which path ended the preview (a preview that stops by itself is otherwise a mystery).
+        log::info!("preview stopped at {:.3} s after {} frames (from {})", self.session.time().seconds(), self.playback.shown, std::panic::Location::caller());
         if let Some(m) = self.playback.restore_max.take() {
             self.ui.maximized = m;
         }
