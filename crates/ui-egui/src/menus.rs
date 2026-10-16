@@ -1101,12 +1101,26 @@ fn handle_shortcuts_impl(app: &mut EffectcraftApp, ctx: &egui::Context, tab_only
             }
             continue;
         }
-        if let Some((_, _, id, params)) = binds.iter().filter(|(m, k, ..)| *k == key && mods_match(*m, mods)).min_by_key(|(_, _, id, params)| {
-            // The focused panel wins over an application command sharing its chord.
-            let key = effectcraft_engine::shortcuts::binding_key(id, params);
-            app.session.shortcuts().find(&key).is_none_or(|b| b.scope != app.ui.focused.id())
-        }) {
+        // macOS ISO layouts can report `<` as a logical punctuation key while retaining
+        // IntlBackslash (or Backtick) as its physical position.
+        let iso_maximize = |k: egui::Key, id: &str| {
+            id == "window.maximizePanel"
+                && matches!(k, egui::Key::Backtick | egui::Key::IntlBackslash)
+                && matches!(physical_key, Some(egui::Key::IntlBackslash | egui::Key::Backtick))
+        };
+        if let Some((_, _, id, params)) =
+            binds.iter().filter(|(m, k, id, _)| (*k == key || iso_maximize(*k, id)) && mods_match(*m, mods)).min_by_key(|(_, _, id, params)| {
+                // The focused panel wins over an application command sharing its chord.
+                let key = effectcraft_engine::shortcuts::binding_key(id, params);
+                app.session.shortcuts().find(&key).is_none_or(|b| b.scope != app.ui.focused.id())
+            })
+        {
             let (id, params) = (id.clone(), if params.is_null() { json!({}) } else { params.clone() });
+            let params = if id == "window.maximizePanel" && matches!(physical_key, Some(egui::Key::IntlBackslash | egui::Key::Backtick)) {
+                json!({"panel": app.ui.focused.id()})
+            } else {
+                params
+            };
             if id == "edit.paste"
                 && let Some(t) = &pasted
             {

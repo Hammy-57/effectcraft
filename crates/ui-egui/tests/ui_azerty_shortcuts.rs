@@ -101,3 +101,23 @@ fn timeline_shift_p_reveals_instead_of_adding_a_text_animator() {
     assert!(h.state().ui.timeline.reveal.contains(&"position".to_string()));
     assert!(h.state().ui.status.is_empty());
 }
+
+#[test]
+fn iso_physical_key_maximizes_active_panel_and_restores_layout() {
+    use effectcraft_ui_egui::dock::PanelKind;
+    for physical in [Key::IntlBackslash, Key::Backtick] {
+        let app = EffectcraftApp::new(Session::default());
+        let mut h = Harness::builder().with_size(vec2(1200.0, 800.0)).build_eframe(|_| app);
+        h.run_steps(3);
+        h.state_mut().ui.focused = PanelKind::Timeline;
+        let layout = h.state().ui.dock.clone();
+        for expected in [Some(PanelKind::Timeline), None] {
+            for pressed in [true, false] {
+                h.event(Event::Key { key: Key::Backslash, physical_key: Some(physical), pressed, repeat: false, modifiers: Modifiers::NONE });
+                h.step();
+            }
+            assert_eq!(h.state().ui.maximized, expected);
+            assert_eq!(h.state().ui.dock, layout);
+        }
+    }
+}
