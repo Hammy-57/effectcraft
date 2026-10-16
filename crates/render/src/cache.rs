@@ -74,8 +74,9 @@ pub struct LayerCache {
     store: Mutex<Option<(Arc<dyn LayerStore>, u64)>>,
     /// While set, inserts are dropped (see [`LayerCache::set_gate`]).
     gate: Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>,
-    /// Keys being rendered right now, by whom (see [`LayerCache::claim`]).
-    inflight: Arc<Mutex<HashMap<u64, Arc<Flight>>>>,
+    /// Keys being rendered right now, by whom, and owners that stopped making progress (see
+    /// [`LayerCache::claim`]).
+    inflight: Arc<Mutex<Flights>>,
     /// Precomp layers' consecutive key misses (see [`LayerCache::precomp_try`]).
     streaks: Mutex<HashMap<u64, u32>>,
     /// Shape layers' whole raster buffers by content key (see [`LayerCache::shape_rect`]).
@@ -379,7 +380,7 @@ impl LayerCache {
             disk: Mutex::new(None),
             store: Mutex::new(None),
             gate: Mutex::new(None),
-            inflight: Arc::new(Mutex::new(HashMap::new())),
+            inflight: Arc::default(),
             streaks: Mutex::new(HashMap::new()),
             shape_rects: Mutex::new(HashMap::new()),
             shape_keys: Mutex::new(HashMap::new()),
@@ -918,23 +919,34 @@ impl LayerCache {
         self.claim_inner(key, false, true)
     }
     fn claim_inner(&self, key: u64, cpu_demand: bool, wait: bool) -> Claim {
-        let me = std::thread::current().id();
+        let me = std::thread::current();
+        let pool = rayon::current_thread_index().is_some();
         let flight = {
             let mut m = self.inflight.lock().unwrap_or_else(PoisonError::into_inner);
-            match m.get(&key) {
-                Some(f) if f.owner == me || !wait => return Claim::Render,
+            match m.map.get(&key) {
+                Some(f) if f.owner.id() == me.id() || !wait => return Claim::Render,
+                // Its owner is stuck (a wait for one of its renders ran out): render it here
+                // rather than wait for each of its renders in turn.
+                Some(f) if pool && m.stalled.contains_key(&f.owner.id()) => return Claim::Render,
                 Some(f) => f.clone(),
                 None => {
-                    if m.len() >= 4096 || m.try_reserve(1).is_err() {
+                    if m.map.len() >= 4096 || m.map.try_reserve(1).is_err() {
                         return Claim::Render;
                     }
                     let f = Arc::new(Flight { owner: me, done: Mutex::new(false), cv: Condvar::new() });
-                    m.insert(key, f.clone());
+                    m.map.insert(key, f.clone());
                     return Claim::Owner(FlightGuard { inflight: Arc::downgrade(&self.inflight), key, flight: f });
                 }
             }
         };
         if !flight.wait() {
+            if pool {
+                let mut m = self.inflight.lock().unwrap_or_else(PoisonError::into_inner);
+                // Until this render of the owner's ends.
+                if m.map.get(&key).is_some_and(|f| Arc::ptr_eq(f, &flight)) {
+                    m.stalled.entry(flight.owner.id()).or_insert_with(|| flight.clone());
+                }
+            }
             return Claim::Render;
         }
         match self.peek(key).or_else(|| cpu_demand.then(|| self.materialize_resident_inner(key, false)).flatten()) {
@@ -1041,9 +1053,26 @@ const WAIT_OTHER: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// A key being rendered.
 struct Flight {
-    owner: std::thread::ThreadId,
+    owner: std::thread::Thread,
     done: Mutex<bool>,
     cv: Condvar,
+}
+
+/// The keys being rendered, and the owners that stopped making progress.
+///
+/// A rayon worker waiting for another thread's render can hold part of that render's parallel
+/// work further down its own stack (stolen while it waited in a join of its own): the owner can't
+/// finish until the waiter returns. Each such wait runs out after [`WAIT_POOL`], and the waiter
+/// renders the key itself; but the stuck owner holds a flight for every layer above it in its
+/// stack and for every layer it had started, and waiting [`WAIT_POOL`] for each of them in turn
+/// froze playback for 10 to 20 seconds with the CPU idle (a 0.5 MB PNG whose decode was stolen
+/// that way took 17 s on a 16-thread PC). So once a wait for an owner runs out, pool threads don't
+/// wait for that owner again until the render they gave up on ends.
+#[derive(Default)]
+struct Flights {
+    map: HashMap<u64, Arc<Flight>>,
+    /// Owners a pool thread gave up waiting for, with the render it waited for.
+    stalled: HashMap<std::thread::ThreadId, Arc<Flight>>,
 }
 
 impl Flight {
@@ -1059,13 +1088,21 @@ impl Flight {
         while !*done {
             let Some(left) = limit.checked_sub(start.elapsed()) else {
                 let n = WAIT_TIMEOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                log::debug!("layer cache: waited {limit:?} for another thread's render, rendering it again ({n} so far)");
+                log::debug!(
+                    target: "effectcraft_stall",
+                    "layer cache: waited {limit:?} for {}'s render, rendering it again ({n} so far)",
+                    self.owner.name().unwrap_or("another thread")
+                );
                 return false;
             };
             done = match self.cv.wait_timeout(done, left) {
                 Ok((g, _)) => g,
                 Err(e) => e.into_inner().0,
             };
+        }
+        let took = start.elapsed();
+        if took >= std::time::Duration::from_millis(150) {
+            log::debug!(target: "effectcraft_stall", "layer cache: waited {:.0} ms for another thread's render", took.as_secs_f64() * 1000.0);
         }
         true
     }
@@ -1084,7 +1121,7 @@ pub enum Claim {
 
 /// Ends a [`LayerCache::claim`] when dropped (also when the render panics).
 pub struct FlightGuard {
-    inflight: Weak<Mutex<HashMap<u64, Arc<Flight>>>>,
+    inflight: Weak<Mutex<Flights>>,
     key: u64,
     flight: Arc<Flight>,
 }
@@ -1094,8 +1131,13 @@ impl Drop for FlightGuard {
         {
             if let Some(inflight) = self.inflight.upgrade() {
                 let mut m = inflight.lock().unwrap_or_else(PoisonError::into_inner);
-                if m.get(&self.key).is_some_and(|f| Arc::ptr_eq(f, &self.flight)) {
-                    m.remove(&self.key);
+                if m.map.get(&self.key).is_some_and(|f| Arc::ptr_eq(f, &self.flight)) {
+                    m.map.remove(&self.key);
+                }
+                // The render a waiter gave up on ended: its owner is moving again.
+                let owner = self.flight.owner.id();
+                if m.stalled.get(&owner).is_some_and(|f| Arc::ptr_eq(f, &self.flight)) {
+                    m.stalled.remove(&owner);
                 }
             }
         }
@@ -2232,6 +2274,63 @@ mod retained_tests {
         // An old producer also carries its original token into the start of relief.
         c.relieve_for(8192, &old);
         assert!(Arc::ptr_eq(&c.get(1).unwrap(), &fresh));
+    }
+}
+
+#[cfg(test)]
+mod tests_stalled_owner {
+    use super::*;
+    use std::time::Instant;
+
+    /// A pool thread whose wait for another thread's render ran out doesn't wait for that
+    /// owner's other renders until the one it gave up on ends: with a 250 ms wait per layer
+    /// key, a stuck owner froze playback for 10 to 20 s with the CPU idle (16 Oct 2026).
+    #[test]
+    fn a_stuck_owner_is_waited_for_once() {
+        let cache = Arc::new(LayerCache::new(1 << 20));
+        // The owner claims three keys and holds them (stuck) until told to let go.
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let owner = {
+            let cache = cache.clone();
+            std::thread::spawn(move || {
+                let guards: Vec<Claim> = (1..=3).map(|k| cache.claim(k)).collect();
+                assert!(guards.iter().all(|c| matches!(c, Claim::Owner(_))));
+                held_tx.send(()).unwrap();
+                rx.recv().unwrap();
+                drop(guards);
+                // A render of its own again: waited for as before.
+                let again = cache.claim(4);
+                held_tx.send(()).unwrap();
+                rx.recv().unwrap();
+                drop(again);
+            })
+        };
+        held_rx.recv().unwrap();
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        let timed = |key: u64| {
+            let cache = cache.clone();
+            pool.install(move || {
+                let t0 = Instant::now();
+                let c = cache.claim(key);
+                (matches!(c, Claim::Render), t0.elapsed())
+            })
+        };
+        let (render, first) = timed(1);
+        assert!(render && first >= WAIT_POOL, "the first wait runs out ({first:?})");
+        for key in [2, 3] {
+            let (render, t) = timed(key);
+            assert!(render && t < WAIT_POOL / 2, "key {key}: no second wait for a stuck owner ({t:?})");
+        }
+        // Its renders end: it isn't stuck any more.
+        tx.send(()).unwrap();
+        held_rx.recv().unwrap();
+        assert!(cache.inflight.lock().unwrap().stalled.is_empty());
+        let (render, t) = timed(4);
+        assert!(render && t >= WAIT_POOL, "waited for again ({t:?})");
+        tx.send(()).unwrap();
+        owner.join().unwrap();
+        assert!(cache.inflight.lock().unwrap().map.is_empty());
     }
 }
 

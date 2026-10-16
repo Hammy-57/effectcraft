@@ -677,6 +677,7 @@ pub fn inspect(app: &EffectcraftApp, ctx: &egui::Context) -> Value {
         "workspaceStorageError": app.workspace_store.error,
         "dialog": app.dialog.map(|d| format!("{d:?}")),
         "renderMs": app.frames.last_ms.lock().map(|v| *v).unwrap_or(0.0),
+        "renderQueue": app.frames.queue_state(),
         // RT10e: GPU viewer frames drawn from their textures, without a copy.
         "zeroCopy": {"active": app.zero_copy_active(), "frames": app.zero_copy_frames(), "viewerOnGpu": app.viewer_on_gpu(), "compositor": app.gpu_adapter()},
     })

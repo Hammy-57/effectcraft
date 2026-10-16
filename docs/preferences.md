@@ -256,3 +256,5 @@ across launches).
 By default the log has `info` records from EffectCraft and warnings and errors from everything
 else. `RUST_LOG` replaces that with env_logger-style directives: `debug`,
 `warn,effectcraft_render=trace`, `wgpu_core=info`. The control-channel token is never logged.
+`warn,effectcraft=info,effectcraft_stall=debug` adds the preview's slow frames, decodes and waits
+(see `renderQueue` in [control-protocol.md](control-protocol.md)).

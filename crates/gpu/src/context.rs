@@ -720,6 +720,8 @@ fn storage_tex_entry(binding: u32, format: wgpu::TextureFormat) -> wgpu::BindGro
 /// drains do not poll or wait for unrelated submitted GPU work.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn init_resource<T>(device: &wgpu::Device, label: &str, create: impl FnOnce() -> T) -> Result<T, String> {
+    let t0 = web_time::Instant::now();
+    let _slow = SlowLog(label, t0);
     let oom = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
     let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
     let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
@@ -843,6 +845,7 @@ impl GpuContext {
             include_str!("shaders/sky.wgsl"),
         ]
         .concat();
+        let compile_start = web_time::Instant::now();
         let module = init_resource(&device, "kernels shader module", || {
             device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("effectcraft kernels"), source: wgpu::ShaderSource::Wgsl(src.into()) })
         })?;
@@ -959,6 +962,12 @@ impl GpuContext {
                 }
             }
         }
+        log::info!(
+            "gpu {name}: {} compute kernels built in {:.1} s ({} unavailable)",
+            pipelines.len(),
+            compile_start.elapsed().as_secs_f64(),
+            unavailable.len()
+        );
         let dmodule = init_resource(&device, "display shader module", || {
             device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("effectcraft display"),
@@ -3375,5 +3384,16 @@ mod upload_budget_tests {
         assert_eq!(g.upload_stats(), (0, 0));
         assert!(a.get(1).is_some() && b.get(2).is_some());
         assert_eq!((a.retained_stats().live_bytes, b.retained_stats().live_bytes), (16, 16));
+    }
+}
+
+/// Logs (target `effectcraft_stall`, debug) a GPU resource that took long to create.
+struct SlowLog<'a>(&'a str, web_time::Instant);
+impl Drop for SlowLog<'_> {
+    fn drop(&mut self) {
+        let took = self.1.elapsed();
+        if took >= std::time::Duration::from_millis(150) {
+            log::debug!(target: "effectcraft_stall", "gpu: creating {} took {:.0} ms on {}", self.0, took.as_secs_f64() * 1000.0, std::thread::current().name().unwrap_or("?"));
+        }
     }
 }

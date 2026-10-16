@@ -1122,6 +1122,26 @@ impl Frames {
         self.inflight.lock().map(|s| s.len()).unwrap_or(0)
     }
 
+    /// The render queue right now (a diagnostic for previews that stop, see `ui.inspect`).
+    pub fn queue_state(&self) -> serde_json::Value {
+        let q = self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut running: Vec<i64> = q.running.iter().map(|k| k.frame).collect();
+        running.sort_unstable();
+        let mut queued: Vec<i64> = q.jobs.iter().map(|j| j.key.frame).collect();
+        queued.sort_unstable();
+        queued.truncate(16);
+        serde_json::json!({
+            "queued": q.jobs.len(),
+            "queuedFrames": queued,
+            "running": running,
+            "landing": q.landing,
+            "parked": q.parked,
+            "urgentRunning": q.urgent_running,
+            "inflight": self.inflight(),
+            "layerCacheWaitTimeouts": effectcraft_render::cache::wait_timeouts(),
+        })
+    }
+
     /// Cached frame numbers of the series of `base` (its comp content, scale, view and render
     /// options) — for the cache bar.
     pub fn cached_frames(&self, base: &FrameKey) -> Vec<i64> {
@@ -1992,10 +2012,29 @@ impl Worker {
     /// `None` if that panicked too.
     fn render_guarded(&self, job: &Job, tail: &Tail) -> Option<Rendered> {
         let attempt = |gpu: bool| std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.render_job(job, gpu, gpu.then_some(tail)))).ok();
-        attempt(true).or_else(|| {
+        let t0 = web_time::Instant::now();
+        let r = attempt(true).or_else(|| {
             log::error!("a frame render panicked (frame {})", job.key.frame);
             job.src.gpu.as_ref().and_then(|_| attempt(false))
-        })
+        });
+        let took = t0.elapsed();
+        if took >= std::time::Duration::from_millis(500) {
+            let how = match &r {
+                Some(Rendered::Landing) => "on the GPU, landing",
+                Some(Rendered::Image(FrameImage::Cpu(_))) => "as an image",
+                Some(Rendered::Image(_)) => "as a GPU texture",
+                None => "failed",
+            };
+            log::debug!(
+                target: "effectcraft_stall",
+                "frames: frame {} (urgent {}) rendered {how} in {:.0} ms on {}",
+                job.key.frame,
+                job.urgent,
+                took.as_secs_f64() * 1000.0,
+                std::thread::current().name().unwrap_or("?")
+            );
+        }
+        r
     }
 
     /// Hand a GPU frame to the landing thread: its readback starts and `job` is finished with the
