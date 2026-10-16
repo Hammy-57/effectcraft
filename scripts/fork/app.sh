@@ -40,6 +40,9 @@ case "${1:-}" in
     ;;
 esac
 
+# Owner-local artwork is pinned outside the checkout; catch accidental replacements before launch.
+python3 "$root/scripts/fork/check-owner-icons.py" || exit 1
+
 build_pid=""
 stop() {
     # Stop the whole build (cargo and every rustc it started), then free the lock.

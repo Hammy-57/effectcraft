@@ -281,8 +281,10 @@ pub fn icon_button_local(ui: &mut Ui, rect: Rect, icon: Icon, local: Option<&str
     } else {
         t.icon
     };
+    // Owner-local viewer glyphs already include their own transparent margin.
     let inner = rect.shrink(rect.width() * 0.22);
-    if !local.is_some_and(|name| crate::local_assets::paint(ui.painter(), inner, name, col)) {
+    let local_rect = if local.is_some_and(|name| name.starts_with("viewer-")) { rect.shrink(2.0) } else { inner };
+    if !local.is_some_and(|name| crate::local_assets::paint(ui.painter(), local_rect, name, col)) {
         icons::paint(ui.painter(), inner, icon, col);
     }
     focus_outline(ui, &resp, t);

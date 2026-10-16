@@ -852,7 +852,8 @@ fn paint_generated(painter: &Painter, rect: Rect, icon: Icon, color: Color32) ->
     let Some((texture, reference)) = texture else { return false };
     if reference {
         let uv = Rect::from_min_max(pos2(0.0, cell as f32 / 24.0), pos2(1.0, (cell + 1) as f32 / 24.0));
-        let side = rect.width().min(rect.height());
+        // The atlas already includes padding; toolbar and timeline buttons both need 20 pt cells.
+        let side = owner_atlas_side(rect.width().min(rect.height()), cell);
         painter.image(texture.id(), Rect::from_center_size(rect.center(), vec2(side, side)), uv, color);
         return true;
     }
@@ -863,6 +864,11 @@ fn paint_generated(painter: &Painter, rect: Rect, icon: Icon, color: Color32) ->
     let side = rect.width().min(rect.height());
     painter.image(texture.id(), Rect::from_center_size(rect.center(), vec2(side, side)), uv, color);
     true
+}
+
+fn owner_atlas_side(inner_side: f32, cell: usize) -> f32 {
+    let button_side = if cell < 18 { 26.0 } else { 24.0 };
+    inner_side * (20.0 / (button_side * 0.56))
 }
 
 /// An alpha mask `w`×`h` averaged down 2× (2×2 boxes, rounded; odd edges average what they
@@ -950,6 +956,43 @@ fn keyframe_shapes(
 #[cfg(test)]
 mod tests {
     use effectcraft_engine::keyframe::KeyHalf as H;
+
+    #[test]
+    fn owner_toolbar_and_timeline_glyphs_keep_their_intended_size() {
+        for cell in 0..24 {
+            let button_side = if cell < 18 { 26.0 } else { 24.0 };
+            assert!((super::owner_atlas_side(button_side * 0.56, cell) - 20.0).abs() < 0.001);
+        }
+    }
+
+    #[test]
+    fn timeline_switches_use_distinct_owner_atlas_cells() {
+        use egui::{Color32, Context, Id, Rect, pos2, vec2};
+        let ctx = Context::default();
+        let texture = ctx.load_texture("synthetic-owner-atlas", egui::ColorImage::filled([1, 24], Color32::WHITE), Default::default());
+        let texture_id = texture.id();
+        ctx.data_mut(|data| data.insert_temp(Id::new("effectcraft-tools-atlas"), Some((texture, true))));
+        let icons = [super::Icon::Flowchart, super::Icon::Draft3D, super::Icon::Shy, super::Icon::FrameBlend, super::Icon::MotionBlur, super::Icon::Graph];
+        let output = ctx.run_ui(Default::default(), |ui| {
+            for (i, icon) in icons.into_iter().enumerate() {
+                super::paint(ui.painter(), Rect::from_min_size(pos2(30.0 * i as f32, 0.0), vec2(13.44, 13.44)), icon, Color32::WHITE);
+            }
+        });
+        let meshes: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Mesh(mesh) if mesh.texture_id == texture_id => Some(mesh),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(meshes.len(), 6);
+        for (i, mesh) in meshes.iter().enumerate() {
+            let y = mesh.vertices.iter().map(|v| v.uv.y).fold(f32::INFINITY, f32::min);
+            assert!((y - (18 + i) as f32 / 24.0).abs() < 0.001);
+            assert!((mesh.calc_bounds().width() - 20.0).abs() < 0.001);
+        }
+    }
 
     /// The tools atlas is kept at half size: 2×2 averages, odd edges included.
     #[test]

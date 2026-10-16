@@ -197,3 +197,10 @@ loads them at runtime. This is the owner-approved exception in `AGENTS.md` §1.9
 never committed, embedded, shipped or attached anywhere, code names an asset only by file name, and
 every icon keeps its code-drawn fallback, so builds without the folder (CI, other machines,
 upstream) look as before.
+
+The owner's `approved-icons.json` pins the local atlas and PNGs by SHA-256. The Mac launcher runs
+`scripts/fork/check-owner-icons.py` before building/launching, so missing or changed approved files
+produce an actionable error instead of silently replacing the owner's artwork. Machines without an
+approved owner set still use the normal fallbacks. Keep the approval file and all artwork outside the
+checkout; update the approval only after visually checking an intentional asset change. UI regression
+tests use synthetic textures to check timeline atlas cells, glyph sizing, and RGB tint preservation.

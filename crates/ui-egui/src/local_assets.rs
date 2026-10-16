@@ -62,6 +62,7 @@ pub(crate) fn icon(ctx: &Context, name: &str) -> Option<TextureHandle> {
 
 pub(crate) fn paint(painter: &Painter, rect: Rect, name: &str, color: Color32) -> bool {
     let Some(texture) = icon(painter.ctx(), name) else { return false };
+    let color = if name == "viewer-channel" { Color32::from_white_alpha(color.a()) } else { color };
     painter.image(texture.id(), rect, Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)), color);
     true
 }
@@ -89,4 +90,33 @@ pub(crate) fn cursor(ctx: &Context, name: &str, hotspot: [u16; 2]) -> bool {
         ctx.set_cursor_image(Some(cursor));
     }
     found
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owner_channel_keeps_rgb_while_mask_icons_take_the_theme_tint() {
+        let ctx = Context::default();
+        for name in ["viewer-channel", "viewer-grid"] {
+            let texture = ctx.load_texture(name, egui::ColorImage::filled([1, 1], Color32::WHITE), Default::default());
+            ctx.data_mut(|data| data.insert_temp(egui::Id::new(("local-icon", name)), Some(texture)));
+        }
+        let tint = Color32::from_gray(100);
+        let output = ctx.run_ui(Default::default(), |ui| {
+            for name in ["viewer-channel", "viewer-grid"] {
+                assert!(paint(ui.painter(), Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(18.0, 18.0)), name, tint));
+            }
+        });
+        let colors: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Mesh(mesh) => mesh.vertices.first().map(|v| v.color),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(colors, [Color32::WHITE, tint]);
+    }
 }
