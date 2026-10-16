@@ -1,4 +1,4 @@
-//! Workspace automation: `cargo xtask <layers|assets|wasm|web|ico|ci>`.
+//! Workspace automation: `cargo xtask <layers|assets|pdf-deps|wasm|web|ico|ci>`.
 //!
 //! - `layers`: enforces the dependency layering of `docs/architecture.md` §1 (downward-only edges,
 //!   listed same-layer edges, no UI/OS crates below L5).
@@ -11,7 +11,7 @@
 //! - `ico <out.ico> <in.png>…`: pack PNGs into a Windows `.ico` (used by `packaging/icons.sh`).
 //! - `fmt [--check]`: rustfmt every source file, including the modules `build.rs` declares
 //!   (`cargo fmt` doesn't see those; see `effectcraft-buildgen`).
-//! - `ci`: fmt check, clippy -D warnings, tests (`--profile ci`), layers, assets, wasm.
+//! - `ci`: fmt check, clippy -D warnings, tests (`--profile ci`), PDF dependency policy, layers, assets, wasm.
 //! - `ci --affected [--base REV] [--dry-run]`: the same gates for only the crates the change since
 //!   REV (default: the merge-base with `main`) can affect; see `affected.rs` and docs/testing.md.
 //! - `bench [--bin CLI] [--quick] [--compare OLD.jsonl] …`: render benchmark of generated scenarios
@@ -29,6 +29,7 @@ mod fmt;
 mod fuzz;
 mod ico;
 mod repros;
+mod pdf_deps;
 mod version;
 
 use std::process::{Command, ExitCode};
@@ -427,6 +428,7 @@ fn ci() -> Result<(), String> {
     fmt::run(&["--check".into()])?;
     run(Command::new(cargo).args(["clippy", "--workspace", "--all-targets", "--profile", "ci", "--", "-D", "warnings"]))?;
     run(Command::new(cargo).args(["test", "--workspace", "--profile", "ci", "--no-fail-fast"]))?;
+    pdf_deps::run(&root())?;
     layers()?;
     assets()?;
     wasm()
@@ -438,6 +440,7 @@ fn main() -> ExitCode {
         "layers" => layers(),
         "wasm" => wasm(),
         "assets" => assets(),
+        "pdf-deps" => pdf_deps::run(&root()),
         "ci" => {
             let rest: Vec<String> = std::env::args().skip(2).collect();
             if rest.iter().any(|a| a == "--affected") { affected::run(&root(), &rest) } else { ci() }
@@ -457,7 +460,7 @@ fn main() -> ExitCode {
             let rest: Vec<String> = std::env::args().skip(2).collect();
             version::run(&root(), &rest.iter().map(String::as_str).collect::<Vec<_>>())
         }
-        _ => Err("usage: cargo xtask <layers|assets|wasm|web [--dev] [--serve PORT]|ico OUT.ico IN.png…|version [set X.Y.Z]|fmt [--check]|ci [--affected [--base REV] [--dry-run]]|repros [--bless] [--dir DIR]|fuzz [--list|--seeds|TARGET… --seconds N]|bench [--bin CLI] [--quick] [--project F --comp C] [--compare OLD.jsonl] (--help)|agents <status|claim|release|gc>|agent-exam <--list|--validate|--check P.ecproj --task T|--run [--tasks a,b] [--out DIR] [--minutes N] [--max-tool-calls N] [--model M]>>".into()),
+        _ => Err("usage: cargo xtask <layers|assets|pdf-deps|wasm|web [--dev] [--serve PORT]|ico OUT.ico IN.png…|version [set X.Y.Z]|fmt [--check]|ci [--affected [--base REV] [--dry-run]]|repros [--bless] [--dir DIR]|fuzz [--list|--seeds|TARGET… --seconds N]|bench [--bin CLI] [--quick] [--project F --comp C] [--compare OLD.jsonl] (--help)|agents <status|claim|release|gc>|agent-exam <--list|--validate|--check P.ecproj --task T|--run [--tasks a,b] [--out DIR] [--minutes N] [--max-tool-calls N] [--model M]>>".into()),
     };
     match r {
         Ok(()) => ExitCode::SUCCESS,
