@@ -636,6 +636,9 @@ pub struct GpuContext {
     /// RT10e: the window's traffic light, when this device is the window's (its submissions
     /// then pause while a surface reconfigures; see [`crate::traffic_light`]).
     light: std::sync::OnceLock<Arc<crate::TrafficLight>>,
+    /// The device belongs to a `wgpu::Instance` of its own ([`Self::request`],
+    /// [`Self::request_off_window`]), not the window's.
+    own_instance: bool,
     pub(crate) name: String,
     pub(crate) max_dim: u32,
     integrated: bool,
@@ -1050,6 +1053,7 @@ impl GpuContext {
             device,
             queue,
             light: std::sync::OnceLock::new(),
+            own_instance: false,
             name,
             max_dim,
             bgl,
@@ -1104,6 +1108,13 @@ impl GpuContext {
     /// configuration must not overlap a submission). Once; `false` when a light is already set.
     pub fn set_traffic_light(&self, light: Arc<crate::TrafficLight>) -> bool {
         self.light.set(light).is_ok()
+    }
+
+    /// The device belongs to a `wgpu::Instance` of its own. `wgpu::Device` equality compares
+    /// ids that are only unique within one instance, so such a device can compare equal to the
+    /// window's without being it: never share textures with the window then.
+    pub fn own_instance(&self) -> bool {
+        self.own_instance
     }
 
     /// The traffic light the compositor submits through, if any.
@@ -1323,7 +1334,9 @@ impl GpuContext {
             .request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, ..Default::default() })
             .await
             .map_err(|e| format!("no adapter: {e}"))?;
-        Self::request_on_adapter(&adapter).await
+        let mut context = Self::request_on_adapter(&adapter).await?;
+        context.own_instance = true;
+        Ok(context)
     }
 
     /// A device of its own on the best Vulkan, Metal or DirectX 12 adapter, when the window's
@@ -1343,7 +1356,15 @@ impl GpuContext {
         let adapters = instance.enumerate_adapters(backends).await;
         let kinds: Vec<_> = adapters.iter().map(|a| a.get_info()).map(|i| (i.backend, i.device_type)).collect();
         let adapter = adapters.get(pick_compositor_adapter((window.backend, window.device_type), &kinds)?)?;
-        Some(Self::request_on_adapter(adapter).await.map_err(|e| format!("{} ({:?}): {e}", adapter.get_info().name, adapter.get_info().backend)))
+        Some(
+            Self::request_on_adapter(adapter)
+                .await
+                .map(|mut context| {
+                    context.own_instance = true;
+                    context
+                })
+                .map_err(|e| format!("{} ({:?}): {e}", adapter.get_info().name, adapter.get_info().backend)),
+        )
     }
 
     /// Request a separate device on an existing adapter (the desktop window's adapter).

@@ -85,6 +85,30 @@ fn compositor_gpu(
     }
 }
 
+/// The compositor runs on the window's device, so its textures can be drawn without a copy.
+/// A device from another `wgpu::Instance` (the compositor apart from an OpenGL or software
+/// window) can compare equal to the window's: its ids are only unique within its instance.
+fn shares_window_device(gpu: &effectcraft_gpu::Gpu, window_device: &eframe::wgpu::Device) -> bool {
+    !gpu.context().own_instance() && gpu.device() == window_device
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[test]
+fn compositor_on_its_own_instance_never_shares_the_window_device() {
+    // A compositor on its own instance next to a window on llvmpipe compared equal to the
+    // window's device (both the first device of their instance), so viewer frames were drawn
+    // from its textures by the window's renderer: a wgpu panic on a non-existent texture view.
+    let instance = eframe::wgpu::Instance::default();
+    let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return };
+    let Ok((device, _queue)) = pollster::block_on(adapter.request_device(&Default::default())) else { return };
+    let Some(gpu) = effectcraft_gpu::Gpu::headless() else { return };
+    assert!(gpu.context().own_instance());
+    assert!(!shares_window_device(&gpu, &device));
+    let Ok((own, own_queue)) = pollster::block_on(adapter.request_device(&Default::default())) else { return };
+    let shared = effectcraft_gpu::Gpu::new(&adapter, own.clone(), own_queue).unwrap();
+    assert!(shares_window_device(&shared, &own));
+}
+
 #[cfg(all(test, target_os = "macos"))]
 #[test]
 fn compositor_shares_the_window_device_only_with_a_traffic_light() {
@@ -1073,7 +1097,7 @@ impl EffectcraftApp {
                     self.frames.revive_gpu();
                 }
                 // RT10e: frames stay textures when the compositor is on egui's device.
-                self.zero_copy.active = g.device() == &rs.device && !cfg!(target_arch = "wasm32");
+                self.zero_copy.active = shares_window_device(&g, &rs.device) && !cfg!(target_arch = "wasm32");
                 self.zero_copy.unified = info.device_type == eframe::wgpu::DeviceType::IntegratedGpu;
                 #[cfg(not(target_arch = "wasm32"))]
                 self.frames.set_resident(self.zero_copy.resident(&self.session.prefs));
