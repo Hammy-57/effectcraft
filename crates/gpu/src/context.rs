@@ -714,6 +714,19 @@ fn storage_tex_entry(binding: u32, format: wgpu::TextureFormat) -> wgpu::BindGro
     }
 }
 
+/// Logs (target `effectcraft_stall`, debug) a GPU resource that took long to create.
+#[cfg(not(target_arch = "wasm32"))]
+struct SlowLog<'a>(&'a str, web_time::Instant);
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for SlowLog<'_> {
+    fn drop(&mut self) {
+        let took = self.1.elapsed();
+        if took >= std::time::Duration::from_millis(150) {
+            log::debug!(target: "effectcraft_stall", "gpu: creating {} took {:.0} ms on {}", self.0, took.as_secs_f64() * 1000.0, std::thread::current().name().unwrap_or("?"));
+        }
+    }
+}
+
 /// Contain synchronous native initialization errors without replacing the device owner's
 /// handlers. Scopes are thread-local with wgpu's enabled `std` feature. The pinned native
 /// wgpu-core backend returns an immediately-ready future from pop_error_scope, so these
@@ -3384,16 +3397,5 @@ mod upload_budget_tests {
         assert_eq!(g.upload_stats(), (0, 0));
         assert!(a.get(1).is_some() && b.get(2).is_some());
         assert_eq!((a.retained_stats().live_bytes, b.retained_stats().live_bytes), (16, 16));
-    }
-}
-
-/// Logs (target `effectcraft_stall`, debug) a GPU resource that took long to create.
-struct SlowLog<'a>(&'a str, web_time::Instant);
-impl Drop for SlowLog<'_> {
-    fn drop(&mut self) {
-        let took = self.1.elapsed();
-        if took >= std::time::Duration::from_millis(150) {
-            log::debug!(target: "effectcraft_stall", "gpu: creating {} took {:.0} ms on {}", self.0, took.as_secs_f64() * 1000.0, std::thread::current().name().unwrap_or("?"));
-        }
     }
 }
