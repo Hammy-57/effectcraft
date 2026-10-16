@@ -53,6 +53,7 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod adapter_choice;
 mod adv3d;
 mod bokeh;
 mod classic3d;
@@ -181,6 +182,13 @@ impl Gpu {
     /// the window surface's queue while it reconfigures.
     pub async fn request_on_adapter(adapter: &wgpu::Adapter) -> Result<Gpu, String> {
         GpuContext::request_on_adapter(adapter).await.map(Gpu::from_context)
+    }
+
+    /// A device of its own on a better adapter than the window's `window`, when that one can't
+    /// run the compositor well (see [`adapter_choice`]): `None` to stay on the window's.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn request_off_window(window: &wgpu::AdapterInfo) -> Option<Result<Gpu, String>> {
+        GpuContext::request_off_window(window).await.map(|r| r.map(Gpu::from_context))
     }
 
     pub fn from_context(ctx: GpuContext) -> Gpu {

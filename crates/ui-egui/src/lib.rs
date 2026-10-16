@@ -40,14 +40,34 @@ const SCREENSHOT_TIMEOUT_S: f64 = 4.0;
 
 /// The GPU compositor for the window's adapter. Natively on a device of its own unless the host
 /// offers egui's (`share`, RT10e: then with the window's traffic light, see [`zero_copy`]).
+/// `off_window`: when the window's adapter is OpenGL or a CPU device, the compositor may use a
+/// better adapter next to it (frames then reach the window through the CPU).
 fn compositor_gpu(
     adapter: &eframe::wgpu::Adapter,
     device: eframe::wgpu::Device,
     queue: eframe::wgpu::Queue,
     share: Option<Option<Arc<zero_copy::TrafficLight>>>,
+    off_window: bool,
 ) -> Result<effectcraft_gpu::Gpu, String> {
     #[cfg(not(target_arch = "wasm32"))]
     {
+        let window = adapter.get_info();
+        if off_window && effectcraft_gpu::adapter_choice::window_adapter_unfit(window.backend, window.device_type) {
+            match pollster::block_on(effectcraft_gpu::Gpu::request_off_window(&window)) {
+                Some(Ok(gpu)) => {
+                    log::info!(
+                        "GPU compositor on {} apart from the window's {} ({:?}, {:?}): frames reach the window through a CPU copy",
+                        effectcraft_engine::render::Accelerator::name(&gpu),
+                        window.name,
+                        window.backend,
+                        window.device_type
+                    );
+                    return Ok(gpu);
+                }
+                Some(Err(e)) => log::info!("GPU compositor: no device apart from the window's: {e}"),
+                None => log::info!("GPU compositor: no adapter better than the window's {} ({:?}, {:?})", window.name, window.backend, window.device_type),
+            }
+        }
         if let Some(light) = share {
             let gpu = effectcraft_gpu::Gpu::new(adapter, device, queue)?;
             if let Some(light) = light {
@@ -60,7 +80,7 @@ fn compositor_gpu(
     }
     #[cfg(target_arch = "wasm32")]
     {
-        let _ = share;
+        let _ = (share, off_window);
         effectcraft_gpu::Gpu::new(adapter, device, queue)
     }
 }
@@ -74,11 +94,11 @@ fn compositor_shares_the_window_device_only_with_a_traffic_light() {
     let instance = eframe::wgpu::Instance::default();
     let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return };
     let Ok((device, queue)) = pollster::block_on(adapter.request_device(&Default::default())) else { return };
-    let gpu = compositor_gpu(&adapter, device.clone(), queue.clone(), None).unwrap();
+    let gpu = compositor_gpu(&adapter, device.clone(), queue.clone(), None, true).unwrap();
     assert_ne!(gpu.device(), &device);
     assert!(gpu.context().traffic_light().is_none());
     let light = zero_copy::TrafficLight::new();
-    let shared = compositor_gpu(&adapter, device.clone(), queue, Some(Some(light.clone()))).unwrap();
+    let shared = compositor_gpu(&adapter, device.clone(), queue, Some(Some(light.clone())), true).unwrap();
     assert_eq!(shared.device(), &device);
     assert!(shared.context().traffic_light().is_some_and(|l| Arc::ptr_eq(l, &light)));
 }
@@ -395,6 +415,9 @@ pub struct EffectcraftApp {
     pub(crate) gpu: Option<effectcraft_gpu::Gpu>,
     /// RT10e: whether the compositor shares egui's device (frames drawn without a copy).
     pub(crate) zero_copy: zero_copy::ZeroCopy,
+    /// The compositor may leave a window adapter that is OpenGL or a CPU device for a better one
+    /// (see [`Self::keep_compositor_on_window_adapter`]).
+    compositor_off_window: bool,
     gpu_checked: bool,
     #[cfg(not(target_arch = "wasm32"))]
     gpu_startup_deferred: bool,
@@ -510,6 +533,7 @@ impl EffectcraftApp {
             wgpu: None,
             gpu: None,
             zero_copy: Default::default(),
+            compositor_off_window: true,
             gpu_checked: false,
             #[cfg(not(target_arch = "wasm32"))]
             gpu_startup_deferred: false,
@@ -819,6 +843,14 @@ impl EffectcraftApp {
         self.zero_copy.offer(light);
     }
 
+    /// Keep the GPU compositor on the window's adapter even when that is OpenGL or a CPU device:
+    /// Window Graphics ▸ OpenGL was chosen because this machine's Vulkan or DirectX 12 driver
+    /// crashes as a device is created (#243), which the compositor's device would too. Call
+    /// before the first frame.
+    pub fn keep_compositor_on_window_adapter(&mut self) {
+        self.compositor_off_window = false;
+    }
+
     /// Viewer frames shown from their GPU textures without a copy so far (RT10e).
     pub fn zero_copy_frames(&self) -> u64 {
         #[cfg(not(target_arch = "wasm32"))]
@@ -991,13 +1023,14 @@ impl EffectcraftApp {
             } else {
                 let (adapter, device, queue, wake) = (rs.adapter.clone(), rs.device.clone(), rs.queue.clone(), ctx.clone());
                 let share = self.zero_copy.share(&self.session.prefs);
+                let off_window = self.compositor_off_window;
                 let project = self.session.freeze_preview_project();
                 let comp = self.session.active_comp_id();
                 self.gpu_startup_key = comp.map(|comp| (self.session.revision, comp));
                 let time = self.session.time();
                 match gpu_startup::Pending::start(
                     move || {
-                        let gpu = compositor_gpu(&adapter, device, queue, share)?;
+                        let gpu = compositor_gpu(&adapter, device, queue, share, off_window)?;
                         // Unified memory sizes its texture pool by RAM (RT9a). Off the UI thread;
                         // not on Windows, where reading it starts PowerShell (the memory watch
                         // passes it on there).
@@ -1022,7 +1055,7 @@ impl EffectcraftApp {
         #[cfg(target_arch = "wasm32")]
         let gpu = {
             let _ = ctx;
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compositor_gpu(&rs.adapter, rs.device.clone(), rs.queue.clone(), None)))
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compositor_gpu(&rs.adapter, rs.device.clone(), rs.queue.clone(), None, false)))
                 .unwrap_or_else(|_| Err("GPU compositor setup failed: backend panicked".into()))
         };
         self.gpu_checked = true;

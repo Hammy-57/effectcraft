@@ -1326,6 +1326,26 @@ impl GpuContext {
         Self::request_on_adapter(&adapter).await
     }
 
+    /// A device of its own on the best Vulkan, Metal or DirectX 12 adapter, when the window's
+    /// adapter `window` is OpenGL or a CPU device and a better one exists (see
+    /// [`crate::adapter_choice`]); `None` to stay on the window's. Ignores `WGPU_BACKEND`,
+    /// which chose the window's API.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn request_off_window(window: &wgpu::AdapterInfo) -> Option<Result<GpuContext, String>> {
+        use crate::adapter_choice::{pick_compositor_adapter, window_adapter_unfit};
+        if !window_adapter_unfit(window.backend, window.device_type) {
+            return None;
+        }
+        let backends = wgpu::Backends::VULKAN | wgpu::Backends::METAL | wgpu::Backends::DX12;
+        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+        desc.backends = backends;
+        let instance = wgpu::Instance::new(desc);
+        let adapters = instance.enumerate_adapters(backends).await;
+        let kinds: Vec<_> = adapters.iter().map(|a| a.get_info()).map(|i| (i.backend, i.device_type)).collect();
+        let adapter = adapters.get(pick_compositor_adapter((window.backend, window.device_type), &kinds)?)?;
+        Some(Self::request_on_adapter(adapter).await.map_err(|e| format!("{} ({:?}): {e}", adapter.get_info().name, adapter.get_info().backend)))
+    }
+
     /// Request a separate device on an existing adapter (the desktop window's adapter).
     pub async fn request_on_adapter(adapter: &wgpu::Adapter) -> Result<GpuContext, String> {
         let limits = adapter.limits();
