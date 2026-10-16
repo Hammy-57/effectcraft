@@ -206,8 +206,10 @@ struct CacheState {
     ahead: HashMap<Arc<str>, Ahead>,
     /// Decode-ahead runners started (each runner's id).
     runners: u64,
-    /// Counts finished decodes: a waiter that sees no progress for [`STALL`] stops waiting.
-    progress: u64,
+    /// Finished decodes per file: a waiter that sees no progress on the file it waits for for
+    /// [`STALL`] stops waiting. Per file: while a movie's decode-ahead kept finishing frames, a
+    /// waiter for a still that another worker was stuck decoding waited on, however long.
+    progress: HashMap<Arc<str>, u64>,
 }
 
 /// A movie's sequential decode-ahead: a runner thread decodes the frames `next..until` (frame
@@ -252,6 +254,62 @@ fn ahead_batch(codec: &str) -> usize {
 /// A rayon worker waits for a frame being decoded elsewhere while decoding progresses, and decodes
 /// it itself after this long without progress (see [`Inner::pixels_at`]).
 const STALL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Waits and decodes longer than this are logged (target `effectcraft_stall`, debug): a
+/// diagnostic for preview playback that stops.
+const SLOW: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Log `what` of frame `raw` of `path` when it took longer than [`SLOW`].
+fn slow(what: &str, path: &str, raw: i64, took: std::time::Duration) {
+    if took >= SLOW {
+        log::debug!(target: "effectcraft_stall", "media: {what} frame {raw} of {path} in {:.0} ms", took.as_secs_f64() * 1000.0);
+    }
+}
+
+/// Logs a movie open (or the wait for another thread's) that took longer than [`SLOW`].
+struct SlowOpen<'a>(&'a str, std::time::Instant);
+impl Drop for SlowOpen<'_> {
+    fn drop(&mut self) {
+        slow("opened (or waited for)", self.0, -1, self.1.elapsed());
+    }
+}
+
+/// A reader's wait for a frame another thread decodes ([`Inner::pixels_at`]), logged when long.
+struct Waited<'a> {
+    path: &'a str,
+    raw: i64,
+    start: std::time::Instant,
+    on: std::cell::Cell<Option<&'static str>>,
+}
+
+impl<'a> Waited<'a> {
+    fn new(path: &'a str, raw: i64) -> Self {
+        Waited { path, raw, start: std::time::Instant::now(), on: Default::default() }
+    }
+
+    /// The reader waits for `whom`.
+    fn on(&self, whom: &'static str) {
+        self.on.set(Some(whom));
+    }
+
+    /// The wait ended with `how`.
+    fn done(&self, how: &str) {
+        if let Some(whom) = self.on.get() {
+            let took = self.start.elapsed();
+            if took >= SLOW {
+                let thread = std::thread::current();
+                log::debug!(
+                    target: "effectcraft_stall",
+                    "media: waited {:.0} ms for {whom} to decode frame {} of {} ({}): {how}",
+                    took.as_secs_f64() * 1000.0,
+                    self.raw,
+                    self.path,
+                    thread.name().unwrap_or("?")
+                );
+            }
+        }
+    }
+}
 
 /// Whether `a` and `b` key frames of the same stream (all but the frame index match).
 fn same_stream(a: &Key, b: &Key) -> bool {
@@ -466,7 +524,12 @@ impl Drop for Inflight<'_> {
     fn drop(&mut self) {
         let mut c = lock(&self.inner.cache);
         c.inflight.remove(&self.key);
-        c.progress = c.progress.wrapping_add(1);
+        if c.progress.len() >= 1024 {
+            // (a waiter sees this as progress once)
+            c.progress.clear();
+        }
+        let n = c.progress.entry(self.key.path.clone()).or_default();
+        *n = n.wrapping_add(1);
         drop(c);
         self.inner.done.notify_all();
     }
@@ -851,6 +914,8 @@ impl Inner {
     fn opened(&self, path: &Arc<str>, hw: bool) -> Option<(SharedSource, Orientation)> {
         let slot = lock(&self.sources).slot(path, hw);
         let mut held = None;
+        let t0 = std::time::Instant::now();
+        let _slow = SlowOpen(path, t0);
         let src = slot
             .get_or_init(|| {
                 self.opened.fetch_add(1, Ordering::Relaxed);
@@ -1014,9 +1079,11 @@ impl Inner {
         let me = std::thread::current().id();
         // (last progress seen, when it was seen): rayon workers stop waiting without progress
         let mut seen: Option<(u64, std::time::Instant)> = None;
+        let wait = Waited::new(&loc.key.path, raw);
         loop {
             if let Some(px) = c.lru.get(&loc.key) {
                 self.hits.fetch_add(1, Ordering::Relaxed);
+                wait.done("cached");
                 return Ok(px);
             }
             let owner = c.inflight.get(&loc.key).copied();
@@ -1032,22 +1099,31 @@ impl Inner {
                 drop(c);
                 return self.decode(&loc, footage, false);
             }
+            wait.on(if owner.is_some() { "another thread" } else { "the decode-ahead" });
             // Another thread or the decode-ahead is decoding the frame: wait for it. A rayon
             // worker waits only while decoding progresses: the decoding thread may wait on a
             // parallel job queued behind this worker's own stack, which it can't run while it
             // waits here. Without progress for a while it decodes a private copy instead.
             if rayon::current_thread_index().is_some() {
                 let now = std::time::Instant::now();
+                let progress = c.progress.get(&loc.key.path).copied().unwrap_or(0);
                 let since = match seen {
-                    Some((p, at)) if p == c.progress => at,
+                    Some((p, at)) if p == progress => at,
                     _ => now,
                 };
-                seen = Some((c.progress, since));
+                seen = Some((progress, since));
                 let left = STALL.saturating_sub(now.saturating_duration_since(since));
                 if left.is_zero() {
                     self.misses.fetch_add(1, Ordering::Relaxed);
                     drop(c);
-                    return self.decode(&loc, footage, false);
+                    wait.done("stalled, decoding it here");
+                    // Kept: every layer showing the same still waited [`STALL`] again for the
+                    // stuck decode (four layers of one JPEG: 4 s a frame). The owner's copy,
+                    // when it comes, replaces it (the same pixels).
+                    let px = self.decode(&loc, footage, false)?;
+                    lock(&self.cache).lru.insert(loc.key, px.clone(), self.budget());
+                    self.done.notify_all();
+                    return Ok(px);
                 }
                 c = match self.done.wait_timeout(c, left) {
                     Ok((g, _)) => g,
@@ -1060,8 +1136,11 @@ impl Inner {
         self.misses.fetch_add(1, Ordering::Relaxed);
         c.inflight.insert(loc.key.clone(), me);
         drop(c);
+        wait.done("not decoding, decoding it here");
         let _guard = Inflight { inner: self, key: loc.key.clone() };
+        let t0 = std::time::Instant::now();
         let px = self.decode(&loc, footage, false)?;
+        slow("decoded", &loc.key.path, raw, t0.elapsed());
         lock(&self.cache).lru.insert(loc.key, px.clone(), self.budget());
         Ok(px)
     }
@@ -1200,10 +1279,12 @@ impl Inner {
                 }
             }
         };
+        let t0 = std::time::Instant::now();
         let decoded = match self.ahead_pool.get().and_then(Option::as_ref) {
             Some(pool) => pool.install(decode_all),
             None => decode_all(),
         };
+        slow("decoded ahead (a batch)", path, todo.first().map_or(-1, |(raw, _)| *raw), t0.elapsed());
         let mut c = lock(&self.cache);
         // in frame order, up to the first frame that failed (as decoding one at a time would)
         for ((raw, loc), px) in todo.into_iter().zip(decoded) {
@@ -1645,6 +1726,48 @@ mod tests {
         drop(busy);
         FootageSource::purge(&pool);
         assert_eq!(pool.open_files(), 0);
+    }
+
+    /// A rayon worker waiting for a still another thread is decoding stops waiting after
+    /// [`STALL`] without progress on that file: other files' decodes finishing (a movie's
+    /// decode-ahead) kept it waiting for as long as they went on.
+    #[test]
+    fn a_waiter_for_a_stuck_decode_ignores_other_files_progress() {
+        let pool = MediaPool::new();
+        let mut png = Vec::new();
+        image::RgbaImage::from_pixel(8, 4, image::Rgba([10, 20, 30, 255])).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        pool.add_bytes("/matte.png", png.into());
+        let f = Footage { path: "/matte.png".into(), kind: FootageKind::Still, width: 8, height: 4, has_video: true, ..Default::default() };
+        // Another thread holds the still's decode and never finishes it.
+        let stuck = std::thread::spawn(|| std::thread::current().id()).join().unwrap();
+        let key = Inner::locate_for(&f, Tick::ZERO, None, false, FloatCurve::Srgb).key;
+        lock(&pool.inner.cache).inflight.insert(key.clone(), stuck);
+        // Meanwhile another file's frames keep finishing.
+        let stop = Arc::new(AtomicBool::new(false));
+        let other = {
+            let (inner, stop) = (pool.inner.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let movie: Arc<str> = "/movie.mov".into();
+                while !stop.load(Ordering::Relaxed) {
+                    let k = Key { path: movie.clone(), ..key.clone() };
+                    lock(&inner.cache).inflight.insert(k.clone(), std::thread::current().id());
+                    drop(Inflight { inner: &inner, key: k });
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            })
+        };
+        let rayon = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        let t0 = std::time::Instant::now();
+        let img = rayon.install(|| pool.frame_at(&f, Tick::ZERO)).unwrap();
+        let took = t0.elapsed();
+        stop.store(true, Ordering::Relaxed);
+        other.join().unwrap();
+        assert_eq!((img.width, img.height), (8, 4));
+        assert!(took >= STALL && took < STALL * 3, "decoded it itself after {took:?}");
+        // The next layer showing the still finds that copy instead of waiting again.
+        let t0 = std::time::Instant::now();
+        rayon.install(|| pool.frame_at(&f, Tick::ZERO)).unwrap();
+        assert!(t0.elapsed() < STALL / 2, "waited again: {:?}", t0.elapsed());
     }
 
     /// A Photoshop document imported as a composition: every layer item decodes from one parsed

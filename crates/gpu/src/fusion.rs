@@ -133,7 +133,12 @@ fn colour_chain(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 impl Pipelines {
     fn get(&self, g: &GpuContext, ids: &[u32]) -> Option<wgpu::ComputePipeline> {
+        let t0 = web_time::Instant::now();
         let mut cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
+        let waited = t0.elapsed();
+        if waited >= std::time::Duration::from_millis(150) {
+            log::debug!(target: "effectcraft_stall", "gpu: waited {:.0} ms for the colour-fusion cache", waited.as_secs_f64() * 1000.0);
+        }
         if let Some(p) = cache.get(ids) {
             return p.clone();
         }
