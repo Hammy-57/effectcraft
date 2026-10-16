@@ -90,6 +90,7 @@ const PINNED_INVOKE: &[&str] = &[
 /// The ids `menus::frontend` handled (frontend events of engine commands), in the old match order.
 const PINNED_FRONTEND: &[&str] = &[
     "effects.copyPresetsFolderPath",
+    "mediaBrowser.copySourcePath",
     "app.about",
     "prop.editGradient",
     "playback.scrubAudio",

@@ -11,8 +11,15 @@ pub(crate) fn handlers() -> &'static [Handler] {
         Handler::frontend("effect.manage", effects_presets),
         Handler::frontend("anim.browsePresets", effects_presets),
         Handler::frontend("effects.copyPresetsFolderPath", copy_presets_folder_path),
+        Handler::frontend("mediaBrowser.copySourcePath", copy_source_path),
     ];
     H
+}
+
+fn copy_source_path(_app: &mut EffectcraftApp, ctx: &egui::Context, _id: &str, p: Value) -> Result<Value, String> {
+    let path = p.get("path").and_then(Value::as_str).filter(|path| !path.is_empty()).ok_or("A source path is required")?;
+    ctx.copy_text(path.to_string());
+    Ok(json!({"path": path}))
 }
 
 fn copy_presets_folder_path(_app: &mut EffectcraftApp, ctx: &egui::Context, _id: &str, _p: Value) -> Result<Value, String> {
