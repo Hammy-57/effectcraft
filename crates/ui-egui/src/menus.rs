@@ -71,6 +71,12 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     uic!("motionLibrary.save", "Motion Library: Save Card to Library", [], None),
     uic!("motionLibrary.saveSelection", "Motion Library: Save Selection to Library", [], None),
     uic!("motionLibrary.folder", "Motion Library: Collection Folder (New, Rename, Icon, Delete)", [], None),
+    uic!("motionLibrary.card", "Motion Library: Card (Rename, Describe, Move, Thumbnail, Preview, Delete)", [], None),
+    uic!("motionLibrary.group", "Motion Library: Collection Group (New, Rename, Delete, Choose)", [], None),
+    uic!("motionLibrary.importFiles", "Motion Library: Import Files into a Collection", [], None),
+    uic!("motionLibrary.refresh", "Motion Library: Refresh Library Sources", [], None),
+    uic!("motionLibrary.curve", "Motion Library: Curves (Read Keys, Apply, Presets)", [], None),
+    uic!("motionLibrary.tool", "Motion Library: Run a Tool (Workflow, Text Split, Bounce, Colour)", [], None),
     // By key position, as in After Effects: on a Mac AZERTY keyboard (ABC-AZERTY, French) the key
     // right of `)` types `-` and zooms in, `)` zooms out; US keyboards are unchanged.
     uic!("timeline.zoomIn", "Zoom In Time", [], Some("Physical+=")),

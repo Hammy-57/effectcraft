@@ -54,7 +54,10 @@ pub struct ViewState {
     pub kind_filter: String,
     /// Only cards that can be applied here (not the ones applied on the Mac).
     pub here_only: bool,
-    /// The rail popover open: `display`, `curves`, `filters`, `save` (empty = none).
+    /// What the main area shows: `""` the cards, `curves` the Curves workspace, `tools` the
+    /// Motion Library tools.
+    pub workspace: String,
+    /// The rail popover open: `display`, `filters`, `save` (empty = none).
     #[serde(skip)]
     pub popover: String,
     /// The card whose details are shown.
@@ -106,6 +109,7 @@ impl Default for ViewState {
             show_tools: true,
             kind_filter: String::new(),
             here_only: false,
+            workspace: String::new(),
             popover: String::new(),
             details: None,
             apply_time: None,
@@ -154,6 +158,7 @@ impl ViewState {
             "showTools": self.show_tools,
             "kind": self.kind_filter,
             "hereOnly": self.here_only,
+            "workspace": self.workspace,
             "details": self.details,
         })
     }
@@ -949,30 +954,6 @@ fn pop_row(app: &mut EffectcraftApp, ui: &mut egui::Ui, r: Rect, y: f32, auto: &
     kit::button(app, ui, b, auto, text, false)
 }
 
-/// Curves: Easy Ease on the selected keyframes, and the library's ease cards.
-fn curves_body(app: &mut EffectcraftApp, ui: &mut egui::Ui, r: Rect, view: &mut ViewState, s: f32) {
-    let t = app.tokens;
-    ui.painter().text(pos2(r.min.x + 12.0 * s, r.min.y + 16.0 * s), Align2::LEFT_CENTER, tr("Curves"), Tokens::semibold(12.0 * s), t.text);
-    let rows = [
-        ("motionLibrary.curves.easyEase", "Easy Ease (F9)", "keys.easyEase"),
-        ("motionLibrary.curves.easeIn", "Easy Ease In", "keys.easyEaseIn"),
-        ("motionLibrary.curves.easeOut", "Easy Ease Out", "keys.easyEaseOut"),
-    ];
-    let mut y = r.min.y + 32.0 * s;
-    for (auto, text, cmd) in rows {
-        if pop_row(app, ui, r, y, auto, text, s) && kit::exec(app, cmd, json!({})).is_some() {
-            app.ui.status = format!("{text} on the selected keyframes");
-        }
-        y += 28.0 * s;
-    }
-    if pop_row(app, ui, r, y, "motionLibrary.curves.cards", "Ease cards in the library", s) {
-        view.kind_filter = "Ease".into();
-        view.folder.clear();
-        view.scroll = 0.0;
-        view.popover.clear();
-    }
-}
-
 /// Filters: what kind of card (Comp, Overlay, Sound…) and only cards that apply here.
 fn filters_body(app: &mut EffectcraftApp, ui: &mut egui::Ui, r: Rect, view: &mut ViewState, kinds: &[(String, usize)], s: f32) {
     let t = app.tokens;
@@ -1090,12 +1071,7 @@ pub fn save_selection_command(app: &mut EffectcraftApp, ctx: &egui::Context, par
         "preset" => ("save_asset", json!({"kind": "preset", "name": name, "category": category})),
         other => return Err(format!("unknown kind `{other}` (layers, comp or preset)")),
     };
-    let scripting = &app.session.prefs.scripting;
-    let port = std::env::var("EFFECTCRAFT_CONTROL_PORT")
-        .ok()
-        .and_then(|v| v.parse::<u16>().ok())
-        .or_else(|| scripting.agent_control.then(|| u16::try_from(scripting.agent_control_port).ok()).flatten())
-        .ok_or("saving reads the project through the control channel: turn on Settings ▸ Scripting ▸ Let Agents Control EffectCraft")?;
+    let port = control_port(app)?;
     app.ui.status = format!("Saving “{name}” to the Motion Library…");
     let done = format!("Saved “{name}” to {category}");
     let save = move || {
@@ -1105,6 +1081,24 @@ pub fn save_selection_command(app: &mut EffectcraftApp, ctx: &egui::Context, par
     };
     spawn_ml_op(ctx, save, FolderChange::Created(category.clone()), done);
     Ok(json!({"saving": name, "category": category, "kind": kind}))
+}
+
+/// This app's control port: Motion Library operations on the open project (saving, tools,
+/// curves) reach it through the Motion Library's EffectCraft plug.
+pub(crate) fn control_port(app: &EffectcraftApp) -> Result<u16, String> {
+    let scripting = &app.session.prefs.scripting;
+    std::env::var("EFFECTCRAFT_CONTROL_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .or_else(|| scripting.agent_control.then(|| u16::try_from(scripting.agent_control_port).ok()).flatten())
+        .ok_or_else(|| "this reads the project through the control channel: turn on Settings ▸ Scripting ▸ Let Agents Control EffectCraft".to_string())
+}
+
+/// One host operation of the Motion Library's EffectCraft plug (`effectcraft_plug.py`: curves,
+/// tools, saving) on the open project, through this app's control port. Blocks: run it off the UI
+/// thread ([`spawn_ml_op`]).
+pub(crate) fn plug_rpc(port: u16, op: &str, args: Value) -> Result<Value, String> {
+    ml_rpc("effectcraft_plug.py", &[], Some(port), op, args)
 }
 
 /// The quick actions on the right: comp tools on the open composition's selection.
@@ -1174,9 +1168,15 @@ fn rail(
     let mut y = bar.min.y + 8.0 * s;
     let mut anchors: Vec<(&str, Rect)> = vec![];
     use crate::icons::Icon;
-    let top: [(&str, Icon, &str, bool); 6] = [
-        ("assets", Icon::Grid, "Assets: everything in the library", view.folder.is_empty() && view.kind_filter.is_empty() && view.query.is_empty()),
-        ("curves", Icon::Graph, "Curves: Easy Ease and the library's ease cards", view.popover == "curves"),
+    let top: [(&str, Icon, &str, bool); 7] = [
+        (
+            "assets",
+            Icon::Grid,
+            "Assets: everything in the library",
+            view.workspace.is_empty() && view.folder.is_empty() && view.kind_filter.is_empty() && view.query.is_empty(),
+        ),
+        ("curves", Icon::Graph, "Curves: the graph editor and curve presets", view.workspace == "curves"),
+        ("tools", Icon::Sparkle, "Tools: Workflow, Text Split, Bounce, Colour", view.workspace == "tools"),
         ("search", Icon::Search, "Search assets", false),
         ("filters", Icon::Hamburger, "Filter cards by kind", view.popover == "filters" || !view.kind_filter.is_empty() || view.here_only),
         ("folders", Icon::Folder, "Show or hide the collections", view.show_folders),
@@ -1189,12 +1189,18 @@ fn rail(
         if resp.on_hover_text(tr(tip)).clicked() {
             match name {
                 "assets" => {
+                    view.workspace.clear();
                     view.folder.clear();
                     view.kind_filter.clear();
                     view.query.clear();
                     view.scroll = 0.0;
                 }
+                "curves" | "tools" => {
+                    view.workspace = if view.workspace == name { String::new() } else { name.to_string() };
+                    view.popover.clear();
+                }
                 "search" => {
+                    view.workspace.clear();
                     ctx.data_mut(|d| d.insert_temp(egui::Id::new("ml-focus-search"), true));
                 }
                 "folders" => view.show_folders = !view.show_folders,
@@ -1317,7 +1323,6 @@ fn rail(
         let anchor = *anchor;
         match which.as_str() {
             "display" => popover(app, ctx, anchor, vec2(236.0 * s, 104.0 * s), view, |app, ui, r, view| display_body(app, ui, r, view, s)),
-            "curves" => popover(app, ctx, anchor, vec2(220.0 * s, 150.0 * s), view, |app, ui, r, view| curves_body(app, ui, r, view, s)),
             "filters" => {
                 let h = (66.0 + 23.0 * (kinds.len() as f32 + 1.0)) * s;
                 popover(app, ctx, anchor, vec2(240.0 * s, h), view, |app, ui, r, view| filters_body(app, ui, r, view, &kinds, s))
@@ -1612,6 +1617,22 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let tools_r = Rect::from_min_max(pos2(rect.max.x - tools_w, rect.min.y), pos2(rect.max.x, rect.max.y - footer_h));
     // Collections: a tree on the left (a dropdown when the panel is very narrow).
     let mut main = Rect::from_min_max(pos2(rail_r.max.x + 1.0, rect.min.y), pos2(rect.max.x - tools_w, rect.max.y - footer_h));
+    // Curves and Tools take the whole area right of the rail (as the web panel's workspaces).
+    if !view.workspace.is_empty() {
+        let area = Rect::from_min_max(main.min, pos2(main.max.x, rect.max.y));
+        match view.workspace.as_str() {
+            "curves" => super::motion_library_curves::workspace(app, ui, &ctx, area, &mut view, s),
+            "tools" => super::motion_library_tools::workspace(app, ui, &ctx, area, &mut view, s),
+            _ => view.workspace.clear(),
+        }
+        rail(app, ui, &ctx, &client, &status, rail_r, &mut view, s);
+        if tools_w > 0.0 {
+            toolbar(app, ui, Rect::from_min_max(tools_r.min, pos2(tools_r.max.x, rect.max.y)), s);
+        }
+        view.clamp();
+        app.ui.motion_library = view;
+        return;
+    }
     if tree_fits && view.show_folders {
         let side_w = (184.0 * s).min(main.width() * if narrow { 0.36 } else { 0.38 }).max(96.0).round();
         let side = Rect::from_min_max(main.min, pos2(main.min.x + side_w, main.max.y));
@@ -2239,10 +2260,17 @@ pub fn set_view(view: &mut ViewState, p: &Value) -> Result<Value, String> {
     }
     if let Some(v) = p.get("popover") {
         let v = v.as_str().unwrap_or("");
-        if !["", "display", "curves", "filters", "save"].contains(&v) {
-            return Err(format!("unknown popover `{v}` (display, curves, filters, save, or \"\")"));
+        if !["", "display", "filters", "save"].contains(&v) {
+            return Err(format!("unknown popover `{v}` (display, filters, save, or \"\")"));
         }
         view.popover = v.to_string();
+    }
+    if let Some(w) = p.get("workspace") {
+        let w = w.as_str().unwrap_or("");
+        if !["", "assets", "curves", "tools"].contains(&w) {
+            return Err(format!("unknown workspace `{w}` (assets, curves, tools)"));
+        }
+        view.workspace = if w == "assets" { String::new() } else { w.to_string() };
     }
     if let Some(k) = p.get("kind") {
         view.kind_filter = k.as_str().ok_or("`kind` is a card kind (Comp, Overlay, Sound…; \"\" = all)")?.to_string();
@@ -2503,7 +2531,7 @@ fn ml_backend() -> Option<std::path::PathBuf> {
 
 /// One backend operation (`backend.py rpc`): its result, or its error message.
 #[cfg(not(target_arch = "wasm32"))]
-fn backend_rpc(op: &str, args: Value) -> Result<Value, String> {
+pub(crate) fn backend_rpc(op: &str, args: Value) -> Result<Value, String> {
     ml_rpc("backend.py", &["rpc"], None, op, args)
 }
 
@@ -2511,7 +2539,7 @@ fn backend_rpc(op: &str, args: Value) -> Result<Value, String> {
 /// envelope, stdin `{operation, args}` → stdout `{ok, result | error}`. `port`: this app's control
 /// port, for scripts that work on the open project.
 #[cfg(not(target_arch = "wasm32"))]
-fn ml_rpc(name: &str, script_args: &[&str], port: Option<u16>, op: &str, args: Value) -> Result<Value, String> {
+pub(crate) fn ml_rpc(name: &str, script_args: &[&str], port: Option<u16>, op: &str, args: Value) -> Result<Value, String> {
     use std::io::Write;
     use std::process::{Command, Stdio};
     let backend = ml_backend().filter(|p| p.is_file()).ok_or("the Motion Library backend (backend.py) isn't on this computer (set EFFECTCRAFT_ML_BACKEND)")?;
@@ -2543,12 +2571,12 @@ fn ml_rpc(name: &str, script_args: &[&str], port: Option<u16>, op: &str, args: V
 }
 
 #[cfg(target_arch = "wasm32")]
-fn backend_rpc(_op: &str, _args: Value) -> Result<Value, String> {
+pub(crate) fn backend_rpc(_op: &str, _args: Value) -> Result<Value, String> {
     Err("Motion Library folders can be changed in the desktop app".into())
 }
 
 #[cfg(target_arch = "wasm32")]
-fn ml_rpc(_name: &str, _script_args: &[&str], _port: Option<u16>, _op: &str, _args: Value) -> Result<Value, String> {
+pub(crate) fn ml_rpc(_name: &str, _script_args: &[&str], _port: Option<u16>, _op: &str, _args: Value) -> Result<Value, String> {
     Err("saving to the Motion Library works in the desktop app".into())
 }
 
@@ -2568,7 +2596,7 @@ fn reindex_library() {
 fn reindex_library() {}
 
 /// What a finished operation changes in the tree right away.
-enum FolderChange {
+pub(crate) enum FolderChange {
     None,
     Created(String),
     Renamed(String, String),
@@ -2582,7 +2610,7 @@ fn spawn_folder_op(ctx: &egui::Context, op: &'static str, args: Value, change: F
 
 /// Run a Motion Library operation in the background, then rebuild the index; the status line says
 /// how it went.
-fn spawn_ml_op(ctx: &egui::Context, op: impl FnOnce() -> Result<Value, String> + Send + 'static, change: FolderChange, done: String) {
+pub(crate) fn spawn_ml_op(ctx: &egui::Context, op: impl FnOnce() -> Result<Value, String> + Send + 'static, change: FolderChange, done: String) {
     let ctx = ctx.clone();
     let run = move || {
         let result = op();
@@ -2828,4 +2856,30 @@ fn folder_ask_sheet(app: &mut EffectcraftApp, ui: &mut egui::Ui, grid: Rect, ask
         return Some(Some(params));
     }
     None
+}
+
+// ── Cards, groups, imports (stubs filled in below) ─────────────────────────────────────────────
+
+/// `motionLibrary.card`: a card's menu operations.
+pub fn card_command(app: &mut EffectcraftApp, ctx: &egui::Context, params: &Value) -> Result<Value, String> {
+    let _ = (app, ctx, params);
+    Err("not yet".into())
+}
+
+/// `motionLibrary.group`: collection groups.
+pub fn group_command(app: &mut EffectcraftApp, ctx: &egui::Context, params: &Value) -> Result<Value, String> {
+    let _ = (app, ctx, params);
+    Err("not yet".into())
+}
+
+/// `motionLibrary.importFiles`: save files into a collection.
+pub fn import_files_command(app: &mut EffectcraftApp, ctx: &egui::Context, params: &Value) -> Result<Value, String> {
+    let _ = (app, ctx, params);
+    Err("not yet".into())
+}
+
+/// `motionLibrary.refresh`: refresh the local library's sources.
+pub fn refresh_command(app: &mut EffectcraftApp, ctx: &egui::Context, params: &Value) -> Result<Value, String> {
+    let _ = (app, ctx, params);
+    Err("not yet".into())
 }
