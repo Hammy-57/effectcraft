@@ -1844,7 +1844,6 @@ fn request_content_key(
     }
 }
 
-
 /// Whether a freshly rendered frame goes to the disk cache: only frames that were expensive to
 /// render, and no prefetch frame while more prefetch is queued (playback and RAM preview keep the
 /// workers busy; there compression would slow the frames being waited for). The viewer's frame

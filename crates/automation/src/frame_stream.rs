@@ -116,7 +116,23 @@ impl Streams {
     pub(crate) fn message(&mut self, m: StreamMsg) {
         let id = m.stream();
         match m {
-            StreamMsg::Start { stream, revision, comp, from, to, loop_from, looping, opts, codec, crf, chunk_frames, ahead_secs, adaptive, max_size, cache } => {
+            StreamMsg::Start {
+                stream,
+                revision,
+                comp,
+                from,
+                to,
+                loop_from,
+                looping,
+                opts,
+                codec,
+                crf,
+                chunk_frames,
+                ahead_secs,
+                adaptive,
+                max_size,
+                cache,
+            } => {
                 if let Some(old) = self.live.remove(&stream) {
                     old.stop();
                 }
@@ -644,7 +660,10 @@ impl Shared {
         }));
         for slot in 0..count as usize {
             let time = st.p.rate.tick_of(first + slot as i64);
-            st.jobs.insert((order, slot), FrameJob { chunk: Arc::clone(&chunk), index: c, level, project: st.project.clone(), slot, time, frame: first + slot as i64 });
+            st.jobs.insert(
+                (order, slot),
+                FrameJob { chunk: Arc::clone(&chunk), index: c, level, project: st.project.clone(), slot, time, frame: first + slot as i64 },
+            );
         }
         st.flying.insert(c, Flight { epoch: st.epoch });
         self.work.notify_all();

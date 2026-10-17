@@ -43,8 +43,8 @@ use effectcraft_engine::time::Tick;
 use serde_json::{Value, json};
 
 use crate::control_wire::{self, lock};
-use crate::frame_cache::FrameCache;
 use crate::figma_bridge::{new_code, same_code};
+use crate::frame_cache::FrameCache;
 use crate::frame_stream::{StreamHost, Streams};
 
 /// The token file in the config directory (mode 0600).
@@ -584,7 +584,14 @@ fn precache(p: &PrecacheJob, shared: &Shared) {
         Ok((frame, gpu)) => {
             let (w, h, rgba) = rgba8(frame);
             shared.frames.put(p.key, w, h, Arc::new(rgba));
-            shared.log(&format!("precache {}/{} frame {} {w}×{h} {} render {:.1} ms", p.conn, p.precache.comp.0, p.frame, if gpu { "gpu" } else { "cpu" }, ms(t0.elapsed())));
+            shared.log(&format!(
+                "precache {}/{} frame {} {w}×{h} {} render {:.1} ms",
+                p.conn,
+                p.precache.comp.0,
+                p.frame,
+                if gpu { "gpu" } else { "cpu" },
+                ms(t0.elapsed())
+            ));
         }
         Err(e) => shared.log(&format!("precache {}/{} frame {}: {e}", p.conn, p.precache.comp.0, p.frame)),
     }
@@ -876,13 +883,7 @@ fn message(conn: u64, msg: FrameMsg, want: Want, urgent: bool, replica: &mut Fra
             let Some(c) = project.comp(p.comp) else { return };
             let last = c.frame_rate.frame_at(c.duration).saturating_sub(1).max(0);
             let mut seen = HashSet::new();
-            let frames: Vec<i64> = p
-                .ranges
-                .iter()
-                .flat_map(|&(a, b)| a.max(0)..=b.min(last))
-                .filter(|f| seen.insert(*f))
-                .take(MAX_PLAN_FRAMES)
-                .collect();
+            let frames: Vec<i64> = p.ranges.iter().flat_map(|&(a, b)| a.max(0)..=b.min(last)).filter(|f| seen.insert(*f)).take(MAX_PLAN_FRAMES).collect();
             shared.log(&format!("connection {conn}: precache comp {} {} frames at {}‰", p.comp.0, frames.len(), p.series.scale));
             let plan = Plan {
                 conn,

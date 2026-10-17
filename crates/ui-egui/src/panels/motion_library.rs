@@ -309,16 +309,88 @@ fn stop_preview(ctx: &egui::Context) {
     }
 }
 
-/// The movie to preview from this machine's library folder: the entry's preview, else its file
-/// when that is a video (Overlay cards). Played from disk: nothing downloads.
-fn local_preview(local: &LocalIndex, card: &Card) -> Option<String> {
+/// What a card plays on hover from this machine's library folder, as the library's web panel
+/// does: its preview movie, a video thumbnail, its file when that is a video (Overlay cards), else
+/// its PNG frames. Read from disk: nothing downloads.
+enum LocalPreview {
+    Movie(String),
+    Frames(Vec<String>),
+}
+
+/// PNG frames played on hover at most (seconds × [`PREVIEW_FPS`]).
+const PREVIEW_PNG_FRAMES: usize = 120;
+
+fn local_preview(local: &LocalIndex, card: &Card) -> Option<LocalPreview> {
     let e = local.get(&card.id)?;
     let is_file = |p: &str| !p.is_empty() && std::path::Path::new(p).is_file();
+    let is_video = |p: &str| {
+        let ext = std::path::Path::new(p).extension().map(|x| x.to_string_lossy().to_lowercase()).unwrap_or_default();
+        matches!(ext.as_str(), "mp4" | "mov" | "m4v" | "webm")
+    };
     if is_file(&e.preview) {
-        return Some(e.preview.clone());
+        return Some(LocalPreview::Movie(e.preview.clone()));
     }
-    let ext = std::path::Path::new(&e.file).extension().map(|x| x.to_string_lossy().to_lowercase()).unwrap_or_default();
-    (matches!(ext.as_str(), "mp4" | "mov" | "m4v" | "webm") && is_file(&e.file)).then(|| e.file.clone())
+    for p in [&e.thumbnail, &e.file] {
+        if is_video(p) && is_file(p) {
+            return Some(LocalPreview::Movie(p.clone()));
+        }
+    }
+    let frames = png_frames(&e.frames);
+    (frames.len() >= 2).then_some(LocalPreview::Frames(frames))
+}
+
+/// A folder's PNGs in natural order (`frame2` before `frame10`), the first [`PREVIEW_PNG_FRAMES`].
+fn png_frames(dir: &str) -> Vec<String> {
+    if dir.is_empty() {
+        return vec![];
+    }
+    let Ok(read) = std::fs::read_dir(dir) else { return vec![] };
+    let mut paths: Vec<std::path::PathBuf> =
+        read.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("png"))).collect();
+    paths.sort_by_cached_key(|p| natural_key(&p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()));
+    paths.into_iter().take(PREVIEW_PNG_FRAMES).map(|p| p.to_string_lossy().to_string()).collect()
+}
+
+/// Sort key: runs of digits compare as numbers.
+fn natural_key(name: &str) -> Vec<(u64, String)> {
+    let mut out = vec![];
+    let mut digits = String::new();
+    let mut text = String::new();
+    for c in name.chars() {
+        if c.is_ascii_digit() {
+            if !text.is_empty() {
+                out.push((0, std::mem::take(&mut text)));
+            }
+            digits.push(c);
+        } else {
+            if !digits.is_empty() {
+                out.push((digits.parse::<u64>().unwrap_or(u64::MAX).saturating_add(1), String::new()));
+                digits.clear();
+            }
+            text.push(c.to_ascii_lowercase());
+        }
+    }
+    if !digits.is_empty() {
+        out.push((digits.parse::<u64>().unwrap_or(u64::MAX).saturating_add(1), String::new()));
+    }
+    if !text.is_empty() {
+        out.push((0, text));
+    }
+    out
+}
+
+/// Decode PNG frames for the hover preview, appending them as they come.
+fn decode_frames(paths: &[String], frames: &Mutex<Vec<([u32; 2], Vec<u8>)>>, cancel: &AtomicBool, ctx: &egui::Context) {
+    for path in paths {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let Some((size, px)) = std::fs::read(path).ok().and_then(|b| decode_image(&b, PREVIEW_SIDE)) else { continue };
+        if let Ok(mut v) = frames.lock() {
+            v.push((size, px));
+        }
+        ctx.request_repaint();
+    }
 }
 
 /// The preview frame to draw over `card` now (starting its decode on first hover: a local file,
@@ -334,8 +406,30 @@ fn preview_frame(app: &EffectcraftApp, ctx: &egui::Context, client: &Client, loc
         return None;
     }
     if p.started.is_none() {
+        // A card this machine has: its local files only (the bucket is for machines without them).
         let state = match local_preview(local, card) {
-            Some(path) => BlobState::Ready(Some(std::path::PathBuf::from(path))),
+            Some(LocalPreview::Movie(path)) => BlobState::Ready(Some(std::path::PathBuf::from(path))),
+            Some(LocalPreview::Frames(paths)) => {
+                let (frames, done, cancel, ctx2) = (p.frames.clone(), p.done.clone(), p.cancel.clone(), ctx.clone());
+                let work = move || {
+                    decode_frames(&paths, &frames, &cancel, &ctx2);
+                    done.store(true, Ordering::Relaxed);
+                    ctx2.request_repaint();
+                };
+                #[cfg(target_arch = "wasm32")]
+                work();
+                #[cfg(not(target_arch = "wasm32"))]
+                if std::thread::Builder::new().name("ec-library-preview".into()).spawn(work).is_err() {
+                    p.error = Some("no thread for the preview".into());
+                    return None;
+                }
+                p.started = Some(ctx.input(|i| i.time));
+                return None;
+            }
+            None if is_local(card, local) => {
+                p.error = Some("no preview on this Mac".into());
+                return None;
+            }
             None => client.blob(card.preview.as_ref()?),
         };
         match state {
@@ -1589,9 +1683,14 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     hovered_card = Some(card.id.clone());
                 }
                 let tex = live.map(|t| (t.id(), t.size_vec2())).or_else(|| {
-                    let thumb = match &card.thumbnail {
-                        Some(b) => thumbnail(&ctx, &client, b, side, &mut budget),
-                        None => local.get(&card.id).filter(|e| !e.thumbnail.is_empty()).and_then(|e| local_thumbnail(&ctx, &e.thumbnail, side, &mut budget)),
+                    // This Mac's library folder first (as the web panel), the bucket's copy else.
+                    let thumb = match local.get(&card.id).filter(|e| !e.thumbnail.is_empty()) {
+                        Some(e) => match cached_thumb(&ctx, &e.thumbnail, side) {
+                            Some(Some(t)) => Some(t),
+                            Some(None) => card.thumbnail.as_ref().and_then(|b| thumbnail(&ctx, &client, b, side, &mut budget)),
+                            None => local_thumbnail(&ctx, &e.thumbnail, side, &mut budget),
+                        },
+                        None => card.thumbnail.as_ref().and_then(|b| thumbnail(&ctx, &client, b, side, &mut budget)),
                     };
                     thumb.map(|(tex, [w, h])| (tex.id(), vec2(w as f32, h as f32)))
                 });
@@ -1993,6 +2092,21 @@ mod tests {
         assert_eq!(ys, vec![(0.0, 0.0), (110.0, 0.0), (0.0, 113.0), (0.0, 226.0)]);
         // A card wider than the grid takes the whole width.
         assert_eq!(layout(&cards, false, 80.0, 1200.0, 10.0, 40.0, 30.0).col_w, 80.0);
+    }
+
+    #[test]
+    fn png_frames_play_in_natural_order() {
+        let dir = std::env::temp_dir().join(format!("ml-frames-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in ["f10.png", "f2.png", "f1.png", "notes.txt", "F3.PNG"] {
+            std::fs::write(dir.join(n), b"x").unwrap();
+        }
+        let names: Vec<String> =
+            png_frames(&dir.to_string_lossy()).iter().map(|p| std::path::Path::new(p).file_name().unwrap().to_string_lossy().to_string()).collect();
+        assert_eq!(names, ["f1.png", "f2.png", "F3.PNG", "f10.png"]);
+        assert!(png_frames("").is_empty() && png_frames("/no/such/dir").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
