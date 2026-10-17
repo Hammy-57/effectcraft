@@ -3,7 +3,7 @@
 use effectcraft_project::{ItemId, LayerId};
 use serde_json::json;
 
-use crate::Session;
+use crate::{Session, freeze_cost::Unit};
 
 struct Fixture {
     s: Session,
@@ -45,9 +45,9 @@ fn a_heavy_precomp_is_suggested_and_a_cheap_layer_is_not() {
     let found = f.s.freeze_suggestions();
     assert_eq!(found.len(), 1, "the solid is cheap and the layer inside is covered by freezing its precomp: {found:?}");
     let top = &found[0];
-    assert_eq!((top.comp, top.layer, top.precomp), (f.outer, f.stack, Some(f.inner)));
+    assert_eq!((top.comp, top.layer, top.unit), (f.outer, f.stack, Unit::Precomp(f.inner)));
     assert!((top.ratio() - 18.0).abs() < 1e-6, "1800 ms against a 100 ms budget");
-    assert!(top.hint().contains("1.8 s/frame"), "{}", top.hint());
+    assert_eq!(top.question(), "Stat Stack renders at 1.8 s/frame — Freeze it?");
     let listed = f.s.execute("freeze.suggest", json!({})).unwrap();
     assert_eq!(listed["candidates"][0]["layer"], f.stack.0);
     assert_eq!(listed["candidates"][0]["freeze"]["mode"], "precomp");
@@ -79,7 +79,7 @@ fn a_heavy_layer_inside_the_comp_is_suggested_and_bad_times_are_ignored() {
     f.s.note_layer_costs(ItemId(9999), [(f.outer, f.solid, 900.0)]);
     let found = f.s.freeze_suggestions();
     assert_eq!(found.len(), 1, "{found:?}");
-    assert_eq!((found[0].layer, found[0].precomp), (f.solid, None));
+    assert_eq!((found[0].layer, found[0].unit), (f.solid, Unit::Layer));
     assert_eq!(found[0].freeze_params()["mode"], "selection");
 }
 
@@ -131,4 +131,59 @@ fn idle_for(s: &mut Session, seconds: u64) {
     let ago = web_time::Instant::now() - std::time::Duration::from_secs(seconds);
     s.freeze_runtime.changed = ago;
     s.freeze_runtime.activity = ago;
+}
+
+#[test]
+fn hints_belong_to_the_open_composition() {
+    let mut f = fixture();
+    // Only the layer inside "Inner" is slow, and "Outer" is open: nothing to say about it.
+    play(&mut f, 12, 5.0, 2.0, 400.0);
+    assert!(f.s.freeze_suggestions().is_empty(), "a layer of another comp is not this comp's hint");
+    assert_eq!(f.s.execute("freeze.suggest", json!({})).unwrap()["candidates"].as_array().unwrap().len(), 0);
+    let all = f.s.execute("freeze.suggest", json!({"all":true})).unwrap();
+    assert_eq!(all["candidates"][0]["layer"], f.inside.0, "a caller can still ask for every comp");
+    let inner = f.s.execute("freeze.suggest", json!({"comp":f.inner.0})).unwrap();
+    assert_eq!(inner["candidates"][0]["layer"], f.inside.0);
+
+    f.s.execute("comp.open", json!({"comp":f.inner.0})).unwrap();
+    let found = f.s.freeze_suggestions();
+    assert_eq!((found.len(), found[0].layer), (1, f.inside), "opening Inner shows Inner's hint");
+    f.s.execute("comp.open", json!({"comp":f.outer.0})).unwrap();
+    assert!(f.s.freeze_suggestions().is_empty(), "and opening Outer takes it away again");
+}
+
+#[test]
+fn a_layer_freeze_refuses_is_offered_as_its_whole_comp_or_not_at_all() {
+    let mut f = fixture();
+    f.s.execute("prop.setExpression", json!({"comp":f.outer.0, "layer":f.solid.0, "path":"transform/position", "expression":"[value[0], value[1]]"})).unwrap();
+    play(&mut f, 12, 5.0, 900.0, 2.0);
+    let refused = f.s.execute("freeze.freeze", json!({"comp":f.outer.0, "layers":[f.solid.0], "mode":"selection"})).unwrap_err().to_string();
+    assert!(refused.contains("expression dependencies"), "{refused}");
+
+    let found = f.s.freeze_suggestions();
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!((found[0].layer, found[0].unit), (f.solid, Unit::Comp));
+    assert_eq!(found[0].question(), "Freeze Outer (Red renders at 900 ms/frame)");
+    let params = found[0].freeze_params();
+    assert_eq!(params["mode"], "comp");
+
+    let mut run = params;
+    run["wait"] = json!(true);
+    run["quickDraft"] = json!(false);
+    f.s.execute("freeze.freeze", run).expect("what the hint offers is what freeze.freeze accepts");
+    assert!(f.s.project.freeze.sections[0].cache.is_some());
+    assert!(f.s.freeze_suggestions().is_empty(), "and once frozen it is not offered again");
+    std::fs::remove_dir_all(crate::freeze_storage::root(&f.s.project.freeze.namespace).unwrap()).ok();
+
+    // The comp itself cannot be frozen (it sits collapsed in another comp): no hint at all.
+    let mut g = fixture();
+    g.s.execute("prop.setExpression", json!({"comp":g.outer.0, "layer":g.solid.0, "path":"transform/position", "expression":"[value[0], value[1]]"})).unwrap();
+    g.s.execute("comp.new", json!({"name":"Top", "width":16, "height":16, "frameRate":10, "duration":0.2})).unwrap();
+    let top = g.s.active_comp_id().unwrap();
+    g.s.execute("layer.addItem", json!({"item":g.outer.0})).unwrap();
+    let nested = g.s.active_comp().unwrap().layers[0].id;
+    g.s.execute("layer.setSwitch", json!({"comp":top.0, "layers":[nested.0], "switch":"collapse", "value":true})).unwrap();
+    g.s.execute("comp.open", json!({"comp":g.outer.0})).unwrap();
+    play(&mut g, 12, 5.0, 900.0, 2.0);
+    assert!(g.s.freeze_suggestions().is_empty(), "neither the layer nor its comp can be frozen: {:?}", g.s.freeze_suggestions());
 }
