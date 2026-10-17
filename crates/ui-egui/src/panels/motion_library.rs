@@ -12,7 +12,7 @@
 //!
 //! Everything here is also a command (`library.*`), so agents use the same library.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -57,6 +57,12 @@ pub struct ViewState {
     /// What the main area shows: `""` the cards, `curves` the Curves workspace, `tools` the
     /// Motion Library tools.
     pub workspace: String,
+    /// The collection group shown (`""` = all collections).
+    pub group: String,
+    /// Card width per folder (the web panel remembers each folder's).
+    pub folder_card_sizes: BTreeMap<String, f32>,
+    /// Width of the collections column in points at 100 % (0 = automatic).
+    pub sidebar_width: f32,
     /// The rail popover open: `display`, `filters`, `save` (empty = none).
     #[serde(skip)]
     pub popover: String,
@@ -78,11 +84,22 @@ pub struct ViewState {
     /// A collection folder dialog (new, rename, delete).
     #[serde(skip)]
     pub folder_ask: Option<FolderAsk>,
+    /// A card or group dialog (rename, describe, move, delete, groups).
+    #[serde(skip)]
+    pub card_ask: Option<CardAsk>,
     /// Save to Motion Library: the card's name and what to save (`layers`, `comp`, `preset`).
     #[serde(skip)]
     pub save_name: String,
     #[serde(skip)]
     pub save_kind: String,
+    /// Save to Motion Library: its description, Comp's contents (`all` / `selected` layers) and
+    /// Layers' card preview (`selected` layers only / `work-area`: the whole comp as a demo).
+    #[serde(skip)]
+    pub save_description: String,
+    #[serde(skip)]
+    pub save_contents: String,
+    #[serde(skip)]
+    pub save_preview: String,
 }
 
 /// A save to confirm: the card, the upload's size and what stays home.
@@ -110,6 +127,9 @@ impl Default for ViewState {
             kind_filter: String::new(),
             here_only: false,
             workspace: String::new(),
+            group: String::new(),
+            folder_card_sizes: BTreeMap::new(),
+            sidebar_width: 0.0,
             popover: String::new(),
             details: None,
             apply_time: None,
@@ -117,8 +137,12 @@ impl Default for ViewState {
             saving: None,
             confirm_save: None,
             folder_ask: None,
+            card_ask: None,
             save_name: String::new(),
             save_kind: String::new(),
+            save_description: String::new(),
+            save_contents: String::new(),
+            save_preview: String::new(),
         }
     }
 }
@@ -142,6 +166,11 @@ impl ViewState {
         if !self.folder_scroll.is_finite() {
             self.folder_scroll = 0.0;
         }
+        self.sidebar_width = if self.sidebar_width.is_finite() && self.sidebar_width > 0.0 { self.sidebar_width.clamp(80.0, 420.0) } else { 0.0 };
+        self.folder_card_sizes.retain(|_, w| w.is_finite());
+        for w in self.folder_card_sizes.values_mut() {
+            *w = w.clamp(CARD_SIZE_RANGE.0, CARD_SIZE_RANGE.1);
+        }
     }
     /// The view as `motionLibrary.view` reports it.
     pub fn to_json(&self) -> Value {
@@ -159,6 +188,7 @@ impl ViewState {
             "kind": self.kind_filter,
             "hereOnly": self.here_only,
             "workspace": self.workspace,
+            "group": self.group,
             "details": self.details,
         })
     }
@@ -641,9 +671,9 @@ fn local_only_cards(ctx: &egui::Context, client: &Client, local: &Arc<LocalIndex
     cards
 }
 
-/// A card by id: the catalog's, else one only this Mac's library folder has.
-fn find_card(client: &Client, local_only: &[Card], id: &str) -> Option<Card> {
-    client.catalog().and_then(|c| c.card(id).cloned()).or_else(|| local_only.iter().find(|c| c.id == id).cloned())
+/// A card by id, as the panel lists it.
+fn find_card(all: &[Card], id: &str) -> Option<Card> {
+    all.iter().find(|c| c.id == id).cloned()
 }
 
 /// The adopted catalog's identity (a new one after an update).
@@ -651,46 +681,43 @@ fn generation(client: &Client) -> u64 {
     client.catalog().map_or(0, |c| Arc::as_ptr(&c) as usize as u64)
 }
 
-/// Cards matching the view, cached per catalog generation, query and folder. Browsing everything
-/// (no folder, no query) groups them by folder in the library's order.
-fn visible_cards(ctx: &egui::Context, client: &Client, local: &Arc<LocalIndex>, local_only: &[Card], view: &ViewState) -> Arc<Vec<Card>> {
-    type Cached = (u64, String, String, String, bool, Arc<Vec<Card>>);
+/// Cards matching the view (search, folder, kind, group), cached per card list and view. Browsing
+/// everything (no folder, no query) groups them by folder in the tree's order.
+fn visible_cards(ctx: &egui::Context, all: &Arc<Vec<Card>>, local: &Arc<LocalIndex>, lib: &LocalLib, tree: &Arc<Vec<FolderRow>>, view: &ViewState) -> Arc<Vec<Card>> {
+    type Cached = ((usize, usize), String, String, String, bool, String, Arc<Vec<Card>>);
     let id = egui::Id::new("ml-cards");
-    let generation = generation(client) ^ (Arc::as_ptr(local) as usize as u64).rotate_left(17);
-    if let Some((g, q, f, k, h, cards)) = ctx.data(|d| d.get_temp::<Cached>(id))
-        && g == generation
+    let key = (Arc::as_ptr(all) as usize, Arc::as_ptr(tree) as usize);
+    if let Some((k, q, f, kind, h, g, cards)) = ctx.data(|d| d.get_temp::<Cached>(id))
+        && k == key
         && q == view.query
         && f == view.folder
-        && k == view.kind_filter
+        && kind == view.kind_filter
         && h == view.here_only
+        && g == view.group
     {
         return cards;
     }
-    let cat = client.catalog();
-    let listed: &[Card] = cat.as_ref().map_or(&[], |c| c.cards.as_slice());
-    let mut cards: Vec<Card> = effectcraft_engine::motionlib::search(listed, &view.query, &view.folder)
+    let ops = folder_ops();
+    let mut cards: Vec<Card> = effectcraft_engine::motionlib::search(all, &view.query, &view.folder)
         .into_iter()
-        .chain(effectcraft_engine::motionlib::search(local_only, &view.query, &view.folder))
         .filter(|c| view.kind_filter.is_empty() || kind_label(c) == view.kind_filter)
-        .filter(|c| !view.here_only || usable(c, local))
+        .filter(|c| !view.here_only || usable(c, local) || plug_use(c, local, lib).is_some())
+        .filter(|c| view.group.is_empty() || folder_group(lib, &ops, &c.category) == view.group)
         .cloned()
         .collect();
+    drop(ops);
     // This Mac's crops (the library folder's index) over the catalog's.
     for c in &mut cards {
         if let Some(crop) = local.get(&c.id).and_then(|e| e.crop) {
             c.crop = Some(crop);
         }
     }
-    if grouped(view)
-        && let Some(cat) = &cat
-    {
-        let ranks = cat.folder_ranks();
-        cards.sort_by_key(|c| ranks.get(&c.category).copied().unwrap_or(usize::MAX));
+    if grouped(view) {
+        let ranks: BTreeMap<&str, usize> = tree.iter().enumerate().map(|(i, r)| (r.path.as_str(), i)).collect();
+        cards.sort_by_key(|c| ranks.get(c.category.as_str()).copied().unwrap_or(usize::MAX));
     }
     let cards = Arc::new(cards);
-    ctx.data_mut(|d| {
-        d.insert_temp::<Cached>(id, (generation, view.query.clone(), view.folder.clone(), view.kind_filter.clone(), view.here_only, cards.clone()))
-    });
+    ctx.data_mut(|d| d.insert_temp::<Cached>(id, (key, view.query.clone(), view.folder.clone(), view.kind_filter.clone(), view.here_only, view.group.clone(), cards.clone())));
     cards
 }
 
@@ -699,21 +726,35 @@ fn grouped(view: &ViewState) -> bool {
     view.folder.is_empty() && view.query.trim().is_empty() && view.kind_filter.is_empty()
 }
 
-/// The collection tree, cached per catalog generation.
-fn folder_tree(ctx: &egui::Context, client: &Client, libraries: &[String]) -> Arc<Vec<FolderRow>> {
-    type Cached = ((u64, u64, usize), Arc<Vec<FolderRow>>);
+/// The collection tree (of collection group `group`; "" = all), cached per catalog, index, edit
+/// and group: the published tree with this Mac's folders, order and edits, counting the cards
+/// the panel lists.
+fn folder_tree(ctx: &egui::Context, client: &Client, local: &Arc<LocalIndex>, lib: &Arc<LocalLib>, group: &str) -> Arc<Vec<FolderRow>> {
+    type Cached = ((u64, u64, usize, usize, String), Arc<Vec<FolderRow>>);
     let id = egui::Id::new("ml-tree");
-    let local = local_folders(ctx, libraries);
-    let ops = folder_ops();
-    let key = (generation(client), ops.revision, Arc::as_ptr(&local) as usize);
+    let all = library_cards(ctx, client, local, lib);
+    let key = (generation(client), folder_ops().revision, Arc::as_ptr(lib) as usize, Arc::as_ptr(&all) as usize, group.to_string());
     if let Some((k, rows)) = ctx.data(|d| d.get_temp::<Cached>(id))
         && k == key
     {
         return rows;
     }
     let catalog = client.catalog().map(|c| c.tree()).unwrap_or_default();
-    let rows = Arc::new(merge_folders(&catalog, &local.0, &ops));
+    let ops = folder_ops();
+    let in_group = |f: &str| group.is_empty() || folder_group(lib, &ops, f) == group;
+    let counts = folder_counts(all.iter().filter(|c| in_group(&c.category)));
+    let mut card_folders: Vec<String> = all.iter().map(|c| c.category.clone()).filter(|c| !c.is_empty()).collect();
+    card_folders.sort();
+    card_folders.dedup();
+    let sorting = lib.present().then(|| {
+        let mut order = lib.order.clone();
+        order.extend(ops.order.iter().map(|(k, v)| (k.clone(), *v)));
+        Sorting { order, priorities: lib.priorities.clone() }
+    });
+    let mut rows = merge_folders(&catalog, &lib.folders, &ops, &card_folders, Some(&counts), sorting.as_ref());
+    rows.retain(|r| in_group(&r.path));
     drop(ops);
+    let rows = Arc::new(rows);
     ctx.data_mut(|d| d.insert_temp::<Cached>(id, (key, rows.clone())));
     rows
 }
@@ -933,25 +974,26 @@ fn display_body(app: &mut EffectcraftApp, ui: &mut egui::Ui, r: Rect, view: &mut
     let track = Rect::from_min_max(pos2(r.min.x + pad + 76.0 * s, y2 - 8.0 * s), pos2(r.max.x - pad, y2 + 8.0 * s));
     let resp = ui.interact(track, egui::Id::new("ml-card-size"), Sense::click_and_drag());
     let (lo, hi) = CARD_SIZE_RANGE;
+    // Each folder keeps its own card size (All motion: the default), as on the web panel.
+    let mut size = view.folder_card_sizes.get(&view.folder).copied().unwrap_or(view.card_size);
     if (resp.dragged() || resp.clicked())
         && let Some(x) = resp.interact_pointer_pos().map(|p| p.x)
     {
         let f = ((x - track.min.x) / track.width().max(1.0)).clamp(0.0, 1.0);
-        view.card_size = (lo + f * (hi - lo)).round();
+        size = (lo + f * (hi - lo)).round();
+        if view.folder.is_empty() {
+            view.card_size = size;
+        } else {
+            view.folder_card_sizes.insert(view.folder.clone(), size);
+        }
     }
-    let f = ((view.card_size - lo) / (hi - lo)).clamp(0.0, 1.0);
+    let f = ((size - lo) / (hi - lo)).clamp(0.0, 1.0);
     let line = Rect::from_min_max(pos2(track.min.x, y2 - 1.5 * s), pos2(track.max.x, y2 + 1.5 * s));
     let p = ui.painter();
     p.rect_filled(line, CornerRadius::same(2), t.field_border);
     p.rect_filled(Rect::from_min_max(line.min, pos2(track.min.x + f * track.width(), line.max.y)), CornerRadius::same(2), t.accent);
     p.circle_filled(pos2(track.min.x + f * track.width(), y2), 6.0 * s, if resp.hovered() || resp.dragged() { t.accent_hover } else { t.accent });
-    app.auto.add_response("motionLibrary.cardSize", &resp, &format!("{}", view.card_size));
-}
-
-/// A full-width button row in a popover; true when clicked.
-fn pop_row(app: &mut EffectcraftApp, ui: &mut egui::Ui, r: Rect, y: f32, auto: &str, text: &str, s: f32) -> bool {
-    let b = Rect::from_min_size(pos2(r.min.x + 10.0 * s, y), vec2(r.width() - 20.0 * s, 24.0 * s));
-    kit::button(app, ui, b, auto, text, false)
+    app.auto.add_response("motionLibrary.cardSize", &resp, &format!("{size}"));
 }
 
 /// Filters: what kind of card (Comp, Overlay, Sound…) and only cards that apply here.
@@ -991,14 +1033,16 @@ fn filters_body(app: &mut EffectcraftApp, ui: &mut egui::Ui, r: Rect, view: &mut
 
 /// + Save: where cards come from.
 /// What "Save to Motion Library" can save from the open project.
-const SAVE_KINDS: [(&str, &str, &str); 3] = [
+const SAVE_KINDS: [(&str, &str, &str); 4] = [
     ("layers", "Layers", "The selected layers (with their parents and mattes), editable"),
-    ("comp", "Comp", "The whole open composition and everything it uses"),
-    ("preset", "Preset", "The selected layer's effects and animation, to apply to other layers"),
+    ("comp", "Comp", "The open composition (or its selected layers) and everything it uses"),
+    ("preset", "Preset", "The selected properties or effects (values, keyframes, expressions), to apply to other layers"),
+    ("expression", "Expression", "The selected property's expression (works in After Effects too)"),
 ];
 
-/// Save to Motion Library: a name, what to save (selected layers, the comp, a preset) and the
-/// collection open in the tree; the card lands in the local library with its preview.
+/// Save to Motion Library: a name, what to save (selected layers, the comp, a preset, an
+/// expression), a description, Comp's contents or Layers' preview, and the collection open in the
+/// tree; the card lands in the local library with its preview.
 fn save_body(app: &mut EffectcraftApp, ui: &mut egui::Ui, r: Rect, view: &mut ViewState, s: f32) -> Option<(&'static str, Value)> {
     let t = app.tokens;
     let p = ui.painter().clone();
@@ -1011,27 +1055,64 @@ fn save_body(app: &mut EffectcraftApp, ui: &mut egui::Ui, r: Rect, view: &mut Vi
     if view.save_kind.is_empty() {
         view.save_kind = "layers".into();
     }
-    let bw = (w - 8.0 * s) / 3.0;
-    for (i, (key, label, _tip)) in SAVE_KINDS.iter().enumerate() {
-        let b = Rect::from_min_size(pos2(x0 + i as f32 * (bw + 4.0 * s), field.max.y + 8.0 * s), vec2(bw, 24.0 * s));
+    let n = SAVE_KINDS.len() as f32;
+    let bw = (w - 4.0 * s * (n - 1.0)) / n;
+    let kinds_y = field.max.y + 8.0 * s;
+    for (i, (key, label, tip)) in SAVE_KINDS.iter().enumerate() {
+        let b = Rect::from_min_size(pos2(x0 + i as f32 * (bw + 4.0 * s), kinds_y), vec2(bw, 24.0 * s));
         if kit::button(app, ui, b, &format!("motionLibrary.save.kind.{key}"), label, view.save_kind == *key) {
             view.save_kind = key.to_string();
         }
+        ui.interact(b, egui::Id::new(("ml-save-tip", key)), Sense::hover()).on_hover_text(tr(tip));
     }
+    let mut y = kinds_y + 32.0 * s;
+    // Comp: the whole comp or its selected layers; Layers: what the card's preview shows.
+    let choice: Option<(&str, [(&str, &str); 2])> = match view.save_kind.as_str() {
+        "comp" => Some(("contents", [("all", "Entire composition"), ("selected", "Selected layers")])),
+        "layers" => Some(("preview", [("selected", "Preview: selected layers only"), ("work-area", "Preview: full comp demo")])),
+        _ => None,
+    };
+    if let Some((which, options)) = choice {
+        let slot = if which == "contents" { &mut view.save_contents } else { &mut view.save_preview };
+        let cur = options.iter().position(|(k, _)| *k == slot.as_str()).unwrap_or(0);
+        let labels: Vec<&str> = options.iter().map(|(_, l)| *l).collect();
+        let dr = Rect::from_min_size(pos2(x0, y), vec2(w, 22.0 * s));
+        let picked = kit::dropdown(app, ui, dr, &format!("motionLibrary.save.{which}"), &labels, cur);
+        if let Some((k, _)) = picked.and_then(|i| options.get(i)) {
+            let slot = if which == "contents" { &mut view.save_contents } else { &mut view.save_preview };
+            *slot = k.to_string();
+        }
+        y += 30.0 * s;
+    }
+    let desc = Rect::from_min_size(pos2(x0, y), vec2(w, 44.0 * s));
+    let dresp = ui.put(desc, egui::TextEdit::multiline(&mut view.save_description).hint_text(tr("Description (optional): when to use it, what it does")));
+    app.auto.add_response("motionLibrary.save.description", &dresp, "Description");
+    y = desc.max.y + 12.0 * s;
     let folder = if view.folder.is_empty() { "My motion".to_string() } else { view.folder.clone() };
-    let into_y = field.max.y + 46.0 * s;
     let into = format!("{} {folder}", tr("Into:"));
-    let shown = elide(&p, &into, &Tokens::ui(11.0 * s), w);
-    p.text(pos2(x0, into_y), Align2::LEFT_CENTER, &shown, Tokens::ui(11.0 * s), t.text_dim);
-    let save = Rect::from_min_size(pos2(r.max.x - 12.0 * s - 90.0 * s, into_y + 12.0 * s), vec2(90.0 * s, 24.0 * s));
+    let shown = elide(&p, &into, &Tokens::ui(11.0 * s), w - 100.0 * s);
+    p.text(pos2(x0, y + 12.0 * s), Align2::LEFT_CENTER, &shown, Tokens::ui(11.0 * s), t.text_dim);
+    let save = Rect::from_min_size(pos2(r.max.x - 12.0 * s - 90.0 * s, y), vec2(90.0 * s, 24.0 * s));
     let name = view.save_name.trim().to_string();
     let enter = resp.lost_focus() && ui.ctx().input(|i| i.key_pressed(egui::Key::Enter));
     if (kit::button(app, ui, save, "motionLibrary.save.go", "Save", true) || enter) && !name.is_empty() {
         view.popover.clear();
         view.save_name.clear();
-        return Some(("motionLibrary.saveSelection", json!({"kind": view.save_kind, "name": name, "category": folder})));
+        let description = std::mem::take(&mut view.save_description).trim().to_string();
+        let mut params = json!({"kind": view.save_kind, "name": name, "category": folder, "description": description});
+        match view.save_kind.as_str() {
+            "comp" => params["contents"] = json!(if view.save_contents.is_empty() { "all" } else { view.save_contents.as_str() }),
+            "layers" => params["preview"] = json!(if view.save_preview.is_empty() { "selected" } else { view.save_preview.as_str() }),
+            _ => {}
+        }
+        return Some(("motionLibrary.saveSelection", params));
     }
     None
+}
+
+/// The Save popover's height for what it shows.
+fn save_height(view: &ViewState) -> f32 {
+    if matches!(view.save_kind.as_str(), "comp" | "layers" | "") { 236.0 } else { 206.0 }
 }
 
 /// Wait (up to 2 min) for a new card's preview, which renders in a job of its own, so the
@@ -1053,9 +1134,18 @@ fn wait_for_preview(id: &str) {
     }
 }
 
-/// `motionLibrary.saveSelection`: save the selected layers (`kind` layers), the open comp (comp)
-/// or the selected layer's effects and animation (preset) as a card `name` in collection
-/// `category` of the local library (the Motion Library's EffectCraft plug, which reads the
+/// A card's name as the panel shows it (renamed here, or only on this Mac).
+pub fn card_name(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str) -> Option<String> {
+    let client = app.session.motion_library().ok()?;
+    let local = app.session.motion_library_local();
+    let lib = local_library(ctx, &app.session.prefs.libraries);
+    find_card(&library_cards(ctx, &client, &local, &lib), id).map(|c| c.name)
+}
+
+/// `motionLibrary.saveSelection`: save the selected layers (`kind` layers; `preview` selected or
+/// work-area), the open comp (comp; `contents` all or selected), the selected properties' values
+/// and animation (preset) or the selected property's expression (expression) as a card `name`
+/// (with an optional `description`) in collection `category` of the local library (the Motion Library's EffectCraft plug, which reads the
 /// project through this app's control port). It runs in the background; the status line says how
 /// it went and the card shows once the library index is rebuilt.
 pub fn save_selection_command(app: &mut EffectcraftApp, ctx: &egui::Context, params: &Value) -> Result<Value, String> {
@@ -1065,11 +1155,23 @@ pub fn save_selection_command(app: &mut EffectcraftApp, ctx: &egui::Context, par
     }
     let category = params.get("category").and_then(Value::as_str).map(|c| c.trim_matches('/')).filter(|c| !c.is_empty()).unwrap_or("My motion").to_string();
     let kind = params.get("kind").and_then(Value::as_str).unwrap_or("layers");
+    let description = params.get("description").and_then(Value::as_str).map(str::trim).unwrap_or_default().to_string();
+    let pick = |key: &str, options: &[&str]| -> Result<String, String> {
+        let v = params.get(key).and_then(Value::as_str).unwrap_or(options.first().copied().unwrap_or_default());
+        if options.contains(&v) { Ok(v.to_string()) } else { Err(format!("`{key}` is one of {}", options.join(", "))) }
+    };
     let (op, args): (&'static str, Value) = match kind {
-        "layers" => ("save_layers", json!({"name": name, "category": category, "preview_mode": "selected"})),
-        "comp" => ("save", json!({"name": name, "category": category, "composition_selection": "all"})),
-        "preset" => ("save_asset", json!({"kind": "preset", "name": name, "category": category})),
-        other => return Err(format!("unknown kind `{other}` (layers, comp or preset)")),
+        "layers" => (
+            "save_layers",
+            json!({"name": name, "category": category, "description": description, "preview_mode": pick("preview", &["selected", "work-area"])?}),
+        ),
+        "comp" => (
+            "save",
+            json!({"name": name, "category": category, "description": description, "composition_selection": pick("contents", &["all", "selected"])?}),
+        ),
+        "preset" => ("save_asset", json!({"kind": "preset", "name": name, "category": category, "description": description})),
+        "expression" => ("save_asset", json!({"kind": "expression", "name": name, "category": category, "description": description})),
+        other => return Err(format!("unknown kind `{other}` (layers, comp, preset or expression)")),
     };
     let port = control_port(app)?;
     app.ui.status = format!("Saving “{name}” to the Motion Library…");
@@ -1233,7 +1335,7 @@ fn rail(
     // Bottom: sync state, refresh, settings, save.
     let bottom: [(&str, Option<Icon>, &str); 4] = [
         ("ec", None, "Library state (click to check for updates)"),
-        ("refresh", None, "Check for library updates"),
+        ("refresh", None, "Refresh: check for library updates and sync the library's sources"),
         ("display", Some(Icon::Gear), "Display settings"),
         ("save", Some(Icon::Plus), "Save to Motion Library"),
     ];
@@ -1284,8 +1386,15 @@ fn rail(
         app.auto.add(&auto, r, &label);
         if resp.on_hover_text(label).clicked() {
             match *name {
-                "ec" | "refresh" => {
+                "ec" => {
                     kit::exec(app, "library.sync", json!({"wait": false}));
+                }
+                "refresh" => {
+                    app.ui.motion_library = view.clone();
+                    if let Err(e) = crate::menus::invoke(app, ctx, "motionLibrary.refresh", json!({})) {
+                        app.ui.status = e;
+                    }
+                    *view = app.ui.motion_library.clone();
                 }
                 other => view.popover = if view.popover == other { String::new() } else { other.to_string() },
             }
@@ -1329,7 +1438,8 @@ fn rail(
             }
             "save" => {
                 let mut pick = None;
-                popover(app, ctx, anchor, vec2(280.0 * s, 150.0 * s), view, |app, ui, r, view| pick = save_body(app, ui, r, view, s));
+                let h = save_height(view) * s;
+                popover(app, ctx, anchor, vec2(300.0 * s, h), view, |app, ui, r, view| pick = save_body(app, ui, r, view, s));
                 if let Some((cmd, params)) = pick {
                     app.ui.motion_library = view.clone();
                     if let Err(e) = crate::menus::invoke(app, ctx, cmd, params) {
@@ -1376,39 +1486,200 @@ fn kind_label(c: &Card) -> &str {
 }
 
 /// A card's right-click menu: each entry is a command (with an automation id) → the one picked.
-fn card_menu(auto: &mut crate::automation::Registry, resp: &egui::Response, card: &Card, local: &LocalIndex, can_save: bool) -> Option<(&'static str, Value)> {
+fn card_menu(
+    auto: &mut crate::automation::Registry,
+    resp: &egui::Response,
+    card: &Card,
+    local: &LocalIndex,
+    lib: &LocalLib,
+    can_save: bool,
+    danger: Color32,
+) -> Option<(&'static str, Value)> {
+    let mut pick = None;
+    crate::widgets::context_menu(resp, |ui| pick = card_menu_entries(ui, auto, card, local, lib, can_save, danger, "menu"));
+    pick
+}
+
+/// The card's menu entries (its right-click menu, the details' ••• menu); `prefix`: their
+/// automation ids' (`motionLibrary.<prefix>.<entry>`).
+#[allow(clippy::too_many_arguments)]
+fn card_menu_entries(
+    ui: &mut egui::Ui,
+    auto: &mut crate::automation::Registry,
+    card: &Card,
+    local: &LocalIndex,
+    lib: &LocalLib,
+    can_save: bool,
+    danger: Color32,
+    prefix: &str,
+) -> Option<(&'static str, Value)> {
     let mut pick = None;
     let here = usable(card, local);
+    let plug = plug_use(card, local, lib);
     let has_file = is_local(card, local);
     let save = unsynced(card, local) && can_save;
-    crate::widgets::context_menu(resp, |ui| {
-        let mut entry = |ui: &mut egui::Ui, key: &str, label: &str, enabled: bool, cmd: &'static str, params: Value| {
-            let b = ui.add_enabled(enabled, egui::Button::new(tr(label)));
-            auto.add_response(&format!("motionLibrary.menu.{key}"), &b, label);
-            if b.clicked() {
-                pick = Some((cmd, params));
-                ui.close();
-            }
-        };
-        entry(ui, "apply", "Apply at Playhead", here, "motionLibrary.apply", json!({"id": card.id}));
-        entry(ui, "applyAtStart", "Apply at Composition Start", here, "motionLibrary.apply", json!({"id": card.id, "time": 0.0}));
+    // This Mac keeps the library: its cards can be edited.
+    let edit = lib.cards.get(&card.id).filter(|_| ml_backend().is_some_and(|p| p.is_file()));
+    let id = card.id.as_str();
+    let mut entry = |ui: &mut egui::Ui, key: &str, label: &str, enabled: bool, cmd: &'static str, params: Value, color: Option<Color32>| {
+        let text = egui::RichText::new(tr(label));
+        let b = ui.add_enabled(
+            enabled,
+            egui::Button::new(match color {
+                Some(c) => text.color(c),
+                None => text,
+            }),
+        );
+        auto.add_response(&format!("motionLibrary.{prefix}.{key}"), &b, label);
+        if b.clicked() {
+            pick = Some((cmd, params));
+            ui.close();
+        }
+    };
+    match plug {
+        Some(how) => {
+            let label = match how {
+                "ease" => "Apply Ease to Selected Keyframes",
+                "expression" => "Apply Expression to Selected Property",
+                _ => "Insert Comp (Converts the AE Project)",
+            };
+            entry(ui, "apply", label, true, "motionLibrary.card", json!({"op": "use", "id": id}), None);
+        }
+        None => {
+            entry(ui, "apply", "Apply at Playhead", here, "motionLibrary.apply", json!({"id": id}), None);
+            entry(ui, "applyAtStart", "Apply at Composition Start", here, "motionLibrary.apply", json!({"id": id, "time": 0.0}), None);
+        }
+    }
+    ui.separator();
+    if prefix == "menu" {
+        entry(ui, "details", "Details…", true, "motionLibrary.card", json!({"op": "details", "id": id}), None);
+    }
+    entry(
+        ui,
+        "showInCollection",
+        "Show in Collection",
+        true,
+        "motionLibrary.view",
+        json!({"folder": card.category, "query": "", "kind": "", "select": id, "details": null}),
+        None,
+    );
+    entry(ui, "reveal", "Reveal in Finder", has_file, "library.reveal", json!({"id": id}), None);
+    entry(ui, "copyName", "Copy Name", true, "motionLibrary.copyName", json!({"id": id}), None);
+    if let Some(e) = edit {
         ui.separator();
-        entry(ui, "details", "Details…", true, "motionLibrary.view", json!({"details": card.id, "select": card.id}));
+        entry(ui, "rename", "Rename…", true, "motionLibrary.card", json!({"op": "rename", "id": id}), None);
+        entry(ui, "describe", "Edit Description…", true, "motionLibrary.card", json!({"op": "describe", "id": id}), None);
+        entry(ui, "move", "Move to Folder…", true, "motionLibrary.card", json!({"op": "move", "id": id}), None);
+        entry(ui, "thumbnail", "Choose Thumbnail…", true, "motionLibrary.card", json!({"op": "setThumbnail", "id": id}), None);
+        if e.thumbnail_override || folder_ops().card_thumbs.get(id).is_some_and(Option::is_some) {
+            entry(ui, "resetThumbnail", "Restore Default Thumbnail", true, "motionLibrary.card", json!({"op": "resetThumbnail", "id": id}), None);
+        }
+        if e.app == "effectcraft" {
+            entry(ui, "preview", "Generate Preview", true, "motionLibrary.card", json!({"op": "preview", "id": id}), None);
+        }
+        if e.kind_label == "Ease" {
+            ui.separator();
+            entry(ui, "editGraph", "Edit Graph…", true, "motionLibrary.card", json!({"op": "editGraph", "id": id}), None);
+            entry(ui, "duplicateGraph", "Duplicate Graph", true, "motionLibrary.card", json!({"op": "duplicateGraph", "id": id}), None);
+            entry(ui, "reverseGraph", "Reverse Graph", true, "motionLibrary.card", json!({"op": "reverseGraph", "id": id}), None);
+        }
+    }
+    if has_file {
+        ui.separator();
         entry(
             ui,
-            "showInCollection",
-            "Show in Collection",
-            true,
-            "motionLibrary.view",
-            json!({"folder": card.category, "query": "", "kind": "", "select": card.id}),
+            "save",
+            if unsynced(card, local) { "Save to Library" } else { "Saved to Library" },
+            save,
+            "motionLibrary.save",
+            json!({"id": id}),
+            None,
         );
-        entry(ui, "reveal", "Reveal in Finder", has_file, "library.reveal", json!({"id": card.id}));
-        entry(ui, "copyName", "Copy Name", true, "motionLibrary.copyName", json!({"id": card.id}));
-        if has_file {
-            ui.separator();
-            entry(ui, "save", if unsynced(card, local) { "Save to Library" } else { "Saved to Library" }, save, "motionLibrary.save", json!({"id": card.id}));
+    }
+    if edit.is_some() {
+        ui.separator();
+        entry(ui, "delete", "Delete Card…", true, "motionLibrary.card", json!({"op": "delete", "id": id}), Some(danger));
+    }
+    pick
+}
+
+/// A folder being dragged in the collection tree.
+#[derive(Clone, Debug)]
+struct FolderDrag(String);
+
+/// Where a folder dropped on a row goes: before or after it (a sibling), or inside it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum DropPlace {
+    Before,
+    Inside,
+    After,
+}
+
+/// The row's top or bottom edge reorders, its middle (and "All motion") takes the folder in.
+fn drop_place(path: &str, row: Rect, pointer: Option<egui::Pos2>) -> DropPlace {
+    let Some(q) = pointer.filter(|_| !path.is_empty()) else { return DropPlace::Inside };
+    let f = (q.y - row.min.y) / row.height().max(1.0);
+    if f < 0.3 {
+        DropPlace::Before
+    } else if f > 0.7 {
+        DropPlace::After
+    } else {
+        DropPlace::Inside
+    }
+}
+
+/// The command a folder dropped on `target` (`""`: All motion) runs.
+fn folder_drop(folder: &str, target: &str, place: DropPlace) -> (&'static str, Value) {
+    let parent = |p: &str| p.rsplit_once('/').map_or(String::new(), |(a, _)| a.to_string());
+    match place {
+        DropPlace::Inside => ("motionLibrary.folder", json!({"op": "move", "category": folder, "parent": target})),
+        _ if parent(folder) == parent(target) => {
+            ("motionLibrary.folder", json!({"op": "reorder", "category": folder, "target": target, "after": place == DropPlace::After}))
         }
-    });
+        _ => ("motionLibrary.folder", json!({"op": "move", "category": folder, "parent": parent(target)})),
+    }
+}
+
+/// The collection groups popover: show all collections or one group; new, rename, delete.
+fn groups_body(app: &mut EffectcraftApp, ui: &mut egui::Ui, r: Rect, view: &ViewState, groups: &[String], s: f32) -> Option<(&'static str, Value)> {
+    let t = app.tokens;
+    ui.painter().text(pos2(r.min.x + 12.0 * s, r.min.y + 16.0 * s), Align2::LEFT_CENTER, tr("Collection groups"), Tokens::semibold(12.0 * s), t.text);
+    let mut y = r.min.y + 30.0 * s;
+    let mut pick = None;
+    let all = [String::new()];
+    for g in all.iter().chain(groups.iter()) {
+        let row = Rect::from_min_size(pos2(r.min.x + 6.0 * s, y), vec2(r.width() - 12.0 * s, 22.0 * s));
+        let resp = ui.interact(row, egui::Id::new(("ml-group", g)), Sense::click());
+        if view.group == *g {
+            ui.painter().rect_filled(row, CornerRadius::same(4), t.accent.gamma_multiply(0.28));
+        } else if resp.hovered() {
+            ui.painter().rect_filled(row, CornerRadius::same(4), t.hover);
+        }
+        let name = if g.is_empty() { tr("All collections").to_string() } else { g.clone() };
+        ui.painter().text(pos2(row.min.x + 8.0 * s, row.center().y), Align2::LEFT_CENTER, &name, Tokens::ui(11.5 * s), t.text);
+        app.auto.add(&format!("motionLibrary.group.{}", if g.is_empty() { "all" } else { g }), row, &name);
+        if resp.clicked() {
+            pick = Some(("motionLibrary.group", json!({"op": "choose", "name": g})));
+        }
+        y += 24.0 * s;
+    }
+    ui.painter().line_segment([pos2(r.min.x + 8.0 * s, y + 3.0 * s), pos2(r.max.x - 8.0 * s, y + 3.0 * s)], Stroke::new(1.0, t.separator));
+    y += 8.0 * s;
+    let row_button = |app: &mut EffectcraftApp, ui: &mut egui::Ui, y: f32, key: &str, label: &str| {
+        let b = Rect::from_min_size(pos2(r.min.x + 6.0 * s, y), vec2(r.width() - 12.0 * s, 22.0 * s));
+        kit::button(app, ui, b, &format!("motionLibrary.group.{key}"), label, false)
+    };
+    if row_button(app, ui, y, "new", "New group…") {
+        pick = Some(("motionLibrary.group", json!({"op": "create"})));
+    }
+    if !view.group.is_empty() {
+        if row_button(app, ui, y + 24.0 * s, "rename", "Rename group…") {
+            pick = Some(("motionLibrary.group", json!({"op": "rename", "name": view.group})));
+        }
+        if row_button(app, ui, y + 48.0 * s, "delete", "Delete group…") {
+            pick = Some(("motionLibrary.group", json!({"op": "delete", "name": view.group})));
+        }
+    }
     pick
 }
 
@@ -1470,7 +1741,11 @@ fn paint_cloud_up(p: &egui::Painter, r: Rect, color: Color32) {
     p.line_segment([pos2(x + u * 0.17, base - u * 0.25), pos2(x, base - u * 0.42)], stroke);
 }
 
-/// The card's details over the grid: preview image, what and where it is, its files, and Apply.
+/// The card's details over the grid: preview image (an Ease card's speed graph), what and where
+/// it is, its description, what the library knows of it (`describe`), its files, Apply and its
+/// menu. Returns the card to apply (`.0`, applied from files) and the command applying it through
+/// the plug (`.1`).
+#[allow(clippy::too_many_arguments)]
 fn details_sheet(
     app: &mut EffectcraftApp,
     ui: &mut egui::Ui,
@@ -1478,51 +1753,95 @@ fn details_sheet(
     client: &Client,
     grid: Rect,
     card: &Card,
+    lib: &LocalLib,
+    plug: Option<&'static str>,
     view: &mut ViewState,
     s: f32,
-) -> Option<String> {
+) -> Option<(String, (&'static str, Value))> {
     let t = app.tokens;
     let p = ui.painter().with_clip_rect(grid);
     // Block the cards below.
     let _ = ui.interact(grid, egui::Id::new("ml-details-block"), Sense::click_and_drag());
     p.rect_filled(grid, 0.0, Color32::from_black_alpha(120));
     let w = (grid.width() - 32.0 * s).min(560.0 * s).max(120.0);
-    let h = (grid.height() - 32.0 * s).min(460.0 * s).max(120.0);
+    let h = (grid.height() - 32.0 * s).min(520.0 * s).max(120.0);
     let r = Rect::from_center_size(grid.center(), vec2(w, h));
     p.rect_filled(r, CornerRadius::same(10), t.header_bg);
     p.rect_stroke(r, CornerRadius::same(10), Stroke::new(1.0, t.separator), egui::StrokeKind::Inside);
     app.auto.add("motionLibrary.details", r, &card.name);
     let pad = 14.0 * s;
     let inner = r.shrink(pad);
-    // Image: the thumbnail at its shape, up to 45 % of the height.
-    let max_h = inner.height() * 0.45;
+    let edit = lib.cards.get(&card.id);
+    let entry = edit.and_then(|_| described(ctx, &card.id)).and_then(Result::ok);
+    // Image: the thumbnail at its shape (an Ease card's speed graph), up to 40 % of the height.
+    let max_h = inner.height() * 0.4;
     let aspect = card.thumb_size.filter(|[a, b]| *a > 0 && *b > 0).map_or(10.0 / 16.0, |[a, b]| b as f32 / a as f32);
     let (iw, ih) = if inner.width() * aspect > max_h { (max_h / aspect, max_h) } else { (inner.width(), inner.width() * aspect) };
     let img = Rect::from_min_size(pos2(inner.center().x - iw / 2.0, inner.min.y), vec2(iw, ih));
     p.rect_filled(img, CornerRadius::same(6), t.field_bg);
+    let ease = edit.filter(|e| !e.thumbnail_override).and_then(|e| e.speed_graph.as_ref()).and_then(keys_curve);
     let mut budget = 2u32;
-    if let Some((tex, [tw, th])) =
+    if let Some(curve) = ease {
+        paint_speed_graph(&p, img, curve, t.accent, t.separator);
+    } else if let Some((tex, [tw, th])) =
         card.thumbnail.as_ref().and_then(|b| thumbnail(ctx, client, b, thumb_side(iw, ctx.pixels_per_point()), card.crop, &mut budget))
     {
         paint_cover(&p, tex.id(), vec2(tw as f32, th as f32), img);
     }
     let mut y = img.max.y + 14.0 * s;
     let name_font = Tokens::semibold(14.0 * s);
-    let name = elide(&p, &card.name, &name_font, inner.width());
+    let name = elide(&p, &card.name, &name_font, inner.width() - 30.0 * s);
     p.text(pos2(inner.min.x, y), Align2::LEFT_TOP, &name, name_font, t.text);
+    // ••• : the card's menu.
+    let more = Rect::from_min_size(pos2(inner.max.x - 24.0 * s, y - 2.0 * s), vec2(24.0 * s, 20.0 * s));
+    let mresp = ui.interact(more, egui::Id::new("ml-details-more"), Sense::click());
+    p.rect_filled(more, CornerRadius::same(4), if mresp.hovered() { t.hover } else { Color32::TRANSPARENT });
+    p.text(more.center(), Align2::CENTER_CENTER, "•••", Tokens::semibold(11.0 * s), t.text_dim);
+    app.auto.add_response("motionLibrary.details.more", &mresp, "More actions");
+    let mut menu_pick = None;
+    let local = app.session.motion_library_local();
+    let saving = view.saving.is_none();
+    egui::Popup::menu(&mresp).style(widgets::menu_style).show(|ui| {
+        menu_pick = card_menu_entries(ui, &mut app.auto, card, &local, lib, saving, t.danger, "details");
+    });
     y += 20.0 * s;
     p.text(pos2(inner.min.x, y), Align2::LEFT_TOP, card.subtitle(), Tokens::ui(11.0 * s), t.text_faint);
     y += 20.0 * s;
-    let local = app.session.motion_library_local();
     let mut facts = vec![];
     if let Some(d) = card.duration.filter(|d| *d > 0.0) {
         facts.push(format!("{d:.1} s"));
+    }
+    if let Some(e) = &entry {
+        if let Some(fps) = e["fps"].as_f64().filter(|f| *f > 0.0) {
+            facts.push(format!("{fps} fps"));
+        }
+        if let Some(v) = e["versions"]["current_version"].as_u64().filter(|v| *v > 1) {
+            facts.push(format!("version {v}"));
+        }
+        if let Some(st) = e["index_status"].as_str() {
+            facts.push(tr(index_label(st)).to_string());
+        }
+        match e["preview_status"].as_str() {
+            Some("queued") => facts.push(tr("preview queued").to_string()),
+            Some("rendering") => facts.push(tr("creating the preview…").to_string()),
+            Some("failed") => facts.push(tr("the preview couldn't be made: Generate Preview tries again").to_string()),
+            _ => {}
+        }
     }
     if let Some(e) = local.get(&card.id).filter(|_| is_local(card, &local)) {
         facts.push(format!("from this Mac's library: {}", e.file));
         if unsynced(card, &local) {
             facts.push(tr("not synced: right-click ▸ Save to Library uploads it").to_string());
         }
+    } else if let Some(how) = plug {
+        facts.push(
+            tr(match how {
+                "ease" => "applies to the selected keyframes (two adjacent keys on one property)",
+                "expression" => "applies to the selected property",
+                _ => "converts its After Effects project, then nests the comp",
+            })
+            .to_string(),
+        );
     } else if card.on_mac {
         facts.push(mac_words(&local).1.to_string());
     } else {
@@ -1541,9 +1860,48 @@ fn details_sheet(
     let buttons_h = 34.0 * s;
     let text_rect = Rect::from_min_max(pos2(inner.min.x, y), pos2(inner.max.x, inner.max.y - buttons_h));
     let mut body = facts.join("  ·  ");
-    if !card.description.is_empty() {
-        body.push_str("\n\n");
-        body.push_str(&card.description);
+    // Its description (editable on the Mac with the library), else the catalog's.
+    let own = edit.map(|e| folder_ops().card_descriptions.get(&card.id).cloned().unwrap_or_else(|| e.description.clone()));
+    match &own {
+        Some(d) if !d.is_empty() => {
+            body.push_str("\n\n");
+            body.push_str(d);
+        }
+        Some(_) => body.push_str(&format!("\n\n{}", tr("No description yet: ••• ▸ Edit Description… (searchable, and agents read it)"))),
+        None if !card.description.is_empty() => {
+            body.push_str("\n\n");
+            body.push_str(&card.description);
+        }
+        None => {}
+    }
+    if let Some(e) = &entry {
+        if let Some(code) = e["payload"]["text"].as_str().filter(|c| !c.is_empty()) {
+            let cut: String = code.chars().take(600).collect();
+            body.push_str(&format!("\n\n{cut}{}", if code.chars().count() > 600 { "\n…" } else { "" }));
+        }
+        let segments: Vec<String> = e["segments"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .take(8)
+                    .map(|g| {
+                        let n = g["name"].as_str().unwrap_or("Movement");
+                        match g["summary"].as_str().filter(|x| !x.is_empty()) {
+                            Some(sm) => format!("• {n}: {sm}"),
+                            None => format!("• {n}"),
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !segments.is_empty() {
+            body.push_str("\n\n");
+            body.push_str(&segments.join("\n"));
+        }
+        if let Some(cap) = e["visual_caption"].as_str().or(e["summary"].as_str()).filter(|c| !c.is_empty()) {
+            body.push_str("\n\n");
+            body.push_str(cap);
+        }
     }
     let galley = p.layout(body, Tokens::ui(11.5 * s), t.text_dim, text_rect.width().max(40.0));
     p.with_clip_rect(text_rect.intersect(grid)).galley(text_rect.min, galley, t.text_dim);
@@ -1552,17 +1910,32 @@ fn details_sheet(
     let by = inner.max.y - 24.0 * s;
     let apply_r = Rect::from_min_size(pos2(inner.max.x - bw, by), vec2(bw, 24.0 * s));
     let close_r = apply_r.translate(vec2(-(bw + 8.0 * s), 0.0));
+    let desc_r = Rect::from_min_size(pos2(inner.min.x, by), vec2(110.0 * s, 24.0 * s));
     let mut apply = None;
     if kit::button(app, ui, close_r, "motionLibrary.details.close", "Close", false) || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
         view.details = None;
     }
-    if usable(card, &local) {
+    if edit.is_some()
+        && ml_backend().is_some_and(|p| p.is_file())
+        && desc_r.max.x < close_r.min.x - 8.0 * s
+        && kit::button(app, ui, desc_r, "motionLibrary.details.describe", if own.as_deref().unwrap_or("").is_empty() { "Add description" } else { "Edit description" }, false)
+    {
+        menu_pick = Some(("motionLibrary.card", json!({"op": "describe", "id": card.id})));
+    }
+    if usable(card, &local) || plug.is_some() {
         if kit::button(app, ui, apply_r, "motionLibrary.details.apply", "Apply", true) {
-            apply = Some(card.id.clone());
+            apply = Some((card.id.clone(), ("motionLibrary.card", json!({"op": "use", "id": card.id}))));
             view.details = None;
         }
     } else {
         p.text(apply_r.center(), Align2::CENTER_CENTER, tr(if local.is_empty() { "On the Mac" } else { "AE only" }), Tokens::medium(11.5 * s), t.text_faint);
+    }
+    if let Some((cmd, params)) = menu_pick {
+        app.ui.motion_library = view.clone();
+        if let Err(e) = crate::menus::invoke(app, ctx, cmd, params) {
+            app.ui.status = e;
+        }
+        *view = app.ui.motion_library.clone();
     }
     apply
 }
@@ -1597,13 +1970,23 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let s = view.scale as f32 / 100.0;
     let ppp = ctx.pixels_per_point();
     let mut budget = 6u32;
-    let total = client.catalog().map_or(0, |c| c.cards.len());
-    let tree = folder_tree(&ctx, &client, &app.session.prefs.libraries);
-    let local_icons = local_folders(&ctx, &app.session.prefs.libraries);
     let local = app.session.motion_library_local();
+    let lib = local_library(&ctx, &app.session.prefs.libraries);
+    let groups = group_names(&lib, &folder_ops());
+    if !view.group.is_empty() && !groups.contains(&view.group) {
+        view.group.clear();
+    }
+    let all = library_cards(&ctx, &client, &local, &lib);
+    let tree = folder_tree(&ctx, &client, &local, &lib, &view.group);
+    let total = if view.group.is_empty() { all.len() } else { tree.iter().filter(|r| r.depth == 0).map(|r| r.cards).sum() };
     if let Some(msg) = folder_ops().status.take() {
         app.ui.status = msg;
+        forget_described();
     }
+    // Where files dragged in from the Finder would land: a folder row, its icon, a card.
+    let pointer = ctx.input(|i| i.pointer.hover_pos());
+    let (mut drop_folder, mut drop_icon, mut drop_card): (Option<String>, Option<String>, Option<String>) = (None, None, None);
+    let mut group_anchor: Option<Rect> = None;
     let mut folder_pick: Option<(&'static str, Value)> = None;
     let footer_h = 32.0 * s;
     let narrow = rect.width() < 460.0;
@@ -1634,12 +2017,41 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         return;
     }
     if tree_fits && view.show_folders {
-        let side_w = (184.0 * s).min(main.width() * if narrow { 0.36 } else { 0.38 }).max(96.0).round();
+        let auto_w = (184.0 * s).min(main.width() * if narrow { 0.36 } else { 0.38 }).max(96.0);
+        let side_w = if view.sidebar_width > 0.0 { (view.sidebar_width * s).min(main.width() * 0.6).max(80.0) } else { auto_w }.round();
         let side = Rect::from_min_max(main.min, pos2(main.min.x + side_w, main.max.y));
         main.min.x = side.max.x + 1.0;
-        p.line_segment([side.right_top(), side.right_bottom()], Stroke::new(1.0, t.separator));
+        // Its right edge: drag to resize (double-click: automatic width again).
+        let edge = Rect::from_min_max(pos2(side.max.x - 3.0, side.min.y), pos2(side.max.x + 3.0, side.max.y));
+        let eresp = ui.interact(edge, egui::Id::new("ml-sidebar-edge"), Sense::click_and_drag()).on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+        app.auto.add_response("motionLibrary.sidebarResize", &eresp, "Resize the collections");
+        if eresp.dragged() {
+            view.sidebar_width = ((side_w + eresp.drag_delta().x) / s).clamp(80.0, 420.0);
+        } else if eresp.double_clicked() {
+            view.sidebar_width = 0.0;
+        }
+        p.line_segment([side.right_top(), side.right_bottom()], Stroke::new(if eresp.hovered() || eresp.dragged() { 2.0 } else { 1.0 }, if eresp.dragged() { t.accent } else { t.separator }));
         let head_h = 30.0 * s;
-        p.text(pos2(side.min.x + 12.0 * s, side.min.y + head_h / 2.0), Align2::LEFT_CENTER, tr("COLLECTIONS"), Tokens::semibold(10.0 * s), t.text_faint);
+        // COLLECTIONS, or the collection group shown: click to choose a group (the web panel's
+        // group picker).
+        let head_label = if view.group.is_empty() { tr("COLLECTIONS").to_string() } else { view.group.to_uppercase() };
+        if lib.present() {
+            let label_r = Rect::from_min_max(pos2(side.min.x + 6.0 * s, side.min.y + 4.0 * s), pos2(side.max.x - 30.0 * s, side.min.y + head_h - 4.0 * s));
+            let gresp = ui.interact(label_r, egui::Id::new("ml-group-pick"), Sense::click());
+            if gresp.hovered() || view.popover == "groups" {
+                p.rect_filled(label_r, CornerRadius::same((4.0 * s) as u8), t.hover);
+            }
+            let font = Tokens::semibold(10.0 * s);
+            let shown = elide(&p, &format!("{head_label} ▾"), &font, label_r.width() - 8.0 * s);
+            p.text(pos2(label_r.min.x + 6.0 * s, label_r.center().y), Align2::LEFT_CENTER, shown, font, if view.group.is_empty() { t.text_faint } else { t.accent });
+            app.auto.add_response("motionLibrary.groups", &gresp, &head_label);
+            if gresp.on_hover_text(tr("Collection groups: show one group's collections")).clicked() {
+                view.popover = if view.popover == "groups" { String::new() } else { "groups".into() };
+            }
+            group_anchor = Some(label_r);
+        } else {
+            p.text(pos2(side.min.x + 12.0 * s, side.min.y + head_h / 2.0), Align2::LEFT_CENTER, &head_label, Tokens::semibold(10.0 * s), t.text_faint);
+        }
         // + : a new top folder (as on the web panel).
         let plus = Rect::from_center_size(pos2(side.max.x - 16.0 * s, side.min.y + head_h / 2.0), vec2(20.0 * s, 20.0 * s));
         let presp = ui.interact(plus, egui::Id::new("ml-new-folder"), Sense::click()).on_hover_text(tr("New folder"));
@@ -1679,8 +2091,52 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 None => ("", tr("All motion"), total, 0),
             };
             let auto_id = format!("motionLibrary.folder.{}", if path.is_empty() { "all" } else { path });
-            let resp = ui.interact(r.intersect(list), egui::Id::new(("ml-folder", path)), Sense::click());
+            let resp = ui.interact(r.intersect(list), egui::Id::new(("ml-folder", path)), Sense::click_and_drag());
             let active = view.folder == path;
+            if pointer.is_some_and(|q| r.intersect(list).contains(q)) {
+                drop_folder = Some(path.to_string());
+            }
+            // Drag a folder to reorder it among its siblings (top or bottom edge of a row) or move
+            // it into another folder (the middle); onto All motion: the top level.
+            if !path.is_empty() && resp.drag_started() {
+                egui::DragAndDrop::set_payload(&ctx, FolderDrag(path.to_string()));
+            }
+            if let Some(fd) = resp.dnd_hover_payload::<FolderDrag>()
+                && fd.0 != path
+                && !under(path, &fd.0)
+            {
+                let place = drop_place(path, r, pointer);
+                let line = |y: f32| {
+                    sp.line_segment([pos2(r.min.x, y), pos2(r.max.x, y)], Stroke::new(2.0, t.accent));
+                };
+                match place {
+                    DropPlace::Before => line(r.min.y),
+                    DropPlace::After => line(r.max.y),
+                    DropPlace::Inside => {
+                        sp.rect_stroke(r, CornerRadius::same((5.0 * s) as u8), Stroke::new(1.5, t.accent), egui::StrokeKind::Inside);
+                    }
+                }
+            }
+            if let Some(fd) = resp.dnd_release_payload::<FolderDrag>()
+                && fd.0 != path
+                && !under(path, &fd.0)
+            {
+                folder_pick = Some(folder_drop(&fd.0, path, drop_place(path, r, pointer)));
+            }
+            // Drop a card on a folder: move it there.
+            if !path.is_empty()
+                && let Some(payload) = resp.dnd_hover_payload::<super::DragPayload>()
+                && matches!(payload.as_ref(), super::DragPayload::LibraryCard(_))
+            {
+                sp.rect_stroke(r, CornerRadius::same((5.0 * s) as u8), Stroke::new(1.5, t.accent), egui::StrokeKind::Inside);
+            }
+            if !path.is_empty()
+                && let Some(payload) = resp.dnd_release_payload::<super::DragPayload>()
+                && let super::DragPayload::LibraryCard(id) = payload.as_ref()
+                && lib.cards.contains_key(id)
+            {
+                folder_pick = Some(("motionLibrary.card", json!({"op": "move", "id": id, "category": path})));
+            }
             if active {
                 sp.rect_filled(r, CornerRadius::same((5.0 * s) as u8), t.accent.gamma_multiply(0.28));
             } else if resp.hovered() {
@@ -1702,8 +2158,11 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 }
             }
             let icon_r = Rect::from_center_size(pos2(arrow.max.x + 9.0 * s, r.center().y), vec2(16.0 * s, 16.0 * s));
+            if !path.is_empty() && pointer.is_some_and(|q| icon_r.expand(3.0).contains(q)) {
+                drop_icon = Some(path.to_string());
+            }
             let color = if active || resp.hovered() { t.text } else { t.text_dim };
-            let local_icon = local_icons.1.get(path).map(String::as_str);
+            let local_icon = lib.icons.get(path).map(String::as_str);
             paint_folder_icon(&ctx, &client, &sp, row, local_icon, icon_r, color, &mut budget);
             let count_s = count.to_string();
             let count_w = sp.layout_no_wrap(count_s.clone(), Tokens::ui(10.0 * s), t.text_faint).size().x;
@@ -1713,7 +2172,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             let shown = elide(&sp, name, &font, name_r.width().max(4.0));
             draw_text_clipped(&sp, name_r, &shown, font, if active { t.text } else { t.text_dim });
             app.auto.add(&auto_id, r.intersect(list), name);
-            if let Some(pick) = folder_menu(&mut app.auto, &resp, path, t.danger) {
+            if let Some(pick) = folder_menu(&mut app.auto, &resp, path, t.danger, !groups.is_empty()) {
                 folder_pick = Some(pick);
             }
             if resp.clicked() && toggle.is_none() {
@@ -1740,7 +2199,10 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         if below_y < list.max.y {
             let below = Rect::from_min_max(pos2(list.min.x, below_y.max(list.min.y)), list.max);
             let bresp = ui.interact(below, egui::Id::new("ml-folder-empty"), Sense::click());
-            if let Some(pick) = folder_menu(&mut app.auto, &bresp, "", t.danger) {
+            if pointer.is_some_and(|q| below.contains(q)) {
+                drop_folder = Some(view.folder.clone());
+            }
+            if let Some(pick) = folder_menu(&mut app.auto, &bresp, "", t.danger, false) {
                 folder_pick = Some(pick);
             }
         }
@@ -1766,6 +2228,16 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         }
     }
 
+    if view.popover == "groups"
+        && let Some(anchor) = group_anchor
+    {
+        let h = (34.0 + 24.0 * (groups.len() as f32 + 1.0) + 8.0 + 24.0 * if view.group.is_empty() { 1.0 } else { 3.0 }) * s;
+        popover(app, &ctx, anchor, vec2(220.0 * s, h), &mut view, |app, ui, r, view| {
+            if let Some(pick) = groups_body(app, ui, r, view, &groups, s) {
+                folder_pick = Some(pick);
+            }
+        });
+    }
     if let Some((cmd, params)) = folder_pick {
         app.ui.motion_library = view.clone();
         if let Err(e) = crate::menus::invoke(app, &ctx, cmd, params) {
@@ -1778,8 +2250,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let pad = 10.0 * s;
     let head_h = 36.0 * s;
     let head = Rect::from_min_size(main.min, vec2(main.width(), head_h));
-    let local_only = local_only_cards(&ctx, &client, &local);
-    let cards = visible_cards(&ctx, &client, &local, &local_only, &view);
+    let cards = visible_cards(&ctx, &all, &local, &lib, &tree, &view);
     let search_w = (240.0 * s).min((head.width() * 0.5).max(80.0));
     let search_r = Rect::from_min_size(pos2(head.max.x - pad - search_w, head.center().y - 12.0 * s), vec2(search_w, 24.0 * s));
     let mut q = view.query.clone();
@@ -1856,8 +2327,9 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let gp = p.with_clip_rect(grid);
     let gap = (8.0 * s).round();
     let inner = grid.shrink2(vec2(pad, 0.0));
-    let card_w = view.card_size * s;
-    let compact = view.card_size <= COMPACT_CARD;
+    let card_size = view.folder_card_sizes.get(&view.folder).copied().unwrap_or(view.card_size);
+    let card_w = card_size * s;
+    let compact = card_size <= COMPACT_CARD;
     let caption_h = if compact { 38.0 * s } else { 42.0 * s };
     let header_h = 30.0 * s;
     let is_grouped = grouped(&view);
@@ -1872,8 +2344,22 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     }
     view.scroll = view.scroll.clamp(0.0, max_scroll);
     if cards.is_empty() {
-        let msg = if total == 0 { "" } else { "No matching motion" };
-        gp.text(grid.center(), Align2::CENTER_CENTER, tr(msg), Tokens::ui(12.0 * s), t.text_faint);
+        let msg = if !view.group.is_empty() && tree.is_empty() {
+            "This group is empty: make a collection with +, or move one here"
+        } else if total == 0 {
+            ""
+        } else {
+            "No matching motion"
+        };
+        gp.text(grid.center() - vec2(0.0, 14.0 * s), Align2::CENTER_CENTER, tr(msg), Tokens::ui(12.0 * s), t.text_faint);
+        // Searching inside a folder: search every collection instead.
+        if !view.query.trim().is_empty() && !view.folder.is_empty() {
+            let b = Rect::from_center_size(grid.center() + vec2(0.0, 16.0 * s), vec2(170.0 * s, 24.0 * s));
+            if kit::button(app, ui, b, "motionLibrary.searchAll", "Search all collections", true) {
+                view.folder.clear();
+                view.scroll = 0.0;
+            }
+        }
     }
     let origin = pos2(inner.min.x, inner.min.y + gap - view.scroll);
     let side = thumb_side(lay.col_w, ppp);
@@ -1907,7 +2393,10 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 let thumb_r = Rect::from_min_size(tile.min, vec2(tile.width(), *thumb_h));
                 let resp = ui.interact(tile.intersect(grid), egui::Id::new(("ml-card", &card.id)), Sense::click_and_drag());
                 // Drag a card onto the Timeline or the Composition viewer to apply it there.
-                if resp.drag_started() && usable(card, &local) {
+                if pointer.is_some_and(|q| tile.intersect(grid).contains(q)) {
+                    drop_card = Some(card.id.clone());
+                }
+                if resp.drag_started() && (usable(card, &local) || lib.cards.contains_key(&card.id)) {
                     egui::DragAndDrop::set_payload(&ctx, super::DragPayload::LibraryCard(card.id.clone()));
                 }
                 let selected = view.selected.as_deref() == Some(card.id.as_str());
@@ -1931,9 +2420,13 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     };
                     thumb.map(|(tex, [w, h])| (tex.id(), vec2(w as f32, h as f32)))
                 });
-                match tex {
-                    Some((tid, size)) => paint_cover(&gp, tid, size, thumb_r),
-                    None => {
+                let ease = (tex.is_none() || lib.cards.get(&card.id).is_some_and(|l| !l.thumbnail_override))
+                    .then(|| lib.cards.get(&card.id).and_then(|l| l.speed_graph.as_ref()).and_then(keys_curve))
+                    .flatten();
+                match (tex, ease) {
+                    (_, Some(curve)) => paint_speed_graph(&gp, thumb_r, curve, t.accent, t.separator),
+                    (Some((tid, size)), None) => paint_cover(&gp, tid, size, thumb_r),
+                    (None, None) => {
                         let icon = match card.kind_label.as_str() {
                             "Sound" => crate::icons::Icon::Audio,
                             "Overlay" => crate::icons::Icon::Play,
@@ -1945,7 +2438,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     }
                 }
                 // A badge: footage to relink, or a card applied in After Effects on the Mac.
-                let badge = if on_mac(card, &local) {
+                let via_plug = plug_use(card, &local, &lib);
+                let badge = if on_mac(card, &local) && via_plug.is_none() {
                     Some((tr(mac_words(&local).0), Color32::from_black_alpha(170), t.text))
                 } else if needs_footage(card, &local) {
                     Some((tr("needs footage"), t.warning.gamma_multiply(0.9), Color32::BLACK))
@@ -2027,7 +2521,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     let meta = elide(&gp, &card.subtitle(), &meta_font, cw);
                     gp.text(pos2(cx, thumb_r.max.y + 28.0 * s), Align2::LEFT_CENTER, &meta, meta_font, t.text_faint);
                 }
-                let label = if on_mac(card, &local) {
+                let label = if on_mac(card, &local) && via_plug.is_none() {
                     format!("{} ({})", card.name, mac_words(&local).0)
                 } else if needs_footage(card, &local) {
                     format!("{} (needs footage)", card.name)
@@ -2038,12 +2532,14 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 if resp.clicked() || resp.secondary_clicked() {
                     view.selected = Some(card.id.clone());
                 }
-                if let Some(pick) = card_menu(&mut app.auto, &resp, card, &local, view.saving.is_none()) {
+                if let Some(pick) = card_menu(&mut app.auto, &resp, card, &local, &lib, view.saving.is_none(), t.danger) {
                     menu_pick = Some(pick);
                 }
                 if resp.double_clicked() {
                     if usable(card, &local) {
                         apply_now = Some(card.id.clone());
+                    } else if via_plug.is_some() {
+                        menu_pick = Some(("motionLibrary.card", json!({"op": "use", "id": card.id})));
                     } else {
                         app.ui.status = format!("“{}”: {}", card.name, mac_words(&local).1);
                     }
@@ -2055,7 +2551,13 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                         tip.push_str(&format!("\nNeeds footage: {}", names.join(", ")));
                     }
                     tip.push('\n');
-                    tip.push_str(if on_mac(card, &local) { mac_words(&local).1 } else { "Double-click to add, or drag it onto the Timeline" });
+                    tip.push_str(match via_plug {
+                        Some("ease") => "Double-click to apply this ease to the selected keyframes",
+                        Some("expression") => "Double-click to apply this expression to the selected property",
+                        Some(_) => "Double-click to insert it (converts its After Effects project)",
+                        None if on_mac(card, &local) => mac_words(&local).1,
+                        None => "Double-click to add, or drag it onto the Timeline (or onto a folder to move it)",
+                    });
                     resp.on_hover_text(tip);
                 }
             }
@@ -2075,11 +2577,12 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     // Footer: the selected card and Apply.
     let footer = Rect::from_min_max(pos2(rect.min.x, rect.max.y - footer_h), rect.max);
     p.line_segment([footer.left_top(), footer.right_top()], Stroke::new(1.0, t.separator));
-    let sel = view.selected.as_ref().and_then(|id| find_card(&client, &local_only, id));
+    let sel = view.selected.as_ref().and_then(|id| find_card(&all, id));
     let ar = Rect::from_min_size(pos2(footer.max.x - 80.0 * s, footer.center().y - 11.0 * s), vec2(72.0 * s, 22.0 * s));
     if let Some(card) = &sel {
         let info = format!("{}  ·  {}{}", card.name, card.subtitle(), if needs_footage(card, &local) { "  ·  needs footage" } else { "" });
-        let ar = if usable(card, &local) { ar } else { Rect::from_min_max(pos2(ar.min.x - 20.0 * s, ar.min.y), ar.max) };
+        let sel_plug = plug_use(card, &local, &lib);
+        let ar = if usable(card, &local) || sel_plug.is_some() { ar } else { Rect::from_min_max(pos2(ar.min.x - 20.0 * s, ar.min.y), ar.max) };
         // Not in the bucket yet: Save to Library beside Apply.
         let save_w = 112.0 * s;
         let ar = if unsynced(card, &local) && view.saving.is_none() {
@@ -2102,6 +2605,10 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             if kit::button(app, ui, ar, "motionLibrary.apply", "Apply", true) {
                 apply_now = Some(card.id.clone());
             }
+        } else if sel_plug.is_some() {
+            if kit::button(app, ui, ar, "motionLibrary.apply", "Apply", true) {
+                menu_pick = Some(("motionLibrary.card", json!({"op": "use", "id": card.id})));
+            }
         } else {
             p.text(
                 pos2(ar.max.x, ar.center().y),
@@ -2115,13 +2622,29 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     }
     // The card's details over the grid.
     if let Some(id) = view.details.clone() {
-        match find_card(&client, &local_only, &id) {
+        match find_card(&all, &id) {
             Some(card) => {
-                if let Some(a) = details_sheet(app, ui, &ctx, &client, grid, &card, &mut view, s) {
-                    apply_now = Some(a);
+                let plug = plug_use(&card, &local, &lib);
+                if let Some(a) = details_sheet(app, ui, &ctx, &client, grid, &card, &lib, plug, &mut view, s) {
+                    if usable(&card, &local) {
+                        apply_now = Some(a.0);
+                    } else {
+                        menu_pick = Some(a.1);
+                    }
                 }
             }
             None => view.details = None,
+        }
+    }
+    // A card or group dialog (rename, describe, move, delete, groups).
+    if let Some(mut ask) = view.card_ask.clone() {
+        match card_ask_sheet(app, ui, grid, &mut ask, s) {
+            Some(Some(pick)) => {
+                view.card_ask = None;
+                menu_pick = Some(pick);
+            }
+            Some(None) => view.card_ask = None,
+            None => view.card_ask = Some(ask),
         }
     }
     // A folder dialog (new, rename, delete).
@@ -2170,12 +2693,50 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         && let super::DragPayload::LibraryCard(id) = payload.as_ref()
         && let Some(ptr) = ctx.pointer_hover_pos()
     {
-        let name = client.catalog().and_then(|c| c.card(id).map(|c| c.name.clone())).unwrap_or_default();
+        let name = find_card(&all, id).map(|c| c.name).unwrap_or_default();
         let lp = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("ml-drag")));
         let g = lp.layout_no_wrap(format!("＋ {name}"), Tokens::medium(11.5), Color32::WHITE);
         let r = Rect::from_min_size(ptr + vec2(14.0, 10.0), g.size()).expand2(vec2(8.0, 4.0));
         lp.rect_filled(r, CornerRadius::same(6), t.accent);
         lp.galley(r.min + vec2(8.0, 4.0), g, Color32::WHITE);
+    }
+    // Files dragged in from the Finder: saved as cards of the folder under the pointer (else the
+    // open one); an image on a folder's icon becomes its icon; Option-drop on a card: its
+    // thumbnail. Taken here, so the app doesn't import them into the project too.
+    if pointer.is_some_and(|q| rect.contains(q)) && lib.present() {
+        let hovered = ctx.input(|i| i.raw.hovered_files.len());
+        let alt = ctx.input(|i| i.modifiers.alt);
+        let is_image = |p: &str| {
+            let e = p.rsplit('.').next().unwrap_or_default().to_ascii_lowercase();
+            matches!(e.as_str(), "png" | "jpg" | "jpeg" | "webp" | "gif")
+        };
+        let folder_name = |f: &Option<String>| f.clone().filter(|f| !f.is_empty()).unwrap_or_else(|| if view.folder.is_empty() { "My motion".into() } else { view.folder.clone() });
+        if hovered > 0 {
+            let hint = match (&drop_card, &drop_icon) {
+                (Some(_), _) if alt => tr("Drop to make it this card's thumbnail").to_string(),
+                (_, Some(f)) => format!("Drop an image to set the icon of {f}"),
+                _ => format!("Drop to save in {}", folder_name(&drop_folder)),
+            };
+            let lp = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("ml-file-drop")));
+            lp.rect_stroke(rect.shrink(4.0), CornerRadius::same(6), Stroke::new(2.0, t.accent), egui::StrokeKind::Inside);
+            let g = lp.layout_no_wrap(hint.clone(), Tokens::medium(12.0 * s), Color32::WHITE);
+            let hr = Rect::from_center_size(pos2(rect.center().x, rect.max.y - 40.0 * s), g.size() + vec2(20.0 * s, 10.0 * s));
+            lp.rect_filled(hr, CornerRadius::same(6), t.accent);
+            lp.galley(hr.min + vec2(10.0 * s, 5.0 * s), g, Color32::WHITE);
+            app.auto.add("motionLibrary.dropTarget", hr, &hint);
+            ctx.input_mut(|i| i.raw.hovered_files.clear());
+        }
+        let dropped: Vec<String> =
+            ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path()).filter(|p| p.is_absolute()).map(|p| p.to_string_lossy().to_string()).collect());
+        if !dropped.is_empty() {
+            ctx.input_mut(|i| i.raw.dropped_files.clear());
+            let first = dropped.first().cloned().unwrap_or_default();
+            menu_pick = Some(match (&drop_card, &drop_icon) {
+                (Some(id), _) if alt => ("motionLibrary.card", json!({"op": "setThumbnail", "id": id, "path": first})),
+                (_, Some(f)) if dropped.len() == 1 && is_image(&first) => ("motionLibrary.folder", json!({"op": "setIcon", "category": f, "path": first})),
+                _ => ("motionLibrary.importFiles", json!({"paths": dropped, "category": folder_name(&drop_folder)})),
+            });
+        }
     }
     if let Some((cmd, params)) = menu_pick {
         // Through the command layer (as menus and agents run them), on the view in hand.
@@ -2409,11 +2970,40 @@ struct FolderOps {
     created: Vec<String>,
     deleted: Vec<String>,
     renamed: Vec<(String, String)>,
+    /// Card edits: name, folder, description, chosen thumbnail (`None`: the default again).
+    card_names: BTreeMap<String, String>,
+    card_folders: BTreeMap<String, String>,
+    card_descriptions: BTreeMap<String, String>,
+    card_thumbs: BTreeMap<String, Option<String>>,
+    cards_deleted: BTreeSet<String>,
+    /// Folder positions among their siblings (a reorder).
+    order: BTreeMap<String, i64>,
+    /// Top folders' collection group (`""`: none), and groups added, renamed, deleted.
+    folder_groups: BTreeMap<String, String>,
+    groups_added: Vec<String>,
+    groups_renamed: Vec<(String, String)>,
+    groups_deleted: Vec<String>,
     revision: u64,
     status: Option<String>,
 }
 
-static FOLDER_OPS: Mutex<FolderOps> = Mutex::new(FolderOps { created: Vec::new(), deleted: Vec::new(), renamed: Vec::new(), revision: 0, status: None });
+static FOLDER_OPS: Mutex<FolderOps> = Mutex::new(FolderOps {
+    created: Vec::new(),
+    deleted: Vec::new(),
+    renamed: Vec::new(),
+    card_names: BTreeMap::new(),
+    card_folders: BTreeMap::new(),
+    card_descriptions: BTreeMap::new(),
+    card_thumbs: BTreeMap::new(),
+    cards_deleted: BTreeSet::new(),
+    order: BTreeMap::new(),
+    folder_groups: BTreeMap::new(),
+    groups_added: Vec::new(),
+    groups_renamed: Vec::new(),
+    groups_deleted: Vec::new(),
+    revision: 0,
+    status: None,
+});
 
 fn folder_ops() -> std::sync::MutexGuard<'static, FolderOps> {
     FOLDER_OPS.lock().unwrap_or_else(|e| e.into_inner())
@@ -2433,13 +3023,45 @@ fn renamed_path(path: &str, renamed: &[(String, String)]) -> String {
     p
 }
 
+/// How the tree orders siblings: the library's saved positions (`folder_order`, then this run's
+/// reorders), else top folders in `priorities` order, else by name (the web panel's `allFolders`).
+#[derive(Default)]
+struct Sorting {
+    order: BTreeMap<String, i64>,
+    priorities: Vec<String>,
+}
+
+impl Sorting {
+    fn cmp(&self, a: &str, b: &str, top: bool) -> std::cmp::Ordering {
+        let (ai, bi) = (self.order.get(a), self.order.get(b));
+        if ai.is_some() || bi.is_some() {
+            return match (ai, bi) {
+                (Some(x), Some(y)) => x.cmp(y).then_with(|| a.cmp(b)),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                _ => std::cmp::Ordering::Greater,
+            };
+        }
+        let rank = |f: &str| if top { self.priorities.iter().position(|p| p == f).unwrap_or(99) } else { 99 };
+        rank(a).cmp(&rank(b)).then_with(|| a.cmp(b))
+    }
+}
+
 /// The published tree merged with the local library's folders and this run's changes: renames
-/// applied, deleted folders gone, new ones under their parents (after the existing ones).
-fn merge_folders(catalog: &[FolderRow], local: &[String], ops: &FolderOps) -> Vec<FolderRow> {
+/// applied, deleted folders gone, new ones under their parents (after the existing ones), the
+/// folders of cards moved elsewhere. `counts`: cards per folder (its subfolders' too) instead of
+/// the catalog's; `sorting`: the library's order instead of the catalog's.
+fn merge_folders(
+    catalog: &[FolderRow],
+    local: &[String],
+    ops: &FolderOps,
+    card_folders: &[String],
+    counts: Option<&BTreeMap<String, usize>>,
+    sorting: Option<&Sorting>,
+) -> Vec<FolderRow> {
     let mut order: Vec<String> = Vec::new();
     let mut seen = BTreeSet::new();
-    let mut cards = std::collections::BTreeMap::new();
-    let mut icons = std::collections::BTreeMap::new();
+    let mut cards = BTreeMap::new();
+    let mut icons = BTreeMap::new();
     let mut add = |p: String, order: &mut Vec<String>| {
         if p.is_empty() || ops.deleted.iter().any(|d| under(&p, d)) {
             return;
@@ -2465,13 +3087,19 @@ fn merge_folders(catalog: &[FolderRow], local: &[String], ops: &FolderOps) -> Ve
         }
         add(p, &mut order);
     }
-    for p in local.iter().chain(ops.created.iter()) {
+    for p in local.iter().chain(ops.created.iter()).chain(card_folders.iter()) {
         add(renamed_path(p.trim_matches('/'), &ops.renamed), &mut order);
     }
-    // Depth-first, siblings in first-seen order.
-    let mut children: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
+    // Depth-first, siblings in first-seen order (or the library's).
+    let mut children: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for p in &order {
         children.entry(p.rsplit_once('/').map_or("", |(parent, _)| parent)).or_default().push(p);
+    }
+    if let Some(sorting) = sorting {
+        for (parent, kids) in children.iter_mut() {
+            let top = parent.is_empty();
+            kids.sort_by(|a, b| sorting.cmp(a, b, top));
+        }
     }
     let mut rows = Vec::with_capacity(order.len());
     let mut stack: Vec<&str> = children.get("").map(|c| c.iter().rev().copied().collect()).unwrap_or_default();
@@ -2481,7 +3109,7 @@ fn merge_folders(catalog: &[FolderRow], local: &[String], ops: &FolderOps) -> Ve
             path: p.to_string(),
             name: p.rsplit('/').next().unwrap_or(p).to_string(),
             depth: p.matches('/').count(),
-            cards: cards.get(p).copied().unwrap_or(0),
+            cards: counts.map_or_else(|| cards.get(p).copied().unwrap_or(0), |c| c.get(p).copied().unwrap_or(0)),
             has_children: kids.is_some_and(|k| !k.is_empty()),
             icon: icons.get(p).cloned(),
         });
@@ -2492,32 +3120,110 @@ fn merge_folders(catalog: &[FolderRow], local: &[String], ops: &FolderOps) -> Ve
     rows
 }
 
-/// The local library's folders and folder icons (`library.json` ▸ `collections`), by file stamp.
-fn local_folders(ctx: &egui::Context, libraries: &[String]) -> Arc<(Vec<String>, std::collections::BTreeMap<String, String>)> {
-    type Folders = (Vec<String>, std::collections::BTreeMap<String, String>);
+/// A card as this Mac's library index lists it (`entries` and `catalog_only` of `library.json`):
+/// the names, folders and descriptions edited here win over the published catalog's.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LocalCard {
+    pub name: String,
+    pub category: String,
+    /// The card's own description (the catalog's is that plus generated search words).
+    pub description: String,
+    pub kind_label: String,
+    /// `effectcraft`, `ae` or `any`: who saved it.
+    pub app: String,
+    pub thumbnail_override: bool,
+    /// An Ease card's two keyframes (its speed graph).
+    pub speed_graph: Option<Value>,
+}
+
+/// The local library's index (`library.json`): its collection settings (folders, icons, order,
+/// groups) and its cards, read again when the file changes.
+#[derive(Default)]
+pub(crate) struct LocalLib {
+    pub folders: Vec<String>,
+    pub icons: BTreeMap<String, String>,
+    pub order: BTreeMap<String, i64>,
+    /// Top folder → collection group.
+    pub groups: BTreeMap<String, String>,
+    pub group_names: Vec<String>,
+    pub priorities: Vec<String>,
+    pub cards: BTreeMap<String, LocalCard>,
+    /// The index lists every card of the library (it has `catalog_only`): a published card it
+    /// doesn't list was deleted here.
+    pub complete: bool,
+}
+
+impl LocalLib {
+    /// This Mac has the library (its index was read).
+    pub fn present(&self) -> bool {
+        !self.cards.is_empty() || !self.folders.is_empty()
+    }
+}
+
+fn parse_local_lib(values: &[Value]) -> LocalLib {
+    let mut lib = LocalLib::default();
+    let text = |v: &Value| v.as_str().unwrap_or_default().to_string();
+    for v in values {
+        let c = &v["collections"];
+        if let Some(list) = c["folders"].as_array() {
+            lib.folders.extend(list.iter().filter_map(Value::as_str).map(str::to_string));
+        }
+        if let Some(map) = c["icons"].as_object() {
+            lib.icons.extend(map.iter().filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string()))));
+        }
+        if let Some(map) = c["order"].as_object() {
+            lib.order.extend(map.iter().filter_map(|(k, v)| v.as_i64().map(|n| (k.clone(), n))));
+        }
+        if let Some(map) = c["groups"].as_object() {
+            lib.groups.extend(map.iter().filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string()))));
+        }
+        if let Some(list) = c["group_names"].as_array() {
+            lib.group_names.extend(list.iter().filter_map(Value::as_str).map(str::to_string));
+        }
+        if let Some(list) = c["priorities"].as_array()
+            && lib.priorities.is_empty()
+        {
+            lib.priorities = list.iter().filter_map(Value::as_str).map(str::to_string).collect();
+        }
+        lib.complete |= v.get("catalog_only").is_some_and(Value::is_array);
+        for key in ["entries", "catalog_only"] {
+            for e in v[key].as_array().map(Vec::as_slice).unwrap_or_default() {
+                let id = text(&e["id"]);
+                if id.is_empty() || lib.cards.contains_key(&id) {
+                    continue;
+                }
+                lib.cards.insert(
+                    id,
+                    LocalCard {
+                        name: text(&e["name"]),
+                        category: text(&e["category"]),
+                        description: text(&e["raw_description"]),
+                        kind_label: text(&e["type_label"]),
+                        app: text(&e["app"]),
+                        thumbnail_override: e["thumbnail_override"] == true,
+                        speed_graph: e.get("speed_graph").filter(|g| g.is_array()).cloned(),
+                    },
+                );
+            }
+        }
+    }
+    lib
+}
+
+/// The local library's index, by file stamp (`library.json` of each library folder).
+pub(crate) fn local_library(ctx: &egui::Context, libraries: &[String]) -> Arc<LocalLib> {
     let paths: Vec<std::path::PathBuf> = libraries.iter().map(|f| std::path::Path::new(f).join("library.json")).collect();
     let stamp: Vec<Option<std::time::SystemTime>> = paths.iter().map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok()).collect();
-    let id = egui::Id::new("ml-local-folders");
-    if let Some((s, f)) = ctx.data(|d| d.get_temp::<(Vec<Option<std::time::SystemTime>>, Arc<Folders>)>(id))
+    let id = egui::Id::new("ml-local-library");
+    if let Some((s, f)) = ctx.data(|d| d.get_temp::<(Vec<Option<std::time::SystemTime>>, Arc<LocalLib>)>(id))
         && s == stamp
     {
         return f;
     }
-    let mut folders = Vec::new();
-    let mut icons = std::collections::BTreeMap::new();
-    for p in &paths {
-        let Some(v) = std::fs::read(p).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()) else { continue };
-        let c = &v["collections"];
-        if let Some(list) = c["folders"].as_array() {
-            folders.extend(list.iter().filter_map(Value::as_str).map(str::to_string));
-        }
-        if let Some(map) = c["icons"].as_object() {
-            icons.extend(map.iter().filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string()))));
-        }
-    }
-    let f = Arc::new((folders, icons));
-    ctx.data_mut(|d| d.insert_temp(id, (stamp, f.clone())));
-    f
+    let values: Vec<Value> = paths.iter().filter_map(|p| std::fs::read(p).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok())).collect();
+    let lib = Arc::new(parse_local_lib(&values));
+    ctx.data_mut(|d| d.insert_temp(id, (stamp, lib.clone())));
+    lib
 }
 
 /// The Motion Library backend script on this Mac (`EFFECTCRAFT_ML_BACKEND`, else the usual place).
@@ -2595,12 +3301,86 @@ fn reindex_library() {
 #[cfg(target_arch = "wasm32")]
 fn reindex_library() {}
 
-/// What a finished operation changes in the tree right away.
+/// What a finished operation changes in the panel right away (before the index has it).
 pub(crate) enum FolderChange {
     None,
     Created(String),
     Renamed(String, String),
     Deleted(String),
+    CardName(String, String),
+    CardFolder(String, String),
+    CardDescription(String, String),
+    CardThumb(String, Option<String>),
+    CardDeleted(String),
+    /// Siblings in their new order.
+    Order(Vec<String>),
+    FolderGroup(String, String),
+    GroupAdded(String),
+    GroupRenamed(String, String),
+    GroupDeleted(String),
+}
+
+fn apply_change(ops: &mut FolderOps, change: FolderChange) {
+    match change {
+        FolderChange::None => {}
+        FolderChange::Created(p) => {
+            ops.deleted.retain(|d| !under(&p, d));
+            ops.created.push(p);
+        }
+        FolderChange::Renamed(old, new) => {
+            ops.deleted.retain(|d| !under(&new, d));
+            ops.renamed.push((old, new));
+        }
+        FolderChange::Deleted(p) => {
+            ops.created.retain(|c| !under(c, &p));
+            ops.deleted.push(p);
+        }
+        FolderChange::CardName(id, name) => {
+            ops.card_names.insert(id, name);
+        }
+        FolderChange::CardFolder(id, folder) => {
+            ops.deleted.retain(|d| !under(&folder, d));
+            ops.card_folders.insert(id, folder);
+        }
+        FolderChange::CardDescription(id, text) => {
+            ops.card_descriptions.insert(id, text);
+        }
+        FolderChange::CardThumb(id, path) => {
+            ops.card_thumbs.insert(id, path);
+        }
+        FolderChange::CardDeleted(id) => {
+            ops.cards_deleted.insert(id);
+        }
+        FolderChange::Order(names) => {
+            for (i, n) in names.into_iter().enumerate() {
+                ops.order.insert(n, i64::try_from(i).unwrap_or(i64::MAX));
+            }
+        }
+        FolderChange::FolderGroup(folder, group) => {
+            ops.folder_groups.insert(folder, group);
+        }
+        FolderChange::GroupAdded(name) => {
+            ops.groups_deleted.retain(|g| *g != name);
+            ops.groups_added.push(name);
+        }
+        FolderChange::GroupRenamed(old, new) => {
+            for g in ops.folder_groups.values_mut() {
+                if *g == old {
+                    *g = new.clone();
+                }
+            }
+            ops.groups_renamed.push((old, new));
+        }
+        FolderChange::GroupDeleted(name) => {
+            for g in ops.folder_groups.values_mut() {
+                if *g == name {
+                    g.clear();
+                }
+            }
+            ops.groups_added.retain(|g| *g != name);
+            ops.groups_deleted.push(name);
+        }
+    }
 }
 
 /// Run a backend operation in the background; the status line says how it went.
@@ -2611,36 +3391,38 @@ fn spawn_folder_op(ctx: &egui::Context, op: &'static str, args: Value, change: F
 /// Run a Motion Library operation in the background, then rebuild the index; the status line says
 /// how it went.
 pub(crate) fn spawn_ml_op(ctx: &egui::Context, op: impl FnOnce() -> Result<Value, String> + Send + 'static, change: FolderChange, done: String) {
+    spawn_ml_op_with(ctx, op, change, move |_| done, true);
+}
+
+/// [`spawn_ml_op`] with a message made from the result, and the index rebuilt only when `reindex`
+/// (operations that change no library file, e.g. using a card, don't).
+pub(crate) fn spawn_ml_op_with(
+    ctx: &egui::Context,
+    op: impl FnOnce() -> Result<Value, String> + Send + 'static,
+    change: FolderChange,
+    done: impl FnOnce(&Value) -> String + Send + 'static,
+    reindex: bool,
+) {
     let ctx = ctx.clone();
     let run = move || {
         let result = op();
+        let done = match &result {
+            Ok(v) => done(v),
+            Err(_) => String::new(),
+        };
         {
             let mut ops = folder_ops();
             match &result {
                 Ok(_) => {
-                    match change {
-                        FolderChange::None => {}
-                        FolderChange::Created(p) => {
-                            ops.deleted.retain(|d| !under(&p, d));
-                            ops.created.push(p);
-                        }
-                        FolderChange::Renamed(old, new) => {
-                            ops.deleted.retain(|d| !under(&new, d));
-                            ops.renamed.push((old, new));
-                        }
-                        FolderChange::Deleted(p) => {
-                            ops.created.retain(|c| !under(c, &p));
-                            ops.deleted.push(p);
-                        }
-                    }
+                    apply_change(&mut ops, change);
                     ops.revision += 1;
-                    ops.status = Some(format!("{done} · updating the library…"));
+                    ops.status = Some(if reindex { format!("{done} · updating the library…") } else { done.clone() });
                 }
                 Err(e) => ops.status = Some(e.clone()),
             }
         }
         ctx.request_repaint();
-        if result.is_ok() {
+        if result.is_ok() && reindex {
             reindex_library();
             let mut ops = folder_ops();
             ops.revision += 1;
@@ -2657,9 +3439,12 @@ pub(crate) fn spawn_ml_op(ctx: &egui::Context, op: impl FnOnce() -> Result<Value
 
 /// `motionLibrary.folder`: `op` create (`category` = parent, `name`), rename (`category`, `name`),
 /// setIcon (`category`, `path`; a file dialog without it), resetIcon, delete (`confirm`; else it
-/// asks), contents. Without a `name`, create and rename ask for one in the panel.
+/// asks), contents, move (`category` into `parent`, "" = the top level), reorder (`category` before
+/// or `after` its sibling `target`), group (`category`, `group`: "" = none; asks without it).
+/// Without a `name`, create and rename ask for one in the panel.
 pub fn folder_command(app: &mut EffectcraftApp, ctx: &egui::Context, params: &Value) -> Result<Value, String> {
-    let op = params.get("op").and_then(Value::as_str).ok_or("missing `op`: create, rename, setIcon, resetIcon, delete or contents")?;
+    let op =
+        params.get("op").and_then(Value::as_str).ok_or("missing `op`: create, rename, setIcon, resetIcon, delete, contents, move, reorder or group")?;
     let category = params.get("category").and_then(Value::as_str).unwrap_or_default().trim_matches('/').to_string();
     let name = params.get("name").and_then(Value::as_str).map(str::trim).unwrap_or_default().to_string();
     if op != "create" && category.is_empty() {
@@ -2742,6 +3527,86 @@ pub fn folder_command(app: &mut EffectcraftApp, ctx: &egui::Context, params: &Va
             Ok(json!({"category": category}))
         }
         "contents" => backend_rpc("folder_contents", json!({"category": category})),
+        "move" => {
+            // Into another folder (`parent`; "" = the top level).
+            let parent = params.get("parent").and_then(Value::as_str).ok_or("missing `parent` (\"\" = the top level)")?.trim_matches('/').to_string();
+            if under(&parent, &category) {
+                return Err("a folder can't go inside itself".into());
+            }
+            let new = if parent.is_empty() { leaf.clone() } else { format!("{parent}/{leaf}") };
+            if new == category {
+                return Ok(json!({"category": new}));
+            }
+            app.ui.status = format!("Moving “{leaf}”…");
+            let view = &mut app.ui.motion_library;
+            if under(&view.folder, &category) {
+                view.folder = format!("{new}{}", &view.folder[category.len()..]);
+            }
+            if !parent.is_empty() {
+                view.expanded.insert(parent.clone());
+            }
+            let to = if parent.is_empty() { tr("the top level").to_string() } else { parent.clone() };
+            spawn_folder_op(
+                ctx,
+                "move_folder",
+                json!({"category": category, "parent": parent}),
+                FolderChange::Renamed(category.clone(), new.clone()),
+                format!("Moved “{leaf}” to {to}"),
+            );
+            Ok(json!({"category": new}))
+        }
+        "reorder" => {
+            // Before or after a sibling (`target`, `after`).
+            let target = params.get("target").and_then(Value::as_str).ok_or("missing `target` (a sibling folder)")?.trim_matches('/').to_string();
+            let after = params.get("after").and_then(Value::as_bool).unwrap_or(false);
+            let parent = category.rsplit_once('/').map_or("", |(p, _)| p).to_string();
+            if target.rsplit_once('/').map_or("", |(p, _)| p) != parent {
+                return Err("reorder moves a folder among its siblings: `target` has another parent".into());
+            }
+            let lib = local_library(ctx, &app.session.prefs.libraries);
+            let before = library_siblings(&lib, &parent);
+            let next = reordered(&before, &category, &target, after).ok_or("the folder or its target isn't in the library (refresh and drag again)")?;
+            if next == before {
+                return Ok(json!({"categories": next}));
+            }
+            spawn_folder_op(
+                ctx,
+                "reorder_folders",
+                json!({"parent": parent, "categories": next}),
+                FolderChange::Order(next.clone()),
+                tr("Folder order saved").to_string(),
+            );
+            Ok(json!({"categories": next}))
+        }
+        "group" => {
+            if category.contains('/') {
+                return Err("only top folders (collections) belong to a group".into());
+            }
+            let Some(group) = params.get("group").and_then(Value::as_str).map(str::trim) else {
+                let lib = local_library(ctx, &app.session.prefs.libraries);
+                let names = group_names(&lib, &folder_ops());
+                if names.is_empty() {
+                    return Err("there are no collection groups yet: make one with New group…".into());
+                }
+                let mut options = vec![String::new()];
+                options.extend(names);
+                let current = folder_group(&lib, &folder_ops(), &category);
+                let choice = options.iter().position(|g| *g == current).unwrap_or(0);
+                app.ui.motion_library.card_ask =
+                    Some(CardAsk { op: "groupAssign".into(), id: category.clone(), name: category.clone(), options, choice, ..CardAsk::default() });
+                return Ok(json!({"dialog": "motionLibrary.group"}));
+            };
+            let group = group.to_string();
+            let label = if group.is_empty() { tr("no group").to_string() } else { format!("“{group}”") };
+            spawn_folder_op(
+                ctx,
+                "set_folder_group",
+                json!({"category": category, "group": group}),
+                FolderChange::FolderGroup(category.clone(), group.clone()),
+                format!("“{leaf}” is in {label}"),
+            );
+            Ok(json!({"category": category, "group": group}))
+        }
         "delete" => {
             if params.get("confirm") != Some(&Value::Bool(true)) {
                 let contents = backend_rpc("folder_contents", json!({"category": category}))?;
@@ -2765,12 +3630,12 @@ pub fn folder_command(app: &mut EffectcraftApp, ctx: &egui::Context, params: &Va
             spawn_folder_op(ctx, "delete_folder", args, FolderChange::Deleted(category.clone()), format!("Deleted “{leaf}”"));
             Ok(json!({"deleted": category}))
         }
-        other => Err(format!("unknown folder op `{other}` (create, rename, setIcon, resetIcon, delete, contents)")),
+        other => Err(format!("unknown folder op `{other}` (create, rename, setIcon, resetIcon, delete, contents, move, reorder, group)")),
     }
 }
 
 /// The folder's right-click menu (the "All motion" row: New folder… only).
-fn folder_menu(auto: &mut crate::automation::Registry, resp: &egui::Response, path: &str, danger: Color32) -> Option<(&'static str, Value)> {
+fn folder_menu(auto: &mut crate::automation::Registry, resp: &egui::Response, path: &str, danger: Color32, groups: bool) -> Option<(&'static str, Value)> {
     let mut pick = None;
     crate::widgets::context_menu(resp, |ui| {
         let mut entry = |ui: &mut egui::Ui, key: &str, label: &str, color: Option<Color32>, params: Value| {
@@ -2791,6 +3656,11 @@ fn folder_menu(auto: &mut crate::automation::Registry, resp: &egui::Response, pa
         }
         entry(ui, "newSubfolder", "New subfolder…", None, json!({"op": "create", "category": path}));
         entry(ui, "rename", "Rename…", None, json!({"op": "rename", "category": path}));
+        if path.contains('/') {
+            entry(ui, "moveTop", "Move to Top Level", None, json!({"op": "move", "category": path, "parent": ""}));
+        } else if groups {
+            entry(ui, "moveGroup", "Move to Group…", None, json!({"op": "group", "category": path}));
+        }
         entry(ui, "chooseIcon", "Choose icon…", None, json!({"op": "setIcon", "category": path}));
         entry(ui, "resetIcon", "Restore default icon", None, json!({"op": "resetIcon", "category": path}));
         ui.separator();
@@ -2858,28 +3728,909 @@ fn folder_ask_sheet(app: &mut EffectcraftApp, ui: &mut egui::Ui, grid: Rect, ask
     None
 }
 
-// ── Cards, groups, imports (stubs filled in below) ─────────────────────────────────────────────
+// ── Cards, groups, imports (right-click a card, the group picker, files dropped on the panel) ──
+//
+// As in the browser panel (:8765): Rename…, Edit description…, Move to folder…, Choose
+// thumbnail…, Restore default thumbnail, Generate preview, Delete card…, Ease cards' Edit /
+// Duplicate / Reverse graph; collection groups; files dropped on the panel saved into a
+// collection; Refresh syncing the library's sources. Library changes go through the backend
+// (`backend.py rpc`), then the index is rebuilt; this run's changes show at once.
 
-/// `motionLibrary.card`: a card's menu operations.
+/// The library's folders (its `folders` table as the index has it, with this run's changes) under
+/// `parent`, in the tree's order: the siblings a reorder lists.
+fn library_siblings(lib: &LocalLib, parent: &str) -> Vec<String> {
+    let ops = folder_ops();
+    let mut names: Vec<String> = Vec::new();
+    for f in lib.folders.iter().chain(ops.created.iter()) {
+        let f = renamed_path(f.trim_matches('/'), &ops.renamed);
+        if f.is_empty() || ops.deleted.iter().any(|d| under(&f, d)) || names.contains(&f) {
+            continue;
+        }
+        if f.rsplit_once('/').map_or("", |(p, _)| p) == parent {
+            names.push(f);
+        }
+    }
+    let mut order = lib.order.clone();
+    order.extend(ops.order.iter().map(|(k, v)| (k.clone(), *v)));
+    let sorting = Sorting { order, priorities: lib.priorities.clone() };
+    names.sort_by(|a, b| sorting.cmp(a, b, parent.is_empty()));
+    names
+}
+
+/// `siblings` with `folder` moved before (or `after`) `target`; `None` when either isn't there.
+fn reordered(siblings: &[String], folder: &str, target: &str, after: bool) -> Option<Vec<String>> {
+    if folder == target || !siblings.iter().any(|f| f == folder) {
+        return None;
+    }
+    let mut next: Vec<String> = siblings.iter().filter(|f| *f != folder).cloned().collect();
+    let at = next.iter().position(|f| f == target)? + usize::from(after);
+    next.insert(at.min(next.len()), folder.to_string());
+    Some(next)
+}
+
+/// The collection groups (the library's and this run's), by name.
+fn group_names(lib: &LocalLib, ops: &FolderOps) -> Vec<String> {
+    let rename = |g: &str| ops.groups_renamed.iter().fold(g.to_string(), |g, (old, new)| if g == *old { new.clone() } else { g });
+    let mut names: Vec<String> = lib
+        .group_names
+        .iter()
+        .chain(lib.groups.values())
+        .chain(ops.groups_added.iter())
+        .chain(ops.folder_groups.values())
+        .map(|g| rename(g))
+        .filter(|g| !g.is_empty() && !ops.groups_deleted.contains(g))
+        .collect();
+    names.sort_by_key(|g| g.to_lowercase());
+    names.dedup();
+    names
+}
+
+/// The group of the collection `folder` is in (`""`: none).
+fn folder_group(lib: &LocalLib, ops: &FolderOps, folder: &str) -> String {
+    let top = folder.split('/').next().unwrap_or(folder);
+    if let Some(g) = ops.folder_groups.get(top) {
+        return g.clone();
+    }
+    let g = lib.groups.get(top).cloned().unwrap_or_default();
+    let g = ops.groups_renamed.iter().fold(g, |g, (old, new)| if g == *old { new.clone() } else { g });
+    if ops.groups_deleted.contains(&g) { String::new() } else { g }
+}
+
+/// A card as the panel shows it: this Mac's index and this run's edits over the published card;
+/// `None` when it was deleted here (or its folder was).
+fn overlay_card(card: &Card, lib: &LocalLib, ops: &FolderOps, published: bool) -> Option<Card> {
+    if ops.cards_deleted.contains(&card.id) {
+        return None;
+    }
+    let mut c = card.clone();
+    match lib.cards.get(&c.id) {
+        Some(l) => {
+            if !l.name.is_empty() {
+                c.name = l.name.clone();
+            }
+            if !l.category.is_empty() {
+                c.category = l.category.clone();
+            }
+        }
+        // A published card this Mac's complete index no longer lists: deleted here.
+        None if published && lib.complete => return None,
+        None => {}
+    }
+    if let Some(n) = ops.card_names.get(&c.id) {
+        c.name = n.clone();
+    }
+    if let Some(f) = ops.card_folders.get(&c.id) {
+        c.category = f.clone();
+    }
+    if let Some(d) = ops.card_descriptions.get(&c.id) {
+        c.description = if c.description.is_empty() { d.clone() } else { format!("{d} · {}", c.description) };
+    }
+    c.category = renamed_path(&c.category, &ops.renamed);
+    if ops.deleted.iter().any(|d| under(&c.category, d)) {
+        return None;
+    }
+    Some(c)
+}
+
+/// Every card the panel lists: the catalog's and this Mac's unpublished ones, with this Mac's
+/// edits (cached per catalog, index and edit).
+fn library_cards(ctx: &egui::Context, client: &Client, local: &Arc<LocalIndex>, lib: &Arc<LocalLib>) -> Arc<Vec<Card>> {
+    type Cached = ((u64, usize, usize, u64), Arc<Vec<Card>>);
+    let id = egui::Id::new("ml-library-cards");
+    let key = (generation(client), Arc::as_ptr(local) as usize, Arc::as_ptr(lib) as usize, folder_ops().revision);
+    if let Some((k, cards)) = ctx.data(|d| d.get_temp::<Cached>(id))
+        && k == key
+    {
+        return cards;
+    }
+    let local_only = local_only_cards(ctx, client, local);
+    let cat = client.catalog();
+    let ops = folder_ops();
+    let mut cards: Vec<Card> = cat.iter().flat_map(|c| c.cards.iter()).filter_map(|c| overlay_card(c, lib, &ops, true)).collect();
+    cards.extend(local_only.iter().filter_map(|c| overlay_card(c, lib, &ops, false)));
+    drop(ops);
+    let cards = Arc::new(cards);
+    ctx.data_mut(|d| d.insert_temp::<Cached>(id, (key, cards.clone())));
+    cards
+}
+
+/// Cards per folder, each counted in its folder and every folder above it.
+fn folder_counts<'a>(cards: impl Iterator<Item = &'a Card>) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for c in cards {
+        let mut path = c.category.as_str();
+        loop {
+            *counts.entry(path.to_string()).or_insert(0) += 1;
+            match path.rsplit_once('/') {
+                Some((parent, _)) => path = parent,
+                None => break,
+            }
+        }
+    }
+    counts
+}
+
+/// How this Mac uses a card EffectCraft can't apply from files, through the Motion Library's
+/// EffectCraft plug (as the web panel does): `ease` (onto the selected keyframes), `expression`
+/// (onto the selected property), `comp` (converts its After Effects project, then nests it).
+fn plug_use(card: &Card, local: &LocalIndex, lib: &LocalLib) -> Option<&'static str> {
+    if usable(card, local) || !ml_backend().is_some_and(|p| p.is_file()) {
+        return None;
+    }
+    let l = lib.cards.get(&card.id)?;
+    match kind_label(card) {
+        "Ease" => Some("ease"),
+        "Expression" => Some("expression"),
+        "Comp" if l.app != "effectcraft" && card.on_mac => Some("comp"),
+        _ => None,
+    }
+}
+
+/// A card dialog over the panel: a name or description to type, a folder or group to choose, a
+/// delete to confirm.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CardAsk {
+    /// rename, describe, move, delete, groupNew, groupRename, groupDelete, groupAssign
+    pub op: String,
+    /// The card (card dialogs), the group (groupRename, groupDelete), the collection (groupAssign).
+    pub id: String,
+    /// What the title names.
+    pub name: String,
+    pub text: String,
+    /// move: folders; groupAssign: groups (`""` = none).
+    pub options: Vec<String>,
+    pub choice: usize,
+}
+
+/// The card dialog over the grid: the command to run when it's answered, `Some(None)` to close.
+fn card_ask_sheet(app: &mut EffectcraftApp, ui: &mut egui::Ui, grid: Rect, ask: &mut CardAsk, s: f32) -> Option<Option<(&'static str, Value)>> {
+    let t = app.tokens;
+    let p = ui.painter().with_clip_rect(grid);
+    let _ = ui.interact(grid, egui::Id::new("ml-card-ask-block"), Sense::click_and_drag());
+    p.rect_filled(grid, 0.0, Color32::from_black_alpha(120));
+    let multiline = ask.op == "describe";
+    let w = (grid.width() - 32.0 * s).clamp(120.0, 420.0 * s);
+    let h = (grid.height() - 32.0 * s).clamp(90.0, if multiline { 280.0 } else { 160.0 } * s);
+    let r = Rect::from_center_size(grid.center(), vec2(w, h));
+    p.rect_filled(r, CornerRadius::same(10), t.header_bg);
+    p.rect_stroke(r, CornerRadius::same(10), Stroke::new(1.0, t.separator), egui::StrokeKind::Inside);
+    app.auto.add("motionLibrary.cardAsk", r, &ask.op);
+    let inner = r.shrink(14.0 * s);
+    let (title, ok_label, body) = match ask.op.as_str() {
+        "rename" => (tr("Rename card").to_string(), "Rename", ""),
+        "describe" => (
+            format!("{} · {}", tr("Description"), ask.name),
+            "Save",
+            "When to use it, what it does, its limits. Searchable, and agents read it.",
+        ),
+        "move" => (format!("Move “{}” to", ask.name), "Move", ""),
+        "delete" => (
+            format!("Delete “{}”?", ask.name),
+            "Delete",
+            "This removes the card, its saved versions and its library previews. Original projects and source media stay untouched.",
+        ),
+        "groupNew" => (tr("New group").to_string(), "Create", "A group collects collections (top folders). Your collections stay where they are."),
+        "groupRename" => (format!("Rename group “{}”", ask.name), "Rename", ""),
+        "groupDelete" => (format!("Delete group “{}”?", ask.name), "Delete", "The group label is removed. Its collections and cards stay in All collections."),
+        _ => (format!("Move “{}” to group", ask.name), "Move", ""),
+    };
+    let title = elide(&p, &title, &Tokens::semibold(13.0 * s), inner.width());
+    p.text(inner.min, Align2::LEFT_TOP, &title, Tokens::semibold(13.0 * s), t.text);
+    let mut y = inner.min.y + 24.0 * s;
+    if !body.is_empty() {
+        let galley = p.layout(tr(body).to_string(), Tokens::ui(11.5 * s), t.text_dim, inner.width().max(40.0));
+        let gh = galley.size().y;
+        p.galley(pos2(inner.min.x, y), galley, t.text_dim);
+        y += gh + 8.0 * s;
+    }
+    let bottom = inner.max.y - 32.0 * s;
+    let enter = ui.ctx().input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
+    match ask.op.as_str() {
+        "rename" | "groupNew" | "groupRename" | "describe" => {
+            let field = Rect::from_min_max(pos2(inner.min.x, y), pos2(inner.max.x, if multiline { bottom } else { (y + 24.0 * s).min(bottom) }));
+            let edit = if multiline {
+                egui::TextEdit::multiline(&mut ask.text).hint_text(tr("Use for… Behavior… Adjustable controls… Avoid when…"))
+            } else {
+                egui::TextEdit::singleline(&mut ask.text).hint_text(tr(if ask.op == "rename" { "Card name" } else { "Group name" }))
+            };
+            let resp = ui.put(field, edit);
+            app.auto.add_response("motionLibrary.cardAsk.text", &resp, &ask.op);
+            if !resp.has_focus() && !resp.lost_focus() {
+                resp.request_focus();
+            }
+        }
+        "move" | "groupAssign" => {
+            let labels: Vec<String> = ask.options.iter().map(|o| if o.is_empty() { tr("No group").to_string() } else { o.clone() }).collect();
+            let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+            let dr = Rect::from_min_size(pos2(inner.min.x, y), vec2(inner.width(), 24.0 * s));
+            if let Some(i) = kit::dropdown(app, ui, dr, "motionLibrary.cardAsk.choice", &refs, ask.choice) {
+                ask.choice = i;
+            }
+        }
+        _ => {}
+    }
+    let bw = 84.0 * s;
+    let ok = Rect::from_min_size(pos2(inner.max.x - bw, inner.max.y - 24.0 * s), vec2(bw, 24.0 * s));
+    let cancel = ok.translate(vec2(-(bw + 8.0 * s), 0.0));
+    if kit::button(app, ui, cancel, "motionLibrary.cardAsk.cancel", "Cancel", false) || ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
+        return Some(None);
+    }
+    let text = ask.text.trim().to_string();
+    let needs_text = matches!(ask.op.as_str(), "rename" | "groupNew" | "groupRename");
+    let valid = !needs_text || !text.is_empty();
+    let submit = kit::button(app, ui, ok, "motionLibrary.cardAsk.ok", ok_label, true) || (enter && !multiline && ask.op != "delete" && ask.op != "groupDelete");
+    if !submit || !valid {
+        return None;
+    }
+    let pick = |i: usize| ask.options.get(i).cloned().unwrap_or_default();
+    Some(Some(match ask.op.as_str() {
+        "rename" => ("motionLibrary.card", json!({"op": "rename", "id": ask.id, "name": text})),
+        "describe" => ("motionLibrary.card", json!({"op": "describe", "id": ask.id, "description": ask.text.trim()})),
+        "move" => ("motionLibrary.card", json!({"op": "move", "id": ask.id, "category": pick(ask.choice)})),
+        "delete" => ("motionLibrary.card", json!({"op": "delete", "id": ask.id, "confirm": true})),
+        "groupNew" => ("motionLibrary.group", json!({"op": "create", "name": text})),
+        "groupRename" => ("motionLibrary.group", json!({"op": "rename", "name": ask.id, "newName": text})),
+        "groupDelete" => ("motionLibrary.group", json!({"op": "delete", "name": ask.id, "confirm": true})),
+        _ => ("motionLibrary.folder", json!({"op": "group", "category": ask.id, "group": pick(ask.choice)})),
+    }))
+}
+
+/// An Ease card's two saved keyframes as a normalized cubic Bézier `[x1, y1, x2, y2]` (the web
+/// panel's `CurveMath.fromKeys`); `None` when they aren't two numeric keys.
+pub(crate) fn keys_curve(keys: &Value) -> Option<[f64; 4]> {
+    let (a, b) = (keys.get(0)?, keys.get(1)?);
+    let (ta, tb, va, vb) = (a["time"].as_f64()?, b["time"].as_f64()?, a["value"].as_f64()?, b["value"].as_f64()?);
+    let (dt, dv) = (tb - ta, vb - va);
+    if !(dt > 0.0) || dv.abs() < 1e-8 || !dt.is_finite() || !dv.is_finite() {
+        return None;
+    }
+    let out = a["out_ease"].get(0);
+    let inc = b["in_ease"].get(0);
+    let x1 = out.and_then(|o| o["influence"].as_f64()).map_or(1.0 / 3.0, |i| (i / 100.0).clamp(0.001, 1.0));
+    let x2 = inc.and_then(|o| o["influence"].as_f64()).map_or(2.0 / 3.0, |i| 1.0 - (i / 100.0).clamp(0.001, 1.0));
+    let y1 = match out.and_then(|o| o["speed"].as_f64()) {
+        Some(sp) if a["out_type"] != "LINEAR" => sp * dt * x1 / dv,
+        _ => x1,
+    };
+    let y2 = match inc.and_then(|o| o["speed"].as_f64()) {
+        Some(sp) if b["in_type"] != "LINEAR" => 1.0 - sp * dt * (1.0 - x2) / dv,
+        _ => x2,
+    };
+    [x1, y1, x2, y2].iter().all(|v| v.is_finite()).then_some([x1, y1, x2, y2])
+}
+
+/// The same ease played backwards in time.
+pub(crate) fn reverse_curve(c: [f64; 4]) -> [f64; 4] {
+    [1.0 - c[2], 1.0 - c[3], 1.0 - c[0], 1.0 - c[1]]
+}
+
+/// Speed along a cubic Bézier ease (0 → 1) at 81 points: `(x, speed)`, as the web panel's speed
+/// graph samples it.
+fn speed_samples(c: [f64; 4]) -> Vec<(f64, f64)> {
+    let [x1, y1, x2, y2] = c;
+    let d = |t: f64, p: f64, q: f64| 3.0 * (1.0 - t) * (1.0 - t) * p + 6.0 * (1.0 - t) * t * (q - p) + 3.0 * t * t * (1.0 - q);
+    (0..=80)
+        .map(|i| {
+            let t = f64::from(i) / 80.0;
+            let x = 3.0 * (1.0 - t) * (1.0 - t) * t * x1 + 3.0 * (1.0 - t) * t * t * x2 + t * t * t;
+            (x, d(t, y1, y2) / d(t, x1, x2).max(1e-5))
+        })
+        .collect()
+}
+
+/// An Ease card's speed graph drawn in `r`.
+fn paint_speed_graph(p: &egui::Painter, r: Rect, curve: [f64; 4], color: Color32, grid: Color32) {
+    let samples = speed_samples(curve);
+    let (mut lo, mut hi) = samples.iter().fold((0.0f64, 0.0f64), |(lo, hi), (_, v)| (lo.min(*v), hi.max(*v)));
+    let pad = (hi - lo).max(1e-6) * 0.12;
+    lo -= pad;
+    hi += pad;
+    let inner = r.shrink2(vec2(r.width() * 0.06, r.height() * 0.12));
+    for f in [0.25f32, 0.5, 0.75] {
+        let y = inner.min.y + inner.height() * f;
+        p.line_segment([pos2(inner.min.x, y), pos2(inner.max.x, y)], Stroke::new(1.0, grid));
+    }
+    let pts: Vec<egui::Pos2> = samples
+        .iter()
+        .map(|(x, v)| pos2(inner.min.x + *x as f32 * inner.width(), inner.min.y + ((hi - v) / (hi - lo)) as f32 * inner.height()))
+        .collect();
+    p.add(egui::Shape::line(pts, Stroke::new(2.0, color)));
+}
+
+/// The card's details from the library (`describe`), fetched in the background when its details
+/// open: `(card, result)`; `None` inside while it loads.
+type Described = Option<(String, Option<Result<Value, String>>)>;
+static DESCRIBED: Mutex<Described> = Mutex::new(None);
+
+/// Start fetching card `id`'s details (once per card) and return them when they are in.
+fn described(ctx: &egui::Context, id: &str) -> Option<Result<Value, String>> {
+    let mut slot = DESCRIBED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((cur, result)) = slot.as_ref()
+        && cur == id
+    {
+        return result.clone();
+    }
+    if !ml_backend().is_some_and(|p| p.is_file()) {
+        return None;
+    }
+    *slot = Some((id.to_string(), None));
+    drop(slot);
+    let (ctx, id) = (ctx.clone(), id.to_string());
+    let run = move || {
+        let r = backend_rpc("describe", json!({"id": id})).map(|v| if v.get("entry").is_some() { v["entry"].clone() } else { v });
+        let mut slot = DESCRIBED.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.as_ref().is_some_and(|(cur, _)| *cur == id) {
+            *slot = Some((id, Some(r)));
+        }
+        drop(slot);
+        ctx.request_repaint();
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    std::thread::spawn(run);
+    #[cfg(target_arch = "wasm32")]
+    run();
+    None
+}
+
+/// Fetch the open card's details again (after an edit).
+fn forget_described() {
+    *DESCRIBED.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// The library's own name for an index state (the web panel's `label`).
+fn index_label(status: &str) -> &str {
+    match status {
+        "catalog-only" | "" => "Not indexed",
+        "partial-motion-index" => "Partial motion index",
+        "native-key-index" | "saved-key-index" => "Keys & expressions indexed",
+        "partial-index" => "Partially indexed",
+        "structure-only" => "Structure indexed",
+        "source-changed" => "Source changed",
+        "indexed" => "Motion indexed",
+        "indexing" => "Indexing",
+        "stale" => "Needs refresh",
+        "failed" => "Index failed",
+        "ready" => "Ready",
+        other => other,
+    }
+}
+
+/// `motionLibrary.card`: `op` use (an Ease, Expression or After Effects comp card, through the
+/// EffectCraft plug), rename (`name`), describe (`description`), move (`category`), setThumbnail
+/// (`path`: an image, GIF or video; a file dialog without it), resetThumbnail, preview (render its
+/// preview again), delete (`confirm`), duplicateGraph, reverseGraph, editGraph (Ease cards), details
+/// (the library's details, fetched in the background). Without their value, rename, describe, move
+/// and delete ask in the panel.
 pub fn card_command(app: &mut EffectcraftApp, ctx: &egui::Context, params: &Value) -> Result<Value, String> {
-    let _ = (app, ctx, params);
-    Err("not yet".into())
+    let op = params.get("op").and_then(Value::as_str).ok_or(
+        "missing `op`: use, rename, describe, move, setThumbnail, resetThumbnail, preview, delete, duplicateGraph, reverseGraph, editGraph or details",
+    )?;
+    let id = params.get("id").and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or("missing `id` (a Motion Library card id)")?.to_string();
+    if id.contains(['/', '\\']) || id.contains("..") {
+        return Err(format!("`{id}` isn't a card id"));
+    }
+    let lib = local_library(ctx, &app.session.prefs.libraries);
+    let local = app.session.motion_library_local();
+    let shown = app.session.motion_library().ok().and_then(|client| library_cards(ctx, &client, &local, &lib).iter().find(|c| c.id == id).cloned());
+    let edit = lib.cards.get(&id).cloned();
+    if op == "details" {
+        app.ui.motion_library.details = Some(id.clone());
+        app.ui.motion_library.selected = Some(id.clone());
+        forget_described();
+        return Ok(json!({"details": id}));
+    }
+    let name = shown.as_ref().map(|c| c.name.clone()).or_else(|| edit.as_ref().map(|e| e.name.clone())).ok_or(format!("no Motion Library card `{id}`"))?;
+    // Everything else edits this Mac's library.
+    let Some(edit) = edit else {
+        return Err(format!("“{name}” isn't in this computer's Motion Library (only the Mac that keeps the library edits its cards)"));
+    };
+    let category = {
+        let ops = folder_ops();
+        ops.card_folders.get(&id).cloned().unwrap_or_else(|| renamed_path(&edit.category, &ops.renamed))
+    };
+    let text = |k: &str| params.get(k).and_then(Value::as_str).map(str::trim).map(str::to_string);
+    let ask = |app: &mut EffectcraftApp, ask: CardAsk| {
+        app.ui.motion_library.card_ask = Some(ask);
+        Ok(json!({"dialog": "motionLibrary.card"}))
+    };
+    match op {
+        "use" => {
+            let card = shown.ok_or(format!("no Motion Library card `{id}`"))?;
+            let how = plug_use(&card, &local, &lib).ok_or(format!("“{name}”: {}", mac_words(&local).1))?;
+            let port = control_port(app)?;
+            let (plug_op, args) = if how == "comp" { ("insert", json!({"id": id, "mode": "comp"})) } else { ("use_asset", json!({"id": id})) };
+            app.ui.status = if how == "comp" { format!("Converting “{name}” from After Effects…") } else { format!("Applying “{name}”…") };
+            let done = match how {
+                "ease" => format!("Applied the ease “{name}” to the selected keyframes"),
+                "expression" => format!("Applied the expression “{name}”"),
+                _ => format!("Inserted “{name}”"),
+            };
+            spawn_ml_op_with(ctx, move || plug_rpc(port, plug_op, args), FolderChange::None, move |_| done, false);
+            Ok(json!({"using": id, "as": how}))
+        }
+        "rename" => {
+            let Some(new) = text("name").filter(|n| !n.is_empty()) else {
+                return ask(app, CardAsk { op: "rename".into(), id, text: name.clone(), name, ..CardAsk::default() });
+            };
+            if new.chars().count() > 240 || new.chars().any(char::is_control) {
+                return Err("a card name is 1 to 240 characters, without control characters".into());
+            }
+            if new == name {
+                return Ok(json!({"name": new}));
+            }
+            app.ui.status = format!("Renaming “{name}”…");
+            spawn_folder_op(
+                ctx,
+                "rename_entry",
+                json!({"id": id, "name": new, "expected_name": edit.name}),
+                FolderChange::CardName(id.clone(), new.clone()),
+                format!("Renamed to “{new}”"),
+            );
+            Ok(json!({"id": id, "name": new}))
+        }
+        "describe" => {
+            let current = folder_ops().card_descriptions.get(&id).cloned().unwrap_or_else(|| edit.description.clone());
+            let Some(description) = params.get("description").and_then(Value::as_str).map(str::trim).map(str::to_string) else {
+                return ask(app, CardAsk { op: "describe".into(), id, text: current, name, ..CardAsk::default() });
+            };
+            if description.chars().count() > 10_000 {
+                return Err("a description is at most 10 000 characters".into());
+            }
+            spawn_folder_op(
+                ctx,
+                "set_description",
+                json!({"id": id, "description": description, "expected_description": current}),
+                FolderChange::CardDescription(id.clone(), description.clone()),
+                format!("Description of “{name}” saved"),
+            );
+            forget_described();
+            Ok(json!({"id": id, "description": description}))
+        }
+        "move" => {
+            let Some(to) = text("category").map(|c| c.trim_matches('/').to_string()).filter(|c| !c.is_empty()) else {
+                let client = app.session.motion_library()?;
+                let tree = folder_tree(ctx, &client, &local, &lib, "");
+                let options: Vec<String> = tree.iter().map(|r| r.path.clone()).collect();
+                if options.is_empty() {
+                    return Err("there are no folders to move it to".into());
+                }
+                let choice = options.iter().position(|o| *o == category).unwrap_or(0);
+                return ask(app, CardAsk { op: "move".into(), id, name, options, choice, ..CardAsk::default() });
+            };
+            if to == category {
+                return Ok(json!({"id": id, "category": to}));
+            }
+            app.ui.status = format!("Moving “{name}”…");
+            spawn_folder_op(ctx, "move", json!({"id": id, "category": to}), FolderChange::CardFolder(id.clone(), to.clone()), format!("Moved “{name}” to {to}"));
+            Ok(json!({"id": id, "category": to}))
+        }
+        "setThumbnail" => {
+            const MEDIA: &[&str] =
+                &["png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff", "heic", "heif", "avif", "gif", "mp4", "mov", "m4v", "webm", "avi", "mkv"];
+            let set = move |ctx: &egui::Context, path: String, id: String, name: String| {
+                spawn_folder_op(
+                    ctx,
+                    "set_thumbnail",
+                    json!({"id": id, "path": path}),
+                    FolderChange::CardThumb(id.clone(), Some(path.clone())),
+                    format!("New thumbnail for “{name}”"),
+                );
+            };
+            if let Some(path) = text("path").filter(|p| !p.is_empty()) {
+                set(ctx, path.clone(), id.clone(), name);
+                return Ok(json!({"id": id, "thumbnail": path}));
+            }
+            if let Some(spawn) = app.hooks.file_dialog_async.as_ref() {
+                let ctx2 = ctx.clone();
+                spawn(
+                    crate::FileDialog::Open { exts: MEDIA.iter().map(|e| e.to_string()).collect(), many: false },
+                    Box::new(move |paths| {
+                        if let Some(path) = paths.into_iter().next() {
+                            set(&ctx2, path, id, name);
+                        }
+                    }),
+                );
+                return Ok(json!({"dialog": "motionLibrary.card"}));
+            }
+            let picked = app.hooks.pick_files.as_ref().map(|f| f(MEDIA)).unwrap_or_default();
+            let Some(path) = picked.into_iter().next() else { return Ok(Value::Null) };
+            set(ctx, path.clone(), id.clone(), name);
+            Ok(json!({"id": id, "thumbnail": path}))
+        }
+        "resetThumbnail" => {
+            spawn_folder_op(
+                ctx,
+                "reset_thumbnail",
+                json!({"id": id}),
+                FolderChange::CardThumb(id.clone(), None),
+                format!("Default thumbnail for “{name}”"),
+            );
+            Ok(json!({"id": id}))
+        }
+        "preview" => {
+            if edit.app != "effectcraft" {
+                return Err(format!("“{name}” was saved in After Effects: its preview renders from the Motion Library panel there"));
+            }
+            let port = control_port(app).ok();
+            app.ui.status = format!("Rendering a preview of “{name}”…");
+            let id2 = id.clone();
+            spawn_ml_op(
+                ctx,
+                move || {
+                    let r = ml_rpc("effectcraft_plug.py", &[], port, "preview", json!({"id": id2}))?;
+                    wait_for_preview(&id2);
+                    Ok(r)
+                },
+                FolderChange::None,
+                format!("Preview of “{name}” ready"),
+            );
+            Ok(json!({"id": id, "preview": "queued"}))
+        }
+        "delete" => {
+            if params.get("confirm") != Some(&Value::Bool(true)) {
+                return ask(app, CardAsk { op: "delete".into(), id, name, ..CardAsk::default() });
+            }
+            let view = &mut app.ui.motion_library;
+            if view.selected.as_deref() == Some(id.as_str()) {
+                view.selected = None;
+            }
+            if view.details.as_deref() == Some(id.as_str()) {
+                view.details = None;
+            }
+            let expected_name = folder_ops().card_names.get(&id).cloned().unwrap_or_else(|| edit.name.clone());
+            app.ui.status = format!("Deleting “{name}”…");
+            spawn_folder_op(
+                ctx,
+                "delete_entry",
+                json!({"id": id, "confirm_delete": true, "expected_name": expected_name, "expected_category": category}),
+                FolderChange::CardDeleted(id.clone()),
+                format!("Deleted “{name}”"),
+            );
+            Ok(json!({"deleted": id}))
+        }
+        "duplicateGraph" | "reverseGraph" | "editGraph" if edit.kind_label != "Ease" => Err(format!("“{name}” isn't an Ease card")),
+        "duplicateGraph" => {
+            spawn_ml_op_with(
+                ctx,
+                move || backend_rpc("duplicate_interpolation", json!({"id": id})),
+                FolderChange::None,
+                |v| format!("Duplicated the graph as “{}”", v["name"].as_str().unwrap_or("a copy")),
+                true,
+            );
+            Ok(json!({"duplicating": name}))
+        }
+        "reverseGraph" => {
+            let id2 = id.clone();
+            spawn_ml_op(
+                ctx,
+                move || {
+                    let entry = backend_rpc("describe", json!({"id": id2}))?;
+                    let entry = if entry.get("entry").is_some() { entry["entry"].clone() } else { entry };
+                    let keys = entry["payload"]["keys"].clone();
+                    let curve = keys_curve(&keys).ok_or("this graph isn't two numeric keyframes")?;
+                    backend_rpc("update_interpolation", json!({"id": id2, "expected_keys": keys, "curve": reverse_curve(curve)}))
+                },
+                FolderChange::None,
+                format!("Reversed the graph “{name}”"),
+            );
+            forget_described();
+            Ok(json!({"reversing": id}))
+        }
+        "editGraph" => crate::menus::invoke(app, ctx, "motionLibrary.curve", json!({"op": "editCard", "id": id})),
+        other => Err(format!("unknown card op `{other}`")),
+    }
 }
 
-/// `motionLibrary.group`: collection groups.
+/// `motionLibrary.group`: `op` choose (`name`: the group shown, "" = all collections), create
+/// (`name`), rename (`name`, `newName`), delete (`name`, `confirm`), list. Without their names,
+/// create, rename and delete ask in the panel.
 pub fn group_command(app: &mut EffectcraftApp, ctx: &egui::Context, params: &Value) -> Result<Value, String> {
-    let _ = (app, ctx, params);
-    Err("not yet".into())
+    let op = params.get("op").and_then(Value::as_str).ok_or("missing `op`: choose, create, rename, delete or list")?;
+    let name = params.get("name").and_then(Value::as_str).map(str::trim).unwrap_or_default().to_string();
+    let lib = local_library(ctx, &app.session.prefs.libraries);
+    let names = group_names(&lib, &folder_ops());
+    let known = |n: &str| names.iter().any(|g| g == n);
+    match op {
+        "list" => Ok(json!({"groups": names, "current": app.ui.motion_library.group})),
+        "choose" => {
+            if !name.is_empty() && !known(&name) {
+                return Err(format!("no collection group `{name}` ({})", names.join(", ")));
+            }
+            let view = &mut app.ui.motion_library;
+            view.group = name.clone();
+            view.folder.clear();
+            view.scroll = 0.0;
+            view.popover.clear();
+            Ok(json!({"group": name}))
+        }
+        "create" => {
+            if name.is_empty() {
+                app.ui.motion_library.popover.clear();
+                app.ui.motion_library.card_ask = Some(CardAsk { op: "groupNew".into(), ..CardAsk::default() });
+                return Ok(json!({"dialog": "motionLibrary.group"}));
+            }
+            if names.iter().any(|g| g.eq_ignore_ascii_case(&name)) {
+                return Err(format!("a group named “{name}” already exists"));
+            }
+            app.ui.motion_library.group = name.clone();
+            app.ui.motion_library.folder.clear();
+            spawn_folder_op(
+                ctx,
+                "create_group",
+                json!({"name": name}),
+                FolderChange::GroupAdded(name.clone()),
+                format!("Group “{name}” created: add a collection with + or move one here"),
+            );
+            Ok(json!({"group": name}))
+        }
+        "rename" => {
+            if !known(&name) {
+                return Err(format!("no collection group `{name}`"));
+            }
+            let Some(new) = params.get("newName").and_then(Value::as_str).map(str::trim).filter(|n| !n.is_empty()).map(str::to_string) else {
+                app.ui.motion_library.popover.clear();
+                app.ui.motion_library.card_ask = Some(CardAsk { op: "groupRename".into(), id: name.clone(), text: name.clone(), name, ..CardAsk::default() });
+                return Ok(json!({"dialog": "motionLibrary.group"}));
+            };
+            if app.ui.motion_library.group == name {
+                app.ui.motion_library.group = new.clone();
+            }
+            spawn_folder_op(
+                ctx,
+                "rename_group",
+                json!({"name": name, "new_name": new}),
+                FolderChange::GroupRenamed(name.clone(), new.clone()),
+                format!("Renamed the group to “{new}”"),
+            );
+            Ok(json!({"group": new}))
+        }
+        "delete" => {
+            if !known(&name) {
+                return Err(format!("no collection group `{name}`"));
+            }
+            if params.get("confirm") != Some(&Value::Bool(true)) {
+                app.ui.motion_library.popover.clear();
+                app.ui.motion_library.card_ask = Some(CardAsk { op: "groupDelete".into(), id: name.clone(), name, ..CardAsk::default() });
+                return Ok(json!({"dialog": "motionLibrary.group"}));
+            }
+            if app.ui.motion_library.group == name {
+                app.ui.motion_library.group.clear();
+            }
+            spawn_folder_op(
+                ctx,
+                "delete_group",
+                json!({"name": name}),
+                FolderChange::GroupDeleted(name.clone()),
+                format!("Group “{name}” removed: its collections and cards were kept"),
+            );
+            Ok(json!({"deleted": name}))
+        }
+        other => Err(format!("unknown group op `{other}` (choose, create, rename, delete, list)")),
+    }
 }
 
-/// `motionLibrary.importFiles`: save files into a collection.
+/// `motionLibrary.importFiles`: save files (`paths`) as cards of collection `category` (default the
+/// folder open in the panel, else "My motion"), as files dropped on the web panel are.
 pub fn import_files_command(app: &mut EffectcraftApp, ctx: &egui::Context, params: &Value) -> Result<Value, String> {
-    let _ = (app, ctx, params);
-    Err("not yet".into())
+    let paths: Vec<String> = match params.get("paths") {
+        Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).map(str::to_string).collect(),
+        Some(Value::String(s)) => vec![s.clone()],
+        _ => vec![],
+    };
+    if paths.is_empty() {
+        return Err("missing `paths` (files to save in the library)".into());
+    }
+    let view = &app.ui.motion_library;
+    let category = params
+        .get("category")
+        .and_then(Value::as_str)
+        .map(|c| c.trim_matches('/').to_string())
+        .filter(|c| !c.is_empty())
+        .unwrap_or_else(|| if view.folder.is_empty() { "My motion".to_string() } else { view.folder.clone() });
+    app.ui.status = format!("Saving {} file{} in {category}…", paths.len(), if paths.len() == 1 { "" } else { "s" });
+    let n = paths.len();
+    spawn_ml_op_with(
+        ctx,
+        move || backend_rpc("import_files", json!({"paths": paths, "category": category})),
+        FolderChange::None,
+        move |r| {
+            let saved = r["saved"].as_array().map_or(0, Vec::len);
+            let mut msg = format!("Saved {saved} of {n} file(s) in {}", r["category"].as_str().unwrap_or("the library"));
+            let errors: Vec<String> = r["errors"]
+                .as_array()
+                .map(|e| {
+                    e.iter()
+                        .take(3)
+                        .map(|x| {
+                            let path = x["path"].as_str().unwrap_or_default();
+                            format!("{}: {}", path.rsplit('/').next().unwrap_or(path), x["error"].as_str().unwrap_or_default())
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !errors.is_empty() {
+                msg.push_str(" · ");
+                msg.push_str(&errors.join("; "));
+            }
+            msg
+        },
+        true,
+    );
+    Ok(json!({"saving": n}))
 }
 
-/// `motionLibrary.refresh`: refresh the local library's sources.
-pub fn refresh_command(app: &mut EffectcraftApp, ctx: &egui::Context, params: &Value) -> Result<Value, String> {
-    let _ = (app, ctx, params);
-    Err("not yet".into())
+/// `motionLibrary.refresh`: check the published catalog (`library.sync`) and, on the Mac with the
+/// library, sync its sources (EarnEdits, SceneYard, SFX) and media previews, then rebuild the index
+/// (the web panel's Refresh).
+pub fn refresh_command(app: &mut EffectcraftApp, ctx: &egui::Context, _params: &Value) -> Result<Value, String> {
+    let _ = app.session.execute("library.sync", json!({"wait": false}));
+    let lib = local_library(ctx, &app.session.prefs.libraries);
+    if !lib.present() || !ml_backend().is_some_and(|p| p.is_file()) {
+        return Ok(json!({"sources": false}));
+    }
+    app.ui.status = tr("Refreshing the library's sources…").to_string();
+    spawn_ml_op_with(
+        ctx,
+        || {
+            let mut errors = vec![];
+            for op in ["sync_earnedits", "sync_sceneyard", "sync_sfx"] {
+                if let Err(e) = backend_rpc(op, json!({})) {
+                    errors.push(format!("{op}: {e}"));
+                }
+            }
+            match backend_rpc("prepare_media", json!({})) {
+                Ok(m) => {
+                    if let Some(n) = m["errors"].as_array().map(Vec::len).filter(|n| *n > 0) {
+                        errors.push(format!("{n} media previews could not be refreshed"));
+                    }
+                }
+                Err(e) => errors.push(e),
+            }
+            Ok(json!({"errors": errors}))
+        },
+        FolderChange::None,
+        |r| match r["errors"].as_array().filter(|e| !e.is_empty()) {
+            Some(e) => format!("Library refreshed · {}", e.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("; ")),
+            None => tr("Library sources refreshed").to_string(),
+        },
+        true,
+    );
+    Ok(json!({"sources": true}))
+}
+
+#[cfg(test)]
+mod library_tests {
+    use super::*;
+
+    #[test]
+    fn reorder_moves_before_and_after() {
+        let s: Vec<String> = ["A", "B", "C", "D"].iter().map(|x| x.to_string()).collect();
+        assert_eq!(reordered(&s, "D", "B", false).unwrap(), ["A", "D", "B", "C"]);
+        assert_eq!(reordered(&s, "A", "C", true).unwrap(), ["B", "C", "A", "D"]);
+        assert_eq!(reordered(&s, "A", "D", true).unwrap(), ["B", "C", "D", "A"]);
+        assert!(reordered(&s, "A", "A", false).is_none());
+        assert!(reordered(&s, "X", "A", false).is_none());
+        assert!(reordered(&s, "A", "X", false).is_none());
+    }
+
+    #[test]
+    fn library_order_then_priorities_then_names() {
+        let mut order = BTreeMap::new();
+        order.insert("Zeta".to_string(), 0);
+        order.insert("Alpha".to_string(), 1);
+        let s = Sorting { order, priorities: vec!["Devin Jatho".into()] };
+        let mut top = vec!["Beta", "Alpha", "Devin Jatho", "Zeta"];
+        top.sort_by(|a, b| s.cmp(a, b, true));
+        assert_eq!(top, ["Zeta", "Alpha", "Devin Jatho", "Beta"]);
+        let catalog = vec![
+            FolderRow { path: "B".into(), name: "B".into(), depth: 0, cards: 3, has_children: false, icon: None },
+            FolderRow { path: "A".into(), name: "A".into(), depth: 0, cards: 1, has_children: false, icon: None },
+        ];
+        let ops = folder_ops_fresh();
+        let mut counts = BTreeMap::new();
+        counts.insert("A".to_string(), 7);
+        counts.insert("C/D".to_string(), 2);
+        counts.insert("C".to_string(), 2);
+        let rows = merge_folders(&catalog, &[], &ops, &["C/D".to_string()], Some(&counts), Some(&Sorting::default()));
+        let got: Vec<(&str, usize)> = rows.iter().map(|r| (r.path.as_str(), r.cards)).collect();
+        assert_eq!(got, [("A", 7), ("B", 0), ("C", 2), ("C/D", 2)]);
+        // Without the library's order: the catalog's.
+        let rows = merge_folders(&catalog, &[], &ops, &[], None, None);
+        assert_eq!(rows.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(), ["B", "A"]);
+    }
+
+    fn folder_ops_fresh() -> FolderOps {
+        FolderOps {
+            created: vec![],
+            deleted: vec![],
+            renamed: vec![],
+            card_names: BTreeMap::new(),
+            card_folders: BTreeMap::new(),
+            card_descriptions: BTreeMap::new(),
+            card_thumbs: BTreeMap::new(),
+            cards_deleted: BTreeSet::new(),
+            order: BTreeMap::new(),
+            folder_groups: BTreeMap::new(),
+            groups_added: vec![],
+            groups_renamed: vec![],
+            groups_deleted: vec![],
+            revision: 0,
+            status: None,
+        }
+    }
+
+    #[test]
+    fn overlay_renames_moves_and_deletes() {
+        let lib = parse_local_lib(&[json!({
+            "collections": {"folders": ["A"], "groups": {"A": "Client"}, "group_names": ["Client", "Empty"]},
+            "entries": [{"id": "c1", "name": "Renamed", "category": "A/B", "raw_description": "mine", "type_label": "Comp"}],
+            "catalog_only": [{"id": "e1", "name": "Snappy", "category": "Graphs", "type_label": "Ease",
+                              "speed_graph": [{"time": 0, "value": 0}, {"time": 1, "value": 1}]}]
+        })]);
+        assert!(lib.complete && lib.present());
+        assert_eq!(lib.cards["c1"].description, "mine");
+        assert!(lib.cards["e1"].speed_graph.is_some());
+        let mut ops = folder_ops_fresh();
+        let published = Card { id: "c1".into(), name: "Old".into(), category: "X".into(), ..Default::default() };
+        let c = overlay_card(&published, &lib, &ops, true).unwrap();
+        assert_eq!((c.name.as_str(), c.category.as_str()), ("Renamed", "A/B"));
+        // A published card the complete index doesn't list was deleted here.
+        let gone = Card { id: "zz".into(), ..Default::default() };
+        assert!(overlay_card(&gone, &lib, &ops, true).is_none());
+        assert!(overlay_card(&gone, &lib, &ops, false).is_some());
+        apply_change(&mut ops, FolderChange::CardFolder("c1".into(), "Z".into()));
+        apply_change(&mut ops, FolderChange::CardName("c1".into(), "New".into()));
+        let c = overlay_card(&published, &lib, &ops, true).unwrap();
+        assert_eq!((c.name.as_str(), c.category.as_str()), ("New", "Z"));
+        apply_change(&mut ops, FolderChange::Renamed("Z".into(), "Y".into()));
+        assert_eq!(overlay_card(&published, &lib, &ops, true).unwrap().category, "Y");
+        apply_change(&mut ops, FolderChange::Deleted("Y".into()));
+        assert!(overlay_card(&published, &lib, &ops, true).is_none());
+        // Groups: the index's, renamed, deleted.
+        assert_eq!(group_names(&lib, &ops), ["Client", "Empty"]);
+        assert_eq!(folder_group(&lib, &ops, "A/B"), "Client");
+        apply_change(&mut ops, FolderChange::GroupRenamed("Client".into(), "Work".into()));
+        assert_eq!(folder_group(&lib, &ops, "A"), "Work");
+        apply_change(&mut ops, FolderChange::GroupDeleted("Work".into()));
+        assert_eq!(folder_group(&lib, &ops, "A"), "");
+        assert_eq!(group_names(&lib, &ops), ["Empty"]);
+    }
+
+    #[test]
+    fn ease_keys_to_curve_and_back() {
+        // Influence 75 % out, 50 % in, zero speeds: a strong ease out, gentle ease in.
+        let keys = json!([
+            {"time": 0.0, "value": 0.0, "out_ease": [{"speed": 0.0, "influence": 75.0}], "out_type": "BEZIER"},
+            {"time": 1.0, "value": 100.0, "in_ease": [{"speed": 0.0, "influence": 50.0}], "in_type": "BEZIER"}
+        ]);
+        let c = keys_curve(&keys).unwrap();
+        assert!((c[0] - 0.75).abs() < 1e-9 && c[1].abs() < 1e-9 && (c[2] - 0.5).abs() < 1e-9 && (c[3] - 1.0).abs() < 1e-9);
+        assert_eq!(reverse_curve(c), [0.5, 0.0, 0.25, 1.0]);
+        assert!(keys_curve(&json!([{"time": 1, "value": 0}, {"time": 1, "value": 1}])).is_none());
+        assert!(keys_curve(&json!([{"time": 0, "value": 3}, {"time": 1, "value": 3}])).is_none());
+        assert!(keys_curve(&json!("x")).is_none());
+        // Linear: a constant speed.
+        let lin = speed_samples([1.0 / 3.0, 1.0 / 3.0, 2.0 / 3.0, 2.0 / 3.0]);
+        assert!(lin.iter().all(|(_, v)| (v - 1.0).abs() < 1e-6));
+    }
 }
