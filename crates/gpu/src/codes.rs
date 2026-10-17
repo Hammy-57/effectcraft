@@ -137,13 +137,6 @@ impl Pixels {
             }
         }
     }
-    /// The float image, when it is one (no decode).
-    pub(crate) fn as_float(&self) -> Option<&GpuImage> {
-        match self {
-            Pixels::Float(g) => Some(g),
-            Pixels::Codes(_) => None,
-        }
-    }
     fn view(&self) -> &wgpu::TextureView {
         match self {
             Pixels::Float(g) => &g.view,

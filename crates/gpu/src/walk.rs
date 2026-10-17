@@ -21,7 +21,7 @@ use crate::ops::{self, Bounds};
 /// Render a comp frame into a GPU image (the canvas in the output space, as
 /// `Renderer::comp_frame_cpu` returns it). `None` when something cannot run here (the caller
 /// renders on the CPU instead).
-pub(crate) fn render<'g>(e: &mut Enc<'g>, r: &Renderer, comp_id: ItemId, t: Tick) -> Option<GpuImage> {
+pub(crate) fn render<'g>(e: &mut Enc<'g>, r: &Renderer, comp_id: ItemId, t: Tick) -> Option<Pixels> {
     // Region-of-interest frames are cropped on the CPU path.
     if r.opts.roi.is_some() {
         return None;
@@ -33,21 +33,23 @@ pub(crate) fn render<'g>(e: &mut Enc<'g>, r: &Renderer, comp_id: ItemId, t: Tick
     if r.depth() > 16 || !e.g.fits(w, h) {
         return None;
     }
-    let mut canvas = e.zeros(w, h);
+    let mut canvas: Pixels = e.zeros(w, h).into();
     draw_comp(e, r, &ctx, &mut canvas)?;
     let pipe = r.pipe();
     if let Some(c) = pipe.from_blend() {
-        canvas = ops::convert(e, &canvas, &c);
+        let below = canvas.float(e)?;
+        canvas = ops::convert(e, &below, &c).into();
     }
     if let Some(l) = pipe.levels {
-        canvas = ops::quantize(e, &canvas, l);
+        canvas = ops::quantize_px(e, &canvas, l, true);
     }
     if r.depth() == 0
         && let Some(c) = pipe.output()
     {
-        canvas = ops::convert(e, &canvas, &c);
+        let below = canvas.float(e)?;
+        canvas = ops::convert(e, &below, &c).into();
         if let Some(l) = pipe.levels {
-            canvas = ops::quantize(e, &canvas, l);
+            canvas = ops::quantize_px(e, &canvas, l, true);
         }
     }
     if r.depth() == 0
@@ -62,14 +64,23 @@ pub(crate) fn render<'g>(e: &mut Enc<'g>, r: &Renderer, comp_id: ItemId, t: Tick
 }
 
 /// Run a CPU drawing step on the canvas (read back, draw, upload).
-fn on_cpu(e: &mut Enc, canvas: &mut GpuImage, f: impl FnOnce(&mut Image)) -> Option<()> {
-    let mut img = e.download(canvas)?;
+fn on_cpu(e: &mut Enc, canvas: &mut Pixels, f: impl FnOnce(&mut Image)) -> Option<()> {
+    let mut img = e.download_px(canvas)?;
     f(&mut img);
-    *canvas = e.g.upload_image(&img)?;
+    *canvas = e.g.upload_image_px(&img)?;
     Some(())
 }
 
-fn draw_comp<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, canvas: &mut GpuImage) -> Option<()> {
+/// The canvas as an f32 image this encoder may draw on in place (taken out of `canvas`, codes
+/// decoded), for a float-only pass; the caller puts the result back.
+fn take_float(e: &mut Enc, canvas: &mut Pixels) -> Option<GpuImage> {
+    match std::mem::replace(canvas, Pixels::Float(e.g.dummy.clone())) {
+        Pixels::Float(g) => Some(g),
+        codes => codes.float(e),
+    }
+}
+
+fn draw_comp<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, canvas: &mut Pixels) -> Option<()> {
     // Passes as on the CPU (Posterize Time adjustment layers hold what is below them).
     for (ctx, visible) in r.draw_passes(ctx) {
         draw_layers(e, r, &ctx, &visible, canvas)?;
@@ -77,12 +88,12 @@ fn draw_comp<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, canvas: &mut 
     Some(())
 }
 
-fn draw_layers<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, visible: &[&'a Layer], canvas: &mut GpuImage) -> Option<()> {
+fn draw_layers<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, visible: &[&'a Layer], canvas: &mut Pixels) -> Option<()> {
     let levels = r.pipe().levels;
     // Layers hidden under an opaque cover are never drawn (`cull`), so they aren't produced either.
-    let mut i = crate::cull::first_drawn(r, ctx, visible, (canvas.width, canvas.height));
+    let mut i = crate::cull::first_drawn(r, ctx, visible, canvas.size());
     // The layers' content on every core first (`prepass`); dropped with what the walk didn't take.
-    let _prefetched = crate::prepass::run(e, r, ctx, visible.get(i..).unwrap_or(&[]), canvas, ordinary_resident_enabled());
+    let _prefetched = crate::prepass::run(e, r, ctx, visible.get(i..).unwrap_or(&[]), canvas.size(), ordinary_resident_enabled());
     while i < visible.len() {
         // A device that ran out of memory (or was lost) on an earlier layer fails every later
         // one: give the frame back to the CPU now instead of drawing the rest of the comp.
@@ -111,7 +122,7 @@ fn draw_layers<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, visible: &[
         }
         // 8/16 bpc: the comp is an integer buffer after every layer.
         if let Some(l) = levels {
-            *canvas = ops::quantize(e, canvas, l);
+            *canvas = ops::quantize_px(e, canvas, l, true);
         }
     }
     Some(())
@@ -120,13 +131,14 @@ fn draw_layers<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, visible: &[
 /// A run of consecutive 3D layers: Classic 3D on the GPU (`classic3d`), with 3D adjustment
 /// layers splitting the run as on the CPU; Advanced 3D, wireframes and runs the kernel cannot
 /// hold draw on the CPU.
-fn draw_3d<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, run: &[&'a Layer], canvas: &mut GpuImage) -> Option<()> {
+fn draw_3d<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, run: &[&'a Layer], canvas: &mut Pixels) -> Option<()> {
     // Environment Light Background layers: the sky behind the rest of the run (drawn first, as
     // `three_d::compose::draw_run` does).
     if run.iter().any(|l| l.environment_background) {
         for l in run.iter().filter(|l| l.environment_background) {
             if let Some(sky) = r.sky_draw(ctx, l) {
-                *canvas = crate::adv3d::sky(e, &sky, canvas)?;
+                let below = canvas.float(e)?;
+                *canvas = crate::adv3d::sky(e, &sky, &below)?.into();
             }
         }
         let rest: Vec<&'a Layer> = run.iter().copied().filter(|l| !l.environment_background).collect();
@@ -148,24 +160,34 @@ fn draw_3d<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, run: &[&'a Laye
         return Some(());
     }
     // Advanced 3D: rendered and composited on the GPU (`adv3d`).
-    if let Some(prep) = r.prepare_adv_run(ctx, run, (canvas.width, canvas.height)) {
-        match crate::adv3d::draw_run(e, &prep, canvas) {
-            Some(img) => *canvas = img,
+    if let Some(prep) = r.prepare_adv_run(ctx, run, canvas.size()) {
+        let below = canvas.float(e)?;
+        match crate::adv3d::draw_run(e, &prep, &below) {
+            Some(img) => *canvas = img.into(),
             None => on_cpu(e, canvas, |img| r.draw_3d_run(ctx, run, img))?,
         }
         return Some(());
     }
     // Advanced 3D with layers on the 2D compositing path (blend modes, track mattes, Preserve
     // Transparency).
-    if let Some(split) = r.split_adv_run(ctx, run, (canvas.width, canvas.height)) {
-        match draw_split(e, r, ctx, &split, canvas) {
+    if let Some(split) = r.split_adv_run(ctx, run, canvas.size()) {
+        let below = canvas.float(e)?;
+        match draw_split(e, r, ctx, &split, &below) {
             Some(img) => *canvas = img,
             None => on_cpu(e, canvas, |img| r.draw_3d_run(ctx, run, img))?,
         }
         return Some(());
     }
-    match r.prepare_3d_run(ctx, run, (canvas.width, canvas.height)).and_then(|prep| crate::classic3d::draw_run(e, &prep, canvas)) {
-        Some(img) => *canvas = img,
+    let prep = r.prepare_3d_run(ctx, run, canvas.size());
+    let drawn = match prep {
+        Some(prep) => {
+            let below = canvas.float(e)?;
+            crate::classic3d::draw_run(e, &prep, &below)
+        }
+        None => None,
+    };
+    match drawn {
+        Some(img) => *canvas = img.into(),
         None => on_cpu(e, canvas, |img| r.draw_3d_run(ctx, run, img))?,
     }
     Some(())
@@ -175,7 +197,7 @@ fn draw_3d<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, run: &[&'a Laye
 /// the canvas, then each special layer (far to near) rendered alone, hidden where the main
 /// scene is nearer, matted (a 3D matte through the camera, else the 2D placement), Preserve
 /// Transparency and blended. `None` = render the run on the CPU.
-fn draw_split(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, split: &effectcraft_render::three_d::adv::SplitRun, canvas: &GpuImage) -> Option<GpuImage> {
+fn draw_split(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, split: &effectcraft_render::three_d::adv::SplitRun, canvas: &GpuImage) -> Option<Pixels> {
     let (w, h) = (canvas.width, canvas.height);
     let main_prep = split.main();
     if main_prep.out != (w, h) {
@@ -183,10 +205,11 @@ fn draw_split(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, split: &effectcraft_rend
     }
     let encode = !main_prep.linear;
     let main = crate::adv3d::resolve_run(e, &main_prep)?;
-    let mut cv = match &main {
+    let mut cv: Pixels = match &main {
         Some(m) => crate::adv3d::finish(e, m, encode, Some(canvas)),
         None => canvas.clone(),
-    };
+    }
+    .into();
     for i in 0..split.len() {
         let Some(iso) = crate::adv3d::resolve_run(e, &split.special(i))? else { continue };
         let iso = match &main {
@@ -204,12 +227,12 @@ fn draw_split(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, split: &effectcraft_rend
             Some(m) => Some(m?),
             None => None,
         };
-        composite_iso_with(e, r, ctx, split.layer(i), iso, &mut cv, 1.0, matte3d, None, None)?;
+        composite_iso_with(e, r, ctx, split.layer(i), iso.into(), &mut cv, 1.0, matte3d, None, None)?;
     }
     Some(cv)
 }
 
-fn draw_collapsed<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, layer: &Layer, item: ItemId, canvas: &mut GpuImage) -> Option<()> {
+fn draw_collapsed<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, layer: &Layer, item: ItemId, canvas: &mut Pixels) -> Option<()> {
     let opacity = r.layer_opacity(ctx, layer);
     if opacity <= 0.0 || crate::cull::skip_matte(r, ctx, layer) {
         return Some(());
@@ -222,14 +245,15 @@ fn draw_collapsed<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, layer: &
         return Some(());
     }
     let Some((sub, nctx)) = r.collapse_into(ctx, layer, item, 1.0) else { return Some(()) };
-    let mut iso = e.zeros(canvas.width, canvas.height);
+    let (w, h) = canvas.size();
+    let mut iso: Pixels = e.zeros(w, h).into();
     draw_comp(e, &sub, &nctx, &mut iso)?;
     composite_iso(e, r, ctx, layer, iso, canvas, opacity, None)
 }
 
 /// Collapsed 2D contents are already placed in comp space before the parent
 /// effect stack. Keep that isolation resident; unsupported work keeps CPU fallback.
-fn draw_collapsed_fx<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, layer: &'a Layer, item: ItemId, canvas: &mut GpuImage) -> Option<()> {
+fn draw_collapsed_fx<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, layer: &'a Layer, item: ItemId, canvas: &mut Pixels) -> Option<()> {
     let opacity = r.layer_opacity(ctx, layer);
     if opacity <= 0.0 || crate::cull::skip_matte(r, ctx, layer) {
         return Some(());
@@ -237,9 +261,11 @@ fn draw_collapsed_fx<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, layer
     let Some((sub, nctx)) = r.collapse_into(ctx, layer, item, 1.0) else {
         return Some(());
     };
-    let mut iso = e.zeros(canvas.width, canvas.height);
+    let (w, h) = canvas.size();
+    let mut iso: Pixels = e.zeros(w, h).into();
     // collapse_into propagates the parent transform and motion-blur time chain.
     draw_comp(e, &sub, &nctx, &mut iso)?;
+    let mut iso = take_float(e, &mut iso)?;
     let pipe = r.pipe();
     if let Some(c) = pipe.from_blend() {
         iso = ops::convert(e, &iso, &c);
@@ -251,13 +277,13 @@ fn draw_collapsed_fx<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, layer
         done = ops::convert(e, &done, &c);
     }
     // Match draw_collapsed_fx: an effect that changes the canvas extent draws nothing.
-    if (done.width, done.height) != (canvas.width, canvas.height) {
+    if (done.width, done.height) != canvas.size() {
         return Some(());
     }
-    composite_iso(e, r, ctx, layer, done, canvas, opacity, None)
+    composite_iso(e, r, ctx, layer, done.into(), canvas, opacity, None)
 }
 
-fn draw_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut GpuImage) -> Option<()> {
+fn draw_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut Pixels) -> Option<()> {
     if layer.switches.adjustment {
         if draw_adjustment(e, r, ctx, layer, canvas).is_some() {
             return Some(());
@@ -266,11 +292,13 @@ fn draw_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &
     }
     if r.quality(layer) == Quality::Wireframe {
         // The layer's bounds as a one-pixel outline (the CPU's pixels).
-        *canvas = crate::adv3d::wireframe(e, canvas, &r.wireframe_pixels(ctx, layer, (canvas.width, canvas.height)));
+        let outline = r.wireframe_pixels(ctx, layer, canvas.size());
+        let below = canvas.float(e)?;
+        *canvas = crate::adv3d::wireframe(e, &below, &outline).into();
         return Some(());
     }
     let opacity = r.layer_opacity(ctx, layer);
-    if opacity <= 0.0 || crate::cull::skip_layer(r, ctx, layer, (canvas.width, canvas.height)) {
+    if opacity <= 0.0 || crate::cull::skip_layer(r, ctx, layer, canvas.size()) {
         return Some(());
     }
     if let Some(done) = draw_precomp(e, r, ctx, layer, canvas, opacity) {
@@ -292,11 +320,11 @@ fn draw_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &
     // Layer styles: exterior passes with their own modes, then the body; the layer's opacity
     // fades the whole stack; knockout and channel switches as on the CPU.
     let bl = styles::blending(ctx, layer);
-    let (w, h) = (canvas.width, canvas.height);
+    let (w, h) = canvas.size();
     // The passes draw in place once they have their own canvas; `reach` is what they changed.
     let mut reach = [0; 4];
     if r.track_matte(ctx, layer).is_some() || layer.preserve_transparency {
-        let mut iso = e.zeros(w, h);
+        let mut iso: Pixels = e.zeros(w, h).into();
         for (b, m) in &st.passes {
             reach = ops::union(reach, place_in(e, r, ctx, layer, b, &mut iso, *m, 1.0, None)?);
         }
@@ -305,16 +333,20 @@ fn draw_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &
     }
     let mut tmp = canvas.clone();
     if bl.knockout > 0 {
-        let mut k = e.zeros(w, h);
+        let mut k: Pixels = e.zeros(w, h).into();
         // Knockout keeps the canvas (× 1) where `k` is transparent.
         reach = place_in(e, r, ctx, layer, &st.content, &mut k, BlendMode::Normal, 1.0, None)?;
-        tmp = ops::knockout(e, &tmp, &k);
+        let (below, k) = (tmp.float(e)?, k.float(e)?);
+        tmp = ops::knockout(e, &below, &k).into();
     }
     for (b, m) in &st.passes {
         reach = ops::union(reach, place_in(e, r, ctx, layer, b, &mut tmp, *m, 1.0, None)?);
     }
     reach = ops::union(reach, place_in(e, r, ctx, layer, &st.body, &mut tmp, layer.blend_mode, 1.0, None)?);
-    ops::channel_mix_in(e, canvas, &tmp, bl.channels, opacity, Some(reach));
+    let tmp = tmp.float(e)?;
+    let mut out = take_float(e, canvas)?;
+    ops::channel_mix_in(e, &mut out, &tmp, bl.channels, opacity, Some(reach));
+    *canvas = out.into();
     Some(())
 }
 
@@ -323,7 +355,7 @@ fn draw_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &
 /// placed directly; the CPU path instead runs each GPU-capable effect run through an
 /// upload → kernels → readback, then uploads the result again to place it. `None`: not this
 /// kind of layer (draw it the usual way); `Some(None)`: the GPU failed.
-fn draw_resident_fx(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut GpuImage, opacity: f32) -> Option<Option<()>> {
+fn draw_resident_fx(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut Pixels, opacity: f32) -> Option<Option<()>> {
     if !layer.switches.effects
         || layer.effects().is_none_or(|f| f.children.is_empty())
         || styles::active(ctx, layer)
@@ -384,7 +416,7 @@ fn precomp_resident_enabled() -> bool {
 
 /// Ordinary plain layers retain layer-space Processed pixels. Styles and precomps
 /// keep their existing paths; keys declined by dependency analysis are not retained.
-fn draw_ordinary_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut GpuImage, opacity: f32) -> Option<Option<()>> {
+fn draw_ordinary_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut Pixels, opacity: f32) -> Option<Option<()>> {
     use effectcraft_render::cache::{Claim, GpuStage};
     if !ordinary_resident_enabled()
         || !e.can_retain_resident()
@@ -455,7 +487,7 @@ fn composite_processed(
     r: &Renderer,
     ctx: &EvalCtx,
     layer: &Layer,
-    canvas: &mut GpuImage,
+    canvas: &mut Pixels,
     opacity: f32,
     mut image: SourceImage,
 ) -> Option<Option<()>> {
@@ -473,7 +505,7 @@ fn composite_processed(
 /// kind of layer, or the nested comp needs the CPU path (masks, layer styles, proxies,
 /// overrides, frame blending, nested motion-blur sampling; see `Renderer::precomp_source`);
 /// `Some(None)`: the GPU failed.
-fn draw_precomp(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut GpuImage, opacity: f32) -> Option<Option<()>> {
+fn draw_precomp(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut Pixels, opacity: f32) -> Option<Option<()>> {
     if layer.masks().is_some_and(|m| !m.children.is_empty()) || styles::active(ctx, layer) {
         return None;
     }
@@ -498,7 +530,7 @@ fn draw_cached_precomp(
     r: &Renderer,
     ctx: &EvalCtx,
     layer: &Layer,
-    canvas: &mut GpuImage,
+    canvas: &mut Pixels,
     opacity: f32,
     source: &(Renderer<'_>, ItemId, Tick, f64),
 ) -> Option<Option<()>> {
@@ -542,7 +574,7 @@ fn draw_cached_precomp(
         let Some(src) = crate::cull::nested(e, ctx, sub, *item, *lt) else {
             return if e.g.check_health().is_ok() { None } else { Some(None) };
         };
-        prepare_processed(e, r, ctx, layer, src, *bs)?.into()
+        prepare_processed(e, r, ctx, layer, src, *bs, true)?
     };
     let result = composite_processed(e, r, ctx, layer, canvas, opacity, image.clone());
     if result == Some(Some(()))
@@ -561,7 +593,7 @@ fn draw_cached_precomp(
     result
 }
 
-fn draw_yuv_footage(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut GpuImage, opacity: f32) -> Option<Option<()>> {
+fn draw_yuv_footage(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut Pixels, opacity: f32) -> Option<Option<()>> {
     if !crate::yuv_transport_enabled() || e.g.yuv.is_none() || styles::active(ctx, layer) {
         return None;
     }
@@ -596,13 +628,19 @@ fn draw_yuv_footage(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, can
     if let Some(mask) = r.source_mask(ctx, layer, &geometry) {
         src = crate::yuv::mask(e, &src, &mask)?;
     }
-    let image = prepare_resident(e, r, ctx, layer, src, footage.scale)?;
-    let result = composite_resident(e, r, ctx, layer, canvas, opacity, image.clone().into());
+    // Native entries stay f32 (`keep_native`), so no codes here.
+    let image = prepare_resident(e, r, ctx, layer, src.into(), footage.scale, false)?;
+    let native = match &image.img {
+        Pixels::Float(img) => Some(crate::context::NativeImage { img: img.clone(), offset: image.offset, scale: image.scale }),
+        Pixels::Codes(_) => None,
+    };
+    let result = composite_resident(e, r, ctx, layer, canvas, opacity, image);
     // A video frame is kept once it is drawn again (a held frame, a paused edit, a loop), not
     // the first time: playback shows each frame once, and keeping every one (33 MB at 1080p)
     // filled the retained allowance in ~45 frames, pushing out layers that do repeat.
     if result == Some(Some(()))
         && let Some((key, token)) = cache
+        && let Some(image) = native
         && r.cache.is_some_and(|c| c.admit_repeated_gpu_content(key))
     {
         e.keep_native(footage.pixels, key, token, metadata, image);
@@ -611,42 +649,47 @@ fn draw_yuv_footage(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, can
 }
 
 #[allow(clippy::too_many_arguments)]
-fn finish_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut GpuImage, opacity: f32, src: GpuImage, bs: f64) -> Option<Option<()>> {
-    let image = prepare_resident(e, r, ctx, layer, src, bs)?;
-    composite_resident(e, r, ctx, layer, canvas, opacity, image.into())
+fn finish_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut Pixels, opacity: f32, src: Pixels, bs: f64) -> Option<Option<()>> {
+    let image = prepare_resident(e, r, ctx, layer, src, bs, true)?;
+    composite_resident(e, r, ctx, layer, canvas, opacity, image)
 }
 
-fn prepare_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, src: GpuImage, bs: f64) -> Option<crate::context::NativeImage> {
+/// `codes`: the result may be 8 bpc codes (see [`prepare_processed`]).
+fn prepare_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, src: Pixels, bs: f64, codes: bool) -> Option<SourceImage> {
     // Native YUV entries retain their historical blending-space representation.
-    let mut image = prepare_processed(e, r, ctx, layer, src, bs)?;
+    let mut image = prepare_processed(e, r, ctx, layer, src, bs, codes)?;
     if let Some(c) = r.pipe().to_blend() {
-        image.img = ops::convert(e, &image.img, &c);
+        let img = image.img.float(e)?;
+        image.img = ops::convert(e, &img, &c).into();
     }
     Some(image)
 }
 
-/// Processed slots also serve lazy CPU consumers, so they must precede to_blend.
-fn prepare_processed(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, mut src: GpuImage, bs: f64) -> Option<crate::context::NativeImage> {
+/// Processed slots also serve lazy CPU consumers, so they must precede to_blend. `codes`: an
+/// image quantised to the 8 bpc grid with no effects to run may stay (or become) codes.
+fn prepare_processed(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, mut src: Pixels, bs: f64, codes: bool) -> Option<SourceImage> {
     let pipe = r.pipe();
+    let effects = layer.switches.effects && layer.effects().is_some_and(|f| !f.children.is_empty());
     // `masked_source` quantises a non-solid source to the project's depth.
     if let Some(l) = pipe.levels {
-        src = ops::quantize(e, &src, l);
+        src = ops::quantize_px(e, &src, l, codes && !effects);
     }
-    let (img, offset, scale) = if layer.switches.effects && layer.effects().is_some_and(|f| !f.children.is_empty()) {
+    let (img, offset, scale) = if effects {
         // Effects run in effect space (0.7.0): from the layer bounds' corner.
         let o = ctx.effect_bounds(layer).1;
+        let src = src.float(e)?;
         let mut fx = crate::effects::GpuFx::new(e, src, [o[0] * bs, o[1] * bs], bs, pipe.levels);
         r.run_layer_effects_on(ctx, layer, &mut fx);
         let (img, off, sc) = fx.finish()?;
-        (img, [off[0] - o[0] * sc, off[1] - o[1] * sc], sc)
+        (img.into(), [off[0] - o[0] * sc, off[1] - o[1] * sc], sc)
     } else {
         (src, [0.0; 2], bs)
     };
-    Some(crate::context::NativeImage { img, offset, scale })
+    Some(SourceImage { img, offset, scale })
 }
 
 #[allow(clippy::too_many_arguments)]
-fn composite_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut GpuImage, opacity: f32, image: SourceImage) -> Option<Option<()>> {
+fn composite_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut Pixels, opacity: f32, image: SourceImage) -> Option<Option<()>> {
     let SourceImage { img, offset, scale } = image;
     if img.width() == 0 || img.height() == 0 {
         return Some(Some(()));
@@ -654,7 +697,8 @@ fn composite_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, c
     let pipe = r.pipe();
     let shape = Buf { img: Image { width: img.width(), height: img.height(), data: Vec::new() }, offset, scale };
     if r.track_matte(ctx, layer).is_some() || layer.preserve_transparency {
-        let mut iso = e.zeros(canvas.width, canvas.height);
+        let (w, h) = canvas.size();
+        let mut iso: Pixels = e.zeros(w, h).into();
         let Some(reach) = place_src_in(e, r, ctx, layer, &shape, img, &mut iso, BlendMode::Normal, 1.0, None) else {
             return Some(None);
         };
@@ -667,21 +711,22 @@ fn composite_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, c
 /// resident on the GPU (non-GPU effects read back, run on the CPU and upload), and the result
 /// replaces the canvas inside the layer's footprint × track matte × opacity. `None` = draw it
 /// on the CPU.
-fn draw_adjustment(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut GpuImage) -> Option<()> {
+fn draw_adjustment(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut Pixels) -> Option<()> {
     // A track matte or a blending mode on the adjustment layer is applied by the CPU path.
     if r.track_matte(ctx, layer).is_some() || layer.blend_mode != BlendMode::Normal {
         return None;
     }
     let opacity = r.layer_opacity(ctx, layer);
     let Some(foot) = r.adjustment_footprint(ctx, layer) else { return Some(()) };
-    let (w, h) = (canvas.width, canvas.height);
+    let (w, h) = canvas.size();
     let matte = place(e, r, ctx, layer, &foot, &e.zeros(w, h), BlendMode::Normal, 1.0, None)?;
     let matte = track_matte(e, r, ctx, layer, matte, None)?;
     let pipe = r.pipe();
+    let comp = canvas.float(e)?;
     // Effects run in the working space, not the linear blending space.
     let below = match pipe.from_blend() {
-        Some(c) => ops::convert(e, canvas, &c),
-        None => canvas.clone(),
+        Some(c) => ops::convert(e, &comp, &c),
+        None => comp.clone(),
     };
     let mut fx = crate::effects::GpuFx::new(e, below, [0.0; 2], r.opts.scale, pipe.levels);
     r.run_effects_on(ctx, layer, true, &mut fx);
@@ -696,34 +741,26 @@ fn draw_adjustment(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canv
     if let Some(c) = pipe.to_blend() {
         adjusted = ops::convert(e, &adjusted, &c);
     }
-    *canvas = ops::adjust_mix(e, canvas, &adjusted, &matte, opacity);
+    *canvas = ops::adjust_mix(e, &comp, &adjusted, &matte, opacity).into();
     Some(())
 }
 
-fn composite_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, buf: &Arc<Buf>, canvas: &mut GpuImage, opacity: f32) -> Option<()> {
+fn composite_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, buf: &Arc<Buf>, canvas: &mut Pixels, opacity: f32) -> Option<()> {
     let matte = r.track_matte(ctx, layer).is_some();
     if !matte && !layer.preserve_transparency {
         // The comp is quantised after the layer (8/16 bpc) in the same pass.
         return place_in(e, r, ctx, layer, buf, canvas, layer.blend_mode, opacity, r.pipe().levels).map(|_| ());
     }
     // Render in isolation, then matte / preserve transparency, then blend.
-    let mut iso = e.zeros(canvas.width, canvas.height);
+    let (w, h) = canvas.size();
+    let mut iso: Pixels = e.zeros(w, h).into();
     let reach = place_in(e, r, ctx, layer, buf, &mut iso, BlendMode::Normal, 1.0, None)?;
     composite_iso(e, r, ctx, layer, iso, canvas, opacity, Some(reach))
 }
 
 /// Track matte / Preserve Transparency on an isolated layer render, then blend.
 #[allow(clippy::too_many_arguments)]
-fn composite_iso(
-    e: &mut Enc,
-    r: &Renderer,
-    ctx: &EvalCtx,
-    layer: &Layer,
-    iso: GpuImage,
-    canvas: &mut GpuImage,
-    opacity: f32,
-    reach: Option<Bounds>,
-) -> Option<()> {
+fn composite_iso(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, iso: Pixels, canvas: &mut Pixels, opacity: f32, reach: Option<Bounds>) -> Option<()> {
     composite_iso_with(e, r, ctx, layer, iso, canvas, opacity, None, r.pipe().levels, reach)
 }
 
@@ -737,18 +774,19 @@ fn composite_iso_with(
     r: &Renderer,
     ctx: &EvalCtx,
     layer: &Layer,
-    mut iso: GpuImage,
-    canvas: &mut GpuImage,
+    mut iso: Pixels,
+    canvas: &mut Pixels,
     opacity: f32,
     matte_img: Option<GpuImage>,
     levels: Option<f32>,
     reach: Option<Bounds>,
 ) -> Option<()> {
     if let Some((m, kind)) = r.track_matte(ctx, layer) {
-        let mimg = match matte_img.filter(|i| (i.width, i.height) == (canvas.width, canvas.height)) {
+        let (w, h) = canvas.size();
+        let mimg = match matte_img.filter(|i| (i.width, i.height) == (w, h)) {
             Some(i) => i,
             None => {
-                let mut mimg = e.zeros(canvas.width, canvas.height);
+                let mut mimg = e.zeros(w, h);
                 if m.is_active_at(ctx.time)
                     && let Some(mb) = r.matte_buf(ctx, m)
                 {
@@ -758,9 +796,11 @@ fn composite_iso_with(
                 mimg
             }
         };
-        ops::matte_in(e, &mut iso, &mimg, kind, reach);
+        let mut matted = take_float(e, &mut iso)?;
+        ops::matte_in(e, &mut matted, &mimg, kind, reach);
+        iso = matted.into();
     }
-    ops::blend_full_in(e, canvas, &iso, layer.blend_mode, opacity, layer.id.0 as u32, levels, layer.preserve_transparency, reach);
+    ops::blend_px_in(e, canvas, &iso, layer.blend_mode, opacity, layer.id.0 as u32, levels, layer.preserve_transparency, reach);
     Some(())
 }
 
@@ -799,9 +839,9 @@ fn place(
     opacity: f32,
     levels: Option<f32>,
 ) -> Option<GpuImage> {
-    let mut out = target.clone();
+    let mut out: Pixels = target.clone().into();
     place_in(e, r, ctx, layer, buf, &mut out, mode, opacity, levels)?;
-    Some(out)
+    out.float(e)
 }
 
 /// [`place`] onto `target` itself (in place over the layer's bounds when the encoder owns it:
@@ -814,7 +854,7 @@ fn place_in(
     ctx: &EvalCtx,
     layer: &Layer,
     buf: &Arc<Buf>,
-    target: &mut GpuImage,
+    target: &mut Pixels,
     mode: BlendMode,
     opacity: f32,
     levels: Option<f32>,
@@ -835,7 +875,7 @@ fn place_src_in(
     layer: &Layer,
     buf: &Buf,
     src: Pixels,
-    target: &mut GpuImage,
+    target: &mut Pixels,
     mode: BlendMode,
     opacity: f32,
     levels: Option<f32>,
@@ -843,17 +883,18 @@ fn place_src_in(
     let pl = r.placement(ctx, layer, buf);
     // A stencil or silhouette mode changes the canvas outside the layer too, and so does
     // quantising a canvas not yet quantised to `levels`.
-    let all = (32..=35).contains(&ops::mode_id(mode)) || (levels.is_some() && target.levels != levels);
-    let everything = [0, 0, target.width, target.height];
+    let all = (32..=35).contains(&ops::mode_id(mode)) || (levels.is_some() && target.levels() != levels);
+    let (w, h) = target.size();
+    let everything = [0, 0, w, h];
     if let [m] = pl.matrices.as_slice() {
-        let reach = ops::warp_bounds((target.width, target.height), src.size(), m);
-        ops::warp_q_in(e, target, &src, m, pl.sampling, mode, opacity, pl.seed, None, levels);
+        let reach = ops::warp_bounds((w, h), src.size(), m);
+        ops::warp_px_in(e, target, &src, m, pl.sampling, mode, opacity, pl.seed, None, levels);
         return Some(if all { everything } else { reach });
     }
     // Motion blur: the sub-samples summed in place on their own canvas, then blended.
     let k = 1.0 / pl.matrices.len() as f32;
-    let mut acc = e.zeros(target.width, target.height);
+    let mut acc = e.zeros(w, h);
     let reach = ops::warp_accumulate_in(e, &mut acc, &src, &pl.matrices, pl.sampling, k);
-    ops::blend_full_in(e, target, &acc, mode, opacity, pl.seed, levels, false, Some(reach));
+    ops::blend_px_in(e, target, &acc.into(), mode, opacity, pl.seed, levels, false, Some(reach));
     Some(if all { everything } else { reach })
 }

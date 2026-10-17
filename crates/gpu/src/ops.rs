@@ -476,6 +476,7 @@ pub(crate) fn blend_full_preserve(
 /// There the full pass stores the canvas pixel back, quantised to `levels`, so in place is
 /// exact unless the mode is a stencil (which blends even transparent pixels) or the canvas
 /// isn't already quantised to `levels` (as [`warp_q_in`]). `dst` stays f32 (see [`blend_px_in`]).
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn blend_full_in(
     e: &mut Enc,
