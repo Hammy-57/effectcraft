@@ -97,6 +97,7 @@ mod readback;
 #[cfg(feature = "profile")]
 mod timestamps;
 pub mod traffic_light;
+pub mod vram;
 mod walk;
 
 use std::sync::Arc;
@@ -379,6 +380,7 @@ impl Gpu {
         ctx.check_health()?;
         #[cfg(not(target_arch = "wasm32"))]
         {
+            let inflight = ctx.enter_render();
             let scope = ctx.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
             let internal = ctx.device.push_error_scope(wgpu::ErrorFilter::Internal);
             // Some allocation failures (Adreno's ERROR_INITIALIZATION_FAILED) surface as
@@ -398,6 +400,11 @@ impl Gpu {
                 }
             };
             if result.is_err() {
+                // Out of memory (or a failed allocation reported otherwise) on a device that
+                // still works: fewer renders at once from now on (CR1).
+                if ctx.check_health().is_ok() {
+                    ctx.render_out_of_memory(inflight.in_flight());
+                }
                 ctx.clear_uploads();
             }
             result
@@ -434,6 +441,10 @@ impl Accelerator for Gpu {
 
     fn available(&self) -> bool {
         self.ctx.check_health().is_ok()
+    }
+
+    fn max_inflight(&self) -> Option<usize> {
+        self.ctx.max_inflight()
     }
 
     fn comp_frame(&self, r: &Renderer, comp: ItemId, t: Tick) -> Option<Image> {

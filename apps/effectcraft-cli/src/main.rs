@@ -155,10 +155,13 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
                                            local endpoint for the EffectCraft Figma plug-in: imports what it
                                            sends into the running app (file.importFigma); prints the pairing code
 options: --project F.ecproj | --demo | --empty   --save | --save-as F   --bridge PORT   --json   --gpu
+         --frame-threads N  render at most N frames at once (viewer frame pool, export batches;
+                            default one per core, 2-16; also EFFECTCRAFT_FRAME_THREADS)
 <comp>: id or name, '-' = active comp; <layer>: id, '#n' or name; <value>: JSON or bare string";
 
 /// Options that take a value.
 const VALUED: &[&str] = &[
+    "--frame-threads",
     "--trace",
     "--profile-offset",
     "--rt-inflight",
@@ -350,6 +353,12 @@ fn main() {
     let json_out = args.flag("--json");
     if args.pos.is_empty() {
         fail_usage("missing subcommand");
+    }
+    // CR1: before any frame pool is made.
+    match args.num("--frame-threads") {
+        Ok(Some(n)) if n >= 1.0 && n.fract() == 0.0 => effectcraft_render::concurrency::set_frame_threads(n as usize),
+        Ok(None) => {}
+        _ => fail_usage("--frame-threads: expected a whole number of at least 1"),
     }
     // Hardware ProRes decoding for previews (the app's Settings ▸ Previews ▸ Hardware ProRes
     // Decoding; a CLI session turns it on with `bench --hw-prores`). Exports always decode exactly.

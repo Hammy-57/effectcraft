@@ -42,6 +42,7 @@ mod landing;
 mod property_reuse;
 #[cfg(not(target_arch = "wasm32"))]
 mod resident;
+mod vram;
 
 /// Comp identities (and the project snapshots behind them) the RAM preview keeps frames of.
 const MAX_KEEPERS: usize = 64;
@@ -607,6 +608,8 @@ pub struct Frames {
     #[cfg(not(target_arch = "wasm32"))]
     content_key_jobs: Arc<Mutex<ContentKeyJobs>>,
     gpu_retired: Arc<AtomicBool>,
+    /// How many GPU frames render at once (CR1, [`vram`]).
+    gpu_gate: Arc<vram::Gate>,
     /// Bumped by [`Frames::clear`]: frames asked for before are dropped when they finish.
     epoch: Arc<AtomicU64>,
     /// [`comp_content`] identities by (revision, preview epoch, comp), with the project that keeps an identity
@@ -655,15 +658,16 @@ fn remember<K: Copy>(v: &mut Vec<(FrameKey, K, Vec<i64>)>, series: FrameKey, k: 
 impl Default for Frames {
     fn default() -> Self {
         #[cfg(not(target_arch = "wasm32"))]
-        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 16);
+        let threads = effectcraft_engine::render::concurrency::frame_threads(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4));
+        let gpu_gate = Arc::new(vram::Gate::default());
         Frames {
             cache: Arc::new(Mutex::new(Cache { map: HashMap::new(), order: Order::default(), protected: HashMap::new(), playhead: None, bytes: 0, gpu_bytes: 0, budget: 3 << 30, gpu_budget: GPU_BUDGET, generation: 0, prints: fingerprint::Prints::default() })),
             inflight: Arc::new(Mutex::new(HashSet::new())),
             failed: Failed::default(),
             #[cfg(not(target_arch = "wasm32"))]
-            queue: Arc::new(Mutex::new(Queue { threads, ..Queue::default() })),
+            queue: Arc::new(Mutex::new(Queue { threads, gate: gpu_gate.clone(), ..Queue::default() })),
             #[cfg(target_arch = "wasm32")]
-            queue: Arc::new(Mutex::new(Queue::default())),
+            queue: Arc::new(Mutex::new(Queue { gate: gpu_gate.clone(), ..Queue::default() })),
             #[cfg(not(target_arch = "wasm32"))]
             // A panicking job would abort the whole process (rayon's default for `spawn`): log it
             // and lose only that frame (the panic hook has logged the message).
@@ -683,6 +687,7 @@ impl Default for Frames {
             #[cfg(not(target_arch = "wasm32"))]
             content_key_jobs: Arc::default(),
             gpu_retired: Arc::default(),
+            gpu_gate,
             epoch: Arc::default(),
             identities: Mutex::default(),
             bases: Mutex::default(),
@@ -704,23 +709,32 @@ impl Default for Frames {
 /// the layer cache's memory budget (Memory & CPU settings): a 4K comp (~530 MB a frame) renders
 /// two frames at once on the default 1 GB, an HD comp eight. At least one.
 ///
-/// A frame the GPU composites keeps those working frames in video memory, not RAM: it may also
-/// run as many as fit in [`gpu_working_budget`], up to `threads` (the frame pool's size).
+/// A frame the GPU composites keeps those working frames in video memory, not RAM: on a discrete
+/// GPU as many run as its video memory holds ([`vram::Gate::limit`], CR1), up to `threads` (the
+/// frame pool's size); on an integrated one as many as fit in [`gpu_working_budget`] (or the RAM
+/// cap, if more), under the ceiling running out of memory set.
+#[cfg(test)]
 fn max_running(job: &Job, threads: usize) -> usize {
+    max_running_gated(job, threads, &vram::Gate::default())
+}
+
+fn max_running_gated(job: &Job, threads: usize, gate: &vram::Gate) -> usize {
     let (w, h) = job.src.project.comp(job.comp).map_or((0, 0), |c| (c.width, c.height));
     let s = job.opts.scale.clamp(0.01, 4.0);
     let frame = ((w as f64 * s).ceil() * (h as f64 * s).ceil() * 16.0 * 4.0).max(1.0);
     let cpu = ((job.src.layer_cache.budget() as f64 / frame) as usize).max(1);
     let on_gpu = |g: &Gpu| job.on_gpu.unwrap_or_else(|| composites_on_gpu(job, g));
     match job.src.gpu.as_ref().filter(|g| on_gpu(g)) {
-        Some(g) => cpu.max(((gpu_working_budget(g) as f64 / frame) as usize).min(threads)),
+        Some(g) => gate
+            .limit(g, frame, threads)
+            .unwrap_or_else(|| cpu.max(((gpu_working_budget(g) as f64 / frame) as usize).min(threads)).min(gate.ceiling())),
         None => cpu,
     }
 }
 
-/// Video memory the GPU frames rendering at once may take. wgpu can't tell how much video memory
-/// there is; the largest buffer the device allows follows it (Metal's is a fraction of the unified
-/// RAM), between 1 and 4 GiB.
+/// Video memory the GPU frames rendering at once may take on an integrated GPU (unified memory).
+/// wgpu can't tell how much memory there is; the largest buffer the device allows follows it
+/// (Metal's is a fraction of the unified RAM), between 1 and 4 GiB.
 fn gpu_working_budget(g: &Gpu) -> u64 {
     g.device().limits().max_buffer_size.clamp(1 << 30, 4 << 30)
 }
@@ -904,6 +918,7 @@ impl Frames {
     /// cannot restore an invalid texture after this removal.
     pub fn retire_gpu(&self) {
         self.gpu_retired.store(true, Ordering::Release);
+        self.gpu_gate.retired();
         #[cfg(not(target_arch = "wasm32"))]
         self.resident.set(false);
         self.adapt_playback(None);
@@ -923,6 +938,7 @@ impl Frames {
     /// RT10e: a new GPU compositor replaces a retired one (the shared-device compositor's
     /// fallback to one on a device of its own): GPU frames are kept again.
     pub fn revive_gpu(&self) {
+        self.gpu_gate.revived();
         self.gpu_retired.store(false, Ordering::Release);
     }
 
@@ -1136,6 +1152,7 @@ impl Frames {
             "running": running,
             "landing": q.landing,
             "parked": q.parked,
+            "gpu": q.gate.state(),
             "urgentRunning": q.urgent_running,
             "inflight": self.inflight(),
             "layerCacheWaitTimeouts": effectcraft_render::cache::wait_timeouts(),
@@ -1497,6 +1514,7 @@ impl Frames {
             playback_budget: self.playback_budget.clone(),
             content_keys: self.content_keys.clone(),
             gpu_retired: self.gpu_retired.clone(),
+            gpu_gate: self.gpu_gate.clone(),
             epoch: self.epoch.clone(),
             #[cfg(not(target_arch = "wasm32"))]
             pool: self.pool.clone(),
@@ -1652,6 +1670,7 @@ struct Worker {
     playback_budget: Arc<Mutex<crate::playback_budget::Budget>>,
     content_keys: ContentKeys,
     gpu_retired: Arc<AtomicBool>,
+    gpu_gate: Arc<vram::Gate>,
     epoch: Arc<AtomicU64>,
     /// The pool frames render on (`None`: rayon's global pool).
     #[cfg(not(target_arch = "wasm32"))]
@@ -2141,6 +2160,7 @@ impl Worker {
             return;
         }
         log::warn!("the GPU ran out of memory ({e}); the frame renders on the CPU and fewer GPU frames are kept");
+        self.gpu_gate.out_of_memory();
         if let Ok(mut c) = self.cache.lock() {
             c.gpu_out_of_memory();
         }
@@ -2207,7 +2227,8 @@ impl Worker {
                 // RT10e: the frame stays a texture egui draws (the compositor is on its device).
                 #[cfg(not(target_arch = "wasm32"))]
                 let resident = self.resident.on() && !job.disk_only;
-                match g.within_memory(|| {
+                let entered = self.gpu_gate.enter(g);
+                let attempt = g.within_memory(|| {
                     let f = g.render_display(&r, job.comp, job.t)?;
                     #[cfg(target_arch = "wasm32")]
                     {
@@ -2230,7 +2251,11 @@ impl Worker {
                         let image = display_color_image(f.width, f.height, &bytes)?;
                         Some(Rendered::Image(FrameImage::Cpu(Arc::new(image))))
                     }
-                }) {
+                });
+                if matches!(attempt, Ok(Some(_))) {
+                    self.gpu_gate.finished(&entered);
+                }
+                match attempt {
                     Ok(Some(Rendered::Landing)) => {
                         if g.context().check_health().is_err() && self.unland(flight) {
                             return self.render_job(job, false, None);
@@ -2287,8 +2312,12 @@ impl Worker {
         }
         if let Some(g) = gpu {
             // The GPU composites and the frame is read back.
+            let entered = self.gpu_gate.enter(g);
             return match g.within_memory(|| r.comp_frame(job.comp, job.t)) {
-                Ok(img) => Rendered::Image(FrameImage::Cpu(Arc::new(to_color_image(&img)))),
+                Ok(img) => {
+                    self.gpu_gate.finished(&entered);
+                    Rendered::Image(FrameImage::Cpu(Arc::new(to_color_image(&img))))
+                }
                 Err(e) => {
                     self.gpu_attempt_failed(g, &e);
                     self.render_job(job, false, None)
@@ -2367,11 +2396,13 @@ struct Queue {
     playhead: Option<Playhead>,
     /// Threads of the frame pool: GPU frames never run more at once.
     threads: usize,
+    /// How many GPU frames render at once (CR1).
+    gate: Arc<vram::Gate>,
 }
 
 impl Queue {
     fn can_start(&self, job: &Job) -> bool {
-        let limit = max_running(job, self.threads);
+        let limit = max_running_gated(job, self.threads, &self.gate);
         let rendering = self.running.len().saturating_sub(self.landing);
         if job.urgent { self.urgent_running == 0 && rendering <= limit } else { rendering < limit }
     }
@@ -2779,6 +2810,66 @@ mod tests {
         picks.record(k, true, 10.0);
         assert!(!gpu_pick(&auto, false), "then measures the CPU");
         assert_eq!(cap(&auto, false), 2, "and that frame gets the CPU's cap");
+    }
+
+    /// CR1: a GPU frame that runs out of video memory with eight GPU frames rendering leaves at
+    /// most four at once; when the compositor then fails for good, its replacement keeps that
+    /// ceiling (sixteen 1080p frames at once filled a 20 GB card and the preview stayed on the CPU
+    /// until a restart).
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn out_of_video_memory_halves_the_gpu_frames_and_a_replacement_keeps_the_ceiling() {
+        use effectcraft_engine::Session;
+        use effectcraft_engine::render::Backend;
+        use serde_json::json;
+        let Some(gpu) = Gpu::headless() else {
+            assert!(std::env::var("EFFECTCRAFT_REQUIRE_GPU").as_deref() != Ok("1"), "GPU required");
+            return;
+        };
+        let mut s = Session::default();
+        let hd = ItemId(s.execute("comp.new", json!({"name": "C", "width": 1920, "height": 1080, "duration": 1})).unwrap()["comp"].as_u64().unwrap());
+        let job = Job {
+            key: key(hd.0, 0, 0),
+            src: RenderSource {
+                freeze_feedback: Default::default(),
+                project: s.project.clone(),
+                footage: Arc::new(effectcraft_engine::render::NoFootage),
+                expr: None,
+                layer_cache: Arc::new(LayerCache::new(64 << 20)),
+                gpu: Some(gpu.clone()),
+                gpu_display: true,
+                disk: None,
+            },
+            comp: hd,
+            t: Tick::ZERO,
+            opts: RenderOpts { backend: Backend::Gpu, ..Default::default() },
+            urgent: false,
+            disk_only: false,
+            seq: 0,
+            epoch: 0,
+            on_gpu: Some(true),
+            retry: None,
+            cancel: Arc::default(),
+            print: None,
+        };
+        let f = Frames::default();
+        let w = f.worker();
+        let cap = || max_running_gated(&job, 16, &f.gpu_gate);
+        let before = cap();
+        // Eight GPU frames render; one runs out of memory (the device itself still works).
+        let rendering: Vec<_> = (0..8).map(|_| f.gpu_gate.enter(&gpu)).collect();
+        w.gpu_attempt_failed(&gpu, "Out of Memory");
+        assert!(cap() <= 4, "at most half as many GPU frames at once: {} (was {before})", cap());
+        assert_eq!(f.cache.lock().unwrap().gpu_budget, GPU_BUDGET / 2, "and fewer GPU frames kept");
+        assert_eq!(f.queue_state()["gpu"][0], 4);
+        drop(rendering);
+        // The device then fails for good: the replacement compositor starts at the same ceiling.
+        f.retire_gpu();
+        assert!(f.gpu_retired.load(Ordering::Acquire));
+        f.revive_gpu();
+        assert!(!f.gpu_retired.load(Ordering::Acquire), "GPU frames are kept again");
+        assert!(cap() <= 4, "the replacement keeps the ceiling: {}", cap());
+        assert!(cap() >= 1);
     }
 
     fn key(content: u64, frame: i64, opts: u64) -> FrameKey {

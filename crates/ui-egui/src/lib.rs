@@ -42,6 +42,10 @@ const SCREENSHOT_TIMEOUT_S: f64 = 4.0;
 /// offers egui's (`share`, RT10e: then with the window's traffic light, see [`zero_copy`]).
 /// `off_window`: when the window's adapter is OpenGL or a CPU device, the compositor may use a
 /// better adapter next to it (frames then reach the window through the CPU).
+/// Compositors set up again after failing on a device of their own, at most (CR1): a device that
+/// keeps failing composites on the CPU after that.
+const MAX_GPU_REBUILDS: u8 = 3;
+
 fn compositor_gpu(
     adapter: &eframe::wgpu::Adapter,
     device: eframe::wgpu::Device,
@@ -453,6 +457,10 @@ pub struct EffectcraftApp {
     gpu_startup_key: Option<(u64, effectcraft_project::ItemId)>,
     gpu_failures: Option<gpu_failure::GpuFailureBridge>,
     gpu_failure_applied: Option<bool>,
+    /// CR1: compositors set up again after a failure on a device of their own (at most
+    /// [`MAX_GPU_REBUILDS`]), and whether the next [`Self::init_gpu`] replaces a failed one.
+    gpu_rebuilds: u8,
+    gpu_rebuilding: bool,
     /// The graphics device was lost and the window is closing (see `close_after_device_loss`);
     /// `true` keeps crash recovery for the next launch.
     device_lost_close: Option<bool>,
@@ -569,6 +577,8 @@ impl EffectcraftApp {
             gpu_startup_key: None,
             gpu_failures: None,
             gpu_failure_applied: None,
+            gpu_rebuilds: 0,
+            gpu_rebuilding: false,
             device_lost_close: None,
             dialog_answers: std::sync::mpsc::channel(),
             command_inbox: None,
@@ -900,15 +910,20 @@ impl EffectcraftApp {
     fn apply_gpu_failure(&mut self, ctx: &egui::Context) {
         let Some(bridge) = &self.gpu_failures else { return };
         // Readback deadlines can retire the compositor without a host device notification.
-        if let Some(gpu) = &self.gpu
-            && let Err(reason) = gpu.context().check_health()
-        {
-            bridge.report(&reason, false);
+        let own = self.gpu.as_ref().and_then(|gpu| gpu.context().check_health().err());
+        if let Some(reason) = &own {
+            bridge.report(reason, false);
         }
-        let Some(failure) = bridge.failure() else { return };
+        let Some(mut failure) = bridge.failure() else { return };
         if self.gpu_failure_applied == Some(failure.presentation_lost) {
-            return;
+            // The bridge latches the first failure: a replacement compositor that fails too
+            // (CR1) is retired by its own health check.
+            match own.filter(|_| !failure.presentation_lost) {
+                Some(reason) => failure.reason = reason,
+                None => return,
+            }
         }
+        let had_gpu = self.gpu.is_some();
         self.gpu_failure_applied = Some(failure.presentation_lost);
         self.gpu_checked = true;
         #[cfg(not(target_arch = "wasm32"))]
@@ -949,8 +964,19 @@ impl EffectcraftApp {
         if fallback {
             self.gpu_checked = false;
         }
+        // CR1: a compositor on a device of its own (out of video memory, a readback that timed
+        // out) is set up again on a new device, with at most half as many GPU frames at once
+        // (`Frames::retire_gpu`), instead of compositing on the CPU until a restart.
+        let rebuild = had_gpu && !fallback && !failure.presentation_lost && self.gpu_rebuilds < MAX_GPU_REBUILDS;
+        if rebuild {
+            self.gpu_rebuilds += 1;
+            self.gpu_rebuilding = true;
+            self.gpu_checked = false;
+        }
         self.ui.status = if failure.presentation_lost {
             "Graphics device lost. The project is still open; presentation requires restarting the application.".into()
+        } else if rebuild {
+            "The GPU preview failed (out of video memory?); it restarts on a new device with fewer frames at once.".into()
         } else if fallback {
             "GPU frames are copied for display again after a GPU error; the GPU preview continues on a device of its own.".into()
         } else {
@@ -1008,7 +1034,8 @@ impl EffectcraftApp {
         }
         // A shared-device compositor's failure leaves the window drawing: its replacement gets a
         // device of its own (RT10e).
-        let replacing = self.zero_copy.failed && self.gpu_failures.as_ref().is_some_and(|bridge| bridge.failure().is_some_and(|f| !f.presentation_lost));
+        let replacing = (self.zero_copy.failed || self.gpu_rebuilding)
+            && self.gpu_failures.as_ref().is_some_and(|bridge| bridge.failure().is_some_and(|f| !f.presentation_lost));
         if !replacing && self.gpu_failures.as_ref().is_some_and(|bridge| bridge.failure().is_some()) {
             self.gpu_checked = true;
             #[cfg(not(target_arch = "wasm32"))]
@@ -1083,6 +1110,7 @@ impl EffectcraftApp {
                 .unwrap_or_else(|_| Err("GPU compositor setup failed: backend panicked".into()))
         };
         self.gpu_checked = true;
+        self.gpu_rebuilding = false;
         match gpu {
             Ok(g) => {
                 // A replacement on a device of its own has its own handlers; the window device's
@@ -2851,6 +2879,40 @@ mod gpu_failure_tests {
             app.handle_events(&ctx);
             assert_eq!(gpu.context().upload_stats(), (0, 0));
             assert_eq!(app.session.layer_cache.retained_stats().live_bytes, 0);
+        }
+    }
+
+    /// CR1: a compositor on a device of its own that fails (out of video memory) is set up again
+    /// on a new device next frame instead of compositing on the CPU until a restart; a
+    /// replacement that fails too is retired by its own health check (the bridge latches only
+    /// the first failure); after [`MAX_GPU_REBUILDS`] the preview stays on the CPU.
+    #[test]
+    fn a_failed_compositor_of_its_own_is_set_up_again_a_few_times() {
+        if effectcraft_gpu::Gpu::headless().is_none() {
+            assert!(std::env::var("EFFECTCRAFT_REQUIRE_GPU").as_deref() != Ok("1"), "GPU required");
+            return;
+        }
+        let mut app = EffectcraftApp::new(Session::default());
+        let ctx = egui::Context::default();
+        let bridge = gpu_failure::GpuFailureBridge::new(&ctx);
+        app.set_gpu_failure_bridge(bridge.clone());
+        for round in 0..=MAX_GPU_REBUILDS {
+            let Some(g) = effectcraft_gpu::Gpu::headless() else { return };
+            app.gpu = Some(g.clone());
+            app.session.accel = Some(Arc::new(g.clone()));
+            app.gpu_checked = true;
+            (g.context().device_failure_notifier())("uncaptured GPU error: Out of Memory".into());
+            app.apply_gpu_failure(&ctx);
+            assert!(app.gpu.is_none() && app.session.accel.is_none(), "round {round}: the failed compositor is retired");
+            if round < MAX_GPU_REBUILDS {
+                assert!(!app.gpu_checked && app.gpu_rebuilding, "round {round}: set up again next frame");
+                assert!(app.ui.status.contains("restarts on a new device"), "{}", app.ui.status);
+                // As `init_gpu` does once the replacement is up.
+                app.gpu_rebuilding = false;
+                app.frames.revive_gpu();
+            } else {
+                assert!(app.gpu_checked && !app.gpu_rebuilding, "a device that keeps failing leaves the preview on the CPU");
+            }
         }
     }
 

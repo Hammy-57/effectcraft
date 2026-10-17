@@ -189,13 +189,15 @@ pub(crate) struct Pool {
 /// outputs already share the layer owner's physical budget; retain them up to
 /// that budget on either adapter type, with the device's existing hard ceiling.
 ///
-/// `system_memory` is the machine's physical RAM in bytes (0: unknown). Integrated GPUs share
-/// it, so their working-texture pool scales with it: 128 MiB below 16 GiB (weak iGPUs, small
-/// laptops), rising linearly to [`POOL_BUDGET`] at 32 GiB and more (Apple Silicon with plenty of
-/// unified memory, where a 128 MiB pool misses on most layer sizes).
-fn cache_budgets(layer_cache: usize, integrated: bool, system_memory: u64) -> (usize, usize, u64) {
+/// `memory` is the machine's physical RAM on an integrated GPU, its video memory on a discrete
+/// one, in bytes (0: unknown). Integrated GPUs share the RAM, so their working-texture pool
+/// scales with it: 128 MiB below 16 GiB (weak iGPUs, small laptops), rising linearly to
+/// [`POOL_BUDGET`] at 32 GiB and more (Apple Silicon with plenty of unified memory, where a
+/// 128 MiB pool misses on most layer sizes). Discrete GPUs with plenty of video memory get a
+/// larger pool ([`discrete_pool_cap`]).
+fn cache_budgets(layer_cache: usize, integrated: bool, memory: u64) -> (usize, usize, u64) {
     let upload_cap = UPLOAD_BUDGET;
-    let pool_cap = if integrated { unified_pool_cap(system_memory) } else { POOL_BUDGET };
+    let pool_cap = if integrated { unified_pool_cap(memory) } else { discrete_pool_cap(memory) };
     // Keep room for one 1080p RGBA-f32 buffer even on shared memory.
     let auxiliary_cap = if integrated { 32 << 20 } else { AUX_CACHE_BUDGET };
     (layer_cache.min(upload_cap), (layer_cache / 2).min(pool_cap), ((layer_cache / 16) as u64).min(auxiliary_cap))
@@ -217,6 +219,17 @@ fn unified_pool_cap(system_memory: u64) -> usize {
     };
     usize::try_from(cap).unwrap_or(POOL_BUDGET)
 }
+
+/// The working-texture pool's cap on a discrete GPU with `vram` bytes of video memory (0:
+/// unknown; see [`cache_budgets`]): [`POOL_BUDGET`], or a sixteenth of the video memory from
+/// 12 GiB on, up to [`DISCRETE_POOL_MAX`] (CR1: 1.5 GiB on a 24 GB card, where many frames
+/// render at once and a 768 MiB pool misses).
+fn discrete_pool_cap(vram: u64) -> usize {
+    usize::try_from(vram / 16).unwrap_or(DISCRETE_POOL_MAX).clamp(POOL_BUDGET, DISCRETE_POOL_MAX)
+}
+
+/// Largest working-texture pool on a discrete GPU (see [`discrete_pool_cap`]).
+const DISCRETE_POOL_MAX: usize = 2 << 30;
 
 /// Profiling builds: `EFFECTCRAFT_RT_POOL_MB` overrides the working-texture pool's budget
 /// (measuring how much a larger pool saves; see [`GpuContext::set_cache_budget`]).
@@ -642,6 +655,14 @@ pub struct GpuContext {
     pub(crate) name: String,
     pub(crate) max_dim: u32,
     integrated: bool,
+    /// A discrete GPU (video memory of its own), and how much of it, where it can be found out
+    /// ([`crate::vram`]).
+    discrete: bool,
+    vram: Option<crate::vram::VideoMemory>,
+    /// Out-of-memory backoff (CR1): renders in flight now, and at most how many after a render
+    /// ran out of memory (`usize::MAX`: no limit yet). See [`GpuContext::max_inflight`].
+    inflight: Arc<std::sync::atomic::AtomicUsize>,
+    inflight_ceiling: std::sync::atomic::AtomicUsize,
     /// Physical RAM in bytes (0: unknown; see [`GpuContext::set_system_memory`]).
     system_memory: std::sync::atomic::AtomicU64,
     /// The layer cache budget last given to [`GpuContext::set_cache_budget`].
@@ -714,6 +735,23 @@ fn storage_tex_entry(binding: u32, format: wgpu::TextureFormat) -> wgpu::BindGro
         visibility: wgpu::ShaderStages::COMPUTE,
         ty: wgpu::BindingType::StorageTexture { access: wgpu::StorageTextureAccess::WriteOnly, format, view_dimension: wgpu::TextureViewDimension::D2 },
         count: None,
+    }
+}
+
+/// Counts a render out of [`GpuContext::enter_render`]'s in-flight count.
+pub(crate) struct InflightGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+impl InflightGuard {
+    /// Renders in flight now, this one included.
+    pub(crate) fn in_flight(&self) -> usize {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        // Paired with `enter_render`'s increment: never below zero.
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
 
@@ -1039,7 +1077,8 @@ impl GpuContext {
         let uniform_stride = PARAMS_SIZE.div_ceil(align).saturating_mul(align);
         let max_dim = device.limits().max_texture_dimension_2d;
         let integrated = info.device_type == wgpu::DeviceType::IntegratedGpu;
-        let (upload_budget, pool_budget, auxiliary_budget) = cache_budgets(UPLOAD_BUDGET, integrated, 0);
+        let vram = if integrated { None } else { crate::vram::dedicated_memory(&info) };
+        let (upload_budget, pool_budget, auxiliary_budget) = cache_budgets(UPLOAD_BUDGET, integrated, vram.map_or(0, |m| m.total));
         let yuv = match crate::yuv::Pipelines::new(adapter, &device) {
             Ok(p) => Some(p),
             Err(reason) => {
@@ -1073,6 +1112,10 @@ impl GpuContext {
             mips: Default::default(),
             pool: Arc::new(Mutex::new(Pool { budget: Some(pool_budget), ..Default::default() })),
             integrated,
+            discrete: info.device_type == wgpu::DeviceType::DiscreteGpu,
+            vram,
+            inflight: Arc::default(),
+            inflight_ceiling: std::sync::atomic::AtomicUsize::new(usize::MAX),
             system_memory: std::sync::atomic::AtomicU64::new(0),
             layer_budget: std::sync::atomic::AtomicUsize::new(UPLOAD_BUDGET),
             upload_limit: std::sync::atomic::AtomicUsize::new(0),
@@ -1090,6 +1133,52 @@ impl GpuContext {
             deferred: None,
             readbacks,
         })
+    }
+
+    /// An integrated GPU (its memory is the machine's RAM).
+    pub fn integrated(&self) -> bool {
+        self.integrated
+    }
+
+    /// A discrete GPU: video memory of its own.
+    pub fn discrete(&self) -> bool {
+        self.discrete
+    }
+
+    /// Video memory of a discrete GPU (total, and free when the device was made), where it can
+    /// be found out (CR1, [`crate::vram`]).
+    pub fn video_memory(&self) -> Option<crate::vram::VideoMemory> {
+        self.vram
+    }
+
+    /// Device memory wgpu's allocator holds for this device now, in bytes (Vulkan and Direct3D
+    /// 12; `None` elsewhere). Walks every allocation: not for every dispatch.
+    pub fn device_bytes(&self) -> Option<u64> {
+        self.device.generate_allocator_report().map(|r| r.total_reserved_bytes)
+    }
+
+    /// At most how many renders should be in flight at once on this device, after one ran out
+    /// of memory: half as many as were in flight then, each time (at least one). `None` until
+    /// then (CR1; an export's GPU frames in flight follow it).
+    pub fn max_inflight(&self) -> Option<usize> {
+        let n = self.inflight_ceiling.load(std::sync::atomic::Ordering::Relaxed);
+        (n != usize::MAX).then_some(n)
+    }
+
+    /// A render enters the device ([`GpuContext::max_inflight`]); the guard counts it out.
+    pub(crate) fn enter_render(&self) -> InflightGuard {
+        self.inflight.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        InflightGuard(self.inflight.clone())
+    }
+
+    /// A render ran out of memory with `in_flight` renders on the device (itself included):
+    /// at most half as many from now on.
+    pub(crate) fn render_out_of_memory(&self, in_flight: usize) {
+        let half = (in_flight / 2).max(1);
+        let before = self.inflight_ceiling.fetch_min(half, std::sync::atomic::Ordering::AcqRel);
+        if half < before {
+            log::warn!("gpu: out of memory with {in_flight} renders in flight; at most {half} from now on");
+        }
     }
 
     /// Whether this context has observed a readback timeout or device failure.
@@ -1324,6 +1413,7 @@ impl GpuContext {
             // Match eframe's backend override so CLI and headless acceptance tests
             // exercise the backend requested for the native viewer.
             desc.backends = wgpu::Backends::from_env().unwrap_or(desc.backends);
+            desc.memory_budget_thresholds = crate::vram::memory_budget_thresholds();
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -1352,6 +1442,7 @@ impl GpuContext {
         let backends = wgpu::Backends::VULKAN | wgpu::Backends::METAL | wgpu::Backends::DX12;
         let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
         desc.backends = backends;
+        desc.memory_budget_thresholds = crate::vram::memory_budget_thresholds();
         let instance = wgpu::Instance::new(desc);
         let adapters = instance.enumerate_adapters(backends).await;
         let kinds: Vec<_> = adapters.iter().map(|a| a.get_info()).map(|i| (i.backend, i.device_type)).collect();
@@ -1815,7 +1906,8 @@ impl GpuContext {
     pub fn set_cache_budget(&self, layer_cache: usize) {
         use std::sync::atomic::Ordering::Relaxed;
         self.layer_budget.store(layer_cache, Relaxed);
-        let (upload, pool, auxiliary) = cache_budgets(layer_cache, self.integrated, self.system_memory.load(Relaxed));
+        let memory = if self.integrated { self.system_memory.load(Relaxed) } else { self.vram.map_or(0, |m| m.total) };
+        let (upload, pool, auxiliary) = cache_budgets(layer_cache, self.integrated, memory);
         let limit = self.upload_limit.load(Relaxed);
         let upload = if limit == 0 { upload } else { upload.min(limit) };
         let pool = pool_budget_override().unwrap_or(pool);
@@ -3134,6 +3226,22 @@ mod upload_budget_tests {
         assert_eq!(pool(usize::MAX, false, 8 * GIB), POOL_BUDGET);
         // Scratch caches keep their unified-memory caps.
         assert_eq!(cache_budgets(usize::MAX, true, 64 * GIB).2, 32 << 20);
+    }
+
+    /// CR1: a discrete GPU with plenty of video memory gets a larger pool (a sixteenth of it, up
+    /// to 2 GiB); unknown or small video memory keeps [`POOL_BUDGET`]; the layer budget still
+    /// bounds it.
+    #[test]
+    fn discrete_pool_cap_scales_with_video_memory() {
+        const GIB: u64 = 1 << 30;
+        let pool = |layer: usize, vram: u64| cache_budgets(layer, false, vram).1;
+        assert_eq!(pool(usize::MAX, 0), POOL_BUDGET);
+        assert_eq!(pool(usize::MAX, 8 * GIB), POOL_BUDGET);
+        assert_eq!(pool(usize::MAX, 12 * GIB), POOL_BUDGET);
+        assert_eq!(pool(usize::MAX, 24 * GIB), 1536 << 20);
+        assert_eq!(pool(usize::MAX, 48 * GIB), DISCRETE_POOL_MAX);
+        assert_eq!(pool(usize::MAX, u64::MAX), DISCRETE_POOL_MAX);
+        assert_eq!(pool(1 << 30, 24 * GIB), 512 << 20);
     }
 
     #[test]
