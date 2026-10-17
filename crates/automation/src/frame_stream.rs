@@ -300,7 +300,8 @@ struct Chunk {
     started: Instant,
     frames: Vec<Option<(u32, u32, Vec<u8>)>>,
     left: usize,
-    failed: bool,
+    /// Why a frame of it failed.
+    failed: Option<String>,
     /// The lead when it started (seconds): encode with more threads when short.
     lead: f64,
 }
@@ -622,7 +623,7 @@ impl Shared {
             started: Instant::now(),
             frames: (0..count).map(|_| None).collect(),
             left: count as usize,
-            failed: false,
+            failed: None,
             lead,
         }));
         for slot in 0..count as usize {
@@ -660,22 +661,22 @@ impl Shared {
             let opts = RenderOpts { scale: base * f64::from(scale), ..opts };
             let rendered = self.host.render.render(&RenderJob { project: &project, comp, time: job.time, opts, cache: &self.host.cache });
             let frame = match rendered {
-                Ok((Rendered::Image(img), _)) => Some((img.width, img.height, remote_encode::rgba8_premultiplied_par(&img))),
-                Ok((Rendered::Rgba8 { width, height, bytes }, _)) => Some((width, height, bytes)),
+                Ok((Rendered::Image(img), _)) => Ok((img.width, img.height, remote_encode::rgba8_premultiplied_par(&img))),
+                Ok((Rendered::Rgba8 { width, height, bytes }, _)) => Ok((width, height, bytes)),
                 Err(e) => {
                     self.log(&format!("frame at {:.3} s: {e}", job.time.seconds()));
-                    None
+                    Err(e)
                 }
             };
             let complete = {
                 let mut c = lock(&job.chunk);
                 match frame {
-                    Some(f) => {
+                    Ok(f) => {
                         if let Some(s) = c.frames.get_mut(job.slot) {
                             *s = Some(f);
                         }
                     }
-                    None => c.failed = true,
+                    Err(e) => c.failed = Some(e),
                 }
                 c.left = c.left.saturating_sub(1);
                 c.left == 0
@@ -696,18 +697,22 @@ impl Shared {
         let (index, epoch, mark, level, revision, failed, render_ms, lead, frames) = {
             let mut c = lock(chunk);
             let frames: Vec<(u32, u32, Vec<u8>)> = c.frames.iter_mut().filter_map(Option::take).collect();
-            (c.index, c.epoch, c.mark, c.level, c.revision, c.failed, c.started.elapsed().as_secs_f64() * 1000.0, c.lead, frames)
+            (c.index, c.epoch, c.mark, c.level, c.revision, c.failed.take(), c.started.elapsed().as_secs_f64() * 1000.0, c.lead, frames)
         };
         let p = {
             let mut st = lock(&self.state);
             if !Self::current(&st, index, epoch, mark) {
                 return;
             }
-            if failed {
-                // Tried again by the controller.
+            if let Some(error) = failed {
+                // A frame that can't render (missing footage or fonts, a renderer error) would
+                // fail again: the stream ends, and the app renders on its own.
                 st.flying.remove(&index);
+                st.stop = true;
+                self.reply(StreamReply::Failed { stream: self.id, error: format!("a frame of chunk {index} failed: {error}") }, vec![]);
                 drop(st);
                 self.cv.notify_all();
+                self.work.notify_all();
                 return;
             }
             st.p.clone()

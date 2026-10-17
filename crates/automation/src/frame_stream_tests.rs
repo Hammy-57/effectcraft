@@ -190,3 +190,31 @@ fn an_adaptive_stream_warms_up_at_quarter_then_half_size_then_sends_full_size_be
     let full: std::collections::BTreeSet<i64> = sizes.iter().filter(|c| c.2 == 1.0).map(|c| c.0).collect();
     assert_eq!(full.into_iter().collect::<Vec<_>>(), vec![0, 15, 30, 45, 60, 75], "{sizes:?}");
 }
+
+/// Every frame fails (as the asset guard does while footage is missing).
+struct Broken;
+
+impl FrameRender for Broken {
+    fn render(&self, _job: &RenderJob<'_>) -> Result<(Rendered, bool), String> {
+        Err("footage missing".into())
+    }
+}
+
+#[test]
+fn a_frame_that_cannot_render_ends_the_stream_once() {
+    let (p, comp) = project();
+    let (tx, rx) = channel();
+    let host = Arc::new(StreamHost { render: Arc::new(Broken), cache: Arc::new(LayerCache::new(16 << 20)), log: Arc::new(|_: &str| {}), render_threads: 3 });
+    let mut s = Streams::new(host, tx, 1);
+    s.synced(Some((1, p)));
+    s.message(start(comp, 0.0, 2.0, 1, true));
+    let got = collect(&rx, |r| matches!(r, StreamReply::Failed { .. }));
+    assert!(matches!(&got.last().unwrap().0, StreamReply::Failed { error, .. } if error.contains("footage missing")));
+    // Nothing more: no retry storm, no second failure.
+    std::thread::sleep(Duration::from_millis(300));
+    let more: Vec<_> = rx
+        .try_iter()
+        .filter(|(d, _)| matches!(d, Down::Reply { reply: FrameReply::Stream(StreamReply::Failed { .. } | StreamReply::Chunk { .. }), .. }))
+        .collect();
+    assert!(more.is_empty(), "{} more replies", more.len());
+}
