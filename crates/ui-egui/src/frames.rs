@@ -44,6 +44,8 @@ mod property_reuse;
 mod resident;
 pub mod times;
 mod vram;
+#[cfg(not(target_arch = "wasm32"))]
+mod workers;
 
 /// Comp identities (and the project snapshots behind them) the RAM preview keeps frames of.
 const MAX_KEEPERS: usize = 64;
@@ -630,7 +632,7 @@ pub struct Frames {
     queue: Arc<Mutex<Queue>>,
     #[cfg(not(target_arch = "wasm32"))]
     /// None if the OS refused the threads: jobs then go to rayon's global pool.
-    pool: Option<Arc<rayon::ThreadPool>>,
+    pool: Option<Arc<workers::Workers>>,
     #[cfg(not(target_arch = "wasm32"))]
     background_running: Arc<AtomicBool>,
     ctx: Option<egui::Context>,
@@ -710,15 +712,9 @@ impl Default for Frames {
             #[cfg(target_arch = "wasm32")]
             queue: Arc::new(Mutex::new(Queue { gate: gpu_gate.clone(), ..Queue::default() })),
             #[cfg(not(target_arch = "wasm32"))]
-            // A panicking job would abort the whole process (rayon's default for `spawn`): log it
-            // and lose only that frame (the panic hook has logged the message).
-            pool: rayon::ThreadPoolBuilder::new()
-                .num_threads(threads)
-                .thread_name(|i| format!("ec-frame-{i}"))
-                .panic_handler(|_| log::error!("a frame render panicked; that frame was skipped"))
-                .build()
-                .ok()
-                .map(Arc::new),
+            // Plain threads, so a frame waiting for another thread's layer or decode doesn't hold
+            // up parallel work or redo it (`workers`). A panicking job loses only that frame.
+            pool: workers::Workers::new(threads).map(Arc::new),
             #[cfg(not(target_arch = "wasm32"))]
             background_running: Arc::default(),
             ctx: None,
@@ -1730,9 +1726,9 @@ struct Worker {
     gpu_retired: Arc<AtomicBool>,
     gpu_gate: Arc<vram::Gate>,
     epoch: Arc<AtomicU64>,
-    /// The pool frames render on (`None`: rayon's global pool).
+    /// The threads frames render on (`None`: rayon's global pool).
     #[cfg(not(target_arch = "wasm32"))]
-    pool: Option<Arc<rayon::ThreadPool>>,
+    pool: Option<Arc<workers::Workers>>,
     #[cfg(not(target_arch = "wasm32"))]
     landing: Arc<landing::Landing>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -2241,9 +2237,10 @@ impl Worker {
             };
             log::debug!(
                 target: "effectcraft_stall",
-                "frames: frame {} (urgent {}) rendered {how} in {:.0} ms on {}",
+                "frames: frame {} (urgent {}, GPU picked {:?}) rendered {how} in {:.0} ms on {}",
                 job.key.frame,
                 job.urgent,
+                job.on_gpu,
                 took.as_secs_f64() * 1000.0,
                 std::thread::current().name().unwrap_or("?")
             );
@@ -2519,6 +2516,7 @@ impl Worker {
                         if job.called_off() {
                             return Rendered::Image(FrameImage::Cpu(Arc::default()));
                         }
+                        log::debug!(target: "effectcraft_stall", "frames: the GPU declined frame {}; it renders on the CPU", job.key.frame);
                         if let Some((p, key)) = auto {
                             p.declined(key);
                         }
@@ -2717,7 +2715,7 @@ mod tests {
         let cid = s.active_comp_id().unwrap();
         let opts = RenderOpts::default();
         let stored = disk_cache::frame_key(disk_cache::comp_content_key(&s.project, cid), 2, 1000, opts_hash(&opts));
-        let mut frames = Frames { pool: Some(Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap())), ..Default::default() };
+        let mut frames = Frames { pool: Some(Arc::new(workers::Workers::new(1).unwrap())), ..Default::default() };
         frames.set_remote(Some(Arc::new(Disk(stored))));
         let (entered, started) = mpsc::channel();
         let (release, wait) = mpsc::channel();

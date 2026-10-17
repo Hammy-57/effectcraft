@@ -683,6 +683,16 @@ pub fn inspect(app: &EffectcraftApp, ctx: &egui::Context) -> Value {
             "observationTimeSeconds": now,
             "lastShownTimeSeconds": last_shown,
             "lastShownAgeSeconds": last_shown.map(|t| (now - t).max(0.0)),
+            "intervals": shown_intervals(&app.playback.log),
+        },
+        // Edit → viewer frame: `shownAt - editAt` once `shownRevision >= editRevision`.
+        "latency": {
+            "editRevision": app.latency.edit_revision,
+            "editAt": app.latency.edit_at,
+            "shownRevision": app.latency.shown.map(|s| s.0),
+            "shownFrame": app.latency.shown.map(|s| s.1),
+            "shownScale": app.latency.shown.map(|s| s.2),
+            "shownAt": app.latency.shown_at,
         },
         "time": app.session.time().seconds(),
         "activeComp": app.session.state.active_comp.map(|i| i.0),
@@ -698,6 +708,17 @@ pub fn inspect(app: &EffectcraftApp, ctx: &egui::Context) -> Value {
         // RT10e: GPU viewer frames drawn from their textures, without a copy.
         "zeroCopy": {"active": app.zero_copy_active(), "frames": app.zero_copy_frames(), "viewerOnGpu": app.viewer_on_gpu(), "compositor": app.gpu_adapter()},
     })
+}
+
+/// Since the preview started: how many frames were shown and skipped, and the percentiles of
+/// the time between frames shown (ms).
+fn shown_intervals(log: &[(f64, i64)]) -> Value {
+    let mut ms: Vec<f64> = log.windows(2).map(|w| (w[1].0 - w[0].0) * 1000.0).collect();
+    let skipped: i64 = log.windows(2).map(|w| (w[1].1 - w[0].1 - 1).max(0)).sum();
+    ms.sort_by(f64::total_cmp);
+    let pct = |p: usize| ms.get((ms.len().saturating_mul(p).div_ceil(100)).saturating_sub(1)).copied();
+    json!({"shown": log.len(), "skipped": skipped, "p50Ms": pct(50), "p95Ms": pct(95), "p99Ms": pct(99), "maxMs": ms.last().copied(),
+        "seconds": log.first().zip(log.last()).map(|(a, b)| b.0 - a.0)})
 }
 
 /// Save a screenshot (optionally cropped to a rect in points) as PNG; returns the reply JSON.
@@ -816,6 +837,17 @@ pub fn encode_png(rgba: &[u8], w: u32, h: u32) -> Result<Vec<u8>, String> {
 
 #[cfg(test)]
 mod tests {
+    /// Playback's frame log: frames skipped between shown ones, interval percentiles in ms.
+    #[test]
+    fn shown_intervals_count_skips_and_percentiles() {
+        let log: Vec<(f64, i64)> = vec![(0.0, 10), (0.033, 11), (0.066, 12), (0.166, 15), (0.2, 16)];
+        let v = super::shown_intervals(&log);
+        assert_eq!((v["shown"].as_u64(), v["skipped"].as_i64()), (Some(5), Some(2)));
+        let ms = |k: &str| v[k].as_f64().map(|x| x.round());
+        assert_eq!((ms("p50Ms"), ms("p99Ms"), ms("maxMs")), (Some(33.0), Some(100.0), Some(100.0)));
+        assert!(super::shown_intervals(&[])["p99Ms"].is_null());
+    }
+
     #[test]
     fn between_frame_controls_use_current_geometry_and_do_not_resurrect_removed_widgets() {
         use super::*;
