@@ -28,7 +28,7 @@ impl Renderer<'_> {
             return None;
         }
         // Which compositor draws the frame isn't part of what the frame shows.
-        let r = Renderer { accel: None, cache: None, profile: None, ..*self };
+        let r = Renderer { accel: None, cache: None, profile: None, times: None, ..*self };
         let key = r.comp_key(id, t)?;
         let mut h = hasher(0x0f1e_2d3c_4b5a_6978);
         key.hash(&mut h);

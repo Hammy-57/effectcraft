@@ -91,20 +91,21 @@ fn draw_layers<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, visible: &[
             while j < visible.len() && visible[j].is_3d() {
                 j += 1;
             }
-            draw_3d(e, r, ctx, &visible[i..j], canvas)?;
+            r.timed_run(ctx, &visible[i..j], || draw_3d(e, r, ctx, &visible[i..j], canvas))?;
             i = j;
         } else {
-            match (r.collapsed(ctx, visible[i]), r.collapsed_fx(ctx, visible[i])) {
-                (Some(item), _) => draw_collapsed(e, r, ctx, visible[i], item, canvas)?,
+            r.timed(ctx, visible[i], || match (r.collapsed(ctx, visible[i]), r.collapsed_fx(ctx, visible[i])) {
+                (Some(item), _) => draw_collapsed(e, r, ctx, visible[i], item, canvas),
                 (None, Some(item)) => {
                     if draw_collapsed_fx(e, r, ctx, visible[i], item, canvas).is_none() {
                         on_cpu(e, canvas, |img| {
                             r.draw_collapsed_fx(ctx, visible[i], item, img);
                         })?;
                     }
+                    Some(())
                 }
-                (None, None) => draw_layer(e, r, ctx, visible[i], canvas)?,
-            }
+                (None, None) => draw_layer(e, r, ctx, visible[i], canvas),
+            })?;
             i += 1;
         }
         // 8/16 bpc: the comp is an integer buffer after every layer.

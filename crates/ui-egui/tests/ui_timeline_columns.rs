@@ -122,7 +122,22 @@ fn context_menu_hides_and_shows_a_column() {
     let listed: Vec<String> = tc::COLUMNS_MENU.iter().map(|c| h.state().auto.find(&format!("timeline.columnsMenu.{c}")).unwrap().label.clone()).collect();
     assert_eq!(
         listed,
-        ["A/V Features", "Label", "#", "Layer Name", "Comment", "Switches", "Modes", "Parent & Link", "Keys", "In", "Out", "Duration", "Stretch"]
+        [
+            "A/V Features",
+            "Label",
+            "#",
+            "Layer Name",
+            "Comment",
+            "Switches",
+            "Modes",
+            "Parent & Link",
+            "Keys",
+            "In",
+            "Out",
+            "Duration",
+            "Stretch",
+            "Render Time"
+        ]
     );
     h.get_by_label("Parent & Link").click();
     h.run_steps(3);
