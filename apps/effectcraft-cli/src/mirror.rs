@@ -228,8 +228,8 @@ fn sync(ssh: &Ssh, opts: &Opts, units: &[Unit], host: &cloud_assets::HostInfo) -
     if !same_size.is_empty() {
         let remote = ssh.sha256(&same_size.iter().map(|u| u.dest.as_str()).collect::<Vec<_>>())?;
         for (u, theirs) in same_size.into_iter().zip(remote) {
-            let mine = match &u.sha256 {
-                Some(h) => Some(h.clone()),
+            let mine = match u.sha256.clone().or_else(|| cloud_assets::cached_sha256(&u.src)) {
+                Some(h) => Some(h),
                 None => {
                     say(&format!("#️⃣  hashing {} ({})", short(&u.src), gb(u.size)));
                     let started = Instant::now();

@@ -709,60 +709,144 @@ pub fn summary(missing: &[Missing]) -> String {
     format!("{} missing: {}{}", missing.len(), shown.join(" · "), if more > 0 { format!(" · {more} more") } else { String::new() })
 }
 
-/// What would render wrong on this machine for `project` itself: used footage that isn't there
-/// and fonts that fall back. The frame server refuses frames while this is non-empty (no
-/// manifest: it can't tell a different font version, `cloud.preflight` can).
+/// Font, style, render font, linked file (path, sha256).
+type FontReq = (String, String, Option<String>, Option<(String, String)>);
+
+/// What one comp asks for: the items its layers read, fonts, effect files and effects.
+#[derive(Default)]
+struct CompNeeds {
+    sources: Vec<ItemId>,
+    fonts: Vec<FontReq>,
+    effect_files: Vec<String>,
+    effects: BTreeSet<String>,
+}
+
+fn comp_needs(c: &effectcraft_project::Comp) -> CompNeeds {
+    let mut n = CompNeeds::default();
+    for l in &c.layers {
+        n.sources.extend(l.source.item());
+        l.props.walk("", &mut |_, p| {
+            for w in crate::collect_report::property_warnings(p) {
+                if w["kind"] == "font_required" {
+                    let req: FontReq = (
+                        w["font"].as_str().unwrap_or("").to_string(),
+                        w["style"].as_str().unwrap_or("").to_string(),
+                        w["render_font"].as_str().filter(|s| !s.is_empty()).map(str::to_string),
+                        serde_json::from_value::<FontFileLink>(w["font_file"].clone()).ok().map(|l| (l.path, l.sha256)),
+                    );
+                    if !n.fonts.contains(&req) {
+                        n.fonts.push(req);
+                    }
+                } else if let Some(path) = w["path"].as_str().filter(|_| w["kind"] == "external_effect_file") {
+                    n.effect_files.push(path.to_string());
+                }
+            }
+        });
+        for g in l.effects().into_iter().flat_map(|fx| fx.groups()) {
+            if let GroupKind::Effect { effect } = &g.kind {
+                n.effects.insert(effect.clone());
+            }
+        }
+    }
+    n
+}
+
+/// [`blockers`]' memory between revisions: each comp's needs by its `Arc` (a sync patch replaces
+/// only the comps it changes) and how each font resolved.
+#[derive(Default)]
+pub struct BlockerCache {
+    comps: Vec<(std::sync::Arc<effectcraft_project::Comp>, CompNeeds)>,
+    fonts: BTreeMap<FontReq, Option<String>>,
+    rescanned: Option<web_time::Instant>,
+}
+
+/// What would render wrong on this machine for `project` itself: used footage that isn't there,
+/// fonts that fall back and effects that aren't loaded. The frame server refuses frames while
+/// this is non-empty (without a manifest it can't tell a different font version;
+/// `cloud.preflight` can).
 pub fn blockers(project: &Project) -> Vec<Missing> {
-    let mut out: Vec<Missing> = vec![];
-    for (path, n) in needed_files(project, &mut |_| vec![]) {
-        if n.used && n.kind != "sequence" && stat(&path).is_none() {
-            out.push(Missing {
-                kind: n.kind.into(),
-                reason: "missing".into(),
-                path: Some(path),
-                font: None,
-                style: None,
-                items: n.items.into_iter().collect(),
-                detail: "not on this machine".into(),
-            });
-        }
-    }
-    // A sequence is there while any of its frames is (footage.check's rule).
-    let used = used_items(project);
+    blockers_cached(project, &mut BlockerCache::default())
+}
+
+/// [`blockers`], recomputing only comps that changed since the last call with `cache`.
+pub fn blockers_cached(project: &Project, cache: &mut BlockerCache) -> Vec<Missing> {
+    let mut comps = Vec::new();
     for item in project.items.values() {
-        if let ItemKind::Footage(f) = &item.kind
-            && !f.sequence.is_empty()
-            && used.contains(&item.id)
-            && stat(&f.path).is_none()
-            && !f.sequence.iter().any(|p| stat(p).is_some())
-        {
-            out.push(Missing {
-                kind: "sequence".into(),
-                reason: "missing".into(),
-                path: Some(f.path.clone()),
-                font: None,
-                style: None,
-                items: vec![item.id.0],
-                detail: "no frame of the sequence is on this machine".into(),
-            });
+        if let ItemKind::Comp(c) = &item.kind {
+            let needs = match cache.comps.iter().position(|(old, _)| std::sync::Arc::ptr_eq(old, c)) {
+                Some(i) => cache.comps.swap_remove(i).1,
+                None => comp_needs(c),
+            };
+            comps.push((c.clone(), needs));
         }
     }
-    for (font, style, render, link) in font_requests(project) {
-        let here = resolve_font(&font, &style, render.as_deref(), link.as_ref());
-        if here.status == "missing" {
+    cache.comps = comps;
+    let used: BTreeSet<ItemId> = cache.comps.iter().flat_map(|(_, n)| n.sources.iter().copied()).collect();
+    let mut out: Vec<Missing> = vec![];
+    let missing = |kind: &str, path: &str, items: Vec<u64>, detail: &str| Missing {
+        kind: kind.into(),
+        reason: "missing".into(),
+        path: Some(path.into()),
+        font: None,
+        style: None,
+        items,
+        detail: detail.into(),
+    };
+    for item in project.items.values().filter(|i| used.contains(&i.id)) {
+        let main = match &item.kind {
+            ItemKind::Footage(f) => Some((f, if f.sequence.is_empty() { "footage" } else { "sequence" })),
+            _ => None,
+        };
+        for (f, kind) in main.into_iter().chain(item.proxy.as_ref().map(|p| (&p.footage, "proxy"))) {
+            if (f.kind == FootageKind::Data && f.data.is_some()) || (f.path.is_empty() && f.sequence.is_empty()) {
+                continue;
+            }
+            // A sequence is there while any of its frames is (footage.check's rule).
+            let present = stat(&f.path).is_some() || (!f.sequence.is_empty() && f.sequence.iter().any(|p| stat(p).is_some()));
+            if !present {
+                out.push(missing(kind, &f.path, vec![item.id.0], "not on this machine"));
+            }
+        }
+    }
+    let files: BTreeSet<&String> = cache.comps.iter().flat_map(|(_, n)| n.effect_files.iter()).collect();
+    for f in files {
+        if stat(f).is_none() {
+            out.push(missing("effect", f, vec![], "not on this machine"));
+        }
+    }
+    let fonts: BTreeSet<FontReq> = cache.comps.iter().flat_map(|(_, n)| n.fonts.iter().cloned()).collect();
+    for req in &fonts {
+        let fallback = match cache.fonts.get(req) {
+            Some(f) => f.clone(),
+            None => {
+                let link = req.3.as_ref().map(|(path, sha256)| FontFileLink { path: path.clone(), sha256: sha256.clone() });
+                let here = resolve_font(&req.0, &req.1, req.2.as_deref(), link.as_ref());
+                let f = (here.status == "missing").then_some(here.postscript);
+                cache.fonts.insert(req.clone(), f.clone());
+                f
+            }
+        };
+        if let Some(fb) = fallback {
             out.push(Missing {
                 kind: "font".into(),
                 reason: "missing-font".into(),
                 path: None,
-                font: Some(font),
-                style: Some(style),
+                font: Some(req.0.clone()),
+                style: Some(req.1.clone()),
                 items: vec![],
-                detail: format!("would be drawn with {} here", here.postscript),
+                detail: format!("would be drawn with {fb} here"),
             });
         }
     }
-    for id in applied_effects(project) {
-        if crate::effects::find(&id).is_none() {
+    // A font the mirror just copied in is found by a rescan (at most every 30 s).
+    if out.iter().any(|m| m.kind == "font") && cache.rescanned.is_none_or(|t| t.elapsed().as_secs() >= 30) {
+        cache.rescanned = Some(web_time::Instant::now());
+        crate::text::fonts::rescan_system();
+        cache.fonts.retain(|_, missing| missing.is_none());
+    }
+    let effects: BTreeSet<&String> = cache.comps.iter().flat_map(|(_, n)| n.effects.iter()).collect();
+    for id in effects {
+        if crate::effects::find(id).is_none() {
             out.push(Missing {
                 kind: "effect".into(),
                 reason: "not-loaded".into(),
@@ -1111,6 +1195,28 @@ mod tests {
         let p = pending_uploads(&s.project, &|_| None);
         assert!(p["pending"].as_array().unwrap().iter().all(|e| e["path"] != path.as_str()), "{p}");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `CR7_PROJECT=/path/to/real.ecproj cargo test -p effectcraft-engine --lib guard_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn guard_cost_on_a_real_project() {
+        let Ok(path) = std::env::var("CR7_PROJECT") else { return };
+        let mut s = Session::default();
+        s.execute("file.open", json!({"path": path})).unwrap();
+        let mut cache = BlockerCache::default();
+        for label in ["first", "cached", "cached"] {
+            let t = std::time::Instant::now();
+            let n = blockers_cached(&s.project, &mut cache).len();
+            eprintln!("{label}: {n} blockers in {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
+        }
+        // One comp changed (as a sync patch does): only it is walked again.
+        let cid = s.project.comps().next().map(|(id, _)| *id).unwrap();
+        // The cache holds the old Arc, so this clones the comp (a new pointer).
+        assert!(std::sync::Arc::make_mut(&mut s.project).comp_mut(cid).is_some());
+        let t = std::time::Instant::now();
+        blockers_cached(&s.project, &mut cache);
+        eprintln!("one comp changed: {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
     }
 
     #[test]
