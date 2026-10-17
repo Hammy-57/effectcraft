@@ -233,12 +233,12 @@ cmd_connect() {
 
   say "🔎 1/5 Checking the machine $TARGET (port $SSH_PORT)"
   local pre; pre="$(rbash <<<"$REMOTE_PREFLIGHT")" || true
-  [ -n "$(printf '%s' "$pre" | parse_kv gpu)" ] || die "cannot reach $TARGET or no GPU there:\n$pre"
+  [ -n "$(printf '%s' "$pre" | parse_kv gpu)" ] || die "cannot reach $TARGET or no GPU there: $pre"
   say "   GPU: $(printf '%s' "$pre" | parse_kv gpu), free VRAM $(printf '%s' "$pre" | parse_kv vram_free_mb) / $(printf '%s' "$pre" | parse_kv vram_total_mb) MB, free disk $(printf '%s' "$pre" | parse_kv disk_free_gb) GB"
   [ "$(printf '%s' "$pre" | parse_kv have_repo)" = 1 ] || die "no $REMOTE_DIR on the machine: it is not set up for EffectCraft yet (see the effectcraft-remote-gpu skill: scripts/template/ec-provision.sh)."
   [ "$(printf '%s' "$pre" | parse_kv have_cargo)" = 1 ] || die "no cargo on the machine, so effectcraft-cli cannot be built there."
   local free; free="$(printf '%s' "$pre" | parse_kv disk_free_gb)"
-  [ "${free:-0}" -ge 6 ] 2>/dev/null || say "⚠️  only ${free:-?} GB free on /workspace: a build and the media may not fit"
+  [ "${free:-0}" -ge 6 ] 2>/dev/null || say "⚠️  only ${free:-?} GB free on /workspace: the media may not fit"
   if [ -x "$SKILL_SCRIPTS/check.sh" ]; then # the template's own check (non-fatal: it tests NVENC for the browser stream, not needed here)
     say "   machine check (check.sh):"
     rbash <"$SKILL_SCRIPTS/check.sh" | sed 's/^/     /' | head -12 || true
@@ -249,6 +249,7 @@ cmd_connect() {
   if [ "$built" = "$mac_commit" ]; then
     say "✅ effectcraft-cli on the machine is already at ${mac_commit:0:8} (this Mac's main)"
   else
+    [ "${free:-0}" -ge 12 ] 2>/dev/null || die "only ${free:-?} GB free on /workspace; a build of effectcraft-cli needs about 12 GB. Free space on the machine first (old target/ folders, /workspace/*.log, old copies like cr*-target or cr*-src), then run connect again."
     say "🔨 2/5 Building effectcraft-cli on the machine at ${mac_commit:0:8} (was ${built:0:8}); nothing is uploaded"
     # only the missing commits travel (git over ssh, a few MB at most); the machine never needs GitHub
     local sshcmd="ssh"; while IFS= read -r l; do sshcmd+=" '$l'"; done < <(ssh_opts)
@@ -297,9 +298,10 @@ EOF
 
   say "🚀 4/5 Frame server on the machine (port $FRAMES_PORT)"
   local token; token="$(cat "$TOKEN_FILE")"
-  rbash "$FRAMES_PORT" "$mac_commit" "$IDLE_MIN" "$token" <<<"$REMOTE_SERVE" >/tmp/ec-cloud-serve.$$ 2>&1 || true
-  if grep -q '^ERR' /tmp/ec-cloud-serve.$$; then cat /tmp/ec-cloud-serve.$$; rm -f /tmp/ec-cloud-serve.$$; die "the frame server did not start"; fi
-  sed 's/^/   /' /tmp/ec-cloud-serve.$$; rm -f /tmp/ec-cloud-serve.$$
+  out="$(mktemp -t ec-cloud-serve)"; trap 'rm -f "$out"' EXIT
+  rbash "$FRAMES_PORT" "$mac_commit" "$IDLE_MIN" "$token" <<<"$REMOTE_SERVE" >"$out" 2>&1 || true
+  if grep -q '^ERR' "$out"; then cat "$out"; die "the frame server did not start"; fi
+  sed 's/^/   /' "$out"
 
   say "🔌 5/5 SSH tunnel 127.0.0.1:$LOCAL_PORT → machine:$FRAMES_PORT and the Mac app"
   tunnel_open
@@ -343,7 +345,7 @@ cmd_disconnect() {
   load_state
   APP_PORT="${APP_PORT:-9877}"
   if app_up; then
-    app_cmd prefs.set '{"key":"previews.previewOn","value":"local"}' >/dev/null || true
+    app_cmd prefs.set '{"values":{"previews.previewOn":"local"}}' >/dev/null || true
     say "🍎 app: Preview On = This Mac"
   else say "🍎 app not reachable on $APP_PORT (set Preview On = This Mac yourself if it is open)"; fi
   tunnel_close; say "🔌 tunnel closed"

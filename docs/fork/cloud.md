@@ -44,7 +44,9 @@ Running `connect` twice is safe: finished steps are skipped (build, mirror bytes
 - Connection state (ip, ports, no secrets): `~/Library/Application Support/EffectCraft/cloud-connection.env`
   (so `status` and `disconnect` need no arguments).
 - Frame token: `…/EffectCraft/cloud-frame-token` (mode 600, made on the first connect; the app reads it, CR5).
-  It reaches the server as an environment variable of the serve process only.
+  It reaches the server as an environment variable of the serve process only (root on the machine can read
+  it in /proc, which is fine on a machine you rent alone; it is passed once as an ssh argument).
+- A build needs about 12 GB free on /workspace: below that `connect` refuses and says what to free.
 - The tunnel's control socket: `/tmp/ec-cloud-<uid>.sock`.
 - `EFFECTCRAFT_CONFIG_DIR` moves all of the above (tests use it); ssh key `~/.ssh/id_ed25519`
   (`EC_CLOUD_KEY`); `EC_CLI` picks the Mac's `effectcraft-cli`.
