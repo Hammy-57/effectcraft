@@ -264,3 +264,56 @@ fn catalog_all_lists_on_the_mac_cards() {
     assert!(found["entries"].as_array().unwrap().iter().all(|e| e["source"] != "motion"), "{found}");
     assert!(s.execute("library.apply", json!({"id": "reel"})).is_ok());
 }
+
+/// On the Mac that keeps the library (its folder added with `library.addFolder`), a card listed
+/// "on the Mac" applies from the local files (one undo step), shows as local, and reveals its
+/// file; one the folder doesn't list stays on the Mac.
+#[test]
+fn on_the_mac_cards_apply_from_the_local_library() {
+    let root = out_dir("motion-library-local");
+    let (lib, media, remote, cache) = (root.join("lib"), root.join("media"), root.join("remote"), root.join("cache"));
+    for d in [&lib, &media, &remote, &lib.join("projects")] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let thumb = media.join("thumb.png");
+    std::fs::write(&thumb, b"thumbnail bytes").unwrap();
+    card_project(&lib.join("projects"), &media, "Reel Card");
+    card_project(&lib.join("projects"), &media, "Other Thing");
+    let index = json!({"format": "effectcraft-library", "version": 1, "name": "Test Library",
+        "entries": [entry("reel", "Reel Card", "Devin Jatho/UI", "projects/Reel Card.ecproj", &thumb),
+                    entry("other", "Other Thing", "Graphs", "projects/Other Thing.ecproj", &thumb)],
+        "catalog_only": [{"id": "ease", "name": "Snappy ease", "category": "Graphs", "kind": "mac", "type_label": "Ease", "thumbnail": thumb.to_string_lossy()}]});
+    std::fs::write(lib.join("library.json"), serde_json::to_vec(&index).unwrap()).unwrap();
+    Session::default()
+        .execute(
+            "library.publish",
+            json!({"library": lib.to_string_lossy(), "folders": ["Devin Jatho"], "catalogAll": true, "remote": remote.to_string_lossy()}),
+        )
+        .unwrap();
+
+    let mut s = session_with(&remote, &cache);
+    s.execute("library.sync", json!({})).unwrap();
+    assert!(s.execute("library.apply", json!({"id": "other"})).unwrap_err().to_string().contains("on the Mac"));
+    s.execute("library.addFolder", json!({"path": lib.to_string_lossy()})).unwrap();
+    let card = s.execute("library.card", json!({"id": "other"})).unwrap();
+    assert_eq!((card["onMac"].as_bool(), card["local"].as_bool()), (Some(false), Some(true)), "{card}");
+    assert_eq!(s.execute("library.card", json!({"id": "ease"})).unwrap()["onMac"], true);
+
+    s.execute("comp.new", json!({"name": "Main", "width": 64, "height": 64, "frameRate": 30, "duration": 4})).unwrap();
+    let undo = s.history.undo.len();
+    let r = s.execute("library.apply", json!({"id": "other", "time": 1.0})).unwrap();
+    assert_eq!(r["source"], "local", "{r}");
+    assert!(r["layer"].as_u64().is_some(), "{r}");
+    assert_eq!(s.history.undo.len(), undo + 1, "one undo step");
+    assert_eq!(s.active_comp().unwrap().layers.iter().next().unwrap().name, "Other Thing");
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.active_comp().unwrap().layers.iter().count(), 0);
+    // `remote: true` still goes to the bucket (which lists it on the Mac only).
+    assert!(s.execute("library.apply", json!({"id": "other", "remote": true})).is_err());
+
+    let r = s.execute("library.reveal", json!({"id": "other"})).unwrap();
+    assert!(r["url"].as_str().unwrap().ends_with("/projects"), "{r}");
+    assert!(s.execute("library.reveal", json!({"id": "ease"})).is_err());
+    let found = s.execute("library.search", json!({"query": "other thing", "source": "motion"})).unwrap();
+    assert_eq!(found["entries"][0]["id"], "other", "{found}");
+}
