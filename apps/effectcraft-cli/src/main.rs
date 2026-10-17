@@ -275,6 +275,7 @@ const VALUED: &[&str] = &[
 const FLAGS: &[&str] = &[
     "--rt-profile",
     "--rt-warm",
+    "--rt-checksum",
     "--hw-prores",
     "--rt-drag",
     "--rt-warmup",
