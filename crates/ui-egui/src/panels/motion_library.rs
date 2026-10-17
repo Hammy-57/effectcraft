@@ -3867,10 +3867,29 @@ fn library_cards(ctx: &egui::Context, client: &Client, local: &Arc<LocalIndex>, 
     let ops = folder_ops();
     let mut cards: Vec<Card> = cat.iter().flat_map(|c| c.cards.iter()).filter_map(|c| overlay_card(c, lib, &ops, true)).collect();
     cards.extend(local_only.iter().filter_map(|c| overlay_card(c, lib, &ops, false)));
+    // Cards only this Mac's library has and EffectCraft can't open from files (Ease, Expression,
+    // unconverted After Effects comps…, the index's `catalog_only`): listed so the plug applies them.
+    let listed: BTreeSet<String> = cards.iter().map(|c| c.id.clone()).chain(local.values().map(|e| e.id.clone())).collect();
+    let unpublished: Vec<Card> = lib.cards.iter().filter(|(id, _)| !listed.contains(id.as_str())).map(|(id, l)| unpublished_card(id, l)).collect();
+    cards.extend(unpublished.iter().filter_map(|c| overlay_card(c, lib, &ops, false)));
     drop(ops);
     let cards = Arc::new(cards);
     ctx.data_mut(|d| d.insert_temp::<Cached>(id, (key, cards.clone())));
     cards
+}
+
+/// A card of the local library that isn't published, as the panel lists it (on this Mac only).
+fn unpublished_card(id: &str, l: &LocalCard) -> Card {
+    Card {
+        id: id.to_string(),
+        name: l.name.clone(),
+        category: l.category.clone(),
+        kind: if l.kind_label == "Comp" { "comp" } else { "footage" }.into(),
+        kind_label: l.kind_label.clone(),
+        description: l.description.clone(),
+        on_mac: true,
+        ..Card::default()
+    }
 }
 
 /// Cards per folder, each counted in its folder and every folder above it.
@@ -4609,6 +4628,9 @@ mod library_tests {
         assert!(lib.complete && lib.present());
         assert_eq!(lib.cards["c1"].description, "mine");
         assert!(lib.cards["e1"].speed_graph.is_some());
+        // An unpublished Ease card is listed (on this Mac) with its label, for the plug to apply.
+        let e = unpublished_card("e1", &lib.cards["e1"]);
+        assert_eq!((e.name.as_str(), e.category.as_str(), e.kind_label.as_str(), e.on_mac), ("Snappy", "Graphs", "Ease", true));
         let mut ops = folder_ops_fresh();
         let published = Card { id: "c1".into(), name: "Old".into(), category: "X".into(), ..Default::default() };
         let c = overlay_card(&published, &lib, &ops, true).unwrap();
