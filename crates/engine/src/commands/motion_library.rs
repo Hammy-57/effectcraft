@@ -45,7 +45,9 @@ pub fn card_summary(c: &Card) -> Value {
         "id": c.id,
         "name": c.name,
         "kind": c.kind,
+        "kindLabel": c.subtitle().split(" · ").next().unwrap_or_default(),
         "category": c.category,
+        "location": if c.location.is_empty() { &c.category } else { &c.location },
         "description": description,
         "duration": c.duration,
         "needsFootage": c.needs_footage(),
@@ -123,7 +125,8 @@ fn catalog(s: &mut Session, p: &Value) -> Result<Value> {
     let limit = p.get("limit").and_then(Value::as_u64).unwrap_or(50).clamp(1, 500) as usize;
     let offset = p.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
     let hits = effectcraft_motionlib::search(&cat.cards, query, folder);
-    let folders: Vec<Value> = cat.folder_counts().into_iter().map(|(f, n)| json!({"folder": f, "cards": n})).collect();
+    // In the library's order, with each folder's depth and whether it has an icon.
+    let folders: Vec<Value> = cat.tree().into_iter().map(|r| json!({"folder": r.path, "cards": r.cards, "depth": r.depth, "icon": r.icon.is_some()})).collect();
     Ok(json!({
         "version": client.status().version,
         "name": cat.name,
