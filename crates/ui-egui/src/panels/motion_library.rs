@@ -849,7 +849,7 @@ fn paint_folder_icon(
         return;
     };
     if let Some(path) = local_icon
-        && let Some((tex, [w, h])) = local_thumbnail(ctx, path, 64, budget)
+        && let Some((tex, [w, h])) = local_thumbnail(ctx, path, 64, None, budget)
     {
         let s = (r.width() / w.max(1) as f32).min(r.height() / h.max(1) as f32);
         let ir = Rect::from_center_size(r.center(), vec2(w as f32, h as f32) * s);
