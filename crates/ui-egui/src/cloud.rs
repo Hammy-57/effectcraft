@@ -1182,9 +1182,12 @@ mod tests {
                                 // (out of order), chunk 0 at half size, then its full-size upgrade.
                                 Up::Msg { msg: FrameMsg::Stream(StreamMsg::Start { stream, .. }), .. } => {
                                     let rate = effectcraft_engine::time::FrameRate::new(30, 1);
-                                    let started = StreamReply::Started { stream, width: 32, height: 18, frame_rate: rate, chunk_frames: 15, codec: StreamCodec::H264 };
+                                    let started =
+                                        StreamReply::Started { stream, width: 32, height: 18, frame_rate: rate, chunk_frames: 15, codec: StreamCodec::H264 };
                                     let mut out = vec![(stream_down(started), vec![])];
-                                    for (seq, index, w, h, color) in [(1u64, 1i64, 32, 18, [255, 0, 0]), (2, 0, 16, 8, [255, 0, 0]), (3, 0, 32, 18, [255, 0, 0])] {
+                                    for (seq, index, w, h, color) in
+                                        [(1u64, 1i64, 32, 18, [255, 0, 0]), (2, 0, 16, 8, [255, 0, 0]), (3, 0, 32, 18, [255, 0, 0])]
+                                    {
                                         out.push(fake_chunk(stream, seq, 1, index, w, h, color));
                                     }
                                     *ls.lock().unwrap() = Some(stream);

@@ -482,16 +482,8 @@ impl CloudPlayback {
                 ahead_secs: ahead,
             };
             client.stream_start(start, shared.clone());
-            self.current = Some(Running {
-                shared,
-                client: client.clone(),
-                revision: p.revision,
-                cur: p.cur,
-                range,
-                playhead_at: p.now,
-                seen: p.now,
-                stalled: false,
-            });
+            self.current =
+                Some(Running { shared, client: client.clone(), revision: p.revision, cur: p.cur, range, playhead_at: p.now, seen: p.now, stalled: false });
             return PlayTick { streamed: true, note: None };
         };
         let failed = r.shared.buffer().failed.clone();
@@ -575,5 +567,3 @@ pub struct StreamStart {
     pub opts: RenderOpts,
     pub ahead_secs: f32,
 }
-
-
