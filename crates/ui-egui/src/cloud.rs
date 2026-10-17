@@ -149,7 +149,9 @@ enum Cmd {
     Start(Box<RemoteJob>, RemoteDone),
     Purge,
     /// This Mac's manifest for the server's preflight (CR7), for connection `generation`.
-    Manifest(u64, Value),
+    /// A manifest for `cloud.preflight` (generation, manifest, what the mirror would upload then:
+    /// confirmed on the server when the preflight passes).
+    Manifest(u64, Value, Value),
     /// Files the project needs that the mirror hasn't confirmed uploaded, at `revision`.
     Pending {
         revision: u64,
@@ -208,6 +210,7 @@ impl CloudFrames {
             uploads: None,
             checking_uploads: false,
             uploads_checked: None,
+            preflight_files: Value::Null,
             shared: shared.clone(),
             client,
             remap,
@@ -377,6 +380,10 @@ struct Link {
     /// The link's own command channel (background checks report back through it).
     me: Sender<Cmd>,
     preflight: Preflight,
+    /// The files pending when the manifest in flight was made ([`pending_uploads`] answer).
+    ///
+    /// [`pending_uploads`]: effectcraft_engine::cloud_assets::pending_uploads
+    preflight_files: Value,
     /// Bumps on every connection: a manifest made for an older one is not sent.
     generation: u64,
     /// Files waiting for the mirror at a revision: (revision, count).
@@ -449,10 +456,11 @@ impl Link {
                 }
             }
             Cmd::Start(job, done) => self.start(*job, done),
-            Cmd::Manifest(generation, manifest) => {
+            Cmd::Manifest(generation, manifest, files) => {
                 if generation != self.generation || !self.client.connected() || !matches!(self.preflight, Preflight::Asking(None)) {
                     return;
                 }
+                self.preflight_files = files;
                 let id = self.id();
                 let params = json!({"command": "cloud.preflight", "params": {"manifest": manifest}});
                 if self.client.send(Up::Control { id, method: "engine.execute".into(), params }, vec![]) {
@@ -657,12 +665,14 @@ impl Link {
         let (me, generation, remap) = (self.me.clone(), self.generation, self.remap.clone());
         let path = self.shared.path.lock().unwrap_or_else(PoisonError::into_inner).clone();
         let spawned = std::thread::Builder::new().name("ec-cloud-manifest".into()).spawn(move || {
-            use effectcraft_engine::cloud_assets::{Hash, manifest, read_sidecar};
-            let project = remap_project(&project, remap.as_ref());
+            use effectcraft_engine::cloud_assets::{Hash, manifest, pending_uploads, read_sidecar};
             let read = |p: &str| std::fs::read(p).ok();
             let sidecar = read_sidecar(&read, path.as_deref());
-            let m = manifest(&project, &read, Hash::Small, &sidecar, path.as_deref());
-            let _ = me.send(Cmd::Manifest(generation, serde_json::to_value(m).unwrap_or(Value::Null)));
+            // Before the manifest: a file that changes in between is then stat'ed newer in the
+            // manifest, so the server checks that version and this one stays pending.
+            let files = pending_uploads(&project, &read, &sidecar);
+            let m = manifest(&remap_project(&project, remap.as_ref()), &read, Hash::Small, &sidecar, path.as_deref());
+            let _ = me.send(Cmd::Manifest(generation, serde_json::to_value(m).unwrap_or(Value::Null), files));
         });
         if spawned.is_err() {
             self.preflight = Preflight::Unknown;
@@ -672,9 +682,10 @@ impl Link {
     /// The server's `cloud.preflight` answer (`reply`: the control reply `{ok, result | error}`).
     fn preflight_answer(&mut self, reply: &Value) {
         let error = reply.get("error").and_then(Value::as_str).unwrap_or("");
-        let (ok, summary) = if reply.get("ok").and_then(Value::as_bool) == Some(true) {
+        // `checked`: the server compared the manifest with its disk.
+        let (ok, checked, summary) = if reply.get("ok").and_then(Value::as_bool) == Some(true) {
             let r = reply.get("result").cloned().unwrap_or(Value::Null);
-            (r.get("ok").and_then(Value::as_bool) != Some(false), r.get("summary").and_then(Value::as_str).map(str::to_string))
+            (r.get("ok").and_then(Value::as_bool) != Some(false), true, r.get("summary").and_then(Value::as_str).map(str::to_string))
         } else if error.contains("still starting") {
             // Ask again shortly.
             self.preflight = Preflight::Missing { retry: Instant::now() + Duration::from_secs(2) };
@@ -683,8 +694,16 @@ impl Link {
             // An older server (no `cloud.preflight`, no control host): it can't say; its own guard
             // still refuses frames with missing files.
             log::info!("cloud preview: no preflight on the server ({error})");
-            (true, None)
+            (true, false, None)
         };
+        let files = std::mem::take(&mut self.preflight_files);
+        if ok && checked {
+            // The server checked every file of the manifest and has it: those the mirror had
+            // not confirmed in this app run (none, after a restart) are no longer pending.
+            if effectcraft_engine::cloud_assets::confirm_on_server(&files) > 0 {
+                self.uploads_checked = None;
+            }
+        }
         self.preflight = if ok { Preflight::Ok } else { Preflight::Missing { retry: Instant::now() + PREFLIGHT_RETRY } };
         self.status().missing = if ok { None } else { Some(summary.unwrap_or_else(|| "files are missing on the cloud machine".into())) };
         self.update_slots();

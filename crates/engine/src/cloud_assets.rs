@@ -1187,6 +1187,28 @@ pub fn pending_uploads(project: &Project, read: &dyn Fn(&str) -> Option<Vec<u8>>
     json!({"count": pending.len(), "bytes": bytes, "pending": pending, "missingHere": missing_here, "confirmed": have.len()})
 }
 
+/// Record that the server has the files of a [`pending_uploads`] answer, as they were then: its
+/// `cloud.preflight` passed for the manifest made with it. After an app restart nothing is
+/// confirmed until the mirror runs again, so without this a server that already has everything
+/// would wait for a mirror run that uploads nothing. A file changed since stays pending (its size
+/// or mtime differs). Returns how many files were recorded.
+pub fn confirm_on_server(pending: &Value) -> usize {
+    let files: Vec<(String, u64, i64)> = pending["pending"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|f| Some((f["path"].as_str()?.to_string(), f["size"].as_u64()?, f["mtime"].as_i64().unwrap_or(0))))
+        .collect();
+    if files.is_empty() {
+        return 0;
+    }
+    let mut guard = confirmed().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let n = files.len();
+    guard.1.extend(files.into_iter().map(|(p, size, mtime)| (p, (size, mtime))));
+    guard.0 = guard.0.wrapping_add(1);
+    n
+}
+
 fn pending_cmd(s: &mut Session, _: &Value) -> Result<Value> {
     let generation = confirmed().lock().unwrap_or_else(std::sync::PoisonError::into_inner).0;
     let key = (s.revision, generation);
@@ -1648,6 +1670,42 @@ mod tests {
         s.execute("cloud.markUploaded", json!({"files": [{"path": path, "size": size, "mtime": mtime}]})).unwrap();
         let p = pending_uploads(&s.project, &|_| None, &Sidecar::default());
         assert!(p["pending"].as_array().unwrap().iter().all(|e| e["path"] != path.as_str()), "{p}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// After an app restart nothing is confirmed in memory: a server whose preflight passes has
+    /// every file, so the app is ready without a mirror run (17 Oct: 181 pending, all there).
+    #[test]
+    fn a_passed_preflight_confirms_pending_files_after_a_restart() {
+        let d = tmp("restart");
+        let f = d.join("already on the server.mov");
+        std::fs::write(&f, b"footage").ok();
+        let path = f.to_string_lossy().to_string();
+        let mut s = Session::default();
+        s.execute("comp.new", json!({"name": "C"})).ok();
+        let id = std::sync::Arc::make_mut(&mut s.project).add_item(
+            "f",
+            Default::default(),
+            None,
+            ItemKind::Footage(effectcraft_project::Footage { path: path.clone(), ..Default::default() }),
+        );
+        let cid = s.active_comp_id().unwrap();
+        s.execute("layer.addItem", json!({"comp": cid.0, "item": id.0, "time": 0.0})).unwrap();
+        let ours = |p: &Value| p["pending"].as_array().unwrap().iter().any(|e| e["path"] == path.as_str());
+        // A fresh app: the mirror has confirmed nothing in this process.
+        let files = pending_uploads(&s.project, &|_| None, &Sidecar::default());
+        assert!(ours(&files), "{files}");
+        // The server (here the same disk) has the file: its preflight passes.
+        let m = manifest(&s.project, &|_| None, Hash::Small, &Sidecar::default(), None);
+        let r = s.execute("cloud.preflight", json!({"manifest": m})).unwrap();
+        assert!(r["missing"].as_array().unwrap().iter().all(|m| m["path"] != path.as_str()), "{r}");
+        assert!(confirm_on_server(&files) >= 1);
+        let p = pending_uploads(&s.project, &|_| None, &Sidecar::default());
+        assert!(!ours(&p), "{p}");
+        // Changed on the Mac since: pending again (the server has the old version).
+        std::fs::write(&f, b"new footage, longer").ok();
+        let p = pending_uploads(&s.project, &|_| None, &Sidecar::default());
+        assert!(ours(&p), "{p}");
         let _ = std::fs::remove_dir_all(&d);
     }
 
