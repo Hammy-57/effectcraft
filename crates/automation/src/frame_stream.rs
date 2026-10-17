@@ -36,8 +36,9 @@ use effectcraft_media::preview_stream::{ChunkSpec, encode_chunk, even};
 use crate::control_wire::lock;
 use crate::frame_server::{FrameRender, LogFn, Out, RenderJob, Rendered};
 
-/// Chunks rendering or encoding at once per stream.
-const MAX_IN_FLIGHT: usize = 3;
+/// Chunks rendering or encoding at once per stream (encoding a chunk takes longer than
+/// rendering it on a busy CPU, so several encode at once).
+const MAX_IN_FLIGHT: usize = 6;
 /// Resolution levels: full, half, quarter of the asked size.
 const LEVELS: [f32; 3] = [1.0, 0.5, 0.25];
 /// Lead kept on top of a level's chunk latency before choosing it (network, decode).
@@ -45,7 +46,7 @@ const MARGIN_SECS: f64 = 0.35;
 /// Below this lead (seconds) a playing stream lowers its resolution; above the high one it raises it.
 const LOW_LEAD_SECS: f64 = 1.0;
 const HIGH_LEAD_SECS: f64 = 2.5;
-/// Chunks of a new stream sent at half size (the warm-up).
+/// Chunks of a new stream sent below full size (the warm-up).
 const WARM_CHUNKS: usize = 2;
 /// Least time between two resolution changes.
 const LEVEL_HOLD: Duration = Duration::from_millis(1200);
@@ -350,8 +351,9 @@ impl State {
         if !self.p.adaptive {
             return 0;
         }
-        if self.seq < WARM_CHUNKS as u64 && self.flying.len() < WARM_CHUNKS {
-            return 1;
+        // The very first chunk at quarter size, the next at half.
+        if self.issued < WARM_CHUNKS as u64 {
+            return if self.issued == 0 { 2 } else { 1 };
         }
         if !self.playing {
             return 0;
@@ -517,6 +519,16 @@ impl Shared {
             }
             let now = st.now_frame();
             let window = st.p.window(now);
+            // Chunks the playhead has passed while they rendered: not wanted any more.
+            if st.playing {
+                let p = st.p.clone();
+                let passed = |c: &i64| !window.contains(c) && p.frames(*c).is_some_and(|(f, n)| f + i64::from(n) <= now);
+                let gone: Vec<i64> = st.flying.keys().copied().filter(|c| passed(c)).collect();
+                if !gone.is_empty() {
+                    st.flying.retain(|c, _| !gone.contains(c));
+                    st.jobs.retain(|_, j| !gone.contains(&j.index));
+                }
+            }
             if said.elapsed() >= Duration::from_secs(2) {
                 said = Instant::now();
                 let flying: Vec<i64> = st.flying.keys().copied().collect();
