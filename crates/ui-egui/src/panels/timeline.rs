@@ -1571,29 +1571,42 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             let _ = app.session.execute("comp.workArea", json!({key: secs, "merge": "wa-drag"}));
         }
     }
-    // Cache bar (green: cached frames of what the viewer shows: its resolution, view and options).
+    // Cache bar (green: cached frames of what the viewer shows: its resolution, view and options;
+    // lighter green: drafts kept from the cloud's playback stream, CR6c).
     let series = app.shown_series(cid);
     let cached = app.frames.cached_frames(&series);
+    let drafts = app.frames.draft_frames(&series);
     let fd = comp.frame_duration().seconds();
     let cy0 = wa_row.max.y - 4.0;
-    let mut run: Option<(i64, i64)> = None;
-    let draw_run = |a: i64, b: i64| {
+    let mut run: Option<(i64, i64, bool)> = None;
+    let draw_run = |a: i64, b: i64, draft: bool| {
         let x0 = tm.x(a as f64 * fd);
         let x1 = tm.x((b + 1) as f64 * fd);
-        p.rect_filled(Rect::from_min_max(pos2(x0, cy0), pos2(x1, cy0 + 2.5)), 0.0, t.cache_green);
+        p.rect_filled(Rect::from_min_max(pos2(x0, cy0), pos2(x1, cy0 + 2.5)), 0.0, if draft { t.cache_draft } else { t.cache_green });
     };
     for f in cached {
+        let draft = drafts.binary_search(&f).is_ok();
         run = match run {
-            Some((a, b)) if f == b + 1 => Some((a, f)),
-            Some((a, b)) => {
-                draw_run(a, b);
-                Some((f, f))
+            Some((a, b, d)) if f == b + 1 && d == draft => Some((a, f, d)),
+            Some((a, b, d)) => {
+                draw_run(a, b, d);
+                Some((f, f, draft))
             }
-            None => Some((f, f)),
+            None => Some((f, f, draft)),
         };
     }
-    if let Some((a, b)) = run {
-        draw_run(a, b);
+    if let Some((a, b, d)) = run {
+        draw_run(a, b, d);
+    }
+    if !drafts.is_empty() {
+        let strip = Rect::from_min_max(pos2(graph_x0, cy0 - 1.5), pos2(wa_row.max.x, wa_row.max.y));
+        let resp = ui.interact(strip, egui::Id::new("tl-cache-bar"), Sense::hover());
+        let over_draft = resp.hover_pos().is_some_and(|pt| drafts.binary_search(&((tm.t(pt.x) / fd).floor() as i64)).is_ok());
+        if over_draft {
+            resp.on_hover_text(crate::i18n::tr(
+                "Draft frames: kept from the cloud's playback at a lower resolution. They play from this Mac without downloading again; a paused frame renders at full quality.",
+            ));
+        }
     }
     // Disk-cached frames not in RAM (blue), like After Effects.
     if app.session.disk_cache.is_some() || app.frames.remote_disk() {
