@@ -38,7 +38,7 @@
 
 use std::sync::Arc;
 
-use effectcraft_project::{ItemId, Project};
+use effectcraft_project::{ItemId, LayerId, Project};
 use effectcraft_render::{Accelerator, AutoKey, Backend, ExprHost, FootageSource, Image, LayerCache, LayerStore, PrefetchStore, RenderOpts, Renderer};
 use effectcraft_time::Tick;
 use serde::{Deserialize, Serialize};
@@ -226,6 +226,10 @@ pub enum FrameReply {
         /// Layer buffers served from the store (fetched from disk).
         #[serde(default, rename = "layerHits", skip_serializing_if = "Vec::is_empty")]
         layer_hits: Vec<String>,
+        /// Each layer's render time on the server, `(comp, layer, ms)`: the Mac's Timeline Render
+        /// Time pane shows them for cloud frames (CR5). Empty when the server didn't time them.
+        #[serde(default, rename = "layerTimes", skip_serializing_if = "Vec::is_empty")]
+        layer_times: Vec<(ItemId, LayerId, f32)>,
     },
     /// The frame (or, with `layer`, a layer buffer) was stored in the disk cache under `key`
     /// (`bytes` on disk).
@@ -519,7 +523,7 @@ impl FrameServer {
             pick.record(key, chose, ms);
         }
         vec![(
-            FrameReply::Frame { id: pr.id, width: img.width, height: img.height, ms, passes: pr.passes, gpu, layer_misses, layer_hits },
+            FrameReply::Frame { id: pr.id, width: img.width, height: img.height, ms, passes: pr.passes, gpu, layer_misses, layer_hits, layer_times: vec![] },
             Some(rgba8_premultiplied(&img)),
         )]
     }
@@ -708,7 +712,7 @@ mod tests {
             assert!(a.starts_with("{\"type\":"), "{a}");
         }
         for r in [
-            FrameReply::Frame { id: 1, width: 2, height: 3, ms: 4.5, passes: 2, gpu: true, layer_misses: vec!["0a".into()], layer_hits: vec![] },
+            FrameReply::Frame { id: 1, width: 2, height: 3, ms: 4.5, passes: 2, gpu: true, layer_misses: vec!["0a".into()], layer_hits: vec![], layer_times: vec![(ItemId(3), LayerId(4), 1.5)] },
             FrameReply::Stored { key: "00ff".into(), bytes: 9, layer: false },
             FrameReply::Stored { key: "00fe".into(), bytes: 8, layer: true },
             FrameReply::Info { gpu: Some("Adapter (BrowserWebGpu)".into()), error: None },

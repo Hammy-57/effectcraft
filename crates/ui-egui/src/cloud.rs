@@ -35,7 +35,8 @@ use effectcraft_engine::remote_wire::{Backoff, Down, Event, FrameClient, Up};
 use effectcraft_engine::render::Backend;
 use serde::Serialize;
 
-use crate::frames::{RemoteDone, RemoteFrame, RemoteFrames, RemoteJob, RemoteRefine};
+use crate::frames::times::FrameTimes;
+use crate::frames::{RemoteDone, RemoteFrame, RemoteFrames, RemoteJob, RemoteRefine, RemoteTimes};
 
 /// Rewrites a footage path for the server (`None`: keep it).
 pub type PathRemap = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
@@ -198,6 +199,7 @@ impl RemoteFrames for CloudFrames {
 struct Pending {
     done: Option<RemoteDone>,
     refined: Option<RemoteRefine>,
+    timed: Option<RemoteTimes>,
     cancel: Arc<AtomicBool>,
     sent: Instant,
 }
@@ -308,7 +310,7 @@ impl Link {
         if !self.client.send(Up::Msg { msg: render, want, urgent: job.urgent }, vec![]) {
             return done(Err("the cloud connection dropped".into()));
         }
-        self.pending.insert(id, Pending { done: Some(done), refined: job.refined, cancel: job.cancel, sent: Instant::now() });
+        self.pending.insert(id, Pending { done: Some(done), refined: job.refined, timed: job.timed, cancel: job.cancel, sent: Instant::now() });
         self.status().queue = self.pending.len();
     }
 
@@ -409,7 +411,7 @@ impl Link {
                 }
             }
             Down::Reply { reply, pixels } => match reply {
-                FrameReply::Frame { id, ms, .. } => {
+                FrameReply::Frame { id, ms, layer_times, .. } => {
                     let Some(px) = pixels else { return self.fail(id, "a frame without pixels".into()) };
                     {
                         let mut s = self.status();
@@ -431,6 +433,12 @@ impl Link {
                     }
                     let Some(mut p) = self.pending.remove(&id) else { return };
                     self.status().queue = self.pending.len();
+                    // The server's times, for the Render Time pane (before the frame lands, so the
+                    // pane has them when it shows the frame).
+                    if let Some(timed) = p.timed.take() {
+                        let layers = layer_times.into_iter().map(|(c, l, ms)| ((c, l), f64::from(ms))).collect();
+                        timed(FrameTimes { frame_ms: ms, layers, remote: true });
+                    }
                     if let Some(refined) = p.refined.take() {
                         self.refining.insert(id, (refined, Instant::now()));
                     }
@@ -691,6 +699,7 @@ pub fn auto_picks_cloud(local_ms: Option<f64>, cloud: &CloudStatus, on_cloud: bo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use effectcraft_engine::project::{ItemId, LayerId};
 
     #[test]
     fn slots_cover_a_round_trip() {
@@ -772,6 +781,7 @@ mod tests {
                                         gpu: true,
                                         layer_misses: vec![],
                                         layer_hits: vec![],
+                                        layer_times: vec![(ItemId(7), LayerId(1), 12.5)],
                                     };
                                     (Down::Reply { reply: frame, pixels: Some(px) }, payload)
                                 }
@@ -848,6 +858,10 @@ mod tests {
         frames.request_urgent(&src, key(0), cid, Tick(0), opts);
         wait_until("the cloud frame", || frames.is_cached(&key(0)));
         assert!(red(&frames, &key(0)), "frame 0 came from the (fake) cloud");
+        // Its render times are the server's, for the Render Time pane.
+        let t = frames.times.get(&key(0)).expect("the cloud frame's times");
+        assert!(t.remote && t.frame_ms == 1.0, "{t:?}");
+        assert_eq!(t.layer(ItemId(7), LayerId(1)), Some(12.5));
         assert_eq!(server.renders.load(Ordering::Acquire), 1);
 
         // A frame in flight when the tunnel goes.
