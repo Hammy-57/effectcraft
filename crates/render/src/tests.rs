@@ -612,6 +612,58 @@ impl crate::Accelerator for ProbeAccel {
     }
 }
 
+/// Records the effect chains the CPU walk sends to the accelerator (each falls back to the CPU).
+#[derive(Default)]
+struct ChainAccel(std::sync::Mutex<Vec<Vec<String>>>);
+impl crate::Accelerator for ChainAccel {
+    fn name(&self) -> String {
+        "chains".into()
+    }
+    fn comp_frame(&self, _r: &crate::Renderer, _comp: ItemId, _t: Tick) -> Option<crate::Image> {
+        None
+    }
+    fn supports_effect(&self, _id: &str) -> bool {
+        true
+    }
+    fn effects(&self, chain: &[crate::FxStep], _buf: &crate::Buf, _levels: Option<f32>) -> Option<crate::Buf> {
+        self.0.lock().unwrap().push(chain.iter().map(|s| s.spec.id.to_string()).collect());
+        None
+    }
+}
+
+/// A Gaussian Blur at 0 is skipped, and blurs alone stay on the CPU on the CPU walk: no upload
+/// and readback for them (a styled layer's blur took 20-170 ms through the GPU at Half in
+/// Comp 28, 0.3 ms here). A blur next to a heavier GPU effect still goes in that GPU run.
+#[test]
+fn zero_and_lone_blurs_skip_the_gpu_round_trip() {
+    let chains = |fx: &[(&str, &[(&str, Value)])]| {
+        let (mut p, cid, comp) = setup();
+        p.settings.gpu_acceleration = true;
+        let mut l = solid(&mut p, &comp, [1.0, 0.0, 0.0], 50, 50);
+        for (id, vals) in fx {
+            add_effect(&mut p, &mut l, id, [50.0, 50.0], vals);
+        }
+        p.comp_mut(cid).unwrap().layers.push(l);
+        let accel = ChainAccel::default();
+        let mut r = crate::Renderer::new(&p, &crate::NoFootage, crate::RenderOpts { backend: crate::Backend::Gpu, ..Default::default() });
+        r.accel = Some(&accel);
+        let img = r.comp_frame(cid, Tick::ZERO);
+        (accel.0.into_inner().unwrap(), img)
+    };
+    let zero: &[(&str, Value)] = &[("blurriness", Value::Scalar(0.0))];
+    let five: &[(&str, Value)] = &[("blurriness", Value::Scalar(5.0))];
+    let (sent, plain) = chains(&[("ec.blur.gaussian", zero)]);
+    assert!(sent.is_empty(), "{sent:?}");
+    let (sent, blurred) = chains(&[("ec.blur.gaussian", zero), ("ec.blur.gaussian", five), ("ec.blur.fastbox", &[("radius", Value::Scalar(3.0))])]);
+    assert!(sent.is_empty(), "{sent:?}");
+    // The blurs still ran (on the CPU): the solid's hard edge softened.
+    let edge = |img: &crate::Image| (0..img.width as i64).map(|x| img.get(x, img.height as i64 / 2)[3]).filter(|a| *a > 0.01 && *a < 0.99).count();
+    assert!(edge(&blurred) > edge(&plain), "{} vs {}", edge(&blurred), edge(&plain));
+    let (sent, _) = chains(&[("ec.blur.gaussian", five), ("ec.stylize.glow", &[])]);
+    // (The probe declines, so the walk then offers the rest of the run again.)
+    assert_eq!(sent.first(), Some(&vec!["ec.blur.gaussian".to_string(), "ec.stylize.glow".to_string()]));
+}
+
 #[test]
 fn auto_backend_sends_2d_and_3d_comps_to_the_gpu() {
     let (mut p, cid, comp) = setup();

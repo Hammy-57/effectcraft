@@ -296,6 +296,7 @@ const FLAGS: &[&str] = &[
     "--ops",
     "--small",
     "--adv3d",
+    "--layers",
     "--autosave",
     "--all-tools",
     "--ui",
@@ -1720,6 +1721,31 @@ fn bench_gpu(s: &Session, args: &Args) -> Result<(), Failure> {
             note!(
                 "{name:<28} {label:>5} {size:>10} {cpu_cold:>9.2} {gpu_cold:>9.2} {cpu_warm:>9.2} {gpu_warm:>9.2} {view:>9.2} {speedup:>7.2}x {auto:>9.2} {pct:>8.3}% {traffic:>11}"
             );
+            // `--layers`: per-layer GPU times of one frame with an empty layer cache (after an edit).
+            if args.flag("--layers") {
+                let times = effectcraft_render::LayerTimes::default();
+                let mut r = Renderer::new(project, s.footage.as_ref(), RenderOpts { scale, backend: Backend::Gpu, ..Default::default() });
+                r.expr = s.expr.as_deref();
+                // A fresh cache: static layers take their cached-layer path, rendered now.
+                let fresh = LayerCache::default();
+                r.cache = Some(&fresh);
+                r.accel = Some(&gpu);
+                r.times = Some(&times);
+                std::hint::black_box(gpu.render_display(&r, cid, t));
+                gpu.wait();
+                let mut rows: Vec<(f64, String)> = times
+                    .into_map()
+                    .into_iter()
+                    .map(|((c, l), ms)| {
+                        let lname = project.comp(c).and_then(|cc| cc.layers.iter().find(|x| x.id == l)).map(|x| x.name.clone()).unwrap_or_default();
+                        (ms, lname)
+                    })
+                    .collect();
+                rows.sort_by(|a, b| b.0.total_cmp(&a.0));
+                for (ms, lname) in rows.iter().take(12) {
+                    note!("    {lname:<28} {ms:8.2} ms");
+                }
+            }
         }
     }
     Ok(())
