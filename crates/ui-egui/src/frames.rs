@@ -819,9 +819,13 @@ fn gpu_pick(job: &Job, retired: bool, playhead: Option<&Playhead>) -> bool {
             }
             let Some(p) = g.auto_pick() else { return true };
             let key = AutoKey::new(job.comp, job.opts.scale, true);
-            // A frame a playing preview reaches goes to the CPU only when that keeps up with it
-            // (`AutoPick::choose_within`).
-            match playhead.filter(|ph| ph.ahead(&job.key).is_some()).and_then(|_| frame_ms(job)) {
+            // A frame a playing preview reaches goes to the CPU only when that keeps up with it,
+            // and a frame someone waits for (the viewer's) only when the CPU measured within
+            // [`URGENT_CPU_MS`] (`AutoPick::choose_within`): the CPU's warm-up and re-probes go to
+            // background frames. After a preview played on the GPU, the next edit's frame was
+            // that warm-up: 1.5–3 s on the CPU instead of ~0.1 s on the GPU.
+            let playing = playhead.filter(|ph| ph.ahead(&job.key).is_some()).and_then(|_| frame_ms(job));
+            match playing.or(job.urgent.then_some(URGENT_CPU_MS)) {
                 Some(budget) => p.choose_within(key, budget),
                 None => p.choose(key),
             }
@@ -830,6 +834,10 @@ fn gpu_pick(job: &Job, retired: bool, playhead: Option<&Playhead>) -> bool {
         _ => composites_on_gpu(job, g),
     }
 }
+
+/// The longest a viewer frame may take on the CPU for Auto to put it there (ms): the edit →
+/// frame target.
+const URGENT_CPU_MS: f64 = 100.0;
 
 /// A frame's duration in `job`'s comp (ms).
 fn frame_ms(job: &Job) -> Option<f64> {
@@ -3075,6 +3083,16 @@ mod tests {
         // Not a frame a playing preview needs: the CPU is unmeasured, so it can't keep up.
         let playing = Playhead { series: auto.key, cur: 0, start: 0, end: 100, step: 1, looping: false };
         assert!(gpu_pick(&auto, false, Some(&playing)), "a playing preview's frame stays on the GPU");
+        // Nor a frame someone waits for: the CPU's warm-up goes to background frames.
+        assert!(gpu_pick(&Job { urgent: true, ..auto.clone() }, false, None), "a viewer frame stays on the GPU");
+        // Once both sides are measured and the CPU is the faster, within the target, viewer
+        // frames go there.
+        for _ in 0..3 {
+            picks.record(k, true, 10.0);
+            picks.record(k, false, 5.0);
+        }
+        let urgent_cpu = (0..10).filter(|_| !gpu_pick(&Job { urgent: true, ..auto.clone() }, false, None)).count();
+        assert!(urgent_cpu > 0, "a fast CPU still renders viewer frames");
     }
 
     /// CR1: a GPU frame that runs out of video memory with eight GPU frames rendering leaves at
