@@ -1240,6 +1240,7 @@ dependencies = [
  "effectcraft-time",
  "effectcraft-ui-egui",
  "image",
+ "rayon",
  "serde_json",
 ]
 
@@ -1486,6 +1487,8 @@ dependencies = [
  "filmcraft-codecs",
  "filmcraft-color",
  "filmcraft-frame",
+ "filmcraft-h264",
+ "filmcraft-h264enc",
  "filmcraft-isobmff",
  "filmcraft-media",
  "filmcraft-prores",

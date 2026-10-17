@@ -200,19 +200,19 @@ impl FrameRender for GpuRender {
 /// heavy 1080p comp needs gigabytes of working textures per frame (Elias's 10-10 Edit: 6–8 GB at
 /// peak on the 3090, where two at once ran out of memory), and the card is shared; one GPU frame
 /// takes ~6 ms, so scrubbing doesn't wait on it.
-fn gpu_slots(threads: usize) -> usize {
+pub(crate) fn gpu_slots(threads: usize) -> usize {
     std::env::var("EFFECTCRAFT_FRAME_GPU_SLOTS").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|n| *n >= 1).unwrap_or(1).min(threads)
 }
 
 /// The layer cache's budget (CPU and GPU pixels, also capping the GPU's retained uploads and
 /// texture pool): `EFFECTCRAFT_FRAME_CACHE_MB`, else 1024 MiB.
-fn cache_budget() -> usize {
+pub(crate) fn cache_budget() -> usize {
     std::env::var("EFFECTCRAFT_FRAME_CACHE_MB").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(1024).saturating_mul(1 << 20)
 }
 
 /// Frame workers: 8, capped by `--frame-threads` / `EFFECTCRAFT_FRAME_THREADS` (CR1's
 /// [`effectcraft_render::concurrency`]).
-fn threads() -> usize {
+pub(crate) fn threads() -> usize {
     effectcraft_render::concurrency::frame_threads(frame_server::DEFAULT_THREADS)
 }
 
@@ -242,18 +242,7 @@ pub fn start(args: &Args, port: u16, gpu: Option<Arc<Gpu>>, control_port: Arc<On
     if let Some(g) = &gpu {
         g.context().set_cache_budget(cache.budget());
     }
-    let render: Arc<dyn FrameRender> = match gpu {
-        Some(gpu) => Arc::new(GpuRender {
-            gpu: std::sync::RwLock::new(gpu),
-            slots: GpuSlots::new(gpu_slots(threads)),
-            revived: Default::default(),
-            footage: s.footage.clone(),
-            expr: s.expr.clone(),
-            log: log.clone(),
-            declined: Default::default(),
-        }),
-        None => Arc::new(CpuRender { footage: s.footage.clone(), expr: s.expr.clone() }),
-    };
+    let render = renderer(&s, gpu, threads, &log);
     let (token, stored) = frame_server::frame_token(effectcraft_host::config_dir().as_deref(), args.opt("--token")).map_err(Failure::Error)?;
     let control: frame_server::ControlFn = Arc::new(move |method: &str, params: Value| match control_port.get() {
         Some(&p) => effectcraft_automation::host_server::request(p, method, params).unwrap_or_else(|e| json!({"ok": false, "error": e.to_string()})),
@@ -269,6 +258,23 @@ pub fn start(args: &Args, port: u16, gpu: Option<Arc<Gpu>>, control_port: Arc<On
     };
     println!("EffectCraft frames on 127.0.0.1:{} ({where_}; {threads} workers on {on}; layer cache {} MiB)", handle.port, cache_budget() >> 20);
     Ok(handle)
+}
+
+/// The server's renderer: [`GpuRender`] on `gpu` (at most [`gpu_slots`] frames on it at once), else
+/// the CPU.
+pub(crate) fn renderer(s: &effectcraft_engine::Session, gpu: Option<Arc<Gpu>>, threads: usize, log: &frame_server::LogFn) -> Arc<dyn FrameRender> {
+    match gpu {
+        Some(gpu) => Arc::new(GpuRender {
+            gpu: std::sync::RwLock::new(gpu),
+            slots: GpuSlots::new(gpu_slots(threads)),
+            revived: Default::default(),
+            footage: s.footage.clone(),
+            expr: s.expr.clone(),
+            log: log.clone(),
+            declined: Default::default(),
+        }),
+        None => Arc::new(CpuRender { footage: s.footage.clone(), expr: s.expr.clone() }),
+    }
 }
 
 /// A frame request's outcome, as the bench sees it.

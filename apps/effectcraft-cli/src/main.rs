@@ -52,6 +52,7 @@ mod figma_bridge;
 mod frame_serve;
 #[cfg(feature = "ui")]
 mod offscreen_ui;
+mod stream_cli;
 mod template;
 
 use effectcraft_automation::tools::{self, Reply};
@@ -159,6 +160,9 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
       [--jpeg-quality Q] [--n N] [--duration SECS]
                                            measure a frame server: round trips, scrub latency, a soak of
                                            random requests
+  stream-bench [F.ecproj | --demo] [--comp C] [--start SECS] [--n FRAMES] [--gpu] [--scale S]
+                                           render consecutive frames of a comp and time the playback
+                                           stream's H.264 chunk encoding (sizes, threads, bitrate)
   figma-bridge [--port 7789] [--control 9877] [--code CODE]
                                            local endpoint for the EffectCraft Figma plug-in: imports what it
                                            sends into the running app (file.importFigma); prints the pairing code
@@ -952,6 +956,7 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
             }
         }
         "frames-bench" => frame_serve::bench(args)?,
+        "stream-bench" => stream_cli::bench(args)?,
         other => return usage_err(&format!("unknown subcommand `{other}`")),
     }
     Ok(())
