@@ -755,7 +755,7 @@ impl Default for Frames {
 /// cap, if more), under the ceiling running out of memory set.
 #[cfg(test)]
 fn max_running(job: &Job, threads: usize) -> usize {
-    max_running_gated(job, threads, &vram::Gate::default())
+    max_running_gated(job, threads, &vram::Gate::warmed())
 }
 
 fn max_running_gated(job: &Job, threads: usize, gate: &vram::Gate) -> usize {
@@ -764,9 +764,14 @@ fn max_running_gated(job: &Job, threads: usize, gate: &vram::Gate) -> usize {
     let frame = ((w as f64 * s).ceil() * (h as f64 * s).ceil() * 16.0 * 4.0).max(1.0);
     let cpu = ((job.src.layer_cache.budget() as f64 / frame) as usize).max(1);
     let on_gpu = |g: &Gpu| job.on_gpu.unwrap_or_else(|| composites_on_gpu(job, g));
-    match job.src.gpu.as_ref().filter(|g| on_gpu(g)) {
-        Some(g) => gate.limit(g, frame, threads).unwrap_or_else(|| cpu.max(((gpu_working_budget(g) as f64 / frame) as usize).min(threads)).min(gate.ceiling())),
-        None => cpu,
+    match job.src.gpu.as_ref() {
+        Some(g) if on_gpu(g) => {
+            gate.limit(g, frame, threads).unwrap_or_else(|| cpu.max(((gpu_working_budget(g) as f64 / frame) as usize).min(threads)).min(gate.ceiling()))
+        }
+        // Composited on the CPU, its effects and uploads still run on a working GPU, in video
+        // memory (CR1): within the GPU's cap too.
+        Some(g) if effectcraft_engine::render::Accelerator::available(g) => gate.limit(g, frame, threads).map_or(cpu, |n| cpu.min(n)),
+        _ => cpu,
     }
 }
 
@@ -2434,6 +2439,8 @@ impl Worker {
         r.cache = (gpu && frozen.is_empty()).then_some(job.src.layer_cache.as_ref());
         let gpu = job.src.gpu.as_ref().filter(|_| gpu_allowed);
         r.accel = gpu.map(|g| g as &dyn effectcraft_engine::render::Accelerator);
+        // Counted while it renders with the GPU attached, composited there or not (CR1).
+        let _entered = gpu.map(|g| self.gpu_gate.enter(g));
         // The GPU leaves the frame in a texture for the viewer; otherwise (Software Only, no
         // adapter, or a frame the GPU cannot finish here) the CPU renders it.
         // Auto (Mercury GPU Acceleration) shows each comp on whichever compositor measured
@@ -2453,7 +2460,6 @@ impl Worker {
                 // RT10e: the frame stays a texture egui draws (the compositor is on its device).
                 #[cfg(not(target_arch = "wasm32"))]
                 let resident = self.resident.on() && !job.disk_only;
-                let entered = self.gpu_gate.enter(g);
                 let attempt = g.within_memory(|| {
                     let f = g.render_display(&r, job.comp, job.t)?;
                     #[cfg(target_arch = "wasm32")]
@@ -2478,9 +2484,6 @@ impl Worker {
                         Some(Rendered::Image(FrameImage::Cpu(Arc::new(image))))
                     }
                 });
-                if matches!(attempt, Ok(Some(_))) {
-                    self.gpu_gate.finished(&entered);
-                }
                 match attempt {
                     Ok(Some(Rendered::Landing)) => {
                         if g.context().check_health().is_err() && self.unland(flight) {
@@ -2539,12 +2542,8 @@ impl Worker {
         }
         if let Some(g) = gpu {
             // The GPU composites and the frame is read back.
-            let entered = self.gpu_gate.enter(g);
             return match g.within_memory(|| r.comp_frame(job.comp, job.t)) {
-                Ok(img) => {
-                    self.gpu_gate.finished(&entered);
-                    Rendered::Image(FrameImage::Cpu(Arc::new(to_color_image(&img))))
-                }
+                Ok(img) => Rendered::Image(FrameImage::Cpu(Arc::new(to_color_image(&img)))),
                 Err(e) => {
                     self.gpu_attempt_failed(g, &e);
                     self.on_cpu_timed(job, times)
@@ -3311,7 +3310,7 @@ mod tests {
         };
         // Admitted one by one, as the pool's threads pick them up.
         let admitted = |backend: Backend| {
-            let mut q = Queue { threads: 8, ..Queue::default() };
+            let mut q = Queue { threads: 8, gate: Arc::new(vram::Gate::warmed()), ..Queue::default() };
             for n in 0..16 {
                 let j = job(n, backend);
                 if !q.can_start(&j) {
