@@ -804,6 +804,20 @@ fn active_cjk_locale() -> String {
     })
 }
 
+/// The CJK locale in force (the raw tag, lower case; empty when none) and the Han glyph forms it
+/// selects: `ja`, `ko`, `zh-hans` or `zh-hant`. Two machines render Han text alike when the second
+/// value matches (a cloud renderer pins `EFFECTCRAFT_CJK_LOCALE` to the Mac's tag).
+pub fn cjk_locale() -> (String, &'static str) {
+    let tag = active_cjk_locale();
+    let forms = match han_order_for(&tag)[0] {
+        FallbackScript::Korean => "ko",
+        FallbackScript::Han if asks_traditional_chinese(&tag) => "zh-hant",
+        FallbackScript::Han => "zh-hans",
+        _ => "ja",
+    };
+    (tag, forms)
+}
+
 /// The CJK language to try first for Han ideographs. Japanese when nothing says otherwise: the
 /// ambiguity only matters for ideographs, and kana / hangul in the same text pick their language
 /// regardless.

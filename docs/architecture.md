@@ -40,6 +40,7 @@ cpal or muda. Everything in L0 to L4, the egui UI and the web app also build for
 | L3 | `export` | Render queue encoding: H.264, HEVC and AV1 MP4, ProRes, WebM (VP9 + alpha or AV1, Opus), PNG/JPEG/TIFF/EXR sequences, GIF, WAV/AIFF |
 | L3 | `gpu` | The GPU compositor and GPU effects on wgpu compute shaders (Metal, Vulkan, Direct3D 12, WebGPU), checked against the CPU renderer |
 | L3 | `interchange` | Premiere Pro interop through timeline interchange (FCP7 XML, FCPXML, OTIO, EDL, AAF, OMF via FilmCraft's `filmcraft-interchange`): sequences ↔ compositions (§6a) |
+| L3 | `motionlib` | Motion Library: a card catalog in a private remote bucket (Cloudflare R2 behind a Worker, or a folder), cached locally by content hash; search (parity with the Python panel's `retrieval.py`), downloads (HTTPS with pure-Rust TLS on desktop, the page's fetch in the browser) and the Mac publisher |
 | L3 | `lottie` | Lottie JSON / dotLottie import and export (layers, precomps, eased and spatial keyframes, shapes, masks, mattes) with a warnings list for what Lottie cannot express |
 | L3 | `aep` | Versioned After Effects project IR → editable comps, layers, properties and media links; source AEP parsing is an import-time Python adapter |
 | L3 | `plugin` | Effect plug-ins: loads sandboxed WebAssembly effect modules (plug-in API v1; the wasmi interpreter behind the `wasm` feature, on for native hosts) into the effect registry ([plugins.md](plugins.md)) |

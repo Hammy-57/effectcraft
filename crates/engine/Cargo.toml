@@ -25,6 +25,7 @@ effectcraft-effects = { workspace = true }
 effectcraft-render = { workspace = true }
 effectcraft-segment = { workspace = true }
 effectcraft-track = { workspace = true }
+effectcraft-motionlib = { workspace = true }
 effectcraft-model = { workspace = true }
 effectcraft-lottie = { workspace = true }
 effectcraft-aep = { workspace = true }

@@ -69,6 +69,7 @@ const LAYERS: &[(&str, u8)] = &[
     ("format", 3),
     ("plugin", 3),
     ("interchange", 3),
+    ("motionlib", 3),
     ("engine", 4),
     ("script", 4),
     ("host", 4),
