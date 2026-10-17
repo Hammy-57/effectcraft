@@ -268,6 +268,23 @@ cmd_connect() {
   local pre; pre="$(rbash <<<"$REMOTE_PREFLIGHT")" || true
   [ -n "$(printf '%s' "$pre" | parse_kv gpu)" ] || die "cannot reach $TARGET or no GPU there: $pre"
   say "   GPU: $(printf '%s' "$pre" | parse_kv gpu), free VRAM $(printf '%s' "$pre" | parse_kv vram_free_mb) / $(printf '%s' "$pre" | parse_kv vram_total_mb) MB, free disk $(printf '%s' "$pre" | parse_kv disk_free_gb) GB"
+  # A machine rented without the EffectCraft template (or whose On-start didn't run): set it up
+  # here with the same script the template embeds, then check again.
+  local provision="$SKILL_SCRIPTS/template/ec-provision.sh"
+  if [ "$(printf '%s' "$pre" | parse_kv have_repo)" != 1 ] && [ -f "$provision" ]; then
+    say "🧰 The machine isn't set up for EffectCraft yet: running the template's setup (ec-provision.sh); about 3 min on 64+ cores"
+    rbash "$(base64 <"$provision" | tr -d '\n')" <<'EOS' >/dev/null
+printf '%s' "$1" | base64 -d > /root/ec-provision.sh
+pgrep -f ec-provision.sh >/dev/null || setsid nohup bash /root/ec-provision.sh >/dev/null 2>&1 </dev/null &
+EOS
+    local waited=0
+    until [ "$(rssh 'cat /tmp/ec-ready 2>/dev/null' | head -1)" != "" ]; do
+      [ "$waited" -ge 1800 ] && die "the setup didn't finish in 30 min (on the machine: tail /tmp/ec-setup.log)"
+      sleep 20; waited=$((waited + 20))
+    done
+    say "   setup: $(rssh 'head -1 /tmp/ec-ready')"
+    pre="$(rbash <<<"$REMOTE_PREFLIGHT")" || true
+  fi
   [ "$(printf '%s' "$pre" | parse_kv have_repo)" = 1 ] || die "no $REMOTE_DIR on the machine: it is not set up for EffectCraft yet (see the effectcraft-remote-gpu skill: scripts/template/ec-provision.sh)."
   [ "$(printf '%s' "$pre" | parse_kv have_cargo)" = 1 ] || die "no cargo on the machine, so effectcraft-cli cannot be built there."
   local free; free="$(printf '%s' "$pre" | parse_kv disk_free_gb)"
