@@ -335,13 +335,15 @@ impl TimelineState {
     }
 }
 
-/// Where a Timeline shortcut scrolls to.
+/// Where the Timeline scrolls to.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ScrollTo {
     /// D: the current time, centred in the time graph.
     Time,
     /// X: the topmost selected layer, at the top of the layers.
     Layer,
+    /// A revealed property, at the top of the rows.
+    Property(u64),
 }
 
 #[derive(Clone, Debug)]

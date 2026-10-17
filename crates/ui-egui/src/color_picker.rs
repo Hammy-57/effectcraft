@@ -66,7 +66,13 @@ pub fn color_popup(ui: &mut Ui, id: egui::Id, pos: egui::Pos2, c: &mut [f32; 3])
     }
     // A press outside closes the picker, unless it is the armed eyedropper's press on the viewer.
     let on_viewer = armed && eyedropper_point(ui.ctx()).is_some();
-    if pressed_outside(ui.ctx(), &area.response) && !on_viewer {
+    // A press in the pass that first draws the picker must not close it: an Area's rect is only
+    // at its requested position from its second pass on (the first pass reports it at the
+    // origin), so the click that just opened the picker would be read as a press outside it and
+    // the picker would flash and close in that one frame (#1476).
+    let pass_id = id.with("open-pass");
+    let drawn_before = ui.data(|d| d.get_temp::<u64>(pass_id)).is_some_and(|p| p < ui.ctx().cumulative_pass_nr());
+    if drawn_before && pressed_outside(ui.ctx(), &area.response) && !on_viewer {
         out.close.get_or_insert(true);
     }
     note_overlay(ui.ctx(), area.response.rect);
@@ -79,6 +85,7 @@ pub fn color_popup(ui: &mut Ui, id: egui::Id, pos: egui::Pos2, c: &mut [f32; 3])
         ui.data_mut(|d| {
             d.insert_temp(id.with("open"), false);
             d.remove::<[f32; 3]>(orig_id);
+            d.remove::<u64>(pass_id);
             // Closed: the next Escape is the dialog's again.
             d.remove::<u64>(open_pass_id());
         });
@@ -86,7 +93,10 @@ pub fn color_popup(ui: &mut Ui, id: egui::Id, pos: egui::Pos2, c: &mut [f32; 3])
         refresh_armed(ui.ctx(), id);
         // Still open after this pass: dialogs leave Escape to the picker (see `open_recently`).
         let pass = ui.ctx().cumulative_pass_nr();
-        ui.data_mut(|d| d.insert_temp(open_pass_id(), pass));
+        ui.data_mut(|d| {
+            d.insert_temp(pass_id, pass);
+            d.insert_temp(open_pass_id(), pass);
+        });
     }
     out.changed || sampled
 }

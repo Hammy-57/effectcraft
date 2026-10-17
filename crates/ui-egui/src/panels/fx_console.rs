@@ -201,7 +201,9 @@ pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context) {
     if esc || (toggle && !c.fresh) {
         return;
     }
-    let presets = super::effects_presets::user_presets(ctx, false);
+    let presets = super::effects_presets::user_presets(ctx, false, || {
+        super::effects_presets::presets_dir().map(|d| super::effects_presets::scan_presets(&d)).unwrap_or_default()
+    });
     let hits = search(&c.query, &app.ui.effects_recent, &app.ui.effects_favorites, &presets);
     if down {
         c.sel = (c.sel + 1).min(hits.len().saturating_sub(1));
