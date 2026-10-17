@@ -89,6 +89,7 @@ const PINNED_INVOKE: &[&str] = &[
     "motionLibrary.apply",
     "motionLibrary.copyName",
     "motionLibrary.save",
+    "motionLibrary.folder",
 ];
 
 /// The ids `menus::frontend` handled (frontend events of engine commands), in the old match order.
