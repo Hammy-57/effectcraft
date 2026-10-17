@@ -220,3 +220,47 @@ fn configure_keeps_the_token_out_of_replies() {
     let st = s.execute("library.sync", json!({})).unwrap();
     assert!(st["error"].as_str().is_some_and(|e| e.contains("not found")), "{st}");
 }
+
+/// `catalogAll`: the rest of the library is listed with thumbnails only (applied on the Mac):
+/// browsable, never applied here, and left out of `library.search` (insertable cards only).
+#[test]
+fn catalog_all_lists_on_the_mac_cards() {
+    let root = out_dir("motion-library-catalog-all");
+    let (lib, media, remote, cache) = (root.join("lib"), root.join("media"), root.join("remote"), root.join("cache"));
+    for d in [&lib, &media, &remote, &lib.join("projects")] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let thumb = media.join("thumb.png");
+    std::fs::write(&thumb, b"thumbnail bytes").unwrap();
+    card_project(&lib.join("projects"), &media, "Reel Card");
+    card_project(&lib.join("projects"), &media, "Other Thing");
+    let index = json!({"format": "effectcraft-library", "version": 1, "name": "Test Library",
+        "collections": {"order": {"Tapa": 0, "Devin Jatho": 1}, "folders": ["Tapa"]},
+        "entries": [entry("reel", "Reel Card", "Devin Jatho/UI", "projects/Reel Card.ecproj", &thumb),
+                    entry("other", "Other Thing", "Graphs", "projects/Other Thing.ecproj", &thumb)],
+        "catalog_only": [{"id": "ease", "name": "Snappy ease", "category": "Graphs", "kind": "mac", "type_label": "Ease", "thumbnail": thumb.to_string_lossy()}]});
+    std::fs::write(lib.join("library.json"), serde_json::to_vec(&index).unwrap()).unwrap();
+    let mut pubs = Session::default();
+    let r = pubs
+        .execute(
+            "library.publish",
+            json!({"library": lib.to_string_lossy(), "folders": ["Devin Jatho"], "catalogAll": true, "remote": remote.to_string_lossy()}),
+        )
+        .unwrap();
+    assert_eq!((r["cards"].as_u64(), r["onMac"].as_u64()), (Some(3), Some(2)), "{r}");
+
+    let mut s = session_with(&remote, &cache);
+    s.execute("library.sync", json!({})).unwrap();
+    let cat = s.execute("library.catalog", json!({"folder": "Graphs"})).unwrap();
+    assert_eq!(cat["total"], 2, "{cat}");
+    assert!(cat["cards"].as_array().unwrap().iter().all(|c| c["onMac"] == true));
+    let folders: Vec<&str> = cat["folders"].as_array().unwrap().iter().filter_map(|f| f["folder"].as_str()).collect();
+    assert_eq!(folders, ["Tapa", "Devin Jatho", "Devin Jatho/UI", "Graphs"]);
+    let card = s.execute("library.card", json!({"id": "ease"})).unwrap();
+    assert_eq!((card["kindLabel"].as_str(), card["onMac"].as_bool()), (Some("Ease"), Some(true)));
+    let err = s.execute("library.apply", json!({"id": "other"})).unwrap_err().to_string();
+    assert!(err.contains("on the Mac"), "{err}");
+    let found = s.execute("library.search", json!({"query": "other thing"})).unwrap();
+    assert!(found["entries"].as_array().unwrap().iter().all(|e| e["source"] != "motion"), "{found}");
+    assert!(s.execute("library.apply", json!({"id": "reel"})).is_ok());
+}

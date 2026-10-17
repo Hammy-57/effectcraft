@@ -872,14 +872,21 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                         crate::icons::paint(&gp, Rect::from_center_size(thumb_r.center(), vec2(g, g)), icon, t.text_faint.gamma_multiply(0.7));
                     }
                 }
-                if card.needs_footage() {
-                    let label = tr("needs footage");
+                // A badge: footage to relink, or a card applied in After Effects on the Mac.
+                let badge = if card.on_mac {
+                    Some((tr("on the Mac"), Color32::from_black_alpha(170), t.text))
+                } else if card.needs_footage() {
+                    Some((tr("needs footage"), t.warning.gamma_multiply(0.9), Color32::BLACK))
+                } else {
+                    None
+                };
+                if let Some((label, fill, color)) = badge {
                     let font = Tokens::medium(9.5 * s);
-                    let bw = gp.layout_no_wrap(label.to_string(), font.clone(), Color32::BLACK).size().x + 12.0 * s;
+                    let bw = gp.layout_no_wrap(label.to_string(), font.clone(), color).size().x + 12.0 * s;
                     let badge = Rect::from_min_size(pos2(thumb_r.min.x + 5.0 * s, thumb_r.max.y - 20.0 * s), vec2(bw, 15.0 * s));
                     if badge.max.x < thumb_r.max.x {
-                        gp.rect_filled(badge, CornerRadius::same((7.0 * s) as u8), t.warning.gamma_multiply(0.9));
-                        gp.text(badge.center(), Align2::CENTER_CENTER, label, font, Color32::BLACK);
+                        gp.rect_filled(badge, CornerRadius::same((7.0 * s) as u8), fill);
+                        gp.text(badge.center(), Align2::CENTER_CENTER, label, font, color);
                     }
                 }
                 if view.applying.as_deref() == Some(card.id.as_str()) {
@@ -905,13 +912,23 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     let meta = elide(&gp, &card.subtitle(), &meta_font, cw);
                     gp.text(pos2(cx, thumb_r.max.y + 28.0 * s), Align2::LEFT_CENTER, &meta, meta_font, t.text_faint);
                 }
-                let label = if card.needs_footage() { format!("{} (needs footage)", card.name) } else { card.name.clone() };
+                let label = if card.on_mac {
+                    format!("{} (on the Mac)", card.name)
+                } else if card.needs_footage() {
+                    format!("{} (needs footage)", card.name)
+                } else {
+                    card.name.clone()
+                };
                 app.auto.add(&format!("motionLibrary.card.{}", card.id), tile.intersect(grid), &label);
                 if resp.clicked() {
                     view.selected = Some(card.id.clone());
                 }
                 if resp.double_clicked() {
-                    apply_now = Some(card.id.clone());
+                    if card.applicable() {
+                        apply_now = Some(card.id.clone());
+                    } else {
+                        app.ui.status = format!("“{}” is on the Mac: apply it in After Effects there", card.name);
+                    }
                 }
                 if hovered {
                     let mut tip = format!("{}\n{}", card.name, card.subtitle());
@@ -919,7 +936,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                         let names: Vec<&str> = card.placeholders.iter().map(|p| p.name.as_str()).take(3).collect();
                         tip.push_str(&format!("\nNeeds footage: {}", names.join(", ")));
                     }
-                    tip.push_str("\nDouble-click to add");
+                    tip.push_str(if card.on_mac { "\nOn the Mac: apply it in After Effects there" } else { "\nDouble-click to add" });
                     resp.on_hover_text(tip);
                 }
             }
@@ -943,6 +960,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let ar = Rect::from_min_size(pos2(footer.max.x - 80.0 * s, footer.center().y - 11.0 * s), vec2(72.0 * s, 22.0 * s));
     if let Some(card) = &sel {
         let info = format!("{}  ·  {}{}", card.name, card.subtitle(), if card.needs_footage() { "  ·  needs footage" } else { "" });
+        let ar = if card.applicable() { ar } else { Rect::from_min_max(pos2(ar.min.x - 20.0 * s, ar.min.y), ar.max) };
         draw_text_clipped(
             &p,
             Rect::from_min_max(pos2(footer.min.x + 10.0 * s, footer.min.y), pos2(ar.min.x - 8.0, footer.max.y)),
@@ -950,8 +968,13 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             Tokens::ui(11.5 * s),
             t.text_dim,
         );
-        if kit::button(app, ui, ar, "motionLibrary.apply", "Apply", true) {
-            apply_now = Some(card.id.clone());
+        if card.applicable() {
+            if kit::button(app, ui, ar, "motionLibrary.apply", "Apply", true) {
+                apply_now = Some(card.id.clone());
+            }
+        } else {
+            p.text(pos2(ar.max.x, ar.center().y), Align2::RIGHT_CENTER, tr("On the Mac"), Tokens::medium(11.5 * s), t.text_faint);
+            app.auto.add("motionLibrary.onMac", ar, "On the Mac");
         }
     }
     if let Some(id) = apply_now {
