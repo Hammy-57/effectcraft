@@ -59,6 +59,15 @@ the quick actions on the right, each an engine command: `layer.smartPrecompose`,
 `layer.decompose`, `layer.multiPrecompose`, `project.deepDuplicate`, `layer.splitMasks`,
 `shape.gradientLock` (and `keys.easyEase`).
 
+On the Mac that keeps the library (its `effectcraft` folder added with `library.addFolder`, as in
+Settings ▸ libraries), every card that folder lists applies from the local files (`library.apply`
+answers `source: "local"`: nothing downloads, footage stays linked) and its hover preview plays
+from the local preview or video; "on the Mac" shows only where those files aren't there.
+`library.apply {remote: true}` uses the bucket anyway. Right-click a card: Apply at Playhead,
+Apply at Composition Start, Details, Show in Collection, Reveal in Finder (`library.reveal`) and
+Copy Name (`motionLibrary.copyName`). Previews from the bucket download once into the cache
+(`~/Library/Caches/EffectCraft/Motion Library`) and play from there.
+
 Search ranks cards like the Python panel (`retrieval.py`; parity test in
 `crates/motionlib/src/search.rs`).
 

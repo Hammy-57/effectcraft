@@ -13,6 +13,9 @@
 //! layers), `footage` and `audio` (media files). Relative paths resolve against the library
 //! folder. Settings ▸ `libraries` lists the folders.
 
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -86,6 +89,72 @@ fn read_library(s: &Session, folder: &str) -> std::result::Result<Library, Strin
 /// Every configured library that reads (the others are reported by `library.folders`).
 fn libraries(s: &Session) -> Vec<Library> {
     s.prefs.libraries.iter().filter_map(|f| read_library(s, f).ok()).collect()
+}
+
+/// A library folder's entry with absolute paths. On the Mac that keeps the Motion Library, its
+/// cards apply and preview from these files (same ids) instead of the bucket.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LocalEntry {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub category: String,
+    pub file: String,
+    pub preview: String,
+    pub thumbnail: String,
+    pub folder: String,
+}
+
+/// Local entries by id (the first folder listing an id wins).
+pub type LocalIndex = BTreeMap<String, LocalEntry>;
+
+/// An index file's size and modification time (none on the web).
+fn stamp(path: &str) -> Option<(u64, std::time::SystemTime)> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let m = std::fs::metadata(path).ok()?;
+        Some((m.len(), m.modified().ok()?))
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = path;
+        None
+    }
+}
+
+type LocalKey = Vec<(String, Option<(u64, std::time::SystemTime)>)>;
+
+/// Every configured folder's entries, read again only when a folder or its index changes (the
+/// Motion Library panel asks every frame).
+pub(crate) fn local_entries(s: &Session) -> Arc<LocalIndex> {
+    static CACHE: Mutex<Option<(LocalKey, Arc<LocalIndex>)>> = Mutex::new(None);
+    let key: LocalKey = s.prefs.libraries.iter().map(|f| (f.clone(), stamp(&index_path(f)))).collect();
+    if let Ok(c) = CACHE.lock()
+        && let Some((k, index)) = c.as_ref()
+        && *k == key
+    {
+        return index.clone();
+    }
+    let mut index = LocalIndex::new();
+    for lib in libraries(s) {
+        for e in &lib.entries {
+            index.entry(e.id.clone()).or_insert_with(|| LocalEntry {
+                id: e.id.clone(),
+                name: e.name.clone(),
+                kind: e.kind.clone(),
+                category: e.category.clone(),
+                file: resolve(&lib.folder, &e.file),
+                preview: resolve(&lib.folder, &e.preview),
+                thumbnail: resolve(&lib.folder, &e.thumbnail),
+                folder: lib.folder.clone(),
+            });
+        }
+    }
+    let index = Arc::new(index);
+    if let Ok(mut c) = CACHE.lock() {
+        *c = Some((key, index.clone()));
+    }
+    index
 }
 
 fn summary(lib: &Library, e: &Entry) -> Value {

@@ -16,6 +16,7 @@ use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use effectcraft_engine::motion_library::LocalIndex;
 use effectcraft_engine::motionlib::{BlobRef, BlobState, Card, Client, FolderRow};
 use egui::{Align2, Color32, CornerRadius, Rect, Sense, Stroke, pos2, vec2};
 use serde::{Deserialize, Serialize};
@@ -261,9 +262,21 @@ fn stop_preview(ctx: &egui::Context) {
     }
 }
 
-/// The preview frame to draw over `card` now (starting its download and decode on first hover).
-fn preview_frame(app: &EffectcraftApp, ctx: &egui::Context, client: &Client, card: &Card) -> Option<egui::TextureHandle> {
-    let blob = card.preview.as_ref()?;
+/// The movie to preview from this machine's library folder: the entry's preview, else its file
+/// when that is a video (Overlay cards). Played from disk: nothing downloads.
+fn local_preview(local: &LocalIndex, card: &Card) -> Option<String> {
+    let e = local.get(&card.id)?;
+    let is_file = |p: &str| !p.is_empty() && std::path::Path::new(p).is_file();
+    if is_file(&e.preview) {
+        return Some(e.preview.clone());
+    }
+    let ext = std::path::Path::new(&e.file).extension().map(|x| x.to_string_lossy().to_lowercase()).unwrap_or_default();
+    (matches!(ext.as_str(), "mp4" | "mov" | "m4v" | "webm") && is_file(&e.file)).then(|| e.file.clone())
+}
+
+/// The preview frame to draw over `card` now (starting its decode on first hover: a local file,
+/// else the preview downloaded once into the cache).
+fn preview_frame(app: &EffectcraftApp, ctx: &egui::Context, client: &Client, local: &LocalIndex, card: &Card) -> Option<egui::TextureHandle> {
     let slot = preview_slot(ctx);
     let mut p = slot.lock().ok()?;
     if p.card != card.id {
@@ -274,7 +287,11 @@ fn preview_frame(app: &EffectcraftApp, ctx: &egui::Context, client: &Client, car
         return None;
     }
     if p.started.is_none() {
-        match client.blob(blob) {
+        let state = match local_preview(local, card) {
+            Some(path) => BlobState::Ready(Some(std::path::PathBuf::from(path))),
+            None => client.blob(card.preview.as_ref()?),
+        };
+        match state {
             BlobState::Loading => {
                 ctx.request_repaint_after(std::time::Duration::from_millis(100));
                 return None;
@@ -367,6 +384,26 @@ fn decode_preview(
     footage.forget(path);
 }
 
+/// This machine has the card's files (a library folder lists it): it applies from them, so it
+/// isn't "on the Mac" and needs no footage here.
+fn is_local(card: &Card, local: &LocalIndex) -> bool {
+    local.get(&card.id).is_some_and(|e| !e.file.is_empty())
+}
+
+/// The card can be applied here (from the bucket or this machine's library folder).
+fn usable(card: &Card, local: &LocalIndex) -> bool {
+    card.applicable() || is_local(card, local)
+}
+
+/// Listed only: applied in After Effects on the Mac that has its files.
+fn on_mac(card: &Card, local: &LocalIndex) -> bool {
+    card.on_mac && !is_local(card, local)
+}
+
+fn needs_footage(card: &Card, local: &LocalIndex) -> bool {
+    card.needs_footage() && !is_local(card, local)
+}
+
 /// The adopted catalog's identity (a new one after an update).
 fn generation(client: &Client) -> u64 {
     client.catalog().map_or(0, |c| Arc::as_ptr(&c) as usize as u64)
@@ -374,10 +411,10 @@ fn generation(client: &Client) -> u64 {
 
 /// Cards matching the view, cached per catalog generation, query and folder. Browsing everything
 /// (no folder, no query) groups them by folder in the library's order.
-fn visible_cards(ctx: &egui::Context, client: &Client, view: &ViewState) -> Arc<Vec<Card>> {
+fn visible_cards(ctx: &egui::Context, client: &Client, local: &Arc<LocalIndex>, view: &ViewState) -> Arc<Vec<Card>> {
     type Cached = (u64, String, String, String, bool, Arc<Vec<Card>>);
     let id = egui::Id::new("ml-cards");
-    let generation = generation(client);
+    let generation = generation(client) ^ (Arc::as_ptr(local) as usize as u64).rotate_left(17);
     if let Some((g, q, f, k, h, cards)) = ctx.data(|d| d.get_temp::<Cached>(id))
         && g == generation
         && q == view.query
@@ -393,7 +430,7 @@ fn visible_cards(ctx: &egui::Context, client: &Client, view: &ViewState) -> Arc<
             let mut found: Vec<Card> = effectcraft_engine::motionlib::search(&cat.cards, &view.query, &view.folder)
                 .into_iter()
                 .filter(|c| view.kind_filter.is_empty() || kind_label(c) == view.kind_filter)
-                .filter(|c| !view.here_only || c.applicable())
+                .filter(|c| !view.here_only || usable(c, local))
                 .cloned()
                 .collect();
             if grouped(view) {
@@ -973,6 +1010,38 @@ fn kind_label(c: &Card) -> &str {
     }
 }
 
+/// A card's right-click menu: each entry is a command (with an automation id) → the one picked.
+fn card_menu(auto: &mut crate::automation::Registry, resp: &egui::Response, card: &Card, local: &LocalIndex) -> Option<(&'static str, Value)> {
+    let mut pick = None;
+    let here = usable(card, local);
+    let has_file = is_local(card, local);
+    crate::widgets::context_menu(resp, |ui| {
+        let mut entry = |ui: &mut egui::Ui, key: &str, label: &str, enabled: bool, cmd: &'static str, params: Value| {
+            let b = ui.add_enabled(enabled, egui::Button::new(tr(label)));
+            auto.add_response(&format!("motionLibrary.menu.{key}"), &b, label);
+            if b.clicked() {
+                pick = Some((cmd, params));
+                ui.close();
+            }
+        };
+        entry(ui, "apply", "Apply at Playhead", here, "motionLibrary.apply", json!({"id": card.id}));
+        entry(ui, "applyAtStart", "Apply at Composition Start", here, "motionLibrary.apply", json!({"id": card.id, "time": 0.0}));
+        ui.separator();
+        entry(ui, "details", "Details…", true, "motionLibrary.view", json!({"details": card.id, "select": card.id}));
+        entry(
+            ui,
+            "showInCollection",
+            "Show in Collection",
+            true,
+            "motionLibrary.view",
+            json!({"folder": card.category, "query": "", "kind": "", "select": card.id}),
+        );
+        entry(ui, "reveal", "Reveal in Finder", has_file, "library.reveal", json!({"id": card.id}));
+        entry(ui, "copyName", "Copy Name", true, "motionLibrary.copyName", json!({"id": card.id}));
+    });
+    pick
+}
+
 /// The card's details over the grid: preview image, what and where it is, its files, and Apply.
 fn details_sheet(
     app: &mut EffectcraftApp,
@@ -1014,11 +1083,14 @@ fn details_sheet(
     y += 20.0 * s;
     p.text(pos2(inner.min.x, y), Align2::LEFT_TOP, card.subtitle(), Tokens::ui(11.0 * s), t.text_faint);
     y += 20.0 * s;
+    let local = app.session.motion_library_local();
     let mut facts = vec![];
     if let Some(d) = card.duration.filter(|d| *d > 0.0) {
         facts.push(format!("{d:.1} s"));
     }
-    if card.on_mac {
+    if let Some(e) = local.get(&card.id).filter(|_| is_local(card, &local)) {
+        facts.push(format!("from this Mac's library: {}", e.file));
+    } else if card.on_mac {
         facts.push(tr("on the Mac: apply it in After Effects there").to_string());
     } else {
         let bytes: u64 = card.apply_blobs().iter().map(|b| b.size).sum();
@@ -1029,7 +1101,7 @@ fn details_sheet(
             bytes as f64 / 1e6
         ));
     }
-    if card.needs_footage() {
+    if needs_footage(card, &local) {
         let names: Vec<&str> = card.placeholders.iter().map(|p| p.name.as_str()).take(4).collect();
         facts.push(format!("needs footage: {}", names.join(", ")));
     }
@@ -1051,7 +1123,7 @@ fn details_sheet(
     if kit::button(app, ui, close_r, "motionLibrary.details.close", "Close", false) || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
         view.details = None;
     }
-    if card.applicable() {
+    if usable(card, &local) {
         if kit::button(app, ui, apply_r, "motionLibrary.details.apply", "Apply", true) {
             apply = Some(card.id.clone());
             view.details = None;
@@ -1094,18 +1166,21 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let mut budget = 6u32;
     let total = client.catalog().map_or(0, |c| c.cards.len());
     let tree = folder_tree(&ctx, &client);
+    let local = app.session.motion_library_local();
     let footer_h = 32.0 * s;
     let narrow = rect.width() < 460.0;
+    // The collection tree stays down to small docks (a dropdown below that).
+    let tree_fits = rect.width() >= 330.0;
 
     // The rail on the left, the quick actions on the right (hidden when the panel is narrow).
     let rail_w = (44.0 * s).round().min(rect.width() * 0.2);
     let rail_r = Rect::from_min_max(rect.min, pos2(rect.min.x + rail_w, rect.max.y));
     let tools_w = if view.show_tools && !narrow { (40.0 * s).round() } else { 0.0 };
     let tools_r = Rect::from_min_max(pos2(rect.max.x - tools_w, rect.min.y), pos2(rect.max.x, rect.max.y - footer_h));
-    // Collections: a tree on the left (a dropdown when the panel is narrow).
+    // Collections: a tree on the left (a dropdown when the panel is very narrow).
     let mut main = Rect::from_min_max(pos2(rail_r.max.x + 1.0, rect.min.y), pos2(rect.max.x - tools_w, rect.max.y - footer_h));
-    if !narrow && view.show_folders {
-        let side_w = (184.0 * s).min(main.width() * 0.38).round();
+    if tree_fits && view.show_folders {
+        let side_w = (184.0 * s).min(main.width() * if narrow { 0.36 } else { 0.38 }).max(96.0).round();
         let side = Rect::from_min_max(main.min, pos2(main.min.x + side_w, main.max.y));
         main.min.x = side.max.x + 1.0;
         p.line_segment([side.right_top(), side.right_bottom()], Stroke::new(1.0, t.separator));
@@ -1187,13 +1262,33 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         {
             view.expanded.insert(path);
         }
+        // Its scroll bar (drag it, or scroll over the tree).
+        let max = (content - list.height()).max(0.0);
+        if max > 0.0 {
+            let track = Rect::from_min_max(pos2(side.max.x - 7.0 * s, list.min.y + 2.0), pos2(side.max.x - 1.0, list.max.y - 2.0));
+            let bar_h = (track.height() * list.height() / content).max(20.0 * s).min(track.height());
+            let y = track.min.y + (track.height() - bar_h) * (view.folder_scroll / max);
+            let bar = Rect::from_min_size(pos2(track.min.x, y), vec2(track.width(), bar_h));
+            let bresp = ui.interact(track, egui::Id::new("ml-folder-scrollbar"), Sense::click_and_drag());
+            app.auto.add("motionLibrary.folderScroll", track, "Scroll the collections");
+            if bresp.dragged() {
+                view.folder_scroll += bresp.drag_delta().y * content / track.height();
+            } else if bresp.clicked()
+                && let Some(pos) = bresp.interact_pointer_pos()
+            {
+                view.folder_scroll = (pos.y - track.min.y - bar_h / 2.0) / (track.height() - bar_h).max(1.0) * max;
+            }
+            view.folder_scroll = view.folder_scroll.clamp(0.0, max);
+            let strong = bresp.hovered() || bresp.dragged();
+            sp.rect_filled(bar, CornerRadius::same(3), t.text_faint.gamma_multiply(if strong { 0.9 } else { 0.5 }));
+        }
     }
 
     // Header: the collection and its count, the update chip or status, search, refresh, display.
     let pad = 10.0 * s;
     let head_h = 36.0 * s;
     let head = Rect::from_min_size(main.min, vec2(main.width(), head_h));
-    let cards = visible_cards(&ctx, &client, &view);
+    let cards = visible_cards(&ctx, &client, &local, &view);
     let search_w = (240.0 * s).min((head.width() * 0.5).max(80.0));
     let search_r = Rect::from_min_size(pos2(head.max.x - pad - search_w, head.center().y - 12.0 * s), vec2(search_w, 24.0 * s));
     let mut q = view.query.clone();
@@ -1245,7 +1340,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         app.auto.add("motionLibrary.status", info, &text);
     }
     let mut grid = Rect::from_min_max(pos2(main.min.x, head.max.y), main.max);
-    if narrow {
+    if !tree_fits {
         let dr = Rect::from_min_size(pos2(grid.min.x + pad, grid.min.y), vec2((grid.width() - 2.0 * pad).max(60.0), 22.0 * s));
         let rows = shown_rows(&tree, &view.expanded);
         let mut paths: Vec<String> = vec![String::new()];
@@ -1294,6 +1389,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let radius = CornerRadius::same((6.0 * s) as u8);
     let mut hovered_card = None;
     let mut apply_now: Option<String> = None;
+    // A card's right-click menu entry: a command and its params, run after the cards.
+    let mut menu_pick: Option<(&'static str, Value)> = None;
     for item in &lay.items {
         match item {
             Placed::Header { folder, count, rect: hr } => {
@@ -1319,7 +1416,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 let thumb_r = Rect::from_min_size(tile.min, vec2(tile.width(), *thumb_h));
                 let resp = ui.interact(tile.intersect(grid), egui::Id::new(("ml-card", &card.id)), Sense::click_and_drag());
                 // Drag a card onto the Timeline or the Composition viewer to apply it there.
-                if resp.drag_started() && card.applicable() {
+                if resp.drag_started() && usable(card, &local) {
                     egui::DragAndDrop::set_payload(&ctx, super::DragPayload::LibraryCard(card.id.clone()));
                 }
                 let selected = view.selected.as_deref() == Some(card.id.as_str());
@@ -1327,7 +1424,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 gp.rect_filled(tile, radius, if hovered { t.hover } else { t.row_alt });
                 let tr_radius = CornerRadius { nw: radius.nw, ne: radius.ne, sw: 0, se: 0 };
                 gp.rect_filled(thumb_r, tr_radius, t.field_bg);
-                let live = if hovered { preview_frame(app, &ctx, &client, card) } else { None };
+                let live = if hovered { preview_frame(app, &ctx, &client, &local, card) } else { None };
                 if hovered {
                     hovered_card = Some(card.id.clone());
                 }
@@ -1349,9 +1446,9 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     }
                 }
                 // A badge: footage to relink, or a card applied in After Effects on the Mac.
-                let badge = if card.on_mac {
+                let badge = if on_mac(card, &local) {
                     Some((tr("on the Mac"), Color32::from_black_alpha(170), t.text))
-                } else if card.needs_footage() {
+                } else if needs_footage(card, &local) {
                     Some((tr("needs footage"), t.warning.gamma_multiply(0.9), Color32::BLACK))
                 } else {
                     None
@@ -1402,19 +1499,22 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     let meta = elide(&gp, &card.subtitle(), &meta_font, cw);
                     gp.text(pos2(cx, thumb_r.max.y + 28.0 * s), Align2::LEFT_CENTER, &meta, meta_font, t.text_faint);
                 }
-                let label = if card.on_mac {
+                let label = if on_mac(card, &local) {
                     format!("{} (on the Mac)", card.name)
-                } else if card.needs_footage() {
+                } else if needs_footage(card, &local) {
                     format!("{} (needs footage)", card.name)
                 } else {
                     card.name.clone()
                 };
                 app.auto.add(&format!("motionLibrary.card.{}", card.id), tile.intersect(grid), &label);
-                if resp.clicked() {
+                if resp.clicked() || resp.secondary_clicked() {
                     view.selected = Some(card.id.clone());
                 }
+                if let Some(pick) = card_menu(&mut app.auto, &resp, card, &local) {
+                    menu_pick = Some(pick);
+                }
                 if resp.double_clicked() {
-                    if card.applicable() {
+                    if usable(card, &local) {
                         apply_now = Some(card.id.clone());
                     } else {
                         app.ui.status = format!("“{}” is on the Mac: apply it in After Effects there", card.name);
@@ -1422,11 +1522,11 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 }
                 if hovered {
                     let mut tip = format!("{}\n{}", card.name, card.subtitle());
-                    if card.needs_footage() {
+                    if needs_footage(card, &local) {
                         let names: Vec<&str> = card.placeholders.iter().map(|p| p.name.as_str()).take(3).collect();
                         tip.push_str(&format!("\nNeeds footage: {}", names.join(", ")));
                     }
-                    tip.push_str(if card.on_mac {
+                    tip.push_str(if on_mac(card, &local) {
                         "\nOn the Mac: apply it in After Effects there"
                     } else {
                         "\nDouble-click to add, or drag it onto the Timeline"
@@ -1453,8 +1553,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let sel = view.selected.as_ref().and_then(|id| client.catalog().and_then(|c| c.card(id).cloned()));
     let ar = Rect::from_min_size(pos2(footer.max.x - 80.0 * s, footer.center().y - 11.0 * s), vec2(72.0 * s, 22.0 * s));
     if let Some(card) = &sel {
-        let info = format!("{}  ·  {}{}", card.name, card.subtitle(), if card.needs_footage() { "  ·  needs footage" } else { "" });
-        let ar = if card.applicable() { ar } else { Rect::from_min_max(pos2(ar.min.x - 20.0 * s, ar.min.y), ar.max) };
+        let info = format!("{}  ·  {}{}", card.name, card.subtitle(), if needs_footage(card, &local) { "  ·  needs footage" } else { "" });
+        let ar = if usable(card, &local) { ar } else { Rect::from_min_max(pos2(ar.min.x - 20.0 * s, ar.min.y), ar.max) };
         draw_text_clipped(
             &p,
             Rect::from_min_max(pos2(footer.min.x + 10.0 * s, footer.min.y), pos2(ar.min.x - 8.0, footer.max.y)),
@@ -1462,7 +1562,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             Tokens::ui(11.5 * s),
             t.text_dim,
         );
-        if card.applicable() {
+        if usable(card, &local) {
             if kit::button(app, ui, ar, "motionLibrary.apply", "Apply", true) {
                 apply_now = Some(card.id.clone());
             }
@@ -1493,6 +1593,14 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         let r = Rect::from_min_size(ptr + vec2(14.0, 10.0), g.size()).expand2(vec2(8.0, 4.0));
         lp.rect_filled(r, CornerRadius::same(6), t.accent);
         lp.galley(r.min + vec2(8.0, 4.0), g, Color32::WHITE);
+    }
+    if let Some((cmd, params)) = menu_pick {
+        // Through the command layer (as menus and agents run them), on the view in hand.
+        app.ui.motion_library = view.clone();
+        if let Err(e) = crate::menus::invoke(app, &ctx, cmd, params) {
+            app.ui.status = e;
+        }
+        view = app.ui.motion_library.clone();
     }
     if let Some(id) = apply_now {
         view.selected = Some(id.clone());
@@ -1585,6 +1693,9 @@ pub fn set_view(view: &mut ViewState, p: &Value) -> Result<Value, String> {
     }
     if let Some(d) = p.get("details") {
         view.details = d.as_str().map(str::to_string);
+    }
+    if let Some(sel) = p.get("select") {
+        view.selected = sel.as_str().map(str::to_string);
     }
     view.clamp();
     Ok(view.to_json())
