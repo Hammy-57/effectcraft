@@ -192,6 +192,12 @@ impl Gpu {
         GpuContext::request_off_window(window).await.map(|r| r.map(Gpu::from_context))
     }
 
+    /// A weak handle on this compositor's device: dead once every clone is dropped, and its
+    /// video memory freed with it (CR1: a replacement waits for that).
+    pub fn downgrade(&self) -> std::sync::Weak<GpuContext> {
+        Arc::downgrade(&self.ctx)
+    }
+
     pub fn from_context(ctx: GpuContext) -> Gpu {
         Gpu { ctx: Arc::new(ctx), auto: Default::default(), declined: Default::default() }
     }

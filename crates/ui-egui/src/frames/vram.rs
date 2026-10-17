@@ -39,8 +39,10 @@ pub(crate) struct Gate {
     finished: AtomicUsize,
     /// Bytes a GPU frame takes on the device, as measured (0: not yet).
     per_frame: AtomicU64,
-    /// Device bytes with no GPU frame rendering (`u64::MAX`: not measured).
+    /// Device bytes with no GPU frame rendering (`u64::MAX`: not measured), and at the last
+    /// measurement.
     baseline: AtomicU64,
+    last_bytes: AtomicU64,
     /// The device reports its allocations: 0 not known yet, 1 yes, 2 no.
     measurable: std::sync::atomic::AtomicU8,
     last_sample: Mutex<Option<web_time::Instant>>,
@@ -55,13 +57,15 @@ impl Default for Gate {
             finished: AtomicUsize::new(0),
             per_frame: AtomicU64::new(0),
             baseline: AtomicU64::new(u64::MAX),
+            last_bytes: AtomicU64::new(0),
             measurable: std::sync::atomic::AtomicU8::new(0),
             last_sample: Mutex::new(None),
         }
     }
 }
 
-/// A GPU frame rendering ([`Gate::enter`]); counted out when dropped.
+/// A frame rendering with the GPU attached ([`Gate::enter`]: composited on it, or composited on
+/// the CPU with its effects and uploads on the GPU); counted out when dropped.
 pub(crate) struct Entered<'a> {
     gate: &'a Gate,
     gpu: Gpu,
@@ -69,6 +73,7 @@ pub(crate) struct Entered<'a> {
 
 impl Drop for Entered<'_> {
     fn drop(&mut self) {
+        self.gate.finished(&self.gpu);
         // Paired with `enter`'s increment.
         if self.gate.rendering.fetch_sub(1, Ordering::AcqRel) == 1 {
             // Nothing rendering: what the device holds now is the baseline.
@@ -95,13 +100,21 @@ impl Gate {
         // took about 1 GB a frame on a 24 GB card): the first frames never fill it at once.
         let assumed = if learned == 0 { vram.map_or(0, |m| m.total / 16) } else { learned };
         let per = (assumed as f64).max(frame).max(1.0);
+        let rendering = self.rendering.load(Ordering::Acquire);
         let mut n = match ctx.live_video_memory() {
             // The frames rendering now, and as many more as the room left on the card holds,
             // keeping a tenth of it free (other programs, the driver): another program that
-            // takes memory (another EffectCraft on the same card) leaves fewer frames.
+            // takes memory (another EffectCraft on the same card) leaves fewer frames. The
+            // frames rendering may still grow to a whole frame each: that room is kept for them
+            // (a heavy stretch of the comp took 9 GB in a second, 8 frames at once).
             Some(m) => {
-                let room = m.free.saturating_sub(m.total / 10);
-                self.rendering.load(Ordering::Acquire).saturating_add((room as f64 / per) as usize)
+                let grown = match self.baseline.load(Ordering::Acquire) {
+                    u64::MAX => 0,
+                    b => self.last_bytes.load(Ordering::Acquire).saturating_sub(b),
+                };
+                let reserve = ((rendering as f64 * per) as u64).saturating_sub(grown);
+                let room = m.free.saturating_sub(m.total / 10).saturating_sub(reserve);
+                rendering.saturating_add((room as f64 / per) as usize)
             }
             None => (UNKNOWN_VRAM_BUDGET as f64 / per) as usize,
         }
@@ -118,28 +131,36 @@ impl Gate {
         self.ceiling.load(Ordering::Acquire).max(1)
     }
 
-    /// A GPU frame starts rendering on `g`.
+    /// A frame starts rendering with `g` attached.
     pub(crate) fn enter(&self, g: &Gpu) -> Entered<'_> {
+        let rendering = self.rendering.load(Ordering::Acquire);
         if self.baseline.load(Ordering::Acquire) == u64::MAX
-            && self.rendering.load(Ordering::Acquire) == 0
+            && rendering == 0
             && let Some(bytes) = self.sample(g, true)
         {
             self.baseline.store(bytes, Ordering::Release);
+        } else if rendering > 0 {
+            // What the frames rendering hold so far, before they finish.
+            self.measure(g, rendering);
         }
         let n = self.rendering.fetch_add(1, Ordering::AcqRel).saturating_add(1);
         self.peak.fetch_max(n, Ordering::AcqRel);
         Entered { gate: self, gpu: g.clone() }
     }
 
-    /// The frame `e` rendered on the GPU: measure what the frames rendering take each.
-    pub(crate) fn finished(&self, e: &Entered<'_>) {
+    /// A frame rendered with `g` attached is done (it is still counted as rendering).
+    fn finished(&self, g: &Gpu) {
         self.finished.fetch_add(1, Ordering::AcqRel);
-        let n = self.rendering.load(Ordering::Acquire).max(1) as u64;
-        let (Some(bytes), baseline) = (self.sample(&e.gpu, false), self.baseline.load(Ordering::Acquire)) else { return };
+        self.measure(g, self.rendering.load(Ordering::Acquire).max(1));
+    }
+
+    /// What the `n` frames rendering take on the device each, measured now (rate limited).
+    fn measure(&self, g: &Gpu, n: usize) {
+        let (Some(bytes), baseline) = (self.sample(g, false), self.baseline.load(Ordering::Acquire)) else { return };
         if baseline == u64::MAX {
             return;
         }
-        let per = bytes.saturating_sub(baseline) / n;
+        let per = bytes.saturating_sub(baseline) / n.max(1) as u64;
         // The largest recent measurement, forgotten slowly (an eighth of the difference each
         // time): a cap that follows a heavier stretch of the comp at once, and a lighter one later.
         let old = self.per_frame.load(Ordering::Acquire);
@@ -195,7 +216,18 @@ impl Gate {
         }
         let bytes = g.context().device_bytes();
         self.measurable.store(if bytes.is_some() { 1 } else { 2 }, Ordering::Release);
+        if let Some(b) = bytes {
+            self.last_bytes.store(b, Ordering::Release);
+        }
         bytes
+    }
+
+    /// A gate past its slow start (tests of the steady-state caps).
+    #[cfg(test)]
+    pub(crate) fn warmed() -> Self {
+        let g = Gate::default();
+        g.finished.store(1 << 20, Ordering::Release);
+        g
     }
 
     /// For `ui.inspect` / tests: (ceiling, learned bytes per frame, frames rendering).
