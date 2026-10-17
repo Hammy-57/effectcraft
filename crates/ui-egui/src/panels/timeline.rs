@@ -3192,6 +3192,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     if tresp.clicked() {
         super::timeline_columns::toggle_switches_modes(&mut app.ui.timeline);
     }
+    crate::freeze_hint::show(app, ui, Rect::from_min_max(pos2(graph_x0, rows_rect.min.y), pos2(rect.max.x, footer.min.y)));
     // The frame in the viewer's own time (kept with it while it is cached, as in After Effects),
     // else the last viewer frame's.
     let ms = shown_times.as_ref().map(|s| s.frame.frame_ms).unwrap_or_else(|| app.frames.last_ms.lock().map(|v| *v).unwrap_or(0.0));
