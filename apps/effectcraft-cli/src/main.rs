@@ -29,6 +29,9 @@
 //! effectcraft-cli replay SCRIPT.jsonl [--keep-going]        replay a repro script (docs/agents.md)
 //! effectcraft-cli mcp [--autosave] [--bridge [PORT] | --ui] [--all-tools] [--client NAME]  MCP server on stdio
 //! effectcraft-cli figma-bridge [--port 7789] [--control 9877] local endpoint for the Figma plug-in
+//! effectcraft-cli mirror USER@HOST [--ssh-port P] [--identity KEY] [--project F.ecproj | --bridge 9877]
+//!     [--font-dir DIR] [--remote-cli PATH] [--dry-run] [--all] [--verify-hash] [--watch SECS]
+//!     copy the media and fonts a project reads to a cloud render machine (same absolute paths), then preflight there
 //!
 //! Project:  --project F.ecproj (or a positional *.ecproj) | --demo | --empty   (default: demo; mcp: empty)
 //! Saving:   --save (back to --project) | --save-as F.ecproj
@@ -48,8 +51,10 @@
 
 use std::io::Write;
 
+mod asset_guard;
 mod figma_bridge;
 mod frame_serve;
+mod mirror;
 #[cfg(feature = "ui")]
 mod offscreen_ui;
 mod template;
@@ -162,6 +167,9 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
   figma-bridge [--port 7789] [--control 9877] [--code CODE]
                                            local endpoint for the EffectCraft Figma plug-in: imports what it
                                            sends into the running app (file.importFigma); prints the pairing code
+  mirror USER@HOST [--ssh-port P] [--identity KEY] [--project F.ecproj | --bridge 9877] [--font-dir DIR]
+         [--remote-cli PATH] [--env-file PATH] [--dry-run] [--all] [--verify-hash] [--watch SECS]
+                                           media + fonts to a cloud render machine (same paths), then cloud.preflight there
 options: --project F.ecproj | --demo | --empty   --save | --save-as F   --bridge PORT   --json   --gpu
          --frame-threads N  render at most N frames at once (viewer frame pool, export batches;
                             default one per core, 2-16; also EFFECTCRAFT_FRAME_THREADS)
@@ -230,6 +238,13 @@ const VALUED: &[&str] = &[
     "--webm-codec",
     "--audio-bitrate",
     "--opus-app",
+    // mirror
+    "--ssh-port",
+    "--identity",
+    "--font-dir",
+    "--remote-cli",
+    "--env-file",
+    "--watch",
     // mcp
     "--automation-read-root",
     "--automation-write-root",
@@ -262,6 +277,10 @@ const FLAGS: &[&str] = &[
     "--ui",
     "--keep-going",
     "--bless",
+    // mirror
+    "--dry-run",
+    "--all",
+    "--verify-hash",
 ];
 
 struct Args {
@@ -952,6 +971,7 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
             }
         }
         "frames-bench" => frame_serve::bench(args)?,
+        "mirror" => mirror::run(args, json_out)?,
         other => return usage_err(&format!("unknown subcommand `{other}`")),
     }
     Ok(())
