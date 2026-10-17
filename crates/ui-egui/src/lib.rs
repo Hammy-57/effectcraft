@@ -294,6 +294,18 @@ impl Hooks {
     }
 }
 
+/// When the project last changed and when the viewer last showed a different frame (UI seconds,
+/// at the start of the UI frame that made the change): the edit → frame latency is
+/// `shown_at - edit_at` once the shown frame's revision reaches the edit's.
+#[derive(Default)]
+pub(crate) struct EditLatency {
+    pub edit_revision: u64,
+    pub edit_at: f64,
+    /// Revision, frame and scale (× 1000) of the frame on screen.
+    pub shown: Option<(u64, i64, u32)>,
+    pub shown_at: f64,
+}
+
 #[derive(Default)]
 pub struct Playback {
     pub playing: bool,
@@ -335,12 +347,21 @@ pub struct Playback {
     /// When playback last looked at the clock (UI seconds, [`Self::observe`]): a hold since
     /// the last frame counts against the achieved rate.
     pub observed: f64,
+    /// Every frame shown since the preview started (UI seconds, frame), for `ui.inspect`'s
+    /// frame-interval percentiles; capped at [`SHOWN_LOG_MAX`].
+    pub log: Vec<(f64, i64)>,
 }
+
+/// Frames [`Playback::log`] keeps (about 9 minutes at 30 fps).
+const SHOWN_LOG_MAX: usize = 16_384;
 
 impl Playback {
     /// A new frame went on screen at `now`.
-    pub fn frame_shown(&mut self, now: f64) {
+    pub fn frame_shown(&mut self, now: f64, frame: i64) {
         self.shown += 1;
+        if self.log.len() < SHOWN_LOG_MAX {
+            self.log.push((now, frame));
+        }
         self.shown_at.push_back(now);
         while self.shown_at.front().is_some_and(|t| now - t > 1.0) {
             self.shown_at.pop_front();
@@ -422,6 +443,8 @@ pub struct EffectcraftApp {
     last_activity: (f64, u64),
     /// When the project last changed, and its revision then (see [`Self::editing`]).
     last_edit: (f64, u64),
+    /// Edit → viewer frame latency, for `ui.inspect`'s `latency`.
+    pub(crate) latency: EditLatency,
     pub(crate) toast: Option<(String, f64)>,
     /// Texture of the last CPU frame shown in the viewer, the key it came from and the factor it
     /// was averaged down by for the magnification (`panels::viewer::minify_factor`).
@@ -555,6 +578,7 @@ impl EffectcraftApp {
             last_ui_time: 0.0,
             last_activity: (0.0, 0),
             last_edit: (0.0, 0),
+            latency: Default::default(),
             toast: None,
             viewer_tex: None,
             passive_tex: std::collections::HashMap::new(),
@@ -1484,6 +1508,7 @@ impl EffectcraftApp {
             preroll: None,
             shown_at: Default::default(),
             observed: now,
+            log: Vec::new(),
         };
         if !self.playback.caching {
             if plan.video {
@@ -1862,7 +1887,7 @@ impl EffectcraftApp {
                 self.playback.waiting = false;
                 if target != cur {
                     self.session.set_time(fr.tick_of(target));
-                    self.playback.frame_shown(now);
+                    self.playback.frame_shown(now, target);
                 }
             } else {
                 // Rendering can't keep up: rather than skip frames, the sound holds (the device
@@ -1922,7 +1947,7 @@ impl EffectcraftApp {
             self.playback.waiting = false;
             if target != cur {
                 self.session.set_time(fr.tick_of(target));
-                self.playback.frame_shown(now);
+                self.playback.frame_shown(now, target);
             }
         } else {
             // Not cached yet: hold the clock at the current frame (cache first, then play).
@@ -2624,8 +2649,18 @@ impl eframe::App for EffectcraftApp {
             ui.ctx().request_repaint();
             return;
         }
+        let started = ui.ctx().input(|i| i.time);
         self.frame(ui);
         let ctx = ui.ctx().clone();
+        if self.latency.edit_revision != self.session.revision {
+            self.latency.edit_revision = self.session.revision;
+            self.latency.edit_at = started;
+        }
+        let shown = self.viewer_shown.as_ref().map(|(_, k)| (k.revision, k.frame, k.scale));
+        if shown != self.latency.shown {
+            self.latency.shown = shown;
+            self.latency.shown_at = started;
+        }
         #[cfg(not(target_arch = "wasm32"))]
         pointer_wrap::finish_native(&ctx, frame);
         // wasm32: no frame threads; render queued frames now, between UI frames.
