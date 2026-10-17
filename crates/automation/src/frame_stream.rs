@@ -492,12 +492,26 @@ impl Shared {
         self.host.render.warm(&project, comp, time);
         self.log(&format!("warmed up in {:.0} ms", t0.elapsed().as_secs_f64() * 1000.0));
         let mut st = lock(&self.state);
+        let mut said = Instant::now();
         loop {
             if st.stop {
                 return;
             }
             let now = st.now_frame();
             let window = st.p.window(now);
+            if said.elapsed() >= Duration::from_secs(2) {
+                said = Instant::now();
+                let flying: Vec<u64> = st.flying.keys().copied().collect();
+                let head: Vec<u64> = window.iter().take(4).copied().collect();
+                self.log(&format!(
+                    "playhead {} (now {now}, {}), lead {:.2} s, level {}, in flight {flying:?}, {} frames queued, window {head:?}…",
+                    st.playhead,
+                    if st.playing { "playing" } else { "paused" },
+                    st.lead(),
+                    st.cur_level,
+                    st.jobs.len()
+                ));
+            }
             if st.flying.len() < MAX_IN_FLIGHT {
                 let lead = st.lead();
                 let missing = window.iter().copied().find(|c| !st.sent.contains_key(c) && !st.flying.contains_key(c));
