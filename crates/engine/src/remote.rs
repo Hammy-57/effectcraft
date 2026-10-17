@@ -38,7 +38,7 @@
 
 use std::sync::Arc;
 
-use effectcraft_project::{ItemId, Project};
+use effectcraft_project::{ItemId, LayerId, Project};
 use effectcraft_render::{Accelerator, AutoKey, Backend, ExprHost, FootageSource, Image, LayerCache, LayerStore, PrefetchStore, RenderOpts, Renderer};
 use effectcraft_time::Tick;
 use serde::{Deserialize, Serialize};
@@ -202,6 +202,8 @@ pub enum FrameMsg {
     Segs { segs: Vec<SegData> },
     /// Drop cached layer buffers (Edit ▸ Purge).
     Purge,
+    /// The playback stream (`crate::remote_stream`): handled by the transport, not here.
+    Stream(crate::remote_stream::StreamMsg),
 }
 
 /// Frame worker → page. A [`FrameReply::Frame`]'s pixels travel next to the message (a
@@ -226,6 +228,10 @@ pub enum FrameReply {
         /// Layer buffers served from the store (fetched from disk).
         #[serde(default, rename = "layerHits", skip_serializing_if = "Vec::is_empty")]
         layer_hits: Vec<String>,
+        /// Each layer's render time on the server, `(comp, layer, ms)`: the Mac's Timeline Render
+        /// Time pane shows them for cloud frames (CR5). Empty when the server didn't time them.
+        #[serde(default, rename = "layerTimes", skip_serializing_if = "Vec::is_empty")]
+        layer_times: Vec<(ItemId, LayerId, f32)>,
     },
     /// The frame (or, with `layer`, a layer buffer) was stored in the disk cache under `key`
     /// (`bytes` on disk).
@@ -246,6 +252,8 @@ pub enum FrameReply {
     Failed { id: u64, error: String, stale: bool },
     /// A sync could not be applied: the page must send the whole project again.
     Resync { error: String },
+    /// The playback stream (`crate::remote_stream`); a chunk's frames are the payload.
+    Stream(crate::remote_stream::StreamReply),
 }
 
 /// The page's record of a worker's replica: the snapshot it holds (its comps and layers are
@@ -438,6 +446,8 @@ impl FrameServer {
                     Err(e) => self.lost(e),
                 }
             }
+            // A transport that streams handles these itself.
+            FrameMsg::Stream(_) => vec![],
             FrameMsg::Segs { segs } => {
                 for s in &segs {
                     s.store();
@@ -519,7 +529,7 @@ impl FrameServer {
             pick.record(key, chose, ms);
         }
         vec![(
-            FrameReply::Frame { id: pr.id, width: img.width, height: img.height, ms, passes: pr.passes, gpu, layer_misses, layer_hits },
+            FrameReply::Frame { id: pr.id, width: img.width, height: img.height, ms, passes: pr.passes, gpu, layer_misses, layer_hits, layer_times: vec![] },
             Some(rgba8_premultiplied(&img)),
         )]
     }
@@ -708,7 +718,17 @@ mod tests {
             assert!(a.starts_with("{\"type\":"), "{a}");
         }
         for r in [
-            FrameReply::Frame { id: 1, width: 2, height: 3, ms: 4.5, passes: 2, gpu: true, layer_misses: vec!["0a".into()], layer_hits: vec![] },
+            FrameReply::Frame {
+                id: 1,
+                width: 2,
+                height: 3,
+                ms: 4.5,
+                passes: 2,
+                gpu: true,
+                layer_misses: vec!["0a".into()],
+                layer_hits: vec![],
+                layer_times: vec![(ItemId(3), LayerId(4), 1.5)],
+            },
             FrameReply::Stored { key: "00ff".into(), bytes: 9, layer: false },
             FrameReply::Stored { key: "00fe".into(), bytes: 8, layer: true },
             FrameReply::Info { gpu: Some("Adapter (BrowserWebGpu)".into()), error: None },

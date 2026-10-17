@@ -596,8 +596,12 @@ fn draw_yuv_footage(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, can
     }
     let image = prepare_resident(e, r, ctx, layer, src, footage.scale)?;
     let result = composite_resident(e, r, ctx, layer, canvas, opacity, image.clone());
+    // A video frame is kept once it is drawn again (a held frame, a paused edit, a loop), not
+    // the first time: playback shows each frame once, and keeping every one (33 MB at 1080p)
+    // filled the retained allowance in ~45 frames, pushing out layers that do repeat.
     if result == Some(Some(()))
         && let Some((key, token)) = cache
+        && r.cache.is_some_and(|c| c.admit_repeated_gpu_content(key))
     {
         e.keep_native(footage.pixels, key, token, metadata, image);
     }

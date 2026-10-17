@@ -47,7 +47,7 @@ impl Drop for Prefetched {
 pub(crate) fn run<'a>(e: &Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, visible: &[&'a Layer], canvas: &GpuImage, resident: bool) -> Prefetched {
     let resident = resident && e.can_retain_resident();
     let held = |slot: u64| READY.try_with(|m| m.try_borrow().map(|m| m.contains_key(&slot)).unwrap_or(true)).unwrap_or(true);
-    let have = |key: u64, slot: u64| held(slot) || e.resident(key, GpuStage::Processed).is_some();
+    let have = |key: u64, slot: u64| held(slot) || e.has_resident(key, GpuStage::Processed);
     let made = r.prefetch(ctx, visible, (canvas.width, canvas.height), resident.then_some(&have as &dyn Fn(u64, u64) -> bool));
     let mut keys = Vec::with_capacity(made.len());
     let _ = READY.try_with(|m| {

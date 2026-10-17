@@ -72,6 +72,10 @@ impl FrameRender for AssetGuard {
     fn gpu_name(&self) -> Option<String> {
         self.inner.gpu_name()
     }
+
+    fn warm(&self, project: &effectcraft_engine::project::Project, comp: effectcraft_engine::project::ItemId, time: effectcraft_engine::time::Tick) {
+        self.inner.warm(project, comp, time);
+    }
 }
 
 #[cfg(test)]
@@ -91,7 +95,7 @@ mod tests {
     fn render(guard: &Arc<dyn FrameRender>, s: &effectcraft_engine::Session) -> Result<(Rendered, bool), String> {
         let cache = LayerCache::new(1 << 20);
         let comp = s.active_comp_id().ok_or("no comp")?;
-        guard.render(&RenderJob { project: &s.project, comp, time: Tick::ZERO, opts: RenderOpts::default(), cache: &cache })
+        guard.render(&RenderJob { project: &s.project, comp, time: Tick::ZERO, opts: RenderOpts::default(), cache: &cache, times: None })
     }
 
     #[test]
