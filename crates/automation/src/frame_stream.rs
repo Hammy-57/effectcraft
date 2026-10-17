@@ -659,7 +659,7 @@ impl Shared {
             let project = job.project.clone();
             let base = if opts.scale > 0.0 { opts.scale } else { 1.0 };
             let opts = RenderOpts { scale: base * f64::from(scale), ..opts };
-            let rendered = self.host.render.render(&RenderJob { project: &project, comp, time: job.time, opts, cache: &self.host.cache });
+            let rendered = self.host.render.render(&RenderJob { project: &project, comp, time: job.time, opts, cache: &self.host.cache, times: None });
             let frame = match rendered {
                 Ok((Rendered::Image(img), _)) => Ok((img.width, img.height, remote_encode::rgba8_premultiplied_par(&img))),
                 Ok((Rendered::Rgba8 { width, height, bytes }, _)) => Ok((width, height, bytes)),
