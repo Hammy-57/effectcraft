@@ -30,16 +30,21 @@ fn fade(t: f64) -> f64 {
     t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
 }
 
-/// Smooth 1D value noise in `[-1, 1]` (C2-continuous, bounded by the lattice values).
+/// Smooth 1D noise in `[-1, 1]` through a random value at every whole `x`, passed on a
+/// Catmull-Rom curve: it keeps moving through them. (Eased from one to the next, as before, it came
+/// to a stop at each one, and `wiggle(1, …)` held still once a second instead of wandering as
+/// After Effects' does.)
 pub fn noise1(seed: u64, x: f64) -> f64 {
     if !x.is_finite() {
         return 0.0;
     }
     let i = x.floor();
-    let u = fade(x - i);
+    let t = x - i;
     let i = i as i64;
-    let (a, b) = (lattice(seed, i), lattice(seed, i.wrapping_add(1)));
-    a + (b - a) * u
+    let p = |k: i64| lattice(seed, i.wrapping_add(k));
+    let (p0, p1, p2, p3) = (p(-1), p(0), p(1), p(2));
+    let v = 0.5 * (2.0 * p1 + (p2 - p0) * t + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t * t + (3.0 * p1 - p0 - 3.0 * p2 + p3) * t * t * t);
+    v.clamp(-1.0, 1.0)
 }
 
 /// Smooth 3D value noise in `[-1, 1]` (AE's `noise()`: nearby inputs give nearby outputs).
@@ -97,6 +102,22 @@ mod tests {
         assert_eq!(noise1(3, 1.25), noise1(3, 1.25));
         assert_ne!(noise1(3, 1.25), noise1(4, 1.25));
         assert!((-1.0..=1.0).contains(&noise3(0.3, 4.2, -7.5)));
+    }
+
+    #[test]
+    fn noise_keeps_moving_through_the_lattice_points() {
+        // Eased from value to value, the noise stopped at every whole x: `wiggle(1, 100)` held
+        // still once a second.
+        let moving = (0..200)
+            .filter(|i| {
+                let x = *i as f64;
+                ((noise1(11, x + 1e-4) - noise1(11, x - 1e-4)) / 2e-4).abs() > 0.05
+            })
+            .count();
+        assert!(moving > 170, "moving at {moving} of 200 lattice points");
+        // And it still spans most of [-1, 1].
+        let (lo, hi) = (0..20_000).map(|i| noise1(3, i as f64 * 0.01)).fold((1.0f64, -1.0f64), |(l, h), v| (l.min(v), h.max(v)));
+        assert!(lo < -0.6 && hi > 0.6, "{lo}..{hi}");
     }
 
     #[test]

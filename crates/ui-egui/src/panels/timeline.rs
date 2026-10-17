@@ -2703,8 +2703,9 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 crate::widgets::context_menu(&name_resp, |ui| prop_menu(ui, &mut app.auto, cid, layer, prop, &mut actions));
                 // Value editors.
                 let value = ectx.value(layer, prop);
+                let raw = prop.value_at(layer.layer_time(ectx.time));
                 let vx = (cw.vx + 4.0).max(name_x + 120.0);
-                let dims = value_editor(app, ui, &lp, layer, prop, &value, pos2(vx, cy), None, &mut actions);
+                let dims = value_editor(app, ui, &lp, layer, prop, &value, &raw, pos2(vx, cy), None, &mut actions);
                 if !dims.is_empty() {
                     dim_hits.push((*uid, dims));
                 }
@@ -4127,6 +4128,7 @@ fn value_editor(
     layer: &Layer,
     prop: &Property,
     value: &Value,
+    raw: &Value,
     at: Pos2,
     instance: Option<&[u64]>,
     actions: &mut Vec<(String, serde_json::Value)>,
@@ -4146,6 +4148,7 @@ fn value_editor(
     // selected layers by selection order, the first unchanged and the last by all of it.
     let proportional = scrub && ui.input(|i| widgets::proportional_scrub(i.modifiers));
     let set = |actions: &mut Vec<(String, serde_json::Value)>, v: serde_json::Value| {
+        let v = widgets::scrub_value(prop.has_expression(), raw, value, v, scrub);
         actions.push((
             "prop.set".into(),
             json!({"layer": layer.id.0, "prop": uid, "value": v, "merge": merge, "selected": true, "offset": scrub, "proportional": proportional}),
