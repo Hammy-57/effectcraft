@@ -3352,6 +3352,10 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     crate::panels::DragPayload::Files(paths) => {
                         actions.push(("mediaBrowser.import".into(), json!({"paths": paths, "addToComp": true, "index": index, "time": time})))
                     }
+                    crate::panels::DragPayload::LibraryCard(id) => {
+                        // At the drop time (the playhead when dropped left of the time graph).
+                        actions.push(("motionLibrary.apply".into(), json!({"id": id, "time": time})))
+                    }
                     crate::panels::DragPayload::Effect(_) | crate::panels::DragPayload::Property { .. } => {}
                 }
             }

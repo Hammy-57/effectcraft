@@ -43,6 +43,7 @@ pub(crate) fn show(app: &mut EffectcraftApp, ui: &egui::Ui, painter: &egui::Pain
             crate::panels::project_drop_items(app, *item).into_iter().rev().map(|item| ("layer.addItem", json!({"item": item, "position": at}))).collect()
         }
         DragPayload::Files(paths) => vec![("mediaBrowser.import", json!({"paths": paths, "addToComp": true, "position": at}))],
+        DragPayload::LibraryCard(id) => vec![("motionLibrary.apply", json!({"id": id}))],
         DragPayload::Property { .. } => vec![],
     };
     if actions.first().is_some_and(|(id, _)| *id != "effect.apply") {

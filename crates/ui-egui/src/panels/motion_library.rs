@@ -45,9 +45,23 @@ pub struct ViewState {
     pub expanded: BTreeSet<String>,
     /// Vertical scroll of the collection tree.
     pub folder_scroll: f32,
-    /// The Display settings popover is open.
+    /// The collections column is shown.
+    pub show_folders: bool,
+    /// The quick-action toolbar (comp tools) is shown.
+    pub show_tools: bool,
+    /// Only cards of this kind (`Comp`, `Overlay`, `Sound`…; empty = every kind).
+    pub kind_filter: String,
+    /// Only cards that can be applied here (not the ones applied on the Mac).
+    pub here_only: bool,
+    /// The rail popover open: `display`, `curves`, `filters`, `save` (empty = none).
     #[serde(skip)]
-    pub display_open: bool,
+    pub popover: String,
+    /// The card whose details are shown.
+    #[serde(skip)]
+    pub details: Option<String>,
+    /// Where the card being applied goes: comp seconds (a drop on the Timeline), else the playhead.
+    #[serde(skip)]
+    pub apply_time: Option<f64>,
     /// The card being applied (downloading) and when it started.
     #[serde(skip)]
     pub applying: Option<String>,
@@ -64,7 +78,13 @@ impl Default for ViewState {
             card_size: DEFAULT_CARD_SIZE,
             expanded: BTreeSet::new(),
             folder_scroll: 0.0,
-            display_open: false,
+            show_folders: true,
+            show_tools: true,
+            kind_filter: String::new(),
+            here_only: false,
+            popover: String::new(),
+            details: None,
+            apply_time: None,
             applying: None,
         }
     }
@@ -99,7 +119,13 @@ impl ViewState {
             "scale": self.scale,
             "cardSize": self.card_size,
             "expanded": self.expanded,
-            "display": self.display_open,
+            "display": self.popover == "display",
+            "popover": self.popover,
+            "showFolders": self.show_folders,
+            "showTools": self.show_tools,
+            "kind": self.kind_filter,
+            "hereOnly": self.here_only,
+            "details": self.details,
         })
     }
     /// Open every folder above `folder` so its row shows in the tree.
@@ -349,20 +375,27 @@ fn generation(client: &Client) -> u64 {
 /// Cards matching the view, cached per catalog generation, query and folder. Browsing everything
 /// (no folder, no query) groups them by folder in the library's order.
 fn visible_cards(ctx: &egui::Context, client: &Client, view: &ViewState) -> Arc<Vec<Card>> {
-    type Cached = (u64, String, String, Arc<Vec<Card>>);
+    type Cached = (u64, String, String, String, bool, Arc<Vec<Card>>);
     let id = egui::Id::new("ml-cards");
     let generation = generation(client);
-    if let Some((g, q, f, cards)) = ctx.data(|d| d.get_temp::<Cached>(id))
+    if let Some((g, q, f, k, h, cards)) = ctx.data(|d| d.get_temp::<Cached>(id))
         && g == generation
         && q == view.query
         && f == view.folder
+        && k == view.kind_filter
+        && h == view.here_only
     {
         return cards;
     }
     let cards: Vec<Card> = client
         .catalog()
         .map(|cat| {
-            let mut found: Vec<Card> = effectcraft_engine::motionlib::search(&cat.cards, &view.query, &view.folder).into_iter().cloned().collect();
+            let mut found: Vec<Card> = effectcraft_engine::motionlib::search(&cat.cards, &view.query, &view.folder)
+                .into_iter()
+                .filter(|c| view.kind_filter.is_empty() || kind_label(c) == view.kind_filter)
+                .filter(|c| !view.here_only || c.applicable())
+                .cloned()
+                .collect();
             if grouped(view) {
                 let ranks = cat.folder_ranks();
                 found.sort_by_key(|c| ranks.get(&c.category).copied().unwrap_or(usize::MAX));
@@ -371,13 +404,15 @@ fn visible_cards(ctx: &egui::Context, client: &Client, view: &ViewState) -> Arc<
         })
         .unwrap_or_default();
     let cards = Arc::new(cards);
-    ctx.data_mut(|d| d.insert_temp::<Cached>(id, (generation, view.query.clone(), view.folder.clone(), cards.clone())));
+    ctx.data_mut(|d| {
+        d.insert_temp::<Cached>(id, (generation, view.query.clone(), view.folder.clone(), view.kind_filter.clone(), view.here_only, cards.clone()))
+    });
     cards
 }
 
 /// Cards show in sections per folder (browsing everything, no search).
 fn grouped(view: &ViewState) -> bool {
-    view.folder.is_empty() && view.query.trim().is_empty()
+    view.folder.is_empty() && view.query.trim().is_empty() && view.kind_filter.is_empty()
 }
 
 /// The collection tree, cached per catalog generation.
@@ -536,60 +571,495 @@ fn paint_folder_icon(ctx: &egui::Context, client: &Client, p: &egui::Painter, ro
     crate::icons::paint(p, r, crate::icons::Icon::Folder, color);
 }
 
-/// Display settings (interface scale, card size), under the header's display button.
-fn display_popover(app: &mut EffectcraftApp, ctx: &egui::Context, anchor: Rect, view: &mut ViewState, s: f32) {
+/// A popover beside the rail button `anchor`: its frame, then `body` inside it. Closes on Escape
+/// or a click outside it (the rail button toggles it itself).
+fn popover(
+    app: &mut EffectcraftApp,
+    ctx: &egui::Context,
+    anchor: Rect,
+    size: egui::Vec2,
+    view: &mut ViewState,
+    body: impl FnOnce(&mut EffectcraftApp, &mut egui::Ui, Rect, &mut ViewState),
+) {
     let t = app.tokens;
-    let size = vec2(236.0 * s, 104.0 * s);
-    let pos = pos2((anchor.max.x - size.x).max(4.0), anchor.max.y + 6.0);
-    let area = egui::Area::new(egui::Id::new("ml-display")).order(egui::Order::Foreground).fixed_pos(pos).show(ctx, |ui| {
+    let screen = ctx.content_rect();
+    let pos = pos2(anchor.max.x + 6.0, anchor.min.y.min(screen.max.y - size.y - 4.0).max(screen.min.y + 4.0));
+    let area = egui::Area::new(egui::Id::new(("ml-popover", view.popover.as_str()))).order(egui::Order::Foreground).fixed_pos(pos).show(ctx, |ui| {
         let (r, _) = ui.allocate_exact_size(size, Sense::click());
-        let p = ui.painter();
-        p.rect_filled(r, CornerRadius::same(8), t.header_bg);
-        p.rect_stroke(r, CornerRadius::same(8), Stroke::new(1.0, t.separator), egui::StrokeKind::Inside);
-        let pad = 12.0 * s;
-        p.text(pos2(r.min.x + pad, r.min.y + 16.0 * s), Align2::LEFT_CENTER, tr("Display settings"), Tokens::semibold(12.0 * s), t.text);
-        // Interface scale: − 100% +.
-        let y1 = r.min.y + 44.0 * s;
-        p.text(pos2(r.min.x + pad, y1), Align2::LEFT_CENTER, tr("Interface scale"), Tokens::ui(11.5 * s), t.text_dim);
-        let bw = 24.0 * s;
-        let plus = Rect::from_center_size(pos2(r.max.x - pad - bw / 2.0, y1), vec2(bw, 22.0 * s));
-        let value = Rect::from_center_size(pos2(plus.min.x - 26.0 * s, y1), vec2(44.0 * s, 22.0 * s));
-        let minus = Rect::from_center_size(pos2(value.min.x - bw / 2.0 - 2.0 * s, y1), vec2(bw, 22.0 * s));
-        if kit::button(app, ui, minus, "motionLibrary.scaleDown", "−", false) && view.scale > SCALE_RANGE.0 {
-            view.scale -= 10;
-        }
-        if kit::button(app, ui, plus, "motionLibrary.scaleUp", "+", false) && view.scale < SCALE_RANGE.1 {
-            view.scale += 10;
-        }
-        let pct = format!("{}%", view.scale);
-        ui.painter().text(value.center(), Align2::CENTER_CENTER, &pct, Tokens::medium(11.5 * s), t.text);
-        app.auto.add("motionLibrary.scale", value, &pct);
-        // Card size: a slider.
-        let y2 = r.min.y + 78.0 * s;
-        ui.painter().text(pos2(r.min.x + pad, y2), Align2::LEFT_CENTER, tr("Card size"), Tokens::ui(11.5 * s), t.text_dim);
-        let track = Rect::from_min_max(pos2(r.min.x + pad + 76.0 * s, y2 - 8.0 * s), pos2(r.max.x - pad, y2 + 8.0 * s));
-        let resp = ui.interact(track, egui::Id::new("ml-card-size"), Sense::click_and_drag());
-        let (lo, hi) = CARD_SIZE_RANGE;
-        if (resp.dragged() || resp.clicked())
-            && let Some(x) = resp.interact_pointer_pos().map(|p| p.x)
-        {
-            let f = ((x - track.min.x) / track.width().max(1.0)).clamp(0.0, 1.0);
-            view.card_size = (lo + f * (hi - lo)).round();
-        }
-        let f = ((view.card_size - lo) / (hi - lo)).clamp(0.0, 1.0);
-        let line = Rect::from_min_max(pos2(track.min.x, y2 - 1.5 * s), pos2(track.max.x, y2 + 1.5 * s));
-        let p = ui.painter();
-        p.rect_filled(line, CornerRadius::same(2), t.field_border);
-        p.rect_filled(Rect::from_min_max(line.min, pos2(track.min.x + f * track.width(), line.max.y)), CornerRadius::same(2), t.accent);
-        p.circle_filled(pos2(track.min.x + f * track.width(), y2), 6.0 * s, if resp.hovered() || resp.dragged() { t.accent_hover } else { t.accent });
-        app.auto.add_response("motionLibrary.cardSize", &resp, &format!("{}", view.card_size));
+        ui.painter().rect_filled(r, CornerRadius::same(8), t.header_bg);
+        ui.painter().rect_stroke(r, CornerRadius::same(8), Stroke::new(1.0, t.separator), egui::StrokeKind::Inside);
+        body(app, ui, r, view);
         r
     });
-    // Close on Escape or a click outside (the display button toggles it itself).
+    app.auto.add(&format!("motionLibrary.popover.{}", view.popover), area.inner, &view.popover);
     let outside = ctx.input(|i| i.pointer.any_pressed() && i.pointer.interact_pos().is_some_and(|p| !area.inner.contains(p) && !anchor.contains(p)));
     if outside || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-        view.display_open = false;
+        view.popover.clear();
     }
+}
+
+/// Display settings: interface scale, card size.
+fn display_body(app: &mut EffectcraftApp, ui: &mut egui::Ui, r: Rect, view: &mut ViewState, s: f32) {
+    let t = app.tokens;
+    let pad = 12.0 * s;
+    ui.painter().text(pos2(r.min.x + pad, r.min.y + 16.0 * s), Align2::LEFT_CENTER, tr("Display settings"), Tokens::semibold(12.0 * s), t.text);
+    // Interface scale: − 100% +.
+    let y1 = r.min.y + 44.0 * s;
+    ui.painter().text(pos2(r.min.x + pad, y1), Align2::LEFT_CENTER, tr("Interface scale"), Tokens::ui(11.5 * s), t.text_dim);
+    let bw = 24.0 * s;
+    let plus = Rect::from_center_size(pos2(r.max.x - pad - bw / 2.0, y1), vec2(bw, 22.0 * s));
+    let value = Rect::from_center_size(pos2(plus.min.x - 26.0 * s, y1), vec2(44.0 * s, 22.0 * s));
+    let minus = Rect::from_center_size(pos2(value.min.x - bw / 2.0 - 2.0 * s, y1), vec2(bw, 22.0 * s));
+    if kit::button(app, ui, minus, "motionLibrary.scaleDown", "−", false) && view.scale > SCALE_RANGE.0 {
+        view.scale -= 10;
+    }
+    if kit::button(app, ui, plus, "motionLibrary.scaleUp", "+", false) && view.scale < SCALE_RANGE.1 {
+        view.scale += 10;
+    }
+    let pct = format!("{}%", view.scale);
+    ui.painter().text(value.center(), Align2::CENTER_CENTER, &pct, Tokens::medium(11.5 * s), t.text);
+    app.auto.add("motionLibrary.scale", value, &pct);
+    // Card size: a slider.
+    let y2 = r.min.y + 78.0 * s;
+    ui.painter().text(pos2(r.min.x + pad, y2), Align2::LEFT_CENTER, tr("Card size"), Tokens::ui(11.5 * s), t.text_dim);
+    let track = Rect::from_min_max(pos2(r.min.x + pad + 76.0 * s, y2 - 8.0 * s), pos2(r.max.x - pad, y2 + 8.0 * s));
+    let resp = ui.interact(track, egui::Id::new("ml-card-size"), Sense::click_and_drag());
+    let (lo, hi) = CARD_SIZE_RANGE;
+    if (resp.dragged() || resp.clicked())
+        && let Some(x) = resp.interact_pointer_pos().map(|p| p.x)
+    {
+        let f = ((x - track.min.x) / track.width().max(1.0)).clamp(0.0, 1.0);
+        view.card_size = (lo + f * (hi - lo)).round();
+    }
+    let f = ((view.card_size - lo) / (hi - lo)).clamp(0.0, 1.0);
+    let line = Rect::from_min_max(pos2(track.min.x, y2 - 1.5 * s), pos2(track.max.x, y2 + 1.5 * s));
+    let p = ui.painter();
+    p.rect_filled(line, CornerRadius::same(2), t.field_border);
+    p.rect_filled(Rect::from_min_max(line.min, pos2(track.min.x + f * track.width(), line.max.y)), CornerRadius::same(2), t.accent);
+    p.circle_filled(pos2(track.min.x + f * track.width(), y2), 6.0 * s, if resp.hovered() || resp.dragged() { t.accent_hover } else { t.accent });
+    app.auto.add_response("motionLibrary.cardSize", &resp, &format!("{}", view.card_size));
+}
+
+/// A full-width button row in a popover; true when clicked.
+fn pop_row(app: &mut EffectcraftApp, ui: &mut egui::Ui, r: Rect, y: f32, auto: &str, text: &str, s: f32) -> bool {
+    let b = Rect::from_min_size(pos2(r.min.x + 10.0 * s, y), vec2(r.width() - 20.0 * s, 24.0 * s));
+    kit::button(app, ui, b, auto, text, false)
+}
+
+/// Curves: Easy Ease on the selected keyframes, and the library's ease cards.
+fn curves_body(app: &mut EffectcraftApp, ui: &mut egui::Ui, r: Rect, view: &mut ViewState, s: f32) {
+    let t = app.tokens;
+    ui.painter().text(pos2(r.min.x + 12.0 * s, r.min.y + 16.0 * s), Align2::LEFT_CENTER, tr("Curves"), Tokens::semibold(12.0 * s), t.text);
+    let rows = [
+        ("motionLibrary.curves.easyEase", "Easy Ease (F9)", "keys.easyEase"),
+        ("motionLibrary.curves.easeIn", "Easy Ease In", "keys.easyEaseIn"),
+        ("motionLibrary.curves.easeOut", "Easy Ease Out", "keys.easyEaseOut"),
+    ];
+    let mut y = r.min.y + 32.0 * s;
+    for (auto, text, cmd) in rows {
+        if pop_row(app, ui, r, y, auto, text, s) && kit::exec(app, cmd, json!({})).is_some() {
+            app.ui.status = format!("{text} on the selected keyframes");
+        }
+        y += 28.0 * s;
+    }
+    if pop_row(app, ui, r, y, "motionLibrary.curves.cards", "Ease cards in the library", s) {
+        view.kind_filter = "Ease".into();
+        view.folder.clear();
+        view.scroll = 0.0;
+        view.popover.clear();
+    }
+}
+
+/// Filters: what kind of card (Comp, Overlay, Sound…) and only cards that apply here.
+fn filters_body(app: &mut EffectcraftApp, ui: &mut egui::Ui, r: Rect, view: &mut ViewState, kinds: &[(String, usize)], s: f32) {
+    let t = app.tokens;
+    ui.painter().text(pos2(r.min.x + 12.0 * s, r.min.y + 16.0 * s), Align2::LEFT_CENTER, tr("Filter cards"), Tokens::semibold(12.0 * s), t.text);
+    let mut y = r.min.y + 30.0 * s;
+    let total: usize = kinds.iter().map(|(_, n)| n).sum();
+    let all = [(String::new(), total)];
+    for (kind, n) in all.iter().chain(kinds.iter()) {
+        let row = Rect::from_min_size(pos2(r.min.x + 6.0 * s, y), vec2(r.width() - 12.0 * s, 22.0 * s));
+        let id = if kind.is_empty() { "all".to_string() } else { kind.clone() };
+        let resp = ui.interact(row, egui::Id::new(("ml-filter", &id)), Sense::click());
+        let active = view.kind_filter == *kind;
+        if active {
+            ui.painter().rect_filled(row, CornerRadius::same(4), t.accent.gamma_multiply(0.28));
+        } else if resp.hovered() {
+            ui.painter().rect_filled(row, CornerRadius::same(4), t.hover);
+        }
+        let name = if kind.is_empty() { tr("All kinds").to_string() } else { kind.clone() };
+        ui.painter().text(pos2(row.min.x + 8.0 * s, row.center().y), Align2::LEFT_CENTER, &name, Tokens::ui(11.5 * s), t.text);
+        ui.painter().text(pos2(row.max.x - 8.0 * s, row.center().y), Align2::RIGHT_CENTER, n.to_string(), Tokens::ui(10.5 * s), t.text_faint);
+        app.auto.add(&format!("motionLibrary.filter.{id}"), row, &name);
+        if resp.clicked() {
+            view.kind_filter = kind.clone();
+            view.scroll = 0.0;
+        }
+        y += 23.0 * s;
+    }
+    let at = pos2(r.min.x + 12.0 * s, y + 6.0 * s);
+    let on = kit::checkbox(app, ui, at, "motionLibrary.filter.here", tr("Only cards that apply here"), view.here_only);
+    if on != view.here_only {
+        view.here_only = on;
+        view.scroll = 0.0;
+    }
+}
+
+/// + Save: where cards come from.
+fn save_body(app: &mut EffectcraftApp, ui: &mut egui::Ui, r: Rect, s: f32) {
+    let t = app.tokens;
+    ui.painter().text(pos2(r.min.x + 12.0 * s, r.min.y + 16.0 * s), Align2::LEFT_CENTER, tr("Save to Motion Library"), Tokens::semibold(12.0 * s), t.text);
+    let text = tr(
+        "Cards are saved in the Motion Library panel in After Effects on the Mac and published with publish-motion-library.sh; this panel then shows Library updated.",
+    );
+    let galley = ui.painter().layout(text.to_string(), Tokens::ui(11.0 * s), t.text_dim, r.width() - 24.0 * s);
+    let h = galley.size().y;
+    ui.painter().galley(pos2(r.min.x + 12.0 * s, r.min.y + 30.0 * s), galley, t.text_dim);
+    if pop_row(app, ui, r, r.min.y + 38.0 * s + h, "motionLibrary.save.check", "Check for new cards", s) {
+        kit::exec(app, "library.sync", json!({"wait": false}));
+    }
+}
+
+/// The quick actions on the right: comp tools on the open composition's selection.
+const TOOLS: [(&str, crate::icons::Icon, &str, &str); 7] = [
+    ("smartPrecomp", crate::icons::Icon::NewComp, "Smart Precomp: the selected layers into one precomp trimmed to their span", "layer.smartPrecompose"),
+    ("decomp", crate::icons::Icon::Collapse, "Decomp: replace the selected precomp layer by its layers", "layer.decompose"),
+    ("multiPrecomp", crate::icons::Icon::Comp, "Multi Precomp: each selected layer into its own precomp", "layer.multiPrecompose"),
+    ("deepDuplicate", crate::icons::Icon::Link, "Deep Duplicate: copy the open comp and every comp nested in it", "project.deepDuplicate"),
+    ("splitMasks", crate::icons::Icon::MaskVis, "Split Masks: one layer per mask of the selected layer", "layer.splitMasks"),
+    ("gradientLock", crate::icons::Icon::Lock, "Gradient Lock: shape gradients follow their rectangle, ellipse or polystar", "shape.gradientLock"),
+    ("easyEase", crate::icons::Icon::Keyframe, "Easy Ease the selected keyframes (F9)", "keys.easyEase"),
+];
+
+/// What a comp tool did, for the status bar.
+fn tool_message(name: &str, r: &Value) -> String {
+    let n = |k: &str| r.get(k).and_then(Value::as_array).map_or(0, Vec::len);
+    match name {
+        "multiPrecomp" => format!("Multi Precomp: {} precomps", n("precomps")),
+        "decomp" => format!("Decomp: {} layers expanded (the comp stays in the project)", r["expanded"]),
+        "deepDuplicate" => format!("Deep Duplicate: {} compositions copied", n("items")),
+        "splitMasks" => format!("Split Masks: {} layers", n("layers")),
+        "gradientLock" => format!("Gradient Lock: {} locked, {} already", r["locked"], r["already"]),
+        "smartPrecomp" => format!("Smart Precomp: {}", r["name"].as_str().unwrap_or("done")),
+        _ => "Done".into(),
+    }
+}
+
+fn toolbar(app: &mut EffectcraftApp, ui: &mut egui::Ui, bar: Rect, s: f32) {
+    let t = app.tokens;
+    ui.painter().rect_filled(bar, 0.0, t.panel_bg);
+    ui.painter().line_segment([bar.left_top(), bar.left_bottom()], Stroke::new(1.0, t.separator));
+    let side = (28.0 * s).round();
+    let mut y = bar.min.y + 8.0 * s;
+    for (name, icon, tip, cmd) in TOOLS {
+        let r = Rect::from_min_size(pos2(bar.center().x - side / 2.0, y), vec2(side, side));
+        if r.max.y > bar.max.y {
+            break;
+        }
+        let resp = widgets::icon_button(ui, r, icon, false, &t, egui::Id::new(("ml-tool", name)));
+        app.auto.add(&format!("motionLibrary.tool.{name}"), r, tip);
+        if resp.on_hover_text(tr(tip)).clicked()
+            && let Some(v) = kit::exec(app, cmd, json!({}))
+        {
+            app.ui.status = tool_message(name, &v);
+        }
+        y += side + 6.0 * s;
+    }
+}
+
+/// The left rail: library views and filters, the label strip, sync state, settings and save.
+#[allow(clippy::too_many_arguments)]
+fn rail(
+    app: &mut EffectcraftApp,
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    client: &Client,
+    status: &effectcraft_engine::motionlib::Status,
+    bar: Rect,
+    view: &mut ViewState,
+    s: f32,
+) {
+    let t = app.tokens;
+    ui.painter().rect_filled(bar, 0.0, t.header_bg);
+    ui.painter().line_segment([bar.right_top(), bar.right_bottom()], Stroke::new(1.0, t.separator));
+    let side = (28.0 * s).round();
+    let x = bar.center().x - side / 2.0;
+    let mut y = bar.min.y + 8.0 * s;
+    let mut anchors: Vec<(&str, Rect)> = vec![];
+    use crate::icons::Icon;
+    let top: [(&str, Icon, &str, bool); 6] = [
+        ("assets", Icon::Grid, "Assets: everything in the library", view.folder.is_empty() && view.kind_filter.is_empty() && view.query.is_empty()),
+        ("curves", Icon::Graph, "Curves: Easy Ease and the library's ease cards", view.popover == "curves"),
+        ("search", Icon::Search, "Search assets", false),
+        ("filters", Icon::Hamburger, "Filter cards by kind", view.popover == "filters" || !view.kind_filter.is_empty() || view.here_only),
+        ("folders", Icon::Folder, "Show or hide the collections", view.show_folders),
+        ("sfx", Icon::Audio, "SFX: the sound effects collection", view.folder == "SFX" || view.folder.starts_with("SFX/")),
+    ];
+    for (name, icon, tip, active) in top {
+        let r = Rect::from_min_size(pos2(x, y), vec2(side, side));
+        let resp = widgets::icon_button(ui, r, icon, active, &t, egui::Id::new(("ml-rail", name)));
+        app.auto.add(&format!("motionLibrary.rail.{name}"), r, tip);
+        if resp.on_hover_text(tr(tip)).clicked() {
+            match name {
+                "assets" => {
+                    view.folder.clear();
+                    view.kind_filter.clear();
+                    view.query.clear();
+                    view.scroll = 0.0;
+                }
+                "search" => {
+                    ctx.data_mut(|d| d.insert_temp(egui::Id::new("ml-focus-search"), true));
+                }
+                "folders" => view.show_folders = !view.show_folders,
+                "sfx" => {
+                    if client.catalog().is_some_and(|c| c.cards.iter().any(|c| c.in_folder("SFX"))) {
+                        view.folder = "SFX".into();
+                        view.reveal("SFX");
+                        view.scroll = 0.0;
+                    } else {
+                        app.ui.status = "This library has no SFX collection".into();
+                    }
+                }
+                other => {
+                    view.popover = if view.popover == other { String::new() } else { other.to_string() };
+                }
+            }
+        }
+        anchors.push((name, r));
+        y += side + 4.0 * s;
+    }
+    // Tools: the quick actions on the right.
+    let tr_r = Rect::from_min_size(pos2(bar.min.x + 2.0, y), vec2(bar.width() - 4.0, 18.0 * s));
+    let tresp = ui.interact(tr_r, egui::Id::new("ml-rail-tools"), Sense::click());
+    ui.painter().text(tr_r.center(), Align2::CENTER_CENTER, tr("Tools"), Tokens::medium(9.5 * s), if view.show_tools { t.text } else { t.text_faint });
+    app.auto.add("motionLibrary.rail.tools", tr_r, "Tools");
+    if tresp.on_hover_text(tr("Show or hide the quick actions")).clicked() {
+        view.show_tools = !view.show_tools;
+    }
+    y += 24.0 * s;
+    // Bottom: sync state, refresh, settings, save.
+    let bottom: [(&str, Option<Icon>, &str); 4] = [
+        ("ec", None, "Library state (click to check for updates)"),
+        ("refresh", None, "Check for library updates"),
+        ("display", Some(Icon::Gear), "Display settings"),
+        ("save", Some(Icon::Plus), "Save to Motion Library"),
+    ];
+    let mut by = bar.max.y - 8.0 * s - side;
+    let bottom_top = bar.max.y - 8.0 * s - 4.0 * (side + 4.0 * s);
+    for (name, icon, tip) in bottom.iter().rev() {
+        let r = Rect::from_min_size(pos2(x, by), vec2(side, side));
+        by -= side + 4.0 * s;
+        if r.min.y < y {
+            continue;
+        }
+        let resp = match (name, icon) {
+            (&"save", Some(i)) => {
+                let resp = ui.interact(r, egui::Id::new(("ml-rail", *name)), Sense::click());
+                ui.painter().circle_filled(r.center(), side / 2.0, if resp.hovered() { t.accent_hover } else { t.accent });
+                crate::icons::paint(ui.painter(), r.shrink(7.0 * s), *i, Color32::WHITE);
+                resp
+            }
+            (_, Some(i)) => widgets::icon_button(ui, r, *i, view.popover == *name, &t, egui::Id::new(("ml-rail", *name))),
+            (&"ec", None) => {
+                let resp = ui.interact(r, egui::Id::new(("ml-rail", *name)), Sense::click());
+                ui.painter().text(r.center(), Align2::CENTER_CENTER, "EC", Tokens::semibold(10.0 * s), t.text_dim);
+                let dot = match (&status.error, &status.update) {
+                    (Some(_), _) => t.danger,
+                    (None, Some(_)) => t.warning,
+                    _ if status.refreshing || !status.checked => t.text_faint,
+                    _ => t.cache_green,
+                };
+                ui.painter().circle_filled(pos2(r.max.x - 5.0 * s, r.min.y + 6.0 * s), 3.0 * s, dot);
+                resp
+            }
+            _ => {
+                let resp = ui.interact(r, egui::Id::new(("ml-rail", *name)), Sense::click());
+                if resp.hovered() {
+                    ui.painter().rect_filled(r, CornerRadius::same(4), t.hover);
+                }
+                ui.painter().text(r.center(), Align2::CENTER_CENTER, if status.refreshing { "…" } else { "↻" }, Tokens::ui(15.0 * s), t.text_dim);
+                resp
+            }
+        };
+        let auto = if *name == "refresh" || *name == "display" { format!("motionLibrary.{name}") } else { format!("motionLibrary.rail.{name}") };
+        let label = match (*name, &status.update, &status.error) {
+            ("ec", _, Some(e)) => e.clone(),
+            ("ec", Some(u), None) => u.label.clone(),
+            ("ec", None, None) => format!("version {}", status.version),
+            _ => tip.to_string(),
+        };
+        app.auto.add(&auto, r, &label);
+        if resp.on_hover_text(label).clicked() {
+            match *name {
+                "ec" | "refresh" => {
+                    kit::exec(app, "library.sync", json!({"wait": false}));
+                }
+                other => view.popover = if view.popover == other { String::new() } else { other.to_string() },
+            }
+        }
+        anchors.push((name, r));
+    }
+    // The label strip: label the selected layers.
+    let sw = (10.0 * s).round();
+    let cols = 2usize;
+    let strip_w = cols as f32 * sw + 3.0 * s;
+    let mut sy = y + 4.0 * s;
+    for (i, l) in effectcraft_color::Label::ALL.iter().skip(1).enumerate() {
+        let (col, row) = (i % cols, i / cols);
+        let r = Rect::from_min_size(pos2(bar.center().x - strip_w / 2.0 + col as f32 * (sw + 3.0 * s), sy + row as f32 * (sw + 3.0 * s)), vec2(sw, sw));
+        if r.max.y > bottom_top - 4.0 * s {
+            break;
+        }
+        let resp = ui.interact(r, egui::Id::new(("ml-label", i)), Sense::click());
+        ui.painter().rect_filled(r, CornerRadius::same(2), t.label(*l));
+        if resp.hovered() {
+            ui.painter().rect_stroke(r.expand(1.0), CornerRadius::same(2), Stroke::new(1.0, t.text), egui::StrokeKind::Outside);
+        }
+        let name = app.session.prefs.label_name(*l);
+        app.auto.add(&format!("motionLibrary.label.{}", l.name()), r, &name);
+        if resp.on_hover_text(format!("Label the selected layers: {name}")).clicked() {
+            kit::exec(app, "edit.label", json!({"label": l.name()}));
+        }
+    }
+    sy += 0.0;
+    let _ = sy;
+    // Popovers beside their buttons.
+    let kinds = kind_counts(ctx, client);
+    let which = view.popover.clone();
+    if let Some((_, anchor)) = anchors.iter().find(|(n, _)| *n == which) {
+        let anchor = *anchor;
+        match which.as_str() {
+            "display" => popover(app, ctx, anchor, vec2(236.0 * s, 104.0 * s), view, |app, ui, r, view| display_body(app, ui, r, view, s)),
+            "curves" => popover(app, ctx, anchor, vec2(220.0 * s, 150.0 * s), view, |app, ui, r, view| curves_body(app, ui, r, view, s)),
+            "filters" => {
+                let h = (66.0 + 23.0 * (kinds.len() as f32 + 1.0)) * s;
+                popover(app, ctx, anchor, vec2(240.0 * s, h), view, |app, ui, r, view| filters_body(app, ui, r, view, &kinds, s))
+            }
+            "save" => popover(app, ctx, anchor, vec2(260.0 * s, 120.0 * s), view, |app, ui, r, _| save_body(app, ui, r, s)),
+            _ => {}
+        }
+    }
+}
+
+/// How many cards of each kind (Comp, Overlay, Sound…) the catalog has, most first.
+fn kind_counts(ctx: &egui::Context, client: &Client) -> Arc<Vec<(String, usize)>> {
+    type Cached = (u64, Arc<Vec<(String, usize)>>);
+    let id = egui::Id::new("ml-kinds");
+    let generation = generation(client);
+    if let Some((g, k)) = ctx.data(|d| d.get_temp::<Cached>(id))
+        && g == generation
+    {
+        return k;
+    }
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for c in client.catalog().iter().flat_map(|c| c.cards.iter()) {
+        *counts.entry(kind_label(c).to_string()).or_default() += 1;
+    }
+    let mut v: Vec<(String, usize)> = counts.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let v = Arc::new(v);
+    ctx.data_mut(|d| d.insert_temp::<Cached>(id, (generation, v.clone())));
+    v
+}
+
+/// The card's kind as the library labels it.
+fn kind_label(c: &Card) -> &str {
+    if !c.kind_label.is_empty() {
+        &c.kind_label
+    } else if c.kind == "comp" {
+        "Comp"
+    } else {
+        "Footage"
+    }
+}
+
+/// The card's details over the grid: preview image, what and where it is, its files, and Apply.
+fn details_sheet(
+    app: &mut EffectcraftApp,
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    client: &Client,
+    grid: Rect,
+    card: &Card,
+    view: &mut ViewState,
+    s: f32,
+) -> Option<String> {
+    let t = app.tokens;
+    let p = ui.painter().with_clip_rect(grid);
+    // Block the cards below.
+    let _ = ui.interact(grid, egui::Id::new("ml-details-block"), Sense::click_and_drag());
+    p.rect_filled(grid, 0.0, Color32::from_black_alpha(120));
+    let w = (grid.width() - 32.0 * s).min(560.0 * s).max(120.0);
+    let h = (grid.height() - 32.0 * s).min(460.0 * s).max(120.0);
+    let r = Rect::from_center_size(grid.center(), vec2(w, h));
+    p.rect_filled(r, CornerRadius::same(10), t.header_bg);
+    p.rect_stroke(r, CornerRadius::same(10), Stroke::new(1.0, t.separator), egui::StrokeKind::Inside);
+    app.auto.add("motionLibrary.details", r, &card.name);
+    let pad = 14.0 * s;
+    let inner = r.shrink(pad);
+    // Image: the thumbnail at its shape, up to 45 % of the height.
+    let max_h = inner.height() * 0.45;
+    let aspect = card.thumb_size.filter(|[a, b]| *a > 0 && *b > 0).map_or(10.0 / 16.0, |[a, b]| b as f32 / a as f32);
+    let (iw, ih) = if inner.width() * aspect > max_h { (max_h / aspect, max_h) } else { (inner.width(), inner.width() * aspect) };
+    let img = Rect::from_min_size(pos2(inner.center().x - iw / 2.0, inner.min.y), vec2(iw, ih));
+    p.rect_filled(img, CornerRadius::same(6), t.field_bg);
+    let mut budget = 2u32;
+    if let Some((tex, [tw, th])) = card.thumbnail.as_ref().and_then(|b| thumbnail(ctx, client, b, thumb_side(iw, ctx.pixels_per_point()), &mut budget)) {
+        paint_cover(&p, tex.id(), vec2(tw as f32, th as f32), img);
+    }
+    let mut y = img.max.y + 14.0 * s;
+    let name_font = Tokens::semibold(14.0 * s);
+    let name = elide(&p, &card.name, &name_font, inner.width());
+    p.text(pos2(inner.min.x, y), Align2::LEFT_TOP, &name, name_font, t.text);
+    y += 20.0 * s;
+    p.text(pos2(inner.min.x, y), Align2::LEFT_TOP, card.subtitle(), Tokens::ui(11.0 * s), t.text_faint);
+    y += 20.0 * s;
+    let mut facts = vec![];
+    if let Some(d) = card.duration.filter(|d| *d > 0.0) {
+        facts.push(format!("{d:.1} s"));
+    }
+    if card.on_mac {
+        facts.push(tr("on the Mac: apply it in After Effects there").to_string());
+    } else {
+        let bytes: u64 = card.apply_blobs().iter().map(|b| b.size).sum();
+        facts.push(format!(
+            "{} file{} · {:.1} MB to download",
+            card.apply_blobs().len(),
+            if card.apply_blobs().len() == 1 { "" } else { "s" },
+            bytes as f64 / 1e6
+        ));
+    }
+    if card.needs_footage() {
+        let names: Vec<&str> = card.placeholders.iter().map(|p| p.name.as_str()).take(4).collect();
+        facts.push(format!("needs footage: {}", names.join(", ")));
+    }
+    let buttons_h = 34.0 * s;
+    let text_rect = Rect::from_min_max(pos2(inner.min.x, y), pos2(inner.max.x, inner.max.y - buttons_h));
+    let mut body = facts.join("  ·  ");
+    if !card.description.is_empty() {
+        body.push_str("\n\n");
+        body.push_str(&card.description);
+    }
+    let galley = p.layout(body, Tokens::ui(11.5 * s), t.text_dim, text_rect.width().max(40.0));
+    p.with_clip_rect(text_rect.intersect(grid)).galley(text_rect.min, galley, t.text_dim);
+    // Buttons.
+    let bw = 84.0 * s;
+    let by = inner.max.y - 24.0 * s;
+    let apply_r = Rect::from_min_size(pos2(inner.max.x - bw, by), vec2(bw, 24.0 * s));
+    let close_r = apply_r.translate(vec2(-(bw + 8.0 * s), 0.0));
+    let mut apply = None;
+    if kit::button(app, ui, close_r, "motionLibrary.details.close", "Close", false) || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        view.details = None;
+    }
+    if card.applicable() {
+        if kit::button(app, ui, apply_r, "motionLibrary.details.apply", "Apply", true) {
+            apply = Some(card.id.clone());
+            view.details = None;
+        }
+    } else {
+        p.text(apply_r.center(), Align2::CENTER_CENTER, tr("On the Mac"), Tokens::medium(11.5 * s), t.text_faint);
+    }
+    apply
 }
 
 pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
@@ -627,11 +1097,16 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let footer_h = 32.0 * s;
     let narrow = rect.width() < 460.0;
 
+    // The rail on the left, the quick actions on the right (hidden when the panel is narrow).
+    let rail_w = (44.0 * s).round().min(rect.width() * 0.2);
+    let rail_r = Rect::from_min_max(rect.min, pos2(rect.min.x + rail_w, rect.max.y));
+    let tools_w = if view.show_tools && !narrow { (40.0 * s).round() } else { 0.0 };
+    let tools_r = Rect::from_min_max(pos2(rect.max.x - tools_w, rect.min.y), pos2(rect.max.x, rect.max.y - footer_h));
     // Collections: a tree on the left (a dropdown when the panel is narrow).
-    let mut main = Rect::from_min_max(rect.min, pos2(rect.max.x, rect.max.y - footer_h));
-    if !narrow {
-        let side_w = (184.0 * s).min(rect.width() * 0.38).round();
-        let side = Rect::from_min_max(rect.min, pos2(rect.min.x + side_w, rect.max.y - footer_h));
+    let mut main = Rect::from_min_max(pos2(rail_r.max.x + 1.0, rect.min.y), pos2(rect.max.x - tools_w, rect.max.y - footer_h));
+    if !narrow && view.show_folders {
+        let side_w = (184.0 * s).min(main.width() * 0.38).round();
+        let side = Rect::from_min_max(main.min, pos2(main.min.x + side_w, main.max.y));
         main.min.x = side.max.x + 1.0;
         p.line_segment([side.right_top(), side.right_bottom()], Stroke::new(1.0, t.separator));
         let head_h = 30.0 * s;
@@ -719,25 +1194,22 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let head_h = 36.0 * s;
     let head = Rect::from_min_size(main.min, vec2(main.width(), head_h));
     let cards = visible_cards(&ctx, &client, &view);
-    let bh = 26.0 * s;
-    let display_r = Rect::from_min_size(pos2(head.max.x - pad - bh, head.center().y - bh / 2.0), vec2(bh, bh));
-    let refresh_r = display_r.translate(vec2(-(bh + 4.0 * s), 0.0));
-    let search_w = (220.0 * s).min((head.width() * 0.45).max(80.0));
-    let search_r = Rect::from_min_size(pos2(refresh_r.min.x - 6.0 * s - search_w, head.center().y - 12.0 * s), vec2(search_w, 24.0 * s));
+    let search_w = (240.0 * s).min((head.width() * 0.5).max(80.0));
+    let search_r = Rect::from_min_size(pos2(head.max.x - pad - search_w, head.center().y - 12.0 * s), vec2(search_w, 24.0 * s));
     let mut q = view.query.clone();
     let resp = widgets::search_field(ui, search_r, &mut q, "Search assets", &t);
     app.auto.add_response("motionLibrary.search", &resp, "Search assets");
+    if ctx.data_mut(|d| d.remove_temp::<bool>(egui::Id::new("ml-focus-search"))).unwrap_or(false) {
+        resp.request_focus();
+    }
     if q != view.query {
         view.query = q;
         view.scroll = 0.0;
     }
-    if kit::button(app, ui, refresh_r, "motionLibrary.refresh", if status.refreshing { "…" } else { "↻" }, false) {
-        kit::exec(app, "library.sync", json!({"wait": false}));
+    let mut title = if view.folder.is_empty() { tr("All motion").to_string() } else { view.folder.rsplit('/').next().unwrap_or(&view.folder).to_string() };
+    if !view.kind_filter.is_empty() {
+        title = format!("{title} · {}", view.kind_filter);
     }
-    if kit::button(app, ui, display_r, "motionLibrary.display", "Aa", view.display_open) {
-        view.display_open = !view.display_open;
-    }
-    let title = if view.folder.is_empty() { tr("All motion").to_string() } else { view.folder.rsplit('/').next().unwrap_or(&view.folder).to_string() };
     let title_font = Tokens::semibold(13.0 * s);
     let left = Rect::from_min_max(pos2(head.min.x + pad, head.min.y), pos2(search_r.min.x - 8.0 * s, head.max.y));
     let title_s = elide(&p, &title, &title_font, (left.width() * 0.6).max(10.0));
@@ -806,7 +1278,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let lay = layout(&cards, is_grouped, (inner.width() - 6.0).max(40.0), card_w, gap, caption_h, header_h);
     let content_h = lay.height + gap * 2.0;
     let max_scroll = (content_h - grid.height()).max(0.0);
-    if ui.rect_contains_pointer(grid) && !view.display_open {
+    if ui.rect_contains_pointer(grid) && view.popover.is_empty() && view.details.is_none() {
         let dy = ctx.input(|i| i.smooth_scroll_delta.y);
         if dy.is_finite() && dy != 0.0 {
             view.scroll -= dy;
@@ -845,7 +1317,11 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 }
                 let Some(card) = cards.get(*index) else { continue };
                 let thumb_r = Rect::from_min_size(tile.min, vec2(tile.width(), *thumb_h));
-                let resp = ui.interact(tile.intersect(grid), egui::Id::new(("ml-card", &card.id)), Sense::click());
+                let resp = ui.interact(tile.intersect(grid), egui::Id::new(("ml-card", &card.id)), Sense::click_and_drag());
+                // Drag a card onto the Timeline or the Composition viewer to apply it there.
+                if resp.drag_started() && card.applicable() {
+                    egui::DragAndDrop::set_payload(&ctx, super::DragPayload::LibraryCard(card.id.clone()));
+                }
                 let selected = view.selected.as_deref() == Some(card.id.as_str());
                 let hovered = resp.hovered();
                 gp.rect_filled(tile, radius, if hovered { t.hover } else { t.row_alt });
@@ -896,6 +1372,20 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 if selected {
                     gp.rect_stroke(tile, radius, Stroke::new(2.0, t.accent), egui::StrokeKind::Inside);
                 }
+                // Details: the ⓘ button over a hovered card.
+                if hovered || view.details.as_deref() == Some(card.id.as_str()) {
+                    let ir = Rect::from_center_size(pos2(thumb_r.max.x - 13.0 * s, thumb_r.min.y + 13.0 * s), vec2(18.0 * s, 18.0 * s));
+                    if grid.contains_rect(ir) {
+                        let iresp = ui.interact(ir, egui::Id::new(("ml-card-info", &card.id)), Sense::click());
+                        gp.circle_filled(ir.center(), 9.0 * s, if iresp.hovered() { t.accent } else { Color32::from_black_alpha(170) });
+                        gp.text(ir.center(), Align2::CENTER_CENTER, "i", Tokens::semibold(11.0 * s), Color32::WHITE);
+                        app.auto.add(&format!("motionLibrary.info.{}", card.id), ir, "Details and options");
+                        if iresp.on_hover_text(tr("Details and options")).clicked() {
+                            view.details = Some(card.id.clone());
+                            view.selected = Some(card.id.clone());
+                        }
+                    }
+                }
                 // Caption: the name, then what and where it is.
                 let cx = tile.min.x + 7.0 * s;
                 let cw = (tile.width() - 14.0 * s).max(4.0);
@@ -936,7 +1426,11 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                         let names: Vec<&str> = card.placeholders.iter().map(|p| p.name.as_str()).take(3).collect();
                         tip.push_str(&format!("\nNeeds footage: {}", names.join(", ")));
                     }
-                    tip.push_str(if card.on_mac { "\nOn the Mac: apply it in After Effects there" } else { "\nDouble-click to add" });
+                    tip.push_str(if card.on_mac {
+                        "\nOn the Mac: apply it in After Effects there"
+                    } else {
+                        "\nDouble-click to add, or drag it onto the Timeline"
+                    });
                     resp.on_hover_text(tip);
                 }
             }
@@ -977,32 +1471,62 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             app.auto.add("motionLibrary.onMac", ar, "On the Mac");
         }
     }
+    // The card's details over the grid.
+    if let Some(id) = view.details.clone() {
+        match client.catalog().and_then(|c| c.card(&id).cloned()) {
+            Some(card) => {
+                if let Some(a) = details_sheet(app, ui, &ctx, &client, grid, &card, &mut view, s) {
+                    apply_now = Some(a);
+                }
+            }
+            None => view.details = None,
+        }
+    }
+    // A card being dragged: its name under the pointer.
+    if let Some(payload) = egui::DragAndDrop::payload::<super::DragPayload>(&ctx)
+        && let super::DragPayload::LibraryCard(id) = payload.as_ref()
+        && let Some(ptr) = ctx.pointer_hover_pos()
+    {
+        let name = client.catalog().and_then(|c| c.card(id).map(|c| c.name.clone())).unwrap_or_default();
+        let lp = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("ml-drag")));
+        let g = lp.layout_no_wrap(format!("＋ {name}"), Tokens::medium(11.5), Color32::WHITE);
+        let r = Rect::from_min_size(ptr + vec2(14.0, 10.0), g.size()).expand2(vec2(8.0, 4.0));
+        lp.rect_filled(r, CornerRadius::same(6), t.accent);
+        lp.galley(r.min + vec2(8.0, 4.0), g, Color32::WHITE);
+    }
     if let Some(id) = apply_now {
         view.selected = Some(id.clone());
         view.applying = Some(id);
+        view.apply_time = None;
     }
     // Applying: poll until the downloads are in, then the import runs (one undo step).
     if let Some(id) = view.applying.clone() {
-        match app.session.execute("library.apply", json!({"id": id, "wait": false})) {
+        match app.session.execute("library.apply", json!({"id": id, "wait": false, "time": view.apply_time})) {
             Ok(r) if r.get("pending").and_then(Value::as_bool) == Some(true) => {
                 ctx.request_repaint_after(std::time::Duration::from_millis(100));
             }
-            Ok(_) => view.applying = None,
+            Ok(_) => {
+                view.applying = None;
+                view.apply_time = None;
+            }
             Err(e) => {
                 app.ui.status = e.to_string();
                 view.applying = None;
+                view.apply_time = None;
             }
         }
     }
-    if view.display_open {
-        display_popover(app, &ctx, display_r, &mut view, s);
+    rail(app, ui, &ctx, &client, &status, rail_r, &mut view, s);
+    if tools_w > 0.0 {
+        toolbar(app, ui, tools_r, s);
     }
     view.clamp();
     app.ui.motion_library = view;
 }
 
 /// `motionLibrary.view`: change what the panel shows (`folder`, `query`, `scale`, `cardSize`,
-/// `expand` / `collapse` folders, `display` popover); returns the view.
+/// `expand` / `collapse` folders, `kind`, `hereOnly`, `showFolders`, `showTools`, `popover` /
+/// `display`, `details`: a card id or null); returns the view.
 pub fn set_view(view: &mut ViewState, p: &Value) -> Result<Value, String> {
     if let Some(f) = p.get("folder") {
         let f = f.as_str().ok_or("`folder` is a folder path (\"\" = All motion)")?.trim().trim_matches('/');
@@ -1041,10 +1565,39 @@ pub fn set_view(view: &mut ViewState, p: &Value) -> Result<Value, String> {
         }
     }
     if let Some(d) = p.get("display").and_then(Value::as_bool) {
-        view.display_open = d;
+        view.popover = if d { "display".into() } else { String::new() };
+    }
+    if let Some(v) = p.get("popover") {
+        let v = v.as_str().unwrap_or("");
+        if !["", "display", "curves", "filters", "save"].contains(&v) {
+            return Err(format!("unknown popover `{v}` (display, curves, filters, save, or \"\")"));
+        }
+        view.popover = v.to_string();
+    }
+    if let Some(k) = p.get("kind") {
+        view.kind_filter = k.as_str().ok_or("`kind` is a card kind (Comp, Overlay, Sound…; \"\" = all)")?.to_string();
+        view.scroll = 0.0;
+    }
+    for (key, slot) in [("hereOnly", &mut view.here_only), ("showFolders", &mut view.show_folders), ("showTools", &mut view.show_tools)] {
+        if let Some(b) = p.get(key) {
+            *slot = b.as_bool().ok_or(format!("`{key}` is true or false"))?;
+        }
+    }
+    if let Some(d) = p.get("details") {
+        view.details = d.as_str().map(str::to_string);
     }
     view.clamp();
     Ok(view.to_json())
+}
+
+/// `motionLibrary.apply`: apply a card from the panel without blocking (`time`: comp seconds,
+/// default the playhead), as a drop on the Timeline does; the panel shows the download.
+pub fn start_apply(view: &mut ViewState, p: &Value) -> Result<Value, String> {
+    let id = p.get("id").and_then(Value::as_str).ok_or("missing `id` (a Motion Library card)")?;
+    view.selected = Some(id.to_string());
+    view.applying = Some(id.to_string());
+    view.apply_time = p.get("time").and_then(Value::as_f64).filter(|t| t.is_finite() && *t >= 0.0);
+    Ok(json!({"applying": id, "time": view.apply_time}))
 }
 
 #[cfg(test)]
