@@ -533,7 +533,13 @@ fn preview_on(app: &mut EffectcraftApp, ui: &mut egui::Ui, x: f32, cy: f32) -> f
         Some(s) => format!(
             "Where the viewer's preview frames render. Exports always render on this Mac.\n{}: {}{}",
             s.address,
-            if s.ready { "ready" } else if s.connected { "loading the project" } else { "not connected" },
+            if s.ready {
+                "ready"
+            } else if s.connected {
+                "loading the project"
+            } else {
+                "not connected"
+            },
             s.gpu.as_ref().map(|g| format!(" · {g}")).unwrap_or_default()
         ),
         None => "Where the viewer's preview frames render. Exports always render on this Mac.".to_string(),

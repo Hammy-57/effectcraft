@@ -302,7 +302,8 @@ impl Link {
         // The server's default renderer is its CPU; Auto picks its GPU (CR4 hand-over).
         opts.backend = Backend::Auto;
         let id = self.id();
-        let render = FrameMsg::Render { id, revision: job.revision, comp: job.comp, time: job.t, opts: Box::new(opts), disk: None, layers: false, prefetch: vec![] };
+        let render =
+            FrameMsg::Render { id, revision: job.revision, comp: job.comp, time: job.t, opts: Box::new(opts), disk: None, layers: false, prefetch: vec![] };
         let want = Want { codec: Codec::Jpeg, quality: 85, max_size: None, refine: job.urgent };
         if !self.client.send(Up::Msg { msg: render, want, urgent: job.urgent }, vec![]) {
             return done(Err("the cloud connection dropped".into()));
@@ -734,7 +735,8 @@ mod tests {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let addr = listener.local_addr().unwrap().to_string();
-            let (kill, stall, renders, streams) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicUsize::new(0)), Arc::new(Mutex::new(vec![])));
+            let (kill, stall, renders, streams) =
+                (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicUsize::new(0)), Arc::new(Mutex::new(vec![])));
             let (k, st, r, ss) = (kill.clone(), stall.clone(), renders.clone(), streams.clone());
             std::thread::spawn(move || {
                 while !k.load(Ordering::Acquire) {
@@ -761,7 +763,16 @@ mod tests {
                                     r.fetch_add(1, Ordering::AcqRel);
                                     let rgba: Vec<u8> = [255u8, 0, 0, 255].repeat(32 * 18);
                                     let (px, payload) = remote_encode::encode(&rgba, 32, 18, Codec::Raw, 85).unwrap();
-                                    let frame = FrameReply::Frame { id, width: 32, height: 18, ms: 1.0, passes: 1, gpu: true, layer_misses: vec![], layer_hits: vec![] };
+                                    let frame = FrameReply::Frame {
+                                        id,
+                                        width: 32,
+                                        height: 18,
+                                        ms: 1.0,
+                                        passes: 1,
+                                        gpu: true,
+                                        layer_misses: vec![],
+                                        layer_hits: vec![],
+                                    };
                                     (Down::Reply { reply: frame, pixels: Some(px) }, payload)
                                 }
                                 _ => continue,

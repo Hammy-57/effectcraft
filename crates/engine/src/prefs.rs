@@ -1284,7 +1284,9 @@ pub fn pages() -> Vec<Page> {
                 Section("Cloud Preview"),
                 s("previews.previewOn", "Preview On", Kind::Choice(&[("This Mac", "local"), ("Cloud", "cloud"), ("Auto", "auto")]), true),
                 s("previews.cloudAddress", "Cloud Address", Kind::Text, true),
-                Note("The viewer's preview frames come from a frame server on a rented GPU (effectcraft-cli serve --gpu --frames 9878), through an SSH tunnel (ssh -L 9878:127.0.0.1:9878 …). Its token goes in the settings folder's cloud-frame-token file (or EFFECTCRAFT_FRAME_TOKEN). Timeline, panels and audio stay on this Mac; exports render here. A lost connection previews on this Mac again."),
+                Note(
+                    "The viewer's preview frames come from a frame server on a rented GPU (effectcraft-cli serve --gpu --frames 9878), through an SSH tunnel (ssh -L 9878:127.0.0.1:9878 …). Its token goes in the settings folder's cloud-frame-token file (or EFFECTCRAFT_FRAME_TOKEN). Timeline, panels and audio stay on this Mac; exports render here. A lost connection previews on this Mac again.",
+                ),
                 Button { label: "GPU Information...", command: "app.gpuInfo", params: "{}" },
             ],
         },
