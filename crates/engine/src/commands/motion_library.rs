@@ -21,6 +21,7 @@ use super::{CommandSpec, always, b_p, bad, f_p, str_p};
 use crate::{EngineError, Result, Session, cmd, query};
 
 /// How long agents' calls wait for downloads by default (seconds).
+#[cfg(not(target_arch = "wasm32"))]
 const WAIT: f64 = 120.0;
 
 fn client(s: &Session, c: &str) -> Result<Client> {
@@ -206,7 +207,7 @@ fn apply(s: &mut Session, p: &Value) -> Result<Value> {
             let rewritten = effectcraft_motionlib::rewrite_paths(&project, &paths).map_err(|e| bad(C, e))?;
             // Named after the card: the Project panel's folder reads as the card.
             let name: String = card.name.chars().map(|c| if c.is_alphanumeric() || " -_".contains(c) { c } else { '_' }).take(100).collect();
-            let key = format!("applied/{}/{}.ecproj", &card.rev.get(..16).unwrap_or("card"), if name.trim().is_empty() { "card" } else { name.trim() });
+            let key = format!("applied/{}/{}.ecproj", card.rev.get(..16).unwrap_or("card"), if name.trim().is_empty() { "card" } else { name.trim() });
             client.store().put(&key, &rewritten).map_err(|e| bad(C, e))?;
             let path = materialize(s, &client, &key, || Some(rewritten.clone())).map_err(|e| bad(C, e))?;
             let r = s.execute("file.importProject", json!({"path": path}))?;
@@ -293,7 +294,14 @@ fn publish(s: &mut Session, p: &Value) -> Result<Value> {
     };
     let mut opts = effectcraft_motionlib::publish::Options::new(library, folders);
     if let Some(mb) = f_p(p, "maxFileMB").filter(|m| m.is_finite() && *m > 0.0) {
-        opts.max_file_bytes = (mb * 1024.0 * 1024.0) as u64;
+        opts.max_file_bytes = (mb * 1e6) as u64;
+    }
+    if let Some(mb) = f_p(p, "maxPreviewMB").filter(|m| m.is_finite() && *m >= 0.0) {
+        opts.max_preview_bytes = (mb * 1e6) as u64;
+    }
+    if let Some(map) = p.get("folderMaxMB").and_then(Value::as_object) {
+        opts.folder_max_bytes =
+            map.iter().filter_map(|(f, mb)| Some((f.clone(), (mb.as_f64().filter(|m| m.is_finite() && *m >= 0.0)? * 1e6) as u64))).collect();
     }
     opts.include_video = b_p(p, "includeVideo").unwrap_or(false);
     opts.dry_run = b_p(p, "dryRun").unwrap_or(false);
@@ -381,7 +389,7 @@ pub fn specs() -> Vec<CommandSpec> {
         query!(
             "library.publish",
             "Publish Motion Library",
-            "{library (folder with library.json), folders? (default [\"Devin Jatho\", \"SceneYard\"]), maxFileMB? (default 100), includeVideo? (default false), dryRun?, force? (upload every blob again), remote? (default the configured one)} — desktop: uploads only new files, then the manifest and a bumped version → {version, previous, unchanged, cards, needsFootage, uploads, uploadBytes, blobs, totalBytes, new, changed, removed, skipped, skippedCount, errors, log}",
+            "{library (folder with library.json), folders? (default [\"Devin Jatho\", \"SceneYard\"]), maxFileMB? (default 90: the Worker takes uploads up to 100 MB), maxPreviewMB?, folderMaxMB? ({\"SceneYard\": 5}: per-folder file limit), includeVideo? (default false), dryRun?, force? (upload every blob again), remote? (default the configured one)} — desktop: uploads only new files, then the manifest and a bumped version → {version, previous, unchanged, cards, needsFootage, uploads, uploadBytes, blobs, totalBytes, new, changed, removed, skipped, skippedCount, errors, log}",
             publish
         ),
     ]

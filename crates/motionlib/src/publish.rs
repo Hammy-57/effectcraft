@@ -34,6 +34,11 @@ pub struct Options {
     pub folders: Vec<String>,
     /// Files bigger than this stay home as placeholders.
     pub max_file_bytes: u64,
+    /// Previews bigger than this are left out (the card shows its thumbnail on hover).
+    pub max_preview_bytes: u64,
+    /// Per folder (and its subfolders): files bigger than this stay home, instead of
+    /// `max_file_bytes` (e.g. `SceneYard` = 5 MB keeps its big footage images home).
+    pub folder_max_bytes: Vec<(String, u64)>,
     pub include_video: bool,
     /// Work everything out, upload nothing.
     pub dry_run: bool,
@@ -43,7 +48,16 @@ pub struct Options {
 
 impl Options {
     pub fn new(library: impl Into<PathBuf>, folders: Vec<String>) -> Options {
-        Options { library: library.into(), folders, max_file_bytes: 100 * 1024 * 1024, include_video: false, dry_run: false, force: false }
+        Options {
+            library: library.into(),
+            folders,
+            max_file_bytes: 90 * 1000 * 1000,
+            max_preview_bytes: 90 * 1000 * 1000,
+            folder_max_bytes: vec![],
+            include_video: false,
+            dry_run: false,
+            force: false,
+        }
     }
 }
 
@@ -67,11 +81,11 @@ pub struct Report {
     pub cards: usize,
     #[serde(rename = "needsFootage")]
     pub needs_footage: usize,
-    /// Blobs uploaded (or to upload, dry run) and their stored bytes.
+    /// Blobs uploaded (or to upload, dry run) and the bytes sent (gzipped blobs compressed).
     pub uploads: usize,
     #[serde(rename = "uploadBytes")]
     pub upload_bytes: u64,
-    /// Every blob the catalog references and their stored bytes (what the bucket holds).
+    /// Every blob the catalog references and their bytes before compression.
     pub blobs: usize,
     #[serde(rename = "totalBytes")]
     pub total_bytes: u64,
@@ -247,7 +261,9 @@ impl Builder<'_> {
             category: text(e, "category"),
             kind: kind.clone(),
             comp: text(e, "comp"),
-            description: text(e, "description"),
+            // The library's own description when the index carries it (search parity with
+            // retrieval.py); else the index's display text.
+            description: e.get("raw_description").and_then(Value::as_str).map_or_else(|| text(e, "description"), str::to_string),
             tags: strings(e, "tags"),
             aliases: strings(e, "aliases"),
             visual_caption: text(e, "visual_caption"),
@@ -259,14 +275,23 @@ impl Builder<'_> {
             duration: e.get("duration").and_then(Value::as_f64).filter(|d| d.is_finite()),
             ..Card::default()
         };
-        let max = self.opts.max_file_bytes;
+        let category = text(e, "category");
+        let max = self
+            .opts
+            .folder_max_bytes
+            .iter()
+            .filter(|(f, _)| category == *f || category.strip_prefix(f.as_str()).is_some_and(|r| r.starts_with('/')))
+            .map(|(_, m)| *m)
+            .min()
+            .unwrap_or(self.opts.max_file_bytes);
         for (key, slot) in [("thumbnail", 0), ("preview", 1)] {
             let p = text(e, key);
             if p.is_empty() {
                 continue;
             }
             let path = self.resolve(&p);
-            if Hasher::stat(&path).is_some_and(|(size, _)| size <= max) {
+            let limit = if slot == 1 { self.opts.max_preview_bytes.min(self.opts.max_file_bytes) } else { self.opts.max_file_bytes };
+            if Hasher::stat(&path).is_some_and(|(size, _)| size <= limit) {
                 let b = self.blob(&path, &file_name(&p));
                 if slot == 0 { card.thumbnail = b } else { card.preview = b }
             }
@@ -394,13 +419,29 @@ pub fn publish(remote: &dyn Remote, opts: &Options, progress: &mut dyn FnMut(Str
         })
         .unwrap_or_default();
     report.blobs = b.uploads.len();
-    let todo: Vec<&Upload> = b.uploads.values().filter(|u| opts.force || !have.contains(&u.blob.remote_key())).collect();
+    let mut todo: Vec<&Upload> = b.uploads.values().filter(|u| opts.force || !have.contains(&u.blob.remote_key())).collect();
+    // Blobs an interrupted publish already sent (not in the published catalog, but there).
+    if !opts.force && !todo.is_empty() {
+        progress(format!("checking which of {} blobs the remote already has", todo.len()));
+        let mut keep = Vec::with_capacity(todo.len());
+        for u in todo {
+            if !remote.exists(&u.blob.remote_key())? {
+                keep.push(u);
+            }
+        }
+        todo = keep;
+    }
     report.uploads = todo.len();
     for u in b.uploads.values() {
         report.total_bytes += u.blob.size;
     }
+    // What goes over the wire: gzipped blobs at their compressed size.
     for u in &todo {
-        report.upload_bytes += u.blob.size;
+        report.upload_bytes += if u.blob.gz {
+            std::fs::read(&u.source).ok().and_then(|d| encode_blob(&d, true).ok()).map_or(u.blob.size, |z| z.len() as u64)
+        } else {
+            u.blob.size
+        };
     }
     if opts.dry_run || report.unchanged {
         return Ok(report);

@@ -30,19 +30,42 @@ pub struct Config {
     pub cache: String,
 }
 
+/// Makes the remote for a Worker URL and token where the host has its own HTTP (the browser's
+/// fetch).
+pub type RemoteFactory = Arc<dyn Fn(&str, &str) -> Result<Arc<dyn effectcraft_motionlib::Remote>, String> + Send + Sync>;
+
 /// The client, made on first use (and again after `library.configure`).
 #[derive(Clone, Default)]
-pub struct Handle(Arc<Mutex<Option<Client>>>);
+pub struct Handle {
+    client: Arc<Mutex<Option<Client>>>,
+    factory: Arc<Mutex<Option<RemoteFactory>>>,
+    store: Arc<Mutex<Option<Arc<dyn Store>>>>,
+}
 
 impl Handle {
     /// Use `client` (hosts with their own transport).
     pub fn set(&self, client: Option<Client>) {
-        if let Ok(mut c) = self.0.lock() {
+        if let Ok(mut c) = self.client.lock() {
             *c = client;
         }
     }
     pub fn get(&self) -> Option<Client> {
-        self.0.lock().ok()?.clone()
+        self.client.lock().ok()?.clone()
+    }
+    /// Reach `https://` locations through `factory`, caching in `store` (the web app).
+    pub fn set_transport(&self, factory: RemoteFactory, store: Arc<dyn Store>) {
+        if let Ok(mut f) = self.factory.lock() {
+            *f = Some(factory);
+        }
+        if let Ok(mut s) = self.store.lock() {
+            *s = Some(store);
+        }
+    }
+    fn factory(&self) -> Option<RemoteFactory> {
+        self.factory.lock().ok()?.clone()
+    }
+    fn host_store(&self) -> Option<Arc<dyn Store>> {
+        self.store.lock().ok()?.clone()
     }
 }
 
@@ -93,11 +116,16 @@ impl Session {
                     .into(),
             );
         }
-        let remote = effectcraft_motionlib::remote_for(&cfg.remote, Some(&cfg.token))?;
+        let http = cfg.remote.starts_with("https://") || cfg.remote.starts_with("http://");
+        let remote = match self.motion_library.factory().filter(|_| http) {
+            Some(make) => make(&cfg.remote, &cfg.token)?,
+            None => effectcraft_motionlib::remote_for(&cfg.remote, Some(&cfg.token))?,
+        };
         let dir = if cfg.cache.is_empty() { default_cache() } else { Some(std::path::PathBuf::from(&cfg.cache)) };
-        let store: Arc<dyn Store> = match dir {
-            Some(d) => Arc::new(DirStore::new(d)),
-            None => Arc::new(MemStore::default()),
+        let store: Arc<dyn Store> = match (self.motion_library.host_store(), dir) {
+            (Some(s), _) => s,
+            (None, Some(d)) => Arc::new(DirStore::new(d)),
+            (None, None) => Arc::new(MemStore::default()),
         };
         let client = Client::new(remote, store);
         self.motion_library.set(Some(client.clone()));

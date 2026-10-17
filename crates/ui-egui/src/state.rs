@@ -672,6 +672,9 @@ pub struct UiState {
     pub status: String,
     /// Effects & Presets search text.
     pub effects_search: String,
+    /// Motion Library panel: search, folder, selected card, scroll.
+    #[serde(default)]
+    pub motion_library: crate::panels::motion_library::ViewState,
     pub effects_open: BTreeSet<String>,
     pub project_search: String,
     pub project_open_folders: BTreeSet<u64>,
@@ -787,6 +790,7 @@ impl Default for UiState {
             show_menu_bar: true,
             status: String::new(),
             effects_search: String::new(),
+            motion_library: Default::default(),
             effects_open: BTreeSet::new(),
             project_search: String::new(),
             project_open_folders: BTreeSet::new(),

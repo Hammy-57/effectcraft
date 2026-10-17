@@ -199,3 +199,24 @@ fn failures_are_messages() {
     assert!(st["error"].as_str().is_some_and(|e| e.contains(&"0".repeat(64)) || e.contains("damaged")), "{st}");
     assert_eq!(st["cards"], 0);
 }
+
+#[test]
+fn configure_keeps_the_token_out_of_replies() {
+    let root = out_dir("motion-library-config");
+    let mut s = Session { config: Some(Arc::new(crate::config::MemoryConfig::default())), ..Default::default() };
+    let r = s
+        .execute(
+            "library.configure",
+            json!({"remote": root.join("remote").to_string_lossy(), "token": "s3cret-token", "cache": root.join("cache").to_string_lossy()}),
+        )
+        .unwrap();
+    assert_eq!(r["tokenSet"], true);
+    let st = s.execute("library.status", json!({})).unwrap();
+    assert_eq!(st["configured"], true);
+    for v in [&r, &st] {
+        assert!(!v.to_string().contains("s3cret-token"), "{v}");
+    }
+    // A folder that isn't a library yet: a message, no catalog.
+    let st = s.execute("library.sync", json!({})).unwrap();
+    assert!(st["error"].as_str().is_some_and(|e| e.contains("not found")), "{st}");
+}

@@ -82,13 +82,15 @@ fn segment_terms(entry: &Value) -> String {
 /// The word plus its likely singulars (heels → heel, boxes → box, bodies → body).
 fn forms(word: &str) -> Vec<String> {
     let mut found = vec![word.to_string()];
-    if word.chars().count() > 3 && word.ends_with('s') {
-        found.push(word[..word.len() - 1].to_string());
-        if word.ends_with("es") {
-            found.push(word[..word.len() - 2].to_string());
+    if word.chars().count() > 3
+        && let Some(one) = word.strip_suffix('s')
+    {
+        found.push(one.to_string());
+        if let Some(two) = word.strip_suffix("es") {
+            found.push(two.to_string());
         }
-        if word.ends_with("ies") {
-            found.push(format!("{}y", &word[..word.len() - 3]));
+        if let Some(stem) = word.strip_suffix("ies") {
+            found.push(format!("{stem}y"));
         }
     }
     found

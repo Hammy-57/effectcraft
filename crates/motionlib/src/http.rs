@@ -128,6 +128,21 @@ impl Remote for HttpRemote {
         req.send(data).map(|_| ()).map_err(|e| format!("upload {key}: {}", describe_error(e)))
     }
 
+    fn exists(&self, key: &str) -> Result<bool, String> {
+        if !valid_key(key) {
+            return Err(format!("bad key `{key}`"));
+        }
+        let mut req = self.agent.head(&self.url(key));
+        if !self.token.is_empty() {
+            req = req.header("Authorization", format!("Bearer {}", self.token));
+        }
+        match req.call() {
+            Ok(_) => Ok(true),
+            Err(ureq::Error::StatusCode(404)) => Ok(false),
+            Err(e) => Err(format!("{key}: {}", describe_error(e))),
+        }
+    }
+
     fn describe(&self) -> String {
         self.base.clone()
     }

@@ -4,7 +4,7 @@
 //! cargo run --release -p effectcraft-motionlib --example publish -- \
 //!     --library "$HOME/Documents/Elias Motion Library/effectcraft" \
 //!     --remote https://motion-library.<account>.workers.dev \
-//!     [--folders "Devin Jatho,SceneYard"] [--max-mb 100] [--include-video] [--dry-run] [--force]
+//!     [--folders "Devin Jatho,SceneYard"] [--max-mb 90] [--max-preview-mb 2] [--folder-max "SceneYard=5"] [--include-video] [--dry-run] [--force]
 //! ```
 //!
 //! The token comes from `EFFECTCRAFT_LIBRARY_TOKEN` (never an argument: it would show in `ps`).
@@ -19,14 +19,25 @@ fn main() {
     let flag = |name: &str| args.iter().any(|a| a == name);
     let (Some(library), Some(remote)) = (opt("--library"), opt("--remote").or_else(|| std::env::var("EFFECTCRAFT_LIBRARY_REMOTE").ok())) else {
         eprintln!(
-            "usage: publish --library <folder with library.json> --remote <url or folder> [--folders a,b] [--max-mb N] [--include-video] [--dry-run] [--force]"
+            "usage: publish --library <folder with library.json> --remote <url or folder> [--folders a,b] [--max-mb N] [--max-preview-mb N] [--folder-max \"Folder=MB,...\"] [--include-video] [--dry-run] [--force]"
         );
         std::process::exit(2);
     };
     let folders = opt("--folders").unwrap_or_else(|| "Devin Jatho,SceneYard".into()).split(',').map(|f| f.trim().to_string()).collect();
     let mut o = Options::new(library, folders);
     if let Some(mb) = opt("--max-mb").and_then(|m| m.parse::<f64>().ok()).filter(|m| *m > 0.0) {
-        o.max_file_bytes = (mb * 1024.0 * 1024.0) as u64;
+        o.max_file_bytes = (mb * 1e6) as u64;
+    }
+    if let Some(mb) = opt("--max-preview-mb").and_then(|m| m.parse::<f64>().ok()).filter(|m| *m >= 0.0) {
+        o.max_preview_bytes = (mb * 1e6) as u64;
+    }
+    // --folder-max "SceneYard=5,Devin Jatho=90" (MB per folder).
+    for part in opt("--folder-max").unwrap_or_default().split(',').filter(|p| !p.trim().is_empty()) {
+        if let Some((f, mb)) = part.rsplit_once('=')
+            && let Ok(mb) = mb.trim().parse::<f64>()
+        {
+            o.folder_max_bytes.push((f.trim().to_string(), (mb * 1e6) as u64));
+        }
     }
     o.include_video = flag("--include-video");
     o.dry_run = flag("--dry-run");

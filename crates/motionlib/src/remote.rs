@@ -18,6 +18,12 @@ pub trait Remote: Send + Sync {
         let _ = (key, data);
         Err("this Motion Library location is read-only".into())
     }
+    /// Whether `key` is there already (publishing: blobs an interrupted publish uploaded).
+    /// `Err` when it can't be told; the default says no, so the blob is uploaded.
+    fn exists(&self, key: &str) -> Result<bool, String> {
+        let _ = key;
+        Ok(false)
+    }
     /// Where it is, for status replies (never includes a token).
     fn describe(&self) -> String;
 }
@@ -50,6 +56,9 @@ impl Remote for DirRemote {
             return Err(format!("bad key `{key}`"));
         }
         write_atomic(&self.root.join(key), data)
+    }
+    fn exists(&self, key: &str) -> Result<bool, String> {
+        Ok(valid_key(key) && self.root.join(key).is_file())
     }
     fn describe(&self) -> String {
         self.root.display().to_string()
