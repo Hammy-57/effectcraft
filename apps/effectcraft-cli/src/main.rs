@@ -55,6 +55,7 @@ mod asset_guard;
 mod drive;
 mod figma_bridge;
 mod frame_serve;
+mod library_pull;
 mod mirror;
 #[cfg(feature = "ui")]
 mod offscreen_ui;
@@ -184,6 +185,7 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
   mirror USER@HOST [--ssh-port P] [--identity KEY] [--project F.ecproj | --bridge 9877] [--font-dir DIR]
          [--remote-cli PATH] [--env-file PATH] [--dry-run] [--all] [--verify-hash] [--retime] [--watch SECS]
                                            media + fonts to a cloud render machine (same paths), then cloud.preflight there
+  library-pull --jobs FILE.json             on the cloud machine: Motion Library files from the library's Worker (read token)
 options: --project F.ecproj | --demo | --empty   --save | --save-as F   --bridge PORT   --json   --gpu
          --frame-threads N  render at most N frames at once (viewer frame pool, export batches;
                             default one per core, 2-16; also EFFECTCRAFT_FRAME_THREADS)
@@ -1022,6 +1024,7 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
         "stream-test" => stream_cli::test(args)?,
         "mirror" => mirror::run(args, json_out)?,
         "drive-pull" => drive::run(args)?,
+        "library-pull" => library_pull::run(args)?,
         other => return usage_err(&format!("unknown subcommand `{other}`")),
     }
     Ok(())
@@ -1722,29 +1725,34 @@ fn bench_gpu(s: &Session, args: &Args) -> Result<(), Failure> {
             note!(
                 "{name:<28} {label:>5} {size:>10} {cpu_cold:>9.2} {gpu_cold:>9.2} {cpu_warm:>9.2} {gpu_warm:>9.2} {view:>9.2} {speedup:>7.2}x {auto:>9.2} {pct:>8.3}% {traffic:>11}"
             );
-            // `--layers`: per-layer GPU times of one frame with an empty layer cache (after an edit).
+            // `--layers`: per-layer GPU times of a frame with an empty layer cache (after an edit),
+            // twice: the first pass also pays first-use costs (pipelines, pools), the second not.
             if args.flag("--layers") {
-                let times = effectcraft_render::LayerTimes::default();
-                let mut r = Renderer::new(project, s.footage.as_ref(), RenderOpts { scale, backend: Backend::Gpu, ..Default::default() });
-                r.expr = s.expr.as_deref();
-                // A fresh cache: static layers take their cached-layer path, rendered now.
-                let fresh = LayerCache::default();
-                r.cache = Some(&fresh);
-                r.accel = Some(&gpu);
-                r.times = Some(&times);
-                std::hint::black_box(gpu.render_display(&r, cid, t));
-                gpu.wait();
-                let mut rows: Vec<(f64, String)> = times
-                    .into_map()
-                    .into_iter()
-                    .map(|((c, l), ms)| {
-                        let lname = project.comp(c).and_then(|cc| cc.layers.iter().find(|x| x.id == l)).map(|x| x.name.clone()).unwrap_or_default();
-                        (ms, lname)
-                    })
-                    .collect();
-                rows.sort_by(|a, b| b.0.total_cmp(&a.0));
-                for (ms, lname) in rows.iter().take(12) {
-                    note!("    {lname:<28} {ms:8.2} ms");
+                for pass in ["first", "again"] {
+                    let times = effectcraft_render::LayerTimes::default();
+                    let mut r = Renderer::new(project, s.footage.as_ref(), RenderOpts { scale, backend: Backend::Gpu, ..Default::default() });
+                    r.expr = s.expr.as_deref();
+                    // A fresh cache: static layers take their cached-layer path, rendered now.
+                    let fresh = LayerCache::default();
+                    r.cache = Some(&fresh);
+                    r.accel = Some(&gpu);
+                    r.times = Some(&times);
+                    let t0 = std::time::Instant::now();
+                    std::hint::black_box(gpu.render_display(&r, cid, t));
+                    gpu.wait();
+                    note!("  layers, empty cache ({pass}): {:.2} ms/frame", t0.elapsed().as_secs_f64() * 1e3);
+                    let mut rows: Vec<(f64, String)> = times
+                        .into_map()
+                        .into_iter()
+                        .map(|((c, l), ms)| {
+                            let lname = project.comp(c).and_then(|cc| cc.layers.iter().find(|x| x.id == l)).map(|x| x.name.clone()).unwrap_or_default();
+                            (ms, lname)
+                        })
+                        .collect();
+                    rows.sort_by(|a, b| b.0.total_cmp(&a.0));
+                    for (ms, lname) in rows.iter().take(8) {
+                        note!("    {lname:<28} {ms:8.2} ms");
+                    }
                 }
             }
         }

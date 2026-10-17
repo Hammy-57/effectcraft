@@ -7,7 +7,8 @@
 #
 # connect: check the machine, make sure its effectcraft-cli is this Mac's main (built there from
 # source, nothing uploaded), mirror the project's media + fonts (CR7: <= 100 MB from the Mac, bigger
-# files from Google Drive links), start the frame server (nohup), open the SSH tunnel, set
+# files from Google Drive links, Motion Library cards fetched by the server from R2 with the read
+# token it installs), start the frame server (nohup), open the SSH tunnel, set
 # "Preview On: Cloud" in the running Mac app. Running it twice is safe.
 # It never rents, stops or destroys an instance: that stays manual in the vast.ai console.
 # Docs: docs/fork/cloud.md
@@ -105,6 +106,27 @@ ensure_token() {
     say "🔑 new frame token saved to $TOKEN_FILE (Mac only; it goes to the server in its environment, not in the state file)"
   fi
   chmod 600 "$TOKEN_FILE"
+}
+# The Motion Library READ token (never the publish token) for the server: library-pull fetches
+# applied cards from R2 there, and the browser desktop app's Motion Library panel works too.
+# It travels on ssh stdin (not in a command line, a log or the template) into
+# ~/.config/effectcraft/motion-library.json (root, for library-pull) and /home/user's (the app), 0600.
+LIBRARY_READ="$CONFIG_DIR/motion-library.read.json"
+INSTALL_LIBRARY='umask 077; f=$(mktemp); cat >"$f"; grep -q "\"token\"" "$f" || { rm -f "$f"; echo "LIB=bad"; exit 0; }
+d="$HOME/.config/effectcraft"; mkdir -p "$d"; install -m 600 "$f" "$d/motion-library.json"
+if [ -d /home/user ] && id user >/dev/null 2>&1; then mkdir -p /home/user/.config/effectcraft; chown user /home/user/.config/effectcraft
+  install -m 600 -o user "$f" /home/user/.config/effectcraft/motion-library.json; fi
+rm -f "$f"; echo "LIB=ok"'
+ensure_library_token() {
+  [ -f "$LIBRARY_READ" ] || { say "   ⚠️  no $LIBRARY_READ: Motion Library cards will be uploaded from this Mac"; return 0; }
+  local pub="$CONFIG_DIR/motion-library.json" t p
+  t="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("token",""))' "$LIBRARY_READ" 2>/dev/null || true)"
+  p="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("token",""))' "$pub" 2>/dev/null || true)"
+  if [ -z "$t" ] || [ "$t" = "$p" ]; then say "   ⚠️  $LIBRARY_READ has no read token (or the publish token): not sent"; return 0; fi
+  case "$(rssh "$INSTALL_LIBRARY" <"$LIBRARY_READ")" in
+    *LIB=ok*) say "🔑 Motion Library read token installed on the machine (the server fetches applied cards from R2)" ;;
+    *) say "   ⚠️  could not install the Motion Library read token there: cards will be uploaded from this Mac" ;;
+  esac
 }
 tunnel_up() { ssh -S "$SOCK" -O check "$TARGET" >/dev/null 2>&1; }
 tunnel_open() {
@@ -273,8 +295,9 @@ cmd_connect() {
   fi
 
   ensure_token
+  ensure_library_token
   if [ "$do_mirror" = 1 ]; then
-    say "📦 3/5 Mirroring media + fonts (up to 100 MB from this Mac once; bigger files from Google Drive links)"
+    say "📦 3/5 Mirroring media + fonts (up to 100 MB from this Mac once; bigger files from Google Drive links; Motion Library cards straight from R2)"
     local cli; cli="$(mac_cli)"
     local mopts=("$TARGET" --ssh-port "$SSH_PORT" --identity "$SSH_KEY")
     if [ -n "$project" ]; then mopts+=(--project "$project")

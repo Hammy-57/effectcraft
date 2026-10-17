@@ -62,6 +62,15 @@ First found wins:
 2. `motion-library.json` in the settings folder (`~/Library/Application Support/EffectCraft` on the
    Mac; the platform config folder elsewhere): `{"remote": "https://…", "token": "…"}`.
 
+### On a rented GPU (cloud preview)
+
+`scripts/fork/cloud.sh connect` installs the read token on the machine (ssh stdin, `motion-library.json`,
+mode 600, for root and `user`), so the browser desktop app there has the panel too. When Elias applies a
+card in the **Mac** app while the cloud preview is connected, the mirror sees the card's files by their path
+in the Mac's cache (`blobs/<sha256>/<name>`) and the server downloads them from the Worker itself
+(`effectcraft-cli library-pull`, sha256 + size checked), so they cross the home connection once (R2 → Mac),
+not twice. If the server can't fetch them, the Mac uploads them as before. Details: `docs/fork/cloud.md`.
+
 Tokens never go in the repo, a project or a command reply. The Worker has two: `READ_TOKEN` for
 every machine (read-only) and `PUBLISH_TOKEN` for the Mac.
 
