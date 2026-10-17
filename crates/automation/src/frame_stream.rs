@@ -131,7 +131,7 @@ impl Streams {
                 }
                 let full = (even(full.0), even(full.1));
                 let ahead = (f64::from(ahead_secs.clamp(0.5, 60.0)) * rate.as_f64()).ceil() as i64;
-                let p = Params { comp, lo, hi, loop_lo, looping, opts: *opts, codec, crf, n, ahead, adaptive, full, rate, bg: c.background };
+                let p = Params { comp, lo, hi, loop_lo, looping, opts: *opts, codec, crf, n, anchor: start, ahead, adaptive, full, rate, bg: c.background };
                 let shared = Arc::new(Shared::new(self.host.clone(), self.out.clone(), self.conn, stream, p, revision, project, start));
                 if let Err(e) = shared.spawn() {
                     return self.reply(fail(e));
@@ -191,6 +191,8 @@ struct Params {
     codec: StreamCodec,
     crf: f32,
     n: u32,
+    /// The chunk grid's frame 0 (where playback started or last jumped to).
+    anchor: i64,
     /// Frames kept ahead of the playhead.
     ahead: i64,
     adaptive: bool,
@@ -205,21 +207,24 @@ impl Params {
         self.rate.as_f64().max(1.0)
     }
     /// The chunk's frames inside the played range.
-    fn frames(&self, index: u64) -> Option<(i64, u32)> {
-        rs::chunk_frames(index, self.n, self.lo, self.hi)
+    fn frames(&self, index: i64) -> Option<(i64, u32)> {
+        rs::chunk_frames(index, self.n, self.anchor, self.lo, self.hi)
     }
-    fn last_chunk(&self) -> u64 {
-        rs::chunk_of(self.hi - 1, self.n)
+    fn chunk_of(&self, frame: i64) -> i64 {
+        rs::chunk_of(frame, self.n, self.anchor)
+    }
+    fn last_chunk(&self) -> i64 {
+        self.chunk_of(self.hi - 1)
     }
     /// Chunks covering `ahead` frames from `frame`, in play order (wrapping when looping).
-    fn window(&self, frame: i64) -> Vec<u64> {
+    fn window(&self, frame: i64) -> Vec<i64> {
         let mut out = vec![];
         let (mut f, mut left) = (frame.clamp(self.lo, self.hi - 1), self.ahead.max(1));
         for _ in 0..4096 {
             if left <= 0 {
                 break;
             }
-            let c = rs::chunk_of(f, self.n);
+            let c = self.chunk_of(f);
             if !out.contains(&c) {
                 out.push(c);
             }
@@ -252,7 +257,7 @@ struct Flight {
 /// One frame to render. (The state lock is never held while a chunk's lock is taken.)
 struct FrameJob {
     chunk: Arc<Mutex<Chunk>>,
-    index: u64,
+    index: i64,
     level: usize,
     project: Arc<Project>,
     slot: usize,
@@ -261,7 +266,7 @@ struct FrameJob {
 
 /// A chunk's frames as they come in.
 struct Chunk {
-    index: u64,
+    index: i64,
     epoch: u64,
     revision: u64,
     /// The edit count when it started (edits after it may overlap it).
@@ -288,8 +293,8 @@ struct State {
     at: Instant,
     /// The newest chunk sequence number the app has.
     received: Option<u64>,
-    sent: BTreeMap<u64, Sent>,
-    flying: BTreeMap<u64, Flight>,
+    sent: BTreeMap<i64, Sent>,
+    flying: BTreeMap<i64, Flight>,
     /// Render queue: (issue order, frame slot) → job.
     jobs: BTreeMap<(u64, usize), FrameJob>,
     issued: u64,
@@ -423,6 +428,9 @@ impl Shared {
         st.playhead = f;
         st.at = Instant::now();
         st.epoch += 1;
+        // A new grid from there: chunks of the old one are sent again when needed.
+        st.p.anchor = f;
+        st.sent.clear();
         st.flying.clear();
         st.jobs.clear();
         st.ended = None;
@@ -447,7 +455,7 @@ impl Shared {
         let mark = st.edits.len() as u64 + 1;
         st.edits.push((mark, from_frame));
         let p = st.p.clone();
-        let ends_after = |c: &u64| p.frames(*c).is_some_and(|(first, count)| first + i64::from(count) > from_frame);
+        let ends_after = |c: &i64| p.frames(*c).is_some_and(|(first, count)| first + i64::from(count) > from_frame);
         st.sent.retain(|c, _| !ends_after(c));
         st.flying.retain(|c, _| !ends_after(c));
         st.jobs.retain(|_, j| !ends_after(&j.index));
@@ -501,8 +509,8 @@ impl Shared {
             let window = st.p.window(now);
             if said.elapsed() >= Duration::from_secs(2) {
                 said = Instant::now();
-                let flying: Vec<u64> = st.flying.keys().copied().collect();
-                let head: Vec<u64> = window.iter().take(4).copied().collect();
+                let flying: Vec<i64> = st.flying.keys().copied().collect();
+                let head: Vec<i64> = window.iter().take(4).copied().collect();
                 self.log(&format!(
                     "playhead {} (now {now}, {}), lead {:.2} s, level {}, in flight {flying:?}, {} frames queued, window {head:?}…",
                     st.playhead,
@@ -544,7 +552,7 @@ impl Shared {
             // Everything to the end is sent: say so once.
             if !st.p.looping && st.ended != Some((st.epoch, st.revision)) {
                 let last = st.p.last_chunk();
-                let from = rs::chunk_of(now, st.p.n);
+                let from = st.p.chunk_of(now);
                 if (from..=last).all(|c| st.sent.contains_key(&c)) && st.flying.is_empty() {
                     st.ended = Some((st.epoch, st.revision));
                     let at = st.p.rate.tick_of(st.p.hi);
@@ -556,7 +564,7 @@ impl Shared {
     }
 
     /// Queue chunk `c`'s frames at `level`.
-    fn issue(&self, st: &mut State, c: u64, level: usize, lead: f64) {
+    fn issue(&self, st: &mut State, c: i64, level: usize, lead: f64) {
         let Some((first, count)) = st.p.frames(c) else { return };
         st.issued += 1;
         let order = st.issued;
@@ -581,7 +589,7 @@ impl Shared {
     }
 
     /// Whether `chunk` (of `epoch`, started at edit `mark`) is still wanted.
-    fn current(st: &State, index: u64, epoch: u64, mark: u64) -> bool {
+    fn current(st: &State, index: i64, epoch: u64, mark: u64) -> bool {
         let p = &st.p;
         let overlapped = st.edits.iter().any(|(m, from)| *m > mark && p.frames(index).is_some_and(|(f, n)| f + i64::from(n) > *from));
         !st.stop && st.epoch == epoch && st.flying.get(&index).is_some_and(|f| f.epoch == epoch) && !overlapped
@@ -725,3 +733,7 @@ impl Shared {
         self.reply(reply, bytes);
     }
 }
+
+#[cfg(test)]
+#[path = "frame_stream_tests.rs"]
+mod tests;

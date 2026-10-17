@@ -164,7 +164,7 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
                                            render consecutive frames of a comp and time the playback
                                            stream's H.264 chunk encoding (sizes, threads, bitrate)
   stream-test --frames HOST:PORT [--token T] [F.ecproj | --demo] [--comp C] [--start SECS] [--duration SECS]
-      [--edit-at SECS] [--scale S] [--max-side PX] [--fixed]
+      [--edit-at SECS] [--ahead SECS] [--scale S] [--max-side PX] [--fixed]
                                            play a comp from a frame server's playback stream: warm-up, each
                                            chunk against its deadline, bitrate, stalls; --edit-at changes a layer
   figma-bridge [--port 7789] [--control 9877] [--code CODE]
@@ -210,6 +210,7 @@ const VALUED: &[&str] = &[
     "--token",
     "--duration",
     "--edit-at",
+    "--ahead",
     // compare
     "--threshold",
     "--min-psnr",

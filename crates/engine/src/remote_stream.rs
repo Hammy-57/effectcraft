@@ -8,9 +8,11 @@
 //! [`FrameReply::Stream`]; a chunk's encoded frames are the reply's payload.
 //!
 //! - **Timing.** Chunks sit on a grid of [`StreamMsg::Start`]'s `chunkFrames` frames in the comp's
-//!   frame rate, counted from frame 0 of the comp: chunk `k` holds frames `k·n … k·n + n − 1`
-//!   (the last one of a range may be shorter). Frame `i` of a chunk is at comp time
-//!   `rate.tick_of(first + i)`; [`StreamReply::Chunk`] carries `first` and `start`.
+//!   frame rate, anchored at the frame playback starts from (Start's `from`, or the latest
+//!   [`StreamMsg::Seek`]): chunk `k` holds frames `a + k·n … a + k·n + n − 1` (`k` is negative
+//!   before the anchor, in a loop; chunks at the ends of the range may be shorter). Frame `i` of a
+//!   chunk is at comp time `rate.tick_of(first + i)`; [`StreamReply::Chunk`] carries `first` and
+//!   `start`.
 //! - **Flow control.** The app reports its playhead and the chunks it has
 //!   ([`StreamMsg::Playhead`], a few times a second). The server keeps at most `aheadSecs` of
 //!   chunks ahead of that playhead and sends them in play order.
@@ -142,8 +144,8 @@ pub enum StreamReply {
         stream: u64,
         seq: u64,
         revision: u64,
-        /// The grid index of the chunk (`first / chunkFrames`).
-        index: u64,
+        /// The chunk's index on the grid (see the module docs).
+        index: i64,
         /// Comp frame index of its first frame, and that frame's time.
         first: i64,
         start: Tick,
@@ -164,18 +166,18 @@ pub enum StreamReply {
     Failed { stream: u64, error: String },
 }
 
-/// The chunk `index` of a grid of `n` frames: its first frame and frame count, inside `[lo, hi)`
-/// (comp frame indices).
-pub fn chunk_frames(index: u64, n: u32, lo: i64, hi: i64) -> Option<(i64, u32)> {
+/// Chunk `index` of the grid of `n` frames anchored at comp frame `anchor`: its first frame and
+/// frame count inside `[lo, hi)` (comp frame indices).
+pub fn chunk_frames(index: i64, n: u32, anchor: i64, lo: i64, hi: i64) -> Option<(i64, u32)> {
     let n = i64::from(n.clamp(1, MAX_CHUNK_FRAMES));
-    let first = i64::try_from(index).ok()?.checked_mul(n)?;
+    let first = anchor.checked_add(index.checked_mul(n)?)?;
     let (a, b) = (first.max(lo), first.saturating_add(n).min(hi));
     (a < b).then(|| (a, u32::try_from(b - a).unwrap_or(0)))
 }
 
-/// The grid index of the chunk holding comp frame `frame`.
-pub fn chunk_of(frame: i64, n: u32) -> u64 {
-    u64::try_from(frame.max(0) / i64::from(n.clamp(1, MAX_CHUNK_FRAMES))).unwrap_or(0)
+/// The index of the chunk holding comp frame `frame` on the grid anchored at `anchor`.
+pub fn chunk_of(frame: i64, n: u32, anchor: i64) -> i64 {
+    frame.saturating_sub(anchor).div_euclid(i64::from(n.clamp(1, MAX_CHUNK_FRAMES)))
 }
 
 /// Most precomp levels followed by [`first_change`].

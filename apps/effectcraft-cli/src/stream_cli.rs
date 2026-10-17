@@ -361,7 +361,7 @@ pub fn test(args: &Args) -> Result<(), Failure> {
         codec: StreamCodec::H264,
         crf: 23.0,
         chunk_frames: 15,
-        ahead_secs: 4.0,
+        ahead_secs: args.num("--ahead").map_err(Failure::Usage)?.unwrap_or(4.0) as f32,
         adaptive: !args.flag("--fixed"),
         max_size: max_side.map(|m| [m, m]),
     });

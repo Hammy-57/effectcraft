@@ -77,17 +77,18 @@ fn an_edit_counts_from_the_changed_layer_and_what_follows_it() {
 
 #[test]
 fn the_chunk_grid_covers_the_range_exactly() {
-    // Frames [20, 50) in chunks of 15: 15–29 (from 20), 30–44, 45–49.
-    assert_eq!(chunk_frames(1, 15, 20, 50), Some((20, 10)));
-    assert_eq!(chunk_frames(2, 15, 20, 50), Some((30, 15)));
-    assert_eq!(chunk_frames(3, 15, 20, 50), Some((45, 5)));
-    assert_eq!(chunk_frames(4, 15, 20, 50), None);
-    assert_eq!(chunk_frames(0, 15, 20, 50), None);
-    assert_eq!(chunk_of(44, 15), 2);
-    assert_eq!(chunk_of(-3, 15), 0);
+    // Frames [20, 50) on a grid anchored at 23, in chunks of 15: 20–22 (index −1, clipped), 23–37,
+    // 38–49 (clipped at the end).
+    assert_eq!(chunk_frames(-1, 15, 23, 20, 50), Some((20, 3)));
+    assert_eq!(chunk_frames(0, 15, 23, 20, 50), Some((23, 15)));
+    assert_eq!(chunk_frames(1, 15, 23, 20, 50), Some((38, 12)));
+    assert_eq!(chunk_frames(2, 15, 23, 20, 50), None);
+    assert_eq!(chunk_frames(-2, 15, 23, 20, 50), None);
+    assert_eq!((chunk_of(22, 15, 23), chunk_of(23, 15, 23), chunk_of(37, 15, 23), chunk_of(38, 15, 23)), (-1, 0, 0, 1));
     // Absurd input: no overflow, no panic.
-    assert_eq!(chunk_frames(u64::MAX, 0, 0, i64::MAX), None);
-    assert_eq!(chunk_of(i64::MAX, 0), i64::MAX as u64);
+    assert_eq!(chunk_frames(i64::MAX, 0, i64::MAX, 0, i64::MAX), None);
+    assert_eq!(chunk_frames(i64::MIN, 15, 0, i64::MIN, 0), None);
+    let _ = chunk_of(i64::MIN, 0, i64::MAX);
 }
 
 #[test]
@@ -100,7 +101,7 @@ fn stream_messages_keep_their_shape_and_defaults() {
         stream: 1,
         seq: 2,
         revision: 3,
-        index: 4,
+        index: -4,
         first: 60,
         start: FrameRate { num: 30000, den: 1001 }.tick_of(60),
         frames: 15,
