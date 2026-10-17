@@ -625,9 +625,11 @@ pub fn check(manifest: &Manifest, verify_hash: bool) -> (Vec<Missing>, Vec<Missi
                         Some(_) => Some(Missing::file(e, "hash", "same size, different content".into())),
                         None => Some(Missing::file(e, "missing", "cannot be read here".into())),
                     },
-                    None if mtime != e.mtime => {
-                        Some(Missing::file(e, "mtime", format!("same size, modified {mtime} here and {} on the Mac (no sha256 to compare: run the mirror)", e.mtime)))
-                    }
+                    None if mtime != e.mtime => Some(Missing::file(
+                        e,
+                        "mtime",
+                        format!("same size, modified {mtime} here and {} on the Mac (no sha256 to compare: run the mirror)", e.mtime),
+                    )),
                     None => None,
                 },
                 Some(_) => None,
@@ -1081,7 +1083,11 @@ mod tests {
             "seq",
             Default::default(),
             None,
-            ItemKind::Footage(effectcraft_project::Footage { path: frame_s.clone(), sequence: vec![frame_s.clone(), "/nowhere/f_0002.png".into()], ..Default::default() }),
+            ItemKind::Footage(effectcraft_project::Footage {
+                path: frame_s.clone(),
+                sequence: vec![frame_s.clone(), "/nowhere/f_0002.png".into()],
+                ..Default::default()
+            }),
         );
         let r = s.execute("project.dependencies", json!({})).unwrap();
         let m: Manifest = serde_json::from_value(r).unwrap();
@@ -1102,7 +1108,8 @@ mod tests {
         let here = d.join("here.mov");
         std::fs::write(&here, b"12345").ok();
         let (size, mtime) = stat(&here.to_string_lossy()).unwrap();
-        let entry = |path: &str, size: u64| FileEntry { path: path.into(), kind: "footage".into(), size, mtime, used: true, exists: true, ..Default::default() };
+        let entry =
+            |path: &str, size: u64| FileEntry { path: path.into(), kind: "footage".into(), size, mtime, used: true, exists: true, ..Default::default() };
         let m = Manifest {
             version: 1,
             files: vec![entry(&here.to_string_lossy(), size), entry("/nowhere/clip.mov", 9), entry(&here.to_string_lossy(), 99)],
@@ -1183,7 +1190,12 @@ mod tests {
         let path = f.to_string_lossy().to_string();
         let mut s = Session::default();
         s.execute("comp.new", json!({"name": "C"})).ok();
-        let id = std::sync::Arc::make_mut(&mut s.project).add_item("new", Default::default(), None, ItemKind::Footage(effectcraft_project::Footage { path: path.clone(), ..Default::default() }));
+        let id = std::sync::Arc::make_mut(&mut s.project).add_item(
+            "new",
+            Default::default(),
+            None,
+            ItemKind::Footage(effectcraft_project::Footage { path: path.clone(), ..Default::default() }),
+        );
         let p = pending_uploads(&s.project, &|_| None);
         assert!(p["pending"].as_array().unwrap().iter().all(|e| e["path"] != path.as_str()), "unused: not needed yet");
         let cid = s.active_comp_id().unwrap();
