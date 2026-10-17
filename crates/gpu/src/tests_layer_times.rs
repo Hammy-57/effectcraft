@@ -4,7 +4,7 @@
 
 use effectcraft_color::Label;
 use effectcraft_project::build;
-use effectcraft_project::{Comp, ItemId, ItemKind, Layer, LayerSource, Project, Solid};
+use effectcraft_project::{Comp, ItemKind, Layer, LayerSource, Project, Solid};
 use effectcraft_render::{Backend, LayerCache, LayerTimes, NoFootage, RenderOpts, Renderer};
 use effectcraft_time::{FrameRate, Tick};
 
