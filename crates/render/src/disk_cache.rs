@@ -248,6 +248,8 @@ struct Queue {
     /// Payload bytes in `jobs`.
     bytes: usize,
     busy: bool,
+    /// Writes wait in the queue ([`DiskCache::hold_writes`]).
+    held: bool,
 }
 
 impl Queue {
@@ -388,7 +390,7 @@ impl DiskCache {
             evictions: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             tmp_counter: AtomicU64::new(0),
-            queue: Arc::new((Mutex::new(Queue { jobs: Default::default(), bytes: 0, busy: false }), Condvar::new())),
+            queue: Arc::new((Mutex::new(Queue { jobs: Default::default(), bytes: 0, busy: false, held: false }), Condvar::new())),
             min_layer_ms: AtomicU64::new(30),
             generation: AtomicU64::new(0),
         });
@@ -537,10 +539,32 @@ impl DiskCache {
         publication.1 = false;
     }
 
-    /// Wait until queued writes are on disk.
+    /// Hold queued writes back (`true`) or let them go (`false`). A playing preview holds them:
+    /// compressing frames took about 8 % of the app's CPU while a 1080p preview played, CPU the
+    /// frames it plays need. Writes queued meanwhile wait (new ones are dropped once the queue
+    /// is full: those frames just aren't kept on disk) and go once released; [`Self::flush`]
+    /// releases them too.
+    pub fn hold_writes(&self, held: bool) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let (m, cv) = &*self.queue;
+            if let Ok(mut q) = m.lock()
+                && q.held != held
+            {
+                q.held = held;
+                cv.notify_all();
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = held;
+    }
+
+    /// Wait until queued writes are on disk (releasing held ones).
     pub fn flush(&self) {
         let (m, cv) = &*self.queue;
         let Ok(mut q) = m.lock() else { return };
+        q.held = false;
+        cv.notify_all();
         #[cfg(target_arch = "wasm32")]
         {
             q.jobs.clear();
@@ -798,7 +822,9 @@ fn writer(dc: std::sync::Weak<DiskCache>, q: Arc<(Mutex<Queue>, Condvar)>) {
         let job = {
             let Ok(mut g) = m.lock() else { return };
             loop {
-                if let Some(j) = g.jobs.pop_front() {
+                if !g.held
+                    && let Some(j) = g.jobs.pop_front()
+                {
                     g.bytes = g.bytes.saturating_sub(j.bytes());
                     g.busy = true;
                     break j;
@@ -1412,7 +1438,7 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn write_queue_is_bounded_by_bytes() {
-        let mut q = Queue { jobs: Default::default(), bytes: 0, busy: false };
+        let mut q = Queue { jobs: Default::default(), bytes: 0, busy: false, held: false };
         assert!(!q.full(QUEUE_BYTES * 2), "empty: one big write goes");
         q.jobs.push_back(Job::Write(Kind::Layer, 1, vec![]));
         q.bytes = QUEUE_BYTES - 10;
@@ -1423,6 +1449,30 @@ mod tests {
             q.jobs.push_back(Job::Write(Kind::Layer, k as u128, vec![]));
         }
         assert!(q.full(0), "count limit");
+    }
+
+    /// Held writes wait in the queue until released; a flush releases them.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn held_writes_go_once_released() {
+        let dir = std::env::temp_dir().join(format!("ec-disk-hold-{}", std::process::id()));
+        let disk = DiskCache::open(&dir, 1 << 30).unwrap();
+        disk.hold_writes(true);
+        disk.put_frame(1, 2, 1, vec![9u8; 8]);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!disk.contains(Kind::Frame, 1), "written while held");
+        disk.hold_writes(false);
+        let t0 = std::time::Instant::now();
+        while !disk.contains(Kind::Frame, 1) && t0.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(disk.contains(Kind::Frame, 1));
+        disk.hold_writes(true);
+        disk.put_frame(2, 2, 1, vec![7u8; 8]);
+        disk.flush();
+        assert!(disk.contains(Kind::Frame, 2), "a flush releases held writes");
+        drop(disk);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// A queued frame counts its uncompressed bytes against the byte budget.
