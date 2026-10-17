@@ -514,6 +514,14 @@ pub struct RemoteJob {
     /// The frame's disk-cache key, when the renderer keeps a disk cache
     /// ([`RemoteFrames::disk`]): served from it on a hit, stored there after a render.
     pub disk_key: Option<u128>,
+    /// The viewer's frame (scrubbing waits for it): it renders before prefetch.
+    pub urgent: bool,
+    /// Set when the frame is no longer wanted (it scrolled out of the playing preview's window,
+    /// or the project moved on): the renderer may drop it and answer `Err`.
+    pub cancel: Arc<AtomicBool>,
+    /// Replaces the cached frame with a better version of it (a lossless refine of a JPEG frame
+    /// sent while scrubbing), if the frame is still cached.
+    pub refined: Option<RemoteRefine>,
 }
 
 /// Premultiplied RGBA8 pixels from a [`RemoteFrames`] renderer.
@@ -527,6 +535,9 @@ pub struct RemoteFrame {
 
 /// Called once with a remote frame (or why there is none).
 pub type RemoteDone = Box<dyn FnOnce(Result<RemoteFrame, String>) + Send>;
+
+/// Called at most once, after [`RemoteDone`], with a better version of the same frame.
+pub type RemoteRefine = Box<dyn FnOnce(RemoteFrame) + Send>;
 
 /// Renders viewer frames elsewhere (the browser's frame worker), so the UI thread never does.
 pub trait RemoteFrames: Send + Sync {
@@ -546,6 +557,11 @@ pub trait RemoteFrames: Send + Sync {
     fn disk(&self) -> bool {
         false
     }
+    /// Native: frames go to it as soon as they are asked for and whenever one of its frames
+    /// comes back (the cloud, CR5), not only when [`Frames::dispatch_remote`] runs.
+    fn eager(&self) -> bool {
+        false
+    }
     /// The disk cache holds the frame of this key (the blue cache bar).
     fn disk_contains(&self, _key: u128) -> bool {
         false
@@ -562,6 +578,22 @@ pub fn comp_has_effects(project: &Project, comp: ItemId) -> bool {
         })
     }
     walk(project, comp, 0)
+}
+
+/// A [`RemoteFrames`] renderer with its bookkeeping, shared with its completions.
+#[derive(Clone)]
+struct RemoteLink {
+    remote: Arc<dyn RemoteFrames>,
+    /// Frames it is rendering.
+    busy: Arc<Mutex<usize>>,
+    /// See [`Frames::latest_remote_for`].
+    latest: Arc<Mutex<Option<FrameKey>>>,
+}
+
+/// A remote frame as an egui image (`None` when its pixels don't match its size).
+fn egui_image(f: &RemoteFrame) -> Option<egui::ColorImage> {
+    let n = (f.width as usize).checked_mul(f.height as usize)?.checked_mul(4)?;
+    (n == f.rgba.len() && n > 0).then(|| egui::ColorImage::from_rgba_premultiplied([f.width as usize, f.height as usize], &f.rgba))
 }
 
 /// See [`Frames::failed`]: (key, revision) pairs.
@@ -626,6 +658,12 @@ pub struct Frames {
     /// Where frames render instead of the UI thread (wasm32), and how many it is rendering.
     remote: Option<Arc<dyn RemoteFrames>>,
     remote_busy: Arc<Mutex<usize>>,
+    /// The newest viewer frame a [`RemoteFrames`] delivered: shown while the frame under a
+    /// scrubbing pointer is on its way (a cloud frame takes a network round trip).
+    latest_remote: Arc<Mutex<Option<FrameKey>>>,
+    /// Whether frames went to the remote renderer at the last [`Frames::tick_remote`].
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    remote_was_active: AtomicBool,
     /// GPU frames whose readback is in flight (see [`landing`]).
     #[cfg(not(target_arch = "wasm32"))]
     landing: Arc<landing::Landing>,
@@ -698,6 +736,8 @@ impl Default for Frames {
             keepers: Mutex::default(),
             remote: None,
             remote_busy: Arc::default(),
+            latest_remote: Arc::default(),
+            remote_was_active: AtomicBool::new(false),
             #[cfg(not(target_arch = "wasm32"))]
             landing: Arc::default(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -1305,6 +1345,14 @@ impl Frames {
             }
             !gone
         });
+        // Frames a remote renderer is rendering that the preview no longer reaches are called
+        // off too: they would hold its slots for a network round trip (CR5).
+        let urgent: HashSet<FrameKey> = q.urgent_cancels.iter().map(|(k, _)| *k).collect();
+        for (k, cancel) in &q.remote_running {
+            if !urgent.contains(k) && k.same_series(&p.series) && p.ahead(k).is_none() {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        }
     }
 
     /// The frames of `series` in flight, after dropping the queued prefetch of the same comp's
@@ -1381,6 +1429,10 @@ impl Frames {
     /// caller tries again later).
     pub fn request_to_disk(&self, src: &RenderSource, key: FrameKey, comp: ItemId, t: Tick, opts: RenderOpts) -> bool {
         let Some(dc) = &src.disk else { return false };
+        // A remote renderer without a disk cache (the cloud) would put the frame in RAM.
+        if cfg!(not(target_arch = "wasm32")) && self.remote_active() && !self.remote_disk() {
+            return false;
+        }
         if self.is_cached(&key) || self.failed(&key) {
             return false;
         }
@@ -1419,7 +1471,7 @@ impl Frames {
         drop(inf);
         drop(q);
         #[cfg(not(target_arch = "wasm32"))]
-        if self.remote.is_none() {
+        if self.local_workers() {
             self.worker().spawn_next();
         }
         true
@@ -1439,6 +1491,13 @@ impl Frames {
         q.jobs.retain(|j| j.key.revision >= key.revision);
         if q.jobs.len() < before {
             inf.retain(|k| k.revision >= key.revision || q.running.contains(k));
+        }
+        // A remote renderer's replica moves to the new revision: its prefetch of older ones
+        // would only come back stale.
+        for (k, cancel) in &q.remote_running {
+            if k.revision < key.revision && !q.urgent_cancels.iter().any(|(u, _)| u == k) {
+                cancel.store(true, Ordering::Relaxed);
+            }
         }
         if urgent {
             // Only the newest viewer frame is urgent. The comp's earlier viewer frames that
@@ -1495,7 +1554,13 @@ impl Frames {
         drop(inf);
         drop(q);
         #[cfg(not(target_arch = "wasm32"))]
-        if self.remote.is_none() {
+        if self.remote_active() {
+            // Handed to an eager remote renderer at once (CR5: the cloud), not at the next UI
+            // frame.
+            if self.remote.as_ref().is_some_and(|r| r.eager()) {
+                self.dispatch_remote();
+            }
+        } else if self.local_workers() {
             // One spawn per job; each spawn renders whichever queued jobs matter most right now.
             self.worker().spawn_next();
         }
@@ -1534,6 +1599,23 @@ impl Frames {
         self.remote = remote;
     }
 
+    /// Native: queued frames render on this machine's workers. Not while a remote renderer
+    /// takes them, nor with an unusable one that isn't eager (a test's or a host's idle
+    /// renderer keeps its frames queued); an eager one with no slots (a cloud that is offline)
+    /// leaves them to this machine.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    fn local_workers(&self) -> bool {
+        match &self.remote {
+            None => true,
+            Some(r) => r.eager() && r.slots() == 0,
+        }
+    }
+
+    /// The remote renderer, if any.
+    pub fn remote(&self) -> Option<&Arc<dyn RemoteFrames>> {
+        self.remote.as_ref()
+    }
+
     /// The remote renderer keeps a disk cache (the browser's).
     pub fn remote_disk(&self) -> bool {
         self.remote.as_ref().is_some_and(|r| r.disk())
@@ -1560,69 +1642,40 @@ impl Frames {
     /// on the GPU render here instead (no readback). Returns how many were started.
     pub fn dispatch_remote(&self) -> usize {
         let Some(remote) = self.remote.clone() else { return 0 };
-        let slots = remote.slots();
-        let w = self.worker();
-        let mut started = 0;
-        loop {
-            let busy = self.remote_busy();
-            if busy >= slots {
-                break;
+        self.worker().dispatch_remote(&RemoteLink { remote, busy: self.remote_busy.clone(), latest: self.latest_remote.clone() })
+    }
+
+    /// Follow the remote renderer becoming usable or unusable (native, every UI frame): frames
+    /// queued for it render on this machine's workers once it is gone (a lost cloud
+    /// connection), so the preview never waits for a renderer that isn't there.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn tick_remote(&self) {
+        let active = self.remote_active();
+        let was = self.remote_was_active.swap(active, Ordering::AcqRel);
+        if active {
+            if self.remote.as_ref().is_some_and(|r| r.eager()) {
+                self.dispatch_remote();
             }
-            let job = {
-                let Ok(mut q) = self.queue.lock() else { break };
-                let Some(i) = q.best() else { break };
-                // Remote renderers deliberately use originals; a local freeze must not
-                // strand their queue waiting for files unavailable to that worker.
-                let mut job = q.jobs.swap_remove(i);
-                job.epoch = self.epoch.load(Ordering::Acquire);
-                q.running.insert(job.key);
-                if job.urgent {
-                    q.urgent_running += 1;
-                }
-                job
-            };
-            // The GPU compositor here keeps the frame on the GPU, but runs layer effects on the
-            // CPU (this thread can't wait for readbacks): frames with effects go to workers
-            // that render them on their own GPU.
-            let gpu_here = job.src.gpu.is_some() && job.src.gpu_display && !(remote.gpu() && comp_has_effects(&job.src.project, job.comp));
-            if gpu_here {
-                let t0 = web_time::Instant::now();
-                if let Some(img) = w.render_gpu(&job) {
-                    w.finish(&job, img, t0);
-                    continue;
-                }
+        } else if was && self.local_workers() {
+            let (queued, threads) = self.queue.lock().map(|q| (q.jobs.len(), q.threads)).unwrap_or((0, 0));
+            for _ in 0..queued.min(threads.max(1)) {
+                self.worker().spawn_next();
             }
-            if let Ok(mut b) = self.remote_busy.lock() {
-                *b += 1;
-            }
-            started += 1;
-            let (key, urgent) = (job.key, job.urgent);
-            let fw = self.worker();
-            let busy = self.remote_busy.clone();
-            let t0 = web_time::Instant::now();
-            let disk_key = remote.disk().then(|| frame_disk_key(&w.content_keys, &job.src.project, &key, opts_hash(&job.opts)));
-            let rj = RemoteJob { project: job.src.project.clone(), revision: key.revision, comp: job.comp, t: job.t, opts: job.opts, disk_key };
-            remote.start(
-                rj,
-                Box::new(move |r: Result<RemoteFrame, String>| {
-                    if let Ok(mut b) = busy.lock() {
-                        *b = b.saturating_sub(1);
-                    }
-                    match r {
-                        Ok(f) => {
-                            let img = egui::ColorImage::from_rgba_premultiplied([f.width as usize, f.height as usize], &f.rgba);
-                            fw.finish_key(key, urgent, FrameImage::Cpu(Arc::new(img)), t0);
-                        }
-                        Err(e) => {
-                            // Not rendered (a stale revision, a lost worker): the viewer asks again.
-                            log::debug!("remote frame: {e}");
-                            fw.release(key, urgent);
-                        }
-                    }
-                }),
-            );
         }
-        started
+    }
+
+    /// The newest viewer frame of `wanted`'s comp, scale, view and options a remote renderer
+    /// delivered, when it is cached: shown while `wanted` is on its way (scrubbing over a
+    /// network shows the frames as they land instead of holding the first one).
+    pub fn latest_remote_for(&self, wanted: &FrameKey) -> Option<(FrameKey, FrameImage)> {
+        if !self.remote_active() {
+            return None;
+        }
+        let k = (*self.latest_remote.lock().ok()?)?;
+        if k.comp != wanted.comp || k.scale != wanted.scale || k.view != wanted.view || k.opts != wanted.opts || k.revision > wanted.revision {
+            return None;
+        }
+        Some((k, self.get(&k)?))
     }
 
     /// Render queued frames, most important first. With a usable [`RemoteFrames`] they are only
@@ -1724,6 +1777,20 @@ struct GpuFlight {
 thread_local! {
     /// This pool thread is inside [`Worker::drain`] (rendering a frame).
     static DRAINING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+thread_local! {
+    /// This thread is inside [`Worker::dispatch_remote`].
+    static DISPATCHING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Clears [`DISPATCHING`], even on a panic.
+struct Dispatching;
+
+impl Drop for Dispatching {
+    fn drop(&mut self) {
+        DISPATCHING.set(false);
+    }
 }
 
 /// Clears [`DRAINING`] when the drain ends, even by a panic.
@@ -1944,6 +2011,128 @@ impl Worker {
         self.release(key, urgent);
     }
 
+    /// Hand queued frames to the remote renderer while it has free slots, most important first
+    /// (see [`Frames::dispatch_remote`]). Native completions call it again, so the next frame
+    /// leaves as soon as a slot frees up rather than at the next UI frame (CR5).
+    fn dispatch_remote(&self, link: &RemoteLink) -> usize {
+        // A completion that runs inside `start` (a renderer answering at once) is inside this
+        // loop already: the loop hands out the slot it freed.
+        if DISPATCHING.get() {
+            return 0;
+        }
+        DISPATCHING.set(true);
+        let _reset = Dispatching;
+        let remote = &link.remote;
+        let slots = remote.slots();
+        let mut started = 0;
+        loop {
+            let busy = link.busy.lock().map(|b| *b).unwrap_or(usize::MAX);
+            if busy >= slots {
+                break;
+            }
+            let job = {
+                let Ok(mut q) = self.queue.lock() else { break };
+                let Some(i) = q.best() else { break };
+                // Remote renderers deliberately use originals; a local freeze must not
+                // strand their queue waiting for files unavailable to that worker.
+                let mut job = q.jobs.swap_remove(i);
+                job.epoch = self.epoch.load(Ordering::Acquire);
+                q.running.insert(job.key);
+                if job.urgent {
+                    q.urgent_running += 1;
+                }
+                q.remote_running.insert(job.key, job.cancel.clone());
+                job
+            };
+            if job.disk_only && !remote.disk() {
+                // Queued for this machine's disk cache before the frames went remote.
+                self.release(job.key, job.urgent);
+                continue;
+            }
+            // The GPU compositor here keeps the frame on the GPU, but runs layer effects on the
+            // CPU (this thread can't wait for readbacks): frames with effects go to workers that
+            // render them on their own GPU. An eager renderer's frames (the cloud's) never render
+            // here: this may be the UI thread or a completion.
+            let gpu_here = !remote.eager() && job.src.gpu.is_some() && job.src.gpu_display && !(remote.gpu() && comp_has_effects(&job.src.project, job.comp));
+            if gpu_here {
+                let t0 = web_time::Instant::now();
+                if let Some(img) = self.render_gpu(&job) {
+                    self.finish(&job, img, t0);
+                    continue;
+                }
+            }
+            if let Ok(mut b) = link.busy.lock() {
+                *b += 1;
+            }
+            started += 1;
+            let (key, urgent, epoch) = (job.key, job.urgent, job.epoch);
+            let t0 = web_time::Instant::now();
+            let disk_key = remote.disk().then(|| frame_disk_key(&self.content_keys, &job.src.project, &key, opts_hash(&job.opts)));
+            let fw = self.clone();
+            let refined = {
+                let fw = self.clone();
+                Box::new(move |f: RemoteFrame| {
+                    if fw.epoch.load(Ordering::Acquire) != epoch {
+                        return;
+                    }
+                    let Some(img) = egui_image(&f) else { return };
+                    if let Ok(mut c) = fw.cache.lock()
+                        && c.map.contains_key(&key)
+                    {
+                        c.insert(key, FrameImage::Cpu(Arc::new(img)));
+                    }
+                    if let Some(ctx) = &fw.ctx {
+                        ctx.request_repaint();
+                    }
+                }) as RemoteRefine
+            };
+            let rj = RemoteJob {
+                project: job.src.project.clone(),
+                revision: key.revision,
+                comp: job.comp,
+                t: job.t,
+                opts: job.opts,
+                disk_key,
+                urgent,
+                cancel: job.cancel.clone(),
+                refined: Some(refined),
+            };
+            let next = link.clone();
+            remote.start(
+                rj,
+                Box::new(move |r: Result<RemoteFrame, String>| {
+                    if let Ok(mut b) = next.busy.lock() {
+                        *b = b.saturating_sub(1);
+                    }
+                    match r.and_then(|f| egui_image(&f).ok_or_else(|| "the frame's size and pixels disagree".to_string())) {
+                        // Purge Caches since it was asked for: its pixels may be from before.
+                        Ok(_) if fw.epoch.load(Ordering::Acquire) != epoch => fw.release(key, urgent),
+                        Ok(img) => {
+                            fw.finish_key(key, urgent, FrameImage::Cpu(Arc::new(img)), t0);
+                            if urgent && let Ok(mut l) = next.latest.lock() {
+                                // Never move back to an older frame finishing late.
+                                if l.is_none_or(|old| old.comp != key.comp || old.revision <= key.revision) {
+                                    *l = Some(key);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            // Not rendered (a stale revision, a lost connection, called off): the
+                            // viewer asks again.
+                            log::debug!("remote frame: {e}");
+                            fw.release(key, urgent);
+                        }
+                    }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if next.remote.eager() {
+                        fw.dispatch_remote(&next);
+                    }
+                }),
+            );
+        }
+        started
+    }
+
     /// The render of `key` failed: remember it (see [`Frames::failed`]) and release the job.
     fn give_up(&self, key: FrameKey, urgent: bool) {
         if let Ok(mut f) = self.failed.lock() {
@@ -1963,6 +2152,7 @@ impl Worker {
         let mut restart = false;
         if let Ok(mut q) = self.queue.lock() {
             q.running.remove(&key);
+            q.remote_running.remove(&key);
             if urgent {
                 q.urgent_running = q.urgent_running.saturating_sub(1);
                 if let Some(i) = q.urgent_cancels.iter().position(|(k, _)| *k == key) {
@@ -2423,6 +2613,9 @@ struct Queue {
     urgent_running: usize,
     /// The running viewer (urgent) frames and how to call them off.
     urgent_cancels: Vec<(FrameKey, Arc<AtomicBool>)>,
+    /// Frames a [`RemoteFrames`] renders, and how to call them off (CR5: prefetch that scrolled
+    /// out of the playing preview's window, frames of a revision the project left).
+    remote_running: HashMap<FrameKey, Arc<AtomicBool>>,
     seq: u64,
     /// Spawns that returned because their job had to wait for memory: each finishing frame
     /// starts one again.

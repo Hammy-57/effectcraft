@@ -417,6 +417,12 @@ pub struct EffectcraftApp {
     next_token: u64,
     pub(crate) last_ui_time: f64,
     pub(crate) scrub_preview: crate::scrub_preview::ScrubPreview,
+    /// CR5: the viewer's preview from a cloud frame server (Settings ▸ Previews ▸ Preview On).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) cloud: cloud::CloudPreview,
+    /// The cloud server's token and when it was read (at most every few seconds).
+    #[cfg(not(target_arch = "wasm32"))]
+    cloud_token: (f64, String),
     /// When the user last did something (input or an edit): Cache Frames When Idle waits for
     /// a second of quiet. (time, project revision then)
     last_activity: (f64, u64),
@@ -552,6 +558,10 @@ impl EffectcraftApp {
             events_sent: (f64::NEG_INFINITY, 0, vec![]),
             next_token: 1,
             scrub_preview: Default::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            cloud: Default::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            cloud_token: (f64::NEG_INFINITY, String::new()),
             last_ui_time: 0.0,
             last_activity: (0.0, 0),
             last_edit: (0.0, 0),
@@ -1279,7 +1289,62 @@ impl EffectcraftApp {
                 return Some((k, img));
             }
         }
-        self.frames.get_for_viewer(key, self.viewer_shown.as_ref().map(|(_, s)| s))
+        self.frames
+            .get_for_viewer(key, self.viewer_shown.as_ref().map(|(_, s)| s))
+            // A cloud frame takes a round trip: while scrubbing, the newest one that landed.
+            .or_else(|| self.frames.latest_remote_for(key))
+    }
+
+    /// Follow Settings ▸ Previews ▸ Preview On (CR5): connect to the cloud frame server or not,
+    /// hand the viewer's frames to it or to this Mac, and note a lost or regained connection in
+    /// the status line (never a dialog; the document is never touched).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn tick_cloud(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|i| i.time);
+        let mode = self.session.prefs.previews.preview_on.clone();
+        if mode != "local" && now - self.cloud_token.0 > 3.0 {
+            let token = std::env::var("EFFECTCRAFT_FRAME_TOKEN")
+                .ok()
+                .or_else(|| self.session.config.as_ref().and_then(|c| c.read(cloud::TOKEN_ENTRY)))
+                .unwrap_or_default();
+            self.cloud_token = (now, token.trim().to_string());
+        }
+        let comp = self.session.active_comp_id().zip(self.session.active_comp()).map(|(id, c)| (id.0, c.frame_rate.as_f64()));
+        let last_ms = self.frames.last_ms.lock().map(|m| *m).unwrap_or(0.0);
+        let address = self.session.prefs.previews.cloud_address.clone();
+        let tick = cloud::Now {
+            mode: &mode,
+            address: &address,
+            token: &self.cloud_token.1,
+            revision: self.session.revision,
+            project: &self.session.project,
+            comp,
+            last_ms,
+        };
+        let (remote, note) = self.cloud.tick(&tick);
+        // Only the cloud's own renderer is swapped in and out (tests and hosts may set another).
+        match remote {
+            Some(c) => {
+                let c: Arc<dyn frames::RemoteFrames> = c;
+                if !self.frames.remote().is_some_and(|r| Arc::ptr_eq(r, &c)) {
+                    self.frames.set_remote(Some(c));
+                }
+                self.cloud.installed = true;
+            }
+            None if self.cloud.installed => {
+                self.frames.set_remote(None);
+                self.cloud.installed = false;
+            }
+            None => {}
+        }
+        if let Some(note) = note {
+            self.ui.status = note;
+        }
+        self.frames.tick_remote();
+        if mode != "local" {
+            // The link's state changes without input (a frame landing, the tunnel dropping).
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
     }
 
     /// The render scale used by the viewer right now.
@@ -2074,6 +2139,10 @@ impl EffectcraftApp {
             // on the UI thread (`Frames::pump`)
             return self.frames.remote_slots().max(1);
         }
+        if self.frames.remote_active() {
+            // The cloud: as many as cover its round trip (CR5).
+            return self.frames.remote_slots();
+        }
         self.frames.parallelism()
     }
 
@@ -2628,6 +2697,8 @@ impl eframe::App for EffectcraftApp {
         let ctx = ui.ctx().clone();
         #[cfg(not(target_arch = "wasm32"))]
         pointer_wrap::finish_native(&ctx, frame);
+        #[cfg(not(target_arch = "wasm32"))]
+        self.tick_cloud(&ctx);
         // wasm32: no frame threads; render queued frames now, between UI frames.
         if cfg!(target_arch = "wasm32") && self.frames.pump(std::time::Duration::from_millis(if self.playback.playing { 24 } else { 40 })) {
             ctx.request_repaint();

@@ -643,11 +643,28 @@ pub fn inspect(app: &EffectcraftApp, ctx: &egui::Context) -> Value {
     if let Some(v) = ui.get_mut("viewer").and_then(Value::as_object_mut) {
         v.insert("res".into(), json!(app.viewer_res()));
     }
+    // CR5: where the viewer's preview frames come from.
+    #[cfg(not(target_arch = "wasm32"))]
+    let (preview_source, cloud) = {
+        let source = if app.frames.remote_active() { "cloud" } else { "mac" };
+        (source, app.cloud.status())
+    };
+    #[cfg(target_arch = "wasm32")]
+    let (preview_source, cloud): (&str, Option<()>) = ("browser", None);
+    #[cfg(not(target_arch = "wasm32"))]
+    let (rtt_ms, cloud_queue) = (cloud.as_ref().and_then(|c| c.rtt_ms), cloud.as_ref().map_or(0, |c| c.queue));
+    #[cfg(target_arch = "wasm32")]
+    let (rtt_ms, cloud_queue): (Option<f64>, usize) = (None, 0);
     json!({
         "window": [size.x, size.y],
         "pixelsPerPoint": ctx.pixels_per_point(),
         "fps": app.fps,
         "ui": ui,
+        "previewOn": app.session.prefs.previews.preview_on,
+        "previewSource": preview_source,
+        "rttMs": rtt_ms,
+        "cloudQueue": cloud_queue,
+        "cloud": cloud,
         "playing": app.playback.playing,
         "playback": {"achievedFps":app.playback.achieved_fps(),"realTime":app.playback.real_time(),
             "shown":app.playback.shown,"caching":app.playback.caching,"waiting":app.playback.waiting,"targetFps":app.playback.fps},
