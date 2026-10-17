@@ -606,13 +606,18 @@ pub fn specs() -> Vec<CommandSpec> {
         query!(
             "freeze.suggest",
             "Suggest Layers to Freeze",
-            "{dismiss?: {comp, layer}} -> {candidates: [{comp, layer, name, msPerFrame, frameBudgetMs, ratio, samples, target, freeze: freeze.freeze params}], autoHeavy}",
+            "{comp?: id|\"all\" (default: the active comp), dismiss?: {comp, layer}} -> {candidates: [{comp, layer, name, msPerFrame, frameBudgetMs, ratio, samples, target: precomp|selection|comp, question, freeze: freeze.freeze params}], autoHeavy}",
             |s, p| {
                 if let Some(d) = p.get("dismiss").filter(|d| !d.is_null()) {
                     let id = |key: &str| d.get(key).and_then(Value::as_u64).ok_or_else(|| bad("freeze.suggest", format!("dismiss.{key} must be an id")));
                     s.dismiss_freeze_suggestion(effectcraft_project::ItemId(id("comp")?), effectcraft_project::LayerId(id("layer")?));
                 }
-                let candidates: Vec<_> = s.freeze_suggestions().iter().map(|c| c.to_json()).collect();
+                let scope = match p.get("comp") {
+                    Some(Value::String(all)) if all == "all" => None,
+                    Some(v) if !v.is_null() => Some(comp_id(s, p).map_err(|_| bad("freeze.suggest", format!("no composition {v}")))?),
+                    _ => s.active_comp_id(),
+                };
+                let candidates: Vec<_> = s.freeze_suggestions_in(scope).iter().map(|c| c.to_json()).collect();
                 Ok(json!({"candidates": candidates, "autoHeavy": s.prefs.previews.freeze_auto_heavy}))
             }
         ),

@@ -92,17 +92,30 @@ impl CostBook {
     }
 }
 
+/// What freezing a suggestion freezes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unit {
+    /// The precomposition the heavy layer shows.
+    Precomp(ItemId),
+    /// The heavy layer alone.
+    Layer,
+    /// The whole composition the layer is in: `freeze.freeze` refuses the layer alone (for
+    /// example the comp has expressions), so its comp is the unit that can be frozen.
+    Comp,
+}
+
 /// One heavy layer, ready for `freeze.freeze`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Suggestion {
     pub comp: ItemId,
     pub layer: LayerId,
     pub name: String,
+    /// The name of `comp`.
+    pub comp_name: String,
     pub ms_per_frame: f64,
     pub budget_ms: f64,
     pub samples: u32,
-    /// The precomposition the layer shows (frozen as a whole), if it is a precomp layer.
-    pub precomp: Option<ItemId>,
+    pub unit: Unit,
 }
 
 impl Suggestion {
@@ -111,16 +124,28 @@ impl Suggestion {
         self.ms_per_frame / self.budget_ms
     }
 
-    /// The parameters `freeze.freeze` takes for this layer.
+    /// The parameters `freeze.freeze` takes for this suggestion.
     pub fn freeze_params(&self) -> Value {
-        json!({"comp": self.comp.0, "layers": [self.layer.0], "mode": if self.precomp.is_some() { "precomp" } else { "selection" }, "auto": true})
+        match self.unit {
+            Unit::Comp => json!({"comp": self.comp.0, "mode": "comp", "auto": true}),
+            Unit::Precomp(_) => json!({"comp": self.comp.0, "layers": [self.layer.0], "mode": "precomp", "auto": true}),
+            Unit::Layer => json!({"comp": self.comp.0, "layers": [self.layer.0], "mode": "selection", "auto": true}),
+        }
     }
 
-    /// "Stat Stack renders at 1.8 s/frame — Freeze it?"
+    /// "Stat Stack renders at 1.8 s/frame"
     pub fn hint(&self) -> String {
-        let time =
-            if self.ms_per_frame >= 1000.0 { format!("{:.1} s/frame", self.ms_per_frame / 1000.0) } else { format!("{:.0} ms/frame", self.ms_per_frame) };
+        let time = if self.ms_per_frame >= 1000.0 { format!("{:.1} s/frame", self.ms_per_frame / 1000.0) } else { format!("{:.0} ms/frame", self.ms_per_frame) };
         format!("{} renders at {time}", self.name)
+    }
+
+    /// The Timeline's question: "Stat Stack renders at 1.8 s/frame — Freeze it?", or, when only
+    /// the whole comp can be frozen, "Freeze Comp 28 (C28 Counter renders at 144 ms/frame)".
+    pub fn question(&self) -> String {
+        match self.unit {
+            Unit::Comp => format!("Freeze {} ({})", self.comp_name, self.hint()),
+            _ => format!("{} — Freeze it?", self.hint()),
+        }
     }
 
     pub fn to_json(&self) -> Value {
@@ -128,11 +153,13 @@ impl Suggestion {
             "comp": self.comp.0,
             "layer": self.layer.0,
             "name": self.name,
+            "compName": self.comp_name,
             "msPerFrame": self.ms_per_frame,
             "frameBudgetMs": self.budget_ms,
             "ratio": self.ratio(),
             "samples": self.samples,
-            "target": if self.precomp.is_some() { "precomp" } else { "selection" },
+            "target": match self.unit { Unit::Comp => "comp", Unit::Precomp(_) => "precomp", Unit::Layer => "selection" },
+            "question": self.question(),
             "freeze": self.freeze_params(),
         })
     }
@@ -154,17 +181,28 @@ impl Session {
         }
     }
 
-    /// Layers that stay far above the frame budget and are not frozen or dismissed, the
-    /// slowest first. A layer inside a precomp that is itself suggested is left out: freezing
-    /// the precomp covers it.
+    /// Heavy layers of the active composition that `freeze.freeze` can freeze (see
+    /// [`Self::freeze_suggestions_in`]).
     pub fn freeze_suggestions(&self) -> Vec<Suggestion> {
+        self.freeze_suggestions_in(self.active_comp_id())
+    }
+
+    /// Layers of `scope` (every composition when `None`) that stay far above the frame budget
+    /// and are not frozen or dismissed, the slowest first. Only what `freeze.freeze` accepts is
+    /// suggested: a layer it refuses on its own (for example expression dependencies) is
+    /// offered as its whole composition when that can be frozen, else not at all. A layer inside
+    /// a precomp that is itself suggested is left out: freezing the precomp covers it.
+    pub fn freeze_suggestions_in(&self, scope: Option<ItemId>) -> Vec<Suggestion> {
         let book = &self.freeze_runtime.cost;
-        let mut found = Vec::new();
+        let mut found: Vec<Suggestion> = Vec::new();
         for (&(comp_id, layer_id), cost) in &book.layers {
-            if !cost.is_heavy() || book.dismissed.contains(&(comp_id, layer_id)) {
+            if !cost.is_heavy() || book.dismissed.contains(&(comp_id, layer_id)) || scope.is_some_and(|c| c != comp_id) {
                 continue;
             }
-            let Some(layer) = self.project.comp(comp_id).and_then(|c| c.layer(layer_id)) else {
+            let Some(comp) = self.project.comp(comp_id) else {
+                continue;
+            };
+            let Some(layer) = comp.layer(layer_id) else {
                 continue;
             };
             if !layer.switches.video {
@@ -185,17 +223,36 @@ impl Session {
             if frozen {
                 continue;
             }
-            found.push(Suggestion {
+            let own = match precomp {
+                Some(item) => (Target::Precomp { comp: item }, Unit::Precomp(item)),
+                None => (Target::Selection { comp: comp_id, layers: vec![layer_id] }, Unit::Layer),
+            };
+            let unit = if crate::freeze::validate_target(&self.project, &own.0).is_ok() {
+                own.1
+            } else if crate::freeze::validate_target(&self.project, &Target::Comp { comp: comp_id }).is_ok() {
+                Unit::Comp
+            } else {
+                continue;
+            };
+            let comp_name = self.project.item(comp_id).map(|i| i.name.clone()).unwrap_or_default();
+            let candidate = Suggestion {
                 comp: comp_id,
                 layer: layer_id,
                 name: layer.name.clone(),
+                comp_name,
                 ms_per_frame: cost.ema_ms,
                 budget_ms: cost.budget_ms,
                 samples: cost.samples,
-                precomp,
-            });
+                unit,
+            };
+            // One whole-comp suggestion per composition: its slowest layer.
+            match found.iter_mut().find(|f| f.unit == Unit::Comp && unit == Unit::Comp && f.comp == comp_id) {
+                Some(existing) if existing.ms_per_frame >= candidate.ms_per_frame => {}
+                Some(existing) => *existing = candidate,
+                None => found.push(candidate),
+            }
         }
-        let outer: BTreeSet<ItemId> = found.iter().filter_map(|f| f.precomp).collect();
+        let outer: BTreeSet<ItemId> = found.iter().filter_map(|f| if let Unit::Precomp(item) = f.unit { Some(item) } else { None }).collect();
         found.retain(|f| !outer.contains(&f.comp));
         found.sort_by(|a, b| b.ms_per_frame.total_cmp(&a.ms_per_frame));
         found.truncate(MAX_SUGGESTIONS);
@@ -220,7 +277,7 @@ impl Session {
             return;
         }
         let Some(pick) =
-            self.freeze_suggestions().into_iter().find(|s| !self.freeze_runtime.cost.tried.contains(&(s.comp, s.layer)) && self.claims.get(s.comp).is_none())
+            self.freeze_suggestions_in(None).into_iter().find(|s| !self.freeze_runtime.cost.tried.contains(&(s.comp, s.layer)) && self.claims.get(s.comp).is_none())
         else {
             return;
         };
