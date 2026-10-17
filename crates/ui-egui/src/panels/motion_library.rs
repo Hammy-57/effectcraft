@@ -154,7 +154,7 @@ impl Default for ViewState {
 }
 
 /// Interface scale limits in percent (as the library's web panel).
-pub const SCALE_RANGE: (u32, u32) = (80, 140);
+pub const SCALE_RANGE: (u32, u32) = (80, 200);
 /// Card width limits in points.
 pub const CARD_SIZE_RANGE: (f32, f32) = (88.0, 1200.0);
 const DEFAULT_CARD_SIZE: f32 = 144.0;
@@ -4873,4 +4873,47 @@ mod library_tests {
         let lin = speed_samples([1.0 / 3.0, 1.0 / 3.0, 2.0 / 3.0, 2.0 / 3.0]);
         assert!(lin.iter().all(|(_, v)| (v - 1.0).abs() < 1e-6));
     }
+}
+
+/// The settings store file the panel's display settings are kept in between sessions.
+pub const DISPLAY_FILE: &str = "motion_library.json";
+
+/// The part of the view kept between sessions: scale, card sizes, columns, the folder open and
+/// its tree (not the search, the selection or the scroll).
+fn kept(view: &ViewState) -> ViewState {
+    ViewState { query: String::new(), selected: None, scroll: 0.0, folder_scroll: 0.0, ..view.clone() }
+}
+
+/// The display settings saved in an earlier session (a file that doesn't read is ignored). Run
+/// once when the app starts.
+pub(crate) fn load_display(app: &mut EffectcraftApp) {
+    let text = app.session.config.as_ref().and_then(|c| c.read(DISPLAY_FILE));
+    match text.map(|t| serde_json::from_str::<ViewState>(&t)) {
+        Some(Ok(mut v)) => {
+            v.clamp();
+            app.ui.motion_library = v;
+        }
+        Some(Err(e)) => log::warn!("{DISPLAY_FILE}: {e}"),
+        None => {}
+    }
+    app.motion_library_saved = Some(kept(&app.ui.motion_library));
+}
+
+/// Keep the display settings for the next session once they changed (not in the middle of a
+/// drag). Run every frame.
+pub(crate) fn store_display(app: &mut EffectcraftApp, ctx: &egui::Context) {
+    if ctx.input(|i| i.pointer.any_down()) {
+        return;
+    }
+    let now = kept(&app.ui.motion_library);
+    if app.motion_library_saved.as_ref() == Some(&now) {
+        return;
+    }
+    if let Some(c) = &app.session.config {
+        let written = serde_json::to_string(&now).map_err(std::io::Error::other).and_then(|t| c.write(DISPLAY_FILE, &t));
+        if let Err(e) = written {
+            log::warn!("{DISPLAY_FILE}: {e}");
+        }
+    }
+    app.motion_library_saved = Some(now);
 }

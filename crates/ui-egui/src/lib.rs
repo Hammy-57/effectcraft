@@ -604,6 +604,9 @@ pub struct EffectcraftApp {
     /// The Timeline column layout last kept in the settings store (see
     /// [`panels::timeline_columns::store_layout`]).
     pub(crate) timeline_layout_saved: Option<panels::timeline_columns::ColumnLayout>,
+    /// The Motion Library display settings last written to the settings store
+    /// ([`panels::motion_library::store_display`]).
+    pub(crate) motion_library_saved: Option<panels::motion_library::ViewState>,
 }
 
 /// The saved workspaces in the settings store ([`effectcraft_engine::config::ConfigStore`]).
@@ -709,6 +712,7 @@ impl EffectcraftApp {
             template_thumbs: Default::default(),
             template_list: None,
             timeline_layout_saved: None,
+            motion_library_saved: None,
         }
         .with_ui_commands()
         .with_timeline_layout()
@@ -717,6 +721,7 @@ impl EffectcraftApp {
     /// The Timeline column layout (columns shown, order, widths, splitter) of the last session.
     fn with_timeline_layout(mut self) -> Self {
         panels::timeline_columns::load_layout(&mut self);
+        panels::motion_library::load_display(&mut self);
         self
     }
 
@@ -2666,6 +2671,7 @@ impl EffectcraftApp {
         self.tick_autosave(&ctx);
         prefs_live::frame(self, &ctx);
         panels::timeline_columns::store_layout(self, &ctx);
+        panels::motion_library::store_display(self, &ctx);
         if let Some(rx) = self.command_inbox.take() {
             while let Ok(id) = rx.try_recv() {
                 if let Err(e) = menus::invoke(self, &ctx, &id, json!({})) {
