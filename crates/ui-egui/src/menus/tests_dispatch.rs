@@ -97,6 +97,7 @@ const PINNED_INVOKE: &[&str] = &[
     "motionLibrary.refresh",
     "motionLibrary.curve",
     "motionLibrary.tool",
+    "viewer.freeTransform",
 ];
 
 /// The ids `menus::frontend` handled (frontend events of engine commands), in the old match order.
@@ -190,7 +191,7 @@ fn handles_exactly_the_pinned_ids() {
         want.sort();
         assert_eq!(got, want, "{stage:?}: the handled ids changed; update PINNED_* only for a deliberate change");
     }
-    assert_eq!(PINNED_INVOKE.len() + PINNED_FRONTEND.len(), 149);
+    assert_eq!(PINNED_INVOKE.len() + PINNED_FRONTEND.len(), 150);
 }
 
 #[test]
