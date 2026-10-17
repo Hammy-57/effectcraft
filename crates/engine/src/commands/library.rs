@@ -165,8 +165,15 @@ fn search(s: &mut Session, p: &Value) -> Result<Value> {
         })
         .collect();
     hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.2.name.to_lowercase().cmp(&b.2.name.to_lowercase())));
-    let total = hits.len();
-    let entries: Vec<Value> = hits.iter().skip(offset).take(limit).map(|(_, lib, e)| summary(lib, e)).collect();
+    // Motion Library cards first (ranked as the Motion Library panel ranks them), then folders.
+    let source = str_p(p, "source").unwrap_or("all");
+    let mut all: Vec<Value> =
+        if source == "folders" { vec![] } else { super::motion_library::search_hits(s, str_p(p, "query").unwrap_or(""), category.as_deref(), kind.as_deref()) };
+    if source != "motion" {
+        all.extend(hits.iter().map(|(_, lib, e)| summary(lib, e)));
+    }
+    let total = all.len();
+    let entries: Vec<Value> = all.into_iter().skip(offset).take(limit).collect();
     Ok(json!({"total": total, "offset": offset, "entries": entries}))
 }
 
@@ -185,7 +192,13 @@ fn insert(s: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "library.insert";
     let id = str_p(p, "id").ok_or_else(|| bad(C, "missing `id`"))?;
     let libs = libraries(s);
-    let (lib, e) = find(&libs, id).ok_or_else(|| bad(C, format!("no library entry `{id}`")))?;
+    let Some((lib, e)) = find(&libs, id) else {
+        // A Motion Library card (library.search lists them too).
+        if s.motion_library().ok().and_then(|c| c.catalog()).is_some_and(|cat| cat.card(id).is_some()) {
+            return s.execute("library.apply", p.clone());
+        }
+        return Err(bad(C, format!("no library entry `{id}`")));
+    };
     let file = resolve(&lib.folder, &e.file);
     if file.is_empty() || !s.services.exists(&file) {
         return Err(bad(C, format!("“{}” has no file EffectCraft can use yet ({})", e.name, if file.is_empty() { "none listed" } else { &file })));
@@ -277,7 +290,7 @@ pub fn specs() -> Vec<CommandSpec> {
         query!(
             "library.search",
             "Search Libraries",
-            "{query? (words; every word must match name, tags, category or description), kind?: comp|preset|footage|audio, category?, limit? (default 20, max 200), offset?} → {total, entries: [{id, name, kind, category, tags, description, duration, thumbnail, library}]}",
+            "{query? (words; every word must match name, tags, category or description), kind?: comp|preset|footage|audio, category?, source?: all|motion|folders (default all: Motion Library cards first, then library folders), limit? (default 20, max 200), offset?} → {total, entries: [{id, name, kind, category, tags, description, duration, thumbnail, library, source?, needsFootage?}]} — Motion Library cards (source \"motion\") apply with library.apply {id}",
             search
         ),
         query!("library.get", "Library Entry", "{id} → the entry with its file, comp, preview and folder", get),

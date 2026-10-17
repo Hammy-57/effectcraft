@@ -33,6 +33,7 @@ effectcraft-expr = { path = "crates/expr" }
 effectcraft-lottie = { path = "crates/lottie" }
 effectcraft-aep = { path = "crates/aep" }
 effectcraft-interchange = { path = "crates/interchange" }
+effectcraft-motionlib = { path = "crates/motionlib" }
 effectcraft-pdf = { path = "crates/pdf" }
 effectcraft-psd = { path = "crates/psd" }
 effectcraft-vp9enc = { path = "crates/vp9enc" }
