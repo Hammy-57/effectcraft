@@ -524,6 +524,17 @@ pub struct RemoteJob {
     /// Replaces the cached frame with a better version of it (a lossless refine of a JPEG frame
     /// sent while scrubbing), if the frame is still cached.
     pub refined: Option<RemoteRefine>,
+    /// Keeps the frame's render times as the renderer measured them (the Timeline's Render Time
+    /// pane), when it sends them.
+    pub timed: Option<RemoteTimes>,
+}
+
+impl RemoteJob {
+    /// A frame with nothing else asked for: no disk key, not urgent, never called off, no
+    /// refine and no render times.
+    pub fn new(project: Arc<Project>, revision: u64, comp: ItemId, t: Tick, opts: RenderOpts) -> RemoteJob {
+        RemoteJob { project, revision, comp, t, opts, disk_key: None, urgent: false, cancel: Arc::default(), refined: None, timed: None }
+    }
 }
 
 /// Premultiplied RGBA8 pixels from a [`RemoteFrames`] renderer.
@@ -540,6 +551,9 @@ pub type RemoteDone = Box<dyn FnOnce(Result<RemoteFrame, String>) + Send>;
 
 /// Called at most once, after [`RemoteDone`], with a better version of the same frame.
 pub type RemoteRefine = Box<dyn FnOnce(RemoteFrame) + Send>;
+
+/// Called at most once with a remote frame's render times ([`times::FrameTimes::remote`] set).
+pub type RemoteTimes = Box<dyn FnOnce(times::FrameTimes) + Send>;
 
 /// Renders viewer frames elsewhere (the browser's frame worker), so the UI thread never does.
 pub trait RemoteFrames: Send + Sync {
@@ -2097,6 +2111,10 @@ impl Worker {
                 urgent,
                 cancel: job.cancel.clone(),
                 refined: Some(refined),
+                timed: Some({
+                    let sink = self.times.clone();
+                    Box::new(move |t: times::FrameTimes| sink.put(&key, t)) as RemoteTimes
+                }),
             };
             let next = link.clone();
             remote.start(
@@ -2412,7 +2430,7 @@ impl Worker {
     /// Keep a frame's render times: its layers' (`times`) and the whole frame's since `t0`.
     fn keep_times(&self, job: &Job, times: LayerTimes, t0: web_time::Instant) {
         let frame_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        self.times.put(&job.key, times::FrameTimes { frame_ms, layers: times.into_map() });
+        self.times.put(&job.key, times::FrameTimes { frame_ms, layers: times.into_map(), remote: false });
     }
 
     /// [`Self::render_timed`] again on the CPU, timed afresh.

@@ -213,7 +213,7 @@ fn on_message(index: u32, json: JsValue, bytes: JsValue, error: JsValue) {
         }
         let reply: FrameReply = serde_json::from_str(&json.as_string()?).ok()?;
         match reply {
-            FrameReply::Frame { id, width, height, ms, passes, gpu, layer_misses, layer_hits } => {
+            FrameReply::Frame { id, width, height, ms, passes, gpu, layer_misses, layer_hits, .. } => {
                 crate::diskcache::note_layers(&layer_misses, &layer_hits);
                 let (_, d) = w.busy.take_if(|b| b.0 == id)?;
                 let rgba = bytes.dyn_into::<js_sys::Uint8Array>().map(|b| b.to_vec()).unwrap_or_default();
@@ -241,6 +241,8 @@ fn on_message(index: u32, json: JsValue, bytes: JsValue, error: JsValue) {
                 }
                 None
             }
+            // Browser frame workers don't stream.
+            FrameReply::Stream(_) => None,
             FrameReply::Info { gpu, error } => {
                 match (&gpu, &error) {
                     (Some(g), _) => log::info!("frame worker {index}: GPU {g}"),
@@ -359,7 +361,7 @@ pub fn worker_frame_check(params: JsValue) -> js_sys::Promise {
                 st.next_id
             });
             CHECKS.with(|c| c.borrow_mut().insert(id, (resolve.clone(), reject.clone(), local, js_sys::Date::now())));
-            let job = RemoteJob { project: s.project.clone(), revision: s.revision, comp, t, opts, disk_key: None };
+            let job = RemoteJob::new(s.project.clone(), s.revision, comp, t, opts);
             WebFrames.render(
                 job,
                 Box::new(move |r: Result<RemoteFrame, String>| {

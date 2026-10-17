@@ -104,7 +104,7 @@ use std::sync::Arc;
 
 #[cfg(feature = "profile")]
 pub use context::take_pool_miss_sites;
-pub use context::{AllocStats, GpuContext, GpuImage, TransferStats};
+pub use context::{AllocStats, GpuContext, GpuImage, TransferStats, VramReport};
 use effectcraft_effects::Buf;
 use effectcraft_project::ItemId;
 use effectcraft_raster::Image;

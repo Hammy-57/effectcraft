@@ -34,6 +34,9 @@ pub(crate) struct Pipelines {
     /// Packed layer codes to floats (`unpack.wgsl`, [`GpuContext::upload_image`]).
     pub(crate) unpack: wgpu::ComputePipeline,
     pub(crate) unpack_layout: wgpu::BindGroupLayout,
+    /// Retained 8 bpc images to codes (`pack.wgsl`, [`crate::context::PackedImage`]); `None`
+    /// where `Rgba8Uint` can't be a storage texture.
+    pub(crate) pack: Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
 }
 
 impl Pipelines {
@@ -137,7 +140,58 @@ impl Pipelines {
         let decode = pipeline("decode", &decode_layout)?;
         let mask = pipeline("mask", &mask_layout)?;
         let unpack = pipeline("unpack", &unpack_layout)?;
-        Ok(Self { decode, decode_layout, mask, mask_layout, unpack, unpack_layout })
+        let pack = Self::pack(adapter, device).map_err(|e| log::info!("gpu: retained images stay 32-bit float ({e})")).ok();
+        Ok(Self { decode, decode_layout, mask, mask_layout, unpack, unpack_layout, pack })
+    }
+
+    fn pack(adapter: &wgpu::Adapter, device: &wgpu::Device) -> Result<(wgpu::ComputePipeline, wgpu::BindGroupLayout), String> {
+        let format = wgpu::TextureFormat::Rgba8Uint;
+        let usage = wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC;
+        if !adapter.get_texture_format_features(format).allowed_usages.contains(usage) {
+            return Err("no Rgba8Uint storage textures".into());
+        }
+        let module = init_resource(device, "pack shader", || {
+            device
+                .create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("pack"), source: wgpu::ShaderSource::Wgsl(include_str!("pack.wgsl").into()) })
+        })?;
+        let entry = |binding, ty| wgpu::BindGroupLayoutEntry { binding, visibility: wgpu::ShaderStages::COMPUTE, ty, count: None };
+        let layout = init_resource(device, "pack layout", || {
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("pack"),
+                entries: &[
+                    entry(
+                        0,
+                        wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                    ),
+                    entry(
+                        1,
+                        wgpu::BindingType::StorageTexture {
+                            access: wgpu::StorageTextureAccess::WriteOnly,
+                            format,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                        },
+                    ),
+                ],
+            })
+        })?;
+        let pipeline_layout = init_resource(device, "pack pipeline layout", || {
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("pack8"), bind_group_layouts: &[Some(&layout)], immediate_size: 0 })
+        })?;
+        let pipeline = init_resource(device, "pack pipeline", || {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("pack8"),
+                layout: Some(&pipeline_layout),
+                module: &module,
+                entry_point: Some("pack8"),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        })?;
+        Ok((pipeline, layout))
     }
 }
 
@@ -536,6 +590,10 @@ mod tests {
             (image, after.yuv_conversions - before.yuv_conversions, after.upload_bytes - before.upload_bytes)
         };
         let (first, conversions, _) = render(&scene);
+        assert_eq!(conversions, 1);
+        // Kept once drawn again (playback never shows a video frame twice).
+        let (again, conversions, _) = render(&scene);
+        assert_eq!(first.data, again.data);
         assert_eq!(conversions, 1);
         let (second, conversions, bytes) = render(&scene);
         assert_eq!(first.data, second.data);

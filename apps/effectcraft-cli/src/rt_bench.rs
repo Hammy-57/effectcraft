@@ -73,7 +73,13 @@ pub(super) fn run(s: &Session, args: &Args) -> Result<(), Failure> {
     for (label, scale) in [("Full", 1.0), ("Half", 0.5)] {
         s.footage.purge();
         gpu.context().clear_uploads();
-        let cache = LayerCache::default();
+        // `EFFECTCRAFT_RT_CACHE_MB`: the layer cache budget (default 1 GiB), as the app's
+        // Memory & CPU setting would give it.
+        let cache_mb = std::env::var("EFFECTCRAFT_RT_CACHE_MB").ok().and_then(|v| v.parse::<usize>().ok());
+        let cache = cache_mb.map_or_else(LayerCache::default, |mb| LayerCache::new(mb.saturating_mul(1 << 20)));
+        if let Some(mb) = cache_mb {
+            gpu.context().set_cache_budget(mb.saturating_mul(1 << 20));
+        }
         let mut r = Renderer::new(&project, s.footage.as_ref(), RenderOpts { scale, backend: Backend::Gpu, ..Default::default() });
         r.cache = Some(&cache);
         r.accel = Some(&gpu);
@@ -126,9 +132,13 @@ pub(super) fn run(s: &Session, args: &Args) -> Result<(), Failure> {
         for i in 0..n {
             let (t0, p0, c0) = (gpu.context().transfer_stats(), gpu.context().pool_stats(), cache.stats());
             let a0 = gpu.context().alloc_stats();
+            let v0 = gpu.context().vram_report(false);
+            gpu.context().reset_vram_peak();
             let now = std::time::Instant::now();
             render(i.saturating_add(1) as i64)?;
             let ms = now.elapsed().as_secs_f64() * 1000.0;
+            let v1 = gpu.context().vram_report(true);
+            note!("vram {label} frame {}: {ms:.0} ms, {}", i.saturating_add(1), vram_line(&v1, Some(&v0)));
             let (t1, p1) = (gpu.context().transfer_stats(), gpu.context().pool_stats());
             let a1 = gpu.context().alloc_stats();
             let (c1, held) = (cache.stats(), cache.retained_stats());
@@ -138,7 +148,8 @@ pub(super) fn run(s: &Session, args: &Args) -> Result<(), Failure> {
                 "poolMisses": p1.1.saturating_sub(p0.1), "allocations": a1.allocations.saturating_sub(a0.allocations),
                 "allocBytes": a1.bytes.saturating_sub(a0.bytes), "cacheCpuEntries": c1.entries, "cacheGpuEntries": c1.gpu_entries,
                 "cacheHits": c1.hits.saturating_sub(c0.hits), "cacheMisses": c1.misses.saturating_sub(c0.misses),
-                "retainedBytes": held.live_bytes, "retainedDebtBytes": held.debt_bytes, "retainedRecords": held.records}));
+                "retainedBytes": held.live_bytes, "retainedDebtBytes": held.debt_bytes, "retainedRecords": held.records,
+                "vram": vram_json(&v1, Some(&v0))}));
         }
         // Throughput with several frames in flight (frames after the profiled one).
         let mut throughput = serde_json::Value::Null;
@@ -146,11 +157,31 @@ pub(super) fn run(s: &Session, args: &Args) -> Result<(), Failure> {
             let (p0, a0) = (gpu.context().pool_stats(), gpu.context().alloc_stats());
             let next = std::sync::atomic::AtomicUsize::new(0);
             let failed = std::sync::atomic::AtomicBool::new(false);
-            let first = n.saturating_add(2);
+            // `--rt-warm`: the latency frames again (visited once, as on a second pass or after
+            // an edit elsewhere), not new ones.
+            let first = if args.flag("--rt-warm") { 1 } else { n.saturating_add(2) };
             let begin = std::time::Instant::now();
+            let done = std::sync::atomic::AtomicBool::new(false);
+            let mut timeline = Vec::new();
+            gpu.context().reset_vram_peak();
             std::thread::scope(|scope| {
+                // VRAM over time while the frames render (every 10 ms; the allocator walk is
+                // cheap next to a frame).
+                let sampler = scope.spawn(|| {
+                    let mut out = Vec::new();
+                    while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                        let v = gpu.context().vram_report(true);
+                        if out.len() % 10 == 0 {
+                            note!("vram {label} in flight {:.0} ms: {}", begin.elapsed().as_secs_f64() * 1000.0, vram_line(&v, None));
+                        }
+                        out.push(json!([begin.elapsed().as_secs_f64() * 1000.0, v.reserved, v.leased, v.uploads, v.pool_free, v.pool_released]));
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    out
+                });
+                let mut workers = Vec::new();
                 for _ in 0..inflight {
-                    scope.spawn(|| {
+                    workers.push(scope.spawn(|| {
                         let mut r = Renderer::new(&project, s.footage.as_ref(), RenderOpts { scale, backend: Backend::Gpu, ..Default::default() });
                         r.cache = Some(&cache);
                         r.accel = Some(&gpu);
@@ -166,8 +197,13 @@ pub(super) fn run(s: &Session, args: &Args) -> Result<(), Failure> {
                                 None => failed.store(true, std::sync::atomic::Ordering::Relaxed),
                             }
                         }
-                    });
+                    }));
                 }
+                for w in workers {
+                    let _ = w.join();
+                }
+                done.store(true, std::sync::atomic::Ordering::Relaxed);
+                timeline = sampler.join().unwrap_or_default();
             });
             if failed.load(std::sync::atomic::Ordering::Relaxed) {
                 return Err(Failure::Error("GPU viewer frame failed in flight; refusing CPU fallback benchmark".into()));
@@ -175,8 +211,13 @@ pub(super) fn run(s: &Session, args: &Args) -> Result<(), Failure> {
             let seconds = begin.elapsed().as_secs_f64();
             let (p1, a1) = (gpu.context().pool_stats(), gpu.context().alloc_stats());
             let per = |v: u64| v as f64 / n as f64;
+            let peak = gpu.context().vram_report(true);
+            let reserved_peak = timeline.iter().filter_map(|row| row.get(1).and_then(serde_json::Value::as_u64)).max();
             throughput = json!({"inflight": inflight, "frames": n, "seconds": seconds, "fps": n as f64 / seconds.max(1e-9),
-                "poolMissesPerFrame": per(p1.1.saturating_sub(p0.1)), "allocBytesPerFrame": per(a1.bytes.saturating_sub(a0.bytes))});
+                "poolMissesPerFrame": per(p1.1.saturating_sub(p0.1)), "allocBytesPerFrame": per(a1.bytes.saturating_sub(a0.bytes)),
+                "reservedPeakBytes": reserved_peak, "vram": vram_json(&peak, None),
+                "vramTimeline": {"columns": ["ms", "reserved", "leased", "uploads", "poolFree", "poolReleased"], "rows": timeline}});
+            note!("{name} {label}: {inflight} in flight: reserved peak {} MiB, leased peak {} MiB", reserved_peak.unwrap_or(0) >> 20, peak.leased_peak >> 20);
             note!("{name} {label}: {inflight} in flight: {:.2} fps", n as f64 / seconds.max(1e-9));
         }
         let after = gpu.context().transfer_stats();
@@ -245,6 +286,47 @@ pub(super) fn run(s: &Session, args: &Args) -> Result<(), Failure> {
     let report = json!({"adapter": effectcraft_render::Accelerator::name(&gpu), "initializationMs": initialization_ms, "colorFusion": effectcraft_gpu::color_fusion_enabled(), "yuvTransport": effectcraft_gpu::yuv_transport_enabled(), "warmup": warmup, "warmupMs": warmup_ms, "staticPipelines": gpu.static_pipeline_count(), "path": "GPU viewer + completion wait (no window presentation)", "rows": rows});
     println!("{}", serde_json::to_string(&report).map_err(|e| Failure::Error(e.to_string()))?);
     Ok(())
+}
+
+/// A [`effectcraft_gpu::VramReport`] on one line (MiB), for runs that may be killed.
+fn vram_line(v: &effectcraft_gpu::VramReport, before: Option<&effectcraft_gpu::VramReport>) -> String {
+    let m = |b: u64| b >> 20;
+    let sites: Vec<_> = v.peak_sites.iter().take(6).map(|(s, b)| format!("{s}={}", b >> 20)).collect();
+    let labels: Vec<_> = v.by_label.iter().take(6).map(|(l, b, n)| format!("{l}={}/{n}", b >> 20)).collect();
+    let published: Vec<_> = v
+        .published
+        .iter()
+        .map(|(k, n, b)| {
+            let was = before.and_then(|w| w.published.iter().find(|e| e.0 == *k)).map_or((0, 0), |e| (e.1, e.2));
+            format!("{k}={}/{}", n.saturating_sub(was.0), b.saturating_sub(was.1) >> 20)
+        })
+        .collect();
+    format!(
+        "reserved {} allocated {} leased {} (peak {}, frame +{}) uploads {} free {} released {} planes {} | published {} | labels {} | peak sites {}",
+        m(v.reserved.unwrap_or(0)),
+        m(v.allocated.unwrap_or(0)),
+        v.leased >> 20,
+        v.leased_peak >> 20,
+        before.map_or(0, |b| v.leased_peak.saturating_sub(b.leased) >> 20),
+        v.uploads >> 20,
+        v.pool_free >> 20,
+        v.pool_released >> 20,
+        m(v.planes),
+        published.join(" "),
+        labels.join(" "),
+        sites.join(" ")
+    )
+}
+
+/// A [`effectcraft_gpu::VramReport`] as JSON; with `before`, also what the frame added at its
+/// peak (`framePeakBytes`: pooled textures handed out at the peak minus those before it).
+fn vram_json(v: &effectcraft_gpu::VramReport, before: Option<&effectcraft_gpu::VramReport>) -> serde_json::Value {
+    let labels: Vec<_> = v.by_label.iter().take(12).map(|(l, b, n)| json!({"label": l, "bytes": b, "count": n})).collect();
+    let sites: Vec<_> = v.peak_sites.iter().take(16).map(|(s, b)| json!({"site": s, "bytes": b})).collect();
+    json!({"reserved": v.reserved, "allocated": v.allocated, "leased": v.leased, "leasedPeak": v.leased_peak,
+        "framePeakBytes": before.map(|b| v.leased_peak.saturating_sub(b.leased)),
+        "poolFree": v.pool_free, "poolReleased": v.pool_released, "uploads": v.uploads, "zeros": v.zeros, "planes": v.planes,
+        "staging": v.staging, "byLabel": labels, "peakSites": sites})
 }
 
 #[cfg(test)]

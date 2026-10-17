@@ -116,6 +116,51 @@ fn compositor_on_its_own_instance_never_shares_the_window_device() {
     assert!(shares_window_device(&shared, &own));
 }
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[test]
+fn the_window_renderer_skips_a_frame_it_cannot_stage() {
+    // Out of video memory (Elias's app on a shared 3090), egui-wgpu panicked on the main thread
+    // when it couldn't stage a frame's index data (renderer.rs:984) and the app died. The
+    // patched copy in vendor/egui-wgpu skips that frame. A lost device fails staging the same way.
+    use eframe::{egui_wgpu, wgpu};
+    let instance = wgpu::Instance::default();
+    let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return };
+    let Ok((device, queue)) = pollster::block_on(adapter.request_device(&Default::default())) else { return };
+    device.on_uncaptured_error(Arc::new(|_| {}));
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let mut renderer = egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
+    let target = device.create_texture(&wgpu::TextureDescriptor {
+        label: None,
+        size: wgpu::Extent3d { width: 64, height: 64, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let mut mesh = egui::Mesh::default();
+    mesh.add_colored_rect(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(10.0, 10.0)), egui::Color32::WHITE);
+    let jobs = [egui::epaint::ClippedPrimitive { clip_rect: egui::Rect::EVERYTHING, primitive: egui::epaint::Primitive::Mesh(mesh) }];
+    let screen = egui_wgpu::ScreenDescriptor { size_in_pixels: [64, 64], pixels_per_point: 1.0 };
+    let mut encoder = device.create_command_encoder(&Default::default());
+    device.destroy();
+    let _ = renderer.update_buffers(&device, &queue, &mut encoder, &jobs, &screen);
+    let mut pass = encoder
+        .begin_render_pass(&wgpu::RenderPassDescriptor {
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+            })],
+            ..Default::default()
+        })
+        .forget_lifetime();
+    renderer.render(&mut pass, &jobs, &screen);
+}
+
 #[cfg(all(test, target_os = "macos"))]
 #[test]
 fn compositor_shares_the_window_device_only_with_a_traffic_light() {
@@ -1362,6 +1407,7 @@ impl EffectcraftApp {
             token: &self.cloud_token.1,
             revision: self.session.revision,
             project: &self.session.project,
+            path: self.session.path.as_deref(),
             comp,
             last_ms,
         };

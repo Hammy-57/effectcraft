@@ -124,6 +124,10 @@ impl GpuAllocation {
         let bytes = (width as usize).checked_mul(height as usize)?.checked_mul(16)?;
         Some(Arc::new(Self { bytes, generation, enrolled: Mutex::new(Enrollment::default()) }))
     }
+    /// An allocation of `bytes` (a texture in another format, e.g. packed 8 bpc codes).
+    pub fn of_bytes(bytes: usize, generation: GpuGeneration) -> Arc<Self> {
+        Arc::new(Self { bytes, generation, enrolled: Mutex::new(Enrollment::default()) })
+    }
     pub fn bytes(&self) -> usize {
         self.bytes
     }

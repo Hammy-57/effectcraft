@@ -16,6 +16,8 @@ pub struct FrameTimes {
     pub frame_ms: f64,
     /// Each layer that rendered, by comp and layer: the frame's comp and the comps nested in it.
     pub layers: HashMap<(ItemId, LayerId), f64>,
+    /// Rendered by a remote renderer (the cloud, CR5): its times there, not this machine's.
+    pub remote: bool,
 }
 
 impl FrameTimes {
@@ -82,7 +84,7 @@ mod tests {
     }
 
     fn times(n: u64) -> FrameTimes {
-        FrameTimes { frame_ms: 1.0, layers: (0..n).map(|i| ((ItemId(1), LayerId(i)), 1.0)).collect() }
+        FrameTimes { frame_ms: 1.0, layers: (0..n).map(|i| ((ItemId(1), LayerId(i)), 1.0)).collect(), remote: false }
     }
 
     #[test]
