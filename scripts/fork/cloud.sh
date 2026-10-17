@@ -188,7 +188,7 @@ fi
 REMOTE_STOP='
 fp="$1"; pidf=/workspace/cloud-serve-$fp.pid; wd=/workspace/cloud-idle-$fp.pid
 [ -f "$wd" ] && kill "$(cat "$wd")" 2>/dev/null; rm -f "$wd"
-if [ -f "$pidf" ] && p=$(cat "$pidf") && tr "\0" " " </proc/$p/cmdline 2>/dev/null | grep -q -- "serve --gpu --frames $fp"; then
+if [ -f "$pidf" ] && p=$(cat "$pidf") && [ -r /proc/$p/cmdline ] && tr "\0" " " </proc/$p/cmdline 2>/dev/null | grep -q -- "serve --gpu --frames $fp"; then
   kill "$p"; sleep 1; echo "serve stopped (pid $p)"; rm -f "$pidf" /workspace/cloud-serve-$fp.commit
 else echo "no serve of ours running on $fp"; rm -f "$pidf"; fi
 '
