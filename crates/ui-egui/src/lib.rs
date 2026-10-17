@@ -492,6 +492,9 @@ pub struct EffectcraftApp {
     /// The cloud server's token and when it was read (at most every few seconds).
     #[cfg(not(target_arch = "wasm32"))]
     cloud_token: (f64, String),
+    /// CR6b: a cloud preview's playback from the server's H.264 stream.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) cloud_play: cloud_stream::CloudPlayback,
     /// When the user last did something (input or an edit): Cache Frames When Idle waits for
     /// a second of quiet. (time, project revision then)
     last_activity: (f64, u64),
@@ -636,6 +639,8 @@ impl EffectcraftApp {
             cloud: Default::default(),
             #[cfg(not(target_arch = "wasm32"))]
             cloud_token: (f64::NEG_INFINITY, String::new()),
+            #[cfg(not(target_arch = "wasm32"))]
+            cloud_play: Default::default(),
             last_ui_time: 0.0,
             last_activity: (0.0, 0),
             last_edit: (0.0, 0),
@@ -1713,6 +1718,11 @@ impl EffectcraftApp {
     pub fn stop(&mut self) {
         let was = std::mem::replace(&mut self.playback.playing, false);
         self.frames.set_playhead(None);
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.cloud_play.active() {
+            let shown = self.viewer_shown.as_ref().map(|(_, k)| *k);
+            self.cloud_play.halt(&self.frames, shown);
+        }
         self.audio = None;
         self.playback.caching = false;
         if !was {
@@ -1854,6 +1864,10 @@ impl EffectcraftApp {
         };
         let ahead = ahead.min(self.frames_that_fit(&c, scale));
         let series = self.frame_series(cid, scale);
+        // CR6b: a cloud preview plays from the server's stream; nothing renders or is asked for
+        // here meanwhile (the stream's first chunk is the pre-roll).
+        let streamed = self.tick_cloud_stream(ctx, &c, series, cur, scale, now);
+        let ahead = if streamed { i64::from(effectcraft_engine::remote_stream::DEFAULT_CHUNK_FRAMES).min(self.frames_that_fit(&c, scale)) } else { ahead };
         // The preview's position orders prefetch and eviction (#595); set before counting the
         // frames in flight, as it drops queued frames the preview no longer reaches.
         let playhead = plan.filter(|p| p.video).map(|p| frames::Playhead { series, cur, start: p.start, end: p.end, step: p.step, looping: p.looping });
@@ -1920,7 +1934,7 @@ impl EffectcraftApp {
         // preview shows first, or be evicted before it gets there (#595).
         let window = (ahead * 3).min(self.frames_that_fit(&c, scale) - 1);
         for k in 0..window {
-            if queued >= ahead as usize || !video {
+            if queued >= ahead as usize || !video || streamed {
                 break;
             }
             let f = match plan {
@@ -1990,7 +2004,7 @@ impl EffectcraftApp {
             self.playback.waiting = true;
             self.playback.start_wall = now;
             self.playback.start_frame = cur;
-            if !self.frames.is_cached(&FrameKey { frame: cur, ..series }) {
+            if !streamed && !self.frames.is_cached(&FrameKey { frame: cur, ..series }) {
                 self.request_frame_urgent(cid, cur, scale);
             }
             // Each finished frame wakes the UI (`Frames::release`); this is only the fallback.
@@ -2086,7 +2100,7 @@ impl EffectcraftApp {
             let next = plan.and_then(|p| p.frame_after(cur, 1)).unwrap_or(if cur + 1 > wb { wa } else { cur + 1 });
             if self.frames.is_cached(&FrameKey { frame: next, ..series }) {
                 self.session.set_time(fr.tick_of(next));
-            } else {
+            } else if !streamed {
                 // The frame playback waits for renders before any prefetch (the prefetch window
                 // can be full of frames further on, or of other comps').
                 self.request_frame_urgent(cid, next, scale);
@@ -2098,6 +2112,47 @@ impl EffectcraftApp {
             return;
         }
         ctx.request_repaint_after(until_next_frame(next_due));
+    }
+
+    /// CR6b: while a cloud preview plays, its frames come from the server's playback stream
+    /// ([`cloud_stream`]): start, feed and stop it, and publish its frames into the RAM cache.
+    /// Whether the stream delivers this preview's frames (nothing renders or is asked for here).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn tick_cloud_stream(&mut self, ctx: &egui::Context, c: &Arc<effectcraft_engine::project::Comp>, series: FrameKey, cur: i64, scale: f64, now: f64) -> bool {
+        let plan = self.playback.plan.filter(|p| self.playback.playing && p.video && !self.playback.caching);
+        let enabled = std::env::var("EFFECTCRAFT_CLOUD_STREAM").map_or(true, |v| v != "0");
+        let Some(cid) = self.session.active_comp_id() else { return false };
+        if plan.is_none() && !self.cloud_play.active() {
+            return false;
+        }
+        let project = self.session.freeze_preview_project();
+        let p = cloud_stream::PlayNow {
+            playing: plan.is_some() && enabled && self.frames.remote_active(),
+            now,
+            comp: cid,
+            rate: c.frame_rate,
+            project: &project,
+            revision: self.session.revision,
+            series,
+            opts: self.frame_opts(cid, scale),
+            cur,
+            start: plan.map_or(cur, |p| p.start),
+            end: plan.map_or(cur, |p| p.end),
+            looping: plan.is_some_and(|p| p.looping),
+            waiting: self.playback.waiting,
+            fit: self.frames_that_fit(c, scale),
+        };
+        let client = self.cloud.client().cloned();
+        let t = self.cloud_play.tick(client.as_ref(), &p, &self.frames, Some(ctx));
+        if let Some(note) = t.note {
+            self.ui.status = note;
+        }
+        t.streamed
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn tick_cloud_stream(&mut self, _: &egui::Context, _: &Arc<effectcraft_engine::project::Comp>, _: FrameKey, _: i64, _: f64, _: f64) -> bool {
+        false
     }
 
     /// While the project keeps changing (an edit within [`EDIT_QUIET`] seconds), how long until
