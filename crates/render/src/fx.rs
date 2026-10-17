@@ -205,6 +205,12 @@ struct CpuFx<'a> {
 
 impl FxTarget for CpuFx<'_> {
     fn gpu(&mut self, steps: &[FxStep]) -> bool {
+        // The buffer is on the CPU: a run of light effects (box-pass blurs) costs less here
+        // than its upload and readback (a styled layer's Gaussian Blur: 0.3 ms here, 10-40 ms
+        // through the GPU at Half).
+        if steps.iter().all(|s| effectcraft_effects::is_light(s.spec.id)) {
+            return false;
+        }
         let (Some(a), Some(b)) = (self.accel, &self.buf) else { return false };
         match a.effects_kept_owned(steps, b, self.levels, self.owner.as_ref()) {
             Some((out, ticket)) => {
@@ -368,6 +374,8 @@ impl<'a> Renderer<'a> {
                 _ => None,
             })
             .filter(|(_, _, s)| !effectcraft_effects::audio_fx::is_audio_effect(s.id))
+            // A blur of 0 changes nothing: skipped, it costs no GPU round trip either.
+            .filter(|(_, g, s)| !(effectcraft_effects::may_be_identity(s.id) && effectcraft_effects::is_identity(s.id, &self.effect_params(ctx, layer, g))))
             .collect();
         // Text and shape rasterisation is tight to the glyphs or the drawn paths. Distortions
         // and tilers need transparent output pixels beyond that rectangle, on CPU and GPU alike

@@ -415,6 +415,32 @@ pub fn gaussian_sigma(blurriness: f64) -> f64 {
     blurriness.max(0.0) * 0.28
 }
 
+/// Effects whose parameters can make them leave their input exactly as it is (see
+/// [`is_identity`]); the renderer evaluates the parameters to check only for these.
+pub fn may_be_identity(id: &str) -> bool {
+    matches!(id, "ec.blur.gaussian" | "ec.blur.fastbox")
+}
+
+/// Whether effect `id` with `params` returns its input unchanged (a Gaussian Blur at Blurriness
+/// 0, a Fast Box Blur of radius 0): the renderer skips it, so it costs nothing on the CPU and
+/// no upload or readback on the GPU.
+pub fn is_identity(id: &str, params: &Params) -> bool {
+    // NaN is no blur too, as the effects themselves treat it.
+    let none = |v: f64| v.is_nan() || v <= 0.0;
+    match id {
+        "ec.blur.gaussian" => none(params.f("blurriness")),
+        "ec.blur.fastbox" => none(params.f("radius")),
+        _ => false,
+    }
+}
+
+/// Memory-bound effects with O(1) work per pixel (running-sum box passes): on a buffer that
+/// lives on the CPU they cost about what uploading it and reading it back alone would, so the
+/// CPU renderer runs them itself rather than in a GPU round trip.
+pub fn is_light(id: &str) -> bool {
+    matches!(id, "ec.blur.gaussian" | "ec.blur.fastbox")
+}
+
 /// What an effect gets to render with.
 pub struct EffectCtx<'a> {
     pub params: &'a Params,
@@ -1221,6 +1247,22 @@ pub(crate) fn run_fx(id: &str, vals: &[(&str, Value)], img: Image, time: f64, en
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_blurs_are_identities() {
+        let with = |k: &str, v: f64| Params { values: [(k.to_string(), Value::Scalar(v))].into_iter().collect() };
+        assert!(is_identity("ec.blur.gaussian", &with("blurriness", 0.0)));
+        assert!(is_identity("ec.blur.gaussian", &with("blurriness", f64::NAN)));
+        assert!(!is_identity("ec.blur.gaussian", &with("blurriness", 0.5)));
+        assert!(is_identity("ec.blur.fastbox", &with("radius", -1.0)));
+        assert!(!is_identity("ec.stylize.glow", &with("radius", 0.0)));
+        // Every identity is also something the renderer checks for.
+        assert!(may_be_identity("ec.blur.gaussian") && !may_be_identity("ec.stylize.glow"));
+        // An identity really is one: the CPU effect returns its input unchanged.
+        let img = Image::filled(4, 3, [0.5, 0.25, 0.125, 1.0]);
+        let out = run_fx("ec.blur.gaussian", &[("blurriness", num(0.0))], img.clone(), 0.0, EffectEnv::default());
+        assert_eq!((out.img.width, out.img.data), (img.width, img.data));
+    }
 
     #[test]
     fn run_fx_passthrough() {
