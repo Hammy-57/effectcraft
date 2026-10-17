@@ -49,6 +49,7 @@
 use std::io::Write;
 
 mod figma_bridge;
+mod frame_serve;
 #[cfg(feature = "ui")]
 mod offscreen_ui;
 mod template;
@@ -146,11 +147,18 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
       [--automation-read-root DIR] [--automation-write-root DIR]
                                            confine the agent's file access: reads under a read or write root,
                                            writes under a write root (each repeatable); scripts are refused
-  serve [F.ecproj | --demo] [--control PORT] [--gpu]
+  serve [F.ecproj | --demo] [--control PORT] [--gpu] [--frames PORT [--token T]]
                                            a windowless host: one project that several agents work on at
                                            once over the control channel (join with mcp --bridge PORT or
                                            the MCP hosts tool); prints the port; checkpoints unsaved work;
-                                           in the host list until it stops (host.release saves and stops it)
+                                           in the host list until it stops (host.release saves and stops it);
+                                           --frames PORT also serves viewer frames to a desktop app over the
+                                           binary frame channel (loopback: reach it through an SSH tunnel),
+                                           token from --token, EFFECTCRAFT_FRAME_TOKEN or <config>/frame-server-token
+  frames-bench --frames HOST:PORT [--token T] [F.ecproj | --demo] [--comp ID] [--scale S] [--max-side PX]
+      [--jpeg-quality Q] [--n N] [--duration SECS]
+                                           measure a frame server: round trips, scrub latency, a soak of
+                                           random requests
   figma-bridge [--port 7789] [--control 9877] [--code CODE]
                                            local endpoint for the EffectCraft Figma plug-in: imports what it
                                            sends into the running app (file.importFigma); prints the pairing code
@@ -189,6 +197,10 @@ const VALUED: &[&str] = &[
     "--port",
     "--control",
     "--code",
+    // serve --frames / frames-bench
+    "--frames",
+    "--token",
+    "--duration",
     // compare
     "--threshold",
     "--min-psnr",
@@ -898,12 +910,29 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
                 Some(p) => p.parse::<u16>().map_err(|_| Failure::Usage(format!("--control: `{p}` is not a port")))?,
                 None => 0,
             };
-            let (project, demo, gpu) = (args.project.clone(), args.flag("--demo"), args.flag("--gpu"));
+            let (project, demo) = (args.project.clone(), args.flag("--demo"));
+            // One device for the host and the frame server.
+            let gpu = match args.flag("--gpu") {
+                true => {
+                    Some(std::sync::Arc::new(effectcraft_gpu::Gpu::try_headless().map_err(|e| Failure::Error(format!("--gpu: no usable GPU adapter ({e})")))?))
+                }
+                false => None,
+            };
+            let control_port = std::sync::Arc::new(std::sync::OnceLock::new());
+            let frames = match args.opt("--frames") {
+                Some(p) => {
+                    let p = p.parse::<u16>().map_err(|_| Failure::Usage(format!("--frames: `{p}` is not a port")))?;
+                    Some(frame_serve::start(args, p, gpu.clone(), control_port.clone())?)
+                }
+                None => None,
+            };
+            // With --frames the device is the frame server's alone: it rebuilds it after a loss,
+            // and a host holding the old one would keep its memory.
+            let host_gpu = if frames.is_some() { None } else { gpu.clone() };
             let make = Box::new(move || -> Result<effectcraft_engine::Session, String> {
                 let mut s = effectcraft_host::session();
-                if gpu {
-                    let g = effectcraft_gpu::Gpu::try_headless().map_err(|e| format!("--gpu: no usable GPU adapter ({e})"))?;
-                    s.accel = Some(std::sync::Arc::new(g));
+                if let Some(g) = host_gpu {
+                    s.accel = Some(g);
                 }
                 if let Some(p) = &project {
                     s.execute("file.open", json!({"path": p})).map_err(|e| e.to_string())?;
@@ -914,10 +943,15 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
             });
             let config = effectcraft_automation::host_server::HostConfig { port, config_dir: effectcraft_host::config_dir() };
             effectcraft_automation::host_server::serve(config, make, |port| {
+                let _ = control_port.set(port);
                 println!("EffectCraft host listening on 127.0.0.1:{port} (agents: effectcraft-cli mcp --bridge {port})");
             })
             .map_err(|e| Failure::Error(format!("serve: {e}")))?;
+            if let Some(f) = frames {
+                f.stop();
+            }
         }
+        "frames-bench" => frame_serve::bench(args)?,
         other => return usage_err(&format!("unknown subcommand `{other}`")),
     }
     Ok(())

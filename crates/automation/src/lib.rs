@@ -25,6 +25,8 @@ mod compact;
 pub mod confine;
 pub mod control_wire;
 pub mod figma_bridge;
+pub mod frame_link;
+pub mod frame_server;
 mod host_join;
 pub mod host_server;
 mod long_job;

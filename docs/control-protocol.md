@@ -356,3 +356,43 @@ layout unchanged. Pointer gestures dispatch through this same catalog command.
 EffectCraft also supports `SetStackOpen` and `ResizeStack`. Dynamic panel identities use
 `{"Viewer":42}` or `{"ScriptPanel":77}` in the action. Closing runs the existing viewer
 and ScriptUI lifecycle callbacks; opening uses the existing panel creation commands.
+
+## Frame channel
+
+`effectcraft-cli serve --frames PORT [--gpu] [--token T]` also serves viewer
+frames to a desktop app that renders in the cloud (a rented GPU). It listens on 127.0.0.1 only:
+reach it through an SSH tunnel (`ssh -L 9878:127.0.0.1:9878 …`). Frames need a binary channel
+next to the JSON lines, so each message is one length-prefixed frame
+(`effectcraft_engine::remote_wire`):
+
+```text
+"ECF1" | header length (u32 LE) | payload length (u32 LE) | header (JSON) | payload (bytes)
+```
+
+- The first message is `{"type":"hello","token":…}`. A wrong token, or anything else, gets
+  `{"type":"refused"}` and the connection closes; five wrong tokens in a row refuse every token
+  for a minute. The token comes from `--token`, `EFFECTCRAFT_FRAME_TOKEN` or
+  `<config dir>/frame-server-token` (created with mode 0600 on first use).
+- `{"type":"msg","msg":…,"want":…,"urgent":…}` carries a `FrameMsg` (`project`, `patch`,
+  `render`, `segs`, `purge`). The app is the source of truth: each connection holds a replica of
+  its project and only renders it. Replies are `{"type":"reply","reply":…,"pixels":…}` with a
+  `FrameReply`; a frame's pixels are the payload.
+- Render requests queue for a pool of workers (8, capped by `--frame-threads` /
+  `EFFECTCRAFT_FRAME_THREADS`; one frame on the GPU at a time, `EFFECTCRAFT_FRAME_GPU_SLOTS`): urgent first (the newest first), then prefetch (the oldest first), then lossless
+  refines. `{"type":"cancel","ids":[…]}` drops requests. A request for another revision than the
+  replica's, also one that turned old while it rendered, answers `failed` with `stale: true`.
+- `want`: `codec` `jpeg` (scrubbing; quality 85 by default; strips of 64 rows, each its own JPEG,
+  plus a lossless alpha plane when the frame isn't opaque), `qoi` (lossless) or `raw`;
+  `maxSize` scales the frame down to the viewer's size; `refine` sends the lossless version of a
+  JPEG frame once the server is idle (`pixels.refine`). Pixels are premultiplied RGBA8, as the
+  viewer shows them.
+- `{"type":"control","id":…,"method":…,"params":…}` runs a control-channel request on the host
+  (`effectcraft_automation::frame_link::RemoteControl` is a `ControlTransport` over it);
+  `{"type":"echo","id":…}` sends the payload back.
+- The server logs render ms, encode ms, bytes and queue depth per frame on standard error.
+  `effectcraft-cli frames-bench --frames HOST:PORT [F.ecproj]` measures a server: round trips,
+  scrub latency and, with `--duration`, a soak of random requests.
+
+`effectcraft_engine::remote_wire::FrameClient` is the client: it reconnects with backoff (0.1 s
+doubling to 5 s) and reports each connection, after which the app sends its project again. A lost
+connection is an event, never an error for the document.
