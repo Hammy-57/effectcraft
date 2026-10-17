@@ -775,7 +775,11 @@ impl CloudPlayback {
         stored
     }
 
+    /// The preview is over: its numbers stay with the last stream's (`ui.inspect`).
     fn end_preview(&mut self) {
+        if self.preview.is_some() {
+            self.last = self.stats();
+        }
         self.preview = None;
     }
 
