@@ -739,8 +739,13 @@ fn folder_tree(ctx: &egui::Context, client: &Client, local: &Arc<LocalIndex>, li
     {
         return rows;
     }
-    let catalog = client.catalog().map(|c| c.tree()).unwrap_or_default();
+    let mut catalog = client.catalog().map(|c| c.tree()).unwrap_or_default();
     let ops = folder_ops();
+    // This Mac's complete index has every folder: a published one it lost was deleted here.
+    if lib.complete {
+        let kept: BTreeSet<&str> = lib.folders.iter().map(String::as_str).chain(all.iter().map(|c| c.category.as_str())).collect();
+        catalog.retain(|r| kept.iter().any(|k| under(k, &r.path)));
+    }
     let in_group = |f: &str| group.is_empty() || folder_group(lib, &ops, f) == group;
     let counts = folder_counts(all.iter().filter(|c| in_group(&c.category)));
     let mut card_folders: Vec<String> = all.iter().map(|c| c.category.clone()).filter(|c| !c.is_empty()).collect();
@@ -1031,7 +1036,6 @@ fn filters_body(app: &mut EffectcraftApp, ui: &mut egui::Ui, r: Rect, view: &mut
     }
 }
 
-/// + Save: where cards come from.
 /// What "Save to Motion Library" can save from the open project.
 const SAVE_KINDS: [(&str, &str, &str); 4] = [
     ("layers", "Layers", "The selected layers (with their parents and mattes), editable"),
@@ -2575,7 +2579,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     }
 
     // Footer: the selected card and Apply.
-    let footer = Rect::from_min_max(pos2(rect.min.x, rect.max.y - footer_h), rect.max);
+    let footer = Rect::from_min_max(pos2(rail_r.max.x + 1.0, rect.max.y - footer_h), rect.max);
     p.line_segment([footer.left_top(), footer.right_top()], Stroke::new(1.0, t.separator));
     let sel = view.selected.as_ref().and_then(|id| find_card(&all, id));
     let ar = Rect::from_min_size(pos2(footer.max.x - 80.0 * s, footer.center().y - 11.0 * s), vec2(72.0 * s, 22.0 * s));
@@ -3286,9 +3290,23 @@ pub(crate) fn ml_rpc(_name: &str, _script_args: &[&str], _port: Option<u16>, _op
     Err("saving to the Motion Library works in the desktop app".into())
 }
 
+/// Index rebuilds asked for, and the last one a finished rebuild covered.
+#[cfg(not(target_arch = "wasm32"))]
+static INDEX_ASKED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(not(target_arch = "wasm32"))]
+static INDEX_DONE: Mutex<usize> = Mutex::new(0);
+
 /// Rebuild the local library's index (`effectcraft_library.py index`) so the panel reads the change.
+/// One at a time, and skipped when a rebuild that started after this change already ran (parallel
+/// rebuilds raced: an older one finishing last wrote a stale index).
 #[cfg(not(target_arch = "wasm32"))]
 fn reindex_library() {
+    let mine = INDEX_ASKED.fetch_add(1, Ordering::SeqCst).saturating_add(1);
+    let mut done = INDEX_DONE.lock().unwrap_or_else(|e| e.into_inner());
+    if *done >= mine {
+        return;
+    }
+    let covers = INDEX_ASKED.load(Ordering::SeqCst);
     let Some(dir) = ml_backend().and_then(|p| p.parent().map(|d| d.to_path_buf())) else { return };
     let _ = std::process::Command::new("/usr/bin/nice")
         .args(["-n", "10", "/usr/bin/python3", "effectcraft_library.py", "index"])
@@ -3296,6 +3314,7 @@ fn reindex_library() {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
+    *done = covers;
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -4001,7 +4020,7 @@ pub(crate) fn keys_curve(keys: &Value) -> Option<[f64; 4]> {
     let (a, b) = (keys.get(0)?, keys.get(1)?);
     let (ta, tb, va, vb) = (a["time"].as_f64()?, b["time"].as_f64()?, a["value"].as_f64()?, b["value"].as_f64()?);
     let (dt, dv) = (tb - ta, vb - va);
-    if !(dt > 0.0) || dv.abs() < 1e-8 || !dt.is_finite() || !dv.is_finite() {
+    if dt.is_nan() || dt <= 0.0 || dv.abs() < 1e-8 || !dt.is_finite() || !dv.is_finite() {
         return None;
     }
     let out = a["out_ease"].get(0);
