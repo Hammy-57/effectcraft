@@ -254,6 +254,8 @@ pub fn start(args: &Args, port: u16, gpu: Option<Arc<Gpu>>, control_port: Arc<On
         }),
         None => Arc::new(CpuRender { footage: s.footage.clone(), expr: s.expr.clone() }),
     };
+    // Never colour bars or Inter from the cloud: frames fail while footage or fonts are missing (CR7).
+    let render = crate::asset_guard::wrap(render, log.clone());
     let (token, stored) = frame_server::frame_token(effectcraft_host::config_dir().as_deref(), args.opt("--token")).map_err(Failure::Error)?;
     let control: frame_server::ControlFn = Arc::new(move |method: &str, params: Value| match control_port.get() {
         Some(&p) => effectcraft_automation::host_server::request(p, method, params).unwrap_or_else(|e| json!({"ok": false, "error": e.to_string()})),
