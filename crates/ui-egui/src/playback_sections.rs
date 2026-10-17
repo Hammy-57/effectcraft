@@ -129,7 +129,7 @@ mod tests {
     /// A layer added to the active comp, then timed by `f`.
     fn add(s: &mut Session, comp: ItemId, cmd: &str, params: serde_json::Value, f: &dyn Fn(&mut effectcraft_engine::project::Layer)) {
         let id = s.execute(cmd, params).unwrap()["layer"].as_u64().unwrap();
-        let c = s.project.comp_mut(comp).unwrap();
+        let c = std::sync::Arc::make_mut(&mut s.project).comp_mut(comp).unwrap();
         f(c.layers.iter_mut().find(|l| l.id.0 == id).unwrap());
     }
 
