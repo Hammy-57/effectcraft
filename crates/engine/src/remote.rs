@@ -712,7 +712,17 @@ mod tests {
             assert!(a.starts_with("{\"type\":"), "{a}");
         }
         for r in [
-            FrameReply::Frame { id: 1, width: 2, height: 3, ms: 4.5, passes: 2, gpu: true, layer_misses: vec!["0a".into()], layer_hits: vec![], layer_times: vec![(ItemId(3), LayerId(4), 1.5)] },
+            FrameReply::Frame {
+                id: 1,
+                width: 2,
+                height: 3,
+                ms: 4.5,
+                passes: 2,
+                gpu: true,
+                layer_misses: vec!["0a".into()],
+                layer_hits: vec![],
+                layer_times: vec![(ItemId(3), LayerId(4), 1.5)],
+            },
             FrameReply::Stored { key: "00ff".into(), bytes: 9, layer: false },
             FrameReply::Stored { key: "00fe".into(), bytes: 8, layer: true },
             FrameReply::Info { gpu: Some("Adapter (BrowserWebGpu)".into()), error: None },

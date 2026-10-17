@@ -34,6 +34,7 @@ use effectcraft_engine::remote_encode::{self, Codec, Want};
 use effectcraft_engine::remote_wire::{Backoff, Down, Event, FrameClient, Up};
 use effectcraft_engine::render::Backend;
 use serde::Serialize;
+use serde_json::{Value, json};
 
 use crate::frames::times::FrameTimes;
 use crate::frames::{RemoteDone, RemoteFrame, RemoteFrames, RemoteJob, RemoteRefine, RemoteTimes};
@@ -50,6 +51,8 @@ const PING: Duration = Duration::from_secs(1);
 const DEAD: Duration = Duration::from_secs(4);
 /// A whole project may take this long to arrive and load before the link counts as dead.
 const PROJECT_DEAD: Duration = Duration::from_secs(120);
+/// How long before asking the server again whether it has the project's files.
+const PREFLIGHT_RETRY: Duration = if cfg!(test) { Duration::from_millis(200) } else { Duration::from_secs(10) };
 /// Refines kept waiting at most this long.
 const REFINE_WAIT: Duration = Duration::from_secs(30);
 
@@ -75,6 +78,11 @@ pub struct CloudStatus {
     pub server: Option<String>,
     /// Why the last connection ended or failed.
     pub error: Option<String>,
+    /// What the cloud machine lacks (CR7 preflight's summary): frames render here until it has it.
+    pub missing: Option<String>,
+    /// Files the mirror hasn't uploaded yet (CR7 `cloud.pendingUploads`): frames render here
+    /// meanwhile.
+    pub pending_uploads: usize,
     /// The server refused the token (the client stopped).
     pub refused: bool,
     pub frames: u64,
@@ -98,6 +106,27 @@ struct Shared {
 enum Cmd {
     Start(Box<RemoteJob>, RemoteDone),
     Purge,
+    /// This Mac's manifest for the server's preflight (CR7), for connection `generation`.
+    Manifest(u64, Value),
+    /// Files the project needs that the mirror hasn't confirmed uploaded, at `revision`.
+    Pending {
+        revision: u64,
+        count: usize,
+    },
+}
+
+/// Whether the server has every file and font the project needs (CR7 `cloud.preflight`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Preflight {
+    /// Not asked yet on this connection.
+    Unknown,
+    /// The manifest is being made, or the request is on its way (`id`).
+    Asking(Option<u64>),
+    Ok,
+    /// Something is missing there: ask again at `retry`.
+    Missing {
+        retry: Instant,
+    },
 }
 
 /// Viewer frames from a cloud frame server (see the module docs).
@@ -119,6 +148,12 @@ impl CloudFrames {
         let (tx, rx) = channel();
         let client = FrameClient::connect(addr, token, "effectcraft-app", Backoff::default());
         let link = Link {
+            me: tx.clone(),
+            preflight: Preflight::Unknown,
+            generation: 0,
+            uploads: None,
+            checking_uploads: false,
+            uploads_checked: None,
             shared: shared.clone(),
             client,
             remap,
@@ -220,6 +255,15 @@ struct Link {
     /// The echo that follows a whole project: (id, sent). The server holds the project once it
     /// comes back (the server handles a connection's messages in order).
     syncing: Option<(u64, Instant)>,
+    /// The link's own command channel (background checks report back through it).
+    me: Sender<Cmd>,
+    preflight: Preflight,
+    /// Bumps on every connection: a manifest made for an older one is not sent.
+    generation: u64,
+    /// Files waiting for the mirror at a revision: (revision, count).
+    uploads: Option<(u64, usize)>,
+    checking_uploads: bool,
+    uploads_checked: Option<Instant>,
 }
 
 /// Exponential smoothing (a quarter of each new sample).
@@ -267,11 +311,97 @@ impl Link {
                 }
             }
             Cmd::Start(job, done) => self.start(*job, done),
+            Cmd::Manifest(generation, manifest) => {
+                if generation != self.generation || !self.client.connected() || !matches!(self.preflight, Preflight::Asking(None)) {
+                    return;
+                }
+                let id = self.id();
+                let params = json!({"command": "cloud.preflight", "params": {"manifest": manifest}});
+                if self.client.send(Up::Control { id, method: "engine.execute".into(), params }, vec![]) {
+                    self.preflight = Preflight::Asking(Some(id));
+                } else {
+                    self.preflight = Preflight::Unknown;
+                }
+            }
+            Cmd::Pending { revision, count } => {
+                self.checking_uploads = false;
+                self.uploads = Some((revision, count));
+                self.status().pending_uploads = count;
+                self.update_slots();
+            }
         }
     }
 
+    /// Frames can go to the server: it holds this Mac's project and every file and font it needs,
+    /// and the mirror has nothing left to upload.
     fn ready(&self) -> bool {
-        self.client.connected() && self.syncing.is_none() && self.mirror.revision().is_some()
+        self.client.connected()
+            && self.syncing.is_none()
+            && self.mirror.revision().is_some()
+            && self.preflight == Preflight::Ok
+            && self.uploads.is_none_or(|(_, n)| n == 0)
+    }
+
+    /// Ask the server whether it has what the project needs: this Mac's manifest (made on a
+    /// thread of its own: it stats and hashes files) goes to `cloud.preflight` there.
+    fn ask_preflight(&mut self) {
+        let latest = self.shared.latest.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        let Some((_, project)) = latest else { return };
+        self.preflight = Preflight::Asking(None);
+        let (me, generation, remap) = (self.me.clone(), self.generation, self.remap.clone());
+        let spawned = std::thread::Builder::new().name("ec-cloud-manifest".into()).spawn(move || {
+            let project = remap_project(&project, remap.as_ref());
+            let m = effectcraft_engine::cloud_assets::manifest(&project, &|p| std::fs::read(p).ok(), effectcraft_engine::cloud_assets::Hash::Small);
+            let _ = me.send(Cmd::Manifest(generation, serde_json::to_value(m).unwrap_or(Value::Null)));
+        });
+        if spawned.is_err() {
+            self.preflight = Preflight::Unknown;
+        }
+    }
+
+    /// The server's `cloud.preflight` answer (`reply`: the control reply `{ok, result | error}`).
+    fn preflight_answer(&mut self, reply: &Value) {
+        let error = reply.get("error").and_then(Value::as_str).unwrap_or("");
+        let (ok, summary) = if reply.get("ok").and_then(Value::as_bool) == Some(true) {
+            let r = reply.get("result").cloned().unwrap_or(Value::Null);
+            (r.get("ok").and_then(Value::as_bool) != Some(false), r.get("summary").and_then(Value::as_str).map(str::to_string))
+        } else if error.contains("still starting") {
+            // Ask again shortly.
+            self.preflight = Preflight::Missing { retry: Instant::now() + Duration::from_secs(2) };
+            return self.update_slots();
+        } else {
+            // An older server (no `cloud.preflight`, no control host): it can't say; its own guard
+            // still refuses frames with missing files.
+            log::info!("cloud preview: no preflight on the server ({error})");
+            (true, None)
+        };
+        self.preflight = if ok { Preflight::Ok } else { Preflight::Missing { retry: Instant::now() + PREFLIGHT_RETRY } };
+        self.status().missing = if ok { None } else { Some(summary.unwrap_or_else(|| "files are missing on the cloud machine".into())) };
+        self.update_slots();
+    }
+
+    /// Ask (on a thread) which files the mirror still has to upload, when the project changed
+    /// or a few seconds passed.
+    fn check_uploads(&mut self) {
+        if self.checking_uploads || self.uploads_checked.is_some_and(|t| t.elapsed() < Duration::from_secs(2)) {
+            return;
+        }
+        let latest = self.shared.latest.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        let Some((revision, project)) = latest else { return };
+        if self.uploads.is_some_and(|(r, n)| r == revision && n == 0) && self.uploads_checked.is_some_and(|t| t.elapsed() < Duration::from_secs(10)) {
+            return;
+        }
+        self.checking_uploads = true;
+        self.uploads_checked = Some(Instant::now());
+        let me = self.me.clone();
+        let spawned = std::thread::Builder::new().name("ec-cloud-uploads".into()).spawn(move || {
+            let v = effectcraft_engine::cloud_assets::pending_uploads(&project, &|p| std::fs::read(p).ok());
+            let count = v.get("count").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let _ = me.send(Cmd::Pending { revision, count });
+        });
+        if spawned.is_err() {
+            self.checking_uploads = false;
+        }
     }
 
     fn start(&mut self, job: RemoteJob, done: RemoteDone) {
@@ -356,6 +486,8 @@ impl Link {
                 self.fail_all("reconnected");
                 self.ping = None;
                 self.syncing = None;
+                self.generation = self.generation.wrapping_add(1);
+                self.preflight = Preflight::Unknown;
                 self.resync();
             }
             Event::Disconnected { error } => self.lost(error),
@@ -371,6 +503,7 @@ impl Link {
     fn lost(&mut self, error: String) {
         self.mirror.reset();
         self.syncing = None;
+        self.preflight = Preflight::Unknown;
         self.ping = None;
         self.fail_all(&error);
         {
@@ -398,6 +531,8 @@ impl Link {
                 if self.syncing.is_some_and(|(s, _)| s == id) {
                     self.syncing = None;
                     self.ping = None;
+                    // The server holds the project: does it have its files? (Again after a resync.)
+                    self.ask_preflight();
                     self.update_slots();
                 } else if let Some((p, sent)) = self.ping
                     && p == id
@@ -455,6 +590,13 @@ impl Link {
                 }
                 FrameReply::Failed { id, error, .. } => {
                     self.refining.remove(&id);
+                    // The server's guard (CR7): files or fonts went missing there. Render here and
+                    // ask again soon.
+                    if let Some(what) = error.strip_prefix("missing on the cloud machine") {
+                        self.preflight = Preflight::Missing { retry: Instant::now() + PREFLIGHT_RETRY / 2 };
+                        self.status().missing = Some(what.trim_start_matches([':', ' ']).to_string());
+                        self.update_slots();
+                    }
                     self.fail(id, error);
                 }
                 FrameReply::Resync { error } => {
@@ -463,7 +605,12 @@ impl Link {
                 }
                 FrameReply::Stored { .. } | FrameReply::Info { .. } => {}
             },
-            Down::Welcome { .. } | Down::Refused { .. } | Down::Control { .. } => {}
+            Down::Control { id, reply } => {
+                if self.preflight == Preflight::Asking(Some(id)) {
+                    self.preflight_answer(&reply);
+                }
+            }
+            Down::Welcome { .. } | Down::Refused { .. } => {}
         }
     }
 
@@ -492,6 +639,14 @@ impl Link {
         // Connected before the app offered a project: send it once there is one.
         if self.mirror.revision().is_none() && self.syncing.is_none() {
             self.resync();
+        }
+        if self.syncing.is_none() && self.mirror.revision().is_some() {
+            if let Preflight::Missing { retry } = self.preflight
+                && Instant::now() >= retry
+            {
+                self.ask_preflight();
+            }
+            self.check_uploads();
         }
         // A silent link (a sleeping laptop, a stalled tunnel) never reports an error: an echo
         // or a whole project that doesn't come back means it is dead. While a whole project is
@@ -597,6 +752,8 @@ pub struct CloudPreview {
     was_ready: bool,
     /// The viewer's frames go to this client now (the app set it as the remote renderer).
     pub installed: bool,
+    /// Why the cloud waits, as last noted (missing files, uploads), so it is noted once.
+    waiting_for: Option<String>,
 }
 
 /// What [`CloudPreview::tick`] follows.
@@ -682,6 +839,20 @@ impl CloudPreview {
             }
             self.was_ready = ready;
         }
+        // Connected but held back by missing files or uploads (CR7): say why, once.
+        let waiting = (!ready && status.connected)
+            .then(|| match (&status.missing, status.pending_uploads) {
+                (Some(m), _) => Some(format!("Cloud preview waits for the cloud machine: {m} — previewing on this Mac")),
+                (None, n) if n > 0 => Some(format!("Cloud preview waits for {n} uploads — previewing on this Mac")),
+                _ => None,
+            })
+            .flatten();
+        if waiting != self.waiting_for {
+            if waiting.is_some() {
+                note = waiting.clone();
+            }
+            self.waiting_for = waiting;
+        }
         self.source = Some(if use_cloud { Source::Cloud } else { Source::Mac });
         (use_cloud.then_some(client), note)
     }
@@ -736,6 +907,8 @@ mod tests {
         stall: Arc<AtomicBool>,
         renders: Arc<AtomicUsize>,
         streams: Arc<Mutex<Vec<std::net::TcpStream>>>,
+        /// What `cloud.preflight` says is missing (`None`: nothing).
+        missing: Arc<Mutex<Option<String>>>,
     }
 
     impl FakeServer {
@@ -747,6 +920,8 @@ mod tests {
             let (kill, stall, renders, streams) =
                 (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicUsize::new(0)), Arc::new(Mutex::new(vec![])));
             let (k, st, r, ss) = (kill.clone(), stall.clone(), renders.clone(), streams.clone());
+            let missing: Arc<Mutex<Option<String>>> = Arc::default();
+            let mi = missing.clone();
             std::thread::spawn(move || {
                 while !k.load(Ordering::Acquire) {
                     let Ok((stream, _)) = listener.accept() else {
@@ -755,7 +930,7 @@ mod tests {
                     };
                     stream.set_nonblocking(false).unwrap();
                     ss.lock().unwrap().push(stream.try_clone().unwrap());
-                    let (st, r) = (st.clone(), r.clone());
+                    let (st, r, mi) = (st.clone(), r.clone(), mi.clone());
                     std::thread::spawn(move || {
                         let (mut rd, mut wr) = (stream.try_clone().unwrap(), stream);
                         let Ok((Up::Hello { token: t, .. }, _)) = read_frame::<Up>(&mut rd, MAX_PART) else { return };
@@ -768,6 +943,11 @@ mod tests {
                         while let Ok((up, _)) = read_frame::<Up>(&mut rd, MAX_PART) {
                             let reply = match up {
                                 Up::Echo { id } => (Down::Echo { id }, vec![]),
+                                Up::Control { id, .. } => {
+                                    let summary = mi.lock().unwrap().clone();
+                                    let reply = json!({"ok": true, "result": {"ok": summary.is_none(), "summary": summary.unwrap_or_default()}});
+                                    (Down::Control { id, reply }, vec![])
+                                }
                                 Up::Msg { msg: FrameMsg::Render { id, .. }, .. } if !st.load(Ordering::Acquire) => {
                                     r.fetch_add(1, Ordering::AcqRel);
                                     let rgba: Vec<u8> = [255u8, 0, 0, 255].repeat(32 * 18);
@@ -794,7 +974,7 @@ mod tests {
                     });
                 }
             });
-            FakeServer { addr, kill, stall, renders, streams }
+            FakeServer { addr, kill, stall, renders, streams, missing }
         }
 
         /// Pull the tunnel: every connection drops and nothing answers on the port again.
@@ -883,5 +1063,34 @@ mod tests {
             assert!(!red(&frames, &key(f)), "frame {f} rendered on this Mac");
         }
         assert_eq!(server.renders.load(Ordering::Acquire), 1, "nothing more went to the cloud");
+    }
+
+    /// CR7: while the cloud machine lacks a file or font, frames render here and the status
+    /// says what is missing; once it has them, frames go to the cloud.
+    #[test]
+    fn missing_files_on_the_cloud_keep_the_preview_here() {
+        let server = FakeServer::start("secret");
+        *server.missing.lock().unwrap() = Some("1 missing: font “X”".into());
+        let cloud = CloudFrames::connect(&server.addr, "secret", None);
+        let mut s = effectcraft_engine::Session::default();
+        s.execute("comp.new", serde_json::json!({"width": 32, "height": 18, "duration": 1})).unwrap();
+        cloud.offer(s.revision, &s.project);
+        wait_until("the preflight answer", || cloud.status().missing.is_some());
+        assert!(!cloud.ready(), "not ready while something is missing there");
+        assert_eq!(cloud.status().missing.as_deref(), Some("1 missing: font “X”"));
+        let mut preview = CloudPreview::default();
+        let now = Now { mode: "cloud", address: &server.addr, token: "secret", revision: s.revision, project: &s.project, comp: None, last_ms: 0.0 };
+        // (A preview of its own: it connects on its own and gets the same answer.)
+        let mut note = None;
+        wait_until("the waiting note", || {
+            let (remote, n) = preview.tick(&now);
+            assert!(remote.is_none());
+            note = n.or(note.take());
+            note.as_deref().is_some_and(|n| n.contains("1 missing"))
+        });
+        // The mirror uploads it: the next preflight says ok.
+        *server.missing.lock().unwrap() = None;
+        wait_until("the cloud to be ready", || cloud.ready());
+        assert!(cloud.status().missing.is_none());
     }
 }
