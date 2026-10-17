@@ -52,6 +52,7 @@
 use std::io::Write;
 
 mod asset_guard;
+mod drive;
 mod figma_bridge;
 mod frame_serve;
 mod mirror;
@@ -245,6 +246,9 @@ const VALUED: &[&str] = &[
     "--remote-cli",
     "--env-file",
     "--watch",
+    "--jobs",
+    "--upload",
+    "--upload-limit-mb",
     // mcp
     "--automation-read-root",
     "--automation-write-root",
@@ -973,6 +977,7 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
         }
         "frames-bench" => frame_serve::bench(args)?,
         "mirror" => mirror::run(args, json_out)?,
+        "drive-pull" => drive::run(args)?,
         other => return usage_err(&format!("unknown subcommand `{other}`")),
     }
     Ok(())
