@@ -94,6 +94,34 @@ fn set_first_vertex_and_free_transform() {
     assert!(s.execute("path.freeTransform", json!({})).is_err());
 }
 
+/// The viewer's Free Transform box sends a general matrix (scale along a rotated box's axes), and
+/// every step of one drag shares a `merge` key: the whole drag is one undo step, and a path with a
+/// stopwatch gets a key at the current time.
+#[test]
+fn free_transform_matrix_merges_into_one_undo_step() {
+    let mut s = comp();
+    let (l, m) = masked(&mut s);
+    s.state.selected_vertices.clear();
+    let before = mask_path(&s, l, m);
+    // Mirror X about x = 200 (a = -1, e = 400), then move 5 down, as two steps of one drag.
+    s.execute("path.freeTransform", json!({"layer": l, "mask": m, "matrix": [-1, 0, 0, 1, 400, 0], "merge": "ft-1"})).unwrap();
+    s.execute("path.freeTransform", json!({"layer": l, "mask": m, "offset": [0, 5], "merge": "ft-1"})).unwrap();
+    let p = mask_path(&s, l, m);
+    assert_eq!(p.vertices[0], [300.0, 105.0]);
+    assert_eq!(p.vertices[1], [100.0, 105.0]);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(mask_path(&s, l, m), before, "one undo step undoes the whole drag");
+    assert!(s.execute("path.freeTransform", json!({"layer": l, "mask": m, "matrix": [1, 0, 0]})).is_err());
+    // With the stopwatch on, the drag keys the path at the current time.
+    let g = layer(&s, l).masks().unwrap().find_group(m).unwrap().get("path").unwrap().uid;
+    s.execute("prop.toggleAnimation", json!({"layer": l, "prop": g, "value": true})).unwrap();
+    s.execute("time.set", json!({"time": 1.0})).unwrap();
+    s.execute("path.freeTransform", json!({"layer": l, "mask": m, "offset": [10, 0]})).unwrap();
+    let ly = layer(&s, l);
+    let pr = ly.masks().unwrap().find_group(m).unwrap().get("path").unwrap();
+    assert_eq!(pr.keys.len(), 2, "a key at 1 s next to the first one");
+}
+
 #[test]
 fn group_and_ungroup_shapes() {
     let mut s = comp();

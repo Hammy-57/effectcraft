@@ -12,6 +12,7 @@ use crate::state::Resolution;
 pub(crate) fn handlers() -> &'static [Handler] {
     const H: &[Handler] = &[
         Handler::ui_prefix("viewer.nudge.", nudge_cmd),
+        Handler::ui("viewer.freeTransform", free_transform),
         Handler::ui("view.theme.toggle", theme_toggle),
         Handler::ui_prefix("view.theme.", theme),
         Handler::ui("view.fit", fit),
@@ -75,6 +76,48 @@ fn nudge(app: &mut EffectcraftApp, ctx: &egui::Context, dir: &str) -> Result<Val
         return crate::panels::viewer::move_path_vertices(app, ctx, [x * k, y * k], None);
     }
     run_engine(app, ctx, "layer.nudge", json!({"x": x * k, "y": y * k}))
+}
+
+/// The path Free Transform Points would work on: the one with selected points, else a selected
+/// mask or shape path (the Timeline selection).
+pub(crate) fn free_transform_target(app: &EffectcraftApp) -> Option<(u64, u64)> {
+    let st = &app.session.state;
+    if let Some(v) = st.selected_vertices.first() {
+        return Some((v.layer.0, v.mask));
+    }
+    let comp = app.session.active_comp()?;
+    st.selected_props
+        .iter()
+        .find(|(l, uid)| comp.layer(*l).and_then(|l| l.props.find_group(*uid)).and_then(|g| g.get("path")).is_some_and(|p| p.value.as_path().is_some()))
+        .map(|(l, uid)| (l.0, *uid))
+}
+
+/// Free Transform Points in the viewer (`viewer.freeTransform`): with no params, start it on the
+/// path whose points (or mask) are selected, as Cmd+T does in After Effects; `{layer, path}`
+/// starts it on that path; `{end: true}` ends it; `angle` (degrees) turns the box and `anchor`
+/// ([u, v], box coordinates, `[0.5, 0.5]` the centre) moves its anchor point. Returns the state.
+fn free_transform(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, p: Value) -> Result<Value, String> {
+    use crate::panels::viewer_overlays as ov;
+    if p.get("end").and_then(Value::as_bool) == Some(true) {
+        ov::end_free_transform(app);
+        return Ok(json!({"freeTransform": null}));
+    }
+    let given = p.get("layer").and_then(Value::as_u64).zip(p.get("path").and_then(Value::as_u64));
+    let start = match given {
+        Some(t) => Some(t),
+        None if app.ui.viewer.free_transform.is_none() || (p.get("angle").is_none() && p.get("anchor").is_none()) => {
+            Some(free_transform_target(app).ok_or("Select points of a mask or shape path first")?)
+        }
+        None => None,
+    };
+    if let Some((layer, path)) = start
+        && ov::free_transform_target(app) != Some((effectcraft_engine::project::LayerId(layer), path))
+    {
+        ov::begin_free_transform(app, effectcraft_engine::project::LayerId(layer), path);
+    }
+    let anchor = p.get("anchor").and_then(Value::as_array).and_then(|a| Some([a.first()?.as_f64()?, a.get(1)?.as_f64()?]));
+    ov::set_free_transform(app, p.get("angle").and_then(Value::as_f64), anchor);
+    serde_json::to_value(&app.ui.viewer.free_transform).map(|v| json!({"freeTransform": v})).map_err(|e| e.to_string())
 }
 
 /// View ▸ Next Appearance Mode: Dark ↔ Light.
