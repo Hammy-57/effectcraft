@@ -186,7 +186,7 @@ fn an_adaptive_stream_warms_up_at_quarter_then_half_size_then_goes_full_size_bef
     // The first chunk at quarter size, the second at half; the rest (and the warm-up chunks
     // again, once the window is full: nothing plays yet) at full size.
     let warm: Vec<(i64, u32)> = sizes.iter().filter(|c| c.2 < 1.0).map(|c| (c.0, c.1)).collect();
-    assert_eq!(warm, vec![(0, 16), (15, 32)], "quarter, then half: {sizes:?}");
+    assert_eq!(warm, vec![(0, 14), (15, 32)], "quarter (16×9 fits as 14×8: even sizes), then half: {sizes:?}");
     let full: std::collections::BTreeSet<i64> = sizes.iter().filter(|c| c.2 == 1.0).map(|c| c.0).collect();
     assert_eq!(full.into_iter().collect::<Vec<_>>(), vec![0, 15, 30, 45, 60, 75], "{sizes:?}");
 }
