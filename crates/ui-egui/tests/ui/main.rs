@@ -127,6 +127,8 @@ mod ui_properties;
 mod ui_ram_preview;
 #[path = "../ui_render_queue.rs"]
 mod ui_render_queue;
+#[path = "../ui_render_time.rs"]
+mod ui_render_time;
 #[path = "../ui_script_console.rs"]
 mod ui_script_console;
 #[path = "../ui_scriptui.rs"]

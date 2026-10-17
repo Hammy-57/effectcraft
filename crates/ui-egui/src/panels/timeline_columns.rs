@@ -2,7 +2,7 @@
 //! right-click ▸ Columns, Hide This), their left-to-right order (drag a header), their widths
 //! (drag the divider right of a header; the icon columns keep a fixed width), the splitter
 //! between the outline and the time graph, the footer's pane buttons (Layer Switches, Transfer
-//! Controls, In/Out/Duration/Stretch) and Toggle Switches / Modes. The layout is kept in the
+//! Controls, In/Out/Duration/Stretch, Render Time) and Toggle Switches / Modes. The layout is kept in the
 //! settings store ([`LAYOUT_FILE`]) and comes back on the next launch.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -32,7 +32,7 @@ pub const MIN_GRAPH_W: f32 = 120.0;
 
 /// The Timeline's columns in After Effects' default left-to-right order: (id, header label).
 /// Right-click a column header to show or hide them; the name column is always shown.
-pub const COLUMNS: [(&str, &str); 13] = [
+pub const COLUMNS: [(&str, &str); 14] = [
     ("av", "A/V Features"),
     ("keys", "Keys"),
     ("label", "Label"),
@@ -46,10 +46,12 @@ pub const COLUMNS: [(&str, &str); 13] = [
     ("out", "Out"),
     ("duration", "Duration"),
     ("stretch", "Stretch"),
+    ("renderTime", "Render Time"),
 ];
 
 /// The column header context menu's Columns submenu, in After Effects' order.
-pub const COLUMNS_MENU: [&str; 13] = ["av", "label", "num", "name", "comment", "switches", "modes", "parent", "keys", "in", "out", "duration", "stretch"];
+pub const COLUMNS_MENU: [&str; 14] =
+    ["av", "label", "num", "name", "comment", "switches", "modes", "parent", "keys", "in", "out", "duration", "stretch", "renderTime"];
 
 /// The columns the In/Out/Duration/Stretch pane button shows and hides together.
 const IN_OUT_PANE: [&str; 4] = ["in", "out", "duration", "stretch"];
@@ -105,6 +107,7 @@ fn resizable(id: &str) -> Option<(f32, f32)> {
         "parent" => (116.0, 70.0),
         "in" | "out" | "duration" => (72.0, 50.0),
         "stretch" => (60.0, 44.0),
+        "renderTime" => (120.0, 60.0),
         _ => return None,
     })
 }
@@ -220,6 +223,7 @@ pub(super) struct Vis {
     pub out: bool,
     pub duration: bool,
     pub stretch: bool,
+    pub render_time: bool,
 }
 
 impl Vis {
@@ -238,6 +242,7 @@ impl Vis {
             out: v("out"),
             duration: v("duration"),
             stretch: v("stretch"),
+            render_time: v("renderTime"),
         }
     }
 }
@@ -268,6 +273,8 @@ pub(super) struct Cols {
     pub duration_w: f32,
     pub stretch: f32,
     pub stretch_w: f32,
+    pub render_time: f32,
+    pub render_time_w: f32,
     /// End of the last visible column.
     pub end: f32,
     /// Where property rows put their values and controls: past the name column (and a Comment
@@ -332,6 +339,8 @@ pub(super) fn cols(x0: f32, tl: &TimelineState) -> Cols {
         duration_w: w("duration"),
         stretch: x_of("stretch"),
         stretch_w: w("stretch"),
+        render_time: x_of("renderTime"),
+        render_time_w: w("renderTime"),
         end: x,
         vx,
         spans,
@@ -418,6 +427,7 @@ pub(super) fn header(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Pain
         (vis.out, "out", cw.out, "Out"),
         (vis.duration, "duration", cw.duration, "Duration"),
         (vis.stretch, "stretch", cw.stretch, "Stretch"),
+        (vis.render_time, "renderTime", cw.render_time, "Render Time"),
     ] {
         if on {
             htext(x + 6.0, room(id, 6.0), s);
@@ -555,14 +565,16 @@ pub(super) fn splitter(app: &mut EffectcraftApp, ui: &mut egui::Ui, x: f32, y0: 
 }
 
 /// The footer's pane buttons (After Effects' lower-left corner): Layer Switches, Transfer
-/// Controls (Modes) and In/Out/Duration/Stretch. Returns where the next footer item goes.
+/// Controls (Modes), In/Out/Duration/Stretch and Render Time. Returns where the next footer item
+/// goes.
 pub(super) fn pane_buttons(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, footer: Rect) -> f32 {
     let t = app.tokens;
     let mut x = footer.min.x + 6.0;
-    let panes: [(&str, &str, bool); 3] = [
+    let panes: [(&str, &str, bool); 4] = [
         ("switches", "Expand or Collapse the Layer Switches pane", column_visible(&app.ui.timeline, "switches")),
         ("modes", "Expand or Collapse the Transfer Controls pane", app.ui.timeline.show_modes),
         ("inOut", "Expand or Collapse the In/Out/Duration/Stretch panes", IN_OUT_PANE.iter().any(|c| column_visible(&app.ui.timeline, c))),
+        ("renderTime", "Expand or Collapse the Render Time pane", column_visible(&app.ui.timeline, "renderTime")),
     ];
     for (id, tip, on) in panes {
         let r = Rect::from_min_size(pos2(x, footer.center().y - 9.0), vec2(18.0, 18.0));
@@ -580,6 +592,9 @@ pub(super) fn pane_buttons(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui
                     let _ = set_column(tl, "switches", !on);
                 }
                 "modes" => tl.show_modes = !on,
+                "renderTime" => {
+                    let _ = set_column(tl, "renderTime", !on);
+                }
                 _ => toggle_in_out_pane(tl),
             }
         }
@@ -588,8 +603,8 @@ pub(super) fn pane_buttons(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui
     x + 6.0
 }
 
-/// Small code-drawn pane icons: a row of switch wells, two overlapping blend discs, and the
-/// in/out brackets.
+/// Small code-drawn pane icons: a row of switch wells, two overlapping blend discs, the in/out
+/// brackets and a stopwatch.
 fn pane_glyph(p: &egui::Painter, r: Rect, id: &str, col: Color32) {
     let s = Stroke::new(1.0, col);
     match id {
@@ -602,6 +617,12 @@ fn pane_glyph(p: &egui::Painter, r: Rect, id: &str, col: Color32) {
         "modes" => {
             p.circle_stroke(pos2(r.center().x - 2.0, r.center().y), 3.5, s);
             p.circle_stroke(pos2(r.center().x + 2.0, r.center().y), 3.5, s);
+        }
+        "renderTime" => {
+            let c = pos2(r.center().x, r.center().y + 1.0);
+            p.circle_stroke(c, 4.5, s);
+            p.line_segment([c, pos2(c.x + 2.0, c.y - 2.5)], s);
+            p.line_segment([pos2(c.x - 1.5, r.min.y), pos2(c.x + 1.5, r.min.y)], s);
         }
         _ => {
             let (y0, y1) = (r.min.y + 1.0, r.max.y - 1.0);

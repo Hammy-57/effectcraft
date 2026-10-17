@@ -1340,6 +1340,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     app.ui.timeline.outline_scroll = app.ui.timeline.outline_scroll.clamp(0.0, overflow);
     let oscroll = app.ui.timeline.outline_scroll;
     let cw = cols(rect.min.x - oscroll, &app.ui.timeline);
+    // The viewer frame's render times (Render Time pane, footer).
+    let shown_times = shown_times(app, cid);
     let graph_x0 = rect.min.x + left_w + 1.0;
     let graph_x1 = rect.max.x - GUTTER_W;
     ctx.data_mut(|d| d.insert_temp(egui::Id::new("timeline-graph-area"), (graph_x0, graph_x1 - graph_x0)));
@@ -1892,7 +1894,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 if vis.num {
                     lp.text(pos2(cw.num + 13.0, cy), Align2::CENTER_CENTER, format!("{}", idx_of(layer.id)), Tokens::ui(11.5), t.text_dim);
                 }
-                layer_cells(app, ui, &lp, &cw, &comp, layer, r, cy, &mut actions);
+                layer_cells(app, ui, &lp, &cw, &comp, layer, r, cy, shown_times.as_ref(), &mut actions);
                 // Row click → select; double-click → rename; drag → reorder. Registered before the
                 // twirl and the name field so those sit on top and get their clicks.
                 let row_x0 = if vis.num && cw.num < cw.name { cw.num } else { cw.name + 16.0 };
@@ -3190,7 +3192,9 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     if tresp.clicked() {
         super::timeline_columns::toggle_switches_modes(&mut app.ui.timeline);
     }
-    let ms = app.frames.last_ms.lock().map(|v| *v).unwrap_or(0.0);
+    // The frame in the viewer's own time (kept with it while it is cached, as in After Effects),
+    // else the last viewer frame's.
+    let ms = shown_times.as_ref().map(|s| s.frame.frame_ms).unwrap_or_else(|| app.frames.last_ms.lock().map(|v| *v).unwrap_or(0.0));
     p.text(
         pos2(graph_x0 - 12.0, footer.center().y),
         Align2::RIGHT_CENTER,
@@ -3432,8 +3436,38 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     }
 }
 
+/// The render times of the frame in the viewer for the Timeline's comp `comp` (the viewer's comp,
+/// or a comp nested in it), and the slowest of its layers, which the Render Time pane's bars are
+/// scaled to.
+pub(super) struct ShownTimes {
+    pub frame: std::sync::Arc<crate::frames::times::FrameTimes>,
+    pub comp: ItemId,
+    pub slowest: f64,
+}
+
+impl ShownTimes {
+    /// The time `layer` took on the frame.
+    pub fn layer(&self, layer: LayerId) -> Option<f64> {
+        self.frame.layer(self.comp, layer)
+    }
+}
+
+/// [`ShownTimes`] of the frame the viewer shows, if it rendered lately.
+fn shown_times(app: &EffectcraftApp, comp: ItemId) -> Option<ShownTimes> {
+    let key = app.viewer_shown.as_ref()?.1;
+    let frame = app.frames.times.get(&key)?;
+    let slowest = frame.layers.iter().filter(|((c, _), _)| *c == comp).map(|(_, ms)| *ms).fold(0.0, f64::max);
+    Some(ShownTimes { frame, comp, slowest })
+}
+
+/// A Render Time pane time, as After Effects writes it ("272ms"), with a tenth below 10 ms.
+pub(super) fn render_time_label(ms: f64) -> String {
+    if ms < 10.0 { format!("{ms:.1}ms") } else { format!("{ms:.0}ms") }
+}
+
 /// The optional per-layer cells: Comment (double-click to edit), In / Out / Duration (drag to
-/// change by frames), Stretch (click: Time Stretch dialog).
+/// change by frames), Stretch (click: Time Stretch dialog), Render Time (the layer's time on the
+/// viewer's frame: a bar scaled to the comp's slowest layer, green to red, and the ms).
 #[allow(clippy::too_many_arguments)]
 fn layer_cells(
     app: &mut EffectcraftApp,
@@ -3444,11 +3478,32 @@ fn layer_cells(
     layer: &Layer,
     r: Rect,
     cy: f32,
+    times: Option<&ShownTimes>,
     actions: &mut Vec<(String, serde_json::Value)>,
 ) {
     let t = app.tokens;
     let ctx = ui.ctx().clone();
     let lid = layer.id.0;
+    if cw.vis.render_time
+        && let Some(times) = times
+        && let Some(ms) = times.layer(layer.id)
+    {
+        let cr = Rect::from_min_max(pos2(cw.render_time + 4.0, r.min.y + 4.0), pos2(cw.render_time + cw.render_time_w - 4.0, r.max.y - 4.0));
+        let label = render_time_label(ms);
+        let share = if times.slowest > 0.0 { (ms / times.slowest).clamp(0.0, 1.0) as f32 } else { 0.0 };
+        let bar_w = (cr.width() - 46.0).max(0.0) * share;
+        let colour = if share < 1.0 / 3.0 {
+            t.cache_green
+        } else if share < 2.0 / 3.0 {
+            t.warning
+        } else {
+            t.danger
+        };
+        let cp = lp.with_clip_rect(cr.intersect(lp.clip_rect()));
+        cp.rect_filled(Rect::from_min_size(cr.min, vec2(bar_w.max(1.0), cr.height())), 1.0, colour.gamma_multiply(0.85));
+        cp.text(pos2(cr.max.x, cy), Align2::RIGHT_CENTER, &label, Tokens::mono(11.0), t.text_dim);
+        app.auto.add(&format!("timeline.layer.{lid}.renderTime"), cr, &label);
+    }
     if cw.vis.comment {
         let cr = Rect::from_min_max(pos2(cw.comment + 4.0, r.min.y + 1.0), pos2(cw.comment + cw.comment_w - 4.0, r.max.y - 1.0));
         let edit_id = egui::Id::new("tl-comment-edit");
