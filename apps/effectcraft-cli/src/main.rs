@@ -163,6 +163,10 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
   stream-bench [F.ecproj | --demo] [--comp C] [--start SECS] [--n FRAMES] [--gpu] [--scale S]
                                            render consecutive frames of a comp and time the playback
                                            stream's H.264 chunk encoding (sizes, threads, bitrate)
+  stream-test --frames HOST:PORT [--token T] [F.ecproj | --demo] [--comp C] [--start SECS] [--duration SECS]
+      [--edit-at SECS] [--scale S] [--max-side PX] [--fixed]
+                                           play a comp from a frame server's playback stream: warm-up, each
+                                           chunk against its deadline, bitrate, stalls; --edit-at changes a layer
   figma-bridge [--port 7789] [--control 9877] [--code CODE]
                                            local endpoint for the EffectCraft Figma plug-in: imports what it
                                            sends into the running app (file.importFigma); prints the pairing code
@@ -205,6 +209,7 @@ const VALUED: &[&str] = &[
     "--frames",
     "--token",
     "--duration",
+    "--edit-at",
     // compare
     "--threshold",
     "--min-psnr",
@@ -250,6 +255,7 @@ const FLAGS: &[&str] = &[
     "--demo",
     "--empty",
     "--gpu",
+    "--fixed",
     "--list",
     "--schemas",
     "--enabled",
@@ -957,6 +963,7 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
         }
         "frames-bench" => frame_serve::bench(args)?,
         "stream-bench" => stream_cli::bench(args)?,
+        "stream-test" => stream_cli::test(args)?,
         other => return usage_err(&format!("unknown subcommand `{other}`")),
     }
     Ok(())
