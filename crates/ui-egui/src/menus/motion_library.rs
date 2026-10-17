@@ -15,6 +15,7 @@ pub(crate) fn handlers() -> &'static [Handler] {
         Handler::ui("motionLibrary.copyName", copy_name),
         Handler::ui("motionLibrary.save", save),
         Handler::ui("motionLibrary.folder", folder),
+        Handler::ui("motionLibrary.saveSelection", save_selection),
     ];
     H
 }
@@ -37,6 +38,10 @@ fn copy_name(app: &mut EffectcraftApp, ctx: &egui::Context, _id: &str, params: V
 
 fn folder(app: &mut EffectcraftApp, ctx: &egui::Context, _id: &str, params: Value) -> Result<Value, String> {
     crate::panels::motion_library::folder_command(app, ctx, &params)
+}
+
+fn save_selection(app: &mut EffectcraftApp, ctx: &egui::Context, _id: &str, params: Value) -> Result<Value, String> {
+    crate::panels::motion_library::save_selection_command(app, ctx, &params)
 }
 
 fn save(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, params: Value) -> Result<Value, String> {

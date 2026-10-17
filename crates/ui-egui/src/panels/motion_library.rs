@@ -75,6 +75,11 @@ pub struct ViewState {
     /// A collection folder dialog (new, rename, delete).
     #[serde(skip)]
     pub folder_ask: Option<FolderAsk>,
+    /// Save to Motion Library: the card's name and what to save (`layers`, `comp`, `preset`).
+    #[serde(skip)]
+    pub save_name: String,
+    #[serde(skip)]
+    pub save_kind: String,
 }
 
 /// A save to confirm: the card, the upload's size and what stays home.
@@ -108,6 +113,8 @@ impl Default for ViewState {
             saving: None,
             confirm_save: None,
             folder_ask: None,
+            save_name: String::new(),
+            save_kind: String::new(),
         }
     }
 }
@@ -1002,18 +1009,102 @@ fn filters_body(app: &mut EffectcraftApp, ui: &mut egui::Ui, r: Rect, view: &mut
 }
 
 /// + Save: where cards come from.
-fn save_body(app: &mut EffectcraftApp, ui: &mut egui::Ui, r: Rect, s: f32) {
+/// What "Save to Motion Library" can save from the open project.
+const SAVE_KINDS: [(&str, &str, &str); 3] = [
+    ("layers", "Layers", "The selected layers (with their parents and mattes), editable"),
+    ("comp", "Comp", "The whole open composition and everything it uses"),
+    ("preset", "Preset", "The selected layer's effects and animation, to apply to other layers"),
+];
+
+/// Save to Motion Library: a name, what to save (selected layers, the comp, a preset) and the
+/// collection open in the tree; the card lands in the local library with its preview.
+fn save_body(app: &mut EffectcraftApp, ui: &mut egui::Ui, r: Rect, view: &mut ViewState, s: f32) -> Option<(&'static str, Value)> {
     let t = app.tokens;
-    ui.painter().text(pos2(r.min.x + 12.0 * s, r.min.y + 16.0 * s), Align2::LEFT_CENTER, tr("Save to Motion Library"), Tokens::semibold(12.0 * s), t.text);
-    let text = tr(
-        "Cards are saved in the Motion Library panel in After Effects on the Mac and published with publish-motion-library.sh; this panel then shows Library updated.",
-    );
-    let galley = ui.painter().layout(text.to_string(), Tokens::ui(11.0 * s), t.text_dim, r.width() - 24.0 * s);
-    let h = galley.size().y;
-    ui.painter().galley(pos2(r.min.x + 12.0 * s, r.min.y + 30.0 * s), galley, t.text_dim);
-    if pop_row(app, ui, r, r.min.y + 38.0 * s + h, "motionLibrary.save.check", "Check for new cards", s) {
-        kit::exec(app, "library.sync", json!({"wait": false}));
+    let p = ui.painter().clone();
+    p.text(pos2(r.min.x + 12.0 * s, r.min.y + 16.0 * s), Align2::LEFT_CENTER, tr("Save to Motion Library"), Tokens::semibold(12.0 * s), t.text);
+    let x0 = r.min.x + 12.0 * s;
+    let w = r.width() - 24.0 * s;
+    let field = Rect::from_min_size(pos2(x0, r.min.y + 32.0 * s), vec2(w, 24.0 * s));
+    let resp = ui.put(field, egui::TextEdit::singleline(&mut view.save_name).hint_text(tr("Card name")));
+    app.auto.add_response("motionLibrary.save.name", &resp, "Card name");
+    if view.save_kind.is_empty() {
+        view.save_kind = "layers".into();
     }
+    let bw = (w - 8.0 * s) / 3.0;
+    for (i, (key, label, _tip)) in SAVE_KINDS.iter().enumerate() {
+        let b = Rect::from_min_size(pos2(x0 + i as f32 * (bw + 4.0 * s), field.max.y + 8.0 * s), vec2(bw, 24.0 * s));
+        if kit::button(app, ui, b, &format!("motionLibrary.save.kind.{key}"), label, view.save_kind == *key) {
+            view.save_kind = key.to_string();
+        }
+    }
+    let folder = if view.folder.is_empty() { "My motion".to_string() } else { view.folder.clone() };
+    let into_y = field.max.y + 46.0 * s;
+    let into = format!("{} {folder}", tr("Into:"));
+    let shown = elide(&p, &into, &Tokens::ui(11.0 * s), w);
+    p.text(pos2(x0, into_y), Align2::LEFT_CENTER, &shown, Tokens::ui(11.0 * s), t.text_dim);
+    let save = Rect::from_min_size(pos2(r.max.x - 12.0 * s - 90.0 * s, into_y + 12.0 * s), vec2(90.0 * s, 24.0 * s));
+    let name = view.save_name.trim().to_string();
+    let enter = resp.lost_focus() && ui.ctx().input(|i| i.key_pressed(egui::Key::Enter));
+    if (kit::button(app, ui, save, "motionLibrary.save.go", "Save", true) || enter) && !name.is_empty() {
+        view.popover.clear();
+        view.save_name.clear();
+        return Some(("motionLibrary.saveSelection", json!({"kind": view.save_kind, "name": name, "category": folder})));
+    }
+    None
+}
+
+/// Wait (up to 2 min) for a new card's preview, which renders in a job of its own, so the
+/// rebuilt index has its preview and poster.
+fn wait_for_preview(id: &str) {
+    if id.is_empty() || id.contains(['/', '.']) {
+        return;
+    }
+    let root = std::env::var_os("ELIAS_MOTION_LIBRARY")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join("Documents/Elias Motion Library")));
+    let Some(dir) = root.map(|r| r.join("previews").join(id)) else { return };
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_secs(120) {
+        if dir.join("preview.mp4").is_file() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+}
+
+/// `motionLibrary.saveSelection`: save the selected layers (`kind` layers), the open comp (comp)
+/// or the selected layer's effects and animation (preset) as a card `name` in collection
+/// `category` of the local library (the Motion Library's EffectCraft plug, which reads the
+/// project through this app's control port). It runs in the background; the status line says how
+/// it went and the card shows once the library index is rebuilt.
+pub fn save_selection_command(app: &mut EffectcraftApp, ctx: &egui::Context, params: &Value) -> Result<Value, String> {
+    let name = params.get("name").and_then(Value::as_str).map(str::trim).unwrap_or_default().to_string();
+    if name.is_empty() {
+        return Err("missing `name` (the card's name)".into());
+    }
+    let category = params.get("category").and_then(Value::as_str).map(|c| c.trim_matches('/')).filter(|c| !c.is_empty()).unwrap_or("My motion").to_string();
+    let kind = params.get("kind").and_then(Value::as_str).unwrap_or("layers");
+    let (op, args): (&'static str, Value) = match kind {
+        "layers" => ("save_layers", json!({"name": name, "category": category, "preview_mode": "selected"})),
+        "comp" => ("save", json!({"name": name, "category": category, "composition_selection": "all"})),
+        "preset" => ("save_asset", json!({"kind": "preset", "name": name, "category": category})),
+        other => return Err(format!("unknown kind `{other}` (layers, comp or preset)")),
+    };
+    let scripting = &app.session.prefs.scripting;
+    let port = std::env::var("EFFECTCRAFT_CONTROL_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .or_else(|| scripting.agent_control.then(|| u16::try_from(scripting.agent_control_port).ok()).flatten())
+        .ok_or("saving reads the project through the control channel: turn on Settings ▸ Scripting ▸ Let Agents Control EffectCraft")?;
+    app.ui.status = format!("Saving “{name}” to the Motion Library…");
+    let done = format!("Saved “{name}” to {category}");
+    let save = move || {
+        let r = ml_rpc("effectcraft_plug.py", &[], Some(port), op, args)?;
+        wait_for_preview(r.get("id").and_then(Value::as_str).unwrap_or_default());
+        Ok(r)
+    };
+    spawn_ml_op(ctx, save, FolderChange::Created(category.clone()), done);
+    Ok(json!({"saving": name, "category": category, "kind": kind}))
 }
 
 /// The quick actions on the right: comp tools on the open composition's selection.
@@ -1231,7 +1322,17 @@ fn rail(
                 let h = (66.0 + 23.0 * (kinds.len() as f32 + 1.0)) * s;
                 popover(app, ctx, anchor, vec2(240.0 * s, h), view, |app, ui, r, view| filters_body(app, ui, r, view, &kinds, s))
             }
-            "save" => popover(app, ctx, anchor, vec2(260.0 * s, 120.0 * s), view, |app, ui, r, _| save_body(app, ui, r, s)),
+            "save" => {
+                let mut pick = None;
+                popover(app, ctx, anchor, vec2(280.0 * s, 150.0 * s), view, |app, ui, r, view| pick = save_body(app, ui, r, view, s));
+                if let Some((cmd, params)) = pick {
+                    app.ui.motion_library = view.clone();
+                    if let Err(e) = crate::menus::invoke(app, ctx, cmd, params) {
+                        app.ui.status = e;
+                    }
+                    *view = app.ui.motion_library.clone();
+                }
+            }
             _ => {}
         }
     }
@@ -2403,13 +2504,25 @@ fn ml_backend() -> Option<std::path::PathBuf> {
 /// One backend operation (`backend.py rpc`): its result, or its error message.
 #[cfg(not(target_arch = "wasm32"))]
 fn backend_rpc(op: &str, args: Value) -> Result<Value, String> {
+    ml_rpc("backend.py", &["rpc"], None, op, args)
+}
+
+/// One operation of a Motion Library script (`backend.py rpc`, `effectcraft_plug.py`): the same
+/// envelope, stdin `{operation, args}` → stdout `{ok, result | error}`. `port`: this app's control
+/// port, for scripts that work on the open project.
+#[cfg(not(target_arch = "wasm32"))]
+fn ml_rpc(name: &str, script_args: &[&str], port: Option<u16>, op: &str, args: Value) -> Result<Value, String> {
     use std::io::Write;
     use std::process::{Command, Stdio};
-    let script = ml_backend().filter(|p| p.is_file()).ok_or("the Motion Library backend (backend.py) isn't on this computer (set EFFECTCRAFT_ML_BACKEND)")?;
-    let dir = script.parent().map(|d| d.to_path_buf()).unwrap_or_default();
-    let mut child = Command::new("/usr/bin/python3")
-        .arg(&script)
-        .arg("rpc")
+    let backend = ml_backend().filter(|p| p.is_file()).ok_or("the Motion Library backend (backend.py) isn't on this computer (set EFFECTCRAFT_ML_BACKEND)")?;
+    let dir = backend.parent().map(|d| d.to_path_buf()).unwrap_or_default();
+    let script = dir.join(name);
+    let mut cmd = Command::new("/usr/bin/python3");
+    cmd.arg(&script).args(script_args);
+    if let Some(port) = port {
+        cmd.env("ELIAS_EFFECTCRAFT_PORT", port.to_string());
+    }
+    let mut child = cmd
         .current_dir(&dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2432,6 +2545,11 @@ fn backend_rpc(op: &str, args: Value) -> Result<Value, String> {
 #[cfg(target_arch = "wasm32")]
 fn backend_rpc(_op: &str, _args: Value) -> Result<Value, String> {
     Err("Motion Library folders can be changed in the desktop app".into())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn ml_rpc(_name: &str, _script_args: &[&str], _port: Option<u16>, _op: &str, _args: Value) -> Result<Value, String> {
+    Err("saving to the Motion Library works in the desktop app".into())
 }
 
 /// Rebuild the local library's index (`effectcraft_library.py index`) so the panel reads the change.
@@ -2459,9 +2577,15 @@ enum FolderChange {
 
 /// Run a backend operation in the background; the status line says how it went.
 fn spawn_folder_op(ctx: &egui::Context, op: &'static str, args: Value, change: FolderChange, done: String) {
+    spawn_ml_op(ctx, move || backend_rpc(op, args), change, done);
+}
+
+/// Run a Motion Library operation in the background, then rebuild the index; the status line says
+/// how it went.
+fn spawn_ml_op(ctx: &egui::Context, op: impl FnOnce() -> Result<Value, String> + Send + 'static, change: FolderChange, done: String) {
     let ctx = ctx.clone();
     let run = move || {
-        let result = backend_rpc(op, args);
+        let result = op();
         {
             let mut ops = folder_ops();
             match &result {
