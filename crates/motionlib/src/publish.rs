@@ -40,6 +40,9 @@ pub struct Options {
     /// `max_file_bytes` (e.g. `SceneYard` = 5 MB keeps its big footage images home).
     pub folder_max_bytes: Vec<(String, u64)>,
     pub include_video: bool,
+    /// List every other library entry too, with its thumbnail only ([`Card::on_mac`]): entries
+    /// outside `folders`, and the index's `catalog_only` ones (what EffectCraft can't apply).
+    pub catalog_all: bool,
     /// Work everything out, upload nothing.
     pub dry_run: bool,
     /// Upload every blob again (a remote that lost files).
@@ -55,6 +58,7 @@ impl Options {
             max_preview_bytes: 90 * 1000 * 1000,
             folder_max_bytes: vec![],
             include_video: false,
+            catalog_all: false,
             dry_run: false,
             force: false,
         }
@@ -81,6 +85,9 @@ pub struct Report {
     pub cards: usize,
     #[serde(rename = "needsFootage")]
     pub needs_footage: usize,
+    /// Cards listed with their thumbnail only (applied on the Mac).
+    #[serde(rename = "onMac")]
+    pub on_mac: usize,
     /// Blobs uploaded (or to upload, dry run) and the bytes sent (gzipped blobs compressed).
     pub uploads: usize,
     #[serde(rename = "uploadBytes")]
@@ -245,7 +252,8 @@ fn image_size_of(b: &[u8]) -> Option<[u32; 2]> {
 /// (top folders) the library's priority list, then by name; parents before their subfolders.
 fn collections(index: &Value, folders: &[String], cards: &[Card], b: &mut Builder) -> Vec<Collection> {
     let meta = index.get("collections");
-    let published = |path: &str| folders.iter().any(|f| path == f || path.strip_prefix(f.as_str()).is_some_and(|r| r.starts_with('/')));
+    // `""` among `folders`: every folder.
+    let published = |path: &str| folders.iter().any(|f| f.is_empty() || path == f || path.strip_prefix(f.as_str()).is_some_and(|r| r.starts_with('/')));
     let mut all: BTreeSet<String> = BTreeSet::new();
     let listed = meta.and_then(|m| m.get("folders")).and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str);
     for path in listed.map(str::to_string).chain(cards.iter().map(|c| c.category.clone())) {
@@ -339,6 +347,40 @@ impl Builder<'_> {
         let blob = BlobRef { hash, size, gz: gz_for(name), name: name.to_string() };
         self.uploads.entry(blob.remote_key()).or_insert_with(|| Upload { blob: blob.clone(), source: path.to_path_buf() });
         Some(blob)
+    }
+
+    /// A card listed with its thumbnail only (no project, preview or files).
+    fn mac_card(&mut self, e: &Value) -> Card {
+        let mut card = Card {
+            id: text(e, "id"),
+            name: text(e, "name"),
+            category: text(e, "category"),
+            kind: "mac".into(),
+            kind_label: text(e, "type_label"),
+            location: text(e, "location"),
+            description: e.get("raw_description").and_then(Value::as_str).map_or_else(|| text(e, "description"), str::to_string),
+            tags: strings(e, "tags"),
+            aliases: strings(e, "aliases"),
+            visual_caption: text(e, "visual_caption"),
+            motion_events: strings(e, "motion_events"),
+            summary: text(e, "summary"),
+            generated_summary: text(e, "generated_summary"),
+            motion_terms: text(e, "motion_terms"),
+            priority: e.get("priority").and_then(Value::as_bool).unwrap_or(false),
+            duration: e.get("duration").and_then(Value::as_f64).filter(|d| d.is_finite()),
+            on_mac: true,
+            ..Card::default()
+        };
+        let p = text(e, "thumbnail");
+        if !p.is_empty() {
+            let path = self.resolve(&p);
+            if Hasher::stat(&path).is_some_and(|(size, _)| size <= self.opts.max_preview_bytes.min(self.opts.max_file_bytes)) {
+                card.thumbnail = self.blob(&path, &file_name(&p));
+                card.thumb_size = card.thumbnail.as_ref().and_then(|_| image_size(&path));
+            }
+        }
+        card.rev = card.compute_rev();
+        card
     }
 
     fn card(&mut self, e: &Value) -> Result<Card, String> {
@@ -459,19 +501,30 @@ pub fn publish(remote: &dyn Remote, opts: &Options, progress: &mut dyn FnMut(Str
     if folders.is_empty() {
         return Err("no folders to publish".into());
     }
-    let entries: Vec<&Value> = index
-        .get("entries")
-        .and_then(Value::as_array)
-        .map(|a| a.iter().collect::<Vec<_>>())
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|e| matches!(e.get("kind").and_then(Value::as_str), Some("comp" | "footage")))
-        .filter(|e| {
-            let cat = text(e, "category");
-            folders.iter().any(|f| cat == *f || cat.strip_prefix(f.as_str()).is_some_and(|r| r.starts_with('/')))
-        })
-        .collect();
-    progress(format!("{} cards in {}", entries.len(), folders.join(", ")));
+    let listed = |key: &str| index.get(key).and_then(Value::as_array).map(|a| a.iter().collect::<Vec<_>>()).unwrap_or_default();
+    let in_folders = |e: &Value| {
+        let cat = text(e, "category");
+        folders.iter().any(|f| cat == *f || cat.strip_prefix(f.as_str()).is_some_and(|r| r.starts_with('/')))
+    };
+    let applicable = |e: &Value| matches!(e.get("kind").and_then(Value::as_str), Some("comp" | "footage"));
+    let entries: Vec<&Value> = listed("entries").into_iter().filter(|e| applicable(e) && in_folders(e)).collect();
+    // Everything else, thumbnails only (applied on the Mac).
+    let mac_entries: Vec<&Value> = if opts.catalog_all {
+        listed("entries")
+            .into_iter()
+            .filter(|e| !(applicable(e) && in_folders(e)))
+            .chain(listed("catalog_only"))
+            .filter(|e| !text(e, "id").is_empty())
+            .collect()
+    } else {
+        vec![]
+    };
+    progress(format!(
+        "{} cards in {}{}",
+        entries.len(),
+        folders.join(", "),
+        if opts.catalog_all { format!(", {} listed only", mac_entries.len()) } else { String::new() }
+    ));
 
     let previous = current(remote)?;
     let mut b = Builder { opts, hasher: Hasher::open(&opts.library), uploads: BTreeMap::new(), report: Report { dry_run: opts.dry_run, ..Report::default() } };
@@ -485,9 +538,13 @@ pub fn publish(remote: &dyn Remote, opts: &Options, progress: &mut dyn FnMut(Str
             Err(err) => b.report.errors.push(err),
         }
     }
+    for e in &mac_entries {
+        cards.push(b.mac_card(e));
+    }
     let mut seen = BTreeSet::new();
     cards.retain(|c| seen.insert(c.id.clone()));
-    let collections = collections(&index, &folders, &cards, &mut b);
+    let shown: Vec<String> = if opts.catalog_all { vec![String::new()] } else { folders.clone() };
+    let collections = collections(&index, &shown, &cards, &mut b);
     b.hasher.save();
 
     let prev_version = previous.as_ref().map_or(0, |(h, _)| h.version);
@@ -495,6 +552,7 @@ pub fn publish(remote: &dyn Remote, opts: &Options, progress: &mut dyn FnMut(Str
     report.previous = prev_version;
     report.cards = cards.len();
     report.needs_footage = cards.iter().filter(|c| c.needs_footage()).count();
+    report.on_mac = cards.iter().filter(|c| c.on_mac).count();
     let prev_cards: Vec<(String, String)> = previous.as_ref().map(|(_, m)| m.cards.iter().map(|c| (c.id.clone(), c.rev.clone())).collect()).unwrap_or_default();
     let now_cards: Vec<(String, String)> = cards.iter().map(|c| (c.id.clone(), c.rev.clone())).collect();
     let same_folders = previous.as_ref().is_some_and(|(_, m)| m.folders == folders && m.name == lib_name && m.collections == collections);

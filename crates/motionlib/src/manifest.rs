@@ -143,11 +143,18 @@ pub struct Card {
     pub files: Vec<CardFile>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub placeholders: Vec<Placeholder>,
+    /// Listed with its thumbnail only: applied in After Effects on the Mac that keeps the library.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub on_mac: bool,
     /// SHA-256 of everything above: a card whose revision changed is "changed".
     pub rev: String,
 }
 
 impl Card {
+    /// Whether the card can be applied here (it has a file; not an on-the-Mac card).
+    pub fn applicable(&self) -> bool {
+        !self.on_mac && self.project.is_some()
+    }
     /// Footage left out of the upload: applying the card imports it as missing footage.
     pub fn needs_footage(&self) -> bool {
         !self.placeholders.is_empty()
