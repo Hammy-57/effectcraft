@@ -65,6 +65,7 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     uic!("view.theme.dark", "Theme: Dark", [], None),
     uic!("view.theme.darker", "Theme: Darker", [], None),
     uic!("view.theme.light", "Theme: Light", [], None),
+    uic!("motionLibrary.view", "Motion Library: Display Settings", [], None),
     // By key position, as in After Effects: on a Mac AZERTY keyboard (ABC-AZERTY, French) the key
     // right of `)` types `-` and zooms in, `)` zooms out; US keyboards are unchanged.
     uic!("timeline.zoomIn", "Zoom In Time", [], Some("Physical+=")),

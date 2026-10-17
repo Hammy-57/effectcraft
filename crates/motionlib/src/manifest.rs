@@ -100,6 +100,12 @@ pub struct Card {
     pub category: String,
     /// `comp` (a project whose composition is nested) or `footage` (a file added as a layer).
     pub kind: String,
+    /// What the card is, as the library labels it (`Comp`, `Overlay`, `Sound`…).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub kind_label: String,
+    /// The folder the card's source is in (shown under its name); empty = its category.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub location: String,
     /// The composition to nest (`comp` cards); empty = the project's primary composition.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub comp: String,
@@ -125,6 +131,9 @@ pub struct Card {
     pub duration: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thumbnail: Option<BlobRef>,
+    /// The thumbnail's width and height in pixels (cards keep its shape before it downloads).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumb_size: Option<[u32; 2]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preview: Option<BlobRef>,
     /// The `.ecproj` (`comp`) or the file (`footage`).
@@ -157,10 +166,49 @@ impl Card {
     pub fn top_folder(&self) -> &str {
         self.category.split('/').next().unwrap_or_default()
     }
+    /// The label under the card's name: `Comp · Devin Jatho/UI`.
+    pub fn subtitle(&self) -> String {
+        let kind = if !self.kind_label.is_empty() {
+            self.kind_label.as_str()
+        } else if self.kind == "comp" {
+            "Comp"
+        } else {
+            "Footage"
+        };
+        format!("{kind} · {}", if self.location.is_empty() { &self.category } else { &self.location })
+    }
     /// Whether the card is in `folder` or one of its subfolders.
     pub fn in_folder(&self, folder: &str) -> bool {
         folder.is_empty() || self.category == folder || self.category.strip_prefix(folder).is_some_and(|rest| rest.starts_with('/'))
     }
+}
+
+/// A folder of the catalog as the library lists it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Collection {
+    /// Folder path, e.g. `Devin Jatho/UI`.
+    pub path: String,
+    /// The folder's icon (a small image).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon: Option<BlobRef>,
+    /// The group the folder is filed under in the library (empty = none).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub group: String,
+}
+
+/// One row of the folder tree ([`Manifest::tree`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FolderRow {
+    pub path: String,
+    /// The last part of the path.
+    pub name: String,
+    /// 0 for a top folder.
+    pub depth: usize,
+    /// Cards in the folder and its subfolders.
+    pub cards: usize,
+    pub has_children: bool,
+    pub icon: Option<BlobRef>,
 }
 
 /// The catalog.
@@ -173,6 +221,9 @@ pub struct Manifest {
     pub name: String,
     /// The top folders published.
     pub folders: Vec<String>,
+    /// Every folder in the library's order (parents before their subfolders), with its icon.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub collections: Vec<Collection>,
     pub cards: Vec<Card>,
 }
 
@@ -230,7 +281,7 @@ impl Changes {
 
 impl Manifest {
     pub fn new(name: &str, folders: Vec<String>, cards: Vec<Card>, version: u64) -> Manifest {
-        Manifest { format: FORMAT.into(), schema: SCHEMA, version, name: name.into(), folders, cards }
+        Manifest { format: FORMAT.into(), schema: SCHEMA, version, name: name.into(), folders, collections: vec![], cards }
     }
 
     /// Parse a manifest's (uncompressed) bytes, dropping cards without an id.
@@ -275,6 +326,59 @@ impl Manifest {
             }
         }
         counts.into_iter().collect()
+    }
+
+    /// The folder tree in the library's order: [`Manifest::collections`] first (as listed),
+    /// folders it doesn't name after their siblings by name. Every folder with cards is in it, and
+    /// listed folders without cards too (count 0).
+    pub fn tree(&self) -> Vec<FolderRow> {
+        let mut counts: BTreeMap<String, usize> = self.folder_counts().into_iter().collect();
+        for c in &self.collections {
+            let mut path = String::new();
+            for part in c.path.split('/').filter(|p| !p.is_empty()) {
+                if !path.is_empty() {
+                    path.push('/');
+                }
+                path.push_str(part);
+                counts.entry(path.clone()).or_default();
+            }
+        }
+        let rank: BTreeMap<&str, usize> = self.collections.iter().enumerate().map(|(i, c)| (c.path.as_str(), i)).collect();
+        let icons: BTreeMap<&str, &BlobRef> = self.collections.iter().filter_map(|c| Some((c.path.as_str(), c.icon.as_ref()?))).collect();
+        let mut children: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for path in counts.keys() {
+            let parent = path.rsplit_once('/').map_or("", |(p, _)| p);
+            children.entry(parent).or_default().push(path.as_str());
+        }
+        for list in children.values_mut() {
+            list.sort_by(|a, b| {
+                let (ra, rb) = (rank.get(a).copied().unwrap_or(usize::MAX), rank.get(b).copied().unwrap_or(usize::MAX));
+                ra.cmp(&rb).then_with(|| a.to_lowercase().cmp(&b.to_lowercase())).then_with(|| a.cmp(b))
+            });
+        }
+        let mut out = Vec::with_capacity(counts.len());
+        // Depth-first, iteratively (folder depth comes from the catalog).
+        let mut stack: Vec<&str> = children.get("").map(|c| c.iter().rev().copied().collect()).unwrap_or_default();
+        while let Some(path) = stack.pop() {
+            let kids = children.get(path);
+            out.push(FolderRow {
+                path: path.to_string(),
+                name: path.rsplit('/').next().unwrap_or(path).to_string(),
+                depth: path.matches('/').count(),
+                cards: counts.get(path).copied().unwrap_or(0),
+                has_children: kids.is_some_and(|k| !k.is_empty()),
+                icon: icons.get(path).map(|b| (*b).clone()),
+            });
+            if let Some(kids) = kids {
+                stack.extend(kids.iter().rev().copied());
+            }
+        }
+        out
+    }
+
+    /// The rank of each folder in [`Manifest::tree`] (cards are grouped into sections in this order).
+    pub fn folder_ranks(&self) -> BTreeMap<String, usize> {
+        self.tree().into_iter().enumerate().map(|(i, r)| (r.path, i)).collect()
     }
 }
 
@@ -323,6 +427,46 @@ mod tests {
         assert_eq!(ch.label(), "1 new · 1 changed · 1 removed");
         assert_eq!(a.folder_counts(), vec![("Devin Jatho".into(), 1), ("Devin Jatho/UI".into(), 1), ("SceneYard".into(), 2)]);
         assert!(a.cards[0].in_folder("Devin Jatho") && !a.cards[0].in_folder("Devin") && a.cards[0].in_folder(""));
+    }
+
+    #[test]
+    fn tree_follows_the_library_order() {
+        let mut m = Manifest::new(
+            "L",
+            vec![],
+            vec![
+                card("a", "1", "Devin Jatho/UI"),
+                card("b", "1", "SceneYard"),
+                card("c", "1", "Devin Jatho"),
+                card("d", "1", "Devin Jatho/Basics"),
+                card("e", "1", "Apps"),
+            ],
+            1,
+        );
+        let icon = BlobRef { hash: "0".repeat(64), size: 3, gz: false, name: "i.png".into() };
+        m.collections = vec![
+            Collection { path: "Tapa".into(), ..Default::default() },
+            Collection { path: "Devin Jatho".into(), icon: Some(icon.clone()), ..Default::default() },
+            Collection { path: "Devin Jatho/Basics".into(), ..Default::default() },
+        ];
+        let rows: Vec<(String, usize, usize, bool)> = m.tree().into_iter().map(|r| (r.path, r.depth, r.cards, r.has_children)).collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("Tapa".into(), 0, 0, false),
+                ("Devin Jatho".into(), 0, 3, true),
+                ("Devin Jatho/Basics".into(), 1, 1, false),
+                ("Devin Jatho/UI".into(), 1, 1, false),
+                ("Apps".into(), 0, 1, false),
+                ("SceneYard".into(), 0, 1, false),
+            ]
+        );
+        assert_eq!(m.tree()[1].icon, Some(icon));
+        assert_eq!(m.folder_ranks()["SceneYard"], 5);
+        let c = Card { kind: "comp".into(), category: "Devin Jatho/UI".into(), ..Default::default() };
+        assert_eq!(c.subtitle(), "Comp · Devin Jatho/UI");
+        let c = Card { kind_label: "Overlay".into(), location: "Devin Jatho/Era elements".into(), ..c };
+        assert_eq!(c.subtitle(), "Overlay · Devin Jatho/Era elements");
     }
 
     #[test]
