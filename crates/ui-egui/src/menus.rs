@@ -76,6 +76,7 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     uic!("motionLibrary.importFiles", "Motion Library: Import Files into a Collection", [], None),
     uic!("motionLibrary.refresh", "Motion Library: Refresh Library Sources", [], None),
     uic!("motionLibrary.curve", "Motion Library: Curves (Read Keys, Apply, Presets)", [], None),
+    uic!("viewer.freeTransform", "Free Transform Points (viewer box: start, end, angle, anchor)", [], None),
     uic!("motionLibrary.tool", "Motion Library: Run a Tool (Workflow, Text Split, Bounce, Colour)", [], None),
     // By key position, as in After Effects: on a Mac AZERTY keyboard (ABC-AZERTY, French) the key
     // right of `)` types `-` and zooms in, `)` zooms out; US keyboards are unchanged.
@@ -208,6 +209,16 @@ fn only_comp(p: &Value) -> Option<effectcraft_engine::project::ItemId> {
 pub fn invoke(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: Value) -> Result<Value, String> {
     if let Some(result) = crate::panels::timeline::invoke_inline(app, ctx, id, &params) {
         return result;
+    }
+    // Cmd+T with path points selected, and Layer ▸ Mask and Shape Path ▸ Free Transform Points
+    // with a path to work on, enter Free Transform in the viewer (After Effects); otherwise
+    // Cmd+T is the Type tool and the menu item asks for numbers.
+    if no_params(&params)
+        && app.session.state.text_edit.is_none()
+        && ((id == "tool.type" && !app.session.state.selected_vertices.is_empty())
+            || (id == "path.freeTransform" && view::free_transform_target(app).is_some()))
+    {
+        return invoke(app, ctx, "viewer.freeTransform", json!({}));
     }
     if matches!(id, "effects.copyPresetsFolderPath" | "mediaBrowser.copySourcePath") {
         return frontend(app, ctx, id, params);

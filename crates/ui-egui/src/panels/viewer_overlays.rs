@@ -16,6 +16,7 @@ use serde_json::json;
 
 use super::viewer::ViewerMap;
 use crate::EffectcraftApp;
+use crate::state::FreeTransform;
 
 /// A vertex or tangent handle drawn this frame (masks and shape paths alike; `mask` is the path
 /// group's uid).
@@ -515,91 +516,203 @@ pub(crate) fn motion_path(
 
 // ---------------------------------------------------------------- free transform
 
-fn ft_id() -> egui::Id {
-    egui::Id::new("viewer-free-transform")
+/// Enter Free Transform on a path (double-click a path with the Selection tool, Cmd+T with its
+/// points selected, Layer ▸ Mask and Shape Path ▸ Free Transform Points): an upright box with the
+/// anchor point in its centre.
+pub(crate) fn begin_free_transform(app: &mut EffectcraftApp, layer: LayerId, uid: u64) {
+    app.ui.viewer.free_transform = Some(FreeTransform::new(layer.0, uid));
 }
 
-/// Enter Free Transform on a path (double-click a path with the Selection tool).
-pub(crate) fn begin_free_transform(ctx: &egui::Context, layer: LayerId, uid: u64) {
-    ctx.data_mut(|d| d.insert_temp(ft_id(), (layer, uid)));
+pub(crate) fn end_free_transform(app: &mut EffectcraftApp) {
+    app.ui.viewer.free_transform = None;
 }
 
-pub(crate) fn end_free_transform(ctx: &egui::Context) {
-    ctx.data_mut(|d| d.remove::<(LayerId, u64)>(ft_id()));
+/// Turn the box (`angle`, degrees) or move its anchor point (`anchor`, box coordinates).
+pub(crate) fn set_free_transform(app: &mut EffectcraftApp, angle: Option<f64>, anchor: Option<[f64; 2]>) {
+    if let Some(f) = app.ui.viewer.free_transform.as_mut() {
+        if let Some(a) = angle.filter(|a| a.is_finite()) {
+            f.angle = a.rem_euclid(360.0);
+        }
+        if let Some(a) = anchor.filter(|a| a[0].is_finite() && a[1].is_finite()) {
+            f.anchor = a;
+        }
+    }
 }
 
-pub(crate) fn free_transform_target(ctx: &egui::Context) -> Option<(LayerId, u64)> {
-    ctx.data(|d| d.get_temp(ft_id()))
+pub(crate) fn free_transform_target(app: &EffectcraftApp) -> Option<(LayerId, u64)> {
+    app.ui.viewer.free_transform.as_ref().map(|f| (LayerId(f.layer), f.path))
 }
 
-/// The free-transform box: path-space bounds of the transformed vertices, its handles on screen
-/// (corners 0–3, edge midpoints 4–7) and the path → comp matrix.
+/// A 2×3 affine matrix `[a, b, c, d, e, f]`: x' = a·x + c·y + e, y' = b·x + d·y + f (the layout
+/// `path.freeTransform` takes as `matrix`).
+pub(crate) type Affine = [f64; 6];
+
+pub(crate) const AF_ID: Affine = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+
+pub(crate) fn af_apply(m: &Affine, p: [f64; 2]) -> [f64; 2] {
+    [m[0] * p[0] + m[2] * p[1] + m[4], m[1] * p[0] + m[3] * p[1] + m[5]]
+}
+
+/// `p ∘ q`: `q` first, then `p`.
+pub(crate) fn af_mul(p: &Affine, q: &Affine) -> Affine {
+    [
+        p[0] * q[0] + p[2] * q[1],
+        p[1] * q[0] + p[3] * q[1],
+        p[0] * q[2] + p[2] * q[3],
+        p[1] * q[2] + p[3] * q[3],
+        p[0] * q[4] + p[2] * q[5] + p[4],
+        p[1] * q[4] + p[3] * q[5] + p[5],
+    ]
+}
+
+pub(crate) fn af_inv(m: &Affine) -> Option<Affine> {
+    let det = m[0] * m[3] - m[2] * m[1];
+    if !det.is_finite() || det.abs() < 1e-12 {
+        return None;
+    }
+    let (a, b, c, d) = (m[3] / det, -m[1] / det, -m[2] / det, m[0] / det);
+    Some([a, b, c, d, -(a * m[4] + c * m[5]), -(b * m[4] + d * m[5])])
+}
+
+/// The box of a free transform: the tightest rectangle around the transformed points, turned by
+/// `angle` (degrees, path space), as `uv → path` (`(0, 0)` its first corner, `(1, 1)` the
+/// opposite one). A side thinner than `min_side` path units (points in a line) is widened about
+/// its centre so the handles stay apart.
+pub(crate) fn fit_box(points: &[[f64; 2]], angle: f64, min_side: f64) -> Option<Affine> {
+    let (s, c) = angle.to_radians().sin_cos();
+    let (mut lo, mut hi) = ([f64::MAX; 2], [f64::MIN; 2]);
+    for p in points {
+        // Into the box's frame (rotate by -angle).
+        let q = [p[0] * c + p[1] * s, -p[0] * s + p[1] * c];
+        lo = [lo[0].min(q[0]), lo[1].min(q[1])];
+        hi = [hi[0].max(q[0]), hi[1].max(q[1])];
+    }
+    if !(lo[0] <= hi[0] && lo[1] <= hi[1]) {
+        return None;
+    }
+    let min_side = if min_side.is_finite() { min_side.max(1e-3) } else { 1e-3 };
+    for k in 0..2 {
+        if hi[k] - lo[k] < min_side {
+            let mid = (lo[k] + hi[k]) / 2.0;
+            (lo[k], hi[k]) = (mid - min_side / 2.0, mid + min_side / 2.0);
+        }
+    }
+    let (w, h) = (hi[0] - lo[0], hi[1] - lo[1]);
+    // uv → box frame, then back to path space (rotate by +angle).
+    let rot: Affine = [c, s, -s, c, 0.0, 0.0];
+    Some(af_mul(&rot, &[w, 0.0, 0.0, h, lo[0], lo[1]]))
+}
+
+/// The handles' box coordinates: corners 0–3 (clockwise from the first corner), edge midpoints
+/// 4–7 (top, right, bottom, left).
+pub(crate) const FT_HANDLES: [[f64; 2]; 8] = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.5, 0.0], [1.0, 0.5], [0.5, 1.0], [0.0, 0.5]];
+
+/// The free-transform box this frame: its `uv → path` matrix, the path → comp matrix, handles,
+/// outline and anchor on screen.
 pub(crate) struct FtBox {
     pub layer: LayerId,
     pub uid: u64,
-    pub b: [f64; 4],
+    pub angle: f64,
+    pub anchor_uv: [f64; 2],
+    pub f: Affine,
     pub m: Mat3,
     pub handles: [Pos2; 8],
     pub quad: [Pos2; 4],
+    pub anchor: Pos2,
+}
+
+/// What the pointer is over on the free-transform box.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum FtPart {
+    Anchor,
+    Handle(usize),
+    Inside,
+    /// Just outside: rotate about the anchor.
+    Rotate,
 }
 
 impl FtBox {
-    /// Path-space position of handle `i`.
-    pub fn handle_local(&self, i: usize) -> [f64; 2] {
-        let [x0, y0, x1, y1] = self.b;
-        let (cx, cy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
-        [[x0, y0], [x1, y0], [x1, y1], [x0, y1], [cx, y0], [x1, cy], [cx, y1], [x0, cy]][i]
-    }
-    pub fn center(&self) -> [f64; 2] {
-        [(self.b[0] + self.b[2]) / 2.0, (self.b[1] + self.b[3]) / 2.0]
+    pub fn part_at(&self, p: Pos2) -> Option<FtPart> {
+        if self.anchor.distance(p) < 8.0 {
+            return Some(FtPart::Anchor);
+        }
+        if let Some(i) =
+            (0..8).min_by(|a, b| self.handles[*a].distance(p).total_cmp(&self.handles[*b].distance(p))).filter(|i| self.handles[*i].distance(p) < 7.0)
+        {
+            return Some(FtPart::Handle(i));
+        }
+        if point_in_quad(p, &self.quad) {
+            return Some(FtPart::Inside);
+        }
+        let near = (0..4).any(|i| seg_dist(p, self.quad[i], self.quad[(i + 1) % 4]) < 28.0);
+        near.then_some(FtPart::Rotate)
     }
 }
 
-/// Draw the free-transform box of the target path (if any) and return it for hit tests.
-pub(crate) fn draw_free_transform(
-    app: &mut EffectcraftApp,
-    ctx: &egui::Context,
-    painter: &egui::Painter,
-    map: &ViewerMap,
-    paths: &[PathInfo],
-) -> Option<FtBox> {
-    let (layer, uid) = free_transform_target(ctx)?;
+fn seg_dist(p: Pos2, a: Pos2, b: Pos2) -> f32 {
+    let ab = b - a;
+    let l2 = ab.length_sq();
+    let t = if l2 > 1e-9 { ((p - a).dot(ab) / l2).clamp(0.0, 1.0) } else { 0.0 };
+    p.distance(a + ab * t)
+}
+
+/// The points the box covers: the path's selected points, or all of them when fewer than two are
+/// (as `path.freeTransform` transforms).
+fn ft_points(app: &EffectcraftApp, p: &PathInfo) -> Vec<[f64; 2]> {
+    let sel: Vec<usize> = app.session.state.selected_vertices.iter().filter(|v| v.layer == p.layer && v.mask == p.uid).map(|v| v.index).collect();
+    let idx: Vec<usize> = if sel.len() < 2 { (0..p.sp.vertices.len()).collect() } else { sel };
+    idx.iter().filter_map(|i| p.sp.vertices.get(*i).copied()).collect()
+}
+
+/// Draw the free-transform box of the target path (if any) and return it for hit tests: the
+/// outline, eight handles and the anchor point's crosshair, as After Effects draws them.
+pub(crate) fn draw_free_transform(app: &mut EffectcraftApp, painter: &egui::Painter, map: &ViewerMap, paths: &[PathInfo]) -> Option<FtBox> {
+    let st = app.ui.viewer.free_transform.clone()?;
+    let (layer, uid) = (LayerId(st.layer), st.path);
     let Some(p) = paths.iter().find(|p| p.layer == layer && p.uid == uid) else {
-        end_free_transform(ctx);
+        end_free_transform(app);
         return None;
     };
-    let sel: Vec<usize> = app.session.state.selected_vertices.iter().filter(|v| v.layer == layer && v.mask == uid).map(|v| v.index).collect();
-    let idx: Vec<usize> = if sel.len() >= 2 { sel } else { (0..p.sp.vertices.len()).collect() };
-    let (mut lo, mut hi) = ([f64::MAX; 2], [f64::MIN; 2]);
-    for &i in &idx {
-        let Some(v) = p.sp.vertices.get(i) else { continue };
-        lo = [lo[0].min(v[0]), lo[1].min(v[1])];
-        hi = [hi[0].max(v[0]), hi[1].max(v[1])];
-    }
-    if lo[0] > hi[0] {
-        return None;
-    }
-    let b = [lo[0], lo[1], hi[0].max(lo[0] + 1e-3), hi[1].max(lo[1] + 1e-3)];
-    let mut f = FtBox { layer, uid, b, m: p.m, handles: [Pos2::ZERO; 8], quad: [Pos2::ZERO; 4] };
-    for i in 0..8 {
-        let q = f.handle_local(i);
+    // Screen points per path unit, for the thinnest box side (8 points).
+    let o = p.m.apply(gv2(0.0, 0.0));
+    let (ex, ey) = (p.m.apply(gv2(1.0, 0.0)), p.m.apply(gv2(0.0, 1.0)));
+    let ppu = (((ex.x - o.x).hypot(ex.y - o.y) + (ey.x - o.x).hypot(ey.y - o.y)) / 2.0) * map.zoom as f64;
+    let min_side = if ppu > 1e-9 { 8.0 / ppu } else { 1.0 };
+    let f = fit_box(&ft_points(app, p), st.angle, min_side)?;
+    let to_screen = |uv: [f64; 2]| {
+        let q = af_apply(&f, uv);
         let c = p.m.apply(gv2(q[0], q[1]));
-        f.handles[i] = map.to_screen([c.x, c.y]);
+        map.to_screen([c.x, c.y])
+    };
+    let mut handles = [Pos2::ZERO; 8];
+    for (h, uv) in handles.iter_mut().zip(FT_HANDLES) {
+        *h = to_screen(uv);
     }
-    f.quad = [f.handles[0], f.handles[1], f.handles[2], f.handles[3]];
+    let quad = [handles[0], handles[1], handles[2], handles[3]];
+    let anchor = to_screen(st.anchor);
+    let b = FtBox { layer, uid, angle: st.angle, anchor_uv: st.anchor, f, m: p.m, handles, quad, anchor };
     let col = app.tokens.accent;
-    painter.add(egui::Shape::closed_line(f.quad.to_vec(), Stroke::new(1.0, col)));
-    for (i, h) in f.handles.iter().enumerate() {
+    let outline = Stroke::new(1.0, col);
+    painter.add(egui::Shape::closed_line(quad.to_vec(), Stroke::new(3.0, Color32::from_black_alpha(90))));
+    painter.add(egui::Shape::closed_line(quad.to_vec(), outline));
+    for (i, h) in handles.iter().enumerate() {
         let r = Rect::from_center_size(*h, vec2(7.0, 7.0));
         painter.rect_filled(r, 0.0, Color32::WHITE);
-        painter.rect_stroke(r, 0.0, Stroke::new(1.0, col), StrokeKind::Outside);
-        app.auto.add(&format!("viewer.freeTransform.handle.{i}"), r, "Free transform handle");
+        painter.rect_stroke(r, 0.0, outline, StrokeKind::Outside);
+        app.auto.add(&format!("viewer.freeTransform.handle.{i}"), r.expand(2.0), "Free transform handle");
     }
-    let c = f.center();
-    let cc = p.m.apply(gv2(c[0], c[1]));
-    let cs = map.to_screen([cc.x, cc.y]);
-    painter.circle_stroke(cs, 4.0, Stroke::new(1.0, col));
-    Some(f)
+    // The anchor point: a circle with a crosshair through it.
+    let shadow = Stroke::new(3.0, Color32::from_black_alpha(110));
+    let line = Stroke::new(1.0, Color32::WHITE);
+    for s in [shadow, line] {
+        painter.circle_stroke(anchor, 5.0, s);
+        painter.line_segment([anchor - vec2(10.0, 0.0), anchor + vec2(10.0, 0.0)], s);
+        painter.line_segment([anchor - vec2(0.0, 10.0), anchor + vec2(0.0, 10.0)], s);
+    }
+    app.auto.add("viewer.freeTransform.anchor", Rect::from_center_size(anchor, vec2(16.0, 16.0)), "Free transform anchor point");
+    let bounds = Rect::from_points(&quad);
+    app.auto.add("viewer.freeTransform.box", bounds, "Free transform box");
+    Some(b)
 }
 
 fn point_in_quad(p: Pos2, q: &[Pos2; 4]) -> bool {
@@ -619,6 +732,81 @@ fn point_in_quad(p: Pos2, q: &[Pos2; 4]) -> bool {
     true
 }
 
+/// A free-transform drag's mode.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum FtMode {
+    Move,
+    /// Scale about `pivot` (box coordinates) along the box's axes `axes` (x, y).
+    Scale {
+        pivot: [f64; 2],
+        axes: [bool; 2],
+    },
+    /// Rotate about the anchor.
+    Rotate,
+    /// Move the anchor point (no edit).
+    Anchor,
+}
+
+/// The whole transform (path space) of a free-transform drag from `press` to `cur` (path
+/// points) on the box `f0` (uv → path) with the anchor at `anchor_uv`, and the box's new angle
+/// change (degrees). `shift` keeps proportions (scale), snaps to 45° (rotate) or to an axis (move).
+pub(crate) fn ft_total(mode: FtMode, f0: &Affine, anchor_uv: [f64; 2], press: [f64; 2], cur: [f64; 2], shift: bool) -> Option<(Affine, f64)> {
+    match mode {
+        FtMode::Anchor => None,
+        FtMode::Move => {
+            let mut d = [cur[0] - press[0], cur[1] - press[1]];
+            if shift {
+                if d[0].abs() >= d[1].abs() {
+                    d[1] = 0.0;
+                } else {
+                    d[0] = 0.0;
+                }
+            }
+            Some(([1.0, 0.0, 0.0, 1.0, d[0], d[1]], 0.0))
+        }
+        FtMode::Scale { pivot, axes } => {
+            let inv = af_inv(f0)?;
+            let (p, c) = (af_apply(&inv, press), af_apply(&inv, cur));
+            let k = |i: usize| {
+                let a = p[i] - pivot[i];
+                if axes[i] && a.abs() > 1e-9 { ((c[i] - pivot[i]) / a).clamp(-100.0, 100.0) } else { 1.0 }
+            };
+            let (mut sx, mut sy) = (k(0), k(1));
+            if shift {
+                // Keep the proportions: the axis that changed most leads.
+                let s = if !axes[1] || (axes[0] && (sx - 1.0).abs() >= (sy - 1.0).abs()) { sx } else { sy };
+                (sx, sy) = (s, s);
+            }
+            let nz = |s: f64| if s.abs() < 1e-3 { 1e-3f64.copysign(s) } else { s };
+            let (sx, sy) = (nz(sx), nz(sy));
+            let s_uv: Affine = [sx, 0.0, 0.0, sy, pivot[0] * (1.0 - sx), pivot[1] * (1.0 - sy)];
+            Some((af_mul(f0, &af_mul(&s_uv, &inv)), 0.0))
+        }
+        FtMode::Rotate => {
+            let a = af_apply(f0, anchor_uv);
+            let a0 = (press[1] - a[1]).atan2(press[0] - a[0]);
+            let a1 = (cur[1] - a[1]).atan2(cur[0] - a[0]);
+            let mut d = (a1 - a0).to_degrees();
+            if shift {
+                d = (d / 45.0).round() * 45.0;
+            }
+            let (s, c) = d.to_radians().sin_cos();
+            let m: Affine = [c, s, -s, c, a[0] - c * a[0] + s * a[1], a[1] - s * a[0] - c * a[1]];
+            Some((m, d))
+        }
+    }
+}
+
+/// The anchor's box coordinates after a scale that flipped the box (a negative factor mirrors
+/// the refitted box, so the anchor's place in it mirrors too).
+pub(crate) fn ft_anchor_after(mode: FtMode, total: &Affine, f0: &Affine, anchor_uv: [f64; 2]) -> [f64; 2] {
+    let FtMode::Scale { .. } = mode else { return anchor_uv };
+    let Some(inv) = af_inv(f0) else { return anchor_uv };
+    // The scale in box coordinates: f0⁻¹ ∘ total ∘ f0 = diag(sx, sy) + offset.
+    let s = af_mul(&inv, &af_mul(total, f0));
+    [if s[0] < 0.0 { 1.0 - anchor_uv[0] } else { anchor_uv[0] }, if s[3] < 0.0 { 1.0 - anchor_uv[1] } else { anchor_uv[1] }]
+}
+
 // ---------------------------------------------------------------- drags
 
 /// Overlay drags owned by this module.
@@ -631,8 +819,9 @@ pub(crate) enum Drag {
     /// The motion path between two keys, bent through the pointer (`time` inside the segment,
     /// `u` its Bezier parameter under the press, `last` the parent-space pointer).
     Segment { layer: LayerId, prop: u64, time: Tick, u: f64, last: [f64; 2], inv: Mat3 },
-    /// Free transform: 0 move, 1 scale (anchor, axes), 2 rotate about `anchor`.
-    Ft { layer: LayerId, path: u64, mode: u8, anchor: [f64; 2], last: [f64; 2], inv: Mat3, axes: [bool; 2] },
+    /// Free transform from `press` (path point) on the box `f0` (uv → path) with the box's angle
+    /// and anchor at the press; `applied` is the transform sent so far, `inv` comp → path.
+    Ft { layer: LayerId, path: u64, mode: FtMode, f0: Affine, angle0: f64, anchor0: [f64; 2], press: [f64; 2], applied: Affine, inv: Mat3 },
     /// Mask Feather tool: drag a feather point's radius handle (comp → layer matrix `inv`).
     Feather { layer: LayerId, mask: u64, index: usize, inv: Mat3 },
     /// A guide dragged in the viewer.
@@ -677,29 +866,28 @@ pub(crate) fn begin_segment_bend(app: &EffectcraftApp, segments: &[MotionSegment
     Some(Drag::Segment { layer: seg.layer, prop: seg.prop, time, u, last: [p.x, p.y], inv })
 }
 
-/// Start a free-transform drag on the box: a handle scales about the opposite one (corners both
-/// axes, edges one), inside moves, just outside a corner rotates about the centre.
-pub(crate) fn begin_ft_drag(f: &FtBox, press: Pos2, map: &ViewerMap) -> Option<Drag> {
+/// Start a free-transform drag on the box (After Effects): the anchor point moves the pivot; a
+/// handle scales about the opposite one (corners both axes, edges one), about the anchor with
+/// Cmd; inside moves; just outside rotates about the anchor.
+pub(crate) fn begin_ft_drag(f: &FtBox, press: Pos2, map: &ViewerMap, cmd: bool) -> Option<Drag> {
     let inv = f.m.inverse()?;
     let c = map.to_comp(press);
     let lp = inv.apply(gv2(c[0], c[1]));
-    let lp = [lp.x, lp.y];
-    if let Some(i) = (0..8).find(|i| f.handles[*i].distance(press) < 7.0) {
-        let opp = [2, 3, 0, 1, 6, 7, 4, 5][i];
-        let axes = match i {
-            4 | 6 => [false, true],
-            5 | 7 => [true, false],
-            _ => [true, true],
-        };
-        return Some(Drag::Ft { layer: f.layer, path: f.uid, mode: 1, anchor: f.handle_local(opp), last: lp, inv, axes });
-    }
-    if point_in_quad(press, &f.quad) {
-        return Some(Drag::Ft { layer: f.layer, path: f.uid, mode: 0, anchor: f.center(), last: lp, inv, axes: [true, true] });
-    }
-    if f.quad.iter().any(|q| q.distance(press) < 24.0) {
-        return Some(Drag::Ft { layer: f.layer, path: f.uid, mode: 2, anchor: f.center(), last: lp, inv, axes: [true, true] });
-    }
-    None
+    let mode = match f.part_at(press)? {
+        FtPart::Anchor => FtMode::Anchor,
+        FtPart::Handle(i) => {
+            let opp = [2, 3, 0, 1, 6, 7, 4, 5].get(i).and_then(|o| FT_HANDLES.get(*o)).copied().unwrap_or([0.5, 0.5]);
+            let axes = match i {
+                4 | 6 => [false, true],
+                5 | 7 => [true, false],
+                _ => [true, true],
+            };
+            FtMode::Scale { pivot: if cmd { f.anchor_uv } else { opp }, axes }
+        }
+        FtPart::Inside => FtMode::Move,
+        FtPart::Rotate => FtMode::Rotate,
+    };
+    Some(Drag::Ft { layer: f.layer, path: f.uid, mode, f0: f.f, angle0: f.angle, anchor0: f.anchor_uv, press: [lp.x, lp.y], applied: AF_ID, inv })
 }
 
 /// Mask Feather tool: press on a feather point's handle to drag it, or on a mask path to add a
@@ -772,37 +960,28 @@ pub(crate) fn update(
             }
             Some(Drag::Segment { layer, prop, time, u, last: cur, inv })
         }
-        Drag::Ft { layer, path, mode, anchor, last, inv, axes } => {
+        Drag::Ft { layer, path, mode, f0, angle0, anchor0, press, applied, inv } => {
             let p = inv.apply(gv2(cpt[0], cpt[1]));
             let cur = [p.x, p.y];
-            let mut q = json!({"layer": layer.0, "mask": path, "anchor": anchor, "merge": merge});
-            match mode {
-                0 => q["offset"] = json!([cur[0] - last[0], cur[1] - last[1]]),
-                1 => {
-                    let f = |k: usize| {
-                        let a = last[k] - anchor[k];
-                        if axes[k] && a.abs() > 1e-6 { ((cur[k] - anchor[k]) / a).clamp(-50.0, 50.0) } else { 1.0 }
-                    };
-                    let (mut fx, mut fy) = (f(0), f(1));
-                    if mods.shift && axes[0] && axes[1] {
-                        let k = (fx + fy) / 2.0;
-                        (fx, fy) = (k, k);
-                    }
-                    if fx.abs() < 1e-3 || fy.abs() < 1e-3 {
-                        return None;
-                    }
-                    q["scale"] = json!([fx * 100.0, fy * 100.0]);
+            let same = Drag::Ft { layer, path, mode, f0, angle0, anchor0, press, applied, inv };
+            if mode == FtMode::Anchor {
+                if let Some(fi) = af_inv(&f0) {
+                    let (u0, u1) = (af_apply(&fi, press), af_apply(&fi, cur));
+                    set_free_transform(app, None, Some([anchor0[0] + u1[0] - u0[0], anchor0[1] + u1[1] - u0[1]]));
                 }
-                _ => {
-                    let a0 = (last[1] - anchor[1]).atan2(last[0] - anchor[0]);
-                    let a1 = (cur[1] - anchor[1]).atan2(cur[0] - anchor[0]);
-                    q["rotation"] = json!((a1 - a0).to_degrees());
+                return Some(same);
+            }
+            let (total, turn) = ft_total(mode, &f0, anchor0, press, cur, mods.shift)?;
+            let delta = af_mul(&total, &af_inv(&applied)?);
+            if delta.iter().zip(AF_ID).any(|(a, b)| (a - b).abs() > 1e-9) {
+                let q = json!({"layer": layer.0, "mask": path, "matrix": delta, "merge": merge});
+                if let Err(e) = app.session.execute("path.freeTransform", q) {
+                    app.ui.status = e.to_string();
+                    return None;
                 }
             }
-            if cur != last {
-                let _ = app.session.execute("path.freeTransform", q);
-            }
-            Some(Drag::Ft { layer, path, mode, anchor, last: cur, inv, axes })
+            set_free_transform(app, Some(angle0 + turn), Some(ft_anchor_after(mode, &total, &f0, anchor0)));
+            Some(Drag::Ft { layer, path, mode, f0, angle0, anchor0, press, applied: total, inv })
         }
         Drag::Feather { layer, mask, index, inv } => {
             let p = inv.apply(gv2(cpt[0], cpt[1]));
@@ -829,6 +1008,37 @@ mod tests {
         let n = vertices.len();
         let sp = ShapePath { vertices, in_tangents: vec![[0.0; 2]; n], out_tangents: vec![[0.0; 2]; n], closed, feather: Vec::new() };
         PathInfo { layer: LayerId(3), uid: 7, m: Mat3::IDENTITY, sp, is_mask: true, feather: Vec::new() }
+    }
+
+    /// The free-transform box fits the points in its own (turned) frame, widens a line of points
+    /// so its handles stay apart, and a scale from a handle maps the grabbed point onto the pointer.
+    #[test]
+    fn free_transform_box_fits_turns_and_scales() {
+        let near = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).abs() < 1e-6 && (a[1] - b[1]).abs() < 1e-6;
+        let pts = [[10.0, 20.0], [50.0, 20.0], [50.0, 80.0]];
+        let f = fit_box(&pts, 0.0, 1.0).unwrap();
+        assert!(near(af_apply(&f, [0.0, 0.0]), [10.0, 20.0]) && near(af_apply(&f, [1.0, 1.0]), [50.0, 80.0]));
+        // A vertical line of points: the box gets the minimum width about the line.
+        let line = fit_box(&[[5.0, 0.0], [5.0, 100.0]], 0.0, 8.0).unwrap();
+        assert!(near(af_apply(&line, [0.0, 0.0]), [1.0, 0.0]) && near(af_apply(&line, [1.0, 1.0]), [9.0, 100.0]));
+        // Turned 90°: the box's first corner follows the turn.
+        let t = fit_box(&pts, 90.0, 1.0).unwrap();
+        for p in pts {
+            let uv = af_apply(&af_inv(&t).unwrap(), p);
+            assert!((-1e-9..=1.0 + 1e-9).contains(&uv[0]) && (-1e-9..=1.0 + 1e-9).contains(&uv[1]), "{uv:?}");
+        }
+        assert!(fit_box(&[], 0.0, 1.0).is_none());
+        // Bottom-right handle dragged from (50, 80) to (90, 140), pivot the first corner.
+        let mode = FtMode::Scale { pivot: [0.0, 0.0], axes: [true, true] };
+        let (m, turn) = ft_total(mode, &f, [0.5, 0.5], [50.0, 80.0], [90.0, 140.0], false).unwrap();
+        assert!(near(af_apply(&m, [50.0, 80.0]), [90.0, 140.0]) && near(af_apply(&m, [10.0, 20.0]), [10.0, 20.0]) && turn == 0.0);
+        // Past the pivot: the box flips and the anchor's place in it mirrors.
+        let (m, _) = ft_total(mode, &f, [0.25, 0.5], [50.0, 80.0], [-30.0, 80.0], false).unwrap();
+        assert_eq!(ft_anchor_after(mode, &m, &f, [0.25, 0.5]), [0.75, 0.5]);
+        // Shift on a rotation snaps to 45°.
+        let (_, turn) = ft_total(FtMode::Rotate, &f, [0.5, 0.5], [60.0, 50.0], [30.0, 75.0], true).unwrap();
+        assert_eq!(turn.rem_euclid(45.0), 0.0);
+        assert!(ft_total(FtMode::Anchor, &f, [0.5, 0.5], [0.0; 2], [1.0; 2], false).is_none());
     }
 
     /// #912: clicking the last vertex of an open path with the Pen resumes that path.
