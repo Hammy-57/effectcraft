@@ -1479,6 +1479,7 @@ dependencies = [
  "effectcraft-gpu",
  "effectcraft-host",
  "effectcraft-media",
+ "effectcraft-motionlib",
  "effectcraft-platform",
  "effectcraft-render",
  "effectcraft-time",
