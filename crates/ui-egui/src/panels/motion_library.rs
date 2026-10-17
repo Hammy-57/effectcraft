@@ -2582,7 +2582,7 @@ pub(crate) fn ml_rpc(_name: &str, _script_args: &[&str], _port: Option<u16>, _op
 
 /// Rebuild the local library's index (`effectcraft_library.py index`) so the panel reads the change.
 #[cfg(not(target_arch = "wasm32"))]
-fn reindex_library() {
+pub(crate) fn reindex_library() {
     let Some(dir) = ml_backend().and_then(|p| p.parent().map(|d| d.to_path_buf())) else { return };
     let _ = std::process::Command::new("/usr/bin/nice")
         .args(["-n", "10", "/usr/bin/python3", "effectcraft_library.py", "index"])
@@ -2593,7 +2593,7 @@ fn reindex_library() {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn reindex_library() {}
+pub(crate) fn reindex_library() {}
 
 /// What a finished operation changes in the tree right away.
 pub(crate) enum FolderChange {
