@@ -143,6 +143,8 @@ mod ui_settings_info;
 mod ui_smart_freeze;
 #[path = "../ui_solo_small_tabs.rs"]
 mod ui_solo_small_tabs;
+#[path = "../ui_sound_preview.rs"]
+mod ui_sound_preview;
 #[path = "../ui_source_icons.rs"]
 mod ui_source_icons;
 #[path = "../ui_tabs.rs"]

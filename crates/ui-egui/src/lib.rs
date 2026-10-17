@@ -291,6 +291,17 @@ pub(crate) struct DialogAnswer {
     pub paths: Vec<String>,
 }
 
+/// A sound to hear while the pointer is over its Motion Library card.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SoundHover {
+    /// The card's id (the same key keeps playing; another restarts).
+    pub key: String,
+    /// The audio file on this machine (the library folder's, or the bucket's cached copy).
+    pub path: String,
+    /// SFX preview volume, linear 0–1.
+    pub gain: f32,
+}
+
 /// Host hooks provided by the native app (file pickers etc.).
 #[derive(Default)]
 pub struct Hooks {
@@ -559,6 +570,10 @@ pub struct EffectcraftApp {
     pub audio: Option<audio::AudioPlayback>,
     /// Audio scrubbing's open output (Ctrl/Cmd-drag the current time, `playback.scrubAudio`).
     pub scrub: Option<audio::AudioScrub>,
+    /// Hover-to-hear in the Motion Library: its open output (see [`audio::SoundPreview`]).
+    pub sound_preview: Option<audio::SoundPreview>,
+    /// The Sound card under the pointer this frame (the panel sets it; each frame takes it).
+    pub sound_hover: Option<SoundHover>,
     /// Audio panel VU meters.
     pub meter: audio::Meter,
     /// Waveform peak summaries per footage item (see `panels::waveform`).
@@ -678,6 +693,8 @@ impl EffectcraftApp {
             integrated_titlebar: false,
             audio: None,
             scrub: None,
+            sound_preview: None,
+            sound_hover: None,
             meter: Default::default(),
             expression_diagnostics: Default::default(),
             waveforms: Default::default(),
@@ -1722,6 +1739,45 @@ impl EffectcraftApp {
         }
     }
 
+    /// Hover-to-hear, once a frame: play the Sound card the Motion Library's pointer is over
+    /// ([`Self::sound_hover`]), stop when it leaves. Silent while the Timeline plays or scrubs
+    /// audio (the comp's sound comes first); an idle output closes after two seconds.
+    fn tick_sound_preview(&mut self, ctx: &egui::Context, now: f64) {
+        let want = self.sound_hover.take().filter(|_| !self.playback.playing && self.scrub.is_none());
+        let Some(want) = want else {
+            if let Some(sp) = &mut self.sound_preview {
+                sp.stop();
+                sp.pump();
+                if now - sp.last_used > 2.0 {
+                    self.sound_preview = None;
+                } else {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(250));
+                }
+            }
+            return;
+        };
+        if self.sound_preview.is_none() {
+            let out = audio::AudioOutput::from_prefs(&self.session.prefs);
+            let Some(dev) = self.hooks.audio_device.as_ref().and_then(|f| f(&out)) else { return };
+            match audio::SoundPreview::open(dev, now) {
+                Ok(sp) => self.sound_preview = Some(sp),
+                Err(e) => {
+                    log::warn!("sound preview: {e}");
+                    return;
+                }
+            }
+        }
+        let Some(sp) = &mut self.sound_preview else { return };
+        sp.set_gain(want.gain);
+        if sp.playing() != Some(want.key.as_str()) && sp.failed().as_deref() != Some(want.key.as_str()) {
+            let path = want.path;
+            sp.play(&want.key, Box::new(move |rate| audio::decode_sound_file(&path, rate)), true, now);
+        }
+        sp.last_used = now;
+        sp.pump();
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    }
+
     #[track_caller]
     pub fn stop(&mut self) {
         let was = std::mem::replace(&mut self.playback.playing, false);
@@ -2552,6 +2608,7 @@ impl EffectcraftApp {
         if let Some(wait) = self.scrub_preview.remaining() {
             ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait));
         }
+        self.tick_sound_preview(&ctx, ctx.input(|i| i.time));
         self.apply_gpu_failure(&ctx);
         self.run_dialog_answers();
         self.auto.begin_frame();

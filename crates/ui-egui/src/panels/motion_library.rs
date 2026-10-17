@@ -2,7 +2,9 @@
 //! (`effectcraft_motionlib`), on every machine the app runs on.
 //!
 //! - Folders on the left, a search field and the cards on the right. Thumbnails download as they
-//!   scroll into view, a card's preview plays while the pointer is over it, and applying a card
+//!   scroll into view, a card's preview plays while the pointer is over it (Sound cards play
+//!   their sound at the SFX preview volume, Display settings, through the app's audio output:
+//!   [`crate::SoundHover`]), and applying a card
 //!   (double-click or **Apply**) downloads its project and files, then nests its composition at
 //!   the playhead (`library.apply`, one undo step).
 //! - Cards whose footage stayed on the publishing Mac show **needs footage**: they import with
@@ -63,6 +65,9 @@ pub struct ViewState {
     pub folder_card_sizes: BTreeMap<String, f32>,
     /// Width of the collections column in points at 100 % (0 = automatic).
     pub sidebar_width: f32,
+    /// SFX preview volume: how loud a Sound card plays while the pointer is over it (linear
+    /// 0–1; the web panel's default is 20 %).
+    pub sfx_volume: f32,
     /// The rail popover open: `display`, `filters`, `save` (empty = none).
     #[serde(skip)]
     pub popover: String,
@@ -130,6 +135,7 @@ impl Default for ViewState {
             group: String::new(),
             folder_card_sizes: BTreeMap::new(),
             sidebar_width: 0.0,
+            sfx_volume: DEFAULT_SFX_VOLUME,
             popover: String::new(),
             details: None,
             apply_time: None,
@@ -154,6 +160,11 @@ pub const CARD_SIZE_RANGE: (f32, f32) = (88.0, 1200.0);
 const DEFAULT_CARD_SIZE: f32 = 144.0;
 /// At or below this card width, names take two lines and the type line is hidden.
 const COMPACT_CARD: f32 = 112.0;
+/// SFX preview volume of a new panel (as the library's web panel).
+pub const DEFAULT_SFX_VOLUME: f32 = 0.2;
+/// A Sound card not on this machine plays on hover only when the bucket's file is at most this
+/// big (a hover never downloads more).
+const SOUND_HOVER_MAX_BYTES: u64 = 4 << 20;
 
 impl ViewState {
     /// Keep settings in range (a hand-edited or old workspace).
@@ -167,6 +178,7 @@ impl ViewState {
             self.folder_scroll = 0.0;
         }
         self.sidebar_width = if self.sidebar_width.is_finite() && self.sidebar_width > 0.0 { self.sidebar_width.clamp(80.0, 420.0) } else { 0.0 };
+        self.sfx_volume = if self.sfx_volume.is_finite() { self.sfx_volume.clamp(0.0, 1.0) } else { DEFAULT_SFX_VOLUME };
         self.folder_card_sizes.retain(|_, w| w.is_finite());
         for w in self.folder_card_sizes.values_mut() {
             *w = w.clamp(CARD_SIZE_RANGE.0, CARD_SIZE_RANGE.1);
@@ -180,6 +192,7 @@ impl ViewState {
             "selected": self.selected,
             "scale": self.scale,
             "cardSize": self.card_size,
+            "sfxVolume": self.sfx_volume,
             "expanded": self.expanded,
             "display": self.popover == "display",
             "popover": self.popover,
@@ -598,6 +611,74 @@ fn decode_preview(
     footage.forget(path);
 }
 
+/// A Sound card (SFX): it plays while the pointer is over it.
+fn is_sound(card: &Card, local: &LocalIndex) -> bool {
+    card.kind_label == "Sound" || local.get(&card.id).is_some_and(|e| e.kind == "audio")
+}
+
+fn is_audio_file(name: &str) -> bool {
+    let ext = std::path::Path::new(name).extension().map(|x| x.to_string_lossy().to_lowercase()).unwrap_or_default();
+    matches!(ext.as_str(), "wav" | "mp3" | "m4a" | "aac" | "aif" | "aiff" | "flac" | "ogg" | "caf")
+}
+
+/// What a hovered Sound card can play.
+enum SoundSource {
+    File(String),
+    /// The bucket's copy is downloading.
+    Loading,
+    None,
+}
+
+/// The file a Sound card plays on hover, as the web panel: this machine's library folder first
+/// (its preview, else its file), else the bucket's copy once downloaded, only when it is at most
+/// [`SOUND_HOVER_MAX_BYTES`] (a hover never downloads more).
+fn sound_source(ctx: &egui::Context, client: &Client, local: &LocalIndex, card: &Card) -> SoundSource {
+    if let Some(e) = local.get(&card.id) {
+        for p in [&e.preview, &e.file] {
+            if is_audio_file(p) && std::path::Path::new(p).is_file() {
+                return SoundSource::File(p.clone());
+            }
+        }
+    }
+    let small = [card.preview.as_ref(), card.project.as_ref()].into_iter().flatten().find(|b| is_audio_file(&b.name) && b.size <= SOUND_HOVER_MAX_BYTES);
+    let Some(blob) = small else { return SoundSource::None };
+    match client.blob(blob) {
+        BlobState::Ready(Some(path)) => SoundSource::File(path.to_string_lossy().to_string()),
+        BlobState::Ready(None) | BlobState::Failed(_) => SoundSource::None,
+        BlobState::Loading => {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            SoundSource::Loading
+        }
+    }
+}
+
+/// Over a hovered Sound card: a speaker and the SFX volume while it plays, "Audio unavailable"
+/// when it can't, nothing while the Timeline's own sound plays.
+fn paint_sound_state(app: &EffectcraftApp, p: &egui::Painter, thumb: Rect, card: &Card, src: &SoundSource, volume: f32, s: f32) {
+    let sp = app.sound_preview.as_ref();
+    let failed = matches!(src, SoundSource::None) || sp.and_then(|sp| sp.failed()).as_deref() == Some(card.id.as_str());
+    let playing = sp.and_then(|sp| sp.playing()) == Some(card.id.as_str());
+    let text = if matches!(src, SoundSource::Loading) {
+        tr("Loading…").to_string()
+    } else if failed {
+        tr("Audio unavailable").to_string()
+    } else if playing {
+        format!("{}%", (volume * 100.0).round() as i32)
+    } else {
+        return;
+    };
+    let font = Tokens::medium(9.5 * s);
+    let w = p.layout_no_wrap(text.clone(), font.clone(), Color32::WHITE).size().x;
+    let icon = if playing && !failed { 14.0 * s } else { 0.0 };
+    let pill = Rect::from_min_size(pos2(thumb.min.x + 5.0 * s, thumb.max.y - 21.0 * s), vec2(w + icon + 12.0 * s, 16.0 * s));
+    p.rect_filled(pill, CornerRadius::same((8.0 * s) as u8), Color32::from_black_alpha(170));
+    if icon > 0.0 {
+        let ir = Rect::from_min_size(pill.min + vec2(5.0 * s, 2.0 * s), vec2(12.0 * s, 12.0 * s));
+        crate::icons::paint(p, ir, crate::icons::Icon::Audio, Color32::WHITE);
+    }
+    p.text(pos2(pill.min.x + 6.0 * s + icon, pill.center().y), Align2::LEFT_CENTER, text, font, Color32::WHITE);
+}
+
 /// This machine has the card's files (a library folder lists it): it applies from them, so it
 /// isn't "on the Mac" and needs no footage here.
 fn is_local(card: &Card, local: &LocalIndex) -> bool {
@@ -961,7 +1042,7 @@ fn popover(
     }
 }
 
-/// Display settings: interface scale, card size.
+/// Display settings: interface scale, card size, SFX preview volume.
 fn display_body(app: &mut EffectcraftApp, ui: &mut egui::Ui, r: Rect, view: &mut ViewState, s: f32) {
     let t = app.tokens;
     let pad = 12.0 * s;
@@ -1008,6 +1089,30 @@ fn display_body(app: &mut EffectcraftApp, ui: &mut egui::Ui, r: Rect, view: &mut
     p.rect_filled(Rect::from_min_max(line.min, pos2(track.min.x + f * track.width(), line.max.y)), CornerRadius::same(2), t.accent);
     p.circle_filled(pos2(track.min.x + f * track.width(), y2), 6.0 * s, if resp.hovered() || resp.dragged() { t.accent_hover } else { t.accent });
     app.auto.add_response("motionLibrary.cardSize", &resp, &format!("{size}"));
+    // SFX preview volume: a slider, 0–100 %.
+    let y3 = r.min.y + 112.0 * s;
+    let pct = format!("{}%", (view.sfx_volume * 100.0).round() as i32);
+    ui.painter().text(pos2(r.min.x + pad, y3), Align2::LEFT_CENTER, tr("SFX volume"), Tokens::ui(11.5 * s), t.text_dim);
+    let vw = 34.0 * s;
+    let track = Rect::from_min_max(pos2(r.min.x + pad + 76.0 * s, y3 - 8.0 * s), pos2(r.max.x - pad - vw, y3 + 8.0 * s));
+    let resp = ui.interact(track, egui::Id::new("ml-sfx-volume"), Sense::click_and_drag());
+    if (resp.dragged() || resp.clicked())
+        && let Some(x) = resp.interact_pointer_pos().map(|p| p.x)
+    {
+        view.sfx_volume = (((x - track.min.x) / track.width().max(1.0)).clamp(0.0, 1.0) * 100.0).round() / 100.0;
+    }
+    let f = view.sfx_volume.clamp(0.0, 1.0);
+    let line = Rect::from_min_max(pos2(track.min.x, y3 - 1.5 * s), pos2(track.max.x, y3 + 1.5 * s));
+    let p = ui.painter();
+    p.rect_filled(line, CornerRadius::same(2), t.field_border);
+    p.rect_filled(Rect::from_min_max(line.min, pos2(track.min.x + f * track.width(), line.max.y)), CornerRadius::same(2), t.accent);
+    p.circle_filled(pos2(track.min.x + f * track.width(), y3), 6.0 * s, if resp.hovered() || resp.dragged() { t.accent_hover } else { t.accent });
+    p.text(pos2(r.max.x - pad, y3), Align2::RIGHT_CENTER, &pct, Tokens::medium(11.0 * s), t.text);
+    app.auto.add_response(
+        "motionLibrary.sfxVolume",
+        &resp.on_hover_text(tr("SFX preview volume: how loud a Sound card plays while the pointer is over it")),
+        &pct,
+    );
 }
 
 /// Filters: what kind of card (Comp, Overlay, Sound…) and only cards that apply here.
@@ -1443,7 +1548,7 @@ fn rail(
     if let Some((_, anchor)) = anchors.iter().find(|(n, _)| *n == which) {
         let anchor = *anchor;
         match which.as_str() {
-            "display" => popover(app, ctx, anchor, vec2(236.0 * s, 104.0 * s), view, |app, ui, r, view| display_body(app, ui, r, view, s)),
+            "display" => popover(app, ctx, anchor, vec2(236.0 * s, 138.0 * s), view, |app, ui, r, view| display_body(app, ui, r, view, s)),
             "filters" => {
                 let h = (66.0 + 23.0 * (kinds.len() as f32 + 1.0)) * s;
                 popover(app, ctx, anchor, vec2(240.0 * s, h), view, |app, ui, r, view| filters_body(app, ui, r, view, &kinds, s))
@@ -2424,9 +2529,15 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 gp.rect_filled(tile, radius, if hovered { t.hover } else { t.row_alt });
                 let tr_radius = CornerRadius { nw: radius.nw, ne: radius.ne, sw: 0, se: 0 };
                 gp.rect_filled(thumb_r, tr_radius, t.field_bg);
-                let live = if hovered { preview_frame(app, &ctx, &client, &local, card) } else { None };
+                let sound = is_sound(card, &local);
+                let live = if hovered && !sound { preview_frame(app, &ctx, &client, &local, card) } else { None };
                 if hovered {
                     hovered_card = Some(card.id.clone());
+                }
+                // Hover to hear a Sound card (the app plays it; it stops when the pointer leaves).
+                let sound_src = if hovered && sound { sound_source(&ctx, &client, &local, card) } else { SoundSource::None };
+                if let SoundSource::File(path) = &sound_src {
+                    app.sound_hover = Some(crate::SoundHover { key: card.id.clone(), path: path.clone(), gain: view.sfx_volume });
                 }
                 let tex = live.map(|t| (t.id(), t.size_vec2())).or_else(|| {
                     // This Mac's library folder first (as the web panel), the bucket's copy else.
@@ -2507,6 +2618,9 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                             menu_pick = Some(("motionLibrary.save", json!({"id": card.id})));
                         }
                     }
+                }
+                if hovered && sound {
+                    paint_sound_state(app, &gp, thumb_r, card, &sound_src, view.sfx_volume, s);
                 }
                 if selected {
                     gp.rect_stroke(tile, radius, Stroke::new(2.0, t.accent), egui::StrokeKind::Inside);
@@ -2854,6 +2968,9 @@ pub fn set_view(view: &mut ViewState, p: &Value) -> Result<Value, String> {
             return Err(format!("unknown workspace `{w}` (assets, curves, tools)"));
         }
         view.workspace = if w == "assets" { String::new() } else { w.to_string() };
+    }
+    if let Some(v) = p.get("sfxVolume") {
+        view.sfx_volume = v.as_f64().ok_or("`sfxVolume` is the SFX preview volume, 0–1")? as f32;
     }
     if let Some(k) = p.get("kind") {
         view.kind_filter = k.as_str().ok_or("`kind` is a card kind (Comp, Overlay, Sound…; \"\" = all)")?.to_string();
@@ -4666,6 +4783,77 @@ mod library_tests {
         apply_change(&mut ops, FolderChange::GroupDeleted("Work".into()));
         assert_eq!(folder_group(&lib, &ops, "A"), "");
         assert_eq!(group_names(&lib, &ops), ["Empty"]);
+    }
+
+    #[test]
+    fn sfx_volume_defaults_persists_and_clamps() {
+        let v = ViewState::default();
+        assert_eq!(v.sfx_volume, DEFAULT_SFX_VOLUME);
+        // A workspace saved before the setting existed keeps the default.
+        let old: ViewState = serde_json::from_value(json!({"query": "hit", "cardSize": 144.0})).unwrap();
+        assert_eq!(old.sfx_volume, DEFAULT_SFX_VOLUME);
+        // Kept with the workspace.
+        let mut v = ViewState { sfx_volume: 0.65, ..ViewState::default() };
+        let back: ViewState = serde_json::from_value(serde_json::to_value(&v).unwrap()).unwrap();
+        assert_eq!(back.sfx_volume, 0.65);
+        // `motionLibrary.view {sfxVolume}`, clamped; a bad value is refused.
+        assert_eq!(set_view(&mut v, &json!({"sfxVolume": 0.4})).unwrap()["sfxVolume"], json!(0.4f32));
+        set_view(&mut v, &json!({"sfxVolume": 3})).unwrap();
+        assert_eq!(v.sfx_volume, 1.0);
+        assert!(set_view(&mut v, &json!({"sfxVolume": "loud"})).is_err());
+        v.sfx_volume = f32::NAN;
+        v.clamp();
+        assert_eq!(v.sfx_volume, DEFAULT_SFX_VOLUME);
+    }
+
+    #[test]
+    fn sound_cards_play_local_files_first_and_only_small_bucket_files() {
+        use effectcraft_engine::motionlib::{DirRemote, DirStore, sha256_hex};
+        let dir = std::env::temp_dir().join(format!("ec-ml-sound-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("remote/blobs")).unwrap();
+        let file = dir.join("Hit.wav");
+        std::fs::write(&file, b"RIFF").unwrap();
+        let client = Client::new(Arc::new(DirRemote::new(dir.join("remote"))), Arc::new(DirStore::new(dir.join("cache"))));
+        let ctx = egui::Context::default();
+        let path = |p: &std::path::Path| p.to_string_lossy().to_string();
+        // This Mac's library folder: its preview when it exists, else its file.
+        let mut local = LocalIndex::new();
+        let entry = effectcraft_engine::motion_library::LocalEntry {
+            id: "sfx-1".into(),
+            kind: "audio".into(),
+            file: path(&file),
+            preview: path(&dir.join("gone/preview.mp3")),
+            ..Default::default()
+        };
+        local.insert("sfx-1".into(), entry);
+        let card = Card { id: "sfx-1".into(), kind: "mac".into(), on_mac: true, ..Card::default() };
+        assert!(is_sound(&card, &local));
+        assert!(matches!(sound_source(&ctx, &client, &local, &card), SoundSource::File(p) if p == path(&file)));
+        // Not a sound: no hover sound (its preview plays as video instead).
+        let comp = Card { id: "c".into(), kind: "comp".into(), kind_label: "Comp".into(), ..Card::default() };
+        assert!(!is_sound(&comp, &local));
+        // Elsewhere: the bucket's copy, when small enough to fetch for a hover.
+        let bytes = b"RIFF small sound".to_vec();
+        let hash = sha256_hex(&bytes);
+        std::fs::write(dir.join("remote/blobs").join(&hash), &bytes).unwrap();
+        let small = BlobRef { hash, size: bytes.len() as u64, gz: false, name: "Whoosh.wav".into() };
+        let remote = Card { id: "sfx-2".into(), kind: "footage".into(), kind_label: "Sound".into(), project: Some(small), ..Card::default() };
+        assert!(is_sound(&remote, &local));
+        let t = std::time::Instant::now();
+        let got = loop {
+            match sound_source(&ctx, &client, &local, &remote) {
+                SoundSource::Loading if t.elapsed() < std::time::Duration::from_secs(10) => std::thread::sleep(std::time::Duration::from_millis(5)),
+                other => break other,
+            }
+        };
+        assert!(matches!(got, SoundSource::File(p) if std::fs::read(&p).unwrap() == bytes));
+        // A big file isn't downloaded for a hover.
+        let big = BlobRef { hash: "ab".repeat(32), size: SOUND_HOVER_MAX_BYTES + 1, gz: false, name: "Long.wav".into() };
+        let huge = Card { id: "sfx-3".into(), kind: "footage".into(), kind_label: "Sound".into(), project: Some(big), ..Card::default() };
+        assert!(matches!(sound_source(&ctx, &client, &local, &huge), SoundSource::None));
+        assert!(!dir.join("cache").read_dir().map(|d| d.flatten().any(|e| e.file_name().to_string_lossy().contains("abab"))).unwrap_or(false));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
