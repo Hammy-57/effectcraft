@@ -1421,6 +1421,7 @@ dependencies = [
  "serde_json",
  "winit",
  "winresource",
+ "x11rb",
  "zbus",
 ]
 
@@ -1599,6 +1600,7 @@ dependencies = [
  "effectcraft-render",
  "effectcraft-text",
  "effectcraft-time",
+ "serde",
  "serde_json",
 ]
 
