@@ -48,6 +48,8 @@ const LOW_LEAD_SECS: f64 = 1.0;
 const HIGH_LEAD_SECS: f64 = 2.5;
 /// Chunks of a new stream sent below full size (the warm-up).
 const WARM_CHUNKS: usize = 2;
+/// Most seconds added to the render-ahead window for a slow pipeline.
+const MAX_EXTRA_AHEAD_SECS: f64 = 8.0;
 /// Least time between two resolution changes.
 const LEVEL_HOLD: Duration = Duration::from_millis(1200);
 /// How often the controller looks again without being woken.
@@ -134,7 +136,24 @@ impl Streams {
                 }
                 let full = (even(full.0), even(full.1));
                 let ahead = (f64::from(ahead_secs.clamp(0.5, 60.0)) * rate.as_f64()).ceil() as i64;
-                let p = Params { comp, lo, hi, loop_lo, looping, opts: *opts, codec, crf, n, anchor: start, ahead, adaptive, full, rate, bg: c.background };
+                let p = Params {
+                    comp,
+                    lo,
+                    hi,
+                    loop_lo,
+                    looping,
+                    opts: *opts,
+                    codec,
+                    crf,
+                    n,
+                    anchor: start,
+                    ahead,
+                    base_ahead: ahead,
+                    adaptive,
+                    full,
+                    rate,
+                    bg: c.background,
+                };
                 let shared = Arc::new(Shared::new(self.host.clone(), self.out.clone(), self.conn, stream, p, revision, project, start));
                 if let Err(e) = shared.spawn() {
                     return self.reply(fail(e));
@@ -196,8 +215,10 @@ struct Params {
     n: u32,
     /// The chunk grid's frame 0 (where playback started or last jumped to).
     anchor: i64,
-    /// Frames kept ahead of the playhead.
+    /// Frames kept ahead of the playhead: `base_ahead` (Start's `aheadSecs`) plus what a chunk
+    /// takes from start to sent now (so the lead stays near `base_ahead` on a slow machine).
     ahead: i64,
+    base_ahead: i64,
     adaptive: bool,
     /// The full-size frame (even).
     full: (u32, u32),
@@ -518,6 +539,8 @@ impl Shared {
                 return;
             }
             let now = st.now_frame();
+            let pipeline = st.latency[st.cur_level.min(LEVELS.len() - 1)].unwrap_or(1.0).clamp(0.0, MAX_EXTRA_AHEAD_SECS);
+            st.p.ahead = st.p.base_ahead + (pipeline * st.p.fps()).ceil() as i64;
             let window = st.p.window(now);
             // Chunks the playhead has passed while they rendered: not wanted any more.
             if st.playing {
