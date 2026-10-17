@@ -78,7 +78,7 @@ pub fn rgba_to_yuv420(rgba: &[u8], w: u32, h: u32, bg: [f32; 3], ew: u32, eh: u3
         for dy in 0..2 {
             let Some(src) = rgba.get((cy * 2 + dy) * stride..).and_then(|s| s.get(..ew * 4)) else { continue };
             let Some(row) = yr.get_mut(dy * ew..(dy + 1) * ew) else { continue };
-            for (x, (px, out)) in src.chunks_exact(4).zip(row.iter_mut()).enumerate() {
+            for (x, (px, out)) in src.as_chunks::<4>().0.iter().zip(row.iter_mut()).enumerate() {
                 let rest = 1.0 - px[3] as f32 / 255.0;
                 let r = (px[0] as f32 + bg[0] * rest) / 255.0;
                 let g = (px[1] as f32 + bg[1] * rest) / 255.0;
@@ -151,7 +151,7 @@ fn yuv420_to_rgba(p: &filmcraft_h264::Picture) -> ChunkFrame {
         let ys = p.y.get(row * p.y_stride..).unwrap_or(&[]);
         let cr = row / 2 * p.uv_stride;
         let (us, vs) = (p.u.get(cr..).unwrap_or(&[]), p.v.get(cr..).unwrap_or(&[]));
-        for (x, px) in out.chunks_exact_mut(4).enumerate() {
+        for (x, px) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let yv = (*ys.get(x).unwrap_or(&16) as f32 - 16.0) / 219.0;
             let cb = (*us.get(x / 2).unwrap_or(&128) as f32 - 128.0) / 224.0;
             let crv = (*vs.get(x / 2).unwrap_or(&128) as f32 - 128.0) / 224.0;
@@ -211,11 +211,16 @@ mod tests {
         assert_eq!(back.len(), 6);
         for (src, got) in frames.iter().zip(&back) {
             assert_eq!((got.width, got.height), (w, h));
-            let diff: f64 =
-                src.chunks_exact(4).zip(got.rgba.chunks_exact(4)).map(|(a, b)| (0..3).map(|c| (a[c] as f64 - b[c] as f64).abs()).sum::<f64>()).sum();
+            let diff: f64 = src
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(got.rgba.as_chunks::<4>().0.iter())
+                .map(|(a, b)| (0..3).map(|c| (a[c] as f64 - b[c] as f64).abs()).sum::<f64>())
+                .sum();
             let mean = diff / (w * h * 3) as f64;
             assert!(mean < 6.0, "mean error {mean}");
-            assert!(got.rgba.chunks_exact(4).all(|p| p[3] == 255), "opaque");
+            assert!(got.rgba.as_chunks::<4>().0.iter().all(|p| p[3] == 255), "opaque");
         }
     }
 

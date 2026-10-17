@@ -238,7 +238,7 @@ fn psnr(src: &[&[u8]], got: &[&[u8]], bg: [f32; 3]) -> f64 {
     for (a, b) in src.iter().zip(got) {
         let mut se = 0.0f64;
         let mut k = 0usize;
-        for (p, q) in a.chunks_exact(4).zip(b.chunks_exact(4)) {
+        for (p, q) in a.as_chunks::<4>().0.iter().zip(b.as_chunks::<4>().0.iter()) {
             let rest = 1.0 - p[3] as f64 / 255.0;
             for c in 0..3 {
                 let v = p[c] as f64 + bg[c] as f64 * 255.0 * rest;
