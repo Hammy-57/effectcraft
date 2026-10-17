@@ -4,9 +4,9 @@
 
 use std::sync::Arc;
 
+use crate::color::Label;
 use effectcraft_keyframe::{Keyframe, Value as KValue};
 use effectcraft_project::{Comp, ItemId, ItemKind, Layer, Project};
-use crate::color::Label;
 use effectcraft_time::Tick;
 use serde_json::json;
 

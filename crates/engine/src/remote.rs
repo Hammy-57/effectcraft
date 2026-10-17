@@ -45,8 +45,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::offload::SegData;
-pub use crate::remote_sync::{Coalescer, LayerOp, Patch, PatchOp, SyncCache, decode_msg, encode_msg, project_hash};
 use crate::remote_sync;
+pub use crate::remote_sync::{Coalescer, LayerOp, Patch, PatchOp, SyncCache, decode_msg, encode_msg, project_hash};
 
 /// One step of a path into a JSON document.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -111,11 +111,9 @@ fn diff_into(old: &Value, new: &Value, path: &mut Vec<Step>, ops: &mut Vec<Op>) 
             let room = a.len().min(b.len()).saturating_sub(pre);
             let suf = a.iter().rev().zip(b.iter().rev()).take(room).take_while(|(x, y)| x == y).count();
             match b.get(pre..b.len().saturating_sub(suf)) {
-                Some(mid) if pre + suf > 0 => ops.push(Op {
-                    path: path.clone(),
-                    value: Some(Value::Array(mid.to_vec())),
-                    splice: Some([pre, a.len().saturating_sub(pre + suf)]),
-                }),
+                Some(mid) if pre + suf > 0 => {
+                    ops.push(Op { path: path.clone(), value: Some(Value::Array(mid.to_vec())), splice: Some([pre, a.len().saturating_sub(pre + suf)]) })
+                }
                 _ => ops.push(Op { path: path.clone(), value: Some(new.clone()), splice: None }),
             }
         }
