@@ -530,18 +530,20 @@ fn preview_on(app: &mut EffectcraftApp, ui: &mut egui::Ui, x: f32, cy: f32) -> f
         _ => "Preview: This Mac".to_string(),
     };
     let tip = match &status {
-        Some(s) => format!(
-            "Where the viewer's preview frames render. Exports always render on this Mac.\n{}: {}{}",
-            s.address,
-            if s.ready {
-                "ready"
-            } else if s.connected {
-                "loading the project"
-            } else {
-                "not connected"
-            },
-            s.gpu.as_ref().map(|g| format!(" · {g}")).unwrap_or_default()
-        ) + &cloud_usage(s),
+        Some(s) => {
+            format!(
+                "Where the viewer's preview frames render. Exports always render on this Mac.\n{}: {}{}",
+                s.address,
+                if s.ready {
+                    "ready"
+                } else if s.connected {
+                    "loading the project"
+                } else {
+                    "not connected"
+                },
+                s.gpu.as_ref().map(|g| format!(" · {g}")).unwrap_or_default()
+            ) + &cloud_usage(s)
+        }
         None => "Where the viewer's preview frames render. Exports always render on this Mac.".to_string(),
     };
     let w = ui.painter().layout_no_wrap(label.clone(), crate::theme::Tokens::ui(11.5), t.text).size().x + 26.0;

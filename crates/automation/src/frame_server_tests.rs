@@ -413,4 +413,3 @@ fn precache_fills_the_frame_cache_and_cached_frames_skip_the_render() {
     assert_eq!(frames.stats().hits, 1);
     h.stop();
 }
-

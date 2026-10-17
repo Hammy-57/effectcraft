@@ -766,18 +766,17 @@ impl Link {
         // The server's default renderer is its CPU; Auto picks its GPU (CR4 hand-over).
         opts.backend = Backend::Auto;
         let id = self.id();
-        let render =
-            FrameMsg::Render {
-                id,
-                revision: job.revision,
-                comp: job.comp,
-                time: job.t,
-                opts: Box::new(opts),
-                // The server's frame cache key (CR8): a frame it holds comes back without a render.
-                disk: job.disk_key.map(|k| format!("{k:032x}")),
-                layers: false,
-                prefetch: vec![],
-            };
+        let render = FrameMsg::Render {
+            id,
+            revision: job.revision,
+            comp: job.comp,
+            time: job.t,
+            opts: Box::new(opts),
+            // The server's frame cache key (CR8): a frame it holds comes back without a render.
+            disk: job.disk_key.map(|k| format!("{k:032x}")),
+            layers: false,
+            prefetch: vec![],
+        };
         let want = Want { codec: Codec::Jpeg, quality: 85, max_size: None, refine: job.urgent };
         if !self.client.send(Up::Msg { msg: render, want, urgent: job.urgent }, vec![]) {
             return done(Err("the cloud connection dropped".into()));

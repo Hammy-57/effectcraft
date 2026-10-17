@@ -50,6 +50,8 @@ struct Entry {
     duration: Option<f64>,
     thumbnail: String,
     preview: String,
+    /// A folder of PNG frames played on hover (the Motion Library's MotionEssence cards).
+    frames: String,
 }
 
 /// A library folder, read.
@@ -102,6 +104,9 @@ pub struct LocalEntry {
     pub file: String,
     pub preview: String,
     pub thumbnail: String,
+    /// A folder of PNG frames to play on hover (the index's `frames`, else `Png` beside the
+    /// thumbnail); may not exist.
+    pub frames: String,
     pub folder: String,
 }
 
@@ -146,6 +151,11 @@ pub(crate) fn local_entries(s: &Session) -> Arc<LocalIndex> {
                 file: resolve(&lib.folder, &e.file),
                 preview: resolve(&lib.folder, &e.preview),
                 thumbnail: resolve(&lib.folder, &e.thumbnail),
+                frames: if e.frames.is_empty() {
+                    std::path::Path::new(&resolve(&lib.folder, &e.thumbnail)).parent().map(|d| d.join("Png").to_string_lossy().to_string()).unwrap_or_default()
+                } else {
+                    resolve(&lib.folder, &e.frames)
+                },
                 folder: lib.folder.clone(),
             });
         }
