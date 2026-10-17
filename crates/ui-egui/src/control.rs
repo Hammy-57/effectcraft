@@ -18,6 +18,8 @@
 //! - `ui.screenshot {path?, panel?, id?, max_side?}`: PNG of the window (or one panel / element),
 //!   longest side at most `max_side` pixels (default 1600, 0 = full size)
 //! - `app.revision`: the session's `{revision}` (a cheap change check)
+//! - `app.sync {follower, have?}`: what a render box needs to mirror the project (a patch since
+//!   the app revision `have`, or the whole project) and the cursors ([`effectcraft_engine::remote_follow`])
 //! - `render.frame {comp?, item?, layer?, time?, max_side?, transparent?, region?, overlays?, path?, base64?}`: PNG of a frame rendered by the session
 //! - `ui.figmaPair {client}`: the one-time Figma pairing prompt; replies `{allowed}` once answered
 //! - `ui.resize {width, height}` / `ui.focus` / `app.quit {force?}` (a modified project asks to save first unless `force`)
@@ -548,6 +550,22 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
             Outcome::Screenshot { path: s("path").map(str::to_string), crop, max_side }
         }
         "app.revision" => ok(json!({"revision": app.session.revision})),
+        // A render box's pull: the diff is cheap here; its bytes (the whole project the first
+        // time) are made on another thread so playback keeps its frames.
+        "app.sync" => match effectcraft_engine::remote_follow::pull(&mut app.session, p) {
+            Ok(pull) if pull.heavy() && !cfg!(target_arch = "wasm32") => {
+                let reply = req.reply.clone();
+                let spawned = std::thread::Builder::new().name("ec-app-sync".into()).spawn(move || {
+                    let _ = reply.send(json!({"ok": true, "result": pull.into_reply()}));
+                });
+                match spawned {
+                    Ok(_) => Outcome::Held,
+                    Err(e) => err(format!("app.sync: {e}")),
+                }
+            }
+            Ok(pull) => ok(pull.into_reply()),
+            Err(e) => err(e),
+        },
         // Desktop: rendered off the UI thread like the engine command (the reply waits for it).
         "render.frame" if !cfg!(target_arch = "wasm32") => match execute_engine(app, "render.frame", p.clone()) {
             Ok(o) => o,
