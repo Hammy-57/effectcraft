@@ -610,7 +610,7 @@ fn message(conn: u64, msg: FrameMsg, want: Want, urgent: bool, replica: &mut Fra
             let t0 = Instant::now();
             let kind = match &sync {
                 FrameMsg::Project { project, .. } => format!("project {} KB", project.len() / 1024),
-                FrameMsg::Patch { ops, .. } => format!("patch {} ops", ops.len()),
+                FrameMsg::Patch(p) => format!("patch {} ops", p.ops.len()),
                 _ => "segmentations".into(),
             };
             for (reply, _) in replica.handle(sync) {

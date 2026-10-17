@@ -257,7 +257,7 @@ fn frames_render_stale_ones_fail_and_refines_are_exact() {
     let (r, ..) = reply(&c);
     assert!(matches!(r, FrameReply::Frame { id: 4, .. }), "{r:?}");
     // A patch that does not apply asks for the whole project.
-    assert!(c.send(Up::Msg { msg: FrameMsg::Patch { from: 999, revision: 1000, ops: vec![] }, want, urgent: false }, vec![]));
+    assert!(c.send(Up::Msg { msg: FrameMsg::Patch(effectcraft_engine::remote_sync::Patch { from_rev: 999, to_rev: 1000, ops: vec![] }), want, urgent: false }, vec![]));
     let (r, ..) = reply(&c);
     assert!(matches!(r, FrameReply::Resync { .. }), "{r:?}");
     h.stop();
