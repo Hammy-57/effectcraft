@@ -187,55 +187,117 @@ pub mod sha256 {
         0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
     ];
 
+    const H0: [u32; 8] = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+
+    fn compress(h: &mut [u32; 8], block: &[u8; 64]) {
+        let mut w = [0u32; 64];
+        for (i, c) in block.as_chunks::<4>().0.iter().enumerate() {
+            w[i] = u32::from_be_bytes([c[0], c[1], c[2], c[3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = *h;
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ (!e & g);
+            let t1 = hh.wrapping_add(s1).wrapping_add(ch).wrapping_add(K[i]).wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        for (x, y) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
+            *x = x.wrapping_add(y);
+        }
+    }
+
+    /// Incremental SHA-256, for files too large to hold in memory (media checksums).
+    #[derive(Clone)]
+    pub struct Sha256 {
+        h: [u32; 8],
+        buf: [u8; 64],
+        fill: usize,
+        len: u64,
+    }
+
+    impl Default for Sha256 {
+        fn default() -> Self {
+            Sha256 { h: H0, buf: [0; 64], fill: 0, len: 0 }
+        }
+    }
+
+    impl Sha256 {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        pub fn update(&mut self, mut data: &[u8]) {
+            self.len = self.len.wrapping_add(data.len() as u64);
+            if self.fill > 0 {
+                let take = (64 - self.fill).min(data.len());
+                self.buf[self.fill..self.fill + take].copy_from_slice(&data[..take]);
+                self.fill += take;
+                data = &data[take..];
+                if self.fill < 64 {
+                    return;
+                }
+                let block = self.buf;
+                compress(&mut self.h, &block);
+                self.fill = 0;
+            }
+            let (blocks, rest) = data.as_chunks::<64>();
+            for block in blocks {
+                compress(&mut self.h, block);
+            }
+            self.buf[..rest.len()].copy_from_slice(rest);
+            self.fill = rest.len();
+        }
+
+        pub fn finish(mut self) -> [u8; 32] {
+            let bits = self.len.wrapping_mul(8);
+            let mut tail = self.buf[..self.fill].to_vec();
+            tail.push(0x80);
+            while tail.len() % 64 != 56 {
+                tail.push(0);
+            }
+            tail.extend_from_slice(&bits.to_be_bytes());
+            for block in tail.as_chunks::<64>().0 {
+                compress(&mut self.h, block);
+            }
+            let mut out = [0u8; 32];
+            for (i, v) in self.h.iter().enumerate() {
+                out[i * 4..i * 4 + 4].copy_from_slice(&v.to_be_bytes());
+            }
+            out
+        }
+
+        pub fn finish_hex(self) -> String {
+            to_hex(&self.finish())
+        }
+    }
+
+    pub fn to_hex(digest: &[u8; 32]) -> String {
+        digest.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
     pub fn digest(data: &[u8]) -> [u8; 32] {
-        let mut h: [u32; 8] = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
-        let bits = (data.len() as u64).wrapping_mul(8);
-        let mut tail = data[data.len() - data.len() % 64..].to_vec();
-        tail.push(0x80);
-        while tail.len() % 64 != 56 {
-            tail.push(0);
-        }
-        tail.extend_from_slice(&bits.to_be_bytes());
-        for block in data[..data.len() - data.len() % 64].as_chunks::<64>().0.iter().chain(tail.as_chunks::<64>().0.iter()) {
-            let mut w = [0u32; 64];
-            for (i, c) in block.as_chunks::<4>().0.iter().enumerate() {
-                w[i] = u32::from_be_bytes([c[0], c[1], c[2], c[3]]);
-            }
-            for i in 16..64 {
-                let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-                let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-                w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
-            }
-            let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
-            for i in 0..64 {
-                let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-                let ch = (e & f) ^ (!e & g);
-                let t1 = hh.wrapping_add(s1).wrapping_add(ch).wrapping_add(K[i]).wrapping_add(w[i]);
-                let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-                let maj = (a & b) ^ (a & c) ^ (b & c);
-                let t2 = s0.wrapping_add(maj);
-                hh = g;
-                g = f;
-                f = e;
-                e = d.wrapping_add(t1);
-                d = c;
-                c = b;
-                b = a;
-                a = t1.wrapping_add(t2);
-            }
-            for (x, y) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
-                *x = x.wrapping_add(y);
-            }
-        }
-        let mut out = [0u8; 32];
-        for (i, v) in h.iter().enumerate() {
-            out[i * 4..i * 4 + 4].copy_from_slice(&v.to_be_bytes());
-        }
-        out
+        let mut h = Sha256::new();
+        h.update(data);
+        h.finish()
     }
 
     pub fn hex(data: &[u8]) -> String {
-        digest(data).iter().map(|b| format!("{b:02x}")).collect()
+        to_hex(&digest(data))
     }
 
     #[cfg(test)]
@@ -247,6 +309,19 @@ pub mod sha256 {
             let long = b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
             assert_eq!(super::hex(long), "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
             assert_eq!(super::hex(&vec![b'a'; 1_000_000]), "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
+        }
+
+        #[test]
+        fn incremental_matches_one_shot_for_any_split() {
+            let data: Vec<u8> = (0..1000u32).map(|i| (i * 31 % 251) as u8).collect();
+            let whole = super::hex(&data);
+            for step in [1, 3, 63, 64, 65, 200, 999] {
+                let mut h = super::Sha256::new();
+                for chunk in data.chunks(step) {
+                    h.update(chunk);
+                }
+                assert_eq!(h.finish_hex(), whole, "step {step}");
+            }
         }
     }
 }

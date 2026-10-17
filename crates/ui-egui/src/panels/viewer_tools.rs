@@ -507,6 +507,71 @@ fn popup(app: &mut EffectcraftApp, ui: &mut egui::Ui, id: &str, anchor: Rect, it
     })
 }
 
+/// Preview On (CR5): where the viewer's preview frames render, This Mac / Cloud / Auto, and
+/// where they come from now (the cloud's round trip while it serves them). Automation ids
+/// `viewer.previewOn` (labelled with what it shows) and `viewer.previewOnItem.<n>`. Returns
+/// the right edge.
+#[cfg(not(target_arch = "wasm32"))]
+fn preview_on(app: &mut EffectcraftApp, ui: &mut egui::Ui, x: f32, cy: f32) -> f32 {
+    use crate::cloud::Source;
+    let t = app.tokens;
+    let mode = app.session.prefs.previews.preview_on.clone();
+    let status = app.cloud.status();
+    let on_cloud = app.cloud.source == Some(Source::Cloud);
+    let rtt = status.as_ref().and_then(|s| s.rtt_ms).map(|r| format!(" {r:.0} ms")).unwrap_or_default();
+    let ready = status.as_ref().is_some_and(|s| s.ready);
+    let label = match mode.as_str() {
+        "cloud" if on_cloud => format!("Preview: Cloud{rtt}"),
+        "cloud" if status.as_ref().is_some_and(|s| s.connected) => "Preview: Cloud (loading)".to_string(),
+        "cloud" => "Preview: Mac (cloud offline)".to_string(),
+        "auto" if on_cloud => format!("Preview: Auto · Cloud{rtt}"),
+        "auto" if ready => "Preview: Auto · Mac".to_string(),
+        "auto" => "Preview: Auto · Mac (cloud offline)".to_string(),
+        _ => "Preview: This Mac".to_string(),
+    };
+    let tip = match &status {
+        Some(s) => format!(
+            "Where the viewer's preview frames render. Exports always render on this Mac.\n{}: {}{}",
+            s.address,
+            if s.ready {
+                "ready"
+            } else if s.connected {
+                "loading the project"
+            } else {
+                "not connected"
+            },
+            s.gpu.as_ref().map(|g| format!(" · {g}")).unwrap_or_default()
+        ),
+        None => "Where the viewer's preview frames render. Exports always render on this Mac.".to_string(),
+    };
+    let w = ui.painter().layout_no_wrap(label.clone(), crate::theme::Tokens::ui(11.5), t.text).size().x + 26.0;
+    let r = Rect::from_min_size(pos2(x, cy - 10.0), vec2(w.clamp(90.0, 260.0), 20.0));
+    let resp = widgets::dropdown_tip(ui, r, &label, Some(&tip), &t, egui::Id::new("vw-preview-on"));
+    if resp.clicked() {
+        toggle_popup(ui, "vw-preview-on-pop");
+    }
+    app.auto.add_response("viewer.previewOn", &resp, &label);
+    let modes = [("This Mac", "local"), ("Cloud", "cloud"), ("Auto", "auto")];
+    let mut items: Vec<(String, bool)> = modes.iter().map(|(l, m)| (l.to_string(), mode == *m)).collect();
+    items.push(("-".into(), false));
+    items.push(("Cloud Preview Settings...".into(), false));
+    match popup(app, ui, "vw-preview-on-pop", r, &items, "previewOnItem") {
+        Some(i) if i < modes.len() => {
+            if let Some((_, m)) = modes.get(i)
+                && *m != mode
+            {
+                if let Err(e) = app.session.prefs.set("previews.previewOn", json!(m)) {
+                    app.ui.status = e;
+                }
+                app.session.prefs_changed();
+            }
+        }
+        Some(_) => crate::panels::settings::open(app, "previews"),
+        None => {}
+    }
+    r.max.x
+}
+
 fn toggle_popup(ui: &egui::Ui, id: &str) {
     let pid = egui::Id::new(id).with("open");
     let open: bool = ui.data(|d| d.get_temp(pid).unwrap_or(false));
@@ -793,6 +858,10 @@ fn bottom_bar_contents(app: &mut EffectcraftApp, ui: &mut egui::Ui, bar: Rect, z
         let _ = app.session.execute("view.fastPreviewMode", json!({"mode": FastPreviews::ALL[i].id()}));
     }
     x += 4.0;
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        x = preview_on(app, ui, x, cy) + 4.0;
+    }
     // 3D renderer + view.
     if comp.has_3d() {
         // The comp's 3D renderer, as After Effects' Composition panel shows it: the menu switches
