@@ -330,10 +330,12 @@ fn transform_row(
     // With several layers selected the edit applies to all: a scrub by the same change, a typed
     // value as it is.
     let scrub = ui.ctx().dragged_id().is_some() && ui.input(|i| i.pointer.is_decidedly_dragging());
+    let value = ectx.value(layer, pr);
+    let raw = pr.value_at(layer.layer_time(ectx.time));
     let set = |actions: &mut Actions, v: serde_json::Value| {
+        let v = widgets::scrub_value(pr.has_expression(), &raw, &value, v, scrub);
         actions.push(("prop.set".into(), json!({"layer": lid, "prop": uid, "value": v, "merge": merge, "selected": true, "offset": scrub})))
     };
-    let value = ectx.value(layer, pr);
     let is_scale = pr.name == "Scale";
     let pct = is_scale || pr.name == "Opacity";
     let suffix = row.suffix.unwrap_or(if pct { "%" } else { "" });

@@ -138,6 +138,35 @@ pub fn hot_number_at(
     (rect, out, resp.drag_stopped())
 }
 
+/// The value a hot-text edit of a property writes. A property with an expression shows the
+/// expression's result, as in After Effects, but a drag moves the value under the expression
+/// (`raw`) by the drag's change: writing the shown value back would add the expression's offset
+/// again every frame, and a `wiggle` ran the angle away by hundreds of degrees whatever the Cmd
+/// (fine) or Shift (coarse) multiplier. A typed value is the new pre-expression value as it is.
+pub fn scrub_value(
+    has_expression: bool,
+    raw: &effectcraft_engine::keyframe::Value,
+    shown: &effectcraft_engine::keyframe::Value,
+    new: serde_json::Value,
+    dragging: bool,
+) -> serde_json::Value {
+    if !has_expression || !dragging {
+        return new;
+    }
+    let (r, s) = (raw.components(), shown.components());
+    let n: Option<Vec<f64>> = match &new {
+        serde_json::Value::Number(x) => x.as_f64().map(|x| vec![x]),
+        serde_json::Value::Array(a) => a.iter().map(serde_json::Value::as_f64).collect(),
+        _ => None,
+    };
+    let Some(n) = n.filter(|n| n.len() == r.len() && n.len() == s.len()) else { return new };
+    let out: Vec<f64> = n.iter().zip(r.iter().zip(s.iter())).map(|(n, (r, s))| r + (n - s)).collect();
+    match (&new, out.as_slice()) {
+        (serde_json::Value::Number(_), [x]) => serde_json::json!(x),
+        _ => serde_json::json!(out),
+    }
+}
+
 /// Ctrl+Alt (Cmd+Opt on macOS) held while scrubbing hot text: After Effects' Proportional
 /// Scrubbing, which spreads the change over the selected layers by selection order. Ctrl alone
 /// still scrubs finely and Shift by tens.

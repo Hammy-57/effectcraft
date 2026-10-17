@@ -135,6 +135,8 @@ mod ui_script_console;
 mod ui_scriptui;
 #[path = "../ui_scrolling.rs"]
 mod ui_scrolling;
+#[path = "../ui_scrub_expression.rs"]
+mod ui_scrub_expression;
 #[path = "../ui_settings_info.rs"]
 mod ui_settings_info;
 #[path = "../ui_smart_freeze.rs"]

@@ -275,6 +275,7 @@ pub(super) fn show(
             let mut eval = EvalCtx::new(&project, n.context.comp, &comp, n.context.time);
             eval.expr = expr.as_deref();
             let value = eval.value(&layer, prop);
+            let raw = prop.value_at(layer.layer_time(eval.time));
             let sw = Rect::from_center_size(pos2(indent, cy), vec2(15.0, 15.0));
             if !prop.static_only {
                 icons::paint(&lp, sw, Icon::Stopwatch, if prop.is_animated() { t.hot_text } else { t.text_dim });
@@ -343,7 +344,7 @@ pub(super) fn show(
                         app.session.history.merge_key = None;
                     }
                 } else {
-                    value_editor(app, ui, &lp, &layer, prop, &value, at, Some(&instance_key(n.root, &n.path)), &mut local);
+                    value_editor(app, ui, &lp, &layer, prop, &value, &raw, at, Some(&instance_key(n.root, &n.path)), &mut local);
                 }
             });
             if !graph_on {
