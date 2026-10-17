@@ -151,6 +151,7 @@ impl FrameRender for GpuRender {
             let mut r = Renderer::new(job.project, self.footage.as_ref(), job.opts);
             r.expr = self.expr.as_deref();
             r.cache = Some(job.cache);
+            r.times = job.times;
             r.accel = Some(gpu.as_ref() as &dyn Accelerator);
             // Gpu, or Auto with the project on Mercury GPU Acceleration (as the viewer decides).
             if r.active_accel().is_some() {
@@ -188,6 +189,11 @@ impl FrameRender for GpuRender {
         let mut r = Renderer::new(job.project, self.footage.as_ref(), RenderOpts { backend: Backend::Cpu, ..job.opts });
         r.expr = self.expr.as_deref();
         r.cache = keep_cache.then_some(job.cache);
+        // A GPU attempt's times are not this frame's.
+        if let Some(t) = job.times {
+            t.clear();
+        }
+        r.times = job.times;
         Ok((Rendered::Image(r.comp_frame_cpu(job.comp, job.time)), false))
     }
 

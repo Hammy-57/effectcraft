@@ -2633,7 +2633,7 @@ fn windowless_host_serves_several_agents_one_project() {
     use crate::host_server::{HostConfig, request, serve};
     let dir = autosave_test_dir("host");
     let (port_tx, port_rx) = std::sync::mpsc::channel();
-    let config = HostConfig { port: 0, config_dir: Some(dir.clone()) };
+    let config = HostConfig { port: 0, config_dir: Some(dir.clone()), follow: None };
     let host = std::thread::spawn(move || serve(config, Box::new(|| Ok(Session::default())), move |p| port_tx.send(p).unwrap()));
     let port = port_rx.recv().unwrap();
     // Each agent keeps its connection open, as an MCP bridge does: a client's claims are released

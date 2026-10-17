@@ -572,6 +572,8 @@ pub struct Session {
     /// The Motion Library (cards in a remote bucket, cached locally): made on first use from
     /// `motion-library.json` or the environment, or set by the host (the web app's fetch).
     pub motion_library: motion_library::Handle,
+    /// Render boxes mirroring this session (`app.sync`, [`remote_follow`]).
+    pub followers: remote_follow::Followers,
 }
 
 /// The count behind [`Session::running_for_script`]; only the engine changes it.
@@ -700,6 +702,7 @@ impl Default for Session {
             browser: None,
             storage: None,
             motion_library: Default::default(),
+            followers: Default::default(),
             tasks: vec![],
             job_log: vec![],
             next_task_id: 1,
