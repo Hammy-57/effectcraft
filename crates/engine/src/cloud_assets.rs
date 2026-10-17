@@ -689,8 +689,11 @@ pub fn manifest(project: &Project, read: &dyn Fn(&str) -> Option<Vec<u8>>, hash:
     }
     if hash != Hash::None {
         use rayon::prelude::*;
-        files.par_iter_mut().filter(|e| e.exists && e.sha256.is_none() && (hash == Hash::All || e.size <= SMALL_FILE)).for_each(|e| {
-            e.sha256 = hash_file(&e.path, &mut |_| {});
+        files.par_iter_mut().filter(|e| e.exists && e.sha256.is_none()).for_each(|e| {
+            // A big file is hashed only when asked for, but a hash already known for it as it is
+            // now still goes (no read): a server copy with another mtime is then compared by
+            // content instead of being reported missing.
+            e.sha256 = if hash == Hash::All || e.size <= SMALL_FILE { hash_file(&e.path, &mut |_| {}) } else { cached_hash(&e.path, e.size, e.mtime) };
         });
     }
     fonts.sort_by(|a, b| (&a.font, &a.style).cmp(&(&b.font, &b.style)));
@@ -1408,6 +1411,32 @@ mod tests {
         let gone = m.files.iter().find(|f| f.path == "/nowhere/f_0002.png").unwrap();
         assert_eq!((gone.kind.as_str(), gone.exists), ("sequence", false));
         assert_eq!(m.totals.missing_here, 1);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// CR6b: a footage file over the small-file limit isn't read for the manifest, but a hash
+    /// already known for it goes along, so the server compares a copy with another mtime by
+    /// content instead of calling it missing (10-10 Edit's 6 GB presenter clip on the 3090).
+    #[test]
+    fn a_big_file_carries_its_known_hash_without_being_read() {
+        let d = tmp("bighash");
+        let (known, unknown) = (d.join("known.mov"), d.join("unknown.mov"));
+        for f in [&known, &unknown] {
+            // Sparse: no 129 MB written.
+            std::fs::File::create(f).and_then(|h| h.set_len(SMALL_FILE + 1)).unwrap();
+        }
+        let (known_s, unknown_s) = (known.to_string_lossy().to_string(), unknown.to_string_lossy().to_string());
+        let h = "ab".repeat(32);
+        remember_hash(&known_s, &h);
+        let mut s = Session::default();
+        let p = std::sync::Arc::make_mut(&mut s.project);
+        for path in [&known_s, &unknown_s] {
+            p.add_item("clip", Default::default(), None, ItemKind::Footage(effectcraft_project::Footage { path: path.clone(), ..Default::default() }));
+        }
+        let m: Manifest = serde_json::from_value(s.execute("project.dependencies", json!({})).unwrap()).unwrap();
+        let sha = |p: &str| m.files.iter().find(|f| f.path == p).and_then(|f| f.sha256.clone());
+        assert_eq!(sha(&known_s), Some(h));
+        assert_eq!(sha(&unknown_s), None, "a big file is not hashed unless asked");
         let _ = std::fs::remove_dir_all(&d);
     }
 
