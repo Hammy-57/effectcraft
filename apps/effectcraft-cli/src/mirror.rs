@@ -6,7 +6,7 @@
 //!   (`/Users/elias/...` on Linux); other font files go to one folder (`--font-dir`), which the
 //!   server reads through `EFFECTCRAFT_FONT_DIRS`.
 //! - Only what is missing or changed is sent: size + mtime, and for a same-size file with another
-//!   mtime the sha256 on both sides (equal: only the mtime is fixed there).
+//!   mtime the sha256 on both sides (equal: nothing is sent; `--retime` also copies the mtime).
 //! - One tar stream over ssh, written here (paths with spaces, no rsync, no AppleDouble `._`
 //!   files), with progress; files over 1 GB are listed before anything is sent.
 //! - Project files (`.ecproj`, `.aep`) are never written: syncing the project is CR3's.
@@ -46,15 +46,17 @@ pub fn run(args: &Args, json_out: bool) -> Result<(), Failure> {
         dry_run: args.flag("--dry-run"),
         all: args.flag("--all"),
         verify_hash: args.flag("--verify-hash"),
+        retime: args.flag("--retime"),
     };
     let watch = args.num("--watch")?.map(|s| Duration::from_secs_f64(s.clamp(1.0, 3600.0)));
     let mut backend = manifest_backend(args)?;
     let bridged = args.project.is_none();
     say(&format!("📋 reading the project's dependencies{}", if bridged { " from the app" } else { "" }));
-    let manifest: Manifest = serde_json::from_value(backend.exec("project.dependencies", json!({"hash": "small"}))?)
+    let mut manifest: Manifest = serde_json::from_value(backend.exec("project.dependencies", json!({"hash": "small"}))?)
         .map_err(|e| Failure::Error(format!("project.dependencies: {e}")))?;
     let units = units_of(&manifest, &opts);
     let report = sync(&ssh, &opts, &units, &manifest.host)?;
+    with_known_hashes(&mut manifest);
     if bridged && !opts.dry_run {
         mark(&mut backend, &report.confirmed, true)?;
     }
@@ -89,7 +91,7 @@ pub fn run(args: &Args, json_out: bool) -> Result<(), Failure> {
             continue;
         }
         // Fresh hashes and font names for what changed.
-        let manifest: Manifest = match backend.exec("project.dependencies", json!({"hash": "small"})).map(serde_json::from_value) {
+        let mut manifest: Manifest = match backend.exec("project.dependencies", json!({"hash": "small"})).map(serde_json::from_value) {
             Ok(Ok(m)) => m,
             _ => continue,
         };
@@ -97,12 +99,21 @@ pub fn run(args: &Args, json_out: bool) -> Result<(), Failure> {
         let units: Vec<Unit> = units_of(&manifest, &opts).into_iter().filter(|u| wanted.contains(u.src.as_str())).collect();
         match sync(&ssh, &opts, &units, &manifest.host) {
             Ok(r) => {
+                with_known_hashes(&mut manifest);
                 mark(&mut backend, &r.confirmed, false)?;
                 out = remote_preflight(&ssh, &opts, &manifest)?;
                 say_preflight(&out, &manifest);
             }
             Err(e) => note(failure_text(&e)),
         }
+    }
+}
+
+/// The big files' sha256 this Mac already computed (the mirror hashes a same-size file once):
+/// the server's preflight then compares contents instead of refusing an mtime it can't trust.
+fn with_known_hashes(m: &mut Manifest) {
+    for f in m.files.iter_mut().filter(|f| f.sha256.is_none() && f.exists) {
+        f.sha256 = cloud_assets::cached_sha256(&f.path);
     }
 }
 
@@ -129,6 +140,7 @@ struct Opts {
     dry_run: bool,
     all: bool,
     verify_hash: bool,
+    retime: bool,
 }
 
 /// One file to have on the server.
@@ -253,8 +265,10 @@ fn sync(ssh: &Ssh, opts: &Opts, units: &[Unit], host: &cloud_assets::HostInfo) -
             send.push(u);
         }
     }
-    // Fixing an mtime is cheap and keeps the next check to size + mtime.
-    if !retime.is_empty() && !opts.dry_run {
+    // Same content: the server's preflight compares the hash (once; it remembers). `--retime` also
+    // sets the Mac's mtime there, so the next check is size + mtime alone; it is off by default
+    // because an app running there may reload footage whose mtime changed.
+    if opts.retime && !retime.is_empty() && !opts.dry_run {
         ssh.retime(&retime.iter().map(|u| (u.dest.as_str(), u.mtime)).collect::<Vec<_>>())?;
     }
     for u in &retime {
@@ -275,7 +289,7 @@ fn sync(ssh: &Ssh, opts: &Opts, units: &[Unit], host: &cloud_assets::HostInfo) -
         }
     }
     let total: u64 = send.iter().map(|u| u.size).fold(0, u64::saturating_add);
-    say(&format!("📦 {} up to date, {} re-timed, {} to send ({})", report.up_to_date, report.retimed, send.len(), gb(total)));
+    say(&format!("📦 {} up to date, {} same content (other mtime), {} to send ({})", report.up_to_date, report.retimed, send.len(), gb(total)));
     let mut big: Vec<&Unit> = send.iter().filter(|u| u.size > BIG_FILE).collect();
     big.sort_by_key(|u| std::cmp::Reverse(u.size));
     for u in &big {
@@ -710,11 +724,20 @@ fn note(s: &str) {
 }
 
 fn progress(s: &str) {
+    use std::io::IsTerminal;
+    // A log file gets the summary lines only.
+    if !std::io::stderr().is_terminal() {
+        return;
+    }
     let _ = write!(std::io::stderr(), "\r\x1b[2K{s}");
     let _ = std::io::stderr().flush();
 }
 
 fn progress_end() {
+    use std::io::IsTerminal;
+    if !std::io::stderr().is_terminal() {
+        return;
+    }
     let _ = write!(std::io::stderr(), "\r\x1b[2K");
 }
 

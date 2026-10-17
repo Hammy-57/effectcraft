@@ -216,6 +216,12 @@ fn remember_hashes(found: Vec<(String, u64, i64, String)>) {
     }
 }
 
+/// The remembered sha256 of a file as it is now, without reading it.
+pub fn cached_sha256(path: &str) -> Option<String> {
+    let (size, mtime) = stat(path)?;
+    cached_hash(path, size, mtime)
+}
+
 /// sha256 of a file, streamed (any size), and remembered by size + mtime. `progress` gets the
 /// bytes read so far.
 pub fn hash_file(path: &str, progress: &mut dyn FnMut(u64)) -> Option<String> {
@@ -612,16 +618,17 @@ pub fn check(manifest: &Manifest, verify_hash: bool) -> (Vec<Missing>, Vec<Missi
             let found = match stat(&e.path) {
                 None => Some(Missing::file(e, "missing", "not on this machine".into())),
                 Some((size, _)) if size != e.size => Some(Missing::file(e, "size", format!("{size} bytes here, {} on the Mac", e.size))),
+                // Copied without its mtime: the content decides (hashed once, then remembered).
                 Some((_, mtime)) if mtime != e.mtime || verify_hash => match &e.sha256 {
-                    Some(want) if verify_hash || e.size <= SMALL_FILE => match hash_file(&e.path, &mut |_| {}) {
+                    Some(want) => match hash_file(&e.path, &mut |_| {}) {
                         Some(h) if h.eq_ignore_ascii_case(want) => None,
                         Some(_) => Some(Missing::file(e, "hash", "same size, different content".into())),
                         None => Some(Missing::file(e, "missing", "cannot be read here".into())),
                     },
-                    _ if mtime != e.mtime => {
-                        Some(Missing::file(e, "mtime", format!("same size, modified {mtime} here and {} on the Mac (the mirror verifies the content)", e.mtime)))
+                    None if mtime != e.mtime => {
+                        Some(Missing::file(e, "mtime", format!("same size, modified {mtime} here and {} on the Mac (no sha256 to compare: run the mirror)", e.mtime)))
                     }
-                    _ => None,
+                    None => None,
                 },
                 Some(_) => None,
             };
