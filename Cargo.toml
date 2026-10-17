@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "apps/*", "xtask"]
+# Patched copies of third-party crates (`[patch.crates-io]` below), not EffectCraft's own.
+exclude = ["vendor"]
 default-members = ["crates/*", "apps/*"]
 
 [workspace.package]
@@ -255,4 +257,7 @@ lto = false
 codegen-units = 16
 
 [patch.crates-io]
+# egui-wgpu 0.36.2 that skips a frame instead of panicking when out of video memory (CR1):
+# vendor/egui-wgpu/EFFECTCRAFT.md.
+egui-wgpu = { path = "vendor/egui-wgpu" }
 hayro-syntax = { git = "https://github.com/storytold/craft-libs", rev = "ca50d63b773c99f96e75c77ce5a1d21e7c9cda0d", version = "=0.7.2" }
