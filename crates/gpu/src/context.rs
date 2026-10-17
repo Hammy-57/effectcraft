@@ -661,8 +661,10 @@ pub struct GpuContext {
     vram: Option<crate::vram::VideoMemory>,
     /// The adapter (type, PCI vendor, device) and its video memory as last asked, when (see
     /// [`GpuContext::live_video_memory`]).
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     adapter_ids: (wgpu::DeviceType, u32, u32),
     vram_live: Arc<Mutex<Option<(web_time::Instant, crate::vram::VideoMemory)>>>,
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     vram_asking: Arc<std::sync::atomic::AtomicBool>,
     /// Out-of-memory backoff (CR1): renders in flight now, and at most how many after a render
     /// ran out of memory (`usize::MAX`: no limit yet). See [`GpuContext::max_inflight`].
