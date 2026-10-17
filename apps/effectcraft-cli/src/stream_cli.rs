@@ -84,7 +84,10 @@ pub fn bench(args: &Args) -> Result<(), Failure> {
     );
 
     // Render: `threads` workers take frames in play order.
+    let render_only = args.flag("--render-only");
     let frames: Vec<Mutex<Option<(u32, u32, Vec<u8>)>>> = (0..n).map(|_| Mutex::new(None)).collect();
+    // When each frame started and ended (seconds from the start), for the per-second report.
+    let spans: Vec<Mutex<(f64, f64)>> = (0..n).map(|_| Mutex::new((0.0, 0.0))).collect();
     let next = AtomicUsize::new(0);
     let warm = Instant::now();
     if let Ok((r, _)) = render.render(&RenderJob { project: &project, comp, time: rate.tick_of(first), opts, cache: &cache }) {
@@ -102,12 +105,21 @@ pub fn bench(args: &Args) -> Result<(), Failure> {
                         break;
                     }
                     let time = rate.tick_of(first + i as i64);
-                    match render.render(&RenderJob { project: &project, comp, time, opts, cache: &cache }) {
+                    let began = t0.elapsed().as_secs_f64();
+                    let out = render.render(&RenderJob { project: &project, comp, time, opts, cache: &cache });
+                    if let Some(sp) = spans.get(i)
+                        && let Ok(mut g) = sp.lock()
+                    {
+                        *g = (began, t0.elapsed().as_secs_f64());
+                    }
+                    match out {
                         Ok((r, gpu)) => {
                             if gpu {
                                 gpu_frames.fetch_add(1, Ordering::Relaxed);
                             }
-                            if let Some(slot) = frames.get(i)
+                            if render_only {
+                                drop(r);
+                            } else if let Some(slot) = frames.get(i)
                                 && let Ok(mut g) = slot.lock()
                             {
                                 *g = Some(rgba8(r));
@@ -120,6 +132,26 @@ pub fn bench(args: &Args) -> Result<(), Failure> {
         }
     });
     let render_s = t0.elapsed().as_secs_f64();
+    if render_only {
+        // Per second of comp time: frames / (last end − first start).
+        let spans: Vec<(f64, f64)> = spans.into_iter().map(|m| m.into_inner().unwrap_or((0.0, 0.0))).collect();
+        let per = rate.as_f64().round().max(1.0) as usize;
+        let mut line = String::new();
+        let mut slow = vec![];
+        for (k, sec) in spans.chunks(per).enumerate() {
+            let a = sec.iter().map(|s| s.0).fold(f64::INFINITY, f64::min);
+            let b = sec.iter().map(|s| s.1).fold(0.0, f64::max);
+            let fps = sec.len() as f64 / (b - a).max(1e-6);
+            let at = (first as f64 + (k * per) as f64) / rate.as_f64();
+            line.push_str(&format!(" {at:.0}s:{fps:.0}"));
+            if fps < rate.as_f64() {
+                slow.push(format!("{at:.0}"));
+            }
+        }
+        println!("render: {n} frames in {render_s:.2} s = {:.1} fps; fps per comp second:{line}", n as f64 / render_s);
+        println!("below real time at: {}", if slow.is_empty() { "none".to_string() } else { slow.join(", ") });
+        return Ok(());
+    }
     let frames: Vec<(u32, u32, Vec<u8>)> = frames.into_iter().filter_map(|m| m.into_inner().ok().flatten()).collect();
     let Some((w, h, _)) = frames.first().map(|f| (f.0, f.1, ())) else { return Err(Failure::Error("no frame rendered".into())) };
     println!(
