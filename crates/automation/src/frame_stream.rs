@@ -55,8 +55,9 @@ const LEVEL_HOLD: Duration = Duration::from_millis(1200);
 /// How often the controller looks again without being woken.
 const TICK: Duration = Duration::from_millis(40);
 /// Encoder threads for a chunk the app waits for, and for one sent ahead.
-const URGENT_ENCODE_THREADS: usize = 8;
-const AHEAD_ENCODE_THREADS: usize = 2;
+/// (One thread per encoder is the cheapest per frame; several chunks encode at once.)
+const URGENT_ENCODE_THREADS: usize = 6;
+const AHEAD_ENCODE_THREADS: usize = 1;
 
 /// What every stream of a server shares.
 pub(crate) struct StreamHost {
@@ -722,7 +723,7 @@ impl Shared {
             .collect();
         let Some(&(w, h, _)) = frames.first().map(|f| (f.0, f.1, ())).as_ref() else { return };
         let (ew, eh) = (even(w), even(h));
-        let threads = if lead < 1.5 { URGENT_ENCODE_THREADS } else { AHEAD_ENCODE_THREADS };
+        let threads = if lead < 1.0 { URGENT_ENCODE_THREADS } else { AHEAD_ENCODE_THREADS };
         let spec = ChunkSpec { crf: p.crf, threads, ..ChunkSpec::new(ew, eh, p.rate.num as u32, p.rate.den as u32) };
         let refs: Vec<&[u8]> = frames.iter().filter(|f| (f.0, f.1) == (w, h)).map(|f| f.2.as_slice()).collect();
         let encoded = encode_chunk(&refs, w, h, p.bg, &spec);

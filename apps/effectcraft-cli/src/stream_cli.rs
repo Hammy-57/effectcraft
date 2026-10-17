@@ -519,17 +519,25 @@ pub fn test(args: &Args) -> Result<(), Failure> {
             }
         }
     }
+    // Deadline = the moment playback shows the chunk's first frame; checked on arrival (the
+    // server's part) and once decoded (this machine's part too).
     let (mut late, mut worst, mut slack) = (0u32, f64::NEG_INFINITY, vec![]);
+    let (mut late_dec, mut slack_dec) = (0u32, vec![]);
     let mut by_scale: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
     for (i, a) in firsts.values().enumerate() {
         let deadline = ps + (a.first - from) as f64 / fps;
-        let margin = deadline - a.decoded;
+        let margin = deadline - a.at;
+        let margin_dec = deadline - a.decoded;
         *by_scale.entry(format!("{}", a.scale)).or_default() += 1;
         if i > 0 {
             slack.push(margin);
             worst = worst.max(-margin);
             if margin < 0.0 {
                 late += 1;
+            }
+            slack_dec.push(margin_dec);
+            if margin_dec < 0.0 {
+                late_dec += 1;
             }
         }
     }
@@ -538,17 +546,23 @@ pub fn test(args: &Args) -> Result<(), Failure> {
     let mut dec: Vec<f64> = arrivals.iter().map(|a| a.decode_ms / f64::from(a.frames.max(1))).collect();
     dec.sort_by(f64::total_cmp);
     slack.sort_by(f64::total_cmp);
+    slack_dec.sort_by(f64::total_cmp);
     let pick = |v: &[f64], p: f64| v.get(((v.len().saturating_sub(1)) as f64 * p).round() as usize).copied().unwrap_or(0.0);
     let (w, h) = started.unwrap_or_default();
     println!("--- stream-test: {:.1} s of comp {} from {:.2} s at {w}×{h} ---", frames_total as f64 / fps, comp.0, start.seconds());
     println!("warm-up (start request → first chunk decoded): {:.0} ms", ps * 1000.0);
     println!(
-        "chunks: {} sent ({} distinct times), late after warm-up: {late}; deadline slack p10 {:.0} ms / p50 {:.0} ms / min {:.0} ms",
+        "chunks: {} sent ({} distinct times); arrived after their deadline (after the warm-up): {late}; slack on arrival p10 {:.0} ms / p50 {:.0} ms / min {:.0} ms",
         arrivals.len(),
         firsts.len(),
         pick(&slack, 0.1) * 1000.0,
         pick(&slack, 0.5) * 1000.0,
         slack.first().copied().unwrap_or(0.0) * 1000.0
+    );
+    println!(
+        "decoded after their deadline: {late_dec}; slack once decoded p10 {:.0} ms / min {:.0} ms",
+        pick(&slack_dec, 0.1) * 1000.0,
+        slack_dec.first().copied().unwrap_or(0.0) * 1000.0
     );
     println!("resolution of the first copy per chunk: {by_scale:?} (1 = full); upgrades sent: {}", arrivals.len().saturating_sub(firsts.len()));
     println!(
