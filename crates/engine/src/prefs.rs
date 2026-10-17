@@ -178,6 +178,12 @@ page!(Previews {
     /// the CPU and back (the GPU compositor shares the window's graphics device). Off: frames are
     /// read back as before (the compositor gets a device of its own at the next launch).
     zero_copy_display: bool = true,
+    /// CR5: where the Composition viewer's preview frames render: `local` (This Mac), `cloud`
+    /// (a frame server on a rented GPU, through an SSH tunnel) or `auto` (the cloud when this
+    /// Mac's frame takes longer than the cloud's round trip). Exports always render here.
+    preview_on: String = "local".into(),
+    /// The cloud frame server, `host:port` (the local end of the SSH tunnel).
+    cloud_address: String = "127.0.0.1:9878".into(),
 });
 
 page!(Appearance {
@@ -1275,6 +1281,12 @@ pub fn pages() -> Vec<Page> {
                 Note("Previews decode ProRes on the Mac's media engines (visually identical, not bit-exact). Renders and exports decode exactly."),
                 s("previews.zeroCopyDisplay", "Show GPU Frames Without Copying", B, true),
                 Note("Off: viewer frames are copied to the CPU and back, and the GPU compositor gets a graphics device of its own at the next launch."),
+                Section("Cloud Preview"),
+                s("previews.previewOn", "Preview On", Kind::Choice(&[("This Mac", "local"), ("Cloud", "cloud"), ("Auto", "auto")]), true),
+                s("previews.cloudAddress", "Cloud Address", Kind::Text, true),
+                Note(
+                    "The viewer's preview frames come from a frame server on a rented GPU (effectcraft-cli serve --gpu --frames 9878), through an SSH tunnel (ssh -L 9878:127.0.0.1:9878 …). Its token goes in the settings folder's cloud-frame-token file (or EFFECTCRAFT_FRAME_TOKEN). Timeline, panels and audio stay on this Mac; exports render here. A lost connection previews on this Mac again.",
+                ),
                 Button { label: "GPU Information...", command: "app.gpuInfo", params: "{}" },
             ],
         },

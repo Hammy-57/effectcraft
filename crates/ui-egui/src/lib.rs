@@ -294,6 +294,18 @@ impl Hooks {
     }
 }
 
+/// When the project last changed and when the viewer last showed a different frame (UI seconds,
+/// at the start of the UI frame that made the change): the edit → frame latency is
+/// `shown_at - edit_at` once the shown frame's revision reaches the edit's.
+#[derive(Default)]
+pub(crate) struct EditLatency {
+    pub edit_revision: u64,
+    pub edit_at: f64,
+    /// Revision, frame and scale (× 1000) of the frame on screen.
+    pub shown: Option<(u64, i64, u32)>,
+    pub shown_at: f64,
+}
+
 #[derive(Default)]
 pub struct Playback {
     pub playing: bool,
@@ -335,12 +347,21 @@ pub struct Playback {
     /// When playback last looked at the clock (UI seconds, [`Self::observe`]): a hold since
     /// the last frame counts against the achieved rate.
     pub observed: f64,
+    /// Every frame shown since the preview started (UI seconds, frame), for `ui.inspect`'s
+    /// frame-interval percentiles; capped at [`SHOWN_LOG_MAX`].
+    pub log: Vec<(f64, i64)>,
 }
+
+/// Frames [`Playback::log`] keeps (about 9 minutes at 30 fps).
+const SHOWN_LOG_MAX: usize = 16_384;
 
 impl Playback {
     /// A new frame went on screen at `now`.
-    pub fn frame_shown(&mut self, now: f64) {
+    pub fn frame_shown(&mut self, now: f64, frame: i64) {
         self.shown += 1;
+        if self.log.len() < SHOWN_LOG_MAX {
+            self.log.push((now, frame));
+        }
         self.shown_at.push_back(now);
         while self.shown_at.front().is_some_and(|t| now - t > 1.0) {
             self.shown_at.pop_front();
@@ -417,11 +438,19 @@ pub struct EffectcraftApp {
     next_token: u64,
     pub(crate) last_ui_time: f64,
     pub(crate) scrub_preview: crate::scrub_preview::ScrubPreview,
+    /// CR5: the viewer's preview from a cloud frame server (Settings ▸ Previews ▸ Preview On).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) cloud: cloud::CloudPreview,
+    /// The cloud server's token and when it was read (at most every few seconds).
+    #[cfg(not(target_arch = "wasm32"))]
+    cloud_token: (f64, String),
     /// When the user last did something (input or an edit): Cache Frames When Idle waits for
     /// a second of quiet. (time, project revision then)
     last_activity: (f64, u64),
     /// When the project last changed, and its revision then (see [`Self::editing`]).
     last_edit: (f64, u64),
+    /// Edit → viewer frame latency, for `ui.inspect`'s `latency`.
+    pub(crate) latency: EditLatency,
     pub(crate) toast: Option<(String, f64)>,
     /// Texture of the last CPU frame shown in the viewer, the key it came from and the factor it
     /// was averaged down by for the magnification (`panels::viewer::minify_factor`).
@@ -552,9 +581,14 @@ impl EffectcraftApp {
             events_sent: (f64::NEG_INFINITY, 0, vec![]),
             next_token: 1,
             scrub_preview: Default::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            cloud: Default::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            cloud_token: (f64::NEG_INFINITY, String::new()),
             last_ui_time: 0.0,
             last_activity: (0.0, 0),
             last_edit: (0.0, 0),
+            latency: Default::default(),
             toast: None,
             viewer_tex: None,
             passive_tex: std::collections::HashMap::new(),
@@ -1279,7 +1313,62 @@ impl EffectcraftApp {
                 return Some((k, img));
             }
         }
-        self.frames.get_for_viewer(key, self.viewer_shown.as_ref().map(|(_, s)| s))
+        self.frames
+            .get_for_viewer(key, self.viewer_shown.as_ref().map(|(_, s)| s))
+            // A cloud frame takes a round trip: while scrubbing, the newest one that landed.
+            .or_else(|| self.frames.latest_remote_for(key))
+    }
+
+    /// Follow Settings ▸ Previews ▸ Preview On (CR5): connect to the cloud frame server or not,
+    /// hand the viewer's frames to it or to this Mac, and note a lost or regained connection in
+    /// the status line (never a dialog; the document is never touched).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn tick_cloud(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|i| i.time);
+        let mode = self.session.prefs.previews.preview_on.clone();
+        if mode != "local" && now - self.cloud_token.0 > 3.0 {
+            let token = std::env::var("EFFECTCRAFT_FRAME_TOKEN")
+                .ok()
+                .or_else(|| self.session.config.as_ref().and_then(|c| c.read(cloud::TOKEN_ENTRY)))
+                .unwrap_or_default();
+            self.cloud_token = (now, token.trim().to_string());
+        }
+        let comp = self.session.active_comp_id().zip(self.session.active_comp()).map(|(id, c)| (id.0, c.frame_rate.as_f64()));
+        let last_ms = self.frames.last_ms.lock().map(|m| *m).unwrap_or(0.0);
+        let address = self.session.prefs.previews.cloud_address.clone();
+        let tick = cloud::Now {
+            mode: &mode,
+            address: &address,
+            token: &self.cloud_token.1,
+            revision: self.session.revision,
+            project: &self.session.project,
+            comp,
+            last_ms,
+        };
+        let (remote, note) = self.cloud.tick(&tick);
+        // Only the cloud's own renderer is swapped in and out (tests and hosts may set another).
+        match remote {
+            Some(c) => {
+                let c: Arc<dyn frames::RemoteFrames> = c;
+                if !self.frames.remote().is_some_and(|r| Arc::ptr_eq(r, &c)) {
+                    self.frames.set_remote(Some(c));
+                }
+                self.cloud.installed = true;
+            }
+            None if self.cloud.installed => {
+                self.frames.set_remote(None);
+                self.cloud.installed = false;
+            }
+            None => {}
+        }
+        if let Some(note) = note {
+            self.ui.status = note;
+        }
+        self.frames.tick_remote();
+        if mode != "local" {
+            // The link's state changes without input (a frame landing, the tunnel dropping).
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
     }
 
     /// The render scale used by the viewer right now.
@@ -1484,6 +1573,7 @@ impl EffectcraftApp {
             preroll: None,
             shown_at: Default::default(),
             observed: now,
+            log: Vec::new(),
         };
         if !self.playback.caching {
             if plan.video {
@@ -1862,7 +1952,7 @@ impl EffectcraftApp {
                 self.playback.waiting = false;
                 if target != cur {
                     self.session.set_time(fr.tick_of(target));
-                    self.playback.frame_shown(now);
+                    self.playback.frame_shown(now, target);
                 }
             } else {
                 // Rendering can't keep up: rather than skip frames, the sound holds (the device
@@ -1922,7 +2012,7 @@ impl EffectcraftApp {
             self.playback.waiting = false;
             if target != cur {
                 self.session.set_time(fr.tick_of(target));
-                self.playback.frame_shown(now);
+                self.playback.frame_shown(now, target);
             }
         } else {
             // Not cached yet: hold the clock at the current frame (cache first, then play).
@@ -2073,6 +2163,10 @@ impl EffectcraftApp {
             // frame workers render one frame each; without them frames render one at a time
             // on the UI thread (`Frames::pump`)
             return self.frames.remote_slots().max(1);
+        }
+        if self.frames.remote_active() {
+            // The cloud: as many as cover its round trip (CR5).
+            return self.frames.remote_slots();
         }
         self.frames.parallelism()
     }
@@ -2624,10 +2718,22 @@ impl eframe::App for EffectcraftApp {
             ui.ctx().request_repaint();
             return;
         }
+        let started = ui.ctx().input(|i| i.time);
         self.frame(ui);
         let ctx = ui.ctx().clone();
+        if self.latency.edit_revision != self.session.revision {
+            self.latency.edit_revision = self.session.revision;
+            self.latency.edit_at = started;
+        }
+        let shown = self.viewer_shown.as_ref().map(|(_, k)| (k.revision, k.frame, k.scale));
+        if shown != self.latency.shown {
+            self.latency.shown = shown;
+            self.latency.shown_at = started;
+        }
         #[cfg(not(target_arch = "wasm32"))]
         pointer_wrap::finish_native(&ctx, frame);
+        #[cfg(not(target_arch = "wasm32"))]
+        self.tick_cloud(&ctx);
         // wasm32: no frame threads; render queued frames now, between UI frames.
         if cfg!(target_arch = "wasm32") && self.frames.pump(std::time::Duration::from_millis(if self.playback.playing { 24 } else { 40 })) {
             ctx.request_repaint();
