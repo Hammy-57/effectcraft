@@ -2665,11 +2665,6 @@ impl eframe::App for EffectcraftApp {
         let started = ui.ctx().input(|i| i.time);
         self.frame(ui);
         let ctx = ui.ctx().clone();
-        // A playing preview holds disk-cache writes back: their compression competes with its
-        // frames for the CPU (`DiskCache::hold_writes`).
-        if let Some(dc) = &self.session.disk_cache {
-            dc.hold_writes(self.playback.playing);
-        }
         if self.latency.edit_revision != self.session.revision {
             self.latency.edit_revision = self.session.revision;
             self.latency.edit_at = started;
