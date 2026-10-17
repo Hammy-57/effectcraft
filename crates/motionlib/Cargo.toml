@@ -1,0 +1,23 @@
+[package]
+name = "effectcraft-motionlib"
+description = "Motion Library: a card catalog of motion (comps, animations) kept in a remote bucket, cached locally by content hash, searched and applied by the panel and agents"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+flate2 = "1"
+
+# HTTPS on desktop and Linux: pure-Rust TLS (rustls + RustCrypto) with the operating system's
+# certificate verification, as FilmCraft's model downloads. The browser build uses the page's
+# fetch instead (a `Remote` the web app supplies).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ureq = { version = "3", default-features = false, features = ["rustls-no-provider", "platform-verifier"] }
+rustls-rustcrypto = "0.0.2-alpha"

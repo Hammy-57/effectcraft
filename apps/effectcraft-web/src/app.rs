@@ -138,6 +138,8 @@ fn query_value(name: &str) -> Option<String> {
 pub fn session() -> Session {
     let pool = Arc::new(effectcraft_media::MediaPool::new());
     persist::register_media(&pool);
+    let motion_library = effectcraft_engine::motion_library::Handle::default();
+    crate::library::install(&motion_library);
     Session {
         services: Arc::new(files::WebServices),
         footage: pool.clone(),
@@ -154,6 +156,7 @@ pub fn session() -> Session {
         }),
         browser: Some(Arc::new(browse::WebBrowser)),
         storage: Some(Arc::new(storage::WebStorage)),
+        motion_library,
         ..Default::default()
     }
 }
