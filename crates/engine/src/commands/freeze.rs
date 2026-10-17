@@ -606,14 +606,14 @@ pub fn specs() -> Vec<CommandSpec> {
         query!(
             "freeze.suggest",
             "Suggest Layers to Freeze",
-            "{comp?: id|\"all\" (default: the active comp), dismiss?: {comp, layer}} -> {candidates: [{comp, layer, name, msPerFrame, frameBudgetMs, ratio, samples, target: precomp|selection|comp, question, freeze: freeze.freeze params}], autoHeavy}",
+            "{comp?: id (default: the active comp), all?: bool (every comp), dismiss?: {comp, layer}} -> {candidates: [{comp, layer, name, msPerFrame, frameBudgetMs, ratio, samples, target: precomp|selection|comp, question, freeze: freeze.freeze params}], autoHeavy}",
             |s, p| {
                 if let Some(d) = p.get("dismiss").filter(|d| !d.is_null()) {
                     let id = |key: &str| d.get(key).and_then(Value::as_u64).ok_or_else(|| bad("freeze.suggest", format!("dismiss.{key} must be an id")));
                     s.dismiss_freeze_suggestion(effectcraft_project::ItemId(id("comp")?), effectcraft_project::LayerId(id("layer")?));
                 }
                 let scope = match p.get("comp") {
-                    Some(Value::String(all)) if all == "all" => None,
+                    _ if b_p(p, "all").unwrap_or(false) => None,
                     Some(v) if !v.is_null() => Some(comp_id(s, p).map_err(|_| bad("freeze.suggest", format!("no composition {v}")))?),
                     _ => s.active_comp_id(),
                 };

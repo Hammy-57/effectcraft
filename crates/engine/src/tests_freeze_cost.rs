@@ -140,7 +140,7 @@ fn hints_belong_to_the_open_composition() {
     play(&mut f, 12, 5.0, 2.0, 400.0);
     assert!(f.s.freeze_suggestions().is_empty(), "a layer of another comp is not this comp's hint");
     assert_eq!(f.s.execute("freeze.suggest", json!({})).unwrap()["candidates"].as_array().unwrap().len(), 0);
-    let all = f.s.execute("freeze.suggest", json!({"comp":"all"})).unwrap();
+    let all = f.s.execute("freeze.suggest", json!({"all":true})).unwrap();
     assert_eq!(all["candidates"][0]["layer"], f.inside.0, "a caller can still ask for every comp");
     let inner = f.s.execute("freeze.suggest", json!({"comp":f.inner.0})).unwrap();
     assert_eq!(inner["candidates"][0]["layer"], f.inside.0);

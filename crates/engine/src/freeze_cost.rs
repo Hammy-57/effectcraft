@@ -135,7 +135,8 @@ impl Suggestion {
 
     /// "Stat Stack renders at 1.8 s/frame"
     pub fn hint(&self) -> String {
-        let time = if self.ms_per_frame >= 1000.0 { format!("{:.1} s/frame", self.ms_per_frame / 1000.0) } else { format!("{:.0} ms/frame", self.ms_per_frame) };
+        let time =
+            if self.ms_per_frame >= 1000.0 { format!("{:.1} s/frame", self.ms_per_frame / 1000.0) } else { format!("{:.0} ms/frame", self.ms_per_frame) };
         format!("{} renders at {time}", self.name)
     }
 
@@ -276,8 +277,10 @@ impl Session {
         if self.tasks.iter().any(|t| matches!(t.kind, "smartFreeze" | "freezeCheck" | "freezeStorage")) {
             return;
         }
-        let Some(pick) =
-            self.freeze_suggestions_in(None).into_iter().find(|s| !self.freeze_runtime.cost.tried.contains(&(s.comp, s.layer)) && self.claims.get(s.comp).is_none())
+        let Some(pick) = self
+            .freeze_suggestions_in(None)
+            .into_iter()
+            .find(|s| !self.freeze_runtime.cost.tried.contains(&(s.comp, s.layer)) && self.claims.get(s.comp).is_none())
         else {
             return;
         };

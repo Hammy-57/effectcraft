@@ -92,7 +92,9 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, area: Rect) {
             outcome = None;
         }
         ctx.data_mut(|d| match &outcome {
-            Some(o) => d.insert_temp(id, o.clone()),
+            Some(o) => {
+                d.insert_temp(id, o.clone());
+            }
             None => d.remove::<Outcome>(id),
         });
         if outcome.is_some() {
@@ -123,11 +125,15 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, area: Rect) {
         let before = last_freeze_job(app).map(|j| j.0);
         let started = now;
         match app.session.execute("freeze.freeze", top.freeze_params()) {
-            Ok(_) => ctx.data_mut(|d| d.insert_temp(id, Outcome { name: top.name.clone(), before, done: None, started })),
+            Ok(_) => ctx.data_mut(|d| {
+                d.insert_temp(id, Outcome { name: top.name.clone(), before, done: None, started });
+            }),
             Err(e) => {
                 let reason = format!("Couldn't freeze {}: {e}", top.name);
                 app.ui.status = reason.clone();
-                ctx.data_mut(|d| d.insert_temp(id, Outcome { name: top.name.clone(), before, done: Some((reason, false, now + 3.0 * SHOWN_FOR)), started }));
+                ctx.data_mut(|d| {
+                    d.insert_temp(id, Outcome { name: top.name.clone(), before, done: Some((reason, false, now + 3.0 * SHOWN_FOR)), started });
+                });
             }
         }
     }
