@@ -12,6 +12,12 @@
 //!   mirror has not confirmed on the server yet (a new import), so frames render locally until
 //!   they are there.
 //!
+//! Where a file comes from on a new machine is per file ([`FileEntry::source`]): files up to the
+//! upload limit (100 MB) go from the Mac over ssh, once (deduplicated by content); bigger ones
+//! only from a Google Drive share link Elias gives (`cloud.driveLinks`, kept in the sidecar
+//! `<project>.cloud.json` next to the project, never inside it), so his upload quota isn't spent
+//! on footage. An item previewed through its proxy needs only the proxy there.
+//!
 //! [`blockers`] is the same check without a manifest, cheap enough to run per project revision:
 //! the frame server refuses frames with it.
 
@@ -19,16 +25,22 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
 use effectcraft_keyframe::text_doc::FontFileLink;
-use effectcraft_project::{FootageKind, GroupKind, ItemId, ItemKind, Project};
+use effectcraft_project::render_queue::ProxyUse;
+use effectcraft_project::{FootageKind, GroupKind, Item, ItemId, ItemKind, Project};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+pub use effectcraft_segment::sha256::Sha256;
 
 use crate::commands::{CommandSpec, bad, str_p};
 use crate::{EngineError, Result, Session, query};
 
 /// Files up to this size are hashed by default (fonts, LUTs, stills); larger ones only with
 /// `hash: "all"` (the mirror hashes them itself, once, when it has to compare).
-pub const SMALL_FILE: u64 = 64 * 1024 * 1024;
+pub const SMALL_FILE: u64 = 128 * 1024 * 1024;
+/// Files up to this size may be sent from the Mac; bigger ones come from Google Drive
+/// (`uploadLimitMb` in the sidecar changes it).
+pub const DEFAULT_UPLOAD_LIMIT: u64 = 100_000_000;
 /// Files the mirror lists first, so a long upload is known up front.
 pub const BIG_FILE: u64 = 1024 * 1024 * 1024;
 /// At most this many files in a model's sidecar list (a malformed model can't explode it).
@@ -54,6 +66,19 @@ pub struct Manifest {
     pub nondeterministic: Vec<Value>,
     #[serde(default)]
     pub totals: Totals,
+    /// Bytes: files up to this size may be uploaded from the Mac, bigger ones need a Drive link.
+    #[serde(default = "default_limit")]
+    pub upload_limit: u64,
+    /// Items the viewer shows through their proxy: only the proxy is needed on the cloud.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proxy_only: Vec<Value>,
+    /// The project file on the Mac (the server gets it only when it has none there).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+}
+
+fn default_limit() -> u64 {
+    DEFAULT_UPLOAD_LIMIT
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -101,6 +126,94 @@ pub struct FileEntry {
     /// The file exists on the machine that wrote the manifest.
     #[serde(default)]
     pub exists: bool,
+    /// Where a new machine gets it: `mac` (uploaded over ssh, up to the upload limit), `drive`
+    /// (its share link in [`FileEntry::drive`]), `drive-folder` (by name from a shared folder),
+    /// `needs-drive-link` (too big to upload: Elias puts it on Drive and pastes the link).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drive: Option<String>,
+    /// The original of an item previewed through its proxy: not needed on the cloud.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub proxied: bool,
+}
+
+// ---------------------------------------------------------------- the sidecar
+
+/// `<project>.cloud.json`, next to the project file (never inside it): where big files come from.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Sidecar {
+    #[serde(default)]
+    pub version: u32,
+    /// Files above this many MB are never uploaded from the Mac (default 100).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upload_limit_mb: Option<f64>,
+    /// Absolute path on the Mac → Google Drive share link (a file, or a folder holding it).
+    #[serde(default)]
+    pub drive: BTreeMap<String, String>,
+    /// Shared folders: a big file without its own link is looked up in them by name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drive_folders: Vec<String>,
+    /// Big files Elias explicitly allowed to be uploaded from the Mac.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_upload: Vec<String>,
+}
+
+impl Sidecar {
+    pub fn upload_limit(&self) -> u64 {
+        match self.upload_limit_mb {
+            Some(mb) if mb.is_finite() && mb >= 0.0 => (mb * 1e6).min(u64::MAX as f64) as u64,
+            _ => DEFAULT_UPLOAD_LIMIT,
+        }
+    }
+
+    /// Where a new machine gets `e`.
+    fn source(&self, e: &FileEntry) -> (&'static str, Option<String>) {
+        if let Some(link) = self.drive.get(&e.path) {
+            return ("drive", Some(link.clone()));
+        }
+        if e.size <= self.upload_limit() || self.allow_upload.contains(&e.path) {
+            return ("mac", None);
+        }
+        if !self.drive_folders.is_empty() {
+            return ("drive-folder", None);
+        }
+        ("needs-drive-link", None)
+    }
+}
+
+/// The sidecar's path for a project file: `10-10 Edit.ecproj` → `10-10 Edit.cloud.json`.
+pub fn sidecar_path(project: &str) -> String {
+    let p = std::path::Path::new(project);
+    p.with_extension("").with_extension("cloud.json").to_string_lossy().into_owned()
+}
+
+/// The project's sidecar (empty when there is none or it can't be read).
+pub fn read_sidecar(read: &dyn Fn(&str) -> Option<Vec<u8>>, project: Option<&str>) -> Sidecar {
+    project.and_then(|p| read(&sidecar_path(p))).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+/// Whether a share link looks like Google Drive's (files, folders, download links).
+pub fn is_drive_link(link: &str) -> bool {
+    let l = link.trim();
+    l.starts_with("https://") && ["drive.google.com/", "docs.google.com/", "drive.usercontent.google.com/"].iter().any(|h| l.contains(h))
+}
+
+/// `6.32 GB`, `336 KB`.
+pub fn human_bytes(bytes: u64) -> String {
+    let b = bytes as f64;
+    if b >= 1e9 {
+        format!("{:.2} GB", b / 1e9)
+    } else if b >= 1e6 {
+        format!("{:.1} MB", b / 1e6)
+    } else {
+        format!("{:.0} KB", (b / 1e3).ceil())
+    }
+}
+
+fn file_name(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
 
 /// One text style's font, as the machine that wrote the manifest resolves it.
@@ -216,6 +329,13 @@ fn remember_hashes(found: Vec<(String, u64, i64, String)>) {
     }
 }
 
+/// Remember `sha256` for `path` as it is now (a file this program just wrote or verified).
+pub fn remember_hash(path: &str, sha256: &str) {
+    if let Some((size, mtime)) = stat(path) {
+        remember_hashes(vec![(path.to_string(), size, mtime, sha256.to_ascii_lowercase())]);
+    }
+}
+
 /// The remembered sha256 of a file as it is now, without reading it.
 pub fn cached_sha256(path: &str) -> Option<String> {
     let (size, mtime) = stat(path)?;
@@ -276,13 +396,25 @@ struct Need {
     kind: &'static str,
     items: BTreeSet<u64>,
     used: bool,
+    /// An item that uses it is previewed through its proxy instead.
+    proxied: bool,
+}
+
+/// Whether frames read `item`'s proxy instead of its source (with `proxy_use`; the viewer's is
+/// [`ProxyUse::CurrentSettings`], the item's Use Proxy switch). Audio stays on the Mac.
+pub fn reads_proxy(item: &Item, proxy_use: ProxyUse) -> bool {
+    item.proxy.as_deref().is_some_and(|p| {
+        proxy_use.uses(matches!(item.kind, ItemKind::Comp(_)), p.enabled)
+            && p.footage.has_video
+            && (!p.footage.path.is_empty() || !p.footage.sequence.is_empty())
+    })
 }
 
 /// Every file path the project reads, with its kind, items and whether a comp uses it.
 fn needed_files(project: &Project, sidecars: &mut dyn FnMut(&str) -> Vec<String>) -> BTreeMap<String, Need> {
     let used = used_items(project);
     let mut out: BTreeMap<String, Need> = BTreeMap::new();
-    let mut add = |path: &str, kind: &'static str, item: Option<u64>, is_used: bool| {
+    let mut add = |path: &str, kind: &'static str, item: Option<u64>, is_used: bool, proxied: bool| {
         let path = path.trim();
         if path.is_empty() {
             return;
@@ -290,24 +422,27 @@ fn needed_files(project: &Project, sidecars: &mut dyn FnMut(&str) -> Vec<String>
         let n = out.entry(path.to_string()).or_insert_with(|| Need { kind, ..Default::default() });
         n.items.extend(item);
         n.used |= is_used;
+        n.proxied |= proxied;
     };
     for item in project.items.values() {
         let is_used = used.contains(&item.id);
+        let via_proxy = reads_proxy(item, ProxyUse::CurrentSettings);
         let main = match &item.kind {
-            ItemKind::Footage(f) => Some((f, if f.sequence.is_empty() { "footage" } else { "sequence" })),
+            ItemKind::Footage(f) => Some((f, if f.sequence.is_empty() { "footage" } else { "sequence" }, is_used && !via_proxy)),
             _ => None,
         };
-        for (f, kind) in main.into_iter().chain(item.proxy.as_ref().map(|p| (&p.footage, "proxy"))) {
+        for (f, kind, needed) in main.into_iter().chain(item.proxy.as_ref().map(|p| (&p.footage, "proxy", is_used && via_proxy))) {
             if f.kind == FootageKind::Data && f.data.is_some() {
                 continue;
             }
-            add(&f.path, kind, Some(item.id.0), is_used);
+            let proxied = is_used && via_proxy && kind != "proxy";
+            add(&f.path, kind, Some(item.id.0), needed, proxied);
             for frame in &f.sequence {
-                add(frame, kind, Some(item.id.0), is_used);
+                add(frame, kind, Some(item.id.0), needed, proxied);
             }
             if f.kind == FootageKind::Model && !f.path.is_empty() {
                 for side in sidecars(&f.path).into_iter().take(MAX_SIDECARS) {
-                    add(&side, "model", Some(item.id.0), is_used);
+                    add(&side, "model", Some(item.id.0), needed, proxied);
                 }
             }
         }
@@ -316,14 +451,14 @@ fn needed_files(project: &Project, sidecars: &mut dyn FnMut(&str) -> Vec<String>
         if w["kind"] == "external_effect_file"
             && let Some(p) = w["path"].as_str()
         {
-            add(p, "effect", None, true);
+            add(p, "effect", None, true, false);
         }
     }
     for id in applied_effects(project) {
         if let Some(src) = crate::effects::plugin::plugin(&id).map(|p| p.source())
             && src.to_ascii_lowercase().ends_with(".wasm")
         {
-            add(&src, "plugin", None, true);
+            add(&src, "plugin", None, true, false);
         }
     }
     out
@@ -508,7 +643,7 @@ pub enum Hash {
 }
 
 /// The manifest of `project` on this machine.
-pub fn manifest(project: &Project, read: &dyn Fn(&str) -> Option<Vec<u8>>, hash: Hash) -> Manifest {
+pub fn manifest(project: &Project, read: &dyn Fn(&str) -> Option<Vec<u8>>, hash: Hash, sidecar: &Sidecar, project_path: Option<&str>) -> Manifest {
     let needs = needed_files(project, &mut |p| model_sidecars(read, p));
     let mut files: Vec<FileEntry> = needs
         .into_iter()
@@ -523,6 +658,8 @@ pub fn manifest(project: &Project, read: &dyn Fn(&str) -> Option<Vec<u8>>, hash:
                 sha256: None,
                 items: n.items.into_iter().collect(),
                 used: n.used,
+                proxied: n.proxied && !n.used,
+                ..Default::default()
             }
         })
         .collect();
@@ -541,8 +678,14 @@ pub fn manifest(project: &Project, read: &dyn Fn(&str) -> Option<Vec<u8>>, hash:
                 items: vec![],
                 used: true,
                 exists: st.is_some(),
+                ..Default::default()
             });
         }
+    }
+    for e in &mut files {
+        let (source, link) = sidecar.source(e);
+        e.source = source.into();
+        e.drive = link;
     }
     if hash != Hash::None {
         use rayon::prelude::*;
@@ -566,7 +709,30 @@ pub fn manifest(project: &Project, read: &dyn Fn(&str) -> Option<Vec<u8>>, hash:
         effects: applied_effects(project).into_iter().collect(),
         nondeterministic: nondeterministic(project),
         totals,
+        upload_limit: sidecar.upload_limit(),
+        proxy_only: proxy_only(project),
+        project: project_path.map(str::to_string),
     }
+}
+
+/// Used items the viewer shows through their proxy: `{item, name, original, proxy, percent, message}`.
+fn proxy_only(project: &Project) -> Vec<Value> {
+    let used = used_items(project);
+    project
+        .items
+        .values()
+        .filter(|i| used.contains(&i.id) && reads_proxy(i, ProxyUse::CurrentSettings))
+        .filter_map(|i| {
+            let ItemKind::Footage(f) = &i.kind else { return None };
+            let px = &i.proxy.as_deref()?.footage;
+            let percent = (f.width > 0 && px.width > 0).then(|| (f64::from(px.width) / f64::from(f.width) * 100.0).round());
+            let shown = percent.map(|p| format!("{p:.0}% proxy")).unwrap_or_else(|| "its proxy".into());
+            Some(json!({
+                "item": i.id.0, "name": i.name, "original": f.path, "proxy": px.path, "percent": percent,
+                "message": format!("{}: previewing from {shown}; original stays on Mac", file_name(&f.path)),
+            }))
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------- the check
@@ -588,11 +754,22 @@ pub struct Missing {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub items: Vec<u64>,
     pub detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
 }
 
 impl Missing {
     fn file(e: &FileEntry, reason: &str, detail: String) -> Missing {
-        Missing { kind: e.kind.clone(), reason: reason.into(), path: Some(e.path.clone()), font: None, style: None, items: e.items.clone(), detail }
+        Missing {
+            kind: e.kind.clone(),
+            reason: reason.into(),
+            path: Some(e.path.clone()),
+            font: None,
+            style: None,
+            items: e.items.clone(),
+            detail,
+            size: Some(e.size),
+        }
     }
     fn label(&self) -> String {
         match (&self.font, &self.path) {
@@ -611,12 +788,24 @@ pub fn check(manifest: &Manifest, verify_hash: bool) -> (Vec<Missing>, Vec<Missi
         .files
         .par_iter()
         .map(|e| {
-            // Missing on the Mac too: both machines show the same placeholder.
-            if !e.exists {
+            // Missing on the Mac too: both machines show the same placeholder. An original seen
+            // through its proxy isn't needed here.
+            if !e.exists || e.proxied {
                 return (e.used, None);
             }
             let found = match stat(&e.path) {
-                None => Some(Missing::file(e, "missing", "not on this machine".into())),
+                None if e.source == "needs-drive-link" => Some(Missing::file(
+                    e,
+                    "needs-drive-link",
+                    format!(
+                        "{} ({}) is over the {} upload limit: upload it to Google Drive and paste its share link (cloud.driveLinks)",
+                        file_name(&e.path),
+                        human_bytes(e.size),
+                        human_bytes(manifest.upload_limit)
+                    ),
+                )),
+                None if e.source.starts_with("drive") => Some(Missing::file(e, "missing", "not pulled from Google Drive yet: run the mirror".into())),
+                None => Some(Missing::file(e, "missing", "not on this machine yet: run the mirror".into())),
                 Some((size, _)) if size != e.size => Some(Missing::file(e, "size", format!("{size} bytes here, {} on the Mac", e.size))),
                 // Copied without its mtime: the content decides (hashed once, then remembered).
                 Some((_, mtime)) if mtime != e.mtime || verify_hash => match &e.sha256 {
@@ -667,6 +856,7 @@ pub fn check(manifest: &Manifest, verify_hash: bool) -> (Vec<Missing>, Vec<Missi
                     here.status,
                     here.file.as_deref().map(|f| format!(", {f}")).unwrap_or_default()
                 ),
+                size: None,
             });
         }
     }
@@ -680,6 +870,7 @@ pub fn check(manifest: &Manifest, verify_hash: bool) -> (Vec<Missing>, Vec<Missi
                 style: None,
                 items: vec![],
                 detail: format!("effect `{id}` is not available here (a plug-in that isn't loaded?)"),
+                size: None,
             });
         }
     }
@@ -696,19 +887,36 @@ pub fn check(manifest: &Manifest, verify_hash: bool) -> (Vec<Missing>, Vec<Missi
                 "Han text would use {forms} glyph forms here, {} on the Mac: set EFFECTCRAFT_CJK_LOCALE={} on this machine",
                 manifest.host.cjk_forms, manifest.host.cjk_locale
             ),
+            size: None,
         });
     }
     (missing, warnings)
 }
 
-/// One line for a status bar: `2 missing: font “SF Pro Display Bold” · footage “…/clip.mov”`.
+/// One line for a status bar: big files without a Drive link first (`upload these to Google
+/// Drive and paste the links: clip.mov (6.32 GB)`), then the rest (`font “SF Pro Display Bold”`).
 pub fn summary(missing: &[Missing]) -> String {
     if missing.is_empty() {
         return "nothing missing".into();
     }
-    let shown: Vec<String> = missing.iter().take(3).map(Missing::label).collect();
-    let more = missing.len().saturating_sub(shown.len());
-    format!("{} missing: {}{}", missing.len(), shown.join(" · "), if more > 0 { format!(" · {more} more") } else { String::new() })
+    let (drive, other): (Vec<&Missing>, Vec<&Missing>) = missing.iter().partition(|m| m.reason == "needs-drive-link");
+    let mut parts = vec![];
+    if !drive.is_empty() {
+        let files: Vec<String> =
+            drive.iter().map(|m| format!("{} ({})", m.path.as_deref().map(file_name).unwrap_or(""), human_bytes(m.size.unwrap_or(0)))).collect();
+        parts.push(format!(
+            "upload {} to Google Drive and paste the link{}: {}",
+            if drive.len() == 1 { "this" } else { "these" },
+            if drive.len() == 1 { "" } else { "s" },
+            files.join(", ")
+        ));
+    }
+    if !other.is_empty() {
+        let shown: Vec<String> = other.iter().take(3).map(|m| m.label()).collect();
+        let more = other.len().saturating_sub(shown.len());
+        parts.push(format!("{}{}", shown.join(" · "), if more > 0 { format!(" · {more} more") } else { String::new() }));
+    }
+    format!("{} missing: {}", missing.len(), parts.join(" — "))
 }
 
 /// Font, style, render font, linked file (path, sha256).
@@ -767,11 +975,12 @@ pub struct BlockerCache {
 /// this is non-empty (without a manifest it can't tell a different font version;
 /// `cloud.preflight` can).
 pub fn blockers(project: &Project) -> Vec<Missing> {
-    blockers_cached(project, &mut BlockerCache::default())
+    blockers_cached(project, ProxyUse::CurrentSettings, &mut BlockerCache::default())
 }
 
-/// [`blockers`], recomputing only comps that changed since the last call with `cache`.
-pub fn blockers_cached(project: &Project, cache: &mut BlockerCache) -> Vec<Missing> {
+/// [`blockers`] for frames rendered with `proxy_use`, recomputing only comps that changed since
+/// the last call with `cache`.
+pub fn blockers_cached(project: &Project, proxy_use: ProxyUse, cache: &mut BlockerCache) -> Vec<Missing> {
     let mut comps = Vec::new();
     for item in project.items.values() {
         if let ItemKind::Comp(c) = &item.kind {
@@ -793,13 +1002,16 @@ pub fn blockers_cached(project: &Project, cache: &mut BlockerCache) -> Vec<Missi
         style: None,
         items,
         detail: detail.into(),
+        size: None,
     };
     for item in project.items.values().filter(|i| used.contains(&i.id)) {
+        // Frames read the proxy instead (with this render's Proxy Use): only it must be here.
+        let via_proxy = reads_proxy(item, proxy_use);
         let main = match &item.kind {
-            ItemKind::Footage(f) => Some((f, if f.sequence.is_empty() { "footage" } else { "sequence" })),
+            ItemKind::Footage(f) if !via_proxy => Some((f, if f.sequence.is_empty() { "footage" } else { "sequence" })),
             _ => None,
         };
-        for (f, kind) in main.into_iter().chain(item.proxy.as_ref().map(|p| (&p.footage, "proxy"))) {
+        for (f, kind) in main.into_iter().chain(item.proxy.as_ref().filter(|_| via_proxy).map(|p| (&p.footage, "proxy"))) {
             if (f.kind == FootageKind::Data && f.data.is_some()) || (f.path.is_empty() && f.sequence.is_empty()) {
                 continue;
             }
@@ -837,6 +1049,7 @@ pub fn blockers_cached(project: &Project, cache: &mut BlockerCache) -> Vec<Missi
                 style: Some(req.1.clone()),
                 items: vec![],
                 detail: format!("would be drawn with {fb} here"),
+                size: None,
             });
         }
     }
@@ -857,6 +1070,7 @@ pub fn blockers_cached(project: &Project, cache: &mut BlockerCache) -> Vec<Missi
                 style: None,
                 items: vec![],
                 detail: format!("effect `{id}` is not available here"),
+                size: None,
             });
         }
     }
@@ -884,7 +1098,7 @@ fn pending_cache() -> &'static Mutex<Option<PendingCache>> {
 }
 
 /// The files `project` uses that the server hasn't confirmed: (path, size, kind, items).
-pub fn pending_uploads(project: &Project, read: &dyn Fn(&str) -> Option<Vec<u8>>) -> Value {
+pub fn pending_uploads(project: &Project, read: &dyn Fn(&str) -> Option<Vec<u8>>, sidecar: &Sidecar) -> Value {
     let (_, have) = {
         let c = confirmed().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         (c.0, c.1.clone())
@@ -907,7 +1121,8 @@ pub fn pending_uploads(project: &Project, read: &dyn Fn(&str) -> Option<Vec<u8>>
             None => missing_here.push(json!({"path": path, "kind": kind})),
             Some((size, mtime)) if have.get(&path) != Some(&(size, mtime)) => {
                 bytes = bytes.saturating_add(size);
-                pending.push(json!({"path": path, "kind": kind, "size": size, "mtime": mtime, "items": items}));
+                let (source, _) = sidecar.source(&FileEntry { path: path.clone(), size, ..Default::default() });
+                pending.push(json!({"path": path, "kind": kind, "size": size, "mtime": mtime, "items": items, "source": source}));
             }
             Some(_) => {}
         }
@@ -928,7 +1143,9 @@ fn pending_cmd(s: &mut Session, _: &Value) -> Result<Value> {
         }
     }
     let services = s.services.clone();
-    let value = pending_uploads(&s.project, &|p| services.read_file(p).ok());
+    let read = |p: &str| services.read_file(p).ok();
+    let sidecar = read_sidecar(&read, s.path.as_deref());
+    let value = pending_uploads(&s.project, &read, &sidecar);
     *pending_cache().lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(PendingCache { key, at: web_time::Instant::now(), value: value.clone() });
     Ok(value)
 }
@@ -965,8 +1182,87 @@ fn hash_p(p: &Value) -> Result<Hash> {
 fn dependencies(s: &mut Session, p: &Value) -> Result<Value> {
     let hash = hash_p(p)?;
     let services = s.services.clone();
-    let m = manifest(&s.project, &|path| services.read_file(path).ok(), hash);
+    let read = |path: &str| services.read_file(path).ok();
+    let sidecar = read_sidecar(&read, s.path.as_deref());
+    let m = manifest(&s.project, &read, hash, &sidecar, s.path.as_deref());
     serde_json::to_value(m).map_err(|e| EngineError::Other(e.to_string()))
+}
+
+/// `cloud.driveLinks`: read or change the project's sidecar (`<project>.cloud.json`).
+fn drive_links(s: &mut Session, p: &Value) -> Result<Value> {
+    let c = "cloud.driveLinks";
+    let Some(project) = s.path.clone() else { return Err(bad(c, "save the project first: the links live next to it")) };
+    let services = s.services.clone();
+    let read = |path: &str| services.read_file(path).ok();
+    let mut sc = read_sidecar(&read, Some(&project));
+    sc.version = 1;
+    // A file is named by its path or, when unique, its file name ("presenter keyed clean.mov").
+    let files: Vec<String> = needed_files(&s.project, &mut |_| vec![]).into_keys().collect();
+    let resolve = |name: &str| -> Result<String> {
+        if std::path::Path::new(name).is_absolute() {
+            return Ok(name.to_string());
+        }
+        let hits: Vec<&String> = files.iter().filter(|f| file_name(f).eq_ignore_ascii_case(name)).collect();
+        match hits.as_slice() {
+            [one] => Ok((*one).clone()),
+            [] => Err(bad(c, format!("no file of the project is called `{name}`"))),
+            _ => Err(bad(c, format!("several files are called `{name}`: give the full path"))),
+        }
+    };
+    let mut changed = false;
+    if let Some(set) = p.get("set").and_then(Value::as_object) {
+        for (name, link) in set {
+            let link = link.as_str().unwrap_or("").trim();
+            if !is_drive_link(link) {
+                return Err(bad(c, format!("`{link}` is not a Google Drive share link")));
+            }
+            sc.drive.insert(resolve(name)?, link.to_string());
+            changed = true;
+        }
+    }
+    for name in p.get("remove").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
+        changed |= sc.drive.remove(&resolve(name)?).is_some();
+    }
+    if let Some(folders) = p.get("folders").and_then(Value::as_array) {
+        let folders: Vec<String> = folders.iter().filter_map(Value::as_str).map(|f| f.trim().to_string()).collect();
+        if let Some(bad_link) = folders.iter().find(|f| !is_drive_link(f)) {
+            return Err(bad(c, format!("`{bad_link}` is not a Google Drive share link")));
+        }
+        sc.drive_folders = folders;
+        changed = true;
+    }
+    if let Some(names) = p.get("allowUpload").and_then(Value::as_array) {
+        sc.allow_upload = names.iter().filter_map(Value::as_str).map(resolve).collect::<Result<_>>()?;
+        changed = true;
+    }
+    if let Some(mb) = p.get("uploadLimitMb").and_then(Value::as_f64) {
+        sc.upload_limit_mb = Some(mb.max(0.0));
+        changed = true;
+    }
+    let path = sidecar_path(&project);
+    if changed {
+        let text = serde_json::to_vec_pretty(&sc).map_err(|e| EngineError::Other(e.to_string()))?;
+        s.services.write_file(&path, &text).map_err(|e| EngineError::Other(format!("cannot write {path}: {e}")))?;
+    }
+    Ok(
+        json!({"sidecar": path, "uploadLimit": sc.upload_limit(), "drive": sc.drive, "driveFolders": sc.drive_folders, "allowUpload": sc.allow_upload, "changed": changed}),
+    )
+}
+
+/// `cloud.rememberHashes`: the mirror tells the render machine the sha256 of files it just sent
+/// (verified by size and mtime there), so later checks and copies need not read them again.
+fn remember_hashes_cmd(_: &mut Session, p: &Value) -> Result<Value> {
+    let mut n = 0;
+    for f in p.get("files").and_then(Value::as_array).into_iter().flatten() {
+        if let (Some(path), Some(h), Some(size), Some(mtime)) = (f["path"].as_str(), f["sha256"].as_str(), f["size"].as_u64(), f["mtime"].as_i64())
+            && h.len() == 64
+            && stat(path) == Some((size, mtime))
+        {
+            remember_hash(path, h);
+            n += 1;
+        }
+    }
+    Ok(json!({"remembered": n}))
 }
 
 fn preflight(s: &mut Session, p: &Value) -> Result<Value> {
@@ -980,11 +1276,11 @@ fn preflight(s: &mut Session, p: &Value) -> Result<Value> {
         }
         (None, None) => None,
     };
-    let (missing, warnings, nondet, counts) = match manifest {
+    let (missing, warnings, nondet, counts, proxied) = match manifest {
         Some(m) => {
             let (missing, warnings) = check(&m, verify_hash);
             let counts = json!({"files": m.files.len(), "fonts": m.fonts.len(), "effects": m.effects.len(), "missing": missing.len()});
-            (missing, warnings, m.nondeterministic, counts)
+            (missing, warnings, m.nondeterministic, counts, m.proxy_only)
         }
         None => {
             // This machine's own project: look for its files first (footage.check marks them).
@@ -993,7 +1289,7 @@ fn preflight(s: &mut Session, p: &Value) -> Result<Value> {
             }
             let missing = blockers(&s.project);
             let counts = json!({"files": needed_files(&s.project, &mut |_| vec![]).len(), "fonts": font_requests(&s.project).len(), "missing": missing.len()});
-            (missing, vec![], nondeterministic(&s.project), counts)
+            (missing, vec![], nondeterministic(&s.project), counts, proxy_only(&s.project))
         }
     };
     Ok(json!({
@@ -1003,6 +1299,7 @@ fn preflight(s: &mut Session, p: &Value) -> Result<Value> {
         "warnings": warnings,
         "counts": counts,
         "nondeterministic": nondet,
+        "proxyOnly": proxied,
     }))
 }
 
@@ -1025,6 +1322,18 @@ pub fn specs() -> Vec<CommandSpec> {
             "Cloud Pending Uploads",
             "{} → {count, bytes, pending: [{path, kind, size, mtime, items}], missingHere, confirmed} — files the project uses that the mirror hasn't confirmed on the cloud machine yet (frames render locally while count > 0)",
             pending_cmd
+        ),
+        query!(
+            "cloud.driveLinks",
+            "Cloud Drive Links",
+            "{set?: {path or file name: Google Drive share link}, remove?: [path or name], folders?: [shared folder links], allowUpload?: [path or name], uploadLimitMb?} → {sidecar, uploadLimit, drive, driveFolders, allowUpload, changed} — where a cloud render machine gets the big files (over the upload limit, default 100 MB): kept in <project>.cloud.json next to the project, never inside it; no passwords, share links only",
+            drive_links
+        ),
+        query!(
+            "cloud.rememberHashes",
+            "Cloud Remember Hashes",
+            "{files: [{path, size, mtime, sha256}]} → {remembered} — on the render machine: the sha256 of files the mirror just sent (kept when size and mtime match)",
+            remember_hashes_cmd
         ),
         query!(
             "cloud.markUploaded",
@@ -1196,15 +1505,15 @@ mod tests {
             None,
             ItemKind::Footage(effectcraft_project::Footage { path: path.clone(), ..Default::default() }),
         );
-        let p = pending_uploads(&s.project, &|_| None);
+        let p = pending_uploads(&s.project, &|_| None, &Sidecar::default());
         assert!(p["pending"].as_array().unwrap().iter().all(|e| e["path"] != path.as_str()), "unused: not needed yet");
         let cid = s.active_comp_id().unwrap();
         s.execute("layer.addItem", json!({"comp": cid.0, "item": id.0, "time": 0.0})).unwrap();
-        let p = pending_uploads(&s.project, &|_| None);
+        let p = pending_uploads(&s.project, &|_| None, &Sidecar::default());
         assert!(p["pending"].as_array().unwrap().iter().any(|e| e["path"] == path.as_str()), "{p}");
         let (size, mtime) = stat(&path).unwrap();
         s.execute("cloud.markUploaded", json!({"files": [{"path": path, "size": size, "mtime": mtime}]})).unwrap();
-        let p = pending_uploads(&s.project, &|_| None);
+        let p = pending_uploads(&s.project, &|_| None, &Sidecar::default());
         assert!(p["pending"].as_array().unwrap().iter().all(|e| e["path"] != path.as_str()), "{p}");
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -1219,7 +1528,7 @@ mod tests {
         let mut cache = BlockerCache::default();
         for label in ["first", "cached", "cached"] {
             let t = std::time::Instant::now();
-            let n = blockers_cached(&s.project, &mut cache).len();
+            let n = blockers_cached(&s.project, ProxyUse::CurrentSettings, &mut cache).len();
             eprintln!("{label}: {n} blockers in {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
         }
         // One comp changed (as a sync patch does): only it is walked again.
@@ -1227,8 +1536,90 @@ mod tests {
         // The cache holds the old Arc, so this clones the comp (a new pointer).
         assert!(std::sync::Arc::make_mut(&mut s.project).comp_mut(cid).is_some());
         let t = std::time::Instant::now();
-        blockers_cached(&s.project, &mut cache);
+        blockers_cached(&s.project, ProxyUse::CurrentSettings, &mut cache);
         eprintln!("one comp changed: {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
+    }
+
+    /// A saved project with one used clip (`clip.mov`, 1920 wide) and a 50% proxy of it.
+    fn proxied_project(dir: &std::path::Path, proxy_on: bool) -> (Session, String, String) {
+        let clip = dir.join("presenter keyed clean.mov").to_string_lossy().to_string();
+        let proxy = dir.join("presenter 50%.mov").to_string_lossy().to_string();
+        std::fs::write(&clip, vec![7u8; 4096]).ok();
+        std::fs::write(&proxy, b"small").ok();
+        let mut s = Session::default();
+        s.execute("comp.new", json!({"name": "C"})).ok();
+        let p = std::sync::Arc::make_mut(&mut s.project);
+        let id = p.add_item(
+            "clip",
+            Default::default(),
+            None,
+            ItemKind::Footage(effectcraft_project::Footage { path: clip.clone(), width: 1920, height: 1080, has_video: true, ..Default::default() }),
+        );
+        if let Some(item) = p.item_mut(id) {
+            item.proxy = Some(Box::new(effectcraft_project::Proxy {
+                footage: effectcraft_project::Footage { path: proxy.clone(), width: 960, height: 540, has_video: true, ..Default::default() },
+                enabled: proxy_on,
+            }));
+        }
+        let cid = s.active_comp_id().unwrap();
+        s.execute("layer.addItem", json!({"comp": cid.0, "item": id.0, "time": 0.0})).unwrap();
+        s.path = Some(dir.join("10-10 Edit.ecproj").to_string_lossy().to_string());
+        (s, clip, proxy)
+    }
+
+    #[test]
+    fn big_files_need_a_drive_link_and_the_message_says_so() {
+        let d = tmp("drive");
+        let (mut s, clip, _) = proxied_project(&d, false);
+        // A 1 KB upload limit makes the 4 KB clip "big".
+        s.execute("cloud.driveLinks", json!({"uploadLimitMb": 0.001})).unwrap();
+        assert!(d.join("10-10 Edit.cloud.json").exists(), "the sidecar sits next to the project");
+        let m: Manifest = serde_json::from_value(s.execute("project.dependencies", json!({})).unwrap()).unwrap();
+        let e = m.files.iter().find(|f| f.path == clip).unwrap();
+        assert_eq!(e.source, "needs-drive-link");
+        // As on a server without the clip.
+        let mut gone = m.clone();
+        for f in &mut gone.files {
+            f.path = f.path.replace(&*d.to_string_lossy(), "/nowhere");
+        }
+        let (missing, _) = check(&gone, false);
+        assert_eq!(missing[0].reason, "needs-drive-link");
+        let line = summary(&missing);
+        assert!(line.contains("upload this to Google Drive and paste the link: presenter keyed clean.mov (5 KB)"), "{line}");
+        // Elias pastes the link (by file name): now it comes from Drive.
+        let link = "https://drive.google.com/file/d/1AbC/view?usp=sharing";
+        s.execute("cloud.driveLinks", json!({"set": {"presenter keyed clean.mov": link}})).unwrap();
+        let m: Manifest = serde_json::from_value(s.execute("project.dependencies", json!({})).unwrap()).unwrap();
+        let e = m.files.iter().find(|f| f.path == clip).unwrap();
+        assert_eq!((e.source.as_str(), e.drive.as_deref()), ("drive", Some(link)));
+        assert!(s.execute("cloud.driveLinks", json!({"set": {"presenter keyed clean.mov": "https://example.com/x"}})).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn an_item_previewed_through_its_proxy_needs_only_the_proxy() {
+        let d = tmp("proxy");
+        let (mut s, clip, proxy) = proxied_project(&d, true);
+        let m: Manifest = serde_json::from_value(s.execute("project.dependencies", json!({})).unwrap()).unwrap();
+        let original = m.files.iter().find(|f| f.path == clip).unwrap();
+        assert!(original.proxied && !original.used);
+        assert!(m.files.iter().find(|f| f.path == proxy).unwrap().used);
+        assert_eq!(m.proxy_only[0]["message"], "presenter keyed clean.mov: previewing from 50% proxy; original stays on Mac");
+        // The server has the proxy but not the original: fine.
+        std::fs::remove_file(&clip).ok();
+        let r = s.execute("cloud.preflight", json!({"manifest": m})).unwrap();
+        assert_eq!(r["ok"], true, "{r}");
+        assert!(blockers(&s.project).is_empty());
+        // Frames rendered with "Use No Proxies" need the original, which isn't here.
+        assert!(!blockers_cached(&s.project, ProxyUse::UseNone, &mut BlockerCache::default()).is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn sidecar_sits_next_to_the_project() {
+        assert_eq!(sidecar_path("/Users/elias/ec/10-10 Edit.ecproj"), "/Users/elias/ec/10-10 Edit.cloud.json");
+        assert!(is_drive_link("https://drive.google.com/drive/folders/1xY?usp=sharing"));
+        assert!(!is_drive_link("http://drive.google.com/file/d/1"));
     }
 
     #[test]
