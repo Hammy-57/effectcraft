@@ -716,14 +716,8 @@ impl Shared {
         }
         let first = p.frames(index).map_or(0, |f| f.0);
         let (lead_now, received) = (st.lead(), st.received);
-        drop(st);
-        self.cv.notify_all();
         let frames_n = u32::try_from(refs.len()).unwrap_or(0);
-        self.log(&format!(
-            "chunk {index} #{seq} frames {first}+{frames_n} {ew}×{eh} render {render_ms:.0} ms encode {encode_ms:.0} ms ({threads} threads) {} KB lead {lead_now:.2} s (app has #{})",
-            bytes.len() / 1024,
-            received.map_or("–".to_string(), |r| r.to_string())
-        ));
+        let kb = bytes.len() / 1024;
         let reply = StreamReply::Chunk {
             stream: self.id,
             seq,
@@ -740,7 +734,15 @@ impl Shared {
             render_ms,
             encode_ms,
         };
+        // Out before the lock goes: the controller may send `End` as soon as it sees the chunk
+        // sent, and that must not overtake the chunk.
         self.reply(reply, bytes);
+        drop(st);
+        self.cv.notify_all();
+        self.log(&format!(
+            "chunk {index} #{seq} frames {first}+{frames_n} {ew}×{eh} render {render_ms:.0} ms encode {encode_ms:.0} ms ({threads} threads) {kb} KB lead {lead_now:.2} s (app has #{})",
+            received.map_or("–".to_string(), |r| r.to_string())
+        ));
     }
 }
 
