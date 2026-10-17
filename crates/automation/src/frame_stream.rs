@@ -43,8 +43,10 @@ const LEVELS: [f32; 3] = [1.0, 0.5, 0.25];
 /// Lead kept on top of a level's chunk latency before choosing it (network, decode).
 const MARGIN_SECS: f64 = 0.35;
 /// Below this lead (seconds) a playing stream lowers its resolution; above the high one it raises it.
-const LOW_LEAD_SECS: f64 = 0.8;
+const LOW_LEAD_SECS: f64 = 1.0;
 const HIGH_LEAD_SECS: f64 = 2.5;
+/// Chunks of a new stream sent at half size (the warm-up).
+const WARM_CHUNKS: usize = 2;
 /// Least time between two resolution changes.
 const LEVEL_HOLD: Duration = Duration::from_millis(1200);
 /// How often the controller looks again without being woken.
@@ -338,17 +340,24 @@ impl State {
         have as f64 / self.p.fps()
     }
 
-    /// The level for a new chunk with `lead` seconds in hand. While playing, a short lead lowers
-    /// the resolution one level and a long one raises it, each at most once per
-    /// [`LEVEL_HOLD`] (so a level gets a few chunks to show what it does). Before playback (the
-    /// pre-roll) and without `adaptive`: full size.
+    /// The level for a new chunk with `lead` seconds in hand. The first chunks of a stream (the
+    /// warm-up, the app waits for them) go at half size: a quarter of the pixels to render and
+    /// encode. While playing, a short lead lowers the resolution one level and a long one raises
+    /// it, each at most once per [`LEVEL_HOLD`] (so a level gets a few chunks to show what it
+    /// does); chunks sent below full size go again at full size when there is time. Before
+    /// playback after the warm-up, and without `adaptive`: full size.
     fn level(&mut self, lead: f64) -> usize {
-        if !self.p.adaptive || !self.playing {
+        if !self.p.adaptive {
+            return 0;
+        }
+        if self.seq < WARM_CHUNKS as u64 && self.flying.len() < WARM_CHUNKS {
+            return 1;
+        }
+        if !self.playing {
             return 0;
         }
         let held = self.level_at.elapsed() >= LEVEL_HOLD;
-        let short = LOW_LEAD_SECS.max(self.latency[self.cur_level.min(2)].unwrap_or(0.0) + MARGIN_SECS);
-        if lead < short && self.cur_level + 1 < LEVELS.len() && held {
+        if lead < LOW_LEAD_SECS && self.cur_level + 1 < LEVELS.len() && held {
             self.cur_level += 1;
             self.level_at = Instant::now();
         } else if lead > HIGH_LEAD_SECS && self.cur_level > 0 && held {
@@ -391,7 +400,8 @@ impl Shared {
             edits: vec![],
             seq: 0,
             latency: [None; 3],
-            cur_level: 0,
+            // Playback starts on the warm-up's half-size chunks.
+            cur_level: 1,
             level_at: Instant::now(),
             ended: None,
         };
@@ -526,7 +536,7 @@ impl Shared {
                 let next = match missing {
                     Some(c) => Some((c, st.level(lead))),
                     // The window is full: send chunks below full size again at full size, if
-                    // there is time for it before the app plays them.
+                    // there is time for it before the app plays them (paused: always).
                     None if st.flying.is_empty() => {
                         let full = st.latency[0].unwrap_or(1.0) + MARGIN_SECS;
                         let fps = st.p.fps();
@@ -537,7 +547,7 @@ impl Shared {
                                 st.sent.get(c).is_some_and(|s| s.level > 0)
                                     && st.p.frames(*c).is_some_and(|(first, _)| {
                                         let until = if first >= now { first - now } else { first + (st.p.hi - now) };
-                                        until as f64 / fps > full
+                                        !st.playing || until as f64 / fps > full
                                     })
                             })
                             .map(|c| (c, 0))

@@ -51,7 +51,7 @@ fn streams() -> (Streams, Receiver<(Down, Vec<u8>)>) {
     (Streams::new(host, tx, 1), rx)
 }
 
-fn start(comp: ItemId, from: f64, to: f64, revision: u64) -> StreamMsg {
+fn start(comp: ItemId, from: f64, to: f64, revision: u64, adaptive: bool) -> StreamMsg {
     StreamMsg::Start {
         stream: 7,
         revision,
@@ -65,7 +65,7 @@ fn start(comp: ItemId, from: f64, to: f64, revision: u64) -> StreamMsg {
         crf: 20.0,
         chunk_frames: 15,
         ahead_secs: 10.0,
-        adaptive: true,
+        adaptive,
         max_size: None,
     }
 }
@@ -101,7 +101,7 @@ fn a_stream_sends_its_range_in_chunks_then_renders_again_after_an_edit_and_a_see
     let (mut s, rx) = streams();
     s.synced(Some((1, p.clone())));
     // From 0.4 s: the grid starts there (frame 12), not at frame 0.
-    s.message(start(comp, 0.4, 2.0, 1));
+    s.message(start(comp, 0.4, 2.0, 1, false));
     let got = collect(&rx, |r| matches!(r, StreamReply::End { .. }));
     assert!(matches!(got.first(), Some((StreamReply::Started { width: 64, height: 36, chunk_frames: 15, .. }, _))), "{:?}", got.first());
     let mut cs = chunks(&got);
@@ -111,7 +111,7 @@ fn a_stream_sends_its_range_in_chunks_then_renders_again_after_an_edit_and_a_see
     for (first, n, rev, bytes) in &cs {
         let frames = decode_chunk(bytes, 1).unwrap();
         assert_eq!(frames.len(), *n as usize, "chunk at {first}");
-        assert_eq!((frames[0].width, frames[0].height, *rev), (64, 36, 1), "full size before playback, revision 1");
+        assert_eq!((frames[0].width, frames[0].height, *rev), (64, 36, 1), "full size (not adaptive), revision 1");
         assert!((frames[0].rgba[0] as i32 - 200).abs() < 12, "red {}", frames[0].rgba[0]);
     }
 
@@ -121,11 +121,7 @@ fn a_stream_sends_its_range_in_chunks_then_renders_again_after_an_edit_and_a_see
     let mut first_layer_edit = q.clone();
     s.synced(Some((2, Arc::new(q))));
     let got = collect(&rx, |r| matches!(r, StreamReply::End { .. }));
-    assert!(
-        matches!(&got[0].0, StreamReply::Stale { revision: 2, from, .. } if *from == Tick::from_seconds_f64(1.0)),
-        "{:?}",
-        got[0].0
-    );
+    assert!(matches!(&got[0].0, StreamReply::Stale { revision: 2, from, .. } if *from == Tick::from_seconds_f64(1.0)), "{:?}", got[0].0);
     let mut again: Vec<(i64, u32)> = chunks(&got).iter().map(|c| (c.0, c.1)).collect();
     again.sort();
     assert_eq!(again, vec![(27, 15), (42, 15), (57, 3)], "the chunk holding frame 30 and those after it");
@@ -156,11 +152,11 @@ fn a_bad_start_fails_the_stream_and_nothing_else() {
     let (p, comp) = project();
     let (mut s, rx) = streams();
     // No project yet.
-    s.message(start(comp, 0.0, 1.0, 1));
+    s.message(start(comp, 0.0, 1.0, 1, true));
     s.synced(Some((1, p)));
     // Another revision, another comp.
-    s.message(start(comp, 0.0, 1.0, 9));
-    s.message(start(ItemId(999_999), 0.0, 1.0, 1));
+    s.message(start(comp, 0.0, 1.0, 9, true));
+    s.message(start(ItemId(999_999), 0.0, 1.0, 1, true));
     // Messages for a stream that doesn't exist are ignored.
     s.message(StreamMsg::Playhead { stream: 3, time: Tick(0), playing: true, received: None });
     s.message(StreamMsg::Seek { stream: 3, time: Tick(0) });
@@ -170,4 +166,27 @@ fn a_bad_start_fails_the_stream_and_nothing_else() {
         fails += 1;
     }
     assert_eq!(fails, 3);
+}
+
+#[test]
+fn an_adaptive_stream_warms_up_at_half_size_then_goes_full_size_before_playback() {
+    let (p, comp) = project();
+    let (mut s, rx) = streams();
+    s.synced(Some((1, p)));
+    s.message(start(comp, 0.0, 3.0, 1, true));
+    let got = collect(&rx, |r| matches!(r, StreamReply::End { .. }));
+    let mut sizes: Vec<(i64, u32, f32)> = got
+        .iter()
+        .filter_map(|(r, _)| match r {
+            StreamReply::Chunk { first, width, scale, .. } => Some((*first, *width, *scale)),
+            _ => None,
+        })
+        .collect();
+    sizes.sort_by_key(|c| c.0);
+    // The first two chunks at half size; the rest (and the warm-up chunks again, once the window
+    // is full: nothing plays yet) at full size.
+    let firsts: Vec<(i64, u32)> = sizes.iter().filter(|c| c.2 == 0.5).map(|c| (c.0, c.1)).collect();
+    assert_eq!(firsts, vec![(0, 32), (15, 32)], "{sizes:?}");
+    let full: std::collections::BTreeSet<i64> = sizes.iter().filter(|c| c.2 == 1.0).map(|c| c.0).collect();
+    assert_eq!(full.into_iter().collect::<Vec<_>>(), vec![0, 15, 30, 45, 60, 75], "{sizes:?}");
 }
