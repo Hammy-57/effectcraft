@@ -33,6 +33,7 @@ pub use effectcraft_color as color;
 pub use effectcraft_effects as effects;
 pub use effectcraft_geom as geom;
 pub use effectcraft_keyframe as keyframe;
+pub use effectcraft_motionlib as motionlib;
 pub use effectcraft_project as project;
 pub use effectcraft_raster as raster;
 pub use effectcraft_render as render;
@@ -568,6 +569,9 @@ pub struct Session {
     /// is, settings that guard what scripts may do can't change (see
     /// [`prefs::Scripting::same_permissions`]).
     pub script_calls: ScriptCalls,
+    /// The Motion Library (cards in a remote bucket, cached locally): made on first use from
+    /// `motion-library.json` or the environment, or set by the host (the web app's fetch).
+    pub motion_library: motion_library::Handle,
 }
 
 /// The count behind [`Session::running_for_script`]; only the engine changes it.
@@ -695,6 +699,7 @@ impl Default for Session {
             offload_log_start: 0,
             browser: None,
             storage: None,
+            motion_library: Default::default(),
             tasks: vec![],
             job_log: vec![],
             next_task_id: 1,

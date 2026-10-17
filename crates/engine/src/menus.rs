@@ -1210,6 +1210,7 @@ Window
   Mask Interpolation | window.panel {"panel":"maskInterpolation"}
   Media Browser | window.panel {"panel":"mediaBrowser"}
   Metadata | window.panel {"panel":"metadata"}
+  Motion Library | window.panel {"panel":"motionLibrary"}
   Motion Sketch | window.panel {"panel":"motionSketch"}
   Paint | window.panel {"panel":"paint"} | Cmd+8
   Paragraph | window.panel {"panel":"paragraph"} | Cmd+7

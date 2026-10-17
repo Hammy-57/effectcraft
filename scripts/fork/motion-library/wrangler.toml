@@ -1,0 +1,10 @@
+# Motion Library bucket gate (see README.md). Deployed by setup.sh; secrets READ_TOKEN and
+# PUBLISH_TOKEN are set with `wrangler secret put`, never written here.
+name = "effectcraft-motion-library"
+main = "worker.js"
+compatibility_date = "2026-06-01"
+workers_dev = true
+
+[[r2_buckets]]
+binding = "LIBRARY"
+bucket_name = "motion-library"

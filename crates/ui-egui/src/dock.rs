@@ -53,10 +53,12 @@ pub enum PanelKind {
     CreateNullsFromPaths,
     /// Window ▸ VR Comp Editor (our own panel).
     VrCompEditor,
+    /// Window ▸ Motion Library (our own panel): the card catalog in the remote bucket.
+    MotionLibrary,
 }
 
 impl PanelKind {
-    pub const ALL: [PanelKind; 35] = [
+    pub const ALL: [PanelKind; 36] = [
         PanelKind::Project,
         PanelKind::EffectControls,
         PanelKind::Composition,
@@ -92,6 +94,7 @@ impl PanelKind {
         PanelKind::ContentAwareFill,
         PanelKind::CreateNullsFromPaths,
         PanelKind::VrCompEditor,
+        PanelKind::MotionLibrary,
     ];
     pub fn title(self) -> &'static str {
         match self {
@@ -132,6 +135,7 @@ impl PanelKind {
             PanelKind::ContentAwareFill => "Content-Aware Fill",
             PanelKind::CreateNullsFromPaths => "Create Nulls From Paths",
             PanelKind::VrCompEditor => "VR Comp Editor",
+            PanelKind::MotionLibrary => "Motion Library",
         }
     }
     pub fn id(self) -> String {

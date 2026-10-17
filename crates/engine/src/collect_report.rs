@@ -43,7 +43,7 @@ pub(super) fn dependency_warnings(project: &Project) -> Vec<Json> {
     warnings
 }
 
-fn property_warnings(property: &Property) -> Vec<Json> {
+pub(crate) fn property_warnings(property: &Property) -> Vec<Json> {
     let mut warnings = Vec::new();
     for value in std::iter::once(&property.value).chain(property.keys.iter().map(|key| &key.value)) {
         if let Value::Text(doc) = value {

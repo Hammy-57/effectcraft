@@ -46,6 +46,9 @@ const SCREENSHOT_TIMEOUT_S: f64 = 4.0;
 /// keeps failing composites on the CPU after that.
 const MAX_GPU_REBUILDS: u8 = 3;
 
+/// A replacement compositor waits at most this long for the failed one's device to be freed.
+const REBUILD_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
 fn compositor_gpu(
     adapter: &eframe::wgpu::Adapter,
     device: eframe::wgpu::Device,
@@ -438,6 +441,12 @@ pub struct EffectcraftApp {
     next_token: u64,
     pub(crate) last_ui_time: f64,
     pub(crate) scrub_preview: crate::scrub_preview::ScrubPreview,
+    /// CR5: the viewer's preview from a cloud frame server (Settings ▸ Previews ▸ Preview On).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) cloud: cloud::CloudPreview,
+    /// The cloud server's token and when it was read (at most every few seconds).
+    #[cfg(not(target_arch = "wasm32"))]
+    cloud_token: (f64, String),
     /// When the user last did something (input or an edit): Cache Frames When Idle waits for
     /// a second of quiet. (time, project revision then)
     last_activity: (f64, u64),
@@ -486,6 +495,9 @@ pub struct EffectcraftApp {
     /// [`MAX_GPU_REBUILDS`]), and whether the next [`Self::init_gpu`] replaces a failed one.
     gpu_rebuilds: u8,
     gpu_rebuilding: bool,
+    /// The failed compositor's device and when it failed: its replacement waits until it is
+    /// gone (its video memory freed), at most [`REBUILD_WAIT`].
+    gpu_failed_device: Option<(std::sync::Weak<effectcraft_gpu::GpuContext>, web_time::Instant)>,
     /// The graphics device was lost and the window is closing (see `close_after_device_loss`);
     /// `true` keeps crash recovery for the next launch.
     device_lost_close: Option<bool>,
@@ -577,6 +589,10 @@ impl EffectcraftApp {
             events_sent: (f64::NEG_INFINITY, 0, vec![]),
             next_token: 1,
             scrub_preview: Default::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            cloud: Default::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            cloud_token: (f64::NEG_INFINITY, String::new()),
             last_ui_time: 0.0,
             last_activity: (0.0, 0),
             last_edit: (0.0, 0),
@@ -606,6 +622,7 @@ impl EffectcraftApp {
             gpu_failure_applied: None,
             gpu_rebuilds: 0,
             gpu_rebuilding: false,
+            gpu_failed_device: None,
             device_lost_close: None,
             dialog_answers: std::sync::mpsc::channel(),
             command_inbox: None,
@@ -951,6 +968,7 @@ impl EffectcraftApp {
             }
         }
         let had_gpu = self.gpu.is_some();
+        let failed_device = self.gpu.as_ref().map(effectcraft_gpu::Gpu::downgrade);
         self.gpu_failure_applied = Some(failure.presentation_lost);
         self.gpu_checked = true;
         #[cfg(not(target_arch = "wasm32"))]
@@ -998,6 +1016,7 @@ impl EffectcraftApp {
         if rebuild {
             self.gpu_rebuilds += 1;
             self.gpu_rebuilding = true;
+            self.gpu_failed_device = failed_device.map(|d| (d, web_time::Instant::now()));
             self.gpu_checked = false;
         }
         self.ui.status = if failure.presentation_lost {
@@ -1063,6 +1082,17 @@ impl EffectcraftApp {
         // device of its own (RT10e).
         let replacing = (self.zero_copy.failed || self.gpu_rebuilding)
             && self.gpu_failures.as_ref().is_some_and(|bridge| bridge.failure().is_some_and(|f| !f.presentation_lost));
+        // A device that ran out of video memory still holds it until its last frames are done:
+        // a replacement made meanwhile ran out too (and the window could not draw), so it waits.
+        if replacing
+            && let Some((old, since)) = &self.gpu_failed_device
+            && old.strong_count() > 0
+            && since.elapsed() < REBUILD_WAIT
+        {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            return;
+        }
+        self.gpu_failed_device = None;
         if !replacing && self.gpu_failures.as_ref().is_some_and(|bridge| bridge.failure().is_some()) {
             self.gpu_checked = true;
             #[cfg(not(target_arch = "wasm32"))]
@@ -1306,7 +1336,62 @@ impl EffectcraftApp {
                 return Some((k, img));
             }
         }
-        self.frames.get_for_viewer(key, self.viewer_shown.as_ref().map(|(_, s)| s))
+        self.frames
+            .get_for_viewer(key, self.viewer_shown.as_ref().map(|(_, s)| s))
+            // A cloud frame takes a round trip: while scrubbing, the newest one that landed.
+            .or_else(|| self.frames.latest_remote_for(key))
+    }
+
+    /// Follow Settings ▸ Previews ▸ Preview On (CR5): connect to the cloud frame server or not,
+    /// hand the viewer's frames to it or to this Mac, and note a lost or regained connection in
+    /// the status line (never a dialog; the document is never touched).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn tick_cloud(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|i| i.time);
+        let mode = self.session.prefs.previews.preview_on.clone();
+        if mode != "local" && now - self.cloud_token.0 > 3.0 {
+            let token = std::env::var("EFFECTCRAFT_FRAME_TOKEN")
+                .ok()
+                .or_else(|| self.session.config.as_ref().and_then(|c| c.read(cloud::TOKEN_ENTRY)))
+                .unwrap_or_default();
+            self.cloud_token = (now, token.trim().to_string());
+        }
+        let comp = self.session.active_comp_id().zip(self.session.active_comp()).map(|(id, c)| (id.0, c.frame_rate.as_f64()));
+        let last_ms = self.frames.last_ms.lock().map(|m| *m).unwrap_or(0.0);
+        let address = self.session.prefs.previews.cloud_address.clone();
+        let tick = cloud::Now {
+            mode: &mode,
+            address: &address,
+            token: &self.cloud_token.1,
+            revision: self.session.revision,
+            project: &self.session.project,
+            comp,
+            last_ms,
+        };
+        let (remote, note) = self.cloud.tick(&tick);
+        // Only the cloud's own renderer is swapped in and out (tests and hosts may set another).
+        match remote {
+            Some(c) => {
+                let c: Arc<dyn frames::RemoteFrames> = c;
+                if !self.frames.remote().is_some_and(|r| Arc::ptr_eq(r, &c)) {
+                    self.frames.set_remote(Some(c));
+                }
+                self.cloud.installed = true;
+            }
+            None if self.cloud.installed => {
+                self.frames.set_remote(None);
+                self.cloud.installed = false;
+            }
+            None => {}
+        }
+        if let Some(note) = note {
+            self.ui.status = note;
+        }
+        self.frames.tick_remote();
+        if mode != "local" {
+            // The link's state changes without input (a frame landing, the tunnel dropping).
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
     }
 
     /// The render scale used by the viewer right now.
@@ -2112,6 +2197,10 @@ impl EffectcraftApp {
             // on the UI thread (`Frames::pump`)
             return self.frames.remote_slots().max(1);
         }
+        if self.frames.remote_active() {
+            // The cloud: as many as cover its round trip (CR5).
+            return self.frames.remote_slots();
+        }
         self.frames.parallelism()
     }
 
@@ -2676,6 +2765,8 @@ impl eframe::App for EffectcraftApp {
         }
         #[cfg(not(target_arch = "wasm32"))]
         pointer_wrap::finish_native(&ctx, frame);
+        #[cfg(not(target_arch = "wasm32"))]
+        self.tick_cloud(&ctx);
         // wasm32: no frame threads; render queued frames now, between UI frames.
         if cfg!(target_arch = "wasm32") && self.frames.pump(std::time::Duration::from_millis(if self.playback.playing { 24 } else { 40 })) {
             ctx.request_repaint();
@@ -2955,6 +3046,10 @@ mod gpu_failure_tests {
             if round < MAX_GPU_REBUILDS {
                 assert!(!app.gpu_checked && app.gpu_rebuilding, "round {round}: set up again next frame");
                 assert!(app.ui.status.contains("restarts on a new device"), "{}", app.ui.status);
+                // The replacement waits until the failed device (still held here) is freed.
+                assert!(app.gpu_failed_device.as_ref().is_some_and(|(d, _)| d.strong_count() > 0));
+                drop(g);
+                assert!(app.gpu_failed_device.as_ref().is_some_and(|(d, _)| d.strong_count() == 0), "then it may start");
                 // As `init_gpu` does once the replacement is up.
                 app.gpu_rebuilding = false;
                 app.frames.revive_gpu();
