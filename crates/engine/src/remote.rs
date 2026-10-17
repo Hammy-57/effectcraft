@@ -5,11 +5,13 @@
 //! replica of the project. The page sends the replica **project diffs** rather than the whole
 //! project per edit, then render requests; the worker answers each with the frame's pixels.
 //!
-//! - [`diff`] / [`patch`]: a structural JSON diff of the serialized project (object members
-//!   added, changed or removed; arrays element-wise when their length is unchanged, else
-//!   replaced). Lossless (unlike JSON Merge Patch, `null` values survive).
+//! - [`diff`] / [`patch`]: a structural JSON diff (object members added, changed or removed;
+//!   arrays element-wise when their length is unchanged, else the run between their common
+//!   start and end spliced). Lossless (unlike JSON Merge Patch, `null` values survive). Used
+//!   for the one layer an edit changed.
 //! - [`Mirror`] (page side): what the worker holds; turns the next project revision into a
-//!   [`FrameMsg::Sync`] (a full project the first time, a diff afterwards).
+//!   [`FrameMsg::Project`] the first time (and after a [`FrameReply::Resync`]), then a
+//!   [`FrameMsg::Patch`] of the comps and layers that changed ([`crate::remote_sync`]).
 //! - [`FrameServer`] (worker side): applies syncs, relayed Roto Brush segmentations and render
 //!   requests, and renders frames as premultiplied RGBA8 ([`rgba8_premultiplied`]).
 //!
@@ -43,6 +45,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::offload::SegData;
+use crate::remote_sync;
+pub use crate::remote_sync::{Coalescer, LayerOp, Patch, PatchOp, SyncCache, decode_msg, encode_msg, project_hash};
 
 /// One step of a path into a JSON document.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -53,12 +57,15 @@ pub enum Step {
 }
 
 /// One change: set the value at `path` (creating or replacing the member/element), or remove
-/// the object member at `path` (`value` absent).
+/// the object member at `path` (`value` absent). With `splice` `[start, count]`, the array at
+/// `path` has `count` elements from `start` replaced by the elements of `value` (an array).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Op {
     pub path: Vec<Step>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub splice: Option<[usize; 2]>,
 }
 
 /// The changes that turn `old` into `new` (empty when equal).
@@ -78,14 +85,14 @@ fn diff_into(old: &Value, new: &Value, path: &mut Vec<Step>, ops: &mut Vec<Op>) 
                 path.push(Step::Key(k.clone()));
                 match b.get(k) {
                     Some(vb) => diff_into(va, vb, path, ops),
-                    None => ops.push(Op { path: path.clone(), value: None }),
+                    None => ops.push(Op { path: path.clone(), value: None, splice: None }),
                 }
                 path.pop();
             }
             for (k, vb) in b {
                 if !a.contains_key(k) {
                     path.push(Step::Key(k.clone()));
-                    ops.push(Op { path: path.clone(), value: Some(vb.clone()) });
+                    ops.push(Op { path: path.clone(), value: Some(vb.clone()), splice: None });
                     path.pop();
                 }
             }
@@ -97,13 +104,36 @@ fn diff_into(old: &Value, new: &Value, path: &mut Vec<Step>, ops: &mut Vec<Op>) 
                 path.pop();
             }
         }
-        _ => ops.push(Op { path: path.clone(), value: Some(new.clone()) }),
+        (Value::Array(a), Value::Array(b)) => {
+            // A different length (a keyframe added or removed): splice the run between the
+            // common start and end.
+            let pre = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+            let room = a.len().min(b.len()).saturating_sub(pre);
+            let suf = a.iter().rev().zip(b.iter().rev()).take(room).take_while(|(x, y)| x == y).count();
+            match b.get(pre..b.len().saturating_sub(suf)) {
+                Some(mid) if pre + suf > 0 => {
+                    ops.push(Op { path: path.clone(), value: Some(Value::Array(mid.to_vec())), splice: Some([pre, a.len().saturating_sub(pre + suf)]) })
+                }
+                _ => ops.push(Op { path: path.clone(), value: Some(new.clone()), splice: None }),
+            }
+        }
+        _ => ops.push(Op { path: path.clone(), value: Some(new.clone()), splice: None }),
     }
 }
 
 /// Apply [`diff`]'s changes to `doc`.
 pub fn patch(doc: &mut Value, ops: &[Op]) -> Result<(), String> {
     for op in ops {
+        if let Some([start, count]) = op.splice {
+            let Some(Value::Array(with)) = &op.value else { return Err("a splice without elements".into()) };
+            let Some(Value::Array(a)) = lookup(doc, &op.path)? else { return Err("a splice of something that is not an array".into()) };
+            let end = start.checked_add(count).filter(|e| *e <= a.len()).ok_or("a splice beyond the array")?;
+            if start > end {
+                return Err("a splice beyond the array".into());
+            }
+            a.splice(start..end, with.iter().cloned());
+            continue;
+        }
         let Some((last, parents)) = op.path.split_last() else {
             *doc = op.value.clone().ok_or("cannot remove the document")?;
             continue;
@@ -130,14 +160,27 @@ pub fn patch(doc: &mut Value, ops: &[Op]) -> Result<(), String> {
     Ok(())
 }
 
+fn lookup<'a>(doc: &'a mut Value, path: &[Step]) -> Result<Option<&'a mut Value>, String> {
+    let mut cur = doc;
+    for st in path {
+        cur = match (st, cur) {
+            (Step::Key(k), Value::Object(m)) => m.get_mut(k).ok_or_else(|| format!("no member `{k}`"))?,
+            (Step::Index(i), Value::Array(a)) => a.get_mut(*i).ok_or_else(|| format!("no element {i}"))?,
+            _ => return Ok(None),
+        };
+    }
+    Ok(Some(cur))
+}
+
 /// Page → frame worker.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum FrameMsg {
     /// The whole project (JSON) at `revision`.
     Project { revision: u64, project: String },
-    /// Changes from the worker's revision `from` to `revision`.
-    Patch { from: u64, revision: u64, ops: Vec<Op> },
+    /// The comps and layers that changed from the worker's revision to the next (see
+    /// [`crate::remote_sync`]).
+    Patch(Patch),
     /// Render a frame of the current project. `disk`: the frame's disk-cache key (32 hex
     /// digits) when the transport should store it.
     Render {
@@ -205,10 +248,12 @@ pub enum FrameReply {
     Resync { error: String },
 }
 
-/// The page's record of a worker's replica.
+/// The page's record of a worker's replica: the snapshot it holds (its comps and layers are
+/// shared with the session's, so the next sync finds the changes by pointer).
 #[derive(Default)]
 pub struct Mirror {
-    sent: Option<(u64, Value)>,
+    sent: Option<(u64, Arc<Project>)>,
+    cache: SyncCache,
 }
 
 impl Mirror {
@@ -220,19 +265,27 @@ impl Mirror {
     /// Forget the replica (the next sync sends the whole project).
     pub fn reset(&mut self) {
         self.sent = None;
+        self.cache.clear();
     }
 
     /// The message that brings the worker to `revision` of `project` (`None` when it has it).
-    pub fn sync(&mut self, revision: u64, project: &Project) -> Option<FrameMsg> {
+    pub fn sync(&mut self, revision: u64, project: &Arc<Project>) -> Option<FrameMsg> {
         if self.revision() == Some(revision) {
             return None;
         }
-        let v = serde_json::to_value(project).unwrap_or(Value::Null);
-        let msg = match self.sent.take() {
-            Some((from, old)) => FrameMsg::Patch { from, revision, ops: diff(&old, &v) },
-            None => FrameMsg::Project { revision, project: v.to_string() },
+        let ops = match self.sent.take() {
+            Some((from, old)) => remote_sync::diff_projects(&old, project, &mut self.cache).ok().map(|ops| (from, ops)),
+            None => None,
         };
-        self.sent = Some((revision, v));
+        let msg = match ops {
+            Some((from_rev, ops)) => FrameMsg::Patch(Patch { from_rev, to_rev: revision, ops }),
+            None => {
+                self.cache.clear();
+                FrameMsg::Project { revision, project: serde_json::to_string(&**project).unwrap_or_default() }
+            }
+        };
+        self.sent = Some((revision, project.clone()));
+        self.cache.trim();
         Some(msg)
     }
 }
@@ -255,8 +308,9 @@ pub struct FrameServer {
     pub cache: Arc<LayerCache>,
     /// The worker's own accelerator (a GPU device; see [`FrameServer::set_accel`]).
     accel: Option<Arc<dyn Accelerator>>,
-    doc: Value,
     project: Option<Arc<Project>>,
+    /// Layer hashes and JSON for the next patch.
+    sync: SyncCache,
     revision: Option<u64>,
     /// The frame being rendered in passes.
     pending: Option<Pending>,
@@ -288,8 +342,8 @@ impl FrameServer {
             expr,
             cache: Arc::new(LayerCache::default()),
             accel: None,
-            doc: Value::Null,
             project: None,
+            sync: SyncCache::default(),
             revision: None,
             pending: None,
             layer_store: None,
@@ -336,13 +390,21 @@ impl FrameServer {
         self.pending.is_some()
     }
 
-    fn load(&mut self, revision: u64) -> Result<(), String> {
-        let p = Project::from_json(&self.doc.to_string()).map_err(|e| e.to_string())?;
-        self.salt = effectcraft_render::disk_cache::footage_salt(&p);
-        self.cache.set_store_salt(self.salt);
-        self.project = Some(Arc::new(p));
+    /// `resalt`: the footage may have changed (the salt reads every footage file's stamp).
+    fn load(&mut self, revision: u64, p: Arc<Project>, resalt: bool) {
+        if resalt {
+            self.salt = effectcraft_render::disk_cache::footage_salt(&p);
+            self.cache.set_store_salt(self.salt);
+        }
+        self.project = Some(p);
         self.revision = Some(revision);
-        Ok(())
+        self.sync.trim();
+    }
+
+    /// [`project_hash`] of the replica (what the page's project hashes to when they match).
+    pub fn project_hash(&mut self) -> Option<u64> {
+        let p = self.project.clone()?;
+        Some(project_hash(&p, &mut self.sync))
     }
 
     /// Handle one message; returns the replies with their pixels. A render that needs more
@@ -350,21 +412,29 @@ impl FrameServer {
     pub fn handle(&mut self, msg: FrameMsg) -> Vec<(FrameReply, Option<Vec<u8>>)> {
         match msg {
             FrameMsg::Project { revision, project } => {
-                let r = serde_json::from_str(&project).map_err(|e| e.to_string()).and_then(|v| {
-                    self.doc = v;
-                    self.load(revision)
-                });
-                match r {
-                    Ok(()) => vec![],
+                self.sync.clear();
+                match remote_sync::read_project(project.as_bytes()) {
+                    Ok(p) => {
+                        self.load(revision, Arc::new(p), true);
+                        vec![]
+                    }
                     Err(e) => self.lost(e),
                 }
             }
-            FrameMsg::Patch { from, revision, ops } => {
-                if self.revision != Some(from) {
-                    return self.lost(format!("the replica is at {:?}, the patch starts at {from}", self.revision));
+            FrameMsg::Patch(Patch { from_rev, to_rev, ops }) => {
+                let (Some(mut p), Some(from)) = (self.project.take(), self.revision) else {
+                    return self.lost(format!("no replica for the patch from {from_rev}"));
+                };
+                if from != from_rev {
+                    return self.lost(format!("the replica is at {from}, the patch starts at {from_rev}"));
                 }
-                match patch(&mut self.doc, &ops).and_then(|_| self.load(revision)) {
-                    Ok(()) => vec![],
+                match remote_sync::apply(&mut p, &ops, &mut self.sync) {
+                    Ok(()) => {
+                        // A drag changes comps only: the footage, and so the salt, stay.
+                        let resalt = ops.iter().any(|op| !matches!(op, PatchOp::Comp { .. }));
+                        self.load(to_rev, p, resalt);
+                        vec![]
+                    }
                     Err(e) => self.lost(e),
                 }
             }
@@ -455,8 +525,8 @@ impl FrameServer {
     }
 
     fn lost(&mut self, error: String) -> Vec<(FrameReply, Option<Vec<u8>>)> {
-        self.doc = Value::Null;
         self.project = None;
+        self.sync.clear();
         self.revision = None;
         vec![(FrameReply::Resync { error }, None)]
     }
@@ -601,7 +671,7 @@ mod tests {
         // An edit travels as a small diff; the replica renders the edited frame.
         s.execute("layer.newSolid", json!({"color": "#ff8800", "name": "Orange"})).unwrap();
         let msg = m.sync(s.revision, &s.project).unwrap();
-        let FrameMsg::Patch { ops, .. } = &msg else { panic!("expected a patch") };
+        let FrameMsg::Patch(Patch { ops, .. }) = &msg else { panic!("expected a patch") };
         assert!(!ops.is_empty() && serde_json::to_string(ops).unwrap().len() < s.project.to_json().len() / 2);
         assert!(send(msg, &mut w).is_empty());
         assert_eq!(**w.project().unwrap(), *s.project);
@@ -611,7 +681,7 @@ mod tests {
         let out = render(&mut w, s.revision + 7, 3);
         assert!(matches!(out[0].0, FrameReply::Failed { id: 3, stale: true, .. }));
         // A patch from the wrong base asks for a resync; the mirror then sends the project.
-        let bad = FrameMsg::Patch { from: 999, revision: 1000, ops: vec![] };
+        let bad = FrameMsg::Patch(Patch { from_rev: 999, to_rev: 1000, ops: vec![] });
         assert!(matches!(send(bad, &mut w)[0].0, FrameReply::Resync { .. }));
         m.reset();
         assert!(matches!(m.sync(s.revision, &s.project), Some(FrameMsg::Project { .. })));

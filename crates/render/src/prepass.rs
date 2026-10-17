@@ -61,6 +61,15 @@ enum Job<'l> {
     Resident(&'l Layer, u64, ContentClip),
 }
 
+impl<'l> Job<'l> {
+    /// The layer the job produces content for (its render time gets the job's).
+    fn layer(&self) -> &'l Layer {
+        match *self {
+            Job::Styled(l) | Job::Matte(l) | Job::Resident(l, ..) => l,
+        }
+    }
+}
+
 /// Layers whose content the pre-pass can produce: rasterised in the renderer, no footage or
 /// nested comp behind them.
 fn rasterised(layer: &Layer) -> bool {
@@ -126,7 +135,7 @@ impl<'a> Renderer<'a> {
                 break;
             }
             let made: Vec<(usize, Option<(u64, Buf)>)> =
-                part.par_iter().map(|j| crate::eval::with_transform_memo(self.project, || self.produce(ctx, *j))).collect();
+                part.par_iter().map(|j| self.timed(ctx, j.layer(), || crate::eval::with_transform_memo(self.project, || self.produce(ctx, *j)))).collect();
             PRODUCED.fetch_add(part.len() as u64, Ordering::Relaxed);
             for (bytes, r) in made {
                 spent = spent.saturating_add(bytes);

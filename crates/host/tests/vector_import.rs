@@ -260,23 +260,25 @@ fn pdf_and_ai_footage_layers_and_shapes_from_vector_layer() {
     // Import As: Composition — one layer per file layer, top first, together like the page.
     let path = tmp("layers.ai");
     std::fs::write(&path, &bytes).unwrap();
-    let mut s = effectcraft_host::session();
-    let r = s.execute_checked("file.import", json!({"paths": [path], "importAs": "composition"})).unwrap();
-    let cid = ItemId(r["comps"][0].as_u64().unwrap());
-    let comp = s.project.comp(cid).unwrap();
-    let names: Vec<&str> = comp.layers.iter().map(|l| l.name.as_str()).collect();
-    assert_eq!(names, vec!["Art", "Sky"]);
-    assert_eq!((comp.width, comp.height), (120, 80));
-    let art = comp.layers[0].id.0;
-    let img = s.render(cid, effectcraft_time::Tick::ZERO, RenderOpts::default());
-    let d = mean_diff(&img, &direct);
-    assert!(d < 1.0 / 255.0, "layered comp vs page {d}");
-    // Each layer's footage shows only its layer.
-    s.execute("layer.setSwitch", json!({"layers": [art], "switch": "video", "value": false})).unwrap();
-    let sky = s.render(cid, effectcraft_time::Tick::ZERO, RenderOpts::default());
-    assert_eq!(sky.get(5, 5), img.get(5, 5));
-    let p = sky.get(60, 30);
-    assert!(p[2] > p[0], "only sky under the art {p:?}");
+    for import_as in ["composition", "compositionLayerSizes"] {
+        let mut s = effectcraft_host::session();
+        let r = s.execute_checked("file.import", json!({"paths": [path], "importAs": import_as})).unwrap();
+        let cid = ItemId(r["comps"][0].as_u64().unwrap());
+        let comp = s.project.comp(cid).unwrap();
+        let names: Vec<&str> = comp.layers.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, vec!["Art", "Sky"]);
+        assert_eq!((comp.width, comp.height), (120, 80));
+        let art = comp.layers[0].id.0;
+        let img = s.render(cid, effectcraft_time::Tick::ZERO, RenderOpts::default());
+        let d = mean_diff(&img, &direct);
+        assert!(d < 1.0 / 255.0, "layered comp vs page {d}");
+        // Each layer's footage shows only its layer.
+        s.execute("layer.setSwitch", json!({"layers": [art], "switch": "video", "value": false})).unwrap();
+        let sky = s.render(cid, effectcraft_time::Tick::ZERO, RenderOpts::default());
+        assert_eq!(sky.get(5, 5), img.get(5, 5));
+        let p = sky.get(60, 30);
+        assert!(p[2] > p[0], "only sky under the art {p:?}");
+    }
 }
 
 #[test]

@@ -66,7 +66,7 @@ fn is_still(path: &str, head: &[u8]) -> bool {
         || image::guess_format(head).is_ok()
 }
 
-/// A standalone MP3 / FLAC / Ogg / AIFF file described from its headers and packet framing,
+/// A standalone MP3 / FLAC / Ogg file described from its headers and packet framing,
 /// without decoding it (FilmCraft decodes these whole when they are opened): `None` when the file
 /// isn't one, or doesn't read cleanly (then it is probed by opening it, as before).
 ///
@@ -80,7 +80,9 @@ fn probe_audio_headers(path: &Path, name: &str) -> Option<Footage> {
     use symphonia::core::meta::MetadataOptions;
     use symphonia::core::probe::Hint;
     let ext = ext_of(path);
-    if !matches!(ext.as_str(), "mp3" | "mp2" | "flac" | "ogg" | "oga" | "aif" | "aiff" | "aifc") {
+    if !matches!(ext.as_str(), "mp3" | "mp2" | "flac" | "ogg" | "oga") {
+        // Not AIFF: symphonia counts the SSND chunk's offset / block size fields as two frames
+        // (#1428); opening the file decodes it exactly.
         return None;
     }
     let file = std::fs::File::open(path).ok()?;

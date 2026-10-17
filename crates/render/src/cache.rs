@@ -1787,8 +1787,9 @@ fn hash_layer_refs(h: &mut KeyHasher, ctx: &EvalCtx, layer: &Layer, reads_other_
             continue;
         }
         let oi = layer_info(ctx.comp, o);
-        // Read at other times, an expression may read anything then.
-        if oi.reads_comp_scene || (reads_other_times && oi.expressions) {
+        // Read at other times, an expression may read anything then. A scene reader's camera and
+        // lights are keyed by `dependencies::hash` (#1252).
+        if reads_other_times && oi.expressions {
             return None;
         }
         // Read at the frame time only: its values there, not its keyframes.

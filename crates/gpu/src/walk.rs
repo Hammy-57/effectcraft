@@ -83,25 +83,29 @@ fn draw_layers<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, visible: &[
     // The layers' content on every core first (`prepass`); dropped with what the walk didn't take.
     let _prefetched = crate::prepass::run(e, r, ctx, visible.get(i..).unwrap_or(&[]), canvas, ordinary_resident_enabled());
     while i < visible.len() {
+        // A device that ran out of memory (or was lost) on an earlier layer fails every later
+        // one: give the frame back to the CPU now instead of drawing the rest of the comp.
+        e.g.check_health().ok()?;
         if visible[i].is_3d() {
             let mut j = i;
             while j < visible.len() && visible[j].is_3d() {
                 j += 1;
             }
-            draw_3d(e, r, ctx, &visible[i..j], canvas)?;
+            r.timed_run(ctx, &visible[i..j], || draw_3d(e, r, ctx, &visible[i..j], canvas))?;
             i = j;
         } else {
-            match (r.collapsed(ctx, visible[i]), r.collapsed_fx(ctx, visible[i])) {
-                (Some(item), _) => draw_collapsed(e, r, ctx, visible[i], item, canvas)?,
+            r.timed(ctx, visible[i], || match (r.collapsed(ctx, visible[i]), r.collapsed_fx(ctx, visible[i])) {
+                (Some(item), _) => draw_collapsed(e, r, ctx, visible[i], item, canvas),
                 (None, Some(item)) => {
                     if draw_collapsed_fx(e, r, ctx, visible[i], item, canvas).is_none() {
                         on_cpu(e, canvas, |img| {
                             r.draw_collapsed_fx(ctx, visible[i], item, img);
                         })?;
                     }
+                    Some(())
                 }
-                (None, None) => draw_layer(e, r, ctx, visible[i], canvas)?,
-            }
+                (None, None) => draw_layer(e, r, ctx, visible[i], canvas),
+            })?;
             i += 1;
         }
         // 8/16 bpc: the comp is an integer buffer after every layer.

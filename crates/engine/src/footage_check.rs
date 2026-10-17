@@ -263,7 +263,7 @@ mod tests {
         std::fs::write(d.join("Job/shots/a.png"), b"x").unwrap();
         // Saved on another machine: the footage sat next to the project in /Users/x/Job.
         let mut s = session_with(&["/Users/x/Job/shots/a.png", "/Users/x/elsewhere/b.png"]);
-        let path = d.join("Job/p.ecproj");
+        let path = d.join("Job").join("p.ecproj");
         s.execute("file.saveAs", json!({"path": path.to_string_lossy()})).unwrap();
         let mut o = Session::default();
         o.execute("file.open", json!({"path": path.to_string_lossy()})).unwrap();
@@ -278,7 +278,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(paths.contains(&d.join("Job/shots/a.png").to_string_lossy().to_string()), "{paths:?}");
+        assert!(paths.contains(&d.join("Job").join("shots").join("a.png").to_string_lossy().to_string()), "{paths:?}");
         assert!(!o.is_dirty(), "finding the files is not an edit");
         let _ = std::fs::remove_dir_all(d);
     }
