@@ -72,6 +72,9 @@ pub struct ViewState {
     /// A save waiting for a yes (its upload is over the size limit).
     #[serde(skip)]
     pub confirm_save: Option<SaveAsk>,
+    /// A collection folder dialog (new, rename, delete).
+    #[serde(skip)]
+    pub folder_ask: Option<FolderAsk>,
 }
 
 /// A save to confirm: the card, the upload's size and what stays home.
@@ -104,6 +107,7 @@ impl Default for ViewState {
             applying: None,
             saving: None,
             confirm_save: None,
+            folder_ask: None,
         }
     }
 }
@@ -684,17 +688,21 @@ fn grouped(view: &ViewState) -> bool {
 }
 
 /// The collection tree, cached per catalog generation.
-fn folder_tree(ctx: &egui::Context, client: &Client) -> Arc<Vec<FolderRow>> {
-    type Cached = (u64, Arc<Vec<FolderRow>>);
+fn folder_tree(ctx: &egui::Context, client: &Client, libraries: &[String]) -> Arc<Vec<FolderRow>> {
+    type Cached = ((u64, u64, usize), Arc<Vec<FolderRow>>);
     let id = egui::Id::new("ml-tree");
-    let generation = generation(client);
-    if let Some((g, rows)) = ctx.data(|d| d.get_temp::<Cached>(id))
-        && g == generation
+    let local = local_folders(ctx, libraries);
+    let ops = folder_ops();
+    let key = (generation(client), ops.revision, Arc::as_ptr(&local) as usize);
+    if let Some((k, rows)) = ctx.data(|d| d.get_temp::<Cached>(id))
+        && k == key
     {
         return rows;
     }
-    let rows = Arc::new(client.catalog().map(|c| c.tree()).unwrap_or_default());
-    ctx.data_mut(|d| d.insert_temp::<Cached>(id, (generation, rows.clone())));
+    let catalog = client.catalog().map(|c| c.tree()).unwrap_or_default();
+    let rows = Arc::new(merge_folders(&catalog, &local.0, &ops));
+    drop(ops);
+    ctx.data_mut(|d| d.insert_temp::<Cached>(id, (key, rows.clone())));
     rows
 }
 
@@ -826,11 +834,28 @@ fn thumb_side(w: f32, ppp: f32) -> u32 {
 }
 
 /// A folder's icon (its image, else the folder glyph).
-fn paint_folder_icon(ctx: &egui::Context, client: &Client, p: &egui::Painter, row: Option<&FolderRow>, r: Rect, color: Color32, budget: &mut u32) {
+fn paint_folder_icon(
+    ctx: &egui::Context,
+    client: &Client,
+    p: &egui::Painter,
+    row: Option<&FolderRow>,
+    local_icon: Option<&str>,
+    r: Rect,
+    color: Color32,
+    budget: &mut u32,
+) {
     let Some(row) = row else {
         crate::icons::paint(p, r, crate::icons::Icon::Grid, color);
         return;
     };
+    if let Some(path) = local_icon
+        && let Some((tex, [w, h])) = local_thumbnail(ctx, path, 64, budget)
+    {
+        let s = (r.width() / w.max(1) as f32).min(r.height() / h.max(1) as f32);
+        let ir = Rect::from_center_size(r.center(), vec2(w as f32, h as f32) * s);
+        p.image(tex.id(), ir, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+        return;
+    }
     if let Some(blob) = &row.icon
         && let Some((tex, [w, h])) = thumbnail(ctx, client, blob, 64, None, budget)
     {
@@ -1467,8 +1492,13 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let ppp = ctx.pixels_per_point();
     let mut budget = 6u32;
     let total = client.catalog().map_or(0, |c| c.cards.len());
-    let tree = folder_tree(&ctx, &client);
+    let tree = folder_tree(&ctx, &client, &app.session.prefs.libraries);
+    let local_icons = local_folders(&ctx, &app.session.prefs.libraries);
     let local = app.session.motion_library_local();
+    if let Some(msg) = folder_ops().status.take() {
+        app.ui.status = msg;
+    }
+    let mut folder_pick: Option<(&'static str, Value)> = None;
     let footer_h = 32.0 * s;
     let narrow = rect.width() < 460.0;
     // The collection tree stays down to small docks (a dropdown below that).
@@ -1488,6 +1518,21 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         p.line_segment([side.right_top(), side.right_bottom()], Stroke::new(1.0, t.separator));
         let head_h = 30.0 * s;
         p.text(pos2(side.min.x + 12.0 * s, side.min.y + head_h / 2.0), Align2::LEFT_CENTER, tr("COLLECTIONS"), Tokens::semibold(10.0 * s), t.text_faint);
+        // + : a new top folder (as on the web panel).
+        let plus = Rect::from_center_size(pos2(side.max.x - 16.0 * s, side.min.y + head_h / 2.0), vec2(20.0 * s, 20.0 * s));
+        let presp = ui.interact(plus, egui::Id::new("ml-new-folder"), Sense::click()).on_hover_text(tr("New folder"));
+        app.auto.add_response("motionLibrary.newFolder", &presp, "New folder");
+        if presp.hovered() {
+            p.rect_filled(plus, CornerRadius::same((4.0 * s) as u8), t.hover);
+        }
+        let pc = if presp.hovered() { t.text } else { t.text_faint };
+        let (cx, cy, arm) = (plus.center().x, plus.center().y, 4.5 * s);
+        let st = Stroke::new(1.4 * s, pc);
+        p.line_segment([pos2(cx - arm, cy), pos2(cx + arm, cy)], st);
+        p.line_segment([pos2(cx, cy - arm), pos2(cx, cy + arm)], st);
+        if presp.clicked() {
+            folder_pick = Some(("motionLibrary.folder", json!({"op": "create", "category": ""})));
+        }
         let list = Rect::from_min_max(pos2(side.min.x, side.min.y + head_h), side.max);
         let sp = p.with_clip_rect(list);
         let row_h = (26.0 * s).round();
@@ -1536,7 +1581,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             }
             let icon_r = Rect::from_center_size(pos2(arrow.max.x + 9.0 * s, r.center().y), vec2(16.0 * s, 16.0 * s));
             let color = if active || resp.hovered() { t.text } else { t.text_dim };
-            paint_folder_icon(&ctx, &client, &sp, row, icon_r, color, &mut budget);
+            let local_icon = local_icons.1.get(path).map(String::as_str);
+            paint_folder_icon(&ctx, &client, &sp, row, local_icon, icon_r, color, &mut budget);
             let count_s = count.to_string();
             let count_w = sp.layout_no_wrap(count_s.clone(), Tokens::ui(10.0 * s), t.text_faint).size().x;
             sp.text(pos2(r.max.x - 6.0 * s, r.center().y), Align2::RIGHT_CENTER, &count_s, Tokens::ui(10.0 * s), if active { t.text } else { t.text_faint });
@@ -1545,6 +1591,9 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             let shown = elide(&sp, name, &font, name_r.width().max(4.0));
             draw_text_clipped(&sp, name_r, &shown, font, if active { t.text } else { t.text_dim });
             app.auto.add(&auto_id, r.intersect(list), name);
+            if let Some(pick) = folder_menu(&mut app.auto, &resp, path, t.danger) {
+                folder_pick = Some(pick);
+            }
             if resp.clicked() && toggle.is_none() {
                 let has_children = row.is_some_and(|r| r.has_children);
                 if active && has_children {
@@ -1563,6 +1612,15 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             && !view.expanded.remove(&path)
         {
             view.expanded.insert(path);
+        }
+        // Space under the last folder: right-click for New folder… too.
+        let below_y = list.min.y + (rows.len() + 1) as f32 * row_h - view.folder_scroll;
+        if below_y < list.max.y {
+            let below = Rect::from_min_max(pos2(list.min.x, below_y.max(list.min.y)), list.max);
+            let bresp = ui.interact(below, egui::Id::new("ml-folder-empty"), Sense::click());
+            if let Some(pick) = folder_menu(&mut app.auto, &bresp, "", t.danger) {
+                folder_pick = Some(pick);
+            }
         }
         // Its scroll bar (drag it, or scroll over the tree).
         let max = (content - list.height()).max(0.0);
@@ -1584,6 +1642,14 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             let strong = bresp.hovered() || bresp.dragged();
             sp.rect_filled(bar, CornerRadius::same(3), t.text_faint.gamma_multiply(if strong { 0.9 } else { 0.5 }));
         }
+    }
+
+    if let Some((cmd, params)) = folder_pick {
+        app.ui.motion_library = view.clone();
+        if let Err(e) = crate::menus::invoke(app, &ctx, cmd, params) {
+            app.ui.status = e;
+        }
+        view = app.ui.motion_library.clone();
     }
 
     // Header: the collection and its count, the update chip or status, search, refresh, display.
@@ -1936,6 +2002,17 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             None => view.details = None,
         }
     }
+    // A folder dialog (new, rename, delete).
+    if let Some(mut ask) = view.folder_ask.clone() {
+        match folder_ask_sheet(app, ui, grid, &mut ask, s) {
+            Some(Some(params)) => {
+                view.folder_ask = None;
+                menu_pick = Some(("motionLibrary.folder", params));
+            }
+            Some(None) => view.folder_ask = None,
+            None => view.folder_ask = Some(ask),
+        }
+    }
     // A save over the size limit: ask first.
     if let Some(ask) = view.confirm_save.clone() {
         match confirm_save_sheet(app, ui, grid, &ask, s) {
@@ -2179,4 +2256,452 @@ mod tests {
         let old: ViewState = serde_json::from_value(json!({"query": "x"})).unwrap();
         assert_eq!((old.scale, old.card_size), (100, DEFAULT_CARD_SIZE));
     }
+}
+
+// ── Collection folders (right-click a folder, + beside COLLECTIONS) ─────────────────────────────
+//
+// As in the browser panel (:8765): New subfolder…, Rename…, Choose icon…, Restore default icon,
+// Delete folder…. The local library's backend (`backend.py rpc`) does the work, then the library
+// index is rebuilt in the background; the tree shows the change at once.
+
+/// A folder dialog over the panel: a name to type (`create`, `rename`) or a delete to confirm.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FolderAsk {
+    pub op: String,
+    /// The folder (`create`: the parent, empty = a top folder).
+    pub category: String,
+    pub text: String,
+    /// `delete`: what goes with the folder (the backend's `folder_contents`).
+    pub contents: Value,
+}
+
+/// Changes made in this run, shown before the index has them (and over the published catalog).
+struct FolderOps {
+    created: Vec<String>,
+    deleted: Vec<String>,
+    renamed: Vec<(String, String)>,
+    revision: u64,
+    status: Option<String>,
+}
+
+static FOLDER_OPS: Mutex<FolderOps> = Mutex::new(FolderOps { created: Vec::new(), deleted: Vec::new(), renamed: Vec::new(), revision: 0, status: None });
+
+fn folder_ops() -> std::sync::MutexGuard<'static, FolderOps> {
+    FOLDER_OPS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn under(path: &str, folder: &str) -> bool {
+    path == folder || path.strip_prefix(folder).is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn renamed_path(path: &str, renamed: &[(String, String)]) -> String {
+    let mut p = path.to_string();
+    for (old, new) in renamed {
+        if under(&p, old) {
+            p = format!("{new}{}", &p[old.len()..]);
+        }
+    }
+    p
+}
+
+/// The published tree merged with the local library's folders and this run's changes: renames
+/// applied, deleted folders gone, new ones under their parents (after the existing ones).
+fn merge_folders(catalog: &[FolderRow], local: &[String], ops: &FolderOps) -> Vec<FolderRow> {
+    let mut order: Vec<String> = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut cards = std::collections::BTreeMap::new();
+    let mut icons = std::collections::BTreeMap::new();
+    let mut add = |p: String, order: &mut Vec<String>| {
+        if p.is_empty() || ops.deleted.iter().any(|d| under(&p, d)) {
+            return;
+        }
+        // Parents first, so every folder has its row above it.
+        let mut parts = Vec::new();
+        let mut cur = p.as_str();
+        while let Some((parent, _)) = cur.rsplit_once('/') {
+            parts.push(parent.to_string());
+            cur = parent;
+        }
+        for q in parts.into_iter().rev().chain(std::iter::once(p)) {
+            if seen.insert(q.clone()) {
+                order.push(q);
+            }
+        }
+    };
+    for row in catalog {
+        let p = renamed_path(&row.path, &ops.renamed);
+        cards.insert(p.clone(), row.cards);
+        if let Some(icon) = &row.icon {
+            icons.insert(p.clone(), icon.clone());
+        }
+        add(p, &mut order);
+    }
+    for p in local.iter().chain(ops.created.iter()) {
+        add(renamed_path(p.trim_matches('/'), &ops.renamed), &mut order);
+    }
+    // Depth-first, siblings in first-seen order.
+    let mut children: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
+    for p in &order {
+        children.entry(p.rsplit_once('/').map_or("", |(parent, _)| parent)).or_default().push(p);
+    }
+    let mut rows = Vec::with_capacity(order.len());
+    let mut stack: Vec<&str> = children.get("").map(|c| c.iter().rev().copied().collect()).unwrap_or_default();
+    while let Some(p) = stack.pop() {
+        let kids = children.get(p);
+        rows.push(FolderRow {
+            path: p.to_string(),
+            name: p.rsplit('/').next().unwrap_or(p).to_string(),
+            depth: p.matches('/').count(),
+            cards: cards.get(p).copied().unwrap_or(0),
+            has_children: kids.is_some_and(|k| !k.is_empty()),
+            icon: icons.get(p).cloned(),
+        });
+        if let Some(kids) = kids {
+            stack.extend(kids.iter().rev().copied());
+        }
+    }
+    rows
+}
+
+/// The local library's folders and folder icons (`library.json` ▸ `collections`), by file stamp.
+fn local_folders(ctx: &egui::Context, libraries: &[String]) -> Arc<(Vec<String>, std::collections::BTreeMap<String, String>)> {
+    type Folders = (Vec<String>, std::collections::BTreeMap<String, String>);
+    let paths: Vec<std::path::PathBuf> = libraries.iter().map(|f| std::path::Path::new(f).join("library.json")).collect();
+    let stamp: Vec<Option<std::time::SystemTime>> = paths.iter().map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok()).collect();
+    let id = egui::Id::new("ml-local-folders");
+    if let Some((s, f)) = ctx.data(|d| d.get_temp::<(Vec<Option<std::time::SystemTime>>, Arc<Folders>)>(id))
+        && s == stamp
+    {
+        return f;
+    }
+    let mut folders = Vec::new();
+    let mut icons = std::collections::BTreeMap::new();
+    for p in &paths {
+        let Some(v) = std::fs::read(p).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()) else { continue };
+        let c = &v["collections"];
+        if let Some(list) = c["folders"].as_array() {
+            folders.extend(list.iter().filter_map(Value::as_str).map(str::to_string));
+        }
+        if let Some(map) = c["icons"].as_object() {
+            icons.extend(map.iter().filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string()))));
+        }
+    }
+    let f = Arc::new((folders, icons));
+    ctx.data_mut(|d| d.insert_temp(id, (stamp, f.clone())));
+    f
+}
+
+/// The Motion Library backend script on this Mac (`EFFECTCRAFT_ML_BACKEND`, else the usual place).
+fn ml_backend() -> Option<std::path::PathBuf> {
+    if let Some(p) = std::env::var_os("EFFECTCRAFT_ML_BACKEND") {
+        return Some(p.into());
+    }
+    let home = std::env::var_os("HOME")?;
+    Some(std::path::PathBuf::from(home).join("Developer/AE Motion graphics/integrations/motion-library/backend.py"))
+}
+
+/// One backend operation (`backend.py rpc`): its result, or its error message.
+#[cfg(not(target_arch = "wasm32"))]
+fn backend_rpc(op: &str, args: Value) -> Result<Value, String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let script = ml_backend().filter(|p| p.is_file()).ok_or("the Motion Library backend (backend.py) isn't on this computer (set EFFECTCRAFT_ML_BACKEND)")?;
+    let dir = script.parent().map(|d| d.to_path_buf()).unwrap_or_default();
+    let mut child = Command::new("/usr/bin/python3")
+        .arg(&script)
+        .arg("rpc")
+        .current_dir(&dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("couldn't start the Motion Library backend: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(json!({"operation": op, "args": args}).to_string().as_bytes()).map_err(|e| format!("Motion Library backend: {e}"))?;
+    }
+    let out = child.wait_with_output().map_err(|e| format!("Motion Library backend: {e}"))?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let v = serde_json::from_str::<Value>(text.trim()).ok().or_else(|| text.lines().rev().find_map(|l| serde_json::from_str::<Value>(l.trim()).ok()));
+    let Some(v) = v else {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("Motion Library backend: {}", err.trim().lines().last().unwrap_or("no answer")));
+    };
+    if v["ok"] == true { Ok(v["result"].clone()) } else { Err(v["error"].as_str().unwrap_or("the Motion Library backend failed").to_string()) }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn backend_rpc(_op: &str, _args: Value) -> Result<Value, String> {
+    Err("Motion Library folders can be changed in the desktop app".into())
+}
+
+/// Rebuild the local library's index (`effectcraft_library.py index`) so the panel reads the change.
+#[cfg(not(target_arch = "wasm32"))]
+fn reindex_library() {
+    let Some(dir) = ml_backend().and_then(|p| p.parent().map(|d| d.to_path_buf())) else { return };
+    let _ = std::process::Command::new("/usr/bin/nice")
+        .args(["-n", "10", "/usr/bin/python3", "effectcraft_library.py", "index"])
+        .current_dir(dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+#[cfg(target_arch = "wasm32")]
+fn reindex_library() {}
+
+/// What a finished operation changes in the tree right away.
+enum FolderChange {
+    None,
+    Created(String),
+    Renamed(String, String),
+    Deleted(String),
+}
+
+/// Run a backend operation in the background; the status line says how it went.
+fn spawn_folder_op(ctx: &egui::Context, op: &'static str, args: Value, change: FolderChange, done: String) {
+    let ctx = ctx.clone();
+    let run = move || {
+        let result = backend_rpc(op, args);
+        {
+            let mut ops = folder_ops();
+            match &result {
+                Ok(_) => {
+                    match change {
+                        FolderChange::None => {}
+                        FolderChange::Created(p) => {
+                            ops.deleted.retain(|d| !under(&p, d));
+                            ops.created.push(p);
+                        }
+                        FolderChange::Renamed(old, new) => {
+                            ops.deleted.retain(|d| !under(&new, d));
+                            ops.renamed.push((old, new));
+                        }
+                        FolderChange::Deleted(p) => {
+                            ops.created.retain(|c| !under(c, &p));
+                            ops.deleted.push(p);
+                        }
+                    }
+                    ops.revision += 1;
+                    ops.status = Some(format!("{done} · updating the library…"));
+                }
+                Err(e) => ops.status = Some(e.clone()),
+            }
+        }
+        ctx.request_repaint();
+        if result.is_ok() {
+            reindex_library();
+            let mut ops = folder_ops();
+            ops.revision += 1;
+            ops.status = Some(done);
+            drop(ops);
+            ctx.request_repaint();
+        }
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    std::thread::spawn(run);
+    #[cfg(target_arch = "wasm32")]
+    run();
+}
+
+/// `motionLibrary.folder`: `op` create (`category` = parent, `name`), rename (`category`, `name`),
+/// setIcon (`category`, `path`; a file dialog without it), resetIcon, delete (`confirm`; else it
+/// asks), contents. Without a `name`, create and rename ask for one in the panel.
+pub fn folder_command(app: &mut EffectcraftApp, ctx: &egui::Context, params: &Value) -> Result<Value, String> {
+    let op = params.get("op").and_then(Value::as_str).ok_or("missing `op`: create, rename, setIcon, resetIcon, delete or contents")?;
+    let category = params.get("category").and_then(Value::as_str).unwrap_or_default().trim_matches('/').to_string();
+    let name = params.get("name").and_then(Value::as_str).map(str::trim).unwrap_or_default().to_string();
+    if op != "create" && category.is_empty() {
+        return Err("missing `category` (the folder path, e.g. `Devin Jatho/UI`)".into());
+    }
+    let leaf = category.rsplit('/').next().unwrap_or(&category).to_string();
+    let ask = |app: &mut EffectcraftApp, op: &str, text: String, contents: Value| {
+        app.ui.motion_library.folder_ask = Some(FolderAsk { op: op.to_string(), category: category.clone(), text, contents });
+        Ok(json!({"dialog": "motionLibrary.folder"}))
+    };
+    if name.contains('/') {
+        return Err("a folder name can't contain /".into());
+    }
+    match op {
+        "create" => {
+            if name.is_empty() {
+                return ask(app, "create", String::new(), Value::Null);
+            }
+            let path = if category.is_empty() { name.clone() } else { format!("{category}/{name}") };
+            app.ui.status = format!("Creating “{name}”…");
+            if !category.is_empty() {
+                app.ui.motion_library.expanded.insert(category.clone());
+            }
+            spawn_folder_op(ctx, "create_folder", json!({"category": path, "group": ""}), FolderChange::Created(path.clone()), format!("Created “{name}”"));
+            Ok(json!({"category": path}))
+        }
+        "rename" => {
+            if name.is_empty() {
+                return ask(app, "rename", leaf, Value::Null);
+            }
+            let new = match category.rsplit_once('/') {
+                Some((parent, _)) => format!("{parent}/{name}"),
+                None => name.clone(),
+            };
+            app.ui.status = format!("Renaming “{leaf}”…");
+            let view = &mut app.ui.motion_library;
+            if under(&view.folder, &category) {
+                view.folder = format!("{new}{}", &view.folder[category.len()..]);
+            }
+            spawn_folder_op(
+                ctx,
+                "rename_folder",
+                json!({"category": category, "name": name}),
+                FolderChange::Renamed(category.clone(), new.clone()),
+                format!("Renamed to “{name}”"),
+            );
+            Ok(json!({"category": new}))
+        }
+        "setIcon" => {
+            let Some(path) = params.get("path").and_then(Value::as_str) else {
+                const IMAGES: &[&str] = &["png", "jpg", "jpeg", "webp", "gif", "svg", "heic"];
+                if let Some(spawn) = app.hooks.file_dialog_async.as_ref() {
+                    let (ctx, category, leaf) = (ctx.clone(), category.clone(), leaf.clone());
+                    spawn(
+                        crate::FileDialog::Open { exts: IMAGES.iter().map(|e| e.to_string()).collect(), many: false },
+                        Box::new(move |paths| {
+                            if let Some(path) = paths.into_iter().next() {
+                                spawn_folder_op(
+                                    &ctx,
+                                    "set_folder_icon",
+                                    json!({"category": category, "path": path}),
+                                    FolderChange::None,
+                                    format!("New icon for “{leaf}”"),
+                                );
+                            }
+                        }),
+                    );
+                    return Ok(json!({"dialog": "motionLibrary.folder"}));
+                }
+                let picked = app.hooks.pick_files.as_ref().map(|f| f(IMAGES)).unwrap_or_default();
+                let Some(path) = picked.into_iter().next() else { return Ok(Value::Null) };
+                spawn_folder_op(ctx, "set_folder_icon", json!({"category": category, "path": path}), FolderChange::None, format!("New icon for “{leaf}”"));
+                return Ok(json!({"category": category}));
+            };
+            spawn_folder_op(ctx, "set_folder_icon", json!({"category": category, "path": path}), FolderChange::None, format!("New icon for “{leaf}”"));
+            Ok(json!({"category": category}))
+        }
+        "resetIcon" => {
+            spawn_folder_op(ctx, "reset_folder_icon", json!({"category": category}), FolderChange::None, format!("Default icon for “{leaf}”"));
+            Ok(json!({"category": category}))
+        }
+        "contents" => backend_rpc("folder_contents", json!({"category": category})),
+        "delete" => {
+            if params.get("confirm") != Some(&Value::Bool(true)) {
+                let contents = backend_rpc("folder_contents", json!({"category": category}))?;
+                return ask(app, "delete", String::new(), contents);
+            }
+            let contents = match params.get("expected") {
+                Some(c) if c.is_object() => c.clone(),
+                _ => backend_rpc("folder_contents", json!({"category": category}))?,
+            };
+            let args = json!({
+                "category": category,
+                "delete_contents": true,
+                "expected_entry_ids": contents["entry_ids"],
+                "expected_folders": contents["folders"],
+            });
+            app.ui.status = format!("Deleting “{leaf}”…");
+            let view = &mut app.ui.motion_library;
+            if under(&view.folder, &category) {
+                view.folder.clear();
+            }
+            spawn_folder_op(ctx, "delete_folder", args, FolderChange::Deleted(category.clone()), format!("Deleted “{leaf}”"));
+            Ok(json!({"deleted": category}))
+        }
+        other => Err(format!("unknown folder op `{other}` (create, rename, setIcon, resetIcon, delete, contents)")),
+    }
+}
+
+/// The folder's right-click menu (the "All motion" row: New folder… only).
+fn folder_menu(auto: &mut crate::automation::Registry, resp: &egui::Response, path: &str, danger: Color32) -> Option<(&'static str, Value)> {
+    let mut pick = None;
+    crate::widgets::context_menu(resp, |ui| {
+        let mut entry = |ui: &mut egui::Ui, key: &str, label: &str, color: Option<Color32>, params: Value| {
+            let text = egui::RichText::new(tr(label));
+            let b = ui.add(egui::Button::new(match color {
+                Some(c) => text.color(c),
+                None => text,
+            }));
+            auto.add_response(&format!("motionLibrary.folderMenu.{key}"), &b, label);
+            if b.clicked() {
+                pick = Some(("motionLibrary.folder", params));
+                ui.close();
+            }
+        };
+        if path.is_empty() {
+            entry(ui, "newFolder", "New folder…", None, json!({"op": "create", "category": ""}));
+            return;
+        }
+        entry(ui, "newSubfolder", "New subfolder…", None, json!({"op": "create", "category": path}));
+        entry(ui, "rename", "Rename…", None, json!({"op": "rename", "category": path}));
+        entry(ui, "chooseIcon", "Choose icon…", None, json!({"op": "setIcon", "category": path}));
+        entry(ui, "resetIcon", "Restore default icon", None, json!({"op": "resetIcon", "category": path}));
+        ui.separator();
+        entry(ui, "delete", "Delete folder…", Some(danger), json!({"op": "delete", "category": path}));
+    });
+    pick
+}
+
+/// The folder dialog over the grid: the command to run when it's answered, `Some(None)` to close.
+fn folder_ask_sheet(app: &mut EffectcraftApp, ui: &mut egui::Ui, grid: Rect, ask: &mut FolderAsk, s: f32) -> Option<Option<Value>> {
+    let t = app.tokens;
+    let p = ui.painter().with_clip_rect(grid);
+    let _ = ui.interact(grid, egui::Id::new("ml-folder-ask-block"), Sense::click_and_drag());
+    p.rect_filled(grid, 0.0, Color32::from_black_alpha(120));
+    let w = (grid.width() - 32.0 * s).clamp(120.0, 380.0 * s);
+    let h = (grid.height() - 32.0 * s).clamp(90.0, 150.0 * s);
+    let r = Rect::from_center_size(grid.center(), vec2(w, h));
+    p.rect_filled(r, CornerRadius::same(10), t.header_bg);
+    p.rect_stroke(r, CornerRadius::same(10), Stroke::new(1.0, t.separator), egui::StrokeKind::Inside);
+    app.auto.add("motionLibrary.folderAsk", r, &ask.op);
+    let inner = r.shrink(14.0 * s);
+    let leaf = ask.category.rsplit('/').next().unwrap_or(&ask.category).to_string();
+    let (title, ok_label) = match ask.op.as_str() {
+        "create" if ask.category.is_empty() => ("New folder".to_string(), "Create"),
+        "create" => (format!("New folder in “{leaf}”"), "Create"),
+        "rename" => (format!("Rename “{leaf}”"), "Rename"),
+        _ => (format!("Delete “{leaf}”?"), "Delete"),
+    };
+    p.text(inner.min, Align2::LEFT_TOP, &title, Tokens::semibold(13.0 * s), t.text);
+    let body_r = Rect::from_min_max(pos2(inner.min.x, inner.min.y + 26.0 * s), pos2(inner.max.x, inner.max.y - 32.0 * s));
+    let enter = ui.ctx().input(|i| i.key_pressed(egui::Key::Enter));
+    if ask.op == "delete" {
+        let items = ask.contents["items"].as_u64().or_else(|| ask.contents["entry_ids"].as_array().map(|a| a.len() as u64)).unwrap_or(0);
+        let subs = ask.contents["subfolders"].as_u64().or_else(|| ask.contents["folders"].as_array().map(|a| a.len().saturating_sub(1) as u64)).unwrap_or(0);
+        let body = if items == 0 && subs == 0 {
+            "The folder is empty.".to_string()
+        } else {
+            format!("This deletes {items} item(s) and {subs} subfolder(s) with it, and their files. It can't be undone.")
+        };
+        let galley = p.layout(body, Tokens::ui(11.5 * s), t.text_dim, body_r.width().max(40.0));
+        p.with_clip_rect(body_r.intersect(grid)).galley(body_r.min, galley, t.text_dim);
+    } else {
+        let field = Rect::from_min_size(body_r.min, vec2(body_r.width(), 24.0 * s));
+        let resp = ui.put(field, egui::TextEdit::singleline(&mut ask.text).hint_text(tr("Folder name")));
+        app.auto.add_response("motionLibrary.folderAsk.name", &resp, "Folder name");
+        if !resp.has_focus() && !resp.lost_focus() {
+            resp.request_focus();
+        }
+    }
+    let bw = 84.0 * s;
+    let ok = Rect::from_min_size(pos2(inner.max.x - bw, inner.max.y - 24.0 * s), vec2(bw, 24.0 * s));
+    let cancel = ok.translate(vec2(-(bw + 8.0 * s), 0.0));
+    if kit::button(app, ui, cancel, "motionLibrary.folderAsk.cancel", "Cancel", false) || ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
+        return Some(None);
+    }
+    let name = ask.text.trim();
+    let valid = ask.op == "delete" || !name.is_empty() && !name.contains('/');
+    if (kit::button(app, ui, ok, "motionLibrary.folderAsk.ok", ok_label, true) || enter && ask.op != "delete") && valid {
+        let params = match ask.op.as_str() {
+            "delete" => json!({"op": "delete", "category": ask.category, "confirm": true, "expected": ask.contents}),
+            op => json!({"op": op, "category": ask.category, "name": name}),
+        };
+        return Some(Some(params));
+    }
+    None
 }
