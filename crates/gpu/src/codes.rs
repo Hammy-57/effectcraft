@@ -126,12 +126,15 @@ impl Pixels {
     /// The image as floats, for a consumer that reads only floats: codes are decoded into a new
     /// working image of `e` (bit-identical to the f32 image they came from). `None`: the decode
     /// kernel is missing (codes never exist without it).
+    #[track_caller]
     pub(crate) fn float(&self, e: &mut Enc) -> Option<GpuImage> {
         match self {
             Pixels::Float(g) => Some(g.clone()),
             Pixels::Codes(c) => {
                 if let Some(bank) = e.g.codes.as_ref() {
                     bank.promotions.fetch_add(1, Relaxed);
+                    let at = std::panic::Location::caller();
+                    bank.count_site(format!("{}:{}", at.file().rsplit('/').next().unwrap_or(""), at.line()));
                 }
                 decode(e, c)
             }
@@ -180,9 +183,17 @@ pub(crate) struct Bank {
     pub(crate) promotions: AtomicU64,
     /// Passes that read or wrote codes (diagnostics, tests).
     pub(crate) dispatches: AtomicU64,
+    /// Decodes by the call site that asked for floats (diagnostics: `codes_stats`).
+    pub(crate) sites: std::sync::Mutex<std::collections::BTreeMap<String, u64>>,
 }
 
 impl Bank {
+    fn count_site(&self, site: String) {
+        if let Ok(mut m) = self.sites.lock() {
+            let n = m.entry(site).or_insert(0);
+            *n = n.saturating_add(1);
+        }
+    }
     /// `Err` when the adapter can't store `Rgba8Uint` working textures.
     pub(crate) fn new(adapter: &wgpu::Adapter, device: &wgpu::Device, queue: &wgpu::Queue) -> Result<Bank, String> {
         let uses = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST;
@@ -200,6 +211,7 @@ impl Bank {
             display: OnceLock::new(),
             promotions: AtomicU64::new(0),
             dispatches: AtomicU64::new(0),
+            sites: Default::default(),
         })
     }
 
@@ -262,6 +274,11 @@ pub(crate) fn dispatch(
         e.mark_missing();
         return;
     };
+    if io.index() != 0
+        && let Some(bank) = e.g.codes.as_ref()
+    {
+        bank.count_site(format!("no variant {entry}"));
+    }
     let (Some(src), aux) = (src.float(e), aux.map(|a| a.float(e))) else {
         e.mark_missing();
         return;

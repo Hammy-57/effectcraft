@@ -299,7 +299,7 @@ pub(super) fn run(s: &Session, args: &Args) -> Result<(), Failure> {
         .map_err(|e| Failure::Error(e.to_string()))?;
         std::fs::write(path, bytes).map_err(|e| Failure::Error(format!("writing {path}: {e}")))?;
     }
-    let report = json!({"adapter": effectcraft_render::Accelerator::name(&gpu), "initializationMs": initialization_ms, "colorFusion": effectcraft_gpu::color_fusion_enabled(), "yuvTransport": effectcraft_gpu::yuv_transport_enabled(), "q8Codes": gpu.codes_stats().map(|(passes, decodes)| json!({"passes": passes, "decodes": decodes})), "warmup": warmup, "warmupMs": warmup_ms, "staticPipelines": gpu.static_pipeline_count(), "path": "GPU viewer + completion wait (no window presentation)", "rows": rows});
+    let report = json!({"adapter": effectcraft_render::Accelerator::name(&gpu), "initializationMs": initialization_ms, "colorFusion": effectcraft_gpu::color_fusion_enabled(), "yuvTransport": effectcraft_gpu::yuv_transport_enabled(), "q8Codes": gpu.codes_stats().map(|(passes, decodes)| json!({"passes": passes, "decodes": decodes, "sites": gpu.codes_sites()})), "warmup": warmup, "warmupMs": warmup_ms, "staticPipelines": gpu.static_pipeline_count(), "path": "GPU viewer + completion wait (no window presentation)", "rows": rows});
     println!("{}", serde_json::to_string(&report).map_err(|e| Failure::Error(e.to_string()))?);
     Ok(())
 }

@@ -156,6 +156,11 @@ impl Gpu {
         self.ctx.codes.as_ref().map(|b| (b.dispatches.load(Relaxed), b.promotions.load(Relaxed)))
     }
 
+    /// Codes decodes by call site (diagnostics).
+    pub fn codes_sites(&self) -> Vec<(String, u64)> {
+        self.ctx.codes.as_ref().and_then(|b| b.sites.lock().ok().map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect())).unwrap_or_default()
+    }
+
     /// Successfully constructed static pipelines (dynamic sequence specializations excluded).
     pub fn static_pipeline_count(&self) -> u64 {
         self.ctx.static_pipeline_count.load(std::sync::atomic::Ordering::Relaxed)
