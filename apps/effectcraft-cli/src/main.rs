@@ -55,6 +55,7 @@ mod asset_guard;
 mod drive;
 mod figma_bridge;
 mod frame_serve;
+mod library_pull;
 mod mirror;
 #[cfg(feature = "ui")]
 mod offscreen_ui;
@@ -184,6 +185,7 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
   mirror USER@HOST [--ssh-port P] [--identity KEY] [--project F.ecproj | --bridge 9877] [--font-dir DIR]
          [--remote-cli PATH] [--env-file PATH] [--dry-run] [--all] [--verify-hash] [--retime] [--watch SECS]
                                            media + fonts to a cloud render machine (same paths), then cloud.preflight there
+  library-pull --jobs FILE.json             on the cloud machine: Motion Library files from the library's Worker (read token)
 options: --project F.ecproj | --demo | --empty   --save | --save-as F   --bridge PORT   --json   --gpu
          --frame-threads N  render at most N frames at once (viewer frame pool, export batches;
                             default one per core, 2-16; also EFFECTCRAFT_FRAME_THREADS)
@@ -1022,6 +1024,7 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
         "stream-test" => stream_cli::test(args)?,
         "mirror" => mirror::run(args, json_out)?,
         "drive-pull" => drive::run(args)?,
+        "library-pull" => library_pull::run(args)?,
         other => return usage_err(&format!("unknown subcommand `{other}`")),
     }
     Ok(())

@@ -28,6 +28,11 @@ or pass `--project "/path/10-10 Edit.ecproj"`.
    stops and lists it. Paste the link in `<project>.cloud.json` (`"driveLinks": {"file name": "link"}`) or
    run `cloud.driveLinks {"set": {"file name": "link"}}` in the app, then run `connect` again. Ends with
    `cloud.preflight` on the machine.
+   **Motion Library cards** (files under the Mac's library cache, `…/Motion Library/blobs/<sha256>/<name>`)
+   are never uploaded: `effectcraft-cli library-pull` on the machine fetches each blob from the library's
+   Worker (R2) with the read token, checks sha256 + size and puts it at the same path. If that fails (no
+   token there, Worker down, an old `effectcraft-cli`) the mirror says so and uploads those files from the
+   Mac instead (still only up to 100 MB). The JSON result carries `fromLibrary` / `libraryBytes`.
 4. **Frame server.** `effectcraft-cli serve --gpu --frames <port>` under `nohup` (also serves the CR6a
    H.264 playback stream), `EFFECTCRAFT_FRAME_GPU_SLOTS=4`, the mirror's `cloud.env` (fonts, CJK locale).
    Skipped when it already runs at the right commit with the same token. Log:
@@ -46,6 +51,10 @@ Running `connect` twice is safe: finished steps are skipped (build, mirror bytes
 - Frame token: `…/EffectCraft/cloud-frame-token` (mode 600, made on the first connect; the app reads it, CR5).
   It reaches the server as an environment variable of the serve process only (root on the machine can read
   it in /proc, which is fine on a machine you rent alone; it is passed once as an ssh argument).
+- Motion Library read token: `connect` sends `…/EffectCraft/motion-library.read.json` (never the publish
+  token `motion-library.json`; it refuses when both hold the same token) over ssh **stdin** into
+  `~/.config/effectcraft/motion-library.json` for root (library-pull) and for `user` (the browser desktop
+  app's Motion Library panel), mode 600. Not in a command line, a log or the vast template.
 - A build needs about 12 GB free on /workspace: below that `connect` refuses and says what to free.
 - The tunnel's control socket: `/tmp/ec-cloud-<uid>.sock`.
 - `EFFECTCRAFT_CONFIG_DIR` moves all of the above (tests use it); ssh key `~/.ssh/id_ed25519`
