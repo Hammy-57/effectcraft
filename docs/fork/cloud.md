@@ -60,6 +60,27 @@ Running `connect` twice is safe: finished steps are skipped (build, mirror bytes
 - `EFFECTCRAFT_CONFIG_DIR` moves all of the above (tests use it); ssh key `~/.ssh/id_ed25519`
   (`EC_CLOUD_KEY`); `EC_CLI` picks the Mac's `effectcraft-cli`.
 
+## Frames stay on the server (CR8)
+
+Elias's home internet is metered: only the frames he looks at should cross it.
+
+- **Cache Frames When Idle** (Composition ▸ Preview) with Preview On = Cloud sends the server *one* plan: the
+  work area from the playhead, then the rest of the comp, at the viewer's resolution. The server renders it
+  into **its own frame cache** at the lowest priority (2 frames at once, `EFFECTCRAFT_PRECACHE_THREADS`; paused
+  while a playback stream runs). Nothing is downloaded. In local mode the setting works as before.
+- The server reports what it holds as ranges about once a second; the timeline's **blue cache bar** shows the
+  frames cached on the server (green is still this Mac's RAM).
+- Scrubbing: every request names its frame key, so a cached frame comes back encode-only (no render). Frames
+  the Mac shows stay in its own RAM cache.
+- Playback (CR6b stream): full-size chunks take cached frames and keep the frames they render.
+- Keys are the Mac's disk-cache keys (`CacheSeries::key` → `disk_cache::frame_key`): an edit changes the comp's
+  content key, so old frames are never served for new content; they age out of the server's cache.
+- Size: `EFFECTCRAFT_SERVER_FRAMES_MB` (RAM) and `EFFECTCRAFT_SERVER_FRAMES_DISK_GB` / `_DIR` (spill to disk;
+  0 = off). `connect` exports them from `ec-tune`'s `machine-tune.json` (`"serve"`: the preview share and the disk
+  cache's room); without it serve takes 85 % of the container's RAM less 8 GB, and no disk.
+- **Internet use:** the Preview dropdown's tooltip, `ui.inspect` (`cloud.bytesDown`, `cloud.bytesUp`,
+  `cloud.serverCache`) and `cloud.sh status` show MB down/up this session (every byte on the wire).
+
 ## Options
 
 `--frames-port N` (default 9878), `--local-port N`, `--app-port N` (default `$EFFECTCRAFT_CONTROL_PORT` or 9877),

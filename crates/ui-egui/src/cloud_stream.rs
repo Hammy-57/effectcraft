@@ -480,6 +480,7 @@ impl CloudPlayback {
                 looping: p.looping,
                 opts: p.opts,
                 ahead_secs: ahead,
+                cache: frames.cache_series(p.project, &p.series, &p.opts),
             };
             client.stream_start(start, shared.clone());
             self.current =
@@ -566,4 +567,7 @@ pub struct StreamStart {
     pub looping: bool,
     pub opts: RenderOpts,
     pub ahead_secs: f32,
+    /// The viewer's frame series (CR8): the server plays frames it cached and keeps the ones it
+    /// renders.
+    pub cache: Option<effectcraft_engine::remote::CacheSeries>,
 }

@@ -18,18 +18,23 @@
 //! - [`CloudPreview`] is the app's side: **Preview on: This Mac / Cloud / Auto** (Settings ▸
 //!   Previews, the viewer's bar), the status note when the source changes, and Auto's pick
 //!   (the cloud when this Mac's frame cost is above the cloud's round trip).
+//! - Cache Frames When Idle (CR8): with the cloud the server renders the frames into its own
+//!   frame cache ([`RemoteFrames::precache`], one plan message) and nothing is downloaded; the
+//!   server reports what it holds as ranges, which the timeline's cache bar shows (blue: on the
+//!   server). Render requests carry their frame key, so a frame the server cached comes back
+//!   encode-only. [`CloudStatus`] counts the bytes on the wire both ways (the internet use).
 //! - Footage paths: the server mirrors media to the same absolute paths (CR7), so frames go with
 //!   the paths as they are; [`PathRemap`] rewrites them for a server that keeps them elsewhere.
 #![cfg(not(target_arch = "wasm32"))]
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use effectcraft_engine::project::{ItemKind, Project};
-use effectcraft_engine::remote::{FrameMsg, FrameReply, Mirror};
+use effectcraft_engine::remote::{CacheSeries, FrameMsg, FrameReply, Mirror, Precache};
 use effectcraft_engine::remote_encode::{self, Codec, Want};
 use effectcraft_engine::remote_stream::{StreamCodec, StreamMsg, StreamReply};
 use effectcraft_engine::remote_wire::{Backoff, Down, Event, FrameClient, Up};
@@ -40,7 +45,7 @@ use serde_json::{Value, json};
 
 use crate::cloud_stream::{ChunkMeta, Decoders, StreamShared, StreamStart};
 use crate::frames::times::FrameTimes;
-use crate::frames::{RemoteDone, RemoteFrame, RemoteFrames, RemoteJob, RemoteRefine, RemoteTimes};
+use crate::frames::{RemoteDone, RemoteFrame, RemoteFrames, RemoteJob, RemotePrecache, RemoteRefine, RemoteTimes};
 
 /// Rewrites a footage path for the server (`None`: keep it).
 pub type PathRemap = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
@@ -56,6 +61,8 @@ const DEAD: Duration = Duration::from_secs(4);
 const PROJECT_DEAD: Duration = Duration::from_secs(120);
 /// How long before asking the server again whether it has the project's files.
 const PREFLIGHT_RETRY: Duration = if cfg!(test) { Duration::from_millis(200) } else { Duration::from_secs(10) };
+/// Frame series whose server-cached frames the client remembers (the newest).
+const KEPT_SERIES: usize = 4;
 /// Refines kept waiting at most this long.
 const REFINE_WAIT: Duration = Duration::from_secs(30);
 
@@ -89,14 +96,44 @@ pub struct CloudStatus {
     /// The server refused the token (the client stopped).
     pub refused: bool,
     pub frames: u64,
+    /// Pixel bytes received (frames and stream chunks).
     pub bytes: u64,
+    /// Bytes on the wire this session, received and sent (everything, headers and projects too):
+    /// what the cloud preview costs the internet connection.
+    pub bytes_down: u64,
+    pub bytes_up: u64,
+    /// The server's frame cache (CR8), from its last report.
+    pub server_cache: Option<ServerCache>,
     pub reconnects: u64,
     /// Whole projects sent (the first, after a reconnect, after a resync).
     pub projects: u64,
 }
 
+/// The server's frame cache as it last reported it.
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerCache {
+    /// Frames of the current Cache Frames When Idle plan cached, of `total`.
+    pub done: u64,
+    pub total: u64,
+    /// The whole cache: frames in RAM, MB in RAM of its budget, MB on its disk.
+    pub frames: u64,
+    pub ram_mb: u64,
+    pub ram_budget_mb: u64,
+    pub disk_mb: u64,
+}
+
+/// Keys of the frames the server's cache holds, per frame series (the newest few).
+#[derive(Default)]
+struct ServerKeys {
+    series: VecDeque<(CacheSeries, HashSet<u128>)>,
+}
+
 struct Shared {
     status: Mutex<CloudStatus>,
+    server_keys: Mutex<ServerKeys>,
+    /// Bumps when `server_keys` changes.
+    keys_generation: AtomicU64,
     /// Frames it renders at once (0 while not ready).
     slots: AtomicUsize,
     /// The comp's frame rate (f32 bits), for the frames in flight.
@@ -125,6 +162,8 @@ enum Cmd {
     StreamSeek(Tick),
     StreamPlayhead(Tick, bool),
     StreamStop,
+    /// CR8: Cache Frames When Idle on the server.
+    Precache(Box<RemotePrecache>),
 }
 
 /// Whether the server has every file and font the project needs (CR7 `cloud.preflight`).
@@ -152,6 +191,8 @@ impl CloudFrames {
     pub fn connect(addr: &str, token: &str, remap: Option<PathRemap>) -> Arc<CloudFrames> {
         let shared = Arc::new(Shared {
             status: Mutex::new(CloudStatus { address: addr.to_string(), ..CloudStatus::default() }),
+            server_keys: Mutex::default(),
+            keys_generation: AtomicU64::new(0),
             slots: AtomicUsize::new(0),
             fps: AtomicU32::new(30f32.to_bits()),
             latest: Mutex::new(None),
@@ -179,6 +220,7 @@ impl CloudFrames {
             syncing: None,
             stream: None,
             next_stream: 1,
+            plan: None,
         };
         let spawned = std::thread::Builder::new().name("ec-cloud-frames".into()).spawn(move || link.run(rx));
         if let Err(e) = spawned {
@@ -281,6 +323,23 @@ impl RemoteFrames for CloudFrames {
     fn eager(&self) -> bool {
         true
     }
+
+    /// The server's frame cache stands in for a disk cache (the blue bar: frames on the server).
+    fn disk(&self) -> bool {
+        true
+    }
+
+    fn disk_contains(&self, key: u128) -> bool {
+        self.shared.server_keys.lock().unwrap_or_else(PoisonError::into_inner).series.iter().any(|(_, k)| k.contains(&key))
+    }
+
+    fn disk_generation(&self) -> u64 {
+        self.shared.keys_generation.load(Ordering::Acquire)
+    }
+
+    fn precache(&self, plan: RemotePrecache) -> bool {
+        self.cmd.lock().unwrap_or_else(PoisonError::into_inner).send(Cmd::Precache(Box::new(plan))).is_ok()
+    }
 }
 
 /// A render request on its way.
@@ -326,6 +385,23 @@ struct Link {
     uploads_checked: Option<Instant>,
     stream: Option<LinkStream>,
     next_stream: u64,
+    /// The newest Cache Frames When Idle plan and whether the server has it (sent again after a
+    /// reconnection).
+    plan: Option<(RemotePrecache, bool)>,
+}
+
+/// The frames a plan covers, whatever their order (a playhead move reorders, doesn't change it).
+fn plan_cover(ranges: &[(i64, i64)]) -> Vec<(i64, i64)> {
+    let mut r: Vec<(i64, i64)> = ranges.iter().filter(|(a, b)| a <= b).copied().collect();
+    r.sort_unstable();
+    let mut out: Vec<(i64, i64)> = Vec::new();
+    for (a, b) in r {
+        match out.last_mut() {
+            Some((_, e)) if a <= e.saturating_add(1) => *e = (*e).max(b),
+            _ => out.push((a, b)),
+        }
+    }
+    out
 }
 
 /// Exponential smoothing (a quarter of each new sample).
@@ -410,7 +486,55 @@ impl Link {
                 }
             }
             Cmd::StreamStop => self.stream_stop(),
+            Cmd::Precache(plan) => {
+                let same = self.plan.as_ref().is_some_and(|(p, _)| {
+                    p.revision == plan.revision && p.comp == plan.comp && p.series == plan.series && plan_cover(&p.ranges) == plan_cover(&plan.ranges)
+                });
+                if !same {
+                    self.plan = Some((*plan, false));
+                    self.send_plan();
+                }
+            }
         }
+    }
+
+    /// Send the precache plan once the server holds its revision (a patch first).
+    fn send_plan(&mut self) {
+        if !self.ready() {
+            return;
+        }
+        let Some((plan, sent)) = &self.plan else { return };
+        if *sent {
+            return;
+        }
+        // The project moved on: the app sends a plan for the new revision.
+        if self.mirror.revision().is_some_and(|r| r > plan.revision) {
+            self.plan = None;
+            return;
+        }
+        let (revision, project) = (plan.revision, plan.project.clone());
+        if !self.sync_to(revision, &project) {
+            return;
+        }
+        let Some((plan, sent)) = &mut self.plan else { return };
+        let mut opts = plan.opts;
+        opts.backend = Backend::Auto;
+        let msg = FrameMsg::Precache(Precache { revision, comp: plan.comp, series: plan.series.clone(), opts: Box::new(opts), ranges: plan.ranges.clone() });
+        *sent = self.client.send(Up::Msg { msg, want: Want::default(), urgent: false }, vec![]);
+    }
+
+    /// The server's frame cache report: remember its frames' keys (the cache bar).
+    #[allow(clippy::too_many_arguments)]
+    fn cached(&mut self, series: CacheSeries, ranges: &[(i64, i64)], done: u64, total: u64, frames: u64, ram: u64, budget: u64, disk: u64) {
+        let keys: HashSet<u128> = ranges.iter().flat_map(|&(a, b)| a..=b.min(a.saturating_add(200_000))).filter_map(|f| series.key(f)).collect();
+        {
+            let mut k = self.shared.server_keys.lock().unwrap_or_else(PoisonError::into_inner);
+            k.series.retain(|(s, _)| *s != series);
+            k.series.push_front((series, keys));
+            k.series.truncate(KEPT_SERIES);
+        }
+        self.shared.keys_generation.fetch_add(1, Ordering::AcqRel);
+        self.status().server_cache = Some(ServerCache { done, total, frames, ram_mb: ram >> 20, ram_budget_mb: budget >> 20, disk_mb: disk >> 20 });
     }
 
     fn stream_msg(&mut self, m: StreamMsg) -> bool {
@@ -468,6 +592,7 @@ impl Link {
             ahead_secs: start.ahead_secs,
             adaptive: true,
             max_size: None,
+            cache: start.cache,
         };
         if !self.stream_msg(msg) {
             return shared.fail("the cloud connection dropped".into());
@@ -623,7 +748,17 @@ impl Link {
         opts.backend = Backend::Auto;
         let id = self.id();
         let render =
-            FrameMsg::Render { id, revision: job.revision, comp: job.comp, time: job.t, opts: Box::new(opts), disk: None, layers: false, prefetch: vec![] };
+            FrameMsg::Render {
+                id,
+                revision: job.revision,
+                comp: job.comp,
+                time: job.t,
+                opts: Box::new(opts),
+                // The server's frame cache key (CR8): a frame it holds comes back without a render.
+                disk: job.disk_key.map(|k| format!("{k:032x}")),
+                layers: false,
+                prefetch: vec![],
+            };
         let want = Want { codec: Codec::Jpeg, quality: 85, max_size: None, refine: job.urgent };
         if !self.client.send(Up::Msg { msg: render, want, urgent: job.urgent }, vec![]) {
             return done(Err("the cloud connection dropped".into()));
@@ -679,6 +814,9 @@ impl Link {
                 self.syncing = None;
                 self.generation = self.generation.wrapping_add(1);
                 self.preflight = Preflight::Unknown;
+                if let Some((_, sent)) = &mut self.plan {
+                    *sent = false;
+                }
                 self.resync();
             }
             Event::Disconnected { error } => self.lost(error),
@@ -798,6 +936,9 @@ impl Link {
                     self.resync();
                 }
                 FrameReply::Stream(r) => self.stream_reply(r, payload),
+                FrameReply::Cached { series, ranges, done, total, frames, ram_bytes, ram_budget, disk_bytes, .. } => {
+                    self.cached(series, &ranges, done, total, frames, ram_bytes, ram_budget, disk_bytes);
+                }
                 FrameReply::Stored { .. } | FrameReply::Info { .. } => {}
             },
             Down::Control { id, reply } => {
@@ -828,8 +969,17 @@ impl Link {
             }
         }
         self.refining.retain(|_, (_, at)| at.elapsed() < REFINE_WAIT);
+        let (down, up) = self.client.bytes();
+        {
+            let mut s = self.status();
+            s.bytes_down = down;
+            s.bytes_up = up;
+        }
         if !self.client.connected() {
             return;
+        }
+        if self.plan.as_ref().is_some_and(|(_, sent)| !sent) {
+            self.send_plan();
         }
         // Connected before the app offered a project: send it once there is one.
         if self.mirror.revision().is_none() && self.syncing.is_none() {
@@ -1108,6 +1258,9 @@ mod tests {
         streams: Arc<Mutex<Vec<std::net::TcpStream>>>,
         /// What `cloud.preflight` says is missing (`None`: nothing).
         missing: Arc<Mutex<Option<String>>>,
+        /// Precache plans received (CR8; answered: every frame cached) and render requests' keys.
+        precaches: Arc<Mutex<Vec<Precache>>>,
+        render_keys: Arc<Mutex<Vec<Option<String>>>>,
     }
 
     fn stream_down(r: StreamReply) -> Down {
@@ -1151,6 +1304,8 @@ mod tests {
             let (k, st, r, ss) = (kill.clone(), stall.clone(), renders.clone(), streams.clone());
             let missing: Arc<Mutex<Option<String>>> = Arc::default();
             let mi = missing.clone();
+            let (precaches, render_keys): (Arc<Mutex<Vec<Precache>>>, Arc<Mutex<Vec<Option<String>>>>) = Default::default();
+            let (pcs, rks) = (precaches.clone(), render_keys.clone());
             std::thread::spawn(move || {
                 while !k.load(Ordering::Acquire) {
                     let Ok((stream, _)) = listener.accept() else {
@@ -1159,7 +1314,7 @@ mod tests {
                     };
                     stream.set_nonblocking(false).unwrap();
                     ss.lock().unwrap().push(stream.try_clone().unwrap());
-                    let (st, r, mi) = (st.clone(), r.clone(), mi.clone());
+                    let (st, r, mi, pcs, rks) = (st.clone(), r.clone(), mi.clone(), pcs.clone(), rks.clone());
                     let ls: Arc<Mutex<Option<u64>>> = Arc::default();
                     std::thread::spawn(move || {
                         let (mut rd, mut wr) = (stream.try_clone().unwrap(), stream);
@@ -1209,8 +1364,25 @@ mod tests {
                                     let (d, payload) = fake_chunk(stream, 4, p.to_rev, 0, 32, 18, [0, 255, 0]);
                                     (d, payload)
                                 }
-                                Up::Msg { msg: FrameMsg::Render { id, .. }, .. } if !st.load(Ordering::Acquire) => {
+                                Up::Msg { msg: FrameMsg::Precache(p), .. } => {
+                                    let n: u64 = p.ranges.iter().map(|(a, b)| (b - a + 1) as u64).sum();
+                                    let reply = FrameReply::Cached {
+                                        comp: p.comp,
+                                        series: p.series.clone(),
+                                        ranges: p.ranges.clone(),
+                                        done: n,
+                                        total: n,
+                                        frames: n,
+                                        ram_bytes: n * 2304,
+                                        ram_budget: 1 << 30,
+                                        disk_bytes: 0,
+                                    };
+                                    pcs.lock().unwrap().push(p);
+                                    (Down::Reply { reply, pixels: None }, vec![])
+                                }
+                                Up::Msg { msg: FrameMsg::Render { id, disk, .. }, .. } if !st.load(Ordering::Acquire) => {
                                     r.fetch_add(1, Ordering::AcqRel);
+                                    rks.lock().unwrap().push(disk);
                                     let rgba: Vec<u8> = [255u8, 0, 0, 255].repeat(32 * 18);
                                     let (px, payload) = remote_encode::encode(&rgba, 32, 18, Codec::Raw, 85).unwrap();
                                     let frame = FrameReply::Frame {
@@ -1235,7 +1407,7 @@ mod tests {
                     });
                 }
             });
-            FakeServer { addr, kill, stall, renders, streams, missing }
+            FakeServer { addr, kill, stall, renders, streams, missing, precaches, render_keys }
         }
 
         /// Pull the tunnel: every connection drops and nothing answers on the port again.
@@ -1450,5 +1622,60 @@ mod tests {
         *server.missing.lock().unwrap() = None;
         wait_until("the cloud to be ready", || cloud.ready());
         assert!(cloud.status().missing.is_none());
+    }
+
+    /// CR8: with the cloud, Cache Frames When Idle sends the server one plan and downloads no
+    /// frames; the server's report fills the blue cache bar; the same plan isn't sent twice, a
+    /// playhead move doesn't resend it; render requests carry their frame keys; the status counts
+    /// the bytes on the wire both ways.
+    #[test]
+    fn idle_caching_goes_to_the_server_and_its_report_fills_the_cache_bar() {
+        use crate::frames::{FrameKey, Frames, RenderSource, opts_hash};
+        use effectcraft_engine::render::RenderOpts;
+        let server = FakeServer::start("secret");
+        let cloud = CloudFrames::connect(&server.addr, "secret", None);
+        let mut s = effectcraft_engine::Session::default();
+        s.execute("comp.new", serde_json::json!({"width": 32, "height": 18, "duration": 1, "frameRate": 10})).unwrap();
+        let cid = s.active_comp_id().unwrap();
+        cloud.offer(s.revision, &s.project);
+        wait_until("the cloud to hold the project", || cloud.ready());
+        let mut frames = Frames::default();
+        frames.set_remote(Some(cloud.clone()));
+        let src = RenderSource {
+            freeze_feedback: Default::default(),
+            project: s.project.clone(),
+            footage: s.footage.clone(),
+            expr: None,
+            layer_cache: Arc::default(),
+            gpu: None,
+            gpu_display: false,
+            disk: None,
+        };
+        let opts = RenderOpts::default();
+        let content = frames.content_of(&s.project, s.revision, cid);
+        let base = FrameKey { revision: s.revision, content, comp: cid.0, frame: 0, scale: 1000, view: 0, opts: opts_hash(&opts) };
+        // The content key is computed on a worker first.
+        let mut sent = None;
+        wait_until("the plan to go", || {
+            sent = frames.precache_remote(&src, &base, cid, opts, vec![(3, 9), (0, 2)]);
+            sent == Some(true)
+        });
+        wait_until("the server's report", || cloud.status().server_cache.is_some_and(|c| c.done == 10));
+        assert_eq!(frames.disk_frames(&src, &base, 10, &opts), (0..10).collect::<Vec<_>>(), "the blue bar: every frame is on the server");
+        assert_eq!(server.renders.load(Ordering::Acquire), 0, "no frame was downloaded");
+        assert_eq!(frames.inflight(), 0);
+        // The playhead moved (other order, same frames): not sent again.
+        assert_eq!(frames.precache_remote(&src, &base, cid, opts, vec![(5, 9), (0, 4)]), Some(true));
+        std::thread::sleep(Duration::from_millis(100));
+        let plans = server.precaches.lock().unwrap().clone();
+        assert_eq!(plans.len(), 1);
+        assert_eq!((plans[0].comp, plans[0].revision, plans[0].ranges.clone()), (cid, s.revision, vec![(3, 9), (0, 2)]));
+        // A viewer frame names its key: the server answers it from its cache.
+        frames.request_urgent(&src, FrameKey { frame: 4, ..base }, cid, Tick(0), opts);
+        wait_until("the viewer frame", || frames.is_cached(&FrameKey { frame: 4, ..base }));
+        let key = server.render_keys.lock().unwrap().first().cloned().flatten().expect("a key");
+        assert_eq!(u128::from_str_radix(&key, 16).ok(), plans[0].series.key(4));
+        let st = cloud.status();
+        assert!(st.bytes_down > 2304 && st.bytes_up > 0, "{st:?}");
     }
 }

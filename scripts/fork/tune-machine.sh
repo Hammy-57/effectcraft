@@ -244,8 +244,11 @@ if changes:
     except Exception:
         pass
 mt = os.path.join(a.conf, "machine-tune.json")
+# The cloud frame server's frame cache (CR8; cloud.sh exports it): the preview share (it stands in for the app's RAM preview
+# when the Mac edits and this machine renders) and the disk cache's room, in a folder of its own.
+serve = {"framesMb": mb(preview), "framesDiskGb": disk_gb if disk_on else 0, "framesDir": os.path.join(os.path.dirname(cache_dir), "server-frames")}
 json.dump({"at": time.strftime("%F %T"), "ram": ram, "hostRam": host, "cgroupLimit": limit, "cores": cores, "gpu": gpu_name, "vram": vram, "diskSize": disk_size,
-           "diskUsable": disk_usable, "cacheDir": cache_dir, "longestComp": longest[1:], "set": new, "hand": sorted(kept)},
+           "diskUsable": disk_usable, "cacheDir": cache_dir, "longestComp": longest[1:], "set": new, "hand": sorted(kept), "serve": serve},
           open(mt, "w"), indent=1)
 try:
     st = os.stat(a.conf); os.chown(mt, st.st_uid, st.st_gid)

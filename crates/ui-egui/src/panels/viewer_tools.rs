@@ -541,7 +541,7 @@ fn preview_on(app: &mut EffectcraftApp, ui: &mut egui::Ui, x: f32, cy: f32) -> f
                 "not connected"
             },
             s.gpu.as_ref().map(|g| format!(" · {g}")).unwrap_or_default()
-        ),
+        ) + &cloud_usage(s),
         None => "Where the viewer's preview frames render. Exports always render on this Mac.".to_string(),
     };
     let w = ui.painter().layout_no_wrap(label.clone(), crate::theme::Tokens::ui(11.5), t.text).size().x + 26.0;
@@ -570,6 +570,24 @@ fn preview_on(app: &mut EffectcraftApp, ui: &mut egui::Ui, x: f32, cy: f32) -> f
         None => {}
     }
     r.max.x
+}
+
+/// The Preview On tooltip's internet use and server cache lines (CR8).
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn cloud_usage(s: &crate::cloud::CloudStatus) -> String {
+    let mb = |b: u64| b as f64 / 1_048_576.0;
+    let mut out = format!("\nInternet this session: {:.1} MB down · {:.1} MB up", mb(s.bytes_down), mb(s.bytes_up));
+    if let Some(c) = &s.server_cache {
+        out += &format!(
+            "\nCached on the server: {} of {} frames (blue cache bar) · {:.1} of {:.1} GB RAM{}",
+            c.done,
+            c.total,
+            c.ram_mb as f64 / 1024.0,
+            c.ram_budget_mb as f64 / 1024.0,
+            if c.disk_mb > 0 { format!(" · {:.1} GB on disk", c.disk_mb as f64 / 1024.0) } else { String::new() }
+        );
+    }
+    out
 }
 
 fn toggle_popup(ui: &egui::Ui, id: &str) {
