@@ -178,6 +178,10 @@ page!(Previews {
     /// the CPU and back (the GPU compositor shares the window's graphics device). Off: frames are
     /// read back as before (the compositor gets a device of its own at the next launch).
     zero_copy_display: bool = true,
+    /// Smart Freeze: freeze (and keep fresh, Auto) a layer or precomp that stays far above the
+    /// frame budget while playing, once you have been idle for a few seconds. Off: the Timeline
+    /// only offers to freeze it.
+    freeze_auto_heavy: bool = false,
     /// CR5: where the Composition viewer's preview frames render: `local` (This Mac), `cloud`
     /// (a frame server on a rented GPU, through an SSH tunnel) or `auto` (the cloud when this
     /// Mac's frame takes longer than the cloud's round trip). Exports always render here.
@@ -1280,6 +1284,8 @@ pub fn pages() -> Vec<Page> {
                 s("previews.hardwareProResDecoding", "Hardware ProRes Decoding", B, true),
                 Note("Previews decode ProRes on the Mac's media engines (visually identical, not bit-exact). Renders and exports decode exactly."),
                 s("previews.zeroCopyDisplay", "Show GPU Frames Without Copying", B, true),
+                s("previews.freezeAutoHeavy", "Freeze Heavy Layers When Idle", B, true),
+                Note("A layer or precomp that stays more than twice the frame time while playing is frozen (Smart Freeze, Auto) after 8 idle seconds. Off: the Timeline offers a Freeze button instead."),
                 Note("Off: viewer frames are copied to the CPU and back, and the GPU compositor gets a graphics device of its own at the next launch."),
                 Section("Cloud Preview"),
                 s("previews.previewOn", "Preview On", Kind::Choice(&[("This Mac", "local"), ("Cloud", "cloud"), ("Auto", "auto")]), true),
