@@ -687,7 +687,15 @@ impl CloudPlayback {
 
     /// Start a stream for the first run of frames ahead that this Mac doesn't hold (RAM, a
     /// stream's fresh frame, or the disk cache), unless the running one covers it.
-    fn plan(&mut self, client: &Arc<CloudFrames>, p: &PlayNow<'_>, frames: &Frames, ctx: Option<&egui::Context>, range: (i64, i64, bool), cap: usize) -> PlayTick {
+    fn plan(
+        &mut self,
+        client: &Arc<CloudFrames>,
+        p: &PlayNow<'_>,
+        frames: &Frames,
+        ctx: Option<&egui::Context>,
+        range: (i64, i64, bool),
+        cap: usize,
+    ) -> PlayTick {
         let streamed = PlayTick { streamed: true, note: None };
         let Some(pv) = &mut self.preview else { return streamed };
         let order = play_order(p.cur, range, p.fit);
