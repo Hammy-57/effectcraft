@@ -57,6 +57,7 @@ pub mod adapter_choice;
 mod adv3d;
 mod bokeh;
 mod classic3d;
+mod codes;
 mod context;
 mod cull;
 pub mod deferred;
@@ -142,6 +143,9 @@ impl Gpu {
         self.ctx.check_health()?;
         crate::adv3d::warm(&self.ctx)?;
         crate::particles::warm(&self.ctx)?;
+        if let Some(bank) = &self.ctx.codes {
+            bank.warm().unwrap_or_else(|e| log::warn!("gpu: 8 bpc codes kernels: {e}"));
+        }
         self.ctx.check_health()
     }
 

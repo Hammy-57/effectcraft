@@ -14,7 +14,8 @@ use effectcraft_raster::Image;
 use effectcraft_render::{EvalCtx, Renderer, styles};
 use effectcraft_time::Tick;
 
-use crate::context::{Enc, GpuImage};
+use crate::codes::Pixels;
+use crate::context::{Enc, GpuImage, SourceImage};
 use crate::ops::{self, Bounds};
 
 /// Render a comp frame into a GPU image (the canvas in the output space, as
@@ -352,7 +353,7 @@ fn draw_resident_fx(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, can
     }
     // The placement only reads the buffer's size, offset and scale.
     let shape = Buf { img: Image { width: img.width, height: img.height, data: Vec::new() }, offset, scale };
-    Some(place_src_in(e, r, ctx, layer, &shape, img, canvas, layer.blend_mode, opacity, pipe.levels).map(|_| ()))
+    Some(place_src_in(e, r, ctx, layer, &shape, img.into(), canvas, layer.blend_mode, opacity, pipe.levels).map(|_| ()))
 }
 
 // Profile-only experiment: disable the ordinary resident producer without
@@ -424,7 +425,7 @@ fn draw_ordinary_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Laye
         }
     }
     let image = if let Some(buf) = cpu {
-        crate::context::NativeImage { img: e.upload_buf(&buf)?, offset: buf.offset, scale: buf.scale }
+        SourceImage { img: e.upload_pixels(&buf)?, offset: buf.offset, scale: buf.scale }
     } else {
         let _profile = effectcraft_render::profile::span("ordinary_resident_produce");
         let buf = crate::prepass::resident_source(r, ctx, layer, key, clip)?;
@@ -432,7 +433,7 @@ fn draw_ordinary_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Laye
         let mut fx = crate::effects::GpuFx::new(e, src, buf.offset, buf.scale, r.pipe().levels);
         let origin = r.run_layer_effects_on(ctx, layer, &mut fx);
         let (img, offset, scale) = fx.finish()?;
-        crate::context::NativeImage { img, offset: [offset[0] - origin[0] * scale, offset[1] - origin[1] * scale], scale }
+        SourceImage { img: img.into(), offset: [offset[0] - origin[0] * scale, offset[1] - origin[1] * scale], scale }
     };
     let result = composite_processed(e, r, ctx, layer, canvas, opacity, image.clone());
     if result == Some(Some(()))
@@ -456,10 +457,11 @@ fn composite_processed(
     layer: &Layer,
     canvas: &mut GpuImage,
     opacity: f32,
-    mut image: crate::context::NativeImage,
+    mut image: SourceImage,
 ) -> Option<Option<()>> {
     if let Some(conversion) = r.pipe().to_blend() {
-        image.img = ops::convert(e, &image.img, &conversion);
+        let img = image.img.float(e)?;
+        image.img = ops::convert(e, &img, &conversion).into();
     }
     composite_resident(e, r, ctx, layer, canvas, opacity, image)
 }
@@ -533,14 +535,14 @@ fn draw_cached_precomp(
     }
     r.resident_precomp_note(noted, cpu.is_some());
     let image = if let Some(buf) = cpu {
-        crate::context::NativeImage { img: e.upload_buf(&buf)?, offset: buf.offset, scale: buf.scale }
+        SourceImage { img: e.upload_pixels(&buf)?, offset: buf.offset, scale: buf.scale }
     } else {
         let _profile = effectcraft_render::profile::span("precomp_resident_produce");
         let (sub, item, lt, bs) = source;
         let Some(src) = crate::cull::nested(e, ctx, sub, *item, *lt) else {
             return if e.g.check_health().is_ok() { None } else { Some(None) };
         };
-        prepare_processed(e, r, ctx, layer, src, *bs)?
+        prepare_processed(e, r, ctx, layer, src, *bs)?.into()
     };
     let result = composite_processed(e, r, ctx, layer, canvas, opacity, image.clone());
     if result == Some(Some(()))
@@ -577,7 +579,7 @@ fn draw_yuv_footage(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, can
         && let Some(image) = e.g.native_get(&footage.pixels, *key, token, &metadata, e.owner.as_ref())
     {
         let _profile = effectcraft_render::profile::span("native_cached_place");
-        return composite_resident(e, r, ctx, layer, canvas, opacity, image);
+        return composite_resident(e, r, ctx, layer, canvas, opacity, image.into());
     }
     let mut src = crate::yuv::decode(e, view)?;
     if let Some((w, h)) = footage.preview {
@@ -595,7 +597,7 @@ fn draw_yuv_footage(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, can
         src = crate::yuv::mask(e, &src, &mask)?;
     }
     let image = prepare_resident(e, r, ctx, layer, src, footage.scale)?;
-    let result = composite_resident(e, r, ctx, layer, canvas, opacity, image.clone());
+    let result = composite_resident(e, r, ctx, layer, canvas, opacity, image.clone().into());
     // A video frame is kept once it is drawn again (a held frame, a paused edit, a loop), not
     // the first time: playback shows each frame once, and keeping every one (33 MB at 1080p)
     // filled the retained allowance in ~45 frames, pushing out layers that do repeat.
@@ -611,7 +613,7 @@ fn draw_yuv_footage(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, can
 #[allow(clippy::too_many_arguments)]
 fn finish_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut GpuImage, opacity: f32, src: GpuImage, bs: f64) -> Option<Option<()>> {
     let image = prepare_resident(e, r, ctx, layer, src, bs)?;
-    composite_resident(e, r, ctx, layer, canvas, opacity, image)
+    composite_resident(e, r, ctx, layer, canvas, opacity, image.into())
 }
 
 fn prepare_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, src: GpuImage, bs: f64) -> Option<crate::context::NativeImage> {
@@ -644,21 +646,13 @@ fn prepare_processed(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, mu
 }
 
 #[allow(clippy::too_many_arguments)]
-fn composite_resident(
-    e: &mut Enc,
-    r: &Renderer,
-    ctx: &EvalCtx,
-    layer: &Layer,
-    canvas: &mut GpuImage,
-    opacity: f32,
-    image: crate::context::NativeImage,
-) -> Option<Option<()>> {
-    let crate::context::NativeImage { img, offset, scale } = image;
-    if img.width == 0 || img.height == 0 {
+fn composite_resident(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut GpuImage, opacity: f32, image: SourceImage) -> Option<Option<()>> {
+    let SourceImage { img, offset, scale } = image;
+    if img.width() == 0 || img.height() == 0 {
         return Some(Some(()));
     }
     let pipe = r.pipe();
-    let shape = Buf { img: Image { width: img.width, height: img.height, data: Vec::new() }, offset, scale };
+    let shape = Buf { img: Image { width: img.width(), height: img.height(), data: Vec::new() }, offset, scale };
     if r.track_matte(ctx, layer).is_some() || layer.preserve_transparency {
         let mut iso = e.zeros(canvas.width, canvas.height);
         let Some(reach) = place_src_in(e, r, ctx, layer, &shape, img, &mut iso, BlendMode::Normal, 1.0, None) else {
@@ -828,7 +822,7 @@ fn place_in(
     if buf.img.is_empty() || opacity <= 0.0 {
         return Some([0; 4]);
     }
-    let src = e.upload_buf(buf)?;
+    let src = e.upload_pixels(buf)?;
     place_src_in(e, r, ctx, layer, buf, src, target, mode, opacity, levels)
 }
 
@@ -840,7 +834,7 @@ fn place_src_in(
     ctx: &EvalCtx,
     layer: &Layer,
     buf: &Buf,
-    src: GpuImage,
+    src: Pixels,
     target: &mut GpuImage,
     mode: BlendMode,
     opacity: f32,
@@ -852,7 +846,7 @@ fn place_src_in(
     let all = (32..=35).contains(&ops::mode_id(mode)) || (levels.is_some() && target.levels != levels);
     let everything = [0, 0, target.width, target.height];
     if let [m] = pl.matrices.as_slice() {
-        let reach = ops::warp_bounds(target, &src, m);
+        let reach = ops::warp_bounds((target.width, target.height), src.size(), m);
         ops::warp_q_in(e, target, &src, m, pl.sampling, mode, opacity, pl.seed, None, levels);
         return Some(if all { everything } else { reach });
     }
