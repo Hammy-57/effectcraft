@@ -654,7 +654,7 @@ fn sound_source(ctx: &egui::Context, client: &Client, local: &LocalIndex, card: 
 
 /// Over a hovered Sound card: a speaker and the SFX volume while it plays, "Audio unavailable"
 /// when it can't, nothing while the Timeline's own sound plays.
-fn paint_sound_state(app: &EffectcraftApp, p: &egui::Painter, thumb: Rect, card: &Card, src: &SoundSource, volume: f32, s: f32) {
+fn paint_sound_state(app: &mut EffectcraftApp, p: &egui::Painter, thumb: Rect, card: &Card, src: &SoundSource, volume: f32, s: f32) {
     let sp = app.sound_preview.as_ref();
     let failed = matches!(src, SoundSource::None) || sp.and_then(|sp| sp.failed()).as_deref() == Some(card.id.as_str());
     let playing = sp.and_then(|sp| sp.playing()) == Some(card.id.as_str());
@@ -676,7 +676,9 @@ fn paint_sound_state(app: &EffectcraftApp, p: &egui::Painter, thumb: Rect, card:
         let ir = Rect::from_min_size(pill.min + vec2(5.0 * s, 2.0 * s), vec2(12.0 * s, 12.0 * s));
         crate::icons::paint(p, ir, crate::icons::Icon::Audio, Color32::WHITE);
     }
+    let label = if playing && !failed { format!("Playing {text}") } else { text.clone() };
     p.text(pos2(pill.min.x + 6.0 * s + icon, pill.center().y), Align2::LEFT_CENTER, text, font, Color32::WHITE);
+    app.auto.add(&format!("motionLibrary.sound.{}", card.id), pill, &label);
 }
 
 /// This machine has the card's files (a library folder lists it): it applies from them, so it
