@@ -646,7 +646,7 @@ mod keep_tests {
             .within_memory(|| {
                 let mut enc = crate::context::Enc::with_owner(&g.ctx, cache.gpu_owner());
                 let image = crate::walk::render(&mut enc, &r, s.cid, Tick::ZERO).unwrap();
-                let result = enc.download(&image).unwrap();
+                let result = enc.download_px(&image).unwrap();
                 enc.publish_native();
                 result
             })
@@ -730,9 +730,9 @@ mod keep_tests {
                         .within_memory(|| {
                             let mut enc = crate::context::Enc::with_owner(&g.ctx, None);
                             let img = crate::walk::render(&mut enc, &legacy, s.cid, Tick::ZERO).unwrap();
-                            let texture = enc.display(&img);
+                            let texture = enc.display_px(&img).unwrap();
                             enc.submit();
-                            crate::DisplayFrame { texture, width: img.width, height: img.height }
+                            crate::DisplayFrame { texture, width: img.width(), height: img.height() }
                         })
                         .unwrap();
                     assert_eq!(actual, g.read_display(&expected_display).unwrap(), "display fidelity {depth:?}/{linear}/{scale}");
@@ -786,9 +786,9 @@ mod keep_tests {
                 .within_memory(|| {
                     let mut enc = crate::context::Enc::with_owner(&g.ctx, None);
                     let img = crate::walk::render(&mut enc, &legacy, s.cid, Tick::ZERO).unwrap();
-                    let texture = enc.display(&img);
+                    let texture = enc.display_px(&img).unwrap();
                     enc.submit();
-                    crate::DisplayFrame { texture, width: img.width, height: img.height }
+                    crate::DisplayFrame { texture, width: img.width(), height: img.height() }
                 })
                 .unwrap();
             assert_eq!(actual, g.read_display(&expected).unwrap(), "CPU-boundary fidelity, budget {budget}");

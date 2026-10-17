@@ -57,6 +57,7 @@ pub mod adapter_choice;
 mod adv3d;
 mod bokeh;
 mod classic3d;
+mod codes;
 mod context;
 mod cull;
 pub mod deferred;
@@ -142,7 +143,22 @@ impl Gpu {
         self.ctx.check_health()?;
         crate::adv3d::warm(&self.ctx)?;
         crate::particles::warm(&self.ctx)?;
+        if let Some(bank) = &self.ctx.codes {
+            bank.warm().unwrap_or_else(|e| log::warn!("gpu: 8 bpc codes kernels: {e}"));
+        }
         self.ctx.check_health()
+    }
+
+    /// 8 bpc working images as codes (`crate::codes`): `None` when this device keeps every image
+    /// f32; else (passes that read or wrote codes, codes decoded for a float-only consumer).
+    pub fn codes_stats(&self) -> Option<(u64, u64)> {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.ctx.codes.as_ref().map(|b| (b.dispatches.load(Relaxed), b.promotions.load(Relaxed)))
+    }
+
+    /// Codes decodes by call site (diagnostics).
+    pub fn codes_sites(&self) -> Vec<(String, u64)> {
+        self.ctx.codes.as_ref().and_then(|b| b.sites.lock().ok().map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect())).unwrap_or_default()
     }
 
     /// Successfully constructed static pipelines (dynamic sequence specializations excluded).
@@ -257,7 +273,7 @@ impl Gpu {
         let _frame = r.frame_mark(comp);
         let mut e = Enc::with_resident(&self.ctx, r.cache.and_then(effectcraft_render::cache::LayerCache::gpu_owner));
         let img = walk::render(&mut e, r, comp, t)?;
-        let texture = e.display(&img);
+        let texture = e.display_px(&img)?;
         e.submit();
         // Reject failures observed during rendering/submission before publishing the frame.
         // A later device fault still requires the presentation host's lifecycle handling.
@@ -267,7 +283,7 @@ impl Gpu {
             return None;
         }
         e.publish_native();
-        Some(DisplayFrame { texture, width: img.width, height: img.height })
+        Some(DisplayFrame { texture, width: img.width(), height: img.height() })
     }
 
     /// Read a display frame back as premultiplied RGBA8 (Info panel sampling, eyedroppers).
@@ -324,7 +340,7 @@ impl Gpu {
         }
         let mut e = Enc::with_resident(&self.ctx, r.cache.and_then(effectcraft_render::cache::LayerCache::gpu_owner));
         let img = walk::render(&mut e, r, comp, t)?;
-        let image = e.download(&img);
+        let image = e.download_px(&img);
         self.ctx.check_health().ok()?;
         // footage reads called off (#329): frames may be missing, so nothing is kept
         if r.footage.called_off() {
@@ -366,6 +382,7 @@ impl Gpu {
             // Layer steps are still in flight: this pass's canvas is not the frame.
             return Some(Image::new(1, 1));
         }
+        let Some(img) = img.float(&mut e) else { return Some(Image::new(1, 1)) };
         match e.read_keyed(&img, key, [0.0; 2], 1.0) {
             Some(rb) => rb.and_then(image),
             None => Some(Image::new(1, 1)),
@@ -595,6 +612,8 @@ mod tests_adjust;
 mod tests_adv3d;
 #[cfg(test)]
 mod tests_box;
+#[cfg(test)]
+mod tests_codes;
 #[cfg(test)]
 mod tests_deferred;
 #[cfg(test)]
