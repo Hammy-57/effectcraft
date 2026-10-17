@@ -971,8 +971,9 @@ fn adjustment_footprint_uploads_once_under_time_dependent_effects() {
     }
 }
 
-/// Encoder-local reuse preserves the barrier while other encoders have unsubmitted reads;
-/// a sole encoder can reuse its own released working texture.
+/// An encoder reuses its own released working texture, also while another encoder (another
+/// frame in flight) has unsubmitted work; the other one never gets it while the first may still
+/// be reading it. A texture that went into a cache keeps the barrier for every open encoder.
 #[test]
 fn enc_reuses_its_own_released_textures() {
     let Some(g) = gpu() else { return };
@@ -984,12 +985,13 @@ fn enc_reuses_its_own_released_textures() {
     let o = other.image(37, 23);
     assert!(o.texture != ta, "another Enc got a texture the first may still be using");
     let b = e.image(37, 23);
-    assert!(b.texture != ta, "an unsubmitted other encoder keeps the reuse barrier");
+    assert!(b.texture == ta, "its own released texture, with another frame in flight");
+    b.share();
     drop(b);
-    drop(o);
-    drop(other);
     let c = e.image(37, 23);
-    assert!(c.texture == ta, "after the other encoder closes, the first can reuse its texture");
+    assert!(c.texture != ta, "a shared texture waits for every open encoder");
+    drop(c);
+    drop(o);
 }
 
 /// In-`Enc` texture reuse changes no pixel: a busy frame (layers, effects, adjustment layer,
@@ -1026,7 +1028,9 @@ fn texture_reuse_does_not_change_output() {
 fn upload_budget_bounds_the_layer_textures_kept() {
     let Some(g) = gpu() else { return };
     let mut s = Scene::new(BitDepth::Bpc8);
-    for (i, c) in [[0.8, 0.2, 0.1], [0.1, 0.3, 0.9]].into_iter().enumerate() {
+    // Eight 200 × 200 footprints: 160 KB each as 8 bpc codes, 1.25 MB together.
+    for i in 0..8 {
+        let c = [0.1 + 0.1 * i as f32, 0.3, 0.9 - 0.1 * i as f32];
         let mut l = s.solid(c, 200, 200);
         set(&mut l, "transform/position", v3(60.0 + 30.0 * i as f64, 40.0));
         // Adjustment layers: their footprints are cached layer buffers the GPU uploads.
@@ -1042,14 +1046,15 @@ fn upload_budget_bounds_the_layer_textures_kept() {
         let img = g.render(&r, s.cid, Tick::from_seconds_f64(k as f64 / 30.0)).expect("the GPU renders the frame");
         (img.data, g.ctx.transfer_stats().upload_bytes - before)
     };
-    let fits = effectcraft_render::cache::LayerCache::new(64 << 20);
+    // (A layer cache large enough to hold all eight on probation.)
+    let fits = effectcraft_render::cache::LayerCache::new(1 << 30);
     let (a, _) = frame(&fits, 0);
     let (b, up) = frame(&fits, 1);
     assert_eq!(up, 0, "static layers re-uploaded within the default budget");
-    // A budget smaller than the two 640 KB footprints: each upload evicts the other.
+    // A budget smaller than the eight footprints: each upload evicts one the frame needs again.
     let default = g.ctx.upload_budget();
     g.ctx.set_upload_budget(1 << 20);
-    let tight = effectcraft_render::cache::LayerCache::new(64 << 20);
+    let tight = effectcraft_render::cache::LayerCache::new(1 << 30);
     let _ = frame(&tight, 0);
     let (c, up) = frame(&tight, 1);
     g.ctx.set_upload_budget(default);
