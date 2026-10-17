@@ -125,7 +125,8 @@ The most important missing piece: it turns every other estimate here into a meas
 - Regression evidence for [#66](https://github.com/storytold/effectcraft/issues/66): scripted
   pointer tests in `ui_viewer` and `ui_text_edit`, checked headlessly on Linux, cover viewer clicks,
   marquee selection and text picking when layers are hidden or excluded by solo. They also check
-  hidden/locked solo layers and solo layers outside their active time range.
+  hidden/locked solo layers, and that solo still excludes the other layers while the soloed
+  layer is outside its active time range (as in After Effects, so nothing is picked there).
 - Regression evidence for [#67](https://github.com/storytold/effectcraft/issues/67): scripted
   input tests in `ui_project_delete`, checked headlessly on Linux, cover Delete/Backspace on
   Project items, multiple selection and undo. They check that an unrelated Timeline layer stays,

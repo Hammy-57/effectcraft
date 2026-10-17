@@ -482,19 +482,21 @@ fn gather<'a>(r: &Renderer<'a>, ctx: &EvalCtx<'a>, run: &[&'a Layer], out: (u32,
         .enumerate()
         .filter(|(_, l)| ctx.opacity(l) > 0.0 && r.quality(l) != effectcraft_project::Quality::Wireframe)
         .flat_map_iter(|(i, l)| {
-            // Stack order with room for a collapsed precomp's layers in between.
-            let i = i * 1024;
-            if let Some(item) = r.collapsed(ctx, l) {
-                return collapsed_items(r, ctx, l, item, i, out);
-            }
-            let mut its = prepare_all(r, ctx, l, i, out, true);
-            if !its.is_empty() {
-                let m = matte_for(r, ctx, l, out);
-                for it in &mut its {
-                    it.matte = m.clone();
+            r.timed(ctx, l, || {
+                // Stack order with room for a collapsed precomp's layers in between.
+                let i = i * 1024;
+                if let Some(item) = r.collapsed(ctx, l) {
+                    return collapsed_items(r, ctx, l, item, i, out);
                 }
-            }
-            its
+                let mut its = prepare_all(r, ctx, l, i, out, true);
+                if !its.is_empty() {
+                    let m = matte_for(r, ctx, l, out);
+                    for it in &mut its {
+                        it.matte = m.clone();
+                    }
+                }
+                its
+            })
         })
         .collect();
     // Shadow casters outside this run (other 3D layers of the comp); none when this render
@@ -531,7 +533,7 @@ fn collapsed_items<'a>(
     let op = ctx.opacity(layer) as f32 * r.opacity_mul();
     let Some((sub, nctx)) = r.collapse_into(ctx, layer, item, op) else { return vec![] };
     let t = nctx.time;
-    let any_solo = nctx.comp.layers.iter().any(|l| l.switches.solo && l.source.is_av() && l.is_active_at(t));
+    let any_solo = nctx.comp.layers.iter().any(|l| l.switches.solo && l.source.is_av());
     let nested: Vec<&'a Layer> = nctx
         .comp
         .layers

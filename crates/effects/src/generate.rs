@@ -495,6 +495,25 @@ mod generator_tests {
     }
 
     #[test]
+    fn four_color_none_stays_inside_the_layer_alpha() {
+        // #1381: like the Gradient Ramp, the gradient fills a shape or text, not its bounding box.
+        let mut img = Image::filled(40, 24, [1.0, 0.0, 0.0, 1.0]);
+        for (i, p) in img.data.iter_mut().enumerate() {
+            let a = [0.0, 0.5, 1.0][i % 40 / 14];
+            *p = p.map(|c| c * a);
+        }
+        for op in [100.0, 50.0] {
+            let o = run_fx("ec.generate.fourcolor", &[("opacity", num(op))], img.clone(), 0.0, EffectEnv::default());
+            let k = op as f32 / 100.0;
+            for (src, out) in img.data.iter().zip(&o.img.data) {
+                assert!((src[3] * k - out[3]).abs() < 1e-6, "opacity {op}: alpha {} became {}", src[3], out[3]);
+                assert!(out[..3].iter().all(|&c| c <= out[3] + 1e-6), "opacity {op}: premultiplied colour above alpha");
+            }
+            assert!(o.img.data.iter().any(|p| p[1] > 0.1), "opacity {op}: the gradient replaces the layer's colour");
+        }
+    }
+
+    #[test]
     fn checkerboard_blending_none_shows_pattern_only_and_size_from_width() {
         let set = [("width", num(8.0)), ("height", num(2.0))];
         // None (default): the off squares are transparent; Width Slider makes 8×8 squares.

@@ -46,6 +46,7 @@ pub fn specs() -> Vec<CommandSpec> {
         fe!("app.templates", "Templates", [], None, "{kind: renderSettings|outputModule}", always),
         fe!("app.find", "Find", ["File"], Some("Cmd+F"), "{query?}", always),
         fe!("effects.copyPresetsFolderPath", "Copy Presets Folder Path", [], None, "{}", always),
+        fe!("mediaBrowser.copySourcePath", "Copy Source Path", [], None, "{path}", always),
         // Preview.
         fe!(
             "playback.toggle",

@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex};
 
 use effectcraft_engine::project::{Comp, ItemId, ItemKind, LayerSource, Node, Project, PropGroup};
 use effectcraft_engine::render::disk_cache::{self, DiskCache};
-use effectcraft_engine::render::{CancellableFootage, ExprHost, FootageSource, LayerCache, RenderOpts, Renderer};
+use effectcraft_engine::render::{CancellableFootage, ExprHost, FootageSource, LayerCache, LayerTimes, RenderOpts, Renderer};
 use effectcraft_engine::time::Tick;
 use effectcraft_gpu::{DisplayFrame, Gpu};
 use rayon::prelude::*;
@@ -42,6 +42,7 @@ mod landing;
 mod property_reuse;
 #[cfg(not(target_arch = "wasm32"))]
 mod resident;
+pub mod times;
 
 /// Comp identities (and the project snapshots behind them) the RAM preview keeps frames of.
 const MAX_KEEPERS: usize = 64;
@@ -104,7 +105,7 @@ pub struct FrameKey {
 
 impl FrameKey {
     /// Everything but the revision.
-    fn id(&self) -> (u64, u64, i64, u32, u64, u64) {
+    pub(crate) fn id(&self) -> (u64, u64, i64, u32, u64, u64) {
         (self.content, self.comp, self.frame, self.scale, self.view, self.opts)
     }
 
@@ -602,6 +603,8 @@ pub struct Frames {
     ctx: Option<egui::Context>,
     /// Render time of the last viewer (urgent) frame in ms, for the Info panel / perf readout.
     pub last_ms: Arc<Mutex<f64>>,
+    /// Each rendered frame's render time and its layers' (the Timeline's Render Time pane).
+    pub times: Arc<times::RenderTimes>,
     playback_budget: Arc<Mutex<crate::playback_budget::Budget>>,
     content_keys: ContentKeys,
     #[cfg(not(target_arch = "wasm32"))]
@@ -678,6 +681,7 @@ impl Default for Frames {
             background_running: Arc::default(),
             ctx: None,
             last_ms: Arc::new(Mutex::new(0.0)),
+            times: Arc::default(),
             playback_budget: Arc::default(),
             content_keys: Arc::default(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -1315,6 +1319,7 @@ impl Frames {
         if let Some(r) = &self.remote {
             r.purge();
         }
+        self.times.clear();
         if let Ok(mut c) = self.cache.lock() {
             c.map.clear();
             c.prints = fingerprint::Prints::default();
@@ -1494,6 +1499,7 @@ impl Frames {
             failed: self.failed.clone(),
             ctx: self.ctx.clone(),
             last: self.last_ms.clone(),
+            times: self.times.clone(),
             playback_budget: self.playback_budget.clone(),
             content_keys: self.content_keys.clone(),
             gpu_retired: self.gpu_retired.clone(),
@@ -1649,6 +1655,7 @@ struct Worker {
     failed: Failed,
     ctx: Option<egui::Context>,
     last: Arc<Mutex<f64>>,
+    times: Arc<times::RenderTimes>,
     playback_budget: Arc<Mutex<crate::playback_budget::Budget>>,
     content_keys: ContentKeys,
     gpu_retired: Arc<AtomicBool>,
@@ -2125,11 +2132,14 @@ impl Worker {
         r.expr = job.src.expr.as_deref();
         r.cache = Some(&job.src.layer_cache);
         r.accel = Some(g as &dyn effectcraft_engine::render::Accelerator);
+        let times = LayerTimes::default();
+        r.times = Some(&times);
         let t0 = web_time::Instant::now();
         let img = to_color_image(&r.comp_frame_cpu(job.comp, job.t));
         if let (Some(key), Some(p)) = (auto, pick) {
             p.record(key, false, t0.elapsed().as_secs_f64() * 1000.0);
         }
+        self.keep_times(job, times, t0);
         Rendered::Image(FrameImage::Cpu(Arc::new(img)))
     }
 
@@ -2161,8 +2171,14 @@ impl Worker {
         r.cache = Some(&job.src.layer_cache);
         r.accel = Some(g as &dyn effectcraft_engine::render::Accelerator);
         r.active_accel()?;
+        let times = LayerTimes::default();
+        r.times = Some(&times);
+        let t0 = web_time::Instant::now();
         match g.within_memory(|| g.render_display(&r, job.comp, job.t)) {
-            Ok(f) => f.map(|f| FrameImage::Gpu(Arc::new(f))),
+            Ok(f) => f.map(|f| {
+                self.keep_times(job, times, t0);
+                FrameImage::Gpu(Arc::new(f))
+            }),
             Err(e) => {
                 self.gpu_attempt_failed(g, &e);
                 None
@@ -2171,13 +2187,38 @@ impl Worker {
     }
 
     /// Render a frame; `gpu: false` keeps it off the GPU compositor. With `tail`, a native GPU
-    /// frame can come back through the landing thread ([`Rendered::Landing`]).
+    /// frame can come back through the landing thread ([`Rendered::Landing`]). Its render times
+    /// are kept for the Render Time pane ([`Frames::times`]).
     fn render_job(&self, job: &Job, gpu: bool, tail: Option<&Tail>) -> Rendered {
+        let times = LayerTimes::default();
+        let t0 = web_time::Instant::now();
+        let out = self.render_timed(job, gpu, tail, &times);
+        if !job.called_off() {
+            self.keep_times(job, times, t0);
+        }
+        out
+    }
+
+    /// Keep a frame's render times: its layers' (`times`) and the whole frame's since `t0`.
+    fn keep_times(&self, job: &Job, times: LayerTimes, t0: web_time::Instant) {
+        let frame_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        self.times.put(&job.key, times::FrameTimes { frame_ms, layers: times.into_map() });
+    }
+
+    /// [`Self::render_timed`] again on the CPU, timed afresh.
+    fn on_cpu_timed(&self, job: &Job, times: &LayerTimes) -> Rendered {
+        times.clear();
+        self.render_timed(job, false, None, times)
+    }
+
+    /// [`Self::render_job`], each layer's time added to `times`.
+    fn render_timed(&self, job: &Job, gpu: bool, tail: Option<&Tail>, times: &LayerTimes) -> Rendered {
         let frozen = effectcraft_engine::freeze::Preview::for_comp(&job.src.project, job.comp).with_feedback(&job.src.freeze_feedback);
         let footage = job.footage();
         let mut r = Renderer::new(&job.src.project, &footage, job.opts);
         r.freeze = (!frozen.is_empty()).then_some(&frozen);
         r.expr = job.src.expr.as_deref();
+        r.times = Some(times);
         let gpu_allowed = gpu && frozen.is_empty() && !self.gpu_retired.load(Ordering::Acquire);
         // A failed GPU attempt may have populated intermediate entries before its scope
         // reported failure. The CPU retry (`gpu: false`) must compute its own pixels from the
@@ -2233,20 +2274,20 @@ impl Worker {
                 }) {
                     Ok(Some(Rendered::Landing)) => {
                         if g.context().check_health().is_err() && self.unland(flight) {
-                            return self.render_job(job, false, None);
+                            return self.on_cpu_timed(job, times);
                         }
                         return Rendered::Landing;
                     }
                     Ok(Some(image)) => {
                         if g.context().check_health().is_err() {
-                            return self.render_job(job, false, None);
+                            return self.on_cpu_timed(job, times);
                         }
                         #[cfg(not(target_arch = "wasm32"))]
                         if resident {
                             // Auto's GPU time is recorded when the GPU has finished the frame.
                             if let Err(e) = self.resident.admit(g, auto.map(|(_, key)| key), t0) {
                                 log::warn!("a GPU viewer frame did not finish ({e}); it renders on the CPU");
-                                return self.render_job(job, false, None);
+                                return self.on_cpu_timed(job, times);
                             }
                             return image;
                         }
@@ -2259,7 +2300,7 @@ impl Worker {
                     }
                     Ok(None) => {
                         if g.context().check_health().is_err() {
-                            return self.render_job(job, false, None);
+                            return self.on_cpu_timed(job, times);
                         }
                         // called off (#329): not a frame the GPU declined, and not worth a CPU render
                         if job.called_off() {
@@ -2274,7 +2315,7 @@ impl Worker {
                             return Rendered::Landing;
                         }
                         self.gpu_attempt_failed(g, &e);
-                        return self.render_job(job, false, None);
+                        return self.on_cpu_timed(job, times);
                     }
                 }
             }
@@ -2291,7 +2332,7 @@ impl Worker {
                 Ok(img) => Rendered::Image(FrameImage::Cpu(Arc::new(to_color_image(&img)))),
                 Err(e) => {
                     self.gpu_attempt_failed(g, &e);
-                    self.render_job(job, false, None)
+                    self.on_cpu_timed(job, times)
                 }
             };
         }

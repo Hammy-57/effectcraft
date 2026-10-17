@@ -28,6 +28,8 @@ pub fn vector_doc(
     }
     effectcraft_pdf::sniff(bytes)?;
     Some(effectcraft_pdf::parse_page(bytes, page as usize).map_err(|e| format!("{path}: {e}")).and_then(|d| match layer {
+        // Retain Layer Sizes without saved bounds crops to the artwork itself.
+        Some(l) if l.layer_size && l.crop_bounds.is_none() => Ok(effectcraft_pdf::layer_doc_with_sizes(&d, l.index as usize, true).0),
         Some(l) => effectcraft_pdf::selected_layer_doc(&d, l.index as usize, &l.name, l.crop_bounds).map_err(|e| format!("{path}: {e}")),
         None => Ok(d),
     }))

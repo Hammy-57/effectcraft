@@ -49,18 +49,29 @@ pub(crate) fn hold_gpu_lock() {
 
 /// The shared test device (the calling test holds [`hold_gpu_lock`]).
 pub(crate) fn gpu() -> Option<&'static Gpu> {
-    static G: OnceLock<Option<Gpu>> = OnceLock::new();
+    static G: OnceLock<Result<Gpu, String>> = OnceLock::new();
     hold_gpu_lock();
-    G.get_or_init(|| {
-        let g = Gpu::headless();
-        if g.is_none() {
-            eprintln!("effectcraft-gpu tests: no GPU adapter, skipping GPU comparisons");
-        } else if let Some(g) = &g {
-            eprintln!("effectcraft-gpu tests: adapter {}", g.ctx.name);
+    let g = G.get_or_init(|| {
+        let g = Gpu::try_headless();
+        match &g {
+            Ok(g) => eprintln!("effectcraft-gpu tests: adapter {}", g.ctx.name),
+            Err(e) => eprintln!("effectcraft-gpu tests: no GPU ({e}), skipping GPU comparisons"),
         }
         g
-    })
-    .as_ref()
+    });
+    require_gpu("effectcraft-gpu tests", g.as_ref())
+}
+
+/// `g`, or `None` (the GPU tests skip) when there is no GPU, unless `EFFECTCRAFT_REQUIRE_GPU=1`
+/// (as in `tests_init`): then a GPU that didn't start fails the test, with why.
+pub(crate) fn require_gpu<G>(tests: &str, g: Result<G, &String>) -> Option<G> {
+    match g {
+        Ok(g) => Some(g),
+        Err(e) if std::env::var("EFFECTCRAFT_REQUIRE_GPU").is_ok_and(|v| v == "1") => {
+            panic!("{tests}: EFFECTCRAFT_REQUIRE_GPU=1 but GPU initialization failed: {e}")
+        }
+        Err(_) => None,
+    }
 }
 
 /// The test device is on wgpu's OpenGL backend (Mesa's llvmpipe on the FreeBSD CI job).

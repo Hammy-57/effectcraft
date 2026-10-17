@@ -4,7 +4,7 @@
 use crate::collapse::{Collapse3d, MAX_THROUGH, Through};
 use crate::{Accelerator, AutoKey, AutoPick, Backend, EvalCtx, ExprHost, FootageSource, Image, LayerCache, NoFootage, color, three_d};
 use effectcraft_geom::Mat3;
-use effectcraft_project::{Comp, ItemId, Layer, Project, Quality};
+use effectcraft_project::{Comp, ItemId, Layer, LayerId, Project, Quality};
 use effectcraft_time::Tick;
 
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
@@ -67,6 +67,9 @@ pub struct Renderer<'a> {
     pub cache: Option<&'a LayerCache>,
     /// Optional per-layer timing sink (`frame --bench` / perf readouts).
     pub profile: Option<&'a std::sync::Mutex<Vec<LayerTiming>>>,
+    /// Each layer's render time on this frame, for the Timeline's Render Time pane (see
+    /// [`LayerTimes`]). `None` times nothing.
+    pub times: Option<&'a LayerTimes>,
     /// Accepted preview caches only. None for exports and cache generation.
     pub freeze: Option<&'a dyn crate::freeze::FreezeSource>,
     /// GPU backend used when [`RenderOpts::backend`] asks for it.
@@ -125,7 +128,70 @@ pub struct LayerTiming {
     pub cached: bool,
 }
 
+/// The time each layer took to render on one frame (ms), by comp and layer: what After Effects'
+/// Render Time pane shows. A layer's time is its wall time on the CPU or GPU compositor: what the
+/// pre-pass produced for it on every core, plus its draw (source, masks, effects, styles, matte,
+/// transform and blend). A precomp layer's time includes the layers drawn inside it, which are
+/// timed under their own comp too. A 3D run's shared scene composite is split evenly between its
+/// layers. A layer whose content came from the layer cache takes only the lookup; a GPU
+/// compositor's time is the time to prepare and record its work, not the device's own run time.
+#[derive(Debug, Default)]
+pub struct LayerTimes(std::sync::Mutex<std::collections::HashMap<(ItemId, LayerId), f64>>);
+
+impl LayerTimes {
+    /// Add `ms` to `layer` of `comp`.
+    pub fn add(&self, comp: ItemId, layer: LayerId, ms: f64) {
+        if !ms.is_finite() || ms < 0.0 {
+            return;
+        }
+        let mut m = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        *m.entry((comp, layer)).or_insert(0.0) += ms;
+    }
+
+    /// The time of `layer` of `comp` so far.
+    pub fn get(&self, comp: ItemId, layer: LayerId) -> Option<f64> {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&(comp, layer)).copied()
+    }
+
+    /// Forget the times taken (a frame rendered again from the start).
+    pub fn clear(&self) {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+    }
+
+    /// The times taken.
+    pub fn into_map(self) -> std::collections::HashMap<(ItemId, LayerId), f64> {
+        self.0.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 impl<'a> Renderer<'a> {
+    /// Run `f` (drawing or producing `layer` of `ctx`'s comp) and add its wall time to the
+    /// layer's render time, when this render is timed ([`Self::times`]).
+    pub fn timed<T>(&self, ctx: &EvalCtx, layer: &Layer, f: impl FnOnce() -> T) -> T {
+        let Some(times) = self.times else { return f() };
+        let t0 = web_time::Instant::now();
+        let out = f();
+        times.add(ctx.comp_id, layer.id, t0.elapsed().as_secs_f64() * 1e3);
+        out
+    }
+
+    /// [`Self::timed`] for a run of 3D layers drawn as one scene: what `f` timed per layer stays
+    /// with that layer, and the rest of the run's time (the shared scene) is split evenly
+    /// between the run's layers.
+    pub fn timed_run<T>(&self, ctx: &EvalCtx, run: &[&Layer], f: impl FnOnce() -> T) -> T {
+        let Some(times) = self.times.filter(|_| !run.is_empty()) else { return f() };
+        let own = |times: &LayerTimes| run.iter().filter_map(|l| times.get(ctx.comp_id, l.id)).sum::<f64>();
+        let before = own(times);
+        let t0 = web_time::Instant::now();
+        let out = f();
+        let total = t0.elapsed().as_secs_f64() * 1e3;
+        let shared = (total - (own(times) - before)).max(0.0) / run.len() as f64;
+        for l in run {
+            times.add(ctx.comp_id, l.id, shared);
+        }
+        out
+    }
+
     pub fn new(project: &'a Project, footage: &'a dyn FootageSource, opts: RenderOpts) -> Renderer<'a> {
         Renderer {
             project,
@@ -134,6 +200,7 @@ impl<'a> Renderer<'a> {
             opts,
             cache: None,
             profile: None,
+            times: None,
             freeze: None,
             accel: None,
             depth: 0,
@@ -445,16 +512,16 @@ impl<'a> Renderer<'a> {
                 while j < visible.len() && visible[j].is_3d() {
                     j += 1;
                 }
-                three_d::compose::draw_run(self, ctx, &visible[i..j], canvas);
+                self.timed_run(ctx, &visible[i..j], || three_d::compose::draw_run(self, ctx, &visible[i..j], canvas));
                 i = j;
                 self.pipe.quantize(canvas);
                 blank = false;
             } else {
-                let changed = match (self.collapsed(ctx, visible[i]), self.collapsed_fx(ctx, visible[i])) {
+                let changed = self.timed(ctx, visible[i], || match (self.collapsed(ctx, visible[i]), self.collapsed_fx(ctx, visible[i])) {
                     (Some(item), _) => self.draw_collapsed(ctx, visible[i], item, canvas, blank),
                     (None, Some(item)) => self.draw_collapsed_fx(ctx, visible[i], item, canvas),
                     (None, None) => self.draw_layer(ctx, visible[i], canvas, blank),
-                };
+                });
                 i += 1;
                 // 8/16 bpc: the comp is an integer buffer after every layer (only the pixels the
                 // layer touched need re-quantising).

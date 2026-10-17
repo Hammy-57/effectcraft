@@ -197,7 +197,7 @@ pub fn invoke(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: V
     if let Some(result) = crate::panels::timeline::invoke_inline(app, ctx, id, &params) {
         return result;
     }
-    if id == "effects.copyPresetsFolderPath" {
+    if matches!(id, "effects.copyPresetsFolderPath" | "mediaBrowser.copySourcePath") {
         return frontend(app, ctx, id, params);
     }
     // Layer ▸ New ▸ Text (menu, shortcut, context menus) puts an insertion point in the centre of
@@ -620,6 +620,19 @@ pub(crate) fn panel_shown(app: &EffectcraftApp, p: PanelKind) -> bool {
         Some(m) => m == p,
         None => app.ui.dock.is_visible(p),
     }
+}
+
+/// The command a menu entry runs when chosen from a menu: Window ▸ <panel> closes a panel whose
+/// entry is checked, as in After Effects (#1630). Shortcuts and agents calling `window.panel`
+/// still only show the panel.
+pub(crate) fn menu_choice(app: &EffectcraftApp, id: String, params: Value) -> (String, Value) {
+    if id == "window.panel"
+        && let Some(p) = params.get("panel").and_then(Value::as_str).and_then(PanelKind::from_name)
+        && panel_shown(app, p)
+    {
+        return ("window.closePanel".into(), params);
+    }
+    (id, params)
 }
 
 /// Check-mark state of frontend toggles (engine state is answered by the engine).
@@ -1155,7 +1168,7 @@ pub fn menu_bar(app: &mut EffectcraftApp, ui: &mut egui::Ui) {
         });
     });
     crate::menu_keys::handle(&ctx, &nav);
-    if let Some((id, params)) = clicked
+    if let Some((id, params)) = clicked.map(|(id, params)| menu_choice(app, id, params))
         && let Err(e) = invoke(app, &ctx, &id, if params.is_null() { json!({}) } else { params })
     {
         app.ui.status = e;

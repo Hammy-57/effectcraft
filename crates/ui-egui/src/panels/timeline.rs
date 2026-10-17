@@ -1340,6 +1340,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     app.ui.timeline.outline_scroll = app.ui.timeline.outline_scroll.clamp(0.0, overflow);
     let oscroll = app.ui.timeline.outline_scroll;
     let cw = cols(rect.min.x - oscroll, &app.ui.timeline);
+    // The viewer frame's render times (Render Time pane, footer).
+    let shown_times = shown_times(app, cid);
     let graph_x0 = rect.min.x + left_w + 1.0;
     let graph_x1 = rect.max.x - GUTTER_W;
     ctx.data_mut(|d| d.insert_temp(egui::Id::new("timeline-graph-area"), (graph_x0, graph_x1 - graph_x0)));
@@ -1733,6 +1735,10 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         if let Some(i) = rows.iter().position(|r| matches!(r.kind, RowKind::Layer) && Some(r.layer) == top) {
             app.ui.timeline.scroll_y = rows.iter().take(i).map(|r| row_height(r, rh)).sum();
         }
+    } else if let Some(crate::state::ScrollTo::Property(uid)) = scroll_to
+        && let Some(i) = rows.iter().position(|r| matches!(r.kind, RowKind::Prop { uid: p } if p == uid))
+    {
+        app.ui.timeline.scroll_y = rows.iter().take(i).map(|r| row_height(r, rh)).sum();
     }
     if ui.rect_contains_pointer(rows_rect) && !(app.ui.timeline.graph_editor && ui.input(|i| i.pointer.hover_pos()).is_some_and(|p| p.x >= graph_x0)) {
         let (dy, dx, zoom) = ui.input(|i| (i.smooth_scroll_delta.y, i.smooth_scroll_delta.x, i.modifiers.alt));
@@ -1852,8 +1858,11 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 gp.line_segment([pos2(graph_x0, r.max.y - 0.5), pos2(r.max.x, r.max.y - 0.5)], Stroke::new(1.0, t.app_bg));
                 // A/V features.
                 let sw = &layer.switches;
+                // Every layer has the Video switch (the eye), nulls, cameras and lights included,
+                // as in After Effects: it hides a null's outline in the viewer and turns a camera or
+                // light off.
                 let av_items: [(Icon, bool, &str, bool); 4] = [
-                    (Icon::Eye, sw.video, "video", layer.source.is_av()),
+                    (Icon::Eye, sw.video, "video", true),
                     (Icon::Speaker, sw.audio, "audio", layer.props.sub("audio").is_some()),
                     (Icon::Solo, sw.solo, "solo", layer.source.is_av()),
                     (Icon::Lock, sw.locked, "lock", true),
@@ -1885,7 +1894,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 if vis.num {
                     lp.text(pos2(cw.num + 13.0, cy), Align2::CENTER_CENTER, format!("{}", idx_of(layer.id)), Tokens::ui(11.5), t.text_dim);
                 }
-                layer_cells(app, ui, &lp, &cw, &comp, layer, r, cy, &mut actions);
+                layer_cells(app, ui, &lp, &cw, &comp, layer, r, cy, shown_times.as_ref(), &mut actions);
                 // Row click → select; double-click → rename; drag → reorder. Registered before the
                 // twirl and the name field so those sit on top and get their clicks.
                 let row_x0 = if vis.num && cw.num < cw.name { cw.num } else { cw.name + 16.0 };
@@ -2283,6 +2292,16 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     },
                 );
                 gp.rect_filled(Rect::from_min_max(pos2(graph_x0, r.min.y), r.max), 0.0, t.tl_bg);
+                // An effect's colour label (26.5): the same bar the Effect Controls header wears,
+                // on the row's left edge.
+                if let Some(lab) =
+                    group.filter(|g| matches!(g.kind, GroupKind::Effect { .. })).and_then(|g| g.label).filter(|l| *l != effectcraft_engine::color::Label::None)
+                {
+                    let [lr, lg, lb] = app.session.prefs.label_rgb(lab);
+                    let bar = Rect::from_min_size(left.min, vec2(4.0, left.height()));
+                    lp.rect_filled(bar, 0.0, Color32::from_rgb(lr, lg, lb));
+                    app.auto.add(&format!("timeline.group.{uid}.label"), bar, &app.session.prefs.label_name(lab));
+                }
                 let indent = cw.name + 6.0 + 14.0 * row.depth as f32;
                 if *has_children {
                     let tw = Rect::from_center_size(pos2(indent, cy), vec2(13.0, 13.0));
@@ -3173,7 +3192,9 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     if tresp.clicked() {
         super::timeline_columns::toggle_switches_modes(&mut app.ui.timeline);
     }
-    let ms = app.frames.last_ms.lock().map(|v| *v).unwrap_or(0.0);
+    // The frame in the viewer's own time (kept with it while it is cached, as in After Effects),
+    // else the last viewer frame's.
+    let ms = shown_times.as_ref().map(|s| s.frame.frame_ms).unwrap_or_else(|| app.frames.last_ms.lock().map(|v| *v).unwrap_or(0.0));
     p.text(
         pos2(graph_x0 - 12.0, footer.center().y),
         Align2::RIGHT_CENTER,
@@ -3279,8 +3300,18 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     {
         let released = ctx.input(|i| i.pointer.any_released());
         if let crate::panels::DragPayload::Effect(e) = payload.as_ref() {
-            p.rect_stroke(rows_rect, 0.0, Stroke::new(2.0, t.accent), StrokeKind::Inside);
             let target = hit_rows.iter().find(|(r, _)| ptr.y >= r.min.y && ptr.y < r.max.y).map(|(_, row)| row.layer);
+            // The layer the effect would land on (its row and its open properties) is the one
+            // that lights up, not the whole timeline.
+            if let Some(l) = target
+                && let Some(span) = hit_rows.iter().filter(|(_, row)| row.layer == l).map(|(r, _)| *r).reduce(|a, b| a.union(b))
+            {
+                let lit = span.intersect(rows_rect);
+                let rp = p.with_clip_rect(rows_rect);
+                rp.rect_filled(lit, 0.0, t.accent.gamma_multiply(0.18));
+                rp.rect_stroke(lit, 0.0, Stroke::new(2.0, t.accent), StrokeKind::Inside);
+                app.auto.add("timeline.dropTarget", lit, "Drop target layer");
+            }
             if released && let Some(l) = target {
                 actions.push(("effect.apply".into(), json!({"effect": e, "layers": [l.0]})));
             }
@@ -3405,8 +3436,38 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     }
 }
 
+/// The render times of the frame in the viewer for the Timeline's comp `comp` (the viewer's comp,
+/// or a comp nested in it), and the slowest of its layers, which the Render Time pane's bars are
+/// scaled to.
+pub(super) struct ShownTimes {
+    pub frame: std::sync::Arc<crate::frames::times::FrameTimes>,
+    pub comp: ItemId,
+    pub slowest: f64,
+}
+
+impl ShownTimes {
+    /// The time `layer` took on the frame.
+    pub fn layer(&self, layer: LayerId) -> Option<f64> {
+        self.frame.layer(self.comp, layer)
+    }
+}
+
+/// [`ShownTimes`] of the frame the viewer shows, if it rendered lately.
+fn shown_times(app: &EffectcraftApp, comp: ItemId) -> Option<ShownTimes> {
+    let key = app.viewer_shown.as_ref()?.1;
+    let frame = app.frames.times.get(&key)?;
+    let slowest = frame.layers.iter().filter(|((c, _), _)| *c == comp).map(|(_, ms)| *ms).fold(0.0, f64::max);
+    Some(ShownTimes { frame, comp, slowest })
+}
+
+/// A Render Time pane time, as After Effects writes it ("272ms"), with a tenth below 10 ms.
+pub(super) fn render_time_label(ms: f64) -> String {
+    if ms < 10.0 { format!("{ms:.1}ms") } else { format!("{ms:.0}ms") }
+}
+
 /// The optional per-layer cells: Comment (double-click to edit), In / Out / Duration (drag to
-/// change by frames), Stretch (click: Time Stretch dialog).
+/// change by frames), Stretch (click: Time Stretch dialog), Render Time (the layer's time on the
+/// viewer's frame: a bar scaled to the comp's slowest layer, green to red, and the ms).
 #[allow(clippy::too_many_arguments)]
 fn layer_cells(
     app: &mut EffectcraftApp,
@@ -3417,11 +3478,32 @@ fn layer_cells(
     layer: &Layer,
     r: Rect,
     cy: f32,
+    times: Option<&ShownTimes>,
     actions: &mut Vec<(String, serde_json::Value)>,
 ) {
     let t = app.tokens;
     let ctx = ui.ctx().clone();
     let lid = layer.id.0;
+    if cw.vis.render_time
+        && let Some(times) = times
+        && let Some(ms) = times.layer(layer.id)
+    {
+        let cr = Rect::from_min_max(pos2(cw.render_time + 4.0, r.min.y + 4.0), pos2(cw.render_time + cw.render_time_w - 4.0, r.max.y - 4.0));
+        let label = render_time_label(ms);
+        let share = if times.slowest > 0.0 { (ms / times.slowest).clamp(0.0, 1.0) as f32 } else { 0.0 };
+        let bar_w = (cr.width() - 46.0).max(0.0) * share;
+        let colour = if share < 1.0 / 3.0 {
+            t.cache_green
+        } else if share < 2.0 / 3.0 {
+            t.warning
+        } else {
+            t.danger
+        };
+        let cp = lp.with_clip_rect(cr.intersect(lp.clip_rect()));
+        cp.rect_filled(Rect::from_min_size(cr.min, vec2(bar_w.max(1.0), cr.height())), 1.0, colour.gamma_multiply(0.85));
+        cp.text(pos2(cr.max.x, cy), Align2::RIGHT_CENTER, &label, Tokens::mono(11.0), t.text_dim);
+        app.auto.add(&format!("timeline.layer.{lid}.renderTime"), cr, &label);
+    }
     if cw.vis.comment {
         let cr = Rect::from_min_max(pos2(cw.comment + 4.0, r.min.y + 1.0), pos2(cw.comment + cw.comment_w - 4.0, r.max.y - 1.0));
         let edit_id = egui::Id::new("tl-comment-edit");
@@ -3945,6 +4027,7 @@ pub(crate) fn layer_menu(ui: &mut egui::Ui, layers: &[u64], caps: LayerMenuCaps,
             }
         })
     });
+    ui.menu_button(crate::i18n::tr("Layer Styles"), |ui| layer_styles_submenu(ui, layers, &mut item));
     ui.menu_button(crate::i18n::tr("Effects"), |ui| effects_submenu(ui, layers, &mut item));
     ui.menu_button(crate::i18n::tr("Arrange"), |ui| {
         item(ui, "Bring Layer to Front", "layer.arrange", json!({"layers": layers, "to": "front"}));
@@ -3957,6 +4040,31 @@ pub(crate) fn layer_menu(ui: &mut egui::Ui, layers: &[u64], caps: LayerMenuCaps,
     item(ui, "Duplicate", "edit.duplicate", json!({"layers": layers}));
     item(ui, "Split Layer", "edit.splitLayer", json!({"layers": layers}));
     item(ui, "Delete", "edit.clear", json!({"layers": layers}));
+}
+
+/// The layer context menu's Layer Styles submenu, matching the Layer ▸ Layer Styles application menu.
+fn layer_styles_submenu(ui: &mut egui::Ui, layers: &[u64], item: &mut dyn FnMut(&mut egui::Ui, &str, &str, serde_json::Value)) {
+    item(ui, "Layer Style Options...", "layer.style.options", json!({}));
+    ui.separator();
+    item(ui, "Convert to Editable Styles", "layer.style.convertToEditable", json!({"layers": layers}));
+    item(ui, "Show All", "layer.style.showAll", json!({"layers": layers}));
+    item(ui, "Remove All", "layer.style.removeAll", json!({"layers": layers}));
+    ui.separator();
+    for (id, label) in effectcraft_engine::project::styles::STYLES {
+        let cmd = match *id {
+            "dropShadow" => "layer.style.dropShadow",
+            "innerShadow" => "layer.style.innerShadow",
+            "outerGlow" => "layer.style.outerGlow",
+            "innerGlow" => "layer.style.innerGlow",
+            "bevelEmboss" => "layer.style.bevelEmboss",
+            "satin" => "layer.style.satin",
+            "colorOverlay" => "layer.style.colorOverlay",
+            "gradientOverlay" => "layer.style.gradientOverlay",
+            "stroke" => "layer.style.stroke",
+            _ => continue,
+        };
+        item(ui, label, cmd, json!({}));
+    }
 }
 
 /// The layer context menu's Effects submenu: every effect from the registry grouped by category,
