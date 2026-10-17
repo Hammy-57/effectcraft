@@ -1,19 +1,27 @@
-//! `mirror <user@host>`: copy the media and fonts a project reads to a cloud render machine
+//! `mirror <user@host>`: put the media and fonts a project reads on a cloud render machine
 //! (`plan/cloud-render.md` CR7), then check there that nothing is missing.
 //!
-//! - The manifest is `project.dependencies` of the running app (`--bridge`, default) or of a
-//!   project file (`--project`). Media and linked fonts go to the **same absolute paths**
-//!   (`/Users/elias/...` on Linux); other font files go to one folder (`--font-dir`), which the
-//!   server reads through `EFFECTCRAFT_FONT_DIRS`.
-//! - Only what is missing or changed is sent: size + mtime, and for a same-size file with another
-//!   mtime the sha256 on both sides (equal: nothing is sent; `--retime` also copies the mtime).
-//! - One tar stream over ssh, written here (paths with spaces, no rsync, no AppleDouble `._`
-//!   files), with progress; files over 1 GB are listed before anything is sent.
-//! - Project files (`.ecproj`, `.aep`) are never written: syncing the project is CR3's.
-//! - Afterwards it writes the server's env file (`EFFECTCRAFT_FONT_DIRS`, the Mac's
-//!   `EFFECTCRAFT_CJK_LOCALE`) and runs `cloud.preflight` there with the manifest.
-//! - `--watch SECS` keeps going: new imports in the app (`cloud.pendingUploads`) are uploaded and
-//!   confirmed (`cloud.markUploaded`), so the Mac renders them locally until they are there.
+//! Elias's upload quota costs money, so each file has a source (`project.dependencies`):
+//! - **Up to the upload limit (100 MB):** sent from the Mac over ssh, once. A file the server
+//!   already holds under another path (same sha256, in its hash store) is copied there instead.
+//!   The bytes are printed before anything is sent, and a running total is kept per day and per
+//!   machine (`~/Library/Caches/EffectCraft/cloud-uploads.jsonl`).
+//! - **Bigger:** never from the Mac (unless `--upload <file>` names it). The server pulls it from
+//!   the Google Drive share link in the project's sidecar (`cloud.driveLinks`, `<project>.cloud.json`)
+//!   with `effectcraft-cli drive-pull`, verified by size and sha256. Without a link the run lists
+//!   it: "upload these to Drive, paste the links".
+//! - **Previewed through a proxy:** only the proxy goes; the original stays on the Mac.
+//! - The project file is sent only when the server has none at its path; it is never replaced
+//!   (CR3 syncs edits, and the server's copy may be newer).
+//!
+//! Media and linked fonts go to the **same absolute paths** (`/Users/elias/...` on Linux); other
+//! font files go to one folder (`--font-dir`, read through `EFFECTCRAFT_FONT_DIRS`). One tar stream
+//! over ssh, written here (paths with spaces, no AppleDouble `._` files). Afterwards it writes the
+//! server's env file and runs `cloud.preflight` there. `--watch SECS` follows the app: new imports
+//! (`cloud.pendingUploads`) are sent and confirmed (`cloud.markUploaded`).
+//!
+//! The dedupe target is a [`Store`]: today the server's own hash store; a shared bucket can take
+//! its place later without changing the rest.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
@@ -31,6 +39,8 @@ const DEFAULT_FONT_DIR: &str = "/home/user/.local/share/fonts/mac";
 const DEFAULT_REMOTE_CLI: &str = "/workspace/effectcraft/target/local/effectcraft-cli";
 /// Where the server's shell environment for `serve` lives (`$HOME` there).
 const DEFAULT_ENV_FILE: &str = "$HOME/.config/effectcraft/cloud.env";
+/// The server's hash store (`cloud_assets` keeps it: path → size, mtime, sha256).
+const REMOTE_HASHES: &str = "$HOME/.cache/effectcraft/file-hashes.json";
 /// Remote output starts after this line (a login banner may come first).
 const MARK: &str = "@@EC-MIRROR@@";
 
@@ -47,6 +57,8 @@ pub fn run(args: &Args, json_out: bool) -> Result<(), Failure> {
         all: args.flag("--all"),
         verify_hash: args.flag("--verify-hash"),
         retime: args.flag("--retime"),
+        upload: args.opts("--upload").into_iter().map(str::to_string).collect(),
+        limit: args.num("--upload-limit-mb")?.map(|mb| (mb.max(0.0) * 1e6) as u64),
     };
     let watch = args.num("--watch")?.map(|s| Duration::from_secs_f64(s.clamp(1.0, 3600.0)));
     let mut backend = manifest_backend(args)?;
@@ -55,14 +67,15 @@ pub fn run(args: &Args, json_out: bool) -> Result<(), Failure> {
     let mut manifest: Manifest = serde_json::from_value(backend.exec("project.dependencies", json!({"hash": "small"}))?)
         .map_err(|e| Failure::Error(format!("project.dependencies: {e}")))?;
     let units = units_of(&manifest, &opts);
-    let report = sync(&ssh, &opts, &units, &manifest.host)?;
+    let report = sync(&ssh, &opts, &units, true)?;
     with_known_hashes(&mut manifest);
     if bridged && !opts.dry_run {
         mark(&mut backend, &report.confirmed, true)?;
     }
     let preflight = if opts.dry_run { Value::Null } else { remote_preflight(&ssh, &opts, &manifest)? };
     let mut out = json!({
-        "uploaded": report.uploaded, "bytes": report.bytes, "upToDate": report.up_to_date, "retimed": report.retimed,
+        "uploaded": report.uploaded, "bytes": report.bytes, "upToDate": report.up_to_date, "sameContent": report.same_content,
+        "copiedOnServer": report.copied, "fromDrive": report.from_drive, "needDriveLink": report.need_link,
         "missingOnMac": report.missing_on_mac, "nondeterministic": manifest.nondeterministic, "preflight": preflight,
     });
     if json_out {
@@ -90,14 +103,14 @@ pub fn run(args: &Args, json_out: bool) -> Result<(), Failure> {
         if pending["count"].as_u64().unwrap_or(0) == 0 {
             continue;
         }
-        // Fresh hashes and font names for what changed.
+        // Fresh hashes, links and font names for what changed.
         let mut manifest: Manifest = match backend.exec("project.dependencies", json!({"hash": "small"})).map(serde_json::from_value) {
             Ok(Ok(m)) => m,
             _ => continue,
         };
         let wanted: BTreeSet<&str> = pending["pending"].as_array().into_iter().flatten().filter_map(|p| p["path"].as_str()).collect();
         let units: Vec<Unit> = units_of(&manifest, &opts).into_iter().filter(|u| wanted.contains(u.src.as_str())).collect();
-        match sync(&ssh, &opts, &units, &manifest.host) {
+        match sync(&ssh, &opts, &units, false) {
             Ok(r) => {
                 with_known_hashes(&mut manifest);
                 mark(&mut backend, &r.confirmed, false)?;
@@ -141,6 +154,19 @@ struct Opts {
     all: bool,
     verify_hash: bool,
     retime: bool,
+    /// Big files Elias said may be uploaded from the Mac (paths or file names).
+    upload: Vec<String>,
+    /// `--upload-limit-mb` (else the sidecar's, else 100 MB).
+    limit: Option<u64>,
+}
+
+/// Where a unit comes from when the server lacks it.
+#[derive(Clone, Debug, PartialEq)]
+enum Source {
+    Mac,
+    Drive(String),
+    DriveFolders(Vec<String>),
+    NeedsLink,
 }
 
 /// One file to have on the server.
@@ -155,14 +181,38 @@ struct Unit {
     sha256: Option<String>,
     /// A font for the font folder: present when a file with its hash is there.
     font_folder: bool,
+    /// The project file: sent only when the server has none.
+    project: bool,
+    source: Source,
 }
 
 fn units_of(m: &Manifest, opts: &Opts) -> Vec<Unit> {
+    let limit = opts.limit.unwrap_or(m.upload_limit);
+    let allowed = |path: &str| {
+        opts.upload.iter().any(|u| u == path || std::path::Path::new(path).file_name().is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(u)))
+    };
+    let folders: Vec<String> = m.files.iter().filter(|f| f.source == "drive-folder").take(1).flat_map(|_| sidecar_folders(m)).collect();
     let mut out: BTreeMap<String, Unit> = BTreeMap::new();
-    for f in m.files.iter().filter(|f| f.exists && (f.used || opts.all)) {
+    for f in m.files.iter().filter(|f| f.exists && !f.proxied && (f.used || opts.all)) {
+        let source = match (&f.drive, f.source.as_str()) {
+            (Some(link), _) => Source::Drive(link.clone()),
+            _ if f.size <= limit || allowed(&f.path) => Source::Mac,
+            (None, "drive-folder") if !folders.is_empty() => Source::DriveFolders(folders.clone()),
+            (None, "mac") => Source::Mac,
+            _ => Source::NeedsLink,
+        };
         out.insert(
             f.path.clone(),
-            Unit { src: f.path.clone(), dest: f.path.clone(), size: f.size, mtime: f.mtime, sha256: f.sha256.clone(), font_folder: false },
+            Unit {
+                src: f.path.clone(),
+                dest: f.path.clone(),
+                size: f.size,
+                mtime: f.mtime,
+                sha256: f.sha256.clone(),
+                font_folder: false,
+                project: false,
+                source,
+            },
         );
     }
     for f in &m.fonts {
@@ -175,10 +225,29 @@ fn units_of(m: &Manifest, opts: &Opts) -> Vec<Unit> {
         let name = std::path::Path::new(file).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "font".into());
         out.insert(
             file.clone(),
-            Unit { src: file.clone(), dest: format!("{}/{name}", opts.font_dir), size, mtime, sha256: f.sha256.clone(), font_folder: true },
+            Unit {
+                src: file.clone(),
+                dest: format!("{}/{name}", opts.font_dir),
+                size,
+                mtime,
+                sha256: f.sha256.clone(),
+                font_folder: true,
+                project: false,
+                source: Source::Mac,
+            },
         );
     }
+    if let Some(p) = &m.project
+        && let Some((size, mtime)) = cloud_assets::stat(p)
+    {
+        out.insert(p.clone(), Unit { src: p.clone(), dest: p.clone(), size, mtime, sha256: None, font_folder: false, project: true, source: Source::Mac });
+    }
     out.into_values().collect()
+}
+
+/// The sidecar's shared folders (read on this Mac, next to the project).
+fn sidecar_folders(m: &Manifest) -> Vec<String> {
+    cloud_assets::read_sidecar(&|p| std::fs::read(p).ok(), m.project.as_deref()).drive_folders
 }
 
 #[derive(Default)]
@@ -186,66 +255,75 @@ struct Report {
     uploaded: usize,
     bytes: u64,
     up_to_date: usize,
-    retimed: usize,
+    same_content: usize,
+    copied: usize,
+    from_drive: usize,
+    /// Big files without a Drive link: (path, size).
+    need_link: Vec<Value>,
     missing_on_mac: Vec<String>,
     /// Mac path, size, mtime of every unit now on the server.
     confirmed: Vec<Value>,
 }
 
-fn sync(ssh: &Ssh, opts: &Opts, units: &[Unit], host: &cloud_assets::HostInfo) -> Result<Report, Failure> {
+fn confirm(report: &mut Report, u: &Unit) {
+    report.confirmed.push(json!({"path": u.src, "size": u.size, "mtime": u.mtime}));
+}
+
+/// Where files can be found by content instead of being sent again.
+trait Store {
+    /// A path on the server holding exactly these bytes.
+    fn locate(&self, sha256: &str, size: u64) -> Option<String>;
+}
+
+/// The server's own hash store: every file it hashed (preflight, Drive pulls, the mirror's sends).
+struct ServerStore {
+    by_hash: BTreeMap<(String, u64), String>,
+}
+
+impl Store for ServerStore {
+    fn locate(&self, sha256: &str, size: u64) -> Option<String> {
+        self.by_hash.get(&(sha256.to_ascii_lowercase(), size)).cloned()
+    }
+}
+
+fn sync(ssh: &Ssh, opts: &Opts, units: &[Unit], first: bool) -> Result<Report, Failure> {
     let mut report = Report::default();
-    let units: Vec<&Unit> = units
-        .iter()
-        .filter(|u| {
-            let project = u.dest.to_ascii_lowercase();
-            // Never a project file: the server's copy may be newer (CR3 syncs projects).
-            !(project.ends_with(".ecproj") || project.ends_with(".aep"))
-        })
-        .collect();
     if units.is_empty() {
         say("✅ nothing to mirror");
         return Ok(report);
     }
     say(&format!("🔎 checking {} file(s) on {}", units.len(), ssh.target));
-    let media: Vec<&Unit> = units.iter().copied().filter(|u| !u.font_folder).collect();
+    let media: Vec<&Unit> = units.iter().filter(|u| !u.font_folder).collect();
     let stats = ssh.stat(&media.iter().map(|u| u.dest.as_str()).collect::<Vec<_>>())?;
     let font_hashes = if units.iter().any(|u| u.font_folder) { ssh.font_hashes(&opts.font_dir)? } else { BTreeMap::new() };
     let taken: BTreeSet<String> = font_hashes.values().cloned().collect();
-    let mut send: Vec<Unit> = vec![];
-    let mut retime: Vec<&Unit> = vec![];
+    let mut need: Vec<Unit> = vec![];
     let mut same_size: Vec<&Unit> = vec![];
+    let mut retime: Vec<&Unit> = vec![];
     for (u, st) in media.iter().zip(stats) {
         match st {
+            // The server's project file is never replaced (CR3 keeps it current; it may be newer).
+            Some(_) if u.project => {}
             Some((size, mtime)) if size == u.size && mtime == u.mtime && !opts.verify_hash => {
                 report.up_to_date += 1;
-                report.confirmed.push(json!({"path": u.src, "size": u.size, "mtime": u.mtime}));
+                confirm(&mut report, u);
             }
             Some((size, _)) if size == u.size => same_size.push(u),
-            _ => send.push((*u).clone()),
+            _ => need.push((*u).clone()),
         }
     }
-    // Same size, other mtime (copied without keeping it): compare contents before sending GBs.
+    // Same size, other mtime (copied without keeping it): compare contents before sending anything.
     if !same_size.is_empty() {
         let remote = ssh.sha256(&same_size.iter().map(|u| u.dest.as_str()).collect::<Vec<_>>())?;
         for (u, theirs) in same_size.into_iter().zip(remote) {
             let mine = match u.sha256.clone().or_else(|| cloud_assets::cached_sha256(&u.src)) {
                 Some(h) => Some(h),
-                None => {
-                    say(&format!("#️⃣  hashing {} ({})", short(&u.src), gb(u.size)));
-                    let started = Instant::now();
-                    let mut last = Instant::now();
-                    cloud_assets::hash_file(&u.src, &mut |done| {
-                        if last.elapsed() > Duration::from_secs(1) {
-                            last = Instant::now();
-                            progress(&format!("   {} / {} · {:.0} MB/s", gb(done), gb(u.size), done as f64 / 1e6 / started.elapsed().as_secs_f64().max(0.001)));
-                        }
-                    })
-                }
+                None => hash_with_progress(&u.src, u.size),
             };
             if mine.is_some() && mine.as_deref().map(str::to_ascii_lowercase) == theirs {
                 retime.push(u);
             } else {
-                send.push(u.clone());
+                need.push(u.clone());
             }
         }
     }
@@ -253,86 +331,208 @@ fn sync(ssh: &Ssh, opts: &Opts, units: &[Unit], host: &cloud_assets::HostInfo) -
         let have = u.sha256.as_deref().map(str::to_ascii_lowercase).is_some_and(|h| font_hashes.contains_key(&h));
         if have {
             report.up_to_date += 1;
-            report.confirmed.push(json!({"path": u.src, "size": u.size, "mtime": u.mtime}));
+            confirm(&mut report, u);
         } else {
-            let mut u = (*u).clone();
+            let mut u = u.clone();
             // Another font of the same file name is there: keep both.
             if taken.contains(&u.dest) {
                 let tag: String = u.sha256.as_deref().unwrap_or("00000000").chars().take(8).collect();
                 let name = u.dest.rsplit('/').next().unwrap_or("font").to_string();
                 u.dest = format!("{}/{tag}-{name}", opts.font_dir);
             }
-            send.push(u);
+            need.push(u);
         }
     }
     // Same content: the server's preflight compares the hash (once; it remembers). `--retime` also
-    // sets the Mac's mtime there, so the next check is size + mtime alone; it is off by default
-    // because an app running there may reload footage whose mtime changed.
+    // sets the Mac's mtime there, so the next check is size + mtime alone; off by default because
+    // an app running there may reload footage whose mtime changed.
     if opts.retime && !retime.is_empty() && !opts.dry_run {
         ssh.retime(&retime.iter().map(|u| (u.dest.as_str(), u.mtime)).collect::<Vec<_>>())?;
     }
     for u in &retime {
-        report.retimed += 1;
-        report.confirmed.push(json!({"path": u.src, "size": u.size, "mtime": u.mtime}));
+        report.same_content += 1;
+        confirm(&mut report, u);
     }
-    // Files change on the Mac between the manifest and now: send what is there now.
-    send.retain(|u| match cloud_assets::stat(&u.src) {
+    // Files change on the Mac between the manifest and now: what is there now counts.
+    need.retain(|u| match cloud_assets::stat(&u.src) {
         Some(_) => true,
         None => {
             report.missing_on_mac.push(u.src.clone());
             false
         }
     });
-    for u in &mut send {
-        if let Some((size, mtime)) = cloud_assets::stat(&u.src) {
-            (u.size, u.mtime) = (size, mtime);
+    for u in &mut need {
+        if let Some((size, mtime)) = cloud_assets::stat(&u.src)
+            && (size, mtime) != (u.size, u.mtime)
+        {
+            (u.size, u.mtime, u.sha256) = (size, mtime, None);
         }
     }
-    let total: u64 = send.iter().map(|u| u.size).fold(0, u64::saturating_add);
-    say(&format!("📦 {} up to date, {} same content (other mtime), {} to send ({})", report.up_to_date, report.retimed, send.len(), gb(total)));
-    let mut big: Vec<&Unit> = send.iter().filter(|u| u.size > BIG_FILE).collect();
-    big.sort_by_key(|u| std::cmp::Reverse(u.size));
-    for u in &big {
-        say(&format!("   🐘 big file: {} ({})", short(&u.src), gb(u.size)));
+    let (mac, rest): (Vec<Unit>, Vec<Unit>) = need.into_iter().partition(|u| u.source == Source::Mac);
+    let (drive, no_link): (Vec<Unit>, Vec<Unit>) = rest.into_iter().partition(|u| matches!(u.source, Source::Drive(_) | Source::DriveFolders(_)));
+    for u in &no_link {
+        report.need_link.push(json!({"path": u.src, "size": u.size}));
     }
-    if send.is_empty() {
-        return Ok(report);
+    // Uploads: the content first, so the store can stand in for the Mac.
+    let mut mac = mac;
+    for u in mac.iter_mut().filter(|u| u.sha256.is_none()) {
+        u.sha256 = cloud_assets::hash_file(&u.src, &mut |_| {});
+    }
+    let store = ssh.store()?;
+    let (copies, send): (Vec<(Unit, String)>, Vec<Unit>) = {
+        let (mut c, mut s) = (vec![], vec![]);
+        for u in mac {
+            match u.sha256.as_deref().and_then(|h| store.locate(h, u.size)).filter(|p| *p != u.dest) {
+                Some(from) => c.push((u, from)),
+                None => s.push(u),
+            }
+        }
+        (c, s)
+    };
+    let send_bytes: u64 = send.iter().map(|u| u.size).fold(0, u64::saturating_add);
+    let drive_bytes: u64 = drive.iter().map(|u| u.size).fold(0, u64::saturating_add);
+    say(&format!(
+        "📦 {} up to date, {} same content (other mtime), {} copied from the server's own store, {} from Google Drive ({}), {} to upload from this Mac ({})",
+        report.up_to_date,
+        report.same_content,
+        copies.len(),
+        drive.len(),
+        gb(drive_bytes),
+        send.len(),
+        gb(send_bytes)
+    ));
+    if !no_link.is_empty() {
+        let list: Vec<String> = no_link.iter().map(|u| format!("{} ({})", short(&u.src), gb(u.size))).collect();
+        say(&format!(
+            "☁️  upload {} to Google Drive and paste the link{} (cloud.driveLinks): {}",
+            if no_link.len() == 1 { "this" } else { "these" },
+            if no_link.len() == 1 { "" } else { "s" },
+            list.join(", ")
+        ));
+    }
+    if !send.is_empty() {
+        let mut list: Vec<&Unit> = send.iter().collect();
+        list.sort_by_key(|u| std::cmp::Reverse(u.size));
+        say(&format!("⬆️  about to upload {} file(s), {} from this Mac:", send.len(), gb(send_bytes)));
+        for u in list.iter().take(12) {
+            say(&format!("   • {} ({})", short(&u.src), gb(u.size)));
+        }
+        if list.len() > 12 {
+            say(&format!("   • … {} more", list.len() - 12));
+        }
     }
     if opts.dry_run {
-        for u in &send {
-            say(&format!("   would send {} → {}", u.src, u.dest));
+        for (u, from) in &copies {
+            say(&format!("   would copy on the server {from} → {}", u.dest));
+        }
+        for u in &drive {
+            say(&format!("   would pull from Drive → {}", u.dest));
         }
         return Ok(report);
     }
-    let free = ssh.free_bytes()?;
     // Keep 1 GB free on the server (renders write caches and logs).
-    if total.saturating_add(BIG_FILE) > free {
+    let free = ssh.free_bytes()?;
+    let needed = send_bytes.saturating_add(drive_bytes).saturating_add(copies.iter().map(|(u, _)| u.size).sum());
+    if needed.saturating_add(BIG_FILE) > free {
         return Err(Failure::Error(format!(
             "the server has {} free and this needs {} (+1 GB headroom): free space there first, nothing was sent",
             gb(free),
-            gb(total)
+            gb(needed)
         )));
     }
-    // Small files first: fonts and stills are usable while the big clip is still on its way.
+    if !copies.is_empty() {
+        ssh.copy_within(&copies.iter().map(|(u, from)| (from.as_str(), u.dest.as_str(), u.mtime)).collect::<Vec<_>>())?;
+        report.copied = copies.len();
+    }
+    let mut arrived: Vec<Unit> = copies.into_iter().map(|(u, _)| u).collect();
+    if !drive.is_empty() {
+        let pulled = ssh.drive_pull(&opts.remote_cli, &drive)?;
+        report.from_drive = pulled.len();
+        arrived.extend(pulled);
+    }
+    // Small files first: fonts and stills are usable while bigger ones are on their way.
+    let mut send = send;
     send.sort_by_key(|u| u.size);
-    let sent = ssh.upload(&send)?;
+    let sent = if send.is_empty() { vec![] } else { ssh.upload(&send)? };
     report.uploaded = sent.len();
     report.bytes = sent.iter().map(|u| u.size).fold(0, u64::saturating_add);
+    if report.bytes > 0 || first {
+        say(&ledger(&ssh.target, report.bytes, sent.len()));
+    }
+    arrived.extend(sent);
     // What arrived: the same size and mtime as sent.
-    let media_sent: Vec<&Unit> = sent.iter().filter(|u| !u.font_folder).collect();
-    let after = ssh.stat(&media_sent.iter().map(|u| u.dest.as_str()).collect::<Vec<_>>())?;
-    for (u, st) in media_sent.iter().zip(after) {
+    let media_arrived: Vec<&Unit> = arrived.iter().filter(|u| !u.font_folder).collect();
+    let after = ssh.stat(&media_arrived.iter().map(|u| u.dest.as_str()).collect::<Vec<_>>())?;
+    let mut remember = vec![];
+    for (u, st) in media_arrived.iter().zip(after) {
         if st == Some((u.size, u.mtime)) {
-            report.confirmed.push(json!({"path": u.src, "size": u.size, "mtime": u.mtime}));
+            confirm(&mut report, u);
+            if let Some(h) = &u.sha256 {
+                remember.push(json!({"path": u.dest, "size": u.size, "mtime": u.mtime, "sha256": h}));
+            }
         } else {
             note(&format!("⚠️  {} didn't arrive complete; run mirror again", u.dest));
         }
     }
-    for u in sent.iter().filter(|u| u.font_folder) {
-        report.confirmed.push(json!({"path": u.src, "size": u.size, "mtime": u.mtime}));
+    for u in arrived.iter().filter(|u| u.font_folder) {
+        confirm(&mut report, u);
     }
-    let _ = host;
+    // The server's store learns what it now holds, so it is never sent again.
+    if !remember.is_empty() {
+        let _ = ssh.remote_exec(&opts.remote_cli, "cloud.rememberHashes", &json!({"files": remember}));
+    }
     Ok(report)
+}
+
+fn hash_with_progress(path: &str, size: u64) -> Option<String> {
+    say(&format!("#️⃣  hashing {} ({})", short(path), gb(size)));
+    let started = Instant::now();
+    let mut last = Instant::now();
+    cloud_assets::hash_file(path, &mut |done| {
+        if last.elapsed() > Duration::from_secs(1) {
+            last = Instant::now();
+            progress(&format!("   {} / {} · {:.0} MB/s", gb(done), gb(size), done as f64 / 1e6 / started.elapsed().as_secs_f64().max(0.001)));
+        }
+    })
+}
+
+/// Record this run's upload and say the running totals (today, this machine).
+fn ledger(target: &str, bytes: u64, files: usize) -> String {
+    let file = ledger_file();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    if bytes > 0
+        && let Some(f) = &file
+    {
+        if let Some(dir) = f.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(mut out) = std::fs::OpenOptions::new().create(true).append(true).open(f) {
+            let _ = writeln!(out, "{}", json!({"at": now, "target": target, "bytes": bytes, "files": files}));
+        }
+    }
+    let (mut today, mut machine) = (0u64, 0u64);
+    let day = now / 86_400;
+    if let Some(text) = file.and_then(|f| std::fs::read_to_string(f).ok()) {
+        for v in text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()) {
+            let b = v["bytes"].as_u64().unwrap_or(0);
+            if v["at"].as_u64().unwrap_or(0) / 86_400 == day {
+                today = today.saturating_add(b);
+            }
+            if v["target"] == target {
+                machine = machine.saturating_add(b);
+            }
+        }
+    }
+    format!("💸 uploaded from this Mac: {} now · {} today (UTC) · {} to this machine so far", gb(bytes), gb(today), gb(machine))
+}
+
+fn ledger_file() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME").filter(|h| !h.is_empty()).map(std::path::PathBuf::from)?;
+    Some(if cfg!(target_os = "macos") {
+        home.join("Library/Caches/EffectCraft/cloud-uploads.jsonl")
+    } else {
+        home.join(".cache/effectcraft/cloud-uploads.jsonl")
+    })
 }
 
 fn mark(b: &mut Backend, confirmed: &[Value], clear: bool) -> Result<(), Failure> {
@@ -537,6 +737,98 @@ impl Ssh {
     fn free_bytes(&self) -> Result<u64, Failure> {
         let out = self.run(&format!("echo {MARK}; df -B1 --output=avail / | tail -1"), &[])?;
         String::from_utf8_lossy(&out).trim().parse().map_err(|_| Failure::Error("cannot read the server's free space".into()))
+    }
+
+    /// The server's hash store, keeping only entries whose file is unchanged.
+    fn store(&self) -> Result<ServerStore, Failure> {
+        let out = self.run(&format!("echo {MARK}; cat {REMOTE_HASHES} 2>/dev/null || echo '{{}}'"), &[])?;
+        let map: BTreeMap<String, (u64, i64, String)> = serde_json::from_slice(&out).unwrap_or_default();
+        let paths: Vec<&str> = map.keys().map(String::as_str).collect();
+        let stats = self.stat(&paths)?;
+        let mut by_hash = BTreeMap::new();
+        for ((path, (size, mtime, sha)), st) in map.iter().zip(stats) {
+            if st == Some((*size, *mtime)) {
+                by_hash.insert((sha.to_ascii_lowercase(), *size), path.clone());
+            }
+        }
+        Ok(ServerStore { by_hash })
+    }
+
+    /// Copy files the server already holds to the paths the project wants, with the Mac's mtime.
+    fn copy_within(&self, files: &[(&str, &str, i64)]) -> Result<(), Failure> {
+        let mut list = vec![];
+        for (from, to, t) in files {
+            for part in [from.to_string(), to.to_string(), t.to_string()] {
+                list.extend_from_slice(part.as_bytes());
+                list.push(0);
+            }
+        }
+        say(&format!("📎 copying {} file(s) the server already has (no upload)", files.len()));
+        self.run(
+            &format!(
+                "while IFS= read -r -d '' f && IFS= read -r -d '' d && IFS= read -r -d '' t; do mkdir -p \"$(dirname \"$d\")\" && cp -- \"$f\" \"$d.ec-part\" && touch -m -d \"@$t\" -- \"$d.ec-part\" && mv -f -- \"$d.ec-part\" \"$d\"; done; echo {MARK}"
+            ),
+            &list,
+        )?;
+        Ok(())
+    }
+
+    /// Run `effectcraft-cli drive-pull` there for these files (its progress shows here). Returns
+    /// the files that arrived verified.
+    fn drive_pull(&self, cli: &str, files: &[Unit]) -> Result<Vec<Unit>, Failure> {
+        let mut files = files.to_vec();
+        // The Mac's sha256 makes the check exact (hashed once, then remembered).
+        for u in files.iter_mut().filter(|u| u.sha256.is_none()) {
+            u.sha256 = cloud_assets::cached_sha256(&u.src).or_else(|| hash_with_progress(&u.src, u.size));
+        }
+        let jobs: Vec<Value> = files
+            .iter()
+            .map(|u| {
+                let mut j = json!({"dest": u.dest, "name": short_name(&u.src), "size": u.size, "mtime": u.mtime, "sha256": u.sha256});
+                match &u.source {
+                    Source::Drive(link) => j["link"] = json!(link),
+                    Source::DriveFolders(folders) => j["folders"] = json!(folders),
+                    _ => {}
+                }
+                j
+            })
+            .collect();
+        let jobs_file = "/tmp/effectcraft-drive-jobs.json";
+        let body = serde_json::to_vec(&jobs).map_err(|e| Failure::Error(e.to_string()))?;
+        say(&format!("☁️  the server pulls {} file(s) from Google Drive (nothing leaves this Mac)", files.len()));
+        let mut child = self
+            .command(&format!(
+                "cat > {jf}; cli={cli}; if [ ! -x \"$cli\" ]; then echo {MARK}; echo '{{\"results\":[]}}'; echo \"no effectcraft-cli at $cli\" >&2; exit 0; fi; out=$(\"$cli\" drive-pull --jobs {jf}); echo {MARK}; echo \"$out\"",
+                jf = sh_quote(jobs_file),
+                cli = sh_quote(cli)
+            ))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|e| Failure::Error(format!("ssh: {e}")))?;
+        if let Some(mut pipe) = child.stdin.take() {
+            let _ = pipe.write_all(&body);
+        }
+        let out = child.wait_with_output().map_err(|e| Failure::Error(format!("ssh: {e}")))?;
+        let text = String::from_utf8_lossy(&after_mark(&out.stdout)).into_owned();
+        let v: Value = text.lines().rev().find_map(|l| serde_json::from_str(l).ok()).unwrap_or(Value::Null);
+        let ok: BTreeSet<&str> = v["results"].as_array().into_iter().flatten().filter(|r| r["ok"] == true).filter_map(|r| r["dest"].as_str()).collect();
+        Ok(files.iter().filter(|u| ok.contains(u.dest.as_str())).cloned().collect())
+    }
+
+    /// Run one engine command there in an empty session (`exec … --json`).
+    fn remote_exec(&self, cli: &str, command: &str, params: &Value) -> Result<Value, Failure> {
+        let body = serde_json::to_vec(params).map_err(|e| Failure::Error(e.to_string()))?;
+        let out = self.run(
+            &format!(
+                "f=$(mktemp); cat > \"$f\"; out=$({cli} exec {command} --empty --params \"$(cat \"$f\")\" --json 2>/dev/null); rm -f \"$f\"; echo {MARK}; echo \"$out\"",
+                cli = sh_quote(cli),
+                command = sh_quote(command)
+            ),
+            &body,
+        )?;
+        Ok(String::from_utf8_lossy(&out).lines().rev().find_map(|l| serde_json::from_str(l).ok()).unwrap_or(Value::Null))
     }
 
     /// Stream the files as one tar archive into `tar -x` there. Returns the files sent whole.
@@ -750,6 +1042,10 @@ fn gb(bytes: u64) -> String {
     } else {
         format!("{:.0} KB", (b / 1e3).ceil())
     }
+}
+
+fn short_name(path: &str) -> String {
+    path.rsplit('/').next().unwrap_or(path).to_string()
 }
 
 /// The last two path components.
