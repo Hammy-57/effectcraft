@@ -221,13 +221,13 @@ fn achieved_frame_rate_and_real_time() {
     let mut p = effectcraft_ui_egui::Playback { playing: true, fps: 24.0, ..Default::default() };
     assert_eq!(p.achieved_fps(), None);
     for i in 0..25 {
-        p.frame_shown(i as f64 / 24.0);
+        p.frame_shown(i as f64 / 24.0, i);
     }
     assert!((p.achieved_fps().unwrap() - 24.0).abs() < 1e-9);
     assert_eq!(p.real_time(), Some(true));
     let mut slow = effectcraft_ui_egui::Playback { playing: true, fps: 24.0, ..Default::default() };
     for i in 0..13 {
-        slow.frame_shown(i as f64 / 12.0);
+        slow.frame_shown(i as f64 / 12.0, i);
     }
     assert_eq!(slow.real_time(), Some(false));
     assert_eq!(slow.shown_at.len(), 13, "only the last second counts");

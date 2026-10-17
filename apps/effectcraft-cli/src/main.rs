@@ -52,6 +52,7 @@
 use std::io::Write;
 
 mod asset_guard;
+mod drive;
 mod figma_bridge;
 mod frame_serve;
 mod mirror;
@@ -144,6 +145,8 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
   mcp [--autosave] [--bridge [PORT] | --ui] MCP server (JSON-RPC over stdio); --autosave preserves unsaved work
                                            (headless or --ui; a bridged app owns its auto-saves);
                                            --bridge without a port uses EFFECTCRAFT_CONTROL_PORT, else 9877;
+                                           --render-box PORT sends renders and lint to a render box
+                                           (serve --follow), edits still to the app;
                                            --ui [--ui-size 1680x1020] [--ui-scale 2] runs the app offscreen
                                            (no window) so screenshot and the ui_* tools work;
                                            --all-tools also lists the older tool aliases;
@@ -152,14 +155,17 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
       [--automation-read-root DIR] [--automation-write-root DIR]
                                            confine the agent's file access: reads under a read or write root,
                                            writes under a write root (each repeatable); scripts are refused
-  serve [F.ecproj | --demo] [--control PORT] [--gpu] [--frames PORT [--token T]]
+  serve [F.ecproj | --demo | --follow APP_PORT] [--control PORT] [--gpu] [--frames PORT [--token T]]
                                            a windowless host: one project that several agents work on at
                                            once over the control channel (join with mcp --bridge PORT or
                                            the MCP hosts tool); prints the port; checkpoints unsaved work;
                                            in the host list until it stops (host.release saves and stops it);
                                            --frames PORT also serves viewer frames to a desktop app over the
                                            binary frame channel (loopback: reach it through an SSH tunnel),
-                                           token from --token, EFFECTCRAFT_FRAME_TOKEN or <config>/frame-server-token
+                                           token from --token, EFFECTCRAFT_FRAME_TOKEN or <config>/frame-server-token;
+                                           --follow APP_PORT makes it a render box: a read-only mirror of the
+                                           app on that control port that agents render and lint on
+                                           (mcp --bridge APP_PORT --render-box PORT), off the app's GPU work
   frames-bench --frames HOST:PORT [--token T] [F.ecproj | --demo] [--comp ID] [--scale S] [--max-side PX]
       [--jpeg-quality Q] [--n N] [--duration SECS]
                                            measure a frame server: round trips, scrub latency, a soak of
@@ -190,6 +196,8 @@ const VALUED: &[&str] = &[
     "--params",
     "--project",
     "--bridge",
+    "--render-box",
+    "--follow",
     "--client",
     "--save-as",
     "--filter",
@@ -245,6 +253,9 @@ const VALUED: &[&str] = &[
     "--remote-cli",
     "--env-file",
     "--watch",
+    "--jobs",
+    "--upload",
+    "--upload-limit-mb",
     // mcp
     "--automation-read-root",
     "--automation-write-root",
@@ -461,7 +472,14 @@ fn backend(args: &Args, default_demo: bool) -> Result<Backend, Failure> {
         if args.project.is_some() || args.flag("--demo") {
             return usage_err("--bridge drives the running app's project; use `exec file.open` to open another");
         }
-        return Ok(Backend::bridge(addr)?);
+        let b = Backend::bridge(addr)?;
+        return Ok(match args.opt("--render-box") {
+            Some(r) => b.with_render_box(r)?,
+            None => b,
+        });
+    }
+    if args.opt("--render-box").is_some() {
+        return usage_err("--render-box needs --bridge PORT: the box mirrors a running app");
     }
     if args.flag("--ui") {
         return offscreen_backend(args, default_demo);
@@ -879,7 +897,10 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
             let f = b.render_with(comp.as_ref(), time, max_side, args.flag("--transparent"))?;
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
             std::fs::write(&out, &f.png).map_err(|e| format!("cannot write {out}: {e}"))?;
-            let info = json!({"path": out, "comp": f.comp, "time": f.time, "width": f.width, "height": f.height, "ms": (ms * 10.0).round() / 10.0});
+            let mut info = json!({"path": out, "comp": f.comp, "time": f.time, "width": f.width, "height": f.height, "ms": (ms * 10.0).round() / 10.0});
+            if let Some(on) = &f.rendered_on {
+                info["renderedOn"] = json!(on);
+            }
             if json_out {
                 emit(&info, true);
             } else {
@@ -961,10 +982,20 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
                 }
                 Ok(s)
             });
-            let config = effectcraft_automation::host_server::HostConfig { port, config_dir: effectcraft_host::config_dir() };
+            let follow = match args.opt("--follow") {
+                Some(p) => Some(p.parse::<u16>().map_err(|_| Failure::Usage(format!("--follow: `{p}` is not a port")))?),
+                None => None,
+            };
+            if follow.is_some() && (args.project.is_some() || args.flag("--demo")) {
+                return usage_err("--follow mirrors the app's project; leave out --project / --demo");
+            }
+            let config = effectcraft_automation::host_server::HostConfig { port, config_dir: effectcraft_host::config_dir(), follow };
             effectcraft_automation::host_server::serve(config, make, |port| {
                 let _ = control_port.set(port);
-                println!("EffectCraft host listening on 127.0.0.1:{port} (agents: effectcraft-cli mcp --bridge {port})");
+                match follow {
+                    Some(app) => println!("EffectCraft render box listening on 127.0.0.1:{port}, following the app on {app} (agents: effectcraft-cli mcp --bridge {app} --render-box {port})"),
+                    None => println!("EffectCraft host listening on 127.0.0.1:{port} (agents: effectcraft-cli mcp --bridge {port})"),
+                }
             })
             .map_err(|e| Failure::Error(format!("serve: {e}")))?;
             if let Some(f) = frames {
@@ -973,6 +1004,7 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
         }
         "frames-bench" => frame_serve::bench(args)?,
         "mirror" => mirror::run(args, json_out)?,
+        "drive-pull" => drive::run(args)?,
         other => return usage_err(&format!("unknown subcommand `{other}`")),
     }
     Ok(())

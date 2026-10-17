@@ -1407,6 +1407,7 @@ impl EffectcraftApp {
             token: &self.cloud_token.1,
             revision: self.session.revision,
             project: &self.session.project,
+            path: self.session.path.as_deref(),
             comp,
             last_ms,
         };

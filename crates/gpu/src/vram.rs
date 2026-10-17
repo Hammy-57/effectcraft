@@ -6,13 +6,59 @@
 /// Overrides the detected video memory, in MiB.
 pub const VRAM_ENV: &str = "EFFECTCRAFT_GPU_VRAM_MB";
 
+/// A hard ceiling on this process's video memory, in MiB: a render box next to the user's app
+/// (`effectcraft-cli serve --follow`). Creating a texture or buffer past it fails with an
+/// out-of-memory error, so the frame renders on the CPU instead of taking memory from the app.
+/// wgpu checks a share of the budget the driver gives this process (Vulkan, Direct3D 12), which
+/// is about what the card has free: the share is the cap's part of what is free when the device
+/// is made, so the ceiling is the cap then, and shrinks while other programs take more.
+pub const VRAM_CAP_ENV: &str = "EFFECTCRAFT_GPU_VRAM_CAP_MB";
+
 /// Memory budget thresholds for the instances this crate creates: on Vulkan (with
 /// `VK_EXT_memory_budget`) and Direct3D 12, creating a texture or buffer past 90 % of the budget
 /// the driver reports fails with an out-of-memory error the frame's error scope catches (the frame
 /// then renders on the CPU and fewer GPU frames run at once), instead of overcommitting video
 /// memory until the device is lost.
 pub fn memory_budget_thresholds() -> wgpu::MemoryBudgetThresholds {
-    wgpu::MemoryBudgetThresholds { for_resource_creation: Some(90), for_device_loss: None }
+    wgpu::MemoryBudgetThresholds { for_resource_creation: Some(creation_percent()), for_device_loss: None }
+}
+
+/// The share of the driver's budget resources may take: 90 %, or [`VRAM_CAP_ENV`]'s share of
+/// the card's free memory now.
+fn creation_percent() -> u8 {
+    static PERCENT: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *PERCENT.get_or_init(|| {
+        let Some(cap) = std::env::var(VRAM_CAP_ENV).ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|mb| *mb > 0) else { return 90 };
+        match card_free_mib() {
+            Some(free) => {
+                let percent = cap_percent(cap, free);
+                log::info!("gpu: video memory capped at {cap} MiB, {free} MiB free ({percent} % of the driver's budget)");
+                percent
+            }
+            None => {
+                log::warn!("gpu: {VRAM_CAP_ENV} is set but the card's memory is unknown; not capped");
+                90
+            }
+        }
+    })
+}
+
+/// `cap` MiB as a whole percentage of `free` MiB, 1 to 90.
+fn cap_percent(cap: u64, free: u64) -> u8 {
+    u8::try_from((cap.saturating_mul(100) / free.max(1)).clamp(1, 90)).unwrap_or(90)
+}
+
+/// The card's free video memory in MiB as its driver tool reports it (the largest card),
+/// ignoring [`VRAM_ENV`].
+#[cfg(not(target_arch = "wasm32"))]
+fn card_free_mib() -> Option<u64> {
+    let out = nvidia_smi()?;
+    out.lines().filter_map(|l| parse_nvidia_smi(l, 0)).map(|m| m.free >> 20).max().filter(|f| *f > 0)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn card_free_mib() -> Option<u64> {
+    None
 }
 
 /// A discrete GPU's video memory, in bytes.
@@ -171,6 +217,15 @@ mod tests {
         assert_eq!(parse_nvidia_smi("", 0x2204), None);
         assert_eq!(parse_nvidia_smi("NVIDIA-SMI has failed\n", 0x2204), None);
         assert_eq!(parse_nvidia_smi("0x220410DE, [N/A], 3\n", 0x2204), None);
+    }
+
+    #[test]
+    fn a_cap_is_a_share_of_the_card() {
+        assert_eq!(cap_percent(5120, 24576), 20);
+        assert_eq!(cap_percent(4096, 24576), 16);
+        assert_eq!(cap_percent(100, 24576), 1, "at least 1 %");
+        assert_eq!(cap_percent(50_000, 24576), 90, "never above the default");
+        assert_eq!(cap_percent(1, 0), 90);
     }
 
     #[test]

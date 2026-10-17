@@ -1481,7 +1481,9 @@ dependencies = [
  "effectcraft-time",
  "effectcraft-ui-egui",
  "image",
+ "rustls-rustcrypto",
  "serde_json",
+ "ureq",
 ]
 
 [[package]]
