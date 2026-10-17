@@ -364,6 +364,7 @@ pub fn test(args: &Args) -> Result<(), Failure> {
         ahead_secs: args.num("--ahead").map_err(Failure::Usage)?.unwrap_or(4.0) as f32,
         adaptive: !args.flag("--fixed"),
         max_size: max_side.map(|m| [m, m]),
+        cache: None,
     });
     client.send(Up::Msg { msg, want: Want::default(), urgent: false }, vec![]);
 

@@ -100,6 +100,10 @@ pub enum StreamMsg {
         /// Largest frame sent (the viewer's size); frames are scaled to fit.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_size: Option<[u32; 2]>,
+        /// The viewer's frame series at `revision` (its keys): the server takes full-size frames
+        /// from its frame cache and keeps the ones it renders there.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache: Option<crate::remote::CacheSeries>,
     },
     /// The playhead jumped: play from `time`.
     Seek {

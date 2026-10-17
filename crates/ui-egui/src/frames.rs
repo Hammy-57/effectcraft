@@ -597,6 +597,27 @@ pub trait RemoteFrames: Send + Sync {
     fn disk_contains(&self, _key: u128) -> bool {
         false
     }
+    /// Bumps whenever [`RemoteFrames::disk_contains`] may answer differently (the cache bar looks
+    /// again); 0 when the bar follows the RAM cache.
+    fn disk_generation(&self) -> u64 {
+        0
+    }
+    /// Render a plan's frames into the renderer's own frame cache and send none here (the cloud
+    /// server's, CR8: Cache Frames When Idle without downloading). `false`: it can't.
+    fn precache(&self, _plan: RemotePrecache) -> bool {
+        false
+    }
+}
+
+/// A [`RemoteFrames::precache`] plan: frames of a comp at a revision, by their keys.
+pub struct RemotePrecache {
+    pub project: Arc<Project>,
+    pub revision: u64,
+    pub comp: ItemId,
+    pub series: effectcraft_engine::remote::CacheSeries,
+    pub opts: RenderOpts,
+    /// Inclusive frame ranges, in the order they render.
+    pub ranges: Vec<(i64, i64)>,
 }
 
 /// Whether a comp (or a comp it nests) has a layer with enabled effects.
@@ -1284,12 +1305,15 @@ impl Frames {
     /// no blue frames until the content key is ready; hashing never blocks timeline painting.
     pub fn disk_frames(&self, src: &RenderSource, base: &FrameKey, frames: i64, opts: &RenderOpts) -> Vec<i64> {
         let remote = self.remote.as_ref().filter(|r| r.disk());
-        let contains = |k: u128| match (&src.disk, remote) {
-            (Some(dc), _) => dc.contains(disk_cache::Kind::Frame, k),
+        let local = src.disk.as_ref();
+        // The cloud's frame cache (CR8) counts with this Mac's disk cache: either holds the frame.
+        let server = remote.filter(|r| r.eager());
+        let contains = |k: u128| match (local, remote) {
+            (Some(dc), _) => dc.contains(disk_cache::Kind::Frame, k) || server.is_some_and(|r| r.disk_contains(k)),
             (None, Some(r)) => r.disk_contains(k),
             (None, None) => false,
         };
-        if src.disk.is_none() && remote.is_none() {
+        if local.is_none() && remote.is_none() {
             return vec![];
         }
         let oh = opts_hash(opts);
@@ -1299,11 +1323,11 @@ impl Frames {
         // milliseconds per repaint on long comps. The remote disk cache has no generation of its
         // own: it gets its frames with the RAM cache's.
         let series = FrameKey { frame: 0, ..*base };
-        let generation = match &src.disk {
+        let generation = match local {
             Some(dc) => dc.generation(),
             None => self.cache.lock().map(|c| c.generation).unwrap_or(0),
-        };
-        let k = [base.revision, frames as u64, oh, generation, u64::from(src.disk.is_some())];
+        } ^ remote.map_or(0, |r| r.disk_generation().rotate_left(32));
+        let k = [base.revision, frames as u64, oh, generation, u64::from(local.is_some())];
         let ram = self.cached_frames(base);
         let in_ram = |f: &i64| ram.binary_search(f).is_ok();
         if let Ok(bar) = self.bar.lock()
@@ -1334,45 +1358,37 @@ impl Frames {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn request_content_key(&self, project: Arc<Project>, revision: u64, comp: u64) {
-        let mut jobs = self.content_key_jobs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Coalesce rapid edits. One worker hashes at most one revision at a time; retained
-        // snapshots are bounded even with multiple timelines open.
-        jobs.pending.retain(|(_, _, c)| *c != comp);
-        if jobs.pending.len() >= 8 {
-            jobs.pending.pop_front();
-        }
-        jobs.pending.push_back((project, revision, comp));
-        if jobs.running {
-            return;
-        }
-        jobs.running = true;
-        drop(jobs);
-        let (jobs, keys, ctx) = (self.content_key_jobs.clone(), self.content_keys.clone(), self.ctx.clone());
-        let work = move || loop {
-            let next = {
-                let mut jobs = jobs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                let next = jobs.pending.pop_back();
-                if next.is_none() {
-                    jobs.running = false;
-                }
-                next
-            };
-            let Some((project, revision, comp)) = next else { return };
-            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| content_key(&keys, &project, revision, comp))).is_err() {
-                log::error!("could not compute a preview disk-cache key; the cache indicator will retry");
-            }
-            if let Some(ctx) = &ctx {
-                ctx.request_repaint();
-            }
-        };
-        match &self.pool {
-            Some(pool) => pool.spawn(work),
-            None => rayon::spawn(work),
-        }
+        request_content_key(&self.content_key_jobs, &self.content_keys, self.ctx.as_ref(), self.pool.as_ref(), project, revision, comp);
     }
 
     /// Change the RAM preview cache budget (Settings ▸ Memory & CPU), evicting the oldest
     /// frames when it shrinks.
+    /// The frame series of `base` with `opts` as a frame cache names it, once its content key is
+    /// known (native: a worker computes it, the UI thread never hashes the comp).
+    pub fn cache_series(&self, project: &Arc<Project>, base: &FrameKey, opts: &RenderOpts) -> Option<effectcraft_engine::remote::CacheSeries> {
+        #[cfg(not(target_arch = "wasm32"))]
+        let content = {
+            let known = self.content_keys.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&(base.revision, base.comp)).copied();
+            if known.is_none() {
+                self.request_content_key(project.clone(), base.revision, base.comp);
+            }
+            known?
+        };
+        #[cfg(target_arch = "wasm32")]
+        let content = content_key(&self.content_keys, project, base.revision, base.comp);
+        Some(effectcraft_engine::remote::CacheSeries::new(content, base.scale, base.view ^ opts_hash(opts)))
+    }
+
+    /// Cache Frames When Idle with the cloud renderer (CR8): the server renders `ranges` of
+    /// `base`'s series into its own frame cache; nothing comes here. `None`: the renderer has no
+    /// frame cache (cache here as usual); `Some(false)`: not sent yet (the content key is on its
+    /// way, or the link isn't ready), try again shortly.
+    pub fn precache_remote(&self, src: &RenderSource, base: &FrameKey, comp: ItemId, opts: RenderOpts, ranges: Vec<(i64, i64)>) -> Option<bool> {
+        let remote = self.remote.as_ref().filter(|r| r.eager() && r.disk())?;
+        let Some(series) = self.cache_series(&src.project, base, &opts) else { return Some(false) };
+        Some(remote.precache(RemotePrecache { project: src.project.clone(), revision: base.revision, comp, series, opts, ranges }))
+    }
+
     pub fn set_budget(&self, bytes: usize) {
         if let Ok(mut c) = self.cache.lock() {
             c.budget = bytes;
@@ -1498,8 +1514,9 @@ impl Frames {
     /// caller tries again later).
     pub fn request_to_disk(&self, src: &RenderSource, key: FrameKey, comp: ItemId, t: Tick, opts: RenderOpts) -> bool {
         let Some(dc) = &src.disk else { return false };
-        // A remote renderer without a disk cache (the cloud) would put the frame in RAM.
-        if cfg!(not(target_arch = "wasm32")) && self.remote_active() && !self.remote_disk() {
+        // A remote renderer without a disk cache would put the frame in RAM; the cloud keeps its
+        // own ([`Frames::precache_remote`]).
+        if cfg!(not(target_arch = "wasm32")) && self.remote_active() && (!self.remote_disk() || self.remote.as_ref().is_some_and(|r| r.eager())) {
             return false;
         }
         if self.is_cached(&key) || self.failed(&key) {
@@ -1652,6 +1669,8 @@ impl Frames {
             times: self.times.clone(),
             playback_budget: self.playback_budget.clone(),
             content_keys: self.content_keys.clone(),
+            #[cfg(not(target_arch = "wasm32"))]
+            content_key_jobs: self.content_key_jobs.clone(),
             gpu_retired: self.gpu_retired.clone(),
             gpu_gate: self.gpu_gate.clone(),
             epoch: self.epoch.clone(),
@@ -1777,6 +1796,55 @@ impl Frames {
 /// would come out of the frame worker's time.
 const DISK_MIN_RENDER: std::time::Duration = std::time::Duration::from_millis(25);
 
+/// Compute a comp's content key on a worker ([`Frames::request_content_key`]).
+#[cfg(not(target_arch = "wasm32"))]
+fn request_content_key(
+    jobs: &Arc<Mutex<ContentKeyJobs>>,
+    keys: &ContentKeys,
+    ctx: Option<&egui::Context>,
+    pool: Option<&Arc<workers::Workers>>,
+    project: Arc<Project>,
+    revision: u64,
+    comp: u64,
+) {
+    let mut g = jobs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Coalesce rapid edits. One worker hashes at most one revision at a time; retained
+    // snapshots are bounded even with multiple timelines open.
+    g.pending.retain(|(_, _, c)| *c != comp);
+    if g.pending.len() >= 8 {
+        g.pending.pop_front();
+    }
+    g.pending.push_back((project, revision, comp));
+    if g.running {
+        return;
+    }
+    g.running = true;
+    drop(g);
+    let (jobs, keys, ctx) = (jobs.clone(), keys.clone(), ctx.cloned());
+    let work = move || loop {
+        let next = {
+            let mut jobs = jobs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let next = jobs.pending.pop_back();
+            if next.is_none() {
+                jobs.running = false;
+            }
+            next
+        };
+        let Some((project, revision, comp)) = next else { return };
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| content_key(&keys, &project, revision, comp))).is_err() {
+            log::error!("could not compute a preview disk-cache key; the cache indicator will retry");
+        }
+        if let Some(ctx) = &ctx {
+            ctx.request_repaint();
+        }
+    };
+    match pool {
+        Some(pool) => pool.spawn(work),
+        None => rayon::spawn(work),
+    }
+}
+
+
 /// Whether a freshly rendered frame goes to the disk cache: only frames that were expensive to
 /// render, and no prefetch frame while more prefetch is queued (playback and RAM preview keep the
 /// workers busy; there compression would slow the frames being waited for). The viewer's frame
@@ -1797,6 +1865,8 @@ struct Worker {
     times: Arc<times::RenderTimes>,
     playback_budget: Arc<Mutex<crate::playback_budget::Budget>>,
     content_keys: ContentKeys,
+    #[cfg(not(target_arch = "wasm32"))]
+    content_key_jobs: Arc<Mutex<ContentKeyJobs>>,
     gpu_retired: Arc<AtomicBool>,
     gpu_gate: Arc<vram::Gate>,
     epoch: Arc<AtomicU64>,
@@ -2089,6 +2159,19 @@ impl Worker {
     /// Hand queued frames to the remote renderer while it has free slots, most important first
     /// (see [`Frames::dispatch_remote`]). Native completions call it again, so the next frame
     /// leaves as soon as a slot frees up rather than at the next UI frame (CR5).
+    /// A frame's disk key when its comp's content key is known; else a worker computes it (the
+    /// next frames carry it) and this is `None`.
+    fn known_disk_key(&self, project: &Arc<Project>, key: &FrameKey, opts: &RenderOpts) -> Option<u128> {
+        let known = self.content_keys.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&(key.revision, key.comp)).copied();
+        #[cfg(not(target_arch = "wasm32"))]
+        if known.is_none() {
+            request_content_key(&self.content_key_jobs, &self.content_keys, self.ctx.as_ref(), self.pool.as_ref(), project.clone(), key.revision, key.comp);
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = project;
+        Some(disk_cache::frame_key(known?, key.frame, key.scale, key.view ^ opts_hash(opts)))
+    }
+
     fn dispatch_remote(&self, link: &RemoteLink) -> usize {
         // A completion that runs inside `start` (a renderer answering at once) is inside this
         // loop already: the loop hands out the slot it freed.
@@ -2119,7 +2202,7 @@ impl Worker {
                 q.remote_running.insert(job.key, job.cancel.clone());
                 job
             };
-            if job.disk_only && !remote.disk() {
+            if job.disk_only && (!remote.disk() || remote.eager()) {
                 // Queued for this machine's disk cache before the frames went remote.
                 self.release(job.key, job.urgent);
                 continue;
@@ -2142,7 +2225,13 @@ impl Worker {
             started += 1;
             let (key, urgent, epoch) = (job.key, job.urgent, job.epoch);
             let t0 = web_time::Instant::now();
-            let disk_key = remote.disk().then(|| frame_disk_key(&self.content_keys, &job.src.project, &key, opts_hash(&job.opts)));
+            // The cloud (eager) never hashes the comp here (this may be the UI thread): its key
+            // goes along once a worker has the content key.
+            let disk_key = if remote.eager() {
+                self.known_disk_key(&job.src.project, &key, &job.opts)
+            } else {
+                remote.disk().then(|| frame_disk_key(&self.content_keys, &job.src.project, &key, opts_hash(&job.opts)))
+            };
             let fw = self.clone();
             let refined = {
                 let fw = self.clone();

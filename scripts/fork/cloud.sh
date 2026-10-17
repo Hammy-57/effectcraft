@@ -188,6 +188,12 @@ if [ "$skip" = 0 ]; then
   cd /workspace
   [ -f "$HOME/.config/effectcraft/cloud.env" ] && . "$HOME/.config/effectcraft/cloud.env"
   export EFFECTCRAFT_FONT_DIRS EFFECTCRAFT_CJK_LOCALE
+  # CR8: the server frame cache sized by ec-tune (machine-tune.json "serve"); without it serve takes 85 % of the container less 8 GB.
+  for mt in /home/user/.config/effectcraft/machine-tune.json "$HOME/.config/effectcraft/machine-tune.json"; do
+    [ -f "$mt" ] || continue
+    eval "$(python3 -c "import json,shlex,sys; s=json.load(open(sys.argv[1])).get(\"serve\") or {}; [print(f\"export {k}={shlex.quote(str(s[j]))}\") for k,j in ((\"EFFECTCRAFT_SERVER_FRAMES_MB\",\"framesMb\"),(\"EFFECTCRAFT_SERVER_FRAMES_DISK_GB\",\"framesDiskGb\"),(\"EFFECTCRAFT_SERVER_FRAMES_DIR\",\"framesDir\")) if j in s]" "$mt" 2>/dev/null)"
+    break
+  done
   EFFECTCRAFT_FRAME_TOKEN="$token" EFFECTCRAFT_FRAME_GPU_SLOTS=4 WGPU_BACKEND=vulkan RUST_LOG=info \
     setsid nohup "$cli" serve --gpu --frames "$fp" >/workspace/cloud-serve-$fp.log 2>&1 </dev/null &
   echo $! >"$pidf"; echo "$commit" >"$stampf"
@@ -360,6 +366,8 @@ cmd_status() {
     ins="$(app_call ui.inspect '{}' || true)"
     say "🍎 app: Preview On = $(printf '%s' "$pv" | jq -r '.result | if type=="object" then .value else . end' 2>/dev/null || echo '?'), pending uploads: $(printf '%s' "$pend" | jq -r '.result.count // "?"' 2>/dev/null || echo '?') ($(printf '%s' "$pend" | jq -r '(.result.bytes // 0) / 1048576 | floor' 2>/dev/null || echo '?') MB)"
     say "   link: $(printf '%s' "$ins" | jq -r '.result.cloud | "connected=\(.connected) ready=\(.ready) rtt=\(.rttMs // "-") ms frames=\(.frames) gpu=\(.gpu // "-")"' 2>/dev/null || echo 'unknown')"
+    say "   📶 internet this session: $(printf '%s' "$ins" | jq -r '.result.cloud | "\((.bytesDown // 0) / 1048576 | floor) MB down, \((.bytesUp // 0) / 1048576 | floor) MB up"' 2>/dev/null || echo 'unknown')"
+    say "   🗄  server frame cache: $(printf '%s' "$ins" | jq -r '.result.cloud.serverCache | if . == null then "no report yet (Cache Frames When Idle off, or not idle yet)" else "\(.done)/\(.total) frames of the comp cached, \(.ramMb) of \(.ramBudgetMb) MB RAM, \(.diskMb) MB disk" end' 2>/dev/null || echo 'unknown')"
   else say "🍎 app: not listening on control port $APP_PORT"; fi
 }
 

@@ -2203,6 +2203,10 @@ impl EffectcraftApp {
             return;
         }
         let cur = comp.frame_rate.frame_at(self.session.time()).clamp(wa, wb);
+        // The cloud (CR8): its server renders the frames into its own cache, nothing downloads.
+        if self.cache_on_server(ctx, comp, series, (wa, wb), cur) {
+            return;
+        }
         let fit = self.frames_that_fit(comp, series.scale as f64 / 1000.0).min(n);
         let slots = (self.frames_parallelism() / 2).max(1);
         let mut queued = self.frames.inflight();
@@ -2228,6 +2232,31 @@ impl EffectcraftApp {
         }
         if pending {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+    }
+
+    /// [`Self::cache_when_idle`] with the cloud renderer: ask its server to cache the work area
+    /// from `cur`, then the rest of the comp, in its own frame cache. Whether the cloud took it
+    /// (or will once its link is ready): then nothing is cached here.
+    fn cache_on_server(&self, ctx: &egui::Context, comp: &effectcraft_engine::project::Comp, series: &FrameKey, (wa, wb): (i64, i64), cur: i64) -> bool {
+        let last = comp.frame_rate.frame_at(comp.duration).saturating_sub(1).max(wb);
+        let ranges: Vec<(i64, i64)> = [(cur, wb), (wa, cur - 1), (wb + 1, last), (0, wa - 1)].into_iter().filter(|(a, b)| a <= b).collect();
+        let cid = ItemId(series.comp);
+        let opts = self.frame_opts(cid, series.scale as f64 / 1000.0);
+        match self.frames.precache_remote(&self.render_source(), series, cid, opts, ranges) {
+            None => false,
+            Some(sent) => {
+                // Not sent yet (the content key is on its way), or the server is still caching:
+                // look again (the cache bar follows its reports).
+                #[cfg(not(target_arch = "wasm32"))]
+                let busy = self.cloud.status().and_then(|s| s.server_cache).is_none_or(|c| c.done < c.total);
+                #[cfg(target_arch = "wasm32")]
+                let busy = false;
+                if !sent || busy {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(if sent { 1000 } else { 200 }));
+                }
+                true
+            }
         }
     }
 

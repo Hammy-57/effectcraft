@@ -204,6 +204,61 @@ pub enum FrameMsg {
     Purge,
     /// The playback stream (`crate::remote_stream`): handled by the transport, not here.
     Stream(crate::remote_stream::StreamMsg),
+    /// Render these frames into the transport's own frame cache and send no pixels (the cloud
+    /// server's Cache Frames When Idle): handled by the transport, not here.
+    Precache(Precache),
+}
+
+/// A series of viewer frames in a frame cache: the keys the app's disk cache uses
+/// ([`effectcraft_render::disk_cache::frame_key`]), so the app and a cloud server name a frame
+/// the same way. Every key goes through [`CacheSeries::key`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheSeries {
+    /// The comp's content key (32 hex digits).
+    pub content: String,
+    /// Resolution in thousandths (the viewer's `FrameKey::scale`).
+    pub scale: u32,
+    /// The view and render options (`FrameKey::view ^ opts_hash`).
+    pub salt: u64,
+}
+
+impl CacheSeries {
+    pub fn new(content: u128, scale: u32, salt: u64) -> CacheSeries {
+        CacheSeries { content: format!("{content:032x}"), scale, salt }
+    }
+
+    /// Frame `frame`'s key (`None`: the content isn't 32 hex digits).
+    pub fn key(&self, frame: i64) -> Option<u128> {
+        let content = u128::from_str_radix(&self.content, 16).ok()?;
+        Some(effectcraft_render::disk_cache::frame_key(content, frame, self.scale, self.salt))
+    }
+}
+
+/// Frames to keep ready in a server's frame cache ([`FrameMsg::Precache`]); a newer one replaces it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Precache {
+    pub revision: u64,
+    pub comp: ItemId,
+    pub series: CacheSeries,
+    pub opts: Box<RenderOpts>,
+    /// Frame ranges (inclusive), in the order they render: the work area from the playhead, then
+    /// the rest of the comp.
+    pub ranges: Vec<(i64, i64)>,
+}
+
+/// Merge frame numbers (sorted, without repeats) into inclusive ranges.
+pub fn frame_ranges(frames: impl IntoIterator<Item = i64>) -> Vec<(i64, i64)> {
+    let mut out: Vec<(i64, i64)> = Vec::new();
+    for f in frames {
+        match out.last_mut() {
+            Some((_, b)) if f == b.saturating_add(1) => *b = f,
+            Some((_, b)) if f <= *b => {}
+            _ => out.push((f, f)),
+        }
+    }
+    out
 }
 
 /// Frame worker → page. A [`FrameReply::Frame`]'s pixels travel next to the message (a
@@ -254,6 +309,22 @@ pub enum FrameReply {
     Resync { error: String },
     /// The playback stream (`crate::remote_stream`); a chunk's frames are the payload.
     Stream(crate::remote_stream::StreamReply),
+    /// What the server's frame cache holds of a [`FrameMsg::Precache`] (its frames `ranges`), and
+    /// the cache as a whole. Sent when the plan arrives, then about once a second while it renders.
+    #[serde(rename_all = "camelCase")]
+    Cached {
+        comp: ItemId,
+        series: CacheSeries,
+        ranges: Vec<(i64, i64)>,
+        /// Frames of the plan cached, of `total`.
+        done: u64,
+        total: u64,
+        /// The whole cache: frames and bytes in RAM, its RAM budget, bytes on disk.
+        frames: u64,
+        ram_bytes: u64,
+        ram_budget: u64,
+        disk_bytes: u64,
+    },
 }
 
 /// The page's record of a worker's replica: the snapshot it holds (its comps and layers are
@@ -446,8 +517,8 @@ impl FrameServer {
                     Err(e) => self.lost(e),
                 }
             }
-            // A transport that streams handles these itself.
-            FrameMsg::Stream(_) => vec![],
+            // A transport that streams (or keeps a frame cache) handles these itself.
+            FrameMsg::Stream(_) | FrameMsg::Precache(_) => vec![],
             FrameMsg::Segs { segs } => {
                 for s in &segs {
                     s.store();
