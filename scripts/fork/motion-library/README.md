@@ -68,6 +68,15 @@ Apply at Composition Start, Details, Show in Collection, Reveal in Finder (`libr
 Copy Name (`motionLibrary.copyName`). Previews from the bucket download once into the cache
 (`~/Library/Caches/EffectCraft/Motion Library`) and play from there.
 
+Sync status: on that Mac, a card its library folder has but whose files aren't in the bucket
+(listed "on the Mac", or new since the last publish: re-index with `effectcraft_library.py index`
+first) shows a small cloud mark. Click it (or right-click ▸ Save to Library, or the footer's Save to
+Library) to upload just that card (`motionLibrary.save` → `library.saveCard`, in the background,
+with the publish token in motion-library.json): a dry run first, its size and what stays home
+(video, files over the limits, missing ones); over 50 MB it asks. The catalog's own folders and the
+publish script's limits apply (previews up to 2 MB, SceneYard files up to 20 MB, no video), and a
+saved card stays saved in later publishes.
+
 Search ranks cards like the Python panel (`retrieval.py`; parity test in
 `crates/motionlib/src/search.rs`).
 

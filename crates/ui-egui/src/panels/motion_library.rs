@@ -66,6 +66,21 @@ pub struct ViewState {
     /// The card being applied (downloading) and when it started.
     #[serde(skip)]
     pub applying: Option<String>,
+    /// The card being saved to the library and its job (`task:N`).
+    #[serde(skip)]
+    pub saving: Option<(String, String)>,
+    /// A save waiting for a yes (its upload is over the size limit).
+    #[serde(skip)]
+    pub confirm_save: Option<SaveAsk>,
+}
+
+/// A save to confirm: the card, the upload's size and what stays home.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SaveAsk {
+    pub id: String,
+    pub name: String,
+    pub mb: f64,
+    pub note: String,
 }
 
 impl Default for ViewState {
@@ -87,6 +102,8 @@ impl Default for ViewState {
             details: None,
             apply_time: None,
             applying: None,
+            saving: None,
+            confirm_save: None,
         }
     }
 }
@@ -175,45 +192,46 @@ fn decode_image(bytes: &[u8], side: u32) -> ThumbPixels {
     Some(([rgba.width(), rgba.height()], rgba.into_raw()))
 }
 
-/// A card's thumbnail texture: downloaded (as it scrolls into view) and decoded off the UI thread.
-fn thumbnail(ctx: &egui::Context, client: &Client, blob: &BlobRef, side: u32, budget: &mut u32) -> Thumb {
-    let id = egui::Id::new(("ml-thumb", &blob.hash, side));
+/// A thumbnail decoded before, or whose decode just finished: `Some(thumb)` once known (`None`
+/// inside: it failed).
+fn cached_thumb(ctx: &egui::Context, key: &str, side: u32) -> Option<Thumb> {
+    let id = egui::Id::new(("ml-thumb", key, side));
     if let Some(t) = ctx.data(|d| d.get_temp::<Thumb>(id)) {
         crate::thumb_lru::touch::<Thumb>(ctx, "ml-thumb", id, MAX_THUMBS);
-        return t;
+        return Some(t);
     }
-    let jid = egui::Id::new(("ml-thumb-job", &blob.hash, side));
-    if let Some(job) = ctx.data(|d| d.get_temp::<ThumbJob>(jid)) {
-        let done = job.get()?;
-        let thumb = done.as_ref().map(|([w, h], px)| {
-            let img = egui::ColorImage::from_rgba_unmultiplied([*w as usize, *h as usize], px);
-            (ctx.load_texture(format!("ml-{}-{side}", blob.hash), img, egui::TextureOptions::LINEAR), [*w, *h])
-        });
-        ctx.data_mut(|d| {
-            d.insert_temp(id, thumb.clone());
-            d.remove::<ThumbJob>(jid);
-        });
-        crate::thumb_lru::touch::<Thumb>(ctx, "ml-thumb", id, MAX_THUMBS);
-        return thumb;
-    }
-    match client.blob(blob) {
-        BlobState::Ready(_) => {}
-        BlobState::Loading => return None,
-        BlobState::Failed(_) => {
-            ctx.data_mut(|d| d.insert_temp::<Thumb>(id, None));
-            return None;
-        }
-    }
-    if *budget == 0 || THUMB_JOBS.load(Ordering::Relaxed) >= MAX_THUMB_JOBS {
-        return None;
+    let jid = egui::Id::new(("ml-thumb-job", key, side));
+    let job = ctx.data(|d| d.get_temp::<ThumbJob>(jid))?;
+    let done = job.get()?;
+    let thumb = done.as_ref().map(|([w, h], px)| {
+        let img = egui::ColorImage::from_rgba_unmultiplied([*w as usize, *h as usize], px);
+        (ctx.load_texture(format!("ml-{key}-{side}"), img, egui::TextureOptions::LINEAR), [*w, *h])
+    });
+    ctx.data_mut(|d| {
+        d.insert_temp(id, thumb.clone());
+        d.remove::<ThumbJob>(jid);
+    });
+    crate::thumb_lru::touch::<Thumb>(ctx, "ml-thumb", id, MAX_THUMBS);
+    Some(thumb)
+}
+
+/// Remember that a thumbnail can't be shown.
+fn failed_thumb(ctx: &egui::Context, key: &str, side: u32) {
+    ctx.data_mut(|d| d.insert_temp::<Thumb>(egui::Id::new(("ml-thumb", key, side)), None));
+}
+
+/// Decode a thumbnail off the UI thread (`load` gives its bytes), a few at a time.
+fn start_thumb(ctx: &egui::Context, key: &str, side: u32, budget: &mut u32, load: impl FnOnce() -> Option<Vec<u8>> + Send + 'static) {
+    let jid = egui::Id::new(("ml-thumb-job", key, side));
+    if ctx.data(|d| d.get_temp::<ThumbJob>(jid)).is_some() || *budget == 0 || THUMB_JOBS.load(Ordering::Relaxed) >= MAX_THUMB_JOBS {
+        return;
     }
     *budget -= 1;
-    let bytes = client.blob_bytes(blob)?;
     let job: ThumbJob = Arc::default();
     ctx.data_mut(|d| d.insert_temp(jid, job.clone()));
     #[cfg(target_arch = "wasm32")]
     {
-        let _ = job.set(decode_image(&bytes, side));
+        let _ = job.set(load().and_then(|b| decode_image(&b, side)));
         ctx.request_repaint();
     }
     #[cfg(not(target_arch = "wasm32"))]
@@ -223,13 +241,42 @@ fn thumbnail(ctx: &egui::Context, client: &Client, blob: &BlobRef, side: u32, bu
         let ctx2 = ctx.clone();
         let spawned = std::thread::Builder::new().name("ec-library-thumb".into()).spawn(move || {
             let _slot = slot;
-            let _ = job.set(decode_image(&bytes, side));
+            let _ = job.set(load().and_then(|b| decode_image(&b, side)));
             ctx2.request_repaint();
         });
         if spawned.is_err() {
             ctx.data_mut(|d| d.remove::<ThumbJob>(jid));
         }
     }
+}
+
+/// A card's thumbnail texture: downloaded (as it scrolls into view) and decoded off the UI thread.
+fn thumbnail(ctx: &egui::Context, client: &Client, blob: &BlobRef, side: u32, budget: &mut u32) -> Thumb {
+    if let Some(t) = cached_thumb(ctx, &blob.hash, side) {
+        return t;
+    }
+    match client.blob(blob) {
+        BlobState::Ready(_) => {}
+        BlobState::Loading => return None,
+        BlobState::Failed(_) => {
+            failed_thumb(ctx, &blob.hash, side);
+            return None;
+        }
+    }
+    if *budget > 0 && THUMB_JOBS.load(Ordering::Relaxed) < MAX_THUMB_JOBS {
+        let bytes = client.blob_bytes(blob)?;
+        start_thumb(ctx, &blob.hash, side, budget, move || Some(bytes));
+    }
+    None
+}
+
+/// A thumbnail from this Mac's library folder (cards the catalog doesn't list yet).
+fn local_thumbnail(ctx: &egui::Context, path: &str, side: u32, budget: &mut u32) -> Thumb {
+    if let Some(t) = cached_thumb(ctx, path, side) {
+        return t;
+    }
+    let owned = path.to_string();
+    start_thumb(ctx, path, side, budget, move || std::fs::read(owned).ok());
     None
 }
 
@@ -404,6 +451,53 @@ fn needs_footage(card: &Card, local: &LocalIndex) -> bool {
     card.needs_footage() && !is_local(card, local)
 }
 
+/// A card of this Mac's library folder whose files aren't in the bucket yet (listed only, or not
+/// in the catalog at all): "Save to Library" uploads them.
+fn unsynced(card: &Card, local: &LocalIndex) -> bool {
+    is_local(card, local) && (card.on_mac || card.project.is_none())
+}
+
+/// Cards this Mac's library folder has that the catalog doesn't list yet (saved since the last
+/// publish), shown with their local thumbnails.
+fn local_only_cards(ctx: &egui::Context, client: &Client, local: &Arc<LocalIndex>) -> Arc<Vec<Card>> {
+    type Cached = (u64, Arc<Vec<Card>>);
+    let id = egui::Id::new("ml-local-only");
+    let key = generation(client) ^ (Arc::as_ptr(local) as usize as u64).rotate_left(17);
+    if let Some((k, cards)) = ctx.data(|d| d.get_temp::<Cached>(id))
+        && k == key
+    {
+        return cards;
+    }
+    let cat = client.catalog();
+    let listed: BTreeSet<&str> = cat.as_ref().map(|c| c.cards.iter().map(|c| c.id.as_str()).collect()).unwrap_or_default();
+    let cards: Vec<Card> = local
+        .values()
+        .filter(|e| !listed.contains(e.id.as_str()))
+        .map(|e| Card {
+            id: e.id.clone(),
+            name: e.name.clone(),
+            category: e.category.clone(),
+            kind: if e.kind == "comp" { "comp" } else { "footage" }.into(),
+            kind_label: match e.kind.as_str() {
+                "comp" => "Comp",
+                "audio" => "Sound",
+                "preset" => "Preset",
+                _ => "Footage",
+            }
+            .into(),
+            ..Card::default()
+        })
+        .collect();
+    let cards = Arc::new(cards);
+    ctx.data_mut(|d| d.insert_temp::<Cached>(id, (key, cards.clone())));
+    cards
+}
+
+/// A card by id: the catalog's, else one only this Mac's library folder has.
+fn find_card(client: &Client, local_only: &[Card], id: &str) -> Option<Card> {
+    client.catalog().and_then(|c| c.card(id).cloned()).or_else(|| local_only.iter().find(|c| c.id == id).cloned())
+}
+
 /// The adopted catalog's identity (a new one after an update).
 fn generation(client: &Client) -> u64 {
     client.catalog().map_or(0, |c| Arc::as_ptr(&c) as usize as u64)
@@ -411,7 +505,7 @@ fn generation(client: &Client) -> u64 {
 
 /// Cards matching the view, cached per catalog generation, query and folder. Browsing everything
 /// (no folder, no query) groups them by folder in the library's order.
-fn visible_cards(ctx: &egui::Context, client: &Client, local: &Arc<LocalIndex>, view: &ViewState) -> Arc<Vec<Card>> {
+fn visible_cards(ctx: &egui::Context, client: &Client, local: &Arc<LocalIndex>, local_only: &[Card], view: &ViewState) -> Arc<Vec<Card>> {
     type Cached = (u64, String, String, String, bool, Arc<Vec<Card>>);
     let id = egui::Id::new("ml-cards");
     let generation = generation(client) ^ (Arc::as_ptr(local) as usize as u64).rotate_left(17);
@@ -424,22 +518,21 @@ fn visible_cards(ctx: &egui::Context, client: &Client, local: &Arc<LocalIndex>, 
     {
         return cards;
     }
-    let cards: Vec<Card> = client
-        .catalog()
-        .map(|cat| {
-            let mut found: Vec<Card> = effectcraft_engine::motionlib::search(&cat.cards, &view.query, &view.folder)
-                .into_iter()
-                .filter(|c| view.kind_filter.is_empty() || kind_label(c) == view.kind_filter)
-                .filter(|c| !view.here_only || usable(c, local))
-                .cloned()
-                .collect();
-            if grouped(view) {
-                let ranks = cat.folder_ranks();
-                found.sort_by_key(|c| ranks.get(&c.category).copied().unwrap_or(usize::MAX));
-            }
-            found
-        })
-        .unwrap_or_default();
+    let cat = client.catalog();
+    let listed: &[Card] = cat.as_ref().map_or(&[], |c| c.cards.as_slice());
+    let mut cards: Vec<Card> = effectcraft_engine::motionlib::search(listed, &view.query, &view.folder)
+        .into_iter()
+        .chain(effectcraft_engine::motionlib::search(local_only, &view.query, &view.folder))
+        .filter(|c| view.kind_filter.is_empty() || kind_label(c) == view.kind_filter)
+        .filter(|c| !view.here_only || usable(c, local))
+        .cloned()
+        .collect();
+    if grouped(view)
+        && let Some(cat) = &cat
+    {
+        let ranks = cat.folder_ranks();
+        cards.sort_by_key(|c| ranks.get(&c.category).copied().unwrap_or(usize::MAX));
+    }
     let cards = Arc::new(cards);
     ctx.data_mut(|d| {
         d.insert_temp::<Cached>(id, (generation, view.query.clone(), view.folder.clone(), view.kind_filter.clone(), view.here_only, cards.clone()))
@@ -1011,10 +1104,11 @@ fn kind_label(c: &Card) -> &str {
 }
 
 /// A card's right-click menu: each entry is a command (with an automation id) → the one picked.
-fn card_menu(auto: &mut crate::automation::Registry, resp: &egui::Response, card: &Card, local: &LocalIndex) -> Option<(&'static str, Value)> {
+fn card_menu(auto: &mut crate::automation::Registry, resp: &egui::Response, card: &Card, local: &LocalIndex, can_save: bool) -> Option<(&'static str, Value)> {
     let mut pick = None;
     let here = usable(card, local);
     let has_file = is_local(card, local);
+    let save = unsynced(card, local) && can_save;
     crate::widgets::context_menu(resp, |ui| {
         let mut entry = |ui: &mut egui::Ui, key: &str, label: &str, enabled: bool, cmd: &'static str, params: Value| {
             let b = ui.add_enabled(enabled, egui::Button::new(tr(label)));
@@ -1038,8 +1132,70 @@ fn card_menu(auto: &mut crate::automation::Registry, resp: &egui::Response, card
         );
         entry(ui, "reveal", "Reveal in Finder", has_file, "library.reveal", json!({"id": card.id}));
         entry(ui, "copyName", "Copy Name", true, "motionLibrary.copyName", json!({"id": card.id}));
+        if has_file {
+            ui.separator();
+            entry(ui, "save", if unsynced(card, local) { "Save to Library" } else { "Saved to Library" }, save, "motionLibrary.save", json!({"id": card.id}));
+        }
     });
     pick
+}
+
+/// What a save leaves at home (its job's `skipped`), as a sentence.
+fn skipped_note(result: &Value) -> String {
+    let skipped = result["skipped"].as_array().cloned().unwrap_or_default();
+    if skipped.is_empty() {
+        return String::new();
+    }
+    let names: Vec<String> =
+        skipped.iter().take(4).map(|k| format!("{} ({})", k["file"].as_str().unwrap_or_default(), k["reason"].as_str().unwrap_or_default())).collect();
+    let more = if skipped.len() > 4 { format!(" and {} more", skipped.len() - 4) } else { String::new() };
+    format!("Left at home (relink on other machines): {}{more}.", names.join(", "))
+}
+
+/// Ask before a big upload: `Some(true)` upload, `Some(false)` cancel.
+fn confirm_save_sheet(app: &mut EffectcraftApp, ui: &mut egui::Ui, grid: Rect, ask: &SaveAsk, s: f32) -> Option<bool> {
+    let t = app.tokens;
+    let p = ui.painter().with_clip_rect(grid);
+    let _ = ui.interact(grid, egui::Id::new("ml-confirm-block"), Sense::click_and_drag());
+    p.rect_filled(grid, 0.0, Color32::from_black_alpha(120));
+    let w = (grid.width() - 32.0 * s).clamp(120.0, 420.0 * s);
+    let h = (grid.height() - 32.0 * s).clamp(90.0, 190.0 * s);
+    let r = Rect::from_center_size(grid.center(), vec2(w, h));
+    p.rect_filled(r, CornerRadius::same(10), t.header_bg);
+    p.rect_stroke(r, CornerRadius::same(10), Stroke::new(1.0, t.separator), egui::StrokeKind::Inside);
+    app.auto.add("motionLibrary.confirmSave", r, &ask.name);
+    let inner = r.shrink(14.0 * s);
+    let title = format!("Upload {:.1} MB to the library?", ask.mb);
+    p.text(inner.min, Align2::LEFT_TOP, &title, Tokens::semibold(13.0 * s), t.text);
+    let body = format!("Saving “{}” uploads its files over your internet connection. {}", ask.name, ask.note);
+    let text_r = Rect::from_min_max(pos2(inner.min.x, inner.min.y + 24.0 * s), pos2(inner.max.x, inner.max.y - 32.0 * s));
+    let galley = p.layout(body, Tokens::ui(11.5 * s), t.text_dim, text_r.width().max(40.0));
+    p.with_clip_rect(text_r.intersect(grid)).galley(text_r.min, galley, t.text_dim);
+    let bw = 84.0 * s;
+    let up = Rect::from_min_size(pos2(inner.max.x - bw, inner.max.y - 24.0 * s), vec2(bw, 24.0 * s));
+    let cancel = up.translate(vec2(-(bw + 8.0 * s), 0.0));
+    if kit::button(app, ui, cancel, "motionLibrary.confirmSave.cancel", "Cancel", false) || ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
+        return Some(false);
+    }
+    if kit::button(app, ui, up, "motionLibrary.confirmSave.upload", "Upload", true) {
+        return Some(true);
+    }
+    None
+}
+
+/// A small cloud with an up arrow (not synced: save to the library).
+fn paint_cloud_up(p: &egui::Painter, r: Rect, color: Color32) {
+    let u = r.height();
+    let base = r.center().y + u * 0.18;
+    let stroke = Stroke::new((u * 0.11).max(1.0), color);
+    let (l, rr) = (r.center().x - u * 0.55, r.center().x + u * 0.55);
+    p.circle_stroke(pos2(r.center().x - u * 0.22, base - u * 0.12), u * 0.25, stroke);
+    p.circle_stroke(pos2(r.center().x + u * 0.12, base - u * 0.22), u * 0.32, stroke);
+    p.line_segment([pos2(l + u * 0.1, base + u * 0.08), pos2(rr - u * 0.05, base + u * 0.08)], stroke);
+    let x = r.center().x;
+    p.line_segment([pos2(x, base + u * 0.02), pos2(x, base - u * 0.42)], stroke);
+    p.line_segment([pos2(x - u * 0.17, base - u * 0.25), pos2(x, base - u * 0.42)], stroke);
+    p.line_segment([pos2(x + u * 0.17, base - u * 0.25), pos2(x, base - u * 0.42)], stroke);
 }
 
 /// The card's details over the grid: preview image, what and where it is, its files, and Apply.
@@ -1090,6 +1246,9 @@ fn details_sheet(
     }
     if let Some(e) = local.get(&card.id).filter(|_| is_local(card, &local)) {
         facts.push(format!("from this Mac's library: {}", e.file));
+        if unsynced(card, &local) {
+            facts.push(tr("not synced: right-click ▸ Save to Library uploads it").to_string());
+        }
     } else if card.on_mac {
         facts.push(tr("on the Mac: apply it in After Effects there").to_string());
     } else {
@@ -1288,7 +1447,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let pad = 10.0 * s;
     let head_h = 36.0 * s;
     let head = Rect::from_min_size(main.min, vec2(main.width(), head_h));
-    let cards = visible_cards(&ctx, &client, &local, &view);
+    let local_only = local_only_cards(&ctx, &client, &local);
+    let cards = visible_cards(&ctx, &client, &local, &local_only, &view);
     let search_w = (240.0 * s).min((head.width() * 0.5).max(80.0));
     let search_r = Rect::from_min_size(pos2(head.max.x - pad - search_w, head.center().y - 12.0 * s), vec2(search_w, 24.0 * s));
     let mut q = view.query.clone();
@@ -1429,7 +1589,10 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     hovered_card = Some(card.id.clone());
                 }
                 let tex = live.map(|t| (t.id(), t.size_vec2())).or_else(|| {
-                    let thumb = card.thumbnail.as_ref().and_then(|b| thumbnail(&ctx, &client, b, side, &mut budget));
+                    let thumb = match &card.thumbnail {
+                        Some(b) => thumbnail(&ctx, &client, b, side, &mut budget),
+                        None => local.get(&card.id).filter(|e| !e.thumbnail.is_empty()).and_then(|e| local_thumbnail(&ctx, &e.thumbnail, side, &mut budget)),
+                    };
                     thumb.map(|(tex, [w, h])| (tex.id(), vec2(w as f32, h as f32)))
                 });
                 match tex {
@@ -1465,6 +1628,35 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 if view.applying.as_deref() == Some(card.id.as_str()) {
                     gp.rect_filled(thumb_r, tr_radius, Color32::from_black_alpha(140));
                     gp.text(thumb_r.center(), Align2::CENTER_CENTER, tr("Downloading…"), Tokens::medium(11.5 * s), Color32::WHITE);
+                }
+                // Not in the bucket yet: the sync mark, a one-click Save to Library.
+                let saving_this = view.saving.as_ref().is_some_and(|(id, _)| *id == card.id);
+                if saving_this {
+                    gp.rect_filled(thumb_r, tr_radius, Color32::from_black_alpha(150));
+                    let msg =
+                        view.saving.as_ref().and_then(|(_, job)| app.session.jobs().into_iter().find(|j| j.id == *job)).map(|j| j.message).unwrap_or_default();
+                    let galley = gp.layout(
+                        format!("{}\n{msg}", tr("Saving to the library…")),
+                        Tokens::medium(10.5 * s),
+                        Color32::WHITE,
+                        (thumb_r.width() - 12.0 * s).max(10.0),
+                    );
+                    gp.galley(thumb_r.center() - galley.size() / 2.0, galley, Color32::WHITE);
+                } else if unsynced(card, &local) {
+                    let sr = Rect::from_min_size(thumb_r.min + vec2(5.0 * s, 5.0 * s), vec2(20.0 * s, 16.0 * s));
+                    if grid.contains_rect(sr) {
+                        let sresp = ui.interact(sr, egui::Id::new(("ml-card-sync", &card.id)), Sense::click());
+                        let hot = sresp.hovered();
+                        gp.rect_filled(sr, CornerRadius::same((8.0 * s) as u8), if hot { t.accent } else { Color32::from_black_alpha(170) });
+                        paint_cloud_up(&gp, sr.shrink2(vec2(3.0 * s, 2.0 * s)), if hot { Color32::WHITE } else { t.warning });
+                        app.auto.add(&format!("motionLibrary.sync.{}", card.id), sr, "Not synced: Save to Library");
+                        if sresp
+                            .on_hover_text(tr("Not synced: only on this Mac. Click to save it to the library (uploads its files; video stays home)"))
+                            .clicked()
+                        {
+                            menu_pick = Some(("motionLibrary.save", json!({"id": card.id})));
+                        }
+                    }
                 }
                 if selected {
                     gp.rect_stroke(tile, radius, Stroke::new(2.0, t.accent), egui::StrokeKind::Inside);
@@ -1510,7 +1702,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 if resp.clicked() || resp.secondary_clicked() {
                     view.selected = Some(card.id.clone());
                 }
-                if let Some(pick) = card_menu(&mut app.auto, &resp, card, &local) {
+                if let Some(pick) = card_menu(&mut app.auto, &resp, card, &local, view.saving.is_none()) {
                     menu_pick = Some(pick);
                 }
                 if resp.double_clicked() {
@@ -1550,11 +1742,22 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     // Footer: the selected card and Apply.
     let footer = Rect::from_min_max(pos2(rect.min.x, rect.max.y - footer_h), rect.max);
     p.line_segment([footer.left_top(), footer.right_top()], Stroke::new(1.0, t.separator));
-    let sel = view.selected.as_ref().and_then(|id| client.catalog().and_then(|c| c.card(id).cloned()));
+    let sel = view.selected.as_ref().and_then(|id| find_card(&client, &local_only, id));
     let ar = Rect::from_min_size(pos2(footer.max.x - 80.0 * s, footer.center().y - 11.0 * s), vec2(72.0 * s, 22.0 * s));
     if let Some(card) = &sel {
         let info = format!("{}  ·  {}{}", card.name, card.subtitle(), if needs_footage(card, &local) { "  ·  needs footage" } else { "" });
         let ar = if usable(card, &local) { ar } else { Rect::from_min_max(pos2(ar.min.x - 20.0 * s, ar.min.y), ar.max) };
+        // Not in the bucket yet: Save to Library beside Apply.
+        let save_w = 112.0 * s;
+        let ar = if unsynced(card, &local) && view.saving.is_none() {
+            let sr = Rect::from_min_size(pos2(ar.min.x - save_w - 8.0 * s, ar.min.y), vec2(save_w, ar.height()));
+            if kit::button(app, ui, sr, "motionLibrary.saveSelected", "Save to Library", false) {
+                menu_pick = Some(("motionLibrary.save", json!({"id": card.id})));
+            }
+            Rect::from_min_max(sr.min, ar.max)
+        } else {
+            ar
+        };
         draw_text_clipped(
             &p,
             Rect::from_min_max(pos2(footer.min.x + 10.0 * s, footer.min.y), pos2(ar.min.x - 8.0, footer.max.y)),
@@ -1573,13 +1776,43 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     }
     // The card's details over the grid.
     if let Some(id) = view.details.clone() {
-        match client.catalog().and_then(|c| c.card(&id).cloned()) {
+        match find_card(&client, &local_only, &id) {
             Some(card) => {
                 if let Some(a) = details_sheet(app, ui, &ctx, &client, grid, &card, &mut view, s) {
                     apply_now = Some(a);
                 }
             }
             None => view.details = None,
+        }
+    }
+    // A save over the size limit: ask first.
+    if let Some(ask) = view.confirm_save.clone() {
+        match confirm_save_sheet(app, ui, grid, &ask, s) {
+            Some(true) => {
+                view.confirm_save = None;
+                menu_pick = Some(("motionLibrary.save", json!({"id": ask.id, "confirm": true})));
+            }
+            Some(false) => view.confirm_save = None,
+            None => {}
+        }
+    }
+    // A save running: when it's done, a size to confirm (the job's result), else nothing to do
+    // (it said how it went).
+    if let Some((id, job)) = view.saving.clone() {
+        match app.session.job_log.iter().rev().find(|r| r.id == job) {
+            Some(rec) => {
+                view.saving = None;
+                if rec.status == "done" && rec.result["needsConfirm"] == true {
+                    view.confirm_save = Some(SaveAsk {
+                        id,
+                        name: rec.result["name"].as_str().unwrap_or_default().to_string(),
+                        mb: rec.result["uploadMB"].as_f64().unwrap_or(0.0),
+                        note: skipped_note(&rec.result),
+                    });
+                }
+            }
+            None if app.session.jobs().iter().any(|j| j.id == job) => ctx.request_repaint_after(std::time::Duration::from_millis(250)),
+            None => view.saving = None,
         }
     }
     // A card being dragged: its name under the pointer.
@@ -1699,6 +1932,24 @@ pub fn set_view(view: &mut ViewState, p: &Value) -> Result<Value, String> {
     }
     view.clamp();
     Ok(view.to_json())
+}
+
+/// `motionLibrary.save`: save a card of this Mac's library folder to the bucket in the background
+/// (`library.saveCard`); over 50 MB the panel asks first (`confirm: true` uploads anyway).
+pub fn start_save(app: &mut EffectcraftApp, p: &Value) -> Result<Value, String> {
+    let id = p.get("id").and_then(Value::as_str).ok_or("missing `id` (a Motion Library card id)")?.to_string();
+    if let Some((busy, _)) = &app.ui.motion_library.saving {
+        return Err(format!("still saving `{busy}`"));
+    }
+    let mut params = json!({"id": id, "confirm": p.get("confirm").and_then(Value::as_bool).unwrap_or(false), "wait": false});
+    if let Some(mb) = p.get("askAboveMB") {
+        params["askAboveMB"] = mb.clone();
+    }
+    let r = app.session.execute("library.saveCard", params).map_err(|e| e.to_string())?;
+    let job = r["job"].as_str().unwrap_or_default().to_string();
+    app.ui.motion_library.confirm_save = None;
+    app.ui.motion_library.saving = Some((id.clone(), job.clone()));
+    Ok(json!({"saving": id, "job": job}))
 }
 
 /// `motionLibrary.apply`: apply a card from the panel without blocking (`time`: comp seconds,
