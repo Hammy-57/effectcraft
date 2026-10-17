@@ -100,6 +100,8 @@ struct Shared {
     fps: AtomicU32,
     /// The newest project, sent whole after a (re)connection.
     latest: Mutex<Option<(u64, Arc<Project>)>>,
+    /// Where the project is saved (its `.cloud.json` sidecar holds the Drive links, CR7).
+    path: Mutex<Option<String>>,
     stop: AtomicBool,
 }
 
@@ -143,6 +145,7 @@ impl CloudFrames {
             slots: AtomicUsize::new(0),
             fps: AtomicU32::new(30f32.to_bits()),
             latest: Mutex::new(None),
+            path: Mutex::new(None),
             stop: AtomicBool::new(false),
         });
         let (tx, rx) = channel();
@@ -178,6 +181,14 @@ impl CloudFrames {
         let mut l = self.shared.latest.lock().unwrap_or_else(PoisonError::into_inner);
         if l.as_ref().is_none_or(|(r, _)| *r != revision) {
             *l = Some((revision, project.clone()));
+        }
+    }
+
+    /// Where the project is saved (`None`: never saved).
+    pub fn set_path(&self, path: Option<&str>) {
+        let mut p = self.shared.path.lock().unwrap_or_else(PoisonError::into_inner);
+        if p.as_deref() != path {
+            *p = path.map(str::to_string);
         }
     }
 
@@ -349,9 +360,13 @@ impl Link {
         let Some((_, project)) = latest else { return };
         self.preflight = Preflight::Asking(None);
         let (me, generation, remap) = (self.me.clone(), self.generation, self.remap.clone());
+        let path = self.shared.path.lock().unwrap_or_else(PoisonError::into_inner).clone();
         let spawned = std::thread::Builder::new().name("ec-cloud-manifest".into()).spawn(move || {
+            use effectcraft_engine::cloud_assets::{Hash, manifest, read_sidecar};
             let project = remap_project(&project, remap.as_ref());
-            let m = effectcraft_engine::cloud_assets::manifest(&project, &|p| std::fs::read(p).ok(), effectcraft_engine::cloud_assets::Hash::Small);
+            let read = |p: &str| std::fs::read(p).ok();
+            let sidecar = read_sidecar(&read, path.as_deref());
+            let m = manifest(&project, &read, Hash::Small, &sidecar, path.as_deref());
             let _ = me.send(Cmd::Manifest(generation, serde_json::to_value(m).unwrap_or(Value::Null)));
         });
         if spawned.is_err() {
@@ -394,8 +409,11 @@ impl Link {
         self.checking_uploads = true;
         self.uploads_checked = Some(Instant::now());
         let me = self.me.clone();
+        let path = self.shared.path.lock().unwrap_or_else(PoisonError::into_inner).clone();
         let spawned = std::thread::Builder::new().name("ec-cloud-uploads".into()).spawn(move || {
-            let v = effectcraft_engine::cloud_assets::pending_uploads(&project, &|p| std::fs::read(p).ok());
+            use effectcraft_engine::cloud_assets::{pending_uploads, read_sidecar};
+            let read = |p: &str| std::fs::read(p).ok();
+            let v = pending_uploads(&project, &read, &read_sidecar(&read, path.as_deref()));
             let count = v.get("count").and_then(Value::as_u64).unwrap_or(0) as usize;
             let _ = me.send(Cmd::Pending { revision, count });
         });
@@ -765,6 +783,8 @@ pub struct Now<'a> {
     pub token: &'a str,
     pub revision: u64,
     pub project: &'a Arc<Project>,
+    /// Where the project is saved.
+    pub path: Option<&'a str>,
     /// The previewed comp and its frame rate.
     pub comp: Option<(u64, f64)>,
     /// The viewer frame's last render time (ms, [`crate::frames::Frames::last_ms`]).
@@ -787,7 +807,7 @@ impl CloudPreview {
     /// [`RemoteFrames`] the viewer should use (`None`: this Mac) and a status note when the
     /// source changed on its own (a lost or regained connection).
     pub fn tick(&mut self, now: &Now<'_>) -> (Option<Arc<CloudFrames>>, Option<String>) {
-        let Now { mode, address, token, revision, project, comp, last_ms } = *now;
+        let Now { mode, address, token, revision, project, path, comp, last_ms } = *now;
         let mode = if MODES.contains(&mode) { mode } else { "local" };
         if mode == "local" || address.trim().is_empty() {
             self.client = None;
@@ -803,6 +823,7 @@ impl CloudPreview {
         }
         let Some(client) = self.client.clone() else { return (None, None) };
         client.offer(revision, project);
+        client.set_path(path);
         if let Some((_, fps)) = comp {
             client.set_fps(fps);
         }
@@ -1079,7 +1100,8 @@ mod tests {
         assert!(!cloud.ready(), "not ready while something is missing there");
         assert_eq!(cloud.status().missing.as_deref(), Some("1 missing: font “X”"));
         let mut preview = CloudPreview::default();
-        let now = Now { mode: "cloud", address: &server.addr, token: "secret", revision: s.revision, project: &s.project, comp: None, last_ms: 0.0 };
+        let now =
+            Now { mode: "cloud", address: &server.addr, token: "secret", revision: s.revision, project: &s.project, path: None, comp: None, last_ms: 0.0 };
         // (A preview of its own: it connects on its own and gets the same answer.)
         let mut note = None;
         wait_until("the waiting note", || {
