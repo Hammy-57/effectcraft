@@ -275,9 +275,74 @@ pub fn stat(path: &str) -> Option<(u64, i64)> {
     }
 }
 
-/// Remembered hashes: (size, mtime) → sha256 per path, so the 6 GB clip is read once.
-fn hash_cache() -> &'static Mutex<Option<BTreeMap<String, (u64, i64, String)>>> {
-    static C: Mutex<Option<BTreeMap<String, (u64, i64, String)>>> = Mutex::new(None);
+/// Remembered hashes: (size, mtime) → sha256 per path, so the 6 GB clip is read once. The file is
+/// shared with other processes on this machine (the mirror CLI hashes while the app runs), so it
+/// is read again whenever it changed on disk: a lookup that misses, and every write, first take
+/// in what another process added (else the app's manifest goes without the hash the mirror just
+/// computed, and the server calls a same-content copy with another mtime missing).
+#[derive(Default)]
+struct HashCache {
+    map: BTreeMap<String, (u64, i64, String)>,
+    /// The file's (length, modified) when it was last read or written; `None`: not yet.
+    seen: Option<(u64, Option<std::time::SystemTime>)>,
+}
+
+type HashEntry = (String, u64, i64, String);
+
+impl HashCache {
+    /// Take in the file's entries if it changed since it was last seen.
+    fn refresh(&mut self, file: Option<&std::path::Path>) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let Some(file) = file else { return };
+            let now = std::fs::metadata(file).ok().map(|m| (m.len(), m.modified().ok()));
+            if now.is_some() && now == self.seen {
+                return;
+            }
+            let loaded: BTreeMap<String, (u64, i64, String)> = std::fs::read(file).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+            self.map.extend(loaded);
+            self.seen = Some(now.unwrap_or((0, None)));
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = file;
+    }
+
+    fn get(&mut self, file: Option<&std::path::Path>, path: &str, size: u64, mtime: i64) -> Option<String> {
+        let hit = |c: &Self| c.map.get(path).filter(|(s, m, _)| *s == size && *m == mtime).map(|(_, _, h)| h.clone());
+        if self.seen.is_some()
+            && let Some(h) = hit(self)
+        {
+            return Some(h);
+        }
+        self.refresh(file);
+        hit(self)
+    }
+
+    fn insert(&mut self, file: Option<&std::path::Path>, found: Vec<HashEntry>) {
+        if found.is_empty() {
+            return;
+        }
+        self.refresh(file);
+        for (path, size, mtime, h) in found {
+            self.map.insert(path, (size, mtime, h));
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let (Some(file), Ok(bytes)) = (file, serde_json::to_vec(&self.map)) {
+            // Best effort: a cache that can't be written is only slower next time.
+            if let Some(dir) = file.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let tmp = file.with_extension(format!("tmp{}", std::process::id()));
+            if std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, file).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+            self.seen = std::fs::metadata(file).ok().map(|m| (m.len(), m.modified().ok()));
+        }
+    }
+}
+
+fn hash_cache() -> &'static Mutex<HashCache> {
+    static C: Mutex<HashCache> = Mutex::new(HashCache { map: BTreeMap::new(), seen: None });
     &C
 }
 
@@ -285,6 +350,10 @@ fn hash_cache() -> &'static Mutex<Option<BTreeMap<String, (u64, i64, String)>>> 
 fn hash_cache_file() -> Option<std::path::PathBuf> {
     if let Some(p) = std::env::var_os("EFFECTCRAFT_HASH_CACHE").filter(|p| !p.is_empty()) {
         return Some(p.into());
+    }
+    // Tests keep their hashes to themselves (and out of the owner's cache).
+    if cfg!(test) {
+        return Some(std::env::temp_dir().join(format!("ec-file-hashes-test-{}.json", std::process::id())));
     }
     let home = std::env::var_os("HOME").filter(|h| !h.is_empty()).map(std::path::PathBuf::from);
     let base = if cfg!(target_os = "macos") {
@@ -297,36 +366,19 @@ fn hash_cache_file() -> Option<std::path::PathBuf> {
     Some(base.join("file-hashes.json"))
 }
 
-fn cached_hash(path: &str, size: u64, mtime: i64) -> Option<String> {
-    let mut c = hash_cache().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    #[cfg(not(target_arch = "wasm32"))]
-    if c.is_none() {
-        let loaded = hash_cache_file().and_then(|f| std::fs::read(f).ok()).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-        *c = Some(loaded);
-    }
-    c.as_ref()?.get(path).filter(|(s, m, _)| *s == size && *m == mtime).map(|(_, _, h)| h.clone())
+#[cfg(target_arch = "wasm32")]
+fn hash_cache_file() -> Option<std::path::PathBuf> {
+    None
 }
 
-fn remember_hashes(found: Vec<(String, u64, i64, String)>) {
-    if found.is_empty() {
-        return;
-    }
-    let mut c = hash_cache().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let map = c.get_or_insert_with(BTreeMap::new);
-    for (path, size, mtime, h) in found {
-        map.insert(path, (size, mtime, h));
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    if let (Some(file), Ok(bytes)) = (hash_cache_file(), serde_json::to_vec(map)) {
-        // Best effort: a cache that can't be written is only slower next time.
-        if let Some(dir) = file.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let tmp = file.with_extension(format!("tmp{}", std::process::id()));
-        if std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, &file).is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
-    }
+fn cached_hash(path: &str, size: u64, mtime: i64) -> Option<String> {
+    let file = hash_cache_file();
+    hash_cache().lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(file.as_deref(), path, size, mtime)
+}
+
+fn remember_hashes(found: Vec<HashEntry>) {
+    let file = hash_cache_file();
+    hash_cache().lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(file.as_deref(), found);
 }
 
 /// Remember `sha256` for `path` as it is now (a file this program just wrote or verified).
@@ -1437,6 +1489,58 @@ mod tests {
         let sha = |p: &str| m.files.iter().find(|f| f.path == p).and_then(|f| f.sha256.clone());
         assert_eq!(sha(&known_s), Some(h));
         assert_eq!(sha(&unknown_s), None, "a big file is not hashed unless asked");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Another process (the mirror CLI) adding a hash to the shared file is seen by a cache that
+    /// already read the file, and a write here keeps what the other process added.
+    #[test]
+    fn the_hash_cache_takes_in_what_another_process_wrote() {
+        let d = tmp("hashcache");
+        let file = d.join("file-hashes.json");
+        let mut c = HashCache::default();
+        assert_eq!(c.get(Some(&file), "/a.mov", 5, 7), None, "nothing on disk yet");
+        let other: BTreeMap<&str, (u64, i64, &str)> = [("/a.mov", (5, 7, "aa"))].into();
+        std::fs::write(&file, serde_json::to_vec(&other).unwrap()).unwrap();
+        assert_eq!(c.get(Some(&file), "/a.mov", 5, 7).as_deref(), Some("aa"));
+        assert_eq!(c.get(Some(&file), "/a.mov", 5, 8), None, "another mtime is another file");
+        let other: BTreeMap<&str, (u64, i64, &str)> = [("/a.mov", (5, 7, "aa")), ("/b.mov", (1, 2, "bb"))].into();
+        std::fs::write(&file, serde_json::to_vec(&other).unwrap()).unwrap();
+        c.insert(Some(&file), vec![("/c.mov".into(), 3, 4, "cc".into())]);
+        let on_disk: BTreeMap<String, (u64, i64, String)> = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!(on_disk.keys().map(String::as_str).collect::<Vec<_>>(), vec!["/a.mov", "/b.mov", "/c.mov"]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 17 Oct, 3090: the mirror hashed the 6 GB presenter clip on the Mac ("1 same content (other
+    /// mtime)"), but the app had read the hash file before that, so its preflight manifest went
+    /// without the sha256 and the server's copy (pulled from Drive, another mtime) was "missing".
+    /// Same content with another mtime must pass once any process here knows the hash.
+    #[test]
+    fn same_content_with_another_mtime_passes_preflight_after_another_process_hashed_it() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let d = tmp("othermtime");
+        let clip = d.join("presenter keyed clean.mov");
+        std::fs::File::create(&clip).and_then(|h| h.set_len(SMALL_FILE + 1)).unwrap();
+        let clip_s = clip.to_string_lossy().to_string();
+        // The app read the hash file before the mirror ran.
+        assert_eq!(cached_sha256(&clip_s), None);
+        // The mirror (another process) hashes the clip and writes the shared file.
+        let (size, mtime) = stat(&clip_s).unwrap();
+        let sha = hash_uncached(&clip_s, &mut |_| {}).unwrap();
+        let file = hash_cache_file().unwrap();
+        let mut on_disk: BTreeMap<String, (u64, i64, String)> = std::fs::read(&file).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        on_disk.insert(clip_s.clone(), (size, mtime, sha.clone()));
+        std::fs::write(&file, serde_json::to_vec(&on_disk).unwrap()).unwrap();
+        let mut s = Session::default();
+        let p = std::sync::Arc::make_mut(&mut s.project);
+        p.add_item("clip", Default::default(), None, ItemKind::Footage(effectcraft_project::Footage { path: clip_s.clone(), ..Default::default() }));
+        let m: Manifest = serde_json::from_value(s.execute("project.dependencies", json!({})).unwrap()).unwrap();
+        assert_eq!(m.files.iter().find(|f| f.path == clip_s).and_then(|f| f.sha256.clone()), Some(sha), "the app's manifest carries the mirror's hash");
+        // The server's copy: same bytes, another mtime.
+        std::fs::File::options().write(true).open(&clip).and_then(|f| f.set_modified(UNIX_EPOCH + Duration::from_secs(1_792_222_222))).unwrap();
+        let (missing, warnings) = check(&m, false);
+        assert!(missing.is_empty() && warnings.is_empty(), "{missing:?} {warnings:?}");
         let _ = std::fs::remove_dir_all(&d);
     }
 

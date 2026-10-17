@@ -56,7 +56,8 @@ pub fn run(args: &Args, json_out: bool) -> Result<(), Failure> {
         dry_run: args.flag("--dry-run"),
         all: args.flag("--all"),
         verify_hash: args.flag("--verify-hash"),
-        retime: args.flag("--retime"),
+        // On unless `--no-retime` (`--retime` is the old opt-in, still accepted).
+        retime: !args.flag("--no-retime"),
         upload: args.opts("--upload").into_iter().map(str::to_string).collect(),
         limit: args.num("--upload-limit-mb")?.map(|mb| (mb.max(0.0) * 1e6) as u64),
     };
@@ -153,6 +154,7 @@ struct Opts {
     dry_run: bool,
     all: bool,
     verify_hash: bool,
+    /// Give a same-content server copy the Mac's mtime (`--no-retime`: leave it).
     retime: bool,
     /// Big files Elias said may be uploaded from the Mac (paths or file names).
     upload: Vec<String>,
@@ -354,11 +356,13 @@ fn sync(ssh: &Ssh, opts: &Opts, units: &[Unit], first: bool) -> Result<Report, F
             need.push(u);
         }
     }
-    // Same content: the server's preflight compares the hash (once; it remembers). `--retime` also
-    // sets the Mac's mtime there, so the next check is size + mtime alone; off by default because
-    // an app running there may reload footage whose mtime changed.
+    // Same content: the server copy gets the Mac's mtime, so every later check (the app's
+    // preflight too, which may not know the big file's hash) is size + mtime alone. `--no-retime`
+    // leaves it (the server's preflight then compares the hash, when the manifest carries one).
     if opts.retime && !retime.is_empty() && !opts.dry_run {
-        ssh.retime(&retime.iter().map(|u| (u.dest.as_str(), u.mtime)).collect::<Vec<_>>())?;
+        if let Err(e) = ssh.retime(&retime.iter().map(|u| (u.dest.as_str(), u.mtime)).collect::<Vec<_>>()) {
+            note(&format!("⚠️  could not set the Mac's mtime on the server copies: {}", failure_text(&e)));
+        }
     }
     for u in &retime {
         report.same_content += 1;
