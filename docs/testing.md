@@ -209,3 +209,8 @@ listing each one. Wall time is never gated (it follows the load). Keep a baselin
 (`cp target/bench/results.jsonl bench-main.jsonl`) and run
 `cargo xtask bench --quick --compare bench-main.jsonl --fail-over 10` before landing performance
 work.
+Results files allow blank lines; corrupt records or invalid comparison fields report the file
+and line instead of being discarded. `--fail-over PCT` requires the same run keys on both sides,
+successful latest runs, and at least one comparable resource metric per run. Failed latest runs,
+missing coverage, empty results and wall-time-only measurements cannot pass the gate. Omit
+`--fail-over` for an exploratory partial comparison; failed latest runs remain visible.

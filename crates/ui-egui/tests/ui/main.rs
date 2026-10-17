@@ -209,5 +209,13 @@ mod ui_quick_offset;
 #[path = "../ui_video_preview_off.rs"]
 mod ui_video_preview_off;
 
+#[path = "../ui_effect_drop_highlight.rs"]
+mod ui_effect_drop_highlight;
+#[path = "../ui_media_browser_cache.rs"]
+mod ui_media_browser_cache;
+#[path = "../ui_media_browser_copy_path.rs"]
+mod ui_media_browser_copy_path;
+#[path = "../ui_timeline_effect_label.rs"]
+mod ui_timeline_effect_label;
 #[path = "../ui_viewer_trackpad.rs"]
 mod ui_viewer_trackpad;

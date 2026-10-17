@@ -336,8 +336,18 @@ fn value_arg(s: &str) -> Value {
     serde_json::from_str(s).unwrap_or_else(|_| json!(s))
 }
 
+/// The command line as text. `std::env::args` panics on an argument that is not Unicode (a
+/// Latin-1 file name on Linux). Every argument is used as a string, and a lossy copy would read or
+/// write another file than the one named, so such an argument is a usage error naming it.
+fn utf8_args(raw: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Vec<String>, String> {
+    raw.into_iter().map(|a| a.into_string().map_err(|a| format!("argument `{}` is not valid Unicode", a.to_string_lossy()))).collect()
+}
+
 fn main() {
-    let raw: Vec<String> = std::env::args().skip(1).collect();
+    let raw = match utf8_args(std::env::args_os().skip(1)) {
+        Ok(raw) => raw,
+        Err(e) => fail_usage(&e),
+    };
     if matches!(raw.first().map(String::as_str), Some("--version" | "-V" | "version")) {
         say!("effectcraft-cli {}", env!("CARGO_PKG_VERSION"));
         return;
@@ -726,6 +736,9 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
             };
             let mut b = backend(args, true)?;
             let r = b.exec(&id, params)?;
+            if let Some(e) = failed_render(&id, &r) {
+                return Err(Failure::Error(e));
+            }
             let saved = maybe_save(&mut b, args)?;
             emit(&with_saved(r, saved), json_out);
         }
@@ -748,6 +761,9 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
                 };
                 i += 1;
                 let r = b.exec(id, params).map_err(|e| Failure::Error(format!("{id}: {e}")))?;
+                if let Some(e) = failed_render(id, &r) {
+                    return Err(Failure::Error(format!("{id}: {e}")));
+                }
                 if !json_out {
                     emit(&r, false);
                 }
@@ -963,6 +979,21 @@ fn positional<const N: usize>(args: &Args, usage: &str) -> Result<[String; N], F
     Ok(std::array::from_fn(|i| args.pos[i].clone()))
 }
 
+/// `renderQueue.render` reports a failed item in its result, not as an error. Under `run`/`exec`
+/// that item fails the command (#1426), as it fails `render --queue`.
+fn failed_render(id: &str, r: &Value) -> Option<String> {
+    if id != "renderQueue.render" {
+        return None;
+    }
+    let failed: Vec<String> = r["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|i| Some(format!("{}: {}", i["compName"].as_str().unwrap_or("?"), i["status"].get("Failed")?.as_str().unwrap_or("failed"))))
+        .collect();
+    (!failed.is_empty()).then(|| failed.join("; "))
+}
+
 fn with_saved(v: Value, saved: Option<String>) -> Value {
     match saved {
         None => v,
@@ -986,11 +1017,10 @@ fn render(args: &Args, json_out: bool) -> Result<(), Failure> {
     let mut s = session(args)?;
     if args.opt("--template").is_some() {
         template::prepare(&mut s, args)?;
-    } else {
-        match &args.project {
-            Some(p) => s.execute("file.open", json!({"path": p})).map_err(|e| Failure::Error(e.to_string()))?,
-            None => s.execute("file.openDemoProject", json!({})).map_err(|e| Failure::Error(e.to_string()))?,
-        };
+    } else if let Some(p) = &args.project {
+        s.execute("file.open", json!({"path": p})).map_err(|e| Failure::Error(e.to_string()))?;
+    } else if args.flag("--demo") || !args.flag("--empty") {
+        s.execute("file.openDemoProject", json!({})).map_err(|e| Failure::Error(e.to_string()))?;
     }
     let err = |e: effectcraft_engine::EngineError| Failure::Error(e.to_string());
     if !args.flag("--queue") {
@@ -1647,6 +1677,18 @@ mod tests {
         assert_eq!(snap_to_frame(1.483333, 60.0), 89.0 / 60.0);
         assert_eq!(snap_to_frame(0.813559, 29.5), 24.0 / 29.5);
         assert_eq!(snap_to_frame(1.49, 60.0), 1.49);
+    }
+
+    /// `std::env::args` panicked on an argument that is not Unicode; it is a usage error naming
+    /// it, and Unicode arguments pass through unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_arguments_are_refused() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let args = [OsString::from("render-frame"), OsString::from("--out"), OsString::from_vec(b"caf\xe9.png".to_vec())];
+        assert_eq!(utf8_args(args).unwrap_err(), "argument `caf\u{fffd}.png` is not valid Unicode");
+        assert_eq!(utf8_args([OsString::from("info"), OsString::from("caf\u{e9}.png")]).unwrap(), ["info", "caf\u{e9}.png"]);
     }
 
     /// Every `--option` the CLI reads is declared in VALUED or FLAGS, so none is refused.

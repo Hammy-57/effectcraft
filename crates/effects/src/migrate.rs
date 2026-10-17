@@ -239,6 +239,8 @@ fn refresh(pr: &mut Property, ps: &ParamSpec, spec: &EffectSpec) {
         // A path typed as text, or set only by commands, that got a Choose… button (Apply Color
         // LUT's LUT, the OCIO files, #514).
         (ParamUi::Hidden | ParamUi::Text, ParamUi::File { .. }) => pr.ui = ps.ui.clone(),
+        // An internal point that became a control (Liquify's Distortion Mesh Offset, #1194).
+        (ParamUi::Hidden, ParamUi::Point) => pr.ui = ParamUi::Point,
         // Same kind of value: take the spec's hints (units, ranges).
         (a, b) if std::mem::discriminant(a) == std::mem::discriminant(b) || is_numeric_ui(a) && is_numeric_ui(b) => pr.ui = ps.ui.clone(),
         _ => {}
@@ -270,6 +272,7 @@ fn refresh_is_no_op(pr: &Property, ps: &ParamSpec, spec: &EffectSpec) -> bool {
         (ParamUi::Popup { .. }, ParamUi::Popup { .. }) => pr.ui == ps.ui,
         (_, ParamUi::Hidden) => pr.ui == ParamUi::Hidden,
         (ParamUi::Hidden | ParamUi::Text, ParamUi::File { .. }) => false,
+        (ParamUi::Hidden, ParamUi::Point) => false,
         (a, b) if std::mem::discriminant(a) == std::mem::discriminant(b) || is_numeric_ui(a) && is_numeric_ui(b) => pr.ui == ps.ui,
         _ => true,
     }
@@ -634,6 +637,19 @@ mod tests {
             assert!(matches!(&pr.ui, ParamUi::File { filters } if filters.iter().any(|f| f == "cube")), "{fx}: {:?}", pr.ui);
             assert_eq!(pr.value, Value::Str("/luts/look.cube".into()));
         }
+    }
+
+    /// #1194: Liquify's Distortion Mesh Offset was hidden; old projects show it, keeping its value.
+    #[test]
+    fn a_hidden_point_that_became_a_control_is_shown() {
+        let mut next = 1;
+        let (spec, mut g) = instance("ec.distort.liquify", &mut next);
+        let pr = g.get_mut("distortionMeshOffset").unwrap();
+        pr.ui = ParamUi::Hidden;
+        pr.value = Value::Vec2([20.0, -5.0]);
+        assert!(upgrade_instance(spec, &mut g, &mut Ids(&mut next), [100.0, 100.0]));
+        let pr = g.get("distortionMeshOffset").unwrap();
+        assert_eq!((&pr.ui, &pr.value), (&ParamUi::Point, &Value::Vec2([20.0, -5.0])));
     }
 
     #[test]

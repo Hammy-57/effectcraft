@@ -83,6 +83,9 @@ fn draw_layers<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, visible: &[
     // The layers' content on every core first (`prepass`); dropped with what the walk didn't take.
     let _prefetched = crate::prepass::run(e, r, ctx, visible.get(i..).unwrap_or(&[]), canvas, ordinary_resident_enabled());
     while i < visible.len() {
+        // A device that ran out of memory (or was lost) on an earlier layer fails every later
+        // one: give the frame back to the CPU now instead of drawing the rest of the comp.
+        e.g.check_health().ok()?;
         if visible[i].is_3d() {
             let mut j = i;
             while j < visible.len() && visible[j].is_3d() {
